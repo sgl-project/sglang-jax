@@ -30,16 +30,12 @@ title: "DeepSeek V3"
 | Minimum & recommended production | v6e-64 | 8x8 | 16 | 64 | 64 | 8 | 8 | 64 | ✅ validated | `dp=8` is required for FP8 shared-expert block-quant compatibility (`2048/8=256 > 128 = block_size`); `dp=4` silently collapses. HBM is tight at `dp=8`; see §2.4 Memory Management. |
 | Alternative (starter) | v7x-8 | 2x4 | 2 | 8 chips / 16 devices | 16 | 1 | 16 | 16 | 🚧 starter | v7x exposes 2 JAX devices per chip; topology matrix not yet validated for V3. Use lower concurrency. |
 
-V6e-64 is the only currently validated production path; the v7x-8 row is a starter alternative pending validation. No smaller TPU configuration is supported for V3. See [`../../base/tpu-topology-reference.md`](../../base/tpu-topology-reference.md) for the TPU generation reference.
+V6e-64 is the only currently validated production path; the v7x-8 row is a starter alternative pending validation. No smaller TPU configuration is supported for V3. See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation reference.
 
 ### 2.2 Environment
 
-Install per [`../../../get_started/install.md`](../../../get_started/install.md). Multi-host required — use [`../../deployment/gke-indexed-job.md`](../../deployment/gke-indexed-job.md) as the primary user-facing path. Advanced users running temporary v6e experiments can adapt [`../../deployment/skypilot.md`](../../deployment/skypilot.md). The required JAX TPU container image:
-
-| Hardware Platform               | Docker Image                                                       |
-|---|---|
-| TPU v5e / v5p / v6e (Trillium)  | `us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1` |
-| TPU v7x (Ironwood)              | `us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1` |
+Install per [install guide](../../../get_started/install.md). Multi-host required — use [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) as the primary user-facing path. Advanced users running temporary v6e experiments can adapt [SkyPilot launcher](../../deployment/skypilot.md).
+The required JAX TPU container image: `us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1` (covers v5e / v5p / v6e Trillium / v7x Ironwood).
 
 For evaluation, additionally install `evalscope` in the client environment (any host that can reach the served `:30000` port — typically a port-forwarded client laptop):
 
@@ -49,9 +45,14 @@ pip install evalscope==0.17.1
 
 ### 2.3 Launch
 
+Two multi-host paths below:
+
+- **TPU v6e-64 (16 nodes, `8x8`)** — the validated production target. The `--dp-size 8` mesh fix from issue #3 (see §2.4) is mandatory on this slice.
+- **TPU v7x-8 (2 nodes, `2x4`, starter)** — smaller v7x alternative pending validation. Same launch shape with `--tp-size 16 --dp-size 1`; use lower concurrency.
+
 #### Multi-host (GKE Indexed Job) — TPU v6e-64
 
-Use [`../../deployment/gke-indexed-job.md`](../../deployment/gke-indexed-job.md) with `<JOB>=deepseek-v3`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=8x8`, `parallelism: 16`, `completions: 16`, and `backoffLimit: 16` (transient GKE control-plane blips happen; a non-zero backoff lets the job survive). Put these model-specific flags into `<LAUNCH_FLAGS>`:
+Use [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) with `<JOB>=deepseek-v3`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=8x8`, `parallelism: 16`, `completions: 16`, and `backoffLimit: 16` (transient GKE control-plane blips happen; a non-zero backoff lets the job survive). Put these model-specific flags into `<LAUNCH_FLAGS>`:
 
 ```bash
   --model-path deepseek-ai/DeepSeek-V3 \
@@ -81,7 +82,7 @@ Use `<ACCELERATOR>=tpu7x`, `<TOPOLOGY>=2x4`, `parallelism: 2`, and `completions:
 
 Not yet validated end-to-end — open a PR with measured numbers when you run it.
 
-For temporary v6e experiments, advanced users can adapt [`../../deployment/skypilot.md`](../../deployment/skypilot.md) with the same launch flags. The default SkyPilot template is v6e-only; use GKE for v7x.
+For temporary v6e experiments, advanced users can adapt [SkyPilot launcher](../../deployment/skypilot.md) with the same launch flags. The default SkyPilot template is v6e-only; use GKE for v7x.
 
 ### 2.4 Configuration Tips
 
@@ -106,13 +107,13 @@ For temporary v6e experiments, advanced users can adapt [`../../deployment/skypi
 - `JAX_COMPILATION_CACHE_DIR` is mandatory — without it, first request blocks ~4 min per node and is repeated on every restart.
 - Mount a shared PVC at the cache directory to amortize compilation across all 16 nodes and across pod restarts. Mesh shape (`data × tensor`) is part of the cache key; changing `--dp-size` invalidates the cache.
 
-For full flag definitions see [`../../base/launch-flags-reference.md`](../../base/launch-flags-reference.md).
+For full flag definitions see [Launch flags reference](../../base/launch-flags-reference.md).
 
 ## 3. Invocation
 
 ### 3.1 Basic Chat Completion
 
-For full cURL + native `/generate` patterns see [`../../base/basic-api-usage.md`](../../base/basic-api-usage.md).
+For full cURL + native `/generate` patterns see [Basic API usage](../../base/basic-api-usage.md).
 
 Short Python OpenAI client example (replace `<rank0-ip>` with your rank-0 internal IP):
 
@@ -131,7 +132,7 @@ resp = client.chat.completions.create(
 print(resp.choices[0].message.content)
 ```
 
-> DeepSeek V3 is non-reasoning and has no native tool-call format. For those workloads, see the **Parser key reference** in [`../index.md`](../index.md#parser-key-reference) for the list of cookbook recipes with reasoning / tool-call parsers registered.
+> DeepSeek V3 is non-reasoning and has no native tool-call format. For those workloads, see the **Parser key reference** in [Parser key reference](../index.md#parser-key-reference) for the list of cookbook recipes with reasoning / tool-call parsers registered.
 
 ## 4. Benchmark
 
@@ -253,5 +254,5 @@ Max ITL (ms):                            2517.66
 
 - [DeepSeek-V3 model card](https://huggingface.co/deepseek-ai/DeepSeek-V3)
 - [SGLang DeepSeek V3 guide](https://docs.sglang.io/docs/basic_usage/deepseek_v3)
-- [`../../base/launch-flags-reference.md`](../../base/launch-flags-reference.md)
-- [`../../troubleshooting.md`](../../troubleshooting.md) — cross-recipe generic issues.
+- [Launch flags reference](../../base/launch-flags-reference.md)
+- [Cross-recipe troubleshooting](../../troubleshooting.md) — cross-recipe generic issues.

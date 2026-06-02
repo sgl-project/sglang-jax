@@ -34,22 +34,18 @@ title: "Wan 2.1 T2V"
 
 > Wan 2.1 runs through SGL-JAX's built-in staged multimodal runtime. Use the `--tp-size` shown for this model; moving to a larger TPU host or slice does not automatically make every stage use more devices.
 
-See [`../../base/tpu-topology-reference.md`](../../base/tpu-topology-reference.md) for the TPU generation reference.
+See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation reference.
 
 ### 2.2 Environment
 
-Install per [`../../../get_started/install.md`](../../../get_started/install.md) and use [`../../deployment/single-host-docker.md`](../../deployment/single-host-docker.md) for the container setup. The required JAX TPU container image:
-
-| Hardware Platform | Docker Image |
-|---|---|
-| TPU v5e / v5p / v6e (Trillium) | `us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1` |
-| TPU v7x (Ironwood) | `us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1` |
+Install per [install guide](../../../get_started/install.md) and use [Single-host Docker template](../../deployment/single-host-docker.md) for the container setup.
+The required JAX TPU container image: `us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1` (covers v5e / v5p / v6e Trillium / v7x Ironwood).
 
 No extra pip package is needed for video generation. The response returns a video path or URL, and any post-processing such as MP4 transcoding happens client-side.
 
 ### 2.3 Launch
 
-#### Single-host (Docker) - TPU v6e-4
+#### Single-host - TPU v6e-4
 
 ```bash
 JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -u -m sgl_jax.launch_server \
@@ -112,7 +108,7 @@ VAE tiling is enabled by default in the multimodal server and there is no `--no-
 - `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache` avoids recompiling the same `(resolution x frame-count)` buckets across server restarts.
 - The cache keys on full kernel shape. Changing `--precompile-width-heights`, `--precompile-frame-paddings`, `--tp-size`, or `--dit-precision` invalidates cached entries.
 
-For full flag definitions see [`../../base/launch-flags-reference.md`](../../base/launch-flags-reference.md) and the multimodal-specific options (`python -m sgl_jax.launch_server --multimodal --help`).
+For full flag definitions see [Launch flags reference](../../base/launch-flags-reference.md) and the multimodal-specific options (`python -m sgl_jax.launch_server --multimodal --help`).
 
 ## 3. Invocation
 
@@ -235,5 +231,5 @@ This is a single-shot smoke datapoint, not a throughput sweep. Throughput sweeps
 
 - [Wan-AI model collection](https://huggingface.co/Wan-AI)
 - [Wan2.1-T2V-14B-Diffusers model card](https://huggingface.co/Wan-AI/Wan2.1-T2V-14B-Diffusers)
-- [`../../base/launch-flags-reference.md`](../../base/launch-flags-reference.md)
-- [`../../troubleshooting.md`](../../troubleshooting.md) — cross-recipe generic issues.
+- [Launch flags reference](../../base/launch-flags-reference.md)
+- [Cross-recipe troubleshooting](../../troubleshooting.md) — cross-recipe generic issues.

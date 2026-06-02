@@ -36,16 +36,12 @@ title: "MiMo-V2.5-Pro"
 
 MiMo-V2.5-Pro ships a single supported deployment class — multi-host MoE on either v6e-64 (primary) or v7x-16 (alternative); single-host configurations are not supported. All nodes must be in the same TPU slice and reach each other on the JAX init port (`5000` by default) and the TPU process port (`8471`).
 
-See [`../../base/tpu-topology-reference.md`](../../base/tpu-topology-reference.md) for the TPU generation / HBM / device-per-chip reference.
+See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation / HBM / device-per-chip reference.
 
 ### 2.2 Environment
 
-Install per [`../../../get_started/install.md`](../../../get_started/install.md) and use one of the launcher templates from [`../../deployment/`](../../deployment/). The required JAX TPU container image:
-
-| Hardware Platform               | Docker Image                                                       |
-|---|---|
-| TPU v5e / v5p / v6e (Trillium)  | `us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1` |
-| TPU v7x (Ironwood)              | `us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1` |
+Install per [install guide](../../../get_started/install.md) and use one of the launcher templates from [Deployment templates](../../deployment/).
+The required JAX TPU container image: `us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1` (covers v5e / v5p / v6e Trillium / v7x Ironwood).
 
 The `jax0.8.1-rev1` image is what SGL-JAX's GKE launcher and advanced SkyPilot path use; pinning it keeps the JAX runtime in lockstep with the SGL-JAX `[tpu]` extras.
 
@@ -57,7 +53,10 @@ pip install evalscope==0.17.1
 
 ### 2.3 Launch
 
-MiMo-V2.5-Pro is multi-host only. Run the same command on every node; only `${NODE_RANK}` and `${MASTER_ADDR}` vary across nodes.
+MiMo-V2.5-Pro is multi-host only. Run the same command on every node; only `${NODE_RANK}` and `${MASTER_ADDR}` vary across nodes. Two equivalent paths:
+
+- **TPU v7x-16 (4 nodes, `2x2x4`)** — reference path; v7x exposes 2 JAX devices per chip so `--tp-size 32` with 4 chips × 4 nodes. Lower latency on v7x interconnect.
+- **TPU v6e-64 (16 nodes, `4x4x4`)** — alternative when v7x-16 capacity is unavailable; tighter HBM per chip but works with the same launch shape (`--tp-size 64`, see SWA pool sizing in §2.4).
 
 #### Multi-host (GKE Indexed Job) — TPU v7x-16 (4 nodes, `2x2x4`)
 
@@ -103,7 +102,7 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -m sgl_jax.launch_server \
 
 `${NODE_RANK}` ranges from `0` to `15`. Compared with v7x-16, this lowers `--mem-fraction-static` to `0.92` and `--swa-full-tokens-ratio` to `0.15` because v6e has less HBM per chip — the lower SWA ratio shifts the smaller KV pool toward full-attention layers.
 
-For the GKE Indexed Job + headless Service manifest pattern that wraps both launch commands, see [`../../deployment/gke-indexed-job.md`](../../deployment/gke-indexed-job.md) — fill in `<JOB>=mimo-v25-pro`, `<ACCELERATOR>=tpu7x` (v7x) or `tpu-v6e-slice` (v6e), `<TOPOLOGY>=2x2x4` / `4x4x4`, `<N>=4` / `16`, and paste the launch flags above into `<LAUNCH_FLAGS>`. For temporary v6e experiments, advanced users can adapt [`../../deployment/skypilot.md`](../../deployment/skypilot.md); the default SkyPilot template is v6e-only, so use GKE for v7x.
+For the GKE Indexed Job + headless Service manifest pattern that wraps both launch commands, see [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) — fill in `<JOB>=mimo-v25-pro`, `<ACCELERATOR>=tpu7x` (v7x) or `tpu-v6e-slice` (v6e), `<TOPOLOGY>=2x2x4` / `4x4x4`, `<N>=4` / `16`, and paste the launch flags above into `<LAUNCH_FLAGS>`. For temporary v6e experiments, advanced users can adapt [SkyPilot launcher](../../deployment/skypilot.md); the default SkyPilot template is v6e-only, so use GKE for v7x.
 
 ### 2.4 Configuration Tips
 
@@ -141,13 +140,13 @@ For the GKE Indexed Job + headless Service manifest pattern that wraps both laun
 - `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache` is mandatory — without it, first request blocks ~4 min while XLA/Pallas re-compiles every kernel.
 - The cache keys on full kernel shape: changing `--page-size`, `--tp-size`, `--chunked-prefill-size`, or `--context-length` invalidates cached entries. Give each tuning experiment its own cache dir to avoid stale-cache misses across runs.
 
-For full flag definitions and defaults see [`../../base/launch-flags-reference.md`](../../base/launch-flags-reference.md).
+For full flag definitions and defaults see [Launch flags reference](../../base/launch-flags-reference.md).
 
 ## 3. Invocation
 
 ### 3.1 Basic Chat Completion
 
-For full cURL + native `/generate` patterns see [`../../base/basic-api-usage.md`](../../base/basic-api-usage.md). For thinking + content streaming see §3.2, for tool calling see §3.3.
+For full cURL + native `/generate` patterns see [Basic API usage](../../base/basic-api-usage.md). For thinking + content streaming see §3.2, for tool calling see §3.3.
 
 Short Python OpenAI client example (replace `<rank0-ip>` with your rank-0 internal IP; tool-calling sampling baseline — for long thinking-on chains raise `max_tokens`):
 
@@ -511,8 +510,8 @@ Max ITL (ms):                            1290.76
 ## Additional Resources
 
 - [MiMo-V2.5-Pro Model Card](https://huggingface.co/XiaomiMiMo/MiMo-V2.5-Pro)
-- [`../../base/tpu-topology-reference.md`](../../base/tpu-topology-reference.md)
-- [`../../base/launch-flags-reference.md`](../../base/launch-flags-reference.md)
-- [`../../deployment/gke-indexed-job.md`](../../deployment/gke-indexed-job.md) — primary multi-host launcher.
-- [`../../deployment/skypilot.md`](../../deployment/skypilot.md) — advanced v6e experiment alternative.
-- [`../../troubleshooting.md`](../../troubleshooting.md) — cross-recipe generic issues.
+- [TPU topology reference](../../base/tpu-topology-reference.md)
+- [Launch flags reference](../../base/launch-flags-reference.md)
+- [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) — primary multi-host launcher.
+- [SkyPilot launcher](../../deployment/skypilot.md) — advanced v6e experiment alternative.
+- [Cross-recipe troubleshooting](../../troubleshooting.md) — cross-recipe generic issues.

@@ -25,16 +25,12 @@ title: "GLM-4.5"
 |---|---|---|---|---|---|---|---|
 | GLM-4.5-Air (106B) | v6e-32 | 4x8 | 8  | 32 | 32 | 32 | BF16 ~210 GB |
 
-See [`../../base/tpu-topology-reference.md`](../../base/tpu-topology-reference.md) for the TPU generation reference.
+See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation reference.
 
 ### 2.2 Environment
 
-Install per [`../../../get_started/install.md`](../../../get_started/install.md). Multi-host required — use [`../../deployment/gke-indexed-job.md`](../../deployment/gke-indexed-job.md) as the primary user-facing path. Advanced users running temporary v6e experiments can adapt [`../../deployment/skypilot.md`](../../deployment/skypilot.md). The required JAX TPU container image:
-
-| Hardware Platform               | Docker Image                                                       |
-|---|---|
-| TPU v5e / v5p / v6e (Trillium)  | `us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1` |
-| TPU v7x (Ironwood)              | `us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1` |
+Install per [install guide](../../../get_started/install.md). Multi-host required — use [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) as the primary user-facing path. Advanced users running temporary v6e experiments can adapt [SkyPilot launcher](../../deployment/skypilot.md).
+The required JAX TPU container image: `us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1` (covers v5e / v5p / v6e Trillium / v7x Ironwood).
 
 ### 2.3 Launch
 
@@ -42,7 +38,7 @@ GLM-4.5-Air is multi-host only.
 
 #### Multi-host (GKE Indexed Job) — TPU v6e-32 (GLM-4.5-Air)
 
-Use [`../../deployment/gke-indexed-job.md`](../../deployment/gke-indexed-job.md) with `<JOB>=glm-4-5-air`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=4x8`, `parallelism: 8`, and `completions: 8`. Put these model-specific flags into `<LAUNCH_FLAGS>`:
+Use [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) with `<JOB>=glm-4-5-air`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=4x8`, `parallelism: 8`, and `completions: 8`. Put these model-specific flags into `<LAUNCH_FLAGS>`:
 
 ```bash
   --model-path zai-org/GLM-4.5-Air \
@@ -60,7 +56,7 @@ Use [`../../deployment/gke-indexed-job.md`](../../deployment/gke-indexed-job.md)
 
 > `--moe-backend epmoe` is mandatory for GLM-4.5-Air. The fused Pallas backend requires `moe_intermediate_size % 512 == 0`; GLM-4.5-Air's `moe_intermediate_size=1408` fails that alignment and crashes at startup (`tile_n` divisibility assert).
 
-For temporary v6e experiments, advanced users can adapt [`../../deployment/skypilot.md`](../../deployment/skypilot.md) with the same launch flags. The model recipe does not require users to run repository-local SkyPilot helper scripts.
+For temporary v6e experiments, advanced users can adapt [SkyPilot launcher](../../deployment/skypilot.md) with the same launch flags. The model recipe does not require users to run repository-local SkyPilot helper scripts.
 
 ### 2.4 Configuration Tips
 
@@ -83,13 +79,13 @@ For temporary v6e experiments, advanced users can adapt [`../../deployment/skypi
 - `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache` is mandatory — without it, first request blocks ~4 min per node.
 - Mount a shared PVC across the cluster's nodes to amortize compilation.
 
-For full flag definitions see [`../../base/launch-flags-reference.md`](../../base/launch-flags-reference.md).
+For full flag definitions see [Launch flags reference](../../base/launch-flags-reference.md).
 
 ## 3. Invocation
 
 ### 3.1 Basic Chat Completion
 
-For full cURL + native `/generate` patterns see [`../../base/basic-api-usage.md`](../../base/basic-api-usage.md).
+For full cURL + native `/generate` patterns see [Basic API usage](../../base/basic-api-usage.md).
 
 Short Python OpenAI client example (replace `<rank0-ip>` with your rank-0 internal IP):
 
@@ -307,5 +303,5 @@ Mean TPOT (ms):           13.35
 ## Additional Resources
 
 - [GLM-4.5-Air model card](https://huggingface.co/zai-org/GLM-4.5-Air)
-- [`../../base/launch-flags-reference.md`](../../base/launch-flags-reference.md)
-- [`../../troubleshooting.md`](../../troubleshooting.md) — cross-recipe generic issues.
+- [Launch flags reference](../../base/launch-flags-reference.md)
+- [Cross-recipe troubleshooting](../../troubleshooting.md) — cross-recipe generic issues.

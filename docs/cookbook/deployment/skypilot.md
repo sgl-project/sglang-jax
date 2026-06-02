@@ -12,7 +12,7 @@ Advanced SkyPilot recipe for provisioning a multi-node v6e TPU cluster and launc
 - GCP TPU quota in the region you target.
 - A working SGL-JAX checkout on the local machine — the launcher script lives at `scripts/launch_tpu.sh`.
 
-For the broader SkyPilot development workflow (clone, sync, destroy) see [`../../developer_guide/tpu_resources_guide.md`](../../developer_guide/tpu_resources_guide.md).
+For the broader SkyPilot development workflow (clone, sync, destroy) see [TPU resources guide](../../developer_guide/tpu_resources_guide.md).
 
 ## The launcher script
 
@@ -98,7 +98,7 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache uv run python -u -m sgl_jax.launch_serv
 | Placeholder | What to fill in |
 |---|---|
 | `<MODEL>` | HuggingFace repo id or absolute path on the node (e.g. `/models/xai-grok-2`). |
-| `<N>` | `--tp-size` = total JAX devices across all nodes. See [`../base/tpu-topology-reference.md`](../base/tpu-topology-reference.md). |
+| `<N>` | `--tp-size` = total JAX devices across all nodes. See [TPU topology reference](../base/tpu-topology-reference.md). |
 | `<NODE_0_IP_ADDRESS>:<PORT>` | Rank-0 node's internal IP and an unused TCP port. SkyPilot does not auto-expose this — `sky status -a <cluster>` shows per-node IPs. |
 | `<NODES>` | Node count. Matches the SkyPilot accelerator name's chip count divided by chips-per-node (4 for v6e). E.g. `tpu-v6e-32` → 8 nodes. |
 | `${SKYPILOT_NODE_RANK}` | Provided automatically by SkyPilot in the remote shell. Escape the `$` (`\$`) so the local shell does not expand it. |
@@ -128,6 +128,6 @@ Single-host recipes ([Qwen-7B-Chat](../autoregressive/Qwen/Qwen.md), [Qwen3](../
 
 ## Related docs
 
-- [`../../developer_guide/tpu_resources_guide.md`](../../developer_guide/tpu_resources_guide.md) — broader SkyPilot dev workflow (sync code, destroy clusters).
-- [`../base/tpu-topology-reference.md`](../base/tpu-topology-reference.md) — TPU/device/chip table for picking `--tp-size`.
-- [`../base/launch-flags-reference.md`](../base/launch-flags-reference.md) — full launch flag reference.
+- [TPU resources guide](../../developer_guide/tpu_resources_guide.md) — broader SkyPilot dev workflow (sync code, destroy clusters).
+- [TPU topology reference](../base/tpu-topology-reference.md) — TPU/device/chip table for picking `--tp-size`.
+- [Launch flags reference](../base/launch-flags-reference.md) — full launch flag reference.

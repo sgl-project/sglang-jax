@@ -31,20 +31,16 @@ title: "Gemma 2"
 | Minimum runnable | Gemma 2 27B-it | v6e-4 | 2x2 | 4 | 4 | BF16 ~54 GB — fits with `--mem-fraction-static 0.85` (~13.5 GB weights/chip + dual KV pools) |
 | Recommended production | Gemma 2 27B-it | v6e-8 | 2x4 | 8 | 8 | More HBM headroom so the global + sliding KV pools both have room; raises `--max-running-requests` ceiling |
 
-See [`../base/tpu-topology-reference.md`](../../base/tpu-topology-reference.md) for the TPU generation reference.
+See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation reference.
 
 ### 2.2 Environment
 
-Install per [`../../get_started/install.md`](../../../get_started/install.md) and use [`../deployment/single-host-docker.md`](../../deployment/single-host-docker.md) for the container setup. The required JAX TPU container image:
-
-| Hardware Platform               | Docker Image                                                       |
-|---|---|
-| TPU v5e / v5p / v6e (Trillium)  | `us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1` |
-| TPU v7x (Ironwood)              | `us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1` |
+Install per [install guide](../../../get_started/install.md) and use [Single-host Docker template](../../deployment/single-host-docker.md) for the container setup.
+The required JAX TPU container image: `us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1` (covers v5e / v5p / v6e Trillium / v7x Ironwood).
 
 ### 2.3 Launch
 
-#### Single-host (Docker) — TPU v6e-4 (Gemma 2 27B-it)
+#### Single-host — TPU v6e-4 (Gemma 2 27B-it)
 
 ```bash
 JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -m sgl_jax.launch_server \
@@ -63,9 +59,6 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -m sgl_jax.launch_server \
 
 The 27B-it `--mem-fraction-static 0.85` leaves room for the dual (global + sliding) KV pools.
 
-#### Multi-host
-
-Not needed at the 27B scale — fits single-host on v6e-4.
 
 ### 2.4 Configuration Tips
 
@@ -84,13 +77,13 @@ Not needed at the 27B scale — fits single-host on v6e-4.
 - `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache` is mandatory — without it, first request blocks ~4 min while XLA/Pallas re-compiles.
 - The cache keys on full kernel shape: changing `--page-size`, `--tp-size`, or `--swa-full-tokens-ratio` invalidates cached entries.
 
-For full flag definitions see [`../base/launch-flags-reference.md`](../../base/launch-flags-reference.md).
+For full flag definitions see [Launch flags reference](../../base/launch-flags-reference.md).
 
 ## 3. Invocation
 
 ### 3.1 Basic Chat Completion
 
-For full cURL + native `/generate` patterns see [`../../base/basic-api-usage.md`](../../base/basic-api-usage.md). Pass `top_k` via `extra_body={"top_k": 64}` since the OpenAI schema does not include it.
+For full cURL + native `/generate` patterns see [Basic API usage](../../base/basic-api-usage.md). Pass `top_k` via `extra_body={"top_k": 64}` since the OpenAI schema does not include it.
 
 Short Python OpenAI client example:
 
@@ -110,7 +103,7 @@ resp = client.chat.completions.create(
 print(resp.choices[0].message.content)
 ```
 
-> Gemma 2 is non-reasoning and has no native tool-call format. For those workloads, see the **Parser key reference** in [`../index.md`](../index.md#parser-key-reference) for the list of cookbook recipes with reasoning / tool-call parsers registered.
+> Gemma 2 is non-reasoning and has no native tool-call format. For those workloads, see the **Parser key reference** in [Parser key reference](../index.md#parser-key-reference) for the list of cookbook recipes with reasoning / tool-call parsers registered.
 
 ## 4. Benchmark
 
@@ -208,5 +201,5 @@ Mean ITL (ms):                           14.48
 ## Additional Resources
 
 - [Gemma 2 27B-it model card](https://huggingface.co/google/gemma-2-27b-it)
-- [`../base/launch-flags-reference.md`](../../base/launch-flags-reference.md)
-- [`../troubleshooting.md`](../../troubleshooting.md) — cross-recipe generic issues including the SWA pool exhaustion note.
+- [Launch flags reference](../../base/launch-flags-reference.md)
+- [Cross-recipe troubleshooting](../../troubleshooting.md) — cross-recipe generic issues including the SWA pool exhaustion note.

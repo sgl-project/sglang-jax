@@ -17,7 +17,7 @@ title: "Qwen2.5-VL"
 - [**Qwen/Qwen2.5-VL-32B-Instruct**](https://huggingface.co/Qwen/Qwen2.5-VL-32B-Instruct) — 32B; starter single-host path on v6e-4 with `--tp-size 4`.
 - [**Qwen/Qwen2.5-VL-72B-Instruct**](https://huggingface.co/Qwen/Qwen2.5-VL-72B-Instruct) — 72B; multi-host serving is pending.
 
-For the text-only Qwen3 dense recipes see [`Qwen3.md`](Qwen3.md).
+For the text-only Qwen3 dense recipes see [Qwen3 recipe](Qwen3.md).
 
 **Key Features**:
 
@@ -43,16 +43,12 @@ For the text-only Qwen3 dense recipes see [`Qwen3.md`](Qwen3.md).
 
 > Multimodal recipes are constrained by SGL-JAX's built-in staged runtime. Use the `--tp-size` shown for the model; a larger TPU slice is not automatically used by changing only `--tp-size`.
 
-See [`../../base/tpu-topology-reference.md`](../../base/tpu-topology-reference.md) for the TPU generation reference.
+See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation reference.
 
 ### 2.2 Environment
 
-Install per [`../../../get_started/install.md`](../../../get_started/install.md). For the current single-host VL paths use [`../../deployment/single-host-docker.md`](../../deployment/single-host-docker.md). Qwen2.5-VL 72B multi-host should stay pending until the built-in staging and scheduler path are fixed. The required JAX TPU container image:
-
-| Hardware Platform               | Docker Image                                                       |
-|---|---|
-| TPU v5e / v5p / v6e (Trillium)  | `us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1` |
-| TPU v7x (Ironwood)              | `us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1` |
+Install per [install guide](../../../get_started/install.md). For the current single-host VL paths use [Single-host Docker template](../../deployment/single-host-docker.md). Qwen2.5-VL 72B multi-host should stay pending until the built-in staging and scheduler path are fixed.
+The required JAX TPU container image: `us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1` (covers v5e / v5p / v6e Trillium / v7x Ironwood).
 
 Extra pip for accuracy benchmarking only:
 
@@ -62,7 +58,7 @@ pip install evalscope==0.17.1
 
 ### 2.3 Launch
 
-#### Single-host (Docker) — TPU v6e-4 (Qwen2.5-VL-32B-Instruct)
+#### Single-host — TPU v6e-4 (Qwen2.5-VL-32B-Instruct)
 
 ```bash
 JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -u -m sgl_jax.launch_server \
@@ -115,7 +111,7 @@ Before this becomes a followable recipe, SGL-JAX needs:
 - `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache` is mandatory — without it, first request blocks ~4 min per stage while XLA/Pallas re-compiles every kernel (ViT and AR each compile independently).
 - The cache keys on full kernel shape: changing `--page-size`, `--tp-size`, image resolution buckets, or `--context-length` invalidates cached entries.
 
-For full flag definitions see [`../../base/launch-flags-reference.md`](../../base/launch-flags-reference.md); run `python -m sgl_jax.launch_server --multimodal --help` to see multimodal-specific flags.
+For full flag definitions see [Launch flags reference](../../base/launch-flags-reference.md); run `python -m sgl_jax.launch_server --multimodal --help` to see multimodal-specific flags.
 
 ## 3. Invocation
 
@@ -247,7 +243,7 @@ print(response.choices[0].message.content)
 
 ## 4. Benchmark
 
-> Benchmark section is intentionally omitted — Qwen2.5-VL is a Starter recipe (banner). All §4.1 Accuracy / §4.2 Speed cells are pending real PR-back measurements. When you run a numbered MMMU / MMMU Pro Vision / DocVQA / ChartQA eval against the model on TPU, file a PR adding the §4 block back with the actual numbers and upgrade the banner to Partially validated or Validated. For the canonical four-part §4 form (Test Environment / Deployment Command / Benchmark Command / Test Results) see any Validated recipe in [`../index.md`](../index.md).
+> Benchmark section is intentionally omitted — Qwen2.5-VL is a Starter recipe (banner). All §4.1 Accuracy / §4.2 Speed cells are pending real PR-back measurements. When you run a numbered MMMU / MMMU Pro Vision / DocVQA / ChartQA eval against the model on TPU, file a PR adding the §4 block back with the actual numbers and upgrade the banner to Partially validated or Validated. For the canonical four-part §4 form (Test Environment / Deployment Command / Benchmark Command / Test Results) see any Validated recipe in [the autoregressive index](../index.md).
 >
 > Note: `bench_serving` does not have native multimodal input support today, so §4.2 Speed needs a custom OpenAI-client load test driving the §3.2 multi-image / video patterns; PR back full TTFT / ITL / output tok/s along with the image resolution and prompt template used.
 
@@ -265,6 +261,6 @@ print(response.choices[0].message.content)
 ## Additional Resources
 
 - [Qwen2.5-VL model collection](https://huggingface.co/Qwen)
-- [`Qwen3.md`](Qwen3.md) — text-only Qwen3 dense recipe (Qwen3 series is the reasoning generation).
-- [`../../base/launch-flags-reference.md`](../../base/launch-flags-reference.md)
-- [`../../troubleshooting.md`](../../troubleshooting.md) — cross-recipe generic issues.
+- [Qwen3 recipe](Qwen3.md) — text-only Qwen3 dense recipe (Qwen3 series is the reasoning generation).
+- [Launch flags reference](../../base/launch-flags-reference.md)
+- [Cross-recipe troubleshooting](../../troubleshooting.md) — cross-recipe generic issues.

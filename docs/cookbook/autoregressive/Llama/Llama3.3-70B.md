@@ -33,22 +33,18 @@ For Llama 4 see the upstream sgl-cookbook (`Llama/Llama4.md`).
 | Minimum runnable | Llama 3.3 70B | v6e-16 | 4x4 | 4 | 16 | 16 | BF16 ~140 GB — fits with `--mem-fraction-static 0.85` (~8.75 GB weights/chip + ample KV headroom) |
 | Recommended production | Llama 3.3 70B | v6e-32 | 4x8 | 8 | 32 | 32 | More HBM per chip → higher `--max-running-requests` and longer context budget |
 
-See [`../../base/tpu-topology-reference.md`](../../base/tpu-topology-reference.md) for the TPU generation reference.
+See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation reference.
 
 ### 2.2 Environment
 
-Install per [`../../../get_started/install.md`](../../../get_started/install.md). Multi-host required — use [`../../deployment/gke-indexed-job.md`](../../deployment/gke-indexed-job.md) as the primary user-facing path. Advanced users running temporary v6e experiments can adapt [`../../deployment/skypilot.md`](../../deployment/skypilot.md). The required JAX TPU container image:
-
-| Hardware Platform               | Docker Image                                                       |
-|---|---|
-| TPU v5e / v5p / v6e (Trillium)  | `us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1` |
-| TPU v7x (Ironwood)              | `us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1` |
+Install per [install guide](../../../get_started/install.md). Multi-host required — use [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) as the primary user-facing path. Advanced users running temporary v6e experiments can adapt [SkyPilot launcher](../../deployment/skypilot.md).
+The required JAX TPU container image: `us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1` (covers v5e / v5p / v6e Trillium / v7x Ironwood).
 
 ### 2.3 Launch
 
 #### Multi-host (GKE Indexed Job) — TPU v6e-16 (minimum)
 
-Use [`../../deployment/gke-indexed-job.md`](../../deployment/gke-indexed-job.md) with `<JOB>=llama-70b`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=4x4`, `parallelism: 4`, and `completions: 4`. Put these model-specific flags into `<LAUNCH_FLAGS>`:
+Use [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) with `<JOB>=llama-70b`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=4x4`, `parallelism: 4`, and `completions: 4`. Put these model-specific flags into `<LAUNCH_FLAGS>`:
 
 ```bash
   --model-path meta-llama/Llama-3.3-70B-Instruct \
@@ -67,7 +63,7 @@ Use [`../../deployment/gke-indexed-job.md`](../../deployment/gke-indexed-job.md)
 
 Same as above but `<TOPOLOGY>=4x8`, `parallelism: 8`, `completions: 8`, and bump `--tp-size 32 --mem-fraction-static 0.9`.
 
-For temporary v6e experiments, advanced users can adapt [`../../deployment/skypilot.md`](../../deployment/skypilot.md) with the same launch flags. The model recipe does not require users to run repository-local SkyPilot helper scripts.
+For temporary v6e experiments, advanced users can adapt [SkyPilot launcher](../../deployment/skypilot.md) with the same launch flags. The model recipe does not require users to run repository-local SkyPilot helper scripts.
 
 ### 2.4 Configuration Tips
 
@@ -88,13 +84,13 @@ For temporary v6e experiments, advanced users can adapt [`../../deployment/skypi
 - `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache` is mandatory — without it, first request blocks ~4 min per node.
 - The cache is per-node; mount a shared PVC at the cache directory to amortize compilation across all 8 nodes.
 
-For full flag definitions see [`../../base/launch-flags-reference.md`](../../base/launch-flags-reference.md).
+For full flag definitions see [Launch flags reference](../../base/launch-flags-reference.md).
 
 ## 3. Invocation
 
 ### 3.1 Basic Chat Completion
 
-For full cURL + native `/generate` patterns see [`../../base/basic-api-usage.md`](../../base/basic-api-usage.md).
+For full cURL + native `/generate` patterns see [Basic API usage](../../base/basic-api-usage.md).
 
 Short Python OpenAI client example (replace `<rank0-ip>` with your rank-0 internal IP):
 
@@ -113,7 +109,7 @@ resp = client.chat.completions.create(
 print(resp.choices[0].message.content)
 ```
 
-> Llama 3 Instruct is non-reasoning and has no native tool-call format. For those workloads, see the **Parser key reference** in [`../index.md`](../index.md#parser-key-reference) for the list of cookbook recipes with reasoning / tool-call parsers registered.
+> Llama 3 Instruct is non-reasoning and has no native tool-call format. For those workloads, see the **Parser key reference** in [Parser key reference](../index.md#parser-key-reference) for the list of cookbook recipes with reasoning / tool-call parsers registered.
 
 ## 4. Benchmark
 
@@ -211,5 +207,5 @@ Mean ITL (ms):                           16.30
 ## Additional Resources
 
 - [Llama 3.3 70B model card](https://huggingface.co/meta-llama/Llama-3.3-70B-Instruct)
-- [`../../base/launch-flags-reference.md`](../../base/launch-flags-reference.md)
-- [`../../troubleshooting.md`](../../troubleshooting.md) — cross-recipe generic issues.
+- [Launch flags reference](../../base/launch-flags-reference.md)
+- [Cross-recipe troubleshooting](../../troubleshooting.md) — cross-recipe generic issues.

@@ -27,16 +27,12 @@ title: "Ling 2.6"
 |---|---|---|---|---|---|---|---|---|---|
 | Ling-2.6-1T | v6e-64 | 8x8 | 16 | 64 | 64 | 8 | 64 | ✅ validated | Trillion-scale; multi-host mandatory. `dp=8` required (GLA `num_groups=8` ≤ tensor axis); `--disable-radix-cache` required (hybrid recurrent state). |
 
-See [`../../base/tpu-topology-reference.md`](../../base/tpu-topology-reference.md) for the TPU generation reference.
+See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation reference.
 
 ### 2.2 Environment
 
-Install per [`../../../get_started/install.md`](../../../get_started/install.md). **Build pin**: use sglang-jax 0.1.0 or later — earlier builds crash at weight load on Ling-2.6's compressed-tensors FP8 QKV split (see §5 Troubleshooting). Multi-host required — use [`../../deployment/gke-indexed-job.md`](../../deployment/gke-indexed-job.md) as the primary user-facing path. Advanced users running temporary v6e experiments can adapt [`../../deployment/skypilot.md`](../../deployment/skypilot.md). The required JAX TPU container image:
-
-| Hardware Platform               | Docker Image                                                       |
-|---|---|
-| TPU v5e / v5p / v6e (Trillium)  | `us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1` |
-| TPU v7x (Ironwood)              | `us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1` |
+Install per [install guide](../../../get_started/install.md). **Build pin**: use sglang-jax 0.1.0 or later — earlier builds crash at weight load on Ling-2.6's compressed-tensors FP8 QKV split (see §5 Troubleshooting). Multi-host required — use [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) as the primary user-facing path. Advanced users running temporary v6e experiments can adapt [SkyPilot launcher](../../deployment/skypilot.md).
+The required JAX TPU container image: `us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1` (covers v5e / v5p / v6e Trillium / v7x Ironwood).
 
 For evaluation, additionally install `evalscope` in the client environment:
 
@@ -48,7 +44,7 @@ pip install evalscope==0.17.1
 
 #### Multi-host (GKE Indexed Job) — TPU v6e-64
 
-Use [`../../deployment/gke-indexed-job.md`](../../deployment/gke-indexed-job.md) with `<JOB>=ling-2-6`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=8x8`, `parallelism: 16`, `completions: 16`, and `backoffLimit: 16`. Put these model-specific flags into `<LAUNCH_FLAGS>`:
+Use [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) with `<JOB>=ling-2-6`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=8x8`, `parallelism: 16`, `completions: 16`, and `backoffLimit: 16`. Put these model-specific flags into `<LAUNCH_FLAGS>`:
 
 ```bash
   --model-path inclusionAI/Ling-2.6-1T \
@@ -68,7 +64,7 @@ Use [`../../deployment/gke-indexed-job.md`](../../deployment/gke-indexed-job.md)
 
 Mount a shared `JAX_COMPILATION_CACHE_DIR` on the same PVC as the model weights — first-time compile is ~9 minutes total (EXTEND ~7 min + DECODE ~2 min) at this build because the GLA chunk kernel has many distinct shape configurations; subsequent restarts with the same mesh shape skip almost all of that.
 
-For temporary v6e experiments, advanced users can adapt [`../../deployment/skypilot.md`](../../deployment/skypilot.md) with the same launch flags. The model recipe does not require users to run repository-local SkyPilot helper scripts.
+For temporary v6e experiments, advanced users can adapt [SkyPilot launcher](../../deployment/skypilot.md) with the same launch flags. The model recipe does not require users to run repository-local SkyPilot helper scripts.
 
 ### 2.4 Configuration Tips
 
@@ -76,7 +72,7 @@ For temporary v6e experiments, advanced users can adapt [`../../deployment/skypi
 - `--recurrent-state-memory-ratio 0.9` (default) budgets the recurrent state pool against the KV cache. The recurrent pool gets `available * ratio / (1 + ratio)` of free HBM.
 - Lower the ratio (e.g. `0.5`) if KV cache is your bottleneck — long prompts with small recurrent state benefit from more KV.
 - `--max-recurrent-state-size` (unset by default — auto) caps recurrent state slots across DP ranks; set only when you need a hard ceiling.
-- `--disable-radix-cache` is **required**, not optional. The server asserts on this at startup: `AssertionError: Hybrid recurrent state models require --disable-radix-cache (prefix sharing is unsafe with recurrent state)`.
+- `--disable-radix-cache` is **required**, not optional — prefix / radix caching for hybrid recurrent models is planned but not yet shipped. The server asserts at startup if you omit the flag: `AssertionError: Hybrid recurrent state models require --disable-radix-cache`.
 
 **Mesh / GLA Constraint:**
 - The GLA linear attention layer has a per-group RMSNorm with `num_groups=8`, sharded along the "tensor" mesh axis. **Effective tensor axis must be ≤ 8.** On v6e-64 that forces `--tp-size 64 --dp-size 8` (tensor axis = `tp/dp` = 8). Setting `--dp-size 1` builds tensor=64 and JIT trace crashes with `Sharding spec ('tensor',) implies that array axis 1 is partitioned 64 times, but does not evenly divide the dimension size 8`.
@@ -105,13 +101,13 @@ For temporary v6e experiments, advanced users can adapt [`../../deployment/skypi
 - `JAX_COMPILATION_CACHE_DIR` is mandatory — without it, first request blocks ~9 min per node (GLA chunk kernel ships many distinct shape configurations).
 - Mount a shared PVC across the cluster's nodes to amortize compilation. Mesh shape (`data × tensor`) is part of the cache key; changing `--dp-size` invalidates the cache.
 
-For full flag definitions see [`../../base/launch-flags-reference.md`](../../base/launch-flags-reference.md).
+For full flag definitions see [Launch flags reference](../../base/launch-flags-reference.md).
 
 ## 3. Invocation
 
 ### 3.1 Basic Chat Completion
 
-For full cURL + native `/generate` patterns see [`../../base/basic-api-usage.md`](../../base/basic-api-usage.md). For thinking + content streaming see §3.2.
+For full cURL + native `/generate` patterns see [Basic API usage](../../base/basic-api-usage.md). For thinking + content streaming see §3.2.
 
 Short Python OpenAI client example (replace `<rank0-ip>` with your rank-0 internal IP):
 
@@ -301,5 +297,5 @@ Max ITL (ms):                            1293.91
 ## Additional Resources
 
 - [Ling-2.6-1T model card](https://huggingface.co/inclusionAI/Ling-2.6-1T)
-- [`../../base/launch-flags-reference.md`](../../base/launch-flags-reference.md)
-- [`../../troubleshooting.md`](../../troubleshooting.md) — cross-recipe generic issues.
+- [Launch flags reference](../../base/launch-flags-reference.md)
+- [Cross-recipe troubleshooting](../../troubleshooting.md) — cross-recipe generic issues.

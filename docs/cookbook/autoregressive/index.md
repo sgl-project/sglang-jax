@@ -91,7 +91,7 @@ A model that generates text one token at a time, conditioning on its own previou
 - **MoE LLMs** — Qwen3-MoE / DeepSeek V2/V3/R1 / GLM-4.5 / Ling 2.6 / MiMo-V2-Flash / MiMo-V2.5-Pro / Kimi-Linear / Grok-2 (base).
 - **Vision-language decoders** — Qwen2.5-VL ingests image / video inputs, but the answer is still produced by an autoregressive generation stage.
 
-Diffusion image/video generation models live in [`../diffusion/`](../diffusion/index.md).
+Diffusion image/video generation models live in [Diffusion recipes](../diffusion/index.md).
 
 ## Picking a starting recipe to clone for a new model
 
@@ -102,7 +102,7 @@ Diffusion image/video generation models live in [`../diffusion/`](../diffusion/i
 | Single-host MoE with backend choice | [`Xiaomi/MiMo-V2-Flash.md`](Xiaomi/MiMo-V2-Flash.md) ✅ |
 | Vision-language chat | [`Qwen/Qwen2.5-VL.md`](Qwen/Qwen2.5-VL.md) ✅ |
 | Large multi-node MoE with GKE manifest | [`Xiaomi/MiMo-V2.5-Pro.md`](Xiaomi/MiMo-V2.5-Pro.md) ✅ |
-| Multi-node dense | [`Llama/Llama3.3-70B.md`](Llama/Llama3.3-70B.md) ✅ (+ [`../deployment/gke-indexed-job.md`](../deployment/gke-indexed-job.md)) |
+| Multi-node dense | [`Llama/Llama3.3-70B.md`](Llama/Llama3.3-70B.md) ✅ (+ [GKE Indexed Job launcher](../deployment/gke-indexed-job.md)) |
 | Base model (no chat template, `/v1/completions` flow) | [`Grok/Grok2.md`](Grok/Grok2.md) ✅ |
 | Linear-attention model with recurrent state | [`Moonshotai/Kimi-Linear.md`](Moonshotai/Kimi-Linear.md) ✅ or [`InclusionAI/Ling-2.6.md`](InclusionAI/Ling-2.6.md) ✅ |
 | Reasoning model (RL-tuned, `<think>` blocks) | [`DeepSeek/DeepSeek-R1.md`](DeepSeek/DeepSeek-R1.md) ✅ |

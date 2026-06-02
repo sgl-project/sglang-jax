@@ -35,16 +35,12 @@ title: "MiMo-V2-Flash"
 | **v7x-8** (minimum, dev) | 1 host × 4 chips | 4 | 1 | 4 chips → 8 JAX devices | 8 | 2 | 8 | `epmoe` | v7x exposes 2 JAX devices/chip; `--tp-size` counts devices not chips |
 | **v6e-16** (recommended, production) | 4x4 | 4 | 4 | 16 | 16 | 4 | 16 | `fused` | Multi-host required |
 
-See [`../base/tpu-topology-reference.md`](../../base/tpu-topology-reference.md) for the TPU generation / HBM / device-per-chip reference.
+See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation / HBM / device-per-chip reference.
 
 ### 2.2 Environment
 
-Install per [`../../get_started/install.md`](../../../get_started/install.md) and use one of the launcher templates from [`../deployment/`](../../deployment/). The required JAX TPU container image:
-
-| Hardware Platform               | Docker Image                                                       |
-|---|---|
-| TPU v5e / v5p / v6e (Trillium)  | `us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1` |
-| TPU v7x (Ironwood)              | `us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1` |
+Install per [install guide](../../../get_started/install.md) and use one of the launcher templates from [Deployment templates](../../deployment/).
+The required JAX TPU container image: `us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1` (covers v5e / v5p / v6e Trillium / v7x Ironwood).
 
 Extra pip for accuracy benchmarking only:
 
@@ -54,9 +50,9 @@ pip install evalscope==0.17.1
 
 ### 2.3 Launch
 
-#### Single-host (Docker) — TPU v7x-8
+#### Single-host — TPU v7x-8
 
-Boot a TPU container per [`../deployment/single-host-docker.md`](../../deployment/single-host-docker.md), then:
+Boot a TPU container per [Single-host Docker template](../../deployment/single-host-docker.md), then:
 
 ```bash
 JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -u -m sgl_jax.launch_server \
@@ -98,9 +94,9 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -u -m sgl_jax.launch_server \
 
 **Launcher** — wrap the above into GKE:
 
-- **GKE Indexed Job + headless Service** — adapt [`../deployment/gke-indexed-job.md`](../../deployment/gke-indexed-job.md). Differences from the template: `<JOB>=mimo-v2-flash`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=4x4`, `<N>=4`, `<MODEL_PATH>=XiaomiMiMo/MiMo-V2-Flash`, `<HTTP_PORT>=30000`, plus the launch flags above. `${NODE_RANK}` comes from `${JOB_COMPLETION_INDEX}`.
+- **GKE Indexed Job + headless Service** — adapt [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md). Differences from the template: `<JOB>=mimo-v2-flash`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=4x4`, `<N>=4`, `<MODEL_PATH>=XiaomiMiMo/MiMo-V2-Flash`, `<HTTP_PORT>=30000`, plus the launch flags above. `${NODE_RANK}` comes from `${JOB_COMPLETION_INDEX}`.
 
-For temporary v6e experiments, advanced users can adapt [`../deployment/skypilot.md`](../../deployment/skypilot.md) with the same launch flags.
+For temporary v6e experiments, advanced users can adapt [SkyPilot launcher](../../deployment/skypilot.md) with the same launch flags.
 
 ### 2.4 Configuration Tips
 
@@ -127,13 +123,13 @@ For temporary v6e experiments, advanced users can adapt [`../deployment/skypilot
 - `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache` is mandatory — without it, first request blocks ~4 min while XLA/Pallas re-compiles every kernel.
 - The cache keys on full kernel shape: changing `--page-size`, `--tp-size`, `--chunked-prefill-size`, or `--context-length` invalidates cached entries. Use a fresh cache dir per tuning experiment to avoid stale-cache cross-pollution.
 
-For full flag definitions and defaults see [`../base/launch-flags-reference.md`](../../base/launch-flags-reference.md).
+For full flag definitions and defaults see [Launch flags reference](../../base/launch-flags-reference.md).
 
 ## 3. Invocation
 
 ### 3.1 Basic Chat Completion
 
-For full cURL + native `/generate` patterns see [`../../base/basic-api-usage.md`](../../base/basic-api-usage.md). For thinking + content streaming see §3.2, for tool calling see §3.3.
+For full cURL + native `/generate` patterns see [Basic API usage](../../base/basic-api-usage.md). For thinking + content streaming see §3.2, for tool calling see §3.3.
 
 Short Python OpenAI client example (single-host v7x-8 default; for multi-host v6e-16 serving replace `127.0.0.1` with your rank-0 internal IP; thinking-off baseline):
 
@@ -481,6 +477,6 @@ The fused MoE tuned-config table covers the EP=8 shapes (server logs report `Usi
 ## Additional Resources
 
 - [MiMo-V2-Flash Model Card](https://huggingface.co/XiaomiMiMo/MiMo-V2-Flash)
-- [`../base/tpu-topology-reference.md`](../../base/tpu-topology-reference.md)
-- [`../base/launch-flags-reference.md`](../../base/launch-flags-reference.md)
-- [`../troubleshooting.md`](../../troubleshooting.md) — cross-recipe generic issues.
+- [TPU topology reference](../../base/tpu-topology-reference.md)
+- [Launch flags reference](../../base/launch-flags-reference.md)
+- [Cross-recipe troubleshooting](../../troubleshooting.md) — cross-recipe generic issues.

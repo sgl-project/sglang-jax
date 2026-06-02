@@ -27,20 +27,16 @@ title: "DeepSeek V2"
 |---|---|---|---|---|---|---|---|
 | DeepSeek-V2-Lite | v6e-4  | 2x2 | 1 | 4  | 4  | 4  | BF16 ~32 GB — single host |
 
-See [`../../base/tpu-topology-reference.md`](../../base/tpu-topology-reference.md) for the TPU generation reference.
+See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation reference.
 
 ### 2.2 Environment
 
-Install per [`../../../get_started/install.md`](../../../get_started/install.md). For V2-Lite single-host use [`../../deployment/single-host-docker.md`](../../deployment/single-host-docker.md). The required JAX TPU container image:
-
-| Hardware Platform               | Docker Image                                                       |
-|---|---|
-| TPU v5e / v5p / v6e (Trillium)  | `us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1` |
-| TPU v7x (Ironwood)              | `us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1` |
+Install per [install guide](../../../get_started/install.md). For V2-Lite single-host use [Single-host Docker template](../../deployment/single-host-docker.md).
+The required JAX TPU container image: `us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1` (covers v5e / v5p / v6e Trillium / v7x Ironwood).
 
 ### 2.3 Launch
 
-#### Single-host (Docker) — TPU v6e-4 (DeepSeek-V2-Lite)
+#### Single-host — TPU v6e-4 (DeepSeek-V2-Lite)
 
 ```bash
 JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -m sgl_jax.launch_server \
@@ -76,13 +72,13 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -m sgl_jax.launch_server \
 **Compilation Cache Hygiene:**
 - `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache` is mandatory — without it, first request blocks ~4 min per node.
 
-For full flag definitions see [`../../base/launch-flags-reference.md`](../../base/launch-flags-reference.md).
+For full flag definitions see [Launch flags reference](../../base/launch-flags-reference.md).
 
 ## 3. Invocation
 
 ### 3.1 Basic Chat Completion
 
-For full cURL + native `/generate` patterns see [`../../base/basic-api-usage.md`](../../base/basic-api-usage.md).
+For full cURL + native `/generate` patterns see [Basic API usage](../../base/basic-api-usage.md).
 
 Short Python OpenAI client example (replace `<rank0-ip>` with your rank-0 internal IP):
 
@@ -175,5 +171,5 @@ Mean TPOT (ms):                          7.41
 ## Additional Resources
 
 - [DeepSeek-V2-Lite model card](https://huggingface.co/deepseek-ai/DeepSeek-V2-Lite)
-- [`../../base/launch-flags-reference.md`](../../base/launch-flags-reference.md)
-- [`../../troubleshooting.md`](../../troubleshooting.md) — cross-recipe generic issues.
+- [Launch flags reference](../../base/launch-flags-reference.md)
+- [Cross-recipe troubleshooting](../../troubleshooting.md) — cross-recipe generic issues.

@@ -34,20 +34,16 @@ title: "Qwen3"
 | Qwen3-8B | v6e-4 | 2x2 | 4 | 4 | Single host; ~16 GB BF16 weights |
 | Qwen3-32B | v6e-4 | 2x2 | 4 | 4 | Single host; ~64 GB BF16 weights — fits with `--mem-fraction-static 0.8` |
 
-Both fit on a single v6e-4 host with `bfloat16`. See [`../base/tpu-topology-reference.md`](../../base/tpu-topology-reference.md) for the TPU generation reference.
+Both fit on a single v6e-4 host with `bfloat16`. See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation reference.
 
 ### 2.2 Environment
 
-Install per [`../../get_started/install.md`](../../../get_started/install.md) and use [`../deployment/single-host-docker.md`](../../deployment/single-host-docker.md) for the container setup. The required JAX TPU container image:
-
-| Hardware Platform               | Docker Image                                                       |
-|---|---|
-| TPU v5e / v5p / v6e (Trillium)  | `us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1` |
-| TPU v7x (Ironwood)              | `us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1` |
+Install per [install guide](../../../get_started/install.md) and use [Single-host Docker template](../../deployment/single-host-docker.md) for the container setup.
+The required JAX TPU container image: `us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1` (covers v5e / v5p / v6e Trillium / v7x Ironwood).
 
 ### 2.3 Launch
 
-#### Single-host (Docker) — TPU v6e-4
+#### Single-host — TPU v6e-4
 
 The same launch command works for both 8B and 32B — only `MODEL_NAME` changes:
 
@@ -69,9 +65,6 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python3 -u -m sgl_jax.launch_server \
   --host 0.0.0.0 --port 30000
 ```
 
-#### Multi-host
-
-Not needed — both 8B and 32B fit single-host on v6e-4.
 
 ### 2.4 Configuration Tips
 
@@ -91,13 +84,13 @@ Not needed — both 8B and 32B fit single-host on v6e-4.
 - `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache` is mandatory — without it, first request blocks ~4 min while XLA/Pallas re-compiles.
 - The cache keys on full kernel shape: changing `--page-size`, `--tp-size`, `--chunked-prefill-size`, or `--context-length` invalidates cached entries.
 
-For full flag definitions and defaults see [`../base/launch-flags-reference.md`](../../base/launch-flags-reference.md).
+For full flag definitions and defaults see [Launch flags reference](../../base/launch-flags-reference.md).
 
 ## 3. Invocation
 
 ### 3.1 Basic Chat Completion
 
-For full cURL + native `/generate` patterns see [`../../base/basic-api-usage.md`](../../base/basic-api-usage.md). For thinking + content streaming see §3.2, for tool calling see §3.3.
+For full cURL + native `/generate` patterns see [Basic API usage](../../base/basic-api-usage.md). For thinking + content streaming see §3.2, for tool calling see §3.3.
 
 Short Python OpenAI client example (thinking-off baseline):
 
@@ -317,7 +310,7 @@ To see the full set of `--tool-call-parser` keys available in your build, run `p
 
 ## 4. Benchmark
 
-> Benchmark data below is a snapshot pinned to the `Tested build` listed in each Test Environment; not refreshed on every release. The full archived ISL × OSL × batch matrix and chart images live in [`../../performance/qwen3_benchmark.md`](../../../performance/qwen3_benchmark.md) as a release-notes-style report.
+> Benchmark data below is a snapshot pinned to the `Tested build` listed in each Test Environment; not refreshed on every release. The full archived ISL × OSL × batch matrix and chart images live in [Qwen3 benchmark report](../../../performance/qwen3_benchmark.md) as a release-notes-style report.
 
 ### 4.1 Accuracy — GSM8K (thinking-on)
 
@@ -468,6 +461,6 @@ Lower than the 1977 tok/s c=64 table cell because c=16 leaves the batch under-fi
 ## Additional Resources
 
 - [Qwen Model Cards](https://huggingface.co/Qwen)
-- [`../../performance/qwen3_benchmark.md`](../../../performance/qwen3_benchmark.md) — full benchmark report with charts.
-- [`../base/launch-flags-reference.md`](../../base/launch-flags-reference.md)
-- [`../troubleshooting.md`](../../troubleshooting.md) — cross-recipe generic issues.
+- [Qwen3 benchmark report](../../../performance/qwen3_benchmark.md) — full benchmark report with charts.
+- [Launch flags reference](../../base/launch-flags-reference.md)
+- [Cross-recipe troubleshooting](../../troubleshooting.md) — cross-recipe generic issues.

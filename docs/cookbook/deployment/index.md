@@ -22,4 +22,4 @@ Launcher / orchestrator templates referenced by cookbook recipes. Model cookbook
 
 ## Picking flags
 
-For TP/EP/page-size/SWA-ratio choices, see the per-recipe Key Flags table. For the full flag inventory: [`../base/launch-flags-reference.md`](../base/launch-flags-reference.md). For TPU generation specs: [`../base/tpu-topology-reference.md`](../base/tpu-topology-reference.md).
+For TP/EP/page-size/SWA-ratio choices, see the per-recipe Key Flags table. For the full flag inventory: [Launch flags reference](../base/launch-flags-reference.md). For TPU generation specs: [TPU topology reference](../base/tpu-topology-reference.md).

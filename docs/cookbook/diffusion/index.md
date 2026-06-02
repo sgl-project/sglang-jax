@@ -31,7 +31,7 @@ End-to-end serving recipes for diffusion-style image and video generation models
 
 A diffusion recipe covers models where the expensive generation loop is denoising, not autoregressive token decoding. For Wan, SGL-JAX stages a text encoder, a DiT denoiser, and a VAE decoder; the endpoint returns an image or video artifact rather than chat tokens.
 
-Autoregressive text and vision-language decoders, including Qwen2.5-VL, live in [`../autoregressive/`](../autoregressive/index.md).
+Autoregressive text and vision-language decoders, including Qwen2.5-VL, live in [Autoregressive recipes](../autoregressive/index.md).
 
 ## Built-in Staging Constraint
 
@@ -48,10 +48,10 @@ Current cookbook-facing configuration summary:
 
 ## Shared references
 
-- [`../base/tpu-topology-reference.md`](../base/tpu-topology-reference.md) — TPU generation / HBM / topology.
-- [`../base/launch-flags-reference.md`](../base/launch-flags-reference.md) — launch flag full table; diffusion-specific flags appear when you run `python -m sgl_jax.launch_server --multimodal --help`.
-- [`../deployment/`](../deployment/) — launcher templates (single-host Docker, GKE Indexed Job, and advanced SkyPilot v6e experiments).
-- [`../troubleshooting.md`](../troubleshooting.md) — cross-recipe generic issues.
+- [TPU topology reference](../base/tpu-topology-reference.md) — TPU generation / HBM / topology.
+- [Launch flags reference](../base/launch-flags-reference.md) — launch flag full table; diffusion-specific flags appear when you run `python -m sgl_jax.launch_server --multimodal --help`.
+- [Deployment templates](../deployment/) — launcher templates (single-host Docker, GKE Indexed Job, and advanced SkyPilot v6e experiments).
+- [Cross-recipe troubleshooting](../troubleshooting.md) — cross-recipe generic issues.
 
 ## Picking a starting recipe to clone
 

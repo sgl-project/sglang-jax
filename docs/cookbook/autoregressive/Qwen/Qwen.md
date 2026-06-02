@@ -6,7 +6,7 @@ title: "Qwen-7B-Chat"
 
 > **Validated recipe** — empirically validated on TPU v6e-4 with sglang-jax 0.1.0.
 >
-> First-generation Qwen recipe. For Qwen3-8B / Qwen3-32B see [`Qwen3.md`](Qwen3.md).
+> First-generation Qwen recipe. For Qwen3-8B / Qwen3-32B see [Qwen3 recipe](Qwen3.md).
 
 ## 1. Model Introduction
 
@@ -30,18 +30,14 @@ title: "Qwen-7B-Chat"
 |---|---|---|---|---|
 | **v6e-4** (minimum and recommended) | 2x2 | 4 | 4 | Single host; v6e is 1:1 chip↔device |
 
-This recipe ships a single supported topology — Qwen-7B fits comfortably on v6e-4, and a larger slice provides no measurable benefit at 8K context. For larger Qwen sizes (8B / 32B) see [`Qwen3.md`](Qwen3.md).
+This recipe ships a single supported topology — Qwen-7B fits comfortably on v6e-4, and a larger slice provides no measurable benefit at 8K context. For larger Qwen sizes (8B / 32B) see [Qwen3 recipe](Qwen3.md).
 
-See [`../base/tpu-topology-reference.md`](../../base/tpu-topology-reference.md) for the TPU generation reference.
+See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation reference.
 
 ### 2.2 Environment
 
-Install per [`../../get_started/install.md`](../../../get_started/install.md) and use [`../deployment/single-host-docker.md`](../../deployment/single-host-docker.md) for the container setup. The required JAX TPU container image:
-
-| Hardware Platform               | Docker Image                                                       |
-|---|---|
-| TPU v5e / v5p / v6e (Trillium)  | `us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1` |
-| TPU v7x (Ironwood)              | `us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1` |
+Install per [install guide](../../../get_started/install.md) and use [Single-host Docker template](../../deployment/single-host-docker.md) for the container setup.
+The required JAX TPU container image: `us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1` (covers v5e / v5p / v6e Trillium / v7x Ironwood).
 
 Extra pip for accuracy benchmarking only:
 
@@ -51,7 +47,7 @@ pip install evalscope
 
 ### 2.3 Launch
 
-#### Single-host (Docker) — TPU v6e-4
+#### Single-host — TPU v6e-4
 
 ```bash
 JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -u -m sgl_jax.launch_server \
@@ -82,13 +78,13 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -u -m sgl_jax.launch_server \
 - `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache` is mandatory — without it, first request blocks ~4 min while XLA/Pallas re-compiles.
 - The cache keys on full kernel shape: changing `--page-size`, `--tp-size`, or context length invalidates cached entries.
 
-For full flag definitions and defaults see [`../base/launch-flags-reference.md`](../../base/launch-flags-reference.md).
+For full flag definitions and defaults see [Launch flags reference](../../base/launch-flags-reference.md).
 
 ## 3. Invocation
 
 ### 3.1 Basic Chat Completion
 
-For full cURL + native `/generate` patterns see [`../../base/basic-api-usage.md`](../../base/basic-api-usage.md).
+For full cURL + native `/generate` patterns see [Basic API usage](../../base/basic-api-usage.md).
 
 Short Python OpenAI client example:
 
@@ -221,7 +217,7 @@ Max ITL (ms):                            154.39
 ## Additional Resources
 
 - [Qwen Model Cards](https://huggingface.co/Qwen)
-- [`Qwen3.md`](Qwen3.md) — newer Qwen3 8B/32B recipe with framework comparison numbers.
+- [Qwen3 recipe](Qwen3.md) — newer Qwen3 8B/32B recipe with framework comparison numbers.
 - [JAX Scaling Book](https://jax-ml.github.io/scaling-book/)
-- [`../base/launch-flags-reference.md`](../../base/launch-flags-reference.md)
-- [`../troubleshooting.md`](../../troubleshooting.md) — cross-recipe generic issues.
+- [Launch flags reference](../../base/launch-flags-reference.md)
+- [Cross-recipe troubleshooting](../../troubleshooting.md) — cross-recipe generic issues.

@@ -10,7 +10,7 @@ title: "Qwen3-MoE"
 
 [**Qwen/Qwen3-30B-A3B**](https://huggingface.co/Qwen/Qwen3-30B-A3B) is Alibaba's MoE variant of the Qwen3 series — a sparse mixture-of-experts decoder with 30B total / 3B activated parameters and the same hybrid reasoning + tool-call format as dense Qwen3; multi-host on v6e-16.
 
-For the dense Qwen3 variants (8B / 32B) see [`Qwen3.md`](Qwen3.md).
+For the dense Qwen3 variants (8B / 32B) see [Qwen3 recipe](Qwen3.md).
 
 **Key Features**:
 
@@ -35,16 +35,12 @@ For the dense Qwen3 variants (8B / 32B) see [`Qwen3.md`](Qwen3.md).
 |---|---|---|---|---|---|---|---|
 | Qwen3-30B-A3B   | v6e-16 | 4x4 | 4  | 16 | 16 | 16 | BF16 ~60 GB  |
 
-See [`../base/tpu-topology-reference.md`](../../base/tpu-topology-reference.md) for the TPU generation reference.
+See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation reference.
 
 ### 2.2 Environment
 
-Install per [`../../get_started/install.md`](../../../get_started/install.md). For multi-host launches use [`../deployment/gke-indexed-job.md`](../../deployment/gke-indexed-job.md) as the primary user-facing path. Advanced users running temporary v6e experiments can adapt [`../deployment/skypilot.md`](../../deployment/skypilot.md). The required JAX TPU container image:
-
-| Hardware Platform               | Docker Image                                                       |
-|---|---|
-| TPU v5e / v5p / v6e (Trillium)  | `us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1` |
-| TPU v7x (Ironwood)              | `us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1` |
+Install per [install guide](../../../get_started/install.md). For multi-host launches use [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) as the primary user-facing path. Advanced users running temporary v6e experiments can adapt [SkyPilot launcher](../../deployment/skypilot.md).
+The required JAX TPU container image: `us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1` (covers v5e / v5p / v6e Trillium / v7x Ironwood).
 
 ### 2.3 Launch
 
@@ -52,7 +48,7 @@ Qwen3-30B-A3B is multi-host only.
 
 #### Multi-host (GKE Indexed Job) — TPU v6e-16 (Qwen3-30B-A3B)
 
-Use [`../../deployment/gke-indexed-job.md`](../../deployment/gke-indexed-job.md) with `<JOB>=qwen3-moe`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=4x4`, `parallelism: 4`, and `completions: 4`. Put these model-specific flags into `<LAUNCH_FLAGS>`:
+Use [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) with `<JOB>=qwen3-moe`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=4x4`, `parallelism: 4`, and `completions: 4`. Put these model-specific flags into `<LAUNCH_FLAGS>`:
 
 ```bash
   --model-path Qwen/Qwen3-30B-A3B \
@@ -70,7 +66,7 @@ Use [`../../deployment/gke-indexed-job.md`](../../deployment/gke-indexed-job.md)
 
 > Note: 30B-A3B uses `--moe-backend epmoe`, not `fused`. The fused MoE kernel requires `intermediate_size % 512 == 0`; Qwen3-30B-A3B's per-expert FFN inner dim is 768 (not a multiple of 512), so launching with `--moe-backend fused` raises `ValueError: Expected intermediate_size=768 to be aligned to bf=512`. See §2.4 MoE Backend.
 
-For temporary v6e experiments, advanced users can adapt [`../../deployment/skypilot.md`](../../deployment/skypilot.md) with the same launch flags. The model recipe does not require users to run repository-local SkyPilot helper scripts.
+For temporary v6e experiments, advanced users can adapt [SkyPilot launcher](../../deployment/skypilot.md) with the same launch flags. The model recipe does not require users to run repository-local SkyPilot helper scripts.
 
 ### 2.4 Configuration Tips
 
@@ -95,13 +91,13 @@ For temporary v6e experiments, advanced users can adapt [`../../deployment/skypi
 - `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache` is mandatory — without it, first request blocks ~4 min per node.
 - On multi-node clusters the cache is per-node. Mount a shared PVC to amortize compilation across all nodes.
 
-For full flag definitions see [`../base/launch-flags-reference.md`](../../base/launch-flags-reference.md).
+For full flag definitions see [Launch flags reference](../../base/launch-flags-reference.md).
 
 ## 3. Invocation
 
 ### 3.1 Basic Chat Completion
 
-For full cURL + native `/generate` patterns see [`../../base/basic-api-usage.md`](../../base/basic-api-usage.md). For thinking + content streaming see §3.2, for tool calling see §3.3.
+For full cURL + native `/generate` patterns see [Basic API usage](../../base/basic-api-usage.md). For thinking + content streaming see §3.2, for tool calling see §3.3.
 
 Short Python OpenAI client example (replace `<rank0-ip>` with your rank-0 internal IP; thinking-off baseline):
 
@@ -391,6 +387,6 @@ Mean ITL (ms):                           9.83
 ## Additional Resources
 
 - [Qwen3-30B-A3B model card](https://huggingface.co/Qwen/Qwen3-30B-A3B)
-- [`Qwen3.md`](Qwen3.md) — dense Qwen3-8B / 32B recipe (same reasoning/tool-call format).
-- [`../base/launch-flags-reference.md`](../../base/launch-flags-reference.md)
-- [`../troubleshooting.md`](../../troubleshooting.md) — cross-recipe generic issues.
+- [Qwen3 recipe](Qwen3.md) — dense Qwen3-8B / 32B recipe (same reasoning/tool-call format).
+- [Launch flags reference](../../base/launch-flags-reference.md)
+- [Cross-recipe troubleshooting](../../troubleshooting.md) — cross-recipe generic issues.

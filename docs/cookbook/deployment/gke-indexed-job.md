@@ -11,7 +11,7 @@ Generic GKE template for launching a multi-host TPU slice serving SGL-JAX. This 
 Multi-host JAX needs:
 1. **A stable rank-0 hostname** for `--dist-init-addr`. Indexed Job gives every pod the index `${JOB_COMPLETION_INDEX}`; combined with a headless Service the pod `0` becomes `<job>-0.<svc>` permanently.
 2. **TPU process address fanout**. The JAX TPU runtime expects `TPU_PROCESS_ADDRESSES` listing every node's `host:8471`. Headless DNS makes those names enumerable.
-3. **No restarts on crash**. `restartPolicy: Never` + `backoffLimit: 0` — if one pod dies, the whole job fails fast rather than partial restart that would desync ranks.
+3. **Recovery from transient blips**. Set `restartPolicy: Never` (rank assignment must stay stable per pod lifetime) + `backoffLimit: 16` — if a GKE control-plane blip evicts the pods, the Job creates replacements that pick up the same `${JOB_COMPLETION_INDEX}` (and the warm JIT cache, if you mounted one). The cookbook recipes uniformly use `backoffLimit: 16`.
 
 ## Manifest template
 

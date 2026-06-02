@@ -14,7 +14,7 @@ title: "Kimi-Linear"
 
 - **Sparse MoE, 48B total / 3B activated**: Only 3B parameters fire per token — MoE economy with single-expert-class latency. Instruction-tuned chat model.
 - **Kimi Delta Attention (linear attention)**: Replaces softmax attention with a linear-attention variant — prefill cost scales near-linearly with sequence length, big win on long prompts (see §3.2 long-context streaming).
-- **Hybrid recurrent state pool**: Linear-attention layers carry a recurrent state alongside the KV cache; `--recurrent-state-memory-ratio` (default 0.9) budgets recurrent vs KV HBM. **Requires `--disable-radix-cache`** (prefix sharing is unsafe with recurrent state).
+- **Hybrid recurrent state pool**: Linear-attention layers carry a recurrent state alongside the KV cache; `--recurrent-state-memory-ratio` (default 0.9) budgets recurrent vs KV HBM. **Requires `--disable-radix-cache`** — prefix / radix caching for hybrid recurrent models is planned but not yet shipped.
 - **Long-context throughput focus**: Designed to amortize prefill on tens-of-thousands-of-token prompts — pair with streaming output for best perceived latency.
 - **Multi-host serving**: Validated on TPU v6e-16 (minimum) and v6e-32 (recommended); GSM8K **0.925 / 0.935** (§4.1).
 
@@ -31,22 +31,18 @@ title: "Kimi-Linear"
 | Minimum runnable | Kimi-Linear-48B-A3B | v6e-16 | 4x4 | 4 | 16 | 16 | BF16 ~96 GB — multi-host required to fit weights + recurrent state pool |
 | Recommended production | Kimi-Linear-48B-A3B | v6e-32 | 4x8 | 8 | 32 | 32 | More HBM per active expert and larger recurrent state budget for long-prompt linear-attention workloads |
 
-See [`../base/tpu-topology-reference.md`](../../base/tpu-topology-reference.md) for the TPU generation reference.
+See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation reference.
 
 ### 2.2 Environment
 
-Install per [`../../get_started/install.md`](../../../get_started/install.md). Multi-host recommended at this size — use [`../deployment/gke-indexed-job.md`](../../deployment/gke-indexed-job.md) as the primary user-facing path. Advanced users running temporary v6e experiments can adapt [`../deployment/skypilot.md`](../../deployment/skypilot.md). The required JAX TPU container image:
-
-| Hardware Platform               | Docker Image                                                       |
-|---|---|
-| TPU v5e / v5p / v6e (Trillium)  | `us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1` |
-| TPU v7x (Ironwood)              | `us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1` |
+Install per [install guide](../../../get_started/install.md). Multi-host recommended at this size — use [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) as the primary user-facing path. Advanced users running temporary v6e experiments can adapt [SkyPilot launcher](../../deployment/skypilot.md).
+The required JAX TPU container image: `us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1` (covers v5e / v5p / v6e Trillium / v7x Ironwood).
 
 ### 2.3 Launch
 
 #### Multi-host (GKE Indexed Job) — TPU v6e-16
 
-Use [`../../deployment/gke-indexed-job.md`](../../deployment/gke-indexed-job.md) with `<JOB>=kimi-linear`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=4x4`, `parallelism: 4`, and `completions: 4`. Put these model-specific flags into `<LAUNCH_FLAGS>`:
+Use [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) with `<JOB>=kimi-linear`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=4x4`, `parallelism: 4`, and `completions: 4`. Put these model-specific flags into `<LAUNCH_FLAGS>`:
 
 ```bash
   --model-path moonshotai/Kimi-Linear-48B-A3B-Instruct \
@@ -82,12 +78,12 @@ Same template with `<TOPOLOGY>=4x8`, `parallelism: 8`, `completions: 8`, and `--
   --skip-server-warmup
 ```
 
-For temporary v6e experiments, advanced users can adapt [`../../deployment/skypilot.md`](../../deployment/skypilot.md) with the same launch flags. The model recipe does not require users to run repository-local SkyPilot helper scripts.
+For temporary v6e experiments, advanced users can adapt [SkyPilot launcher](../../deployment/skypilot.md) with the same launch flags. The model recipe does not require users to run repository-local SkyPilot helper scripts.
 
 ### 2.4 Configuration Tips
 
 **Mandatory: `--disable-radix-cache` for hybrid recurrent state:**
-- Kimi-Linear is a hybrid recurrent state model — radix prefix sharing is unsafe with the recurrent state pool. Without `--disable-radix-cache` startup asserts: `Hybrid recurrent state models require --disable-radix-cache (prefix sharing is unsafe with recurrent state)`.
+- Kimi-Linear is a hybrid recurrent state model — prefix / radix caching for hybrid recurrent models is planned but not yet shipped. Until it lands, `--disable-radix-cache` is required at launch; without it the server asserts: `Hybrid recurrent state models require --disable-radix-cache`.
 
 **Recurrent State Pool (linear-attention specific):**
 - `--recurrent-state-memory-ratio 0.9` (default) budgets the recurrent state pool against the KV cache. The recurrent pool gets `available * ratio / (1 + ratio)` of free HBM.
@@ -105,13 +101,13 @@ For temporary v6e experiments, advanced users can adapt [`../../deployment/skypi
 - `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache` is mandatory — without it, first request blocks ~4 min per node.
 - Mount a shared PVC across the cluster's 4 nodes to amortize compilation.
 
-For full flag definitions see [`../base/launch-flags-reference.md`](../../base/launch-flags-reference.md).
+For full flag definitions see [Launch flags reference](../../base/launch-flags-reference.md).
 
 ## 3. Invocation
 
 ### 3.1 Basic Chat Completion
 
-For full cURL + native `/generate` patterns see [`../../base/basic-api-usage.md`](../../base/basic-api-usage.md). For long-context streaming see §3.2.
+For full cURL + native `/generate` patterns see [Basic API usage](../../base/basic-api-usage.md). For long-context streaming see §3.2.
 
 Short Python OpenAI client example (replace `<rank0-ip>` with your rank-0 internal IP):
 
@@ -159,7 +155,7 @@ for chunk in stream:
 print()
 ```
 
-> Kimi-Linear-Instruct ships with a chat template but no native reasoning or tool-call format. For reasoning / tool-call workloads, pick a model with `--reasoning-parser` / `--tool-call-parser` support — see the **Parser key reference** table in [`../index.md`](../index.md#parser-key-reference) for the list of cookbook recipes with reasoning / tool-call parsers registered.
+> Kimi-Linear-Instruct ships with a chat template but no native reasoning or tool-call format. For reasoning / tool-call workloads, pick a model with `--reasoning-parser` / `--tool-call-parser` support — see the **Parser key reference** table in [Parser key reference](../index.md#parser-key-reference) for the list of cookbook recipes with reasoning / tool-call parsers registered.
 
 ## 4. Benchmark
 
@@ -222,7 +218,7 @@ v6e-32 delivers ~5% throughput / 13% TTFT improvement over v6e-16. Scaling is su
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| `AssertionError: Hybrid recurrent state models require --disable-radix-cache` at startup | Radix prefix sharing incompatible with recurrent state pool | Pass `--disable-radix-cache` (mandatory for Kimi-Linear) — see §2.4. |
+| `AssertionError: Hybrid recurrent state models require --disable-radix-cache` at startup | Prefix / radix caching for hybrid recurrent models is planned but not yet shipped. | Pass `--disable-radix-cache` (mandatory for Kimi-Linear until the caching path lands) — see §2.4. |
 | `RegisterTask DEADLINE_EXCEEDED` (5 min) on multi-host launch | Ranks dispatched too far apart — the JAX distributed service has a 5-min RPC deadline | Dispatch all ranks within seconds of each other (parallel `kubectl exec`); a >5-min stagger between ranks fails registration on the early-arriving ranks. |
 | OOM at startup | Recurrent state + KV exceed budget | Lower `--recurrent-state-memory-ratio` (e.g. to 0.7) and/or `--mem-fraction-static` to 0.88. |
 | Long-prompt requests stall | KV cache exhausted before recurrent state | Lower `--recurrent-state-memory-ratio` to give the KV cache more headroom. |
@@ -232,5 +228,5 @@ v6e-32 delivers ~5% throughput / 13% TTFT improvement over v6e-16. Scaling is su
 ## Additional Resources
 
 - [Kimi-Linear model card](https://huggingface.co/moonshotai/Kimi-Linear-48B-A3B-Instruct)
-- [`../base/launch-flags-reference.md`](../../base/launch-flags-reference.md)
-- [`../troubleshooting.md`](../../troubleshooting.md) — cross-recipe generic issues.
+- [Launch flags reference](../../base/launch-flags-reference.md)
+- [Cross-recipe troubleshooting](../../troubleshooting.md) — cross-recipe generic issues.

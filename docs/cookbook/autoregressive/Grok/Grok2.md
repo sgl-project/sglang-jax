@@ -37,16 +37,12 @@ title: "Grok-2"
 
 **Pre-sharded TP=8 constraint**: the checkpoint files are named `pytorch_model-NNNNN-TP-{000..007}.safetensors` — `--tp-size` must be a multiple of 8 so the loader can map each pre-shard onto a contiguous device slice. v6e-64 (`tp=64=8×8`), v6e-32 (`tp=32=8×4`), and v7x-16 (`tp=32=8×4` over 32 JAX devices) all satisfy this.
 
-See [`../../base/tpu-topology-reference.md`](../../base/tpu-topology-reference.md) for the TPU generation reference.
+See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation reference.
 
 ### 2.2 Environment
 
-Install per [`../../../get_started/install.md`](../../../get_started/install.md). **Build pin**: use sglang-jax 0.1.0 or later. For multi-host serving, use [`../../deployment/gke-indexed-job.md`](../../deployment/gke-indexed-job.md) as the primary user-facing path. Advanced users running temporary v6e experiments can adapt [`../../deployment/skypilot.md`](../../deployment/skypilot.md). The required JAX TPU container image:
-
-| Hardware Platform               | Docker Image                                                       |
-|---|---|
-| TPU v5e / v5p / v6e (Trillium)  | `us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1` |
-| TPU v7x (Ironwood)              | `us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1` |
+Install per [install guide](../../../get_started/install.md). **Build pin**: use sglang-jax 0.1.0 or later. For multi-host serving, use [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) as the primary user-facing path. Advanced users running temporary v6e experiments can adapt [SkyPilot launcher](../../deployment/skypilot.md).
+The required JAX TPU container image: `us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1` (covers v5e / v5p / v6e Trillium / v7x Ironwood).
 
 The community tokenizer is downloaded on first launch — no extra pip needed beyond standard install. For evaluation, additionally install `evalscope`:
 
@@ -56,11 +52,14 @@ pip install evalscope==0.17.1
 
 ### 2.3 Launch
 
-Grok-2 is multi-host only; cannot fit single-host.
+Grok-2 is multi-host only; cannot fit single-host. Two paths below:
+
+- **TPU v6e-64 (16 nodes)** — the validated production target. Use this unless v6e-64 capacity is unavailable.
+- **TPU v6e-32 (8 nodes, starter)** — smaller-slice fallback when v6e-64 isn't available. Same launch shape with `--tp-size 32`; expect tighter HBM headroom and lower throughput. Not yet validated end-to-end.
 
 #### Multi-host (GKE Indexed Job) — TPU v6e-64 (16 nodes)
 
-Use [`../../deployment/gke-indexed-job.md`](../../deployment/gke-indexed-job.md) with `<JOB>=grok-2`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=8x8`, `parallelism: 16`, `completions: 16`, and `backoffLimit: 16`. Put these model-specific flags into `<LAUNCH_FLAGS>`:
+Use [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) with `<JOB>=grok-2`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=8x8`, `parallelism: 16`, `completions: 16`, and `backoffLimit: 16`. Put these model-specific flags into `<LAUNCH_FLAGS>`:
 
 ```bash
   --model-path /models/grok-2 \
@@ -90,7 +89,7 @@ Change `<TOPOLOGY>=4x8`, `parallelism: 8`, `completions: 8`, and adjust the para
 
 The other flags stay identical. v6e-32 is the smallest slice the pre-sharded TP=8 layout fits cleanly on; v6e-16 doesn't satisfy `tp_size % 8 == 0` constraints cleanly without dp.
 
-For temporary v6e experiments, advanced users can adapt [`../../deployment/skypilot.md`](../../deployment/skypilot.md) with the same launch flags. The model recipe does not require users to run repository-local SkyPilot helper scripts.
+For temporary v6e experiments, advanced users can adapt [SkyPilot launcher](../../deployment/skypilot.md) with the same launch flags. The model recipe does not require users to run repository-local SkyPilot helper scripts.
 
 ### 2.4 Configuration Tips
 
@@ -121,13 +120,13 @@ For temporary v6e experiments, advanced users can adapt [`../../deployment/skypi
 - `JAX_COMPILATION_CACHE_DIR` is mandatory — without it, first request blocks ~5-10 min per node (smaller than 1T-class models but still non-trivial).
 - On multi-node clusters, mount a shared PVC at the cache directory so all 16 nodes share warmups. Mesh shape (`data × tensor`) is part of the cache key; changing `--tp-size` or `--ep-size` invalidates the cache.
 
-For full flag definitions and defaults see [`../../base/launch-flags-reference.md`](../../base/launch-flags-reference.md).
+For full flag definitions and defaults see [Launch flags reference](../../base/launch-flags-reference.md).
 
 ## 3. Invocation
 
 ### 3.1 Basic Text Completion (base model)
 
-For the standard cURL / Python `requests` / OpenAI client / native `/generate` patterns see [`../../base/basic-api-usage.md`](../../base/basic-api-usage.md). Grok-2 is a base model with no chat template — use the raw `/v1/completions` endpoint, not `/v1/chat/completions`. Replace `127.0.0.1` with your rank-0 internal IP:
+For the standard cURL / Python `requests` / OpenAI client / native `/generate` patterns see [Basic API usage](../../base/basic-api-usage.md). Grok-2 is a base model with no chat template — use the raw `/v1/completions` endpoint, not `/v1/chat/completions`. Replace `127.0.0.1` with your rank-0 internal IP:
 
 ```bash
 curl -X POST http://<rank0-ip>:30000/v1/completions \
@@ -158,7 +157,7 @@ print(resp.choices[0].text)
 
 > **Why not `/v1/chat/completions`?** Grok-2 has no chat template — sending `messages` either fails (no template registered) or wraps the prompt in a community-grafted template the model wasn't trained on. The community-template path looks superficially OK on single-turn sanity prompts but silently degrades accuracy on chat-format eval datasets: the model doesn't emit EOS at the end of a short answer and continues in-context with self-generated follow-ups (see §5 troubleshooting; per design §6.F base models skip §4 Accuracy entirely).
 
-> Grok-2 has no hybrid reasoning or native tool-calling format. For those workloads, see the **Parser key reference** in [`../index.md`](../index.md#parser-key-reference) for the list of cookbook recipes with reasoning / tool-call parsers registered.
+> Grok-2 has no hybrid reasoning or native tool-calling format. For those workloads, see the **Parser key reference** in [Parser key reference](../index.md#parser-key-reference) for the list of cookbook recipes with reasoning / tool-call parsers registered.
 
 ## 4. Benchmark
 
@@ -256,7 +255,7 @@ Max ITL (ms):                            1270.39
 
 - [Grok-2 Model Card](https://huggingface.co/xai-org/grok-2)
 - [Community tokenizer](https://huggingface.co/alvarobartt/grok-2-tokenizer)
-- [`../../deployment/gke-indexed-job.md`](../../deployment/gke-indexed-job.md) — primary multi-host launcher template.
-- [`../../deployment/skypilot.md`](../../deployment/skypilot.md) — advanced v6e experiment alternative.
-- [`../../base/launch-flags-reference.md`](../../base/launch-flags-reference.md)
-- [`../../troubleshooting.md`](../../troubleshooting.md) — cross-recipe generic issues.
+- [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) — primary multi-host launcher template.
+- [SkyPilot launcher](../../deployment/skypilot.md) — advanced v6e experiment alternative.
+- [Launch flags reference](../../base/launch-flags-reference.md)
+- [Cross-recipe troubleshooting](../../troubleshooting.md) — cross-recipe generic issues.
