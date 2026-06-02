@@ -25,6 +25,20 @@ def replicate_to_mesh(
     return out[0] if len(out) == 1 else out
 
 
+def _can_use_fused_greedy_decode_step3(model_worker_batch: ModelWorkerBatch) -> bool:
+    sampling_info = getattr(model_worker_batch, "sampling_info", None)
+    if sampling_info is None or not getattr(sampling_info, "is_all_greedy", False):
+        return False
+    if getattr(model_worker_batch, "speculative_eagle_topk", None) != 1:
+        return False
+    if getattr(model_worker_batch, "speculative_num_steps", None) != 3:
+        return False
+    if getattr(model_worker_batch, "speculative_num_draft_tokens", None) != 4:
+        return False
+    seq_lens = getattr(model_worker_batch, "seq_lens", None)
+    return seq_lens is not None and len(seq_lens) == 32
+
+
 class BaseDraftWorker(ABC):
     """Draft model worker interface for speculative decoding.
 
@@ -141,6 +155,9 @@ class BaseSpecWorker:
         cur_allocate_lens = np.asarray(model_worker_batch.spec_info_padded.allocate_lens)[sel]
         self.draft_worker.draft(model_worker_batch)
         batch_output = self.verify(model_worker_batch, cur_allocate_lens)
+        model_worker_batch.use_fused_greedy_decode_step3 = _can_use_fused_greedy_decode_step3(
+            model_worker_batch
+        )
         self.draft_worker.draft_extend_for_decode(model_worker_batch, batch_output)
         return batch_output
 
