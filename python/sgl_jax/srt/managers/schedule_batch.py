@@ -2390,7 +2390,48 @@ class ScheduleBatch:
             # Pad to total_bs
             lora_ids = lora_ids + ["0"] * (total_bs - real_bs)
 
-        # input_embedding = None
+        # Reassemble multimodal input_embedding (DP-aware).
+        #
+        # Mirrors the per-req slice/concat/pad logic from 785f3806 but scatters
+        # into the DP-interleaved padded token layout produced by
+        # _merge_input_and_positions: per-DP-rank slot stride is
+        # per_dp_token_padding, and within a rank the per-req EXTEND window is
+        # [prefix_len, seq_len) -- the same zip(info.seq_lens, info.prefix_lens)
+        # order used to build positions. The result aligns 1:1 with
+        # input_ids_cpu so forward_batch.input_embedding[k] matches
+        # input_ids[k]; trailing padding rows stay zero.
+        input_embedding = None
+        if self.forward_mode.is_extend() and any(
+            getattr(req, "multimodal_embedding", None) is not None
+            for info in self.reqs_info
+            if info.reqs
+            for req in info.reqs
+        ):
+            emb = None
+            offset = 0
+            for dp_rank in range(self.dp_size):
+                info = self.reqs_info[dp_rank]
+                if not info.reqs or info.seq_lens is None or len(info.seq_lens) == 0:
+                    offset += per_dp_token_padding
+                    continue
+                local = 0
+                for req, seq_len, prefix_len in zip(info.reqs, info.seq_lens, info.prefix_lens):
+                    ext_len = int(seq_len) - int(prefix_len)
+                    mm = getattr(req, "multimodal_embedding", None)
+                    if mm is not None and ext_len > 0:
+                        mm_full = np.asarray(mm)
+                        start = int(prefix_len or 0)
+                        end = start + ext_len
+                        chunk = mm_full[start:end]
+                        if emb is None:
+                            emb = np.zeros(
+                                (total_token_size, mm_full.shape[1]),
+                                dtype=mm_full.dtype,
+                            )
+                        emb[offset + local : offset + local + chunk.shape[0]] = chunk
+                    local += ext_len
+                offset += per_dp_token_padding
+            input_embedding = emb
 
         # Merge per-DP top_logprobs_nums / token_ids_logprobs with the same
         # offset_bs += per_dp_bs_padding padding scheme used in _merge_batch_metadata.
@@ -2496,7 +2537,7 @@ class ScheduleBatch:
             dp_size=self.dp_size,
             per_dp_bs_size=per_dp_bs_padding,
             launch_done=self.launch_done,
-            input_embedding=None,
+            input_embedding=input_embedding,
             apply_for_deepstack=False,
             deepstack_visual_embedding=None,
             recurrent_indices=recurrent_indices_cpu,
