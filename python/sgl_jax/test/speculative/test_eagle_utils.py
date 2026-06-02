@@ -14,6 +14,99 @@ from sgl_jax.test.test_utils import CustomTestCase
 
 
 class TestVerifyTree(CustomTestCase):
+    def test_verify_tree_greedy_device_outputs_match_host_postprocess(self):
+        from sgl_jax.srt.speculative.eagle_util import greedy_sample_device_outputs
+
+        speculative_num_steps = 3
+        num_draft_tokens = 4
+        draft_tokens = jnp.array(
+            [
+                11,
+                12,
+                13,
+                14,
+                21,
+                22,
+                23,
+                24,
+            ],
+            dtype=jnp.int32,
+        )
+        retrive_index = jnp.array(
+            [
+                [0, 1, 2, 3],
+                [4, 5, 6, 7],
+            ],
+            dtype=jnp.int32,
+        )
+        retrive_next_token = jnp.array(
+            [
+                [1, 2, 3, -1],
+                [1, 2, 3, -1],
+            ],
+            dtype=jnp.int32,
+        )
+        retrive_next_sibling = jnp.full((2, 4), -1, dtype=jnp.int32)
+        vocab = 32
+        logits = jnp.full((8, vocab), 1.0, dtype=jnp.float32)
+        logits = logits.at[0, 11].set(10.0)
+        logits = logits.at[1, 12].set(10.0)
+        logits = logits.at[2, 99 % vocab].set(10.0)
+        logits = logits.at[3, 14].set(10.0)
+        logits = logits.at[4, 21].set(10.0)
+        logits = logits.at[5, 22].set(10.0)
+        logits = logits.at[6, 23].set(10.0)
+        logits = logits.at[7, 24].set(10.0)
+
+        from sgl_jax.srt.speculative import eagle_util
+
+        def fake_verify_tree_greedy(**kwargs):
+            return (
+                jnp.array([[0, 1, -1, -1], [4, 5, 6, -1]], dtype=jnp.int32),
+                jnp.array([2, 3], dtype=jnp.int32),
+                jnp.array(
+                    [
+                        [11, 12, 0, 0, 99],
+                        [21, 22, 23, 0, 88],
+                    ],
+                    dtype=jnp.int32,
+                ),
+            )
+
+        old_verify_tree_greedy = eagle_util.verify_tree_greedy
+        eagle_util.verify_tree_greedy = fake_verify_tree_greedy
+        try:
+            outputs = greedy_sample_device_outputs(
+                speculative_num_steps=speculative_num_steps,
+                num_draft_tokens=num_draft_tokens,
+                draft_tokens=draft_tokens,
+                retrive_index=retrive_index,
+                retrive_next_token=retrive_next_token,
+                retrive_next_sibling=retrive_next_sibling,
+                next_token_logits=logits,
+            )
+        finally:
+            eagle_util.verify_tree_greedy = old_verify_tree_greedy
+
+        expected_accept_index = np.array([0, 1, -1, -1, 4, 5, 6, -1], dtype=np.int32)
+        expected_accept_length = np.array([3, 4], dtype=np.int32)
+        req_ids = np.arange(len(expected_accept_index)) // (speculative_num_steps + 1)
+        expected_safe_index = np.where(
+            expected_accept_index >= 0,
+            expected_accept_index,
+            req_ids * num_draft_tokens + num_draft_tokens - 1,
+        )
+        expected_predict = np.array([[11, 12, 0, 0, 99], [21, 22, 23, 0, 88]], dtype=np.int32)
+        expected_verified_id = np.array([11, 12, 0, 0, 99, 21, 22, 0], dtype=np.int32)
+        expected_select_index = np.array([2, 7], dtype=np.int32)
+
+        np.testing.assert_array_equal(np.asarray(outputs.predict), expected_predict)
+        np.testing.assert_array_equal(np.asarray(outputs.accept_index), expected_accept_index)
+        np.testing.assert_array_equal(np.asarray(outputs.accept_length), expected_accept_length)
+        np.testing.assert_array_equal(np.asarray(outputs.safe_index), expected_safe_index)
+        np.testing.assert_array_equal(np.asarray(outputs.verified_id), expected_verified_id)
+        np.testing.assert_array_equal(np.asarray(outputs.select_index), expected_select_index)
+
     def test_verify_tree_greedy(self):
         candidates = jnp.array(
             [
