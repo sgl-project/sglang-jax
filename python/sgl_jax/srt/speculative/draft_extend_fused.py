@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 from functools import partial
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -23,6 +24,54 @@ from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 logger = logging.getLogger(__name__)
+
+
+class GreedyVerifyPostprocessOutput(NamedTuple):
+    next_token_logits: jax.Array
+    hidden_states: jax.Array
+    positions: jax.Array
+    new_seq_lens: jax.Array
+    select_index: jax.Array
+    verified_id: jax.Array
+    accept_lens: jax.Array
+
+
+@partial(
+    jax.jit,
+    static_argnames=["speculative_num_steps", "speculative_num_draft_tokens"],
+)
+def _greedy_verify_postprocess_jit(
+    next_token_logits,
+    hidden_states,
+    positions,
+    seq_lens,
+    accept_index,
+    accept_length,
+    verified_id,
+    *,
+    speculative_num_steps,
+    speculative_num_draft_tokens,
+):
+    accept_width = speculative_num_steps + 1
+    req_ids = jnp.arange(accept_index.shape[0], dtype=jnp.int32) // accept_width
+    per_req_last = req_ids * speculative_num_draft_tokens + speculative_num_draft_tokens - 1
+    safe_index = jnp.where(accept_index >= 0, accept_index, per_req_last)
+    gathered_logits = next_token_logits[safe_index, :]
+    gathered_hidden = hidden_states[safe_index, :]
+    gathered_positions = positions[safe_index]
+    new_seq_lens = seq_lens + accept_length
+    select_index = (
+        jnp.arange(accept_length.shape[0], dtype=jnp.int32) * accept_width + accept_length - 1
+    )
+    return GreedyVerifyPostprocessOutput(
+        next_token_logits=gathered_logits,
+        hidden_states=gathered_hidden,
+        positions=gathered_positions,
+        new_seq_lens=new_seq_lens,
+        select_index=select_index,
+        verified_id=verified_id,
+        accept_lens=accept_length,
+    )
 
 
 def _device_rotate_input_ids(input_ids, ext_lens, sel_pos, new_tokens):
