@@ -793,16 +793,31 @@ def greedy_sample_device_outputs(
     retrive_next_token: jax.Array,
     retrive_next_sibling: jax.Array,
     next_token_logits: jax.Array,
+    mesh: Mesh | None = None,
 ) -> GreedySampleDeviceOutputs:
-    accept_index_2d, accept_length_raw, predict = verify_tree_greedy(
-        speculative_num_steps=speculative_num_steps,
-        num_draft_tokens=num_draft_tokens,
-        draft_tokens=draft_tokens,
-        retrive_index=retrive_index,
-        retrive_next_token=retrive_next_token,
-        retrive_next_sibling=retrive_next_sibling,
-        next_token_logits=next_token_logits,
-    )
+    def _run_verify_tree_greedy():
+        return verify_tree_greedy(
+            speculative_num_steps=speculative_num_steps,
+            num_draft_tokens=num_draft_tokens,
+            draft_tokens=draft_tokens,
+            retrive_index=retrive_index,
+            retrive_next_token=retrive_next_token,
+            retrive_next_sibling=retrive_next_sibling,
+            next_token_logits=next_token_logits,
+        )
+
+    if mesh is None:
+        accept_index_2d, accept_length_raw, predict = _run_verify_tree_greedy()
+    else:
+        try:
+            ctx = jax.sharding.use_mesh(mesh)
+        except AttributeError:
+            try:
+                ctx = jax.set_mesh(mesh)
+            except AttributeError:
+                ctx = mesh
+        with ctx:
+            accept_index_2d, accept_length_raw, predict = _run_verify_tree_greedy()
     accept_length = accept_length_raw + 1
     accept_width = speculative_num_steps + 1
     accept_index = accept_index_2d.reshape(-1)

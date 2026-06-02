@@ -1,11 +1,16 @@
 from types import SimpleNamespace
 
+import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
+from jax.sharding import AxisType, Mesh, NamedSharding
+from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.speculative.draft_extend_fused import (
-    GreedyVerifyPostprocessOutput,
+    _greedy_step3_prepare_draft_inputs,
     _greedy_verify_postprocess_jit,
+    _replicate_for_host_output,
 )
 
 
@@ -38,6 +43,104 @@ def test_greedy_verify_postprocess_safe_index_matches_host_logic():
     np.testing.assert_array_equal(np.asarray(out.select_index), np.array([1, 6], dtype=np.int32))
     np.testing.assert_array_equal(np.asarray(out.verified_id), np.asarray(verified_id))
     np.testing.assert_array_equal(np.asarray(out.accept_lens), np.asarray(accept_length))
+
+
+def test_greedy_step3_prepare_draft_inputs_matches_safe_index_logic():
+    hidden = jnp.arange(8 * 5, dtype=jnp.float32).reshape(8, 5)
+    positions = jnp.arange(8, dtype=jnp.int32) + 100
+    seq_lens = jnp.array([10, 20], dtype=jnp.int32)
+    accept_index = jnp.array([0, 1, -1, -1, 4, 5, 6, -1], dtype=jnp.int32)
+    accept_length = jnp.array([2, 3], dtype=jnp.int32)
+    verified_id = jnp.array([11, 12, 0, 0, 21, 22, 23, 0], dtype=jnp.int32)
+
+    out = _greedy_step3_prepare_draft_inputs(
+        hidden,
+        positions,
+        seq_lens,
+        accept_index,
+        accept_length,
+        verified_id,
+        speculative_num_steps=3,
+        speculative_num_draft_tokens=4,
+    )
+
+    safe_index = np.array([0, 1, 3, 3, 4, 5, 6, 7], dtype=np.int32)
+    np.testing.assert_array_equal(np.asarray(out.hidden_states), np.asarray(hidden)[safe_index])
+    np.testing.assert_array_equal(np.asarray(out.positions), np.asarray(positions)[safe_index])
+    np.testing.assert_array_equal(np.asarray(out.new_seq_lens), np.array([12, 23], dtype=np.int32))
+    np.testing.assert_array_equal(np.asarray(out.select_index), np.array([1, 6], dtype=np.int32))
+    np.testing.assert_array_equal(np.asarray(out.verified_id), np.asarray(verified_id))
+    np.testing.assert_array_equal(np.asarray(out.accept_lens), np.asarray(accept_length))
+    np.testing.assert_array_equal(np.asarray(out.sel_pos), np.array([1, 2], dtype=np.int32))
+
+
+def test_greedy_step3_prepare_draft_inputs_preserves_position_data_sharding():
+    devices = np.asarray(jax.devices())
+    if devices.size < 4:
+        pytest.skip("requires at least 4 JAX devices for a 2x2 mesh")
+
+    mesh = Mesh(
+        devices[:4].reshape(2, 2),
+        ("data", "tensor"),
+        axis_types=(AxisType.Explicit, AxisType.Explicit),
+    )
+    data_sharding = NamedSharding(mesh, P("data"))
+    replicated_sharding = NamedSharding(mesh, P())
+    hidden = jax.device_put(jnp.arange(8 * 5, dtype=jnp.float32).reshape(8, 5), replicated_sharding)
+    positions = jax.device_put(jnp.arange(8, dtype=jnp.int32) + 100, data_sharding)
+    seq_lens = jax.device_put(jnp.array([10, 20], dtype=jnp.int32), data_sharding)
+    accept_index = jax.device_put(
+        jnp.array([0, 1, -1, -1, 4, 5, 6, -1], dtype=jnp.int32),
+        replicated_sharding,
+    )
+    accept_length = jax.device_put(jnp.array([2, 3], dtype=jnp.int32), data_sharding)
+    verified_id = jax.device_put(
+        jnp.array([11, 12, 0, 0, 21, 22, 23, 0], dtype=jnp.int32),
+        replicated_sharding,
+    )
+
+    @jax.jit
+    def prepare(hidden, positions, seq_lens, accept_index, accept_length, verified_id):
+        return _greedy_step3_prepare_draft_inputs(
+            hidden,
+            positions,
+            seq_lens,
+            accept_index,
+            accept_length,
+            verified_id,
+            speculative_num_steps=3,
+            speculative_num_draft_tokens=4,
+        )
+
+    with jax.set_mesh(mesh):
+        out = prepare(hidden, positions, seq_lens, accept_index, accept_length, verified_id)
+
+    assert out.positions.sharding == data_sharding
+
+
+def test_replicate_for_host_output_reshards_data_sharded_array():
+    devices = np.asarray(jax.devices())
+    if devices.size < 4:
+        pytest.skip("requires at least 4 JAX devices for a 2x2 mesh")
+
+    mesh = Mesh(
+        devices[:4].reshape(2, 2),
+        ("data", "tensor"),
+        axis_types=(AxisType.Explicit, AxisType.Explicit),
+    )
+    data_sharding = NamedSharding(mesh, P("data"))
+    replicated_sharding = NamedSharding(mesh, P())
+    value = jax.device_put(jnp.array([12, 23], dtype=jnp.int32), data_sharding)
+
+    @jax.jit
+    def replicate(value):
+        return _replicate_for_host_output(value, replicated_sharding)
+
+    with jax.set_mesh(mesh):
+        out = replicate(value)
+
+    assert out.sharding.is_fully_replicated
+    np.testing.assert_array_equal(np.asarray(out), np.array([12, 23], dtype=np.int32))
 
 
 class _SamplingInfo:
@@ -92,37 +195,34 @@ def test_multi_layer_draft_worker_routes_fixed_greedy_path(monkeypatch):
     assert calls == ["step3"]
 
 
-def test_step3_entrypoint_applies_postprocess_before_fallback(monkeypatch):
+def test_step3_entrypoint_does_not_split_postprocess_before_fused_extend(monkeypatch):
     from sgl_jax.srt.speculative import draft_extend_fused
 
-    post = GreedyVerifyPostprocessOutput(
-        next_token_logits=jnp.ones((8, 3), dtype=jnp.float32),
-        hidden_states=jnp.ones((8, 5), dtype=jnp.float32) * 2,
-        positions=jnp.arange(8, dtype=jnp.int32) + 200,
-        new_seq_lens=jnp.array([12, 23], dtype=jnp.int32),
-        select_index=jnp.array([1, 6], dtype=jnp.int32),
-        verified_id=jnp.arange(8, dtype=jnp.int32) + 10,
-        accept_lens=jnp.array([2, 3], dtype=jnp.int32),
-    )
     calls = []
 
-    def fake_postprocess(*args, **kwargs):
-        calls.append(("postprocess", kwargs))
-        return post
+    def fail_if_split_postprocess(*args, **kwargs):
+        raise AssertionError("Step3 must fuse verify postprocess into draft-extend JIT")
 
-    def fake_fallback(worker, model_worker_batch, batch_output):
-        calls.append(("fallback", None))
-        assert batch_output.logits_output.next_token_logits is post.next_token_logits
-        assert batch_output.logits_output.hidden_states is post.hidden_states
-        assert batch_output.next_draft_input.hidden_states is post.hidden_states
-        assert batch_output.next_draft_input.verified_id is post.verified_id
-        assert batch_output.accept_lens is post.accept_lens
-        assert model_worker_batch.positions is post.positions
+    def fake_fused_step3_impl(worker, model_worker_batch, batch_output):
+        calls.append(("fused_step3_impl", None))
+        assert batch_output.next_draft_input.safe_index is safe_index
+        assert batch_output.next_draft_input.accept_index is accept_index
+        assert batch_output.accept_lens is accept_lens
 
-    monkeypatch.setattr(draft_extend_fused, "_greedy_verify_postprocess_jit", fake_postprocess)
-    monkeypatch.setattr(draft_extend_fused, "draft_extend_for_decode_fused", fake_fallback)
+    monkeypatch.setattr(
+        draft_extend_fused, "_greedy_verify_postprocess_jit", fail_if_split_postprocess
+    )
+    monkeypatch.setattr(
+        draft_extend_fused,
+        "_draft_extend_for_decode_fused_step3_impl",
+        fake_fused_step3_impl,
+        raising=False,
+    )
 
     draft_worker = SimpleNamespace(speculative_num_steps=3, speculative_num_draft_tokens=4)
+    accept_index = jnp.array([0, 1, -1, -1, 4, 5, 6, -1], dtype=jnp.int32)
+    safe_index = jnp.array([0, 1, 3, 3, 4, 5, 6, 7], dtype=jnp.int32)
+    accept_lens = jnp.array([2, 3], dtype=jnp.int32)
     model_worker_batch = SimpleNamespace(
         positions=jnp.arange(8, dtype=jnp.int32),
         seq_lens=jnp.array([10, 20], dtype=jnp.int32),
@@ -133,22 +233,16 @@ def test_step3_entrypoint_applies_postprocess_before_fallback(monkeypatch):
             hidden_states=jnp.zeros((8, 5), dtype=jnp.float32),
         ),
         next_draft_input=SimpleNamespace(
-            accept_index=jnp.array([0, 1, -1, -1, 4, 5, 6, -1], dtype=jnp.int32),
+            accept_index=accept_index,
+            safe_index=safe_index,
             verified_id=jnp.array([11, 12, 0, 0, 21, 22, 23, 0], dtype=jnp.int32),
             new_seq_lens=None,
         ),
-        accept_lens=jnp.array([2, 3], dtype=jnp.int32),
+        accept_lens=accept_lens,
     )
 
     draft_extend_fused.draft_extend_for_decode_fused_step3(
         draft_worker, model_worker_batch, batch_output
     )
 
-    assert calls == [
-        (
-            "postprocess",
-            {"speculative_num_steps": 3, "speculative_num_draft_tokens": 4},
-        ),
-        ("fallback", None),
-    ]
-    assert batch_output.next_draft_input.new_seq_lens is post.new_seq_lens
+    assert calls == [("fused_step3_impl", None)]
