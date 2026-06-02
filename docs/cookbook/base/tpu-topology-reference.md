@@ -69,7 +69,7 @@ with `dtype_bytes = 2` for `bfloat16`, `1` for FP8. The MiMo-V2-Flash recipe rec
 | GKE accelerator label (v7x) | `cloud.google.com/gke-tpu-accelerator: tpu7x` | [MiMo-V2.5-Pro GKE manifest](../autoregressive/Xiaomi/MiMo-V2.5-Pro.md) |
 | GKE topology label | `cloud.google.com/gke-tpu-topology: 2x2x4` | same |
 | Docker image | `us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1` | same |
-| SkyPilot resource (v6e) | `tpu-v6e-N` (N ∈ {1, 4, 8, 16, 32, 64}) | [SkyPilot deployment](../deployment/skypilot.md), `scripts/launch_tpu.sh` |
+| SkyPilot resource (v6e) | `tpu-v6e-N` (N ∈ {1, 4, 8, 16, 32, 64}) | [SkyPilot launcher](../deployment/skypilot.md), `scripts/launch_tpu.sh` |
 | SkyPilot runtime (v6e) | `runtime_version: v2-alpha-tpuv6e` | `scripts/tpu_resource.sky.yaml`, [`developer_guide/tpu_resources_guide.md`](../../developer_guide/tpu_resources_guide.md) |
 
 ## What this page intentionally does NOT cover

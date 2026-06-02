@@ -6,7 +6,7 @@ title: "Basic API Usage"
 
 This page is the shared reference for sending requests to a running sglang-jax server. Every recipe's §3.1 Basic Usage links here for the cURL / Python / streaming patterns; the recipe pages then add only the model-specific bits (recommended sampling parameters, parser keys, multi-turn examples).
 
-For installing the server see [install guide](../../get_started/install.md). For the full launch-flag reference see [Launch flags reference](launch-flags-reference.md).
+For installing the server see [Install guide](../../get_started/install.md). For the full launch-flag reference see [Launch flags reference](launch-flags-reference.md).
 
 ## 1. Launch a Server
 

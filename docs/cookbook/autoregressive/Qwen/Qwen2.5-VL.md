@@ -47,7 +47,7 @@ See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU g
 
 ### 2.2 Environment
 
-Install per [install guide](../../../get_started/install.md). For the current single-host VL paths use [Single-host Docker template](../../deployment/single-host-docker.md). Qwen2.5-VL 72B multi-host should stay pending until the built-in staging and scheduler path are fixed.
+Install per [Install guide](../../../get_started/install.md). For the current single-host VL paths use [Single-host Docker template](../../deployment/single-host-docker.md). Qwen2.5-VL 72B multi-host should stay pending until the built-in staging and scheduler path are fixed.
 The required JAX TPU container image: `us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1` (covers v5e / v5p / v6e Trillium / v7x Ironwood).
 
 Extra pip for accuracy benchmarking only:
@@ -243,7 +243,7 @@ print(response.choices[0].message.content)
 
 ## 4. Benchmark
 
-> Benchmark section is intentionally omitted — Qwen2.5-VL is a Starter recipe (banner). All §4.1 Accuracy / §4.2 Speed cells are pending real PR-back measurements. When you run a numbered MMMU / MMMU Pro Vision / DocVQA / ChartQA eval against the model on TPU, file a PR adding the §4 block back with the actual numbers and upgrade the banner to Partially validated or Validated. For the canonical four-part §4 form (Test Environment / Deployment Command / Benchmark Command / Test Results) see any Validated recipe in [the autoregressive index](../index.md).
+> Benchmark section is intentionally omitted — Qwen2.5-VL is a Starter recipe (banner). All §4.1 Accuracy / §4.2 Speed cells are pending real PR-back measurements. When you run a numbered MMMU / MMMU Pro Vision / DocVQA / ChartQA eval against the model on TPU, file a PR adding the §4 block back with the actual numbers and upgrade the banner to Partially validated or Validated. For the canonical four-part §4 form (Test Environment / Deployment Command / Benchmark Command / Test Results) see any Validated recipe in [Autoregressive index](../index.md).
 >
 > Note: `bench_serving` does not have native multimodal input support today, so §4.2 Speed needs a custom OpenAI-client load test driving the §3.2 multi-image / video patterns; PR back full TTFT / ITL / output tok/s along with the image resolution and prompt template used.
 

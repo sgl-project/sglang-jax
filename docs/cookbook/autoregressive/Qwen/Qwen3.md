@@ -38,7 +38,7 @@ Both fit on a single v6e-4 host with `bfloat16`. See [TPU topology reference](..
 
 ### 2.2 Environment
 
-Install per [install guide](../../../get_started/install.md) and use [Single-host Docker template](../../deployment/single-host-docker.md) for the container setup.
+Install per [Install guide](../../../get_started/install.md) and use [Single-host Docker template](../../deployment/single-host-docker.md) for the container setup.
 The required JAX TPU container image: `us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1` (covers v5e / v5p / v6e Trillium / v7x Ironwood).
 
 ### 2.3 Launch
@@ -415,7 +415,7 @@ chmod +x benchmark.sh
 ./benchmark.sh vllm Qwen/Qwen3-8B
 ```
 
-**Test Results** (selected representative cells — see [the benchmark report](../../../performance/qwen3_benchmark.md) for the full ISL × OSL × batch matrix)
+**Test Results** (selected representative cells — see [Qwen3 benchmark report](../../../performance/qwen3_benchmark.md) for the full ISL × OSL × batch matrix)
 
 Qwen3-8B:
 

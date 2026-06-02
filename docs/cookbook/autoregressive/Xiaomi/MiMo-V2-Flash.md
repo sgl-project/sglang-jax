@@ -39,7 +39,7 @@ See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU g
 
 ### 2.2 Environment
 
-Install per [install guide](../../../get_started/install.md) and use one of the launcher templates from [Deployment templates](../../deployment/).
+Install per [Install guide](../../../get_started/install.md) and use one of the launcher templates from [Deployment templates](../../deployment/).
 The required JAX TPU container image: `us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1` (covers v5e / v5p / v6e Trillium / v7x Ironwood).
 
 Extra pip for accuracy benchmarking only:
