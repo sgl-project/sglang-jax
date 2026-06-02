@@ -24,6 +24,7 @@ from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.layers.moe import (
     EPMoE,
     FusedEPMoE,
+    FusedEPMoEV2,
     GateLogit,
     TopK,
     create_moe_weights_mapping,
@@ -436,9 +437,28 @@ class BailingMoELinearDecoderLayer(nnx.Module):
             layer_id=layer_id,
         )
 
-        moe_backend = getattr(config, "moe_backend", MoEBackend.EPMOE)
-        self.use_fused = moe_backend == MoEBackend.FUSED or moe_backend == "fused"
-        if self.use_fused:
+        self.moe_backend = getattr(config, "moe_backend", MoEBackend.EPMOE)
+        self.use_fused = self.moe_backend in (MoEBackend.FUSED, MoEBackend.FUSED_V2)
+        if self.moe_backend == MoEBackend.FUSED_V2:
+            self.mlp = FusedEPMoEV2(
+                hidden_size=config.hidden_size,
+                num_experts=num_experts,
+                num_experts_per_tok=config.num_experts_per_tok,
+                intermediate_dim=config.moe_intermediate_size,
+                mesh=mesh,
+                activation="silu",
+                ep_size=getattr(config, "ep_size", 1),
+                weight_dtype=dtype,
+                dtype=dtype,
+                layer_id=layer_id,
+                renormalize_topk_logits=getattr(config, "norm_topk_prob", False),
+                use_grouped_topk=getattr(config, "n_group", 0) > 0,
+                num_groups=getattr(config, "n_group", 0),
+                top_k_groups=getattr(config, "topk_group", 0),
+                num_shared_experts=0,
+                quantization_config=getattr(config, "quantization_config", None),
+            )
+        elif self.moe_backend == MoEBackend.FUSED:
             self.mlp = FusedEPMoE(
                 hidden_size=config.hidden_size,
                 num_experts=num_experts,
@@ -454,10 +474,7 @@ class BailingMoELinearDecoderLayer(nnx.Module):
                 use_grouped_topk=getattr(config, "n_group", 0) > 0,
                 num_groups=getattr(config, "n_group", 0),
                 top_k_groups=getattr(config, "topk_group", 0),
-                num_shared_experts=getattr(config, "num_shared_experts", 0),
-                moe_shared_expert_intermediate_size=getattr(
-                    config, "moe_shared_expert_intermediate_size", config.moe_intermediate_size
-                ),
+                num_shared_experts=0,
                 quantization_config=getattr(config, "quantization_config", None),
             )
         else:
@@ -475,7 +492,7 @@ class BailingMoELinearDecoderLayer(nnx.Module):
             )
 
         num_shared_experts = getattr(config, "num_shared_experts", 0)
-        if num_shared_experts > 0 and not self.use_fused:
+        if num_shared_experts > 0:
             shared_intermediate = (
                 getattr(
                     config,
@@ -1015,7 +1032,15 @@ class BailingMoeV2_5ForCausalLM(nnx.Module):
             num_physical_experts = metadata.num_physical_experts
 
         moe_backend = getattr(self.config, "moe_backend", "epmoe")
-        use_fused = moe_backend == "fused"
+        use_fused = moe_backend in ("fused", "fused_v2")
+        # All current backends (epmoe / fused / fused_v2) route shared experts
+        # through an external DeepseekV3MLP module — see the layer init, which
+        # constructs FusedEPMoE/FusedEPMoEV2 with num_shared_experts=0. The
+        # in-kernel `w*_shared` weight-mapping branch below is kept as a
+        # placeholder for any future backend that re-enables in-kernel shared
+        # experts; flip this flag back to `moe_backend == "fused"` (or similar)
+        # when that path is wired up.
+        use_fused_shared = False
         moe_mappings = create_moe_weights_mapping(
             prefix=prefix,
             target_prefix=target,
@@ -1058,7 +1083,15 @@ class BailingMoeV2_5ForCausalLM(nnx.Module):
                     is_w2 = target_base.endswith("w2")
                     out_dim = hidden_size if is_w2 else inter_size
                     in_dim = inter_size if is_w2 else hidden_size
-                    num_blocks = in_dim // BLOCK_SIZE
+                    # Per-channel when no weight_block_size in quant config:
+                    # scale shape is [E, 1, 1, out_dim] with no K-tiling.
+                    _wbs = getattr(
+                        getattr(self.config, "quantization_config", None),
+                        "weight_block_size",
+                        None,
+                    )
+                    is_per_channel = _wbs is None
+                    num_blocks = 1 if is_per_channel else in_dim // BLOCK_SIZE
                     # Mirror the fused weight sharding (("data", "tensor"), ...)
                     # promoted to 4D for the [E, K_blocks, 1, out_dim] scale.
                     fused_weight_shard = wm.sharding[0] if wm.sharding else ("data", "tensor")
@@ -1067,7 +1100,7 @@ class BailingMoeV2_5ForCausalLM(nnx.Module):
                         sharding=(fused_weight_shard, None, None, None),
                         transpose=False,
                         reshape=(num_physical_experts, 1, 1, out_dim),
-                        repeat=(1, num_blocks),
+                        repeat=None if is_per_channel else (1, num_blocks),
                         physical_to_logical_map=wm.physical_to_logical_map,
                     )
                 else:
@@ -1080,10 +1113,12 @@ class BailingMoeV2_5ForCausalLM(nnx.Module):
             mappings.update(scale_extra_mappings)
 
         num_shared = getattr(self.config, "num_shared_experts", 0)
-        if num_shared > 0 and use_fused:
+        if num_shared > 0 and use_fused_shared:
             # FusedEPMoE: shared experts live as nnx.Param `w*_shared`/`w*_shared_scale`
             # on the layer's `mlp` module. Per-channel shared scale `[out_dim]` is
             # reshaped to `[1, 1, out_dim]` to match the kernel placeholder.
+            # NOTE: currently disabled (use_fused_shared=False above) — kept as a
+            # placeholder for backends that re-enable in-kernel shared experts.
             shared_inter = (
                 getattr(
                     self.config,
@@ -1113,8 +1148,9 @@ class BailingMoeV2_5ForCausalLM(nnx.Module):
                         reshape=(1, 1, out_dim),
                     )
         elif num_shared > 0:
-            # EPMoE backend stores shared experts as a DeepseekV3MLP (LinearBase)
-            # — `apply_linear_quantization` will swap each to QuantizedLinear and
+            # External shared experts (current path for all backends): stored
+            # as a DeepseekV3MLP (LinearBase) at layer.shared_experts.
+            # `apply_linear_quantization` swaps each to QuantizedLinear and
             # the standard `_add_linear` path handles the FP8 sidecars.
             for proj, sharding in [
                 ("gate_proj", (None, "tensor")),
