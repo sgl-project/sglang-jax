@@ -1962,20 +1962,23 @@ class ScheduleBatch:
 
         per_dp_cache_loc_size = total_cache_loc_size // self.dp_size
         # Reuse a persistent host buffer instead of allocating a fresh
-        # np.zeros every step. A fresh allocation per step pays malloc/munmap
-        # churn plus first-touch page faults on every write; a resident buffer
-        # only needs a memset of the used prefix. Reuse is safe because the H2D
-        # copy (ForwardBatch.init_new -> device_array) runs synchronously on
-        # this (scheduler) thread before the next step rebuilds the buffer, and
-        # the resulting device array does not alias the host buffer afterwards.
+        # np.zeros every step. The attention kernels (RPA v2/v3, MLA v2) use
+        # seq_lens / cu_kv_lens to truncate KV loading: padding requests
+        # (seq_lens=0) load zero pages, and real requests truncate via
+        # [:kv_len]. Therefore padding entries in cache_loc are never read on
+        # device — we can skip per-step zeroing entirely and just overwrite
+        # real-request slots.  Reuse is safe because the H2D copy
+        # (ForwardBatch.init_new -> device_array) runs synchronously on this
+        # (scheduler) thread before the next step rebuilds the buffer.
         # Sized to the largest padding bucket so every step's prefix fits.
         max_cache_loc_size = cache_loc_paddings[-1]
         cache_loc_buf = getattr(self.req_to_token_pool, "_cache_loc_host_buf", None)
         if cache_loc_buf is None or cache_loc_buf.shape[0] < max_cache_loc_size:
-            cache_loc_buf = np.zeros(max_cache_loc_size, dtype=np.int32)
+            cache_loc_buf = np.empty(max_cache_loc_size, dtype=np.int32)
             self.req_to_token_pool._cache_loc_host_buf = cache_loc_buf
         cache_loc_cpu = cache_loc_buf[:total_cache_loc_size]
-        cache_loc_cpu.fill(0)
+        # No fill(0): padding slots are never read by attention kernels.
+        # Real-request slots are overwritten by the per-req copy loop below.
 
         offset_bs = 0
         req_to_token = self.req_to_token_pool.req_to_token

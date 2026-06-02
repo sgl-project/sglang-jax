@@ -336,7 +336,10 @@ class EagleDraftWorker(BaseDraftWorker):
         per_dp_bs = model_worker_batch.per_dp_bs_size if dp_size > 1 else len(seq_lens_cpu)
         assert total_cache_loc_size % dp_size == 0
         per_dp_cache_len = total_cache_loc_size // dp_size
-        cache_loc_cpu = np.zeros(total_cache_loc_size, dtype=np.int32)
+        # Use np.empty: padding slots are never read by attention kernels
+        # (seq_lens=0 → zero KV pages loaded), and real-request slots are
+        # overwritten by the per-req copy loop below.
+        cache_loc_cpu = np.empty(total_cache_loc_size, dtype=np.int32)
         valid_mask = seq_lens_cpu > 0
         if np.any(valid_mask):
             valid_indices = np.where(valid_mask)[0]
