@@ -32,9 +32,10 @@ from pd_transfer_matrix import (
     _read_line,
     _replicated_sharding,
 )
+
 from sgl_jax.srt.disaggregation.base.kv_manager import KVPoll
-from sgl_jax.srt.disaggregation.jax_transfer.conn import JaxTransferKVManager, PMetadata
 from sgl_jax.srt.disaggregation.common.zmq_notifier import ZmqPullNotifier
+from sgl_jax.srt.disaggregation.jax_transfer.conn import JaxTransferKVManager, PMetadata
 from sgl_jax.srt.disaggregation.jax_transfer.wrapper import get_or_create_wrapper
 from sgl_jax.srt.mem_cache.host_kv_pool import QueueHostKVPool
 
@@ -57,7 +58,10 @@ def _wait_for_terminal(handle, timeout_s: float) -> KVPoll:
 
 
 def _make_host_pool() -> QueueHostKVPool:
-    mesh = Mesh(np.asarray(jax.local_devices()).reshape(len(jax.local_devices())), axis_names=("x",))
+    mesh = Mesh(
+        np.asarray(jax.local_devices()).reshape(len(jax.local_devices())),
+        axis_names=("x",),
+    )
     return QueueHostKVPool(
         pool_size=1,
         max_tokens_per_buffer=NUM_ELEMS,
@@ -81,7 +85,9 @@ def _prefill(args: argparse.Namespace) -> int:
         ctl.sendall(
             f"{args.my_host} {args.transfer_port} {args.side_channel_port} {int(args.use_d2h_staging)}\n".encode()
         )
-        payload_sharding = _replicated_sharding() if args.use_d2h_staging else _device_sharding()
+        payload_sharding = (
+            _replicated_sharding() if args.use_d2h_staging else _device_sharding()
+        )
         host_pool = _make_host_pool() if args.use_d2h_staging else None
         mgr = JaxTransferKVManager(wrapper, notifier, host_pool=host_pool)
         sender = mgr.create_sender(REQ_ID)
@@ -91,7 +97,11 @@ def _prefill(args: argparse.Namespace) -> int:
             payload_sharding,
         )
         payload_flat.block_until_ready()
-        payload = payload_flat.reshape((NUM_ELEMS, 1, 1, 1)) if args.use_d2h_staging else payload_flat
+        payload = (
+            payload_flat.reshape((NUM_ELEMS, 1, 1, 1))
+            if args.use_d2h_staging
+            else payload_flat
+        )
         sender.attach_payload({"kv": payload}, use_d2h_staging=args.use_d2h_staging)
         sender.send()
         status = _read_line(ctl, rx_buf).strip()
@@ -100,7 +110,10 @@ def _prefill(args: argparse.Namespace) -> int:
             return 1
         if _wait_for_terminal(sender, timeout_s=30.0) != KVPoll.SUCCESS:
             return 1
-        if host_pool is not None and host_pool.available_size() != host_pool.total_size():
+        if (
+            host_pool is not None
+            and host_pool.available_size() != host_pool.total_size()
+        ):
             print("[P] host pool leak detected", flush=True)
             return 1
         print("[P] PASS sender reached SUCCESS and cleanup completed", flush=True)
@@ -147,7 +160,10 @@ def _decode(args: argparse.Namespace) -> int:
         expected = _payload_numpy(SEED, DTYPE_NAME, NUM_ELEMS).tobytes()
         if got != expected:
             ctl.sendall(b"FAIL bytes-mismatch\n")
-            print(f"[D] FAIL bytes mismatch: got={len(got)} expected={len(expected)}", flush=True)
+            print(
+                f"[D] FAIL bytes mismatch: got={len(got)} expected={len(expected)}",
+                flush=True,
+            )
             return 1
         ctl.sendall(b"PASS\n")
         print("[D] PASS byte-equal transfer and ack completed", flush=True)

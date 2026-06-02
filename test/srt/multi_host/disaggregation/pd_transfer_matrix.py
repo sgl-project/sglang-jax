@@ -48,13 +48,13 @@ from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.disaggregation.base.kv_manager import KVPoll
+from sgl_jax.srt.disaggregation.common.zmq_notifier import ZmqPullNotifier
 from sgl_jax.srt.disaggregation.jax_transfer.conn import (
     JaxTransferKVManager,
     JaxTransferKVReceiver,
     JaxTransferKVSender,
     PMetadata,
 )
-from sgl_jax.srt.disaggregation.common.zmq_notifier import ZmqPullNotifier
 from sgl_jax.srt.disaggregation.jax_transfer.wrapper import get_or_create_wrapper
 from sgl_jax.srt.mem_cache.host_kv_pool import QueueHostKVPool
 
@@ -185,7 +185,8 @@ def _print_cell_result(
     elapsed_s: float,
 ) -> None:
     bytes_per_iter = (
-        np.prod(_payload_shape(page_count * PAGE_SIZE_TOKENS), dtype=np.int64) * itemsize
+        np.prod(_payload_shape(page_count * PAGE_SIZE_TOKENS), dtype=np.int64)
+        * itemsize
     )
     total_bytes = bytes_per_iter * num_iters
     throughput_mib_s = total_bytes / max(elapsed_s, 1e-9) / (1024**2)
@@ -233,7 +234,9 @@ def _connect(host: str, port: int, timeout_s: float = 120.0) -> socket.socket:
         except (TimeoutError, ConnectionRefusedError) as e:
             last_err = e
             time.sleep(1.0)
-    raise TimeoutError(f"could not connect to {host}:{port} within " f"{timeout_s}s: {last_err}")
+    raise TimeoutError(
+        f"could not connect to {host}:{port} within {timeout_s}s: {last_err}"
+    )
 
 
 def _read_line(sock: socket.socket, buf: bytearray) -> str:
@@ -361,7 +364,7 @@ def _prefill(args: argparse.Namespace) -> int:
             while sender.poll() != KVPoll.SUCCESS:
                 if time.perf_counter() > deadline:
                     raise RuntimeError(
-                        f"sender {req_id} stuck at " f"{sender.poll().value} after D acked"
+                        f"sender {req_id} stuck at {sender.poll().value} after D acked"
                     )
                 time.sleep(0.001)
             ok_count += 1
@@ -377,7 +380,8 @@ def _prefill(args: argparse.Namespace) -> int:
             )
         else:
             print(
-                f"[P] cell {cell.dtype_name}/{cell.page_count}: " f"{ok_count}/{ITERATIONS}",
+                f"[P] cell {cell.dtype_name}/{cell.page_count}: "
+                f"{ok_count}/{ITERATIONS}",
                 flush=True,
             )
         _print_cell_result(
@@ -395,7 +399,8 @@ def _prefill(args: argparse.Namespace) -> int:
     failed = bool(failed_cells) or leak_total != 0
     total = len(cells) * ITERATIONS
     print(
-        f"[P] done: failed_cells={failed_cells} leaked_total={leak_total} " f"total_target={total}",
+        f"[P] done: failed_cells={failed_cells} leaked_total={leak_total} "
+        f"total_target={total}",
         flush=True,
     )
     return 0 if not failed else 1
@@ -403,7 +408,7 @@ def _prefill(args: argparse.Namespace) -> int:
 
 def _decode(args: argparse.Namespace) -> int:
     print(
-        f"[D] connecting to P ctl at " f"{args.remote}:{args.ctl_port}",
+        f"[D] connecting to P ctl at {args.remote}:{args.ctl_port}",
         flush=True,
     )
     ctl = _connect(args.remote, args.ctl_port)
@@ -455,7 +460,9 @@ def _decode(args: argparse.Namespace) -> int:
                     _payload_shape(num_tokens), dtype, sharding=repl_sharding
                 )
             else:
-                spec = jax.ShapeDtypeStruct(_payload_shape(num_tokens), dtype, sharding=sharding)
+                spec = jax.ShapeDtypeStruct(
+                    _payload_shape(num_tokens), dtype, sharding=sharding
+                )
             metas.append(
                 (
                     req_id,
@@ -511,7 +518,7 @@ def _decode(args: argparse.Namespace) -> int:
             successes += 1
             cell_done += 1
         print(
-            f"[D] cell {cell.dtype_name}/{cell.page_count}: " f"{cell_done}/{ITERATIONS}",
+            f"[D] cell {cell.dtype_name}/{cell.page_count}: {cell_done}/{ITERATIONS}",
             flush=True,
         )
         _print_cell_result(
@@ -528,7 +535,7 @@ def _decode(args: argparse.Namespace) -> int:
     d_notifier.stop()
     failed = bool(failed_cells)
     print(
-        f"[D] done: {successes}/{expected_total} iters, " f"failed={failed_cells}",
+        f"[D] done: {successes}/{expected_total} iters, failed={failed_cells}",
         flush=True,
     )
     return 0 if not failed else 1
