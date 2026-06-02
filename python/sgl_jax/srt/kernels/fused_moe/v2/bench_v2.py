@@ -14,8 +14,6 @@ Env vars:
   BENCH_QBK     — quant_block_k for fp8 (default: 128)
   BENCH_DIRECT_SCALED_DOT — 1 to use direct-scaled-dot for both FFN1/FFN2
   BENCH_DIRECT_SCALED_DOT_FFN1/FFN2 — optional comma-separated 0/1 hybrid sweep
-  BENCH_FFN1_DEQUANT_MODE — full or fchunk when FFN1 direct-scaled-dot is off
-  BENCH_FFN1_DEQUANT_CHUNK — comma-separated FFN1 dequant chunk sizes for fchunk
   BENCH_W2_FETCH_ORDER — after_w13 or before_w13 for current-expert W2 DMA
   BENCH_W2_FETCH_PRIORITY — comma-separated 0/1 priority for current-expert W2 DMA
   BENCH_SKIP_INTER_BT_SYNC — comma-separated 0/1 skip inter-BT sync barrier
@@ -258,8 +256,6 @@ direct_scaled_dot_ffn2_modes = parse_csv_bool(
 cast_ffn1_input_fp8 = os.environ.get("BENCH_CAST_FFN1_INPUT_FP8", "0") == "1"
 cast_ffn2_input_fp8 = os.environ.get("BENCH_CAST_FFN2_INPUT_FP8", "0") == "1"
 enable_act_quant = os.environ.get("BENCH_ACT_QUANT", "0") == "1"
-ffn1_dequant_modes = parse_csv_str("BENCH_FFN1_DEQUANT_MODE", ["full"])
-ffn1_dequant_chunks = parse_csv_int_or_none("BENCH_FFN1_DEQUANT_CHUNK")
 inkernel_metadata = os.environ.get("BENCH_INKERNEL_MD", "1") == "1"
 enable_bt_scatter_overlap = os.environ.get("BENCH_BT_SCATTER_OVERLAP", "1") == "1"
 cross_expert_prefetch_modes = parse_csv_str("BENCH_CROSS_EXPERT_PREFETCH", ["full"])
@@ -274,15 +270,6 @@ interleave_bt_modes = parse_csv_bool(
     "BENCH_INTERLEAVE_BT",
     [True],
 )
-valid_ffn1_dequant_modes = {"full", "fchunk"}
-invalid_ffn1_dequant_modes = [
-    mode for mode in ffn1_dequant_modes if mode not in valid_ffn1_dequant_modes
-]
-if invalid_ffn1_dequant_modes:
-    raise ValueError(
-        f"Unsupported BENCH_FFN1_DEQUANT_MODE values {invalid_ffn1_dequant_modes}; "
-        "expected one of full or fchunk."
-    )
 valid_cross_expert_prefetch_modes = {"none", "full", "w13"}
 invalid_modes = [
     mode for mode in cross_expert_prefetch_modes if mode not in valid_cross_expert_prefetch_modes
@@ -408,8 +395,6 @@ if direct_scaled_dot_ffn1_modes != [direct_scaled_dot] or direct_scaled_dot_ffn2
         "direct_scaled_dot hybrid sweep: "
         f"ffn1={direct_scaled_dot_ffn1_modes} ffn2={direct_scaled_dot_ffn2_modes}"
     )
-if ffn1_dequant_modes != ["full"] or ffn1_dequant_chunks != [None]:
-    log("ffn1_dequant sweep: " f"mode={ffn1_dequant_modes} chunk={ffn1_dequant_chunks}")
 if inkernel_metadata:
     log("inkernel_metadata=True (in-kernel ICI allgather, no JAX lax.all_gather)")
 if enable_bt_scatter_overlap:
@@ -1074,8 +1059,6 @@ for num_tokens in token_candidates:
             next_w2_prologue_priorities,
             direct_scaled_dot_ffn1_modes,
             direct_scaled_dot_ffn2_modes,
-            ffn1_dequant_modes,
-            ffn1_dequant_chunks,
             w2_fetch_orders,
             w2_fetch_priorities,
             skip_inter_bt_sync_modes,
@@ -1090,8 +1073,6 @@ for num_tokens in token_candidates:
         next_w2_priority,
         direct_ffn1,
         direct_ffn2,
-        ffn1_dequant_mode,
-        ffn1_dequant_chunk,
         w2_fetch_order,
         w2_fetch_priority,
         skip_inter_bt_sync,
@@ -1099,22 +1080,13 @@ for num_tokens in token_candidates:
     ) in configs_to_try:
         if xprefetch_mode != "w13" and next_w2_priority != next_w2_prologue_priorities[0]:
             continue
-        if direct_ffn1 and (
-            ffn1_dequant_mode != ffn1_dequant_modes[0]
-            or ffn1_dequant_chunk != ffn1_dequant_chunks[0]
-        ):
-            continue
-        if ffn1_dequant_mode != "fchunk" and ffn1_dequant_chunk is not None:
-            continue
         bt, bf, btc, bts = bc.bt, bc.bf, bc.btc, bc.bts
-        ffn1_mode_tag = "direct" if direct_ffn1 else ffn1_dequant_mode
         tag = (
             f"bt={bt},bf={bf},btc={btc},bts={bts},bse={bc.bse},"
             f"xprefetch={xprefetch_mode},w2p={next_w2_priority},"
             f"w2order={w2_fetch_order},w2fp={w2_fetch_priority},"
             f"direct_f1={int(direct_ffn1)},direct_f2={int(direct_ffn2)},"
             f"cast_f1={int(cast_ffn1_input_fp8)},cast_f2={int(cast_ffn2_input_fp8)},"
-            f"ffn1dq={ffn1_mode_tag},ffn1chunk={ffn1_dequant_chunk},"
             f"skip_ibt={int(skip_inter_bt_sync)},"
             f"ilv_bt={int(interleave_bt)}"
         )
@@ -1139,7 +1111,6 @@ for num_tokens in token_candidates:
             f"w2order={w2_fetch_order},w2fp={w2_fetch_priority},"
             f"direct_f1={int(direct_ffn1)},direct_f2={int(direct_ffn2)},"
             f"cast_f1={int(cast_ffn1_input_fp8)},cast_f2={int(cast_ffn2_input_fp8)},"
-            f"ffn1dq={ffn1_mode_tag},ffn1chunk={ffn1_dequant_chunk},"
             f"skip_ibt={int(skip_inter_bt_sync)},"
             f"ilv_bt={int(interleave_bt)}"
         )
@@ -1152,8 +1123,6 @@ for num_tokens in token_candidates:
             next_w2_priority,
             direct_ffn1,
             direct_ffn2,
-            ffn1_dequant_mode,
-            ffn1_dequant_chunk,
             w2_fetch_order,
             w2_fetch_priority,
             skip_inter_bt_sync,
@@ -1215,8 +1184,6 @@ for num_tokens in token_candidates:
                 direct_scaled_dot=direct_scaled_dot,
                 direct_scaled_dot_ffn1=direct_ffn1,
                 direct_scaled_dot_ffn2=direct_ffn2,
-                ffn1_dequant_mode=ffn1_dequant_mode,
-                ffn1_dequant_chunk=ffn1_dequant_chunk,
                 cast_ffn1_input_fp8=cast_ffn1_input_fp8,
                 cast_ffn2_input_fp8=cast_ffn2_input_fp8,
                 enable_act_quant=enable_act_quant,
@@ -1336,8 +1303,6 @@ if check_correctness:
             direct_scaled_dot=direct_scaled_dot,
             direct_scaled_dot_ffn1=direct_scaled_dot_ffn1_modes[0],
             direct_scaled_dot_ffn2=direct_scaled_dot_ffn2_modes[0],
-            ffn1_dequant_mode=ffn1_dequant_modes[0],
-            ffn1_dequant_chunk=ffn1_dequant_chunks[0],
             cast_ffn1_input_fp8=cast_ffn1_input_fp8,
             cast_ffn2_input_fp8=cast_ffn2_input_fp8,
             enable_act_quant=enable_act_quant,

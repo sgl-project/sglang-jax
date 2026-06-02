@@ -298,12 +298,12 @@ def _fused_ep_moe_kernel(
     b_w3_scale_x2_vmem,  # None | (2, t_packing, h_per_t // qbk, 1, bf) f32
     b_w2_scale_x2_vmem,  # None | (2, t_packing, bf // qbk, 1, h_per_t) f32
     # Dequant scratch (single-buf, populated after DMA wait, None when not quantized)
-    b_w1_dq_vmem,  # None | (t_packing, h_per_t, bf|ffn1_dequant_chunk) bf16
-    b_w3_dq_vmem,  # None | (t_packing, h_per_t, bf|ffn1_dequant_chunk) bf16
+    b_w1_dq_vmem,  # None | (t_packing, h_per_t, bf) bf16
+    b_w3_dq_vmem,  # None | (t_packing, h_per_t, bf) bf16
     b_w2_dq_vmem,  # None | (t_packing, bf, h_per_t) bf16
     # Gate/up accumulators (per bts tile)
-    b_gate_acc_vmem,  # None | (bts, bf|ffn1_dequant_chunk) f32
-    b_up_acc_vmem,  # None | (bts, bf) f32
+    b_gate_acc_vmem,  # (bts, bf) f32
+    b_up_acc_vmem,  # (bts, bf) f32
     # Token staging per bts tile
     b_x_vmem,  # (bts, t_packing, h_per_t) bf16
     # Output accumulator per bts tile
@@ -375,8 +375,6 @@ def _fused_ep_moe_kernel(
     direct_scaled_dot: bool = False,
     direct_scaled_dot_ffn1: bool = False,
     direct_scaled_dot_ffn2: bool = False,
-    ffn1_dequant_mode: str = "full",
-    ffn1_dequant_chunk: int | None = None,
     cast_ffn1_input_fp8: bool = False,
     cast_ffn2_input_fp8: bool = False,
     bt: int,
@@ -449,21 +447,12 @@ def _fused_ep_moe_kernel(
         num_pq_chunks = 0
 
     num_bf = cdiv(intermediate_size, bf)
-    ffn1_use_chunked_dequant = (
-        ffn1_dequant_mode == "fchunk" and not direct_scaled_dot_ffn1 and w1_scale_hbm is not None
-    )
-    ffn1_stream_chunked_down = (
-        ffn1_use_chunked_dequant and direct_scaled_dot_ffn2 and w2_scale_hbm is not None
-    )
-    ffn1_chunk = bf if ffn1_dequant_chunk is None else ffn1_dequant_chunk
-    num_ffn1_chunks = bf // ffn1_chunk
 
     per_channel = quant_block_k is None and w1_scale_hbm is not None
     ffn1_qbk = h_per_t if per_channel else quant_block_k
     ffn2_qbk = bf if per_channel else quant_block_k
     n_sg = h_per_t // ffn1_qbk if ffn1_qbk is not None else 1
     n_sg2 = bf // ffn2_qbk if ffn2_qbk is not None else 1
-    n_ffn1_chunk_sg = ffn1_chunk // ffn1_qbk if ffn1_qbk is not None else 1
 
     def maybe_cast_ffn1_input(x):
         return x.astype(jnp.float8_e4m3fn) if cast_ffn1_input_fp8 else x
@@ -1300,82 +1289,6 @@ def _fused_ep_moe_kernel(
 
             lax.fori_loop(0, n_sg, _dq_w3, None, unroll=n_sg)
 
-    def dequant_w1_chunk(slot, bf_off):
-        if not ffn1_use_chunked_dequant:
-            return
-        for p in range(t_packing):
-
-            def _dq_w1(sg_id, _):
-                sg_off = sg_id * quant_block_k
-                w_fp8 = b_w1_x2_vmem[
-                    slot,
-                    p,
-                    pl.ds(sg_off, quant_block_k),
-                    pl.ds(bf_off, ffn1_chunk),
-                ]
-                s = b_w1_scale_x2_vmem[
-                    slot,
-                    p,
-                    pl.ds(sg_id, 1),
-                    0,
-                    pl.ds(bf_off, ffn1_chunk),
-                ]
-                s = s.reshape(1, ffn1_chunk)
-                w_bf16 = (
-                    w_fp8.astype(jnp.float32) * jnp.broadcast_to(s, (quant_block_k, ffn1_chunk))
-                ).astype(jnp.bfloat16)
-                b_w1_dq_vmem.at[
-                    p,
-                    pl.ds(sg_off, quant_block_k),
-                    pl.ds(0, ffn1_chunk),
-                ][...] = w_bf16
-                return None
-
-            lax.fori_loop(0, n_sg, _dq_w1, None, unroll=n_sg)
-
-    def dequant_w3_chunk(slot, bf_off):
-        if not ffn1_use_chunked_dequant:
-            return
-        for p in range(t_packing):
-
-            def _dq_w3(sg_id, _):
-                sg_off = sg_id * quant_block_k
-                w_fp8 = b_w3_x2_vmem[
-                    slot,
-                    p,
-                    pl.ds(sg_off, quant_block_k),
-                    pl.ds(bf_off, ffn1_chunk),
-                ]
-                s = b_w3_scale_x2_vmem[
-                    slot,
-                    p,
-                    pl.ds(sg_id, 1),
-                    0,
-                    pl.ds(bf_off, ffn1_chunk),
-                ]
-                s = s.reshape(1, ffn1_chunk)
-                w_bf16 = (
-                    w_fp8.astype(jnp.float32) * jnp.broadcast_to(s, (quant_block_k, ffn1_chunk))
-                ).astype(jnp.bfloat16)
-                if ffn1_stream_chunked_down:
-                    # Streaming fchunk only needs one W13 dequant scratch:
-                    # W1 is consumed into gate chunk storage before W3 is
-                    # dequantized, so W3 can reuse the same buffer.
-                    b_w1_dq_vmem.at[
-                        p,
-                        pl.ds(sg_off, quant_block_k),
-                        pl.ds(0, ffn1_chunk),
-                    ][...] = w_bf16
-                else:
-                    b_w3_dq_vmem.at[
-                        p,
-                        pl.ds(sg_off, quant_block_k),
-                        pl.ds(0, ffn1_chunk),
-                    ][...] = w_bf16
-                return None
-
-            lax.fori_loop(0, n_sg, _dq_w3, None, unroll=n_sg)
-
     def dequant_w2(slot):
         if w2_scale_hbm is None or direct_scaled_dot_ffn2:
             return
@@ -1655,167 +1568,6 @@ def _fused_ep_moe_kernel(
 
                         lax.fori_loop(0, num_btc_per_bts, gate_up_btc_direct, None)
 
-                    elif ffn1_use_chunked_dequant:
-                        wait_fetch_w1(slot)
-                        wait_fetch_w3(slot)
-
-                        for fchunk_id in range(num_ffn1_chunks):
-                            bf_off = fchunk_id * ffn1_chunk
-
-                            dequant_w1_chunk(slot, bf_off)
-
-                            if ffn1_stream_chunked_down:
-
-                                def gate_chunk_btc(btc_id, ___):
-                                    gate = jnp.zeros(
-                                        (btc, ffn1_chunk),
-                                        dtype=jnp.float32,
-                                    )
-                                    if not disable_dynamic_ffn1:
-                                        for p_id in range(t_packing):
-                                            x_slice = b_x_vmem[
-                                                pl.ds(btc_id * btc, btc),
-                                                p_id,
-                                                pl.ds(0, h_per_t),
-                                            ]
-                                            w1_tile = b_w1_dq_vmem[
-                                                p_id,
-                                                pl.ds(0, h_per_t),
-                                                pl.ds(0, ffn1_chunk),
-                                            ]
-                                            gate += jnp.dot(
-                                                x_slice,
-                                                w1_tile,
-                                                preferred_element_type=jnp.float32,
-                                            )
-                                    b_gate_acc_vmem.at[
-                                        pl.ds(btc_id * btc, btc),
-                                        pl.ds(0, ffn1_chunk),
-                                    ][...] = gate
-                                    return None
-
-                                lax.fori_loop(
-                                    0,
-                                    num_btc_per_bts,
-                                    gate_chunk_btc,
-                                    None,
-                                )
-
-                            dequant_w3_chunk(slot, bf_off)
-                            if ffn1_stream_chunked_down and fchunk_id == 0:
-                                wait_fetch_w2(slot)
-
-                            def gate_up_chunk_btc(btc_id, ___):
-                                up = jnp.zeros((btc, ffn1_chunk), dtype=jnp.float32)
-                                if ffn1_stream_chunked_down:
-                                    gate = b_gate_acc_vmem[
-                                        pl.ds(btc_id * btc, btc),
-                                        pl.ds(0, ffn1_chunk),
-                                    ]
-                                else:
-                                    gate = jnp.zeros(
-                                        (btc, ffn1_chunk),
-                                        dtype=jnp.float32,
-                                    )
-                                if not disable_dynamic_ffn1:
-                                    for p_id in range(t_packing):
-                                        x_slice = b_x_vmem[
-                                            pl.ds(btc_id * btc, btc),
-                                            p_id,
-                                            pl.ds(0, h_per_t),
-                                        ]
-                                        if ffn1_stream_chunked_down:
-                                            w3_tile = b_w1_dq_vmem[
-                                                p_id,
-                                                pl.ds(0, h_per_t),
-                                                pl.ds(0, ffn1_chunk),
-                                            ]
-                                        else:
-                                            w1_tile = b_w1_dq_vmem[
-                                                p_id,
-                                                pl.ds(0, h_per_t),
-                                                pl.ds(0, ffn1_chunk),
-                                            ]
-                                            w3_tile = b_w3_dq_vmem[
-                                                p_id,
-                                                pl.ds(0, h_per_t),
-                                                pl.ds(0, ffn1_chunk),
-                                            ]
-                                            gate += jnp.dot(
-                                                x_slice,
-                                                w1_tile,
-                                                preferred_element_type=jnp.float32,
-                                            )
-                                        up += jnp.dot(
-                                            x_slice,
-                                            w3_tile,
-                                            preferred_element_type=jnp.float32,
-                                        )
-                                if ffn1_stream_chunked_down:
-                                    act = activation_fn(gate, up, act_fn)
-                                    if not disable_dynamic_ffn2:
-                                        for p_id in range(out_packing):
-                                            partial = jnp.zeros(
-                                                (btc, h_per_out),
-                                                dtype=jnp.float32,
-                                            )
-                                            for sg_id in range(n_ffn1_chunk_sg):
-                                                chunk_sg_off = sg_id * quant_block_k
-                                                global_sg_off = bf_off + chunk_sg_off
-                                                act_slice = act[
-                                                    :,
-                                                    chunk_sg_off : chunk_sg_off + quant_block_k,
-                                                ]
-                                                act_slice = maybe_cast_ffn2_input(act_slice)
-                                                w2_tile = b_w2_x2_vmem[
-                                                    slot,
-                                                    p_id,
-                                                    pl.ds(global_sg_off, quant_block_k),
-                                                    pl.ds(0, h_per_out),
-                                                ]
-                                                d = jnp.dot(
-                                                    act_slice,
-                                                    w2_tile,
-                                                    preferred_element_type=jnp.float32,
-                                                )
-                                                s = b_w2_scale_x2_vmem[
-                                                    slot,
-                                                    p_id,
-                                                    pl.ds(global_sg_off // quant_block_k, 1),
-                                                    0,
-                                                    pl.ds(0, h_per_out),
-                                                ].reshape(1, h_per_out)
-                                                partial += d * jnp.broadcast_to(
-                                                    s,
-                                                    d.shape,
-                                                )
-                                            acc_ref = b_y_acc_vmem.at[
-                                                pl.ds(btc_id * btc, btc),
-                                                p_id,
-                                                pl.ds(0, h_per_out),
-                                            ]
-                                            if bf_id == 0 and fchunk_id == 0:
-                                                acc_ref[...] = partial
-                                            else:
-                                                acc_ref[...] = acc_ref[...] + partial
-                                else:
-                                    b_gate_acc_vmem.at[
-                                        pl.ds(btc_id * btc, btc),
-                                        pl.ds(bf_off, ffn1_chunk),
-                                    ][...] = gate
-                                    b_up_acc_vmem.at[
-                                        pl.ds(btc_id * btc, btc),
-                                        pl.ds(bf_off, ffn1_chunk),
-                                    ][...] = up
-                                return None
-
-                            lax.fori_loop(
-                                0,
-                                num_btc_per_bts,
-                                gate_up_chunk_btc,
-                                None,
-                            )
-
                     else:
                         wait_fetch_w1(slot)
                         wait_fetch_w3(slot)
@@ -1870,9 +1622,8 @@ def _fused_ep_moe_kernel(
                     # In w13 mode, next-expert W2 is intentionally not
                     # cross-prefetched here: its own prologue can start W2
                     # while W1/W3 drive gate/up.
-                    if not ffn1_stream_chunked_down:
-                        wait_fetch_w2(slot)
-                        dequant_w2(slot)
+                    wait_fetch_w2(slot)
+                    dequant_w2(slot)
 
                     # Act+down — accumulate in VMEM f32 across bf tiles
                     def act_down_btc(btc_id, ___):
@@ -1946,8 +1697,7 @@ def _fused_ep_moe_kernel(
                                     acc_ref[...] = acc_ref[...] + partial
                         return None
 
-                    if not ffn1_stream_chunked_down:
-                        lax.fori_loop(0, num_btc_per_bts, act_down_btc, None)
+                    lax.fori_loop(0, num_btc_per_bts, act_down_btc, None)
 
                     # Same-expert bf+2 keeps the original full-slot rolling point:
                     # W1/W3/W2 are fetched together after down frees the slot.
@@ -2764,8 +2514,6 @@ def jax_allreduce_metadata_by_bt(
         "direct_scaled_dot",
         "direct_scaled_dot_ffn1",
         "direct_scaled_dot_ffn2",
-        "ffn1_dequant_mode",
-        "ffn1_dequant_chunk",
         "cast_ffn1_input_fp8",
         "cast_ffn2_input_fp8",
         "cross_expert_prefetch_mode",
@@ -2839,8 +2587,6 @@ def fused_ep_moe_v2(
     direct_scaled_dot: bool = False,
     direct_scaled_dot_ffn1: bool | None = None,
     direct_scaled_dot_ffn2: bool | None = None,
-    ffn1_dequant_mode: str = "full",
-    ffn1_dequant_chunk: int | None = None,
     cast_ffn1_input_fp8: bool = False,
     cast_ffn2_input_fp8: bool = False,
     cross_expert_prefetch_mode: str = "full",
@@ -2858,8 +2604,6 @@ def fused_ep_moe_v2(
             f"Unsupported {cross_expert_prefetch_mode=}; "
             "expected one of 'none', 'full', or 'w13'."
         )
-    if ffn1_dequant_mode not in ("full", "fchunk"):
-        raise ValueError(f"Unsupported {ffn1_dequant_mode=}; expected 'full' or 'fchunk'.")
     if next_w2_prologue_priority not in (0, 1):
         raise ValueError(f"Unsupported {next_w2_prologue_priority=}; expected 0 or 1.")
     if w2_fetch_order not in ("after_w13", "before_w13"):
@@ -2983,20 +2727,6 @@ def fused_ep_moe_v2(
         if w3_scale is not None and w3_scale.shape != expected_w3_scale:
             raise ValueError(f"{w3_scale.shape=} != {expected_w3_scale}")
 
-    if ffn1_dequant_mode == "fchunk" and not direct_scaled_dot_ffn1 and w1_scale is not None:
-        if w3_scale is None:
-            raise ValueError("ffn1_dequant_mode='fchunk' requires w3_scale.")
-        if ffn1_dequant_chunk is None:
-            raise ValueError("ffn1_dequant_chunk required for fchunk mode.")
-        if quant_block_k is None:
-            raise ValueError("quant_block_k required for fchunk mode.")
-        if ffn1_dequant_chunk <= 0 or ffn1_dequant_chunk > bf:
-            raise ValueError(f"{ffn1_dequant_chunk=} must be in (0, bf].")
-        if bf % ffn1_dequant_chunk != 0:
-            raise ValueError(f"{bf=} must be divisible by {ffn1_dequant_chunk=}.")
-        if ffn1_dequant_chunk % quant_block_k != 0:
-            raise ValueError(f"{ffn1_dequant_chunk=} must be divisible by {quant_block_k=}.")
-
     needs_jax_allreduce = use_jax_allreduce_metadata and ep_size > 1
 
     padded_num_experts = align_to(num_experts, 128)
@@ -3064,18 +2794,8 @@ def fused_ep_moe_v2(
     use_bt_banking = use_bt_scatter_bank or use_gather_bank
     num_bt_banks = num_bt if use_gather_bank else (2 if use_bt_scatter_bank else 1)
     smem_banks = num_bt if use_gather_bank else 2
-    use_ffn1_chunked_dequant = (
-        ffn1_dequant_mode == "fchunk" and not direct_scaled_dot_ffn1 and w1_scale is not None
-    )
-    use_ffn1_stream_chunked_down = (
-        use_ffn1_chunked_dequant and direct_scaled_dot_ffn2 and w2_scale is not None
-    )
-    w1_dequant_scratch_bf = ffn1_dequant_chunk if use_ffn1_chunked_dequant else bf
-    gate_acc_scratch_bf = w1_dequant_scratch_bf if use_ffn1_stream_chunked_down else bf
     use_w1_dequant_scratch = w1_scale is not None and not direct_scaled_dot_ffn1
-    use_w3_dequant_scratch = (
-        w3_scale is not None and not direct_scaled_dot_ffn1 and not use_ffn1_stream_chunked_down
-    )
+    use_w3_dequant_scratch = w3_scale is not None and not direct_scaled_dot_ffn1
     use_w2_dequant_scratch = w2_scale is not None and not direct_scaled_dot_ffn2
 
     scope_name = f"fused-moe-v2-k_{top_k}-bt_{bt}_{bts}_{btc}-bf_{bf}"
@@ -3086,8 +2806,6 @@ def fused_ep_moe_v2(
             f"-direct_scaled_dot_f1_{int(direct_scaled_dot_ffn1)}"
             f"_f2_{int(direct_scaled_dot_ffn2)}"
         )
-    if use_ffn1_chunked_dequant:
-        scope_name += f"-ffn1_fchunk_{ffn1_dequant_chunk}"
     if cast_ffn1_input_fp8 or cast_ffn2_input_fp8:
         scope_name += f"-castf1_{int(cast_ffn1_input_fp8)}_f2_{int(cast_ffn2_input_fp8)}"
     scope_name += f"-xprefetch_{cross_expert_prefetch_mode}"
@@ -3165,23 +2883,21 @@ def fused_ep_moe_v2(
         (
             None
             if not use_w1_dequant_scratch
-            else pltpu.VMEM((t_packing, h_per_t, w1_dequant_scratch_bf), jnp.bfloat16)
+            else pltpu.VMEM((t_packing, h_per_t, bf), jnp.bfloat16)
         ),  # W1/shared dequant
         (
             None
             if not use_w3_dequant_scratch
-            else pltpu.VMEM((t_packing, h_per_t, w1_dequant_scratch_bf), jnp.bfloat16)
+            else pltpu.VMEM((t_packing, h_per_t, bf), jnp.bfloat16)
         ),  # W3 dequant
         (
             None
             if not use_w2_dequant_scratch
             else pltpu.VMEM((out_packing, bf, h_per_out), jnp.bfloat16)
         ),  # W2 dequant
-        # VMEM: gate/up accumulators (per bts tile). Streaming fchunk stores
-        # only one gate chunk and computes up directly from the reused W13
-        # dequant scratch.
-        pltpu.VMEM((bts, gate_acc_scratch_bf), jnp.float32),  # gate_acc
-        (None if use_ffn1_stream_chunked_down else pltpu.VMEM((bts, bf), jnp.float32)),  # up_acc
+        # VMEM: gate/up accumulators (per bts tile).
+        pltpu.VMEM((bts, bf), jnp.float32),  # gate_acc
+        pltpu.VMEM((bts, bf), jnp.float32),  # up_acc
         # VMEM: token staging per bts tile
         pltpu.VMEM((bts, t_packing, h_per_t), t_dtype),  # x
         # VMEM: output accumulator per bts tile (fp32)
@@ -3273,8 +2989,6 @@ def fused_ep_moe_v2(
                 direct_scaled_dot=direct_scaled_dot,
                 direct_scaled_dot_ffn1=direct_scaled_dot_ffn1,
                 direct_scaled_dot_ffn2=direct_scaled_dot_ffn2,
-                ffn1_dequant_mode=ffn1_dequant_mode,
-                ffn1_dequant_chunk=ffn1_dequant_chunk,
                 cast_ffn1_input_fp8=cast_ffn1_input_fp8,
                 cast_ffn2_input_fp8=cast_ffn2_input_fp8,
                 bt=bt,
