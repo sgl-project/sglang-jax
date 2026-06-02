@@ -107,6 +107,51 @@ class TestVerifyTree(CustomTestCase):
         np.testing.assert_array_equal(np.asarray(outputs.verified_id), expected_verified_id)
         np.testing.assert_array_equal(np.asarray(outputs.select_index), expected_select_index)
 
+    def test_greedy_sample_device_outputs_enters_mesh_context(self):
+        from sgl_jax.srt.speculative import eagle_util
+        from sgl_jax.srt.speculative.eagle_util import greedy_sample_device_outputs
+
+        entered = {"value": False}
+
+        class _Ctx:
+            def __enter__(self):
+                entered["value"] = True
+
+            def __exit__(self, exc_type, exc, tb):
+                pass
+
+        def fake_set_mesh(mesh):
+            return _Ctx()
+
+        def fake_verify_tree_greedy(**kwargs):
+            assert entered["value"]
+            return (
+                jnp.array([[0, -1, -1, -1]], dtype=jnp.int32),
+                jnp.array([0], dtype=jnp.int32),
+                jnp.array([[1, 2, 3, 4, 5]], dtype=jnp.int32),
+            )
+
+        old_set_mesh = eagle_util.jax.set_mesh
+        old_verify_tree_greedy = eagle_util.verify_tree_greedy
+        eagle_util.jax.set_mesh = fake_set_mesh
+        eagle_util.verify_tree_greedy = fake_verify_tree_greedy
+        try:
+            greedy_sample_device_outputs(
+                speculative_num_steps=3,
+                num_draft_tokens=4,
+                draft_tokens=jnp.arange(4, dtype=jnp.int32),
+                retrive_index=jnp.arange(4, dtype=jnp.int32).reshape(1, 4),
+                retrive_next_token=jnp.full((4,), -1, dtype=jnp.int32),
+                retrive_next_sibling=jnp.full((4,), -1, dtype=jnp.int32),
+                next_token_logits=jnp.zeros((4, 8), dtype=jnp.float32),
+                mesh=object(),
+            )
+        finally:
+            eagle_util.jax.set_mesh = old_set_mesh
+            eagle_util.verify_tree_greedy = old_verify_tree_greedy
+
+        assert entered["value"]
+
     def test_verify_tree_greedy(self):
         candidates = jnp.array(
             [

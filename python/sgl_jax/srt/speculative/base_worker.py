@@ -209,6 +209,7 @@ class BaseSpecWorker:
                 retrive_next_token=spec_info.retrive_next_token,
                 retrive_next_sibling=spec_info.retrive_next_sibling,
                 next_token_logits=logits_output.next_token_logits,
+                mesh=self.mesh,
             )
             new_seq_lens = model_worker_batch.seq_lens + sample_output.accept_length
             next_draft_input = EagleDraftInput(
