@@ -347,7 +347,6 @@ disable_expert_stage_writeback = (
 )
 disable_expert_store_dma = all_disable or os.environ.get("DISABLE_EXPERT_STORE_DMA", "0") == "1"
 disable_expert_store_wait = all_disable or os.environ.get("DISABLE_EXPERT_STORE_WAIT", "0") == "1"
-disable_acc_and_store = all_disable or os.environ.get("DISABLE_ACC_AND_STORE", "0") == "1"
 disable_acc_load = all_disable or os.environ.get("DISABLE_ACC_LOAD", "0") == "1"
 disable_acc_compute = all_disable or os.environ.get("DISABLE_ACC_COMPUTE", "0") == "1"
 disable_acc_store_vmem = all_disable or os.environ.get("DISABLE_ACC_STORE_VMEM", "0") == "1"
@@ -375,7 +374,6 @@ ablation_flags = {
     "disable_expert_stage_writeback": disable_expert_stage_writeback,
     "disable_expert_store_dma": disable_expert_store_dma,
     "disable_expert_store_wait": disable_expert_store_wait,
-    "disable_acc_and_store": disable_acc_and_store,
     "disable_acc_load": disable_acc_load,
     "disable_acc_compute": disable_acc_compute,
     "disable_acc_store_vmem": disable_acc_store_vmem,
@@ -1176,7 +1174,6 @@ for num_tokens in token_candidates:
                 disable_expert_stage_writeback=disable_expert_stage_writeback,
                 disable_expert_store_dma=disable_expert_store_dma,
                 disable_expert_store_wait=disable_expert_store_wait,
-                disable_acc_and_store=disable_acc_and_store,
                 disable_acc_load=disable_acc_load,
                 disable_acc_compute=disable_acc_compute,
                 disable_acc_store_vmem=disable_acc_store_vmem,

@@ -83,10 +83,6 @@ def align_to(x, a):
     return cdiv(x, a) * a
 
 
-def _pad128(x):
-    return ((x + 127) // 128) * 128
-
-
 def get_dtype_packing(dtype):
     bits = jnp.dtype(dtype).itemsize * 8
     return 32 // bits
@@ -312,12 +308,6 @@ def _fused_ep_moe_kernel(
     b_y_stage_vmem,  # (bts, t_packing, h_per_t) bf16
     # Per-token activation scale (act_quant only)
     b_x_scale_vmem,  # None | (bts, 128) f32
-    # Shared expert buffers
-    b_se_tokens_vmem,  # None | (2, 2, bt, t_packing, h_per_t)
-    b_se_w1_x2_vmem,  # None | (2, t_packing, h_per_t, bse)
-    b_se_w3_x2_vmem,  # None | (2, t_packing, h_per_t, bse)
-    b_se_w2_x2_vmem,  # None | (2, t_packing, bse, h_per_t)
-    b_se_acc_vmem,  # None | (2, bt, hidden_size) f32
     # --- Semaphores ---
     x_stage_sem,  # DMA(1,) — token staging
     y_store_sem,  # DMA(1,) — output store from y_acc
@@ -359,7 +349,6 @@ def _fused_ep_moe_kernel(
     disable_expert_stage_writeback: bool = False,
     disable_expert_store_dma: bool = False,
     disable_expert_store_wait: bool = False,
-    disable_acc_and_store: bool = False,
     disable_acc_load: bool = False,
     disable_acc_compute: bool = False,
     disable_acc_store_vmem: bool = False,
@@ -372,7 +361,6 @@ def _fused_ep_moe_kernel(
     w2_fetch_priority: int = 1,
     skip_inter_bt_sync: bool = True,
     interleave_bt: bool = True,
-    direct_scaled_dot: bool = False,
     direct_scaled_dot_ffn1: bool = False,
     direct_scaled_dot_ffn2: bool = False,
     cast_ffn1_input_fp8: bool = False,
@@ -2500,7 +2488,6 @@ def jax_allreduce_metadata_by_bt(
         "disable_expert_stage_writeback",
         "disable_expert_store_dma",
         "disable_expert_store_wait",
-        "disable_acc_and_store",
         "disable_acc_load",
         "disable_acc_compute",
         "disable_acc_store_vmem",
@@ -2559,7 +2546,6 @@ def fused_ep_moe_v2(
     disable_expert_stage_writeback: bool = False,
     disable_expert_store_dma: bool = False,
     disable_expert_store_wait: bool = False,
-    disable_acc_and_store: bool = False,
     disable_acc_load: bool = False,
     disable_acc_compute: bool = False,
     disable_acc_store_vmem: bool = False,
@@ -2906,13 +2892,6 @@ def fused_ep_moe_v2(
         pltpu.VMEM((bts, out_packing, h_per_out), out_dtype),  # y_stage
         # VMEM: per-token activation scale (act_quant only)
         (None if not enable_act_quant else pltpu.VMEM((bts, 128), jnp.float32)),  # x_scale
-        # Shared expert reuses routed VMEM (b_x / b_w*_x2 / b_output), so the
-        # dedicated SE buffers are gone — pass None for all five.
-        None,  # se_tokens (reuses b_x)
-        None,  # se_w1 (reuses b_w1_x2)
-        None,  # se_w3 (reuses b_w3_x2)
-        None,  # se_w2 (reuses b_w2_x2)
-        None,  # se_acc (reuses b_output)
         # Semaphores
         pltpu.SemaphoreType.DMA((1,)),  # x_stage
         pltpu.SemaphoreType.DMA((1,)),  # y_store
@@ -2972,7 +2951,6 @@ def fused_ep_moe_v2(
                 disable_expert_stage_writeback=disable_expert_stage_writeback,
                 disable_expert_store_dma=disable_expert_store_dma,
                 disable_expert_store_wait=disable_expert_store_wait,
-                disable_acc_and_store=disable_acc_and_store,
                 disable_acc_load=disable_acc_load,
                 disable_acc_compute=disable_acc_compute,
                 disable_acc_store_vmem=disable_acc_store_vmem,
@@ -2986,7 +2964,6 @@ def fused_ep_moe_v2(
                 skip_inter_bt_sync=skip_inter_bt_sync,
                 interleave_bt=interleave_bt,
                 enable_act_quant=enable_act_quant,
-                direct_scaled_dot=direct_scaled_dot,
                 direct_scaled_dot_ffn1=direct_scaled_dot_ffn1,
                 direct_scaled_dot_ffn2=direct_scaled_dot_ffn2,
                 cast_ffn1_input_fp8=cast_ffn1_input_fp8,
