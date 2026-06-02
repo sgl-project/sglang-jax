@@ -33,3 +33,33 @@ def test_greedy_verify_postprocess_safe_index_matches_host_logic():
     np.testing.assert_array_equal(np.asarray(out.select_index), np.array([1, 6], dtype=np.int32))
     np.testing.assert_array_equal(np.asarray(out.verified_id), np.asarray(verified_id))
     np.testing.assert_array_equal(np.asarray(out.accept_lens), np.asarray(accept_length))
+
+
+class _SamplingInfo:
+    is_all_greedy = True
+
+
+class _Batch:
+    sampling_info = _SamplingInfo()
+    speculative_eagle_topk = 1
+    speculative_num_steps = 3
+    speculative_num_draft_tokens = 4
+
+    def __init__(self, bs):
+        self.seq_lens = np.ones((bs,), dtype=np.int32)
+
+
+def test_fused_greedy_decode_predicate_accepts_only_fixed_bucket():
+    from sgl_jax.srt.speculative.base_worker import _can_use_fused_greedy_decode_step3
+
+    assert _can_use_fused_greedy_decode_step3(_Batch(32))
+    assert not _can_use_fused_greedy_decode_step3(_Batch(16))
+
+    batch = _Batch(32)
+    batch.sampling_info = _SamplingInfo()
+    batch.sampling_info.is_all_greedy = False
+    assert not _can_use_fused_greedy_decode_step3(batch)
+
+    batch = _Batch(32)
+    batch.speculative_num_steps = 2
+    assert not _can_use_fused_greedy_decode_step3(batch)
