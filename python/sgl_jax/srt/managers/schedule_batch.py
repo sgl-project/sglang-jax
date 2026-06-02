@@ -1974,7 +1974,7 @@ class ScheduleBatch:
         max_cache_loc_size = cache_loc_paddings[-1]
         cache_loc_buf = getattr(self.req_to_token_pool, "_cache_loc_host_buf", None)
         if cache_loc_buf is None or cache_loc_buf.shape[0] < max_cache_loc_size:
-            cache_loc_buf = np.empty(max_cache_loc_size, dtype=np.int32)
+            cache_loc_buf = np.zeros(max_cache_loc_size, dtype=np.int32)
             self.req_to_token_pool._cache_loc_host_buf = cache_loc_buf
         cache_loc_cpu = cache_loc_buf[:total_cache_loc_size]
         # No fill(0): padding slots are never read by attention kernels.
