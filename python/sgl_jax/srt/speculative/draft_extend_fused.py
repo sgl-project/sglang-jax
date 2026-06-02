@@ -65,7 +65,7 @@ def _build_fused_draft_extend_jit(num_layers: int, topk: int):
         model_def,
         model_state_def,
         all_leaves,  # tuple of N tuples-of-arrays
-        all_forward_batches,  # tuple of N ForwardBatch pytrees (each with its own attn_backend)
+        forward_batch,  # single ForwardBatch (shared across layers)
         all_memory_pools,  # tuple of N MemoryPools pytrees
         logits_metadata,  # LogitsMetadata pytree
         target_hidden,  # (tokens, hidden_dim) replicated
@@ -77,17 +77,16 @@ def _build_fused_draft_extend_jit(num_layers: int, topk: int):
         all_topk_index = []
         all_pool_updates = []
         layer0_hidden = None
-        input_ids = all_forward_batches[0].input_ids
+        input_ids = forward_batch.input_ids
 
         for i in range(num_layers):
             state = jax.tree_util.tree_unflatten(model_state_def, all_leaves[i])
             model = nnx.merge(model_def, state)
 
-            fb = all_forward_batches[i]
-            fb.spec_info.hidden_states = target_hidden
-            fb.input_ids = input_ids
+            forward_batch.spec_info.hidden_states = target_hidden
+            forward_batch.input_ids = input_ids
 
-            output, pool_updates, _, _ = model(fb, all_memory_pools[i], logits_metadata)
+            output, pool_updates, _, _ = model(forward_batch, all_memory_pools[i], logits_metadata)
             all_pool_updates.append(pool_updates)
 
             # Replicate logits + hidden to P() (all-gather)
@@ -116,7 +115,7 @@ def _build_fused_draft_extend_jit(num_layers: int, topk: int):
             # Device-side rotate for topk=1 (shared with offline equivalence
             # test; exact mirror of host _rotate_ids).
             if i < num_layers - 1:
-                ext_lens = all_forward_batches[0].extend_seq_lens
+                ext_lens = forward_batch.extend_seq_lens
                 input_ids = _device_rotate_input_ids(input_ids, ext_lens, sel_pos, topk_idx[:, 0])
 
         # Force P() replicated sharding on outputs that must be cross-process
@@ -173,21 +172,24 @@ def draft_extend_for_decode_fused(draft_worker, model_worker_batch, batch_output
 
     # --- Host preparation (all done before single jit call) ---
 
-    # Pre-compute per-layer: forward_batch (with correct attn_backend), metadata, memory_pools, weights
-    all_forward_batches = []
+    # Build ONE ForwardBatch and reuse for all layers. All workers share the
+    # same mwb so forward_metadata is identical; only memory_pools/weights differ.
+    mr0 = draft_worker._workers[0].model_runner
+    mwb.spec_info_padded.hidden_states = target_hidden
+    mr0.attn_backend.forward_metadata = mr0.attn_backend.get_eagle_forward_metadata(mwb)
+    shared_fb = ForwardBatch.init_new(mwb, mr0)
+    shared_fb.bid = model_worker_batch.bid
+
     all_memory_pools = []
     all_leaves = []
     for w in draft_worker._workers:
         mr = w.model_runner
-        mwb.spec_info_padded.hidden_states = target_hidden
-        mr.attn_backend.forward_metadata = mr.attn_backend.get_eagle_forward_metadata(mwb)
-        fb = ForwardBatch.init_new(mwb, mr)
-        fb.bid = model_worker_batch.bid
-        all_forward_batches.append(fb)
         all_memory_pools.append(mr.memory_pools)
         all_leaves.append(tuple(mr.model_state_leaves))
 
-    sel_pos_device = jax.device_put(sel_pos, NamedSharding(draft_worker.mesh, P("data")))
+    sel_pos_device = jax.device_put(
+        sel_pos.astype(np.int32), NamedSharding(draft_worker.mesh, P("data"))
+    )
 
     # --- Build / get cached fused jit ---
     if not hasattr(draft_worker, "_fused_jit_fn"):
@@ -195,8 +197,6 @@ def draft_extend_for_decode_fused(draft_worker, model_worker_batch, batch_output
             num_layers=draft_worker.speculative_num_steps,
             topk=draft_worker.topk,
         )
-
-    mr0 = draft_worker._workers[0].model_runner
 
     # --- Single jit call: all N layers fused ---
     # Model internals use P() with implicit mesh; need use_mesh context
@@ -213,7 +213,7 @@ def draft_extend_for_decode_fused(draft_worker, model_worker_batch, batch_output
                 mr0._model_def,
                 mr0._model_state_def,
                 tuple(all_leaves),
-                tuple(all_forward_batches),
+                shared_fb,
                 tuple(all_memory_pools),
                 logits_metadata,
                 target_hidden,
