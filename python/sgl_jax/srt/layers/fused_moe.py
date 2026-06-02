@@ -204,6 +204,37 @@ class FusedEPMoE(nnx.Module):
             self.quant_block_k = None
             self.quant_block_n = None
 
+        # Narrow-N safety guard for block-wise FP8/INT8. The blockwise
+        # Pallas kernel collapses on TPU when a Linear's output dim is
+        # <= block_size_out (see `xla_quantized_matmul_local` for the
+        # QuantizedLinear path and `should_use_blockwise_kernel` for the
+        # helper). Mirror that guard here so the fused and epmoe MoE
+        # backends share the same safety surface.
+        if (
+            self.quantized_dtype is not None
+            and self.quant_block_n is not None
+            and not getattr(quantization_config, "allow_narrow_n_blockwise", False)
+        ):
+            from sgl_jax.srt.kernels.quantized_matmul.blockwise_utils import (
+                should_use_blockwise_kernel,
+            )
+
+            out_dims = [intermediate_dim, intermediate_dim, hidden_size]  # w1, w3, w2
+            if num_shared_experts and num_shared_experts > 0:
+                se_inter = self.moe_shared_expert_intermediate_size * num_shared_experts
+                out_dims += [se_inter, se_inter, hidden_size]  # w{1,3,2}_shared
+            for out_dim in out_dims:
+                if not should_use_blockwise_kernel(
+                    out_dim=int(out_dim), block_size_out=int(self.quant_block_n)
+                ):
+                    raise RuntimeError(
+                        f"FusedEPMoE blockwise kernel does not support "
+                        f"out_dim={out_dim} with block_size_out={self.quant_block_n} "
+                        f"(known to cause accuracy collapse). Set "
+                        f"allow_narrow_n_blockwise=True in your quantization "
+                        f"config to override."
+                    )
+
     def quantize_weights(self, is_static: bool = False):
         """Quantize MoE weights in-place. Call once after model loading."""
         if self.quantized_dtype is None:
