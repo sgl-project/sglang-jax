@@ -2433,6 +2433,63 @@ class ScheduleBatch:
                 offset += per_dp_token_padding
             input_embedding = emb
 
+        # Reassemble deepstack visual embeddings (DP-aware), densified to the
+        # batched token layout. Each req carries a sparse (num_layers, num_visual,
+        # hidden) embedding plus a per-prompt boolean pos-mask; we scatter the
+        # visual rows of the EXTEND window into a dense
+        # (num_layers, total_token_size, hidden) tensor at the matching token
+        # positions (same DP offset/stride as input_embedding above). Non-visual
+        # rows stay zero, so the model can add deepstack[layer] to all tokens
+        # (Qwen3-Omni thinker) without a separate position mask. Mirrors the
+        # pre-DP densification dropped by de5287ed.
+        apply_for_deepstack = False
+        deepstack_visual_embedding = None
+        if self.forward_mode.is_extend():
+            dense = None
+            num_layers = None
+            offset = 0
+            for dp_rank in range(self.dp_size):
+                info = self.reqs_info[dp_rank]
+                if not info.reqs or info.seq_lens is None or len(info.seq_lens) == 0:
+                    offset += per_dp_token_padding
+                    continue
+                local = 0
+                for req, seq_len, prefix_len in zip(info.reqs, info.seq_lens, info.prefix_lens):
+                    ext_len = int(seq_len) - int(prefix_len)
+                    ds_emb = getattr(req, "deepstack_visual_embedding", None)
+                    ds_mask = getattr(req, "deepstack_visual_pos_mask", None)
+                    if (
+                        getattr(req, "apply_for_deepstack", False)
+                        and ds_emb is not None
+                        and ds_mask is not None
+                        and ext_len > 0
+                    ):
+                        full_mask = np.asarray(ds_mask).astype(bool)
+                        emb_arr = np.asarray(ds_emb)  # (num_layers, num_visual, hidden)
+                        start = int(prefix_len or 0)
+                        end = start + ext_len
+                        # Only valid when the per-req mask spans the full prompt
+                        # (skips the audio-only dummy [1]-length fallback).
+                        if full_mask.shape[0] >= end and emb_arr.ndim == 3:
+                            window_mask = full_mask[start:end]
+                            nvis = int(window_mask.sum())
+                            if nvis > 0:
+                                vstart = int(full_mask[:start].sum())
+                                window_emb = emb_arr[:, vstart : vstart + nvis, :]
+                                if dense is None:
+                                    num_layers = emb_arr.shape[0]
+                                    dense = np.zeros(
+                                        (num_layers, total_token_size, emb_arr.shape[2]),
+                                        dtype=emb_arr.dtype,
+                                    )
+                                vis_pos = offset + local + np.nonzero(window_mask)[0]
+                                dense[:, vis_pos, :] = window_emb
+                    local += ext_len
+                offset += per_dp_token_padding
+            if dense is not None:
+                apply_for_deepstack = True
+                deepstack_visual_embedding = dense
+
         # Merge per-DP top_logprobs_nums / token_ids_logprobs with the same
         # offset_bs += per_dp_bs_padding padding scheme used in _merge_batch_metadata.
         if self.return_logprob:
@@ -2538,8 +2595,8 @@ class ScheduleBatch:
             per_dp_bs_size=per_dp_bs_padding,
             launch_done=self.launch_done,
             input_embedding=input_embedding,
-            apply_for_deepstack=False,
-            deepstack_visual_embedding=None,
+            apply_for_deepstack=apply_for_deepstack,
+            deepstack_visual_embedding=deepstack_visual_embedding,
             recurrent_indices=recurrent_indices_cpu,
             has_initial_state=has_initial_state_cpu,
             spec_algorithm=self.spec_algorithm,
