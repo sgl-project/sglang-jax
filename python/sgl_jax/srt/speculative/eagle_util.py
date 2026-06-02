@@ -776,6 +776,56 @@ class EagleVerifyOutput:
     accepted_indices: np.ndarray
 
 
+@dataclass
+class GreedySampleDeviceOutputs:
+    predict: jax.Array
+    accept_index: jax.Array
+    accept_length: jax.Array
+    verified_id: jax.Array
+    safe_index: jax.Array
+    select_index: jax.Array
+
+
+def greedy_sample_device_outputs(
+    *,
+    speculative_num_steps: int,
+    num_draft_tokens: int,
+    draft_tokens: jax.Array,
+    retrive_index: jax.Array,
+    retrive_next_token: jax.Array,
+    retrive_next_sibling: jax.Array,
+    next_token_logits: jax.Array,
+) -> GreedySampleDeviceOutputs:
+    accept_index_2d, accept_length_raw, predict = verify_tree_greedy(
+        speculative_num_steps=speculative_num_steps,
+        num_draft_tokens=num_draft_tokens,
+        draft_tokens=draft_tokens,
+        retrive_index=retrive_index,
+        retrive_next_token=retrive_next_token,
+        retrive_next_sibling=retrive_next_sibling,
+        next_token_logits=next_token_logits,
+    )
+    accept_length = accept_length_raw + 1
+    accept_width = speculative_num_steps + 1
+    accept_index = accept_index_2d.reshape(-1)
+    req_ids = jnp.arange(accept_index.shape[0], dtype=jnp.int32) // accept_width
+    per_req_last = req_ids * num_draft_tokens + num_draft_tokens - 1
+    safe_index = jnp.where(accept_index >= 0, accept_index, per_req_last)
+    safe_predict = jnp.take(predict.reshape(-1), safe_index)
+    verified_id = jnp.where(accept_index >= 0, safe_predict, jnp.zeros_like(safe_predict))
+    select_index = (
+        jnp.arange(accept_length.shape[0], dtype=jnp.int32) * accept_width + accept_length - 1
+    )
+    return GreedySampleDeviceOutputs(
+        predict=predict,
+        accept_index=accept_index,
+        accept_length=accept_length,
+        verified_id=verified_id,
+        safe_index=safe_index,
+        select_index=select_index,
+    )
+
+
 @register_pytree_node_class
 @dataclass
 class EagleVerifyInput:
