@@ -61,7 +61,9 @@ def gmm(
     if interpret is None:
         interpret = not is_tpu_runtime()
 
-    use_gmm_v2 = not interpret and is_supported_by_gmm_v2(rhs_scale)
+    use_gmm_v2 = not interpret and is_supported_by_gmm_v2(
+        rhs_scale, maybe_quantize_lhs=maybe_quantize_lhs
+    )
 
     # Pad LHS to multiple of 128 (or 32 for v2) on TPU to avoid small/unaligned tiles
     m = lhs.shape[0]

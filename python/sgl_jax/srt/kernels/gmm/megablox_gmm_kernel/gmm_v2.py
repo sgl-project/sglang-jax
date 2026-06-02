@@ -1064,6 +1064,18 @@ def gmm_v2(
     )(group_sizes, group_offset, lhs, rhs_weights)[:, : dims.size_n]
 
 
-def is_supported_by_gmm_v2(rhs_scale: jax.Array | None) -> bool:
-    # Supports per-channel (k_blocks=1) and block-wise (k_blocks>1, W8A16 path only).
-    return rhs_scale is None or rhs_scale.ndim == 4
+def is_supported_by_gmm_v2(
+    rhs_scale: jax.Array | None,
+    *,
+    maybe_quantize_lhs: bool = False,
+) -> bool:
+    if rhs_scale is None:
+        return True
+    if rhs_scale.ndim != 4:
+        return False
+    if rhs_scale.shape[1] == 1:
+        return True
+    # Block-wise rhs_scale (k_blocks > 1) is only implemented for the W8A16
+    # path (no lhs activation quant). Route W8A8 + block-scale to gmm_v1,
+    # which supports it via pre-quantized lhs in the backend.
+    return not maybe_quantize_lhs
