@@ -39,7 +39,6 @@ Both fit on a single v6e-4 host with `bfloat16`. See [TPU topology reference](..
 ### 2.2 Environment
 
 Install per [Install guide](../../../get_started/install.md) and use [Single-host Docker template](../../deployment/single-host-docker.md) for the container setup.
-The required JAX TPU container image: `us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1` (covers v5e / v5p / v6e Trillium / v7x Ironwood).
 
 ### 2.3 Launch
 
@@ -310,8 +309,6 @@ To see the full set of `--tool-call-parser` keys available in your build, run `p
 
 ## 4. Benchmark
 
-> Benchmark data below is a snapshot pinned to the `Tested build` listed in each Test Environment; not refreshed on every release. The full archived ISL × OSL × batch matrix and chart images live in [Qwen3 benchmark report](../../../performance/qwen3_benchmark.md) as a release-notes-style report.
-
 ### 4.1 Accuracy — GSM8K (thinking-on)
 
 **Test Environment**
@@ -461,6 +458,5 @@ Lower than the 1977 tok/s c=64 table cell because c=16 leaves the batch under-fi
 ## Additional Resources
 
 - [Qwen Model Cards](https://huggingface.co/Qwen)
-- [Qwen3 benchmark report](../../../performance/qwen3_benchmark.md) — full benchmark report with charts.
 - [Launch flags reference](../../base/launch-flags-reference.md)
 - [Cross-recipe troubleshooting](../../troubleshooting.md) — cross-recipe generic issues.

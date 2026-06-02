@@ -35,7 +35,6 @@ V6e-64 is the minimum slice that fits the official FP8 checkpoint plus runtime o
 ### 2.2 Environment
 
 Install per [Install guide](../../../get_started/install.md). Multi-host required — use [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) as the primary user-facing path. Advanced users running temporary v6e experiments can adapt [SkyPilot launcher](../../deployment/skypilot.md).
-The required JAX TPU container image: `us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1` (covers v5e / v5p / v6e Trillium / v7x Ironwood).
 
 For evaluation, additionally install `evalscope` in the client environment:
 

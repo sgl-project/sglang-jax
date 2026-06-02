@@ -42,7 +42,6 @@ See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU g
 ### 2.2 Environment
 
 Install per [Install guide](../../../get_started/install.md). **Build pin**: use sglang-jax 0.1.0 or later. For multi-host serving, use [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) as the primary user-facing path. Advanced users running temporary v6e experiments can adapt [SkyPilot launcher](../../deployment/skypilot.md).
-The required JAX TPU container image: `us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1` (covers v5e / v5p / v6e Trillium / v7x Ironwood).
 
 The community tokenizer is downloaded on first launch — no extra pip needed beyond standard install. For evaluation, additionally install `evalscope`:
 
