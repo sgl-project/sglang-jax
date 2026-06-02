@@ -256,7 +256,6 @@ direct_scaled_dot_ffn2_modes = parse_csv_bool(
 cast_ffn1_input_fp8 = os.environ.get("BENCH_CAST_FFN1_INPUT_FP8", "0") == "1"
 cast_ffn2_input_fp8 = os.environ.get("BENCH_CAST_FFN2_INPUT_FP8", "0") == "1"
 enable_act_quant = os.environ.get("BENCH_ACT_QUANT", "0") == "1"
-inkernel_metadata = os.environ.get("BENCH_INKERNEL_MD", "1") == "1"
 enable_bt_scatter_overlap = os.environ.get("BENCH_BT_SCATTER_OVERLAP", "1") == "1"
 cross_expert_prefetch_modes = parse_csv_str("BENCH_CROSS_EXPERT_PREFETCH", ["full"])
 next_w2_prologue_priorities = parse_csv_int("BENCH_NEXT_W2_PRIORITY", [1])
@@ -393,8 +392,6 @@ if direct_scaled_dot_ffn1_modes != [direct_scaled_dot] or direct_scaled_dot_ffn2
         "direct_scaled_dot hybrid sweep: "
         f"ffn1={direct_scaled_dot_ffn1_modes} ffn2={direct_scaled_dot_ffn2_modes}"
     )
-if inkernel_metadata:
-    log("inkernel_metadata=True (in-kernel ICI allgather, no JAX lax.all_gather)")
 if enable_bt_scatter_overlap:
     log("bt_scatter_overlap=True (next-BT scatter HBM bank overlap)")
 log(
@@ -1191,7 +1188,6 @@ for num_tokens in token_candidates:
                 skip_inter_bt_sync=skip_inter_bt_sync,
                 interleave_bt=interleave_bt,
                 enable_bt_scatter_overlap=enable_bt_scatter_overlap,
-                use_jax_allreduce_metadata=not inkernel_metadata,
             )
 
         try:
@@ -1308,7 +1304,6 @@ if check_correctness:
             skip_inter_bt_sync=skip_inter_bt_sync_modes[0],
             interleave_bt=interleave_bt_modes[0],
             enable_bt_scatter_overlap=enable_bt_scatter_overlap,
-            use_jax_allreduce_metadata=not inkernel_metadata,
         )
         ref_kwargs = {}
         if use_fp8:
