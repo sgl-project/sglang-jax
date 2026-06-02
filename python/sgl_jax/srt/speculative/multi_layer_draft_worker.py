@@ -288,7 +288,14 @@ class MultiLayerDraftWorker(EagleDraftWorker):
     def draft_extend_for_decode(
         self, model_worker_batch: ModelWorkerBatch, batch_output: GenerationBatchResult
     ) -> None:
-        """Decode-extend across all MTP layers — fused single JIT."""
+        """Decode-extend across all MTP layers."""
+        if getattr(model_worker_batch, "use_fused_greedy_decode_step3", False):
+            from sgl_jax.srt.speculative.draft_extend_fused import (
+                draft_extend_for_decode_fused_step3,
+            )
+
+            return draft_extend_for_decode_fused_step3(self, model_worker_batch, batch_output)
+
         from sgl_jax.srt.speculative.draft_extend_fused import (
             draft_extend_for_decode_fused,
         )

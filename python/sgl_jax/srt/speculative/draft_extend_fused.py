@@ -290,3 +290,13 @@ def draft_extend_for_decode_fused(draft_worker, model_worker_batch, batch_output
     batch_output.next_draft_input.verified_id = np.asarray(verified_id_arr)[select_index]
     batch_output.allocate_lens = batch_output.allocate_lens[: model_worker_batch.real_bs]
     batch_output.accept_lens = accept_host
+
+
+def draft_extend_for_decode_fused_step3(draft_worker, model_worker_batch, batch_output):
+    """Greedy fixed-shape path for verify postprocess plus fused MTP extend.
+
+    This entrypoint is intentionally a behavior-preserving skeleton for the
+    first routing step. Later tasks move verify postprocess and draft-extend
+    preparation into this path before collapsing it into one JIT boundary.
+    """
+    return draft_extend_for_decode_fused(draft_worker, model_worker_batch, batch_output)
