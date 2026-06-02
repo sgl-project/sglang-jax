@@ -59,6 +59,24 @@ jobs:
           cd test/srt
           python3 run_suite.py --suite nightly-test-perf-text-models-tpu-v6e-1-daily
 
+  nightly-test-openai-api-surface-1-tpu-daily:
+    if: github.repository == 'sgl-project/sglang-jax'
+    runs-on: arc-runner-v6e-1
+    env:
+      TZ: Asia/Shanghai
+      JAX_COMPILATION_CACHE_DIR: /xla-cache
+      SGLANG_JAX_MODEL_CACHE: /models/model_scope
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Setup Python environment
+        uses: ./.github/actions/setup-venv
+      - name: Run OpenAI API surface tests
+        timeout-minutes: 15
+        run: |
+          cd test/srt
+          python3 run_suite.py --suite nightly-test-openai-api-surface-tpu-v6e-1-daily
+
   multi-host-test-mimo-flash-daily:
     if: github.repository == 'sgl-project/sglang-jax'
     uses: ./.github/workflows/multi-host-test.yml
@@ -89,6 +107,7 @@ jobs:
     needs: [
       nightly-test-accuracy-text-models-1-tpu-daily,
       nightly-test-perf-text-models-1-tpu-daily,
+      nightly-test-openai-api-surface-1-tpu-daily,
       multi-host-test-mimo-flash-daily,
       nightly-infra-smoke-1-tpu-daily,
     ]
@@ -100,6 +119,7 @@ jobs:
           echo "=== Daily Test Results ==="
           echo "accuracy-1-tpu-daily: ${{ needs.nightly-test-accuracy-text-models-1-tpu-daily.result }}"
           echo "perf-text-1-tpu-daily: ${{ needs.nightly-test-perf-text-models-1-tpu-daily.result }}"
+          echo "openai-api-surface-1-tpu-daily: ${{ needs.nightly-test-openai-api-surface-1-tpu-daily.result }}"
           echo "multi-host-mimo-flash-daily: ${{ needs.multi-host-test-mimo-flash-daily.result }}"
           echo "infra-smoke-1-tpu-daily: ${{ needs.nightly-infra-smoke-1-tpu-daily.result }}"
           echo ""
@@ -108,6 +128,7 @@ jobs:
           for job_result in \
             "accuracy-1-tpu-daily=${{ needs.nightly-test-accuracy-text-models-1-tpu-daily.result }}" \
             "perf-text-1-tpu-daily=${{ needs.nightly-test-perf-text-models-1-tpu-daily.result }}" \
+            "openai-api-surface-1-tpu-daily=${{ needs.nightly-test-openai-api-surface-1-tpu-daily.result }}" \
             "multi-host-mimo-flash-daily=${{ needs.multi-host-test-mimo-flash-daily.result }}" \
             "infra-smoke-1-tpu-daily=${{ needs.nightly-infra-smoke-1-tpu-daily.result }}"; do
             job_name="${job_result%%=*}"
