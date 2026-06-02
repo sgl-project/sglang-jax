@@ -1,7 +1,12 @@
+from types import SimpleNamespace
+
 import jax.numpy as jnp
 import numpy as np
 
-from sgl_jax.srt.speculative.draft_extend_fused import _greedy_verify_postprocess_jit
+from sgl_jax.srt.speculative.draft_extend_fused import (
+    GreedyVerifyPostprocessOutput,
+    _greedy_verify_postprocess_jit,
+)
 
 
 def test_greedy_verify_postprocess_safe_index_matches_host_logic():
@@ -85,3 +90,65 @@ def test_multi_layer_draft_worker_routes_fixed_greedy_path(monkeypatch):
     worker.draft_extend_for_decode(batch, object())
 
     assert calls == ["step3"]
+
+
+def test_step3_entrypoint_applies_postprocess_before_fallback(monkeypatch):
+    from sgl_jax.srt.speculative import draft_extend_fused
+
+    post = GreedyVerifyPostprocessOutput(
+        next_token_logits=jnp.ones((8, 3), dtype=jnp.float32),
+        hidden_states=jnp.ones((8, 5), dtype=jnp.float32) * 2,
+        positions=jnp.arange(8, dtype=jnp.int32) + 200,
+        new_seq_lens=jnp.array([12, 23], dtype=jnp.int32),
+        select_index=jnp.array([1, 6], dtype=jnp.int32),
+        verified_id=jnp.arange(8, dtype=jnp.int32) + 10,
+        accept_lens=jnp.array([2, 3], dtype=jnp.int32),
+    )
+    calls = []
+
+    def fake_postprocess(*args, **kwargs):
+        calls.append(("postprocess", kwargs))
+        return post
+
+    def fake_fallback(worker, model_worker_batch, batch_output):
+        calls.append(("fallback", None))
+        assert batch_output.logits_output.next_token_logits is post.next_token_logits
+        assert batch_output.logits_output.hidden_states is post.hidden_states
+        assert batch_output.next_draft_input.hidden_states is post.hidden_states
+        assert batch_output.next_draft_input.verified_id is post.verified_id
+        assert batch_output.accept_lens is post.accept_lens
+        assert model_worker_batch.positions is post.positions
+
+    monkeypatch.setattr(draft_extend_fused, "_greedy_verify_postprocess_jit", fake_postprocess)
+    monkeypatch.setattr(draft_extend_fused, "draft_extend_for_decode_fused", fake_fallback)
+
+    draft_worker = SimpleNamespace(speculative_num_steps=3, speculative_num_draft_tokens=4)
+    model_worker_batch = SimpleNamespace(
+        positions=jnp.arange(8, dtype=jnp.int32),
+        seq_lens=jnp.array([10, 20], dtype=jnp.int32),
+    )
+    batch_output = SimpleNamespace(
+        logits_output=SimpleNamespace(
+            next_token_logits=jnp.zeros((8, 3), dtype=jnp.float32),
+            hidden_states=jnp.zeros((8, 5), dtype=jnp.float32),
+        ),
+        next_draft_input=SimpleNamespace(
+            accept_index=jnp.array([0, 1, -1, -1, 4, 5, 6, -1], dtype=jnp.int32),
+            verified_id=jnp.array([11, 12, 0, 0, 21, 22, 23, 0], dtype=jnp.int32),
+            new_seq_lens=None,
+        ),
+        accept_lens=jnp.array([2, 3], dtype=jnp.int32),
+    )
+
+    draft_extend_fused.draft_extend_for_decode_fused_step3(
+        draft_worker, model_worker_batch, batch_output
+    )
+
+    assert calls == [
+        (
+            "postprocess",
+            {"speculative_num_steps": 3, "speculative_num_draft_tokens": 4},
+        ),
+        ("fallback", None),
+    ]
+    assert batch_output.next_draft_input.new_seq_lens is post.new_seq_lens

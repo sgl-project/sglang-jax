@@ -295,8 +295,26 @@ def draft_extend_for_decode_fused(draft_worker, model_worker_batch, batch_output
 def draft_extend_for_decode_fused_step3(draft_worker, model_worker_batch, batch_output):
     """Greedy fixed-shape path for verify postprocess plus fused MTP extend.
 
-    This entrypoint is intentionally a behavior-preserving skeleton for the
-    first routing step. Later tasks move verify postprocess and draft-extend
-    preparation into this path before collapsing it into one JIT boundary.
+    The target verify forward still runs outside this function. This path keeps
+    greedy sample outputs on device, applies the safe-index gather in one JIT,
+    then delegates to the existing fused MTP draft extend implementation.
     """
+    post = _greedy_verify_postprocess_jit(
+        batch_output.logits_output.next_token_logits,
+        batch_output.logits_output.hidden_states,
+        model_worker_batch.positions,
+        model_worker_batch.seq_lens,
+        batch_output.next_draft_input.accept_index,
+        batch_output.accept_lens,
+        batch_output.next_draft_input.verified_id,
+        speculative_num_steps=draft_worker.speculative_num_steps,
+        speculative_num_draft_tokens=draft_worker.speculative_num_draft_tokens,
+    )
+    batch_output.logits_output.next_token_logits = post.next_token_logits
+    batch_output.logits_output.hidden_states = post.hidden_states
+    model_worker_batch.positions = post.positions
+    batch_output.next_draft_input.hidden_states = post.hidden_states
+    batch_output.next_draft_input.verified_id = post.verified_id
+    batch_output.next_draft_input.new_seq_lens = post.new_seq_lens
+    batch_output.accept_lens = post.accept_lens
     return draft_extend_for_decode_fused(draft_worker, model_worker_batch, batch_output)
