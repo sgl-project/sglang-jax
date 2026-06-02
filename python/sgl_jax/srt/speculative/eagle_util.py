@@ -340,6 +340,35 @@ def build_chain_verify_inputs(
     return out
 
 
+@functools.partial(jax.jit, static_argnames=["num_verify_tokens", "batch_size"])
+def build_chain_verify_inputs_device(
+    verified_id: jax.Array,
+    token_list: jax.Array,
+    seq_lens: jax.Array,
+    num_verify_tokens: int,
+    batch_size: int,
+) -> jax.Array:
+    """Device-side verify input builder for topk=1 linear chains."""
+    n = num_verify_tokens
+    bs = batch_size
+    tid_range = jnp.arange(n, dtype=jnp.int32)
+    draft_tokens = jnp.concatenate(
+        [verified_id.astype(jnp.int32)[:, None], token_list[:, : n - 1].astype(jnp.int32)],
+        axis=1,
+    ).reshape(bs * n)
+    positions = (seq_lens.astype(jnp.int32)[:, None] + tid_range[None, :]).reshape(bs * n)
+    retrive_index = jnp.arange(bs * n, dtype=jnp.int32)
+    retrive_next_token = jnp.broadcast_to(
+        jnp.concatenate([jnp.arange(1, n, dtype=jnp.int32), jnp.array([-1], dtype=jnp.int32)]),
+        (bs, n),
+    ).reshape(bs * n)
+    retrive_next_sibling = jnp.full((bs * n,), -1, dtype=jnp.int32)
+    return jnp.stack(
+        [draft_tokens, positions, retrive_index, retrive_next_token, retrive_next_sibling],
+        axis=0,
+    )
+
+
 def build_tree_kernel_efficient(
     verified_id: jax.Array,
     score_list: jax.Array,
