@@ -1823,6 +1823,82 @@ class ScheduleBatch:
 
         return input_ids_cpu, positions_cpu, out_cache_loc_cpu, real_input_ids_len
 
+    def _merge_mrope_positions(
+        self,
+        per_dp_token_size: int,
+        total_token_size: int,
+    ) -> np.ndarray | None:
+        """Merge 3-D mrope_positions from all DP ranks, aligned with input_ids.
+
+        Mirrors the DP-interleaved rank-offset layout of
+        ``_merge_input_and_positions``: each DP rank occupies a
+        ``per_dp_token_size`` slot (offset advances per rank, padding columns
+        stay zero), and within a rank per-req positions are written in the same
+        ``[prefix_len, seq_len)`` extend-window order used to build input_ids,
+        so ``out[:, k]`` lines up with ``input_ids[k]``.
+
+        Absorbs the per-req slice / delta / fallback logic of the former
+        single-rank ``_compute_mrope_positions_for_batch`` (orphaned by the DP
+        refactor de5287ed). Returns ``None`` when no request carries mrope data
+        so the model keeps its 1-D positions path (pure-text 0-diff).
+        """
+        has_mrope = any(
+            _extract_mm_value(getattr(req, "mm_inputs", None), "mrope_positions") is not None
+            or _extract_mm_value(getattr(req, "mm_inputs", None), "mrope_position_delta")
+            is not None
+            for info in self.reqs_info
+            if info.reqs
+            for req in info.reqs
+        )
+        if not has_mrope:
+            return None
+
+        is_decode = self.forward_mode.is_decode()
+        out = np.zeros((3, total_token_size), dtype=np.int32)
+        offset = 0
+        for dp_rank in range(self.dp_size):
+            info = self.reqs_info[dp_rank]
+            if not info.reqs or info.seq_lens is None or len(info.seq_lens) == 0:
+                offset += per_dp_token_size
+                continue
+            local = 0
+            if is_decode:
+                # One token per request; mrope advances by the cached delta.
+                for req, seq_len in zip(info.reqs, info.seq_lens):
+                    mm_inputs = getattr(req, "mm_inputs", None)
+                    base_pos = int(seq_len) - 1
+                    delta = _extract_mm_value(mm_inputs, "mrope_position_delta")
+                    if delta is not None:
+                        base_pos += _as_int_scalar(delta)
+                    out[:, offset + local] = base_pos
+                    local += 1
+            else:
+                for req, seq_len, prefix_len in zip(info.reqs, info.seq_lens, info.prefix_lens):
+                    ext_len = int(seq_len) - int(prefix_len)
+                    if ext_len <= 0:
+                        continue
+                    start = int(prefix_len or 0)
+                    mm_inputs = getattr(req, "mm_inputs", None)
+                    mm_positions = _extract_mm_value(mm_inputs, "mrope_positions")
+                    if mm_positions is None:
+                        # Text-only req in a mixed mrope batch: 1-D positions
+                        # broadcast to 3 rows (T==H==W), matching the model's
+                        # non-mrope fallback for these tokens.
+                        base = np.arange(start, start + ext_len, dtype=np.int32)
+                        chunk = np.broadcast_to(base.reshape(1, -1), (3, ext_len))
+                    else:
+                        chunk = np.asarray(mm_positions)[:, start : start + ext_len]
+                        if chunk.size == 0:
+                            delta = _extract_mm_value(mm_inputs, "mrope_position_delta")
+                            base = np.arange(start, start + ext_len, dtype=np.int32)
+                            if delta is not None:
+                                base = base + _as_int_scalar(delta)
+                            chunk = np.broadcast_to(base.reshape(1, -1), (3, ext_len))
+                    out[:, offset + local : offset + local + ext_len] = chunk
+                    local += ext_len
+            offset += per_dp_token_size
+        return out
+
     def _merge_batch_metadata(
         self,
         per_dp_bs_size: int,
@@ -2490,6 +2566,11 @@ class ScheduleBatch:
                 apply_for_deepstack = True
                 deepstack_visual_embedding = dense
 
+        # Reassemble 3-D mrope_positions (DP-aware), aligned column-for-column
+        # with input_ids_cpu. Returns None for pure-text batches so the model
+        # keeps its 1-D positions path. Restores wiring dropped by de5287ed.
+        mrope_positions = self._merge_mrope_positions(per_dp_token_padding, total_token_size)
+
         # Merge per-DP top_logprobs_nums / token_ids_logprobs with the same
         # offset_bs += per_dp_bs_padding padding scheme used in _merge_batch_metadata.
         if self.return_logprob:
@@ -2573,7 +2654,7 @@ class ScheduleBatch:
             token_ids_logprobs=token_ids_logprobs,
             sampling_info=sampling_info,
             positions=positions_cpu,
-            mrope_positions=None,
+            mrope_positions=mrope_positions,
             cache_loc=cache_loc_cpu,
             extend_prefix_lens=extend_prefix_lens,
             extend_seq_lens=extend_seq_lens,
@@ -2798,84 +2879,6 @@ def _as_int_scalar(value: Any, default: int = 0) -> int:
             return default
         return int(arr.reshape(-1)[0])
     return int(value)
-
-
-def _compute_mrope_positions_for_batch(
-    reqs: list[Req],
-    forward_mode: ForwardMode,
-    seq_lens_cpu: np.ndarray,
-    input_ids_len: int,
-    extend_prefix_lens: np.ndarray | None,
-    extend_seq_lens: np.ndarray | None,
-) -> np.ndarray | None:
-    mm_inputs_list = [getattr(req, "mm_inputs", None) for req in reqs]
-    has_mrope = any(
-        _extract_mm_value(mm, "mrope_positions") is not None
-        or _extract_mm_value(mm, "mrope_position_delta") is not None
-        for mm in mm_inputs_list
-    )
-    if not has_mrope:
-        return None
-
-    if forward_mode.is_decode():
-        mrope_positions_list = []
-        for batch_idx, mm_inputs in enumerate(mm_inputs_list):
-            base_pos = int(seq_lens_cpu[batch_idx]) - 1
-            delta = _extract_mm_value(mm_inputs, "mrope_position_delta")
-            if delta is not None:
-                base_pos += _as_int_scalar(delta)
-            mrope_positions_list.append(
-                np.full((3, 1), base_pos, dtype=np.int32),
-            )
-        mrope_positions = (
-            np.concatenate(mrope_positions_list, axis=1)
-            if mrope_positions_list
-            else np.zeros((3, 0), dtype=np.int32)
-        )
-    else:
-        if extend_prefix_lens is None or extend_seq_lens is None:
-            return None
-        mrope_positions_list = []
-        for batch_idx, mm_inputs in enumerate(mm_inputs_list):
-            extend_len = int(extend_seq_lens[batch_idx])
-            prefix_len = int(extend_prefix_lens[batch_idx])
-            if extend_len <= 0:
-                mrope_positions_list.append(np.zeros((3, 0), dtype=np.int32))
-                continue
-
-            mm_positions = _extract_mm_value(mm_inputs, "mrope_positions")
-            if mm_positions is None:
-                positions = np.arange(prefix_len, prefix_len + extend_len, dtype=np.int32)
-                mrope_positions_list.append(
-                    np.broadcast_to(positions.reshape(1, -1), (3, extend_len))
-                )
-                continue
-
-            mm_positions = np.asarray(mm_positions)
-            chunk = mm_positions[:, prefix_len : prefix_len + extend_len]
-            if chunk.size == 0:
-                delta = _extract_mm_value(mm_inputs, "mrope_position_delta")
-                if delta is not None:
-                    delta_val = _as_int_scalar(delta)
-                    positions = (
-                        np.arange(prefix_len, prefix_len + extend_len, dtype=np.int32) + delta_val
-                    )
-                else:
-                    positions = np.arange(prefix_len, prefix_len + extend_len, dtype=np.int32)
-                chunk = np.broadcast_to(positions.reshape(1, -1), (3, extend_len))
-            mrope_positions_list.append(chunk.astype(np.int32, copy=False))
-
-        mrope_positions = (
-            np.concatenate(mrope_positions_list, axis=1)
-            if mrope_positions_list
-            else np.zeros((3, 0), dtype=np.int32)
-        )
-
-    pad_len = input_ids_len - mrope_positions.shape[1]
-    if pad_len > 0:
-        pad = np.zeros((3, pad_len), dtype=mrope_positions.dtype)
-        mrope_positions = np.concatenate([mrope_positions, pad], axis=1)
-    return mrope_positions
 
 
 @dataclasses.dataclass
