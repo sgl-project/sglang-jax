@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from sgl_jax.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -17,5 +17,5 @@ class CacheInitParams:
 
     is_eagle: bool = False
 
-    chunked_prefill_size: Optional[int] = None
-    sliding_window_size: Optional[int] = None
+    chunked_prefill_size: int | None = None
+    sliding_window_size: int | None = None

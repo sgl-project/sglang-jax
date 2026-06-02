@@ -557,9 +557,7 @@ class Scheduler(
             )
 
     def init_memory_pool_and_cache(self):
-        self.req_to_token_pool, self.token_to_kv_pool_allocator = (
-            self.tp_worker.get_memory_pool()
-        )
+        self.req_to_token_pool, self.token_to_kv_pool_allocator = self.tp_worker.get_memory_pool()
         result = build_kv_cache(
             server_args=self.server_args,
             model_config=self.model_config,

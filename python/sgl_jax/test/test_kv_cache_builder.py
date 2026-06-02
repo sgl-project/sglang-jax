@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 from sgl_jax.srt.mem_cache.kv_cache_builder import KVCacheBuildResult, build_kv_cache
 
@@ -61,9 +61,7 @@ class TestBuildKVCache(unittest.TestCase):
 
     def test_disable_radix_with_chunked_prefill_returns_chunk_cache(self):
         result = build_kv_cache(
-            server_args=_make_server_args(
-                disable_radix_cache=True, chunked_prefill_size=8192
-            ),
+            server_args=_make_server_args(disable_radix_cache=True, chunked_prefill_size=8192),
             model_config=_make_model_config(),
             req_to_token_pool=MagicMock(),
             token_to_kv_pool_allocator=MagicMock(),

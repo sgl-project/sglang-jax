@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING
 
 from sgl_jax.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sgl_jax.srt.mem_cache.cache_init_params import CacheInitParams
@@ -20,7 +20,7 @@ class TreeCacheBuildContext:
     params: CacheInitParams
     is_hybrid_swa: bool
     disable_radix_cache: bool
-    effective_chunked_prefill_size: Optional[int]
+    effective_chunked_prefill_size: int | None
     model_config: ModelConfig
     tp_size: int
 
@@ -49,10 +49,7 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
             disable=False,
         )
 
-    if (
-        ctx.effective_chunked_prefill_size is not None
-        and ctx.disable_radix_cache
-    ):
+    if ctx.effective_chunked_prefill_size is not None and ctx.disable_radix_cache:
         from sgl_jax.srt.mem_cache.chunk_cache import ChunkCache
 
         return ChunkCache(
