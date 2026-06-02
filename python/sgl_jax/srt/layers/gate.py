@@ -104,8 +104,8 @@ class TopK(nnx.Module):
 
         if self.renormalize:
             topk_weights = topk_weights / (jnp.sum(topk_weights, axis=-1, keepdims=True))
-            if self.routed_scaling_factor is not None:
-                topk_weights *= self.routed_scaling_factor
+        if self.routed_scaling_factor is not None:
+            topk_weights *= self.routed_scaling_factor
 
         topk_weights = topk_weights.astype(jnp.float32)
 
