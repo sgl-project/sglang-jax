@@ -41,7 +41,7 @@ Install per [Install guide](../../../get_started/install.md). Multi-host require
 
 ### 2.3 Launch
 
-#### Multi-host (GKE Indexed Job) — TPU v6e-16 (minimum)
+#### Multi-host — TPU v6e-16 (minimum)
 
 Use [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) with `<JOB>=llama-70b`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=4x4`, `parallelism: 4`, and `completions: 4`. Put these model-specific flags into `<LAUNCH_FLAGS>`:
 
@@ -58,7 +58,7 @@ Use [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) with `<JOB>=
   --skip-server-warmup
 ```
 
-#### Multi-host (GKE Indexed Job) — TPU v6e-32 (recommended production)
+#### Multi-host — TPU v6e-32 (recommended production)
 
 Same as above but `<TOPOLOGY>=4x8`, `parallelism: 8`, `completions: 8`, and bump `--tp-size 32 --mem-fraction-static 0.9`.
 

@@ -57,7 +57,7 @@ MiMo-V2.5-Pro is multi-host only. Run the same command on every node; only `${NO
 - **TPU v7x-16 (4 nodes, `2x2x4`)** — reference path; v7x exposes 2 JAX devices per chip so `--tp-size 32` with 4 chips × 4 nodes. Lower latency on v7x interconnect.
 - **TPU v6e-64 (16 nodes, `4x4x4`)** — alternative when v7x-16 capacity is unavailable; tighter HBM per chip but works with the same launch shape (`--tp-size 64`, see SWA pool sizing in §2.4).
 
-#### Multi-host (GKE Indexed Job) — TPU v7x-16 (4 nodes, `2x2x4`)
+#### Multi-host — TPU v7x-16 (4 nodes, `2x2x4`)
 
 ```bash
 JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -m sgl_jax.launch_server \

@@ -49,7 +49,7 @@ Two multi-host paths below:
 - **TPU v6e-64 (16 nodes, `8x8`)** — the validated production target. R1 inherits V3's `--dp-size 8` mesh constraint (see §2.4); add `--reasoning-parser deepseek-r1` to expose `reasoning_content`.
 - **TPU v7x-8 (2 nodes, `2x4`, starter)** — smaller v7x alternative pending validation. Same launch shape with `--tp-size 16 --dp-size 1`; use lower concurrency.
 
-#### Multi-host (GKE Indexed Job) — TPU v6e-64
+#### Multi-host — TPU v6e-64
 
 Use [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) with `<JOB>=deepseek-r1`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=8x8`, `parallelism: 16`, `completions: 16`, and `backoffLimit: 16` (transient GKE control-plane blips happen; a non-zero backoff lets the job survive). Put these model-specific flags into `<LAUNCH_FLAGS>`:
 
@@ -70,7 +70,7 @@ Use [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) with `<JOB>=
 
 Mount a shared `JAX_COMPILATION_CACHE_DIR` on the same PVC as the model weights — first-time compile is ~4 minutes total (EXTEND ~70 s + DECODE ~3 min); subsequent restarts with the same mesh shape skip almost all of that.
 
-#### Multi-host (GKE Indexed Job) — TPU v7x-8 (starter)
+#### Multi-host — TPU v7x-8 (starter)
 
 Use `<ACCELERATOR>=tpu7x`, `<TOPOLOGY>=2x4`, `parallelism: 2`, and `completions: 2`; change the launch flags above to:
 

@@ -35,7 +35,7 @@ Install per [Install guide](../../../get_started/install.md). Multi-host require
 
 GLM-4.5-Air is multi-host only.
 
-#### Multi-host (GKE Indexed Job) — TPU v6e-32 (GLM-4.5-Air)
+#### Multi-host — TPU v6e-32 (GLM-4.5-Air)
 
 Use [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) with `<JOB>=glm-4-5-air`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=4x8`, `parallelism: 8`, and `completions: 8`. Put these model-specific flags into `<LAUNCH_FLAGS>`:
 

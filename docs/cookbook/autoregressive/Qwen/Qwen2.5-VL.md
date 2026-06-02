@@ -79,7 +79,7 @@ For Qwen2.5-VL-3B or Qwen2.5-VL-7B, use the same command shape but set `--model-
 
 > `--multimodal` is required — without it, the launcher boots the text-only HTTP server which has no ViT stage and cannot consume `image_url` / `video_url` content blocks.
 
-#### Multi-host (GKE Indexed Job) — Qwen2.5-VL-72B pending
+#### Multi-host — Qwen2.5-VL-72B pending
 
 Do not use a v6e-16/v6e-32 launch command for Qwen2.5-VL-72B as a cookbook path today. Current SGL-JAX multimodal staging does not provide a followable 72B multi-host setup, and simply changing `--tp-size` to 16 or 32 does not make the runtime use that larger slice correctly.
 

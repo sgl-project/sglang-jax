@@ -45,7 +45,7 @@ Install per [Install guide](../../../get_started/install.md). For multi-host lau
 
 Qwen3-30B-A3B is multi-host only.
 
-#### Multi-host (GKE Indexed Job) — TPU v6e-16 (Qwen3-30B-A3B)
+#### Multi-host — TPU v6e-16 (Qwen3-30B-A3B)
 
 Use [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) with `<JOB>=qwen3-moe`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=4x4`, `parallelism: 4`, and `completions: 4`. Put these model-specific flags into `<LAUNCH_FLAGS>`:
 

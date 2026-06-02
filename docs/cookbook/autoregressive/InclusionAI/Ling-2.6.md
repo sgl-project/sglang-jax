@@ -41,7 +41,7 @@ pip install evalscope==0.17.1
 
 ### 2.3 Launch
 
-#### Multi-host (GKE Indexed Job) — TPU v6e-64
+#### Multi-host — TPU v6e-64
 
 Use [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) with `<JOB>=ling-2-6`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=8x8`, `parallelism: 16`, `completions: 16`, and `backoffLimit: 16`. Put these model-specific flags into `<LAUNCH_FLAGS>`:
 

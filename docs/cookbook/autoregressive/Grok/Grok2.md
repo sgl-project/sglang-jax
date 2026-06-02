@@ -56,7 +56,7 @@ Grok-2 is multi-host only; cannot fit single-host. Two paths below:
 - **TPU v6e-64 (16 nodes)** — the validated production target. Use this unless v6e-64 capacity is unavailable.
 - **TPU v6e-32 (8 nodes, starter)** — smaller-slice fallback when v6e-64 isn't available. Same launch shape with `--tp-size 32`; expect tighter HBM headroom and lower throughput. Not yet validated end-to-end.
 
-#### Multi-host (GKE Indexed Job) — TPU v6e-64 (16 nodes)
+#### Multi-host — TPU v6e-64 (16 nodes)
 
 Use [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) with `<JOB>=grok-2`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=8x8`, `parallelism: 16`, `completions: 16`, and `backoffLimit: 16`. Put these model-specific flags into `<LAUNCH_FLAGS>`:
 
@@ -78,7 +78,7 @@ Use [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) with `<JOB>=
 
 Mount a shared `JAX_COMPILATION_CACHE_DIR` on the same PVC as the model weights — first cold compile is ~5-10 min, much faster than 1T-class models since the MoE kernel shape sweep is smaller.
 
-#### Multi-host (GKE Indexed Job) — TPU v6e-32 (8 nodes, starter)
+#### Multi-host — TPU v6e-32 (8 nodes, starter)
 
 Change `<TOPOLOGY>=4x8`, `parallelism: 8`, `completions: 8`, and adjust the parallelism flags:
 

@@ -69,7 +69,7 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -u -m sgl_jax.launch_server \
   --host 0.0.0.0 --port 30000
 ```
 
-#### Multi-host (GKE Indexed Job) — TPU v6e-16 (4 nodes)
+#### Multi-host — TPU v6e-16 (4 nodes)
 
 The launch command is the same on every node — only `${NODE_RANK}` and `${MASTER_ADDR}` vary. `${NODE_RANK}` ranges from `0` to `3`.
 
