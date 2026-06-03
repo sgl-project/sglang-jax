@@ -191,7 +191,12 @@ class EAGLEWorker(BaseSpecWorker):
                     per_dp_bs_size=per_dp_bs,
                 )
                 num_steps = self.speculative_num_steps
-                topk_shape = (bs, num_steps, self.topk) if num_steps > 1 else (bs, self.topk)
+                from sgl_jax.srt.speculative.multi_layer_draft_worker import (
+                    MultiLayerDraftWorker,
+                )
+
+                is_multi_layer = isinstance(self.draft_worker, MultiLayerDraftWorker)
+                topk_shape = (bs, num_steps, self.topk) if is_multi_layer else (bs, self.topk)
                 spec_info = EagleDraftInput(
                     topk_p=jnp.ones(
                         topk_shape,

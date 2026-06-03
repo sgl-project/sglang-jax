@@ -928,7 +928,6 @@ class EagleVerifyInput:
                     dtype=model_worker_batch.model_config.dtype,
                     topk=self.topk,
                     capture_hidden_mode=CaptureHiddenMode.LAST,
-                    num_steps=self.spec_steps,
                 ),
                 logits_output=logits_output,
                 verified_id=jnp.empty(0, dtype=jnp.int32),
