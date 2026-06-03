@@ -11,7 +11,6 @@ from jax.sharding import PartitionSpec as P
 from sgl_jax.srt.speculative.draft_extend_fused import (
     _greedy_sample_and_prepare_draft_inputs,
     _greedy_step3_prepare_draft_inputs,
-    _replicate_for_host_output,
 )
 
 
@@ -633,31 +632,6 @@ def test_greedy_step3_prepare_draft_inputs_preserves_position_data_sharding():
     assert out.positions.sharding == data_sharding
 
 
-def test_replicate_for_host_output_reshards_data_sharded_array():
-    devices = np.asarray(jax.devices())
-    if devices.size < 4:
-        pytest.skip("requires at least 4 JAX devices for a 2x2 mesh")
-
-    mesh = Mesh(
-        devices[:4].reshape(2, 2),
-        ("data", "tensor"),
-        axis_types=(AxisType.Explicit, AxisType.Explicit),
-    )
-    data_sharding = NamedSharding(mesh, P("data"))
-    replicated_sharding = NamedSharding(mesh, P())
-    value = jax.device_put(jnp.array([12, 23], dtype=jnp.int32), data_sharding)
-
-    @jax.jit
-    def replicate(value):
-        return _replicate_for_host_output(value, replicated_sharding)
-
-    with jax.set_mesh(mesh):
-        out = replicate(value)
-
-    assert out.sharding.is_fully_replicated
-    np.testing.assert_array_equal(np.asarray(out), np.array([12, 23], dtype=np.int32))
-
-
 def test_fused_greedy_jit_does_not_reshard_model_outputs_before_compute():
     from sgl_jax.srt.speculative import draft_extend_fused
 
@@ -676,6 +650,12 @@ def test_fused_greedy_jit_uses_constraints_for_final_host_outputs():
 
     assert "_replicate_for_host_output" not in source
     assert "jax.lax.with_sharding_constraint" in source
+
+
+def test_obsolete_host_output_reshard_helper_is_removed():
+    from sgl_jax.srt.speculative import draft_extend_fused
+
+    assert not hasattr(draft_extend_fused, "_replicate_for_host_output")
 
 
 def test_fused_greedy_jit_only_returns_large_target_outputs_when_requested():

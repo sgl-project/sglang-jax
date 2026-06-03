@@ -255,11 +255,6 @@ def _device_rotate_input_ids(input_ids, ext_lens, sel_pos, new_tokens):
     return shifted_2d.reshape(-1)
 
 
-def _replicate_for_host_output(value, replicated_sharding):
-    """Move final small scheduler outputs to replicated sharding."""
-    return jax.sharding.reshard(value, replicated_sharding)
-
-
 def _gather_rows_preserve_sharding(values, index):
     sharding = jax.typeof(values).sharding
     if isinstance(sharding, NamedSharding) and not sharding.mesh.empty:
