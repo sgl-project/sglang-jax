@@ -1,4 +1,17 @@
-"""Shared-secret helpers for PD channels."""
+"""Shared-secret auth helpers for PD channels.
+
+The three PD channels — bootstrap HTTP, transfer pull side channel,
+and ZMQ ack channel — all share a single secret. Each channel
+applies the secret differently (Bearer header for HTTP, HMAC tag
+beside the payload for ZMQ / transfer), but the resolution rules and
+constant-time compare live here so every channel agrees on the same
+edge cases.
+
+Resolution order:
+  1. ``SGL_JAX_PD_SHARED_SECRET`` environment variable.
+  2. ``ServerArgs.disaggregation_shared_secret``.
+  3. ``None`` → auth is disabled.
+"""
 
 from __future__ import annotations
 
@@ -10,12 +23,6 @@ _ENV_VAR = "SGL_JAX_PD_SHARED_SECRET"
 
 
 def resolve_secret(server_args_value: str | None) -> str | None:
-    """Return the effective PD shared secret.
-
-    The environment override wins so operators can inject or rotate the
-    secret without changing CLI/config wiring.
-    """
-
     env = os.environ.get(_ENV_VAR)
     if env:
         return env
@@ -23,17 +30,30 @@ def resolve_secret(server_args_value: str | None) -> str | None:
 
 
 def compute_tag(secret: str, payload: bytes) -> bytes:
-    """Return the HMAC-SHA256 tag for ``payload``."""
-
     return hmac.new(secret.encode("utf-8"), payload, sha256).digest()
 
 
-def verify_tag(secret: str | None, payload: bytes, candidate: bytes | None) -> bool:
-    """Return whether ``candidate`` matches the expected HMAC tag."""
-
+def verify_tag(
+    secret: str | None, payload: bytes, candidate: bytes | None
+) -> bool:
     if secret is None:
         return True
     if candidate is None:
         return False
     expected = compute_tag(secret, payload)
     return hmac.compare_digest(expected, candidate)
+
+
+def bearer_header(secret: str | None) -> dict:
+    if secret is None:
+        return {}
+    return {"Authorization": f"Bearer {secret}"}
+
+
+def verify_bearer(secret: str | None, header_value: str | None) -> bool:
+    if secret is None:
+        return True
+    if not header_value or not header_value.startswith("Bearer "):
+        return False
+    candidate = header_value[len("Bearer "):]
+    return hmac.compare_digest(secret, candidate)
