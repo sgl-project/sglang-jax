@@ -52,32 +52,12 @@ pip install evalscope==0.17.1
 
 ### 2.3 Launch
 
-MiMo-V2.5-Pro is multi-host only. Run the same command on every node; only `${NODE_RANK}` and `${MASTER_ADDR}` vary across nodes. Two equivalent paths:
+MiMo-V2.5-Pro is multi-host only. Run the same command on every node; only `${NODE_RANK}` and `${MASTER_ADDR}` vary across nodes. Two slices below:
 
-- **TPU v7x-16 (4 nodes, `2x2x4`)** — reference path; v7x exposes 2 JAX devices per chip so `--tp-size 32` with 4 chips × 4 nodes. Lower latency on v7x interconnect.
-- **TPU v6e-64 (16 nodes, `4x4x4`)** — alternative when v7x-16 capacity is unavailable; tighter HBM per chip but works with the same launch shape (`--tp-size 64`, see SWA pool sizing in §2.4).
+- **TPU v6e-64 (16 nodes, `4x4x4`)** — the slice we measured on; §4 numbers are pinned here. `--tp-size 64`, see SWA pool sizing in §2.4.
+- **TPU v7x-16 (4 nodes, `2x2x4`)** — same launch shape on different hardware; v7x exposes 2 JAX devices per chip so `--tp-size 32` over 4 chips × 4 nodes. Historical AIME 2025 reference numbers in §4.1; not rerun on the current build.
 
-#### Multi-host — TPU v7x-16 (4 nodes, `2x2x4`)
-
-```bash
-JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -m sgl_jax.launch_server \
-  --model-path XiaomiMiMo/MiMo-V2.5-Pro \
-  --trust-remote-code \
-  --tp-size 32 --dp-size 4 --ep-size 32 \
-  --moe-backend fused \
-  --page-size 256 --context-length 262144 \
-  --chunked-prefill-size 4096 \
-  --dtype bfloat16 --mem-fraction-static 0.95 \
-  --swa-full-tokens-ratio 0.25 \
-  --max-running-requests 512 \
-  --attention-backend fa \
-  --skip-server-warmup \
-  --nnodes 4 --node-rank ${NODE_RANK} \
-  --dist-init-addr ${MASTER_ADDR} \
-  --host 0.0.0.0 --port 30000
-```
-
-`${NODE_RANK}` ranges from `0` to `3`.
+For other slices, see [Adapting to other topologies](../../base/tpu-topology-reference.md#adapting-to-other-topologies).
 
 #### Multi-host — TPU v6e-64 (16 nodes, `4x4x4`)
 
@@ -99,7 +79,29 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -m sgl_jax.launch_server \
   --host 0.0.0.0 --port 30000
 ```
 
-`${NODE_RANK}` ranges from `0` to `15`. Compared with v7x-16, this lowers `--mem-fraction-static` to `0.92` and `--swa-full-tokens-ratio` to `0.15` because v6e has less HBM per chip — the lower SWA ratio shifts the smaller KV pool toward full-attention layers.
+`${NODE_RANK}` ranges from `0` to `15`.
+
+#### Multi-host — TPU v7x-16 (4 nodes, `2x2x4`)
+
+```bash
+JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -m sgl_jax.launch_server \
+  --model-path XiaomiMiMo/MiMo-V2.5-Pro \
+  --trust-remote-code \
+  --tp-size 32 --dp-size 4 --ep-size 32 \
+  --moe-backend fused \
+  --page-size 256 --context-length 262144 \
+  --chunked-prefill-size 4096 \
+  --dtype bfloat16 --mem-fraction-static 0.95 \
+  --swa-full-tokens-ratio 0.25 \
+  --max-running-requests 512 \
+  --attention-backend fa \
+  --skip-server-warmup \
+  --nnodes 4 --node-rank ${NODE_RANK} \
+  --dist-init-addr ${MASTER_ADDR} \
+  --host 0.0.0.0 --port 30000
+```
+
+`${NODE_RANK}` ranges from `0` to `3`. Compared with v6e-64, this raises `--mem-fraction-static` to `0.95` and `--swa-full-tokens-ratio` to `0.25` because v7x has more HBM per chip — the higher SWA ratio gives sliding-window layers more KV.
 
 For the GKE Indexed Job + headless Service manifest pattern that wraps both launch commands, see [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) — fill in `<JOB>=mimo-v25-pro`, `<ACCELERATOR>=tpu7x` (v7x) or `tpu-v6e-slice` (v6e), `<TOPOLOGY>=2x2x4` / `4x4x4`, `<N>=4` / `16`, and paste the launch flags above into `<LAUNCH_FLAGS>`. For temporary v6e experiments, advanced users can adapt [SkyPilot launcher](../../deployment/skypilot.md); the default SkyPilot template is v6e-only, so use GKE for v7x.
 

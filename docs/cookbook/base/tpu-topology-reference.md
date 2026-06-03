@@ -62,6 +62,57 @@ with `dtype_bytes = 2` for `bfloat16`, `1` for FP8. The MiMo-V2-Flash recipe rec
 
 `--mem-fraction-static` defaults to 0.88 on TPU (`server_args.py` `__post_init__`); raising to 0.95 is common for dedicated serving but leaves no room for short-lived buffers from other processes on the same host.
 
+## Adapting to other topologies
+
+Each cookbook recipe ships **the slice we had access to when measuring** — that's the reproducibility contract, not a designed "tier" claim. If you have a different (larger / smaller / cross-generation) slice, the launch flags follow a small set of mechanical scaling rules:
+
+### 1. Tested config vs minimum requirement
+
+A recipe's `## 2.1 Hardware Matrix` will surface two facts:
+
+- **Tested configuration** — the slice we ran the §4 numbers on. Launch command in §2.3 is verbatim copyable.
+- **Minimum requirement** — the smallest slice the model fits, derived from BF16/FP8 weight footprint + per-token KV + activation peak.
+
+Anything between (and many things above) the minimum is also valid; the recipe just doesn't carry §4 numbers for those slices yet.
+
+### 2. Scale up to a larger slice (same generation)
+
+`--tp-size` and `--ep-size` scale linearly with chip count. Worked example using DeepSeek-V3 on v6e:
+
+| Slice | Chips | `--tp-size` | `--dp-size` | `--ep-size` | Notes |
+|---|---|---|---|---|---|
+| v6e-32 | 32 | 32 | 4 | 32 | hits FP8 shared-expert collapse at `dp=4` — see DeepSeek-V3 §2.4 |
+| v6e-64 (tested) | 64 | 64 | **8** | 64 | tested configuration; `dp=8` mandatory for FP8 mesh |
+| v6e-128 | 128 | 128 | 16 | 128 | extrapolation; `dp=16` still satisfies `144 % tensor == 0` and shared-expert `2048/(tp/dp)=128` |
+
+The model-specific mesh constraints (`dp` divisibility, MoE expert divisibility, GLA `num_groups` ≤ tensor axis) usually pin `--dp-size` and force `--tp-size` to be a multiple of something — check §2.4 of the target recipe before scaling.
+
+### 3. Swap v6e ↔ v7x
+
+v7x exposes **2 JAX devices per chip**, so `--tp-size = chip_count × 2`. A v7x-N slice maps to the same `--tp-size` as v6e-(2N). Examples:
+
+| v6e slice | Equivalent `--tp-size` | v7x slice | Notes |
+|---|---|---|---|
+| v6e-16 | 16 | v7x-8 | same `--tp-size`, v7x has more HBM per device |
+| v6e-32 | 32 | v7x-16 | same launch shape; v7x interconnect lower latency |
+| v6e-64 | 64 | v7x-32 | both viable for trillion-class MoE |
+
+Memory math also changes — v7x's 96 GiB / JAX device vs v6e's 32 GiB means a tighter v6e slice can be replaced by a smaller v7x chip count. Re-derive the minimum requirement from HBM math, not just chip count.
+
+### 4. Scale down toward the minimum
+
+Lower bound is set by **weight footprint + activation peak + KV pool**, not by `--tp-size` math. Common failure modes when too small:
+
+- `RESOURCE_EXHAUSTED: ... Used 31.X G of 31.25 G hbm` during EXTEND precompile — drop `--chunked-prefill-size` and `--max-running-requests` before lowering `--tp-size`.
+- Block-wise FP8 accuracy collapse if `tensor_axis` divides `moe_intermediate_size` to ≤ `block_size_out` (DSV-V3 footnote).
+- MoE expert-axis ≥ `ep_size`; can't reduce `--ep-size` below `num_local_experts`.
+
+The recipe's §5 troubleshooting table usually flags these.
+
+### 5. When to add a new tested row to the cookbook
+
+If you run a recipe successfully on a different slice and want to upstream the result: file a PR that adds a row to that recipe's §2.1 hardware matrix and a `#### Multi-host — TPU <slice>` subsection in §2.3 with the measured numbers. Don't list a slice you haven't run end-to-end.
+
 ## GKE / SkyPilot identifiers
 
 | Identifier | Value | Used in |
@@ -76,4 +127,4 @@ with `dtype_bytes = 2` for `bfloat16`, `1` for FP8. The MiMo-V2-Flash recipe rec
 
 - Pricing / region availability — see Google Cloud TPU docs.
 - Provisioning / quota workflows — see [`developer_guide/tpu_resources_guide.md`](../../developer_guide/tpu_resources_guide.md) (SkyPilot) and per-recipe GKE manifests.
-- Per-recipe TP/DP/EP picks — those live in each recipe's *Hardware Requirements* table.
+- Per-recipe TP/DP/EP numbers and the §4 benchmark data points — those live in each recipe's `## 2.1 Hardware Matrix`. This page covers the **scaling math** to adapt them, not the specific tested numbers.

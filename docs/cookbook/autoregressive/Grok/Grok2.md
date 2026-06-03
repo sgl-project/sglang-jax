@@ -29,15 +29,14 @@ title: "Grok-2"
 
 ### 2.1 Hardware Matrix
 
-| Tier | TPU | Topology | Nodes | Chips | `--tp-size` | `--ep-size` | `--moe-backend` | Status | Notes |
+| Role | TPU | Topology | Nodes | Chips | `--tp-size` | `--ep-size` | `--moe-backend` | Status | Notes |
 |---|---|---|---|---|---|---|---|---|---|
-| Recommended production | **v6e-64** | 8x8 | 16 | 64 | 64 | 8 | `fused` | 🧪 in validation | Primary validation target. 64-chip slice; ~8.4 GB weights per chip, plenty of room for KV / activations. `--ep-size 8` matches the 8 experts (and the pre-sharded TP-{000..007} file layout). |
-| Minimum runnable | **v6e-32** | 4x8 | 8 | 32 | 32 | 8 | `fused` | 🚧 starter | Smaller v6e slice; same flags but `--tp-size 32`. Tighter HBM but should fit BF16. Not validated end-to-end yet. |
-| Alternative | **v7x-16** | 4x4 | 4 | 16 (32 devices) | 32 | 8 | `fused` | 🚧 starter | v7x exposes 2 JAX devices per chip → 16 × 2 = 32. Same `--tp-size 32` shape as v6e-32 but with more HBM headroom. Not validated end-to-end yet. |
+| Tested configuration | **v6e-64** | 8x8 | 16 | 64 | 64 | 8 | `fused` | 🧪 in validation | Slice we measured on. 64-chip slice; ~8.4 GB weights per chip, plenty of room for KV / activations. `--ep-size 8` matches the 8 experts (and the pre-sharded TP-{000..007} file layout). |
+| HBM minimum | **v6e-32** | 4x8 | 8 | 32 | 32 | 8 | `fused` | 🚧 starter | Smallest v6e slice the pre-sharded TP=8 layout fits cleanly. Same flags but `--tp-size 32`. Tighter HBM but should fit BF16. Not measured end-to-end yet. |
 
-**Pre-sharded TP=8 constraint**: the checkpoint files are named `pytorch_model-NNNNN-TP-{000..007}.safetensors` — `--tp-size` must be a multiple of 8 so the loader can map each pre-shard onto a contiguous device slice. v6e-64 (`tp=64=8×8`), v6e-32 (`tp=32=8×4`), and v7x-16 (`tp=32=8×4` over 32 JAX devices) all satisfy this.
+**Pre-sharded TP=8 constraint**: the checkpoint files are named `pytorch_model-NNNNN-TP-{000..007}.safetensors` — `--tp-size` must be a multiple of 8 so the loader can map each pre-shard onto a contiguous device slice. v6e-64 (`tp=64=8×8`) and v6e-32 (`tp=32=8×4`) both satisfy this; v7x topologies that expose `--tp-size` as a multiple of 8 are also valid.
 
-See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation reference.
+These are the two slices we walked end-to-end. For other slices (larger v6e, v7x variants), see [Adapting to other topologies](../../base/tpu-topology-reference.md#adapting-to-other-topologies) in the topology reference — the `--tp-size = chip_count × devices_per_chip` and `tp_size % 8 == 0` rules carry over directly.
 
 ### 2.2 Environment
 
@@ -53,8 +52,10 @@ pip install evalscope==0.17.1
 
 Grok-2 is multi-host only; cannot fit single-host. Two paths below:
 
-- **TPU v6e-64 (16 nodes)** — the validated production target. Use this unless v6e-64 capacity is unavailable.
-- **TPU v6e-32 (8 nodes, starter)** — smaller-slice fallback when v6e-64 isn't available. Same launch shape with `--tp-size 32`; expect tighter HBM headroom and lower throughput. Not yet validated end-to-end.
+- **TPU v6e-64 (16 nodes)** — the slice we measured on; §4 numbers are pinned to this configuration.
+- **TPU v6e-32 (8 nodes, HBM minimum)** — same launch shape with `--tp-size 32`. Smallest v6e slice the pre-sharded TP=8 layout fits cleanly. Tighter HBM, lower concurrency; not measured end-to-end yet.
+
+For other slices (larger v6e, v7x variants), see [Adapting to other topologies](../../base/tpu-topology-reference.md#adapting-to-other-topologies).
 
 #### Multi-host — TPU v6e-64 (16 nodes)
 
