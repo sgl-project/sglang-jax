@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from sgl_jax.srt.mem_cache.base_prefix_cache import BasePrefixCache
@@ -18,13 +17,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-@dataclass(frozen=True)
-class KVCacheBuildResult:
-    tree_cache: BasePrefixCache
-    is_hybrid_swa: bool
-    sliding_window_size: int | None
-
-
 def build_kv_cache(
     *,
     server_args: ServerArgs,
@@ -36,7 +28,7 @@ def build_kv_cache(
     sliding_window_size: int | None,
     tp_size: int,
     spec_algorithm: SpeculativeAlgorithm | None,
-) -> KVCacheBuildResult:
+) -> BasePrefixCache:
     params = CacheInitParams(
         req_to_token_pool=req_to_token_pool,
         token_to_kv_pool_allocator=token_to_kv_pool_allocator,
@@ -45,7 +37,7 @@ def build_kv_cache(
         sliding_window_size=sliding_window_size,
     )
 
-    tree_cache = create_tree_cache(
+    return create_tree_cache(
         TreeCacheBuildContext(
             server_args=server_args,
             params=params,
@@ -55,10 +47,4 @@ def build_kv_cache(
             model_config=model_config,
             tp_size=tp_size,
         )
-    )
-
-    return KVCacheBuildResult(
-        tree_cache=tree_cache,
-        is_hybrid_swa=is_hybrid,
-        sliding_window_size=sliding_window_size,
     )

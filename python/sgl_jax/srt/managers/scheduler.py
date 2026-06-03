@@ -558,7 +558,7 @@ class Scheduler(
 
     def init_memory_pool_and_cache(self):
         self.req_to_token_pool, self.token_to_kv_pool_allocator = self.tp_worker.get_memory_pool()
-        result = build_kv_cache(
+        self.tree_cache = build_kv_cache(
             server_args=self.server_args,
             model_config=self.model_config,
             req_to_token_pool=self.req_to_token_pool,
@@ -569,7 +569,6 @@ class Scheduler(
             tp_size=self.tp_size,
             spec_algorithm=self.spec_algorithm,
         )
-        self.tree_cache = result.tree_cache
 
     def _select_round_robin_dp(self) -> int:
         dp_rank = self.dp_round_robin_counter % self.dp_size

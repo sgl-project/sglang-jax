@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import MagicMock
 
-from sgl_jax.srt.mem_cache.kv_cache_builder import KVCacheBuildResult, build_kv_cache
+from sgl_jax.srt.mem_cache.kv_cache_builder import build_kv_cache
 
 
 def _make_server_args(**overrides):
@@ -24,7 +24,7 @@ def _make_model_config():
 
 class TestBuildKVCache(unittest.TestCase):
     def test_default_returns_radix_cache(self):
-        result = build_kv_cache(
+        cache = build_kv_cache(
             server_args=_make_server_args(),
             model_config=_make_model_config(),
             req_to_token_pool=MagicMock(),
@@ -35,15 +35,12 @@ class TestBuildKVCache(unittest.TestCase):
             tp_size=1,
             spec_algorithm=None,
         )
-        self.assertIsInstance(result, KVCacheBuildResult)
         from sgl_jax.srt.mem_cache.radix_cache import RadixCache
 
-        self.assertIsInstance(result.tree_cache, RadixCache)
-        self.assertFalse(result.is_hybrid_swa)
-        self.assertIsNone(result.sliding_window_size)
+        self.assertIsInstance(cache, RadixCache)
 
     def test_disable_radix_no_chunked_prefill_returns_disabled_radix(self):
-        result = build_kv_cache(
+        cache = build_kv_cache(
             server_args=_make_server_args(disable_radix_cache=True),
             model_config=_make_model_config(),
             req_to_token_pool=MagicMock(),
@@ -56,11 +53,11 @@ class TestBuildKVCache(unittest.TestCase):
         )
         from sgl_jax.srt.mem_cache.radix_cache import RadixCache
 
-        self.assertIsInstance(result.tree_cache, RadixCache)
-        self.assertTrue(result.tree_cache.disable)
+        self.assertIsInstance(cache, RadixCache)
+        self.assertTrue(cache.disable)
 
     def test_disable_radix_with_chunked_prefill_returns_chunk_cache(self):
-        result = build_kv_cache(
+        cache = build_kv_cache(
             server_args=_make_server_args(disable_radix_cache=True, chunked_prefill_size=8192),
             model_config=_make_model_config(),
             req_to_token_pool=MagicMock(),
@@ -73,13 +70,13 @@ class TestBuildKVCache(unittest.TestCase):
         )
         from sgl_jax.srt.mem_cache.chunk_cache import ChunkCache
 
-        self.assertIsInstance(result.tree_cache, ChunkCache)
+        self.assertIsInstance(cache, ChunkCache)
 
     def test_hybrid_returns_swa_radix_cache(self):
         from sgl_jax.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 
         mock_allocator = MagicMock(spec=SWATokenToKVPoolAllocator)
-        result = build_kv_cache(
+        cache = build_kv_cache(
             server_args=_make_server_args(),
             model_config=_make_model_config(),
             req_to_token_pool=MagicMock(),
@@ -92,12 +89,10 @@ class TestBuildKVCache(unittest.TestCase):
         )
         from sgl_jax.srt.mem_cache.swa_radix_cache import SWARadixCache
 
-        self.assertIsInstance(result.tree_cache, SWARadixCache)
-        self.assertTrue(result.is_hybrid_swa)
-        self.assertEqual(result.sliding_window_size, 4096)
+        self.assertIsInstance(cache, SWARadixCache)
 
     def test_hybrid_disable_radix_returns_swa_chunk_cache(self):
-        result = build_kv_cache(
+        cache = build_kv_cache(
             server_args=_make_server_args(disable_radix_cache=True),
             model_config=_make_model_config(),
             req_to_token_pool=MagicMock(),
@@ -110,12 +105,12 @@ class TestBuildKVCache(unittest.TestCase):
         )
         from sgl_jax.srt.mem_cache.chunk_cache import SWAChunkCache
 
-        self.assertIsInstance(result.tree_cache, SWAChunkCache)
+        self.assertIsInstance(cache, SWAChunkCache)
 
     def test_eagle_spec_algorithm(self):
         spec = MagicMock()
         spec.is_eagle.return_value = True
-        result = build_kv_cache(
+        cache = build_kv_cache(
             server_args=_make_server_args(),
             model_config=_make_model_config(),
             req_to_token_pool=MagicMock(),
@@ -128,8 +123,8 @@ class TestBuildKVCache(unittest.TestCase):
         )
         from sgl_jax.srt.mem_cache.radix_cache import RadixCache
 
-        self.assertIsInstance(result.tree_cache, RadixCache)
-        self.assertTrue(result.tree_cache.is_eagle)
+        self.assertIsInstance(cache, RadixCache)
+        self.assertTrue(cache.is_eagle)
 
 
 if __name__ == "__main__":
