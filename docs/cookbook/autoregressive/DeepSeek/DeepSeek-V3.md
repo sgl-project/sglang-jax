@@ -4,7 +4,7 @@ title: "DeepSeek V3"
 
 # DeepSeek V3 on SGL-JAX
 
-> **Validated recipe** — TPU v6e-64 path validated on sglang-jax 0.1.0: server starts, greedy output correct, GSM8K accuracy 97.5% (200 examples), `bench_serving` numbers in §4.2. TPU v7x path is still a starter target.
+> **Validated recipe** — TPU v6e-64 path validated on sglang-jax 0.1.0: server starts, greedy output correct, GSM8K accuracy 97.5% (200 examples), `bench_serving` numbers in §4.2.
 
 ## 1. Model Introduction
 
@@ -25,12 +25,11 @@ title: "DeepSeek V3"
 
 ### 2.1 Hardware Matrix
 
-| Tier | TPU | Topology | Nodes | Chips / JAX devices | `--tp-size` | `--dp-size` | Tensor axis | `--ep-size` | Status | Notes |
-|---|---|---|---|---|---|---|---|---|---|---|
-| Minimum & recommended production | v6e-64 | 8x8 | 16 | 64 | 64 | 8 | 8 | 64 | ✅ validated | `dp=8` is required for FP8 shared-expert block-quant compatibility (`2048/8=256 > 128 = block_size`); `dp=4` silently collapses. HBM is tight at `dp=8`; see §2.4 Memory Management. |
-| Alternative (starter) | v7x-8 | 2x4 | 2 | 8 chips / 16 devices | 16 | 1 | 16 | 16 | 🚧 starter | v7x exposes 2 JAX devices per chip; topology matrix not yet validated for V3. Use lower concurrency. |
+| TPU | Topology | Nodes | Chips / JAX devices | `--tp-size` | `--dp-size` | Tensor axis | `--ep-size` | Notes |
+|---|---|---|---|---|---|---|---|---|
+| **v6e-64** | 8x8 | 16 | 64 | 64 | 8 | 8 | 64 | This is the slice we measured on. `dp=8` is required for FP8 shared-expert block-quant compatibility (`2048/8=256 > 128 = block_size`); `dp=4` silently collapses. HBM is tight at `dp=8`; see §2.4 Memory Management. |
 
-V6e-64 is the only currently validated production path; the v7x-8 row is a starter alternative pending validation. No smaller TPU configuration is supported for V3. See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation reference.
+See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation reference. For other slices (larger v6e, v7x variants, scaled-down configs), see [Adapting to other topologies](../../base/tpu-topology-reference.md#adapting-to-other-topologies).
 
 ### 2.2 Environment
 
@@ -43,11 +42,6 @@ pip install evalscope==0.17.1
 ```
 
 ### 2.3 Launch
-
-Two multi-host paths below:
-
-- **TPU v6e-64 (16 nodes, `8x8`)** — the validated production target. The `--dp-size 8` mesh fix from issue #3 (see §2.4) is mandatory on this slice.
-- **TPU v7x-8 (2 nodes, `2x4`, starter)** — smaller v7x alternative pending validation. Same launch shape with `--tp-size 16 --dp-size 1`; use lower concurrency.
 
 #### Multi-host — TPU v6e-64
 
@@ -69,19 +63,7 @@ Use [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) with `<JOB>=
 
 Mount a shared `JAX_COMPILATION_CACHE_DIR` on the same PVC as the model weights — first-time compile is ~4 minutes total (EXTEND ~70 s + DECODE ~3 min); subsequent restarts with the same mesh shape skip almost all of that.
 
-#### Multi-host — TPU v7x-8 (starter)
-
-Use `<ACCELERATOR>=tpu7x`, `<TOPOLOGY>=2x4`, `parallelism: 2`, and `completions: 2`; change the launch flags above to:
-
-```text
-  --tp-size 16 --dp-size 1 --ep-size 16 \
-  --mem-fraction-static 0.85 \
-  --max-running-requests 32 \
-```
-
-Not yet validated end-to-end — open a PR with measured numbers when you run it.
-
-For temporary v6e experiments, advanced users can adapt [SkyPilot launcher](../../deployment/skypilot.md) with the same launch flags. The default SkyPilot template is v6e-only; use GKE for v7x.
+For temporary v6e experiments, advanced users can adapt [SkyPilot launcher](../../deployment/skypilot.md) with the same launch flags.
 
 ### 2.4 Configuration Tips
 

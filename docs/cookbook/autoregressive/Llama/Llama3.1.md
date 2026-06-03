@@ -20,12 +20,11 @@ For Llama 4 see the upstream sgl-cookbook (`Llama/Llama4.md`).
 
 ### 2.1 Hardware Matrix
 
-| Tier | Model | TPU | Topology | Chips | `--tp-size` | Notes |
-|---|---|---|---|---|---|---|
-| Minimum runnable | Llama 3.1 8B-Instruct | v6e-4 | 2x2 | 4 | 4 | BF16 ~16 GB — fits with headroom; lowest-cost single-host serving |
-| Recommended production | Llama 3.1 8B-Instruct | v6e-8 | 2x4 | 8 | 8 | More HBM headroom for higher `--max-running-requests` / longer context — same single-host class, no multi-node coordination |
+| Model | TPU | Topology | Chips | `--tp-size` | Notes |
+|---|---|---|---|---|---|
+| Llama 3.1 8B-Instruct | **v6e-4** | 2x2 | 4 | 4 | This is the slice we measured on. BF16 ~16 GB — fits with headroom; single-host serving. |
 
-See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation reference.
+See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation reference. For other slices (larger v6e, v7x variants), see [Adapting to other topologies](../../base/tpu-topology-reference.md#adapting-to-other-topologies).
 
 ### 2.2 Environment
 

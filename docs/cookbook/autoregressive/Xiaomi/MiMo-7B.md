@@ -25,12 +25,11 @@ title: "MiMo-7B"
 
 ### 2.1 Hardware Matrix
 
-| Tier | Model | TPU | Topology | Chips | `--tp-size` | Notes |
-|---|---|---|---|---|---|---|
-| Minimum runnable | MiMo-7B-RL | v6e-4 | 2x2 | 4 | 4 | BF16 weights ~14 GB — fits with headroom; lowest-cost single-host serving |
-| Recommended production | MiMo-7B-RL | v6e-8 | 2x4 | 8 | 8 | More HBM headroom for higher `--max-running-requests` and longer reasoning outputs |
+| Model | TPU | Topology | Chips | `--tp-size` | Notes |
+|---|---|---|---|---|---|
+| MiMo-7B-RL | **v6e-4** | 2x2 | 4 | 4 | This is the slice we measured on. BF16 weights ~14 GB — fits with headroom; single-host serving. |
 
-See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation reference.
+See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation reference. For other slices (larger v6e, v7x variants), see [Adapting to other topologies](../../base/tpu-topology-reference.md#adapting-to-other-topologies).
 
 ### 2.2 Environment
 

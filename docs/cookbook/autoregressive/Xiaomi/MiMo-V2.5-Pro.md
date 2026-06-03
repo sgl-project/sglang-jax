@@ -4,7 +4,7 @@ title: "MiMo-V2.5-Pro"
 
 # MiMo-V2.5-Pro on SGL-JAX
 
-> **Validated recipe** — TPU v6e-64 path validated on sglang-jax 0.1.0: server starts, thinking-on output correct, GSM8K accuracy 97.5% (200 examples, see §4.1), `bench_serving` numbers in §4.2. TPU v7x-16 is a supported alternative hardware path (same launch shape, lower HBM-per-chip pressure); v6e-64 is the validation target for this recipe and v7x reruns are not required to keep the ✅ status.
+> **Validated recipe** — TPU v6e-64 path validated on sglang-jax 0.1.0: server starts, thinking-on output correct, GSM8K accuracy 97.5% (200 examples, see §4.1), `bench_serving` numbers in §4.2.
 
 ## 1. Model Introduction
 
@@ -29,14 +29,13 @@ title: "MiMo-V2.5-Pro"
 
 ### 2.1 Hardware Matrix
 
-| Tier | TPU | Topology | Chips per node | Nodes | Total chips | `--tp-size` | `--dp-size` | `--ep-size` | `--moe-backend` | Status | Notes |
-|---|---|---|---|---|---|---|---|---|---|---|---|
-| Primary production | **v6e-64** | `4x4x4` | 4 | 16 | 64 | 64 | 8 | 64 | `fused` | ✅ validated | Primary validation target. v6e is 1:1 chip↔device; lower HBM per chip — see §2.4 SWA Pool Sizing for tradeoff. GSM8K + bench_serving in §4. |
-| Alternative production | **v7x-16** | `2x2x4` | 4 | 4 | 16 | 32 | 4 | 32 | `fused` | alternative | Supported alternative hardware; same launch shape. v7x exposes 2 JAX devices/chip → 16 × 2 = 32; attention TP = `tp_size/dp_size` = 8. Historical AIME 2025 reference numbers in §4.1; not rerun on current build (not required for ✅). |
+| TPU | Topology | Chips per node | Nodes | Total chips | `--tp-size` | `--dp-size` | `--ep-size` | `--moe-backend` | Notes |
+|---|---|---|---|---|---|---|---|---|---|
+| **v6e-64** | `4x4x4` | 4 | 16 | 64 | 64 | 8 | 64 | `fused` | This is the slice we measured on. v6e is 1:1 chip↔device; see §2.4 SWA Pool Sizing for tradeoffs. GSM8K + bench_serving in §4. |
 
-MiMo-V2.5-Pro ships a single supported deployment class — multi-host MoE on either v6e-64 (primary) or v7x-16 (alternative); single-host configurations are not supported. All nodes must be in the same TPU slice and reach each other on the JAX init port (`5000` by default) and the TPU process port (`8471`).
+MiMo-V2.5-Pro is multi-host only — all nodes must be in the same TPU slice and reach each other on the JAX init port (`5000` by default) and the TPU process port (`8471`).
 
-See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation / HBM / device-per-chip reference.
+See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation / HBM / device-per-chip reference. For other slices (larger v6e, v7x variants, scaled-down configs), see [Adapting to other topologies](../../base/tpu-topology-reference.md#adapting-to-other-topologies).
 
 ### 2.2 Environment
 
@@ -52,12 +51,7 @@ pip install evalscope==0.17.1
 
 ### 2.3 Launch
 
-MiMo-V2.5-Pro is multi-host only. Run the same command on every node; only `${NODE_RANK}` and `${MASTER_ADDR}` vary across nodes. Two slices below:
-
-- **TPU v6e-64 (16 nodes, `4x4x4`)** — the slice we measured on; §4 numbers are pinned here. `--tp-size 64`, see SWA pool sizing in §2.4.
-- **TPU v7x-16 (4 nodes, `2x2x4`)** — same launch shape on different hardware; v7x exposes 2 JAX devices per chip so `--tp-size 32` over 4 chips × 4 nodes. Historical AIME 2025 reference numbers in §4.1; not rerun on the current build.
-
-For other slices, see [Adapting to other topologies](../../base/tpu-topology-reference.md#adapting-to-other-topologies).
+MiMo-V2.5-Pro is multi-host only. Run the same command on every node; only `${NODE_RANK}` and `${MASTER_ADDR}` vary across nodes.
 
 #### Multi-host — TPU v6e-64 (16 nodes, `4x4x4`)
 
@@ -81,38 +75,16 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -m sgl_jax.launch_server \
 
 `${NODE_RANK}` ranges from `0` to `15`.
 
-#### Multi-host — TPU v7x-16 (4 nodes, `2x2x4`)
-
-```bash
-JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -m sgl_jax.launch_server \
-  --model-path XiaomiMiMo/MiMo-V2.5-Pro \
-  --trust-remote-code \
-  --tp-size 32 --dp-size 4 --ep-size 32 \
-  --moe-backend fused \
-  --page-size 256 --context-length 262144 \
-  --chunked-prefill-size 4096 \
-  --dtype bfloat16 --mem-fraction-static 0.95 \
-  --swa-full-tokens-ratio 0.25 \
-  --max-running-requests 512 \
-  --attention-backend fa \
-  --skip-server-warmup \
-  --nnodes 4 --node-rank ${NODE_RANK} \
-  --dist-init-addr ${MASTER_ADDR} \
-  --host 0.0.0.0 --port 30000
-```
-
-`${NODE_RANK}` ranges from `0` to `3`. Compared with v6e-64, this raises `--mem-fraction-static` to `0.95` and `--swa-full-tokens-ratio` to `0.25` because v7x has more HBM per chip — the higher SWA ratio gives sliding-window layers more KV.
-
-For the GKE Indexed Job + headless Service manifest pattern that wraps both launch commands, see [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) — fill in `<JOB>=mimo-v25-pro`, `<ACCELERATOR>=tpu7x` (v7x) or `tpu-v6e-slice` (v6e), `<TOPOLOGY>=2x2x4` / `4x4x4`, `<N>=4` / `16`, and paste the launch flags above into `<LAUNCH_FLAGS>`. For temporary v6e experiments, advanced users can adapt [SkyPilot launcher](../../deployment/skypilot.md); the default SkyPilot template is v6e-only, so use GKE for v7x.
+For the GKE Indexed Job + headless Service manifest pattern that wraps the launch command, see [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) — fill in `<JOB>=mimo-v25-pro`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=4x4x4`, `<N>=16`, and paste the launch flags above into `<LAUNCH_FLAGS>`. For temporary v6e experiments, advanced users can adapt [SkyPilot launcher](../../deployment/skypilot.md) with the same launch flags.
 
 ### 2.4 Configuration Tips
 
 **Memory Management:**
 - `--context-length 262144` is the model's native 256K. For most production traffic, **lowering to 128K (`131072`) is safe** and frees KV budget for higher `--max-running-requests`.
-- `--mem-fraction-static 0.95` (v7x) / `0.92` (v6e) — v6e has less HBM per chip, so the conservative value avoids host fragmentation killing the launch.
+- `--mem-fraction-static 0.92` on v6e-64 — v6e has limited HBM per chip, so this conservative value avoids host fragmentation killing the launch.
 
 **SWA Pool Sizing (hybrid attention):**
-- This recipe uses `--swa-full-tokens-ratio 0.25` on v7x-16 and `0.20`–`0.15` on v6e-64.
+- This recipe uses `--swa-full-tokens-ratio 0.15` on v6e-64.
 - The flag is a **per-layer** ratio `swa_tokens_per_layer / full_tokens_per_layer` — **not** a pool fraction. Default `0.8` means each SWA layer gets 80% as many KV tokens as each full layer.
 - Lower the ratio when full-attention KV is the bottleneck (each full layer gets relatively more); raise when SWA layers are saturating first.
 - Observation point: server logs `swa token usage` / `full token usage`. If SWA hits OOM, **raise** the ratio; if full hits OOM, **lower** it.
@@ -134,7 +106,7 @@ For the GKE Indexed Job + headless Service manifest pattern that wraps both laun
 - Mainly latency-sensitive scenarios benefit; high-concurrency throughput often does not.
 
 **Chunked Prefill Tuning:**
-- `--chunked-prefill-size 4096` bounds peak HBM during prefill. Raise to `8192` on v7x for shorter TTFT on long prompts (if HBM allows); lower to `2048` on v6e if prefill-time OOM occurs.
+- `--chunked-prefill-size 4096` bounds peak HBM during prefill. Lower to `2048` if prefill-time OOM occurs.
 - Setting `-1` disables chunking entirely — **not recommended** at 256K context.
 
 **Compilation Cache Hygiene:**
@@ -174,16 +146,16 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -m sgl_jax.launch_server \
   --model-path XiaomiMiMo/MiMo-V2.5-Pro \
   --trust-remote-code \
   --reasoning-parser mimo \
-  --tp-size 32 --dp-size 4 --ep-size 32 \
+  --tp-size 64 --dp-size 8 --ep-size 64 \
   --moe-backend fused \
   --page-size 256 --context-length 262144 \
   --chunked-prefill-size 4096 \
-  --dtype bfloat16 --mem-fraction-static 0.95 \
-  --swa-full-tokens-ratio 0.25 \
+  --dtype bfloat16 --mem-fraction-static 0.92 \
+  --swa-full-tokens-ratio 0.15 \
   --max-running-requests 512 \
   --attention-backend fa \
   --skip-server-warmup \
-  --nnodes 4 --node-rank ${NODE_RANK} \
+  --nnodes 16 --node-rank ${NODE_RANK} \
   --dist-init-addr ${MASTER_ADDR} \
   --host 0.0.0.0 --port 30000
 ```
@@ -423,8 +395,6 @@ evalscope eval \
 |:---|:---|:---|:---|:---|:---|
 | MiMo-V2.5-Pro | gsm8k | AverageAccuracy | main | 200 | **0.975** |
 
-> Historical AIME 2025 results on **TPU v7x-16** (different hardware): AIME2025-I AveragePass@1 = 0.8667 (15 problems), AIME2025-II = 1.0000 (15), OVERALL = 0.9334 (30). Build pre-dates the pin convention. Kept here as a reference for the v7x path until that path is re-validated on a current build.
-
 ### 4.2 Speed
 
 > **Layout F — single-workload sweep (one data point).** Standard chat (ISL=1000, OSL=1000), `max_concurrency=16`, 80 prompts, `seed=42`. Future PRs can add reasoning-typical workloads (long OSL) and concurrency sweeps. Do **not** set `--reasoning-parser mimo` for throughput benchmarks (the parser adds per-token CPU work that distorts raw token rates).
@@ -506,7 +476,7 @@ Max ITL (ms):                            1290.76
 | First request takes ~4 min on each new launch | JIT cache empty | Persist `JAX_COMPILATION_CACHE_DIR` across restarts (host volume mount in Docker; PVC in GKE). Don't share a cache dir across recipes with different `--page-size` / `--tp-size` / etc. |
 | Speculative decoding refuses to start | Overlap scheduler conflict | Add `--disable-overlap-schedule` — required whenever `--speculative-algorithm` is set. |
 | Multi-node hang at `jax.distributed.initialize` | `${MASTER_ADDR}` unreachable from non-rank-0 nodes | Verify rank-0 IP + port `5000` reachable from all nodes; check firewall and headless Service DNS resolution (GKE) or `sky status -a` (SkyPilot). |
-| `Mismatched TPU process count` at first step | `TPU_PROCESS_ADDRESSES` length ≠ `--nnodes` | `echo $TPU_PROCESS_ADDRESSES | tr ',' '\n' | wc -l` should equal `${NNODES}`. GKE manifest hardcodes 4 entries — make sure you didn't apply the v7x-16 manifest to a v6e-64 job. |
+| `Mismatched TPU process count` at first step | `TPU_PROCESS_ADDRESSES` length ≠ `--nnodes` | `echo $TPU_PROCESS_ADDRESSES | tr ',' '\n' | wc -l` should equal `${NNODES}`. The v6e-64 manifest expects 16 entries — make sure the GKE Indexed Job manifest matches the slice. |
 
 ## Additional Resources
 

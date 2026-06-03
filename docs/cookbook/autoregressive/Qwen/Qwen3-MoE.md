@@ -33,9 +33,9 @@ For the dense Qwen3 variants (8B / 32B) see [Qwen3 recipe](Qwen3.md).
 
 | Model | TPU | Topology | Nodes | Chips | `--tp-size` | `--ep-size` | Notes |
 |---|---|---|---|---|---|---|---|
-| Qwen3-30B-A3B   | v6e-16 | 4x4 | 4  | 16 | 16 | 16 | BF16 ~60 GB  |
+| Qwen3-30B-A3B   | **v6e-16** | 4x4 | 4  | 16 | 16 | 16 | This is the slice we measured on. BF16 ~60 GB. |
 
-See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation reference.
+See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation reference. For other slices (larger v6e, v7x variants), see [Adapting to other topologies](../../base/tpu-topology-reference.md#adapting-to-other-topologies).
 
 ### 2.2 Environment
 
@@ -43,9 +43,7 @@ Install per [Install guide](../../../get_started/install.md). For multi-host lau
 
 ### 2.3 Launch
 
-Qwen3-30B-A3B is multi-host only.
-
-#### Multi-host — TPU v6e-16 (Qwen3-30B-A3B)
+#### Multi-host — TPU v6e-16
 
 Use [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) with `<JOB>=qwen3-moe`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=4x4`, `parallelism: 4`, and `completions: 4`. Put these model-specific flags into `<LAUNCH_FLAGS>`:
 

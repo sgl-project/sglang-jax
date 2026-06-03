@@ -28,11 +28,9 @@ title: "Qwen-7B-Chat"
 
 | TPU | Topology | Chips | `--tp-size` | Notes |
 |---|---|---|---|---|
-| **v6e-4** (minimum and recommended) | 2x2 | 4 | 4 | Single host; v6e is 1:1 chip↔device |
+| **v6e-4** | 2x2 | 4 | 4 | This is the slice we measured on. Single host; v6e is 1:1 chip↔device. |
 
-This recipe ships a single supported topology — Qwen-7B fits comfortably on v6e-4, and a larger slice provides no measurable benefit at 8K context. For larger Qwen sizes (8B / 32B) see [Qwen3 recipe](Qwen3.md).
-
-See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation reference.
+See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation reference. For other slices (larger v6e, v7x variants), see [Adapting to other topologies](../../base/tpu-topology-reference.md#adapting-to-other-topologies). For larger Qwen sizes (8B / 32B) see [Qwen3 recipe](Qwen3.md).
 
 ### 2.2 Environment
 

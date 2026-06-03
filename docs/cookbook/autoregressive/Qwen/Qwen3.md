@@ -31,10 +31,10 @@ title: "Qwen3"
 
 | Model | TPU | Topology | Chips | `--tp-size` | Notes |
 |---|---|---|---|---|---|
-| Qwen3-8B | v6e-4 | 2x2 | 4 | 4 | Single host; ~16 GB BF16 weights |
-| Qwen3-32B | v6e-4 | 2x2 | 4 | 4 | Single host; ~64 GB BF16 weights — fits with `--mem-fraction-static 0.8` |
+| Qwen3-8B | **v6e-4** | 2x2 | 4 | 4 | This is the slice we measured on. Single host; ~16 GB BF16 weights. |
+| Qwen3-32B | **v6e-4** | 2x2 | 4 | 4 | This is the slice we measured on. Single host; ~64 GB BF16 weights — fits with `--mem-fraction-static 0.8`. |
 
-Both fit on a single v6e-4 host with `bfloat16`. See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation reference.
+Both fit on a single v6e-4 host with `bfloat16`. See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation reference. For other slices (larger v6e, v7x variants), see [Adapting to other topologies](../../base/tpu-topology-reference.md#adapting-to-other-topologies).
 
 ### 2.2 Environment
 

@@ -25,9 +25,9 @@ title: "DeepSeek V2"
 
 | Model | TPU | Topology | Nodes | Chips | `--tp-size` | `--ep-size` | Notes |
 |---|---|---|---|---|---|---|---|
-| DeepSeek-V2-Lite | v6e-4  | 2x2 | 1 | 4  | 4  | 4  | BF16 ~32 GB — single host |
+| DeepSeek-V2-Lite | **v6e-4**  | 2x2 | 1 | 4  | 4  | 4  | This is the slice we measured on. BF16 ~32 GB — single host. |
 
-See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation reference.
+See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation reference. For other slices (larger v6e, v7x variants), see [Adapting to other topologies](../../base/tpu-topology-reference.md#adapting-to-other-topologies).
 
 ### 2.2 Environment
 

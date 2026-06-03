@@ -8,7 +8,7 @@ title: "Grok-2"
 
 ## 1. Model Introduction
 
-[**xai-org/grok-2**](https://huggingface.co/xai-org/grok-2) is xAI's open-weight Grok-2 release — a **~269B-parameter MoE base model — not instruction-tuned** (8 experts, 2 active per token; ~70B active parameters) under the `Grok1ForCausalLM` runtime. xAI did not release a Grok-2-Chat / Grok-2-Instruct sibling; the HuggingFace repo has no `chat_template` in `tokenizer_config.json`. SGL-JAX serves it multi-host on TPU v6e-32 (starter) or v6e-64 (validated below) with tensor + expert parallelism. The primary user-facing deployment path is GKE Indexed Job; SkyPilot is an advanced v6e experiment alternative.
+[**xai-org/grok-2**](https://huggingface.co/xai-org/grok-2) is xAI's open-weight Grok-2 release — a **~269B-parameter MoE base model — not instruction-tuned** (8 experts, 2 active per token; ~70B active parameters) under the `Grok1ForCausalLM` runtime. xAI did not release a Grok-2-Chat / Grok-2-Instruct sibling; the HuggingFace repo has no `chat_template` in `tokenizer_config.json`. SGL-JAX serves it multi-host on TPU v6e-64 (validated below) with tensor + expert parallelism. The primary user-facing deployment path is GKE Indexed Job; SkyPilot is an advanced v6e experiment alternative.
 
 **Key Features**:
 
@@ -29,14 +29,13 @@ title: "Grok-2"
 
 ### 2.1 Hardware Matrix
 
-| Role | TPU | Topology | Nodes | Chips | `--tp-size` | `--ep-size` | `--moe-backend` | Status | Notes |
-|---|---|---|---|---|---|---|---|---|---|
-| Tested configuration | **v6e-64** | 8x8 | 16 | 64 | 64 | 8 | `fused` | 🧪 in validation | Slice we measured on. 64-chip slice; ~8.4 GB weights per chip, plenty of room for KV / activations. `--ep-size 8` matches the 8 experts (and the pre-sharded TP-{000..007} file layout). |
-| HBM minimum | **v6e-32** | 4x8 | 8 | 32 | 32 | 8 | `fused` | 🚧 starter | Smallest v6e slice the pre-sharded TP=8 layout fits cleanly. Same flags but `--tp-size 32`. Tighter HBM but should fit BF16. Not measured end-to-end yet. |
+| TPU | Topology | Nodes | Chips | `--tp-size` | `--ep-size` | `--moe-backend` | Notes |
+|---|---|---|---|---|---|---|---|
+| **v6e-64** | 8x8 | 16 | 64 | 64 | 8 | `fused` | This is the slice we measured on. 64-chip slice; ~8.4 GB weights per chip, plenty of room for KV / activations. `--ep-size 8` matches the 8 experts (and the pre-sharded TP-{000..007} file layout). |
 
-**Pre-sharded TP=8 constraint**: the checkpoint files are named `pytorch_model-NNNNN-TP-{000..007}.safetensors` — `--tp-size` must be a multiple of 8 so the loader can map each pre-shard onto a contiguous device slice. v6e-64 (`tp=64=8×8`) and v6e-32 (`tp=32=8×4`) both satisfy this; v7x topologies that expose `--tp-size` as a multiple of 8 are also valid.
+**Pre-sharded TP=8 constraint**: the checkpoint files are named `pytorch_model-NNNNN-TP-{000..007}.safetensors` — `--tp-size` must be a multiple of 8 so the loader can map each pre-shard onto a contiguous device slice. v6e-64 (`tp=64=8×8`) satisfies this.
 
-These are the two slices we walked end-to-end. For other slices (larger v6e, v7x variants), see [Adapting to other topologies](../../base/tpu-topology-reference.md#adapting-to-other-topologies) in the topology reference — the `--tp-size = chip_count × devices_per_chip` and `tp_size % 8 == 0` rules carry over directly.
+For other slices (larger v6e, v7x variants, scaled-down configs), see [Adapting to other topologies](../../base/tpu-topology-reference.md#adapting-to-other-topologies) — the `--tp-size = chip_count × devices_per_chip` and `tp_size % 8 == 0` rules carry over directly.
 
 ### 2.2 Environment
 
@@ -50,14 +49,7 @@ pip install evalscope==0.17.1
 
 ### 2.3 Launch
 
-Grok-2 is multi-host only; cannot fit single-host. Two paths below:
-
-- **TPU v6e-64 (16 nodes)** — the slice we measured on; §4 numbers are pinned to this configuration.
-- **TPU v6e-32 (8 nodes, HBM minimum)** — same launch shape with `--tp-size 32`. Smallest v6e slice the pre-sharded TP=8 layout fits cleanly. Tighter HBM, lower concurrency; not measured end-to-end yet.
-
-For other slices (larger v6e, v7x variants), see [Adapting to other topologies](../../base/tpu-topology-reference.md#adapting-to-other-topologies).
-
-#### Multi-host — TPU v6e-64 (16 nodes)
+#### Multi-host — TPU v6e-64
 
 Use [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) with `<JOB>=grok-2`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=8x8`, `parallelism: 16`, `completions: 16`, and `backoffLimit: 16`. Put these model-specific flags into `<LAUNCH_FLAGS>`:
 
@@ -78,16 +70,6 @@ Use [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) with `<JOB>=
 ```
 
 Mount a shared `JAX_COMPILATION_CACHE_DIR` on the same PVC as the model weights — first cold compile is ~5-10 min, much faster than 1T-class models since the MoE kernel shape sweep is smaller.
-
-#### Multi-host — TPU v6e-32 (8 nodes, starter)
-
-Change `<TOPOLOGY>=4x8`, `parallelism: 8`, `completions: 8`, and adjust the parallelism flags:
-
-```text
-  --tp-size 32 --ep-size 8 \
-```
-
-The other flags stay identical. v6e-32 is the smallest slice the pre-sharded TP=8 layout fits cleanly on; v6e-16 doesn't satisfy `tp_size % 8 == 0` constraints cleanly without dp.
 
 For temporary v6e experiments, advanced users can adapt [SkyPilot launcher](../../deployment/skypilot.md) with the same launch flags. The model recipe does not require users to run repository-local SkyPilot helper scripts.
 

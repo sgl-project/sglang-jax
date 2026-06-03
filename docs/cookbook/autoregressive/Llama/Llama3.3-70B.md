@@ -4,7 +4,7 @@ title: "Llama 3.3 70B"
 
 # Llama 3.3 70B on SGL-JAX
 
-> **Validated recipe** — empirically validated on TPU v6e-16 with sglang-jax 0.1.0; see §4 for measured numbers. v6e-32 / v6e-64 production tiers below use the same launch path with larger `--tp-size` but are unmeasured.
+> **Validated recipe** — empirically validated on TPU v6e-16 with sglang-jax 0.1.0; see §4 for measured numbers.
 
 ## 1. Model Introduction
 
@@ -14,7 +14,7 @@ For Llama 4 see the upstream sgl-cookbook (`Llama/Llama4.md`).
 
 **Key Features**:
 
-- **70B dense decoder, multi-host required**: BF16 weights ~140 GB — needs v6e-16 minimum (validated, see §4); v6e-32 recommended for production.
+- **70B dense decoder, multi-host required**: BF16 weights ~140 GB — needs v6e-16 minimum (validated, see §4).
 - **Llama 3.3 Instruct**: Instruction-tuned chat model — strong general-purpose assistant; non-reasoning, no native tool-call format.
 - **Grouped-Query Attention (GQA)**: `num_kv_heads=8` shrinks the KV cache vs full MHA, leaving more HBM headroom for concurrency and longer prompts.
 - **128K context window**: Supports long-document inputs out of the box; pair with `--chunked-prefill-size 2048` to bound peak HBM on long prefills.
@@ -28,12 +28,11 @@ For Llama 4 see the upstream sgl-cookbook (`Llama/Llama4.md`).
 
 ### 2.1 Hardware Matrix
 
-| Tier | Model | TPU | Topology | Nodes | Chips | `--tp-size` | Notes |
-|---|---|---|---|---|---|---|---|
-| Minimum runnable | Llama 3.3 70B | v6e-16 | 4x4 | 4 | 16 | 16 | BF16 ~140 GB — fits with `--mem-fraction-static 0.85` (~8.75 GB weights/chip + ample KV headroom) |
-| Recommended production | Llama 3.3 70B | v6e-32 | 4x8 | 8 | 32 | 32 | More HBM per chip → higher `--max-running-requests` and longer context budget |
+| Model | TPU | Topology | Nodes | Chips | `--tp-size` | Notes |
+|---|---|---|---|---|---|---|
+| Llama 3.3 70B | **v6e-16** | 4x4 | 4 | 16 | 16 | This is the slice we measured on. BF16 ~140 GB — fits with `--mem-fraction-static 0.85` (~8.75 GB weights/chip + ample KV headroom). |
 
-See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation reference.
+See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation reference. For other slices (larger v6e, v7x variants), see [Adapting to other topologies](../../base/tpu-topology-reference.md#adapting-to-other-topologies).
 
 ### 2.2 Environment
 
@@ -41,7 +40,7 @@ Install per [Install guide](../../../get_started/install.md). Multi-host require
 
 ### 2.3 Launch
 
-#### Multi-host — TPU v6e-16 (minimum)
+#### Multi-host — TPU v6e-16
 
 Use [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) with `<JOB>=llama-70b`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=4x4`, `parallelism: 4`, and `completions: 4`. Put these model-specific flags into `<LAUNCH_FLAGS>`:
 
@@ -58,17 +57,12 @@ Use [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) with `<JOB>=
   --skip-server-warmup
 ```
 
-#### Multi-host — TPU v6e-32 (recommended production)
-
-Same as above but `<TOPOLOGY>=4x8`, `parallelism: 8`, `completions: 8`, and bump `--tp-size 32 --mem-fraction-static 0.9`.
-
 For temporary v6e experiments, advanced users can adapt [SkyPilot launcher](../../deployment/skypilot.md) with the same launch flags. The model recipe does not require users to run repository-local SkyPilot helper scripts.
 
 ### 2.4 Configuration Tips
 
 **Memory Management:**
 - v6e-16 (TP=16): `--mem-fraction-static 0.85` validated; ~8.75 GB weights per chip leaves ~18 GB headroom for KV at 32 GB HBM.
-- v6e-32 (TP=32): bump to `--mem-fraction-static 0.9` — weights drop to ~4.4 GB per chip, more room for higher `--max-running-requests`. Lower to 0.85 if you hit OOM at startup.
 
 **Throughput vs Latency:**
 - `--page-size 128` reduces KV page-table overhead at 70B scale.
@@ -76,12 +70,12 @@ For temporary v6e experiments, advanced users can adapt [SkyPilot launcher](../.
 - `--max-running-requests 256` caps concurrent decodes; lower for tighter latency tails.
 
 **Tensor Parallelism:**
-- `--tp-size 16` on v6e-16 fully shards Llama 3.3 70B's GQA `num_kv_heads=8` (tensor axis must be a divisor of 8 — 16 maps cleanly: 2 chips per KV head). v6e-32 uses `--tp-size 32` (4 chips per KV head). All ranks must be in the same TPU slice; verify `--nnodes` matches the slice node count.
+- `--tp-size 16` on v6e-16 fully shards Llama 3.3 70B's GQA `num_kv_heads=8` (tensor axis must be a divisor of 8 — 16 maps cleanly: 2 chips per KV head). All ranks must be in the same TPU slice; verify `--nnodes` matches the slice node count.
 - Multi-host coordination: every rank runs the same launch command; only `${NODE_RANK}` and `${MASTER_ADDR}` vary. Dispatch all ranks within seconds of each other (a >5-min stagger trips the JAX distributed RPC deadline).
 
 **Compilation Cache Hygiene:**
 - `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache` is mandatory — without it, first request blocks ~4 min per node.
-- The cache is per-node; mount a shared PVC at the cache directory to amortize compilation across all 8 nodes.
+- The cache is per-node; mount a shared PVC at the cache directory to amortize compilation across all 4 nodes.
 
 For full flag definitions see [Launch flags reference](../../base/launch-flags-reference.md).
 

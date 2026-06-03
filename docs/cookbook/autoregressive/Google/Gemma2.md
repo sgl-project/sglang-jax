@@ -26,12 +26,11 @@ title: "Gemma 2"
 
 ### 2.1 Hardware Matrix
 
-| Tier | Model | TPU | Topology | Chips | `--tp-size` | Notes |
-|---|---|---|---|---|---|---|
-| Minimum runnable | Gemma 2 27B-it | v6e-4 | 2x2 | 4 | 4 | BF16 ~54 GB — fits with `--mem-fraction-static 0.85` (~13.5 GB weights/chip + dual KV pools) |
-| Recommended production | Gemma 2 27B-it | v6e-8 | 2x4 | 8 | 8 | More HBM headroom so the global + sliding KV pools both have room; raises `--max-running-requests` ceiling |
+| Model | TPU | Topology | Chips | `--tp-size` | Notes |
+|---|---|---|---|---|---|
+| Gemma 2 27B-it | **v6e-4** | 2x2 | 4 | 4 | This is the slice we measured on. BF16 ~54 GB — fits with `--mem-fraction-static 0.85` (~13.5 GB weights/chip + dual KV pools). |
 
-See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation reference.
+See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation reference. For other slices (larger v6e, v7x variants), see [Adapting to other topologies](../../base/tpu-topology-reference.md#adapting-to-other-topologies).
 
 ### 2.2 Environment
 

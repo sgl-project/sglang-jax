@@ -23,9 +23,9 @@ title: "GLM-4.5"
 
 | Model | TPU | Topology | Nodes | Chips | `--tp-size` | `--ep-size` | Notes |
 |---|---|---|---|---|---|---|---|
-| GLM-4.5-Air (106B) | v6e-32 | 4x8 | 8  | 32 | 32 | 32 | BF16 ~210 GB |
+| GLM-4.5-Air (106B) | **v6e-32** | 4x8 | 8  | 32 | 32 | 32 | This is the slice we measured on. BF16 ~210 GB. |
 
-See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation reference.
+See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation reference. For other slices (larger v6e, v7x variants, scaled-down configs), see [Adapting to other topologies](../../base/tpu-topology-reference.md#adapting-to-other-topologies).
 
 ### 2.2 Environment
 
@@ -33,9 +33,7 @@ Install per [Install guide](../../../get_started/install.md). Multi-host require
 
 ### 2.3 Launch
 
-GLM-4.5-Air is multi-host only.
-
-#### Multi-host — TPU v6e-32 (GLM-4.5-Air)
+#### Multi-host — TPU v6e-32
 
 Use [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) with `<JOB>=glm-4-5-air`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=4x8`, `parallelism: 8`, and `completions: 8`. Put these model-specific flags into `<LAUNCH_FLAGS>`:
 

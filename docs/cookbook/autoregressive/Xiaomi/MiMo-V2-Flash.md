@@ -32,10 +32,10 @@ title: "MiMo-V2-Flash"
 
 | TPU | Topology | Chips per node | Nodes | Total chips | `--tp-size` | `--dp-size` | `--ep-size` | `--moe-backend` | Notes |
 |---|---|---|---|---|---|---|---|---|---|
-| **v7x-8** (minimum, dev) | 1 host × 4 chips | 4 | 1 | 4 chips → 8 JAX devices | 8 | 2 | 8 | `epmoe` | v7x exposes 2 JAX devices/chip; `--tp-size` counts devices not chips |
-| **v6e-16** (recommended, production) | 4x4 | 4 | 4 | 16 | 16 | 4 | 16 | `fused` | Multi-host required |
+| **v7x-8** | 1 host × 4 chips | 4 | 1 | 4 chips → 8 JAX devices | 8 | 2 | 8 | `epmoe` | One of two slices we measured on. v7x exposes 2 JAX devices/chip; `--tp-size` counts devices not chips. |
+| **v6e-16** | 4x4 | 4 | 4 | 16 | 16 | 4 | 16 | `fused` | The other slice we measured on. Multi-host required. |
 
-See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation / HBM / device-per-chip reference.
+See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation / HBM / device-per-chip reference. For other slices (larger v6e, v7x variants, scaled-down configs), see [Adapting to other topologies](../../base/tpu-topology-reference.md#adapting-to-other-topologies).
 
 ### 2.2 Environment
 
@@ -48,6 +48,11 @@ pip install evalscope==0.17.1
 ```
 
 ### 2.3 Launch
+
+Two slices we measured on, each as a separate launch path:
+
+- **TPU v7x-8** (1 host, single-host) — `--tp-size 8 --dp-size 2 --ep-size 8 --moe-backend epmoe`.
+- **TPU v6e-16** (4 nodes, multi-host) — `--tp-size 16 --dp-size 4 --ep-size 16 --moe-backend fused`.
 
 #### Single-host — TPU v7x-8
 

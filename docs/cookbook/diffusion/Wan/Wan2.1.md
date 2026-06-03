@@ -28,13 +28,13 @@ title: "Wan 2.1 T2V"
 
 ### 2.1 Hardware Matrix
 
-| Tier | Model | TPU | Topology | `--tp-size` | Notes |
-|---|---|---|---|---|---|
-| Validated | Wan 2.1 14B | v6e-4 | 2x2 | 2 | Current built-in staging uses part of the host for text encoding and the rest for video stages |
+| Model | TPU | Topology | `--tp-size` | Notes |
+|---|---|---|---|---|
+| Wan 2.1 14B | **v6e-4** | 2x2 | 2 | This is the slice we measured on. Current built-in staging uses part of the host for text encoding and the rest for video stages. |
 
 > Wan 2.1 runs through SGL-JAX's built-in staged multimodal runtime. Use the `--tp-size` shown for this model; moving to a larger TPU host or slice does not automatically make every stage use more devices.
 
-See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation reference.
+See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation reference. For other slices (larger v6e, v7x variants), see [Adapting to other topologies](../../base/tpu-topology-reference.md#adapting-to-other-topologies).
 
 ### 2.2 Environment
 

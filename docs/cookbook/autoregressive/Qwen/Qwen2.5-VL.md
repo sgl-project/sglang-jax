@@ -34,16 +34,13 @@ For the text-only Qwen3 dense recipes see [Qwen3 recipe](Qwen3.md).
 
 ### 2.1 Hardware Matrix
 
-| Tier | Model | TPU | Topology | `--tp-size` | Notes |
-|---|---|---|---|---|---|
-| Candidate | Qwen2.5-VL-3B | v6e-4 | 2x2 | 1 | SGL-JAX currently exposes a 1-way AR path for this size; validate before marking production |
-| Candidate | Qwen2.5-VL-7B | v6e-4 | 2x2 | 1 | SGL-JAX currently exposes a 1-way AR path for this size; validate HBM and latency before increasing traffic |
-| Starter target | Qwen2.5-VL-32B | v6e-4 | 2x2 | 4 | Current followable starter path |
-| Pending | Qwen2.5-VL-72B | _Pending_ | _Pending_ | _Pending_ | Needs a multi-host SGL-JAX configuration and scheduler fix before becoming followable |
+| Model | TPU | Topology | `--tp-size` | Notes |
+|---|---|---|---|---|
+| Qwen2.5-VL-32B | **v6e-4** | 2x2 | 4 | This is the slice we walked end-to-end. Single host; v6e is 1:1 chip↔device. For 3B / 7B variants, use the same v6e-4 host with `--tp-size 1` and the launch shape in §2.3. The 72B variant needs a multi-host SGL-JAX staging path that isn't followable today. |
 
 > Multimodal recipes are constrained by SGL-JAX's built-in staged runtime. Use the `--tp-size` shown for the model; a larger TPU slice is not automatically used by changing only `--tp-size`.
 
-See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation reference.
+See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation reference. For other slices (larger v6e, v7x variants), see [Adapting to other topologies](../../base/tpu-topology-reference.md#adapting-to-other-topologies).
 
 ### 2.2 Environment
 
@@ -57,7 +54,7 @@ pip install evalscope==0.17.1
 
 ### 2.3 Launch
 
-#### Single-host — TPU v6e-4 (Qwen2.5-VL-32B-Instruct)
+#### Single-host — TPU v6e-4
 
 ```bash
 JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -u -m sgl_jax.launch_server \
@@ -75,19 +72,9 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -u -m sgl_jax.launch_server \
   --host 0.0.0.0 --port 30000
 ```
 
-For Qwen2.5-VL-3B or Qwen2.5-VL-7B, use the same command shape but set `--model-path` to the target checkpoint and `--tp-size 1`. Keep those paths as candidates until validated on your TPU host.
+For Qwen2.5-VL-3B or Qwen2.5-VL-7B, use the same command shape but set `--model-path` to the target checkpoint and `--tp-size 1`.
 
 > `--multimodal` is required — without it, the launcher boots the text-only HTTP server which has no ViT stage and cannot consume `image_url` / `video_url` content blocks.
-
-#### Multi-host — Qwen2.5-VL-72B pending
-
-Do not use a v6e-16/v6e-32 launch command for Qwen2.5-VL-72B as a cookbook path today. Current SGL-JAX multimodal staging does not provide a followable 72B multi-host setup, and simply changing `--tp-size` to 16 or 32 does not make the runtime use that larger slice correctly.
-
-Before this becomes a followable recipe, SGL-JAX needs:
-
-- a 72B-specific multi-host staging path that matches the intended `--tp-size`;
-- multimodal AR scheduler support for `QueueBackend + nnodes > 1` request broadcast;
-- GKE validation that all ranks pass `sync_pub_sub()` and participate in the same AR forward.
 
 ### 2.4 Configuration Tips
 

@@ -16,7 +16,7 @@ title: "Kimi-Linear"
 - **Kimi Delta Attention (linear attention)**: Replaces softmax attention with a linear-attention variant — prefill cost scales near-linearly with sequence length, big win on long prompts (see §3.2 long-context streaming).
 - **Hybrid recurrent state pool**: Linear-attention layers carry a recurrent state alongside the KV cache; `--recurrent-state-memory-ratio` (default 0.9) budgets recurrent vs KV HBM. **Requires `--disable-radix-cache`** — prefix / radix caching for hybrid recurrent models is planned but not yet shipped.
 - **Long-context throughput focus**: Designed to amortize prefill on tens-of-thousands-of-token prompts — pair with streaming output for best perceived latency.
-- **Multi-host serving**: Validated on TPU v6e-16 (minimum) and v6e-32 (recommended); GSM8K **0.925 / 0.935** (§4.1).
+- **Multi-host serving**: Validated on TPU v6e-16 and v6e-32; GSM8K **0.925 / 0.935** (§4.1).
 
 **Recommended Generation Parameters**: `temperature=0.6`, `top_p=0.95`, `max_tokens=1024` (Kimi defaults — verify against the model card).
 
@@ -26,18 +26,23 @@ title: "Kimi-Linear"
 
 ### 2.1 Hardware Matrix
 
-| Tier | Model | TPU | Topology | Nodes | Chips | `--tp-size` | Notes |
-|---|---|---|---|---|---|---|---|
-| Minimum runnable | Kimi-Linear-48B-A3B | v6e-16 | 4x4 | 4 | 16 | 16 | BF16 ~96 GB — multi-host required to fit weights + recurrent state pool |
-| Recommended production | Kimi-Linear-48B-A3B | v6e-32 | 4x8 | 8 | 32 | 32 | More HBM per active expert and larger recurrent state budget for long-prompt linear-attention workloads |
+| Model | TPU | Topology | Nodes | Chips | `--tp-size` | Notes |
+|---|---|---|---|---|---|---|
+| Kimi-Linear-48B-A3B | **v6e-16** | 4x4 | 4 | 16 | 16 | One of two slices we measured on. BF16 ~96 GB — multi-host required to fit weights + recurrent state pool. |
+| Kimi-Linear-48B-A3B | **v6e-32** | 4x8 | 8 | 32 | 32 | The other slice we measured on. More HBM per active expert and larger recurrent state budget for long-prompt linear-attention workloads. |
 
-See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation reference.
+See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation reference. For other slices (larger v6e, v7x variants, scaled-down configs), see [Adapting to other topologies](../../base/tpu-topology-reference.md#adapting-to-other-topologies).
 
 ### 2.2 Environment
 
 Install per [Install guide](../../../get_started/install.md). Multi-host recommended at this size — use [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) as the primary user-facing path. Advanced users running temporary v6e experiments can adapt [SkyPilot launcher](../../deployment/skypilot.md).
 
 ### 2.3 Launch
+
+Two slices we measured on, each as a separate launch path:
+
+- **TPU v6e-16 (4 nodes, `4x4`)** — `--tp-size 16`.
+- **TPU v6e-32 (8 nodes, `4x8`)** — `--tp-size 32`.
 
 #### Multi-host — TPU v6e-16
 
@@ -58,7 +63,7 @@ Use [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) with `<JOB>=
   --skip-server-warmup
 ```
 
-#### Multi-host — TPU v6e-32 (recommended production)
+#### Multi-host — TPU v6e-32
 
 Same template with `<TOPOLOGY>=4x8`, `parallelism: 8`, `completions: 8`, and `--tp-size 32`:
 
@@ -211,7 +216,7 @@ Within the ±2.3 pp sampling-noise band at limit=200; v6e-32 doubling TP does no
 | TPU v6e-16 | sglang-jax 0.1.0 | 148.28 | 1381.14 | 690.57 | 20.77 | 607.66 |
 | TPU v6e-32 | sglang-jax 0.1.0 | 140.55 | 1457.14 | 728.57 | 19.72 | 526.89 |
 
-v6e-32 delivers ~5% throughput / 13% TTFT improvement over v6e-16. Scaling is sublinear because Kimi-Linear's sparse 3B-activated MoE caps the per-token chip utilization — the production recommendation for v6e-32 is driven by HBM headroom for long-context recurrent state, not raw token throughput.
+v6e-32 delivers ~5% throughput / 13% TTFT improvement over v6e-16. Scaling is sublinear because Kimi-Linear's sparse 3B-activated MoE caps the per-token chip utilization — the larger slice's main win is HBM headroom for long-context recurrent state, not raw token throughput.
 
 ## 5. Troubleshooting
 

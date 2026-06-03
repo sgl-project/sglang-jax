@@ -23,11 +23,11 @@ title: "Ling 2.6"
 
 ### 2.1 Hardware Matrix
 
-| Model | TPU | Topology | Nodes | Chips | `--tp-size` | `--dp-size` | `--ep-size` | Status | Notes |
-|---|---|---|---|---|---|---|---|---|---|
-| Ling-2.6-1T | v6e-64 | 8x8 | 16 | 64 | 64 | 8 | 64 | ✅ validated | Trillion-scale; multi-host mandatory. `dp=8` required (GLA `num_groups=8` ≤ tensor axis); `--disable-radix-cache` required (hybrid recurrent state). |
+| Model | TPU | Topology | Nodes | Chips | `--tp-size` | `--dp-size` | `--ep-size` | Notes |
+|---|---|---|---|---|---|---|---|---|
+| Ling-2.6-1T | **v6e-64** | 8x8 | 16 | 64 | 64 | 8 | 64 | This is the slice we measured on. Trillion-scale; multi-host mandatory. `dp=8` required (GLA `num_groups=8` ≤ tensor axis); `--disable-radix-cache` required (hybrid recurrent state). |
 
-See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation reference.
+See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation reference. For other slices (larger v6e, v7x variants, scaled-down configs), see [Adapting to other topologies](../../base/tpu-topology-reference.md#adapting-to-other-topologies).
 
 ### 2.2 Environment
 
