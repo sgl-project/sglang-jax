@@ -65,7 +65,7 @@ def benchmark_backend(
             new_kv_c,
             new_k_pe,
             kv_cache,
-            seq_lens,
+            kv_lens,
             page_indices,
             cu_q_lens,
             cu_kv_lens,
