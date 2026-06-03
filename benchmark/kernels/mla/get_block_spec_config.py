@@ -175,8 +175,8 @@ def main():
         max_num_batched_tokens_config = [
             1, 2, 4, 8, 16, 32, 64, 8192, 16384
         ]
-        # Query heads per rank: 128 total heads / TP size
-        q_head_num_config = [4, 8, 16] 
+        # Query heads per rank: 64 total heads / TP size (TP=32 -> 2, TP=16 -> 4, TP=8 -> 8, TP=4 -> 16)
+        q_head_num_config = [2, 4, 8, 16] 
         kv_lora_rank_config = [512]
         qk_rope_head_dim_config = [64]
     else:

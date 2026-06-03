@@ -134,13 +134,16 @@ class MLAAttentionBackend(AttentionBackend):
         self.decode_batch_size = decode_batch_size
         self.dtype = dtype
 
+        tp_size = mesh.shape["tensor"] if (mesh is not None and "tensor" in mesh.shape) else 1
+        local_num_attn_heads = num_attn_heads // tp_size
+
         if num_kv_pages_per_block == (3, 1, 1) and num_queries_per_block == (1, 16, 16):
             # Resolve Decode configurations (using max_num_tokens = 1)
             dec_bkv, dec_bq = get_tuned_block_sizes(
                 page_size=page_size,
                 q_dtype=dtype,
                 kv_dtype=dtype,
-                num_q_heads=num_attn_heads,
+                num_q_heads=local_num_attn_heads,
                 kv_lora_rank=kv_lora_rank,
                 qk_rope_head_dim=qk_rope_head_dim,
                 max_num_tokens=1,
@@ -150,7 +153,7 @@ class MLAAttentionBackend(AttentionBackend):
                 page_size=page_size,
                 q_dtype=dtype,
                 kv_dtype=dtype,
-                num_q_heads=num_attn_heads,
+                num_q_heads=local_num_attn_heads,
                 kv_lora_rank=kv_lora_rank,
                 qk_rope_head_dim=qk_rope_head_dim,
                 max_num_tokens=8192,
