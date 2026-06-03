@@ -688,6 +688,22 @@ def test_topk1_index_helper_does_not_reshard_per_layer_outputs():
     assert "jax.sharding.reshard" not in source
 
 
+def test_fused_draft_extend_jit_does_not_return_topk1_probs_to_host():
+    from sgl_jax.srt.speculative import draft_extend_fused
+
+    jit_source = inspect.getsource(draft_extend_fused._build_fused_draft_extend_jit)
+    host_source = inspect.getsource(draft_extend_fused.draft_extend_for_decode_fused)
+
+    assert "all_topk_p" not in jit_source
+    assert "stacked_p" not in jit_source
+    assert "jax.lax.top_k" not in jit_source
+    assert "jax.nn.logsumexp" not in jit_source
+    assert "jax.sharding.reshard(output.next_token_logits" not in jit_source
+    assert "jax.sharding.reshard(output.hidden_states" not in jit_source
+    assert "topk_p_stacked" not in host_source
+    assert "np.ones(topk_index.shape" in host_source
+
+
 def test_fused_greedy_jit_does_not_return_topk1_probs_to_host():
     from sgl_jax.srt.speculative import draft_extend_fused
 

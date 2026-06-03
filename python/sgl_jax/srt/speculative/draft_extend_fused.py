@@ -293,7 +293,6 @@ def _build_fused_draft_extend_jit(num_layers: int, topk: int):
         *,
         num_layers,
     ):
-        all_topk_p = []
         all_topk_index = []
         all_pool_updates = []
         layer0_hidden = None
@@ -312,27 +311,13 @@ def _build_fused_draft_extend_jit(num_layers: int, topk: int):
             output, pool_updates, _, _ = model(forward_batch, all_memory_pools[i], logits_metadata)
             all_pool_updates.append(pool_updates)
 
-            # Replicate logits + hidden to P() (all-gather)
             sh = jax.typeof(output.next_token_logits).sharding
             mesh = sh.mesh if isinstance(sh, NamedSharding) else None
-            if mesh is not None:
-                rep_logits = jax.sharding.reshard(
-                    output.next_token_logits, NamedSharding(mesh, P())
-                )
-                rep_hidden = jax.sharding.reshard(output.hidden_states, NamedSharding(mesh, P()))
-            else:
-                rep_logits = output.next_token_logits
-                rep_hidden = output.hidden_states
 
             if i == 0:
-                layer0_hidden = rep_hidden
+                layer0_hidden = output.hidden_states
 
-            # topk (inline, not separate jit)
-            topk_logits, topk_idx = jax.lax.top_k(rep_logits, topk)
-            logsumexp = jax.nn.logsumexp(rep_logits, axis=-1, keepdims=True)
-            topk_p = jnp.exp(topk_logits - logsumexp).astype(rep_logits.dtype)
-
-            all_topk_p.append(topk_p)
+            topk_idx = _topk1_index_from_logits(output.next_token_logits)
             all_topk_index.append(topk_idx)
 
             # Device-side rotate for topk=1 (shared with offline equivalence
@@ -345,17 +330,14 @@ def _build_fused_draft_extend_jit(num_layers: int, topk: int):
         # consistent. Without this, donate_argnames may let XLA alias output
         # buffers with donated P("data")-sharded pool buffers, silently making
         # np.asarray() return per-process-different values.
-        stacked_p = jnp.stack(all_topk_p, axis=1)
         stacked_idx = jnp.stack(all_topk_index, axis=1)
         if mesh is not None:
             rep = NamedSharding(mesh, P())
             layer0_hidden = jax.lax.with_sharding_constraint(layer0_hidden, rep)
-            stacked_p = jax.lax.with_sharding_constraint(stacked_p, rep)
             stacked_idx = jax.lax.with_sharding_constraint(stacked_idx, rep)
 
         return (
             layer0_hidden,
-            stacked_p,
             stacked_idx,
             tuple(all_pool_updates),
         )
@@ -732,18 +714,16 @@ def draft_extend_for_decode_fused(draft_worker, model_worker_batch, batch_output
         except AttributeError:
             ctx = draft_worker.mesh
     with ctx:
-        layer0_hidden, topk_p_stacked, topk_index_stacked, all_pool_updates = (
-            draft_worker._fused_jit_fn(
-                mr0._model_def,
-                mr0._model_state_def,
-                tuple(all_leaves),
-                shared_fb,
-                tuple(all_memory_pools),
-                logits_metadata,
-                target_hidden,
-                sel_pos_device,
-                num_layers=draft_worker.speculative_num_steps,
-            )
+        layer0_hidden, topk_index_stacked, all_pool_updates = draft_worker._fused_jit_fn(
+            mr0._model_def,
+            mr0._model_state_def,
+            tuple(all_leaves),
+            shared_fb,
+            tuple(all_memory_pools),
+            logits_metadata,
+            target_hidden,
+            sel_pos_device,
+            num_layers=draft_worker.speculative_num_steps,
         )
 
     # --- Host post-processing: replace memory pools + assemble outputs ---
@@ -756,12 +736,12 @@ def draft_extend_for_decode_fused(draft_worker, model_worker_batch, batch_output
         jax.copy_to_host_async(verified_id_arr)
 
     jax.copy_to_host_async(layer0_hidden)
-    jax.copy_to_host_async(topk_p_stacked)
     jax.copy_to_host_async(topk_index_stacked)
 
     batch_output.next_draft_input.hidden_states = np.asarray(layer0_hidden)[select_index]
-    batch_output.next_draft_input.topk_p = np.asarray(topk_p_stacked)[sel]
-    batch_output.next_draft_input.topk_index = np.asarray(topk_index_stacked)[sel]
+    topk_index = np.asarray(topk_index_stacked)[sel]
+    batch_output.next_draft_input.topk_p = np.ones(topk_index.shape, dtype=np.float32)
+    batch_output.next_draft_input.topk_index = topk_index
     batch_output.next_draft_input.verified_id = np.asarray(verified_id_arr)[select_index]
     batch_output.allocate_lens = batch_output.allocate_lens[: model_worker_batch.real_bs]
     batch_output.accept_lens = accept_host
