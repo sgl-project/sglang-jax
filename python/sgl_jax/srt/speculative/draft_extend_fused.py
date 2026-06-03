@@ -512,7 +512,6 @@ def _build_fused_greedy_verify_step3_jit(num_layers: int, topk: int):
             selected_layer0_hidden = _replicate_for_host_output(selected_layer0_hidden, rep)
             stacked_idx = _replicate_for_host_output(stacked_idx, rep)
             prepared_accept_lens = _replicate_for_host_output(prepared.accept_lens, rep)
-            prepared_new_seq_lens = _replicate_for_host_output(prepared.new_seq_lens, rep)
             prepared_predict = _replicate_for_host_output(prepared.predict, rep)
             if return_target_logits:
                 target_logits_for_host = _replicate_for_host_output(target_logits, rep)
@@ -520,7 +519,6 @@ def _build_fused_greedy_verify_step3_jit(num_layers: int, topk: int):
                 target_hidden_for_host = _replicate_for_host_output(target_hidden, rep)
         else:
             prepared_accept_lens = prepared.accept_lens
-            prepared_new_seq_lens = prepared.new_seq_lens
             prepared_predict = prepared.predict
 
         return (
@@ -529,7 +527,6 @@ def _build_fused_greedy_verify_step3_jit(num_layers: int, topk: int):
             target_pool_updates,
             tuple(all_pool_updates),
             prepared_accept_lens,
-            prepared_new_seq_lens,
             prepared_predict,
             target_logits_for_host,
             target_hidden_for_host,
@@ -823,10 +820,10 @@ def _materialize_fused_greedy_batch_output_for_scheduler(
     batch_output,
     selector,
     real_bs,
+    seq_lens_host,
     layer0_hidden,
     topk_index_stacked,
     accept_lens_device,
-    new_seq_lens_device,
     predict_device,
     target_logits,
     target_hidden,
@@ -838,7 +835,6 @@ def _materialize_fused_greedy_batch_output_for_scheduler(
         jax.copy_to_host_async(layer0_hidden)
         jax.copy_to_host_async(topk_index_stacked)
         jax.copy_to_host_async(accept_lens_device)
-        jax.copy_to_host_async(new_seq_lens_device)
         jax.copy_to_host_async(predict_device)
 
         batch_output.logits_output = LogitsProcessorOutput(
@@ -851,8 +847,9 @@ def _materialize_fused_greedy_batch_output_for_scheduler(
         batch_output.next_draft_input.topk_index = topk_index
         accept_lens = np.asarray(accept_lens_device)
         predict = np.asarray(predict_device)
+        seq_lens_host = np.asarray(seq_lens_host)
         batch_output.next_draft_input.verified_id = predict[selector, accept_lens[selector] - 1]
-        batch_output.next_draft_input.new_seq_lens = np.asarray(new_seq_lens_device)[selector]
+        batch_output.next_draft_input.new_seq_lens = seq_lens_host[selector] + accept_lens[selector]
         batch_output.allocate_lens = batch_output.allocate_lens[:real_bs]
         batch_output.accept_lens = accept_lens
         batch_output.next_token_ids = predict
@@ -958,7 +955,6 @@ def fused_greedy_verify_and_draft_extend_for_decode(
             target_pool_updates,
             all_pool_updates,
             accept_lens_device,
-            new_seq_lens_device,
             predict_device,
             target_logits,
             target_hidden,
@@ -992,10 +988,10 @@ def fused_greedy_verify_and_draft_extend_for_decode(
         batch_output=batch_output,
         selector=np.asarray(model_worker_batch.logits_indices_selector),
         real_bs=model_worker_batch.real_bs,
+        seq_lens_host=model_worker_batch.seq_lens,
         layer0_hidden=layer0_hidden,
         topk_index_stacked=topk_index_stacked,
         accept_lens_device=accept_lens_device,
-        new_seq_lens_device=new_seq_lens_device,
         predict_device=predict_device,
         target_logits=target_logits,
         target_hidden=target_hidden,
