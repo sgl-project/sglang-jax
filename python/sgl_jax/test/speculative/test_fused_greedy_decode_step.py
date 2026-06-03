@@ -704,6 +704,17 @@ def test_fused_draft_extend_jit_does_not_return_topk1_probs_to_host():
     assert "np.ones(topk_index.shape" in host_source
 
 
+def test_fused_draft_extend_selects_layer0_hidden_before_host_materialize():
+    from sgl_jax.srt.speculative import draft_extend_fused
+
+    jit_source = inspect.getsource(draft_extend_fused._build_fused_draft_extend_jit)
+    host_source = inspect.getsource(draft_extend_fused.draft_extend_for_decode_fused)
+
+    assert "selected_layer0_hidden" in jit_source
+    assert "np.asarray(layer0_hidden)[select_index]" not in host_source
+    assert "copy_to_host_async(layer0_hidden)" not in host_source
+
+
 def test_fused_greedy_jit_does_not_return_topk1_probs_to_host():
     from sgl_jax.srt.speculative import draft_extend_fused
 

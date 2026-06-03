@@ -326,6 +326,8 @@ def _build_fused_draft_extend_jit(num_layers: int, topk: int):
                 ext_lens = forward_batch.extend_seq_lens
                 input_ids = _device_rotate_input_ids(input_ids, ext_lens, sel_pos, topk_idx[:, 0])
 
+        select_index = jnp.arange(sel_pos.shape[0], dtype=jnp.int32) * (num_layers + 1) + sel_pos
+        selected_layer0_hidden = _gather_rows_preserve_sharding(layer0_hidden, select_index)
         # Force P() replicated sharding on outputs that must be cross-process
         # consistent. Without this, donate_argnames may let XLA alias output
         # buffers with donated P("data")-sharded pool buffers, silently making
@@ -333,11 +335,11 @@ def _build_fused_draft_extend_jit(num_layers: int, topk: int):
         stacked_idx = jnp.stack(all_topk_index, axis=1)
         if mesh is not None:
             rep = NamedSharding(mesh, P())
-            layer0_hidden = jax.lax.with_sharding_constraint(layer0_hidden, rep)
+            selected_layer0_hidden = jax.lax.with_sharding_constraint(selected_layer0_hidden, rep)
             stacked_idx = jax.lax.with_sharding_constraint(stacked_idx, rep)
 
         return (
-            layer0_hidden,
+            selected_layer0_hidden,
             stacked_idx,
             tuple(all_pool_updates),
         )
@@ -714,7 +716,7 @@ def draft_extend_for_decode_fused(draft_worker, model_worker_batch, batch_output
         except AttributeError:
             ctx = draft_worker.mesh
     with ctx:
-        layer0_hidden, topk_index_stacked, all_pool_updates = draft_worker._fused_jit_fn(
+        selected_layer0_hidden, topk_index_stacked, all_pool_updates = draft_worker._fused_jit_fn(
             mr0._model_def,
             mr0._model_state_def,
             tuple(all_leaves),
@@ -730,18 +732,18 @@ def draft_extend_for_decode_fused(draft_worker, model_worker_batch, batch_output
     for i, w in enumerate(draft_worker._workers):
         w.model_runner.memory_pools.replace_all(all_pool_updates[i])
 
-    select_index = sel * (draft_worker.speculative_num_steps + 1) + accept_host[sel] - 1
     verified_id_arr = batch_output.next_draft_input.verified_id
     if hasattr(verified_id_arr, "copy_to_host_async"):
         jax.copy_to_host_async(verified_id_arr)
 
-    jax.copy_to_host_async(layer0_hidden)
+    jax.copy_to_host_async(selected_layer0_hidden)
     jax.copy_to_host_async(topk_index_stacked)
 
-    batch_output.next_draft_input.hidden_states = np.asarray(layer0_hidden)[select_index]
+    batch_output.next_draft_input.hidden_states = np.asarray(selected_layer0_hidden)[sel]
     topk_index = np.asarray(topk_index_stacked)[sel]
     batch_output.next_draft_input.topk_p = np.ones(topk_index.shape, dtype=np.float32)
     batch_output.next_draft_input.topk_index = topk_index
+    select_index = sel * (draft_worker.speculative_num_steps + 1) + accept_host[sel] - 1
     batch_output.next_draft_input.verified_id = np.asarray(verified_id_arr)[select_index]
     batch_output.allocate_lens = batch_output.allocate_lens[: model_worker_batch.real_bs]
     batch_output.accept_lens = accept_host
