@@ -154,13 +154,16 @@ class EagleDraftWorker(BaseDraftWorker):
                 )
                 packed = jax.device_put(packed, rep)
             else:
-                packed = build_chain_verify_inputs(
+                packed_np = build_chain_verify_inputs(
                     np.asarray(verified_id, dtype=np.int32),
                     np.asarray(token_list, dtype=np.int32),
                     np.asarray(verified_seq_lens, dtype=np.int32),
                     n,
                     bs,
                 )
+                # One allgather instead of five: pack into a single (5, bs*n)
+                # buffer, device_put once, then slice on device.
+                packed = jax.device_put(packed_np, NamedSharding(self.mesh, P()))
             draft_tokens = packed[0]
             position = packed[1]
             retrive_index = packed[2].reshape(bs, n)
