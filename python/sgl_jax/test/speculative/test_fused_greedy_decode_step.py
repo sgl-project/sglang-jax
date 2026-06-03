@@ -1,3 +1,4 @@
+import inspect
 from types import SimpleNamespace
 
 import jax
@@ -589,6 +590,19 @@ def test_replicate_for_host_output_reshards_data_sharded_array():
 
     assert out.sharding.is_fully_replicated
     np.testing.assert_array_equal(np.asarray(out), np.array([12, 23], dtype=np.int32))
+
+
+def test_fused_greedy_jit_does_not_reshard_model_outputs_before_compute():
+    from sgl_jax.srt.speculative import draft_extend_fused
+
+    source = inspect.getsource(draft_extend_fused._build_fused_greedy_verify_step3_jit)
+
+    assert "jax.sharding.reshard(target_output.next_token_logits" not in source
+    assert "jax.sharding.reshard(target_output.hidden_states" not in source
+    assert "jax.sharding.reshard(output.next_token_logits" not in source
+    assert "jax.sharding.reshard(output.hidden_states" not in source
+    assert "_replicate_for_host_output(target_logits" in source
+    assert "_replicate_for_host_output(target_hidden" in source
 
 
 class _SamplingInfo:

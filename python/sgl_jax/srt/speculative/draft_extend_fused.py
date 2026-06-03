@@ -23,7 +23,10 @@ from flax import nnx
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from sgl_jax.srt.kernels.speculative.verify_tree_greedy_kernel import verify_tree_greedy
+from sgl_jax.srt.kernels.speculative.verify_tree_greedy_kernel import (
+    verify_tree_greedy,
+    verify_tree_greedy_pallas_call,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -140,6 +143,88 @@ def _greedy_sample_and_prepare_draft_inputs(
     )
 
 
+def _greedy_sample_and_prepare_draft_inputs_from_predict(
+    *,
+    target_hidden,
+    positions,
+    seq_lens,
+    draft_tokens,
+    retrive_index,
+    retrive_next_token,
+    retrive_next_sibling,
+    target_predict,
+    speculative_num_steps,
+    speculative_num_draft_tokens,
+):
+    bs = retrive_index.shape[0]
+    candidates = draft_tokens.reshape(bs, speculative_num_draft_tokens)
+    predict = jnp.zeros((target_predict.shape[0] + 1,), dtype=jnp.int32)
+    accept_index_2d = jnp.full((bs, speculative_num_steps + 1), -1, dtype=jnp.int32)
+    accept_length_raw = jnp.zeros((bs,), dtype=jnp.int32)
+    in_specs = (
+        P(),  # predicts
+        P(),  # accept_index
+        P(),  # accept_token_num
+        P(),  # candidates
+        P(),  # retrive_index
+        P(),  # retrive_next_token
+        P(),  # retrive_next_sibling
+        P(),  # target_predict
+        None,
+        None,
+    )
+    out_specs = (
+        P(),  # accept_index
+        P(),  # accept_token_num
+        P(),  # predicts
+    )
+    accept_index_2d, accept_length_raw, predict = jax.shard_map(
+        verify_tree_greedy_pallas_call,
+        in_specs=in_specs,
+        out_specs=out_specs,
+        check_vma=False,
+    )(
+        predict,
+        accept_index_2d,
+        accept_length_raw,
+        candidates,
+        retrive_index,
+        retrive_next_token,
+        retrive_next_sibling,
+        target_predict,
+        retrive_index.shape[1],
+        accept_index_2d.shape[1],
+    )
+    accept_length = accept_length_raw + 1
+    accept_index = accept_index_2d.reshape(-1)
+    accept_width = speculative_num_steps + 1
+    req_ids = jnp.arange(accept_index.shape[0], dtype=jnp.int32) // accept_width
+    per_req_last = req_ids * speculative_num_draft_tokens + speculative_num_draft_tokens - 1
+    safe_index = jnp.where(accept_index >= 0, accept_index, per_req_last)
+    safe_predict = jnp.take(predict.reshape(-1), safe_index)
+    verified_id = jnp.where(accept_index >= 0, safe_predict, jnp.zeros_like(safe_predict))
+    prepared = _greedy_step3_prepare_draft_inputs(
+        target_hidden,
+        positions,
+        seq_lens,
+        accept_index,
+        accept_length,
+        verified_id,
+        speculative_num_steps=speculative_num_steps,
+        speculative_num_draft_tokens=speculative_num_draft_tokens,
+    )
+    return GreedySampleAndPrepareOutput(
+        hidden_states=prepared.hidden_states,
+        positions=prepared.positions,
+        new_seq_lens=prepared.new_seq_lens,
+        select_index=prepared.select_index,
+        verified_id=prepared.verified_id,
+        accept_lens=prepared.accept_lens,
+        sel_pos=prepared.sel_pos,
+        predict=predict,
+    )
+
+
 def _build_topk1_chain_verify_inputs_device_tuple(
     *,
     verified_id,
@@ -202,6 +287,15 @@ def _device_rotate_input_ids(input_ids, ext_lens, sel_pos, new_tokens):
 def _replicate_for_host_output(value, replicated_sharding):
     """Move final small scheduler outputs to replicated sharding."""
     return jax.sharding.reshard(value, replicated_sharding)
+
+
+def _topk1_index_from_logits(logits, replicated_sharding):
+    topk_idx = jnp.argmax(logits, axis=-1).astype(jnp.int32)[:, None]
+    topk_p = jnp.ones(topk_idx.shape, dtype=logits.dtype)
+    if replicated_sharding is not None:
+        topk_idx = jax.sharding.reshard(topk_idx, replicated_sharding)
+        topk_p = jax.sharding.reshard(topk_p, replicated_sharding)
+    return topk_p, topk_idx
 
 
 def _build_fused_draft_extend_jit(num_layers: int, topk: int):
@@ -370,15 +464,14 @@ def _build_fused_greedy_verify_step3_jit(num_layers: int, topk: int):
 
         sh = jax.typeof(target_output.next_token_logits).sharding
         mesh = sh.mesh if isinstance(sh, NamedSharding) else None
-        if mesh is not None:
-            rep = NamedSharding(mesh, P())
-            target_logits = jax.sharding.reshard(target_output.next_token_logits, rep)
-            target_hidden = jax.sharding.reshard(target_output.hidden_states, rep)
-        else:
-            target_logits = target_output.next_token_logits
-            target_hidden = target_output.hidden_states
+        rep = NamedSharding(mesh, P()) if mesh is not None else None
+        target_logits = target_output.next_token_logits
+        target_hidden = target_output.hidden_states
+        target_predict = jnp.argmax(target_logits, axis=-1).astype(jnp.int32).reshape(-1)
+        if rep is not None:
+            target_predict = jax.sharding.reshard(target_predict, rep)
 
-        prepared = _greedy_sample_and_prepare_draft_inputs(
+        prepared = _greedy_sample_and_prepare_draft_inputs_from_predict(
             target_hidden=target_hidden,
             positions=target_forward_batch.positions,
             seq_lens=target_forward_batch.seq_lens,
@@ -386,7 +479,7 @@ def _build_fused_greedy_verify_step3_jit(num_layers: int, topk: int):
             retrive_index=retrive_index,
             retrive_next_token=retrive_next_token,
             retrive_next_sibling=retrive_next_sibling,
-            next_token_logits=target_logits,
+            target_predict=target_predict,
             speculative_num_steps=speculative_num_steps,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
         )
@@ -416,20 +509,13 @@ def _build_fused_greedy_verify_step3_jit(num_layers: int, topk: int):
 
             sh = jax.typeof(output.next_token_logits).sharding
             mesh = sh.mesh if isinstance(sh, NamedSharding) else mesh
-            if mesh is not None:
-                rep = NamedSharding(mesh, P())
-                rep_logits = jax.sharding.reshard(output.next_token_logits, rep)
-                rep_hidden = jax.sharding.reshard(output.hidden_states, rep)
-            else:
-                rep_logits = output.next_token_logits
-                rep_hidden = output.hidden_states
+            rep = NamedSharding(mesh, P()) if mesh is not None else None
+            topk_p, topk_idx = _topk1_index_from_logits(output.next_token_logits, rep)
+            rep_hidden = output.hidden_states
 
             if i == 0:
                 layer0_hidden = rep_hidden
 
-            topk_logits, topk_idx = jax.lax.top_k(rep_logits, topk)
-            logsumexp = jax.nn.logsumexp(rep_logits, axis=-1, keepdims=True)
-            topk_p = jnp.exp(topk_logits - logsumexp)
             all_topk_p.append(topk_p)
             all_topk_index.append(topk_idx)
 
