@@ -52,31 +52,7 @@ _WARNED_MISSES: set[tuple] = set()
 # Schema: see module docstring.
 TUNED_BLOCK_SIZES_MLA: dict[str, dict[tuple, tuple]] = {
     "TPU v5": {},
-    "TPU v6e": {
-        # ===== DeepSeek-V3 (kv_lora_rank=512, qk_rope_head_dim=64) =====
-        # Deploy: --tp-size 64 --dp-size 8 --page-size 128
-        # → attention_tp = 8 → per-shard num_q_heads = 128/8 = 16.
-        # Tuned 2026-06-05 on chavoshi-us-east5-b-2 v6e-64 via
-        # benchmark/kernels/mla/get_block_spec_config_mla.py (kv_len=4096).
-        ("decode", "bfloat16", "bfloat16", 16, 512, 64, 128, 1): (16, 1, 2),
-        ("decode", "bfloat16", "bfloat16", 16, 512, 64, 128, 8): (16, 1, 2),
-        ("decode", "bfloat16", "bfloat16", 16, 512, 64, 128, 16): (32, 1, 2),
-        ("decode", "bfloat16", "bfloat16", 16, 512, 64, 128, 32): (32, 1, 2),
-        ("decode", "bfloat16", "bfloat16", 16, 512, 64, 128, 64): (32, 1, 2),
-        ("decode", "bfloat16", "bfloat16", 16, 512, 64, 128, 128): (32, 1, 2),
-        ("decode", "bfloat16", "bfloat16", 16, 512, 64, 128, 256): (32, 1, 2),
-        ("decode", "bfloat16", "bfloat16", 16, 512, 64, 128, 512): (32, 1, 2),
-        ("decode", "bfloat16", "bfloat16", 16, 512, 64, 128, 1024): (32, 1, 2),
-        ("mixed", "bfloat16", "bfloat16", 16, 512, 64, 128, 1): (16, 64),
-        ("mixed", "bfloat16", "bfloat16", 16, 512, 64, 128, 8): (16, 64),
-        ("mixed", "bfloat16", "bfloat16", 16, 512, 64, 128, 16): (16, 64),
-        ("mixed", "bfloat16", "bfloat16", 16, 512, 64, 128, 32): (16, 64),
-        ("mixed", "bfloat16", "bfloat16", 16, 512, 64, 128, 64): (16, 64),
-        ("mixed", "bfloat16", "bfloat16", 16, 512, 64, 128, 128): (16, 128),
-        ("mixed", "bfloat16", "bfloat16", 16, 512, 64, 128, 256): (8, 256),
-        ("mixed", "bfloat16", "bfloat16", 16, 512, 64, 128, 512): (8, 256),
-        ("mixed", "bfloat16", "bfloat16", 16, 512, 64, 128, 1024): (8, 256),
-    },
+    "TPU v6e": {},
     "TPU v7": {
         # ===== Ling-2.6-1T (kv_lora_rank=512, qk_rope_head_dim=64) =====
         # Production deploy: --tp-size 32 --dp-size 4 --page-size 256
@@ -117,28 +93,38 @@ TUNED_BLOCK_SIZES_MLA: dict[str, dict[tuple, tuple]] = {
         ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 256, 1024): (8, 256),
         ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 256, 2048): (8, 256),
         ("mixed", "bfloat16", "bfloat16", 8, 512, 64, 256, 4096): (8, 256),
-        # ===== DeepSeek-V3 671B (num_q_heads=128 → 16/shard, kv_lora=512,
-        # page=128). decode reuses v6e sweep; mixed bq capped at 128 — v7x
-        # scoped VMEM limit is 57.6M (< v6e), bq=256 OOMs by 3.6M at mnt≥256.
-        ("decode", "bfloat16", "bfloat16", 16, 512, 64, 128, 1): (16, 1, 2),
-        ("decode", "bfloat16", "bfloat16", 16, 512, 64, 128, 8): (16, 1, 2),
-        ("decode", "bfloat16", "bfloat16", 16, 512, 64, 128, 16): (32, 1, 2),
-        ("decode", "bfloat16", "bfloat16", 16, 512, 64, 128, 32): (32, 1, 2),
-        ("decode", "bfloat16", "bfloat16", 16, 512, 64, 128, 64): (32, 1, 2),
-        ("decode", "bfloat16", "bfloat16", 16, 512, 64, 128, 128): (32, 1, 2),
-        ("decode", "bfloat16", "bfloat16", 16, 512, 64, 128, 256): (32, 1, 2),
-        ("decode", "bfloat16", "bfloat16", 16, 512, 64, 128, 512): (32, 1, 2),
-        ("decode", "bfloat16", "bfloat16", 16, 512, 64, 128, 1024): (32, 1, 2),
-        ("mixed", "bfloat16", "bfloat16", 16, 512, 64, 128, 1): (16, 64),
-        ("mixed", "bfloat16", "bfloat16", 16, 512, 64, 128, 8): (16, 64),
-        ("mixed", "bfloat16", "bfloat16", 16, 512, 64, 128, 16): (16, 64),
-        ("mixed", "bfloat16", "bfloat16", 16, 512, 64, 128, 32): (16, 64),
-        ("mixed", "bfloat16", "bfloat16", 16, 512, 64, 128, 64): (16, 64),
-        ("mixed", "bfloat16", "bfloat16", 16, 512, 64, 128, 128): (16, 128),
-        ("mixed", "bfloat16", "bfloat16", 16, 512, 64, 128, 256): (8, 128),
-        ("mixed", "bfloat16", "bfloat16", 16, 512, 64, 128, 512): (8, 128),
-        ("mixed", "bfloat16", "bfloat16", 16, 512, 64, 128, 1024): (8, 128),
-        ("mixed", "bfloat16", "bfloat16", 16, 512, 64, 128, 2048): (8, 128),
+
+        # ===== GLM-5.1 (TP=32) configurations on TPU v7 =====
+        # Decode & Mixed tuned for q_head_num=2 (TP=32 sharding)
+        ('decode', 'bfloat16', 'bfloat16', 2, 512, 64, 64, 1): (16, 1, 4),
+        ('decode', 'bfloat16', 'bfloat16', 2, 512, 64, 64, 2): (32, 1, 4),
+        ('decode', 'bfloat16', 'bfloat16', 2, 512, 64, 64, 4): (64, 1, 4),
+        ('decode', 'bfloat16', 'bfloat16', 2, 512, 64, 64, 8): (32, 1, 4),
+        ('decode', 'bfloat16', 'bfloat16', 2, 512, 64, 64, 16): (64, 1, 4),
+        ('decode', 'bfloat16', 'bfloat16', 2, 512, 64, 64, 32): (64, 1, 4),
+        ('decode', 'bfloat16', 'bfloat16', 2, 512, 64, 64, 64): (64, 1, 4),  # Capped from 128 to prevent VMEM OOM when dbs=4
+        ('mixed', 'bfloat16', 'bfloat16', 2, 512, 64, 64, 8192): (2, 256),
+        ('mixed', 'bfloat16', 'bfloat16', 2, 512, 64, 64, 16384): (2, 256),
+
+        ('decode', 'bfloat16', 'bfloat16', 2, 512, 64, 128, 1): (8, 1, 4),
+        ('decode', 'bfloat16', 'bfloat16', 2, 512, 64, 128, 2): (8, 1, 4),
+        ('decode', 'bfloat16', 'bfloat16', 2, 512, 64, 128, 4): (16, 1, 4),
+        ('decode', 'bfloat16', 'bfloat16', 2, 512, 64, 128, 8): (16, 1, 4),
+        ('decode', 'bfloat16', 'bfloat16', 2, 512, 64, 128, 16): (32, 1, 4),
+        ('decode', 'bfloat16', 'bfloat16', 2, 512, 64, 128, 32): (32, 1, 4),  # Capped from 64 to prevent VMEM OOM when dbs=4
+        ('decode', 'bfloat16', 'bfloat16', 2, 512, 64, 128, 64): (32, 1, 4),
+        ('mixed', 'bfloat16', 'bfloat16', 2, 512, 64, 128, 8192): (2, 256),
+        ('mixed', 'bfloat16', 'bfloat16', 2, 512, 64, 128, 16384): (1, 512),
+
+        ('decode', 'bfloat16', 'bfloat16', 2, 512, 64, 256, 1): (4, 1, 4),
+        ('decode', 'bfloat16', 'bfloat16', 2, 512, 64, 256, 2): (8, 1, 4),
+        ('decode', 'bfloat16', 'bfloat16', 2, 512, 64, 256, 4): (8, 1, 4),
+        ('decode', 'bfloat16', 'bfloat16', 2, 512, 64, 256, 8): (8, 1, 4),
+        ('decode', 'bfloat16', 'bfloat16', 2, 512, 64, 256, 16): (8, 1, 4),
+        ('decode', 'bfloat16', 'bfloat16', 2, 512, 64, 256, 32): (16, 1, 4),  # Capped from 32 to prevent VMEM OOM when dbs=4
+        ('decode', 'bfloat16', 'bfloat16', 2, 512, 64, 256, 64): (16, 1, 4),  # Capped from 32 to prevent VMEM OOM when dbs=4
+        ('mixed', 'bfloat16', 'bfloat16', 2, 512, 64, 256, 8192): (1, 512),
+        ('mixed', 'bfloat16', 'bfloat16', 2, 512, 64, 256, 16384): (1, 512),
     },
 }
 

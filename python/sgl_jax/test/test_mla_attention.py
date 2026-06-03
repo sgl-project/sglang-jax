@@ -279,6 +279,7 @@ def create_mla_forward_batch(
         page_size=page_size,
         mesh=mesh,
         attention_data_partition_axis="data",
+        dtype=dtype,
     )
 
     mwb = ModelWorkerBatch(

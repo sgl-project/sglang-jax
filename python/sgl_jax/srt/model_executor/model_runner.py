@@ -442,6 +442,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 page_size=self.page_size,
                 mesh=self.mesh,
                 attention_data_partition_axis="data",
+                dtype=self.dtype,
             )
 
         elif backend in ("fa", "fa_mha"):
