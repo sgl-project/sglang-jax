@@ -173,7 +173,7 @@ def main():
         print("Tuning exclusively for GLM-5.1 (TP=32, TP=16, TP=8) configurations.")
         page_size_config = [256]
         max_num_batched_tokens_config = [
-            1, 2, 4, 8, 16, 32, 64, 128, 256, 16384
+            1, 2, 4, 8, 16, 32, 64, 16384
         ]
         # Query heads per rank: 128 total heads / TP size
         q_head_num_config = [4, 8, 16] 
