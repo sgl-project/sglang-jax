@@ -210,12 +210,15 @@ def main():
                             )
 
     # Tiling search space
-    num_kv_pages_per_blk_config = [1, 2, 4, 8, 16, 32]
-    num_queries_per_block_config = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
+    num_kv_pages_per_blk_config = [1, 2, 4, 8, 16]
+    num_queries_per_block_config = [1, 2, 4, 8, 16, 32, 64, 128, 256]
 
     prefill_only_block_spec_configs = []
     for num_kv_pages_per_blk in num_kv_pages_per_blk_config:
         for num_queries_per_block in num_queries_per_block_config:
+            # Skip configurations that are too large and guaranteed to overflow VMEM (Vector Memory)
+            if num_kv_pages_per_blk * num_queries_per_block > 256:
+                continue
             prefill_only_block_spec_configs.append((num_kv_pages_per_blk, num_queries_per_block))
 
     decode_only_block_spec_configs = []
@@ -266,8 +269,13 @@ def main():
                     best_output = flash_time
                     best_config = (num_kv_pages_per_blk, num_queries_per_block)
             except Exception as e:
-                import traceback
-                traceback.print_exc()
+                err_str = str(e)
+                if "RESOURCE_EXHAUSTED" in err_str or "vmem limit" in err_str:
+                    if jax.process_index() == 0:
+                        print(f"  [Skipped OOM] (num_kv_pages_per_blk={num_kv_pages_per_blk}, num_queries_per_block={num_queries_per_block}) due to Vector Memory (VMEM) limits.", flush=True)
+                else:
+                    import traceback
+                    traceback.print_exc()
         if jax.process_index() == 0 and best_config:
             # Output in python dict format for easy copying to tuned_block_sizes.py
             print(
