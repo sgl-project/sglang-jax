@@ -179,6 +179,23 @@ def test_concurrent_32_acks(p_notifier, d_notifier):
     assert p_notifier.pending_count() == 0
 
 
+def test_mark_retired_dedup(p_notifier, d_notifier):
+    received: list[bytes] = []
+    event = threading.Event()
+    uuid = b"dedup-uuid"
+
+    p_notifier.register_callback(uuid, lambda u: (received.append(u), event.set()))
+    d_notifier.send_done(uuid, "127.0.0.1", p_notifier.port)
+    assert event.wait(timeout=2.0)
+    assert len(received) == 1
+
+    p_notifier.mark_retired(uuid, state="SUCCESS", reason="ack")
+
+    d_notifier.send_done(uuid, "127.0.0.1", p_notifier.port)
+    time.sleep(0.3)
+    assert len(received) == 1
+
+
 def test_stop_is_idempotent_and_releases_socket():
     n = ZmqPullNotifier("prefill", "127.0.0.1", _free_port())
     n.start()

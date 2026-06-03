@@ -211,6 +211,12 @@ class Req:
         self.lora_id = lora_id if lora_id is not None else "0"
         self.dp_rank = dp_rank
 
+        # PD disaggregation routing keys.
+        self.bootstrap_host: str | None = None
+        self.bootstrap_port: int | None = None
+        self.bootstrap_room: int | None = None
+        self.disagg_transfer_id: str | None = None
+
         # Memory pool info
         self.req_pool_idx: int | None = None
         self.recurrent_pool_idx: int | None = None
@@ -397,6 +403,39 @@ class Req:
         tree_cache: BasePrefixCache | None = None,
     ):
         self.fill_ids = self.origin_input_ids + self.output_ids
+        # PD decode-side: KV was written externally; skip tree_cache.match_prefix
+        # for this req's first decode iter.
+        if getattr(self, "_pd_skip_prefix_match", False):
+            self._pd_skip_prefix_match = False
+            root = (
+                getattr(tree_cache, "root_node", None)
+                if tree_cache is not None else None
+            )
+            self.last_node = root
+            self.last_host_node = root
+            self.host_hit_length = 0
+            self.last_matched_prefix_len = len(self.prefix_indices)
+            self.extend_input_len = (
+                len(self.fill_ids) - len(self.prefix_indices)
+            )
+            return
+        # PD req with empty output_ids: skip match_prefix to avoid
+        # stale radix cache hits.
+        if (
+            getattr(self, "bootstrap_room", None) is not None
+            and not self.output_ids
+        ):
+            self.prefix_indices = []
+            self.last_matched_prefix_len = 0
+            self.extend_input_len = len(self.fill_ids)
+            root = (
+                getattr(tree_cache, "root_node", None)
+                if tree_cache is not None else None
+            )
+            self.last_node = root
+            self.last_host_node = root
+            self.host_hit_length = 0
+            return
         if tree_cache is not None:
             (
                 self.prefix_indices,
