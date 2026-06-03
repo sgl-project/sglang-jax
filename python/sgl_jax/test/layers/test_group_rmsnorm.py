@@ -2,7 +2,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from jax.sharding import AxisType, Mesh, NamedSharding
+from jax.sharding import AbstractMesh, AxisType, Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.layers.attention.fla.group_rmsnorm import GroupRMSNorm
@@ -131,17 +131,21 @@ class TestGroupRMSNorm:
 
         np.testing.assert_allclose(jax_output, expected, rtol=FP32_RTOL, atol=FP32_ATOL)
 
-    def test_rejects_tp_smaller_than_num_groups(self):
-        """Tensor parallelism must be at least the number of RMS groups."""
-        mesh = Mesh(
-            np.array(jax.devices()[:1]).reshape(1, 1),
+    def test_rejects_tp_not_dividing_num_groups(self):
+        """Tensor parallel size must evenly divide the number of RMS groups."""
+        # tp=16 does not divide num_groups=8, so the 8 groups cannot be sharded
+        # evenly across the tensor axis. Use an AbstractMesh so the constructor
+        # guard is exercised without requiring 16 physical devices (the guard
+        # raises before any sharded parameter is created).
+        mesh = AbstractMesh(
+            axis_sizes=(1, 16),
             axis_names=("data", "tensor"),
             axis_types=(AxisType.Explicit, AxisType.Explicit),
         )
 
         with pytest.raises(
             ValueError,
-            match="tensor parallel size.*num_groups",
+            match="tensor parallel size to divide num_groups",
         ):
             GroupRMSNorm(
                 HIDDEN_SIZE,
