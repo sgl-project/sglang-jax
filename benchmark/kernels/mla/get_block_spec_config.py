@@ -158,9 +158,11 @@ def benchmark_backend(
 
 
 def main():
-    print("JAX devices:", jax.devices())
-    print("Device count:", jax.device_count())
-    print()
+    jax.distributed.initialize()
+    if jax.process_index() == 0:
+        print("JAX devices:", jax.devices())
+        print("Device count:", jax.device_count())
+        print()
 
     # GLM-5.1 default shapes to tune specifically, or general sweep
     # If a specific argument is passed, tune ONLY GLM-5.1 shapes on TPU v7x
@@ -257,7 +259,7 @@ def main():
                     best_config = (num_kv_pages_per_blk, num_queries_per_block)
             except Exception:
                 pass
-        if best_config:
+        if jax.process_index() == 0 and best_config:
             # Output in python dict format for easy copying to tuned_block_sizes.py
             print(
                 f"('{q_dtype}', '{k_dtype}', {q_head_num}, {kv_lora_rank}, {qk_rope_head_dim}, {page_size}, {max_num_batched_tokens}): ({best_config[0]}, {best_config[1]}),"
