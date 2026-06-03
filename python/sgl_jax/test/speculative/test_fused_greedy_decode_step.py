@@ -10,6 +10,7 @@ from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.speculative.draft_extend_fused import (
     _greedy_sample_and_prepare_draft_inputs,
+    _greedy_sample_and_prepare_draft_inputs_chain_from_predict,
     _greedy_step3_prepare_draft_inputs,
 )
 
@@ -108,10 +109,6 @@ def test_greedy_sample_and_prepare_draft_inputs_calls_verify_inside(monkeypatch)
 
 
 def test_greedy_chain_sample_and_prepare_from_predict_matches_fixed_chain_semantics():
-    from sgl_jax.srt.speculative.draft_extend_fused import (
-        _greedy_sample_and_prepare_draft_inputs_chain_from_predict,
-    )
-
     hidden = jnp.arange(8 * 5, dtype=jnp.float32).reshape(8, 5)
     positions = jnp.arange(8, dtype=jnp.int32) + 100
     seq_lens = jnp.array([10, 20], dtype=jnp.int32)
@@ -149,6 +146,83 @@ def test_greedy_chain_sample_and_prepare_from_predict_matches_fixed_chain_semant
         np.asarray(prepared.hidden_states),
         np.asarray(hidden)[np.array([0, 1, 2, 3, 4, 7, 7, 7], dtype=np.int32)],
     )
+
+
+def test_greedy_chain_sample_and_prepare_compiles_with_explicit_data_sharding():
+    devices = np.asarray(jax.devices())
+    mesh = Mesh(devices[:1], ("data",), axis_types=(AxisType.Explicit,))
+    bs = 32
+    num_draft_tokens = 4
+    hidden_size = 8
+
+    with jax.set_mesh(mesh):
+        data_sharding = NamedSharding(mesh, P("data"))
+        hidden_sharding = NamedSharding(mesh, P("data", None))
+        draft_tokens = jax.device_put(
+            jnp.tile(jnp.array([10, 11, 12, 13], dtype=jnp.int32), bs),
+            data_sharding,
+        )
+        target_predict = jax.device_put(
+            jnp.tile(jnp.array([11, 12, 99, 0], dtype=jnp.int32), bs),
+            data_sharding,
+        )
+        seq_lens = jax.device_put(jnp.arange(bs, dtype=jnp.int32) + 10, data_sharding)
+        positions = jax.device_put(
+            jnp.arange(bs * num_draft_tokens, dtype=jnp.int32) + 100,
+            data_sharding,
+        )
+        hidden = jax.device_put(
+            jnp.arange(bs * num_draft_tokens * hidden_size, dtype=jnp.float32).reshape(
+                bs * num_draft_tokens, hidden_size
+            ),
+            hidden_sharding,
+        )
+
+        @jax.jit
+        def prepare(hidden, positions, seq_lens, draft_tokens, target_predict):
+            out = _greedy_sample_and_prepare_draft_inputs_chain_from_predict(
+                target_hidden=hidden,
+                positions=positions,
+                seq_lens=seq_lens,
+                draft_tokens=draft_tokens,
+                target_predict=target_predict,
+                speculative_num_steps=3,
+                speculative_num_draft_tokens=num_draft_tokens,
+            )
+            return (
+                out.hidden_states,
+                out.positions,
+                out.new_seq_lens,
+                out.select_index,
+                out.verified_id,
+                out.accept_lens,
+                out.sel_pos,
+                out.predict,
+            )
+
+        out = prepare(hidden, positions, seq_lens, draft_tokens, target_predict)
+        jax.tree_util.tree_map(lambda x: x.block_until_ready(), out)
+
+    (
+        hidden_states,
+        positions_out,
+        new_seq_lens,
+        select_index,
+        verified_id,
+        accept_lens,
+        sel_pos,
+        predict,
+    ) = out
+    assert hidden_states.shape == (bs * num_draft_tokens, hidden_size)
+    assert positions_out.shape == (bs * num_draft_tokens,)
+    assert new_seq_lens.shape == (bs,)
+    assert select_index.shape == (bs,)
+    assert verified_id.shape == (bs * num_draft_tokens,)
+    assert accept_lens.shape == (bs,)
+    assert sel_pos.shape == (bs,)
+    assert predict.shape == (bs * num_draft_tokens,)
+    assert jax.typeof(hidden_states).sharding.spec == P("data", None)
+    assert jax.typeof(verified_id).sharding.spec == P("data")
 
 
 def test_step3_logits_metadata_can_skip_placeholder_accept_lens(monkeypatch):
@@ -643,13 +717,13 @@ def test_fused_greedy_jit_does_not_reshard_model_outputs_before_compute():
     assert "jax.sharding.reshard(output.hidden_states" not in source
 
 
-def test_fused_greedy_jit_uses_constraints_for_final_host_outputs():
+def test_fused_greedy_jit_uses_reshard_for_final_host_outputs():
     from sgl_jax.srt.speculative import draft_extend_fused
 
     source = inspect.getsource(draft_extend_fused._build_fused_greedy_verify_step3_jit)
 
     assert "_replicate_for_host_output" not in source
-    assert "jax.lax.with_sharding_constraint" in source
+    assert "jax.sharding.reshard" in source
 
 
 def test_obsolete_host_output_reshard_helper_is_removed():

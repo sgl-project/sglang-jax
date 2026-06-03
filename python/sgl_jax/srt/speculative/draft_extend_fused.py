@@ -49,6 +49,13 @@ class GreedySampleAndPrepareOutput(NamedTuple):
     predict: jax.Array
 
 
+def _take_with_index_sharding(values, index):
+    index_sharding = jax.typeof(index).sharding
+    if isinstance(index_sharding, NamedSharding):
+        return values.reshape(-1).at[index].get(out_sharding=index_sharding)
+    return jnp.take(values.reshape(-1), index)
+
+
 def _greedy_step3_prepare_draft_inputs(
     hidden_states,
     positions,
@@ -61,7 +68,10 @@ def _greedy_step3_prepare_draft_inputs(
     speculative_num_draft_tokens,
 ):
     accept_width = speculative_num_steps + 1
-    req_ids = jnp.arange(accept_index.shape[0], dtype=jnp.int32) // accept_width
+    req_ids = (
+        jnp.zeros_like(accept_index)
+        + jnp.arange(accept_index.shape[0], dtype=jnp.int32) // accept_width
+    )
     per_req_last = req_ids * speculative_num_draft_tokens + speculative_num_draft_tokens - 1
     safe_index = jnp.where(accept_index >= 0, accept_index, per_req_last)
     select_index = (
@@ -116,7 +126,7 @@ def _greedy_sample_and_prepare_draft_inputs(
     req_ids = jnp.arange(accept_index.shape[0], dtype=jnp.int32) // accept_width
     per_req_last = req_ids * speculative_num_draft_tokens + speculative_num_draft_tokens - 1
     safe_index = jnp.where(accept_index >= 0, accept_index, per_req_last)
-    safe_predict = jnp.take(predict.reshape(-1), safe_index)
+    safe_predict = _take_with_index_sharding(predict, safe_index)
     verified_id = jnp.where(accept_index >= 0, safe_predict, jnp.zeros_like(safe_predict))
     prepared = _greedy_step3_prepare_draft_inputs(
         target_hidden,
@@ -161,7 +171,8 @@ def _greedy_sample_and_prepare_draft_inputs_chain_from_predict(
     accept_length_raw = jnp.sum(accepted_children.astype(jnp.int32), axis=1)
     accept_length = accept_length_raw + 1
 
-    base = jnp.arange(bs, dtype=jnp.int32)[:, None] * n
+    row_ids = jnp.zeros_like(accept_length_raw) + jnp.arange(bs, dtype=jnp.int32)
+    base = row_ids[:, None] * n
     child_offsets = jnp.arange(1, width, dtype=jnp.int32)[None, :]
     accept_index_children = jnp.where(accepted_children, base + child_offsets, -1)
     accept_index_2d = jnp.concatenate([base, accept_index_children], axis=1)
@@ -169,10 +180,13 @@ def _greedy_sample_and_prepare_draft_inputs_chain_from_predict(
 
     predict = target_predict.astype(jnp.int32).reshape(-1)
     accept_width = speculative_num_steps + 1
-    req_ids = jnp.arange(accept_index.shape[0], dtype=jnp.int32) // accept_width
+    req_ids = (
+        jnp.zeros_like(accept_index)
+        + jnp.arange(accept_index.shape[0], dtype=jnp.int32) // accept_width
+    )
     per_req_last = req_ids * speculative_num_draft_tokens + speculative_num_draft_tokens - 1
     safe_index = jnp.where(accept_index >= 0, accept_index, per_req_last)
-    safe_predict = jnp.take(predict.reshape(-1), safe_index)
+    safe_predict = _take_with_index_sharding(predict, safe_index)
     verified_id = jnp.where(accept_index >= 0, safe_predict, jnp.zeros_like(safe_predict))
     prepared = _greedy_step3_prepare_draft_inputs(
         target_hidden,
@@ -330,8 +344,8 @@ def _build_fused_draft_extend_jit(num_layers: int, topk: int):
         stacked_idx = jnp.stack(all_topk_index, axis=1)
         if mesh is not None:
             rep = NamedSharding(mesh, P())
-            selected_layer0_hidden = jax.lax.with_sharding_constraint(selected_layer0_hidden, rep)
-            stacked_idx = jax.lax.with_sharding_constraint(stacked_idx, rep)
+            selected_layer0_hidden = jax.sharding.reshard(selected_layer0_hidden, rep)
+            stacked_idx = jax.sharding.reshard(stacked_idx, rep)
 
         return (
             selected_layer0_hidden,
@@ -484,14 +498,14 @@ def _build_fused_greedy_verify_step3_jit(num_layers: int, topk: int):
         target_hidden_for_host = target_hidden if return_target_hidden else None
         if mesh is not None:
             rep = NamedSharding(mesh, P())
-            selected_layer0_hidden = jax.lax.with_sharding_constraint(selected_layer0_hidden, rep)
-            stacked_idx = jax.lax.with_sharding_constraint(stacked_idx, rep)
-            prepared_accept_lens = jax.lax.with_sharding_constraint(prepared.accept_lens, rep)
-            prepared_predict = jax.lax.with_sharding_constraint(prepared.predict, rep)
+            selected_layer0_hidden = jax.sharding.reshard(selected_layer0_hidden, rep)
+            stacked_idx = jax.sharding.reshard(stacked_idx, rep)
+            prepared_accept_lens = jax.sharding.reshard(prepared.accept_lens, rep)
+            prepared_predict = jax.sharding.reshard(prepared.predict, rep)
             if return_target_logits:
-                target_logits_for_host = jax.lax.with_sharding_constraint(target_logits, rep)
+                target_logits_for_host = jax.sharding.reshard(target_logits, rep)
             if return_target_hidden:
-                target_hidden_for_host = jax.lax.with_sharding_constraint(target_hidden, rep)
+                target_hidden_for_host = jax.sharding.reshard(target_hidden, rep)
         else:
             prepared_accept_lens = prepared.accept_lens
             prepared_predict = prepared.predict
