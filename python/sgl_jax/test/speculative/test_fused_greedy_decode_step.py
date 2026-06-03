@@ -669,6 +669,15 @@ def test_fused_greedy_jit_does_not_reshard_model_outputs_before_compute():
     assert "jax.sharding.reshard(output.hidden_states" not in source
 
 
+def test_fused_greedy_jit_uses_constraints_for_final_host_outputs():
+    from sgl_jax.srt.speculative import draft_extend_fused
+
+    source = inspect.getsource(draft_extend_fused._build_fused_greedy_verify_step3_jit)
+
+    assert "_replicate_for_host_output" not in source
+    assert "jax.lax.with_sharding_constraint" in source
+
+
 def test_fused_greedy_jit_only_returns_large_target_outputs_when_requested():
     from sgl_jax.srt.speculative import draft_extend_fused
 

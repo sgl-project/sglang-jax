@@ -489,14 +489,14 @@ def _build_fused_greedy_verify_step3_jit(num_layers: int, topk: int):
         target_hidden_for_host = target_hidden if return_target_hidden else None
         if mesh is not None:
             rep = NamedSharding(mesh, P())
-            selected_layer0_hidden = _replicate_for_host_output(selected_layer0_hidden, rep)
-            stacked_idx = _replicate_for_host_output(stacked_idx, rep)
-            prepared_accept_lens = _replicate_for_host_output(prepared.accept_lens, rep)
-            prepared_predict = _replicate_for_host_output(prepared.predict, rep)
+            selected_layer0_hidden = jax.lax.with_sharding_constraint(selected_layer0_hidden, rep)
+            stacked_idx = jax.lax.with_sharding_constraint(stacked_idx, rep)
+            prepared_accept_lens = jax.lax.with_sharding_constraint(prepared.accept_lens, rep)
+            prepared_predict = jax.lax.with_sharding_constraint(prepared.predict, rep)
             if return_target_logits:
-                target_logits_for_host = _replicate_for_host_output(target_logits, rep)
+                target_logits_for_host = jax.lax.with_sharding_constraint(target_logits, rep)
             if return_target_hidden:
-                target_hidden_for_host = _replicate_for_host_output(target_hidden, rep)
+                target_hidden_for_host = jax.lax.with_sharding_constraint(target_hidden, rep)
         else:
             prepared_accept_lens = prepared.accept_lens
             prepared_predict = prepared.predict
