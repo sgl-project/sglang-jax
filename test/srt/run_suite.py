@@ -396,6 +396,7 @@ suites = {
         TestFile("test/srt/rl/test_multi_engines_in_one_process.py", 5),
         TestFile("test/srt/multimodal/test_wan2_1_models.py", 30),
         TestFile("test/srt/multimodal/test_flux1_dev_models.py", 30),
+        TestFile("test/srt/multimodal/test_mimo_vision_encoder.py", 30),
     ],
 }
 
