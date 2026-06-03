@@ -56,13 +56,12 @@ def create_prefill_uniform_data(
     head_dim,
     page_size=128,
     dtype=jnp.bfloat16,
+    static_q_len=None,
     seed=42,
 ):
-    if max_num_batched_tokens > 2048:
-        batch_size = cdiv(max_num_batched_tokens, 2048)
-        seq_lens_list = [2048] * (batch_size - 1) + [
-            max_num_batched_tokens - 2048 * (batch_size - 1)
-        ]
+    if static_q_len is not None:
+        batch_size = cdiv(max_num_batched_tokens, static_q_len)
+        seq_lens_list = [static_q_len] * batch_size
     else:
         batch_size = 1
         seq_lens_list = [max_num_batched_tokens]
@@ -98,7 +97,11 @@ def create_prefill_uniform_data(
     )
 
     num_seqs = jnp.array([batch_size], dtype=jnp.int32)
-    distribution = jnp.array([0, 0, batch_size], dtype=jnp.int32)
+    distribution = (
+        jnp.array([0, 0, batch_size], dtype=jnp.int32)
+        if static_q_len is None
+        else jnp.array([0, batch_size, batch_size], dtype=jnp.int32)
+    )
     return (
         q,
         k,
