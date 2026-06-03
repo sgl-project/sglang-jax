@@ -189,9 +189,7 @@ def draft_extend_for_decode_fused(draft_worker, model_worker_batch, batch_output
         all_memory_pools.append(mr.memory_pools)
         all_leaves.append(tuple(mr.model_state_leaves))
 
-    sel_pos_device = jax.device_put(
-        sel_pos.astype(np.int32), NamedSharding(draft_worker.mesh, P("data"))
-    )
+    sel_pos_device = jax.device_put(sel_pos, NamedSharding(draft_worker.mesh, P("data")))
 
     # --- Build / get cached fused jit ---
     if not hasattr(draft_worker, "_fused_jit_fn"):
