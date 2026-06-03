@@ -77,12 +77,15 @@ def _build_fused_draft_extend_jit(num_layers: int, topk: int):
         all_topk_index = []
         all_pool_updates = []
         layer0_hidden = None
+        mesh = None
         input_ids = forward_batch.input_ids
 
         for i in range(num_layers):
             state = jax.tree_util.tree_unflatten(model_state_def, all_leaves[i])
             model = nnx.merge(model_def, state)
 
+            # shared forward_batch: only hidden_states and input_ids change per layer;
+            # model() must not mutate other fields (positions, attn metadata, etc.)
             forward_batch.spec_info.hidden_states = target_hidden
             forward_batch.input_ids = input_ids
 
@@ -107,7 +110,7 @@ def _build_fused_draft_extend_jit(num_layers: int, topk: int):
             # topk (inline, not separate jit)
             topk_logits, topk_idx = jax.lax.top_k(rep_logits, topk)
             logsumexp = jax.nn.logsumexp(rep_logits, axis=-1, keepdims=True)
-            topk_p = jnp.exp(topk_logits - logsumexp)
+            topk_p = jnp.exp(topk_logits - logsumexp).astype(rep_logits.dtype)
 
             all_topk_p.append(topk_p)
             all_topk_index.append(topk_idx)
@@ -167,8 +170,7 @@ def draft_extend_for_decode_fused(draft_worker, model_worker_batch, batch_output
     sel = np.asarray(model_worker_batch.logits_indices_selector)
     accept_host = np.asarray(jax.device_get(batch_output.accept_lens))
     assert (accept_host[sel] >= 1).all(), f"accept_length < 1: {accept_host[sel]}"
-    sel_pos = np.clip(accept_host - 1, 0, None).astype(np.int64)
-    mwb.input_ids = np.asarray(jax.device_get(mwb.input_ids)).copy()
+    sel_pos = np.clip(accept_host - 1, 0, None).astype(np.int32)
 
     # --- Host preparation (all done before single jit call) ---
 

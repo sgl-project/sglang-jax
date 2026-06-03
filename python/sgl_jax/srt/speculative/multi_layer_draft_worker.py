@@ -76,6 +76,9 @@ class MultiLayerDraftWorker(EagleDraftWorker):
 
         self.num_mtp_layers = self.speculative_num_steps
         assert self.num_mtp_layers > 1
+        assert (
+            self.topk == 1
+        ), f"MultiLayerDraftWorker fused decode requires topk=1, got {self.topk}"
         cfg_mtp = getattr(target_worker.model_config.hf_config, "num_nextn_predict_layers", None)
         # MiMo-style configs omit num_nextn_predict_layers; only enforce equality
         # when the field exists (scheduler routes here iff n_mtp>1 either way).

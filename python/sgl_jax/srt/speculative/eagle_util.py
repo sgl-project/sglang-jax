@@ -694,12 +694,14 @@ class EagleDraftInput:
         dtype: np.dtype,
         topk: int,
         capture_hidden_mode: CaptureHiddenMode,
+        num_steps: int = 1,
     ):
+        topk_shape = (0, num_steps, topk) if num_steps > 1 else (0, topk)
         return cls(
             verified_id=np.empty((0,), dtype=np.int32),
             hidden_states=np.empty((0, hidden_size), dtype=dtype),
-            topk_p=np.empty((0, topk), dtype=np.float32),
-            topk_index=np.empty((0, topk), dtype=np.int32),
+            topk_p=np.empty(topk_shape, dtype=np.float32),
+            topk_index=np.empty(topk_shape, dtype=np.int32),
             capture_hidden_mode=capture_hidden_mode,
             accept_length=np.empty((0,), dtype=np.int32),
             accept_length_cpu=np.empty((0,), dtype=np.int32),
@@ -926,6 +928,7 @@ class EagleVerifyInput:
                     dtype=model_worker_batch.model_config.dtype,
                     topk=self.topk,
                     capture_hidden_mode=CaptureHiddenMode.LAST,
+                    num_steps=self.spec_steps,
                 ),
                 logits_output=logits_output,
                 verified_id=jnp.empty(0, dtype=jnp.int32),

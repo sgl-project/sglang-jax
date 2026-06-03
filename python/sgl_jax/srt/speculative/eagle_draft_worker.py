@@ -151,7 +151,7 @@ class EagleDraftWorker(BaseDraftWorker):
             )
             # One allgather instead of five: pack into a single (5, bs*n) buffer,
             # device_put once, then slice on device (replicated views are free).
-            packed = jax.device_put(jnp.asarray(packed_np), NamedSharding(self.mesh, P()))
+            packed = jax.device_put(packed_np, NamedSharding(self.mesh, P()))
             draft_tokens = packed[0]
             position = packed[1]
             retrive_index = packed[2].reshape(bs, n)
