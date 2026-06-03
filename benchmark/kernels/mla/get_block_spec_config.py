@@ -184,7 +184,7 @@ def main():
 
     if tune_only_glm5:
         print("Tuning exclusively for GLM-5.1 (TP=32, TP=16, TP=8) configurations.")
-        page_size_config = [256]
+        page_size_config = [64, 128, 256]
         max_num_batched_tokens_config = [
             1, 2, 4, 8, 16, 32, 64, 8192, 16384
         ]
@@ -292,7 +292,7 @@ def main():
         if jax.process_index() == 0 and best_config:
             # Output in python dict format for easy copying to tuned_block_sizes.py
             print(
-                f"('{q_dtype}', '{k_dtype}', {q_head_num}, {kv_lora_rank}, {qk_rope_head_dim}, {page_size}, {max_num_batched_tokens}): ({best_config[0]}, {best_config[1]}),",
+                f"('{q_dtype}', '{k_dtype}', {q_head_num}, {kv_lora_rank}, {qk_rope_head_dim}, {page_size}, {max_num_batched_tokens}): ({best_config[0]}, {best_config[1]}),  # Best latency: {best_output:.4f} ms",
                 flush=True,
             )
 
