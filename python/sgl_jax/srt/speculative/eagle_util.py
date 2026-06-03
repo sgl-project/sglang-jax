@@ -340,14 +340,15 @@ def build_chain_verify_inputs(
     return out
 
 
-def _build_chain_verify_inputs_device_impl(
+@functools.partial(jax.jit, static_argnames=["num_verify_tokens", "batch_size"])
+def build_chain_verify_inputs_device(
     verified_id: jax.Array,
     token_list: jax.Array,
     seq_lens: jax.Array,
     num_verify_tokens: int,
     batch_size: int,
 ) -> jax.Array:
-    """Inlineable device-side verify input builder for topk=1 linear chains."""
+    """Build verify inputs for topk=1 linear chains on device."""
     n = num_verify_tokens
     bs = batch_size
     tid_range = jnp.arange(n, dtype=jnp.int32)
@@ -365,29 +366,6 @@ def _build_chain_verify_inputs_device_impl(
     return jnp.stack(
         [draft_tokens, positions, retrive_index, retrive_next_token, retrive_next_sibling],
         axis=0,
-    )
-
-
-@functools.partial(jax.jit, static_argnames=["num_verify_tokens", "batch_size"])
-def build_chain_verify_inputs_device(
-    verified_id: jax.Array,
-    token_list: jax.Array,
-    seq_lens: jax.Array,
-    num_verify_tokens: int,
-    batch_size: int,
-) -> jax.Array:
-    """Jitted wrapper for the current standalone draft path.
-
-    Keep the implementation split out so the future whole-decode JIT can call
-    it directly and inline chain verify input construction instead of launching
-    this wrapper as a separate PjitFunction.
-    """
-    return _build_chain_verify_inputs_device_impl(
-        verified_id=verified_id,
-        token_list=token_list,
-        seq_lens=seq_lens,
-        num_verify_tokens=num_verify_tokens,
-        batch_size=batch_size,
     )
 
 

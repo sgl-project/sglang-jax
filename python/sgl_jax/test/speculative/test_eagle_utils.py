@@ -51,10 +51,7 @@ class TestVerifyTree(CustomTestCase):
         self.assertIs(eagle_util._as_int32_array(device_arr), device_arr)
 
     def test_build_chain_verify_inputs_device_matches_linear_chain_layout(self):
-        from sgl_jax.srt.speculative.eagle_util import (
-            _build_chain_verify_inputs_device_impl,
-            build_chain_verify_inputs_device,
-        )
+        from sgl_jax.srt.speculative.eagle_util import build_chain_verify_inputs_device
 
         verified_id = jnp.array([101, 201], dtype=jnp.int32)
         token_list = jnp.array(
@@ -85,16 +82,6 @@ class TestVerifyTree(CustomTestCase):
             dtype=np.int32,
         )
         np.testing.assert_array_equal(np.asarray(packed), expected)
-
-        inline_packed = _build_chain_verify_inputs_device_impl(
-            verified_id=verified_id,
-            token_list=token_list,
-            seq_lens=seq_lens,
-            num_verify_tokens=4,
-            batch_size=2,
-        )
-
-        np.testing.assert_array_equal(np.asarray(inline_packed), expected)
 
     def test_verify_tree_greedy_device_outputs_match_host_postprocess(self):
         from sgl_jax.srt.speculative.eagle_util import greedy_sample_device_outputs
