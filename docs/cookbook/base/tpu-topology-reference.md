@@ -64,54 +64,108 @@ with `dtype_bytes = 2` for `bfloat16`, `1` for FP8. The MiMo-V2-Flash recipe rec
 
 ## Adapting to other topologies
 
-Each cookbook recipe ships **the slice we had access to when measuring** — that's the reproducibility contract, not a designed "tier" claim. If you have a different (larger / smaller / cross-generation) slice, the launch flags follow a small set of mechanical scaling rules:
+Each cookbook recipe ships **one** TPU configuration — the slice we ran the §4 numbers on. The recipe doesn't claim that's the only valid slice; it's the only slice we measured. This section is the math for sizing your own slice when you have different hardware.
 
-### 1. Tested config vs minimum requirement
+### Step 1 — Compute per-chip HBM footprint
 
-A recipe's `## 2.1 Hardware Matrix` will surface two facts:
+Three pieces add up per JAX device:
 
-- **Tested configuration** — the slice we ran the §4 numbers on. Launch command in §2.3 is verbatim copyable.
-- **Minimum requirement** — the smallest slice the model fits, derived from BF16/FP8 weight footprint + per-token KV + activation peak.
+```
+weight_GiB_per_device   = params_billions × dtype_bytes / tp_size
+kv_GiB_per_device       = (kv_bytes_per_token × max_running_requests × max_context_length) / tp_size
+activation_peak_GiB     = chunked_prefill_size × hidden_dim × dtype_bytes × layer_count_factor / tp_size
+```
 
-Anything between (and many things above) the minimum is also valid; the recipe just doesn't carry §4 numbers for those slices yet.
+| Symbol | Where to find it |
+|---|---|
+| `params_billions` | HF `config.json` (`num_parameters`) or the model card. For MoE, use the **total** params figure, not the activated count — every expert lives in HBM. |
+| `dtype_bytes` | `bfloat16` → 2; FP8 → 1; channel-wise FP8 with BF16 fall-back layers → mostly 1, a few 2 |
+| `kv_bytes_per_token` | `2 × num_kv_heads × head_dim × num_hidden_layers × dtype_bytes`. For MLA models the head dim is the latent dim (DSV-V3: 512 × 1 × 61 × 2 / kv-group = much smaller than dense GQA). |
+| `max_running_requests` | Recipe §2.3 launch flag; start at the recipe's value. |
+| `max_context_length` | Recipe §2.3 `--context-length` (or model native max if not set). |
+| `chunked_prefill_size` | Recipe §2.3 `--chunked-prefill-size`; the EXTEND precompile peak is roughly `chunked_prefill_size × hidden_dim × dtype_bytes`. |
+| `layer_count_factor` | 1–3 in practice; depends on attention layout. Use 2 as a starter when you can't measure. |
 
-### 2. Scale up to a larger slice (same generation)
+Add the three terms. Multiply by `1 / mem_fraction_static` to get the required HBM/device, then compare against the table at the top of this page:
 
-`--tp-size` and `--ep-size` scale linearly with chip count. Worked example using DeepSeek-V3 on v6e:
+```
+v6e:   32 GiB / device
+v7x:   96 GiB / device     (each chip exposes 2 devices, see "Why v7x is special")
+v5p:   95 GiB / device
+v5e:   16 GiB / device
+v4:    32 GiB / device
+```
 
-| Slice | Chips | `--tp-size` | `--dp-size` | `--ep-size` | Notes |
-|---|---|---|---|---|---|
-| v6e-32 | 32 | 32 | 4 | 32 | hits FP8 shared-expert collapse at `dp=4` — see DeepSeek-V3 §2.4 |
-| v6e-64 (tested) | 64 | 64 | **8** | 64 | tested configuration; `dp=8` mandatory for FP8 mesh |
-| v6e-128 | 128 | 128 | 16 | 128 | extrapolation; `dp=16` still satisfies `144 % tensor == 0` and shared-expert `2048/(tp/dp)=128` |
+If the sum exceeds available HBM, raise `tp_size` (more chips → less weight per chip) or lower `max_running_requests` / `max_context_length` / `chunked_prefill_size`. The recipe's §2.4 Configuration Tips usually documents which knob is safe to push first.
 
-The model-specific mesh constraints (`dp` divisibility, MoE expert divisibility, GLA `num_groups` ≤ tensor axis) usually pin `--dp-size` and force `--tp-size` to be a multiple of something — check §2.4 of the target recipe before scaling.
+**Worked example**: serve Qwen3-8B on v6e-4 with the recipe defaults (`--max-running-requests 256`, `--context-length 32768`, `--chunked-prefill-size 2048`, `--tp-size 4`):
 
-### 3. Swap v6e ↔ v7x
+- weights: `8 × 2 / 4 = 4 GiB/device`
+- KV: `2 × 8 × 128 × 36 × 2 = 147 KB/token × 256 × 32768 / 4 = 308 GiB/device` (impossible at full context × max concurrency — recipe assumes most requests are far shorter)
+- Practical: at `avg_context × 32` concurrency the KV pool needs maybe ~6 GiB; activation peak ~5 GiB
+- Total ~15 GiB/device vs 32 GiB/device on v6e — fits comfortably; doubling `--max-running-requests` is safe.
 
-v7x exposes **2 JAX devices per chip**, so `--tp-size = chip_count × 2`. A v7x-N slice maps to the same `--tp-size` as v6e-(2N). Examples:
+The KV term is the one that surprises — most "won't fit" failures are KV pool exhaustion, not weight footprint.
 
-| v6e slice | Equivalent `--tp-size` | v7x slice | Notes |
+### Step 2 — Pick the parallelism shape
+
+Default rule:
+
+```
+tp_size = total_jax_devices = chip_count × devices_per_chip   # v7x = 2, everything else = 1
+ep_size = tp_size                                              # one expert shard per device, for MoE
+dp_size = 1                                                    # unless the recipe §2.4 says otherwise
+```
+
+`tp_size = ep_size` is the textbook starting point for MoE. `dp_size` is **almost always pinned by model-specific constraints**, not by free choice:
+
+- **GQA `num_kv_heads`**: tensor axis (`tp_size / dp_size`) must divide `num_kv_heads`. Check HF `config.json` for the value. Llama 3.1 8B has 8 → tensor axis ∈ {1, 2, 4, 8}.
+- **GLA `num_groups`** (linear-attention models): tensor axis ≤ `num_groups`. Ling-2.6 / Kimi-Linear have 8 → on v6e-64 you need `--dp-size 8` so tensor axis = 64/8 = 8.
+- **FP8 block-quant constraint** (DSV-V3 / R1): per-rank shared-expert `out_dim = moe_intermediate_size / tensor_axis` must be > `block_size_out` (default 128). DSV-V3 has `moe_intermediate_size=2048`, so tensor axis ≤ 16; combined with the dense-MLP scale grid constraint (`144 % tensor == 0`), only tensor axis = 8 works → `--dp-size 8` on v6e-64.
+- **Pre-sharded checkpoint** (Grok-2): `--tp-size` must be a multiple of the pre-shard count. Grok-2 ships TP-{000..007} files → `--tp-size` ∈ {8, 16, 24, 32, ...}.
+
+Always read the target recipe's §2.4 before setting `--dp-size` / `--tp-size` — the constraint is model-specific and usually forces exactly one choice.
+
+### Step 3 — Constraint checklist before launch
+
+Before you hit "go", verify against `python/sgl_jax/srt/configs/model_config.py` + the HF `config.json`:
+
+| # | Check | Failure mode | Source of truth |
 |---|---|---|---|
-| v6e-16 | 16 | v7x-8 | same `--tp-size`, v7x has more HBM per device |
-| v6e-32 | 32 | v7x-16 | same launch shape; v7x interconnect lower latency |
-| v6e-64 | 64 | v7x-32 | both viable for trillion-class MoE |
+| 1 | `tp_size % num_kv_heads == 0` (GQA models) | KV head replication fails, shape error at first prefill | HF `config.json` `num_key_value_heads` |
+| 2 | `num_local_experts % ep_size == 0` (MoE) | Expert dim mis-shards at load time | HF `config.json` `num_local_experts` (or equivalent) |
+| 3 | `moe_intermediate_size % 512 == 0` if using `--moe-backend fused` | Fused kernel `tile_n` assert at startup | HF `config.json` `moe_intermediate_size` |
+| 4 | FP8 block-quant: `per_rank_shared_expert_out_dim > block_size_out` | Block-wise quant accuracy collapse (silent for `fused`, asserted for `epmoe`) | HF `config.json` `quantization_config.weight_block_size` + `moe_intermediate_size` |
+| 5 | Hybrid recurrent models (Ling-2.6, Kimi-Linear) require `--disable-radix-cache` | Server asserts on startup | Recipe §2.4 |
+| 6 | MLA models (DeepSeek family) require `--page-size >= 2` | MLA backend asserts on startup | Recipe §2.4 |
 
-Memory math also changes — v7x's 96 GiB / JAX device vs v6e's 32 GiB means a tighter v6e slice can be replaced by a smaller v7x chip count. Re-derive the minimum requirement from HBM math, not just chip count.
+The recipe's §5 Troubleshooting table will have a symptom row for each — start there if launch fails.
 
-### 4. Scale down toward the minimum
+### Step 4 — If launch hits OOM
 
-Lower bound is set by **weight footprint + activation peak + KV pool**, not by `--tp-size` math. Common failure modes when too small:
+Tune in this order (each step is safer than the next):
 
-- `RESOURCE_EXHAUSTED: ... Used 31.X G of 31.25 G hbm` during EXTEND precompile — drop `--chunked-prefill-size` and `--max-running-requests` before lowering `--tp-size`.
-- Block-wise FP8 accuracy collapse if `tensor_axis` divides `moe_intermediate_size` to ≤ `block_size_out` (DSV-V3 footnote).
-- MoE expert-axis ≥ `ep_size`; can't reduce `--ep-size` below `num_local_experts`.
+1. **Lower `--max-running-requests`** — shrinks KV pool, the most common OOM culprit. Halve it and retry.
+2. **Lower `--chunked-prefill-size`** — bounds activation peak during prefill. Drop from 2048 to 1024 to 512 progressively.
+3. **Lower `--context-length`** — model native max is usually overkill for production traffic; `--context-length 32768` (vs 256K) frees substantial KV budget.
+4. **Lower `--mem-fraction-static`** — last resort. Default 0.88 leaves ~12% headroom; dropping to 0.85 helps tiny overruns but creates fragmentation noise.
+5. **Raise `--tp-size`** — needs more chips. Re-check the constraints in Step 3 because changing `tp_size` cascades into `dp_size` / `ep_size`.
 
-The recipe's §5 troubleshooting table usually flags these.
+### Step 5 — v6e ↔ v7x conversion
 
-### 5. When to add a new tested row to the cookbook
+One rule: v7x has **2 JAX devices per chip**. So:
 
-If you run a recipe successfully on a different slice and want to upstream the result: file a PR that adds a row to that recipe's §2.1 hardware matrix and a `#### Multi-host — TPU <slice>` subsection in §2.3 with the measured numbers. Don't list a slice you haven't run end-to-end.
+```
+v7x_chip_count   = v6e_chip_count / 2
+v7x_tp_size      = v6e_tp_size                # same tp_size, half the chips
+v7x_HBM_per_chip = 192 GiB total, 96 GiB / JAX device
+```
+
+v7x's higher per-device HBM means a model that needs a v6e-32 slice (32 chips × 32 GiB = 1 TiB chip HBM) fits on a v7x-8 (8 chips × 192 GiB = 1.5 TiB chip HBM), with `--tp-size 16` (8 chips × 2 devices). Re-derive Step 1 from the v7x numbers — don't just port `--tp-size` over without recomputing the per-device math.
+
+### Step 6 — PR back when you've measured a new slice
+
+If you size a slice this section's math suggests, run the recipe end-to-end, and get §4-equivalent measurements, file a PR adding your slice as a new row in the target recipe's §2.1 Hardware Matrix and a `#### Multi-host — TPU <slice>` subsection in §2.3. The cookbook's "tested config only" rule means we don't list a slice until someone has run it — your measurement makes it shippable.
 
 ## GKE / SkyPilot identifiers
 
