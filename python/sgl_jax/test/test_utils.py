@@ -145,6 +145,7 @@ QWEN3_MOE_30B = _local_or_hf("Qwen/Qwen3-30B-A3B")
 QWEN2_5_7B_INSTRUCT = _local_or_hf("Qwen/Qwen2.5-7B-Instruct")
 QWEN3_CODER_30B_A3B_INSTRUCT = _local_or_hf("Qwen/Qwen3-Coder-30B-A3B-Instruct")
 GEMMA2_2B_IT = _local_or_hf("google/gemma-2-2b-it")
+GEMMA4_31B_IT = _local_or_hf("google/gemma-4-31B-it")
 
 BAILING_MOE = _local_or_hf("inclusionAI/Ling-mini-2.0")
 DEEPSEEK_R1_DISTILL_QWEN_1_5B = _local_or_hf("deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B")
