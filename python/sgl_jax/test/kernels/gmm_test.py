@@ -209,7 +209,7 @@ class GmmTest(jtu.JaxTestCase):
         weight_dtype=[jnp.int8, jnp.float8_e4m3fn],
         block_size=[64, 128, 256, 512],
         group_offset=[0, 2, 3],
-        version=[GMM_VERSION_V1],
+        version=[GMM_VERSION_V1, GMM_VERSION_V2],
     )
     def test_gmm_weight_quantized(
         self,
