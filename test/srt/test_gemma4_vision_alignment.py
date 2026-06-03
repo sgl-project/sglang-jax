@@ -65,8 +65,7 @@ class TestGemma4VisionAlignment(CustomTestCase):
         hf = Gemma4VisionModel(vcfg).to(torch.bfloat16).eval()
         tensors, mappings = _load_vision_weights(GEMMA4_31B_IT, vcfg.num_hidden_layers)
         sd = {
-            k.removeprefix("model.vision_tower."): torch.from_numpy(v)
-            for k, v in tensors.items()
+            k.removeprefix("model.vision_tower."): torch.from_numpy(v) for k, v in tensors.items()
         }
         hf.load_state_dict(sd, strict=True)
         with torch.no_grad():
@@ -93,8 +92,7 @@ class TestGemma4VisionAlignment(CustomTestCase):
 
         self.assertEqual(hf_out.shape, jax_out.shape)
         cos = float(
-            (hf_out * jax_out).sum()
-            / (np.linalg.norm(hf_out) * np.linalg.norm(jax_out) + 1e-8)
+            (hf_out * jax_out).sum() / (np.linalg.norm(hf_out) * np.linalg.norm(jax_out) + 1e-8)
         )
         mae = float(np.abs(hf_out - jax_out).mean())
         print(f"cos={cos:.6f} mae={mae:.5f}")

@@ -36,9 +36,7 @@ def select_budget(num_patches: int, pool_k: int = 3) -> int:
 class RMSNorm(nnx.Module):
     """Standard RMSNorm (x * w), matching HF Gemma4RMSNorm. Mesh-free."""
 
-    def __init__(
-        self, dim: int, epsilon: float = 1e-6, use_scale: bool = True, dtype=jnp.bfloat16
-    ):
+    def __init__(self, dim: int, epsilon: float = 1e-6, use_scale: bool = True, dtype=jnp.bfloat16):
         self.eps = epsilon
         self.dtype = dtype
         self.scale = nnx.Param(jnp.ones((dim,), dtype=dtype)) if use_scale else None
@@ -121,13 +119,9 @@ class Gemma4VisionAttention(nnx.Module):
 
         self.q_norm = RMSNorm(self.head_dim, epsilon=cfg.rms_norm_eps, dtype=dtype)
         self.k_norm = RMSNorm(self.head_dim, epsilon=cfg.rms_norm_eps, dtype=dtype)
-        self.v_norm = RMSNorm(
-            self.head_dim, epsilon=cfg.rms_norm_eps, use_scale=False, dtype=dtype
-        )
+        self.v_norm = RMSNorm(self.head_dim, epsilon=cfg.rms_norm_eps, use_scale=False, dtype=dtype)
 
-    def __call__(
-        self, x: jax.Array, positions_xy: jax.Array, padding_mask: jax.Array
-    ) -> jax.Array:
+    def __call__(self, x: jax.Array, positions_xy: jax.Array, padding_mask: jax.Array) -> jax.Array:
         b, n, _ = x.shape
         h, d = self.num_heads, self.head_dim
 
@@ -163,9 +157,7 @@ class Gemma4VisionBlock(nnx.Module):
         self.self_attn = Gemma4VisionAttention(cfg, dtype, rngs)
         self.mlp = Gemma4VisionMLP(cfg.hidden_size, cfg.intermediate_size, dtype, rngs)
 
-    def __call__(
-        self, x: jax.Array, positions_xy: jax.Array, padding_mask: jax.Array
-    ) -> jax.Array:
+    def __call__(self, x: jax.Array, positions_xy: jax.Array, padding_mask: jax.Array) -> jax.Array:
         h = self.input_layernorm(x)
         h = self.self_attn(h, positions_xy, padding_mask)
         x = x + self.post_attention_layernorm(h)
@@ -254,9 +246,7 @@ class Gemma4VisionEncoder(nnx.Module):
         for layer in self.layers:
             x = layer(x, pixel_position_ids, padding_mask)
 
-        x, valid_mask = avg_pool_by_positions(
-            x, pixel_position_ids, self.pool_k, out_len
-        )
+        x, valid_mask = avg_pool_by_positions(x, pixel_position_ids, self.pool_k, out_len)
         x = x * jnp.sqrt(jnp.asarray(self.cfg.hidden_size, x.dtype))
         x = (x - self.std_bias.value.astype(x.dtype)) * self.std_scale.value.astype(x.dtype)
         return x, valid_mask

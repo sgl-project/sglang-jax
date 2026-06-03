@@ -486,9 +486,7 @@ class ProportionalRotaryEmbedding(RotaryEmbedding):
             base ** (np.arange(0, 2 * rope_angles, 2, dtype=np.float32) / head_size)
         )
         if nope_angles > 0:
-            inv_freq = np.concatenate(
-                [inv_freq_rotated, np.zeros(nope_angles, dtype=np.float32)]
-            )
+            inv_freq = np.concatenate([inv_freq_rotated, np.zeros(nope_angles, dtype=np.float32)])
         else:
             inv_freq = inv_freq_rotated
         self._inv_freq_np = inv_freq / factor

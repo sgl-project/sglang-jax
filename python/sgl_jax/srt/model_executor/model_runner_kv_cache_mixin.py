@@ -461,10 +461,7 @@ class ModelRunnerKVCacheMixin:
                 head_dim=(self.model_config.head_dim + 127) // 128 * 128,
                 swa_head_num=swa_head_num,
                 swa_head_dim=(
-                    (
-                        getattr(self.model_config.hf_text_config, "swa_head_dim", None)
-                        + 127
-                    )
+                    (getattr(self.model_config.hf_text_config, "swa_head_dim", None) + 127)
                     // 128
                     * 128
                     if getattr(self.model_config.hf_text_config, "swa_head_dim", None)

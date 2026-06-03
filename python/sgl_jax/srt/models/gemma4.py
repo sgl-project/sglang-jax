@@ -381,11 +381,7 @@ class Gemma4ForConditionalGeneration(nnx.Module):
     def _k_eq_v_layers(self) -> set[int]:
         if not getattr(self.text_config, "attention_k_eq_v", False):
             return set()
-        return {
-            i
-            for i, t in enumerate(self.text_config.layer_types)
-            if t == _FULL
-        }
+        return {i for i, t in enumerate(self.text_config.layer_types) if t == _FULL}
 
     def _create_weight_mappings(self) -> dict[str, WeightMapping]:
         mappings: dict[str, WeightMapping] = {

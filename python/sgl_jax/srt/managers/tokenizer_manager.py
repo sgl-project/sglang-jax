@@ -21,8 +21,8 @@ from typing import Any
 
 import fastapi
 import jax
-import numpy as np
 import jax.numpy as jnp
+import numpy as np
 import uvloop
 import zmq
 import zmq.asyncio
