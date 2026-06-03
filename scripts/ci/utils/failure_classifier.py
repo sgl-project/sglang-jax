@@ -51,7 +51,10 @@ _INFRASTRUCTURE_RE = re.compile(
     r"|serviceunavailable"
     r"|httperror|google\.api_core\.exceptions"
     r"|preempted|was preempted|tpu is not healthy"
-    r"|could not find device|failed to create tpu",
+    r"|could not find device|failed to create tpu"
+    r"|failedscheduling|nottriggerscaleup"
+    r"|max node group size reached|failed scale-up|scale-up failed"
+    r"|didn't match pod's node affinity",
     re.IGNORECASE,
 )
 
@@ -159,9 +162,16 @@ def fetch_job_logs(repo, job_id, max_lines=500):
         return ""
 
 
+_FINISH_GATE_RE = re.compile(r"-finish$", re.IGNORECASE)
+
+
 def classify_jobs(repo, failed_jobs):
     """Fetch logs and classify each failed job. Mutates jobs in-place, adding 'failure_type'."""
     for job in failed_jobs:
+        if _FINISH_GATE_RE.search(job["name"]):
+            job["failure_type"] = "infrastructure"
+            print(f"  {job['name']}: infrastructure (finish gate)")
+            continue
         log_text = fetch_job_logs(repo, job["id"])
         job["failure_type"] = classify_failure(log_text, job.get("conclusion"))
         print(f"  {job['name']}: {job['failure_type']}")
