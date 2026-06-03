@@ -271,6 +271,9 @@ class GenerateReqInput:
     input_ids: list[list[int]] | list[int] | None = None
     # The embeddings for input_ids; one can specify either text or input_ids or input_embeds.
     input_embeds: list[list[list[float]]] | list[list[float]] | None = None
+    # Pre-computed multimodal inputs (e.g. {"multimodal_embedding": [[...], ...]}) to
+    # bypass server-side encoding. Passed through to scheduler unchanged.
+    mm_inputs: dict | None = None
     # The image input. It can be an image instance, file name, URL, or base64 encoded string.
     # Can be formatted as:
     # - Single image for a single request
@@ -332,8 +335,13 @@ class GenerateReqInput:
             raise ValueError("The rid should be a string or a list of strings.")
 
     def normalize_batch_and_arguments(self):
-        # at least one of text, input_ids, or image should be provided
-        if self.text is None and self.input_ids is None and self.image_data is None:
+        # at least one of text, input_ids, input_embeds, or image should be provided
+        if (
+            self.text is None
+            and self.input_ids is None
+            and self.input_embeds is None
+            and self.image_data is None
+        ):
             raise ValueError("At least one of text, input_ids, or image should be provided")
 
         # text and input_ids cannot be provided at the same time

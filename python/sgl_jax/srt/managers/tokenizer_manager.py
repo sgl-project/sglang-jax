@@ -21,6 +21,7 @@ from typing import Any
 
 import fastapi
 import jax
+import numpy as np
 import jax.numpy as jnp
 import uvloop
 import zmq
@@ -303,6 +304,8 @@ class TokenizerManager:
                 )
             encoded = self.tokenizer(input_text)
             input_ids = encoded["input_ids"]
+        if input_ids is None and getattr(obj, "input_embeds", None) is not None:
+            input_ids = [0] * len(obj.input_embeds)
         self._validate_one_request(obj, input_ids)
         return self._create_tokenized_object(obj, input_text, input_ids)
 
@@ -373,6 +376,12 @@ class TokenizerManager:
             obj.extra_key,
             obj.return_routed_experts,
         )
+        if getattr(obj, "mm_inputs", None) is not None:
+            tokenized_obj.mm_inputs = obj.mm_inputs
+        elif getattr(obj, "input_embeds", None) is not None:
+            tokenized_obj.mm_inputs = {
+                "multimodal_embedding": np.asarray(obj.input_embeds, dtype=np.float32)
+            }
         # note: When only `return_logprob` is specified, we assume that only the output probability is required.
         if (
             tokenized_obj.return_logprob
