@@ -744,10 +744,8 @@ def _materialize_fused_greedy_batch_output_for_scheduler(
         return batch_output
 
 
-def fused_greedy_verify_and_draft_extend_for_decode(
-    spec_worker, model_worker_batch, cur_allocate_lens
-):
-    """Greedy target-verify + MTP draft-extend fused route."""
+def spec_decode(spec_worker, model_worker_batch, cur_allocate_lens):
+    """Run one fused speculative decode round."""
     from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
     from sgl_jax.srt.managers.scheduler import GenerationBatchResult
     from sgl_jax.srt.speculative.eagle_util import EagleDraftInput

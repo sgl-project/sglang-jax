@@ -78,6 +78,12 @@ class BaseSpecWorker:
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
+        self._can_use_fused_spec_decode = (
+            self.speculative_algorithm.is_nextn()
+            and self.topk == 1
+            and self.speculative_num_steps > 1
+            and self.speculative_num_draft_tokens == self.speculative_num_steps + 1
+        )
 
         self.req_to_token_pool, self.token_to_kv_pool_allocator = target_worker.get_memory_pool()
 
@@ -139,29 +145,12 @@ class BaseSpecWorker:
         # to global-flat (real_bs,) so reqs_info[0].spec_info stays flat-ordered.
         sel = model_worker_batch.logits_indices_selector
         cur_allocate_lens = np.asarray(model_worker_batch.spec_info_padded.allocate_lens)[sel]
-        sampling_info = getattr(model_worker_batch, "sampling_info", None)
-        draft_workers = getattr(self.draft_worker, "_workers", ())
-        num_steps = getattr(self.draft_worker, "speculative_num_steps", self.speculative_num_steps)
-        num_draft_tokens = getattr(
-            self.draft_worker,
-            "speculative_num_draft_tokens",
-            self.speculative_num_draft_tokens,
-        )
-        model_worker_batch.use_fused_greedy_decode = (
-            sampling_info is not None
-            and getattr(sampling_info, "is_all_greedy", False)
-            and getattr(self.draft_worker, "topk", self.topk) == 1
-            and len(draft_workers) == num_steps
-            and num_draft_tokens == num_steps + 1
-        )
-        if model_worker_batch.use_fused_greedy_decode:
-            from sgl_jax.srt.speculative.draft_extend_fused import (
-                fused_greedy_verify_and_draft_extend_for_decode,
-            )
+        if self._can_use_fused_spec_decode and model_worker_batch.sampling_info.is_all_greedy:
+            # Current fused route covers greedy NEXTN decode; more speculative
+            # decode paths can be folded into this entry point over time.
+            from sgl_jax.srt.speculative.draft_extend_fused import spec_decode
 
-            return fused_greedy_verify_and_draft_extend_for_decode(
-                self, model_worker_batch, cur_allocate_lens
-            )
+            return spec_decode(self, model_worker_batch, cur_allocate_lens)
         self.draft_worker.draft(model_worker_batch)
         batch_output = self.verify(model_worker_batch, cur_allocate_lens)
         self.draft_worker.draft_extend_for_decode(model_worker_batch, batch_output)
@@ -187,12 +176,6 @@ class BaseSpecWorker:
     def verify(self, model_worker_batch: ModelWorkerBatch, cur_allocate_lens: jax.Array):
         from sgl_jax.srt.managers.scheduler import GenerationBatchResult
         from sgl_jax.srt.speculative.eagle_util import EagleDraftInput, EagleVerifyInput
-
-        if getattr(model_worker_batch, "use_fused_greedy_decode", False):
-            raise RuntimeError(
-                "Fixed greedy decode must enter the whole-round fused path before "
-                "BaseSpecWorker.verify()."
-            )
 
         spec_info: EagleVerifyInput = model_worker_batch.spec_info_padded
         spec_info.allocate_lens = cur_allocate_lens

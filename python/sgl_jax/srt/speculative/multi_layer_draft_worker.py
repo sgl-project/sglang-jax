@@ -293,13 +293,6 @@ class MultiLayerDraftWorker(EagleDraftWorker):
         self, model_worker_batch: ModelWorkerBatch, batch_output: GenerationBatchResult
     ) -> None:
         """Decode-extend across all MTP layers."""
-        if getattr(model_worker_batch, "use_fused_greedy_decode", False):
-            raise RuntimeError(
-                "Fixed greedy decode must use "
-                "fused_greedy_verify_and_draft_extend_for_decode before "
-                "draft_extend_for_decode."
-            )
-
         from sgl_jax.srt.speculative.draft_extend_fused import (
             draft_extend_for_decode_fused,
         )
