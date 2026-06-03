@@ -286,6 +286,10 @@ def jax_causal_conv1d_update(
     ), f"conv_state {conv_state.shape} channels/kernel != ({D}, {kernel - 1})"
     assert state_indices.shape == (B,), f"state_indices {state_indices.shape} != expected ({B},)"
 
+    # Donated-pool aliasing barrier: conv_state is donated, so under multi-host
+    # SPMD the scatter below can race this gather and corrupt reused slots
+    # (decode NaN). optimization_barrier is value-preserving -- do not remove.
+    conv_state = jax.lax.optimization_barrier(conv_state)
     state = conv_state[state_indices]  # [B, D, K-1]
     if has_initial_state is not None and kernel > 1:
         assert has_initial_state.shape == (
@@ -307,6 +311,8 @@ def jax_causal_conv1d_update(
 
     # Scatter the per-request new state back into the full pool table.
     new_conv_state = _scatter_idx0_safe(conv_state, state_indices, new_state)
+    # Pin the scatter result across the aliasing boundary (see entry barrier).
+    new_conv_state, y = jax.lax.optimization_barrier((new_conv_state, y))
     return y, new_conv_state
 
 
@@ -536,6 +542,9 @@ def decode_gated_delta_rule_ref(
     beta = jax.nn.sigmoid(b.astype(jnp.float32))
     g = -A * jax.nn.softplus(a.astype(jnp.float32) + dt_bias_f32)
 
+    # Donated-pool aliasing barrier (see jax_causal_conv1d_update): without it the
+    # scatter below races this gather under multi-host SPMD -> recurrent-state NaN.
+    recurrent_state = jax.lax.optimization_barrier(recurrent_state)
     state = recurrent_state[state_indices].astype(jnp.float32)
     if has_initial_state is not None:
         B = state.shape[0]
@@ -547,4 +556,6 @@ def decode_gated_delta_rule_ref(
 
     # Scatter the per-request new state back into the full pool table.
     new_recurrent_state = _scatter_idx0_safe(recurrent_state, state_indices, new_state)
+    # Pin the scatter result across the aliasing boundary (see entry barrier).
+    new_recurrent_state, out = jax.lax.optimization_barrier((new_recurrent_state, out))
     return new_recurrent_state, out.astype(mixed_qkv.dtype)
