@@ -7,9 +7,8 @@ sees the **target** model's hidden, not the previous MTP layer's output.
 So ``draft_extend`` forwards each layer once with the same target hidden
 and a per-layer rotated ``input_ids`` (shift+append previous topk), and
 ``draft_forward`` does no model forward — it just reads the per-layer
-topk that ``draft_extend`` already stored. Chain-style hidden passing
-(layer i+1 ← layer i output) is only correct for archs like Step3p5MTP;
-see GPU sglang ``multi_layer_eagle_worker_v2.chain_mtp_hidden_states``.
+topk that ``draft_extend`` already stored. Chain-style hidden passing is
+only correct for architectures that explicitly chain MTP hidden states.
 """
 
 from __future__ import annotations
@@ -213,7 +212,7 @@ class MultiLayerDraftWorker(EagleDraftWorker):
         ``(topk_{i-1}, target_hidden_{last})``. Each layer's topk goes into
         ``spec_info.topk_index[:, i]`` and ``draft_forward`` does no model
         forward. Mirrors GPU sglang ``multi_layer_eagle_worker_v2`` for
-        non-chain archs (chain is only for Step3p5MTP).
+        non-chain architectures.
         """
         sel = np.asarray(model_worker_batch.logits_indices_selector)
         verified_id_np = np.asarray(jax.device_get(next_token_ids))[sel]
@@ -294,12 +293,11 @@ class MultiLayerDraftWorker(EagleDraftWorker):
         self, model_worker_batch: ModelWorkerBatch, batch_output: GenerationBatchResult
     ) -> None:
         """Decode-extend across all MTP layers."""
-        if getattr(model_worker_batch, "use_fused_greedy_decode_step3", False):
+        if getattr(model_worker_batch, "use_fused_greedy_decode", False):
             raise RuntimeError(
                 "Fixed greedy decode must use "
                 "fused_greedy_verify_and_draft_extend_for_decode before "
-                "draft_extend_for_decode; refusing to launch the obsolete "
-                "step3-only fused path."
+                "draft_extend_for_decode."
             )
 
         from sgl_jax.srt.speculative.draft_extend_fused import (

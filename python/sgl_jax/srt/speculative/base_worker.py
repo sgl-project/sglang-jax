@@ -25,29 +25,6 @@ def replicate_to_mesh(
     return out[0] if len(out) == 1 else out
 
 
-def _can_use_fused_greedy_decode_step3(
-    model_worker_batch: ModelWorkerBatch, draft_worker: BaseDraftWorker | None = None
-) -> bool:
-    sampling_info = getattr(model_worker_batch, "sampling_info", None)
-    if sampling_info is None or not getattr(sampling_info, "is_all_greedy", False):
-        return False
-
-    def _spec_value(batch_attr: str, worker_attr: str):
-        value = getattr(model_worker_batch, batch_attr, None)
-        if value not in (None, 0):
-            return value
-        return getattr(draft_worker, worker_attr, value)
-
-    if _spec_value("speculative_eagle_topk", "topk") != 1:
-        return False
-    if _spec_value("speculative_num_steps", "speculative_num_steps") != 3:
-        return False
-    if _spec_value("speculative_num_draft_tokens", "speculative_num_draft_tokens") != 4:
-        return False
-    seq_lens = getattr(model_worker_batch, "seq_lens", None)
-    return seq_lens is not None and len(seq_lens) == 32
-
-
 class BaseDraftWorker(ABC):
     """Draft model worker interface for speculative decoding.
 
@@ -162,10 +139,22 @@ class BaseSpecWorker:
         # to global-flat (real_bs,) so reqs_info[0].spec_info stays flat-ordered.
         sel = model_worker_batch.logits_indices_selector
         cur_allocate_lens = np.asarray(model_worker_batch.spec_info_padded.allocate_lens)[sel]
-        model_worker_batch.use_fused_greedy_decode_step3 = _can_use_fused_greedy_decode_step3(
-            model_worker_batch, self.draft_worker
+        sampling_info = getattr(model_worker_batch, "sampling_info", None)
+        draft_workers = getattr(self.draft_worker, "_workers", ())
+        num_steps = getattr(self.draft_worker, "speculative_num_steps", self.speculative_num_steps)
+        num_draft_tokens = getattr(
+            self.draft_worker,
+            "speculative_num_draft_tokens",
+            self.speculative_num_draft_tokens,
         )
-        if model_worker_batch.use_fused_greedy_decode_step3:
+        model_worker_batch.use_fused_greedy_decode = (
+            sampling_info is not None
+            and getattr(sampling_info, "is_all_greedy", False)
+            and getattr(self.draft_worker, "topk", self.topk) == 1
+            and len(draft_workers) == num_steps
+            and num_draft_tokens == num_steps + 1
+        )
+        if model_worker_batch.use_fused_greedy_decode:
             from sgl_jax.srt.speculative.draft_extend_fused import (
                 fused_greedy_verify_and_draft_extend_for_decode,
             )
@@ -199,7 +188,7 @@ class BaseSpecWorker:
         from sgl_jax.srt.managers.scheduler import GenerationBatchResult
         from sgl_jax.srt.speculative.eagle_util import EagleDraftInput, EagleVerifyInput
 
-        if getattr(model_worker_batch, "use_fused_greedy_decode_step3", False):
+        if getattr(model_worker_batch, "use_fused_greedy_decode", False):
             raise RuntimeError(
                 "Fixed greedy decode must enter the whole-round fused path before "
                 "BaseSpecWorker.verify()."

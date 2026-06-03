@@ -436,18 +436,7 @@ def build_tree_kernel_efficient(
         speculative_num_steps,
     )
 
-    # Get batch size
-    # for compatibility, 0.6.3 need to use use_mesh. set_mesh is not have __entry__ attribute.
-    # on jax >=0.7.1, we need to use set_mesh.
-    try:
-        ctx = jax.sharding.use_mesh(mesh)
-    except AttributeError:
-        try:
-            ctx = jax.set_mesh(mesh)
-        except AttributeError:
-            ctx = mesh
-    with ctx:
-
+    with jax.set_mesh(mesh):
         tree_mask, positions, retrive_index, retrive_next_token, retrive_next_sibling = (
             build_eagle_tree_structure(
                 parent_list=parent_list,
@@ -862,14 +851,7 @@ def greedy_sample_device_outputs(
     if mesh is None:
         accept_index_2d, accept_length_raw, predict = _run_verify_tree_greedy()
     else:
-        try:
-            ctx = jax.sharding.use_mesh(mesh)
-        except AttributeError:
-            try:
-                ctx = jax.set_mesh(mesh)
-            except AttributeError:
-                ctx = mesh
-        with ctx:
+        with jax.set_mesh(mesh):
             accept_index_2d, accept_length_raw, predict = _run_verify_tree_greedy()
     accept_length = accept_length_raw + 1
     accept_width = speculative_num_steps + 1
@@ -1076,16 +1058,7 @@ class EagleVerifyInput:
         is_all_greedy = sampling_info.is_all_greedy
 
         if is_all_greedy:
-            # # for compatibility, 0.6.3 need to use use_mesh. set_mesh is not have __entry__ attribute.
-            # # on jax >=0.7.1, we need to use set_mesh.
-            try:
-                ctx = jax.sharding.use_mesh(mesh)
-            except AttributeError:
-                try:
-                    ctx = jax.set_mesh(mesh)
-                except AttributeError:
-                    ctx = mesh
-            with ctx:
+            with jax.set_mesh(mesh):
                 accept_index, accept_length, predict = verify_tree_greedy(
                     speculative_num_steps=self.spec_steps,
                     num_draft_tokens=self.draft_token_num,

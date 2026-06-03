@@ -1,18 +1,7 @@
-"""Fused single-JIT for N-layer MTP draft extend decode.
-
-Merges all N model forward calls into one @jax.jit, eliminating:
-- Per-layer host dispatch overhead (~N jit calls → 1)
-- Per-layer device_get for rotate_ids (device .at[].set for topk=1)
-- Per-layer replicate_to_mesh boundary (with_sharding_constraint inside jit)
-
-Constraints:
-- topk=1 only (rotate_ids = .at[sel_pos].set)
-- All MTP layers share same model class (same model_def / model_state_def)
-"""
+"""Fused greedy speculative decode and MTP draft extend."""
 
 from __future__ import annotations
 
-import logging
 from functools import partial
 from typing import NamedTuple
 
@@ -23,12 +12,8 @@ from flax import nnx
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from sgl_jax.srt.kernels.speculative.verify_tree_greedy_kernel import verify_tree_greedy
 
-logger = logging.getLogger(__name__)
-
-
-class GreedyStep3DraftInputs(NamedTuple):
+class GreedyDraftInputs(NamedTuple):
     hidden_states: jax.Array
     positions: jax.Array
     new_seq_lens: jax.Array
@@ -56,7 +41,7 @@ def _take_with_index_sharding(values, index):
     return jnp.take(values.reshape(-1), index)
 
 
-def _greedy_step3_prepare_draft_inputs(
+def _greedy_prepare_draft_inputs(
     hidden_states,
     positions,
     seq_lens,
@@ -79,15 +64,15 @@ def _greedy_step3_prepare_draft_inputs(
     )
     hidden_sharding = jax.typeof(hidden_states).sharding
     positions_sharding = jax.typeof(positions).sharding
-    if isinstance(hidden_sharding, NamedSharding) and not hidden_sharding.mesh.empty:
-        gathered_hidden = hidden_states.at[safe_index, :].get(out_sharding=hidden_sharding.spec)
+    if isinstance(hidden_sharding, NamedSharding):
+        gathered_hidden = hidden_states.at[safe_index, :].get(out_sharding=hidden_sharding)
     else:
         gathered_hidden = hidden_states[safe_index, :]
-    if isinstance(positions_sharding, NamedSharding) and not positions_sharding.mesh.empty:
-        gathered_positions = positions.at[safe_index].get(out_sharding=positions_sharding.spec)
+    if isinstance(positions_sharding, NamedSharding):
+        gathered_positions = positions.at[safe_index].get(out_sharding=positions_sharding)
     else:
         gathered_positions = positions[safe_index]
-    return GreedyStep3DraftInputs(
+    return GreedyDraftInputs(
         hidden_states=gathered_hidden,
         positions=gathered_positions,
         new_seq_lens=seq_lens + accept_length,
@@ -95,58 +80,6 @@ def _greedy_step3_prepare_draft_inputs(
         verified_id=verified_id,
         accept_lens=accept_length,
         sel_pos=jnp.clip(accept_length - 1, 0, None).astype(jnp.int32),
-    )
-
-
-def _greedy_sample_and_prepare_draft_inputs(
-    *,
-    target_hidden,
-    positions,
-    seq_lens,
-    draft_tokens,
-    retrive_index,
-    retrive_next_token,
-    retrive_next_sibling,
-    next_token_logits,
-    speculative_num_steps,
-    speculative_num_draft_tokens,
-):
-    accept_index_2d, accept_length_raw, predict = verify_tree_greedy(
-        speculative_num_steps=speculative_num_steps,
-        num_draft_tokens=speculative_num_draft_tokens,
-        draft_tokens=draft_tokens,
-        retrive_index=retrive_index,
-        retrive_next_token=retrive_next_token,
-        retrive_next_sibling=retrive_next_sibling,
-        next_token_logits=next_token_logits,
-    )
-    accept_length = accept_length_raw + 1
-    accept_index = accept_index_2d.reshape(-1)
-    accept_width = speculative_num_steps + 1
-    req_ids = jnp.arange(accept_index.shape[0], dtype=jnp.int32) // accept_width
-    per_req_last = req_ids * speculative_num_draft_tokens + speculative_num_draft_tokens - 1
-    safe_index = jnp.where(accept_index >= 0, accept_index, per_req_last)
-    safe_predict = _take_with_index_sharding(predict, safe_index)
-    verified_id = jnp.where(accept_index >= 0, safe_predict, jnp.zeros_like(safe_predict))
-    prepared = _greedy_step3_prepare_draft_inputs(
-        target_hidden,
-        positions,
-        seq_lens,
-        accept_index,
-        accept_length,
-        verified_id,
-        speculative_num_steps=speculative_num_steps,
-        speculative_num_draft_tokens=speculative_num_draft_tokens,
-    )
-    return GreedySampleAndPrepareOutput(
-        hidden_states=prepared.hidden_states,
-        positions=prepared.positions,
-        new_seq_lens=prepared.new_seq_lens,
-        select_index=prepared.select_index,
-        verified_id=prepared.verified_id,
-        accept_lens=prepared.accept_lens,
-        sel_pos=prepared.sel_pos,
-        predict=predict,
     )
 
 
@@ -188,7 +121,7 @@ def _greedy_sample_and_prepare_draft_inputs_chain_from_predict(
     safe_index = jnp.where(accept_index >= 0, accept_index, per_req_last)
     safe_predict = _take_with_index_sharding(predict, safe_index)
     verified_id = jnp.where(accept_index >= 0, safe_predict, jnp.zeros_like(safe_predict))
-    prepared = _greedy_step3_prepare_draft_inputs(
+    prepared = _greedy_prepare_draft_inputs(
         target_hidden,
         positions,
         seq_lens,
@@ -243,19 +176,7 @@ def _build_topk1_chain_verify_inputs_device_tuple(
 
 
 def _device_rotate_input_ids(input_ids, ext_lens, sel_pos, new_tokens):
-    """Device-side per-req rotate for topk=1, exact mirror of the host
-    ``MultiLayerDraftWorker._rotate_ids``:
-
-      seg[:-1] = seg[1:]      # left-shift, KEEP last column (= prev last token)
-      seg[sel_pos] = new_token
-      padding reqs (ext_lens == 0) are left untouched
-
-    input_ids is the flat (bs * tokens_per_req,) buffer; every req occupies a
-    fixed ``tokens_per_req`` segment (real reqs have extend_seq_lens ==
-    tokens_per_req, padding reqs have 0). The last column is the captured-logit
-    position, so it must be copy-last (NOT jnp.roll, which wraps the first token
-    into the last column and diverges on partial accept).
-    """
+    """Mirror MultiLayerDraftWorker._rotate_ids on device for topk=1."""
     bs = ext_lens.shape[0]
     tokens_per_req = input_ids.shape[0] // bs
     ids_2d = input_ids.reshape(bs, tokens_per_req)
@@ -271,8 +192,8 @@ def _device_rotate_input_ids(input_ids, ext_lens, sel_pos, new_tokens):
 
 def _gather_rows_preserve_sharding(values, index):
     sharding = jax.typeof(values).sharding
-    if isinstance(sharding, NamedSharding) and not sharding.mesh.empty:
-        return values.at[index, :].get(out_sharding=sharding.spec)
+    if isinstance(sharding, NamedSharding):
+        return values.at[index, :].get(out_sharding=sharding)
     return values[index, :]
 
 
@@ -293,12 +214,12 @@ def _build_fused_draft_extend_jit(num_layers: int, topk: int):
     def fused_draft_extend(
         model_def,
         model_state_def,
-        all_leaves,  # tuple of N tuples-of-arrays
-        forward_batch,  # single ForwardBatch (shared across layers)
-        all_memory_pools,  # tuple of N MemoryPools pytrees
-        logits_metadata,  # LogitsMetadata pytree
-        target_hidden,  # (tokens, hidden_dim) replicated
-        sel_pos,  # (bs,) device array — rotate position
+        all_leaves,
+        forward_batch,
+        all_memory_pools,
+        logits_metadata,
+        target_hidden,
+        sel_pos,
         *,
         num_layers,
     ):
@@ -312,8 +233,6 @@ def _build_fused_draft_extend_jit(num_layers: int, topk: int):
             state = jax.tree_util.tree_unflatten(model_state_def, all_leaves[i])
             model = nnx.merge(model_def, state)
 
-            # shared forward_batch: only hidden_states and input_ids change per layer;
-            # model() must not mutate other fields (positions, attn metadata, etc.)
             forward_batch.spec_info.hidden_states = target_hidden
             forward_batch.input_ids = input_ids
 
@@ -329,8 +248,6 @@ def _build_fused_draft_extend_jit(num_layers: int, topk: int):
             topk_idx = _topk1_index_from_logits(output.next_token_logits)
             all_topk_index.append(topk_idx)
 
-            # Device-side rotate for topk=1 (shared with offline equivalence
-            # test; exact mirror of host _rotate_ids).
             if i < num_layers - 1:
                 ext_lens = forward_batch.extend_seq_lens
                 input_ids = _device_rotate_input_ids(input_ids, ext_lens, sel_pos, topk_idx[:, 0])
@@ -356,9 +273,9 @@ def _build_fused_draft_extend_jit(num_layers: int, topk: int):
     return fused_draft_extend
 
 
-def _build_fused_greedy_verify_step3_jit(num_layers: int, topk: int):
+def _build_fused_greedy_decode_jit(num_layers: int, topk: int):
     """Build fused JIT: target verify forward + greedy sample + MTP extend."""
-    assert topk == 1, "Fused greedy verify+Step3 only supports topk=1"
+    assert topk == 1, "Fused greedy decode only supports topk=1"
 
     @partial(
         jax.jit,
@@ -373,7 +290,7 @@ def _build_fused_greedy_verify_step3_jit(num_layers: int, topk: int):
             "return_target_hidden",
         ],
     )
-    def fused_greedy_verify_step3(
+    def fused_greedy_decode(
         target_model_def,
         target_model_state_def,
         target_leaves,
@@ -435,7 +352,6 @@ def _build_fused_greedy_verify_step3_jit(num_layers: int, topk: int):
 
         sh = jax.typeof(target_output.next_token_logits).sharding
         mesh = sh.mesh if isinstance(sh, NamedSharding) else None
-        rep = NamedSharding(mesh, P()) if mesh is not None else None
         target_logits = target_output.next_token_logits
         target_hidden = target_output.hidden_states
         target_predict = jnp.argmax(target_logits, axis=-1).astype(jnp.int32).reshape(-1)
@@ -521,7 +437,7 @@ def _build_fused_greedy_verify_step3_jit(num_layers: int, topk: int):
             target_hidden_for_host,
         )
 
-    return fused_greedy_verify_step3
+    return fused_greedy_decode
 
 
 def _prepare_topk1_verify_placeholders_from_draft_state(draft_worker, model_worker_batch):
@@ -689,10 +605,6 @@ def draft_extend_for_decode_fused(draft_worker, model_worker_batch, batch_output
     assert (accept_host[sel] >= 1).all(), f"accept_length < 1: {accept_host[sel]}"
     sel_pos = np.clip(accept_host - 1, 0, None).astype(np.int32)
 
-    # --- Host preparation (all done before single jit call) ---
-
-    # Build ONE ForwardBatch and reuse for all layers. All workers share the
-    # same mwb so forward_metadata is identical; only memory_pools/weights differ.
     mr0 = draft_worker._workers[0].model_runner
     mwb.spec_info_padded.hidden_states = target_hidden
     mr0.attn_backend.forward_metadata = mr0.attn_backend.get_eagle_forward_metadata(mwb)
@@ -708,23 +620,13 @@ def draft_extend_for_decode_fused(draft_worker, model_worker_batch, batch_output
 
     sel_pos_device = jax.device_put(sel_pos, NamedSharding(draft_worker.mesh, P("data")))
 
-    # --- Build / get cached fused jit ---
     if not hasattr(draft_worker, "_fused_jit_fn"):
         draft_worker._fused_jit_fn = _build_fused_draft_extend_jit(
             num_layers=draft_worker.speculative_num_steps,
             topk=draft_worker.topk,
         )
 
-    # --- Single jit call: all N layers fused ---
-    # Model internals use P() with implicit mesh; need use_mesh context
-    try:
-        ctx = jax.sharding.use_mesh(draft_worker.mesh)
-    except AttributeError:
-        try:
-            ctx = jax.set_mesh(draft_worker.mesh)
-        except AttributeError:
-            ctx = draft_worker.mesh
-    with ctx:
+    with jax.set_mesh(draft_worker.mesh):
         selected_layer0_hidden, topk_index_stacked, all_pool_updates = draft_worker._fused_jit_fn(
             mr0._model_def,
             mr0._model_state_def,
@@ -737,7 +639,6 @@ def draft_extend_for_decode_fused(draft_worker, model_worker_batch, batch_output
             num_layers=draft_worker.speculative_num_steps,
         )
 
-    # --- Host post-processing: replace memory pools + assemble outputs ---
     for i, w in enumerate(draft_worker._workers):
         w.model_runner.memory_pools.replace_all(all_pool_updates[i])
 
@@ -758,9 +659,7 @@ def draft_extend_for_decode_fused(draft_worker, model_worker_batch, batch_output
     batch_output.accept_lens = accept_host
 
 
-def _prepare_step3_model_worker_batch_for_draft_extend(
-    draft_worker, model_worker_batch, batch_output
-):
+def _prepare_model_worker_batch_for_draft_extend(draft_worker, model_worker_batch, batch_output):
     from sgl_jax.srt.model_executor.forward_batch_info import (
         CaptureHiddenMode,
         ForwardMode,
@@ -848,7 +747,7 @@ def _materialize_fused_greedy_batch_output_for_scheduler(
 def fused_greedy_verify_and_draft_extend_for_decode(
     spec_worker, model_worker_batch, cur_allocate_lens
 ):
-    """Greedy fixed-shape target-verify + Step3 draft-extend fused route."""
+    """Greedy target-verify + MTP draft-extend fused route."""
     from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
     from sgl_jax.srt.managers.scheduler import GenerationBatchResult
     from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
@@ -907,7 +806,7 @@ def fused_greedy_verify_and_draft_extend_for_decode(
     )
     model_worker_batch.spec_info_padded = next_draft_input
 
-    draft_mwb, draft_logits_metadata = _prepare_step3_model_worker_batch_for_draft_extend(
+    draft_mwb, draft_logits_metadata = _prepare_model_worker_batch_for_draft_extend(
         draft_worker, model_worker_batch, batch_output
     )
     if draft_mwb.input_ids.shape[0] <= 0:
@@ -924,20 +823,13 @@ def fused_greedy_verify_and_draft_extend_for_decode(
         all_memory_pools.append(mr.memory_pools)
         all_leaves.append(tuple(mr.model_state_leaves))
 
-    if not hasattr(draft_worker, "_fused_greedy_verify_step3_jit_fn"):
-        draft_worker._fused_greedy_verify_step3_jit_fn = _build_fused_greedy_verify_step3_jit(
+    if not hasattr(draft_worker, "_fused_greedy_decode_jit_fn"):
+        draft_worker._fused_greedy_decode_jit_fn = _build_fused_greedy_decode_jit(
             num_layers=draft_worker.speculative_num_steps,
             topk=draft_worker.topk,
         )
 
-    try:
-        ctx = jax.sharding.use_mesh(draft_worker.mesh)
-    except AttributeError:
-        try:
-            ctx = jax.set_mesh(draft_worker.mesh)
-        except AttributeError:
-            ctx = draft_worker.mesh
-    with ctx:
+    with jax.set_mesh(draft_worker.mesh):
         (
             layer0_hidden,
             topk_index_stacked,
@@ -947,7 +839,7 @@ def fused_greedy_verify_and_draft_extend_for_decode(
             predict_device,
             target_logits,
             target_hidden,
-        ) = draft_worker._fused_greedy_verify_step3_jit_fn(
+        ) = draft_worker._fused_greedy_decode_jit_fn(
             target_mr._model_def,
             target_mr._model_state_def,
             tuple(target_mr.model_state_leaves),

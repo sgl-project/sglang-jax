@@ -1,4 +1,3 @@
-import inspect
 from types import SimpleNamespace
 
 import jax
@@ -9,13 +8,12 @@ from jax.sharding import AxisType, Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.speculative.draft_extend_fused import (
-    _greedy_sample_and_prepare_draft_inputs,
+    _greedy_prepare_draft_inputs,
     _greedy_sample_and_prepare_draft_inputs_chain_from_predict,
-    _greedy_step3_prepare_draft_inputs,
 )
 
 
-def test_greedy_step3_prepare_draft_inputs_matches_safe_index_logic():
+def test_greedy_prepare_draft_inputs_matches_safe_index_logic():
     hidden = jnp.arange(8 * 5, dtype=jnp.float32).reshape(8, 5)
     positions = jnp.arange(8, dtype=jnp.int32) + 100
     seq_lens = jnp.array([10, 20], dtype=jnp.int32)
@@ -23,7 +21,7 @@ def test_greedy_step3_prepare_draft_inputs_matches_safe_index_logic():
     accept_length = jnp.array([2, 3], dtype=jnp.int32)
     verified_id = jnp.array([11, 12, 0, 0, 21, 22, 23, 0], dtype=jnp.int32)
 
-    out = _greedy_step3_prepare_draft_inputs(
+    out = _greedy_prepare_draft_inputs(
         hidden,
         positions,
         seq_lens,
@@ -42,70 +40,6 @@ def test_greedy_step3_prepare_draft_inputs_matches_safe_index_logic():
     np.testing.assert_array_equal(np.asarray(out.verified_id), np.asarray(verified_id))
     np.testing.assert_array_equal(np.asarray(out.accept_lens), np.asarray(accept_length))
     np.testing.assert_array_equal(np.asarray(out.sel_pos), np.array([1, 2], dtype=np.int32))
-
-
-def test_greedy_sample_and_prepare_draft_inputs_calls_verify_inside(monkeypatch):
-    from sgl_jax.srt.speculative import draft_extend_fused
-
-    calls = []
-
-    def fake_verify_tree_greedy(**kwargs):
-        calls.append(kwargs)
-        return (
-            jnp.array([[0, 1, -1, -1], [4, 5, 6, -1]], dtype=jnp.int32),
-            jnp.array([2, 3], dtype=jnp.int32),
-            jnp.array(
-                [
-                    [11, 12, 0, 0, 99],
-                    [21, 22, 23, 0, 88],
-                ],
-                dtype=jnp.int32,
-            ),
-        )
-
-    monkeypatch.setattr(draft_extend_fused, "verify_tree_greedy", fake_verify_tree_greedy)
-
-    hidden = jnp.arange(8 * 5, dtype=jnp.float32).reshape(8, 5)
-    positions = jnp.arange(8, dtype=jnp.int32) + 100
-    seq_lens = jnp.array([10, 20], dtype=jnp.int32)
-    draft_tokens = jnp.array([11, 12, 13, 14, 21, 22, 23, 24], dtype=jnp.int32)
-    retrive_index = jnp.array([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=jnp.int32)
-    retrive_next_token = jnp.array([[1, 2, 3, -1], [1, 2, 3, -1]], dtype=jnp.int32)
-    retrive_next_sibling = jnp.full((2, 4), -1, dtype=jnp.int32)
-    next_token_logits = jnp.zeros((8, 32), dtype=jnp.float32)
-
-    prepared = _greedy_sample_and_prepare_draft_inputs(
-        target_hidden=hidden,
-        positions=positions,
-        seq_lens=seq_lens,
-        draft_tokens=draft_tokens,
-        retrive_index=retrive_index,
-        retrive_next_token=retrive_next_token,
-        retrive_next_sibling=retrive_next_sibling,
-        next_token_logits=next_token_logits,
-        speculative_num_steps=3,
-        speculative_num_draft_tokens=4,
-    )
-
-    assert len(calls) == 1
-    assert calls[0]["draft_tokens"] is draft_tokens
-    assert calls[0]["next_token_logits"] is next_token_logits
-    np.testing.assert_array_equal(
-        np.asarray(prepared.accept_lens),
-        np.array([3, 4], dtype=np.int32),
-    )
-    np.testing.assert_array_equal(
-        np.asarray(prepared.select_index),
-        np.array([2, 7], dtype=np.int32),
-    )
-    np.testing.assert_array_equal(
-        np.asarray(prepared.verified_id),
-        np.array([11, 12, 0, 0, 99, 21, 22, 0], dtype=np.int32),
-    )
-    np.testing.assert_array_equal(
-        np.asarray(prepared.hidden_states),
-        np.asarray(hidden)[np.array([0, 1, 3, 3, 4, 5, 6, 7], dtype=np.int32)],
-    )
 
 
 def test_greedy_chain_sample_and_prepare_from_predict_matches_fixed_chain_semantics():
@@ -225,7 +159,7 @@ def test_greedy_chain_sample_and_prepare_compiles_with_explicit_data_sharding():
     assert jax.typeof(verified_id).sharding.spec == P("data")
 
 
-def test_step3_logits_metadata_can_skip_placeholder_accept_lens(monkeypatch):
+def test_draft_extend_logits_metadata_can_skip_placeholder_accept_lens(monkeypatch):
     from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
     from sgl_jax.srt.speculative import draft_extend_fused
 
@@ -334,7 +268,7 @@ def test_fused_greedy_materialize_keeps_scheduler_d2h_in_one_boundary():
     )
 
 
-def test_fused_greedy_verify_round_bypasses_split_verify_and_step3(monkeypatch):
+def test_fused_greedy_verify_round_bypasses_split_verify_and_draft_extend(monkeypatch):
     from sgl_jax.srt.speculative import draft_extend_fused
 
     devices = np.asarray(jax.devices())
@@ -424,8 +358,8 @@ def test_fused_greedy_verify_round_bypasses_split_verify_and_step3(monkeypatch):
             jnp.array([[102, 103, 104], [202, 203, 204]], dtype=jnp.int32),
         )
 
-    def fake_prepare_step3(draft_worker_arg, batch_arg, batch_output):
-        calls.append("prepare_step3")
+    def fake_prepare_draft_extend(draft_worker_arg, batch_arg, batch_output):
+        calls.append("prepare_draft_extend")
         return batch_arg, "draft-logits-metadata"
 
     def fake_fused_jit(*args, **kwargs):
@@ -468,12 +402,12 @@ def test_fused_greedy_verify_round_bypasses_split_verify_and_step3(monkeypatch):
     )
     monkeypatch.setattr(
         draft_extend_fused,
-        "_prepare_step3_model_worker_batch_for_draft_extend",
-        fake_prepare_step3,
+        "_prepare_model_worker_batch_for_draft_extend",
+        fake_prepare_draft_extend,
     )
     monkeypatch.setattr(
         draft_extend_fused,
-        "_build_fused_greedy_verify_step3_jit",
+        "_build_fused_greedy_decode_jit",
         lambda num_layers, topk: fake_fused_jit,
         raising=False,
     )
@@ -506,7 +440,7 @@ def test_fused_greedy_verify_round_bypasses_split_verify_and_step3(monkeypatch):
 
     assert "prepare_topk1_verify_placeholders" in calls
     assert ("prepare_for_verify", 64) in calls
-    assert "prepare_step3" in calls
+    assert "prepare_draft_extend" in calls
     assert any(call[0] == "fused_jit" for call in calls if isinstance(call, tuple))
     assert "materialize_batch_output" in calls
     np.testing.assert_array_equal(np.asarray(out.accept_lens), np.array([3, 3]))
@@ -597,8 +531,8 @@ def test_fused_greedy_verify_round_builds_topk1_verify_inputs_inside_jit(monkeyp
     def fake_forward_batch_init_new_preserve_device(batch_arg, model_runner):
         return target_fb if model_runner is target_mr else draft_fb
 
-    def fake_prepare_step3(draft_worker_arg, batch_arg, batch_output):
-        calls.append("prepare_step3")
+    def fake_prepare_draft_extend(draft_worker_arg, batch_arg, batch_output):
+        calls.append("prepare_draft_extend")
         return batch_arg, "draft-logits-metadata"
 
     def fake_fused_jit(*args, **kwargs):
@@ -635,12 +569,12 @@ def test_fused_greedy_verify_round_builds_topk1_verify_inputs_inside_jit(monkeyp
     )
     monkeypatch.setattr(
         draft_extend_fused,
-        "_prepare_step3_model_worker_batch_for_draft_extend",
-        fake_prepare_step3,
+        "_prepare_model_worker_batch_for_draft_extend",
+        fake_prepare_draft_extend,
     )
     monkeypatch.setattr(
         draft_extend_fused,
-        "_build_fused_greedy_verify_step3_jit",
+        "_build_fused_greedy_decode_jit",
         lambda num_layers, topk: fake_fused_jit,
         raising=False,
     )
@@ -662,7 +596,7 @@ def test_fused_greedy_verify_round_builds_topk1_verify_inputs_inside_jit(monkeyp
     np.testing.assert_array_equal(np.asarray(out.accept_lens), np.array([3, 3]))
 
 
-def test_greedy_step3_prepare_draft_inputs_preserves_position_data_sharding():
+def test_greedy_prepare_draft_inputs_preserves_position_data_sharding():
     devices = np.asarray(jax.devices())
     if devices.size < 4:
         pytest.skip("requires at least 4 JAX devices for a 2x2 mesh")
@@ -689,7 +623,7 @@ def test_greedy_step3_prepare_draft_inputs_preserves_position_data_sharding():
 
     @jax.jit
     def prepare(hidden, positions, seq_lens, accept_index, accept_length, verified_id):
-        return _greedy_step3_prepare_draft_inputs(
+        return _greedy_prepare_draft_inputs(
             hidden,
             positions,
             seq_lens,
@@ -706,206 +640,11 @@ def test_greedy_step3_prepare_draft_inputs_preserves_position_data_sharding():
     assert out.positions.sharding == data_sharding
 
 
-def test_fused_greedy_jit_does_not_reshard_model_outputs_before_compute():
-    from sgl_jax.srt.speculative import draft_extend_fused
-
-    source = inspect.getsource(draft_extend_fused._build_fused_greedy_verify_step3_jit)
-
-    assert "jax.sharding.reshard(target_output.next_token_logits" not in source
-    assert "jax.sharding.reshard(target_output.hidden_states" not in source
-    assert "jax.sharding.reshard(output.next_token_logits" not in source
-    assert "jax.sharding.reshard(output.hidden_states" not in source
-
-
-def test_fused_greedy_jit_uses_reshard_for_final_host_outputs():
-    from sgl_jax.srt.speculative import draft_extend_fused
-
-    source = inspect.getsource(draft_extend_fused._build_fused_greedy_verify_step3_jit)
-
-    assert "_replicate_for_host_output" not in source
-    assert "jax.sharding.reshard" in source
-
-
-def test_obsolete_host_output_reshard_helper_is_removed():
-    from sgl_jax.srt.speculative import draft_extend_fused
-
-    assert not hasattr(draft_extend_fused, "_replicate_for_host_output")
-
-
-def test_fused_greedy_jit_only_returns_large_target_outputs_when_requested():
-    from sgl_jax.srt.speculative import draft_extend_fused
-
-    source = inspect.getsource(draft_extend_fused._build_fused_greedy_verify_step3_jit)
-
-    assert "return_target_logits" in source
-    assert "return_target_hidden" in source
-    assert "if return_target_logits:" in source
-    assert "if return_target_hidden:" in source
-
-
-def test_topk1_index_helper_does_not_reshard_per_layer_outputs():
-    from sgl_jax.srt.speculative import draft_extend_fused
-
-    source = inspect.getsource(draft_extend_fused._topk1_index_from_logits)
-
-    assert "jax.sharding.reshard" not in source
-
-
-def test_fused_draft_extend_jit_does_not_return_topk1_probs_to_host():
-    from sgl_jax.srt.speculative import draft_extend_fused
-
-    jit_source = inspect.getsource(draft_extend_fused._build_fused_draft_extend_jit)
-    host_source = inspect.getsource(draft_extend_fused.draft_extend_for_decode_fused)
-
-    assert "all_topk_p" not in jit_source
-    assert "stacked_p" not in jit_source
-    assert "jax.lax.top_k" not in jit_source
-    assert "jax.nn.logsumexp" not in jit_source
-    assert "jax.sharding.reshard(output.next_token_logits" not in jit_source
-    assert "jax.sharding.reshard(output.hidden_states" not in jit_source
-    assert "topk_p_stacked" not in host_source
-    assert "np.ones(topk_index.shape" in host_source
-
-
-def test_fused_draft_extend_selects_layer0_hidden_before_host_materialize():
-    from sgl_jax.srt.speculative import draft_extend_fused
-
-    jit_source = inspect.getsource(draft_extend_fused._build_fused_draft_extend_jit)
-    host_source = inspect.getsource(draft_extend_fused.draft_extend_for_decode_fused)
-
-    assert "selected_layer0_hidden" in jit_source
-    assert "np.asarray(layer0_hidden)[select_index]" not in host_source
-    assert "copy_to_host_async(layer0_hidden)" not in host_source
-
-
-def test_fused_greedy_jit_does_not_return_topk1_probs_to_host():
-    from sgl_jax.srt.speculative import draft_extend_fused
-
-    jit_source = inspect.getsource(draft_extend_fused._build_fused_greedy_verify_step3_jit)
-    materialize_source = inspect.getsource(
-        draft_extend_fused._materialize_fused_greedy_batch_output_for_scheduler
-    )
-
-    assert "all_topk_p" not in jit_source
-    assert "stacked_p" not in jit_source
-    assert "topk_p_stacked" not in materialize_source
-    assert "np.ones(topk_index.shape" in materialize_source
-
-
-def test_fused_greedy_jit_does_not_return_selected_verified_id_to_host():
-    from sgl_jax.srt.speculative import draft_extend_fused
-
-    jit_source = inspect.getsource(draft_extend_fused._build_fused_greedy_verify_step3_jit)
-    materialize_source = inspect.getsource(
-        draft_extend_fused._materialize_fused_greedy_batch_output_for_scheduler
-    )
-
-    assert "selected_verified_id" not in jit_source
-    assert "selected_verified_id_device" not in materialize_source
-    assert (
-        "selector * speculative_num_draft_tokens + accept_lens[selector] - 1" in materialize_source
-    )
-
-
-def test_fused_greedy_jit_does_not_return_new_seq_lens_to_host():
-    from sgl_jax.srt.speculative import draft_extend_fused
-
-    jit_source = inspect.getsource(draft_extend_fused._build_fused_greedy_verify_step3_jit)
-    materialize_source = inspect.getsource(
-        draft_extend_fused._materialize_fused_greedy_batch_output_for_scheduler
-    )
-
-    assert "prepared_new_seq_lens" not in jit_source
-    assert "new_seq_lens_device" not in materialize_source
-    assert "seq_lens_host[selector]" in materialize_source
-    assert "accept_lens[selector]" in materialize_source
-
-
-def test_fused_greedy_jit_does_not_replicate_target_predict_before_verify():
-    from sgl_jax.srt.speculative import draft_extend_fused
-
-    source = inspect.getsource(draft_extend_fused._build_fused_greedy_verify_step3_jit)
-
-    assert "target_predict = jax.sharding.reshard" not in source
-    assert "verify_tree_greedy_pallas_call" not in source
-
-
-def test_fused_greedy_module_does_not_import_pallas_verify_for_fixed_chain():
-    from sgl_jax.srt.speculative import draft_extend_fused
-
-    source = inspect.getsource(draft_extend_fused)
-
-    assert "verify_tree_greedy_pallas_call" not in source
-
-
-def test_fused_greedy_selects_next_draft_rows_before_host_materialize():
-    from sgl_jax.srt.speculative import draft_extend_fused
-
-    jit_source = inspect.getsource(draft_extend_fused._build_fused_greedy_verify_step3_jit)
-    materialize_source = inspect.getsource(
-        draft_extend_fused._materialize_fused_greedy_batch_output_for_scheduler
-    )
-
-    assert "selected_layer0_hidden" in jit_source
-    assert "selected_verified_id" not in jit_source
-    assert "select_index_device" not in materialize_source
-    assert "np.asarray(layer0_hidden)[select_index]" not in materialize_source
-    assert "np.asarray(verified_id_device)[select_index]" not in materialize_source
-
-
 class _SamplingInfo:
     is_all_greedy = True
 
 
-class _Batch:
-    sampling_info = _SamplingInfo()
-    speculative_eagle_topk = 1
-    speculative_num_steps = 3
-    speculative_num_draft_tokens = 4
-
-    def __init__(self, bs):
-        self.seq_lens = np.ones((bs,), dtype=np.int32)
-
-
-def test_fused_greedy_decode_predicate_accepts_only_fixed_bucket():
-    from sgl_jax.srt.speculative.base_worker import _can_use_fused_greedy_decode_step3
-
-    assert _can_use_fused_greedy_decode_step3(_Batch(32))
-    assert not _can_use_fused_greedy_decode_step3(_Batch(16))
-
-    batch = _Batch(32)
-    batch.sampling_info = _SamplingInfo()
-    batch.sampling_info.is_all_greedy = False
-    assert not _can_use_fused_greedy_decode_step3(batch)
-
-    batch = _Batch(32)
-    batch.speculative_num_steps = 2
-    assert not _can_use_fused_greedy_decode_step3(batch)
-
-
-def test_fused_greedy_decode_predicate_uses_worker_config_before_padding():
-    from sgl_jax.srt.speculative.base_worker import _can_use_fused_greedy_decode_step3
-
-    batch = SimpleNamespace(
-        sampling_info=_SamplingInfo(),
-        seq_lens=np.ones((32,), dtype=np.int32),
-        speculative_eagle_topk=0,
-        speculative_num_steps=0,
-        speculative_num_draft_tokens=0,
-    )
-    draft_worker = SimpleNamespace(
-        topk=1,
-        speculative_num_steps=3,
-        speculative_num_draft_tokens=4,
-    )
-
-    assert _can_use_fused_greedy_decode_step3(batch, draft_worker)
-
-    batch.speculative_num_steps = 2
-    assert not _can_use_fused_greedy_decode_step3(batch, draft_worker)
-
-
-def test_multi_layer_draft_worker_rejects_direct_fixed_greedy_step3_route(monkeypatch):
+def test_multi_layer_draft_worker_rejects_direct_fixed_greedy_draft_extend_route(monkeypatch):
     from sgl_jax.srt.speculative import draft_extend_fused
     from sgl_jax.srt.speculative.multi_layer_draft_worker import MultiLayerDraftWorker
 
@@ -917,7 +656,7 @@ def test_multi_layer_draft_worker_rejects_direct_fixed_greedy_step3_route(monkey
     monkeypatch.setattr(draft_extend_fused, "draft_extend_for_decode_fused", fake_fallback)
 
     worker = object.__new__(MultiLayerDraftWorker)
-    batch = type("Batch", (), {"use_fused_greedy_decode_step3": True})()
+    batch = type("Batch", (), {"use_fused_greedy_decode": True})()
 
     with pytest.raises(RuntimeError, match="Fixed greedy decode must use"):
         worker.draft_extend_for_decode(batch, object())
@@ -926,7 +665,7 @@ def test_multi_layer_draft_worker_rejects_direct_fixed_greedy_step3_route(monkey
 
 
 def test_base_spec_worker_routes_fixed_greedy_decode_to_fused_round(monkeypatch):
-    from sgl_jax.srt.speculative import base_worker, draft_extend_fused
+    from sgl_jax.srt.speculative import draft_extend_fused
     from sgl_jax.srt.speculative.base_worker import BaseSpecWorker
 
     calls = []
@@ -936,6 +675,11 @@ def test_base_spec_worker_routes_fixed_greedy_decode_to_fused_round(monkeypatch)
             return False
 
     class _DraftWorker:
+        topk = 1
+        speculative_num_steps = 3
+        speculative_num_draft_tokens = 4
+        _workers = (object(), object(), object())
+
         def draft(self, model_worker_batch):
             raise AssertionError("fixed greedy route should not call standalone draft")
 
@@ -949,9 +693,6 @@ def test_base_spec_worker_routes_fixed_greedy_decode_to_fused_round(monkeypatch)
         calls.append(("fused_round", tuple(cur_allocate_lens.tolist())))
         return "batch-output"
 
-    monkeypatch.setattr(
-        base_worker, "_can_use_fused_greedy_decode_step3", lambda batch, draft_worker: True
-    )
     monkeypatch.setattr(BaseSpecWorker, "verify", fail_verify)
     monkeypatch.setattr(
         draft_extend_fused,
@@ -962,8 +703,13 @@ def test_base_spec_worker_routes_fixed_greedy_decode_to_fused_round(monkeypatch)
 
     worker = object.__new__(BaseSpecWorker)
     worker._draft_worker = _DraftWorker()
+    worker.topk = 1
+    worker.speculative_num_steps = 3
+    worker.speculative_num_draft_tokens = 4
     batch = SimpleNamespace(
         forward_mode=_ForwardMode(),
+        sampling_info=_SamplingInfo(),
+        seq_lens=np.ones((64,), dtype=np.int32),
         logits_indices_selector=np.array([0, 2], dtype=np.int32),
         spec_info_padded=SimpleNamespace(
             allocate_lens=np.array([10, 11, 12, 13], dtype=np.int32),
@@ -974,14 +720,14 @@ def test_base_spec_worker_routes_fixed_greedy_decode_to_fused_round(monkeypatch)
 
     assert out == "batch-output"
     assert calls == [("fused_round", (10, 12))]
-    assert batch.use_fused_greedy_decode_step3 is True
+    assert batch.use_fused_greedy_decode is True
 
 
 def test_base_spec_worker_verify_rejects_direct_fixed_greedy_route():
     from sgl_jax.srt.speculative.base_worker import BaseSpecWorker
 
     worker = object.__new__(BaseSpecWorker)
-    batch = SimpleNamespace(use_fused_greedy_decode_step3=True)
+    batch = SimpleNamespace(use_fused_greedy_decode=True)
 
     with pytest.raises(RuntimeError, match="must enter the whole-round fused path"):
         worker.verify(batch, np.array([1], dtype=np.int32))
@@ -1206,11 +952,3 @@ def test_eagle_draft_topk1_keeps_device_chain_builder_for_device_inputs(monkeypa
     assert len(calls) == 1
     np.testing.assert_array_equal(np.asarray(calls[0][2]), np.array([7, 11], dtype=np.int32))
     assert isinstance(batch.spec_info_padded.draft_token, jax.Array)
-
-
-def test_obsolete_step3_entrypoint_is_removed():
-    from sgl_jax.srt.speculative import draft_extend_fused
-
-    assert not hasattr(draft_extend_fused, "draft_extend_for_decode_fused_step3")
-    assert not hasattr(draft_extend_fused, "_draft_extend_for_decode_fused_step3_impl")
-    assert not hasattr(draft_extend_fused, "_build_fused_greedy_step3_draft_extend_jit")

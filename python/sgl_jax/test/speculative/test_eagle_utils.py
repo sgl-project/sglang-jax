@@ -285,19 +285,10 @@ class TestVerifyTree(CustomTestCase):
         accept_index = jnp.full((bs, num_spec_step), -1, dtype=jnp.int32)  # mutable
         accept_token_num = jnp.full((bs,), 0, dtype=jnp.int32)  # mutable
 
-        # # for compatibility, 0.6.3 need to use use_mesh. set_mesh is not have __entry__ attribute.
-        # # on jax >=0.7.1, we need to use set_mesh.
         from sgl_jax.srt.utils.mesh_utils import create_device_mesh
 
         mesh = create_device_mesh(ici_parallelism=[-1, 1], dcn_parallelism=[1, 1])
-        try:
-            ctx = jax.sharding.use_mesh(mesh)
-        except AttributeError:
-            try:
-                ctx = jax.set_mesh(mesh)
-            except AttributeError:
-                ctx = mesh
-        with ctx:
+        with jax.set_mesh(mesh):
             accept_index, accept_token_num, predicts = verify_tree_greedy(
                 speculative_num_steps=4,
                 num_draft_tokens=6,
