@@ -31,6 +31,31 @@ from sgl_jax.utils import get_exception_traceback
 logger = logging.getLogger(__name__)
 
 
+def _iter_padded_input_logprob_reqs(model_worker_batch, padded_rows: int):
+    """Yield (slot, row_offset, pruned_len) per req, in DP-rank-then-req order.
+
+    On the padded path the `input_*` device arrays are `dp_size` equal sections
+    of `per_dp_token = padded_rows // dp_size`, with each rank's valid rows packed
+    at its section start — so rank `d` req `r` lives at `[d*per_dp_token + cum, +plen)`.
+    `slot = d*per_dp_bs + r` indexes the DP-interleaved per-req lists; pruned
+    lengths are rebuilt from extend_seq_lens/extend_logprob_start_lens, since
+    extend_logprob_pruned_lens_cpu is nulled on the padded path.
+    """
+    dp_size = model_worker_batch.dp_size
+    per_dp_bs = model_worker_batch.per_dp_bs_size
+    per_dp_token = padded_rows // dp_size
+    eseq = model_worker_batch.extend_seq_lens
+    estart = model_worker_batch.extend_logprob_start_lens
+    for d in range(dp_size):
+        base = d * per_dp_token
+        cum = 0
+        for r in range(model_worker_batch.real_bs_per_dp[d]):
+            slot = d * per_dp_bs + r
+            plen = max(int(eseq[slot]) - int(estart[slot]), 0)
+            yield slot, base + cum, plen
+            cum += plen
+
+
 class ModelWorker:
     """A tensor parallel model worker."""
 
@@ -435,9 +460,7 @@ class ModelWorker:
                 logits_output.next_token_logprobs = jax.device_get(logprobs)[selector]
         if new_logits_output is not None:
             logits_output = new_logits_output
-            self._materialize_logprobs_to_host(
-                logits_output, model_worker_batch, logits_metadata, selector
-            )
+            self._materialize_logprobs_to_host(logits_output, model_worker_batch, selector)
 
         return (
             logits_output,
@@ -449,18 +472,18 @@ class ModelWorker:
         self,
         logits_output: LogitsProcessorOutput,
         model_worker_batch: ModelWorkerBatch,
-        logits_metadata: LogitsMetadata,
         selector: np.ndarray,
     ):
         """Reorder + per-req split logprob tensors from device to host lists.
 
         `next_token_*` tensors are batch-major and routed through `selector`
         to recover original-req order. `input_*` tensors are per prompt-token
-        in DP-rank-then-req order which already matches the original-req
-        order, so they are split directly using `extend_logprob_pruned_lens_cpu`.
-        Per-req `top_logprobs_nums` / `token_ids_logprobs` give the trim k_i /
-        gather columns. Output shape is `list[list[float]]` per req, matching
-        the consumer contract in `scheduler_output_processor_mixin`.
+        in DP-rank-then-req order which already matches the original-req order,
+        so they are split via `_iter_padded_input_logprob_reqs` (per-dp padded
+        sections; per-req pruned lengths reconstructed from the batch). Per-req
+        `top_logprobs_nums` / `token_ids_logprobs` give the trim k_i / gather
+        columns. Output shape is `list[list[float]]` per req, matching the
+        consumer contract in `scheduler_output_processor_mixin`.
         """
 
         def gather(arr, *, as_float=False):
@@ -500,40 +523,39 @@ class ModelWorker:
             logits_output.next_token_token_ids_logprobs_val = per_req_vals
             logits_output.next_token_token_ids_logprobs_idx = per_req_idxs
 
-        pruned_lens = logits_metadata.extend_logprob_pruned_lens_cpu
-
+        # input_* per-token logprobs use the padded layout; split per req via the
+        # helper. (A dp>1 tight fallback never reaches here — it crashes earlier
+        # at the sharded slice; dp=1 is a single section, base 0.)
         if logits_output.input_top_logprobs_val is not None:
             vals = jax.device_get(logits_output.input_top_logprobs_val.astype(jnp.float32))
             idxs = jax.device_get(logits_output.input_top_logprobs_idx)
             per_req_vals, per_req_idxs = [], []
-            pt = 0
-            for k, plen in zip(logits_metadata.top_logprobs_nums, pruned_lens):
+            for slot, off, plen in _iter_padded_input_logprob_reqs(
+                model_worker_batch, vals.shape[0]
+            ):
+                k = top_nums[slot] if top_nums else 0
                 if plen <= 0:
                     per_req_vals.append([])
                     per_req_idxs.append([])
                     continue
-                per_req_vals.append(vals[pt : pt + plen, :k].tolist())
-                per_req_idxs.append(idxs[pt : pt + plen, :k].tolist())
-                pt += plen
+                per_req_vals.append(vals[off : off + plen, :k].tolist())
+                per_req_idxs.append(idxs[off : off + plen, :k].tolist())
             logits_output.input_top_logprobs_val = per_req_vals
             logits_output.input_top_logprobs_idx = per_req_idxs
 
         if logits_output.input_token_ids_logprobs_val is not None:
             full = jax.device_get(logits_output.input_token_ids_logprobs_val.astype(jnp.float32))
             per_req_vals, per_req_idxs = [], []
-            pt = 0
-            for ids, plen in zip(logits_metadata.token_ids_logprobs, pruned_lens):
-                if plen <= 0:
+            for slot, off, plen in _iter_padded_input_logprob_reqs(
+                model_worker_batch, full.shape[0]
+            ):
+                ids = tok_ids[slot] if tok_ids else None
+                if plen <= 0 or not ids:
                     per_req_vals.append([])
                     per_req_idxs.append([])
                     continue
-                if ids:
-                    per_req_vals.append(full[pt : pt + plen][:, ids].tolist())
-                    per_req_idxs.append([list(ids) for _ in range(plen)])
-                else:
-                    per_req_vals.append([])
-                    per_req_idxs.append([])
-                pt += plen
+                per_req_vals.append(full[off : off + plen][:, ids].tolist())
+                per_req_idxs.append([list(ids) for _ in range(plen)])
             logits_output.input_token_ids_logprobs_val = per_req_vals
             logits_output.input_token_ids_logprobs_idx = per_req_idxs
 

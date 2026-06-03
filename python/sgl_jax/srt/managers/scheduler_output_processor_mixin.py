@@ -123,16 +123,19 @@ class SchedulerOutputProcessorMixin:
                 logits_output.next_token_logprobs = jax.device_get(
                     logits_output.next_token_logprobs
                 ).astype(float)
-            if batch.return_logprob:
-                if logits_output.next_token_logprobs is not None:
-                    logits_output.next_token_logprobs = jax.device_get(
-                        logits_output.next_token_logprobs
-                    ).astype(float)
-                if logits_output.input_token_logprobs is not None:
-                    logits_output.input_token_logprobs = _materialize_input_token_logprobs(
-                        logits_output.input_token_logprobs,
-                        _input_logprob_lens_per_dp(batch),
-                    )
+            if batch.return_logprob and logits_output.next_token_logprobs is not None:
+                logits_output.next_token_logprobs = jax.device_get(
+                    logits_output.next_token_logprobs
+                ).astype(float)
+
+        # Compact the per-DP padded scalar input_token_logprobs so the logprob_pt
+        # walk below stays aligned. Runs for overlap (resolve_last_batch_result
+        # leaves it flat-padded) and non-overlap; no-op when already compact.
+        if batch.return_logprob and logits_output.input_token_logprobs is not None:
+            logits_output.input_token_logprobs = _materialize_input_token_logprobs(
+                logits_output.input_token_logprobs,
+                _input_logprob_lens_per_dp(batch),
+            )
         hidden_state_offset = 0
         per_dp_bs_size = batch.per_dp_bs_size
 

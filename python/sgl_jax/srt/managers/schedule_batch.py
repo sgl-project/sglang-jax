@@ -2411,13 +2411,11 @@ class ScheduleBatch:
             top_logprobs_nums = None
             token_ids_logprobs = None
 
-        use_padded_input_logprob = (
-            self.forward_mode.is_extend()
-            and not self.enable_overlap
-            and not self.return_hidden_states
-            and not (top_logprobs_nums and any(x > 0 for x in top_logprobs_nums))
-            and not (token_ids_logprobs and any(x is not None for x in token_ids_logprobs))
-        )
+        # extend+logprob always uses the padded path: the legacy fallback slices
+        # hidden_states per req under P("data","tensor") and crashes when the row
+        # count isn't divisible by dp (dp>1). The padded path supports top_logprobs /
+        # token_ids / overlap at any dp. return_hidden_states still falls back.
+        use_padded_input_logprob = self.forward_mode.is_extend() and not self.return_hidden_states
         input_logprob_indices = None
         merged_extend_input_logprob_token_ids = None
         if self.return_logprob:
@@ -2449,16 +2447,16 @@ class ScheduleBatch:
                         local_pt += extend_len
                     token_offset += per_dp_token_padding
             else:
-                # Merge per-DP extend_input_logprob_token_ids (set on info at L1099 when
-                # return_logprob=True). Previously hardcoded None below, which combined
-                # with the new server-side scalar gather caused 'NoneType.reshape' in
-                # LogitsProcessor._select_input_token_logprobs.
+                # Only extend batches have prompt-token logprobs. Overlap also routes
+                # speculated DECODE batches here carrying a stale extend residual;
+                # sharding it over P("data") crashes when len % dp != 0 (dp>=4). Decode
+                # never reads the field, so gate the merge on is_extend().
                 chunks = [
                     info.extend_input_logprob_token_ids
                     for info in self.reqs_info
                     if getattr(info, "extend_input_logprob_token_ids", None) is not None
                 ]
-                if chunks:
+                if chunks and self.forward_mode.is_extend():
                     merged_extend_input_logprob_token_ids = np.concatenate(chunks)
 
         return ModelWorkerBatch(
@@ -2565,6 +2563,10 @@ class ScheduleBatch:
             new_info.reqs = info.reqs  # Shallow copy (list reference)
             new_info.out_cache_loc = info.out_cache_loc
             new_info.decoding_reqs = info.decoding_reqs
+            # process_batch_result compacts per-DP padded input logprobs via
+            # _input_logprob_lens_per_dp, which reads these.
+            new_info.extend_lens = info.extend_lens
+            new_info.extend_logprob_start_lens = info.extend_logprob_start_lens
             copied_reqs_info.append(new_info)
 
         return ScheduleBatch(
