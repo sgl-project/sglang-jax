@@ -289,12 +289,9 @@ def _replicate_for_host_output(value, replicated_sharding):
     return jax.sharding.reshard(value, replicated_sharding)
 
 
-def _topk1_index_from_logits(logits, replicated_sharding):
+def _topk1_index_from_logits(logits):
     topk_idx = jnp.argmax(logits, axis=-1).astype(jnp.int32)[:, None]
     topk_p = jnp.ones(topk_idx.shape, dtype=logits.dtype)
-    if replicated_sharding is not None:
-        topk_idx = jax.sharding.reshard(topk_idx, replicated_sharding)
-        topk_p = jax.sharding.reshard(topk_p, replicated_sharding)
     return topk_p, topk_idx
 
 
@@ -402,6 +399,8 @@ def _build_fused_greedy_verify_step3_jit(num_layers: int, topk: int):
             "num_layers",
             "speculative_num_steps",
             "speculative_num_draft_tokens",
+            "return_target_logits",
+            "return_target_hidden",
         ],
     )
     def fused_greedy_verify_step3(
@@ -423,6 +422,8 @@ def _build_fused_greedy_verify_step3_jit(num_layers: int, topk: int):
         num_layers,
         speculative_num_steps,
         speculative_num_draft_tokens,
+        return_target_logits,
+        return_target_hidden,
     ):
         target_bs = target_forward_batch.seq_lens.shape[0]
         (
@@ -509,8 +510,7 @@ def _build_fused_greedy_verify_step3_jit(num_layers: int, topk: int):
 
             sh = jax.typeof(output.next_token_logits).sharding
             mesh = sh.mesh if isinstance(sh, NamedSharding) else mesh
-            rep = NamedSharding(mesh, P()) if mesh is not None else None
-            topk_p, topk_idx = _topk1_index_from_logits(output.next_token_logits, rep)
+            topk_p, topk_idx = _topk1_index_from_logits(output.next_token_logits)
             rep_hidden = output.hidden_states
 
             if i == 0:
@@ -529,6 +529,8 @@ def _build_fused_greedy_verify_step3_jit(num_layers: int, topk: int):
 
         stacked_p = jnp.stack(all_topk_p, axis=1)
         stacked_idx = jnp.stack(all_topk_index, axis=1)
+        target_logits_for_host = target_logits if return_target_logits else None
+        target_hidden_for_host = target_hidden if return_target_hidden else None
         if mesh is not None:
             rep = NamedSharding(mesh, P())
             layer0_hidden = _replicate_for_host_output(layer0_hidden, rep)
@@ -539,8 +541,10 @@ def _build_fused_greedy_verify_step3_jit(num_layers: int, topk: int):
             prepared_accept_lens = _replicate_for_host_output(prepared.accept_lens, rep)
             prepared_new_seq_lens = _replicate_for_host_output(prepared.new_seq_lens, rep)
             prepared_predict = _replicate_for_host_output(prepared.predict, rep)
-            target_logits = _replicate_for_host_output(target_logits, rep)
-            target_hidden = _replicate_for_host_output(target_hidden, rep)
+            if return_target_logits:
+                target_logits_for_host = _replicate_for_host_output(target_logits, rep)
+            if return_target_hidden:
+                target_hidden_for_host = _replicate_for_host_output(target_hidden, rep)
         else:
             prepared_select_index = prepared.select_index
             prepared_verified_id = prepared.verified_id
@@ -559,8 +563,8 @@ def _build_fused_greedy_verify_step3_jit(num_layers: int, topk: int):
             prepared_accept_lens,
             prepared_new_seq_lens,
             prepared_predict,
-            target_logits,
-            target_hidden,
+            target_logits_for_host,
+            target_hidden_for_host,
         )
 
     return fused_greedy_verify_step3
@@ -907,6 +911,11 @@ def fused_greedy_verify_and_draft_extend_for_decode(
         draft_worker, model_worker_batch
     )
     spec_info = model_worker_batch.spec_info_padded
+    return_target_logits = bool(
+        getattr(model_worker_batch, "return_logprob", False)
+        or getattr(model_worker_batch, "return_output_logprob_only", False)
+    )
+    return_target_hidden = bool(getattr(model_worker_batch, "return_hidden_states", False))
 
     spec_info.allocate_lens = cur_allocate_lens
     spec_info.prepare_for_verify(model_worker_batch, spec_worker.page_size, target_worker)
@@ -1011,6 +1020,8 @@ def fused_greedy_verify_and_draft_extend_for_decode(
             num_layers=draft_worker.speculative_num_steps,
             speculative_num_steps=draft_worker.speculative_num_steps,
             speculative_num_draft_tokens=draft_worker.speculative_num_draft_tokens,
+            return_target_logits=return_target_logits,
+            return_target_hidden=return_target_hidden,
         )
 
     target_mr.memory_pools.replace_all(target_pool_updates)
