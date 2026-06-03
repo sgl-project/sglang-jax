@@ -271,13 +271,6 @@ def _gather_rows_preserve_sharding(values, index):
     return values[index, :]
 
 
-def _gather_1d_preserve_sharding(values, index):
-    sharding = jax.typeof(values).sharding
-    if isinstance(sharding, NamedSharding) and not sharding.mesh.empty:
-        return values.at[index].get(out_sharding=sharding.spec)
-    return values[index]
-
-
 def _topk1_index_from_logits(logits):
     topk_idx = jnp.argmax(logits, axis=-1).astype(jnp.int32)[:, None]
     return topk_idx
@@ -512,16 +505,12 @@ def _build_fused_greedy_verify_step3_jit(num_layers: int, topk: int):
         selected_layer0_hidden = _gather_rows_preserve_sharding(
             layer0_hidden, prepared.select_index
         )
-        selected_verified_id = _gather_1d_preserve_sharding(
-            prepared.verified_id, prepared.select_index
-        )
         target_logits_for_host = target_logits if return_target_logits else None
         target_hidden_for_host = target_hidden if return_target_hidden else None
         if mesh is not None:
             rep = NamedSharding(mesh, P())
             selected_layer0_hidden = _replicate_for_host_output(selected_layer0_hidden, rep)
             stacked_idx = _replicate_for_host_output(stacked_idx, rep)
-            selected_verified_id = _replicate_for_host_output(selected_verified_id, rep)
             prepared_accept_lens = _replicate_for_host_output(prepared.accept_lens, rep)
             prepared_new_seq_lens = _replicate_for_host_output(prepared.new_seq_lens, rep)
             prepared_predict = _replicate_for_host_output(prepared.predict, rep)
@@ -539,7 +528,6 @@ def _build_fused_greedy_verify_step3_jit(num_layers: int, topk: int):
             stacked_idx,
             target_pool_updates,
             tuple(all_pool_updates),
-            selected_verified_id,
             prepared_accept_lens,
             prepared_new_seq_lens,
             prepared_predict,
@@ -837,7 +825,6 @@ def _materialize_fused_greedy_batch_output_for_scheduler(
     real_bs,
     layer0_hidden,
     topk_index_stacked,
-    selected_verified_id_device,
     accept_lens_device,
     new_seq_lens_device,
     predict_device,
@@ -850,8 +837,6 @@ def _materialize_fused_greedy_batch_output_for_scheduler(
     with jax.profiler.TraceAnnotation("fused_greedy_batch_output_d2h"):
         jax.copy_to_host_async(layer0_hidden)
         jax.copy_to_host_async(topk_index_stacked)
-        if hasattr(selected_verified_id_device, "copy_to_host_async"):
-            jax.copy_to_host_async(selected_verified_id_device)
         jax.copy_to_host_async(accept_lens_device)
         jax.copy_to_host_async(new_seq_lens_device)
         jax.copy_to_host_async(predict_device)
@@ -864,13 +849,13 @@ def _materialize_fused_greedy_batch_output_for_scheduler(
         topk_index = np.asarray(topk_index_stacked)[selector]
         batch_output.next_draft_input.topk_p = np.ones(topk_index.shape, dtype=np.float32)
         batch_output.next_draft_input.topk_index = topk_index
-        batch_output.next_draft_input.verified_id = np.asarray(selected_verified_id_device)[
-            selector
-        ]
+        accept_lens = np.asarray(accept_lens_device)
+        predict = np.asarray(predict_device)
+        batch_output.next_draft_input.verified_id = predict[selector, accept_lens[selector] - 1]
         batch_output.next_draft_input.new_seq_lens = np.asarray(new_seq_lens_device)[selector]
         batch_output.allocate_lens = batch_output.allocate_lens[:real_bs]
-        batch_output.accept_lens = np.asarray(accept_lens_device)
-        batch_output.next_token_ids = np.asarray(predict_device)
+        batch_output.accept_lens = accept_lens
+        batch_output.next_token_ids = predict
         return batch_output
 
 
@@ -972,7 +957,6 @@ def fused_greedy_verify_and_draft_extend_for_decode(
             topk_index_stacked,
             target_pool_updates,
             all_pool_updates,
-            selected_verified_id_device,
             accept_lens_device,
             new_seq_lens_device,
             predict_device,
@@ -1010,7 +994,6 @@ def fused_greedy_verify_and_draft_extend_for_decode(
         real_bs=model_worker_batch.real_bs,
         layer0_hidden=layer0_hidden,
         topk_index_stacked=topk_index_stacked,
-        selected_verified_id_device=selected_verified_id_device,
         accept_lens_device=accept_lens_device,
         new_seq_lens_device=new_seq_lens_device,
         predict_device=predict_device,
