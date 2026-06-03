@@ -159,7 +159,20 @@ def benchmark_backend(
 
 
 def main():
-    jax.distributed.initialize()
+    import os
+    coordinator_address = os.environ.get("JAX_COORDINATOR_ADDRESS", None)
+    num_processes = int(os.environ.get("JAX_PROCESS_COUNT", 1))
+    process_id = int(os.environ.get("JAX_PROCESS_INDEX", 0))
+    if coordinator_address:
+        print(f"Initializing JAX distributed explicitly: coordinator={coordinator_address}, num_processes={num_processes}, process_id={process_id}", flush=True)
+        jax.distributed.initialize(
+            coordinator_address=coordinator_address,
+            num_processes=num_processes,
+            process_id=process_id,
+        )
+    else:
+        print("Running tuner in local single-process mode.", flush=True)
+
     if jax.process_index() == 0:
         print("JAX devices:", jax.devices())
         print("Device count:", jax.device_count())
