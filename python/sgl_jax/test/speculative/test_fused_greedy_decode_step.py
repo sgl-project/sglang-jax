@@ -145,6 +145,7 @@ def test_greedy_chain_sample_and_prepare_from_predict_matches_fixed_chain_semant
         np.asarray(prepared.predict[:8]),
         np.array([11, 12, 99, 0, 99, 0, 0, 0], dtype=np.int32),
     )
+    assert prepared.predict.shape == target_predict.shape
     np.testing.assert_array_equal(
         np.asarray(prepared.hidden_states),
         np.asarray(hidden)[np.array([0, 1, 2, 3, 4, 7, 7, 7], dtype=np.int32)],
@@ -210,9 +211,18 @@ def test_fused_greedy_materialize_keeps_scheduler_d2h_in_one_boundary():
     )
     predict = jnp.array(
         [
-            [10, 11, 12, 13, 14],
-            [20, 21, 22, 23, 24],
-            [30, 31, 32, 33, 34],
+            10,
+            11,
+            12,
+            13,
+            20,
+            21,
+            22,
+            23,
+            30,
+            31,
+            32,
+            33,
         ],
         dtype=jnp.int32,
     )
@@ -227,6 +237,7 @@ def test_fused_greedy_materialize_keeps_scheduler_d2h_in_one_boundary():
         topk_index_stacked=topk_index_stacked,
         accept_lens_device=jnp.array([3, 4, 2], dtype=jnp.int32),
         predict_device=predict,
+        speculative_num_draft_tokens=width,
         target_logits=jnp.ones((total_bs * width, 8), dtype=jnp.float32),
         target_hidden=jnp.ones((total_bs * width, hidden_size), dtype=jnp.float32),
     )
@@ -701,7 +712,9 @@ def test_fused_greedy_jit_does_not_return_selected_verified_id_to_host():
 
     assert "selected_verified_id" not in jit_source
     assert "selected_verified_id_device" not in materialize_source
-    assert "predict[selector, accept_lens[selector] - 1]" in materialize_source
+    assert (
+        "selector * speculative_num_draft_tokens + accept_lens[selector] - 1" in materialize_source
+    )
 
 
 def test_fused_greedy_jit_does_not_return_new_seq_lens_to_host():

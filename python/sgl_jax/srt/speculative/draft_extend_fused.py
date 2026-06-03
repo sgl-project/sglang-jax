@@ -167,11 +167,7 @@ def _greedy_sample_and_prepare_draft_inputs_chain_from_predict(
     accept_index_2d = jnp.concatenate([base, accept_index_children], axis=1)
     accept_index = accept_index_2d.reshape(-1)
 
-    predict = jnp.zeros((target_predict.shape[0] + 1,), dtype=jnp.int32)
-    predict = predict.at[: target_predict.shape[0]].set(
-        target_predict,
-        out_sharding=jax.typeof(predict).sharding,
-    )
+    predict = target_predict.astype(jnp.int32).reshape(-1)
     accept_width = speculative_num_steps + 1
     req_ids = jnp.arange(accept_index.shape[0], dtype=jnp.int32) // accept_width
     per_req_last = req_ids * speculative_num_draft_tokens + speculative_num_draft_tokens - 1
@@ -825,6 +821,7 @@ def _materialize_fused_greedy_batch_output_for_scheduler(
     topk_index_stacked,
     accept_lens_device,
     predict_device,
+    speculative_num_draft_tokens,
     target_logits,
     target_hidden,
 ):
@@ -848,7 +845,8 @@ def _materialize_fused_greedy_batch_output_for_scheduler(
         accept_lens = np.asarray(accept_lens_device)
         predict = np.asarray(predict_device)
         seq_lens_host = np.asarray(seq_lens_host)
-        batch_output.next_draft_input.verified_id = predict[selector, accept_lens[selector] - 1]
+        verified_pos = selector * speculative_num_draft_tokens + accept_lens[selector] - 1
+        batch_output.next_draft_input.verified_id = predict[verified_pos]
         batch_output.next_draft_input.new_seq_lens = seq_lens_host[selector] + accept_lens[selector]
         batch_output.allocate_lens = batch_output.allocate_lens[:real_bs]
         batch_output.accept_lens = accept_lens
@@ -993,6 +991,7 @@ def fused_greedy_verify_and_draft_extend_for_decode(
         topk_index_stacked=topk_index_stacked,
         accept_lens_device=accept_lens_device,
         predict_device=predict_device,
+        speculative_num_draft_tokens=draft_worker.speculative_num_draft_tokens,
         target_logits=target_logits,
         target_hidden=target_hidden,
     )
