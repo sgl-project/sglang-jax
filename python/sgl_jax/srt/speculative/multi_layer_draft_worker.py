@@ -76,6 +76,9 @@ class MultiLayerDraftWorker(EagleDraftWorker):
 
         self.num_mtp_layers = self.speculative_num_steps
         assert self.num_mtp_layers > 1
+        assert (
+            self.topk == 1
+        ), f"MultiLayerDraftWorker fused decode requires topk=1, got {self.topk}"
         cfg_mtp = getattr(target_worker.model_config.hf_config, "num_nextn_predict_layers", None)
         # MiMo-style configs omit num_nextn_predict_layers; only enforce equality
         # when the field exists (scheduler routes here iff n_mtp>1 either way).
@@ -107,6 +110,19 @@ class MultiLayerDraftWorker(EagleDraftWorker):
 
         for i, w in enumerate(self._workers):
             w.model_runner.initialize_jit()
+
+        # Share target's SWA index mapping with draft workers. The scheduler
+        # allocates KV pages via the target's SWATokenToKVPoolAllocator which
+        # maintains full_to_swa_index_mapping. Draft workers have independent
+        # allocators whose mappings stay at zero. Without this, draft SWA
+        # attention remaps all page indices to 0 → reads wrong KV data.
+        target_allocator = target_worker.model_runner.token_to_kv_pool_allocator
+        target_swa_mapping = getattr(target_allocator, "full_to_swa_index_mapping", None)
+        if target_swa_mapping is not None:
+            for w in self._workers:
+                object.__setattr__(
+                    w.model_runner.attn_backend, "swa_index_mapping", target_swa_mapping
+                )
 
         (
             self.precompile_token_paddings,
@@ -141,11 +157,11 @@ class MultiLayerDraftWorker(EagleDraftWorker):
         hidden_states = model_worker_batch.spec_info_padded.hidden_states
         bs = model_worker_batch.seq_lens.shape[0]
         step_min_1 = self.speculative_num_steps - 1
-        score_list = jnp.empty((bs, 1 + step_min_1 * self.topk, self.topk))
-        token_list = jnp.empty(
+        score_list = jnp.zeros((bs, 1 + step_min_1 * self.topk, self.topk))
+        token_list = jnp.zeros(
             (bs, self.topk + step_min_1 * self.topk * self.topk), dtype=jnp.int32
         )
-        parents_list = jnp.empty((bs, self.topk + 1 + step_min_1 * self.topk))
+        parents_list = jnp.zeros((bs, self.topk + 1 + step_min_1 * self.topk))
         scores = None
         for i in range(self.speculative_num_steps):
             _, hidden_states, scores, tree_info = select_top_k_tokens(
@@ -272,56 +288,9 @@ class MultiLayerDraftWorker(EagleDraftWorker):
     def draft_extend_for_decode(
         self, model_worker_batch: ModelWorkerBatch, batch_output: GenerationBatchResult
     ) -> None:
-        """Decode-extend across all MTP layers; see draft_extend_for_prefill."""
-        if batch_output.next_draft_input.verified_id.shape[0] <= 0:
-            return
-        target_hidden = batch_output.logits_output.hidden_states
-
-        draft_input = EagleDraftInput(
-            hidden_states=target_hidden, allocate_lens=batch_output.allocate_lens
+        """Decode-extend across all MTP layers — fused single JIT."""
+        from sgl_jax.srt.speculative.draft_extend_fused import (
+            draft_extend_for_decode_fused,
         )
-        mwb, logits_metadata = draft_input.prepare_for_extend_after_verify(
-            model_worker_batch,
-            self.draft_model_runner,
-            batch_output,
-            self.speculative_num_draft_tokens,
-        )
-        if mwb.input_ids.shape[0] <= 0:
-            return
 
-        sel = np.asarray(model_worker_batch.logits_indices_selector)
-        accept_host = np.asarray(jax.device_get(batch_output.accept_lens))
-        assert (accept_host[sel] >= 1).all(), f"accept_length < 1: {accept_host[sel]}"
-        sel_pos = np.clip(accept_host - 1, 0, None).astype(np.int64)
-        mwb.input_ids = np.asarray(jax.device_get(mwb.input_ids)).copy()
-
-        layer0_hidden = None
-        all_topk_p, all_topk_index = [], []
-        for i, w in enumerate(self._workers):
-            mr = w.model_runner
-            mwb.spec_info_padded.hidden_states = target_hidden
-            mr.attn_backend.forward_metadata = mr.attn_backend.get_eagle_forward_metadata(mwb)
-            forward_batch = ForwardBatch.init_new(mwb, mr)
-            logits_output, _, _ = mr.forward(forward_batch, logits_metadata=logits_metadata)
-            if i == 0:
-                layer0_hidden = replicate_to_mesh(self.mesh, logits_output.hidden_states)
-            tp, ti = topk_probs_from_logits(
-                replicate_to_mesh(self.mesh, logits_output.next_token_logits), self.topk
-            )
-            all_topk_p.append(np.asarray(jax.device_get(tp)))
-            all_topk_index.append(np.asarray(jax.device_get(ti)))
-            if i < len(self._workers) - 1:
-                self._rotate_ids(mwb, all_topk_index[-1][:, 0], sel_pos)
-
-        select_index = sel * (self.speculative_num_steps + 1) + accept_host[sel] - 1
-        verified_id_arr = batch_output.next_draft_input.verified_id
-        if hasattr(verified_id_arr, "copy_to_host_async"):
-            jax.copy_to_host_async(verified_id_arr)
-        batch_output.next_draft_input.hidden_states = np.asarray(jax.device_get(layer0_hidden))[
-            select_index
-        ]
-        batch_output.next_draft_input.topk_p = np.stack(all_topk_p, axis=1)[sel]
-        batch_output.next_draft_input.topk_index = np.stack(all_topk_index, axis=1)[sel]
-        batch_output.next_draft_input.verified_id = np.asarray(verified_id_arr)[select_index]
-        batch_output.allocate_lens = batch_output.allocate_lens[: model_worker_batch.real_bs]
-        batch_output.accept_lens = accept_host
+        return draft_extend_for_decode_fused(self, model_worker_batch, batch_output)

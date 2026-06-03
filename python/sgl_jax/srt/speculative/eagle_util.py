@@ -295,6 +295,51 @@ def build_tree_mask_for_draft_decode(
     return jnp.asarray(concatenated, dtype=jnp.int32)
 
 
+def build_chain_verify_inputs(
+    verified_id: np.ndarray,
+    token_list: np.ndarray,
+    seq_lens: np.ndarray,
+    num_verify_tokens: int,
+    batch_size: int,
+) -> np.ndarray:
+    """Build verify inputs for topk=1 (linear chain) without tree mask.
+
+    Returns a single ``(5, bs*n)`` int32 buffer packing all 5 outputs
+    [draft_tokens, positions, retrive_index, retrive_next_token,
+    retrive_next_sibling] so the caller can do **one** ``device_put``
+    instead of five — under multi-host setup each independent P() replicated
+    output triggers a separate allgather (~1.5ms each).
+
+    When topk=1 the draft tree is a simple chain, so causal attention is
+    equivalent to the tree mask.
+    """
+    n = num_verify_tokens
+    bs = batch_size
+    out = np.empty((5, bs * n), dtype=np.int32)
+
+    # row 0: draft_tokens (bs*n,)
+    out[0].reshape(bs, n)[:, 0] = verified_id
+    out[0].reshape(bs, n)[:, 1:] = token_list[:, : n - 1]
+
+    # row 1: positions (bs*n,) = seq_lens[bid] + tid
+    tid_range = np.arange(n, dtype=np.int32)
+    out[1] = (seq_lens.astype(np.int32)[:, None] + tid_range[None, :]).reshape(-1)
+
+    # row 2: retrive_index (bs, n) flattened: bid*n + tid
+    out[2] = np.arange(bs * n, dtype=np.int32)
+
+    # row 3: retrive_next_token (bs, n) flattened: chain → tid+1, last is -1
+    next_token_row = np.empty(n, dtype=np.int32)
+    next_token_row[: n - 1] = np.arange(1, n, dtype=np.int32)
+    next_token_row[n - 1] = -1
+    out[3] = np.broadcast_to(next_token_row, (bs, n)).reshape(-1)
+
+    # row 4: retrive_next_sibling: chain has no siblings, all -1
+    out[4].fill(-1)
+
+    return out
+
+
 def build_tree_kernel_efficient(
     verified_id: jax.Array,
     score_list: jax.Array,
@@ -649,12 +694,14 @@ class EagleDraftInput:
         dtype: np.dtype,
         topk: int,
         capture_hidden_mode: CaptureHiddenMode,
+        num_steps: int = 1,
     ):
+        topk_shape = (0, num_steps, topk) if num_steps > 1 else (0, topk)
         return cls(
             verified_id=np.empty((0,), dtype=np.int32),
             hidden_states=np.empty((0, hidden_size), dtype=dtype),
-            topk_p=np.empty((0, topk), dtype=np.float32),
-            topk_index=np.empty((0, topk), dtype=np.int32),
+            topk_p=np.empty(topk_shape, dtype=np.float32),
+            topk_index=np.empty(topk_shape, dtype=np.int32),
             capture_hidden_mode=capture_hidden_mode,
             accept_length=np.empty((0,), dtype=np.int32),
             accept_length_cpu=np.empty((0,), dtype=np.int32),
@@ -744,8 +791,8 @@ class EagleVerifyInput:
     #: device ``(b*draft_token_num,)`` — flattened draft tokens to verify.
     draft_token: jax.Array
     #: device ``(sum(q_i*kv_i),)`` — tree attention mask; shape participates
-    #: in the JIT cache key.
-    custom_mask: jax.Array
+    #: in the JIT cache key.  ``None`` when topk=1 (chain mode uses causal).
+    custom_mask: jax.Array | None
     #: device ``(b*draft_token_num,)`` — verify positions (follows
     #: ``ForwardBatch`` host/device convention).
     positions: jax.Array
@@ -996,9 +1043,12 @@ class EagleVerifyInput:
                 rng=rng,
             )
 
-        predict = np.asarray(jax.device_get(predict))
-        accept_index = np.asarray(jax.device_get(accept_index))
-        accept_length = np.asarray(jax.device_get(accept_length))
+        for arr in (predict, accept_index, accept_length):
+            if hasattr(arr, "copy_to_host_async"):
+                arr.copy_to_host_async()
+        predict = np.asarray(predict)
+        accept_index = np.asarray(accept_index)
+        accept_length = np.asarray(accept_length)
 
         accept_length = accept_length + 1
         accept_index = accept_index.flatten()

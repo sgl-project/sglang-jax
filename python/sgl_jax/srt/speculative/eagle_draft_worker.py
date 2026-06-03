@@ -20,6 +20,7 @@ from sgl_jax.srt.speculative.base_worker import BaseDraftWorker, replicate_to_me
 from sgl_jax.srt.speculative.eagle_util import (
     EagleDraftInput,
     EagleVerifyInput,
+    build_chain_verify_inputs,
     build_tree_kernel_efficient,
     build_tree_mask_for_draft_decode,
 )
@@ -136,29 +137,52 @@ class EagleDraftWorker(BaseDraftWorker):
         self.padding_for_decode(model_worker_batch)
         score_list, token_list, parents_list = self.draft_forward(model_worker_batch)
         verified_seq_lens = model_worker_batch.seq_lens - 1
-        max_seq_len = int(np.max(verified_seq_lens)) if verified_seq_lens.size > 0 else 1
-        max_context_len = self._pick_context_len(max_seq_len)
-        (
-            tree_mask,
-            position,
-            retrive_index,
-            retrive_next_token,
-            retrive_next_sibling,
-            draft_tokens,
-        ) = build_tree_kernel_efficient(
-            model_worker_batch.spec_info_padded.verified_id,
-            score_list,
-            token_list,
-            parents_list,
-            verified_seq_lens,
-            np.sum(verified_seq_lens),
-            self.topk,
-            self.speculative_num_draft_tokens,
-            max_context_len,
-            model_worker_batch.seq_lens.shape[0],
-            model_worker_batch.speculative_num_steps,
-            self.mesh,
-        )
+        bs = model_worker_batch.seq_lens.shape[0]
+
+        if self.topk == 1:
+            token_list_cpu = np.asarray(jax.device_get(token_list))
+            verified_id_cpu = np.asarray(
+                jax.device_get(model_worker_batch.spec_info_padded.verified_id)
+            )
+            seq_lens_cpu = np.asarray(verified_seq_lens)
+            n = self.speculative_num_draft_tokens
+            packed_np = build_chain_verify_inputs(
+                verified_id_cpu, token_list_cpu, seq_lens_cpu, n, bs
+            )
+            # One allgather instead of five: pack into a single (5, bs*n) buffer,
+            # device_put once, then slice on device (replicated views are free).
+            packed = jax.device_put(packed_np, NamedSharding(self.mesh, P()))
+            draft_tokens = packed[0]
+            position = packed[1]
+            retrive_index = packed[2].reshape(bs, n)
+            retrive_next_token = packed[3].reshape(bs, n)
+            retrive_next_sibling = packed[4].reshape(bs, n)
+            tree_mask = None
+        else:
+            max_seq_len = int(np.max(verified_seq_lens)) if verified_seq_lens.size > 0 else 1
+            max_context_len = self._pick_context_len(max_seq_len)
+            (
+                tree_mask,
+                position,
+                retrive_index,
+                retrive_next_token,
+                retrive_next_sibling,
+                draft_tokens,
+            ) = build_tree_kernel_efficient(
+                model_worker_batch.spec_info_padded.verified_id,
+                score_list,
+                token_list,
+                parents_list,
+                verified_seq_lens,
+                np.sum(verified_seq_lens),
+                self.topk,
+                self.speculative_num_draft_tokens,
+                max_context_len,
+                bs,
+                model_worker_batch.speculative_num_steps,
+                self.mesh,
+            )
+
         model_worker_batch.spec_info_padded = EagleVerifyInput(
             draft_token=draft_tokens,
             custom_mask=tree_mask,
@@ -255,7 +279,9 @@ class EagleDraftWorker(BaseDraftWorker):
             logits_metadata=logits_metadata,
         )
         sel = np.asarray(model_worker_batch.logits_indices_selector)
-        accept_host = np.asarray(jax.device_get(batch_output.accept_lens))
+        if hasattr(batch_output.accept_lens, "copy_to_host_async"):
+            batch_output.accept_lens.copy_to_host_async()
+        accept_host = np.asarray(batch_output.accept_lens)
         select_index = sel * (self.speculative_num_steps + 1) + accept_host[sel] - 1
         rep_logits, rep_hidden = replicate_to_mesh(
             self.mesh, draft_logits_output.next_token_logits, draft_logits_output.hidden_states
@@ -478,42 +504,33 @@ class EagleDraftWorker(BaseDraftWorker):
         return 1 << (max_seq_len - 1).bit_length()
 
     def copy_model_worker_batch_to_cpu(self, model_worker_batch: ModelWorkerBatch):
-        model_worker_batch.input_ids = np.array(
-            jax.device_get(model_worker_batch.input_ids), dtype=model_worker_batch.input_ids.dtype
-        )
-        model_worker_batch.seq_lens = np.array(
-            jax.device_get(model_worker_batch.seq_lens), dtype=model_worker_batch.seq_lens.dtype
-        )
-        model_worker_batch.out_cache_loc = np.array(
-            jax.device_get(model_worker_batch.out_cache_loc),
-            dtype=model_worker_batch.out_cache_loc.dtype,
-        )
-        model_worker_batch.positions = np.array(
-            jax.device_get(model_worker_batch.positions), dtype=model_worker_batch.positions.dtype
-        )
-        model_worker_batch.req_pool_indices = np.array(
-            jax.device_get(model_worker_batch.req_pool_indices),
-            dtype=model_worker_batch.req_pool_indices.dtype,
-        )
-        model_worker_batch.cache_loc = np.array(
-            jax.device_get(model_worker_batch.cache_loc), dtype=model_worker_batch.cache_loc.dtype
-        )
-        model_worker_batch.extend_prefix_lens = (
-            np.array(
-                jax.device_get(model_worker_batch.extend_prefix_lens),
-                dtype=model_worker_batch.extend_prefix_lens.dtype,
-            )
-            if model_worker_batch.extend_prefix_lens is not None
-            else None
-        )
-        model_worker_batch.extend_seq_lens = (
-            np.array(
-                jax.device_get(model_worker_batch.extend_seq_lens),
-                dtype=model_worker_batch.extend_seq_lens.dtype,
-            )
-            if model_worker_batch.extend_seq_lens is not None
-            else None
-        )
+        mwb = model_worker_batch
+        fields = [
+            "input_ids",
+            "seq_lens",
+            "out_cache_loc",
+            "positions",
+            "req_pool_indices",
+            "cache_loc",
+        ]
+        optional = ["extend_prefix_lens", "extend_seq_lens"]
+
+        for name in fields:
+            arr = getattr(mwb, name)
+            if hasattr(arr, "copy_to_host_async"):
+                arr.copy_to_host_async()
+        for name in optional:
+            arr = getattr(mwb, name)
+            if arr is not None and hasattr(arr, "copy_to_host_async"):
+                arr.copy_to_host_async()
+
+        for name in fields:
+            arr = getattr(mwb, name)
+            setattr(mwb, name, np.asarray(arr))
+        for name in optional:
+            arr = getattr(mwb, name)
+            if arr is not None:
+                setattr(mwb, name, np.asarray(arr))
 
     def get_padding_bs(self, real_bs: int) -> int:
         self.precompile_bs_paddings.sort()
