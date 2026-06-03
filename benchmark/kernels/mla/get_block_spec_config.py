@@ -230,6 +230,13 @@ def main():
         kv_lora_rank,
         qk_rope_head_dim,
     ) in enumerate(all_combinations):
+        if jax.process_index() == 0:
+            print(
+                f"\n[Tuner Progress] Tuning combination {i + 1}/{len(all_combinations)}: "
+                f"page_size={page_size}, max_num_batched_tokens={max_num_batched_tokens}, "
+                f"q_head_num={q_head_num}, kv_lora_rank={kv_lora_rank}, qk_rope_head_dim={qk_rope_head_dim}...",
+                flush=True,
+            )
         best_output = inf
         best_config = None
         if is_decode_only(max_num_batched_tokens):
@@ -264,7 +271,8 @@ def main():
         if jax.process_index() == 0 and best_config:
             # Output in python dict format for easy copying to tuned_block_sizes.py
             print(
-                f"('{q_dtype}', '{k_dtype}', {q_head_num}, {kv_lora_rank}, {qk_rope_head_dim}, {page_size}, {max_num_batched_tokens}): ({best_config[0]}, {best_config[1]}),"
+                f"('{q_dtype}', '{k_dtype}', {q_head_num}, {kv_lora_rank}, {qk_rope_head_dim}, {page_size}, {max_num_batched_tokens}): ({best_config[0]}, {best_config[1]}),",
+                flush=True,
             )
 
 
