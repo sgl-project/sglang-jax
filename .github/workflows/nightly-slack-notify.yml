@@ -3,10 +3,11 @@ name: Nightly Slack Notify
 on:
   workflow_run:
     workflows:
-      - "Nightly Test"
       - "Nightly Test Daily"
     types:
       - completed
+    branches:
+      - main
   workflow_dispatch:
     inputs:
       run_id:
@@ -82,7 +83,7 @@ jobs:
             ## Required output
 
             Write a file `ai_bug_analysis.txt` with a concise plain-text
-            summary (max 800 chars total) suitable for inclusion in a Slack
+            summary (max 400 chars total) suitable for inclusion in a Slack
             notification. Use this format — one entry per bug-type job:
 
             *<job_name>*: <1-2 sentence root cause and suggested fix>

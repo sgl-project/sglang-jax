@@ -1,0 +1,40 @@
+name: Post-merge PR Comment
+
+on:
+  workflow_run:
+    workflows:
+      - "PR Test"
+    types:
+      - requested
+    branches:
+      - main
+
+jobs:
+  comment-on-pr:
+    if: >-
+      github.repository == 'sgl-project/sglang-jax'
+      && github.event.workflow_run.event == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Find merged PR and post comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          PR_NUMBER=$(gh api "repos/$REPO/commits/$HEAD_SHA/pulls" \
+            --jq '.[0].number // empty')
+          if [ -z "$PR_NUMBER" ]; then
+            echo "No PR found for commit $HEAD_SHA, skipping."
+            exit 0
+          fi
+          echo "Found PR #$PR_NUMBER for commit ${HEAD_SHA:0:7}"
+          gh pr comment "$PR_NUMBER" --repo "$REPO" \
+            --body ":arrows_counterclockwise: Post-merge test started: [Run #${RUN_ID}](${RUN_URL})"

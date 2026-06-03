@@ -7,23 +7,25 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "utils"))
 from failure_classifier import FAILURE_TYPES, classify_jobs, get_failed_jobs
+from github_output import write_github_output
 
 
-def format_slack_summary(workflow_name, run_url, commit_sha, author, failed_jobs, ai_analysis=""):
-    """Format Slack mrkdwn summary with failure types and per-job links."""
+def format_slack_summary(run_url, commit_sha, author, failed_jobs, ai_analysis=""):
+    """Format compact Slack mrkdwn summary."""
+    display_jobs = [j for j in failed_jobs if not j["name"].endswith("-finish")]
     short_sha = commit_sha[:7] if len(commit_sha) >= 7 else commit_sha
-    lines = [":red_circle: *Nightly CI Failure*"]
+    job_word = "job" if len(display_jobs) == 1 else "jobs"
+    lines = [
+        f":red_circle: *Nightly CI Failure* — {len(display_jobs)} {job_word} failed  |  <{run_url}|View run>"
+    ]
+    safe_author = author.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    lines.append(f"`{short_sha}` by {safe_author}")
     lines.append("")
-    lines.append(f"*Workflow:* {workflow_name}")
-    lines.append(f"*Commit:* `{short_sha}` by {author}")
-    lines.append(f"*Run:* <{run_url}|View failed run>")
-    lines.append("")
-    lines.append(f"*Failed jobs ({len(failed_jobs)}):*")
-    for job in failed_jobs:
+    for job in display_jobs:
         ft = FAILURE_TYPES.get(job["failure_type"], FAILURE_TYPES["bug"])
         safe_name = job["name"].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
         safe_name = safe_name.replace("|", "/")
-        lines.append(f"• {ft['emoji']} <{job['html_url']}|{safe_name}> [{ft['label']}]")
+        lines.append(f"• {ft['emoji']} {safe_name} [{ft['label']}]")
 
     if ai_analysis:
         lines.append("")
@@ -34,15 +36,6 @@ def format_slack_summary(workflow_name, run_url, commit_sha, author, failed_jobs
     if len(text) > 2900:
         text = text[:2900].rsplit("\n", 1)[0] + "\n… (truncated)"
     return text
-
-
-def _write_github_output(name, value):
-    """Write a name=value pair to GITHUB_OUTPUT."""
-    output_file = os.environ.get("GITHUB_OUTPUT", "")
-    if output_file:
-        with open(output_file, "a") as f:
-            f.write(f"{name}={value}\n")
-    print(f"  output: {name}={value}")
 
 
 def main():
@@ -88,7 +81,7 @@ def main():
             if args.slack_output:
                 with open(args.slack_output, "w") as f:
                     f.write("")
-            _write_github_output("has_bugs", "false")
+            write_github_output("has_bugs", "false")
             return
 
         print(f"Failed jobs: {', '.join(j['name'] for j in failed_jobs)}")
@@ -98,7 +91,7 @@ def main():
         needs_ai_jobs = [
             j for j in failed_jobs if j["failure_type"] in ("bug", "resource_exhaustion")
         ]
-        _write_github_output("has_bugs", "true" if needs_ai_jobs else "false")
+        write_github_output("has_bugs", "true" if needs_ai_jobs else "false")
 
         classification_data = {
             "failed_jobs": [
@@ -118,7 +111,6 @@ def main():
         print("Classification written to classification.json")
 
     summary = format_slack_summary(
-        args.workflow_name,
         args.run_url,
         args.commit_sha,
         args.commit_author,
