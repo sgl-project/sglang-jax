@@ -208,14 +208,14 @@ def test_fused_greedy_materialize_keeps_scheduler_d2h_in_one_boundary():
         next_token_ids=None,
     )
     predict = jnp.arange(bs * (width + 1), dtype=jnp.int32).reshape(bs, width + 1)
+    topk_index_stacked = jnp.arange(bs * 3, dtype=jnp.int32).reshape(bs, 3, 1)
 
     out = _materialize_fused_greedy_batch_output_for_scheduler(
         batch_output=batch_output,
         selector=np.array([0, 1], dtype=np.int32),
         real_bs=bs,
         layer0_hidden=jnp.ones((bs, hidden_size), dtype=jnp.float32),
-        topk_p_stacked=jnp.ones((bs, 3, 1), dtype=jnp.float32),
-        topk_index_stacked=jnp.ones((bs, 3, 1), dtype=jnp.int32),
+        topk_index_stacked=topk_index_stacked,
         selected_verified_id_device=jnp.array([0, width], dtype=jnp.int32),
         accept_lens_device=jnp.array([3, 4], dtype=jnp.int32),
         new_seq_lens_device=jnp.array([13, 24], dtype=jnp.int32),
@@ -230,6 +230,11 @@ def test_fused_greedy_materialize_keeps_scheduler_d2h_in_one_boundary():
     np.testing.assert_array_equal(out.accept_lens, np.array([3, 4], dtype=np.int32))
     np.testing.assert_array_equal(
         out.next_draft_input.verified_id, np.array([0, 4], dtype=np.int32)
+    )
+    np.testing.assert_array_equal(out.next_draft_input.topk_index, np.asarray(topk_index_stacked))
+    np.testing.assert_array_equal(
+        out.next_draft_input.topk_p,
+        np.ones(np.asarray(topk_index_stacked).shape, dtype=np.float32),
     )
 
 
@@ -331,7 +336,6 @@ def test_fused_greedy_verify_round_bypasses_split_verify_and_step3(monkeypatch):
         calls.append(("fused_jit", args[0], args[7]))
         return (
             jnp.ones((2, 3), dtype=jnp.float32),
-            jnp.ones((2, 3, 1), dtype=jnp.float32),
             jnp.ones((2, 3, 1), dtype=jnp.int32),
             "target-pool-updates",
             ("draft-pool-updates",),
@@ -508,7 +512,6 @@ def test_fused_greedy_verify_round_builds_topk1_verify_inputs_inside_jit(monkeyp
         np.testing.assert_array_equal(np.asarray(args[-1]), previous_topk_index[:, :, 0])
         return (
             jnp.ones((2, 3), dtype=jnp.float32),
-            jnp.ones((2, 3, 1), dtype=jnp.float32),
             jnp.ones((2, 3, 1), dtype=jnp.int32),
             "target-pool-updates",
             ("draft-pool-updates",),
@@ -663,6 +666,20 @@ def test_topk1_index_helper_does_not_reshard_per_layer_outputs():
     source = inspect.getsource(draft_extend_fused._topk1_index_from_logits)
 
     assert "jax.sharding.reshard" not in source
+
+
+def test_fused_greedy_jit_does_not_return_topk1_probs_to_host():
+    from sgl_jax.srt.speculative import draft_extend_fused
+
+    jit_source = inspect.getsource(draft_extend_fused._build_fused_greedy_verify_step3_jit)
+    materialize_source = inspect.getsource(
+        draft_extend_fused._materialize_fused_greedy_batch_output_for_scheduler
+    )
+
+    assert "all_topk_p" not in jit_source
+    assert "stacked_p" not in jit_source
+    assert "topk_p_stacked" not in materialize_source
+    assert "np.ones(topk_index.shape" in materialize_source
 
 
 def test_fused_greedy_jit_does_not_replicate_target_predict_before_verify():

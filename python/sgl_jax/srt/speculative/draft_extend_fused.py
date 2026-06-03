@@ -280,8 +280,7 @@ def _gather_1d_preserve_sharding(values, index):
 
 def _topk1_index_from_logits(logits):
     topk_idx = jnp.argmax(logits, axis=-1).astype(jnp.int32)[:, None]
-    topk_p = jnp.ones(topk_idx.shape, dtype=logits.dtype)
-    return topk_p, topk_idx
+    return topk_idx
 
 
 def _build_fused_draft_extend_jit(num_layers: int, topk: int):
@@ -469,7 +468,6 @@ def _build_fused_greedy_verify_step3_jit(num_layers: int, topk: int):
             speculative_num_draft_tokens=speculative_num_draft_tokens,
         )
 
-        all_topk_p = []
         all_topk_index = []
         all_pool_updates = []
         layer0_hidden = None
@@ -494,13 +492,12 @@ def _build_fused_greedy_verify_step3_jit(num_layers: int, topk: int):
 
             sh = jax.typeof(output.next_token_logits).sharding
             mesh = sh.mesh if isinstance(sh, NamedSharding) else mesh
-            topk_p, topk_idx = _topk1_index_from_logits(output.next_token_logits)
+            topk_idx = _topk1_index_from_logits(output.next_token_logits)
             rep_hidden = output.hidden_states
 
             if i == 0:
                 layer0_hidden = rep_hidden
 
-            all_topk_p.append(topk_p)
             all_topk_index.append(topk_idx)
 
             if i < num_layers - 1:
@@ -511,7 +508,6 @@ def _build_fused_greedy_verify_step3_jit(num_layers: int, topk: int):
                     topk_idx[:, 0],
                 )
 
-        stacked_p = jnp.stack(all_topk_p, axis=1)
         stacked_idx = jnp.stack(all_topk_index, axis=1)
         selected_layer0_hidden = _gather_rows_preserve_sharding(
             layer0_hidden, prepared.select_index
@@ -524,7 +520,6 @@ def _build_fused_greedy_verify_step3_jit(num_layers: int, topk: int):
         if mesh is not None:
             rep = NamedSharding(mesh, P())
             selected_layer0_hidden = _replicate_for_host_output(selected_layer0_hidden, rep)
-            stacked_p = _replicate_for_host_output(stacked_p, rep)
             stacked_idx = _replicate_for_host_output(stacked_idx, rep)
             selected_verified_id = _replicate_for_host_output(selected_verified_id, rep)
             prepared_accept_lens = _replicate_for_host_output(prepared.accept_lens, rep)
@@ -541,7 +536,6 @@ def _build_fused_greedy_verify_step3_jit(num_layers: int, topk: int):
 
         return (
             selected_layer0_hidden,
-            stacked_p,
             stacked_idx,
             target_pool_updates,
             tuple(all_pool_updates),
@@ -842,7 +836,6 @@ def _materialize_fused_greedy_batch_output_for_scheduler(
     selector,
     real_bs,
     layer0_hidden,
-    topk_p_stacked,
     topk_index_stacked,
     selected_verified_id_device,
     accept_lens_device,
@@ -856,7 +849,6 @@ def _materialize_fused_greedy_batch_output_for_scheduler(
 
     with jax.profiler.TraceAnnotation("fused_greedy_batch_output_d2h"):
         jax.copy_to_host_async(layer0_hidden)
-        jax.copy_to_host_async(topk_p_stacked)
         jax.copy_to_host_async(topk_index_stacked)
         if hasattr(selected_verified_id_device, "copy_to_host_async"):
             jax.copy_to_host_async(selected_verified_id_device)
@@ -869,8 +861,9 @@ def _materialize_fused_greedy_batch_output_for_scheduler(
             hidden_states=target_hidden,
         )
         batch_output.next_draft_input.hidden_states = np.asarray(layer0_hidden)[selector]
-        batch_output.next_draft_input.topk_p = np.asarray(topk_p_stacked)[selector]
-        batch_output.next_draft_input.topk_index = np.asarray(topk_index_stacked)[selector]
+        topk_index = np.asarray(topk_index_stacked)[selector]
+        batch_output.next_draft_input.topk_p = np.ones(topk_index.shape, dtype=np.float32)
+        batch_output.next_draft_input.topk_index = topk_index
         batch_output.next_draft_input.verified_id = np.asarray(selected_verified_id_device)[
             selector
         ]
@@ -976,7 +969,6 @@ def fused_greedy_verify_and_draft_extend_for_decode(
     with ctx:
         (
             layer0_hidden,
-            topk_p_stacked,
             topk_index_stacked,
             target_pool_updates,
             all_pool_updates,
@@ -1017,7 +1009,6 @@ def fused_greedy_verify_and_draft_extend_for_decode(
         selector=np.asarray(model_worker_batch.logits_indices_selector),
         real_bs=model_worker_batch.real_bs,
         layer0_hidden=layer0_hidden,
-        topk_p_stacked=topk_p_stacked,
         topk_index_stacked=topk_index_stacked,
         selected_verified_id_device=selected_verified_id_device,
         accept_lens_device=accept_lens_device,
