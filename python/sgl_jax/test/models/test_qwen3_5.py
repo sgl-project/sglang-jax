@@ -1,6 +1,10 @@
 """Qwen3.5-35B-A3B consolidated CPU test (RFC §4.2).
 
-Uses the local config-only fixture (config.json + safetensors index, no blobs).
+Default fixture is the public HF Hub repo ``Qwen/Qwen3.5-35B-A3B`` — only
+``config.json`` and ``model.safetensors.index.json`` are downloaded (~190 KB,
+no weight blobs). Set ``QWEN3_5_FIXTURE`` to a local directory to override, or
+``QWEN3_5_REVISION`` to pin a commit; if the Hub is unreachable and no local
+fixture is set, the test skips instead of failing.
 CPU-only: validates config aliasing, layer schedule, module wiring/shapes,
 partial M-RoPE construction, and weight-mapping coverage against the real
 safetensors key set. Full numerical correctness is validated by the TPU smoke
@@ -18,16 +22,15 @@ from pathlib import Path
 
 import jax
 import jax.numpy as jnp
+from huggingface_hub import hf_hub_download
 from transformers import AutoConfig
 
 import sgl_jax.srt.hf_transformers_utils  # noqa: F401  (registers Qwen3_5HybridConfig)
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
 
-CKPT_FIXTURE = os.environ.get(
-    "QWEN3_5_FIXTURE",
-    "/Users/yuhao/Desktop/Dev/Primatrix/_Delivery/202605A_sgl_jax_qwen3p5/"
-    "Qwen3p5_all_model_configs/35B_A3B/",
-)
+CKPT_FIXTURE = os.environ.get("QWEN3_5_FIXTURE", "Qwen/Qwen3.5-35B-A3B")
+# Pin a commit for reproducible / offline-cached CI runs (None = latest).
+CKPT_REVISION = os.environ.get("QWEN3_5_REVISION") or None
 
 _mesh = create_device_mesh(
     ici_parallelism=[1, 1], dcn_parallelism=[1, 1], devices=[jax.devices()[0]]
@@ -38,7 +41,19 @@ jax.sharding.set_mesh(_mesh)
 class TestQwen3_5(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.cfg = AutoConfig.from_pretrained(CKPT_FIXTURE, trust_remote_code=False)
+        # Default fixture is a live HF Hub repo (config + index only). If it is
+        # unreachable (offline CI, no cache) and no local QWEN3_5_FIXTURE is set,
+        # skip rather than error -- matches the repo's skipTest idiom for
+        # unavailable resources. OSError is what transformers raises for an
+        # unreachable repo; a real config bug raises ValueError and still fails.
+        try:
+            cls.cfg = AutoConfig.from_pretrained(
+                CKPT_FIXTURE, revision=CKPT_REVISION, trust_remote_code=False
+            )
+        except OSError as e:
+            if os.path.isdir(CKPT_FIXTURE):
+                raise
+            raise unittest.SkipTest(f"Qwen3.5 fixture {CKPT_FIXTURE!r} unavailable: {e}") from e
         cls.mesh = _mesh
 
     # --- 1: config RoPE alias ---
@@ -46,8 +61,12 @@ class TestQwen3_5(unittest.TestCase):
         tc = self.cfg.text_config
         self.assertEqual(type(self.cfg).__name__, "Qwen3_5HybridConfig")
         self.assertEqual(self.cfg.model_type, "qwen3_5_moe")
+        # Subset-only: newer transformers versions inject extra fields
+        # (rope_theta, partial_rotary_factor) into rope_scaling. We only assert
+        # the fields the model actually consumes.
+        keys = ("rope_type", "mrope_section", "mrope_interleaved")
         self.assertEqual(
-            tc.rope_scaling,
+            {k: tc.rope_scaling[k] for k in keys},
             {"rope_type": "default", "mrope_section": [11, 11, 10], "mrope_interleaved": True},
         )
         self.assertEqual(tc.rope_theta, 10000000)
@@ -115,7 +134,18 @@ class TestQwen3_5(unittest.TestCase):
     def test_weight_mapping_covers_ckpt_keys(self):
         from sgl_jax.srt.models.qwen3_5 import _create_qwen3_5_weight_mappings
 
-        idx_path = Path(CKPT_FIXTURE) / "model.safetensors.index.json"
+        # Resolve from local fixture dir if set; otherwise pull just the index
+        # file from the HF Hub repo (no weight blobs).
+        if os.path.isdir(CKPT_FIXTURE):
+            idx_path = Path(CKPT_FIXTURE) / "model.safetensors.index.json"
+        else:
+            idx_path = Path(
+                hf_hub_download(
+                    repo_id=CKPT_FIXTURE,
+                    filename="model.safetensors.index.json",
+                    revision=CKPT_REVISION,
+                )
+            )
         with open(idx_path) as f:
             ckpt_keys = set(json.load(f)["weight_map"].keys())
 
