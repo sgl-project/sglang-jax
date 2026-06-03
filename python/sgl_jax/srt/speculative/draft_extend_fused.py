@@ -23,10 +23,7 @@ from flax import nnx
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from sgl_jax.srt.kernels.speculative.verify_tree_greedy_kernel import (
-    verify_tree_greedy,
-    verify_tree_greedy_pallas_call,
-)
+from sgl_jax.srt.kernels.speculative.verify_tree_greedy_kernel import verify_tree_greedy
 
 logger = logging.getLogger(__name__)
 
@@ -143,60 +140,38 @@ def _greedy_sample_and_prepare_draft_inputs(
     )
 
 
-def _greedy_sample_and_prepare_draft_inputs_from_predict(
+def _greedy_sample_and_prepare_draft_inputs_chain_from_predict(
     *,
     target_hidden,
     positions,
     seq_lens,
     draft_tokens,
-    retrive_index,
-    retrive_next_token,
-    retrive_next_sibling,
     target_predict,
     speculative_num_steps,
     speculative_num_draft_tokens,
 ):
-    bs = retrive_index.shape[0]
-    candidates = draft_tokens.reshape(bs, speculative_num_draft_tokens)
-    predict = jnp.zeros((target_predict.shape[0] + 1,), dtype=jnp.int32)
-    accept_index_2d = jnp.full((bs, speculative_num_steps + 1), -1, dtype=jnp.int32)
-    accept_length_raw = jnp.zeros((bs,), dtype=jnp.int32)
-    in_specs = (
-        P(),  # predicts
-        P(),  # accept_index
-        P(),  # accept_token_num
-        P(),  # candidates
-        P(),  # retrive_index
-        P(),  # retrive_next_token
-        P(),  # retrive_next_sibling
-        P(),  # target_predict
-        None,
-        None,
-    )
-    out_specs = (
-        P(),  # accept_index
-        P(),  # accept_token_num
-        P(),  # predicts
-    )
-    accept_index_2d, accept_length_raw, predict = jax.shard_map(
-        verify_tree_greedy_pallas_call,
-        in_specs=in_specs,
-        out_specs=out_specs,
-        check_vma=False,
-    )(
-        predict,
-        accept_index_2d,
-        accept_length_raw,
-        candidates,
-        retrive_index,
-        retrive_next_token,
-        retrive_next_sibling,
-        target_predict,
-        retrive_index.shape[1],
-        accept_index_2d.shape[1],
-    )
+    bs = seq_lens.shape[0]
+    n = speculative_num_draft_tokens
+    width = speculative_num_steps + 1
+    draft_2d = draft_tokens.reshape(bs, n)
+    target_predict_2d = target_predict.reshape(bs, n)
+
+    child_matches = draft_2d[:, 1:] == target_predict_2d[:, :-1]
+    accepted_children = jnp.cumprod(child_matches.astype(jnp.int32), axis=1).astype(jnp.bool_)
+    accept_length_raw = jnp.sum(accepted_children.astype(jnp.int32), axis=1)
     accept_length = accept_length_raw + 1
+
+    base = jnp.arange(bs, dtype=jnp.int32)[:, None] * n
+    child_offsets = jnp.arange(1, width, dtype=jnp.int32)[None, :]
+    accept_index_children = jnp.where(accepted_children, base + child_offsets, -1)
+    accept_index_2d = jnp.concatenate([base, accept_index_children], axis=1)
     accept_index = accept_index_2d.reshape(-1)
+
+    predict = jnp.zeros((target_predict.shape[0] + 1,), dtype=jnp.int32)
+    predict = predict.at[: target_predict.shape[0]].set(
+        target_predict,
+        out_sharding=jax.typeof(predict).sharding,
+    )
     accept_width = speculative_num_steps + 1
     req_ids = jnp.arange(accept_index.shape[0], dtype=jnp.int32) // accept_width
     per_req_last = req_ids * speculative_num_draft_tokens + speculative_num_draft_tokens - 1
@@ -287,6 +262,20 @@ def _device_rotate_input_ids(input_ids, ext_lens, sel_pos, new_tokens):
 def _replicate_for_host_output(value, replicated_sharding):
     """Move final small scheduler outputs to replicated sharding."""
     return jax.sharding.reshard(value, replicated_sharding)
+
+
+def _gather_rows_preserve_sharding(values, index):
+    sharding = jax.typeof(values).sharding
+    if isinstance(sharding, NamedSharding) and not sharding.mesh.empty:
+        return values.at[index, :].get(out_sharding=sharding.spec)
+    return values[index, :]
+
+
+def _gather_1d_preserve_sharding(values, index):
+    sharding = jax.typeof(values).sharding
+    if isinstance(sharding, NamedSharding) and not sharding.mesh.empty:
+        return values.at[index].get(out_sharding=sharding.spec)
+    return values[index]
 
 
 def _topk1_index_from_logits(logits):
@@ -469,17 +458,12 @@ def _build_fused_greedy_verify_step3_jit(num_layers: int, topk: int):
         target_logits = target_output.next_token_logits
         target_hidden = target_output.hidden_states
         target_predict = jnp.argmax(target_logits, axis=-1).astype(jnp.int32).reshape(-1)
-        if rep is not None:
-            target_predict = jax.sharding.reshard(target_predict, rep)
 
-        prepared = _greedy_sample_and_prepare_draft_inputs_from_predict(
+        prepared = _greedy_sample_and_prepare_draft_inputs_chain_from_predict(
             target_hidden=target_hidden,
             positions=target_forward_batch.positions,
             seq_lens=target_forward_batch.seq_lens,
             draft_tokens=draft_tokens,
-            retrive_index=retrive_index,
-            retrive_next_token=retrive_next_token,
-            retrive_next_sibling=retrive_next_sibling,
             target_predict=target_predict,
             speculative_num_steps=speculative_num_steps,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
@@ -529,15 +513,20 @@ def _build_fused_greedy_verify_step3_jit(num_layers: int, topk: int):
 
         stacked_p = jnp.stack(all_topk_p, axis=1)
         stacked_idx = jnp.stack(all_topk_index, axis=1)
+        selected_layer0_hidden = _gather_rows_preserve_sharding(
+            layer0_hidden, prepared.select_index
+        )
+        selected_verified_id = _gather_1d_preserve_sharding(
+            prepared.verified_id, prepared.select_index
+        )
         target_logits_for_host = target_logits if return_target_logits else None
         target_hidden_for_host = target_hidden if return_target_hidden else None
         if mesh is not None:
             rep = NamedSharding(mesh, P())
-            layer0_hidden = _replicate_for_host_output(layer0_hidden, rep)
+            selected_layer0_hidden = _replicate_for_host_output(selected_layer0_hidden, rep)
             stacked_p = _replicate_for_host_output(stacked_p, rep)
             stacked_idx = _replicate_for_host_output(stacked_idx, rep)
-            prepared_select_index = _replicate_for_host_output(prepared.select_index, rep)
-            prepared_verified_id = _replicate_for_host_output(prepared.verified_id, rep)
+            selected_verified_id = _replicate_for_host_output(selected_verified_id, rep)
             prepared_accept_lens = _replicate_for_host_output(prepared.accept_lens, rep)
             prepared_new_seq_lens = _replicate_for_host_output(prepared.new_seq_lens, rep)
             prepared_predict = _replicate_for_host_output(prepared.predict, rep)
@@ -546,20 +535,17 @@ def _build_fused_greedy_verify_step3_jit(num_layers: int, topk: int):
             if return_target_hidden:
                 target_hidden_for_host = _replicate_for_host_output(target_hidden, rep)
         else:
-            prepared_select_index = prepared.select_index
-            prepared_verified_id = prepared.verified_id
             prepared_accept_lens = prepared.accept_lens
             prepared_new_seq_lens = prepared.new_seq_lens
             prepared_predict = prepared.predict
 
         return (
-            layer0_hidden,
+            selected_layer0_hidden,
             stacked_p,
             stacked_idx,
             target_pool_updates,
             tuple(all_pool_updates),
-            prepared_select_index,
-            prepared_verified_id,
+            selected_verified_id,
             prepared_accept_lens,
             prepared_new_seq_lens,
             prepared_predict,
@@ -858,8 +844,7 @@ def _materialize_fused_greedy_batch_output_for_scheduler(
     layer0_hidden,
     topk_p_stacked,
     topk_index_stacked,
-    select_index_device,
-    verified_id_device,
+    selected_verified_id_device,
     accept_lens_device,
     new_seq_lens_device,
     predict_device,
@@ -870,25 +855,25 @@ def _materialize_fused_greedy_batch_output_for_scheduler(
     from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
 
     with jax.profiler.TraceAnnotation("fused_greedy_batch_output_d2h"):
-        if hasattr(verified_id_device, "copy_to_host_async"):
-            jax.copy_to_host_async(verified_id_device)
         jax.copy_to_host_async(layer0_hidden)
         jax.copy_to_host_async(topk_p_stacked)
         jax.copy_to_host_async(topk_index_stacked)
-        jax.copy_to_host_async(select_index_device)
+        if hasattr(selected_verified_id_device, "copy_to_host_async"):
+            jax.copy_to_host_async(selected_verified_id_device)
         jax.copy_to_host_async(accept_lens_device)
         jax.copy_to_host_async(new_seq_lens_device)
         jax.copy_to_host_async(predict_device)
 
-        select_index = np.asarray(select_index_device)[selector]
         batch_output.logits_output = LogitsProcessorOutput(
             next_token_logits=target_logits,
             hidden_states=target_hidden,
         )
-        batch_output.next_draft_input.hidden_states = np.asarray(layer0_hidden)[select_index]
+        batch_output.next_draft_input.hidden_states = np.asarray(layer0_hidden)[selector]
         batch_output.next_draft_input.topk_p = np.asarray(topk_p_stacked)[selector]
         batch_output.next_draft_input.topk_index = np.asarray(topk_index_stacked)[selector]
-        batch_output.next_draft_input.verified_id = np.asarray(verified_id_device)[select_index]
+        batch_output.next_draft_input.verified_id = np.asarray(selected_verified_id_device)[
+            selector
+        ]
         batch_output.next_draft_input.new_seq_lens = np.asarray(new_seq_lens_device)[selector]
         batch_output.allocate_lens = batch_output.allocate_lens[:real_bs]
         batch_output.accept_lens = np.asarray(accept_lens_device)
@@ -995,8 +980,7 @@ def fused_greedy_verify_and_draft_extend_for_decode(
             topk_index_stacked,
             target_pool_updates,
             all_pool_updates,
-            select_index_device,
-            verified_id_device,
+            selected_verified_id_device,
             accept_lens_device,
             new_seq_lens_device,
             predict_device,
@@ -1035,8 +1019,7 @@ def fused_greedy_verify_and_draft_extend_for_decode(
         layer0_hidden=layer0_hidden,
         topk_p_stacked=topk_p_stacked,
         topk_index_stacked=topk_index_stacked,
-        select_index_device=select_index_device,
-        verified_id_device=verified_id_device,
+        selected_verified_id_device=selected_verified_id_device,
         accept_lens_device=accept_lens_device,
         new_seq_lens_device=new_seq_lens_device,
         predict_device=predict_device,

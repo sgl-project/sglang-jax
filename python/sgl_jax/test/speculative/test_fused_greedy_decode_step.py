@@ -108,6 +108,49 @@ def test_greedy_sample_and_prepare_draft_inputs_calls_verify_inside(monkeypatch)
     )
 
 
+def test_greedy_chain_sample_and_prepare_from_predict_matches_fixed_chain_semantics():
+    from sgl_jax.srt.speculative.draft_extend_fused import (
+        _greedy_sample_and_prepare_draft_inputs_chain_from_predict,
+    )
+
+    hidden = jnp.arange(8 * 5, dtype=jnp.float32).reshape(8, 5)
+    positions = jnp.arange(8, dtype=jnp.int32) + 100
+    seq_lens = jnp.array([10, 20], dtype=jnp.int32)
+    draft_tokens = jnp.array([10, 11, 12, 13, 20, 21, 22, 23], dtype=jnp.int32)
+    target_predict = jnp.array([11, 12, 99, 0, 99, 0, 0, 0], dtype=jnp.int32)
+
+    prepared = _greedy_sample_and_prepare_draft_inputs_chain_from_predict(
+        target_hidden=hidden,
+        positions=positions,
+        seq_lens=seq_lens,
+        draft_tokens=draft_tokens,
+        target_predict=target_predict,
+        speculative_num_steps=3,
+        speculative_num_draft_tokens=4,
+    )
+
+    np.testing.assert_array_equal(
+        np.asarray(prepared.accept_lens),
+        np.array([3, 1], dtype=np.int32),
+    )
+    np.testing.assert_array_equal(
+        np.asarray(prepared.select_index),
+        np.array([2, 4], dtype=np.int32),
+    )
+    np.testing.assert_array_equal(
+        np.asarray(prepared.verified_id),
+        np.array([11, 12, 99, 0, 99, 0, 0, 0], dtype=np.int32),
+    )
+    np.testing.assert_array_equal(
+        np.asarray(prepared.predict[:8]),
+        np.array([11, 12, 99, 0, 99, 0, 0, 0], dtype=np.int32),
+    )
+    np.testing.assert_array_equal(
+        np.asarray(prepared.hidden_states),
+        np.asarray(hidden)[np.array([0, 1, 2, 3, 4, 7, 7, 7], dtype=np.int32)],
+    )
+
+
 def test_step3_logits_metadata_can_skip_placeholder_accept_lens(monkeypatch):
     from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
     from sgl_jax.srt.speculative import draft_extend_fused
@@ -170,11 +213,10 @@ def test_fused_greedy_materialize_keeps_scheduler_d2h_in_one_boundary():
         batch_output=batch_output,
         selector=np.array([0, 1], dtype=np.int32),
         real_bs=bs,
-        layer0_hidden=jnp.ones((bs * width, hidden_size), dtype=jnp.float32),
+        layer0_hidden=jnp.ones((bs, hidden_size), dtype=jnp.float32),
         topk_p_stacked=jnp.ones((bs, 3, 1), dtype=jnp.float32),
         topk_index_stacked=jnp.ones((bs, 3, 1), dtype=jnp.int32),
-        select_index_device=jnp.array([0, width], dtype=jnp.int32),
-        verified_id_device=jnp.arange(bs * width, dtype=jnp.int32),
+        selected_verified_id_device=jnp.array([0, width], dtype=jnp.int32),
         accept_lens_device=jnp.array([3, 4], dtype=jnp.int32),
         new_seq_lens_device=jnp.array([13, 24], dtype=jnp.int32),
         predict_device=predict,
@@ -186,6 +228,9 @@ def test_fused_greedy_materialize_keeps_scheduler_d2h_in_one_boundary():
     np.testing.assert_array_equal(out.next_token_ids, np.asarray(predict))
     assert isinstance(out.accept_lens, np.ndarray)
     np.testing.assert_array_equal(out.accept_lens, np.array([3, 4], dtype=np.int32))
+    np.testing.assert_array_equal(
+        out.next_draft_input.verified_id, np.array([0, 4], dtype=np.int32)
+    )
 
 
 def test_fused_greedy_verify_round_bypasses_split_verify_and_step3(monkeypatch):
@@ -285,13 +330,12 @@ def test_fused_greedy_verify_round_bypasses_split_verify_and_step3(monkeypatch):
     def fake_fused_jit(*args, **kwargs):
         calls.append(("fused_jit", args[0], args[7]))
         return (
-            jnp.ones((8, 3), dtype=jnp.float32),
+            jnp.ones((2, 3), dtype=jnp.float32),
             jnp.ones((2, 3, 1), dtype=jnp.float32),
             jnp.ones((2, 3, 1), dtype=jnp.int32),
             "target-pool-updates",
             ("draft-pool-updates",),
             jnp.array([0, 4], dtype=jnp.int32),
-            jnp.arange(8, dtype=jnp.int32),
             jnp.array([3, 3], dtype=jnp.int32),
             jnp.array([13, 23], dtype=jnp.int32),
             jnp.ones((2, 5), dtype=jnp.int32),
@@ -463,13 +507,12 @@ def test_fused_greedy_verify_round_builds_topk1_verify_inputs_inside_jit(monkeyp
         np.testing.assert_array_equal(np.asarray(args[-2]), previous_verified_id)
         np.testing.assert_array_equal(np.asarray(args[-1]), previous_topk_index[:, :, 0])
         return (
-            jnp.ones((8, 3), dtype=jnp.float32),
+            jnp.ones((2, 3), dtype=jnp.float32),
             jnp.ones((2, 3, 1), dtype=jnp.float32),
             jnp.ones((2, 3, 1), dtype=jnp.int32),
             "target-pool-updates",
             ("draft-pool-updates",),
             jnp.array([0, 4], dtype=jnp.int32),
-            jnp.arange(8, dtype=jnp.int32),
             jnp.array([3, 3], dtype=jnp.int32),
             jnp.array([13, 23], dtype=jnp.int32),
             jnp.ones((2, 5), dtype=jnp.int32),
@@ -620,6 +663,38 @@ def test_topk1_index_helper_does_not_reshard_per_layer_outputs():
     source = inspect.getsource(draft_extend_fused._topk1_index_from_logits)
 
     assert "jax.sharding.reshard" not in source
+
+
+def test_fused_greedy_jit_does_not_replicate_target_predict_before_verify():
+    from sgl_jax.srt.speculative import draft_extend_fused
+
+    source = inspect.getsource(draft_extend_fused._build_fused_greedy_verify_step3_jit)
+
+    assert "target_predict = jax.sharding.reshard" not in source
+    assert "verify_tree_greedy_pallas_call" not in source
+
+
+def test_fused_greedy_module_does_not_import_pallas_verify_for_fixed_chain():
+    from sgl_jax.srt.speculative import draft_extend_fused
+
+    source = inspect.getsource(draft_extend_fused)
+
+    assert "verify_tree_greedy_pallas_call" not in source
+
+
+def test_fused_greedy_selects_next_draft_rows_before_host_materialize():
+    from sgl_jax.srt.speculative import draft_extend_fused
+
+    jit_source = inspect.getsource(draft_extend_fused._build_fused_greedy_verify_step3_jit)
+    materialize_source = inspect.getsource(
+        draft_extend_fused._materialize_fused_greedy_batch_output_for_scheduler
+    )
+
+    assert "selected_layer0_hidden" in jit_source
+    assert "selected_verified_id" in jit_source
+    assert "select_index_device" not in materialize_source
+    assert "np.asarray(layer0_hidden)[select_index]" not in materialize_source
+    assert "np.asarray(verified_id_device)[select_index]" not in materialize_source
 
 
 class _SamplingInfo:
