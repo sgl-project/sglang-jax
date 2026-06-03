@@ -3,6 +3,7 @@ from math import inf
 import sys
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 from utils import create_decode_uniform_data, create_prefill_uniform_data
 
