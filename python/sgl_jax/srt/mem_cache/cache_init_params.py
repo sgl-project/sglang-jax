@@ -10,12 +10,10 @@ if TYPE_CHECKING:
 
 @dataclasses.dataclass
 class CacheInitParams:
-    disable: bool
     req_to_token_pool: ReqToTokenPool
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
     page_size: int
 
     is_eagle: bool = False
 
-    chunked_prefill_size: int | None = None
     sliding_window_size: int | None = None

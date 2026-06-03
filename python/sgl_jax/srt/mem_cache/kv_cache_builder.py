@@ -38,12 +38,10 @@ def build_kv_cache(
     spec_algorithm: SpeculativeAlgorithm | None,
 ) -> KVCacheBuildResult:
     params = CacheInitParams(
-        disable=server_args.disable_radix_cache,
         req_to_token_pool=req_to_token_pool,
         token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         page_size=page_size,
         is_eagle=spec_algorithm is not None and spec_algorithm.is_eagle(),
-        chunked_prefill_size=server_args.chunked_prefill_size,
         sliding_window_size=sliding_window_size,
     )
 
