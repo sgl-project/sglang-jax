@@ -283,6 +283,11 @@ suites = {
     # cpu-test CI job sets that env var.
     "unit-test-cpu": [
         TestFile("test/srt/test_tokenizer_manager_event.py", 0.1),
+        TestFile("test/srt/disaggregation/test_wrapper.py", 0.2, runner="pytest"),
+        TestFile("test/srt/disaggregation/test_transport.py", 0.3, runner="pytest"),
+        TestFile("test/srt/disaggregation/test_conn.py", 0.5, runner="pytest"),
+        TestFile("test/srt/disaggregation/test_infra.py", 0.3, runner="pytest"),
+        TestFile("test/srt/disaggregation/test_zmq_pull_notifier.py", 0.2, runner="pytest"),
         TestFile("python/sgl_jax/test/test_compilation_manager.py", 1),
         TestFile("python/sgl_jax/test/test_kernel_utils.py", 1),
         TestFile("python/sgl_jax/test/speculative/test_spec_info.py", 0.2, runner="pytest"),
