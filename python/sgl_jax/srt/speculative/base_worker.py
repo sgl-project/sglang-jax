@@ -25,15 +25,24 @@ def replicate_to_mesh(
     return out[0] if len(out) == 1 else out
 
 
-def _can_use_fused_greedy_decode_step3(model_worker_batch: ModelWorkerBatch) -> bool:
+def _can_use_fused_greedy_decode_step3(
+    model_worker_batch: ModelWorkerBatch, draft_worker: BaseDraftWorker | None = None
+) -> bool:
     sampling_info = getattr(model_worker_batch, "sampling_info", None)
     if sampling_info is None or not getattr(sampling_info, "is_all_greedy", False):
         return False
-    if getattr(model_worker_batch, "speculative_eagle_topk", None) != 1:
+
+    def _spec_value(batch_attr: str, worker_attr: str):
+        value = getattr(model_worker_batch, batch_attr, None)
+        if value not in (None, 0):
+            return value
+        return getattr(draft_worker, worker_attr, value)
+
+    if _spec_value("speculative_eagle_topk", "topk") != 1:
         return False
-    if getattr(model_worker_batch, "speculative_num_steps", None) != 3:
+    if _spec_value("speculative_num_steps", "speculative_num_steps") != 3:
         return False
-    if getattr(model_worker_batch, "speculative_num_draft_tokens", None) != 4:
+    if _spec_value("speculative_num_draft_tokens", "speculative_num_draft_tokens") != 4:
         return False
     seq_lens = getattr(model_worker_batch, "seq_lens", None)
     return seq_lens is not None and len(seq_lens) == 32
@@ -153,10 +162,18 @@ class BaseSpecWorker:
         # to global-flat (real_bs,) so reqs_info[0].spec_info stays flat-ordered.
         sel = model_worker_batch.logits_indices_selector
         cur_allocate_lens = np.asarray(model_worker_batch.spec_info_padded.allocate_lens)[sel]
-        self.draft_worker.draft(model_worker_batch)
         model_worker_batch.use_fused_greedy_decode_step3 = _can_use_fused_greedy_decode_step3(
-            model_worker_batch
+            model_worker_batch, self.draft_worker
         )
+        if model_worker_batch.use_fused_greedy_decode_step3:
+            from sgl_jax.srt.speculative.draft_extend_fused import (
+                fused_greedy_verify_and_draft_extend_for_decode,
+            )
+
+            return fused_greedy_verify_and_draft_extend_for_decode(
+                self, model_worker_batch, cur_allocate_lens
+            )
+        self.draft_worker.draft(model_worker_batch)
         batch_output = self.verify(model_worker_batch, cur_allocate_lens)
         self.draft_worker.draft_extend_for_decode(model_worker_batch, batch_output)
         return batch_output
@@ -180,11 +197,13 @@ class BaseSpecWorker:
 
     def verify(self, model_worker_batch: ModelWorkerBatch, cur_allocate_lens: jax.Array):
         from sgl_jax.srt.managers.scheduler import GenerationBatchResult
-        from sgl_jax.srt.speculative.eagle_util import (
-            EagleDraftInput,
-            EagleVerifyInput,
-            greedy_sample_device_outputs,
-        )
+        from sgl_jax.srt.speculative.eagle_util import EagleDraftInput, EagleVerifyInput
+
+        if getattr(model_worker_batch, "use_fused_greedy_decode_step3", False):
+            raise RuntimeError(
+                "Fixed greedy decode must enter the whole-round fused path before "
+                "BaseSpecWorker.verify()."
+            )
 
         spec_info: EagleVerifyInput = model_worker_batch.spec_info_padded
         spec_info.allocate_lens = cur_allocate_lens
@@ -200,41 +219,6 @@ class BaseSpecWorker:
             self.mesh, logits_output.next_token_logits, logits_output.hidden_states
         )
         spec_info.hidden_states = logits_output.hidden_states
-        if getattr(model_worker_batch, "use_fused_greedy_decode_step3", False):
-            sample_output = greedy_sample_device_outputs(
-                speculative_num_steps=self.speculative_num_steps,
-                num_draft_tokens=self.speculative_num_draft_tokens,
-                draft_tokens=spec_info.draft_token,
-                retrive_index=spec_info.retrive_index,
-                retrive_next_token=spec_info.retrive_next_token,
-                retrive_next_sibling=spec_info.retrive_next_sibling,
-                next_token_logits=logits_output.next_token_logits,
-                mesh=self.mesh,
-            )
-            new_seq_lens = model_worker_batch.seq_lens + sample_output.accept_length
-            next_draft_input = EagleDraftInput(
-                verified_id=sample_output.verified_id,
-                new_seq_lens=new_seq_lens,
-                allocate_lens=cur_allocate_lens,
-                hidden_states=logits_output.hidden_states,
-                accept_length=sample_output.accept_length,
-            )
-            next_draft_input.accept_index = sample_output.accept_index
-            next_draft_input.predict = sample_output.predict
-            next_draft_input.safe_index = sample_output.safe_index
-            next_draft_input.select_index = sample_output.select_index
-            model_worker_batch.spec_info_padded = next_draft_input
-            return GenerationBatchResult(
-                logits_output=logits_output,
-                next_token_ids=sample_output.predict,
-                next_draft_input=next_draft_input,
-                accept_lens=sample_output.accept_length,
-                allocate_lens=cur_allocate_lens,
-                bid=model_worker_batch.bid,
-                cache_miss_count=cache_miss_count,
-                extend_input_len_per_req=None,
-                extend_logprob_start_len_per_req=None,
-            )
 
         (
             predict,

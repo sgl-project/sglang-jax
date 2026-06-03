@@ -20,6 +20,7 @@ from sgl_jax.srt.speculative.base_worker import BaseDraftWorker, replicate_to_me
 from sgl_jax.srt.speculative.eagle_util import (
     EagleDraftInput,
     EagleVerifyInput,
+    build_chain_verify_inputs,
     build_chain_verify_inputs_device,
     build_tree_kernel_efficient,
     build_tree_mask_for_draft_decode,
@@ -141,15 +142,25 @@ class EagleDraftWorker(BaseDraftWorker):
 
         if self.topk == 1:
             n = self.speculative_num_draft_tokens
-            rep = NamedSharding(self.mesh, P())
-            verified_id, token_list, verified_seq_lens = jax.device_put(
-                (model_worker_batch.spec_info_padded.verified_id, token_list, verified_seq_lens),
-                rep,
-            )
-            packed = build_chain_verify_inputs_device(
-                verified_id, token_list, verified_seq_lens, n, bs
-            )
-            packed = jax.device_put(packed, rep)
+            verified_id = model_worker_batch.spec_info_padded.verified_id
+            if any(isinstance(x, jax.Array) for x in (verified_id, token_list, verified_seq_lens)):
+                rep = NamedSharding(self.mesh, P())
+                verified_id, token_list, verified_seq_lens = jax.device_put(
+                    (verified_id, token_list, verified_seq_lens),
+                    rep,
+                )
+                packed = build_chain_verify_inputs_device(
+                    verified_id, token_list, verified_seq_lens, n, bs
+                )
+                packed = jax.device_put(packed, rep)
+            else:
+                packed = build_chain_verify_inputs(
+                    np.asarray(verified_id, dtype=np.int32),
+                    np.asarray(token_list, dtype=np.int32),
+                    np.asarray(verified_seq_lens, dtype=np.int32),
+                    n,
+                    bs,
+                )
             draft_tokens = packed[0]
             position = packed[1]
             retrive_index = packed[2].reshape(bs, n)

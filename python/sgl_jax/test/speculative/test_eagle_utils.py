@@ -14,8 +14,47 @@ from sgl_jax.test.test_utils import CustomTestCase
 
 
 class TestVerifyTree(CustomTestCase):
+    def test_as_int32_array_keeps_host_metadata_on_host(self):
+        from sgl_jax.srt.speculative import eagle_util
+
+        original_jnp_asarray = eagle_util.jnp.asarray
+        original_jnp_empty = eagle_util.jnp.empty
+
+        def fail_jnp_asarray(*args, **kwargs):
+            raise AssertionError("host metadata conversion must not call jnp.asarray")
+
+        def fail_jnp_empty(*args, **kwargs):
+            raise AssertionError("host metadata placeholder must not call jnp.empty")
+
+        try:
+            eagle_util.jnp.asarray = fail_jnp_asarray
+            eagle_util.jnp.empty = fail_jnp_empty
+            arr = eagle_util._as_int32_array(np.array([1, 2], dtype=np.int64))
+            scalar = eagle_util._as_int32_array(3)
+            listed = eagle_util._as_int32_array([4, 5])
+            children, _ = eagle_util.EagleDraftInput().tree_flatten()
+        finally:
+            eagle_util.jnp.asarray = original_jnp_asarray
+            eagle_util.jnp.empty = original_jnp_empty
+
+        self.assertIsInstance(arr, np.ndarray)
+        self.assertEqual(arr.dtype, np.int32)
+        np.testing.assert_array_equal(arr, np.array([1, 2], dtype=np.int32))
+        self.assertIsInstance(scalar, np.ndarray)
+        self.assertEqual(scalar.dtype, np.int32)
+        np.testing.assert_array_equal(listed, np.array([4, 5], dtype=np.int32))
+        self.assertIsInstance(children[9], np.ndarray)
+        self.assertEqual(children[9].dtype, np.int32)
+        self.assertEqual(children[9].shape, (0,))
+
+        device_arr = jnp.array([6], dtype=jnp.int32)
+        self.assertIs(eagle_util._as_int32_array(device_arr), device_arr)
+
     def test_build_chain_verify_inputs_device_matches_linear_chain_layout(self):
-        from sgl_jax.srt.speculative.eagle_util import build_chain_verify_inputs_device
+        from sgl_jax.srt.speculative.eagle_util import (
+            _build_chain_verify_inputs_device_impl,
+            build_chain_verify_inputs_device,
+        )
 
         verified_id = jnp.array([101, 201], dtype=jnp.int32)
         token_list = jnp.array(
@@ -46,6 +85,16 @@ class TestVerifyTree(CustomTestCase):
             dtype=np.int32,
         )
         np.testing.assert_array_equal(np.asarray(packed), expected)
+
+        inline_packed = _build_chain_verify_inputs_device_impl(
+            verified_id=verified_id,
+            token_list=token_list,
+            seq_lens=seq_lens,
+            num_verify_tokens=4,
+            batch_size=2,
+        )
+
+        np.testing.assert_array_equal(np.asarray(inline_packed), expected)
 
     def test_verify_tree_greedy_device_outputs_match_host_postprocess(self):
         from sgl_jax.srt.speculative.eagle_util import greedy_sample_device_outputs
