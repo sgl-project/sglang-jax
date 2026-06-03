@@ -257,8 +257,9 @@ def main():
                 if flash_time < best_output:
                     best_output = flash_time
                     best_config = (num_kv_pages_per_blk, num_queries_per_block)
-            except Exception:
-                pass
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
         if jax.process_index() == 0 and best_config:
             # Output in python dict format for easy copying to tuned_block_sizes.py
             print(
