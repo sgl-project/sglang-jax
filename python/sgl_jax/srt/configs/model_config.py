@@ -286,7 +286,15 @@ class ModelConfig:
                     moe_activation_dtype=None,
                     ignored_layers=ignored_layers,
                     weight_block_size=weight_block_size,
+                    # Static block scales are correct; the narrow-N guard targets
+                    # the dynamic online-quant path (computed at load time).
+                    allow_narrow_n_blockwise=weight_block_size is not None,
                 )
+                if weight_block_size is not None:
+                    logger.info(
+                        "Static block-wise FP8 (block=%s): enabling allow_narrow_n_blockwise.",
+                        weight_block_size,
+                    )
                 return quant_config
 
             elif quant_method == "compressed-tensors":

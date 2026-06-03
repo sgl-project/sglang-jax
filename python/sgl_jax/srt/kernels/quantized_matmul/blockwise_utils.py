@@ -224,7 +224,10 @@ def should_use_blockwise_kernel(
 
     When a tensor-parallel column shard collapses to a single output block
     (for example local N=128 with block_size_out=128), the TPU blockwise
-    kernel can produce NaNs on Qwen3-MoE k/v projections.
+    kernel can produce NaNs on Qwen3-MoE k/v projections. This is specific to
+    the dynamic online-quant path (scales computed at load time); static FP8
+    checkpoints ship correct offline block scales and opt past this guard via
+    ``allow_narrow_n_blockwise``.
     """
     return out_dim > block_size_out
 
