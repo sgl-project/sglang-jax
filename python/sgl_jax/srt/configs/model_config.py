@@ -150,6 +150,18 @@ class ModelConfig:
             # Each draft runner is a single SWA layer; without this the KV pool
             # sizes for all 70 target layers and OOMs.
             self.hf_config.num_hidden_layers = 1
+            # MTP uses SWA attention; override KV head count and head dims so
+            # the KV cache shape matches the SWA layer output, not the full-
+            # attention target config.
+            self.hf_config.num_key_value_heads = getattr(
+                self.hf_config, "swa_num_key_value_heads", self.hf_config.num_key_value_heads
+            )
+            self.hf_config.num_attention_heads = getattr(
+                self.hf_config, "swa_num_attention_heads", self.hf_config.num_attention_heads
+            )
+            self.hf_config.head_dim = getattr(
+                self.hf_config, "swa_head_dim", self.hf_config.head_dim
+            )
             if self.quantization_config is not None:
                 # eh_proj / o_proj are BF16 in model_mtp.safetensors (no
                 # weight_scale_inv); keep them as plain LinearBase so mappings

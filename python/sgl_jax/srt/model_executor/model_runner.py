@@ -187,6 +187,8 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         model_def, model_state = nnx.split(self.model)
         # note export for external modification
         self.model_state_leaves, model_state_def = jax.tree_util.tree_flatten(model_state)
+        self._model_def = model_def
+        self._model_state_def = model_state_def
         sampler_def, sampler_state = nnx.split(self.sampler)
         sampler_state_leaves, sampler_state_def = jax.tree_util.tree_flatten(sampler_state)
 
