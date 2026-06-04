@@ -1612,9 +1612,13 @@ def get_default_block_sizes(
 
 def get_vmem_limit():
     try:
-        # Use half of VMEM capacity as default to approximate the scoped VMEM limit.
-        # The compiler's scoped VMEM allocation is typically ~50% of total capacity.
-        vmem_limit_bytes = pltpu.get_tpu_info().vmem_capacity_bytes // 2
+        # Use full VMEM capacity. A Pallas custom call does not run concurrently
+        # with other XLA HLO ops on the same core, so the Pallas vmem budget and
+        # the surrounding scoped_vmem budget do not sum. Capping at half only
+        # shrank the candidate space and forced XLA MSA "conflicting pending
+        # required assignment" CHECK-failures on some (decode, hd256, bkv=256)
+        # layouts. The tuned block-size table is measured against this budget.
+        vmem_limit_bytes = pltpu.get_tpu_info().vmem_capacity_bytes
     except Exception:
         vmem_limit_bytes = DEFAULT_VMEM_LIMIT_BYTES
     return vmem_limit_bytes
