@@ -61,6 +61,10 @@ def benchmark_backend(
             kv_head_num,
             head_dim,
             page_size=page_size,
+            # Keep the historical 2048 chunk split so the perf-guard workload
+            # (and its baselines) are unchanged; the param default is 4096 for
+            # the tuner, which must match the production chunked_prefill_size.
+            chunk_prefill_size=2048,
         )
     elif mode == "decode":
         (
