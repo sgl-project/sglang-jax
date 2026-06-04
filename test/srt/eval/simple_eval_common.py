@@ -1,6 +1,7 @@
 # Adapted from https://github.com/openai/simple-evals/
 
 import os
+import re
 import resource
 import time
 from collections import defaultdict
@@ -175,6 +176,27 @@ D) {D}
 
 ANSWER_PATTERN_MULTICHOICE = r"(?i)Answer\s*:\s*([A-D])"
 ANSWER_PATTERN = r"(?i)Answer\s*:\s*([^\n]+)"
+
+_REASONING_RE_BOTH = re.compile(r"<think>.*?</think>", flags=re.DOTALL)
+_REASONING_RE_CLOSE_ONLY = re.compile(r"^.*?</think>", flags=re.DOTALL)
+
+
+def strip_reasoning(text: str) -> str:
+    """Drop the reasoning span before multichoice answer extraction.
+
+    Handles both shapes:
+    - Full ``<think>...</think>`` block in the response (some templates).
+    - Bare ``</think>`` only (Qwen-style: the opening ``<think>\\n`` is
+      injected by the chat template into the prompt, so the server's
+      content field starts directly with reasoning text and only emits
+      the closing tag).
+    """
+    if not text:
+        return text
+    text = _REASONING_RE_BOTH.sub("", text)
+    if "</think>" in text:
+        text = _REASONING_RE_CLOSE_ONLY.sub("", text, count=1)
+    return text.strip()
 
 
 EQUALITY_TEMPLATE = r"""

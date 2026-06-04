@@ -310,6 +310,7 @@ suites = {
         TestFile("test/srt/openai_server/basic/test_serving_chat.py", 0.1),
         TestFile("test/srt/openai_server/basic/test_serving_completions.py", 0.1),
         TestFile("test/srt/test_reasoning_parser.py", 0.1),
+        TestFile("test/srt/eval/test_simple_eval_common.py", 0.1, runner="pytest"),
         TestFile("test/srt/test_server_info.py", 0.1),
     ],
     "unit-test-tpu-v6e-4": [
