@@ -7,11 +7,11 @@ import os
 
 from sgl_jax.srt.multimodal.configs.dits.flux_model_config import FluxModelConfig
 from sgl_jax.srt.multimodal.configs.dits.wan_model_config import WanModelConfig
+from sgl_jax.srt.multimodal.configs.kimi.kimi_k25_config import KimiK25ModelVitConfig
 from sgl_jax.srt.multimodal.configs.mimo_audio.mimo_audio_backbone_config import (
     MiMoAudioBackboneConfig,
 )
 from sgl_jax.srt.multimodal.configs.mimo_audio.mimo_audio_config import MiMoAudioConfig
-from sgl_jax.srt.multimodal.configs.kimi.kimi_k25_config import KimiK25ModelVitConfig
 from sgl_jax.srt.multimodal.configs.multimodal_base_config import MultiModalModelConfigs
 from sgl_jax.srt.multimodal.configs.qwen_vl.qwen_2_5_vl_config import (
     QwenVLModelVitConfig,
@@ -101,6 +101,7 @@ _KIMI_VL_VISION_LIST_FIELDS = {
     "merge_kernel_size",
 }
 
+
 def _load_local_config_dict(model_path: str) -> dict | None:
     if not isinstance(model_path, str):
         return None
@@ -114,8 +115,9 @@ def _load_local_config_dict(model_path: str) -> dict | None:
         logger.warning("Failed to read config.json from %s: %s", config_path, exc)
         return None
 
+
 def _apply_kimi_vl_vision_overrides(
-        config: KimiK25ModelVitConfig, model_path: str
+    config: KimiK25ModelVitConfig, model_path: str
 ) -> KimiK25ModelVitConfig:
     config_dict = _load_local_config_dict(model_path)
     if not config_dict:
@@ -510,6 +512,7 @@ class KimiVLConfigRegistry:
         """List all registered model names."""
         return list(cls._REGISTRY.keys())
 
+
 class QwenVLConfigRegistry:
     # Model name -> config factory mapping
     _REGISTRY: dict[str, callable] = {
@@ -604,6 +607,7 @@ def get_kimi_vl_config(model_path: str) -> KimiK25ModelVitConfig:
     """
     return KimiVLConfigRegistry.get_config(model_path)
 
+
 def get_qwen_vl_config(model_path: str) -> QwenVLModelVitConfig:
     """Convenience function to get Qwen vl config.
     Args:
@@ -614,8 +618,9 @@ def get_qwen_vl_config(model_path: str) -> QwenVLModelVitConfig:
     """
     return QwenVLConfigRegistry.get_config(model_path)
 
+
 def get_vl_config(model_class: type, model_path: str) -> MultiModalModelConfigs:
-    """Generic funtion to get the appropriate vl config.
+    """Generic function to get the appropriate vl config.
     Args:
         model_class: The model class.
         model_path: Path of the model from server args.
@@ -629,9 +634,8 @@ def get_vl_config(model_class: type, model_path: str) -> MultiModalModelConfigs:
     elif model_class.__name__ == "Kimi_K25_VisionModel":
         return get_kimi_vl_config(model_path)
     else:
-        raise ValueError(
-            f"No VL config found for model class '{model_class.__name__}'"
-        )
+        raise ValueError(f"No VL config found for model class '{model_class.__name__}'")
+
 
 class AudioConfigRegistry:
     """Registry that maps model names to their audio tokenizer configs."""

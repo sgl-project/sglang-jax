@@ -1,0 +1,52 @@
+import logging  
+import jax  
+import jax.numpy as jnp  
+from flax import nnx  
+  
+from sgl_jax.srt.hf_transformers_utils import get_hf_text_config  
+from sgl_jax.srt.layers.embeddings import ParallelLMHead  
+from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor  
+from sgl_jax.srt.mem_cache.memory_pool import KVCache
+from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch  
+from sgl_jax.srt.multimodal.models.qwen2_5VL.qwen2_5_vl_generation import Qwen2_5_VL_Model  
+  
+logger = logging.getLogger(__name__)  
+  
+class KimiK25ForConditionalGeneration(nnx.Module):  
+    """Dummy Kimi K2.5 generation model for e2e pipeline testing."""  
+  
+    def __init__(self, config=None, dtype=None, mesh=None):  
+        super().__init__()  
+        self.config = config  
+        self.mesh = mesh  
+        self.dtype = dtype or jnp.bfloat16  
+        self.vocab_size = getattr(config, "vocab_size", 163840)  
+  
+    def load_weights(self, model_config):  
+        pass  # no weights to load  
+  
+    def __call__(  
+        self,  
+        forward_batch: ForwardBatch,  
+        kvcache: KVCache,  
+        logits_metadata: LogitsMetadata,  
+    ):  
+        num_seqs = forward_batch.seq_lens.shape[0]
+        hidden_size = 1  
+        dummy_hidden = jax.sharding.reshard(  
+            jnp.zeros((num_seqs, hidden_size), dtype=jnp.bfloat16),  
+            NamedSharding(self.mesh, P("data", None))  
+        )  
+        dummy_embed = jax.sharding.reshard(  
+            jnp.zeros((self.vocab_size, hidden_size), dtype=jnp.bfloat16),  
+            NamedSharding(self.mesh, P("tensor", None))  
+        )  
+        dummy_logits = jnp.dot(  
+            dummy_hidden, dummy_embed.T,  
+            out_sharding=NamedSharding(self.mesh, P("data", "tensor"))  
+        )  
+        output = LogitsProcessorOutput(next_token_logits=dummy_logits)  
+
+        pool_updates = list(kv_cache.kv_buffer)  
+  
+        return output, pool_updates, [], None  

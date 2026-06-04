@@ -58,16 +58,14 @@ class VitModelRunner(BaseModelRunner):
                     combined.extend(image_grid_thw)
                 else:
                     combined.extend(
-                        tuple(int(x) for x in row)
-                        for row in np.asarray(image_grid_thw).tolist()
+                        tuple(int(x) for x in row) for row in np.asarray(image_grid_thw).tolist()
                     )
             if video_grid_thw is not None:
                 if isinstance(video_grid_thw, tuple):
                     combined.extend(video_grid_thw)
                 else:
                     combined.extend(
-                        tuple(int(x) for x in row)
-                        for row in np.asarray(video_grid_thw).tolist()
+                        tuple(int(x) for x in row) for row in np.asarray(video_grid_thw).tolist()
                     )
             if not combined:
                 return jnp.zeros(
@@ -157,7 +155,11 @@ class VitModelRunner(BaseModelRunner):
         if vision_embeds.size == 0:
             return None
 
-        image_token_id = mm_inputs.get("im_token_id") or mm_inputs.get("image_token_id") or mm_input.get("media_placeholder_token_id")
+        image_token_id = (
+            mm_inputs.get("im_token_id")
+            or mm_inputs.get("image_token_id")
+            or mm_inputs.get("media_placeholder_token_id")
+        )
         video_token_id = mm_inputs.get("video_token_id")
         placeholder_token_ids = [tok for tok in (image_token_id, video_token_id) if tok is not None]
         if not placeholder_token_ids:

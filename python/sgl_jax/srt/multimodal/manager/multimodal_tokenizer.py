@@ -490,12 +490,12 @@ class MultimodalTokenizer(TokenizerManager):
                 videos = [self._preprocess_qwen_video(item, video_config) for item in video_data]
                 processor_kwargs["videos_kwargs"] = {"do_sample_frames": False}
                 processor_kwargs["videos_kwargs"]["fps"] = video_config.get("fps", _QWEN_FPS)
-            elif self._is_kimi_processor(): 
+            elif self._is_kimi_processor():
                 medias = []
                 if images:
-                    medias.extend([{'type': 'image', 'image': img} for img in images])
+                    medias.extend([{"type": "image", "image": img} for img in images])
                 processor_kwargs["medias"] = medias
-                images = None  
+                images = None
                 videos = None
             else:
                 videos = [self._load_video_from_source(item) for item in video_data]
@@ -511,7 +511,9 @@ class MultimodalTokenizer(TokenizerManager):
             if "input_ids" in processor_out:
                 input_ids = processor_out["input_ids"][0].tolist()
 
-            image_grid_thw = self._to_grid_list(processor_out.get("image_grid_thw") or processor_out.get("grid_thws"))
+            image_grid_thw = self._to_grid_list(
+                processor_out.get("image_grid_thw") or processor_out.get("grid_thws")
+            )
             video_grid_thw = self._to_grid_list(processor_out.get("video_grid_thw"))
 
             if self._is_kimi_processor() and image_grid_thw and input_ids is not None:
@@ -523,7 +525,7 @@ class MultimodalTokenizer(TokenizerManager):
                     for tok in input_ids:
                         if tok == mm_token_id:
                             t, h, w = next(grid_iter)
-                            n_visual = (t * h * w) // (merge_kernel_size ** 2)
+                            n_visual = (t * h * w) // (merge_kernel_size**2)
                             expanded.extend([mm_token_id] * n_visual)
                         else:
                             expanded.append(tok)
@@ -604,7 +606,8 @@ class MultimodalTokenizer(TokenizerManager):
                 "mm_items": mm_items,
                 "im_start_id": getattr(self.mm_config, "vision_start_token_id", None),
                 "im_end_id": getattr(self.mm_config, "vision_end_token_id", None),
-                "im_token_id": getattr(self.mm_config, "image_token_id", None) or getattr(self.mm_config, "media_placeholder_token_id", None),
+                "im_token_id": getattr(self.mm_config, "image_token_id", None)
+                or getattr(self.mm_config, "media_placeholder_token_id", None),
                 "video_token_id": getattr(self.mm_config, "video_token_id", None),
                 "audio_token_id": getattr(self.mm_config, "audio_token_id", None),
                 "mrope_positions": mrope_positions,
