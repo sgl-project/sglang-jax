@@ -546,6 +546,7 @@ class FusedEPMoEV2(FusedEPMoE):
         topk_ids: jax.Array,
         *,
         block_config=None,
+        out_sharding: jax.sharding.Sharding | None = None,
     ) -> jax.Array:
         from sgl_jax.srt.kernels.fused_moe.v2.kernel import fused_ep_moe_v2
         from sgl_jax.srt.kernels.fused_moe.v2.tuned_block_configs import (
@@ -631,7 +632,15 @@ class FusedEPMoEV2(FusedEPMoE):
             tp_axis_name="tensor",
         )
 
-        output = jax.sharding.reshard(
-            output, jax.sharding.NamedSharding(self.mesh, P("data", None))
-        )
+        # Reshard the MoE output to the caller-requested layout. Under sequence
+        # parallelism out_sharding carries the SP-aware reduce_sharding
+        # (('data','tensor') on the scatter dim); without it we fall back to the
+        # plain DP layout P('data', None). b79f9951 dropped this arg and hardcoded
+        # the DP layout, which silently broke SP for MoE layers — restored here.
+        if out_sharding is not None:
+            output = jax.sharding.reshard(output, out_sharding)
+        else:
+            output = jax.sharding.reshard(
+                output, jax.sharding.NamedSharding(self.mesh, P("data", None))
+            )
         return output
