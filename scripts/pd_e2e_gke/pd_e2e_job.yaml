@@ -1,0 +1,192 @@
+# PD e2e test on GKE: headless Service + Indexed Job (2 pods, each gets 1 v6e chip)
+#
+# Pod 0: bootstrap server + prefill server
+# Pod 1: decode server + test client (runs full Tier 1+2 test suite)
+#
+# Placeholders: <JOB_NAME>, <SSH_KEY_B64>, <GH_ORG>, <BRANCH>
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: <JOB_NAME>-headless-svc
+spec:
+  clusterIP: None
+  selector:
+    job-name: <JOB_NAME>
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: <JOB_NAME>
+spec:
+  completionMode: Indexed
+  parallelism: 2
+  completions: 2
+  backoffLimit: 0
+  template:
+    metadata:
+      annotations:
+        gke-gcsfuse/volumes: "true"
+    spec:
+      subdomain: <JOB_NAME>-headless-svc
+      restartPolicy: Never
+      nodeSelector:
+        cloud.google.com/gke-tpu-accelerator: tpu-v6e-slice
+        cloud.google.com/gke-tpu-topology: "1x1"
+        cloud.google.com/gke-nodepool: pd-v6e-1
+      tolerations:
+      - key: google.com/tpu
+        operator: Exists
+        effect: NoSchedule
+      serviceAccountName: gcs-account
+      containers:
+      - name: jax-tpu
+        image: python:3.12
+        securityContext:
+          privileged: true
+        env:
+        - name: P_HOST
+          value: "<JOB_NAME>-0.<JOB_NAME>-headless-svc"
+        - name: D_HOST
+          value: "<JOB_NAME>-1.<JOB_NAME>-headless-svc"
+        - name: MODEL_PATH
+          value: "/models/Qwen/Qwen3-8B-Base"
+        - name: BOOTSTRAP_URL
+          value: "http://<JOB_NAME>-0.<JOB_NAME>-headless-svc:8998"
+        command:
+        - bash
+        - -c
+        - |
+          set -ex
+
+          # --- Install JAX + libtpu ---
+          pip install -U --pre jax jaxlib libtpu requests \
+            -i https://us-python.pkg.dev/ml-oss-artifacts-published/jax/simple/ \
+            -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+
+          # --- SSH key for private repo clone ---
+          mkdir -p ~/.ssh
+          echo "<SSH_KEY_B64>" | base64 -d > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+
+          apt-get update && apt-get install -y iproute2 tmux vim
+
+          # --- Clone repo + install ---
+          export UV_CACHE_DIR="/tmp/tpu_logs/uv_cache"
+          export UV_PYTHON_INSTALL_DIR="/tmp/tpu_logs/python"
+          export TMPDIR="/tmp/tpu_logs"
+          mkdir -p "$TMPDIR"
+          pip install uv && uv venv /tmp/tpu_logs/venv && source /tmp/tpu_logs/venv/bin/activate
+          uv pip install pip
+          git clone git@github.com:<GH_ORG>/sglang-jax.git --branch <BRANCH>
+          cd sglang-jax && uv pip install -e python[all]
+
+          INDEX=${JOB_COMPLETION_INDEX}
+          echo "=== Pod index: $INDEX ==="
+
+          if [ "$INDEX" = "0" ]; then
+            # ========== POD 0: Bootstrap + Prefill ==========
+            echo "Starting bootstrap server..."
+            python -m sgl_jax.srt.disaggregation.run_bootstrap \
+              --host 0.0.0.0 --port 8998 &
+            BOOTSTRAP_PID=$!
+            sleep 3
+
+            echo "Starting prefill server..."
+            python -m sgl_jax.launch_server \
+              --model-path "$MODEL_PATH" \
+              --host 0.0.0.0 \
+              --port 10000 \
+              --page-size 128 \
+              --disaggregation-mode prefill \
+              --disaggregation-bootstrap-url "http://${P_HOST}:8998" \
+              2>&1 | tee /tmp/prefill_server.log &
+            P_PID=$!
+
+            # Wait for P server health
+            echo "Waiting for prefill server to be ready..."
+            for i in $(seq 1 300); do
+              curl -sf http://localhost:10000/health && break
+              sleep 2
+            done
+
+            echo "Prefill server ready. Waiting for test to complete..."
+            wait $P_PID
+
+          else
+            # ========== POD 1: Decode + Test Client ==========
+            echo "Waiting for bootstrap server at ${P_HOST}:8998..."
+            for i in $(seq 1 300); do
+              curl -sf "http://${P_HOST}:8998/health" && break
+              sleep 2
+            done
+            echo "Bootstrap server ready."
+
+            echo "Waiting for prefill server at ${P_HOST}:10000..."
+            for i in $(seq 1 300); do
+              curl -sf "http://${P_HOST}:10000/health" && break
+              sleep 2
+            done
+            echo "Prefill server ready."
+
+            echo "Starting decode server..."
+            python -m sgl_jax.launch_server \
+              --model-path "$MODEL_PATH" \
+              --host 0.0.0.0 \
+              --port 10001 \
+              --page-size 128 \
+              --disaggregation-mode decode \
+              --disaggregation-bootstrap-url "http://${P_HOST}:8998" \
+              2>&1 | tee /tmp/decode_server.log &
+            D_PID=$!
+
+            echo "Waiting for decode server to be ready..."
+            for i in $(seq 1 300); do
+              curl -sf http://localhost:10001/health && break
+              sleep 2
+            done
+            echo "Decode server ready."
+
+            echo "=========================================="
+            echo "Running PD e2e test suite (Tier 1 + 2)..."
+            echo "=========================================="
+            python scripts/pd_e2e_test_suite.py \
+              --prefill-url "http://${P_HOST}:10000" \
+              --decode-url "http://localhost:10001" \
+              --skip-health-check \
+              --tier 2 \
+              --timeout 300
+            TEST_EXIT=$?
+
+            echo "=========================================="
+            echo "Test exit code: $TEST_EXIT"
+            echo "=========================================="
+
+            # Keep pod alive briefly for log collection
+            sleep 30
+            exit $TEST_EXIT
+          fi
+        resources:
+          requests:
+            ephemeral-storage: 38Gi
+            google.com/tpu: 1
+          limits:
+            ephemeral-storage: 38Gi
+            google.com/tpu: 1
+        volumeMounts:
+        - name: dshm
+          mountPath: /dev/shm
+        - name: model-storage
+          mountPath: /models
+      volumes:
+      - name: model-storage
+        csi:
+          driver: gcsfuse.csi.storage.gke.io
+          volumeAttributes:
+            bucketName: model-storage-sglang
+            mountOptions: "implicit-dirs,metadata-cache:ttl-secs:-1,metadata-cache:stat-cache-max-size-mb:512,metadata-cache:type-cache-max-size-mb:64,file-cache:max-size-mb:5120,file-cache:cache-file-for-range-read:true,file-system:kernel-list-cache-ttl-secs:-1,file-cache:enable-parallel-downloads:true,file-cache:parallel-downloads-per-file:32"
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 32Gi
