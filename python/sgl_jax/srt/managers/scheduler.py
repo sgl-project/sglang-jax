@@ -2233,6 +2233,13 @@ def _install_disaggregation_wiring(scheduler, server_args) -> None:
     mode = getattr(server_args, "disaggregation_mode", "null")
     if mode == "null":
         return
+    dp_size = getattr(server_args, "dp_size", 1)
+    if dp_size > 1:
+        raise RuntimeError(
+            f"PD disaggregation does not yet support dp_size>1 "
+            f"(got dp_size={dp_size}). This will be supported in a "
+            f"future PR."
+        )
     if server_args.disaggregation_bootstrap_url is None:
         raise RuntimeError(
             "disaggregation_mode != null requires bootstrap_url"
