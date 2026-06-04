@@ -749,6 +749,20 @@ def _materialize_fused_greedy_batch_output_for_scheduler(
         return batch_output
 
 
+def _build_fused_greedy_verify_jit():
+    """Build JIT A: draft/target verify/sample only.
+
+    Returns scheduler-visible values and a private draft_extend_state payload.
+    The function must not run draft_extend.
+    """
+    raise NotImplementedError("implemented in split verify phase task")
+
+
+def spec_decode_verify_phase(spec_worker, model_worker_batch, cur_allocate_lens):
+    """Run phase A and return SpecVerifyPhaseResult without draft_extend."""
+    raise NotImplementedError("implemented in split verify phase task")
+
+
 def spec_decode(spec_worker, model_worker_batch, cur_allocate_lens):
     """Run one fused speculative decode round."""
     from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput

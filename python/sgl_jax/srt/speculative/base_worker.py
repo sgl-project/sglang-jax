@@ -103,6 +103,14 @@ class BaseSpecWorker:
 
     # -- Main entry point --
 
+    def forward_batch_speculative_verify_phase(self, model_worker_batch: ModelWorkerBatch):
+        """Run greedy fused spec verify/sample and return scheduler-visible phase A."""
+        sel = model_worker_batch.logits_indices_selector
+        cur_allocate_lens = np.asarray(model_worker_batch.spec_info_padded.allocate_lens)[sel]
+        from sgl_jax.srt.speculative.draft_extend_fused import spec_decode_verify_phase
+
+        return spec_decode_verify_phase(self, model_worker_batch, cur_allocate_lens)
+
     def forward_batch_speculative_generation(self, model_worker_batch: ModelWorkerBatch):
         from sgl_jax.srt.managers.scheduler import GenerationBatchResult
         from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata

@@ -32,3 +32,11 @@ def test_spec_verify_phase_result_keeps_dp_padded_accept_layout():
     assert result.accept_lens.shape == (total_bs,)
     assert result.next_token_ids.shape == (total_bs * stride,)
     assert result.scheduler_next_draft_input.new_seq_lens.shape == (total_bs,)
+
+
+def test_split_phase_entrypoints_import():
+    from sgl_jax.srt.speculative.base_worker import BaseSpecWorker
+    from sgl_jax.srt.speculative.draft_extend_fused import spec_decode_verify_phase
+
+    assert callable(spec_decode_verify_phase)
+    assert hasattr(BaseSpecWorker, "forward_batch_speculative_verify_phase")
