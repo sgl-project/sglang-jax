@@ -1823,6 +1823,158 @@ class ScheduleBatch:
 
         return input_ids_cpu, positions_cpu, out_cache_loc_cpu, real_input_ids_len
 
+    def _merge_multimodal(
+        self,
+        per_dp_token_size: int,
+        total_token_size: int,
+    ) -> dict:
+        """Assemble all per-token multimodal tensors in one DP-interleaved pass.
+
+        Single traversal of ``reqs_info[*].reqs`` that produces, on the same
+        rank-offset layout as ``_merge_input_and_positions`` (per-rank slot
+        stride ``per_dp_token_size``; within a rank the per-req EXTEND window
+        ``[prefix_len, seq_len)``), all three multimodal tensors at once:
+
+        - ``input_embedding`` ``[total_token_size, hidden]`` -- per-req merged
+          embedding sliced to its extend window.
+        - ``mrope_positions`` ``[3, total_token_size]`` -- 3-D mRoPE positions;
+          extend slices ``mm_positions[:, prefix:prefix+ext]`` (delta / arange
+          fallback), decode advances ``seq_len-1 (+delta)``.
+        - ``deepstack_visual_embedding`` ``[num_layers, total_token_size,
+          hidden]`` -- sparse visual rows densified into the batched layout with
+          non-visual rows zero, plus the derived ``apply_for_deepstack``.
+
+        Data stays on ``Req`` (no new ScheduleReqsInfo fields); this only reads it. Collapses the
+        three previously separate rank-offset loops so the layout logic lives in
+        exactly one place. Each field is ``None`` / ``False`` when no request
+        carries it, keeping pure-text / non-multimodal paths unchanged (0-diff).
+        """
+        is_extend = self.forward_mode.is_extend()
+        is_decode = self.forward_mode.is_decode()
+
+        has_mrope = any(
+            _extract_mm_value(getattr(req, "mm_inputs", None), "mrope_positions") is not None
+            or _extract_mm_value(getattr(req, "mm_inputs", None), "mrope_position_delta")
+            is not None
+            for info in self.reqs_info
+            if info.reqs
+            for req in info.reqs
+        )
+
+        # input_embedding / deepstack are extend-only; mrope also refreshes on
+        # decode. Nothing to assemble otherwise -> all None/False (0-diff).
+        emb = None
+        mrope = np.zeros((3, total_token_size), dtype=np.int32) if has_mrope else None
+        dense = None
+        if not is_extend and mrope is None:
+            return {
+                "input_embedding": None,
+                "mrope_positions": None,
+                "apply_for_deepstack": False,
+                "deepstack_visual_embedding": None,
+            }
+
+        offset = 0
+        for dp_rank in range(self.dp_size):
+            info = self.reqs_info[dp_rank]
+            if not info.reqs or info.seq_lens is None or len(info.seq_lens) == 0:
+                offset += per_dp_token_size
+                continue
+            local = 0
+
+            if is_decode:
+                # Decode: one token per request; only mrope advances (embedding
+                # and deepstack are extend-only and stay None/False).
+                if mrope is not None:
+                    for req, seq_len in zip(info.reqs, info.seq_lens):
+                        base_pos = int(seq_len) - 1
+                        delta = _extract_mm_value(
+                            getattr(req, "mm_inputs", None), "mrope_position_delta"
+                        )
+                        if delta is not None:
+                            base_pos += _as_int_scalar(delta)
+                        mrope[:, offset + local] = base_pos
+                        local += 1
+                offset += per_dp_token_size
+                continue
+
+            # Extend: write each req's [prefix_len, seq_len) window.
+            for req, seq_len, prefix_len in zip(info.reqs, info.seq_lens, info.prefix_lens):
+                ext_len = int(seq_len) - int(prefix_len)
+                if ext_len <= 0:
+                    continue
+                start = int(prefix_len or 0)
+                end = start + ext_len
+
+                # input_embedding: per-req merged embedding, extend window.
+                mm_emb = getattr(req, "multimodal_embedding", None)
+                if mm_emb is not None:
+                    mm_full = np.asarray(mm_emb)
+                    chunk = mm_full[start:end]
+                    if emb is None:
+                        emb = np.zeros((total_token_size, mm_full.shape[1]), dtype=mm_full.dtype)
+                    emb[offset + local : offset + local + chunk.shape[0]] = chunk
+
+                # mrope_positions: 3-D positions, slice with fallback.
+                if mrope is not None:
+                    mm_positions = _extract_mm_value(
+                        getattr(req, "mm_inputs", None), "mrope_positions"
+                    )
+                    if mm_positions is None:
+                        # Text-only req in a mixed mrope batch: 1-D positions
+                        # broadcast to 3 rows (T==H==W), matching the model's
+                        # non-mrope fallback for these tokens.
+                        base = np.arange(start, start + ext_len, dtype=np.int32)
+                        mchunk = np.broadcast_to(base.reshape(1, -1), (3, ext_len))
+                    else:
+                        mchunk = np.asarray(mm_positions)[:, start : start + ext_len]
+                        if mchunk.size == 0:
+                            delta = _extract_mm_value(
+                                getattr(req, "mm_inputs", None), "mrope_position_delta"
+                            )
+                            base = np.arange(start, start + ext_len, dtype=np.int32)
+                            if delta is not None:
+                                base = base + _as_int_scalar(delta)
+                            mchunk = np.broadcast_to(base.reshape(1, -1), (3, ext_len))
+                    mrope[:, offset + local : offset + local + ext_len] = mchunk
+
+                # deepstack: densify sparse visual rows into batched layout,
+                # non-visual rows stay zero (so the model can add to all tokens).
+                ds_emb = getattr(req, "deepstack_visual_embedding", None)
+                ds_mask = getattr(req, "deepstack_visual_pos_mask", None)
+                if (
+                    getattr(req, "apply_for_deepstack", False)
+                    and ds_emb is not None
+                    and ds_mask is not None
+                ):
+                    full_mask = np.asarray(ds_mask).astype(bool)
+                    emb_arr = np.asarray(ds_emb)  # (num_layers, num_visual, hidden)
+                    # Only valid when the per-req mask spans the full prompt
+                    # (skips the audio-only dummy [1]-length fallback).
+                    if full_mask.shape[0] >= end and emb_arr.ndim == 3:
+                        window_mask = full_mask[start:end]
+                        nvis = int(window_mask.sum())
+                        if nvis > 0:
+                            vstart = int(full_mask[:start].sum())
+                            window_emb = emb_arr[:, vstart : vstart + nvis, :]
+                            if dense is None:
+                                dense = np.zeros(
+                                    (emb_arr.shape[0], total_token_size, emb_arr.shape[2]),
+                                    dtype=emb_arr.dtype,
+                                )
+                            vis_pos = offset + local + np.nonzero(window_mask)[0]
+                            dense[:, vis_pos, :] = window_emb
+
+                local += ext_len
+            offset += per_dp_token_size
+
+        return {
+            "input_embedding": emb,
+            "mrope_positions": mrope,
+            "apply_for_deepstack": dense is not None,
+            "deepstack_visual_embedding": dense,
+        }
+
     def _merge_batch_metadata(
         self,
         per_dp_bs_size: int,
@@ -2390,7 +2542,16 @@ class ScheduleBatch:
             # Pad to total_bs
             lora_ids = lora_ids + ["0"] * (total_bs - real_bs)
 
-        # input_embedding = None
+        # Assemble all per-token multimodal tensors (input_embedding,
+        # mrope_positions, deepstack) in a single DP-interleaved pass over
+        # reqs_info[*].reqs; see ScheduleBatch._merge_multimodal. Each is
+        # None/False for pure-text batches, so non-multimodal paths stay
+        # unchanged.
+        _mm = self._merge_multimodal(per_dp_token_padding, total_token_size)
+        input_embedding = _mm["input_embedding"]
+        mrope_positions = _mm["mrope_positions"]
+        apply_for_deepstack = _mm["apply_for_deepstack"]
+        deepstack_visual_embedding = _mm["deepstack_visual_embedding"]
 
         # Merge per-DP top_logprobs_nums / token_ids_logprobs with the same
         # offset_bs += per_dp_bs_padding padding scheme used in _merge_batch_metadata.
@@ -2473,7 +2634,7 @@ class ScheduleBatch:
             token_ids_logprobs=token_ids_logprobs,
             sampling_info=sampling_info,
             positions=positions_cpu,
-            mrope_positions=None,
+            mrope_positions=mrope_positions,
             cache_loc=cache_loc_cpu,
             extend_prefix_lens=extend_prefix_lens,
             extend_seq_lens=extend_seq_lens,
@@ -2494,9 +2655,9 @@ class ScheduleBatch:
             dp_size=self.dp_size,
             per_dp_bs_size=per_dp_bs_padding,
             launch_done=self.launch_done,
-            input_embedding=None,
-            apply_for_deepstack=False,
-            deepstack_visual_embedding=None,
+            input_embedding=input_embedding,
+            apply_for_deepstack=apply_for_deepstack,
+            deepstack_visual_embedding=deepstack_visual_embedding,
             recurrent_indices=recurrent_indices_cpu,
             has_initial_state=has_initial_state_cpu,
             spec_algorithm=self.spec_algorithm,
@@ -2702,84 +2863,6 @@ def _as_int_scalar(value: Any, default: int = 0) -> int:
             return default
         return int(arr.reshape(-1)[0])
     return int(value)
-
-
-def _compute_mrope_positions_for_batch(
-    reqs: list[Req],
-    forward_mode: ForwardMode,
-    seq_lens_cpu: np.ndarray,
-    input_ids_len: int,
-    extend_prefix_lens: np.ndarray | None,
-    extend_seq_lens: np.ndarray | None,
-) -> np.ndarray | None:
-    mm_inputs_list = [getattr(req, "mm_inputs", None) for req in reqs]
-    has_mrope = any(
-        _extract_mm_value(mm, "mrope_positions") is not None
-        or _extract_mm_value(mm, "mrope_position_delta") is not None
-        for mm in mm_inputs_list
-    )
-    if not has_mrope:
-        return None
-
-    if forward_mode.is_decode():
-        mrope_positions_list = []
-        for batch_idx, mm_inputs in enumerate(mm_inputs_list):
-            base_pos = int(seq_lens_cpu[batch_idx]) - 1
-            delta = _extract_mm_value(mm_inputs, "mrope_position_delta")
-            if delta is not None:
-                base_pos += _as_int_scalar(delta)
-            mrope_positions_list.append(
-                np.full((3, 1), base_pos, dtype=np.int32),
-            )
-        mrope_positions = (
-            np.concatenate(mrope_positions_list, axis=1)
-            if mrope_positions_list
-            else np.zeros((3, 0), dtype=np.int32)
-        )
-    else:
-        if extend_prefix_lens is None or extend_seq_lens is None:
-            return None
-        mrope_positions_list = []
-        for batch_idx, mm_inputs in enumerate(mm_inputs_list):
-            extend_len = int(extend_seq_lens[batch_idx])
-            prefix_len = int(extend_prefix_lens[batch_idx])
-            if extend_len <= 0:
-                mrope_positions_list.append(np.zeros((3, 0), dtype=np.int32))
-                continue
-
-            mm_positions = _extract_mm_value(mm_inputs, "mrope_positions")
-            if mm_positions is None:
-                positions = np.arange(prefix_len, prefix_len + extend_len, dtype=np.int32)
-                mrope_positions_list.append(
-                    np.broadcast_to(positions.reshape(1, -1), (3, extend_len))
-                )
-                continue
-
-            mm_positions = np.asarray(mm_positions)
-            chunk = mm_positions[:, prefix_len : prefix_len + extend_len]
-            if chunk.size == 0:
-                delta = _extract_mm_value(mm_inputs, "mrope_position_delta")
-                if delta is not None:
-                    delta_val = _as_int_scalar(delta)
-                    positions = (
-                        np.arange(prefix_len, prefix_len + extend_len, dtype=np.int32) + delta_val
-                    )
-                else:
-                    positions = np.arange(prefix_len, prefix_len + extend_len, dtype=np.int32)
-                chunk = np.broadcast_to(positions.reshape(1, -1), (3, extend_len))
-            mrope_positions_list.append(chunk.astype(np.int32, copy=False))
-
-        mrope_positions = (
-            np.concatenate(mrope_positions_list, axis=1)
-            if mrope_positions_list
-            else np.zeros((3, 0), dtype=np.int32)
-        )
-
-    pad_len = input_ids_len - mrope_positions.shape[1]
-    if pad_len > 0:
-        pad = np.zeros((3, pad_len), dtype=mrope_positions.dtype)
-        mrope_positions = np.concatenate([mrope_positions, pad], axis=1)
-    return mrope_positions
 
 
 @dataclasses.dataclass
