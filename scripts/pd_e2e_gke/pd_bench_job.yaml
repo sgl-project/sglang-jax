@@ -48,7 +48,7 @@ spec:
         - name: P_HOST
           value: "<JOB_NAME>-0.<JOB_NAME>-headless-svc"
         - name: MODEL_PATH
-          value: "/models/Qwen/Qwen3-8B-Base"
+          value: "/models/DeepSeek-R1-Distill-Qwen-1.5B"
         command:
         - bash
         - -c
@@ -150,7 +150,8 @@ spec:
               --prefill-url "$P_URL" \
               --decode-url "$D_URL" \
               --num-questions 200 \
-              --parallel 16 \
+              --max-new-tokens 256 \
+              --parallel 8 \
               --result-file /tmp/gsm8k_results.jsonl \
               --output-file /tmp/gsm8k_outputs.txt
             GSM_EXIT=$?
@@ -163,8 +164,8 @@ spec:
               --prefill-url "$P_URL" \
               --decode-url "$D_URL" \
               --model-path "$MODEL_PATH" \
-              --configs "512:1024:16,1024:1024:32,2048:1024:32,4096:1024:64" \
-              --num-requests 32 \
+              --configs "512:256:4,1024:256:8,2048:256:8" \
+              --num-requests 16 \
               --output-file /tmp/throughput_results.json
             BENCH_EXIT=$?
             echo "Throughput exit: $BENCH_EXIT"
