@@ -78,7 +78,8 @@ jobs:
           python3 run_suite.py --suite nightly-test-openai-api-surface-tpu-v6e-1-daily
 
   multi-host-test-mimo-flash-daily:
-    if: github.repository == 'sgl-project/sglang-jax'
+    # Temporarily skipped until CI has 4-node v6e capacity for this multi-host suite.
+    if: false
     uses: ./.github/workflows/multi-host-test.yml
     permissions:
       contents: read
@@ -133,6 +134,10 @@ jobs:
             "infra-smoke-1-tpu-daily=${{ needs.nightly-infra-smoke-1-tpu-daily.result }}"; do
             job_name="${job_result%%=*}"
             result="${job_result#*=}"
+            if [ "$job_name" = "multi-host-mimo-flash-daily" ] && [ "$result" = "skipped" ]; then
+              echo "${job_name} temporarily skipped: multi-host CI capacity unavailable"
+              continue
+            fi
             if [ "$result" != "success" ]; then
               echo "::error::${job_name} did not succeed: ${result}"
               has_failure=true
