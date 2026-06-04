@@ -65,7 +65,7 @@ class FusedEPMoE(nnx.Module):
         num_shared_experts: int = 0,
         moe_shared_expert_intermediate_size: int | None = None,
         quantization_config=None,
-        enable_act_quant: bool | None = None,
+        enable_act_quant: bool = True,
         # Profiling / ablation flags (primarily for microbenching).
         disable_a2a: bool = False,
         disable_dynamic_ffn1: bool = False,

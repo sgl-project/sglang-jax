@@ -466,7 +466,6 @@ class BailingMoELinearDecoderLayer(nnx.Module):
                 num_shared_experts=num_shared_experts if use_inkernel_se else 0,
                 moe_shared_expert_intermediate_size=moe_shared_expert_intermediate_size,
                 quantization_config=getattr(config, "quantization_config", None),
-                enable_act_quant=getattr(config, "moe_fused_act_quant", None),
             )
         elif self.moe_backend == MoEBackend.FUSED:
             self.mlp = FusedEPMoE(
