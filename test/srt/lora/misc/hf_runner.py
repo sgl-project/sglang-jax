@@ -1,11 +1,9 @@
 # misc file, only used for dump hf_logprobs
 # adapted from sglang python/sglang/test/runners.py
 # Copyright 2023-2024 SGLang Team
-import json
 import multiprocessing as mp
-import os
 from dataclasses import dataclass
-from typing import Any, List, Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -418,7 +416,7 @@ class HFRunner:
 
             if lora_paths is not None and lora_paths[i] is not None:
                 # Unload the LoRA adapter if it is used
-                model.unload()
+                base_model = model.unload()
 
         return ModelOutput(
             output_strs=output_strs,

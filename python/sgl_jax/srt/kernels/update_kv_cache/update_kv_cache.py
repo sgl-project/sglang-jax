@@ -6,6 +6,7 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
+from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.utils import cdiv
@@ -117,6 +118,36 @@ def kv_cache_update_kernel(
         async_copy.wait()
 
 
+def _reshape_fused_kv_to_3d(x):
+    """Reshape 5D fused KV to 3D for Pallas kernel.
+
+    [tokens, page_size, packed_heads, packing, head_dim]
+    -> [tokens * page_size, packed_heads * packing, head_dim]
+
+    JAX 0.9.2 requires explicit out_sharding when reshaping sharded arrays.
+    Strips NamedSharding to replicated because pallas_call requires Manual
+    mesh axes and rejects Explicit inputs.
+    """
+    s = x.shape
+    out_shape = (s[0] * s[1], s[2] * s[3], s[4])
+
+    sharding = getattr(x, "sharding", None)
+    if isinstance(sharding, NamedSharding):
+        # Strip Explicit NamedSharding before feeding the 3D views to Pallas.
+        # Pallas kernels expect Manual mesh axes under shard_map and reject
+        # Explicit sharding annotations in JAX 0.9.2.
+        # In the sharded path, the enclosing shard_map out_specs restores the
+        # expected output sharding. In the local/test path, correctness does
+        # not depend on preserving the intermediate sharding annotation.
+        return jax.lax.reshape(
+            x,
+            out_shape,
+            out_sharding=P(None, None, None),
+        )
+
+    return x.reshape(out_shape)
+
+
 def kv_cache_update_impl(
     new_kv,
     slices,
@@ -133,10 +164,8 @@ def kv_cache_update_impl(
     ), f"slices.shape[1]={slices.shape[1]} is not divisible by num_slices_per_block={num_slices_per_block}"
 
     original_cache_shape = kv_cache.shape
-    s = new_kv.shape
-    new_kv = new_kv.reshape(s[0] * s[1], s[2] * s[3], s[4])
-    s = kv_cache.shape
-    kv_cache = kv_cache.reshape(s[0] * s[1], s[2] * s[3], s[4])
+    new_kv = _reshape_fused_kv_to_3d(new_kv)
+    kv_cache = _reshape_fused_kv_to_3d(kv_cache)
 
     _, num_combined_kv_heads, head_dim = new_kv.shape
 

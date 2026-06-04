@@ -1,10 +1,13 @@
 import jax
 import jax.numpy as jnp
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.configs.bailing_hybrid import (
     BailingHybridConfig,
     get_bailing_hybrid_config,
 )
+from sgl_jax.srt.layers.attention.linear.lightning_backend import _head_axis
 from sgl_jax.srt.model_loader.arch import get_model_architecture
 from sgl_jax.srt.models.bailing_moe_linear import (
     BailingMoEGQAAttention,
@@ -117,6 +120,23 @@ def test_decoder_layer_selects_gqa_fallback_for_non_mla_full_attention():
         full_layer = BailingMoELinearDecoderLayer(cfg, mesh=mesh, layer_id=1, dtype=jnp.float32)
 
     assert isinstance(full_layer.self_attn, BailingMoEGQAAttention)
+
+
+def test_linear_attention_head_axis_only_shards_divisible_heads():
+    mesh = create_device_mesh(ici_parallelism=[1, -1], dcn_parallelism=[1, 1])
+
+    assert _head_axis(mesh, mesh.shape["tensor"] * 2) == "tensor"
+    assert _head_axis(mesh, 2) is None
+
+    qkv = jnp.ones((3, 48), dtype=jnp.float32)
+    qkv = jax.lax.reshape(
+        qkv,
+        (3, 3, 2, 8),
+        out_sharding=NamedSharding(mesh, P("data", None, _head_axis(mesh, 2), None)),
+    )
+
+    assert qkv.shape == (3, 3, 2, 8)
+    assert qkv.sharding.spec == P("data", None, None, None)
 
 
 def test_weight_mapping_contains_linear_mla_dense_and_shared_mlp_keys():

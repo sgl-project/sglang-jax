@@ -35,6 +35,7 @@ from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
     LinearRecurrentAttnBackend,
 )
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+from sgl_jax.srt.utils.jax_utils import effective_axis
 
 
 def _mesh_tp_size(mesh: jax.sharding.Mesh) -> int:
@@ -200,9 +201,25 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
         """One token per request — single conv1d update + parallel single
         recurrence step across the batch, all inside a shard_map."""
         state_indices = self.forward_metadata.recurrent_indices
-        tp = _mesh_tp_size(self.mesh)
+        mixed_data = effective_axis(mixed_qkv, 0, "data")
+        mixed_axis = effective_axis(mixed_qkv, 1, "tensor")
+        conv_data = effective_axis(conv_state_in, 0, "data")
+        conv_axis = effective_axis(conv_state_in, 1, "tensor")
+        rec_data = effective_axis(recurrent_state_in, 0, "data")
+        rec_axis = effective_axis(recurrent_state_in, 1, "tensor")
+        weight_axis = effective_axis(self.conv1d_weight.value, 0, "tensor")
+        a_log_axis = effective_axis(self.A_log.value, 0, "tensor")
+        dt_bias_axis = effective_axis(self.dt_bias.value, 0, "tensor")
+        b_data = effective_axis(b, 0, "data")
+        b_axis = effective_axis(b, 1, "tensor")
+        a_data = effective_axis(a, 0, "data")
+        a_axis = effective_axis(a, 1, "tensor")
+        idx_data = effective_axis(state_indices, 0, "data")
+
+        tp = _mesh_tp_size(self.mesh) if mixed_axis == "tensor" else 1
+        v_tp = _mesh_tp_size(self.mesh) if b_axis == "tensor" else 1
         n_kq_tp = self.num_k_heads // tp
-        n_v_tp = self.num_v_heads // tp
+        n_v_tp = self.num_v_heads // v_tp
         d_k = self.head_k_dim
         d_v = self.head_v_dim
 
@@ -244,20 +261,20 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
             _decode_local,
             mesh=self.mesh,
             in_specs=(
-                P(None, "tensor"),  # mixed_qkv
-                P(None, "tensor", None),  # conv_state
-                P(None, "tensor", None, None),  # recurrent_state
-                P("tensor", None),  # conv1d weight
-                P("tensor"),  # A_log
-                P("tensor"),  # dt_bias
-                P(None, "tensor"),  # b
-                P(None, "tensor"),  # a
-                P(),  # state_indices (replicated)
+                P(mixed_data, mixed_axis),  # mixed_qkv
+                P(conv_data, conv_axis, None),  # conv_state
+                P(rec_data, rec_axis, None, None),  # recurrent_state
+                P(weight_axis, None),  # conv1d weight
+                P(a_log_axis),  # A_log
+                P(dt_bias_axis),  # dt_bias
+                P(b_data, b_axis),  # b
+                P(a_data, a_axis),  # a
+                P(idx_data),  # state_indices
             ),
             out_specs=(
-                P(None, "tensor", None),  # out [B, n_v, d_v]
-                P(None, "tensor", None),  # new_conv_state [num_blocks, conv_dim, K-1]
-                P(None, "tensor", None, None),  # new_rec_state [num_blocks, n_v, d_k, d_v]
+                P(b_data, b_axis, None),  # out [B, n_v, d_v]
+                P(conv_data, conv_axis, None),  # new_conv_state [num_blocks, conv_dim, K-1]
+                P(rec_data, rec_axis, None, None),  # new_rec_state [num_blocks, n_v, d_k, d_v]
             ),
             check_vma=False,
         )(
@@ -289,9 +306,32 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
         cu_seqlens = meta.cu_q_lens
         state_indices = meta.recurrent_indices
         has_initial_state = meta.has_initial_state
-        tp = _mesh_tp_size(self.mesh)
+        mixed_data = effective_axis(mixed_qkv, 0, "data")
+        mixed_axis = effective_axis(mixed_qkv, 1, "tensor")
+        conv_data = effective_axis(conv_state_in, 0, "data")
+        conv_axis = effective_axis(conv_state_in, 1, "tensor")
+        rec_data = effective_axis(recurrent_state_in, 0, "data")
+        rec_axis = effective_axis(recurrent_state_in, 1, "tensor")
+        weight_axis = effective_axis(self.conv1d_weight.value, 0, "tensor")
+        a_log_axis = effective_axis(self.A_log.value, 0, "tensor")
+        dt_bias_axis = effective_axis(self.dt_bias.value, 0, "tensor")
+        b_data = effective_axis(b, 0, "data")
+        b_axis = effective_axis(b, 1, "tensor")
+        a_data = effective_axis(a, 0, "data")
+        a_axis = effective_axis(a, 1, "tensor")
+        cu_data = effective_axis(cu_seqlens, 0, "data")
+        idx_data = effective_axis(state_indices, 0, "data")
+        init_data = (
+            effective_axis(has_initial_state, 0, "data")
+            if has_initial_state is not None
+            else None
+        )
+        init_spec = P(init_data) if has_initial_state is not None else P()
+
+        tp = _mesh_tp_size(self.mesh) if mixed_axis == "tensor" else 1
+        v_tp = _mesh_tp_size(self.mesh) if b_axis == "tensor" else 1
         n_kq_tp = self.num_k_heads // tp
-        n_v_tp = self.num_v_heads // tp
+        n_v_tp = self.num_v_heads // v_tp
         d_k = self.head_k_dim
         d_v = self.head_v_dim
 
@@ -344,22 +384,22 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
             _extend_local,
             mesh=self.mesh,
             in_specs=(
-                P(None, "tensor"),  # mixed_qkv
-                P(None, "tensor", None),  # conv_state
-                P(None, "tensor", None, None),  # recurrent_state
-                P("tensor", None),  # conv1d weight
-                P("tensor"),  # A_log
-                P("tensor"),  # dt_bias
-                P(None, "tensor"),  # b
-                P(None, "tensor"),  # a
-                P(),  # cu_seqlens (replicated)
-                P(),  # state_indices (replicated)
-                P(),  # has_initial_state (replicated)
+                P(mixed_data, mixed_axis),  # mixed_qkv
+                P(conv_data, conv_axis, None),  # conv_state
+                P(rec_data, rec_axis, None, None),  # recurrent_state
+                P(weight_axis, None),  # conv1d weight
+                P(a_log_axis),  # A_log
+                P(dt_bias_axis),  # dt_bias
+                P(b_data, b_axis),  # b
+                P(a_data, a_axis),  # a
+                P(cu_data),  # cu_seqlens
+                P(idx_data),  # state_indices
+                init_spec,  # has_initial_state
             ),
             out_specs=(
-                P(None, "tensor", None),  # out [T, n_v, d_v]
-                P(None, "tensor", None),  # new_conv_state [num_blocks, conv_dim, K-1]
-                P(None, "tensor", None, None),  # new_rec_state [num_blocks, n_v, d_k, d_v]
+                P(b_data, b_axis, None),  # out [T, n_v, d_v]
+                P(conv_data, conv_axis, None),  # new_conv_state [num_blocks, conv_dim, K-1]
+                P(rec_data, rec_axis, None, None),  # new_rec_state [num_blocks, n_v, d_k, d_v]
             ),
             check_vma=False,
         )(

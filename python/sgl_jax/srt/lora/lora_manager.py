@@ -23,12 +23,17 @@ from jax.sharding import Mesh
 
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.lora.backend.bgmv_backend import BgmvLoRABackend
+from sgl_jax.srt.lora.constants import is_base_lora_id, normalize_lora_id
 from sgl_jax.srt.lora.layers import BaseLayerWithLoRA
 from sgl_jax.srt.lora.lora import LoRAAdapter
 from sgl_jax.srt.lora.lora_config import LoRAConfig
 from sgl_jax.srt.lora.lora_memory_pool import LoRAMemoryPool
 from sgl_jax.srt.lora.lora_registry import LoRARef
-from sgl_jax.srt.lora.utils import get_normalized_target_modules, get_target_module_name
+from sgl_jax.srt.lora.utils import (
+    LoRABatchPlan,
+    get_normalized_target_modules,
+    get_target_module_name,
+)
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 
 logger = logging.getLogger(__name__)
@@ -98,6 +103,9 @@ class LoRAManager:
         self.mesh = mesh
         self.server_args = server_args
         self.model_config = model_config
+        self.static_lora = bool(getattr(server_args, "enable_static_lora", False))
+        self.num_lora_slots = max_loras_per_batch if self.static_lora else max_loras_per_batch + 1
+        self.has_new_weights = False
 
         # Extract model architecture from hf_config
         self.num_layers = base_hf_config.num_hidden_layers
@@ -110,7 +118,6 @@ class LoRAManager:
         self.head_dim = getattr(base_hf_config, "head_dim", None)
         if self.head_dim is None:
             self.head_dim = self.hidden_size // self.num_attention_heads
-        self.static_lora = server_args.enable_static_lora
 
         # Get original num_kv_heads and tp_size for replication
         if model_config is not None:
@@ -235,11 +242,8 @@ class LoRAManager:
                     unsupported = adapter_target_modules - self.target_modules
                     lora_name = self.lora_refs[lora_id].lora_name
                     raise ValueError(
-                        "LoRA adapter '%s' contains unsupported modules: %s. "
-                        "Specified target_modules: %s",
-                        lora_name,
-                        unsupported,
-                        self.target_modules,
+                        f"LoRA adapter {lora_name!r} contains unsupported modules: "
+                        f"{unsupported}. Specified target_modules: {self.target_modules}"
                     )
             else:
                 # Infer target_modules from adapter
@@ -263,9 +267,10 @@ class LoRAManager:
     def init_memory_pool(self):
         """Initialize the LoRA memory pool with proper sharding."""
         logger.info(
-            "Initializing LoRA memory pool: num_layers=%d, max_loras_per_batch=%d, max_lora_rank=%d",
+            "Initializing LoRA memory pool: num_layers=%d, max_loras_per_batch=%d, num_lora_slots=%d, max_lora_rank=%d",
             self.num_layers,
             self.max_loras_per_batch,
+            self.num_lora_slots,
             self.max_lora_rank,
         )
         logger.info(
@@ -292,6 +297,7 @@ class LoRAManager:
             head_dim=self.head_dim,
             original_num_kv_heads=self.original_num_kv_heads,
             tp_size=self.tp_size,
+            reserve_base_slot=not self.static_lora,
         )
         self.memory_pool.init_buffers()
 
@@ -371,7 +377,7 @@ class LoRAManager:
 
         # Create LoRA backend
         lora_backend = BgmvLoRABackend(
-            max_loras_per_batch=self.max_loras_per_batch,
+            max_loras_per_batch=self.num_lora_slots,
             max_lora_rank=self.max_lora_rank,
         )
 
@@ -408,6 +414,39 @@ class LoRAManager:
         """Check if memory pool can support the given LoRA config."""
         return self.memory_pool.can_support(config)
 
+    def _build_static_lora_batch_plan(self, batch_size: int) -> LoRABatchPlan:
+        return LoRABatchPlan.for_static_lora(
+            batch_size=batch_size,
+            num_lora_slots=self.num_lora_slots,
+            rank=self.max_lora_rank,
+            scaling=self.server_args.lora_scaling,
+        )
+
+    def _build_dynamic_lora_batch_plan(
+        self,
+        lora_ids: list[str],
+        cur_uids: list[str],
+    ) -> tuple[LoRABatchPlan, bool]:
+        has_new_weights = self.memory_pool.prepare_lora_batch(
+            cur_uids=cur_uids,
+            lora_adapters=self.loras,
+        )
+
+        weight_indices = []
+        lora_ranks = [0] * self.num_lora_slots
+        scalings = [0.0] * self.num_lora_slots
+
+        for uid in lora_ids:
+            buffer_id = self.memory_pool.get_buffer_id(uid)
+            weight_indices.append(buffer_id)
+
+            if uid in self.loras:
+                lora = self.loras[uid]
+                lora_ranks[buffer_id] = lora.config.r
+                scalings[buffer_id] = lora.scaling
+
+        return LoRABatchPlan(weight_indices, lora_ranks, scalings), has_new_weights
+
     def prepare_lora_batch(self, model_worker_batch: ModelWorkerBatch):
         """
         Prepare LoRA batch for inference.
@@ -421,50 +460,40 @@ class LoRAManager:
         Raises:
             ValueError: If batch exceeds max_loras_per_batch or adapter not loaded
         """
-        # Load active loras into lora memory pool
-        cur_uids = set(model_worker_batch.lora_ids)
+        # Load active LoRAs into the memory pool. Normalize the base-model
+        # sentinel locally and keep first-seen order stable so adapter slots are
+        # deterministic across batches without mutating scheduler-owned input.
+        lora_ids = [normalize_lora_id(uid) for uid in model_worker_batch.lora_ids]
+        cur_uids = list(dict.fromkeys(lora_ids))
+        real_uids = [uid for uid in cur_uids if not is_base_lora_id(uid)]
 
-        assert len(cur_uids) <= self.max_loras_per_batch
+        if len(real_uids) > self.max_loras_per_batch:
+            raise ValueError(
+                f"Batch uses {len(real_uids)} LoRA adapters, exceeding "
+                f"max_loras_per_batch={self.max_loras_per_batch}"
+            )
 
-        weight_indices = [0] * len(model_worker_batch.lora_ids)
-        lora_ranks = [0] * self.max_loras_per_batch
-        scalings = [0] * self.max_loras_per_batch
+        unknown_uids = [uid for uid in real_uids if uid not in self.loras]
+        if not self.static_lora and unknown_uids:
+            raise ValueError(
+                "LoRA adapters are not loaded: "
+                f"{unknown_uids}. Available adapters: {sorted(self.loras)}"
+            )
+
         has_new_weights = False
 
-        def prepare_static_lora_batch():
-            self.lora_backend.prepare_lora_batch(
-                model_worker_batch=model_worker_batch,
-                weight_indices=[0] * len(model_worker_batch.lora_ids),
-                lora_ranks=[self.max_lora_rank] * self.max_loras_per_batch,
-                scalings=[self.server_args.lora_scaling] * self.max_loras_per_batch,
-            )
-
-        def prepare_dynamic_lora_batch():
-            # Load adapters into device memory pool (CPU -> device transfer)
-            has_new_weights = self.memory_pool.prepare_lora_batch(
-                cur_uids=cur_uids,
-                lora_adapters=self.loras,
-            )
-
-            for i, uid in enumerate(model_worker_batch.lora_ids):
-                weight_indices[i] = self.memory_pool.get_buffer_id(uid)
-                if uid is not None and uid in self.loras:
-                    lora = self.loras[uid]
-                    lora_ranks[weight_indices[i]] = lora.config.r
-                    scalings[weight_indices[i]] = lora.scaling
-
-            self.lora_backend.prepare_lora_batch(
-                model_worker_batch=model_worker_batch,
-                weight_indices=weight_indices,
-                lora_ranks=lora_ranks,
-                scalings=scalings,
-            )
-            return has_new_weights
-
         if self.static_lora:
-            prepare_static_lora_batch()
+            batch_plan = self._build_static_lora_batch_plan(len(lora_ids))
         else:
-            has_new_weights = prepare_dynamic_lora_batch()
+            batch_plan, has_new_weights = self._build_dynamic_lora_batch_plan(
+                lora_ids=lora_ids,
+                cur_uids=cur_uids,
+            )
+
+        self.lora_backend.prepare_lora_batch(
+            model_worker_batch=model_worker_batch,
+            batch_plan=batch_plan,
+        )
 
         # Update LoRA layer buffer references after loading new weights
         # This is necessary because JAX arrays are immutable, and load_lora_weight_to_buffer
@@ -608,7 +637,7 @@ class LoRAManager:
             from sgl_jax.srt.lora.backend.bgmv_backend import BgmvLoRABackend
 
             self.lora_backend = BgmvLoRABackend(
-                max_loras_per_batch=self.max_loras_per_batch,
+                max_loras_per_batch=self.num_lora_slots,
                 max_lora_rank=self.max_lora_rank,
             )
 
@@ -623,32 +652,3 @@ class LoRAManager:
 
         # Track the replacement
         self.lora_modules[layer_idx][attr_name] = lora_layer
-
-    def _get_nested_attr(self, obj, attr_path: str):
-        """
-        Get nested attribute using dot notation.
-
-        Args:
-            obj: Object to traverse
-            attr_path: Dot-separated path (e.g., "layers.0.self_attn.q_proj")
-
-        Returns:
-            The nested attribute
-        """
-        for attr in attr_path.split("."):
-            obj = getattr(obj, attr)
-        return obj
-
-    def _set_nested_attr(self, obj, attr_path: str, value):
-        """
-        Set nested attribute using dot notation.
-
-        Args:
-            obj: Object to traverse
-            attr_path: Dot-separated path
-            value: Value to set
-        """
-        parts = attr_path.split(".")
-        for attr in parts[:-1]:
-            obj = getattr(obj, attr)
-        setattr(obj, parts[-1], value)

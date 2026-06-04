@@ -184,7 +184,9 @@ class BailingMoELinearAttention(nnx.Module):
             k = jax.nn.silu(k)
             v = jax.nn.silu(v)
 
-        head_shard = NamedSharding(self.mesh, P("data", "tensor", None))
+        tensor_size = self.mesh.shape.get("tensor", 1) if self.mesh else 1
+        head_axis = "tensor" if self.num_heads % tensor_size == 0 else None
+        head_shard = NamedSharding(self.mesh, P("data", head_axis, None))
         q = q.reshape(
             hidden_states.shape[0], self.num_heads, self.head_dim, out_sharding=head_shard
         )

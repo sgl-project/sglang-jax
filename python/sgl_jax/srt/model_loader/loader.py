@@ -130,6 +130,24 @@ class DefaultModelLoader(BaseModelLoader):
         if is_local:
             hf_folder = model_name_or_path
         else:
+            if os.path.isabs(model_name_or_path):
+                models_prefix = os.path.join(os.path.sep, "models") + os.path.sep
+                if model_name_or_path.startswith(models_prefix):
+                    repo_id = model_name_or_path[len(models_prefix) :].strip(os.path.sep)
+                    if len(repo_id.split(os.path.sep)) == 2:
+                        model_name_or_path = repo_id
+                    else:
+                        raise ValueError(
+                            f"Model path {model_name_or_path!r} does not exist locally and "
+                            "cannot be interpreted as a HuggingFace repo id. Expected either "
+                            "an existing directory or /models/<namespace>/<repo>."
+                        )
+                else:
+                    raise ValueError(
+                        f"Model path {model_name_or_path!r} is absolute but does not exist. "
+                        "Pass an existing local directory or a HuggingFace repo id."
+                    )
+
             from huggingface_hub import snapshot_download
 
             hf_folder = snapshot_download(

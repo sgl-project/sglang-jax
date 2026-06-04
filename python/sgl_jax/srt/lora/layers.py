@@ -19,6 +19,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import jax
+import jax.numpy as jnp
 from flax import nnx
 from jax.sharding import Mesh
 
@@ -33,7 +34,26 @@ from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 if TYPE_CHECKING:
     from sgl_jax.srt.lora.backend.base_backend import BaseLoRABackend
 
-global debug_count
+
+def _restore_base_output_for_rank_zero(
+    base_output: jax.Array,
+    lora_output: jax.Array,
+    ranks: jax.Array | None,
+) -> jax.Array:
+    """Keep no-LoRA rows exact when they share a compiled LoRA batch."""
+    if ranks is None:
+        return lora_output
+
+    if ranks.ndim > lora_output.ndim:
+        raise ValueError(
+            f"LoRA ranks must be broadcastable to output: ranks.ndim={ranks.ndim}, "
+            f"output.ndim={lora_output.ndim}"
+        )
+
+    base_mask = ranks == 0
+    broadcast_shape = base_mask.shape + (1,) * (lora_output.ndim - base_mask.ndim)
+    base_mask = jnp.reshape(base_mask, broadcast_shape)
+    return jnp.where(base_mask, base_output, lora_output)
 
 
 class BaseLayerWithLoRA(nnx.Module):
@@ -79,7 +99,6 @@ class LoRALinear(BaseLayerWithLoRA):
             backend: LoRA backend for computation
         """
         super().__init__(base_layer, lora_backend)
-        self.lora_backend = lora_backend
 
     def set_lora_info(
         self,
@@ -104,7 +123,7 @@ class LoRALinear(BaseLayerWithLoRA):
             self.A_buffer = nnx.Param(A_buffer)
             self.B_buffer = nnx.Param(B_buffer)
 
-    def apply_lora(self, base_output, x, scalings, token_indices) -> jax.Array:
+    def apply_lora(self, base_output, x, scalings, token_indices, ranks) -> jax.Array:
         lora_a_output = self.lora_backend.run_lora_a_gemm(
             x=x,
             weights=self.A_buffer,
@@ -119,7 +138,7 @@ class LoRALinear(BaseLayerWithLoRA):
             sharding=self.lora_b_output_sharding,
             token_indices=token_indices,
         )
-        return lora_output
+        return _restore_base_output_for_rank_zero(base_output, lora_output, ranks)
 
     def __call__(
         self,
@@ -135,11 +154,21 @@ class LoRALinear(BaseLayerWithLoRA):
             Output tensor with LoRA delta added (if enabled) and bias from base_model
         """
         forward_batch = LoraBatchContext.get_batch()
+        if forward_batch is None:
+            raise RuntimeError(
+                "LoRALinear requires LoraBatchContext to be set before forward. "
+                "Ensure LoRAManager.prepare_lora_batch runs and the model forward is "
+                "wrapped in LoraBatchContext.set_batch(...)."
+            )
 
         base_output, output_bias = self.base_layer(x)
 
         output = self.apply_lora(
-            base_output, x, forward_batch.lora_scalings, forward_batch.lora_token_indices
+            base_output,
+            x,
+            forward_batch.lora_scalings,
+            forward_batch.lora_token_indices,
+            forward_batch.lora_ranks,
         )
         return output, output_bias
 

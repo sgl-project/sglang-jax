@@ -29,6 +29,7 @@ from fastapi import BackgroundTasks
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.hf_transformers_utils import get_tokenizer
+from sgl_jax.srt.lora.constants import BASE_LORA_ID, is_base_lora_id
 from sgl_jax.srt.lora.lora_registry import LoRARegistry
 from sgl_jax.srt.managers.io_struct import (
     AbortReq,
@@ -261,9 +262,16 @@ class TokenizerManager:
         self.auto_create_handle_loop()
         obj.normalize_batch_and_arguments()
 
-        # Acquire LoRA ID if lora_path is provided
-        if isinstance(obj, GenerateReqInput) and self.server_args.enable_lora and obj.lora_path:
-            obj.lora_id = await self.lora_registry.acquire(obj.lora_path)
+        # Acquire LoRA ID if lora_path is provided. On LoRA-enabled servers,
+        # base-model requests use an explicit namespace so radix-cache
+        # entries cannot collide with adapter-specific prefixes.
+        if isinstance(obj, GenerateReqInput) and self.server_args.enable_lora:
+            if obj.lora_path:
+                obj.lora_id = await self.lora_registry.acquire(obj.lora_path)
+            elif obj.is_single:
+                obj.lora_id = BASE_LORA_ID
+            else:
+                obj.lora_id = [BASE_LORA_ID] * obj.batch_size
 
         if isinstance(obj, EmbeddingReqInput) and self.is_generation:
             raise ValueError(
@@ -1063,6 +1071,7 @@ class TokenizerManager:
                     isinstance(state.obj, GenerateReqInput)
                     and self.server_args.enable_lora
                     and state.obj.lora_id
+                    and not is_base_lora_id(state.obj.lora_id)
                 ):
                     asyncio.create_task(self.lora_registry.release(state.obj.lora_id))
                 del self.rid_to_state[rid]

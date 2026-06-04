@@ -18,6 +18,7 @@ import asyncio
 from dataclasses import dataclass, field, fields
 from uuid import uuid4
 
+from sgl_jax.srt.lora.constants import BASE_LORA_ID, is_base_lora_id
 from sgl_jax.srt.utils import ConcurrentCounter, RWLock
 
 
@@ -39,6 +40,8 @@ class LoRARef:
     def __post_init__(self):
         if self.lora_id is None:
             raise ValueError("lora_id cannot be None")
+        if self.lora_id == BASE_LORA_ID:
+            raise ValueError(f"lora_id {BASE_LORA_ID!r} is reserved for base-model requests")
 
     def __str__(self) -> str:
         parts = [
@@ -105,15 +108,15 @@ class LoRARegistry:
 
         return lora_ref.lora_id
 
-    async def acquire(self, lora_name: str | list[str]) -> str | list[str]:
+    async def acquire(self, lora_name: str | None | list[str | None]) -> str | list[str]:
         """
         Queries registry for LoRA IDs based on LoRA names and start tracking the usage of the corresponding LoRA adapters
         by incrementing its counter.
         """
 
-        def _lookup(name: str) -> str:
+        def _lookup(name: str | None) -> str:
             if name is None:
-                return None
+                return BASE_LORA_ID
 
             lora_ref = self._registry.get(name, None)
             if lora_ref is None:
@@ -128,6 +131,8 @@ class LoRARegistry:
                 lora_id = _lookup(lora_name)
                 await self._counters[lora_id].increment(notify_all=False)
                 return lora_id
+            elif lora_name is None:
+                return BASE_LORA_ID
             elif isinstance(lora_name, list):
                 lora_ids = [_lookup(name) for name in lora_name]
 
@@ -136,7 +141,7 @@ class LoRARegistry:
                     *[
                         self._counters[id].increment(notify_all=False)
                         for id in lora_ids
-                        if id is not None
+                        if not is_base_lora_id(id)
                     ]
                 )
                 return lora_ids
@@ -150,10 +155,16 @@ class LoRARegistry:
 
         async with self._registry_lock.reader_lock:
             if isinstance(lora_id, str):
+                if is_base_lora_id(lora_id):
+                    return
                 await self._counters[lora_id].decrement()
             elif isinstance(lora_id, list):
                 await asyncio.gather(
-                    *[self._counters[id].decrement() for id in lora_id if id is not None]
+                    *[
+                        self._counters[id].decrement()
+                        for id in lora_id
+                        if not is_base_lora_id(id)
+                    ]
                 )
             else:
                 raise TypeError("lora_id must be either a string or a list of strings.")
