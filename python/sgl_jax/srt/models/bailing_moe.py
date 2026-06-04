@@ -315,6 +315,8 @@ class BailingMoEDecoderLayer(nnx.Module):
                 "moe_shared_expert_intermediate_size",
                 config.moe_intermediate_size,
             )
+            use_inkernel_se = self.moe_backend == MoEBackend.FUSED_V2 and num_shared_experts > 0
+            self.use_inkernel_se = use_inkernel_se
 
             self.topk = TopK(
                 topk=config.num_experts_per_tok,
@@ -341,7 +343,8 @@ class BailingMoEDecoderLayer(nnx.Module):
                     use_grouped_topk=config.n_group > 0,
                     num_groups=config.n_group,
                     top_k_groups=config.topk_group,
-                    num_shared_experts=0,
+                    num_shared_experts=num_shared_experts if use_inkernel_se else 0,
+                    moe_shared_expert_intermediate_size=moe_shared_expert_intermediate_size,
                     quantization_config=getattr(config, "quantization_config", None),
                 )
             elif self.use_fused:
@@ -360,8 +363,7 @@ class BailingMoEDecoderLayer(nnx.Module):
                     use_grouped_topk=config.n_group > 0,
                     num_groups=config.n_group,
                     top_k_groups=config.topk_group,
-                    num_shared_experts=num_shared_experts,
-                    moe_shared_expert_intermediate_size=moe_shared_expert_intermediate_size,
+                    num_shared_experts=0,
                     quantization_config=getattr(config, "quantization_config", None),
                 )
             else:
@@ -378,7 +380,7 @@ class BailingMoEDecoderLayer(nnx.Module):
                     quantization_config=getattr(config, "quantization_config", None),
                 )
 
-            if num_shared_experts > 0 and self.moe_backend != MoEBackend.FUSED:
+            if num_shared_experts > 0 and not use_inkernel_se:
                 self.shared_experts = BailingMoEMLP(
                     hidden_size=config.hidden_size,
                     intermediate_size=moe_shared_expert_intermediate_size * num_shared_experts,
@@ -846,7 +848,7 @@ class BailingMoEForCausalLM(nnx.Module):
 
             num_shared = getattr(self.config, "num_shared_experts", 0)
             if num_shared > 0:
-                use_fused_shared = moe_backend == "fused"
+                use_fused_shared = moe_backend == "fused_v2" and num_shared > 0
                 if use_fused_shared:
                     shared_map = [
                         ("gate_proj", "w1_shared"),
