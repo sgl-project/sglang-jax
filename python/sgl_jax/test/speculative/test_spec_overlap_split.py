@@ -40,3 +40,17 @@ def test_split_phase_entrypoints_import():
 
     assert callable(spec_decode_verify_phase)
     assert hasattr(BaseSpecWorker, "forward_batch_speculative_verify_phase")
+
+
+def test_split_phase_wrapper_entrypoints_import():
+    from sgl_jax.srt.speculative.base_worker import BaseSpecWorker
+    from sgl_jax.srt.speculative.draft_extend_fused import (
+        spec_decode,
+        spec_decode_draft_extend_phase,
+        spec_decode_verify_phase,
+    )
+
+    assert callable(spec_decode)
+    assert callable(spec_decode_verify_phase)
+    assert callable(spec_decode_draft_extend_phase)
+    assert hasattr(BaseSpecWorker, "forward_batch_speculative_draft_extend_phase")

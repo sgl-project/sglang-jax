@@ -111,6 +111,18 @@ class BaseSpecWorker:
 
         return spec_decode_verify_phase(self, model_worker_batch, cur_allocate_lens)
 
+    def forward_batch_speculative_draft_extend_phase(
+        self,
+        model_worker_batch: ModelWorkerBatch,
+        verify_phase_result,
+    ):
+        """Run greedy fused draft_extend after phase A has been published."""
+        from sgl_jax.srt.speculative.draft_extend_fused import (
+            spec_decode_draft_extend_phase,
+        )
+
+        return spec_decode_draft_extend_phase(self, model_worker_batch, verify_phase_result)
+
     def forward_batch_speculative_generation(self, model_worker_batch: ModelWorkerBatch):
         from sgl_jax.srt.managers.scheduler import GenerationBatchResult
         from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
