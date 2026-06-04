@@ -36,8 +36,9 @@ class TestMiMoVisionEncoderE2E(unittest.TestCase):
         )
 
         vision_config = load_vision_config_dict()
-        cls.config = make_checkpoint_vision_config(vision_config)
-        cls.hf_transformer = load_hf_vision_transformer(MIMO_MODEL_PATH, cls.config)
+        hf_config = make_hf_vision_config(vision_config)
+        cls.hf_transformer = load_hf_vision_transformer(MIMO_MODEL_PATH, hf_config)
+        cls.config = make_checkpoint_vision_config(vision_config, cls.hf_transformer)
         cls.mesh = create_device_mesh(ici_parallelism=[1, -1], dcn_parallelism=[1, 1])
         with jax.set_mesh(cls.mesh):
             cls.jax_transformer = MiMoVisionTransformer(
@@ -93,53 +94,44 @@ def load_vision_config_dict(model_path: str = MIMO_MODEL_PATH) -> dict:
     return vision_config
 
 
-def make_checkpoint_vision_config(vision_config: dict, model_path: str = MIMO_MODEL_PATH):
-    patch_weight = load_unique_weight(
-        (
-            "visual.patch_embed.proj.weight",
-            "patch_embed.proj.weight",
-        ),
-        model_path,
-    )
-    merger_weights = load_merger_weights(model_path)
+def make_hf_vision_config(vision_config: dict):
+    return SimpleNamespace(**vision_config)
+
+
+def make_checkpoint_vision_config(
+    vision_config: dict,
+    hf_transformer,
+    model_path: str = MIMO_MODEL_PATH,
+):
     depth = int(vision_config["depth"])
-    fullatt_block_indexes = vision_config.get("fullatt_block_indexes") or []
-    first_sink_block = next(
-        (
-            block_idx
-            for block_idx in range(depth)
-            if load_attention_weights(block_idx, model_path)["sinks"] is not None
-        ),
-        0,
-    )
-    attn_weights = load_attention_weights(first_sink_block, model_path)
-    hidden_size, num_heads, num_kv_heads, head_dim = infer_attention_dims(
-        vision_config, attn_weights
-    )
-    mlp_weights = load_mlp_weights(0, model_path)
-    return SimpleNamespace(
+    qk_channels = int(hf_transformer.blocks[0].attn.head_dim)
+    hf_head_dims = {int(block.attn.head_dim) for block in hf_transformer.blocks}
+    if hf_head_dims != {qk_channels}:
+        raise AssertionError(f"MiMo vision blocks use inconsistent head_dim values: {hf_head_dims}")
+    config = SimpleNamespace(
         depth=depth,
-        hidden_size=hidden_size,
-        hidden_act=vision_config.get("hidden_act", "silu"),
-        intermediate_size=int(mlp_weights["gate_weight"].shape[0]),
-        num_heads=num_heads,
-        num_key_value_heads=num_kv_heads,
-        in_channels=int(patch_weight.shape[1]),
-        patch_size=int(patch_weight.shape[3]),
-        spatial_merge_size=int(vision_config.get("spatial_merge_size", 2)),
-        temporal_patch_size=int(patch_weight.shape[2]),
-        tokens_per_second=vision_config.get("tokens_per_second", 2),
-        window_size=int(vision_config.get("window_size", 128)),
-        out_hidden_size=int(merger_weights["fc2_weight"].shape[0]),
-        fullatt_block_indexes=fullatt_block_indexes,
-        initializer_range=vision_config.get("initializer_range", 0.02),
-        kv_channels=head_dim,
-        qk_channels=head_dim,
-        num_query_groups=num_heads // num_kv_heads,
-        vit_window_attn_types=vision_config.get("vit_window_attn_types") or [0] * depth,
-        visual_token_window_size=int(vision_config.get("visual_token_window_size", 64)),
-        use_sink=True,
+        hidden_size=int(vision_config["hidden_size"]),
+        hidden_act=vision_config["hidden_act"],
+        intermediate_size=int(vision_config["intermediate_size"]),
+        num_heads=int(vision_config["num_heads"]),
+        num_key_value_heads=int(vision_config["num_key_value_heads"]),
+        in_channels=int(vision_config["in_chans"]),
+        patch_size=int(vision_config["patch_size"]),
+        spatial_merge_size=int(vision_config["spatial_merge_size"]),
+        temporal_patch_size=int(vision_config["temporal_patch_size"]),
+        tokens_per_second=vision_config["tokens_per_second"],
+        window_size=int(vision_config["window_size"]),
+        out_hidden_size=int(vision_config["out_hidden_size"]),
+        fullatt_block_indexes=vision_config["fullatt_block_indexes"],
+        kv_channels=qk_channels,
+        qk_channels=qk_channels,
+        num_query_groups=int(vision_config["num_query_groups"]),
+        vit_window_attn_types=vision_config["vit_window_attn_types"],
+        visual_token_window_size=int(vision_config["visual_token_window_size"]),
+        use_sink=bool(vision_config["use_sink"]),
     )
+    assert_checkpoint_shapes_match_config(config, model_path)
+    return config
 
 
 def load_hf_vision_transformer(model_path: str, config):
@@ -173,6 +165,51 @@ def load_hf_vision_state_dict(model_path: str) -> dict[str, torch.Tensor]:
                     continue
                 state_dict[key[len(HF_VISION_PREFIX) :]] = handle.get_tensor(key).to(torch.float32)
     return state_dict
+
+
+def assert_checkpoint_shapes_match_config(config, model_path: str):
+    patch_weight = load_unique_weight(
+        (
+            "visual.patch_embed.proj.weight",
+            "patch_embed.proj.weight",
+        ),
+        model_path,
+    )
+    expected_patch_shape = (
+        config.hidden_size,
+        config.in_channels,
+        config.temporal_patch_size,
+        config.patch_size,
+        config.patch_size,
+    )
+    if tuple(patch_weight.shape) != expected_patch_shape:
+        raise AssertionError(
+            f"Patch embedding weight shape {tuple(patch_weight.shape)} does not match "
+            f"config-derived shape {expected_patch_shape}"
+        )
+
+    merger_weights = load_merger_weights(model_path)
+    if int(merger_weights["fc2_weight"].shape[0]) != config.out_hidden_size:
+        raise AssertionError(
+            f"Patch merger output size {merger_weights['fc2_weight'].shape[0]} does not match "
+            f"config out_hidden_size {config.out_hidden_size}"
+        )
+
+    attn_weights = load_attention_weights(0, model_path)
+    q_size = config.num_heads * config.qk_channels
+    kv_size = config.num_key_value_heads * config.qk_channels
+    expected_qkv_shape = (q_size + 2 * kv_size, config.hidden_size)
+    expected_proj_shape = (config.hidden_size, q_size)
+    if tuple(attn_weights["qkv_weight"].shape) != expected_qkv_shape:
+        raise AssertionError(
+            f"Attention qkv weight shape {tuple(attn_weights['qkv_weight'].shape)} does not "
+            f"match config-derived shape {expected_qkv_shape}"
+        )
+    if tuple(attn_weights["proj_weight"].shape) != expected_proj_shape:
+        raise AssertionError(
+            f"Attention proj weight shape {tuple(attn_weights['proj_weight'].shape)} does not "
+            f"match config-derived shape {expected_proj_shape}"
+        )
 
 
 def load_unique_weight(
@@ -220,14 +257,6 @@ def load_optional_weight(
         return None
 
 
-def load_mlp_weights(block_idx: int = 0, model_path: str = MIMO_MODEL_PATH):
-    prefix = f"visual.blocks.{block_idx}.mlp"
-    return {
-        "gate_weight": load_unique_weight((f"{prefix}.gate_proj.weight",), model_path),
-        "up_weight": load_unique_weight((f"{prefix}.up_proj.weight",), model_path),
-    }
-
-
 def load_merger_weights(model_path: str = MIMO_MODEL_PATH):
     return {
         "fc2_weight": load_unique_weight(("visual.merger.mlp.2.weight",), model_path),
@@ -241,40 +270,6 @@ def load_attention_weights(block_idx: int, model_path: str = MIMO_MODEL_PATH):
         "proj_weight": load_unique_weight((f"{prefix}.proj.weight",), model_path),
         "sinks": load_optional_weight((f"{prefix}.sinks",), model_path),
     }
-
-
-def infer_attention_dims(vision_config: dict, weights: dict[str, torch.Tensor]):
-    hidden_size = int(weights["qkv_weight"].shape[1])
-    qkv_size = int(weights["qkv_weight"].shape[0])
-    q_size = int(weights["proj_weight"].shape[1])
-    kv_total_size = qkv_size - q_size
-    if kv_total_size <= 0 or kv_total_size % 2 != 0:
-        raise AssertionError(
-            f"Invalid MiMo attention qkv/proj shapes: qkv={weights['qkv_weight'].shape}, "
-            f"proj={weights['proj_weight'].shape}"
-        )
-    kv_size = kv_total_size // 2
-
-    if weights["sinks"] is not None:
-        num_heads = int(weights["sinks"].shape[0])
-        if q_size % num_heads != 0:
-            raise AssertionError(f"Cannot infer head_dim from q_size={q_size}, sinks={num_heads}")
-        head_dim = q_size // num_heads
-    else:
-        head_dim = int(
-            vision_config.get("qk_channels")
-            or vision_config.get("head_dim")
-            or vision_config.get("kv_channels")
-            or np.gcd(q_size, kv_size)
-        )
-        num_heads = q_size // head_dim
-    if q_size % head_dim != 0 or kv_size % head_dim != 0:
-        raise AssertionError(
-            f"Cannot infer attention heads from q_size={q_size}, kv_size={kv_size}, "
-            f"head_dim={head_dim}"
-        )
-
-    return hidden_size, num_heads, kv_size // head_dim, head_dim
 
 
 if __name__ == "__main__":

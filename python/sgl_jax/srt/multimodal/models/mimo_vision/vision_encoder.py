@@ -3,6 +3,7 @@ import math
 import os
 import warnings
 from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
@@ -12,7 +13,8 @@ from jax.lax import Precision
 from safetensors import safe_open
 from transformers import modeling_flax_utils
 
-from sgl_jax.srt.utils.weight_utils import WeightMapping
+if TYPE_CHECKING:
+    from sgl_jax.srt.utils.weight_utils import WeightMapping
 
 
 def convert_torch_conv3d_kernel_to_jax(weight: jax.Array) -> jax.Array:
@@ -450,11 +452,7 @@ class MiMoVisionTransformer(nnx.Module):
 
         num_heads = int(config.num_heads)
         num_kv_heads = int(getattr(config, "num_key_value_heads", num_heads))
-        head_dim = int(
-            getattr(config, "qk_channels", None)
-            or getattr(config, "head_dim", None)
-            or self.hidden_size // num_heads
-        )
+        head_dim = int(config.qk_channels)
         self.rotary_pos_emb = MiMoVisionRotaryEmbedding(head_dim // 2)
 
         self.patch_embed = MiMoVisionPatchEmbed(
@@ -577,7 +575,9 @@ def create_mimo_vision_weight_mappings(
     config,
     source_prefix: str = "visual",
     target_prefix: str = "",
-) -> dict[str, WeightMapping]:
+) -> dict[str, "WeightMapping"]:
+    from sgl_jax.srt.utils.weight_utils import WeightMapping
+
     mappings: dict[str, WeightMapping] = {
         f"{source_prefix}.patch_embed.proj.weight": WeightMapping(
             target_path=f"{target_prefix}patch_embed.proj.kernel",
@@ -675,7 +675,7 @@ def to_mappings(
     config,
     source_prefix: str = "visual",
     target_prefix: str = "",
-) -> dict[str, WeightMapping]:
+) -> dict[str, "WeightMapping"]:
     return create_mimo_vision_weight_mappings(config, source_prefix, target_prefix)
 
 
