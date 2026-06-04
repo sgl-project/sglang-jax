@@ -68,6 +68,8 @@ class _MockDecodeScheduler(SchedulerDisaggregationDecodeMixin):
         self.disagg_prealloc_queue = DecodePreallocQueue()
         self.disagg_transfer_queue = DecodeTransferQueue()
         self.debug_pulls: list[Any] = []
+        self._comm_backend = None
+        self.send_to_tokenizer = mock.MagicMock()
         # Bootstrap / manager / receiver are wired by tests below.
 
     def process_input_requests(self, recv_reqs):
@@ -640,7 +642,30 @@ def test_prefill_extract_failure_skips_send():
     sched.disagg_kv_manager.create_sender.assert_not_called()
 
 
-def test_decode_event_loop_idle_structure():
+def test_prefill_sender_init_failure_aborts_and_releases():
+    """If sender.init raises, the req gets FINISH_ABORT and resources are released."""
+
+    sched = _MockPrefillScheduler()
+    sched.disagg_use_d2h_staging = False
+    sched._extract_req_kv = mock.MagicMock(return_value="device-kv")
+
+    bad_sender = mock.MagicMock()
+    bad_sender.init.side_effect = RuntimeError("sender init exploded")
+    sched.disagg_kv_manager = mock.MagicMock()
+    sched.disagg_kv_manager.create_sender.return_value = bad_sender
+
+    req = _fake_req("p-sender-fail", bootstrap_room=7)
+    req.return_logprob = False
+    req.return_output_logprob_only = False
+    batch = SimpleNamespace(reqs=[req])
+
+    sched.process_prefill_chunk(batch, None)
+
+    assert isinstance(req.finished_reason, FINISH_ABORT)
+    assert "sender init exploded" in req.finished_reason.message
+    assert sched.streamed
+    assert sched.released_reqs == [req]
+    assert len(sched.disagg_prefill_queue) == 0
     """Decode event loop: when no batch and no recv_reqs, it still calls
     process_decode_queue each tick.
     """
@@ -685,3 +710,209 @@ def test_decode_event_loop_idle_structure():
 
     assert sched._ticks == 3
     assert sched.cur_batch is None
+
+
+# --- Decode failure path: AbortReq sent to tokenizer ---
+
+
+def test_bootstrap_lookup_failure_sends_abort_to_tokenizer():
+    sched = _MockDecodeScheduler()
+    sched.disagg_bootstrap_client = mock.MagicMock()
+    sched.disagg_bootstrap_client.get_prefill_info.side_effect = (
+        RuntimeError("bootstrap unreachable")
+    )
+    sched.disagg_kv_manager = mock.MagicMock()
+
+    pd_req = _fake_req("r-abort-boot", bootstrap_room=42, req_pool_idx=3)
+    sched.process_input_requests_disagg_decode([pd_req])
+
+    from sgl_jax.srt.managers.io_struct import AbortReq
+
+    sched.send_to_tokenizer.send_pyobj.assert_called_once()
+    abort_msg = sched.send_to_tokenizer.send_pyobj.call_args[0][0]
+    assert isinstance(abort_msg, AbortReq)
+    assert abort_msg.rid == "r-abort-boot"
+
+
+def test_receiver_init_failure_sends_abort_to_tokenizer():
+    sched = _MockDecodeScheduler()
+    sched.disagg_bootstrap_client = mock.MagicMock()
+    sched.disagg_bootstrap_client.get_prefill_info.return_value = {
+        "host": "10.0.0.1",
+        "transfer_port": 30001,
+        "side_channel_port": 9600,
+    }
+    bad_receiver = mock.MagicMock()
+    bad_receiver.init.side_effect = RuntimeError("boom")
+    sched.disagg_kv_manager = mock.MagicMock()
+    sched.disagg_kv_manager.create_receiver.return_value = bad_receiver
+    sched._prealloc_decode_kv_indices = lambda req: "kv-idx"
+    sched._release_decode_kv_indices = mock.MagicMock()
+
+    pd_req = _fake_req("r-abort-init", bootstrap_room=42, req_pool_idx=5)
+    sched.process_input_requests_disagg_decode([pd_req])
+
+    from sgl_jax.srt.managers.io_struct import AbortReq
+
+    sched.send_to_tokenizer.send_pyobj.assert_called_once()
+    abort_msg = sched.send_to_tokenizer.send_pyobj.call_args[0][0]
+    assert isinstance(abort_msg, AbortReq)
+    assert abort_msg.rid == "r-abort-init"
+
+
+def test_kv_writeback_failure_sends_abort_to_tokenizer():
+    sched = _MockDecodeScheduler()
+
+    def _bad_write(req, kv_indices, kv):
+        raise RuntimeError("writeback exploded")
+
+    sched._write_kv_to_pool = _bad_write
+    sched._release_decode_kv_indices = mock.MagicMock()
+
+    receiver = _mock_receiver(initial_state=KVPoll.SUCCESS)
+    pd_req = _fake_req("r-abort-wb", bootstrap_room=42, req_pool_idx=8)
+    sched.disagg_prealloc_queue.add(
+        DecodeBookkeeping(
+            req_id="r-abort-wb", req=pd_req, receiver=receiver,
+            kv_indices="kv-idx-W", started=True,
+        )
+    )
+
+    sched.process_decode_queue()
+
+    from sgl_jax.srt.managers.io_struct import AbortReq
+
+    sched.send_to_tokenizer.send_pyobj.assert_called_once()
+    abort_msg = sched.send_to_tokenizer.send_pyobj.call_args[0][0]
+    assert isinstance(abort_msg, AbortReq)
+    assert abort_msg.rid == "r-abort-wb"
+
+
+def test_receiver_terminal_failed_sends_abort_to_tokenizer():
+    sched = _MockDecodeScheduler()
+    sched._release_decode_kv_indices = mock.MagicMock()
+
+    receiver = _mock_receiver(initial_state=KVPoll.FAILED)
+    pd_req = _fake_req("r-abort-fail", bootstrap_room=42, req_pool_idx=10)
+    sched.disagg_prealloc_queue.add(
+        DecodeBookkeeping(
+            req_id="r-abort-fail", req=pd_req, receiver=receiver,
+            kv_indices="kv-idx-F", started=True,
+        )
+    )
+
+    sched.process_decode_queue()
+
+    from sgl_jax.srt.managers.io_struct import AbortReq
+
+    sched.send_to_tokenizer.send_pyobj.assert_called_once()
+    abort_msg = sched.send_to_tokenizer.send_pyobj.call_args[0][0]
+    assert isinstance(abort_msg, AbortReq)
+    assert abort_msg.rid == "r-abort-fail"
+
+
+# --- dispatch_scheduler_event_loop routing ---
+
+
+def test_dispatch_scheduler_event_loop_routes_correctly():
+    from sgl_jax.srt.managers.scheduler import dispatch_scheduler_event_loop
+
+    for mode, overlap, expected_method in [
+        ("null", False, "event_loop_normal"),
+        ("null", True, "event_loop_overlap"),
+        ("prefill", False, "event_loop_normal_disagg_prefill"),
+        ("decode", False, "event_loop_normal_disagg_decode"),
+    ]:
+        scheduler = mock.MagicMock()
+        scheduler.enable_overlap = overlap
+        server_args = SimpleNamespace(disaggregation_mode=mode)
+
+        dispatch_scheduler_event_loop(scheduler, server_args)
+
+        getattr(scheduler, expected_method).assert_called_once()
+
+
+# --- abort_matching / flush / internal_state ---
+
+
+def test_decode_prealloc_queue_abort_matching():
+    q = DecodePreallocQueue()
+    e1 = DecodeBookkeeping(req_id="r-1", req=_fake_req("r-1"))
+    e2 = DecodeBookkeeping(req_id="r-2", req=_fake_req("r-2"))
+    e3 = DecodeBookkeeping(req_id="s-1", req=_fake_req("s-1"))
+    q.add(e1)
+    q.add(e2)
+    q.add(e3)
+
+    aborted = q.abort_matching("r-", abort_all=False)
+    assert {e.req_id for e in aborted} == {"r-1", "r-2"}
+    assert len(q) == 1
+
+
+def test_decode_transfer_queue_abort_matching():
+    q = DecodeTransferQueue()
+    e1 = DecodeBookkeeping(req_id="x-a", req=_fake_req("x-a"))
+    e2 = DecodeBookkeeping(req_id="y-b", req=_fake_req("y-b"))
+    q.add(e1)
+    q.add(e2)
+
+    aborted = q.abort_matching("", abort_all=True)
+    assert len(aborted) == 2
+    assert len(q) == 0
+
+
+def test_prefill_queue_abort_matching():
+    q = PrefillBootstrapQueue()
+    sender = mock.MagicMock()
+    q.add("p-1", sender)
+    q.add("p-2", sender)
+    q.add("q-1", sender)
+
+    aborted = q.abort_matching("p-", abort_all=False)
+    assert {e.req_id for e in aborted} == {"p-1", "p-2"}
+    assert len(q) == 1
+
+
+# --- disagg_transfer_id contract ---
+
+
+def test_different_rids_same_transfer_id_uses_shared_id():
+    """P and D have different rids but share the same transfer_id.
+    Both sides must use the shared transfer_id, not their own rid.
+    """
+
+    # --- Prefill side ---
+    p_sched = _MockPrefillScheduler()
+    p_sched.disagg_use_d2h_staging = False
+    p_sched._extract_req_kv = mock.MagicMock(return_value="kv-data")
+    p_sender = mock.MagicMock()
+    p_sched.disagg_kv_manager = mock.MagicMock()
+    p_sched.disagg_kv_manager.create_sender.return_value = p_sender
+
+    p_req = _fake_req("p-req-1", bootstrap_room=7)
+    p_req.disagg_transfer_id = "shared-xfer-42"
+    p_batch = SimpleNamespace(reqs=[p_req])
+    p_sched.process_prefill_chunk(p_batch, None)
+
+    p_sender.init.assert_called_once_with(
+        kv_indices=None, transfer_id="shared-xfer-42"
+    )
+
+    # --- Decode side ---
+    d_sched = _MockDecodeScheduler()
+    d_sched.disagg_bootstrap_client = mock.MagicMock()
+    d_sched.disagg_bootstrap_client.get_prefill_info.return_value = {
+        "host": "10.0.0.1",
+        "transfer_port": 30001,
+        "side_channel_port": 9600,
+    }
+    d_receiver = _mock_receiver()
+    d_sched.disagg_kv_manager = mock.MagicMock()
+    d_sched.disagg_kv_manager.create_receiver.return_value = d_receiver
+
+    d_req = _fake_req("d-req-1", bootstrap_room=7)
+    d_req.disagg_transfer_id = "shared-xfer-42"
+    d_sched.process_input_requests_disagg_decode([d_req])
+
+    (metadata,), _ = d_receiver.init.call_args
+    assert metadata.uuid == "shared-xfer-42"

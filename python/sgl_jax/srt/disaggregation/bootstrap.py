@@ -8,8 +8,7 @@ request.
 
 This is the lightest viable rendezvous — single process, no
 replication, no auth. Production hardening (graceful shutdown,
-authentication, replication) is out of scope and lives in the
-hardening (authentication, replication) is out of scope.
+authentication, replication) is out of scope.
 """
 
 from __future__ import annotations
@@ -17,13 +16,13 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 
 import httpx
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
-import builtins
 
 logger = logging.getLogger(__name__)
 
@@ -96,7 +95,7 @@ class _Registry:
     last_seen: dict[str, float] = field(default_factory=dict)
     lock: threading.Lock = field(default_factory=threading.Lock)
     ttl_seconds: float = HEARTBEAT_TTL_SECONDS
-    clock: object = time.monotonic
+    clock: Callable[[], float] = time.monotonic
 
     def now(self) -> float:
         return self.clock()  # type: ignore[no-any-return]
@@ -136,7 +135,7 @@ class _Registry:
             self.last_seen.pop(k, None)
         _set_registry_size(len(self.prefills))
 
-    def list(self) -> builtins.list[PrefillInfo]:
+    def list_all(self) -> list[PrefillInfo]:
         with self.lock:
             self._evict_stale_locked()
             return list(self.prefills.values())
@@ -214,7 +213,7 @@ def build_app(
 
     @app.get("/list_prefills")
     def list_prefills() -> dict[str, list[dict[str, object]]]:
-        return {"prefills": [p.to_dict() for p in registry.list()]}
+        return {"prefills": [p.to_dict() for p in registry.list_all()]}
 
     @app.get("/get_prefill_info")
     def get_prefill_info(bootstrap_room: int) -> dict[str, object]:

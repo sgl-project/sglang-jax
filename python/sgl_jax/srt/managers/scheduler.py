@@ -1227,6 +1227,17 @@ class Scheduler(
         ret["new_token_ratio"] = self.new_token_ratio
         ret["init_new_token_ratio"] = self.init_new_token_ratio
 
+        # PD disaggregation queues
+        ret["disagg_prefill_queue_size"] = len(
+            getattr(self, "disagg_prefill_queue", None) or ()
+        )
+        ret["disagg_prealloc_queue_size"] = len(
+            getattr(self, "disagg_prealloc_queue", None) or ()
+        )
+        ret["disagg_transfer_queue_size"] = len(
+            getattr(self, "disagg_transfer_queue", None) or ()
+        )
+
         return GetInternalStateReqOutput(internal_state=ret)
 
     def set_internal_state(self, recv_req: SetInternalStateReq):
@@ -1324,12 +1335,23 @@ class Scheduler(
             or pending_results > 0
         )
 
+        pd_prefill = len(getattr(self, "disagg_prefill_queue", None) or ())
+        pd_prealloc = len(getattr(self, "disagg_prealloc_queue", None) or ())
+        pd_transfer = len(getattr(self, "disagg_transfer_queue", None) or ())
+        has_pending = (
+            has_pending
+            or pd_prefill > 0
+            or pd_prealloc > 0
+            or pd_transfer > 0
+        )
+
         if has_pending:
             msg = (
                 "Cache not flushed because there are pending requests. "
                 f"waiting={waiting_reqs}, pending_dp={pending_dp_reqs}, running={running_reqs}, "
                 f"cur_batch={current_batch_reqs}, last_batch={last_batch_reqs}, "
-                f"chunked={chunked_pending}, pending_results={pending_results}"
+                f"chunked={chunked_pending}, pending_results={pending_results}, "
+                f"pd_prefill={pd_prefill}, pd_prealloc={pd_prealloc}, pd_transfer={pd_transfer}"
             )
             return False, msg
 
@@ -2082,6 +2104,34 @@ class Scheduler(
                 logger.debug("Abort running request. rid=%s", req.rid)
                 req.to_finish = FINISH_ABORT()
 
+        # Abort PD disaggregation queues
+        prefill_q = getattr(self, "disagg_prefill_queue", None)
+        if prefill_q is not None:
+            for entry in prefill_q.abort_matching(recv_req.rid, recv_req.abort_all):
+                logger.debug("Abort prefill queue request. rid=%s", entry.req_id)
+                if hasattr(entry.sender, "abort"):
+                    entry.sender.abort()
+
+        prealloc_q = getattr(self, "disagg_prealloc_queue", None)
+        if prealloc_q is not None:
+            for entry in prealloc_q.abort_matching(recv_req.rid, recv_req.abort_all):
+                logger.debug("Abort prealloc queue request. rid=%s", entry.req_id)
+                if entry.receiver is not None and hasattr(entry.receiver, "abort"):
+                    entry.receiver.abort()
+                if entry.kv_indices is not None:
+                    self._release_decode_kv_indices(entry.kv_indices)
+                self._abort_decode_request(entry.req, "abort_request")
+
+        transfer_q = getattr(self, "disagg_transfer_queue", None)
+        if transfer_q is not None:
+            for entry in transfer_q.abort_matching(recv_req.rid, recv_req.abort_all):
+                logger.debug("Abort transfer queue request. rid=%s", entry.req_id)
+                if entry.receiver is not None and hasattr(entry.receiver, "abort"):
+                    entry.receiver.abort()
+                if entry.kv_indices is not None:
+                    self._release_decode_kv_indices(entry.kv_indices)
+                self._abort_decode_request(entry.req, "abort_request")
+
     def pause_generation(self, recv_req: PauseGenerationReqInput):
         self._engine_paused = True
 
@@ -2148,20 +2198,26 @@ def run_scheduler_process(
             }
         )
 
-        mode = getattr(server_args, "disaggregation_mode", "null")
-        if mode == "prefill":
-            scheduler.event_loop_normal_disagg_prefill()
-        elif mode == "decode":
-            scheduler.event_loop_normal_disagg_decode()
-        elif scheduler.enable_overlap:
-            scheduler.event_loop_overlap()
-        else:
-            scheduler.event_loop_normal()
+        dispatch_scheduler_event_loop(scheduler, server_args)
 
     except Exception:
         traceback = get_exception_traceback()
         logger.error("Scheduler hit an exception: %s", traceback)
         parent_process.send_signal(signal.SIGQUIT)
+
+
+def dispatch_scheduler_event_loop(scheduler, server_args) -> None:
+    """Choose and run the appropriate scheduler event loop."""
+
+    mode = getattr(server_args, "disaggregation_mode", "null")
+    if mode == "prefill":
+        scheduler.event_loop_normal_disagg_prefill()
+    elif mode == "decode":
+        scheduler.event_loop_normal_disagg_decode()
+    elif scheduler.enable_overlap:
+        scheduler.event_loop_overlap()
+    else:
+        scheduler.event_loop_normal()
 
 
 def _install_disaggregation_wiring(scheduler, server_args) -> None:
@@ -2377,6 +2433,7 @@ def run_scheduler_loop_thread_after_create(
     # Create a scheduler and run the event loop
     try:
         scheduler = Scheduler(server_args, port_args)
+        _install_disaggregation_wiring(scheduler, server_args)
         scheduler_thread = threading.Thread(
             target=scheduler_loop_after_create,
             args=(server_args, scheduler),
@@ -2410,10 +2467,7 @@ def scheduler_loop_after_create(server_args, scheduler):
     # Configure the logger
     configure_logger(server_args, prefix=prefix)
     try:
-        if scheduler.enable_overlap:
-            scheduler.event_loop_overlap()
-        else:
-            scheduler.event_loop_normal()
+        dispatch_scheduler_event_loop(scheduler, server_args)
     except Exception:
         traceback = get_exception_traceback()
         logger.error("Scheduler hit an exception: %s", traceback)
