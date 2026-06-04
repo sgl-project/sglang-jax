@@ -65,7 +65,7 @@ class FusedEPMoE(nnx.Module):
         num_shared_experts: int = 0,
         moe_shared_expert_intermediate_size: int | None = None,
         quantization_config=None,
-        enable_act_quant: bool = False,
+        enable_act_quant: bool | None = None,
         # Profiling / ablation flags (primarily for microbenching).
         disable_a2a: bool = False,
         disable_dynamic_ffn1: bool = False,
@@ -124,9 +124,8 @@ class FusedEPMoE(nnx.Module):
         self.activation_quantized_dtype = (
             quantization_config.get_moe_activation_dtype() if quantization_config else None
         )
-        # Explicit opt-in to in-kernel activation quantization (fp8-token prequant +
-        # fp8xfp8 dots, the −19%/−8% lever). OR'd with the quant-config-derived
-        # signal; only takes effect for fp8-weight models (guarded in __call__).
+        # Optional explicit disable for in-kernel activation quantization. The
+        # positive signal comes from quantization_config.moe_activation_dtype.
         self.enable_act_quant_cfg = enable_act_quant
 
         # Initialize weights.
@@ -569,11 +568,11 @@ class FusedEPMoEV2(FusedEPMoE):
         w2_shared_scale = (
             self.w2_shared_scale.value[:, 0, :] if self.w2_shared_scale is not None else None
         )
-        # In-kernel act-quant (fp8 token, Mode 1) needs fp8 weights. Honor the
-        # explicit opt-in OR the quant-config signal, then guard on fp8 (w1_scale
-        # present) so bf16 models stay in Mode 2/3 instead of hitting the kernel gate.
+        # In-kernel act-quant (fp8 token, Mode 1) needs both a quant-config
+        # activation dtype and fp8 weights. Weight-only fp8 checkpoints stay in
+        # Mode 2 (bf16 token x fp8 weight).
         enable_act_quant = (
-            self.enable_act_quant_cfg or self.activation_quantized_dtype is not None
+            self.activation_quantized_dtype is not None and self.enable_act_quant_cfg is not False
         ) and (w1_scale is not None)
 
         if block_config is None:
