@@ -78,8 +78,8 @@ jobs:
           python3 run_suite.py --suite nightly-test-openai-api-surface-tpu-v6e-1-daily
 
   multi-host-test-mimo-flash-daily:
-    # Temporarily disabled until CI has 4-node v6e capacity for this multi-host suite.
-    if: github.repository == 'sgl-project/sglang-jax' && vars.ENABLE_MIMO_MULTI_HOST_DAILY == 'true'
+    # Temporarily skipped until CI has 4-node v6e capacity for this multi-host suite.
+    if: false
     uses: ./.github/workflows/multi-host-test.yml
     permissions:
       contents: read
