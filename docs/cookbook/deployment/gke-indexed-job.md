@@ -23,7 +23,6 @@ The TL;DR: **Indexed Job is the cookbook default because JAX multi-host requires
 Multi-host JAX needs:
 1. **A stable rank-0 hostname** for `--dist-init-addr`. Indexed Job gives every pod the index `${JOB_COMPLETION_INDEX}`; combined with a headless Service the pod `0` becomes `<job>-0.<svc>` permanently.
 2. **TPU process address fanout**. The JAX TPU runtime expects `TPU_PROCESS_ADDRESSES` listing every node's `host:8471`. Headless DNS makes those names enumerable.
-3. **Recovery from transient blips**. Set `restartPolicy: Never` (rank assignment must stay stable per pod lifetime) + `backoffLimit: 16` — if a GKE control-plane blip evicts the pods, the Job creates replacements that pick up the same `${JOB_COMPLETION_INDEX}` (and the warm JIT cache, if you mounted one). The cookbook recipes uniformly use `backoffLimit: 16`.
 
 ## Manifest template
 
@@ -37,6 +36,8 @@ Fill in:
 - `<LAUNCH_FLAGS>` — flags from the recipe's `--tp-size`/`--dp-size`/etc. block.
 - `<HTTP_PORT>` — server port (cookbook recipes use 30000 or 30271).
 - `<MODEL_PVC>` — your PersistentVolumeClaim name with the model weights.
+
+`restartPolicy: Never` and `backoffLimit: 16` are hardcoded in the template — the cookbook standard. `restartPolicy: Never` is structural (rank assignment must stay stable per pod lifetime; an in-place restart would desync ranks). `backoffLimit: 16` is operational tuning to absorb transient GKE control-plane blips — Job creates replacements that pick up the same `${JOB_COMPLETION_INDEX}` (and the warm JIT cache, if you mounted one). Lower to `0` for fail-fast benchmark posture where you want a single bad pod to terminate the whole run; raise if your cluster blips more often than 16 retries can cover.
 
 ```yaml
 ---
@@ -59,7 +60,7 @@ kind: Job
 metadata:
   name: <JOB>
 spec:
-  backoffLimit: 0
+  backoffLimit: 16
   completionMode: Indexed
   parallelism: <N>
   completions: <N>
