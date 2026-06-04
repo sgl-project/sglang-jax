@@ -502,15 +502,6 @@ def _estimate_vmem_bytes_v2(
         + 3 * 4  # a2a_acc + md_send + md_recv + barrier
     )
 
-    # SMEM (not VMEM, but allocated alongside — counts toward compiler budget)
-    b_smem = (
-        smem_banks * bt * padded_top_k * 4  # t2e_routing smem
-        + smem_banks * ep_size * padded_num_experts * 4  # d2e_count smem
-        + smem_banks * 2 * padded_num_experts * 4  # expert_offsets smem
-        + smem_banks * padded_num_experts * 4  # expert_starts smem
-        + smem_banks * padded_num_experts * 4  # expert_sizes smem
-    )
-
     total = (
         b_a2a_g_acc
         + b_topk_w

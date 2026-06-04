@@ -1,12 +1,13 @@
 """Minimal multi-device correctness test for fused_ep_moe_v2."""
+
 from __future__ import annotations
 
 import sys
 import time
 
-import numpy as np
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import lax
 
 t0 = time.time()
@@ -25,7 +26,7 @@ _pid[0] = jax.process_index()
 log(f"initialized: {jax.device_count()} devices, {jax.process_count()} processes")
 
 sys.path.insert(0, "/tmp/tpu_logs/sglang-jax/python/sgl_jax/srt/kernels/fused_moe/v2")
-from kernel import fused_ep_moe_v2, ref_moe, FusedMoEBlockConfig
+from kernel import FusedMoEBlockConfig, fused_ep_moe_v2, ref_moe
 
 P = jax.sharding.PartitionSpec
 num_devices = jax.device_count()
@@ -69,8 +70,14 @@ bc = FusedMoEBlockConfig(bt=bt, bf=bf, btc=btc, bse=256)
 
 log("calling fused_ep_moe_v2 (compile + run)...")
 result = fused_ep_moe_v2(
-    mesh, tokens_s, w1_s, w2_s, w3_s,
-    topk_wts_s, topk_idx_s, top_k,
+    mesh,
+    tokens_s,
+    w1_s,
+    w2_s,
+    w3_s,
+    topk_wts_s,
+    topk_idx_s,
+    top_k,
     block_config=bc,
 )
 log("blocking on result...")
@@ -80,9 +87,7 @@ log("done!")
 log("computing reference...")
 ref = ref_moe(tokens, w1, w2, w3, topk_wts, topk_idx, top_k)
 
-result_gathered = jax.device_get(
-    jax.device_put(result, jax.sharding.NamedSharding(mesh, P()))
-)
+result_gathered = jax.device_get(jax.device_put(result, jax.sharding.NamedSharding(mesh, P())))
 
 if jax.process_index() == 0:
     result_f32 = result_gathered.astype(np.float32)
