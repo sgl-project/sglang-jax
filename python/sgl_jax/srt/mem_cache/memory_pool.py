@@ -92,9 +92,9 @@ class ReqToTokenPool:
         self.cache_loc_host_buf = None
 
     def init_cache_loc_host_buffer(self, size: int):
-        """Pre-allocate the persistent cache_loc host buffer (called once at
-        init by tp_worker with the largest cache_loc precompile bucket)."""
-        self.cache_loc_host_buf = np.zeros(size, dtype=np.int32)
+        """Ensure the persistent cache_loc host buffer has enough capacity."""
+        if self.cache_loc_host_buf is None or self.cache_loc_host_buf.shape[0] < size:
+            self.cache_loc_host_buf = np.zeros(size, dtype=np.int32)
 
     def tree_flatten(self):
         children = (self.req_to_token,)

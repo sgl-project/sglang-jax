@@ -1946,7 +1946,15 @@ class ScheduleBatch:
         #    np.zeros + only valid slots are ever written), so even SWA's
         #    host-side mapping[cache_loc] lookup (flashattention_backend) can't go
         #    OOB. This REQUIRES the init buffer to be np.zeros, not np.empty.
-        cache_loc_cpu = self.req_to_token_pool.cache_loc_host_buf[:total_cache_loc_size]
+        cache_loc_host_buf = self.req_to_token_pool.cache_loc_host_buf
+        assert (
+            cache_loc_host_buf is not None and cache_loc_host_buf.shape[0] >= total_cache_loc_size
+        ), (
+            "cache_loc_host_buf is not initialized or too small: "
+            f"capacity={0 if cache_loc_host_buf is None else cache_loc_host_buf.shape[0]}, "
+            f"required={total_cache_loc_size}"
+        )
+        cache_loc_cpu = cache_loc_host_buf[:total_cache_loc_size]
 
         offset_bs = 0
         req_to_token = self.req_to_token_pool.req_to_token
