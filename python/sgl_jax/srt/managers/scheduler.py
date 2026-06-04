@@ -14,6 +14,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from types import SimpleNamespace
+from typing import Any
 
 import jax
 import numpy as np
@@ -122,6 +123,35 @@ class GenerationBatchResult:
     allocate_lens: np.ndarray | None = None
     num_accepted_tokens: int | None = None
     accept_lens: np.ndarray | None = None
+
+
+@dataclass
+class SpecVerifyPhaseResult:
+    """Scheduler-visible output from greedy spec verify/sample.
+
+    Layout:
+    - accept_lens: DP-padded `(per_dp_bs * dp_size,)`.
+    - next_token_ids: flattened by DP-padded slot, stride speculative_num_draft_tokens.
+    - scheduler_next_draft_input: scheduler-only view; may contain verified_id,
+      new_seq_lens, and allocate_lens, but must not require hidden/topk.
+    - draft_extend_state: private payload needed to run draft_extend after scheduler can proceed.
+    """
+
+    logits_output: LogitsProcessorOutput | None
+    next_token_ids: Any
+    accept_lens: Any
+    allocate_lens: Any
+    scheduler_next_draft_input: EagleDraftInput
+    draft_extend_state: Any
+    bid: int
+    cache_miss_count: int
+
+
+@dataclass
+class SpecDraftExtendPhaseResult:
+    """Output from draft_extend phase that refreshes next-round spec state."""
+
+    next_draft_input: EagleDraftInput
 
 
 class Scheduler(
