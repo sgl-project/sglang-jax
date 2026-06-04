@@ -7,7 +7,7 @@ from sgl_jax.srt.configs.load_config import LoadConfig
 from sgl_jax.srt.model_executor.base_model_runner import BaseModelRunner
 from sgl_jax.srt.model_loader.loader import get_model_loader
 from sgl_jax.srt.multimodal.common.ServerArgs import MultimodalServerArgs
-from sgl_jax.srt.multimodal.configs.config_registry import get_qwen_vl_config
+from sgl_jax.srt.multimodal.configs.config_registry import get_vl_config
 from sgl_jax.srt.multimodal.manager.schedule_batch import Req
 
 
@@ -34,7 +34,7 @@ class VitModelRunner(BaseModelRunner):
         self.initialize_jit()
 
     def load_model(self):
-        self.model_config = get_qwen_vl_config(self.server_args.model_path)
+        self.model_config = get_vl_config(self.model_class, self.server_args.model_path)
         self.model_config.model_path = self.server_args.model_path
         self.model_config.model_class = self.model_class
         self.model = self.model_loader.load_model(
@@ -42,6 +42,44 @@ class VitModelRunner(BaseModelRunner):
         )
 
     def initialize_jit(self):
+        model_class_name = type(self.model).__name__
+        if model_class_name == "Kimi_K25_VisionModel":
+            self._initialize_jit_kimi()
+        else:
+            self._initialize_jit_qwen()
+
+    def _initialize_jit_kimi(self):
+        # Note: No JIT wrapping yet, JIT wrapping will be added once compute_aux_arrays for Kimi is defined.
+
+        def encode_vision_wrapper(pixel_values, image_grid_thw, video_grid_thw):
+            combined = []
+            if image_grid_thw is not None:
+                if isinstance(image_grid_thw, tuple):
+                    combined.extend(image_grid_thw)
+                else:
+                    combined.extend(
+                        tuple(int(x) for x in row)
+                        for row in np.asarray(image_grid_thw).tolist()
+                    )
+            if video_grid_thw is not None:
+                if isinstance(video_grid_thw, tuple):
+                    combined.extend(video_grid_thw)
+                else:
+                    combined.extend(
+                        tuple(int(x) for x in row)
+                        for row in np.asarray(video_grid_thw).tolist()
+                    )
+            if not combined:
+                return jnp.zeros(
+                    (0, self.model.config.hidden_size),
+                    dtype=pixel_values.dtype if pixel_values is not None else jnp.float32,
+                )
+            grid_thws = np.array(combined)
+            return self.model.vision_tower(pixel_values, grid_thws)
+
+        self.jitted_encode_vision = encode_vision_wrapper
+
+    def _initialize_jit_qwen(self):
         model_def, model_state = nnx.split(self.model)
         model_state_leaves, model_state_def = jax.tree_util.tree_flatten(model_state)
 
@@ -119,7 +157,7 @@ class VitModelRunner(BaseModelRunner):
         if vision_embeds.size == 0:
             return None
 
-        image_token_id = mm_inputs.get("im_token_id") or mm_inputs.get("image_token_id")
+        image_token_id = mm_inputs.get("im_token_id") or mm_inputs.get("image_token_id") or mm_input.get("media_placeholder_token_id")
         video_token_id = mm_inputs.get("video_token_id")
         placeholder_token_ids = [tok for tok in (image_token_id, video_token_id) if tok is not None]
         if not placeholder_token_ids:
@@ -144,6 +182,7 @@ class VitModelRunner(BaseModelRunner):
             image_grid_thw=batch.image_grid_thw,
             video_grid_thw=batch.video_grid_thw,
         )
+
         mm_inputs = batch.omni_inputs if isinstance(batch.omni_inputs, dict) else None
         if mm_inputs is not None:
             input_ids = batch.input_ids or batch.origin_input_ids

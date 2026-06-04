@@ -540,6 +540,26 @@ def _execute_multimodal_server_warmup(
             ],
             "max_tokens": 3,
         }
+    elif "kimi" in server_args.model_path.lower() or "Kimi-K2" in server_args.model_path:
+        request_endpoint = "/v1/chat/completions"
+        json_data = {
+            "model": server_args.model_path,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "What can you see in this image?"},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": "https://github.com/IS-Model-Framework/sglang-jax/blob/dev/vl/test/srt/example_image.png?raw=true"
+                            },
+                        },
+                    ],
+                }
+            ],
+            "max_tokens": 3,
+        }
     elif "Qwen3-Omni" in server_args.model_path:
         request_endpoint = "/v1/chat/completions"
         json_data = {

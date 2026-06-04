@@ -44,6 +44,8 @@ class StageConfigRegistry:
         # MiMo Audio series
         "XiaomiMiMo/MiMo-Audio-7B-Instruct": "mimo_audio_stage_config.yaml",
         "XiaomiMiMo/MiMo-Audio-7B-Base": "mimo_audio_stage_config.yaml",
+        # Kimi K2.5
+        "moonshotai/Kimi-K2.5": "kimi_k2_5_stage_config.yaml",
     }
 
     # Keyword patterns for fallback matching (order matters - more specific first)
