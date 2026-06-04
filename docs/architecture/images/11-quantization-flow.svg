@@ -1,0 +1,226 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 2000" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#334155"/>
+    </marker>
+    <marker id="arrowGreen" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#15803d"/>
+    </marker>
+    <marker id="arrowBlue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#0e7490"/>
+    </marker>
+    <marker id="arrowPurple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#7c3aed"/>
+    </marker>
+    <marker id="arrowOrange" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#b45309"/>
+    </marker>
+    <style>
+      .title    { font-size: 22px; font-weight: 800; fill: #0f172a; }
+      .subtitle { font-size: 13px; fill: #475569; }
+      .stepTitle { font-size: 15px; font-weight: 700; fill: #0f172a; }
+      .stepSub  { font-size: 13px; fill: #1e293b; }
+      .code     { font-size: 12px; fill: #0f172a; font-family: 'SF Mono', Menlo, Consolas, monospace; }
+      .codeKey  { font-size: 12px; fill: #b45309; font-family: 'SF Mono', Menlo, Consolas, monospace; font-weight: 700; }
+      .edge     { font-size: 12px; fill: #1e293b; font-weight: 600; }
+      .note     { font-size: 11.5px; fill: #64748b; font-style: italic; }
+      .tag      { font-size: 10.5px; font-weight: 700; fill: #ffffff; }
+    </style>
+  </defs>
+
+  <!-- Title -->
+  <text x="40" y="40" class="title">Quantization Pipeline Full Data Flow</text>
+  <text x="40" y="62" class="subtitle">Config resolution → quantization replacement at model load → quantized compute at Forward (static / dynamic paths)</text>
+
+  <!-- ============== STEP 1: Config Resolution ============== -->
+  <g>
+    <rect x="40" y="100" width="1520" height="200" rx="10" fill="#dbeafe" stroke="#0284c7" stroke-width="2"/>
+    <rect x="40" y="100" width="1520" height="28" rx="10" fill="#0284c7"/>
+    <text x="56" y="120" class="tag">STEP 1 · Three-Tier Config Resolution</text>
+
+    <!-- Tier 1 -->
+    <rect x="60" y="148" width="460" height="130" rx="8" fill="#dcfce7" stroke="#15803d" stroke-width="2"/>
+    <text x="76" y="168" class="stepTitle">Tier 1: User YAML (highest priority)</text>
+    <text x="76" y="188" class="code">--quantization-config-path fp8.yaml</text>
+    <text x="76" y="208" class="stepSub">• Load <tspan class="codeKey">QuantizationConfig</tspan> from YAML</text>
+    <text x="76" y="228" class="stepSub">• Includes <tspan class="code">linear_rules</tspan> (regex matching)</text>
+    <text x="76" y="248" class="stepSub">• Includes <tspan class="code">moe_weight_dtype</tspan> / <tspan class="code">moe_activation_dtype</tspan></text>
+    <text x="76" y="268" class="note">11 built-in configs: fp8.yaml, int8.yaml, fp8_block_128_dynamic.yaml, ...</text>
+
+    <!-- Tier 2 -->
+    <rect x="540" y="148" width="480" height="130" rx="8" fill="#cffafe" stroke="#0e7490" stroke-width="2"/>
+    <text x="556" y="168" class="stepTitle">Tier 2: HF quantization_config</text>
+    <text x="556" y="188" class="code">config.json: {"quantization_config": {"quant_method": "fp8"}}</text>
+    <text x="556" y="208" class="stepSub">• Auto-parse HuggingFace model's built-in config</text>
+    <text x="556" y="228" class="stepSub">• Supports <tspan class="code">quant_method="fp8"</tspan></text>
+    <text x="556" y="248" class="stepSub">• Supports <tspan class="code">format="float-quantized"</tspan> (compressed-tensors)</text>
+    <text x="556" y="268" class="note">Auto-sets is_static_checkpoint=True</text>
+
+    <!-- Tier 3 -->
+    <rect x="1040" y="148" width="500" height="130" rx="8" fill="#f3e8ff" stroke="#7c3aed" stroke-width="2"/>
+    <text x="1056" y="168" class="stepTitle">Tier 3: None (no quantization)</text>
+    <text x="1056" y="188" class="stepSub">• No quantization config provided</text>
+    <text x="1056" y="208" class="stepSub">• Model uses original precision (BFloat16 / Float32)</text>
+    <text x="1056" y="228" class="stepSub">• No quantization replacement performed</text>
+  </g>
+
+  <path d="M 800 300 L 800 330" stroke="#334155" stroke-width="2.5" fill="none" marker-end="url(#arrow)"/>
+
+  <!-- ============== STEP 2: Model Loading with Quantization ============== -->
+  <g>
+    <rect x="40" y="338" width="1520" height="180" rx="10" fill="#dcfce7" stroke="#15803d" stroke-width="2"/>
+    <rect x="40" y="338" width="1520" height="28" rx="10" fill="#15803d"/>
+    <text x="56" y="358" class="tag">STEP 2 · Quantization Replacement at Model Load</text>
+    <text x="56" y="390" class="stepTitle">JAXModelLoader._get_model() Pipeline</text>
+    <text x="56" y="410" class="code">model = nnx.eval_shape(lambda: ModelClass(...))  # Shape-only construction</text>
+    <text x="56" y="430" class="code">apply_moe_quantization(model, quant_config)  # quantize MoE layers</text>
+    <text x="56" y="450" class="code">apply_linear_quantization(model, quant_config)  # quantize Linear layers</text>
+    <text x="56" y="470" class="code">model.load_weights(model_config)  # load weights</text>
+    <text x="56" y="490" class="stepSub">• Quantization replacement happens before weight load, swapping <tspan class="code">LinearBase</tspan> for <tspan class="code">QuantizedLinear</tspan></text>
+    <text x="56" y="508" class="note">Regex matches module path (e.g. .*q_proj); one rule covers all layers</text>
+  </g>
+
+  <path d="M 800 518 L 800 548" stroke="#334155" stroke-width="2.5" fill="none" marker-end="url(#arrow)"/>
+
+  <!-- ============== STEP 3: Static vs Dynamic Path ============== -->
+  <g>
+    <rect x="40" y="556" width="1520" height="28" rx="10" fill="#b45309"/>
+    <text x="56" y="576" class="tag">STEP 3 · Static vs Dynamic Quantization Path</text>
+  </g>
+
+  <!-- Static Path -->
+  <g>
+    <rect x="60" y="604" width="720" height="240" rx="10" fill="#fef3c7" stroke="#b45309" stroke-width="2"/>
+    <text x="76" y="624" class="stepTitle">Static Path (is_static_checkpoint=True)</text>
+    <text x="76" y="644" class="stepSub">• Weights pre-quantized to FP8/INT8, stored in checkpoint</text>
+    <text x="76" y="664" class="code">QuantizedLinear.from_linear(linear, quant_config, is_static=True)</text>
+    <text x="76" y="684" class="stepSub">• Loaded directly as quantized tensors:</text>
+    <text x="96" y="704" class="code">weight_q = load_tensor("weight")  # already quantized</text>
+    <text x="96" y="724" class="code">weight_scale = load_tensor("weight_scale")  # scale factor</text>
+    <text x="76" y="744" class="stepSub">• No runtime quantization, saves init time</text>
+    <text x="76" y="764" class="stepSub">• Activation quantization (if enabled) still done dynamically at Forward</text>
+    <text x="76" y="784" class="stepSub">• Storage layout:</text>
+    <text x="96" y="804" class="code">weight_q: (out_features, in_features) dtype=float8_e4m3fn/int8</text>
+    <text x="96" y="824" class="code">weight_scale: (out_features,) or (num_blocks,) dtype=float32</text>
+  </g>
+
+  <!-- Dynamic Path -->
+  <g>
+    <rect x="800" y="604" width="740" height="240" rx="10" fill="#fce7f3" stroke="#be185d" stroke-width="2"/>
+    <text x="816" y="624" class="stepTitle">Dynamic Path (is_static_checkpoint=False)</text>
+    <text x="816" y="644" class="stepSub">• Weights stored in original precision (BFloat16) in checkpoint</text>
+    <text x="816" y="664" class="code">QuantizedLinear.from_linear(linear, quant_config, is_static=False)</text>
+    <text x="816" y="684" class="stepSub">• Quantize weights immediately after loading:</text>
+    <text x="836" y="704" class="code">weight_q, weight_scale = quantize_tensor(weight, dtype, block_size)</text>
+    <text x="816" y="724" class="stepSub">• Quantization function picks strategy from config:</text>
+    <text x="836" y="744" class="code">Per-Channel: scale = max(abs(weight), axis=1)</text>
+    <text x="836" y="764" class="code">Per-Tensor: scale = max(abs(weight))</text>
+    <text x="836" y="784" class="code">Per-Block: scale = max(abs(weight_block)) for each block</text>
+    <text x="816" y="804" class="stepSub">• Longer init, but supports any-precision checkpoints</text>
+    <text x="816" y="824" class="note">Block-wise quant: split weight matrix into blocks, compute Scale per block</text>
+  </g>
+
+  <path d="M 800 844 L 800 874" stroke="#7c3aed" stroke-width="2.5" fill="none" marker-end="url(#arrowPurple)"/>
+
+  <!-- ============== STEP 4: Forward Quantization ============== -->
+  <g>
+    <rect x="40" y="882" width="1520" height="220" rx="10" fill="#f3e8ff" stroke="#7c3aed" stroke-width="2"/>
+    <rect x="40" y="882" width="1520" height="28" rx="10" fill="#7c3aed"/>
+    <text x="56" y="902" class="tag">STEP 4 · Quantized Compute at Forward</text>
+    <text x="56" y="934" class="stepTitle">QuantizedLinear.__call__(x) — Forward execution</text>
+    <text x="56" y="954" class="stepSub">• Step 1: Quantize Activation (if <tspan class="code">activation_dtype</tspan> not None)</text>
+    <text x="76" y="974" class="code">x_q, x_scale = quantize_tensor(x, activation_dtype, block_size)</text>
+    <text x="56" y="994" class="stepSub">• Step 2: Call quantized matmul Kernel</text>
+    <text x="76" y="1014" class="code">output = xla_quantized_matmul_local(x_q, weight_q, x_scale, weight_scale)</text>
+    <text x="56" y="1034" class="stepSub">• Step 3: Kernel performs INT8/FP8 matmul + Scale correction</text>
+    <text x="76" y="1054" class="code">result = (x_q @ weight_q.T) * (x_scale * weight_scale)  # simplified</text>
+    <text x="56" y="1074" class="stepSub">• Step 4: Return BFloat16 result (auto-dequantized)</text>
+    <text x="56" y="1092" class="note">Quantized matmul uses TPU's INT8/FP8 instructions, 2-4x throughput vs BFloat16</text>
+  </g>
+
+  <path d="M 800 1102 L 800 1132" stroke="#0e7490" stroke-width="2.5" fill="none" marker-end="url(#arrowBlue)"/>
+
+  <!-- ============== STEP 5: Kernel Dispatch ============== -->
+  <g>
+    <rect x="40" y="1140" width="1520" height="240" rx="10" fill="#cffafe" stroke="#0e7490" stroke-width="2"/>
+    <rect x="40" y="1140" width="1520" height="28" rx="10" fill="#0e7490"/>
+    <text x="56" y="1160" class="tag">STEP 5 · Kernel Dispatch and Tuning</text>
+
+    <!-- Per-Channel -->
+    <rect x="60" y="1188" width="480" height="170" rx="8" fill="#dcfce7" stroke="#15803d" stroke-width="2"/>
+    <text x="76" y="1208" class="stepTitle">Per-Channel Kernel</text>
+    <text x="76" y="1228" class="stepSub">• Condition: <tspan class="code">block_size is None</tspan></text>
+    <text x="76" y="1248" class="code">matmul_perchannel_kernel(...)</text>
+    <text x="76" y="1268" class="stepSub">• Independent Scale per row/column</text>
+    <text x="76" y="1288" class="stepSub">• Simple and efficient, fits most cases</text>
+    <text x="76" y="1308" class="stepSub">• Scale Shape: <tspan class="code">(out_features,)</tspan></text>
+    <text x="76" y="1328" class="stepSub">• Broadcast to each output element</text>
+    <text x="76" y="1346" class="note">Default choice, best stability</text>
+
+    <!-- Block-wise -->
+    <rect x="560" y="1188" width="480" height="170" rx="8" fill="#fef3c7" stroke="#b45309" stroke-width="2"/>
+    <text x="576" y="1208" class="stepTitle">Block-wise Kernel</text>
+    <text x="576" y="1228" class="stepSub">• Condition: <tspan class="code">block_size is not None</tspan></text>
+    <text x="576" y="1248" class="code">matmul_blockwise_kernel(...)</text>
+    <text x="576" y="1268" class="stepSub">• Independent Scale per Block</text>
+    <text x="576" y="1288" class="stepSub">• Finer granularity, higher precision</text>
+    <text x="576" y="1308" class="stepSub">• Scale Shape: <tspan class="code">(num_blocks_out, num_blocks_in)</tspan></text>
+    <text x="576" y="1328" class="stepSub">• Needs cross-Block reduction and Scale correction</text>
+    <text x="576" y="1346" class="note">Shape Guard: falls back to Per-Channel for single-Block case</text>
+
+    <!-- Three-Tier Tuning -->
+    <rect x="1060" y="1188" width="480" height="170" rx="8" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/>
+    <text x="1076" y="1208" class="stepTitle">Three-Tier Tuning Fallback</text>
+    <text x="1076" y="1228" class="code">get_safe_blockwise_tuned_value()</text>
+    <text x="1076" y="1248" class="stepSub">• Tier 1: lookup Tuning Table</text>
+    <text x="1096" y="1268" class="code"><tspan>TUNED_CONFIGS[(shape, dtype)]</tspan></text>
+    <text x="1076" y="1288" class="stepSub">• Tier 2: use default values</text>
+    <text x="1096" y="1308" class="code">DEFAULT_BLOCKWISE_CONFIG</text>
+    <text x="1076" y="1328" class="stepSub">• Tier 3: fall back to Per-Channel</text>
+    <text x="1096" y="1348" class="code">use_perchannel_kernel()</text>
+  </g>
+
+  <path d="M 800 1380 L 800 1410" stroke="#334155" stroke-width="2.5" fill="none" marker-end="url(#arrow)"/>
+
+  <!-- ============== STEP 6: Output ============== -->
+  <g>
+    <rect x="40" y="1418" width="1520" height="100" rx="10" fill="#dcfce7" stroke="#15803d" stroke-width="2"/>
+    <rect x="40" y="1418" width="1520" height="28" rx="10" fill="#15803d"/>
+    <text x="56" y="1438" class="tag">STEP 6 · Output</text>
+    <text x="56" y="1470" class="stepTitle">Return BFloat16 result</text>
+    <text x="56" y="1490" class="stepSub">• Kernel automatically dequantizes the result to BFloat16</text>
+    <text x="56" y="1510" class="stepSub">• Downstream layers see standard precision and need not know about quantization</text>
+  </g>
+
+  <!-- Footer notes -->
+  <g>
+    <rect x="40" y="1560" width="1520" height="400" rx="10" fill="#e0e7ff" stroke="#4f46e5" stroke-width="2"/>
+    <rect x="40" y="1560" width="1520" height="28" rx="10" fill="#4f46e5"/>
+    <text x="56" y="1580" class="tag">Key Design Notes</text>
+
+    <text x="56" y="1612" class="stepTitle">Why FP8 e4m3fn instead of e5m2?</text>
+    <text x="56" y="1632" class="stepSub">• e4m3fn: 4-bit Exponent + 3-bit Mantissa, higher precision (~0.1% relative error), dynamic range +/-240</text>
+    <text x="56" y="1650" class="stepSub">• e5m2: 5-bit Exponent + 2-bit Mantissa, larger range (+/-57344) but lower precision</text>
+    <text x="56" y="1668" class="stepSub">• LLM weights/activations after LayerNorm/RMSNorm have concentrated value ranges; precision matters more than wide range</text>
+
+    <text x="56" y="1696" class="stepTitle">Benefits of regex matching on module paths</text>
+    <text x="56" y="1716" class="stepSub">• Transformer models have N Decoder Layers; module paths only differ by layer index</text>
+    <text x="56" y="1734" class="stepSub">• A regex pattern (e.g. <tspan class="code">.*q_proj</tspan>) covers all layers in one rule, avoiding per-layer config</text>
+    <text x="56" y="1752" class="stepSub">• Supports flexible module selection (e.g. quantize Attention only, leave FFN)</text>
+
+    <text x="56" y="1780" class="stepTitle">Block-wise quantization Shape Guard</text>
+    <text x="56" y="1800" class="stepSub">• Single-Block case (<tspan class="code">out_dim &lt;= block_size_out</tspan>): Blockwise Kernel reduction degenerates</text>
+    <text x="56" y="1818" class="stepSub">• Only one Output Block participates, missing the cross-Block Softmax-style correction, leading to NaN</text>
+    <text x="56" y="1836" class="stepSub">• <tspan class="code">should_use_blockwise_kernel()</tspan> detects this and falls back to Per-Channel Kernel</text>
+
+    <text x="56" y="1864" class="stepTitle">Static vs Dynamic quantization trade-offs</text>
+    <text x="56" y="1884" class="stepSub">• Static: fast init, but requires pre-quantized checkpoint (usually provided by model authors)</text>
+    <text x="56" y="1902" class="stepSub">• Dynamic: works with any-precision checkpoints, but quantizes all weights at init (seconds to minutes)</text>
+    <text x="56" y="1920" class="stepSub">• Activation quantization is always dynamic (per Forward), since Activations depend on input</text>
+
+    <text x="56" y="1948" class="stepTitle">Performance gains from quantization</text>
+    <text x="56" y="1968" class="stepSub">• TPU INT8/FP8 matmul throughput is 2-4x BFloat16</text>
+    <text x="56" y="1986" class="stepSub">• Memory footprint halved (FP8/INT8 vs BFloat16), enabling larger Batch Size or longer sequences</text>
+  </g>
+</svg>

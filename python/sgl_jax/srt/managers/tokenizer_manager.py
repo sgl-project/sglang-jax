@@ -173,6 +173,7 @@ class TokenizerManager:
                 tokenizer_mode=server_args.tokenizer_mode,
                 trust_remote_code=server_args.trust_remote_code,
                 revision=server_args.revision,
+                tokenizer_backend=server_args.tokenizer_backend,
                 sub_dir=tokenizer_subdir,
             )
 
@@ -196,20 +197,12 @@ class TokenizerManager:
         self.current_load_lock = asyncio.Lock()
 
         # Communicators
-        self.release_memory_occupation_communicator = _Communicator(
-            self.send_to_scheduler, server_args.dp_size
-        )
-        self.resume_memory_occupation_communicator = _Communicator(
-            self.send_to_scheduler, server_args.dp_size
-        )
-        self.flush_cache_communicator = _Communicator(self.send_to_scheduler, server_args.dp_size)
-        self.profile_communicator = _Communicator(self.send_to_scheduler, server_args.dp_size)
-        self.get_internal_state_communicator = _Communicator(
-            self.send_to_scheduler, server_args.dp_size
-        )
-        self.set_internal_state_communicator = _Communicator(
-            self.send_to_scheduler, server_args.dp_size
-        )
+        self.release_memory_occupation_communicator = _Communicator(self.send_to_scheduler, 1)
+        self.resume_memory_occupation_communicator = _Communicator(self.send_to_scheduler, 1)
+        self.flush_cache_communicator = _Communicator(self.send_to_scheduler, 1)
+        self.profile_communicator = _Communicator(self.send_to_scheduler, 1)
+        self.get_internal_state_communicator = _Communicator(self.send_to_scheduler, 1)
+        self.set_internal_state_communicator = _Communicator(self.send_to_scheduler, 1)
 
         # LoRA
         self.lora_registry = LoRARegistry(self.server_args.lora_paths)
@@ -456,21 +449,28 @@ class TokenizerManager:
         return state
 
     def _notify_state_event(self, state: ReqState) -> None:
-        """Thread-safe wrapper around state.event.set().
+        """Wake the consumer waiting on ``state.event``.
 
-        If enable_engine_loop_run_forever_daemon was enabled, handle_loop would run on the daemon_loop thread, but the asyncio.Event's
-        internal Future belongs to the eval_loop (the loop that called
-        _send_one_request).  Calling fut.set_result() from the wrong thread
-        does not wake up eval_loop's selector.  call_soon_threadsafe writes to
-        the self-pipe so the selector returns from epoll_wait immediately.
+        Same-loop callers set the event directly to avoid a
+        schedule-after-clear race in ``_wait_one_response``. Cross-loop
+        callers (``enable_engine_loop_run_forever_daemon``) must go through
+        ``call_soon_threadsafe`` because ``Future.set_result`` from the
+        wrong thread cannot wake the eval-loop's selector.
         """
         loop = state.event_loop
-        if loop is not None:
+        if loop is None:
+            state.event.set()
+            return
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is loop:
+            state.event.set()
+        else:
             with contextlib.suppress(RuntimeError):
                 # RuntimeError: loop is already closed (request timed-out / cancelled).
                 loop.call_soon_threadsafe(state.event.set)
-        else:
-            state.event.set()
 
     async def _wait_one_response(
         self,
@@ -497,10 +497,19 @@ class TokenizerManager:
                         ) from e
                 continue
 
-            out = state.out_list[-1]
-
+            # Drain in one sync block so a deferred cross-loop set cannot
+            # wake the next wait_for against an empty list.
+            out_list = state.out_list
             state.out_list = []
-            if state.finished:
+            finished = state.finished
+            state.event.clear()
+
+            if not out_list:
+                continue
+
+            out = out_list[-1]
+
+            if finished:
                 if self.log_requests:
                     max_length, skip_names, out_skip_names = self.log_request_metadata
                     msg = f"Finish: obj={dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}, out={dataclass_to_string_truncated(out, max_length, skip_names=out_skip_names)}"
@@ -517,8 +526,6 @@ class TokenizerManager:
 
                 yield out
                 break
-
-            state.event.clear()
 
             if obj.stream:
                 yield out

@@ -46,21 +46,25 @@ For more features and usage details, please read the documents in the [`docs`](h
 
 ## Supported Models
 
-SGL-JAX is designed for easy extension to new model architectures. It currently provides first-class, optimized support for:
+SGL-JAX is designed for easy extension to new model architectures. It currently provides first-class support for:
 
--   **Qwen**: Performance needs to improve.
--   **Qwen 2**: Performance needs to improve.
--   **Qwen 2 MoE**: Performance needs to improve.
--   **Qwen 3**: Currently these series have achieved our best performance.
--   **Qwen 3 MoE**: Apart from models like Qwen-coder3-480B with large parameters, these series have achieved our best performance.
--   **Llama**: Performance needs to improve.
--   **Bailing MoE**: Performance needs to improve.
--   **MiMo-7B**: Support Eagle's Speculative Decoding, Performance needs to improve.
+-   **Qwen**
+-   **Qwen 2** / **Qwen 2 MoE**
+-   **Qwen 3** / **Qwen 3 MoE**
+-   **Llama**
+-   **Gemma 2**
+-   **DeepSeek V2 / V3**
+-   **GLM-4 MoE**
+-   **Grok-2**
+-   **Bailing MoE** / **Bailing MoE V2**
+-   **MiMo-7B**
+-   **MiMo-V2-Flash**
+-   **MiMo-V2.5-Pro**
 
-Currently, SGL-JAX already supports MultiModal Models, and its usage is compatible with LLMs. The architecture has been adapted to support flexible multimodal model architectures.
+SGL-JAX also supports multimodal models with the same usage interface as LLMs. The architecture has been adapted to support flexible multimodal model architectures.
 
 -   **Wan 2.1 T2V**: Text-to-Video generation model.
--   **Wan 2.2 T2V**: Text-to-Video generation model. Uses different DiT models at different noise stages for denoising, achieving higher generation quality.
+-   **Wan 2.2 T2V**: Text-to-Video generation model. Uses different DiT models at different noise stages for denoising.
 -   **Qwen2.5-VL**: Vision-language model series based on Qwen2.5.
 
 For multimodal model usage, see the [Usage Guide](docs/mutlimodal/multimodal_usage.md) and [Architecture Design](docs/mutlimodal/design/[RFC]multimodal_architechure.md).

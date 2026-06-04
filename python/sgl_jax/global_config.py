@@ -45,5 +45,10 @@ class GlobalConfig:
         self.enable_precache_with_tracing = True
         self.enable_parallel_encoding = True
 
+        # Control whether row parallel linear/MoE activation needs to be reduce-scattered.
+        # 128 is a conservative number. 8 is the minimum number in order to fully utilize
+        # VPU sub-lanes
+        self.tpu_scatter_min_local_size = int(os.environ.get("TPU_SCATTER_MIN_LOCAL_SIZE", 128))
+
 
 global_config = GlobalConfig()

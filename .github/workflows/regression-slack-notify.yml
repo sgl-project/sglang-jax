@@ -1,0 +1,83 @@
+name: Regression Slack Notify
+
+on:
+  workflow_run:
+    workflows:
+      - "CI Auto Bisect"
+    types:
+      - completed
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "CI Auto Bisect run ID (for manual testing)"
+        required: true
+
+jobs:
+  notify-regression:
+    if: >-
+      github.repository == 'sgl-project/sglang-jax'
+      && (github.event_name == 'workflow_dispatch'
+          || github.event.workflow_run.conclusion != 'cancelled')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Download analysis artifact
+        id: download
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BISECT_RUN_ID: ${{ github.event.workflow_run.id || inputs.run_id }}
+        run: |
+          ARTIFACT_ID=$(gh api "repos/$REPO/actions/runs/$BISECT_RUN_ID/artifacts" \
+            --jq '.artifacts[] | select(.name | startswith("ci-auto-bisect-")) | .id' \
+            | head -1)
+          if [ -z "$ARTIFACT_ID" ]; then
+            echo "No analysis artifact found, skipping."
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          gh api "repos/$REPO/actions/artifacts/$ARTIFACT_ID/zip" > artifact.zip
+          unzip -o artifact.zip
+          if [ ! -f analysis_result.json ]; then
+            echo "analysis_result.json not found in artifact, skipping."
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "found=true" >> "$GITHUB_OUTPUT"
+
+      - name: Check regression and format message
+        if: steps.download.outputs.found == 'true'
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          python3 scripts/ci/regression_notify.py
+          --analysis analysis_result.json
+          --repo "${{ github.repository }}"
+          --slack-output slack_summary.txt
+
+      - name: Post to Slack
+        if: steps.gate.outputs.send_slack == 'true'
+        continue-on-error: true
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          if [ -z "$SLACK_WEBHOOK_URL" ]; then
+            echo "SLACK_WEBHOOK_URL not set, skipping."
+            exit 0
+          fi
+          SUMMARY=$(cat slack_summary.txt)
+          if [ -z "$SUMMARY" ]; then
+            echo "Empty summary, skipping."
+            exit 0
+          fi
+          jq -n --arg text "$SUMMARY" \
+            '{"blocks":[{"type":"section","text":{"type":"mrkdwn","text":$text}}]}' | \
+            curl --fail-with-body -X POST -H 'Content-type: application/json' \
+              -d @- "$SLACK_WEBHOOK_URL"

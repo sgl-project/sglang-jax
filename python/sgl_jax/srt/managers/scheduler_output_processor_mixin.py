@@ -11,6 +11,7 @@ from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
 from sgl_jax.srt.layers.routed_experts_capturer import get_global_experts_capturer
 from sgl_jax.srt.managers.io_struct import AbortReq, BatchTokenIDOut
 from sgl_jax.srt.managers.schedule_batch import BaseFinishReason, Req, ScheduleBatch
+from sgl_jax.srt.mem_cache.common import release_kv_cache
 from sgl_jax.srt.precision_tracer import precision_tracer
 from sgl_jax.srt.utils.common_utils import cdiv
 
@@ -24,6 +25,47 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 DEFAULT_FORCE_STREAM_INTERVAL = 50
+
+
+def _input_logprob_lens_per_dp(batch: ScheduleBatch) -> list[int] | None:
+    if not batch.forward_mode.is_extend():
+        return None
+
+    lens_per_dp = []
+    for info in batch.reqs_info:
+        extend_lens = info.extend_lens or []
+        start_lens = info.extend_logprob_start_lens or []
+        lens_per_dp.append(
+            sum(
+                max(extend_len - start_len, 0)
+                for extend_len, start_len in zip(extend_lens, start_lens)
+            )
+        )
+    return lens_per_dp
+
+
+def _materialize_input_token_logprobs(input_token_logprobs, lens_per_dp: list[int] | None = None):
+    input_shape = getattr(input_token_logprobs, "shape", None)
+    if input_shape is not None and len(input_shape) != 1:
+        raise RuntimeError(
+            "input_token_logprobs must be a 1-D scalar logprob array before "
+            f"host transfer; got shape {input_shape}. This would expose "
+            "full-vocab logprob rows in meta_info and can exhaust host RAM."
+        )
+    host_logprobs = np.asarray(jax.device_get(input_token_logprobs))
+
+    values = host_logprobs.astype(float).tolist()
+    if lens_per_dp:
+        valid_len = sum(lens_per_dp)
+        if len(values) != valid_len and len(values) % len(lens_per_dp) == 0:
+            per_dp_token_size = len(values) // len(lens_per_dp)
+            compact_values = []
+            offset = 0
+            for dp_valid_len in lens_per_dp:
+                compact_values.extend(values[offset : offset + dp_valid_len])
+                offset += per_dp_token_size
+            values = compact_values
+    return tuple(values)
 
 
 class SchedulerOutputProcessorMixin:
@@ -51,7 +93,11 @@ class SchedulerOutputProcessorMixin:
         result: GenerationBatchResult,
         launch_done: threading.Event | None = None,
     ):
-        skip_stream_req = None
+        # On dp>1 each dp rank can have its own chunked-in-flight req, so this
+        # must hold up to `dp_size` reqs, not just one. A single-Req variable
+        # (the pre-DP design) silently leaked unchunked reqs into stream_output
+        # with `input_token_logprobs_val` still None, crashing the consumer.
+        skip_stream_reqs: set = set()
 
         assert self.is_generation
         (
@@ -77,159 +123,210 @@ class SchedulerOutputProcessorMixin:
                 logits_output.next_token_logprobs = jax.device_get(
                     logits_output.next_token_logprobs
                 ).astype(float)
-            if batch.return_logprob:
-                if logits_output.next_token_logprobs is not None:
-                    logits_output.next_token_logprobs = jax.device_get(
-                        logits_output.next_token_logprobs
-                    ).astype(float)
-                if logits_output.input_token_logprobs is not None:
-                    logits_output.input_token_logprobs = tuple(
-                        jax.device_get(logits_output.input_token_logprobs).astype(float)
-                    )
+            if batch.return_logprob and logits_output.next_token_logprobs is not None:
+                logits_output.next_token_logprobs = jax.device_get(
+                    logits_output.next_token_logprobs
+                ).astype(float)
+
+        # Compact the per-DP padded scalar input_token_logprobs so the logprob_pt
+        # walk below stays aligned. Runs for overlap (resolve_last_batch_result
+        # leaves it flat-padded) and non-overlap; no-op when already compact.
+        if batch.return_logprob and logits_output.input_token_logprobs is not None:
+            logits_output.input_token_logprobs = _materialize_input_token_logprobs(
+                logits_output.input_token_logprobs,
+                _input_logprob_lens_per_dp(batch),
+            )
         hidden_state_offset = 0
-        # Check finish conditions
+        per_dp_bs_size = batch.per_dp_bs_size
+
         logprob_pt = 0
-        for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
-            if req.is_retracted:
+        # Flat index across all DP ranks. logprob arrays in `logits_output`
+        # have already been reordered to original-req order in tp_worker
+        # via `logits_indices_selector`, so we just walk it sequentially.
+        # `extend_*_per_req` lists are also collected in DP-rank-then-req
+        # order in scheduler.run_batch, matching this counter. Increment
+        # for every req we visit (including retracted) so the counter stays
+        # aligned with the selector / collected lists.
+        req_idx = 0
+
+        for dp_rank in range(batch.dp_size):
+            info = batch.reqs_info[dp_rank]
+            reqs = info.reqs
+            dp_output_ids = next_token_ids[
+                per_dp_bs_size * dp_rank : per_dp_bs_size * (dp_rank + 1)
+            ]
+
+            # Skip empty DP ranks
+            if not reqs or not dp_output_ids:
                 continue
 
-            req.latest_bid = batch.bid
+            # Check finish conditions for each request in this DP rank
+            for i, (req, next_token_id) in enumerate(zip(reqs, dp_output_ids)):
+                if req.finished() or req.is_retracted:
+                    # release_kv_cache owns over-allocated KV; freeing here would double-free.
+                    req_idx += 1
+                    continue
 
-            if self.is_mixed_chunk and self.enable_overlap and req.finished():
-                j = len(batch.out_cache_loc) - len(batch.reqs) + i
-                self.token_to_kv_pool_allocator.free(batch.out_cache_loc[j : j + 1])
-                continue
+                req.latest_bid = result.bid
 
-            if req.is_chunked <= 0:
-                # req output_ids are set here
-                req.output_ids.append(next_token_id)
-                req.check_finished()
+                if req.is_chunked <= 0:
+                    req.output_ids.append(next_token_id)
+                    req.check_finished()
+                    if req.finished():
+                        self.maybe_collect_routed_experts(req)
+                        if precision_tracer.get_trace_active():
+                            precision_tracer.set_request_status_to_completed(req.rid)
+                            precision_tracer.add_completed_requests_count()
+                            precision_tracer.set_end_time_and_duration(req.rid)
+                            logger.info(
+                                "Request trace completed (%d/%d): %s",
+                                precision_tracer.get_completed_requests_count(),
+                                precision_tracer.get_max_requests(),
+                                req.rid,
+                            )
+                            if (
+                                precision_tracer.get_completed_requests_count()
+                                >= precision_tracer.get_max_requests()
+                            ):
+                                precision_tracer.stop_trace()
+                        release_kv_cache(req, self.tree_cache)
+                    elif not info.decoding_reqs or req not in info.decoding_reqs:
+                        # This updates radix so others can match
+                        self.tree_cache.cache_unfinished_req(req)
 
-                if req.finished():
-                    self.maybe_collect_routed_experts(req)
-                    if precision_tracer.get_trace_active():
-                        precision_tracer.set_request_status_to_completed(req.rid)
-                        precision_tracer.add_completed_requests_count()
-                        precision_tracer.set_end_time_and_duration(req.rid)
-                        logger.info(
-                            "Request trace completed (%d/%d): %s",
-                            precision_tracer.get_completed_requests_count(),
-                            precision_tracer.get_max_requests(),
-                            req.rid,
+                    if req.return_output_logprob_only:
+                        req.output_token_logprobs_val.append(
+                            logits_output.next_token_logprobs[req_idx]
                         )
-                        if (
-                            precision_tracer.get_completed_requests_count()
-                            >= precision_tracer.get_max_requests()
-                        ):
-                            precision_tracer.stop_trace()
-                    self.tree_cache.cache_finished_req(req)
-                elif not batch.decoding_reqs or req not in batch.decoding_reqs:
-                    # This updates radix so others can match
-                    self.tree_cache.cache_unfinished_req(req)
+                        req.output_token_logprobs_idx.append(next_token_id)
 
-                if req.return_output_logprob_only:
-                    req.output_token_logprobs_val.append(logits_output.next_token_logprobs[i])
-                    req.output_token_logprobs_idx.append(next_token_ids[i])
-
-                if req.return_logprob:
-                    assert extend_logprob_start_len_per_req is not None
-                    assert extend_input_len_per_req is not None
-                    extend_logprob_start_len = extend_logprob_start_len_per_req[i]
-                    extend_input_len = extend_input_len_per_req[i]
-                    num_input_logprobs = extend_input_len - extend_logprob_start_len
-                    self.add_logprob_return_values(
-                        i,
-                        req,
-                        logprob_pt,
-                        next_token_ids,
-                        num_input_logprobs,
-                        logits_output,
-                    )
-                    logprob_pt += num_input_logprobs
-                if req.return_hidden_states and logits_output.hidden_states is not None:
-                    req.hidden_states.append(
-                        jax.device_get(
-                            logits_output.hidden_states[
-                                hidden_state_offset : (
-                                    hidden_state_offset := hidden_state_offset
-                                    + len(req.origin_input_ids)
-                                )
-                            ]
-                        ).astype(float)
-                    )
-                # Update grammar state after token sampling
-                if req.grammar is not None:
-                    try:
-                        req.grammar.accept_token(int(next_token_id))
-                    except ValueError as e:
-                        # Grammar accept_token can raise ValueError if the token is not in the grammar.
-                        # This can happen if the grammar is not set correctly or the token is invalid.
-                        logger.error(
-                            "Grammar accept_token failed for req %s with token %s: %s",
-                            req.rid,
-                            next_token_id,
-                            e,
-                        )
-
-                        self.abort_request(AbortReq(rid=req.rid))
-                    req.grammar.finished = req.finished()
-            else:
-                # being chunked reqs' prefill is not finished
-                req.is_chunked -= 1
-                # There is only at most one request being currently chunked.
-                # Because this request does not finish prefill,
-                # we don't want to stream the request currently being chunked.
-                skip_stream_req = req
-
-                # Incrementally update input logprobs.
-                if req.return_logprob:
-                    extend_logprob_start_len = extend_logprob_start_len_per_req[i]
-                    extend_input_len = extend_input_len_per_req[i]
-                    if extend_logprob_start_len < extend_input_len:
-                        # Update input logprobs.
+                    if req.return_logprob:
+                        assert extend_logprob_start_len_per_req is not None
+                        assert extend_input_len_per_req is not None
+                        extend_logprob_start_len = extend_logprob_start_len_per_req[req_idx]
+                        extend_input_len = extend_input_len_per_req[req_idx]
                         num_input_logprobs = extend_input_len - extend_logprob_start_len
-                        self.add_input_logprob_return_values(
-                            i,
+                        self.add_logprob_return_values(
+                            req_idx,
                             req,
-                            logits_output,
                             logprob_pt,
+                            dp_output_ids,  # Pass current DP rank's output IDs
                             num_input_logprobs,
-                            last_prefill_chunk=False,
+                            logits_output,
+                            local_idx=i,
                         )
                         logprob_pt += num_input_logprobs
+
+                    if req.return_hidden_states and logits_output.hidden_states is not None:
+                        req.hidden_states.append(
+                            jax.device_get(
+                                logits_output.hidden_states[
+                                    hidden_state_offset : (
+                                        hidden_state_offset := hidden_state_offset
+                                        + len(req.origin_input_ids)
+                                    )
+                                ]
+                            ).astype(float)
+                        )
+
+                    # Update grammar state after token sampling
+                    if req.grammar is not None:
+                        try:
+                            req.grammar.accept_token(next_token_id)
+                        except ValueError as e:
+                            # Grammar accept_token can raise ValueError if the token is not in the grammar.
+                            # This can happen if the grammar is not set correctly or the token is invalid.
+                            logger.error(
+                                "Grammar accept_token failed for req %s with token %s: %s",
+                                req.rid,
+                                next_token_id,
+                                e,
+                            )
+
+                            self.abort_request(AbortReq(rid=req.rid))
+                        req.grammar.finished = req.finished()
+                else:
+                    # being chunked reqs' prefill is not finished
+                    req.is_chunked -= 1
+                    # On dp>1, multiple reqs (one per dp rank) can be chunked
+                    # in the same batch; collect all so stream_output skips them.
+                    skip_stream_reqs.add(id(req))
+
+                    # Incrementally update input logprobs.
+                    if req.return_logprob:
+                        extend_logprob_start_len = extend_logprob_start_len_per_req[req_idx]
+                        extend_input_len = extend_input_len_per_req[req_idx]
+                        if extend_logprob_start_len < extend_input_len:
+                            # Update input logprobs.
+                            num_input_logprobs = extend_input_len - extend_logprob_start_len
+                            self.add_input_logprob_return_values(
+                                req_idx,
+                                req,
+                                logits_output,
+                                logprob_pt,
+                                num_input_logprobs,
+                                last_prefill_chunk=False,
+                            )
+                            logprob_pt += num_input_logprobs
+                req_idx += 1
 
         batch.cache_miss_count = cache_miss_count
 
         if batch.cache_miss_count > 0:
             logger.info("Prefill batch. #bid: %s, #cache_miss: %s", result.bid, cache_miss_count)
 
+        # Collect all requests from all DP ranks for stream output
+        all_reqs = []
+        for info in batch.reqs_info:
+            if info.reqs:
+                all_reqs.extend(info.reqs)
+
         self.set_next_batch_sampling_info_done(batch)
 
         self.stream_output(
-            batch.reqs,
+            all_reqs,
             batch.return_logprob,
             batch.return_output_logprob_only,
-            skip_stream_req,
+            skip_stream_reqs,
             cache_miss_count,
         )
 
-        batch.spec_info = result.next_draft_input
+        if result.next_draft_input is not None:
+            real_bs_per_dp = [len(info.reqs) if info.reqs else 0 for info in batch.reqs_info]
+            per_rank_spec = ScheduleBatch._split_spec_info_per_rank(
+                result.next_draft_input, real_bs_per_dp
+            )
+            for r, s in enumerate(per_rank_spec):
+                batch.reqs_info[r].spec_info = s
 
     def _resolve_spec_decode_token_ids(
         self: Scheduler, result: GenerationBatchResult, batch: ScheduleBatch
     ) -> list[list[int]]:
-        """Resolve the padding next token ids for speculative decoding with overlap."""
+        """Resolve per-req accepted token lists from the verify output.
 
-        next_token_ids = result.next_token_ids
-        accept_lens = result.accept_lens.tolist()
-        result.num_accepted_tokens = sum(accept_lens) - len(batch.reqs)
-        predict_tokens = []
+        Returns a list of length ``per_dp_bs * dp_size`` (DP-padded order),
+        with ``[]`` at padding slots, so the per-rank slice in
+        ``process_batch_result_decode`` works for any ``dp_size``.
+        """
+        next_token_ids = np.asarray(jax.device_get(result.next_token_ids))
+        accept_lens = np.asarray(jax.device_get(result.accept_lens)).tolist()
         stride = self.draft_worker.speculative_num_draft_tokens
-        for i, req in enumerate(batch.reqs):
-            predict_tokens.append(next_token_ids[i * stride : i * stride + accept_lens[i]])
-            req.spec_verify_ct += 1
-            req.spec_accepted_tokens += accept_lens[i]
-
+        per_dp_bs = batch.per_dp_bs_size
+        total_bs = per_dp_bs * batch.dp_size
+        predict_tokens: list[list[int]] = [[] for _ in range(total_bs)]
+        n_real = 0
+        total_accepted = 0
+        for dp_rank, info in enumerate(batch.reqs_info):
+            base = dp_rank * per_dp_bs
+            for j, req in enumerate(info.reqs or []):
+                i = base + j
+                a = accept_lens[i]
+                predict_tokens[i] = next_token_ids[i * stride : i * stride + a].tolist()
+                req.spec_verify_ct += 1
+                req.spec_accepted_tokens += a
+                total_accepted += a
+                n_real += 1
+        result.num_accepted_tokens = total_accepted - n_real
         return predict_tokens
 
     def process_batch_result_decode(
@@ -249,14 +346,15 @@ class SchedulerOutputProcessorMixin:
             # allocate_lens_list = result.allocate_lens.tolist()
             # accept_lens_list = result.accept_lens.tolist()
 
+        # TODO: Speculative decoding support for DP
         if self.spec_algorithm is None or self.spec_algorithm.is_none():
-            self.num_generated_tokens += len(batch.reqs)
+            self.num_generated_tokens += batch.batch_size()
         else:
             for next_token_id in next_token_ids:
                 self.num_generated_tokens += len(next_token_id)
                 self.accept_token += len(next_token_id)
-            self.spec_num_forward_ct += len(batch.reqs)
-            self.draft_token += len(batch.reqs) * self.draft_worker.speculative_num_draft_tokens
+            self.spec_num_forward_ct += batch.batch_size()
+            self.draft_token += batch.batch_size() * self.draft_worker.speculative_num_draft_tokens
         # FIXME(pc) add spec decode metrics
 
         if self.enable_overlap:
@@ -273,112 +371,157 @@ class SchedulerOutputProcessorMixin:
 
         self.token_to_kv_pool_allocator.free_group_begin()
 
-        # Check finish condition
-        for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
-            req: Req
-            if req.is_retracted:
+        # Process each DP rank's requests (unified for all dp_size >= 1)
+        per_dp_bs_size = batch.per_dp_bs_size  # Padded batch size per DP rank
+        # Flat index across all DP ranks. logprob arrays in `logits_output`
+        # / `next_token_logprobs` have already been reordered to original-req
+        # order in tp_worker via `logits_indices_selector`. Increment for
+        # every visited req (including retracted) so the counter stays
+        # aligned with the selector.
+        req_idx = 0
+
+        for dp_rank in range(batch.dp_size):
+            info = batch.reqs_info[dp_rank]
+            reqs = info.reqs
+            dp_output_ids = next_token_ids[
+                per_dp_bs_size * dp_rank : per_dp_bs_size * (dp_rank + 1)
+            ]
+
+            # Skip empty DP ranks
+            if not reqs or not dp_output_ids:
                 continue
 
-            req.latest_bid = batch.bid
+            # Check finish condition for each request in this DP rank
+            for i, (req, next_token_id) in enumerate(zip(reqs, dp_output_ids)):
+                req: Req
+                if self.enable_overlap and (req.finished() or req.is_retracted):
+                    # release_kv_cache owns over-allocated KV; freeing here would double-free.
+                    req_idx += 1
+                    continue
 
-            indices_to_free = None
-            if self.enable_overlap and req.finished():
-                if self.page_size == 1:
-                    indices_to_free = batch.out_cache_loc[i : i + 1]
-                else:
-                    if (len(req.origin_input_ids) + len(req.output_ids) - 1) % self.page_size == 0:
-                        indices_to_free = batch.out_cache_loc[i : i + 1]
-                if indices_to_free is not None:
-                    self.token_to_kv_pool_allocator.free(indices_to_free)
-                continue
+                if req.is_retracted:
+                    req_idx += 1
+                    continue
 
-            new_accepted_len = 1
-            if batch.spec_algorithm is None or batch.spec_algorithm.is_none():
-                req.output_ids.append(next_token_id)
-            elif self.spec_algorithm.is_eagle():
-                req.output_ids.extend(next_token_id)
-                new_accepted_len = len(next_token_id)
+                req.latest_bid = result.bid
 
-            req.check_finished(new_accepted_len)
-            if req.finished():
-                self.maybe_collect_routed_experts(req)
-                if batch.spec_algorithm is not None and batch.spec_algorithm.is_eagle():
-                    cur_allocate_len = batch.spec_info.allocate_lens[i]
-                    all_token_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
-                    if self.page_size > 1:
-                        all_token_len = cdiv(all_token_len, self.page_size) * self.page_size
-                    kv_indices = self.req_to_token_pool.req_to_token[
-                        req.req_pool_idx,
-                        all_token_len:cur_allocate_len,
-                    ]
-                    kv_indices = kv_indices[kv_indices != 0]
-                    from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
+                new_accepted_len = 1
+                if batch.spec_algorithm is None or batch.spec_algorithm.is_none():
+                    req.output_ids.append(next_token_id)
+                elif self.spec_algorithm.is_eagle():
+                    req.output_ids.extend([int(t) for t in next_token_id])
+                    new_accepted_len = len(next_token_id)
 
-                    assert (
-                        len(kv_indices) <= EagleDraftInput.ALLOC_LEN_PER_DECODE
-                    ), f"redundant kv indices {len(kv_indices)=} should less than {EagleDraftInput.ALLOC_LEN_PER_DECODE=}"
+                req.check_finished(new_accepted_len)
 
-                    self.token_to_kv_pool_allocator.free(kv_indices)
-                # End trace for finished request
-                if precision_tracer.get_trace_active():
-                    precision_tracer.set_request_status_to_completed(req.rid)
-                    precision_tracer.add_completed_requests_count()
-                    precision_tracer.set_end_time_and_duration(req.rid)
-                    logger.info(
-                        "Request trace completed (%d/%d): %s",
-                        precision_tracer.get_completed_requests_count(),
-                        precision_tracer.get_max_requests(),
-                        req.rid,
-                    )
-                    if (
-                        precision_tracer.get_completed_requests_count()
-                        >= precision_tracer.get_max_requests()
-                    ):
-                        precision_tracer.stop_trace()
-                self.tree_cache.cache_finished_req(req)
+                if req.finished():
+                    self.maybe_collect_routed_experts(req)
+                    if batch.spec_algorithm is not None and batch.spec_algorithm.is_eagle():
+                        cur_allocate_len = int(info.spec_info.allocate_lens[i])
+                        actual_token_len = len(req.origin_input_ids) + max(
+                            len(req.output_ids) - 1, 0
+                        )
+                        all_token_len = actual_token_len
+                        if self.page_size > 1:
+                            all_token_len = cdiv(all_token_len, self.page_size) * self.page_size
+                        kv_indices = self.req_to_token_pool.req_to_token[
+                            req.req_pool_idx,
+                            all_token_len:cur_allocate_len,
+                        ]
+                        kv_indices = kv_indices[kv_indices != 0]
+                        from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
 
-            if req.return_output_logprob_only:
-                req.output_token_logprobs_val.append(next_token_logprobs[i])
-                req.output_token_logprobs_idx.append(next_token_id)
+                        assert (
+                            len(kv_indices) <= EagleDraftInput.ALLOC_LEN_PER_DECODE
+                        ), f"redundant kv indices {len(kv_indices)=} should less than {EagleDraftInput.ALLOC_LEN_PER_DECODE=}"
 
-            if req.return_logprob and (
-                batch.spec_algorithm is None or batch.spec_algorithm.is_none()
-            ):
-                # speculative worker handles logprob in speculative decoding
-                req.output_token_logprobs_val.append(next_token_logprobs[i])
-                req.output_token_logprobs_idx.append(next_token_id)
-                if req.top_logprobs_num > 0:
-                    req.output_top_logprobs_val.append(logits_output.next_token_top_logprobs_val[i])
-                    req.output_top_logprobs_idx.append(logits_output.next_token_top_logprobs_idx[i])
-                if req.token_ids_logprob is not None:
-                    req.output_token_ids_logprobs_val.append(
-                        logits_output.next_token_token_ids_logprobs_val[i]
-                    )
-                    req.output_token_ids_logprobs_idx.append(
-                        logits_output.next_token_token_ids_logprobs_idx[i]
-                    )
+                        self.token_to_kv_pool_allocator.free(kv_indices, dp_rank)
+                        # Spec decode allocates via EagleDraftInput.prepare_for_decode,
+                        # not ScheduleBatch.prepare_for_decode, so kv_committed_len is
+                        # never bumped past prefill. cache_finished_req would then
+                        # free only the prefill page and leak every decode-allocated
+                        # page (visible on idle check_memory at bs=1). Use the
+                        # *unaligned* actual token count: ChunkCache.cache_finished_req
+                        # does NOT filter 0-valued req_to_token entries, so a
+                        # page-aligned length would free the page-0 sentinel.
+                        req.kv_committed_len = actual_token_len
+                        req.kv_allocated_len = actual_token_len
+                    # End trace for finished request
+                    if precision_tracer.get_trace_active():
+                        precision_tracer.set_request_status_to_completed(req.rid)
+                        precision_tracer.add_completed_requests_count()
+                        precision_tracer.set_end_time_and_duration(req.rid)
+                        logger.info(
+                            "Request trace completed (%d/%d): %s",
+                            precision_tracer.get_completed_requests_count(),
+                            precision_tracer.get_max_requests(),
+                            req.rid,
+                        )
+                        if (
+                            precision_tracer.get_completed_requests_count()
+                            >= precision_tracer.get_max_requests()
+                        ):
+                            precision_tracer.stop_trace()
+                    release_kv_cache(req, self.tree_cache)
 
-            # Update grammar state after token sampling
-            if req.grammar is not None:
-                try:
-                    req.grammar.accept_token(int(next_token_id))
-                except ValueError as e:
-                    # Grammar accept_token can raise ValueError if the token is not in the grammar.
-                    # This can happen if the grammar is not set correctly or the token is invalid.
-                    logger.error(
-                        "Grammar accept_token failed for req %s with token %s: %s",
-                        req.rid,
-                        next_token_id,
-                        e,
-                    )
+                if req.return_output_logprob_only:
+                    req.output_token_logprobs_val.append(next_token_logprobs[req_idx])
+                    req.output_token_logprobs_idx.append(next_token_id)
 
-                    self.abort_request(AbortReq(rid=req.rid))
-                req.grammar.finished = req.finished()
-            if req.return_hidden_states and logits_output.hidden_states is not None:
-                req.hidden_states.append(logits_output.hidden_states[i])
+                if req.return_logprob and (
+                    batch.spec_algorithm is None or batch.spec_algorithm.is_none()
+                ):
+                    # speculative worker handles logprob in speculative decoding
+                    req.output_token_logprobs_val.append(next_token_logprobs[req_idx])
+                    req.output_token_logprobs_idx.append(next_token_id)
+                    if req.top_logprobs_num > 0:
+                        req.output_top_logprobs_val.append(
+                            logits_output.next_token_top_logprobs_val[req_idx]
+                        )
+                        req.output_top_logprobs_idx.append(
+                            logits_output.next_token_top_logprobs_idx[req_idx]
+                        )
+                    if req.token_ids_logprob is not None:
+                        req.output_token_ids_logprobs_val.append(
+                            logits_output.next_token_token_ids_logprobs_val[req_idx]
+                        )
+                        req.output_token_ids_logprobs_idx.append(
+                            logits_output.next_token_token_ids_logprobs_idx[req_idx]
+                        )
+
+                # Update grammar state after token sampling
+                if req.grammar is not None:
+                    try:
+                        req.grammar.accept_token(next_token_id)
+                    except ValueError as e:
+                        # Grammar accept_token can raise ValueError if the token is not in the grammar.
+                        # This can happen if the grammar is not set correctly or the token is invalid.
+                        logger.error(
+                            "Grammar accept_token failed for req %s with token %s: %s",
+                            req.rid,
+                            next_token_id,
+                            e,
+                        )
+
+                        self.abort_request(AbortReq(rid=req.rid))
+                    req.grammar.finished = req.finished()
+                if req.return_hidden_states and logits_output.hidden_states is not None:
+                    # NOTE: hidden_states is not yet reordered through
+                    # logits_indices_selector. Decode-mode hidden_states is
+                    # DP-interleaved like the raw next_token_logprobs were.
+                    # Tracking as a follow-up; not in scope for this fix.
+                    req.hidden_states.append(logits_output.hidden_states[i])
+                req_idx += 1
+
+        # Collect all requests from all DP ranks for stream output
+        all_reqs = []
+        for info in batch.reqs_info:
+            if info.reqs:
+                all_reqs.extend(info.reqs)
+
         self.set_next_batch_sampling_info_done(batch)
         self.stream_output(
-            batch.reqs,
+            all_reqs,
             batch.return_logprob,
             batch.return_output_logprob_only,
             cache_miss_count=cache_miss_count,
@@ -527,10 +670,19 @@ class SchedulerOutputProcessorMixin:
         next_token_ids: list[int],
         num_input_logprobs: int,
         output: LogitsProcessorOutput,
+        local_idx: int | None = None,
     ):
-        """Attach logprobs to the return values."""
+        """Attach logprobs to the return values.
+
+        `i` indexes logprob arrays (already reordered to original-req order).
+        `local_idx` indexes `next_token_ids` (per-DP-rank slice from caller).
+        DP=1: `i == local_idx`; pass `local_idx=None` to fall back to `i`.
+        DP>1: `i` is the global flat req index, `local_idx` is the per-rank
+        position; both must be passed.
+        """
+        nt_idx = i if local_idx is None else local_idx
         req.output_token_logprobs_val.append(output.next_token_logprobs[i])
-        req.output_token_logprobs_idx.append(next_token_ids[i])
+        req.output_token_logprobs_idx.append(next_token_ids[nt_idx])
 
         self.add_input_logprob_return_values(
             i, req, output, pt, num_input_logprobs, last_prefill_chunk=True
@@ -551,13 +703,18 @@ class SchedulerOutputProcessorMixin:
         reqs: list[Req],
         return_logprob: bool,
         return_output_logprob_only: bool,
-        skip_req: Req | None = None,
+        skip_reqs: set | Req | None = None,
         cache_miss_count: int = None,
     ):
-        """Stream the output to detokenizer."""
+        """Stream the output to detokenizer.
+
+        `skip_reqs` accepts either a `set` of `id(req)` to skip, or a single
+        `Req` (back-compat). A set is required on dp>1 because more than one
+        req can be mid-chunked in the same batch.
+        """
         assert self.is_generation
         self.stream_output_generation(
-            reqs, return_logprob, return_output_logprob_only, skip_req, cache_miss_count
+            reqs, return_logprob, return_output_logprob_only, skip_reqs, cache_miss_count
         )
 
     def stream_output_generation(
@@ -565,9 +722,15 @@ class SchedulerOutputProcessorMixin:
         reqs: list[Req],
         return_logprob: bool,
         return_output_logprob_only: bool,
-        skip_req: Req | None = None,
+        skip_reqs: set | Req | None = None,
         cache_miss_count: int = None,
     ):
+        if skip_reqs is None:
+            skip_ids: set = set()
+        elif isinstance(skip_reqs, set):
+            skip_ids = skip_reqs
+        else:
+            skip_ids = {id(skip_reqs)}
         rids = []
         finished_reasons: list[BaseFinishReason] = []
 
@@ -619,7 +782,7 @@ class SchedulerOutputProcessorMixin:
             ) = output_token_ids_logprobs_idx = None
 
         for req in reqs:
-            if req is skip_req:
+            if id(req) in skip_ids:
                 continue
 
             if req.finished():
@@ -656,18 +819,20 @@ class SchedulerOutputProcessorMixin:
 
                 decode_ids_list.append(decode_ids[req.send_decode_id_offset :])
 
+                output_ids_ = req.output_ids_through_stop
+
                 req.send_decode_id_offset = len(decode_ids)
                 read_offsets.append(read_offset)
                 if self.skip_tokenizer_init:
-                    output_ids.append(req.output_ids[send_token_offset:])
-                req.send_token_offset = len(req.output_ids)
+                    output_ids.append(output_ids_[send_token_offset:])
+                req.send_token_offset = len(output_ids_)
                 skip_special_tokens.append(req.sampling_params.skip_special_tokens)
                 spaces_between_special_tokens.append(
                     req.sampling_params.spaces_between_special_tokens
                 )
                 no_stop_trim.append(req.sampling_params.no_stop_trim)
                 prompt_tokens.append(len(req.origin_input_ids))
-                completion_tokens.append(len(req.output_ids))
+                completion_tokens.append(len(output_ids_))
                 cached_tokens.append(req.cached_tokens)
 
                 if self.spec_algorithm is not None and not self.spec_algorithm.is_none():

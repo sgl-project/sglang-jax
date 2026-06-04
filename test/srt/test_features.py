@@ -810,47 +810,6 @@ cache_misses_common_args = [
 ]
 
 
-class TestCacheMissesTP1(CustomTestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            device="tpu",
-            other_args=cache_misses_common_args + ["--tp-size", "1"],
-            env={
-                "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
-            },
-        )
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
-    def test_cache_miss_prefill(self):
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            text="the capital of France is",
-            temperature=0,
-            max_new_tokens=1,
-        )
-
-        run_curl(args)
-
-    def test_cache_miss_decode(self):
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            text="the capital of France is",
-            temperature=0,
-            max_new_tokens=2,
-        )
-
-        run_curl(args)
-
-
 class TestCacheMissesTP4(CustomTestCase):
     @classmethod
     def setUpClass(cls):

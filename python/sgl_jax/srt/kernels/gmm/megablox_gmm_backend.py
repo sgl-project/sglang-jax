@@ -61,7 +61,18 @@ def gmm(
     if interpret is None:
         interpret = not is_tpu_runtime()
 
-    use_gmm_v2 = not interpret and is_supported_by_gmm_v2(rhs_scale)
+    use_gmm_v2 = not interpret and is_supported_by_gmm_v2(
+        rhs_scale, maybe_quantize_lhs=maybe_quantize_lhs
+    )
+
+    # Pad LHS to multiple of 128 (or 32 for v2) on TPU to avoid small/unaligned tiles
+    m = lhs.shape[0]
+    pad_size = 0
+    alignment = 32 if use_gmm_v2 else 128
+    if not interpret and m % alignment != 0:
+        pad_size = alignment - (m % alignment)
+        lhs = jax.lax.pad(lhs, jnp.zeros((), dtype=lhs.dtype), ((0, pad_size, 0), (0, 0, 0)))
+        group_sizes = group_sizes.at[-1].add(pad_size)
 
     lhs_scale = None
     if not use_gmm_v2 and activation_quantized_dtype is not None:
@@ -101,5 +112,9 @@ def gmm(
 
     if lhs_scale is not None:
         out = out * lhs_scale
+
+    # Slice output back to original size if padded
+    if pad_size > 0:
+        out = out[:m]
 
     return out

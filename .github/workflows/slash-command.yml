@@ -1,0 +1,131 @@
+name: Slash Command Handler
+
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  handle-command:
+    if: >-
+      github.event.issue.pull_request &&
+      startsWith(github.event.comment.body, '/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+      actions: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          sparse-checkout: scripts/ci
+
+      - name: Get PR head branch
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          head_ref=$(gh pr view "$PR_NUMBER" --json headRefName --jq .headRefName)
+          echo "head_ref=$head_ref" >> "$GITHUB_OUTPUT"
+
+      - name: Parse slash command
+        id: parse
+        env:
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          ACTOR: ${{ github.event.comment.user.login }}
+          ACTOR_ASSOCIATION: ${{ github.event.comment.author_association }}
+        run: python3 scripts/ci/slash_command_parse.py
+
+      - name: React to comment
+        if: steps.parse.outputs.valid == 'true' && steps.parse.outputs.permitted == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh api repos/"$REPO"/issues/comments/"$COMMENT_ID"/reactions \
+            -f content='+1' --silent
+
+      - name: Reply on permission denied
+        if: steps.parse.outputs.valid == 'true' && steps.parse.outputs.permitted == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          ERROR_MSG: ${{ steps.parse.outputs.error }}
+        run: |
+          gh pr comment "$PR_NUMBER" \
+            --body "> **Slash command rejected**: $ERROR_MSG"
+
+      - name: Reply on command error
+        if: >-
+          steps.parse.outputs.valid == 'true' &&
+          steps.parse.outputs.permitted == 'true' &&
+          steps.parse.outputs.error != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          ERROR_MSG: ${{ steps.parse.outputs.error }}
+        run: |
+          gh pr comment "$PR_NUMBER" \
+            --body "> **Slash command error**: $ERROR_MSG"
+
+      - name: Rerun failed jobs
+        if: >-
+          steps.parse.outputs.valid == 'true' &&
+          steps.parse.outputs.permitted == 'true' &&
+          steps.parse.outputs.action == 'rerun_failed'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          HEAD_REF: ${{ steps.pr.outputs.head_ref }}
+          REPO: ${{ github.repository }}
+        run: python3 scripts/ci/slash_command_dispatch.py
+
+      - name: Add label
+        if: >-
+          steps.parse.outputs.valid == 'true' &&
+          steps.parse.outputs.permitted == 'true' &&
+          steps.parse.outputs.action == 'add_label'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          LABELS_CSV: ${{ steps.parse.outputs.labels_csv }}
+        run: |
+          gh pr edit "$PR_NUMBER" --add-label "$LABELS_CSV"
+          gh pr comment "$PR_NUMBER" \
+            --body "> **Slash command**: Added label(s) \`$LABELS_CSV\` — CI will be triggered by the label event"
+
+      - name: Rerun test group
+        if: >-
+          steps.parse.outputs.valid == 'true' &&
+          steps.parse.outputs.permitted == 'true' &&
+          steps.parse.outputs.action == 'rerun_group'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          HEAD_REF: ${{ steps.pr.outputs.head_ref }}
+          SUITE: ${{ steps.parse.outputs.suite }}
+          RUNNER: ${{ steps.parse.outputs.runner }}
+        run: |
+          gh workflow run rerun-test.yml --ref main \
+            -f suite="$SUITE" \
+            -f runner="$RUNNER" \
+            -f ref="$HEAD_REF" \
+            -f pr_number="$PR_NUMBER"
+          gh pr comment "$PR_NUMBER" \
+            --body "> **Slash command**: Dispatched \`$SUITE\` on \`$RUNNER\` for branch \`$HEAD_REF\`"
+
+      - name: Rerun stage
+        if: >-
+          steps.parse.outputs.valid == 'true' &&
+          steps.parse.outputs.permitted == 'true' &&
+          steps.parse.outputs.action == 'rerun_stage'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          HEAD_REF: ${{ steps.pr.outputs.head_ref }}
+          STAGE: ${{ steps.parse.outputs.stage }}
+          STAGE_SUITES_JSON: ${{ steps.parse.outputs.stage_suites_json }}
+        run: python3 scripts/ci/slash_command_stage_dispatch.py

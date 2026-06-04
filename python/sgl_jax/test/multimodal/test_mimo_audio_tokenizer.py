@@ -2,6 +2,8 @@
 
 import numpy as np
 
+from sgl_jax.test.test_utils import MIMO_AUDIO_7B_INSTRUCT
+
 
 def test_multimodal_tokenizer():
     """Test MultimodalTokenizer's _init_audio_processor and _preprocess_audio_to_mel."""
@@ -9,7 +11,7 @@ def test_multimodal_tokenizer():
 
     # Mock server_args
     server_args = MagicMock()
-    server_args.model_path = "XiaomiMiMo/MiMo-Audio-7B-Instruct"
+    server_args.model_path = MIMO_AUDIO_7B_INSTRUCT
     server_args.tokenizer_path = None
     server_args.tokenizer_mode = "auto"
     server_args.skip_tokenizer_init = True

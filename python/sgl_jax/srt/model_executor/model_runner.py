@@ -1,7 +1,6 @@
 """ModelRunner runs the forward passes of the models."""
 
 import logging
-import os
 from functools import partial
 
 import jax
@@ -9,8 +8,6 @@ import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 from jax._src import mesh as mesh_lib
-from jax.sharding import NamedSharding
-from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.configs.load_config import LoadConfig
 from sgl_jax.srt.configs.model_config import AttentionArch, MockModelConfig, ModelConfig
@@ -29,19 +26,14 @@ from sgl_jax.srt.managers.schedule_batch import (
     GLOBAL_SERVER_ARGS_KEYS,
     global_server_args_dict,
 )
-from sgl_jax.srt.mem_cache.allocator import (
-    BaseTokenToKVPoolAllocator,
-    PagedTokenToKVPoolAllocator,
-    SWATokenToKVPoolAllocator,
-    TokenToKVPoolAllocator,
-)
-from sgl_jax.srt.mem_cache.memory_pool import (
-    MHATokenToKVPool,
-    ReqToTokenPool,
-    SWAKVPool,
-)
+from sgl_jax.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sgl_jax.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
 from sgl_jax.srt.model_executor.base_model_runner import BaseModelRunner
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+from sgl_jax.srt.model_executor.model_runner_kv_cache_mixin import (
+    ModelRunnerKVCacheMixin,
+    _build_non_hybrid_memory_pools,
+)
 from sgl_jax.srt.model_loader.loader import get_model_loader
 from sgl_jax.srt.precision_tracer import precision_tracer
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
@@ -53,7 +45,7 @@ from sgl_jax.srt.utils.jax_utils import get_available_device_memory
 logger = logging.getLogger(__name__)
 
 
-class ModelRunner(BaseModelRunner):
+class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
     """ModelRunner runs the forward passes of the models."""
 
     def __init__(
@@ -61,6 +53,7 @@ class ModelRunner(BaseModelRunner):
         model_config: ModelConfig,
         mem_fraction_static: float,
         tp_size: int,
+        dp_size: int,
         server_args: ServerArgs,
         mesh: jax.sharding.Mesh,
         is_draft_worker: bool = False,
@@ -78,10 +71,14 @@ class ModelRunner(BaseModelRunner):
         self.mesh = mesh
         # model args
         self.num_attn_heads = model_config.num_attention_heads
-        self.num_kv_heads = model_config.get_total_num_kv_heads_with_replication(tp_size)
         self.rngs = rngs
 
         self.tp_size = tp_size
+        self.dp_size = dp_size
+        self.attention_tp_size = self.tp_size // self.dp_size
+        self.num_kv_heads = model_config.get_total_num_kv_heads_with_replication(
+            self.attention_tp_size
+        )
         self.ep_size = server_args.ep_size
         self.server_args = server_args
         self.is_generation = model_config.is_generation
@@ -150,9 +147,9 @@ class ModelRunner(BaseModelRunner):
         if server_args.enable_lora:
             self.init_lora_manager()
 
+        self._sampler_base_rng = jax.random.PRNGKey(server_args.random_seed)
+        self._sampler_step = 0
         if not self.is_draft_worker:
-            self._sampler_base_rng = jax.random.PRNGKey(server_args.random_seed)
-            self._sampler_step = 0
             self.initialize_jit()
 
         # Init memory pool and attention backends
@@ -160,6 +157,7 @@ class ModelRunner(BaseModelRunner):
             server_args.max_running_requests,
             server_args.max_total_tokens,
             total_device_memory,
+            dp_size=server_args.dp_size,
         )
 
         # Init routed experts capturer
@@ -168,6 +166,7 @@ class ModelRunner(BaseModelRunner):
     def init_routed_experts_capturer(self):
         set_global_experts_capturer(
             RoutedExpertsCapturer.create(
+                mesh=self.mesh,
                 enable=self.server_args.enable_return_routed_experts,
                 model_config=self.model_config,
                 num_tokens=self.max_total_num_tokens + self.page_size,
@@ -205,7 +204,7 @@ class ModelRunner(BaseModelRunner):
 
         @partial(
             jax.jit,
-            donate_argnames=["token_to_kv_pool"],  # just donate KV cache
+            donate_argnames=["memory_pools"],
             static_argnames=["model_state_def"],
             compiler_options=jit_compiler_options,
         )
@@ -214,13 +213,13 @@ class ModelRunner(BaseModelRunner):
             model_state_def,
             model_state_leaves,
             forward_batch,
-            token_to_kv_pool,
+            memory_pools,
             logits_metadata,
         ):
             model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
             model = nnx.merge(model_def, model_state)
             with LoraBatchContext.set_batch(forward_batch):
-                return model(forward_batch, token_to_kv_pool, logits_metadata)
+                return model(forward_batch, memory_pools, logits_metadata)
 
         # Capture base RNG key as a constant in the JIT closure.
         # fold_in(constant, dynamic_step) is computed inside JIT, avoiding
@@ -249,13 +248,12 @@ class ModelRunner(BaseModelRunner):
             return compute_logprobs(mesh, logits, next_tokens)
 
         def run_model_wrapper(forward_batch, logits_metadata):
-            token_to_kv_pool = self.token_to_kv_pool
             return jitted_run_model(
                 model_def,
                 model_state_def,
                 self.model_state_leaves,
                 forward_batch,
-                token_to_kv_pool,
+                self.memory_pools,
                 logits_metadata,
             )
 
@@ -298,14 +296,27 @@ class ModelRunner(BaseModelRunner):
 
     def load_model(self):
         set_global_server_args(self.server_args)
-        self.model_config.validate_tensor_parallel_config(self.tp_size)
-        self.model_config.configure_for_tensor_parallel(self.tp_size)
-        self.model_config.log_kv_heads_info(self.tp_size)
+
+        self.model_config.validate_tensor_parallel_config(self.attention_tp_size)
+        self.model_config.configure_for_tensor_parallel(self.attention_tp_size)
+        self.model_config.log_kv_heads_info(self.attention_tp_size)
         self.model_config.hf_config.ep_size = self.ep_size
         self.model_config.hf_config.ep_num_redundant_experts = (
             self.server_args.ep_num_redundant_experts
         )
         self.model_config.hf_config.moe_backend = self.model_config.moe_backend.value
+        self.model_config.hf_config.use_jax_allreduce_metadata = (
+            not self.server_args.disable_jax_allreduce_metadata
+        )
+        # Pick MLA forward path at server start. Only `fa` selects absorbed
+        # (the MLA Pallas kernel); `fa_mha` and `native` both decompress latent
+        # KV via kv_b_proj and run standard attention. Read by
+        # DeepseekV3DecoderLayer to construct DeepseekV3Attention; harmless on
+        # non-MLA models that ignore the attribute.
+        self.model_config.hf_config.use_absorbed_mla = self.server_args.attention_backend == "fa"
+        self.model_config.hf_config.enable_sequence_parallel = (
+            self.server_args.enable_sequence_parallel
+        )
 
         if self.server_args.ep_dispatch_algorithm:
             with jax.set_mesh(self.mesh):
@@ -379,7 +390,6 @@ class ModelRunner(BaseModelRunner):
         if swa_num_kv_heads is None:
             return self.model_config.num_hidden_layers
 
-        num_kv_heads = self.model_config.hf_config.num_key_value_heads
         # Compute SWA vs full layer counts from hybrid_layer_pattern
         pattern = getattr(self.model_config.hf_config, "hybrid_layer_pattern", None)
         if pattern is None:
@@ -387,47 +397,13 @@ class ModelRunner(BaseModelRunner):
         swa_layers = sum(1 for p in pattern if p == 1)
         full_layers = sum(1 for p in pattern if p == 0)
 
-        # Effective layer count weighted by KV head ratio
-        effective = (swa_num_kv_heads / num_kv_heads) * swa_layers + full_layers
+        from sgl_jax.srt.utils.jax_utils import get_num_kv_heads_by_tp
+
+        full_heads_per_device = self.model_config.get_num_kv_heads(self.attention_tp_size)
+        swa_heads_per_device = get_num_kv_heads_by_tp(swa_num_kv_heads, self.attention_tp_size)
+        ratio = swa_heads_per_device / full_heads_per_device
+        effective = ratio * swa_layers + full_layers
         return effective
-
-    def profile_max_num_token(self, total_device_memory: int):
-        """
-        Profile the maximum number of tokens that can fit in memory.
-        Uses tpu_info to get accurate TPU memory information.
-        """
-        # Get accurate memory information using TPU-specific methods
-        # Use tpu_info for memory information
-        available_device_memory = self.get_available_device_memory()
-        available_kv_cache_bytes = available_device_memory - total_device_memory * (
-            1 - self.mem_fraction_static
-        )
-
-        if available_kv_cache_bytes <= 0:
-            raise RuntimeError("Not enough memory. Please try to increase --mem-fraction-static.")
-        head_dim_aligned = self.model_config.head_dim
-        if head_dim_aligned % 128 != 0:
-            head_dim_aligned = (self.model_config.head_dim + 127) // 128 * 128
-        cell_size = (
-            self.model_config.get_num_kv_heads(self.tp_size)
-            * head_dim_aligned
-            * self.adjust_layer_num()
-            * 2
-            * jnp.dtype(self.kv_cache_dtype).itemsize
-        )
-
-        # Calculate max tokens that can fit in available memory
-        max_tokens = max(1, int(available_kv_cache_bytes // cell_size))
-
-        logger.info(
-            "TPU Memory profiling: available_device_memory=%.1fGB, available_kv_cache=%.1fGB, max_tokens=%d, cell_size=%dbytes",
-            available_device_memory / (1024**3),
-            available_kv_cache_bytes / (1024**3),
-            max_tokens,
-            cell_size,
-        )
-
-        return max_tokens
 
     @property
     def is_hybrid_gdn(self):
@@ -436,185 +412,68 @@ class ModelRunner(BaseModelRunner):
             "Qwen3NextForCausalLMMTP",
         ]
 
-    def init_memory_pool(
-        self,
-        max_num_reqs: int | None = None,
-        max_total_tokens: int | None = None,
-        total_device_memory: int | None = None,
-    ):
-        """Initialize memory pool for KV cache."""
-        # Set KV cache data type
-        if self.server_args.kv_cache_dtype == "auto":
-            self.kv_cache_dtype = self.dtype
-        elif self.server_args.kv_cache_dtype == "bf16":
-            self.kv_cache_dtype = jnp.bfloat16
-        else:
-            raise ValueError(f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}.")
-        logger.info("ModelRunner kv_cache_dtype: %s", self.kv_cache_dtype)
-        # Profile maximum number of tokens
-        self.max_total_num_tokens = self.profile_max_num_token(total_device_memory)
-
-        # Calculate max number of requests if not provided
-        if max_num_reqs is None:
-            max_num_reqs = min(
-                max(
-                    int(self.max_total_num_tokens / self.model_config.context_len * 512),
-                    2048,
-                ),
-                4096,
-            )
-
-        # Handle CI environment variable for testing
-        SGLANG_CI_SMALL_KV_SIZE = os.environ.get("SGLANG_CI_SMALL_KV_SIZE")
-        if SGLANG_CI_SMALL_KV_SIZE:
-            self.max_total_num_tokens = int(SGLANG_CI_SMALL_KV_SIZE)
-
-        if self.spec_algorithm is not None and not self.spec_algorithm.is_none():
-            if self.is_draft_worker:
-                self.max_total_num_tokens = self.server_args.draft_runner_cache_size
-                max_num_reqs = self.server_args.max_num_reqs
-            else:
-                # We are sharing the `token_to_kv_pool`, and both verify and draft tokens
-                # can be concurrently allocated, so we should give a headroom for it.
-                self.server_args.draft_runner_cache_size = (
-                    self.max_total_num_tokens
-                    # draft
-                    + max_num_reqs
-                    * self.server_args.speculative_num_steps
-                    * self.server_args.speculative_eagle_topk
-                    # verify
-                    + max_num_reqs * self.server_args.speculative_num_draft_tokens
-                    # buffer
-                    + 100
-                )
-                # Target worker and draft worker shares the same indices for the
-                # token_to_kv_pool, so we should make sure to match max_total_num_tokens.
-                self.max_total_num_tokens = self.server_args.draft_runner_cache_size
-                self.server_args.max_num_reqs = max_num_reqs
-
-        # Handle max_total_tokens override
-        if max_total_tokens is not None:
-            if max_total_tokens > self.max_total_num_tokens:
-                logger.warning(
-                    "max_total_tokens=%s is larger than the profiled value %s. Use the profiled value instead.",
-                    max_total_tokens,
-                    self.max_total_num_tokens,
-                )
-            self.max_total_num_tokens = min(self.max_total_num_tokens, max_total_tokens)
-
-        # Align to page size
-        self.max_total_num_tokens = (
-            self.max_total_num_tokens // self.server_args.page_size * self.server_args.page_size
-        )
-
-        # create token size for hybrid cache
-        if self.is_hybrid:
-            self.set_num_token_hybrid()
-
-        if self.max_total_num_tokens <= 0:
-            raise RuntimeError("Not enough memory. Please try to increase --mem-fraction-static.")
-
-        logger.info("ModelRunner max_total_num_tokens: %s", self.max_total_num_tokens)
-
-        # Create request to token pool if not already created
-        if self.req_to_token_pool is None:
-            self.req_to_token_pool = ReqToTokenPool(
-                size=max_num_reqs + 1,
-                max_context_len=self.model_config.context_len + 4,
-                dtype=np.int32,
-            )
-
-        # Create KV cache pool
-        if self.is_hybrid:
-            # Compute SWA KV head count (may differ from full attention heads)
-            swa_num_kv_heads = getattr(self.model_config.hf_config, "swa_num_key_value_heads", None)
-            if swa_num_kv_heads is not None:
-                swa_head_num = max(swa_num_kv_heads, self.tp_size)
-            else:
-                swa_head_num = None
-            self.token_to_kv_pool = SWAKVPool(
-                size=self.full_max_total_num_tokens,
-                size_swa=self.swa_max_total_num_tokens,
-                swa_attention_layer_ids=self.model_config.swa_attention_layer_ids,
-                full_attention_layer_ids=self.model_config.full_attention_layer_ids,
-                dtype=self.kv_cache_dtype,
-                head_num=self.model_config.get_total_num_kv_heads_with_replication(self.tp_size),
-                head_dim=(self.model_config.head_dim + 127) // 128 * 128,
-                page_size=self.page_size,
-                swa_head_num=swa_head_num,
-                mesh=self.mesh,
-            )
-        else:
-            self.token_to_kv_pool = MHATokenToKVPool(
-                size=self.max_total_num_tokens,
-                page_size=self.page_size,
-                dtype=self.kv_cache_dtype,
-                head_num=self.model_config.get_total_num_kv_heads_with_replication(self.tp_size),
-                head_dim=(self.model_config.head_dim + 127) // 128 * 128,
-                layer_num=self.model_config.num_hidden_layers,
-                mesh=self.mesh,
-            )
-
-        # Create KV pool allocator
-        if self.token_to_kv_pool_allocator is None:
-            if self.is_hybrid:
-                self.token_to_kv_pool_allocator = SWATokenToKVPoolAllocator(
-                    self.full_max_total_num_tokens,
-                    self.swa_max_total_num_tokens,
-                    kvcache=self.token_to_kv_pool,
-                    page_size=self.page_size,
-                )
-            elif self.page_size == 1:
-                self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
-                    size=self.max_total_num_tokens,
-                    kvcache=self.token_to_kv_pool,
-                )
-            else:
-                self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
-                    size=self.max_total_num_tokens,
-                    page_size=self.page_size,
-                    kvcache=self.token_to_kv_pool,
-                    debug_mode=False,
-                )
-
-        # Set swa_index_mapping on attention backend for SWA page index computation
-        if self.is_hybrid and hasattr(self.token_to_kv_pool_allocator, "full_to_swa_index_mapping"):
-            object.__setattr__(
-                self.attn_backend,
-                "swa_index_mapping",
-                self.token_to_kv_pool_allocator.full_to_swa_index_mapping,
-            )
-
     def init_attention_backend(self):
         """Init attention kernel backend."""
         self.attn_backend = self._get_attention_backend()
 
     def _get_attention_backend(self):
-        # Fallback on CPU: FlashAttention (Pallas/Triton) does not support CPU compilation and execution
         backend = self.server_args.attention_backend
-        if self.server_args.device == "cpu" and backend == "fa":
+        if self.server_args.device == "cpu" and backend in ("fa", "fa_mha"):
             logger.warning(
                 "FlashAttention backend is not supported on CPU; falling back to native."
             )
             backend = "native"
+
         if backend == "native":
             from sgl_jax.srt.layers.attention.native_backend import NativeAttention
 
-            return NativeAttention(self.num_attn_heads, self.num_kv_heads, self.mesh)
-        elif backend == "fa":
+            full_attn_backend = NativeAttention(self.num_attn_heads, self.num_kv_heads, self.mesh)
+
+        elif backend == "fa" and self.use_mla_backend:
+            from sgl_jax.srt.layers.attention.mla_backend import MLAAttentionBackend
+
+            cfg = self.model_config.hf_text_config
+            full_attn_backend = MLAAttentionBackend(
+                num_attn_heads=self.num_attn_heads,
+                kv_lora_rank=cfg.kv_lora_rank,
+                qk_nope_head_dim=cfg.qk_nope_head_dim,
+                qk_rope_head_dim=cfg.qk_rope_head_dim,
+                v_head_dim=cfg.v_head_dim,
+                page_size=self.page_size,
+                mesh=self.mesh,
+                attention_data_partition_axis="data",
+            )
+
+        elif backend in ("fa", "fa_mha"):
             from sgl_jax.srt.layers.attention.flashattention_backend import (
                 FlashAttention,
             )
 
-            return FlashAttention(
+            if backend == "fa_mha" and self.use_mla_backend:
+                cfg = self.model_config.hf_text_config
+                head_dim = cfg.qk_nope_head_dim + cfg.qk_rope_head_dim
+                num_kv_heads = self.num_attn_heads
+            else:
+                head_dim = self.model_config.head_dim
+                num_kv_heads = self.num_kv_heads
+
+            full_attn_backend = FlashAttention(
                 self.num_attn_heads,
-                self.num_kv_heads,
-                self.model_config.head_dim,
+                num_kv_heads,
+                head_dim,
                 page_size=self.page_size,
                 mesh=self.mesh,
             )
+
         else:
             raise ValueError(f"Unsupported attention backend: {self.server_args.attention_backend}")
+
+        # Always go through the wrapper — it's a no-op when no hybrid config is set.
+        from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
+            attn_backend_wrapper,
+        )
+
+        return attn_backend_wrapper(self, full_attn_backend)
 
     def _forward(
         self,
@@ -624,63 +483,21 @@ class ModelRunner(BaseModelRunner):
         cache_miss_count = 0
         import jax._src.test_util as jtu
 
-        for key, value in forward_batch.__dict__.items():
-            if isinstance(value, jax.Array):
-                logger.debug(
-                    "forward_batch %s: shape=%s, sharding=%s, dtype=%s",
-                    key,
-                    value.shape,
-                    value.sharding,
-                    value.dtype,
-                )
-            else:
-                logger.debug("forward_batch %s: %s", key, value)
-
-        for key, value in logits_metadata.__dict__.items():
-            if isinstance(value, jax.Array):
-                logger.debug(
-                    "logits_metadata %s: shape=%s, sharding=%s, dtype=%s",
-                    key,
-                    value.shape,
-                    value.sharding,
-                    value.dtype,
-                )
-            else:
-                logger.debug("logits_metadata %s: %s", key, value)
-
         with jtu.count_pjit_cpp_cache_miss() as count:
-            output, layers_kv_fused, _, layers_topk_ids = self.jitted_run_model(
+            output, pool_updates, _, layers_topk_ids = self.jitted_run_model(
                 forward_batch, logits_metadata
             )
             cache_miss_count = count()
-        self._set_kv_cache_after_forward(layers_kv_fused)
+
+        # tp_size==1: sharding constraint is lost after JIT; re-place explicitly.
+        # See https://github.com/sgl-project/sglang-jax/issues/233
+        if self.tp_size == 1 and isinstance(pool_updates, list):
+            target_sharding = self.token_to_kv_pool.kv_sharding
+            pool_updates = [jax.device_put(kv, target_sharding) for kv in pool_updates]
+        self.memory_pools.replace_all(pool_updates)
 
         # layers_topk_ids required real_bs and original_input_len which could not be stored in ForwardBatch
         return output, cache_miss_count, layers_topk_ids
-
-    def _set_kv_cache_after_forward(self, layers_kv_fused):
-        # Note: For tp_size == 1, we need to put the layers_kv_fused on the device with the target_sharding
-        # because sharding P(None, 'tensor') constraint has lost and this results in cache_miss for first prefill phase.
-        # Issue: https://github.com/sgl-project/sglang-jax/issues/233
-        # Q: Why does not call device_put in every layer?
-        # A: Because it does not work and cache_miss still happens. According to benchmark(https://github.com/sgl-project/sglang-jax/pull/234), the performance is not influenced.
-        if self.tp_size == 1:
-            target_sharding = NamedSharding(
-                self.token_to_kv_pool.mesh,
-                P(
-                    None,
-                    None,
-                    self.token_to_kv_pool.kv_partition_axis,
-                    None,
-                    None,
-                ),
-            )
-            layers_kv_fused = [
-                jax.device_put(layer_kv_fused, target_sharding)
-                for layer_kv_fused in layers_kv_fused
-            ]
-
-        self.token_to_kv_pool.replace_kv_buffer(layers_kv_fused)
 
     def forward_idle(
         self,
@@ -789,23 +606,44 @@ class ModelRunner(BaseModelRunner):
         self.model_config.full_attention_layer_ids = full_attention_layer_ids
 
         # Algorithm:
-        # Existing max_total_num_tokens is per layer and assume all layers have the same number of tokens.
-        # - Find total # of tokens available across layers.
-        # - Calculate full_max_total_num_tokens and swa_max_total_num_tokens based on the given swa_full_tokens_ratio.
+        # total_tokens is in "full-layer-equivalent token-layer" units,
+        # when swa kv_head_num is not same as full kv_head_num, the constraint is:
+        #   swa_tokens * swa_layers * ratio + full_tokens * full_layers = total_tokens
+        #   swa_tokens = full_tokens * swa_full_tokens_ratio
         total_tokens = self.max_total_num_tokens * self.adjust_layer_num()
         full_layers_num = len(full_attention_layer_ids)
         swa_layers_num = len(swa_attention_layer_ids)
         swa_full_tokens_ratio = self.server_args.swa_full_tokens_ratio
 
-        # Solve the equations:
-        # 1. swa_max_total_num_tokens * swa_layers_num + full_max_total_num_tokens * full_layers_num == total_tokens
-        # 2. full_max_total_num_tokens * swa_full_tokens_ratio == swa_max_total_num_tokens
-        denominator = swa_full_tokens_ratio * swa_layers_num + full_layers_num
-        self.full_max_total_num_tokens = int(total_tokens / denominator)
-        self.swa_max_total_num_tokens = int(self.full_max_total_num_tokens * swa_full_tokens_ratio)
+        swa_num_kv_heads = getattr(self.model_config.hf_config, "swa_num_key_value_heads", None)
+        if swa_num_kv_heads is not None:
+            from sgl_jax.srt.utils.jax_utils import get_num_kv_heads_by_tp
 
-        # Align pool sizes to page_size for correct memory accounting
-        alignment = self.page_size
+            full_heads = self.model_config.get_num_kv_heads(self.attention_tp_size)
+            swa_heads = get_num_kv_heads_by_tp(swa_num_kv_heads, self.attention_tp_size)
+            ratio = swa_heads / full_heads
+        else:
+            ratio = 1.0
+
+        denominator = swa_full_tokens_ratio * swa_layers_num * ratio + full_layers_num
+        if self.is_draft_worker:
+            if full_layers_num == 0:
+                self.full_max_total_num_tokens = 0
+                self.swa_max_total_num_tokens = self.max_total_num_tokens
+            else:
+                self.full_max_total_num_tokens = self.max_total_num_tokens
+                self.swa_max_total_num_tokens = int(
+                    self.max_total_num_tokens * swa_full_tokens_ratio
+                )
+        else:
+            self.full_max_total_num_tokens = int(total_tokens / denominator)
+            self.swa_max_total_num_tokens = int(
+                self.full_max_total_num_tokens * swa_full_tokens_ratio
+            )
+
+        # Align pool sizes to page_size and dp_size for sharding compatibility
+        dp_size = self.server_args.dp_size
+        alignment = self.page_size * dp_size
         self.full_max_total_num_tokens -= self.full_max_total_num_tokens % alignment
         self.swa_max_total_num_tokens -= self.swa_max_total_num_tokens % alignment
 
@@ -845,13 +683,17 @@ class MockModelRunner(ModelRunner):
     ):
         self.server_args = server_args
         self.tp_size = server_args.tp_size
+        self.dp_size = server_args.dp_size
+        self.attention_tp_size = self.tp_size // self.dp_size
 
         if isinstance(model_config, MockModelConfig):
             self.num_kv_heads = model_config.num_kv_heads
             self.num_attn_heads = model_config.num_heads
             self.rngs = rngs
         else:
-            self.num_kv_heads = model_config.get_total_num_kv_heads_with_replication(self.tp_size)
+            self.num_kv_heads = model_config.get_total_num_kv_heads_with_replication(
+                self.attention_tp_size
+            )
             self.num_attn_heads = model_config.num_attention_heads
             self.rngs = rngs
 
@@ -865,7 +707,7 @@ class MockModelRunner(ModelRunner):
 
         # Validate tensor parallel configuration for MockModelRunner too
         if not isinstance(model_config, MockModelConfig):
-            self.model_config.validate_tensor_parallel_config(self.tp_size)
+            self.model_config.validate_tensor_parallel_config(self.attention_tp_size)
 
         # If it is a draft model, tp_group can be different
         max_num_reqs = min(
@@ -885,8 +727,11 @@ class MockModelRunner(ModelRunner):
             size=self.max_total_num_tokens,
             page_size=self.page_size,
             dtype=self.kv_cache_dtype,
-            head_num=self.model_config.get_total_num_kv_heads_with_replication(self.tp_size),
+            head_num=self.model_config.get_total_num_kv_heads_with_replication(
+                self.attention_tp_size
+            ),
             head_dim=(self.model_config.head_dim + 127) // 128 * 128,
             layer_num=self.model_config.num_hidden_layers,
             mesh=mesh,
         )
+        self.memory_pools = _build_non_hybrid_memory_pools(self.token_to_kv_pool)

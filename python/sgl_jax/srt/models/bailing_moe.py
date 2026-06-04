@@ -5,6 +5,8 @@ import jax
 import numpy as np
 from flax import nnx
 from jax import numpy as jnp
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig, MoEBackend
@@ -21,7 +23,7 @@ from sgl_jax.srt.layers.moe import (
     create_moe_weights_mapping,
 )
 from sgl_jax.srt.layers.radix_attention import RadixAttention
-from sgl_jax.srt.mem_cache.memory_pool import KVCache
+from sgl_jax.srt.mem_cache.memory_pool import KVCache, MemoryPools
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
@@ -48,6 +50,7 @@ class BailingMoEAttention(nnx.Module):
         attention_bias: bool = False,
         dtype: jnp.dtype = jnp.bfloat16,
     ):
+        self.mesh = mesh
         self.layer_id = layer_id
         assert num_heads % num_kv_heads == 0
 
@@ -135,9 +138,42 @@ class BailingMoEAttention(nnx.Module):
         k, _ = self.k_proj(hidden_states)
         v, _ = self.v_proj(hidden_states)
 
-        q = q.reshape(-1, self.q_head_num, self.head_dim)
-        k = k.reshape(-1, self.kv_head_num, self.head_dim)
-        v = v.reshape(-1, self.kv_head_num, self.head_dim)
+        q = q.reshape(
+            -1,
+            self.q_head_num,
+            self.head_dim,
+            out_sharding=NamedSharding(
+                self.mesh,
+                P(
+                    "data",
+                    "tensor",
+                ),
+            ),
+        )
+        k = k.reshape(
+            -1,
+            self.kv_head_num,
+            self.head_dim,
+            out_sharding=NamedSharding(
+                self.mesh,
+                P(
+                    "data",
+                    "tensor",
+                ),
+            ),
+        )
+        v = v.reshape(
+            -1,
+            self.kv_head_num,
+            self.head_dim,
+            out_sharding=NamedSharding(
+                self.mesh,
+                P(
+                    "data",
+                    "tensor",
+                ),
+            ),
+        )
 
         if self.use_qk_norm:
             q = self.q_norm(q)
@@ -401,7 +437,7 @@ class BailingMoEDecoderLayer(nnx.Module):
             hidden_states = self.mlp(hidden_states)
             topk_ids = None
 
-        return hidden_states, residual, kv_fused, topk_ids
+        return hidden_states, residual, kv_fused, jax.sharding.reshard(topk_ids, P(None))
 
 
 class BailingMoEModel(nnx.Module):
@@ -870,18 +906,19 @@ class BailingMoEForCausalLM(nnx.Module):
     def __call__(
         self,
         forward_batch: ForwardBatch,
-        token_to_kv_pool: KVCache,
+        memory_pools: MemoryPools,
         logits_metadata: LogitsMetadata,
     ):
+        kv_pool = memory_pools.token_to_kv_pool
         hidden_states, layers_kv_fused, layers_topk_ids = self.model(
             forward_batch,
-            token_to_kv_pool,
+            kv_pool,
         )
         if not getattr(self.config, "tie_word_embeddings", False):
             output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
         else:
             output = self.logits_processor(hidden_states, self.model.embed_tokens, logits_metadata)
-        return output, layers_kv_fused, True, layers_topk_ids
+        return output, {"token_to_kv_pool": layers_kv_fused}, True, layers_topk_ids
 
 
 class BailingMoeForCausalLM(BailingMoEForCausalLM):

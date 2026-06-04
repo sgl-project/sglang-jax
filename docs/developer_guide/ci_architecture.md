@@ -4,6 +4,9 @@
 - [Overview](#overview)
 - [Architecture Principles](#architecture-principles)
 - [CI/CD Pipeline Categories](#cicd-pipeline-categories)
+  - [Slash Command Handler](#slash-command-handler-slash-commandyml)
+  - [PR Review](#pr-review-pr-reviewyml)
+  - [CI Auto Bisect](#ci-auto-bisect-ci-auto-bisectyml)
   - [Pull Request Testing](#pull-request-testing)
   - [Nightly Testing](#nightly-testing)
   - [Release Automation](#release-automation)
@@ -46,6 +49,48 @@ Testing follows a progressive strategy:
 
 ## CI/CD Pipeline Workflows
 
+### Slash Command Handler (slash-command.yml)
+
+Allows maintainers to trigger targeted CI operations from PR comments instead of
+re-running the entire workflow.
+
+*Trigger:* `issue_comment` (created) — only processed when the comment starts with `/`.
+
+*Permission Model:*
+- `OWNER`, `MEMBER`, `COLLABORATOR` — allowed
+- All other associations — rejected with a reply comment
+
+*Supported Commands:*
+
+| Command | Description |
+|---------|-------------|
+| `/rerun-failed-ci` | Re-run only the failed jobs from the most recent `pr-test` run on the PR branch |
+| `/test perf` | Add the `test:perf` label — the label event triggers CI with perf tests enabled |
+| `/rerun-group <suite>` | Run a specific test suite on the matching runner via `rerun-test.yml`. Suite names from `test/srt/run_suite.py`; runner derived from suffix (`-v6e-1`, `-v6e-4`, `-cpu`) |
+| `/rerun-stage <stage>` | Dispatch all suites in a stage independently via `rerun-test.yml`. Stage: `1`/`fast` (unit), `2`/`medium` (e2e+accuracy), `3`/`heavy` (performance) |
+
+*Architecture:*
+- `scripts/ci/slash_command_parse.py` — pure-Python parser (stdlib only), reads
+  `COMMENT_BODY` / `ACTOR` / `ACTOR_ASSOCIATION` env vars, writes results to `$GITHUB_OUTPUT`
+- `scripts/ci/slash_command_dispatch.py` — dispatch logic for `/rerun-failed-ci`
+- `scripts/ci/slash_command_stage_dispatch.py` — dispatch logic for `/rerun-stage`,
+  loops through each suite in the stage and dispatches `rerun-test.yml` independently
+- `rerun-test.yml` — `workflow_dispatch` workflow for `/rerun-group` and `/rerun-stage`,
+  accepts suite name, runner label, and git ref as inputs
+- The handler workflow reacts with thumbs-up and posts result comments on the PR
+
+### PR Review (pr-review.yml)
+
+AI-powered code review using Claude Code Action. Auto-triggers on PR open/ready_for_review;
+also available on-demand via `/review` comment (`OWNER`/`COLLABORATOR` only).
+
+### CI Auto Bisect (ci-auto-bisect.yml)
+
+AI-powered CI failure analysis. Auto-triggers on failed workflow runs (PR Test, Nightly Test, etc.);
+also available on-demand via `/auto-bisect [run_id]` comment (`OWNER`/`COLLABORATOR` only).
+Classifies failures as `code_regression`, `flaky_test`, `infrastructure`, or `environment`
+and posts analysis results on the associated PR.
+
 ### Pull Request Testing (pr-test.yml)
 *Purpose:* Comprehensive testing for JAX
 
@@ -68,8 +113,8 @@ Testing follows a progressive strategy:
 | unit-test-4-tpu | 4x TPU | - | All unit test pass|
 | performance-test-1-tpu (including cache miss check) | 1x TPU | - | Latency, Throughput|
 | performance-test-4-tpu (including cache miss check) | 4x TPU | - | Latency, Throughput|
-| accurancy-test-1-tpu | 1x TPU | - | Model Evaluation  |
-| accurancy-test-4-tpu | 4x TPU | - | Model Evaluation  |
+| accuracy-test-1-tpu | 1x TPU | - | Model Evaluation  |
+| accuracy-test-4-tpu | 4x TPU | - | Model Evaluation  |
 | pallas-kernel-benchmark | 1x TPU | - | Speed |
 | e2e-test-1-tpu | 1x TPU | - | Accuracy |
 | e2e-test-4-tpu | 4x TPU | - | Accuracy |
@@ -77,11 +122,11 @@ Testing follows a progressive strategy:
 ### Nightly Testing
 Coming soon
 <!--
-#### Comprehensive Nightly Tests (`nightly-test.yml`)
-*Schedule:* Daily at midnight UTC
+#### Comprehensive Weekly Tests (`weekly-test.yml`)
+*Schedule:* Weekly, Sunday 00:00 UTC+8
 
 *Trigger Conditions:*
-- Cron schedule: `0 0 * * *`
+- Cron schedule: `0 16 * * 0`
 - Push to `main` when `version.py` changes
 - Manual dispatch
 
@@ -96,8 +141,8 @@ Coming soon
 | unit-test-4-tpu | 4x TPU | - | All unit test pass|
 | performance-test-1-tpu (including cache miss check) | 1x TPU | - | Latency, Throughput|
 | performance-test-4-tpu (including cache miss check) | 4x TPU | - | Latency, Throughput|
-| accurancy-test-1-tpu | 1x TPU | - | Model Evaluation  |
-| accurancy-test-4-tpu | 4x TPU | - | Model Evaluation  |
+| accuracy-test-1-tpu | 1x TPU | - | Model Evaluation  |
+| accuracy-test-4-tpu | 4x TPU | - | Model Evaluation  |
 | pallas-kernel-benchmark | 1x TPU | - | Speed |
 | e2e-test-1-tpu | 1x TPU | - | Accuracy |
 | e2e-test-4-tpu | 4x TPU | - | Accuracy |

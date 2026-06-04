@@ -102,7 +102,7 @@ class Embed(nnx.Module):
         if self.num_embeddings == 1:
             return jnp.broadcast_to(embedding, inputs.shape + (self.features,))
 
-        output_pspec = P(*([None] * inputs.ndim), self.kernel_axes[-1])
+        output_pspec = P("data", *([None] * (inputs.ndim - 1)), self.kernel_axes[-1])
         output_sharding = NamedSharding(self.mesh, output_pspec)
         output = embedding.at[inputs].get(out_sharding=output_sharding)
         return output
@@ -200,6 +200,7 @@ class RotaryEmbedding:
         base: int,
         is_neox_style: bool,
         dtype: jnp.dtype,
+        mesh: jax.sharding.Mesh | None = None,
     ):
         self.head_size = head_size
         self.rotary_dim = rotary_dim
@@ -232,16 +233,22 @@ class RotaryEmbedding:
         num_tokens = positions.shape[0]
         query = query.reshape(num_tokens, -1, self.head_size)
         query_rot = query[..., : self.rotary_dim]
-        query_pass = query[..., self.rotary_dim :]
         query_rot = apply_rotary_emb(query_rot, cos, sin, self.is_neox_style)
-        query = jnp.concatenate((query_rot, query_pass), axis=-1).reshape(query_shape)
+        if self.rotary_dim < self.head_size:
+            query_pass = query[..., self.rotary_dim :]
+            query = jnp.concatenate((query_rot, query_pass), axis=-1).reshape(query_shape)
+        else:
+            query = query_rot.reshape(query_shape)
 
         key_shape = key.shape
         key = key.reshape(num_tokens, -1, self.head_size)
         key_rot = key[..., : self.rotary_dim]
-        key_pass = key[..., self.rotary_dim :]
         key_rot = apply_rotary_emb(key_rot, cos, sin, self.is_neox_style)
-        key = jnp.concatenate((key_rot, key_pass), axis=-1).reshape(key_shape)
+        if self.rotary_dim < self.head_size:
+            key_pass = key[..., self.rotary_dim :]
+            key = jnp.concatenate((key_rot, key_pass), axis=-1).reshape(key_shape)
+        else:
+            key = key_rot.reshape(key_shape)
 
         return query, key
 
@@ -613,7 +620,13 @@ def get_rope(
         else:
             raise ValueError("Unknown RoPE scaling type")
 
-        if scaling_type == "llama3":
+        if scaling_type == "default":
+            # HF transformers uses rope_type="default" to mean "no scaling",
+            # equivalent to rope_scaling=None.  Fall back to plain RotaryEmbedding.
+            rotary_emb = RotaryEmbedding(
+                head_size, rotary_dim, max_position, base, is_neox_style, dtype
+            )
+        elif scaling_type == "llama3":
             scaling_factor = rope_scaling["factor"]
             low_freq_factor = rope_scaling["low_freq_factor"]
             high_freq_factor = rope_scaling["high_freq_factor"]
@@ -775,15 +788,21 @@ class YarnRotaryEmbedding(RotaryEmbedding):
         num_tokens = positions.shape[0]
         query = query.reshape(num_tokens, -1, self.head_size)
         query_rot = query[..., : self.rotary_dim]
-        query_pass = query[..., self.rotary_dim :]
         query_rot = apply_rotary_emb(query_rot, cos, sin, self.is_neox_style)
-        query = jnp.concatenate((query_rot, query_pass), axis=-1).reshape(query_shape)
+        if self.rotary_dim < self.head_size:
+            query_pass = query[..., self.rotary_dim :]
+            query = jnp.concatenate((query_rot, query_pass), axis=-1).reshape(query_shape)
+        else:
+            query = query_rot.reshape(query_shape)
 
         key_shape = key.shape
         key = key.reshape(num_tokens, -1, self.head_size)
         key_rot = key[..., : self.rotary_dim]
-        key_pass = key[..., self.rotary_dim :]
         key_rot = apply_rotary_emb(key_rot, cos, sin, self.is_neox_style)
-        key = jnp.concatenate((key_rot, key_pass), axis=-1).reshape(key_shape)
+        if self.rotary_dim < self.head_size:
+            key_pass = key[..., self.rotary_dim :]
+            key = jnp.concatenate((key_rot, key_pass), axis=-1).reshape(key_shape)
+        else:
+            key = key_rot.reshape(key_shape)
 
         return query, key

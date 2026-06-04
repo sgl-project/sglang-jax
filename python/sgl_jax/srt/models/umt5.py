@@ -271,6 +271,13 @@ class UMT5Attention(nnx.Module):
 
         q_h, k_h, v_h = to_heads(q), to_heads(k), to_heads(v)
 
+        # Token axis carries "data" from LinearBase; without this, einsum
+        # would map "data" to both q and k axes -> DuplicateSpecError.
+        qkv_spec = NamedSharding(self.mesh, P("tensor", None, None))
+        q_h = jax.sharding.reshard(q_h, qkv_spec)
+        k_h = jax.sharding.reshard(k_h, qkv_spec)
+        v_h = jax.sharding.reshard(v_h, qkv_spec)
+
         # Compute scores in float32
         scores = jnp.einsum("hqd,hkd->hqk", q_h.astype(jnp.float32), k_h.astype(jnp.float32))
 
@@ -279,6 +286,11 @@ class UMT5Attention(nnx.Module):
         # Fallback if seq_lens is None: assume single sequence
         if q_lens is None:
             q_lens = jnp.array([q.shape[0]], dtype=jnp.int32)
+
+        # seq_lens arrives sharded P("data"); position-bias scatter needs
+        # a replicated index to mix with mesh-less jnp.zeros intermediates.
+        replicated = NamedSharding(self.mesh, P())
+        q_lens = jax.sharding.reshard(q_lens, replicated)
 
         # Add position bias for self-attention (T5-specific)
         if not self.is_cross_attention and hasattr(self, "rel_bias"):
@@ -291,6 +303,7 @@ class UMT5Attention(nnx.Module):
             if self.is_cross_attention
             else q_lens
         )
+        kv_lens = jax.sharding.reshard(kv_lens, replicated)
         is_causal = self.is_decoder and not self.is_cross_attention
 
         # Apply block_diagonal_mask
@@ -460,15 +473,21 @@ class UMT5EncoderModel(nnx.Module):
             m.update(_block_mappings(self.config, i, False, "encoder.block", "encoder.blocks"))
         return m
 
-    def __call__(self, forward_batch: ForwardBatch, token_to_kv_pool=None, logits_metadata=None):
+    def __call__(self, forward_batch: ForwardBatch, memory_pools=None, logits_metadata=None):
+        kv_pool = memory_pools.token_to_kv_pool if memory_pools is not None else None
         x = self.shared(forward_batch.input_ids)
         deterministic = getattr(forward_batch, "deterministic", True)
-        hidden = self.encoder(x, forward_batch, token_to_kv_pool, deterministic)
+        hidden = self.encoder(x, forward_batch, kv_pool, deterministic)
 
-        # Dummy logits for interface compatibility
+        # Replicate so host-side hidden_states slicing in the output
+        # processor doesn't need an explicit out_sharding.
+        hidden = jax.sharding.reshard(hidden, NamedSharding(self.mesh, P()))
+
+        # Dummy logits at P("data","tensor") to match the sampler's
+        # penalty-add branch and keep lax.cond's two branches consistent.
         bs = forward_batch.seq_lens.shape[0]
         dummy = jnp.zeros((bs, self.config.vocab_size), dtype=self.dtype)
-        dummy = jax.sharding.reshard(dummy, NamedSharding(self.mesh, P(None, "tensor")))
+        dummy = jax.sharding.reshard(dummy, NamedSharding(self.mesh, P("data", "tensor")))
         return LogitsProcessorOutput(next_token_logits=dummy, hidden_states=hidden), [], [], None
 
 
@@ -505,10 +524,11 @@ class UMT5DecoderModel(nnx.Module):
             m.update(_block_mappings(self.config, i, True, "decoder.block", "decoder.blocks"))
         return m
 
-    def __call__(self, forward_batch: ForwardBatch, token_to_kv_pool=None):
+    def __call__(self, forward_batch: ForwardBatch, memory_pools=None):
+        kv_pool = memory_pools.token_to_kv_pool if memory_pools is not None else None
         x = self.shared(forward_batch.input_ids)
         deterministic = getattr(forward_batch, "deterministic", True)
-        return self.decoder(x, forward_batch, token_to_kv_pool, deterministic)
+        return self.decoder(x, forward_batch, kv_pool, deterministic)
 
 
 class UMT5Model(nnx.Module):
@@ -554,7 +574,8 @@ class UMT5Model(nnx.Module):
             m.update(_block_mappings(self.config, i, True, "decoder.block", "decoder.blocks"))
         return m
 
-    def __call__(self, forward_batch: ForwardBatch, token_to_kv_pool=None):
+    def __call__(self, forward_batch: ForwardBatch, memory_pools=None):
+        kv_pool = memory_pools.token_to_kv_pool if memory_pools is not None else None
         deterministic = getattr(forward_batch, "deterministic", True)
 
         # Encoder pass - save state immediately
@@ -574,7 +595,7 @@ class UMT5Model(nnx.Module):
         ):
             update_decoder_seq_lens(forward_batch, dec_ids)
 
-        return self.decoder(self.shared(dec_ids), forward_batch, token_to_kv_pool, deterministic)
+        return self.decoder(self.shared(dec_ids), forward_batch, kv_pool, deterministic)
 
 
 class UMT5ForConditionalGeneration(nnx.Module):
@@ -631,7 +652,7 @@ class UMT5ForConditionalGeneration(nnx.Module):
             m.update(_block_mappings(self.config, i, True, "decoder.block", "decoder.blocks"))
         return m
 
-    def __call__(self, forward_batch: ForwardBatch, token_to_kv_pool=None, logits_metadata=None):
+    def __call__(self, forward_batch: ForwardBatch, memory_pools=None, logits_metadata=None):
         deterministic = getattr(forward_batch, "deterministic", True)
 
         # Encoder pass (cache if needed)
@@ -655,7 +676,8 @@ class UMT5ForConditionalGeneration(nnx.Module):
         ):
             update_decoder_seq_lens(forward_batch, dec_ids)
 
-        dec_h = self.decoder(self.shared(dec_ids), forward_batch, token_to_kv_pool, deterministic)
+        kv_pool = memory_pools.token_to_kv_pool if memory_pools is not None else None
+        dec_h = self.decoder(self.shared(dec_ids), forward_batch, kv_pool, deterministic)
 
         if logits_metadata is not None:
             logits = self.logits_processor(dec_h, self.lm_head, logits_metadata)

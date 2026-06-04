@@ -6,6 +6,7 @@ import uuid
 from collections.abc import AsyncGenerator
 from typing import Any
 
+import orjson
 from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 
@@ -25,6 +26,7 @@ from sgl_jax.srt.entrypoints.openai.protocol import (
     LogProbs,
     MessageProcessingResult,
     ToolCall,
+    ToolChoice,
     TopLogprob,
 )
 from sgl_jax.srt.entrypoints.openai.serving_base import OpenAIServingBase
@@ -122,6 +124,16 @@ class OpenAIServingChat(OpenAIServingBase):
             tool_call_parser = self.tokenizer_manager.server_args.tool_call_parser
             parser = FunctionCallParser(request.tools, tool_call_parser)
             tool_call_constraint = parser.get_structure_constraint(request.tool_choice)
+
+        # Structural_tag grammars block special tokens like <think>.
+        # Disable thinking so the template injects an empty <think></think>
+        # prefix instead of letting the model generate <think> itself.
+        if tool_call_constraint and tool_call_constraint[0] == "structural_tag":
+            if request.chat_template_kwargs is None:
+                request.chat_template_kwargs = {}
+            if "enable_thinking" not in request.chat_template_kwargs:
+                logger.debug("Disabling thinking mode: incompatible with structural_tag grammar")
+            request.chat_template_kwargs.setdefault("enable_thinking", False)
 
         # Use chat template
         if self.template_manager.chat_template_name is None:
@@ -382,7 +394,7 @@ Assistant: {% endif %}"""
                     constraint_value.model_dump(by_alias=True)
                 )
             else:
-                sampling_params[constraint_type] = constraint_value
+                sampling_params[constraint_type] = convert_json_schema_to_str(constraint_value)
         return sampling_params
 
     async def _handle_streaming_request(
@@ -474,6 +486,7 @@ Assistant: {% endif %}"""
                 if (
                     self.tokenizer_manager.server_args.reasoning_parser
                     and request.separate_reasoning
+                    and self._get_reasoning_from_request(request)
                 ):
                     reasoning_text, delta = self._process_reasoning_stream(
                         index, delta, reasoning_parser_dict, content, request
@@ -649,7 +662,11 @@ Assistant: {% endif %}"""
             # Handle reasoning content
             reasoning_text = None
             reasoning_parser = self.tokenizer_manager.server_args.reasoning_parser
-            if reasoning_parser and request.separate_reasoning:
+            if (
+                reasoning_parser
+                and request.separate_reasoning
+                and self._get_reasoning_from_request(request)
+            ):
                 try:
                     parser = ReasoningParser(model_type=reasoning_parser, stream_reasoning=False)
                     reasoning_text, text = parser.parse_non_stream(text)
@@ -666,7 +683,11 @@ Assistant: {% endif %}"""
             if request.tool_choice != "none" and request.tools:
                 tool_call_parser = self.tokenizer_manager.server_args.tool_call_parser
                 tool_calls, text, finish_reason = self._process_tool_calls(
-                    text, request.tools, tool_call_parser, finish_reason
+                    text,
+                    request.tools,
+                    tool_call_parser,
+                    finish_reason,
+                    tool_choice=request.tool_choice,
                 )
 
             choice_data = ChatCompletionResponseChoice(
@@ -757,6 +778,7 @@ Assistant: {% endif %}"""
         tools: list[Any],
         tool_call_parser: str | None,
         finish_reason: dict[str, Any],
+        tool_choice: ToolChoice | str = "auto",
     ) -> tuple[list[ToolCall] | None, str, dict[str, Any]]:
         """Process tool calls in the response"""
         parser = FunctionCallParser(tools, tool_call_parser)
@@ -778,7 +800,35 @@ Assistant: {% endif %}"""
                 return tool_calls, text, finish_reason
             except Exception as e:
                 logger.error("Tool call parsing error: %s", e)
-                # Return error but don't fail the whole request
+                return None, text, finish_reason
+
+        # Fallback: when tool_choice is "required" or a specific function,
+        # the json_schema constraint forces bare JSON output without
+        # detector-specific markers (e.g. <tool_call> tags).  Parse the raw
+        # JSON directly using the detector's base parser.
+        if tool_choice == "required" or isinstance(tool_choice, ToolChoice):
+            try:
+                parsed = orjson.loads(text)
+                if isinstance(parsed, list):
+                    parsed = [item for item in parsed if isinstance(item, dict)]
+                call_info_list = parser.detector.parse_base_json(parsed, tools)
+                if call_info_list:
+                    if finish_reason["type"] == "stop":
+                        finish_reason["type"] = "tool_calls"
+                        finish_reason["matched"] = None
+                    tool_calls = [
+                        ToolCall(
+                            id=f"call_{uuid.uuid4().hex[:24]}",
+                            function=FunctionResponse(
+                                name=call_info.name,
+                                arguments=call_info.parameters,
+                            ),
+                        )
+                        for call_info in call_info_list
+                    ]
+                    return tool_calls, "", finish_reason
+            except Exception as e:
+                logger.error("Tool call JSON fallback parsing error: %s", e)
                 return None, text, finish_reason
 
         return None, text, finish_reason
@@ -812,23 +862,22 @@ Assistant: {% endif %}"""
         reasoning_parser = reasoning_parser_dict[index]
         return reasoning_parser.parse_stream_chunk(delta)
 
-    def _get_enable_thinking_from_request(request: ChatCompletionRequest) -> bool:
-        """Extracts the 'enable_thinking' flag from request chat_template_kwargs.
+    def _get_reasoning_from_request(self, request: ChatCompletionRequest) -> bool:
+        """Decide whether reasoning should be parsed for this request.
 
-        NOTE: This parameter is only useful for models that support enable_thinking
-        flag, such as Qwen3.
-
-        Args:
-            request_obj: The request object (or an item from a list of requests).
-        Returns:
-            The boolean value of 'enable_thinking' if found and not True, otherwise True.
+        MIMO's chat template defaults enable_thinking=False; user must explicitly
+        set True to opt into reasoning. Qwen3 is reverse (default True, opt-out
+        via False). Both reuse the same Qwen3Detector, but the enable_thinking
+        semantics are inverted, so the serving layer must gate.
         """
-        if (
-            hasattr(request, "chat_template_kwargs")
-            and request.chat_template_kwargs
-            and request.chat_template_kwargs.get("enable_thinking") is not None
-        ):
-            return request.chat_template_kwargs.get("enable_thinking")
+        parser = self.tokenizer_manager.server_args.reasoning_parser
+        if not parser:
+            return False
+        kwargs = request.chat_template_kwargs or {}
+        if parser == "qwen3":
+            return kwargs.get("enable_thinking") is not False
+        if parser == "mimo":
+            return kwargs.get("enable_thinking") is True
         return True
 
     async def _process_tool_call_stream(

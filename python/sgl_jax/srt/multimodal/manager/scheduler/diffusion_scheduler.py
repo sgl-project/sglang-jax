@@ -36,7 +36,7 @@ class DiffusionScheduler(SchedulerProfilerMixin):
         communication_backend: CommunicationBackend,
         model_class,
         stage_sub_dir: str | None = None,
-        precompile_params: dict | None = None,
+        **kwargs,
     ):
         """Initialize the DiffusionScheduler.
 
@@ -50,8 +50,13 @@ class DiffusionScheduler(SchedulerProfilerMixin):
 
         self.communication_backend = communication_backend
         self.mesh = mesh
+        self.scheduler = kwargs.get("Scheduler")
         self.diffusion_worker = DiffusionModelWorker(
-            server_args, mesh=mesh, model_class=model_class, stage_sub_dir=stage_sub_dir
+            server_args,
+            mesh=mesh,
+            model_class=model_class,
+            stage_sub_dir=stage_sub_dir,
+            scheduler=self.scheduler,
         )
         self.forward_ct = 0
         self.init_profier()

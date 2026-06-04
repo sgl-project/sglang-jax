@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=64.0", "wheel"]
+requires = ["setuptools>=80", "setuptools-scm[simple]>=9.2", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "sglang-jax"
-version = "0.0.2"
+dynamic = ["version"]
 description = "JAX backend for SGL"
 readme = "README.md"
 requires-python = ">=3.12,<3.14"
@@ -43,12 +43,15 @@ dependencies = [
     "pathwaysutils",
     "omegaconf",
     "imageio[ffmpeg]",
-    "librosa",
+    "librosa>=0.10",
     "datasets",
 ]
 
 [project.optional-dependencies]
 dev = [
+]
+fastokens = [
+    "fastokens>=0.1.1,<0.2.0",
 ]
 tpu = [
     "jax[tpu]==0.8.1",
@@ -61,6 +64,7 @@ cpu = [
 ]
 all = [
     "jax[tpu]==0.8.1",
+    "fastokens>=0.1.1,<0.2.0",
 ]
 multimodal = [
     "torch",
@@ -70,7 +74,13 @@ multimodal = [
     "msgpack==1.0.0",
     "qwix",
     "soundfile",
+    "sentencepiece",
 ]
+
+[tool.setuptools_scm]
+root = ".."
+fallback_version = "0.0.0.dev0"
+version_file = "sgl_jax/_version.py"
 
 [tool.setuptools.packages.find]
 exclude = [
@@ -136,6 +146,7 @@ ignore = [
 # Pallas kernels: Python for-loops are statically unrolled at trace time,
 # so closures capturing loop variables is intentional and correct.
 "sgl_jax/srt/kernels/fused_moe/v1/kernel.py" = ["B023"]
+"sgl_jax/srt/kernels/mla/v2/kernel.py" = ["B023"]
 
 [tool.ruff.format]
 docstring-code-format = true

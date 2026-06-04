@@ -58,6 +58,8 @@ class ModelWorkerClient:
         )
         self.forward_thread.start()
         self.parent_process = psutil.Process().parent()
+        replicated_sharding = NamedSharding(mesh, PartitionSpec())
+        self.async_gather_fn = jax.jit(lambda x: x, out_shardings=replicated_sharding)
 
     def get_model_runner(self):
         return self.worker.get_model_runner()
@@ -105,7 +107,7 @@ class ModelWorkerClient:
             # Resolve future tokens in the input
             input_ids = model_worker_batch.forward_batch.input_ids
             model_worker_batch.forward_batch.input_ids = resolve_future_token_ids(
-                input_ids, self.future_token_ids_map
+                input_ids, self.future_token_ids_map, self.mesh
             )
 
             # Run forward
@@ -118,12 +120,13 @@ class ModelWorkerClient:
                         forward_metadata=forward_metadata,
                     )
                 )
-
+            next_token_ids = self.async_gather_fn(next_token_ids)
             # Update the future token ids map
             self.future_token_ids_map = set_future_token_ids(
                 self.future_token_ids_map,
                 future_token_ids_ct,
                 next_token_ids,
+                self.mesh,
             )
             self.output_queue.put((None, logits_output, next_token_ids, cache_miss_count))
 
@@ -131,19 +134,39 @@ class ModelWorkerClient:
         """
         This function is called to resolve the last batch result and
         wait for the current batch to be launched. Used in overlap mode.
+
+        Uses jax.copy_to_host_async to start all device-to-host copies in
+        parallel, then materializes them. This lets the four arrays we need
+        overlap on PCIe rather than serializing the per-array sync that
+        jax.device_get does.
         """
         _, logits_output, next_token_ids, cache_miss_count = self.output_queue.get()
-        if logits_output.next_token_logprobs is not None:
-            logits_output.next_token_logprobs = jax.device_get(
-                logits_output.next_token_logprobs
-            ).tolist()
-        if logits_output.input_token_logprobs is not None:
-            logits_output.input_token_logprobs = jax.device_get(
-                logits_output.input_token_logprobs
-            ).tolist()
-        if logits_output.hidden_states is not None:
-            logits_output.hidden_states = jax.device_get(logits_output.hidden_states)
+        # Step 1: kick off async D2H copies for everything we need
+        async_next_logprobs = (
+            jax.copy_to_host_async(logits_output.next_token_logprobs)
+            if logits_output.next_token_logprobs is not None
+            else None
+        )
+        async_input_logprobs = (
+            jax.copy_to_host_async(logits_output.input_token_logprobs)
+            if logits_output.input_token_logprobs is not None
+            else None
+        )
+        async_hidden_states = (
+            jax.copy_to_host_async(logits_output.hidden_states)
+            if logits_output.hidden_states is not None
+            else None
+        )
         next_token_ids = jax.device_get(next_token_ids).tolist()
+
+        # Step 2: materialize. The first np.asarray waits for that array's
+        # copy; the others have been making progress in parallel.
+        if async_next_logprobs is not None:
+            logits_output.next_token_logprobs = np.asarray(async_next_logprobs).tolist()
+        if async_input_logprobs is not None:
+            logits_output.input_token_logprobs = np.asarray(async_input_logprobs).tolist()
+        if async_hidden_states is not None:
+            logits_output.hidden_states = np.asarray(async_hidden_states)
 
         if launch_done is not None:
             launch_done.wait()
@@ -167,7 +190,7 @@ class ModelWorkerClient:
         if sampling_metadata is None:
             sampling_metadata = SamplingMetadata.from_model_worker_batch(
                 model_worker_batch,
-                len(model_worker_batch.seq_lens) - model_worker_batch.real_bs,
+                0,
                 self.mesh,
                 self.worker.model_config.vocab_size,
             )
@@ -195,7 +218,7 @@ class ModelWorkerClient:
         )
 
         # Allocate output future objects
-        bs = len([seq_len for seq_len in model_worker_batch.seq_lens if seq_len > 0])
+        bs = len(model_worker_batch.seq_lens)
 
         future_next_token_ids = np.arange(
             -(self.future_token_ids_ct + 1),
@@ -208,6 +231,10 @@ class ModelWorkerClient:
 
     def run_precompile(self):
         self.worker.run_precompile(self.future_token_ids_map)
+
+    @property
+    def page_size(self) -> int:
+        return self.worker.page_size
 
     @property
     def sliding_window_size(self) -> int | None:

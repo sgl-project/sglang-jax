@@ -24,6 +24,11 @@ def run_eval(args):
 
         filename = "https://openaipublic.blob.core.windows.net/simple-evals/mmlu.csv"
         eval_obj = MMLUEval(filename, args.num_examples, args.num_threads)
+    elif args.eval_name == "sglang_mmlu":
+        from eval.sglang_mmlu import SglangMMLUEval
+
+        filename = "https://openaipublic.blob.core.windows.net/simple-evals/mmlu.csv"
+        eval_obj = SglangMMLUEval(filename, args.num_examples, args.num_threads)
     elif args.eval_name == "math":
         from eval.simple_eval_math import MathEval
 
@@ -52,6 +57,26 @@ def run_eval(args):
         from eval.simple_eval_gsm8k import GSM8KEval
 
         eval_obj = GSM8KEval(args.num_examples, args.num_threads)
+    elif args.eval_name == "aime25":
+        from eval.simple_eval_aime25 import AIME25Eval
+
+        eval_obj = AIME25Eval(args.num_examples, args.num_threads)
+    elif args.eval_name == "aime26":
+        from eval.simple_eval_aime26 import AIME26Eval
+
+        eval_obj = AIME26Eval(args.num_examples, args.num_threads)
+    elif args.eval_name == "csimpleqa":
+        from eval.simple_eval_csimpleqa import ChineseSimpleQAEval
+
+        # Self-grading: same served endpoint, deterministic, only one of A/B/C
+        # is needed so an 8-token cap is more than enough.
+        grader = ChatCompletionSampler(
+            base_url=base_url,
+            model=args.model,
+            temperature=0.0,
+            max_tokens=8,
+        )
+        eval_obj = ChineseSimpleQAEval(grader, args.num_examples, args.num_threads)
     else:
         raise ValueError(f"Invalid eval name: {args.eval_name}")
 
@@ -60,11 +85,17 @@ def run_eval(args):
     else:
         max_tokens = 2048
 
+    top_p = getattr(args, "top_p", None)
+    chat_template_kwargs = getattr(args, "chat_template_kwargs", None)
+    extra_body = {"chat_template_kwargs": chat_template_kwargs} if chat_template_kwargs else None
+
     sampler = ChatCompletionSampler(
         model=args.model,
         max_tokens=max_tokens,
         base_url=base_url,
         temperature=getattr(args, "temperature", 0.0),
+        top_p=top_p,
+        extra_body=extra_body,
     )
 
     # Run eval
@@ -116,6 +147,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-examples", type=int)
     parser.add_argument("--num-threads", type=int, default=512)
     parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--max-tokens", type=int, default=2048)
     args = parser.parse_args()
 
     run_eval(args)

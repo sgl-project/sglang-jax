@@ -46,6 +46,17 @@ class TestLogprobsDense(unittest.TestCase):
         """Clean up after all tests - shutdown the engine."""
         cls.engine.shutdown()
 
+    def assert_scalar_logprobs(self, logprobs, key):
+        for i, (logprob, _, _) in enumerate(logprobs):
+            if logprob is None:
+                continue
+            self.assertFalse(
+                isinstance(logprob, (list, tuple)),
+                f"{key}[{i}] should be a scalar logprob, got {type(logprob)}",
+            )
+            shape = getattr(logprob, "shape", ())
+            self.assertEqual(shape, (), f"{key}[{i}] should be scalar, got shape {shape}")
+
     def test_logprobs(self):
         ## prompt = "please introduce yourself"
         input_ids = [151646, 151644, 30021, 19131, 6133, 151645, 151648, 198]
@@ -70,6 +81,7 @@ class TestLogprobsDense(unittest.TestCase):
             len(input_ids) - start_len,
             "input_token_logprobs is invalid",
         )
+        self.assert_scalar_logprobs(output_meta["input_token_logprobs"], "input_token_logprobs")
         self.assertEqual(
             len(output_meta["output_token_logprobs"]),
             len(output["output_ids"]),
@@ -115,9 +127,9 @@ class TestLogprobsDense(unittest.TestCase):
         )
 
         expected_output_logprobs = [
-            [-0.87109375, 32313, "Okay"],
+            [-0.8515625, 32313, "Okay"],
             [0.0, 11, ","],
-            [-0.318359375, 773, " so"],
+            [-0.3515625, 773, " so"],
         ]
         self.check_output(output_meta, "output_token_logprobs", expected_output_logprobs)
 

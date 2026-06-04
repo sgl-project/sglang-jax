@@ -717,6 +717,12 @@ class WanTransformer3DModel(nnx.Module):
         # Unpatchify: reshape from patches back to image space
         # hidden_states shape: [batch_size, num_patches, out_channels * patch_volume]
         p_t, p_h, p_w = self.patch_size
+        # proj_out leaves "tensor" on the channel axis; multi-axis split
+        # reshape can't be inferred under that sharding, so drop it.
+        if self.mesh is not None:
+            hidden_states = jax.sharding.reshard(
+                hidden_states, jax.sharding.NamedSharding(self.mesh, jax.sharding.PartitionSpec())
+            )
         hidden_states = hidden_states.reshape(
             batch_size,
             post_patch_num_frames,

@@ -7,22 +7,19 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 if TYPE_CHECKING:
-    from sgl_jax.srt.managers.schedule_batch import ScheduleBatch
+    from sgl_jax.srt.managers.schedule_batch import ScheduleReqsInfo
 
 
 class BatchedPenalizerOrchestrator:
     def __init__(
         self,
         vocab_size: int,
-        batch: ScheduleBatch,
+        reqs_info: ScheduleReqsInfo,
         penalizers: set[type[_BatchedPenalizer]],
     ):
         self.vocab_size = vocab_size
-        self._batch_ref = weakref.ref(batch)
+        self._reqs_info_ref = weakref.ref(reqs_info)
         self.penalizers = {Penalizer: Penalizer(self) for Penalizer in penalizers}
-
-        # No longer need internal penalty array management -
-        # work directly on the provided linear_penalty array
 
         is_required = False
         for penalizer in self.penalizers.values():
@@ -31,18 +28,19 @@ class BatchedPenalizerOrchestrator:
         self.is_required = is_required
 
     @property
-    def batch(self) -> ScheduleBatch | None:
-        return self._batch_ref()
+    def reqs_info(self) -> ScheduleReqsInfo | None:
+        return self._reqs_info_ref()
 
-    @batch.setter
-    def batch(self, value: ScheduleBatch | None):
+    @reqs_info.setter
+    def reqs_info(self, value: ScheduleReqsInfo | None):
         if value is None:
-            self._batch_ref = lambda: None
+            self._reqs_info_ref = lambda: None
         else:
-            self._batch_ref = weakref.ref(value)
+            self._reqs_info_ref = weakref.ref(value)
 
     def reqs(self):
-        return self.batch.reqs
+        info = self.reqs_info
+        return info.reqs if info is not None and info.reqs else []
 
     def cumulate_output_tokens(self, output_ids: np.ndarray):
         """
