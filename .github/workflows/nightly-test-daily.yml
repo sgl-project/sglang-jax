@@ -104,6 +104,24 @@ jobs:
           cd test/srt
           python3 run_suite.py --suite nightly-infra-smoke-tpu-v6e-1
 
+  nightly-test-accuracy-text-models-4-tpu-daily:
+    if: github.repository == 'sgl-project/sglang-jax'
+    runs-on: arc-runner-v6e-4
+    env:
+      TZ: Asia/Shanghai
+      JAX_COMPILATION_CACHE_DIR: /xla-cache
+      SGLANG_JAX_MODEL_CACHE: /models/model_scope
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Setup Python environment
+        uses: ./.github/actions/setup-venv
+      - name: Run 4-TPU accuracy daily suite
+        timeout-minutes: 150
+        run: |
+          cd test/srt
+          python3 nightly/single_host/suite_runner.py --suite accuracy-text-models-v6e-4
+
   nightly-test-daily-finish:
     needs: [
       nightly-test-accuracy-text-models-1-tpu-daily,
@@ -111,6 +129,7 @@ jobs:
       nightly-test-openai-api-surface-1-tpu-daily,
       multi-host-test-mimo-flash-daily,
       nightly-infra-smoke-1-tpu-daily,
+      nightly-test-accuracy-text-models-4-tpu-daily,
     ]
     if: always() && github.repository == 'sgl-project/sglang-jax'
     runs-on: ubuntu-latest
@@ -123,6 +142,7 @@ jobs:
           echo "openai-api-surface-1-tpu-daily: ${{ needs.nightly-test-openai-api-surface-1-tpu-daily.result }}"
           echo "multi-host-mimo-flash-daily: ${{ needs.multi-host-test-mimo-flash-daily.result }}"
           echo "infra-smoke-1-tpu-daily: ${{ needs.nightly-infra-smoke-1-tpu-daily.result }}"
+          echo "accuracy-4-tpu-daily: ${{ needs.nightly-test-accuracy-text-models-4-tpu-daily.result }}"
           echo ""
 
           has_failure=false
@@ -131,7 +151,8 @@ jobs:
             "perf-text-1-tpu-daily=${{ needs.nightly-test-perf-text-models-1-tpu-daily.result }}" \
             "openai-api-surface-1-tpu-daily=${{ needs.nightly-test-openai-api-surface-1-tpu-daily.result }}" \
             "multi-host-mimo-flash-daily=${{ needs.multi-host-test-mimo-flash-daily.result }}" \
-            "infra-smoke-1-tpu-daily=${{ needs.nightly-infra-smoke-1-tpu-daily.result }}"; do
+            "infra-smoke-1-tpu-daily=${{ needs.nightly-infra-smoke-1-tpu-daily.result }}" \
+            "accuracy-4-tpu-daily=${{ needs.nightly-test-accuracy-text-models-4-tpu-daily.result }}"; do
             job_name="${job_result%%=*}"
             result="${job_result#*=}"
             if [ "$job_name" = "multi-host-mimo-flash-daily" ] && [ "$result" = "skipped" ]; then

@@ -6,10 +6,12 @@
 # `gs://observability-storage-sglang/<date>/<workload>/` in CI.
 #
 # Producers: any accuracy nightly runner. Today:
-#   - test/srt/multi_host/accuracy_case_runner.py (multi-host suites)
-# New runners that produce accuracy JSON SHOULD emit this schema and bump
-# `ACCURACY_RESULT_SCHEMA_VERSION` (with a changelog entry below) when they
-# need additional fields.
+#   - test/srt/nightly/multi_host/accuracy_case_runner.py (multi-host suites)
+#   - test/srt/nightly/single_host/accuracy_case_runner.py (single-host v6e-1 / v6e-4 suites, #1200)
+# Both build the document via the shared emitter test/srt/nightly/results.py.
+# New runners that produce accuracy JSON SHOULD emit this schema (via that
+# emitter) and bump `ACCURACY_RESULT_SCHEMA_VERSION` (with a changelog entry
+# below) when they need additional fields.
 # Consumer: dashboards / regression trackers that ingest the bucket.
 
 schema: accuracy_result
@@ -22,8 +24,9 @@ description: |
   and provenance so the result is reproducible from CI metadata alone.
 
 # How the version field evolves. The Python constant
-# `ACCURACY_RESULT_SCHEMA_VERSION` in accuracy_case_runner.py MUST stay in
-# sync with the latest entry in `changelog` below.
+# `ACCURACY_RESULT_SCHEMA_VERSION` in test/srt/nightly/results.py (the shared
+# emitter for both runners) MUST stay in sync with the latest entry in
+# `changelog` below.
 versioning:
   policy: semver
   rules:

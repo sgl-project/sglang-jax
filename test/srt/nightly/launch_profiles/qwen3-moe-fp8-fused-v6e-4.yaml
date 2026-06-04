@@ -1,0 +1,33 @@
+# Statically-quantized FP8 checkpoint × moe-backend fused (issue #1200, 1.1.5).
+# Weights ship in FP8, so the loader detects quantization from the model config;
+# no runtime --quantization-config-path. FP8 loader fix tracked in #1291.
+# Same server config as the bf16 fused profile (max-running-requests=64 is a
+# multiple of ep_size, so the fused MoE kernel's num_tokens % ep_size alignment
+# holds without pinning --precompile-bs-paddings).
+name: qwen3_moe-fp8-fused-tp4-ep4
+target: v6e-4
+model_path: Qwen/Qwen3-30B-A3B-FP8
+tp_size: 4
+dp_size: 1
+ep_size: 4
+port: 30051
+server_args:
+  - --skip-server-warmup
+  - --random-seed
+  - "3"
+  - --mem-fraction-static
+  - "0.8"
+  - --max-prefill-tokens
+  - "8192"
+  - --download-dir
+  - /dev/shm/
+  - --dtype
+  - bfloat16
+  - --attention-backend
+  - fa
+  - --page-size
+  - "256"
+  - --max-running-requests
+  - "64"
+  - --moe-backend
+  - fused

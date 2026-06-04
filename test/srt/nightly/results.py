@@ -1,27 +1,27 @@
-"""Accuracy case runner: drives run_eval against a given server URL.
+"""Single source of truth for the ``accuracy_result.v1.yaml`` document shape.
 
-The summary JSON written to ``${RESULTS_DIR}/<case>.json`` follows the schema
-documented in ``test/srt/schemas/accuracy_result.v1.yaml`` (shared across
-single-host and multi-host accuracy nightlies). Bump
-``ACCURACY_RESULT_SCHEMA_VERSION`` (and add a matching changelog entry to the
-schema file) whenever the document shape changes.
+Both the single-host runner (``test/srt/nightly/single_host/accuracy_case_runner.py``)
+and the multi-host runner (``test/srt/nightly/multi_host/accuracy_case_runner.py``)
+build and write their result JSON here, so the schema in
+``test/srt/nightly/schemas/accuracy_result.v1.yaml`` has exactly one
+producer-side implementation and the two runners cannot drift.
+
+Bump ``ACCURACY_RESULT_SCHEMA_VERSION`` (and add a matching changelog entry to
+the schema file) whenever the document shape changes.
 """
 
 import json
 import os
 import subprocess
 import sys
-import time
 from datetime import datetime, timezone
 from pathlib import Path
-from types import SimpleNamespace
 
-_TEST_SRT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir))
-if _TEST_SRT not in sys.path:
-    sys.path.insert(0, _TEST_SRT)
+_NIGHTLY_DIR = os.path.dirname(os.path.abspath(__file__))
+if _NIGHTLY_DIR not in sys.path:
+    sys.path.insert(0, _NIGHTLY_DIR)
 
-from multi_host_suite import AccuracyCase, SuiteError
-from profile_loader import LaunchProfile
+from cases import AccuracyCase  # noqa: E402
 
 ACCURACY_RESULT_SCHEMA_VERSION = "1.0.0"
 
@@ -61,13 +61,20 @@ def _build_github_run_url() -> str | None:
     return None
 
 
-def _build_summary(
+def build_accuracy_result(
     case: AccuracyCase,
-    profile: LaunchProfile,
+    profile_name: str,
+    target: str,
     metrics: dict | None,
     started_at: float,
     finished_at: float,
 ) -> dict:
+    """Build one ``accuracy_result.v1.yaml`` document for a finished case.
+
+    ``profile_name`` / ``target`` are plain strings so single-host callers can
+    pass their own labels and multi-host callers can pass ``profile.name`` /
+    ``profile.target`` from a LaunchProfile.
+    """
     score = metrics.get("score") if isinstance(metrics, dict) else None
     passed: bool | None
     if case.score_threshold is None or score is None:
@@ -81,8 +88,8 @@ def _build_summary(
         "case": case.name,
         "dataset": case.dataset,
         "model_id": case.model_id,
-        "profile": profile.name,
-        "target": profile.target,
+        "profile": profile_name,
+        "target": target,
         "score": score,
         "score_threshold": case.score_threshold,
         "passed": passed,
@@ -101,12 +108,37 @@ def _build_summary(
     }
 
 
-def run_accuracy_case(case: AccuracyCase, profile: LaunchProfile) -> None:
+def write_accuracy_result(result: dict, case_name: str) -> Path | None:
+    """Write ``result`` to ``$RESULTS_DIR/<case_name>.json``.
+
+    Returns the path written, or ``None`` when ``RESULTS_DIR`` is unset (so
+    callers can log the skip in their own voice).
+    """
+    results_dir = os.environ.get("RESULTS_DIR")
+    if not results_dir:
+        return None
+    out_path = Path(results_dir) / f"{case_name}.json"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(result, indent=2, sort_keys=True, default=float))
+    return out_path
+
+
+def run_eval_for_case(case: AccuracyCase, base_url: str):
+    """Drive ``run_eval`` for one case against a live server at ``base_url``.
+
+    Shared by the single- and multi-host accuracy runners so the eval-args
+    construction + ``run_eval`` call live in one place. Returns
+    ``(metrics, started_at, finished_at)``; each host runner does its own
+    logging / gating and calls ``build_accuracy_result`` + ``write_accuracy_result``.
+    """
+    import time
+    from types import SimpleNamespace
+
     from run_eval import run_eval
 
     gen = case.generation_config or {}
     args = SimpleNamespace(
-        base_url=f"http://127.0.0.1:{profile.port}",
+        base_url=base_url,
         host=None,
         port=None,
         model=case.model_id,
@@ -118,61 +150,7 @@ def run_accuracy_case(case: AccuracyCase, profile: LaunchProfile) -> None:
         top_p=gen.get("top_p"),
         chat_template_kwargs=gen.get("chat_template_kwargs"),
     )
-
-    print(
-        f"[multi-host-suite] Running accuracy case "
-        f"name={case.name}, dataset={case.dataset}, "
-        f"num_threads={args.num_threads}, "
-        f"temperature={args.temperature}, max_tokens={args.max_tokens}, "
-        f"top_p={args.top_p}, chat_template_kwargs={args.chat_template_kwargs}, "
-        f"limit={case.limit}",
-        flush=True,
-    )
-
     started_at = time.time()
     metrics = run_eval(args)
     finished_at = time.time()
-
-    summary = _build_summary(case, profile, metrics, started_at, finished_at)
-
-    results_dir = os.environ.get("RESULTS_DIR")
-    if results_dir:
-        out_path = Path(results_dir) / f"{case.name}.json"
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(json.dumps(summary, indent=2, sort_keys=True, default=float))
-        print(f"[multi-host-suite] Wrote accuracy summary to {out_path}", flush=True)
-    else:
-        print(
-            f"[multi-host-suite] RESULTS_DIR unset; skipping accuracy summary write",
-            flush=True,
-        )
-
-    score = summary["score"]
-    if case.score_threshold is not None:
-        if score is None:
-            raise SuiteError(
-                kind="case",
-                message=(
-                    f"Accuracy case {case.name} produced no score; cannot evaluate "
-                    f"against threshold={case.score_threshold}"
-                ),
-            )
-        if score < case.score_threshold:
-            raise SuiteError(
-                kind="threshold",
-                message=(
-                    f"Accuracy case {case.name} score={score:.4f} below "
-                    f"threshold={case.score_threshold:.4f}"
-                ),
-            )
-        print(
-            f"[multi-host-suite] Accuracy case {case.name} passed: "
-            f"score={score:.4f} >= threshold={case.score_threshold:.4f}",
-            flush=True,
-        )
-    else:
-        print(
-            f"[multi-host-suite] Accuracy case {case.name} finished "
-            f"(no threshold set, score={score})",
-            flush=True,
-        )
+    return metrics, started_at, finished_at
