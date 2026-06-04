@@ -2110,6 +2110,14 @@ class Scheduler(
                 logger.debug("Abort prefill queue request. rid=%s", entry.req_id)
                 if hasattr(entry.sender, "abort"):
                     entry.sender.abort()
+                if entry.on_terminal is not None:
+                    try:
+                        entry.on_terminal()
+                    except Exception:
+                        logger.exception(
+                            "on_terminal for aborted prefill req_id=%s raised",
+                            entry.req_id,
+                        )
 
         prealloc_q = getattr(self, "disagg_prealloc_queue", None)
         if prealloc_q is not None:

@@ -172,9 +172,9 @@ class SchedulerDisaggregationPrefillMixin:
                 continue
             try:
                 device_kv = self._extract_req_kv(req)
-            except Exception:
+            except Exception as exc:
                 logger.exception(
-                    "failed to extract KV for req_id=%s; skipping send",
+                    "failed to extract KV for req_id=%s; aborting",
                     req_id,
                 )
                 try:
@@ -187,7 +187,23 @@ class SchedulerDisaggregationPrefillMixin:
                     ).inc()
                 except Exception:  # noqa: BLE001
                     pass
+                from sgl_jax.srt.managers.schedule_batch import FINISH_ABORT
+
+                req.finished_reason = FINISH_ABORT(
+                    f"KV extraction failed for req_id={req_id!r}: {exc}",
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    "PDTransferError",
+                )
+                req.output_ids = []
+                if hasattr(self, "stream_output"):
+                    self.stream_output(  # type: ignore[attr-defined]
+                        [req],
+                        getattr(req, "return_logprob", False),
+                        getattr(req, "return_output_logprob_only", False),
+                    )
+                self._release_prefill_req_resources(req)
                 continue
+            sender = None
             try:
                 self._maybe_log_prefill_extract_debug(
                     req,
@@ -211,6 +227,18 @@ class SchedulerDisaggregationPrefillMixin:
                     "sender init/send failed for req_id=%s; aborting",
                     req_id,
                 )
+                if sender is not None:
+                    try:
+                        if hasattr(sender, "abort"):
+                            sender.abort()
+                        if hasattr(sender, "clear"):
+                            sender.clear()
+                    except Exception:  # noqa: BLE001
+                        logger.debug(
+                            "sender cleanup failed for req_id=%s",
+                            req_id,
+                            exc_info=True,
+                        )
                 try:
                     from sgl_jax.srt.disaggregation.common.metrics import (
                         PD_TRANSFER_FAILURES_TOTAL,

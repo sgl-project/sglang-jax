@@ -611,14 +611,16 @@ def test_write_kv_to_pool_keeps_last_real_page_when_bucket_is_padded():
     assert host[6].tolist() == [[3.0], [3.0]]
 
 
-def test_prefill_extract_failure_skips_send():
-    """If _extract_req_kv raises, no sender is created and the queue is empty."""
+def test_prefill_extract_failure_aborts_and_releases():
+    """If _extract_req_kv raises, the req gets FINISH_ABORT and resources are released."""
 
     class _FailExtractScheduler(SchedulerDisaggregationPrefillMixin):
         def __init__(self):
             self.disagg_prefill_queue = PrefillBootstrapQueue()
             self.disagg_use_d2h_staging = False
             self._extract_called = False
+            self.released_reqs: list[Any] = []
+            self.streamed: list[Any] = []
 
         def set_next_batch_sampling_info_done(self, batch):
             pass
@@ -630,9 +632,20 @@ def test_prefill_extract_failure_skips_send():
         def _maybe_log_prefill_extract_debug(self, req, kv, **meta):
             pass
 
+        def _release_prefill_req_resources(self, req):
+            self.released_reqs.append(req)
+
+        def stream_output(
+            self, reqs, return_logprob, return_output_logprob_only,
+            skip_req=None, cache_miss_count=None,
+        ):
+            self.streamed.append(list(reqs))
+
     sched = _FailExtractScheduler()
     sched.disagg_kv_manager = mock.MagicMock()
     req = _fake_req("r-fail-extract", bootstrap_room=1)
+    req.return_logprob = False
+    req.return_output_logprob_only = False
     batch = SimpleNamespace(reqs=[req], next_batch_sampling_info=None)
 
     sched.process_prefill_chunk(batch, None)
@@ -640,6 +653,10 @@ def test_prefill_extract_failure_skips_send():
     assert sched._extract_called
     assert len(sched.disagg_prefill_queue) == 0
     sched.disagg_kv_manager.create_sender.assert_not_called()
+    assert isinstance(req.finished_reason, FINISH_ABORT)
+    assert "simulated extract failure" in req.finished_reason.message
+    assert sched.streamed == [[req]]
+    assert sched.released_reqs == [req]
 
 
 def test_prefill_sender_init_failure_aborts_and_releases():
@@ -666,6 +683,11 @@ def test_prefill_sender_init_failure_aborts_and_releases():
     assert sched.streamed
     assert sched.released_reqs == [req]
     assert len(sched.disagg_prefill_queue) == 0
+    assert bad_sender.abort.called
+    assert bad_sender.clear.called
+
+
+def test_decode_event_loop_idle_structure():
     """Decode event loop: when no batch and no recv_reqs, it still calls
     process_decode_queue each tick.
     """
@@ -871,6 +893,46 @@ def test_prefill_queue_abort_matching():
     aborted = q.abort_matching("p-", abort_all=False)
     assert {e.req_id for e in aborted} == {"p-1", "p-2"}
     assert len(q) == 1
+
+
+def test_prefill_queue_abort_calls_on_terminal():
+    """abort_request must invoke on_terminal for entries popped from
+    the prefill queue, otherwise the request has no terminal response
+    and resources leak.
+    """
+
+    sched = _MockPrefillScheduler()
+    sender = mock.MagicMock()
+    sender.poll.return_value = KVPoll.WAITING_FOR_INPUT
+
+    req = _fake_req("p-abort-1", bootstrap_room=1)
+    req.return_logprob = False
+    req.return_output_logprob_only = False
+
+    sched.disagg_prefill_queue.add(
+        req.rid,
+        sender,
+        on_terminal=lambda req=req, snd=sender: sched._on_prefill_transfer_terminal(
+            req, snd
+        ),
+    )
+
+    # Provide minimal Scheduler attributes so abort_request can run.
+    sched.waiting_queue = []
+    sched.grammar_queue = []
+    sched.running_batch = SimpleNamespace(reqs_info=[])
+    sched.cur_batch = None
+    sched._comm_backend = None
+    sched.send_to_tokenizer = mock.MagicMock()
+
+    from sgl_jax.srt.managers.scheduler import Scheduler
+
+    recv_req = SimpleNamespace(rid="p-abort-1", abort_all=False)
+    Scheduler.abort_request(sched, recv_req)
+
+    assert sender.abort.called
+    assert sched.released_reqs == [req]
+    assert len(sched.disagg_prefill_queue) == 0
 
 
 # --- disagg_transfer_id contract ---
