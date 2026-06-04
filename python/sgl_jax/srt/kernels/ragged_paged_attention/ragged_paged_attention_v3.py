@@ -1843,10 +1843,16 @@ def ragged_paged_attention(
             q.dtype,
         )
 
-        bo_double_buf = pltpu.VMEM(
-            (2, actual_num_kv_heads, bq_sz, *q.shape[2:]),
-            q.dtype,
-        )
+        # Unaliasing bo from the bq input buffer cuts decode latency on v7 (the
+        # tuned table's e2e win) but adds VMEM scratch that regresses the v6e
+        # Mosaic schedule (mixed hd128 perf guard). Keep it v7-only; v6e/v5 alias.
+        if tpu_version == 7:
+            bo_double_buf = pltpu.VMEM(
+                (2, actual_num_kv_heads, bq_sz, *q.shape[2:]),
+                q.dtype,
+            )
+        else:
+            bo_double_buf = bq_double_buf
 
         if use_causal_mask:
             bkvmask_double_buf = None
@@ -1860,10 +1866,14 @@ def ragged_paged_attention(
             (actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128),
             out_dtype,
         )
-        m_scratch = pltpu.VMEM(
-            (actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128),
-            out_dtype,
-        )
+        # See bo_double_buf above: v7-only unalias, v6e/v5 alias to l_scratch.
+        if tpu_version == 7:
+            m_scratch = pltpu.VMEM(
+                (actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128),
+                out_dtype,
+            )
+        else:
+            m_scratch = l_scratch
 
         acc_scratch = pltpu.VMEM(
             (actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, head_dim),
