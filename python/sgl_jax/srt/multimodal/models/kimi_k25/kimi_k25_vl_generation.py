@@ -2,13 +2,15 @@ import logging
 import jax  
 import jax.numpy as jnp  
 from flax import nnx  
+
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
   
 from sgl_jax.srt.hf_transformers_utils import get_hf_text_config  
 from sgl_jax.srt.layers.embeddings import ParallelLMHead  
-from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor  
+from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput  
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch  
-from sgl_jax.srt.multimodal.models.qwen2_5VL.qwen2_5_vl_generation import Qwen2_5_VL_Model  
   
 logger = logging.getLogger(__name__)  
   
@@ -28,7 +30,7 @@ class KimiK25ForConditionalGeneration(nnx.Module):
     def __call__(  
         self,  
         forward_batch: ForwardBatch,  
-        kvcache: KVCache,  
+        kv_cache: KVCache,  
         logits_metadata: LogitsMetadata,  
     ):  
         num_seqs = forward_batch.seq_lens.shape[0]
