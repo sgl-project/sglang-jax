@@ -754,6 +754,8 @@ class EagleDraftInput:
             self.verified_id = self.verified_id[: len(new_indices)]
             if self.allocate_lens is not None:
                 self.allocate_lens = np.asarray(self.allocate_lens)[: len(new_indices)]
+            if self.new_seq_lens is not None:
+                self.new_seq_lens = np.asarray(self.new_seq_lens)[: len(new_indices)]
         else:
             self.topk_p = self.topk_p[new_indices]
             self.topk_index = self.topk_index[new_indices]
@@ -761,6 +763,8 @@ class EagleDraftInput:
             self.verified_id = self.verified_id[new_indices]
             if self.allocate_lens is not None:
                 self.allocate_lens = np.asarray(self.allocate_lens)[new_indices]
+            if self.new_seq_lens is not None:
+                self.new_seq_lens = np.asarray(self.new_seq_lens)[new_indices]
 
     def merge_batch(self, spec_info: EagleDraftInput):
         if self.hidden_states is None:
@@ -768,6 +772,8 @@ class EagleDraftInput:
             self.verified_id = spec_info.verified_id
             self.topk_p = spec_info.topk_p
             self.topk_index = spec_info.topk_index
+            self.allocate_lens = spec_info.allocate_lens
+            self.new_seq_lens = spec_info.new_seq_lens
             return
         if spec_info.hidden_states is None:
             return
@@ -778,6 +784,12 @@ class EagleDraftInput:
         self.topk_p = np.concatenate([self.topk_p, spec_info.topk_p])
         self.topk_index = np.concatenate([self.topk_index, spec_info.topk_index])
         self.allocate_lens = np.concatenate([self.allocate_lens, spec_info.allocate_lens])
+        if self.new_seq_lens is not None and spec_info.new_seq_lens is not None:
+            self.new_seq_lens = np.concatenate(
+                [np.asarray(self.new_seq_lens), np.asarray(spec_info.new_seq_lens)]
+            )
+        else:
+            self.new_seq_lens = None
 
 
 @dataclass

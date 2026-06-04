@@ -1846,6 +1846,61 @@ class Scheduler(
                     dp_rank * per_dp_bs_size : dp_rank * per_dp_bs_size + num_real_reqs
                 ]
 
+    def _publish_spec_verify_phase_lengths_to_batch(
+        self,
+        batch: ScheduleBatch,
+        model_worker_batch,
+        verify_result,
+    ) -> None:
+        """Publish Phase A scheduler-visible lengths without touching draft state."""
+        accept = verify_result.accept_lens
+        if accept is not None:
+            if hasattr(accept, "copy_to_host_async"):
+                accept.copy_to_host_async()
+            accept = np.asarray(jax.device_get(accept))
+        per_dp_bs = model_worker_batch.per_dp_bs_size
+        for dp_rank, info in enumerate(batch.reqs_info):
+            if info.seq_lens is None or len(info.seq_lens) == 0:
+                continue
+            if accept is not None:
+                off = dp_rank * per_dp_bs
+                info.seq_lens = info.seq_lens + accept[off : off + len(info.seq_lens)]
+            else:
+                info.seq_lens = info.seq_lens + 1
+
+    def _write_back_spec_draft_state_to_batch(
+        self,
+        batch: ScheduleBatch,
+        model_worker_batch,
+        next_draft_input: EagleDraftInput | None,
+    ) -> None:
+        """Write Phase B complete cross-round draft state back to per-DP batch."""
+        if next_draft_input is None:
+            return
+        assert isinstance(next_draft_input, EagleDraftInput), (
+            "_write_back_spec_draft_state_to_batch expects EagleDraftInput, got "
+            f"{type(next_draft_input)!r}"
+        )
+        if getattr(model_worker_batch, "real_bs", 0) > 0:
+            for field in (
+                "topk_index",
+                "topk_p",
+                "hidden_states",
+                "verified_id",
+                "allocate_lens",
+            ):
+                assert getattr(next_draft_input, field, None) is not None, (
+                    "incomplete spec draft state: "
+                    f"{field} is None; Phase A scheduler state must not be "
+                    "written back as cross-round draft state"
+                )
+
+        per_rank_spec = ScheduleBatch._split_spec_info_per_rank(
+            next_draft_input, model_worker_batch.real_bs_per_dp
+        )
+        for r, s in enumerate(per_rank_spec):
+            batch.reqs_info[r].spec_info = s
+
     def run_batch(self, batch: ScheduleBatch) -> GenerationBatchResult:
         """Run a batch."""
         self.forward_ct += 1
@@ -1915,26 +1970,54 @@ class Scheduler(
                     self.server_args.enable_static_lora,
                     draft_token_num=self.draft_worker.speculative_num_draft_tokens,
                 )
-            batch_output = self.draft_worker.forward_batch_speculative_generation(
-                model_worker_batch
+            use_split_verify_phase = (
+                batch.forward_mode.is_decode()
+                and getattr(self.draft_worker, "_can_use_fused_spec_decode", False)
+                and self.draft_worker._has_fused_greedy_draft_state(model_worker_batch)
+                and model_worker_batch.sampling_info.is_all_greedy
             )
-            per_rank_spec = ScheduleBatch._split_spec_info_per_rank(
-                batch_output.next_draft_input, model_worker_batch.real_bs_per_dp
-            )
-            for r, s in enumerate(per_rank_spec):
-                batch.reqs_info[r].spec_info = s
-            accept = batch_output.accept_lens
-            if accept is not None:
-                accept = np.asarray(jax.device_get(accept))
-            per_dp_bs = model_worker_batch.per_dp_bs_size
-            for dp_rank, info in enumerate(batch.reqs_info):
-                if info.seq_lens is None or len(info.seq_lens) == 0:
-                    continue
-                if accept is not None:
-                    off = dp_rank * per_dp_bs
-                    info.seq_lens = info.seq_lens + accept[off : off + len(info.seq_lens)]
-                else:
-                    info.seq_lens = info.seq_lens + 1
+            if use_split_verify_phase:
+                from sgl_jax.srt.speculative.draft_extend_fused import (
+                    _convert_split_phase_to_generation_result,
+                )
+
+                verify_result = self.draft_worker.forward_batch_speculative_verify_phase(
+                    model_worker_batch
+                )
+                self._publish_spec_verify_phase_lengths_to_batch(
+                    batch,
+                    model_worker_batch,
+                    verify_result,
+                )
+                draft_extend_result = (
+                    self.draft_worker.forward_batch_speculative_draft_extend_phase(
+                        model_worker_batch,
+                        verify_result,
+                    )
+                )
+                batch_output = _convert_split_phase_to_generation_result(
+                    verify_result,
+                    draft_extend_result,
+                )
+                self._write_back_spec_draft_state_to_batch(
+                    batch,
+                    model_worker_batch,
+                    batch_output.next_draft_input,
+                )
+            else:
+                batch_output = self.draft_worker.forward_batch_speculative_generation(
+                    model_worker_batch
+                )
+                self._publish_spec_verify_phase_lengths_to_batch(
+                    batch,
+                    model_worker_batch,
+                    batch_output,
+                )
+                self._write_back_spec_draft_state_to_batch(
+                    batch,
+                    model_worker_batch,
+                    batch_output.next_draft_input,
+                )
             next_token_ids = np.asarray(jax.device_get(batch_output.next_token_ids))
             self._extract_dp_output_ids(next_token_ids, model_worker_batch, batch)
             logits_output = batch_output.logits_output

@@ -103,6 +103,14 @@ class BaseSpecWorker:
 
     # -- Main entry point --
 
+    def _has_fused_greedy_draft_state(self, model_worker_batch: ModelWorkerBatch) -> bool:
+        spec_info = model_worker_batch.spec_info_padded
+        return (
+            spec_info is not None
+            and getattr(spec_info, "topk_index", None) is not None
+            and getattr(spec_info, "verified_id", None) is not None
+        )
+
     def forward_batch_speculative_verify_phase(self, model_worker_batch: ModelWorkerBatch):
         """Run greedy fused spec verify/sample and return scheduler-visible phase A."""
         sel = model_worker_batch.logits_indices_selector
@@ -165,7 +173,11 @@ class BaseSpecWorker:
         # to global-flat (real_bs,) so reqs_info[0].spec_info stays flat-ordered.
         sel = model_worker_batch.logits_indices_selector
         cur_allocate_lens = np.asarray(model_worker_batch.spec_info_padded.allocate_lens)[sel]
-        if self._can_use_fused_spec_decode and model_worker_batch.sampling_info.is_all_greedy:
+        if (
+            self._can_use_fused_spec_decode
+            and model_worker_batch.sampling_info.is_all_greedy
+            and self._has_fused_greedy_draft_state(model_worker_batch)
+        ):
             # Current fused route covers greedy NEXTN decode; more speculative
             # decode paths can be folded into this entry point over time.
             from sgl_jax.srt.speculative.draft_extend_fused import spec_decode

@@ -2205,6 +2205,7 @@ class ScheduleBatch:
             hidden_states=_scatter1(flat.hidden_states),
             verified_id=_scatter1(flat.verified_id),
             allocate_lens=_scatter1(flat.allocate_lens),
+            new_seq_lens=_scatter1(flat.new_seq_lens),
             capture_hidden_mode=flat.capture_hidden_mode,
             accept_length=flat.accept_length,
             accept_length_cpu=flat.accept_length_cpu,
@@ -2229,6 +2230,7 @@ class ScheduleBatch:
             "hidden_states",
             "verified_id",
             "allocate_lens",
+            "new_seq_lens",
             "accept_length",
             "accept_length_cpu",
         )
@@ -2265,6 +2267,7 @@ class ScheduleBatch:
             "hidden_states",
             "verified_id",
             "allocate_lens",
+            "new_seq_lens",
             "accept_length",
             "accept_length_cpu",
         )
