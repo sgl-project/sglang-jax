@@ -234,6 +234,12 @@ class ModelWorker:
             has_recurrent_state=self.model_runner.linear_recurrent_config is not None,
         )
 
+        # Allocate the persistent cache_loc host buffer once (reused every step
+        # by ScheduleBatch._merge_cache_loc), sized to the largest cache_loc bucket.
+        self.model_runner.req_to_token_pool.init_cache_loc_host_buffer(
+            self.compilation_manager.cache_loc_buckets[-1]
+        )
+
         self.parent_process = psutil.Process().parent()
         self.sync_queue = Queue()
         self.sync_expert_ids_d2h_thread = threading.Thread(
