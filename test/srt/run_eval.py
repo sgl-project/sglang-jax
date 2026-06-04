@@ -10,6 +10,38 @@ import time
 
 from eval.simple_eval_common import ChatCompletionSampler, make_report, set_ulimit
 
+# Sampling params the SGLang server accepts but the OpenAI chat-completion API
+# does not expose as native kwargs. They ride in `extra_body`, which the OpenAI
+# client merges into the request body so the server reads them at the JSON top
+# level. Keeping the OpenAI-vs-SGLang split here (rather than inside the sampler)
+# means callers forward a flat generation config and routing lives in one place.
+SGLANG_EXTRA_SAMPLING_PARAMS = (
+    "top_k",
+    "min_p",
+    "presence_penalty",
+    "repetition_penalty",
+    "frequency_penalty",
+    "seed",
+)
+
+
+def build_extra_body(args) -> dict | None:
+    """Assemble the OpenAI ``extra_body`` from a flat generation config.
+
+    Collects the SGLang-only sampling params plus ``chat_template_kwargs``
+    (e.g. thinking-mode toggles). Returns ``None`` when nothing is set so the
+    sampler omits ``extra_body`` entirely.
+    """
+    extra_body: dict = {}
+    chat_template_kwargs = getattr(args, "chat_template_kwargs", None)
+    if chat_template_kwargs:
+        extra_body["chat_template_kwargs"] = chat_template_kwargs
+    for name in SGLANG_EXTRA_SAMPLING_PARAMS:
+        value = getattr(args, name, None)
+        if value is not None:
+            extra_body[name] = value
+    return extra_body or None
+
 
 def run_eval(args):
     set_ulimit()
@@ -86,8 +118,7 @@ def run_eval(args):
         max_tokens = 2048
 
     top_p = getattr(args, "top_p", None)
-    chat_template_kwargs = getattr(args, "chat_template_kwargs", None)
-    extra_body = {"chat_template_kwargs": chat_template_kwargs} if chat_template_kwargs else None
+    extra_body = build_extra_body(args)
 
     sampler = ChatCompletionSampler(
         model=args.model,
@@ -148,6 +179,12 @@ if __name__ == "__main__":
     parser.add_argument("--num-threads", type=int, default=512)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--max-tokens", type=int, default=2048)
+    parser.add_argument("--top-k", type=int, default=None)
+    parser.add_argument("--min-p", type=float, default=None)
+    parser.add_argument("--presence-penalty", type=float, default=None)
+    parser.add_argument("--repetition-penalty", type=float, default=None)
+    parser.add_argument("--frequency-penalty", type=float, default=None)
+    parser.add_argument("--seed", type=int, default=None)
     args = parser.parse_args()
 
     run_eval(args)

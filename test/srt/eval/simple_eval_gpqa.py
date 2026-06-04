@@ -19,6 +19,7 @@ from eval.simple_eval_common import (
     SamplerBase,
     SingleEvalResult,
     format_multichoice_question,
+    strip_reasoning,
 )
 
 
@@ -66,7 +67,7 @@ class GPQAEval(Eval):
                 )
             ]
             response_text = sampler(prompt_messages)
-            match = re.search(ANSWER_PATTERN_MULTICHOICE, response_text)
+            match = re.search(ANSWER_PATTERN_MULTICHOICE, strip_reasoning(response_text))
             extracted_answer = match.group(1) if match else None
             score = 1.0 if extracted_answer == correct_answer else 0.0
             html = common.jinja_env.from_string(HTML_JINJA).render(

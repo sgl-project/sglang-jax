@@ -30,7 +30,11 @@ def run_accuracy_case(case: AccuracyCase, profile: LaunchProfile) -> None:
         f"name={case.name}, dataset={case.dataset}, "
         f"num_threads={case.eval_batch_size}, "
         f"temperature={gen.get('temperature', 0.0)}, max_tokens={gen.get('max_tokens', 2048)}, "
-        f"top_p={gen.get('top_p')}, chat_template_kwargs={gen.get('chat_template_kwargs')}, "
+        f"top_p={gen.get('top_p')}, top_k={gen.get('top_k')}, min_p={gen.get('min_p')}, "
+        f"presence_penalty={gen.get('presence_penalty')}, "
+        f"repetition_penalty={gen.get('repetition_penalty')}, "
+        f"frequency_penalty={gen.get('frequency_penalty')}, seed={gen.get('seed')}, "
+        f"chat_template_kwargs={gen.get('chat_template_kwargs')}, "
         f"limit={case.limit}",
         flush=True,
     )

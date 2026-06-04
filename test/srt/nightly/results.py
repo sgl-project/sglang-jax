@@ -137,6 +137,10 @@ def run_eval_for_case(case: AccuracyCase, base_url: str):
     from run_eval import run_eval
 
     gen = case.generation_config or {}
+    # Forward the full sampler config. run_eval routes the SGLang-only params
+    # (SGLANG_EXTRA_SAMPLING_PARAMS) into extra_body; cherry-picking a subset
+    # here would let a case set e.g. top_k in generation_config, record it in
+    # the summary, yet silently drop it before it reaches the sampler.
     args = SimpleNamespace(
         base_url=base_url,
         host=None,
@@ -148,6 +152,12 @@ def run_eval_for_case(case: AccuracyCase, base_url: str):
         temperature=gen.get("temperature", 0.0),
         max_tokens=gen.get("max_tokens", 2048),
         top_p=gen.get("top_p"),
+        top_k=gen.get("top_k"),
+        min_p=gen.get("min_p"),
+        presence_penalty=gen.get("presence_penalty"),
+        repetition_penalty=gen.get("repetition_penalty"),
+        frequency_penalty=gen.get("frequency_penalty"),
+        seed=gen.get("seed"),
         chat_template_kwargs=gen.get("chat_template_kwargs"),
     )
     started_at = time.time()
