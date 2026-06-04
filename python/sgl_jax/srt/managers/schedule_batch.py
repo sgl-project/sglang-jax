@@ -1695,6 +1695,14 @@ class ScheduleBatch:
                 # Copy everything from other_info
                 self_info.reqs = other_info.reqs.copy()
                 self_info.sampling_info = other_info.sampling_info
+                # reqs_info is a weakref (orchestrator.py) still pointing at the
+                # transient other_info; rebind to the surviving self_info so
+                # reqs() stays live, else penalizers desync -> IndexError crash.
+                if (
+                    self_info.sampling_info is not None
+                    and self_info.sampling_info.penalizer_orchestrator is not None
+                ):
+                    self_info.sampling_info.penalizer_orchestrator.reqs_info = self_info
                 self_info.req_pool_indices = other_info.req_pool_indices
                 self_info.seq_lens = other_info.seq_lens
                 self_info.out_cache_loc = other_info.out_cache_loc
