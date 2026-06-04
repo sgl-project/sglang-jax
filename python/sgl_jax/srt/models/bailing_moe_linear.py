@@ -1092,7 +1092,10 @@ class BailingMoeV2_5ForCausalLM(nnx.Module):
                         "weight_block_size",
                         None,
                     )
-                    is_per_channel = _wbs is None
+                    # Per-channel layout ([E,1,1,out]) only for the v2 kernel;
+                    # the v1 kernel needs scales tiled to block-256
+                    # ([E, K//256, 1, out]), so keep block layout for v1.
+                    is_per_channel = _wbs is None and moe_backend == "fused_v2"
                     num_blocks = 1 if is_per_channel else in_dim // BLOCK_SIZE
                     # Mirror the fused weight sharding (("data", "tensor"), ...)
                     # promoted to 4D for the [E, K_blocks, 1, out_dim] scale.

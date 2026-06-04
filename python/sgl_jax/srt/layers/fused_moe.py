@@ -213,8 +213,14 @@ class FusedEPMoE(nnx.Module):
         if self.quantized_dtype is None:
             return
 
-        # Determine quant_block_k: None → per-channel, else block-wise.
-        wsz = self.quant_block_k if self.quant_block_k is not None else None
+        # Determine quant_block_k. The v1 kernel requires a block size when
+        # scales are provided, so per-channel fp8 must tile to block-256; the v2
+        # kernel accepts per-channel (None).
+        wsz = (
+            self.quant_block_k
+            if self.quant_block_k is not None
+            else (None if isinstance(self, FusedEPMoEV2) else 256)
+        )
         if hasattr(self, "quant_block_k"):
             del self.quant_block_k
         self.quant_block_k = wsz
