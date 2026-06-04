@@ -1998,16 +1998,24 @@ def ragged_paged_attention(
 
     def _prepare_block_sizes(block_sizes, case):
         if block_sizes is None:
-            tuned = get_tuned_block_sizes_v3(
-                case.symbol,
-                q.dtype,
-                kv_cache_fused_processed.dtype,
-                actual_num_q_heads,
-                actual_num_kv_heads,
-                head_dim,
-                page_size,
-                max_num_tokens,
-                sliding_window=sliding_window,
+            # The tuned table is measured on v7 (full VMEM). Restrict lookups to
+            # v7 so v6e/v5 keep main's heuristic path unchanged (the v7-tuned
+            # entries are not valid for the v6e //2 budget and regress its
+            # perf guard). v6e/v5 tuning can be added later under their own keys.
+            tuned = (
+                get_tuned_block_sizes_v3(
+                    case.symbol,
+                    q.dtype,
+                    kv_cache_fused_processed.dtype,
+                    actual_num_q_heads,
+                    actual_num_kv_heads,
+                    head_dim,
+                    page_size,
+                    max_num_tokens,
+                    sliding_window=sliding_window,
+                )
+                if tpu_version == 7
+                else None
             )
             if tuned is not None:
                 block_sizes = tuned
