@@ -1612,13 +1612,14 @@ def get_default_block_sizes(
 
 def get_vmem_limit():
     try:
-        # Use full VMEM capacity. A Pallas custom call does not run concurrently
-        # with other XLA HLO ops on the same core, so the Pallas vmem budget and
-        # the surrounding scoped_vmem budget do not sum. Capping at half only
-        # shrank the candidate space and forced XLA MSA "conflicting pending
-        # required assignment" CHECK-failures on some (decode, hd256, bkv=256)
-        # layouts. The tuned block-size table is measured against this budget.
-        vmem_limit_bytes = pltpu.get_tpu_info().vmem_capacity_bytes
+        cap = pltpu.get_tpu_info().vmem_capacity_bytes
+        # Device-dependent budget. On v7 the full VMEM capacity is fastest and is
+        # required to compile some (decode, hd256, bkv>=256) layouts without an XLA
+        # MSA "conflicting pending required assignment" CHECK-failure; the tuned
+        # table's v7 entries are measured against it. On v6e/v5 the Mosaic
+        # scheduler emits faster code with the conservative half budget (full
+        # regresses e.g. mixed hd128 num_tokens=4096 by ~68%), so keep upstream //2.
+        vmem_limit_bytes = cap if get_tpu_version() == 7 else cap // 2
     except Exception:
         vmem_limit_bytes = DEFAULT_VMEM_LIMIT_BYTES
     return vmem_limit_bytes

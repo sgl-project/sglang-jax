@@ -18,6 +18,9 @@ from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention_v3 import
     get_vmem_limit,
     ragged_paged_attention,
 )
+from sgl_jax.srt.kernels.ragged_paged_attention.tuned_block_sizes_v3 import (
+    get_tuned_block_sizes_v3,
+)
 from sgl_jax.srt.kernels.utils.perf import multiple_iteration_timeit_from_trace
 from sgl_jax.srt.utils.jax_utils import get_device_name
 from sgl_jax.test.test_utils import CustomTestCase, is_in_ci
@@ -124,7 +127,12 @@ def benchmark_backend(
     max_num_seqs = kv_lens.shape[0]
     pages_per_seq = page_indices.shape[0] // max_num_seqs
     rpa_case = RpaCase.DECODE if mode == "decode" else RpaCase.MIXED
-    block_sizes = get_default_block_sizes(
+    # Match the production block-selection path: prefer the tuned table (what the
+    # kernel actually uses via block_sizes=None), fall back to the heuristic on a
+    # miss. The kernel run below uses None -> tuned lookup, so building the trace
+    # scope_name from the same tuned config keeps the label aligned with the op.
+    tuned = get_tuned_block_sizes_v3(
+        rpa_case.symbol,
         q.dtype,
         k.dtype,
         q_head_num,
@@ -132,12 +140,31 @@ def benchmark_backend(
         head_dim,
         page_size,
         max_num_batched_tokens,
-        max_num_seqs,
-        pages_per_seq,
-        case=rpa_case,
-        vmem_limit_bytes=get_vmem_limit(),
         sliding_window=sliding_window,
     )
+    if tuned is not None:
+        bq_sz, bkv_sz, bq_csz, bkv_csz = tuned
+        block_sizes = {
+            "bq_sz": bq_sz,
+            "bkv_sz": bkv_sz,
+            "bq_csz": bq_csz,
+            "bkv_csz": bkv_csz,
+        }
+    else:
+        block_sizes = get_default_block_sizes(
+            q.dtype,
+            k.dtype,
+            q_head_num,
+            kv_head_num,
+            head_dim,
+            page_size,
+            max_num_batched_tokens,
+            max_num_seqs,
+            pages_per_seq,
+            case=rpa_case,
+            vmem_limit_bytes=get_vmem_limit(),
+            sliding_window=sliding_window,
+        )
     attn = functools.partial(
         jitted_attn,
         q,
