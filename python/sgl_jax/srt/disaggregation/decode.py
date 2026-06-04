@@ -63,6 +63,16 @@ class DecodePreallocQueue:
             self._entries.clear()
             return out
 
+    def abort_matching(
+        self, rid_prefix: str, abort_all: bool
+    ) -> list[DecodeBookkeeping]:
+        out: list[DecodeBookkeeping] = []
+        with self._lock:
+            for rid in list(self._entries):
+                if abort_all or rid.startswith(rid_prefix):
+                    out.append(self._entries.pop(rid))
+        return out
+
 
 class DecodeTransferQueue:
     """Receivers in TRANSFERRING; polled each tick."""
@@ -103,6 +113,16 @@ class DecodeTransferQueue:
                 rid: e.receiver.poll() if e.receiver else KVPoll.BOOTSTRAPPING
                 for rid, e in self._entries.items()
             }
+
+    def abort_matching(
+        self, rid_prefix: str, abort_all: bool
+    ) -> list[DecodeBookkeeping]:
+        out: list[DecodeBookkeeping] = []
+        with self._lock:
+            for rid in list(self._entries):
+                if abort_all or rid.startswith(rid_prefix):
+                    out.append(self._entries.pop(rid))
+        return out
 
 
 class SchedulerDisaggregationDecodeMixin:
@@ -184,7 +204,7 @@ class SchedulerDisaggregationDecodeMixin:
                     ).inc()
                 except Exception:  # noqa: BLE001
                     pass
-                self._release_decode_req_resources(req)
+                self._abort_decode_request(req, "bootstrap_lookup")
                 continue
 
             kv_indices = None
@@ -224,7 +244,7 @@ class SchedulerDisaggregationDecodeMixin:
                 # Release any slots we allocated before the failure.
                 if kv_indices is not None:
                     self._release_decode_kv_indices(kv_indices)
-                self._release_decode_req_resources(req)
+                self._abort_decode_request(req, "receiver_init")
                 continue
 
             entry = DecodeBookkeeping(
@@ -291,7 +311,7 @@ class SchedulerDisaggregationDecodeMixin:
                     )
                     if entry.kv_indices is not None:
                         self._release_decode_kv_indices(entry.kv_indices)
-                    self._release_decode_req_resources(entry.req)
+                    self._abort_decode_request(entry.req, "kv_writeback")
             else:
                 logger.warning(
                     "KVReceiver for req_id=%s reached %s; releasing "
@@ -310,7 +330,7 @@ class SchedulerDisaggregationDecodeMixin:
                     pass
                 if entry.kv_indices is not None:
                     self._release_decode_kv_indices(entry.kv_indices)
-                self._release_decode_req_resources(entry.req)
+                self._abort_decode_request(entry.req, "receiver_terminal_failed")
 
     # ------------------------------------------------------------------
     # Overridable / test-friendly hooks
@@ -484,6 +504,24 @@ class SchedulerDisaggregationDecodeMixin:
                         "req_id=%s",
                         req_pool_idx, req.rid,
                     )
+
+    def _abort_decode_request(self, req: Req, reason: str) -> None:
+        """Release resources AND send AbortReq back to tokenizer."""
+
+        self._release_decode_req_resources(req)
+        try:
+            from sgl_jax.srt.managers.io_struct import AbortReq
+
+            abort_out = AbortReq(rid=req.rid)
+            if self._comm_backend is not None:  # type: ignore[attr-defined]
+                self._comm_backend.send_pyobj(abort_out)  # type: ignore[attr-defined]
+            else:
+                self.send_to_tokenizer.send_pyobj(abort_out)  # type: ignore[attr-defined]
+        except Exception:
+            logger.exception(
+                "failed to send AbortReq for req_id=%s (reason=%s)",
+                req.rid, reason,
+            )
 
     def _maybe_log_decode_pull_debug(self, req: Req, kv) -> None:
         from sgl_jax.srt.disaggregation.debug_utils import (

@@ -133,11 +133,11 @@ def test_ttl_evicts_stale_entries():
         bootstrap_key="p0", host="10.0.0.1",
         transfer_port=30001, side_channel_port=9600,
     ))
-    assert len(registry.list()) == 1
+    assert len(registry.list_all()) == 1
 
     # Advance past TTL.
     clock.t += 31.0
-    assert registry.list() == []
+    assert registry.list_all() == []
     assert registry.pick_for_room(0) is None
 
 
@@ -153,7 +153,7 @@ def test_heartbeat_refreshes_ttl():
     clock.t += 25.0
     # Without heartbeat we'd be at 50s; with the refresh we're at 25s
     # since last_seen, still under 30s.
-    assert len(registry.list()) == 1
+    assert len(registry.list_all()) == 1
 
 
 def test_concurrent_register_list():
@@ -176,7 +176,7 @@ def test_concurrent_register_list():
     def do_list():
         barrier.wait()
         try:
-            registry.list()
+            registry.list_all()
         except BaseException as e:
             errors.append(e)
 
@@ -189,7 +189,7 @@ def test_concurrent_register_list():
     for t in threads:
         t.join()
     assert errors == []
-    assert len(registry.list()) == 50
+    assert len(registry.list_all()) == 50
 
 
 def test_heartbeat_daemon_keeps_registration_alive(server_and_client):
@@ -305,5 +305,5 @@ def test_registry_stores_protocol_version():
             protocol_version=PROTOCOL_VERSION,
         )
     )
-    rows = reg.list()
+    rows = reg.list_all()
     assert rows[0].protocol_version == PROTOCOL_VERSION

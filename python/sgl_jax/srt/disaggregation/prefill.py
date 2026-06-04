@@ -102,6 +102,16 @@ class PrefillBootstrapQueue:
                 for rid, entry in self._entries.items()
             }
 
+    def abort_matching(
+        self, rid_prefix: str, abort_all: bool
+    ) -> list[PrefillBookkeeping]:
+        out: list[PrefillBookkeeping] = []
+        with self._lock:
+            for req_id in list(self._entries):
+                if abort_all or req_id.startswith(rid_prefix):
+                    out.append(self._entries.pop(req_id))
+        return out
+
 
 class SchedulerDisaggregationPrefillMixin:
     """Mixin for PD prefill mode on Scheduler."""
@@ -167,24 +177,66 @@ class SchedulerDisaggregationPrefillMixin:
                     "failed to extract KV for req_id=%s; skipping send",
                     req_id,
                 )
+                try:
+                    from sgl_jax.srt.disaggregation.common.metrics import (
+                        PD_TRANSFER_FAILURES_TOTAL,
+                    )
+
+                    PD_TRANSFER_FAILURES_TOTAL.labels(
+                        reason="kv_extraction", role="prefill"
+                    ).inc()
+                except Exception:  # noqa: BLE001
+                    pass
                 continue
-            self._maybe_log_prefill_extract_debug(
-                req,
-                device_kv,
-                use_d2h_staging=self.disagg_use_d2h_staging,
-            )
-            sender = self.disagg_kv_manager.create_sender(req_id)
-            sender.init(
-                kv_indices=None,
-                transfer_id=(
-                    getattr(req, "disagg_transfer_id", None) or req_id
-                ),
-            )
-            sender.attach_payload(
-                {"kv": device_kv},
-                use_d2h_staging=self.disagg_use_d2h_staging,
-            )
-            sender.send()
+            try:
+                self._maybe_log_prefill_extract_debug(
+                    req,
+                    device_kv,
+                    use_d2h_staging=self.disagg_use_d2h_staging,
+                )
+                sender = self.disagg_kv_manager.create_sender(req_id)
+                sender.init(
+                    kv_indices=None,
+                    transfer_id=(
+                        getattr(req, "disagg_transfer_id", None) or req_id
+                    ),
+                )
+                sender.attach_payload(
+                    {"kv": device_kv},
+                    use_d2h_staging=self.disagg_use_d2h_staging,
+                )
+                sender.send()
+            except Exception as exc:
+                logger.exception(
+                    "sender init/send failed for req_id=%s; aborting",
+                    req_id,
+                )
+                try:
+                    from sgl_jax.srt.disaggregation.common.metrics import (
+                        PD_TRANSFER_FAILURES_TOTAL,
+                    )
+
+                    PD_TRANSFER_FAILURES_TOTAL.labels(
+                        reason="sender_init", role="prefill"
+                    ).inc()
+                except Exception:  # noqa: BLE001
+                    pass
+                from sgl_jax.srt.managers.schedule_batch import FINISH_ABORT
+
+                req.finished_reason = FINISH_ABORT(
+                    f"Prefill sender failed for req_id={req_id!r}: {exc}",
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    "PDTransferError",
+                )
+                req.output_ids = []
+                if hasattr(self, "stream_output"):
+                    self.stream_output(  # type: ignore[attr-defined]
+                        [req],
+                        getattr(req, "return_logprob", False),
+                        getattr(req, "return_output_logprob_only", False),
+                    )
+                self._release_prefill_req_resources(req)
+                continue
 
             def _on_terminal(req_obj=req, sender_obj=sender):
                 self._on_prefill_transfer_terminal(req_obj, sender_obj)
