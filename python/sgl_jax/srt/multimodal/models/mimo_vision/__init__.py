@@ -7,12 +7,11 @@ from sgl_jax.srt.multimodal.models.mimo_vision.vision_encoder import (
     MiMoVisionSwiGLUMLP,
     MiMoVisionTransformer,
     convert_torch_conv3d_kernel_to_jax,
+    create_mimo_vision_weight_mappings,
+    load_weights_from_safetensors,
     mimo_vision_apply_index,
     mimo_vision_get_window_index_1d,
     mimo_vision_rot_pos_emb,
-)
-from sgl_jax.srt.multimodal.models.mimo_vision.weights_mapping import (
-    load_weights_from_safetensors,
     to_mappings,
 )
 
@@ -24,10 +23,11 @@ __all__ = [
     "MiMoVisionRotaryEmbedding",
     "MiMoVisionSwiGLUMLP",
     "MiMoVisionTransformer",
+    "create_mimo_vision_weight_mappings",
     "convert_torch_conv3d_kernel_to_jax",
+    "load_weights_from_safetensors",
     "mimo_vision_apply_index",
     "mimo_vision_get_window_index_1d",
     "mimo_vision_rot_pos_emb",
-    "load_weights_from_safetensors",
     "to_mappings",
 ]
