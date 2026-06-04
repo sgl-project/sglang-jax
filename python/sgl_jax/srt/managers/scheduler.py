@@ -2193,9 +2193,6 @@ def run_scheduler_process(
     # Create a scheduler and run the event loop
     try:
         scheduler = Scheduler(server_args, port_args)
-        # PD disaggregation wiring. Engine entry installs
-        # the manager / notifier / queues based on
-        # ServerArgs.disaggregation_mode.
         _install_disaggregation_wiring(scheduler, server_args)
         pipe_writer.send(
             {

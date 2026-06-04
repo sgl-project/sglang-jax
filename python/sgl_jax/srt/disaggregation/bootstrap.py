@@ -7,8 +7,8 @@ keyed by ``bootstrap_room``) which prefill peer holds the KV for that
 request.
 
 This is the lightest viable rendezvous — single process, no
-replication, no auth. Production hardening (graceful shutdown,
-authentication, replication) is out of scope.
+replication, optional shared-secret auth. Production hardening
+(graceful shutdown, replication) is out of scope.
 """
 
 from __future__ import annotations
