@@ -31,6 +31,9 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from sgl_jax.srt.kernels.ragged_paged_attention.tuned_block_sizes_v3 import (
+    get_tuned_block_sizes_v3,
+)
 from sgl_jax.srt.kernels.ragged_paged_attention.util import (
     align_to,
     cdiv,
@@ -1049,7 +1052,10 @@ def _ragged_paged_attention_kernel_loop(
 
                                 lm_slice_start = bq_start * num_q_heads_per_kv_head
                                 lm_slice_size = actual_bq_csz * num_q_heads_per_kv_head
-                                lm_slice = (kv_head_idx, pl.ds(lm_slice_start, lm_slice_size))
+                                lm_slice = (
+                                    kv_head_idx,
+                                    pl.ds(lm_slice_start, lm_slice_size),
+                                )
 
                                 cur_p, cur_v, cur_exp_m_diff = flash_attention_step1_qk_softmax(
                                     bq_c,
@@ -1216,7 +1222,8 @@ def prepare_inputs(
         sink = sink.reshape(actual_num_kv_heads, actual_num_q_heads_per_kv_head)
         if num_q_heads_per_kv_head > actual_num_q_heads_per_kv_head:
             sink = jnp.pad(
-                sink, ((0, 0), (0, num_q_heads_per_kv_head - actual_num_q_heads_per_kv_head))
+                sink,
+                ((0, 0), (0, num_q_heads_per_kv_head - actual_num_q_heads_per_kv_head)),
             )
         attention_sink = sink.reshape(actual_num_kv_heads, num_q_heads_per_kv_head, 1)
         attention_sink = jnp.repeat(attention_sink, 128, axis=-1)
@@ -1831,7 +1838,10 @@ def ragged_paged_attention(
             q.dtype,
         )
 
-        bo_double_buf = bq_double_buf
+        bo_double_buf = pltpu.VMEM(
+            (2, actual_num_kv_heads, bq_sz, *q.shape[2:]),
+            q.dtype,
+        )
 
         if use_causal_mask:
             bkvmask_double_buf = None
@@ -1845,7 +1855,10 @@ def ragged_paged_attention(
             (actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128),
             out_dtype,
         )
-        m_scratch = l_scratch
+        m_scratch = pltpu.VMEM(
+            (actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128),
+            out_dtype,
+        )
 
         acc_scratch = pltpu.VMEM(
             (actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, head_dim),
@@ -1970,7 +1983,8 @@ def ragged_paged_attention(
 
     def _prepare_block_sizes(block_sizes, case):
         if block_sizes is None:
-            return get_default_block_sizes(
+            tuned = get_tuned_block_sizes_v3(
+                case.symbol,
                 q.dtype,
                 kv_cache_fused_processed.dtype,
                 actual_num_q_heads,
@@ -1978,13 +1992,26 @@ def ragged_paged_attention(
                 head_dim,
                 page_size,
                 max_num_tokens,
-                max_num_seqs,
-                pages_per_seq,
-                case=case,
-                vmem_limit_bytes=vmem_limit_bytes,
-                use_custom_mask=not use_causal_mask,
                 sliding_window=sliding_window,
             )
+            if tuned is not None:
+                block_sizes = tuned
+            else:
+                return get_default_block_sizes(
+                    q.dtype,
+                    kv_cache_fused_processed.dtype,
+                    actual_num_q_heads,
+                    actual_num_kv_heads,
+                    head_dim,
+                    page_size,
+                    max_num_tokens,
+                    max_num_seqs,
+                    pages_per_seq,
+                    case=case,
+                    vmem_limit_bytes=vmem_limit_bytes,
+                    use_custom_mask=not use_causal_mask,
+                    sliding_window=sliding_window,
+                )
 
         return {
             "bq_sz": block_sizes[0],
