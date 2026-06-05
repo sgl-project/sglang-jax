@@ -24,6 +24,14 @@ from sgl_jax.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
 
+PHASE_B_DEVICE_RELAY_FIELDS = (
+    "topk_index",
+    "topk_p",
+    "verified_id",
+    "hidden_states",
+    "previous_token_list",
+)
+
 
 class ModelWorkerClient:
     """A tensor parallel model worker."""
@@ -568,19 +576,10 @@ class ModelWorkerClient:
 
         candidate_spec_info = candidate_batch.spec_info_padded
         prepared_launch = getattr(candidate_batch, "prepared_fused_greedy_verify_launch", None)
-        for field in (
-            "topk_index",
-            "topk_p",
-            "verified_id",
-            "hidden_states",
-            "previous_token_list",
-        ):
+        for field in PHASE_B_DEVICE_RELAY_FIELDS:
             value = getattr(padded_next_draft_input, field, None)
             if value is not None:
                 setattr(candidate_spec_info, field, value)
-        new_seq_lens = getattr(padded_next_draft_input, "new_seq_lens", None)
-        if new_seq_lens is not None:
-            candidate_spec_info.new_seq_lens = new_seq_lens
 
         if prepared_launch is not None:
             previous_verified_id = getattr(padded_next_draft_input, "verified_id", None)

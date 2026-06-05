@@ -243,3 +243,26 @@ def test_prebuilt_candidate_keeps_prepared_verify_launch_payload():
     candidate = SimpleNamespace(prepared_fused_greedy_verify_launch=payload)
 
     assert candidate.prepared_fused_greedy_verify_launch is payload
+
+
+def test_phase_b_relay_patches_only_device_dependent_fields():
+    relayed = EagleDraftInput(
+        topk_index=np.array([[[1]], [[2]]], dtype=np.int32),
+        topk_p=np.ones((2, 1, 1), dtype=np.float32),
+        hidden_states=np.ones((2, 4), dtype=np.float32),
+        verified_id=np.array([7, 8], dtype=np.int32),
+        new_seq_lens=np.array([100, 200], dtype=np.int32),
+        allocate_lens=np.array([300, 400], dtype=np.int32),
+    )
+    relayed.previous_token_list = np.array([[1], [2]], dtype=np.int32)
+    candidate_spec = EagleDraftInput(
+        new_seq_lens=np.array([10, 20], dtype=np.int32),
+        allocate_lens=np.array([30, 40], dtype=np.int32),
+    )
+
+    for field in ("topk_index", "topk_p", "verified_id", "hidden_states", "previous_token_list"):
+        setattr(candidate_spec, field, getattr(relayed, field))
+
+    np.testing.assert_array_equal(candidate_spec.new_seq_lens, np.array([10, 20], dtype=np.int32))
+    np.testing.assert_array_equal(candidate_spec.allocate_lens, np.array([30, 40], dtype=np.int32))
+    np.testing.assert_array_equal(candidate_spec.verified_id, np.array([7, 8], dtype=np.int32))
