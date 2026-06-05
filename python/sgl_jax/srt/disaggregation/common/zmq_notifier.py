@@ -1,26 +1,4 @@
-"""D→P pull-done side channel.
-
-Decouples the prefill side from blocking on transfer completion. The
-sender waits for an explicit ack from the decoder before transitioning to
-``SUCCESS``. The transport is ZMQ ``DEALER → ROUTER`` carrying
-``msgpack({"uuid": bytes})``.
-
-Threading model:
-  * P side: ROUTER socket bound in :meth:`start`. A daemon listener
-    thread recv-loops, parses each frame, looks up the callback under
-    a lock, and invokes it. ``register_callback`` from the main thread
-    and ``pop`` from the listener thread share ``_callbacks`` under the
-    same lock — the read-then-decide-then-pop sequence on the listener
-    side is atomic.
-  * D side: A fresh DEALER socket per ``send_done`` call (no pool, no
-    persistent connection). The send is fire-and-forget — if the P
-    side has already torn down or hasn't bound yet, the ack is lost.
-    Recovery from lost acks is intentionally handled by the higher-level
-    timeout and cleanup logic.
-
-Process-wide ZMQ context: ``zmq.Context.instance()``. Tests spinning
-up multiple notifiers on different ports share the context safely.
-"""
+"""D→P pull-done side channel (ZMQ DEALER→ROUTER, msgpack frames)."""
 
 from __future__ import annotations
 

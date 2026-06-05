@@ -1,30 +1,7 @@
 """PD Prometheus metrics.
 
-All metric names follow the RFC schema. If ``prometheus_client`` is
-not installed the module installs no-op stubs so production code can
-emit metrics unconditionally without breaking tests / CPU-only
-environments.
-
-Emit points (see callers):
-  * ``pd_state_transition_total`` — incremented from
-    :py:meth:`StateHolder._transition_to`.
-  * ``pd_transfer_bytes_total`` — incremented from
-    :py:meth:`JaxTransferWrapper.register_pull` (direction="net"
-    register-side; the d2h/h2d directions are populated from
-    :py:meth:`QueueHostKVPool.copy_from_device` and from D's
-    receiver-finalization).
-  * ``pd_transfer_duration_seconds`` — observed at three phases:
-    bootstrap lookup (in the decode Mixin), pull (in the receiver),
-    ack (in the sender's ``_on_ack``).
-  * ``pd_transfer_inflight`` — incremented on
-    :py:meth:`JaxTransferKVManager.create_sender` /
-    ``create_receiver``, decremented when the entry is pruned.
-  * ``pd_host_pool_used_buffers`` — set by
-    :py:meth:`QueueHostKVPool.alloc` / ``free``.
-  * ``pd_transfer_failures_total`` — incremented on terminal FAILED
-    transitions (orphan timeout / pull timeout / peer crash).
-  * ``pd_bootstrap_registry_size`` — set by ``_Registry`` on
-    register / unregister / evict.
+No-op stubs when ``prometheus_client`` is not installed, so callers
+can emit unconditionally.
 """
 
 from __future__ import annotations
@@ -104,12 +81,6 @@ PD_BOOTSTRAP_REGISTRY_SIZE = Gauge(
     "pd_bootstrap_registry_size",
     "Number of P registrations in the bootstrap registry",
 )
-
-
-def is_prometheus_available() -> bool:
-    """True iff the real ``prometheus_client`` lib is installed."""
-
-    return _PROM_AVAILABLE
 
 
 # ---- helpers ----------------------------------------------------------------

@@ -1,21 +1,4 @@
-"""Host IP resolution for PD multi-host deployment.
-
-In multi-host TPU TP a single PD role (P or D) runs as N processes,
-one per host. Each process needs to publish its own host-reachable IP
-to the bootstrap server so the remote pull goes over DCN rather than
-loopback.
-
-Resolution order:
-
-1. ``--disaggregation-host-ip`` (explicit operator override) — used as-is.
-2. ``HOSTNAME`` env var resolved via ``socket.gethostbyname`` — covers
-   GKE in-cluster DNS where each pod's hostname resolves to its
-   per-pod IP.
-3. ``socket.gethostname()`` + ``gethostbyname`` — generic fallback.
-
-Bind/loopback addresses are rejected because they don't round-trip to
-a remote peer. We use :mod:`ipaddress` for the classification.
-"""
+"""Host IP resolution for PD multi-host deployment."""
 
 from __future__ import annotations
 

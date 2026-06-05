@@ -1,9 +1,4 @@
-"""Debug-only KV diagnostics for PD disaggregation.
-
-These helpers are intentionally environment-gated and side-effect free
-so we can turn them on in manual TPU investigations without perturbing
-the steady-state PD path by default.
-"""
+"""Debug-only KV diagnostics for PD disaggregation (env-gated)."""
 
 from __future__ import annotations
 

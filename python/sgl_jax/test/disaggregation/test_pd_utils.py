@@ -1,4 +1,4 @@
-"""Unit tests for :func:`resolve_host_ip` (Stage 3)."""
+"""PD utility tests: host_ip resolution + shared-secret auth."""
 
 from __future__ import annotations
 
@@ -6,8 +6,14 @@ import socket
 from unittest import mock
 
 import pytest
+from fastapi.testclient import TestClient
 
+from sgl_jax.srt.disaggregation import pd_auth
+from sgl_jax.srt.disaggregation.bootstrap import build_app
 from sgl_jax.srt.disaggregation.host_ip import resolve_host_ip
+
+
+# ---- host_ip resolution -----------------------------------------------------
 
 
 def test_explicit_value_is_returned_as_is():
@@ -24,26 +30,19 @@ def test_explicit_value_rejects_bind_addresses():
 
 
 def test_explicit_value_rejects_ipv6_bind_and_loopback():
-    """Stage 3 review I2: cover the IPv6 forms that the string-set
-    implementation missed. ``ipaddress`` catches both compact and
-    long forms uniformly.
-    """
-
     with pytest.raises(RuntimeError, match="loopback"):
         resolve_host_ip("::1")
     with pytest.raises(RuntimeError, match="bind/unspecified"):
         resolve_host_ip("::")
     with pytest.raises(RuntimeError, match="loopback"):
-        resolve_host_ip("0:0:0:0:0:0:0:1")  # long-form IPv6 loopback
+        resolve_host_ip("0:0:0:0:0:0:0:1")
     with pytest.raises(RuntimeError, match="bind/unspecified"):
-        resolve_host_ip("0:0:0:0:0:0:0:0")  # long-form IPv6 unspecified
+        resolve_host_ip("0:0:0:0:0:0:0:0")
     with pytest.raises(RuntimeError, match="loopback"):
-        resolve_host_ip("::ffff:127.0.0.1")  # IPv4-mapped IPv6 loopback
+        resolve_host_ip("::ffff:127.0.0.1")
 
 
 def test_explicit_value_rejects_127_block():
-    """Stage 3 review I3: not just 127.0.0.1 — entire 127.0.0.0/8."""
-
     with pytest.raises(RuntimeError, match="loopback"):
         resolve_host_ip("127.0.0.2")
     with pytest.raises(RuntimeError, match="loopback"):
@@ -103,11 +102,6 @@ def test_raises_when_all_strategies_fail(monkeypatch):
 
 
 def test_resolved_bind_address_is_rejected(monkeypatch):
-    """If a misconfigured DNS round-trips ``hostname`` → ``0.0.0.0``
-    or similar, we reject the resolution rather than silently
-    publishing a useless address.
-    """
-
     monkeypatch.setenv("HOSTNAME", "bad-dns")
     with mock.patch(
         "sgl_jax.srt.disaggregation.host_ip.socket.gethostbyname",
@@ -117,12 +111,115 @@ def test_resolved_bind_address_is_rejected(monkeypatch):
 
 
 def test_dns_name_passes_through():
-    """Non-numeric strings (DNS names) pass through unchanged —
-    they round-trip correctly through ``f"{host}:{port}"`` for any
-    downstream peer that re-resolves them.
-    """
-
     assert (
         resolve_host_ip("pd-host-3.cluster.local")
         == "pd-host-3.cluster.local"
     )
+
+
+# ---- pd_auth: secret resolution + HMAC tags ---------------------------------
+
+
+def test_resolve_secret_env_wins(monkeypatch):
+    monkeypatch.setenv("SGL_JAX_PD_SHARED_SECRET", "from-env")
+    assert pd_auth.resolve_secret("from-args") == "from-env"
+
+
+def test_resolve_secret_falls_back_to_args(monkeypatch):
+    monkeypatch.delenv("SGL_JAX_PD_SHARED_SECRET", raising=False)
+    assert pd_auth.resolve_secret("from-args") == "from-args"
+
+
+def test_resolve_secret_none_when_neither(monkeypatch):
+    monkeypatch.delenv("SGL_JAX_PD_SHARED_SECRET", raising=False)
+    assert pd_auth.resolve_secret(None) is None
+
+
+def test_verify_tag_disabled_accepts_anything():
+    assert pd_auth.verify_tag(None, b"u", None) is True
+    assert pd_auth.verify_tag(None, b"u", b"\x00\x01") is True
+
+
+def test_verify_tag_rejects_missing():
+    assert pd_auth.verify_tag("s", b"u", None) is False
+
+
+def test_verify_tag_rejects_wrong():
+    tag = pd_auth.compute_tag("s", b"u")
+    bad = bytes([(b ^ 0x55) for b in tag])
+    assert pd_auth.verify_tag("s", b"u", bad) is False
+
+
+def test_verify_tag_accepts_right():
+    tag = pd_auth.compute_tag("s", b"u")
+    assert pd_auth.verify_tag("s", b"u", tag) is True
+
+
+def test_verify_bearer_disabled():
+    assert pd_auth.verify_bearer(None, None) is True
+    assert pd_auth.verify_bearer(None, "Bearer x") is True
+
+
+def test_verify_bearer_missing_header():
+    assert pd_auth.verify_bearer("s", None) is False
+
+
+def test_verify_bearer_wrong_scheme():
+    assert pd_auth.verify_bearer("s", "Basic abc") is False
+
+
+def test_verify_bearer_wrong_secret():
+    assert pd_auth.verify_bearer("s", "Bearer wrong") is False
+
+
+def test_verify_bearer_right():
+    assert pd_auth.verify_bearer("s", "Bearer s") is True
+
+
+# ---- pd_auth: Bootstrap Bearer enforcement ----------------------------------
+
+
+def test_bootstrap_health_open_with_auth():
+    app, _ = build_app(shared_secret="shh")
+    with TestClient(app) as c:
+        r = c.get("/health")
+        assert r.status_code == 200
+
+
+def test_bootstrap_rejects_no_auth():
+    app, _ = build_app(shared_secret="shh")
+    with TestClient(app) as c:
+        r = c.get("/list_prefills")
+        assert r.status_code == 401
+
+
+def test_bootstrap_rejects_wrong_auth():
+    app, _ = build_app(shared_secret="shh")
+    with TestClient(app) as c:
+        r = c.get(
+            "/list_prefills",
+            headers={"Authorization": "Bearer wrong"},
+        )
+        assert r.status_code == 401
+
+
+def test_bootstrap_accepts_right_auth():
+    app, _ = build_app(shared_secret="shh")
+    with TestClient(app) as c:
+        r = c.get(
+            "/list_prefills",
+            headers={"Authorization": "Bearer shh"},
+        )
+        assert r.status_code == 200
+
+
+def test_bootstrap_disabled_auth_accepts_anything():
+    app, _ = build_app(shared_secret=None)
+    with TestClient(app) as c:
+        r = c.get("/list_prefills")
+        assert r.status_code == 200
+        r2 = c.get(
+            "/list_prefills",
+            headers={"Authorization": "Bearer anything"},
+        )
+        assert r2.status_code == 200
