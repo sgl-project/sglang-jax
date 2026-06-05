@@ -369,20 +369,20 @@ suites = {
         TestFile("test/srt/lora/test_static_lora.py", 10),
     ],
     "e2e-test-tpu-v6e-4": [
-        TestFile("test/srt/openai_server/basic/test_tool_calls.py", 4),
-        TestFile("test/srt/test_features.py", 5),
-        TestFile("test/srt/test_chunked_prefill_size.py", 5),
+        TestFile("test/srt/openai_server/basic/test_tool_calls.py", 2),
+        TestFile("test/srt/test_features.py", 3),
+        TestFile("test/srt/test_chunked_prefill_size.py", 2),
         # TestFile("test/srt/test_sliding_window_attention.py", 30), # add after gpt-oss supported
-        TestFile("test/srt/test_logprobs_dp.py", 17),
-        TestFile("test/srt/test_model_loader.py", 4),
-        TestFile("test/srt/test_deepseek_v2_lite_models.py", 6),
-        TestFile("test/srt/quantization/test_w8_quantization.py", 9),
+        TestFile("test/srt/test_logprobs_dp.py", 3),
+        TestFile("test/srt/test_model_loader.py", 1),
+        TestFile("test/srt/test_deepseek_v2_lite_models.py", 5),
+        TestFile("test/srt/quantization/test_w8_quantization.py", 4),
         TestFile(
             "test/srt/quantization/test_w8_block_dynamic_quantization.py",
-            6,
+            2,
             runner="pytest",
         ),
-        TestFile("test/srt/quantization/test_w8_moe_block_linear_channel_quantization.py", 8),
+        TestFile("test/srt/quantization/test_w8_moe_block_linear_channel_quantization.py", 3),
         # TestFile("test/srt/test_engine_determine_generation.py", 5),
         # ^ Disabled in DP merge: asserts bit-exact equivalence between baseline,
         #   retract, and abort+regenerate generation paths under temperature=0.
@@ -391,14 +391,14 @@ suites = {
         #   so re-prefilling [prompt + N generated tokens] after retract no longer reproduces
         #   the original decode-step logits bit-exactly, causing argmax to diverge.
         #   Tracked separately; not a regression introduced by this PR.
-        TestFile("test/srt/test_engine_flush_cache.py", 2),
-        TestFile("test/srt/test_engine_pause_continue.py", 4),
-        TestFile("test/srt/test_server_pause_continue.py", 5),
-        TestFile("test/srt/test_retract_decode.py", 22),
-        TestFile("test/srt/rl/test_return_routed_experts.py", 3),
-        TestFile("test/srt/rl/test_multi_engines_in_one_process.py", 3),
-        TestFile("test/srt/multimodal/test_wan2_1_models.py", 8),
-        TestFile("test/srt/multimodal/test_flux1_dev_models.py", 4),
+        TestFile("test/srt/test_engine_flush_cache.py", 1),
+        TestFile("test/srt/test_engine_pause_continue.py", 2),
+        TestFile("test/srt/test_server_pause_continue.py", 3),
+        TestFile("test/srt/test_retract_decode.py", 17),
+        TestFile("test/srt/rl/test_return_routed_experts.py", 2),
+        TestFile("test/srt/rl/test_multi_engines_in_one_process.py", 1),
+        TestFile("test/srt/multimodal/test_wan2_1_models.py", 4),
+        TestFile("test/srt/multimodal/test_flux1_dev_models.py", 2),
     ],
 }
 
