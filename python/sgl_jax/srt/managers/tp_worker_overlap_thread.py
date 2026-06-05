@@ -147,6 +147,7 @@ class ModelWorkerClient:
                                 model_worker_batch,
                             )
                         )
+                    self._start_same_batch_spec_chain_prepare_prewarm(model_worker_batch)
                 else:
                     model_worker_batch = chained_candidate.model_worker_batch
                     verify_async_result = chained_candidate.verify_async_result
@@ -529,6 +530,58 @@ class ModelWorkerClient:
                     self._prepare_chained_verify_launch_after_phase_a(candidate)
                 )
             return candidate
+
+    def _prewarm_same_batch_spec_chain_prepare_cache(
+        self,
+        model_worker_batch: ModelWorkerBatch,
+    ) -> None:
+        if not getattr(model_worker_batch, "allow_same_batch_spec_chain", False):
+            return
+        current_seq_lens = getattr(model_worker_batch, "seq_lens", None)
+        if current_seq_lens is None:
+            return
+        from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
+
+        prewarm_pending = SimpleNamespace(
+            padded_next_draft_input=EagleDraftInput(
+                new_seq_lens=np.asarray(current_seq_lens, dtype=np.int32),
+            ),
+            padded_req_pool_indices=np.asarray(
+                model_worker_batch.req_pool_indices,
+                dtype=np.int32,
+            ).copy(),
+            padded_new_seq_lens_host=np.asarray(current_seq_lens, dtype=np.int32).copy(),
+        )
+        candidate = self._build_same_batch_spec_chain_candidate_batch(
+            model_worker_batch,
+            prewarm_pending,
+        )
+        if candidate is None:
+            return
+        with jax.profiler.TraceAnnotation("prewarm_chained_verify_launch_cache"):
+            self._prepare_chained_verify_launch_after_phase_a(candidate)
+
+    def _start_same_batch_spec_chain_prepare_prewarm(
+        self,
+        model_worker_batch: ModelWorkerBatch,
+    ) -> None:
+        if not getattr(model_worker_batch, "allow_same_batch_spec_chain", False):
+            return
+
+        def _run_prewarm():
+            try:
+                self._prewarm_same_batch_spec_chain_prepare_cache(model_worker_batch)
+            except Exception:
+                logger.debug(
+                    "same_batch_chain prepare cache prewarm failed",
+                    exc_info=True,
+                )
+
+        threading.Thread(
+            target=_run_prewarm,
+            name=f"spec-chain-prepare-prewarm-{model_worker_batch.bid}",
+            daemon=True,
+        ).start()
 
     def _prepare_chained_verify_launch_after_phase_a(self, candidate_batch: ModelWorkerBatch):
         try:

@@ -345,6 +345,46 @@ def test_eagle_prepare_for_decode_reserves_extra_chain_slack(monkeypatch):
     assert allocated["extend_num_tokens"] == 64
 
 
+def test_same_batch_chain_prewarm_uses_current_layout_without_stashing():
+    from sgl_jax.srt.managers.tp_worker_overlap_thread import ModelWorkerClient
+
+    worker = ModelWorkerClient.__new__(ModelWorkerClient)
+    calls = []
+    req_pool = np.array([1, 2], dtype=np.int32)
+
+    def fake_prepare(candidate):
+        calls.append(candidate)
+        return SimpleNamespace(target_forward_batch=object())
+
+    worker._prepare_chained_verify_launch_after_phase_a = fake_prepare
+    model_worker_batch = SimpleNamespace(
+        allow_same_batch_spec_chain=True,
+        req_pool_indices=req_pool,
+        same_batch_chain_req_pool_indices=req_pool.copy(),
+        same_batch_chain_out_cache_loc_chunks=[
+            np.arange(4, dtype=np.int32),
+            np.arange(4, 8, dtype=np.int32),
+        ],
+        same_batch_chain_verify_write_lens=np.array([24, 25], dtype=np.int32),
+        same_batch_chain_allocate_lens=np.array([64, 64], dtype=np.int32),
+        spec_info_padded=EagleDraftInput(allocate_lens=np.array([64, 64], dtype=np.int32)),
+        seq_lens=np.array([21, 22], dtype=np.int32),
+        seq_lens_sum=43,
+        out_cache_loc=np.arange(8, dtype=np.int32),
+        bid=12,
+    )
+
+    worker._prewarm_same_batch_spec_chain_prepare_cache(model_worker_batch)
+
+    assert len(calls) == 1
+    assert getattr(worker, "pending_same_batch_spec_chain_candidate", None) is None
+    np.testing.assert_array_equal(calls[0].seq_lens, np.array([21, 22], dtype=np.int32))
+    np.testing.assert_array_equal(
+        calls[0].spec_info_padded.allocate_lens,
+        np.array([64, 64], dtype=np.int32),
+    )
+
+
 def test_prebuilt_candidate_keeps_prepared_verify_launch_payload():
     payload = object()
     candidate = SimpleNamespace(prepared_fused_greedy_verify_launch=payload)
