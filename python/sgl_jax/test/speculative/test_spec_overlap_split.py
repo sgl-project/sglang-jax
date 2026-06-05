@@ -238,6 +238,59 @@ def test_phase_a_prebuild_builds_same_batch_candidate_from_padded_new_seq_lens()
     assert candidate.skip_fused_verify_padding_for_decode is True
 
 
+def test_same_batch_chain_peek_prefers_scheduler_reserved_frontier(monkeypatch):
+    from sgl_jax.srt.managers.tp_worker_overlap_thread import ModelWorkerClient
+
+    monkeypatch.setattr(EagleDraftInput, "ALLOC_LEN_PER_DECODE", 4)
+    worker = ModelWorkerClient.__new__(ModelWorkerClient)
+    req_pool = np.array([1, 2], dtype=np.int32)
+    stale_spec_info = EagleDraftInput(
+        allocate_lens=np.array([10, 10], dtype=np.int32),
+    )
+    stale_spec_info.verify_write_lens = np.array([10, 10], dtype=np.int32)
+    req_to_token = np.arange(3 * 80, dtype=np.int32).reshape(3, 80)
+    worker.worker = SimpleNamespace(
+        model_runner=SimpleNamespace(
+            req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
+        )
+    )
+    model_worker_batch = SimpleNamespace(
+        allow_same_batch_spec_chain=True,
+        req_pool_indices=req_pool,
+        same_batch_chain_req_pool_indices=req_pool.copy(),
+        same_batch_chain_out_cache_loc_chunks=None,
+        same_batch_chain_verify_write_lens=np.array([20, 20], dtype=np.int32),
+        same_batch_chain_allocate_lens=np.array([64, 64], dtype=np.int32),
+        spec_info_padded=stale_spec_info,
+        seq_lens=np.array([16, 16], dtype=np.int32),
+        seq_lens_sum=32,
+        out_cache_loc=np.arange(8, dtype=np.int32),
+        bid=11,
+    )
+    pending = SimpleNamespace(
+        padded_next_draft_input=EagleDraftInput(
+            new_seq_lens=np.array([21, 22], dtype=np.int32),
+        ),
+        padded_req_pool_indices=req_pool.copy(),
+        padded_new_seq_lens_host=np.array([21, 22], dtype=np.int32),
+    )
+
+    candidate = worker._build_same_batch_spec_chain_candidate_batch(
+        model_worker_batch,
+        pending,
+    )
+
+    assert candidate is not None
+    np.testing.assert_array_equal(
+        candidate.spec_info_padded.allocate_lens,
+        np.array([64, 64], dtype=np.int32),
+    )
+    np.testing.assert_array_equal(
+        candidate.spec_info_padded.verify_write_lens,
+        np.array([24, 25], dtype=np.int32),
+    )
+
+
 def test_prebuilt_candidate_keeps_prepared_verify_launch_payload():
     payload = object()
     candidate = SimpleNamespace(prepared_fused_greedy_verify_launch=payload)

@@ -743,20 +743,20 @@ class ModelWorkerClient:
         new_seq_lens = getattr(pending, "padded_new_seq_lens_host", None)
         if new_seq_lens is None:
             new_seq_lens = getattr(padded_next_draft_input, "new_seq_lens", None)
-        old_verify_write_lens = getattr(spec_info, "verify_write_lens", None)
+        old_verify_write_lens = getattr(
+            model_worker_batch,
+            "same_batch_chain_verify_write_lens",
+            None,
+        )
         if old_verify_write_lens is None:
-            old_verify_write_lens = getattr(
-                model_worker_batch,
-                "same_batch_chain_verify_write_lens",
-                None,
-            )
-        allocate_lens = getattr(spec_info, "allocate_lens", None)
+            old_verify_write_lens = getattr(spec_info, "verify_write_lens", None)
+        allocate_lens = getattr(
+            model_worker_batch,
+            "same_batch_chain_allocate_lens",
+            None,
+        )
         if allocate_lens is None:
-            allocate_lens = getattr(
-                model_worker_batch,
-                "same_batch_chain_allocate_lens",
-                None,
-            )
+            allocate_lens = getattr(spec_info, "allocate_lens", None)
         if new_seq_lens is None or old_verify_write_lens is None or allocate_lens is None:
             with jax.profiler.TraceAnnotation("same_batch_chain_peek_skip:missing_frontier"):
                 pass
