@@ -44,6 +44,12 @@ def _per_dp_cumsum(lens, dp_size: int, per_dp_bs: int) -> np.ndarray:
     return cu.ravel()
 
 
+def _per_dp_cumsum_device(lens: jax.Array, dp_size: int, per_dp_bs: int) -> jax.Array:
+    lens_2d = lens.astype(jnp.int32).reshape(dp_size, per_dp_bs)
+    zeros = jnp.zeros((dp_size, 1), dtype=jnp.int32)
+    return jnp.concatenate([zeros, jnp.cumsum(lens_2d, axis=1)], axis=1).reshape(-1)
+
+
 def _select_draft_extend_allocate_lens(
     allocate_lens,
     sel: np.ndarray,
@@ -263,6 +269,12 @@ class FlashAttention(AttentionBackend):
 
         seq_lens = np.copy(batch.seq_lens)
 
+        target_verify_seq_lens_device = getattr(batch, "target_verify_seq_lens_device", None)
+        use_dynamic_target_verify_lens = (
+            batch.forward_mode.is_target_verify()
+            and isinstance(target_verify_seq_lens_device, jax.Array)
+            and metadata.custom_mask is None
+        )
         if batch.forward_mode.is_target_verify():
             seq_lens += extend_seq_lens
             aligned_seq_lens = ((seq_lens + self.page_size - 1) // self.page_size) * self.page_size
@@ -368,6 +380,29 @@ class FlashAttention(AttentionBackend):
             else:
                 swa_loc = np.asarray(swa_mapping)[full_loc]
             swa_page_indices = (swa_loc // self.page_size).astype(np.int32)
+
+        if use_dynamic_target_verify_lens:
+            sharding = NamedSharding(self.mesh, P("data"))
+            target_verify_seq_lens_device = jax.device_put(
+                target_verify_seq_lens_device.astype(jnp.int32),
+                sharding,
+            )
+            (
+                metadata.cu_q_lens,
+                metadata.cu_kv_lens,
+                metadata.page_indices,
+                metadata.distribution,
+            ) = device_array(
+                (cu_q_lens, cu_kv_lens, page_indices, distribution),
+                sharding=sharding,
+            )
+            metadata.seq_lens = target_verify_seq_lens_device
+            if swa_page_indices is not None:
+                metadata.swa_page_indices = device_array(
+                    swa_page_indices,
+                    sharding=sharding,
+                )
+            return metadata
 
         cache_key = None
         if (

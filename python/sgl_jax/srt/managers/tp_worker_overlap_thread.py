@@ -175,7 +175,10 @@ class ModelWorkerClient:
                         pending_dispatch_done.wait()
                         pending_result = pending_dispatch_holder.get("result")
                         prebuilt_chain_candidate = None
-                        if pending_result is not None:
+                        if pending_result is not None and not pending_dispatch_holder.get(
+                            "stashed_chain_candidate",
+                            False,
+                        ):
                             prebuilt_chain_candidate = (
                                 self._prebuild_same_batch_spec_chain_candidate_after_phase_a(
                                     model_worker_batch,
@@ -229,6 +232,17 @@ class ModelWorkerClient:
                             )
                         )
                         pending_dispatch_holder["result"] = self.pending_spec_draft_extend_result
+                        if self.pending_spec_draft_extend_result is not None:
+                            candidate = self._prebuild_same_batch_spec_chain_candidate_after_phase_b_dispatch(
+                                model_worker_batch,
+                                self.pending_spec_draft_extend_result,
+                            )
+                            if candidate is not None:
+                                self._stash_prebuilt_same_batch_spec_chain_candidate(
+                                    candidate,
+                                    self.pending_spec_draft_extend_result,
+                                )
+                                pending_dispatch_holder["stashed_chain_candidate"] = True
                     finally:
                         pending_dispatch_done.set()
                 phase_a_thread.join()
@@ -560,6 +574,24 @@ class ModelWorkerClient:
             return
         with jax.profiler.TraceAnnotation("prewarm_chained_verify_launch_cache"):
             self._prepare_chained_verify_launch_after_phase_a(candidate)
+
+    def _prebuild_same_batch_spec_chain_candidate_after_phase_b_dispatch(
+        self,
+        model_worker_batch: ModelWorkerBatch,
+        pending,
+    ):
+        with jax.profiler.TraceAnnotation(
+            "prebuild_same_batch_spec_chain_candidate_after_phase_b_dispatch"
+        ):
+            candidate = self._build_same_batch_spec_chain_candidate_batch(
+                model_worker_batch,
+                pending,
+            )
+            if candidate is not None:
+                candidate.prepared_fused_greedy_verify_launch = (
+                    self._prepare_chained_verify_launch_after_phase_a(candidate)
+                )
+            return candidate
 
     def _start_same_batch_spec_chain_prepare_prewarm(
         self,

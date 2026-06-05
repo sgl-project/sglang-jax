@@ -1,8 +1,11 @@
 from types import SimpleNamespace
 
+import jax
+import jax.numpy as jnp
 import numpy as np
 
 from sgl_jax.srt.managers.scheduler import Scheduler, SpecVerifyPhaseResult
+from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
 
 
@@ -382,6 +385,88 @@ def test_same_batch_chain_prewarm_uses_current_layout_without_stashing():
     np.testing.assert_array_equal(
         calls[0].spec_info_padded.allocate_lens,
         np.array([64, 64], dtype=np.int32),
+    )
+
+
+def test_phase_b_dispatch_prebuild_uses_device_new_seq_lens():
+    from sgl_jax.srt.managers.tp_worker_overlap_thread import ModelWorkerClient
+
+    worker = ModelWorkerClient.__new__(ModelWorkerClient)
+    prepared = object()
+    req_pool = np.array([1, 2], dtype=np.int32)
+    device_seq_lens = jnp.array([21, 22], dtype=jnp.int32)
+
+    def fake_prepare(candidate):
+        assert candidate.spec_info_padded.new_seq_lens is device_seq_lens
+        np.testing.assert_array_equal(candidate.seq_lens, np.array([19, 20], dtype=np.int32))
+        return prepared
+
+    worker._prepare_chained_verify_launch_after_phase_a = fake_prepare
+    model_worker_batch = SimpleNamespace(
+        allow_same_batch_spec_chain=True,
+        req_pool_indices=req_pool,
+        same_batch_chain_req_pool_indices=req_pool.copy(),
+        same_batch_chain_out_cache_loc_chunks=[
+            np.arange(4, dtype=np.int32),
+            np.arange(4, 8, dtype=np.int32),
+        ],
+        same_batch_chain_verify_write_lens=np.array([24, 25], dtype=np.int32),
+        same_batch_chain_allocate_lens=np.array([64, 64], dtype=np.int32),
+        spec_info_padded=EagleDraftInput(allocate_lens=np.array([64, 64], dtype=np.int32)),
+        seq_lens=np.array([19, 20], dtype=np.int32),
+        seq_lens_sum=39,
+        out_cache_loc=np.arange(8, dtype=np.int32),
+        bid=13,
+    )
+    pending = SimpleNamespace(
+        padded_next_draft_input=EagleDraftInput(new_seq_lens=device_seq_lens),
+        padded_req_pool_indices=req_pool.copy(),
+    )
+
+    candidate = worker._prebuild_same_batch_spec_chain_candidate_after_phase_b_dispatch(
+        model_worker_batch,
+        pending,
+    )
+
+    assert candidate is not None
+    assert candidate.prepared_fused_greedy_verify_launch is prepared
+    assert candidate.spec_info_padded.new_seq_lens is device_seq_lens
+
+
+def test_flashattention_target_verify_metadata_uses_device_seq_lens():
+    from jax.sharding import Mesh
+
+    from sgl_jax.srt.layers.attention.flashattention_backend import FlashAttention
+
+    mesh = Mesh(np.array(jax.devices()[:1]).reshape(1), axis_names=("data",))
+    attn = FlashAttention(
+        num_attn_heads=1,
+        num_kv_heads=1,
+        head_dim=16,
+        page_size=64,
+        mesh=mesh,
+    )
+    batch = SimpleNamespace(
+        forward_mode=ForwardMode.TARGET_VERIFY,
+        seq_lens=np.array([20, 0], dtype=np.int32),
+        target_verify_seq_lens_device=jnp.array([21, 0], dtype=jnp.int32),
+        cache_loc=np.arange(128, dtype=np.int32),
+        dp_size=1,
+        per_dp_bs_size=2,
+        logits_indices_selector=np.array([0], dtype=np.int32),
+        spec_info_padded=SimpleNamespace(custom_mask=None, draft_token_num=4),
+    )
+
+    metadata = attn.get_eagle_forward_metadata(batch)
+
+    np.testing.assert_array_equal(np.asarray(metadata.seq_lens), np.array([21, 0], dtype=np.int32))
+    np.testing.assert_array_equal(
+        np.asarray(metadata.cu_q_lens),
+        np.array([0, 4, 4], dtype=np.int32),
+    )
+    np.testing.assert_array_equal(
+        np.asarray(metadata.cu_kv_lens),
+        np.array([0, 64, 64], dtype=np.int32),
     )
 
 

@@ -232,6 +232,31 @@ def _build_topk1_chain_verify_inputs_device_tuple(
     )
 
 
+def _per_dp_cumsum_device(lens: jax.Array, dp_size: int, per_dp_bs: int) -> jax.Array:
+    lens_2d = lens.astype(jnp.int32).reshape(dp_size, per_dp_bs)
+    zeros = jnp.zeros((dp_size, 1), dtype=jnp.int32)
+    return jnp.concatenate([zeros, jnp.cumsum(lens_2d, axis=1)], axis=1).reshape(-1)
+
+
+def _refresh_target_verify_dynamic_metadata_in_jit(target_forward_batch):
+    """Fold device-lens target-verify metadata math into the verify JIT."""
+    metadata = target_forward_batch.attn_backend.forward_metadata
+    if metadata.custom_mask is not None:
+        return
+    page_size = int(target_forward_batch.attn_backend.page_size)
+    dp_size = int(metadata.distribution.shape[0] // 3)
+    per_dp_bs = int(target_forward_batch.seq_lens.shape[0] // dp_size)
+    draft_token_num = int(target_forward_batch.spec_info.draft_token_num)
+    seq_lens = jnp.where(
+        target_forward_batch.seq_lens > 0,
+        target_forward_batch.seq_lens + draft_token_num,
+        0,
+    )
+    aligned_seq_lens = ((seq_lens + page_size - 1) // page_size) * page_size
+    metadata.seq_lens = seq_lens
+    metadata.cu_kv_lens = _per_dp_cumsum_device(aligned_seq_lens, dp_size, per_dp_bs)
+
+
 def _device_rotate_input_ids(input_ids, ext_lens, sel_pos, new_tokens):
     """Mirror MultiLayerDraftWorker._rotate_ids on device for topk=1."""
     bs = ext_lens.shape[0]
@@ -399,6 +424,7 @@ def _build_fused_greedy_decode_jit(num_layers: int, topk: int):
         target_forward_batch.spec_info.retrive_index = retrive_index
         target_forward_batch.spec_info.retrive_next_token = retrive_next_token
         target_forward_batch.spec_info.retrive_next_sibling = retrive_next_sibling
+        _refresh_target_verify_dynamic_metadata_in_jit(target_forward_batch)
 
         target_state = jax.tree_util.tree_unflatten(target_model_state_def, target_leaves)
         target_model = nnx.merge(target_model_def, target_state)
@@ -1070,6 +1096,7 @@ def _build_fused_greedy_verify_jit():
         target_forward_batch.spec_info.retrive_index = retrive_index
         target_forward_batch.spec_info.retrive_next_token = retrive_next_token
         target_forward_batch.spec_info.retrive_next_sibling = retrive_next_sibling
+        _refresh_target_verify_dynamic_metadata_in_jit(target_forward_batch)
 
         target_state = jax.tree_util.tree_unflatten(target_model_state_def, target_leaves)
         target_model = nnx.merge(target_model_def, target_state)
