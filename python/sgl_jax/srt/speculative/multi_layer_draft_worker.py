@@ -7,9 +7,8 @@ sees the **target** model's hidden, not the previous MTP layer's output.
 So ``draft_extend`` forwards each layer once with the same target hidden
 and a per-layer rotated ``input_ids`` (shift+append previous topk), and
 ``draft_forward`` does no model forward — it just reads the per-layer
-topk that ``draft_extend`` already stored. Chain-style hidden passing
-(layer i+1 ← layer i output) is only correct for archs like Step3p5MTP;
-see GPU sglang ``multi_layer_eagle_worker_v2.chain_mtp_hidden_states``.
+topk that ``draft_extend`` already stored. Chain-style hidden passing is
+only correct for architectures that explicitly chain MTP hidden states.
 """
 
 from __future__ import annotations
@@ -155,6 +154,11 @@ class MultiLayerDraftWorker(EagleDraftWorker):
         topk_p = model_worker_batch.spec_info_padded.topk_p
         topk_index = model_worker_batch.spec_info_padded.topk_index
         hidden_states = model_worker_batch.spec_info_padded.hidden_states
+        if self.topk == 1:
+            if isinstance(topk_index, np.ndarray):
+                return None, np.asarray(topk_index[:, :, 0], dtype=np.int32), None
+            return None, topk_index[:, :, 0].astype(jnp.int32), None
+
         bs = model_worker_batch.seq_lens.shape[0]
         step_min_1 = self.speculative_num_steps - 1
         score_list = jnp.zeros((bs, 1 + step_min_1 * self.topk, self.topk))
@@ -208,7 +212,7 @@ class MultiLayerDraftWorker(EagleDraftWorker):
         ``(topk_{i-1}, target_hidden_{last})``. Each layer's topk goes into
         ``spec_info.topk_index[:, i]`` and ``draft_forward`` does no model
         forward. Mirrors GPU sglang ``multi_layer_eagle_worker_v2`` for
-        non-chain archs (chain is only for Step3p5MTP).
+        non-chain architectures.
         """
         sel = np.asarray(model_worker_batch.logits_indices_selector)
         verified_id_np = np.asarray(jax.device_get(next_token_ids))[sel]
@@ -288,7 +292,7 @@ class MultiLayerDraftWorker(EagleDraftWorker):
     def draft_extend_for_decode(
         self, model_worker_batch: ModelWorkerBatch, batch_output: GenerationBatchResult
     ) -> None:
-        """Decode-extend across all MTP layers — fused single JIT."""
+        """Decode-extend across all MTP layers."""
         from sgl_jax.srt.speculative.draft_extend_fused import (
             draft_extend_for_decode_fused,
         )

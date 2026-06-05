@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
@@ -14,6 +15,202 @@ from sgl_jax.test.test_utils import CustomTestCase
 
 
 class TestVerifyTree(CustomTestCase):
+    def test_as_int32_array_keeps_host_metadata_on_host(self):
+        from sgl_jax.srt.speculative import eagle_util
+
+        original_jnp_asarray = eagle_util.jnp.asarray
+        original_jnp_empty = eagle_util.jnp.empty
+
+        def fail_jnp_asarray(*args, **kwargs):
+            raise AssertionError("host metadata conversion must not call jnp.asarray")
+
+        def fail_jnp_empty(*args, **kwargs):
+            raise AssertionError("host metadata placeholder must not call jnp.empty")
+
+        try:
+            eagle_util.jnp.asarray = fail_jnp_asarray
+            eagle_util.jnp.empty = fail_jnp_empty
+            arr = eagle_util._as_int32_array(np.array([1, 2], dtype=np.int64))
+            scalar = eagle_util._as_int32_array(3)
+            listed = eagle_util._as_int32_array([4, 5])
+            children, _ = eagle_util.EagleDraftInput().tree_flatten()
+        finally:
+            eagle_util.jnp.asarray = original_jnp_asarray
+            eagle_util.jnp.empty = original_jnp_empty
+
+        self.assertIsInstance(arr, np.ndarray)
+        self.assertEqual(arr.dtype, np.int32)
+        np.testing.assert_array_equal(arr, np.array([1, 2], dtype=np.int32))
+        self.assertIsInstance(scalar, np.ndarray)
+        self.assertEqual(scalar.dtype, np.int32)
+        np.testing.assert_array_equal(listed, np.array([4, 5], dtype=np.int32))
+        self.assertIsInstance(children[9], np.ndarray)
+        self.assertEqual(children[9].dtype, np.int32)
+        self.assertEqual(children[9].shape, (0,))
+
+        device_arr = jnp.array([6], dtype=jnp.int32)
+        self.assertIs(eagle_util._as_int32_array(device_arr), device_arr)
+
+    def test_build_chain_verify_inputs_device_matches_linear_chain_layout(self):
+        from sgl_jax.srt.speculative.eagle_util import build_chain_verify_inputs_device
+
+        verified_id = jnp.array([101, 201], dtype=jnp.int32)
+        token_list = jnp.array(
+            [
+                [102, 103, 104],
+                [202, 203, 204],
+            ],
+            dtype=jnp.int32,
+        )
+        seq_lens = jnp.array([7, 11], dtype=jnp.int32)
+
+        packed = build_chain_verify_inputs_device(
+            verified_id=verified_id,
+            token_list=token_list,
+            seq_lens=seq_lens,
+            num_verify_tokens=4,
+            batch_size=2,
+        )
+
+        expected = np.array(
+            [
+                [101, 102, 103, 104, 201, 202, 203, 204],
+                [7, 8, 9, 10, 11, 12, 13, 14],
+                [0, 1, 2, 3, 4, 5, 6, 7],
+                [1, 2, 3, -1, 1, 2, 3, -1],
+                [-1, -1, -1, -1, -1, -1, -1, -1],
+            ],
+            dtype=np.int32,
+        )
+        np.testing.assert_array_equal(np.asarray(packed), expected)
+
+    def test_fused_chain_verify_matches_topk1_linear_reference(self):
+        from sgl_jax.srt.speculative.draft_extend_fused import (
+            _greedy_sample_and_prepare_draft_inputs_chain_from_predict,
+        )
+
+        speculative_num_steps = 3
+        num_draft_tokens = 4
+        bs = 4
+        draft_tokens = jnp.array(
+            [
+                10,
+                11,
+                12,
+                13,
+                20,
+                21,
+                22,
+                23,
+                30,
+                31,
+                32,
+                33,
+                40,
+                41,
+                42,
+                43,
+            ],
+            dtype=jnp.int32,
+        )
+        target_predict = np.array(
+            [
+                99,
+                12,
+                13,
+                14,
+                21,
+                99,
+                23,
+                24,
+                31,
+                32,
+                99,
+                34,
+                41,
+                42,
+                43,
+                44,
+            ],
+            dtype=np.int32,
+        )
+        chain = _greedy_sample_and_prepare_draft_inputs_chain_from_predict(
+            target_hidden=jnp.arange(bs * num_draft_tokens * 2, dtype=jnp.float32).reshape(
+                bs * num_draft_tokens, 2
+            ),
+            positions=jnp.arange(bs * num_draft_tokens, dtype=jnp.int32),
+            seq_lens=jnp.array([100, 200, 300, 400], dtype=jnp.int32),
+            draft_tokens=draft_tokens,
+            target_predict=jnp.asarray(target_predict),
+            speculative_num_steps=speculative_num_steps,
+            speculative_num_draft_tokens=num_draft_tokens,
+        )
+
+        np.testing.assert_array_equal(np.asarray(chain.accept_lens), np.array([1, 2, 3, 4]))
+        np.testing.assert_array_equal(
+            np.asarray(chain.select_index),
+            np.arange(bs, dtype=np.int32) * (speculative_num_steps + 1)
+            + np.asarray(chain.accept_lens)
+            - 1,
+        )
+        select_index = np.asarray(chain.select_index)
+        np.testing.assert_array_equal(
+            np.asarray(chain.verified_id)[select_index],
+            np.array([99, 99, 99, 44], dtype=np.int32),
+        )
+
+    def test_fused_chain_verify_zeroes_padding_accept_length(self):
+        from sgl_jax.srt.speculative.draft_extend_fused import (
+            _greedy_sample_and_prepare_draft_inputs_chain_from_predict,
+        )
+
+        out = _greedy_sample_and_prepare_draft_inputs_chain_from_predict(
+            target_hidden=jnp.arange(8 * 2, dtype=jnp.float32).reshape(8, 2),
+            positions=jnp.arange(8, dtype=jnp.int32),
+            seq_lens=jnp.array([0, 10], dtype=jnp.int32),
+            draft_tokens=jnp.array([0, 0, 0, 0, 20, 21, 22, 23], dtype=jnp.int32),
+            target_predict=jnp.array([0, 0, 0, 0, 21, 22, 99, 24], dtype=jnp.int32),
+            speculative_num_steps=3,
+            speculative_num_draft_tokens=4,
+        )
+
+        np.testing.assert_array_equal(np.asarray(out.accept_lens), np.array([0, 3]))
+        np.testing.assert_array_equal(np.asarray(out.new_seq_lens), np.array([0, 13]))
+        np.testing.assert_array_equal(np.asarray(out.sel_pos), np.array([0, 2]))
+
+    def test_fused_materialize_uses_original_seq_lens_for_new_seq_lens(self):
+        from sgl_jax.srt.speculative.draft_extend_fused import (
+            _materialize_fused_greedy_batch_output_for_scheduler,
+        )
+
+        batch_output = SimpleNamespace(
+            logits_output=None,
+            next_draft_input=SimpleNamespace(),
+            allocate_lens=np.array([9, 8, 7], dtype=np.int32),
+            accept_lens=None,
+            next_token_ids=None,
+        )
+        out = _materialize_fused_greedy_batch_output_for_scheduler(
+            batch_output=batch_output,
+            selector=np.array([0, 2], dtype=np.int32),
+            real_bs=2,
+            seq_lens_host=np.array([103, 203, 303], dtype=np.int32),
+            layer0_hidden=jnp.arange(12 * 2, dtype=jnp.float32).reshape(12, 2),
+            topk_index_stacked=jnp.array(
+                [[[11], [12], [13]], [[21], [22], [23]], [[31], [32], [33]]]
+            ),
+            accept_lens_device=jnp.array([1, 2, 4], dtype=jnp.int32),
+            predict_device=jnp.arange(12, dtype=jnp.int32),
+            speculative_num_draft_tokens=4,
+            target_logits=None,
+            target_hidden=None,
+        )
+
+        np.testing.assert_array_equal(
+            out.next_draft_input.new_seq_lens,
+            np.array([101, 304], dtype=np.int32),
+        )
+
     def test_verify_tree_greedy(self):
         candidates = jnp.array(
             [
@@ -65,19 +262,10 @@ class TestVerifyTree(CustomTestCase):
         accept_index = jnp.full((bs, num_spec_step), -1, dtype=jnp.int32)  # mutable
         accept_token_num = jnp.full((bs,), 0, dtype=jnp.int32)  # mutable
 
-        # # for compatibility, 0.6.3 need to use use_mesh. set_mesh is not have __entry__ attribute.
-        # # on jax >=0.7.1, we need to use set_mesh.
         from sgl_jax.srt.utils.mesh_utils import create_device_mesh
 
         mesh = create_device_mesh(ici_parallelism=[-1, 1], dcn_parallelism=[1, 1])
-        try:
-            ctx = jax.sharding.use_mesh(mesh)
-        except AttributeError:
-            try:
-                ctx = jax.set_mesh(mesh)
-            except AttributeError:
-                ctx = mesh
-        with ctx:
+        with jax.set_mesh(mesh):
             accept_index, accept_token_num, predicts = verify_tree_greedy(
                 speculative_num_steps=4,
                 num_draft_tokens=6,
