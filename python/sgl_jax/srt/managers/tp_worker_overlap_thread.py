@@ -170,6 +170,7 @@ class ModelWorkerClient:
                                 verify_async_result
                             )
                         phase_a_holder["result"] = verify_result
+                        phase_a_holder["phase_a_ready"].set()
                         prebuilt_chain_candidate = (
                             self._prebuild_same_batch_spec_chain_candidate_after_phase_a(
                                 model_worker_batch,
@@ -177,7 +178,6 @@ class ModelWorkerClient:
                             )
                         )
                         phase_a_holder["prebuilt_chain_candidate"] = prebuilt_chain_candidate
-                        phase_a_holder["phase_a_ready"].set()
                         pending_dispatch_done.wait()
                         pending_result = pending_dispatch_holder.get("result")
                         if pending_result is not None:
