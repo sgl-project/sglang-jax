@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import argparse
 import dataclasses
 import json
@@ -19,24 +21,24 @@ for _p in (_TEST_SRT, _NIGHTLY_DIR, _SELF_DIR):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from accuracy_case_runner import run_accuracy_case
 from multi_host_suite import (
     AccuracyCase,
     ModelRun,
     MultiHostSuite,
     PerfCase,
-    RuntimeConfig,
     SuiteError,
     dry_run_suite,
 )
+
+# Case runners, sgl_jax, and the pydantic/yaml profile loader are imported lazily in
+# the functions that use them, keeping module import light and jax-free (e.g. --dry-run);
+# `from __future__ import annotations` keeps the deferred types usable in signatures.
 
 # Exit codes consumed by the multi-host CI workflow's Classify step.
 EXIT_OK = 0
 EXIT_INFRA = 10  # server / runtime infra failure → caller may retry
 EXIT_THRESHOLD = 20  # case finished but score below threshold → do not retry
 EXIT_CASE_CRASH = 30  # case raised unexpectedly → bug, do not retry
-from perf_case_runner import run_perf_case
-from profile_loader import LaunchProfile, build_other_server_args, load_profile
 
 _control_state = {"done": False, "exit_code": 0}
 
@@ -120,6 +122,8 @@ def wait_for_done(control_url: str, server_process, timeout_seconds: int = 3600)
 
 
 def build_runtime_config(node_rank: int | None = None) -> RuntimeConfig:
+    from profiles import RuntimeConfig
+
     workload_name = _get_env("WORKLOAD_NAME")
     headless_service_name = _get_env("HEADLESS_SERVICE_NAME")
     resolved_node_rank = int(_get_env("JOB_COMPLETION_INDEX") if node_rank is None else node_rank)
@@ -136,6 +140,10 @@ def build_runtime_config(node_rank: int | None = None) -> RuntimeConfig:
 
 
 def run_case(case: PerfCase | AccuracyCase, profile: LaunchProfile) -> None:
+    # Lazy: pull jax in only to actually run a case (module import stays jax-free).
+    from accuracy_case_runner import run_accuracy_case
+    from perf_case_runner import run_perf_case
+
     if isinstance(case, PerfCase):
         run_perf_case(case, profile)
         return
@@ -147,6 +155,8 @@ def run_case(case: PerfCase | AccuracyCase, profile: LaunchProfile) -> None:
 
 
 def run_model_run(model_run: ModelRun, runtime_cfg: RuntimeConfig) -> int:
+    from profile_loader import build_other_server_args, load_profile
+
     from sgl_jax.srt.utils import kill_process_tree
     from sgl_jax.test.test_utils import popen_launch_server
 
@@ -313,6 +323,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def select_suites(suite_name: str | None, target: str | None) -> list[MultiHostSuite]:
+    from profile_loader import load_profile
+
     suites = get_suites()
     if suite_name is not None:
         return [suites[suite_name]]

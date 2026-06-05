@@ -8,13 +8,111 @@ and writes results to $GITHUB_OUTPUT.
 import json
 import os
 import re
+import subprocess
 import sys
 
 ALLOWED_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
 
-VALID_COMMANDS = {"rerun-failed-ci", "test", "rerun-group", "rerun-stage"}
+VALID_COMMANDS = {
+    "rerun-failed-ci",
+    "test",
+    "rerun-group",
+    "rerun-stage",
+    "run-nightly",
+}
 
 _SAFE_ARG_RE = re.compile(r"[^a-zA-Z0-9_-]")
+
+# case_key = a real case name (lowercase, e.g. "qwen3-8b-fa" or
+# "qwen3-32b-c32-i4096-o1024"), so the charset includes hyphens.
+_CASE_KEY_RE = re.compile(r"[^a-z0-9_.-]")
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# Single-host suite -> its nightly-test-daily.yml job (job_filter value). case_keys
+# aren't listed here — they're derived from the catalog (single source of truth),
+# so adding a case to a suite needs no change here.
+_SINGLE_HOST_SUITE_JOBS = {
+    "accuracy-text-models-v6e-4": "nightly-test-accuracy-text-models-4-tpu-daily",
+    "perf-text-models-v6e-4": "nightly-test-perf-text-models-4-tpu-daily",
+}
+# Multi-host (the mimo-flash suite) is intentionally NOT wired into /run-nightly: its
+# nightly job stays `if: false` until multi-host CI has 4-node v6e capacity. To enable
+# later, add a suite->job map here and enumerate it in nightly_index().
+
+
+class NightlyEnumerationError(RuntimeError):
+    """Raised when a suite runner's --caselist can't be enumerated."""
+
+
+def _run_caselist(runner_relpath: str) -> list[dict]:
+    """Enumerate a runner's cases via its --caselist CLI (a subprocess).
+
+    Mirrors pytest's `--collect-only`: the suite runner owns its case list and
+    prints it as JSON; we don't import it (it's stdlib-only for --caselist, but a
+    subprocess keeps the parser's import space clean and isolates failures). Runs
+    on a plain CPU runner — --caselist needs no jax. The timeout guards the slash
+    handler against a catalog that hangs at import. Raises on non-zero exit.
+    """
+    path = os.path.join(_REPO_ROOT, "test", "srt", "nightly", runner_relpath)
+    try:
+        proc = subprocess.run(
+            [sys.executable, path, "--caselist"], capture_output=True, text=True, timeout=60
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise NightlyEnumerationError(
+            f"{runner_relpath} --caselist timed out after {exc.timeout:.0f}s"
+        ) from exc
+    if proc.returncode != 0:
+        raise NightlyEnumerationError(
+            f"{runner_relpath} --caselist failed (exit {proc.returncode}): "
+            f"{proc.stderr.strip()[:300]}"
+        )
+    try:
+        data = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise NightlyEnumerationError(f"{runner_relpath} --caselist bad JSON: {exc}") from exc
+    if not isinstance(data, list) or not all(isinstance(entry, dict) for entry in data):
+        raise NightlyEnumerationError(f"{runner_relpath} --caselist must be a JSON list of objects")
+    return data
+
+
+def nightly_index() -> dict[str, tuple[str, str]]:
+    """Map each runnable case_key -> (job, cases-arg for suite_runner --cases).
+
+    The single-host runner self-enumerates via --caselist; this maps the suites it
+    exposes to a job name, one key per case (cases=case). Multi-host is not wired in
+    (see _SINGLE_HOST_SUITE_JOBS note above).
+    """
+    index: dict[str, tuple[str, str]] = {}
+    for entry in _run_caselist("single_host/suite_runner.py"):
+        suite, case = entry.get("suite"), entry.get("case")
+        if suite is None or case is None:
+            continue
+        job = _SINGLE_HOST_SUITE_JOBS.get(suite)
+        if job is None:
+            continue
+        index[case] = (job, case)
+    return index
+
+
+def format_nightly_list():
+    """Render the runnable /run-nightly case_keys, grouped by job."""
+    try:
+        index = nightly_index()
+    except NightlyEnumerationError as exc:
+        return f"Could not list nightly cases: {exc}"
+    by_job: dict[str, list[str]] = {}
+    for key, (job, _cases) in index.items():
+        by_job.setdefault(job, []).append(key)
+    lines = ["**Available `/run-nightly` cases:**", ""]
+    for job in sorted(by_job):
+        names = ", ".join(f"`{k}`" for k in sorted(by_job[job]))
+        lines.append(f"- `{job}`: {names}")
+    lines.append("")
+    lines.append("Usage: `/run-nightly <case_key>` — e.g. `/run-nightly qwen3-8b-fa`")
+    return "\n".join(lines)
+
 
 RUNNER_SUFFIXES = [
     ("-cpu", "arc-runner-cpu"),
@@ -101,11 +199,13 @@ def resolve_jobs(command, args):
 
     Keys:
         action     — "rerun_failed" | "add_label" | "rerun_group" | "rerun_stage"
+                     | "run_nightly"
         suite      — test suite name (for rerun-group)
         runner     — runner label (for rerun-group)
         labels     — labels to add to the PR
         stage      — canonical stage name (for rerun-stage)
         jobs       — list of pr-test.yml job names (for rerun-stage)
+        nightly_*  — job / cases / case_key (for run-nightly)
         error      — non-empty string on invalid input
     """
     result = {
@@ -116,6 +216,9 @@ def resolve_jobs(command, args):
         "error": "",
         "stage": "",
         "jobs": [],
+        "nightly_job": "",
+        "nightly_cases": "",
+        "nightly_case_key": "",
     }
 
     if command == "rerun-failed-ci":
@@ -164,6 +267,37 @@ def resolve_jobs(command, args):
         result["action"] = "rerun_stage"
         result["stage"] = stage
         result["jobs"] = STAGE_JOBS[stage]
+        return result
+
+    if command == "run-nightly":
+        # No arg or "?" → list cases instead of erroring ("?" mirrors Prow's
+        # /test ?, but a bare /run-nightly should be just as discoverable).
+        if not args or args[0] == "?":
+            result["action"] = "list_nightly"
+            return result
+        case_key = args[0].lower()
+        # Reject malformed keys (don't silently strip) so the error names what was
+        # typed. Echo with only illegal chars removed; the kept set is
+        # injection-safe, "<empty>" if every char was illegal.
+        if _CASE_KEY_RE.search(case_key):
+            safe = _CASE_KEY_RE.sub("", case_key)[:60] or "<empty>"
+            result["error"] = f"Invalid case_key '{safe}'. Allowed characters: [a-z0-9_.-]"
+            return result
+        try:
+            index = nightly_index()
+        except NightlyEnumerationError as exc:
+            result["error"] = f"Could not list nightly cases: {exc}"
+            return result
+        entry = index.get(case_key)
+        if entry is None:
+            valid = ", ".join(sorted(index))
+            result["error"] = f"Unknown case_key '{case_key}'. Valid: {valid}"
+            return result
+        job, cases = entry
+        result["action"] = "run_nightly"
+        result["nightly_job"] = job
+        result["nightly_cases"] = cases
+        result["nightly_case_key"] = case_key
         return result
 
     result["error"] = f"Unknown command '{command}'"
@@ -241,6 +375,10 @@ def main():
             suite_name, runner = JOB_TO_SUITE[job]
             suites.append({"suite": suite_name, "runner": runner})
         outputs["stage_suites_json"] = json.dumps(suites)
+    if job_info["action"] == "run_nightly":
+        outputs["nightly_job"] = job_info["nightly_job"]
+        outputs["nightly_cases"] = job_info["nightly_cases"]
+        outputs["nightly_case_key"] = job_info["nightly_case_key"]
 
     write_outputs(outputs)
 
@@ -258,6 +396,11 @@ def main():
     if job_info["stage"]:
         print(f"stage: {job_info['stage']}")
         print(f"jobs: {', '.join(job_info['jobs'])}")
+    if job_info["action"] == "run_nightly":
+        print(f"case_key: {job_info['nightly_case_key']}")
+        print(f"nightly_job: {job_info['nightly_job']}")
+        if job_info["nightly_cases"]:
+            print(f"nightly_cases: {job_info['nightly_cases']}")
 
 
 if __name__ == "__main__":

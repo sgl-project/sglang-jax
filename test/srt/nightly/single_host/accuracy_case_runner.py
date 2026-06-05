@@ -39,11 +39,6 @@ _LAUNCH_PROFILES_DIR = os.path.join(_NIGHTLY_DIR, "launch_profiles")
 # server's HTTP port.
 _DIST_INIT_PORT_OFFSET = 5000
 
-# Default gsm8k sampling for the 4-TPU accuracy gates: greedy decode.
-# Cases reference this so every AccuracyCase carries an explicit
-# generation_config, matching the per-case convention.
-GSM8K_GENERATION_CONFIG = {"temperature": 0.0, "max_tokens": 2048}
-
 
 def _fmt(value: float | None) -> str:
     return f"{value:.4f}" if isinstance(value, (int, float)) else "N/A"

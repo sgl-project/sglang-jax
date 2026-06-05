@@ -1,5 +1,11 @@
 name: Nightly Test Daily
 
+# Inputs (ref/job_filter/cases/pr_number) drive a single-case run on a PR. run-name
+# tags manual workflow_dispatch runs by PR + case; under /run-nightly this is invoked
+# as a reusable workflow, where the run is named by the caller (Slash Command Handler).
+run-name: >-
+  ${{ inputs.pr_number != '' && format('Nightly Test Daily — PR #{0} {1}', inputs.pr_number, inputs.cases || inputs.job_filter) || 'Nightly Test Daily' }}
+
 # NOTE: The daily nightly suites are currently empty shells. Coverage will be
 # redefined as part of the nightly vs daily split decision. The workflow is
 # kept so any new daily case can be added by populating run_suite.py without
@@ -14,8 +20,52 @@ on:
     paths:
       - "python/sgl_jax/version.py"
   workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to test (PR HEAD for /run-nightly). Empty = this workflow's ref."
+        required: false
+        type: string
+      job_filter:
+        description: "Run only this job (its name). Empty or 'all' runs every daily job."
+        required: false
+        type: string
+        default: "all"
+      cases:
+        description: "Comma-separated case name(s) for single_host/suite_runner.py --cases. Empty = whole suite."
+        required: false
+        type: string
+      pr_number:
+        description: "PR number to comment results on (for /run-nightly). Empty = no comment."
+        required: false
+        type: string
+  # Reusable entry for /run-nightly: invoked via `uses:` from slash-command.yml, so a
+  # PR-triggered nightly is part of the Slash Command Handler run — no standalone
+  # "Nightly Test Daily" run, so the notifier / auto-bisect that watch it don't fire.
+  workflow_call:
+    inputs:
+      ref:
+        description: "Git ref to test (PR HEAD for /run-nightly). Empty = this workflow's ref."
+        required: false
+        type: string
+      job_filter:
+        description: "Run only this job (its name). Empty or 'all' runs every daily job."
+        required: false
+        type: string
+        default: "all"
+      cases:
+        description: "Comma-separated case name(s) for single_host/suite_runner.py --cases. Empty = whole suite."
+        required: false
+        type: string
+      pr_number:
+        description: "PR number to comment results on (for /run-nightly). Empty = no comment."
+        required: false
+        type: string
+
 concurrency:
-  group: nightly-test-daily-${{ github.ref }}
+  # Key by tested ref + job + case: a /run-nightly never cancels the scheduled main
+  # run, and two cases mapping to the same job don't cancel each other (only a repeat
+  # of the same case collapses).
+  group: nightly-test-daily-${{ inputs.ref || github.ref }}-${{ inputs.job_filter || 'all' }}-${{ inputs.cases || 'all' }}
   cancel-in-progress: true
 
 permissions:
@@ -24,7 +74,7 @@ permissions:
 jobs:
 
   nightly-test-accuracy-text-models-1-tpu-daily:
-    if: github.repository == 'sgl-project/sglang-jax'
+    if: github.repository == 'sgl-project/sglang-jax' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-accuracy-text-models-1-tpu-daily')
     runs-on: arc-runner-v6e-1
     env:
       TZ: Asia/Shanghai
@@ -34,6 +84,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
       - name: Setup Python environment
         uses: ./.github/actions/setup-venv
       - name: Run accuracy daily suite
@@ -43,7 +95,7 @@ jobs:
           python3 run_suite.py --suite nightly-test-accuracy-text-models-tpu-v6e-1-daily
 
   nightly-test-perf-text-models-1-tpu-daily:
-    if: github.repository == 'sgl-project/sglang-jax'
+    if: github.repository == 'sgl-project/sglang-jax' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-perf-text-models-1-tpu-daily')
     runs-on: arc-runner-v6e-1
     env:
       TZ: Asia/Shanghai
@@ -53,6 +105,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
       - name: Setup Python environment
         uses: ./.github/actions/setup-venv
       - name: Run perf daily suite
@@ -62,7 +116,7 @@ jobs:
           python3 run_suite.py --suite nightly-test-perf-text-models-tpu-v6e-1-daily
 
   nightly-test-openai-api-surface-1-tpu-daily:
-    if: github.repository == 'sgl-project/sglang-jax'
+    if: github.repository == 'sgl-project/sglang-jax' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-openai-api-surface-1-tpu-daily')
     runs-on: arc-runner-v6e-1
     env:
       TZ: Asia/Shanghai
@@ -72,6 +126,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
       - name: Setup Python environment
         uses: ./.github/actions/setup-venv
       - name: Run OpenAI API surface tests
@@ -90,7 +146,7 @@ jobs:
     secrets: inherit
 
   nightly-infra-smoke-1-tpu-daily:
-    if: github.repository == 'sgl-project/sglang-jax'
+    if: github.repository == 'sgl-project/sglang-jax' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-infra-smoke-1-tpu-daily')
     runs-on: arc-runner-v6e-1
     env:
       TZ: Asia/Shanghai
@@ -100,6 +156,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
       - name: Setup Python environment
         uses: ./.github/actions/setup-venv
       - name: Run infra smoke tests
@@ -109,8 +167,12 @@ jobs:
           python3 run_suite.py --suite nightly-infra-smoke-tpu-v6e-1
 
   nightly-test-accuracy-text-models-4-tpu-daily:
-    if: github.repository == 'sgl-project/sglang-jax'
+    if: github.repository == 'sgl-project/sglang-jax' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-accuracy-text-models-4-tpu-daily')
     runs-on: arc-runner-v6e-4
+    # Read-only + persist-credentials:false — this job runs PR-HEAD code, so it must not
+    # hold a write token; PASS/FAIL is posted from the separate comment job below.
+    permissions:
+      contents: read
     env:
       TZ: Asia/Shanghai
       JAX_COMPILATION_CACHE_DIR: /xla-cache
@@ -118,17 +180,53 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          persist-credentials: false
       - name: Setup Python environment
         uses: ./.github/actions/setup-venv
       - name: Run 4-TPU accuracy daily suite
+        id: run
         timeout-minutes: 150
+        env:
+          # /run-nightly passes a single case name here; empty runs the whole suite.
+          CASES: ${{ inputs.cases }}
         run: |
           cd test/srt
-          python3 nightly/single_host/suite_runner.py --suite accuracy-text-models-v6e-4
+          python3 nightly/single_host/suite_runner.py --suite accuracy-text-models-v6e-4 ${CASES:+--cases "$CASES"}
+
+  nightly-test-accuracy-4-tpu-comment:
+    # Posts PASS/FAIL from a clean job (no PR-HEAD code ran here) so the write token
+    # never shares an environment the PR could have tampered with. Skips cancelled
+    # (superseded) / skipped runs.
+    needs: nightly-test-accuracy-text-models-4-tpu-daily
+    if: >-
+      always() && inputs.pr_number != ''
+      && contains(fromJSON('["success", "failure"]'), needs.nightly-test-accuracy-text-models-4-tpu-daily.result)
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Comment result on PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          CASE_KEY: ${{ inputs.cases || 'accuracy-text-models-v6e-4' }}
+          RESULT: ${{ needs.nightly-test-accuracy-text-models-4-tpu-daily.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ "$RESULT" = "success" ]; then status="PASS"; else status="FAIL"; fi
+          gh pr comment "$PR_NUMBER" --repo "$REPO" \
+            --body "> **Nightly** [\`$CASE_KEY\`]($RUN_URL): **$status** — see the run's step summary for the score."
 
   nightly-test-perf-text-models-4-tpu-daily:
-    if: github.repository == 'sgl-project/sglang-jax'
+    if: github.repository == 'sgl-project/sglang-jax' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-perf-text-models-4-tpu-daily')
     runs-on: arc-runner-v6e-4
+    # Read-only + persist-credentials:false — runs PR-HEAD code, no write token here;
+    # PASS/FAIL is posted from the separate comment job below.
+    permissions:
+      contents: read
     env:
       TZ: Asia/Shanghai
       JAX_COMPILATION_CACHE_DIR: /xla-cache
@@ -138,19 +236,26 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          persist-credentials: false
       - name: Setup Python environment
         uses: ./.github/actions/setup-venv
       - name: Run 4-TPU perf daily suite
+        id: run
         timeout-minutes: 480
         env:
-          # Token for the trailing-baseline gate's ci-data reads (anonymous API
-          # gets rate-limited, silently disabling the trailing gate).
-          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+          # ci-data reads for the trailing-baseline gate (anonymous API gets
+          # rate-limited, disabling that gate). Scheduled runs only — never hand the
+          # PAT to PR-HEAD code, which a /run-nightly dispatch executes here.
+          GITHUB_TOKEN: ${{ inputs.pr_number == '' && secrets.GH_PAT_FOR_NIGHTLY_CI_DATA || '' }}
+          # /run-nightly passes a single case name here; empty runs the whole suite.
+          CASES: ${{ inputs.cases }}
         run: |
           cd test/srt
-          python3 nightly/single_host/suite_runner.py --suite perf-text-models-v6e-4
+          python3 nightly/single_host/suite_runner.py --suite perf-text-models-v6e-4 ${CASES:+--cases "$CASES"}
       - name: Publish perf CSV to ci-data (main only)
-        if: github.ref == 'refs/heads/main' && github.repository == 'sgl-project/sglang-jax'
+        if: github.ref == 'refs/heads/main' && github.repository == 'sgl-project/sglang-jax' && inputs.pr_number == ''
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
           GITHUB_RUN_ID: ${{ github.run_id }}
@@ -167,7 +272,7 @@ jobs:
             echo "::warning::No perf CSV to publish — suite produced no per-model CSV"
           fi
       - name: Publish perf traces to ci-data (main only)
-        if: github.ref == 'refs/heads/main' && github.repository == 'sgl-project/sglang-jax'
+        if: github.ref == 'refs/heads/main' && github.repository == 'sgl-project/sglang-jax' && inputs.pr_number == ''
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
           GITHUB_RUN_ID: ${{ github.run_id }}
@@ -183,7 +288,7 @@ jobs:
             echo "::warning::No perf traces to publish"
           fi
       - name: Publish perf JSON to observability dashboard mount (main only)
-        if: github.ref == 'refs/heads/main' && github.repository == 'sgl-project/sglang-jax'
+        if: github.ref == 'refs/heads/main' && github.repository == 'sgl-project/sglang-jax' && inputs.pr_number == ''
         run: |
           # observability bucket is gcsfuse-mounted (like /models), so this is a
           # plain copy; layout matches multi-host, single-host- prefix marks source.
@@ -202,6 +307,30 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
+  nightly-test-perf-4-tpu-comment:
+    # Same trust-boundary split as the accuracy comment job: PASS/FAIL posted from a
+    # clean job that never ran PR-HEAD code. Skips cancelled (superseded) / skipped.
+    needs: nightly-test-perf-text-models-4-tpu-daily
+    if: >-
+      always() && inputs.pr_number != ''
+      && contains(fromJSON('["success", "failure"]'), needs.nightly-test-perf-text-models-4-tpu-daily.result)
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Comment result on PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          CASE_KEY: ${{ inputs.cases || 'perf-text-models-v6e-4' }}
+          RESULT: ${{ needs.nightly-test-perf-text-models-4-tpu-daily.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ "$RESULT" = "success" ]; then status="PASS"; else status="FAIL"; fi
+          gh pr comment "$PR_NUMBER" --repo "$REPO" \
+            --body "> **Nightly (perf)** [\`$CASE_KEY\`]($RUN_URL): **$status** — see the run's step summary."
+
   nightly-test-daily-finish:
     needs: [
       nightly-test-accuracy-text-models-1-tpu-daily,
@@ -212,7 +341,7 @@ jobs:
       nightly-test-accuracy-text-models-4-tpu-daily,
       nightly-test-perf-text-models-4-tpu-daily,
     ]
-    if: always() && github.repository == 'sgl-project/sglang-jax'
+    if: always() && github.repository == 'sgl-project/sglang-jax' && (inputs.job_filter == '' || inputs.job_filter == 'all')
     runs-on: ubuntu-latest
     steps:
       - name: Check all daily job statuses
