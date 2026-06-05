@@ -54,6 +54,16 @@ class FusedGreedyVerifyPhaseAsync(NamedTuple):
     cache_miss_count: int
 
 
+class PreparedFusedGreedyVerifyLaunch(NamedTuple):
+    target_forward_batch: object
+    target_logits_metadata: object
+    previous_verified_id: object | None
+    previous_token_list: object | None
+    draft_verify_write_lens: object
+    return_target_logits: bool
+    return_target_hidden: bool
+
+
 class FusedDraftExtendDispatch(NamedTuple):
     batch_output: object
     selector: np.ndarray
@@ -488,7 +498,7 @@ def _build_fused_greedy_decode_jit(num_layers: int, topk: int):
     return fused_greedy_decode
 
 
-def _prepare_topk1_verify_placeholders_from_draft_state(draft_worker, model_worker_batch):
+def _prepare_topk1_verify_placeholders_for_batch(draft_worker, model_worker_batch):
     """Prepare fixed-shape verify placeholders while keeping chain build inside JIT."""
     from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode
     from sgl_jax.srt.speculative.eagle_util import EagleVerifyInput
@@ -498,17 +508,6 @@ def _prepare_topk1_verify_placeholders_from_draft_state(draft_worker, model_work
     draft_input = model_worker_batch.spec_info_padded
     if isinstance(getattr(draft_input, "new_seq_lens", None), jax.Array):
         model_worker_batch.target_verify_seq_lens_device = draft_input.new_seq_lens
-    previous_verified_id = draft_input.verified_id
-    if isinstance(previous_verified_id, np.ndarray):
-        previous_verified_id = np.asarray(previous_verified_id, dtype=np.int32)
-    previous_token_list = getattr(draft_input, "previous_token_list", None)
-    if previous_token_list is None:
-        previous_token_list = draft_input.topk_index[:, :, 0]
-    if isinstance(previous_token_list, np.ndarray):
-        previous_token_list = np.asarray(previous_token_list, dtype=np.int32)
-    else:
-        previous_token_list = previous_token_list.astype(jnp.int32)
-
     bs = model_worker_batch.seq_lens.shape[0]
     n = draft_worker.speculative_num_draft_tokens
     placeholders = _get_fused_verify_zero_placeholders(draft_worker, bs=bs, n=n)
@@ -527,6 +526,23 @@ def _prepare_topk1_verify_placeholders_from_draft_state(draft_worker, model_work
         seq_lens_sum=model_worker_batch.seq_lens_sum,
         seq_lens_cpu=model_worker_batch.seq_lens,
     )
+
+
+def _prepare_topk1_verify_placeholders_from_draft_state(draft_worker, model_worker_batch):
+    """Prepare previous draft handles plus fixed-shape verify placeholders."""
+    draft_input = model_worker_batch.spec_info_padded
+    previous_verified_id = draft_input.verified_id
+    if isinstance(previous_verified_id, np.ndarray):
+        previous_verified_id = np.asarray(previous_verified_id, dtype=np.int32)
+    previous_token_list = getattr(draft_input, "previous_token_list", None)
+    if previous_token_list is None:
+        previous_token_list = draft_input.topk_index[:, :, 0]
+    if isinstance(previous_token_list, np.ndarray):
+        previous_token_list = np.asarray(previous_token_list, dtype=np.int32)
+    else:
+        previous_token_list = previous_token_list.astype(jnp.int32)
+
+    _prepare_topk1_verify_placeholders_for_batch(draft_worker, model_worker_batch)
     return previous_verified_id, previous_token_list
 
 
@@ -1123,30 +1139,32 @@ def _build_fused_greedy_verify_jit():
     return fused_greedy_verify
 
 
-def spec_decode_verify_phase_enqueue(
+def prepare_fused_greedy_verify_launch(
     spec_worker,
     model_worker_batch,
     padded_allocate_lens,
     compact_allocate_lens,
+    *,
+    require_previous: bool = True,
 ):
-    """Enqueue fused verify and Phase A D2H, returning before materialization."""
-    from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
-    from sgl_jax.srt.managers.scheduler import GenerationBatchResult
-    from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
-
+    """Prepare host metadata and ForwardBatch for a fused greedy verify launch."""
     draft_worker = spec_worker.draft_worker
     target_worker = spec_worker.target_worker
     target_mr = target_worker.model_runner
-    selector = np.asarray(model_worker_batch.logits_indices_selector)
-    seq_lens_host = np.asarray(model_worker_batch.seq_lens)
     draft_verify_write_lens = getattr(
         model_worker_batch.spec_info_padded,
         "verify_write_lens",
         None,
     )
-    previous_verified_id, previous_token_list = _prepare_topk1_verify_placeholders_from_draft_state(
-        draft_worker, model_worker_batch
-    )
+    if require_previous:
+        previous_verified_id, previous_token_list = (
+            _prepare_topk1_verify_placeholders_from_draft_state(draft_worker, model_worker_batch)
+        )
+    else:
+        previous_verified_id = None
+        previous_token_list = None
+        _prepare_topk1_verify_placeholders_for_batch(draft_worker, model_worker_batch)
+
     spec_info = model_worker_batch.spec_info_padded
     return_target_logits = bool(
         getattr(model_worker_batch, "return_logprob", False)
@@ -1166,11 +1184,60 @@ def spec_decode_verify_phase_enqueue(
         spec_worker.mesh,
         cache_owner=target_mr,
     )
+    return PreparedFusedGreedyVerifyLaunch(
+        target_forward_batch=target_forward_batch,
+        target_logits_metadata=target_logits_metadata,
+        previous_verified_id=previous_verified_id,
+        previous_token_list=previous_token_list,
+        draft_verify_write_lens=draft_verify_write_lens,
+        return_target_logits=return_target_logits,
+        return_target_hidden=return_target_hidden,
+    )
+
+
+def spec_decode_verify_phase_enqueue(
+    spec_worker,
+    model_worker_batch,
+    padded_allocate_lens,
+    compact_allocate_lens,
+    *,
+    prepared_launch=None,
+):
+    """Enqueue fused verify and Phase A D2H, returning before materialization."""
+    from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
+    from sgl_jax.srt.managers.scheduler import GenerationBatchResult
+    from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
+
+    draft_worker = spec_worker.draft_worker
+    target_worker = spec_worker.target_worker
+    target_mr = target_worker.model_runner
+    selector = np.asarray(model_worker_batch.logits_indices_selector)
+    seq_lens_host = np.asarray(model_worker_batch.seq_lens)
+    if prepared_launch is None:
+        with jax.profiler.TraceAnnotation("prepare_fused_greedy_verify_launch"):
+            prepared_launch = prepare_fused_greedy_verify_launch(
+                spec_worker,
+                model_worker_batch,
+                padded_allocate_lens,
+                compact_allocate_lens,
+            )
+    target_forward_batch = prepared_launch.target_forward_batch
+    target_logits_metadata = prepared_launch.target_logits_metadata
+    previous_verified_id = prepared_launch.previous_verified_id
+    previous_token_list = prepared_launch.previous_token_list
+    draft_verify_write_lens = prepared_launch.draft_verify_write_lens
+    return_target_logits = prepared_launch.return_target_logits
+    return_target_hidden = prepared_launch.return_target_hidden
+    assert previous_verified_id is not None, "prepared verify launch missing previous_verified_id"
+    assert previous_token_list is not None, "prepared verify launch missing previous_token_list"
 
     if not hasattr(draft_worker, "_fused_greedy_verify_jit_fn"):
         draft_worker._fused_greedy_verify_jit_fn = _build_fused_greedy_verify_jit()
 
-    with jax.set_mesh(draft_worker.mesh):
+    with (
+        jax.set_mesh(draft_worker.mesh),
+        jax.profiler.TraceAnnotation("submit_fused_greedy_verify_jit"),
+    ):
         (
             prepared_hidden,
             prepared_positions,

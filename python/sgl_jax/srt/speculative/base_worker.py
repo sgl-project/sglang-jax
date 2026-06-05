@@ -154,7 +154,12 @@ class BaseSpecWorker:
             predispatch_draft_extend=predispatch_draft_extend,
         )
 
-    def forward_batch_speculative_verify_phase_enqueue(self, model_worker_batch: ModelWorkerBatch):
+    def forward_batch_speculative_verify_phase_enqueue(
+        self,
+        model_worker_batch: ModelWorkerBatch,
+        *,
+        prepared_launch=None,
+    ):
         """Enqueue greedy fused spec verify/sample and Phase A D2H."""
         sel = model_worker_batch.logits_indices_selector
         padded_allocate_lens = np.asarray(model_worker_batch.spec_info_padded.allocate_lens)
@@ -171,6 +176,7 @@ class BaseSpecWorker:
             model_worker_batch,
             padded_allocate_lens,
             compact_allocate_lens,
+            prepared_launch=prepared_launch,
         )
 
     def materialize_speculative_verify_phase(self, verify_phase_async_result):

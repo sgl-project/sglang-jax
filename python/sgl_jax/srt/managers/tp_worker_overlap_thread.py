@@ -512,10 +512,42 @@ class ModelWorkerClient:
                     dtype=np.int32,
                 ).copy(),
             )
-            return self._build_same_batch_spec_chain_candidate_batch(
+            candidate = self._build_same_batch_spec_chain_candidate_batch(
                 model_worker_batch,
                 prebuild_pending,
             )
+            if candidate is not None:
+                candidate.prepared_fused_greedy_verify_launch = (
+                    self._prepare_chained_verify_launch_after_phase_a(candidate)
+                )
+            return candidate
+
+    def _prepare_chained_verify_launch_after_phase_a(self, candidate_batch: ModelWorkerBatch):
+        try:
+            from sgl_jax.srt.speculative.draft_extend_fused import (
+                prepare_fused_greedy_verify_launch,
+            )
+
+            padded_allocate_lens = np.asarray(candidate_batch.spec_info_padded.allocate_lens)
+            selector = np.asarray(candidate_batch.logits_indices_selector)
+            if selector.size > 0 and int(np.max(selector)) < len(padded_allocate_lens):
+                compact_allocate_lens = padded_allocate_lens[selector]
+            else:
+                compact_allocate_lens = padded_allocate_lens
+            with jax.profiler.TraceAnnotation("prepare_chained_verify_launch_after_phase_a"):
+                return prepare_fused_greedy_verify_launch(
+                    self.spec_worker,
+                    candidate_batch,
+                    padded_allocate_lens,
+                    compact_allocate_lens,
+                    require_previous=False,
+                )
+        except Exception:
+            logger.debug(
+                "same_batch_chain prepared launch unavailable",
+                exc_info=True,
+            )
+            return None
 
     def _stash_prebuilt_same_batch_spec_chain_candidate(
         self,
@@ -535,6 +567,7 @@ class ModelWorkerClient:
             return
 
         candidate_spec_info = candidate_batch.spec_info_padded
+        prepared_launch = getattr(candidate_batch, "prepared_fused_greedy_verify_launch", None)
         for field in (
             "topk_index",
             "topk_p",
@@ -549,7 +582,22 @@ class ModelWorkerClient:
         if new_seq_lens is not None:
             candidate_spec_info.new_seq_lens = new_seq_lens
 
-        if (
+        if prepared_launch is not None:
+            previous_verified_id = getattr(padded_next_draft_input, "verified_id", None)
+            previous_token_list = getattr(padded_next_draft_input, "previous_token_list", None)
+            if previous_token_list is None:
+                topk_index = getattr(padded_next_draft_input, "topk_index", None)
+                if topk_index is not None:
+                    previous_token_list = topk_index[:, :, 0]
+            if previous_verified_id is None or previous_token_list is None:
+                self.pending_same_batch_spec_chain_candidate = None
+                return
+            prepared_launch = prepared_launch._replace(
+                previous_verified_id=previous_verified_id,
+                previous_token_list=previous_token_list,
+            )
+            candidate_batch.prepared_fused_greedy_verify_launch = prepared_launch
+        elif (
             getattr(candidate_spec_info, "topk_index", None) is None
             and getattr(candidate_spec_info, "previous_token_list", None) is None
         ) or getattr(candidate_spec_info, "verified_id", None) is None:
@@ -561,6 +609,7 @@ class ModelWorkerClient:
         ):
             verify_async_result = self.spec_worker.forward_batch_speculative_verify_phase_enqueue(
                 candidate_batch,
+                prepared_launch=prepared_launch,
             )
         self.pending_same_batch_spec_chain_candidate = SimpleNamespace(
             req_pool_indices=np.asarray(candidate_batch.req_pool_indices, dtype=np.int32).copy(),

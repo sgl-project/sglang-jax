@@ -236,3 +236,10 @@ def test_phase_a_prebuild_builds_same_batch_candidate_from_padded_new_seq_lens()
     np.testing.assert_array_equal(candidate.seq_lens, verify_result.padded_new_seq_lens_host)
     assert candidate.seq_lens_sum == int(verify_result.padded_new_seq_lens_host.sum())
     assert candidate.skip_fused_verify_padding_for_decode is True
+
+
+def test_prebuilt_candidate_keeps_prepared_verify_launch_payload():
+    payload = object()
+    candidate = SimpleNamespace(prepared_fused_greedy_verify_launch=payload)
+
+    assert candidate.prepared_fused_greedy_verify_launch is payload
