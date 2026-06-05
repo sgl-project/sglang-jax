@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
@@ -83,143 +84,132 @@ class TestVerifyTree(CustomTestCase):
         )
         np.testing.assert_array_equal(np.asarray(packed), expected)
 
-    def test_verify_tree_greedy_device_outputs_match_host_postprocess(self):
-        from sgl_jax.srt.speculative.eagle_util import greedy_sample_device_outputs
+    def test_fused_chain_verify_matches_topk1_linear_reference(self):
+        from sgl_jax.srt.speculative.draft_extend_fused import (
+            _greedy_sample_and_prepare_draft_inputs_chain_from_predict,
+        )
 
         speculative_num_steps = 3
         num_draft_tokens = 4
+        bs = 4
         draft_tokens = jnp.array(
             [
+                10,
                 11,
+                12,
+                13,
+                20,
+                21,
+                22,
+                23,
+                30,
+                31,
+                32,
+                33,
+                40,
+                41,
+                42,
+                43,
+            ],
+            dtype=jnp.int32,
+        )
+        target_predict = np.array(
+            [
+                99,
                 12,
                 13,
                 14,
                 21,
-                22,
+                99,
                 23,
                 24,
+                31,
+                32,
+                99,
+                34,
+                41,
+                42,
+                43,
+                44,
             ],
-            dtype=jnp.int32,
+            dtype=np.int32,
         )
-        retrive_index = jnp.array(
-            [
-                [0, 1, 2, 3],
-                [4, 5, 6, 7],
-            ],
-            dtype=jnp.int32,
+        chain = _greedy_sample_and_prepare_draft_inputs_chain_from_predict(
+            target_hidden=jnp.arange(bs * num_draft_tokens * 2, dtype=jnp.float32).reshape(
+                bs * num_draft_tokens, 2
+            ),
+            positions=jnp.arange(bs * num_draft_tokens, dtype=jnp.int32),
+            seq_lens=jnp.array([100, 200, 300, 400], dtype=jnp.int32),
+            draft_tokens=draft_tokens,
+            target_predict=jnp.asarray(target_predict),
+            speculative_num_steps=speculative_num_steps,
+            speculative_num_draft_tokens=num_draft_tokens,
         )
-        retrive_next_token = jnp.array(
-            [
-                [1, 2, 3, -1],
-                [1, 2, 3, -1],
-            ],
-            dtype=jnp.int32,
+
+        np.testing.assert_array_equal(np.asarray(chain.accept_lens), np.array([1, 2, 3, 4]))
+        np.testing.assert_array_equal(
+            np.asarray(chain.select_index),
+            np.arange(bs, dtype=np.int32) * (speculative_num_steps + 1)
+            + np.asarray(chain.accept_lens)
+            - 1,
         )
-        retrive_next_sibling = jnp.full((2, 4), -1, dtype=jnp.int32)
-        vocab = 32
-        logits = jnp.full((8, vocab), 1.0, dtype=jnp.float32)
-        logits = logits.at[0, 11].set(10.0)
-        logits = logits.at[1, 12].set(10.0)
-        logits = logits.at[2, 99 % vocab].set(10.0)
-        logits = logits.at[3, 14].set(10.0)
-        logits = logits.at[4, 21].set(10.0)
-        logits = logits.at[5, 22].set(10.0)
-        logits = logits.at[6, 23].set(10.0)
-        logits = logits.at[7, 24].set(10.0)
-
-        from sgl_jax.srt.speculative import eagle_util
-
-        def fake_verify_tree_greedy(**kwargs):
-            return (
-                jnp.array([[0, 1, -1, -1], [4, 5, 6, -1]], dtype=jnp.int32),
-                jnp.array([2, 3], dtype=jnp.int32),
-                jnp.array(
-                    [
-                        [11, 12, 0, 0, 99],
-                        [21, 22, 23, 0, 88],
-                    ],
-                    dtype=jnp.int32,
-                ),
-            )
-
-        old_verify_tree_greedy = eagle_util.verify_tree_greedy
-        eagle_util.verify_tree_greedy = fake_verify_tree_greedy
-        try:
-            outputs = greedy_sample_device_outputs(
-                speculative_num_steps=speculative_num_steps,
-                num_draft_tokens=num_draft_tokens,
-                draft_tokens=draft_tokens,
-                retrive_index=retrive_index,
-                retrive_next_token=retrive_next_token,
-                retrive_next_sibling=retrive_next_sibling,
-                next_token_logits=logits,
-            )
-        finally:
-            eagle_util.verify_tree_greedy = old_verify_tree_greedy
-
-        expected_accept_index = np.array([0, 1, -1, -1, 4, 5, 6, -1], dtype=np.int32)
-        expected_accept_length = np.array([3, 4], dtype=np.int32)
-        req_ids = np.arange(len(expected_accept_index)) // (speculative_num_steps + 1)
-        expected_safe_index = np.where(
-            expected_accept_index >= 0,
-            expected_accept_index,
-            req_ids * num_draft_tokens + num_draft_tokens - 1,
+        select_index = np.asarray(chain.select_index)
+        np.testing.assert_array_equal(
+            np.asarray(chain.verified_id)[select_index],
+            np.array([99, 99, 99, 44], dtype=np.int32),
         )
-        expected_predict = np.array([[11, 12, 0, 0, 99], [21, 22, 23, 0, 88]], dtype=np.int32)
-        expected_verified_id = np.array([11, 12, 0, 0, 99, 21, 22, 0], dtype=np.int32)
-        expected_select_index = np.array([2, 7], dtype=np.int32)
 
-        np.testing.assert_array_equal(np.asarray(outputs.predict), expected_predict)
-        np.testing.assert_array_equal(np.asarray(outputs.accept_index), expected_accept_index)
-        np.testing.assert_array_equal(np.asarray(outputs.accept_length), expected_accept_length)
-        np.testing.assert_array_equal(np.asarray(outputs.safe_index), expected_safe_index)
-        np.testing.assert_array_equal(np.asarray(outputs.verified_id), expected_verified_id)
-        np.testing.assert_array_equal(np.asarray(outputs.select_index), expected_select_index)
+    def test_fused_chain_verify_zeroes_padding_accept_length(self):
+        from sgl_jax.srt.speculative.draft_extend_fused import (
+            _greedy_sample_and_prepare_draft_inputs_chain_from_predict,
+        )
 
-    def test_greedy_sample_device_outputs_enters_mesh_context(self):
-        from sgl_jax.srt.speculative import eagle_util
-        from sgl_jax.srt.speculative.eagle_util import greedy_sample_device_outputs
+        out = _greedy_sample_and_prepare_draft_inputs_chain_from_predict(
+            target_hidden=jnp.arange(8 * 2, dtype=jnp.float32).reshape(8, 2),
+            positions=jnp.arange(8, dtype=jnp.int32),
+            seq_lens=jnp.array([0, 10], dtype=jnp.int32),
+            draft_tokens=jnp.array([0, 0, 0, 0, 20, 21, 22, 23], dtype=jnp.int32),
+            target_predict=jnp.array([0, 0, 0, 0, 21, 22, 99, 24], dtype=jnp.int32),
+            speculative_num_steps=3,
+            speculative_num_draft_tokens=4,
+        )
 
-        entered = {"value": False}
+        np.testing.assert_array_equal(np.asarray(out.accept_lens), np.array([0, 3]))
+        np.testing.assert_array_equal(np.asarray(out.new_seq_lens), np.array([0, 13]))
+        np.testing.assert_array_equal(np.asarray(out.sel_pos), np.array([0, 2]))
 
-        class _Ctx:
-            def __enter__(self):
-                entered["value"] = True
+    def test_fused_materialize_uses_original_seq_lens_for_new_seq_lens(self):
+        from sgl_jax.srt.speculative.draft_extend_fused import (
+            _materialize_fused_greedy_batch_output_for_scheduler,
+        )
 
-            def __exit__(self, exc_type, exc, tb):
-                pass
+        batch_output = SimpleNamespace(
+            logits_output=None,
+            next_draft_input=SimpleNamespace(),
+            allocate_lens=np.array([9, 8, 7], dtype=np.int32),
+            accept_lens=None,
+            next_token_ids=None,
+        )
+        out = _materialize_fused_greedy_batch_output_for_scheduler(
+            batch_output=batch_output,
+            selector=np.array([0, 2], dtype=np.int32),
+            real_bs=2,
+            seq_lens_host=np.array([103, 203, 303], dtype=np.int32),
+            layer0_hidden=jnp.arange(12 * 2, dtype=jnp.float32).reshape(12, 2),
+            topk_index_stacked=jnp.array(
+                [[[11], [12], [13]], [[21], [22], [23]], [[31], [32], [33]]]
+            ),
+            accept_lens_device=jnp.array([1, 2, 4], dtype=jnp.int32),
+            predict_device=jnp.arange(12, dtype=jnp.int32),
+            speculative_num_draft_tokens=4,
+            target_logits=None,
+            target_hidden=None,
+        )
 
-        def fake_set_mesh(mesh):
-            return _Ctx()
-
-        def fake_verify_tree_greedy(**kwargs):
-            assert entered["value"]
-            return (
-                jnp.array([[0, -1, -1, -1]], dtype=jnp.int32),
-                jnp.array([0], dtype=jnp.int32),
-                jnp.array([[1, 2, 3, 4, 5]], dtype=jnp.int32),
-            )
-
-        old_set_mesh = eagle_util.jax.set_mesh
-        old_verify_tree_greedy = eagle_util.verify_tree_greedy
-        eagle_util.jax.set_mesh = fake_set_mesh
-        eagle_util.verify_tree_greedy = fake_verify_tree_greedy
-        try:
-            greedy_sample_device_outputs(
-                speculative_num_steps=3,
-                num_draft_tokens=4,
-                draft_tokens=jnp.arange(4, dtype=jnp.int32),
-                retrive_index=jnp.arange(4, dtype=jnp.int32).reshape(1, 4),
-                retrive_next_token=jnp.full((4,), -1, dtype=jnp.int32),
-                retrive_next_sibling=jnp.full((4,), -1, dtype=jnp.int32),
-                next_token_logits=jnp.zeros((4, 8), dtype=jnp.float32),
-                mesh=object(),
-            )
-        finally:
-            eagle_util.jax.set_mesh = old_set_mesh
-            eagle_util.verify_tree_greedy = old_verify_tree_greedy
-
-        assert entered["value"]
+        np.testing.assert_array_equal(
+            out.next_draft_input.new_seq_lens,
+            np.array([101, 304], dtype=np.int32),
+        )
 
     def test_verify_tree_greedy(self):
         candidates = jnp.array(

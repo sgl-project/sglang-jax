@@ -59,8 +59,9 @@ def _greedy_prepare_draft_inputs(
     )
     per_req_last = req_ids * speculative_num_draft_tokens + speculative_num_draft_tokens - 1
     safe_index = jnp.where(accept_index >= 0, accept_index, per_req_last)
+    safe_accept_length = jnp.clip(accept_length, 1, None)
     select_index = (
-        jnp.arange(accept_length.shape[0], dtype=jnp.int32) * accept_width + accept_length - 1
+        jnp.arange(accept_length.shape[0], dtype=jnp.int32) * accept_width + safe_accept_length - 1
     )
     hidden_sharding = jax.typeof(hidden_states).sharding
     positions_sharding = jax.typeof(positions).sharding
@@ -100,15 +101,18 @@ def _greedy_sample_and_prepare_draft_inputs_chain_from_predict(
     target_predict_2d = target_predict.reshape(bs, n)
 
     child_matches = draft_2d[:, 1:] == target_predict_2d[:, :-1]
+    is_padding = seq_lens == 0
     accepted_children = jnp.cumprod(child_matches.astype(jnp.int32), axis=1).astype(jnp.bool_)
+    accepted_children = jnp.where(is_padding[:, None], False, accepted_children)
     accept_length_raw = jnp.sum(accepted_children.astype(jnp.int32), axis=1)
-    accept_length = accept_length_raw + 1
+    accept_length = jnp.where(is_padding, 0, accept_length_raw + 1)
 
     row_ids = jnp.zeros_like(accept_length_raw) + jnp.arange(bs, dtype=jnp.int32)
     base = row_ids[:, None] * n
     child_offsets = jnp.arange(1, width, dtype=jnp.int32)[None, :]
     accept_index_children = jnp.where(accepted_children, base + child_offsets, -1)
     accept_index_2d = jnp.concatenate([base, accept_index_children], axis=1)
+    accept_index_2d = jnp.where(is_padding[:, None], -1, accept_index_2d)
     accept_index = accept_index_2d.reshape(-1)
 
     predict = target_predict.astype(jnp.int32).reshape(-1)
@@ -737,7 +741,8 @@ def _materialize_fused_greedy_batch_output_for_scheduler(
         seq_lens_host = np.asarray(seq_lens_host)
         verified_pos = selector * speculative_num_draft_tokens + accept_lens[selector] - 1
         batch_output.next_draft_input.verified_id = predict[verified_pos]
-        batch_output.next_draft_input.new_seq_lens = seq_lens_host[selector] + accept_lens[selector]
+        original_seq_lens = seq_lens_host[selector] - speculative_num_draft_tokens + 1
+        batch_output.next_draft_input.new_seq_lens = original_seq_lens + accept_lens[selector]
         batch_output.allocate_lens = batch_output.allocate_lens[:real_bs]
         batch_output.accept_lens = accept_lens
         batch_output.next_token_ids = predict
