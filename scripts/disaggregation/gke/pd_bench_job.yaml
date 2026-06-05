@@ -146,7 +146,7 @@ spec:
             echo "=========================================="
             echo "Benchmark 1: GSM8K (200 questions)"
             echo "=========================================="
-            python scripts/pd_bench_gsm8k.py \
+            python scripts/disaggregation/bench_gsm8k.py \
               --prefill-url "$P_URL" \
               --decode-url "$D_URL" \
               --num-questions 200 \
@@ -160,7 +160,7 @@ spec:
             echo "=========================================="
             echo "Benchmark 2: Throughput sweep"
             echo "=========================================="
-            python scripts/pd_bench_throughput.py \
+            python scripts/disaggregation/bench_throughput.py \
               --prefill-url "$P_URL" \
               --decode-url "$D_URL" \
               --model-path "$MODEL_PATH" \

@@ -2,7 +2,7 @@
 # Deploy PD e2e test job on GKE.
 #
 # Usage:
-#   ./scripts/pd_e2e_gke/deploy.sh [--delete-only]
+#   ./scripts/disaggregation/gke/deploy.sh [--delete-only]
 #
 # Prerequisites:
 #   - gcloud + kubectl configured, USE_GKE_GCLOUD_AUTH_PLUGIN=True

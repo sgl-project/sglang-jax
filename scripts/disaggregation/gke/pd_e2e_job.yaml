@@ -151,7 +151,7 @@ spec:
             echo "=========================================="
             echo "Running PD e2e test suite (Tier 1 + 2)..."
             echo "=========================================="
-            python scripts/pd_e2e_test_suite.py \
+            python scripts/disaggregation/e2e_test_suite.py \
               --prefill-url "http://${P_HOST}:10000" \
               --decode-url "http://localhost:10001" \
               --skip-health-check \

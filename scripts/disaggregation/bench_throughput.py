@@ -6,7 +6,7 @@ measuring decode-side throughput across different input/output sizes and
 concurrency levels.
 
 Usage:
-    python scripts/pd_bench_throughput.py \
+    python scripts/disaggregation/bench_throughput.py \
         --prefill-url http://<P>:10000 \
         --decode-url  http://<D>:10001 \
         --configs "512:1024:16,1024:1024:32,2048:1024:32,4096:1024:64"

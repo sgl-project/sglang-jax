@@ -44,10 +44,20 @@ def test_pd_mixins_use_explicit_scheduler_contracts_for_first_party_fields():
     truly heterogeneous inputs.
     """
 
-    root = Path(__file__).parents[3]
+    root = Path(__file__).resolve().parents[3]
     sources = {
-        "prefill": root / "sgl_jax" / "srt" / "disaggregation" / "prefill.py",
-        "decode": root / "sgl_jax" / "srt" / "disaggregation" / "decode.py",
+        "prefill": root
+        / "python"
+        / "sgl_jax"
+        / "srt"
+        / "disaggregation"
+        / "prefill.py",
+        "decode": root
+        / "python"
+        / "sgl_jax"
+        / "srt"
+        / "disaggregation"
+        / "decode.py",
     }
     for source in sources.values():
         text = source.read_text()

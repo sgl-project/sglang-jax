@@ -27,7 +27,7 @@ Step 3: Start D server on Machine B:
         --disaggregation-bootstrap-url http://<MACHINE_A_IP>:8998
 
 Step 4: Run this test from any machine:
-    python scripts/pd_e2e_two_host.py \
+    python scripts/disaggregation/e2e_two_host.py \
         --prefill-url http://<MACHINE_A_IP>:10000 \
         --decode-url  http://<MACHINE_B_IP>:10001 \
         [--prompt "What is 2+2?"] \
