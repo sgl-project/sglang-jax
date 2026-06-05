@@ -1,4 +1,5 @@
 import functools
+import os
 
 import jax
 import jax.numpy as jnp
@@ -7,6 +8,11 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.utils.common_utils import cdiv
+
+
+def _get_interpret() -> bool:
+    env = os.environ.get("PALLAS_INTERPRET", "")
+    return env.strip().lower() in ("1", "true")
 
 
 def _verify_tree_greedy_kernel(
@@ -38,8 +44,27 @@ def _verify_tree_greedy_kernel(
             unroll=num_spec_tokens,
         )
 
+    def init_predicts():
+        def body(i, _):
+            o_predicts_ref.at[bid * draft_token_num + i].set(0)
+
+        jax.lax.fori_loop(
+            0,
+            draft_token_num,
+            body,
+            None,
+            unroll=draft_token_num,
+        )
+        jax.lax.cond(
+            bid == 0,
+            lambda _: o_predicts_ref.at[target_predict_ref.shape[0]].set(0),
+            lambda _: None,
+            operand=None,
+        )
+
     # init accept_index to -1
     init_accept_index()
+    init_predicts()
     # index-0 token must be accepted
     last_accepted_retrive_idx = retrive_index_ref[bid * draft_token_num]
     o_accept_index_ref.at[bid, 0].set(last_accepted_retrive_idx)
@@ -211,6 +236,7 @@ def verify_tree_greedy_pallas_call(
     num_spec_tokens: int,
 ):
     """Verify the tree greedy using a Pallas kernel"""
+    interpret = _get_interpret()
     bs = candidates.shape[0]
 
     (candidates, retrive_index, retrive_next_token, retrive_next_sibling) = prepare_for_verify(
@@ -254,6 +280,7 @@ def verify_tree_greedy_pallas_call(
             jax.ShapeDtypeStruct(shape=accept_token_num.shape, dtype=accept_token_num.dtype),
             jax.ShapeDtypeStruct(shape=predicts.shape, dtype=predicts.dtype),
         ],
+        interpret=interpret,
     )
     (
         accept_index,
