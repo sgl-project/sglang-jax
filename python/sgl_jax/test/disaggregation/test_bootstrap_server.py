@@ -307,3 +307,55 @@ def test_registry_stores_protocol_version():
     )
     rows = reg.list_all()
     assert rows[0].protocol_version == PROTOCOL_VERSION
+
+
+# ---- register retry (ref: upstream test_register_to_bootstrap.py) -----------
+
+
+def test_register_prefill_succeeds_after_transient_failures(monkeypatch):
+    """register_prefill retries on ConnectError and succeeds eventually."""
+    client = BootstrapClient(
+        "http://nowhere:9999",
+        register_retries=3,
+        register_retry_delay_s=0,
+    )
+
+    call_count = 0
+
+    def _mock_post(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count < 3:
+            raise httpx.ConnectError("connection refused")
+        resp = mock.MagicMock()
+        resp.raise_for_status.return_value = None
+        return resp
+
+    monkeypatch.setattr(httpx, "post", _mock_post)
+    client.register_prefill(
+        host="10.0.0.1",
+        transfer_port=30001,
+        side_channel_port=9600,
+        bootstrap_key="k1",
+    )
+    assert call_count == 3
+
+
+def test_register_prefill_exhausts_retries_and_raises(monkeypatch):
+    """All retries fail → RuntimeError."""
+    client = BootstrapClient(
+        "http://nowhere:9999",
+        register_retries=2,
+        register_retry_delay_s=0,
+    )
+    monkeypatch.setattr(
+        httpx, "post",
+        mock.MagicMock(side_effect=httpx.ConnectError("refused")),
+    )
+    with pytest.raises(RuntimeError, match="failed after 2 attempts"):
+        client.register_prefill(
+            host="10.0.0.1",
+            transfer_port=30001,
+            side_channel_port=9600,
+            bootstrap_key="k2",
+        )

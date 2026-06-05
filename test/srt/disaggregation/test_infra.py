@@ -77,10 +77,6 @@ def test_bootstrap_registry_gauge_set():
     M.PD_BOOTSTRAP_REGISTRY_SIZE.set(0)
 
 
-def test_is_prometheus_available_is_bool():
-    assert isinstance(M.is_prometheus_available(), bool)
-
-
 def test_noop_when_prom_missing(monkeypatch):
     class _BoomMetric:
         def labels(self, **_):

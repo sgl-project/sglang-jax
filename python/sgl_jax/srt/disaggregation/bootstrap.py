@@ -1,15 +1,4 @@
-"""PD bootstrap: P↔D rendezvous service + client.
-
-The bootstrap server is a centralised FastAPI process. Every prefill
-worker registers itself on start, heartbeats periodically, and
-deregisters on exit. Every decode worker asks the server (per request,
-keyed by ``bootstrap_room``) which prefill peer holds the KV for that
-request.
-
-This is the lightest viable rendezvous — single process, no
-replication, optional shared-secret auth. Production hardening
-(graceful shutdown, replication) is out of scope.
-"""
+"""PD bootstrap: P↔D rendezvous service + client."""
 
 from __future__ import annotations
 
@@ -321,19 +310,7 @@ class BootstrapServer:
 
 
 class BootstrapClient:
-    """HTTP client for the bootstrap server.
-
-    Stateless — every call hits the server. Used by P (register +
-    heartbeat + unregister) and by D (get_prefill_info).
-
-    ``register_prefill`` retries on connection refused / timeout
-    because the bootstrap server may take a moment to come up
-    relative to the engine, and the engine's PD wiring would
-    otherwise crash on the first transient. The current retry policy
-    is fixed delay (``register_retry_delay_s``); jittered exponential
-    backoff is a follow-up if the fixed delay ever proves too
-    aggressive against a slow bootstrap.
-    """
+    """Stateless HTTP client for the bootstrap server."""
 
     def __init__(
         self,

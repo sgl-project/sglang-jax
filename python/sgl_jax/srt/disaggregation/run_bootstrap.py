@@ -1,16 +1,6 @@
 """Standalone PD bootstrap server entrypoint.
 
-Usage:
-    python -m sgl_jax.srt.disaggregation.run_bootstrap \\
-        --host 0.0.0.0 --port 8998
-
-Started by the operator (or systemd, or a sidecar) BEFORE the PD
-engines come up. The engines connect to this via
-``--disaggregation-bootstrap-url http://<this-host>:<port>``.
-
-This script does not import JAX, so it can run on any Python 3.12
-process — including a CPU-only container that doesn't even have
-the TPU runtime. The bootstrap server has no model state.
+Usage: python -m sgl_jax.srt.disaggregation.run_bootstrap --host 0.0.0.0 --port 8998
 """
 
 from __future__ import annotations
