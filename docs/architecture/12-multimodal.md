@@ -141,7 +141,7 @@ The `auto_regressive` Scheduler type in the YAML config reuses the text engine's
 
 | Directory | Model | Pipeline stages |
 |------|------|--------------|
-| `wan/` | Wan 2.1/2.2 | Embed → Diffusion → VAE |
+| `wan/` | Wan 2.1/2.2 | Text Encoder → Diffusion → VAE |
 | `qwen2_5VL/` | Qwen2.5-VL | ViT → AutoRegressive |
 | `qwen3_omni_moe/` | Qwen3-Omni-MoE | ViT → AutoRegressive → Audio |
 | `mimo_audio/` | MiMo Audio | Audio → AutoRegressive |
@@ -154,8 +154,8 @@ Each model has a corresponding YAML config under `multimodal/models/static_confi
 **Wan 2.1 example** (3-stage pipeline, `wan2_1_stage_config.yaml`):
 
 ```text
-Stage 0: scheduler=auto_regressive, model_class=UMT5EncoderModel
-  → Text encoding (reuses the text engine's Scheduler)
+Stage 0: scheduler=text_encoder, model_class=UMT5EncoderModel
+  → UMT5 text encoding through the dedicated encoder scheduler
 
 Stage 1: scheduler=diffusion, model_class=WanTransformer3DModel
   → N-step diffusion denoising

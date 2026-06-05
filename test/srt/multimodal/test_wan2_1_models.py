@@ -29,27 +29,30 @@ class TestWan2_1Model(CustomTestCase):
                 "--random-seed",
                 "3",
                 "--multimodal",
-                "--disable-precompile",
             ],
             multimodal=True,
         )
-        data = {
-            "prompt": "A curious raccoon",
-            "size": "480*832",
-            "num_frames": 41,
-            "num_inference_steps": 5,
-        }
-        response = requests.post(
-            DEFAULT_URL_FOR_TEST + "/api/v1/videos/generation",
-            headers=headers,
-            json=data,
-            timeout=1200,
-        )
-        response.raise_for_status()
-        result = response.json()
-        print("success！")
-        print(json.dumps(result, indent=4, ensure_ascii=False))
-        process.kill()
+        try:
+            data = {
+                "prompt": "A curious raccoon",
+                "size": "480*832",
+                "num_frames": 41,
+                "num_inference_steps": 5,
+            }
+            response = requests.post(
+                DEFAULT_URL_FOR_TEST + "/api/v1/videos/generation",
+                headers=headers,
+                json=data,
+                timeout=1200,
+            )
+            response.raise_for_status()
+            result = response.json()
+            self.assertTrue(result.get("success"), msg=f"generation not successful: {result}")
+            self.assertIn("meta_info", result)
+            print("success！")
+            print(json.dumps(result, indent=4, ensure_ascii=False))
+        finally:
+            kill_process_tree(process.pid)
 
     def test_wan2_1_14b(self):
         process = popen_launch_server(
@@ -63,22 +66,25 @@ class TestWan2_1Model(CustomTestCase):
                 "--random-seed",
                 "3",
                 "--multimodal",
-                "--disable-precompile",
             ],
             multimodal=True,
         )
-        data = {"prompt": "A curious raccoon", "size": "480*832", "num_frames": 5}
-        response = requests.post(
-            DEFAULT_URL_FOR_TEST + "/api/v1/videos/generation",
-            headers=headers,
-            json=data,
-            timeout=1200,
-        )
-        response.raise_for_status()
-        result = response.json()
-        print("success！")
-        print(json.dumps(result, indent=4, ensure_ascii=False))
-        process.kill()
+        try:
+            data = {"prompt": "A curious raccoon", "size": "480*832", "num_frames": 5}
+            response = requests.post(
+                DEFAULT_URL_FOR_TEST + "/api/v1/videos/generation",
+                headers=headers,
+                json=data,
+                timeout=1200,
+            )
+            response.raise_for_status()
+            result = response.json()
+            self.assertTrue(result.get("success"), msg=f"generation not successful: {result}")
+            self.assertIn("meta_info", result)
+            print("success！")
+            print(json.dumps(result, indent=4, ensure_ascii=False))
+        finally:
+            kill_process_tree(process.pid)
 
 
 if __name__ == "__main__":
