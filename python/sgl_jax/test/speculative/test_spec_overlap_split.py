@@ -266,3 +266,61 @@ def test_phase_b_relay_patches_only_device_dependent_fields():
     np.testing.assert_array_equal(candidate_spec.new_seq_lens, np.array([10, 20], dtype=np.int32))
     np.testing.assert_array_equal(candidate_spec.allocate_lens, np.array([30, 40], dtype=np.int32))
     np.testing.assert_array_equal(candidate_spec.verified_id, np.array([7, 8], dtype=np.int32))
+
+
+def test_swa_radix_cache_finished_req_uses_eagle_page_aligned_kv_len():
+    from sgl_jax.srt.mem_cache.swa_radix_cache import SWARadixCache
+
+    inserted = {}
+    freed = []
+
+    class FakeAllocator:
+        def free(self, indices, dp_rank=0):
+            freed.append((np.asarray(indices, dtype=np.int32).copy(), dp_rank))
+
+    class FakeReq:
+        req_pool_idx = 3
+        dp_rank = 0
+        origin_input_ids = [1, 2, 3]
+        output_ids = [4, 5, 6]
+        extra_key = None
+        cache_protected_len = 0
+        last_matched_prefix_len = 0
+        last_node = None
+        swa_uuid_for_lock = None
+        swa_evicted_seqlen = 0
+
+        def pop_committed_kv_cache(self):
+            return 5
+
+    cache = SWARadixCache.__new__(SWARadixCache)
+    cache.disable = False
+    cache.page_size = 4
+    cache.is_eagle = True
+    cache.req_to_token_pool = SimpleNamespace(
+        req_to_token=np.array(
+            [
+                np.zeros(16, dtype=np.int32),
+                np.zeros(16, dtype=np.int32),
+                np.zeros(16, dtype=np.int32),
+                np.array([11, 12, 13, 14, 15, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+            ]
+        )
+    )
+    cache.token_to_kv_pool_allocator = FakeAllocator()
+
+    def fake_insert(key, value, prev_prefix_len, swa_evicted_seqlen=0):
+        inserted["key_len"] = len(key.token_ids)
+        inserted["value"] = np.asarray(value, dtype=np.int32).copy()
+        inserted["prev_prefix_len"] = prev_prefix_len
+        inserted["swa_evicted_seqlen"] = swa_evicted_seqlen
+
+    cache.insert = fake_insert
+    cache.dec_lock_ref = lambda *args, **kwargs: None
+
+    cache.cache_finished_req(FakeReq())
+
+    assert inserted["key_len"] == 5
+    np.testing.assert_array_equal(inserted["value"], np.array([11, 12, 13, 14]))
+    assert len(freed) == 1
+    np.testing.assert_array_equal(freed[0][0], np.array([15], dtype=np.int32))

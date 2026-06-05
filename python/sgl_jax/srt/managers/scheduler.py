@@ -611,6 +611,7 @@ class Scheduler(
                     sliding_window_size=self.sliding_window_size,
                     page_size=self.page_size,
                     disable=False,
+                    is_eagle=self.spec_algorithm is not None and self.spec_algorithm.is_eagle(),
                 )
         elif server_args.chunked_prefill_size is not None and server_args.disable_radix_cache:
             self.tree_cache = ChunkCache(

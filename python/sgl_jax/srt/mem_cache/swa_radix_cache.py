@@ -286,12 +286,14 @@ class SWARadixCache(BasePrefixCache):
         sliding_window_size: int,
         page_size: int,
         disable: bool = False,
+        is_eagle: bool = False,
     ):
         assert isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator)
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.page_size = page_size
         self.disable = disable
+        self.is_eagle = is_eagle
 
         if self.page_size == 1:
             self.key_match_fn = _key_match_page_size1_radix
@@ -405,22 +407,25 @@ class SWARadixCache(BasePrefixCache):
             return
 
         token_ids = (req.origin_input_ids + req.output_ids)[:committed_kv_len]
-        kv_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx, : len(token_ids)]
+        actual_kv_len = committed_kv_len - 1 if self.is_eagle else committed_kv_len
+        kv_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx, :committed_kv_len]
+        kv_indices = kv_indices[kv_indices != 0]
 
         if self.page_size != 1:
-            page_aligned_len = len(kv_indices) // self.page_size * self.page_size
+            page_aligned_len = actual_kv_len // self.page_size * self.page_size
             page_aligned_kv_indices = kv_indices[:page_aligned_len].copy()
             self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:], dp_rank=dp_rank)
         else:
-            page_aligned_len = len(kv_indices)
+            page_aligned_len = actual_kv_len
             # Make a copy to avoid aliasing tree node values with req_to_token rows
-            page_aligned_kv_indices = kv_indices.copy()
+            page_aligned_kv_indices = kv_indices[:page_aligned_len].copy()
+        page_aligned_token_len = page_aligned_len + 1 if self.is_eagle else page_aligned_len
 
         if is_insert:
             # Radix Cache takes one ref in memory pool
             # Note: the insert function already frees the overlapped kv_indices
             self.insert(
-                RadixKey(token_ids[:page_aligned_len], req.extra_key, req.dp_rank),
+                RadixKey(token_ids[:page_aligned_token_len], req.extra_key, req.dp_rank),
                 page_aligned_kv_indices,
                 req.cache_protected_len,
                 swa_evicted_seqlen=req.swa_evicted_seqlen,
