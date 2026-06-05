@@ -195,3 +195,44 @@ def test_fused_greedy_draft_state_requires_topk_and_verified_id():
 
     assert not worker._has_fused_greedy_draft_state(batch_without_topk)
     assert worker._has_fused_greedy_draft_state(batch_with_state)
+
+
+def test_phase_a_prebuild_builds_same_batch_candidate_from_padded_new_seq_lens():
+    from sgl_jax.srt.managers.tp_worker_overlap_thread import ModelWorkerClient
+
+    worker = ModelWorkerClient.__new__(ModelWorkerClient)
+    req_pool = np.array([10, 11, 12, 13], dtype=np.int32)
+    spec_info = EagleDraftInput(
+        allocate_lens=np.full((4,), 64, dtype=np.int32),
+    )
+    spec_info.verify_write_lens = np.array([20, 21, 22, 23], dtype=np.int32)
+    model_worker_batch = SimpleNamespace(
+        allow_same_batch_spec_chain=True,
+        req_pool_indices=req_pool,
+        same_batch_chain_req_pool_indices=req_pool.copy(),
+        same_batch_chain_out_cache_loc_chunks=[
+            np.arange(4, dtype=np.int32),
+            np.arange(4, 8, dtype=np.int32),
+        ],
+        same_batch_chain_verify_write_lens=np.array([24, 25, 26, 27], dtype=np.int32),
+        same_batch_chain_allocate_lens=np.full((4,), 64, dtype=np.int32),
+        spec_info_padded=spec_info,
+        seq_lens=np.array([16, 17, 18, 19], dtype=np.int32),
+        seq_lens_sum=70,
+        out_cache_loc=np.arange(8, dtype=np.int32),
+        bid=9,
+    )
+    verify_result = SimpleNamespace(
+        padded_new_seq_lens_host=np.array([21, 22, 23, 24], dtype=np.int32)
+    )
+
+    candidate = worker._prebuild_same_batch_spec_chain_candidate_after_phase_a(
+        model_worker_batch,
+        verify_result,
+    )
+
+    assert candidate is not None
+    np.testing.assert_array_equal(candidate.req_pool_indices, req_pool)
+    np.testing.assert_array_equal(candidate.seq_lens, verify_result.padded_new_seq_lens_host)
+    assert candidate.seq_lens_sum == int(verify_result.padded_new_seq_lens_host.sum())
+    assert candidate.skip_fused_verify_padding_for_decode is True

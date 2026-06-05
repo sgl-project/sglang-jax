@@ -492,29 +492,30 @@ class ModelWorkerClient:
         model_worker_batch: ModelWorkerBatch,
         verify_result,
     ):
-        from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
+        with jax.profiler.TraceAnnotation("prebuild_same_batch_spec_chain_candidate_after_phase_a"):
+            from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
 
-        padded_new_seq_lens_host = getattr(verify_result, "padded_new_seq_lens_host", None)
-        if padded_new_seq_lens_host is None:
-            return None
-        prebuild_draft_input = EagleDraftInput(
-            new_seq_lens=np.asarray(padded_new_seq_lens_host, dtype=np.int32),
-        )
-        prebuild_pending = SimpleNamespace(
-            padded_next_draft_input=prebuild_draft_input,
-            padded_req_pool_indices=np.asarray(
-                model_worker_batch.req_pool_indices,
-                dtype=np.int32,
-            ).copy(),
-            padded_new_seq_lens_host=np.asarray(
-                padded_new_seq_lens_host,
-                dtype=np.int32,
-            ).copy(),
-        )
-        return self._build_same_batch_spec_chain_candidate_batch(
-            model_worker_batch,
-            prebuild_pending,
-        )
+            padded_new_seq_lens_host = getattr(verify_result, "padded_new_seq_lens_host", None)
+            if padded_new_seq_lens_host is None:
+                return None
+            prebuild_draft_input = EagleDraftInput(
+                new_seq_lens=np.asarray(padded_new_seq_lens_host, dtype=np.int32),
+            )
+            prebuild_pending = SimpleNamespace(
+                padded_next_draft_input=prebuild_draft_input,
+                padded_req_pool_indices=np.asarray(
+                    model_worker_batch.req_pool_indices,
+                    dtype=np.int32,
+                ).copy(),
+                padded_new_seq_lens_host=np.asarray(
+                    padded_new_seq_lens_host,
+                    dtype=np.int32,
+                ).copy(),
+            )
+            return self._build_same_batch_spec_chain_candidate_batch(
+                model_worker_batch,
+                prebuild_pending,
+            )
 
     def _stash_prebuilt_same_batch_spec_chain_candidate(
         self,
