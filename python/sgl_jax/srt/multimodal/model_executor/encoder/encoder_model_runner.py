@@ -20,6 +20,13 @@ from sgl_jax.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
 
+# Padded sequence-length buckets the encoder can dispatch to at request time.
+# Shared as the single source of truth between runtime length selection
+# (`_select_precompiled_max_length`) and precompile coverage
+# (`get_precompile_lengths`), so every length the runtime can pick is
+# precompiled and no compilation happens on the request path.
+ENCODER_TOKEN_BUCKETS = [16, 32, 64, 128, 256, 512, 1024]
+
 
 @dataclass
 class _EncoderSpec:
@@ -362,11 +369,28 @@ class EncoderModelRunner(BaseModelRunner):
         actual_length: int,
         encoder_max_length: int,
     ) -> int:
-        token_buckets = [16, 32, 64, 128, 256, 512, 1024]
-        for size in token_buckets:
+        for size in ENCODER_TOKEN_BUCKETS:
             if actual_length <= size <= encoder_max_length:
                 return size
         return encoder_max_length
+
+    def get_precompile_lengths(self, spec: _EncoderSpec, encoder_idx: int) -> list[int]:
+        """Return every padded sequence length the runtime can dispatch for this
+        encoder, so precompile covers all of them.
+
+        Mirrors `_tokenize_text`: FLUX T5 always pads to ``max_length`` (no
+        bucketing), while other encoders pick a bucket from
+        ``ENCODER_TOKEN_BUCKETS`` capped at ``max_length`` and fall back to
+        ``max_length`` when no bucket fits.
+        """
+        if spec.max_length is None:
+            raise ValueError(f"Encoder max_length is not initialized for {spec.model_class}.")
+        if self.is_flux_t5(spec, encoder_idx):
+            return [spec.max_length]
+        lengths = [size for size in ENCODER_TOKEN_BUCKETS if size <= spec.max_length]
+        if spec.max_length not in lengths:
+            lengths.append(spec.max_length)
+        return lengths
 
     def _get_model_attention_mask(
         self,

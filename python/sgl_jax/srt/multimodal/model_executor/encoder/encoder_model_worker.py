@@ -30,22 +30,28 @@ class EncoderModelWorker:
         )
 
     def run_precompile(self):
-        """Precompile encoder JIT by running a dummy forward pass."""
+        """Precompile encoder JIT by running dummy forward passes.
+
+        Covers every padded length the runtime can dispatch (see
+        ``EncoderModelRunner.get_precompile_lengths``) so no compilation
+        happens on the request path, regardless of prompt length.
+        """
         import time
 
         start_time = time.perf_counter()
         for i, spec in enumerate(self.model_runner.encoder_specs):
-            max_length = spec.max_length or 512
+            lengths = self.model_runner.get_precompile_lengths(spec, i)
             logger.info(
-                "[ENCODER] Precompiling encoder %d/%d (%s), max_length=%d",
+                "[ENCODER] Precompiling encoder %d/%d (%s), lengths=%s",
                 i + 1,
                 len(self.model_runner.encoder_specs),
                 spec.model_class.__name__,
-                max_length,
+                lengths,
             )
-            dummy_input_ids = jnp.ones((1, max_length), dtype=jnp.int32)
-            dummy_attention_mask = jnp.ones((1, max_length), dtype=jnp.int32)
-            spec.jitted_forward(dummy_input_ids, dummy_attention_mask)
+            for length in lengths:
+                dummy_input_ids = jnp.ones((1, length), dtype=jnp.int32)
+                dummy_attention_mask = jnp.ones((1, length), dtype=jnp.int32)
+                spec.jitted_forward(dummy_input_ids, dummy_attention_mask)
         elapsed = time.perf_counter() - start_time
         logger.info("[ENCODER] Precompile finished in %.0f secs", elapsed)
 
