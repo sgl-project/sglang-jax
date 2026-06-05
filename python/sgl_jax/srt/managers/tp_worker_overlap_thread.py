@@ -217,12 +217,9 @@ class ModelWorkerClient:
                 )
 
                 with jax.profiler.TraceAnnotation(
-                    f"dispatch_spec_draft_extend_after_phase_a_publish {model_worker_batch.bid}"
+                    f"dispatch_spec_draft_extend_after_verify_enqueue {model_worker_batch.bid}"
                 ):
                     try:
-                        phase_a_holder["phase_a_ready"].wait()
-                        if "exception" in phase_a_holder:
-                            raise RuntimeError(phase_a_holder["exception"])
                         self.pending_spec_draft_extend_result = (
                             spec_decode_dispatch_draft_extend_for_pending(
                                 self.spec_worker,
@@ -234,6 +231,8 @@ class ModelWorkerClient:
                     finally:
                         pending_dispatch_done.set()
                 phase_a_thread.join()
+                if "exception" in phase_a_holder:
+                    raise RuntimeError(phase_a_holder["exception"])
                 if self.pending_spec_draft_extend_result is None:
                     verify_kind, verify_payload = self.output_queue.get()
                     if verify_kind == "spec_verify_exception":
