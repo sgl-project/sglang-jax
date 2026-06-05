@@ -567,8 +567,7 @@ def test_mixin_e2e_single_req_happy_path(mixin_e2e_infra):
     batch = _FakeBatch([req_p])
     p_sched.process_prefill_chunk(batch, None)
 
-    _poll_until(lambda: p_sched.disagg_prefill_queue.drain_terminal() or
-                p_sched.disagg_prefill_queue.snapshot_states().get("req-1") == KVPoll.TRANSFERRING or True)
+    _poll_until(lambda: p_sched.disagg_prefill_queue.drain_terminal() or True)
 
     req_d = _make_pd_req("req-1", input_ids, bootstrap_room=42, req_pool_idx=0)
     d_sched.process_input_requests_disagg_decode([req_d])
@@ -651,8 +650,7 @@ def test_mixin_e2e_sender_failure_aborts(mixin_e2e_infra):
     p_sched.process_prefill_chunk(batch, None)
 
     # Force the sender to FAILED
-    states = p_sched.disagg_prefill_queue.snapshot_states()
-    assert "req-fail" in states
+    assert "req-fail" in p_sched.disagg_prefill_queue._entries
 
     entry = p_sched.disagg_prefill_queue._entries["req-fail"]
     entry.sender.fail(reason="test-induced-failure")

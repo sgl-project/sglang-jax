@@ -27,9 +27,6 @@ class KVPoll(enum.Enum):
     FAILED = "failed"
 
 
-TERMINAL_STATES: frozenset[KVPoll] = frozenset({KVPoll.SUCCESS, KVPoll.FAILED})
-
-
 LEGAL_TRANSITIONS: frozenset[tuple[KVPoll, KVPoll]] = frozenset(
     {
         (KVPoll.BOOTSTRAPPING, KVPoll.WAITING_FOR_INPUT),
