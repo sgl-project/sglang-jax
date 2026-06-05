@@ -53,13 +53,51 @@ from sgl_jax.srt.precision_tracer import (
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sgl_jax.srt.sampling.sampling_params import DEFAULT_SAMPLING_SEED, SamplingParams
 from sgl_jax.srt.server_args import ServerArgs
-from sgl_jax.srt.utils.common_utils import get_bool_env_var, pad_to_bucket
+from sgl_jax.srt.utils.common_utils import cdiv, get_bool_env_var, pad_to_bucket
 
 if TYPE_CHECKING:
     from sgl_jax.srt.speculative.eagle_util import EagleDraftInput, EagleVerifyInput
     from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
+
+
+def release_spec_decode_kv_cache(
+    req: Req,
+    tree_cache: BasePrefixCache,
+    spec_info: EagleDraftInput | None,
+    local_idx: int,
+) -> None:
+    """Release a finished spec-decode request, including draft over-allocation."""
+    if req.req_pool_idx is None:
+        return
+
+    cur_allocate_len = None
+    if spec_info is not None and spec_info.allocate_lens is not None:
+        cur_allocate_len = int(np.asarray(spec_info.allocate_lens)[local_idx])
+
+    actual_token_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+    if cur_allocate_len is not None and cur_allocate_len > actual_token_len:
+        free_start = actual_token_len
+        page_size = tree_cache.page_size
+        if page_size > 1:
+            free_start = cdiv(free_start, page_size) * page_size
+        if free_start < cur_allocate_len:
+            kv_indices = tree_cache.req_to_token_pool.req_to_token[
+                req.req_pool_idx,
+                free_start:cur_allocate_len,
+            ]
+            kv_indices = kv_indices[kv_indices != 0]
+            if len(kv_indices) > 0:
+                dp_rank = req.dp_rank if req.dp_rank is not None else 0
+                tree_cache.token_to_kv_pool_allocator.free(kv_indices, dp_rank=dp_rank)
+
+    # Spec decode allocates through EagleDraftInput.prepare_for_decode, so Req's
+    # generic KV accounting can lag behind the draft allocation. Reset it to the
+    # actual committed length before handing the request to the common release path.
+    req.kv_committed_len = actual_token_len
+    req.kv_allocated_len = actual_token_len
+    release_kv_cache(req, tree_cache)
 
 
 GLOBAL_SERVER_ARGS_KEYS = [
@@ -217,6 +255,9 @@ class Req:
 
         # Check finish
         self.tokenizer = None
+        self._tokenizer_finish_attrs_cached = False
+        self._tokenizer_eos_token_id = None
+        self._tokenizer_additional_stop_token_ids = None
         self.finished_reason = None
         self.finished_len = None
         # Whether this request has finished output
@@ -506,9 +547,15 @@ class Req:
                     }
                 matched_eos |= token_id in self.eos_token_ids
             if self.tokenizer is not None:
-                matched_eos |= token_id == self.tokenizer.eos_token_id
-                if self.tokenizer.additional_stop_token_ids:
-                    matched_eos |= token_id in self.tokenizer.additional_stop_token_ids
+                if not self._tokenizer_finish_attrs_cached:
+                    self._tokenizer_eos_token_id = self.tokenizer.eos_token_id
+                    self._tokenizer_additional_stop_token_ids = (
+                        self.tokenizer.additional_stop_token_ids
+                    )
+                    self._tokenizer_finish_attrs_cached = True
+                matched_eos |= token_id == self._tokenizer_eos_token_id
+                if self._tokenizer_additional_stop_token_ids:
+                    matched_eos |= token_id in self._tokenizer_additional_stop_token_ids
             if matched_eos:
                 self.finished_reason = FINISH_MATCHED_TOKEN(matched=token_id)
                 matched_pos = len(self.output_ids) - len(new_accepted_tokens) + i
@@ -1571,6 +1618,21 @@ class ScheduleBatch:
                     and (chunked_req is None or info.reqs[i] != chunked_req)
                 ]
 
+            if (
+                self.spec_algorithm is not None
+                and self.spec_algorithm.is_eagle()
+                and info.spec_info is not None
+            ):
+                keep_set = set(keep_indices_dp)
+                for i, req in enumerate(info.reqs):
+                    if i not in keep_set and req.req_pool_idx is not None:
+                        release_spec_decode_kv_cache(
+                            req,
+                            self.tree_cache,
+                            info.spec_info,
+                            i,
+                        )
+
             # Early exit: Clear all if nothing to keep
             if len(keep_indices_dp) == 0:
                 info.reqs = []
@@ -2129,14 +2191,20 @@ class ScheduleBatch:
             )
             for i in self.reqs_info
         ]
-        # Pad each rank's out_cache_loc to per_dp_bs * draft_token_num so the
-        # merged shape is stable across runtime bs. max_chunk_len defensive.
-        max_chunk_len = max((len(c) for c in ocl_chunks), default=0)
-        target_per_rank_ocl = max(per_dp_bs * draft_token_num, max_chunk_len)
+        # Pad each rank's forward out_cache_loc to per_dp_bs*draft_token_num so
+        # the verify JIT input shape matches the precompiled bucket. The
+        # per-rank chunks can be longer because prepare_for_decode allocates
+        # full request growth; req_to_token_pool already records those slots.
+        # Verify only forwards draft_token_num tokens per padded slot.
+        target_per_rank_ocl = per_dp_bs * draft_token_num
         out_cache_loc = (
             np.concatenate(
                 [
-                    np.pad(c, (0, target_per_rank_ocl - len(c)), constant_values=-1)
+                    np.pad(
+                        c[:target_per_rank_ocl],
+                        (0, max(0, target_per_rank_ocl - len(c))),
+                        constant_values=-1,
+                    )
                     for c in ocl_chunks
                 ]
             )
@@ -2205,6 +2273,7 @@ class ScheduleBatch:
             hidden_states=_scatter1(flat.hidden_states),
             verified_id=_scatter1(flat.verified_id),
             allocate_lens=_scatter1(flat.allocate_lens),
+            verify_write_lens=_scatter1(getattr(flat, "verify_write_lens", None)),
             new_seq_lens=_scatter1(flat.new_seq_lens),
             capture_hidden_mode=flat.capture_hidden_mode,
             accept_length=flat.accept_length,
@@ -2230,6 +2299,7 @@ class ScheduleBatch:
             "hidden_states",
             "verified_id",
             "allocate_lens",
+            "verify_write_lens",
             "new_seq_lens",
             "accept_length",
             "accept_length_cpu",
@@ -2267,6 +2337,7 @@ class ScheduleBatch:
             "hidden_states",
             "verified_id",
             "allocate_lens",
+            "verify_write_lens",
             "new_seq_lens",
             "accept_length",
             "accept_length_cpu",

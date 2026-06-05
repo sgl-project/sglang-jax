@@ -25,6 +25,22 @@ def replicate_to_mesh(
     return out[0] if len(out) == 1 else out
 
 
+def filter_spec_precompile_token_paddings(server_args, token_paddings: list[int]) -> list[int]:
+    user_paddings = getattr(server_args, "precompile_token_paddings", None)
+    if user_paddings is None:
+        return token_paddings
+
+    dp_size = getattr(server_args, "dp_size", 1)
+    allowed = set()
+    for item in user_paddings:
+        if item % dp_size != 0:
+            item = (item // dp_size) * dp_size
+        if item >= dp_size:
+            allowed.add(item)
+    filtered = [item for item in token_paddings if item in allowed]
+    return filtered or token_paddings
+
+
 class BaseDraftWorker(ABC):
     """Draft model worker interface for speculative decoding.
 
@@ -92,6 +108,10 @@ class BaseSpecWorker:
             self.precompile_bs_paddings,
             self.precompile_cache_loc_paddings,
         ) = target_worker.get_precompile_paddings()
+        self.precompile_token_paddings = filter_spec_precompile_token_paddings(
+            server_args,
+            self.precompile_token_paddings,
+        )
 
     @property
     def target_worker(self) -> ModelWorker:
@@ -111,13 +131,55 @@ class BaseSpecWorker:
             and getattr(spec_info, "verified_id", None) is not None
         )
 
-    def forward_batch_speculative_verify_phase(self, model_worker_batch: ModelWorkerBatch):
+    def forward_batch_speculative_verify_phase(
+        self,
+        model_worker_batch: ModelWorkerBatch,
+        *,
+        predispatch_draft_extend: bool = False,
+    ):
         """Run greedy fused spec verify/sample and return scheduler-visible phase A."""
         sel = model_worker_batch.logits_indices_selector
-        cur_allocate_lens = np.asarray(model_worker_batch.spec_info_padded.allocate_lens)[sel]
+        padded_allocate_lens = np.asarray(model_worker_batch.spec_info_padded.allocate_lens)
+        if sel.size > 0 and int(np.max(sel)) < len(padded_allocate_lens):
+            compact_allocate_lens = padded_allocate_lens[sel]
+        else:
+            compact_allocate_lens = padded_allocate_lens
         from sgl_jax.srt.speculative.draft_extend_fused import spec_decode_verify_phase
 
-        return spec_decode_verify_phase(self, model_worker_batch, cur_allocate_lens)
+        return spec_decode_verify_phase(
+            self,
+            model_worker_batch,
+            padded_allocate_lens,
+            compact_allocate_lens,
+            predispatch_draft_extend=predispatch_draft_extend,
+        )
+
+    def forward_batch_speculative_verify_phase_enqueue(self, model_worker_batch: ModelWorkerBatch):
+        """Enqueue greedy fused spec verify/sample and Phase A D2H."""
+        sel = model_worker_batch.logits_indices_selector
+        padded_allocate_lens = np.asarray(model_worker_batch.spec_info_padded.allocate_lens)
+        if sel.size > 0 and int(np.max(sel)) < len(padded_allocate_lens):
+            compact_allocate_lens = padded_allocate_lens[sel]
+        else:
+            compact_allocate_lens = padded_allocate_lens
+        from sgl_jax.srt.speculative.draft_extend_fused import (
+            spec_decode_verify_phase_enqueue,
+        )
+
+        return spec_decode_verify_phase_enqueue(
+            self,
+            model_worker_batch,
+            padded_allocate_lens,
+            compact_allocate_lens,
+        )
+
+    def materialize_speculative_verify_phase(self, verify_phase_async_result):
+        """Resolve Phase A D2H and return scheduler-visible verify result."""
+        from sgl_jax.srt.speculative.draft_extend_fused import (
+            spec_decode_materialize_verify_phase,
+        )
+
+        return spec_decode_materialize_verify_phase(verify_phase_async_result)
 
     def forward_batch_speculative_draft_extend_phase(
         self,
@@ -172,7 +234,8 @@ class BaseSpecWorker:
         # spec_info.allocate_lens is DP-padded (total_bs,) at dp>1; gather back
         # to global-flat (real_bs,) so reqs_info[0].spec_info stays flat-ordered.
         sel = model_worker_batch.logits_indices_selector
-        cur_allocate_lens = np.asarray(model_worker_batch.spec_info_padded.allocate_lens)[sel]
+        padded_allocate_lens = np.asarray(model_worker_batch.spec_info_padded.allocate_lens)
+        compact_allocate_lens = padded_allocate_lens[sel]
         if (
             self._can_use_fused_spec_decode
             and model_worker_batch.sampling_info.is_all_greedy
@@ -182,9 +245,14 @@ class BaseSpecWorker:
             # decode paths can be folded into this entry point over time.
             from sgl_jax.srt.speculative.draft_extend_fused import spec_decode
 
-            return spec_decode(self, model_worker_batch, cur_allocate_lens)
+            return spec_decode(
+                self,
+                model_worker_batch,
+                padded_allocate_lens,
+                compact_allocate_lens,
+            )
         self.draft_worker.draft(model_worker_batch)
-        batch_output = self.verify(model_worker_batch, cur_allocate_lens)
+        batch_output = self.verify(model_worker_batch, compact_allocate_lens)
         self.draft_worker.draft_extend_for_decode(model_worker_batch, batch_output)
         return batch_output
 

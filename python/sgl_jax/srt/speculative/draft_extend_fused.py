@@ -37,6 +37,44 @@ class GreedySampleAndPrepareOutput(NamedTuple):
 class FusedGreedyDraftExtendState(NamedTuple):
     batch_output: object
     positions: jax.Array
+    predispatched: object | None = None
+
+
+class FusedGreedyVerifyPhaseAsync(NamedTuple):
+    logits_output: object
+    next_token_ids_prefetch: object
+    accept_lens_prefetch: object
+    accept_lens_device: jax.Array
+    allocate_lens: np.ndarray
+    scheduler_next_draft_input_allocate_lens: np.ndarray
+    selector: np.ndarray
+    seq_lens_host: np.ndarray
+    draft_extend_state: FusedGreedyDraftExtendState
+    bid: int
+    cache_miss_count: int
+
+
+class FusedDraftExtendDispatch(NamedTuple):
+    batch_output: object
+    selector: np.ndarray
+    selected_layer0_hidden: jax.Array
+    topk_index_stacked: jax.Array
+    previous_token_list: jax.Array
+    selected_verified_id: jax.Array
+    verified_id_arr: jax.Array
+    accept_lens_device: jax.Array
+    materialize_hidden: bool = True
+    materialize_topk: bool = True
+    accept_lens_host: np.ndarray | None = None
+    verified_id_host: np.ndarray | None = None
+
+
+class FusedVerifyZeroPlaceholders(NamedTuple):
+    draft_token: jax.Array
+    positions: jax.Array
+    retrive_index: jax.Array
+    retrive_next_token: jax.Array
+    retrive_next_sibling: jax.Array
 
 
 def _take_with_index_sharding(values, index):
@@ -228,7 +266,7 @@ def _build_fused_draft_extend_jit(num_layers: int, topk: int):
         all_memory_pools,
         logits_metadata,
         target_hidden,
-        sel_pos,
+        accept_lens,
         *,
         num_layers,
     ):
@@ -237,6 +275,7 @@ def _build_fused_draft_extend_jit(num_layers: int, topk: int):
         layer0_hidden = None
         mesh = None
         input_ids = forward_batch.input_ids
+        sel_pos = jnp.clip(accept_lens - 1, 0).astype(jnp.int32)
 
         for i in range(num_layers):
             state = jax.tree_util.tree_unflatten(model_state_def, all_leaves[i])
@@ -454,12 +493,17 @@ def _prepare_topk1_verify_placeholders_from_draft_state(draft_worker, model_work
     from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode
     from sgl_jax.srt.speculative.eagle_util import EagleVerifyInput
 
-    draft_worker.padding_for_decode(model_worker_batch)
+    if not getattr(model_worker_batch, "skip_fused_verify_padding_for_decode", False):
+        draft_worker.padding_for_decode(model_worker_batch)
     draft_input = model_worker_batch.spec_info_padded
+    if isinstance(getattr(draft_input, "new_seq_lens", None), jax.Array):
+        model_worker_batch.target_verify_seq_lens_device = draft_input.new_seq_lens
     previous_verified_id = draft_input.verified_id
     if isinstance(previous_verified_id, np.ndarray):
         previous_verified_id = np.asarray(previous_verified_id, dtype=np.int32)
-    previous_token_list = draft_input.topk_index[:, :, 0]
+    previous_token_list = getattr(draft_input, "previous_token_list", None)
+    if previous_token_list is None:
+        previous_token_list = draft_input.topk_index[:, :, 0]
     if isinstance(previous_token_list, np.ndarray):
         previous_token_list = np.asarray(previous_token_list, dtype=np.int32)
     else:
@@ -467,14 +511,14 @@ def _prepare_topk1_verify_placeholders_from_draft_state(draft_worker, model_work
 
     bs = model_worker_batch.seq_lens.shape[0]
     n = draft_worker.speculative_num_draft_tokens
-    flat = bs * n
+    placeholders = _get_fused_verify_zero_placeholders(draft_worker, bs=bs, n=n)
     model_worker_batch.spec_info_padded = EagleVerifyInput(
-        draft_token=np.zeros((flat,), dtype=np.int32),
+        draft_token=placeholders.draft_token,
         custom_mask=None,
-        positions=np.zeros((flat,), dtype=np.int32),
-        retrive_index=np.zeros((bs, n), dtype=np.int32),
-        retrive_next_token=np.zeros((bs, n), dtype=np.int32),
-        retrive_next_sibling=np.zeros((bs, n), dtype=np.int32),
+        positions=placeholders.positions,
+        retrive_index=placeholders.retrive_index,
+        retrive_next_token=placeholders.retrive_next_token,
+        retrive_next_sibling=placeholders.retrive_next_sibling,
         retrive_cum_len=None,
         spec_steps=draft_worker.speculative_num_steps,
         topk=draft_worker.topk,
@@ -486,18 +530,88 @@ def _prepare_topk1_verify_placeholders_from_draft_state(draft_worker, model_work
     return previous_verified_id, previous_token_list
 
 
+def _get_fused_verify_zero_placeholders(draft_worker, *, bs: int, n: int):
+    cache = getattr(draft_worker, "_fused_verify_placeholder_cache", None)
+    if cache is None:
+        cache = {}
+        draft_worker._fused_verify_placeholder_cache = cache
+    key = (int(bs), int(n))
+    cached = cache.get(key)
+    if cached is not None:
+        return cached
+
+    data_sharding = NamedSharding(draft_worker.mesh, P("data"))
+    flat = bs * n
+    cached = FusedVerifyZeroPlaceholders(
+        draft_token=jax.device_put(np.zeros((flat,), dtype=np.int32), data_sharding),
+        positions=jax.device_put(np.zeros((flat,), dtype=np.int32), data_sharding),
+        retrive_index=jax.device_put(np.zeros((bs, n), dtype=np.int32), data_sharding),
+        retrive_next_token=jax.device_put(np.zeros((bs, n), dtype=np.int32), data_sharding),
+        retrive_next_sibling=jax.device_put(np.zeros((bs, n), dtype=np.int32), data_sharding),
+    )
+    cache[key] = cached
+    return cached
+
+
+def _select_next_verified_id_for_verify(verified_id_arr, accept_lens):
+    accept_width = verified_id_arr.shape[0] // accept_lens.shape[0]
+    select_index = (
+        jnp.arange(accept_lens.shape[0], dtype=jnp.int32) * accept_width
+        + accept_lens.astype(jnp.int32)
+        - 1
+    )
+    return _take_with_index_sharding(verified_id_arr, select_index)
+
+
 def _device_array_preserve_device(value, sharding):
     from sgl_jax.srt.utils.jax_utils import device_array
 
     if value is None:
         return None
     if isinstance(value, jax.Array):
+        try:
+            value_sharding = getattr(value, "sharding", None)
+            if value_sharding == sharding:
+                return value
+            if (
+                value_sharding is not None
+                and hasattr(value_sharding, "is_equivalent_to")
+                and value_sharding.is_equivalent_to(sharding, value.ndim)
+            ):
+                return value
+        except Exception:
+            pass
         return jax.device_put(value, sharding)
     return device_array(value, sharding=sharding)
 
 
+def _cached_host_device_array_preserve_device(owner, field_name: str, value, sharding):
+    if value is None or isinstance(value, jax.Array):
+        return _device_array_preserve_device(value, sharding)
+    if not isinstance(value, np.ndarray):
+        return _device_array_preserve_device(value, sharding)
+
+    cache = getattr(owner, "_fused_verify_host_device_array_cache", None)
+    if cache is None:
+        cache = {}
+        owner._fused_verify_host_device_array_cache = cache
+    cached = cache.get(field_name)
+    if cached is not None:
+        cached_host, cached_device = cached
+        if (
+            cached_host.shape == value.shape
+            and cached_host.dtype == value.dtype
+            and np.array_equal(cached_host, value)
+        ):
+            return cached_device
+
+    device_value = _device_array_preserve_device(value, sharding)
+    cache[field_name] = (np.array(value, copy=True), device_value)
+    return device_value
+
+
 def _logits_metadata_from_model_worker_batch_preserve_device(
-    batch, mesh, *, include_accept_lens: bool = True
+    batch, mesh, *, include_accept_lens: bool = True, cache_owner=None
 ):
     from sgl_jax.srt.layers.logits_processor import LogitsMetadata
 
@@ -514,16 +628,43 @@ def _logits_metadata_from_model_worker_batch_preserve_device(
         extend_return_logprob=False,
         extend_return_top_logprob=False,
         extend_token_ids_logprob=False,
-        extend_seq_lens=_device_array_preserve_device(batch.extend_seq_lens, sharding),
-        logits_indices=_device_array_preserve_device(batch.logits_indices, sharding),
+        extend_seq_lens=(
+            _cached_host_device_array_preserve_device(
+                cache_owner,
+                "logits_metadata_extend_seq_lens",
+                batch.extend_seq_lens,
+                sharding,
+            )
+            if cache_owner is not None
+            else _device_array_preserve_device(batch.extend_seq_lens, sharding)
+        ),
+        logits_indices=(
+            _cached_host_device_array_preserve_device(
+                cache_owner,
+                "logits_metadata_logits_indices",
+                batch.logits_indices,
+                sharding,
+            )
+            if cache_owner is not None
+            else _device_array_preserve_device(batch.logits_indices, sharding)
+        ),
         accept_lens=_device_array_preserve_device(accept_lens, sharding),
         extend_seq_lens_cpu=None,
         extend_logprob_start_lens_cpu=None,
         extend_logprob_pruned_lens_cpu=None,
         top_logprobs_nums=getattr(batch, "top_logprobs_nums", None),
         token_ids_logprobs=getattr(batch, "token_ids_logprobs", None),
-        extend_input_logprob_token_ids_device=_device_array_preserve_device(
-            getattr(batch, "extend_input_logprob_token_ids", None), sharding
+        extend_input_logprob_token_ids_device=(
+            _cached_host_device_array_preserve_device(
+                cache_owner,
+                "logits_metadata_extend_input_logprob_token_ids",
+                getattr(batch, "extend_input_logprob_token_ids", None),
+                sharding,
+            )
+            if cache_owner is not None
+            else _device_array_preserve_device(
+                getattr(batch, "extend_input_logprob_token_ids", None), sharding
+            )
         ),
     )
 
@@ -561,12 +702,34 @@ def _forward_batch_init_new_preserve_device(batch, model_runner):
         forward_mode=batch.forward_mode,
         batch_size=len(batch.seq_lens),
         input_ids=_device_array_preserve_device(batch.input_ids, data_sharding),
-        seq_lens=_device_array_preserve_device(batch.seq_lens, data_sharding),
-        out_cache_loc=_device_array_preserve_device(batch.out_cache_loc, data_sharding),
+        seq_lens=_device_array_preserve_device(
+            (
+                getattr(batch, "target_verify_seq_lens_device", None)
+                if getattr(batch, "target_verify_seq_lens_device", None) is not None
+                else batch.seq_lens
+            ),
+            data_sharding,
+        ),
+        out_cache_loc=_cached_host_device_array_preserve_device(
+            model_runner,
+            "target_verify_out_cache_loc",
+            batch.out_cache_loc,
+            data_sharding,
+        ),
         positions=_device_array_preserve_device(batch.positions, data_sharding),
         mrope_positions=_device_array_preserve_device(batch.mrope_positions, replicated_2d),
-        req_pool_indices=_device_array_preserve_device(batch.req_pool_indices, data_sharding),
-        cache_loc=_device_array_preserve_device(batch.cache_loc, data_sharding),
+        req_pool_indices=_cached_host_device_array_preserve_device(
+            model_runner,
+            "target_verify_req_pool_indices",
+            batch.req_pool_indices,
+            data_sharding,
+        ),
+        cache_loc=_cached_host_device_array_preserve_device(
+            model_runner,
+            "target_verify_cache_loc",
+            batch.cache_loc,
+            data_sharding,
+        ),
         extend_prefix_lens=_device_array_preserve_device(batch.extend_prefix_lens, data_sharding),
         extend_seq_lens=_device_array_preserve_device(batch.extend_seq_lens, data_sharding),
         lora_ids=batch.lora_ids,
@@ -585,16 +748,42 @@ def _forward_batch_init_new_preserve_device(batch, model_runner):
     )
 
 
-def draft_extend_for_decode_fused(draft_worker, model_worker_batch, batch_output):
+def draft_extend_for_decode_fused(
+    draft_worker, model_worker_batch, batch_output, *, materialize_hidden: bool = True
+):
     """Drop-in replacement for MultiLayerDraftWorker.draft_extend_for_decode.
 
     Fuses all N MTP layer forwards into a single jit call.
     """
-    from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+    dispatch = _dispatch_draft_extend_for_decode_fused(
+        draft_worker,
+        model_worker_batch,
+        batch_output,
+        materialize_hidden=materialize_hidden,
+    )
+    if dispatch is None:
+        return
+    _materialize_draft_extend_for_decode_fused(draft_worker, model_worker_batch, dispatch)
+
+
+def _dispatch_draft_extend_for_decode_fused(
+    draft_worker,
+    model_worker_batch,
+    batch_output,
+    *,
+    materialize_hidden: bool = True,
+    materialize_topk: bool = True,
+):
+    """Prepare and dispatch fused draft_extend without materializing results.
+
+    This lets the split verify path issue Phase B while the verify device work
+    and Phase A D2H are still in flight. Materialization can happen later at
+    the ordinary Phase B boundary.
+    """
     from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
 
     if batch_output.next_draft_input.verified_id.shape[0] <= 0:
-        return
+        return None
     target_hidden = batch_output.logits_output.hidden_states
 
     draft_input = EagleDraftInput(
@@ -605,19 +794,21 @@ def draft_extend_for_decode_fused(draft_worker, model_worker_batch, batch_output
         draft_worker.draft_model_runner,
         batch_output,
         draft_worker.speculative_num_draft_tokens,
+        build_logits_metadata=False,
     )
     if mwb.input_ids.shape[0] <= 0:
-        return
-
+        return None
     sel = np.asarray(model_worker_batch.logits_indices_selector)
-    accept_host = np.asarray(jax.device_get(batch_output.accept_lens))
-    assert (accept_host[sel] >= 1).all(), f"accept_length < 1: {accept_host[sel]}"
-    sel_pos = np.clip(accept_host - 1, 0, None).astype(np.int32)
 
     mr0 = draft_worker._workers[0].model_runner
+    logits_metadata = _logits_metadata_from_model_worker_batch_preserve_device(
+        mwb,
+        draft_worker.mesh,
+        include_accept_lens=False,
+        cache_owner=mr0,
+    )
     mwb.spec_info_padded.hidden_states = target_hidden
-    mr0.attn_backend.forward_metadata = mr0.attn_backend.get_eagle_forward_metadata(mwb)
-    shared_fb = ForwardBatch.init_new(mwb, mr0)
+    shared_fb = _forward_batch_init_new_preserve_device(mwb, mr0)
     shared_fb.bid = model_worker_batch.bid
 
     all_memory_pools = []
@@ -626,8 +817,6 @@ def draft_extend_for_decode_fused(draft_worker, model_worker_batch, batch_output
         mr = w.model_runner
         all_memory_pools.append(mr.memory_pools)
         all_leaves.append(tuple(mr.model_state_leaves))
-
-    sel_pos_device = jax.device_put(sel_pos, NamedSharding(draft_worker.mesh, P("data")))
 
     if not hasattr(draft_worker, "_fused_jit_fn"):
         draft_worker._fused_jit_fn = _build_fused_draft_extend_jit(
@@ -644,27 +833,76 @@ def draft_extend_for_decode_fused(draft_worker, model_worker_batch, batch_output
             tuple(all_memory_pools),
             logits_metadata,
             target_hidden,
-            sel_pos_device,
+            batch_output.accept_lens,
             num_layers=draft_worker.speculative_num_steps,
         )
 
+    previous_token_list = (
+        topk_index_stacked[:, :, 0] if len(topk_index_stacked.shape) == 3 else topk_index_stacked
+    )
     for i, w in enumerate(draft_worker._workers):
         w.model_runner.memory_pools.replace_all(all_pool_updates[i])
 
     verified_id_arr = batch_output.next_draft_input.verified_id
-    if hasattr(verified_id_arr, "copy_to_host_async"):
+    selected_verified_id = getattr(
+        batch_output.next_draft_input,
+        "selected_verified_id",
+        None,
+    )
+    if selected_verified_id is None:
+        selected_verified_id = _select_next_verified_id_for_verify(
+            verified_id_arr,
+            batch_output.accept_lens,
+        )
+    if materialize_hidden and hasattr(verified_id_arr, "copy_to_host_async"):
         jax.copy_to_host_async(verified_id_arr)
+    if materialize_hidden:
+        jax.copy_to_host_async(selected_layer0_hidden)
+    if materialize_topk:
+        jax.copy_to_host_async(topk_index_stacked)
+    jax.copy_to_host_async(batch_output.accept_lens)
 
-    jax.copy_to_host_async(selected_layer0_hidden)
-    jax.copy_to_host_async(topk_index_stacked)
+    return FusedDraftExtendDispatch(
+        batch_output=batch_output,
+        selector=sel,
+        selected_layer0_hidden=selected_layer0_hidden,
+        topk_index_stacked=topk_index_stacked,
+        previous_token_list=previous_token_list,
+        selected_verified_id=selected_verified_id,
+        verified_id_arr=verified_id_arr,
+        accept_lens_device=batch_output.accept_lens,
+        materialize_hidden=materialize_hidden,
+        materialize_topk=materialize_topk,
+    )
 
-    batch_output.next_draft_input.hidden_states = np.asarray(selected_layer0_hidden)[sel]
-    topk_index = np.asarray(topk_index_stacked)[sel]
-    batch_output.next_draft_input.topk_p = np.ones(topk_index.shape, dtype=np.float32)
-    batch_output.next_draft_input.topk_index = topk_index
-    select_index = sel * (draft_worker.speculative_num_steps + 1) + accept_host[sel] - 1
-    batch_output.next_draft_input.verified_id = np.asarray(verified_id_arr)[select_index]
-    batch_output.allocate_lens = batch_output.allocate_lens[: model_worker_batch.real_bs]
+
+def _materialize_draft_extend_for_decode_fused(draft_worker, model_worker_batch, dispatch):
+    batch_output = dispatch.batch_output
+    sel = dispatch.selector
+    accept_host = (
+        dispatch.accept_lens_host
+        if dispatch.accept_lens_host is not None
+        else np.asarray(dispatch.accept_lens_device)
+    )
+    assert (accept_host[sel] >= 1).all(), f"accept_length < 1: {accept_host[sel]}"
+    if dispatch.materialize_hidden:
+        batch_output.next_draft_input.hidden_states = np.asarray(dispatch.selected_layer0_hidden)[
+            sel
+        ]
+    else:
+        batch_output.next_draft_input.hidden_states = None
+    if dispatch.materialize_topk:
+        topk_index = np.asarray(dispatch.topk_index_stacked)[sel]
+        batch_output.next_draft_input.topk_p = np.ones(topk_index.shape, dtype=np.float32)
+        batch_output.next_draft_input.topk_index = topk_index
+    if dispatch.verified_id_host is not None:
+        batch_output.next_draft_input.verified_id = dispatch.verified_id_host
+    else:
+        select_index = sel * (draft_worker.speculative_num_steps + 1) + accept_host[sel] - 1
+        batch_output.next_draft_input.verified_id = np.asarray(dispatch.verified_id_arr)[
+            select_index
+        ]
+    batch_output.allocate_lens = batch_output.allocate_lens[: len(sel)]
     batch_output.accept_lens = accept_host
 
 
@@ -843,12 +1081,17 @@ def _build_fused_greedy_verify_jit():
 
         target_logits_for_host = target_logits if return_target_logits else None
         target_hidden_for_host = target_hidden if return_target_hidden else None
+        selected_verified_id = _take_with_index_sharding(
+            prepared.verified_id,
+            prepared.select_index,
+        )
         if mesh is not None:
             rep = NamedSharding(mesh, P())
             prepared_hidden = jax.sharding.reshard(prepared.hidden_states, rep)
             prepared_positions = jax.sharding.reshard(prepared.positions, rep)
-            prepared_new_seq_lens = jax.sharding.reshard(prepared.new_seq_lens, rep)
+            prepared_new_seq_lens = prepared.new_seq_lens
             prepared_verified_id = jax.sharding.reshard(prepared.verified_id, rep)
+            prepared_selected_verified_id = jax.sharding.reshard(selected_verified_id, rep)
             prepared_accept_lens = jax.sharding.reshard(prepared.accept_lens, rep)
             prepared_predict = jax.sharding.reshard(prepared.predict, rep)
             if return_target_logits:
@@ -860,6 +1103,7 @@ def _build_fused_greedy_verify_jit():
             prepared_positions = prepared.positions
             prepared_new_seq_lens = prepared.new_seq_lens
             prepared_verified_id = prepared.verified_id
+            prepared_selected_verified_id = selected_verified_id
             prepared_accept_lens = prepared.accept_lens
             prepared_predict = prepared.predict
 
@@ -868,6 +1112,7 @@ def _build_fused_greedy_verify_jit():
             prepared_positions,
             prepared_new_seq_lens,
             prepared_verified_id,
+            prepared_selected_verified_id,
             prepared_accept_lens,
             prepared_predict,
             target_pool_updates,
@@ -878,18 +1123,27 @@ def _build_fused_greedy_verify_jit():
     return fused_greedy_verify
 
 
-def spec_decode_verify_phase(spec_worker, model_worker_batch, cur_allocate_lens):
-    """Run phase A and return SpecVerifyPhaseResult without draft_extend."""
+def spec_decode_verify_phase_enqueue(
+    spec_worker,
+    model_worker_batch,
+    padded_allocate_lens,
+    compact_allocate_lens,
+):
+    """Enqueue fused verify and Phase A D2H, returning before materialization."""
     from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
-    from sgl_jax.srt.managers.scheduler import (
-        GenerationBatchResult,
-        SpecVerifyPhaseResult,
-    )
+    from sgl_jax.srt.managers.scheduler import GenerationBatchResult
     from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
 
     draft_worker = spec_worker.draft_worker
     target_worker = spec_worker.target_worker
     target_mr = target_worker.model_runner
+    selector = np.asarray(model_worker_batch.logits_indices_selector)
+    seq_lens_host = np.asarray(model_worker_batch.seq_lens)
+    draft_verify_write_lens = getattr(
+        model_worker_batch.spec_info_padded,
+        "verify_write_lens",
+        None,
+    )
     previous_verified_id, previous_token_list = _prepare_topk1_verify_placeholders_from_draft_state(
         draft_worker, model_worker_batch
     )
@@ -900,7 +1154,7 @@ def spec_decode_verify_phase(spec_worker, model_worker_batch, cur_allocate_lens)
     )
     return_target_hidden = bool(getattr(model_worker_batch, "return_hidden_states", False))
 
-    spec_info.allocate_lens = cur_allocate_lens
+    spec_info.allocate_lens = padded_allocate_lens
     spec_info.prepare_for_verify(model_worker_batch, spec_worker.page_size, target_worker)
     target_mr.attn_backend.forward_metadata = target_mr.attn_backend.get_eagle_forward_metadata(
         model_worker_batch
@@ -908,7 +1162,9 @@ def spec_decode_verify_phase(spec_worker, model_worker_batch, cur_allocate_lens)
     target_forward_batch = _forward_batch_init_new_preserve_device(model_worker_batch, target_mr)
     target_forward_batch.bid = model_worker_batch.bid
     target_logits_metadata = _logits_metadata_from_model_worker_batch_preserve_device(
-        model_worker_batch, spec_worker.mesh
+        model_worker_batch,
+        spec_worker.mesh,
+        cache_owner=target_mr,
     )
 
     if not hasattr(draft_worker, "_fused_greedy_verify_jit_fn"):
@@ -920,6 +1176,7 @@ def spec_decode_verify_phase(spec_worker, model_worker_batch, cur_allocate_lens)
             prepared_positions,
             prepared_new_seq_lens,
             prepared_verified_id,
+            selected_verified_id,
             accept_lens_device,
             predict_device,
             target_pool_updates,
@@ -942,26 +1199,14 @@ def spec_decode_verify_phase(spec_worker, model_worker_batch, cur_allocate_lens)
 
     target_mr.memory_pools.replace_all(target_pool_updates)
 
-    with jax.profiler.TraceAnnotation("fused_greedy_verify_phase_d2h"):
-        jax.copy_to_host_async(accept_lens_device)
-        jax.copy_to_host_async(predict_device)
-        accept_lens = np.asarray(accept_lens_device)
-        predict = np.asarray(predict_device)
-
-    selector = np.asarray(model_worker_batch.logits_indices_selector)
-    seq_lens_host = np.asarray(model_worker_batch.seq_lens)
-    verified_pos = selector * draft_worker.speculative_num_draft_tokens + accept_lens[selector] - 1
-    scheduler_next_draft_input = EagleDraftInput(
-        verified_id=predict[verified_pos],
-        new_seq_lens=seq_lens_host[selector] + accept_lens[selector],
-        allocate_lens=cur_allocate_lens[: model_worker_batch.real_bs],
-    )
     draft_next_draft_input = EagleDraftInput(
         verified_id=prepared_verified_id,
         new_seq_lens=prepared_new_seq_lens,
-        allocate_lens=cur_allocate_lens,
+        allocate_lens=compact_allocate_lens,
         hidden_states=prepared_hidden,
     )
+    draft_next_draft_input.verify_write_lens = draft_verify_write_lens
+    draft_next_draft_input.selected_verified_id = selected_verified_id
     draft_batch_output = GenerationBatchResult(
         logits_output=LogitsProcessorOutput(
             next_token_logits=None,
@@ -970,42 +1215,278 @@ def spec_decode_verify_phase(spec_worker, model_worker_batch, cur_allocate_lens)
         next_token_ids=predict_device,
         next_draft_input=draft_next_draft_input,
         accept_lens=accept_lens_device,
-        allocate_lens=cur_allocate_lens,
+        allocate_lens=compact_allocate_lens,
         bid=model_worker_batch.bid,
         cache_miss_count=0,
         extend_input_len_per_req=None,
         extend_logprob_start_len_per_req=None,
     )
-    return SpecVerifyPhaseResult(
+
+    with jax.profiler.TraceAnnotation("fused_greedy_verify_phase_d2h_enqueue"):
+        accept_lens_prefetch = jax.copy_to_host_async(accept_lens_device)
+        predict_prefetch = jax.copy_to_host_async(predict_device)
+
+    return FusedGreedyVerifyPhaseAsync(
         logits_output=LogitsProcessorOutput(
             next_token_logits=target_logits,
             hidden_states=target_hidden,
         ),
-        next_token_ids=predict,
-        accept_lens=accept_lens,
-        allocate_lens=cur_allocate_lens[: model_worker_batch.real_bs],
-        scheduler_next_draft_input=scheduler_next_draft_input,
+        next_token_ids_prefetch=predict_prefetch,
+        accept_lens_prefetch=accept_lens_prefetch,
+        accept_lens_device=accept_lens_device,
+        allocate_lens=padded_allocate_lens,
+        scheduler_next_draft_input_allocate_lens=compact_allocate_lens,
+        selector=selector,
+        seq_lens_host=seq_lens_host,
         draft_extend_state=FusedGreedyDraftExtendState(
             batch_output=draft_batch_output,
             positions=prepared_positions,
+            predispatched=None,
         ),
         bid=model_worker_batch.bid,
         cache_miss_count=0,
     )
 
 
+def spec_decode_materialize_verify_phase(async_result):
+    """Materialize Phase A host data and build scheduler-visible result."""
+    from sgl_jax.srt.managers.scheduler import SpecVerifyPhaseResult
+    from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
+
+    with jax.profiler.TraceAnnotation("fused_greedy_verify_phase_d2h"):
+        accept_lens = np.asarray(async_result.accept_lens_prefetch)
+        predict = np.asarray(async_result.next_token_ids_prefetch)
+
+    state = async_result.draft_extend_state
+    stride = state.batch_output.next_draft_input.verified_id.shape[0] // accept_lens.shape[0]
+    selector = async_result.selector
+    verified_pos = selector * stride + accept_lens[selector] - 1
+    verified_id_host = predict[verified_pos]
+    scheduler_next_draft_input = EagleDraftInput(
+        verified_id=verified_id_host,
+        new_seq_lens=async_result.seq_lens_host[selector] + accept_lens[selector],
+        allocate_lens=async_result.scheduler_next_draft_input_allocate_lens,
+    )
+    padded_new_seq_lens_host = async_result.seq_lens_host + accept_lens
+
+    return SpecVerifyPhaseResult(
+        logits_output=async_result.logits_output,
+        next_token_ids=predict,
+        accept_lens=accept_lens,
+        allocate_lens=async_result.allocate_lens,
+        scheduler_next_draft_input=scheduler_next_draft_input,
+        draft_extend_state=state,
+        bid=async_result.bid,
+        cache_miss_count=async_result.cache_miss_count,
+        padded_new_seq_lens_host=padded_new_seq_lens_host,
+    )
+
+
+def spec_decode_verify_phase(
+    spec_worker,
+    model_worker_batch,
+    padded_allocate_lens,
+    compact_allocate_lens,
+    *,
+    predispatch_draft_extend: bool = False,
+):
+    """Run phase A and return SpecVerifyPhaseResult without draft_extend."""
+    async_result = spec_decode_verify_phase_enqueue(
+        spec_worker,
+        model_worker_batch,
+        padded_allocate_lens,
+        compact_allocate_lens,
+    )
+    verify_result = spec_decode_materialize_verify_phase(async_result)
+
+    predispatched = None
+    if predispatch_draft_extend:
+        with jax.profiler.TraceAnnotation("predispatch_spec_draft_extend_phase"):
+            predispatched = _dispatch_draft_extend_for_decode_fused(
+                spec_worker.draft_worker,
+                model_worker_batch,
+                verify_result.draft_extend_state.batch_output,
+                materialize_hidden=False,
+                materialize_topk=False,
+            )
+    if predispatched is not None:
+        predispatched = predispatched._replace(
+            accept_lens_host=verify_result.accept_lens,
+            verified_id_host=verify_result.scheduler_next_draft_input.verified_id,
+        )
+        verify_result = verify_result.__class__(
+            logits_output=verify_result.logits_output,
+            next_token_ids=verify_result.next_token_ids,
+            accept_lens=verify_result.accept_lens,
+            allocate_lens=verify_result.allocate_lens,
+            scheduler_next_draft_input=verify_result.scheduler_next_draft_input,
+            draft_extend_state=verify_result.draft_extend_state._replace(
+                predispatched=predispatched,
+            ),
+            bid=verify_result.bid,
+            cache_miss_count=verify_result.cache_miss_count,
+            padded_new_seq_lens_host=verify_result.padded_new_seq_lens_host,
+        )
+
+    return verify_result
+
+
 def spec_decode_draft_extend_phase(spec_worker, model_worker_batch, verify_phase_result):
     """Run phase B and return the next-round spec forward state."""
     from sgl_jax.srt.managers.scheduler import SpecDraftExtendPhaseResult
+    from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
 
     state = verify_phase_result.draft_extend_state
     model_worker_batch.positions = state.positions
-    draft_extend_for_decode_fused(
+    padded_next_draft_input = None
+    padded_req_pool_indices = None
+    if state.predispatched is not None:
+        with jax.profiler.TraceAnnotation("materialize_predispatched_spec_draft_extend_phase"):
+            _materialize_draft_extend_for_decode_fused(
+                spec_worker.draft_worker,
+                model_worker_batch,
+                state.predispatched,
+            )
+        if not state.predispatched.materialize_topk:
+            padded_next_draft_input = EagleDraftInput(
+                topk_index=state.predispatched.topk_index_stacked,
+                verified_id=state.predispatched.selected_verified_id,
+                new_seq_lens=state.batch_output.next_draft_input.new_seq_lens,
+                allocate_lens=getattr(
+                    state.batch_output.next_draft_input,
+                    "allocate_lens",
+                    None,
+                ),
+            )
+            padded_next_draft_input.verify_write_lens = getattr(
+                state.batch_output.next_draft_input,
+                "verify_write_lens",
+                None,
+            )
+            padded_next_draft_input.previous_token_list = state.predispatched.previous_token_list
+            padded_req_pool_indices = np.asarray(model_worker_batch.req_pool_indices).copy()
+    else:
+        draft_extend_for_decode_fused(
+            spec_worker.draft_worker,
+            model_worker_batch,
+            state.batch_output,
+        )
+    selector = np.asarray(model_worker_batch.logits_indices_selector)
+    req_pool_indices = np.asarray(model_worker_batch.req_pool_indices)[selector]
+    return SpecDraftExtendPhaseResult(
+        next_draft_input=state.batch_output.next_draft_input,
+        req_pool_indices=req_pool_indices,
+        padded_next_draft_input=padded_next_draft_input,
+        padded_req_pool_indices=padded_req_pool_indices,
+        padded_new_seq_lens_host=getattr(
+            verify_phase_result,
+            "padded_new_seq_lens_host",
+            None,
+        ),
+    )
+
+
+def spec_decode_pending_draft_extend_result_from_predispatch(
+    model_worker_batch,
+    verify_phase_result,
+):
+    """Build next-round draft state from predispatched Phase B device handles.
+
+    The split-overlap path already dispatches fused draft_extend before Phase A
+    D2H materializes. For the common exact padded-layout decode case, the next
+    verify needs only the padded topk/verified-token device handles. Returning
+    those handles directly lets the ordered worker thread accept the next batch
+    without synchronously materializing Phase B host rows.
+    """
+    from sgl_jax.srt.managers.scheduler import SpecDraftExtendPhaseResult
+    from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
+
+    state = getattr(verify_phase_result, "draft_extend_state", None)
+    dispatch = getattr(state, "predispatched", None)
+    if dispatch is None or getattr(dispatch, "materialize_topk", True):
+        return None
+    batch_output = getattr(state, "batch_output", None)
+    next_draft_input = getattr(batch_output, "next_draft_input", None)
+
+    padded_next_draft_input = EagleDraftInput(
+        topk_index=dispatch.topk_index_stacked,
+        verified_id=dispatch.selected_verified_id,
+        new_seq_lens=getattr(next_draft_input, "new_seq_lens", None),
+        allocate_lens=getattr(next_draft_input, "allocate_lens", None),
+    )
+    padded_next_draft_input.verify_write_lens = getattr(
+        next_draft_input,
+        "verify_write_lens",
+        None,
+    )
+    padded_next_draft_input.previous_token_list = dispatch.previous_token_list
+
+    selector = np.asarray(model_worker_batch.logits_indices_selector)
+    req_pool_indices = np.asarray(model_worker_batch.req_pool_indices)[selector]
+    return SpecDraftExtendPhaseResult(
+        next_draft_input=EagleDraftInput(),
+        req_pool_indices=req_pool_indices,
+        padded_next_draft_input=padded_next_draft_input,
+        padded_req_pool_indices=np.asarray(model_worker_batch.req_pool_indices).copy(),
+        padded_new_seq_lens_host=getattr(
+            verify_phase_result,
+            "padded_new_seq_lens_host",
+            None,
+        ),
+    )
+
+
+def spec_decode_dispatch_draft_extend_for_pending(
+    spec_worker,
+    model_worker_batch,
+    verify_phase_result,
+):
+    """Dispatch Phase B after Phase A has already been published to scheduler."""
+    from sgl_jax.srt.managers.scheduler import SpecDraftExtendPhaseResult
+    from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
+
+    state = verify_phase_result.draft_extend_state
+    model_worker_batch.positions = state.positions
+    dispatch = _dispatch_draft_extend_for_decode_fused(
         spec_worker.draft_worker,
         model_worker_batch,
         state.batch_output,
+        materialize_hidden=False,
+        materialize_topk=False,
     )
-    return SpecDraftExtendPhaseResult(next_draft_input=state.batch_output.next_draft_input)
+    if dispatch is None:
+        return None
+
+    padded_next_draft_input = EagleDraftInput(
+        topk_index=dispatch.topk_index_stacked,
+        verified_id=dispatch.selected_verified_id,
+        new_seq_lens=state.batch_output.next_draft_input.new_seq_lens,
+        allocate_lens=getattr(
+            state.batch_output.next_draft_input,
+            "allocate_lens",
+            None,
+        ),
+    )
+    padded_next_draft_input.verify_write_lens = getattr(
+        state.batch_output.next_draft_input,
+        "verify_write_lens",
+        None,
+    )
+    padded_next_draft_input.previous_token_list = dispatch.previous_token_list
+
+    selector = np.asarray(model_worker_batch.logits_indices_selector)
+    req_pool_indices = np.asarray(model_worker_batch.req_pool_indices)[selector]
+    return SpecDraftExtendPhaseResult(
+        next_draft_input=EagleDraftInput(),
+        req_pool_indices=req_pool_indices,
+        padded_next_draft_input=padded_next_draft_input,
+        padded_req_pool_indices=np.asarray(model_worker_batch.req_pool_indices).copy(),
+        padded_new_seq_lens_host=getattr(
+            verify_phase_result,
+            "padded_new_seq_lens_host",
+            None,
+        ),
+    )
 
 
 def _convert_split_phase_to_generation_result(verify_phase_result, draft_extend_result):
@@ -1024,12 +1505,18 @@ def _convert_split_phase_to_generation_result(verify_phase_result, draft_extend_
     )
 
 
-def spec_decode(spec_worker, model_worker_batch, cur_allocate_lens):
+def spec_decode(
+    spec_worker,
+    model_worker_batch,
+    padded_allocate_lens,
+    compact_allocate_lens,
+):
     """Run one fused speculative decode round."""
     verify_phase_result = spec_decode_verify_phase(
         spec_worker,
         model_worker_batch,
-        cur_allocate_lens,
+        padded_allocate_lens,
+        compact_allocate_lens,
     )
     draft_extend_result = spec_decode_draft_extend_phase(
         spec_worker,

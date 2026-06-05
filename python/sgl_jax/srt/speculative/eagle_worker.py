@@ -230,6 +230,16 @@ class EAGLEWorker(BaseSpecWorker):
                         ]
                     )
                 self.forward_batch_speculative_generation(model_worker_batch)
+                if (
+                    getattr(self, "_can_use_fused_spec_decode", False)
+                    and model_worker_batch.sampling_info.is_all_greedy
+                    and self._has_fused_greedy_draft_state(model_worker_batch)
+                ):
+                    verify_result = self.forward_batch_speculative_verify_phase(model_worker_batch)
+                    self.forward_batch_speculative_draft_extend_phase(
+                        model_worker_batch,
+                        verify_result,
+                    )
 
         end_time = time.perf_counter()
         logger.info("[SPEC_DECODE] Precompile finished in %.0f secs", end_time - start_time)

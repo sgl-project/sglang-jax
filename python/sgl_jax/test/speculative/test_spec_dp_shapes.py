@@ -46,6 +46,7 @@ class _Req:
         self.stream = False
         self.grammar = None
         self.return_hidden_states = False
+        self.req_pool_idx = None
 
     def finished(self) -> bool:
         return self._done
@@ -138,7 +139,7 @@ def test_get_spec_decode_mwb_dp_shapes(dp, bs_per_rank):
     sb = _mk_batch(dp, bs_per_rank)
     real_bs = sum(bs_per_rank)
     buckets = [b for b in BS_BUCKETS if b >= dp]
-    mwb = sb._get_spec_decode_mwb_dp(buckets, enable_static_lora=False)
+    mwb = sb._get_spec_decode_mwb_dp(buckets, enable_static_lora=False, draft_token_num=DRAFT_N)
 
     assert mwb.dp_size == dp
     assert mwb.real_bs == real_bs
@@ -161,6 +162,23 @@ def test_get_spec_decode_mwb_dp_shapes(dp, bs_per_rank):
         assert np.all(seg[:bs] > 0), f"rank {r} real slots zero: {seg}"
         assert np.all(seg[bs:] == 0), f"rank {r} pad slots nonzero: {seg}"
     assert mwb.spec_info_padded is not None
+
+
+def test_spec_decode_mwb_pins_out_cache_loc_shape_when_allocator_chunk_is_longer():
+    dp = 4
+    bs_per_rank = [8, 8, 8, 8]
+    sb = _mk_batch(dp, bs_per_rank)
+    for r, info in enumerate(sb.reqs_info):
+        target = bs_per_rank[r] * DRAFT_N
+        info.out_cache_loc = np.arange(r * 1000, r * 1000 + target + 7, dtype=np.int32)
+
+    mwb = sb._get_spec_decode_mwb_dp([32, 64], enable_static_lora=False, draft_token_num=DRAFT_N)
+
+    assert mwb.out_cache_loc.shape == (32 * DRAFT_N,)
+    ocl = np.asarray(mwb.out_cache_loc).reshape(dp, -1)
+    for r in range(dp):
+        target = bs_per_rank[r] * DRAFT_N
+        assert list(ocl[r]) == list(range(r * 1000, r * 1000 + target))
 
 
 @pytest.mark.parametrize(
@@ -220,6 +238,178 @@ def test_filter_batch_preserves_global_spec_info(dp, bs_per_rank, finish):
         flat_base += bs
 
 
+def test_filter_batch_releases_finished_spec_decode_overalloc():
+    class _Allocator:
+        page_size = 64
+
+        def __init__(self):
+            self.freed = []
+
+        def free(self, indices, dp_rank=0):
+            self.freed.append((dp_rank, np.asarray(indices).copy()))
+
+    class _ReqPool:
+        def __init__(self):
+            self.req_to_token = np.arange(256, dtype=np.int32).reshape(1, 256)
+            self.freed_req = None
+
+        def free(self, req):
+            self.freed_req = req
+            req.req_pool_idx = None
+
+    class _TreeCache:
+        page_size = 64
+
+        def __init__(self):
+            self.token_to_kv_pool_allocator = _Allocator()
+            self.req_to_token_pool = _ReqPool()
+            self.cached = []
+
+        def cache_finished_req(self, req, is_insert=True):
+            self.cached.append((req.rid, is_insert))
+
+    class _FinishedReq(_Req):
+        def __init__(self):
+            super().__init__(0)
+            self._done = True
+            self.req_pool_idx = 0
+            self.dp_rank = 0
+            self.origin_input_ids = list(range(64))
+            self.output_ids = [10, 11]
+            self.kv_committed_len = 64
+            self.kv_allocated_len = 64
+            self.kv_overallocated_freed = False
+
+        def pop_overallocated_kv_cache(self):
+            self.kv_overallocated_freed = True
+            return self.kv_committed_len, self.kv_allocated_len
+
+    req = _FinishedReq()
+    tree_cache = _TreeCache()
+    info = ScheduleReqsInfo()
+    info.reqs = [req]
+    info.req_pool_indices = np.array([0], dtype=np.int32)
+    info.seq_lens = np.array([66], dtype=np.int32)
+    info.spec_info = EagleDraftInput(
+        allocate_lens=np.array([192], dtype=np.int32),
+        topk_p=np.ones((1, TOPK), np.float32),
+        topk_index=np.zeros((1, TOPK), np.int32),
+        hidden_states=np.zeros((1, HIDDEN), np.float32),
+        verified_id=np.zeros((1,), np.int32),
+    )
+
+    sb = ScheduleBatch.__new__(ScheduleBatch)
+    sb.__dict__.update(
+        dict(
+            reqs_info=[info],
+            dp_size=1,
+            spec_algorithm=SpeculativeAlgorithm.NEXTN,
+            tree_cache=tree_cache,
+            token_to_kv_pool_allocator=tree_cache.token_to_kv_pool_allocator,
+            return_logprob=False,
+            return_output_logprob_only=False,
+            has_stream=False,
+            has_grammar=False,
+        )
+    )
+
+    sb.filter_batch()
+
+    assert req.req_pool_idx is None
+    assert tree_cache.cached == [(req.rid, True)]
+    assert len(tree_cache.token_to_kv_pool_allocator.freed) == 1
+    dp_rank, freed = tree_cache.token_to_kv_pool_allocator.freed[0]
+    assert dp_rank == 0
+    np.testing.assert_array_equal(freed, np.arange(128, 192, dtype=np.int32))
+
+
+def test_filter_batch_releases_dropped_unfinished_spec_decode_req():
+    class _Allocator:
+        page_size = 64
+
+        def __init__(self):
+            self.freed = []
+
+        def free(self, indices, dp_rank=0):
+            self.freed.append((dp_rank, np.asarray(indices).copy()))
+
+    class _ReqPool:
+        def __init__(self):
+            self.req_to_token = np.arange(512, dtype=np.int32).reshape(2, 256)
+            self.freed = []
+
+        def free(self, req):
+            self.freed.append(req.rid)
+            req.req_pool_idx = None
+
+    class _TreeCache:
+        page_size = 64
+
+        def __init__(self):
+            self.token_to_kv_pool_allocator = _Allocator()
+            self.req_to_token_pool = _ReqPool()
+            self.cached = []
+
+        def cache_finished_req(self, req, is_insert=True):
+            self.cached.append((req.rid, is_insert))
+
+    class _ReqWithPool(_Req):
+        def __init__(self, rid: int, req_pool_idx: int):
+            super().__init__(rid)
+            self.req_pool_idx = req_pool_idx
+            self.dp_rank = 0
+            self.origin_input_ids = list(range(64))
+            self.output_ids = [10, 11]
+            self.kv_committed_len = 64
+            self.kv_allocated_len = 64
+            self.kv_overallocated_freed = False
+
+        def pop_overallocated_kv_cache(self):
+            self.kv_overallocated_freed = True
+            return self.kv_committed_len, self.kv_allocated_len
+
+    dropped = _ReqWithPool(0, 0)
+    kept = _ReqWithPool(1, 1)
+    tree_cache = _TreeCache()
+    info = ScheduleReqsInfo()
+    info.reqs = [dropped, kept]
+    info.req_pool_indices = np.array([0, 1], dtype=np.int32)
+    info.seq_lens = np.array([66, 66], dtype=np.int32)
+    info.spec_info = EagleDraftInput(
+        allocate_lens=np.array([192, 192], dtype=np.int32),
+        topk_p=np.ones((2, TOPK), np.float32),
+        topk_index=np.zeros((2, TOPK), np.int32),
+        hidden_states=np.zeros((2, HIDDEN), np.float32),
+        verified_id=np.zeros((2,), np.int32),
+    )
+
+    sb = ScheduleBatch.__new__(ScheduleBatch)
+    sb.__dict__.update(
+        dict(
+            reqs_info=[info],
+            dp_size=1,
+            spec_algorithm=SpeculativeAlgorithm.NEXTN,
+            tree_cache=tree_cache,
+            token_to_kv_pool_allocator=tree_cache.token_to_kv_pool_allocator,
+            return_logprob=False,
+            return_output_logprob_only=False,
+            has_stream=False,
+            has_grammar=False,
+        )
+    )
+
+    sb.filter_batch(keep_indices={0: [1]})
+
+    assert dropped.req_pool_idx is None
+    assert kept.req_pool_idx == 1
+    assert tree_cache.req_to_token_pool.freed == [dropped.rid]
+    assert len(tree_cache.token_to_kv_pool_allocator.freed) == 1
+    dp_rank, freed = tree_cache.token_to_kv_pool_allocator.freed[0]
+    assert dp_rank == 0
+    np.testing.assert_array_equal(freed, np.arange(128, 192, dtype=np.int32))
+    assert sb.reqs_info[0].reqs == [kept]
+
+
 def test_filter_batch_then_decode_mwb_round_trip():
     """Regression for 2-req partial-finish → next-round decode mwb (r9 crash).
 
@@ -240,7 +430,7 @@ def test_filter_batch_then_decode_mwb_round_trip():
     assert list(np.asarray(sb.reqs_info[1].spec_info.allocate_lens)) == [120]
 
     buckets = [b for b in BS_BUCKETS if b >= dp]
-    mwb = sb._get_spec_decode_mwb_dp(buckets, enable_static_lora=False)
+    mwb = sb._get_spec_decode_mwb_dp(buckets, enable_static_lora=False, draft_token_num=DRAFT_N)
     assert mwb.real_bs == 1
     assert mwb.real_bs_per_dp == [0, 1]
     assert len(mwb.seq_lens) % dp == 0
@@ -287,7 +477,7 @@ def test_spec_info_aligns_with_dp_padded_slots(dp, bs_per_rank):
         )
         flat_base += bs
     buckets = [b for b in BS_BUCKETS if b >= dp]
-    mwb = sb._get_spec_decode_mwb_dp(buckets, enable_static_lora=False)
+    mwb = sb._get_spec_decode_mwb_dp(buckets, enable_static_lora=False, draft_token_num=DRAFT_N)
     per_dp = mwb.per_dp_bs_size
     total_bs = per_dp * dp
 
@@ -338,7 +528,7 @@ def test_draft_page_indices_dp_segmented(dp, bs_per_rank):
         )
         flat_base += bs
     buckets = [b for b in BS_BUCKETS if b >= dp]
-    mwb = sb._get_spec_decode_mwb_dp(buckets, enable_static_lora=False)
+    mwb = sb._get_spec_decode_mwb_dp(buckets, enable_static_lora=False, draft_token_num=DRAFT_N)
     per_dp = mwb.per_dp_bs_size
     sel = np.asarray(mwb.logits_indices_selector)
     assert sel.shape == (real_bs,)
@@ -371,7 +561,7 @@ def test_draft_page_indices_dp_segmented(dp, bs_per_rank):
                 out[m] = r * base + np.concatenate(([0], c[:-1]))
         return out
 
-    DST, per_dst = 16384, 16384 // dp
+    DST, per_dst = len(src_locs), len(src_locs) // dp
     flat_cum = np.concatenate(([0], np.cumsum(spec_pg)[:-1]))
     off = np.arange(int(spec_pg.sum())) - np.repeat(flat_cum, spec_pg)
     gi = np.repeat(starts(alloc_pg, L_pg), spec_pg) + off

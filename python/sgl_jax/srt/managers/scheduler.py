@@ -145,6 +145,7 @@ class SpecVerifyPhaseResult:
     draft_extend_state: Any
     bid: int
     cache_miss_count: int
+    padded_new_seq_lens_host: np.ndarray | None = None
 
 
 @dataclass
@@ -152,6 +153,10 @@ class SpecDraftExtendPhaseResult:
     """Output from draft_extend phase that refreshes next-round spec state."""
 
     next_draft_input: EagleDraftInput
+    req_pool_indices: np.ndarray | None = None
+    padded_next_draft_input: EagleDraftInput | None = None
+    padded_req_pool_indices: np.ndarray | None = None
+    padded_new_seq_lens_host: np.ndarray | None = None
 
 
 class Scheduler(
@@ -372,10 +377,13 @@ class Scheduler(
                     EAGLEWorker as _SpecWorkerCls,
                 )
 
+            spec_target_worker = self.tp_worker.worker if self.enable_overlap else self.tp_worker
             self.draft_worker = _SpecWorkerCls(
                 server_args=server_args,
-                target_worker=self.tp_worker,
+                target_worker=spec_target_worker,
             )
+            if self.enable_overlap:
+                self.tp_worker.spec_worker = self.draft_worker
 
         # Get token and memory info from the model worker
         (
@@ -886,6 +894,7 @@ class Scheduler(
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and Accelerator computation."""
         self.result_queue = deque()
+        self._pending_spec_draft_extend = False
 
         while True:
             recv_reqs = (
@@ -901,6 +910,18 @@ class Scheduler(
             if self._engine_paused:
                 continue
 
+            processed_last_batch_early = False
+            if (
+                self.last_batch
+                and self.spec_algorithm is not None
+                and not self.spec_algorithm.is_none()
+            ):
+                tmp_batch, tmp_result = self.result_queue.popleft()
+                tmp_batch.next_batch_sampling_info = None
+                with jax.profiler.TraceAnnotation("process_spec_phase_a_result_early"):
+                    self.process_batch_result(tmp_batch, tmp_result, None)
+                processed_last_batch_early = True
+
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
 
@@ -908,7 +929,12 @@ class Scheduler(
                 batch.launch_done = threading.Event()
                 with jax.profiler.TraceAnnotation("run_batch"):
                     result = self.run_batch(batch)
-                self.result_queue.append((batch.copy(), result))
+                queued_batch = (
+                    batch
+                    if self.spec_algorithm is not None and not self.spec_algorithm.is_none()
+                    else batch.copy()
+                )
+                self.result_queue.append((queued_batch, result))
 
                 if self.last_batch is None:
                     # Create a dummy first batch to start the pipeline for overlap schedule.
@@ -929,7 +955,9 @@ class Scheduler(
                     with jax.profiler.TraceAnnotation("process_batch_result"):
                         self.process_batch_result(tmp_batch, None, batch.launch_done)
 
-            if self.last_batch:
+            self._flush_deferred_decode_stats_logs()
+
+            if self.last_batch and not processed_last_batch_early:
                 # Process the results of the last batch
                 tmp_batch, tmp_result = self.result_queue.popleft()
                 tmp_batch.next_batch_sampling_info = (
@@ -1859,14 +1887,414 @@ class Scheduler(
                 accept.copy_to_host_async()
             accept = np.asarray(jax.device_get(accept))
         per_dp_bs = model_worker_batch.per_dp_bs_size
+        compact_off = 0
+        compact_total = sum(model_worker_batch.real_bs_per_dp)
+        padded_total = per_dp_bs * len(batch.reqs_info)
         for dp_rank, info in enumerate(batch.reqs_info):
             if info.seq_lens is None or len(info.seq_lens) == 0:
                 continue
+            off = dp_rank * per_dp_bs
+            n = len(info.seq_lens)
             if accept is not None:
-                off = dp_rank * per_dp_bs
-                info.seq_lens = info.seq_lens + accept[off : off + len(info.seq_lens)]
+                info.seq_lens = info.seq_lens + accept[off : off + n]
             else:
                 info.seq_lens = info.seq_lens + 1
+            self._publish_spec_verify_phase_allocate_lens_to_info(
+                info,
+                verify_result.allocate_lens,
+                padded_offset=off,
+                compact_offset=compact_off,
+                length=n,
+                padded_total=padded_total,
+                compact_total=compact_total,
+            )
+            compact_off += n
+
+    def _publish_spec_verify_phase_lengths_to_schedule_batch(
+        self,
+        batch: ScheduleBatch,
+        verify_result,
+    ) -> None:
+        """Overlap variant: update scheduler batch lengths from a phase-A result."""
+        accept = verify_result.accept_lens
+        if accept is not None:
+            if hasattr(accept, "copy_to_host_async"):
+                accept.copy_to_host_async()
+            accept = np.asarray(jax.device_get(accept))
+        per_dp_bs = batch.per_dp_bs_size
+        compact_off = 0
+        compact_total = sum(len(info.reqs) if info.reqs else 0 for info in batch.reqs_info)
+        padded_total = per_dp_bs * len(batch.reqs_info)
+        for dp_rank, info in enumerate(batch.reqs_info):
+            if info.seq_lens is None or len(info.seq_lens) == 0:
+                continue
+            off = dp_rank * per_dp_bs
+            n = len(info.seq_lens)
+            if accept is not None:
+                info.seq_lens = info.seq_lens + accept[off : off + n]
+            else:
+                info.seq_lens = info.seq_lens + 1
+            self._publish_spec_verify_phase_allocate_lens_to_info(
+                info,
+                verify_result.allocate_lens,
+                padded_offset=off,
+                compact_offset=compact_off,
+                length=n,
+                padded_total=padded_total,
+                compact_total=compact_total,
+            )
+            compact_off += n
+
+    @staticmethod
+    def _slice_spec_verify_phase_allocate_lens(
+        allocate_lens,
+        *,
+        padded_offset: int,
+        compact_offset: int,
+        length: int,
+        padded_total: int,
+        compact_total: int,
+    ):
+        if allocate_lens is None:
+            return None
+        if hasattr(allocate_lens, "copy_to_host_async"):
+            allocate_lens.copy_to_host_async()
+        allocate_lens = np.asarray(jax.device_get(allocate_lens))
+        if allocate_lens.shape[0] == padded_total:
+            return allocate_lens[padded_offset : padded_offset + length].copy()
+        if allocate_lens.shape[0] == compact_total:
+            return allocate_lens[compact_offset : compact_offset + length].copy()
+        raise AssertionError(
+            "unexpected spec verify allocate_lens layout: "
+            f"{allocate_lens.shape[0]=}, {padded_total=}, {compact_total=}, "
+            f"{padded_offset=}, {compact_offset=}, {length=}"
+        )
+
+    @staticmethod
+    def _publish_spec_verify_phase_allocate_lens_to_info(
+        info,
+        allocate_lens,
+        *,
+        padded_offset: int,
+        compact_offset: int,
+        length: int,
+        padded_total: int,
+        compact_total: int,
+    ) -> None:
+        """Keep scheduler-side KV allocation frontier current after Phase A."""
+        if info.spec_info is None or allocate_lens is None:
+            return
+        if getattr(info.spec_info, "allocate_lens", None) is None:
+            return
+        info.spec_info.allocate_lens = Scheduler._slice_spec_verify_phase_allocate_lens(
+            allocate_lens,
+            padded_offset=padded_offset,
+            compact_offset=compact_offset,
+            length=length,
+            padded_total=padded_total,
+            compact_total=compact_total,
+        )
+
+    def _generation_result_from_spec_verify_phase(
+        self,
+        verify_result: SpecVerifyPhaseResult,
+    ) -> GenerationBatchResult:
+        return GenerationBatchResult(
+            logits_output=verify_result.logits_output,
+            next_token_ids=verify_result.next_token_ids,
+            next_draft_input=None,
+            accept_lens=verify_result.accept_lens,
+            allocate_lens=verify_result.allocate_lens,
+            bid=verify_result.bid,
+            cache_miss_count=verify_result.cache_miss_count,
+            extend_input_len_per_req=None,
+            extend_logprob_start_len_per_req=None,
+        )
+
+    @staticmethod
+    def _take_spec_info_rows(spec_info: EagleDraftInput, indices: list[int]) -> EagleDraftInput:
+        fields = (
+            "topk_p",
+            "topk_index",
+            "hidden_states",
+            "verified_id",
+            "allocate_lens",
+            "verify_write_lens",
+            "new_seq_lens",
+            "accept_length",
+            "accept_length_cpu",
+        )
+        kwargs = {"capture_hidden_mode": spec_info.capture_hidden_mode}
+        for field in fields:
+            value = getattr(spec_info, field, None)
+            kwargs[field] = None if value is None else np.asarray(value)[indices]
+        return EagleDraftInput(**kwargs)
+
+    def _write_back_spec_draft_state_by_req_pool_to_batch(
+        self,
+        batch: ScheduleBatch,
+        draft_extend_result: SpecDraftExtendPhaseResult,
+        *,
+        require_all_current: bool = True,
+    ) -> None:
+        """Write Phase B state into the current batch by stable req_pool_idx."""
+        next_draft_input = draft_extend_result.next_draft_input
+        req_pool_indices = draft_extend_result.req_pool_indices
+        if next_draft_input is None or req_pool_indices is None:
+            return
+        self._write_back_spec_draft_state_to_batch(
+            batch=SimpleNamespace(reqs_info=[SimpleNamespace(spec_info=None)]),
+            model_worker_batch=SimpleNamespace(
+                real_bs=len(req_pool_indices),
+                real_bs_per_dp=[len(req_pool_indices)],
+            ),
+            next_draft_input=next_draft_input,
+        )
+
+        next_draft_input._ensure_host()
+        req_pool_indices = np.asarray(req_pool_indices, dtype=np.int32)
+        phase_b_pos = {int(req_pool_idx): i for i, req_pool_idx in enumerate(req_pool_indices)}
+
+        current_req_pool_indices = []
+        real_bs_per_dp = []
+        for info in batch.reqs_info:
+            n = len(info.reqs) if info.reqs else 0
+            if n == 0:
+                real_bs_per_dp.append(0)
+                continue
+            req_pool = np.asarray(info.req_pool_indices, dtype=np.int32)
+            current_req_pool_indices.extend([int(x) for x in req_pool[:n]])
+            real_bs_per_dp.append(n)
+
+        existing_flat = ScheduleBatch._concat_spec_info_per_rank(
+            [info.spec_info for info in batch.reqs_info]
+        )
+        existing_req_pool_indices = []
+        for info in batch.reqs_info:
+            if info.spec_info is None:
+                continue
+            n = len(info.reqs) if info.reqs else 0
+            if n == 0:
+                continue
+            req_pool = np.asarray(info.req_pool_indices, dtype=np.int32)
+            existing_req_pool_indices.extend([int(x) for x in req_pool[:n]])
+        existing_pos = {req_pool_idx: i for i, req_pool_idx in enumerate(existing_req_pool_indices)}
+
+        selected_rows = []
+        selected_from_phase_b = []
+        for req_pool_idx in current_req_pool_indices:
+            if req_pool_idx in phase_b_pos:
+                selected_rows.append(phase_b_pos[req_pool_idx])
+                selected_from_phase_b.append(True)
+            else:
+                if existing_flat is None or req_pool_idx not in existing_pos:
+                    assert not require_all_current, (
+                        "missing spec draft state for req_pool_idx="
+                        f"{req_pool_idx}; neither Phase B nor existing batch state has it"
+                    )
+                    return
+                selected_rows.append(existing_pos[req_pool_idx])
+                selected_from_phase_b.append(False)
+
+        if not selected_rows:
+            return
+
+        phase_b_indices = [
+            row if from_phase_b else -1
+            for row, from_phase_b in zip(selected_rows, selected_from_phase_b, strict=True)
+        ]
+        existing_indices = [
+            row if not from_phase_b else -1
+            for row, from_phase_b in zip(selected_rows, selected_from_phase_b, strict=True)
+        ]
+
+        def _merge_field(field: str):
+            phase_b_value = getattr(next_draft_input, field, None)
+            existing_value = (
+                getattr(existing_flat, field, None) if existing_flat is not None else None
+            )
+            rows = []
+            for from_phase_b, phase_b_i, existing_i in zip(
+                selected_from_phase_b,
+                phase_b_indices,
+                existing_indices,
+                strict=True,
+            ):
+                if from_phase_b:
+                    assert phase_b_value is not None, f"Phase B field {field} is None"
+                    rows.append(np.asarray(phase_b_value)[phase_b_i])
+                else:
+                    assert existing_value is not None, f"existing field {field} is None"
+                    rows.append(np.asarray(existing_value)[existing_i])
+            if not rows:
+                return None
+            return np.stack(rows, axis=0)
+
+        def _merge_existing_field_by_req_pool(field: str):
+            assert existing_flat is not None, f"existing field {field} is None"
+            existing_value = getattr(existing_flat, field, None)
+            assert existing_value is not None, f"existing field {field} is None"
+            return np.stack(
+                [
+                    np.asarray(existing_value)[existing_pos[req_pool_idx]]
+                    for req_pool_idx in current_req_pool_indices
+                ],
+                axis=0,
+            )
+
+        fields = (
+            "topk_p",
+            "topk_index",
+            "hidden_states",
+            "verified_id",
+            "allocate_lens",
+            "verify_write_lens",
+            "new_seq_lens",
+            "accept_length",
+            "accept_length_cpu",
+        )
+        merged = EagleDraftInput(capture_hidden_mode=next_draft_input.capture_hidden_mode)
+        for field in fields:
+            phase_b_value = getattr(next_draft_input, field, None)
+            existing_value = (
+                getattr(existing_flat, field, None) if existing_flat is not None else None
+            )
+            if field == "verify_write_lens" and phase_b_value is None:
+                setattr(
+                    merged,
+                    field,
+                    (
+                        _merge_existing_field_by_req_pool(field)
+                        if existing_value is not None
+                        else None
+                    ),
+                )
+                continue
+            if phase_b_value is None and existing_value is None:
+                setattr(merged, field, None)
+            else:
+                setattr(merged, field, _merge_field(field))
+
+        per_rank_spec = ScheduleBatch._split_spec_info_per_rank(merged, real_bs_per_dp)
+        for r, spec_info in enumerate(per_rank_spec):
+            batch.reqs_info[r].spec_info = spec_info
+
+    def _wait_pending_spec_draft_extend_before_launch(self, batch: ScheduleBatch) -> None:
+        if not getattr(self, "_pending_spec_draft_extend", False):
+            return
+        with jax.profiler.TraceAnnotation("wait_pending_spec_draft_extend_before_launch"):
+            draft_extend_result = self.tp_worker.resolve_last_spec_draft_extend_result()
+        self._write_back_spec_draft_state_by_req_pool_to_batch(
+            batch,
+            draft_extend_result,
+            require_all_current=batch.forward_mode.is_decode(),
+        )
+        self._pending_spec_draft_extend = False
+
+    def _can_chain_same_batch_spec_decode(
+        self,
+        batch: ScheduleBatch,
+        previous_padded_req_pool_indices,
+    ) -> bool:
+        """Return whether a future worker-owned same-batch chain is safe.
+
+        This is intentionally conservative. Without rollback for extra KV writes,
+        chaining before scheduler catch-up is only safe when no request can finish
+        or change launch-visible layout before the next verify.
+        """
+        if not getattr(self, "enable_overlap", False):
+            return False
+        spec_algorithm = getattr(self, "spec_algorithm", None)
+        if spec_algorithm is None or spec_algorithm.is_none():
+            return False
+        if batch is None or not batch.forward_mode.is_decode():
+            return False
+        if getattr(self, "waiting_queue", None) or getattr(self, "pending_dp_reqs", None):
+            return False
+        if (
+            getattr(batch, "return_logprob", False)
+            or getattr(batch, "return_output_logprob_only", False)
+            or getattr(batch, "return_hidden_states", False)
+            or getattr(batch, "has_grammar", False)
+        ):
+            return False
+
+        current_req_pool = []
+        for info in batch.reqs_info:
+            req_pool_indices = getattr(info, "req_pool_indices", None)
+            if req_pool_indices is None:
+                return False
+            current_req_pool.extend(np.asarray(req_pool_indices, dtype=np.int32).tolist())
+        current_req_pool = np.asarray(current_req_pool, dtype=np.int32)
+        previous_req_pool = np.asarray(previous_padded_req_pool_indices, dtype=np.int32)
+        if current_req_pool.shape != previous_req_pool.shape:
+            return False
+        if not np.array_equal(current_req_pool, previous_req_pool):
+            return False
+
+        for info in batch.reqs_info:
+            spec_info = getattr(info, "spec_info", None)
+            allocate_lens = getattr(spec_info, "allocate_lens", None)
+            verify_write_lens = getattr(spec_info, "verify_write_lens", None)
+            if allocate_lens is None or verify_write_lens is None:
+                return False
+            allocate_lens = np.asarray(allocate_lens, dtype=np.int32)
+            verify_write_lens = np.asarray(verify_write_lens, dtype=np.int32)
+            req_count = len(getattr(info, "reqs", None) or [])
+            if allocate_lens.shape[0] < req_count or verify_write_lens.shape[0] < req_count:
+                return False
+            if np.any(verify_write_lens[:req_count] > allocate_lens[:req_count]):
+                return False
+            for req in getattr(info, "reqs", None) or []:
+                if req.finished() or getattr(req, "is_retracted", False):
+                    return False
+                sampling_params = req.sampling_params
+                if getattr(req, "grammar", None) is not None:
+                    return False
+                if len(req.output_ids) >= sampling_params.max_new_tokens:
+                    return False
+        return True
+
+    def _attach_same_batch_spec_chain_preview(
+        self,
+        batch: ScheduleBatch,
+        model_worker_batch,
+    ) -> None:
+        """Attach no-allocation same-batch chain preview to a worker batch.
+
+        This only prepares data for a future worker-owned chain path. It must
+        not mutate scheduler state or change launch behavior by itself.
+        """
+        model_worker_batch.allow_same_batch_spec_chain = False
+        model_worker_batch.same_batch_chain_out_cache_loc_chunks = None
+        model_worker_batch.same_batch_chain_verify_write_lens = None
+        model_worker_batch.same_batch_chain_allocate_lens = None
+        model_worker_batch.same_batch_chain_req_pool_indices = None
+        if not self._can_chain_same_batch_spec_decode(
+            batch,
+            model_worker_batch.req_pool_indices,
+        ):
+            return
+        flat_spec = ScheduleBatch._concat_spec_info_per_rank(
+            [info.spec_info for info in batch.reqs_info]
+        )
+        if flat_spec is None:
+            return
+        preview = flat_spec.peek_reserved_decode_out_cache_loc(batch)
+        if preview is None:
+            return
+        out_cache_loc_chunks, new_verify_write_lens = preview
+        model_worker_batch.allow_same_batch_spec_chain = True
+        model_worker_batch.same_batch_chain_out_cache_loc_chunks = out_cache_loc_chunks
+        model_worker_batch.same_batch_chain_verify_write_lens = new_verify_write_lens
+        model_worker_batch.same_batch_chain_allocate_lens = np.asarray(
+            flat_spec.allocate_lens,
+            dtype=np.int32,
+        ).copy()
+        model_worker_batch.same_batch_chain_req_pool_indices = np.asarray(
+            model_worker_batch.req_pool_indices,
+            dtype=np.int32,
+        ).copy()
 
     def _write_back_spec_draft_state_to_batch(
         self,
@@ -1976,7 +2404,14 @@ class Scheduler(
                 and self.draft_worker._has_fused_greedy_draft_state(model_worker_batch)
                 and model_worker_batch.sampling_info.is_all_greedy
             )
-            if use_split_verify_phase:
+            if use_split_verify_phase and self.enable_overlap:
+                self._attach_same_batch_spec_chain_preview(batch, model_worker_batch)
+            if self.enable_overlap:
+                batch_output = self.tp_worker.forward_batch_speculative_generation(
+                    model_worker_batch,
+                    use_split_verify_phase=use_split_verify_phase,
+                )
+            elif use_split_verify_phase:
                 from sgl_jax.srt.speculative.draft_extend_fused import (
                     _convert_split_phase_to_generation_result,
                 )
@@ -2018,10 +2453,15 @@ class Scheduler(
                     model_worker_batch,
                     batch_output.next_draft_input,
                 )
-            next_token_ids = np.asarray(jax.device_get(batch_output.next_token_ids))
-            self._extract_dp_output_ids(next_token_ids, model_worker_batch, batch)
-            logits_output = batch_output.logits_output
-            cache_miss_count = batch_output.cache_miss_count
+            if self.enable_overlap:
+                next_token_ids = None
+                logits_output = None
+                cache_miss_count = 0
+            else:
+                next_token_ids = np.asarray(jax.device_get(batch_output.next_token_ids))
+                self._extract_dp_output_ids(next_token_ids, model_worker_batch, batch)
+                logits_output = batch_output.logits_output
+                cache_miss_count = batch_output.cache_miss_count
         bid = model_worker_batch.bid
 
         # These 2 values are needed for processing the output, but the values can be
@@ -2048,13 +2488,23 @@ class Scheduler(
 
         ret = GenerationBatchResult(
             logits_output=logits_output,
-            next_token_ids=next_token_ids.tolist(),
+            next_token_ids=None if next_token_ids is None else next_token_ids.tolist(),
             extend_input_len_per_req=extend_input_len_per_req,
             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
             bid=bid,
             cache_miss_count=cache_miss_count,
         )
-        if self.spec_algorithm is not None and self.spec_algorithm.is_eagle():
+        if (
+            self.enable_overlap
+            and self.spec_algorithm is not None
+            and self.spec_algorithm.is_eagle()
+        ):
+            ret.spec_overlap_split = getattr(batch_output, "spec_overlap_split", False)
+        if (
+            self.spec_algorithm is not None
+            and self.spec_algorithm.is_eagle()
+            and not self.enable_overlap
+        ):
             assert isinstance(batch_output.next_draft_input, EagleDraftInput)
             ret.next_draft_input = batch_output.next_draft_input
             ret.accept_lens = batch_output.accept_lens

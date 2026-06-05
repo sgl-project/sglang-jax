@@ -30,7 +30,10 @@ from sgl_jax.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
-from sgl_jax.srt.speculative.base_worker import replicate_to_mesh
+from sgl_jax.srt.speculative.base_worker import (
+    filter_spec_precompile_token_paddings,
+    replicate_to_mesh,
+)
 from sgl_jax.srt.speculative.eagle_draft_worker import (
     EagleDraftWorker,
     select_top_k_tokens,
@@ -128,6 +131,10 @@ class MultiLayerDraftWorker(EagleDraftWorker):
             self.precompile_bs_paddings,
             self.precompile_cache_loc_paddings,
         ) = target_worker.get_precompile_paddings()
+        self.precompile_token_paddings = filter_spec_precompile_token_paddings(
+            server_args,
+            self.precompile_token_paddings,
+        )
 
     def _share_embed_head_one(self, target_worker: ModelWorker, draft_worker: ModelWorker):
         embed, head = target_worker.model_runner.model.get_embed_and_head()

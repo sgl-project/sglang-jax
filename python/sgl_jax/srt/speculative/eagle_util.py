@@ -486,6 +486,9 @@ class EagleDraftInput:
     #: next-round pre-allocation and over-allocated slot release. Distinct from
     #: ``accept_length`` (logical) and ``new_seq_lens`` (scheduler-visible).
     allocate_lens: np.ndarray | None = None
+    #: host ``(b,)`` — frontier whose KV slots have been handed to target verify.
+    #: This can lag behind ``allocate_lens`` when decode reserves ahead by page.
+    verify_write_lens: np.ndarray | None = None
     #: host ``(b,)`` — scheduler-visible logical length after verify. May be
     #: derived from ``old_seq_lens + accept_length`` if not stored.
     new_seq_lens: np.ndarray | None = None
@@ -510,6 +513,55 @@ class EagleDraftInput:
 
     def get_verify_token_num(self, bs: int) -> int:
         return 0
+
+    def peek_reserved_decode_out_cache_loc(self, schedule_batch: ScheduleBatch):
+        """Preview next decode KV write slots without allocating or mutating state.
+
+        Returns ``(out_cache_loc_chunks, new_verify_write_lens)`` when every DP
+        rank has enough reserved KV slack for the next verify write. Returns
+        ``None`` if an allocator call would be required.
+        """
+        bs = schedule_batch.batch_size()
+        assert (
+            self.allocate_lens.shape[0] == bs
+        ), f" {self.allocate_lens.shape[0]=} but batch_size is {bs} "
+        if self.verify_write_lens is None:
+            return None
+
+        out_cache_chunks = []
+        new_verify_write_chunks = []
+        flat_off = 0
+        alloc_len_per_decode = self.get_spec_adjust_token_coefficient()
+        for info in schedule_batch.reqs_info:
+            if info.seq_lens is None or len(info.seq_lens) == 0:
+                continue
+            bs_r = len(info.seq_lens)
+            seq_r = np.asarray(info.seq_lens)
+            required_write_r = seq_r + alloc_len_per_decode - 1
+            reserve_r = np.asarray(self.allocate_lens)[flat_off : flat_off + bs_r]
+            old_write_r = np.asarray(self.verify_write_lens)[flat_off : flat_off + bs_r]
+            if np.any(required_write_r > reserve_r):
+                return None
+            loc_chunks = [
+                schedule_batch.req_to_token_pool.req_to_token[
+                    req_pool_idx, int(old_write) : int(required_write)
+                ]
+                for req_pool_idx, old_write, required_write in zip(
+                    info.req_pool_indices, old_write_r, required_write_r, strict=True
+                )
+                if int(required_write) > int(old_write)
+            ]
+            out_cache_chunks.append(
+                np.concatenate(loc_chunks).astype(np.int32, copy=False)
+                if loc_chunks
+                else np.empty(0, dtype=np.int32)
+            )
+            new_verify_write_chunks.append(required_write_r.astype(np.int32, copy=False))
+            flat_off += bs_r
+
+        if not new_verify_write_chunks:
+            return [], np.empty(0, dtype=np.int32)
+        return out_cache_chunks, np.concatenate(new_verify_write_chunks)
 
     def tree_flatten(self):
         accept_length_cpu_arr = (
@@ -607,6 +659,8 @@ class EagleDraftInput:
         draft_model_runner: Any,
         batch_output: GenerationBatchResult,
         speculative_num_draft_tokens: int,
+        *,
+        build_logits_metadata: bool = True,
     ):
         model_worker_batch.spec_info_padded = self
         sel = model_worker_batch.logits_indices_selector
@@ -614,7 +668,7 @@ class EagleDraftInput:
             model_worker_batch.seq_lens[sel] + speculative_num_draft_tokens - 1
         )
         bs = batch_output.accept_lens.shape[0]
-        step_plus_1 = model_worker_batch.input_ids.shape[0] // bs
+        step_plus_1 = batch_output.next_draft_input.verified_id.shape[0] // bs
         model_worker_batch.positions = model_worker_batch.positions
         model_worker_batch.extend_seq_lens = np.zeros((bs,), dtype=np.int32)
         model_worker_batch.extend_seq_lens[sel] = step_plus_1
@@ -641,11 +695,13 @@ class EagleDraftInput:
         )
 
         draft_model_runner.attn_backend.forward_metadata = forward_metadata
-        from sgl_jax.srt.layers.logits_processor import LogitsMetadata
+        logits_metadata = None
+        if build_logits_metadata:
+            from sgl_jax.srt.layers.logits_processor import LogitsMetadata
 
-        logits_metadata = LogitsMetadata.from_model_worker_batch(
-            model_worker_batch, draft_model_runner.mesh
-        )
+            logits_metadata = LogitsMetadata.from_model_worker_batch(
+                model_worker_batch, draft_model_runner.mesh
+            )
         return model_worker_batch, logits_metadata
 
     def prepare_for_decode(self, schedule_batch: ScheduleBatch):
@@ -659,35 +715,66 @@ class EagleDraftInput:
         ), f" {self.allocate_lens.shape[0]=} but batch_size is {bs} "
         page_size = schedule_batch.token_to_kv_pool_allocator.page_size
         new_alloc_chunks = []
+        new_verify_write_chunks = []
         flat_off = 0
         for dp_rank, info in enumerate(schedule_batch.reqs_info):
             if info.seq_lens is None or len(info.seq_lens) == 0:
                 continue
             bs_r = len(info.seq_lens)
             seq_r = np.asarray(info.seq_lens)
-            new_r = seq_r + self.ALLOC_LEN_PER_DECODE - 1
-            old_r = self.allocate_lens[flat_off : flat_off + bs_r]
-            ext_r = int((new_r - old_r).sum())
-            if page_size == 1:
-                ocl_r = alloc_token_slots(schedule_batch.tree_cache, ext_r, dp_rank=dp_rank)
+            required_write_r = seq_r + self.ALLOC_LEN_PER_DECODE - 1
+            reserve_required_r = seq_r + 3 * self.ALLOC_LEN_PER_DECODE - 1
+            old_reserve_r = self.allocate_lens[flat_off : flat_off + bs_r]
+            if self.verify_write_lens is not None:
+                old_write_r = np.asarray(self.verify_write_lens)[flat_off : flat_off + bs_r]
             else:
-                last_loc_r = get_last_loc(
-                    schedule_batch.req_to_token_pool.req_to_token,
+                old_write_r = old_reserve_r
+            if page_size > 1:
+                reserve_r = ((reserve_required_r + page_size - 1) // page_size) * page_size
+                reserve_r = np.maximum(reserve_r, old_reserve_r)
+            else:
+                reserve_r = reserve_required_r
+            ext_r = int((reserve_r - old_reserve_r).sum())
+            if ext_r > 0:
+                if page_size == 1:
+                    alloc_r = alloc_token_slots(schedule_batch.tree_cache, ext_r, dp_rank=dp_rank)
+                else:
+                    last_loc_r = get_last_loc(
+                        schedule_batch.req_to_token_pool.req_to_token,
+                        info.req_pool_indices,
+                        old_reserve_r,
+                    )
+                    alloc_r = alloc_paged_token_slots_extend(
+                        schedule_batch.tree_cache,
+                        old_reserve_r,
+                        reserve_r,
+                        last_loc_r,
+                        ext_r,
+                        dp_rank=dp_rank,
+                    )
+                assign_req_to_token_pool(
                     info.req_pool_indices,
-                    old_r,
+                    schedule_batch.req_to_token_pool,
+                    old_reserve_r,
+                    reserve_r,
+                    alloc_r,
                 )
-                ocl_r = alloc_paged_token_slots_extend(
-                    schedule_batch.tree_cache,
-                    old_r,
-                    new_r,
-                    last_loc_r,
-                    ext_r,
-                    dp_rank=dp_rank,
+            loc_chunks = [
+                schedule_batch.req_to_token_pool.req_to_token[
+                    req_pool_idx, int(old_write) : int(required_write)
+                ]
+                for req_pool_idx, old_write, required_write in zip(
+                    info.req_pool_indices, old_write_r, required_write_r, strict=True
                 )
-            assign_req_to_token_pool(
-                info.req_pool_indices, schedule_batch.req_to_token_pool, old_r, new_r, ocl_r
+                if int(required_write) > int(old_write)
+            ]
+            ocl_r = (
+                np.concatenate(loc_chunks).astype(np.int32, copy=False)
+                if loc_chunks
+                else np.empty(0, dtype=np.int32)
             )
-            new_alloc_chunks.append(new_r)
+            new_alloc_chunks.append(reserve_r)
+            new_verify_write_chunks.append(required_write_r)
             # Per-rank store (matches nospec extend); _get_spec_decode_mwb_dp
             # DP-segments these so each rank's P("data") shard = its own slots.
             info.out_cache_loc = np.asarray(ocl_r, dtype=np.int32)
@@ -695,6 +782,7 @@ class EagleDraftInput:
             info.seq_lens_sum = np.sum(info.seq_lens).item()
 
         self.allocate_lens = np.concatenate(new_alloc_chunks)
+        self.verify_write_lens = np.concatenate(new_verify_write_chunks)
 
     def prepare_for_draft_decode(
         self, model_worker_batch: ModelWorkerBatch, topk: int, num_steps: int
@@ -754,6 +842,8 @@ class EagleDraftInput:
             self.verified_id = self.verified_id[: len(new_indices)]
             if self.allocate_lens is not None:
                 self.allocate_lens = np.asarray(self.allocate_lens)[: len(new_indices)]
+            if self.verify_write_lens is not None:
+                self.verify_write_lens = np.asarray(self.verify_write_lens)[: len(new_indices)]
             if self.new_seq_lens is not None:
                 self.new_seq_lens = np.asarray(self.new_seq_lens)[: len(new_indices)]
         else:
@@ -763,6 +853,8 @@ class EagleDraftInput:
             self.verified_id = self.verified_id[new_indices]
             if self.allocate_lens is not None:
                 self.allocate_lens = np.asarray(self.allocate_lens)[new_indices]
+            if self.verify_write_lens is not None:
+                self.verify_write_lens = np.asarray(self.verify_write_lens)[new_indices]
             if self.new_seq_lens is not None:
                 self.new_seq_lens = np.asarray(self.new_seq_lens)[new_indices]
 
@@ -773,6 +865,7 @@ class EagleDraftInput:
             self.topk_p = spec_info.topk_p
             self.topk_index = spec_info.topk_index
             self.allocate_lens = spec_info.allocate_lens
+            self.verify_write_lens = spec_info.verify_write_lens
             self.new_seq_lens = spec_info.new_seq_lens
             return
         if spec_info.hidden_states is None:
@@ -784,6 +877,15 @@ class EagleDraftInput:
         self.topk_p = np.concatenate([self.topk_p, spec_info.topk_p])
         self.topk_index = np.concatenate([self.topk_index, spec_info.topk_index])
         self.allocate_lens = np.concatenate([self.allocate_lens, spec_info.allocate_lens])
+        if self.verify_write_lens is not None and spec_info.verify_write_lens is not None:
+            self.verify_write_lens = np.concatenate(
+                [
+                    np.asarray(self.verify_write_lens),
+                    np.asarray(spec_info.verify_write_lens),
+                ]
+            )
+        else:
+            self.verify_write_lens = None
         if self.new_seq_lens is not None and spec_info.new_seq_lens is not None:
             self.new_seq_lens = np.concatenate(
                 [np.asarray(self.new_seq_lens), np.asarray(spec_info.new_seq_lens)]

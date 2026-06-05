@@ -1,4 +1,5 @@
 import logging
+import weakref
 from dataclasses import dataclass
 
 import jax
@@ -23,6 +24,13 @@ from sgl_jax.srt.utils.jax_utils import device_array
 from sgl_jax.srt.utils.profiling_utils import named_scope
 
 logger = logging.getLogger(__name__)
+_TARGET_VERIFY_STATIC_METADATA_CACHE = {}
+_TARGET_VERIFY_STATIC_METADATA_FINALIZERS = {}
+
+
+def _clear_target_verify_static_metadata_cache(cache_id: int):
+    _TARGET_VERIFY_STATIC_METADATA_CACHE.pop(cache_id, None)
+    _TARGET_VERIFY_STATIC_METADATA_FINALIZERS.pop(cache_id, None)
 
 
 def _per_dp_cumsum(lens, dp_size: int, per_dp_bs: int) -> np.ndarray:
@@ -34,6 +42,27 @@ def _per_dp_cumsum(lens, dp_size: int, per_dp_bs: int) -> np.ndarray:
     cu = np.zeros((dp_size, per_dp_bs + 1), dtype=np.int32)
     cu[:, 1:] = np.cumsum(np.asarray(lens, dtype=np.int32).reshape(dp_size, per_dp_bs), axis=1)
     return cu.ravel()
+
+
+def _select_draft_extend_allocate_lens(
+    allocate_lens,
+    sel: np.ndarray,
+    total_slots: int,
+) -> np.ndarray:
+    """Return real-request allocate_lens for DRAFT_EXTEND metadata."""
+    allocate_lens = np.asarray(allocate_lens)
+    if len(allocate_lens) == len(sel):
+        return allocate_lens
+    if len(allocate_lens) == total_slots:
+        return allocate_lens[sel]
+    raise AssertionError((len(allocate_lens), len(sel), total_slots))
+
+
+def _metadata_cache_part(value: np.ndarray | None):
+    if value is None:
+        return None
+    value = np.ascontiguousarray(np.asarray(value))
+    return value.shape, value.dtype.str, value.tobytes()
 
 
 @register_pytree_node_class
@@ -107,6 +136,12 @@ class FlashAttention(AttentionBackend):
         self.attention_data_partition_axis = attention_data_partition_axis
         self.forward_metadata = nnx.data(FlashAttentionMetadata())
         self.mesh = mesh
+        cache_id = id(self)
+        _TARGET_VERIFY_STATIC_METADATA_FINALIZERS[cache_id] = weakref.finalize(
+            self,
+            _clear_target_verify_static_metadata_cache,
+            cache_id,
+        )
         # SWA dual-pool support: set by model_runner after pool creation.
         # Accessed on host during metadata construction.
 
@@ -289,11 +324,12 @@ class FlashAttention(AttentionBackend):
             allocate_lens = batch.spec_info_padded.allocate_lens
             if hasattr(allocate_lens, "device"):
                 allocate_lens = jax.device_get(allocate_lens)
-            allocate_lens = np.asarray(allocate_lens)
             sel = np.asarray(batch.logits_indices_selector)
-            # allocate_lens here is global-flat (real_bs,) (cur_allocate_lens via
-            # verify); sel is DP-slot indices, only used for rank_of/aligned_seq.
-            assert len(allocate_lens) == len(sel), (len(allocate_lens), len(sel))
+            allocate_lens = _select_draft_extend_allocate_lens(
+                allocate_lens,
+                sel,
+                len(batch.seq_lens),
+            )
             full_pg = page_indices.shape[0]
             assert full_pg % dp_size == 0, (full_pg, dp_size)
             per_dp_pg = full_pg // dp_size
@@ -318,19 +354,9 @@ class FlashAttention(AttentionBackend):
         distribution = np.column_stack([np.zeros_like(local_n), local_n, local_n]).ravel()
         page_indices = np.array(page_indices)
         seq_lens = np.array(seq_lens)
-        (
-            metadata.cu_q_lens,
-            metadata.cu_kv_lens,
-            metadata.page_indices,
-            metadata.seq_lens,
-            metadata.distribution,
-        ) = device_array(
-            (cu_q_lens, cu_kv_lens, page_indices, seq_lens, distribution),
-            sharding=(NamedSharding(self.mesh, P("data"))),
-        )
-        # Hybrid SWA targets need swa_page_indices for TARGET_VERIFY too,
-        # otherwise SWA layers index the swa sub-pool with full-pool page ids.
+        sharding = NamedSharding(self.mesh, P("data"))
         swa_mapping = getattr(self, "swa_index_mapping", None)
+        swa_page_indices = None
         if swa_mapping is not None:
             full_loc = (page_indices.astype(np.int64) * self.page_size).astype(np.int32)
             if isinstance(swa_mapping, list):
@@ -341,9 +367,64 @@ class FlashAttention(AttentionBackend):
                 swa_loc = swa_2d.ravel()
             else:
                 swa_loc = np.asarray(swa_mapping)[full_loc]
+            swa_page_indices = (swa_loc // self.page_size).astype(np.int32)
+
+        cache_key = None
+        if (
+            batch.forward_mode in (ForwardMode.TARGET_VERIFY, ForwardMode.DRAFT_EXTEND)
+            and metadata.custom_mask is None
+        ):
+            cache_key = (
+                batch.forward_mode,
+                dp_size,
+                per_dp_bs,
+                self.page_size,
+                _metadata_cache_part(cu_q_lens),
+                _metadata_cache_part(cu_kv_lens),
+                _metadata_cache_part(page_indices),
+                _metadata_cache_part(distribution),
+                _metadata_cache_part(swa_page_indices),
+            )
+            cache_id = id(self)
+            cached = _TARGET_VERIFY_STATIC_METADATA_CACHE.get(cache_id)
+            if cached is not None and cached[0] == cache_key:
+                (
+                    metadata.cu_q_lens,
+                    metadata.cu_kv_lens,
+                    metadata.page_indices,
+                    metadata.distribution,
+                    metadata.swa_page_indices,
+                ) = cached[1]
+                metadata.seq_lens = device_array(seq_lens, sharding=sharding)
+                return metadata
+
+        (
+            metadata.cu_q_lens,
+            metadata.cu_kv_lens,
+            metadata.page_indices,
+            metadata.seq_lens,
+            metadata.distribution,
+        ) = device_array(
+            (cu_q_lens, cu_kv_lens, page_indices, seq_lens, distribution),
+            sharding=sharding,
+        )
+        # Hybrid SWA targets need swa_page_indices for TARGET_VERIFY too,
+        # otherwise SWA layers index the swa sub-pool with full-pool page ids.
+        if swa_page_indices is not None:
             metadata.swa_page_indices = device_array(
-                (swa_loc // self.page_size).astype(np.int32),
-                sharding=NamedSharding(self.mesh, P("data")),
+                swa_page_indices,
+                sharding=sharding,
+            )
+        if cache_key is not None:
+            _TARGET_VERIFY_STATIC_METADATA_CACHE[id(self)] = (
+                cache_key,
+                (
+                    metadata.cu_q_lens,
+                    metadata.cu_kv_lens,
+                    metadata.page_indices,
+                    metadata.distribution,
+                    metadata.swa_page_indices,
+                ),
             )
         return metadata
 
@@ -380,9 +461,8 @@ class FlashAttention(AttentionBackend):
         # must be written DP-segmented so the P("data") shard gives each rank
         # its own draft page_indices (otherwise rank>0 reads page 0 → accept~1).
         per_dp_src_pages = full_size // dp_size
-        TARGET_PADDING = 16384
-        assert TARGET_PADDING % dp_size == 0
-        per_dp_dst_pages = TARGET_PADDING // dp_size
+        output_page_count = full_size
+        per_dp_dst_pages = output_page_count // dp_size
         rank_of_req = (sel // per_dp_bs).astype(np.int64)
 
         def _dp_starts(pages, per_dp_base):
@@ -420,7 +500,7 @@ class FlashAttention(AttentionBackend):
             write_indices = np.repeat(dst_starts, repeats) + local_off
             gathered_locs = original_selected_cache_locs[gather_indices]
 
-            result_locs = np.zeros(TARGET_PADDING, dtype=original_selected_cache_locs.dtype)
+            result_locs = np.zeros(output_page_count, dtype=original_selected_cache_locs.dtype)
             result_locs[write_indices] = gathered_locs
             page_indices.append((result_locs // self.page_size).astype(np.int32))
 
