@@ -5,6 +5,7 @@ import dataclasses
 import logging
 import signal
 import threading
+import time
 from queue import Queue
 from types import SimpleNamespace
 
@@ -171,6 +172,7 @@ class ModelWorkerClient:
                             )
                         phase_a_holder["result"] = verify_result
                         phase_a_holder["phase_a_ready"].set()
+                        time.sleep(0)
                         prebuilt_chain_candidate = (
                             self._prebuild_same_batch_spec_chain_candidate_after_phase_a(
                                 model_worker_batch,
