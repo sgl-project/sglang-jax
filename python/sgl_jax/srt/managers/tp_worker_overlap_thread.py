@@ -852,16 +852,20 @@ class ModelWorkerClient:
                 allocate_lens is not None,
             )
             return None
-        if isinstance(new_seq_lens, jax.Array):
-            with jax.profiler.TraceAnnotation("same_batch_chain_peek_skip:device_seq_lens"):
-                pass
-            logger.info("same_batch_chain_peek_skip reason=device_seq_lens")
-            return None
-
         req_pool_indices = np.asarray(padded_req_pool_indices, dtype=np.int32)
-        new_seq_lens = np.asarray(new_seq_lens, dtype=np.int32)
         old_verify_write_lens = np.asarray(old_verify_write_lens, dtype=np.int32)
         allocate_lens = np.asarray(allocate_lens, dtype=np.int32)
+
+        if isinstance(new_seq_lens, jax.Array):
+            return self._peek_same_batch_spec_chain_device_lens_reserved_suffix(
+                model_worker_batch,
+                padded_next_draft_input,
+                req_pool_indices,
+                old_verify_write_lens,
+                allocate_lens,
+            )
+
+        new_seq_lens = np.asarray(new_seq_lens, dtype=np.int32)
         if (
             req_pool_indices.shape != new_seq_lens.shape
             or req_pool_indices.shape != old_verify_write_lens.shape
@@ -948,6 +952,107 @@ class ModelWorkerClient:
                     else np.empty(0, dtype=np.int32)
                 )
             ]
+        return (
+            out_cache_loc_chunks,
+            required_write_lens.astype(np.int32, copy=False),
+            allocate_lens.astype(np.int32, copy=False),
+        )
+
+    def _peek_same_batch_spec_chain_device_lens_reserved_suffix(
+        self,
+        model_worker_batch: ModelWorkerBatch,
+        padded_next_draft_input,
+        req_pool_indices: np.ndarray,
+        old_verify_write_lens: np.ndarray,
+        allocate_lens: np.ndarray,
+    ):
+        if (
+            req_pool_indices.shape != old_verify_write_lens.shape
+            or req_pool_indices.shape != allocate_lens.shape
+        ):
+            with jax.profiler.TraceAnnotation("same_batch_chain_peek_skip:device_shape"):
+                pass
+            logger.info(
+                "same_batch_chain_peek_skip reason=device_shape req_pool=%s old_write=%s alloc=%s",
+                req_pool_indices.shape,
+                old_verify_write_lens.shape,
+                allocate_lens.shape,
+            )
+            return None
+
+        alloc_len_per_decode = padded_next_draft_input.get_spec_adjust_token_coefficient()
+        valid_slots = req_pool_indices >= 0
+        required_write_lens = np.where(
+            valid_slots,
+            old_verify_write_lens + alloc_len_per_decode,
+            old_verify_write_lens,
+        )
+        if np.any(required_write_lens[valid_slots] > allocate_lens[valid_slots]):
+            with jax.profiler.TraceAnnotation("same_batch_chain_peek_skip:device_reserve"):
+                pass
+            logger.info(
+                "same_batch_chain_peek_skip reason=device_reserve max_required=%d max_alloc=%d min_slack=%d",
+                int(np.max(required_write_lens[valid_slots])),
+                int(np.max(allocate_lens[valid_slots])),
+                int(np.min(allocate_lens[valid_slots] - required_write_lens[valid_slots])),
+            )
+            return None
+
+        req_to_token_pool = getattr(
+            getattr(self.worker, "model_runner", None), "req_to_token_pool", None
+        )
+        req_to_token = getattr(req_to_token_pool, "req_to_token", None)
+        if req_to_token is None:
+            with jax.profiler.TraceAnnotation("same_batch_chain_peek_skip:device_req_to_token"):
+                pass
+            logger.info("same_batch_chain_peek_skip reason=device_req_to_token")
+            return None
+
+        dp_size = int(getattr(model_worker_batch, "dp_size", 1) or 1)
+        per_dp_bs = int(getattr(model_worker_batch, "per_dp_bs_size", 0) or 0)
+        out_cache_loc_chunks = []
+        if dp_size > 1 and per_dp_bs > 0 and req_pool_indices.shape[0] == dp_size * per_dp_bs:
+            for dp_rank in range(dp_size):
+                start = dp_rank * per_dp_bs
+                end = start + per_dp_bs
+                loc_chunks = [
+                    req_to_token[req_pool_idx, int(old_write) : int(required_write)]
+                    for req_pool_idx, old_write, required_write, valid in zip(
+                        req_pool_indices[start:end],
+                        old_verify_write_lens[start:end],
+                        required_write_lens[start:end],
+                        valid_slots[start:end],
+                        strict=True,
+                    )
+                    if bool(valid) and int(required_write) > int(old_write)
+                ]
+                out_cache_loc_chunks.append(
+                    np.concatenate(loc_chunks).astype(np.int32, copy=False)
+                    if loc_chunks
+                    else np.empty(0, dtype=np.int32)
+                )
+        else:
+            loc_chunks = [
+                req_to_token[req_pool_idx, int(old_write) : int(required_write)]
+                for req_pool_idx, old_write, required_write, valid in zip(
+                    req_pool_indices,
+                    old_verify_write_lens,
+                    required_write_lens,
+                    valid_slots,
+                    strict=True,
+                )
+                if bool(valid) and int(required_write) > int(old_write)
+            ]
+            out_cache_loc_chunks = [
+                (
+                    np.concatenate(loc_chunks).astype(np.int32, copy=False)
+                    if loc_chunks
+                    else np.empty(0, dtype=np.int32)
+                )
+            ]
+
+        with jax.profiler.TraceAnnotation("same_batch_chain_peek_device_reserved_suffix"):
+            pass
         return (
             out_cache_loc_chunks,
             required_write_lens.astype(np.int32, copy=False),

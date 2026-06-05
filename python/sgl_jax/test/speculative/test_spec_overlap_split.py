@@ -433,6 +433,54 @@ def test_phase_b_dispatch_prebuild_uses_device_new_seq_lens():
     assert candidate.spec_info_padded.new_seq_lens is device_seq_lens
 
 
+def test_same_batch_chain_device_lens_uses_reserved_suffix_without_host_lens(monkeypatch):
+    from sgl_jax.srt.managers.tp_worker_overlap_thread import ModelWorkerClient
+
+    monkeypatch.setattr(EagleDraftInput, "ALLOC_LEN_PER_DECODE", 4)
+    worker = ModelWorkerClient.__new__(ModelWorkerClient)
+    req_pool = np.array([1, 2], dtype=np.int32)
+    req_to_token = np.arange(3 * 80, dtype=np.int32).reshape(3, 80)
+    worker.worker = SimpleNamespace(
+        model_runner=SimpleNamespace(
+            req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
+        )
+    )
+    model_worker_batch = SimpleNamespace(
+        allow_same_batch_spec_chain=True,
+        req_pool_indices=req_pool,
+        same_batch_chain_req_pool_indices=req_pool.copy(),
+        same_batch_chain_out_cache_loc_chunks=None,
+        same_batch_chain_verify_write_lens=np.array([20, 24], dtype=np.int32),
+        same_batch_chain_allocate_lens=np.array([64, 64], dtype=np.int32),
+        spec_info_padded=EagleDraftInput(allocate_lens=np.array([64, 64], dtype=np.int32)),
+        seq_lens=np.array([19, 23], dtype=np.int32),
+        seq_lens_sum=42,
+        out_cache_loc=np.arange(8, dtype=np.int32),
+        bid=14,
+    )
+    pending = SimpleNamespace(
+        padded_next_draft_input=EagleDraftInput(new_seq_lens=jnp.array([21, 25], dtype=jnp.int32)),
+        padded_req_pool_indices=req_pool.copy(),
+    )
+
+    candidate = worker._build_same_batch_spec_chain_candidate_batch(
+        model_worker_batch,
+        pending,
+    )
+
+    assert candidate is not None
+    np.testing.assert_array_equal(
+        candidate.same_batch_chain_verify_write_lens,
+        np.array([24, 28], dtype=np.int32),
+    )
+    np.testing.assert_array_equal(
+        candidate.out_cache_loc,
+        np.concatenate([req_to_token[1, 20:24], req_to_token[2, 24:28]]),
+    )
+    assert candidate.spec_info_padded.new_seq_lens is pending.padded_next_draft_input.new_seq_lens
+    np.testing.assert_array_equal(candidate.seq_lens, np.array([19, 23], dtype=np.int32))
+
+
 def test_flashattention_target_verify_metadata_uses_device_seq_lens():
     from jax.sharding import Mesh
 
