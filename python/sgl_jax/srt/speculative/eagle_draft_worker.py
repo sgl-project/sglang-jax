@@ -21,6 +21,7 @@ from sgl_jax.srt.speculative.eagle_util import (
     EagleDraftInput,
     EagleVerifyInput,
     build_chain_verify_inputs,
+    build_chain_verify_inputs_device,
     build_tree_kernel_efficient,
     build_tree_mask_for_draft_decode,
 )
@@ -140,18 +141,33 @@ class EagleDraftWorker(BaseDraftWorker):
         bs = model_worker_batch.seq_lens.shape[0]
 
         if self.topk == 1:
-            token_list_cpu = np.asarray(jax.device_get(token_list))
-            verified_id_cpu = np.asarray(
-                jax.device_get(model_worker_batch.spec_info_padded.verified_id)
-            )
-            seq_lens_cpu = np.asarray(verified_seq_lens)
             n = self.speculative_num_draft_tokens
-            packed_np = build_chain_verify_inputs(
-                verified_id_cpu, token_list_cpu, seq_lens_cpu, n, bs
-            )
-            # One allgather instead of five: pack into a single (5, bs*n) buffer,
-            # device_put once, then slice on device (replicated views are free).
-            packed = jax.device_put(packed_np, NamedSharding(self.mesh, P()))
+            verified_id = model_worker_batch.spec_info_padded.verified_id
+            if any(isinstance(x, jax.Array) for x in (verified_id, token_list, verified_seq_lens)):
+                rep = NamedSharding(self.mesh, P())
+                verified_id, token_list, verified_seq_lens = jax.device_put(
+                    (verified_id, token_list, verified_seq_lens),
+                    rep,
+                )
+                packed = build_chain_verify_inputs_device(
+                    verified_id, token_list, verified_seq_lens, n, bs
+                )
+                packed = jax.device_put(packed, rep)
+            else:
+                packed_np = build_chain_verify_inputs(
+                    np.asarray(verified_id, dtype=np.int32),
+                    np.asarray(token_list, dtype=np.int32),
+                    np.asarray(verified_seq_lens, dtype=np.int32),
+                    n,
+                    bs,
+                )
+                # One allgather instead of five: pack into a single (5, bs*n)
+                # buffer, device_put once, then slice on device.
+                packed = (
+                    jax.device_put(packed_np, NamedSharding(self.mesh, P()))
+                    if self.mesh is not None
+                    else packed_np
+                )
             draft_tokens = packed[0]
             position = packed[1]
             retrive_index = packed[2].reshape(bs, n)

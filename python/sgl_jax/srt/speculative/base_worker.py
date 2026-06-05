@@ -78,6 +78,12 @@ class BaseSpecWorker:
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
+        self._can_use_fused_spec_decode = (
+            self.speculative_algorithm.is_nextn()
+            and self.topk == 1
+            and self.speculative_num_steps > 1
+            and self.speculative_num_draft_tokens == self.speculative_num_steps + 1
+        )
 
         self.req_to_token_pool, self.token_to_kv_pool_allocator = target_worker.get_memory_pool()
 
@@ -139,6 +145,12 @@ class BaseSpecWorker:
         # to global-flat (real_bs,) so reqs_info[0].spec_info stays flat-ordered.
         sel = model_worker_batch.logits_indices_selector
         cur_allocate_lens = np.asarray(model_worker_batch.spec_info_padded.allocate_lens)[sel]
+        if self._can_use_fused_spec_decode and model_worker_batch.sampling_info.is_all_greedy:
+            # Current fused route covers greedy NEXTN decode; more speculative
+            # decode paths can be folded into this entry point over time.
+            from sgl_jax.srt.speculative.draft_extend_fused import spec_decode
+
+            return spec_decode(self, model_worker_batch, cur_allocate_lens)
         self.draft_worker.draft(model_worker_batch)
         batch_output = self.verify(model_worker_batch, cur_allocate_lens)
         self.draft_worker.draft_extend_for_decode(model_worker_batch, batch_output)
@@ -179,6 +191,7 @@ class BaseSpecWorker:
             self.mesh, logits_output.next_token_logits, logits_output.hidden_states
         )
         spec_info.hidden_states = logits_output.hidden_states
+
         (
             predict,
             verified_id,

@@ -56,22 +56,22 @@ def _is_jax_leaf(value: Any) -> bool:
     return cls.__name__ == "Leaf" and cls.__module__.startswith("jax.")
 
 
-def _as_int32_array(value: Any, *, fallback: int = -1) -> jax.Array:
-    """Convert scalar-like inputs into scalar int32 JAX arrays."""
+def _as_int32_array(value: Any, *, fallback: int = -1) -> Any:
+    """Convert scalar-like metadata into int32 arrays without forcing device work."""
     if value is None:
         return None
     if isinstance(value, jax.Array):
         return value
     if isinstance(value, numpy.ndarray):
-        return jnp.asarray(value, dtype=jnp.int32)
+        return np.asarray(value, dtype=np.int32)
     if isinstance(value, (int, numpy.integer)):
-        return jnp.asarray(int(value), dtype=jnp.int32)
+        return np.asarray(int(value), dtype=np.int32)
     if isinstance(value, (list, tuple)):
-        return jnp.asarray(value, dtype=jnp.int32)
+        return np.asarray(value, dtype=np.int32)
     if _is_jax_leaf(value):
-        return jnp.asarray(fallback, dtype=jnp.int32)
+        return np.asarray(fallback, dtype=np.int32)
     try:
-        return jnp.asarray(value, dtype=jnp.int32)
+        return np.asarray(value, dtype=np.int32)
     except (TypeError, ValueError) as exc:
         raise TypeError(
             f"Unable to convert value of type {type(value)} into int32 metadata array."
@@ -340,6 +340,35 @@ def build_chain_verify_inputs(
     return out
 
 
+@functools.partial(jax.jit, static_argnames=["num_verify_tokens", "batch_size"])
+def build_chain_verify_inputs_device(
+    verified_id: jax.Array,
+    token_list: jax.Array,
+    seq_lens: jax.Array,
+    num_verify_tokens: int,
+    batch_size: int,
+) -> jax.Array:
+    """Build verify inputs for topk=1 linear chains on device."""
+    n = num_verify_tokens
+    bs = batch_size
+    tid_range = jnp.arange(n, dtype=jnp.int32)
+    draft_tokens = jnp.concatenate(
+        [verified_id.astype(jnp.int32)[:, None], token_list[:, : n - 1].astype(jnp.int32)],
+        axis=1,
+    ).reshape(bs * n)
+    positions = (seq_lens.astype(jnp.int32)[:, None] + tid_range[None, :]).reshape(bs * n)
+    retrive_index = jnp.arange(bs * n, dtype=jnp.int32)
+    retrive_next_token = jnp.broadcast_to(
+        jnp.concatenate([jnp.arange(1, n, dtype=jnp.int32), jnp.array([-1], dtype=jnp.int32)]),
+        (bs, n),
+    ).reshape(bs * n)
+    retrive_next_sibling = jnp.full((bs * n,), -1, dtype=jnp.int32)
+    return jnp.stack(
+        [draft_tokens, positions, retrive_index, retrive_next_token, retrive_next_sibling],
+        axis=0,
+    )
+
+
 def build_tree_kernel_efficient(
     verified_id: jax.Array,
     score_list: jax.Array,
@@ -385,18 +414,7 @@ def build_tree_kernel_efficient(
         speculative_num_steps,
     )
 
-    # Get batch size
-    # for compatibility, 0.6.3 need to use use_mesh. set_mesh is not have __entry__ attribute.
-    # on jax >=0.7.1, we need to use set_mesh.
-    try:
-        ctx = jax.sharding.use_mesh(mesh)
-    except AttributeError:
-        try:
-            ctx = jax.set_mesh(mesh)
-        except AttributeError:
-            ctx = mesh
-    with ctx:
-
+    with jax.set_mesh(mesh):
         tree_mask, positions, retrive_index, retrive_next_token, retrive_next_sibling = (
             build_eagle_tree_structure(
                 parent_list=parent_list,
@@ -495,7 +513,7 @@ class EagleDraftInput:
 
     def tree_flatten(self):
         accept_length_cpu_arr = (
-            jnp.empty((0,), dtype=jnp.int32)
+            np.empty((0,), dtype=np.int32)
             if self.accept_length_cpu is None
             else _as_int32_array(self.accept_length_cpu, fallback=0)
         )
@@ -960,16 +978,7 @@ class EagleVerifyInput:
         is_all_greedy = sampling_info.is_all_greedy
 
         if is_all_greedy:
-            # # for compatibility, 0.6.3 need to use use_mesh. set_mesh is not have __entry__ attribute.
-            # # on jax >=0.7.1, we need to use set_mesh.
-            try:
-                ctx = jax.sharding.use_mesh(mesh)
-            except AttributeError:
-                try:
-                    ctx = jax.set_mesh(mesh)
-                except AttributeError:
-                    ctx = mesh
-            with ctx:
+            with jax.set_mesh(mesh):
                 accept_index, accept_length, predict = verify_tree_greedy(
                     speculative_num_steps=self.spec_steps,
                     num_draft_tokens=self.draft_token_num,
