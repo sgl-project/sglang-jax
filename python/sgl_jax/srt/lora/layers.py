@@ -124,23 +124,30 @@ class LoRALinear(BaseLayerWithLoRA):
     def __call__(
         self,
         x: jax.Array,
+        *,
+        out_sharding: jax.sharding.Sharding | None = None,
     ) -> tuple[jax.Array, jax.Array | None]:
         """
         Forward pass with optional LoRA computation using backend.
 
         Args:
             x: Input tensor (shape: [seq_len, in_features])
+            out_sharding: Output sharding passed through to base_layer; the LoRA
+                delta is then resharded to the same target so the final sum
+                stays consistent.
 
         Returns:
             Output tensor with LoRA delta added (if enabled) and bias from base_model
         """
         forward_batch = LoraBatchContext.get_batch()
 
-        base_output, output_bias = self.base_layer(x)
+        base_output, output_bias = self.base_layer(x, out_sharding=out_sharding)
 
         output = self.apply_lora(
             base_output, x, forward_batch.lora_scalings, forward_batch.lora_token_indices
         )
+        if out_sharding is not None:
+            output = jax.sharding.reshard(output, out_sharding)
         return output, output_bias
 
 

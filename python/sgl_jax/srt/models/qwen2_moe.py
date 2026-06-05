@@ -378,7 +378,7 @@ class Qwen2MoeDecoderLayer(nnx.Module):
 
         hidden_states = mlp_output if shared_output is None else (mlp_output + shared_output)
 
-        return hidden_states, residual, kv_fused, jax.sharding.reshard(topk_ids, P(None))
+        return hidden_states, residual, kv_fused, topk_ids
 
 
 class Qwen2MoeModel(nnx.Module):
