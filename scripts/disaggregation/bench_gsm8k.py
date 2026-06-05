@@ -5,7 +5,7 @@ Sends paired P+D requests for each question. Accuracy and throughput
 measured from the D-side responses.
 
 Usage:
-    python scripts/pd_bench_gsm8k.py \
+    python scripts/disaggregation/bench_gsm8k.py \
         --prefill-url http://<P>:10000 \
         --decode-url  http://<D>:10001 \
         --num-questions 200 --parallel 16

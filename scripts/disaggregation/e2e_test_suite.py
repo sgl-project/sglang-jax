@@ -5,7 +5,7 @@ Runs Tier 1 (E1-E5) and Tier 2 (E6-E8) tests against a live P+D deployment.
 
 Usage
 -----
-    python scripts/pd_e2e_test_suite.py \
+    python scripts/disaggregation/e2e_test_suite.py \
         --prefill-url http://<P_HOST>:10000 \
         --decode-url  http://<D_HOST>:10001 \
         [--tier 1]          # 1 = Tier 1 only, 2 = Tier 1+2
