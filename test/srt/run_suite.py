@@ -254,7 +254,9 @@ suites = {
     "unit-test-tpu-v6e-1": [
         TestFile("python/sgl_jax/test/kernels/quantized_linear_test.py", 0.3, runner="pytest"),
         TestFile("python/sgl_jax/test/kernels/moe_block_quant_test.py", 0.2, runner="pytest"),
-        TestFile("python/sgl_jax/test/test_flashattention.py", 15),
+        TestFile("python/sgl_jax/test/test_flashattention_mha.py", 11),
+        TestFile("python/sgl_jax/test/test_flashattention_gqa.py", 11),
+        TestFile("python/sgl_jax/test/test_flashattention_misc.py", 7),
         TestFile("python/sgl_jax/test/test_mla_attention.py", 2.5),
         TestFile("python/sgl_jax/test/test_moe_topk.py", 0.3),
         TestFile("python/sgl_jax/test/kernels/fused_moe_v1_test.py", 9),
