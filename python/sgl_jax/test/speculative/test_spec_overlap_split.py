@@ -291,6 +291,60 @@ def test_same_batch_chain_peek_prefers_scheduler_reserved_frontier(monkeypatch):
     )
 
 
+def test_eagle_prepare_for_decode_reserves_extra_chain_slack(monkeypatch):
+    from sgl_jax.srt.speculative import eagle_util
+
+    monkeypatch.setattr(EagleDraftInput, "ALLOC_LEN_PER_DECODE", 4)
+    allocated = {}
+
+    def fake_alloc_paged_token_slots_extend(
+        tree_cache,
+        prefix_lens,
+        seq_lens,
+        last_loc,
+        extend_num_tokens,
+        dp_rank=0,
+    ):
+        allocated["prefix_lens"] = np.asarray(prefix_lens, dtype=np.int32).copy()
+        allocated["seq_lens"] = np.asarray(seq_lens, dtype=np.int32).copy()
+        allocated["extend_num_tokens"] = int(extend_num_tokens)
+        return np.arange(128, 192, dtype=np.int32)
+
+    monkeypatch.setattr(
+        eagle_util,
+        "alloc_paged_token_slots_extend",
+        fake_alloc_paged_token_slots_extend,
+    )
+    req_to_token = np.zeros((1, 256), dtype=np.int32)
+    req_to_token[0, 127] = 127
+    schedule_batch = SimpleNamespace(
+        batch_size=lambda: 1,
+        token_to_kv_pool_allocator=SimpleNamespace(page_size=64),
+        tree_cache=SimpleNamespace(
+            token_to_kv_pool_allocator=SimpleNamespace(page_size=64),
+        ),
+        req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
+        reqs_info=[
+            SimpleNamespace(
+                seq_lens=np.array([117], dtype=np.int32),
+                req_pool_indices=np.array([0], dtype=np.int32),
+            )
+        ],
+    )
+    draft = EagleDraftInput(
+        allocate_lens=np.array([128], dtype=np.int32),
+    )
+    draft.verify_write_lens = np.array([120], dtype=np.int32)
+
+    draft.prepare_for_decode(schedule_batch)
+
+    np.testing.assert_array_equal(draft.allocate_lens, np.array([192], dtype=np.int32))
+    np.testing.assert_array_equal(draft.verify_write_lens, np.array([120], dtype=np.int32))
+    np.testing.assert_array_equal(allocated["prefix_lens"], np.array([128], dtype=np.int32))
+    np.testing.assert_array_equal(allocated["seq_lens"], np.array([192], dtype=np.int32))
+    assert allocated["extend_num_tokens"] == 64
+
+
 def test_prebuilt_candidate_keeps_prepared_verify_launch_payload():
     payload = object()
     candidate = SimpleNamespace(prepared_fused_greedy_verify_launch=payload)

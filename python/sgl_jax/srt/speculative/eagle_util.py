@@ -723,7 +723,7 @@ class EagleDraftInput:
             bs_r = len(info.seq_lens)
             seq_r = np.asarray(info.seq_lens)
             required_write_r = seq_r + self.ALLOC_LEN_PER_DECODE - 1
-            reserve_required_r = seq_r + 3 * self.ALLOC_LEN_PER_DECODE - 1
+            reserve_required_r = seq_r + 4 * self.ALLOC_LEN_PER_DECODE - 1
             old_reserve_r = self.allocate_lens[flat_off : flat_off + bs_r]
             if self.verify_write_lens is not None:
                 old_write_r = np.asarray(self.verify_write_lens)[flat_off : flat_off + bs_r]
