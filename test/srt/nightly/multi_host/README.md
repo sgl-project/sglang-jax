@@ -8,10 +8,10 @@ Model owners just declare a suite; CI takes care of provisioning the runtime env
 
 ### Step 1: Write a launch profile
 
-Create a YAML under `launch_profiles/` describing how to start the server.
+Create a YAML under `test/srt/nightly/launch_profiles/` describing how to start the server.
 
 ```yaml
-# launch_profiles/<your-model>-<target>.yaml
+# test/srt/nightly/launch_profiles/<your-model>-<target>.yaml
 name: <run name>                    # label for this launch
 target: <target-name>               # runtime environment identifier (provided by CI, see below)
 model_path: <your-model-path>       # model path
@@ -40,7 +40,7 @@ server_args:                        # extra flags forwarded to launch_server
 
 ### Step 2: Register the suite in `SUITES`
 
-Open `test/srt/multi_host/suite_runner.py` and add an entry to the `SUITES` dict at the top:
+Open `test/srt/nightly/multi_host/suite_runner.py` and add an entry to the `SUITES` dict at the top:
 
 ```python
 SUITES: dict[str, MultiHostSuite] = {
@@ -49,7 +49,7 @@ SUITES: dict[str, MultiHostSuite] = {
         name="<unique-suite-name>",
         runs=[
             ModelRun(
-                launch_profile="launch_profiles/<your-model>-<target>.yaml",
+                launch_profile="<your-model>-<target>.yaml",
                 cases=[
                     PerfCase(
                         name="random-1024-128",

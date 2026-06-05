@@ -5,8 +5,11 @@ import os
 import sys
 
 _SELF_DIR = os.path.dirname(os.path.abspath(__file__))
-if _SELF_DIR not in sys.path:
-    sys.path.insert(0, _SELF_DIR)
+_NIGHTLY_DIR = os.path.dirname(_SELF_DIR)
+_TEST_SRT = os.path.dirname(_NIGHTLY_DIR)
+for _p in (_TEST_SRT, _NIGHTLY_DIR, _SELF_DIR):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 from profile_loader import load_profile
 

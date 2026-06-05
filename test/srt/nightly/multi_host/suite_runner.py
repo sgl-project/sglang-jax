@@ -13,8 +13,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 _SELF_DIR = os.path.dirname(os.path.abspath(__file__))
-if _SELF_DIR not in sys.path:
-    sys.path.insert(0, _SELF_DIR)
+_NIGHTLY_DIR = os.path.dirname(_SELF_DIR)
+_TEST_SRT = os.path.dirname(_NIGHTLY_DIR)
+for _p in (_TEST_SRT, _NIGHTLY_DIR, _SELF_DIR):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 from accuracy_case_runner import run_accuracy_case
 from multi_host_suite import (
@@ -248,7 +251,7 @@ SUITES: dict[str, MultiHostSuite] = {
         name="mimo-flash-accuracy-nightly-test",
         runs=[
             ModelRun(
-                launch_profile="launch_profiles/mimo-flash-v6e-4x4.yaml",
+                launch_profile="mimo-flash-v6e-4x4.yaml",
                 cases=[
                     AccuracyCase(
                         name="mimo-flash-gsm8k",
@@ -284,7 +287,11 @@ SUITES: dict[str, MultiHostSuite] = {
 
 
 def get_suites() -> dict[str, MultiHostSuite]:
-    base_dir = Path(_SELF_DIR)
+    # Profile filenames are bare (e.g. "mimo-flash-v6e-4x4.yaml") and resolve
+    # against the shared nightly/launch_profiles/ dir — same reference style the
+    # single-host suite uses, so a launch_profile value reads identically on
+    # both sides.
+    base_dir = Path(_NIGHTLY_DIR) / "launch_profiles"
     return {
         name: dataclasses.replace(
             suite, runs=[_resolve_launch_profile(r, base_dir) for r in suite.runs]
