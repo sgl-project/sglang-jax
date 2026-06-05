@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import suppress
 from http import HTTPStatus
 import logging
 import threading
@@ -20,6 +21,7 @@ from sgl_jax.srt.disaggregation.jax_transfer.conn import (
 
 if TYPE_CHECKING:
     from sgl_jax.srt.managers.schedule_batch import Req
+    from sgl_jax.srt.managers.scheduler import Scheduler
 
 logger = logging.getLogger(__name__)
 
@@ -113,49 +115,45 @@ class SchedulerDisaggregationPrefillMixin:
     disagg_prefill_queue: PrefillBootstrapQueue
     disagg_use_d2h_staging: bool
 
-    def event_loop_normal_disagg_prefill(self) -> None:
+    def event_loop_normal_disagg_prefill(self: Scheduler) -> None:
         """Prefill-only event loop."""
 
         while True:
             recv_reqs = (
-                self._comm_backend.recv_requests()  # type: ignore[attr-defined]
-                if self._comm_backend is not None  # type: ignore[attr-defined]
-                else self.recv_requests()  # type: ignore[attr-defined]
+                self._comm_backend.recv_requests()
+                if self._comm_backend is not None
+                else self.recv_requests()
             )
-            recv_reqs = self.select_dp_for_request(recv_reqs)  # type: ignore[attr-defined]
-            self.process_input_requests(recv_reqs)  # type: ignore[attr-defined]
+            recv_reqs = self.select_dp_for_request(recv_reqs)
+            self.process_input_requests(recv_reqs)
 
-            if self._engine_paused:  # type: ignore[attr-defined]
+            if self._engine_paused:
                 continue
 
-            batch = self.get_next_batch_to_run()  # type: ignore[attr-defined]
-            self.cur_batch = batch  # type: ignore[attr-defined]
+            batch = self.get_next_batch_to_run()
+            self.cur_batch = batch
 
             if batch:
-                result = self.run_batch(batch)  # type: ignore[attr-defined]
+                result = self.run_batch(batch)
                 self.process_prefill_chunk(batch, result)
             else:
                 self.send_kv_chunk()
-                self.new_token_ratio = self.init_new_token_ratio  # type: ignore[attr-defined]
-                if self._comm_backend is not None:  # type: ignore[attr-defined]
-                    self._comm_backend.wait_for_new_requests(0.001)  # type: ignore[attr-defined]
+                self.new_token_ratio = self.init_new_token_ratio
+                if self._comm_backend is not None:
+                    self._comm_backend.wait_for_new_requests(0.001)
 
             self.send_kv_chunk()
-            self.last_batch = batch  # type: ignore[attr-defined]
+            self.last_batch = batch
 
-    def process_prefill_chunk(self, batch, result) -> None:
+    def process_prefill_chunk(self: Scheduler, batch, result) -> None:
         """Extract KV for PD reqs and hand off to sender."""
 
-        pd_reqs = [
-            req
-            for req in batch.reqs
-            if getattr(req, "bootstrap_room", None) is not None
-        ]
+        pd_reqs = [req for req in batch.reqs if req.bootstrap_room is not None]
         if not pd_reqs:
-            self.process_batch_result(batch, result)  # type: ignore[attr-defined]
+            self.process_batch_result(batch, result)
             return
 
-        self.set_next_batch_sampling_info_done(batch)  # type: ignore[attr-defined]
+        self.set_next_batch_sampling_info_done(batch)
 
         for req in batch.reqs:
             if req.bootstrap_room is None:
@@ -170,31 +168,11 @@ class SchedulerDisaggregationPrefillMixin:
                     "failed to extract KV for req_id=%s; aborting",
                     req_id,
                 )
-                try:
-                    from sgl_jax.srt.disaggregation.common.metrics import (
-                        PD_TRANSFER_FAILURES_TOTAL,
-                    )
-
-                    PD_TRANSFER_FAILURES_TOTAL.labels(
-                        reason="kv_extraction", role="prefill"
-                    ).inc()
-                except Exception:  # noqa: BLE001
-                    pass
-                from sgl_jax.srt.managers.schedule_batch import FINISH_ABORT
-
-                req.finished_reason = FINISH_ABORT(
+                self._abort_prefill_req(
+                    req,
                     f"KV extraction failed for req_id={req_id!r}: {exc}",
-                    HTTPStatus.INTERNAL_SERVER_ERROR,
-                    "PDTransferError",
+                    metric_reason="kv_extraction",
                 )
-                req.output_ids = []
-                if hasattr(self, "stream_output"):
-                    self.stream_output(  # type: ignore[attr-defined]
-                        [req],
-                        getattr(req, "return_logprob", False),
-                        getattr(req, "return_output_logprob_only", False),
-                    )
-                self._release_prefill_req_resources(req)
                 continue
             sender = None
             try:
@@ -206,9 +184,7 @@ class SchedulerDisaggregationPrefillMixin:
                 sender = self.disagg_kv_manager.create_sender(req_id)
                 sender.init(
                     kv_indices=None,
-                    transfer_id=(
-                        getattr(req, "disagg_transfer_id", None) or req_id
-                    ),
+                    transfer_id=req.disagg_transfer_id or req_id,
                 )
                 sender.attach_payload(
                     {"kv": device_kv},
@@ -221,42 +197,15 @@ class SchedulerDisaggregationPrefillMixin:
                     req_id,
                 )
                 if sender is not None:
-                    try:
-                        if hasattr(sender, "abort"):
-                            sender.abort()
-                        if hasattr(sender, "clear"):
-                            sender.clear()
-                    except Exception:  # noqa: BLE001
-                        logger.debug(
-                            "sender cleanup failed for req_id=%s",
-                            req_id,
-                            exc_info=True,
-                        )
-                try:
-                    from sgl_jax.srt.disaggregation.common.metrics import (
-                        PD_TRANSFER_FAILURES_TOTAL,
-                    )
-
-                    PD_TRANSFER_FAILURES_TOTAL.labels(
-                        reason="sender_init", role="prefill"
-                    ).inc()
-                except Exception:  # noqa: BLE001
-                    pass
-                from sgl_jax.srt.managers.schedule_batch import FINISH_ABORT
-
-                req.finished_reason = FINISH_ABORT(
+                    with suppress(Exception):
+                        sender.abort()
+                    with suppress(Exception):
+                        sender.clear()
+                self._abort_prefill_req(
+                    req,
                     f"Prefill sender failed for req_id={req_id!r}: {exc}",
-                    HTTPStatus.INTERNAL_SERVER_ERROR,
-                    "PDTransferError",
+                    metric_reason="sender_init",
                 )
-                req.output_ids = []
-                if hasattr(self, "stream_output"):
-                    self.stream_output(  # type: ignore[attr-defined]
-                        [req],
-                        getattr(req, "return_logprob", False),
-                        getattr(req, "return_output_logprob_only", False),
-                    )
-                self._release_prefill_req_resources(req)
                 continue
 
             def _on_terminal(req_obj=req, sender_obj=sender):
@@ -266,7 +215,7 @@ class SchedulerDisaggregationPrefillMixin:
                 req_id, sender, on_terminal=_on_terminal
             )
 
-    def send_kv_chunk(self) -> None:
+    def send_kv_chunk(self: Scheduler) -> None:
         """Reap senders that reached SUCCESS / FAILED."""
 
         terminal = self.disagg_prefill_queue.drain_terminal()
@@ -286,16 +235,14 @@ class SchedulerDisaggregationPrefillMixin:
     # Overridable / test-friendly hooks
     # ------------------------------------------------------------------
 
-    def _extract_req_kv(self, req: Req):
+    def _extract_req_kv(self: Scheduler, req: Req):
         """Gather prefilled KV from the paged pool for ``req``.
 
         Returns shape ``(layer_num, padded_pages, page_size, ...)``.
         """
 
-        req_to_token = self.req_to_token_pool.req_to_token  # type: ignore[attr-defined]
-        kv_pool = (
-            self.token_to_kv_pool_allocator.get_kvcache()  # type: ignore[attr-defined]
-        )
+        req_to_token = self.req_to_token_pool.req_to_token
+        kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
         page_size = kv_pool.page_size
         seqlen = len(req.origin_input_ids)
         num_pages = (seqlen + page_size - 1) // page_size
@@ -332,14 +279,51 @@ class SchedulerDisaggregationPrefillMixin:
         )
         return jnp.stack(layer_kvs, axis=0)
 
-    def _release_prefill_req_resources(self, req: Req) -> None:
-        """Release req resources. Delegates to cache_finished_req."""
+    def _release_prefill_req_resources(self: Scheduler, req: Req) -> None:
+        """Release prefill-side KV and request-pool resources."""
 
-        if hasattr(self, "cache_finished_req"):
-            self.cache_finished_req(req)  # type: ignore[attr-defined]
+        from sgl_jax.srt.mem_cache.common import release_kv_cache
+
+        release_kv_cache(req, self.tree_cache)
+
+    def _record_prefill_transfer_failure(self, reason: str) -> None:
+        with suppress(Exception):
+            from sgl_jax.srt.disaggregation.common.metrics import (
+                PD_TRANSFER_FAILURES_TOTAL,
+            )
+
+            PD_TRANSFER_FAILURES_TOTAL.labels(
+                reason=reason, role="prefill"
+            ).inc()
+
+    def _stream_prefill_req(self: Scheduler, req: Req) -> None:
+        self.stream_output(
+            [req],
+            req.return_logprob,
+            req.return_output_logprob_only,
+        )
+
+    def _abort_prefill_req(
+        self: Scheduler,
+        req: Req,
+        message: str,
+        *,
+        metric_reason: str,
+    ) -> None:
+        from sgl_jax.srt.managers.schedule_batch import FINISH_ABORT
+
+        self._record_prefill_transfer_failure(metric_reason)
+        req.finished_reason = FINISH_ABORT(
+            message,
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "PDTransferError",
+        )
+        req.output_ids = []
+        self._stream_prefill_req(req)
+        self._release_prefill_req_resources(req)
 
     def _on_prefill_transfer_terminal(
-        self, req: Req, sender: JaxTransferKVSender
+        self: Scheduler, req: Req, sender: JaxTransferKVSender
     ) -> None:
         try:
             if sender.poll() == KVPoll.SUCCESS:
@@ -347,31 +331,25 @@ class SchedulerDisaggregationPrefillMixin:
             else:
                 self._finish_prefill_only_failure(req, sender)
         finally:
-            if hasattr(sender, "clear"):
-                sender.clear()
+            sender.clear()
             self._release_prefill_req_resources(req)
 
-    def _finish_prefill_only_success(self, req: Req) -> None:
+    def _finish_prefill_only_success(self: Scheduler, req: Req) -> None:
         from sgl_jax.srt.managers.schedule_batch import FINISH_LENGTH
 
         req.finished_reason = FINISH_LENGTH(length=0)
         req.output_ids = []
         req.finished_len = 0
-        if hasattr(self, "stream_output"):
-            self.stream_output(  # type: ignore[attr-defined]
-                [req],
-                getattr(req, "return_logprob", False),
-                getattr(req, "return_output_logprob_only", False),
-            )
+        self._stream_prefill_req(req)
 
     def _finish_prefill_only_failure(
-        self, req: Req, sender: JaxTransferKVSender
+        self: Scheduler, req: Req, sender: JaxTransferKVSender
     ) -> None:
         from sgl_jax.srt.managers.schedule_batch import FINISH_ABORT
 
         error_message = (
-            f"Prefill transfer failed for req_id={getattr(req, 'rid', None)!r} "
-            f"bootstrap_room={getattr(req, 'bootstrap_room', None)!r}"
+            f"Prefill transfer failed for req_id={req.rid!r} "
+            f"bootstrap_room={req.bootstrap_room!r}"
         )
         try:
             sender.failure_exception()
@@ -383,12 +361,7 @@ class SchedulerDisaggregationPrefillMixin:
             "PDTransferError",
         )
         req.output_ids = []
-        if hasattr(self, "stream_output"):
-            self.stream_output(  # type: ignore[attr-defined]
-                [req],
-                getattr(req, "return_logprob", False),
-                getattr(req, "return_output_logprob_only", False),
-            )
+        self._stream_prefill_req(req)
 
     def _maybe_log_prefill_extract_debug(self, req: Req, kv, **meta) -> None:
         from sgl_jax.srt.disaggregation.debug_utils import (
@@ -396,7 +369,7 @@ class SchedulerDisaggregationPrefillMixin:
             kv_debug_enabled,
         )
 
-        if not kv_debug_enabled(getattr(req, "rid", None)):
+        if not kv_debug_enabled(req.rid):
             return
 
         snapshot = build_kv_debug_snapshot(kv)

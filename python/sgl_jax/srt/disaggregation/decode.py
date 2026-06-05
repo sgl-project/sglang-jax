@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import suppress
 import logging
 import threading
 from dataclasses import dataclass
@@ -20,6 +21,7 @@ from sgl_jax.srt.disaggregation.jax_transfer.conn import (
 
 if TYPE_CHECKING:
     from sgl_jax.srt.managers.schedule_batch import Req
+    from sgl_jax.srt.managers.scheduler import Scheduler
 
 logger = logging.getLogger(__name__)
 
@@ -126,43 +128,43 @@ class SchedulerDisaggregationDecodeMixin:
     disagg_prealloc_queue: DecodePreallocQueue
     disagg_transfer_queue: DecodeTransferQueue
 
-    def event_loop_normal_disagg_decode(self) -> None:
+    def event_loop_normal_disagg_decode(self: Scheduler) -> None:
         """Decode event loop."""
 
         while True:
             recv_reqs = (
-                self._comm_backend.recv_requests()  # type: ignore[attr-defined]
-                if self._comm_backend is not None  # type: ignore[attr-defined]
-                else self.recv_requests()  # type: ignore[attr-defined]
+                self._comm_backend.recv_requests()
+                if self._comm_backend is not None
+                else self.recv_requests()
             )
-            recv_reqs = self.select_dp_for_request(recv_reqs)  # type: ignore[attr-defined]
+            recv_reqs = self.select_dp_for_request(recv_reqs)
             self.process_input_requests_disagg_decode(recv_reqs)
 
-            if self._engine_paused:  # type: ignore[attr-defined]
+            if self._engine_paused:
                 continue
 
             self.process_decode_queue()
 
-            batch = self.get_next_batch_to_run()  # type: ignore[attr-defined]
-            self.cur_batch = batch  # type: ignore[attr-defined]
+            batch = self.get_next_batch_to_run()
+            self.cur_batch = batch
 
             if batch:
-                result = self.run_batch(batch)  # type: ignore[attr-defined]
-                self.process_batch_result(batch, result)  # type: ignore[attr-defined]
+                result = self.run_batch(batch)
+                self.process_batch_result(batch, result)
             else:
                 # Skip check_memory / check_tree_cache for PD decode.
-                self.new_token_ratio = self.init_new_token_ratio  # type: ignore[attr-defined]
-                if self._comm_backend is not None:  # type: ignore[attr-defined]
-                    self._comm_backend.wait_for_new_requests(0.001)  # type: ignore[attr-defined]
+                self.new_token_ratio = self.init_new_token_ratio
+                if self._comm_backend is not None:
+                    self._comm_backend.wait_for_new_requests(0.001)
 
-            self.last_batch = batch  # type: ignore[attr-defined]
+            self.last_batch = batch
 
-    def process_input_requests_disagg_decode(self, recv_reqs) -> None:
+    def process_input_requests_disagg_decode(self: Scheduler, recv_reqs) -> None:
         """Decode-mode request intake. PD reqs are extracted from
         waiting_queue and routed to the prealloc queue.
         """
 
-        self.process_input_requests(recv_reqs)  # type: ignore[attr-defined]
+        self.process_input_requests(recv_reqs)
 
         recv_pd_rids = {
             getattr(r, "rid", None)
@@ -187,16 +189,7 @@ class SchedulerDisaggregationDecodeMixin:
                     "bootstrap_room=%s; releasing resources",
                     req.rid, req.bootstrap_room,
                 )
-                try:
-                    from sgl_jax.srt.disaggregation.common.metrics import (
-                        PD_TRANSFER_FAILURES_TOTAL,
-                    )
-
-                    PD_TRANSFER_FAILURES_TOTAL.labels(
-                        reason="bootstrap_lookup", role="decode"
-                    ).inc()
-                except Exception:  # noqa: BLE001
-                    pass
+                self._record_decode_transfer_failure("bootstrap_lookup")
                 self._abort_decode_request(req, "bootstrap_lookup")
                 continue
 
@@ -210,10 +203,7 @@ class SchedulerDisaggregationDecodeMixin:
                         remote_addr=(
                             f"{p_info['host']}:{p_info['transfer_port']}"
                         ),
-                        uuid=(
-                            getattr(req, "disagg_transfer_id", None)
-                            or req.rid
-                        ),
+                        uuid=req.disagg_transfer_id or req.rid,
                         specs={"kv": spec},
                         p_side_channel_host=str(p_info["host"]),
                         p_side_channel_port=int(p_info["side_channel_port"]),
@@ -224,16 +214,7 @@ class SchedulerDisaggregationDecodeMixin:
                     "failed to set up KVReceiver for req_id=%s",
                     req.rid,
                 )
-                try:
-                    from sgl_jax.srt.disaggregation.common.metrics import (
-                        PD_TRANSFER_FAILURES_TOTAL,
-                    )
-
-                    PD_TRANSFER_FAILURES_TOTAL.labels(
-                        reason="receiver_init", role="decode"
-                    ).inc()
-                except Exception:  # noqa: BLE001
-                    pass
+                self._record_decode_transfer_failure("receiver_init")
                 # Release any slots we allocated before the failure.
                 if kv_indices is not None:
                     self._release_decode_kv_indices(kv_indices)
@@ -249,17 +230,16 @@ class SchedulerDisaggregationDecodeMixin:
             )
             self.disagg_prealloc_queue.add(entry)
 
-    def _extract_pd_reqs_from_waiting_queue(self, rids: set) -> list[Req]:
+    def _extract_pd_reqs_from_waiting_queue(
+        self: Scheduler, rids: set
+    ) -> list[Req]:
         """Extract PD reqs from waiting_queue by rid set."""
 
         out: list[Req] = []
-        queue = getattr(self, "waiting_queue", None)
-        if queue is None:
-            return out
+        queue = self.waiting_queue
         survivors = []
         for req in queue:
-            rid = getattr(req, "rid", None)
-            if rid in rids and getattr(req, "bootstrap_room", None) is not None:
+            if req.rid in rids and req.bootstrap_room is not None:
                 out.append(req)
             else:
                 survivors.append(req)
@@ -267,7 +247,7 @@ class SchedulerDisaggregationDecodeMixin:
         queue.extend(survivors)
         return out
 
-    def process_decode_queue(self) -> None:
+    def process_decode_queue(self: Scheduler) -> None:
         """Drive prealloc -> transfer -> ready transitions."""
 
         for entry in self.disagg_prealloc_queue.pop_all():
@@ -284,17 +264,7 @@ class SchedulerDisaggregationDecodeMixin:
                     self._write_kv_to_pool(
                         entry.req, entry.kv_indices, kv
                     )
-                    try:
-                        from sgl_jax.srt.disaggregation.common.metrics import (
-                            PD_TRANSFER_BYTES_TOTAL,
-                        )
-
-                        if kv is not None and hasattr(kv, "nbytes"):
-                            PD_TRANSFER_BYTES_TOTAL.labels(
-                                direction="h2d", role="decode"
-                            ).inc(int(kv.nbytes))
-                    except Exception:  # noqa: BLE001
-                        pass
+                    self._record_decode_transfer_bytes(kv)
                     self._enqueue_for_decode(entry.req)
                 except Exception:
                     logger.exception(
@@ -311,16 +281,9 @@ class SchedulerDisaggregationDecodeMixin:
                     "resources and aborting request",
                     entry.req_id, state.value,
                 )
-                try:
-                    from sgl_jax.srt.disaggregation.common.metrics import (
-                        PD_TRANSFER_FAILURES_TOTAL,
-                    )
-
-                    PD_TRANSFER_FAILURES_TOTAL.labels(
-                        reason="receiver_terminal_failed", role="decode"
-                    ).inc()
-                except Exception:  # noqa: BLE001
-                    pass
+                self._record_decode_transfer_failure(
+                    "receiver_terminal_failed"
+                )
                 if entry.kv_indices is not None:
                     self._release_decode_kv_indices(entry.kv_indices)
                 self._abort_decode_request(entry.req, "receiver_terminal_failed")
@@ -329,28 +292,24 @@ class SchedulerDisaggregationDecodeMixin:
     # Overridable / test-friendly hooks
     # ------------------------------------------------------------------
 
-    def _prealloc_decode_kv_indices(self, req: Req):
+    def _prealloc_decode_kv_indices(self: Scheduler, req: Req):
         """Reserve page-aligned KV slots in the paged pool for ``req``."""
 
         seqlen = len(req.origin_input_ids)
-        allocator = getattr(
-            self, "token_to_kv_pool_allocator", None
-        )
+        allocator = self.token_to_kv_pool_allocator
         if allocator is None:
             return None
-        page_size = getattr(allocator, "page_size", 1)
+        page_size = allocator.page_size
         page_aligned = ((seqlen + page_size - 1) // page_size) * page_size
         return allocator.alloc(page_aligned)
 
-    def _release_decode_kv_indices(self, kv_indices) -> None:
+    def _release_decode_kv_indices(self: Scheduler, kv_indices) -> None:
         """Release KV indices back to the allocator."""
 
         if kv_indices is None:
             return
-        allocator = getattr(
-            self, "token_to_kv_pool_allocator", None
-        )
-        if allocator is not None and hasattr(allocator, "free"):
+        allocator = self.token_to_kv_pool_allocator
+        if allocator is not None:
             try:
                 allocator.free(kv_indices)
             except Exception:
@@ -358,16 +317,16 @@ class SchedulerDisaggregationDecodeMixin:
                     "failed to free kv_indices=%r", kv_indices
                 )
 
-    def _build_kv_spec_for_req(self, req: Req) -> jax.ShapeDtypeStruct:
+    def _build_kv_spec_for_req(
+        self: Scheduler, req: Req
+    ) -> jax.ShapeDtypeStruct:
         """Build ShapeDtypeStruct matching P's KV layout for the receiver."""
 
         from jax.sharding import NamedSharding, PartitionSpec
 
         from sgl_jax.srt.disaggregation.prefill import _pad_to_page_bucket
 
-        kv_pool = (
-            self.token_to_kv_pool_allocator.get_kvcache()  # type: ignore[attr-defined]
-        )
+        kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
         page_size = kv_pool.page_size
         seqlen = len(req.origin_input_ids)
         num_pages = (seqlen + page_size - 1) // page_size
@@ -379,7 +338,9 @@ class SchedulerDisaggregationDecodeMixin:
         sharding = NamedSharding(kv_pool.kv_sharding.mesh, stacked_spec)
         return jax.ShapeDtypeStruct(shape, kv_pool.dtype, sharding=sharding)
 
-    def _write_kv_to_pool(self, req: Req, kv_indices, kv: jax.Array) -> None:
+    def _write_kv_to_pool(
+        self: Scheduler, req: Req, kv_indices, kv: jax.Array
+    ) -> None:
         """Scatter pulled KV into the local paged pool."""
 
         if kv_indices is None:
@@ -391,9 +352,7 @@ class SchedulerDisaggregationDecodeMixin:
 
         from jax.sharding import NamedSharding, PartitionSpec
 
-        kv_pool = (
-            self.token_to_kv_pool_allocator.get_kvcache()  # type: ignore[attr-defined]
-        )
+        kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
         page_size = kv_pool.page_size
         seqlen = len(req.origin_input_ids)
         num_pages = (seqlen + page_size - 1) // page_size
@@ -469,36 +428,29 @@ class SchedulerDisaggregationDecodeMixin:
             req, kv_pool, page_ids_padded, kv
         )
 
-    def _enqueue_for_decode(self, req: Req) -> None:
-        """Put ``req`` into the scheduler's decode-ready queue.
-        Default: append to ``waiting_queue`` if present.
-        """
+    def _enqueue_for_decode(self: Scheduler, req: Req) -> None:
+        """Put ``req`` into the scheduler's decode-ready queue."""
 
-        queue = getattr(self, "waiting_queue", None)
-        if queue is not None and req not in queue:
-            queue.append(req)
+        if req not in self.waiting_queue:
+            self.waiting_queue.append(req)
 
-    def _release_decode_req_resources(self, req: Req) -> None:
+    def _release_decode_req_resources(self: Scheduler, req: Req) -> None:
         """Best-effort release of req_to_token_pool slot. Does NOT
         call cache_finished_req (req never went through prefill).
         """
 
-        req_pool_idx = getattr(req, "req_pool_idx", None)
-        if req_pool_idx is not None:
-            req_to_token_pool = getattr(self, "req_to_token_pool", None)
-            if req_to_token_pool is not None and hasattr(
-                req_to_token_pool, "free"
-            ):
-                try:
-                    req_to_token_pool.free(req_pool_idx)
-                except Exception:
-                    logger.exception(
-                        "failed to free req_to_token_pool slot %d for "
-                        "req_id=%s",
-                        req_pool_idx, req.rid,
-                    )
+        if req.req_pool_idx is None:
+            return
+        try:
+            self.req_to_token_pool.free(req)
+        except Exception:
+            logger.exception(
+                "failed to free req_to_token_pool slot %d for req_id=%s",
+                req.req_pool_idx,
+                req.rid,
+            )
 
-    def _abort_decode_request(self, req: Req, reason: str) -> None:
+    def _abort_decode_request(self: Scheduler, req: Req, reason: str) -> None:
         """Release resources AND send AbortReq back to tokenizer."""
 
         self._release_decode_req_resources(req)
@@ -506,15 +458,36 @@ class SchedulerDisaggregationDecodeMixin:
             from sgl_jax.srt.managers.io_struct import AbortReq
 
             abort_out = AbortReq(rid=req.rid)
-            if self._comm_backend is not None:  # type: ignore[attr-defined]
-                self._comm_backend.send_pyobj(abort_out)  # type: ignore[attr-defined]
+            if self._comm_backend is not None:
+                self._comm_backend.send_pyobj(abort_out)
             else:
-                self.send_to_tokenizer.send_pyobj(abort_out)  # type: ignore[attr-defined]
+                self.send_to_tokenizer.send_pyobj(abort_out)
         except Exception:
             logger.exception(
                 "failed to send AbortReq for req_id=%s (reason=%s)",
                 req.rid, reason,
             )
+
+    def _record_decode_transfer_failure(self, reason: str) -> None:
+        with suppress(Exception):
+            from sgl_jax.srt.disaggregation.common.metrics import (
+                PD_TRANSFER_FAILURES_TOTAL,
+            )
+
+            PD_TRANSFER_FAILURES_TOTAL.labels(
+                reason=reason, role="decode"
+            ).inc()
+
+    def _record_decode_transfer_bytes(self, kv) -> None:
+        with suppress(Exception):
+            from sgl_jax.srt.disaggregation.common.metrics import (
+                PD_TRANSFER_BYTES_TOTAL,
+            )
+
+            if kv is not None and hasattr(kv, "nbytes"):
+                PD_TRANSFER_BYTES_TOTAL.labels(
+                    direction="h2d", role="decode"
+                ).inc(int(kv.nbytes))
 
     def _maybe_log_decode_pull_debug(self, req: Req, kv) -> None:
         from sgl_jax.srt.disaggregation.debug_utils import (
@@ -522,7 +495,7 @@ class SchedulerDisaggregationDecodeMixin:
             kv_debug_enabled,
         )
 
-        if not kv_debug_enabled(getattr(req, "rid", None)):
+        if not kv_debug_enabled(req.rid):
             return
 
         snapshot = build_kv_debug_snapshot(kv)
@@ -550,7 +523,7 @@ class SchedulerDisaggregationDecodeMixin:
         )
         from sgl_jax.srt.disaggregation.prefill import _jit_gather_all_layers
 
-        if not kv_debug_enabled(getattr(req, "rid", None)):
+        if not kv_debug_enabled(req.rid):
             return
 
         page_ids_jax = jax.device_put(

@@ -10,6 +10,7 @@ not happen.
 from __future__ import annotations
 
 from http import HTTPStatus
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest import mock
@@ -31,6 +32,37 @@ from sgl_jax.srt.disaggregation.prefill import (
     SchedulerDisaggregationPrefillMixin,
 )
 from sgl_jax.srt.managers.schedule_batch import FINISH_ABORT, FINISH_LENGTH
+
+
+def test_pd_mixins_use_explicit_scheduler_contracts_for_first_party_fields():
+    """Keep PD mixins close to upstream style.
+
+    The mixins are Scheduler-only extensions, so they should type ``self``
+    against Scheduler under TYPE_CHECKING instead of hiding missing
+    attributes with type-ignore comments. First-party request fields should
+    also be accessed directly; getattr is reserved for capability probes or
+    truly heterogeneous inputs.
+    """
+
+    root = Path(__file__).parents[3]
+    sources = {
+        "prefill": root / "sgl_jax" / "srt" / "disaggregation" / "prefill.py",
+        "decode": root / "sgl_jax" / "srt" / "disaggregation" / "decode.py",
+    }
+    for source in sources.values():
+        text = source.read_text()
+        assert "type: ignore" not in text
+
+    prefill_text = sources["prefill"].read_text()
+    decode_text = sources["decode"].read_text()
+    for bad in (
+        'getattr(req, "bootstrap_room"',
+        'getattr(req, "disagg_transfer_id"',
+        'getattr(req, "return_logprob"',
+        'getattr(req, "return_output_logprob_only"',
+    ):
+        assert bad not in prefill_text
+        assert bad not in decode_text
 
 
 def _fake_req(rid: str, *, bootstrap_room: int | None = 42, req_pool_idx=7):
@@ -55,8 +87,9 @@ class _MockReqToTokenPool:
     def __init__(self):
         self.freed: list[int] = []
 
-    def free(self, idx: int) -> None:
-        self.freed.append(idx)
+    def free(self, req) -> None:
+        self.freed.append(req.req_pool_idx)
+        req.req_pool_idx = None
 
 
 class _MockDecodeScheduler(SchedulerDisaggregationDecodeMixin):
@@ -70,6 +103,7 @@ class _MockDecodeScheduler(SchedulerDisaggregationDecodeMixin):
         self.debug_pulls: list[Any] = []
         self._comm_backend = None
         self.send_to_tokenizer = mock.MagicMock()
+        self.token_to_kv_pool_allocator = None
         # Bootstrap / manager / receiver are wired by tests below.
 
     def process_input_requests(self, recv_reqs):
@@ -837,7 +871,7 @@ def test_receiver_terminal_failed_sends_abort_to_tokenizer():
 
 
 def test_dispatch_scheduler_event_loop_routes_correctly():
-    from sgl_jax.srt.managers.scheduler import dispatch_scheduler_event_loop
+    from sgl_jax.srt.disaggregation.runtime import dispatch_scheduler_event_loop
 
     for mode, overlap, expected_method in [
         ("null", False, "event_loop_normal"),
@@ -924,6 +958,8 @@ def test_prefill_queue_abort_calls_on_terminal():
     sched.cur_batch = None
     sched._comm_backend = None
     sched.send_to_tokenizer = mock.MagicMock()
+    sched.disagg_prealloc_queue = None
+    sched.disagg_transfer_queue = None
 
     from sgl_jax.srt.managers.scheduler import Scheduler
 
@@ -984,7 +1020,7 @@ def test_different_rids_same_transfer_id_uses_shared_id():
 
 
 def test_disagg_shutdown_handler_unregisters_and_drains():
-    from sgl_jax.srt.managers.scheduler import _make_disagg_shutdown
+    from sgl_jax.srt.disaggregation.runtime import _make_disagg_shutdown
 
     scheduler = mock.MagicMock()
     scheduler.disagg_bootstrap_key = "bkey"
