@@ -384,7 +384,6 @@ class Gemma3ForCausalLM(nnx.Module):
         architectures = getattr(hf_config, "architectures", []) or []
         if "Gemma3ForConditionalGeneration" in architectures:
             # Text weights in conditional checkpoints are nested under language_model.
-            # The conditional architecture itself is registered when vision support lands.
             return self._create_text_weight_mappings(hf_prefix="language_model.")
         return self._create_text_weight_mappings()
 
@@ -524,4 +523,12 @@ class Gemma3ForCausalLM(nnx.Module):
         return output, {"token_to_kv_pool": layers_kv_fused}, True, None
 
 
-EntryClass = Gemma3ForCausalLM
+class Gemma3ForConditionalGeneration(Gemma3ForCausalLM):
+    """Text-only adapter for Gemma 3 conditional-generation checkpoints.
+
+    Vision/projector/image-token handling is intentionally left to the
+    multimodal Gemma 3 implementation.
+    """
+
+
+EntryClass = [Gemma3ForCausalLM, Gemma3ForConditionalGeneration]

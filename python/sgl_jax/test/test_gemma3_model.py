@@ -8,6 +8,7 @@ from transformers import PretrainedConfig
 from sgl_jax.srt.layers.radix_attention import AttentionType
 from sgl_jax.srt.models.gemma3 import (
     Gemma3ForCausalLM,
+    Gemma3ForConditionalGeneration,
     _get_forward_batch_input_embeds,
     _get_layer_type,
     _get_rope_theta,
@@ -85,10 +86,23 @@ def _build_model(config, dtype=jnp.bfloat16):
         return Gemma3ForCausalLM(config, mesh=mesh, dtype=dtype)
 
 
+def _build_conditional_model(config, dtype=jnp.bfloat16):
+    mesh = _single_device_mesh()
+    with jax.set_mesh(mesh):
+        return Gemma3ForConditionalGeneration(config, mesh=mesh, dtype=dtype)
+
+
 def test_registry_exposes_gemma3_causal_lm():
     assert ModelRegistry.resolve_model_cls(["Gemma3ForCausalLM"]) == (
         Gemma3ForCausalLM,
         "Gemma3ForCausalLM",
+    )
+
+
+def test_registry_exposes_gemma3_conditional_generation_text_model():
+    assert ModelRegistry.resolve_model_cls(["Gemma3ForConditionalGeneration"]) == (
+        Gemma3ForConditionalGeneration,
+        "Gemma3ForConditionalGeneration",
     )
 
 
@@ -256,7 +270,7 @@ def test_text_weight_mappings_include_qk_norms():
 
 def test_conditional_language_model_weight_mappings_use_prefixed_hf_keys():
     text_config = _tiny_gemma3_config()
-    model = _build_model(_tiny_outer_conditional_config(text_config))
+    model = _build_conditional_model(_tiny_outer_conditional_config(text_config))
     mappings = model._create_weight_mappings()
 
     assert (
@@ -272,6 +286,21 @@ def test_conditional_language_model_weight_mappings_use_prefixed_hf_keys():
         == (None,)
     )
     assert "model.layers.0.self_attn.q_norm.weight" not in mappings
+
+
+def test_conditional_text_model_initializes_from_outer_config():
+    text_config = _tiny_gemma3_config()
+    outer_config = _tiny_outer_conditional_config(text_config)
+    model = _build_conditional_model(outer_config)
+
+    assert model.hf_config is outer_config
+    assert model.config is text_config
+    assert len(model.model.layers) == text_config.num_hidden_layers
+    assert model.model.layers[0].self_attn.head_dim == text_config.head_dim
+    assert [layer.self_attn.attn.attn_type for layer in model.model.layers] == [
+        AttentionType.DECODER,
+        AttentionType.DECODER,
+    ]
 
 
 def test_forward_batch_input_embedding_only_used_for_extend_modes():
