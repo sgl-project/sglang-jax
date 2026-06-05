@@ -1,7 +1,6 @@
 """A scheduler that manages a tensor parallel TPU worker."""
 
 import concurrent.futures as futures
-import contextlib
 import dataclasses
 import faulthandler
 import json
@@ -69,6 +68,10 @@ from sgl_jax.srt.disaggregation.prefill import (
 )
 from sgl_jax.srt.disaggregation.decode import (
     SchedulerDisaggregationDecodeMixin,
+)
+from sgl_jax.srt.disaggregation.runtime import (
+    dispatch_scheduler_event_loop,
+    install_disaggregation_wiring,
 )
 from sgl_jax.srt.managers.tp_worker import ModelWorker
 from sgl_jax.srt.managers.tp_worker_overlap_thread import ModelWorkerClient
@@ -228,12 +231,25 @@ class Scheduler(
         if server_args.multimodal:
             logger.info("Multimodal mode enabled, disabling overlap schedule")
             self.enable_overlap = False
-        if getattr(server_args, "disaggregation_mode", "null") != "null":
+        if server_args.disaggregation_mode != "null":
             logger.info(
                 "PD disaggregation mode enabled, disabling overlap schedule"
             )
             self.enable_overlap = False
         self.spec_algorithm = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
+
+        # PD disaggregation runtime attributes. They are populated by
+        # install_disaggregation_wiring() when disaggregation_mode != "null".
+        self.disagg_kv_manager = None
+        self.disagg_bootstrap_client = None
+        self.disagg_bootstrap_server = None
+        self.disagg_heartbeat = None
+        self.disagg_bootstrap_key = None
+        self.disagg_shutdown = None
+        self.disagg_use_d2h_staging = False
+        self.disagg_prefill_queue = None
+        self.disagg_prealloc_queue = None
+        self.disagg_transfer_queue = None
 
         # LoRA configurations
         self.lora_paths = server_args.lora_paths
@@ -1030,12 +1046,10 @@ class Scheduler(
         )
         req.tokenizer = self.tokenizer
         # PD disaggregation routing keys.
-        req.bootstrap_host = getattr(recv_req, "bootstrap_host", None)
-        req.bootstrap_port = getattr(recv_req, "bootstrap_port", None)
-        req.bootstrap_room = getattr(recv_req, "bootstrap_room", None)
-        req.disagg_transfer_id = (
-            getattr(recv_req, "disagg_transfer_id", None) or req.rid
-        )
+        req.bootstrap_host = recv_req.bootstrap_host
+        req.bootstrap_port = recv_req.bootstrap_port
+        req.bootstrap_room = recv_req.bootstrap_room
+        req.disagg_transfer_id = recv_req.disagg_transfer_id or req.rid
         if hasattr(recv_req, "mm_inputs") and recv_req.mm_inputs:
             req.mm_inputs = recv_req.mm_inputs
             multimodal_embedding = recv_req.mm_inputs.get("multimodal_embedding")
@@ -1229,13 +1243,13 @@ class Scheduler(
 
         # PD disaggregation queues
         ret["disagg_prefill_queue_size"] = len(
-            getattr(self, "disagg_prefill_queue", None) or ()
+            self.disagg_prefill_queue or ()
         )
         ret["disagg_prealloc_queue_size"] = len(
-            getattr(self, "disagg_prealloc_queue", None) or ()
+            self.disagg_prealloc_queue or ()
         )
         ret["disagg_transfer_queue_size"] = len(
-            getattr(self, "disagg_transfer_queue", None) or ()
+            self.disagg_transfer_queue or ()
         )
 
         return GetInternalStateReqOutput(internal_state=ret)
@@ -1335,9 +1349,9 @@ class Scheduler(
             or pending_results > 0
         )
 
-        pd_prefill = len(getattr(self, "disagg_prefill_queue", None) or ())
-        pd_prealloc = len(getattr(self, "disagg_prealloc_queue", None) or ())
-        pd_transfer = len(getattr(self, "disagg_transfer_queue", None) or ())
+        pd_prefill = len(self.disagg_prefill_queue or ())
+        pd_prealloc = len(self.disagg_prealloc_queue or ())
+        pd_transfer = len(self.disagg_transfer_queue or ())
         has_pending = (
             has_pending
             or pd_prefill > 0
@@ -2104,12 +2118,11 @@ class Scheduler(
                 req.to_finish = FINISH_ABORT()
 
         # Abort PD disaggregation queues
-        prefill_q = getattr(self, "disagg_prefill_queue", None)
+        prefill_q = self.disagg_prefill_queue
         if prefill_q is not None:
             for entry in prefill_q.abort_matching(recv_req.rid, recv_req.abort_all):
                 logger.debug("Abort prefill queue request. rid=%s", entry.req_id)
-                if hasattr(entry.sender, "abort"):
-                    entry.sender.abort()
+                entry.sender.abort()
                 if entry.on_terminal is not None:
                     try:
                         entry.on_terminal()
@@ -2119,21 +2132,21 @@ class Scheduler(
                             entry.req_id,
                         )
 
-        prealloc_q = getattr(self, "disagg_prealloc_queue", None)
+        prealloc_q = self.disagg_prealloc_queue
         if prealloc_q is not None:
             for entry in prealloc_q.abort_matching(recv_req.rid, recv_req.abort_all):
                 logger.debug("Abort prealloc queue request. rid=%s", entry.req_id)
-                if entry.receiver is not None and hasattr(entry.receiver, "abort"):
+                if entry.receiver is not None:
                     entry.receiver.abort()
                 if entry.kv_indices is not None:
                     self._release_decode_kv_indices(entry.kv_indices)
                 self._abort_decode_request(entry.req, "abort_request")
 
-        transfer_q = getattr(self, "disagg_transfer_queue", None)
+        transfer_q = self.disagg_transfer_queue
         if transfer_q is not None:
             for entry in transfer_q.abort_matching(recv_req.rid, recv_req.abort_all):
                 logger.debug("Abort transfer queue request. rid=%s", entry.req_id)
-                if entry.receiver is not None and hasattr(entry.receiver, "abort"):
+                if entry.receiver is not None:
                     entry.receiver.abort()
                 if entry.kv_indices is not None:
                     self._release_decode_kv_indices(entry.kv_indices)
@@ -2193,7 +2206,7 @@ def run_scheduler_process(
     # Create a scheduler and run the event loop
     try:
         scheduler = Scheduler(server_args, port_args)
-        _install_disaggregation_wiring(scheduler, server_args)
+        install_disaggregation_wiring(scheduler, server_args)
         pipe_writer.send(
             {
                 "status": "ready",
@@ -2209,233 +2222,6 @@ def run_scheduler_process(
         logger.error("Scheduler hit an exception: %s", traceback)
         parent_process.send_signal(signal.SIGQUIT)
 
-
-def dispatch_scheduler_event_loop(scheduler, server_args) -> None:
-    """Choose and run the appropriate scheduler event loop."""
-
-    mode = getattr(server_args, "disaggregation_mode", "null")
-    if mode == "prefill":
-        scheduler.event_loop_normal_disagg_prefill()
-    elif mode == "decode":
-        scheduler.event_loop_normal_disagg_decode()
-    elif scheduler.enable_overlap:
-        scheduler.event_loop_overlap()
-    else:
-        scheduler.event_loop_normal()
-
-
-def _install_disaggregation_wiring(scheduler, server_args) -> None:
-    """Wire up PD attributes on the scheduler when
-    ``disaggregation_mode`` is set. No-op when mode == "null".
-    """
-
-    mode = getattr(server_args, "disaggregation_mode", "null")
-    if mode == "null":
-        return
-    dp_size = getattr(server_args, "dp_size", 1)
-    if dp_size > 1:
-        raise RuntimeError(
-            f"PD disaggregation does not yet support dp_size>1 "
-            f"(got dp_size={dp_size}). This will be supported in a "
-            f"future PR."
-        )
-    if server_args.disaggregation_bootstrap_url is None:
-        raise RuntimeError(
-            "disaggregation_mode != null requires bootstrap_url"
-        )
-    from sgl_jax.srt.disaggregation.bootstrap import (
-        BootstrapClient,
-        BootstrapServer,
-        HeartbeatDaemon,
-    )
-    from sgl_jax.srt.disaggregation.decode import (
-        DecodePreallocQueue,
-        DecodeTransferQueue,
-    )
-    from sgl_jax.srt.disaggregation.host_ip import resolve_host_ip
-    from sgl_jax.srt.disaggregation.jax_transfer.conn import (
-        JaxTransferKVManager,
-    )
-    from sgl_jax.srt.disaggregation.common.zmq_notifier import (
-        ZmqPullNotifier,
-    )
-    from sgl_jax.srt.disaggregation.jax_transfer.wrapper import (
-        get_or_create_wrapper,
-    )
-    from sgl_jax.srt.disaggregation.prefill import PrefillBootstrapQueue
-
-    local_host = resolve_host_ip(
-        getattr(server_args, "disaggregation_host_ip", None)
-    )
-    transfer_port = server_args.disaggregation_transfer_port
-    side_channel_port = server_args.disaggregation_side_channel_port
-    role = "prefill" if mode == "prefill" else "decode"
-
-    # Resolve the effective shared secret once.
-    from sgl_jax.srt.disaggregation.pd_auth import resolve_secret
-
-    shared_secret = resolve_secret(
-        getattr(server_args, "disaggregation_shared_secret", None)
-    )
-
-    # Optionally launch the bootstrap server in-process (single-host
-    # deployments). Controlled by env so the standalone-bootstrap
-    # deployment story stays simple.
-    if os.environ.get("DISAGG_LAUNCH_BOOTSTRAP", "") == "1":
-        bootstrap_host = local_host
-        bootstrap_port = server_args.disaggregation_bootstrap_port
-        scheduler.disagg_bootstrap_server = BootstrapServer(
-            host=bootstrap_host,
-            port=bootstrap_port,
-            shared_secret=shared_secret,
-        )
-        scheduler.disagg_bootstrap_server.start()
-        logger.info(
-            "embedded BootstrapServer started at %s:%d",
-            bootstrap_host, bootstrap_port,
-        )
-
-    wrapper = get_or_create_wrapper(
-        local_host,
-        transfer_port,
-        channel_number=getattr(
-            server_args, "disaggregation_channel_number", 1
-        ),
-    )
-    wrapper.start()
-    notifier = ZmqPullNotifier(
-        role, local_host, side_channel_port,
-        shared_secret=shared_secret,
-    )
-    notifier.start()
-    scheduler.disagg_kv_manager = JaxTransferKVManager(
-        wrapper,
-        notifier,
-        host_pool=None,
-        ack_timeout_seconds=getattr(
-            server_args, "disaggregation_ack_timeout_seconds", 60.0
-        ),
-        pull_timeout_seconds=getattr(
-            server_args, "disaggregation_pull_timeout_seconds", 30.0
-        ),
-        reaper_interval_seconds=getattr(
-            server_args,
-            "disaggregation_orphan_reaper_interval_seconds",
-            5.0,
-        ),
-    )
-    scheduler.disagg_kv_manager.start_reaper()
-    scheduler.disagg_use_d2h_staging = (
-        server_args.disaggregation_enable_d2h
-    )
-    if scheduler.disagg_use_d2h_staging:
-        # d2h staging requires a wired QueueHostKVPool.
-        raise RuntimeError(
-            "--disaggregation-enable-d2h=true requires a wired "
-            "QueueHostKVPool on the JaxTransferKVManager. Currently "
-            "host_pool=None, so producer_handoff() would crash. "
-            "Run with --no-disaggregation-enable-d2h."
-        )
-    scheduler.disagg_bootstrap_client = BootstrapClient(
-        server_args.disaggregation_bootstrap_url,
-        timeout_s=getattr(
-            server_args,
-            "disaggregation_bootstrap_timeout_seconds",
-            5.0,
-        ),
-        shared_secret=shared_secret,
-    )
-
-    if mode == "prefill":
-        scheduler.disagg_prefill_queue = PrefillBootstrapQueue()
-        bootstrap_key = f"{local_host}:{transfer_port}"
-        scheduler.disagg_bootstrap_client.register_prefill(
-            bootstrap_key=bootstrap_key,
-            host=local_host,
-            transfer_port=transfer_port,
-            side_channel_port=side_channel_port,
-            tp_rank=getattr(server_args, "node_rank", 0),
-            tp_size=getattr(server_args, "tp_size", 1),
-            system_dp_rank=getattr(server_args, "dp_rank", 0) or 0,
-        )
-        scheduler.disagg_heartbeat = HeartbeatDaemon(
-            scheduler.disagg_bootstrap_client, bootstrap_key
-        )
-        scheduler.disagg_heartbeat.start()
-        scheduler.disagg_bootstrap_key = bootstrap_key
-    else:
-        scheduler.disagg_prealloc_queue = DecodePreallocQueue()
-        scheduler.disagg_transfer_queue = DecodeTransferQueue()
-
-    # Install a SIGTERM handler for graceful shutdown.
-    scheduler.disagg_shutdown = _make_disagg_shutdown(scheduler, mode)
-    try:
-        import signal as _signal
-
-        prev = _signal.getsignal(_signal.SIGTERM)
-
-        def _handler(_signum, _frame, _prev=prev):
-            try:
-                scheduler.disagg_shutdown()
-            finally:
-                if callable(_prev) and _prev not in (
-                    _signal.SIG_DFL, _signal.SIG_IGN
-                ):
-                    _prev(_signum, _frame)
-
-        _signal.signal(_signal.SIGTERM, _handler)
-    except (ValueError, RuntimeError):
-        # Not in the main thread; the host process is expected to
-        # call scheduler.disagg_shutdown() itself.
-        logger.info(
-            "PD graceful shutdown handler skipped — install "
-            "scheduler.disagg_shutdown() yourself from the main "
-            "thread."
-        )
-
-
-def _make_disagg_shutdown(scheduler, mode: str):
-    """Closure that runs the graceful shutdown order:
-    unregister → stop heartbeat → drain transfers → stop reaper →
-    stop notifier. Idempotent."""
-
-    state = {"done": False}
-
-    def _shutdown():
-        if state["done"]:
-            return
-        state["done"] = True
-        if mode == "prefill":
-            try:
-                key = getattr(scheduler, "disagg_bootstrap_key", None)
-                if key is not None:
-                    scheduler.disagg_bootstrap_client.unregister_prefill(
-                        key
-                    )
-            except Exception:
-                logger.warning(
-                    "PD shutdown: unregister_prefill failed",
-                    exc_info=True,
-                )
-            with contextlib.suppress(Exception):
-                scheduler.disagg_heartbeat.stop()
-        try:
-            scheduler.disagg_kv_manager.graceful_shutdown(
-                drain_timeout_seconds=getattr(
-                    scheduler, "disagg_shutdown_drain_seconds", 30.0
-                )
-            )
-        except Exception:
-            logger.warning(
-                "PD shutdown: manager.graceful_shutdown failed",
-                exc_info=True,
-            )
-        with contextlib.suppress(Exception):
-            scheduler.disagg_kv_manager.zmq_notifier.stop()
-
-    return _shutdown
-
-
 def run_scheduler_loop_thread_after_create(
     server_args: ServerArgs,
     port_args: PortArgs,
@@ -2444,7 +2230,7 @@ def run_scheduler_loop_thread_after_create(
     # Create a scheduler and run the event loop
     try:
         scheduler = Scheduler(server_args, port_args)
-        _install_disaggregation_wiring(scheduler, server_args)
+        install_disaggregation_wiring(scheduler, server_args)
         scheduler_thread = threading.Thread(
             target=scheduler_loop_after_create,
             args=(server_args, scheduler),
