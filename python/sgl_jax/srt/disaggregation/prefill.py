@@ -95,13 +95,6 @@ class PrefillBootstrapQueue:
                     del self._entries[req_id]
         return terminal
 
-    def snapshot_states(self) -> dict[str, KVPoll]:
-        with self._lock:
-            return {
-                rid: entry.sender.poll()
-                for rid, entry in self._entries.items()
-            }
-
     def abort_matching(
         self, rid_prefix: str, abort_all: bool
     ) -> list[PrefillBookkeeping]:

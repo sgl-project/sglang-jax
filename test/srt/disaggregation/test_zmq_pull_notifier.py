@@ -95,7 +95,7 @@ def test_single_callback_fires(p_notifier, d_notifier):
     d_notifier.send_done(b"req-A", "127.0.0.1", p_notifier.port)
     assert event.wait(timeout=2.0)
     assert received == [b"req-A"]
-    assert p_notifier.pending_count() == 0
+    assert len(p_notifier._callbacks) == 0
 
 
 def test_single_callback_fires_with_shared_secret():
@@ -116,7 +116,7 @@ def test_single_callback_fires_with_shared_secret():
         d_notifier.send_done(b"req-auth", "127.0.0.1", p_notifier.port)
         assert event.wait(timeout=2.0)
         assert received == [b"req-auth"]
-        assert p_notifier.pending_count() == 0
+        assert len(p_notifier._callbacks) == 0
     finally:
         d_notifier.stop()
         p_notifier.stop()
@@ -176,7 +176,7 @@ def test_concurrent_32_acks(p_notifier, d_notifier):
 
     assert done.wait(timeout=5.0), f"only saw {len(seen)} / {n} acks"
     assert sorted(seen) == sorted(uuids)
-    assert p_notifier.pending_count() == 0
+    assert len(p_notifier._callbacks) == 0
 
 
 def test_mark_retired_dedup(p_notifier, d_notifier):

@@ -159,10 +159,6 @@ class ZmqPullNotifier:
         with self._callbacks_lock:
             return self._callbacks.pop(uuid, None)
 
-    def pending_count(self) -> int:
-        with self._callbacks_lock:
-            return len(self._callbacks)
-
     def mark_retired(self, uuid: bytes, *, state: str, reason: str) -> None:
         """Remember that ``uuid`` reached a terminal state.
 

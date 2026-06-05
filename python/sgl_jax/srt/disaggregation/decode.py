@@ -107,13 +107,6 @@ class DecodeTransferQueue:
                     del self._entries[rid]
         return out
 
-    def snapshot_states(self) -> dict[str, KVPoll]:
-        with self._lock:
-            return {
-                rid: e.receiver.poll() if e.receiver else KVPoll.BOOTSTRAPPING
-                for rid, e in self._entries.items()
-            }
-
     def abort_matching(
         self, rid_prefix: str, abort_all: bool
     ) -> list[DecodeBookkeeping]:
