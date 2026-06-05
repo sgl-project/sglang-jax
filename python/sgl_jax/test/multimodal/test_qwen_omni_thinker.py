@@ -59,7 +59,6 @@ class TestQwen3OmniMoeThinkerTextPrecision(unittest.TestCase):
                 "1200",
             ],
             env={
-                "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
                 "DUMP_LAST_LAYER_LOGITS_FILENAMES": cls.prefill_data + "," + cls.decode_data,
                 "SGLANG_HEALTH_CHECK_TIMEOUT": "1200",
             },

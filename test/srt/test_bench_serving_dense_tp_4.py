@@ -55,9 +55,6 @@ class TestBenchServingDenseTp4(CustomTestCase):
                 "--context-length",
                 "3072",
             ],
-            env={
-                "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
-            },
         )
 
     @classmethod

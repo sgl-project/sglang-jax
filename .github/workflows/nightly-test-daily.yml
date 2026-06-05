@@ -29,6 +29,7 @@ jobs:
     env:
       TZ: Asia/Shanghai
       JAX_COMPILATION_CACHE_DIR: /xla-cache
+      JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS: "1"
       SGLANG_JAX_MODEL_CACHE: /models/model_scope
     steps:
       - name: Checkout code
@@ -47,6 +48,7 @@ jobs:
     env:
       TZ: Asia/Shanghai
       JAX_COMPILATION_CACHE_DIR: /xla-cache
+      JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS: "1"
       SGLANG_JAX_MODEL_CACHE: /models/model_scope
     steps:
       - name: Checkout code
@@ -65,6 +67,7 @@ jobs:
     env:
       TZ: Asia/Shanghai
       JAX_COMPILATION_CACHE_DIR: /xla-cache
+      JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS: "1"
       SGLANG_JAX_MODEL_CACHE: /models/model_scope
     steps:
       - name: Checkout code
@@ -92,6 +95,7 @@ jobs:
     env:
       TZ: Asia/Shanghai
       JAX_COMPILATION_CACHE_DIR: /xla-cache
+      JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS: "1"
       SGLANG_JAX_MODEL_CACHE: /models/model_scope
     steps:
       - name: Checkout code

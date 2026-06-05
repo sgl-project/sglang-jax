@@ -68,9 +68,6 @@ class TestFeatures(CustomTestCase):
                 "--max-running-requests",
                 "64",
             ],
-            env={
-                "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
-            },
         )
 
     @classmethod
@@ -666,9 +663,6 @@ class TestNoOverlapSchedule(CustomTestCase):
                 "8192",
                 "--disable-overlap-schedule",
             ],
-            env={
-                "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
-            },
         )
 
     @classmethod
@@ -821,9 +815,6 @@ class TestCacheMissesTP4(CustomTestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             device="tpu",
             other_args=cache_misses_common_args + ["--tp-size", "4"],
-            env={
-                "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
-            },
         )
 
     @classmethod

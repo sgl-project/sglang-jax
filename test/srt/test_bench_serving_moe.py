@@ -53,9 +53,6 @@ class TestBenchServingMOE(CustomTestCase):
                 "256",
                 "--disable-radix-cache",
             ],
-            env={
-                "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
-            },
         )
 
     @classmethod

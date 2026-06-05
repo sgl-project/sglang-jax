@@ -31,9 +31,6 @@ class TestWan2_1Model(CustomTestCase):
                 "--multimodal",
                 "--disable-precompile",
             ],
-            env={
-                "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
-            },
             multimodal=True,
         )
         data = {
@@ -68,9 +65,6 @@ class TestWan2_1Model(CustomTestCase):
                 "--multimodal",
                 "--disable-precompile",
             ],
-            env={
-                "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
-            },
             multimodal=True,
         )
         data = {"prompt": "A curious raccoon", "size": "480*832", "num_frames": 5}

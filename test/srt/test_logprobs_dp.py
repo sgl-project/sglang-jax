@@ -1,12 +1,8 @@
 import math
-import os
 import unittest
 
 from sgl_jax.srt.entrypoints.engine import Engine
 from sgl_jax.test.test_utils import DEEPSEEK_R1_DISTILL_QWEN_1_5B
-
-os.environ["JAX_COMPILATION_CACHE_DIR"] = "/tmp/jit_cache"
-
 
 print("Running on Google TPU")
 # tp_size=4 / dp_size=2 -> [dp, tp//dp] = [2, 2] mesh = 4 devices (the TPU runner
