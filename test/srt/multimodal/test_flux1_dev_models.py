@@ -27,9 +27,6 @@ class TestFLUX1_DEV(CustomTestCase):
                 "3",
                 "--multimodal",
             ],
-            env={
-                "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
-            },
             multimodal=True,
         )
         data = {

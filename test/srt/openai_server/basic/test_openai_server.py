@@ -58,9 +58,6 @@ class TestOpenAIServer(CustomTestCase):
                 "--page-size",
                 "64",
             ],
-            env={
-                "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
-            },
         )
         cls.base_url += "/v1"
         cls.tokenizer = get_tokenizer(DEFAULT_MODEL_NAME_FOR_TEST, trust_remote_code=True)

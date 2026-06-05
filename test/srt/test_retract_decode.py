@@ -70,7 +70,6 @@ class _BaseRetractDecode(CustomTestCase):
             env={
                 "SGLANG_TEST_RETRACT": "1",
                 "SGLANG_TEST_RETRACT_NO_PREFILL_BS": "6",
-                "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
             },
         )
 

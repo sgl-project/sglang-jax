@@ -37,9 +37,6 @@ class TestAlignLoRAAccuracy(CustomTestCase):
     def setUpClass(cls):
         cls.model_path = QWEN3_4B
         cls.lora_target_modules = ["all"]
-        import os
-
-        os.environ["JAX_COMPILATION_CACHE_DIR"] = "/tmp/jit_cache"
         cls.single_prompt_prefill_logits_cpu_dump_filename = (
             f"./lora_data/sglangjax/single_prompt_prefill_logits_cpu.txt"
         )

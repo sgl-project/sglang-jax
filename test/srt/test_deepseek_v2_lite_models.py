@@ -52,9 +52,6 @@ class TestDeepSeekCoderV2LiteInstruct(CustomTestCase):
                 "--context-length",
                 "8192",
             ],
-            env={
-                "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
-            },
         )
 
     @classmethod

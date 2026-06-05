@@ -49,9 +49,6 @@ def setup_class(cls, backend):
             "--grammar-backend",
             backend,
         ],
-        env={
-            "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
-        },
     )
     cls.client = openai.Client(api_key="EMPTY", base_url=f"{cls.base_url}/v1")
 

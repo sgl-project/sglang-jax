@@ -53,6 +53,7 @@ jobs:
             export USE_DEVICE_TYPE=cpu
           else
             export JAX_COMPILATION_CACHE_DIR=/xla-cache
+            export JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS=1
             export SGLANG_JAX_MODEL_CACHE=/models/model_scope
           fi
           bash scripts/killall_sglang.sh 2>/dev/null || true
