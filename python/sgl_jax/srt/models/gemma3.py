@@ -57,6 +57,28 @@ def _get_rope_theta(config: PretrainedConfig, layer_type: str) -> float:
     return getattr(config, "rope_theta", 10000.0)
 
 
+def _get_rope_linear_scaling_factor(config: PretrainedConfig, layer_type: str) -> float:
+    # HF Gemma3 uses linear scaling only for global RoPE. Local/sliding RoPE is
+    # created from a copied config with rope_scaling reset to default.
+    if layer_type == "sliding_attention":
+        return 1.0
+
+    rope_scaling = getattr(config, "rope_scaling", None)
+    if not isinstance(rope_scaling, dict):
+        return 1.0
+
+    rope_type = rope_scaling.get("rope_type", rope_scaling.get("type", "default"))
+    if rope_type in (None, "default"):
+        return 1.0
+    if rope_type == "linear":
+        return float(rope_scaling.get("factor", 1.0))
+
+    raise ValueError(
+        "Gemma3 only supports default and linear rope_scaling, "
+        f"got {rope_type!r}."
+    )
+
+
 def _get_forward_batch_input_embeds(forward_batch: ForwardBatch) -> jax.Array | None:
     forward_mode = getattr(forward_batch, "forward_mode", None)
     is_extend = getattr(forward_mode, "is_extend_or_draft_extend_or_mixed", None)
@@ -185,6 +207,9 @@ class Gemma3Attention(nnx.Module):
             base=_get_rope_theta(config, self.layer_type),
             is_neox_style=getattr(config, "rope_is_neox_style", True),
             dtype=dtype,
+            linear_scaling_factor=_get_rope_linear_scaling_factor(
+                config, self.layer_type
+            ),
         )
         self.attn = RadixAttention(
             num_heads=self.num_heads,

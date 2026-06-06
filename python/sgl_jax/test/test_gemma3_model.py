@@ -11,6 +11,7 @@ from sgl_jax.srt.models.gemma3 import (
     Gemma3ForConditionalGeneration,
     _get_forward_batch_input_embeds,
     _get_layer_type,
+    _get_rope_linear_scaling_factor,
     _get_rope_theta,
     get_attention_sliding_window_size,
 )
@@ -67,6 +68,7 @@ def _tiny_gemma3_config(**overrides):
             "sliding_attention": {"rope_theta": 10000.0},
             "full_attention": {"rope_theta": 1000000.0},
         },
+        "rope_scaling": {"rope_type": "linear", "factor": 8.0},
         "tie_word_embeddings": True,
     }
     values.update(overrides)
@@ -112,6 +114,27 @@ def test_rope_and_sliding_window_helpers_use_gemma3_conventions():
     assert get_attention_sliding_window_size(config) == 8
     assert _get_rope_theta(config, "sliding_attention") == 10000.0
     assert _get_rope_theta(config, "full_attention") == 1000000.0
+    assert _get_rope_linear_scaling_factor(config, "sliding_attention") == 1.0
+    assert _get_rope_linear_scaling_factor(config, "full_attention") == 8.0
+
+
+def test_rope_scaling_is_applied_only_to_global_rope():
+    config = _tiny_gemma3_config()
+    model = _build_model(config)
+
+    sliding_inv_freq = model.model.layers[0].self_attn.rotary_emb._inv_freq_np
+    full_inv_freq = model.model.layers[1].self_attn.rotary_emb._inv_freq_np
+
+    np.testing.assert_allclose(
+        sliding_inv_freq[1],
+        1.0 / (10000.0 ** (2.0 / config.head_dim)),
+        rtol=1e-6,
+    )
+    np.testing.assert_allclose(
+        full_inv_freq[1],
+        (1.0 / (1000000.0 ** (2.0 / config.head_dim))) / 8.0,
+        rtol=1e-6,
+    )
 
 
 def test_layer_type_falls_back_to_sliding_window_pattern():
