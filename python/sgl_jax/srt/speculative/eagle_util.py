@@ -538,7 +538,7 @@ class EagleDraftInput:
             bs_r = len(info.seq_lens)
             seq_r = np.asarray(info.seq_lens)
             required_write_r = seq_r + alloc_len_per_decode - 1
-            reserve_r = np.asarray(self.allocate_lens)[flat_off : flat_off + bs_r]
+            reserve_r = np.asarray([req.kv_allocated_len for req in info.reqs], dtype=np.int32)
             old_write_r = np.asarray(self.verify_write_lens)[flat_off : flat_off + bs_r]
             if np.any(required_write_r > reserve_r):
                 return None
@@ -714,6 +714,13 @@ class EagleDraftInput:
             self.allocate_lens.shape[0] == bs
         ), f" {self.allocate_lens.shape[0]=} but batch_size is {bs} "
         page_size = schedule_batch.token_to_kv_pool_allocator.page_size
+        alloc_len_per_decode = self.get_spec_adjust_token_coefficient()
+        double_alloc = alloc_len_per_decode + alloc_len_per_decode
+        # Upstream EAGLE v2 keeps a 2x reserve for the next decode. The fused
+        # same-batch chain path also peeks the following verify suffix before
+        # running prepare_for_decode again, so preserve the older 4x slack to
+        # avoid falling back to the host prepare path.
+        chain_reserve_alloc = double_alloc + double_alloc
         new_alloc_chunks = []
         new_verify_write_chunks = []
         flat_off = 0
@@ -722,9 +729,17 @@ class EagleDraftInput:
                 continue
             bs_r = len(info.seq_lens)
             seq_r = np.asarray(info.seq_lens)
-            required_write_r = seq_r + self.ALLOC_LEN_PER_DECODE - 1
-            reserve_required_r = seq_r + 4 * self.ALLOC_LEN_PER_DECODE - 1
-            old_reserve_r = self.allocate_lens[flat_off : flat_off + bs_r]
+            required_write_r = seq_r + alloc_len_per_decode - 1
+            old_reserve_r = np.asarray([req.kv_allocated_len for req in info.reqs], dtype=np.int32)
+            old_mapped_r = old_reserve_r
+            reserve_required_r = np.asarray(
+                [
+                    max(req.kv_allocated_len, req.kv_committed_len + chain_reserve_alloc)
+                    for req in info.reqs
+                ],
+                dtype=np.int32,
+            )
+            reserve_required_r = np.maximum(reserve_required_r, required_write_r)
             if self.verify_write_lens is not None:
                 old_write_r = np.asarray(self.verify_write_lens)[flat_off : flat_off + bs_r]
             else:
@@ -734,7 +749,8 @@ class EagleDraftInput:
                 reserve_r = np.maximum(reserve_r, old_reserve_r)
             else:
                 reserve_r = reserve_required_r
-            ext_r = int((reserve_r - old_reserve_r).sum())
+            mapped_r = np.maximum(reserve_r, old_mapped_r)
+            ext_r = int((mapped_r - old_mapped_r).sum())
             if ext_r > 0:
                 if page_size == 1:
                     alloc_r = alloc_token_slots(schedule_batch.tree_cache, ext_r, dp_rank=dp_rank)
@@ -742,12 +758,12 @@ class EagleDraftInput:
                     last_loc_r = get_last_loc(
                         schedule_batch.req_to_token_pool.req_to_token,
                         info.req_pool_indices,
-                        old_reserve_r,
+                        old_mapped_r,
                     )
                     alloc_r = alloc_paged_token_slots_extend(
                         schedule_batch.tree_cache,
-                        old_reserve_r,
-                        reserve_r,
+                        old_mapped_r,
+                        mapped_r,
                         last_loc_r,
                         ext_r,
                         dp_rank=dp_rank,
@@ -755,8 +771,8 @@ class EagleDraftInput:
                 assign_req_to_token_pool(
                     info.req_pool_indices,
                     schedule_batch.req_to_token_pool,
-                    old_reserve_r,
-                    reserve_r,
+                    old_mapped_r,
+                    mapped_r,
                     alloc_r,
                 )
             loc_chunks = [
@@ -773,8 +789,17 @@ class EagleDraftInput:
                 if loc_chunks
                 else np.empty(0, dtype=np.int32)
             )
-            new_alloc_chunks.append(reserve_r)
+            assert (ocl_r >= 0).all(), (
+                "spec decode target KV slots were not mapped: "
+                f"{ocl_r[ocl_r < 0][:16]=}, {old_write_r=}, {required_write_r=}, "
+                f"{old_mapped_r=}, {mapped_r=}, {reserve_r=}"
+            )
+            new_alloc_chunks.append(required_write_r.astype(np.int32, copy=False))
             new_verify_write_chunks.append(required_write_r)
+            for req, mapped_len in zip(info.reqs, mapped_r, strict=True):
+                req.kv_allocated_len = int(mapped_len)
+                req.decode_batch_idx += 1
+                req.kv_committed_len += 1
             # Per-rank store (matches nospec extend); _get_spec_decode_mwb_dp
             # DP-segments these so each rank's P("data") shard = its own slots.
             info.out_cache_loc = np.asarray(ocl_r, dtype=np.int32)
@@ -822,15 +847,35 @@ class EagleDraftInput:
         Converting to numpy first and re-uploading at bucket-padded size in
         _scatter_spec_info_to_dp_slots eliminates those persistent cache misses.
         """
-        device_fields = ("topk_p", "topk_index", "hidden_states", "verified_id", "accept_length")
-        to_copy = []
-        for f in device_fields:
-            v = getattr(self, f, None)
+
+        def _to_host_array(v):
+            if isinstance(v, jax.Array):
+                if not getattr(v, "is_fully_addressable", True):
+                    from jax.experimental.multihost_utils import process_allgather
+
+                    return np.asarray(process_allgather(v, tiled=True))
+                jax.copy_to_host_async(v)
+                return np.asarray(jax.device_get(v))
             if v is not None and hasattr(v, "copy_to_host_async"):
                 jax.copy_to_host_async(v)
-                to_copy.append(f)
-        for f in to_copy:
-            setattr(self, f, np.asarray(getattr(self, f)))
+                return np.asarray(jax.device_get(v))
+            return v
+
+        per_req_fields = (
+            "topk_p",
+            "topk_index",
+            "hidden_states",
+            "verified_id",
+            "accept_length",
+            "accept_length_cpu",
+            "allocate_lens",
+            "verify_write_lens",
+            "new_seq_lens",
+        )
+        for f in per_req_fields:
+            v = getattr(self, f, None)
+            if v is not None:
+                setattr(self, f, _to_host_array(v))
 
     def filter_batch(self, new_indices: np.ndarray, has_been_filtered: bool = True):
         new_indices = np.asarray(new_indices)
@@ -859,13 +904,22 @@ class EagleDraftInput:
                 self.new_seq_lens = np.asarray(self.new_seq_lens)[new_indices]
 
     def merge_batch(self, spec_info: EagleDraftInput):
+        def _verify_write_lens_or_allocate_lens(draft_input: EagleDraftInput):
+            verify_write_lens = getattr(draft_input, "verify_write_lens", None)
+            if verify_write_lens is not None:
+                return verify_write_lens
+            allocate_lens = getattr(draft_input, "allocate_lens", None)
+            if allocate_lens is None:
+                return None
+            return np.asarray(allocate_lens, dtype=np.int32)
+
         if self.hidden_states is None:
             self.hidden_states = spec_info.hidden_states
             self.verified_id = spec_info.verified_id
             self.topk_p = spec_info.topk_p
             self.topk_index = spec_info.topk_index
             self.allocate_lens = spec_info.allocate_lens
-            self.verify_write_lens = spec_info.verify_write_lens
+            self.verify_write_lens = _verify_write_lens_or_allocate_lens(spec_info)
             self.new_seq_lens = spec_info.new_seq_lens
             return
         if spec_info.hidden_states is None:
@@ -877,11 +931,13 @@ class EagleDraftInput:
         self.topk_p = np.concatenate([self.topk_p, spec_info.topk_p])
         self.topk_index = np.concatenate([self.topk_index, spec_info.topk_index])
         self.allocate_lens = np.concatenate([self.allocate_lens, spec_info.allocate_lens])
-        if self.verify_write_lens is not None and spec_info.verify_write_lens is not None:
+        self_verify_write_lens = _verify_write_lens_or_allocate_lens(self)
+        spec_verify_write_lens = _verify_write_lens_or_allocate_lens(spec_info)
+        if self_verify_write_lens is not None and spec_verify_write_lens is not None:
             self.verify_write_lens = np.concatenate(
                 [
-                    np.asarray(self.verify_write_lens),
-                    np.asarray(spec_info.verify_write_lens),
+                    np.asarray(self_verify_write_lens),
+                    np.asarray(spec_verify_write_lens),
                 ]
             )
         else:

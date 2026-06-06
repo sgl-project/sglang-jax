@@ -229,6 +229,7 @@ class EagleDraftWorker(BaseDraftWorker):
             num_tokens_per_batch=np.asarray(1, dtype=jnp.int32),
             num_tokens_for_logprob_per_batch=np.asarray(1, dtype=jnp.int32),
             allocate_lens=model_worker_batch.seq_lens,
+            verify_write_lens=model_worker_batch.seq_lens,
         )
         model_worker_batch.return_hidden_states = False
         model_worker_batch.spec_info_padded.prepare_for_extend_after_target_prefill(
@@ -531,6 +532,19 @@ class EagleDraftWorker(BaseDraftWorker):
         ]
         optional = ["extend_prefix_lens", "extend_seq_lens"]
 
+        def _to_host_array(arr):
+            if isinstance(arr, jax.Array):
+                if not getattr(arr, "is_fully_addressable", True):
+                    from jax.experimental.multihost_utils import process_allgather
+
+                    return np.asarray(process_allgather(arr, tiled=True))
+                jax.copy_to_host_async(arr)
+                return np.asarray(jax.device_get(arr))
+            if hasattr(arr, "copy_to_host_async"):
+                arr.copy_to_host_async()
+                return np.asarray(jax.device_get(arr))
+            return np.asarray(arr)
+
         for name in fields:
             arr = getattr(mwb, name)
             if hasattr(arr, "copy_to_host_async"):
@@ -542,11 +556,11 @@ class EagleDraftWorker(BaseDraftWorker):
 
         for name in fields:
             arr = getattr(mwb, name)
-            setattr(mwb, name, np.asarray(arr))
+            setattr(mwb, name, _to_host_array(arr))
         for name in optional:
             arr = getattr(mwb, name)
             if arr is not None:
-                setattr(mwb, name, np.asarray(arr))
+                setattr(mwb, name, _to_host_array(arr))
 
     def get_padding_bs(self, real_bs: int) -> int:
         self.precompile_bs_paddings.sort()

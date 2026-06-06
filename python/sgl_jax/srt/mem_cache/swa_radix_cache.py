@@ -438,7 +438,12 @@ class SWARadixCache(BasePrefixCache):
                     kv_indices[old_prefix_len:page_aligned_len], dp_rank=dp_rank
                 )
 
-        self.dec_lock_ref(req.last_node, req.swa_uuid_for_lock)
+        self.dec_lock_ref(
+            req.last_node,
+            req.swa_uuid_for_lock,
+            skip_swa=req.swa_prefix_lock_released,
+        )
+        req.swa_prefix_lock_released = False
 
     def cache_unfinished_req(self, req: Req, chunked=False) -> None:
         """Cache request when it is unfinished."""
@@ -481,7 +486,12 @@ class SWARadixCache(BasePrefixCache):
             new_indices[old_prefix_len:],
         )
 
-        self.dec_lock_ref(req.last_node, req.swa_uuid_for_lock)
+        self.dec_lock_ref(
+            req.last_node,
+            req.swa_uuid_for_lock,
+            skip_swa=req.swa_prefix_lock_released,
+        )
+        req.swa_prefix_lock_released = False
         swa_uuid_for_lock = self.inc_lock_ref(new_last_node)
 
         if self.page_size != 1:
@@ -649,7 +659,12 @@ class SWARadixCache(BasePrefixCache):
             node = node.parent
         return swa_uuid_for_lock
 
-    def dec_lock_ref(self, node: TreeNode, swa_uuid_for_lock: int | None = None):
+    def dec_lock_ref(
+        self,
+        node: TreeNode,
+        swa_uuid_for_lock: int | None = None,
+        skip_swa: bool = False,
+    ):
         """
         Decrement the lock reference count for the node.
         It unlocks the full_lock_ref for nodes between the [last node, root), exclusive.
@@ -659,7 +674,7 @@ class SWARadixCache(BasePrefixCache):
         if self.disable:
             return
 
-        dec_lock_swa = True
+        dec_lock_swa = not skip_swa
         while node != self.root_node:
             # Get dp_rank from node's key
             node_dp_rank = node.key.dp_rank if node.key and node.key.dp_rank is not None else 0
@@ -686,6 +701,39 @@ class SWARadixCache(BasePrefixCache):
                 if swa_uuid_for_lock and node.swa_uuid == swa_uuid_for_lock:
                     dec_lock_swa = False
 
+            node = node.parent
+
+    def dec_swa_lock_only(self, node: TreeNode, swa_uuid_for_lock: int | None = None):
+        """Release only the SWA side of a radix-tree lock.
+
+        The full-cache lock remains protected. This lets long-running decode
+        requests release prefill-time SWA protection after they move beyond the
+        sliding window while still preserving full-cache prefix ownership.
+        """
+        if self.disable:
+            return
+
+        while node != self.root_node:
+            node_dp_rank = node.key.dp_rank if node.key and node.key.dp_rank is not None else 0
+
+            assert not node.swa_tombstone, f"dec_swa_lock_only on swa_tombstone node, {node.id=}"
+            assert (
+                node.swa_lock_ref > 0
+            ), f"dec_swa_lock_only on node with {node.swa_lock_ref=}, {node.id=}"
+
+            if node.swa_lock_ref == 1:
+                eff = self._swa_eff_len(node.value, dp_rank=node_dp_rank)
+                self.swa_protected_size_[node_dp_rank] -= eff
+                if len(node.children) == 0:
+                    self.token_to_kv_pool_allocator.free_swa(node.value, dp_rank=node_dp_rank)
+                    self.swa_lru_list.remove_node(node)
+                    node.swa_tombstone = True
+                else:
+                    self.swa_evictable_size_[node_dp_rank] += eff
+            node.swa_lock_ref -= 1
+
+            if swa_uuid_for_lock and node.swa_uuid == swa_uuid_for_lock:
+                break
             node = node.parent
 
     def sanity_check(self):

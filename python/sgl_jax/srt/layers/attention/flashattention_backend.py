@@ -387,6 +387,30 @@ class FlashAttention(AttentionBackend):
                 target_verify_seq_lens_device.astype(jnp.int32),
                 sharding,
             )
+            cache_key = (
+                batch.forward_mode,
+                "dynamic_seq_lens",
+                dp_size,
+                per_dp_bs,
+                self.page_size,
+                _metadata_cache_part(cu_q_lens),
+                _metadata_cache_part(cu_kv_lens),
+                _metadata_cache_part(page_indices),
+                _metadata_cache_part(distribution),
+                _metadata_cache_part(swa_page_indices),
+            )
+            cache_id = id(self)
+            cached = _TARGET_VERIFY_STATIC_METADATA_CACHE.get(cache_id)
+            if cached is not None and cached[0] == cache_key:
+                (
+                    metadata.cu_q_lens,
+                    metadata.cu_kv_lens,
+                    metadata.page_indices,
+                    metadata.distribution,
+                    metadata.swa_page_indices,
+                ) = cached[1]
+                metadata.seq_lens = target_verify_seq_lens_device
+                return metadata
             (
                 metadata.cu_q_lens,
                 metadata.cu_kv_lens,
@@ -402,6 +426,16 @@ class FlashAttention(AttentionBackend):
                     swa_page_indices,
                     sharding=sharding,
                 )
+            _TARGET_VERIFY_STATIC_METADATA_CACHE[cache_id] = (
+                cache_key,
+                (
+                    metadata.cu_q_lens,
+                    metadata.cu_kv_lens,
+                    metadata.page_indices,
+                    metadata.distribution,
+                    metadata.swa_page_indices,
+                ),
+            )
             return metadata
 
         cache_key = None
@@ -496,8 +530,9 @@ class FlashAttention(AttentionBackend):
         # must be written DP-segmented so the P("data") shard gives each rank
         # its own draft page_indices (otherwise rank>0 reads page 0 → accept~1).
         per_dp_src_pages = full_size // dp_size
-        output_page_count = full_size
-        per_dp_dst_pages = output_page_count // dp_size
+        target_padding = 16384
+        assert target_padding % dp_size == 0
+        per_dp_dst_pages = target_padding // dp_size
         rank_of_req = (sel // per_dp_bs).astype(np.int64)
 
         def _dp_starts(pages, per_dp_base):
@@ -535,7 +570,7 @@ class FlashAttention(AttentionBackend):
             write_indices = np.repeat(dst_starts, repeats) + local_off
             gathered_locs = original_selected_cache_locs[gather_indices]
 
-            result_locs = np.zeros(output_page_count, dtype=original_selected_cache_locs.dtype)
+            result_locs = np.zeros(target_padding, dtype=original_selected_cache_locs.dtype)
             result_locs[write_indices] = gathered_locs
             page_indices.append((result_locs // self.page_size).astype(np.int32))
 

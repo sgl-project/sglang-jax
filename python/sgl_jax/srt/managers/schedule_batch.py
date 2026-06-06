@@ -62,6 +62,23 @@ if TYPE_CHECKING:
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
 
+GLOBAL_SERVER_ARGS_KEYS = [
+    "device",
+    "chunked_prefill_size",
+    "disable_radix_cache",
+    "speculative_accept_threshold_single",
+    "speculative_accept_threshold_acc",
+    "enable_deterministic_sampling",
+]
+
+PADDING_BUCKETS = [1 << i for i in range(6, 21)]
+
+# Put some global args for easy access
+global_server_args_dict = {k: getattr(ServerArgs, k) for k in GLOBAL_SERVER_ARGS_KEYS}
+
+logger = logging.getLogger(__name__)
+
+
 def release_spec_decode_kv_cache(
     req: Req,
     tree_cache: BasePrefixCache,
@@ -72,9 +89,12 @@ def release_spec_decode_kv_cache(
     if req.req_pool_idx is None:
         return
 
+    allocated_before = int(req.kv_allocated_len)
     cur_allocate_len = None
     if spec_info is not None and spec_info.allocate_lens is not None:
         cur_allocate_len = int(np.asarray(spec_info.allocate_lens)[local_idx])
+    if cur_allocate_len is None or cur_allocate_len < allocated_before:
+        cur_allocate_len = allocated_before
 
     actual_token_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
     if cur_allocate_len is not None and cur_allocate_len > actual_token_len:
@@ -92,29 +112,11 @@ def release_spec_decode_kv_cache(
                 dp_rank = req.dp_rank if req.dp_rank is not None else 0
                 tree_cache.token_to_kv_pool_allocator.free(kv_indices, dp_rank=dp_rank)
 
-    # Spec decode allocates through EagleDraftInput.prepare_for_decode, so Req's
-    # generic KV accounting can lag behind the draft allocation. Reset it to the
-    # actual committed length before handing the request to the common release path.
+    # Spec decode can allocate ahead of the finally accepted length. Normalize
+    # Req accounting before handing the committed prefix to the shared release path.
     req.kv_committed_len = actual_token_len
     req.kv_allocated_len = actual_token_len
     release_kv_cache(req, tree_cache)
-
-
-GLOBAL_SERVER_ARGS_KEYS = [
-    "device",
-    "chunked_prefill_size",
-    "disable_radix_cache",
-    "speculative_accept_threshold_single",
-    "speculative_accept_threshold_acc",
-    "enable_deterministic_sampling",
-]
-
-PADDING_BUCKETS = [1 << i for i in range(6, 21)]
-
-# Put some global args for easy access
-global_server_args_dict = {k: getattr(ServerArgs, k) for k in GLOBAL_SERVER_ARGS_KEYS}
-
-logger = logging.getLogger(__name__)
 
 
 class BaseFinishReason:
@@ -294,6 +296,7 @@ class Req:
         self.last_host_node: Any = None
         # The node to lock until for swa radix tree lock ref
         self.swa_uuid_for_lock: int | None = None
+        self.swa_prefix_lock_released: bool = False
         # SWA eviction: sequence positions [0, swa_evicted_seqlen) have had
         # their SWA pool slots freed (no longer in the sliding window).
         self.swa_evicted_seqlen: int = 0
@@ -582,6 +585,7 @@ class Req:
         self.prefix_indices = []
         self.last_node = None
         self.swa_uuid_for_lock = None
+        self.swa_prefix_lock_released = False
         self.extend_input_len = 0
         self.is_retracted = True
         self.input_token_logprobs = None
@@ -1396,6 +1400,7 @@ class ScheduleBatch:
             multiplier = float(os.environ.get("SGL_JAX_SWA_EVICTION_INTERVAL_MULTIPLIER", "1.0"))
             evict_interval = max(page_size, int(sliding_window_size * multiplier))
             evict_interval = (evict_interval // page_size) * page_size
+            release_leaf_lock = hasattr(self.tree_cache, "dec_swa_lock_only")
             for dp_rank, info in enumerate(self.reqs_info):
                 if not info.reqs:
                     continue
@@ -1417,6 +1422,18 @@ class ScheduleBatch:
                             self._evict_swa(
                                 req, req.seqlen - 1, sliding_window_size, page_size, dp_rank
                             )
+                        if (
+                            release_leaf_lock
+                            and not req.swa_prefix_lock_released
+                            and req.swa_uuid_for_lock is not None
+                            and req.last_node is not None
+                            and req.decode_batch_idx >= sliding_window_size
+                        ):
+                            self.tree_cache.dec_swa_lock_only(
+                                req.last_node,
+                                req.swa_uuid_for_lock,
+                            )
+                            req.swa_prefix_lock_released = True
             return
 
         if self.forward_mode is None or not self.forward_mode.is_extend():
@@ -2192,10 +2209,7 @@ class ScheduleBatch:
             for i in self.reqs_info
         ]
         # Pad each rank's forward out_cache_loc to per_dp_bs*draft_token_num so
-        # the verify JIT input shape matches the precompiled bucket. The
-        # per-rank chunks can be longer because prepare_for_decode allocates
-        # full request growth; req_to_token_pool already records those slots.
-        # Verify only forwards draft_token_num tokens per padded slot.
+        # the verify JIT input shape matches the precompiled bucket.
         target_per_rank_ocl = per_dp_bs * draft_token_num
         out_cache_loc = (
             np.concatenate(
@@ -2984,6 +2998,7 @@ class ModelWorkerBatch:
     # For padding
     real_bs: int
     real_bs_per_dp: list[int]
+    is_precompile_dummy: bool = False
 
     # Maps "original request order" (DP-rank-then-req flat order) to the
     # DP-interleaved padded slot in the global batch. Host code applies

@@ -115,6 +115,7 @@ def release_kv_cache(
     req,
     tree_cache: BasePrefixCache,
     is_insert: bool = True,
+    allow_overallocated: bool = False,
 ) -> None:
     """Single entry point for releasing a request's KV cache (sglang #12224)."""
     if req.req_pool_idx is None:
@@ -125,9 +126,10 @@ def release_kv_cache(
     tree_cache.cache_finished_req(req, is_insert=is_insert)
 
     start_p, end_p = req.pop_overallocated_kv_cache()
-    assert (
-        start_p == end_p
-    ), f"Unexpected overallocated KV cache, {req.kv_committed_len=}, {req.kv_allocated_len=}"
+    if not allow_overallocated:
+        assert (
+            start_p == end_p
+        ), f"Unexpected overallocated KV cache, {req.kv_committed_len=}, {req.kv_allocated_len=}"
 
     page_size = tree_cache.page_size
     if page_size > 1:

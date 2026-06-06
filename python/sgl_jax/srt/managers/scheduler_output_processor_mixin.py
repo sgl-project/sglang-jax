@@ -50,6 +50,20 @@ class SchedulerOutputProcessorMixin:
         )
         req.routed_experts = np.transpose(tmp, (1, 0, 2))
 
+    @staticmethod
+    def _advance_spec_decode_req_kv_accounting(
+        req: Req,
+        accepted_len: int,
+        finished: bool = False,
+    ) -> None:
+        # EagleDraftInput.prepare_for_decode pre-claims the bonus slot. Resolve
+        # the remaining accepted draft tokens here; decode_batch_idx and
+        # kv_allocated_len are advanced during allocation, not result handling.
+        if finished:
+            req.kv_committed_len -= 1
+        else:
+            req.kv_committed_len += max(int(accepted_len) - 1, 0)
+
     def process_batch_result_prefill(
         self: Scheduler,
         batch: ScheduleBatch,
@@ -148,6 +162,14 @@ class SchedulerOutputProcessorMixin:
 
                 if req.is_chunked <= 0:
                     req.output_ids.append(next_token_id)
+                    if (
+                        self.enable_overlap
+                        and batch.spec_algorithm is not None
+                        and not batch.spec_algorithm.is_none()
+                        and info.seq_lens is not None
+                    ):
+                        info.seq_lens[i] += 1
+                        info.seq_lens_sum += 1
                     req.check_finished()
                     if req.finished():
                         self.maybe_collect_routed_experts(req)
@@ -424,6 +446,10 @@ class SchedulerOutputProcessorMixin:
                 elif self.spec_algorithm.is_eagle():
                     req.output_ids.extend([int(t) for t in next_token_id])
                     new_accepted_len = len(next_token_id)
+                    self._advance_spec_decode_req_kv_accounting(
+                        req,
+                        accepted_len=new_accepted_len,
+                    )
 
                 req.check_finished(new_accepted_len)
 

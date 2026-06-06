@@ -95,6 +95,7 @@ TEST_RETRACT_INTERVAL = int(os.environ.get("SGLANG_TEST_RETRACT_INTERVAL", "3"))
 TEST_RETRACT_NO_PREFILL_BS = int(os.environ.get("SGLANG_TEST_RETRACT_NO_PREFILL_BS", str(2**31)))
 RECORD_STEP_TIME = get_bool_env_var("SGLANG_RECORD_STEP_TIME")
 GRAMMAR_TIMEOUT = float(os.environ.get("SGLANG_GRAMMAR_TIMEOUT", 300))
+SPEC_DECODE_MONOLITHIC = os.environ.get("SGL_JAX_SPEC_DECODE_MONOLITHIC") == "1"
 
 
 class SyncError(Exception):
@@ -2203,6 +2204,10 @@ class Scheduler(
         chaining before scheduler catch-up is only safe when no request can finish
         or change launch-visible layout before the next verify.
         """
+        if os.environ.get("SGL_JAX_DISABLE_SAME_BATCH_SPEC_CHAIN") == "1":
+            return False
+        if os.environ.get("SGL_JAX_ENABLE_SAME_BATCH_SPEC_CHAIN") != "1":
+            return False
         if not getattr(self, "enable_overlap", False):
             return False
         spec_algorithm = getattr(self, "spec_algorithm", None)
@@ -2404,6 +2409,7 @@ class Scheduler(
                 and getattr(self.draft_worker, "_can_use_fused_spec_decode", False)
                 and self.draft_worker._has_fused_greedy_draft_state(model_worker_batch)
                 and model_worker_batch.sampling_info.is_all_greedy
+                and not SPEC_DECODE_MONOLITHIC
             )
             if use_split_verify_phase and self.enable_overlap:
                 self._attach_same_batch_spec_chain_preview(batch, model_worker_batch)

@@ -56,7 +56,12 @@ class BasePrefixCache(abc.ABC):
         pass
 
     @abc.abstractmethod
-    def dec_lock_ref(self, node: Any, swa_uuid_for_lock: str | None = None):
+    def dec_lock_ref(
+        self,
+        node: Any,
+        swa_uuid_for_lock: str | None = None,
+        skip_swa: bool = False,
+    ):
         pass
 
     def evictable_size(self, dp_rank: int = 0):

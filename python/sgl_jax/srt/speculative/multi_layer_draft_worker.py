@@ -229,6 +229,7 @@ class MultiLayerDraftWorker(EagleDraftWorker):
             num_tokens_per_batch=np.asarray(1, dtype=jnp.int32),
             num_tokens_for_logprob_per_batch=np.asarray(1, dtype=jnp.int32),
             allocate_lens=model_worker_batch.seq_lens,
+            verify_write_lens=model_worker_batch.seq_lens,
         )
         model_worker_batch.return_hidden_states = False
         model_worker_batch.spec_info_padded.prepare_for_extend_after_target_prefill(

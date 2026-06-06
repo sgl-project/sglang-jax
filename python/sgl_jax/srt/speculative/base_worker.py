@@ -242,11 +242,10 @@ class BaseSpecWorker:
         sel = model_worker_batch.logits_indices_selector
         padded_allocate_lens = np.asarray(model_worker_batch.spec_info_padded.allocate_lens)
         compact_allocate_lens = padded_allocate_lens[sel]
-        if (
-            self._can_use_fused_spec_decode
-            and model_worker_batch.sampling_info.is_all_greedy
-            and self._has_fused_greedy_draft_state(model_worker_batch)
-        ):
+        can_use_fused = self._can_use_fused_spec_decode
+        is_all_greedy = model_worker_batch.sampling_info.is_all_greedy
+        has_fused_state = self._has_fused_greedy_draft_state(model_worker_batch)
+        if can_use_fused and is_all_greedy and has_fused_state:
             # Current fused route covers greedy NEXTN decode; more speculative
             # decode paths can be folded into this entry point over time.
             from sgl_jax.srt.speculative.draft_extend_fused import spec_decode

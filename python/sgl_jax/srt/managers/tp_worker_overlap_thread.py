@@ -3,6 +3,7 @@
 import copy
 import dataclasses
 import logging
+import os
 import signal
 import threading
 from queue import Queue
@@ -179,13 +180,6 @@ class ModelWorkerClient:
                             "stashed_chain_candidate",
                             False,
                         ):
-                            prebuilt_chain_candidate = (
-                                self._prebuild_same_batch_spec_chain_candidate_after_phase_a(
-                                    model_worker_batch,
-                                    verify_result,
-                                )
-                            )
-                            phase_a_holder["prebuilt_chain_candidate"] = prebuilt_chain_candidate
                             padded_new_seq_lens_host = getattr(
                                 verify_result,
                                 "padded_new_seq_lens_host",
@@ -193,6 +187,18 @@ class ModelWorkerClient:
                             )
                             if padded_new_seq_lens_host is not None:
                                 pending_result.padded_new_seq_lens_host = padded_new_seq_lens_host
+                                prebuilt_chain_candidate = self._prebuild_same_batch_spec_chain_candidate_after_phase_b_dispatch(
+                                    model_worker_batch,
+                                    pending_result,
+                                )
+                            if prebuilt_chain_candidate is None:
+                                prebuilt_chain_candidate = (
+                                    self._prebuild_same_batch_spec_chain_candidate_after_phase_a(
+                                        model_worker_batch,
+                                        verify_result,
+                                    )
+                                )
+                            phase_a_holder["prebuilt_chain_candidate"] = prebuilt_chain_candidate
                             if prebuilt_chain_candidate is not None:
                                 self._stash_prebuilt_same_batch_spec_chain_candidate(
                                     prebuilt_chain_candidate,
@@ -407,10 +413,9 @@ class ModelWorkerClient:
             with jax.profiler.TraceAnnotation("apply_padded_phase_b_topk_fastpath"):
                 for field in (
                     "topk_index",
+                    "topk_p",
+                    "hidden_states",
                     "verified_id",
-                    "new_seq_lens",
-                    "allocate_lens",
-                    "verify_write_lens",
                 ):
                     value = getattr(padded_next_draft_input, field, None)
                     if value is not None:
@@ -423,18 +428,16 @@ class ModelWorkerClient:
                 )
                 if previous_token_list is not None:
                     spec_info.previous_token_list = previous_token_list
+                    direct_padded_fields.add("previous_token_list")
 
         fields = (
             "topk_p",
             "topk_index",
             "hidden_states",
             "verified_id",
-            "allocate_lens",
-            "verify_write_lens",
-            "new_seq_lens",
-            "accept_length",
-            "accept_length_cpu",
+            "previous_token_list",
         )
+        host_field_updates = {}
         for slot, req_pool_idx in enumerate(current_req_pool_indices):
             req_pool_idx = int(req_pool_idx)
             phase_i = phase_pos.get(req_pool_idx)
@@ -465,7 +468,18 @@ class ModelWorkerClient:
                 dst = getattr(spec_info, field, None)
                 if src is None or dst is None or src_i is None:
                     continue
-                dst[slot] = np.asarray(src)[src_i]
+                if isinstance(dst, jax.Array):
+                    dst = host_field_updates.get(field)
+                    if dst is None:
+                        dst = np.asarray(jax.device_get(getattr(spec_info, field))).copy()
+                        host_field_updates[field] = dst
+                elif not isinstance(dst, np.ndarray):
+                    dst = np.asarray(dst).copy()
+                    host_field_updates[field] = dst
+                dst[slot] = np.asarray(jax.device_get(src))[src_i]
+
+        for field, value in host_field_updates.items():
+            setattr(spec_info, field, value)
 
         self.pending_spec_draft_extend_result = None
 
@@ -477,12 +491,51 @@ class ModelWorkerClient:
         if candidate is None:
             return None
         self.pending_same_batch_spec_chain_candidate = None
+        if os.environ.get("SGL_JAX_DISABLE_SAME_BATCH_SPEC_CHAIN_COMMIT") == "1":
+            return None
         current_req_pool = np.asarray(model_worker_batch.req_pool_indices, dtype=np.int32)
         candidate_req_pool = np.asarray(candidate.req_pool_indices, dtype=np.int32)
         if current_req_pool.shape != candidate_req_pool.shape:
             return None
         if not np.array_equal(current_req_pool, candidate_req_pool):
             return None
+        if not getattr(candidate, "device_frontier_seq_lens", False):
+            expected_seq_lens = getattr(candidate, "expected_seq_lens", None)
+            if expected_seq_lens is None:
+                return None
+            current_seq_lens = np.asarray(model_worker_batch.seq_lens, dtype=np.int32)
+            expected_seq_lens = np.asarray(expected_seq_lens, dtype=np.int32)
+            if current_seq_lens.shape != expected_seq_lens.shape:
+                return None
+            if not np.array_equal(current_seq_lens, expected_seq_lens):
+                return None
+
+        spec_info = getattr(model_worker_batch, "spec_info_padded", None)
+        if spec_info is None:
+            return None
+        for current_field, expected_field in (
+            ("verify_write_lens", "expected_verify_write_lens"),
+            ("allocate_lens", "expected_allocate_lens"),
+        ):
+            current_value = getattr(spec_info, current_field, None)
+            expected_value = getattr(candidate, expected_field, None)
+            if current_value is None or expected_value is None:
+                return None
+            current_value = np.asarray(current_value, dtype=np.int32)
+            expected_value = np.asarray(expected_value, dtype=np.int32)
+            if current_value.shape != expected_value.shape:
+                return None
+            if not np.array_equal(current_value, expected_value):
+                return None
+        deferred_target_pool_updates = getattr(
+            candidate.verify_async_result,
+            "deferred_target_pool_updates",
+            None,
+        )
+        if deferred_target_pool_updates is not None:
+            self.spec_worker.target_worker.model_runner.memory_pools.replace_all(
+                deferred_target_pool_updates
+            )
         self.pending_spec_draft_extend_result = None
         return candidate
 
@@ -498,6 +551,11 @@ class ModelWorkerClient:
         if candidate_batch is None:
             self.pending_same_batch_spec_chain_candidate = None
             return
+        if os.environ.get("SGL_JAX_DISABLE_SAME_BATCH_SPEC_CHAIN_ENQUEUE") == "1":
+            self.pending_same_batch_spec_chain_candidate = None
+            return
+        candidate_batch.skip_fused_verify_padding_for_decode = True
+        candidate_batch.defer_target_pool_updates = True
         with jax.profiler.TraceAnnotation(
             f"forward_batch_speculative_chained_verify_phase {candidate_batch.bid}"
         ):
@@ -506,8 +564,26 @@ class ModelWorkerClient:
             )
         self.pending_same_batch_spec_chain_candidate = SimpleNamespace(
             req_pool_indices=np.asarray(candidate_batch.req_pool_indices, dtype=np.int32).copy(),
+            expected_seq_lens=(
+                None
+                if getattr(candidate_batch, "same_batch_chain_device_frontier_seq_lens", False)
+                else np.asarray(candidate_batch.seq_lens, dtype=np.int32).copy()
+            ),
+            expected_verify_write_lens=np.asarray(
+                candidate_batch.same_batch_chain_verify_write_lens,
+                dtype=np.int32,
+            ).copy(),
+            expected_allocate_lens=np.asarray(
+                candidate_batch.same_batch_chain_allocate_lens,
+                dtype=np.int32,
+            ).copy(),
             verify_async_result=verify_async_result,
             model_worker_batch=candidate_batch,
+            device_frontier_seq_lens=getattr(
+                candidate_batch,
+                "same_batch_chain_device_frontier_seq_lens",
+                False,
+            ),
         )
 
     def _prebuild_same_batch_spec_chain_candidate_after_phase_a(
@@ -539,10 +615,14 @@ class ModelWorkerClient:
                 model_worker_batch,
                 prebuild_pending,
             )
-            if candidate is not None:
+            if (
+                candidate is not None
+                and os.environ.get("SGL_JAX_DISABLE_SAME_BATCH_SPEC_CHAIN_PREPARE") != "1"
+            ):
                 candidate.prepared_fused_greedy_verify_launch = (
                     self._prepare_chained_verify_launch_after_phase_a(candidate)
                 )
+                candidate.same_batch_chain_prepared_layout = "phase_a"
             return candidate
 
     def _prewarm_same_batch_spec_chain_prepare_cache(
@@ -550,6 +630,8 @@ class ModelWorkerClient:
         model_worker_batch: ModelWorkerBatch,
     ) -> None:
         if not getattr(model_worker_batch, "allow_same_batch_spec_chain", False):
+            return
+        if os.environ.get("SGL_JAX_DISABLE_SAME_BATCH_SPEC_CHAIN_PREPARE") == "1":
             return
         current_seq_lens = getattr(model_worker_batch, "seq_lens", None)
         if current_seq_lens is None:
@@ -587,10 +669,14 @@ class ModelWorkerClient:
                 model_worker_batch,
                 pending,
             )
-            if candidate is not None:
+            if (
+                candidate is not None
+                and os.environ.get("SGL_JAX_DISABLE_SAME_BATCH_SPEC_CHAIN_PREPARE") != "1"
+            ):
                 candidate.prepared_fused_greedy_verify_launch = (
                     self._prepare_chained_verify_launch_after_phase_a(candidate)
                 )
+                candidate.same_batch_chain_prepared_layout = "phase_b"
             return candidate
 
     def _start_same_batch_spec_chain_prepare_prewarm(
@@ -652,6 +738,9 @@ class ModelWorkerClient:
         if padded_next_draft_input is None or padded_req_pool_indices is None:
             self.pending_same_batch_spec_chain_candidate = None
             return
+        if os.environ.get("SGL_JAX_DISABLE_SAME_BATCH_SPEC_CHAIN_ENQUEUE") == "1":
+            self.pending_same_batch_spec_chain_candidate = None
+            return
         if not np.array_equal(
             np.asarray(candidate_batch.req_pool_indices, dtype=np.int32),
             np.asarray(padded_req_pool_indices, dtype=np.int32),
@@ -659,12 +748,35 @@ class ModelWorkerClient:
             self.pending_same_batch_spec_chain_candidate = None
             return
 
-        candidate_spec_info = candidate_batch.spec_info_padded
         prepared_launch = getattr(candidate_batch, "prepared_fused_greedy_verify_launch", None)
+
+        # Phase-A prebuild intentionally skips the full decode padding because
+        # Phase-B draft state is not available yet. Once Phase B arrives, the
+        # cached launch has stale target metadata/cache_loc, so rebuild the
+        # launch from the complete draft state before enqueueing. Phase-B
+        # prebuild already uses the complete layout and can be enqueued directly.
+        if (
+            prepared_launch is not None
+            and getattr(candidate_batch, "same_batch_chain_prepared_layout", None) != "phase_b"
+        ):
+            prepared_launch = None
+            candidate_batch.prepared_fused_greedy_verify_launch = None
+            candidate_batch.spec_info_padded = copy.copy(padded_next_draft_input)
+            candidate_batch.spec_info_padded.allocate_lens = np.asarray(
+                candidate_batch.same_batch_chain_allocate_lens,
+                dtype=np.int32,
+            )
+            candidate_batch.spec_info_padded.verify_write_lens = np.asarray(
+                candidate_batch.same_batch_chain_verify_write_lens,
+                dtype=np.int32,
+            )
+        candidate_spec_info = candidate_batch.spec_info_padded
         for field in PHASE_B_DEVICE_RELAY_FIELDS:
             value = getattr(padded_next_draft_input, field, None)
             if value is not None:
                 setattr(candidate_spec_info, field, value)
+        candidate_batch.skip_fused_verify_padding_for_decode = True
+        candidate_batch.defer_target_pool_updates = True
 
         if prepared_launch is not None:
             previous_verified_id = getattr(padded_next_draft_input, "verified_id", None)
@@ -697,8 +809,26 @@ class ModelWorkerClient:
             )
         self.pending_same_batch_spec_chain_candidate = SimpleNamespace(
             req_pool_indices=np.asarray(candidate_batch.req_pool_indices, dtype=np.int32).copy(),
+            expected_seq_lens=(
+                None
+                if getattr(candidate_batch, "same_batch_chain_device_frontier_seq_lens", False)
+                else np.asarray(candidate_batch.seq_lens, dtype=np.int32).copy()
+            ),
+            expected_verify_write_lens=np.asarray(
+                candidate_batch.same_batch_chain_verify_write_lens,
+                dtype=np.int32,
+            ).copy(),
+            expected_allocate_lens=np.asarray(
+                candidate_batch.same_batch_chain_allocate_lens,
+                dtype=np.int32,
+            ).copy(),
             verify_async_result=verify_async_result,
             model_worker_batch=candidate_batch,
+            device_frontier_seq_lens=getattr(
+                candidate_batch,
+                "same_batch_chain_device_frontier_seq_lens",
+                False,
+            ),
         )
 
     def _build_same_batch_spec_chain_candidate_batch(
@@ -787,13 +917,31 @@ class ModelWorkerClient:
             dtype=np.int32,
         )
         candidate_seq_lens = getattr(pending, "padded_new_seq_lens_host", None)
+        device_frontier_seq_lens = False
         if candidate_seq_lens is None:
             candidate_seq_lens = getattr(padded_next_draft_input, "new_seq_lens", None)
-        if candidate_seq_lens is not None and not isinstance(candidate_seq_lens, jax.Array):
-            candidate.seq_lens = np.asarray(candidate_seq_lens, dtype=np.int32).copy()
-            candidate.seq_lens_sum = int(candidate.seq_lens.sum())
+        if candidate_seq_lens is None:
+            with jax.profiler.TraceAnnotation("same_batch_chain_build_skip:missing_host_seq_lens"):
+                pass
+            return None
+        if isinstance(candidate_seq_lens, jax.Array):
+            alloc_len_per_decode = padded_next_draft_input.get_spec_adjust_token_coefficient()
+            candidate_seq_lens = (
+                np.asarray(verify_write_lens, dtype=np.int32) - int(alloc_len_per_decode) + 1
+            )
+            candidate_seq_lens = np.where(
+                np.asarray(padded_req_pool_indices, dtype=np.int32) >= 0,
+                candidate_seq_lens,
+                0,
+            )
+            device_frontier_seq_lens = True
+        else:
+            candidate_seq_lens = np.asarray(candidate_seq_lens, dtype=np.int32)
+        candidate.seq_lens = candidate_seq_lens.astype(np.int32, copy=True)
+        candidate.seq_lens_sum = int(candidate.seq_lens.sum())
         candidate.allow_same_batch_spec_chain = True
         candidate.skip_fused_verify_padding_for_decode = True
+        candidate.same_batch_chain_device_frontier_seq_lens = device_frontier_seq_lens
         candidate.same_batch_chain_req_pool_indices = None
         candidate.same_batch_chain_out_cache_loc_chunks = None
         candidate.same_batch_chain_verify_write_lens = np.asarray(
