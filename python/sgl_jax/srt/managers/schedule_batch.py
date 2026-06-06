@@ -961,9 +961,7 @@ class ScheduleBatch:
             info.extend_logprob_start_lens.extend([0] * added_count)
 
             if self.is_hybrid_recurrent:
-                info.recurrent_indices = self.req_to_token_pool.get_linear_recurrent_indices(
-                    info.req_pool_indices
-                )
+                self._refresh_recurrent_indices_for_info(info)
 
             info.extend_num_tokens = (info.extend_num_tokens or 0) + added_count
 
@@ -1602,6 +1600,7 @@ class ScheduleBatch:
                 info.seq_lens = None
                 info.output_ids = None
                 info.out_cache_loc = None
+                info.recurrent_indices = None
                 info.seq_lens_sum = 0
                 info.top_logprobs_nums = None
                 info.token_ids_logprobs = None
@@ -1619,6 +1618,10 @@ class ScheduleBatch:
             # Filter memory pool indices
             if info.req_pool_indices is not None:
                 info.req_pool_indices = info.req_pool_indices[keep_indices_dp]
+                if self.is_hybrid_recurrent:
+                    info.recurrent_indices = self.req_to_token_pool.get_linear_recurrent_indices(
+                        info.req_pool_indices
+                    )
 
             # Filter sequence data
             if info.seq_lens is not None:
@@ -1671,6 +1674,16 @@ class ScheduleBatch:
             self.has_stream = False
             self.has_grammar = False
 
+    def _refresh_recurrent_indices_for_info(self, info: ScheduleReqsInfo):
+        if not self.is_hybrid_recurrent:
+            return
+        if info.req_pool_indices is None or not info.reqs:
+            info.recurrent_indices = None
+            return
+        info.recurrent_indices = self.req_to_token_pool.get_linear_recurrent_indices(
+            info.req_pool_indices
+        )
+
     def merge_batch(self, other: ScheduleBatch):
         """Merge another batch into this batch (unified for all dp_size >= 1).
 
@@ -1711,6 +1724,7 @@ class ScheduleBatch:
                 self_info.top_logprobs_nums = other_info.top_logprobs_nums
                 self_info.token_ids_logprobs = other_info.token_ids_logprobs
                 self_info.spec_info = other_info.spec_info
+                self._refresh_recurrent_indices_for_info(self_info)
                 continue
 
             # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
@@ -1757,6 +1771,7 @@ class ScheduleBatch:
 
             # Merge reqs list
             self_info.reqs.extend(other_info.reqs)
+            self._refresh_recurrent_indices_for_info(self_info)
 
             # Merge spec_info
             if self_info.spec_info and other_info.spec_info:
@@ -2097,6 +2112,78 @@ class ScheduleBatch:
             real_bs_per_dp,
             logits_indices_selector,
         )
+
+    def _check_and_log_recurrent_alignment(
+        self,
+        *,
+        bid: int,
+        input_ids_cpu: np.ndarray,
+        req_pool_indices_cpu: np.ndarray,
+        recurrent_indices_cpu: np.ndarray | None,
+        has_initial_state_cpu: np.ndarray,
+        real_bs_per_dp: list[int],
+        per_dp_token_size: int,
+        per_dp_bs_size: int,
+    ) -> None:
+        if not self.is_hybrid_recurrent:
+            return
+        if recurrent_indices_cpu is None:
+            raise AssertionError("hybrid recurrent batch is missing recurrent_indices")
+
+        debug_layout = []
+        offset_tok = 0
+        offset_bs = 0
+        for dp_rank, dp_bs in enumerate(real_bs_per_dp):
+            info = self.reqs_info[dp_rank]
+            if dp_bs > 0:
+                req_pool_slice = req_pool_indices_cpu[offset_bs : offset_bs + dp_bs]
+                recurrent_slice = recurrent_indices_cpu[offset_bs : offset_bs + dp_bs]
+                has_initial_slice = has_initial_state_cpu[offset_bs : offset_bs + dp_bs]
+                if len(req_pool_slice) != dp_bs or len(recurrent_slice) != dp_bs:
+                    raise AssertionError(
+                        "hybrid recurrent metadata length mismatch: "
+                        f"bid={bid}, dp_rank={dp_rank}, dp_bs={dp_bs}, "
+                        f"req_pool_len={len(req_pool_slice)}, recurrent_len={len(recurrent_slice)}"
+                    )
+                if np.any(req_pool_slice < 0):
+                    raise AssertionError(
+                        "hybrid recurrent real request has invalid req_pool_index: "
+                        f"bid={bid}, dp_rank={dp_rank}, req_pool_indices={req_pool_slice.tolist()}"
+                    )
+                if np.any(recurrent_slice <= 0):
+                    raise AssertionError(
+                        "hybrid recurrent real request has invalid recurrent_index: "
+                        f"bid={bid}, dp_rank={dp_rank}, recurrent_indices={recurrent_slice.tolist()}"
+                    )
+
+                if get_bool_env_var("SGLANG_DBG_RECUR_ALIGN"):
+                    input_len = len(info.input_ids) if info.input_ids is not None else 0
+                    debug_layout.append(
+                        {
+                            "dp": dp_rank,
+                            "rids": [req.rid for req in info.reqs[:dp_bs]],
+                            "input_ids": input_ids_cpu[
+                                offset_tok : offset_tok + min(input_len, 64)
+                            ].tolist(),
+                            "req_pool_indices": req_pool_slice.tolist(),
+                            "recurrent_indices": recurrent_slice.tolist(),
+                            "has_initial_state": has_initial_slice.tolist(),
+                        }
+                    )
+            offset_tok += per_dp_token_size
+            offset_bs += per_dp_bs_size
+
+        if debug_layout:
+            logger.error(
+                "DBG_RECUR_ALIGN bid=%s mode=%s real_bs_per_dp=%s per_dp_bs=%s "
+                "per_dp_token=%s layout=%s",
+                bid,
+                self.forward_mode,
+                real_bs_per_dp,
+                per_dp_bs_size,
+                per_dp_token_size,
+                debug_layout,
+            )
 
     def _merge_cache_loc(
         self,
@@ -2573,6 +2660,17 @@ class ScheduleBatch:
                         extend_prefix_lens[offset_bs : offset_bs + dp_bs] > 0
                     )
                 offset_bs += per_dp_bs_padding
+
+        self._check_and_log_recurrent_alignment(
+            bid=bid,
+            input_ids_cpu=input_ids_cpu,
+            req_pool_indices_cpu=req_pool_indices_cpu,
+            recurrent_indices_cpu=recurrent_indices_cpu,
+            has_initial_state_cpu=has_initial_state_cpu,
+            real_bs_per_dp=real_bs_per_dp,
+            per_dp_token_size=per_dp_token_padding,
+            per_dp_bs_size=per_dp_bs_padding,
+        )
 
         # Step 6: Generate trace info if needed
         if precision_tracer.get_trace_active():
