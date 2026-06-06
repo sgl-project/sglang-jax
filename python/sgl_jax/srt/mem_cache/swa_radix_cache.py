@@ -474,11 +474,9 @@ class SWARadixCache(BasePrefixCache):
             swa_evicted_seqlen=req.swa_evicted_seqlen,
         )
 
-        match_result = self.match_prefix(
+        new_indices, new_last_node = self._match_full_prefix(
             RadixKey(page_aligned_token_ids, req.extra_key, req.dp_rank)
         )
-        new_indices = match_result.device_indices
-        new_last_node = match_result.last_device_node
         assert old_prefix_len <= len(new_indices), f"{old_prefix_len=}, {new_indices=}"
         assert new_prefix_len <= len(new_indices), f"{new_prefix_len=}, {new_indices=}"
         self.req_to_token_pool.write(
@@ -830,7 +828,24 @@ class SWARadixCache(BasePrefixCache):
 
     ##### Internal Helper Functions #####
 
-    def _match_prefix_helper(self, key: RadixKey) -> tuple[list[np.array], TreeNode]:
+    def _match_full_prefix(self, key: RadixKey) -> tuple[np.ndarray, TreeNode]:
+        """Match the full radix path, including SWA tombstone nodes.
+
+        Public ``match_prefix`` intentionally returns only SWA-usable prefix
+        indices after tombstone filtering. ``cache_unfinished_req`` needs the
+        full-cache prefix for chunked prefill writeback and full-cache locking.
+        """
+        if self.page_size != 1:
+            page_aligned_len = len(key) // self.page_size * self.page_size
+            key = key[:page_aligned_len]
+
+        value, last_node = self._match_prefix_helper(key, filter_swa=False)
+        value = np.concatenate(value) if value else np.empty((0,), dtype=np.int64)
+        return value, last_node
+
+    def _match_prefix_helper(
+        self, key: RadixKey, filter_swa: bool = True
+    ) -> tuple[list[np.array], TreeNode]:
         """
         SWA prefix matching helper. It factors in the sliding window size such that
         the matched node is guaranteed to either 1. connected to root without swa tombstone,
@@ -849,7 +864,7 @@ class SWARadixCache(BasePrefixCache):
             child = node.children[child_key]
 
             # update best_value_len and best_last_node if needed
-            if child.swa_tombstone:
+            if filter_swa and child.swa_tombstone:
                 if match_len_since_tombstone >= self.sliding_window_size:
                     best_value_len = len(value)
                     best_last_node = node
@@ -874,7 +889,7 @@ class SWARadixCache(BasePrefixCache):
                     child_key = self.get_child_key_fn(key)
 
         # handle best_value_len and best_last_node, for the case that last node is fully matched
-        if match_len_since_tombstone >= self.sliding_window_size:
+        if not filter_swa or match_len_since_tombstone >= self.sliding_window_size:
             best_value_len = len(value)
             best_last_node = node
 

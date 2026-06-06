@@ -36,6 +36,31 @@ bsz=64:
 bsz=128:
 ```
 
+启动/调试记录：
+
+- 已先推送 `origin/dev/spec-overlap-bubble-followup-codex`，commit `d27127f10917a43a7548a6e3c9525856914cb818`。
+- 初次长上下文 server `bench16k1k_004426` 使用：
+  - `--context-length 18432`
+  - `--max-prefill-tokens 16384`
+  - `--chunked-prefill-size 4096`
+  - `--max-running-requests 128`
+  - `--precompile-bs-paddings 32 64 128`
+  - `--precompile-token-paddings 4096 8192 16384`
+  - `SGL_JAX_ENABLE_SAME_BATCH_SPEC_CHAIN=1`
+- 初次 `bench_serving` smoke：`num_prompts=4`、`random_input_len=16384`、`random_output_len=16`、`max_concurrency=4` 触发 crash。
+- crash 根因：
+  - chunked prefill 第二块调用 `SWARadixCache.cache_unfinished_req()`。
+  - `req.swa_evicted_seqlen=4096` 时，insert 会把 full prefix 前半段作为 SWA tombstone 保留。
+  - public `match_prefix()` 会按 SWA window 过滤 tombstone path，只返回约 4096 个 SWA-safe indices。
+  - `cache_unfinished_req()` 需要的是 full prefix writeback；使用 filtered match 导致 `new_prefix_len=8192` 但 `len(new_indices)=4096`，触发 assert：
+    `python/sgl_jax/srt/mem_cache/swa_radix_cache.py:483`。
+- 修复：
+  - 新增内部 `_match_full_prefix()`，只供 `cache_unfinished_req()` 在 insert 后回写 full prefix path。
+  - 保持 public `match_prefix()` SWA-filtered 语义不变。
+- pod rank0 CPU focused 验证：
+  - `test_cache_unfinished_req_writeback_includes_swa_tombstone_prefix`: `1 passed`
+  - `test_cache_unfinished_req_writeback_range` + 新测试：`2 passed`
+
 ## 当前跟进状态（2026-06-06）
 
 ### 2026-06-06 后续更新：accept-rate 回退根因已定位并修复

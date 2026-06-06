@@ -1160,6 +1160,46 @@ class TestSWARadixCache(CustomTestCase):
 
         self._verify_size_consistency_for(cache, "after simulated cache_unfinished_req")
 
+    def test_cache_unfinished_req_writeback_includes_swa_tombstone_prefix(self):
+        """Chunked prefill writeback needs the full prefix, not only SWA-safe match."""
+        page_size = 4
+        cache = SWARadixCache(
+            req_to_token_pool=self.req_pool,
+            token_to_kv_pool_allocator=self.allocator,
+            sliding_window_size=4,
+            page_size=page_size,
+            disable=False,
+        )
+
+        class Req:
+            req_pool_idx = 0
+            dp_rank = 0
+            extra_key = None
+            fill_ids = list(range(8))
+            cache_protected_len = 0
+            last_node = cache.root_node
+            swa_uuid_for_lock = None
+            swa_prefix_lock_released = False
+            swa_evicted_seqlen = 4
+            prefix_indices = np.empty((0,), dtype=np.int32)
+            last_matched_prefix_len = 0
+
+        req = Req()
+        kv_indices = self._alloc_indices(len(req.fill_ids))
+        self.req_pool.write((req.req_pool_idx, slice(0, len(kv_indices))), kv_indices)
+
+        cache.cache_unfinished_req(req)
+
+        np.testing.assert_array_equal(
+            self.req_pool.read(req.req_pool_idx, len(req.fill_ids)),
+            kv_indices,
+        )
+        np.testing.assert_array_equal(req.prefix_indices, kv_indices)
+        self.assertEqual(req.cache_protected_len, len(req.fill_ids))
+        self.assertEqual(req.last_matched_prefix_len, len(req.fill_ids))
+
+        self._verify_size_consistency_for(cache, "after tombstone-prefix unfinished writeback")
+
 
 class TestSchedulerCacheInit(CustomTestCase):
     """Tests for scheduler cache type selection with hybrid models (#202)."""
