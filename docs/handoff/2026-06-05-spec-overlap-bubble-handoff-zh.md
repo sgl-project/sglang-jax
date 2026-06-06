@@ -1,10 +1,10 @@
 # Spec Decode Scheduler Overlap 交接文档
 
-更新时间：2026-06-07 02:02 CST
+更新时间：2026-06-07 04:00 CST
 
 ## 当前跟进状态（2026-06-07）
 
-### 2026-06-07 待执行：bench_serving 16k input / 1k output 吞吐
+### 2026-06-07 已完成：bench_serving 16k input / 1k output 吞吐
 
 用户要求：
 
@@ -24,20 +24,92 @@
 - 当前 overlap+same-batch chain xprof 中 `broadcast -> verify` device gap 平均约 `7.23 us`。
 - GSM8K evalscope 全量 `1319` 条结果 `AverageAccuracy=0.953`。
 
-待填 bench_serving 结果：
+本轮最终修复和 bench_serving 结果：
 
 ```text
-server run_id: `bench16k1k_leafrepair_015238`
-remote branch/commit: `origin/dev/spec-overlap-bubble-followup-codex` / `7f26c192caeade85f5fb5523e0070b8c18476553`
-runtime hash check:
-  - all four `perf-16-*` pods at `7f26c192caeade85f5fb5523e0070b8c18476553`
-  - `swa_radix_cache.py`: `312e183ec64d879d4f27c824fbd8e118d1b4968d3b83ef3a63ca35d835f100cb`
-  - `test_swa_radix_cache.py`: `5b4981ffa9f3db4d48d46240e9599baada1f505ecd0e6dcbcbe63b2cd9a1bc78`
+server run_id: `bench16k1k_filterchunk_031806`
+local branch before final commit: `dev/spec-overlap-bubble-followup-codex`
+base commit before final commit: `59956c8037302de6e1243ac93dee933d4311e8cb`
+runtime final source hash:
+  - `swa_radix_cache.py`: `3ac873f836d411cc41934f2f27ac084452e420c135f19819cc7ffa47f498f1a7`
+  - `test_swa_radix_cache.py`: `b6d61412a56c50b4466bfbaf11a1ceb486cea8d8544eb0b999acde28c194b6cb`
+  - `schedule_batch.py`: `96d09b175e134e3a2e42af98ab6261659fb60e1a94a1923b3b1e9137482c3b61`
 
-bsz=32: 未执行；被 4 条 smoke crash 阻塞。
-bsz=64: 未执行；被 4 条 smoke crash 阻塞。
-bsz=128: 未执行；被 4 条 smoke crash 阻塞。
+smoke:
+  - bench_serving num_prompts=4, input=16384, output=16, max_concurrency=4
+  - Successful requests: 4
+  - 四 rank 无 `SWA_UNFINISHED_MISMATCH|Scheduler hit|Traceback|AssertionError|Received sigquit|ERROR`
+
+bsz=32 / num_prompts=300:
+  - Successful requests: 300
+  - Benchmark duration: 1610.33 s
+  - Request throughput: 0.19 req/s
+  - Input token throughput: 3052.30 tok/s
+  - Output token throughput: 191.01 tok/s
+  - Total token throughput: 3243.31 tok/s
+  - Concurrency: 31.56
+  - Mean TTFT: 71144.52 ms
+  - Mean TPOT: 95.96 ms
+
+bsz=64 / num_prompts=300:
+  - Successful requests: 300
+  - Benchmark duration: 1636.05 s
+  - Request throughput: 0.18 req/s
+  - Input token throughput: 3004.30 tok/s
+  - Output token throughput: 188.02 tok/s
+  - Total token throughput: 3192.32 tok/s
+  - Concurrency: 59.63
+  - Mean TTFT: 230888.38 ms
+  - Mean TPOT: 92.07 ms
+
+bsz=128 / num_prompts=300:
+  - Successful requests: 300
+  - Benchmark duration: 1658.39 s
+  - Request throughput: 0.18 req/s
+  - Input token throughput: 2963.84 tok/s
+  - Output token throughput: 185.47 tok/s
+  - Total token throughput: 3149.31 tok/s
+  - Concurrency: 104.72
+  - Mean TTFT: 489596.90 ms
+  - Mean TPOT: 87.20 ms
+  - P99 ITL: 2480.31 ms
+  - Max ITL: 64734.34 ms
 ```
+
+本轮新增修复：
+
+- `SWARadixCache` 的 short `len(key) > len(value)` repair 从 leaf-only 扩展到 internal node。
+  - 如果 repair 后仍有 page-aligned value，则裁剪当前 node 并丢弃其不可信 children，避免后续 split 出 empty-value cache hit。
+  - 如果 internal node 的 value 为空，则丢弃该未锁定 corrupt subtree 并从 parent children 移除。
+- `cache_unfinished_req()` 在上一个 `last_node` 已无 lock ref 时不再无条件 `dec_lock_ref()`，避免 chunked overlap lifecycle 中重复释放未持有 lock 的 node。
+- `ScheduleBatch.filter_batch()` 的 spec decode KV release 跳过当前 `chunked_req`，避免 chunked request 已由 `cache_unfinished_req()` 处理后又进入 filtered-out release 路径，触发 `Committed KV cache already freed`。
+- 临时诊断日志已从最终 diff 移除。
+
+pod 验证：
+
+```text
+rank0 pod py_compile:
+  - `swa_radix_cache.py`
+  - `schedule_batch.py`
+  - `test_swa_radix_cache.py`
+  - passed
+
+rank0 pod CPU focused pytest:
+  - `test_cache_unfinished_req_does_not_tombstone_active_chunks`
+  - `test_cache_unfinished_req_repairs_short_leaf_value`
+  - `test_cache_unfinished_req_repairs_short_internal_value`
+  - `test_cache_unfinished_req_drops_empty_internal_value`
+  - `test_cache_unfinished_req_allows_unlocked_previous_node`
+  - result: `5 passed, 43 deselected in 7.29s`
+
+说明：server 仍占用 TPU，因此最终 focused pytest 使用 `JAX_PLATFORMS=cpu` 在 pod 上执行；没有在本地跑测试。
+```
+
+当前剩余待办：
+
+- cache miss / reserve miss 回退仍存在，需要后续单独修。之前已观察到 `same_batch_chain_peek_skip reason=device_reserve/reserve` 增多。
+- accept-rate 回退/波动仍保留为待办。长上下文 c128 尾段局部 decode log 有 `accept-ratio` 低到 `0.75/0.85/0.90` 的小 running batch；需要回到 GSM8K baseline 请求上，用 d52 commit `d52a68b350b27ced3c3ed43a597032cef63b7387` 和当前代码同口径复核。
+- 16k/1k bench 的 c64/c128 没带来吞吐提升，反而 TTFT 明显变长，说明当前长上下文 large-concurrency 下被 chunked prefill/drain 和 running req 利用率限制；后续应结合 profile 看 prefill/decode overlap 与 max-running 实际利用率。
 
 启动/调试记录：
 
@@ -96,7 +168,7 @@ bsz=128: 未执行；被 4 条 smoke crash 阻塞。
     - crash 位置仍是 `SWARadixCache.cache_unfinished_req()`：
       `AssertionError: new_prefix_len=8192, new_indices=... shape=(4096,)`
     - 说明 short-leaf repair 假设没有命中真实 radix 结构；正式 `32/64/128 x 300` bench 不能继续，否则只会重复 crash。
-- 当前最新判断：
+- 当时判断：
   - 问题稳定复现在 DP0 连续两个 `4096` chunk 后。
   - `insert()` 返回 `new_prefix_len=8192`，但 `_match_full_prefix()` 只能取回 `4096` 个 indices。
   - 下一步应加一次临时诊断日志，在 `cache_unfinished_req()` assert 前 dump：

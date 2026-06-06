@@ -1299,6 +1299,171 @@ class TestSWARadixCache(CustomTestCase):
 
         self._verify_size_consistency_for(cache, "after repairing short leaf value")
 
+    def test_cache_unfinished_req_repairs_short_internal_value(self):
+        """A short internal value must not split into an empty-value cache hit."""
+        page_size = 4
+        cache = SWARadixCache(
+            req_to_token_pool=self.req_pool,
+            token_to_kv_pool_allocator=self.allocator,
+            sliding_window_size=4,
+            page_size=page_size,
+            disable=False,
+        )
+
+        first_chunk_indices = self._alloc_indices(4)
+        request_suffix_indices = self._alloc_indices(8)
+        stale_child_indices = self._alloc_indices(4)
+
+        # Simulate the corrupt shape observed on the pod:
+        # root -> key_len=8/value_len=4 -> child. A lookup for the full key
+        # used to split the short internal node into a 4-token node followed by
+        # an empty-value child, so insert returned a prefix longer than the KV
+        # indices that could be written back.
+        short_internal = cache._add_new_node(
+            cache.root_node,
+            RadixKey(list(range(8)), None, 0),
+            first_chunk_indices,
+            swa_tombstone=False,
+        )
+        cache._add_new_node(
+            short_internal,
+            RadixKey(list(range(8, 12)), None, 0),
+            stale_child_indices,
+            swa_tombstone=False,
+        )
+
+        class Req:
+            req_pool_idx = 0
+            dp_rank = 0
+            extra_key = None
+            fill_ids = list(range(12))
+            cache_protected_len = 4
+            last_node = cache.root_node
+            swa_uuid_for_lock = None
+            swa_prefix_lock_released = False
+            swa_evicted_seqlen = 0
+            prefix_indices = first_chunk_indices
+            last_matched_prefix_len = 4
+
+        req = Req()
+        expected = np.concatenate([first_chunk_indices, request_suffix_indices])
+        self.req_pool.write((req.req_pool_idx, slice(0, len(expected))), expected)
+
+        cache.cache_unfinished_req(req)
+
+        np.testing.assert_array_equal(req.prefix_indices, expected)
+        np.testing.assert_array_equal(
+            self.req_pool.read(req.req_pool_idx, len(req.fill_ids)),
+            expected,
+        )
+        self.assertEqual(req.cache_protected_len, len(req.fill_ids))
+        self.assertEqual(req.last_matched_prefix_len, len(req.fill_ids))
+
+        self._verify_size_consistency_for(cache, "after repairing short internal value")
+
+    def test_cache_unfinished_req_drops_empty_internal_value(self):
+        """An empty internal value must not count as a matched full prefix."""
+        page_size = 4
+        cache = SWARadixCache(
+            req_to_token_pool=self.req_pool,
+            token_to_kv_pool_allocator=self.allocator,
+            sliding_window_size=4,
+            page_size=page_size,
+            disable=False,
+        )
+
+        first_chunk_indices = self._alloc_indices(4)
+        request_suffix_indices = self._alloc_indices(8)
+        stale_child_indices = self._alloc_indices(4)
+
+        parent = cache._add_new_node(
+            cache.root_node,
+            RadixKey(list(range(4)), None, 0),
+            first_chunk_indices,
+            swa_tombstone=False,
+        )
+        empty_internal = cache._add_new_node(
+            parent,
+            RadixKey(list(range(4, 8)), None, 0),
+            np.empty((0,), dtype=np.int32),
+            swa_tombstone=False,
+        )
+        cache._add_new_node(
+            empty_internal,
+            RadixKey(list(range(8, 12)), None, 0),
+            stale_child_indices,
+            swa_tombstone=False,
+        )
+
+        class Req:
+            req_pool_idx = 0
+            dp_rank = 0
+            extra_key = None
+            fill_ids = list(range(12))
+            cache_protected_len = 4
+            last_node = cache.root_node
+            swa_uuid_for_lock = None
+            swa_prefix_lock_released = False
+            swa_evicted_seqlen = 0
+            prefix_indices = first_chunk_indices
+            last_matched_prefix_len = 4
+
+        req = Req()
+        expected = np.concatenate([first_chunk_indices, request_suffix_indices])
+        self.req_pool.write((req.req_pool_idx, slice(0, len(expected))), expected)
+
+        cache.cache_unfinished_req(req)
+
+        np.testing.assert_array_equal(req.prefix_indices, expected)
+        self.assertEqual(req.cache_protected_len, len(req.fill_ids))
+        self.assertEqual(req.last_matched_prefix_len, len(req.fill_ids))
+
+        self._verify_size_consistency_for(cache, "after dropping empty internal value")
+
+    def test_cache_unfinished_req_allows_unlocked_previous_node(self):
+        """Overlap chunking can carry an unlocked last_node from the previous chunk."""
+        page_size = 4
+        cache = SWARadixCache(
+            req_to_token_pool=self.req_pool,
+            token_to_kv_pool_allocator=self.allocator,
+            sliding_window_size=4,
+            page_size=page_size,
+            disable=False,
+        )
+
+        first_chunk_indices = self._alloc_indices(4)
+        second_chunk_indices = self._alloc_indices(4)
+        cache.insert(RadixKey(list(range(4)), None, 0), first_chunk_indices, prev_prefix_len=0)
+        previous_match = cache.match_prefix(RadixKey(list(range(4)), None, 0))
+        previous_node = previous_match.last_device_node
+        self.assertEqual(previous_node.full_lock_ref, 0)
+
+        class Req:
+            req_pool_idx = 0
+            dp_rank = 0
+            extra_key = None
+            fill_ids = list(range(8))
+            cache_protected_len = 4
+            last_node = previous_node
+            swa_uuid_for_lock = None
+            swa_prefix_lock_released = False
+            swa_evicted_seqlen = 0
+            prefix_indices = first_chunk_indices
+            last_matched_prefix_len = 4
+
+        req = Req()
+        expected = np.concatenate([first_chunk_indices, second_chunk_indices])
+        self.req_pool.write((req.req_pool_idx, slice(0, len(expected))), expected)
+
+        cache.cache_unfinished_req(req)
+
+        np.testing.assert_array_equal(req.prefix_indices, expected)
+        self.assertEqual(req.cache_protected_len, len(req.fill_ids))
+        self.assertGreater(req.last_node.full_lock_ref, 0)
+
+        cache.dec_lock_ref(req.last_node, req.swa_uuid_for_lock)
+        self._verify_size_consistency_for(cache, "after unlocked previous node writeback")
+
 
 class TestSchedulerCacheInit(CustomTestCase):
     """Tests for scheduler cache type selection with hybrid models (#202)."""

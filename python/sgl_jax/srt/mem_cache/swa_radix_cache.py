@@ -483,11 +483,12 @@ class SWARadixCache(BasePrefixCache):
             new_indices[old_prefix_len:],
         )
 
-        self.dec_lock_ref(
-            req.last_node,
-            req.swa_uuid_for_lock,
-            skip_swa=req.swa_prefix_lock_released,
-        )
+        if self._lock_ref_is_held(req.last_node):
+            self.dec_lock_ref(
+                req.last_node,
+                req.swa_uuid_for_lock,
+                skip_swa=req.swa_prefix_lock_released,
+            )
         req.swa_prefix_lock_released = False
         swa_uuid_for_lock = self.inc_lock_ref(new_last_node)
 
@@ -790,6 +791,9 @@ class SWARadixCache(BasePrefixCache):
             node = node.parent
         return prefix_len
 
+    def _lock_ref_is_held(self, node: TreeNode | None) -> bool:
+        return node is not None and node != self.root_node and node.full_lock_ref > 0
+
     def evict_req_swa(self, req: Req, pre_len: int, dp_rank: int = 0) -> None:
         """Free request-owned SWA slots while preserving the tree-owned prefix."""
         protected_prefix_len = self._node_prefix_len(req.last_node)
@@ -842,25 +846,60 @@ class SWARadixCache(BasePrefixCache):
         value = np.concatenate(value) if value else np.empty((0,), dtype=np.int64)
         return value, last_node
 
-    def _repair_short_leaf_value(self, node: TreeNode) -> None:
-        """Trim a leaf key if it somehow outgrew the stored KV value.
+    def _drop_unlocked_subtree(self, node: TreeNode) -> None:
+        """Drop an unreachable corrupt subtree and release its tree-owned KV."""
+        for child in list(node.children.values()):
+            self._drop_unlocked_subtree(child)
+
+        assert (
+            node.full_lock_ref == 0 and node.swa_lock_ref == 0
+        ), f"cannot drop locked corrupt subtree node, {node.id=}"
+
+        node_dp_rank = node.key.dp_rank if node.key and node.key.dp_rank is not None else 0
+        if self.full_lru_list.in_list(node):
+            self.full_lru_list.remove_node(node)
+            self.full_evictable_size_[node_dp_rank] -= len(node.value)
+        elif node.full_lock_ref > 0:
+            self.full_protected_size_[node_dp_rank] -= len(node.value)
+
+        if not node.swa_tombstone:
+            eff = self._swa_eff_len(node.value, dp_rank=node_dp_rank)
+            if self.swa_lru_list.in_list(node):
+                self.swa_lru_list.remove_node(node)
+                self.swa_evictable_size_[node_dp_rank] -= eff
+            elif node.swa_lock_ref > 0:
+                self.swa_protected_size_[node_dp_rank] -= eff
+
+        self.token_to_kv_pool_allocator.free(node.value, dp_rank=node_dp_rank)
+        node.children.clear()
+
+    def _repair_short_node_value(self, node: TreeNode) -> bool:
+        """Trim a node key if it somehow outgrew the stored KV value.
 
         Chunked prefill relies on radix prefix length and KV value length staying
         identical.  If an active chunk was inserted with a longer key than value,
         the next insert can otherwise treat missing KV slots as a cache hit and
-        free the request-owned suffix.  Only repair leaves; internal nodes need
-        their child path preserved and should fail loudly in sanity checks.
+        free the request-owned suffix.
+
+        Returns whether the node is still reachable after repair.
         """
         if node == self.root_node or node.value is None or len(node.value) >= len(node.key):
-            return
-        if len(node.children) != 0:
-            return
+            return True
 
         repair_len = len(node.value)
         if self.page_size != 1:
             repair_len = repair_len // self.page_size * self.page_size
         if repair_len <= 0:
-            return
+            parent = node.parent
+            old_child_key = self.get_child_key_fn(node.key)
+            self._drop_unlocked_subtree(node)
+            if old_child_key in parent.children:
+                del parent.children[old_child_key]
+            return False
+
+        for child in list(node.children.values()):
+            self._drop_unlocked_subtree(child)
+        node.children.clear()
 
         parent = node.parent
         old_child_key = self.get_child_key_fn(node.key)
@@ -868,6 +907,7 @@ class SWARadixCache(BasePrefixCache):
         if old_child_key in parent.children:
             del parent.children[old_child_key]
         parent.children[self.get_child_key_fn(node.key)] = node
+        return True
 
     def _match_prefix_helper(
         self, key: RadixKey, filter_swa: bool = True
@@ -888,7 +928,8 @@ class SWARadixCache(BasePrefixCache):
         best_last_node = node
         while len(key) > 0 and child_key in node.children:
             child = node.children[child_key]
-            self._repair_short_leaf_value(child)
+            if not self._repair_short_node_value(child):
+                break
 
             # update best_value_len and best_last_node if needed
             if filter_swa and child.swa_tombstone:
@@ -1013,8 +1054,10 @@ class SWARadixCache(BasePrefixCache):
 
         total_prefix_length = 0
         while len(key) > 0 and child_key in node.children:
-            node = node.children[child_key]
-            self._repair_short_leaf_value(node)
+            child = node.children[child_key]
+            if not self._repair_short_node_value(child):
+                break
+            node = child
             node.last_access_time = time.monotonic()
             self.full_lru_list.reset_node_mru(node)
             if not node.swa_tombstone:

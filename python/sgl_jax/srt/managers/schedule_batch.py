@@ -1642,6 +1642,8 @@ class ScheduleBatch:
             ):
                 keep_set = set(keep_indices_dp)
                 for i, req in enumerate(info.reqs):
+                    if chunked_req is not None and req is chunked_req:
+                        continue
                     if i not in keep_set and req.req_pool_idx is not None:
                         release_spec_decode_kv_cache(
                             req,
