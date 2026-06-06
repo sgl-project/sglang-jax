@@ -1,6 +1,6 @@
 # Spec Decode Scheduler Overlap 交接文档
 
-更新时间：2026-06-07 00:00 CST
+更新时间：2026-06-07 01:50 CST
 
 ## 当前跟进状态（2026-06-07）
 
@@ -27,9 +27,9 @@
 待填 bench_serving 结果：
 
 ```text
-server run_id:
-remote branch/commit:
-runtime hash check:
+server run_id: 待重启
+remote branch/commit: origin/dev/spec-overlap-bubble-followup-codex / 待推送新 commit
+runtime hash check: 待四 rank 重新同步后填写
 
 bsz=32:
 bsz=64:
@@ -60,6 +60,26 @@ bsz=128:
 - pod rank0 CPU focused 验证：
   - `test_cache_unfinished_req_writeback_includes_swa_tombstone_prefix`: `1 passed`
   - `test_cache_unfinished_req_writeback_range` + 新测试：`2 passed`
+- 第二次长上下文 server `bench16k1k_swafix_011006` 已完成 16k prefill + `32/64/128` decode padding 预编译，但同一个 smoke 仍 crash：
+  - server health 从 200 变为 000，四个 rank 进程退出。
+  - stack 仍在 `SWARadixCache.cache_unfinished_req()`：
+    `AssertionError: new_prefix_len=8192, new_indices=... shape=(4096,)`。
+- 第二次根因修正：
+  - 对比上游 `/Users/niu/code/sglang/python/sglang/srt/mem_cache/swa_radix_cache.py` 后确认，上游 `cache_unfinished_req()` 调 `insert()` 不传 `swa_evicted_seqlen`，只有 `cache_finished_req()` 会传。
+  - 当前 JAX 分支把 `req.swa_evicted_seqlen` 传给 unfinished chunk insert，导致 active chunked prefill 路径在请求未完成时提前 tombstone 化；随后即使用 internal full-match，也只能拿到 4096 个有效 prefix indices。
+  - 已将 JAX `cache_unfinished_req()` 对齐回上游：unfinished insert 不再传 `swa_evicted_seqlen`；保留 `cache_finished_req()` 的 SWA eviction 语义。
+- 新增回归测试：
+  - `test_cache_unfinished_req_does_not_tombstone_active_chunks`
+  - 覆盖 `req.swa_evicted_seqlen != 0` 且连续两次 unfinished chunk writeback，要求 `cache_protected_len/last_matched_prefix_len/prefix_indices` 都推进到完整 8 token。
+- pod rank0 CPU focused 验证：
+  - `test_cache_unfinished_req_writeback_includes_swa_tombstone_prefix`
+  - `test_cache_unfinished_req_does_not_tombstone_active_chunks`
+  - 结果：`2 passed in 7.42s`
+- 下一步：
+  - 提交并推送新修复。
+  - 重新同步四个 `perf-16-*` pod 到同一 commit。
+  - kill 旧进程并重启 4-rank server。
+  - 先重跑 4 条 smoke；通过后再跑 `bsz=32/64/128`，每种 `num_prompts=300`。
 
 ## 当前跟进状态（2026-06-06）
 

@@ -471,7 +471,6 @@ class SWARadixCache(BasePrefixCache):
             RadixKey(page_aligned_token_ids, req.extra_key, req.dp_rank),
             page_aligned_kv_indices,
             old_prefix_len,
-            swa_evicted_seqlen=req.swa_evicted_seqlen,
         )
 
         new_indices, new_last_node = self._match_full_prefix(

@@ -1200,6 +1200,53 @@ class TestSWARadixCache(CustomTestCase):
 
         self._verify_size_consistency_for(cache, "after tombstone-prefix unfinished writeback")
 
+    def test_cache_unfinished_req_does_not_tombstone_active_chunks(self):
+        """Unfinished chunk insertion matches upstream: do not pass req.swa_evicted_seqlen."""
+        page_size = 4
+        cache = SWARadixCache(
+            req_to_token_pool=self.req_pool,
+            token_to_kv_pool_allocator=self.allocator,
+            sliding_window_size=4,
+            page_size=page_size,
+            disable=False,
+        )
+
+        class Req:
+            req_pool_idx = 0
+            dp_rank = 0
+            extra_key = None
+            cache_protected_len = 0
+            last_node = cache.root_node
+            swa_uuid_for_lock = None
+            swa_prefix_lock_released = False
+            swa_evicted_seqlen = 4
+            prefix_indices = np.empty((0,), dtype=np.int32)
+            last_matched_prefix_len = 0
+
+        req = Req()
+
+        first_chunk_indices = self._alloc_indices(4)
+        req.fill_ids = list(range(4))
+        self.req_pool.write((req.req_pool_idx, slice(0, 4)), first_chunk_indices)
+        cache.cache_unfinished_req(req)
+
+        second_chunk_indices = self._alloc_indices(4)
+        req.fill_ids = list(range(8))
+        self.req_pool.write((req.req_pool_idx, slice(0, 4)), first_chunk_indices)
+        self.req_pool.write((req.req_pool_idx, slice(4, 8)), second_chunk_indices)
+        cache.cache_unfinished_req(req)
+
+        expected = np.concatenate([first_chunk_indices, second_chunk_indices])
+        np.testing.assert_array_equal(
+            self.req_pool.read(req.req_pool_idx, len(req.fill_ids)),
+            expected,
+        )
+        np.testing.assert_array_equal(req.prefix_indices, expected)
+        self.assertEqual(req.cache_protected_len, len(req.fill_ids))
+        self.assertEqual(req.last_matched_prefix_len, len(req.fill_ids))
+
+        self._verify_size_consistency_for(cache, "after active chunk unfinished writeback")
+
 
 class TestSchedulerCacheInit(CustomTestCase):
     """Tests for scheduler cache type selection with hybrid models (#202)."""
