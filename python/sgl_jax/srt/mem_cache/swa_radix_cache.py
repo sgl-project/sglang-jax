@@ -842,6 +842,33 @@ class SWARadixCache(BasePrefixCache):
         value = np.concatenate(value) if value else np.empty((0,), dtype=np.int64)
         return value, last_node
 
+    def _repair_short_leaf_value(self, node: TreeNode) -> None:
+        """Trim a leaf key if it somehow outgrew the stored KV value.
+
+        Chunked prefill relies on radix prefix length and KV value length staying
+        identical.  If an active chunk was inserted with a longer key than value,
+        the next insert can otherwise treat missing KV slots as a cache hit and
+        free the request-owned suffix.  Only repair leaves; internal nodes need
+        their child path preserved and should fail loudly in sanity checks.
+        """
+        if node == self.root_node or node.value is None or len(node.value) >= len(node.key):
+            return
+        if len(node.children) != 0:
+            return
+
+        repair_len = len(node.value)
+        if self.page_size != 1:
+            repair_len = repair_len // self.page_size * self.page_size
+        if repair_len <= 0:
+            return
+
+        parent = node.parent
+        old_child_key = self.get_child_key_fn(node.key)
+        node.key = node.key[:repair_len]
+        if old_child_key in parent.children:
+            del parent.children[old_child_key]
+        parent.children[self.get_child_key_fn(node.key)] = node
+
     def _match_prefix_helper(
         self, key: RadixKey, filter_swa: bool = True
     ) -> tuple[list[np.array], TreeNode]:
@@ -861,6 +888,7 @@ class SWARadixCache(BasePrefixCache):
         best_last_node = node
         while len(key) > 0 and child_key in node.children:
             child = node.children[child_key]
+            self._repair_short_leaf_value(child)
 
             # update best_value_len and best_last_node if needed
             if filter_swa and child.swa_tombstone:
@@ -986,6 +1014,7 @@ class SWARadixCache(BasePrefixCache):
         total_prefix_length = 0
         while len(key) > 0 and child_key in node.children:
             node = node.children[child_key]
+            self._repair_short_leaf_value(node)
             node.last_access_time = time.monotonic()
             self.full_lru_list.reset_node_mru(node)
             if not node.swa_tombstone:

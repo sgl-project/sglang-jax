@@ -1247,6 +1247,58 @@ class TestSWARadixCache(CustomTestCase):
 
         self._verify_size_consistency_for(cache, "after active chunk unfinished writeback")
 
+    def test_cache_unfinished_req_repairs_short_leaf_value(self):
+        """A short leaf value must not make insert free the active chunk suffix."""
+        page_size = 4
+        cache = SWARadixCache(
+            req_to_token_pool=self.req_pool,
+            token_to_kv_pool_allocator=self.allocator,
+            sliding_window_size=4,
+            page_size=page_size,
+            disable=False,
+        )
+
+        first_chunk_indices = self._alloc_indices(4)
+        second_chunk_indices = self._alloc_indices(4)
+
+        # Simulate a corrupted active chunk leaf: token key covers two pages, but
+        # only the first page has tree-owned KV values.
+        cache._add_new_node(
+            cache.root_node,
+            RadixKey(list(range(8)), None, 0),
+            first_chunk_indices,
+            swa_tombstone=False,
+        )
+
+        class Req:
+            req_pool_idx = 0
+            dp_rank = 0
+            extra_key = None
+            fill_ids = list(range(8))
+            cache_protected_len = 4
+            last_node = cache.root_node
+            swa_uuid_for_lock = None
+            swa_prefix_lock_released = False
+            swa_evicted_seqlen = 0
+            prefix_indices = first_chunk_indices
+            last_matched_prefix_len = 4
+
+        req = Req()
+        expected = np.concatenate([first_chunk_indices, second_chunk_indices])
+        self.req_pool.write((req.req_pool_idx, slice(0, 8)), expected)
+
+        cache.cache_unfinished_req(req)
+
+        np.testing.assert_array_equal(req.prefix_indices, expected)
+        np.testing.assert_array_equal(
+            self.req_pool.read(req.req_pool_idx, len(req.fill_ids)),
+            expected,
+        )
+        self.assertEqual(req.cache_protected_len, len(req.fill_ids))
+        self.assertEqual(req.last_matched_prefix_len, len(req.fill_ids))
+
+        self._verify_size_consistency_for(cache, "after repairing short leaf value")
+
 
 class TestSchedulerCacheInit(CustomTestCase):
     """Tests for scheduler cache type selection with hybrid models (#202)."""
