@@ -883,8 +883,8 @@ class WeightLoader:
                     weight.shape,
                     model_param.value.shape,
                 )
-                weight = jnp.repeat(weight, block_size_out, axis=2)[..., :out_dim]
-                return weight[:, :, None, :]
+                idx = jnp.arange(out_dim) // block_size_out
+                return jnp.take(weight, idx, axis=2)[:, :, None, :]
             if weight.shape == (num_experts, expected_out_blocks, k_blocks):
                 logger.info(
                     "Transposing+expanding fused MoE 2D scale %s from %s to fast kernel layout %s",
@@ -893,8 +893,8 @@ class WeightLoader:
                     model_param.value.shape,
                 )
                 weight = jnp.transpose(weight, (0, 2, 1))
-                weight = jnp.repeat(weight, block_size_out, axis=2)[..., :out_dim]
-                return weight[:, :, None, :]
+                idx = jnp.arange(out_dim) // block_size_out
+                return jnp.take(weight, idx, axis=2)[:, :, None, :]
 
         if weight.shape == (num_experts, out_dim, k_blocks):
             return jnp.expand_dims(jnp.transpose(weight, (0, 2, 1)), axis=2)
