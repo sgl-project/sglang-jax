@@ -108,8 +108,95 @@ rank0 pod CPU focused pytest:
 当前剩余待办：
 
 - cache miss / reserve miss 回退仍存在，需要后续单独修。之前已观察到 `same_batch_chain_peek_skip reason=device_reserve/reserve` 增多。
-- accept-rate 回退/波动仍保留为待办。长上下文 c128 尾段局部 decode log 有 `accept-ratio` 低到 `0.75/0.85/0.90` 的小 running batch；需要回到 GSM8K baseline 请求上，用 d52 commit `d52a68b350b27ced3c3ed43a597032cef63b7387` 和当前代码同口径复核。
+- accept-rate 已用 GSM8K first 8 x4 同口径复核通过，e5da548 running32 accept-ratio `0.8891` 高于 d52 baseline `~0.8350`。长上下文 c128 尾段局部 decode log 仍有小 running batch accept-ratio 低到 `0.75/0.85/0.90`，保留为观察项，不再视为 GSM8K accept-rate blocker。
 - 16k/1k bench 的 c64/c128 没带来吞吐提升，反而 TTFT 明显变长，说明当前长上下文 large-concurrency 下被 chunked prefill/drain 和 running req 利用率限制；后续应结合 profile 看 prefill/decode overlap 与 max-running 实际利用率。
+
+### 2026-06-07 最新补充：e5da548 accept-rate 与 overlap profile 复核
+
+复核目的：确认最终 crash 修复 commit `e5da54804aa898f6c6045c04016389409a6077bb` 没有造成 accept-rate 或 overlap device-idle 回退。
+
+server：
+
+```text
+run_id: `accept_latest_chain_e5da_045715`
+branch: `dev/spec-overlap-bubble-followup-codex`
+commit: `e5da54804aa898f6c6045c04016389409a6077bb`
+pods: `perf-16-0-jgb5c`..`perf-16-3-vqw2x`
+port: `30271`
+context-length: `4096`
+max-prefill-tokens: `4096`
+max-running-requests: `64`
+precompile-bs-paddings: `32 64`
+precompile-token-paddings: `256 512`
+same-batch chain: `SGL_JAX_ENABLE_SAME_BATCH_SPEC_CHAIN=1`
+```
+
+GSM8K first 8 x4，32 并发，非 profile run：
+
+```text
+tag: `gsm8k8x4_accept_latest_chain_e5da_050319`
+ok=32 bad=0
+finish_counts={'stop': 32}
+latency=129.079 s
+output_tokens=3516
+output_tok_s=27.24
+
+rank0 decode log after run start:
+all decode:
+  n=66
+  accept_len_mean=3.5806
+  accept_ratio_mean=0.8959
+  throughput_mean=1375.95 token/s
+  throughput_median=1146.18 token/s
+running32:
+  n=11
+  accept_len_mean=3.5464
+  accept_ratio_mean=0.8891
+  throughput_mean=1640.56 token/s
+  throughput_median=1986.32 token/s
+cache_or_skip_lines=1:
+  [2026-06-06 21:04:31 NP0] Prefill batch. #bid: 7, #cache_miss: 2
+四 rank error grep 为空。
+```
+
+结论：同口径 d52 baseline running32 accept-ratio 约 `0.8350`，当前 e5da548 overlap+chain running32 accept-ratio `0.8891`，本轮没有 accept-rate 回退。仍有 `#cache_miss: 2`，所以 cache miss / reserve miss 待办不能关闭。
+
+profile run：
+
+```text
+tag: `gsm8k8x4_profile_accept_latest_chain_e5da_045715_decode6_after_decode32_050728`
+ok=32 bad=0
+finish_counts={'stop': 31, 'length': 1}
+latency=17.395 s
+output_tokens=3857
+output_tok_s=221.74
+
+remote profile:
+/tmp/profile_accept_latest_chain_e5da_045715_decode6_after_decode32_050728/decode6_after_decode32/plugins/profile/2026_06_06_21_07_37/perf-16-0.trace.json.gz
+
+local archive:
+profiles/profile_accept_latest_chain_e5da_045715_decode6_after_decode32_050728/profile_accept_latest_chain_e5da_045715_decode6_after_decode32_050728.tar.gz
+sha256: 98c3d8b73e9debb5213dc1159da3c5811328339d7ee5c53d47ec25ff4c73cb24
+
+local trace:
+profiles/profile_accept_latest_chain_e5da_045715_decode6_after_decode32_050728/profile_accept_latest_chain_e5da_045715_decode6_after_decode32_050728/decode6_after_decode32/plugins/profile/2026_06_06_21_07_37/perf-16-0.trace.json.gz
+```
+
+profile gap 解析：
+
+```text
+device items: 24
+jit_fused_draft_extend: n=6, mean=1336.23 us, median=1336.38 us, max=1336.91 us
+jit_broadcast_in_dim: n=6, mean=27.28 us, median=11.24 us, max=107.99 us
+jit_fused_greedy_verify: n=12, mean=31623.87 us, median=30807.15 us, max=68997.16 us
+
+draft -> broadcast gap: n=6, mean=555.71 us, median=549.80 us, max=603.06 us
+broadcast -> verify gap: n=6, mean=7.19 us, median=7.19 us, max=7.26 us
+verify -> verify adjacent same-kind gap: n=5, mean=7.59 us, median=7.59 us, max=7.63 us
+verify -> verify all verify kernels: n=11, mean=1074.49 us, median=1928.58 us, max=2091.61 us
+```
+
+结论：当前 e5da548 的 `broadcast -> verify` device gap 仍为约 `7us`，与之前 `overlap_chain_targetpadding_215442` 的约 `7.23us` 一致；crash 修复没有破坏 overlap device idle。
 
 启动/调试记录：
 
