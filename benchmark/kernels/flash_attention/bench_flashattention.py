@@ -14,12 +14,7 @@ from utils import create_decode_uniform_data, create_prefill_uniform_data
 
 from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention_v3 import (
     RpaCase,
-    get_default_block_sizes,
-    get_vmem_limit,
     ragged_paged_attention,
-)
-from sgl_jax.srt.kernels.ragged_paged_attention.tuned_block_sizes_v3 import (
-    get_tuned_block_sizes_v3,
 )
 from sgl_jax.srt.kernels.utils.perf import multiple_iteration_timeit_from_trace
 from sgl_jax.srt.utils.jax_utils import get_device_name
@@ -128,47 +123,7 @@ def benchmark_backend(
         )
 
     # Benchmark
-    max_num_seqs = kv_lens.shape[0]
-    pages_per_seq = page_indices.shape[0] // max_num_seqs
     rpa_case = RpaCase.DECODE if mode == "decode" else RpaCase.MIXED
-    # Match the production block-selection path: prefer the tuned table (what the
-    # kernel actually uses via block_sizes=None), fall back to the heuristic on a
-    # miss. The kernel run below uses None -> tuned lookup, so building the trace
-    # scope_name from the same tuned config keeps the label aligned with the op.
-    tuned = get_tuned_block_sizes_v3(
-        rpa_case.symbol,
-        q.dtype,
-        k.dtype,
-        q_head_num,
-        kv_head_num,
-        head_dim,
-        page_size,
-        max_num_batched_tokens,
-        sliding_window=sliding_window,
-    )
-    if tuned is not None:
-        bq_sz, bkv_sz, bq_csz, bkv_csz = tuned
-        block_sizes = {
-            "bq_sz": bq_sz,
-            "bkv_sz": bkv_sz,
-            "bq_csz": bq_csz,
-            "bkv_csz": bkv_csz,
-        }
-    else:
-        block_sizes = get_default_block_sizes(
-            q.dtype,
-            k.dtype,
-            q_head_num,
-            kv_head_num,
-            head_dim,
-            page_size,
-            max_num_batched_tokens,
-            max_num_seqs,
-            pages_per_seq,
-            case=rpa_case,
-            vmem_limit_bytes=get_vmem_limit(),
-            sliding_window=sliding_window,
-        )
     attn = functools.partial(
         jitted_attn,
         q,
@@ -187,13 +142,13 @@ def benchmark_backend(
     # Warmup
     output = attn()
     jax.block_until_ready(output)
-    scope_name = (
-        f"RPA{rpa_case.symbol}-p_{page_size}"
-        f"-bq_{block_sizes["bq_sz"]}_{block_sizes["bq_csz"]}"
-        f"-bkv_{block_sizes["bkv_sz"]}_{block_sizes["bkv_csz"]}"
-    )
-    if sliding_window is not None:
-        scope_name += f"-sw_{sliding_window}"
+    # Match the kernel's pallas op by stage + page_size prefix only. The kernel
+    # encodes its actually-selected block sizes into the op name
+    # ("RPA{d,p,m}-p_{ps}-bq_..-bkv_.."), which differ between the heuristic and
+    # tuned paths; matching the full block-encoded name would miss the op (and
+    # silently fall back to whole-call timing). The stage+page prefix is stable
+    # regardless of which block config the kernel picks.
+    scope_name = f"RPA{rpa_case.symbol}-p_{page_size}-"
 
     times = multiple_iteration_timeit_from_trace(
         compute_func=lambda: attn(),
