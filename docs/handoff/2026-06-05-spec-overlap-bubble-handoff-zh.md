@@ -1,6 +1,6 @@
 # Spec Decode Scheduler Overlap 交接文档
 
-更新时间：2026-06-07 01:50 CST
+更新时间：2026-06-07 02:02 CST
 
 ## 当前跟进状态（2026-06-07）
 
@@ -27,13 +27,16 @@
 待填 bench_serving 结果：
 
 ```text
-server run_id: 待重启
-remote branch/commit: origin/dev/spec-overlap-bubble-followup-codex / 待推送新 commit
-runtime hash check: 待四 rank 重新同步后填写
+server run_id: `bench16k1k_leafrepair_015238`
+remote branch/commit: `origin/dev/spec-overlap-bubble-followup-codex` / `7f26c192caeade85f5fb5523e0070b8c18476553`
+runtime hash check:
+  - all four `perf-16-*` pods at `7f26c192caeade85f5fb5523e0070b8c18476553`
+  - `swa_radix_cache.py`: `312e183ec64d879d4f27c824fbd8e118d1b4968d3b83ef3a63ca35d835f100cb`
+  - `test_swa_radix_cache.py`: `5b4981ffa9f3db4d48d46240e9599baada1f505ecd0e6dcbcbe63b2cd9a1bc78`
 
-bsz=32:
-bsz=64:
-bsz=128:
+bsz=32: 未执行；被 4 条 smoke crash 阻塞。
+bsz=64: 未执行；被 4 条 smoke crash 阻塞。
+bsz=128: 未执行；被 4 条 smoke crash 阻塞。
 ```
 
 启动/调试记录：
@@ -80,6 +83,25 @@ bsz=128:
   - 重新同步四个 `perf-16-*` pod 到同一 commit。
   - kill 旧进程并重启 4-rank server。
   - 先重跑 4 条 smoke；通过后再跑 `bsz=32/64/128`，每种 `num_prompts=300`。
+- 第三次修复尝试：
+  - commit `7f26c192` 新增 `_repair_short_leaf_value()`，尝试修复 radix leaf `len(key) > len(value)` 导致 insert 误判完整 prefix hit 的情况。
+  - 新增 `test_cache_unfinished_req_repairs_short_leaf_value`，pod rank0 CPU focused 验证：
+    `test_cache_unfinished_req_writeback_includes_swa_tombstone_prefix`、
+    `test_cache_unfinished_req_does_not_tombstone_active_chunks`、
+    `test_cache_unfinished_req_repairs_short_leaf_value`，结果 `3 passed in 7.44s`。
+  - 四 rank 已同步到 `7f26c192` 并重启 server `bench16k1k_leafrepair_015238`，`--trust-remote-code` 和 dist-init `:5001`。
+  - server 可完成 16k prefill + `32/64/128` decode padding 预编译并 `/health` 返回 200。
+  - 但同一 smoke 仍 crash：
+    - `bench_serving --num-prompts 4 --random-input-len 16384 --random-output-len 16 --max-concurrency 4`
+    - crash 位置仍是 `SWARadixCache.cache_unfinished_req()`：
+      `AssertionError: new_prefix_len=8192, new_indices=... shape=(4096,)`
+    - 说明 short-leaf repair 假设没有命中真实 radix 结构；正式 `32/64/128 x 300` bench 不能继续，否则只会重复 crash。
+- 当前最新判断：
+  - 问题稳定复现在 DP0 连续两个 `4096` chunk 后。
+  - `insert()` 返回 `new_prefix_len=8192`，但 `_match_full_prefix()` 只能取回 `4096` 个 indices。
+  - 下一步应加一次临时诊断日志，在 `cache_unfinished_req()` assert 前 dump：
+    `len(fill_ids)`、`old_prefix_len`、`req.cache_protected_len`、`req.last_matched_prefix_len`、`len(prefix_indices)`、`req.swa_evicted_seqlen`、`new_prefix_len`、`len(new_indices)`、`new_last_node` path 的 key/value/tombstone 长度，以及 root 到匹配路径的 child key。
+  - 不建议继续猜测修复；需要用该 dump 确认到底是 tombstone filtering、重复缓存、key/value length mismatch，还是 child rekey/split 结构问题。
 
 ## 当前跟进状态（2026-06-06）
 
