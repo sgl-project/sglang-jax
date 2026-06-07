@@ -104,6 +104,25 @@ def first(events: list[dict[str, Any]], rid: str, event_name: str, mode: str | N
     return None
 
 
+def last_before(
+    events: list[dict[str, Any]],
+    rid: str,
+    event_name: str,
+    mode: str | None,
+    before_ts: float | None,
+):
+    matched = None
+    for event in events:
+        if event.get("rid") != rid or event.get("event") != event_name:
+            continue
+        if mode is not None and mode not in str(event.get("mode")):
+            continue
+        if before_ts is not None and float(event.get("ts", 0.0)) > before_ts:
+            continue
+        matched = event
+    return matched
+
+
 def digest_delta(left: Any, right: Any) -> float | None:
     if left is None or right is None:
         return None
@@ -122,9 +141,15 @@ def build_rows(cases: dict[int, OutputCase], events: list[dict[str, Any]], token
         rid = case.rid
         if rid is None:
             continue
-        prefill_state = first(events, rid, "state_digest", "EXTEND")
         decode_state = first(events, rid, "state_digest", "DECODE")
         first_decode = first(events, rid, "future_token_resolve", "DECODE")
+        prefill_state = last_before(
+            events,
+            rid,
+            "state_digest",
+            "EXTEND",
+            float(first_decode.get("ts")) if first_decode else None,
+        )
         rows.append(
             {
                 "idx": case.idx,
