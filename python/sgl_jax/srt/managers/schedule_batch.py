@@ -2231,6 +2231,19 @@ class ScheduleBatch:
                 if not recurrent_trace.should_trace_rid(req.rid):
                     continue
 
+                if self.forward_mode.is_extend():
+                    max_extend_batches = recurrent_trace.env_int(
+                        "SGLANG_DBG_RECUR_TRACE_MAX_EXTEND_BATCHES", 2
+                    )
+                    if int(req.extend_batch_idx) > max_extend_batches:
+                        continue
+                elif self.forward_mode.is_decode():
+                    max_decode_batches = recurrent_trace.env_int(
+                        "SGLANG_DBG_RECUR_TRACE_MAX_DECODE_BATCHES", 2
+                    )
+                    if int(req.decode_batch_idx) > max_decode_batches:
+                        continue
+
                 global_row = offset_bs + local_idx
                 record = {
                     "bid": bid,

@@ -73,7 +73,9 @@ def get_answer_value(answer_str):
         return INVALID
 
 
-async def send_request(session, base_url, text, sampling_params, semaphore, pbar, rid=None):
+async def send_request(
+    session, base_url, text, sampling_params, semaphore, pbar, rid=None, request_timeout=300
+):
     payload = {
         "text": text,
         "sampling_params": sampling_params,
@@ -82,7 +84,7 @@ async def send_request(session, base_url, text, sampling_params, semaphore, pbar
     if rid is not None:
         payload["rid"] = rid
     async with semaphore:
-        timeout = aiohttp.ClientTimeout(total=300)
+        timeout = aiohttp.ClientTimeout(total=request_timeout)
         async with session.post(f"{base_url}/generate", json=payload, timeout=timeout) as response:
             if response.status != 200:
                 error_text = await response.text()
@@ -92,7 +94,7 @@ async def send_request(session, base_url, text, sampling_params, semaphore, pbar
             return result
 
 
-async def run_batch(base_url, questions, sampling_params, parallel, rids=None):
+async def run_batch(base_url, questions, sampling_params, parallel, rids=None, request_timeout=300):
     semaphore = asyncio.Semaphore(parallel)
     pbar = tqdm(total=len(questions), desc="Generating")
     if rids is None:
@@ -100,7 +102,16 @@ async def run_batch(base_url, questions, sampling_params, parallel, rids=None):
 
     async with aiohttp.ClientSession() as session:
         tasks = [
-            send_request(session, base_url, q, sampling_params, semaphore, pbar, rid)
+            send_request(
+                session,
+                base_url,
+                q,
+                sampling_params,
+                semaphore,
+                pbar,
+                rid,
+                request_timeout,
+            )
             for q, rid in zip(questions, rids)
         ]
         results = await asyncio.gather(*tasks)
@@ -172,7 +183,16 @@ def main(args):
         f"(parallelism={args.parallel})..."
     )
     tic = time.perf_counter()
-    results = asyncio.run(run_batch(args.base_url, questions, sampling_params, args.parallel, rids))
+    results = asyncio.run(
+        run_batch(
+            args.base_url,
+            questions,
+            sampling_params,
+            args.parallel,
+            rids,
+            args.request_timeout,
+        )
+    )
     latency = time.perf_counter() - tic
 
     # Extract predictions
@@ -238,6 +258,12 @@ if __name__ == "__main__":
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--parallel", type=int, default=64, help="Max concurrent requests")
+    parser.add_argument(
+        "--request-timeout",
+        type=int,
+        default=300,
+        help="Per-request HTTP timeout in seconds",
+    )
     parser.add_argument(
         "--debug-request-tag-prefix",
         type=str,
