@@ -18,10 +18,6 @@ from sgl_jax.srt.managers.io_struct import (
     ProfileReq,
     ProfileReqOutput,
 )
-from sgl_jax.srt.multimodal.common.modality_enum import (
-    MultimodalDataItem,
-    pad_input_tokens,
-)
 from sgl_jax.srt.multimodal.manager.device_manager import DeviceManager
 from sgl_jax.srt.multimodal.manager.io_struct import (
     TokenizedGenerateAudioReqInput,
@@ -292,57 +288,13 @@ class GlobalScheduler:
         req.origin_input_text = input.prompt
         req.origin_input_ids = input.input_ids
         req.omni_inputs = input.mm_inputs
-        if input.mm_inputs:
-            mm_items = input.mm_inputs.get("mm_items", [])
-            image_items = []
-            video_items = []
-            audio_items = []
-            all_mm_items = []
-            for item in mm_items:
-                if isinstance(item, MultimodalDataItem):
-                    all_mm_items.append(item)
-                    if item.is_image():
-                        image_items.append(item)
-                    elif item.is_video():
-                        video_items.append(item)
-                    elif item.is_audio():
-                        audio_items.append(item)
-                elif isinstance(item, dict):
-                    item_obj = MultimodalDataItem.from_dict(item)
-                    all_mm_items.append(item_obj)
-                    if item_obj.is_image():
-                        image_items.append(item_obj)
-                    elif item_obj.is_video():
-                        video_items.append(item_obj)
-                    elif item_obj.is_audio():
-                        audio_items.append(item_obj)
-
-            pixel_values_list = []
-            pixel_values_images_list = []
-            pixel_values_videos_list = []
-            audio_values_list = []
-            for item in image_items:
-                if item.feature is not None:
-                    pixel_values_list.append(np.asarray(item.feature))
-                    pixel_values_images_list.append(np.asarray(item.feature))
-            for item in video_items:
-                if item.feature is not None:
-                    pixel_values_list.append(np.asarray(item.feature))
-                    pixel_values_videos_list.append(np.asarray(item.feature))
-            for item in audio_items:
-                if item.feature is not None:
-                    audio_values_list.append(np.asarray(item.feature))
-
-            if pixel_values_list:
-                req.pixel_values = np.concatenate(pixel_values_list, axis=0)
-            if pixel_values_images_list:
-                req.pixel_values_images = np.concatenate(pixel_values_images_list, axis=0)
-            if pixel_values_videos_list:
-                req.pixel_values_videos = np.concatenate(pixel_values_videos_list, axis=0)
-            if audio_values_list:
-                req.audio_features = np.concatenate(audio_values_list, axis=0)
-
-            image_grid_thw = input.mm_inputs.get("image_grid_thw")
+        mm_inputs = req.omni_inputs if isinstance(req.omni_inputs, dict) else None
+        if mm_inputs is not None:
+            # P1: mm_items is the single source of truth; feature assembly (mm_items ->
+            # model kwargs) happens in the executors, so the scheduler no longer flattens
+            # features into req.pixel_values_*/audio_features. It only transports grid_thw
+            # for downstream mrope/vision use.
+            image_grid_thw = mm_inputs.get("image_grid_thw")
             if image_grid_thw is not None:
                 if isinstance(image_grid_thw, np.ndarray):
                     image_grid_thw = tuple(map(tuple, image_grid_thw.tolist()))
@@ -352,7 +304,7 @@ class GlobalScheduler:
                     )
             req.image_grid_thw = image_grid_thw
 
-            video_grid_thw = input.mm_inputs.get("video_grid_thw")
+            video_grid_thw = mm_inputs.get("video_grid_thw")
             if video_grid_thw is not None:
                 if isinstance(video_grid_thw, np.ndarray):
                     video_grid_thw = tuple(map(tuple, video_grid_thw.tolist()))
@@ -361,18 +313,6 @@ class GlobalScheduler:
                         tuple(x) if isinstance(x, list) else x for x in video_grid_thw
                     )
             req.video_grid_thw = video_grid_thw
-
-            im_token_id = input.mm_inputs.get("im_token_id")
-            video_token_id = input.mm_inputs.get("video_token_id")
-            audio_token_id = input.mm_inputs.get("audio_token_id")
-            if req.input_ids:
-                req.cache_input_ids = pad_input_tokens(
-                    input_ids=list(req.input_ids),
-                    mm_items=all_mm_items,
-                    im_token_id=im_token_id,
-                    video_token_id=video_token_id,
-                    audio_token_id=audio_token_id,
-                )
         if input.sampling_params is not None:
             req.extra["sampling_params"] = input.sampling_params
         req.extra["stream"] = bool(getattr(input, "stream", False))

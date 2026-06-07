@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import dataclasses
 import uuid
 from enum import Enum, auto
@@ -148,6 +150,13 @@ class GenerateOmniReqInput:
     n: int | None = 1
     sampling_params: dict | None = None
     stop: str | list[str] | None = None
+    # Carried from the OpenAI request so the multimodal path does not silently drop
+    # them (see review D5-5). logprobs are not yet plumbed through the omni AR stage;
+    # serving_chat raises an explicit error when they are requested.
+    return_logprob: bool = False
+    logprob_start_len: int = -1
+    top_logprobs_num: int = 0
+    extra_key: str | None = None
 
     def __post_init__(self):
         if self.rid is None:
@@ -165,7 +174,7 @@ class TokenizedGenerateMMReqInput:
     n: int | None = 1
     input_reference: str | None = None
     preprocessed_image: np.ndarray | None = None
-    mm_inputs: "OmniInputs | None" = None
+    mm_inputs: OmniInputs | None = None
     size: str = None
     seconds: int | None = None
     fps: int | None = None
@@ -182,7 +191,7 @@ class TokenizedGenerateOmniReqInput:
     rid: str | None = None
     prompt: str | None = None
     input_ids: list[int] | None = None
-    mm_inputs: "OmniInputs | None" = None
+    mm_inputs: OmniInputs | None = None
     stream: bool = False
     n: int | None = 1
     sampling_params: dict | None = None

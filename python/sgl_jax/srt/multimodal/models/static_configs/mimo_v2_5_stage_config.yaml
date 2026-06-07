@@ -1,0 +1,33 @@
+model_arch: MiMo-V2.5
+stage_args:
+ - stage_id: 0
+   stage_sub_dir: ""
+   runtime:
+     num_tpus: 1
+     device_kind: tpu
+     max_batch_size: 1
+   scheduler: embedding
+   final_output: false
+   scheduler_params: {}
+   model_class: MiMoV2_5Embedding
+
+ - stage_id: 1
+   stage_sub_dir: ""
+   runtime:
+     num_tpus: 16
+     max_batch_size: 1
+   scheduler: auto_regressive
+   scheduler_params: {}
+   precompile_params: {"capture_hidden_mode": 0, "input_embedding": True, "deepstack_visual_embedding": False, "mrope": False}
+   # AR backbone reuses the text MiMo-V2 MoE LM directly — MiMo-V2.5's text part is
+   # identical to MiMoV2ForCausalLM (no omni-specific AR behavior; the omni merge
+   # happens in stage0, the AR model just reads forward_batch.input_embedding via the
+   # input_embedding hook already in MiMoV2Model). The HF arch name "MiMoV2ForCausalLM"
+   # resolves in stage.py to the fused-QKV mimo_v2_pro variant. CONFIRMED against the
+   # one-hand HF config.json ("attention_projection_layout": "fused_qkv") +
+   # modeling_mimo_v2.py:278 (if projection_layout == "fused_qkv": self.qkv_proj = ...),
+   # so the checkpoint stores self_attn.qkv_proj (not separate q/k/v) and this is the
+   # correct class. (MiMoV2FlashForCausalLM, separate q/k/v, stays registered in stage.py
+   # only as the fallback for a hypothetical split-layout checkpoint.)
+   model_class: MiMoV2ForCausalLM
+   final_output: true

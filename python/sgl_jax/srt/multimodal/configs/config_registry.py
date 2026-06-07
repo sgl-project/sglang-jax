@@ -544,6 +544,9 @@ class AudioBackboneConfigRegistry:
         "MiMo-Audio-7B-Instruct": lambda: MiMoAudioBackboneConfig(),
         "XiaomiMiMo/MiMo-Audio-7B-Base": lambda: MiMoAudioBackboneConfig(),
         "MiMo-Audio-7B-Base": lambda: MiMoAudioBackboneConfig(),
+        # MiMo-V2.5 omni does NOT use the standalone audio_backbone stage; its audio
+        # understanding tower is built inside MiMoV2_5Embedding from config.audio_config.
+        # No MiMo-V2.5 entry here on purpose (was dead code, review D5-2).
     }
 
     _KEYWORD_PATTERNS: list[tuple[str, callable]] = [

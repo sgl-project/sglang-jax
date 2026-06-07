@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import base64
 import dataclasses
@@ -34,6 +36,7 @@ from sgl_jax.srt.managers.io_struct import (
 )
 from sgl_jax.srt.managers.tokenizer_manager import ReqState, TokenizerManager
 from sgl_jax.srt.multimodal.common.modality_enum import Modality, MultimodalDataItem
+from sgl_jax.srt.multimodal.manager.host_processor import resolve_host_processor
 from sgl_jax.srt.multimodal.manager.io_struct import (
     AudioSpeechRequest,
     AudioTranscriptionRequest,
@@ -281,9 +284,10 @@ class MultimodalTokenizer(TokenizerManager):
         self.mm_config = None
 
         # since mimo-audio does not specify preprocessor, manual implementation is required to align
-        # it with the official implementation
+        # it with the official implementation. Match the adjacent "mimo-audio" token (not separate
+        # "mimo"+"audio" substrings) so omni dirs like "MiMo-V2.5-omni-audio" do not collide.
         model_path = server_args.model_path
-        is_mimo_audio = "mimo" in model_path.lower() and "audio" in model_path.lower()
+        is_mimo_audio = "mimo-audio" in model_path.lower()
 
         if is_mimo_audio:
             self.mm_processor = MiMoAudioProcessor()
@@ -317,6 +321,17 @@ class MultimodalTokenizer(TokenizerManager):
 
         self.wait_timeout = int(os.environ.get("SGLANG_WAIT_TIMEOUT", "600"))
 
+        # Some omni models need a composed host processor (e.g. MiMo-V2.5 wraps the
+        # vision-only Qwen2.5-VL processor + a host RVQ audio codec). resolve_host_processor
+        # returns the original mm_processor unchanged for models on the generic path.
+        if self.mm_processor is not None:
+            self.mm_processor = resolve_host_processor(
+                self.mm_config,
+                model_path,
+                self.mm_processor,
+                trust_remote_code=getattr(server_args, "trust_remote_code", True),
+            )
+
         self.prompt_builder = MultimodalPromptBuilder(tokenizer=self.tokenizer)
 
         self.rid_to_state: dict[str, MMReqState] = {}
@@ -336,6 +351,46 @@ class MultimodalTokenizer(TokenizerManager):
                 ),
             ]
         )
+
+    @staticmethod
+    def _get_config_value(config, key: str, default=None):
+        value = getattr(config, key, None)
+        if value is not None:
+            return value
+        processor_config = getattr(config, "processor_config", None)
+        if isinstance(processor_config, dict):
+            return processor_config.get(key, default)
+        return getattr(processor_config, key, default)
+
+    def _effective_mm_config(self):
+        """The config that actually holds multimodal structure.
+
+        Single thinker-resolution point: Qwen3-Omni nests vision/audio config + token ids
+        under ``thinker_config``; other models (e.g. MiMo-V2.5) use the top-level config.
+        Both the mrope branch and token-id lookups resolve through here so there is exactly
+        one place that knows about thinker nesting.
+        """
+        if self.mm_config is None:
+            return None
+        return getattr(self.mm_config, "thinker_config", None) or self.mm_config
+
+    def _get_mm_config_value(self, key: str, default=None):
+        config = self._effective_mm_config()
+        if config is None:
+            return default
+        return self._get_config_value(config, key, default)
+
+    @staticmethod
+    def _uses_mrope(mm_config) -> bool:
+        """True only for models whose rope_scaling declares an mrope_section (Qwen 系).
+
+        Config-driven so 1-D-rope models (e.g. MiMo-V2.5, rope_scaling.type=default) skip
+        mrope without any model-specific flag.
+        """
+        rope_scaling = getattr(mm_config, "rope_scaling", None)
+        if isinstance(rope_scaling, dict):
+            return rope_scaling.get("mrope_section") is not None
+        return getattr(rope_scaling, "mrope_section", None) is not None
 
     def _handle_batch_output(self, reqs: list | BatchStrOut | BatchEmbeddingOut | BatchTokenIDOut):
         """Handle a batch of outputs returned from the pipeline.
@@ -475,12 +530,13 @@ class MultimodalTokenizer(TokenizerManager):
                 image_data = [obj.input_reference]
             elif obj.data_type == DataType.VIDEO:
                 video_data = [obj.input_reference]
-        if (image_data or video_data) and self.mm_processor is None:
+        needs_mm_processor = bool(image_data or video_data or audio_data)
+        if needs_mm_processor and self.mm_processor is None:
             raise ValueError(
                 "Multimodal inputs provided but processor/config is not available. "
                 "Check model_path and trust_remote_code settings."
             )
-        if image_data or video_data or audio_data:
+        if needs_mm_processor:
             images = [
                 self._load_image_from_source(item) for item in image_data
             ]  # note: We did not perform a resize operation
@@ -492,16 +548,21 @@ class MultimodalTokenizer(TokenizerManager):
                 processor_kwargs["videos_kwargs"]["fps"] = video_config.get("fps", _QWEN_FPS)
             else:
                 videos = [self._load_video_from_source(item) for item in video_data]
-            audios = [self._load_audio_from_source(item) for item in audio_data]
+            # Audio routing by processor capability (generic, not model-specific):
+            # continuous processors pre-load waveforms; codes processors load internally.
+            if getattr(self.mm_processor, "feature_extractor", None) is not None:
+                audio_arg = [self._load_audio_from_source(item) for item in audio_data] or None
+            else:
+                audio_arg = audio_data or None
             processor_out = self.mm_processor(
                 images=images or None,
                 videos=videos or None,
-                audio=audios or None,
+                audio=audio_arg,
                 text=input_text or "",
                 return_tensors="pt",
                 **processor_kwargs,
             )
-            if "input_ids" in processor_out:
+            if processor_out.get("input_ids") is not None:
                 input_ids = processor_out["input_ids"][0].tolist()
 
             image_grid_thw = self._to_grid_list(processor_out.get("image_grid_thw"))
@@ -512,16 +573,16 @@ class MultimodalTokenizer(TokenizerManager):
             pixel_values = self._strip_batch_dim(processor_out.get("pixel_values"))
             pixel_values_videos = self._strip_batch_dim(processor_out.get("pixel_values_videos"))
 
+            # mrope: config-driven — only models whose rope_scaling declares an mrope_section
+            # (e.g. Qwen2.5-VL/Qwen3-Omni) use it; 1-D-rope models (e.g. MiMo-V2.5) skip it.
             mrope_positions = None
             mrope_position_delta = None
-            if self.mm_config is not None and input_ids is not None:
-                if hasattr(self.mm_config, "thinker_config"):
-                    # for qwen3-omni
-                    self.mm_config = self.mm_config.thinker_config
-                vision_start_token_id = getattr(self.mm_config, "vision_start_token_id", None)
-                image_token_id = getattr(self.mm_config, "image_token_id", None)
-                video_token_id = getattr(self.mm_config, "video_token_id", None)
-                vision_config = getattr(self.mm_config, "vision_config", None)
+            mm_config = self._effective_mm_config()
+            if mm_config is not None and input_ids is not None and self._uses_mrope(mm_config):
+                vision_start_token_id = self._get_config_value(mm_config, "vision_start_token_id")
+                image_token_id = self._get_config_value(mm_config, "image_token_id")
+                video_token_id = self._get_config_value(mm_config, "video_token_id")
+                vision_config = getattr(mm_config, "vision_config", None)
                 spatial_merge_size = getattr(vision_config, "spatial_merge_size", None)
                 tokens_per_second = getattr(vision_config, "tokens_per_second", None)
                 if (
@@ -556,16 +617,34 @@ class MultimodalTokenizer(TokenizerManager):
                         feature=np.asarray(pixel_values_videos),
                     )
                 )
-            audio_features = processor_out.get("audio_features") or processor_out.get(
-                "input_features"
-            )
-            if audio_features is not None:
+            # Audio as a first-class mm_item: discrete codes (e.g. MiMo-V2.5) or continuous
+            # features. The audio kind/meta is carried generically; the model interprets it.
+            processor_audio_codes = processor_out.get("audio_codes")
+            if processor_audio_codes is not None:
                 mm_items.append(
                     MultimodalDataItem(
                         modality=Modality.AUDIO,
-                        feature=np.asarray(audio_features),
+                        feature=np.asarray(processor_audio_codes),
+                        offsets=processor_out.get("audio_offsets"),
+                        model_specific_data={
+                            "is_codes": True,
+                            "token_lengths": processor_out.get("audio_token_lengths"),
+                            "group_size": processor_out.get("audio_group_size"),
+                            "codebook_sizes": processor_out.get("audio_codebook_sizes"),
+                        },
                     )
                 )
+            else:
+                audio_features = processor_out.get("audio_features")
+                if audio_features is None:
+                    audio_features = processor_out.get("input_features")
+                if audio_features is not None:
+                    mm_items.append(
+                        MultimodalDataItem(
+                            modality=Modality.AUDIO,
+                            feature=np.asarray(audio_features),
+                        )
+                    )
 
             audio_feature_attention_mask = processor_out.get("feature_attention_mask")
             if audio_feature_attention_mask is not None:
@@ -579,11 +658,11 @@ class MultimodalTokenizer(TokenizerManager):
 
             mm_inputs = {
                 "mm_items": mm_items,
-                "im_start_id": getattr(self.mm_config, "vision_start_token_id", None),
-                "im_end_id": getattr(self.mm_config, "vision_end_token_id", None),
-                "im_token_id": getattr(self.mm_config, "image_token_id", None),
-                "video_token_id": getattr(self.mm_config, "video_token_id", None),
-                "audio_token_id": getattr(self.mm_config, "audio_token_id", None),
+                "im_start_id": self._get_mm_config_value("vision_start_token_id"),
+                "im_end_id": self._get_mm_config_value("vision_end_token_id"),
+                "im_token_id": self._get_mm_config_value("image_token_id"),
+                "video_token_id": self._get_mm_config_value("video_token_id"),
+                "audio_token_id": self._get_mm_config_value("audio_token_id"),
                 "mrope_positions": mrope_positions,
                 "mrope_position_delta": mrope_position_delta,
                 "image_grid_thw": image_grid_thw,
@@ -621,13 +700,21 @@ class MultimodalTokenizer(TokenizerManager):
             return []
         return data if isinstance(data, list) else [data]
 
+    _QWEN_VIDEO_PROCESSORS = {"Qwen2_5_VLProcessor", "Qwen3OmniMoeProcessor"}
+
     def _is_qwen_video_processor(self) -> bool:
-        if self.mm_processor is None:
+        processor = self.mm_processor
+        if processor is None:
             return False
-        return self.mm_processor.__class__.__name__ in {
-            "Qwen2_5_VLProcessor",
-            "Qwen3OmniMoeProcessor",
-        }
+        # Consider both the processor itself and any HF processor it wraps, so a
+        # composed host processor (e.g. MiMoV25Processor over Qwen2.5-VL) still routes
+        # video through Qwen preprocessing. `wrapped_hf_processor` is the wrapping
+        # convention; plain processors don't expose it.
+        names = {processor.__class__.__name__}
+        wrapped = getattr(processor, "wrapped_hf_processor", None)
+        if wrapped is not None:
+            names.add(wrapped.__class__.__name__)
+        return bool(names & self._QWEN_VIDEO_PROCESSORS)
 
     def _build_qwen_video_config(self, obj: GenerateMMReqInput | GenerateOmniReqInput) -> dict:
         video_config: dict[str, Any] = {}
@@ -796,15 +883,11 @@ class MultimodalTokenizer(TokenizerManager):
         raise ValueError("Unsupported video source format")
 
     def _load_audio_from_source(self, source: str | bytes) -> np.ndarray:
-        if not hasattr(self.mm_processor, "feature_extractor"):
-            return None
-        if isinstance(source, dict) and "url" in source:
-            source = source["url"]
-        if hasattr(source, "url"):
-            source = source.url
-        if isinstance(source, bytes):
+        # Caller only invokes this for processors that expose a feature_extractor
+        # (continuous-audio path), so sampling_rate is always available below.
+        def load_audio_bytes(audio_bytes: bytes) -> np.ndarray:
             with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
-                tmp.write(source)
+                tmp.write(audio_bytes)
                 tmp_path = tmp.name
             try:
                 audio_data, _ = librosa.load(
@@ -813,20 +896,31 @@ class MultimodalTokenizer(TokenizerManager):
                 return audio_data
             finally:
                 os.unlink(tmp_path)
+
+        if isinstance(source, dict) and "url" in source:
+            source = source["url"]
+        if hasattr(source, "url"):
+            source = source.url
+        if isinstance(source, bytes):
+            return load_audio_bytes(source)
+        if isinstance(source, str) and source.startswith("data:") and "base64," in source:
+            return load_audio_bytes(base64.b64decode(source.split("base64,", 1)[1]))
+        if isinstance(source, str):
+            try:
+                return load_audio_bytes(base64.b64decode(source, validate=True))
+            except Exception:
+                pass
         if os.path.exists(source):
             audio_data, _ = librosa.load(
                 source, sr=self.mm_processor.feature_extractor.sampling_rate
             )
             return audio_data
         if source.startswith(("http://", "https://")):
-            try:
-                audio_data, _ = librosa.load(
-                    BytesIO(urlopen(source, timeout=10).read()),
-                    sr=self.mm_processor.feature_extractor.sampling_rate,
-                )
-                return audio_data
-            finally:
-                pass
+            audio_data, _ = librosa.load(
+                BytesIO(urlopen(source, timeout=10).read()),
+                sr=self.mm_processor.feature_extractor.sampling_rate,
+            )
+            return audio_data
         raise ValueError("Unsupported audio source format")
 
     def _hash_payload(self, payload: bytes) -> int:

@@ -159,7 +159,7 @@ class ModelConfig:
                 self.quantization_config.ignored_layers = ignored
         # Check model type
         self.is_generation = is_generation_model(self.hf_config.architectures, is_embedding)
-        self.is_multimodal = False
+        self.is_multimodal = is_multimodal_model(self.hf_config)
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
 
         # Derive context length
@@ -794,6 +794,26 @@ def is_generation_model(model_architectures: list[str], is_embedding: bool = Fal
         return False
     else:
         return not is_embedding
+
+
+def is_multimodal_model(hf_config) -> bool:
+    architectures = getattr(hf_config, "architectures", None) or []
+    if isinstance(architectures, str):
+        architectures = [architectures]
+    model_type = getattr(hf_config, "model_type", None)
+    # MiMo-V2.5 omni shares model_type "mimo_v2" with the text-only Pro/Flash, but some
+    # checkpoints normalize it to "mimo_v2_5" / "mimo_v25". Accept the same set that
+    # MiMoV25Processor.matches() recognizes, and key multimodality on a vision/audio
+    # config so text-only Pro/Flash (no such config) stay on the text path.
+    normalized_type = str(model_type or "").lower().replace("-", "_").replace(".", "_")
+    if normalized_type in ("mimo_v2", "mimo_v2_5", "mimo_v25", "mimo2_5") and (
+        getattr(hf_config, "vision_config", None) is not None
+        or getattr(hf_config, "audio_config", None) is not None
+    ):
+        return True
+    if hasattr(hf_config, "thinker_config"):
+        return True
+    return any(arch in multimodal_model_archs for arch in architectures)
 
 
 multimodal_model_archs = [
