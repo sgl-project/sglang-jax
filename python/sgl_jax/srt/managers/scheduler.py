@@ -133,6 +133,19 @@ class Scheduler(
     A scheduler that manages a tensor parallel TPU worker, which managaes fixed multi TPU devices.
     """
 
+    @staticmethod
+    def _chunked_req_was_scheduled(adder: PrefillAdder, dp_rank: int, req: Req) -> bool:
+        return any(candidate is req for candidate in adder.can_run_list.get(dp_rank, []))
+
+    @staticmethod
+    def _scheduled_chunked_reqs_for_batch(
+        chunked_reqs: list[Req | None], scheduled_last_iter: list[bool]
+    ) -> list[Req | None]:
+        assert len(chunked_reqs) == len(scheduled_last_iter)
+        return [
+            req if scheduled else None for req, scheduled in zip(chunked_reqs, scheduled_last_iter)
+        ]
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -419,6 +432,7 @@ class Scheduler(
         if self.chunked_prefill_size <= 0:  # -1 means disable
             self.chunked_prefill_size = None
         self.chunked_reqs = [None] * self.dp_size  # Per-DP chunked requests
+        self._chunked_req_scheduled_last_iter = [False] * self.dp_size
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and server_args.enable_mixed_chunk
         )
@@ -1317,6 +1331,7 @@ class Scheduler(
         )
         self.pending_dp_reqs = []
         self.chunked_reqs = [None] * self.dp_size
+        self._chunked_req_scheduled_last_iter = [False] * self.dp_size
         if self.enable_overlap:
             self.result_queue = deque()
 
@@ -1452,11 +1467,13 @@ class Scheduler(
         # Process chunked requests for each DP rank
         chunked_req_to_exclude = {}
         for dp_rank in range(self.dp_size):
-            if self.chunked_reqs[dp_rank] is not None:
+            req = self.chunked_reqs[dp_rank]
+            if req is not None:
                 # Move the chunked request out of the batch so that we can merge
                 # only finished requests to running_batch.
-                chunked_req_to_exclude[dp_rank] = self.chunked_reqs[dp_rank]
-                self.tree_cache.cache_unfinished_req(self.chunked_reqs[dp_rank])
+                chunked_req_to_exclude[dp_rank] = req
+                if self._chunked_req_scheduled_last_iter[dp_rank]:
+                    self.tree_cache.cache_unfinished_req(req)
 
         # Merge the prefill batch into the running batch
         if self.last_batch and self.last_batch.forward_mode.is_extend():
@@ -1558,9 +1575,16 @@ class Scheduler(
 
         # Process existing chunked requests for each DP rank
         for dp_rank in range(self.dp_size):
-            if self.chunked_reqs[dp_rank] is not None:
-                self.chunked_reqs[dp_rank].init_next_round_input()
-                self.chunked_reqs[dp_rank] = adder.add_chunked_req(self.chunked_reqs[dp_rank])
+            req = self.chunked_reqs[dp_rank]
+            if req is not None:
+                req.init_next_round_input()
+                self.chunked_reqs[dp_rank] = adder.add_chunked_req(req)
+                self._chunked_req_scheduled_last_iter[dp_rank] = (
+                    self._chunked_req_was_scheduled(adder, dp_rank, req)
+                    and self.chunked_reqs[dp_rank] is not None
+                )
+            else:
+                self._chunked_req_scheduled_last_iter[dp_rank] = False
 
         # Collect existing LoRA IDs in the running batch if LoRA is enabled
         if self.lora_paths is not None:
@@ -1636,18 +1660,22 @@ class Scheduler(
                     self.chunked_reqs[dp_rank] is None
                 ), f"Chunked request already exists for DP rank {dp_rank} when adding new chunked req"
                 self.chunked_reqs[dp_rank] = adder.new_chunked_reqs[dp_rank]
-            # Increment for any chunked req (new OR continuing) to keep
-            # process_batch_result_prefill from sampling on intermediate chunks.
-            if self.chunked_reqs[dp_rank] is not None:
-                self.chunked_reqs[dp_rank].is_chunked += 1
+                self._chunked_req_scheduled_last_iter[dp_rank] = True
+            # Increment only for chunked requests that entered this forward.
+            if self._chunked_req_scheduled_last_iter[dp_rank]:
+                chunked_req = self.chunked_reqs[dp_rank]
+                assert chunked_req is not None
+                chunked_req.is_chunked += 1
 
         self.log_prefill_stats(adder, all_can_run_reqs, running_bs)
 
         # Use adder.can_run_list directly as reqs_per_dp (already grouped by DP rank)
         reqs_per_dp = [adder.can_run_list.get(i, []) for i in range(self.dp_size)]
 
-        # Use self.chunked_reqs directly as chunked_reqs_per_dp
-        chunked_reqs_per_dp = self.chunked_reqs.copy()
+        # Record only chunked requests that are actually part of this forward.
+        chunked_reqs_per_dp = self._scheduled_chunked_reqs_for_batch(
+            self.chunked_reqs, self._chunked_req_scheduled_last_iter
+        )
 
         # Create a new batch
         new_batch = ScheduleBatch.init_new(
@@ -2063,6 +2091,7 @@ class Scheduler(
                     self._add_request_to_queue(req)
 
             self.chunked_reqs = [None] * self.dp_size
+            self._chunked_req_scheduled_last_iter = [False] * self.dp_size
             logger.info("Paused generation retracted")
         elif recv_req.mode == "in_place":
             logger.info("Paused generation in place")
