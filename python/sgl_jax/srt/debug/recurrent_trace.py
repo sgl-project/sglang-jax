@@ -142,6 +142,10 @@ def digest_arrays_for_indices(buffers: list[Any], indices: list[int], layers: li
     layer_digests = []
     for layer in layers:
         selected = _take_rows(buffers[layer], idx).astype(jnp.float32)
+        value_size = int(np.prod(selected.shape[1:]))
+        if value_size == 0:
+            layer_digests.append(jnp.zeros((len(indices), 4), dtype=jnp.float32))
+            continue
         axes = tuple(range(1, selected.ndim))
         abs_selected = jnp.abs(selected)
         layer_digests.append(
