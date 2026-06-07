@@ -2868,7 +2868,10 @@ class ScheduleBatch:
         for info in self.reqs_info:
             # Create a new ScheduleReqsInfo with shallow copies of necessary fields
             new_info = ScheduleReqsInfo()
-            new_info.reqs = info.reqs  # Shallow copy (list reference)
+            # Snapshot the list container so later in-place filter/merge on the
+            # live batch cannot change the launch-time req order. Req objects
+            # themselves stay shared for result processing.
+            new_info.reqs = info.reqs.copy()
             new_info.out_cache_loc = info.out_cache_loc
             new_info.decoding_reqs = info.decoding_reqs
             # process_batch_result compacts per-DP padded input logprobs via
