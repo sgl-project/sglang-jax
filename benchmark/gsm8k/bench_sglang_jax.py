@@ -73,12 +73,14 @@ def get_answer_value(answer_str):
         return INVALID
 
 
-async def send_request(session, base_url, text, sampling_params, semaphore, pbar):
+async def send_request(session, base_url, text, sampling_params, semaphore, pbar, rid=None):
     payload = {
         "text": text,
         "sampling_params": sampling_params,
         "stream": False,
     }
+    if rid is not None:
+        payload["rid"] = rid
     async with semaphore:
         timeout = aiohttp.ClientTimeout(total=300)
         async with session.post(f"{base_url}/generate", json=payload, timeout=timeout) as response:
@@ -90,13 +92,16 @@ async def send_request(session, base_url, text, sampling_params, semaphore, pbar
             return result
 
 
-async def run_batch(base_url, questions, sampling_params, parallel):
+async def run_batch(base_url, questions, sampling_params, parallel, rids=None):
     semaphore = asyncio.Semaphore(parallel)
     pbar = tqdm(total=len(questions), desc="Generating")
+    if rids is None:
+        rids = [None] * len(questions)
 
     async with aiohttp.ClientSession() as session:
         tasks = [
-            send_request(session, base_url, q, sampling_params, semaphore, pbar) for q in questions
+            send_request(session, base_url, q, sampling_params, semaphore, pbar, rid)
+            for q, rid in zip(questions, rids)
         ]
         results = await asyncio.gather(*tasks)
 
@@ -134,6 +139,7 @@ def main(args):
 
     questions = []
     labels = []
+    rids = []
     for i in range(len(lines[:num_questions])):
         raw_question = few_shot_examples + get_one_example(lines, i, False)
         if tokenizer is not None:
@@ -146,6 +152,10 @@ def main(args):
             )
         questions.append(raw_question)
         labels.append(get_answer_value(lines[i]["answer"]))
+        if args.debug_request_tag_prefix:
+            rids.append(f"{args.debug_request_tag_prefix}-{i:05d}")
+        else:
+            rids.append(None)
     assert all(label != INVALID for label in labels)
 
     # Sampling parameters
@@ -162,7 +172,7 @@ def main(args):
         f"(parallelism={args.parallel})..."
     )
     tic = time.perf_counter()
-    results = asyncio.run(run_batch(args.base_url, questions, sampling_params, args.parallel))
+    results = asyncio.run(run_batch(args.base_url, questions, sampling_params, args.parallel, rids))
     latency = time.perf_counter() - tic
 
     # Extract predictions
@@ -189,6 +199,7 @@ def main(args):
         with open(args.output_file, "w") as f:
             for i, r in enumerate(results):
                 f.write(f"=== Question {i} ===\n")
+                f.write(f"=== Request ID: {r.get('meta_info', {}).get('id', rids[i])} ===\n")
                 f.write(questions[i] + "\n")
                 f.write("=== Answer ===\n")
                 f.write(r["text"] + "\n")
@@ -227,6 +238,12 @@ if __name__ == "__main__":
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--parallel", type=int, default=64, help="Max concurrent requests")
+    parser.add_argument(
+        "--debug-request-tag-prefix",
+        type=str,
+        default=None,
+        help="If set, send each request with a stable rid '<prefix>-00000' for tracing.",
+    )
     parser.add_argument(
         "--result-file",
         type=str,

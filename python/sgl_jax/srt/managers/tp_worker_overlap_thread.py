@@ -12,6 +12,7 @@ import numpy as np
 import psutil
 from jax.sharding import NamedSharding, PartitionSpec
 
+from sgl_jax.srt.debug import recurrent_trace
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 from sgl_jax.srt.managers.tp_worker import ModelWorker
 from sgl_jax.srt.managers.utils import resolve_future_token_ids, set_future_token_ids
@@ -109,6 +110,15 @@ class ModelWorkerClient:
             model_worker_batch.forward_batch.input_ids = resolve_future_token_ids(
                 input_ids, self.future_token_ids_map, self.mesh
             )
+            trace_payload = None
+            if recurrent_trace.enabled() and model_worker_batch.forward_batch.trace_records:
+                trace_payload = {
+                    "bid": model_worker_batch.bid,
+                    "mode": str(model_worker_batch.forward_mode),
+                    "records": model_worker_batch.forward_batch.trace_records,
+                    "input_ids_before_resolve": input_ids,
+                    "input_ids_after_resolve": model_worker_batch.forward_batch.input_ids,
+                }
 
             # Run forward
             with jax.profiler.TraceAnnotation(f"forward_batch_generation {model_worker_batch.bid}"):
@@ -120,6 +130,9 @@ class ModelWorkerClient:
                         forward_metadata=forward_metadata,
                     )
                 )
+            state_trace_payload = getattr(
+                self.worker.model_runner, "_last_recurrent_trace_payload", None
+            )
             next_token_ids = self.async_gather_fn(next_token_ids)
             # Update the future token ids map
             self.future_token_ids_map = set_future_token_ids(
@@ -128,7 +141,16 @@ class ModelWorkerClient:
                 next_token_ids,
                 self.mesh,
             )
-            self.output_queue.put((None, logits_output, next_token_ids, cache_miss_count))
+            self.output_queue.put(
+                (
+                    None,
+                    logits_output,
+                    next_token_ids,
+                    cache_miss_count,
+                    trace_payload,
+                    state_trace_payload,
+                )
+            )
 
     def resolve_last_batch_result(self, launch_done: threading.Event | None = None):
         """
@@ -140,7 +162,20 @@ class ModelWorkerClient:
         overlap on PCIe rather than serializing the per-array sync that
         jax.device_get does.
         """
-        _, logits_output, next_token_ids, cache_miss_count = self.output_queue.get()
+        output_item = self.output_queue.get()
+        if len(output_item) == 4:
+            _, logits_output, next_token_ids, cache_miss_count = output_item
+            trace_payload = None
+            state_trace_payload = None
+        else:
+            (
+                _,
+                logits_output,
+                next_token_ids,
+                cache_miss_count,
+                trace_payload,
+                state_trace_payload,
+            ) = output_item
         # Step 1: kick off async D2H copies for everything we need
         async_next_logprobs = (
             jax.copy_to_host_async(logits_output.next_token_logprobs)
@@ -157,6 +192,11 @@ class ModelWorkerClient:
             if logits_output.hidden_states is not None
             else None
         )
+        async_before_resolve = None
+        async_after_resolve = None
+        if trace_payload is not None:
+            async_before_resolve = jax.copy_to_host_async(trace_payload["input_ids_before_resolve"])
+            async_after_resolve = jax.copy_to_host_async(trace_payload["input_ids_after_resolve"])
         next_token_ids = jax.device_get(next_token_ids).tolist()
 
         # Step 2: materialize. The first np.asarray waits for that array's
@@ -167,11 +207,46 @@ class ModelWorkerClient:
             logits_output.input_token_logprobs = np.asarray(async_input_logprobs).tolist()
         if async_hidden_states is not None:
             logits_output.hidden_states = np.asarray(async_hidden_states)
+        if trace_payload is not None:
+            before_resolve = np.asarray(async_before_resolve)
+            after_resolve = np.asarray(async_after_resolve)
+            for record in trace_payload["records"]:
+                token_start = record["input_token_start"]
+                token_stop = record["input_token_stop"]
+                recurrent_trace.write_event(
+                    "future_token_resolve",
+                    **record,
+                    input_ids_before_resolve=before_resolve[token_start:token_stop].tolist(),
+                    input_ids_after_resolve=after_resolve[token_start:token_stop].tolist(),
+                )
+        if state_trace_payload is not None:
+            self._write_state_trace_payload(state_trace_payload)
 
         if launch_done is not None:
             launch_done.wait()
 
         return logits_output, next_token_ids, cache_miss_count
+
+    def _write_state_trace_payload(self, payload):
+        rec_before = recurrent_trace.materialize(payload.get("recurrent_before"))
+        rec_after = recurrent_trace.materialize(payload.get("recurrent_after"))
+        conv_before = recurrent_trace.materialize(payload.get("conv_before"))
+        conv_after = recurrent_trace.materialize(payload.get("conv_after"))
+        layers = payload.get("layers") or []
+        for row_idx, record in enumerate(payload.get("records") or []):
+            event = {
+                **record,
+                "layers": layers,
+            }
+            if rec_before is not None:
+                event["recurrent_before"] = rec_before[:, row_idx, :]
+            if rec_after is not None:
+                event["recurrent_after"] = rec_after[:, row_idx, :]
+            if conv_before is not None:
+                event["conv_before"] = conv_before[:, row_idx, :]
+            if conv_after is not None:
+                event["conv_after"] = conv_after[:, row_idx, :]
+            recurrent_trace.write_event("state_digest", **event)
 
     def forward_batch_generation(
         self,

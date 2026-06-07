@@ -184,6 +184,7 @@ class ForwardBatch:
 
     trace_request_ids: list[str] | None = None
     trace_request_objects: list | None = None
+    trace_records: list[dict] | None = None
 
     spec_info: EagleVerifyInput | EagleDraftInput | None = None
     spec_algorithm: SpeculativeAlgorithm = None
@@ -248,6 +249,7 @@ class ForwardBatch:
         obj.deterministic = aux_data.get("deterministic", True)
         obj.trace_request_ids = None
         obj.trace_request_objects = None
+        obj.trace_records = None
 
         obj.input_ids = children[0]
         obj.req_pool_indices = children[1]
@@ -418,6 +420,9 @@ class ForwardBatch:
             expert_location_metadata=expert_location_metadata,
             recurrent_indices=recurrent_indices,
         )
+        obj.trace_records = batch.trace_records
+        if batch.trace_records:
+            obj.trace_request_ids = [record["rid"] for record in batch.trace_records]
 
         # Auto-generate attention mask for Encoder-only models (e.g. UMT5Encoder, BERT)
         is_embedding = getattr(model_runner.model_config, "is_embedding", False)

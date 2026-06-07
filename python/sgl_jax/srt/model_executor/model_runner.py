@@ -11,6 +11,7 @@ from jax._src import mesh as mesh_lib
 
 from sgl_jax.srt.configs.load_config import LoadConfig
 from sgl_jax.srt.configs.model_config import AttentionArch, MockModelConfig, ModelConfig
+from sgl_jax.srt.debug import recurrent_trace
 from sgl_jax.srt.eplb.expert_location import (
     init_expert_location_metadata,
     set_global_server_args,
@@ -90,6 +91,9 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         self.spec_algorithm = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
 
         self.forward_pass_id = 0
+        self._last_recurrent_trace_payload = None
+        self._recurrent_trace_extend_batches = 0
+        self._recurrent_trace_decode_batches = 0
 
         # For sampling
         self.use_sort_for_toppk_minp = server_args.use_sort_for_toppk_minp
@@ -235,7 +239,6 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             rng_step,
             *args,
         ):
-
             model_state = jax.tree_util.tree_unflatten(sampler_state_def, sampler_state_leaves)
             sampler = nnx.merge(sampler_def, model_state)
             rng_key = jax.random.fold_in(base_rng_key, rng_step)
@@ -483,6 +486,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         cache_miss_count = 0
         import jax._src.test_util as jtu
 
+        recurrent_trace_payload = self._start_recurrent_trace_payload(forward_batch)
         with jtu.count_pjit_cpp_cache_miss() as count:
             output, pool_updates, _, layers_topk_ids = self.jitted_run_model(
                 forward_batch, logits_metadata
@@ -494,10 +498,79 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         if self.tp_size == 1 and isinstance(pool_updates, list):
             target_sharding = self.token_to_kv_pool.kv_sharding
             pool_updates = [jax.device_put(kv, target_sharding) for kv in pool_updates]
+        self._last_recurrent_trace_payload = self._finish_recurrent_trace_payload(
+            recurrent_trace_payload, pool_updates
+        )
         self.memory_pools.replace_all(pool_updates)
 
         # layers_topk_ids required real_bs and original_input_len which could not be stored in ForwardBatch
         return output, cache_miss_count, layers_topk_ids
+
+    def _should_capture_recurrent_trace(self, forward_batch: ForwardBatch) -> bool:
+        if not recurrent_trace.enabled() or not forward_batch.trace_records:
+            return False
+        if not hasattr(self.memory_pools, "recurrent_state_pool"):
+            return False
+        if forward_batch.forward_mode.is_extend():
+            limit = recurrent_trace.env_int("SGLANG_DBG_RECUR_TRACE_MAX_EXTEND_BATCHES", 2)
+            if self._recurrent_trace_extend_batches >= limit:
+                return False
+            self._recurrent_trace_extend_batches += 1
+            return True
+        if forward_batch.forward_mode.is_decode():
+            limit = recurrent_trace.env_int("SGLANG_DBG_RECUR_TRACE_MAX_DECODE_BATCHES", 2)
+            if self._recurrent_trace_decode_batches >= limit:
+                return False
+            self._recurrent_trace_decode_batches += 1
+            return True
+        return False
+
+    def _start_recurrent_trace_payload(self, forward_batch: ForwardBatch):
+        if not self._should_capture_recurrent_trace(forward_batch):
+            return None
+
+        before_pool = self.memory_pools.recurrent_state_pool
+        layers = recurrent_trace.layer_indices(len(before_pool.recurrent_buffers))
+        records = forward_batch.trace_records or []
+        indices = [int(record["recurrent_idx"]) for record in records]
+
+        conv_before = [inner[0] for inner in before_pool.conv_buffers]
+
+        return {
+            "bid": forward_batch.bid,
+            "mode": str(forward_batch.forward_mode),
+            "forward_pass_id": self.forward_pass_id,
+            "layers": layers,
+            "records": records,
+            "recurrent_before": recurrent_trace.digest_arrays_for_indices(
+                before_pool.recurrent_buffers, indices, layers
+            ),
+            "conv_before": recurrent_trace.digest_arrays_for_indices(conv_before, indices, layers),
+        }
+
+    def _finish_recurrent_trace_payload(self, payload, pool_updates):
+        if payload is None:
+            return None
+        if not isinstance(pool_updates, dict) or "recurrent_state_pool" not in pool_updates:
+            return None
+
+        recurrent_after, conv_after_nested = pool_updates["recurrent_state_pool"]
+        layers = payload["layers"]
+        indices = [int(record["recurrent_idx"]) for record in payload["records"]]
+        conv_after = [inner[0] for inner in conv_after_nested]
+
+        payload = dict(payload)
+        payload.update(
+            {
+                "recurrent_after": recurrent_trace.digest_arrays_for_indices(
+                    recurrent_after, indices, layers
+                ),
+                "conv_after": recurrent_trace.digest_arrays_for_indices(
+                    conv_after, indices, layers
+                ),
+            }
+        )
+        return payload
 
     def forward_idle(
         self,

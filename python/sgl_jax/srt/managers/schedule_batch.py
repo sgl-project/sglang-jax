@@ -30,6 +30,7 @@ from jax._src import mesh as mesh_lib
 
 from sgl_jax.global_config import global_config
 from sgl_jax.srt.configs.model_config import ModelConfig
+from sgl_jax.srt.debug import recurrent_trace
 from sgl_jax.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
@@ -757,7 +758,7 @@ class ScheduleBatch:
         is_hybrid = False
         if isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):
             assert tree_cache is None or isinstance(
-                tree_cache, (SWARadixCache, ChunkCache)
+                tree_cache, SWARadixCache | ChunkCache
             ), "SWARadixCache or ChunkCache is required for SWATokenToKVPoolAllocator"
             is_hybrid = True
 
@@ -2185,6 +2186,94 @@ class ScheduleBatch:
                 debug_layout,
             )
 
+    def _build_recurrent_trace_records(
+        self,
+        *,
+        bid: int,
+        input_ids_cpu: np.ndarray,
+        req_pool_indices_cpu: np.ndarray,
+        recurrent_indices_cpu: np.ndarray | None,
+        has_initial_state_cpu: np.ndarray,
+        real_bs_per_dp: list[int],
+        per_dp_token_size: int,
+        per_dp_bs_size: int,
+    ) -> list[dict[str, Any]] | None:
+        if not recurrent_trace.enabled():
+            return None
+
+        records: list[dict[str, Any]] = []
+        offset_tok = 0
+        offset_bs = 0
+        mode = str(self.forward_mode)
+        for dp_rank, dp_bs in enumerate(real_bs_per_dp):
+            info = self.reqs_info[dp_rank]
+            if dp_bs <= 0 or not info.reqs:
+                offset_tok += per_dp_token_size
+                offset_bs += per_dp_bs_size
+                continue
+            local_token_pt = 0
+            for local_idx, req in enumerate(info.reqs[:dp_bs]):
+                if self.forward_mode.is_extend():
+                    extend_len = (
+                        int(info.extend_lens[local_idx])
+                        if info.extend_lens is not None and local_idx < len(info.extend_lens)
+                        else 0
+                    )
+                    token_start = offset_tok + local_token_pt
+                    token_stop = token_start + extend_len
+                    input_token_ids = input_ids_cpu[token_start:token_stop].tolist()
+                    local_token_pt += extend_len
+                else:
+                    token_start = offset_tok + local_idx
+                    token_stop = token_start + 1
+                    input_token_ids = input_ids_cpu[token_start:token_stop].tolist()
+
+                if not recurrent_trace.should_trace_rid(req.rid):
+                    continue
+
+                global_row = offset_bs + local_idx
+                record = {
+                    "bid": bid,
+                    "mode": mode,
+                    "dp_rank": dp_rank,
+                    "local_idx": local_idx,
+                    "global_row": global_row,
+                    "rid": req.rid,
+                    "request_idx": recurrent_trace.request_index_from_rid(req.rid),
+                    "req_pool_idx": int(req_pool_indices_cpu[global_row]),
+                    "recurrent_idx": (
+                        int(recurrent_indices_cpu[global_row])
+                        if recurrent_indices_cpu is not None
+                        else None
+                    ),
+                    "has_initial_state": bool(has_initial_state_cpu[global_row]),
+                    "seq_len": int(info.seq_lens[local_idx]) if info.seq_lens is not None else None,
+                    "prefix_len": (
+                        int(info.prefix_lens[local_idx])
+                        if info.prefix_lens is not None and local_idx < len(info.prefix_lens)
+                        else None
+                    ),
+                    "extend_len": (
+                        int(info.extend_lens[local_idx])
+                        if info.extend_lens is not None and local_idx < len(info.extend_lens)
+                        else None
+                    ),
+                    "decode_batch_idx": int(req.decode_batch_idx),
+                    "extend_batch_idx": int(req.extend_batch_idx),
+                    "output_len": len(req.output_ids),
+                    "output_ids_tail": req.output_ids[-4:],
+                    "input_token_start": token_start,
+                    "input_token_stop": token_stop,
+                    "input_token_ids": input_token_ids,
+                }
+                records.append(record)
+                recurrent_trace.write_event("schedule_batch_row", **record)
+
+            offset_tok += per_dp_token_size
+            offset_bs += per_dp_bs_size
+
+        return records or None
+
     def _merge_cache_loc(
         self,
         bs_paddings: list,
@@ -2671,6 +2760,16 @@ class ScheduleBatch:
             per_dp_token_size=per_dp_token_padding,
             per_dp_bs_size=per_dp_bs_padding,
         )
+        trace_records = self._build_recurrent_trace_records(
+            bid=bid,
+            input_ids_cpu=input_ids_cpu,
+            req_pool_indices_cpu=req_pool_indices_cpu,
+            recurrent_indices_cpu=recurrent_indices_cpu,
+            has_initial_state_cpu=has_initial_state_cpu,
+            real_bs_per_dp=real_bs_per_dp,
+            per_dp_token_size=per_dp_token_padding,
+            per_dp_bs_size=per_dp_bs_padding,
+        )
 
         # Step 6: Generate trace info if needed
         if precision_tracer.get_trace_active():
@@ -2807,6 +2906,7 @@ class ScheduleBatch:
             deepstack_visual_embedding=deepstack_visual_embedding,
             recurrent_indices=recurrent_indices_cpu,
             has_initial_state=has_initial_state_cpu,
+            trace_records=trace_records,
             spec_algorithm=self.spec_algorithm,
         )
 
@@ -3007,7 +3107,7 @@ def _extract_mm_value(mm_inputs: Any, key: str):
 def _as_int_scalar(value: Any, default: int = 0) -> int:
     if value is None:
         return default
-    if isinstance(value, (np.ndarray, jax.Array)):
+    if isinstance(value, np.ndarray | jax.Array):
         arr = np.asarray(value)
         if arr.size == 0:
             return default
@@ -3257,6 +3357,9 @@ class ModelWorkerBatch:
 
     # Whether each request has prior recurrent state (lazy zero-on-read)
     has_initial_state: np.ndarray | None = None
+
+    # Host-only debug records for env-gated recurrent trace logging.
+    trace_records: list[dict[str, Any]] | None = None
 
     def get_original_input_len(self):
         """

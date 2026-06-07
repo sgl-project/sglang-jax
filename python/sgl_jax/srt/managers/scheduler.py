@@ -28,6 +28,7 @@ from sgl_jax.srt.constrained.base_grammar_backend import (
     INVALID_GRAMMAR_OBJ,
     create_grammar_backend,
 )
+from sgl_jax.srt.debug import recurrent_trace
 from sgl_jax.srt.hf_transformers_utils import get_tokenizer
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
 from sgl_jax.srt.managers.communication import CommunicationBackend
@@ -1010,6 +1011,16 @@ class Scheduler(
             return_hidden_states=recv_req.return_hidden_states,
         )
         req.tokenizer = self.tokenizer
+        if recurrent_trace.should_trace_rid(req.rid):
+            recurrent_trace.write_event(
+                "request_received",
+                rid=req.rid,
+                request_idx=recurrent_trace.request_index_from_rid(req.rid),
+                dp_rank=recv_req.dp_rank,
+                input_len=len(req.origin_input_ids),
+                input_ids_tail=req.origin_input_ids[-8:],
+                max_new_tokens=req.sampling_params.max_new_tokens,
+            )
         if hasattr(recv_req, "mm_inputs") and recv_req.mm_inputs:
             req.mm_inputs = recv_req.mm_inputs
             multimodal_embedding = recv_req.mm_inputs.get("multimodal_embedding")
@@ -1402,7 +1413,7 @@ class Scheduler(
                 protected = self.tree_cache.protected_size(dp_rank=dp)
                 if avail + evict + protected != size_per_rank:
                     leak_msgs.append(
-                        f"[dp={dp}] expected={size_per_rank}, " f"{avail=}, {evict=}, {protected=}"
+                        f"[dp={dp}] expected={size_per_rank}, {avail=}, {evict=}, {protected=}"
                     )
             if leak_msgs:
                 raise ValueError(
@@ -1767,7 +1778,7 @@ class Scheduler(
                 )
             else:
                 logger.info(
-                    "Testing retraction." " #retracted_reqs: %d, #aborted_reqs: %d",
+                    "Testing retraction. #retracted_reqs: %d, #aborted_reqs: %d",
                     num_retracted_reqs,
                     len(reqs_to_abort),
                 )
@@ -1848,7 +1859,6 @@ class Scheduler(
                 with jax.profiler.TraceAnnotation(
                     f"forward_batch_generation_overlap {self.forward_ct}"
                 ):
-
                     logits_output, next_token_ids, cache_miss_count = (
                         self.tp_worker.forward_batch_generation(
                             model_worker_batch, sampling_metadata=None
