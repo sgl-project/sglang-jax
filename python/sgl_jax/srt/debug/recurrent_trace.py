@@ -165,4 +165,9 @@ def digest_arrays_for_indices(buffers: list[Any], indices: list[int], layers: li
 def materialize(value: Any) -> Any:
     if value is None:
         return None
-    return jax.device_get(value)
+    try:
+        return jax.device_get(value)
+    except RuntimeError as exc:
+        if "non-addressable" not in str(exc):
+            raise
+        return None

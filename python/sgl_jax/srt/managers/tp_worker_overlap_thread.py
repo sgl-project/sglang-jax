@@ -208,16 +208,28 @@ class ModelWorkerClient:
         if async_hidden_states is not None:
             logits_output.hidden_states = np.asarray(async_hidden_states)
         if trace_payload is not None:
-            before_resolve = np.asarray(async_before_resolve)
-            after_resolve = np.asarray(async_after_resolve)
+            before_resolve = recurrent_trace.materialize(async_before_resolve)
+            after_resolve = recurrent_trace.materialize(async_after_resolve)
             for record in trace_payload["records"]:
                 token_start = record["input_token_start"]
                 token_stop = record["input_token_stop"]
+                event = {**record}
+                if before_resolve is not None:
+                    event["input_ids_before_resolve"] = before_resolve[
+                        token_start:token_stop
+                    ].tolist()
+                else:
+                    event["input_ids_before_resolve"] = record.get("input_token_ids")
+                    event["input_ids_before_resolve_materialize_skipped"] = True
+                if after_resolve is not None:
+                    event["input_ids_after_resolve"] = after_resolve[
+                        token_start:token_stop
+                    ].tolist()
+                else:
+                    event["input_ids_after_resolve_materialize_skipped"] = True
                 recurrent_trace.write_event(
                     "future_token_resolve",
-                    **record,
-                    input_ids_before_resolve=before_resolve[token_start:token_stop].tolist(),
-                    input_ids_after_resolve=after_resolve[token_start:token_stop].tolist(),
+                    **event,
                 )
         if state_trace_payload is not None:
             self._write_state_trace_payload(state_trace_payload)
