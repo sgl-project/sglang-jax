@@ -1657,3 +1657,55 @@ precompile dummy 和真实请求输入不一致：
   当前 request-path cache miss 已清零，应转向 prefill/decode 调度、
   16k chunked prefill 与 decode interleave、以及同批 chain 的实际
   running/queue 分布。
+
+### 2026-06-07 正式 16k/1k bench 结果
+
+代码：
+
+- commit：`6efa46b4 Fix spec decode precompile cache keys`
+- pod 文件已同步校验：
+  `python/sgl_jax/srt/speculative/eagle_worker.py`
+  sha256 `f28e7fd00c01e141b3ebf8f0df59522d5e3f6c209521187de85ed7873d34f8b6`
+- server run id：`bench16k_formal_103806`
+- server 环境：无 `JAX_EXPLAIN_CACHE_MISSES`，无 `JAX_LOG_COMPILES`，
+  保留 `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache`
+- 启动参数同 16k bench 规格：
+  `--context-length 18432 --max-prefill-tokens 16384 --chunked-prefill-size 4096`
+  `--max-running-requests 128 --precompile-bs-paddings 32 64 128`
+  `--precompile-token-paddings 4096 8192 16384`
+
+最终错误检查：
+
+- 4 个 rank log 中
+  `Traceback|AssertionError|ERROR|Killed|Received sigquit|TypeError|ValueError|OOM|leak detected`
+  计数均为 `0`。
+
+bench 命令固定参数：
+
+- `--dataset-name random`
+- `--num-prompts 300`
+- `--random-input-len 16384`
+- `--random-output-len 1024`
+- `--random-range-ratio 1`
+- `--warmup-requests 0`
+- `--disable-tqdm`
+
+结果：
+
+| max concurrency | success | duration (s) | output tok/s | total tok/s | mean TTFT (ms) | mean TPOT (ms) | peak output tok/s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 32 | 300/300 | 1610.25 | 191.01 | 3243.46 | 72872.97 | 94.57 | 2376.00 |
+| 64 | 300/300 | 1610.91 | 190.95 | 3242.15 | 227653.76 | 91.14 | 2377.00 |
+| 128 | 300/300 | 1643.35 | 187.17 | 3178.13 | 481973.30 | 84.66 | 2457.00 |
+
+和修复前正式 bench 对比：
+
+- c32 基本持平：`191.01` vs 旧 `191.01 tok/s`。
+- c64 小幅提升：`190.95` vs 旧 `188.02 tok/s`。
+- c128 小幅提升：`187.17` vs 旧 `185.47 tok/s`。
+
+结论：
+
+- request-path JAX tracing cache miss 已修掉并验证清零。
+- 16k/1k 总体吞吐仍主要受 16k chunked prefill 与 decode interleave /
+  调度窗口限制影响；当前低吞吐不应继续归因于 JAX tracing cache miss。
