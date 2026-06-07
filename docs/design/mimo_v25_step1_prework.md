@@ -275,3 +275,65 @@ EmbedModelRunner.forward(请求):
 ### 附录
 - 本文覆盖三项必做前置（问题 1/2/3）+ 两条后续限制（DP>1、batch>1）+ 复盘备查；问题编号为本文内部编号，独立成文。
 - 全程以源码为准（branch `fix/dp-multimodal-input-embedding`）；`文件:行号` 为审读时所见，实施前请复核（行号可能随提交漂移）。
+
+---
+
+# 附章 · multimodal runtime 的 multi-host(SPMD)支持
+
+> **动因**：MiMo-V2.5 omni 的 AR backbone 是 293GiB FP8 256-expert MoE，单 v6e chip 32GiB 装不下，需 16 chip。而 v6e-16 = **4 host × 4 chip**（multi-host）。当前 multimodal runtime（`GlobalScheduler` + `Stage`）是**单进程单 host**：从不调 `jax.distributed.initialize`，`DeviceManager()=jax.devices()` 只看到本机 4 chip，`allocate(16)` 直接报 `device is not enough`。本章给 multimodal runtime 加 multi-host。
+
+## A. 现状与候选路径
+
+| 路径 | 机制 | 契合度 | 取舍 |
+|---|---|---|---|
+| Pathways 单-controller | `JAX_PLATFORMS=proxy`，1 进程经 IFRT proxy 驱动全部 16 chip | 架构契合好（单 controller + queue 不变） | ❌ 此 GKE 环境无 Pathways 现成支撑 |
+| **SPMD 多-controller** | 4 pod 各跑一进程，`jax.distributed.initialize` 组 16-chip mesh，所有 rank 跑相同 jitted forward | 与同集群真机样板 `perf-16`（`TPU_WORKER_HOSTNAMES`+`TPU_WORKER_ID`）一致 | ✅ **选用** |
+
+## B. 标准 runtime 的 SPMD 模型（复用基础）
+
+`managers/scheduler.py`（= multimodal AR stage 的 `AutoRegressiveScheduler` 别名）**已内建** multi-host：
+- `node_rank==0` 收 ZMQ 请求 → `recv_requests()` → `broadcast_pyobj()`（pub/sub `pub_sub_addr`）广播到非 rank0；
+- 所有 rank 跑**相同** jitted forward，jax SPMD 自动处理跨 host collective；
+- `nnodes>1` 时 `jax.distributed.initialize(dist_init_addr, nnodes, node_rank)`；`mem_fraction_static` 已 `0.5/process_count()` 自适应。
+
+## C. 核心矛盾：QueueBackend 旁路了标准 broadcast
+
+multimodal 里 AR stage 以 `communication_backend=QueueBackend(in/out queue)` 实例化（`stage.py:164,179`）→ 其 IO 走**进程内 queue**，标准 scheduler 的 ZMQ recv + pub/sub broadcast 被旁路。
+
+**死锁链**：仅进程级加 `jax.distributed.initialize` 而不广播 batch → rank0 GlobalScheduler 收请求投 rank0 stage queue → rank0 AR forward 发起 SPMD collective **等其它 rank**；非 rank0 stage queue 永空、AR 不触发 → **collective 永久死锁**。
+
+∴ 真正要解决的是：**进 AR stage 的每个 batch 必须从 rank0 广播到全部 4 rank，同步跑相同 forward**。
+
+## D. 方案（5 处改动，按数据流由外到内）
+
+1. **launch 透传 + 非 rank0 精简启动** — `multimodal/entrypoint/http_server.py:launch`
+   - 把 `nnodes/node_rank/dist_init_addr` 经 `server_args` 透传进 `run_global_scheduler_process`。
+   - `node_rank>=1`：只起 GlobalScheduler 进程，**不起** tokenizer/detokenizer/http server（仿 `entrypoints/engine.py:585` 的 `node_rank>=1` 分支），跑完 join 等待。
+
+2. **GlobalScheduler 进程级 init distributed** — `multimodal/manager/global_scheduler.py:run_global_scheduler_process`
+   - 在 `GlobalScheduler(...)`→`DeviceManager()` **之前**：`if server_args.nnodes>1 and not jax.distributed.is_initialized(): jax.distributed.initialize(server_args.dist_init_addr, server_args.nnodes, server_args.node_rank)`。
+   - init 后 `jax.devices()` 返回全局 16，`DeviceManager` 才能 `allocate(16)`。
+
+3. **AR stage batch 跨 rank 广播** — `GlobalScheduler` + `Stage`
+   - rank0：把 dispatch 到 AR stage（`scheduler=="auto_regressive"`）的 batch 经 pub/sub 广播给非 rank0。
+   - 非 rank0：GlobalScheduler 精简循环——只订阅 rank0 的 AR batch、投入本 rank 的 AR stage queue，使所有 rank 的 AR forward 同步触发。
+   - 复用标准 scheduler 已有的 pub/sub 原语（`run_publisher`/`run_subscriber`/`broadcast_pyobj`），避免重写。
+
+4. **embed(CPU) 只在 rank0 执行** — stage 编排
+   - embed stage `device_kind:cpu` 仅 rank0 跑（CPU 算 + 既有 host-roundtrip `np.asarray` 进 AR）；非 rank0 不构造 embed stage（省内存、避免 4 份重复 CPU 计算）。
+
+5. **device_indexes / mesh** — 已被现有逻辑覆盖
+   - `server_args.py:267` 多机时 `device_indexes=None`;`create_device_mesh` 的 `[-1, num_tpus]` 在 init distributed 后跨 host 成立（标准路径已验证）。AR mesh `[data=1, tensor=16]`，`num_tpus=16` 整除 256 experts，fused MoE EP=16 ✓。
+
+## E. 部署形态（GKE）
+
+- **4-pod Indexed Job**（completions=parallelism=4），headless Service 做 rank 发现；对齐同集群 `perf-16`。
+- 每 pod env：`TPU_WORKER_HOSTNAMES`（4 pod 的 headless DNS 列表）、`TPU_WORKER_ID`（pod completion index → node_rank）。
+- 启动参数:`--nnodes 4 --node-rank $TPU_WORKER_ID --dist-init-addr <pod0-dns>:<port>`。
+- 存储:gcsfuse 挂 `model-storage-sglang`,权重 `MiMo-V2.5/`;SA `gcs-account`;image `jax-ai-image/tpu:jax0.8.1-rev1`。
+- stage yaml:embed→CPU(0 TPU)+ AR→16 TPU(已改)。
+
+## F. 验证里程碑
+
+1. **text-only**:4-pod 起 + `jax.distributed.initialize` 成功 + AR 加载 fused-qkv FP8 checkpoint + 单 text prompt 出 token。先验证 multi-host runtime 本身打通。
+2. **text+audio**:在 text-only 通过后,开 audio(host codec encode + embed CPU scatter + 跨 stage embedding 进 AR)。注意 review R2-3/9/11 的 audio 编码链首次真权重验证。

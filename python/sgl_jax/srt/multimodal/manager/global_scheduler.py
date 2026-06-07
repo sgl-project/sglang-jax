@@ -6,6 +6,7 @@ import signal
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
+import jax
 import numpy as np
 import psutil
 import setproctitle
@@ -86,6 +87,7 @@ class GlobalScheduler:
         """
         context = zmq.Context(2)
         self.server_args = server_args
+        self.port_args = port_args
         self.recv_from_tokenizer = get_zmq_socket(
             context, zmq.PULL, port_args.scheduler_input_ipc_name, False
         )
@@ -114,7 +116,12 @@ class GlobalScheduler:
 
         def _build_stage(idx_cfg: tuple[int, Any]) -> tuple[int, Stage]:
             idx, cfg = idx_cfg
-            return idx, Stage(cfg, device_manager=self.device_manager, server_args=self.server_args)
+            return idx, Stage(
+                cfg,
+                device_manager=self.device_manager,
+                server_args=self.server_args,
+                port_args=self.port_args,
+            )
 
         with ThreadPoolExecutor(
             max_workers=min(len(self.stage_configs), max(1, os.cpu_count() or 1))
@@ -454,6 +461,22 @@ def run_global_scheduler_process(
     setproctitle.setproctitle("sglang-jax::global_scheduler")
     configure_logger(server_args)
     parent_process = psutil.Process().parent()
+
+    # Multi-host (SPMD): bring up the JAX distributed cluster BEFORE constructing the
+    # GlobalScheduler, so DeviceManager()=jax.devices() sees the full cross-host device
+    # set (e.g. 16 chips over 4 hosts) instead of only the local 4. Without this,
+    # device_manager.allocate(num_tpus) for the AR stage raises "device is not enough".
+    # See prework appendix "multi-host (SPMD)" §D.2.
+    nnodes = getattr(server_args, "nnodes", 1)
+    if nnodes > 1 and not jax.distributed.is_initialized():
+        logger.info(
+            "Initializing JAX distributed: addr=%s nnodes=%s node_rank=%s",
+            server_args.dist_init_addr,
+            nnodes,
+            server_args.node_rank,
+        )
+        jax.distributed.initialize(server_args.dist_init_addr, nnodes, server_args.node_rank)
+        logger.info("JAX distributed ready: %s global devices visible", len(jax.devices()))
 
     try:
         scheduler = GlobalScheduler(server_args, port_args)

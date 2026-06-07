@@ -3,8 +3,13 @@ stage_args:
  - stage_id: 0
    stage_sub_dir: ""
    runtime:
+     # embed stage runs on host CPU (MiMoV2_5Embedding weights ~1.5GB; not on the
+     # critical perf path). This frees all TPU chips for the AR stage: device_kind=cpu
+     # takes a CPU device via jax.devices("cpu") and bypasses the TPU device pool, so
+     # embed(0 TPU) + AR(16 TPU) fits a v6e-16 (was 1+16=17 > 16). Cross-stage handoff
+     # is host-roundtrip (multimodal_embedding -> np.asarray -> AR), so CPU->TPU is safe.
      num_tpus: 1
-     device_kind: tpu
+     device_kind: cpu
      max_batch_size: 1
    scheduler: embedding
    final_output: false

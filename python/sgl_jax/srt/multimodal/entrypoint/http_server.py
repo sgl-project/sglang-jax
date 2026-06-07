@@ -258,6 +258,26 @@ def launch(
     processes.append(scheduler_proc)
     scheduler_procs.append(scheduler_proc)
 
+    # Multi-host (SPMD): non-rank0 nodes only run the GlobalScheduler process (which
+    # participates in the AR stage's cross-host jitted forward via jax.distributed).
+    # They do NOT run tokenizer/detokenizer/HTTP — only rank0 owns request IO. Mirrors
+    # entrypoints/engine.py:585. See prework appendix "multi-host (SPMD)" §D.1.
+    if getattr(server_args, "node_rank", 0) >= 1:
+        for reader in scheduler_pipe_readers:
+            data = reader.recv()
+            if data.get("status") != "ready":
+                raise RuntimeError(
+                    "Initialization failed on non-rank0 node. See error messages above."
+                )
+        logger.info(
+            "node_rank=%s ready; non-rank0 node blocks on scheduler process (no HTTP).",
+            server_args.node_rank,
+        )
+        for proc in scheduler_procs:
+            proc.join()
+            logger.error("Scheduler %s terminated with exitcode %s", proc.pid, proc.exitcode)
+        return
+
     # 2. Multimodal Detokenizer
     detokenizer_proc = mp.Process(
         target=run_multimodal_detokenizer_process,
