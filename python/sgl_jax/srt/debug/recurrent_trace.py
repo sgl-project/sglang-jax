@@ -99,6 +99,41 @@ def write_event(event: str, **payload: Any) -> None:
         f.write(line + "\n")
 
 
+def _replicated_sharding(value: Any):
+    sharding = getattr(value, "sharding", None)
+    if isinstance(sharding, jax.sharding.NamedSharding):
+        return jax.sharding.NamedSharding(sharding.mesh, jax.sharding.PartitionSpec())
+    return None
+
+
+def _row_gather_sharding(value: Any, num_rows: int):
+    sharding = getattr(value, "sharding", None)
+    if not isinstance(sharding, jax.sharding.NamedSharding):
+        return None
+
+    spec = sharding.spec
+    if len(spec) == 0 or spec[0] is None:
+        return sharding
+
+    first_dim_spec = spec[0] if isinstance(spec[0], tuple) else (spec[0],)
+    shard_count = 1
+    for axis_name in first_dim_spec:
+        if axis_name is None:
+            continue
+        shard_count *= sharding.mesh.shape[axis_name]
+
+    if num_rows % shard_count == 0:
+        return sharding
+    return _replicated_sharding(value)
+
+
+def _take_rows(value: Any, idx: Any):
+    out_sharding = _row_gather_sharding(value, int(idx.shape[0]))
+    if out_sharding is None:
+        return value[idx]
+    return value.at[idx].get(mode="clip", out_sharding=out_sharding)
+
+
 def digest_arrays_for_indices(buffers: list[Any], indices: list[int], layers: list[int]) -> Any:
     """Return a small JAX array [layer, row, metric] without host synchronization."""
     if not buffers or not indices or not layers:
@@ -106,7 +141,7 @@ def digest_arrays_for_indices(buffers: list[Any], indices: list[int], layers: li
     idx = jnp.asarray(indices, dtype=jnp.int32)
     layer_digests = []
     for layer in layers:
-        selected = buffers[layer][idx].astype(jnp.float32)
+        selected = _take_rows(buffers[layer], idx).astype(jnp.float32)
         axes = tuple(range(1, selected.ndim))
         abs_selected = jnp.abs(selected)
         layer_digests.append(
