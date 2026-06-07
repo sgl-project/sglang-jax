@@ -1594,3 +1594,66 @@ cd /tmp/sglang-jax/python &&
 4. 重启 4-rank server，不带 `--disable-overlap-schedule`。
 5. 用 32 并发 curl 请求复现当前稳态吞吐和 profile。
 6. 如果 profile 仍是 `3-4 ms` gap，优先做 Step 2 / Step 3。
+
+## 2026-06-07 更新：16k bench cache miss 修复
+
+当前分支：
+
+- 本地 worktree：`/Users/niu/code/sglang-jax/.worktrees/spec-overlap-bubble-followup-codex`
+- 分支：`dev/spec-overlap-bubble-followup-codex`
+- 最新已推送基线：`16165aaf`
+
+用户观察 16k bench 吞吐偏低后，用 `JAX_EXPLAIN_CACHE_MISSES=1` 在
+`perf-16-{0..3}` 4-rank pod 上复查。确认 request path 有两个
+`fused_greedy_verify` tracing cache miss，根因都在 spec decode
+precompile dummy 和真实请求输入不一致：
+
+1. `previous_verified_id` / `previous_token_list`：
+   precompile dummy 是无显式 sharding 的 `jnp.ones`，真实 same-batch
+   chained verify 复用上一轮 device 输出，带 replicated mesh sharding
+   `{Explicit: ('data', 'tensor')}`。
+2. `return_target_logits`：
+   precompile dummy 继承 `_make_dummy_batch()` 的
+   `return_output_logprob_only=True`，导致静态参数为
+   `return_target_logits=True`；bench 真实请求为 no-logprob，
+   `return_target_logits=False`。
+
+修复：
+
+- `python/sgl_jax/srt/speculative/eagle_worker.py`
+- 在 `precompile_spec_decode()` 中把 dummy `EagleDraftInput` 的
+  `topk_p` / `topk_index` / `hidden_states` / `verified_id` /
+  `accept_length` 放到 `NamedSharding(mesh, P())`。
+- 在同一 precompile dummy 上显式设置
+  `return_logprob=False`、`return_output_logprob_only=False`，覆盖 16k
+  bench 的 no-logprob 热路径。
+
+验证：
+
+- explain server run id：`bench16k_explain_fix2_102502`
+- 启动参数仍为 16k bench 规格：
+  `--context-length 18432 --max-prefill-tokens 16384 --chunked-prefill-size 4096`
+  `--max-running-requests 128 --precompile-bs-paddings 32 64 128`
+  `--precompile-token-paddings 4096 8192 16384`
+- 32 条 `16k input / 128 output / concurrency=32` probe：
+  `Successful requests: 32/32`
+  `Benchmark duration: 162.48s`
+  `Output throughput: 25.46 tok/s`
+  `Mean TTFT: 82500.42 ms`
+  `Mean TPOT: 402.71 ms`
+- probe window 从 UTC `02:32:33` 起统计 rank0 log：
+  `TRACING CACHE MISS=0`
+  `Persistent compilation cache miss=0`
+  `Compiling jit=0`
+  `same_batch_chain_peek_skip=0`
+  `ERROR/Traceback=0`
+
+待办：
+
+- 用无 `JAX_EXPLAIN_CACHE_MISSES` / 无 `JAX_LOG_COMPILES` 的 server
+  重新跑正式 bench：
+  `16k input / 1k output / num_prompts=300 / bsz=32,64,128`。
+- 如果正式 bench 吞吐仍低，下一步不要再优先看 JAX tracing cache；
+  当前 request-path cache miss 已清零，应转向 prefill/decode 调度、
+  16k chunked prefill 与 decode interleave、以及同批 chain 的实际
+  running/queue 分布。

@@ -5,6 +5,8 @@ import time
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 from tqdm import tqdm
 
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
@@ -19,6 +21,10 @@ from sgl_jax.srt.utils.common_utils import get_bool_env_var
 
 logger = logging.getLogger(__name__)
 RETURN_ORIGINAL_LOGPROB = get_bool_env_var("RETURN_ORIGINAL_LOGPROB")
+
+
+def _replicated_mesh_array(value, mesh):
+    return jax.device_put(value, NamedSharding(mesh, P()))
 
 
 class EAGLEWorker(BaseSpecWorker):
@@ -190,6 +196,8 @@ class EAGLEWorker(BaseSpecWorker):
                     dp_size=dp_size,
                     per_dp_bs_size=per_dp_bs,
                 )
+                model_worker_batch.return_logprob = False
+                model_worker_batch.return_output_logprob_only = False
                 num_steps = self.speculative_num_steps
                 from sgl_jax.srt.speculative.multi_layer_draft_worker import (
                     MultiLayerDraftWorker,
@@ -197,18 +205,32 @@ class EAGLEWorker(BaseSpecWorker):
 
                 is_multi_layer = isinstance(self.draft_worker, MultiLayerDraftWorker)
                 topk_shape = (bs, num_steps, self.topk) if is_multi_layer else (bs, self.topk)
+                rep_mesh = self.target_worker.model_runner.mesh
+                spec_dtype = jnp.bfloat16 if self.server_args.dtype == "bfloat16" else jnp.float32
                 spec_info = EagleDraftInput(
-                    topk_p=jnp.ones(
-                        topk_shape,
-                        dtype=jnp.bfloat16 if self.server_args.dtype == "bfloat16" else jnp.float32,
+                    topk_p=_replicated_mesh_array(
+                        jnp.ones(topk_shape, dtype=spec_dtype),
+                        rep_mesh,
                     ),
-                    topk_index=jnp.ones(topk_shape, dtype=jnp.int32),
-                    hidden_states=jnp.ones(
-                        (bs, self.draft_worker.model_config.hidden_size),
-                        dtype=jnp.bfloat16 if self.server_args.dtype == "bfloat16" else jnp.float32,
+                    topk_index=_replicated_mesh_array(
+                        np.ones(topk_shape, dtype=np.int32),
+                        rep_mesh,
                     ),
-                    verified_id=jnp.ones((bs,), dtype=jnp.int32),
-                    accept_length=jnp.ones((bs,), dtype=jnp.int32),
+                    hidden_states=_replicated_mesh_array(
+                        jnp.ones(
+                            (bs, self.draft_worker.model_config.hidden_size),
+                            dtype=spec_dtype,
+                        ),
+                        rep_mesh,
+                    ),
+                    verified_id=_replicated_mesh_array(
+                        np.ones((bs,), dtype=np.int32),
+                        rep_mesh,
+                    ),
+                    accept_length=_replicated_mesh_array(
+                        np.ones((bs,), dtype=np.int32),
+                        rep_mesh,
+                    ),
                     capture_hidden_mode=CaptureHiddenMode.LAST,
                     allocate_lens=model_worker_batch.seq_lens
                     + EagleDraftInput.ALLOC_LEN_PER_DECODE,
