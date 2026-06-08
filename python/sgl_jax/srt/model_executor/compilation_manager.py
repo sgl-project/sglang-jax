@@ -286,10 +286,13 @@ class CompilationManager:
 
         if speculative_algorithm is None:
             sampling_info = ModelWorkerSamplingInfo.generate_for_precompile(bs, self.vocab_size)
+            return_output_logprob_only = True
         else:
             sampling_info = ModelWorkerSamplingInfo.generate_for_precompile_all_greedy(
                 bs, self.vocab_size
             )
+            sampling_info.vocab_mask = None
+            return_output_logprob_only = False
 
         return ModelWorkerBatch(
             bid=1,
@@ -301,7 +304,7 @@ class CompilationManager:
             seq_lens=np.array([1] * bs, dtype=np.int32),
             out_cache_loc=np.concat([valid_out_cache_loc, invalid_out_cache_loc], axis=0),
             return_logprob=False,
-            return_output_logprob_only=True,
+            return_output_logprob_only=return_output_logprob_only,
             sampling_info=sampling_info,
             extend_input_logprob_token_ids=None,
             positions=np.concat([valid_positions, invalid_positions], axis=0),

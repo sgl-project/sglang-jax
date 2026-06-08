@@ -152,6 +152,9 @@ class EAGLEWorker(BaseSpecWorker):
                     dp_size=dp_size,
                     per_dp_bs_size=per_dp_bs,
                 )
+                assert self._can_use_fused_spec_prefill(
+                    model_worker_batch
+                ), "spec extend precompile must use fused greedy prefill"
                 self.forward_batch_speculative_generation(model_worker_batch)
         end_time = time.perf_counter()
         logger.info("[SPEC_EXTEND] Precompile finished in %.0f secs", end_time - start_time)
@@ -190,6 +193,9 @@ class EAGLEWorker(BaseSpecWorker):
                     dp_size=dp_size,
                     per_dp_bs_size=per_dp_bs,
                 )
+                assert not model_worker_batch.return_logprob
+                assert not model_worker_batch.return_output_logprob_only
+                assert model_worker_batch.sampling_info.is_all_greedy
                 num_steps = self.speculative_num_steps
                 from sgl_jax.srt.speculative.multi_layer_draft_worker import (
                     MultiLayerDraftWorker,
@@ -198,18 +204,16 @@ class EAGLEWorker(BaseSpecWorker):
                 is_multi_layer = isinstance(self.draft_worker, MultiLayerDraftWorker)
                 topk_shape = (bs, num_steps, self.topk) if is_multi_layer else (bs, self.topk)
                 spec_info = EagleDraftInput(
-                    topk_p=jnp.ones(
-                        topk_shape,
-                        dtype=jnp.bfloat16 if self.server_args.dtype == "bfloat16" else jnp.float32,
-                    ),
-                    topk_index=jnp.ones(topk_shape, dtype=jnp.int32),
-                    hidden_states=jnp.ones(
+                    topk_p=np.ones(topk_shape, dtype=np.float32),
+                    topk_index=np.ones(topk_shape, dtype=np.int32),
+                    hidden_states=np.ones(
                         (bs, self.draft_worker.model_config.hidden_size),
-                        dtype=jnp.bfloat16 if self.server_args.dtype == "bfloat16" else jnp.float32,
+                        dtype=jnp.bfloat16 if self.server_args.dtype == "bfloat16" else np.float32,
                     ),
-                    verified_id=jnp.ones((bs,), dtype=jnp.int32),
-                    accept_length=jnp.ones((bs,), dtype=jnp.int32),
-                    capture_hidden_mode=CaptureHiddenMode.LAST,
+                    verified_id=np.ones((bs,), dtype=np.int32),
+                    capture_hidden_mode=CaptureHiddenMode.FULL,
+                    num_tokens_per_batch=np.asarray(1, dtype=np.int32),
+                    num_tokens_for_logprob_per_batch=np.asarray(1, dtype=np.int32),
                     allocate_lens=model_worker_batch.seq_lens
                     + EagleDraftInput.ALLOC_LEN_PER_DECODE,
                 )

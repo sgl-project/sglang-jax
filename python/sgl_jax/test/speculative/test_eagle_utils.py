@@ -55,6 +55,41 @@ class TestVerifyTree(CustomTestCase):
             worker._can_use_fused_spec_prefill(make_batch(return_output_logprob_only=True))
         )
 
+    def test_spec_precompile_dummy_matches_fused_greedy_runtime_fields(self):
+        from sgl_jax.srt.managers.schedule_batch import ForwardMode
+        from sgl_jax.srt.model_executor.compilation_manager import CompilationManager
+        from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        manager = CompilationManager.__new__(CompilationManager)
+        manager.vocab_size = 128
+        manager.multimodal = False
+        manager.has_recurrent_state = False
+
+        spec_batch = manager._make_dummy_batch(
+            bs=4,
+            num_tokens=64,
+            mode=ForwardMode.EXTEND,
+            max_cache_loc_size=64,
+            speculative_algorithm=SpeculativeAlgorithm.NEXTN,
+            dp_size=4,
+            per_dp_bs_size=1,
+        )
+        self.assertFalse(spec_batch.return_logprob)
+        self.assertFalse(spec_batch.return_output_logprob_only)
+        self.assertTrue(spec_batch.sampling_info.is_all_greedy)
+        self.assertIsNone(spec_batch.sampling_info.vocab_mask)
+
+        plain_batch = manager._make_dummy_batch(
+            bs=4,
+            num_tokens=64,
+            mode=ForwardMode.EXTEND,
+            max_cache_loc_size=64,
+            speculative_algorithm=None,
+            dp_size=4,
+            per_dp_bs_size=1,
+        )
+        self.assertTrue(plain_batch.return_output_logprob_only)
+
     def test_spec_decode_uses_split_verify_and_draft_extend_phases(self):
         from sgl_jax.srt.speculative import draft_extend_fused
 
