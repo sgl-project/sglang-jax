@@ -18,7 +18,7 @@ import time
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec as P
 
 # Qwen3-8B parameters
 NUM_LAYERS = 36
@@ -48,7 +48,11 @@ def create_mesh():
         mesh_shape = (1, 1)
     print(f"Mesh shape: {mesh_shape} (data={mesh_shape[0]}, tensor={mesh_shape[1]})")
     devices_array = np.array(devices[: mesh_shape[0] * mesh_shape[1]]).reshape(mesh_shape)
-    return Mesh(devices_array, axis_names=("data", "tensor"))
+    return Mesh(
+        devices_array,
+        axis_names=("data", "tensor"),
+        axis_types=(AxisType.Explicit, AxisType.Explicit),
+    )
 
 
 def create_kv_pool(mesh):
