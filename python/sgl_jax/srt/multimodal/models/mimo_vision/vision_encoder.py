@@ -404,13 +404,13 @@ class MiMoVisionPatchMerger(nnx.Module):
             epsilon=norm_eps,
             dtype=dtype,
             param_dtype=dtype,
-            use_bias=True,
+            use_bias=False,
             rngs=_rngs,
         )
         self.mlp_fc1 = nnx.Linear(
             self.hidden_size,
             self.hidden_size,
-            use_bias=True,
+            use_bias=False,
             param_dtype=dtype,
             rngs=_rngs,
         )
@@ -418,7 +418,7 @@ class MiMoVisionPatchMerger(nnx.Module):
         self.mlp_fc2 = nnx.Linear(
             self.hidden_size,
             out_hidden_size,
-            use_bias=True,
+            use_bias=False,
             param_dtype=dtype,
             rngs=_rngs,
         )
@@ -587,25 +587,15 @@ def create_mimo_vision_weight_mappings(
             target_path=f"{target_prefix}merger.ln_q.scale",
             sharding=(),
         ),
-        f"{source_prefix}.merger.ln_q.bias": WeightMapping(
-            target_path=f"{target_prefix}merger.ln_q.bias",
-            sharding=(),
-        ),
+        # merger ln_q / mlp are bias-free in the checkpoint (no .bias keys); the merger
+        # module is built with use_bias=False to match.
         f"{source_prefix}.merger.mlp.0.weight": WeightMapping(
             target_path=f"{target_prefix}merger.mlp_fc1.kernel",
             transpose=True,
         ),
-        f"{source_prefix}.merger.mlp.0.bias": WeightMapping(
-            target_path=f"{target_prefix}merger.mlp_fc1.bias",
-            sharding=(),
-        ),
         f"{source_prefix}.merger.mlp.2.weight": WeightMapping(
             target_path=f"{target_prefix}merger.mlp_fc2.kernel",
             transpose=True,
-        ),
-        f"{source_prefix}.merger.mlp.2.bias": WeightMapping(
-            target_path=f"{target_prefix}merger.mlp_fc2.bias",
-            sharding=(),
         ),
     }
 
