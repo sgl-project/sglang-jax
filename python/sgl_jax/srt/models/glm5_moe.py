@@ -536,14 +536,18 @@ class Glm5MLP(nnx.Module):
             wd = jnp.pad(wd, ((0, pad_inter), (0, 0)), mode="constant")
             local_inter_size += pad_inter
 
-        # Combine wg and wu block-by-block
+        # Combine wg and wu block-by-block using jax.lax.reshape to explicitly
+        # specify the sharding for the split/merged dimensions under JAX SPMD.
         num_blocks = local_inter_size // B_INTER
-        wg_reshaped = wg.reshape(hidden_size, num_blocks, B_INTER)
-        wu_reshaped = wu.reshape(hidden_size, num_blocks, B_INTER)
+        sharding_3d = jax.sharding.NamedSharding(self.mesh, P(None, "tensor", None))
+        wg_reshaped = jax.lax.reshape(wg, (hidden_size, num_blocks, B_INTER), out_sharding=sharding_3d)
+        wu_reshaped = jax.lax.reshape(wu, (hidden_size, num_blocks, B_INTER), out_sharding=sharding_3d)
         
         # Concat along block dimension and flatten
         w_gu = jnp.concatenate([wg_reshaped, wu_reshaped], axis=-1)
-        w_gu = w_gu.reshape(hidden_size, local_inter_size * 2)
+        
+        sharding_2d = jax.sharding.NamedSharding(self.mesh, P(None, "tensor"))
+        w_gu = jax.lax.reshape(w_gu, (hidden_size, local_inter_size * 2), out_sharding=sharding_2d)
         
         # Assign values directly to pre-allocated sharded parameters
         self.w_gu.value = w_gu
