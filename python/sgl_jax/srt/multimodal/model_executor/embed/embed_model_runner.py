@@ -5,6 +5,8 @@ import math
 
 import jax
 import jax.numpy as jnp
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 from flax import nnx
 from transformers import AutoConfig
 
@@ -235,6 +237,23 @@ class EmbedModelRunner(BaseModelRunner):
             if assembled["video_grid_thw"] is not None
             else None
         )
+
+        # Pin vision inputs to the embed stage's mesh (CPU). jnp.asarray above places
+        # arrays on the *default* backend (TPU here), so without this the ViT's early
+        # patch-embed reshape runs on TPU and allocates TPU HBM — which OOMs the AR
+        # stage's chips on large (video) inputs. device_put onto the CPU mesh keeps the
+        # whole vision tower on host RAM. (Confirmed via [VISION-DEVICE] logging: input
+        # pixel_values was landing on TpuDevice while the ViT weights were on CpuDevice.)
+        if self.mesh is not None:
+            replicated = NamedSharding(self.mesh, P())
+
+            def _to_mesh(arr):
+                return jax.device_put(arr, replicated) if arr is not None else None
+
+            pixel_values = _to_mesh(pixel_values)
+            pixel_values_videos = _to_mesh(pixel_values_videos)
+            image_grid_thw = _to_mesh(image_grid_thw)
+            video_grid_thw = _to_mesh(video_grid_thw)
 
         return {
             "input_ids": input_ids,
