@@ -53,12 +53,11 @@ def create_mesh():
 
 def create_kv_pool(mesh):
     """Create per-layer KV buffers matching memory_pool.py layout."""
-    tp_size = mesh.shape["tensor"]
-    heads_per_shard = NUM_KV_HEADS // tp_size
+    # Global shape (JAX shards automatically via PartitionSpec)
     buffer_shape = (
         NUM_PAGES_POOL,
         PAGE_SIZE,
-        heads_per_shard * 2 // PACKING,
+        NUM_KV_HEADS * 2 // PACKING,  # [K0,V0,K1,V1,...] interleaved
         PACKING,
         HEAD_DIM,
     )
