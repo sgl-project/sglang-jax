@@ -501,8 +501,17 @@ class Glm5MLP(nnx.Module):
         if use_fused:
             tp_size = mesh.shape["tensor"]
             local_inter_size = intermediate_size // tp_size
-            B_INTER = 128
-            pad_inter = (B_INTER - (local_inter_size % B_INTER)) % B_INTER
+            
+            # Dynamically choose block size (B_INTER) based on local intermediate size
+            # to ensure that num_blocks is always a multiple of the TP size.
+            if local_inter_size >= 128:
+                self.b_inter = 128
+            elif local_inter_size >= 64:
+                self.b_inter = 64
+            else:
+                self.b_inter = 32
+
+            pad_inter = (self.b_inter - (local_inter_size % self.b_inter)) % self.b_inter
             local_inter_size_padded = local_inter_size + pad_inter
             global_inter_size_padded = local_inter_size_padded * tp_size
 
@@ -525,11 +534,12 @@ class Glm5MLP(nnx.Module):
         wu = self.up_proj.weight.value
         wd = self.down_proj.weight.value
         
-        B_INTER = 128
+        # Use dynamically chosen block size
+        b_inter = self.b_inter
         hidden_size, local_inter_size = wg.shape
         
-        # Pad local intermediate dimension to a multiple of B_INTER
-        pad_inter = (B_INTER - (local_inter_size % B_INTER)) % B_INTER
+        # Pad local intermediate dimension to a multiple of b_inter
+        pad_inter = (b_inter - (local_inter_size % b_inter)) % b_inter
         if pad_inter > 0:
             wg = jnp.pad(wg, ((0, 0), (0, pad_inter)), mode="constant")
             wu = jnp.pad(wu, ((0, 0), (0, pad_inter)), mode="constant")
@@ -538,10 +548,10 @@ class Glm5MLP(nnx.Module):
 
         # Combine wg and wu block-by-block using jax.lax.reshape to explicitly
         # specify the sharding for the split/merged dimensions under JAX SPMD.
-        num_blocks = local_inter_size // B_INTER
+        num_blocks = local_inter_size // b_inter
         sharding_3d = jax.sharding.NamedSharding(self.mesh, P(None, "tensor", None))
-        wg_reshaped = jax.lax.reshape(wg, (hidden_size, num_blocks, B_INTER), out_sharding=sharding_3d)
-        wu_reshaped = jax.lax.reshape(wu, (hidden_size, num_blocks, B_INTER), out_sharding=sharding_3d)
+        wg_reshaped = jax.lax.reshape(wg, (hidden_size, num_blocks, b_inter), out_sharding=sharding_3d)
+        wu_reshaped = jax.lax.reshape(wu, (hidden_size, num_blocks, b_inter), out_sharding=sharding_3d)
         
         # Concat along block dimension and flatten
         w_gu = jnp.concatenate([wg_reshaped, wu_reshaped], axis=-1)
@@ -565,6 +575,7 @@ class Glm5MLP(nnx.Module):
                 self.w_gu.value,
                 self.w_d.value,
                 self.mesh,
+                b_inter=self.b_inter,
             )
             
         # Fallback non-fused path
