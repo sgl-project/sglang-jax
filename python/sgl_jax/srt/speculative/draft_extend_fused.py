@@ -248,31 +248,6 @@ def _build_topk1_chain_verify_inputs_device_tuple(
     )
 
 
-def _per_dp_cumsum_device(lens: jax.Array, dp_size: int, per_dp_bs: int) -> jax.Array:
-    lens_2d = lens.astype(jnp.int32).reshape(dp_size, per_dp_bs)
-    zeros = jnp.zeros((dp_size, 1), dtype=jnp.int32)
-    return jnp.concatenate([zeros, jnp.cumsum(lens_2d, axis=1)], axis=1).reshape(-1)
-
-
-def _refresh_target_verify_dynamic_metadata_in_jit(target_forward_batch):
-    """Fold device-lens target-verify metadata math into the verify JIT."""
-    metadata = target_forward_batch.attn_backend.forward_metadata
-    if metadata.custom_mask is not None:
-        return
-    page_size = int(target_forward_batch.attn_backend.page_size)
-    dp_size = int(metadata.distribution.shape[0] // 3)
-    per_dp_bs = int(target_forward_batch.seq_lens.shape[0] // dp_size)
-    draft_token_num = int(target_forward_batch.spec_info.draft_token_num)
-    seq_lens = jnp.where(
-        target_forward_batch.seq_lens > 0,
-        target_forward_batch.seq_lens + draft_token_num,
-        0,
-    )
-    aligned_seq_lens = ((seq_lens + page_size - 1) // page_size) * page_size
-    metadata.seq_lens = seq_lens
-    metadata.cu_kv_lens = _per_dp_cumsum_device(aligned_seq_lens, dp_size, per_dp_bs)
-
-
 def _device_rotate_input_ids(input_ids, ext_lens, sel_pos, new_tokens):
     """Mirror MultiLayerDraftWorker._rotate_ids on device for topk=1."""
     bs = ext_lens.shape[0]
@@ -1575,56 +1550,6 @@ def spec_decode_draft_extend_phase(spec_worker, model_worker_batch, verify_phase
         req_pool_indices=req_pool_indices,
         padded_next_draft_input=padded_next_draft_input,
         padded_req_pool_indices=padded_req_pool_indices,
-        padded_new_seq_lens_host=getattr(
-            verify_phase_result,
-            "padded_new_seq_lens_host",
-            None,
-        ),
-    )
-
-
-def spec_decode_pending_draft_extend_result_from_predispatch(
-    model_worker_batch,
-    verify_phase_result,
-):
-    """Build next-round draft state from predispatched Phase B device handles.
-
-    The split-overlap path already dispatches fused draft_extend before Phase A
-    D2H materializes. For the common exact padded-layout decode case, the next
-    verify needs only the padded topk/verified-token device handles. Returning
-    those handles directly lets the ordered worker thread accept the next batch
-    without synchronously materializing Phase B host rows.
-    """
-    from sgl_jax.srt.managers.scheduler import SpecDraftExtendPhaseResult
-    from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
-
-    state = getattr(verify_phase_result, "draft_extend_state", None)
-    dispatch = getattr(state, "predispatched", None)
-    if dispatch is None or getattr(dispatch, "materialize_topk", True):
-        return None
-    batch_output = getattr(state, "batch_output", None)
-    next_draft_input = getattr(batch_output, "next_draft_input", None)
-
-    padded_next_draft_input = EagleDraftInput(
-        topk_index=dispatch.topk_index_stacked,
-        verified_id=dispatch.selected_verified_id,
-        new_seq_lens=getattr(next_draft_input, "new_seq_lens", None),
-        allocate_lens=getattr(next_draft_input, "allocate_lens", None),
-    )
-    padded_next_draft_input.verify_write_lens = getattr(
-        next_draft_input,
-        "verify_write_lens",
-        None,
-    )
-    padded_next_draft_input.previous_token_list = dispatch.previous_token_list
-
-    selector = np.asarray(model_worker_batch.logits_indices_selector)
-    req_pool_indices = np.asarray(model_worker_batch.req_pool_indices)[selector]
-    return SpecDraftExtendPhaseResult(
-        next_draft_input=EagleDraftInput(),
-        req_pool_indices=req_pool_indices,
-        padded_next_draft_input=padded_next_draft_input,
-        padded_req_pool_indices=np.asarray(model_worker_batch.req_pool_indices).copy(),
         padded_new_seq_lens_host=getattr(
             verify_phase_result,
             "padded_new_seq_lens_host",
