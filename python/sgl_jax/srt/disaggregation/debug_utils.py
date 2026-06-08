@@ -9,7 +9,6 @@ from dataclasses import dataclass
 import jax
 import numpy as np
 
-
 _ENV_ENABLE = "SGL_JAX_PD_DEBUG_KV"
 _ENV_REQ_FILTER = "SGL_JAX_PD_DEBUG_REQ_ID"
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
@@ -68,17 +67,14 @@ class KVDebugSnapshot:
     def sample_page_digests(
         self, *, max_layers: int = 2, max_pages: int = 4
     ) -> tuple[tuple[str, ...], ...]:
-        return tuple(
-            row[:max_pages] for row in self.page_digests[:max_layers]
-        )
+        return tuple(row[:max_pages] for row in self.page_digests[:max_layers])
 
 
 def build_kv_debug_snapshot(value) -> KVDebugSnapshot:
     host = _host_array(value)
     if host.ndim < 2:
         raise ValueError(
-            "build_kv_debug_snapshot expects an array with at least 2 "
-            "dims (layer, page, ...)"
+            "build_kv_debug_snapshot expects an array with at least 2 " "dims (layer, page, ...)"
         )
 
     page_digests = []
@@ -97,9 +93,7 @@ def build_kv_debug_snapshot(value) -> KVDebugSnapshot:
     )
 
 
-def count_kv_debug_mismatches(
-    left: KVDebugSnapshot, right: KVDebugSnapshot
-) -> int:
+def count_kv_debug_mismatches(left: KVDebugSnapshot, right: KVDebugSnapshot) -> int:
     _validate_snapshot_shapes(left, right)
     mismatches = 0
     for left_row, right_row in zip(left.page_digests, right.page_digests):
@@ -112,20 +106,14 @@ def find_first_kv_debug_mismatch(
     left: KVDebugSnapshot, right: KVDebugSnapshot
 ) -> tuple[int, int] | None:
     _validate_snapshot_shapes(left, right)
-    for layer_idx, (left_row, right_row) in enumerate(
-        zip(left.page_digests, right.page_digests)
-    ):
-        for page_idx, (left_digest, right_digest) in enumerate(
-            zip(left_row, right_row)
-        ):
+    for layer_idx, (left_row, right_row) in enumerate(zip(left.page_digests, right.page_digests)):
+        for page_idx, (left_digest, right_digest) in enumerate(zip(left_row, right_row)):
             if left_digest != right_digest:
                 return (layer_idx, page_idx)
     return None
 
 
-def _validate_snapshot_shapes(
-    left: KVDebugSnapshot, right: KVDebugSnapshot
-) -> None:
+def _validate_snapshot_shapes(left: KVDebugSnapshot, right: KVDebugSnapshot) -> None:
     if len(left.page_digests) != len(right.page_digests):
         raise ValueError(
             "snapshot layer counts differ: "

@@ -35,14 +35,17 @@ def resolve_host_ip(
             resolved = socket.gethostbyname(hostname)
             logger.info(
                 "resolved host IP from $%s=%r: %s",
-                env_name, hostname, resolved,
+                env_name,
+                hostname,
+                resolved,
             )
             return _validate(resolved, source=f"${env_name}")
         except socket.gaierror as e:
             logger.warning(
-                "could not resolve $%s=%r: %s; falling back to "
-                "socket.gethostname()",
-                env_name, hostname, e,
+                "could not resolve $%s=%r: %s; falling back to " "socket.gethostname()",
+                env_name,
+                hostname,
+                e,
             )
 
     try:

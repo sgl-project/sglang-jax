@@ -3,8 +3,6 @@
 import asyncio
 import contextlib
 import copy
-import zlib
-from urllib.parse import urlparse
 import dataclasses
 import json
 import logging
@@ -16,10 +14,12 @@ import sys
 import threading
 import time
 import uuid
+import zlib
 from collections import deque
 from datetime import datetime
 from http import HTTPStatus
 from typing import Any
+from urllib.parse import urlparse
 
 import fastapi
 import jax
@@ -382,16 +382,10 @@ class TokenizerManager:
         #
         # If the request didn't carry bootstrap_* fields but the engine
         # knows its bootstrap URL, auto-derive them.
-        if (
-            getattr(self.server_args, "disaggregation_mode", "null")
-            == "decode"
-        ):
-            bootstrap_url = getattr(
-                self.server_args, "disaggregation_bootstrap_url", None
-            )
+        if getattr(self.server_args, "disaggregation_mode", "null") == "decode":
+            bootstrap_url = getattr(self.server_args, "disaggregation_bootstrap_url", None)
             if (
-                obj.bootstrap_host is None
-                or obj.bootstrap_port is None
+                obj.bootstrap_host is None or obj.bootstrap_port is None
             ) and bootstrap_url is not None:
                 parsed = urlparse(bootstrap_url)
                 if parsed.hostname is not None and parsed.port is not None:
@@ -403,13 +397,10 @@ class TokenizerManager:
                     if obj.bootstrap_port is None:
                         obj.bootstrap_port = parsed.port
             if obj.bootstrap_room is None and obj.rid is not None:
-                obj.bootstrap_room = zlib.crc32(
-                    str(obj.rid).encode("utf-8")
-                )
+                obj.bootstrap_room = zlib.crc32(str(obj.rid).encode("utf-8"))
             missing = [
-                name for name in (
-                    "bootstrap_host", "bootstrap_port", "bootstrap_room"
-                )
+                name
+                for name in ("bootstrap_host", "bootstrap_port", "bootstrap_room")
                 if getattr(obj, name, None) is None
             ]
             if missing:
@@ -423,9 +414,7 @@ class TokenizerManager:
         tokenized_obj.bootstrap_host = getattr(obj, "bootstrap_host", None)
         tokenized_obj.bootstrap_port = getattr(obj, "bootstrap_port", None)
         tokenized_obj.bootstrap_room = getattr(obj, "bootstrap_room", None)
-        tokenized_obj.disagg_transfer_id = getattr(
-            obj, "disagg_transfer_id", None
-        )
+        tokenized_obj.disagg_transfer_id = getattr(obj, "disagg_transfer_id", None)
         # note: When only `return_logprob` is specified, we assume that only the output probability is required.
         if (
             tokenized_obj.return_logprob

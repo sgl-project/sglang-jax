@@ -46,18 +46,8 @@ def test_pd_mixins_use_explicit_scheduler_contracts_for_first_party_fields():
 
     root = Path(__file__).resolve().parents[3]
     sources = {
-        "prefill": root
-        / "python"
-        / "sgl_jax"
-        / "srt"
-        / "disaggregation"
-        / "prefill.py",
-        "decode": root
-        / "python"
-        / "sgl_jax"
-        / "srt"
-        / "disaggregation"
-        / "decode.py",
+        "prefill": root / "python" / "sgl_jax" / "srt" / "disaggregation" / "prefill.py",
+        "decode": root / "python" / "sgl_jax" / "srt" / "disaggregation" / "decode.py",
     }
     for source in sources.values():
         text = source.read_text()
@@ -201,8 +191,8 @@ def test_bootstrap_lookup_failure_releases_resources_and_doesnt_leak():
 
     sched = _MockDecodeScheduler()
     sched.disagg_bootstrap_client = mock.MagicMock()
-    sched.disagg_bootstrap_client.get_prefill_info.side_effect = (
-        RuntimeError("bootstrap unreachable")
+    sched.disagg_bootstrap_client.get_prefill_info.side_effect = RuntimeError(
+        "bootstrap unreachable"
     )
     sched.disagg_kv_manager = mock.MagicMock()
 
@@ -264,8 +254,11 @@ def test_process_decode_queue_success_path_enqueues_for_decode():
     pd_req = _fake_req("r-ok", bootstrap_room=42)
     sched.disagg_prealloc_queue.add(
         DecodeBookkeeping(
-            req_id="r-ok", req=pd_req, receiver=receiver,
-            kv_indices="kv-idx-A", started=True,
+            req_id="r-ok",
+            req=pd_req,
+            receiver=receiver,
+            kv_indices="kv-idx-A",
+            started=True,
         )
     )
 
@@ -291,8 +284,11 @@ def test_process_decode_queue_failure_path_releases_resources():
     pd_req = _fake_req("r-bad", bootstrap_room=42, req_pool_idx=11)
     sched.disagg_prealloc_queue.add(
         DecodeBookkeeping(
-            req_id="r-bad", req=pd_req, receiver=receiver,
-            kv_indices="kv-idx-X", started=True,
+            req_id="r-bad",
+            req=pd_req,
+            receiver=receiver,
+            kv_indices="kv-idx-X",
+            started=True,
         )
     )
     sched._release_decode_kv_indices = released.append
@@ -369,7 +365,8 @@ def test_send_kv_chunk_drains_terminal_senders_and_releases():
     pd_req = _fake_req("p-1", bootstrap_room=1)
 
     sched.disagg_prefill_queue.add(
-        pd_req.rid, sender,
+        pd_req.rid,
+        sender,
         on_terminal=lambda req=pd_req: sched._release_prefill_req_resources(req),
     )
 
@@ -459,9 +456,7 @@ def test_send_kv_chunk_success_streams_empty_completion_for_prefill_only_req():
     sched.disagg_prefill_queue.add(
         req.rid,
         sender,
-        on_terminal=lambda req=req, snd=sender: sched._on_prefill_transfer_terminal(
-            req, snd
-        ),
+        on_terminal=lambda req=req, snd=sender: sched._on_prefill_transfer_terminal(req, snd),
     )
 
     sched.send_kv_chunk()
@@ -492,9 +487,7 @@ def test_send_kv_chunk_failed_streams_abort_for_prefill_only_req():
     sched.disagg_prefill_queue.add(
         req.rid,
         sender,
-        on_terminal=lambda req=req, snd=sender: sched._on_prefill_transfer_terminal(
-            req, snd
-        ),
+        on_terminal=lambda req=req, snd=sender: sched._on_prefill_transfer_terminal(req, snd),
     )
 
     sched.send_kv_chunk()
@@ -594,9 +587,7 @@ def test_write_kv_to_pool_keeps_last_real_page_when_bucket_is_padded():
 
     mesh = Mesh(np.asarray(jax.local_devices()[:1]).reshape(1), ("x",))
     sharding = NamedSharding(mesh, PartitionSpec(None, None, None))
-    kv_buffer = jax.device_put(
-        jnp.zeros((8, 2, 1), dtype=jnp.float32), sharding
-    )
+    kv_buffer = jax.device_put(jnp.zeros((8, 2, 1), dtype=jnp.float32), sharding)
 
     class _Pool:
         def __init__(self):
@@ -680,8 +671,12 @@ def test_prefill_extract_failure_aborts_and_releases():
             self.released_reqs.append(req)
 
         def stream_output(
-            self, reqs, return_logprob, return_output_logprob_only,
-            skip_req=None, cache_miss_count=None,
+            self,
+            reqs,
+            return_logprob,
+            return_output_logprob_only,
+            skip_req=None,
+            cache_miss_count=None,
         ):
             self.streamed.append(list(reqs))
 
@@ -784,8 +779,8 @@ def test_decode_event_loop_idle_structure():
 def test_bootstrap_lookup_failure_sends_abort_to_tokenizer():
     sched = _MockDecodeScheduler()
     sched.disagg_bootstrap_client = mock.MagicMock()
-    sched.disagg_bootstrap_client.get_prefill_info.side_effect = (
-        RuntimeError("bootstrap unreachable")
+    sched.disagg_bootstrap_client.get_prefill_info.side_effect = RuntimeError(
+        "bootstrap unreachable"
     )
     sched.disagg_kv_manager = mock.MagicMock()
 
@@ -839,8 +834,11 @@ def test_kv_writeback_failure_sends_abort_to_tokenizer():
     pd_req = _fake_req("r-abort-wb", bootstrap_room=42, req_pool_idx=8)
     sched.disagg_prealloc_queue.add(
         DecodeBookkeeping(
-            req_id="r-abort-wb", req=pd_req, receiver=receiver,
-            kv_indices="kv-idx-W", started=True,
+            req_id="r-abort-wb",
+            req=pd_req,
+            receiver=receiver,
+            kv_indices="kv-idx-W",
+            started=True,
         )
     )
 
@@ -862,8 +860,11 @@ def test_receiver_terminal_failed_sends_abort_to_tokenizer():
     pd_req = _fake_req("r-abort-fail", bootstrap_room=42, req_pool_idx=10)
     sched.disagg_prealloc_queue.add(
         DecodeBookkeeping(
-            req_id="r-abort-fail", req=pd_req, receiver=receiver,
-            kv_indices="kv-idx-F", started=True,
+            req_id="r-abort-fail",
+            req=pd_req,
+            receiver=receiver,
+            kv_indices="kv-idx-F",
+            started=True,
         )
     )
 
@@ -956,9 +957,7 @@ def test_prefill_queue_abort_calls_on_terminal():
     sched.disagg_prefill_queue.add(
         req.rid,
         sender,
-        on_terminal=lambda req=req, snd=sender: sched._on_prefill_transfer_terminal(
-            req, snd
-        ),
+        on_terminal=lambda req=req, snd=sender: sched._on_prefill_transfer_terminal(req, snd),
     )
 
     # Provide minimal Scheduler attributes so abort_request can run.
@@ -1002,9 +1001,7 @@ def test_different_rids_same_transfer_id_uses_shared_id():
     p_batch = SimpleNamespace(reqs=[p_req])
     p_sched.process_prefill_chunk(p_batch, None)
 
-    p_sender.init.assert_called_once_with(
-        kv_indices=None, transfer_id="shared-xfer-42"
-    )
+    p_sender.init.assert_called_once_with(kv_indices=None, transfer_id="shared-xfer-42")
 
     # --- Decode side ---
     d_sched = _MockDecodeScheduler()
@@ -1040,9 +1037,7 @@ def test_disagg_shutdown_handler_unregisters_and_drains():
 
     fn = _make_disagg_shutdown(scheduler, "prefill")
     fn()
-    scheduler.disagg_bootstrap_client.unregister_prefill.assert_called_once_with(
-        "bkey"
-    )
+    scheduler.disagg_bootstrap_client.unregister_prefill.assert_called_once_with("bkey")
     scheduler.disagg_heartbeat.stop.assert_called_once()
     scheduler.disagg_kv_manager.graceful_shutdown.assert_called_once()
     scheduler.disagg_kv_manager.zmq_notifier.stop.assert_called_once()

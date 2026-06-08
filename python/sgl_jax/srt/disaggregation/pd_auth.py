@@ -33,9 +33,7 @@ def compute_tag(secret: str, payload: bytes) -> bytes:
     return hmac.new(secret.encode("utf-8"), payload, sha256).digest()
 
 
-def verify_tag(
-    secret: str | None, payload: bytes, candidate: bytes | None
-) -> bool:
+def verify_tag(secret: str | None, payload: bytes, candidate: bytes | None) -> bool:
     if secret is None:
         return True
     if candidate is None:
@@ -55,5 +53,5 @@ def verify_bearer(secret: str | None, header_value: str | None) -> bool:
         return True
     if not header_value or not header_value.startswith("Bearer "):
         return False
-    candidate = header_value[len("Bearer "):]
+    candidate = header_value[len("Bearer ") :]
     return hmac.compare_digest(secret, candidate)

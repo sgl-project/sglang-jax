@@ -31,9 +31,7 @@ def _set_registry_size(n: int) -> None:
     metrics must never crash the registration path."""
 
     try:
-        from sgl_jax.srt.disaggregation.common.metrics import (
-            PD_BOOTSTRAP_REGISTRY_SIZE,
-        )
+        from sgl_jax.srt.disaggregation.common.metrics import PD_BOOTSTRAP_REGISTRY_SIZE
 
         PD_BOOTSTRAP_REGISTRY_SIZE.set(n)
     except Exception:  # noqa: BLE001
@@ -114,9 +112,7 @@ class _Registry:
 
     def _evict_stale_locked(self) -> None:
         cutoff = self.now() - self.ttl_seconds
-        stale = [
-            k for k, t in self.last_seen.items() if t < cutoff
-        ]
+        stale = [k for k, t in self.last_seen.items() if t < cutoff]
         if not stale:
             return
         for k in stale:
@@ -166,14 +162,14 @@ def build_app(
             # /health stays open so liveness / readiness probes from
             # kubelet (which don't share the secret) keep working.
             if request.url.path != "/health" and not verify_bearer(
-                    shared_secret, request.headers.get("authorization")
-                ):
-                    from fastapi.responses import JSONResponse
+                shared_secret, request.headers.get("authorization")
+            ):
+                from fastapi.responses import JSONResponse
 
-                    return JSONResponse(
-                        status_code=401,
-                        content={"detail": "unauthorized"},
-                    )
+                return JSONResponse(
+                    status_code=401,
+                    content={"detail": "unauthorized"},
+                )
             return await call_next(request)
 
     @app.get("/health")
@@ -271,9 +267,7 @@ class BootstrapServer:
         self._thread.start()
         self._wait_until_ready(timeout_s=10.0)
         self._started = True
-        logger.info(
-            "BootstrapServer started at %s:%d", self._host, self._port
-        )
+        logger.info("BootstrapServer started at %s:%d", self._host, self._port)
 
     def stop(self) -> None:
         if not self._started:
@@ -285,7 +279,8 @@ class BootstrapServer:
             if self._thread.is_alive():
                 logger.warning(
                     "BootstrapServer at %s:%d did not stop within 5s",
-                    self._host, self._port,
+                    self._host,
+                    self._port,
                 )
             self._thread = None
         self._server = None
@@ -304,8 +299,7 @@ class BootstrapServer:
                 last_err = e
             time.sleep(0.05)
         raise TimeoutError(
-            f"BootstrapServer did not become ready within {timeout_s}s "
-            f"(last error: {last_err})"
+            f"BootstrapServer did not become ready within {timeout_s}s " f"(last error: {last_err})"
         )
 
 
@@ -339,9 +333,7 @@ class BootstrapClient:
         return bearer_header(self._shared_secret)
 
     def health(self) -> bool:
-        r = httpx.get(
-            f"{self._base_url}/health", timeout=self._timeout_s
-        )
+        r = httpx.get(f"{self._base_url}/health", timeout=self._timeout_s)
         return r.status_code == 200
 
     def register_prefill(
@@ -383,7 +375,9 @@ class BootstrapClient:
                     logger.warning(
                         "bootstrap register_prefill attempt %d/%d "
                         "failed (%s); retrying in %.1fs",
-                        attempt + 1, self._register_retries, e,
+                        attempt + 1,
+                        self._register_retries,
+                        e,
                         self._register_retry_delay_s,
                     )
                     time.sleep(self._register_retry_delay_s)

@@ -17,7 +17,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import os
 import random
 import sys
 import time
@@ -54,9 +53,7 @@ async def _send_pd_pair(
 
         async def _post(url):
             timeout = aiohttp.ClientTimeout(total=600)
-            async with session.post(
-                f"{url}/generate", json=payload, timeout=timeout
-            ) as resp:
+            async with session.post(f"{url}/generate", json=payload, timeout=timeout) as resp:
                 if resp.status != 200:
                     text = await resp.text()
                     raise RuntimeError(f"HTTP {resp.status}: {text[:200]}")
@@ -105,8 +102,12 @@ async def run_benchmark(
             tid = f"bench-{uuid.uuid4().hex[:12]}"
             tasks.append(
                 _send_pd_pair(
-                    session, p_url, d_url,
-                    prompt, output_len, tid,
+                    session,
+                    p_url,
+                    d_url,
+                    prompt,
+                    output_len,
+                    tid,
                     bootstrap_room=i,
                     semaphore=semaphore,
                 )
@@ -147,9 +148,7 @@ async def run_benchmark(
         "errors": errors,
         "total_time_s": round(t_total, 2),
         "output_throughput_tok_s": round(total_output_tokens / t_total, 1),
-        "total_throughput_tok_s": round(
-            (total_prompt_tokens + total_output_tokens) / t_total, 1
-        ),
+        "total_throughput_tok_s": round((total_prompt_tokens + total_output_tokens) / t_total, 1),
         "avg_latency_s": round(np.mean(latencies), 2),
         "p50_latency_s": round(np.percentile(latencies, 50), 2),
         "p99_latency_s": round(np.percentile(latencies, 99), 2),
@@ -167,10 +166,12 @@ def main():
         default="512:1024:16,1024:1024:32,2048:1024:32,4096:1024:64",
         help="Comma-separated configs as input_len:output_len:concurrency",
     )
-    parser.add_argument("--num-requests", type=int, default=32,
-                        help="Number of requests per config")
-    parser.add_argument("--tokenizer", type=str, default=None,
-                        help="Tokenizer path (defaults to model from server)")
+    parser.add_argument(
+        "--num-requests", type=int, default=32, help="Number of requests per config"
+    )
+    parser.add_argument(
+        "--tokenizer", type=str, default=None, help="Tokenizer path (defaults to model from server)"
+    )
     parser.add_argument("--model-path", type=str, default=None)
     parser.add_argument("--output-file", type=str, default=None)
     args = parser.parse_args()
@@ -180,6 +181,7 @@ def main():
     if model_path is None:
         # Try to get from server
         import requests as req
+
         try:
             info = req.get(f"{args.decode_url}/get_model_info", timeout=10).json()
             model_path = info.get("model_path", "Qwen/Qwen3-8B-Base")
@@ -187,6 +189,7 @@ def main():
             model_path = "Qwen/Qwen3-8B-Base"
 
     from transformers import AutoTokenizer
+
     print(f"Loading tokenizer from {model_path}...")
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
 
@@ -208,8 +211,7 @@ def main():
     for input_len, output_len, conc in configs:
         print(f"--- input={input_len}, output={output_len}, concurrency={conc} ---")
         result = asyncio.run(
-            run_benchmark(p_url, d_url, input_len, output_len, conc,
-                          args.num_requests, tokenizer)
+            run_benchmark(p_url, d_url, input_len, output_len, conc, args.num_requests, tokenizer)
         )
         all_results.append(result)
         print(f"  throughput: {result.get('output_throughput_tok_s', 'N/A')} output tok/s")
@@ -221,16 +223,20 @@ def main():
 
     # Summary table
     print("=" * 80)
-    print(f"{'Input':>6} {'Output':>7} {'Conc':>5} {'OutTok/s':>10} "
-          f"{'TotalTok/s':>11} {'AvgLat':>8} {'P99Lat':>8} {'OK':>4}")
+    print(
+        f"{'Input':>6} {'Output':>7} {'Conc':>5} {'OutTok/s':>10} "
+        f"{'TotalTok/s':>11} {'AvgLat':>8} {'P99Lat':>8} {'OK':>4}"
+    )
     print("-" * 80)
     for r in all_results:
-        print(f"{r['input_len']:>6} {r['output_len']:>7} {r['concurrency']:>5} "
-              f"{r.get('output_throughput_tok_s', 'ERR'):>10} "
-              f"{r.get('total_throughput_tok_s', 'ERR'):>11} "
-              f"{r.get('avg_latency_s', 'ERR'):>8} "
-              f"{r.get('p99_latency_s', 'ERR'):>8} "
-              f"{r.get('completed', 0):>4}")
+        print(
+            f"{r['input_len']:>6} {r['output_len']:>7} {r['concurrency']:>5} "
+            f"{r.get('output_throughput_tok_s', 'ERR'):>10} "
+            f"{r.get('total_throughput_tok_s', 'ERR'):>11} "
+            f"{r.get('avg_latency_s', 'ERR'):>8} "
+            f"{r.get('p99_latency_s', 'ERR'):>8} "
+            f"{r.get('completed', 0):>4}"
+        )
     print("=" * 80)
 
     if args.output_file:

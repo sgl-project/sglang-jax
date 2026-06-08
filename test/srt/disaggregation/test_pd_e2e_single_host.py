@@ -35,27 +35,15 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from sgl_jax.srt.disaggregation.bootstrap import (
-    BootstrapClient,
-    BootstrapServer,
-)
 from sgl_jax.srt.disaggregation.base.kv_manager import KVPoll
-from sgl_jax.srt.disaggregation.jax_transfer.conn import (
-    JaxTransferKVManager,
-    PMetadata,
-)
-from sgl_jax.srt.disaggregation.common.zmq_notifier import (
-    ZmqPullNotifier,
-)
+from sgl_jax.srt.disaggregation.bootstrap import BootstrapClient, BootstrapServer
+from sgl_jax.srt.disaggregation.common.zmq_notifier import ZmqPullNotifier
+from sgl_jax.srt.disaggregation.decode import SchedulerDisaggregationDecodeMixin
 from sgl_jax.srt.disaggregation.jax_transfer import wrapper as jtw_mod
+from sgl_jax.srt.disaggregation.jax_transfer.conn import JaxTransferKVManager, PMetadata
 from sgl_jax.srt.disaggregation.jax_transfer.wrapper import JaxTransferWrapper
-from sgl_jax.srt.disaggregation.prefill import (
-    SchedulerDisaggregationPrefillMixin,
-)
-from sgl_jax.srt.disaggregation.decode import (
-    SchedulerDisaggregationDecodeMixin,
-)
-from sgl_jax.srt.managers.schedule_batch import Req, FINISH_ABORT
+from sgl_jax.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
+from sgl_jax.srt.managers.schedule_batch import FINISH_ABORT, Req
 from sgl_jax.srt.sampling.sampling_params import SamplingParams
 
 
@@ -112,9 +100,7 @@ def _reset_singleton():
 
 def _device_sharding():
     devices = jax.local_devices()
-    mesh = jax.sharding.Mesh(
-        np.asarray(devices[:1]).reshape(1), axis_names=("x",)
-    )
+    mesh = jax.sharding.Mesh(np.asarray(devices[:1]).reshape(1), axis_names=("x",))
     return jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
 
 
@@ -158,9 +144,7 @@ def test_pd_wire_flow_e2e():
     d_side_channel_port = _free_port()
     bootstrap_room = 12345
     prompt_input_ids = [101, 7592, 1024]  # "hi"
-    expected_tokens = _fake_decode(
-        _fake_prefill_kv(prompt_input_ids), steps=4
-    )
+    expected_tokens = _fake_decode(_fake_prefill_kv(prompt_input_ids), steps=4)
 
     server = BootstrapServer("127.0.0.1", bootstrap_port)
     server.start()
@@ -171,14 +155,13 @@ def test_pd_wire_flow_e2e():
             # ---------- P side ----------
             p_wrapper = JaxTransferWrapper("127.0.0.1", p_transfer_port)
             with mock.patch.object(
-                jtw_mod.jax, "local_devices",
+                jtw_mod.jax,
+                "local_devices",
                 return_value=[mock.MagicMock()],
             ):
                 p_wrapper.start()
             jtw_mod._reset_singleton_for_test()  # let D get its own
-            p_notifier = ZmqPullNotifier(
-                "prefill", "127.0.0.1", p_side_channel_port
-            )
+            p_notifier = ZmqPullNotifier("prefill", "127.0.0.1", p_side_channel_port)
             p_notifier.start()
             p_mgr = JaxTransferKVManager(p_wrapper, p_notifier)
             p_client = BootstrapClient(bootstrap_url)
@@ -193,13 +176,12 @@ def test_pd_wire_flow_e2e():
             # ---------- D side ----------
             d_wrapper = JaxTransferWrapper("127.0.0.1", d_transfer_port)
             with mock.patch.object(
-                jtw_mod.jax, "local_devices",
+                jtw_mod.jax,
+                "local_devices",
                 return_value=[mock.MagicMock()],
             ):
                 d_wrapper.start()
-            d_notifier = ZmqPullNotifier(
-                "decode", "127.0.0.1", d_side_channel_port
-            )
+            d_notifier = ZmqPullNotifier("decode", "127.0.0.1", d_side_channel_port)
             d_notifier.start()
             d_mgr = JaxTransferKVManager(d_wrapper, d_notifier)
             d_client = BootstrapClient(bootstrap_url)
@@ -219,13 +201,9 @@ def test_pd_wire_flow_e2e():
                 p_info = d_client.get_prefill_info(bootstrap_room)
                 assert p_info["bootstrap_key"] == p_key
 
-                spec = jax.ShapeDtypeStruct(
-                    (64,), jnp.float32, sharding=_device_sharding()
-                )
+                spec = jax.ShapeDtypeStruct((64,), jnp.float32, sharding=_device_sharding())
                 metadata = PMetadata(
-                    remote_addr=(
-                        f"{p_info['host']}:{p_info['transfer_port']}"
-                    ),
+                    remote_addr=(f"{p_info['host']}:{p_info['transfer_port']}"),
                     uuid=req_id,
                     specs={"kv": spec},
                     p_side_channel_host=str(p_info["host"]),
@@ -241,9 +219,7 @@ def test_pd_wire_flow_e2e():
                     if state == KVPoll.FAILED:
                         pytest.fail(f"receiver state={state}")
                     if time.perf_counter() > deadline:
-                        pytest.fail(
-                            f"receiver stuck at {state} after 5s"
-                        )
+                        pytest.fail(f"receiver stuck at {state} after 5s")
                     time.sleep(0.005)
 
                 # P's sender should have received the ack and gone
@@ -251,16 +227,13 @@ def test_pd_wire_flow_e2e():
                 deadline = time.perf_counter() + 5.0
                 while sender.poll() != KVPoll.SUCCESS:
                     if time.perf_counter() > deadline:
-                        pytest.fail(
-                            f"sender stuck at {sender.poll()}"
-                        )
+                        pytest.fail(f"sender stuck at {sender.poll()}")
                     time.sleep(0.005)
 
                 # D: fake decode from received KV
                 got_tokens = _fake_decode(receiver.result["kv"], steps=4)
                 assert got_tokens == expected_tokens, (
-                    f"PD decode {got_tokens} != baseline "
-                    f"{expected_tokens}"
+                    f"PD decode {got_tokens} != baseline " f"{expected_tokens}"
                 )
             finally:
                 d_notifier.stop()
@@ -287,9 +260,7 @@ class _FakeKVPool:
         head_dim: int = 4,
     ):
         devices = jax.local_devices()
-        self.mesh = jax.sharding.Mesh(
-            np.asarray(devices[:1]).reshape(1), axis_names=("x",)
-        )
+        self.mesh = jax.sharding.Mesh(np.asarray(devices[:1]).reshape(1), axis_names=("x",))
         self.page_size = page_size
         self.layer_num = layer_num
         self.start_layer = 0
@@ -351,9 +322,7 @@ class _FakeReqToTokenPool:
     """Fake req_to_token_pool backed by a numpy 2D array."""
 
     def __init__(self, max_reqs: int = 16, max_tokens: int = 512):
-        self.req_to_token = np.zeros(
-            (max_reqs, max_tokens), dtype=np.int32
-        )
+        self.req_to_token = np.zeros((max_reqs, max_tokens), dtype=np.int32)
 
     def free(self, req_pool_idx):
         pass
@@ -394,9 +363,7 @@ class _FakePrefillScheduler(SchedulerDisaggregationPrefillMixin):
     """Stub that inherits SchedulerDisaggregationPrefillMixin."""
 
     def __init__(self, kv_pool, allocator, req_to_token_pool, kv_manager):
-        from sgl_jax.srt.disaggregation.prefill import (
-            PrefillBootstrapQueue,
-        )
+        from sgl_jax.srt.disaggregation.prefill import PrefillBootstrapQueue
 
         self.token_to_kv_pool_allocator = allocator
         self.req_to_token_pool = req_to_token_pool
@@ -473,15 +440,14 @@ def mixin_e2e_infra():
 
         p_wrapper = JaxTransferWrapper("127.0.0.1", p_transfer_port)
         with mock.patch.object(
-            jtw_mod.jax, "local_devices",
+            jtw_mod.jax,
+            "local_devices",
             return_value=[mock.MagicMock()],
         ):
             p_wrapper.start()
         jtw_mod._reset_singleton_for_test()
 
-        p_notifier = ZmqPullNotifier(
-            "prefill", "127.0.0.1", p_side_channel_port
-        )
+        p_notifier = ZmqPullNotifier("prefill", "127.0.0.1", p_side_channel_port)
         p_notifier.start()
         p_mgr = JaxTransferKVManager(p_wrapper, p_notifier)
 
@@ -496,31 +462,24 @@ def mixin_e2e_infra():
 
         d_wrapper = JaxTransferWrapper("127.0.0.1", d_transfer_port)
         with mock.patch.object(
-            jtw_mod.jax, "local_devices",
+            jtw_mod.jax,
+            "local_devices",
             return_value=[mock.MagicMock()],
         ):
             d_wrapper.start()
 
-        d_notifier = ZmqPullNotifier(
-            "decode", "127.0.0.1", d_side_channel_port
-        )
+        d_notifier = ZmqPullNotifier("decode", "127.0.0.1", d_side_channel_port)
         d_notifier.start()
         d_mgr = JaxTransferKVManager(d_wrapper, d_notifier)
         d_client = BootstrapClient(f"http://127.0.0.1:{bootstrap_port}")
 
-        p_sched = _FakePrefillScheduler(
-            p_kv_pool, p_alloc, p_r2t, p_mgr
-        )
-        d_sched = _FakeDecodeScheduler(
-            d_kv_pool, d_alloc, d_r2t, d_mgr, d_client
-        )
+        p_sched = _FakePrefillScheduler(p_kv_pool, p_alloc, p_r2t, p_mgr)
+        d_sched = _FakeDecodeScheduler(d_kv_pool, d_alloc, d_r2t, d_mgr, d_client)
 
         # Seed P's KV pool with deterministic data per page
         for layer_idx in range(p_kv_pool.layer_num):
             rng = np.random.default_rng(layer_idx)
-            buf_np = rng.standard_normal(
-                p_kv_pool.kv_buffer[layer_idx].shape
-            ).astype(np.float32)
+            buf_np = rng.standard_normal(p_kv_pool.kv_buffer[layer_idx].shape).astype(np.float32)
             p_kv_pool.kv_buffer[layer_idx] = jax.device_put(
                 jnp.asarray(buf_np), p_kv_pool.kv_sharding
             )
@@ -575,9 +534,7 @@ def test_mixin_e2e_single_req_happy_path(mixin_e2e_infra):
     assert len(d_sched.disagg_prealloc_queue) == 1
 
     _poll_until(
-        lambda: (
-            d_sched.process_decode_queue() or True
-        ) and len(d_sched.waiting_queue) > 0,
+        lambda: (d_sched.process_decode_queue() or True) and len(d_sched.waiting_queue) > 0,
         timeout=5.0,
     )
 
@@ -589,8 +546,7 @@ def test_mixin_e2e_single_req_happy_path(mixin_e2e_infra):
     # P sender should be SUCCESS after D ack
     p_sched.send_kv_chunk()
     _poll_until(
-        lambda: (p_sched.send_kv_chunk() or True) and
-                len(p_sched._stream_output_calls) > 0,
+        lambda: (p_sched.send_kv_chunk() or True) and len(p_sched._stream_output_calls) > 0,
         timeout=5.0,
     )
     assert len(p_sched._stream_output_calls) >= 1
@@ -610,9 +566,7 @@ def test_mixin_e2e_multi_req_concurrent(mixin_e2e_infra):
         req_p = _make_pd_req(rid, input_ids, bootstrap_room=100 + i, req_pool_idx=i)
         _fill_req_to_token(infra["p_r2t"], req_p, infra["p_alloc"])
         reqs_p.append(req_p)
-        reqs_d.append(
-            _make_pd_req(rid, input_ids, bootstrap_room=100 + i, req_pool_idx=i)
-        )
+        reqs_d.append(_make_pd_req(rid, input_ids, bootstrap_room=100 + i, req_pool_idx=i))
 
     batch = _FakeBatch(reqs_p)
     p_sched.process_prefill_chunk(batch, None)
@@ -620,9 +574,7 @@ def test_mixin_e2e_multi_req_concurrent(mixin_e2e_infra):
     d_sched.process_input_requests_disagg_decode(reqs_d)
 
     _poll_until(
-        lambda: (
-            d_sched.process_decode_queue() or True
-        ) and len(d_sched.waiting_queue) >= 3,
+        lambda: (d_sched.process_decode_queue() or True) and len(d_sched.waiting_queue) >= 3,
         timeout=10.0,
     )
 
@@ -631,8 +583,7 @@ def test_mixin_e2e_multi_req_concurrent(mixin_e2e_infra):
     assert finished_rids == expected_rids
 
     _poll_until(
-        lambda: (p_sched.send_kv_chunk() or True) and
-                len(p_sched._stream_output_calls) >= 3,
+        lambda: (p_sched.send_kv_chunk() or True) and len(p_sched._stream_output_calls) >= 3,
         timeout=10.0,
     )
 
@@ -679,8 +630,7 @@ def test_mixin_e2e_pd_skip_prefix_match_consume_once(mixin_e2e_infra):
     d_sched.process_input_requests_disagg_decode([req_d])
 
     _poll_until(
-        lambda: (d_sched.process_decode_queue() or True) and
-                len(d_sched.waiting_queue) > 0,
+        lambda: (d_sched.process_decode_queue() or True) and len(d_sched.waiting_queue) > 0,
         timeout=5.0,
     )
 
@@ -706,13 +656,9 @@ def test_scheduler_composes_disaggregation_mixins():
     worker), so we inspect the class object directly.
     """
 
+    from sgl_jax.srt.disaggregation.decode import SchedulerDisaggregationDecodeMixin
+    from sgl_jax.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
     from sgl_jax.srt.managers.scheduler import Scheduler
-    from sgl_jax.srt.disaggregation.decode import (
-        SchedulerDisaggregationDecodeMixin,
-    )
-    from sgl_jax.srt.disaggregation.prefill import (
-        SchedulerDisaggregationPrefillMixin,
-    )
 
     assert issubclass(Scheduler, SchedulerDisaggregationPrefillMixin)
     assert issubclass(Scheduler, SchedulerDisaggregationDecodeMixin)

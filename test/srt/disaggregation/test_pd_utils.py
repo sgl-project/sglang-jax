@@ -12,7 +12,6 @@ from sgl_jax.srt.disaggregation import pd_auth
 from sgl_jax.srt.disaggregation.bootstrap import build_app
 from sgl_jax.srt.disaggregation.host_ip import resolve_host_ip
 
-
 # ---- host_ip resolution -----------------------------------------------------
 
 
@@ -61,12 +60,15 @@ def test_resolves_from_hostname_env_var(monkeypatch):
 
 def test_resolves_from_socket_when_env_unset(monkeypatch):
     monkeypatch.delenv("HOSTNAME", raising=False)
-    with mock.patch(
-        "sgl_jax.srt.disaggregation.host_ip.socket.gethostname",
-        return_value="fallback-host",
-    ), mock.patch(
-        "sgl_jax.srt.disaggregation.host_ip.socket.gethostbyname",
-        return_value="10.0.0.7",
+    with (
+        mock.patch(
+            "sgl_jax.srt.disaggregation.host_ip.socket.gethostname",
+            return_value="fallback-host",
+        ),
+        mock.patch(
+            "sgl_jax.srt.disaggregation.host_ip.socket.gethostbyname",
+            return_value="10.0.0.7",
+        ),
     ):
         assert resolve_host_ip() == "10.0.0.7"
 
@@ -79,42 +81,49 @@ def test_falls_through_when_env_resolution_fails(monkeypatch):
             raise socket.gaierror(-2, "no such host")
         return "10.0.0.99"
 
-    with mock.patch(
-        "sgl_jax.srt.disaggregation.host_ip.socket.gethostname",
-        return_value="real-host",
-    ), mock.patch(
-        "sgl_jax.srt.disaggregation.host_ip.socket.gethostbyname",
-        side_effect=_gethostbyname,
+    with (
+        mock.patch(
+            "sgl_jax.srt.disaggregation.host_ip.socket.gethostname",
+            return_value="real-host",
+        ),
+        mock.patch(
+            "sgl_jax.srt.disaggregation.host_ip.socket.gethostbyname",
+            side_effect=_gethostbyname,
+        ),
     ):
         assert resolve_host_ip() == "10.0.0.99"
 
 
 def test_raises_when_all_strategies_fail(monkeypatch):
     monkeypatch.delenv("HOSTNAME", raising=False)
-    with mock.patch(
-        "sgl_jax.srt.disaggregation.host_ip.socket.gethostname",
-        return_value="some-host",
-    ), mock.patch(
-        "sgl_jax.srt.disaggregation.host_ip.socket.gethostbyname",
-        side_effect=socket.gaierror(-2, "no such host"),
-    ), pytest.raises(RuntimeError, match="resolve a usable host IP"):
+    with (
+        mock.patch(
+            "sgl_jax.srt.disaggregation.host_ip.socket.gethostname",
+            return_value="some-host",
+        ),
+        mock.patch(
+            "sgl_jax.srt.disaggregation.host_ip.socket.gethostbyname",
+            side_effect=socket.gaierror(-2, "no such host"),
+        ),
+        pytest.raises(RuntimeError, match="resolve a usable host IP"),
+    ):
         resolve_host_ip()
 
 
 def test_resolved_bind_address_is_rejected(monkeypatch):
     monkeypatch.setenv("HOSTNAME", "bad-dns")
-    with mock.patch(
-        "sgl_jax.srt.disaggregation.host_ip.socket.gethostbyname",
-        return_value="127.0.0.1",
-    ), pytest.raises(RuntimeError, match="loopback"):
+    with (
+        mock.patch(
+            "sgl_jax.srt.disaggregation.host_ip.socket.gethostbyname",
+            return_value="127.0.0.1",
+        ),
+        pytest.raises(RuntimeError, match="loopback"),
+    ):
         resolve_host_ip()
 
 
 def test_dns_name_passes_through():
-    assert (
-        resolve_host_ip("pd-host-3.cluster.local")
-        == "pd-host-3.cluster.local"
-    )
+    assert resolve_host_ip("pd-host-3.cluster.local") == "pd-host-3.cluster.local"
 
 
 # ---- pd_auth: secret resolution + HMAC tags ---------------------------------
