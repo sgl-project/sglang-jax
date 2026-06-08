@@ -709,6 +709,9 @@ class EagleDraftInput:
             # Per-rank store (matches nospec extend); _get_spec_decode_mwb_dp
             # DP-segments these so each rank's P("data") shard = its own slots.
             info.out_cache_loc = np.asarray(ocl_r, dtype=np.int32)
+            for req, allocated_len in zip(info.reqs, new_r):
+                req.decode_batch_idx += 1
+                req.kv_allocated_len = int(allocated_len)
             flat_off += bs_r
             info.seq_lens_sum = np.sum(info.seq_lens).item()
 
