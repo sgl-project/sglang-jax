@@ -255,6 +255,20 @@ class TestVerifyTree(CustomTestCase):
         source = inspect.getsource(Scheduler.run_batch)
         self.assertIn("resolve_spec_decode_scheduler_fields", source)
 
+    def test_model_worker_client_exposes_target_worker_attributes_for_spec(self):
+        from sgl_jax.srt.managers.tp_worker_overlap_thread import ModelWorkerClient
+
+        client = ModelWorkerClient.__new__(ModelWorkerClient)
+        model_config = object()
+        model_runner = object()
+        client.worker = SimpleNamespace(
+            model_config=model_config,
+            model_runner=model_runner,
+        )
+
+        self.assertIs(client.model_config, model_config)
+        self.assertIs(client.model_runner, model_runner)
+
     def test_as_int32_array_keeps_host_metadata_on_host(self):
         from sgl_jax.srt.speculative import eagle_util
 
