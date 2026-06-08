@@ -373,6 +373,33 @@ class TestVerifyTree(CustomTestCase):
         self.assertIn("can_use_spec_decode_overlap", source)
         self.assertIn("forward_batch_speculative_decode_overlap", source)
 
+    def test_server_args_allow_supported_spec_overlap_configuration(self):
+        from sgl_jax.srt.server_args import ServerArgs
+
+        args = ServerArgs(
+            model_path="/tmp/model",
+            speculative_algorithm="NEXTN",
+            speculative_eagle_topk=1,
+            speculative_num_steps=3,
+            speculative_num_draft_tokens=4,
+            disable_overlap_schedule=False,
+        )
+        args.check_server_args()
+
+    def test_server_args_reject_unsupported_spec_overlap_configuration(self):
+        from sgl_jax.srt.server_args import ServerArgs
+
+        args = ServerArgs(
+            model_path="/tmp/model",
+            speculative_algorithm="NEXTN",
+            speculative_eagle_topk=2,
+            speculative_num_steps=3,
+            speculative_num_draft_tokens=4,
+            disable_overlap_schedule=False,
+        )
+        with self.assertRaises(ValueError):
+            args.check_server_args()
+
     def test_decode_output_processor_restores_spec_pending_draft_extend(self):
         from sgl_jax.srt.managers.scheduler_output_processor_mixin import (
             SchedulerOutputProcessorMixin,
