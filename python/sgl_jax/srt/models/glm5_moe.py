@@ -498,6 +498,25 @@ class Glm5MLP(nnx.Module):
 
         self.act_fn = jax.nn.silu
 
+        if use_fused:
+            tp_size = mesh.shape["tensor"]
+            local_inter_size = intermediate_size // tp_size
+            B_INTER = 128
+            pad_inter = (B_INTER - (local_inter_size % B_INTER)) % B_INTER
+            local_inter_size_padded = local_inter_size + pad_inter
+            global_inter_size_padded = local_inter_size_padded * tp_size
+
+            # Pre-allocate fused parameters with correct global shape and sharding
+            # under the active constructor mesh context.
+            self.w_gu = nnx.Param(
+                jnp.zeros((hidden_size, global_inter_size_padded * 2), dtype=dtype),
+                out_sharding=P(None, "tensor"),
+            )
+            self.w_d = nnx.Param(
+                jnp.zeros((global_inter_size_padded, hidden_size), dtype=dtype),
+                out_sharding=P("tensor", None),
+            )
+
     def post_load_weights(self):
         if not self.use_fused:
             return
@@ -526,9 +545,9 @@ class Glm5MLP(nnx.Module):
         w_gu = jnp.concatenate([wg_reshaped, wu_reshaped], axis=-1)
         w_gu = w_gu.reshape(hidden_size, local_inter_size * 2)
         
-        # Store fused parameters sharded exactly like original projections
-        self.w_gu = nnx.Param(w_gu, out_sharding=P(None, "tensor"))
-        self.w_d = nnx.Param(wd, out_sharding=P("tensor", None))
+        # Assign values directly to pre-allocated sharded parameters
+        self.w_gu.value = w_gu
+        self.w_d.value = wd
         
         # Free original projection modules to save HBM
         self.gate_proj = None
