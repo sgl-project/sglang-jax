@@ -77,7 +77,7 @@ from sgl_jax.srt.multimodal.tokenizer_utils import resolve_tokenizer_subdir
 from sgl_jax.srt.precision_tracer import precision_tracer
 from sgl_jax.srt.server_args import PortArgs, ServerArgs
 from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
-from sgl_jax.srt.speculative.overlap_future import (
+from sgl_jax.srt.speculative.overlap_worker import (
     can_use_spec_decode_overlap,
     publish_spec_decode_new_seq_lens,
 )
@@ -126,10 +126,8 @@ class GenerationBatchResult:
     # relay path: forward stream -> next step forward
     next_draft_input: EagleDraftInput | None = None
 
-    allocate_lens: np.ndarray | None = None
     num_accepted_tokens: int | None = None
     accept_lens: np.ndarray | None = None
-    pending_draft_extend_result: object | None = None
 
 
 class Scheduler(
@@ -340,6 +338,10 @@ class Scheduler(
                 server_args=server_args,
                 target_worker=self.tp_worker,
             )
+            if self.enable_overlap:
+                from sgl_jax.srt.speculative.overlap_worker import SpecWorkerClient
+
+                self.draft_worker = SpecWorkerClient(self.draft_worker)
 
         # Get token and memory info from the model worker
         (
@@ -527,6 +529,9 @@ class Scheduler(
         if cache_status is None:
             cache_status = "not configured (JAX_COMPILATION_CACHE_DIR unset)"
         logger.info("XLA persistent compilation cache: %s", cache_status)
+
+    def _is_spec_decode_enabled(self) -> bool:
+        return self.spec_algorithm is not None and not self.spec_algorithm.is_none()
 
     def sync_pub(self):
         logger.info(
@@ -1559,7 +1564,7 @@ class Scheduler(
             if not self.last_batch.is_empty() and not self.last_batch.is_prefill_only:
                 if self.running_batch.is_empty():
                     self.running_batch = self.last_batch
-                else:
+                elif not self._is_spec_decode_enabled():
                     # Merge running_batch with prefill batch
                     self.running_batch.merge_batch(self.last_batch)
 
@@ -1592,6 +1597,8 @@ class Scheduler(
 
         # Handle the cases where prefill is not allowed
         has_chunked_reqs = any(req is not None for req in self.chunked_reqs)
+        if self._is_spec_decode_enabled() and not self.running_batch.is_empty():
+            return None
         if (
             self.running_batch.batch_is_full or len(self.waiting_queue) == 0
         ) and not has_chunked_reqs:
@@ -1734,6 +1741,7 @@ class Scheduler(
         # Mixed-style chunked prefill
         if (
             self.is_mixed_chunk
+            and not self._is_spec_decode_enabled()
             and not self.running_batch.is_empty()
             and not (new_batch.return_logprob or self.running_batch.return_logprob)
         ):
@@ -1928,24 +1936,29 @@ class Scheduler(
                     draft_token_num=self.draft_worker.speculative_num_draft_tokens,
                 )
             if can_use_spec_decode_overlap(self.enable_overlap, self.spec_algorithm, batch):
-                batch_output, publish_fields = (
+                batch_output, published_new_seq_lens = (
                     self.draft_worker.forward_batch_speculative_decode_overlap(model_worker_batch)
                 )
             else:
                 batch_output = self.draft_worker.forward_batch_speculative_generation(
                     model_worker_batch
                 )
-                publish_fields = (
+                published_new_seq_lens = (
                     publish_spec_decode_new_seq_lens(batch_output)
                     if batch.forward_mode.is_decode()
                     else None
                 )
-            per_rank_spec = ScheduleBatch._split_spec_info_per_rank(
-                batch_output.next_draft_input, model_worker_batch.real_bs_per_dp
+            if batch_output.next_draft_input is not None:
+                per_rank_spec = ScheduleBatch._split_spec_info_per_rank(
+                    batch_output.next_draft_input, model_worker_batch.real_bs_per_dp
+                )
+                for r, s in enumerate(per_rank_spec):
+                    batch.reqs_info[r].spec_info = s
+            new_seq_lens = (
+                np.asarray(jax.device_get(published_new_seq_lens))
+                if published_new_seq_lens is not None
+                else None
             )
-            for r, s in enumerate(per_rank_spec):
-                batch.reqs_info[r].spec_info = s
-            new_seq_lens = publish_fields.new_seq_lens if publish_fields is not None else None
             per_dp_bs = model_worker_batch.per_dp_bs_size
             for dp_rank, info in enumerate(batch.reqs_info):
                 if info.seq_lens is None or len(info.seq_lens) == 0:
@@ -2007,12 +2020,14 @@ class Scheduler(
             bid=bid,
             cache_miss_count=cache_miss_count,
         )
-        if self.spec_algorithm is not None and self.spec_algorithm.is_eagle():
+        if (
+            self.spec_algorithm is not None
+            and self.spec_algorithm.is_eagle()
+            and batch_output.next_draft_input is not None
+        ):
             assert isinstance(batch_output.next_draft_input, EagleDraftInput)
             ret.next_draft_input = batch_output.next_draft_input
             ret.accept_lens = batch_output.accept_lens
-            ret.allocate_lens = batch_output.allocate_lens
-            ret.pending_draft_extend_result = batch_output.pending_draft_extend_result
         return ret
 
     def process_batch_result(

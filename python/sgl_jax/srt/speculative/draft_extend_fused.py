@@ -40,7 +40,6 @@ class FusedDraftExtendPendingResult(NamedTuple):
     batch_output: object
     selected_layer0_hidden: object
     topk_index_stacked: object
-    all_pool_updates: object
     accept_lens: object
     sel: np.ndarray
 
@@ -49,9 +48,6 @@ class SpecDecodePendingDraftExtendResult(NamedTuple):
     draft_worker: object
     model_worker_batch: object
     pending_result: FusedDraftExtendPendingResult | None
-
-
-_RESTORED_SPEC_DECODE_PENDING_DRAFT_EXTEND_IDS = set()
 
 
 def _take_with_index_sharding(values, index):
@@ -548,7 +544,8 @@ def _build_fused_greedy_prefill_jit(num_layers: int, topk: int):
         stacked_idx = jnp.stack(all_topk_index, axis=1)
         if mesh is not None:
             rep = NamedSharding(mesh, P())
-            next_token_ids = jax.sharding.reshard(next_token_ids, rep)
+            data_sharding = NamedSharding(mesh, P("data"))
+            next_token_ids = jax.sharding.reshard(jnp.copy(next_token_ids), data_sharding)
             selected_layer0_hidden = jax.sharding.reshard(selected_layer0_hidden, rep)
             stacked_idx = jax.sharding.reshard(stacked_idx, rep)
 
@@ -700,6 +697,22 @@ def _forward_batch_init_new_preserve_device(batch, model_runner):
     )
 
 
+def prepare_spec_prefill_forward_batch(spec_worker, model_worker_batch):
+    """Prepare the target ForwardBatch before speculative prefill is queued."""
+    from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode
+
+    target_mr = spec_worker.target_worker.model_runner
+    model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
+    target_mr.attn_backend.forward_metadata = target_mr.attn_backend.get_forward_metadata(
+        model_worker_batch
+    )
+    model_worker_batch.forward_batch = _forward_batch_init_new_preserve_device(
+        model_worker_batch, target_mr
+    )
+    model_worker_batch.forward_batch.bid = model_worker_batch.bid
+    return model_worker_batch.forward_batch
+
+
 def launch_fused_draft_extend_for_decode(draft_worker, model_worker_batch, batch_output):
     """Launch fused MTP draft extend and return deferred host restore state."""
     from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
@@ -710,7 +723,8 @@ def launch_fused_draft_extend_for_decode(draft_worker, model_worker_batch, batch
     target_hidden = batch_output.logits_output.hidden_states
 
     draft_input = EagleDraftInput(
-        hidden_states=target_hidden, allocate_lens=batch_output.allocate_lens
+        hidden_states=target_hidden,
+        allocate_lens=batch_output.next_draft_input.allocate_lens,
     )
     mwb, logits_metadata = draft_input.prepare_for_extend_after_verify(
         model_worker_batch,
@@ -761,11 +775,13 @@ def launch_fused_draft_extend_for_decode(draft_worker, model_worker_batch, batch
             num_layers=draft_worker.speculative_num_steps,
         )
 
+    for i, w in enumerate(draft_worker._workers):
+        w.model_runner.memory_pools.replace_all(all_pool_updates[i])
+
     return FusedDraftExtendPendingResult(
         batch_output=batch_output,
         selected_layer0_hidden=selected_layer0_hidden,
         topk_index_stacked=topk_index_stacked,
-        all_pool_updates=all_pool_updates,
         accept_lens=batch_output.accept_lens,
         sel=sel,
     )
@@ -778,12 +794,8 @@ def restore_fused_draft_extend_result(draft_worker, model_worker_batch, pending_
     batch_output = pending_result.batch_output
     selected_layer0_hidden = pending_result.selected_layer0_hidden
     topk_index_stacked = pending_result.topk_index_stacked
-    all_pool_updates = pending_result.all_pool_updates
     accept_host = np.asarray(jax.device_get(pending_result.accept_lens))
     sel = pending_result.sel
-
-    for i, w in enumerate(draft_worker._workers):
-        w.model_runner.memory_pools.replace_all(all_pool_updates[i])
 
     verified_id_arr = batch_output.next_draft_input.verified_id
     if hasattr(verified_id_arr, "copy_to_host_async"):
@@ -798,28 +810,28 @@ def restore_fused_draft_extend_result(draft_worker, model_worker_batch, pending_
     batch_output.next_draft_input.topk_index = topk_index
     select_index = sel * (draft_worker.speculative_num_steps + 1) + accept_host[sel] - 1
     batch_output.next_draft_input.verified_id = np.asarray(verified_id_arr)[select_index]
-    batch_output.allocate_lens = batch_output.allocate_lens[: model_worker_batch.real_bs]
+    batch_output.next_draft_input.allocate_lens = batch_output.next_draft_input.allocate_lens[
+        : model_worker_batch.real_bs
+    ]
     batch_output.accept_lens = accept_host
 
 
 def restore_spec_decode_pending_draft_extend_result(pending_draft_extend_result):
     if pending_draft_extend_result is None:
         return None
-    pending_id = id(pending_draft_extend_result)
-    if pending_id in _RESTORED_SPEC_DECODE_PENDING_DRAFT_EXTEND_IDS:
-        if pending_draft_extend_result.pending_result is None:
-            return None
-        return pending_draft_extend_result.pending_result.batch_output
+    if pending_draft_extend_result.pending_result is None:
+        return None
+
+    batch_output = pending_draft_extend_result.pending_result.batch_output
+    if getattr(batch_output.next_draft_input, "topk_index", None) is not None:
+        return batch_output
 
     restore_fused_draft_extend_result(
         pending_draft_extend_result.draft_worker,
         pending_draft_extend_result.model_worker_batch,
         pending_draft_extend_result.pending_result,
     )
-    _RESTORED_SPEC_DECODE_PENDING_DRAFT_EXTEND_IDS.add(pending_id)
-    if pending_draft_extend_result.pending_result is None:
-        return None
-    return pending_draft_extend_result.pending_result.batch_output
+    return batch_output
 
 
 def draft_extend_for_decode_fused(draft_worker, model_worker_batch, batch_output):
@@ -833,7 +845,7 @@ def draft_extend_for_decode_fused(draft_worker, model_worker_batch, batch_output
     restore_fused_draft_extend_result(draft_worker, model_worker_batch, pending_result)
 
 
-def spec_prefill(spec_worker, model_worker_batch):
+def spec_prefill(spec_worker, model_worker_batch, launch_done=None):
     """Run greedy prefill target forward and MTP draft-extend in one JIT."""
     from sgl_jax.srt.managers.scheduler import GenerationBatchResult
     from sgl_jax.srt.model_executor.forward_batch_info import (
@@ -846,12 +858,15 @@ def spec_prefill(spec_worker, model_worker_batch):
     target_worker = spec_worker.target_worker
     target_mr = target_worker.model_runner
 
-    model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
-    target_mr.attn_backend.forward_metadata = target_mr.attn_backend.get_forward_metadata(
-        model_worker_batch
-    )
-    target_forward_batch = _forward_batch_init_new_preserve_device(model_worker_batch, target_mr)
-    target_forward_batch.bid = model_worker_batch.bid
+    if getattr(model_worker_batch, "forward_batch", None) is None:
+        target_forward_batch = prepare_spec_prefill_forward_batch(spec_worker, model_worker_batch)
+    else:
+        model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
+        target_mr.attn_backend.forward_metadata = target_mr.attn_backend.get_forward_metadata(
+            model_worker_batch
+        )
+        target_forward_batch = model_worker_batch.forward_batch
+        target_forward_batch.bid = model_worker_batch.bid
     target_logits_metadata = _logits_metadata_from_model_worker_batch_preserve_device(
         model_worker_batch, spec_worker.mesh
     )
@@ -873,6 +888,7 @@ def spec_prefill(spec_worker, model_worker_batch):
         model_worker_batch
     )
     draft_forward_batch = ForwardBatch.init_new(model_worker_batch, draft_mr0)
+    draft_forward_batch.input_ids = target_forward_batch.input_ids
     draft_forward_batch.bid = model_worker_batch.bid
     draft_logits_indices = _device_array_preserve_device(
         model_worker_batch.logits_indices,
@@ -923,17 +939,22 @@ def spec_prefill(spec_worker, model_worker_batch):
         )
         cache_miss_count = count()
 
+    if launch_done is not None:
+        launch_done.set()
+
     target_mr.memory_pools.replace_all(target_pool_updates)
     for i, w in enumerate(draft_worker._workers):
         w.model_runner.memory_pools.replace_all(all_pool_updates[i])
 
+    relay_next_token_ids = next_token_ids
+    host_next_token_ids = next_token_ids
     if model_worker_batch.dp_size > 1:
         from jax.experimental.multihost_utils import process_allgather
 
-        next_token_ids = process_allgather(next_token_ids, tiled=True)
+        host_next_token_ids = process_allgather(host_next_token_ids, tiled=True)
 
     sel = np.asarray(model_worker_batch.logits_indices_selector)
-    jax.copy_to_host_async(next_token_ids)
+    jax.copy_to_host_async(host_next_token_ids)
     jax.copy_to_host_async(layer0_hidden)
     jax.copy_to_host_async(topk_index_stacked)
 
@@ -942,13 +963,12 @@ def spec_prefill(spec_worker, model_worker_batch):
     model_worker_batch.spec_info_padded.topk_p = np.ones(topk_index.shape, dtype=np.float32)
     model_worker_batch.spec_info_padded.topk_index = topk_index
     model_worker_batch.spec_info_padded.allocate_lens = np.asarray(model_worker_batch.seq_lens)[sel]
-    model_worker_batch.spec_info_padded.verified_id = np.asarray(next_token_ids)[sel]
+    model_worker_batch.spec_info_padded.verified_id = np.asarray(host_next_token_ids)[sel]
 
     return GenerationBatchResult(
         logits_output=logits_output,
-        next_token_ids=next_token_ids,
+        next_token_ids=relay_next_token_ids if launch_done is not None else host_next_token_ids,
         next_draft_input=model_worker_batch.spec_info_padded,
-        allocate_lens=np.asarray(model_worker_batch.seq_lens)[sel],
         bid=model_worker_batch.bid,
         cache_miss_count=cache_miss_count,
         extend_input_len_per_req=None,
@@ -1032,7 +1052,6 @@ def spec_decode_verify_phase(spec_worker, model_worker_batch, cur_allocate_lens)
         next_token_ids=prepared_predict,
         next_draft_input=next_draft_input,
         accept_lens=prepared_accept_lens,
-        allocate_lens=cur_allocate_lens,
         bid=model_worker_batch.bid,
         cache_miss_count=cache_miss_count,
         extend_input_len_per_req=None,
@@ -1071,9 +1090,8 @@ def spec_decode_overlap(spec_worker, model_worker_batch, cur_allocate_lens):
             batch_output,
         ),
     )
-    from sgl_jax.srt.speculative.overlap_future import publish_spec_decode_new_seq_lens
+    from sgl_jax.srt.speculative.overlap_worker import publish_spec_decode_new_seq_lens
 
-    publish_fields = publish_spec_decode_new_seq_lens(batch_output)
-    batch_output.pending_draft_extend_result = pending_draft_extend_result
+    published_new_seq_lens = publish_spec_decode_new_seq_lens(batch_output)
     batch_output.next_draft_input.pending_draft_extend_result = pending_draft_extend_result
-    return batch_output, publish_fields
+    return batch_output, published_new_seq_lens

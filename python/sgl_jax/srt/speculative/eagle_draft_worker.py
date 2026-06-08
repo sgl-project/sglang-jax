@@ -278,7 +278,7 @@ class EagleDraftWorker(BaseDraftWorker):
             return
         draft_input = EagleDraftInput(
             hidden_states=batch_output.logits_output.hidden_states,
-            allocate_lens=batch_output.allocate_lens,
+            allocate_lens=batch_output.next_draft_input.allocate_lens,
         )
         model_worker_batch, logits_metadata = draft_input.prepare_for_extend_after_verify(
             model_worker_batch,
@@ -321,7 +321,9 @@ class EagleDraftWorker(BaseDraftWorker):
         batch_output.next_draft_input.topk_p = topk_p
         batch_output.next_draft_input.topk_index = topk_index
         batch_output.next_draft_input.verified_id = verified_id
-        batch_output.allocate_lens = batch_output.allocate_lens[: model_worker_batch.real_bs]
+        batch_output.next_draft_input.allocate_lens = batch_output.next_draft_input.allocate_lens[
+            : model_worker_batch.real_bs
+        ]
         batch_output.accept_lens = accept_host
 
     # -- Internal draft helpers --

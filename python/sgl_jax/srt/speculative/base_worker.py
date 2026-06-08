@@ -144,19 +144,31 @@ class BaseSpecWorker:
 
         from sgl_jax.srt.speculative.draft_extend_fused import spec_decode_overlap
 
-        return spec_decode_overlap(self, model_worker_batch, cur_allocate_lens)
+        result = spec_decode_overlap(self, model_worker_batch, cur_allocate_lens)
+        launch_done = getattr(model_worker_batch, "launch_done", None)
+        if launch_done is not None:
+            launch_done.set()
+        return result
 
-    def forward_batch_speculative_generation(self, model_worker_batch: ModelWorkerBatch):
+    def forward_batch_speculative_generation(
+        self, model_worker_batch: ModelWorkerBatch, launch_done=None
+    ):
         from sgl_jax.srt.managers.scheduler import GenerationBatchResult
         from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 
-        self._prepare_overlap_sampling_info(model_worker_batch)
+        if launch_done is None:
+            self._prepare_overlap_sampling_info(model_worker_batch)
 
         if model_worker_batch.forward_mode.is_extend():
             if self._can_use_fused_spec_prefill(model_worker_batch):
-                from sgl_jax.srt.speculative.draft_extend_fused import spec_prefill
+                from sgl_jax.srt.speculative.draft_extend_fused import (
+                    prepare_spec_prefill_forward_batch,
+                    spec_prefill,
+                )
 
-                return spec_prefill(self, model_worker_batch)
+                if getattr(model_worker_batch, "forward_batch", None) is None:
+                    prepare_spec_prefill_forward_batch(self, model_worker_batch)
+                return spec_prefill(self, model_worker_batch, launch_done=launch_done)
 
             if model_worker_batch.sampling_info.temperatures.ndim == 1:
                 model_worker_batch.sampling_info.temperatures = (
@@ -182,9 +194,6 @@ class BaseSpecWorker:
                 logits_output=logits_output,
                 next_token_ids=next_token_ids,
                 next_draft_input=model_worker_batch.spec_info_padded,
-                allocate_lens=np.asarray(model_worker_batch.seq_lens)[
-                    model_worker_batch.logits_indices_selector
-                ],
                 bid=bid,
                 cache_miss_count=cache_miss_count,
                 extend_input_len_per_req=None,
@@ -200,10 +209,17 @@ class BaseSpecWorker:
             # decode paths can be folded into this entry point over time.
             from sgl_jax.srt.speculative.draft_extend_fused import spec_decode
 
-            return spec_decode(self, model_worker_batch, cur_allocate_lens)
+            batch_output = spec_decode(self, model_worker_batch, cur_allocate_lens)
+            launch_done = getattr(model_worker_batch, "launch_done", None)
+            if launch_done is not None:
+                launch_done.set()
+            return batch_output
         self.draft_worker.draft(model_worker_batch)
         batch_output = self.verify(model_worker_batch, cur_allocate_lens)
         self.draft_worker.draft_extend_for_decode(model_worker_batch, batch_output)
+        launch_done = getattr(model_worker_batch, "launch_done", None)
+        if launch_done is not None:
+            launch_done.set()
         return batch_output
 
     def forward_target_extend(self, model_worker_batch: ModelWorkerBatch, sampling_metadata):
@@ -281,8 +297,6 @@ class BaseSpecWorker:
             next_token_ids=predict,
             next_draft_input=next_draft_input,
             accept_lens=accept_length,
-            # FIXME(pc) this field is for overlap
-            allocate_lens=cur_allocate_lens,
             bid=model_worker_batch.bid,
             cache_miss_count=cache_miss_count,
             extend_input_len_per_req=None,

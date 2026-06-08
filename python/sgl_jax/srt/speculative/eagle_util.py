@@ -438,6 +438,13 @@ def build_tree_kernel_efficient(
     )
 
 
+@dataclass
+class PendingDraftExtendResultSlice:
+    pending_draft_extend_result: object
+    offset: int
+    length: int
+
+
 @register_pytree_node_class
 @dataclass
 class EagleDraftInput:
@@ -490,6 +497,14 @@ class EagleDraftInput:
     #: derived from ``old_seq_lens + accept_length`` if not stored.
     new_seq_lens: np.ndarray | None = None
     pending_draft_extend_result: object | None = None
+
+    @staticmethod
+    def make_pending_draft_extend_slice(pending_draft_extend_result, offset: int, length: int):
+        return PendingDraftExtendResultSlice(
+            pending_draft_extend_result=pending_draft_extend_result,
+            offset=offset,
+            length=length,
+        )
 
     # ---- SpecInput protocol -------------------------------------------------
     def is_draft_input(self) -> bool:
@@ -710,25 +725,51 @@ class EagleDraftInput:
         if self.pending_draft_extend_result is None:
             return
 
+        from sgl_jax.srt.speculative.overlap_worker import PendingPrefillResult
+
+        pending = self.pending_draft_extend_result
+        slice_obj = None
+        if isinstance(pending, PendingDraftExtendResultSlice):
+            slice_obj = slice(pending.offset, pending.offset + pending.length)
+            pending = pending.pending_draft_extend_result
+
+        def _slice(v):
+            if v is None:
+                return None
+            if slice_obj is None:
+                return v
+            return v[slice_obj]
+
+        if isinstance(pending, PendingPrefillResult):
+            batch_output = pending.resolve()
+            self.pending_draft_extend_result = None
+            if batch_output is None:
+                return
+            restored = batch_output.next_draft_input
+            self.topk_p = _slice(restored.topk_p)
+            self.topk_index = _slice(restored.topk_index)
+            self.hidden_states = _slice(restored.hidden_states)
+            self.verified_id = _slice(restored.verified_id)
+            self.allocate_lens = _slice(restored.allocate_lens)
+            return
+
         from sgl_jax.srt.speculative.draft_extend_fused import (
             restore_spec_decode_pending_draft_extend_result,
         )
 
-        restored_batch_output = restore_spec_decode_pending_draft_extend_result(
-            self.pending_draft_extend_result
-        )
+        restored_batch_output = restore_spec_decode_pending_draft_extend_result(pending)
         self.pending_draft_extend_result = None
         if restored_batch_output is None:
             return
 
         restored = restored_batch_output.next_draft_input
-        self.topk_p = restored.topk_p
-        self.topk_index = restored.topk_index
-        self.hidden_states = restored.hidden_states
-        self.verified_id = restored.verified_id
-        self.allocate_lens = restored_batch_output.allocate_lens
-        self.accept_length = restored_batch_output.accept_lens
-        self.accept_length_cpu = restored_batch_output.accept_lens
+        self.topk_p = _slice(restored.topk_p)
+        self.topk_index = _slice(restored.topk_index)
+        self.hidden_states = _slice(restored.hidden_states)
+        self.verified_id = _slice(restored.verified_id)
+        self.allocate_lens = _slice(restored.allocate_lens)
+        self.accept_length = _slice(restored_batch_output.accept_lens)
+        self.accept_length_cpu = self.accept_length
 
     @classmethod
     def create_idle_input(
@@ -770,6 +811,7 @@ class EagleDraftInput:
             setattr(self, f, np.asarray(getattr(self, f)))
 
     def filter_batch(self, new_indices: np.ndarray, has_been_filtered: bool = True):
+        self.resolve_pending_draft_extend_result()
         new_indices = np.asarray(new_indices)
         self._ensure_host()
         if has_been_filtered and len(new_indices) == len(self.topk_p):
@@ -787,12 +829,31 @@ class EagleDraftInput:
             if self.allocate_lens is not None:
                 self.allocate_lens = np.asarray(self.allocate_lens)[new_indices]
 
+    def trim_to_length(self, n: int):
+        self.resolve_pending_draft_extend_result()
+        self._ensure_host()
+        for f in (
+            "topk_p",
+            "topk_index",
+            "hidden_states",
+            "verified_id",
+            "allocate_lens",
+            "accept_length",
+            "accept_length_cpu",
+        ):
+            v = getattr(self, f, None)
+            if v is not None and len(v) != n:
+                setattr(self, f, np.asarray(v)[:n])
+
     def merge_batch(self, spec_info: EagleDraftInput):
+        self.resolve_pending_draft_extend_result()
+        spec_info.resolve_pending_draft_extend_result()
         if self.hidden_states is None:
             self.hidden_states = spec_info.hidden_states
             self.verified_id = spec_info.verified_id
             self.topk_p = spec_info.topk_p
             self.topk_index = spec_info.topk_index
+            self.allocate_lens = spec_info.allocate_lens
             return
         if spec_info.hidden_states is None:
             return

@@ -1514,6 +1514,13 @@ class ScheduleBatch:
                     info.seq_lens = None
                     info.out_cache_loc = None
                     info.seq_lens_sum = 0
+                    info.spec_info = None
+                elif (
+                    info.spec_info is not None
+                    and getattr(info.spec_info, "allocate_lens", None) is not None
+                    and len(info.spec_info.allocate_lens) != len(info.reqs)
+                ):
+                    info.spec_info.trim_to_length(len(info.reqs))
             flat_spec = self._concat_spec_info_per_rank([info.spec_info for info in self.reqs_info])
             flat_spec.resolve_pending_draft_extend_result()
             flat_spec.prepare_for_decode(self)
@@ -1661,6 +1668,14 @@ class ScheduleBatch:
 
             # Early exit: No filtering needed if all requests kept
             if len(keep_indices_dp) == len(info.reqs):
+                spec_info_len = (
+                    None
+                    if info.spec_info is None
+                    or getattr(info.spec_info, "allocate_lens", None) is None
+                    else len(info.spec_info.allocate_lens)
+                )
+                if spec_info_len is not None and spec_info_len != len(info.reqs):
+                    info.spec_info.trim_to_length(len(info.reqs))
                 continue
 
             # Filter reqs list
@@ -2366,6 +2381,7 @@ class ScheduleBatch:
         # aligns with seq_lens[i]. Returns a new object — does not mutate
         # the per-rank cross-round state on reqs_info[r].spec_info.
         flat_spec = self._concat_spec_info_per_rank([info.spec_info for info in self.reqs_info])
+        flat_spec.resolve_pending_draft_extend_result()
         spec_info = self._scatter_spec_info_to_dp_slots(
             flat_spec, logits_indices_selector, total_bs
         )
@@ -2443,10 +2459,12 @@ class ScheduleBatch:
         the cross-round flat state on ``reqs_info[r].spec_info`` is unchanged.
         """
 
-        def _scatter1(arr):
+        def _scatter1(arr, *, require_selector_len: bool = True):
             if arr is None:
                 return None
             a = np.asarray(arr)
+            if require_selector_len and a.shape[0] != len(selector):
+                return None
             out = np.zeros((total_bs,) + a.shape[1:], dtype=a.dtype)
             out[selector] = a
             return out
@@ -2458,8 +2476,8 @@ class ScheduleBatch:
             verified_id=_scatter1(flat.verified_id),
             allocate_lens=_scatter1(flat.allocate_lens),
             capture_hidden_mode=flat.capture_hidden_mode,
-            accept_length=flat.accept_length,
-            accept_length_cpu=flat.accept_length_cpu,
+            accept_length=_scatter1(flat.accept_length),
+            accept_length_cpu=_scatter1(flat.accept_length_cpu),
             pending_draft_extend_result=flat.pending_draft_extend_result,
         )
 
@@ -2501,7 +2519,12 @@ class ScheduleBatch:
                     kwargs[f] = None
                 else:
                     kwargs[f] = None if v is None else v[offset : offset + n]
-            kwargs["pending_draft_extend_result"] = flat.pending_draft_extend_result
+            if has_pending_draft_extend:
+                kwargs["pending_draft_extend_result"] = flat.make_pending_draft_extend_slice(
+                    flat.pending_draft_extend_result,
+                    offset,
+                    n,
+                )
             out.append(type(flat)(**kwargs))
             offset += n
         return out
@@ -2518,6 +2541,9 @@ class ScheduleBatch:
         if not nonempty:
             return None
 
+        for spec_info in nonempty:
+            spec_info.resolve_pending_draft_extend_result()
+
         per_req_fields = (
             "topk_p",
             "topk_index",
@@ -2530,12 +2556,15 @@ class ScheduleBatch:
 
         kwargs = {
             "capture_hidden_mode": nonempty[0].capture_hidden_mode,
-            "pending_draft_extend_result": nonempty[0].pending_draft_extend_result,
+            "pending_draft_extend_result": None,
         }
         for f in per_req_fields:
             vals = [getattr(s, f, None) for s in nonempty]
             nonnull = [v for v in vals if v is not None]
             if not nonnull:
+                kwargs[f] = None
+                continue
+            if f in ("accept_length", "accept_length_cpu") and len(nonnull) != len(nonempty):
                 kwargs[f] = None
                 continue
             # All nonempty ranks should agree on which optional fields they
