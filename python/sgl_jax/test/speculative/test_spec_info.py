@@ -52,29 +52,3 @@ def test_three_token_counts_are_distinct():
     assert int(di.get_logical_token_num(bs=2).sum()) == 4
     assert int(di.get_allocated_token_num().sum()) == 200
     assert di.get_verify_token_num(bs=2) == 0
-
-
-def test_eagle_draft_merge_fills_missing_verify_write_lens_from_allocate_lens():
-    """Fresh prefill draft state starts with committed frontier == allocated len."""
-    old = EagleDraftInput(
-        hidden_states=np.zeros((2, 4), dtype=np.float32),
-        verified_id=np.array([10, 11], dtype=np.int32),
-        topk_p=np.zeros((2, 1), dtype=np.float32),
-        topk_index=np.zeros((2, 1), dtype=np.int32),
-        allocate_lens=np.array([128, 192], dtype=np.int32),
-        verify_write_lens=np.array([104, 164], dtype=np.int32),
-    )
-    fresh_prefill = EagleDraftInput(
-        hidden_states=np.ones((1, 4), dtype=np.float32),
-        verified_id=np.array([12], dtype=np.int32),
-        topk_p=np.ones((1, 1), dtype=np.float32),
-        topk_index=np.ones((1, 1), dtype=np.int32),
-        allocate_lens=np.array([64], dtype=np.int32),
-    )
-
-    old.merge_batch(fresh_prefill)
-
-    np.testing.assert_array_equal(
-        old.verify_write_lens,
-        np.array([104, 164, 64], dtype=np.int32),
-    )

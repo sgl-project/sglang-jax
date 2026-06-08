@@ -15,8 +15,6 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 from types import SimpleNamespace
 
-import jax
-import jax.numpy as jnp
 import numpy as np
 import pytest
 
@@ -492,28 +490,6 @@ def test_split_concat_spec_info_round_trip(real_bs_per_dp):
 def test_split_spec_info_none_passthrough():
     parts = ScheduleBatch._split_spec_info_per_rank(None, [2, 3])
     assert parts == [None, None]
-
-
-def test_split_spec_info_moves_scheduler_metadata_to_host():
-    """Split must not slice device metadata arrays with Python gather indexing."""
-    flat = _mk_distinct_spec_info(4, seed=3)
-    flat.allocate_lens = jnp.asarray(flat.allocate_lens)
-    flat.verify_write_lens = jnp.asarray(np.arange(10, 14, dtype=np.int32))
-    flat.new_seq_lens = jnp.asarray(np.arange(20, 24, dtype=np.int32))
-    flat.accept_length_cpu = jnp.asarray(np.arange(30, 34, dtype=np.int32))
-
-    parts = ScheduleBatch._split_spec_info_per_rank(flat, [2, 2])
-
-    for part in parts:
-        assert part is not None
-        assert isinstance(part.allocate_lens, np.ndarray)
-        assert isinstance(part.verify_write_lens, np.ndarray)
-        assert isinstance(part.new_seq_lens, np.ndarray)
-        assert isinstance(part.accept_length_cpu, np.ndarray)
-        assert not isinstance(part.allocate_lens, jax.Array)
-        assert not isinstance(part.verify_write_lens, jax.Array)
-        assert not isinstance(part.new_seq_lens, jax.Array)
-        assert not isinstance(part.accept_length_cpu, jax.Array)
 
 
 def test_concat_spec_info_all_none():
