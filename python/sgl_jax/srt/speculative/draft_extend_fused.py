@@ -41,7 +41,7 @@ class FusedDraftExtendPendingResult(NamedTuple):
     selected_layer0_hidden: object
     topk_index_stacked: object
     all_pool_updates: object
-    accept_host: np.ndarray
+    accept_lens: object
     sel: np.ndarray
 
 
@@ -416,6 +416,7 @@ def _build_fused_greedy_verify_jit(topk: int):
         prepared_verified_id = prepared.verified_id
         prepared_new_seq_lens = prepared.new_seq_lens
         prepared_accept_lens = prepared.accept_lens
+        prepared_sel_pos = prepared.sel_pos
         prepared_predict = prepared.predict
 
         if mesh is not None:
@@ -424,6 +425,7 @@ def _build_fused_greedy_verify_jit(topk: int):
             prepared_verified_id = jax.sharding.reshard(prepared_verified_id, rep)
             prepared_new_seq_lens = jax.sharding.reshard(prepared_new_seq_lens, rep)
             prepared_accept_lens = jax.sharding.reshard(prepared_accept_lens, rep)
+            prepared_sel_pos = jax.sharding.reshard(prepared_sel_pos, rep)
             prepared_predict = jax.sharding.reshard(prepared_predict, rep)
             if return_target_logits:
                 target_logits_for_host = jax.sharding.reshard(target_logits_for_host, rep)
@@ -434,6 +436,7 @@ def _build_fused_greedy_verify_jit(topk: int):
             prepared_verified_id,
             prepared_new_seq_lens,
             prepared_accept_lens,
+            prepared_sel_pos,
             prepared_predict,
             target_logits_for_host,
         )
@@ -710,8 +713,10 @@ def launch_fused_draft_extend_for_decode(draft_worker, model_worker_batch, batch
         return None
 
     sel = np.asarray(model_worker_batch.logits_indices_selector)
-    accept_host = np.asarray(jax.device_get(batch_output.accept_lens))
-    sel_pos = np.clip(accept_host - 1, 0, None).astype(np.int32)
+    if hasattr(batch_output.next_draft_input, "sel_pos"):
+        sel_pos = batch_output.next_draft_input.sel_pos
+    else:
+        sel_pos = jnp.clip(batch_output.accept_lens - 1, 0, None).astype(jnp.int32)
 
     mr0 = draft_worker._workers[0].model_runner
     mwb.spec_info_padded.hidden_states = target_hidden
@@ -752,7 +757,7 @@ def launch_fused_draft_extend_for_decode(draft_worker, model_worker_batch, batch
         selected_layer0_hidden=selected_layer0_hidden,
         topk_index_stacked=topk_index_stacked,
         all_pool_updates=all_pool_updates,
-        accept_host=accept_host,
+        accept_lens=batch_output.accept_lens,
         sel=sel,
     )
 
@@ -765,7 +770,7 @@ def restore_fused_draft_extend_result(draft_worker, model_worker_batch, pending_
     selected_layer0_hidden = pending_result.selected_layer0_hidden
     topk_index_stacked = pending_result.topk_index_stacked
     all_pool_updates = pending_result.all_pool_updates
-    accept_host = pending_result.accept_host
+    accept_host = np.asarray(jax.device_get(pending_result.accept_lens))
     sel = pending_result.sel
 
     for i, w in enumerate(draft_worker._workers):
@@ -963,6 +968,7 @@ def spec_decode_verify_phase(spec_worker, model_worker_batch, cur_allocate_lens)
             prepared_verified_id,
             prepared_new_seq_lens,
             prepared_accept_lens,
+            prepared_sel_pos,
             prepared_predict,
             target_logits,
         ) = draft_worker._fused_greedy_verify_jit_fn(
@@ -992,6 +998,7 @@ def spec_decode_verify_phase(spec_worker, model_worker_batch, cur_allocate_lens)
         allocate_lens=cur_allocate_lens,
         hidden_states=prepared_hidden,
     )
+    next_draft_input.sel_pos = prepared_sel_pos
     batch_output = GenerationBatchResult(
         logits_output=LogitsProcessorOutput(
             next_token_logits=target_logits,

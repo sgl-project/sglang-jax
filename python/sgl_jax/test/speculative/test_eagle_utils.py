@@ -123,6 +123,13 @@ class TestVerifyTree(CustomTestCase):
         self.assertIn("launch_fused_draft_extend_for_decode", source)
         self.assertIn("restore_fused_draft_extend_result", source)
 
+    def test_fused_draft_extend_launch_does_not_materialize_accept_lens(self):
+        from sgl_jax.srt.speculative import draft_extend_fused
+
+        source = inspect.getsource(draft_extend_fused.launch_fused_draft_extend_for_decode)
+        self.assertNotIn("device_get(batch_output.accept_lens)", source)
+        self.assertIn("next_draft_input.sel_pos", source)
+
     def test_fused_draft_extend_pending_result_contract_fields(self):
         from sgl_jax.srt.speculative import draft_extend_fused
 
@@ -134,7 +141,7 @@ class TestVerifyTree(CustomTestCase):
                 "selected_layer0_hidden",
                 "topk_index_stacked",
                 "all_pool_updates",
-                "accept_host",
+                "accept_lens",
                 "sel",
             },
         )
