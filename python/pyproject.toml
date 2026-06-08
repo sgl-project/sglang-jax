@@ -193,3 +193,8 @@ explicit = true
 torch = { index = "pytorch-cpu" }
 torchvision = { index = "pytorch-cpu" }
 torchaudio = { index = "pytorch-cpu" }
+
+[tool.uv]
+override-dependencies = [
+    "libtpu==0.0.38",
+]
