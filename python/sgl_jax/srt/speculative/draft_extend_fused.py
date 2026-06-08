@@ -728,6 +728,12 @@ def launch_fused_draft_extend_for_decode(draft_worker, model_worker_batch, batch
         batch_output,
         draft_worker.speculative_num_draft_tokens,
     )
+    mwb.spec_info_padded.accept_length = None
+    logits_metadata = _logits_metadata_from_model_worker_batch_preserve_device(
+        mwb,
+        draft_worker.mesh,
+        include_accept_lens=False,
+    )
     if mwb.input_ids.shape[0] <= 0:
         return None
 
