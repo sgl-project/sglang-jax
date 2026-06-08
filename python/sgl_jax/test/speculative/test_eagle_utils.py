@@ -104,6 +104,55 @@ class TestVerifyTree(CustomTestCase):
         self.assertIn("spec_decode_draft_extend_phase", source)
         self.assertNotIn("_fused_greedy_decode_jit_fn", source)
 
+    def test_spec_decode_future_result_contract_fields(self):
+        from sgl_jax.srt.speculative import overlap_future
+
+        self.assertTrue(hasattr(overlap_future, "SpecDecodeFutureResult"))
+        fields = set(overlap_future.SpecDecodeFutureResult.__dataclass_fields__)
+        self.assertEqual(
+            fields,
+            {
+                "logits_output",
+                "next_token_ids",
+                "accept_lens",
+                "new_seq_lens",
+                "allocate_lens",
+                "next_draft_input",
+                "bid",
+                "cache_miss_count",
+            },
+        )
+
+    def test_make_spec_decode_future_result_preserves_deferred_fields(self):
+        from sgl_jax.srt.speculative import overlap_future
+
+        next_draft_input = SimpleNamespace(
+            new_seq_lens=object(),
+            hidden_states=object(),
+            topk_index=object(),
+            verified_id=object(),
+        )
+        batch_output = SimpleNamespace(
+            logits_output=object(),
+            next_token_ids=object(),
+            accept_lens=object(),
+            allocate_lens=object(),
+            next_draft_input=next_draft_input,
+            bid=7,
+            cache_miss_count=0,
+        )
+
+        future_result = overlap_future.make_spec_decode_future_result(batch_output)
+
+        self.assertIs(future_result.logits_output, batch_output.logits_output)
+        self.assertIs(future_result.next_token_ids, batch_output.next_token_ids)
+        self.assertIs(future_result.accept_lens, batch_output.accept_lens)
+        self.assertIs(future_result.new_seq_lens, next_draft_input.new_seq_lens)
+        self.assertIs(future_result.allocate_lens, batch_output.allocate_lens)
+        self.assertIs(future_result.next_draft_input, next_draft_input)
+        self.assertEqual(future_result.bid, 7)
+        self.assertEqual(future_result.cache_miss_count, 0)
+
     def test_as_int32_array_keeps_host_metadata_on_host(self):
         from sgl_jax.srt.speculative import eagle_util
 
