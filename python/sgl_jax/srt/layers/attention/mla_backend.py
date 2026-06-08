@@ -26,7 +26,6 @@ from jax.sharding import PartitionSpec as P
 from jax.tree_util import register_pytree_node_class
 
 from sgl_jax.srt.kernels.mla.v2.kernel import cdiv, mla_ragged_paged_attention
-from sgl_jax.srt.kernels.mla.v2.tuned_block_sizes import get_tuned_block_sizes
 from sgl_jax.srt.layers.attention.base_attn_backend import AttentionBackend
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.utils.jax_utils import device_array
@@ -110,7 +109,6 @@ class MLAAttentionBackend(AttentionBackend):
         # When num_kv_pages_per_block is None, the kernel's lookup path also
         # overrides this with the tuned value if the "decode" entry hits.
         decode_batch_size: int = 4,
-        dtype: jnp.dtype = jnp.bfloat16,
     ):
         assert page_size > 1, (
             "MLA attention backend does not support page_size=1. "
@@ -131,38 +129,9 @@ class MLAAttentionBackend(AttentionBackend):
 
             vmem_limit_bytes = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.9)
         self.vmem_limit_bytes = vmem_limit_bytes
+        self.num_kv_pages_per_block = num_kv_pages_per_block
+        self.num_queries_per_block = num_queries_per_block
         self.decode_batch_size = decode_batch_size
-        self.dtype = dtype
-
-        tp_size = mesh.shape["tensor"] if (mesh is not None and "tensor" in mesh.shape) else 1
-        local_num_attn_heads = num_attn_heads // tp_size
-
-        if num_kv_pages_per_block == (3, 1, 1) and num_queries_per_block == (1, 16, 16):
-            # Resolve Decode configurations (using max_num_tokens = 1)
-            dec_bkv, dec_bq = get_tuned_block_sizes(
-                page_size=page_size,
-                q_dtype=dtype,
-                kv_dtype=dtype,
-                num_q_heads=local_num_attn_heads,
-                kv_lora_rank=kv_lora_rank,
-                qk_rope_head_dim=qk_rope_head_dim,
-                max_num_tokens=1,
-            )
-            # Resolve Prefill / Mixed configurations (using max_num_tokens = 8192)
-            pref_bkv, pref_bq = get_tuned_block_sizes(
-                page_size=page_size,
-                q_dtype=dtype,
-                kv_dtype=dtype,
-                num_q_heads=local_num_attn_heads,
-                kv_lora_rank=kv_lora_rank,
-                qk_rope_head_dim=qk_rope_head_dim,
-                max_num_tokens=8192,
-            )
-            self.num_kv_pages_per_block = (dec_bkv, pref_bkv, pref_bkv)
-            self.num_queries_per_block = (dec_bq, pref_bq, pref_bq)
-        else:
-            self.num_kv_pages_per_block = num_kv_pages_per_block
-            self.num_queries_per_block = num_queries_per_block
 
         self.forward_metadata = nnx.data(MLAAttentionMetadata())
 
@@ -256,7 +225,6 @@ class MLAAttentionBackend(AttentionBackend):
             "num_kv_pages_per_block": self.num_kv_pages_per_block,
             "num_queries_per_block": self.num_queries_per_block,
             "decode_batch_size": self.decode_batch_size,
-            "dtype": self.dtype,
         }
         return (children, aux_data)
 
@@ -275,7 +243,6 @@ class MLAAttentionBackend(AttentionBackend):
             num_kv_pages_per_block=aux_data["num_kv_pages_per_block"],
             num_queries_per_block=aux_data["num_queries_per_block"],
             decode_batch_size=aux_data["decode_batch_size"],
-            dtype=aux_data.get("dtype", jnp.bfloat16),
         )
         obj.forward_metadata = children[0]
         return obj
