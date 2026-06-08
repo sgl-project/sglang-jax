@@ -36,7 +36,7 @@ def normalize_aime_answer(answer: str | None) -> str | None:
         num = int(float(answer))
         if 0 <= num <= 999:
             return str(num)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, OverflowError):
         pass
     return answer
 

@@ -2836,6 +2836,29 @@ class WeightLoader:
             if dim1 == total_kv_heads * self.head_dim:
                 target_axis = 1
                 step_size = self.head_dim
+            elif self.model_config.has_global_head_dim:
+                g_dim, l_dim, orig_l_heads, orig_g_heads, target_heads = self.model_config.get_local_global_weight_params()
+                if dim1 == g_dim:
+                    if self.sharding_size > 1:
+                        total_kv_heads = 1
+                        num_replicas = self.sharding_size
+                        target_axis = 1
+                        step_size = g_dim
+                        logger.info("MQA Global KV replication: matching dim1=%d to 1 head, replicating %d times", dim1, num_replicas)
+                elif dim1 == orig_g_heads * g_dim:
+                    if target_heads > orig_g_heads:
+                        total_kv_heads = orig_g_heads
+                        num_replicas = target_heads // orig_g_heads
+                        target_axis = 1
+                        step_size = g_dim
+                        logger.info("GQA Global KV replication: matching dim1=%d to %d heads, replicating %d times to %d heads", dim1, total_kv_heads, num_replicas, target_heads)
+                elif dim1 == orig_l_heads * l_dim:
+                    if self.sharding_size > orig_l_heads:
+                        total_kv_heads = orig_l_heads
+                        num_replicas = self.sharding_size // orig_l_heads
+                        target_axis = 1
+                        step_size = l_dim
+                        logger.info("GQA Local KV replication: matching dim1=%d to %d heads, replicating %d times", dim1, total_kv_heads, num_replicas)
 
         if target_axis == -1:
             return weight

@@ -314,6 +314,7 @@ class GenerateReqInput:
     extra_key: list[str] | str | None = None
 
     return_routed_experts: list[bool] | bool | None = None
+    mm_inputs: dict | list[dict] | None = None
 
     # PD disaggregation routing keys.
     bootstrap_host: list[str] | str | None = None
@@ -326,6 +327,7 @@ class GenerateReqInput:
             has_valid_data(self.image_data)
             or has_valid_data(self.video_data)
             or has_valid_data(self.audio_data)
+            or self.mm_inputs is not None
         )
 
     def _normalize_rid(self, num):
@@ -346,9 +348,9 @@ class GenerateReqInput:
             raise ValueError("The rid should be a string or a list of strings.")
 
     def normalize_batch_and_arguments(self):
-        # at least one of text, input_ids, or image should be provided
-        if self.text is None and self.input_ids is None and self.image_data is None:
-            raise ValueError("At least one of text, input_ids, or image should be provided")
+        # at least one of text, input_ids, image, input_embeds, or mm_inputs should be provided
+        if self.text is None and self.input_ids is None and self.image_data is None and self.input_embeds is None and self.mm_inputs is None:
+            raise ValueError("At least one of text, input_ids, image, input_embeds, or mm_inputs should be provided")
 
         # text and input_ids cannot be provided at the same time
         if self.text is not None and self.input_ids is not None:
@@ -410,6 +412,8 @@ class GenerateReqInput:
                 self.input_ids = [self.input_ids]
             if self.input_embeds is not None:
                 self.input_embeds = [self.input_embeds]
+            if self.mm_inputs is not None and isinstance(self.mm_inputs, dict):
+                self.mm_inputs = [self.mm_inputs]
 
     def _normalize_batch_inputs(self):
         """Normalize inputs for a batch of examples, including parallel sampling expansion."""
@@ -442,13 +446,13 @@ class GenerateReqInput:
             if not isinstance(self.input_embeds, list):
                 raise ValueError("input_embeds should be a list for batch processing.")
             self.input_embeds = self.input_embeds * self.parallel_sample_num
+        if self.mm_inputs is not None and isinstance(self.mm_inputs, list):
+            self.mm_inputs = self.mm_inputs * self.parallel_sample_num
 
     def _validate_inputs(self):
         """Validate that the input configuration is valid."""
-        if (self.text is None and self.input_ids is None) or (
-            self.text is not None and self.input_ids is not None
-        ):
-            raise ValueError("Either text or input_ids should be provided.")
+        if self.text is None and self.input_ids is None and self.input_embeds is None and self.mm_inputs is None:
+            raise ValueError("Either text, input_ids, input_embeds, or mm_inputs should be provided.")
 
     def _normalize_sampling_params(self, num):
         """Normalize sampling parameters for batch processing."""
@@ -472,20 +476,27 @@ class GenerateReqInput:
         elif self.input_ids is not None:
             if len(self.input_ids) == 0:
                 raise ValueError("input_ids cannot be empty.")
-            if isinstance(self.input_ids[0], int):
+            if not isinstance(self.input_ids[0], (list, tuple)):
                 self.is_single = True
                 self.batch_size = 1
             else:
                 self.is_single = False
                 self.batch_size = len(self.input_ids)
             self.input_embeds = None
-        else:
+        elif self.input_embeds is not None:
             if isinstance(self.input_embeds[0][0], float):
                 self.is_single = True
                 self.batch_size = 1
             else:
                 self.is_single = False
                 self.batch_size = len(self.input_embeds)
+        elif self.mm_inputs is not None:
+            if isinstance(self.mm_inputs, dict):
+                self.is_single = True
+                self.batch_size = 1
+            else:
+                self.is_single = False
+                self.batch_size = len(self.mm_inputs)
 
     def _normalize_return_routed_experts(self, num):
         self.return_routed_experts = self._normalize_param(
@@ -545,6 +556,7 @@ class GenerateReqInput:
         return GenerateReqInput(
             text=self.text[i] if self.text is not None else None,
             input_ids=self.input_ids[i] if self.input_ids is not None else None,
+            input_embeds=self.input_embeds[i] if self.input_embeds is not None else None,
             sampling_params=self.sampling_params[i],
             rid=self.rid[i],
             return_logprob=self.return_logprob[i],
@@ -577,6 +589,11 @@ class GenerateReqInput:
                 self.disagg_transfer_id[i]
                 if isinstance(self.disagg_transfer_id, list)
                 else self.disagg_transfer_id
+            ),
+            mm_inputs=(
+                self.mm_inputs[i]
+                if isinstance(self.mm_inputs, list)
+                else self.mm_inputs
             ),
         )
 

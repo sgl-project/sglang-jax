@@ -244,6 +244,8 @@ class ModelConfig:
                 self.num_hidden_layers = model_layer_nums
                 # Also update hf_config to ensure consistency across all components
                 self.hf_config.num_hidden_layers = model_layer_nums
+                if hasattr(self, "hf_text_config") and self.hf_text_config is not None:
+                    self.hf_text_config.num_hidden_layers = model_layer_nums
 
         # Cache attributes
         self.hf_eos_token_id = self.get_hf_eos_token_id()
@@ -574,6 +576,10 @@ class ModelConfig:
 
     def needs_kv_head_replication(self, tensor_parallel_size: int) -> bool:
         """Returns True if KV heads need to be replicated across devices."""
+        if hasattr(self, "_original_global_kv_heads"):
+            return tensor_parallel_size > self._original_global_kv_heads
+        if getattr(self.hf_text_config, "num_global_key_value_heads", None) is not None:
+            return tensor_parallel_size > getattr(self.hf_text_config, "num_global_key_value_heads", 1)
         total_num_kv_heads = self.get_total_num_kv_heads()
         return tensor_parallel_size > total_num_kv_heads
 
@@ -639,6 +645,15 @@ class ModelConfig:
                 swa_kv_heads_per_device * tensor_parallel_size
             )
 
+        if hasattr(self.hf_text_config, "num_global_key_value_heads") or hasattr(self.hf_text_config, "layer_types"):
+            orig_global = getattr(self.hf_text_config, "num_global_key_value_heads", 1)
+            if not hasattr(self, "_original_global_kv_heads"):
+                self._original_global_kv_heads = orig_global
+                self._original_local_kv_heads = self._original_hf_num_key_value_heads
+            from sgl_jax.srt.utils.jax_utils import get_num_kv_heads_by_tp
+            global_per_dev = get_num_kv_heads_by_tp(self._original_global_kv_heads, tensor_parallel_size)
+            self.hf_text_config.num_global_key_value_heads = global_per_dev * tensor_parallel_size
+
     def get_original_kv_head_id(self, tp_rank: int, tensor_parallel_size: int) -> int:
         """Determine which original KV head this device should use."""
         from sgl_jax.srt.utils.jax_utils import get_original_kv_head_id
@@ -650,8 +665,57 @@ class ModelConfig:
         """Returns True if this is a Grouped Query Attention model."""
         return self.get_total_num_kv_heads() < self.num_attention_heads
 
+    @property
+    def has_global_head_dim(self) -> bool:
+        """Indicates whether the model defines a separate head dimension for global full attention layers (e.g., hybrid global/local attention architectures)."""
+        cfg = getattr(self, "hf_text_config", self.hf_config)
+        return getattr(cfg, "global_head_dim", None) is not None
+
+    @property
+    def global_head_dim(self) -> int:
+        """Returns the specific head dimension for global full attention layers, gracefully falling back to standard head_dim."""
+        cfg = getattr(self, "hf_text_config", self.hf_config)
+        return getattr(cfg, "global_head_dim", self.head_dim)
+
+    def get_local_global_head_counts(self, tensor_parallel_size: int):
+        """Resolves per-device KV head counts and layer distributions for models featuring interleaved sliding window and global full attention layers.
+
+        Returns:
+            tuple: (full_heads_per_device, swa_heads_per_device, swa_layers, full_layers)
+        """
+        cfg = getattr(self, "hf_text_config", self.hf_config)
+        # Identify layer pattern composition from layer_types attribute
+        layer_types = getattr(cfg, "layer_types", ["full_attention"] * self.num_hidden_layers)
+        swa_layers = sum(1 for lt in layer_types if lt == "sliding_attention")
+        full_layers = len(layer_types) - swa_layers
+
+        # Retrieve full attention vs sliding window KV head capacities
+        num_full_heads = getattr(cfg, "num_global_key_value_heads", getattr(cfg, "num_key_value_heads", 1))
+        num_swa_heads = getattr(cfg, "num_key_value_heads", 1)
+
+        from sgl_jax.srt.utils.jax_utils import get_num_kv_heads_by_tp
+        full_heads_per_device = get_num_kv_heads_by_tp(num_full_heads, tensor_parallel_size)
+        swa_heads_per_device = get_num_kv_heads_by_tp(num_swa_heads, tensor_parallel_size)
+        return full_heads_per_device, swa_heads_per_device, swa_layers, full_layers
+
+    def get_local_global_weight_params(self):
+        """Retrieves head dimensions, original checkpoint head counts, and target sharded head boundaries required for lazy weight loader tensor replication.
+
+        Returns:
+            tuple: (global_head_dim, local_head_dim, original_local_heads, original_global_heads, target_heads)
+        """
+        cfg = getattr(self, "hf_text_config", self.hf_config)
+        orig_local_heads = getattr(self, "_original_local_kv_heads", getattr(self, "_original_hf_num_key_value_heads", 4))
+        orig_global_heads = getattr(self, "_original_global_kv_heads", orig_local_heads)
+        target_heads = getattr(cfg, "num_global_key_value_heads", getattr(cfg, "num_key_value_heads", orig_global_heads))
+        return cfg.global_head_dim, cfg.head_dim, orig_local_heads, orig_global_heads, target_heads
+
     def get_kv_padding_strategy(self) -> str:
         """Returns the padding strategy for KV heads."""
+        if getattr(self.hf_text_config, "num_global_key_value_heads", None) is not None:
+            return "replicate"
+        if hasattr(self, "_original_global_kv_heads"):
+            return "replicate"
         if self.is_gqa_model():
             # GQA models should replicate existing kv heads to maintain attention semantics
             return "replicate"

@@ -60,13 +60,13 @@ AutoConfig.register("qwen3_5_moe", Qwen3_5HybridConfig, exist_ok=True)
 _UNSET = object()
 
 
-def download_from_hf(model_path: str, allow_patterns: list[str] | None = _UNSET):
+def download_from_hf(model_path: str, allow_patterns: list[str] | None = _UNSET, cache_dir: str | None = None):
     if os.path.exists(model_path):
         return model_path
 
     if allow_patterns is _UNSET:
         allow_patterns = ["*.json", "*.bin", "*.model", "*.py", "*.tiktoken"]
-    return snapshot_download(model_path, allow_patterns=allow_patterns)
+    return snapshot_download(model_path, allow_patterns=allow_patterns, cache_dir=cache_dir)
 
 
 def get_hf_text_config(config: PretrainedConfig):
@@ -246,6 +246,7 @@ def get_tokenizer(
     tokenizer_revision: str | None = None,
     tokenizer_backend: str = "huggingface",
     sub_dir: str = "",
+    download_dir: str | None = None,
     **kwargs,
 ) -> PreTrainedTokenizer | PreTrainedTokenizerFast | TiktokenTokenizer:
     """Gets a tokenizer for the given model name via Huggingface."""
@@ -276,7 +277,7 @@ def get_tokenizer(
             f"Remote URLs are not supported in JAX implementation. "
             f"Please use a local path or HuggingFace model name instead: {tokenizer_name}"
         )
-    tokenizer_name = download_from_hf(tokenizer_name)
+    tokenizer_name = download_from_hf(tokenizer_name, cache_dir=download_dir)
     if sub_dir:
         # Only append sub_dir if it actually exists
         sub_dir_path = tokenizer_name + "/" + sub_dir

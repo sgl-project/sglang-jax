@@ -181,6 +181,16 @@ class Req:
         # Input and output info
         self.rid = rid
         self.origin_input_text = origin_input_text
+        if hasattr(origin_input_ids, "input_ids"):
+            origin_input_ids = getattr(origin_input_ids, "input_ids")
+        elif isinstance(origin_input_ids, dict) and "input_ids" in origin_input_ids:
+            origin_input_ids = origin_input_ids["input_ids"]
+        if hasattr(origin_input_ids, "tolist"):
+            origin_input_ids = origin_input_ids.tolist()
+        if isinstance(origin_input_ids, (list, tuple)) and len(origin_input_ids) > 0 and isinstance(origin_input_ids[0], (list, tuple)):
+            origin_input_ids = origin_input_ids[0]
+        origin_input_ids = list(origin_input_ids)
+
         self.origin_input_ids_unpadded = (
             origin_input_ids_unpadded
             if origin_input_ids_unpadded

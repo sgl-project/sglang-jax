@@ -32,6 +32,10 @@ def create_device_mesh(
         device_indexes = [idx + offset for idx in device_indexes]
         devices_dict = {device.id: device for device in devices}
         devices = [devices_dict.get(i) for i in list(set(device_indexes))]
+    elif -1 not in ici_parallelism:
+        target_count = int(np.prod(ici_parallelism) * num_slices)
+        if len(devices) > target_count:
+            devices = devices[:target_count]
     ici_parallelism = fill_unspecified_parallelism(ici_parallelism, len(devices))
     if num_slices > 1:
         dcn_parallelism = fill_unspecified_parallelism(dcn_parallelism, num_slices)

@@ -32,7 +32,6 @@ from sgl_jax.srt.utils.common_utils import get_bool_env_var, retry
 _MODEL_CACHE_ENV = "SGLANG_JAX_MODEL_CACHE"
 _LOCAL_MODEL_LOG_ONCE: set[str] = set()
 
-
 def _validate_local_snapshot(d: Path) -> bool:
     if not d.is_dir():
         return False
@@ -146,6 +145,7 @@ QWEN3_5_35B_A3B = "/models/Qwen3.5-35B-A3B/"
 QWEN2_5_7B_INSTRUCT = _local_or_hf("Qwen/Qwen2.5-7B-Instruct")
 QWEN3_CODER_30B_A3B_INSTRUCT = _local_or_hf("Qwen/Qwen3-Coder-30B-A3B-Instruct")
 GEMMA2_2B_IT = _local_or_hf("google/gemma-2-2b-it")
+GEMMA4_31B_IT = _local_or_hf("google/gemma-4-31B-it")
 
 BAILING_MOE = _local_or_hf("inclusionAI/Ling-mini-2.0")
 DEEPSEEK_R1_DISTILL_QWEN_1_5B = _local_or_hf("deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B")
