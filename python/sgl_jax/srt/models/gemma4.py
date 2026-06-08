@@ -505,7 +505,7 @@ class Gemma4Model(nnx.Module):
             hidden_states = forward_batch.input_embedding
         else:
             hidden_states = self.embed_tokens(forward_batch.input_ids)
-        hidden_states *= jnp.array([self.hidden_size**0.5], dtype=hidden_states.dtype)
+            hidden_states *= jnp.array([self.hidden_size**0.5], dtype=hidden_states.dtype)
 
         layers_kv_fused = []
         layers_callback_flag = []
@@ -634,10 +634,9 @@ class Gemma4ForCausalLM(nnx.Module):
                     layer.experts.wi_1.value = jax.device_put(jnp.zeros(shape_wi1, dtype=self.dtype), sharding_wi)
                     layer.experts.wo.value = jax.device_put(jnp.zeros(shape_wo, dtype=self.dtype), sharding_wo)
 
-        if hasattr(self, "lm_head"):
-            if isinstance(self.lm_head.embedding.value, jax.ShapeDtypeStruct):
-                logger.info("Tying lm_head weights to embed_tokens (lm_head not in safetensors)")
-                self.lm_head.embedding = self.model.embed_tokens.embedding
+        if hasattr(self, "lm_head") and isinstance(self.lm_head.embedding.value, jax.ShapeDtypeStruct):
+            logger.info("Tying lm_head weights to embed_tokens (lm_head not in safetensors)")
+            self.lm_head.embedding = self.model.embed_tokens.embedding
 
         logger.info("Gemma4 weights loaded successfully!")
 

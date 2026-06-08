@@ -306,10 +306,6 @@ class TokenizerManager:
                 )
             encoded = self.tokenizer(input_text)
             input_ids = encoded["input_ids"]
-        elif input_ids is None and getattr(obj, "input_embeds", None) is not None:
-            input_ids = [0] * len(obj.input_embeds)
-        elif input_ids is None and getattr(obj, "mm_inputs", None) is not None:
-            input_ids = [0]
         self._validate_one_request(obj, input_ids)
         return self._create_tokenized_object(obj, input_text, input_ids)
 
@@ -326,27 +322,18 @@ class TokenizerManager:
                 f"model's context length ({self.context_len} tokens)."
             )
 
-        if isinstance(obj, GenerateReqInput):
-            # Check if input + max_new_tokens exceeds context length
-            if self.preferred_sampling_params:
-                sampling_kwargs = {**self.preferred_sampling_params, **obj.sampling_params}
-            else:
-                sampling_kwargs = obj.sampling_params
-            sampling_params = SamplingParams(**sampling_kwargs)
-            max_new_tokens = sampling_params.max_new_tokens
-
-            if input_token_num + max_new_tokens > self.context_len:
-                raise ValueError(
-                    f"The input ({input_token_num} tokens) + max_new_tokens "
-                    f"({max_new_tokens}) is longer than the model's context "
-                    f"length ({self.context_len} tokens)."
-                )
-
-        vocab_size = self.model_config.vocab_size
-        if any(id >= vocab_size for id in input_ids):
-            raise ValueError(
-                f"The input_ids {input_ids} contains values greater than the vocab size ({vocab_size})."
+        # Check total tokens (input + max_new_tokens)
+        max_new_tokens = obj.sampling_params.get("max_new_tokens")
+        if max_new_tokens is not None and (max_new_tokens + input_token_num) >= self.context_len:
+            total_tokens = max_new_tokens + input_token_num
+            error_msg = (
+                f"Requested token count exceeds the model's maximum context length "
+                f"of {self.context_len} tokens. You requested a total of {total_tokens} "
+                f"tokens: {input_token_num} tokens from the input messages and "
+                f"{max_new_tokens} tokens for the completion. Please reduce the number "
+                f"of tokens in the input messages or the completion to fit within the limit."
             )
+            raise ValueError(error_msg)
 
     def _validate_input_ids_in_vocab(self, input_ids: list[int], vocab_size: int) -> None:
         if any(id >= vocab_size for id in input_ids):
@@ -375,20 +362,19 @@ class TokenizerManager:
         # Build return object
 
         tokenized_obj = TokenizedGenerateReqInput(
-            rid=obj.rid,
-            text=input_text,
-            input_ids=input_ids,
-            sampling_params=sampling_params,
-            return_logprob=obj.return_logprob,
-            return_output_logprob_only=obj.return_output_logprob_only,
-            logprob_start_len=obj.logprob_start_len,
-            top_logprobs_num=obj.top_logprobs_num,
-            token_ids_logprob=obj.token_ids_logprob,
-            stream=obj.stream,
-            lora_id=obj.lora_id,
-            extra_key=obj.extra_key,
-            return_routed_experts=obj.return_routed_experts,
-            mm_inputs=getattr(obj, "mm_inputs", None),
+            obj.rid,
+            input_text,
+            input_ids,
+            sampling_params,
+            obj.return_logprob,
+            obj.return_output_logprob_only,
+            obj.logprob_start_len,
+            obj.top_logprobs_num,
+            obj.token_ids_logprob,
+            obj.stream,
+            obj.lora_id,
+            obj.extra_key,
+            obj.return_routed_experts,
         )
 
         # PD disaggregation passthrough. When the engine is

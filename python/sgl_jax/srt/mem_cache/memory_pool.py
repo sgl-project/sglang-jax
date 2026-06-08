@@ -763,10 +763,7 @@ class SWAKVPool(KVCache):
             return remapped.reshape(-1).astype(jnp.int32)
         else:
             # DP=1: simple 1D gather
-            orig_sharding = jax.typeof(loc).sharding
-            loc_rep = jax.sharding.reshard(loc, NamedSharding(self.full_kv_pool.mesh, P()))
-            res = jnp.asarray(mapping)[loc_rep].astype(jnp.int32)
-            return jax.sharding.reshard(res, orig_sharding)
+            return jnp.asarray(mapping)[loc].astype(jnp.int32)
 
     def set_kv_buffer(
         self,
