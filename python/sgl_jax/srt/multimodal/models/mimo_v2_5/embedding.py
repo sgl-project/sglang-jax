@@ -103,15 +103,53 @@ class MiMoV2_5Embedding(nnx.Module):
             dtype=dtype,
             rngs=rngs,
         )
-        # Reserved: MiMoVL ViT, shared by image + video (HF `self.visual`).
-        # Implement in mimo_v2_5/vision_encoder.py and instantiate here to enable.
-        self.visual = None
+        # MiMoVL ViT, shared by image + video (HF `self.visual`). Built from
+        # config.vision_config when present; absent on audio-only checkpoints.
+        vision_config = getattr(config, "vision_config", None)
+        if vision_config is not None:
+            from sgl_jax.srt.multimodal.models.mimo_vision.vision_encoder import (
+                MiMoVisionTransformer,
+            )
+
+            self.visual = MiMoVisionTransformer(
+                self._normalize_vision_config(vision_config),
+                dtype=dtype,
+                rngs=rngs,
+            )
+        else:
+            self.visual = None
 
         # --- Per-modality scatter token ids (image/video reserved) ---
         audio_token_id = self._get_config_value(config, "audio_token_id", 151669)
         self.audio_token_id = int(audio_token_id) if audio_token_id is not None else None
         self.image_token_id = self._get_config_value(config, "image_token_id")
         self.video_token_id = self._get_config_value(config, "video_token_id")
+
+    @staticmethod
+    def _normalize_vision_config(vision_config):
+        """Adapt the checkpoint's vision_config to what MiMoVisionTransformer expects.
+
+        The HF checkpoint stores ``in_chans`` (not ``in_channels``) and omits
+        ``qk_channels``; the real ViT head_dim is ``qk_channels`` default 64 (review
+        D1-1: 1280/32=40 is wrong — the model uses getattr(config,"qk_channels",64) and
+        vision_config has no qk_channels). Wrap the config to supply both without
+        mutating the shared hf_config. A wrong head_dim is caught at weight load (the
+        qkv shape won't match), so this is fail-safe.
+        """
+        from types import SimpleNamespace
+
+        def g(key, default=None):
+            if isinstance(vision_config, dict):
+                return vision_config.get(key, default)
+            return getattr(vision_config, key, default)
+
+        in_channels = g("in_channels", g("in_chans", 3))
+        qk_channels = g("qk_channels", 64)
+        # Carry every original field through, then override the two normalized names.
+        base = dict(vision_config) if isinstance(vision_config, dict) else dict(vars(vision_config))
+        base["in_channels"] = int(in_channels)
+        base["qk_channels"] = int(qk_channels)
+        return SimpleNamespace(**base)
 
     @classmethod
     def get_embed_model_config(cls, model_config: PretrainedConfig) -> PretrainedConfig:
@@ -138,6 +176,19 @@ class MiMoV2_5Embedding(nnx.Module):
             num_audio_channels=self.audio_encoder.audio_channels,
             num_input_local_layers=len(self.audio_encoder.input_local_transformer.layers),
         )
+        # Vision tower: add visual.* -> self.visual.* mappings when the ViT is built.
+        # source_prefix="visual" matches the checkpoint's `visual.*` keys; target_prefix
+        # "visual." targets this module's self.visual submodule.
+        if self.visual is not None:
+            from sgl_jax.srt.multimodal.models.mimo_vision.vision_encoder import (
+                create_mimo_vision_weight_mappings,
+            )
+
+            mappings.update(
+                create_mimo_vision_weight_mappings(
+                    self.visual.config, source_prefix="visual", target_prefix="visual."
+                )
+            )
         # Hard-fail on a missing audio-tower key (review R2-5). load_weights_from_safetensors
         # only logs+skips a missing HF key, which would leave the audio tower at random
         # init and produce silently-wrong audio embeddings. Since the HF key prefixes here
@@ -178,20 +229,29 @@ class MiMoV2_5Embedding(nnx.Module):
             return None
         if self.visual is None:
             raise NotImplementedError(
-                "MiMo-V2.5 image tower (self.visual / MiMoVL ViT) is not wired yet "
-                "in this round; see design §1.3 / mimo_v2_5/vision_encoder.py."
+                "MiMo-V2.5 received image input but this checkpoint has no vision_config "
+                "(self.visual is None); it is an audio-only build."
             )
-        return self.visual(pixel_values.astype(self.dtype), image_grid_thw)
+        return self.visual(pixel_values.astype(self.dtype), self._as_grid_tuple(image_grid_thw))
 
     def _encode_video(self, *, pixel_values_videos, video_grid_thw):
         if pixel_values_videos is None:
             return None
         if self.visual is None:
             raise NotImplementedError(
-                "MiMo-V2.5 video tower (shared MiMoVL ViT) is not wired yet in this "
-                "round; see design §4.2 / mimo_v2_5/vision_encoder.py."
+                "MiMo-V2.5 received video input but this checkpoint has no vision_config "
+                "(self.visual is None); it is an audio-only build."
             )
-        return self.visual(pixel_values_videos.astype(self.dtype), video_grid_thw)
+        return self.visual(
+            pixel_values_videos.astype(self.dtype), self._as_grid_tuple(video_grid_thw)
+        )
+
+    @staticmethod
+    def _as_grid_tuple(grid_thw):
+        """Normalize grid_thw to a hashable tuple-of-(t,h,w); it is a static ViT arg."""
+        if grid_thw is None:
+            return None
+        return tuple(tuple(int(x) for x in row) for row in grid_thw)
 
     def _scatter_modality(
         self,
