@@ -51,6 +51,9 @@ class SpecDecodePendingDraftExtendResult(NamedTuple):
     pending_result: FusedDraftExtendPendingResult | None
 
 
+_RESTORED_SPEC_DECODE_PENDING_DRAFT_EXTEND_IDS = set()
+
+
 def _take_with_index_sharding(values, index):
     index_sharding = jax.typeof(index).sharding
     if isinstance(index_sharding, NamedSharding):
@@ -802,12 +805,18 @@ def restore_fused_draft_extend_result(draft_worker, model_worker_batch, pending_
 def restore_spec_decode_pending_draft_extend_result(pending_draft_extend_result):
     if pending_draft_extend_result is None:
         return None
+    pending_id = id(pending_draft_extend_result)
+    if pending_id in _RESTORED_SPEC_DECODE_PENDING_DRAFT_EXTEND_IDS:
+        if pending_draft_extend_result.pending_result is None:
+            return None
+        return pending_draft_extend_result.pending_result.batch_output
 
     restore_fused_draft_extend_result(
         pending_draft_extend_result.draft_worker,
         pending_draft_extend_result.model_worker_batch,
         pending_draft_extend_result.pending_result,
     )
+    _RESTORED_SPEC_DECODE_PENDING_DRAFT_EXTEND_IDS.add(pending_id)
     if pending_draft_extend_result.pending_result is None:
         return None
     return pending_draft_extend_result.pending_result.batch_output
@@ -1072,4 +1081,5 @@ def spec_decode_overlap(spec_worker, model_worker_batch, cur_allocate_lens):
         ),
     )
     batch_output.pending_draft_extend_result = pending_draft_extend_result
+    batch_output.next_draft_input.pending_draft_extend_result = pending_draft_extend_result
     return batch_output, scheduler_fields

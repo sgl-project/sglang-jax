@@ -1515,6 +1515,7 @@ class ScheduleBatch:
                     info.out_cache_loc = None
                     info.seq_lens_sum = 0
             flat_spec = self._concat_spec_info_per_rank([info.spec_info for info in self.reqs_info])
+            flat_spec.resolve_pending_draft_extend_result()
             flat_spec.prepare_for_decode(self)
             real_bs_per_dp = [len(info.reqs) if info.reqs else 0 for info in self.reqs_info]
             per_rank_spec = self._split_spec_info_per_rank(flat_spec, real_bs_per_dp)
@@ -2459,6 +2460,7 @@ class ScheduleBatch:
             capture_hidden_mode=flat.capture_hidden_mode,
             accept_length=flat.accept_length,
             accept_length_cpu=flat.accept_length_cpu,
+            pending_draft_extend_result=flat.pending_draft_extend_result,
         )
 
     @staticmethod
@@ -2472,7 +2474,9 @@ class ScheduleBatch:
         if flat is None:
             return [None] * len(real_bs_per_dp)
 
-        flat._ensure_host()
+        has_pending_draft_extend = flat.pending_draft_extend_result is not None
+        if not has_pending_draft_extend:
+            flat._ensure_host()
 
         per_req_fields = (
             "topk_p",
@@ -2493,7 +2497,11 @@ class ScheduleBatch:
             kwargs = {"capture_hidden_mode": flat.capture_hidden_mode}
             for f in per_req_fields:
                 v = getattr(flat, f, None)
-                kwargs[f] = None if v is None else v[offset : offset + n]
+                if has_pending_draft_extend and f not in ("allocate_lens", "new_seq_lens"):
+                    kwargs[f] = None
+                else:
+                    kwargs[f] = None if v is None else v[offset : offset + n]
+            kwargs["pending_draft_extend_result"] = flat.pending_draft_extend_result
             out.append(type(flat)(**kwargs))
             offset += n
         return out
@@ -2520,7 +2528,10 @@ class ScheduleBatch:
             "accept_length_cpu",
         )
 
-        kwargs = {"capture_hidden_mode": nonempty[0].capture_hidden_mode}
+        kwargs = {
+            "capture_hidden_mode": nonempty[0].capture_hidden_mode,
+            "pending_draft_extend_result": nonempty[0].pending_draft_extend_result,
+        }
         for f in per_req_fields:
             vals = [getattr(s, f, None) for s in nonempty]
             nonnull = [v for v in vals if v is not None]
@@ -2827,6 +2838,7 @@ class ScheduleBatch:
             # _input_logprob_lens_per_dp, which reads these.
             new_info.extend_lens = info.extend_lens
             new_info.extend_logprob_start_lens = info.extend_logprob_start_lens
+            new_info.spec_info = info.spec_info
             copied_reqs_info.append(new_info)
 
         return ScheduleBatch(

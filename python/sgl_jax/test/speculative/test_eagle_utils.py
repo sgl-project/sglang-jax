@@ -168,6 +168,26 @@ class TestVerifyTree(CustomTestCase):
             },
         )
 
+    def test_eagle_draft_input_carries_pending_draft_extend_result(self):
+        from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
+
+        fields = set(EagleDraftInput.__dataclass_fields__)
+        self.assertIn("pending_draft_extend_result", fields)
+        self.assertTrue(hasattr(EagleDraftInput, "resolve_pending_draft_extend_result"))
+
+    def test_schedule_batch_prepare_for_decode_resolves_pending_spec_info(self):
+        from sgl_jax.srt.managers.schedule_batch import ScheduleBatch
+
+        source = inspect.getsource(ScheduleBatch.prepare_for_decode)
+        self.assertIn("resolve_pending_draft_extend_result", source)
+        self.assertIn("flat_spec.prepare_for_decode", source)
+
+    def test_schedule_batch_copy_preserves_spec_info_for_overlap_processing(self):
+        from sgl_jax.srt.managers.schedule_batch import ScheduleBatch
+
+        source = inspect.getsource(ScheduleBatch.copy)
+        self.assertIn("new_info.spec_info = info.spec_info", source)
+
     def test_base_spec_worker_overlap_entry_uses_verify_boundary(self):
         from sgl_jax.srt.speculative.base_worker import BaseSpecWorker
 

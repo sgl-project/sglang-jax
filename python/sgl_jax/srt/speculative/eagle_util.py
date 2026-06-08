@@ -489,6 +489,7 @@ class EagleDraftInput:
     #: host ``(b,)`` — scheduler-visible logical length after verify. May be
     #: derived from ``old_seq_lens + accept_length`` if not stored.
     new_seq_lens: np.ndarray | None = None
+    pending_draft_extend_result: object | None = None
 
     # ---- SpecInput protocol -------------------------------------------------
     def is_draft_input(self) -> bool:
@@ -704,6 +705,30 @@ class EagleDraftInput:
         self.num_tokens_for_logprob_per_batch = topk
         model_worker_batch.return_hidden_states = False
         model_worker_batch.seq_lens_sum = np.sum(model_worker_batch.seq_lens)
+
+    def resolve_pending_draft_extend_result(self):
+        if self.pending_draft_extend_result is None:
+            return
+
+        from sgl_jax.srt.speculative.draft_extend_fused import (
+            restore_spec_decode_pending_draft_extend_result,
+        )
+
+        restored_batch_output = restore_spec_decode_pending_draft_extend_result(
+            self.pending_draft_extend_result
+        )
+        self.pending_draft_extend_result = None
+        if restored_batch_output is None:
+            return
+
+        restored = restored_batch_output.next_draft_input
+        self.topk_p = restored.topk_p
+        self.topk_index = restored.topk_index
+        self.hidden_states = restored.hidden_states
+        self.verified_id = restored.verified_id
+        self.allocate_lens = restored_batch_output.allocate_lens
+        self.accept_length = restored_batch_output.accept_lens
+        self.accept_length_cpu = restored_batch_output.accept_lens
 
     @classmethod
     def create_idle_input(
