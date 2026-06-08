@@ -290,9 +290,15 @@ def main():
                     import traceback
                     traceback.print_exc()
         if jax.process_index() == 0 and best_config:
-            # Output in python dict format for easy copying to tuned_block_sizes.py
+            # Output in the new upstream format for easy copying to tuned_block_sizes.py
+            case_label = "decode" if is_decode_only(max_num_batched_tokens) else "mixed"
+            if case_label == "decode":
+                value_str = f"({best_config[0]}, 1, 4)"
+            else:
+                value_str = f"({best_config[0]}, {best_config[1]})"
+            
             print(
-                f"('{q_dtype}', '{k_dtype}', {q_head_num}, {kv_lora_rank}, {qk_rope_head_dim}, {page_size}, {max_num_batched_tokens}): ({best_config[0]}, {best_config[1]}),  # Best latency: {best_output:.4f} ms",
+                f"        ('{case_label}', '{q_dtype}', '{k_dtype}', {q_head_num}, {kv_lora_rank}, {qk_rope_head_dim}, {page_size}, {max_num_batched_tokens}): {value_str},  # Best latency: {best_output:.4f} ms",
                 flush=True,
             )
 
