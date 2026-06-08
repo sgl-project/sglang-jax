@@ -234,34 +234,6 @@ class MiMoV2_5Embedding(nnx.Module):
             audio_codes=audio_codes,
         )
 
-    @staticmethod
-    def _describe_device(arr) -> str:
-        """Best-effort one-line description of where a jax array physically lives."""
-        try:
-            devs = list(arr.devices())
-            plats = sorted({getattr(d, "platform", "?") for d in devs})
-            sharding = getattr(arr, "sharding", None)
-            return f"shape={tuple(arr.shape)} platforms={plats} devices={devs} sharding={sharding}"
-        except Exception as e:  # pragma: no cover - diagnostic only
-            return f"<undescribable: {e!r}>"
-
-    def _log_vision_devices(self, pv) -> None:
-        """One-shot diagnostic: prove whether the ViT compute runs on CPU or TPU."""
-        import jax as _jax
-
-        try:
-            mesh_plats = sorted({getattr(d, "platform", "?") for d in self.mesh.devices.flatten()})
-        except Exception:
-            mesh_plats = "<no mesh>"
-        logger.info("[VISION-DEVICE] jax.default_backend=%s", _jax.default_backend())
-        logger.info("[VISION-DEVICE] embed self.mesh platforms=%s", mesh_plats)
-        logger.info("[VISION-DEVICE] input pixel_values: %s", self._describe_device(pv))
-        try:
-            kernel = self.visual.patch_embed.proj.kernel.value
-            logger.info("[VISION-DEVICE] patch_embed kernel: %s", self._describe_device(kernel))
-        except Exception as e:
-            logger.info("[VISION-DEVICE] patch_embed kernel: <err %r>", e)
-
     def _encode_image(self, *, pixel_values, image_grid_thw):
         if pixel_values is None:
             return None
@@ -270,15 +242,7 @@ class MiMoV2_5Embedding(nnx.Module):
                 "MiMo-V2.5 received image input but this checkpoint has no vision_config "
                 "(self.visual is None); it is an audio-only build."
             )
-        pv = pixel_values.astype(self.dtype)
-        if not getattr(type(self), "_vision_device_logged", False):
-            type(self)._vision_device_logged = True
-            self._log_vision_devices(pv)
-        out = self.visual(pv, self._as_grid_tuple(image_grid_thw))
-        if not getattr(type(self), "_vision_out_logged", False):
-            type(self)._vision_out_logged = True
-            logger.info("[VISION-DEVICE] ViT output embeds: %s", self._describe_device(out))
-        return out
+        return self.visual(pixel_values.astype(self.dtype), self._as_grid_tuple(image_grid_thw))
 
     def _encode_video(self, *, pixel_values_videos, video_grid_thw):
         if pixel_values_videos is None:
