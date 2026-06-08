@@ -1,5 +1,11 @@
 import logging
 import os
+
+host0 = "grok2-multi-grok-worker-0-0-0.grok2-multi"
+host1 = "grok2-multi-grok-worker-1-0-0.grok2-multi"
+os.environ["TPU_WORKER_HOSTNAMES"] = f"{host0},{host1}"
+os.environ["TPU_PROCESS_ADDRESSES"] = f"{host0}:8471,{host1}:8471"
+
 import jax
 
 # Set up logging immediately
