@@ -113,6 +113,27 @@ class TestVerifyTree(CustomTestCase):
         self.assertIn("resolve_spec_decode_scheduler_fields", source)
         self.assertIn("spec_decode_draft_extend_phase", source)
 
+    def test_base_spec_worker_overlap_entry_uses_verify_boundary(self):
+        from sgl_jax.srt.speculative.base_worker import BaseSpecWorker
+
+        self.assertTrue(hasattr(BaseSpecWorker, "forward_batch_speculative_generation_overlap"))
+        source = inspect.getsource(BaseSpecWorker.forward_batch_speculative_generation_overlap)
+        self.assertIn("spec_decode_overlap", source)
+        self.assertNotIn("spec_decode(", source)
+
+    def test_base_spec_worker_overlap_entry_rejects_prefill(self):
+        from sgl_jax.srt.speculative.base_worker import BaseSpecWorker
+
+        worker = BaseSpecWorker.__new__(BaseSpecWorker)
+        worker._can_use_fused_spec_decode = True
+        batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(is_decode=lambda: False),
+            sampling_info=SimpleNamespace(is_all_greedy=True),
+        )
+
+        with self.assertRaises(NotImplementedError):
+            worker.forward_batch_speculative_generation_overlap(batch)
+
     def test_spec_decode_future_result_contract_fields(self):
         from sgl_jax.srt.speculative import overlap_future
 
