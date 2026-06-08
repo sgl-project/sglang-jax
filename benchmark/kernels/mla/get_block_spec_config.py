@@ -164,13 +164,13 @@ def main():
     tune_only_glm5 = len(sys.argv) > 1 and sys.argv[1] == "--glm5-only"
 
     if tune_only_glm5:
-        print("Tuning exclusively for GLM-5.1 (TP=32, TP=16, TP=8) configurations.")
+        print("Tuning exclusively for GLM-5.1 (TP=32) configuration.")
         page_size_config = [64, 128, 256]
         max_num_batched_tokens_config = [
             1, 2, 4, 8, 16, 32, 64, 8192, 16384
         ]
-        # Query heads per rank: 64 total heads / TP size (TP=32 -> 2, TP=16 -> 4, TP=8 -> 8, TP=4 -> 16)
-        q_head_num_config = [2, 4, 8, 16] 
+        # Query heads per rank: 64 total heads / TP size (TP=32 -> 2)
+        q_head_num_config = [2] 
         kv_lora_rank_config = [512]
         qk_rope_head_dim_config = [64]
     else:
