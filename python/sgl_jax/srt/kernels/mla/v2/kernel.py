@@ -1047,14 +1047,12 @@ def _mla_ragged_paged_attention_kernel(
             bkvc_ref = (
                 bkvc_x2_ref.bitcast(jnp.uint32)
                 .at[bkv_sem_idx, b, :bkv_sz_per_kv_packing]
-                .reshape(bkv_sz_per_kv_packing, lkv_dim)
             )
             bkvc_vec = pltpu.bitcast(bkvc_ref[...], kv_dtype).reshape(bkv_sz, lkv_dim)
 
             bkpe_ref = (
                 bkpe_x2_ref.bitcast(jnp.uint32)
                 .at[bkv_sem_idx, b, :bkv_sz_per_kv_packing]
-                .reshape(bkv_sz_per_kv_packing, r_dim)
             )
             bkpe_vec = pltpu.bitcast(bkpe_ref[...], kv_dtype).reshape(bkv_sz, r_dim)
             bkvc_vecs.append(bkvc_vec)
