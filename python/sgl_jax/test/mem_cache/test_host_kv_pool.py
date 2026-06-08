@@ -7,7 +7,8 @@ import unittest
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+from jax.sharding import Mesh, NamedSharding
+from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.mem_cache.host_kv_pool import HostKVPool, make_host_sharding
 
@@ -98,9 +99,7 @@ class TestD2HRoundTrip(unittest.TestCase):
         retrieved = pool.get(ids[0])
         restored = jax.device_put(retrieved, device_sharding)
 
-        np.testing.assert_allclose(
-            np.asarray(restored), np.asarray(original), rtol=0, atol=0
-        )
+        np.testing.assert_allclose(np.asarray(restored), np.asarray(original), rtol=0, atol=0)
 
 
 class TestHostSharding(unittest.TestCase):

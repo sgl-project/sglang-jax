@@ -9,7 +9,7 @@ memory_kind='pinned_host'.
 from __future__ import annotations
 
 import logging
-from typing import Sequence
+from collections.abc import Sequence
 
 import jax
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
@@ -26,9 +26,7 @@ def make_host_sharding(mesh: Mesh, partition_spec: PartitionSpec) -> NamedShardi
     try:
         return NamedSharding(mesh, partition_spec, memory_kind="pinned_host")
     except (TypeError, ValueError):
-        logger.warning(
-            "pinned_host memory_kind unavailable; falling back to default."
-        )
+        logger.warning("pinned_host memory_kind unavailable; falling back to default.")
         return NamedSharding(mesh, partition_spec)
 
 
