@@ -141,6 +141,32 @@ class TestFormatSlackSummary(unittest.TestCase):
         self.assertLessEqual(len(summary), 2950)
         self.assertIn("truncated", summary)
 
+    def test_includes_issue_link_when_provided(self):
+        jobs = self._make_jobs([("job-a", "bug")])
+        summary = format_slack_summary(
+            "https://run",
+            "abc1234567",
+            "author",
+            jobs,
+            failure_issues={
+                ("job-a", "bug"): {
+                    "issue_number": 123,
+                    "issue_url": "https://github.com/sgl-project/sglang-jax/issues/123",
+                }
+            },
+        )
+        self.assertIn("<https://example.com/0|job-a>", summary)
+        self.assertIn(
+            "Issue: <https://github.com/sgl-project/sglang-jax/issues/123|#123>",
+            summary,
+        )
+
+    def test_works_without_failure_issues(self):
+        jobs = self._make_jobs([("job-a", "bug")])
+        summary = format_slack_summary("https://run", "abc1234567", "author", jobs)
+        self.assertIn("job-a", summary)
+        self.assertNotIn("Issue:", summary)
+
 
 class TestFormatRegressionSummary(unittest.TestCase):
     """Test format_regression_summary output."""

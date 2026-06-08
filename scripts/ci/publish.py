@@ -248,6 +248,15 @@ def collect_files(source_dir, file_extension, target_base_path):
     return files_to_upload
 
 
+def collect_status_file(source_dir):
+    path = os.path.join(source_dir, "nightly-status.json")
+    if not os.path.exists(path):
+        print(f"Warning: {path} does not exist")
+        return []
+    with open(path, "rb") as f:
+        return [("nightly-status/nightly-status.json", f.read())]
+
+
 def publish(source_dir, data_type, run_id, run_number):
     """Publish files to GitHub repository in a single commit."""
     token = os.getenv("GITHUB_TOKEN")
@@ -268,6 +277,7 @@ def publish(source_dir, data_type, run_id, run_number):
         def make_commit_message(count):
             return f"Nightly traces for run {run_id} at {run_number} ({count} files)"
 
+        files_to_upload = collect_files(source_dir, file_extension, target_base_path)
     elif data_type == "perf":
         # Per-model perf CSV. Like bench, the path under --source-dir is preserved
         # as-is; callers stage perf/<date>/<file>.csv (the caller owns the layout).
@@ -278,6 +288,15 @@ def publish(source_dir, data_type, run_id, run_number):
         def make_commit_message(count):
             return f"Perf CSV of Nightly-test for run {run_id} at {run_number} ({count} files)"
 
+        files_to_upload = collect_files(source_dir, file_extension, target_base_path)
+    elif data_type == "status":
+        no_files_msg = "No nightly status file found to upload"
+        success_msg = "Successfully published nightly status"
+
+        def make_commit_message(count):
+            return f"Nightly health status for run {run_id} at {run_number}"
+
+        files_to_upload = collect_status_file(source_dir)
     else:  # bench
         file_extension = ".csv"
         no_files_msg = "No csv files found to upload"
@@ -286,7 +305,7 @@ def publish(source_dir, data_type, run_id, run_number):
         def make_commit_message(count):
             return f"CSV files of Nightly-test for run {run_id} at {run_number} ({count} files)"
 
-    files_to_upload = collect_files(source_dir, file_extension, target_base_path)
+        files_to_upload = collect_files(source_dir, file_extension, target_base_path)
 
     if not files_to_upload:
         print(no_files_msg)
@@ -375,8 +394,8 @@ def main():
         "--data-type",
         type=str,
         required=True,
-        choices=["bench", "perf", "trace"],
-        help="Type of data to publish: bench (scans .csv, ci-data root), perf (scans .csv, under perf/), or trace (scans .json.gz)",
+        choices=["bench", "perf", "trace", "status"],
+        help="Type of data to publish: bench (scans .csv, ci-data root), perf (scans .csv, under perf/), trace (scans .json.gz), or status (nightly-status.json)",
     )
     args = parser.parse_args()
 

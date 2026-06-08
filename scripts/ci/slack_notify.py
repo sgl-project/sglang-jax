@@ -10,22 +10,53 @@ from failure_classifier import FAILURE_TYPES, classify_jobs, get_failed_jobs
 from github_output import write_github_output
 
 
-def format_slack_summary(run_url, commit_sha, author, failed_jobs, ai_analysis=""):
+def _escape_mrkdwn(text):
+    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def load_failure_issues(path):
+    if not path:
+        return {}
+    with open(path) as f:
+        data = json.load(f)
+    return {
+        (item.get("job_name", ""), item.get("failure_type", "")): item
+        for item in data.get("failed_jobs", [])
+    }
+
+
+def issue_for_job(job, failure_issue_map):
+    return failure_issue_map.get(
+        (job.get("name", ""), job.get("failure_type", "")),
+        failure_issue_map.get((job.get("name", ""), "")),
+    )
+
+
+def format_slack_summary(
+    run_url, commit_sha, author, failed_jobs, ai_analysis="", failure_issues=None
+):
     """Format compact Slack mrkdwn summary."""
+    failure_issues = failure_issues or {}
     display_jobs = [j for j in failed_jobs if not j["name"].endswith("-finish")]
     short_sha = commit_sha[:7] if len(commit_sha) >= 7 else commit_sha
     job_word = "job" if len(display_jobs) == 1 else "jobs"
     lines = [
         f":red_circle: *Nightly CI Failure* — {len(display_jobs)} {job_word} failed  |  <{run_url}|View run>"
     ]
-    safe_author = author.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    safe_author = _escape_mrkdwn(author)
     lines.append(f"`{short_sha}` by {safe_author}")
     lines.append("")
     for job in display_jobs:
         ft = FAILURE_TYPES.get(job["failure_type"], FAILURE_TYPES["bug"])
-        safe_name = job["name"].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        safe_name = _escape_mrkdwn(job["name"])
         safe_name = safe_name.replace("|", "/")
-        lines.append(f"• {ft['emoji']} {safe_name} [{ft['label']}]")
+        job_url = job.get("html_url")
+        job_ref = f"<{job_url}|{safe_name}>" if job_url else safe_name
+        issue = issue_for_job(job, failure_issues)
+        issue_text = ""
+        if issue and issue.get("issue_number") and issue.get("issue_url"):
+            issue_text = f" — Issue: <{issue['issue_url']}|#{issue['issue_number']}>"
+        lines.append(f"• {ft['emoji']} {job_ref} [{ft['label']}]{issue_text}")
 
     if ai_analysis:
         lines.append("")
@@ -57,12 +88,19 @@ def main():
         type=str,
         help="Path to file containing AI analysis text to include in summary",
     )
+    parser.add_argument(
+        "--failure-issues",
+        type=str,
+        help="failure_issues.json from ci_failure_issues.py",
+    )
     args = parser.parse_args()
 
     ai_analysis = ""
     if args.ai_analysis and os.path.isfile(args.ai_analysis):
         with open(args.ai_analysis) as f:
             ai_analysis = f.read().strip()
+
+    failure_issue_map = load_failure_issues(args.failure_issues)
 
     if args.from_classification:
         with open(args.from_classification) as f:
@@ -99,6 +137,7 @@ def main():
                     "name": j["name"],
                     "id": j["id"],
                     "html_url": j["html_url"],
+                    "conclusion": j.get("conclusion", "failure"),
                     "failure_type": j["failure_type"],
                 }
                 for j in failed_jobs
@@ -116,6 +155,7 @@ def main():
         args.commit_author,
         failed_jobs,
         ai_analysis,
+        failure_issue_map,
     )
 
     if args.slack_output:
@@ -131,7 +171,13 @@ def main():
             f.write(f"**Commit:** {args.commit_sha[:7]} by {args.commit_author}\n\n")
             f.write(f"**Failed jobs ({len(failed_jobs)}):**\n\n")
             for job in failed_jobs:
-                f.write(f"- [{job['name']}]({job['html_url']}) — {job['failure_type']}\n")
+                issue = issue_for_job(job, failure_issue_map)
+                issue_text = ""
+                if issue and issue.get("issue_number") and issue.get("issue_url"):
+                    issue_text = f" — Issue: [#{issue['issue_number']}]({issue['issue_url']})"
+                f.write(
+                    f"- [{job['name']}]({job['html_url']}) — {job['failure_type']}{issue_text}\n"
+                )
             if ai_analysis:
                 f.write(f"\n**AI Analysis:**\n\n{ai_analysis}\n")
         print("Report appended to GITHUB_STEP_SUMMARY.")
