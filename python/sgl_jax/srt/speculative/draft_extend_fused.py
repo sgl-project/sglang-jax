@@ -987,3 +987,15 @@ def spec_decode(spec_worker, model_worker_batch, cur_allocate_lens):
     """Run speculative decode as verify JIT followed by draft-extend JIT."""
     batch_output = spec_decode_verify_phase(spec_worker, model_worker_batch, cur_allocate_lens)
     return spec_decode_draft_extend_phase(spec_worker, model_worker_batch, batch_output)
+
+
+def spec_decode_overlap(spec_worker, model_worker_batch, cur_allocate_lens):
+    """Expose the verify boundary needed by speculative decode overlap."""
+    from sgl_jax.srt.speculative.overlap_future import (
+        resolve_spec_decode_scheduler_fields,
+    )
+
+    batch_output = spec_decode_verify_phase(spec_worker, model_worker_batch, cur_allocate_lens)
+    scheduler_fields = resolve_spec_decode_scheduler_fields(batch_output)
+    spec_decode_draft_extend_phase(spec_worker, model_worker_batch, batch_output)
+    return batch_output, scheduler_fields

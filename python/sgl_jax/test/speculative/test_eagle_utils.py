@@ -104,6 +104,15 @@ class TestVerifyTree(CustomTestCase):
         self.assertIn("spec_decode_draft_extend_phase", source)
         self.assertNotIn("_fused_greedy_decode_jit_fn", source)
 
+    def test_spec_decode_overlap_uses_verify_then_draft_extend_boundary(self):
+        from sgl_jax.srt.speculative import draft_extend_fused
+
+        self.assertTrue(hasattr(draft_extend_fused, "spec_decode_overlap"))
+        source = inspect.getsource(draft_extend_fused.spec_decode_overlap)
+        self.assertIn("spec_decode_verify_phase", source)
+        self.assertIn("resolve_spec_decode_scheduler_fields", source)
+        self.assertIn("spec_decode_draft_extend_phase", source)
+
     def test_spec_decode_future_result_contract_fields(self):
         from sgl_jax.srt.speculative import overlap_future
 
