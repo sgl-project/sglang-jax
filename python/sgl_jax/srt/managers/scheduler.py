@@ -77,6 +77,7 @@ from sgl_jax.srt.multimodal.tokenizer_utils import resolve_tokenizer_subdir
 from sgl_jax.srt.precision_tracer import precision_tracer
 from sgl_jax.srt.server_args import PortArgs, ServerArgs
 from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
+from sgl_jax.srt.speculative.overlap_future import resolve_spec_decode_scheduler_fields
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 from sgl_jax.srt.utils.common_utils import (
     configure_logger,
@@ -1928,9 +1929,8 @@ class Scheduler(
             )
             for r, s in enumerate(per_rank_spec):
                 batch.reqs_info[r].spec_info = s
-            accept = batch_output.accept_lens
-            if accept is not None:
-                accept = np.asarray(jax.device_get(accept))
+            scheduler_fields = resolve_spec_decode_scheduler_fields(batch_output)
+            accept = scheduler_fields.accept_lens
             per_dp_bs = model_worker_batch.per_dp_bs_size
             for dp_rank, info in enumerate(batch.reqs_info):
                 if info.seq_lens is None or len(info.seq_lens) == 0:
@@ -1940,7 +1940,7 @@ class Scheduler(
                     info.seq_lens = info.seq_lens + accept[off : off + len(info.seq_lens)]
                 else:
                     info.seq_lens = info.seq_lens + 1
-            next_token_ids = np.asarray(jax.device_get(batch_output.next_token_ids))
+            next_token_ids = scheduler_fields.next_token_ids
             self._extract_dp_output_ids(next_token_ids, model_worker_batch, batch)
             logits_output = batch_output.logits_output
             cache_miss_count = batch_output.cache_miss_count

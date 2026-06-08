@@ -249,6 +249,12 @@ class TestVerifyTree(CustomTestCase):
             )
         )
 
+    def test_scheduler_spec_decode_resolve_delegates_to_speculative_helper(self):
+        from sgl_jax.srt.managers.scheduler import Scheduler
+
+        source = inspect.getsource(Scheduler.run_batch)
+        self.assertIn("resolve_spec_decode_scheduler_fields", source)
+
     def test_as_int32_array_keeps_host_metadata_on_host(self):
         from sgl_jax.srt.speculative import eagle_util
 
