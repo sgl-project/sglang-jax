@@ -223,14 +223,14 @@ def main():
                             )
 
     # Tiling search space
-    num_kv_pages_per_blk_config = [1, 2, 4, 8, 16]
-    num_queries_per_block_config = [1, 2, 4, 8, 16, 32, 64, 128, 256]
+    num_kv_pages_per_blk_config = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
+    num_queries_per_block_config = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
 
     prefill_only_block_spec_configs = []
     for num_kv_pages_per_blk in num_kv_pages_per_blk_config:
         for num_queries_per_block in num_queries_per_block_config:
             # Skip configurations that are too large and guaranteed to overflow VMEM (Vector Memory)
-            if num_kv_pages_per_blk * num_queries_per_block > 256:
+            if num_kv_pages_per_blk * num_queries_per_block > 512:
                 continue
             prefill_only_block_spec_configs.append((num_kv_pages_per_blk, num_queries_per_block))
 
