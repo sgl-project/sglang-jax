@@ -2478,6 +2478,7 @@ class ScheduleBatch:
             capture_hidden_mode=flat.capture_hidden_mode,
             accept_length=_scatter1(flat.accept_length),
             accept_length_cpu=_scatter1(flat.accept_length_cpu),
+            new_seq_lens=_scatter1(flat.new_seq_lens),
             pending_draft_extend_result=flat.pending_draft_extend_result,
         )
 
@@ -2495,6 +2496,36 @@ class ScheduleBatch:
         has_pending_draft_extend = flat.pending_draft_extend_result is not None
         if not has_pending_draft_extend:
             flat._ensure_host()
+            required_fields = ("topk_p", "topk_index", "hidden_states", "verified_id")
+            missing = [f for f in required_fields if getattr(flat, f, None) is None]
+            if missing:
+
+                def _field_state(v):
+                    if v is None:
+                        return None
+                    shape = getattr(v, "shape", None)
+                    if shape is not None:
+                        return shape
+                    return len(v)
+
+                field_states = {
+                    f: _field_state(getattr(flat, f, None))
+                    for f in (
+                        "topk_p",
+                        "topk_index",
+                        "hidden_states",
+                        "verified_id",
+                        "allocate_lens",
+                        "accept_length",
+                        "accept_length_cpu",
+                        "new_seq_lens",
+                    )
+                }
+                raise RuntimeError(
+                    "_split_spec_info_per_rank got incomplete EagleDraftInput "
+                    f"without pending_draft_extend_result; missing={missing}, "
+                    f"field_states={field_states}, real_bs_per_dp={real_bs_per_dp}"
+                )
 
         per_req_fields = (
             "topk_p",
@@ -2504,6 +2535,7 @@ class ScheduleBatch:
             "allocate_lens",
             "accept_length",
             "accept_length_cpu",
+            "new_seq_lens",
         )
 
         out = []
@@ -2552,6 +2584,7 @@ class ScheduleBatch:
             "allocate_lens",
             "accept_length",
             "accept_length_cpu",
+            "new_seq_lens",
         )
 
         kwargs = {

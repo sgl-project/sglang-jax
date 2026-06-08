@@ -631,7 +631,9 @@ class EagleDraftInput:
         )
         bs = batch_output.accept_lens.shape[0]
         step_plus_1 = model_worker_batch.input_ids.shape[0] // bs
-        model_worker_batch.positions = model_worker_batch.positions
+        positions = getattr(batch_output.next_draft_input, "positions", None)
+        if positions is not None:
+            model_worker_batch.positions = positions
         model_worker_batch.extend_seq_lens = np.zeros((bs,), dtype=np.int32)
         model_worker_batch.extend_seq_lens[sel] = step_plus_1
         # Per-rank-local cumsum: _select_hidden_states is a shard_map rank-local
@@ -821,6 +823,8 @@ class EagleDraftInput:
             self.verified_id = self.verified_id[: len(new_indices)]
             if self.allocate_lens is not None:
                 self.allocate_lens = np.asarray(self.allocate_lens)[: len(new_indices)]
+            if self.new_seq_lens is not None:
+                self.new_seq_lens = np.asarray(self.new_seq_lens)[: len(new_indices)]
         else:
             self.topk_p = self.topk_p[new_indices]
             self.topk_index = self.topk_index[new_indices]
@@ -828,6 +832,8 @@ class EagleDraftInput:
             self.verified_id = self.verified_id[new_indices]
             if self.allocate_lens is not None:
                 self.allocate_lens = np.asarray(self.allocate_lens)[new_indices]
+            if self.new_seq_lens is not None:
+                self.new_seq_lens = np.asarray(self.new_seq_lens)[new_indices]
 
     def trim_to_length(self, n: int):
         self.resolve_pending_draft_extend_result()
@@ -838,6 +844,7 @@ class EagleDraftInput:
             "hidden_states",
             "verified_id",
             "allocate_lens",
+            "new_seq_lens",
             "accept_length",
             "accept_length_cpu",
         ):
@@ -854,6 +861,7 @@ class EagleDraftInput:
             self.topk_p = spec_info.topk_p
             self.topk_index = spec_info.topk_index
             self.allocate_lens = spec_info.allocate_lens
+            self.new_seq_lens = spec_info.new_seq_lens
             return
         if spec_info.hidden_states is None:
             return
@@ -864,6 +872,12 @@ class EagleDraftInput:
         self.topk_p = np.concatenate([self.topk_p, spec_info.topk_p])
         self.topk_index = np.concatenate([self.topk_index, spec_info.topk_index])
         self.allocate_lens = np.concatenate([self.allocate_lens, spec_info.allocate_lens])
+        if self.new_seq_lens is not None and spec_info.new_seq_lens is not None:
+            self.new_seq_lens = np.concatenate(
+                [np.asarray(self.new_seq_lens), np.asarray(spec_info.new_seq_lens)]
+            )
+        else:
+            self.new_seq_lens = None
 
 
 @dataclass

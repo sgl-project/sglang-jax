@@ -211,40 +211,29 @@ def _device_rotate_input_ids(input_ids, ext_lens, sel_pos, new_tokens):
     return shifted_2d.reshape(-1)
 
 
-def _device_rotate_prefill_input_ids(input_ids, extend_seq_lens, verified_id):
-    token_count = input_ids.shape[0]
-    starts = jnp.cumsum(extend_seq_lens, axis=0) - extend_seq_lens
-    input_ids_sharding = jax.typeof(input_ids).sharding
-    has_mesh_axes = isinstance(input_ids_sharding, NamedSharding) and bool(
-        getattr(input_ids_sharding.mesh, "shape", ())
-    )
-    if has_mesh_axes:
-        req_ids = jnp.repeat(
-            jnp.arange(extend_seq_lens.shape[0], dtype=jnp.int32),
-            extend_seq_lens,
-            total_repeat_length=token_count,
-            out_sharding=input_ids_sharding,
-        )
-        req_starts = starts.at[req_ids].get(out_sharding=input_ids_sharding)
-        req_lens = extend_seq_lens.at[req_ids].get(out_sharding=input_ids_sharding)
-        req_verified_id = verified_id.at[req_ids].get(out_sharding=input_ids_sharding)
-        shifted_index = jnp.minimum(jnp.arange(token_count, dtype=jnp.int32) + 1, token_count - 1)
-        shifted = input_ids.at[shifted_index].get(out_sharding=input_ids_sharding)
-    else:
-        req_ids = jnp.repeat(
-            jnp.arange(extend_seq_lens.shape[0], dtype=jnp.int32),
-            extend_seq_lens,
-            total_repeat_length=token_count,
-        )
-        req_starts = starts[req_ids]
-        req_lens = extend_seq_lens[req_ids]
-        req_verified_id = verified_id[req_ids]
-        shifted_index = jnp.minimum(jnp.arange(token_count, dtype=jnp.int32) + 1, token_count - 1)
-        shifted = input_ids[shifted_index]
+def _device_rotate_prefill_input_ids(input_ids, extend_seq_lens, verified_id, dp_size, per_dp_bs):
+    per_dp_tokens = input_ids.shape[0] // dp_size
+    ids = input_ids.reshape(dp_size, per_dp_tokens)
+    ext = extend_seq_lens.reshape(dp_size, per_dp_bs)
+    verified = verified_id.reshape(dp_size, per_dp_bs)
+    tok = jnp.arange(per_dp_tokens, dtype=jnp.int32)
 
-    token_offsets = jnp.arange(token_count, dtype=jnp.int32) - req_starts
-    is_last = token_offsets == (req_lens - 1)
-    return jnp.where(is_last, req_verified_id, shifted)
+    def rotate_rank(ids_rank, ext_rank, verified_rank):
+        starts = jnp.cumsum(ext_rank, axis=0) - ext_rank
+        ends = starts + ext_rank
+        in_req = (tok[None, :] >= starts[:, None]) & (tok[None, :] < ends[:, None])
+        has_req = jnp.any(in_req, axis=0)
+        slot = jnp.argmax(in_req.astype(jnp.int32), axis=0)
+        req_starts = starts.at[slot].get()
+        req_lens = ext_rank.at[slot].get()
+        req_verified = verified_rank.at[slot].get()
+        shifted_index = jnp.minimum(tok + 1, per_dp_tokens - 1)
+        shifted = ids_rank.at[shifted_index].get()
+        is_last = has_req & ((tok - req_starts) == (req_lens - 1))
+        rotated = jnp.where(is_last, req_verified, shifted)
+        return jnp.where(has_req, rotated, ids_rank)
+
+    return jax.vmap(rotate_rank)(ids, ext, verified).reshape(input_ids.shape)
 
 
 def _gather_rows_preserve_sharding(values, index):
@@ -423,6 +412,7 @@ def _build_fused_greedy_verify_jit(topk: int):
         prepared_accept_lens = prepared.accept_lens
         prepared_sel_pos = prepared.sel_pos
         prepared_predict = prepared.predict
+        prepared_positions = prepared.positions
 
         if mesh is not None:
             rep = NamedSharding(mesh, P())
@@ -432,6 +422,7 @@ def _build_fused_greedy_verify_jit(topk: int):
             prepared_accept_lens = jax.sharding.reshard(prepared_accept_lens, rep)
             prepared_sel_pos = jax.sharding.reshard(prepared_sel_pos, rep)
             prepared_predict = jax.sharding.reshard(prepared_predict, rep)
+            prepared_positions = jax.sharding.reshard(prepared_positions, rep)
             if return_target_logits:
                 target_logits_for_host = jax.sharding.reshard(target_logits_for_host, rep)
 
@@ -443,6 +434,7 @@ def _build_fused_greedy_verify_jit(topk: int):
             prepared_accept_lens,
             prepared_sel_pos,
             prepared_predict,
+            prepared_positions,
             target_logits_for_host,
         )
 
@@ -498,6 +490,8 @@ def _build_fused_greedy_prefill_jit(num_layers: int, topk: int):
             draft_forward_batch.input_ids,
             draft_forward_batch.extend_seq_lens,
             next_token_ids,
+            dp_size,
+            per_dp_bs,
         )
 
         all_topk_index = []
@@ -528,6 +522,8 @@ def _build_fused_greedy_prefill_jit(num_layers: int, topk: int):
                     input_ids,
                     draft_forward_batch.extend_seq_lens,
                     topk_idx[:, 0],
+                    dp_size,
+                    per_dp_bs,
                 )
 
         last_idx = draft_logits_indices
@@ -727,12 +723,6 @@ def launch_fused_draft_extend_for_decode(draft_worker, model_worker_batch, batch
         draft_worker.draft_model_runner,
         batch_output,
         draft_worker.speculative_num_draft_tokens,
-    )
-    mwb.spec_info_padded.accept_length = None
-    logits_metadata = _logits_metadata_from_model_worker_batch_preserve_device(
-        mwb,
-        draft_worker.mesh,
-        include_accept_lens=False,
     )
     if mwb.input_ids.shape[0] <= 0:
         return None
@@ -1021,6 +1011,7 @@ def spec_decode_verify_phase(spec_worker, model_worker_batch, cur_allocate_lens)
             prepared_accept_lens,
             prepared_sel_pos,
             prepared_predict,
+            prepared_positions,
             target_logits,
         ) = draft_worker._fused_greedy_verify_jit_fn(
             target_mr._model_def,
@@ -1046,6 +1037,7 @@ def spec_decode_verify_phase(spec_worker, model_worker_batch, cur_allocate_lens)
         hidden_states=prepared_hidden,
     )
     next_draft_input.sel_pos = prepared_sel_pos
+    next_draft_input.positions = prepared_positions
     batch_output = GenerationBatchResult(
         logits_output=LogitsProcessorOutput(
             next_token_logits=target_logits,
