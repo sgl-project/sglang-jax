@@ -59,8 +59,11 @@ def _device_to_numpy(value):
 
 
 def publish_spec_decode_new_seq_lens(future_result):
+    new_seq_lens = getattr(future_result, "new_seq_lens", None)
+    if new_seq_lens is None and getattr(future_result, "next_draft_input", None) is not None:
+        new_seq_lens = future_result.next_draft_input.new_seq_lens
     return SpecDecodePublishFields(
-        new_seq_lens=future_result.new_seq_lens,
+        new_seq_lens=new_seq_lens,
     )
 
 

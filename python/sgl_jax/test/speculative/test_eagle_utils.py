@@ -352,6 +352,19 @@ class TestVerifyTree(CustomTestCase):
 
         np.testing.assert_array_equal(fields.new_seq_lens, np.array([4, 7], dtype=np.int32))
 
+    def test_publish_spec_decode_new_seq_lens_accepts_generation_batch_result_shape(self):
+        from sgl_jax.srt.speculative import overlap_future
+
+        batch_output = SimpleNamespace(
+            next_draft_input=SimpleNamespace(
+                new_seq_lens=jnp.array([5, 9], dtype=jnp.int32),
+            )
+        )
+
+        fields = overlap_future.publish_spec_decode_new_seq_lens(batch_output)
+
+        np.testing.assert_array_equal(fields.new_seq_lens, np.array([5, 9], dtype=np.int32))
+
     def test_can_use_spec_decode_overlap_gate_lives_under_speculative(self):
         from sgl_jax.srt.speculative import overlap_future
 
