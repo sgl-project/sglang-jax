@@ -1,9 +1,9 @@
 """MiMo-V2.5 omni model package (text + audio + image + video understanding).
 
-Exports use lazy attribute loading (PEP 562) so light submodules such as
-``configuration`` can be imported without pulling the jax/flax model stack.
-The audio tower (``audio_encoder``) and ViT (``vision_encoder``) live alongside
-``embedding`` here; ``embedding`` imports both lazily.
+Exports use lazy attribute loading (PEP 562) so importing the package does not
+pull the jax/flax model stack until a model class is actually accessed. The audio
+tower (``audio_encoder``) and ViT (``vision_encoder``) live alongside ``embedding``
+here; ``embedding`` imports both lazily.
 """
 
 from __future__ import annotations

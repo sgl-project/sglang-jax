@@ -118,7 +118,7 @@ class MiMoV2_5Embedding(nnx.Module):
         else:
             self.visual = None
 
-        # --- Per-modality scatter token ids (image/video reserved) ---
+        # --- Per-modality scatter token ids ---
         audio_token_id = self._get_config_value(config, "audio_token_id", 151669)
         self.audio_token_id = int(audio_token_id) if audio_token_id is not None else None
         self.image_token_id = self._get_config_value(config, "image_token_id")
@@ -200,9 +200,8 @@ class MiMoV2_5Embedding(nnx.Module):
             mappings.update(vision_mappings)
         # Hard-fail on a missing audio-tower key (review R2-5). load_weights_from_safetensors
         # only logs+skips a missing HF key, which would leave the audio tower at random
-        # init and produce silently-wrong audio embeddings. Since the HF key prefixes here
-        # are not yet verified against a real checkpoint, refuse to load rather than run
-        # garbage: every speech_embeddings / input_local / projection key must exist.
+        # init and produce silently-wrong audio embeddings, so refuse to load instead:
+        # every speech_embeddings / input_local / projection key must exist.
         self._assert_audio_tower_weights_present(loader, mappings)
         loader.load_weights_from_safetensors(mappings)
         logger.info("MiMoV2_5Embedding weights loaded successfully!")

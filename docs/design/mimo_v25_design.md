@@ -206,8 +206,6 @@ stage_args:
 
 ### 10.6 性能与依赖
 - **embed 未 JIT/分桶**:当前 embed forward 是 **eager**(`forward_wrapper` 未包 `jax.jit`)。原设计的 JIT + 形状分桶未落地;CPU eager 对小图/短音频可接受,但长视频(178 帧)极慢。
-- **长视频 OOM 边界**:V4 device 修复后整条 ViT 跑 CPU/host RAM,不再 TPU OOM;但长视频帧数大、CPU eager 慢,生产需限帧/分块策略。
-- **依赖未入镜像**:torch/torchvision/torchaudio + decord 目前部署时临时安装,待并入镜像。
 
 ### 10.7 超出本轮范围
 - **DP > 1**:每 stage 网格 `data` 轴恒 1,与核心 `dp_size` 冲突;需 `ici_parallelism=[dp_size, 芯片数//dp_size]` + 启动断言。本轮 **DP=1**。

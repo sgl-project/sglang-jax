@@ -4,7 +4,7 @@ Split out of ``embedding.py`` (design doc §5). Consumes discrete RVQ
 ``audio_codes`` (the host-side codec produces them) and runs the frozen
 per-channel ``speech_embeddings`` -> ``input_local_transformer`` (6-layer
 full-attention) -> 2-layer ``projection`` path, emitting one ``[hidden]`` row per
-LLM audio token. Image/video towers are intentionally out of scope this round.
+LLM audio token. The image/video tower lives in ``vision_encoder.py``.
 """
 
 from __future__ import annotations

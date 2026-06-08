@@ -240,8 +240,7 @@ class EmbedModelRunner(BaseModelRunner):
         # arrays on the *default* backend (TPU here), so without this the ViT's early
         # patch-embed reshape runs on TPU and allocates TPU HBM — which OOMs the AR
         # stage's chips on large (video) inputs. device_put onto the CPU mesh keeps the
-        # whole vision tower on host RAM. (Confirmed via [VISION-DEVICE] logging: input
-        # pixel_values was landing on TpuDevice while the ViT weights were on CpuDevice.)
+        # whole vision tower on host RAM.
         mesh = getattr(self, "mesh", None)
         if mesh is not None:
             from jax.sharding import NamedSharding

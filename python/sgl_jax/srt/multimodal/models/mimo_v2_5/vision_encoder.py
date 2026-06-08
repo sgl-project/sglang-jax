@@ -17,19 +17,6 @@ if TYPE_CHECKING:
     from sgl_jax.srt.utils.weight_utils import WeightMapping
 
 
-def convert_torch_conv3d_kernel_to_jax(weight: jax.Array) -> jax.Array:
-    """Convert PyTorch Conv3d kernel layout to Flax/JAX Conv layout.
-
-    PyTorch Conv3d stores kernels as:
-        [out_channels, in_channels, temporal, height, width]
-
-    Flax NNX Conv expects:
-        [temporal, height, width, in_channels, out_channels]
-    """
-    if weight.ndim != 5:
-        raise ValueError(f"Expected a 5D Conv3d kernel, got shape {weight.shape}.")
-    return jnp.transpose(weight, (2, 3, 4, 1, 0))
-
 
 def apply_rotary_pos_emb_vision(
     query: jax.Array,
@@ -659,14 +646,6 @@ def create_mimo_vision_weight_mappings(
             }
         )
     return mappings
-
-
-def to_mappings(
-    config,
-    source_prefix: str = "visual",
-    target_prefix: str = "",
-) -> dict[str, "WeightMapping"]:
-    return create_mimo_vision_weight_mappings(config, source_prefix, target_prefix)
 
 
 def load_weights_from_safetensors(model: nnx.Module, model_path: str, config) -> None:

@@ -2,8 +2,9 @@
 
 Split out of ``embedding.py`` (design doc §5). Each builder returns a
 ``{hf_key: WeightMapping}`` dict; :func:`build_embedding_weight_mappings`
-assembles the full map for ``MiMoV2_5Embedding`` (text embedding + audio tower).
-The vision tower mappings are intentionally omitted this round.
+assembles the text-embedding + audio-tower map for ``MiMoV2_5Embedding``. The
+vision-tower mappings live in ``vision_encoder.create_mimo_vision_weight_mappings``
+and are merged in by ``MiMoV2_5Embedding.load_weights``.
 """
 
 from __future__ import annotations
