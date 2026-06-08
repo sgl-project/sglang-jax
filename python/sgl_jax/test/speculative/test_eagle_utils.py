@@ -116,12 +116,12 @@ class TestVerifyTree(CustomTestCase):
     def test_base_spec_worker_overlap_entry_uses_verify_boundary(self):
         from sgl_jax.srt.speculative.base_worker import BaseSpecWorker
 
-        self.assertTrue(hasattr(BaseSpecWorker, "forward_batch_speculative_generation_overlap"))
-        source = inspect.getsource(BaseSpecWorker.forward_batch_speculative_generation_overlap)
+        self.assertTrue(hasattr(BaseSpecWorker, "forward_batch_speculative_decode_overlap"))
+        source = inspect.getsource(BaseSpecWorker.forward_batch_speculative_decode_overlap)
         self.assertIn("spec_decode_overlap", source)
         self.assertNotIn("spec_decode(", source)
 
-    def test_base_spec_worker_overlap_entry_rejects_prefill(self):
+    def test_base_spec_worker_decode_overlap_entry_rejects_prefill(self):
         from sgl_jax.srt.speculative.base_worker import BaseSpecWorker
 
         worker = BaseSpecWorker.__new__(BaseSpecWorker)
@@ -132,7 +132,7 @@ class TestVerifyTree(CustomTestCase):
         )
 
         with self.assertRaises(NotImplementedError):
-            worker.forward_batch_speculative_generation_overlap(batch)
+            worker.forward_batch_speculative_decode_overlap(batch)
 
     def test_spec_decode_future_result_contract_fields(self):
         from sgl_jax.srt.speculative import overlap_future
@@ -284,6 +284,23 @@ class TestVerifyTree(CustomTestCase):
 
         source = inspect.getsource(Scheduler.run_batch)
         self.assertIn("resolve_spec_decode_scheduler_fields", source)
+
+    def test_scheduler_spec_decode_overlap_calls_worker_overlap_entry(self):
+        from sgl_jax.srt.managers.scheduler import Scheduler
+
+        source = inspect.getsource(Scheduler.run_batch)
+        self.assertIn("can_use_spec_decode_overlap", source)
+        self.assertIn("forward_batch_speculative_decode_overlap", source)
+
+    def test_scheduler_spec_prefill_does_not_use_decode_scheduler_fields(self):
+        from sgl_jax.srt.managers.scheduler import Scheduler
+
+        source = inspect.getsource(Scheduler.run_batch)
+        extend_pos = source.index("batch.forward_mode.is_extend()")
+        decode_pos = source.index("get_spec_model_worker_batch")
+        resolve_pos = source.index("resolve_spec_decode_scheduler_fields")
+        self.assertGreater(resolve_pos, decode_pos)
+        self.assertGreater(decode_pos, extend_pos)
 
     def test_model_worker_client_exposes_target_worker_attributes_for_spec(self):
         from sgl_jax.srt.managers.tp_worker_overlap_thread import ModelWorkerClient

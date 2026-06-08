@@ -77,7 +77,10 @@ from sgl_jax.srt.multimodal.tokenizer_utils import resolve_tokenizer_subdir
 from sgl_jax.srt.precision_tracer import precision_tracer
 from sgl_jax.srt.server_args import PortArgs, ServerArgs
 from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
-from sgl_jax.srt.speculative.overlap_future import resolve_spec_decode_scheduler_fields
+from sgl_jax.srt.speculative.overlap_future import (
+    can_use_spec_decode_overlap,
+    resolve_spec_decode_scheduler_fields,
+)
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 from sgl_jax.srt.utils.common_utils import (
     configure_logger,
@@ -1921,16 +1924,25 @@ class Scheduler(
                     self.server_args.enable_static_lora,
                     draft_token_num=self.draft_worker.speculative_num_draft_tokens,
                 )
-            batch_output = self.draft_worker.forward_batch_speculative_generation(
-                model_worker_batch
-            )
+            if can_use_spec_decode_overlap(self.enable_overlap, self.spec_algorithm, batch):
+                batch_output, scheduler_fields = (
+                    self.draft_worker.forward_batch_speculative_decode_overlap(model_worker_batch)
+                )
+            else:
+                batch_output = self.draft_worker.forward_batch_speculative_generation(
+                    model_worker_batch
+                )
+                scheduler_fields = (
+                    resolve_spec_decode_scheduler_fields(batch_output)
+                    if batch.forward_mode.is_decode()
+                    else None
+                )
             per_rank_spec = ScheduleBatch._split_spec_info_per_rank(
                 batch_output.next_draft_input, model_worker_batch.real_bs_per_dp
             )
             for r, s in enumerate(per_rank_spec):
                 batch.reqs_info[r].spec_info = s
-            scheduler_fields = resolve_spec_decode_scheduler_fields(batch_output)
-            accept = scheduler_fields.accept_lens
+            accept = scheduler_fields.accept_lens if scheduler_fields is not None else None
             per_dp_bs = model_worker_batch.per_dp_bs_size
             for dp_rank, info in enumerate(batch.reqs_info):
                 if info.seq_lens is None or len(info.seq_lens) == 0:
@@ -1940,7 +1952,11 @@ class Scheduler(
                     info.seq_lens = info.seq_lens + accept[off : off + len(info.seq_lens)]
                 else:
                     info.seq_lens = info.seq_lens + 1
-            next_token_ids = scheduler_fields.next_token_ids
+            next_token_ids = (
+                scheduler_fields.next_token_ids
+                if scheduler_fields is not None
+                else np.asarray(jax.device_get(batch_output.next_token_ids))
+            )
             self._extract_dp_output_ids(next_token_ids, model_worker_batch, batch)
             logits_output = batch_output.logits_output
             cache_miss_count = batch_output.cache_miss_count

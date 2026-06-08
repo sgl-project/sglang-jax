@@ -118,7 +118,7 @@ class BaseSpecWorker:
 
     # -- Main entry point --
 
-    def forward_batch_speculative_generation_overlap(self, model_worker_batch: ModelWorkerBatch):
+    def forward_batch_speculative_decode_overlap(self, model_worker_batch: ModelWorkerBatch):
         if not model_worker_batch.forward_mode.is_decode():
             raise NotImplementedError("Spec overlap entry only supports decode batches.")
         if not (self._can_use_fused_spec_decode and model_worker_batch.sampling_info.is_all_greedy):
