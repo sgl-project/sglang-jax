@@ -269,6 +269,111 @@ class TestVerifyTree(CustomTestCase):
         self.assertIs(client.model_config, model_config)
         self.assertIs(client.model_runner, model_runner)
 
+    def test_overlap_queue_item_has_explicit_spec_worker_slot(self):
+        from sgl_jax.srt.managers.tp_worker_overlap_thread import OverlapForwardInput
+
+        fields = set(OverlapForwardInput.__dataclass_fields__)
+        self.assertEqual(
+            fields,
+            {
+                "model_worker_batch",
+                "future_token_ids_ct",
+                "sampling_metadata",
+                "forward_metadata",
+                "spec_worker",
+            },
+        )
+
+    def test_model_worker_client_spec_submit_uses_existing_queue(self):
+        from queue import Queue
+
+        from sgl_jax.srt.managers.tp_worker_overlap_thread import ModelWorkerClient
+
+        client = ModelWorkerClient.__new__(ModelWorkerClient)
+        client.input_queue = Queue()
+        spec_worker = object()
+        model_worker_batch = object()
+
+        result = client.forward_batch_speculative_generation(
+            spec_worker=spec_worker,
+            model_worker_batch=model_worker_batch,
+        )
+        forward_input = client.input_queue.get_nowait()
+
+        self.assertIsNone(result)
+        self.assertIs(forward_input.spec_worker, spec_worker)
+        self.assertIs(forward_input.model_worker_batch, model_worker_batch)
+
+    def test_model_worker_client_thread_runs_spec_payload_from_existing_queue(self):
+        from queue import Queue
+
+        from sgl_jax.srt.managers.tp_worker_overlap_thread import (
+            ModelWorkerClient,
+            OverlapForwardInput,
+        )
+
+        next_draft_input = SimpleNamespace(new_seq_lens=object())
+        batch_output = SimpleNamespace(
+            logits_output=object(),
+            next_token_ids=object(),
+            accept_lens=object(),
+            allocate_lens=object(),
+            next_draft_input=next_draft_input,
+            bid=13,
+            cache_miss_count=0,
+        )
+        model_worker_batch = object()
+        calls = []
+
+        class FakeSpecWorker:
+            def forward_batch_speculative_generation(self, batch):
+                calls.append(batch)
+                return batch_output
+
+        client = ModelWorkerClient.__new__(ModelWorkerClient)
+        client.input_queue = Queue()
+        client.output_queue = Queue()
+        client.input_queue.put(
+            OverlapForwardInput(
+                model_worker_batch=model_worker_batch,
+                spec_worker=FakeSpecWorker(),
+            )
+        )
+        client.input_queue.put(OverlapForwardInput(model_worker_batch=None))
+
+        client.forward_thread_func_()
+
+        result = client.output_queue.get_nowait()
+        self.assertEqual(calls, [model_worker_batch])
+        self.assertIs(result.next_draft_input, next_draft_input)
+        self.assertIs(result.new_seq_lens, next_draft_input.new_seq_lens)
+        self.assertEqual(result.bid, 13)
+
+    def test_model_worker_client_resolves_spec_result_from_existing_queue(self):
+        import threading
+        from queue import Queue
+
+        from sgl_jax.srt.managers.tp_worker_overlap_thread import ModelWorkerClient
+        from sgl_jax.srt.speculative.overlap_future import SpecDecodeFutureResult
+
+        result = SpecDecodeFutureResult(
+            logits_output=None,
+            next_token_ids=None,
+            accept_lens=None,
+            new_seq_lens=None,
+            allocate_lens=None,
+            next_draft_input=None,
+            bid=17,
+            cache_miss_count=0,
+        )
+        client = ModelWorkerClient.__new__(ModelWorkerClient)
+        client.output_queue = Queue()
+        client.output_queue.put(result)
+        launch_done = threading.Event()
+        launch_done.set()
+
+        self.assertIs(client.resolve_last_spec_batch_result(launch_done), result)
+
     def test_as_int32_array_keeps_host_metadata_on_host(self):
         from sgl_jax.srt.speculative import eagle_util
 
