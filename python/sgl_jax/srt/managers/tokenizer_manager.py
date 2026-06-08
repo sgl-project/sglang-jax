@@ -173,6 +173,7 @@ class TokenizerManager:
                 tokenizer_mode=server_args.tokenizer_mode,
                 trust_remote_code=server_args.trust_remote_code,
                 revision=server_args.revision,
+                tokenizer_backend=server_args.tokenizer_backend,
                 sub_dir=tokenizer_subdir,
             )
 

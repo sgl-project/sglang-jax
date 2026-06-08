@@ -109,6 +109,7 @@ class LogitsMetadata:
     extend_logprob_pruned_lens_cpu: list[int] | None = None
     top_logprobs_nums: list[int] | None = None
     extend_input_logprob_token_ids_device: jax.Array | None = None
+    input_logprob_indices_device: jax.Array | None = None
     token_ids_logprobs: list[list[int]] | None = None
 
     # logits and logprobs post processing
@@ -123,9 +124,11 @@ class LogitsMetadata:
             self.accept_lens,
             self.logits_indices,
             self.extend_input_logprob_token_ids_device,
+            self.input_logprob_indices_device,
             self.temperature,
             self.top_p,
         )
+        has_padded_input_logprob_indices = self.input_logprob_indices_device is not None
 
         aux_data = {
             "forward_mode": self.forward_mode,
@@ -133,9 +136,15 @@ class LogitsMetadata:
             "extend_return_logprob": self.extend_return_logprob,
             "extend_return_top_logprob": self.extend_return_top_logprob,
             "extend_token_ids_logprob": self.extend_token_ids_logprob,
-            "extend_seq_lens_cpu": self.extend_seq_lens_cpu,
-            "extend_logprob_start_lens_cpu": self.extend_logprob_start_lens_cpu,
-            "extend_logprob_pruned_lens_cpu": self.extend_logprob_pruned_lens_cpu,
+            "extend_seq_lens_cpu": (
+                None if has_padded_input_logprob_indices else self.extend_seq_lens_cpu
+            ),
+            "extend_logprob_start_lens_cpu": (
+                None if has_padded_input_logprob_indices else self.extend_logprob_start_lens_cpu
+            ),
+            "extend_logprob_pruned_lens_cpu": (
+                None if has_padded_input_logprob_indices else self.extend_logprob_pruned_lens_cpu
+            ),
             "top_logprobs_nums": self.top_logprobs_nums,
             "token_ids_logprobs": self.token_ids_logprobs,
             "temp_scaled_logprobs": self.temp_scaled_logprobs,
@@ -152,8 +161,9 @@ class LogitsMetadata:
         obj.accept_lens = children[1]
         obj.logits_indices = children[2]
         obj.extend_input_logprob_token_ids_device = children[3]
-        obj.temperature = children[4]
-        obj.top_p = children[5]
+        obj.input_logprob_indices_device = children[4]
+        obj.temperature = children[5]
+        obj.top_p = children[6]
 
         obj.forward_mode = aux_data["forward_mode"]
         obj.capture_hidden_mode = aux_data["capture_hidden_mode"]
@@ -201,10 +211,11 @@ class LogitsMetadata:
             extend_seq_lens=device_array(batch.extend_seq_lens, sharding=sharding),
             logits_indices=device_array(batch.logits_indices, sharding=sharding),
             accept_lens=(
-                device_array(batch.spec_info.accept_length, sharding=sharding)
-                if batch.spec_info is not None
-                and hasattr(batch.spec_info, "accept_length")
-                and batch.spec_info.accept_length is not None
+                device_array(batch.spec_info_padded.accept_length, sharding=sharding)
+                if batch.forward_mode.is_draft_extend()
+                and batch.spec_info_padded is not None
+                and hasattr(batch.spec_info_padded, "accept_length")
+                and batch.spec_info_padded.accept_length is not None
                 else None
             ),
             extend_seq_lens_cpu=extend_seq_lens_cpu,
@@ -218,6 +229,9 @@ class LogitsMetadata:
             token_ids_logprobs=batch.token_ids_logprobs,
             extend_input_logprob_token_ids_device=device_array(
                 batch.extend_input_logprob_token_ids, sharding=sharding
+            ),
+            input_logprob_indices_device=device_array(
+                batch.input_logprob_indices, sharding=sharding
             ),
         )
 
@@ -258,6 +272,28 @@ class LogitsProcessor(nnx.Module):
             in_specs=(P("data", "tensor"), P("data")),
             out_specs=P("data", "tensor"),
         )(logits, indices)
+
+    def _select_input_token_logprobs(
+        self, input_logprobs: jax.Array, token_ids: jax.Array | None
+    ) -> jax.Array:
+        # Keep the public input_token_logprobs API scalar-per-token. Returning
+        # full vocab rows here makes host memory scale as tokens * vocab_size.
+        # By the time we reach this function, extend_return_logprob is True
+        # (gated in __call__), so at least one req has extend_len - start_len
+        # > 0. Both the padded path (np.zeros over total_token_size in
+        # get_model_worker_batch) and the non-padded chunk concat produce a
+        # non-None token_ids in that case. A None here means an upstream
+        # regression dropped the gather ids — fail loudly rather than
+        # silently returning None to the user.
+        assert token_ids is not None, (
+            "extend_input_logprob_token_ids_device must be populated when "
+            "extend_return_logprob=True; got None"
+        )
+        token_ids = token_ids.reshape((-1,))
+        row_ids = np.arange(input_logprobs.shape[0], dtype=np.int64)
+        out_sharding = NamedSharding(self.mesh, P(None))
+        selected = input_logprobs.at[(row_ids, token_ids)].get(out_sharding=out_sharding)
+        return selected.reshape((input_logprobs.shape[0],))
 
     @named_scope
     def __call__(
@@ -302,39 +338,44 @@ class LogitsProcessor(nnx.Module):
             # 1. pruned_states: hidden states that we want logprobs from.
             # 2. sample_indices: Indices that have sampled tokens.
             # 3. input_logprob_indices: Indices that have input logprob tokens.
-            sample_index_pt = -1
-            sample_indices = []
-            input_logprob_indices_pt = 0
-            input_logprob_indices = []
-            pt, pruned_states = 0, []
+            if logits_metadata.input_logprob_indices_device is not None:
+                pruned_states = hidden_states
+                sample_indices = logits_metadata.logits_indices
+                input_logprob_indices = logits_metadata.input_logprob_indices_device
+            else:
+                sample_index_pt = -1
+                sample_indices = []
+                input_logprob_indices_pt = 0
+                input_logprob_indices = []
+                pt, pruned_states = 0, []
 
-            for extend_logprob_start_len, extend_len in zip(
-                logits_metadata.extend_logprob_start_lens_cpu,
-                logits_metadata.extend_seq_lens_cpu,
-            ):
-                start_len = extend_logprob_start_len
-                pruned_states.append(hidden_states[pt + start_len : pt + extend_len])
-                pt += extend_len
-                sample_index_pt += extend_len - start_len
-                sample_indices.append(sample_index_pt)
-                input_logprob_indices.extend(
-                    [
-                        input_logprob_indices_pt + i
-                        for i in range(extend_len - extend_logprob_start_len)
-                    ]
+                for extend_logprob_start_len, extend_len in zip(
+                    logits_metadata.extend_logprob_start_lens_cpu,
+                    logits_metadata.extend_seq_lens_cpu,
+                ):
+                    start_len = extend_logprob_start_len
+                    pruned_states.append(hidden_states[pt + start_len : pt + extend_len])
+                    pt += extend_len
+                    sample_index_pt += extend_len - start_len
+                    sample_indices.append(sample_index_pt)
+                    input_logprob_indices.extend(
+                        [
+                            input_logprob_indices_pt + i
+                            for i in range(extend_len - extend_logprob_start_len)
+                        ]
+                    )
+                    input_logprob_indices_pt += extend_len - start_len
+
+                pruned_states = jnp.concat(pruned_states)
+                sample_indices = device_array(
+                    np.array(
+                        sample_indices,
+                        dtype=np.int64,
+                    ),
                 )
-                input_logprob_indices_pt += extend_len - start_len
-
-            pruned_states = jnp.concat(pruned_states)
-            sample_indices = device_array(
-                np.array(
-                    sample_indices,
-                    dtype=np.int64,
-                ),
-            )
-            input_logprob_indices = device_array(
-                np.array(input_logprob_indices, dtype=np.int64),
-            )
+                input_logprob_indices = device_array(
+                    np.array(input_logprob_indices, dtype=np.int64),
+                )
 
         # Compute logits for both input and sampled tokens.
         logits = self._get_logits(pruned_states, lm_head)
@@ -383,31 +424,34 @@ class LogitsProcessor(nnx.Module):
             del hidden_states, logits
 
             # Normalize the logprob w/o temperature, top-p
-            pruned_lens = device_array(
-                np.array(
-                    logits_metadata.extend_logprob_pruned_lens_cpu,
-                ),
-            )
-            if logits_metadata.temp_scaled_logprobs:
-                logits_metadata.temperature = jnp.repeat(
-                    logits_metadata.temperature.reshape(-1),
-                    pruned_lens,
-                ).reshape(-1, 1)
-            if logits_metadata.top_p_normalized_logprobs:
-                logits_metadata.top_p = jnp.repeat(
-                    logits_metadata.top_p,
-                    pruned_lens,
+            if logits_metadata.temp_scaled_logprobs or logits_metadata.top_p_normalized_logprobs:
+                pruned_lens = device_array(
+                    np.array(
+                        logits_metadata.extend_logprob_pruned_lens_cpu,
+                    ),
                 )
+                if logits_metadata.temp_scaled_logprobs:
+                    logits_metadata.temperature = jnp.repeat(
+                        logits_metadata.temperature.reshape(-1),
+                        pruned_lens,
+                    ).reshape(-1, 1)
+                if logits_metadata.top_p_normalized_logprobs:
+                    logits_metadata.top_p = jnp.repeat(
+                        logits_metadata.top_p,
+                        pruned_lens,
+                    )
             input_logprobs = self.compute_temp_top_p_normalized_logprobs(
                 input_logprobs, logits_metadata
             )
 
-            # Get the logprob of top-k tokens
+            # Get the logprob of top-k tokens. Shared impl lives in sampler;
+            # local import avoids a top-level cycle (sampler imports this module).
             if logits_metadata.extend_return_top_logprob:
-                (
-                    input_top_logprobs_val,
-                    input_top_logprobs_idx,
-                ) = self.get_top_logprobs(input_logprobs, logits_metadata)
+                from sgl_jax.srt.layers.sampler import get_top_logprobs
+
+                input_top_logprobs_val, input_top_logprobs_idx = get_top_logprobs(
+                    input_logprobs, logits_metadata.top_logprobs_nums, self.mesh
+                )
             else:
                 input_top_logprobs_val = input_top_logprobs_idx = None
 
@@ -419,12 +463,10 @@ class LogitsProcessor(nnx.Module):
             else:
                 input_token_ids_logprobs_val = input_token_ids_logprobs_idx = None
 
-            out_sharding = NamedSharding(self.mesh, P(None))
-            indices = (
-                np.arange(input_logprobs.shape[0]),
+            input_token_logprobs = self._select_input_token_logprobs(
+                input_logprobs,
                 logits_metadata.extend_input_logprob_token_ids_device,
             )
-            input_token_logprobs = input_logprobs.at[indices].get(out_sharding=out_sharding)
 
             return LogitsProcessorOutput(
                 next_token_logits=sampled_logits,
@@ -435,16 +477,6 @@ class LogitsProcessor(nnx.Module):
                 input_token_ids_logprobs_val=input_token_ids_logprobs_val,
                 input_token_ids_logprobs_idx=input_token_ids_logprobs_idx,
             )
-
-    @staticmethod
-    def get_top_logprobs(all_logprobs: jax.Array, logits_metadata: LogitsMetadata):
-        # Return device-side dense `[total_pruned_tokens, max_k]` tensors.
-        # XLA can't stack ragged per-req lists; per-req slicing is done on
-        # host in tp_worker after device_get, using
-        # `extend_logprob_pruned_lens_cpu` and `top_logprobs_nums`.
-        max_k = max(logits_metadata.top_logprobs_nums)
-        values, indices = jax.lax.top_k(all_logprobs, max_k)
-        return values, indices
 
     def compute_temp_top_p_normalized_logprobs(
         self, last_logits: jax.Array, logits_metadata: LogitsMetadata
@@ -485,6 +517,10 @@ class LogitsProcessor(nnx.Module):
         hidden_states, embedding = lm_head.promote_dtype(
             (hidden_states, lm_head.embedding.value),
             dtype=lm_head.dtype,
+        )
+        hidden_states = jax.sharding.reshard(
+            hidden_states,
+            NamedSharding(self.mesh, P("data", None)),
         )
 
         logits = jnp.dot(

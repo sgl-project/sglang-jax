@@ -1,0 +1,157 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1400 1820" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#334155"/>
+    </marker>
+    <marker id="arrowGreen" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#15803d"/>
+    </marker>
+    <marker id="arrowOrange" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#b45309"/>
+    </marker>
+    <style>
+      .title    { font-size: 22px; font-weight: 800; fill: #0f172a; }
+      .subtitle { font-size: 13px; fill: #475569; }
+      .modTitle { font-size: 15px; font-weight: 700; fill: #0f172a; }
+      .modSub   { font-size: 13px; fill: #1e293b; }
+      .modPath  { font-size: 11.5px; fill: #475569; font-family: 'SF Mono', Menlo, Consolas, monospace; }
+      .code     { font-size: 13px; fill: #0f172a; font-family: 'SF Mono', Menlo, Consolas, monospace; }
+      .codeKey  { font-size: 13px; fill: #b45309; font-family: 'SF Mono', Menlo, Consolas, monospace; font-weight: 700; }
+      .edge     { font-size: 12px; fill: #1e293b; font-weight: 600; }
+      .note     { font-size: 11.5px; fill: #64748b; font-style: italic; }
+      .tag      { font-size: 10.5px; font-weight: 700; fill: #ffffff; }
+    </style>
+  </defs>
+
+  <!-- title -->
+  <text x="40" y="40" class="title">KV Cache Allocation and Prefix Match Flow</text>
+  <text x="40" y="62" class="subtitle">alloc_token_slots() full flow: Prefix match → LRU eviction → free page allocation</text>
+
+  <!-- ============== STEP 1: Match Prefix ============== -->
+  <g>
+    <rect x="40" y="100" width="1320" height="160" rx="10" fill="#ede9fe" stroke="#6d28d9" stroke-width="2"/>
+    <rect x="40" y="100" width="1320" height="28" rx="10" fill="#6d28d9"/>
+    <text x="56" y="120" class="tag">STEP 1 · Prefix Match</text>
+    <text x="56" y="152" class="modTitle">tree_cache.match_prefix(key: RadixKey | list[int])</text>
+    <text x="56" y="172" class="modPath">mem_cache/radix_cache.py</text>
+    <text x="56" y="192" class="modSub">• Find longest matching Prefix for <tspan class="codeKey">key</tspan> in the Radix Tree</text>
+    <text x="56" y="212" class="modSub">• Returns <tspan class="codeKey">MatchResult(prefix_len, kv_indices)</tspan></text>
+    <text x="56" y="232" class="modSub">• On match, reuse cached KV Cache and skip recomputation</text>
+    <text x="56" y="252" class="note">Radix Tree matches token-by-token from root, stops at branch point. Time complexity O(L)</text>
+  </g>
+
+  <path d="M 700 260 L 700 290" stroke="#334155" stroke-width="2.5" fill="none" marker-end="url(#arrow)"/>
+
+  <!-- ============== STEP 2: Calculate Required Slots ============== -->
+  <g>
+    <rect x="40" y="298" width="1320" height="140" rx="10" fill="#dcfce7" stroke="#15803d" stroke-width="2"/>
+    <rect x="40" y="298" width="1320" height="28" rx="10" fill="#15803d"/>
+    <text x="56" y="318" class="tag">STEP 2 · Compute Required Slots</text>
+    <text x="56" y="350" class="modTitle">num_new_tokens = num_tokens - prefix_len</text>
+    <text x="56" y="370" class="modPath">mem_cache/common.py:alloc_token_slots()</text>
+    <text x="56" y="390" class="modSub">• <tspan class="codeKey">num_tokens</tspan>: total tokens needed for this Forward</text>
+    <text x="56" y="410" class="modSub">• <tspan class="codeKey">prefix_len</tspan>: length of the matched Prefix</text>
+    <text x="56" y="430" class="modSub">• <tspan class="codeKey">num_new_tokens</tspan>: number of new Token Slots to allocate</text>
+  </g>
+
+  <path d="M 700 438 L 700 468" stroke="#334155" stroke-width="2.5" fill="none" marker-end="url(#arrow)"/>
+
+  <!-- ============== STEP 3: Check Available Space ============== -->
+  <g>
+    <rect x="40" y="476" width="1320" height="140" rx="10" fill="#fef3c7" stroke="#b45309" stroke-width="2"/>
+    <rect x="40" y="476" width="1320" height="28" rx="10" fill="#b45309"/>
+    <text x="56" y="496" class="tag">STEP 3 · Call evict_from_tree_cache</text>
+    <text x="56" y="528" class="modTitle">evict_from_tree_cache(tree_cache, num_tokens, dp_rank=0)</text>
+    <text x="56" y="548" class="modPath">mem_cache/common.py</text>
+    <text x="56" y="568" class="modSub">• Always called; the function checks internally whether available space suffices</text>
+    <text x="56" y="588" class="modSub">• If enough space, returns directly; otherwise triggers LRU eviction</text>
+    <text x="56" y="608" class="note">Paged Allocator: allocates by Page (default page_size=1, set by server_args)</text>
+  </g>
+
+  <path d="M 700 616 L 700 646" stroke="#b45309" stroke-width="2.5" fill="none" marker-end="url(#arrowOrange)"/>
+  <text x="712" y="638" class="edge">internal space check →</text>
+
+  <!-- ============== STEP 4: LRU Eviction ============== -->
+  <g>
+    <rect x="40" y="654" width="1320" height="180" rx="10" fill="#fef3c7" stroke="#b45309" stroke-width="2"/>
+    <rect x="40" y="654" width="1320" height="28" rx="10" fill="#b45309"/>
+    <text x="56" y="674" class="tag">STEP 4 · LRU Eviction</text>
+    <text x="56" y="706" class="modTitle">tree_cache.evict(num_tokens, dp_rank=None)</text>
+    <text x="56" y="726" class="modPath">mem_cache/radix_cache.py</text>
+    <text x="56" y="746" class="modSub">• Evict from leaf nodes of the Radix Tree in LRU order</text>
+    <text x="56" y="766" class="modSub">• Only leaf nodes are evicted (shared Prefixes protected)</text>
+    <text x="56" y="786" class="modSub">• Release KV Cache indices held by evicted nodes</text>
+    <text x="56" y="806" class="modSub">• Internally calls <tspan class="codeKey">allocator.free(indices)</tspan> to return slots to free list</text>
+    <text x="56" y="826" class="note">evictable_size = allocator.available_size() + size of evictable Cache</text>
+  </g>
+
+  <path d="M 700 834 L 700 864" stroke="#334155" stroke-width="2.5" fill="none" marker-end="url(#arrow)"/>
+
+  <!-- ============== STEP 5: Allocate New Slots ============== -->
+  <g>
+    <rect x="40" y="872" width="1320" height="160" rx="10" fill="#dcfce7" stroke="#15803d" stroke-width="2"/>
+    <rect x="40" y="872" width="1320" height="28" rx="10" fill="#15803d"/>
+    <text x="56" y="892" class="tag">STEP 5 · Allocate New Slots</text>
+    <text x="56" y="924" class="modTitle">new_kv_indices = allocator.alloc(num_new_tokens)</text>
+    <text x="56" y="944" class="modPath">mem_cache/allocator.py</text>
+    <text x="56" y="964" class="modSub">• Allocate <tspan class="codeKey">num_new_tokens</tspan> slots from the Allocator's free list</text>
+    <text x="56" y="984" class="modSub">• Paged Allocator: allocates whole pages, returns Page IDs</text>
+    <text x="56" y="1004" class="modSub">• Token Allocator: allocates individual Token Slots</text>
+    <text x="56" y="1024" class="note">If allocation fails (still not enough), returns None and triggers Retract or Abort</text>
+  </g>
+
+  <path d="M 700 1032 L 700 1062" stroke="#334155" stroke-width="2.5" fill="none" marker-end="url(#arrow)"/>
+
+  <!-- ============== STEP 6: Combine Indices ============== -->
+  <g>
+    <rect x="40" y="1070" width="1320" height="160" rx="10" fill="#dcfce7" stroke="#15803d" stroke-width="2"/>
+    <rect x="40" y="1070" width="1320" height="28" rx="10" fill="#15803d"/>
+    <text x="56" y="1090" class="tag">STEP 6 · Caller Combines Indices</text>
+    <text x="56" y="1122" class="modTitle">Combination happens at the schedule_batch caller</text>
+    <text x="56" y="1142" class="modPath">mem_cache/common.py only returns new_kv_indices</text>
+    <text x="56" y="1162" class="modSub">• Callers like ScheduleBatch.prepare_for_extend() concatenate Prefix indices with new ones</text>
+    <text x="56" y="1182" class="modSub">• Build <tspan class="codeKey">out_cache_loc</tspan> (write positions) and <tspan class="codeKey">cache_loc</tspan> (read positions)</text>
+    <text x="56" y="1202" class="modSub">• Write to <tspan class="codeKey">req_to_token_pool</tspan> for use during model Forward</text>
+    <text x="56" y="1222" class="note">out_cache_loc points to newly allocated Slots; cache_loc covers Prefix + new Slots</text>
+  </g>
+
+  <path d="M 700 1230 L 700 1260" stroke="#15803d" stroke-width="2.5" fill="none" marker-end="url(#arrowGreen)"/>
+
+  <!-- ============== STEP 7: Return Success ============== -->
+  <g>
+    <rect x="40" y="1268" width="1320" height="100" rx="10" fill="#dcfce7" stroke="#15803d" stroke-width="2"/>
+    <rect x="40" y="1268" width="1320" height="28" rx="10" fill="#15803d"/>
+    <text x="56" y="1288" class="tag">STEP 7 · Return Success</text>
+    <text x="56" y="1320" class="modTitle">return True</text>
+    <text x="56" y="1340" class="modPath">KV Cache allocation succeeded</text>
+    <text x="56" y="1360" class="modSub">Request can join the Batch and run model Forward</text>
+  </g>
+
+  <!-- Footer notes -->
+  <g>
+    <rect x="40" y="1400" width="1320" height="380" rx="10" fill="#e0e7ff" stroke="#4f46e5" stroke-width="2"/>
+    <rect x="40" y="1400" width="1320" height="28" rx="10" fill="#4f46e5"/>
+    <text x="56" y="1420" class="tag">Key Design Notes</text>
+
+    <text x="56" y="1452" class="modTitle">Radix Tree Advantages</text>
+    <text x="56" y="1472" class="modSub">• Longest prefix match: O(L) time, matches token-by-token from root</text>
+    <text x="56" y="1490" class="modSub">• Structural sharing: shared Prefix stored once, node count = O(branch points)</text>
+    <text x="56" y="1508" class="modSub">• LRU eviction protects shared Prefix: only leaves evicted, internal nodes with any child stay</text>
+
+    <text x="56" y="1536" class="modTitle">Four-Layer Architecture</text>
+    <text x="56" y="1556" class="modSub">• <tspan class="codeKey">Memory Pool</tspan>: device-side JAX Array storing actual KV data</text>
+    <text x="56" y="1574" class="modSub">• <tspan class="codeKey">Allocator</tspan>: maintains free Token/Page list, performs alloc/free</text>
+    <text x="56" y="1592" class="modSub">• <tspan class="codeKey">Prefix Cache</tspan>: Radix Tree, manages Prefix sharing and LRU eviction</text>
+    <text x="56" y="1610" class="modSub">• <tspan class="codeKey">Coordination</tspan>: alloc_token_slots() orchestrates the three layers</text>
+
+    <text x="56" y="1638" class="modTitle">Paged vs Token Allocator</text>
+    <text x="56" y="1658" class="modSub">• Paged: allocates by Page (page_size from server_args, default 1), reduces fragmentation, suits long sequences</text>
+    <text x="56" y="1676" class="modSub">• Token: allocates per single Token, flexible but may fragment</text>
+
+    <text x="56" y="1704" class="modTitle">Failure Handling</text>
+    <text x="56" y="1724" class="modSub">• On allocation failure, Scheduler triggers Retract (releases newest request in running_batch)</text>
+    <text x="56" y="1742" class="modSub">• If still insufficient after Retract, Abort some requests</text>
+    <text x="56" y="1760" class="modSub">• Ensures the system keeps running under memory pressure</text>
+  </g>
+</svg>

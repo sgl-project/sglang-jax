@@ -1,5 +1,6 @@
 """GMM-based Expert-Parallel MoE layer and weight mapping utilities."""
 
+import math
 from functools import partial
 
 import jax
@@ -15,7 +16,6 @@ from sgl_jax.srt.kernels.gmm.megablox_gmm_backend import gmm
 # Re-export for backward compatibility: external code imports from this module.
 from sgl_jax.srt.layers.fused_moe import FusedEPMoE  # noqa: F401
 from sgl_jax.srt.layers.gate import GateLogit, TopK  # noqa: F401
-from sgl_jax.srt.utils.parallel_utils import should_scatter
 from sgl_jax.srt.utils.profiling_utils import named_scope
 from sgl_jax.srt.utils.quantization.quantization_utils import (
     quantize_tensor,
@@ -40,7 +40,6 @@ class EPMoE(nnx.Module):
         quantization_config=None,
         physical_to_logical_map: "jax.Array | None" = None,
         pre_gather_quant_dtype=None,
-        enable_sequence_parallel=False,
     ):
         self.num_experts_per_tok = num_experts_per_tok
         self.physical_to_logical_map = physical_to_logical_map
@@ -61,7 +60,6 @@ class EPMoE(nnx.Module):
         self.mesh = mesh
         self.activation = activation
         self.hidden_size = hidden_size
-        self.enable_sequence_parallel = enable_sequence_parallel
 
         # Get quantization settings from config
         self.quantized_dtype = (
@@ -78,7 +76,7 @@ class EPMoE(nnx.Module):
             raise ValueError(
                 f"num_experts({self.num_experts}) must be divisible by ep_size ({self.ep_size})"
             )
-        world_size = self.mesh.shape.get("data", 1) * mesh.shape.get("tensor", 1)
+        world_size = math.prod(self.mesh.shape.values())
         self.tp_size = world_size // self.ep_size
         self.experts_per_device = self.num_experts // self.ep_size
 
@@ -188,6 +186,13 @@ class EPMoE(nnx.Module):
                         f"Unsupported {scale_name} shape {scale.shape} for weight shape {weight.shape}. "
                         f"Expected k_blocks dimension to be 1 or {expected_k_blocks}."
                     )
+            # FIXME(jax-upgrade): incoming sharding is typically P("expert", None, None, None) —
+            # the EPMoE weight loader passes a 3-tuple ("expert", None, None) that JAX pads
+            # with None on the 4D array — which doesn't textually match the downstream
+            # shard_map in_specs P("expert", None, None, "tensor"). jax 0.8.1 accepts this
+            # because the "tensor" axis is size 1 (ep_size == world_size); jax 0.10.x checks
+            # strictly and will raise. Fix by reshard'ing here like the ndim==3 branches do,
+            # or fix the loader to emit a full 4-tuple.
             return scale
 
         if scale.ndim == 2 and scale.shape == (num_experts, out_dim):
@@ -405,22 +410,27 @@ class EPMoE(nnx.Module):
             )
 
     @named_scope
-    def __call__(self, hidden_states, topk_weights, topk_ids) -> jax.Array:
-        # Activation quantization is now handled per-GEMM inside _gmm_compute
-        # (aligned with sglang-gpu scheme: quantize before each GEMM, dequantize after)
-
-        # Decide once whether SP should reduce-scatter the post-MoE result.
-        # Three things downstream consume this: the shard_map ``out_specs``,
-        # ``_forward``'s ``psum`` vs ``psum_scatter`` choice, and the
-        # post-shard_map reshard back to the original mesh. They MUST agree
-        # — if they ever diverge, ``out_specs`` lies about what the kernel
-        # produced and shard_map concatenates duplicates (see the bug fixed
-        # in ``QuantizedLinear``). Safe today only because input is
-        # pre-replicated to ``P(None)``; hoisting the decision keeps it safe
-        # if that ever changes.
-        do_scatter = self.enable_sequence_parallel and should_scatter(
-            hidden_states.shape[0], self.tp_size
+    def __call__(
+        self,
+        hidden_states,
+        topk_weights,
+        topk_ids,
+        *,
+        out_sharding: jax.sharding.NamedSharding | None = None,
+    ) -> jax.Array:
+        if out_sharding is None:
+            out_sharding = jax.sharding.NamedSharding(self.mesh, P(*([None] * hidden_states.ndim)))
+        # Translate the caller's target sharding (on self.mesh: data,tensor)
+        # into shard_map out_specs (on self.moe_mesh: expert,tensor). Only
+        # 'tensor' is shared between the two meshes; everything else is
+        # irrelevant inside the per-expert shard_map context.
+        out_specs = P(
+            *[
+                "tensor" if (s == "tensor" or (isinstance(s, tuple) and "tensor" in s)) else None
+                for s in out_sharding.spec
+            ]
         )
+        scatter_on_tensor = "tensor" in out_specs
 
         # Run MoE computation on the expert-parallel mesh
         with jax.sharding.use_abstract_mesh(self.updated_mesh):
@@ -445,9 +455,8 @@ class EPMoE(nnx.Module):
                 scale_name="wo_scale",
             )
 
-            out_specs = P("tensor", None) if do_scatter else P(None)
             result = shard_map(
-                partial(self._forward, do_scatter=do_scatter),
+                partial(self._forward, scatter_on_tensor=scatter_on_tensor),
                 mesh=self.moe_mesh,
                 in_specs=(
                     P(None),
@@ -483,14 +492,10 @@ class EPMoE(nnx.Module):
                 None,
             )
 
-        # Reshard result back to original mesh. When the scatter fired inside
-        # shard_map the token dim is already striped across moe_mesh's
-        # "tensor" axis; preserve that by combining ``"data"`` with
-        # ``"tensor"`` on the original mesh so the next decoder layer keeps
-        # the SP shard. Otherwise fall back to DP-only on ``"data"``.
-        token_axis = ("data", "tensor") if do_scatter else "data"
-        out_pspec = P(token_axis, *([None] * (result.ndim - 1)))
-        return jax.sharding.reshard(result, jax.sharding.NamedSharding(self.mesh, out_pspec))
+        # The shard_map ran under updated_mesh (expert, tensor); land back on
+        # the original mesh so downstream ops (residual add, layernorm) see a
+        # consistent context.
+        return jax.sharding.reshard(result, out_sharding)
 
     def _forward(
         self,
@@ -507,10 +512,9 @@ class EPMoE(nnx.Module):
         w1_kernel_bias=None,
         wo_kernel_bias=None,
         *,
-        do_scatter: bool = False,
+        scatter_on_tensor: bool = False,
     ):
         expert_shard_id = jax.lax.axis_index("expert")
-
         if hidden_states.ndim == 2:
             total_tokens = hidden_states.shape[0]
             batch_size, seq_len = 1, total_tokens
@@ -550,13 +554,11 @@ class EPMoE(nnx.Module):
             seq_len,
         )
 
-        # All-reduce after unpermute: communication volume is (T, hidden_size)
-        # instead of (T * top_k, hidden_size), reducing by a factor of top_k.
-        # ``do_scatter`` is decided once in ``__call__`` so this branch and
-        # the outer ``out_specs`` can never disagree.
+        # Reduce on the "tensor" axis. RS (psum_scatter) when caller asked
+        # for SP layout on the token dim, AR (psum) otherwise. The matching
+        # out_specs is set in __call__ from the same source of truth.
         if self.tp_size > 1:
-            if do_scatter:
-                # scatter on sequence/token dimension
+            if scatter_on_tensor:
                 output = jax.lax.psum_scatter(output, "tensor", scatter_dimension=0, tiled=True)
             else:
                 output = jax.lax.psum(output, "tensor")
@@ -596,22 +598,15 @@ class EPMoE(nnx.Module):
         else:
             x = inputs_2d[token_indices].astype(self.dtype)
 
-        # TODO(Qinghan): DeepSeek-V2-Lite has num_experts_per_tok=6, so with
-        # the default power-of-2 bs bucketing `padded_bs * 6` can land on a
-        # value > 16 that isn't a multiple of 16 (e.g. bs=4 -> size_m=24),
-        # which is why this padding is necessary. Models with power-of-2
-        # top_k (Grok=2, DeepSeek-V3=8, Qwen3-MoE=8) wouldn't need it.
-        from jax.experimental.pallas import tpu as pltpu
-
-        sublane_align = pltpu.get_tpu_info().get_sublane_tiling(x.dtype)
-        # TODO: remove once bucketing guarantees total_tokens*top_k divisible by GMM tile_m=128.
-        gmm_tile_m = 128
-        align = max(sublane_align, gmm_tile_m)
-        pad_size = (-x.shape[0]) % align
-        if pad_size > 0:
-            x = jnp.pad(x, ((0, pad_size), (0, 0)))
-            group_sizes = group_sizes.at[-1].add(pad_size)
-
+        # NOTE: do NOT pad LHS / bump group_sizes here. The megablox backend
+        # ``gmm`` (sgl_jax/srt/kernels/gmm/megablox_gmm_backend.py:67-73)
+        # already pads ``lhs`` to its required alignment (32 for v2, 128 for
+        # v1), bumps ``group_sizes[-1]`` accordingly, and slices the output
+        # back to the original ``m`` afterwards. An outer pre-pad is at best
+        # redundant; in practice the previous workaround pre-padded to a
+        # hard-coded ``128`` which forced v2 (alignment=32) into a 4x larger
+        # tile, hit a kernel auto-tiler edge case at decode bs=8 / top_k=8
+        # (m=64 -> 128) and triggered an on-device SparseCore halt.
         group_sizes = group_sizes.astype(jnp.int32)
         act_q_dtype = self.activation_quantized_dtype
 

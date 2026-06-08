@@ -305,7 +305,7 @@ def create_mla_forward_batch(
         real_bs_per_dp=[len(lens)],
         dp_size=1,
         per_dp_bs_size=len(lens),
-        spec_info=None,
+        spec_info_padded=None,
     )
 
     fb = ForwardBatch(

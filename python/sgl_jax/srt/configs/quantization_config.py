@@ -107,6 +107,26 @@ class QuantizationConfig:
     weight_block_size: tuple[int, int] | None = None
     allow_narrow_n_blockwise: bool = False
 
+    def to_dict(self) -> dict:
+        # Required by transformers.PretrainedConfig.to_json_string when this
+        # object is attached as hf_config.quantization_config and the config is
+        # repr'd (e.g. inside JAX_EXPLAIN_CACHE_MISSES diagnostics).
+        return {
+            "linear_rules": self.linear_rules,
+            "moe_weight_dtype": (
+                str(self.moe_weight_dtype) if self.moe_weight_dtype is not None else None
+            ),
+            "moe_activation_dtype": (
+                str(self.moe_activation_dtype) if self.moe_activation_dtype is not None else None
+            ),
+            "is_static_checkpoint": self.is_static_checkpoint,
+            "ignored_layers": self.ignored_layers,
+            "weight_block_size": (
+                list(self.weight_block_size) if self.weight_block_size is not None else None
+            ),
+            "allow_narrow_n_blockwise": self.allow_narrow_n_blockwise,
+        }
+
     @classmethod
     def from_yaml(cls, yaml_path: str) -> "QuantizationConfig":
         """Load quantization config from a YAML file.

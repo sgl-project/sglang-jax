@@ -634,9 +634,6 @@ class TestReturnRoutedExperts(CustomTestCase):
                 "2",
                 "--enable-single-process",
             ],
-            env={
-                "JAX_COMPILATION_CACHE_DIR": "/tmp/jit_cache",
-            },
         )
 
         try:

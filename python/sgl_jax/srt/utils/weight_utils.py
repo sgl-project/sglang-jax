@@ -37,6 +37,20 @@ if not hasattr(np, "float8_e5m2"):
     np.float8_e5m2 = ml_dtypes.float8_e5m2
 
 
+# safetensors header stores tensor dtype as a string. Map to jax dtype.
+# Kept in one place because multiple callers used to inline the same dict.
+_SAFETENSORS_DTYPE_TO_JAX: dict[str, jnp.dtype] = {
+    "BF16": jnp.bfloat16,
+    "F16": jnp.float16,
+    "F32": jnp.float32,
+    "I64": jnp.int64,
+    "I32": jnp.int32,
+    "BOOL": jnp.bool_,
+    "F8_E4M3": jnp.float8_e4m3fn,
+    "F8_E5M2": jnp.float8_e5m2,
+}
+
+
 def _reinterpret_dtype_if_needed(data: np.ndarray, target_dtype: jnp.dtype) -> np.ndarray:
     if data.dtype == np.uint8:
         if target_dtype == jnp.float8_e4m3fn:
@@ -136,18 +150,23 @@ class WeightLoader:
         self.mesh = mesh
         self.dtype = dtype
         self.dummy_mode = getattr(model_config, "_dummy_mode", False)
+        self._weight_info_cache: dict[str, list[dict]] | None = None
         if hasattr(model_config, "num_attention_heads"):
             self.num_heads = model_config.num_attention_heads
             # Use original count for replication logic
             self.num_kv_heads = model_config.get_total_num_kv_heads()
             self.hidden_size = model_config.hidden_size
-            self.head_dim_original = getattr(
-                model_config, "head_dim", self.hidden_size // self.num_heads
-            )
+            # Read head_dim / v_head_dim from hf_text_config rather than model_config:
+            # patch_model_config writes mc.head_dim for KV-cache / MemoryPools sizing,
+            # but the loader needs the per-layer truth for split-QKV weight slicing.
+            # hf_text_config stays unpatched so split-QKV slicing is correct for
+            # hybrid-attention models.
+            hf_cfg = getattr(model_config, "hf_text_config", model_config)
+            self.head_dim_original = getattr(hf_cfg, "head_dim", self.hidden_size // self.num_heads)
 
             self.head_dim_pad = (self.head_dim_original + 127) // 128 * 128 - self.head_dim_original
             self.head_dim = self.head_dim_original
-            self.v_head_dim = getattr(model_config, "v_head_dim", self.head_dim_original)
+            self.v_head_dim = getattr(hf_cfg, "v_head_dim", self.head_dim_original)
         if hasattr(self.mesh, "shape") and "tensor" in self.mesh.shape:
             self.sharding_size = self.mesh.shape["tensor"]
         else:
@@ -181,6 +200,10 @@ class WeightLoader:
             return True
         ignored = quant_cfg.ignored_layers or []
         return any(hf_path == ig or hf_path.endswith(f".{ig}") for ig in ignored)
+
+    def has_weight_on_disk(self, hf_key: str) -> bool:
+        """Return whether a concrete HF weight key exists in the safetensors files."""
+        return hf_key in self._scan_weight_info()
 
     # ------------------------------------------------------------------
     # Post-load hooks: dequant FP8 → BF16, KV head replication
@@ -552,8 +575,11 @@ class WeightLoader:
 
         head_dim = config.head_dim
         v_head_dim = getattr(config, "v_head_dim", head_dim)
-        num_heads = config.num_attention_heads
-        num_kv_heads = config.num_key_value_heads
+        full_num_heads = config.num_attention_heads
+        full_num_kv_heads = config.num_key_value_heads
+        swa_num_heads = getattr(config, "swa_num_attention_heads", full_num_heads)
+        swa_num_kv_heads = getattr(config, "swa_num_key_value_heads", full_num_kv_heads)
+        hybrid_layer_pattern = getattr(config, "hybrid_layer_pattern", None)
 
         quant_cfg = getattr(config, "quantization_config", None)
         block_size = int(quant_cfg.weight_block_size[0]) if quant_cfg else 128
@@ -561,6 +587,17 @@ class WeightLoader:
         tp_sharding = NamedSharding(self.mesh, P(None, "tensor"))
 
         for layer_idx in sorted(fused_qkv_buffers.keys()):
+            # Hybrid SWA/full-attn models (e.g. MiMo-V2.5) can have different
+            # num_kv_heads per layer; pick the correct head counts based on
+            # hybrid_layer_pattern (1=SWA, 0=full).
+            is_swa = (
+                hybrid_layer_pattern is not None
+                and layer_idx < len(hybrid_layer_pattern)
+                and hybrid_layer_pattern[layer_idx] == 1
+            )
+            num_heads = swa_num_heads if is_swa else full_num_heads
+            num_kv_heads = swa_num_kv_heads if is_swa else full_num_kv_heads
+
             buf = fused_qkv_buffers[layer_idx]
             fused_weight = buf["weight"]  # numpy, [total_qkv, hidden], FP8
             fused_scale = buf["scale"]  # numpy, [total_blocks, in_blocks], f32
@@ -699,8 +736,15 @@ class WeightLoader:
         # Try config value first, then smaller divisors (descending)
         kv_candidates = sorted(set(kv_candidates), reverse=True)
 
-        # TP candidates: all divisors of num_heads (covers any quantization-time TP)
-        tp_candidates = sorted(d for d in range(1, num_heads + 1) if num_heads % d == 0)
+        # TP candidates: all divisors of num_heads, descending.  Prefer the
+        # largest TP that matches because the Q/K/V split must reflect the
+        # actual quantization-time sharding.  When per_shard_total is a
+        # multiple of block_size, smaller TP values also satisfy the
+        # dimension check but produce an incorrect Q/K/V split.
+        tp_candidates = sorted(
+            (d for d in range(1, num_heads + 1) if num_heads % d == 0),
+            reverse=True,
+        )
 
         for orig_kv in kv_candidates:
             for tp in tp_candidates:
@@ -799,6 +843,14 @@ class WeightLoader:
 
         param_shape = model_param.value.shape
         num_experts = param_shape[0]
+
+        # Compressed-tensors per-channel checkpoints (e.g. Ling-2.6-1T) emit
+        # each expert's scale as ``[out_dim, 1]``; after stacking they show up
+        # here as ``[E, out_dim, 1]``. The kernel still wants
+        # ``[E, 1, 1, out_dim]`` (k_blocks=1), so squeeze the trailing 1 first
+        # and let the per-channel path below handle the 4D promotion.
+        if weight.ndim == 3 and weight.shape[0] == num_experts and weight.shape[-1] == 1:
+            weight = jnp.squeeze(weight, axis=-1)
 
         # --- FusedEPMoE legacy 2D block-wise placeholder ---
         # Older placeholders may use (E, K_groups, N_groups, 1).
@@ -911,6 +963,19 @@ class WeightLoader:
         if not target_path.endswith("weight_scale"):
             return weight
 
+        # Per-channel compressed-tensors checkpoints (e.g. Ling-2.6-1T) ship the
+        # weight scale as a 2D ``[out_dim, 1]`` tensor while the model placeholder
+        # is a 1D ``[out_dim]``. Squeeze the trailing singleton so the shapes
+        # line up — this is the per-channel sibling of the block-quant expand
+        # path below.
+        if (
+            weight.ndim == 2
+            and weight.shape[-1] == 1
+            and model_param.value.ndim == 1
+            and model_param.value.shape[0] == weight.shape[0]
+        ):
+            return jnp.squeeze(weight, axis=-1)
+
         # Only convert when checkpoint has 2D scale and model expects 3D.
         if weight.ndim != 2 or model_param.value.ndim != 3:
             return weight
@@ -946,6 +1011,9 @@ class WeightLoader:
         """
         Scan all safetensors files to build a mapping from HF key to file info.
         """
+        if self._weight_info_cache is not None:
+            return self._weight_info_cache
+
         # 1. Host 0 does the heavy lifting (Scanning)
         if jax.process_index() == 0:
             model_path = self.model_config.model_path
@@ -964,29 +1032,36 @@ class WeightLoader:
             iterator = tqdm(weights_files, desc="Scanning Metadata", unit="file")
 
             for st_file in iterator:
-                # Parse safetensors header for byte offsets (for bulk MoE reads)
+                # Read the safetensors header directly: 8-byte length prefix +
+                # JSON header that lists {dtype, shape, data_offsets} per tensor.
+                # That's all we need — do NOT use safe_open here. safe_open mmaps
+                # the entire file, and on GCSFuse a single page fault triggers a
+                # chunked-download (download-chunk-size-mb), so scanning 34 files
+                # winds up downloading the full ~30GB model just to read metadata.
                 with open(st_file, "rb") as raw_f:
                     header_size = struct.unpack("<Q", raw_f.read(8))[0]
                     raw_header = json.loads(raw_f.read(header_size))
                 data_section_offset = 8 + header_size
 
-                with safe_open(st_file, framework="flax", device="cpu") as f:
-                    for key in f.keys():  # noqa: SIM118
-                        slice_info = f.get_slice(key)
-                        info = {
-                            "file": st_file,
-                            "shape": tuple(slice_info.get_shape()),
-                            "dtype": slice_info.get_dtype(),
-                        }
-                        # Add byte offset info for direct reads
-                        if key in raw_header:
-                            offsets = raw_header[key].get("data_offsets")
-                            if offsets:
-                                info["byte_offset"] = data_section_offset + offsets[0]
-                                info["byte_size"] = offsets[1] - offsets[0]
-                        if key not in weight_info:
-                            weight_info[key] = []
-                        weight_info[key].append(info)
+                for key, meta in raw_header.items():
+                    if key == "__metadata__":
+                        continue
+                    info = {
+                        "file": st_file,
+                        "shape": tuple(meta["shape"]),
+                        # Keep dtype as the safetensors string — downstream
+                        # consumers (_create_lazy_tensors, MoE bulk_read) all
+                        # already look up _SAFETENSORS_DTYPE_TO_JAX by string,
+                        # and st_dtype.startswith("F8_") in MoE path needs str.
+                        "dtype": meta["dtype"],
+                    }
+                    offsets = meta.get("data_offsets")
+                    if offsets:
+                        info["byte_offset"] = data_section_offset + offsets[0]
+                        info["byte_size"] = offsets[1] - offsets[0]
+                    if key not in weight_info:
+                        weight_info[key] = []
+                    weight_info[key].append(info)
 
             # Serialize the result
             serialized_data = pickle.dumps(weight_info)
@@ -1020,6 +1095,7 @@ class WeightLoader:
         if jax.process_index() != 0:
             logger.info("Metadata received. Total keys: %s", len(weight_info))
 
+        self._weight_info_cache = weight_info
         return weight_info
 
     def _create_lazy_tensors(
@@ -1038,18 +1114,7 @@ class WeightLoader:
         for info in infos:
             shape = info["shape"]
             st_dtype = info["dtype"]
-
-            dtype_map = {
-                "BF16": jnp.bfloat16,
-                "F16": jnp.float16,
-                "F32": jnp.float32,
-                "I64": jnp.int64,
-                "I32": jnp.int32,
-                "BOOL": jnp.bool_,
-                "F8_E4M3": jnp.float8_e4m3fn,
-                "F8_E5M2": jnp.float8_e5m2,
-            }
-            target_dtype = dtype_map.get(st_dtype, jnp.float32)
+            target_dtype = _SAFETENSORS_DTYPE_TO_JAX.get(st_dtype, jnp.float32)
 
             filename = info["file"]
 
@@ -1113,17 +1178,7 @@ class WeightLoader:
         global_shape = tuple(global_shape)
 
         st_dtype = sorted_infos[0]["dtype"]
-        dtype_map = {
-            "BF16": jnp.bfloat16,
-            "F16": jnp.float16,
-            "F32": jnp.float32,
-            "I64": jnp.int64,
-            "I32": jnp.int32,
-            "BOOL": jnp.bool_,
-            "F8_E4M3": jnp.float8_e4m3fn,
-            "F8_E5M2": jnp.float8_e5m2,
-        }
-        target_dtype = dtype_map.get(st_dtype, jnp.float32)
+        target_dtype = _SAFETENSORS_DTYPE_TO_JAX.get(st_dtype, jnp.float32)
 
         if target_sharding is None:
             sharding = jax.sharding.NamedSharding(self.mesh, P())
@@ -1210,17 +1265,7 @@ class WeightLoader:
         sorted_first_infos = sorted(first_infos, key=lambda x: x["file"])
 
         st_dtype = sorted_first_infos[0]["dtype"]
-        dtype_map = {
-            "BF16": jnp.bfloat16,
-            "F16": jnp.float16,
-            "F32": jnp.float32,
-            "I64": jnp.int64,
-            "I32": jnp.int32,
-            "BOOL": jnp.bool_,
-            "F8_E4M3": jnp.float8_e4m3fn,
-            "F8_E5M2": jnp.float8_e5m2,
-        }
-        target_dtype = dtype_map.get(st_dtype, jnp.float32)
+        target_dtype = _SAFETENSORS_DTYPE_TO_JAX.get(st_dtype, jnp.float32)
 
         for hf_key in expected_hf_keys:
             infos = weight_infos[hf_key]
@@ -1345,17 +1390,7 @@ class WeightLoader:
         single_expert_shape = info["shape"]
         st_dtype = info["dtype"]
 
-        dtype_map = {
-            "BF16": jnp.bfloat16,
-            "F16": jnp.float16,
-            "F32": jnp.float32,
-            "I64": jnp.int64,
-            "I32": jnp.int32,
-            "BOOL": jnp.bool_,
-            "F8_E4M3": jnp.float8_e4m3fn,
-            "F8_E5M2": jnp.float8_e5m2,
-        }
-        target_dtype = dtype_map.get(st_dtype, jnp.float32)
+        target_dtype = _SAFETENSORS_DTYPE_TO_JAX.get(st_dtype, jnp.float32)
 
         num_logical_experts = len(expected_hf_keys)
         physical_to_logical_map = self._normalize_physical_to_logical_map(
@@ -2536,37 +2571,112 @@ class WeightLoader:
                 v_bias = jnp.reshape(v_bias, (self.num_kv_heads * v_head_dim_padded,))
 
             splits = [q_bias, k_bias, v_bias]
+        elif "scale" in hf_key and weight.ndim == 1:
+            # Per-channel weight_scale (e.g. compressed-tensors W8A16): 1-D
+            # shape [Q_out + K_out + V_out,]. Splits along the single axis with
+            # the same Q/K/V offsets the bias branch uses; applies per-head pad
+            # the same way if mapping.head_dim_padding is set. Falls through to
+            # the 2-D scale branch below for block-quant scales (ndim == 2).
+            q_dim = self.num_heads * self.head_dim_original
+            k_dim = self.num_kv_heads * self.head_dim_original
+            v_dim = self.num_kv_heads * v_head_dim
+
+            q_scale = weight[:q_dim]
+            k_scale = weight[q_dim : q_dim + k_dim]
+            v_scale = weight[q_dim + k_dim : q_dim + k_dim + v_dim]
+
+            if mapping.head_dim_padding and self.head_dim_pad > 0:
+                q_scale = jnp.reshape(q_scale, (self.num_heads, self.head_dim_original))
+                q_scale = jnp.pad(q_scale, ((0, 0), (0, self.head_dim_pad)))
+                q_scale = jnp.reshape(q_scale, (self.num_heads * self.head_dim,))
+
+                k_scale = jnp.reshape(k_scale, (self.num_kv_heads, self.head_dim_original))
+                k_scale = jnp.pad(k_scale, ((0, 0), (0, self.head_dim_pad)))
+                k_scale = jnp.reshape(k_scale, (self.num_kv_heads * self.head_dim,))
+
+            if mapping.head_dim_padding and v_head_dim_pad > 0:
+                v_scale = jnp.reshape(v_scale, (self.num_kv_heads, v_head_dim))
+                v_scale = jnp.pad(v_scale, ((0, 0), (0, v_head_dim_pad)))
+                v_scale = jnp.reshape(v_scale, (self.num_kv_heads * v_head_dim_padded,))
+
+            splits = [q_scale, k_scale, v_scale]
         elif "scale" in hf_key and weight.ndim == 2:
-            # Block-quant scale: split along block dimension, not element dimension.
-            # The fused QKV scale has shape [total_blocks, in_blocks] where blocks
-            # are computed per Q/K/V segment independently.
+            # 2-D scale in a fused QKV weight. Two formats land here:
+            #   (a) block-quant scale [total_blocks, in_blocks] — split along
+            #       block dimension (the original case this branch was written
+            #       for; introduced in #978 for MiMo-V2.5-Pro day0 support).
+            #   (b) channel-wise / per-tensor scale stored as 2-D, e.g.
+            #       compressed-tensors W8A16 on Ling-2.6-1T where some scales
+            #       arrive shaped [Q_out+K_out+V_out, inner] instead of 1-D.
+            # Distinguish by whether the quantization_config has weight_block_size.
             import math
 
             quant_cfg = getattr(self.model_config, "quantization_config", None)
-            block_size = int(quant_cfg.weight_block_size[0]) if quant_cfg else 128
+            weight_block_size = getattr(quant_cfg, "weight_block_size", None) if quant_cfg else None
 
-            q_dim = self.num_heads * self.head_dim_original
-            k_dim = self.num_kv_heads * self.head_dim_original
+            if weight_block_size is None:
+                # Path (b): element-wise split along axis 0, same Q/K/V offsets
+                # as the 1-D branch above. Padding mirrors the 1-D path with an
+                # extra inner axis preserved.
+                logger.info(
+                    "Splitting 2-D non-block scale %s shape=%s element-wise "
+                    "(quant_cfg has no weight_block_size)",
+                    hf_key,
+                    weight.shape,
+                )
+                q_dim = self.num_heads * self.head_dim_original
+                k_dim = self.num_kv_heads * self.head_dim_original
+                v_dim = self.num_kv_heads * v_head_dim
 
-            q_blocks = math.ceil(q_dim / block_size)
-            k_blocks = math.ceil(k_dim / block_size)
-            # V gets remaining blocks (may include padding to head_dim_original)
-            v_blocks = weight.shape[0] - q_blocks - k_blocks
+                q_scale = weight[:q_dim, :]
+                k_scale = weight[q_dim : q_dim + k_dim, :]
+                v_scale = weight[q_dim + k_dim : q_dim + k_dim + v_dim, :]
 
-            logger.info(
-                "Splitting QKV scale %s shape=%s into Q=%d K=%d V=%d blocks",
-                hf_key,
-                weight.shape,
-                q_blocks,
-                k_blocks,
-                v_blocks,
-            )
+                if mapping.head_dim_padding and self.head_dim_pad > 0:
+                    inner = weight.shape[1]
+                    q_scale = jnp.reshape(q_scale, (self.num_heads, self.head_dim_original, inner))
+                    q_scale = jnp.pad(q_scale, ((0, 0), (0, self.head_dim_pad), (0, 0)))
+                    q_scale = jnp.reshape(q_scale, (self.num_heads * self.head_dim, inner))
 
-            q_scale = weight[:q_blocks, :]
-            k_scale = weight[q_blocks : q_blocks + k_blocks, :]
-            v_scale = weight[q_blocks + k_blocks :, :]
+                    k_scale = jnp.reshape(
+                        k_scale, (self.num_kv_heads, self.head_dim_original, inner)
+                    )
+                    k_scale = jnp.pad(k_scale, ((0, 0), (0, self.head_dim_pad), (0, 0)))
+                    k_scale = jnp.reshape(k_scale, (self.num_kv_heads * self.head_dim, inner))
 
-            splits = [q_scale, k_scale, v_scale]
+                if mapping.head_dim_padding and v_head_dim_pad > 0:
+                    inner = weight.shape[1]
+                    v_scale = jnp.reshape(v_scale, (self.num_kv_heads, v_head_dim, inner))
+                    v_scale = jnp.pad(v_scale, ((0, 0), (0, v_head_dim_pad), (0, 0)))
+                    v_scale = jnp.reshape(v_scale, (self.num_kv_heads * v_head_dim_padded, inner))
+
+                splits = [q_scale, k_scale, v_scale]
+            else:
+                # Path (a): block-quant scale, original behavior.
+                block_size = int(weight_block_size[0])
+
+                q_dim = self.num_heads * self.head_dim_original
+                k_dim = self.num_kv_heads * self.head_dim_original
+
+                q_blocks = math.ceil(q_dim / block_size)
+                k_blocks = math.ceil(k_dim / block_size)
+                # V gets remaining blocks (may include padding to head_dim_original)
+                v_blocks = weight.shape[0] - q_blocks - k_blocks
+
+                logger.info(
+                    "Splitting QKV scale %s shape=%s into Q=%d K=%d V=%d blocks",
+                    hf_key,
+                    weight.shape,
+                    q_blocks,
+                    k_blocks,
+                    v_blocks,
+                )
+
+                q_scale = weight[:q_blocks, :]
+                k_scale = weight[q_blocks : q_blocks + k_blocks, :]
+                v_scale = weight[q_blocks + k_blocks :, :]
+
+                splits = [q_scale, k_scale, v_scale]
         else:
             q_dim = self.num_heads * self.head_dim_original
             k_dim = self.num_kv_heads * self.head_dim_original
@@ -2747,10 +2857,9 @@ class WeightLoader:
         elif padding_strategy == "zero":
             target_heads_total = total_kv_heads * num_replicas
 
-            if step_size == 1:
-                target_len = target_heads_total
-            else:
-                target_len = target_heads_total * self.head_dim
+            target_len = (
+                target_heads_total if step_size == 1 else target_heads_total * self.head_dim
+            )
 
             current_len = weight.shape[target_axis]
             padding_len = target_len - current_len

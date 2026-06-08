@@ -421,7 +421,7 @@ def create_test_data(
         real_bs_per_dp=real_bs_per_dp,
         dp_size=dp_size,
         per_dp_bs_size=per_dp_bs_padding,
-        spec_info=None,
+        spec_info_padded=None,
         recurrent_indices=recurrent_indices_cpu,
         has_initial_state=has_initial_state_cpu,
     )

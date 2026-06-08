@@ -1,15 +1,11 @@
-"""LightningAttnBackend — GLA (Gated Linear Attention) backend.
+"""LightningAttnBackend — GLA backend.
 
-Extends LinearRecurrentAttnBackend to provide:
-- Chunked prefill via simple_gla_fwd (Pallas kernel, varlen — kernel pads each
-  sequence internally, so cu_seqlens carries real lengths)
-- Decode via fused_recurrent_simple_gla (jax.lax.scan)
-- Recurrent state management through RecurrentStatePool (no conv state)
+DECODE uses ``decode_simple_gla_fused`` (Pallas, in-kernel async DMA
+gather/scatter on the recurrent state buffer).
 
-Aligns with upstream sglang's LightningAttentionBackend(MambaAttnBackendBase) pattern.
-Per-layer ALiBi slope decay is owned here (indexed by layer_id), mirroring
-upstream's ``self.tp_slope[layer.layer_id]``; the model layer only carries
-identification + head shape via ``RadixLightningAttention``.
+EXTEND uses the baseline ``simple_gla_fwd`` (Pallas) wrapped with JAX
+gather/scatter — a fused EXTEND variant existed but was reverted as
+slower than the baseline path used here.
 """
 
 from __future__ import annotations
@@ -34,13 +30,14 @@ from sgl_jax.srt.utils.profiling_utils import named_scope
 logger = logging.getLogger(__name__)
 
 try:
-    from sgl_jax.srt.kernels.simple_gla.simple_gla import (
-        fused_recurrent_simple_gla,
-        simple_gla_fwd,
-    )
+    from sgl_jax.srt.kernels.simple_gla.simple_gla import simple_gla_fwd
 except ModuleNotFoundError:
     simple_gla_fwd = None
-    fused_recurrent_simple_gla = None
+
+try:
+    from sgl_jax.srt.kernels.simple_gla.simple_gla_fused import decode_simple_gla_fused
+except ModuleNotFoundError:
+    decode_simple_gla_fused = None
 
 if TYPE_CHECKING:
     from sgl_jax.srt.layers.radix_lightning_attention import RadixLightningAttention
@@ -74,10 +71,9 @@ def _compute_layer_slope(
 ) -> jax.Array:
     """Per-layer slope decay used as ``g_gamma`` by the simple_gla kernels.
 
-    Returned array is sharded along the ``tensor`` axis when ``mesh`` is
-    provided, matching how the slope is consumed inside the jitted forward
-    (``P("tensor")``). Constructing it as single-device on the host caused
-    ``shard_device_array`` to reshard it on every forward step.
+    Sharded along the ``tensor`` axis when ``mesh`` is provided, matching
+    the ``P("tensor")`` spec the slope is consumed with inside the jitted
+    forward.
     """
     base = np.asarray(_build_alibi_base_slopes(num_heads), dtype=np.float32)
     slope_np = -base * (1 - (layer_id - 1) / (num_hidden_layers - 1) + 1e-5)
@@ -142,8 +138,9 @@ class LightningAttnBackend(LinearRecurrentAttnBackend):
         recurrent_state_pool,
         **kwargs,
     ) -> tuple[jax.Array, tuple]:
-        recurrent_indices = self.forward_metadata.recurrent_indices
-        ssm_states = self.get_state(recurrent_state_pool, layer.layer_id, recurrent_indices)
+        md = self.forward_metadata
+        recurrent_buffer, _ = self.get_layer_cache(recurrent_state_pool, layer.layer_id)
+
         try:
             slope = self.tp_slope[layer.layer_id]
         except KeyError:
@@ -155,63 +152,31 @@ class LightningAttnBackend(LinearRecurrentAttnBackend):
             ) from None
 
         if forward_batch.forward_mode == ForwardMode.DECODE:
-            output, new_recurrent = self._forward_decode(q, k, v, ssm_states, slope)
+            output, new_buffer = self._forward_decode(
+                q,
+                k,
+                v,
+                recurrent_buffer,
+                md.recurrent_indices,
+                md.has_initial_state,
+                slope,
+            )
         elif forward_batch.forward_mode == ForwardMode.EXTEND:
-            output, new_recurrent = self._forward_extend(q, k, v, ssm_states, slope)
+            output, new_buffer = self._forward_extend(
+                q,
+                k,
+                v,
+                recurrent_buffer,
+                md.recurrent_indices,
+                md.has_initial_state,
+                slope,
+            )
         else:
             raise NotImplementedError(
                 f"LightningAttnBackend does not support {forward_batch.forward_mode}"
             )
 
-        new_ssm_full = self.set_ssm_state(
-            recurrent_state_pool, layer.layer_id, recurrent_indices, new_recurrent
-        )
-        return output.reshape(output.shape[0], -1), (new_ssm_full, [])
-
-    def get_state(self, recurrent_state_pool, layer_id, recurrent_indices):
-        """Gather recurrent states using shard_map."""
-        recurrent_buffer, _ = self.get_layer_cache(recurrent_state_pool, layer_id)
-
-        def _gather_local(buf, indices):
-            return buf[indices]
-
-        state = jax.shard_map(
-            _gather_local,
-            mesh=self.mesh,
-            in_specs=(
-                P("data", "tensor", None, None),
-                P("data"),
-            ),
-            out_specs=P("data", "tensor", None, None),
-            check_vma=False,
-        )(recurrent_buffer, recurrent_indices)
-        has_initial_state = self.forward_metadata.has_initial_state
-        if has_initial_state is not None:
-            state = jnp.where(has_initial_state[:, None, None, None], state, 0.0)
-        return state
-
-    def set_ssm_state(self, recurrent_state_pool, layer_id, recurrent_indices, new_recurrent):
-        """Scatter recurrent states using shard_map."""
-        recurrent_buffer, _ = self.get_layer_cache(recurrent_state_pool, layer_id)
-
-        def _scatter_local(buf, indices, state):
-            # whenever indices == 0, write val otherwise
-            keep_mask = (indices == 0).reshape(-1, 1, 1, 1)
-            old = buf[indices]
-            safe_val = jnp.where(keep_mask, old, state)
-            return buf.at[indices].set(safe_val)
-
-        return jax.shard_map(
-            _scatter_local,
-            mesh=self.mesh,
-            in_specs=(
-                P("data", "tensor", None, None),
-                P("data"),
-                P("data", "tensor", None, None),
-            ),
-            out_specs=P("data", "tensor", None, None),
-            check_vma=False,
-        )(recurrent_buffer, recurrent_indices, new_recurrent)
+        return output.reshape(output.shape[0], -1), (new_buffer, [])
 
     @named_scope("lightning_decode")
     def _forward_decode(
@@ -219,48 +184,45 @@ class LightningAttnBackend(LinearRecurrentAttnBackend):
         q: jax.Array,
         k: jax.Array,
         v: jax.Array,
-        ssm_states: jax.Array,
+        recurrent_buffer: jax.Array,
+        recurrent_indices: jax.Array,
+        has_initial_state: jax.Array,
         slope: jnp.ndarray,
     ) -> tuple[jax.Array, jax.Array]:
-        """Decode forward using shard_map."""
-        if fused_recurrent_simple_gla is None:
-            raise ImportError("simple_gla kernel is required for GLA decode")
+        """Decode forward via fused Pallas kernel with in-kernel state DMA."""
+        if decode_simple_gla_fused is None:
+            raise ImportError("simple_gla_fused kernel is required for GLA decode")
 
-        ssm_states = ssm_states.astype(jnp.float32)
-
-        def _decode_fn(q_local, k_local, v_local, gamma, h0):
-            q_d = q_local[:, None, :, :]
-            k_d = k_local[:, None, :, :]
-            v_d = v_local[:, None, :, :]
-            output_d, new_state = fused_recurrent_simple_gla(
-                q_d,
-                k_d,
-                v_d,
+        def _decode_fn(q_l, k_l, v_l, gamma, buf_l, idx_l, has_l):
+            return decode_simple_gla_fused(
+                q_l,
+                k_l,
+                v_l,
+                recurrent_buffer=buf_l,
+                recurrent_indices=idx_l,
+                has_initial_state=has_l,
                 g_gamma=gamma,
-                initial_state=h0,
-                output_final_state=True,
                 scale=None,
             )
-            return output_d[:, 0, :, :], new_state
 
-        output, new_state = jax.shard_map(
+        return jax.shard_map(
             _decode_fn,
             mesh=self.mesh,
             in_specs=(
-                P("data", "tensor", None),  # q
-                P("data", "tensor", None),  # k
-                P("data", "tensor", None),  # v
-                P("tensor"),  # slope
-                P("data", "tensor", None, None),  # ssm_states
+                P("data", "tensor", None),
+                P("data", "tensor", None),
+                P("data", "tensor", None),
+                P("tensor"),
+                P("data", "tensor", None, None),
+                P("data"),
+                P("data"),
             ),
             out_specs=(
                 P("data", "tensor", None),
                 P("data", "tensor", None, None),
             ),
             check_vma=False,
-        )(q, k, v, slope, ssm_states)
-
-        return output, new_state
+        )(q, k, v, slope, recurrent_buffer, recurrent_indices, has_initial_state)
 
     @named_scope("lightning_extend")
     def _forward_extend(
@@ -268,50 +230,59 @@ class LightningAttnBackend(LinearRecurrentAttnBackend):
         q: jax.Array,
         k: jax.Array,
         v: jax.Array,
-        ssm_states: jax.Array,
+        recurrent_buffer: jax.Array,
+        recurrent_indices: jax.Array,
+        has_initial_state: jax.Array,
         slope: jnp.ndarray,
     ) -> tuple[jax.Array, jax.Array]:
-        """Extend forward using shard_map."""
+        """Extend forward via baseline simple_gla_fwd + JAX gather/scatter."""
         if simple_gla_fwd is None:
             raise ImportError("simple_gla kernel is required for GLA prefill")
 
         cu_seqlens = self.forward_metadata.cu_q_lens
-        ssm_states = ssm_states.astype(jnp.float32)
         chunk_size = self.chunk_size
 
-        def _prefill_fn(q_local, k_local, v_local, gamma, h0, cu_seqlens_p):
+        def _prefill_fn(q_l, k_l, v_l, gamma, buf_l, idx_l, has_l, cu_l):
+            h0 = buf_l[idx_l]
+            h0 = jnp.where(has_l[:, None, None, None], h0, 0.0)
+
             output, ht = simple_gla_fwd(
-                q_local[None],
-                k_local[None],
-                v_local[None],
+                q_l[None],
+                k_l[None],
+                v_l[None],
                 g_gamma=gamma,
                 h0=h0,
-                cu_seqlens_dev=cu_seqlens_p,
+                cu_seqlens_dev=cu_l,
                 scale=None,
                 use_ht=True,
                 chunk_size=chunk_size,
             )
-            return output[0], ht
 
-        output, new_state = jax.shard_map(
+            # Skip writing back to dummy slot 0.
+            keep_mask = (idx_l == 0).reshape(-1, 1, 1, 1)
+            safe_val = jnp.where(keep_mask, buf_l[idx_l], ht)
+            new_buf = buf_l.at[idx_l].set(safe_val)
+            return output[0], new_buf
+
+        return jax.shard_map(
             _prefill_fn,
             mesh=self.mesh,
             in_specs=(
-                P("data", "tensor", None),  # q: always has "data" axis
-                P("data", "tensor", None),  # k
-                P("data", "tensor", None),  # v
-                P("tensor"),  # slope: replicated
-                P("data", "tensor", None, None),  # ssm_states
-                P("data"),  # cu_seqlens
+                P("data", "tensor", None),
+                P("data", "tensor", None),
+                P("data", "tensor", None),
+                P("tensor"),
+                P("data", "tensor", None, None),
+                P("data"),
+                P("data"),
+                P("data"),
             ),
             out_specs=(
                 P("data", "tensor", None),
                 P("data", "tensor", None, None),
             ),
             check_vma=False,
-        )(q, k, v, slope, ssm_states, cu_seqlens)
-
-        return output, new_state
+        )(q, k, v, slope, recurrent_buffer, recurrent_indices, has_initial_state, cu_seqlens)
 
 
 __all__ = ["LightningAttnBackend"]

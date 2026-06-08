@@ -3,7 +3,7 @@
 import jax
 from flax import nnx
 from jax import numpy as jnp
-from jax.sharding import Mesh, NamedSharding
+from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.eplb.expert_location import get_global_expert_location_metadata
@@ -260,24 +260,30 @@ class FusedEPMoE(nnx.Module):
                 )
 
                 if self.num_shared_experts > 0:
+                    # fused kernel expects per-channel shared scale (1, 1, se_inter)
+                    # — see _validate_fused_ep_moe_args / kernel.py:455-470
                     shared_scale_sharding = P(None, None, None)
+                    se_inter = self.moe_shared_expert_intermediate_size * self.num_shared_experts
 
                     if hasattr(self, "w1_shared_scale"):
                         del self.w1_shared_scale
                     self.w1_shared_scale = nnx.Param(
-                        jnp.zeros((1,), dtype=jnp.float32), out_sharding=shared_scale_sharding
+                        jnp.zeros((1, 1, se_inter), dtype=jnp.float32),
+                        out_sharding=shared_scale_sharding,
                     )
 
                     if hasattr(self, "w3_shared_scale"):
                         del self.w3_shared_scale
                     self.w3_shared_scale = nnx.Param(
-                        jnp.zeros((1,), dtype=jnp.float32), out_sharding=shared_scale_sharding
+                        jnp.zeros((1, 1, se_inter), dtype=jnp.float32),
+                        out_sharding=shared_scale_sharding,
                     )
 
                     if hasattr(self, "w2_shared_scale"):
                         del self.w2_shared_scale
                     self.w2_shared_scale = nnx.Param(
-                        jnp.zeros((1,), dtype=jnp.float32), out_sharding=shared_scale_sharding
+                        jnp.zeros((1, 1, self.hidden_size), dtype=jnp.float32),
+                        out_sharding=shared_scale_sharding,
                     )
 
                 return
@@ -437,19 +443,9 @@ class FusedEPMoE(nnx.Module):
         topk_ids: jax.Array,
         *,
         block_config: FusedMoEBlockConfig | None = None,
+        out_sharding: jax.sharding.Sharding | None = None,
     ) -> jax.Array:
-        """
-        Forward pass through the fused MoE layer.
-
-        Args:
-            hidden_states: Input tokens, shape (num_tokens, hidden_size) or
-                          (batch_size, seq_len, hidden_size)
-            topk_weights: Pre-computed top-k weights
-            topk_ids: Pre-computed top-k expert IDs
-
-        Returns:
-            MoE layer output, same shape as hidden_states
-        """
+        """Forward pass through the fused MoE layer."""
         assert hidden_states.ndim == 2
 
         w1_shared_val = self.w1_shared.value if self.w1_shared is not None else None
@@ -508,5 +504,7 @@ class FusedEPMoE(nnx.Module):
             tp_axis_name="tensor",
         )
 
-        output = jax.sharding.reshard(output, NamedSharding(self.mesh, P("data", None)))
+        if out_sharding is None:
+            out_sharding = jax.sharding.NamedSharding(self.mesh, P(*([None] * output.ndim)))
+        output = jax.sharding.reshard(output, out_sharding)
         return output

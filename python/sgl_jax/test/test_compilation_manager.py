@@ -220,7 +220,7 @@ class TestDummyBatch(unittest.TestCase):
         )
         assert batch.dp_size == 4
         assert batch.per_dp_bs_size == 16
-        assert batch.real_bs_per_dp == [64, 64, 64, 64]
+        assert batch.real_bs_per_dp == [16, 16, 16, 16]
 
     def test_multimodal_capture_hidden(self):
         cm = CompilationManager(

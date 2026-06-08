@@ -554,49 +554,36 @@ class ModelRunnerKVCacheMixin:
         # 4. Resolve max_num_reqs (needed for spec dec headroom)
         max_num_reqs = self._resolve_max_num_reqs(max_num_reqs)
 
-        # 5. Speculative decoding headroom (needs max_num_reqs)
+        # 5. Speculative decoding: resolve draft/target cache sizes.
+        # Headroom added to max_total_num_tokens BEFORE _apply_token_constraints
+        # so it goes through page_align * dp_size naturally.
         if self.spec_algorithm is not None and not self.spec_algorithm.is_none():
             if self.is_draft_worker:
                 self.max_total_num_tokens = self.server_args.draft_runner_cache_size
                 max_num_reqs = self.server_args.max_num_reqs
             else:
-                self.server_args.draft_runner_cache_size = (
-                    self.max_total_num_tokens
-                    + max_num_reqs
+                spec_headroom = (
+                    max_num_reqs
                     * self.server_args.speculative_num_steps
                     * self.server_args.speculative_eagle_topk
                     + max_num_reqs * self.server_args.speculative_num_draft_tokens
                     + 100
                 )
-                self.max_total_num_tokens = self.server_args.draft_runner_cache_size
+                self.max_total_num_tokens += spec_headroom
                 self.server_args.max_num_reqs = max_num_reqs
+                self.server_args.draft_runner_cache_size = self.max_total_num_tokens
 
-        # 6. Apply constraints (CI, user cap, page align, dp). Draft worker's
-        # pool size is target-derived (must cover target's allocator slot
-        # range), so the user --max-total-tokens cap is not re-applied — it
-        # could otherwise shrink the draft pool below the (post-hybrid) target
-        # range and reintroduce the high-slot garbage this commit fixes.
+        # 6. Apply constraints (CI, user cap, page align, dp).
         self.max_total_num_tokens = self._apply_token_constraints(
             self.max_total_num_tokens,
             None if self.is_draft_worker else max_total_tokens,
             dp_size,
         )
 
-        # 7. Hybrid SWA token split (existing logic, not moved)
+        # 7. Hybrid SWA token split. draft_runner_cache_size was saved
+        # above (per-chip, pre-dp) so the draft won't see hybrid inflation.
         if self.is_hybrid:
             self.set_num_token_hybrid()
-            if (
-                not self.is_draft_worker
-                and self.spec_algorithm is not None
-                and not self.spec_algorithm.is_none()
-            ):
-                # Draft shares target's allocator, whose slot range is the
-                # *post-hybrid* full-pool size. The draft_runner_cache_size set
-                # in step 5 was pre-hybrid; without this overwrite, draft's own
-                # KV pool is smaller than the slot range it indexes into, so any
-                # slot >= pre-hybrid size reads/writes garbage (manifests as
-                # accept[1:]=1 for reqs allocated at high slots).
-                self.server_args.draft_runner_cache_size = self.max_total_num_tokens
 
         if self.max_total_num_tokens <= 0:
             raise RuntimeError("Not enough memory. Please try to increase --mem-fraction-static.")

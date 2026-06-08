@@ -115,6 +115,30 @@ class TestReqToTokenPoolFree(CustomTestCase):
         self.assertEqual(self.pool.free_slots, free_slots_before)
 
 
+class TestReqToTokenPoolCacheLocHostBuffer(CustomTestCase):
+    def setUp(self):
+        self.pool = ReqToTokenPool(size=4, max_context_len=16, dtype=np.int32)
+
+    def test_cache_loc_host_buffer_never_shrinks(self):
+        self.pool.init_cache_loc_host_buffer(16)
+        original = self.pool.cache_loc_host_buf
+        original[:] = 7
+
+        self.pool.init_cache_loc_host_buffer(8)
+
+        self.assertIs(self.pool.cache_loc_host_buf, original)
+        self.assertEqual(self.pool.cache_loc_host_buf.shape[0], 16)
+        np.testing.assert_array_equal(self.pool.cache_loc_host_buf, np.full(16, 7, dtype=np.int32))
+
+    def test_cache_loc_host_buffer_grows_when_needed(self):
+        self.pool.init_cache_loc_host_buffer(8)
+
+        self.pool.init_cache_loc_host_buffer(16)
+
+        self.assertEqual(self.pool.cache_loc_host_buf.shape[0], 16)
+        np.testing.assert_array_equal(self.pool.cache_loc_host_buf, np.zeros(16, dtype=np.int32))
+
+
 class TestReqToTokenPoolChunkedReqLifecycle(CustomTestCase):
     """End-to-end lock-in for chunked-req slot ownership across batches."""
 

@@ -35,9 +35,8 @@ def _get_layer_type(config: PretrainedConfig, layer_id: int) -> str:
         "sliding_window_pattern",
         getattr(config, "_sliding_window_pattern", None),
     )
-    if sliding_window_pattern:
-        if (layer_id + 1) % sliding_window_pattern:
-            return "sliding_attention"
+    if sliding_window_pattern and (layer_id + 1) % sliding_window_pattern:
+        return "sliding_attention"
     return "full_attention"
 
 
@@ -73,10 +72,7 @@ def _get_rope_linear_scaling_factor(config: PretrainedConfig, layer_type: str) -
     if rope_type == "linear":
         return float(rope_scaling.get("factor", 1.0))
 
-    raise ValueError(
-        "Gemma3 only supports default and linear rope_scaling, "
-        f"got {rope_type!r}."
-    )
+    raise ValueError("Gemma3 only supports default and linear rope_scaling, " f"got {rope_type!r}.")
 
 
 def _get_forward_batch_input_embeds(forward_batch: ForwardBatch) -> jax.Array | None:
@@ -151,9 +147,7 @@ class Gemma3Attention(nnx.Module):
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.num_kv_heads = config.num_key_value_heads
-        self.head_dim = getattr(
-            config, "head_dim", self.hidden_size // self.num_heads
-        )
+        self.head_dim = getattr(config, "head_dim", self.hidden_size // self.num_heads)
         self.scaling = getattr(config, "query_pre_attn_scalar", self.head_dim) ** -0.5
         self.layer_type = _get_layer_type(config, layer_id)
         self.is_sliding = self.layer_type == "sliding_attention"
@@ -207,9 +201,7 @@ class Gemma3Attention(nnx.Module):
             base=_get_rope_theta(config, self.layer_type),
             is_neox_style=getattr(config, "rope_is_neox_style", True),
             dtype=dtype,
-            linear_scaling_factor=_get_rope_linear_scaling_factor(
-                config, self.layer_type
-            ),
+            linear_scaling_factor=_get_rope_linear_scaling_factor(config, self.layer_type),
         )
         self.attn = RadixAttention(
             num_heads=self.num_heads,
@@ -433,9 +425,7 @@ class Gemma3ForCausalLM(nnx.Module):
         }
 
         for layer_idx in range(self.config.num_hidden_layers):
-            mappings.update(
-                self._create_layer_mappings(layer_idx, hf_prefix=hf_prefix)
-            )
+            mappings.update(self._create_layer_mappings(layer_idx, hf_prefix=hf_prefix))
 
         return mappings
 

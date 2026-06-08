@@ -51,9 +51,6 @@ class TestQwenModel(CustomTestCase):
                 "--ep-size",
                 "4",
             ],
-            env={
-                "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
-            },
         )
 
     @classmethod
@@ -114,9 +111,6 @@ class TestQwenModelForFusedMoE(CustomTestCase):
                 "--moe-backend",
                 "fused",
             ],
-            env={
-                "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
-            },
         )
 
     @classmethod

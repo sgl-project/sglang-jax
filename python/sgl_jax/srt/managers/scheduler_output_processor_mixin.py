@@ -27,6 +27,47 @@ logger = logging.getLogger(__name__)
 DEFAULT_FORCE_STREAM_INTERVAL = 50
 
 
+def _input_logprob_lens_per_dp(batch: ScheduleBatch) -> list[int] | None:
+    if not batch.forward_mode.is_extend():
+        return None
+
+    lens_per_dp = []
+    for info in batch.reqs_info:
+        extend_lens = info.extend_lens or []
+        start_lens = info.extend_logprob_start_lens or []
+        lens_per_dp.append(
+            sum(
+                max(extend_len - start_len, 0)
+                for extend_len, start_len in zip(extend_lens, start_lens)
+            )
+        )
+    return lens_per_dp
+
+
+def _materialize_input_token_logprobs(input_token_logprobs, lens_per_dp: list[int] | None = None):
+    input_shape = getattr(input_token_logprobs, "shape", None)
+    if input_shape is not None and len(input_shape) != 1:
+        raise RuntimeError(
+            "input_token_logprobs must be a 1-D scalar logprob array before "
+            f"host transfer; got shape {input_shape}. This would expose "
+            "full-vocab logprob rows in meta_info and can exhaust host RAM."
+        )
+    host_logprobs = np.asarray(jax.device_get(input_token_logprobs))
+
+    values = host_logprobs.astype(float).tolist()
+    if lens_per_dp:
+        valid_len = sum(lens_per_dp)
+        if len(values) != valid_len and len(values) % len(lens_per_dp) == 0:
+            per_dp_token_size = len(values) // len(lens_per_dp)
+            compact_values = []
+            offset = 0
+            for dp_valid_len in lens_per_dp:
+                compact_values.extend(values[offset : offset + dp_valid_len])
+                offset += per_dp_token_size
+            values = compact_values
+    return tuple(values)
+
+
 class SchedulerOutputProcessorMixin:
     """
     This class implements the output processing logic for Scheduler.
@@ -52,7 +93,11 @@ class SchedulerOutputProcessorMixin:
         result: GenerationBatchResult,
         launch_done: threading.Event | None = None,
     ):
-        skip_stream_req = None
+        # On dp>1 each dp rank can have its own chunked-in-flight req, so this
+        # must hold up to `dp_size` reqs, not just one. A single-Req variable
+        # (the pre-DP design) silently leaked unchunked reqs into stream_output
+        # with `input_token_logprobs_val` still None, crashing the consumer.
+        skip_stream_reqs: set = set()
 
         assert self.is_generation
         (
@@ -78,15 +123,19 @@ class SchedulerOutputProcessorMixin:
                 logits_output.next_token_logprobs = jax.device_get(
                     logits_output.next_token_logprobs
                 ).astype(float)
-            if batch.return_logprob:
-                if logits_output.next_token_logprobs is not None:
-                    logits_output.next_token_logprobs = jax.device_get(
-                        logits_output.next_token_logprobs
-                    ).astype(float)
-                if logits_output.input_token_logprobs is not None:
-                    logits_output.input_token_logprobs = tuple(
-                        jax.device_get(logits_output.input_token_logprobs).astype(float)
-                    )
+            if batch.return_logprob and logits_output.next_token_logprobs is not None:
+                logits_output.next_token_logprobs = jax.device_get(
+                    logits_output.next_token_logprobs
+                ).astype(float)
+
+        # Compact the per-DP padded scalar input_token_logprobs so the logprob_pt
+        # walk below stays aligned. Runs for overlap (resolve_last_batch_result
+        # leaves it flat-padded) and non-overlap; no-op when already compact.
+        if batch.return_logprob and logits_output.input_token_logprobs is not None:
+            logits_output.input_token_logprobs = _materialize_input_token_logprobs(
+                logits_output.input_token_logprobs,
+                _input_logprob_lens_per_dp(batch),
+            )
         hidden_state_offset = 0
         per_dp_bs_size = batch.per_dp_bs_size
 
@@ -199,10 +248,9 @@ class SchedulerOutputProcessorMixin:
                 else:
                     # being chunked reqs' prefill is not finished
                     req.is_chunked -= 1
-                    # There is only at most one request being currently chunked.
-                    # Because this request does not finish prefill,
-                    # we don't want to stream the request currently being chunked.
-                    skip_stream_req = req
+                    # On dp>1, multiple reqs (one per dp rank) can be chunked
+                    # in the same batch; collect all so stream_output skips them.
+                    skip_stream_reqs.add(id(req))
 
                     # Incrementally update input logprobs.
                     if req.return_logprob:
@@ -239,27 +287,46 @@ class SchedulerOutputProcessorMixin:
             all_reqs,
             batch.return_logprob,
             batch.return_output_logprob_only,
-            skip_stream_req,
+            skip_stream_reqs,
             cache_miss_count,
         )
 
-        batch.spec_info = result.next_draft_input
+        if result.next_draft_input is not None:
+            real_bs_per_dp = [len(info.reqs) if info.reqs else 0 for info in batch.reqs_info]
+            per_rank_spec = ScheduleBatch._split_spec_info_per_rank(
+                result.next_draft_input, real_bs_per_dp
+            )
+            for r, s in enumerate(per_rank_spec):
+                batch.reqs_info[r].spec_info = s
 
     def _resolve_spec_decode_token_ids(
         self: Scheduler, result: GenerationBatchResult, batch: ScheduleBatch
     ) -> list[list[int]]:
-        """Resolve the padding next token ids for speculative decoding with overlap."""
+        """Resolve per-req accepted token lists from the verify output.
 
-        next_token_ids = result.next_token_ids
-        accept_lens = result.accept_lens.tolist()
-        result.num_accepted_tokens = sum(accept_lens) - len(batch.reqs)
-        predict_tokens = []
+        Returns a list of length ``per_dp_bs * dp_size`` (DP-padded order),
+        with ``[]`` at padding slots, so the per-rank slice in
+        ``process_batch_result_decode`` works for any ``dp_size``.
+        """
+        next_token_ids = np.asarray(jax.device_get(result.next_token_ids))
+        accept_lens = np.asarray(jax.device_get(result.accept_lens)).tolist()
         stride = self.draft_worker.speculative_num_draft_tokens
-        for i, req in enumerate(batch.reqs):
-            predict_tokens.append(next_token_ids[i * stride : i * stride + accept_lens[i]])
-            req.spec_verify_ct += 1
-            req.spec_accepted_tokens += accept_lens[i]
-
+        per_dp_bs = batch.per_dp_bs_size
+        total_bs = per_dp_bs * batch.dp_size
+        predict_tokens: list[list[int]] = [[] for _ in range(total_bs)]
+        n_real = 0
+        total_accepted = 0
+        for dp_rank, info in enumerate(batch.reqs_info):
+            base = dp_rank * per_dp_bs
+            for j, req in enumerate(info.reqs or []):
+                i = base + j
+                a = accept_lens[i]
+                predict_tokens[i] = next_token_ids[i * stride : i * stride + a].tolist()
+                req.spec_verify_ct += 1
+                req.spec_accepted_tokens += a
+                total_accepted += a
+                n_real += 1
+        result.num_accepted_tokens = total_accepted - n_real
         return predict_tokens
 
     def process_batch_result_decode(
@@ -350,8 +417,11 @@ class SchedulerOutputProcessorMixin:
                 if req.finished():
                     self.maybe_collect_routed_experts(req)
                     if batch.spec_algorithm is not None and batch.spec_algorithm.is_eagle():
-                        cur_allocate_len = info.spec_info.allocate_lens[i]
-                        all_token_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+                        cur_allocate_len = int(info.spec_info.allocate_lens[i])
+                        actual_token_len = len(req.origin_input_ids) + max(
+                            len(req.output_ids) - 1, 0
+                        )
+                        all_token_len = actual_token_len
                         if self.page_size > 1:
                             all_token_len = cdiv(all_token_len, self.page_size) * self.page_size
                         kv_indices = self.req_to_token_pool.req_to_token[
@@ -366,6 +436,16 @@ class SchedulerOutputProcessorMixin:
                         ), f"redundant kv indices {len(kv_indices)=} should less than {EagleDraftInput.ALLOC_LEN_PER_DECODE=}"
 
                         self.token_to_kv_pool_allocator.free(kv_indices, dp_rank)
+                        # Spec decode allocates via EagleDraftInput.prepare_for_decode,
+                        # not ScheduleBatch.prepare_for_decode, so kv_committed_len is
+                        # never bumped past prefill. cache_finished_req would then
+                        # free only the prefill page and leak every decode-allocated
+                        # page (visible on idle check_memory at bs=1). Use the
+                        # *unaligned* actual token count: ChunkCache.cache_finished_req
+                        # does NOT filter 0-valued req_to_token entries, so a
+                        # page-aligned length would free the page-0 sentinel.
+                        req.kv_committed_len = actual_token_len
+                        req.kv_allocated_len = actual_token_len
                     # End trace for finished request
                     if precision_tracer.get_trace_active():
                         precision_tracer.set_request_status_to_completed(req.rid)
@@ -623,13 +703,18 @@ class SchedulerOutputProcessorMixin:
         reqs: list[Req],
         return_logprob: bool,
         return_output_logprob_only: bool,
-        skip_req: Req | None = None,
+        skip_reqs: set | Req | None = None,
         cache_miss_count: int = None,
     ):
-        """Stream the output to detokenizer."""
+        """Stream the output to detokenizer.
+
+        `skip_reqs` accepts either a `set` of `id(req)` to skip, or a single
+        `Req` (back-compat). A set is required on dp>1 because more than one
+        req can be mid-chunked in the same batch.
+        """
         assert self.is_generation
         self.stream_output_generation(
-            reqs, return_logprob, return_output_logprob_only, skip_req, cache_miss_count
+            reqs, return_logprob, return_output_logprob_only, skip_reqs, cache_miss_count
         )
 
     def stream_output_generation(
@@ -637,9 +722,15 @@ class SchedulerOutputProcessorMixin:
         reqs: list[Req],
         return_logprob: bool,
         return_output_logprob_only: bool,
-        skip_req: Req | None = None,
+        skip_reqs: set | Req | None = None,
         cache_miss_count: int = None,
     ):
+        if skip_reqs is None:
+            skip_ids: set = set()
+        elif isinstance(skip_reqs, set):
+            skip_ids = skip_reqs
+        else:
+            skip_ids = {id(skip_reqs)}
         rids = []
         finished_reasons: list[BaseFinishReason] = []
 
@@ -691,7 +782,7 @@ class SchedulerOutputProcessorMixin:
             ) = output_token_ids_logprobs_idx = None
 
         for req in reqs:
-            if req is skip_req:
+            if id(req) in skip_ids:
                 continue
 
             if req.finished():
@@ -728,18 +819,20 @@ class SchedulerOutputProcessorMixin:
 
                 decode_ids_list.append(decode_ids[req.send_decode_id_offset :])
 
+                output_ids_ = req.output_ids_through_stop
+
                 req.send_decode_id_offset = len(decode_ids)
                 read_offsets.append(read_offset)
                 if self.skip_tokenizer_init:
-                    output_ids.append(req.output_ids[send_token_offset:])
-                req.send_token_offset = len(req.output_ids)
+                    output_ids.append(output_ids_[send_token_offset:])
+                req.send_token_offset = len(output_ids_)
                 skip_special_tokens.append(req.sampling_params.skip_special_tokens)
                 spaces_between_special_tokens.append(
                     req.sampling_params.spaces_between_special_tokens
                 )
                 no_stop_trim.append(req.sampling_params.no_stop_trim)
                 prompt_tokens.append(len(req.origin_input_ids))
-                completion_tokens.append(len(req.output_ids))
+                completion_tokens.append(len(output_ids_))
                 cached_tokens.append(req.cached_tokens)
 
                 if self.spec_algorithm is not None and not self.spec_algorithm.is_none():

@@ -68,15 +68,6 @@ class EagleDraftWorker(BaseDraftWorker):
 
         self._share_embed_head(target_worker)
 
-        target_slot_range = target_worker.model_runner.max_total_num_tokens
-        draft_pool_size = self.draft_model_runner.max_total_num_tokens
-        assert draft_pool_size >= target_slot_range, (
-            f"draft KV pool ({draft_pool_size}) < target allocator slot range "
-            f"({target_slot_range}); high-slot draft KV reads/writes will be "
-            f"garbage. Hybrid target without the post-set_num_token_hybrid "
-            f"draft_runner_cache_size overwrite hits this."
-        )
-
         self._worker.model_runner.initialize_jit()
 
         (
@@ -155,7 +146,7 @@ class EagleDraftWorker(BaseDraftWorker):
             retrive_next_sibling,
             draft_tokens,
         ) = build_tree_kernel_efficient(
-            model_worker_batch.spec_info.verified_id,
+            model_worker_batch.spec_info_padded.verified_id,
             score_list,
             token_list,
             parents_list,
@@ -168,7 +159,7 @@ class EagleDraftWorker(BaseDraftWorker):
             model_worker_batch.speculative_num_steps,
             self.mesh,
         )
-        model_worker_batch.spec_info = EagleVerifyInput(
+        model_worker_batch.spec_info_padded = EagleVerifyInput(
             draft_token=draft_tokens,
             custom_mask=tree_mask,
             positions=position,
@@ -190,8 +181,9 @@ class EagleDraftWorker(BaseDraftWorker):
         hidden_states: jax.Array,
         next_token_ids: jax.Array,
     ) -> None:
-        verified_id_np = np.asarray(jax.device_get(next_token_ids))[: model_worker_batch.real_bs]
-        model_worker_batch.spec_info = EagleDraftInput(
+        sel = np.asarray(model_worker_batch.logits_indices_selector)
+        verified_id_np = np.asarray(jax.device_get(next_token_ids))[sel]
+        model_worker_batch.spec_info_padded = EagleDraftInput(
             hidden_states=hidden_states,
             verified_id=verified_id_np,
             num_tokens_per_batch=np.asarray(1, dtype=jnp.int32),
@@ -199,11 +191,18 @@ class EagleDraftWorker(BaseDraftWorker):
             allocate_lens=model_worker_batch.seq_lens,
         )
         model_worker_batch.return_hidden_states = False
-        model_worker_batch.spec_info.prepare_for_extend_after_target_prefill(
+        model_worker_batch.spec_info_padded.prepare_for_extend_after_target_prefill(
             model_worker_batch=model_worker_batch
         )
-        model_worker_batch.spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
+        model_worker_batch.spec_info_padded.capture_hidden_mode = CaptureHiddenMode.LAST
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
+
+        padded_bs = int(model_worker_batch.seq_lens.shape[0])
+        if verified_id_np.shape[0] < padded_bs:
+            model_worker_batch.spec_info_padded.verified_id = np.pad(
+                verified_id_np, ((0, padded_bs - verified_id_np.shape[0]),)
+            )
+
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.draft_model_runner)
         forward_batch.return_logprob = False
 
@@ -218,17 +217,19 @@ class EagleDraftWorker(BaseDraftWorker):
             forward_batch,
             logits_metadata=LogitsMetadata.from_model_worker_batch(model_worker_batch, self.mesh),
         )
-        logits_output.next_token_logits = logits_output.next_token_logits[
-            : model_worker_batch.real_bs, :
-        ]
-        if len(logits_output.hidden_states.shape) == 1:
-            logits_output.hidden_states = jnp.expand_dims(logits_output.hidden_states, axis=0)
+        # Restore real_bs so split_spec_info_per_rank cuts on real_bs_per_dp.
+        model_worker_batch.spec_info_padded.verified_id = verified_id_np
+        rep_logits, rep_hidden = replicate_to_mesh(
+            self.mesh, logits_output.next_token_logits, logits_output.hidden_states
+        )
+        if len(rep_hidden.shape) == 1:
+            rep_hidden = jnp.expand_dims(rep_hidden, axis=0)
+        logits_output.next_token_logits = rep_logits
+        logits_output.hidden_states = rep_hidden
         assert isinstance(forward_batch.spec_info, EagleDraftInput)
-        forward_batch.spec_info.allocate_lens = model_worker_batch.seq_lens[
-            : model_worker_batch.real_bs
-        ]
+        forward_batch.spec_info.allocate_lens = np.asarray(model_worker_batch.seq_lens)[sel]
 
-        self.capture_for_decode(logits_output, forward_batch.spec_info)
+        self.capture_for_decode(logits_output, forward_batch.spec_info, sel=sel)
 
     def draft_extend_for_decode(
         self, model_worker_batch: ModelWorkerBatch, batch_output: GenerationBatchResult
@@ -253,44 +254,61 @@ class EagleDraftWorker(BaseDraftWorker):
             forward_batch,
             logits_metadata=logits_metadata,
         )
-        select_index = (
-            np.arange(len(model_worker_batch.seq_lens[: model_worker_batch.real_bs]))
-            * (self.speculative_num_steps + 1)
-            + batch_output.accept_lens[: model_worker_batch.real_bs]
-            - 1
-        )
+        sel = np.asarray(model_worker_batch.logits_indices_selector)
+        accept_host = np.asarray(jax.device_get(batch_output.accept_lens))
+        select_index = sel * (self.speculative_num_steps + 1) + accept_host[sel] - 1
         rep_logits, rep_hidden = replicate_to_mesh(
             self.mesh, draft_logits_output.next_token_logits, draft_logits_output.hidden_states
         )
-        draft_logits_output.next_token_logits = rep_logits[select_index]
-        draft_logits_output.hidden_states = rep_hidden[select_index]
-        topk_p, topk_index = topk_probs_from_logits(
-            draft_logits_output.next_token_logits, self.topk
-        )
+        # topk_probs_from_logits runs as @jax.jit on bucket-shaped rep_logits;
+        # keep this on device with stable shape.
+        topk_p, topk_index = topk_probs_from_logits(rep_logits, self.topk)
+        # Gather to real_bs on host to avoid variable-shape device gathers.
+        jax.copy_to_host_async(topk_p)
+        jax.copy_to_host_async(topk_index)
+        jax.copy_to_host_async(rep_hidden)
+        verified_id_arr = batch_output.next_draft_input.verified_id
+        if hasattr(verified_id_arr, "copy_to_host_async"):
+            jax.copy_to_host_async(verified_id_arr)
+        topk_p = np.asarray(topk_p)[sel]
+        topk_index = np.asarray(topk_index)[sel]
+        hidden = np.asarray(rep_hidden)[select_index]
+        verified_id = np.asarray(verified_id_arr)[select_index]
 
-        batch_output.next_draft_input.hidden_states = draft_logits_output.hidden_states
+        batch_output.next_draft_input.hidden_states = hidden
         batch_output.next_draft_input.topk_p = topk_p
         batch_output.next_draft_input.topk_index = topk_index
-        batch_output.next_draft_input.verified_id = batch_output.next_draft_input.verified_id[
-            select_index
-        ]
+        batch_output.next_draft_input.verified_id = verified_id
         batch_output.allocate_lens = batch_output.allocate_lens[: model_worker_batch.real_bs]
-        batch_output.accept_lens = batch_output.accept_lens[: model_worker_batch.real_bs]
+        batch_output.accept_lens = accept_host
 
     # -- Internal draft helpers --
 
     def capture_for_decode(
-        self, logits_output: LogitsProcessorOutput, draft_input: EagleDraftInput
+        self, logits_output: LogitsProcessorOutput, draft_input: EagleDraftInput, sel=None
     ):
         topk_p, topk_index = topk_probs_from_logits(logits_output.next_token_logits, self.topk)
+        hidden = replicate_to_mesh(self.mesh, logits_output.hidden_states)
+        if sel is not None:
+            jax.copy_to_host_async(topk_p)
+            jax.copy_to_host_async(topk_index)
+            jax.copy_to_host_async(hidden)
+            topk_p = np.asarray(topk_p)[sel]
+            topk_index = np.asarray(topk_index)[sel]
+            hidden = np.asarray(hidden)[sel]
         draft_input.topk_p = topk_p
         draft_input.topk_index = topk_index
-        draft_input.hidden_states = replicate_to_mesh(self.mesh, logits_output.hidden_states)
+        draft_input.hidden_states = hidden
 
     def padding_for_decode(self, model_worker_batch: ModelWorkerBatch):
-        _, padding_bs_index = self.get_padding_bs(model_worker_batch.real_bs)
+        # At dp>1 the incoming mwb is already DP-padded to total_bs (== a bucket
+        # value, see _get_spec_decode_mwb_dp); use the larger of real_bs and the
+        # incoming seq_lens length so we don't shrink below the DP layout.
+        _, padding_bs_index = self.get_padding_bs(
+            max(model_worker_batch.real_bs, len(model_worker_batch.seq_lens))
+        )
         self.copy_model_worker_batch_to_cpu(model_worker_batch)
-        model_worker_batch.spec_info.prepare_for_draft_decode(
+        model_worker_batch.spec_info_padded.prepare_for_draft_decode(
             model_worker_batch, self.topk, self.speculative_num_steps
         )
         model_worker_batch.seq_lens = model_worker_batch.seq_lens
@@ -300,39 +318,50 @@ class EagleDraftWorker(BaseDraftWorker):
         token_indices_with_all_reqs = req_to_token_pool.req_to_token[
             model_worker_batch.req_pool_indices
         ]
-        spec_info = model_worker_batch.spec_info
+        spec_info = model_worker_batch.spec_info_padded
         assert isinstance(spec_info, EagleDraftInput)
-        cache_loc_flat = np.array([], dtype=np.int32)
-        if len(seq_lens_cpu) > 0:
-            valid_mask = seq_lens_cpu > 0
-            if np.any(valid_mask):
-                valid_indices = np.where(valid_mask)[0]
-                valid_allocate_lens = spec_info.allocate_lens[valid_mask]
-                aligned_lengths = ((valid_allocate_lens + page_size - 1) // page_size) * page_size
-                total_aligned_length = np.sum(aligned_lengths)
-                cache_loc_flat = np.zeros(total_aligned_length, dtype=np.int32)
-                offset = 0
-                for i, (seq_idx, allocate_len, aligned_len) in enumerate(
-                    zip(valid_indices, valid_allocate_lens, aligned_lengths)
-                ):
-                    cache_loc_flat[offset : offset + allocate_len] = token_indices_with_all_reqs[
-                        seq_idx, :allocate_len
-                    ]
-                    offset += aligned_len
+        # At dp>1 spec_info arrays arrive at (real_bs,) but seq_lens_cpu is
+        # (total_bs,); pad allocate_lens up front so valid_mask indexing works
+        # (the per-field bs-padding loop below would do this anyway, just later).
+        if len(spec_info.allocate_lens) < len(seq_lens_cpu):
+            spec_info.allocate_lens = np.pad(
+                spec_info.allocate_lens, (0, len(seq_lens_cpu) - len(spec_info.allocate_lens))
+            )
+        # DP-segmented cache_loc: rank r's slots occupy
+        # [r*per_dp_cache_len : (r+1)*per_dp_cache_len) so the P("data") shard
+        # gives each rank its own page_indices (not the contiguous-then-padding
+        # layout where rank>0's shard lands in the padding region).
         total_cache_loc_size = self.precompile_cache_loc_paddings[padding_bs_index]
-        assert total_cache_loc_size >= len(cache_loc_flat)
-        cache_loc_cpu = np.empty(total_cache_loc_size, dtype=np.int32)
-        if len(cache_loc_flat) > 0:
-            cache_loc_cpu[: len(cache_loc_flat)] = cache_loc_flat
-        if len(cache_loc_flat) < total_cache_loc_size:
-            cache_loc_cpu[len(cache_loc_flat) :] = 0
+        dp_size = model_worker_batch.dp_size
+        per_dp_bs = model_worker_batch.per_dp_bs_size if dp_size > 1 else len(seq_lens_cpu)
+        assert total_cache_loc_size % dp_size == 0
+        per_dp_cache_len = total_cache_loc_size // dp_size
+        cache_loc_cpu = np.zeros(total_cache_loc_size, dtype=np.int32)
+        valid_mask = seq_lens_cpu > 0
+        if np.any(valid_mask):
+            valid_indices = np.where(valid_mask)[0]
+            valid_allocate_lens = spec_info.allocate_lens[valid_mask]
+            aligned_lengths = ((valid_allocate_lens + page_size - 1) // page_size) * page_size
+            intra_rank_off = np.zeros(dp_size, dtype=np.int64)
+            for seq_idx, allocate_len, aligned_len in zip(
+                valid_indices, valid_allocate_lens, aligned_lengths
+            ):
+                r = int(seq_idx) // per_dp_bs
+                base = r * per_dp_cache_len + intra_rank_off[r]
+                assert (
+                    base + aligned_len <= (r + 1) * per_dp_cache_len
+                ), f"rank {r} cache_loc overflow: {intra_rank_off[r]+aligned_len} > {per_dp_cache_len}"
+                cache_loc_cpu[base : base + allocate_len] = token_indices_with_all_reqs[
+                    seq_idx, :allocate_len
+                ]
+                intra_rank_off[r] += aligned_len
 
         model_worker_batch.cache_loc = cache_loc_cpu
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
 
         topk_index = spec_info.topk_index
         if self.hot_token_ids is not None:
-            model_worker_batch.spec_info.topk_index = self.hot_token_ids[topk_index]
+            model_worker_batch.spec_info_padded.topk_index = self.hot_token_ids[topk_index]
         if self.topk > 1:
             self.draft_model_runner.attn_backend.forward_metadata.custom_mask = (
                 build_tree_mask_for_draft_decode(
@@ -343,44 +372,38 @@ class EagleDraftWorker(BaseDraftWorker):
                 )
             )
         bs = self.precompile_bs_paddings[padding_bs_index]
-        if bs - model_worker_batch.spec_info.verified_id.shape[0] > 0:
-            model_worker_batch.spec_info.verified_id = np.pad(
-                model_worker_batch.spec_info.verified_id,
-                ((0, bs - model_worker_batch.spec_info.verified_id.shape[0]),),
-            )
-        if bs - model_worker_batch.spec_info.topk_p.shape[0] > 0:
-            model_worker_batch.spec_info.topk_p = np.pad(
-                model_worker_batch.spec_info.topk_p,
-                (
-                    (0, bs - model_worker_batch.spec_info.topk_p.shape[0]),
-                    (0, 0),
-                ),
-            )
+        dp_size = model_worker_batch.dp_size
+        per_dp_padded = bs // dp_size
+
+        def _dp_segment_pad(arr, target_bs):
+            """DP-segmented pad: pad each rank's section separately to per_dp_padded.
+
+            Input arr shape (curr_bs, ...) with curr_bs = per_dp_curr * dp_size.
+            Returns (target_bs, ...) with each rank's slice padded at the end.
+            End-padding the whole array would let shard_map(P("data")) hand a
+            following rank's data to a prior rank.
+            """
+            if arr is None or arr.shape[0] >= target_bs:
+                return arr
+            per_dp_curr = max(arr.shape[0] // dp_size, 1)
+            if dp_size <= 1 or arr.shape[0] % dp_size != 0:
+                # Fallback to end-pad if layout isn't DP-divisible (dp=1 path).
+                pad_widths = [(0, target_bs - arr.shape[0])] + [(0, 0)] * (arr.ndim - 1)
+                return np.pad(arr, pad_widths)
+            reshaped = arr.reshape((dp_size, per_dp_curr) + arr.shape[1:])
+            pad_widths = [(0, 0), (0, per_dp_padded - per_dp_curr)] + [(0, 0)] * (arr.ndim - 1)
+            padded = np.pad(reshaped, pad_widths)
+            return padded.reshape((target_bs,) + arr.shape[1:])
+
+        spec_info_padded = model_worker_batch.spec_info_padded
+        spec_info_padded.verified_id = _dp_segment_pad(spec_info_padded.verified_id, bs)
+        spec_info_padded.topk_p = _dp_segment_pad(spec_info_padded.topk_p, bs)
         if bs - model_worker_batch.seq_lens.shape[0] > 0:
-            model_worker_batch.seq_lens = np.pad(
-                model_worker_batch.seq_lens, ((0, bs - model_worker_batch.seq_lens.shape[0]),)
-            )
-            if model_worker_batch.spec_info.allocate_lens is not None:
-                model_worker_batch.spec_info.allocate_lens = np.pad(
-                    model_worker_batch.spec_info.allocate_lens,
-                    ((0, bs - model_worker_batch.spec_info.allocate_lens.shape[0]),),
-                )
-        if bs - model_worker_batch.spec_info.topk_index.shape[0] > 0:
-            model_worker_batch.spec_info.topk_index = np.pad(
-                model_worker_batch.spec_info.topk_index,
-                (
-                    (0, bs - model_worker_batch.spec_info.topk_index.shape[0]),
-                    (0, 0),
-                ),
-            )
-        if bs - model_worker_batch.spec_info.hidden_states.shape[0] > 0:
-            model_worker_batch.spec_info.hidden_states = np.pad(
-                model_worker_batch.spec_info.hidden_states,
-                (
-                    (0, bs - model_worker_batch.spec_info.hidden_states.shape[0]),
-                    (0, 0),
-                ),
-            )
+            model_worker_batch.seq_lens = _dp_segment_pad(model_worker_batch.seq_lens, bs)
+            if spec_info_padded.allocate_lens is not None:
+                spec_info_padded.allocate_lens = _dp_segment_pad(spec_info_padded.allocate_lens, bs)
+        spec_info_padded.topk_index = _dp_segment_pad(spec_info_padded.topk_index, bs)
+        spec_info_padded.hidden_states = _dp_segment_pad(spec_info_padded.hidden_states, bs)
         model_worker_batch.speculative_eagle_topk = self.topk
         model_worker_batch.speculative_num_steps = self.speculative_num_steps
         model_worker_batch.speculative_num_draft_tokens = self.speculative_num_draft_tokens
@@ -389,9 +412,9 @@ class EagleDraftWorker(BaseDraftWorker):
 
     def draft_forward(self, model_worker_batch: ModelWorkerBatch):
         topk_p, topk_index, hidden_states = (
-            model_worker_batch.spec_info.topk_p,
-            model_worker_batch.spec_info.topk_index,
-            model_worker_batch.spec_info.hidden_states,
+            model_worker_batch.spec_info_padded.topk_p,
+            model_worker_batch.spec_info_padded.topk_index,
+            model_worker_batch.spec_info_padded.hidden_states,
         )
         bs = model_worker_batch.seq_lens.shape[0]
         step_min_1 = self.speculative_num_steps - 1
@@ -449,11 +472,9 @@ class EagleDraftWorker(BaseDraftWorker):
         return score_list, token_list, parents_list
 
     def _pick_context_len(self, max_seq_len: int) -> int:
-        max_seq_len = max(int(max_seq_len), 1)
         if self.precompile_token_paddings:
-            for padding in self.precompile_token_paddings:
-                if padding >= max_seq_len:
-                    return padding
+            return self.precompile_token_paddings[-1]
+        max_seq_len = max(int(max_seq_len), 1)
         return 1 << (max_seq_len - 1).bit_length()
 
     def copy_model_worker_batch_to_cpu(self, model_worker_batch: ModelWorkerBatch):
@@ -639,6 +660,10 @@ def select_top_k_tokens_step_greater_0(
     scores: jax.Array,
     topk: int,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    # scores carries the prior step's top-k probs; topk_p comes from the next
+    # draft forward. Target and draft logits can be different dtypes (e.g. MiMo
+    # V2 Flash), so promote before lax.mul which requires matching dtypes.
+    scores = scores.astype(topk_p.dtype)
     expand_scores = jax.lax.mul(jnp.expand_dims(scores, axis=2), topk_p.reshape(-1, topk, topk))
     topk_cs_p, topk_cs_index = fast_topk(
         expand_scores.reshape(expand_scores.shape[0], -1), topk, axis=-1

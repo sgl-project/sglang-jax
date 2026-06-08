@@ -248,13 +248,12 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             return compute_logprobs(mesh, logits, next_tokens)
 
         def run_model_wrapper(forward_batch, logits_metadata):
-            memory_pools = self.memory_pools
             return jitted_run_model(
                 model_def,
                 model_state_def,
                 self.model_state_leaves,
                 forward_batch,
-                memory_pools,
+                self.memory_pools,
                 logits_metadata,
             )
 
@@ -627,8 +626,20 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             ratio = 1.0
 
         denominator = swa_full_tokens_ratio * swa_layers_num * ratio + full_layers_num
-        self.full_max_total_num_tokens = int(total_tokens / denominator)
-        self.swa_max_total_num_tokens = int(self.full_max_total_num_tokens * swa_full_tokens_ratio)
+        if self.is_draft_worker:
+            if full_layers_num == 0:
+                self.full_max_total_num_tokens = 0
+                self.swa_max_total_num_tokens = self.max_total_num_tokens
+            else:
+                self.full_max_total_num_tokens = self.max_total_num_tokens
+                self.swa_max_total_num_tokens = int(
+                    self.max_total_num_tokens * swa_full_tokens_ratio
+                )
+        else:
+            self.full_max_total_num_tokens = int(total_tokens / denominator)
+            self.swa_max_total_num_tokens = int(
+                self.full_max_total_num_tokens * swa_full_tokens_ratio
+            )
 
         # Align pool sizes to page_size and dp_size for sharding compatibility
         dp_size = self.server_args.dp_size

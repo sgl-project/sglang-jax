@@ -201,7 +201,9 @@ class RotaryEmbedding:
         is_neox_style: bool,
         dtype: jnp.dtype,
         linear_scaling_factor: float = 1.0,
+        mesh: jax.sharding.Mesh | None = None,
     ):
+        del mesh
         if linear_scaling_factor <= 0:
             raise ValueError(
                 f"linear_scaling_factor must be positive, got {linear_scaling_factor}."
@@ -627,7 +629,13 @@ def get_rope(
         else:
             raise ValueError("Unknown RoPE scaling type")
 
-        if scaling_type == "llama3":
+        if scaling_type == "default":
+            # HF transformers uses rope_type="default" to mean "no scaling",
+            # equivalent to rope_scaling=None.  Fall back to plain RotaryEmbedding.
+            rotary_emb = RotaryEmbedding(
+                head_size, rotary_dim, max_position, base, is_neox_style, dtype
+            )
+        elif scaling_type == "llama3":
             scaling_factor = rope_scaling["factor"]
             low_freq_factor = rope_scaling["low_freq_factor"]
             high_freq_factor = rope_scaling["high_freq_factor"]
@@ -696,7 +704,7 @@ def _yarn_find_correction_range(
     low_rot: int,
     high_rot: int,
     dim: int,
-    base: int,
+    base: int | float,
     max_position_embeddings: int,
 ) -> tuple[float, float]:
     low = math.floor(_yarn_find_correction_dim(low_rot, dim, base, max_position_embeddings))

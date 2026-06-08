@@ -297,18 +297,35 @@ class ForwardBatch:
         jax_arrays_str = ", ".join(jax_array_fields)
         return f"ForwardBatch(forward_mode={self.forward_mode}, batch_size={self.batch_size}, {jax_arrays_str})"
 
-    def get_token_valid_mask(self, num_tokens: int) -> jax.Array | None:
+    def get_token_valid_mask(
+        self,
+        num_tokens: int,
+        out_sharding: NamedSharding | None = None,
+    ) -> jax.Array | None:
         """Return a per-token validity mask for padded batches.
 
         Prefer using `out_cache_loc` when available because it aligns with the
         token dimension in both decode and extend: padded tokens are marked as
         `-1` in `out_cache_loc`.
+
+        If ``out_sharding`` is provided, the mask is resharded to it before
+        return (caller's responsibility to construct a 1D sharding compatible
+        with their downstream broadcast operands).
         """
         if self.out_cache_loc is not None and self.out_cache_loc.shape == (num_tokens,):
-            return self.out_cache_loc > 0
-        if self.seq_lens is None or self.seq_lens.ndim != 1 or num_tokens != self.seq_lens.shape[0]:
+            mask = self.out_cache_loc > 0
+        elif (
+            self.seq_lens is not None
+            and self.seq_lens.ndim == 1
+            and num_tokens == self.seq_lens.shape[0]
+        ):
+            mask = self.seq_lens > 0
+        else:
             return None
-        return self.seq_lens > 0
+
+        if out_sharding is not None:
+            mask = jax.sharding.reshard(mask, out_sharding)
+        return mask
 
     @classmethod
     def init_new(
@@ -409,7 +426,7 @@ class ForwardBatch:
             lora_token_indices=lora_token_indices,
             lora_ranks=lora_ranks,
             attn_backend=model_runner.attn_backend,
-            spec_info=batch.spec_info,
+            spec_info=batch.spec_info_padded,
             spec_algorithm=batch.spec_algorithm,
             capture_hidden_mode=batch.capture_hidden_mode,
             input_embedding=input_embedding,

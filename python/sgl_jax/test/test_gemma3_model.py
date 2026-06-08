@@ -304,10 +304,7 @@ def test_conditional_language_model_weight_mappings_use_prefixed_hf_keys():
         mappings["language_model.model.layers.0.self_attn.q_norm.weight"].target_path
         == "model.layers.0.self_attn.q_norm.weight"
     )
-    assert (
-        mappings["language_model.model.layers.0.self_attn.k_norm.weight"].sharding
-        == (None,)
-    )
+    assert mappings["language_model.model.layers.0.self_attn.k_norm.weight"].sharding == (None,)
     assert "model.layers.0.self_attn.q_norm.weight" not in mappings
 
 

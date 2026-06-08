@@ -27,7 +27,6 @@ class TestW8Int8MoeBlockLinearChannelQuant(CustomTestCase):
         "--download-dir=/dev/shm",
         "--max-running-requests=64",
         "--page-size=64",
-        "--disable-precompile",
     ]
 
     @classmethod
@@ -43,7 +42,6 @@ class TestW8Int8MoeBlockLinearChannelQuant(CustomTestCase):
             cls.base_url,
             timeout=1800,
             other_args=other_args,
-            check_cache_miss=False,
         )
 
     @classmethod

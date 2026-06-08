@@ -5,14 +5,17 @@ import json
 import logging
 import os
 
+from sgl_jax.srt.multimodal.configs.dits.flux_model_config import FluxModelConfig
 from sgl_jax.srt.multimodal.configs.dits.wan_model_config import WanModelConfig
 from sgl_jax.srt.multimodal.configs.mimo_audio.mimo_audio_backbone_config import (
     MiMoAudioBackboneConfig,
 )
 from sgl_jax.srt.multimodal.configs.mimo_audio.mimo_audio_config import MiMoAudioConfig
+from sgl_jax.srt.multimodal.configs.multimodal_base_config import MultiModalModelConfigs
 from sgl_jax.srt.multimodal.configs.qwen_vl.qwen_2_5_vl_config import (
     QwenVLModelVitConfig,
 )
+from sgl_jax.srt.multimodal.configs.vaes.flux_vae_config import FluxVAEConfig
 from sgl_jax.srt.multimodal.configs.vaes.wan_vae_config import WanVAEConfig
 
 logger = logging.getLogger(__name__)
@@ -176,6 +179,8 @@ class DiffusionConfigRegistry:
             boundary_ratio=0.875,
             **DiffusionConfigRegistry._WAN_14B_ARCH,
         ),
+        # FLUX.1-dev
+        "black-forest-labs/FLUX.1-dev": lambda: FluxModelConfig(),
     }
 
     # Keyword patterns for fallback matching (order matters - more specific first)
@@ -216,6 +221,8 @@ class DiffusionConfigRegistry:
         ("T2V-1.3B", lambda: WanModelConfig(flow_shift=3.0)),
         # Generic Wan2.1 fallback (default to 1.3B/480P)
         ("Wan2.1", lambda: WanModelConfig(flow_shift=3.0)),
+        # FLUX.1.dev
+        ("FLUX.1-dev", lambda: FluxModelConfig()),
     ]
 
     @classmethod
@@ -230,7 +237,7 @@ class DiffusionConfigRegistry:
         logger.info("Registered diffusion config '%s'", model_name)
 
     @classmethod
-    def get_config(cls, model_path: str) -> WanModelConfig:
+    def get_config(cls, model_path: str) -> MultiModalModelConfigs:
         """Get the diffusion model config for a given model path.
 
         Args:
@@ -296,6 +303,8 @@ class VAEConfigRegistry:
 
     # Model name -> config factory mapping
     _REGISTRY: dict[str, callable] = {
+        "black-forest-labs/FLUX.1-dev": lambda: FluxVAEConfig(),
+        "FLUX.1-dev": lambda: FluxVAEConfig(),
         # Wan2.1 T2V 1.3B
         "Wan-AI/Wan2.1-T2V-1.3B-Diffusers": lambda: WanVAEConfig(),
         "Wan2.1-T2V-1.3B-Diffusers": lambda: WanVAEConfig(),
@@ -313,6 +322,7 @@ class VAEConfigRegistry:
 
     # Keyword patterns for fallback matching (order matters - more specific first)
     _KEYWORD_PATTERNS: list[tuple[str, callable]] = [
+        ("FLUX.1", lambda: FluxVAEConfig()),
         # Wan2.2 patterns
         ("Wan2.2", lambda: WanVAEConfig(is_residual=False)),
         # Wan2.1 patterns

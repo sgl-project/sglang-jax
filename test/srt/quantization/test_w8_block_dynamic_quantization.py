@@ -26,7 +26,6 @@ class TestW8Int8DynamicBlockQuant(CustomTestCase):
         "--download-dir=/dev/shm",
         "--max-running-requests=128",
         "--page-size=64",
-        "--disable-precompile",
     ]
 
     @classmethod
@@ -42,7 +41,6 @@ class TestW8Int8DynamicBlockQuant(CustomTestCase):
             cls.base_url,
             timeout=1200,
             other_args=other_args,
-            check_cache_miss=False,
         )
 
     @classmethod

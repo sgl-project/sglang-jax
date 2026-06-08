@@ -67,7 +67,7 @@ from sgl_jax.srt.managers.tp_worker import ModelWorker
 from sgl_jax.srt.managers.tp_worker_overlap_thread import ModelWorkerClient
 from sgl_jax.srt.managers.utils import validate_input_length
 from sgl_jax.srt.mem_cache.chunk_cache import ChunkCache
-from sgl_jax.srt.mem_cache.radix_cache import RadixCache
+from sgl_jax.srt.mem_cache.kv_cache_builder import build_kv_cache
 from sgl_jax.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.multimodal.tokenizer_utils import resolve_tokenizer_subdir
@@ -148,14 +148,56 @@ class Scheduler(
             server_args.model_sub_dir = stage_sub_dir
         # set jit cache
         jit_cache_dir = os.getenv("JAX_COMPILATION_CACHE_DIR", None)
+        device_indexes = server_args.device_indexes
+        # Report the effective persistent-cache state after resolving overrides below.
+        cache_status = None
+        # libtpu (tpu-v6e + libtpu 0.0.30) crashes during JAX persistent
+        # compilation-cache use when the device subset does not start at
+        # device 0 (e.g. device_indexes=[2, 3]). Disable the cache for
+        # such schedulers and override any cache config a sibling
+        # scheduler may have set in the same process. See
+        # sgl-project/sglang-jax#1216.
+        if (
+            jit_cache_dir is not None
+            and device_indexes is not None
+            and min(device_indexes, default=0) > 0
+        ):
+            jax.config.update("jax_compilation_cache_dir", "")
+            jit_cache_dir = None
+            # jax.config.update alone does not take effect once the
+            # compilation_cache module's _cache_initialized flag is set
+            # by an earlier sibling scheduler in the same process; that
+            # flag is one-shot. cc.reset_cache() is the only public API
+            # that clears it, forcing the next cache lookup to re-read
+            # the (now-empty) cache_dir config and stay disabled.
+            from jax.experimental.compilation_cache import compilation_cache as cc
+
+            cc.reset_cache()
+            cache_status = (
+                f"disabled for non-zero-base device subset: device_indexes={device_indexes}"
+            )
         if jit_cache_dir is not None:
             jax.config.update("jax_compilation_cache_dir", jit_cache_dir)
+            # Default the compile-time write threshold to 0 (cache every compile) for
+            # local/dev. When JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS is set (CI sets
+            # it to 1 to skip tiny entries and cut small-file GCS writes), defer to JAX's
+            # own parsing so the behavior — including validation of bad values — matches
+            # upstream JAX.
+            if "JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS" not in os.environ:
+                jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
+            # Disable the size gate; the compile-time threshold still controls writes.
             jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
-            jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
+            # Include XLA sub-caches such as kernel/autotune data.
             jax.config.update("jax_persistent_cache_enable_xla_caches", "all")
             from jax.experimental.compilation_cache import compilation_cache as cc
 
             cc.set_cache_dir(jit_cache_dir)
+            min_compile_time = jax.config.jax_persistent_cache_min_compile_time_secs
+            cache_status = f"enabled, dir={jit_cache_dir}, min_compile_time={min_compile_time}s"
+
+        if cache_status is None:
+            cache_status = "not configured (JAX_COMPILATION_CACHE_DIR unset)"
+        logger.info("XLA persistent compilation cache: %s", cache_status)
 
         # Parse args
         self.server_args = server_args
@@ -298,10 +340,28 @@ class Scheduler(
         )
 
         # launch draft worker
+        self._spec_multi_layer = False
         if self.spec_algorithm is not None and self.spec_algorithm.is_eagle():
-            from sgl_jax.srt.speculative.eagle_worker import EAGLEWorker
+            # Multi-layer vs single-layer is a model property (how many MTP heads
+            # the target ships), not a CLI-algorithm property. NEXTN with a single
+            # MTP head behaves exactly like EAGLE (same head run N times).
+            # DeepSeek-style configs expose num_nextn_predict_layers; MiMo-style
+            # configs don't, so fall back to --speculative-num-steps under NEXTN
+            # (one MTP weight set per step).
+            n_mtp = getattr(self.tp_worker.model_config.hf_config, "num_nextn_predict_layers", None)
+            if n_mtp is None and self.spec_algorithm.is_nextn():
+                n_mtp = server_args.speculative_num_steps
+            self._spec_multi_layer = n_mtp is not None and n_mtp > 1
+            if self._spec_multi_layer:
+                from sgl_jax.srt.speculative.multi_layer_eagle_worker import (
+                    MultiLayerEAGLEWorker as _SpecWorkerCls,
+                )
+            else:
+                from sgl_jax.srt.speculative.eagle_worker import (
+                    EAGLEWorker as _SpecWorkerCls,
+                )
 
-            self.draft_worker = EAGLEWorker(
+            self.draft_worker = _SpecWorkerCls(
                 server_args=server_args,
                 target_worker=self.tp_worker,
             )
@@ -330,6 +390,7 @@ class Scheduler(
         self.per_dp_max_running_requests = self.max_running_requests // self.dp_size
 
         self.is_hybrid = self.tp_worker.is_hybrid
+        self.sliding_window_size = None
         if self.is_hybrid:
             self.sliding_window_size = self.tp_worker.sliding_window_size
             self.full_tokens_per_layer, self.swa_tokens_per_layer = (
@@ -510,39 +571,23 @@ class Scheduler(
                 tokenizer_mode=server_args.tokenizer_mode,
                 trust_remote_code=server_args.trust_remote_code,
                 revision=server_args.revision,
+                tokenizer_backend=server_args.tokenizer_backend,
                 sub_dir=tokenizer_subdir,
             )
 
     def init_memory_pool_and_cache(self):
-        server_args = self.server_args
         self.req_to_token_pool, self.token_to_kv_pool_allocator = self.tp_worker.get_memory_pool()
-
-        if self.is_hybrid:
-            self.tree_cache = SWARadixCache(
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                sliding_window_size=self.sliding_window_size,
-                page_size=self.page_size,
-                disable=server_args.disable_radix_cache,
-            )
-        elif server_args.chunked_prefill_size is not None and server_args.disable_radix_cache:
-            self.tree_cache = ChunkCache(
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                page_size=self.page_size,
-            )
-        else:
-            self.tree_cache = RadixCache(
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                page_size=self.page_size,
-                disable=server_args.disable_radix_cache,
-                kv_head_num=self.model_config.get_num_kv_heads(self.tp_size),
-                head_dim=self.model_config.head_dim,
-                layer_num=self.model_config.num_hidden_layers,
-                max_seq_len=server_args.max_seq_len,
-                is_eagle=self.spec_algorithm is not None and self.spec_algorithm.is_eagle(),
-            )
+        self.tree_cache = build_kv_cache(
+            server_args=self.server_args,
+            model_config=self.model_config,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            page_size=self.page_size,
+            is_hybrid=self.is_hybrid,
+            sliding_window_size=self.sliding_window_size,
+            tp_size=self.tp_size,
+            spec_algorithm=self.spec_algorithm,
+        )
 
     def _select_round_robin_dp(self) -> int:
         dp_rank = self.dp_round_robin_counter % self.dp_size
@@ -1559,6 +1604,11 @@ class Scheduler(
             ):
                 continue
 
+            # Skip DP ranks with an ongoing chunked request to avoid
+            # creating a second chunked req on the same rank.
+            if self.chunked_reqs[dp_rank] is not None:
+                continue
+
             # Check LoRA constraint: ensure we don't exceed max_loras_per_batch
             # This is GLOBAL - must be same across all DP ranks
             if (
@@ -1679,7 +1729,7 @@ class Scheduler(
             return batch
 
         # Check if decode out of memory
-        if not batch.check_decode_mem() or (
+        if (kv_full_retract_flag := not batch.check_decode_mem()) or (
             TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0
         ):
             old_ratio = self.new_token_ratio
@@ -1696,13 +1746,22 @@ class Scheduler(
                 else:
                     self.send_to_tokenizer.send_pyobj(abort_out)
 
-            logger.info(
-                "KV cache pool is full. Retract requests. #retracted_reqs: %d, #aborted_reqs: %d, #new_token_ratio: %.4f -> %.4f",
-                num_retracted_reqs,
-                len(reqs_to_abort),
-                old_ratio,
-                self.new_token_ratio,
-            )
+            if kv_full_retract_flag:
+                logger.warning(
+                    "KV cache pool is full. Retract requests."
+                    " #retracted_reqs: %d, #aborted_reqs: %d,"
+                    " #new_token_ratio: %.4f -> %.4f",
+                    num_retracted_reqs,
+                    len(reqs_to_abort),
+                    old_ratio,
+                    self.new_token_ratio,
+                )
+            else:
+                logger.info(
+                    "Testing retraction." " #retracted_reqs: %d, #aborted_reqs: %d",
+                    num_retracted_reqs,
+                    len(reqs_to_abort),
+                )
 
             self._extend_requests_to_queue(retracted_reqs, is_retracted=True)
         else:
@@ -1802,24 +1861,46 @@ class Scheduler(
                 next_token_ids = np.array(jax.device_get(next_token_ids_device))
                 self._extract_dp_output_ids(next_token_ids, model_worker_batch, batch)
         else:
-            model_worker_batch = batch.get_spec_model_worker_batch(
-                precompile_token_paddings,
-                precompile_bs_paddings,
-                precompile_cache_loc_paddings,
-                self.page_size,
-                self.server_args.enable_static_lora,
-            )
+            if batch.forward_mode.is_extend():
+                # Spec extend always uses the padded mwb so target and draft
+                # see identical shapes regardless of dp_size / multi-layer
+                # (#1090 + #1053 P1-5b assert dp>1 spec extend must go here).
+                model_worker_batch = batch.get_model_worker_batch(
+                    precompile_token_paddings,
+                    precompile_bs_paddings,
+                    precompile_cache_loc_paddings,
+                    self.page_size,
+                    self.server_args.enable_static_lora,
+                )
+            else:
+                model_worker_batch = batch.get_spec_model_worker_batch(
+                    precompile_token_paddings,
+                    precompile_bs_paddings,
+                    precompile_cache_loc_paddings,
+                    self.page_size,
+                    self.server_args.enable_static_lora,
+                    draft_token_num=self.draft_worker.speculative_num_draft_tokens,
+                )
             batch_output = self.draft_worker.forward_batch_speculative_generation(
                 model_worker_batch
             )
-            info = batch.reqs_info[0]
-            if batch_output.accept_lens is not None:
-                # Decode
-                info.seq_lens = info.seq_lens + batch_output.accept_lens
-            else:
-                # Prefill
-                info.seq_lens = info.seq_lens + 1
-            info.spec_info = batch_output.next_draft_input
+            per_rank_spec = ScheduleBatch._split_spec_info_per_rank(
+                batch_output.next_draft_input, model_worker_batch.real_bs_per_dp
+            )
+            for r, s in enumerate(per_rank_spec):
+                batch.reqs_info[r].spec_info = s
+            accept = batch_output.accept_lens
+            if accept is not None:
+                accept = np.asarray(jax.device_get(accept))
+            per_dp_bs = model_worker_batch.per_dp_bs_size
+            for dp_rank, info in enumerate(batch.reqs_info):
+                if info.seq_lens is None or len(info.seq_lens) == 0:
+                    continue
+                if accept is not None:
+                    off = dp_rank * per_dp_bs
+                    info.seq_lens = info.seq_lens + accept[off : off + len(info.seq_lens)]
+                else:
+                    info.seq_lens = info.seq_lens + 1
             next_token_ids = np.asarray(jax.device_get(batch_output.next_token_ids))
             self._extract_dp_output_ids(next_token_ids, model_worker_batch, batch)
             logits_output = batch_output.logits_output
