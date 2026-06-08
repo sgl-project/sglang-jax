@@ -1140,9 +1140,13 @@ class WeightLoader:
 
                 return _load_slice
 
-            lazy_array = jax.make_array_from_callback(shape, sharding, _make_load_slice()).astype(
-                target_dtype
-            )
+            # Pass dtype explicitly: when this host has no addressable shard for the
+            # given sharding (e.g. the embed stage's single-CPU-device mesh on non-rank0
+            # hosts), jax.make_array_from_callback cannot infer dtype from the callback
+            # (which is never invoked here) and raises. target_dtype is the load dtype.
+            lazy_array = jax.make_array_from_callback(
+                shape, sharding, _make_load_slice(), dtype=target_dtype
+            ).astype(target_dtype)
 
             lazy_arrays.append(lazy_array)
 
