@@ -44,12 +44,6 @@ def _per_dp_cumsum(lens, dp_size: int, per_dp_bs: int) -> np.ndarray:
     return cu.ravel()
 
 
-def _per_dp_cumsum_device(lens: jax.Array, dp_size: int, per_dp_bs: int) -> jax.Array:
-    lens_2d = lens.astype(jnp.int32).reshape(dp_size, per_dp_bs)
-    zeros = jnp.zeros((dp_size, 1), dtype=jnp.int32)
-    return jnp.concatenate([zeros, jnp.cumsum(lens_2d, axis=1)], axis=1).reshape(-1)
-
-
 def _select_draft_extend_allocate_lens(
     allocate_lens,
     sel: np.ndarray,
