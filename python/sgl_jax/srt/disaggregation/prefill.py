@@ -38,10 +38,27 @@ def _pad_to_page_bucket(num_pages: int) -> int:
 
 
 @partial(jax.jit, static_argnames=("out_sharding",))
-def _jit_gather_all_layers(buffers, page_indices, out_sharding):
-    """Gather ``page_indices`` from every per-layer KV buffer in one jit."""
+def _jit_gather_one_layer(buf, page_indices, out_sharding):
+    """Gather ``page_indices`` from a single per-layer KV buffer.
 
-    return [buf.at[page_indices].get(out_sharding=out_sharding) for buf in buffers]
+    Split from the original all-layers-in-one-jit to avoid XLA compile-time
+    OOM when layer_num * per_layer_size exceeds HBM (e.g. 36 layers × 684 MB
+    = 24.6 GB input → ~45 GB compile footprint on v6e-1).
+    Per-layer compile footprint is ~1.2 GB regardless of layer count.
+    """
+    return buf.at[page_indices].get(out_sharding=out_sharding)
+
+
+def _jit_gather_all_layers(buffers, page_indices, out_sharding):
+    """Gather ``page_indices`` from every per-layer KV buffer.
+
+    Dispatches per-layer jit calls. Each call compiles independently with
+    ~1.2 GB footprint. The 36 kernel launches add ~1.8ms total overhead
+    (negligible vs transfer + E2E latency).
+    """
+    return [
+        _jit_gather_one_layer(buf, page_indices, out_sharding) for buf in buffers
+    ]
 
 
 @dataclass
