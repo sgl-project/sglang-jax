@@ -172,6 +172,7 @@ class CompletionRequest(BaseModel):
     bootstrap_host: str | None = None
     bootstrap_port: int | None = None
     bootstrap_room: int | None = None
+    disagg_transfer_id: str | None = None
 
     # For request id
     rid: list[str] | str | None = None
@@ -441,6 +442,7 @@ class ChatCompletionRequest(BaseModel):
     bootstrap_host: str | None = None
     bootstrap_port: int | None = None
     bootstrap_room: int | None = None
+    disagg_transfer_id: str | None = None
 
 
 class ChatMessage(BaseModel):
