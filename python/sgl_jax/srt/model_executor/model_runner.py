@@ -66,7 +66,6 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         # Parse args
         self.is_draft_worker = is_draft_worker
         self.model_config = model_config
-        self.dtype = model_config.dtype
         self.mem_fraction_static = mem_fraction_static
         self.device = server_args.device
         self.mesh = mesh
@@ -443,7 +442,6 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 page_size=self.page_size,
                 mesh=self.mesh,
                 attention_data_partition_axis="data",
-                dtype=self.dtype,
             )
 
         elif backend in ("fa", "fa_mha"):
