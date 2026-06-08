@@ -49,9 +49,13 @@ class CompilationManager:
         self.has_recurrent_state = has_recurrent_state
         self.moe_backend = server_args.moe_backend
         self.enable_static_lora = server_args.enable_static_lora
-        # Fused MoE shards tokens across EP (local = num_tokens // ep_size) and REQUIRES
-        # num_tokens % ep_size == 0; precompile decode buckets (=batch size) must honor it.
+        # Fused MoE shards tokens across EP (local = num_tokens // ep_size) AND the kernel
+        # requires local_num_tokens % t_packing == 0, where t_packing = 32 // dtype_bits
+        # (=2 for bf16 activations). So every compiled num_tokens must be a multiple of
+        # ep_size * t_packing. Use bf16 packing (=2); for fp32 (packing=1) ep_size alone
+        # suffices, and a multiple of 2*ep_size is still valid.
         self.ep_size = getattr(server_args, "ep_size", 1) or 1
+        self.moe_token_align = self.ep_size * 2
 
         self.token_buckets = self._compute_token_buckets(server_args.precompile_token_paddings)
         self.bs_buckets = self._compute_bs_buckets(server_args.precompile_bs_paddings)
@@ -69,7 +73,9 @@ class CompilationManager:
         # multiples of ep_size (in addition to dp_size).
         align = dp_size
         if fused:
-            align = dp_size * self.ep_size // _gcd(dp_size, self.ep_size)  # lcm(dp, ep)
+            align = (
+                dp_size * self.moe_token_align // _gcd(dp_size, self.moe_token_align)
+            )  # lcm(dp, ep*packing)
 
         buckets = []
         for item in user_paddings:
@@ -84,8 +90,10 @@ class CompilationManager:
 
         buckets.sort()
         max_bucket = self.max_padded_num_tokens
-        if fused and max_bucket % self.ep_size != 0:
-            max_bucket = ((max_bucket + self.ep_size - 1) // self.ep_size) * self.ep_size
+        if fused and max_bucket % self.moe_token_align != 0:
+            max_bucket = (
+                (max_bucket + self.moe_token_align - 1) // self.moe_token_align
+            ) * self.moe_token_align
         if len(buckets) == 0 or buckets[-1] < max_bucket:
             buckets.append(max_bucket)
 
@@ -102,14 +110,16 @@ class CompilationManager:
         for bs in bs_list:
             if bs > self.max_padded_batch_size or bs < self.dp_size:
                 continue
-            if fused and bs % self.ep_size != 0:
+            if fused and bs % self.moe_token_align != 0:
                 continue
             buckets.append(bs)
         buckets.sort()
         # Force-append a final bucket covering max batch; align it to ep_size for fused.
         max_bucket = self.max_padded_batch_size
-        if fused and max_bucket % self.ep_size != 0:
-            max_bucket = ((max_bucket + self.ep_size - 1) // self.ep_size) * self.ep_size
+        if fused and max_bucket % self.moe_token_align != 0:
+            max_bucket = (
+                (max_bucket + self.moe_token_align - 1) // self.moe_token_align
+            ) * self.moe_token_align
         if len(buckets) == 0 or buckets[-1] < max_bucket:
             buckets.append(max_bucket)
         return buckets
