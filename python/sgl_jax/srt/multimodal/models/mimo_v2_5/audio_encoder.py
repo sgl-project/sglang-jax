@@ -218,10 +218,23 @@ class MiMoV25AudioUnderstandingEncoder(nnx.Module):
             hidden = hidden + embeds
 
         positions = jnp.arange(group_size, dtype=jnp.int32)
-        hidden = hidden.reshape(batch * groups, group_size, self.input_local_dim)
+        # Keep the tiny audio tower fully replicated: the data-axis sharding that the
+        # embed mesh attaches to hidden makes these group/proj reshapes unsupported
+        # without an explicit out_sharding. Re-pin to replicated before each reshape.
+        hidden = self._replicate(hidden).reshape(
+            batch * groups, group_size, self.input_local_dim
+        )
         hidden, _, _ = self.input_local_transformer(hidden, positions)
-        hidden = hidden.reshape(batch, groups, self.input_local_dim * group_size)
+        hidden = self._replicate(hidden).reshape(
+            batch, groups, self.input_local_dim * group_size
+        )
         hidden, _ = self.proj_fc1(hidden)
         hidden = jax.nn.gelu(hidden)
         hidden, _ = self.proj_fc2(hidden)
-        return hidden.reshape(-1, self.hidden_size)
+        return self._replicate(hidden).reshape(-1, self.hidden_size)
+
+    def _replicate(self, x: jax.Array) -> jax.Array:
+        """Pin a tensor to fully-replicated sharding (no-op when already replicated)."""
+        return jax.lax.with_sharding_constraint(
+            x, jax.sharding.NamedSharding(self.mesh, jax.sharding.PartitionSpec())
+        )
