@@ -153,8 +153,15 @@ class WeightLoader:
         self._weight_info_cache: dict[str, list[dict]] | None = None
         if hasattr(model_config, "num_attention_heads"):
             self.num_heads = model_config.num_attention_heads
-            # Use original count for replication logic
-            self.num_kv_heads = model_config.get_total_num_kv_heads()
+            # Use original count for replication logic. The AR ModelConfig exposes
+            # get_total_num_kv_heads(); the embed stage passes a raw HF config (audio
+            # tower, no LLM KV replication) -> fall back to its num_key_value_heads.
+            if hasattr(model_config, "get_total_num_kv_heads"):
+                self.num_kv_heads = model_config.get_total_num_kv_heads()
+            else:
+                self.num_kv_heads = getattr(
+                    model_config, "num_key_value_heads", model_config.num_attention_heads
+                )
             self.hidden_size = model_config.hidden_size
             # Read head_dim / v_head_dim from hf_text_config rather than model_config:
             # patch_model_config writes mc.head_dim for KV-cache / MemoryPools sizing,
