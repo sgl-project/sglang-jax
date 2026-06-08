@@ -362,10 +362,38 @@ class SchedulerOutputProcessorMixin:
         # FIXME(pc) add spec decode metrics
 
         if self.enable_overlap:
-            logits_output, next_token_ids, cache_miss_count = (
-                self.tp_worker.resolve_last_batch_result(launch_done)
-            )
-            next_token_logprobs = logits_output.next_token_logprobs
+            if (
+                self.spec_algorithm is not None
+                and not self.spec_algorithm.is_none()
+                and result.pending_draft_extend_result is not None
+            ):
+                if launch_done is not None:
+                    launch_done.wait()
+                from sgl_jax.srt.speculative.draft_extend_fused import (
+                    restore_spec_decode_pending_draft_extend_result,
+                )
+
+                restored_batch_output = restore_spec_decode_pending_draft_extend_result(
+                    result.pending_draft_extend_result
+                )
+                if restored_batch_output is not None:
+                    result.next_draft_input = restored_batch_output.next_draft_input
+                    result.accept_lens = restored_batch_output.accept_lens
+                    result.allocate_lens = restored_batch_output.allocate_lens
+                    real_bs_per_dp = [
+                        len(info.reqs) if info.reqs else 0 for info in batch.reqs_info
+                    ]
+                    per_rank_spec = ScheduleBatch._split_spec_info_per_rank(
+                        result.next_draft_input, real_bs_per_dp
+                    )
+                    for r, s in enumerate(per_rank_spec):
+                        batch.reqs_info[r].spec_info = s
+                next_token_logprobs = None
+            else:
+                logits_output, next_token_ids, cache_miss_count = (
+                    self.tp_worker.resolve_last_batch_result(launch_done)
+                )
+                next_token_logprobs = logits_output.next_token_logprobs
         else:
             # spec decoding handles output logprobs inside verify process.
             if batch.return_logprob or batch.return_output_logprob_only:

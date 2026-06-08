@@ -45,6 +45,12 @@ class FusedDraftExtendPendingResult(NamedTuple):
     sel: np.ndarray
 
 
+class SpecDecodePendingDraftExtendResult(NamedTuple):
+    draft_worker: object
+    model_worker_batch: object
+    pending_result: FusedDraftExtendPendingResult | None
+
+
 def _take_with_index_sharding(values, index):
     index_sharding = jax.typeof(index).sharding
     if isinstance(index_sharding, NamedSharding):
@@ -793,6 +799,20 @@ def restore_fused_draft_extend_result(draft_worker, model_worker_batch, pending_
     batch_output.accept_lens = accept_host
 
 
+def restore_spec_decode_pending_draft_extend_result(pending_draft_extend_result):
+    if pending_draft_extend_result is None:
+        return None
+
+    restore_fused_draft_extend_result(
+        pending_draft_extend_result.draft_worker,
+        pending_draft_extend_result.model_worker_batch,
+        pending_draft_extend_result.pending_result,
+    )
+    if pending_draft_extend_result.pending_result is None:
+        return None
+    return pending_draft_extend_result.pending_result.batch_output
+
+
 def draft_extend_for_decode_fused(draft_worker, model_worker_batch, batch_output):
     """Drop-in replacement for MultiLayerDraftWorker.draft_extend_for_decode.
 
@@ -1042,10 +1062,14 @@ def spec_decode_overlap(spec_worker, model_worker_batch, cur_allocate_lens):
 
     batch_output = spec_decode_verify_phase(spec_worker, model_worker_batch, cur_allocate_lens)
     scheduler_fields = resolve_spec_decode_scheduler_fields(batch_output)
-    pending_draft_extend_result = launch_fused_draft_extend_for_decode(
-        spec_worker.draft_worker,
-        model_worker_batch,
-        batch_output,
+    pending_draft_extend_result = SpecDecodePendingDraftExtendResult(
+        draft_worker=spec_worker.draft_worker,
+        model_worker_batch=model_worker_batch,
+        pending_result=launch_fused_draft_extend_for_decode(
+            spec_worker.draft_worker,
+            model_worker_batch,
+            batch_output,
+        ),
     )
     batch_output.pending_draft_extend_result = pending_draft_extend_result
     return batch_output, scheduler_fields

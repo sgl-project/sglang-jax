@@ -154,6 +154,20 @@ class TestVerifyTree(CustomTestCase):
             },
         )
 
+    def test_spec_decode_pending_draft_extend_result_contract_fields(self):
+        from sgl_jax.srt.speculative import draft_extend_fused
+
+        self.assertTrue(hasattr(draft_extend_fused, "SpecDecodePendingDraftExtendResult"))
+        fields = set(draft_extend_fused.SpecDecodePendingDraftExtendResult._fields)
+        self.assertEqual(
+            fields,
+            {
+                "draft_worker",
+                "model_worker_batch",
+                "pending_result",
+            },
+        )
+
     def test_base_spec_worker_overlap_entry_uses_verify_boundary(self):
         from sgl_jax.srt.speculative.base_worker import BaseSpecWorker
 
@@ -338,6 +352,16 @@ class TestVerifyTree(CustomTestCase):
         source = inspect.getsource(Scheduler.run_batch)
         self.assertIn("can_use_spec_decode_overlap", source)
         self.assertIn("forward_batch_speculative_decode_overlap", source)
+
+    def test_decode_output_processor_restores_spec_pending_draft_extend(self):
+        from sgl_jax.srt.managers.scheduler_output_processor_mixin import (
+            SchedulerOutputProcessorMixin,
+        )
+
+        source = inspect.getsource(SchedulerOutputProcessorMixin.process_batch_result_decode)
+        self.assertIn("result.pending_draft_extend_result", source)
+        self.assertIn("restore_spec_decode_pending_draft_extend_result", source)
+        self.assertIn("launch_done.wait()", source)
 
     def test_scheduler_spec_prefill_does_not_use_decode_scheduler_fields(self):
         from sgl_jax.srt.managers.scheduler import Scheduler
