@@ -128,11 +128,12 @@ class SpecWorkerClient:
                 break
 
             assert model_worker_batch.forward_mode.is_extend()
-            model_worker_batch.forward_batch.input_ids = resolve_future_token_ids(
-                model_worker_batch.forward_batch.input_ids,
-                self.prefill_token_relay_map,
-                self.mesh,
-            )
+            if model_worker_batch.forward_batch is not None:
+                model_worker_batch.forward_batch.input_ids = resolve_future_token_ids(
+                    model_worker_batch.forward_batch.input_ids,
+                    self.prefill_token_relay_map,
+                    self.mesh,
+                )
             batch_output = self.worker.forward_batch_speculative_generation(
                 model_worker_batch,
                 launch_done=model_worker_batch.launch_done,
@@ -156,7 +157,10 @@ class SpecWorkerClient:
         from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
 
         self.worker._prepare_overlap_sampling_info(model_worker_batch)
-        if getattr(model_worker_batch, "forward_batch", None) is None:
+        if (
+            self.worker._can_use_fused_spec_prefill(model_worker_batch)
+            and getattr(model_worker_batch, "forward_batch", None) is None
+        ):
             prepare_spec_prefill_forward_batch(self.worker, model_worker_batch)
         pending_prefill = PendingPrefillResult(
             self,

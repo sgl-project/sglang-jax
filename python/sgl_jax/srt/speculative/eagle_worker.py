@@ -152,9 +152,11 @@ class EAGLEWorker(BaseSpecWorker):
                     dp_size=dp_size,
                     per_dp_bs_size=per_dp_bs,
                 )
-                assert self._can_use_fused_spec_prefill(
-                    model_worker_batch
-                ), "spec extend precompile must use fused greedy prefill"
+                if not self._can_use_fused_spec_prefill(model_worker_batch):
+                    logger.warning(
+                        "[SPEC_EXTEND] skip fused precompile because fused spec prefill is disabled"
+                    )
+                    continue
                 self.forward_batch_speculative_generation(model_worker_batch)
         end_time = time.perf_counter()
         logger.info("[SPEC_EXTEND] Precompile finished in %.0f secs", end_time - start_time)

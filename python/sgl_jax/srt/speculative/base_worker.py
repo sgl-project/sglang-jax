@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import os
 import threading
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING
@@ -104,6 +105,8 @@ class BaseSpecWorker:
         return self._draft_worker
 
     def _can_use_fused_spec_prefill(self, model_worker_batch: ModelWorkerBatch) -> bool:
+        if os.getenv("SGL_JAX_DISABLE_FUSED_SPEC_PREFILL") == "1":
+            return False
         sampling_info = model_worker_batch.sampling_info
         penalizer = getattr(sampling_info, "penalizer_orchestrator", None)
         has_penalty = getattr(sampling_info, "linear_penalty", None) is not None or bool(

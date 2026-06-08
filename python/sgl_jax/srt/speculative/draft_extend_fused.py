@@ -524,13 +524,9 @@ def _build_fused_greedy_prefill_jit(num_layers: int, topk: int):
             if i == 0:
                 layer0_hidden = output.hidden_states
             if i < num_layers - 1:
-                sel_pos = jnp.clip(draft_forward_batch.extend_seq_lens - 1, 0, None).astype(
-                    jnp.int32
-                )
-                input_ids = _device_rotate_input_ids(
+                input_ids = _device_rotate_prefill_input_ids(
                     input_ids,
                     draft_forward_batch.extend_seq_lens,
-                    sel_pos,
                     topk_idx[:, 0],
                 )
 
