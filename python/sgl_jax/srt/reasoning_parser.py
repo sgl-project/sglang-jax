@@ -211,6 +211,86 @@ class Glm45Detector(BaseReasoningFormatDetector):
         )
 
 
+class Gemma4Detector(BaseReasoningFormatDetector):
+    """
+    Detector for Gemma 4 model.
+    Assumes reasoning format:
+      <|channel>thought\n*(.*)<channel|>
+    """
+
+    def __init__(self, stream_reasoning: bool = True):
+        super().__init__(
+            "<|channel>thought\n",
+            "<channel|>",
+            force_reasoning=False,
+            stream_reasoning=stream_reasoning,
+        )
+
+    def detect_and_parse(self, text: str) -> StreamingParseResult:
+        if text.startswith("<|channel>thought\n"):
+            text = text[len("<|channel>thought\n"):]
+            self._in_reasoning = True
+        elif text.startswith("thought\n"):
+            text = text[len("thought\n"):]
+            self._in_reasoning = True
+
+        if not self._in_reasoning and "<channel|>" in text:
+            self._in_reasoning = True
+
+        if not self._in_reasoning:
+            return StreamingParseResult(normal_text=text)
+
+        processed_text = text.strip()
+
+        if self.think_end_token not in processed_text:
+            return StreamingParseResult(reasoning_text=processed_text)
+
+        splits = processed_text.split(self.think_end_token, maxsplit=1)
+        reasoning_text = splits[0].strip()
+        normal_text = splits[1].strip()
+
+        return StreamingParseResult(normal_text=normal_text, reasoning_text=reasoning_text)
+
+    def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
+        self._buffer += new_text
+        current_text = self._buffer
+
+        tokens_to_check = [self.think_start_token, "thought\n", self.think_end_token]
+        if any(token.startswith(current_text) and token != current_text for token in tokens_to_check):
+            return StreamingParseResult()
+
+        if not self.stripped_think_start:
+            if current_text.startswith("<|channel>thought\n"):
+                current_text = current_text[len("<|channel>thought\n"):]
+                self.stripped_think_start = True
+                self._in_reasoning = True
+            elif current_text.startswith("thought\n"):
+                current_text = current_text[len("thought\n"):]
+                self.stripped_think_start = True
+                self._in_reasoning = True
+
+        if self._in_reasoning and self.think_end_token in current_text:
+            end_idx = current_text.find(self.think_end_token)
+            reasoning_text = current_text[:end_idx]
+            self._buffer = ""
+            self._in_reasoning = False
+            normal_text = current_text[end_idx + len(self.think_end_token) :]
+            return StreamingParseResult(normal_text=normal_text, reasoning_text=reasoning_text.rstrip())
+
+        if self._in_reasoning:
+            if self.stream_reasoning:
+                self._buffer = ""
+                return StreamingParseResult(reasoning_text=current_text)
+            else:
+                return StreamingParseResult()
+
+        if not self._in_reasoning:
+            self._buffer = ""
+            return StreamingParseResult(normal_text=new_text)
+
+        return StreamingParseResult()
+
+
 class ReasoningParser:
     """
     Parser that handles both streaming and non-streaming scenarios for extracting
@@ -228,6 +308,7 @@ class ReasoningParser:
         "mimo": Qwen3Detector,
         "kimi": KimiDetector,
         "glm45": Glm45Detector,
+        "gemma4": Gemma4Detector,
     }
 
     def __init__(self, model_type: str | None = None, stream_reasoning: bool = True):
