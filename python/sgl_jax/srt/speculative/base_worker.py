@@ -101,6 +101,21 @@ class BaseSpecWorker:
     def draft_worker(self) -> BaseDraftWorker:
         return self._draft_worker
 
+    def _can_use_fused_spec_prefill(self, model_worker_batch: ModelWorkerBatch) -> bool:
+        sampling_info = model_worker_batch.sampling_info
+        penalizer = getattr(sampling_info, "penalizer_orchestrator", None)
+        has_penalty = getattr(sampling_info, "linear_penalty", None) is not None or bool(
+            getattr(penalizer, "is_required", False)
+        )
+        return (
+            self._can_use_fused_spec_decode
+            and sampling_info.is_all_greedy
+            and not has_penalty
+            and getattr(sampling_info, "vocab_mask", None) is None
+            and not getattr(model_worker_batch, "return_logprob", False)
+            and not getattr(model_worker_batch, "return_output_logprob_only", False)
+        )
+
     # -- Main entry point --
 
     def forward_batch_speculative_generation(self, model_worker_batch: ModelWorkerBatch):
@@ -108,6 +123,11 @@ class BaseSpecWorker:
         from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 
         if model_worker_batch.forward_mode.is_extend():
+            if self._can_use_fused_spec_prefill(model_worker_batch):
+                from sgl_jax.srt.speculative.draft_extend_fused import spec_prefill
+
+                return spec_prefill(self, model_worker_batch)
+
             if model_worker_batch.sampling_info.temperatures.ndim == 1:
                 model_worker_batch.sampling_info.temperatures = (
                     model_worker_batch.sampling_info.temperatures[:, None]

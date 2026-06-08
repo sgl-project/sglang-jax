@@ -1,3 +1,4 @@
+import inspect
 import unittest
 from types import SimpleNamespace
 
@@ -15,6 +16,59 @@ from sgl_jax.test.test_utils import CustomTestCase
 
 
 class TestVerifyTree(CustomTestCase):
+    def test_fused_spec_prefill_guard_only_allows_greedy_plain_requests(self):
+        from sgl_jax.srt.speculative.base_worker import BaseSpecWorker
+
+        worker = BaseSpecWorker.__new__(BaseSpecWorker)
+        worker._can_use_fused_spec_decode = True
+
+        def make_batch(**overrides):
+            sampling_info = SimpleNamespace(
+                is_all_greedy=True,
+                linear_penalty=None,
+                penalizer_orchestrator=SimpleNamespace(is_required=False),
+                vocab_mask=None,
+            )
+            batch = SimpleNamespace(
+                sampling_info=sampling_info,
+                return_logprob=False,
+                return_output_logprob_only=False,
+            )
+            for key, value in overrides.items():
+                if hasattr(sampling_info, key):
+                    setattr(sampling_info, key, value)
+                else:
+                    setattr(batch, key, value)
+            return batch
+
+        self.assertTrue(worker._can_use_fused_spec_prefill(make_batch()))
+        self.assertFalse(worker._can_use_fused_spec_prefill(make_batch(is_all_greedy=False)))
+        self.assertFalse(worker._can_use_fused_spec_prefill(make_batch(linear_penalty=1.0)))
+        self.assertFalse(
+            worker._can_use_fused_spec_prefill(
+                make_batch(penalizer_orchestrator=SimpleNamespace(is_required=True))
+            )
+        )
+        self.assertFalse(worker._can_use_fused_spec_prefill(make_batch(vocab_mask=np.ones(4))))
+        self.assertFalse(worker._can_use_fused_spec_prefill(make_batch(return_logprob=True)))
+        self.assertFalse(
+            worker._can_use_fused_spec_prefill(make_batch(return_output_logprob_only=True))
+        )
+
+    def test_spec_decode_uses_split_verify_and_draft_extend_phases(self):
+        from sgl_jax.srt.speculative import draft_extend_fused
+
+        self.assertTrue(hasattr(draft_extend_fused, "_build_fused_greedy_verify_jit"))
+        self.assertTrue(hasattr(draft_extend_fused, "_build_fused_greedy_prefill_jit"))
+        self.assertTrue(hasattr(draft_extend_fused, "spec_prefill"))
+        self.assertTrue(hasattr(draft_extend_fused, "spec_decode_verify_phase"))
+        self.assertTrue(hasattr(draft_extend_fused, "spec_decode_draft_extend_phase"))
+
+        source = inspect.getsource(draft_extend_fused.spec_decode)
+        self.assertIn("spec_decode_verify_phase", source)
+        self.assertIn("spec_decode_draft_extend_phase", source)
+        self.assertNotIn("_fused_greedy_decode_jit_fn", source)
+
     def test_as_int32_array_keeps_host_metadata_on_host(self):
         from sgl_jax.srt.speculative import eagle_util
 
@@ -178,38 +232,34 @@ class TestVerifyTree(CustomTestCase):
         np.testing.assert_array_equal(np.asarray(out.new_seq_lens), np.array([0, 13]))
         np.testing.assert_array_equal(np.asarray(out.sel_pos), np.array([0, 2]))
 
-    def test_fused_materialize_uses_original_seq_lens_for_new_seq_lens(self):
+    def test_device_rotate_prefill_input_ids_matches_host_prefill_rotation(self):
         from sgl_jax.srt.speculative.draft_extend_fused import (
-            _materialize_fused_greedy_batch_output_for_scheduler,
+            _device_rotate_prefill_input_ids,
         )
 
-        batch_output = SimpleNamespace(
-            logits_output=None,
-            next_draft_input=SimpleNamespace(),
-            allocate_lens=np.array([9, 8, 7], dtype=np.int32),
-            accept_lens=None,
-            next_token_ids=None,
-        )
-        out = _materialize_fused_greedy_batch_output_for_scheduler(
-            batch_output=batch_output,
-            selector=np.array([0, 2], dtype=np.int32),
-            real_bs=2,
-            seq_lens_host=np.array([103, 203, 303], dtype=np.int32),
-            layer0_hidden=jnp.arange(12 * 2, dtype=jnp.float32).reshape(12, 2),
-            topk_index_stacked=jnp.array(
-                [[[11], [12], [13]], [[21], [22], [23]], [[31], [32], [33]]]
+        input_ids = np.array([10, 11, 12, 20, 30, 31], dtype=np.int32)
+        extend_seq_lens = np.array([3, 1, 0, 2], dtype=np.int32)
+        verified_id = np.array([99, 88, 0, 77], dtype=np.int32)
+
+        expected = input_ids.copy()
+        pos = 0
+        for slot, extend_len in enumerate(extend_seq_lens):
+            if extend_len == 0:
+                continue
+            segment = expected[pos : pos + extend_len].copy()
+            expected[pos : pos + extend_len] = np.concatenate(
+                (segment[1:], verified_id[slot : slot + 1])
+            )
+            pos += extend_len
+
+        actual = _device_rotate_prefill_input_ids(
+            jax.device_put(input_ids, jax.sharding.SingleDeviceSharding(jax.devices("cpu")[0])),
+            jax.device_put(
+                extend_seq_lens, jax.sharding.SingleDeviceSharding(jax.devices("cpu")[0])
             ),
-            accept_lens_device=jnp.array([1, 2, 4], dtype=jnp.int32),
-            predict_device=jnp.arange(12, dtype=jnp.int32),
-            speculative_num_draft_tokens=4,
-            target_logits=None,
-            target_hidden=None,
+            jax.device_put(verified_id, jax.sharding.SingleDeviceSharding(jax.devices("cpu")[0])),
         )
-
-        np.testing.assert_array_equal(
-            out.next_draft_input.new_seq_lens,
-            np.array([101, 304], dtype=np.int32),
-        )
+        np.testing.assert_array_equal(np.asarray(actual), expected)
 
     def test_verify_tree_greedy(self):
         candidates = jnp.array(
