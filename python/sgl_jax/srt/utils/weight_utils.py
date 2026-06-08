@@ -61,6 +61,22 @@ def _reinterpret_dtype_if_needed(data: np.ndarray, target_dtype: jnp.dtype) -> n
         return data.view(ml_dtypes.bfloat16)
     return data
 
+def unpack_4bit_jax(lazy_weight: jax.Array, target_dtype: jnp.dtype) -> jax.Array:
+    if lazy_weight.dtype in [jnp.int32, jnp.uint32]:
+        shifts = jnp.arange(0, 32, 4, dtype=jnp.int32)
+        unpacked = (lazy_weight[..., None] >> shifts) & 0x0F
+        unpacked = jnp.reshape(unpacked, lazy_weight.shape[:-1] + (lazy_weight.shape[-1] * 8,))
+    else:
+        unpacked = jnp.stack([lazy_weight & 0x0F, lazy_weight >> 4], axis=-1)
+        unpacked = jnp.reshape(unpacked, lazy_weight.shape[:-1] + (lazy_weight.shape[-1] * 2,))
+
+    if target_dtype == jnp.int4:
+        unpacked = unpacked.astype(jnp.int8)
+        unpacked = jnp.where(unpacked >= 8, unpacked - 16, unpacked)
+        return unpacked.astype(jnp.int4)
+    return unpacked.astype(target_dtype)
+
+
 
 @dataclass
 class WeightMapping:
@@ -1240,6 +1256,7 @@ class WeightLoader:
         do_transpose: bool = False,
         target_sharding: jax.sharding.NamedSharding = None,
         physical_to_logical_map: np.ndarray | None = None,
+        param_dtype: jnp.dtype = None,
     ) -> jax.Array:
         """
         Lazy loader for TP-Split MOE weights (e.g., Grok MOE).
@@ -1370,7 +1387,10 @@ class WeightLoader:
             return out_array
 
         result = jax.make_array_from_callback(stacked_shape, sharding, _load_stacked_slice)
-        if result.dtype != target_dtype:
+        
+        if param_dtype in [jnp.int4, jnp.uint4, jnp.float4_e2m1fn] and result.dtype in [jnp.int32, jnp.uint32, jnp.int8, jnp.uint8]:
+            result = unpack_4bit_jax(result, param_dtype)
+        elif result.dtype != target_dtype:
             result = result.astype(target_dtype)
         if do_transpose and result.ndim >= 3:
             result = jnp.transpose(result, (0, 2, 1))
@@ -1384,6 +1404,7 @@ class WeightLoader:
         do_transpose: bool = False,
         target_sharding: jax.sharding.NamedSharding = None,
         physical_to_logical_map: np.ndarray | None = None,
+        param_dtype: jnp.dtype = None,
     ) -> jax.Array:
         first_key = expected_hf_keys[0]
         info = weight_info[first_key][0]
@@ -1950,6 +1971,10 @@ class WeightLoader:
                                 target_sharding=final_sharding,
                             )
                             lazy_weight = lazy_arrays[0]
+
+
+                        if model_param.value.dtype in [jnp.int4, jnp.uint4, jnp.float4_e2m1fn] and lazy_weight.dtype in [jnp.int32, jnp.uint32, jnp.int8, jnp.uint8]:
+                            lazy_weight = unpack_4bit_jax(lazy_weight, model_param.value.dtype)
 
                         # Handle multi-dimensional transpose (transpose_axes) or 2D transpose
                         if mapping.transpose_axes is not None:
