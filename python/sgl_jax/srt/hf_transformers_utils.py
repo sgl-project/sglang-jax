@@ -30,6 +30,8 @@ logger = logging.getLogger(__name__)
 
 
 class GlmMoeDsaConfig(PretrainedConfig):
+    # Empty stub (PR #1037): just claims the model_type; real fields live with
+    # the model / stock HF config.
     model_type = "glm_moe_dsa"
 
 
@@ -43,13 +45,15 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
     ]
 }
 
+# Register local configs; suppress() defers to stock on a name clash (fine for
+# bailing/kimi which don't clash, and for the glm stub where stock is preferable).
 for name, cls in _CONFIG_REGISTRY.items():
     with contextlib.suppress(ValueError):
         AutoConfig.register(name, cls)
 
-# Override HF's stock ``Qwen3_5MoeConfig`` registration (transformers >=5.3)
-# with our hybrid alias subclass; needed because the suppress(ValueError) loop
-# above silently skips already-registered entries.
+# Qwen3.5 is the exception: stock transformers >=5.3 owns ``qwen3_5_moe`` so the
+# loop skips ours, but ours isn't interchangeable (flattens rope_parameters +
+# exposes the hybrid/GDN interface the runner needs). Force ours to win.
 AutoConfig.register("qwen3_5_moe", Qwen3_5HybridConfig, exist_ok=True)
 
 
