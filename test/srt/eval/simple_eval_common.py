@@ -107,12 +107,6 @@ class ChatCompletionSampler(SamplerBase):
         self.max_tokens = max_tokens
         self.top_p = top_p
         self.extra_body = dict(extra_body) if extra_body else {}
-        if "chat_template_kwargs" not in self.extra_body:
-            self.extra_body["chat_template_kwargs"] = {}
-        else:
-            self.extra_body["chat_template_kwargs"] = dict(self.extra_body["chat_template_kwargs"])
-        if "enable_thinking" not in self.extra_body["chat_template_kwargs"]:
-            self.extra_body["chat_template_kwargs"]["enable_thinking"] = True
         self.image_format = "url"
 
     def _handle_image(
@@ -147,7 +141,6 @@ class ChatCompletionSampler(SamplerBase):
                     messages=message_list,
                     temperature=self.temperature,
                     max_tokens=self.max_tokens,
-                    extra_body={"chat_template_kwargs": {"enable_thinking": True}},
                 )
                 if self.top_p is not None:
                     kwargs["top_p"] = self.top_p

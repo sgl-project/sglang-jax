@@ -118,6 +118,10 @@ def run_eval(args):
         max_tokens = 2048
 
     top_p = getattr(args, "top_p", None)
+    chat_template_kwargs = dict(getattr(args, "chat_template_kwargs", {}) or {})
+    if getattr(args, "enable_thinking", False):
+        chat_template_kwargs["enable_thinking"] = True
+    args.chat_template_kwargs = chat_template_kwargs or None
     extra_body = build_extra_body(args)
 
     sampler = ChatCompletionSampler(
@@ -186,6 +190,12 @@ if __name__ == "__main__":
     parser.add_argument("--repetition-penalty", type=float, default=None)
     parser.add_argument("--frequency-penalty", type=float, default=None)
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument(
+        "--enable-thinking",
+        type=lambda x: (str(x).lower() in ["true", "1", "yes"]),
+        default=False,
+        help="Enable thinking mode for evals (true/false).",
+    )
     args = parser.parse_args()
 
     run_eval(args)
