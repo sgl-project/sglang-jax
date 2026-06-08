@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import dataclasses
+import importlib.machinery
 import importlib.util
 import io
 import json
@@ -688,8 +689,16 @@ class MiMoV25AudioCodecProcessor:
             return self._load_waveform_bytes(item)
         if isinstance(item, str):
             if os.path.exists(item):
-                waveform, sample_rate = torchaudio.load(item)
-                return waveform, int(sample_rate)
+                try:
+                    waveform, sample_rate = torchaudio.load(item)
+                    return waveform, int(sample_rate)
+                except Exception:
+                    # Newer torchaudio routes load() through torchcodec, which may be
+                    # absent; soundfile is a sufficient CPU fallback for wav/flac/ogg.
+                    import soundfile as sf
+
+                    audio_array, sample_rate = sf.read(item)
+                    return torch.as_tensor(audio_array, dtype=torch.float32), int(sample_rate)
             if item.startswith(("http://", "https://")):
                 with urllib.request.urlopen(item, timeout=10) as resp:
                     return self._load_waveform_bytes(resp.read())
@@ -806,12 +815,35 @@ class MiMoV25AudioCodecProcessor:
         modeling_path = os.path.join(self.model_path, "modeling_mimo_v2.py")
         if not os.path.exists(modeling_path):
             return None
-        module_name = f"_sgl_jax_mimo_v25_{abs(hash(os.path.abspath(modeling_path)))}"
-        spec = importlib.util.spec_from_file_location(module_name, modeling_path)
-        if spec is None or spec.loader is None:
-            raise ImportError(f"Cannot load MiMo-V2.5 remote module from {modeling_path}")
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        # modeling_mimo_v2.py uses relative imports (e.g. `from .configuration_mimo_v2
+        # import MiMoV2Config`), so it must be loaded as part of a package, not as a bare
+        # file. Register a synthetic package rooted at model_path and import the module
+        # under it so the relative imports resolve. Falls back to None (-> HF
+        # get_class_from_dynamic_module path) if anything goes wrong.
+        import sys
+
+        pkg_name = f"_sgl_mimo_v25_pkg_{abs(hash(os.path.abspath(self.model_path)))}"
+        try:
+            if pkg_name not in sys.modules:
+                pkg = importlib.util.module_from_spec(
+                    importlib.machinery.ModuleSpec(pkg_name, None, is_package=True)
+                )
+                pkg.__path__ = [os.path.abspath(self.model_path)]
+                sys.modules[pkg_name] = pkg
+            module_name = f"{pkg_name}.modeling_mimo_v2"
+            spec = importlib.util.spec_from_file_location(module_name, modeling_path)
+            if spec is None or spec.loader is None:
+                return None
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[module_name] = module
+            spec.loader.exec_module(module)
+        except Exception as exc:  # pragma: no cover - fall back to HF dynamic loader
+            logger.warning(
+                "MiMo-V2.5 remote module package-load failed (%s); "
+                "falling back to get_class_from_dynamic_module.",
+                exc,
+            )
+            return None
         self._remote_module = module
         return module
 
