@@ -876,6 +876,8 @@ class Glm5ForCausalLM(nnx.Module):
             layer.self_attn.post_load_weights()
             if hasattr(layer, "mlp") and hasattr(layer.mlp, "post_load_weights"):
                 layer.mlp.post_load_weights()
+            if hasattr(layer, "shared_experts") and layer.shared_experts is not None and hasattr(layer.shared_experts, "post_load_weights"):
+                layer.shared_experts.post_load_weights()
         logger.info("Absorbed MLA weights and Fused MLP weights processed successfully!")
 
         # Skipping scale inversion for BF16
