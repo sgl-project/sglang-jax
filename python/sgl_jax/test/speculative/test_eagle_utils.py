@@ -439,6 +439,20 @@ class TestVerifyTree(CustomTestCase):
         self.assertIn("can_use_spec_decode_overlap", source)
         self.assertIn("forward_batch_speculative_decode_overlap", source)
 
+    def test_scheduler_spec_decode_overlap_defers_output_token_resolution(self):
+        from sgl_jax.srt.managers.scheduler import Scheduler
+
+        source = inspect.getsource(Scheduler.run_batch)
+        defer_pos = source.index("defer_spec_decode_output")
+        extract_pos = source.index("self._extract_dp_output_ids", defer_pos)
+        ret_pos = source.index("GenerationBatchResult", extract_pos)
+        ret_source = source[ret_pos:]
+
+        self.assertIn("if not defer_spec_decode_output", source[defer_pos:ret_pos])
+        self.assertIn("batch_output.next_token_ids", ret_source)
+        self.assertLess(defer_pos, extract_pos)
+        self.assertNotIn("accept_lens", source[defer_pos:extract_pos])
+
     def test_overlap_scheduler_uses_spec_sampling_info_owner(self):
         from sgl_jax.srt.managers.scheduler import Scheduler
 
