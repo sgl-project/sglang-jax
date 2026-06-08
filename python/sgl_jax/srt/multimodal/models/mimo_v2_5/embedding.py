@@ -115,6 +115,14 @@ class MiMoV2_5Embedding(nnx.Module):
 
     @classmethod
     def get_embed_model_config(cls, model_config: PretrainedConfig) -> PretrainedConfig:
+        # The embed stage only builds the text-embed + audio understanding tower, none of
+        # which are FP8-quantized (the quantized weights are the AR MoE/attention layers).
+        # The shared checkpoint config.json carries a top-level fp8 `quantization_config`
+        # dict; if left on this config the loader's _get_model would call
+        # `.is_static_checkpoint` on a plain dict and crash. Strip it so the embed tower
+        # loads as plain bf16. (AR stage builds its own ModelConfig which resolves fp8.)
+        if getattr(model_config, "quantization_config", None) is not None:
+            model_config.quantization_config = None
         return model_config
 
     def load_weights(self, model_config: ModelConfig):

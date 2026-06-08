@@ -1,0 +1,29 @@
+# GKE TPU config for MiMo-V2.5 omni multi-host run (lianfang-v6e-mimo)
+[gke]
+project = "tpu-service-473302"
+cluster = "lianfang-v6e-mimo"
+zone    = "us-east5-a"
+
+[tpu]
+accelerator    = "tpu-v6e-slice"
+topology       = "4x4"
+chips_per_node = 4
+machine_type   = "ct6e-standard-4t"
+max_nodes      = 4
+
+[workload]
+name            = "lianfang-mimo-v25"
+docker_image    = "us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1"
+service_account = "gcs-account"
+
+[storage]
+type       = "gcsfuse"
+bucket     = "model-storage-sglang"
+mount_path = "/models"
+# weights live at /models/MiMo-V2.5/
+
+[repo]
+git_url     = "https://github.com/primatrix/sglang-jax.git"
+remote_path = "/tmp/sglang-jax"
+branch      = "feat/mimo-v2.5"
+install_cmd = "pip install -e python[all]"
