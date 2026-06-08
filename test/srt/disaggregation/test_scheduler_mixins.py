@@ -882,7 +882,7 @@ def test_receiver_terminal_failed_sends_abort_to_tokenizer():
 
 
 def test_dispatch_scheduler_event_loop_routes_correctly():
-    from sgl_jax.srt.disaggregation.runtime import dispatch_scheduler_event_loop
+    from sgl_jax.srt.managers.scheduler import dispatch_scheduler_event_loop
 
     for mode, overlap, expected_method in [
         ("null", False, "event_loop_normal"),

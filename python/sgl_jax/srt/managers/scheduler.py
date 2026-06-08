@@ -30,10 +30,7 @@ from sgl_jax.srt.constrained.base_grammar_backend import (
 )
 from sgl_jax.srt.disaggregation.decode import SchedulerDisaggregationDecodeMixin
 from sgl_jax.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
-from sgl_jax.srt.disaggregation.runtime import (
-    dispatch_scheduler_event_loop,
-    install_disaggregation_wiring,
-)
+from sgl_jax.srt.disaggregation.runtime import install_disaggregation_wiring
 from sgl_jax.srt.hf_transformers_utils import get_tokenizer
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
 from sgl_jax.srt.managers.communication import CommunicationBackend
@@ -154,58 +151,7 @@ class Scheduler(
         if stage_sub_dir is not None:
             server_args = dataclasses.replace(server_args)
             server_args.model_sub_dir = stage_sub_dir
-        # set jit cache
-        jit_cache_dir = os.getenv("JAX_COMPILATION_CACHE_DIR", None)
-        device_indexes = server_args.device_indexes
-        # Report the effective persistent-cache state after resolving overrides below.
-        cache_status = None
-        # libtpu (tpu-v6e + libtpu 0.0.30) crashes during JAX persistent
-        # compilation-cache use when the device subset does not start at
-        # device 0 (e.g. device_indexes=[2, 3]). Disable the cache for
-        # such schedulers and override any cache config a sibling
-        # scheduler may have set in the same process. See
-        # sgl-project/sglang-jax#1216.
-        if (
-            jit_cache_dir is not None
-            and device_indexes is not None
-            and min(device_indexes, default=0) > 0
-        ):
-            jax.config.update("jax_compilation_cache_dir", "")
-            jit_cache_dir = None
-            # jax.config.update alone does not take effect once the
-            # compilation_cache module's _cache_initialized flag is set
-            # by an earlier sibling scheduler in the same process; that
-            # flag is one-shot. cc.reset_cache() is the only public API
-            # that clears it, forcing the next cache lookup to re-read
-            # the (now-empty) cache_dir config and stay disabled.
-            from jax.experimental.compilation_cache import compilation_cache as cc
-
-            cc.reset_cache()
-            cache_status = (
-                f"disabled for non-zero-base device subset: device_indexes={device_indexes}"
-            )
-        if jit_cache_dir is not None:
-            jax.config.update("jax_compilation_cache_dir", jit_cache_dir)
-            # Default the compile-time write threshold to 0 (cache every compile) for
-            # local/dev. When JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS is set (CI sets
-            # it to 1 to skip tiny entries and cut small-file GCS writes), defer to JAX's
-            # own parsing so the behavior — including validation of bad values — matches
-            # upstream JAX.
-            if "JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS" not in os.environ:
-                jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
-            # Disable the size gate; the compile-time threshold still controls writes.
-            jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
-            # Include XLA sub-caches such as kernel/autotune data.
-            jax.config.update("jax_persistent_cache_enable_xla_caches", "all")
-            from jax.experimental.compilation_cache import compilation_cache as cc
-
-            cc.set_cache_dir(jit_cache_dir)
-            min_compile_time = jax.config.jax_persistent_cache_min_compile_time_secs
-            cache_status = f"enabled, dir={jit_cache_dir}, min_compile_time={min_compile_time}s"
-
-        if cache_status is None:
-            cache_status = "not configured (JAX_COMPILATION_CACHE_DIR unset)"
-        logger.info("XLA persistent compilation cache: %s", cache_status)
+        self._setup_jit_cache(server_args)
 
         # Parse args
         self.server_args = server_args
@@ -524,6 +470,58 @@ class Scheduler(
                 logger.info("[Scheduler] Begins to run spec_decode worker precompile.")
                 self.draft_worker.run_spec_decode_precompile()
                 logger.info("[Scheduler] Completes spec_decode worker precompile.")
+
+    def _setup_jit_cache(self, server_args: ServerArgs) -> None:
+        jit_cache_dir = os.getenv("JAX_COMPILATION_CACHE_DIR", None)
+        device_indexes = server_args.device_indexes
+        cache_status = None
+        # libtpu (tpu-v6e + libtpu 0.0.30) crashes during JAX persistent
+        # compilation-cache use when the device subset does not start at
+        # device 0 (e.g. device_indexes=[2, 3]). Disable the cache for
+        # such schedulers and override any cache config a sibling
+        # scheduler may have set in the same process. See
+        # sgl-project/sglang-jax#1216.
+        if (
+            jit_cache_dir is not None
+            and device_indexes is not None
+            and min(device_indexes, default=0) > 0
+        ):
+            jax.config.update("jax_compilation_cache_dir", "")
+            jit_cache_dir = None
+            # jax.config.update alone does not take effect once the
+            # compilation_cache module's _cache_initialized flag is set
+            # by an earlier sibling scheduler in the same process; that
+            # flag is one-shot. cc.reset_cache() is the only public API
+            # that clears it, forcing the next cache lookup to re-read
+            # the (now-empty) cache_dir config and stay disabled.
+            from jax.experimental.compilation_cache import compilation_cache as cc
+
+            cc.reset_cache()
+            cache_status = (
+                f"disabled for non-zero-base device subset: device_indexes={device_indexes}"
+            )
+        if jit_cache_dir is not None:
+            jax.config.update("jax_compilation_cache_dir", jit_cache_dir)
+            # Default the compile-time write threshold to 0 (cache every compile) for
+            # local/dev. When JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS is set (CI sets
+            # it to 1 to skip tiny entries and cut small-file GCS writes), defer to JAX's
+            # own parsing so the behavior — including validation of bad values — matches
+            # upstream JAX.
+            if "JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS" not in os.environ:
+                jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
+            # Disable the size gate; the compile-time threshold still controls writes.
+            jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
+            # Include XLA sub-caches such as kernel/autotune data.
+            jax.config.update("jax_persistent_cache_enable_xla_caches", "all")
+            from jax.experimental.compilation_cache import compilation_cache as cc
+
+            cc.set_cache_dir(jit_cache_dir)
+            min_compile_time = jax.config.jax_persistent_cache_min_compile_time_secs
+            cache_status = f"enabled, dir={jit_cache_dir}, min_compile_time={min_compile_time}s"
+
+        if cache_status is None:
+            cache_status = "not configured (JAX_COMPILATION_CACHE_DIR unset)"
+        logger.info("XLA persistent compilation cache: %s", cache_status)
 
     def sync_pub(self):
         logger.info(
@@ -2165,6 +2163,20 @@ class Scheduler(
     def continue_generation(self, recv_req: ContinueGenerationReqInput):
         self._engine_paused = False
         logger.info("Generation continued")
+
+
+def dispatch_scheduler_event_loop(scheduler: Scheduler, server_args: ServerArgs) -> None:
+    """Choose and run the appropriate scheduler event loop."""
+
+    mode = server_args.disaggregation_mode
+    if mode == "prefill":
+        scheduler.event_loop_normal_disagg_prefill()
+    elif mode == "decode":
+        scheduler.event_loop_normal_disagg_decode()
+    elif scheduler.enable_overlap:
+        scheduler.event_loop_overlap()
+    else:
+        scheduler.event_loop_normal()
 
 
 def run_scheduler_process(

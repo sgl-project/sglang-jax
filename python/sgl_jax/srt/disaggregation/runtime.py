@@ -15,20 +15,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def dispatch_scheduler_event_loop(scheduler: Scheduler, server_args: ServerArgs) -> None:
-    """Choose and run the appropriate scheduler event loop."""
-
-    mode = server_args.disaggregation_mode
-    if mode == "prefill":
-        scheduler.event_loop_normal_disagg_prefill()
-    elif mode == "decode":
-        scheduler.event_loop_normal_disagg_decode()
-    elif scheduler.enable_overlap:
-        scheduler.event_loop_overlap()
-    else:
-        scheduler.event_loop_normal()
-
-
 def install_disaggregation_wiring(scheduler: Scheduler, server_args: ServerArgs) -> None:
     """Wire up PD runtime attributes when disaggregation mode is enabled."""
 
