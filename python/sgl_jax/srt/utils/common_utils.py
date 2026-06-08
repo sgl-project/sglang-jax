@@ -39,6 +39,22 @@ PRECOMPILE_DEFAULT_TOKEN_PADDINGS = [1 << i for i in range(6, 14)]
 PRECOMPILE_DEFAULT_BS_PADDINGS = [1 << i for i in range(0, 9)]
 
 
+def align_bs_for_fused_ep(bs: int, ep_size: int) -> int:
+    """Down-align a global batch size so it is launchable by fused_ep_moe.
+
+    The fused MoE kernel requires ``bs % ep_size == 0`` and the per-EP local
+    batch ``bs // ep_size`` to be in ``{2, 4}`` or a multiple of 8. The
+    attention-backend / pool-derived ``max_running_requests`` is not ep-aware
+    (e.g. 408 on v7x-16 with ep=32), so callers must align it before it flows
+    into the scheduler and the precompile bucket list.
+    """
+    if ep_size <= 1:
+        return bs
+    local = bs // ep_size
+    local = (local // 8) * 8 if local >= 8 else (4 if local >= 4 else 2)
+    return local * ep_size
+
+
 def pad_to_bucket(value: int, buckets: list[int]) -> tuple[int, int]:
     """Return the smallest bucket >= value and its index.
 

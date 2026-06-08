@@ -3,7 +3,27 @@ from unittest.mock import MagicMock
 
 from sgl_jax.srt.model_executor.compilation_manager import CompilationManager
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
-from sgl_jax.srt.utils.common_utils import pad_to_bucket
+from sgl_jax.srt.utils.common_utils import align_bs_for_fused_ep, pad_to_bucket
+
+
+class TestAlignBsForFusedEp(unittest.TestCase):
+    def test_v7x16_dsv3_408_to_256(self):
+        # DeepSeek-V3 v7x-16: attn_limit 102×dp4=408, ep=32 → local=12 invalid
+        self.assertEqual(align_bs_for_fused_ep(408, 32), 256)
+
+    def test_already_aligned_noop(self):
+        self.assertEqual(align_bs_for_fused_ep(512, 32), 512)  # local=16=8k
+        self.assertEqual(align_bs_for_fused_ep(512, 64), 512)  # local=8
+        self.assertEqual(align_bs_for_fused_ep(128, 32), 128)  # local=4
+        self.assertEqual(align_bs_for_fused_ep(64, 32), 64)  # local=2
+
+    def test_small_local_snaps_to_2_or_4(self):
+        self.assertEqual(align_bs_for_fused_ep(100, 32), 64)  # local=3→2
+        self.assertEqual(align_bs_for_fused_ep(200, 32), 128)  # local=6→4
+
+    def test_ep_le_1_passthrough(self):
+        self.assertEqual(align_bs_for_fused_ep(408, 1), 408)
+        self.assertEqual(align_bs_for_fused_ep(408, 0), 408)
 
 
 def _make_server_args(**overrides):

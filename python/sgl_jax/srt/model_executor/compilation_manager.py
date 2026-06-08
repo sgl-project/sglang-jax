@@ -47,7 +47,6 @@ class CompilationManager:
         self.multimodal = multimodal
         self.has_recurrent_state = has_recurrent_state
         self.moe_backend = server_args.moe_backend
-        self.ep_size = server_args.ep_size
         self.enable_static_lora = server_args.enable_static_lora
 
         self.token_buckets = self._compute_token_buckets(server_args.precompile_token_paddings)
@@ -90,18 +89,7 @@ class CompilationManager:
                 buckets.append(bs)
         buckets.sort()
         if len(buckets) == 0 or buckets[-1] < self.max_padded_batch_size:
-            cap = self.max_padded_batch_size
-            if self.moe_backend == "fused" and self.ep_size > 1:
-                # fused_ep_moe requires global num_tokens % ep_size == 0 AND the
-                # derived per-ep bt (= num_tokens // ep_size) to be in {2, 4, 8k}.
-                # max_padded_batch_size comes from min(attn_backend_limit, ...)
-                # which is not ep-aware (e.g. 408 on v7x-16 ep=32); down-align so
-                # the auto-appended bucket is always launchable.
-                local = cap // self.ep_size
-                local = (local // 8) * 8 if local >= 8 else (4 if local >= 4 else 2)
-                cap = local * self.ep_size
-            if len(buckets) == 0 or cap > buckets[-1]:
-                buckets.append(cap)
+            buckets.append(self.max_padded_batch_size)
         return buckets
 
     def _compute_cache_loc_buckets(self) -> list[int]:
