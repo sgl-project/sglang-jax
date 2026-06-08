@@ -106,7 +106,13 @@ class ChatCompletionSampler(SamplerBase):
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.top_p = top_p
-        self.extra_body = extra_body
+        self.extra_body = dict(extra_body) if extra_body else {}
+        if "chat_template_kwargs" not in self.extra_body:
+            self.extra_body["chat_template_kwargs"] = {}
+        else:
+            self.extra_body["chat_template_kwargs"] = dict(self.extra_body["chat_template_kwargs"])
+        if "enable_thinking" not in self.extra_body["chat_template_kwargs"]:
+            self.extra_body["chat_template_kwargs"]["enable_thinking"] = True
         self.image_format = "url"
 
     def _handle_image(
@@ -141,13 +147,17 @@ class ChatCompletionSampler(SamplerBase):
                     messages=message_list,
                     temperature=self.temperature,
                     max_tokens=self.max_tokens,
+                    extra_body={"chat_template_kwargs": {"enable_thinking": True}},
                 )
                 if self.top_p is not None:
                     kwargs["top_p"] = self.top_p
                 if self.extra_body:
                     kwargs["extra_body"] = self.extra_body
                 response = self.client.chat.completions.create(**kwargs)
-                return response.choices[0].message.content
+                txt = response.choices[0].message.content or ""
+                if hasattr(response.choices[0].message, "reasoning_content") and response.choices[0].message.reasoning_content:
+                    txt = f"{response.choices[0].message.reasoning_content}\n{txt}"
+                return txt
             # NOTE: BadRequestError is triggered once for MMMU, please uncomment if you are rerunning MMMU
             except openai.BadRequestError as e:
                 print("Bad Request Error", e)

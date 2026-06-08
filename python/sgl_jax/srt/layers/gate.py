@@ -20,26 +20,30 @@ class GateLogit(nnx.Module):
         weight_dtype: jnp.dtype = jnp.bfloat16,
         enable_expert_bias: bool | None = False,
         score_func: str | None = "softmax",
+        mesh: jax.sharding.Mesh | None = None,
     ):
         self.weight_dtype = weight_dtype
         self.enable_expert_bias = enable_expert_bias
         self.score_func = score_func
+        self.mesh = mesh
 
+        kernel_sharding = jax.sharding.NamedSharding(mesh, P(None, None)) if mesh is not None else None
         self.kernel = nnx.Param(
             jax.random.normal(
                 jax.random.PRNGKey(0),
                 (input_size, num_experts),
                 dtype=jnp.float32,
-                out_sharding=P(None, None),
+                out_sharding=kernel_sharding,
             ),
         )
         if enable_expert_bias:
+            bias_sharding = jax.sharding.NamedSharding(mesh, P(None)) if mesh is not None else None
             self.bias = nnx.Param(
                 jax.random.normal(
                     jax.random.PRNGKey(0),
                     (num_experts,),
                     dtype=self.weight_dtype,
-                    out_sharding=P(None),
+                    out_sharding=bias_sharding,
                 ),
             )
         else:

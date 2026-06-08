@@ -201,7 +201,6 @@ class RotaryEmbedding:
         is_neox_style: bool,
         dtype: jnp.dtype,
         mesh: jax.sharding.Mesh | None = None,
-        base_div_dim: int | None = None,
     ):
         self.head_size = head_size
         self.rotary_dim = rotary_dim
@@ -210,8 +209,7 @@ class RotaryEmbedding:
         self.is_neox_style = is_neox_style
         self.dtype = dtype
 
-        div_dim = base_div_dim if base_div_dim is not None else rotary_dim
-        inv_freq_np = 1.0 / (base ** (np.arange(0, rotary_dim, 2, dtype=np.float32) / div_dim))
+        inv_freq_np = 1.0 / (base ** (np.arange(0, rotary_dim, 2, dtype=np.float32) / rotary_dim))
         self._inv_freq_np = inv_freq_np  # shape: (rotary_dim // 2,)
 
     @named_scope
@@ -222,26 +220,35 @@ class RotaryEmbedding:
         key: jax.Array,
     ) -> tuple[jax.Array, jax.Array]:
         positions = positions.flatten()  # [num_tokens]
-        num_tokens = positions.shape[0]
 
         inv_freq = jnp.asarray(self._inv_freq_np, dtype=self.dtype)
+
+        # Compute freqs = positions * inv_freq
         freqs = jnp.einsum("n,d->nd", positions.astype(jnp.float32), inv_freq)
-
-        query_shape = query.shape
-        key_shape = key.shape
-        query = query.reshape(num_tokens, -1, self.head_size)
-        key = key.reshape(num_tokens, -1, self.head_size)
-
-        if self.rotary_dim < self.head_size:
-            # Match official tpu-inference padding alignment for partial RoPE
-            nope_angles = self.head_size // 2 - (self.rotary_dim // 2)
-            freqs = jnp.pad(freqs, ((0, 0), (0, nope_angles)), mode="constant", constant_values=0.0)
 
         cos = jnp.cos(freqs).astype(self.dtype)
         sin = jnp.sin(freqs).astype(self.dtype)
 
-        query = apply_rotary_emb(query, cos, sin, self.is_neox_style).reshape(query_shape)
-        key = apply_rotary_emb(key, cos, sin, self.is_neox_style).reshape(key_shape)
+        query_shape = query.shape
+        num_tokens = positions.shape[0]
+        query = query.reshape(num_tokens, -1, self.head_size)
+        query_rot = query[..., : self.rotary_dim]
+        query_rot = apply_rotary_emb(query_rot, cos, sin, self.is_neox_style)
+        if self.rotary_dim < self.head_size:
+            query_pass = query[..., self.rotary_dim :]
+            query = jnp.concatenate((query_rot, query_pass), axis=-1).reshape(query_shape)
+        else:
+            query = query_rot.reshape(query_shape)
+
+        key_shape = key.shape
+        key = key.reshape(num_tokens, -1, self.head_size)
+        key_rot = key[..., : self.rotary_dim]
+        key_rot = apply_rotary_emb(key_rot, cos, sin, self.is_neox_style)
+        if self.rotary_dim < self.head_size:
+            key_pass = key[..., self.rotary_dim :]
+            key = jnp.concatenate((key_rot, key_pass), axis=-1).reshape(key_shape)
+        else:
+            key = key_rot.reshape(key_shape)
 
         return query, key
 
@@ -605,7 +612,6 @@ def get_rope(
     dtype: jnp.dtype | None = jnp.bfloat16,
     partial_rotary_factor: float = 1.0,
     dual_chunk_attention_config: dict[str, Any] | None = None,
-    base_div_dim: int | None = None,
 ) -> RotaryEmbedding:
     if rope_scaling is not None:
         # Transforms every value that is a list into a tuple for caching calls
@@ -637,14 +643,13 @@ def get_rope(
         rope_scaling_args,
         dual_chunk_attention_args,
         dtype,
-        base_div_dim,
     )
     if key in _ROPE_DICT:
         return _ROPE_DICT[key]
 
     if rope_scaling is None:
         rotary_emb = RotaryEmbedding(
-            head_size, rotary_dim, max_position, base, is_neox_style, dtype, base_div_dim=base_div_dim
+            head_size, rotary_dim, max_position, base, is_neox_style, dtype
         )
     else:
         if "rope_type" in rope_scaling:
