@@ -27,7 +27,11 @@ def can_use_spec_decode_overlap(enable_overlap, spec_algorithm, batch) -> bool:
         return False
     if spec_algorithm is None or spec_algorithm.is_none():
         return False
+    if batch.forward_mode.is_mixed():
+        return False
     if not batch.forward_mode.is_decode():
+        return False
+    if any(info.decoding_reqs for info in batch.reqs_info):
         return False
     return not (batch.return_logprob or batch.return_output_logprob_only)
 
