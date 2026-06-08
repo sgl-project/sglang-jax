@@ -306,6 +306,25 @@ def get_tokenizer(
             if "extra_special_tokens" in config_data and isinstance(config_data["extra_special_tokens"], list):
                 config_data.pop("extra_special_tokens", None)
                 is_patched = True
+
+            # Simplify dict-valued special tokens to strings to avoid transformers TypeError
+            special_token_keys = ["bos_token", "eos_token", "unk_token", "pad_token", "sep_token", "cls_token", "mask_token"]
+            for key in special_token_keys:
+                if key in config_data and isinstance(config_data[key], dict):
+                    if "content" in config_data[key]:
+                        config_data[key] = config_data[key]["content"]
+                        is_patched = True
+            
+            if "additional_special_tokens" in config_data and isinstance(config_data["additional_special_tokens"], list):
+                new_additional = []
+                for token in config_data["additional_special_tokens"]:
+                    if isinstance(token, dict) and "content" in token:
+                        new_additional.append(token["content"])
+                        is_patched = True
+                    else:
+                        new_additional.append(token)
+                config_data["additional_special_tokens"] = new_additional
+
             if is_patched:
                 with open(tokenizer_config_path, "w", encoding="utf-8") as f:
                     json.dump(config_data, f, indent=2)
