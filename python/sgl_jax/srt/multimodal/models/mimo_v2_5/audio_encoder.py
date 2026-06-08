@@ -201,12 +201,9 @@ class MiMoV25AudioUnderstandingEncoder(nnx.Module):
         codes = self._ensure_channel_first_audio_codes(audio_codes).astype(jnp.int32)
         # The audio understanding tower is tiny and runs replicated on the embed device.
         # Under the embed stage's explicit-sharding mesh the incoming codes may carry a
-        # data-axis sharding, which makes the group/proj reshapes (e.g. [N,4,1024] ->
-        # [1,N,4096]) unsupported without an out_sharding. Pin codes to fully replicated
-        # so every downstream reshape is a local op.
-        codes = jax.lax.with_sharding_constraint(
-            codes, jax.sharding.NamedSharding(self.mesh, jax.sharding.PartitionSpec())
-        )
+        # data-axis sharding, which makes the group/proj reshapes unsupported without an
+        # out_sharding. Pin to fully replicated so every downstream reshape is local.
+        codes = self._replicate(codes)
 
         grouped_codes = self._group_audio_codes(codes)
         batch, groups, group_size, _ = grouped_codes.shape
@@ -235,6 +232,9 @@ class MiMoV25AudioUnderstandingEncoder(nnx.Module):
 
     def _replicate(self, x: jax.Array) -> jax.Array:
         """Pin a tensor to fully-replicated sharding (no-op when already replicated)."""
+        mesh = getattr(self, "mesh", None)
+        if mesh is None:
+            return x
         return jax.lax.with_sharding_constraint(
-            x, jax.sharding.NamedSharding(self.mesh, jax.sharding.PartitionSpec())
+            x, jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
         )

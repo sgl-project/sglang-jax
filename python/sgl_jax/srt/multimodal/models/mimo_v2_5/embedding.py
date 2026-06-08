@@ -193,8 +193,8 @@ class MiMoV2_5Embedding(nnx.Module):
             )
         return self.visual(pixel_values_videos.astype(self.dtype), video_grid_thw)
 
-    @staticmethod
     def _scatter_modality(
+        self,
         input_ids: jax.Array,
         input_embeds: jax.Array,
         modality_embeds: jax.Array | None,
@@ -222,6 +222,15 @@ class MiMoV2_5Embedding(nnx.Module):
         # fill_value = seq_len → an always-out-of-bounds row index; combined with
         # mode="drop" below, extra (unmatched) slots scatter nowhere instead of to row 0.
         positions = jnp.nonzero(mask, size=modality_embeds.shape[0], fill_value=seq_len)[0]
+        # Under the embed mesh's explicit sharding, input_embeds is data-sharded and the
+        # scatter cannot resolve an output sharding (operand [seq@data,H] vs replicated
+        # updates [N,H]). The embed sequence is short; replicate operand + updates so the
+        # scatter is unambiguous and local. forward() slices to real seq len afterwards.
+        mesh = getattr(self, "mesh", None)
+        if mesh is not None:
+            replicated = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+            input_embeds = jax.lax.with_sharding_constraint(input_embeds, replicated)
+            modality_embeds = jax.lax.with_sharding_constraint(modality_embeds, replicated)
         return input_embeds.at[positions, :].set(modality_embeds, mode="drop")
 
     def __call__(
