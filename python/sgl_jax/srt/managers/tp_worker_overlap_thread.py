@@ -18,19 +18,9 @@ from sgl_jax.srt.managers.utils import resolve_future_token_ids, set_future_toke
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 from sgl_jax.srt.server_args import ServerArgs
-from sgl_jax.srt.speculative.overlap_future import make_spec_decode_future_result
 from sgl_jax.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
-
-
-@dataclasses.dataclass
-class OverlapForwardInput:
-    model_worker_batch: ModelWorkerBatch | None
-    future_token_ids_ct: int | None = None
-    sampling_metadata: SamplingMetadata | None = None
-    forward_metadata: object | None = None
-    spec_worker: object | None = None
 
 
 class ModelWorkerClient:
@@ -113,19 +103,14 @@ class ModelWorkerClient:
 
     def forward_thread_func_(self):
         while True:
-            forward_input: OverlapForwardInput = self.input_queue.get()
-            model_worker_batch = forward_input.model_worker_batch
+            (
+                model_worker_batch,
+                future_token_ids_ct,
+                sampling_metadata,
+                forward_metadata,
+            ) = self.input_queue.get()
             if not model_worker_batch:
                 break
-            if forward_input.spec_worker is not None:
-                batch_output = forward_input.spec_worker.forward_batch_speculative_generation(
-                    model_worker_batch
-                )
-                self.output_queue.put(make_spec_decode_future_result(batch_output))
-                continue
-            future_token_ids_ct = forward_input.future_token_ids_ct
-            sampling_metadata = forward_input.sampling_metadata
-            forward_metadata = forward_input.forward_metadata
 
             # Resolve future tokens in the input
             input_ids = model_worker_batch.forward_batch.input_ids
@@ -196,12 +181,6 @@ class ModelWorkerClient:
 
         return logits_output, next_token_ids, cache_miss_count
 
-    def resolve_last_spec_batch_result(self, launch_done: threading.Event | None = None):
-        batch_output = self.output_queue.get()
-        if launch_done is not None:
-            launch_done.wait()
-        return batch_output
-
     def forward_batch_generation(
         self,
         model_worker_batch: ModelWorkerBatch,
@@ -238,11 +217,11 @@ class ModelWorkerClient:
 
         # Push a new batch to the queue (JAX handles synchronization automatically)
         self.input_queue.put(
-            OverlapForwardInput(
+            (
                 model_worker_batch,
-                future_token_ids_ct=self.future_token_ids_ct,
-                sampling_metadata=sampling_metadata,
-                forward_metadata=forward_metadata,
+                self.future_token_ids_ct,
+                sampling_metadata,
+                forward_metadata,
             )
         )
 
@@ -257,15 +236,6 @@ class ModelWorkerClient:
         )
         self.future_token_ids_ct = (self.future_token_ids_ct + bs) % self.future_token_ids_limit
         return None, future_next_token_ids, 0
-
-    def forward_batch_speculative_generation(self, spec_worker, model_worker_batch):
-        self.input_queue.put(
-            OverlapForwardInput(
-                model_worker_batch=model_worker_batch,
-                spec_worker=spec_worker,
-            )
-        )
-        return None
 
     def run_precompile(self):
         self.worker.run_precompile(self.future_token_ids_map)
@@ -286,4 +256,4 @@ class ModelWorkerClient:
         return self.worker.get_tokens_per_layer_info()
 
     def __delete__(self):
-        self.input_queue.put(OverlapForwardInput(None))
+        self.input_queue.put((None, None, None, None))
