@@ -460,14 +460,13 @@ class ModelRunnerKVCacheMixin:
 
             full_head_dim = self.model_config.head_dim
             full_head_num = self.model_config.get_total_num_kv_heads_with_replication(self.attention_tp_size)
-            swa_head_dim = getattr(self.model_config.hf_config, "swa_head_dim", None)
+            swa_head_dim = None
             if self.model_config.has_global_head_dim:
                 full_head_dim = self.model_config.global_head_dim
                 _, _, _, _, target_heads = self.model_config.get_local_global_weight_params()
                 full_head_num = target_heads
-                raw_swa_dim = getattr(self.model_config.hf_config, "swa_head_dim", self.model_config.head_dim)
-                swa_head_dim = (raw_swa_dim + 127) // 128 * 128
-                swa_head_num = getattr(self.model_config.hf_config, "swa_num_key_value_heads", getattr(self.model_config.hf_text_config, "num_key_value_heads", 1))
+                swa_head_dim = (self.model_config.head_dim + 127) // 128 * 128
+                swa_head_num = getattr(self.model_config.hf_text_config, "num_key_value_heads", 1)
 
             self.token_to_kv_pool = SWAKVPool(
                 size=self.full_max_total_num_tokens,

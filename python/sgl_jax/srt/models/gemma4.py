@@ -47,7 +47,6 @@ class Gemma4Router(nnx.Module):
             input_size=self.hidden_size,
             num_experts=self.num_experts,
             weight_dtype=dtype,
-            mesh=mesh,
         )
         self.per_expert_scale = nnx.Param(jnp.ones((self.num_experts,), dtype=dtype))
 
@@ -563,30 +562,6 @@ class Gemma4ForCausalLM(nnx.Module):
         )
         self.capture_aux_hidden_states = False
 
-    @classmethod
-    def patch_model_config(cls, model_config: ModelConfig) -> None:
-        text_cfg = model_config.hf_text_config
-        global_head_dim = getattr(text_cfg, "global_head_dim", None)
-        global_kv = getattr(text_cfg, "num_global_key_value_heads", None)
-        if global_head_dim is None and global_kv is None:
-            return
-        if getattr(text_cfg, "_gemma4_patched", False):
-            model_config.head_dim = text_cfg.head_dim
-            return
-        text_cfg._gemma4_patched = True
-
-        text_cfg.swa_head_dim = text_cfg.head_dim
-        text_cfg.swa_num_key_value_heads = text_cfg.num_key_value_heads
-        if global_head_dim is not None:
-            text_cfg.head_dim = global_head_dim
-        if global_kv is not None:
-            text_cfg.num_key_value_heads = global_kv
-
-        for attr in ("swa_head_dim", "swa_num_key_value_heads", "head_dim", "num_key_value_heads"):
-            setattr(model_config.hf_config, attr, getattr(text_cfg, attr))
-
-        model_config.head_dim = text_cfg.head_dim
-
     def load_weights(self, model_config: ModelConfig):
         loader = WeightLoader(
             model=self,
@@ -597,6 +572,7 @@ class Gemma4ForCausalLM(nnx.Module):
 
         weight_mappings = self._create_gemma4_weight_mappings()
         if not loader.dummy_mode:
+            # Filter weight mappings to match exact safetensors index keys, preventing false-positive "weight not found" errors
             weight_info = loader._scan_weight_info()
             weight_mappings = {k: v for k, v in weight_mappings.items() if k in weight_info}
 
