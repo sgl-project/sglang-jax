@@ -176,6 +176,7 @@ class TokenizedGenerateReqInput:
     # provide a per-attempt value to isolate late acks.
     disagg_transfer_id: str | None = None
 
+
 @dataclass
 class AbortReq(BaseReq):
     # Whether to abort all requests

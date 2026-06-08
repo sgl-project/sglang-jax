@@ -2,16 +2,16 @@
 
 from __future__ import annotations
 
-from contextlib import suppress
-from http import HTTPStatus
 import logging
 import threading
+from contextlib import suppress
 from dataclasses import dataclass
+from functools import partial
+from http import HTTPStatus
 from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
-from functools import partial
 
 from sgl_jax.srt.disaggregation.base.kv_manager import KVPoll
 from sgl_jax.srt.disaggregation.jax_transfer.conn import (
@@ -41,9 +41,7 @@ def _pad_to_page_bucket(num_pages: int) -> int:
 def _jit_gather_all_layers(buffers, page_indices, out_sharding):
     """Gather ``page_indices`` from every per-layer KV buffer in one jit."""
 
-    return [
-        buf.at[page_indices].get(out_sharding=out_sharding) for buf in buffers
-    ]
+    return [buf.at[page_indices].get(out_sharding=out_sharding) for buf in buffers]
 
 
 @dataclass
@@ -77,10 +75,7 @@ class PrefillBootstrapQueue:
     ) -> None:
         with self._lock:
             if req_id in self._entries:
-                raise ValueError(
-                    f"PrefillBootstrapQueue already tracks "
-                    f"req_id={req_id!r}"
-                )
+                raise ValueError(f"PrefillBootstrapQueue already tracks " f"req_id={req_id!r}")
             self._entries[req_id] = PrefillBookkeeping(
                 req_id=req_id, sender=sender, on_terminal=on_terminal
             )
@@ -97,9 +92,7 @@ class PrefillBootstrapQueue:
                     del self._entries[req_id]
         return terminal
 
-    def abort_matching(
-        self, rid_prefix: str, abort_all: bool
-    ) -> list[PrefillBookkeeping]:
+    def abort_matching(self, rid_prefix: str, abort_all: bool) -> list[PrefillBookkeeping]:
         out: list[PrefillBookkeeping] = []
         with self._lock:
             for req_id in list(self._entries):
@@ -211,9 +204,7 @@ class SchedulerDisaggregationPrefillMixin:
             def _on_terminal(req_obj=req, sender_obj=sender):
                 self._on_prefill_transfer_terminal(req_obj, sender_obj)
 
-            self.disagg_prefill_queue.add(
-                req_id, sender, on_terminal=_on_terminal
-            )
+            self.disagg_prefill_queue.add(req_id, sender, on_terminal=_on_terminal)
 
     def send_kv_chunk(self: Scheduler) -> None:
         """Reap senders that reached SUCCESS / FAILED."""
@@ -247,12 +238,10 @@ class SchedulerDisaggregationPrefillMixin:
         seqlen = len(req.origin_input_ids)
         num_pages = (seqlen + page_size - 1) // page_size
         padded_pages = _pad_to_page_bucket(num_pages)
-        page_id_source = (
-            req_to_token[
-                req.req_pool_idx,
-                : padded_pages * page_size : page_size,
-            ]
-        )
+        page_id_source = req_to_token[
+            req.req_pool_idx,
+            : padded_pages * page_size : page_size,
+        ]
         import numpy as _np
         from jax.sharding import NamedSharding as _NamedSharding
         from jax.sharding import PartitionSpec as _P
@@ -274,9 +263,7 @@ class SchedulerDisaggregationPrefillMixin:
                 kv_pool.start_layer + kv_pool.layer_num,
             )
         ]
-        layer_kvs = _jit_gather_all_layers(
-            layer_buffers, page_indices, gather_out_sharding
-        )
+        layer_kvs = _jit_gather_all_layers(layer_buffers, page_indices, gather_out_sharding)
         return jnp.stack(layer_kvs, axis=0)
 
     def _release_prefill_req_resources(self: Scheduler, req: Req) -> None:
@@ -292,9 +279,7 @@ class SchedulerDisaggregationPrefillMixin:
                 PD_TRANSFER_FAILURES_TOTAL,
             )
 
-            PD_TRANSFER_FAILURES_TOTAL.labels(
-                reason=reason, role="prefill"
-            ).inc()
+            PD_TRANSFER_FAILURES_TOTAL.labels(reason=reason, role="prefill").inc()
 
     def _stream_prefill_req(self: Scheduler, req: Req) -> None:
         self.stream_output(

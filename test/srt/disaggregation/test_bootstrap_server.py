@@ -12,15 +12,14 @@ import threading
 import time
 from unittest import mock
 
+import httpx
 import pytest
 
-import httpx
-
 from sgl_jax.srt.disaggregation.bootstrap import (
-    BootstrapClient,
-    BootstrapServer,
     MIN_COMPATIBLE_VERSION,
     PROTOCOL_VERSION,
+    BootstrapClient,
+    BootstrapServer,
     PrefillInfo,
     _Registry,
 )
@@ -49,8 +48,13 @@ def test_registry_register_list_get(server_and_client):
     assert client.health()
     assert client.list_prefills() == []
     client.register_prefill(
-        bootstrap_key="p0", host="10.0.0.1", transfer_port=30001,
-        side_channel_port=9600, tp_rank=0, tp_size=1, system_dp_rank=0,
+        bootstrap_key="p0",
+        host="10.0.0.1",
+        transfer_port=30001,
+        side_channel_port=9600,
+        tp_rank=0,
+        tp_size=1,
+        system_dp_rank=0,
     )
     plist = client.list_prefills()
     assert len(plist) == 1
@@ -65,7 +69,9 @@ def test_register_multiple_room_hashing(server_and_client):
     _, client = server_and_client
     for i in range(3):
         client.register_prefill(
-            bootstrap_key=f"p{i}", host="10.0.0.1", transfer_port=30001 + i,
+            bootstrap_key=f"p{i}",
+            host="10.0.0.1",
+            transfer_port=30001 + i,
             side_channel_port=9600 + i,
         )
     seen: list[str] = []
@@ -79,11 +85,15 @@ def test_register_multiple_room_hashing(server_and_client):
 def test_re_register_overwrites_and_refreshes(server_and_client):
     _, client = server_and_client
     client.register_prefill(
-        bootstrap_key="p0", host="10.0.0.1", transfer_port=30001,
+        bootstrap_key="p0",
+        host="10.0.0.1",
+        transfer_port=30001,
         side_channel_port=9600,
     )
     client.register_prefill(
-        bootstrap_key="p0", host="10.0.0.2", transfer_port=30002,
+        bootstrap_key="p0",
+        host="10.0.0.2",
+        transfer_port=30002,
         side_channel_port=9601,
     )
     info = client.get_prefill_info(bootstrap_room=0)
@@ -101,7 +111,9 @@ def test_heartbeat_unknown_returns_404(server_and_client):
 def test_unregister_removes_entry(server_and_client):
     _, client = server_and_client
     client.register_prefill(
-        bootstrap_key="p0", host="10.0.0.1", transfer_port=30001,
+        bootstrap_key="p0",
+        host="10.0.0.1",
+        transfer_port=30001,
         side_channel_port=9600,
     )
     client.unregister_prefill("p0")
@@ -129,10 +141,14 @@ class _ManualClock:
 def test_ttl_evicts_stale_entries():
     clock = _ManualClock()
     registry = _Registry(ttl_seconds=30.0, clock=clock)
-    registry.register(PrefillInfo(
-        bootstrap_key="p0", host="10.0.0.1",
-        transfer_port=30001, side_channel_port=9600,
-    ))
+    registry.register(
+        PrefillInfo(
+            bootstrap_key="p0",
+            host="10.0.0.1",
+            transfer_port=30001,
+            side_channel_port=9600,
+        )
+    )
     assert len(registry.list_all()) == 1
 
     # Advance past TTL.
@@ -144,10 +160,14 @@ def test_ttl_evicts_stale_entries():
 def test_heartbeat_refreshes_ttl():
     clock = _ManualClock()
     registry = _Registry(ttl_seconds=30.0, clock=clock)
-    registry.register(PrefillInfo(
-        bootstrap_key="p0", host="10.0.0.1",
-        transfer_port=30001, side_channel_port=9600,
-    ))
+    registry.register(
+        PrefillInfo(
+            bootstrap_key="p0",
+            host="10.0.0.1",
+            transfer_port=30001,
+            side_channel_port=9600,
+        )
+    )
     clock.t += 25.0
     assert registry.heartbeat("p0")
     clock.t += 25.0
@@ -166,10 +186,14 @@ def test_concurrent_register_list():
     def do_register(i):
         barrier.wait()
         try:
-            registry.register(PrefillInfo(
-                bootstrap_key=f"p{i}", host="10.0.0.1",
-                transfer_port=30001 + i, side_channel_port=9600 + i,
-            ))
+            registry.register(
+                PrefillInfo(
+                    bootstrap_key=f"p{i}",
+                    host="10.0.0.1",
+                    transfer_port=30001 + i,
+                    side_channel_port=9600 + i,
+                )
+            )
         except BaseException as e:
             errors.append(e)
 
@@ -241,8 +265,7 @@ def test_heartbeat_daemon_survives_transient_server_errors():
     try:
         time.sleep(0.1)
         assert call_count["n"] >= 3, (
-            f"daemon should have kept beating after raises, "
-            f"saw n={call_count['n']}"
+            f"daemon should have kept beating after raises, " f"saw n={call_count['n']}"
         )
     finally:
         daemon.stop()
@@ -253,7 +276,10 @@ def test_heartbeat_daemon_survives_transient_server_errors():
 
 def test_prefill_info_defaults_to_current_version():
     info = PrefillInfo(
-        bootstrap_key="k", host="h", transfer_port=1, side_channel_port=2,
+        bootstrap_key="k",
+        host="h",
+        transfer_port=1,
+        side_channel_port=2,
     )
     assert info.protocol_version == PROTOCOL_VERSION
 
@@ -300,8 +326,10 @@ def test_registry_stores_protocol_version():
     reg = _Registry()
     reg.register(
         PrefillInfo(
-            bootstrap_key="k", host="h",
-            transfer_port=1, side_channel_port=2,
+            bootstrap_key="k",
+            host="h",
+            transfer_port=1,
+            side_channel_port=2,
             protocol_version=PROTOCOL_VERSION,
         )
     )
@@ -349,7 +377,8 @@ def test_register_prefill_exhausts_retries_and_raises(monkeypatch):
         register_retry_delay_s=0,
     )
     monkeypatch.setattr(
-        httpx, "post",
+        httpx,
+        "post",
         mock.MagicMock(side_effect=httpx.ConnectError("refused")),
     )
     with pytest.raises(RuntimeError, match="failed after 2 attempts"):

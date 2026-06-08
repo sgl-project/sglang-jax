@@ -17,15 +17,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import signal
-import socket
-import subprocess
 import sys
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
-from urllib.error import HTTPError, URLError
 
 
 def _post_json(url: str, payload: dict, timeout: float = 120.0) -> dict:
@@ -104,7 +101,8 @@ def test_e1_happy_path(p_url: str, d_url: str) -> TestResult:
     """E1: Happy path single request."""
     try:
         _, d_resp = _send_pd_request(
-            p_url, d_url,
+            p_url,
+            d_url,
             prompt="What is 2+2? Answer briefly.",
             max_new_tokens=32,
         )
@@ -132,7 +130,8 @@ def test_e2_concurrent(p_url: str, d_url: str) -> TestResult:
         def _run_one(i):
             tid = f"e2-concurrent-{uuid.uuid4().hex[:8]}"
             _, d_resp = _send_pd_request(
-                p_url, d_url,
+                p_url,
+                d_url,
                 prompt=prompts[i],
                 max_new_tokens=32,
                 transfer_id=tid,
@@ -156,8 +155,7 @@ def test_e2_concurrent(p_url: str, d_url: str) -> TestResult:
 
         if errors:
             return TestResult(
-                "E2-concurrent", False,
-                f"{len(errors)} failures: {'; '.join(errors)}"
+                "E2-concurrent", False, f"{len(errors)} failures: {'; '.join(errors)}"
             )
         detail = "; ".join(f"req{i}={t!r}" for i, t in sorted(results))
         return TestResult("E2-concurrent", True, detail)
@@ -169,7 +167,8 @@ def test_e3_long_output(p_url: str, d_url: str) -> TestResult:
     """E3: Long output (128+ tokens) to test multi-page KV gather/scatter."""
     try:
         _, d_resp = _send_pd_request(
-            p_url, d_url,
+            p_url,
+            d_url,
             prompt="Write a short story about a robot learning to paint. Be creative and detailed.",
             max_new_tokens=128,
             timeout=180.0,
@@ -197,35 +196,23 @@ def test_e4_d_starts_first(p_url: str, d_url: str) -> TestResult:
         bootstrap_url = os.environ.get("BOOTSTRAP_URL", "")
         if not bootstrap_url:
             return TestResult(
-                "E4-startup-order", True,
-                "skipped: BOOTSTRAP_URL not set (structural test)"
+                "E4-startup-order", True, "skipped: BOOTSTRAP_URL not set (structural test)"
             )
         req = Request(f"{bootstrap_url}/list_prefills")
         with urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read())
         prefills = data.get("prefills", [])
         if not prefills:
-            return TestResult(
-                "E4-startup-order", False,
-                "no prefills registered in bootstrap"
-            )
-        return TestResult(
-            "E4-startup-order", True,
-            f"{len(prefills)} prefill(s) registered"
-        )
+            return TestResult("E4-startup-order", False, "no prefills registered in bootstrap")
+        return TestResult("E4-startup-order", True, f"{len(prefills)} prefill(s) registered")
     except Exception as e:
         return TestResult("E4-startup-order", False, str(e))
 
 
-def test_e5_correctness(
-    p_url: str, d_url: str, normal_url: str | None
-) -> TestResult:
+def test_e5_correctness(p_url: str, d_url: str, normal_url: str | None) -> TestResult:
     """E5: Compare PD output with normal mode output."""
     if normal_url is None:
-        return TestResult(
-            "E5-correctness", True,
-            "skipped: --normal-url not provided"
-        )
+        return TestResult("E5-correctness", True, "skipped: --normal-url not provided")
     prompt = "What is the capital of Japan? Answer in one word."
     max_new_tokens = 16
 
@@ -246,21 +233,18 @@ def test_e5_correctness(
 
         # PD mode
         _, d_resp = _send_pd_request(
-            p_url, d_url,
+            p_url,
+            d_url,
             prompt=prompt,
             max_new_tokens=max_new_tokens,
         )
         pd_text = d_resp.get("text", "")
 
         if normal_text == pd_text:
-            return TestResult(
-                "E5-correctness", True,
-                f"outputs match: {pd_text!r}"
-            )
+            return TestResult("E5-correctness", True, f"outputs match: {pd_text!r}")
         else:
             return TestResult(
-                "E5-correctness", False,
-                f"MISMATCH normal={normal_text!r} pd={pd_text!r}"
+                "E5-correctness", False, f"MISMATCH normal={normal_text!r} pd={pd_text!r}"
             )
     except Exception as e:
         return TestResult("E5-correctness", False, str(e))
@@ -285,39 +269,24 @@ def test_e6_prefill_crash(p_url: str, d_url: str) -> TestResult:
 
         # Only send to D (no matching P request), expect timeout/error
         try:
-            resp = _post_json(
-                f"{d_url}/generate", payload, timeout=90.0
-            )
+            resp = _post_json(f"{d_url}/generate", payload, timeout=90.0)
             text = resp.get("text", "")
             # If we get an error message back, that's the expected behavior
             meta = resp.get("meta_info", {})
             finish = meta.get("finish_reason", {})
             if isinstance(finish, dict) and finish.get("type") == "abort":
-                return TestResult(
-                    "E6-prefill-crash", True,
-                    "D returned abort as expected"
-                )
+                return TestResult("E6-prefill-crash", True, "D returned abort as expected")
             # If we somehow get text, it means something unexpected happened
             if text:
-                return TestResult(
-                    "E6-prefill-crash", False,
-                    f"D returned text without P: {text!r}"
-                )
-            return TestResult(
-                "E6-prefill-crash", True,
-                "D handled missing P transfer gracefully"
-            )
+                return TestResult("E6-prefill-crash", False, f"D returned text without P: {text!r}")
+            return TestResult("E6-prefill-crash", True, "D handled missing P transfer gracefully")
         except HTTPError as e:
             if e.code >= 400:
-                return TestResult(
-                    "E6-prefill-crash", True,
-                    f"D returned HTTP {e.code} as expected"
-                )
+                return TestResult("E6-prefill-crash", True, f"D returned HTTP {e.code} as expected")
             return TestResult("E6-prefill-crash", False, str(e))
         except TimeoutError:
             return TestResult(
-                "E6-prefill-crash", False,
-                "D hung (timeout) — should have returned error"
+                "E6-prefill-crash", False, "D hung (timeout) — should have returned error"
             )
     except Exception as e:
         return TestResult("E6-prefill-crash", False, str(e))
@@ -331,18 +300,12 @@ def test_e7_bootstrap_resilience(p_url: str, d_url: str) -> TestResult:
     try:
         bootstrap_url = os.environ.get("BOOTSTRAP_URL", "")
         if not bootstrap_url:
-            return TestResult(
-                "E7-bootstrap", True,
-                "skipped: BOOTSTRAP_URL not set"
-            )
+            return TestResult("E7-bootstrap", True, "skipped: BOOTSTRAP_URL not set")
         # Check health
         req = Request(f"{bootstrap_url}/health")
         with urlopen(req, timeout=5) as resp:
             if resp.status != 200:
-                return TestResult(
-                    "E7-bootstrap", False,
-                    f"health returned {resp.status}"
-                )
+                return TestResult("E7-bootstrap", False, f"health returned {resp.status}")
 
         # Check P is registered
         req = Request(f"{bootstrap_url}/list_prefills")
@@ -350,25 +313,16 @@ def test_e7_bootstrap_resilience(p_url: str, d_url: str) -> TestResult:
             data = json.loads(resp.read())
         prefills = data.get("prefills", [])
         if not prefills:
-            return TestResult(
-                "E7-bootstrap", False,
-                "no prefills registered after health check"
-            )
+            return TestResult("E7-bootstrap", False, "no prefills registered after health check")
 
         # Verify bootstrap_room lookup works
         req = Request(f"{bootstrap_url}/get_prefill_info?bootstrap_room=0")
         with urlopen(req, timeout=5) as resp:
             info = json.loads(resp.read())
         if "bootstrap_key" not in info:
-            return TestResult(
-                "E7-bootstrap", False,
-                "get_prefill_info missing bootstrap_key"
-            )
+            return TestResult("E7-bootstrap", False, "get_prefill_info missing bootstrap_key")
 
-        return TestResult(
-            "E7-bootstrap", True,
-            f"healthy, {len(prefills)} prefill(s), lookup ok"
-        )
+        return TestResult("E7-bootstrap", True, f"healthy, {len(prefills)} prefill(s), lookup ok")
     except Exception as e:
         return TestResult("E7-bootstrap", False, str(e))
 
@@ -380,16 +334,14 @@ def test_e8_abort_no_leak(p_url: str, d_url: str) -> TestResult:
     try:
         # First run a normal request to completion
         _, d_resp = _send_pd_request(
-            p_url, d_url,
+            p_url,
+            d_url,
             prompt="Say hello.",
             max_new_tokens=8,
         )
         text = d_resp.get("text", "")
         if not text:
-            return TestResult(
-                "E8-abort-leak", False,
-                "baseline request failed"
-            )
+            return TestResult("E8-abort-leak", False, "baseline request failed")
 
         # Give a moment for cleanup
         time.sleep(2)
@@ -404,16 +356,14 @@ def test_e8_abort_no_leak(p_url: str, d_url: str) -> TestResult:
                 num_running = state.get("num_running_reqs", -1)
                 if num_running > 0:
                     return TestResult(
-                        "E8-abort-leak", False,
-                        f"{role} has {num_running} running reqs after completion"
+                        "E8-abort-leak",
+                        False,
+                        f"{role} has {num_running} running reqs after completion",
                     )
             except Exception:
                 pass
 
-        return TestResult(
-            "E8-abort-leak", True,
-            "no leak detected after request completion"
-        )
+        return TestResult("E8-abort-leak", True, "no leak detected after request completion")
     except Exception as e:
         return TestResult("E8-abort-leak", False, str(e))
 
@@ -422,10 +372,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="PD e2e test suite")
     parser.add_argument("--prefill-url", required=True)
     parser.add_argument("--decode-url", required=True)
-    parser.add_argument("--normal-url", default=None,
-                        help="Normal mode server URL for E5 comparison")
-    parser.add_argument("--tier", type=int, default=1, choices=[1, 2],
-                        help="1=Tier1 only, 2=Tier1+2")
+    parser.add_argument(
+        "--normal-url", default=None, help="Normal mode server URL for E5 comparison"
+    )
+    parser.add_argument(
+        "--tier", type=int, default=1, choices=[1, 2], help="1=Tier1 only, 2=Tier1+2"
+    )
     parser.add_argument("--skip-health-check", action="store_true")
     parser.add_argument("--timeout", type=float, default=300.0)
     args = parser.parse_args()

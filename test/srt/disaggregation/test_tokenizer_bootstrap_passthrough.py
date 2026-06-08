@@ -18,10 +18,7 @@ from unittest import mock
 
 import pytest
 
-from sgl_jax.srt.managers.io_struct import (
-    GenerateReqInput,
-    TokenizedGenerateReqInput,
-)
+from sgl_jax.srt.managers.io_struct import GenerateReqInput, TokenizedGenerateReqInput
 from sgl_jax.srt.sampling.sampling_params import SamplingParams
 
 
@@ -90,14 +87,11 @@ def test_tokenizer_passes_bootstrap_fields_through_in_decode_mode():
     # ``_create_tokenized_object`` calls ``SamplingParams.normalize +
     # verify``; SamplingParams.normalize expects a tokenizer, the
     # SimpleNamespace stand-in satisfies the attribute lookup.
-    with mock.patch.object(
-        SamplingParams, "normalize", lambda self, t: None
-    ), mock.patch.object(
-        SamplingParams, "verify", lambda self, v: None
+    with (
+        mock.patch.object(SamplingParams, "normalize", lambda self, t: None),
+        mock.patch.object(SamplingParams, "verify", lambda self, v: None),
     ):
-        tokenized = tm._create_tokenized_object(
-            obj, input_text="hi", input_ids=[1, 2, 3]
-        )
+        tokenized = tm._create_tokenized_object(obj, input_text="hi", input_ids=[1, 2, 3])
     assert tokenized.bootstrap_host == "10.0.0.1"
     assert tokenized.bootstrap_port == 8998
     assert tokenized.bootstrap_room == 42
@@ -111,14 +105,12 @@ def test_tokenizer_rejects_missing_fields_in_decode_mode():
         text="hi",
         sampling_params={"max_new_tokens": 4},
     )
-    with mock.patch.object(
-        SamplingParams, "normalize", lambda self, t: None
-    ), mock.patch.object(
-        SamplingParams, "verify", lambda self, v: None
-    ), pytest.raises(ValueError, match="bootstrap"):
-        tm._create_tokenized_object(
-            obj, input_text="hi", input_ids=[1, 2, 3]
-        )
+    with (
+        mock.patch.object(SamplingParams, "normalize", lambda self, t: None),
+        mock.patch.object(SamplingParams, "verify", lambda self, v: None),
+        pytest.raises(ValueError, match="bootstrap"),
+    ):
+        tm._create_tokenized_object(obj, input_text="hi", input_ids=[1, 2, 3])
 
 
 def test_tokenizer_allows_missing_fields_in_null_mode():
@@ -128,14 +120,11 @@ def test_tokenizer_allows_missing_fields_in_null_mode():
         text="hi",
         sampling_params={"max_new_tokens": 4},
     )
-    with mock.patch.object(
-        SamplingParams, "normalize", lambda self, t: None
-    ), mock.patch.object(
-        SamplingParams, "verify", lambda self, v: None
+    with (
+        mock.patch.object(SamplingParams, "normalize", lambda self, t: None),
+        mock.patch.object(SamplingParams, "verify", lambda self, v: None),
     ):
-        tokenized = tm._create_tokenized_object(
-            obj, input_text="hi", input_ids=[1, 2, 3]
-        )
+        tokenized = tm._create_tokenized_object(obj, input_text="hi", input_ids=[1, 2, 3])
     assert tokenized.bootstrap_room is None
 
 
@@ -148,14 +137,11 @@ def test_tokenizer_allows_missing_fields_in_prefill_mode():
         text="hi",
         sampling_params={"max_new_tokens": 4},
     )
-    with mock.patch.object(
-        SamplingParams, "normalize", lambda self, t: None
-    ), mock.patch.object(
-        SamplingParams, "verify", lambda self, v: None
+    with (
+        mock.patch.object(SamplingParams, "normalize", lambda self, t: None),
+        mock.patch.object(SamplingParams, "verify", lambda self, v: None),
     ):
-        tokenized = tm._create_tokenized_object(
-            obj, input_text="hi", input_ids=[1, 2, 3]
-        )
+        tokenized = tm._create_tokenized_object(obj, input_text="hi", input_ids=[1, 2, 3])
     assert tokenized.bootstrap_room is None
 
 
@@ -199,18 +185,16 @@ def test_decode_mode_auto_derives_from_bootstrap_url():
         text="hi",
         sampling_params={"max_new_tokens": 4},
     )
-    with mock.patch.object(
-        SamplingParams, "normalize", lambda self, t: None
-    ), mock.patch.object(
-        SamplingParams, "verify", lambda self, v: None
+    with (
+        mock.patch.object(SamplingParams, "normalize", lambda self, t: None),
+        mock.patch.object(SamplingParams, "verify", lambda self, v: None),
     ):
-        tokenized = tm._create_tokenized_object(
-            obj, input_text="hi", input_ids=[1, 2, 3]
-        )
+        tokenized = tm._create_tokenized_object(obj, input_text="hi", input_ids=[1, 2, 3])
     assert tokenized.bootstrap_host == "10.0.0.5"
     assert tokenized.bootstrap_port == 8998
     # Stable CRC32 of "r-auto".
     import zlib
+
     assert tokenized.bootstrap_room == zlib.crc32(b"r-auto")
 
 
@@ -227,14 +211,11 @@ def test_decode_mode_auto_derive_brackets_ipv6_host():
         text="hi",
         sampling_params={"max_new_tokens": 4},
     )
-    with mock.patch.object(
-        SamplingParams, "normalize", lambda self, t: None
-    ), mock.patch.object(
-        SamplingParams, "verify", lambda self, v: None
+    with (
+        mock.patch.object(SamplingParams, "normalize", lambda self, t: None),
+        mock.patch.object(SamplingParams, "verify", lambda self, v: None),
     ):
-        tokenized = tm._create_tokenized_object(
-            obj, input_text="hi", input_ids=[1, 2, 3]
-        )
+        tokenized = tm._create_tokenized_object(obj, input_text="hi", input_ids=[1, 2, 3])
     assert tokenized.bootstrap_host == "[fe80::1]"
     assert tokenized.bootstrap_port == 8998
 
@@ -253,14 +234,11 @@ def test_decode_mode_explicit_values_win_over_auto_derive():
         bootstrap_port=9999,
         bootstrap_room=42,
     )
-    with mock.patch.object(
-        SamplingParams, "normalize", lambda self, t: None
-    ), mock.patch.object(
-        SamplingParams, "verify", lambda self, v: None
+    with (
+        mock.patch.object(SamplingParams, "normalize", lambda self, t: None),
+        mock.patch.object(SamplingParams, "verify", lambda self, v: None),
     ):
-        tokenized = tm._create_tokenized_object(
-            obj, input_text="hi", input_ids=[1, 2, 3]
-        )
+        tokenized = tm._create_tokenized_object(obj, input_text="hi", input_ids=[1, 2, 3])
     assert tokenized.bootstrap_host == "10.0.0.99"
     assert tokenized.bootstrap_port == 9999
     assert tokenized.bootstrap_room == 42

@@ -410,31 +410,20 @@ class Req:
         # for this req's first decode iter.
         if getattr(self, "_pd_skip_prefix_match", False):
             self._pd_skip_prefix_match = False
-            root = (
-                getattr(tree_cache, "root_node", None)
-                if tree_cache is not None else None
-            )
+            root = getattr(tree_cache, "root_node", None) if tree_cache is not None else None
             self.last_node = root
             self.last_host_node = root
             self.host_hit_length = 0
             self.last_matched_prefix_len = len(self.prefix_indices)
-            self.extend_input_len = (
-                len(self.fill_ids) - len(self.prefix_indices)
-            )
+            self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
             return
         # PD req with empty output_ids: skip match_prefix to avoid
         # stale radix cache hits.
-        if (
-            getattr(self, "bootstrap_room", None) is not None
-            and not self.output_ids
-        ):
+        if getattr(self, "bootstrap_room", None) is not None and not self.output_ids:
             self.prefix_indices = []
             self.last_matched_prefix_len = 0
             self.extend_input_len = len(self.fill_ids)
-            root = (
-                getattr(tree_cache, "root_node", None)
-                if tree_cache is not None else None
-            )
+            root = getattr(tree_cache, "root_node", None) if tree_cache is not None else None
             self.last_node = root
             self.last_host_node = root
             self.host_hit_length = 0

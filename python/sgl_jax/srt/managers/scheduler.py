@@ -28,6 +28,12 @@ from sgl_jax.srt.constrained.base_grammar_backend import (
     INVALID_GRAMMAR_OBJ,
     create_grammar_backend,
 )
+from sgl_jax.srt.disaggregation.decode import SchedulerDisaggregationDecodeMixin
+from sgl_jax.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
+from sgl_jax.srt.disaggregation.runtime import (
+    dispatch_scheduler_event_loop,
+    install_disaggregation_wiring,
+)
 from sgl_jax.srt.hf_transformers_utils import get_tokenizer
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
 from sgl_jax.srt.managers.communication import CommunicationBackend
@@ -63,16 +69,6 @@ from sgl_jax.srt.managers.scheduler_output_processor_mixin import (
     SchedulerOutputProcessorMixin,
 )
 from sgl_jax.srt.managers.scheduler_profiler_mixing import SchedulerProfilerMixin
-from sgl_jax.srt.disaggregation.prefill import (
-    SchedulerDisaggregationPrefillMixin,
-)
-from sgl_jax.srt.disaggregation.decode import (
-    SchedulerDisaggregationDecodeMixin,
-)
-from sgl_jax.srt.disaggregation.runtime import (
-    dispatch_scheduler_event_loop,
-    install_disaggregation_wiring,
-)
 from sgl_jax.srt.managers.tp_worker import ModelWorker
 from sgl_jax.srt.managers.tp_worker_overlap_thread import ModelWorkerClient
 from sgl_jax.srt.managers.utils import validate_input_length
@@ -232,9 +228,7 @@ class Scheduler(
             logger.info("Multimodal mode enabled, disabling overlap schedule")
             self.enable_overlap = False
         if server_args.disaggregation_mode != "null":
-            logger.info(
-                "PD disaggregation mode enabled, disabling overlap schedule"
-            )
+            logger.info("PD disaggregation mode enabled, disabling overlap schedule")
             self.enable_overlap = False
         self.spec_algorithm = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
 
@@ -1242,15 +1236,9 @@ class Scheduler(
         ret["init_new_token_ratio"] = self.init_new_token_ratio
 
         # PD disaggregation queues
-        ret["disagg_prefill_queue_size"] = len(
-            self.disagg_prefill_queue or ()
-        )
-        ret["disagg_prealloc_queue_size"] = len(
-            self.disagg_prealloc_queue or ()
-        )
-        ret["disagg_transfer_queue_size"] = len(
-            self.disagg_transfer_queue or ()
-        )
+        ret["disagg_prefill_queue_size"] = len(self.disagg_prefill_queue or ())
+        ret["disagg_prealloc_queue_size"] = len(self.disagg_prealloc_queue or ())
+        ret["disagg_transfer_queue_size"] = len(self.disagg_transfer_queue or ())
 
         return GetInternalStateReqOutput(internal_state=ret)
 
@@ -1352,12 +1340,7 @@ class Scheduler(
         pd_prefill = len(self.disagg_prefill_queue or ())
         pd_prealloc = len(self.disagg_prealloc_queue or ())
         pd_transfer = len(self.disagg_transfer_queue or ())
-        has_pending = (
-            has_pending
-            or pd_prefill > 0
-            or pd_prealloc > 0
-            or pd_transfer > 0
-        )
+        has_pending = has_pending or pd_prefill > 0 or pd_prealloc > 0 or pd_transfer > 0
 
         if has_pending:
             msg = (
@@ -2222,6 +2205,7 @@ def run_scheduler_process(
         traceback = get_exception_traceback()
         logger.error("Scheduler hit an exception: %s", traceback)
         parent_process.send_signal(signal.SIGQUIT)
+
 
 def run_scheduler_loop_thread_after_create(
     server_args: ServerArgs,

@@ -73,16 +73,18 @@ def _wait_health(url: str, timeout: float = 300.0) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="PD e2e two-host test")
-    parser.add_argument("--prefill-url", required=True,
-                        help="P server URL, e.g. http://10.0.0.1:10000")
-    parser.add_argument("--decode-url", required=True,
-                        help="D server URL, e.g. http://10.0.0.2:10001")
-    parser.add_argument("--prompt", default="What is 2+2? Answer briefly.",
-                        help="Prompt to send")
+    parser.add_argument(
+        "--prefill-url", required=True, help="P server URL, e.g. http://10.0.0.1:10000"
+    )
+    parser.add_argument(
+        "--decode-url", required=True, help="D server URL, e.g. http://10.0.0.2:10001"
+    )
+    parser.add_argument("--prompt", default="What is 2+2? Answer briefly.", help="Prompt to send")
     parser.add_argument("--max-new-tokens", type=int, default=32)
     parser.add_argument("--skip-health-check", action="store_true")
-    parser.add_argument("--timeout", type=float, default=120.0,
-                        help="Per-request timeout in seconds")
+    parser.add_argument(
+        "--timeout", type=float, default=120.0, help="Per-request timeout in seconds"
+    )
     args = parser.parse_args()
 
     p_url = args.prefill_url.rstrip("/")

@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from contextlib import suppress
-from typing import TYPE_CHECKING
 import logging
 import os
 import signal
+from contextlib import suppress
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from sgl_jax.srt.managers.scheduler import Scheduler
@@ -15,9 +15,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def dispatch_scheduler_event_loop(
-    scheduler: Scheduler, server_args: ServerArgs
-) -> None:
+def dispatch_scheduler_event_loop(scheduler: Scheduler, server_args: ServerArgs) -> None:
     """Choose and run the appropriate scheduler event loop."""
 
     mode = server_args.disaggregation_mode
@@ -31,9 +29,7 @@ def dispatch_scheduler_event_loop(
         scheduler.event_loop_normal()
 
 
-def install_disaggregation_wiring(
-    scheduler: Scheduler, server_args: ServerArgs
-) -> None:
+def install_disaggregation_wiring(scheduler: Scheduler, server_args: ServerArgs) -> None:
     """Wire up PD runtime attributes when disaggregation mode is enabled."""
 
     mode = server_args.disaggregation_mode
@@ -46,29 +42,21 @@ def install_disaggregation_wiring(
             f"supported in a future PR."
         )
     if server_args.disaggregation_bootstrap_url is None:
-        raise RuntimeError(
-            "disaggregation_mode != null requires bootstrap_url"
-        )
+        raise RuntimeError("disaggregation_mode != null requires bootstrap_url")
 
     from sgl_jax.srt.disaggregation.bootstrap import (
         BootstrapClient,
         BootstrapServer,
         HeartbeatDaemon,
     )
-    from sgl_jax.srt.disaggregation.common.zmq_notifier import (
-        ZmqPullNotifier,
-    )
+    from sgl_jax.srt.disaggregation.common.zmq_notifier import ZmqPullNotifier
     from sgl_jax.srt.disaggregation.decode import (
         DecodePreallocQueue,
         DecodeTransferQueue,
     )
     from sgl_jax.srt.disaggregation.host_ip import resolve_host_ip
-    from sgl_jax.srt.disaggregation.jax_transfer.conn import (
-        JaxTransferKVManager,
-    )
-    from sgl_jax.srt.disaggregation.jax_transfer.wrapper import (
-        get_or_create_wrapper,
-    )
+    from sgl_jax.srt.disaggregation.jax_transfer.conn import JaxTransferKVManager
+    from sgl_jax.srt.disaggregation.jax_transfer.wrapper import get_or_create_wrapper
     from sgl_jax.srt.disaggregation.pd_auth import resolve_secret
     from sgl_jax.srt.disaggregation.prefill import PrefillBootstrapQueue
 
@@ -110,9 +98,7 @@ def install_disaggregation_wiring(
         host_pool=None,
         ack_timeout_seconds=server_args.disaggregation_ack_timeout_seconds,
         pull_timeout_seconds=server_args.disaggregation_pull_timeout_seconds,
-        reaper_interval_seconds=(
-            server_args.disaggregation_orphan_reaper_interval_seconds
-        ),
+        reaper_interval_seconds=(server_args.disaggregation_orphan_reaper_interval_seconds),
     )
     scheduler.disagg_kv_manager.start_reaper()
     scheduler.disagg_use_d2h_staging = server_args.disaggregation_enable_d2h
@@ -194,9 +180,7 @@ def _make_disagg_shutdown(scheduler: Scheduler, mode: str):
             with suppress(Exception):
                 scheduler.disagg_heartbeat.stop()
         try:
-            scheduler.disagg_kv_manager.graceful_shutdown(
-                drain_timeout_seconds=30.0
-            )
+            scheduler.disagg_kv_manager.graceful_shutdown(drain_timeout_seconds=30.0)
         except Exception:
             logger.warning(
                 "PD shutdown: manager.graceful_shutdown failed",

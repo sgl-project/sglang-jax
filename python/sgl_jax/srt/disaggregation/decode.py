@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from contextlib import suppress
 import logging
 import threading
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -53,10 +53,7 @@ class DecodePreallocQueue:
     def add(self, entry: DecodeBookkeeping) -> None:
         with self._lock:
             if entry.req_id in self._entries:
-                raise ValueError(
-                    f"DecodePreallocQueue already tracks "
-                    f"req_id={entry.req_id!r}"
-                )
+                raise ValueError(f"DecodePreallocQueue already tracks " f"req_id={entry.req_id!r}")
             self._entries[entry.req_id] = entry
 
     def pop_all(self) -> list[DecodeBookkeeping]:
@@ -65,9 +62,7 @@ class DecodePreallocQueue:
             self._entries.clear()
             return out
 
-    def abort_matching(
-        self, rid_prefix: str, abort_all: bool
-    ) -> list[DecodeBookkeeping]:
+    def abort_matching(self, rid_prefix: str, abort_all: bool) -> list[DecodeBookkeeping]:
         out: list[DecodeBookkeeping] = []
         with self._lock:
             for rid in list(self._entries):
@@ -90,10 +85,7 @@ class DecodeTransferQueue:
     def add(self, entry: DecodeBookkeeping) -> None:
         with self._lock:
             if entry.req_id in self._entries:
-                raise ValueError(
-                    f"DecodeTransferQueue already tracks "
-                    f"req_id={entry.req_id!r}"
-                )
+                raise ValueError(f"DecodeTransferQueue already tracks " f"req_id={entry.req_id!r}")
             self._entries[entry.req_id] = entry
 
     def drain_terminal(self) -> list[DecodeBookkeeping]:
@@ -109,9 +101,7 @@ class DecodeTransferQueue:
                     del self._entries[rid]
         return out
 
-    def abort_matching(
-        self, rid_prefix: str, abort_all: bool
-    ) -> list[DecodeBookkeeping]:
+    def abort_matching(self, rid_prefix: str, abort_all: bool) -> list[DecodeBookkeeping]:
         out: list[DecodeBookkeeping] = []
         with self._lock:
             for rid in list(self._entries):
@@ -180,14 +170,13 @@ class SchedulerDisaggregationDecodeMixin:
                 from sgl_jax.srt.disaggregation.common.metrics import time_phase
 
                 with time_phase("bootstrap", "decode"):
-                    p_info = self.disagg_bootstrap_client.get_prefill_info(
-                        req.bootstrap_room
-                    )
+                    p_info = self.disagg_bootstrap_client.get_prefill_info(req.bootstrap_room)
             except Exception:
                 logger.exception(
                     "bootstrap lookup failed for req_id=%s "
                     "bootstrap_room=%s; releasing resources",
-                    req.rid, req.bootstrap_room,
+                    req.rid,
+                    req.bootstrap_room,
                 )
                 self._record_decode_transfer_failure("bootstrap_lookup")
                 self._abort_decode_request(req, "bootstrap_lookup")
@@ -200,9 +189,7 @@ class SchedulerDisaggregationDecodeMixin:
                 spec = self._build_kv_spec_for_req(req)
                 receiver.init(
                     PMetadata(
-                        remote_addr=(
-                            f"{p_info['host']}:{p_info['transfer_port']}"
-                        ),
+                        remote_addr=(f"{p_info['host']}:{p_info['transfer_port']}"),
                         uuid=req.disagg_transfer_id or req.rid,
                         specs={"kv": spec},
                         p_side_channel_host=str(p_info["host"]),
@@ -230,9 +217,7 @@ class SchedulerDisaggregationDecodeMixin:
             )
             self.disagg_prealloc_queue.add(entry)
 
-    def _extract_pd_reqs_from_waiting_queue(
-        self: Scheduler, rids: set
-    ) -> list[Req]:
+    def _extract_pd_reqs_from_waiting_queue(self: Scheduler, rids: set) -> list[Req]:
         """Extract PD reqs from waiting_queue by rid set."""
 
         out: list[Req] = []
@@ -261,9 +246,7 @@ class SchedulerDisaggregationDecodeMixin:
                     kv_result = entry.receiver.result
                     kv = kv_result["kv"] if kv_result else None
                     self._maybe_log_decode_pull_debug(entry.req, kv)
-                    self._write_kv_to_pool(
-                        entry.req, entry.kv_indices, kv
-                    )
+                    self._write_kv_to_pool(entry.req, entry.kv_indices, kv)
                     self._record_decode_transfer_bytes(kv)
                     self._enqueue_for_decode(entry.req)
                 except Exception:
@@ -279,11 +262,10 @@ class SchedulerDisaggregationDecodeMixin:
                 logger.warning(
                     "KVReceiver for req_id=%s reached %s; releasing "
                     "resources and aborting request",
-                    entry.req_id, state.value,
+                    entry.req_id,
+                    state.value,
                 )
-                self._record_decode_transfer_failure(
-                    "receiver_terminal_failed"
-                )
+                self._record_decode_transfer_failure("receiver_terminal_failed")
                 if entry.kv_indices is not None:
                     self._release_decode_kv_indices(entry.kv_indices)
                 self._abort_decode_request(entry.req, "receiver_terminal_failed")
@@ -313,13 +295,9 @@ class SchedulerDisaggregationDecodeMixin:
             try:
                 allocator.free(kv_indices)
             except Exception:
-                logger.exception(
-                    "failed to free kv_indices=%r", kv_indices
-                )
+                logger.exception("failed to free kv_indices=%r", kv_indices)
 
-    def _build_kv_spec_for_req(
-        self: Scheduler, req: Req
-    ) -> jax.ShapeDtypeStruct:
+    def _build_kv_spec_for_req(self: Scheduler, req: Req) -> jax.ShapeDtypeStruct:
         """Build ShapeDtypeStruct matching P's KV layout for the receiver."""
 
         from jax.sharding import NamedSharding, PartitionSpec
@@ -338,9 +316,7 @@ class SchedulerDisaggregationDecodeMixin:
         sharding = NamedSharding(kv_pool.kv_sharding.mesh, stacked_spec)
         return jax.ShapeDtypeStruct(shape, kv_pool.dtype, sharding=sharding)
 
-    def _write_kv_to_pool(
-        self: Scheduler, req: Req, kv_indices, kv: jax.Array
-    ) -> None:
+    def _write_kv_to_pool(self: Scheduler, req: Req, kv_indices, kv: jax.Array) -> None:
         """Scatter pulled KV into the local paged pool."""
 
         if kv_indices is None:
@@ -349,7 +325,6 @@ class SchedulerDisaggregationDecodeMixin:
                 f"{req.rid!r}; allocator may have OOM'd"
             )
         import numpy as np
-
         from jax.sharding import NamedSharding, PartitionSpec
 
         kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
@@ -357,17 +332,14 @@ class SchedulerDisaggregationDecodeMixin:
         seqlen = len(req.origin_input_ids)
         num_pages = (seqlen + page_size - 1) // page_size
         kv_indices_np = (
-            np.asarray(kv_indices) if not isinstance(kv_indices, np.ndarray)
-            else kv_indices
+            np.asarray(kv_indices) if not isinstance(kv_indices, np.ndarray) else kv_indices
         )
         page_ids_np = kv_indices_np[::page_size] // page_size
         page_ids_np = page_ids_np[:num_pages]
         # Pad page ids to bucket size by repeating the last valid id.
         padded_pages = kv.shape[1]
         if num_pages < padded_pages:
-            pad = np.full(
-                padded_pages - num_pages, page_ids_np[-1], dtype=page_ids_np.dtype
-            )
+            pad = np.full(padded_pages - num_pages, page_ids_np[-1], dtype=page_ids_np.dtype)
             page_ids_padded = np.concatenate([page_ids_np, pad])
             # Duplicate last valid page's payload so stale tail
             # rows don't overwrite the final real page.
@@ -424,9 +396,7 @@ class SchedulerDisaggregationDecodeMixin:
         # Make sure fill_ids is set so the scheduler doesn't re-derive
         # an empty prefill chunk.
         req.fill_ids = list(req.origin_input_ids) + list(req.output_ids)
-        self._maybe_verify_decode_writeback_debug(
-            req, kv_pool, page_ids_padded, kv
-        )
+        self._maybe_verify_decode_writeback_debug(req, kv_pool, page_ids_padded, kv)
 
     def _enqueue_for_decode(self: Scheduler, req: Req) -> None:
         """Put ``req`` into the scheduler's decode-ready queue."""
@@ -465,7 +435,8 @@ class SchedulerDisaggregationDecodeMixin:
         except Exception:
             logger.exception(
                 "failed to send AbortReq for req_id=%s (reason=%s)",
-                req.rid, reason,
+                req.rid,
+                reason,
             )
 
     def _record_decode_transfer_failure(self, reason: str) -> None:
@@ -474,9 +445,7 @@ class SchedulerDisaggregationDecodeMixin:
                 PD_TRANSFER_FAILURES_TOTAL,
             )
 
-            PD_TRANSFER_FAILURES_TOTAL.labels(
-                reason=reason, role="decode"
-            ).inc()
+            PD_TRANSFER_FAILURES_TOTAL.labels(reason=reason, role="decode").inc()
 
     def _record_decode_transfer_bytes(self, kv) -> None:
         with suppress(Exception):
@@ -485,9 +454,7 @@ class SchedulerDisaggregationDecodeMixin:
             )
 
             if kv is not None and hasattr(kv, "nbytes"):
-                PD_TRANSFER_BYTES_TOTAL.labels(
-                    direction="h2d", role="decode"
-                ).inc(int(kv.nbytes))
+                PD_TRANSFER_BYTES_TOTAL.labels(direction="h2d", role="decode").inc(int(kv.nbytes))
 
     def _maybe_log_decode_pull_debug(self, req: Req, kv) -> None:
         from sgl_jax.srt.disaggregation.debug_utils import (
@@ -510,9 +477,7 @@ class SchedulerDisaggregationDecodeMixin:
             snapshot.sample_page_digests(),
         )
 
-    def _maybe_verify_decode_writeback_debug(
-        self, req: Req, kv_pool, page_ids_padded, kv
-    ) -> None:
+    def _maybe_verify_decode_writeback_debug(self, req: Req, kv_pool, page_ids_padded, kv) -> None:
         from jax.sharding import NamedSharding, PartitionSpec
 
         from sgl_jax.srt.disaggregation.debug_utils import (

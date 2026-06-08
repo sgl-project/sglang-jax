@@ -65,7 +65,9 @@ def _get_answer_value(s: str):
 def _build_prompt(lines, idx, few_shot_lines, num_shots):
     shots = ""
     for i in range(num_shots):
-        shots += f"Question: {few_shot_lines[i]['question']}\nAnswer: {few_shot_lines[i]['answer']}\n\n"
+        shots += (
+            f"Question: {few_shot_lines[i]['question']}\nAnswer: {few_shot_lines[i]['answer']}\n\n"
+        )
     return shots + f"Question: {lines[idx]['question']}\nAnswer:"
 
 
@@ -95,9 +97,7 @@ async def _send_pd(
         timeout = aiohttp.ClientTimeout(total=300)
 
         async def _post(url):
-            async with session.post(
-                f"{url}/generate", json=payload, timeout=timeout
-            ) as resp:
+            async with session.post(f"{url}/generate", json=payload, timeout=timeout) as resp:
                 if resp.status != 200:
                     raise RuntimeError(f"HTTP {resp.status}")
                 return await resp.json()
@@ -132,10 +132,15 @@ async def run_eval(args):
     async with aiohttp.ClientSession() as session:
         tasks = [
             _send_pd(
-                session, p_url, d_url,
-                prompts[i], args.max_new_tokens,
-                f"gsm-{uuid.uuid4().hex[:8]}", i,
-                sem, pbar,
+                session,
+                p_url,
+                d_url,
+                prompts[i],
+                args.max_new_tokens,
+                f"gsm-{uuid.uuid4().hex[:8]}",
+                i,
+                sem,
+                pbar,
             )
             for i in range(num_q)
         ]
@@ -154,9 +159,7 @@ async def run_eval(args):
             errors += 1
         else:
             preds.append(_get_answer_value(r.get("text", "")))
-            total_output_tokens += r.get("meta_info", {}).get(
-                "completion_tokens", 0
-            )
+            total_output_tokens += r.get("meta_info", {}).get("completion_tokens", 0)
 
     acc = np.mean(np.array(preds) == np.array(labels))
     invalid_rate = np.mean(np.array(preds) == INVALID)

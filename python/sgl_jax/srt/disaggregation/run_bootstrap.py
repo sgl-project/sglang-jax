@@ -14,17 +14,17 @@ from sgl_jax.srt.disaggregation.bootstrap import BootstrapServer
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="PD bootstrap server (standalone)"
-    )
+    parser = argparse.ArgumentParser(description="PD bootstrap server (standalone)")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8998)
     parser.add_argument(
-        "--log-level", default="info",
+        "--log-level",
+        default="info",
         choices=["critical", "error", "warning", "info", "debug"],
     )
     parser.add_argument(
-        "--shared-secret", default=None,
+        "--shared-secret",
+        default=None,
         help="Enable Bearer auth with this secret. "
         "Overridden by SGL_JAX_PD_SHARED_SECRET if set.",
     )
@@ -48,7 +48,9 @@ def main() -> int:
     server.start()
     logger.info(
         "PD bootstrap server listening on %s:%d (auth=%s)",
-        args.host, args.port, "on" if secret else "off",
+        args.host,
+        args.port,
+        "on" if secret else "off",
     )
 
     stop = False
