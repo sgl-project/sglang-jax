@@ -36,6 +36,15 @@ class GreedySampleAndPrepareOutput(NamedTuple):
     predict: jax.Array
 
 
+class FusedDraftExtendPendingResult(NamedTuple):
+    batch_output: object
+    selected_layer0_hidden: object
+    topk_index_stacked: object
+    all_pool_updates: object
+    accept_host: np.ndarray
+    sel: np.ndarray
+
+
 def _take_with_index_sharding(values, index):
     index_sharding = jax.typeof(index).sharding
     if isinstance(index_sharding, NamedSharding):
@@ -679,16 +688,13 @@ def _forward_batch_init_new_preserve_device(batch, model_runner):
     )
 
 
-def draft_extend_for_decode_fused(draft_worker, model_worker_batch, batch_output):
-    """Drop-in replacement for MultiLayerDraftWorker.draft_extend_for_decode.
-
-    Fuses all N MTP layer forwards into a single jit call.
-    """
+def launch_fused_draft_extend_for_decode(draft_worker, model_worker_batch, batch_output):
+    """Launch fused MTP draft extend and return deferred host restore state."""
     from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
     from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
 
     if batch_output.next_draft_input.verified_id.shape[0] <= 0:
-        return
+        return None
     target_hidden = batch_output.logits_output.hidden_states
 
     draft_input = EagleDraftInput(
@@ -701,7 +707,7 @@ def draft_extend_for_decode_fused(draft_worker, model_worker_batch, batch_output
         draft_worker.speculative_num_draft_tokens,
     )
     if mwb.input_ids.shape[0] <= 0:
-        return
+        return None
 
     sel = np.asarray(model_worker_batch.logits_indices_selector)
     accept_host = np.asarray(jax.device_get(batch_output.accept_lens))
@@ -741,6 +747,27 @@ def draft_extend_for_decode_fused(draft_worker, model_worker_batch, batch_output
             num_layers=draft_worker.speculative_num_steps,
         )
 
+    return FusedDraftExtendPendingResult(
+        batch_output=batch_output,
+        selected_layer0_hidden=selected_layer0_hidden,
+        topk_index_stacked=topk_index_stacked,
+        all_pool_updates=all_pool_updates,
+        accept_host=accept_host,
+        sel=sel,
+    )
+
+
+def restore_fused_draft_extend_result(draft_worker, model_worker_batch, pending_result):
+    if pending_result is None:
+        return
+
+    batch_output = pending_result.batch_output
+    selected_layer0_hidden = pending_result.selected_layer0_hidden
+    topk_index_stacked = pending_result.topk_index_stacked
+    all_pool_updates = pending_result.all_pool_updates
+    accept_host = pending_result.accept_host
+    sel = pending_result.sel
+
     for i, w in enumerate(draft_worker._workers):
         w.model_runner.memory_pools.replace_all(all_pool_updates[i])
 
@@ -759,6 +786,17 @@ def draft_extend_for_decode_fused(draft_worker, model_worker_batch, batch_output
     batch_output.next_draft_input.verified_id = np.asarray(verified_id_arr)[select_index]
     batch_output.allocate_lens = batch_output.allocate_lens[: model_worker_batch.real_bs]
     batch_output.accept_lens = accept_host
+
+
+def draft_extend_for_decode_fused(draft_worker, model_worker_batch, batch_output):
+    """Drop-in replacement for MultiLayerDraftWorker.draft_extend_for_decode.
+
+    Fuses all N MTP layer forwards into a single jit call.
+    """
+    pending_result = launch_fused_draft_extend_for_decode(
+        draft_worker, model_worker_batch, batch_output
+    )
+    restore_fused_draft_extend_result(draft_worker, model_worker_batch, pending_result)
 
 
 def spec_prefill(spec_worker, model_worker_batch):

@@ -113,6 +113,32 @@ class TestVerifyTree(CustomTestCase):
         self.assertIn("resolve_spec_decode_scheduler_fields", source)
         self.assertIn("spec_decode_draft_extend_phase", source)
 
+    def test_fused_draft_extend_splits_launch_and_restore(self):
+        from sgl_jax.srt.speculative import draft_extend_fused
+
+        self.assertTrue(hasattr(draft_extend_fused, "FusedDraftExtendPendingResult"))
+        self.assertTrue(hasattr(draft_extend_fused, "launch_fused_draft_extend_for_decode"))
+        self.assertTrue(hasattr(draft_extend_fused, "restore_fused_draft_extend_result"))
+        source = inspect.getsource(draft_extend_fused.draft_extend_for_decode_fused)
+        self.assertIn("launch_fused_draft_extend_for_decode", source)
+        self.assertIn("restore_fused_draft_extend_result", source)
+
+    def test_fused_draft_extend_pending_result_contract_fields(self):
+        from sgl_jax.srt.speculative import draft_extend_fused
+
+        fields = set(draft_extend_fused.FusedDraftExtendPendingResult._fields)
+        self.assertEqual(
+            fields,
+            {
+                "batch_output",
+                "selected_layer0_hidden",
+                "topk_index_stacked",
+                "all_pool_updates",
+                "accept_host",
+                "sel",
+            },
+        )
+
     def test_base_spec_worker_overlap_entry_uses_verify_boundary(self):
         from sgl_jax.srt.speculative.base_worker import BaseSpecWorker
 
