@@ -111,7 +111,15 @@ class TestVerifyTree(CustomTestCase):
         source = inspect.getsource(draft_extend_fused.spec_decode_overlap)
         self.assertIn("spec_decode_verify_phase", source)
         self.assertIn("resolve_spec_decode_scheduler_fields", source)
-        self.assertIn("spec_decode_draft_extend_phase", source)
+        self.assertIn("launch_fused_draft_extend_for_decode", source)
+
+    def test_spec_decode_overlap_does_not_restore_draft_extend_inline(self):
+        from sgl_jax.srt.speculative import draft_extend_fused
+
+        source = inspect.getsource(draft_extend_fused.spec_decode_overlap)
+        self.assertNotIn("spec_decode_draft_extend_phase", source)
+        self.assertNotIn("restore_fused_draft_extend_result", source)
+        self.assertIn("pending_draft_extend_result", source)
 
     def test_fused_draft_extend_splits_launch_and_restore(self):
         from sgl_jax.srt.speculative import draft_extend_fused
@@ -185,6 +193,12 @@ class TestVerifyTree(CustomTestCase):
                 "cache_miss_count",
             },
         )
+
+    def test_generation_batch_result_carries_pending_draft_extend_result(self):
+        from sgl_jax.srt.managers.scheduler import GenerationBatchResult
+
+        fields = set(GenerationBatchResult.__dataclass_fields__)
+        self.assertIn("pending_draft_extend_result", fields)
 
     def test_make_spec_decode_future_result_preserves_deferred_fields(self):
         from sgl_jax.srt.speculative import overlap_future

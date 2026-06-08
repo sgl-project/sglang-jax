@@ -129,6 +129,7 @@ class GenerationBatchResult:
     allocate_lens: np.ndarray | None = None
     num_accepted_tokens: int | None = None
     accept_lens: np.ndarray | None = None
+    pending_draft_extend_result: object | None = None
 
 
 class Scheduler(
@@ -1997,6 +1998,7 @@ class Scheduler(
             ret.next_draft_input = batch_output.next_draft_input
             ret.accept_lens = batch_output.accept_lens
             ret.allocate_lens = batch_output.allocate_lens
+            ret.pending_draft_extend_result = batch_output.pending_draft_extend_result
         return ret
 
     def process_batch_result(
