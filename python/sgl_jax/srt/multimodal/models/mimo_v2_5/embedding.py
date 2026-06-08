@@ -180,15 +180,25 @@ class MiMoV2_5Embedding(nnx.Module):
         # source_prefix="visual" matches the checkpoint's `visual.*` keys; target_prefix
         # "visual." targets this module's self.visual submodule.
         if self.visual is not None:
+            import dataclasses as _dc
+
             from sgl_jax.srt.multimodal.models.mimo_vision.vision_encoder import (
                 create_mimo_vision_weight_mappings,
             )
 
-            mappings.update(
-                create_mimo_vision_weight_mappings(
-                    self.visual.config, source_prefix="visual", target_prefix="visual."
-                )
+            vision_mappings = create_mimo_vision_weight_mappings(
+                self.visual.config, source_prefix="visual", target_prefix="visual."
             )
+            # The ViT runs replicated on the small embed stage (not TP-sharded like the AR
+            # LLM). The loader's default-sharding inference tensor-shards gate/up/down/qkv
+            # kernels by name, which makes the ViT's dot_general ambiguous (replicated
+            # activation x tensor-sharded kernel) and crashes. Force every vision weight to
+            # fully-replicated sharding so the tower computes locally on the embed device.
+            vision_mappings = {
+                hf_key: _dc.replace(m, sharding=())
+                for hf_key, m in vision_mappings.items()
+            }
+            mappings.update(vision_mappings)
         # Hard-fail on a missing audio-tower key (review R2-5). load_weights_from_safetensors
         # only logs+skips a missing HF key, which would leave the audio tower at random
         # init and produce silently-wrong audio embeddings. Since the HF key prefixes here
