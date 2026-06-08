@@ -188,6 +188,67 @@ class TestVerifyTree(CustomTestCase):
         np.testing.assert_array_equal(fields.accept_lens, np.array([2, 1], dtype=np.int32))
         np.testing.assert_array_equal(fields.new_seq_lens, np.array([4, 7], dtype=np.int32))
 
+    def test_can_use_spec_decode_overlap_gate_lives_under_speculative(self):
+        from sgl_jax.srt.speculative import overlap_future
+
+        spec_algorithm = SimpleNamespace(is_none=lambda: False)
+        none_algorithm = SimpleNamespace(is_none=lambda: True)
+        decode_mode = SimpleNamespace(is_decode=lambda: True)
+        extend_mode = SimpleNamespace(is_decode=lambda: False)
+
+        def make_batch(**overrides):
+            batch = SimpleNamespace(
+                forward_mode=decode_mode,
+                return_logprob=False,
+                return_output_logprob_only=False,
+            )
+            for key, value in overrides.items():
+                setattr(batch, key, value)
+            return batch
+
+        self.assertTrue(
+            overlap_future.can_use_spec_decode_overlap(
+                enable_overlap=True,
+                spec_algorithm=spec_algorithm,
+                batch=make_batch(),
+            )
+        )
+        self.assertFalse(
+            overlap_future.can_use_spec_decode_overlap(
+                enable_overlap=False,
+                spec_algorithm=spec_algorithm,
+                batch=make_batch(),
+            )
+        )
+        self.assertFalse(
+            overlap_future.can_use_spec_decode_overlap(
+                enable_overlap=True,
+                spec_algorithm=none_algorithm,
+                batch=make_batch(),
+            )
+        )
+        self.assertFalse(
+            overlap_future.can_use_spec_decode_overlap(
+                enable_overlap=True,
+                spec_algorithm=spec_algorithm,
+                batch=make_batch(forward_mode=extend_mode),
+            )
+        )
+        self.assertFalse(
+            overlap_future.can_use_spec_decode_overlap(
+                enable_overlap=True,
+                spec_algorithm=spec_algorithm,
+                batch=make_batch(return_logprob=True),
+            )
+        )
+        self.assertFalse(
+            overlap_future.can_use_spec_decode_overlap(
+                enable_overlap=True,
+                spec_algorithm=spec_algorithm,
+                batch=make_batch(return_output_logprob_only=True),
+            )
+        )
+
     def test_as_int32_array_keeps_host_metadata_on_host(self):
         from sgl_jax.srt.speculative import eagle_util
 

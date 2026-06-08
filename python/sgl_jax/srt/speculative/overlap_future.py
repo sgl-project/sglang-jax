@@ -51,3 +51,13 @@ def resolve_spec_decode_scheduler_fields(future_result):
         accept_lens=_device_to_numpy(future_result.accept_lens),
         new_seq_lens=_device_to_numpy(future_result.new_seq_lens),
     )
+
+
+def can_use_spec_decode_overlap(enable_overlap, spec_algorithm, batch) -> bool:
+    if not enable_overlap:
+        return False
+    if spec_algorithm is None or spec_algorithm.is_none():
+        return False
+    if not batch.forward_mode.is_decode():
+        return False
+    return not (batch.return_logprob or batch.return_output_logprob_only)
