@@ -17,7 +17,6 @@ class TestMiMoV25AudioCodecProcessor(unittest.TestCase):
         payload = MiMoV25AudioCodecProcessor.build_payload_from_codes(
             np.zeros((20, 5), dtype=np.int32),
             audio_token_id=self.audio_token_id,
-            source="unit",
         )
 
         self.assertEqual(payload.codes.shape, (8, 20))
@@ -31,7 +30,6 @@ class TestMiMoV25AudioCodecProcessor(unittest.TestCase):
         payload = MiMoV25AudioCodecProcessor.build_payload_from_codes(
             [first, second],
             audio_token_id=self.audio_token_id,
-            source="unit",
         )
 
         self.assertEqual(payload.codes.shape, (16, 20))
@@ -48,7 +46,6 @@ class TestMiMoV25AudioCodecProcessor(unittest.TestCase):
         payload = MiMoV25AudioCodecProcessor.build_payload_from_codes(
             np.stack([first, second], axis=0),
             audio_token_id=self.audio_token_id,
-            source="unit",
         )
 
         self.assertEqual(payload.codes.shape, (16, 20))
@@ -63,7 +60,6 @@ class TestMiMoV25AudioCodecProcessor(unittest.TestCase):
         payload = MiMoV25AudioCodecProcessor.build_payload_from_codes(
             np.stack([first, second], axis=0),
             audio_token_id=self.audio_token_id,
-            source="unit",
         )
 
         self.assertEqual(payload.codes.shape, (16, 20))
@@ -79,7 +75,6 @@ class TestMiMoV25AudioCodecProcessor(unittest.TestCase):
             MiMoV25AudioCodecProcessor.build_payload_from_codes(
                 codes,
                 audio_token_id=self.audio_token_id,
-                source="unit",
             )
 
     def test_normalize_codes_rejects_empty_time_major_codes(self):
@@ -89,130 +84,6 @@ class TestMiMoV25AudioCodecProcessor(unittest.TestCase):
     def test_normalize_codes_rejects_empty_channel_major_codes(self):
         with self.assertRaisesRegex(ValueError, "audio_codes cannot be empty"):
             MiMoV25AudioCodecProcessor.normalize_codes(np.zeros((20, 0), dtype=np.int32))
-
-    def test_normalize_payload_rejects_empty_codes(self):
-        payload = MiMoV25AudioPayload(
-            codes=np.zeros((0, 20), dtype=np.int32),
-            token_lengths=[1],
-            audio_token_id=self.audio_token_id,
-        )
-
-        with self.assertRaisesRegex(ValueError, "audio_codes cannot be empty"):
-            MiMoV25AudioCodecProcessor.normalize_payload(payload)
-
-    def test_normalize_payload_pads_single_unpadded_payload(self):
-        payload = MiMoV25AudioPayload(
-            codes=np.ones((5, 20), dtype=np.int32),
-            token_lengths=[2],
-            audio_token_id=self.audio_token_id,
-            offsets=[(3, 5)],
-            source="direct",
-            is_tokenized=False,
-        )
-
-        normalized = MiMoV25AudioCodecProcessor.normalize_payload(payload)
-
-        self.assertEqual(normalized.codes.shape, (8, 20))
-        self.assertEqual(normalized.token_lengths, [2])
-        self.assertEqual(normalized.offsets, [(3, 5)])
-        self.assertEqual(normalized.source, "direct")
-        self.assertFalse(normalized.is_tokenized)
-
-    def test_normalize_payload_rejects_single_payload_token_length_mismatch(self):
-        payload = MiMoV25AudioPayload(
-            codes=np.ones((5, 20), dtype=np.int32),
-            token_lengths=[3],
-            audio_token_id=self.audio_token_id,
-        )
-
-        with self.assertRaisesRegex(ValueError, "token_lengths mismatch"):
-            MiMoV25AudioCodecProcessor.normalize_payload(payload)
-
-    def test_normalize_payload_rejects_multi_segment_raw_concat(self):
-        payload = MiMoV25AudioPayload(
-            codes=np.ones((11, 20), dtype=np.int32),
-            token_lengths=[2, 2],
-            audio_token_id=self.audio_token_id,
-        )
-
-        with self.assertRaisesRegex(ValueError, "stage0-ready"):
-            MiMoV25AudioCodecProcessor.normalize_payload(payload)
-
-    def test_normalize_payload_rejects_offset_count_mismatch(self):
-        payload = MiMoV25AudioPayload(
-            codes=np.ones((12, 20), dtype=np.int32),
-            token_lengths=[1, 2],
-            offsets=[(0, 1)],
-            audio_token_id=self.audio_token_id,
-        )
-
-        with self.assertRaisesRegex(ValueError, "offset count mismatch"):
-            MiMoV25AudioCodecProcessor.normalize_payload(payload)
-
-    def test_normalize_payload_rejects_offset_length_mismatch(self):
-        payload = MiMoV25AudioPayload(
-            codes=np.ones((8, 20), dtype=np.int32),
-            token_lengths=[2],
-            offsets=[(0, 1)],
-            audio_token_id=self.audio_token_id,
-        )
-
-        with self.assertRaisesRegex(ValueError, "offset length mismatch"):
-            MiMoV25AudioCodecProcessor.normalize_payload(payload)
-
-    def test_payload_from_obj_normalizes_json_transport_shape(self):
-        payload = MiMoV25AudioPayload.from_obj(
-            {
-                "codes": np.ones((8, 20), dtype=np.int32).tolist(),
-                "token_lengths": ["2"],
-                "offsets": [[4, 6]],
-                "audio_token_id": str(self.audio_token_id),
-                "num_channels": "20",
-                "codebook_size": "1280",
-                "group_size": "4",
-                "source": "json",
-                "is_tokenized": "false",
-            }
-        )
-
-        normalized = MiMoV25AudioCodecProcessor.normalize_payload(payload)
-
-        self.assertIsInstance(normalized.codes, np.ndarray)
-        self.assertEqual(normalized.codes.dtype, np.int32)
-        self.assertEqual(normalized.token_lengths, [2])
-        self.assertEqual(normalized.offsets, [(4, 6)])
-        self.assertEqual(normalized.audio_token_id, self.audio_token_id)
-        self.assertFalse(normalized.is_tokenized)
-
-    def test_payload_from_obj_rejects_invalid_offset_shape(self):
-        with self.assertRaisesRegex(ValueError, "offsets must be"):
-            MiMoV25AudioPayload.from_obj(
-                {
-                    "codes": np.ones((8, 20), dtype=np.int32).tolist(),
-                    "token_lengths": [2],
-                    "offsets": [[1, 2, 3]],
-                    "audio_token_id": self.audio_token_id,
-                }
-            )
-
-    def test_payload_transport_dict_roundtrip(self):
-        payload = MiMoV25AudioPayload(
-            codes=np.arange(160, dtype=np.int32).reshape(8, 20),
-            token_lengths=[2],
-            offsets=[(5, 7)],
-            audio_token_id=self.audio_token_id,
-            source="unit",
-            is_tokenized=False,
-        )
-
-        restored = MiMoV25AudioPayload.from_obj(payload.to_transport_dict())
-        normalized = MiMoV25AudioCodecProcessor.normalize_payload(restored)
-
-        np.testing.assert_array_equal(normalized.codes, payload.codes)
-        self.assertEqual(normalized.token_lengths, [2])
-        self.assertEqual(normalized.offsets, [(5, 7)])
-        self.assertEqual(normalized.audio_token_id, self.audio_token_id)
-        self.assertFalse(normalized.is_tokenized)
 
     def test_expand_single_audio_placeholder_and_attach_offset(self):
         payload = MiMoV25AudioPayload(

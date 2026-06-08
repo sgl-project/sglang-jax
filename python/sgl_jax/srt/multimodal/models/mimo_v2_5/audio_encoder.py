@@ -166,9 +166,9 @@ class MiMoV25AudioUnderstandingEncoder(nnx.Module):
 
     def _ensure_channel_first_audio_codes(self, codes: jax.Array) -> jax.Array:
         # Contract: host-side MiMoV25AudioCodecProcessor always emits time-major
-        # codes (last axis == num_channels, see MiMoV25AudioPayload.codes_layout).
-        # We therefore resolve the last axis as channels first, so the ambiguous
-        # square [C, C] case is interpreted consistently with the host contract.
+        # codes (last axis == num_channels). We therefore resolve the last axis as
+        # channels first, so the ambiguous square [C, C] case is interpreted
+        # consistently with the host contract.
         if codes.ndim == 2:
             if codes.shape[-1] == self.audio_channels:
                 return self._require_non_empty_audio_codes(jnp.swapaxes(codes[None, ...], 1, 2))

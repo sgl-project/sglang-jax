@@ -202,7 +202,6 @@ class _FakeCodec:
         return MiMoV25AudioCodecProcessor.build_payload_from_codes(
             np.zeros((5, 20), dtype=np.int32),
             audio_token_id=self.audio_token_id,
-            source="fake_raw_audio",
         )
 
 

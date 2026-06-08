@@ -27,11 +27,9 @@ class MiMoV25AudioPayload:
     """Structured MiMo-V2.5 audio-code payload for omni requests.
 
     ``codes`` is always stored time-major as ``[T, num_channels]`` (one row per
-    RVQ timestep). ``codes_layout`` records that contract so the embed stage does
-    not have to re-guess the axis order from the shape (which is ambiguous for the
-    square ``T == num_channels`` case). ``codebook_sizes`` optionally carries the
-    per-quantizer codebook size so out-of-range ids can be rejected per channel
-    instead of against the loose scalar ``codebook_size`` upper bound.
+    RVQ timestep). ``codebook_sizes`` optionally carries the per-quantizer codebook
+    size so out-of-range ids can be rejected per channel instead of against the
+    loose scalar ``codebook_size`` upper bound.
     """
 
     codes: np.ndarray | list
@@ -42,80 +40,6 @@ class MiMoV25AudioPayload:
     codebook_size: int = 1280
     codebook_sizes: list[int] | None = None
     group_size: int = 4
-    codes_layout: str = "time_major"
-    source: str = "unknown"
-    is_tokenized: bool = True
-
-    @classmethod
-    def from_obj(cls, obj) -> MiMoV25AudioPayload | None:
-        """Build a payload from dataclass/dict transport forms."""
-        if obj is None:
-            return None
-        if isinstance(obj, cls):
-            return obj
-        if not isinstance(obj, dict):
-            raise TypeError(f"MiMo-V2.5 audio payload must be a dict or payload, got {type(obj)!r}")
-
-        data = dict(obj)
-        if "codes" in data and not isinstance(data["codes"], np.ndarray):
-            data["codes"] = np.asarray(data["codes"], dtype=np.int32)
-        if "token_lengths" in data and data["token_lengths"] is not None:
-            data["token_lengths"] = [int(length) for length in data["token_lengths"]]
-        if "offsets" in data and data["offsets"] is not None:
-            offsets = []
-            for offset in data["offsets"]:
-                if len(offset) != 2:
-                    raise ValueError(
-                        f"MiMo-V2.5 audio payload offsets must be [start, end] pairs, got {offset}"
-                    )
-                offsets.append(tuple(map(int, offset)))
-            data["offsets"] = offsets
-        for key in ("audio_token_id", "num_channels", "codebook_size", "group_size"):
-            if key in data and data[key] is not None:
-                data[key] = int(data[key])
-        if data.get("codebook_sizes") is not None:
-            data["codebook_sizes"] = [int(size) for size in data["codebook_sizes"]]
-        if data.get("codes_layout") is not None:
-            data["codes_layout"] = str(data["codes_layout"])
-        if isinstance(data.get("is_tokenized"), str):
-            value = data["is_tokenized"].strip().lower()
-            if value in {"true", "1", "yes"}:
-                data["is_tokenized"] = True
-            elif value in {"false", "0", "no"}:
-                data["is_tokenized"] = False
-            else:
-                raise ValueError(
-                    "MiMo-V2.5 audio payload is_tokenized must be a boolean-like value, "
-                    f"got {data['is_tokenized']!r}"
-                )
-        return cls(**data)
-
-    def to_transport_dict(self) -> dict:
-        """Return a JSON/pickle-friendly representation for mm_inputs transport."""
-        codes = np.asarray(self.codes, dtype=np.int32)
-        return {
-            "codes": codes.tolist(),
-            "token_lengths": [int(length) for length in self.token_lengths],
-            "offsets": (
-                [[int(start), int(end)] for start, end in self.offsets]
-                if self.offsets is not None
-                else None
-            ),
-            "audio_token_id": (
-                int(self.audio_token_id) if self.audio_token_id is not None else None
-            ),
-            "num_channels": int(self.num_channels),
-            "codebook_size": int(self.codebook_size),
-            "codebook_sizes": (
-                [int(size) for size in self.codebook_sizes]
-                if self.codebook_sizes is not None
-                else None
-            ),
-            "group_size": int(self.group_size),
-            "codes_layout": str(self.codes_layout),
-            "source": self.source,
-            "is_tokenized": bool(self.is_tokenized),
-        }
 
 
 class MiMoV25AudioCodecProcessor:
@@ -188,7 +112,6 @@ class MiMoV25AudioCodecProcessor:
         codebook_size: int = DEFAULT_CODEBOOK_SIZE,
         codebook_sizes: list[int] | None = None,
         group_size: int = DEFAULT_GROUP_SIZE,
-        source: str,
     ) -> MiMoV25AudioPayload:
         if group_size <= 0:
             raise ValueError(f"MiMo-V2.5 audio group_size must be positive, got {group_size}")
@@ -220,84 +143,6 @@ class MiMoV25AudioCodecProcessor:
             codebook_size=codebook_size,
             codebook_sizes=list(codebook_sizes) if codebook_sizes is not None else None,
             group_size=group_size,
-            source=source,
-        )
-
-    @classmethod
-    def normalize_payload(
-        cls,
-        payload: MiMoV25AudioPayload,
-        *,
-        audio_token_id: int | None = None,
-        num_channels: int | None = None,
-        codebook_size: int | None = None,
-        codebook_sizes: list[int] | None = None,
-        group_size: int | None = None,
-        source: str | None = None,
-    ) -> MiMoV25AudioPayload:
-        """Normalize a user-provided payload into the stage0-ready contract."""
-        num_channels = int(num_channels or payload.num_channels or cls.DEFAULT_NUM_CHANNELS)
-        codebook_size = int(codebook_size or payload.codebook_size or cls.DEFAULT_CODEBOOK_SIZE)
-        if codebook_sizes is None:
-            codebook_sizes = payload.codebook_sizes
-        codebook_sizes = list(codebook_sizes) if codebook_sizes is not None else None
-        group_size = int(group_size or payload.group_size or cls.DEFAULT_GROUP_SIZE)
-        if group_size <= 0:
-            raise ValueError(f"MiMo-V2.5 audio group_size must be positive, got {group_size}")
-        token_lengths = [int(length) for length in payload.token_lengths]
-        if not token_lengths or any(length <= 0 for length in token_lengths):
-            raise ValueError(f"MiMo-V2.5 audio token_lengths must be positive, got {token_lengths}")
-        offsets = cls.normalize_offsets(payload.offsets, token_lengths)
-
-        codes = cls.normalize_codes(
-            payload.codes,
-            num_channels=num_channels,
-            codebook_size=codebook_size,
-            codebook_sizes=codebook_sizes,
-        )
-        expected_rows = sum(token_lengths) * group_size
-        if codes.shape[0] != expected_rows:
-            if len(token_lengths) == 1:
-                raw_token_length = math.ceil(codes.shape[0] / group_size)
-                if token_lengths[0] != raw_token_length:
-                    raise ValueError(
-                        "MiMo-V2.5 audio payload token_lengths mismatch: "
-                        f"codes rows={codes.shape[0]} imply token_lengths=[{raw_token_length}] "
-                        f"with group_size={group_size}, got {token_lengths}"
-                    )
-                return MiMoV25AudioPayload(
-                    codes=cls.pad_codes_to_group_size(codes, group_size=group_size),
-                    token_lengths=token_lengths,
-                    offsets=offsets,
-                    audio_token_id=(
-                        audio_token_id if audio_token_id is not None else payload.audio_token_id
-                    ),
-                    num_channels=num_channels,
-                    codebook_size=codebook_size,
-                    codebook_sizes=codebook_sizes,
-                    group_size=group_size,
-                    source=source or payload.source,
-                    is_tokenized=payload.is_tokenized,
-                )
-            raise ValueError(
-                "MiMo-V2.5 audio payload codes must be stage0-ready for multi-audio payloads: "
-                f"codes rows={codes.shape[0]}, expected={expected_rows} from "
-                f"token_lengths={token_lengths}, group_size={group_size}. "
-                "Pass multi-audio codes as a list/3D audio_codes input so each segment can be padded "
-                "independently, or provide already padded payload.codes."
-            )
-
-        return MiMoV25AudioPayload(
-            codes=codes,
-            token_lengths=token_lengths,
-            offsets=offsets,
-            audio_token_id=audio_token_id if audio_token_id is not None else payload.audio_token_id,
-            num_channels=num_channels,
-            codebook_size=codebook_size,
-            codebook_sizes=codebook_sizes,
-            group_size=group_size,
-            source=source or payload.source,
-            is_tokenized=payload.is_tokenized,
         )
 
     @staticmethod
@@ -577,9 +422,9 @@ class MiMoV25AudioCodecProcessor:
     def encode(self, audio_data) -> MiMoV25AudioPayload:
         """Encode raw audio or mel inputs into a MiMo-V2.5 audio payload."""
         mels = [self._to_mel_tensor(item) for item in self._normalize_audio_items(audio_data)]
-        return self.encode_mels(mels, source="host_codec")
+        return self.encode_mels(mels)
 
-    def encode_mels(self, mels, *, source: str = "host_codec_mel") -> MiMoV25AudioPayload:
+    def encode_mels(self, mels) -> MiMoV25AudioPayload:
         """Encode one or more mel tensors shaped [T, 128] into RVQ codes."""
         if mels is None:
             raise ValueError("MiMo-V2.5 mel inputs cannot be None")
@@ -600,7 +445,6 @@ class MiMoV25AudioCodecProcessor:
             codebook_size=self.DEFAULT_CODEBOOK_SIZE,
             codebook_sizes=self.get_codebook_sizes(),
             group_size=self.DEFAULT_GROUP_SIZE,
-            source=source,
         )
         return payload
 

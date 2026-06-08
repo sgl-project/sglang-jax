@@ -2,7 +2,7 @@
 
 These cover the fixes from the step-2 review:
 - D4-5: per-quantizer codebook range validation (vs the loose scalar bound).
-- D3-7 / D4-4: explicit time-major codes_layout contract + square-matrix layout.
+- D3-7 / D4-4: time-major code normalization + square-matrix layout.
 All assertions run on numpy alone (no jax/torch needed).
 """
 
@@ -15,7 +15,6 @@ import numpy as np
 
 from sgl_jax.srt.multimodal.models.mimo_v2_5.audio_codec_processor import (
     MiMoV25AudioCodecProcessor,
-    MiMoV25AudioPayload,
 )
 
 
@@ -56,21 +55,18 @@ class TestMiMoV25CodecPerQuantizerValidation(unittest.TestCase):
             np.zeros((5, 20), dtype=np.int32),
             audio_token_id=self.audio_token_id,
             codebook_sizes=codebook_sizes,
-            source="unit",
         )
         self.assertEqual(payload.codebook_sizes, codebook_sizes)
 
 
 class TestMiMoV25CodecLayoutContract(unittest.TestCase):
-    def test_payload_records_time_major_layout(self):
+    def test_payload_normalizes_channel_major_to_time_major(self):
         payload = MiMoV25AudioCodecProcessor.build_payload_from_codes(
             np.zeros((20, 5), dtype=np.int32),  # channel-major input
             audio_token_id=151669,
-            source="unit",
         )
         # normalized to time-major [T, C]
         self.assertEqual(payload.codes.shape, (8, 20))
-        self.assertEqual(payload.codes_layout, "time_major")
 
     def test_square_codes_are_treated_time_major(self):
         # A [20, 20] block is layout-ambiguous; the contract resolves the last
@@ -79,18 +75,6 @@ class TestMiMoV25CodecLayoutContract(unittest.TestCase):
         out = MiMoV25AudioCodecProcessor.normalize_codes(codes)
         self.assertEqual(out.shape, (20, 20))
         np.testing.assert_array_equal(out, codes)
-
-    def test_transport_roundtrip_preserves_new_fields(self):
-        codebook_sizes = [1024, 1024, 256, 128] + [1280] * 16
-        payload = MiMoV25AudioCodecProcessor.build_payload_from_codes(
-            np.zeros((5, 20), dtype=np.int32),
-            audio_token_id=151669,
-            codebook_sizes=codebook_sizes,
-            source="unit",
-        )
-        restored = MiMoV25AudioPayload.from_obj(payload.to_transport_dict())
-        self.assertEqual(restored.codes_layout, "time_major")
-        self.assertEqual(restored.codebook_sizes, codebook_sizes)
 
 
 class TestMiMoV25CodecGuards(unittest.TestCase):
@@ -103,7 +87,6 @@ class TestMiMoV25CodecGuards(unittest.TestCase):
             MiMoV25AudioCodecProcessor.build_payload_from_codes(
                 np.zeros((5, 20), dtype=np.int32),
                 audio_token_id=None,
-                source="unit",
             )
 
     def test_codebook_sizes_missing_config_returns_none(self):
