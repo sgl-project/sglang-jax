@@ -336,17 +336,33 @@ class GlobalScheduler:
         Spawns a thread per `Stage` running `Stage.run_stage` and then blocks
         on each stage's output queue for a readiness message. Raises if a
         stage fails to initialize.
+
+        Multi-host (SPMD): stages load weights via JAX cross-host collectives
+        (multihost_utils.broadcast_one_to_all), which require every process to
+        issue them in the same global order. Starting all stage threads at once
+        lets Stage-0 and Stage-1 interleave their collectives nondeterministically
+        across hosts and deadlocks. So when nnodes>1 we start each stage thread
+        only after the previous one has signaled ready, serializing the
+        per-stage collective sequence identically on every rank.
         """
 
         import threading
 
-        for stage in self.stage_list:
+        serialize = getattr(self.server_args, "nnodes", 1) > 1
+        threads = []
+        for i, stage in enumerate(self.stage_list):
             thread = threading.Thread(target=stage.run_stage)
             thread.start()
-        for i, q in enumerate(self.out_queues):
-            status = q.get()
-            if status["status"] != "ready":
-                raise Exception(f"stage {i} init failed")
+            threads.append(thread)
+            if serialize:
+                status = self.out_queues[i].get()
+                if status["status"] != "ready":
+                    raise Exception(f"stage {i} init failed")
+        if not serialize:
+            for i, q in enumerate(self.out_queues):
+                status = q.get()
+                if status["status"] != "ready":
+                    raise Exception(f"stage {i} init failed")
 
     def recv_request(self):
         """Non-blockingly drain incoming requests from the tokenizer socket.
