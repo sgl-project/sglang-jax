@@ -21,6 +21,7 @@ from sgl_jax.srt.layers.moe import (
     create_moe_weights_mapping,
 )
 from sgl_jax.srt.layers.radix_attention import RadixAttention
+from sgl_jax.srt.kernels.fused_mlp import apply_fused_mlp_with_padding
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
@@ -459,8 +460,11 @@ class Glm5MLP(nnx.Module):
         mesh: jax.sharding.Mesh,
         layer_id: int = 0,
         dtype: jnp.dtype = jnp.bfloat16,
+        use_fused: bool = True,
     ) -> None:
         self.layer_id = layer_id
+        self.mesh = mesh
+        self.use_fused = use_fused
 
         self.gate_proj = LinearBase(
             input_size=hidden_size,
@@ -494,7 +498,53 @@ class Glm5MLP(nnx.Module):
 
         self.act_fn = jax.nn.silu
 
+    def post_load_weights(self):
+        if not self.use_fused:
+            return
+        
+        wg = self.gate_proj.weight.value
+        wu = self.up_proj.weight.value
+        wd = self.down_proj.weight.value
+        
+        B_INTER = 128
+        hidden_size, local_inter_size = wg.shape
+        
+        # Pad local intermediate dimension to a multiple of B_INTER
+        pad_inter = (B_INTER - (local_inter_size % B_INTER)) % B_INTER
+        if pad_inter > 0:
+            wg = jnp.pad(wg, ((0, 0), (0, pad_inter)), mode="constant")
+            wu = jnp.pad(wu, ((0, 0), (0, pad_inter)), mode="constant")
+            wd = jnp.pad(wd, ((0, pad_inter), (0, 0)), mode="constant")
+            local_inter_size += pad_inter
+
+        # Combine wg and wu block-by-block
+        num_blocks = local_inter_size // B_INTER
+        wg_reshaped = wg.reshape(hidden_size, num_blocks, B_INTER)
+        wu_reshaped = wu.reshape(hidden_size, num_blocks, B_INTER)
+        
+        # Concat along block dimension and flatten
+        w_gu = jnp.concatenate([wg_reshaped, wu_reshaped], axis=-1)
+        w_gu = w_gu.reshape(hidden_size, local_inter_size * 2)
+        
+        # Store fused parameters sharded exactly like original projections
+        self.w_gu = nnx.Param(w_gu, out_sharding=P(None, "tensor"))
+        self.w_d = nnx.Param(wd, out_sharding=P("tensor", None))
+        
+        # Free original projection modules to save HBM
+        self.gate_proj = None
+        self.up_proj = None
+        self.down_proj = None
+
     def __call__(self, hidden_states: jax.Array):
+        if self.use_fused and hasattr(self, "w_gu"):
+            return apply_fused_mlp_with_padding(
+                hidden_states,
+                self.w_gu.value,
+                self.w_d.value,
+                self.mesh,
+            )
+            
+        # Fallback non-fused path
         a1, _ = self.gate_proj(hidden_states)
         a2, _ = self.up_proj(hidden_states)
         intermediate_parallel = a2 * self.act_fn(a1)
@@ -805,7 +855,9 @@ class Glm5ForCausalLM(nnx.Module):
 
         for layer in self.model.layers:
             layer.self_attn.post_load_weights()
-        logger.info("Absorbed MLA weights split successfully!")
+            if hasattr(layer, "mlp") and hasattr(layer.mlp, "post_load_weights"):
+                layer.mlp.post_load_weights()
+        logger.info("Absorbed MLA weights and Fused MLP weights processed successfully!")
 
         # Skipping scale inversion for BF16
         logger.info("Skipping scale inversion for BF16 model.")
