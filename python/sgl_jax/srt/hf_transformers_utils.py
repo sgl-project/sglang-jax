@@ -303,7 +303,7 @@ def get_tokenizer(
             if config_data.get("tokenizer_class") == "TokenizersBackend":
                 config_data.pop("tokenizer_class", None)
                 is_patched = True
-            if "extra_special_tokens" in config_data and isinstance(config_data["extra_special_tokens"], list):
+            if "extra_special_tokens" in config_data:
                 config_data.pop("extra_special_tokens", None)
                 is_patched = True
 
