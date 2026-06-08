@@ -89,9 +89,7 @@ class EPMoE(nnx.Module):
 
         abstract_mesh = self.mesh.abstract_mesh
         self.updated_mesh = abstract_mesh.update(
-            axis_sizes=(self.ep_size, self.tp_size),
-            axis_names=("expert", "tensor"),
-            axis_types=(jax.sharding.AxisType.Explicit, jax.sharding.AxisType.Explicit),
+            axis_sizes=(self.ep_size, self.tp_size), axis_names=("expert", "tensor")
         )
 
         with jax.sharding.use_abstract_mesh(self.updated_mesh):
