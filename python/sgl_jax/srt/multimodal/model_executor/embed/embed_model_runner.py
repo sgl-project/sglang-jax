@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import inspect
-import math
 
 import jax
 import jax.numpy as jnp
@@ -75,63 +74,6 @@ class EmbedModelRunner(BaseModelRunner):
                 "video_grid_thw",
             )
         return tuple(signature.parameters)
-
-    @staticmethod
-    def _validate_audio_placeholder_contract(input_ids, omni_inputs, audio_codes) -> None:
-        if input_ids is None or audio_codes is None or not isinstance(omni_inputs, dict):
-            return
-
-        audio_token_id = omni_inputs.get("audio_token_id")
-        if audio_token_id is None:
-            # Audio codes present but no scatter target: the embedding model would
-            # silently drop the audio (scatter is a no-op when token_id is None), so
-            # the audio would never reach the AR stage. Fail loudly (review R2-6).
-            raise ValueError(
-                "MiMo-V2.5 received audio codes but omni_inputs has no audio_token_id; "
-                "cannot place audio embeddings. Check that the model config / processor "
-                "resolves audio_token_id (expected 151669)."
-            )
-
-        items = omni_inputs.get("mm_items", []) or []
-        expected = 0
-        for raw_item in items:
-            if isinstance(raw_item, dict):
-                modality = raw_item.get("modality")
-                modality_name = str(modality).lower()
-                is_audio = modality_name == "audio" or modality_name.endswith("audio")
-                meta = raw_item.get("model_specific_data") or {}
-                feature = raw_item.get("feature")
-            else:
-                is_audio = raw_item.is_audio() if hasattr(raw_item, "is_audio") else False
-                meta = getattr(raw_item, "model_specific_data", None) or {}
-                feature = getattr(raw_item, "feature", None)
-            if not is_audio:
-                continue
-            if not (meta.get("is_codes") or "token_lengths" in meta):
-                continue
-            token_lengths = meta.get("token_lengths")
-            if token_lengths is not None:
-                expected += sum(int(length) for length in token_lengths)
-                continue
-            group_size = int(meta.get("group_size") or 1)
-            if feature is None:
-                continue
-            shape = getattr(feature, "shape", ())
-            if len(shape) == 2:
-                expected += math.ceil(int(shape[0]) / group_size)
-
-        if expected == 0:
-            return
-
-        ids = input_ids.tolist() if hasattr(input_ids, "tolist") else list(input_ids)
-        actual = sum(1 for token in ids if int(token) == int(audio_token_id))
-        if actual != expected:
-            raise ValueError(
-                "MiMo-V2.5 audio placeholder count mismatch before embed stage: "
-                f"found {actual} audio pad tokens, expected {expected} from mm_items "
-                f"token_lengths. input_ids_len={len(ids)} audio_codes_shape="
-                f"{getattr(audio_codes, 'shape', None)}"
-            )
 
     def initialize_jit(self):
         model_def, model_state = nnx.split(self.model)
@@ -211,7 +153,14 @@ class EmbedModelRunner(BaseModelRunner):
 
         audio_codes = _arr(assembled["audio_codes"])
         audio_features = _arr(assembled["audio_features"])
-        self._validate_audio_placeholder_contract(input_ids, omni_inputs, audio_codes)
+        # Optional model-owned host-side input guard (model-agnostic dispatch): a model
+        # may define validate_embed_inputs to reject malformed placeholder/feature
+        # contracts before the forward. Models without the hook skip it.
+        validate_inputs = getattr(getattr(self, "model", None), "validate_embed_inputs", None)
+        if validate_inputs is not None:
+            validate_inputs(
+                input_ids=input_ids, omni_inputs=omni_inputs, audio_codes=audio_codes
+            )
         audio_feature_lengths = None
         # Continuous-audio models (e.g. Qwen3-Omni mel) densify via feature_attention_mask;
         # discrete-codes audio sets audio_features=None and skips this generically.

@@ -98,6 +98,9 @@ _install_import_stubs()
 from sgl_jax.srt.multimodal.model_executor.embed.embed_model_runner import (  # noqa: E402
     EmbedModelRunner,
 )
+from sgl_jax.srt.multimodal.models.mimo_v2_5.audio_codec_processor import (  # noqa: E402
+    MiMoV25AudioCodecProcessor,
+)
 
 
 class _Item:
@@ -149,16 +152,15 @@ class TestEmbedModelRunnerPrepareInput(unittest.TestCase):
         )
 
     def test_audio_placeholder_mismatch_raises_before_embed(self):
+        # Host contract guard (model hook delegates here); 2 token_lengths but 1 pad.
         item = _Item(
             "audio", np.zeros((8, 20), dtype=np.int32), {"is_codes": True, "token_lengths": [2]}
         )
-        batch = self._batch(
-            [1, self.audio_token_id, 2],
-            {"audio_token_id": self.audio_token_id, "mm_items": [item]},
-        )
-
+        omni = {"audio_token_id": self.audio_token_id, "mm_items": [item]}
         with self.assertRaisesRegex(ValueError, "audio placeholder count mismatch"):
-            self._runner()._prepare_input(batch)
+            MiMoV25AudioCodecProcessor.validate_audio_placeholder_contract(
+                [1, self.audio_token_id, 2], omni, item.feature
+            )
 
     def test_audio_placeholder_mismatch_raises_for_transport_dict_item(self):
         item = {
@@ -166,13 +168,11 @@ class TestEmbedModelRunnerPrepareInput(unittest.TestCase):
             "feature": np.zeros((8, 20), dtype=np.int32),
             "model_specific_data": {"is_codes": True, "token_lengths": [2]},
         }
-        batch = self._batch(
-            [1, self.audio_token_id, 2],
-            {"audio_token_id": self.audio_token_id, "mm_items": [item]},
-        )
-
+        omni = {"audio_token_id": self.audio_token_id, "mm_items": [item]}
         with self.assertRaisesRegex(ValueError, "audio placeholder count mismatch"):
-            self._runner()._prepare_input(batch)
+            MiMoV25AudioCodecProcessor.validate_audio_placeholder_contract(
+                [1, self.audio_token_id, 2], omni, item["feature"]
+            )
 
     def test_audio_codes_without_audio_token_id_raises(self):
         # Audio codes present but no scatter target id: must fail loudly, not silently
@@ -180,9 +180,10 @@ class TestEmbedModelRunnerPrepareInput(unittest.TestCase):
         item = _Item(
             "audio", np.zeros((8, 20), dtype=np.int32), {"is_codes": True, "token_lengths": [2]}
         )
-        batch = self._batch([1, 2, 3], {"mm_items": [item]})  # no audio_token_id key
         with self.assertRaisesRegex(ValueError, "no audio_token_id"):
-            self._runner()._prepare_input(batch)
+            MiMoV25AudioCodecProcessor.validate_audio_placeholder_contract(
+                [1, 2, 3], {"mm_items": [item]}, item.feature
+            )
 
     def test_text_only_no_mm_inputs(self):
         out = self._runner()._prepare_input(self._batch([1, 2, 3], None))

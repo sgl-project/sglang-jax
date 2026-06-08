@@ -555,100 +555,13 @@ class MiMoVisionTransformer(nnx.Module):
         load_weights_from_safetensors(self, model_path, config or self.config)
 
 
-CONV3D_TORCH_TO_JAX = (2, 3, 4, 1, 0)
-
-
-def create_mimo_vision_weight_mappings(
-    config,
-    source_prefix: str = "visual",
-    target_prefix: str = "",
-) -> dict[str, "WeightMapping"]:
-    from sgl_jax.srt.utils.weight_utils import WeightMapping
-
-    mappings: dict[str, WeightMapping] = {
-        f"{source_prefix}.patch_embed.proj.weight": WeightMapping(
-            target_path=f"{target_prefix}patch_embed.proj.kernel",
-            transpose_axes=CONV3D_TORCH_TO_JAX,
-        ),
-        f"{source_prefix}.merger.ln_q.weight": WeightMapping(
-            target_path=f"{target_prefix}merger.ln_q.scale",
-            sharding=(),
-        ),
-        # merger ln_q / mlp are bias-free in the checkpoint (no .bias keys); the merger
-        # module is built with use_bias=False to match.
-        f"{source_prefix}.merger.mlp.0.weight": WeightMapping(
-            target_path=f"{target_prefix}merger.mlp_fc1.kernel",
-            transpose=True,
-        ),
-        f"{source_prefix}.merger.mlp.2.weight": WeightMapping(
-            target_path=f"{target_prefix}merger.mlp_fc2.kernel",
-            transpose=True,
-        ),
-    }
-
-    for block_idx in range(int(config.depth)):
-        source = f"{source_prefix}.blocks.{block_idx}"
-        target = f"{target_prefix}blocks.{block_idx}"
-        mappings.update(
-            {
-                f"{source}.norm1.weight": WeightMapping(
-                    target_path=f"{target}.norm1.scale",
-                    sharding=(),
-                ),
-                f"{source}.norm2.weight": WeightMapping(
-                    target_path=f"{target}.norm2.scale",
-                    sharding=(),
-                ),
-                f"{source}.attn.qkv.weight": WeightMapping(
-                    target_path=f"{target}.attn.qkv.kernel",
-                    transpose=True,
-                ),
-                f"{source}.attn.qkv.bias": WeightMapping(
-                    target_path=f"{target}.attn.qkv.bias",
-                    sharding=(),
-                ),
-                f"{source}.attn.proj.weight": WeightMapping(
-                    target_path=f"{target}.attn.proj.kernel",
-                    transpose=True,
-                ),
-                f"{source}.attn.proj.bias": WeightMapping(
-                    target_path=f"{target}.attn.proj.bias",
-                    sharding=(),
-                ),
-                f"{source}.attn.sinks": WeightMapping(
-                    target_path=f"{target}.attn.sinks",
-                    sharding=(),
-                ),
-                f"{source}.mlp.gate_proj.weight": WeightMapping(
-                    target_path=f"{target}.mlp.gate_proj.kernel",
-                    transpose=True,
-                ),
-                f"{source}.mlp.gate_proj.bias": WeightMapping(
-                    target_path=f"{target}.mlp.gate_proj.bias",
-                    sharding=(),
-                ),
-                f"{source}.mlp.up_proj.weight": WeightMapping(
-                    target_path=f"{target}.mlp.up_proj.kernel",
-                    transpose=True,
-                ),
-                f"{source}.mlp.up_proj.bias": WeightMapping(
-                    target_path=f"{target}.mlp.up_proj.bias",
-                    sharding=(),
-                ),
-                f"{source}.mlp.down_proj.weight": WeightMapping(
-                    target_path=f"{target}.mlp.down_proj.kernel",
-                    transpose=True,
-                ),
-                f"{source}.mlp.down_proj.bias": WeightMapping(
-                    target_path=f"{target}.mlp.down_proj.bias",
-                    sharding=(),
-                ),
-            }
-        )
-    return mappings
 
 
 def load_weights_from_safetensors(model: nnx.Module, model_path: str, config) -> None:
+    from sgl_jax.srt.multimodal.models.mimo_v2_5.weights_mapping import (
+        create_mimo_vision_weight_mappings,
+    )
+
     weight_index = _index_safetensors(model_path)
     mappings = create_mimo_vision_weight_mappings(config)
     zero_filled: list[str] = []

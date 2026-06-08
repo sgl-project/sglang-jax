@@ -34,6 +34,7 @@ from sgl_jax.srt.multimodal.models.mimo_v2_5.audio_encoder import (
 )
 from sgl_jax.srt.multimodal.models.mimo_v2_5.weights_mapping import (
     build_embedding_weight_mappings,
+    create_mimo_vision_weight_mappings,
 )
 from sgl_jax.srt.utils.weight_utils import WeightLoader
 
@@ -181,10 +182,6 @@ class MiMoV2_5Embedding(nnx.Module):
         if self.visual is not None:
             import dataclasses as _dc
 
-            from sgl_jax.srt.multimodal.models.mimo_v2_5.vision_encoder import (
-                create_mimo_vision_weight_mappings,
-            )
-
             vision_mappings = create_mimo_vision_weight_mappings(
                 self.visual.config, source_prefix="visual", target_prefix="visual."
             )
@@ -232,26 +229,28 @@ class MiMoV2_5Embedding(nnx.Module):
             audio_codes=audio_codes,
         )
 
-    def _encode_image(self, *, pixel_values, image_grid_thw):
+    def _encode_visual(self, pixel_values, grid_thw, *, kind: str):
+        """Shared image/video path: both feed the same MiMoVL ViT (self.visual)."""
         if pixel_values is None:
             return None
         if self.visual is None:
             raise NotImplementedError(
-                "MiMo-V2.5 received image input but this checkpoint has no vision_config "
+                f"MiMo-V2.5 received {kind} input but this checkpoint has no vision_config "
                 "(self.visual is None); it is an audio-only build."
             )
-        return self.visual(pixel_values.astype(self.dtype), self._as_grid_tuple(image_grid_thw))
+        return self.visual(pixel_values.astype(self.dtype), self._as_grid_tuple(grid_thw))
 
-    def _encode_video(self, *, pixel_values_videos, video_grid_thw):
-        if pixel_values_videos is None:
-            return None
-        if self.visual is None:
-            raise NotImplementedError(
-                "MiMo-V2.5 received video input but this checkpoint has no vision_config "
-                "(self.visual is None); it is an audio-only build."
-            )
-        return self.visual(
-            pixel_values_videos.astype(self.dtype), self._as_grid_tuple(video_grid_thw)
+    def validate_embed_inputs(self, *, input_ids, omni_inputs, audio_codes=None, **_) -> None:
+        """Host-side pre-forward guard (called generically by EmbedModelRunner).
+
+        Delegates to the host audio-codec contract owner; no-op without audio.
+        """
+        from sgl_jax.srt.multimodal.models.mimo_v2_5.audio_codec_processor import (
+            MiMoV25AudioCodecProcessor,
+        )
+
+        MiMoV25AudioCodecProcessor.validate_audio_placeholder_contract(
+            input_ids, omni_inputs, audio_codes
         )
 
     @staticmethod
@@ -319,14 +318,8 @@ class MiMoV2_5Embedding(nnx.Module):
             audio_feature_lengths=audio_feature_lengths,
             audio_codes=audio_codes,
         )
-        image_embeds = self._encode_image(
-            pixel_values=pixel_values,
-            image_grid_thw=image_grid_thw,
-        )
-        video_embeds = self._encode_video(
-            pixel_values_videos=pixel_values_videos,
-            video_grid_thw=video_grid_thw,
-        )
+        image_embeds = self._encode_visual(pixel_values, image_grid_thw, kind="image")
+        video_embeds = self._encode_visual(pixel_values_videos, video_grid_thw, kind="video")
 
         input_embeds = self._scatter_modality(
             input_ids, input_embeds, audio_embeds, self.audio_token_id
