@@ -9,7 +9,6 @@ import psutil
 
 from sgl_jax.srt.managers.communication import MultiHostQueueBackend, QueueBackend
 from sgl_jax.srt.managers.scheduler import Scheduler as AutoRegressiveScheduler
-from sgl_jax.srt.models.mimo_v2_flash import MiMoV2FlashForCausalLM
 from sgl_jax.srt.models.mimo_v2_pro import MiMoV2ForCausalLM
 from sgl_jax.srt.models.qwen2 import Qwen2ForCausalLM
 from sgl_jax.srt.models.umt5 import UMT5EncoderModel
@@ -280,7 +279,6 @@ def get_model_class(name: str) -> type | list[type]:
         "MiMoAudioTokenizer": MiMoAudioTokenizer,
         "MiMoAudioForCausalLM": MiMoAudioForCausalLM,
         "MiMoV2_5Embedding": MiMoV2_5Embedding,
-        "MiMoV2FlashForCausalLM": MiMoV2FlashForCausalLM,
         "MiMoV2ForCausalLM": MiMoV2ForCausalLM,
         "CLIPTextModel": CLIPTextModel,
         "T5EncoderModel": T5EncoderModel,

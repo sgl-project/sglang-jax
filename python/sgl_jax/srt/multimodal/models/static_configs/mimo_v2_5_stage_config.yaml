@@ -32,7 +32,6 @@ stage_args:
    # one-hand HF config.json ("attention_projection_layout": "fused_qkv") +
    # modeling_mimo_v2.py:278 (if projection_layout == "fused_qkv": self.qkv_proj = ...),
    # so the checkpoint stores self_attn.qkv_proj (not separate q/k/v) and this is the
-   # correct class. (MiMoV2FlashForCausalLM, separate q/k/v, stays registered in stage.py
-   # only as the fallback for a hypothetical split-layout checkpoint.)
+   # correct class.
    model_class: MiMoV2ForCausalLM
    final_output: true
