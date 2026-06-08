@@ -153,6 +153,41 @@ class TestVerifyTree(CustomTestCase):
         self.assertEqual(future_result.bid, 7)
         self.assertEqual(future_result.cache_miss_count, 0)
 
+    def test_resolve_spec_decode_scheduler_fields_only_materializes_scheduler_data(
+        self,
+    ):
+        from sgl_jax.srt.speculative import overlap_future
+
+        class DeferredState:
+            def __array__(self, dtype=None):
+                raise AssertionError("deferred draft state must not be materialized")
+
+        next_draft_input = SimpleNamespace(
+            new_seq_lens=jnp.array([4, 7], dtype=jnp.int32),
+            hidden_states=DeferredState(),
+            topk_index=DeferredState(),
+            verified_id=DeferredState(),
+        )
+        future_result = overlap_future.SpecDecodeFutureResult(
+            logits_output=None,
+            next_token_ids=jnp.array([[10, 11, 12], [20, 21, 22]], dtype=jnp.int32),
+            accept_lens=jnp.array([2, 1], dtype=jnp.int32),
+            new_seq_lens=next_draft_input.new_seq_lens,
+            allocate_lens=None,
+            next_draft_input=next_draft_input,
+            bid=0,
+            cache_miss_count=0,
+        )
+
+        fields = overlap_future.resolve_spec_decode_scheduler_fields(future_result)
+
+        np.testing.assert_array_equal(
+            fields.next_token_ids,
+            np.array([[10, 11, 12], [20, 21, 22]], dtype=np.int32),
+        )
+        np.testing.assert_array_equal(fields.accept_lens, np.array([2, 1], dtype=np.int32))
+        np.testing.assert_array_equal(fields.new_seq_lens, np.array([4, 7], dtype=np.int32))
+
     def test_as_int32_array_keeps_host_metadata_on_host(self):
         from sgl_jax.srt.speculative import eagle_util
 
