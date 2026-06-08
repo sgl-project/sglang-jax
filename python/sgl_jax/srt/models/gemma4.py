@@ -596,6 +596,9 @@ class Gemma4ForCausalLM(nnx.Module):
         )
 
         weight_mappings = self._create_gemma4_weight_mappings()
+        if not loader.dummy_mode:
+            weight_info = loader._scan_weight_info()
+            weight_mappings = {k: v for k, v in weight_mappings.items() if k in weight_info}
 
         loader.load_weights_from_safetensors(weight_mappings)
 
