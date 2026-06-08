@@ -1,0 +1,25 @@
+{
+  "eval_name": "config-field",
+  "expectations": [
+    {
+      "text": "Identifies 13-configuration-reference.md as needing update",
+      "passed": true,
+      "evidence": "with-skill impact_report.md lists `wiki/docs/projects/sglang-jax/13-configuration-reference.md` under 需要更新 because `ServerArgs.enable_hybrid_memory_pool` is a user-visible configuration field."
+    },
+    {
+      "text": "Considers 07-kv-cache.md because memory_pool.py is involved",
+      "passed": true,
+      "evidence": "with-skill impact_report.md lists `wiki/docs/projects/sglang-jax/07-kv-cache.md` under 需要更新 and ties it to `memory_pool.py` selecting between `ReqToTokenPool` and `HybridReqToTokenPool`."
+    },
+    {
+      "text": "Does not include PR numbers, commit hashes, or code line numbers in final docs",
+      "passed": true,
+      "evidence": "simulated final docs in `with_skill/outputs/docs/13-configuration-reference.md` and `docs/07-kv-cache.md` contain no PR references, commit hashes, code line numbers, authors, reviewers, or release-note wording; validation_report.md records the same check."
+    },
+    {
+      "text": "Uses an update plan before modifying docs",
+      "passed": true,
+      "evidence": "with-skill output includes `update_plan.md` with decisions for `13-configuration-reference.md` and `07-kv-cache.md` before the simulated changed docs under `outputs/docs/`."
+    }
+  ]
+}

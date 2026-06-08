@@ -1,0 +1,25 @@
+{
+  "eval_name": "scheduler-flow",
+  "expectations": [
+    {
+      "text": "Identifies 03-scheduler.md as primary documentation",
+      "passed": true,
+      "evidence": "with-skill impact_report.md lists `wiki/docs/projects/sglang-jax/03-scheduler.md` under 需要更新 because `scheduler.py` delegates prefill token-budget computation to `ScheduleBatch.compute_prefill_token_budget`."
+    },
+    {
+      "text": "Considers 04-model-executor.md only if the batch-to-worker boundary is affected",
+      "passed": true,
+      "evidence": "with-skill impact_report.md lists `wiki/docs/projects/sglang-jax/04-model-executor.md` under 不需要更新 and explains executor still receives prepared batches; no batch-to-worker interface or executor responsibility change is shown."
+    },
+    {
+      "text": "Uses section restructuring when a simple appended note would make the scheduler chapter patchy",
+      "passed": true,
+      "evidence": "with-skill update_plan.md chooses `章节重构` for `03-scheduler.md` and says a simple appended note would create a patch-like contradiction."
+    },
+    {
+      "text": "Explains why overview docs are or are not updated",
+      "passed": true,
+      "evidence": "with-skill impact_report.md lists `wiki/docs/projects/sglang-jax/01-architecture-overview.md` under 不需要更新 because the change is internal to scheduler/`ScheduleBatch` responsibilities and does not alter overview-level component relationships."
+    }
+  ]
+}

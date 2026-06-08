@@ -1,0 +1,11 @@
+{
+  "eval_id": 1,
+  "eval_name": "config-field",
+  "prompt": "You are maintaining sglang-jax Chinese architecture docs. In an isolated copy of /Users/lianfang/primatrix, simulate a branch change that adds a ServerArgs field named enable_hybrid_memory_pool in sglang-jax/server_args.py and uses it in srt/mem_cache/memory_pool.py. Update the wiki docs as appropriate. Before editing, report docs impact and an update plan. After editing, report validation. Save all changed files and final report under outputs/.",
+  "assertions": [
+    "Identifies 13-configuration-reference.md as needing update",
+    "Considers 07-kv-cache.md because memory_pool.py is involved",
+    "Does not include PR numbers, commit hashes, or code line numbers in final docs",
+    "Uses an update plan before modifying docs"
+  ]
+}

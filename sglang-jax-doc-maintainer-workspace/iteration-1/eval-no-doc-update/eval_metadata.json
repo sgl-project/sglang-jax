@@ -1,0 +1,11 @@
+{
+  "eval_id": 4,
+  "eval_name": "no-doc-update",
+  "prompt": "You are maintaining sglang-jax Chinese architecture docs. In an isolated copy of /Users/lianfang/primatrix, simulate a change that only updates sglang-jax/.github/workflows/lint.yml cache keys and fixes formatting in sglang-jax/test/srt/test_qwen3_0_6b_cpu.py. Decide whether wiki docs need changes. Save the impact report and any changed files under outputs/.",
+  "assertions": [
+    "Reports that no architecture docs need updating",
+    "Explains that CI cache and test formatting do not affect documented architecture",
+    "Leaves wiki docs unchanged",
+    "Still provides a validation statement"
+  ]
+}

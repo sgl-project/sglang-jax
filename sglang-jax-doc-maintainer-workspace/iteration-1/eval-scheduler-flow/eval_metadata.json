@@ -1,0 +1,11 @@
+{
+  "eval_id": 2,
+  "eval_name": "scheduler-flow",
+  "prompt": "You are maintaining sglang-jax Chinese architecture docs. In an isolated copy of /Users/lianfang/primatrix, simulate a scheduler change that moves part of prefill token budgeting from sglang-jax/srt/managers/scheduler.py into sglang-jax/srt/managers/schedule_batch.py. Update the wiki docs as appropriate. Before editing, report docs impact and an update plan. After editing, report validation. Save all changed files and final report under outputs/.",
+  "assertions": [
+    "Identifies 03-scheduler.md as primary documentation",
+    "Considers 04-model-executor.md only if the batch-to-worker boundary is affected",
+    "Uses section restructuring when a simple appended note would make the scheduler chapter patchy",
+    "Explains why overview docs are or are not updated"
+  ]
+}

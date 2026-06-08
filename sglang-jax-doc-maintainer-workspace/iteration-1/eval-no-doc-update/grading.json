@@ -1,0 +1,25 @@
+{
+  "eval_name": "no-doc-update",
+  "expectations": [
+    {
+      "text": "Reports that no architecture docs need updating",
+      "passed": true,
+      "evidence": "with-skill impact_report.md says 需要更新: 无 because the inputs only affect CI cache keys and test assertion formatting, not architecture, runtime flow, module responsibility, public config, or documented behavior."
+    },
+    {
+      "text": "Explains that CI cache and test formatting do not affect documented architecture",
+      "passed": true,
+      "evidence": "with-skill impact_report.md and update_plan.md explicitly state CI cache key changes are maintenance/execution details and test formatting does not change scheduler behavior or documented semantics."
+    },
+    {
+      "text": "Leaves wiki docs unchanged",
+      "passed": true,
+      "evidence": "with-skill outputs for no-doc-update contain no `docs/` changed-doc artifacts; validation_report.md states no simulated docs files were produced and real `/Users/lianfang/primatrix/wiki` was not modified."
+    },
+    {
+      "text": "Still provides a validation statement",
+      "passed": true,
+      "evidence": "with-skill validation_report.md includes validation for diff scope, PR/commit trace absence, reference-check non-applicability, and docs build not run because there were no documentation edits."
+    }
+  ]
+}

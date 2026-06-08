@@ -1,0 +1,25 @@
+{
+  "eval_name": "attention-backend",
+  "expectations": [
+    {
+      "text": "Identifies 06-layers-and-attention.md as primary documentation",
+      "passed": true,
+      "evidence": "with-skill impact_report.md lists `wiki/docs/projects/sglang-jax/06-layers-and-attention.md` under 需要更新 for the new `BlockSparseAttentionBackend` and selector entry."
+    },
+    {
+      "text": "Uses external research only for general mature-technology background",
+      "passed": true,
+      "evidence": "simulated `docs/06-layers-and-attention.md` has a separate `通用背景：Block Sparse Attention` section and validation_report.md states external material is limited to mature general background."
+    },
+    {
+      "text": "Separates general motivation from sglang-jax implementation facts",
+      "passed": true,
+      "evidence": "simulated `docs/06-layers-and-attention.md` separates `通用背景：Block Sparse Attention` from `sglang-jax 实现边界`, where project facts cite `backend_selector.py`, `BlockSparseAttentionBackend`, `forward_extend`, and `block_mask`."
+    },
+    {
+      "text": "Avoids unsupported performance claims",
+      "passed": true,
+      "evidence": "simulated final doc explicitly says throughput, memory, hardware coverage, and default strategy require more code or benchmarks; validation_report.md records no throughput/speedup/显著提升/节省显存/default-enable claims."
+    }
+  ]
+}

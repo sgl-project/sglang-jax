@@ -1,0 +1,11 @@
+{
+  "eval_id": 3,
+  "eval_name": "attention-backend",
+  "prompt": "You are maintaining sglang-jax Chinese architecture docs. In an isolated copy of /Users/lianfang/primatrix, simulate adding a new attention backend file under sglang-jax/srt/layers/attention/ named block_sparse_attention_backend.py and a selector entry that can choose it. Update the wiki docs as appropriate. You may use external research for general block sparse attention background, but project-specific claims must come from code. Before editing, report docs impact and an update plan. After editing, report validation. Save all changed files and final report under outputs/.",
+  "assertions": [
+    "Identifies 06-layers-and-attention.md as primary documentation",
+    "Uses external research only for general mature-technology background",
+    "Separates general motivation from sglang-jax implementation facts",
+    "Avoids unsupported performance claims"
+  ]
+}

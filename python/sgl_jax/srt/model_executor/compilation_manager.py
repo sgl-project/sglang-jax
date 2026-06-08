@@ -4,6 +4,7 @@ import itertools
 import logging
 import time
 from collections.abc import Callable
+from math import gcd as _gcd
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -48,6 +49,9 @@ class CompilationManager:
         self.has_recurrent_state = has_recurrent_state
         self.moe_backend = server_args.moe_backend
         self.enable_static_lora = server_args.enable_static_lora
+        # Fused MoE shards tokens across EP (local = num_tokens // ep_size) and REQUIRES
+        # num_tokens % ep_size == 0; precompile decode buckets (=batch size) must honor it.
+        self.ep_size = getattr(server_args, "ep_size", 1) or 1
 
         self.token_buckets = self._compute_token_buckets(server_args.precompile_token_paddings)
         self.bs_buckets = self._compute_bs_buckets(server_args.precompile_bs_paddings)
@@ -60,10 +64,17 @@ class CompilationManager:
         if user_paddings is None:
             user_paddings = [item * dp_size for item in PRECOMPILE_DEFAULT_TOKEN_PADDINGS]
 
+        fused = self.moe_backend == "fused"
+        # Fused MoE also splits prefill/extend tokens across EP, so token buckets must be
+        # multiples of ep_size (in addition to dp_size).
+        align = dp_size
+        if fused:
+            align = dp_size * self.ep_size // _gcd(dp_size, self.ep_size)  # lcm(dp, ep)
+
         buckets = []
         for item in user_paddings:
-            if item % dp_size != 0:
-                item = (item // dp_size) * dp_size
+            if item % align != 0:
+                item = ((item + align - 1) // align) * align
             if (
                 item >= self.max_padded_batch_size
                 and item <= self.max_padded_num_tokens
@@ -72,24 +83,35 @@ class CompilationManager:
                 buckets.append(item)
 
         buckets.sort()
-        if len(buckets) == 0 or buckets[-1] < self.max_padded_num_tokens:
-            buckets.append(self.max_padded_num_tokens)
+        max_bucket = self.max_padded_num_tokens
+        if fused and max_bucket % self.ep_size != 0:
+            max_bucket = ((max_bucket + self.ep_size - 1) // self.ep_size) * self.ep_size
+        if len(buckets) == 0 or buckets[-1] < max_bucket:
+            buckets.append(max_bucket)
 
         return buckets
 
     def _compute_bs_buckets(self, user_paddings: list[int] | None) -> list[int]:
         bs_list = user_paddings if user_paddings is not None else PRECOMPILE_DEFAULT_BS_PADDINGS
+        fused = self.moe_backend == "fused"
+        # Fused MoE requires every compiled batch size (decode num_tokens) to be a
+        # multiple of ep_size, not merely >= tp_size*2 (with separate EP/TP these differ,
+        # e.g. ep_size=16, attn tp_size=4 — bs=8 passed the old guard but crashes the
+        # fused kernel's num_tokens // ep_size split).
         buckets = []
         for bs in bs_list:
-            if (
-                bs <= self.max_padded_batch_size
-                and (self.moe_backend != "fused" or bs >= self.tp_size * 2)
-                and bs >= self.dp_size
-            ):
-                buckets.append(bs)
+            if bs > self.max_padded_batch_size or bs < self.dp_size:
+                continue
+            if fused and bs % self.ep_size != 0:
+                continue
+            buckets.append(bs)
         buckets.sort()
-        if len(buckets) == 0 or buckets[-1] < self.max_padded_batch_size:
-            buckets.append(self.max_padded_batch_size)
+        # Force-append a final bucket covering max batch; align it to ep_size for fused.
+        max_bucket = self.max_padded_batch_size
+        if fused and max_bucket % self.ep_size != 0:
+            max_bucket = ((max_bucket + self.ep_size - 1) // self.ep_size) * self.ep_size
+        if len(buckets) == 0 or buckets[-1] < max_bucket:
+            buckets.append(max_bucket)
         return buckets
 
     def _compute_cache_loc_buckets(self) -> list[int]:
