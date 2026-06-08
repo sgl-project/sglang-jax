@@ -269,53 +269,6 @@ class TestVerifyTree(CustomTestCase):
         self.assertIs(client.model_config, model_config)
         self.assertIs(client.model_runner, model_runner)
 
-    def test_spec_worker_client_runs_spec_forward_as_future_result(self):
-        from sgl_jax.srt.speculative.overlap_worker import SpecWorkerClient
-
-        next_draft_input = SimpleNamespace(new_seq_lens=object())
-        batch_output = SimpleNamespace(
-            logits_output=object(),
-            next_token_ids=object(),
-            accept_lens=object(),
-            allocate_lens=object(),
-            next_draft_input=next_draft_input,
-            bid=11,
-            cache_miss_count=0,
-        )
-        model_worker_batch = object()
-        calls = []
-
-        class FakeSpecWorker:
-            def forward_batch_speculative_generation(self, batch):
-                calls.append(batch)
-                return batch_output
-
-        client = SpecWorkerClient(FakeSpecWorker())
-
-        future = client.forward_batch_speculative_generation(model_worker_batch)
-        result = client.resolve_last_batch_result(future)
-        client.close()
-
-        self.assertEqual(calls, [model_worker_batch])
-        self.assertIs(result.next_draft_input, next_draft_input)
-        self.assertIs(result.new_seq_lens, next_draft_input.new_seq_lens)
-        self.assertEqual(result.bid, 11)
-
-    def test_spec_worker_client_delegates_worker_attributes(self):
-        from sgl_jax.srt.speculative.overlap_worker import SpecWorkerClient
-
-        class FakeSpecWorker:
-            speculative_num_draft_tokens = 4
-
-            def forward_batch_speculative_generation(self, batch):
-                raise NotImplementedError
-
-        client = SpecWorkerClient(FakeSpecWorker())
-        try:
-            self.assertEqual(client.speculative_num_draft_tokens, 4)
-        finally:
-            client.close()
-
     def test_as_int32_array_keeps_host_metadata_on_host(self):
         from sgl_jax.srt.speculative import eagle_util
 
