@@ -1058,11 +1058,6 @@ def spec_decode_verify_phase(spec_worker, model_worker_batch, cur_allocate_lens)
 def spec_decode_draft_extend_phase(spec_worker, model_worker_batch, batch_output):
     """Run MTP draft extend as the second speculative decode JIT."""
     spec_worker.draft_worker.draft_extend_for_decode(model_worker_batch, batch_output)
-
-    new_seq_lens = batch_output.next_draft_input.new_seq_lens
-    sel = np.asarray(model_worker_batch.logits_indices_selector)
-    if new_seq_lens is not None and getattr(new_seq_lens, "shape", (0,))[0] > len(sel):
-        batch_output.next_draft_input.new_seq_lens = np.asarray(new_seq_lens)[sel]
     return batch_output
 
 
