@@ -5,7 +5,7 @@ import sys
 import jax
 import jax.numpy as jnp
 import numpy as np
-from utils import create_decode_uniform_data, create_prefill_uniform_data
+from utils import create_mla_decode_uniform_data, create_mla_mixed_uniform_data
 
 from sgl_jax.srt.kernels.mla.v2.kernel import mla_ragged_paged_attention
 from sgl_jax.srt.kernels.utils.perf import multiple_iteration_timeit_from_trace
@@ -48,7 +48,7 @@ def benchmark_backend(
             seq_lens,
             _,
             distribution,
-        ) = create_prefill_uniform_data(
+        ) = create_mla_mixed_uniform_data(
             max_context_len,
             max_kv_cache_tokens,
             max_num_batched_tokens,
@@ -73,7 +73,7 @@ def benchmark_backend(
             seq_lens,
             _,
             distribution,
-        ) = create_decode_uniform_data(
+        ) = create_mla_decode_uniform_data(
             max_context_len,
             max_kv_cache_tokens,
             max_num_batched_tokens,
