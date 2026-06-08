@@ -1017,10 +1017,6 @@ def spec_decode_verify_phase(spec_worker, model_worker_batch, cur_allocate_lens)
 
     target_mr.memory_pools.replace_all(target_pool_updates)
 
-    jax.copy_to_host_async(prepared_accept_lens)
-    jax.copy_to_host_async(prepared_predict)
-    jax.copy_to_host_async(prepared_new_seq_lens)
-
     next_draft_input = EagleDraftInput(
         verified_id=prepared_verified_id,
         new_seq_lens=prepared_new_seq_lens,
@@ -1065,12 +1061,7 @@ def spec_decode(spec_worker, model_worker_batch, cur_allocate_lens):
 
 def spec_decode_overlap(spec_worker, model_worker_batch, cur_allocate_lens):
     """Launch decode verify and draft-extend without restoring draft results inline."""
-    from sgl_jax.srt.speculative.overlap_future import (
-        resolve_spec_decode_scheduler_fields,
-    )
-
     batch_output = spec_decode_verify_phase(spec_worker, model_worker_batch, cur_allocate_lens)
-    scheduler_fields = resolve_spec_decode_scheduler_fields(batch_output)
     pending_draft_extend_result = SpecDecodePendingDraftExtendResult(
         draft_worker=spec_worker.draft_worker,
         model_worker_batch=model_worker_batch,
@@ -1080,6 +1071,9 @@ def spec_decode_overlap(spec_worker, model_worker_batch, cur_allocate_lens):
             batch_output,
         ),
     )
+    from sgl_jax.srt.speculative.overlap_future import publish_spec_decode_new_seq_lens
+
+    publish_fields = publish_spec_decode_new_seq_lens(batch_output)
     batch_output.pending_draft_extend_result = pending_draft_extend_result
     batch_output.next_draft_input.pending_draft_extend_result = pending_draft_extend_result
-    return batch_output, scheduler_fields
+    return batch_output, publish_fields

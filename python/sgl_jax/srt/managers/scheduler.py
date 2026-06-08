@@ -79,7 +79,7 @@ from sgl_jax.srt.server_args import PortArgs, ServerArgs
 from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
 from sgl_jax.srt.speculative.overlap_future import (
     can_use_spec_decode_overlap,
-    resolve_spec_decode_scheduler_fields,
+    publish_spec_decode_new_seq_lens,
 )
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 from sgl_jax.srt.utils.common_utils import (
@@ -118,7 +118,7 @@ class ReceiveDataError(Exception):
 @dataclass
 class GenerationBatchResult:
     logits_output: LogitsProcessorOutput | None
-    next_token_ids: list[int] | None
+    next_token_ids: object | None
     extend_input_len_per_req: list[int]
     extend_logprob_start_len_per_req: list[int]
     bid: int
@@ -918,7 +918,9 @@ class Scheduler(
                         mesh=self.mesh,
                     )
                     tmp_batch.forward_mode = ForwardMode.DUMMY_FIRST
-                    tmp_batch.next_batch_sampling_info = self.tp_worker.cur_sampling_info
+                    tmp_batch.next_batch_sampling_info = (
+                        self._current_sampling_info_owner().cur_sampling_info
+                    )
                     with jax.profiler.TraceAnnotation("process_batch_result"):
                         self.process_batch_result(tmp_batch, None, batch.launch_done)
 
@@ -926,7 +928,7 @@ class Scheduler(
                 # Process the results of the last batch
                 tmp_batch, tmp_result = self.result_queue.popleft()
                 tmp_batch.next_batch_sampling_info = (
-                    self.tp_worker.cur_sampling_info if batch else None
+                    self._current_sampling_info_owner().cur_sampling_info if batch else None
                 )
                 # NOTE: we should use current launched batch's launch_done event Instead of the last batch's
                 self.process_batch_result(
@@ -1926,15 +1928,15 @@ class Scheduler(
                     draft_token_num=self.draft_worker.speculative_num_draft_tokens,
                 )
             if can_use_spec_decode_overlap(self.enable_overlap, self.spec_algorithm, batch):
-                batch_output, scheduler_fields = (
+                batch_output, publish_fields = (
                     self.draft_worker.forward_batch_speculative_decode_overlap(model_worker_batch)
                 )
             else:
                 batch_output = self.draft_worker.forward_batch_speculative_generation(
                     model_worker_batch
                 )
-                scheduler_fields = (
-                    resolve_spec_decode_scheduler_fields(batch_output)
+                publish_fields = (
+                    publish_spec_decode_new_seq_lens(batch_output)
                     if batch.forward_mode.is_decode()
                     else None
                 )
@@ -1943,22 +1945,25 @@ class Scheduler(
             )
             for r, s in enumerate(per_rank_spec):
                 batch.reqs_info[r].spec_info = s
-            accept = scheduler_fields.accept_lens if scheduler_fields is not None else None
+            new_seq_lens = publish_fields.new_seq_lens if publish_fields is not None else None
             per_dp_bs = model_worker_batch.per_dp_bs_size
             for dp_rank, info in enumerate(batch.reqs_info):
                 if info.seq_lens is None or len(info.seq_lens) == 0:
                     continue
-                if accept is not None:
+                if new_seq_lens is not None:
                     off = dp_rank * per_dp_bs
-                    info.seq_lens = info.seq_lens + accept[off : off + len(info.seq_lens)]
+                    info.seq_lens = new_seq_lens[off : off + len(info.seq_lens)]
                 else:
                     info.seq_lens = info.seq_lens + 1
-            next_token_ids = (
-                scheduler_fields.next_token_ids
-                if scheduler_fields is not None
-                else np.asarray(jax.device_get(batch_output.next_token_ids))
+            defer_spec_decode_output = (
+                self.enable_overlap
+                and batch.forward_mode.is_decode()
+                and self.spec_algorithm is not None
+                and not self.spec_algorithm.is_none()
             )
-            self._extract_dp_output_ids(next_token_ids, model_worker_batch, batch)
+            if not defer_spec_decode_output:
+                next_token_ids = np.asarray(jax.device_get(batch_output.next_token_ids))
+                self._extract_dp_output_ids(next_token_ids, model_worker_batch, batch)
             logits_output = batch_output.logits_output
             cache_miss_count = batch_output.cache_miss_count
         bid = model_worker_batch.bid
@@ -1987,7 +1992,16 @@ class Scheduler(
 
         ret = GenerationBatchResult(
             logits_output=logits_output,
-            next_token_ids=next_token_ids.tolist(),
+            next_token_ids=(
+                batch_output.next_token_ids
+                if (
+                    self.spec_algorithm is not None
+                    and self.spec_algorithm.is_eagle()
+                    and batch.forward_mode.is_decode()
+                    and self.enable_overlap
+                )
+                else next_token_ids.tolist()
+            ),
             extend_input_len_per_req=extend_input_len_per_req,
             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
             bid=bid,
@@ -2044,6 +2058,11 @@ class Scheduler(
             if batch.next_batch_sampling_info.grammars is not None:
                 batch.next_batch_sampling_info.update_grammar_vocab_mask()
             batch.next_batch_sampling_info.sampling_info_done.set()
+
+    def _current_sampling_info_owner(self):
+        if self.spec_algorithm is not None and not self.spec_algorithm.is_none():
+            return self.draft_worker
+        return self.tp_worker
 
     def watchdog_thread(self):
         """A watch dog thread that will try to kill the server itself if one forward batch takes too long."""

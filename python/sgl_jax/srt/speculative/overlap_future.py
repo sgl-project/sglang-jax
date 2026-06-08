@@ -16,11 +16,18 @@ class SpecDecodeFutureResult:
     cache_miss_count: int
 
 
-@dataclass
-class SpecDecodeSchedulerFields:
-    next_token_ids: np.ndarray
-    accept_lens: np.ndarray | None
-    new_seq_lens: np.ndarray | None
+class SpecDecodePublishFields:
+    def __init__(self, *, new_seq_lens):
+        self._new_seq_lens = new_seq_lens
+        self._new_seq_lens_host = None
+
+        _prefetch_to_host(new_seq_lens)
+
+    @property
+    def new_seq_lens(self) -> np.ndarray | None:
+        if self._new_seq_lens_host is None:
+            self._new_seq_lens_host = _device_to_numpy(self._new_seq_lens)
+        return self._new_seq_lens_host
 
 
 def make_spec_decode_future_result(batch_output):
@@ -37,19 +44,23 @@ def make_spec_decode_future_result(batch_output):
     )
 
 
+def _prefetch_to_host(value):
+    if value is None:
+        return
+    if hasattr(value, "copy_to_host_async"):
+        value.copy_to_host_async()
+
+
 def _device_to_numpy(value):
     if value is None:
         return None
-    if hasattr(value, "copy_to_host_async"):
-        value.copy_to_host_async()
+    _prefetch_to_host(value)
     return np.asarray(jax.device_get(value))
 
 
-def resolve_spec_decode_scheduler_fields(future_result):
-    return SpecDecodeSchedulerFields(
-        next_token_ids=_device_to_numpy(future_result.next_token_ids),
-        accept_lens=_device_to_numpy(future_result.accept_lens),
-        new_seq_lens=_device_to_numpy(future_result.new_seq_lens),
+def publish_spec_decode_new_seq_lens(future_result):
+    return SpecDecodePublishFields(
+        new_seq_lens=future_result.new_seq_lens,
     )
 
 

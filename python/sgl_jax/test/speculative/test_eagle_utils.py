@@ -1,6 +1,7 @@
 import inspect
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import jax
 import jax.numpy as jnp
@@ -110,8 +111,20 @@ class TestVerifyTree(CustomTestCase):
         self.assertTrue(hasattr(draft_extend_fused, "spec_decode_overlap"))
         source = inspect.getsource(draft_extend_fused.spec_decode_overlap)
         self.assertIn("spec_decode_verify_phase", source)
-        self.assertIn("resolve_spec_decode_scheduler_fields", source)
+        self.assertIn("publish_spec_decode_new_seq_lens", source)
         self.assertIn("launch_fused_draft_extend_for_decode", source)
+        self.assertLess(
+            source.index("launch_fused_draft_extend_for_decode"),
+            source.index("publish_spec_decode_new_seq_lens"),
+        )
+
+    def test_spec_decode_verify_phase_does_not_prefetch_publish_or_result_fields(self):
+        from sgl_jax.srt.speculative import draft_extend_fused
+
+        source = inspect.getsource(draft_extend_fused.spec_decode_verify_phase)
+        self.assertNotIn("copy_to_host_async(prepared_accept_lens)", source)
+        self.assertNotIn("copy_to_host_async(prepared_predict)", source)
+        self.assertNotIn("copy_to_host_async(prepared_new_seq_lens)", source)
 
     def test_spec_decode_overlap_does_not_restore_draft_extend_inline(self):
         from sgl_jax.srt.speculative import draft_extend_fused
@@ -201,13 +214,24 @@ class TestVerifyTree(CustomTestCase):
 
         worker = BaseSpecWorker.__new__(BaseSpecWorker)
         worker._can_use_fused_spec_decode = True
+        worker._prepare_overlap_sampling_info = mock.Mock()
         batch = SimpleNamespace(
             forward_mode=SimpleNamespace(is_decode=lambda: False),
             sampling_info=SimpleNamespace(is_all_greedy=True),
         )
 
-        with self.assertRaises(NotImplementedError):
+        with self.assertRaisesRegex(NotImplementedError, "decode-overlap entry"):
             worker.forward_batch_speculative_decode_overlap(batch)
+        worker._prepare_overlap_sampling_info.assert_not_called()
+
+    def test_base_spec_worker_prepares_overlap_sampling_info(self):
+        from sgl_jax.srt.speculative.base_worker import BaseSpecWorker
+
+        self.assertTrue(hasattr(BaseSpecWorker, "_prepare_overlap_sampling_info"))
+        decode_source = inspect.getsource(BaseSpecWorker.forward_batch_speculative_decode_overlap)
+        generation_source = inspect.getsource(BaseSpecWorker.forward_batch_speculative_generation)
+        self.assertIn("_prepare_overlap_sampling_info", decode_source)
+        self.assertIn("_prepare_overlap_sampling_info", generation_source)
 
     def test_spec_decode_future_result_contract_fields(self):
         from sgl_jax.srt.speculative import overlap_future
@@ -264,7 +288,7 @@ class TestVerifyTree(CustomTestCase):
         self.assertEqual(future_result.bid, 7)
         self.assertEqual(future_result.cache_miss_count, 0)
 
-    def test_resolve_spec_decode_scheduler_fields_only_materializes_scheduler_data(
+    def test_publish_spec_decode_new_seq_lens_prefetches_only_new_seq_lens(
         self,
     ):
         from sgl_jax.srt.speculative import overlap_future
@@ -273,16 +297,29 @@ class TestVerifyTree(CustomTestCase):
             def __array__(self, dtype=None):
                 raise AssertionError("deferred draft state must not be materialized")
 
+        class LazyDeviceValue:
+            def __init__(self):
+                self.prefetch_count = 0
+
+            def copy_to_host_async(self):
+                self.prefetch_count += 1
+
+            def __array__(self, dtype=None):
+                raise AssertionError("published field must be materialized lazily")
+
+        next_token_ids = LazyDeviceValue()
+        accept_lens = LazyDeviceValue()
+        new_seq_lens = LazyDeviceValue()
         next_draft_input = SimpleNamespace(
-            new_seq_lens=jnp.array([4, 7], dtype=jnp.int32),
+            new_seq_lens=new_seq_lens,
             hidden_states=DeferredState(),
             topk_index=DeferredState(),
             verified_id=DeferredState(),
         )
         future_result = overlap_future.SpecDecodeFutureResult(
             logits_output=None,
-            next_token_ids=jnp.array([[10, 11, 12], [20, 21, 22]], dtype=jnp.int32),
-            accept_lens=jnp.array([2, 1], dtype=jnp.int32),
+            next_token_ids=next_token_ids,
+            accept_lens=accept_lens,
             new_seq_lens=next_draft_input.new_seq_lens,
             allocate_lens=None,
             next_draft_input=next_draft_input,
@@ -290,13 +327,29 @@ class TestVerifyTree(CustomTestCase):
             cache_miss_count=0,
         )
 
-        fields = overlap_future.resolve_spec_decode_scheduler_fields(future_result)
+        fields = overlap_future.publish_spec_decode_new_seq_lens(future_result)
 
-        np.testing.assert_array_equal(
-            fields.next_token_ids,
-            np.array([[10, 11, 12], [20, 21, 22]], dtype=np.int32),
+        self.assertEqual(next_token_ids.prefetch_count, 0)
+        self.assertEqual(accept_lens.prefetch_count, 0)
+        self.assertEqual(new_seq_lens.prefetch_count, 1)
+        self.assertIsNotNone(fields)
+
+    def test_spec_decode_publish_fields_materializes_new_seq_lens_on_access(self):
+        from sgl_jax.srt.speculative import overlap_future
+
+        future_result = overlap_future.SpecDecodeFutureResult(
+            logits_output=None,
+            next_token_ids=jnp.array([[10, 11, 12], [20, 21, 22]], dtype=jnp.int32),
+            accept_lens=jnp.array([2, 1], dtype=jnp.int32),
+            new_seq_lens=jnp.array([4, 7], dtype=jnp.int32),
+            allocate_lens=None,
+            next_draft_input=None,
+            bid=0,
+            cache_miss_count=0,
         )
-        np.testing.assert_array_equal(fields.accept_lens, np.array([2, 1], dtype=np.int32))
+
+        fields = overlap_future.publish_spec_decode_new_seq_lens(future_result)
+
         np.testing.assert_array_equal(fields.new_seq_lens, np.array([4, 7], dtype=np.int32))
 
     def test_can_use_spec_decode_overlap_gate_lives_under_speculative(self):
@@ -360,11 +413,11 @@ class TestVerifyTree(CustomTestCase):
             )
         )
 
-    def test_scheduler_spec_decode_resolve_delegates_to_speculative_helper(self):
+    def test_scheduler_spec_decode_publish_delegates_to_speculative_helper(self):
         from sgl_jax.srt.managers.scheduler import Scheduler
 
         source = inspect.getsource(Scheduler.run_batch)
-        self.assertIn("resolve_spec_decode_scheduler_fields", source)
+        self.assertIn("publish_spec_decode_new_seq_lens", source)
 
     def test_scheduler_spec_decode_overlap_calls_worker_overlap_entry(self):
         from sgl_jax.srt.managers.scheduler import Scheduler
@@ -372,6 +425,14 @@ class TestVerifyTree(CustomTestCase):
         source = inspect.getsource(Scheduler.run_batch)
         self.assertIn("can_use_spec_decode_overlap", source)
         self.assertIn("forward_batch_speculative_decode_overlap", source)
+
+    def test_overlap_scheduler_uses_spec_sampling_info_owner(self):
+        from sgl_jax.srt.managers.scheduler import Scheduler
+
+        self.assertTrue(hasattr(Scheduler, "_current_sampling_info_owner"))
+        source = inspect.getsource(Scheduler.event_loop_overlap)
+        self.assertIn("_current_sampling_info_owner()", source)
+        self.assertNotIn("self.tp_worker.cur_sampling_info", source)
 
     def test_server_args_allow_supported_spec_overlap_configuration(self):
         from sgl_jax.srt.server_args import ServerArgs
@@ -410,14 +471,14 @@ class TestVerifyTree(CustomTestCase):
         self.assertIn("restore_spec_decode_pending_draft_extend_result", source)
         self.assertIn("launch_done.wait()", source)
 
-    def test_scheduler_spec_prefill_does_not_use_decode_scheduler_fields(self):
+    def test_scheduler_spec_prefill_does_not_use_decode_publish_fields(self):
         from sgl_jax.srt.managers.scheduler import Scheduler
 
         source = inspect.getsource(Scheduler.run_batch)
         extend_pos = source.index("batch.forward_mode.is_extend()")
         decode_pos = source.index("get_spec_model_worker_batch")
-        resolve_pos = source.index("resolve_spec_decode_scheduler_fields")
-        self.assertGreater(resolve_pos, decode_pos)
+        publish_pos = source.index("publish_spec_decode_new_seq_lens")
+        self.assertGreater(publish_pos, decode_pos)
         self.assertGreater(decode_pos, extend_pos)
 
     def test_model_worker_client_exposes_target_worker_attributes_for_spec(self):

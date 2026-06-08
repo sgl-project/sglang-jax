@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import dataclasses
+import threading
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING
 
@@ -118,12 +120,25 @@ class BaseSpecWorker:
 
     # -- Main entry point --
 
+    def _prepare_overlap_sampling_info(self, model_worker_batch: ModelWorkerBatch):
+        sampling_info = model_worker_batch.sampling_info
+        sampling_info.update_penalties()
+        model_worker_batch.sampling_info = self.cur_sampling_info = dataclasses.replace(
+            sampling_info,
+            sampling_info_done=threading.Event(),
+            penalizer_orchestrator=None,
+        )
+
     def forward_batch_speculative_decode_overlap(self, model_worker_batch: ModelWorkerBatch):
         if not model_worker_batch.forward_mode.is_decode():
-            raise NotImplementedError("Spec overlap entry only supports decode batches.")
+            raise NotImplementedError(
+                "Spec decode-overlap entry only supports decode batches; "
+                "prefill overlap uses forward_batch_speculative_generation()."
+            )
         if not (self._can_use_fused_spec_decode and model_worker_batch.sampling_info.is_all_greedy):
             raise NotImplementedError("Spec overlap entry only supports fused greedy decode.")
 
+        self._prepare_overlap_sampling_info(model_worker_batch)
         sel = model_worker_batch.logits_indices_selector
         cur_allocate_lens = np.asarray(model_worker_batch.spec_info_padded.allocate_lens)[sel]
 
@@ -134,6 +149,8 @@ class BaseSpecWorker:
     def forward_batch_speculative_generation(self, model_worker_batch: ModelWorkerBatch):
         from sgl_jax.srt.managers.scheduler import GenerationBatchResult
         from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
+
+        self._prepare_overlap_sampling_info(model_worker_batch)
 
         if model_worker_batch.forward_mode.is_extend():
             if self._can_use_fused_spec_prefill(model_worker_batch):
