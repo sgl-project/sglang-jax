@@ -34,55 +34,36 @@ def benchmark_backend(
     scale = (kv_lora_rank + qk_rope_head_dim) ** -0.5
 
     if not is_decode_only(max_num_batched_tokens):
-        (
-            ql_nope,
-            q_pe,
-            new_kv_c,
-            new_k_pe,
-            kv_cache,
-            kv_lens,
-            page_indices,
-            cu_q_lens,
-            cu_kv_lens,
-            num_seqs,
-            seq_lens,
-            _,
-            distribution,
-        ) = create_mla_mixed_uniform_data(
-            max_context_len,
-            max_kv_cache_tokens,
-            max_num_batched_tokens,
-            q_head_num,
-            kv_lora_rank,
-            qk_rope_head_dim,
+        data = create_mla_mixed_uniform_data(
+            max_num_tokens=max_num_batched_tokens,
+            num_q_heads=q_head_num,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
             page_size=page_size,
+            kv_len=max_context_len,
             dtype=dtype,
         )
     else:
-        (
-            ql_nope,
-            q_pe,
-            new_kv_c,
-            new_k_pe,
-            kv_cache,
-            kv_lens,
-            page_indices,
-            cu_q_lens,
-            cu_kv_lens,
-            num_seqs,
-            seq_lens,
-            _,
-            distribution,
-        ) = create_mla_decode_uniform_data(
-            max_context_len,
-            max_kv_cache_tokens,
-            max_num_batched_tokens,
-            q_head_num,
-            kv_lora_rank,
-            qk_rope_head_dim,
+        data = create_mla_decode_uniform_data(
+            max_num_tokens=max_num_batched_tokens,
+            num_q_heads=q_head_num,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
             page_size=page_size,
+            kv_len=max_context_len,
             dtype=dtype,
         )
+
+    ql_nope = data["ql_nope"]
+    q_pe = data["q_pe"]
+    new_kv_c = data["new_kv_c"]
+    new_k_pe = data["new_k_pe"]
+    kv_cache = data["cache_kv"]
+    kv_lens = data["kv_lens"]
+    page_indices = data["page_indices"]
+    cu_q_lens = data["cu_q_lens"]
+    cu_kv_lens = data["cu_kv_lens"]
+    distribution = data["distribution"]
 
     # Wrap the attention execution for JIT compilation
     @functools.partial(
