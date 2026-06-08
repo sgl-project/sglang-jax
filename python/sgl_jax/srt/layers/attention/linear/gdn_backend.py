@@ -7,9 +7,9 @@ pytree boilerplate. **Stateless** — owns no weights. The parent
 plus the ``A_log`` / ``dt_bias`` recurrence params; this backend reads
 them off ``layer.*`` at call time.
 
-The parent hands in already-sliced ``q`` / ``k`` / ``v`` (per
-decision #4 — the slice happens in the model layer). The backend
-re-concatenates them along the channel axis to feed the depthwise
+The parent hands in already-sliced ``q`` / ``k`` / ``v`` (the slice
+happens in the model layer). The backend re-concatenates them along
+the channel axis to feed the depthwise
 ``conv1d``; XLA collapses the slice→concat into a single slice of
 the upstream ``in_proj_qkvz`` activation, so this rebuild adds no
 HBM traffic.
@@ -60,12 +60,10 @@ def _mesh_tp_size(mesh: jax.sharding.Mesh) -> int:
 class GDNAttnBackend(LinearRecurrentAttnBackend):
     """Gated-DeltaNet attention backend.
 
-    Carries only shape metadata; weights live on the parent
-    :class:`RadixLinearAttention`. Dispatches conv1d + ragged delta-rule
-    (extend) or single-step delta-rule (decode) under ``jax.shard_map``.
-    Reads ``cu_q_lens`` / ``recurrent_indices`` / ``has_initial_state``
-    from ``self.forward_metadata``, populated by the base class's
-    :meth:`get_forward_metadata` before each forward.
+    Stateless (weights on the parent :class:`RadixLinearAttention`);
+    dispatches conv1d + ragged delta-rule (extend) or single-step delta-rule
+    (decode) under ``jax.shard_map``. Reads ``cu_q_lens`` /
+    ``recurrent_indices`` / ``has_initial_state`` off ``self.forward_metadata``.
     """
 
     def __init__(
@@ -134,25 +132,17 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
     ) -> tuple[jax.Array, tuple[jax.Array, jax.Array]]:
         """Dispatch by ``forward_batch.forward_mode``.
 
-        Per decision #4 the slice happens in the model layer; the backend
-        rebuilds ``mixed_qkv`` as the per-rank ``[q_d | k_d | v_d]`` block so
-        each TP shard sees its own head-striped channels (matching the
-        rank-major conv1d weight stripe). A plain ``concatenate([q,k,v])`` is
-        WRONG under TP>1: q/k/v have unequal per-device widths, so a concat
-        along the tensor-sharded axis yields the logical ``[Q|K|V]`` layout
-        (device 0 = all of Q, etc.), scrambling the depthwise-conv channels.
-        Reshaping each into ``[T, tp, *]`` rank-blocks before the concat keeps
-        the striping; it collapses to a plain ``[Q|K|V]`` at tp=1.
+        Rebuilds ``mixed_qkv`` as the per-rank ``[q_d | k_d | v_d]`` block so
+        each TP shard sees its own head-striped channels (matching the rank-major
+        conv1d weight stripe). A plain ``concatenate([q,k,v])`` is WRONG at TP>1:
+        q/k/v have unequal per-device widths, so concatenating along the sharded
+        axis gives the logical ``[Q|K|V]`` layout and scrambles the conv channels.
+        Reshaping to ``[T, tp, *]`` rank-blocks first preserves the stripe (and
+        collapses to plain ``[Q|K|V]`` at tp=1).
 
-        Fetches per-layer ``(recurrent_state, conv_state)`` from the pool
-        via the base class's :meth:`get_layer_cache`. ``conv_state`` is the
-        first (only) entry of the per-layer conv-state list — GDN uses a
-        single fused conv1d, so it needs exactly one conv buffer per layer
-        (vs. KDA, which keeps q/k/v conv states as three list entries).
-
-        Returns ``(core_attn_out, (new_rec_state, [new_conv_state]))``
-        matching the linear-backend contract consumed by
-        ``RadixLinearAttention``.
+        ``conv_state`` is the single fused-conv1d buffer (GDN keeps one per
+        layer, vs. KDA's three q/k/v entries). Returns ``(core_attn_out,
+        (new_rec_state, [new_conv_state]))`` per the linear-backend contract.
         """
         tp = _mesh_tp_size(self.mesh)
         T = q.shape[0]
