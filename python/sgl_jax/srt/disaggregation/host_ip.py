@@ -87,6 +87,10 @@ def _validate(ip: str, *, source: str) -> str:
     except ValueError:
         # Not a numeric IP — assume it's a routable DNS name.
         return ip
+    if isinstance(addr, ipaddress.IPv6Address):
+        mapped = addr.ipv4_mapped
+        if mapped is not None:
+            addr = mapped
     if addr.is_loopback or addr.is_unspecified:
         raise RuntimeError(
             f"host IP {ip!r} (from {source}) is a "
