@@ -4,16 +4,15 @@ Builds the first-token embedding sequence for MiMo-V2.5 omni requests by embeddi
 text and scattering each modality's understanding-tower features into their
 placeholder positions.
 
-Interface is modality-uniform and forward-looking:
+Interface is modality-uniform:
 
 - Towers mirror the HF checkpoint's own attribute names: ``self.audio_encoder``
-  (wired) and ``self.visual`` (the MiMoVL ViT shared by image+video, reserved).
+  (RVQ-codes audio tower) and ``self.visual`` (the MiMoVL ViT shared by image+video).
 - ``__call__`` keeps the full keyword surface (audio / image / video inputs) and
   runs the same ``_encode_<modality>`` -> ``_scatter_modality`` flow for each.
-- To add vision later: implement the ViT (``mimo_v2_5/vision_encoder.py``),
-  instantiate it as ``self.visual`` in ``__init__``, and add its weight mappings
-  in ``weights_mapping.py``. ``_encode_image`` / ``_encode_video`` then start
-  returning features with no further interface change.
+- The audio tower lives in ``mimo_v2_5/audio_encoder.py`` and the ViT in
+  ``mimo_v2_5/vision_encoder.py``; both are instantiated here and their weight
+  mappings merged in ``load_weights``.
 
 ``MiMoV25AudioUnderstandingEncoder`` is re-exported here for backward compatibility.
 """
@@ -107,7 +106,7 @@ class MiMoV2_5Embedding(nnx.Module):
         # config.vision_config when present; absent on audio-only checkpoints.
         vision_config = getattr(config, "vision_config", None)
         if vision_config is not None:
-            from sgl_jax.srt.multimodal.models.mimo_vision.vision_encoder import (
+            from sgl_jax.srt.multimodal.models.mimo_v2_5.vision_encoder import (
                 MiMoVisionTransformer,
             )
 
@@ -182,7 +181,7 @@ class MiMoV2_5Embedding(nnx.Module):
         if self.visual is not None:
             import dataclasses as _dc
 
-            from sgl_jax.srt.multimodal.models.mimo_vision.vision_encoder import (
+            from sgl_jax.srt.multimodal.models.mimo_v2_5.vision_encoder import (
                 create_mimo_vision_weight_mappings,
             )
 

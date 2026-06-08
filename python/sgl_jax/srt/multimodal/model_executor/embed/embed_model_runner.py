@@ -5,8 +5,6 @@ import math
 
 import jax
 import jax.numpy as jnp
-from jax.sharding import NamedSharding
-from jax.sharding import PartitionSpec as P
 from flax import nnx
 from transformers import AutoConfig
 
@@ -244,8 +242,12 @@ class EmbedModelRunner(BaseModelRunner):
         # stage's chips on large (video) inputs. device_put onto the CPU mesh keeps the
         # whole vision tower on host RAM. (Confirmed via [VISION-DEVICE] logging: input
         # pixel_values was landing on TpuDevice while the ViT weights were on CpuDevice.)
-        if self.mesh is not None:
-            replicated = NamedSharding(self.mesh, P())
+        mesh = getattr(self, "mesh", None)
+        if mesh is not None:
+            from jax.sharding import NamedSharding
+            from jax.sharding import PartitionSpec as P
+
+            replicated = NamedSharding(mesh, P())
 
             def _to_mesh(arr):
                 return jax.device_put(arr, replicated) if arr is not None else None

@@ -31,7 +31,7 @@ E2E_GRID_CASES = {
 class TestMiMoVisionEncoderE2E(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        from sgl_jax.srt.multimodal.models.mimo_vision.vision_encoder import (
+        from sgl_jax.srt.multimodal.models.mimo_v2_5.vision_encoder import (
             MiMoVisionTransformer,
         )
 
