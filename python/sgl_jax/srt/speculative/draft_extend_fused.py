@@ -92,7 +92,7 @@ def _greedy_prepare_draft_inputs(
     return GreedyDraftInputs(
         hidden_states=gathered_hidden,
         positions=gathered_positions,
-        new_seq_lens=seq_lens + accept_length,
+        new_seq_lens=seq_lens + accept_length + 1,
         select_index=select_index,
         verified_id=verified_id,
         accept_lens=accept_length,

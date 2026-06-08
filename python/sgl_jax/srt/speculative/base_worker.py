@@ -286,7 +286,7 @@ class BaseSpecWorker:
         logits_output.next_token_logits = logits_output.next_token_logits[safe_index, :]
         logits_output.hidden_states = logits_output.hidden_states[safe_index, :]
         model_worker_batch.positions = model_worker_batch.positions[safe_index]
-        new_seq_lens = model_worker_batch.seq_lens + accept_length
+        new_seq_lens = model_worker_batch.seq_lens + accept_length + 1
         next_draft_input = EagleDraftInput(
             verified_id=verified_id,
             new_seq_lens=new_seq_lens,
