@@ -9,6 +9,7 @@ association all behave identically wherever they appear.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from datetime import datetime, timezone
 from typing import Any
@@ -83,3 +84,19 @@ def issue_for_job(
 ) -> dict[str, Any] | None:
     """Resolve the issue record for a classification job dict."""
     return lookup_issue(index, job.get("name", ""), job.get("failure_type", ""))
+
+
+def load_ai_analysis(path: str | None) -> dict[str, dict[str, str]]:
+    """Read ai_analysis.json ({jobs:[{name,root_cause,fix}]}) indexed by job name.
+
+    Returns {} when absent/empty/malformed so analysis stays optional and a
+    broken AI step never blocks issues or Slack.
+    """
+    if not path or not os.path.isfile(path):
+        return {}
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return {j.get("name", ""): j for j in data.get("jobs", []) if j.get("name")}

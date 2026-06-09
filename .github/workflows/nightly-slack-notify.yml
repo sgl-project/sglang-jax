@@ -52,28 +52,6 @@ jobs:
           --commit-author "$COMMIT_AUTHOR"
           --slack-output slack_summary.txt
 
-      - name: Create or update CI failure issues
-        if: steps.classify.conclusion == 'success' && hashFiles('classification.json') != ''
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          RUN_ID: ${{ github.event.workflow_run.id || github.event.inputs.run_id }}
-          WORKFLOW_NAME: ${{ github.event.workflow_run.name || 'Manual Check' }}
-          RUN_URL: ${{ github.event.workflow_run.html_url || format('https://github.com/{0}/actions/runs/{1}', github.repository, github.event.inputs.run_id) }}
-          COMMIT_SHA: ${{ github.event.workflow_run.head_sha || 'N/A' }}
-          COMMIT_AUTHOR: ${{ github.event.workflow_run.head_commit.author.name || github.event.workflow_run.actor.login || 'unknown' }}
-          CI_FAILURE_FALLBACK_ASSIGNEES: ${{ vars.CI_FAILURE_FALLBACK_ASSIGNEES }}
-        run: >
-          python3 scripts/ci/ci_failure_issues.py
-          --repo "$REPO"
-          --run-id "$RUN_ID"
-          --workflow-name "$WORKFLOW_NAME"
-          --run-url "$RUN_URL"
-          --commit-sha "$COMMIT_SHA"
-          --commit-author "$COMMIT_AUTHOR"
-          --classification classification.json
-          --output failure_issues.json
-
       - name: AI bug analysis
         id: ai_analysis
         if: steps.classify.outputs.has_bugs == 'true'
@@ -109,20 +87,17 @@ jobs:
 
             ## Required output
 
-            Write a file `ai_bug_analysis.txt` for inclusion in a Slack
-            notification. State only the key point, broken into bullets so it
-            scans at a glance. Use exactly this format — one block per
-            bug-type job:
+            Write `ai_analysis.json` in the working directory with this exact
+            shape — one entry per bug-type job, key point only:
 
-            *<job_name>*
-            • Root cause: <one short sentence — the single key reason>
-            • Fix: <one short, actionable sentence>
+            {"jobs": [{"name": "<exact job name from classification.json>",
+                       "root_cause": "<one short sentence: the single key reason>",
+                       "fix": "<one short, actionable sentence>"}]}
 
             Rules:
-            - One line per bullet; no second sentence, no wrapping prose.
-            - Omit stack traces, code blocks, file:line dumps, and evidence —
-              that lives in the run logs, not the Slack alert.
-            - Keep the whole file under ~600 chars. Fewer, sharper words win.
+            - Use the exact job names from classification.json; bug-type jobs only.
+            - One sentence per field. No stack traces, code blocks, or file:line
+              dumps — those live in the run logs.
 
             ## Discipline
 
@@ -142,6 +117,29 @@ jobs:
           ANTHROPIC_DEFAULT_OPUS_MODEL: claude-opus-4-7
           ANTHROPIC_DEFAULT_HAIKU_MODEL: claude-opus-4-7
           CLAUDE_CODE_LOG_LEVEL: debug
+
+      - name: Create or update CI failure issues
+        if: always() && steps.classify.conclusion == 'success' && hashFiles('classification.json') != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id || github.event.inputs.run_id }}
+          WORKFLOW_NAME: ${{ github.event.workflow_run.name || 'Manual Check' }}
+          RUN_URL: ${{ github.event.workflow_run.html_url || format('https://github.com/{0}/actions/runs/{1}', github.repository, github.event.inputs.run_id) }}
+          COMMIT_SHA: ${{ github.event.workflow_run.head_sha || 'N/A' }}
+          COMMIT_AUTHOR: ${{ github.event.workflow_run.head_commit.author.name || github.event.workflow_run.actor.login || 'unknown' }}
+          CI_FAILURE_FALLBACK_ASSIGNEES: ${{ vars.CI_FAILURE_FALLBACK_ASSIGNEES }}
+        run: >
+          python3 scripts/ci/ci_failure_issues.py
+          --repo "$REPO"
+          --run-id "$RUN_ID"
+          --workflow-name "$WORKFLOW_NAME"
+          --run-url "$RUN_URL"
+          --commit-sha "$COMMIT_SHA"
+          --commit-author "$COMMIT_AUTHOR"
+          --classification classification.json
+          --ai-analysis ai_analysis.json
+          --output failure_issues.json
 
       - name: Find latest successful nightly
         if: always()
@@ -227,7 +225,7 @@ jobs:
             --commit-sha "$COMMIT_SHA"
             --commit-author "$COMMIT_AUTHOR"
             --from-classification classification.json
-            --ai-analysis ai_bug_analysis.txt
+            --ai-analysis ai_analysis.json
             --slack-output slack_summary.txt
           )
           if [ -f failure_issues.json ]; then
@@ -264,7 +262,7 @@ jobs:
             classification.json
             failure_issues.json
             nightly-status.json
-            ai_bug_analysis.txt
+            ai_analysis.json
             latest_successful_nightly.json
           retention-days: 14
           if-no-files-found: ignore

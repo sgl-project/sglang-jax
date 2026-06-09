@@ -90,5 +90,30 @@ class TestFailureIssueAssociation(unittest.TestCase):
         self.assertEqual(ci_common.load_failure_issues(None), {})
 
 
+class TestLoadAiAnalysis(unittest.TestCase):
+    def test_indexes_by_job_name(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "ai_analysis.json")
+            with open(path, "w") as f:
+                json.dump({"jobs": [{"name": "job-a", "root_cause": "rc", "fix": "fx"}]}, f)
+            index = ci_common.load_ai_analysis(path)
+            self.assertEqual(index["job-a"]["root_cause"], "rc")
+
+    def test_missing_path_returns_empty(self):
+        self.assertEqual(ci_common.load_ai_analysis(None), {})
+        self.assertEqual(ci_common.load_ai_analysis("/no/such/file.json"), {})
+
+    def test_malformed_returns_empty(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "ai_analysis.json")
+            with open(path, "w") as f:
+                f.write("not json{{")
+            self.assertEqual(ci_common.load_ai_analysis(path), {})
+
+
 if __name__ == "__main__":
     unittest.main()

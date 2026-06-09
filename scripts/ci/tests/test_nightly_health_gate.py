@@ -32,6 +32,37 @@ class TestCiFailureIssues(unittest.TestCase):
             "<!-- ci-failure-monitor:workflow=Nightly Test Daily;job=job-a;failure_type=bug -->",
         )
 
+    def test_issue_body_embeds_ai_analysis(self):
+        payload = ci_failure_issues.issue_payload(
+            workflow_name="Nightly Test Daily",
+            run_id="1",
+            run_url="u",
+            job=self._job(),
+            commit_sha="abc",
+            commit_author="me",
+            marker="<!--m-->",
+            timestamp="t",
+            assignees=[],
+            analysis={"root_cause": "null deref in foo", "fix": "guard it"},
+        )
+        self.assertIn("## Root cause (AI)", payload["body"])
+        self.assertIn("null deref in foo", payload["body"])
+        self.assertIn("Fix: guard it", payload["body"])
+
+    def test_issue_body_without_analysis_has_no_ai_section(self):
+        payload = ci_failure_issues.issue_payload(
+            workflow_name="Nightly Test Daily",
+            run_id="1",
+            run_url="u",
+            job=self._job(),
+            commit_sha="abc",
+            commit_author="me",
+            marker="<!--m-->",
+            timestamp="t",
+            assignees=[],
+        )
+        self.assertNotIn("Root cause (AI)", payload["body"])
+
     @patch.object(ci_failure_issues, "gh_json")
     def test_find_open_issue_uses_get_for_search_fields(self, gh_json):
         gh_json.return_value = {"items": []}

@@ -187,6 +187,17 @@ class TestFormatSlackSummary(unittest.TestCase):
         self.assertIn("job-a", summary)
         self.assertNotIn("Issue:", summary)
 
+    def test_includes_ai_root_cause_per_job(self):
+        jobs = self._make_jobs([("job-a", "bug")])
+        summary = format_slack_summary(
+            "https://run",
+            "abc1234567",
+            "author",
+            jobs,
+            analysis={"job-a": {"root_cause": "null deref in foo", "fix": "guard it"}},
+        )
+        self.assertIn("null deref in foo", summary)
+
 
 class TestFormatRegressionSummary(unittest.TestCase):
     """Test format_regression_summary output."""
@@ -256,12 +267,11 @@ class TestFormatRegressionSummary(unittest.TestCase):
         self.assertIn("*Root cause*\n• gate flipped below threshold", summary)
         self.assertIn("*Suggested fix*\n• loosen the gate", summary)
 
-    def test_long_field_is_clamped(self):
-        long_cause = "word " * 400  # ~2000 chars, far over the per-field cap
+    def test_field_not_truncated(self):
+        long_cause = "• " + "word " * 200  # long but under the Slack hard cap
         summary = format_regression_summary("abc1234", "https://run/1", "job-a", long_cause, "fix")
-        self.assertIn("…", summary)
-        # The clamp keeps the section well under the raw input length.
-        self.assertLess(len(summary), 1200)
+        self.assertIn(long_cause.strip(), summary)
+        self.assertNotIn("…", summary)
 
     def test_empty_fields_omit_sections(self):
         summary = format_regression_summary("abc1234", "https://run/1", "job-a", "", "")

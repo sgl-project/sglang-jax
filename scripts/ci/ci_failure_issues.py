@@ -19,7 +19,7 @@ import sys
 from typing import Any
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "utils"))
-from ci_common import gh_json, utc_now
+from ci_common import gh_json, load_ai_analysis, utc_now
 from failure_classifier import is_finish_gate
 
 ISSUE_MARKER_PREFIX = "ci-failure-monitor"
@@ -106,6 +106,16 @@ def failure_table(
     )
 
 
+def analysis_block(analysis: dict[str, str] | None) -> str:
+    """AI root-cause section for the issue body, or '' when no analysis exists."""
+    if not analysis or not analysis.get("root_cause"):
+        return ""
+    lines = ["## Root cause (AI)", f"- {analysis['root_cause']}"]
+    if analysis.get("fix"):
+        lines.append(f"- Fix: {analysis['fix']}")
+    return "\n".join(lines)
+
+
 def issue_payload(
     *,
     workflow_name: str,
@@ -117,6 +127,7 @@ def issue_payload(
     marker: str,
     timestamp: str,
     assignees: list[str],
+    analysis: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     title = f"[CI Failure] {workflow_name} / {job['name']} [{job['failure_type']}]"
     owner_note = (
@@ -133,13 +144,12 @@ def issue_payload(
         commit_author=commit_author,
         timestamp=timestamp,
     )
-    body = f"""{marker}
-## CI Failure
-
-{table}
-
-{owner_note}
-"""
+    parts = [marker, "## CI Failure", "", table]
+    block = analysis_block(analysis)
+    if block:
+        parts += ["", block]
+    parts += ["", owner_note, ""]
+    body = "\n".join(parts)
     payload: dict[str, Any] = {"title": title, "body": body}
     if assignees:
         payload["assignees"] = assignees
@@ -156,6 +166,7 @@ def comment_body(
     commit_author: str,
     marker: str,
     timestamp: str,
+    analysis: dict[str, str] | None = None,
 ) -> str:
     table = failure_table(
         workflow_name=workflow_name,
@@ -166,11 +177,12 @@ def comment_body(
         commit_author=commit_author,
         timestamp=timestamp,
     )
-    return f"""{marker}
-### CI Failure Recurrence
-
-{table}
-"""
+    parts = [marker, "### CI Failure Recurrence", "", table]
+    block = analysis_block(analysis)
+    if block:
+        parts += ["", block]
+    parts += [""]
+    return "\n".join(parts)
 
 
 def create_issue(repo: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -199,15 +211,18 @@ def process_failed_jobs(
     commit_sha: str,
     commit_author: str,
     failed_jobs: list[dict[str, Any]],
+    analysis: dict[str, dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     timestamp = utc_now()
     assignees = fallback_assignees()
+    analysis = analysis or {}
     records = []
 
     for job in failed_jobs:
         if is_finish_gate(job["name"]):
             continue
         marker = build_marker(workflow_name, job["name"], job["failure_type"])
+        job_analysis = analysis.get(job["name"])
         try:
             existing = find_open_issue(repo, marker)
             if existing:
@@ -223,6 +238,7 @@ def process_failed_jobs(
                         commit_author=commit_author,
                         marker=marker,
                         timestamp=timestamp,
+                        analysis=job_analysis,
                     ),
                 )
                 action = "updated"
@@ -245,6 +261,7 @@ def process_failed_jobs(
                             commit_author=commit_author,
                             marker=marker,
                             timestamp=timestamp,
+                            analysis=job_analysis,
                         ),
                     )
                     action = "updated"
@@ -263,6 +280,7 @@ def process_failed_jobs(
                             marker=marker,
                             timestamp=timestamp,
                             assignees=assignees,
+                            analysis=job_analysis,
                         ),
                     )
                     action = "created"
@@ -317,6 +335,7 @@ def main() -> None:
         required=True,
         help="classification.json from slack_notify.py",
     )
+    parser.add_argument("--ai-analysis", help="ai_analysis.json from the AI analysis step")
     parser.add_argument("--output", default=DEFAULT_OUTPUT)
     args = parser.parse_args()
 
@@ -339,6 +358,7 @@ def main() -> None:
             commit_sha=args.commit_sha,
             commit_author=args.commit_author,
             failed_jobs=failed_jobs,
+            analysis=load_ai_analysis(args.ai_analysis),
         )
 
     with open(args.output, "w") as f:

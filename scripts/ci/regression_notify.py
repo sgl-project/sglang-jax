@@ -19,14 +19,6 @@ def _run_gh(args):
     ).stdout
 
 
-def _clamp(text, limit=600):
-    """Bound an AI-authored field so a non-bulleted wall can't flood Slack."""
-    text = text.strip()
-    if len(text) <= limit:
-        return text
-    return text[:limit].rsplit(" ", 1)[0].rstrip() + " …"
-
-
 def format_regression_summary(
     short_sha,
     run_url,
@@ -37,11 +29,10 @@ def format_regression_summary(
     pr_number=None,
     branch_unverified=False,
 ):
-    """Format Slack mrkdwn summary for a post-merge regression.
+    """Slack summary for a post-merge regression.
 
-    ``root_cause`` / ``suggested_fix`` are expected to be short bullet lines
-    from the bisect agent; each renders under its own header so the alert
-    stays scannable. The full causal chain lives in the PR comment.
+    ``root_cause`` / ``suggested_fix`` are short bullet lines from the bisect
+    agent; each renders under its own header. The full detail is in the PR comment.
     """
     pr_link = ""
     if pr_url and pr_number:
@@ -59,9 +50,9 @@ def format_regression_summary(
         f"*Failed jobs:* {_escape_mrkdwn(failed_jobs)}",
     ]
     if root_cause.strip():
-        lines += ["", "*Root cause*", _escape_mrkdwn(_clamp(root_cause))]
+        lines += ["", "*Root cause*", _escape_mrkdwn(root_cause.strip())]
     if suggested_fix.strip():
-        lines += ["", "*Suggested fix*", _escape_mrkdwn(_clamp(suggested_fix))]
+        lines += ["", "*Suggested fix*", _escape_mrkdwn(suggested_fix.strip())]
 
     text = "\n".join(lines)
     if len(text) > 2900:
