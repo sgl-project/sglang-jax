@@ -830,7 +830,11 @@ class MultimodalTokenizer(TokenizerManager):
             img = Image.fromarray(frame)
             if img.mode != "RGB":
                 img = img.convert("RGB")
-            img = img.resize((resized_width, resized_height), resample=Image.BILINEAR)
+            # BICUBIC matches the HF Qwen2VL/Qwen3-VL/Qwen-Omni video+image processor
+            # default (transformers image_processing_qwen2_vl.py / video_processing_qwen3_vl.py).
+            # BILINEAR here diverged from the official preprocessing for every qwen-family
+            # video model (MiMo-V2.5 uses Qwen2_5_VLProcessor; Qwen3-Omni also defaults BICUBIC).
+            img = img.resize((resized_width, resized_height), resample=Image.BICUBIC)
             resized_frames.append(np.asarray(img))
         return np.stack(resized_frames, axis=0)
 

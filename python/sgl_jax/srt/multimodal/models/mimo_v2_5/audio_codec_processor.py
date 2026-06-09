@@ -623,32 +623,35 @@ class MiMoV25AudioCodecProcessor:
             audio_array, sample_rate = sf.read(io.BytesIO(audio_bytes))
             return torch.as_tensor(audio_array, dtype=torch.float32), int(sample_rate)
 
+    def _get_mel_processor(self):
+        # Reuse the in-repo MiMo-Audio mel front-end (transformers mel_filter_bank +
+        # spectrogram, annotated "matches the official MiMo Audio implementation"),
+        # so V2.5 uses the exact same mel as the already-integrated MiMo-Audio model
+        # instead of a separately hand-built torchaudio front-end (avoids melscale_fbanks
+        # vs mel_filter_bank numeric drift). Cached; lazy import avoids a module cycle.
+        if getattr(self, "_mel_processor", None) is None:
+            from sgl_jax.srt.multimodal.manager.multimodal_tokenizer import (
+                MiMoAudioProcessor,
+            )
+
+            self._mel_processor = MiMoAudioProcessor()
+        return self._mel_processor
+
     def _waveform_to_mel(self, waveform, sample_rate: int):
         torch = self._require_torch()
-        torchaudio = self._require_torchaudio()
         audio = torch.as_tensor(waveform, dtype=torch.float32)
         if audio.ndim == 2:
+            # mono mixdown: channel-first [C, N] vs frame-major [N, C]
             if audio.shape[0] <= 8 and audio.shape[1] > audio.shape[0]:
                 audio = audio.mean(dim=0)
             else:
                 audio = audio.mean(dim=-1)
         if audio.ndim != 1:
             raise ValueError(f"MiMo-V2.5 waveform must be 1D or 2D, got shape={tuple(audio.shape)}")
-        if sample_rate != 24000:
-            audio = torchaudio.functional.resample(audio, sample_rate, 24000)
-        mel_transform = torchaudio.transforms.MelSpectrogram(
-            sample_rate=24000,
-            n_fft=960,
-            win_length=960,
-            hop_length=240,
-            n_mels=128,
-            power=1.0,
-            center=True,
-            f_min=0,
-            f_max=None,
-        )
-        mel = mel_transform(audio)
-        return torch.log(torch.clamp(mel, min=1e-7)).transpose(0, 1).to(dtype=torch.float32)
+        # Delegate to the official-aligned MiMoAudioProcessor (handles resample to 24kHz,
+        # htk mel_filter_bank, power=1.0, log_mel with mel_floor=1e-7). Returns [1,T,128].
+        mels, _ = self._get_mel_processor()(audio.numpy(), sampling_rate=int(sample_rate))
+        return torch.as_tensor(mels[0], dtype=torch.float32)  # [T, 128] time-major
 
     def _load_audio_tokenizer(self):
         if self._audio_tokenizer is not None:

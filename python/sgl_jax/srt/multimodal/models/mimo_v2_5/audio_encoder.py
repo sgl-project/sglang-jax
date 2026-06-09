@@ -226,7 +226,9 @@ class MiMoV25AudioUnderstandingEncoder(nnx.Module):
             batch, groups, self.input_local_dim * group_size
         )
         hidden, _ = self.proj_fc1(hidden)
-        hidden = jax.nn.gelu(hidden)
+        # HF AudioProjection uses nn.GELU() = exact erf (modeling_mimo_v2.py:924); jax.nn.gelu
+        # defaults to the tanh approximation. Match HF (the vision merger already uses erf).
+        hidden = jax.nn.gelu(hidden, approximate=False)
         hidden, _ = self.proj_fc2(hidden)
         return self._replicate(hidden).reshape(-1, self.hidden_size)
 
