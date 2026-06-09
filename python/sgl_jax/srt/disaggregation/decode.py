@@ -124,33 +124,67 @@ class SchedulerDisaggregationDecodeMixin:
     def event_loop_normal_disagg_decode(self: Scheduler) -> None:
         """Decode event loop."""
 
+        wd = self.disagg_decode_watchdog
+        wd.start()
+
         while True:
+            wd.beat("recv_requests")
             recv_reqs = (
                 self._comm_backend.recv_requests()
                 if self._comm_backend is not None
                 else self.recv_requests()
             )
             recv_reqs = self.select_dp_for_request(recv_reqs)
+            wd.beat("process_input_requests")
             self.process_input_requests_disagg_decode(recv_reqs)
 
             if self._engine_paused:
                 continue
 
+            wd.beat("process_decode_queue")
             self.process_decode_queue()
 
+            wd.beat("get_next_batch")
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
 
             if batch:
+                wd.beat("run_batch")
                 result = self.run_batch(batch)
+                wd.beat("process_batch_result")
                 self.process_batch_result(batch, result)
             else:
+                wd.beat("idle")
                 # Skip check_memory / check_tree_cache for PD decode.
                 self.new_token_ratio = self.init_new_token_ratio
                 if self._comm_backend is not None:
                     self._comm_backend.wait_for_new_requests(0.001)
 
             self.last_batch = batch
+
+    def _decode_backlog_snapshot(self: Scheduler) -> str:
+        """One-line backlog snapshot for the watchdog stall report.
+
+        Cheap reads only; never raises (the watchdog suppresses, but a
+        clean string is more useful in the log than a swallowed error).
+        """
+
+        prealloc = len(self.disagg_prealloc_queue or ())
+        transfer = len(self.disagg_transfer_queue or ())
+        try:
+            ns, nr = self.disagg_kv_manager.inflight_count()
+        except Exception:
+            ns, nr = (-1, -1)
+        try:
+            kv_avail = self.token_to_kv_pool_allocator.available_size()
+        except Exception:
+            kv_avail = -1
+        running = len(self.running_batch.reqs) if self.running_batch is not None else 0
+        return (
+            f"prealloc_q={prealloc} transfer_q={transfer} "
+            f"inflight_send={ns} inflight_recv={nr} "
+            f"kv_avail={kv_avail} running_reqs={running}"
+        )
 
     def process_input_requests_disagg_decode(self: Scheduler, recv_reqs) -> None:
         """Decode-mode request intake. PD reqs are extracted from
@@ -172,11 +206,14 @@ class SchedulerDisaggregationDecodeMixin:
             try:
                 from sgl_jax.srt.disaggregation.common.metrics import time_phase
 
+                self._pd_mark_time(req, "bootstrap_start")
+                with time_phase("bootstrap", "decode"):
                 with time_phase("bootstrap", "decode"):
                     if jax.process_count() > 1:
                         p_info = self._pick_prefill_peer_for_this_host()
                     else:
                         p_info = self.disagg_bootstrap_client.get_prefill_info(req.bootstrap_room)
+                self._pd_mark_time(req, "bootstrap_done")
             except Exception:
                 logger.exception(
                     "bootstrap lookup failed for req_id=%s "
@@ -188,8 +225,27 @@ class SchedulerDisaggregationDecodeMixin:
                 self._abort_decode_request(req, "bootstrap_lookup")
                 continue
 
+            try:
+                from sgl_jax.srt.disaggregation.bootstrap import check_prefill_compat
+
+                check_prefill_compat(
+                    p_info,
+                    local_page_size=self.server_args.page_size,
+                    local_kv_dtype=self.server_args.kv_cache_dtype,
+                )
+            except ValueError as exc:
+                logger.error(
+                    "prefill/decode KV layout mismatch for req_id=%s: %s",
+                    req.rid,
+                    exc,
+                )
+                self._record_decode_transfer_failure("config_mismatch")
+                self._abort_decode_request(req, "config_mismatch")
+                continue
+
             kv_indices = None
             try:
+                self._pd_mark_time(req, "prealloc_entry")
                 kv_indices = self._prealloc_decode_kv_indices(req)
                 receiver = self.disagg_kv_manager.create_receiver(req.rid)
                 spec = self._build_kv_spec_for_req(req)
@@ -221,6 +277,7 @@ class SchedulerDisaggregationDecodeMixin:
                 kv_indices=kv_indices,
                 started=True,
             )
+            self._pd_mark_time(req, "transfer_entry")
             self.disagg_prealloc_queue.add(entry)
 
     def _extract_pd_reqs_from_waiting_queue(self: Scheduler, rids: set) -> list[Req]:
@@ -261,6 +318,20 @@ class SchedulerDisaggregationDecodeMixin:
                     self._write_kv_to_pool(entry.req, entry.kv_indices, kv)
                     self._record_decode_transfer_bytes(kv)
                     self._enqueue_for_decode(entry.req)
+                    self._pd_mark_time(entry.req, "first_token")
+                    from sgl_jax.srt.disaggregation.req_time_stats import (
+                        maybe_log_time_stats,
+                    )
+
+                    maybe_log_time_stats(
+                        entry.req.pd_time_stats,
+                        req_id=entry.req_id,
+                        enabled=getattr(
+                            self.server_args,
+                            "enable_request_time_stats_logging",
+                            False,
+                        ),
+                    )
                 except Exception:
                     logger.exception(
                         "failed to install KV / enqueue decode for "
@@ -345,6 +416,19 @@ class SchedulerDisaggregationDecodeMixin:
     # ------------------------------------------------------------------
     # Overridable / test-friendly hooks
     # ------------------------------------------------------------------
+
+    def _pd_mark_time(self: Scheduler, req: Req, name: str) -> None:
+        """Record a PD lifecycle mark on ``req`` (no-op unless enabled)."""
+
+        if not getattr(self.server_args, "enable_request_time_stats_logging", False):
+            return
+        from sgl_jax.srt.disaggregation.req_time_stats import TimeStats
+
+        ts = req.pd_time_stats
+        if ts is None:
+            ts = TimeStats("decode")
+            req.pd_time_stats = ts
+        ts.mark(name)
 
     def _prealloc_decode_kv_indices(self: Scheduler, req: Req):
         """Reserve page-aligned KV slots in the paged pool for ``req``."""
