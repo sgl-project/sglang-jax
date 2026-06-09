@@ -133,8 +133,7 @@ class BaseSpecWorker:
         )
 
     def forward_batch_speculative_decode_overlap(self, model_worker_batch: ModelWorkerBatch):
-        prepared = getattr(model_worker_batch, "spec_decode_verify_prepare", None)
-        if prepared is None and not model_worker_batch.forward_mode.is_decode():
+        if not model_worker_batch.forward_mode.is_decode():
             raise NotImplementedError(
                 "Spec decode-overlap entry only supports decode batches; "
                 "prefill overlap uses forward_batch_speculative_generation()."
@@ -142,6 +141,7 @@ class BaseSpecWorker:
         if not (self._can_use_fused_spec_decode and model_worker_batch.sampling_info.is_all_greedy):
             raise NotImplementedError("Spec overlap entry only supports fused greedy decode.")
 
+        prepared = getattr(model_worker_batch, "spec_decode_verify_prepare", None)
         if prepared is None:
             self._prepare_overlap_sampling_info(model_worker_batch)
             sel = model_worker_batch.logits_indices_selector
