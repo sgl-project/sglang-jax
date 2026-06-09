@@ -40,6 +40,7 @@ class FusedDraftExtendPendingResult(NamedTuple):
     batch_output: object
     selected_layer0_hidden: object
     topk_index_stacked: object
+    next_verified_id: object
     accept_lens: object
     sel: np.ndarray
 
@@ -48,16 +49,6 @@ class SpecDecodePendingDraftExtendResult(NamedTuple):
     draft_worker: object
     model_worker_batch: object
     pending_result: FusedDraftExtendPendingResult | None
-
-
-@partial(jax.jit, static_argnames=("num_steps",))
-def _select_next_verified_id(verified_id, accept_lens, *, num_steps: int):
-    accept_width = num_steps + 1
-    safe_accept_lens = jnp.clip(accept_lens, 1, None)
-    select_index = (
-        jnp.arange(accept_lens.shape[0], dtype=jnp.int32) * accept_width + safe_accept_lens - 1
-    )
-    return _take_with_index_sharding(verified_id, select_index)
 
 
 def build_padded_draft_input_from_pending(flat_spec, selector: np.ndarray, total_bs: int):
@@ -69,16 +60,11 @@ def build_padded_draft_input_from_pending(flat_spec, selector: np.ndarray, total
     from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
 
     pending_result = pending.pending_result
-    batch_output = pending_result.batch_output
     data_sharding = NamedSharding(pending.draft_worker.mesh, P("data"))
     topk_index = jax.device_put(pending_result.topk_index_stacked, data_sharding)
     hidden_states = pending_result.selected_layer0_hidden
     accept_lens = pending_result.accept_lens
-    verified_id = _select_next_verified_id(
-        batch_output.next_draft_input.verified_id,
-        accept_lens,
-        num_steps=topk_index.shape[1],
-    )
+    verified_id = pending_result.next_verified_id
 
     def _scatter_host(arr):
         if arr is None:
@@ -461,6 +447,9 @@ def _build_fused_greedy_verify_jit(topk: int):
         )
         prepared_hidden = prepared.hidden_states
         prepared_verified_id = prepared.verified_id
+        prepared_next_verified_id = _take_with_index_sharding(
+            prepared.verified_id, prepared.select_index
+        )
         prepared_new_seq_lens = prepared.new_seq_lens
         prepared_accept_lens = prepared.accept_lens
         prepared_sel_pos = prepared.sel_pos
@@ -469,8 +458,10 @@ def _build_fused_greedy_verify_jit(topk: int):
 
         if mesh is not None:
             rep = NamedSharding(mesh, P())
+            data = NamedSharding(mesh, P("data"))
             prepared_hidden = jax.sharding.reshard(prepared_hidden, rep)
             prepared_verified_id = jax.sharding.reshard(prepared_verified_id, rep)
+            prepared_next_verified_id = jax.sharding.reshard(prepared_next_verified_id, data)
             prepared_new_seq_lens = jax.sharding.reshard(prepared_new_seq_lens, rep)
             prepared_accept_lens = jax.sharding.reshard(prepared_accept_lens, rep)
             prepared_sel_pos = jax.sharding.reshard(prepared_sel_pos, rep)
@@ -483,6 +474,7 @@ def _build_fused_greedy_verify_jit(topk: int):
             target_pool_updates,
             prepared_hidden,
             prepared_verified_id,
+            prepared_next_verified_id,
             prepared_new_seq_lens,
             prepared_accept_lens,
             prepared_sel_pos,
@@ -838,6 +830,7 @@ def launch_fused_draft_extend_for_decode(draft_worker, model_worker_batch, batch
         batch_output=batch_output,
         selected_layer0_hidden=selected_layer0_hidden,
         topk_index_stacked=topk_index_stacked,
+        next_verified_id=batch_output.next_draft_input.next_verified_id,
         accept_lens=batch_output.accept_lens,
         sel=sel,
     )
@@ -850,22 +843,19 @@ def restore_fused_draft_extend_result(draft_worker, model_worker_batch, pending_
     batch_output = pending_result.batch_output
     selected_layer0_hidden = pending_result.selected_layer0_hidden
     topk_index_stacked = pending_result.topk_index_stacked
+    next_verified_id = pending_result.next_verified_id
     accept_host = np.asarray(jax.device_get(pending_result.accept_lens))
     sel = pending_result.sel
 
-    verified_id_arr = batch_output.next_draft_input.verified_id
-    if hasattr(verified_id_arr, "copy_to_host_async"):
-        jax.copy_to_host_async(verified_id_arr)
-
     jax.copy_to_host_async(selected_layer0_hidden)
     jax.copy_to_host_async(topk_index_stacked)
+    jax.copy_to_host_async(next_verified_id)
 
     batch_output.next_draft_input.hidden_states = np.asarray(selected_layer0_hidden)[sel]
     topk_index = np.asarray(topk_index_stacked)[sel]
     batch_output.next_draft_input.topk_p = np.ones(topk_index.shape, dtype=np.float32)
     batch_output.next_draft_input.topk_index = topk_index
-    select_index = sel * (draft_worker.speculative_num_steps + 1) + accept_host[sel] - 1
-    batch_output.next_draft_input.verified_id = np.asarray(verified_id_arr)[select_index]
+    batch_output.next_draft_input.verified_id = np.asarray(next_verified_id)[sel]
     batch_output.next_draft_input.allocate_lens = batch_output.next_draft_input.allocate_lens[
         : model_worker_batch.real_bs
     ]
@@ -1071,6 +1061,7 @@ def spec_decode_verify_phase(spec_worker, model_worker_batch, cur_allocate_lens)
             target_pool_updates,
             prepared_hidden,
             prepared_verified_id,
+            prepared_next_verified_id,
             prepared_new_seq_lens,
             prepared_accept_lens,
             prepared_sel_pos,
@@ -1100,6 +1091,7 @@ def spec_decode_verify_phase(spec_worker, model_worker_batch, cur_allocate_lens)
         allocate_lens=cur_allocate_lens,
         hidden_states=prepared_hidden,
     )
+    next_draft_input.next_verified_id = prepared_next_verified_id
     next_draft_input.sel_pos = prepared_sel_pos
     next_draft_input.positions = prepared_positions
     batch_output = GenerationBatchResult(
