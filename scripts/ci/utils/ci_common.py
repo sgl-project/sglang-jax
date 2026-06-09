@@ -1,10 +1,5 @@
-"""Shared helpers for the nightly failure pipeline.
-
-These primitives are reused across the Slack notifier, the GitHub issue
-creator, and the nightly status builder/checker so that timestamp formatting,
-``gh`` invocation, Slack mrkdwn escaping, and the failed-job-to-issue
-association all behave identically wherever they appear.
-"""
+"""Shared helpers for the nightly failure pipeline, so the Slack notifier,
+issue creator, and status builder render the same failures identically."""
 
 from __future__ import annotations
 
@@ -26,8 +21,7 @@ def escape_mrkdwn(text: Any) -> str:
 
 
 def clamp(text: str, limit: int = 600) -> str:
-    """Backstop an AI field at a word boundary; only fires if the model ignores
-    the 'be brief' prompt, so a runaway wall can't flood the message."""
+    """Truncate at a word boundary — backstop for when the model ignores the brief-output prompt."""
     text = (text or "").strip()
     if len(text) <= limit:
         return text
@@ -79,12 +73,7 @@ def load_failure_issues(path: str | None) -> dict[tuple[str, str], dict[str, Any
 def lookup_issue(
     index: dict[tuple[str, str], dict[str, Any]], job_name: str, failure_type: str
 ) -> dict[str, Any] | None:
-    """Resolve the issue record for a failed job from a pre-built index.
-
-    Falls back to a ``(job_name, "")`` key so callers that omit a failure type
-    still match. No current producer emits an empty failure type, so the
-    fallback is inert today; it keeps the lookup tolerant of that shape.
-    """
+    """Resolve a job's issue from the index (``(name, "")`` fallback is inert today but tolerant)."""
     return index.get((job_name, failure_type)) or index.get((job_name, ""))
 
 
@@ -96,11 +85,7 @@ def issue_for_job(
 
 
 def load_ai_analysis(path: str | None) -> dict[str, dict[str, str]]:
-    """Read ai_analysis.json ({jobs:[{name,root_cause,fix}]}) indexed by job name.
-
-    Returns {} when absent/empty/malformed so analysis stays optional and a
-    broken AI step never blocks issues or Slack.
-    """
+    """Index ai_analysis.json by job name; {} when absent/malformed so analysis stays optional."""
     if not path or not os.path.isfile(path):
         return {}
     try:

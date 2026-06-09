@@ -1,13 +1,8 @@
 """Create or update GitHub issues for failed CI jobs.
 
-This extends the nightly failure notification pipeline by consuming the
-``classification.json`` produced by ``slack_notify.py``. It intentionally does
-not fetch or classify failures itself; the existing Slack notification pipeline
-owns that stage.
-
-CODEOWNERS is not present in this repository today. Until one exists, assignees
-are intentionally limited to the optional CI_FAILURE_FALLBACK_ASSIGNEES env var
-(comma-separated GitHub logins).
+Consumes classification.json + ai_analysis.json from the Slack pipeline; does
+not detect or classify itself. No CODEOWNERS yet, so assignees come only from
+the optional CI_FAILURE_FALLBACK_ASSIGNEES env var (comma-separated logins).
 """
 
 from __future__ import annotations
