@@ -71,6 +71,7 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "device",
     "chunked_prefill_size",
     "disable_radix_cache",
+    "speculative_algorithm",
     "speculative_accept_threshold_single",
     "speculative_accept_threshold_acc",
     "enable_deterministic_sampling",

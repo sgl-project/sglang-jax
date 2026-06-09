@@ -204,7 +204,14 @@ class SchedulerOutputProcessorMixin:
                                 >= precision_tracer.get_max_requests()
                             ):
                                 precision_tracer.stop_trace()
-                        release_kv_cache(req, self.tree_cache)
+                        release_kv_cache(
+                            req,
+                            self.tree_cache,
+                            allow_overallocated=(
+                                self.spec_algorithm is not None
+                                and not self.spec_algorithm.is_none()
+                            ),
+                        )
                     elif not info.decoding_reqs or req not in info.decoding_reqs:
                         # This updates radix so others can match
                         self.tree_cache.cache_unfinished_req(req)
