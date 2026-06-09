@@ -1,11 +1,8 @@
 """Perf case runner: drives bench_serving against a given server URL."""
 
-import json
-import os
-from pathlib import Path
-
 from multi_host_suite import PerfCase
 from profile_loader import LaunchProfile
+from results import write_perf_json
 
 
 def run_perf_case(case: PerfCase, profile: LaunchProfile) -> None:
@@ -40,23 +37,13 @@ def run_perf_case(case: PerfCase, profile: LaunchProfile) -> None:
     )
     metrics = run_benchmark(args)
 
-    summary = {
-        "type": "perf",
-        "case": case.name,
-        "profile": profile.name,
-        "target": profile.target,
-        **metrics,
-    }
-    # default=float handles numpy scalars returned by bench_serving.
-    summary_json = json.dumps(summary, indent=2, sort_keys=True, default=float)
-    print("[multi-host-suite] Perf summary:", flush=True)
-    print(f"[multi-host-suite] {summary_json}", flush=True)
-
-    results_dir = os.environ.get("RESULTS_DIR")
-    if results_dir:
-        out_path = Path(results_dir) / f"{case.name}.json"
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(summary_json)
-
+    # Incomplete points (OOM / dropped requests) aren't persisted — see the
+    # single-host runner.
     if metrics.get("completed") != case.num_prompts:
         raise RuntimeError(f"Expected completed={case.num_prompts}, got {metrics.get('completed')}")
+
+    out_path = write_perf_json(case, profile.name, profile.target, metrics)
+    if out_path is not None:
+        print(f"[multi-host-suite] Wrote perf summary to {out_path}", flush=True)
+    else:
+        print("[multi-host-suite] RESULTS_DIR unset; skipping perf summary write", flush=True)

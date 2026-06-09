@@ -644,7 +644,7 @@ class TokenizerManager:
         host_tracer_level: int | None = None,
         python_tracer_level: int | None = None,
         stage_id: int | None = None,
-        profile_by_stage: bool = False,
+        profile_by_stage: bool | None = False,
         profile_stages: list[str] | None = None,
     ):
         self.auto_create_handle_loop()
