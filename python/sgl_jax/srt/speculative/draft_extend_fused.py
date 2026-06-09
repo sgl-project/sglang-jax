@@ -804,7 +804,6 @@ def launch_fused_draft_extend_for_decode(draft_worker, model_worker_batch, batch
 
     mr0 = draft_worker._workers[0].model_runner
     mwb.spec_info_padded.hidden_states = target_hidden
-    mr0.attn_backend.forward_metadata = mr0.attn_backend.get_eagle_forward_metadata(mwb)
     shared_fb = ForwardBatch.init_new(mwb, mr0)
     shared_fb.bid = model_worker_batch.bid
 
