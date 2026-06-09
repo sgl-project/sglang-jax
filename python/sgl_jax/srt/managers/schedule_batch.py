@@ -1522,7 +1522,8 @@ class ScheduleBatch:
                 ):
                     info.spec_info.trim_to_length(len(info.reqs))
             flat_spec = self._concat_spec_info_per_rank([info.spec_info for info in self.reqs_info])
-            flat_spec.resolve_pending_draft_extend_result()
+            if getattr(flat_spec, "pending_draft_extend_result", None) is None:
+                flat_spec.resolve_pending_draft_extend_result()
             flat_spec.prepare_for_decode(self)
             real_bs_per_dp = [len(info.reqs) if info.reqs else 0 for info in self.reqs_info]
             per_rank_spec = self._split_spec_info_per_rank(flat_spec, real_bs_per_dp)
@@ -2381,10 +2382,24 @@ class ScheduleBatch:
         # aligns with seq_lens[i]. Returns a new object — does not mutate
         # the per-rank cross-round state on reqs_info[r].spec_info.
         flat_spec = self._concat_spec_info_per_rank([info.spec_info for info in self.reqs_info])
-        flat_spec.resolve_pending_draft_extend_result()
-        spec_info = self._scatter_spec_info_to_dp_slots(
-            flat_spec, logits_indices_selector, total_bs
-        )
+        if getattr(flat_spec, "pending_draft_extend_result", None) is not None:
+            from sgl_jax.srt.speculative.draft_extend_fused import (
+                build_padded_draft_input_from_pending,
+            )
+
+            spec_info = build_padded_draft_input_from_pending(
+                flat_spec, logits_indices_selector, total_bs
+            )
+            if spec_info is None:
+                flat_spec.resolve_pending_draft_extend_result()
+                spec_info = self._scatter_spec_info_to_dp_slots(
+                    flat_spec, logits_indices_selector, total_bs
+                )
+        else:
+            flat_spec.resolve_pending_draft_extend_result()
+            spec_info = self._scatter_spec_info_to_dp_slots(
+                flat_spec, logits_indices_selector, total_bs
+            )
         # Per-rank out_cache_loc chunks (set in spec prepare_for_decode) have
         # variable length (∝ accept_len). DP-segment: pad each to max_len with
         # -1 so the P("data") shard in ForwardBatch.init_new gives rank r its
@@ -2573,8 +2588,24 @@ class ScheduleBatch:
         if not nonempty:
             return None
 
-        for spec_info in nonempty:
-            spec_info.resolve_pending_draft_extend_result()
+        pending = None
+        if any(getattr(s, "pending_draft_extend_result", None) is not None for s in nonempty):
+            from sgl_jax.srt.speculative.eagle_util import PendingDraftExtendResultSlice
+
+            for spec_info in nonempty:
+                p = getattr(spec_info, "pending_draft_extend_result", None)
+                assert (
+                    p is not None
+                ), "_concat_spec_info_per_rank: mixed pending/non-pending spec_info"
+                if isinstance(p, PendingDraftExtendResultSlice):
+                    p = p.pending_draft_extend_result
+                if pending is None:
+                    pending = p
+                else:
+                    assert p is pending, "_concat_spec_info_per_rank: mixed pending draft results"
+        else:
+            for spec_info in nonempty:
+                spec_info.resolve_pending_draft_extend_result()
 
         per_req_fields = (
             "topk_p",
@@ -2589,7 +2620,7 @@ class ScheduleBatch:
 
         kwargs = {
             "capture_hidden_mode": nonempty[0].capture_hidden_mode,
-            "pending_draft_extend_result": None,
+            "pending_draft_extend_result": pending,
         }
         for f in per_req_fields:
             vals = [getattr(s, f, None) for s in nonempty]

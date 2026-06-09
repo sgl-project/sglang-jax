@@ -50,6 +50,55 @@ class SpecDecodePendingDraftExtendResult(NamedTuple):
     pending_result: FusedDraftExtendPendingResult | None
 
 
+@partial(jax.jit, static_argnames=("num_steps",))
+def _select_next_verified_id(verified_id, accept_lens, *, num_steps: int):
+    accept_width = num_steps + 1
+    safe_accept_lens = jnp.clip(accept_lens, 1, None)
+    select_index = (
+        jnp.arange(accept_lens.shape[0], dtype=jnp.int32) * accept_width + safe_accept_lens - 1
+    )
+    return _take_with_index_sharding(verified_id, select_index)
+
+
+def build_padded_draft_input_from_pending(flat_spec, selector: np.ndarray, total_bs: int):
+    """Build next decode's DP-padded draft state without host-restoring tensors."""
+    pending = getattr(flat_spec, "pending_draft_extend_result", None)
+    if pending is None or getattr(pending, "pending_result", None) is None:
+        return None
+
+    from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
+
+    pending_result = pending.pending_result
+    batch_output = pending_result.batch_output
+    topk_index = pending_result.topk_index_stacked
+    hidden_states = pending_result.selected_layer0_hidden
+    accept_lens = pending_result.accept_lens
+    verified_id = _select_next_verified_id(
+        batch_output.next_draft_input.verified_id,
+        accept_lens,
+        num_steps=topk_index.shape[1],
+    )
+
+    def _scatter_host(arr):
+        if arr is None:
+            return None
+        a = np.asarray(arr)
+        out = np.zeros((total_bs,) + a.shape[1:], dtype=a.dtype)
+        out[selector] = a
+        return out
+
+    return EagleDraftInput(
+        topk_p=jnp.ones_like(topk_index, dtype=jnp.float32),
+        topk_index=topk_index,
+        hidden_states=hidden_states,
+        verified_id=verified_id,
+        accept_length=accept_lens,
+        allocate_lens=_scatter_host(flat_spec.allocate_lens),
+        new_seq_lens=_scatter_host(flat_spec.new_seq_lens),
+        capture_hidden_mode=flat_spec.capture_hidden_mode,
+    )
+
+
 def _take_with_index_sharding(values, index):
     index_sharding = jax.typeof(index).sharding
     if isinstance(index_sharding, NamedSharding):
