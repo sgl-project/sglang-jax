@@ -206,7 +206,10 @@ class EAGLEWorker(BaseSpecWorker):
                 )
 
                 is_multi_layer = isinstance(self.draft_worker, MultiLayerDraftWorker)
-                topk_shape = (bs, num_steps, self.topk) if is_multi_layer else (bs, self.topk)
+                if is_multi_layer and self.topk == 1:
+                    topk_shape = (bs, num_steps)
+                else:
+                    topk_shape = (bs, num_steps, self.topk) if is_multi_layer else (bs, self.topk)
                 data_sharding = NamedSharding(self.mesh, P("data"))
                 spec_info = EagleDraftInput(
                     topk_p=jax.device_put(np.ones(topk_shape, dtype=np.float32), data_sharding),

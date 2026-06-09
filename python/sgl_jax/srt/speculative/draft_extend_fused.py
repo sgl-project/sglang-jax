@@ -357,7 +357,10 @@ def _build_fused_draft_extend_jit(num_layers: int, topk: int):
         # consistent. Without this, donate_argnames may let XLA alias output
         # buffers with donated P("data")-sharded pool buffers, silently making
         # np.asarray() return per-process-different values.
-        stacked_idx = jnp.stack(all_topk_index, axis=1)
+        if topk == 1:
+            stacked_idx = jnp.stack([idx[:, 0] for idx in all_topk_index], axis=1)
+        else:
+            stacked_idx = jnp.stack(all_topk_index, axis=1)
         if mesh is not None:
             rep = NamedSharding(mesh, P())
             selected_layer0_hidden = jax.sharding.reshard(selected_layer0_hidden, rep)
@@ -586,7 +589,10 @@ def _build_fused_greedy_prefill_jit(num_layers: int, topk: int):
             last_idx = last_idx + rank_ids * per_dp_tokens
 
         selected_layer0_hidden = _gather_rows_preserve_sharding(layer0_hidden, last_idx)
-        stacked_idx = jnp.stack(all_topk_index, axis=1)
+        if topk == 1:
+            stacked_idx = jnp.stack([idx[:, 0] for idx in all_topk_index], axis=1)
+        else:
+            stacked_idx = jnp.stack(all_topk_index, axis=1)
         if mesh is not None:
             rep = NamedSharding(mesh, P())
             data_sharding = NamedSharding(mesh, P("data"))
@@ -617,7 +623,9 @@ def _prepare_topk1_verify_placeholders_from_draft_state(draft_worker, model_work
     if isinstance(previous_verified_id, np.ndarray):
         previous_verified_id = np.asarray(previous_verified_id, dtype=np.int32)
     topk_index = draft_input.topk_index
-    if len(topk_index.shape) == 3 and topk_index.shape[-1] == 1:
+    if len(topk_index.shape) == 2:
+        previous_token_list = topk_index
+    elif len(topk_index.shape) == 3 and topk_index.shape[-1] == 1:
         previous_token_list = (
             np.squeeze(topk_index, axis=-1)
             if isinstance(topk_index, np.ndarray)
