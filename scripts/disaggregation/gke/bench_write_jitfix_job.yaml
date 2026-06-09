@@ -1,0 +1,160 @@
+# Microbench v3: does wrapping the eager write path in a MODULE-LEVEL jax.jit
+# stop the per-call recompile? Mirrors bench_write_recompile_job.yaml exactly,
+# except update_fused_kv_cache_vectorized is now called through a stable
+# module-level @jax.jit (_jit_write_one_layer), like the decode.py fix.
+# Expectation: call#0 ~8s (compile once) then call#1+ sub-second (cache hit),
+# and the 28-layer request loop drops from ~250s to single-digit seconds.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: bench-write-jitfix
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        cloud.google.com/gke-tpu-accelerator: tpu-v6e-slice
+        cloud.google.com/gke-tpu-topology: "1x1"
+        cloud.google.com/gke-nodepool: pd-v6e-1
+      tolerations:
+      - key: google.com/tpu
+        operator: Exists
+        effect: NoSchedule
+      containers:
+      - name: jax-tpu
+        image: python:3.12
+        securityContext:
+          privileged: true
+        command:
+        - bash
+        - -c
+        - |
+          set -ex
+          pip install "jax[tpu]==0.8.1" \
+            -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+          pip install numpy
+          cat > /tmp/bench.py <<'PYEOF'
+          import time
+          from functools import partial
+          import jax, jax.numpy as jnp, numpy as np
+          from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+          from jax.experimental import pallas as pl
+          from jax.experimental.pallas import tpu as pltpu
+
+          cdiv = lambda a, b: (a + b - 1) // b
+          VMEM_SIZE = 64 * 1024 * 1024
+
+          def get_slot_mapping(nspb, kv_start, new_start, slice_lens):
+              sm = jnp.stack([kv_start, new_start, slice_lens], axis=1)
+              padded = (sm.shape[0] + nspb - 1) // nspb * nspb
+              sm = jnp.pad(sm, [[0, padded - sm.shape[0]], [0, 0]], constant_values=0)
+              return jnp.transpose(sm).astype(jnp.int32)
+
+          def get_num_slices_per_block(new_kv, kv_cache, page_size=128):
+              bpe = jnp.dtype(kv_cache.dtype).itemsize
+              total = new_kv.shape[0] * new_kv.shape[1]
+              khn = new_kv.shape[2] * new_kv.shape[3]
+              hd = new_kv.shape[4]
+              cap = VMEM_SIZE // (bpe * page_size * khn * hd)
+              return total if total < cap else cap
+
+          def kv_cache_update_kernel(slices_ref, new_kv_ref, kv_ref, _, scratch, sem):
+              ac = []
+              blk = pl.program_id(0); nspb = scratch.shape[0]
+              for i in range(nspb):
+                  off = i + blk * nspb
+                  ns = slices_ref[1, off]; ln = slices_ref[2, off]
+                  c = pltpu.make_async_copy(new_kv_ref.at[pl.ds(ns, ln), ...],
+                      scratch.at[jnp.uint32(i), pl.ds(0, ln), ...], sem)
+                  c.start(); ac.append(c)
+              for c in ac: c.wait()
+              ac.clear()
+              for i in range(nspb):
+                  off = i + blk * nspb
+                  ks = slices_ref[0, off]; ln = slices_ref[2, off]
+                  c = pltpu.make_async_copy(scratch.at[jnp.uint32(i), pl.ds(0, ln), ...],
+                      kv_ref.at[pl.ds(ks, ln), ...], sem)
+                  c.start(); ac.append(c)
+              for c in ac: c.wait()
+
+          def kv_cache_update_impl(new_kv, slices, kv_cache, num_upd, page_size, nspb):
+              oshape = kv_cache.shape
+              s = new_kv.shape; new_kv = new_kv.reshape(s[0]*s[1], s[2]*s[3], s[4])
+              s = kv_cache.shape; kv_cache = kv_cache.reshape(s[0]*s[1], s[2]*s[3], s[4])
+              _, nh, hd = new_kv.shape
+              any_mem = getattr(pltpu.MemorySpace, "ANY", pltpu.MemorySpace.HBM)
+              in_specs = [pl.BlockSpec(memory_space=any_mem), pl.BlockSpec(memory_space=any_mem)]
+              out_specs = [pl.BlockSpec(memory_space=any_mem)]
+              out_shape = [jax.ShapeDtypeStruct(kv_cache.shape, dtype=kv_cache.dtype)]
+              scratch = pltpu.VMEM((nspb, page_size, nh, hd), new_kv.dtype)
+              kernel = pl.pallas_call(kv_cache_update_kernel,
+                  grid_spec=pltpu.PrefetchScalarGridSpec(num_scalar_prefetch=1,
+                      in_specs=in_specs, out_specs=out_specs,
+                      grid=(cdiv(num_upd[0], nspb),),
+                      scratch_shapes=[scratch, pltpu.SemaphoreType.DMA]),
+                  compiler_params=pltpu.CompilerParams(vmem_limit_bytes=VMEM_SIZE),
+                  out_shape=out_shape, input_output_aliases={2: 0})
+              return kernel(slices, new_kv, kv_cache)[0].reshape(oshape)
+
+          # EXACT production structure: nested shard_map created on every call.
+          def update_fused_kv_cache_vectorized(fused_kv, loc, kv_cache, page_size,
+                  kv_partition_axis="tensor", data_partition_axis="data", mesh=None):
+              @jax.shard_map(in_specs=(P(data_partition_axis,None,kv_partition_axis,None,None),
+                  P(data_partition_axis), P(data_partition_axis,None,kv_partition_axis,None,None)),
+                  out_specs=P(data_partition_axis,None,kv_partition_axis,None,None),
+                  mesh=mesh, check_vma=False)
+              def _sharded_update(f, l, c):
+                  tt = l.shape[0]; li = l.astype(jnp.int32)
+                  kl = jnp.where(li == -1, 0, li).astype(jnp.int32)
+                  nl = jnp.arange(tt, dtype=jnp.int32)
+                  sl = jnp.where(li == -1, 0, 1).astype(jnp.int32)
+                  nspb = get_num_slices_per_block(f, c, page_size)
+                  sm = get_slot_mapping(nspb, kl, nl, sl)
+                  nu = jnp.array([tt], dtype=jnp.int32)
+                  return kv_cache_update_impl(f, sm, c, nu, page_size, nspb)
+              return _sharded_update(fused_kv, loc, kv_cache)
+
+          # THE FIX: module-level jax.jit wrapper (mirrors decode.py _jit_write_one_layer).
+          @partial(jax.jit, static_argnames=("page_size","kv_partition_axis",
+              "data_partition_axis","mesh"), donate_argnames=("kv_cache",))
+          def jit_write_one_layer(fused_kv, loc, kv_cache, page_size,
+                  kv_partition_axis, data_partition_axis, mesh):
+              return update_fused_kv_cache_vectorized(fused_kv, loc, kv_cache,
+                  page_size, kv_partition_axis, data_partition_axis, mesh)
+
+          PAGE_SIZE=128; COMBINED=2; PACKING=2; HEAD_DIM=128; NUM_PAGES=2048; DTYPE=jnp.bfloat16
+          LAYERS=28
+          devs=jax.devices(); print(f"devices={len(devs)}", flush=True)
+          mesh=Mesh(np.array(devs).reshape(1,len(devs)), ("data","tensor"))
+          kv_sh=NamedSharding(mesh, P("data",None,"tensor",None,None))
+          bufs=[jax.device_put(jnp.zeros((NUM_PAGES,PAGE_SIZE,COMBINED,PACKING,HEAD_DIM),DTYPE), kv_sh) for _ in range(LAYERS)]
+
+          tt=512
+          fused=jax.device_put(jnp.zeros((tt,1,COMBINED,PACKING,HEAD_DIM),DTYPE), kv_sh)
+          loc_np=np.full(tt,-1,dtype=np.int32); loc_np[:tt]=np.arange(tt,dtype=np.int32)
+          loc=jax.device_put(jnp.asarray(loc_np), NamedSharding(mesh, P("data")))
+
+          print("=== jit-wrapped repeated-call test (same shape tt=512) ===", flush=True)
+          for call in range(6):
+              t0=time.time()
+              out=jit_write_one_layer(fused, loc, bufs[0], PAGE_SIZE, "tensor","data", mesh)
+              out.block_until_ready()
+              print(f"call#{call}: {time.time()-t0:8.2f}s", flush=True)
+              bufs[0]=out
+
+          print("=== full 28-layer request loop (mimics decode.py write) ===", flush=True)
+          for req in range(3):
+              t0=time.time()
+              for li in range(LAYERS):
+                  bufs[li]=jit_write_one_layer(fused, loc, bufs[li], PAGE_SIZE, "tensor","data", mesh)
+              jax.block_until_ready(bufs)
+              print(f"request#{req} (28 layers): {time.time()-t0:8.2f}s", flush=True)
+          print("DONE", flush=True)
+          PYEOF
+          python /tmp/bench.py
+        resources:
+          requests:
+            google.com/tpu: 1
+          limits:
+            google.com/tpu: 1
