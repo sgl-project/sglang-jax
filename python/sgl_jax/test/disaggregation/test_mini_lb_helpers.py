@@ -1,6 +1,5 @@
 """Tests for mini_lb_helpers.py."""
 
-import pytest
 
 from sgl_jax.srt.disaggregation.mini_lb_helpers import (
     ensure_request_identity_fields,

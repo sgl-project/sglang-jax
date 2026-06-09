@@ -1,7 +1,7 @@
 """Tests for mini_lb.py FastAPI endpoints using TestClient."""
 
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 from sgl_jax.srt.disaggregation.mini_lb import MiniLoadBalancer, app
 from sgl_jax.srt.disaggregation.router_args import RouterArgs

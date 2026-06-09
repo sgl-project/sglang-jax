@@ -6,7 +6,6 @@ original all-layers-in-one-jit approach, across all page bucket sizes.
 
 from __future__ import annotations
 
-from functools import partial
 
 import jax
 import jax.numpy as jnp
@@ -164,7 +163,13 @@ class TestPadToPageBucket:
             (32, 32),
             (33, 64),
             (64, 64),
-            (65, 64),  # clamped to max bucket
+            (65, 128),
+            (128, 128),
+            (129, 256),
+            (256, 256),
+            (257, 512),
+            (512, 512),
+            (513, 1024),  # beyond largest bucket: rounds up, never truncates
         ],
     )
     def test_bucket_selection(self, input_pages, expected_bucket):

@@ -1,6 +1,5 @@
 """Tests for RouterArgs CLI parsing."""
 
-import pytest
 
 from sgl_jax.srt.disaggregation.router_args import RouterArgs
 
