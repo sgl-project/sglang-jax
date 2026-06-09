@@ -849,6 +849,10 @@ def restore_fused_draft_extend_result(draft_worker, model_worker_batch, pending_
 
     jax.copy_to_host_async(selected_layer0_hidden)
     jax.copy_to_host_async(topk_index_stacked)
+    if model_worker_batch.dp_size > 1:
+        from jax.experimental.multihost_utils import process_allgather
+
+        next_verified_id = process_allgather(next_verified_id, tiled=True)
     jax.copy_to_host_async(next_verified_id)
 
     batch_output.next_draft_input.hidden_states = np.asarray(selected_layer0_hidden)[sel]
