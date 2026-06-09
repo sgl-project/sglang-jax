@@ -65,19 +65,28 @@ def update_spec_relay_buffers(
     hidden_states = hidden_states.reshape((dp_size, per_dp_bs) + hidden_states.shape[1:])
     verified_id = verified_id.reshape((dp_size, per_dp_bs))
 
-    old_topk_index = buffers.topk_index[dp_indices, indices]
-    old_hidden_states = buffers.hidden_states[dp_indices, indices]
-    old_verified_id = buffers.verified_id[dp_indices, indices]
+    old_topk_index = buffers.topk_index.at[dp_indices, indices].get(
+        out_sharding=buffers.topk_index.sharding
+    )
+    old_hidden_states = buffers.hidden_states.at[dp_indices, indices].get(
+        out_sharding=buffers.hidden_states.sharding
+    )
+    old_verified_id = buffers.verified_id.at[dp_indices, indices].get(
+        out_sharding=buffers.verified_id.sharding
+    )
 
     return SpecRelayBuffers(
         topk_index=buffers.topk_index.at[dp_indices, indices].set(
-            jnp.where(valid[..., None], topk_index, old_topk_index)
+            jnp.where(valid[..., None], topk_index, old_topk_index),
+            out_sharding=buffers.topk_index.sharding,
         ),
         hidden_states=buffers.hidden_states.at[dp_indices, indices].set(
-            jnp.where(valid[..., None], hidden_states, old_hidden_states)
+            jnp.where(valid[..., None], hidden_states, old_hidden_states),
+            out_sharding=buffers.hidden_states.sharding,
         ),
         verified_id=buffers.verified_id.at[dp_indices, indices].set(
-            jnp.where(valid, verified_id, old_verified_id)
+            jnp.where(valid, verified_id, old_verified_id),
+            out_sharding=buffers.verified_id.sharding,
         ),
     )
 
@@ -94,13 +103,15 @@ def gather_spec_relay_buffers(
     dp_indices = jnp.arange(dp_size, dtype=jnp.int32)[:, None]
 
     return (
-        buffers.topk_index[dp_indices, indices].reshape(
-            future_indices.shape + buffers.topk_index.shape[2:]
-        ),
-        buffers.hidden_states[dp_indices, indices].reshape(
-            future_indices.shape + buffers.hidden_states.shape[2:]
-        ),
-        buffers.verified_id[dp_indices, indices].reshape(future_indices.shape),
+        buffers.topk_index.at[dp_indices, indices]
+        .get(out_sharding=buffers.topk_index.sharding)
+        .reshape(future_indices.shape + buffers.topk_index.shape[2:]),
+        buffers.hidden_states.at[dp_indices, indices]
+        .get(out_sharding=buffers.hidden_states.sharding)
+        .reshape(future_indices.shape + buffers.hidden_states.shape[2:]),
+        buffers.verified_id.at[dp_indices, indices]
+        .get(out_sharding=buffers.verified_id.sharding)
+        .reshape(future_indices.shape),
     )
 
 
