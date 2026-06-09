@@ -1834,9 +1834,17 @@ class Scheduler(
                     dp_rank * per_dp_bs_size : dp_rank * per_dp_bs_size + num_real_reqs
                 ]
 
-    def _apply_spec_decode_result(self, batch, batch_output, per_dp_bs):
+    def _apply_spec_decode_result(self, batch, batch_output, per_dp_bs, real_bs_per_dp=None):
+        cur_bs = [len(i.reqs) if i.reqs else 0 for i in batch.reqs_info]
+        if real_bs_per_dp is None:
+            real_bs_per_dp = cur_bs
+        elif os.path.exists("/tmp/p2a-kvdbg"):
+            assert list(real_bs_per_dp) == cur_bs, (
+                f"reqs drift between dispatch and finalize: "
+                f"dispatch={list(real_bs_per_dp)} now={cur_bs}"
+            )
         per_rank_spec = ScheduleBatch._split_spec_info_per_rank(
-            batch_output.next_draft_input, [len(i.reqs) for i in batch.reqs_info]
+            batch_output.next_draft_input, real_bs_per_dp
         )
         for r, s in enumerate(per_rank_spec):
             batch.reqs_info[r].spec_info = s
@@ -1867,7 +1875,9 @@ class Scheduler(
         pending = ret.spec_pending
         with jax.profiler.TraceAnnotation("spec_finalize_pending"):
             batch_output = pending.finalize()
-        self._apply_spec_decode_result(batch, batch_output, pending.per_dp_bs)
+        self._apply_spec_decode_result(
+            batch, batch_output, pending.per_dp_bs, real_bs_per_dp=pending.real_bs_per_dp
+        )
         for r in range(self.dp_size):
             batch_copy.reqs_info[r].spec_info = batch.reqs_info[r].spec_info
         ret.next_token_ids = np.asarray(batch_output.next_token_ids).tolist()

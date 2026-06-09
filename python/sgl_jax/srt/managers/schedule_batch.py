@@ -2511,7 +2511,10 @@ class ScheduleBatch:
         for info in self.reqs_info:
             # Create a new ScheduleReqsInfo with shallow copies of necessary fields
             new_info = ScheduleReqsInfo()
-            new_info.reqs = info.reqs  # Shallow copy (list reference)
+            # Snapshot the reqs list: merge_batch does in-place .extend() on
+            # running_batch.reqs_info[r].reqs, which would otherwise mutate this
+            # copy under overlap (process_batch_result(N) runs after prep(N+1)).
+            new_info.reqs = list(info.reqs) if info.reqs else info.reqs
             new_info.out_cache_loc = info.out_cache_loc
             new_info.decoding_reqs = info.decoding_reqs
             copied_reqs_info.append(new_info)
