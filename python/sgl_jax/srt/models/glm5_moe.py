@@ -29,6 +29,26 @@ from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 logger = logging.getLogger(__name__)
 
 
+_USE_FP32_ACCUM_FOR_TPU_V7X = None
+
+
+def _get_preferred_dtype(params_dtype) -> jnp.dtype:
+    global _USE_FP32_ACCUM_FOR_TPU_V7X
+    if _USE_FP32_ACCUM_FOR_TPU_V7X is not None:
+        return jnp.float32 if _USE_FP32_ACCUM_FOR_TPU_V7X else params_dtype
+
+    _USE_FP32_ACCUM_FOR_TPU_V7X = False
+    try:
+        devs = jax.devices()
+        if len(devs) > 0 and devs[0].platform == "tpu":
+            device_kind = getattr(devs[0], "device_kind", "")
+            if "7x" in device_kind or device_kind == "TPU7x":
+                _USE_FP32_ACCUM_FOR_TPU_V7X = True
+    except Exception:
+        pass
+    return jnp.float32 if _USE_FP32_ACCUM_FOR_TPU_V7X else params_dtype
+
+
 class GlmNorm(nnx.Module):
     def __init__(self, dim: int, dtype: jnp.dtype = jnp.bfloat16):
         self.weight = nnx.Param(jnp.ones((dim,), dtype=dtype))
@@ -277,6 +297,13 @@ class Glm5Attention(nnx.Module):
                     out_sharding=P(*uk_axes),
                 )
             )
+            self.w_vo = nnx.Param(
+                jnp.zeros(
+                    (self.kv_lora_rank, num_heads, hidden_size),
+                    dtype=dtype,
+                    out_sharding=P(None, "tensor", None),
+                )
+            )
             self.attn_mqa = RadixAttention(
                 num_heads=num_heads,
                 head_dim=self.kv_lora_rank + self.qk_rope_head_dim,
@@ -310,8 +337,15 @@ class Glm5Attention(nnx.Module):
             self.qk_nope_head_dim + self.v_head_dim,
         )
         self.w_uk.value = w_kv[:, :, : self.qk_nope_head_dim]
-        self.w_uv.value = w_kv[:, :, self.qk_nope_head_dim :]
+        w_uv_val = w_kv[:, :, self.qk_nope_head_dim :]
         self.kv_b_proj = None
+
+        # Fused Value-Output Weight Contraction: w_uv and o_proj.weight
+        w_o = self.o_proj.weight.value.reshape(self.num_heads, self.v_head_dim, -1)
+        # Contract: "r h d, h d c -> r h c"
+        self.w_vo.value = jnp.einsum("rhd,hdc->rhc", w_uv_val, w_o)
+        self.w_uv = None
+        self.o_proj = None
 
     def _forward_mqa(
         self,
@@ -333,9 +367,22 @@ class Glm5Attention(nnx.Module):
             q_rope=q_rope,
             k_rope=k_rope,
         )
-        o_v = jnp.einsum("thr,rhd->thd", attn_output, self.w_uv.value)
-        attn_output = o_v.reshape(-1, self.num_heads * self.v_head_dim)
-        return attn_output, kv_fused
+        preferred_dtype = _get_preferred_dtype(q_nope.dtype)
+
+        # Fused Value-Output Projection:
+        # attn_output shape: [num_heads, T, kv_lora_rank]
+        # w_vo shape: [kv_lora_rank, num_heads, hidden_size]
+        # Contract: attn_output(h, t, r) * w_vo(r, h, c) -> output_local(t, c)
+        output_local = jax.lax.dot_general(
+            attn_output,
+            self.w_vo.value,
+            (((2, 0), (0, 1)), ((), ())),
+            preferred_element_type=preferred_dtype,
+        )
+        
+        # RowParallel psum All-Reduce
+        output = jax.lax.psum(output_local, axis_name="tensor").astype(q_nope.dtype)
+        return output, kv_fused
 
     def _forward_mha(
         self,
@@ -393,12 +440,12 @@ class Glm5Attention(nnx.Module):
             attn_output, kv_fused = self._forward_mqa(
                 q_nope, q_rope, compressed, k_rope, forward_batch, token_to_kv_pool
             )
+            output = attn_output
         else:
             attn_output, kv_fused = self._forward_mha(
                 q_nope, q_rope, compressed, k_rope, forward_batch, token_to_kv_pool
             )
-
-        output, _ = self.o_proj(attn_output)
+            output, _ = self.o_proj(attn_output)
         return output, kv_fused
 
 
