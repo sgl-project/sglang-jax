@@ -1936,7 +1936,6 @@ class Scheduler(
                     draft_token_num=self.draft_worker.speculative_num_draft_tokens,
                 )
             if can_use_spec_decode_overlap(self.enable_overlap, self.spec_algorithm, batch):
-                self.draft_worker.prepare_speculative_decode_overlap(model_worker_batch)
                 batch_output, published_new_seq_lens = (
                     self.draft_worker.forward_batch_speculative_decode_overlap(model_worker_batch)
                 )

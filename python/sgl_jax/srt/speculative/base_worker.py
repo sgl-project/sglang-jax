@@ -141,13 +141,9 @@ class BaseSpecWorker:
         if not (self._can_use_fused_spec_decode and model_worker_batch.sampling_info.is_all_greedy):
             raise NotImplementedError("Spec overlap entry only supports fused greedy decode.")
 
-        prepared = getattr(model_worker_batch, "spec_decode_verify_prepare", None)
-        if prepared is None:
-            self._prepare_overlap_sampling_info(model_worker_batch)
-            sel = model_worker_batch.logits_indices_selector
-            cur_allocate_lens = np.asarray(model_worker_batch.spec_info_padded.allocate_lens)[sel]
-        else:
-            cur_allocate_lens = prepared.cur_allocate_lens
+        self._prepare_overlap_sampling_info(model_worker_batch)
+        sel = model_worker_batch.logits_indices_selector
+        cur_allocate_lens = np.asarray(model_worker_batch.spec_info_padded.allocate_lens)[sel]
 
         from sgl_jax.srt.speculative.draft_extend_fused import spec_decode_overlap
 
@@ -156,22 +152,6 @@ class BaseSpecWorker:
         if launch_done is not None:
             launch_done.set()
         return result
-
-    def prepare_speculative_decode_overlap(self, model_worker_batch: ModelWorkerBatch):
-        """Prepare decode-overlap verify metadata before entering the forward path."""
-        if not (self._can_use_fused_spec_decode and model_worker_batch.sampling_info.is_all_greedy):
-            return
-        self._prepare_overlap_sampling_info(model_worker_batch)
-        sel = model_worker_batch.logits_indices_selector
-        cur_allocate_lens = np.asarray(model_worker_batch.spec_info_padded.allocate_lens)[sel]
-
-        from sgl_jax.srt.speculative.draft_extend_fused import (
-            prepare_spec_decode_verify_phase,
-        )
-
-        model_worker_batch.spec_decode_verify_prepare = prepare_spec_decode_verify_phase(
-            self, model_worker_batch, cur_allocate_lens
-        )
 
     def forward_batch_speculative_generation(
         self, model_worker_batch: ModelWorkerBatch, launch_done=None
