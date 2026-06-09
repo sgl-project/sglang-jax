@@ -687,6 +687,8 @@ class EagleDraftInput:
             assign_req_to_token_pool(
                 info.req_pool_indices, schedule_batch.req_to_token_pool, old_r, new_r, ocl_r
             )
+            for j, req in enumerate(info.reqs):
+                req.kv_allocated_len = int(new_r[j])
             new_alloc_chunks.append(new_r)
             # Per-rank store (matches nospec extend); _get_spec_decode_mwb_dp
             # DP-segments these so each rank's P("data") shard = its own slots.

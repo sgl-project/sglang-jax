@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from typing import TYPE_CHECKING
 
@@ -114,7 +115,16 @@ class SchedulerOutputProcessorMixin:
             # Check finish conditions for each request in this DP rank
             for i, (req, next_token_id) in enumerate(zip(reqs, dp_output_ids)):
                 if req.finished() or req.is_retracted:
-                    # release_kv_cache owns over-allocated KV; freeing here would double-free.
+                    if (
+                        self.enable_overlap
+                        and batch.spec_algorithm is not None
+                        and batch.spec_algorithm.is_eagle()
+                        and req.finished()
+                        and req.req_pool_idx is not None
+                    ):
+                        # Deferred from process_batch_result_decode under overlap;
+                        # this round was mixed (decode+prefill) so we land here.
+                        self._free_spec_overalloc_and_release(req, dp_rank)
                     req_idx += 1
                     continue
 
@@ -285,16 +295,27 @@ class SchedulerOutputProcessorMixin:
         result.num_accepted_tokens = total_accepted - n_real
         return predict_tokens
 
-    def _free_spec_overalloc_and_release(self, req, cur_allocate_len: int, dp_rank: int):
-        """Free spec-decode over-allocated KV slots beyond committed length, then release."""
+    def _free_spec_overalloc_and_release(self, req, dp_rank: int):
+        """Free spec-decode over-allocated KV slots beyond committed length, then release.
+
+        Uses req.kv_allocated_len (bumped per-round in EagleDraftInput.prepare_for_decode)
+        as the upper bound, so this works regardless of which process_batch_result path
+        (decode/prefill/mixed) the deferred release lands in under overlap.
+        """
         all_token_len = req.kv_committed_len
         if self.page_size > 1:
             all_token_len = cdiv(all_token_len, self.page_size) * self.page_size
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, all_token_len:cur_allocate_len
+            req.req_pool_idx, all_token_len : req.kv_allocated_len
         ]
         kv_indices = kv_indices[kv_indices != 0]
         self.token_to_kv_pool_allocator.free(kv_indices, dp_rank)
+        if os.path.exists("/tmp/p2a-kvdbg"):
+            logger.info(
+                "[kvdbg] release rid=%s dp=%d committed=%d alloc=%d freed=%d",
+                req.rid[:8], dp_rank, req.kv_committed_len, req.kv_allocated_len, len(kv_indices),
+            )
+        req.kv_allocated_len = req.kv_committed_len
         release_kv_cache(req, self.tree_cache)
 
     def process_batch_result_decode(
@@ -372,11 +393,9 @@ class SchedulerOutputProcessorMixin:
                         # Under overlap, this req was marked finished in
                         # process_result(k) but already dispatched in round k+1
                         # before that. Its over-alloc free + req_pool release
-                        # were deferred there; do them now using round k+1's
-                        # allocate_lens (covers both round k and k+1 over-alloc).
-                        self._free_spec_overalloc_and_release(
-                            req, int(result.allocate_lens[req_idx]), dp_rank
-                        )
+                        # were deferred there; do them now (kv_allocated_len was
+                        # bumped to round k+1's alloc by prepare_for_decode).
+                        self._free_spec_overalloc_and_release(req, dp_rank)
                     req_idx += 1
                     continue
 
@@ -400,14 +419,13 @@ class SchedulerOutputProcessorMixin:
                     is_spec = batch.spec_algorithm is not None and batch.spec_algorithm.is_eagle()
                     if is_spec:
                         # Spec decode allocates via EagleDraftInput.prepare_for_decode
-                        # so kv_committed_len was never bumped past prefill; align to
-                        # the *unaligned* actual token count so cache_finished_req
-                        # frees decode pages without touching the page-0 sentinel.
-                        actual_token_len = len(req.origin_input_ids) + max(
+                        # (which bumps req.kv_allocated_len) but kv_committed_len was
+                        # never bumped past prefill; align to the *unaligned* actual
+                        # token count so cache_finished_req frees decode pages without
+                        # touching the page-0 sentinel.
+                        req.kv_committed_len = len(req.origin_input_ids) + max(
                             len(req.output_ids) - 1, 0
                         )
-                        req.kv_committed_len = actual_token_len
-                        req.kv_allocated_len = actual_token_len
                     # End trace for finished request
                     if precision_tracer.get_trace_active():
                         precision_tracer.set_request_status_to_completed(req.rid)
@@ -426,16 +444,14 @@ class SchedulerOutputProcessorMixin:
                             precision_tracer.stop_trace()
                     if is_spec and self.enable_overlap:
                         # Req is already in-flight on device for round k+1
-                        # (dispatched before this process_result(k) ran). Defer
-                        # over-alloc free + req_pool release to the finished
-                        # branch above on the next round, using round k+1's
-                        # allocate_lens, so req_pool_idx isn't recycled
-                        # mid-flight and both rounds' over-alloc are freed.
+                        # (dispatched before this process_result(k) ran).
+                        # prepare_for_decode(k+1) already bumped kv_allocated_len
+                        # to round k+1's alloc; defer free+release to next round's
+                        # already-finished branch (decode L353 or prefill L116) so
+                        # req_pool_idx isn't recycled mid-flight.
                         pass
                     elif is_spec:
-                        self._free_spec_overalloc_and_release(
-                            req, int(result.allocate_lens[req_idx]), dp_rank
-                        )
+                        self._free_spec_overalloc_and_release(req, dp_rank)
                     else:
                         release_kv_cache(req, self.tree_cache)
 
