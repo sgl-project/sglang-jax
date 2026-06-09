@@ -4,9 +4,13 @@ from __future__ import annotations
 
 import argparse
 import json
-import subprocess
+import os
+import sys
 from datetime import datetime, timedelta, timezone
 from typing import Any
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "utils"))
+from ci_common import gh_json, index_failure_issues, lookup_issue, utc_now
 
 DEFAULT_OUTPUT = "nightly-status.json"
 
@@ -22,10 +26,6 @@ def parse_time(value: str | None) -> datetime | None:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
-
-
-def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 def load_json_file(path: str | None, default: Any) -> Any:
@@ -45,26 +45,17 @@ def load_json_dict(path: str, description: str) -> dict[str, Any]:
     return data
 
 
-def issue_map(failure_issues: dict[str, Any] | None) -> dict[tuple[str, str], dict[str, Any]]:
-    mapping = {}
-    if not failure_issues:
-        return mapping
-    for item in failure_issues.get("failed_jobs", []):
-        mapping[(item.get("job_name", ""), item.get("failure_type", ""))] = item
-    return mapping
-
-
 def normalize_failed_jobs(
     classification: dict[str, Any] | None,
     failure_issues: dict[str, Any] | None,
 ) -> list[dict[str, Any]]:
     if not classification:
         return []
-    issues = issue_map(failure_issues)
+    index = index_failure_issues(failure_issues)
     failed = []
     for job in classification.get("failed_jobs", []):
         failure_type = job.get("failure_type", "bug")
-        issue = issues.get((job.get("name", ""), failure_type), {})
+        issue = lookup_issue(index, job.get("name", ""), failure_type) or {}
         failed.append(
             {
                 "name": job.get("name", ""),
@@ -189,23 +180,10 @@ def create_audit_issue(
         f"| Created at | {utc_now()} |\n\n"
         f"Justification:\n\n{justification}\n"
     )
-    result = subprocess.run(
-        [
-            "gh",
-            "api",
-            f"repos/{repo}/issues",
-            "--method",
-            "POST",
-            "--input",
-            "-",
-        ],
-        input=json.dumps({"title": title, "body": body}),
-        capture_output=True,
-        text=True,
-        check=True,
-        timeout=180,
+    data = gh_json(
+        ["api", f"repos/{repo}/issues", "--method", "POST", "--input", "-"],
+        input_text=json.dumps({"title": title, "body": body}),
     )
-    data = json.loads(result.stdout)
     return {"number": data["number"], "url": data["html_url"]}
 
 

@@ -109,15 +109,20 @@ jobs:
 
             ## Required output
 
-            Write a file `ai_bug_analysis.txt` with a concise plain-text
-            summary (max 400 chars total) suitable for inclusion in a Slack
-            notification. Use this format — one entry per bug-type job:
+            Write a file `ai_bug_analysis.txt` for inclusion in a Slack
+            notification. State only the key point, broken into bullets so it
+            scans at a glance. Use exactly this format — one block per
+            bug-type job:
 
-            *<job_name>*: <1-2 sentence root cause and suggested fix>
+            *<job_name>*
+            • Root cause: <one short sentence — the single key reason>
+            • Fix: <one short, actionable sentence>
 
-            No markdown headers, no code blocks, no bullet points.
-            Keep it terse — this goes into a Slack notification with a
-            3000 character limit.
+            Rules:
+            - One line per bullet; no second sentence, no wrapping prose.
+            - Omit stack traces, code blocks, file:line dumps, and evidence —
+              that lives in the run logs, not the Slack alert.
+            - Keep the whole file under ~600 chars. Fewer, sharper words win.
 
             ## Discipline
 

@@ -7,6 +7,8 @@ import subprocess
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "utils"))
+from ci_common import escape_mrkdwn as _escape_mrkdwn
+from failure_classifier import is_finish_gate
 from github_output import write_github_output
 
 
@@ -17,9 +19,12 @@ def _run_gh(args):
     ).stdout
 
 
-def _escape_mrkdwn(text):
-    """Escape Slack mrkdwn special characters."""
-    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+def _clamp(text, limit=600):
+    """Bound an AI-authored field so a non-bulleted wall can't flood Slack."""
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit].rsplit(" ", 1)[0].rstrip() + " …"
 
 
 def format_regression_summary(
@@ -32,7 +37,12 @@ def format_regression_summary(
     pr_number=None,
     branch_unverified=False,
 ):
-    """Format Slack mrkdwn summary for a post-merge regression."""
+    """Format Slack mrkdwn summary for a post-merge regression.
+
+    ``root_cause`` / ``suggested_fix`` are expected to be short bullet lines
+    from the bisect agent; each renders under its own header so the alert
+    stays scannable. The full causal chain lives in the PR comment.
+    """
     pr_link = ""
     if pr_url and pr_number:
         pr_link = f"  |  <{pr_url}|PR #{pr_number}>"
@@ -47,9 +57,11 @@ def format_regression_summary(
         f"{commit_part}{pr_link}  |  <{run_url}|View run>",
         "",
         f"*Failed jobs:* {_escape_mrkdwn(failed_jobs)}",
-        f"*Root cause:* {_escape_mrkdwn(root_cause)}",
-        f"*Suggested fix:* {_escape_mrkdwn(suggested_fix)}",
     ]
+    if root_cause.strip():
+        lines += ["", "*Root cause*", _escape_mrkdwn(_clamp(root_cause))]
+    if suggested_fix.strip():
+        lines += ["", "*Suggested fix*", _escape_mrkdwn(_clamp(suggested_fix))]
 
     text = "\n".join(lines)
     if len(text) > 2900:
@@ -100,7 +112,11 @@ def main():
     head_sha = run_meta["sha"]
     short_sha = head_sha[:7] if head_sha else ""
     run_url = result.get("run_url", "")
-    failed_jobs = ", ".join(result.get("failed_jobs", []))
+    all_failed = result.get("failed_jobs", [])
+    # Drop matrix *-finish aggregation gates (noise); keep the raw list if that
+    # would leave nothing to show.
+    shown_jobs = [j for j in all_failed if not is_finish_gate(j)] or all_failed
+    failed_jobs = ", ".join(shown_jobs)
     root_cause = result.get("root_cause", "")
     suggested_fix = result.get("suggested_fix", "")
 

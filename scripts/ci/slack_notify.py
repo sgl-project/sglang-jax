@@ -6,30 +6,14 @@ import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "utils"))
-from failure_classifier import FAILURE_TYPES, classify_jobs, get_failed_jobs
+from ci_common import escape_mrkdwn, issue_for_job, load_failure_issues
+from failure_classifier import (
+    FAILURE_TYPES,
+    classify_jobs,
+    get_failed_jobs,
+    is_finish_gate,
+)
 from github_output import write_github_output
-
-
-def _escape_mrkdwn(text):
-    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-
-def load_failure_issues(path):
-    if not path:
-        return {}
-    with open(path) as f:
-        data = json.load(f)
-    return {
-        (item.get("job_name", ""), item.get("failure_type", "")): item
-        for item in data.get("failed_jobs", [])
-    }
-
-
-def issue_for_job(job, failure_issue_map):
-    return failure_issue_map.get(
-        (job.get("name", ""), job.get("failure_type", "")),
-        failure_issue_map.get((job.get("name", ""), "")),
-    )
 
 
 def format_slack_summary(
@@ -37,18 +21,18 @@ def format_slack_summary(
 ):
     """Format compact Slack mrkdwn summary."""
     failure_issues = failure_issues or {}
-    display_jobs = [j for j in failed_jobs if not j["name"].endswith("-finish")]
+    display_jobs = [j for j in failed_jobs if not is_finish_gate(j["name"])]
     short_sha = commit_sha[:7] if len(commit_sha) >= 7 else commit_sha
     job_word = "job" if len(display_jobs) == 1 else "jobs"
     lines = [
         f":red_circle: *Nightly CI Failure* — {len(display_jobs)} {job_word} failed  |  <{run_url}|View run>"
     ]
-    safe_author = _escape_mrkdwn(author)
+    safe_author = escape_mrkdwn(author)
     lines.append(f"`{short_sha}` by {safe_author}")
     lines.append("")
     for job in display_jobs:
         ft = FAILURE_TYPES.get(job["failure_type"], FAILURE_TYPES["bug"])
-        safe_name = _escape_mrkdwn(job["name"])
+        safe_name = escape_mrkdwn(job["name"])
         safe_name = safe_name.replace("|", "/")
         job_url = job.get("html_url")
         job_ref = f"<{job_url}|{safe_name}>" if job_url else safe_name

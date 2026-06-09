@@ -170,11 +170,16 @@ jobs:
                  "classification": "code_regression|flaky_test|infrastructure|environment|not_applicable",
                  "confidence": "low|medium|high",
                  "failed_jobs": ["<job name>", "..."],
-                 "root_cause": "<one-paragraph explanation>",
+                 "root_cause": "<2-3 short bullet lines, key point only, each prefixed with '• '; no diff hunks / file:line / stack traces here>",
                  "evidence": "<concrete log excerpts / diff hunks / file:line references>",
-                 "suggested_fix": "<actionable next step, or 'none' for flaky/infra>"
+                 "suggested_fix": "<1-2 short bullet lines each prefixed with '• ', or 'none' for flaky/infra>"
                }
                ```
+
+               `root_cause` and `suggested_fix` feed a Slack alert, so keep
+               them terse and scannable — bullets, key point only. Put the
+               thorough causal chain, diff hunks, and full evidence in the PR
+               comment (output 4) and `evidence`, NOT in these two fields.
 
             2. **Append a markdown report to `$GITHUB_STEP_SUMMARY`** covering:
                classification, confidence, run URL, failed jobs, root cause,

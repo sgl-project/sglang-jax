@@ -7,7 +7,12 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "utils"))
 
-from failure_classifier import _FINISH_GATE_RE, _INFRASTRUCTURE_RE, classify_failure
+from failure_classifier import (
+    _FINISH_GATE_RE,
+    _INFRASTRUCTURE_RE,
+    classify_failure,
+    is_finish_gate,
+)
 from regression_notify import _escape_mrkdwn, format_regression_summary
 from slack_notify import format_slack_summary
 
@@ -87,6 +92,21 @@ class TestFinishGateRegex(unittest.TestCase):
 
     def test_finish_mid_name_no_match(self):
         self.assertIsNone(_FINISH_GATE_RE.search("finish-setup-job"))
+
+
+class TestIsFinishGate(unittest.TestCase):
+    """Shared is_finish_gate predicate used by slack/issue/regression."""
+
+    def test_matches_finish_gates(self):
+        self.assertTrue(is_finish_gate("pr-test-finish"))
+        self.assertTrue(is_finish_gate("nightly-test-daily-finish"))
+
+    def test_rejects_real_jobs(self):
+        self.assertFalse(is_finish_gate("e2e-test-4-tpu (2)"))
+        self.assertFalse(is_finish_gate("finish-setup-job"))
+
+    def test_handles_none(self):
+        self.assertFalse(is_finish_gate(None))
 
 
 class TestInfrastructureRegexNoFalsePositives(unittest.TestCase):
@@ -224,6 +244,29 @@ class TestFormatRegressionSummary(unittest.TestCase):
         self.assertIn("job&lt;a&gt;", summary)
         self.assertIn("a &amp; b &lt; c", summary)
         self.assertIn("x &gt; y", summary)
+
+    def test_bulleted_sections_on_own_lines(self):
+        summary = format_regression_summary(
+            "abc1234",
+            "https://run/1",
+            "job-a",
+            "• gate flipped below threshold\n• batch composition changed",
+            "• loosen the gate\n• do not revert",
+        )
+        self.assertIn("*Root cause*\n• gate flipped below threshold", summary)
+        self.assertIn("*Suggested fix*\n• loosen the gate", summary)
+
+    def test_long_field_is_clamped(self):
+        long_cause = "word " * 400  # ~2000 chars, far over the per-field cap
+        summary = format_regression_summary("abc1234", "https://run/1", "job-a", long_cause, "fix")
+        self.assertIn("…", summary)
+        # The clamp keeps the section well under the raw input length.
+        self.assertLess(len(summary), 1200)
+
+    def test_empty_fields_omit_sections(self):
+        summary = format_regression_summary("abc1234", "https://run/1", "job-a", "", "")
+        self.assertNotIn("*Root cause*", summary)
+        self.assertNotIn("*Suggested fix*", summary)
 
 
 class TestEscapeMrkdwn(unittest.TestCase):

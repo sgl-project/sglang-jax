@@ -8,7 +8,7 @@ import sys
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -476,11 +476,12 @@ class TestNightlyStatus(unittest.TestCase):
         self.assertIn("audit-issue-number=321", output.getvalue())
         self.assertIn("audit-issue-url=https://issue", output.getvalue())
 
-    @patch.object(nightly_status.subprocess, "run")
-    def test_emergency_override_creates_audit_issue_metadata(self, run):
-        run.return_value = Mock(
-            stdout=json.dumps({"number": 321, "html_url": "https://github.com/o/r/issues/321"})
-        )
+    @patch.object(nightly_status, "gh_json")
+    def test_emergency_override_creates_audit_issue_metadata(self, gh_json):
+        gh_json.return_value = {
+            "number": 321,
+            "html_url": "https://github.com/o/r/issues/321",
+        }
         audit = nightly_status.create_audit_issue(
             "o/r",
             "release hotfix",
@@ -494,7 +495,7 @@ class TestNightlyStatus(unittest.TestCase):
         )
         self.assertEqual(audit["number"], 321)
         self.assertEqual(audit["url"], "https://github.com/o/r/issues/321")
-        payload = json.loads(run.call_args.kwargs["input"])
+        payload = json.loads(gh_json.call_args.kwargs["input_text"])
         self.assertIn("alice", payload["body"])
         self.assertIn("v1.2.3", payload["body"])
         self.assertIn("1.2.3", payload["body"])

@@ -15,17 +15,15 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import subprocess
-from datetime import datetime, timezone
+import sys
 from typing import Any
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "utils"))
+from ci_common import gh_json, utc_now
+from failure_classifier import is_finish_gate
 
 ISSUE_MARKER_PREFIX = "ci-failure-monitor"
 DEFAULT_OUTPUT = "failure_issues.json"
-FINISH_JOB_SUFFIX = "-finish"
-
-
-def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 def sanitize_marker_value(value: str) -> str:
@@ -37,23 +35,6 @@ def build_marker(workflow_name: str, job_name: str, failure_type: str) -> str:
     job = sanitize_marker_value(job_name)
     kind = sanitize_marker_value(failure_type)
     return f"<!-- {ISSUE_MARKER_PREFIX}:workflow={workflow};job={job};failure_type={kind} -->"
-
-
-def run_gh(args: list[str], input_text: str | None = None) -> str:
-    result = subprocess.run(
-        ["gh"] + args,
-        input=input_text,
-        capture_output=True,
-        text=True,
-        check=True,
-        timeout=180,
-    )
-    return result.stdout.strip()
-
-
-def gh_json(args: list[str], input_text: str | None = None) -> Any:
-    output = run_gh(args, input_text=input_text)
-    return json.loads(output) if output else {}
 
 
 def load_classification(path: str) -> list[dict[str, Any]]:
@@ -101,6 +82,30 @@ def find_open_issue(repo: str, marker: str) -> dict[str, Any] | None:
     return None
 
 
+def failure_table(
+    *,
+    workflow_name: str,
+    run_id: str,
+    run_url: str,
+    job: dict[str, Any],
+    commit_sha: str,
+    commit_author: str,
+    timestamp: str,
+) -> str:
+    """Render the shared failure-detail table used by issues and comments."""
+    return (
+        "| Field | Value |\n"
+        "| --- | --- |\n"
+        f"| Workflow | {workflow_name} |\n"
+        f"| Run | [{run_id}]({run_url}) |\n"
+        f"| Job | [{job['name']}]({job.get('html_url', '')}) |\n"
+        f"| Commit | `{commit_sha}` |\n"
+        f"| Commit author | {commit_author} |\n"
+        f"| Failure type | `{job['failure_type']}` |\n"
+        f"| Updated at | {timestamp} |"
+    )
+
+
 def issue_payload(
     *,
     workflow_name: str,
@@ -119,18 +124,19 @@ def issue_payload(
         if assignees
         else "No CODEOWNERS file found; no fallback assignee configured."
     )
+    table = failure_table(
+        workflow_name=workflow_name,
+        run_id=run_id,
+        run_url=run_url,
+        job=job,
+        commit_sha=commit_sha,
+        commit_author=commit_author,
+        timestamp=timestamp,
+    )
     body = f"""{marker}
 ## CI Failure
 
-| Field | Value |
-| --- | --- |
-| Workflow | {workflow_name} |
-| Run | [{run_id}]({run_url}) |
-| Job | [{job['name']}]({job.get('html_url', '')}) |
-| Commit | `{commit_sha}` |
-| Commit author | {commit_author} |
-| Failure type | `{job['failure_type']}` |
-| Updated at | {timestamp} |
+{table}
 
 {owner_note}
 """
@@ -151,18 +157,19 @@ def comment_body(
     marker: str,
     timestamp: str,
 ) -> str:
+    table = failure_table(
+        workflow_name=workflow_name,
+        run_id=run_id,
+        run_url=run_url,
+        job=job,
+        commit_sha=commit_sha,
+        commit_author=commit_author,
+        timestamp=timestamp,
+    )
     return f"""{marker}
 ### CI Failure Recurrence
 
-| Field | Value |
-| --- | --- |
-| Workflow | {workflow_name} |
-| Run | [{run_id}]({run_url}) |
-| Job | [{job['name']}]({job.get('html_url', '')}) |
-| Commit | `{commit_sha}` |
-| Commit author | {commit_author} |
-| Failure type | `{job['failure_type']}` |
-| Updated at | {timestamp} |
+{table}
 """
 
 
@@ -198,7 +205,7 @@ def process_failed_jobs(
     records = []
 
     for job in failed_jobs:
-        if job["name"].endswith(FINISH_JOB_SUFFIX):
+        if is_finish_gate(job["name"]):
             continue
         marker = build_marker(workflow_name, job["name"], job["failure_type"])
         try:
