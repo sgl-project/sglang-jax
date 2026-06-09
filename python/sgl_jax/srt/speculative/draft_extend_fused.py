@@ -74,13 +74,10 @@ def build_padded_draft_input_from_pending(flat_spec, selector: np.ndarray, total
     topk_index = jax.device_put(pending_result.topk_index_stacked, data_sharding)
     hidden_states = pending_result.selected_layer0_hidden
     accept_lens = pending_result.accept_lens
-    verified_id = jax.device_put(
-        _select_next_verified_id(
-            batch_output.next_draft_input.verified_id,
-            accept_lens,
-            num_steps=topk_index.shape[1],
-        ),
-        data_sharding,
+    verified_id = _select_next_verified_id(
+        batch_output.next_draft_input.verified_id,
+        accept_lens,
+        num_steps=topk_index.shape[1],
     )
 
     def _scatter_host(arr):
@@ -92,7 +89,7 @@ def build_padded_draft_input_from_pending(flat_spec, selector: np.ndarray, total
         return out
 
     return EagleDraftInput(
-        topk_p=jax.device_put(jnp.ones_like(topk_index, dtype=jnp.float32), data_sharding),
+        topk_p=np.ones(topk_index.shape, dtype=np.float32),
         topk_index=topk_index,
         hidden_states=hidden_states,
         verified_id=verified_id,
