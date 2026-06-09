@@ -207,13 +207,9 @@ class FlashAttention(AttentionBackend):
         """Return the metadata for a forward pass."""
         # below code is for verify and draft extend phase
         metadata = FlashAttentionMetadata()
-        page_indices = getattr(batch, "eagle_page_indices", None)
-        if page_indices is None:
-            indices = np.arange(0, len(batch.cache_loc), self.page_size)
-            selected_cache_locs = batch.cache_loc[indices]
-            page_indices = (selected_cache_locs // self.page_size).astype(np.int32)
-        else:
-            page_indices = np.asarray(page_indices, dtype=np.int32)
+        indices = np.arange(0, len(batch.cache_loc), self.page_size)
+        selected_cache_locs = batch.cache_loc[indices]
+        page_indices = (selected_cache_locs // self.page_size).astype(np.int32)
 
         if batch.forward_mode == ForwardMode.TARGET_VERIFY:
             metadata.custom_mask = batch.spec_info_padded.custom_mask
@@ -352,14 +348,11 @@ class FlashAttention(AttentionBackend):
         return metadata
 
     def get_eagle_multi_step_metadata(self, batch: ModelWorkerBatch):
-        page_indices = getattr(batch, "eagle_page_indices", None)
-        if page_indices is None:
-            indices = np.arange(0, len(batch.cache_loc), self.page_size)
-            # NOTE: Use original_selected_cache_locs as the source of truth for all steps
-            # to avoid the bug where selected_cache_locs is overwritten by truncated data in loops.
-            original_selected_cache_locs = batch.cache_loc[indices]
-        else:
-            original_selected_cache_locs = np.asarray(page_indices, dtype=np.int32) * self.page_size
+
+        indices = np.arange(0, len(batch.cache_loc), self.page_size)
+        # NOTE: Use original_selected_cache_locs as the source of truth for all steps
+        # to avoid the bug where selected_cache_locs is overwritten by truncated data in loops.
+        original_selected_cache_locs = batch.cache_loc[indices]
         assert batch.forward_mode is ForwardMode.DECODE
 
         page_indices = []
