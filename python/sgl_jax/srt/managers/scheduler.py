@@ -885,6 +885,7 @@ class Scheduler(
                 continue
 
             self._finalize_pending_spec()
+            self._drain_deferred_spec_release()
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
 
@@ -1875,6 +1876,24 @@ class Scheduler(
         ret.accept_lens = batch_output.accept_lens
         ret.allocate_lens = batch_output.allocate_lens
         ret.spec_pending = None
+
+    def _drain_deferred_spec_release(self):
+        """Release finished spec reqs whose KV release was deferred under overlap.
+
+        process_batch_result_decode marks a req finished one round after it was
+        already re-dispatched (or skipped, if a prefill batch pre-empted decode
+        that round). The req is then dropped by filter_batch and never revisited
+        by process_batch_result. Sweep running_batch here — before filter_batch —
+        and release any finished req still holding req_pool_idx.
+        """
+        if self.spec_algorithm is None or self.spec_algorithm.is_none():
+            return
+        if self.running_batch is None or self.running_batch.is_empty():
+            return
+        for dp_rank, info in enumerate(self.running_batch.reqs_info):
+            for req in info.reqs or ():
+                if req.finished() and req.req_pool_idx is not None:
+                    self._free_spec_overalloc_and_release(req, dp_rank)
 
     def run_batch(self, batch: ScheduleBatch) -> GenerationBatchResult:
         """Run a batch."""
