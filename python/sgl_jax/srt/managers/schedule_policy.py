@@ -582,7 +582,15 @@ class PrefillAdder:
                 return AddReqResult.NO_TOKEN
 
         total_can_run = sum(len(v) for v in self.can_run_list.values())
-        if real_input_tokens >= self.rem_input_tokens and total_can_run != 0:
+        if (
+            self.rem_chunk_tokens_list is None
+            and real_input_tokens >= self.rem_input_tokens
+            and total_can_run != 0
+        ):
+            # Without chunked prefill, the full extend_input_len is committed this round,
+            # so gate on the global rem_input_tokens. With chunked prefill the per-round
+            # footprint is bounded by rem_chunk_tokens_list[dp_rank]; comparing the
+            # untruncated length here would serialize admission to one DP rank.
             return AddReqResult.OTHER
 
         with self._lock_node(req.last_node):
@@ -598,7 +606,11 @@ class PrefillAdder:
             input_tokens = self.ceil_paged_tokens(req.extend_input_len)
 
             total_can_run = sum(len(v) for v in self.can_run_list.values())
-            if input_tokens >= self.rem_input_tokens and total_can_run != 0:
+            if (
+                self.rem_chunk_tokens_list is None
+                and input_tokens >= self.rem_input_tokens
+                and total_can_run != 0
+            ):
                 return AddReqResult.OTHER
 
             if (
