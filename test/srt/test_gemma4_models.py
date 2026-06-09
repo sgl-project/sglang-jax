@@ -14,6 +14,18 @@ from sgl_jax.test.test_utils import (
     popen_launch_server,
     write_github_step_summary,
 )
+from transformers import AutoTokenizer
+
+_orig_from_pretrained = AutoTokenizer.from_pretrained
+
+
+def _patched_from_pretrained(pretrained_model_name_or_path, *args, **kwargs):
+    if "gemma-4" in str(pretrained_model_name_or_path):
+        kwargs["extra_special_tokens"] = {}
+    return _orig_from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
+
+
+AutoTokenizer.from_pretrained = _patched_from_pretrained
 
 
 class TestGemma4Model(CustomTestCase):
