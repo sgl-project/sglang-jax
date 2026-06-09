@@ -1,52 +1,11 @@
 import logging
 import os
 
-host0 = "10.128.0.2"
-host1 = "10.128.0.4"
-os.environ["TPU_WORKER_HOSTNAMES"] = f"{host0},{host1}"
-os.environ["TPU_PROCESS_ADDRESSES"] = f"{host0}:8471,{host1}:8471"
-
-# Override coordinator port to avoid "newer incarnation" crashes
-if "JAX_COORDINATOR_ADDRESS" in os.environ:
-    os.environ["JAX_COORDINATOR_ADDRESS"] = os.environ["JAX_COORDINATOR_ADDRESS"].rsplit(":", 1)[0] + ":10025"
-if "MEGASCALE_COORDINATOR_ADDRESS" in os.environ:
-    os.environ["MEGASCALE_COORDINATOR_ADDRESS"] = os.environ["MEGASCALE_COORDINATOR_ADDRESS"].rsplit(":", 1)[0] + ":10026"
-
 import jax
 
 # Set up logging immediately
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("test_kimi_int4_loading")
-
-# Set TPU overrides before JAX init and backend init
-process_id = int(os.environ.get("JAX_PROCESS_ID", 0))
-
-if process_id == 0:
-    os.environ["TPU_WORKER_HOSTNAMES"] = host0
-    os.environ["TPU_PROCESS_ADDRESSES"] = f"{host0}:8471"
-    os.environ["TPU_HOSTNAME_OVERRIDE"] = host0
-    os.environ["MEGASCALE_SLICE_ID"] = "0"
-elif process_id == 1:
-    os.environ["TPU_WORKER_HOSTNAMES"] = host1
-    os.environ["TPU_PROCESS_ADDRESSES"] = f"{host1}:8471"
-    os.environ["TPU_HOSTNAME_OVERRIDE"] = host1
-    os.environ["MEGASCALE_SLICE_ID"] = "1"
-    
-os.environ["TPU_HOST_BOUNDS"] = "1,1,1"
-os.environ["MEGASCALE_NUM_SLICES"] = "2"
-os.environ["MEGASCALE_COORDINATOR_ADDRESS"] = f"{host0}:9915"
-
-logger.info("TPU overrides set in Python: TPU_WORKER_HOSTNAMES=%s, TPU_HOSTNAME_OVERRIDE=%s, MEGASCALE_SLICE_ID=%s, TPU_HOST_BOUNDS=%s", 
-            os.environ["TPU_WORKER_HOSTNAMES"], os.environ["TPU_HOSTNAME_OVERRIDE"], os.environ["MEGASCALE_SLICE_ID"], os.environ["TPU_HOST_BOUNDS"])
-
-# Initialize JAX distributed as early as possible to avoid backend init issues
-if "JAX_COORDINATOR_ADDRESS" in os.environ:
-    logger.info("Initializing JAX distributed at startup...")
-    try:
-        jax.distributed.initialize()
-        logger.info("JAX Distributed Initialized successfully at startup.")
-    except Exception as e:
-        logger.info(f"JAX distributed init failed or already initialized: {e}")
 
 import numpy as np
 import jax.numpy as jnp
@@ -64,7 +23,7 @@ def main():
     devices = jax.devices()
     logger.info("Available JAX devices: %d (%s)", len(devices), [d.platform for d in devices])
     mesh = Mesh(
-        np.array(devices).reshape(1, 16),
+        np.array(devices).reshape(1, 8),
         axis_names=("data", "tensor"),
         axis_types=(AxisType.Explicit, AxisType.Explicit),
     )
@@ -77,14 +36,16 @@ def main():
         dtype="bfloat16"
     )
     
-    # Configure ideal sharding for 16 devices (EP=16, TP=16)
-    model_config.ep_size = 16
+    # Configure ideal sharding for 8 devices (EP=1, TP=8)
+    model_config.ep_size = 1
     if hasattr(model_config, "hf_config"):
-        model_config.hf_config.ep_size = 16
+        model_config.hf_config.ep_size = 1
         if hasattr(model_config.hf_config, "text_config") and model_config.hf_config.text_config is not None:
-            model_config.hf_config.text_config.ep_size = 16
+            model_config.hf_config.text_config.ep_size = 1
+            model_config.hf_config.text_config.n_routed_experts = 16
     if hasattr(model_config, "hf_text_config") and model_config.hf_text_config is not None:
-        model_config.hf_text_config.ep_size = 16
+        model_config.hf_text_config.ep_size = 1
+        model_config.hf_text_config.n_routed_experts = 16
     
     num_layers_env = os.environ.get("NUM_LAYERS")
     if num_layers_env is not None:

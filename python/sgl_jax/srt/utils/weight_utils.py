@@ -62,6 +62,8 @@ def _reinterpret_dtype_if_needed(data: np.ndarray, target_dtype: jnp.dtype) -> n
     return data
 
 def unpack_4bit_jax(lazy_weight: jax.Array, target_dtype: jnp.dtype) -> jax.Array:
+    import logging
+    logging.info(f"Trace unpack_4bit_jax (before): JAX TPU array lazy_weight dtype={lazy_weight.dtype}, target={target_dtype}")
     if lazy_weight.dtype in [jnp.int32, jnp.uint32]:
         shifts = jnp.arange(0, 32, 4, dtype=jnp.int32)
         unpacked = (lazy_weight[..., None] >> shifts) & 0x0F
@@ -73,8 +75,12 @@ def unpack_4bit_jax(lazy_weight: jax.Array, target_dtype: jnp.dtype) -> jax.Arra
     if target_dtype == jnp.int4:
         unpacked = unpacked.astype(jnp.int8)
         unpacked = jnp.where(unpacked >= 8, unpacked - 16, unpacked)
-        return unpacked.astype(jnp.int4)
-    return unpacked.astype(target_dtype)
+        final_array = unpacked.astype(jnp.int4)
+        logging.info(f"Trace unpack_4bit_jax (after): JAX TPU array casted to final dtype={final_array.dtype}")
+        return final_array
+    final_array = unpacked.astype(target_dtype)
+    logging.info(f"Trace unpack_4bit_jax (after): JAX TPU array casted to final dtype={final_array.dtype}")
+    return final_array
 
 
 
@@ -1256,7 +1262,6 @@ class WeightLoader:
         do_transpose: bool = False,
         target_sharding: jax.sharding.NamedSharding = None,
         physical_to_logical_map: np.ndarray | None = None,
-        param_dtype: jnp.dtype = None,
     ) -> jax.Array:
         """
         Lazy loader for TP-Split MOE weights (e.g., Grok MOE).
@@ -1383,14 +1388,13 @@ class WeightLoader:
             if remaining_logical:
                 with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
                     list(executor.map(load_and_fill_expert, remaining_logical))
-
+            
+            import logging
+            logging.info(f"Trace CPU Safetensor Read: out_array loaded into CPU RAM with dtype={out_array.dtype}")
             return out_array
 
         result = jax.make_array_from_callback(stacked_shape, sharding, _load_stacked_slice)
-        
-        if param_dtype in [jnp.int4, jnp.uint4, jnp.float4_e2m1fn] and result.dtype in [jnp.int32, jnp.uint32, jnp.int8, jnp.uint8]:
-            result = unpack_4bit_jax(result, param_dtype)
-        elif result.dtype != target_dtype:
+        if result.dtype != target_dtype:
             result = result.astype(target_dtype)
         if do_transpose and result.ndim >= 3:
             result = jnp.transpose(result, (0, 2, 1))
@@ -1404,7 +1408,6 @@ class WeightLoader:
         do_transpose: bool = False,
         target_sharding: jax.sharding.NamedSharding = None,
         physical_to_logical_map: np.ndarray | None = None,
-        param_dtype: jnp.dtype = None,
     ) -> jax.Array:
         first_key = expected_hf_keys[0]
         info = weight_info[first_key][0]
@@ -1972,6 +1975,8 @@ class WeightLoader:
                             )
                             lazy_weight = lazy_arrays[0]
 
+                        target_path = mapping.target_path
+                        model_param = self._get_param(params, target_path)
 
                         if model_param.value.dtype in [jnp.int4, jnp.uint4, jnp.float4_e2m1fn] and lazy_weight.dtype in [jnp.int32, jnp.uint32, jnp.int8, jnp.uint8]:
                             lazy_weight = unpack_4bit_jax(lazy_weight, model_param.value.dtype)
@@ -1989,9 +1994,6 @@ class WeightLoader:
                                 lazy_weight.astype(jnp.float32)
                                 * self.model_config.hf_config.output_multiplier_scale
                             )
-
-                        target_path = mapping.target_path
-                        model_param = self._get_param(params, target_path)
 
                         # Expand 2D block-quant scale to 3D kernel-ready layout.
                         lazy_weight = self._maybe_expand_linear_block_scale(
@@ -2102,13 +2104,20 @@ class WeightLoader:
                         # Standard Sharding
                         final_sharding = jax.sharding.NamedSharding(self.mesh, P(*mapping.sharding))
 
+                    target_path = mapping.target_path[0]
+                    model_param = self._get_param(params, target_path)
+
+                    is_int4_weight = model_param.value.dtype in [
+                        getattr(jnp, t) for t in ["int4", "uint4", "float4_e2m1fn"] if hasattr(jnp, t)
+                    ]
+
                     # 2. Call creator
                     _t_load_start = time.monotonic()
                     stacked_weight = self._create_stacked_moe_lazy_tensor(
                         expected_hf_keys,
                         weight_info,
                         file_manager,
-                        do_transpose=mapping.transpose,  # CPU transpose
+                        do_transpose=mapping.transpose if not is_int4_weight else False,
                         target_sharding=final_sharding,  # Global loading
                         physical_to_logical_map=mapping.physical_to_logical_map,
                     )
@@ -2122,9 +2131,14 @@ class WeightLoader:
                         axis, times = mapping.repeat
                         stacked_weight = jnp.repeat(stacked_weight, times, axis=axis)
 
+                    # Unpack 4-bit weights if needed (e.g. MoE int4)
+                    if is_int4_weight and stacked_weight.dtype in [jnp.int32, jnp.uint32, jnp.int8, jnp.uint8]:
+                        stacked_weight = unpack_4bit_jax(stacked_weight, model_param.value.dtype)
+                        # Perform the deferred transpose on TPU after unpacking
+                        if mapping.transpose:
+                            stacked_weight = jnp.transpose(stacked_weight, (0, 2, 1))
+
                     # 3. Direct assignment
-                    target_path = mapping.target_path[0]
-                    model_param = self._get_param(params, target_path)
                     stacked_weight = self._maybe_convert_epmoe_scale_for_kernel(
                         stacked_weight,
                         model_param,
