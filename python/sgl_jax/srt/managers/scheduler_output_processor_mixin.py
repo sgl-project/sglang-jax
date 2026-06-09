@@ -285,6 +285,18 @@ class SchedulerOutputProcessorMixin:
         result.num_accepted_tokens = total_accepted - n_real
         return predict_tokens
 
+    def _free_spec_overalloc_and_release(self, req, cur_allocate_len: int, dp_rank: int):
+        """Free spec-decode over-allocated KV slots beyond committed length, then release."""
+        all_token_len = req.kv_committed_len
+        if self.page_size > 1:
+            all_token_len = cdiv(all_token_len, self.page_size) * self.page_size
+        kv_indices = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, all_token_len:cur_allocate_len
+        ]
+        kv_indices = kv_indices[kv_indices != 0]
+        self.token_to_kv_pool_allocator.free(kv_indices, dp_rank)
+        release_kv_cache(req, self.tree_cache)
+
     def process_batch_result_decode(
         self: Scheduler,
         batch: ScheduleBatch,
@@ -351,7 +363,20 @@ class SchedulerOutputProcessorMixin:
             for i, (req, next_token_id) in enumerate(zip(reqs, dp_output_ids)):
                 req: Req
                 if self.enable_overlap and (req.finished() or req.is_retracted):
-                    # release_kv_cache owns over-allocated KV; freeing here would double-free.
+                    if (
+                        batch.spec_algorithm is not None
+                        and batch.spec_algorithm.is_eagle()
+                        and req.finished()
+                        and req.req_pool_idx is not None
+                    ):
+                        # Under overlap, this req was marked finished in
+                        # process_result(k) but already dispatched in round k+1
+                        # before that. Its over-alloc free + req_pool release
+                        # were deferred there; do them now using round k+1's
+                        # allocate_lens (covers both round k and k+1 over-alloc).
+                        self._free_spec_overalloc_and_release(
+                            req, int(result.allocate_lens[req_idx]), dp_rank
+                        )
                     req_idx += 1
                     continue
 
@@ -372,34 +397,15 @@ class SchedulerOutputProcessorMixin:
 
                 if req.finished():
                     self.maybe_collect_routed_experts(req)
-                    if batch.spec_algorithm is not None and batch.spec_algorithm.is_eagle():
-                        cur_allocate_len = int(info.spec_info.allocate_lens[i])
+                    is_spec = batch.spec_algorithm is not None and batch.spec_algorithm.is_eagle()
+                    if is_spec:
+                        # Spec decode allocates via EagleDraftInput.prepare_for_decode
+                        # so kv_committed_len was never bumped past prefill; align to
+                        # the *unaligned* actual token count so cache_finished_req
+                        # frees decode pages without touching the page-0 sentinel.
                         actual_token_len = len(req.origin_input_ids) + max(
                             len(req.output_ids) - 1, 0
                         )
-                        all_token_len = actual_token_len
-                        if self.page_size > 1:
-                            all_token_len = cdiv(all_token_len, self.page_size) * self.page_size
-                        kv_indices = self.req_to_token_pool.req_to_token[
-                            req.req_pool_idx,
-                            all_token_len:cur_allocate_len,
-                        ]
-                        kv_indices = kv_indices[kv_indices != 0]
-                        from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
-
-                        assert (
-                            len(kv_indices) <= EagleDraftInput.ALLOC_LEN_PER_DECODE
-                        ), f"redundant kv indices {len(kv_indices)=} should less than {EagleDraftInput.ALLOC_LEN_PER_DECODE=}"
-
-                        self.token_to_kv_pool_allocator.free(kv_indices, dp_rank)
-                        # Spec decode allocates via EagleDraftInput.prepare_for_decode,
-                        # not ScheduleBatch.prepare_for_decode, so kv_committed_len is
-                        # never bumped past prefill. cache_finished_req would then
-                        # free only the prefill page and leak every decode-allocated
-                        # page (visible on idle check_memory at bs=1). Use the
-                        # *unaligned* actual token count: ChunkCache.cache_finished_req
-                        # does NOT filter 0-valued req_to_token entries, so a
-                        # page-aligned length would free the page-0 sentinel.
                         req.kv_committed_len = actual_token_len
                         req.kv_allocated_len = actual_token_len
                     # End trace for finished request
@@ -418,7 +424,20 @@ class SchedulerOutputProcessorMixin:
                             >= precision_tracer.get_max_requests()
                         ):
                             precision_tracer.stop_trace()
-                    release_kv_cache(req, self.tree_cache)
+                    if is_spec and self.enable_overlap:
+                        # Req is already in-flight on device for round k+1
+                        # (dispatched before this process_result(k) ran). Defer
+                        # over-alloc free + req_pool release to the finished
+                        # branch above on the next round, using round k+1's
+                        # allocate_lens, so req_pool_idx isn't recycled
+                        # mid-flight and both rounds' over-alloc are freed.
+                        pass
+                    elif is_spec:
+                        self._free_spec_overalloc_and_release(
+                            req, int(result.allocate_lens[req_idx]), dp_rank
+                        )
+                    else:
+                        release_kv_cache(req, self.tree_cache)
 
                 if req.return_output_logprob_only:
                     req.output_token_logprobs_val.append(next_token_logprobs[req_idx])
