@@ -150,7 +150,18 @@ class SchedulerOutputProcessorMixin:
                                 >= precision_tracer.get_max_requests()
                             ):
                                 precision_tracer.stop_trace()
-                        release_kv_cache(req, self.tree_cache)
+                        if (
+                            self.enable_overlap
+                            and self.spec_algorithm is not None
+                            and self.spec_algorithm.is_eagle()
+                        ):
+                            # Round k+1 prepare_for_decode already bumped
+                            # kv_allocated_len; release_kv_cache would assert
+                            # committed==allocated. Defer to drain (req is in
+                            # running_batch after last_batch merge at k+1).
+                            pass
+                        else:
+                            release_kv_cache(req, self.tree_cache)
                     elif not info.decoding_reqs or req not in info.decoding_reqs:
                         # This updates radix so others can match
                         self.tree_cache.cache_unfinished_req(req)
