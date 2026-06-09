@@ -830,15 +830,15 @@ def launch_fused_draft_extend_for_decode(
         all_memory_pools.append(mr.memory_pools)
         all_leaves.append(tuple(mr.model_state_leaves))
 
-    sel_pos_device = jax.device_put(sel_pos, NamedSharding(draft_worker.mesh, P("data")))
+    data_sharding = NamedSharding(draft_worker.mesh, P("data"))
+    sel_pos_device = _device_array_preserve_device(sel_pos, data_sharding)
     update_relay = relay_buffers is not None
     if relay_future_indices is None:
         relay_future_indices = np.zeros(model_worker_batch.req_pool_indices.shape, dtype=np.int32)
     if relay_valid_mask is None:
         relay_valid_mask = np.zeros(model_worker_batch.req_pool_indices.shape, dtype=np.bool_)
-    data_sharding = NamedSharding(draft_worker.mesh, P("data"))
-    relay_future_indices = jax.device_put(relay_future_indices, data_sharding)
-    relay_valid_mask = jax.device_put(relay_valid_mask, data_sharding)
+    relay_future_indices = _device_array_preserve_device(relay_future_indices, data_sharding)
+    relay_valid_mask = _device_array_preserve_device(relay_valid_mask, data_sharding)
 
     if not hasattr(draft_worker, "_fused_jit_fn"):
         draft_worker._fused_jit_fn = _build_fused_draft_extend_jit(
@@ -1096,7 +1096,7 @@ def spec_decode_verify_phase(spec_worker, model_worker_batch, cur_allocate_lens)
     data_sharding = NamedSharding(spec_worker.mesh, P("data"))
     if relay_future_indices is None:
         relay_future_indices = np.zeros(model_worker_batch.seq_lens.shape, dtype=np.int32)
-    relay_future_indices = jax.device_put(relay_future_indices, data_sharding)
+    relay_future_indices = _device_array_preserve_device(relay_future_indices, data_sharding)
 
     if not hasattr(draft_worker, "_fused_greedy_verify_jit_fn"):
         draft_worker._fused_greedy_verify_jit_fn = _build_fused_greedy_verify_jit(
