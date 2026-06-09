@@ -10,7 +10,11 @@ import psutil
 from jax.sharding import NamedSharding, PartitionSpec
 
 from sgl_jax.srt.managers.utils import resolve_future_token_ids, set_future_token_ids
-from sgl_jax.srt.speculative.relay_buffer import create_spec_relay_buffers
+from sgl_jax.srt.speculative.relay_buffer import (
+    create_spec_relay_buffers,
+    gather_spec_relay_buffers,
+    update_spec_relay_buffers,
+)
 from sgl_jax.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -66,14 +70,16 @@ class SpecWorkerClient:
         self.worker = worker
         self.mesh = worker.mesh
         self.max_running_requests = worker.target_worker.max_running_requests
-        hidden_dtype = jnp.bfloat16 if worker.server_args.dtype == "bfloat16" else jnp.float32
+        self.spec_relay_hidden_dtype = (
+            jnp.bfloat16 if worker.server_args.dtype == "bfloat16" else jnp.float32
+        )
         self.spec_relay_buffers = create_spec_relay_buffers(
             self.mesh,
             worker.target_worker.model_runner.req_to_token_pool,
             dp_size=worker.server_args.dp_size,
             num_steps=worker.speculative_num_steps,
             hidden_size=worker.target_worker.model_config.hidden_size,
-            hidden_dtype=hidden_dtype,
+            hidden_dtype=self.spec_relay_hidden_dtype,
         )
         self.worker.spec_relay_buffers = self.spec_relay_buffers
         self.prefill_token_relay_ct = 0
@@ -97,6 +103,7 @@ class SpecWorkerClient:
 
     def run_spec_decode_precompile(self):
         self._precompile_prefill_token_relay()
+        self._precompile_spec_relay_buffers()
         self.worker.run_spec_decode_precompile()
 
     def _precompile_prefill_token_relay(self):
@@ -127,6 +134,52 @@ class SpecWorkerClient:
             jnp.zeros((self.max_running_requests * 5,), dtype=jnp.int32),
             NamedSharding(self.mesh, PartitionSpec(None)),
         )
+
+    def _precompile_spec_relay_buffers(self):
+        data_sharding = NamedSharding(self.mesh, PartitionSpec("data"))
+        dp_size = self.worker.server_args.dp_size
+        hidden_size = self.worker.target_worker.model_config.hidden_size
+        for bs in self.worker.precompile_bs_paddings:
+            if bs % dp_size != 0:
+                continue
+            future_indices = jax.device_put(
+                jnp.zeros((bs,), dtype=jnp.int32),
+                data_sharding,
+            )
+            valid_mask = jax.device_put(
+                jnp.zeros((bs,), dtype=jnp.bool_),
+                data_sharding,
+            )
+            topk_index = jax.device_put(
+                jnp.zeros((bs, self.worker.speculative_num_steps), dtype=jnp.int32),
+                data_sharding,
+            )
+            hidden_states = jax.device_put(
+                jnp.zeros((bs, hidden_size), dtype=self.spec_relay_hidden_dtype),
+                data_sharding,
+            )
+            verified_id = jax.device_put(
+                jnp.zeros((bs,), dtype=jnp.int32),
+                data_sharding,
+            )
+            jax.block_until_ready(
+                gather_spec_relay_buffers(
+                    self.spec_relay_buffers,
+                    future_indices,
+                    dp_size=dp_size,
+                )
+            )
+            self.spec_relay_buffers = update_spec_relay_buffers(
+                self.spec_relay_buffers,
+                future_indices,
+                valid_mask,
+                topk_index,
+                hidden_states,
+                verified_id,
+                dp_size=dp_size,
+            )
+            jax.block_until_ready(self.spec_relay_buffers)
+        self.worker.spec_relay_buffers = self.spec_relay_buffers
 
     def forward_thread_func(self):
         try:
