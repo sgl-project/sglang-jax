@@ -1,7 +1,7 @@
 name: Nightly Test Daily
 
-# NOTE: As of #1218 the daily nightly suites are empty shells. Coverage will
-# be redefined under #1117 (nightly vs daily split decision). The workflow is
+# NOTE: The daily nightly suites are currently empty shells. Coverage will be
+# redefined as part of the nightly vs daily split decision. The workflow is
 # kept so any new daily case can be added by populating run_suite.py without
 # restructuring CI.
 
@@ -36,7 +36,7 @@ jobs:
         uses: actions/checkout@v4
       - name: Setup Python environment
         uses: ./.github/actions/setup-venv
-      - name: Run accuracy daily suite (currently empty — see #1117)
+      - name: Run accuracy daily suite
         timeout-minutes: 10
         run: |
           cd test/srt
@@ -55,7 +55,7 @@ jobs:
         uses: actions/checkout@v4
       - name: Setup Python environment
         uses: ./.github/actions/setup-venv
-      - name: Run perf daily suite (currently empty — see #1117)
+      - name: Run perf daily suite
         timeout-minutes: 10
         run: |
           cd test/srt
@@ -102,7 +102,7 @@ jobs:
         uses: actions/checkout@v4
       - name: Setup Python environment
         uses: ./.github/actions/setup-venv
-      - name: Run infra smoke tests (#1207)
+      - name: Run infra smoke tests
         timeout-minutes: 30
         run: |
           cd test/srt
@@ -126,6 +126,82 @@ jobs:
           cd test/srt
           python3 nightly/single_host/suite_runner.py --suite accuracy-text-models-v6e-4
 
+  nightly-test-perf-text-models-4-tpu-daily:
+    if: github.repository == 'sgl-project/sglang-jax'
+    runs-on: arc-runner-v6e-4
+    env:
+      TZ: Asia/Shanghai
+      JAX_COMPILATION_CACHE_DIR: /xla-cache
+      SGLANG_JAX_MODEL_CACHE: /models/model_scope
+      SGLANG_JAX_PROFILER_DIR: ${{ github.workspace }}/test/nightly_test_output/perf/traces
+      RESULTS_DIR: ${{ github.workspace }}/test/nightly_test_output/perf
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Setup Python environment
+        uses: ./.github/actions/setup-venv
+      - name: Run 4-TPU perf daily suite
+        timeout-minutes: 480
+        env:
+          # Token for the trailing-baseline gate's ci-data reads (anonymous API
+          # gets rate-limited, silently disabling the trailing gate).
+          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+        run: |
+          cd test/srt
+          python3 nightly/single_host/suite_runner.py --suite perf-text-models-v6e-4
+      - name: Publish perf CSV to ci-data (main only)
+        if: github.ref == 'refs/heads/main' && github.repository == 'sgl-project/sglang-jax'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          # Stage as perf/<date>/<file>.csv — publish.py preserves the path under
+          # --source-dir, landing at ci-data perf/<date>/ (caller owns the layout).
+          DATE=$(date +'%Y-%m-%d')
+          STAGE=./perf_csv_stage/perf/$DATE
+          mkdir -p "$STAGE"
+          if cp ${{ github.workspace }}/test/nightly_test_output/perf/*.csv "$STAGE"/ 2>/dev/null; then
+            python3 scripts/ci/publish.py --data-type perf --source-dir ./perf_csv_stage
+          else
+            echo "::warning::No perf CSV to publish — suite produced no per-model CSV"
+          fi
+      - name: Publish perf traces to ci-data (main only)
+        if: github.ref == 'refs/heads/main' && github.repository == 'sgl-project/sglang-jax'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          # Namespace traces by date/run so runs don't pile up at the ci-data root.
+          DATE=$(date +'%Y-%m-%d')
+          STAGE=./perf_trace_stage/traces/$DATE/single-host-perf-${{ github.run_id }}
+          mkdir -p "$STAGE"
+          if cp -r ${{ github.workspace }}/test/nightly_test_output/perf/traces/. "$STAGE"/ 2>/dev/null; then
+            python3 scripts/ci/publish.py --data-type trace --source-dir ./perf_trace_stage
+          else
+            echo "::warning::No perf traces to publish"
+          fi
+      - name: Publish perf JSON to observability dashboard mount (main only)
+        if: github.ref == 'refs/heads/main' && github.repository == 'sgl-project/sglang-jax'
+        run: |
+          # observability bucket is gcsfuse-mounted (like /models), so this is a
+          # plain copy; layout matches multi-host, single-host- prefix marks source.
+          DATE=$(date +'%Y-%m-%d')
+          DEST="/observability-storage/${DATE}/single-host-perf-${{ github.run_id }}"
+          mkdir -p "$DEST"
+          cp ${{ github.workspace }}/test/nightly_test_output/perf/*.json "$DEST"/ 2>/dev/null \
+            && echo "Published perf JSON to $DEST" \
+            || echo "No perf JSON to publish"
+      - name: Upload perf results (per-model CSV + xprof traces)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-results-v6e-4-${{ github.run_id }}
+          path: ${{ github.workspace }}/test/nightly_test_output/perf
+          if-no-files-found: warn
+          retention-days: 30
+
   nightly-test-daily-finish:
     needs: [
       nightly-test-accuracy-text-models-1-tpu-daily,
@@ -134,6 +210,7 @@ jobs:
       multi-host-test-mimo-flash-daily,
       nightly-infra-smoke-1-tpu-daily,
       nightly-test-accuracy-text-models-4-tpu-daily,
+      nightly-test-perf-text-models-4-tpu-daily,
     ]
     if: always() && github.repository == 'sgl-project/sglang-jax'
     runs-on: ubuntu-latest
@@ -147,6 +224,7 @@ jobs:
           echo "multi-host-mimo-flash-daily: ${{ needs.multi-host-test-mimo-flash-daily.result }}"
           echo "infra-smoke-1-tpu-daily: ${{ needs.nightly-infra-smoke-1-tpu-daily.result }}"
           echo "accuracy-4-tpu-daily: ${{ needs.nightly-test-accuracy-text-models-4-tpu-daily.result }}"
+          echo "perf-4-tpu-daily: ${{ needs.nightly-test-perf-text-models-4-tpu-daily.result }}"
           echo ""
 
           has_failure=false
@@ -156,7 +234,8 @@ jobs:
             "openai-api-surface-1-tpu-daily=${{ needs.nightly-test-openai-api-surface-1-tpu-daily.result }}" \
             "multi-host-mimo-flash-daily=${{ needs.multi-host-test-mimo-flash-daily.result }}" \
             "infra-smoke-1-tpu-daily=${{ needs.nightly-infra-smoke-1-tpu-daily.result }}" \
-            "accuracy-4-tpu-daily=${{ needs.nightly-test-accuracy-text-models-4-tpu-daily.result }}"; do
+            "accuracy-4-tpu-daily=${{ needs.nightly-test-accuracy-text-models-4-tpu-daily.result }}" \
+            "perf-4-tpu-daily=${{ needs.nightly-test-perf-text-models-4-tpu-daily.result }}"; do
             job_name="${job_result%%=*}"
             result="${job_result#*=}"
             if [ "$job_name" = "multi-host-mimo-flash-daily" ] && [ "$result" = "skipped" ]; then

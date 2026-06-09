@@ -268,7 +268,17 @@ def publish(source_dir, data_type, run_id, run_number):
         def make_commit_message(count):
             return f"Nightly traces for run {run_id} at {run_number} ({count} files)"
 
-    else:  # bench or perf
+    elif data_type == "perf":
+        # Per-model perf CSV. Like bench, the path under --source-dir is preserved
+        # as-is; callers stage perf/<date>/<file>.csv (the caller owns the layout).
+        file_extension = ".csv"
+        no_files_msg = "No perf csv files found to upload"
+        success_msg = "Successfully published all perf csv files in a single commit"
+
+        def make_commit_message(count):
+            return f"Perf CSV of Nightly-test for run {run_id} at {run_number} ({count} files)"
+
+    else:  # bench
         file_extension = ".csv"
         no_files_msg = "No csv files found to upload"
         success_msg = "Successfully published all csv files in a single commit"
@@ -366,7 +376,7 @@ def main():
         type=str,
         required=True,
         choices=["bench", "perf", "trace"],
-        help="Type of data to publish: bench/perf (scans .csv) or trace (scans .json.gz)",
+        help="Type of data to publish: bench (scans .csv, ci-data root), perf (scans .csv, under perf/), or trace (scans .json.gz)",
     )
     args = parser.parse_args()
 

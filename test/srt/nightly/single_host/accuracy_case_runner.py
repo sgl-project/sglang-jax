@@ -18,17 +18,14 @@ for _p in (_TEST_SRT, _NIGHTLY_DIR, _SELF_DIR):
         sys.path.insert(0, _p)
 
 from cases import AccuracyCase  # noqa: E402
+from drivers import run_eval_for_case  # noqa: E402
 from profiles import (  # noqa: E402
     LaunchProfile,
     RuntimeConfig,
     build_other_server_args,
     load_profile,
 )
-from results import (  # noqa: E402
-    build_accuracy_result,
-    run_eval_for_case,
-    write_accuracy_result,
-)
+from results import build_accuracy_result, write_result  # noqa: E402
 
 from sgl_jax.test.test_utils import (  # noqa: E402
     _local_or_hf,
@@ -42,9 +39,9 @@ _LAUNCH_PROFILES_DIR = os.path.join(_NIGHTLY_DIR, "launch_profiles")
 # server's HTTP port.
 _DIST_INIT_PORT_OFFSET = 5000
 
-# Default gsm8k sampling for the 4-TPU accuracy gates (#1200): greedy decode.
+# Default gsm8k sampling for the 4-TPU accuracy gates: greedy decode.
 # Cases reference this so every AccuracyCase carries an explicit
-# generation_config, matching the per-case convention from #1226.
+# generation_config, matching the per-case convention.
 GSM8K_GENERATION_CONFIG = {"temperature": 0.0, "max_tokens": 2048}
 
 
@@ -80,7 +77,7 @@ def run_accuracy_case(
 
     result = build_accuracy_result(case, profile_name, target, metrics, started_at, finished_at)
 
-    out_path = write_accuracy_result(result, case.name)
+    out_path = write_result(result, case.name)
     if out_path is not None:
         print(f"[accuracy-runner] Wrote result to {out_path}", flush=True)
 

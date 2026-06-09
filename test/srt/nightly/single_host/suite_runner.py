@@ -1,20 +1,16 @@
-"""Single-host nightly accuracy suites (v6e-1 / v6e-4).
+"""Single-host nightly suites (v6e-1 / v6e-4) — accuracy and perf.
 
-The single-host analogue of ``multi_host/suite_runner.py``, with the same data
-model: a suite is a list of runs, each run is one launch profile plus a list of
-cases evaluated against the single server it launches. Run it directly (the
-4-TPU daily CI job does)::
+The single-host analogue of ``multi_host/suite_runner.py``: a suite is a list of
+runs, each run one launch profile + the cases evaluated against the server it
+launches (nnodes=1). Run it directly (the 4-TPU daily CI jobs do)::
 
     cd test/srt
     python3 nightly/single_host/suite_runner.py --suite accuracy-text-models-v6e-4
+    python3 nightly/single_host/suite_runner.py --suite perf-text-models-v6e-4
 
-Each ``SingleHostRun`` mirrors the multi-host ``ModelRun`` (``launch_profile`` +
-``cases``): all server args live in the profile YAML (one profile per config —
-e.g. epmoe vs fused are separate profiles), so there is no per-run override layer.
-The runner launches one server on this host (nnodes=1) from the profile,
-evaluates each ``AccuracyCase`` via ``accuracy_case_runner``, and gates on the
-score. Pass/fail is conveyed through the process exit code (same tagged codes as
-the multi-host runner) so CI can classify the result.
+``AccuracyCase`` / ``PerfCase`` are dispatched by type to their case runner.
+Pass/fail is conveyed through the process exit code (same tagged codes as the
+multi-host runner) so CI can classify the result.
 """
 
 import argparse
@@ -36,7 +32,14 @@ from accuracy_case_runner import (  # noqa: E402
     profile_server_spec,
     run_accuracy_case,
 )
-from cases import AccuracyCase, SuiteError  # noqa: E402
+from cases import (  # noqa: E402
+    AccuracyCase,
+    PerfCase,
+    PerfParams,
+    SuiteError,
+    perf_sweep_cases,
+)
+from perf_case_runner import run_perf_case  # noqa: E402
 
 from sgl_jax.srt.utils import kill_process_tree  # noqa: E402
 from sgl_jax.test.test_utils import (  # noqa: E402
@@ -62,7 +65,7 @@ class SingleHostRun:
     """
 
     launch_profile: str
-    cases: tuple[AccuracyCase, ...]
+    cases: tuple[AccuracyCase | PerfCase, ...]
 
     def __post_init__(self):
         # Allow call sites to pass a list for readability; freeze to a tuple.
@@ -91,10 +94,17 @@ SUITES: dict[str, SingleHostSuite] = {
     "accuracy-text-models-v6e-4": SingleHostSuite(
         name="accuracy-text-models-v6e-4",
         runs=[
-            # 1.1.1 Qwen3-8B dense × fa, TP4 (native variant out of scope — tracked in #1297)
+            # 1.1.1 Qwen3-8B dense × fa, TP4 (native variant out of scope)
             SingleHostRun(
                 launch_profile="qwen3-8b-fa-v6e-4.yaml",
                 cases=[_gsm8k_case("qwen3-8b-fa", "Qwen/Qwen3-8B", 0.85, 128)],
+            ),
+            # Qwen3-32B dense × fa, TP4 — correctness gate for the perf 32B config.
+            # Threshold 0.92 = measured gsm8k ~0.97 less ~0.05 margin to absorb
+            # run-to-run noise (same convention as the MoE/dense cases above).
+            SingleHostRun(
+                launch_profile="qwen3-32b-fa-v6e-4.yaml",
+                cases=[_gsm8k_case("qwen3-32b-fa", "Qwen/Qwen3-32B", 0.92, 128)],
             ),
             # 1.1.2 DeepSeek-Coder-V2-Lite-Instruct × {mla, fa_mha}, DP4×TP4
             SingleHostRun(
@@ -135,9 +145,8 @@ SUITES: dict[str, SingleHostSuite] = {
                 ],
             ),
             # 1.1.5 Qwen3-MoE-30B-A3B-FP8 (static FP8 checkpoint) × {epmoe, fused},
-            # TP4/EP4, drift gate vs bf16. Calibrated on v6e-4 after the FP8 loader
-            # fix (#1291): epmoe mean ~0.934, fused mean ~0.937 (≈ bf16). epmoe gated
-            # one notch below to absorb run-to-run gsm8k noise observed in CI.
+            # TP4/EP4, drift gate vs bf16. epmoe gated one notch below fused to
+            # absorb run-to-run gsm8k noise observed in CI.
             SingleHostRun(
                 launch_profile="qwen3-moe-fp8-epmoe-v6e-4.yaml",
                 cases=[_gsm8k_case("qwen3-moe-fp8-epmoe", "Qwen/Qwen3-30B-A3B-FP8", 0.92, 64)],
@@ -145,6 +154,59 @@ SUITES: dict[str, SingleHostSuite] = {
             SingleHostRun(
                 launch_profile="qwen3-moe-fp8-fused-v6e-4.yaml",
                 cases=[_gsm8k_case("qwen3-moe-fp8-fused", "Qwen/Qwen3-30B-A3B-FP8", 0.93, 64)],
+            ),
+        ],
+    ),
+    # 4-TPU perf sweeps. One server per model/config; concurrency points filtered
+    # to what each server can actually run concurrently (decode is KV-bound:
+    # dense ceiling ~41, MoE ~118 at i4096/o1024). Prefill (c{8,32} × i{4k,8k} × o1)
+    # fills for all; decode (× i4k × o1024) is trimmed per model. radix cache
+    # disabled. One full profile per config, at the largest decode point that fills.
+    "perf-text-models-v6e-4": SingleHostSuite(
+        name="perf-text-models-v6e-4",
+        runs=[
+            # 2.1.1 Qwen3-32B dense, TP4 + fa. Decode KV ceiling ~41 -> {16,32};
+            # repr/trace at c32 (c64 exceeds the ceiling).
+            SingleHostRun(
+                launch_profile="qwen3-32b-perf-v6e-4.yaml",
+                cases=perf_sweep_cases(
+                    "qwen3-32b",
+                    PerfParams(
+                        decode_concurrencies=(16, 32),
+                        profile_point=(32, 4096, 1024),
+                        floors={"out_tps": 865.6},
+                        prefill_floor_point=(32, 4096, 1),
+                        prefill_floors={"in_tps": 15629.7},
+                    ),
+                ),
+            ),
+            # 2.1.2a Qwen3-MoE-30B-A3B, full-EP (TP4/EP4), moe-backend=epmoe.
+            # Decode KV ceiling ~118 -> {32,64,96}; repr/trace at c64.
+            SingleHostRun(
+                launch_profile="qwen3-moe-epmoe-perf-v6e-4.yaml",
+                cases=perf_sweep_cases(
+                    "qwen3-moe-epmoe",
+                    PerfParams(
+                        decode_concurrencies=(32, 64, 96),
+                        floors={"out_tps": 1534.1},
+                        prefill_floor_point=(32, 4096, 1),
+                        prefill_floors={"in_tps": 24039.9},
+                    ),
+                ),
+            ),
+            # 2.1.2b Qwen3-MoE-30B-A3B, full-EP (TP4/EP4), moe-backend=fused.
+            # Same KV ceiling as epmoe (same checkpoint) -> {32,64,96}; repr at c64.
+            SingleHostRun(
+                launch_profile="qwen3-moe-fused-perf-v6e-4.yaml",
+                cases=perf_sweep_cases(
+                    "qwen3-moe-fused",
+                    PerfParams(
+                        decode_concurrencies=(32, 64, 96),
+                        floors={"out_tps": 1601.3},
+                        prefill_floor_point=(32, 4096, 1),
+                        prefill_floors={"in_tps": 31954.6},
+                    ),
+                ),
             ),
         ],
     ),
@@ -173,10 +235,11 @@ def run_one(run: SingleHostRun) -> None:
     """Launch one server for ``run`` and evaluate its cases.
 
     Collects per-case failures across all of ``run.cases`` — both gating misses
-    (threshold / no-score) and unexpected crashes from ``run_accuracy_case`` — and
-    raises a single SuiteError tagged with the dominant kind (a crash maps to
-    ``case`` so it surfaces as EXIT_CASE_CRASH, not retryable infra). Only genuine
-    infra errors (profile load, server launch) propagate as-is.
+    and unexpected crashes from the case runner — and raises a single SuiteError
+    tagged with the dominant kind (a crash maps to ``case`` so it surfaces as
+    EXIT_CASE_CRASH, not retryable infra). Only genuine infra errors (profile
+    load, server launch) propagate as-is. ``AccuracyCase`` and ``PerfCase`` are
+    dispatched by type to their case runner.
     """
     profile = load_profile_file(run.launch_profile)
     spec = profile_server_spec(profile)
@@ -191,12 +254,17 @@ def run_one(run: SingleHostRun) -> None:
     try:
         for case in run.cases:
             try:
-                result = run_accuracy_case(case, spec["base_url"], profile.name, profile.target)
+                if isinstance(case, PerfCase):
+                    result, fail = run_perf_case(
+                        case, spec["base_url"], spec["model"], profile.name, profile.target
+                    )
+                else:
+                    result = run_accuracy_case(case, spec["base_url"], profile.name, profile.target)
+                    fail = _gate_accuracy(case, result)
             except Exception as exc:  # noqa: BLE001 — a case crash is a bug, not infra
                 _log(f"{case.name}: CRASH — {exc!r}")
                 failures.append(("case", f"{case.name}: {exc!r}"))
                 continue
-            fail = _gate_accuracy(case, result)
             if fail:
                 _log(f"{case.name}: FAIL ({fail[0]}) — {fail[1]}")
                 failures.append(fail)
@@ -249,8 +317,9 @@ def _dry_run(suite: SingleHostSuite) -> dict:
                 "cases": [
                     {
                         "case": case.name,
-                        "model_id": case.model_id,
-                        "score_threshold": case.score_threshold,
+                        # accuracy-only fields; absent on PerfCase
+                        "model_id": getattr(case, "model_id", None),
+                        "score_threshold": getattr(case, "score_threshold", None),
                     }
                     for case in run.cases
                 ],
@@ -261,7 +330,7 @@ def _dry_run(suite: SingleHostSuite) -> dict:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run single-host SGL-JAX accuracy suites")
+    parser = argparse.ArgumentParser(description="Run single-host SGL-JAX nightly suites")
     parser.add_argument("--suite", required=True, choices=sorted(SUITES))
     parser.add_argument(
         "--cases",
