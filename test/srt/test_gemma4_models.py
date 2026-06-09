@@ -1,20 +1,21 @@
 import unittest
 from types import SimpleNamespace
 
+from transformers import AutoTokenizer
+
 from sgl_jax.bench_serving import run_benchmark
 from sgl_jax.srt.utils import kill_process_tree
 from sgl_jax.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
-    GEMMA4_31B_IT,
     GEMMA4_26B_A4B_IT,
+    GEMMA4_31B_IT,
     CustomTestCase,
     get_benchmark_args,
     is_in_ci,
     popen_launch_server,
     write_github_step_summary,
 )
-from transformers import AutoTokenizer
 
 _orig_from_pretrained = AutoTokenizer.from_pretrained
 

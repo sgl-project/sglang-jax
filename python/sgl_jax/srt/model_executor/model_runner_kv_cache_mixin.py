@@ -215,9 +215,23 @@ class ModelRunnerKVCacheMixin:
             return per_token * num_layers
 
         if self.model_config.has_global_head_dim:
-            full_heads_per_device, swa_heads_per_device, swa_layers, full_layers = self.model_config.get_local_global_head_counts(self.attention_tp_size)
-            full_cost = full_heads_per_device * align128(self.model_config.global_head_dim) * 2 * full_layers * dtype_size
-            swa_cost = swa_heads_per_device * align128(self.model_config.head_dim) * 2 * swa_layers * dtype_size
+            full_heads_per_device, swa_heads_per_device, swa_layers, full_layers = (
+                self.model_config.get_local_global_head_counts(self.attention_tp_size)
+            )
+            full_cost = (
+                full_heads_per_device
+                * align128(self.model_config.global_head_dim)
+                * 2
+                * full_layers
+                * dtype_size
+            )
+            swa_cost = (
+                swa_heads_per_device
+                * align128(self.model_config.head_dim)
+                * 2
+                * swa_layers
+                * dtype_size
+            )
             return int(full_cost + swa_cost)
 
         return (
@@ -459,7 +473,9 @@ class ModelRunnerKVCacheMixin:
                 swa_head_num = None
 
             full_head_dim = self.model_config.head_dim
-            full_head_num = self.model_config.get_total_num_kv_heads_with_replication(self.attention_tp_size)
+            full_head_num = self.model_config.get_total_num_kv_heads_with_replication(
+                self.attention_tp_size
+            )
             swa_head_dim = None
             if self.model_config.has_global_head_dim:
                 full_head_dim = self.model_config.global_head_dim

@@ -579,7 +579,9 @@ class ModelConfig:
         if hasattr(self, "_original_global_kv_heads"):
             return tensor_parallel_size > self._original_global_kv_heads
         if getattr(self.hf_text_config, "num_global_key_value_heads", None) is not None:
-            return tensor_parallel_size > getattr(self.hf_text_config, "num_global_key_value_heads", 1)
+            return tensor_parallel_size > getattr(
+                self.hf_text_config, "num_global_key_value_heads", 1
+            )
         total_num_kv_heads = self.get_total_num_kv_heads()
         return tensor_parallel_size > total_num_kv_heads
 
@@ -645,13 +647,18 @@ class ModelConfig:
                 swa_kv_heads_per_device * tensor_parallel_size
             )
 
-        if hasattr(self.hf_text_config, "num_global_key_value_heads") or hasattr(self.hf_text_config, "layer_types"):
+        if hasattr(self.hf_text_config, "num_global_key_value_heads") or hasattr(
+            self.hf_text_config, "layer_types"
+        ):
             orig_global = getattr(self.hf_text_config, "num_global_key_value_heads", 1)
             if not hasattr(self, "_original_global_kv_heads"):
                 self._original_global_kv_heads = orig_global
                 self._original_local_kv_heads = self._original_hf_num_key_value_heads
             from sgl_jax.srt.utils.jax_utils import get_num_kv_heads_by_tp
-            global_per_dev = get_num_kv_heads_by_tp(self._original_global_kv_heads, tensor_parallel_size)
+
+            global_per_dev = get_num_kv_heads_by_tp(
+                self._original_global_kv_heads, tensor_parallel_size
+            )
             self.hf_text_config.num_global_key_value_heads = global_per_dev * tensor_parallel_size
 
     def get_original_kv_head_id(self, tp_rank: int, tensor_parallel_size: int) -> int:
@@ -690,10 +697,13 @@ class ModelConfig:
         full_layers = len(layer_types) - swa_layers
 
         # Retrieve full attention vs sliding window KV head capacities
-        num_full_heads = getattr(cfg, "num_global_key_value_heads", getattr(cfg, "num_key_value_heads", 1))
+        num_full_heads = getattr(
+            cfg, "num_global_key_value_heads", getattr(cfg, "num_key_value_heads", 1)
+        )
         num_swa_heads = getattr(cfg, "num_key_value_heads", 1)
 
         from sgl_jax.srt.utils.jax_utils import get_num_kv_heads_by_tp
+
         full_heads_per_device = get_num_kv_heads_by_tp(num_full_heads, tensor_parallel_size)
         swa_heads_per_device = get_num_kv_heads_by_tp(num_swa_heads, tensor_parallel_size)
         return full_heads_per_device, swa_heads_per_device, swa_layers, full_layers
@@ -705,9 +715,15 @@ class ModelConfig:
             tuple: (global_head_dim, local_head_dim, original_local_heads, original_global_heads, target_heads)
         """
         cfg = getattr(self, "hf_text_config", self.hf_config)
-        orig_local_heads = getattr(self, "_original_local_kv_heads", getattr(self, "_original_hf_num_key_value_heads", 4))
+        orig_local_heads = getattr(
+            self, "_original_local_kv_heads", getattr(self, "_original_hf_num_key_value_heads", 4)
+        )
         orig_global_heads = getattr(self, "_original_global_kv_heads", orig_local_heads)
-        target_heads = getattr(cfg, "num_global_key_value_heads", getattr(cfg, "num_key_value_heads", orig_global_heads))
+        target_heads = getattr(
+            cfg,
+            "num_global_key_value_heads",
+            getattr(cfg, "num_key_value_heads", orig_global_heads),
+        )
         return cfg.global_head_dim, cfg.head_dim, orig_local_heads, orig_global_heads, target_heads
 
     def get_kv_padding_strategy(self) -> str:

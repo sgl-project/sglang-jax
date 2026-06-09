@@ -148,7 +148,10 @@ class ChatCompletionSampler(SamplerBase):
                     kwargs["extra_body"] = self.extra_body
                 response = self.client.chat.completions.create(**kwargs)
                 txt = response.choices[0].message.content or ""
-                if hasattr(response.choices[0].message, "reasoning_content") and response.choices[0].message.reasoning_content:
+                if (
+                    hasattr(response.choices[0].message, "reasoning_content")
+                    and response.choices[0].message.reasoning_content
+                ):
                     txt = f"{response.choices[0].message.reasoning_content}\n{txt}"
                 return txt
             # NOTE: BadRequestError is triggered once for MMMU, please uncomment if you are rerunning MMMU

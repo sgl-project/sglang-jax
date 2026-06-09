@@ -387,8 +387,12 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             return self.model_config.num_hidden_layers
 
         if self.model_config.has_global_head_dim:
-            full_heads_per_device, swa_heads_per_device, swa_layers, full_layers = self.model_config.get_local_global_head_counts(self.attention_tp_size)
-            ratio = (swa_heads_per_device * self.model_config.head_dim) / float(full_heads_per_device * self.model_config.global_head_dim)
+            full_heads_per_device, swa_heads_per_device, swa_layers, full_layers = (
+                self.model_config.get_local_global_head_counts(self.attention_tp_size)
+            )
+            ratio = (swa_heads_per_device * self.model_config.head_dim) / float(
+                full_heads_per_device * self.model_config.global_head_dim
+            )
             return ratio * swa_layers + full_layers
 
         swa_num_kv_heads = getattr(self.model_config.hf_config, "swa_num_key_value_heads", None)
@@ -416,6 +420,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             "Qwen3NextForCausalLM",
             "Qwen3NextForCausalLMMTP",
         ]
+
     def init_attention_backend(self):
         """Init attention kernel backend."""
         self.attn_backend = self._get_attention_backend()
@@ -620,8 +625,12 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         swa_full_tokens_ratio = self.server_args.swa_full_tokens_ratio
 
         if self.model_config.has_global_head_dim:
-            full_heads_per_device, swa_heads_per_device, _, _ = self.model_config.get_local_global_head_counts(self.attention_tp_size)
-            ratio = (swa_heads_per_device * self.model_config.head_dim) / float(full_heads_per_device * self.model_config.global_head_dim)
+            full_heads_per_device, swa_heads_per_device, _, _ = (
+                self.model_config.get_local_global_head_counts(self.attention_tp_size)
+            )
+            ratio = (swa_heads_per_device * self.model_config.head_dim) / float(
+                full_heads_per_device * self.model_config.global_head_dim
+            )
         else:
             swa_num_kv_heads = getattr(self.model_config.hf_config, "swa_num_key_value_heads", None)
             if swa_num_kv_heads is not None:

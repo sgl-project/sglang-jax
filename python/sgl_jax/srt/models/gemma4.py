@@ -11,11 +11,11 @@ from jax.sharding import PartitionSpec as P
 from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig
+from sgl_jax.srt.eplb.expert_location import topk_ids_logical_to_physical
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, get_rope
 from sgl_jax.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
-from sgl_jax.srt.eplb.expert_location import topk_ids_logical_to_physical
 from sgl_jax.srt.layers.moe import EPMoE, GateLogit, TopK
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
@@ -40,9 +40,15 @@ class Gemma4Router(nnx.Module):
         self.num_experts = getattr(config, "num_experts", 128)
         rms_norm_eps = getattr(config, "rms_norm_eps", 1e-6)
 
-        self.norm = RMSNorm(self.hidden_size, epsilon=rms_norm_eps, param_dtype=dtype, use_scale=False, scope_name="norm")
+        self.norm = RMSNorm(
+            self.hidden_size,
+            epsilon=rms_norm_eps,
+            param_dtype=dtype,
+            use_scale=False,
+            scope_name="norm",
+        )
         self.scale = nnx.Param(jnp.ones((self.hidden_size,), dtype=dtype))
-        self.root_size = self.hidden_size ** -0.5
+        self.root_size = self.hidden_size**-0.5
         self.proj = GateLogit(
             input_size=self.hidden_size,
             num_experts=self.num_experts,
@@ -145,18 +151,36 @@ class Gemma4Attention(nnx.Module):
                 rope_params["rope_type"] = "default"
             if "partial_rotary_factor" not in rope_params:
                 rope_params["partial_rotary_factor"] = 1.0
-            rope_theta = rope_params.get("rope_theta", getattr(config, "rope_local_base_freq", 10000.0))
+            rope_theta = rope_params.get(
+                "rope_theta", getattr(config, "rope_local_base_freq", 10000.0)
+            )
 
         if not self.is_sliding:
-            self.head_dim = getattr(config, "global_head_dim", getattr(config, "head_dim", self.hidden_size // self.num_heads))
+            self.head_dim = getattr(
+                config,
+                "global_head_dim",
+                getattr(config, "head_dim", self.hidden_size // self.num_heads),
+            )
         else:
-            self.head_dim = getattr(config, "swa_head_dim", getattr(config, "head_dim", self.hidden_size // self.num_heads))
+            self.head_dim = getattr(
+                config,
+                "swa_head_dim",
+                getattr(config, "head_dim", self.hidden_size // self.num_heads),
+            )
 
-        self.use_k_eq_v = ((not self.is_sliding) and getattr(config, "attention_k_eq_v", False))
+        self.use_k_eq_v = (not self.is_sliding) and getattr(config, "attention_k_eq_v", False)
         if self.use_k_eq_v:
-            self.num_kv_heads = getattr(config, "num_global_key_value_heads", getattr(config, "num_key_value_heads", self.num_heads))
+            self.num_kv_heads = getattr(
+                config,
+                "num_global_key_value_heads",
+                getattr(config, "num_key_value_heads", self.num_heads),
+            )
         else:
-            self.num_kv_heads = getattr(config, "swa_num_key_value_heads", getattr(config, "num_key_value_heads", self.num_heads))
+            self.num_kv_heads = getattr(
+                config,
+                "swa_num_key_value_heads",
+                getattr(config, "num_key_value_heads", self.num_heads),
+            )
 
         self.q_head_num = self.num_heads
         self.kv_head_num = self.num_kv_heads
@@ -171,9 +195,7 @@ class Gemma4Attention(nnx.Module):
             mesh=mesh,
             scope_name="q_proj",
         )
-        self.q_norm = GemmaRMSNorm(
-            self.head_dim, epsilon=rms_norm_eps, add_unit_offset=False
-        )
+        self.q_norm = GemmaRMSNorm(self.head_dim, epsilon=rms_norm_eps, add_unit_offset=False)
 
         self.k_proj = LinearBase(
             input_size=self.hidden_size,
@@ -184,9 +206,7 @@ class Gemma4Attention(nnx.Module):
             mesh=mesh,
             scope_name="k_proj",
         )
-        self.k_norm = GemmaRMSNorm(
-            self.head_dim, epsilon=rms_norm_eps, add_unit_offset=False
-        )
+        self.k_norm = GemmaRMSNorm(self.head_dim, epsilon=rms_norm_eps, add_unit_offset=False)
 
         if self.use_k_eq_v:
             self.v_proj = None
@@ -201,7 +221,11 @@ class Gemma4Attention(nnx.Module):
                 scope_name="v_proj",
             )
         self.v_norm = RMSNorm(
-            self.head_dim, epsilon=rms_norm_eps, param_dtype=dtype, use_scale=False, scope_name="v_norm"
+            self.head_dim,
+            epsilon=rms_norm_eps,
+            param_dtype=dtype,
+            use_scale=False,
+            scope_name="v_norm",
         )
 
         self.o_proj = LinearBase(
@@ -334,8 +358,12 @@ class Gemma4DecoderLayer(nnx.Module):
         self.enable_moe_block = getattr(config, "enable_moe_block", False)
         if self.enable_moe_block:
             num_experts = getattr(config, "num_experts", 128)
-            num_experts_per_tok = getattr(config, "num_experts_per_tok", getattr(config, "top_k_experts", 8))
-            moe_intermediate_size = getattr(config, "moe_intermediate_size", config.intermediate_size)
+            num_experts_per_tok = getattr(
+                config, "num_experts_per_tok", getattr(config, "top_k_experts", 8)
+            )
+            moe_intermediate_size = getattr(
+                config, "moe_intermediate_size", config.intermediate_size
+            )
 
             self.router = Gemma4Router(
                 config=config,
@@ -423,7 +451,9 @@ class Gemma4DecoderLayer(nnx.Module):
 
             router_logits = self.router(hidden_states)
             topk_weights, topk_ids = self.topk(router_logits, dispatch_info=None)
-            expert_scales = self.router.per_expert_scale.value.at[topk_ids].get(out_sharding=NamedSharding(self.mesh, P("data")))
+            expert_scales = self.router.per_expert_scale.value.at[topk_ids].get(
+                out_sharding=NamedSharding(self.mesh, P("data"))
+            )
             topk_weights = topk_weights * expert_scales
 
             dispatch_info = getattr(forward_batch, "expert_location_metadata", None)
@@ -530,7 +560,13 @@ class Gemma4Model(nnx.Module):
             hidden_states, "transformer_output", "TRANSFORMER"
         )
         layers_callback_flag.append(callback_flag)
-        return hidden_states, aux_hidden_states, layers_kv_fused, layers_callback_flag, layers_topk_ids
+        return (
+            hidden_states,
+            aux_hidden_states,
+            layers_kv_fused,
+            layers_callback_flag,
+            layers_topk_ids,
+        )
 
 
 class Gemma4ForCausalLM(nnx.Module):
@@ -584,7 +620,9 @@ class Gemma4ForCausalLM(nnx.Module):
                 if layer.enable_moe_block and layer.experts is not None:
                     key_gu = f"model.language_model.layers.{layer_idx}.experts.gate_up_proj"
                     if key_gu not in weight_info:
-                        key_gu = f"model.language_model.layers.{layer_idx}.experts.gate_up_proj.weight"
+                        key_gu = (
+                            f"model.language_model.layers.{layer_idx}.experts.gate_up_proj.weight"
+                        )
                     if key_gu not in weight_info:
                         key_gu = f"model.layers.{layer_idx}.experts.gate_up_proj"
                     if key_gu in weight_info:
@@ -594,13 +632,33 @@ class Gemma4ForCausalLM(nnx.Module):
                             F = tensor.shape[1] // 2
                             w0 = np.transpose(tensor[:, :F, :], (0, 2, 1))
                             w1 = np.transpose(tensor[:, F:, :], (0, 2, 1))
-                            sharding_w0 = jax.sharding.NamedSharding(layer.experts.moe_mesh, P("expert", None, "tensor")) if hasattr(layer.experts, 'moe_mesh') else None
-                            layer.experts.wi_0.value = jax.device_put(w0.astype(jnp.float32), sharding_w0).astype(self.dtype) if sharding_w0 else jnp.array(w0, dtype=self.dtype)
-                            layer.experts.wi_1.value = jax.device_put(w1.astype(jnp.float32), sharding_w0).astype(self.dtype) if sharding_w0 else jnp.array(w1, dtype=self.dtype)
-                    
+                            sharding_w0 = (
+                                jax.sharding.NamedSharding(
+                                    layer.experts.moe_mesh, P("expert", None, "tensor")
+                                )
+                                if hasattr(layer.experts, "moe_mesh")
+                                else None
+                            )
+                            layer.experts.wi_0.value = (
+                                jax.device_put(w0.astype(jnp.float32), sharding_w0).astype(
+                                    self.dtype
+                                )
+                                if sharding_w0
+                                else jnp.array(w0, dtype=self.dtype)
+                            )
+                            layer.experts.wi_1.value = (
+                                jax.device_put(w1.astype(jnp.float32), sharding_w0).astype(
+                                    self.dtype
+                                )
+                                if sharding_w0
+                                else jnp.array(w1, dtype=self.dtype)
+                            )
+
                     key_down = f"model.language_model.layers.{layer_idx}.experts.down_proj"
                     if key_down not in weight_info:
-                        key_down = f"model.language_model.layers.{layer_idx}.experts.down_proj.weight"
+                        key_down = (
+                            f"model.language_model.layers.{layer_idx}.experts.down_proj.weight"
+                        )
                     if key_down not in weight_info:
                         key_down = f"model.layers.{layer_idx}.experts.down_proj"
                     if key_down in weight_info:
@@ -608,8 +666,20 @@ class Gemma4ForCausalLM(nnx.Module):
                         with safetensors.safe_open(fn, framework="np", device="cpu") as f:
                             tensor = f.get_tensor(key_down)
                             wo = np.transpose(tensor, (0, 2, 1))
-                            sharding_wo = jax.sharding.NamedSharding(layer.experts.moe_mesh, P("expert", "tensor", None)) if hasattr(layer.experts, 'moe_mesh') else None
-                            layer.experts.wo.value = jax.device_put(wo.astype(jnp.float32), sharding_wo).astype(self.dtype) if sharding_wo else jnp.array(wo, dtype=self.dtype)
+                            sharding_wo = (
+                                jax.sharding.NamedSharding(
+                                    layer.experts.moe_mesh, P("expert", "tensor", None)
+                                )
+                                if hasattr(layer.experts, "moe_mesh")
+                                else None
+                            )
+                            layer.experts.wo.value = (
+                                jax.device_put(wo.astype(jnp.float32), sharding_wo).astype(
+                                    self.dtype
+                                )
+                                if sharding_wo
+                                else jnp.array(wo, dtype=self.dtype)
+                            )
 
         if getattr(self.config, "enable_moe_block", False) and loader.dummy_mode:
             ep_size = getattr(self.config, "ep_size", 1)
@@ -625,16 +695,24 @@ class Gemma4ForCausalLM(nnx.Module):
                 if layer.enable_moe_block and layer.experts is not None:
                     sharding_wi = jax.sharding.NamedSharding(moe_mesh, P("expert", None, "tensor"))
                     sharding_wo = jax.sharding.NamedSharding(moe_mesh, P("expert", "tensor", None))
-                    
+
                     shape_wi0 = layer.experts.wi_0.value.shape
                     shape_wi1 = layer.experts.wi_1.value.shape
                     shape_wo = layer.experts.wo.value.shape
-                    
-                    layer.experts.wi_0.value = jax.device_put(jnp.zeros(shape_wi0, dtype=self.dtype), sharding_wi)
-                    layer.experts.wi_1.value = jax.device_put(jnp.zeros(shape_wi1, dtype=self.dtype), sharding_wi)
-                    layer.experts.wo.value = jax.device_put(jnp.zeros(shape_wo, dtype=self.dtype), sharding_wo)
 
-        if hasattr(self, "lm_head") and isinstance(self.lm_head.embedding.value, jax.ShapeDtypeStruct):
+                    layer.experts.wi_0.value = jax.device_put(
+                        jnp.zeros(shape_wi0, dtype=self.dtype), sharding_wi
+                    )
+                    layer.experts.wi_1.value = jax.device_put(
+                        jnp.zeros(shape_wi1, dtype=self.dtype), sharding_wi
+                    )
+                    layer.experts.wo.value = jax.device_put(
+                        jnp.zeros(shape_wo, dtype=self.dtype), sharding_wo
+                    )
+
+        if hasattr(self, "lm_head") and isinstance(
+            self.lm_head.embedding.value, jax.ShapeDtypeStruct
+        ):
             logger.info("Tying lm_head weights to embed_tokens (lm_head not in safetensors)")
             self.lm_head.embedding = self.model.embed_tokens.embedding
 
@@ -665,7 +743,11 @@ class Gemma4ForCausalLM(nnx.Module):
         multimodal_mappings = {f"language_model.{k}": v for k, v in mappings.items()}
         mappings.update(multimodal_mappings)
 
-        model_lm_mappings = {k.replace("model.", "model.language_model."): v for k, v in mappings.items() if k.startswith("model.")}
+        model_lm_mappings = {
+            k.replace("model.", "model.language_model."): v
+            for k, v in mappings.items()
+            if k.startswith("model.")
+        }
         mappings.update(model_lm_mappings)
 
         return mappings
@@ -677,7 +759,7 @@ class Gemma4ForCausalLM(nnx.Module):
         if hasattr(self.config, "layer_types") and layer_idx < len(self.config.layer_types):
             layer_type = self.config.layer_types[layer_idx]
         is_sliding = layer_type == "sliding_attention"
-        use_k_eq_v = ((not is_sliding) and getattr(self.config, "attention_k_eq_v", False))
+        use_k_eq_v = (not is_sliding) and getattr(self.config, "attention_k_eq_v", False)
 
         mappings = {
             f"{prefix}.layer_scalar": WeightMapping(
@@ -764,19 +846,29 @@ class Gemma4ForCausalLM(nnx.Module):
                     target_path=f"{target_prefix}.router.scale", sharding=(None,), transpose=False
                 ),
                 f"{prefix}.router.per_expert_scale": WeightMapping(
-                    target_path=f"{target_prefix}.router.per_expert_scale", sharding=(None,), transpose=False
+                    target_path=f"{target_prefix}.router.per_expert_scale",
+                    sharding=(None,),
+                    transpose=False,
                 ),
                 f"{prefix}.router.proj.weight": WeightMapping(
-                    target_path=f"{target_prefix}.router.proj.kernel", sharding=(None, None), transpose=True
+                    target_path=f"{target_prefix}.router.proj.kernel",
+                    sharding=(None, None),
+                    transpose=True,
                 ),
                 f"{prefix}.post_feedforward_layernorm_1.weight": WeightMapping(
-                    target_path=f"{target_prefix}.post_feedforward_layernorm_1.weight", sharding=(None,), transpose=False
+                    target_path=f"{target_prefix}.post_feedforward_layernorm_1.weight",
+                    sharding=(None,),
+                    transpose=False,
                 ),
                 f"{prefix}.post_feedforward_layernorm_2.weight": WeightMapping(
-                    target_path=f"{target_prefix}.post_feedforward_layernorm_2.weight", sharding=(None,), transpose=False
+                    target_path=f"{target_prefix}.post_feedforward_layernorm_2.weight",
+                    sharding=(None,),
+                    transpose=False,
                 ),
                 f"{prefix}.pre_feedforward_layernorm_2.weight": WeightMapping(
-                    target_path=f"{target_prefix}.pre_feedforward_layernorm_2.weight", sharding=(None,), transpose=False
+                    target_path=f"{target_prefix}.pre_feedforward_layernorm_2.weight",
+                    sharding=(None,),
+                    transpose=False,
                 ),
             }
             mappings.update(moe_norm_mappings)
@@ -819,8 +911,8 @@ class Gemma4ForCausalLM(nnx.Module):
         logits_metadata: LogitsMetadata,
     ):
         kv_pool = memory_pools.token_to_kv_pool
-        hidden_states, aux_hidden_states, layers_kv_fused, layers_callback_flag, layers_topk_ids = self.model(
-            forward_batch, kv_pool
+        hidden_states, aux_hidden_states, layers_kv_fused, layers_callback_flag, layers_topk_ids = (
+            self.model(forward_batch, kv_pool)
         )
         if not getattr(self.config, "tie_word_embeddings", True):
             output = self.logits_processor(

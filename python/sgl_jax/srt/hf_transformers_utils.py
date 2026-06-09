@@ -19,6 +19,7 @@ from transformers import (
     PreTrainedTokenizerFast,
 )
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
+
 from sgl_jax.srt.configs.bailing_hybrid import BailingHybridConfig
 from sgl_jax.srt.configs.gemma4 import Gemma4Config
 from sgl_jax.srt.configs.kimi_linear import KimiLinearConfig
@@ -61,7 +62,9 @@ AutoConfig.register("qwen3_5_moe", Qwen3_5HybridConfig, exist_ok=True)
 _UNSET = object()
 
 
-def download_from_hf(model_path: str, allow_patterns: list[str] | None = _UNSET, cache_dir: str | None = None):
+def download_from_hf(
+    model_path: str, allow_patterns: list[str] | None = _UNSET, cache_dir: str | None = None
+):
     if os.path.exists(model_path):
         return model_path
 
@@ -285,8 +288,9 @@ def get_tokenizer(
     try:
         config_path = os.path.join(tokenizer_name, "config.json")
         if os.path.exists(config_path):
-            with open(config_path, "r") as f:
+            with open(config_path) as f:
                 import json
+
                 model_config_data = json.load(f)
                 if model_config_data.get("model_type") == "gemma4":
                     kwargs.setdefault("extra_special_tokens", {})
@@ -312,11 +316,10 @@ def get_tokenizer(
         try:
             jinja_template_path = os.path.join(tokenizer_name, "chat_template.jinja")
             if os.path.exists(jinja_template_path):
-                with open(jinja_template_path, "r") as f:
+                with open(jinja_template_path) as f:
                     tokenizer.chat_template = f.read()
         except Exception:
             pass
-
 
     except Exception as e:
         if tokenizer_backend == "fastokens":

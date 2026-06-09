@@ -228,10 +228,10 @@ class Gemma4Detector(BaseReasoningFormatDetector):
 
     def detect_and_parse(self, text: str) -> StreamingParseResult:
         if text.startswith("<|channel>thought\n"):
-            text = text[len("<|channel>thought\n"):]
+            text = text[len("<|channel>thought\n") :]
             self._in_reasoning = True
         elif text.startswith("thought\n"):
-            text = text[len("thought\n"):]
+            text = text[len("thought\n") :]
             self._in_reasoning = True
 
         if not self._in_reasoning and "<channel|>" in text:
@@ -256,16 +256,18 @@ class Gemma4Detector(BaseReasoningFormatDetector):
         current_text = self._buffer
 
         tokens_to_check = [self.think_start_token, "thought\n", self.think_end_token]
-        if any(token.startswith(current_text) and token != current_text for token in tokens_to_check):
+        if any(
+            token.startswith(current_text) and token != current_text for token in tokens_to_check
+        ):
             return StreamingParseResult()
 
         if not self.stripped_think_start:
             if current_text.startswith("<|channel>thought\n"):
-                current_text = current_text[len("<|channel>thought\n"):]
+                current_text = current_text[len("<|channel>thought\n") :]
                 self.stripped_think_start = True
                 self._in_reasoning = True
             elif current_text.startswith("thought\n"):
-                current_text = current_text[len("thought\n"):]
+                current_text = current_text[len("thought\n") :]
                 self.stripped_think_start = True
                 self._in_reasoning = True
 
@@ -275,7 +277,9 @@ class Gemma4Detector(BaseReasoningFormatDetector):
             self._buffer = ""
             self._in_reasoning = False
             normal_text = current_text[end_idx + len(self.think_end_token) :]
-            return StreamingParseResult(normal_text=normal_text, reasoning_text=reasoning_text.rstrip())
+            return StreamingParseResult(
+                normal_text=normal_text, reasoning_text=reasoning_text.rstrip()
+            )
 
         if self._in_reasoning:
             if self.stream_reasoning:

@@ -32,6 +32,7 @@ from sgl_jax.srt.utils.common_utils import get_bool_env_var, retry
 _MODEL_CACHE_ENV = "SGLANG_JAX_MODEL_CACHE"
 _LOCAL_MODEL_LOG_ONCE: set[str] = set()
 
+
 def _validate_local_snapshot(d: Path) -> bool:
     if not d.is_dir():
         return False

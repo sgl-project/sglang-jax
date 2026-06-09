@@ -198,9 +198,7 @@ class GemmaRMSNorm(nnx.Module):
         self.add_unit_offset = add_unit_offset
         init_fn = nnx.initializers.ones if not add_unit_offset else nnx.initializers.zeros
         self.weight = nnx.Param(
-            nnx.with_partitioning(init_fn, kernel_axes)(
-                jax.random.PRNGKey(0), (hidden_size,)
-            )
+            nnx.with_partitioning(init_fn, kernel_axes)(jax.random.PRNGKey(0), (hidden_size,))
         )
 
     @named_scope
