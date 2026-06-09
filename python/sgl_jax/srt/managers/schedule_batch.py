@@ -2592,17 +2592,17 @@ class ScheduleBatch:
         if any(getattr(s, "pending_draft_extend_result", None) is not None for s in nonempty):
             from sgl_jax.srt.speculative.eagle_util import PendingDraftExtendResultSlice
 
+            pending_values = []
             for spec_info in nonempty:
                 p = getattr(spec_info, "pending_draft_extend_result", None)
-                assert (
-                    p is not None
-                ), "_concat_spec_info_per_rank: mixed pending/non-pending spec_info"
                 if isinstance(p, PendingDraftExtendResultSlice):
                     p = p.pending_draft_extend_result
-                if pending is None:
-                    pending = p
-                else:
-                    assert p is pending, "_concat_spec_info_per_rank: mixed pending draft results"
+                pending_values.append(p)
+            if all(p is not None and p is pending_values[0] for p in pending_values):
+                pending = pending_values[0]
+            else:
+                for spec_info in nonempty:
+                    spec_info.resolve_pending_draft_extend_result()
         else:
             for spec_info in nonempty:
                 spec_info.resolve_pending_draft_extend_result()
