@@ -2393,12 +2393,12 @@ class ScheduleBatch:
             if spec_info is None:
                 flat_spec.resolve_pending_draft_extend_result()
                 spec_info = self._scatter_spec_info_to_dp_slots(
-                    flat_spec, logits_indices_selector, total_bs
+                    flat_spec, logits_indices_selector, total_bs, mesh=self.mesh
                 )
         else:
             flat_spec.resolve_pending_draft_extend_result()
             spec_info = self._scatter_spec_info_to_dp_slots(
-                flat_spec, logits_indices_selector, total_bs
+                flat_spec, logits_indices_selector, total_bs, mesh=self.mesh
             )
         # Per-rank out_cache_loc chunks (set in spec prepare_for_decode) have
         # variable length (∝ accept_len). DP-segment: pad each to max_len with
@@ -2466,7 +2466,9 @@ class ScheduleBatch:
         )
 
     @staticmethod
-    def _scatter_spec_info_to_dp_slots(flat, selector: np.ndarray, total_bs: int):
+    def _scatter_spec_info_to_dp_slots(
+        flat, selector: np.ndarray, total_bs: int, mesh: mesh_lib.Mesh = None
+    ):
         """Scatter global-flat spec_info arrays into DP-padded ``(total_bs, …)``.
 
         ``selector[k]`` is the DP-padded slot of the k-th global-flat req
@@ -2474,7 +2476,7 @@ class ScheduleBatch:
         the cross-round flat state on ``reqs_info[r].spec_info`` is unchanged.
         """
 
-        def _scatter1(arr, *, require_selector_len: bool = True):
+        def _scatter1(arr, *, require_selector_len: bool = True, data_sharded: bool = False):
             if arr is None:
                 return None
             a = np.asarray(arr)
@@ -2482,13 +2484,18 @@ class ScheduleBatch:
                 return None
             out = np.zeros((total_bs,) + a.shape[1:], dtype=a.dtype)
             out[selector] = a
+            if data_sharded and mesh is not None:
+                from jax.sharding import NamedSharding
+                from jax.sharding import PartitionSpec as P
+
+                return jax.device_put(out, NamedSharding(mesh, P("data")))
             return out
 
         return type(flat)(
-            topk_p=_scatter1(flat.topk_p),
-            topk_index=_scatter1(flat.topk_index),
+            topk_p=_scatter1(flat.topk_p, data_sharded=True),
+            topk_index=_scatter1(flat.topk_index, data_sharded=True),
             hidden_states=_scatter1(flat.hidden_states),
-            verified_id=_scatter1(flat.verified_id),
+            verified_id=_scatter1(flat.verified_id, data_sharded=True),
             allocate_lens=_scatter1(flat.allocate_lens),
             capture_hidden_mode=flat.capture_hidden_mode,
             accept_length=_scatter1(flat.accept_length),
