@@ -50,6 +50,15 @@ class SpecDecodePendingDraftExtendResult(NamedTuple):
     pending_result: FusedDraftExtendPendingResult | None
 
 
+class PreparedSpecDecodeVerify(NamedTuple):
+    previous_verified_id: object
+    previous_token_list: object
+    target_forward_metadata: object
+    target_forward_batch: object
+    target_logits_metadata: object
+    cur_allocate_lens: object
+
+
 @partial(jax.jit, static_argnames=("num_steps",))
 def _select_next_verified_id(verified_id, accept_lens, *, num_steps: int):
     accept_width = num_steps + 1
@@ -758,6 +767,33 @@ def _forward_batch_init_new_preserve_device(batch, model_runner):
     )
 
 
+def prepare_spec_decode_verify_phase(spec_worker, model_worker_batch, cur_allocate_lens):
+    """Prepare host/device metadata needed to launch the target verify JIT."""
+    draft_worker = spec_worker.draft_worker
+    target_worker = spec_worker.target_worker
+    target_mr = target_worker.model_runner
+    previous_verified_id, previous_token_list = _prepare_topk1_verify_placeholders_from_draft_state(
+        draft_worker, model_worker_batch
+    )
+    spec_info = model_worker_batch.spec_info_padded
+    spec_info.allocate_lens = cur_allocate_lens
+    spec_info.prepare_for_verify(model_worker_batch, spec_worker.page_size, target_worker)
+    target_forward_metadata = target_mr.attn_backend.get_eagle_forward_metadata(model_worker_batch)
+    target_forward_batch = _forward_batch_init_new_preserve_device(model_worker_batch, target_mr)
+    target_forward_batch.bid = model_worker_batch.bid
+    target_logits_metadata = _logits_metadata_from_model_worker_batch_preserve_device(
+        model_worker_batch, spec_worker.mesh
+    )
+    return PreparedSpecDecodeVerify(
+        previous_verified_id=previous_verified_id,
+        previous_token_list=previous_token_list,
+        target_forward_metadata=target_forward_metadata,
+        target_forward_batch=target_forward_batch,
+        target_logits_metadata=target_logits_metadata,
+        cur_allocate_lens=cur_allocate_lens,
+    )
+
+
 def prepare_spec_prefill_forward_batch(spec_worker, model_worker_batch):
     """Prepare the target ForwardBatch before speculative prefill is queued."""
     from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode
@@ -1046,25 +1082,17 @@ def spec_decode_verify_phase(spec_worker, model_worker_batch, cur_allocate_lens)
     draft_worker = spec_worker.draft_worker
     target_worker = spec_worker.target_worker
     target_mr = target_worker.model_runner
-    previous_verified_id, previous_token_list = _prepare_topk1_verify_placeholders_from_draft_state(
-        draft_worker, model_worker_batch
-    )
-    spec_info = model_worker_batch.spec_info_padded
+    prepared = getattr(model_worker_batch, "spec_decode_verify_prepare", None)
+    if prepared is None:
+        prepared = prepare_spec_decode_verify_phase(
+            spec_worker, model_worker_batch, cur_allocate_lens
+        )
     return_target_logits = bool(
         getattr(model_worker_batch, "return_logprob", False)
         or getattr(model_worker_batch, "return_output_logprob_only", False)
     )
 
-    spec_info.allocate_lens = cur_allocate_lens
-    spec_info.prepare_for_verify(model_worker_batch, spec_worker.page_size, target_worker)
-    target_mr.attn_backend.forward_metadata = target_mr.attn_backend.get_eagle_forward_metadata(
-        model_worker_batch
-    )
-    target_forward_batch = _forward_batch_init_new_preserve_device(model_worker_batch, target_mr)
-    target_forward_batch.bid = model_worker_batch.bid
-    target_logits_metadata = _logits_metadata_from_model_worker_batch_preserve_device(
-        model_worker_batch, spec_worker.mesh
-    )
+    target_mr.attn_backend.forward_metadata = prepared.target_forward_metadata
 
     if not hasattr(draft_worker, "_fused_greedy_verify_jit_fn"):
         draft_worker._fused_greedy_verify_jit_fn = _build_fused_greedy_verify_jit(
@@ -1086,11 +1114,11 @@ def spec_decode_verify_phase(spec_worker, model_worker_batch, cur_allocate_lens)
             target_mr._model_def,
             target_mr._model_state_def,
             tuple(target_mr.model_state_leaves),
-            target_forward_batch,
+            prepared.target_forward_batch,
             target_mr.memory_pools,
-            target_logits_metadata,
-            previous_verified_id,
-            previous_token_list,
+            prepared.target_logits_metadata,
+            prepared.previous_verified_id,
+            prepared.previous_token_list,
             speculative_num_steps=draft_worker.speculative_num_steps,
             speculative_num_draft_tokens=draft_worker.speculative_num_draft_tokens,
             return_target_logits=return_target_logits,
