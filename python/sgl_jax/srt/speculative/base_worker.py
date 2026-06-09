@@ -187,9 +187,15 @@ class BaseSpecWorker:
         logits_output, _, cache_miss_count = self.target_worker.forward_batch_generation(
             model_worker_batch, skip_sample=True, forward_metadata=forward_metadata
         )
-        logits_output.next_token_logits, logits_output.hidden_states = replicate_to_mesh(
-            self.mesh, logits_output.next_token_logits, logits_output.hidden_states
-        )
+        is_all_greedy = model_worker_batch.sampling_info.is_all_greedy
+        if is_all_greedy:
+            logits_output.hidden_states = replicate_to_mesh(
+                self.mesh, logits_output.hidden_states
+            )
+        else:
+            logits_output.next_token_logits, logits_output.hidden_states = replicate_to_mesh(
+                self.mesh, logits_output.next_token_logits, logits_output.hidden_states
+            )
         spec_info.hidden_states = logits_output.hidden_states
 
         (
@@ -214,7 +220,8 @@ class BaseSpecWorker:
         req_ids = np.arange(len(accept_index)) // accept_width
         per_req_last = req_ids * draft_n + draft_n - 1
         safe_index = np.where(accept_index >= 0, accept_index, per_req_last)
-        logits_output.next_token_logits = logits_output.next_token_logits[safe_index, :]
+        if not is_all_greedy:
+            logits_output.next_token_logits = logits_output.next_token_logits[safe_index, :]
         logits_output.hidden_states = logits_output.hidden_states[safe_index, :]
         model_worker_batch.positions = model_worker_batch.positions[safe_index]
         new_seq_lens = model_worker_batch.seq_lens + accept_length

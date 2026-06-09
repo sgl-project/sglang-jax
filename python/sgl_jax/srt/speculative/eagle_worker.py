@@ -39,6 +39,32 @@ class EAGLEWorker(BaseSpecWorker):
     # -- BaseSpecWorker provides target_worker/draft_worker/verify/
     #    forward_target_extend/forward_batch_speculative_generation --
 
+    def verify(self, model_worker_batch, cur_allocate_lens):
+        """Greedy topk=1 fast path: fuse target verify forward + chain accept.
+
+        Falls back to the base eager verify for non-greedy / topk>1 / simulated
+        accept-length. The fused JIT keeps the target and draft_extend forwards
+        as separate dispatches (overlap boundary preserved); it only folds the
+        large next_token_logits argmax + accept gathers into the forward graph.
+        """
+        from sgl_jax.srt.speculative.eagle_util import SIMULATE_ACC_LEN
+
+        if (
+            self.topk == 1
+            and not SIMULATE_ACC_LEN
+            and not model_worker_batch.forward_mode.is_idle()
+            and model_worker_batch.sampling_info is not None
+            and model_worker_batch.sampling_info.is_all_greedy
+        ):
+            from sgl_jax.srt.speculative.draft_extend_fused import (
+                fused_target_verify_greedy_decode,
+            )
+
+            return fused_target_verify_greedy_decode(
+                self, model_worker_batch, cur_allocate_lens
+            )
+        return super().verify(model_worker_batch, cur_allocate_lens)
+
     # -- Logprob post-processing --
 
     def add_logprob_values(

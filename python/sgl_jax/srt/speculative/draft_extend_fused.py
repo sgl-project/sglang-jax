@@ -147,6 +147,208 @@ def _greedy_sample_and_prepare_draft_inputs_chain_from_predict(
     )
 
 
+def _build_fused_target_verify_greedy_jit(speculative_num_steps, speculative_num_draft_tokens):
+    """Build the fused target-verify JIT (cached on the spec worker).
+
+    Runs the target model forward AND the topk=1 greedy chain accept inside a
+    SINGLE jit, so the large ``next_token_logits`` (bs*draft_tokens, vocab) is
+    consumed by ``argmax`` in-graph and never crosses a JIT boundary / gets
+    materialized. The draft_extend forward stays a separate dispatch (overlap
+    boundary kept between target and draft, not inside verify).
+    """
+
+    @partial(
+        jax.jit,
+        donate_argnames=["target_memory_pools"],
+        static_argnames=[
+            "target_model_state_def",
+            "speculative_num_steps",
+            "speculative_num_draft_tokens",
+            "return_target_logits",
+        ],
+    )
+    def fused_target_verify_greedy(
+        target_model_def,
+        target_model_state_def,
+        target_leaves,
+        target_forward_batch,
+        target_memory_pools,
+        target_logits_metadata,
+        *,
+        speculative_num_steps,
+        speculative_num_draft_tokens,
+        return_target_logits,
+    ):
+        target_state = jax.tree_util.tree_unflatten(target_model_state_def, target_leaves)
+        target_model = nnx.merge(target_model_def, target_state)
+        target_output, target_pool_updates, _, _ = target_model(
+            target_forward_batch,
+            target_memory_pools,
+            target_logits_metadata,
+        )
+
+        logits = target_output.next_token_logits
+        hidden = target_output.hidden_states
+
+        mesh = None
+        for value in (logits, hidden):
+            sharding = jax.typeof(value).sharding
+            if isinstance(sharding, NamedSharding):
+                mesh = sharding.mesh
+                break
+
+        # prepare_for_verify already set input_ids=draft_token, positions, and
+        # decremented seq_lens, so read the chain inputs straight off the batch.
+        target_predict = jnp.argmax(logits, axis=-1).astype(jnp.int32).reshape(-1)
+        draft_tokens = target_forward_batch.input_ids
+        positions = target_forward_batch.positions
+        seq_lens = target_forward_batch.seq_lens
+        # Replicate the chain inputs before the accept helper. This mirrors the
+        # eager greedy verify (which replicate_to_mesh's hidden then gathers on
+        # host-built indices), so it is NOT an extra cost vs eager: hidden was
+        # already replicated there, and the index tensors are bs*draft_tokens
+        # int32 (negligible all-gather even at dp>1). It also sidesteps the
+        # P("data") 1-D -> 2-D reshape that otherwise yields an illegal
+        # PartitionSpec("data","data") inside the helper under explicit sharding.
+        if mesh is not None:
+            rep = NamedSharding(mesh, P())
+            hidden = jax.sharding.reshard(hidden, rep)
+            target_predict = jax.sharding.reshard(target_predict, rep)
+            draft_tokens = jax.sharding.reshard(draft_tokens, rep)
+            positions = jax.sharding.reshard(positions, rep)
+            seq_lens = jax.sharding.reshard(seq_lens, rep)
+
+        prepared = _greedy_sample_and_prepare_draft_inputs_chain_from_predict(
+            target_hidden=hidden,
+            positions=positions,
+            seq_lens=seq_lens,
+            draft_tokens=draft_tokens,
+            target_predict=target_predict,
+            speculative_num_steps=speculative_num_steps,
+            speculative_num_draft_tokens=speculative_num_draft_tokens,
+        )
+
+        accept_lens = prepared.accept_lens
+        verified_id = prepared.verified_id
+        predict = prepared.predict
+        new_seq_lens = prepared.new_seq_lens
+        selected_hidden = prepared.hidden_states
+        selected_positions = prepared.positions
+        target_logits_out = logits if return_target_logits else None
+        if mesh is not None:
+            rep = NamedSharding(mesh, P())
+            accept_lens = jax.sharding.reshard(accept_lens, rep)
+            verified_id = jax.sharding.reshard(verified_id, rep)
+            predict = jax.sharding.reshard(predict, rep)
+            new_seq_lens = jax.sharding.reshard(new_seq_lens, rep)
+            selected_hidden = jax.sharding.reshard(selected_hidden, rep)
+            selected_positions = jax.sharding.reshard(selected_positions, rep)
+            if return_target_logits:
+                target_logits_out = jax.sharding.reshard(target_logits_out, rep)
+
+        return (
+            accept_lens,
+            verified_id,
+            predict,
+            selected_hidden,
+            selected_positions,
+            new_seq_lens,
+            target_pool_updates,
+            target_logits_out,
+        )
+
+    return fused_target_verify_greedy
+
+
+def fused_target_verify_greedy_decode(spec_worker, model_worker_batch, cur_allocate_lens):
+    """Host entry: fused target verify forward + greedy chain accept (topk=1).
+
+    Drop-in replacement for ``BaseSpecWorker.verify`` on the greedy topk=1 path.
+    Does NOT run draft_extend (caller still invokes it afterwards), so the
+    target<->draft overlap boundary is preserved.
+    """
+    from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
+    from sgl_jax.srt.managers.scheduler import GenerationBatchResult
+    from sgl_jax.srt.speculative.eagle_util import EagleDraftInput, EagleVerifyInput
+
+    target_worker = spec_worker.target_worker
+    target_mr = target_worker.model_runner
+
+    spec_info: EagleVerifyInput = model_worker_batch.spec_info_padded
+    spec_info.allocate_lens = cur_allocate_lens
+    spec_info.prepare_for_verify(model_worker_batch, spec_worker.page_size, target_worker)
+    target_mr.attn_backend.forward_metadata = target_mr.attn_backend.get_eagle_forward_metadata(
+        model_worker_batch
+    )
+
+    return_target_logits = bool(
+        getattr(model_worker_batch, "return_logprob", False)
+        or getattr(model_worker_batch, "return_output_logprob_only", False)
+    )
+
+    target_forward_batch = _forward_batch_init_new_preserve_device(model_worker_batch, target_mr)
+    target_forward_batch.bid = model_worker_batch.bid
+    target_logits_metadata = _logits_metadata_from_model_worker_batch_preserve_device(
+        model_worker_batch, spec_worker.mesh
+    )
+
+    if not hasattr(spec_worker, "_fused_target_verify_jit_fn"):
+        spec_worker._fused_target_verify_jit_fn = _build_fused_target_verify_greedy_jit(
+            spec_worker.speculative_num_steps,
+            spec_worker.speculative_num_draft_tokens,
+        )
+
+    with jax.set_mesh(spec_worker.mesh):
+        (
+            accept_lens,
+            verified_id,
+            predict,
+            selected_hidden,
+            selected_positions,
+            new_seq_lens,
+            target_pool_updates,
+            target_logits_out,
+        ) = spec_worker._fused_target_verify_jit_fn(
+            target_mr._model_def,
+            target_mr._model_state_def,
+            tuple(target_mr.model_state_leaves),
+            target_forward_batch,
+            target_mr.memory_pools,
+            target_logits_metadata,
+            speculative_num_steps=spec_worker.speculative_num_steps,
+            speculative_num_draft_tokens=spec_worker.speculative_num_draft_tokens,
+            return_target_logits=return_target_logits,
+        )
+
+    target_mr.memory_pools.replace_all(target_pool_updates)
+
+    # Mirror eager verify's mutations: gathered positions feed draft_extend
+    # (prepare_for_extend_after_verify keeps model_worker_batch.positions as-is).
+    model_worker_batch.positions = selected_positions
+
+    next_draft_input = EagleDraftInput(
+        verified_id=verified_id,
+        new_seq_lens=new_seq_lens,
+        allocate_lens=cur_allocate_lens,
+        hidden_states=selected_hidden,
+    )
+    model_worker_batch.spec_info_padded = next_draft_input
+    return GenerationBatchResult(
+        logits_output=LogitsProcessorOutput(
+            next_token_logits=target_logits_out,
+            hidden_states=selected_hidden,
+        ),
+        next_token_ids=predict,
+        next_draft_input=next_draft_input,
+        accept_lens=accept_lens,
+        allocate_lens=cur_allocate_lens,
+        bid=model_worker_batch.bid,
+        cache_miss_count=0,
+        extend_input_len_per_req=None,
+        extend_logprob_start_len_per_req=None,
+    )
+
+
 def _build_topk1_chain_verify_inputs_device_tuple(
     *,
     verified_id,
