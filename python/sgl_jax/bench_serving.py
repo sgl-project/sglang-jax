@@ -2141,6 +2141,25 @@ def wrap_multi_turn_request_func(request_func: Callable, backend: str) -> Callab
     return f
 
 
+def _read_vllm_spec_counters(base_url: str):
+    """Read spec decode counters from vllm /metrics endpoint. Returns (drafts, accepted) or None."""
+    try:
+        resp = requests.get(base_url + "/metrics", timeout=5)
+        if resp.status_code != 200:
+            return None
+        drafts = accepted = None
+        for line in resp.text.splitlines():
+            if line.startswith("vllm:spec_decode_num_drafts_total"):
+                drafts = float(line.split()[-1])
+            elif line.startswith("vllm:spec_decode_num_accepted_tokens_total"):
+                accepted = float(line.split()[-1])
+        if drafts is not None and accepted is not None:
+            return (drafts, accepted)
+    except Exception:
+        pass
+    return None
+
+
 async def benchmark(
     backend: str,
     api_url: str,
@@ -2275,6 +2294,9 @@ async def benchmark(
             if profile_output.success:
                 print("Profiler started")
 
+    # Snapshot spec decode counters before benchmark (for vllm /metrics)
+    _spec_before = _read_vllm_spec_counters(base_url) if "sgl-jax" not in backend else None
+
     # Run all requests
     benchmark_start_time = time.perf_counter()
     tasks: list[asyncio.Task] = []
@@ -2357,22 +2379,27 @@ async def benchmark(
     if pbar is not None:
         pbar.close()
 
+    accept_length = None
     if "sgl-jax" in backend:
-        server_info = requests.get(base_url + "/get_server_info")
-        if server_info.status_code == 200:
-            server_info_json = server_info.json()
-            if "decode" in server_info_json:
-                server_info_json = server_info_json["decode"][0]
-            if "internal_states" in server_info_json and server_info_json["internal_states"]:
-                accept_length = server_info_json["internal_states"][0].get(
-                    "avg_spec_accept_length", None
-                )
-            else:
-                accept_length = None
-        else:
-            accept_length = None
+        try:
+            server_info = requests.get(base_url + "/get_server_info")
+            if server_info.status_code == 200:
+                server_info_json = server_info.json()
+                if "decode" in server_info_json:
+                    server_info_json = server_info_json["decode"][0]
+                if "internal_states" in server_info_json and server_info_json["internal_states"]:
+                    accept_length = server_info_json["internal_states"][0].get(
+                        "avg_spec_accept_length", None
+                    )
+        except Exception:
+            pass
     else:
-        accept_length = None
+        _spec_after = _read_vllm_spec_counters(base_url)
+        if _spec_before and _spec_after:
+            d_drafts = _spec_after[0] - _spec_before[0]
+            d_accepted = _spec_after[1] - _spec_before[1]
+            if d_drafts > 0:
+                accept_length = (d_accepted + d_drafts) / d_drafts
 
     # Compute metrics and print results
     benchmark_duration = time.perf_counter() - benchmark_start_time
