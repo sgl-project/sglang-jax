@@ -31,17 +31,21 @@ logger = logging.getLogger(__name__)
 def _jit_scatter_one_layer(buf, page_indices, vals, out_sharding):
     """Scatter ``vals`` into a single per-layer KV buffer at ``page_indices``.
 
-    Symmetric to prefill's ``_jit_gather_one_layer``. Two properties keep the
-    per-layer compile footprint small enough for v6e single-chip HBM:
+    The scatter output is the *entire* layer buffer (~884 MB on Qwen-1.5B),
+    so it must update ``buf`` in place — a fresh allocation that large OOMs a
+    v6e single chip whose HBM is already filled by the model + KV pool.
 
-    * ``donate_argnums=(0,)`` lets XLA update ``buf`` in place instead of
-      allocating a second full-layer buffer for the scatter output.
-    * ``out_sharding`` leaves the page axis unsharded (``P(None, ...)``) so the
-      result already matches the scatter's natural sharding and XLA does not
-      insert a full-layer ``reshard``.
+    In-place requires two things together:
 
-    Without these, the eager ``buf.at[idx].set(vals, out_sharding=pool_sharding)``
-    reshards + double-allocates (~884 MB/layer) and OOMs the decode event loop.
+    * ``donate_argnums=(0,)`` so XLA may alias the output onto ``buf``'s storage.
+    * ``out_sharding`` **equal to ``buf``'s own sharding** (the caller passes
+      ``kv_pool.kv_sharding``). XLA only aliases a donated input when the output
+      sharding matches the input's; a mismatched ``out_sharding`` (e.g. the
+      ``P(None, ...)`` used on the read/gather side, whose output is small)
+      defeats aliasing and forces the full-layer fresh allocation that OOMs.
+
+    Without both, the eager ``buf.at[idx].set(...)`` double-allocates the layer
+    and wedges the single-threaded decode event loop in an XLA OOM-retry.
     """
 
     return buf.at[page_indices].set(vals, out_sharding=out_sharding)
@@ -479,11 +483,10 @@ class SchedulerDisaggregationDecodeMixin:
             page_ids_padded = page_ids_np
         idx_sharding = NamedSharding(kv_pool.mesh, PartitionSpec(None))
         page_ids_jax = jax.device_put(page_ids_padded, idx_sharding)
-        # Leave the page axis unsharded so the scatter output matches its
-        # natural sharding (no full-layer reshard); see _jit_scatter_one_layer.
-        out_sharding = NamedSharding(
-            kv_pool.mesh, PartitionSpec(None, *kv_pool.kv_sharding.spec[1:])
-        )
+        # Pass the buffer's OWN sharding so the donated input can be aliased
+        # in place; a different out_sharding would force a fresh full-layer
+        # allocation and OOM the chip. See _jit_scatter_one_layer.
+        out_sharding = kv_pool.kv_sharding
         for i, layer_id in enumerate(
             range(kv_pool.start_layer, kv_pool.start_layer + kv_pool.layer_num)
         ):

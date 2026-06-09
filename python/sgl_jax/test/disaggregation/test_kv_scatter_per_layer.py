@@ -51,8 +51,11 @@ def _pool_sharding(mesh):
 
 
 def _out_sharding(mesh, pool_sharding):
-    """Page axis unsharded, mirroring decode._write_kv_to_pool."""
-    return NamedSharding(mesh, P(None, *pool_sharding.spec[1:]))
+    """The scatter out_sharding equals the buffer's own sharding, mirroring
+    decode._write_kv_to_pool: matching sharding is what lets XLA alias the
+    donated input in place (a mismatched sharding defeats donation and forces
+    a fresh full-layer allocation that OOMs the chip)."""
+    return pool_sharding
 
 
 def _make_layer_buffer(mesh, pool_sharding, rng_seed=42):
