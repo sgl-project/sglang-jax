@@ -8,6 +8,9 @@ import numpy as np
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
+RELAY_STATE_SPEC = P("data", None, None)
+RELAY_ID_SPEC = P("data", None)
+
 
 class SpecRelayBuffers(NamedTuple):
     topk_index: jax.Array
@@ -26,9 +29,9 @@ def create_spec_relay_buffers(
 ) -> SpecRelayBuffers:
     """Create DP-local req-indexed buffers for cross-batch draft state relay."""
     capacity = int(req_to_token_pool.req_to_token.shape[0])
-    token_sharding = NamedSharding(mesh, P("data", None, None))
-    hidden_sharding = NamedSharding(mesh, P("data", None, None))
-    id_sharding = NamedSharding(mesh, P("data", None))
+    token_sharding = NamedSharding(mesh, RELAY_STATE_SPEC)
+    hidden_sharding = NamedSharding(mesh, RELAY_STATE_SPEC)
+    id_sharding = NamedSharding(mesh, RELAY_ID_SPEC)
     return SpecRelayBuffers(
         topk_index=jax.device_put(
             jnp.zeros((dp_size, capacity, num_steps), dtype=jnp.int32),
@@ -65,28 +68,24 @@ def update_spec_relay_buffers(
     hidden_states = hidden_states.reshape((dp_size, per_dp_bs) + hidden_states.shape[1:])
     verified_id = verified_id.reshape((dp_size, per_dp_bs))
 
-    old_topk_index = buffers.topk_index.at[dp_indices, indices].get(
-        out_sharding=buffers.topk_index.sharding
-    )
+    old_topk_index = buffers.topk_index.at[dp_indices, indices].get(out_sharding=RELAY_STATE_SPEC)
     old_hidden_states = buffers.hidden_states.at[dp_indices, indices].get(
-        out_sharding=buffers.hidden_states.sharding
+        out_sharding=RELAY_STATE_SPEC
     )
-    old_verified_id = buffers.verified_id.at[dp_indices, indices].get(
-        out_sharding=buffers.verified_id.sharding
-    )
+    old_verified_id = buffers.verified_id.at[dp_indices, indices].get(out_sharding=RELAY_ID_SPEC)
 
     return SpecRelayBuffers(
         topk_index=buffers.topk_index.at[dp_indices, indices].set(
             jnp.where(valid[..., None], topk_index, old_topk_index),
-            out_sharding=buffers.topk_index.sharding,
+            out_sharding=RELAY_STATE_SPEC,
         ),
         hidden_states=buffers.hidden_states.at[dp_indices, indices].set(
             jnp.where(valid[..., None], hidden_states, old_hidden_states),
-            out_sharding=buffers.hidden_states.sharding,
+            out_sharding=RELAY_STATE_SPEC,
         ),
         verified_id=buffers.verified_id.at[dp_indices, indices].set(
             jnp.where(valid, verified_id, old_verified_id),
-            out_sharding=buffers.verified_id.sharding,
+            out_sharding=RELAY_ID_SPEC,
         ),
     )
 
@@ -104,13 +103,13 @@ def gather_spec_relay_buffers(
 
     return (
         buffers.topk_index.at[dp_indices, indices]
-        .get(out_sharding=buffers.topk_index.sharding)
+        .get(out_sharding=RELAY_STATE_SPEC)
         .reshape(future_indices.shape + buffers.topk_index.shape[2:]),
         buffers.hidden_states.at[dp_indices, indices]
-        .get(out_sharding=buffers.hidden_states.sharding)
+        .get(out_sharding=RELAY_STATE_SPEC)
         .reshape(future_indices.shape + buffers.hidden_states.shape[2:]),
         buffers.verified_id.at[dp_indices, indices]
-        .get(out_sharding=buffers.verified_id.sharding)
+        .get(out_sharding=RELAY_ID_SPEC)
         .reshape(future_indices.shape),
     )
 
