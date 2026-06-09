@@ -448,12 +448,31 @@ class SchedulerDisaggregationDecodeMixin:
                 kv_pool.mesh, PartitionSpec(kv_pool.attention_data_partition_axis)
             ),
         )
+        # fused_kv must match the shard_map in_spec of the write kernel:
+        # token axis on the data mesh axis, heads on the tensor mesh axis.
+        # Merging the (page, page_size) axes into the token axis crosses a
+        # sharded axis (page is @data), so the reshape needs an explicit
+        # out_sharding or XLA:TPU raises ShardingTypeError.
+        fused_sharding = NamedSharding(
+            kv_pool.mesh,
+            PartitionSpec(
+                kv_pool.attention_data_partition_axis,
+                None,
+                kv_pool.kv_partition_axis,
+                None,
+                None,
+            ),
+        )
         for i, layer_id in enumerate(
             range(kv_pool.start_layer, kv_pool.start_layer + kv_pool.layer_num)
         ):
             layer_idx = layer_id - kv_pool.start_layer
             layer_kv = kv[i]  # [padded_pages, page_size, H, packing, head_dim]
-            fused = layer_kv.reshape((total_tokens, 1) + layer_kv.shape[2:])
+            fused = jax.lax.reshape(
+                layer_kv,
+                (total_tokens, 1) + tuple(layer_kv.shape[2:]),
+                out_sharding=fused_sharding,
+            )
             kv_pool.kv_buffer[layer_idx] = _set_fused_kv_buffer(
                 fused_kv=fused,
                 loc=loc,
