@@ -133,6 +133,12 @@ def release_kv_cache(
 
     start_p, end_p = req.pop_overallocated_kv_cache()
     if not allow_overallocated:
+        from sgl_jax.srt.managers.schedule_batch import global_server_args_dict
+
+        spec_algorithm = global_server_args_dict.get("speculative_algorithm")
+        allow_overallocated = spec_algorithm is not None
+
+    if not allow_overallocated:
         assert (
             start_p == end_p
         ), f"Unexpected overallocated KV cache, {req.kv_committed_len=}, {req.kv_allocated_len=}"
