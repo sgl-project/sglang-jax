@@ -179,6 +179,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-threads", type=int, default=512)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--max-tokens", type=int, default=2048)
+    parser.add_argument("--top-p", type=float, default=None)
     parser.add_argument("--top-k", type=int, default=None)
     parser.add_argument("--min-p", type=float, default=None)
     parser.add_argument("--presence-penalty", type=float, default=None)
