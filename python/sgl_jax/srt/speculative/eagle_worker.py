@@ -5,6 +5,8 @@ import time
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 from tqdm import tqdm
 
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
@@ -205,14 +207,15 @@ class EAGLEWorker(BaseSpecWorker):
 
                 is_multi_layer = isinstance(self.draft_worker, MultiLayerDraftWorker)
                 topk_shape = (bs, num_steps, self.topk) if is_multi_layer else (bs, self.topk)
+                data_sharding = NamedSharding(self.mesh, P("data"))
                 spec_info = EagleDraftInput(
-                    topk_p=np.ones(topk_shape, dtype=np.float32),
-                    topk_index=np.ones(topk_shape, dtype=np.int32),
+                    topk_p=jax.device_put(np.ones(topk_shape, dtype=np.float32), data_sharding),
+                    topk_index=jax.device_put(np.ones(topk_shape, dtype=np.int32), data_sharding),
                     hidden_states=np.ones(
                         (bs, self.draft_worker.model_config.hidden_size),
                         dtype=jnp.bfloat16 if self.server_args.dtype == "bfloat16" else np.float32,
                     ),
-                    verified_id=np.ones((bs,), dtype=np.int32),
+                    verified_id=jax.device_put(np.ones((bs,), dtype=np.int32), data_sharding),
                     capture_hidden_mode=CaptureHiddenMode.FULL,
                     num_tokens_per_batch=np.asarray(1, dtype=np.int32),
                     num_tokens_for_logprob_per_batch=np.asarray(1, dtype=np.int32),
