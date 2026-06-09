@@ -370,18 +370,18 @@ class Glm5Attention(nnx.Module):
         preferred_dtype = _get_preferred_dtype(q_nope.dtype)
 
         # Fused Value-Output Projection:
-        # attn_output shape: [num_heads, T, kv_lora_rank]
+        # attn_output shape: [T, num_heads, kv_lora_rank]
         # w_vo shape: [kv_lora_rank, num_heads, hidden_size]
-        # Contract: attn_output(h, t, r) * w_vo(r, h, c) -> output_local(t, c)
-        output_local = jax.lax.dot_general(
+        # Batch GEMM: contract R (512), batch H (64). Output: [T, H, C] sharded P(None, "tensor", None)
+        o_local = jax.lax.dot_general(
             attn_output,
             self.w_vo.value,
-            (((2, 1), (0, 1)), ((), ())),
+            (((2,), (0,)), ((1,), (1,))),
             preferred_element_type=preferred_dtype,
         )
         
-        # RowParallel psum All-Reduce
-        output = jax.lax.psum(output_local, axis_name="tensor").astype(q_nope.dtype)
+        # Summing over the sharded head dimension (axis 1) automatically triggers the RowParallel All-Reduce (psum)
+        output = jnp.sum(o_local, axis=1).astype(q_nope.dtype)
         return output, kv_fused
 
     def _forward_mha(
