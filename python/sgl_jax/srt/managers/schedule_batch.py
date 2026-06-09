@@ -356,6 +356,9 @@ class Req:
         self.has_log_time_stats: bool = False
         self.queue_time_start = None
         self.queue_time_end = None
+        # PD disaggregation per-request phase timing (None unless
+        # --enable-request-time-stats-logging and PD mode).
+        self.pd_time_stats = None
 
         # the start index of the sent kv cache
         # We want to send it chunk by chunk for chunked prefill.

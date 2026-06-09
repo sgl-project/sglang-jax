@@ -190,6 +190,7 @@ class Scheduler(
         self.disagg_prefill_queue = None
         self.disagg_prealloc_queue = None
         self.disagg_transfer_queue = None
+        self.disagg_decode_watchdog = None
 
         # LoRA configurations
         self.lora_paths = server_args.lora_paths

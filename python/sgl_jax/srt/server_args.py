@@ -246,6 +246,11 @@ class ServerArgs:
     # ``SGL_JAX_PD_SHARED_SECRET`` overrides this at process start.
     # ``None`` disables auth for backward compatibility.
     disaggregation_shared_secret: str | None = None
+    # Diagnostic: if > 0, a watchdog thread logs the stuck decode
+    # event-loop phase + backlog snapshot + main-thread traceback when a
+    # single loop tick exceeds this many seconds. 0 disables it. Opt-in
+    # for stress runs; off by default in production.
+    disaggregation_decode_watchdog_seconds: float = 0.0
 
     def __post_init__(self):
         # Set missing default values
@@ -1366,6 +1371,15 @@ class ServerArgs:
             type=float,
             default=ServerArgs.disaggregation_orphan_reaper_interval_seconds,
             help="How often the background reaper scans for orphan " "senders/receivers.",
+        )
+        parser.add_argument(
+            "--disaggregation-decode-watchdog-seconds",
+            type=float,
+            default=ServerArgs.disaggregation_decode_watchdog_seconds,
+            help="Diagnostic: if > 0, a watchdog logs the stuck decode "
+            "event-loop phase + backlog snapshot + main-thread "
+            "traceback when one loop tick exceeds this many seconds. "
+            "0 disables it (default). Opt-in for stress debugging.",
         )
         parser.add_argument(
             "--disaggregation-shared-secret",

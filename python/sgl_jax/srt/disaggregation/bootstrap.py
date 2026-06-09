@@ -50,9 +50,43 @@ class PrefillInfo:
     tp_size: int = 1
     system_dp_rank: int = 0
     protocol_version: int = PROTOCOL_VERSION
+    # KV layout. Decode must match these or the transferred KV would be
+    # silently misinterpreted. Defaults (0 / "") mean "not reported" so a
+    # peer predating these fields skips the check.
+    page_size: int = 0
+    kv_dtype: str = ""
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
+
+
+def check_prefill_compat(
+    info: dict[str, object],
+    *,
+    local_page_size: int,
+    local_kv_dtype: str,
+) -> None:
+    """Raise ``ValueError`` if the prefill peer's KV layout is incompatible.
+
+    Backward-compatible: a field is only checked when both sides report it
+    (peer value truthy and local value truthy), so older peers and
+    not-yet-initialized decoders never trigger a false rejection.
+    """
+
+    peer_page_size = int(info.get("page_size", 0) or 0)
+    if peer_page_size and local_page_size and peer_page_size != local_page_size:
+        raise ValueError(
+            f"prefill peer {info.get('bootstrap_key')!r} uses "
+            f"page_size={peer_page_size} but this decode uses "
+            f"page_size={local_page_size}; KV layout incompatible"
+        )
+    peer_kv_dtype = str(info.get("kv_dtype", "") or "")
+    if peer_kv_dtype and local_kv_dtype and peer_kv_dtype != local_kv_dtype:
+        raise ValueError(
+            f"prefill peer {info.get('bootstrap_key')!r} uses "
+            f"kv_dtype={peer_kv_dtype!r} but this decode uses "
+            f"kv_dtype={local_kv_dtype!r}; KV layout incompatible"
+        )
 
 
 class RegisterPrefillRequest(BaseModel):
@@ -64,6 +98,8 @@ class RegisterPrefillRequest(BaseModel):
     tp_size: int = 1
     system_dp_rank: int = 0
     protocol_version: int = PROTOCOL_VERSION
+    page_size: int = 0
+    kv_dtype: str = ""
 
 
 class HeartbeatRequest(BaseModel):
@@ -347,6 +383,8 @@ class BootstrapClient:
         tp_size: int = 1,
         system_dp_rank: int = 0,
         protocol_version: int = PROTOCOL_VERSION,
+        page_size: int = 0,
+        kv_dtype: str = "",
     ) -> None:
         payload = {
             "bootstrap_key": bootstrap_key,
@@ -357,6 +395,8 @@ class BootstrapClient:
             "tp_size": tp_size,
             "system_dp_rank": system_dp_rank,
             "protocol_version": protocol_version,
+            "page_size": page_size,
+            "kv_dtype": kv_dtype,
         }
         last_err: Exception | None = None
         for attempt in range(self._register_retries):

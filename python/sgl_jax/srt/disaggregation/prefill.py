@@ -27,14 +27,18 @@ logger = logging.getLogger(__name__)
 
 
 # Bucket page counts to bound XLA's per-shape compile pool.
-_KV_GATHER_PAGE_BUCKETS = (1, 2, 4, 8, 16, 32, 64)
+# Largest bucket (512 pages × 128 tokens/page) covers 64k-token prompts.
+_KV_GATHER_PAGE_BUCKETS = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512)
 
 
 def _pad_to_page_bucket(num_pages: int) -> int:
     for b in _KV_GATHER_PAGE_BUCKETS:
         if b >= num_pages:
             return b
-    return _KV_GATHER_PAGE_BUCKETS[-1]
+    # Beyond the largest predefined bucket: round up to a multiple of it so we
+    # never truncate KV, while keeping the set of compiled shapes bounded.
+    largest = _KV_GATHER_PAGE_BUCKETS[-1]
+    return ((num_pages + largest - 1) // largest) * largest
 
 
 @partial(jax.jit, static_argnames=("out_sharding",))
@@ -200,6 +204,7 @@ class SchedulerDisaggregationPrefillMixin:
                     {"kv": device_kv},
                     use_d2h_staging=self.disagg_use_d2h_staging,
                 )
+                self._pd_mark_time(req, "transfer_start")
                 sender.send()
             except Exception as exc:
                 logger.exception(
@@ -242,6 +247,19 @@ class SchedulerDisaggregationPrefillMixin:
     # ------------------------------------------------------------------
     # Overridable / test-friendly hooks
     # ------------------------------------------------------------------
+
+    def _pd_mark_time(self: Scheduler, req: Req, name: str) -> None:
+        """Record a PD lifecycle mark on ``req`` (no-op unless enabled)."""
+
+        if not getattr(self.server_args, "enable_request_time_stats_logging", False):
+            return
+        from sgl_jax.srt.disaggregation.req_time_stats import TimeStats
+
+        ts = req.pd_time_stats
+        if ts is None:
+            ts = TimeStats("prefill")
+            req.pd_time_stats = ts
+        ts.mark(name)
 
     def _extract_req_kv(self: Scheduler, req: Req):
         """Gather prefilled KV from the paged pool for ``req``.
@@ -333,6 +351,16 @@ class SchedulerDisaggregationPrefillMixin:
             else:
                 self._finish_prefill_only_failure(req, sender)
         finally:
+            self._pd_mark_time(req, "transfer_done")
+            from sgl_jax.srt.disaggregation.req_time_stats import maybe_log_time_stats
+
+            maybe_log_time_stats(
+                req.pd_time_stats,
+                req_id=req.rid,
+                enabled=getattr(
+                    self.server_args, "enable_request_time_stats_logging", False
+                ),
+            )
             sender.clear()
             self._release_prefill_req_resources(req)
 

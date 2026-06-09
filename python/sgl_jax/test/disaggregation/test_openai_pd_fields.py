@@ -1,6 +1,5 @@
 """Tests for OpenAI serving layer PD field passthrough."""
 
-import pytest
 from unittest.mock import MagicMock, patch
 
 from sgl_jax.srt.entrypoints.openai.protocol import (

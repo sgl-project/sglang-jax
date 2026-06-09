@@ -40,6 +40,7 @@ def install_disaggregation_wiring(scheduler: Scheduler, server_args: ServerArgs)
         DecodePreallocQueue,
         DecodeTransferQueue,
     )
+    from sgl_jax.srt.disaggregation.decode_watchdog import EventLoopWatchdog
     from sgl_jax.srt.disaggregation.host_ip import resolve_host_ip
     from sgl_jax.srt.disaggregation.jax_transfer.conn import JaxTransferKVManager
     from sgl_jax.srt.disaggregation.jax_transfer.wrapper import get_or_create_wrapper
@@ -113,6 +114,8 @@ def install_disaggregation_wiring(scheduler: Scheduler, server_args: ServerArgs)
             tp_rank=server_args.node_rank,
             tp_size=server_args.tp_size,
             system_dp_rank=0,
+            page_size=server_args.page_size,
+            kv_dtype=server_args.kv_cache_dtype,
         )
         scheduler.disagg_heartbeat = HeartbeatDaemon(
             scheduler.disagg_bootstrap_client, bootstrap_key
@@ -122,6 +125,10 @@ def install_disaggregation_wiring(scheduler: Scheduler, server_args: ServerArgs)
     else:
         scheduler.disagg_prealloc_queue = DecodePreallocQueue()
         scheduler.disagg_transfer_queue = DecodeTransferQueue()
+        scheduler.disagg_decode_watchdog = EventLoopWatchdog(
+            stall_threshold_s=server_args.disaggregation_decode_watchdog_seconds,
+            snapshot_provider=scheduler._decode_backlog_snapshot,
+        )
 
     scheduler.disagg_shutdown = _make_disagg_shutdown(scheduler, mode)
     try:
@@ -174,5 +181,8 @@ def _make_disagg_shutdown(scheduler: Scheduler, mode: str):
             )
         with suppress(Exception):
             scheduler.disagg_kv_manager.zmq_notifier.stop()
+        if scheduler.disagg_decode_watchdog is not None:
+            with suppress(Exception):
+                scheduler.disagg_decode_watchdog.stop()
 
     return _shutdown
