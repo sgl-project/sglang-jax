@@ -376,7 +376,7 @@ class Glm5Attention(nnx.Module):
         output_local = jax.lax.dot_general(
             attn_output,
             self.w_vo.value,
-            (((2, 0), (0, 1)), ((), ())),
+            (((2, 1), (0, 1)), ((), ())),
             preferred_element_type=preferred_dtype,
         )
         
