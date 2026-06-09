@@ -1194,13 +1194,6 @@ class ServerArgs:
         # Check LoRA configuration
         self.check_lora_server_args()
 
-        # Disallow overlap scheduler when speculative decoding is enabled
-        if self.speculative_algorithm is not None and not self.disable_overlap_schedule:
-            raise ValueError(
-                "Speculative decoding does not support overlap scheduler. "
-                "Please pass --disable-overlap-schedule when using --speculative-algorithm."
-            )
-
     def check_lora_server_args(self):
         """Validate and normalize LoRA-related server arguments."""
         # Import LoRARef here to avoid circular imports

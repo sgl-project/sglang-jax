@@ -910,36 +910,59 @@ def spec_decode(spec_worker, model_worker_batch, cur_allocate_lens):
     for i, w in enumerate(draft_worker._workers):
         w.model_runner.memory_pools.replace_all(all_pool_updates[i])
 
+    jax.copy_to_host_async(layer0_hidden)
+    jax.copy_to_host_async(topk_index_stacked)
+    jax.copy_to_host_async(accept_lens_device)
+    jax.copy_to_host_async(predict_device)
+
     selector = np.asarray(model_worker_batch.logits_indices_selector)
-    result = _materialize_fused_greedy_batch_output_for_scheduler(
-        batch_output=batch_output,
+    seq_lens_host = model_worker_batch.seq_lens.copy()
+    real_bs = model_worker_batch.real_bs
+    n_draft = draft_worker.speculative_num_draft_tokens
+
+    def _finalize():
+        result = _materialize_fused_greedy_batch_output_for_scheduler(
+            batch_output=batch_output,
+            selector=selector,
+            real_bs=real_bs,
+            seq_lens_host=seq_lens_host,
+            layer0_hidden=layer0_hidden,
+            topk_index_stacked=topk_index_stacked,
+            accept_lens_device=accept_lens_device,
+            predict_device=predict_device,
+            speculative_num_draft_tokens=n_draft,
+            target_logits=target_logits,
+            target_hidden=target_hidden,
+        )
+        if _SH["on"]:
+            padded_bs = result.accept_lens.shape[0]
+            prev_vid = np.asarray(previous_verified_id, dtype=np.int32).reshape(padded_bs, 1)
+            prev_tl = np.asarray(previous_token_list, dtype=np.int32)[:, : n_draft - 1]
+            draft_2d = np.concatenate([prev_vid, prev_tl], axis=1)
+            predict_2d = np.asarray(result.next_token_ids).reshape(padded_bs, n_draft)
+            _log_step_hit(draft_2d, predict_2d, selector)
+        return result
+
+    pending = SpecDecodePending(
+        finalize=_finalize,
         selector=selector,
-        real_bs=model_worker_batch.real_bs,
-        seq_lens_host=model_worker_batch.seq_lens,
-        layer0_hidden=layer0_hidden,
-        topk_index_stacked=topk_index_stacked,
-        accept_lens_device=accept_lens_device,
-        predict_device=predict_device,
-        speculative_num_draft_tokens=draft_worker.speculative_num_draft_tokens,
-        target_logits=target_logits,
-        target_hidden=target_hidden,
+        per_dp_bs=model_worker_batch.per_dp_bs_size,
+        real_bs_per_dp=list(model_worker_batch.real_bs_per_dp),
     )
-    if _SH["on"] or _DUMP["on"]:
-        n = draft_worker.speculative_num_draft_tokens
-        padded_bs = result.accept_lens.shape[0]
-        prev_vid = np.asarray(previous_verified_id, dtype=np.int32).reshape(padded_bs, 1)
-        prev_tl = np.asarray(previous_token_list, dtype=np.int32)[:, : n - 1]
-        draft_2d = np.concatenate([prev_vid, prev_tl], axis=1)
-        predict_2d = np.asarray(result.next_token_ids).reshape(padded_bs, n)
-        _log_step_hit(draft_2d, predict_2d, selector)
-        if _DUMP["on"]:
-            _dump_dext_round(
-                "spec",
-                draft=draft_2d[selector],
-                predict=predict_2d[selector],
-                accept=result.accept_lens[selector],
-                topk_next=result.next_draft_input.topk_index,  # (real_bs, num_layers, 1)
-                verified_next=result.next_draft_input.verified_id,
-                l0_hidden8=result.next_draft_input.hidden_states[:, :8],
-            )
-    return result
+    if model_worker_batch.defer_spec_materialize:
+        return pending
+    return pending.finalize()
+
+
+class SpecDecodePending(NamedTuple):
+    """Deferred materialization handle for one fused spec-decode round.
+
+    Under overlap, the scheduler calls ``finalize()`` at the start of the
+    *next* iteration (before ``get_next_batch_to_run``), so the d2h sync and
+    host bookkeeping run while the device was busy with this round's JIT.
+    """
+
+    finalize: Any
+    selector: np.ndarray
+    per_dp_bs: int
+    real_bs_per_dp: list

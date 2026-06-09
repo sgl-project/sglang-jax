@@ -2526,6 +2526,7 @@ class ScheduleBatch:
             bid=self.bid,
             dp_size=self.dp_size,
             per_dp_bs_size=self.per_dp_bs_size,
+            spec_algorithm=self.spec_algorithm,
         )
 
     def _evict_tree_cache_if_needed(self, num_tokens_per_dp: dict[int, int]) -> None:
@@ -2967,6 +2968,10 @@ class ModelWorkerBatch:
 
     # Whether each request has prior recurrent state (lazy zero-on-read)
     has_initial_state: np.ndarray | None = None
+
+    # When True, fused spec_decode returns a SpecDecodePending (device handles)
+    # instead of blocking on d2h; the scheduler finalizes it next iteration.
+    defer_spec_materialize: bool = False
 
     def get_original_input_len(self):
         """

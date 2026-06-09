@@ -68,7 +68,7 @@ class SchedulerOutputProcessorMixin:
             result.extend_logprob_start_len_per_req,
             result.cache_miss_count,
         )
-        if self.enable_overlap:
+        if self._overlap_via_tp_thread:
             logits_output, next_token_ids, cache_miss_count = (
                 self.tp_worker.resolve_last_batch_result(launch_done)
             )
@@ -313,7 +313,7 @@ class SchedulerOutputProcessorMixin:
             self.draft_token += batch.batch_size() * self.draft_worker.speculative_num_draft_tokens
         # FIXME(pc) add spec decode metrics
 
-        if self.enable_overlap:
+        if self._overlap_via_tp_thread:
             logits_output, next_token_ids, cache_miss_count = (
                 self.tp_worker.resolve_last_batch_result(launch_done)
             )

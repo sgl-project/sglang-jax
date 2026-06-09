@@ -122,6 +122,7 @@ class GenerationBatchResult:
     allocate_lens: np.ndarray | None = None
     num_accepted_tokens: int | None = None
     accept_lens: np.ndarray | None = None
+    spec_pending: object | None = None
 
 
 class Scheduler(
@@ -311,7 +312,13 @@ class Scheduler(
                     server_args.tp_size,
                 )
 
-        TpWorkerClass = ModelWorkerClient if self.enable_overlap else ModelWorker
+        # Spec decode handles its own overlap (defer materialize in event_loop_overlap)
+        # without the tp_worker thread; ModelWorkerClient's output_queue would deadlock
+        # since spec extend/decode never enqueue to it.
+        self._overlap_via_tp_thread = self.enable_overlap and (
+            self.spec_algorithm is None or self.spec_algorithm.is_none()
+        )
+        TpWorkerClass = ModelWorkerClient if self._overlap_via_tp_thread else ModelWorker
 
         self.tp_worker = TpWorkerClass(
             server_args=server_args,
@@ -329,7 +336,12 @@ class Scheduler(
             # DeepSeek-style configs expose num_nextn_predict_layers; MiMo-style
             # configs don't, so fall back to --speculative-num-steps under NEXTN
             # (one MTP weight set per step).
-            n_mtp = getattr(self.tp_worker.model_config.hf_config, "num_nextn_predict_layers", None)
+            spec_target_worker = (
+                self.tp_worker.worker if self._overlap_via_tp_thread else self.tp_worker
+            )
+            n_mtp = getattr(
+                spec_target_worker.model_config.hf_config, "num_nextn_predict_layers", None
+            )
             if n_mtp is None and self.spec_algorithm.is_nextn():
                 n_mtp = server_args.speculative_num_steps
             self._spec_multi_layer = n_mtp is not None and n_mtp > 1
@@ -344,7 +356,7 @@ class Scheduler(
 
             self.draft_worker = _SpecWorkerCls(
                 server_args=server_args,
-                target_worker=self.tp_worker,
+                target_worker=spec_target_worker,
             )
 
         # Get token and memory info from the model worker
@@ -856,6 +868,7 @@ class Scheduler(
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and Accelerator computation."""
         self.result_queue = deque()
+        self._spec_pending = None
 
         while True:
             recv_reqs = (
@@ -871,6 +884,7 @@ class Scheduler(
             if self._engine_paused:
                 continue
 
+            self._finalize_pending_spec()
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
 
@@ -878,7 +892,10 @@ class Scheduler(
                 batch.launch_done = threading.Event()
                 with jax.profiler.TraceAnnotation("run_batch"):
                     result = self.run_batch(batch)
-                self.result_queue.append((batch.copy(), result))
+                batch_copy = batch.copy()
+                self.result_queue.append((batch_copy, result))
+                if getattr(result, "spec_pending", None) is not None:
+                    self._spec_pending = (batch, batch_copy, result)
 
                 if self.last_batch is None:
                     # Create a dummy first batch to start the pipeline for overlap schedule.
@@ -895,7 +912,7 @@ class Scheduler(
                         mesh=self.mesh,
                     )
                     tmp_batch.forward_mode = ForwardMode.DUMMY_FIRST
-                    tmp_batch.next_batch_sampling_info = self.tp_worker.cur_sampling_info
+                    tmp_batch.next_batch_sampling_info = getattr(self.tp_worker, "cur_sampling_info", None)
                     with jax.profiler.TraceAnnotation("process_batch_result"):
                         self.process_batch_result(tmp_batch, None, batch.launch_done)
 
@@ -903,7 +920,7 @@ class Scheduler(
                 # Process the results of the last batch
                 tmp_batch, tmp_result = self.result_queue.popleft()
                 tmp_batch.next_batch_sampling_info = (
-                    self.tp_worker.cur_sampling_info if batch else None
+                    getattr(self.tp_worker, "cur_sampling_info", None) if batch else None
                 )
                 # NOTE: we should use current launched batch's launch_done event Instead of the last batch's
                 self.process_batch_result(
@@ -1816,6 +1833,49 @@ class Scheduler(
                     dp_rank * per_dp_bs_size : dp_rank * per_dp_bs_size + num_real_reqs
                 ]
 
+    def _apply_spec_decode_result(self, batch, batch_output, per_dp_bs):
+        per_rank_spec = ScheduleBatch._split_spec_info_per_rank(
+            batch_output.next_draft_input, [len(i.reqs) for i in batch.reqs_info]
+        )
+        for r, s in enumerate(per_rank_spec):
+            batch.reqs_info[r].spec_info = s
+        accept = batch_output.accept_lens
+        if accept is not None:
+            accept = np.asarray(accept)
+        for dp_rank, info in enumerate(batch.reqs_info):
+            if info.seq_lens is None or len(info.seq_lens) == 0:
+                continue
+            if accept is not None:
+                off = dp_rank * per_dp_bs
+                info.seq_lens = info.seq_lens + accept[off : off + len(info.seq_lens)]
+            else:
+                info.seq_lens = info.seq_lens + 1
+
+    def _finalize_pending_spec(self):
+        """Materialize the deferred spec-decode round before next-round prep.
+
+        Called at the top of event_loop_overlap, after process_batch_result(N-1)
+        has run concurrently with device JIT(N). Blocks on JIT(N) d2h, then
+        writes seq_lens/spec_info/output_ids back to batch(N) so
+        get_next_batch_to_run(N+1) sees consistent state.
+        """
+        if self._spec_pending is None:
+            return
+        batch, batch_copy, ret = self._spec_pending
+        self._spec_pending = None
+        pending = ret.spec_pending
+        with jax.profiler.TraceAnnotation("spec_finalize_pending"):
+            batch_output = pending.finalize()
+        self._apply_spec_decode_result(batch, batch_output, pending.per_dp_bs)
+        for r in range(self.dp_size):
+            batch_copy.reqs_info[r].spec_info = batch.reqs_info[r].spec_info
+        ret.next_token_ids = np.asarray(batch_output.next_token_ids).tolist()
+        ret.logits_output = batch_output.logits_output
+        ret.next_draft_input = batch_output.next_draft_input
+        ret.accept_lens = batch_output.accept_lens
+        ret.allocate_lens = batch_output.allocate_lens
+        ret.spec_pending = None
+
     def run_batch(self, batch: ScheduleBatch) -> GenerationBatchResult:
         """Run a batch."""
         self.forward_ct += 1
@@ -1885,26 +1945,33 @@ class Scheduler(
                     self.server_args.enable_static_lora,
                     draft_token_num=self.draft_worker.speculative_num_draft_tokens,
                 )
+            model_worker_batch.defer_spec_materialize = (
+                self.enable_overlap
+                and batch.forward_mode.is_decode()
+                and getattr(self.draft_worker, "_can_use_fused_spec_decode", False)
+                and model_worker_batch.sampling_info.is_all_greedy
+            )
             batch_output = self.draft_worker.forward_batch_speculative_generation(
                 model_worker_batch
             )
-            per_rank_spec = ScheduleBatch._split_spec_info_per_rank(
-                batch_output.next_draft_input, model_worker_batch.real_bs_per_dp
-            )
-            for r, s in enumerate(per_rank_spec):
-                batch.reqs_info[r].spec_info = s
-            accept = batch_output.accept_lens
-            if accept is not None:
-                accept = np.asarray(jax.device_get(accept))
-            per_dp_bs = model_worker_batch.per_dp_bs_size
-            for dp_rank, info in enumerate(batch.reqs_info):
-                if info.seq_lens is None or len(info.seq_lens) == 0:
-                    continue
-                if accept is not None:
-                    off = dp_rank * per_dp_bs
-                    info.seq_lens = info.seq_lens + accept[off : off + len(info.seq_lens)]
-                else:
-                    info.seq_lens = info.seq_lens + 1
+            if model_worker_batch.defer_spec_materialize:
+                # Fused JIT dispatched; d2h + seq_lens/spec_info writeback are
+                # deferred to _finalize_pending_spec at the start of the next
+                # event_loop_overlap iteration so process_batch_result(N-1)
+                # overlaps device compute(N).
+                ret = GenerationBatchResult(
+                    logits_output=None,
+                    next_token_ids=None,
+                    extend_input_len_per_req=None,
+                    extend_logprob_start_len_per_req=None,
+                    bid=model_worker_batch.bid,
+                    cache_miss_count=0,
+                )
+                ret.spec_pending = batch_output
+                if hasattr(batch, "launch_done"):
+                    batch.launch_done.set()
+                return ret
+            self._apply_spec_decode_result(batch, batch_output, model_worker_batch.per_dp_bs_size)
             next_token_ids = np.asarray(jax.device_get(batch_output.next_token_ids))
             self._extract_dp_output_ids(next_token_ids, model_worker_batch, batch)
             logits_output = batch_output.logits_output
@@ -1959,7 +2026,7 @@ class Scheduler(
         elif batch.forward_mode.is_extend():
             self.process_batch_result_prefill(batch, result, launch_done)
         elif batch.forward_mode.is_idle():
-            if self.enable_overlap:
+            if self._overlap_via_tp_thread:
                 self.tp_worker.resolve_last_batch_result(launch_done)
                 self.set_next_batch_sampling_info_done(batch)
         elif batch.forward_mode.is_dummy_first():
