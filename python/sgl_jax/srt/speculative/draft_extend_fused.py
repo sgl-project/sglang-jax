@@ -776,7 +776,6 @@ def prepare_spec_prefill_forward_batch(spec_worker, model_worker_batch):
 
 def launch_fused_draft_extend_for_decode(draft_worker, model_worker_batch, batch_output):
     """Launch fused MTP draft extend and return deferred host restore state."""
-    from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
     from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
 
     if batch_output.next_draft_input.verified_id.shape[0] <= 0:
@@ -804,7 +803,7 @@ def launch_fused_draft_extend_for_decode(draft_worker, model_worker_batch, batch
 
     mr0 = draft_worker._workers[0].model_runner
     mwb.spec_info_padded.hidden_states = target_hidden
-    shared_fb = ForwardBatch.init_new(mwb, mr0)
+    shared_fb = _forward_batch_init_new_preserve_device(mwb, mr0)
     shared_fb.bid = model_worker_batch.bid
 
     all_memory_pools = []
