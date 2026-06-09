@@ -344,6 +344,10 @@ class SchedulerOutputProcessorMixin:
             for dp_rank, info in enumerate(batch.reqs_info):
                 base = dp_rank * per_dp_bs
                 for j, req in enumerate(info.reqs or []):
+                    if self.enable_overlap and (req.finished() or req.is_retracted):
+                        continue
+                    if req.is_retracted:
+                        continue
                     a = accept_lens[base + j]
                     req.spec_verify_ct += 1
                     req.spec_accepted_tokens += a
@@ -357,11 +361,21 @@ class SchedulerOutputProcessorMixin:
         if not is_spec_decode:
             self.num_generated_tokens += batch.batch_size()
         else:
-            for next_token_id in next_token_ids:
-                self.num_generated_tokens += len(next_token_id)
-                self.accept_token += len(next_token_id)
-            self.spec_num_forward_ct += batch.batch_size()
-            self.draft_token += batch.batch_size() * self.draft_worker.speculative_num_draft_tokens
+            active_spec_reqs = 0
+            per_dp_bs = batch.per_dp_bs_size
+            for dp_rank, info in enumerate(batch.reqs_info):
+                base = dp_rank * per_dp_bs
+                for j, req in enumerate(info.reqs or []):
+                    if self.enable_overlap and (req.finished() or req.is_retracted):
+                        continue
+                    if req.is_retracted:
+                        continue
+                    accepted = len(next_token_ids[base + j])
+                    self.num_generated_tokens += accepted
+                    self.accept_token += accepted
+                    active_spec_reqs += 1
+            self.spec_num_forward_ct += active_spec_reqs
+            self.draft_token += active_spec_reqs * self.draft_worker.speculative_num_draft_tokens
         # FIXME(pc) add spec decode metrics
 
         if self.enable_overlap:
