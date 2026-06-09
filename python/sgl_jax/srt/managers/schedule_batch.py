@@ -2377,6 +2377,16 @@ class ScheduleBatch:
             logits_indices_selector,
         ) = self._merge_batch_metadata(per_dp_bs, total_bs)
         sampling_info = self._merge_sampling_info(per_dp_bs, total_bs)
+        for dp_rank, info in enumerate(self.reqs_info):
+            spec_info_dp = info.spec_info
+            future_indices = getattr(spec_info_dp, "future_indices", None)
+            if future_indices is None:
+                continue
+            num_reqs = len(info.reqs) if info.reqs is not None else 0
+            assert len(future_indices) == num_reqs, (
+                f"future_indices length mismatch on dp_rank={dp_rank}: "
+                f"{len(future_indices)=}, {num_reqs=}"
+            )
         # Concat per-rank spec_info into a cross-rank-flat EagleDraftInput,
         # then scatter into DP-padded (total_bs, ...) slots so spec_info[i]
         # aligns with seq_lens[i]. Returns a new object — does not mutate
@@ -2501,6 +2511,7 @@ class ScheduleBatch:
             accept_length=_scatter1(flat.accept_length),
             accept_length_cpu=_scatter1(flat.accept_length_cpu),
             new_seq_lens=_scatter1(flat.new_seq_lens),
+            future_indices=_scatter1(flat.future_indices),
             pending_draft_extend_result=flat.pending_draft_extend_result,
         )
 
@@ -2516,7 +2527,8 @@ class ScheduleBatch:
             return [None] * len(real_bs_per_dp)
 
         has_pending_draft_extend = flat.pending_draft_extend_result is not None
-        if not has_pending_draft_extend:
+        has_future_indices = getattr(flat, "future_indices", None) is not None
+        if not has_pending_draft_extend and not has_future_indices:
             flat._ensure_host()
             required_fields = ("topk_p", "topk_index", "hidden_states", "verified_id")
             missing = [f for f in required_fields if getattr(flat, f, None) is None]
@@ -2541,6 +2553,7 @@ class ScheduleBatch:
                         "accept_length",
                         "accept_length_cpu",
                         "new_seq_lens",
+                        "future_indices",
                     )
                 }
                 raise RuntimeError(
@@ -2558,6 +2571,7 @@ class ScheduleBatch:
             "accept_length",
             "accept_length_cpu",
             "new_seq_lens",
+            "future_indices",
         )
 
         out = []
@@ -2569,7 +2583,12 @@ class ScheduleBatch:
             kwargs = {"capture_hidden_mode": flat.capture_hidden_mode}
             for f in per_req_fields:
                 v = getattr(flat, f, None)
-                if has_pending_draft_extend and f not in ("allocate_lens", "new_seq_lens"):
+                if (has_pending_draft_extend or has_future_indices) and f not in (
+                    "allocate_lens",
+                    "new_seq_lens",
+                    "accept_length_cpu",
+                    "future_indices",
+                ):
                     kwargs[f] = None
                 else:
                     kwargs[f] = None if v is None else v[offset : offset + n]
@@ -2596,7 +2615,13 @@ class ScheduleBatch:
             return None
 
         pending = None
-        if any(getattr(s, "pending_draft_extend_result", None) is not None for s in nonempty):
+        has_future_indices = any(getattr(s, "future_indices", None) is not None for s in nonempty)
+        if has_future_indices:
+            assert all(getattr(s, "future_indices", None) is not None for s in nonempty), (
+                "_concat_spec_info_per_rank requires every nonempty rank to carry "
+                "future_indices on the relay-buffer path"
+            )
+        elif any(getattr(s, "pending_draft_extend_result", None) is not None for s in nonempty):
             from sgl_jax.srt.speculative.eagle_util import PendingDraftExtendResultSlice
 
             pending_values = []
@@ -2623,6 +2648,7 @@ class ScheduleBatch:
             "accept_length",
             "accept_length_cpu",
             "new_seq_lens",
+            "future_indices",
         )
 
         kwargs = {

@@ -496,6 +496,8 @@ class EagleDraftInput:
     #: host ``(b,)`` — scheduler-visible logical length after verify. May be
     #: derived from ``old_seq_lens + accept_length`` if not stored.
     new_seq_lens: np.ndarray | None = None
+    #: host ``(b,)`` — req_pool_indices used to gather relay-buffer state.
+    future_indices: np.ndarray | None = None
     pending_draft_extend_result: object | None = None
 
     @staticmethod
@@ -547,6 +549,7 @@ class EagleDraftInput:
             self.kv_indices,
             self.seq_lens_for_draft_extend,
             self.req_pool_indices_for_draft_extend,
+            self.future_indices,
             accept_length_cpu_arr,
             num_tokens_per_batch_arr,
             num_tokens_for_logprob_arr,
@@ -570,10 +573,11 @@ class EagleDraftInput:
         obj.kv_indices = children[6]
         obj.seq_lens_for_draft_extend = children[7]
         obj.req_pool_indices_for_draft_extend = children[8]
+        obj.future_indices = children[9]
 
-        obj.accept_length_cpu = children[9]
-        obj.num_tokens_per_batch = children[10]
-        obj.num_tokens_for_logprob_per_batch = children[11]
+        obj.accept_length_cpu = children[10]
+        obj.num_tokens_per_batch = children[11]
+        obj.num_tokens_for_logprob_per_batch = children[12]
 
         return obj
 
@@ -846,8 +850,24 @@ class EagleDraftInput:
             setattr(self, f, np.asarray(getattr(self, f)))
 
     def filter_batch(self, new_indices: np.ndarray, has_been_filtered: bool = True):
-        self.resolve_pending_draft_extend_result()
         new_indices = np.asarray(new_indices)
+        if self.future_indices is not None:
+            src = np.asarray(self.future_indices)
+            idx = (
+                slice(0, len(new_indices))
+                if has_been_filtered and len(new_indices) == len(src)
+                else new_indices
+            )
+            self.future_indices = src[idx]
+            if self.allocate_lens is not None:
+                self.allocate_lens = np.asarray(self.allocate_lens)[idx]
+            if self.new_seq_lens is not None:
+                self.new_seq_lens = np.asarray(self.new_seq_lens)[idx]
+            if self.accept_length_cpu is not None:
+                self.accept_length_cpu = np.asarray(self.accept_length_cpu)[idx]
+            return
+
+        self.resolve_pending_draft_extend_result()
         self._ensure_host()
         if has_been_filtered and len(new_indices) == len(self.topk_p):
             self.topk_p = self.topk_p[: len(new_indices)]
@@ -880,12 +900,45 @@ class EagleDraftInput:
             "new_seq_lens",
             "accept_length",
             "accept_length_cpu",
+            "future_indices",
         ):
             v = getattr(self, f, None)
             if v is not None and len(v) != n:
                 setattr(self, f, np.asarray(v)[:n])
 
     def merge_batch(self, spec_info: EagleDraftInput):
+        if self.future_indices is not None or spec_info.future_indices is not None:
+            assert self.future_indices is not None and spec_info.future_indices is not None, (
+                "merge_batch requires both EagleDraftInput objects to carry future_indices "
+                "on the relay-buffer path"
+            )
+            self.future_indices = np.concatenate(
+                [np.asarray(self.future_indices), np.asarray(spec_info.future_indices)],
+                axis=0,
+            )
+            if self.allocate_lens is not None and spec_info.allocate_lens is not None:
+                self.allocate_lens = np.concatenate(
+                    [np.asarray(self.allocate_lens), np.asarray(spec_info.allocate_lens)],
+                    axis=0,
+                )
+            else:
+                self.allocate_lens = None
+            if self.new_seq_lens is not None and spec_info.new_seq_lens is not None:
+                self.new_seq_lens = np.concatenate(
+                    [np.asarray(self.new_seq_lens), np.asarray(spec_info.new_seq_lens)],
+                    axis=0,
+                )
+            else:
+                self.new_seq_lens = None
+            if self.accept_length_cpu is not None and spec_info.accept_length_cpu is not None:
+                self.accept_length_cpu = np.concatenate(
+                    [np.asarray(self.accept_length_cpu), np.asarray(spec_info.accept_length_cpu)],
+                    axis=0,
+                )
+            else:
+                self.accept_length_cpu = None
+            return
+
         self.resolve_pending_draft_extend_result()
         spec_info.resolve_pending_draft_extend_result()
         if self.hidden_states is None:
