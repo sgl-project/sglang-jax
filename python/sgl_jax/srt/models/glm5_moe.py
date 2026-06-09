@@ -21,6 +21,7 @@ from sgl_jax.srt.layers.moe import (
     create_moe_weights_mapping,
 )
 from sgl_jax.srt.layers.radix_attention import RadixAttention
+from sgl_jax.srt.kernels.fused_rnr import apply_fused_rnr_with_padding
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
@@ -606,16 +607,21 @@ class Glm5DecoderLayer(nnx.Module):
             forward_batch=forward_batch,
             token_to_kv_pool=token_to_kv_pool,
         )
-        hidden_states += residual
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-
         if self.is_moe_layer:
+            # Fused Residual Add + RMSNorm + MoE Router Gating Pallas Kernel
+            residual, hidden_states, router_logits = apply_fused_rnr_with_padding(
+                attn_out=hidden_states,
+                res=residual,
+                gamma=self.post_attention_layernorm.scale.value,
+                w_gate=self.moe_gate.kernel.value,
+                hidden_size=self.hidden_size,
+                num_experts=self.moe_gate.kernel.value.shape[1],
+                eps=self.post_attention_layernorm.epsilon,
+            )
             if self.shared_experts is not None:
                 shared_output = self.shared_experts(hidden_states)
             else:
                 shared_output = None
-            router_logits = self.moe_gate(hidden_states)
 
             correction_bias = self.moe_gate.bias.value if self.moe_gate.bias is not None else None
             topk_weights, topk_ids = self.topk(
@@ -629,6 +635,10 @@ class Glm5DecoderLayer(nnx.Module):
             if shared_output is not None:
                 hidden_states = hidden_states + shared_output
         else:
+            # Standard sequential execution for dense layers
+            hidden_states += residual
+            residual = hidden_states
+            hidden_states = self.post_attention_layernorm(hidden_states)
             hidden_states = self.mlp(hidden_states)
             topk_ids = None
 
