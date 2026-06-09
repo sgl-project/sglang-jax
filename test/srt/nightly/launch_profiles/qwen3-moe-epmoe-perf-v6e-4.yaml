@@ -1,0 +1,30 @@
+# Qwen3-MoE-30B-A3B (bf16) on v6e-4, full-EP (TP4/EP4), moe-backend epmoe.
+# Perf sweep; radix cache disabled so hit-rate cannot skew the baseline.
+name: qwen3_moe-epmoe-perf-tp4-ep4
+target: v6e-4
+model_path: Qwen/Qwen3-30B-A3B
+tp_size: 4
+dp_size: 1
+ep_size: 4
+port: 30061
+server_args:
+  - --skip-server-warmup
+  - --random-seed
+  - "3"
+  - --mem-fraction-static
+  - "0.9"
+  - --max-prefill-tokens
+  - "8192"
+  - --download-dir
+  - /dev/shm/
+  - --dtype
+  - bfloat16
+  - --attention-backend
+  - fa
+  - --page-size
+  - "256"
+  - --max-running-requests
+  - "256"
+  - --disable-radix-cache
+  - --moe-backend
+  - epmoe

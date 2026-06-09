@@ -16,9 +16,10 @@ for _p in (_TEST_SRT, _NIGHTLY_DIR, _SELF_DIR):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+from drivers import run_eval_for_case
 from multi_host_suite import AccuracyCase, SuiteError
 from profile_loader import LaunchProfile
-from results import build_accuracy_result, run_eval_for_case, write_accuracy_result
+from results import build_accuracy_result, write_result
 
 
 def run_accuracy_case(case: AccuracyCase, profile: LaunchProfile) -> None:
@@ -45,7 +46,7 @@ def run_accuracy_case(case: AccuracyCase, profile: LaunchProfile) -> None:
         case, profile.name, profile.target, metrics, started_at, finished_at
     )
 
-    out_path = write_accuracy_result(summary, case.name)
+    out_path = write_result(summary, case.name)
     if out_path is not None:
         print(f"[multi-host-suite] Wrote accuracy summary to {out_path}", flush=True)
     else:

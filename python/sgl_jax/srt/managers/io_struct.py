@@ -656,7 +656,9 @@ class ProfileReqInput:
     # 1: Enables Python tracing (this is the default).
     python_tracer_level: int | None = None
     stage_id: int | None = None  # Which stage to count steps for (multimodal only)
-    profile_by_stage: bool = False  # Whether to profile prefill/decode separately
+    # Accept None from clients (e.g. bench_serving) that omit this field; None is
+    # treated as False (no per-stage profiling) by the scheduler boolean check.
+    profile_by_stage: bool | None = False  # Whether to profile prefill/decode separately
     profile_stages: list[str] | None = None  # Stages to profile, e.g. ["prefill", "decode"]
 
 
@@ -676,7 +678,7 @@ class ProfileReq:
     python_tracer_level: int | None = None
     profile_id: str | None = None
     stage_id: int | None = None
-    profile_by_stage: bool = False
+    profile_by_stage: bool | None = False
     profile_stages: list[str] | None = None
 
 
