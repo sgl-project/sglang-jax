@@ -1083,3 +1083,339 @@ def spec_decode(spec_worker, model_worker_batch, cur_allocate_lens):
         target_logits=target_logits,
         target_hidden=target_hidden,
     )
+
+
+# ---------------------------------------------------------------------------
+# JIT-B: fuse the EAGLE3 topk=1 greedy draft autoregressive forward loop.
+# Runs num_steps-1 draft decode forwards + select_top_k / update_eagle_lists +
+# the topk=1 chain verify-input build inside a SINGLE jit. Each step uses its
+# own attention metadata (metadata_per_step, a pytree list passed as a JIT arg
+# and switched in the static-unrolled loop). The host keeps padding_for_decode
+# and get_eagle_multi_step_metadata (numpy) outside.
+# ---------------------------------------------------------------------------
+
+
+def _build_fused_eagle3_draft_forward_jit(num_steps, topk, num_draft_tokens, mesh):
+    from sgl_jax.srt.speculative.eagle_draft_worker import topk_probs_from_logits
+
+    @partial(
+        jax.jit,
+        donate_argnames=["draft_memory_pools"],
+        static_argnames=[
+            "draft_model_state_def",
+            "num_steps",
+            "topk",
+            "num_draft_tokens",
+        ],
+    )
+    def fused_eagle3_draft_forward(
+        draft_model_def,
+        draft_model_state_def,
+        draft_leaves,
+        draft_forward_batch,
+        draft_memory_pools,
+        draft_logits_metadata,
+        metadata_per_step,
+        topk_p_init,
+        topk_index_init,
+        hidden_init,
+        verified_id,
+        verified_seq_lens,
+        positions_base,
+        hot_token_ids,
+        *,
+        num_steps,
+        topk,
+        num_draft_tokens,
+    ):
+        bs = verified_seq_lens.shape[0]
+        rep = NamedSharding(mesh, P())
+
+        def _rep(x):
+            if x is None:
+                return x
+            return jax.sharding.reshard(x, rep)
+
+        # topk=1 greedy chain: the eager select_top_k_tokens/update_eagle_lists
+        # machinery degenerates to "feed the previous predicted token, stack the
+        # per-step tokens". We inline that directly to avoid the topk>1 tree path
+        # (its jnp.repeat/gather demand out_sharding under an Explicit mesh).
+        # token_list[:, i] is the token fed to step i: seed (from prev round's
+        # draft_extend) for i=0, then each forward's argmax. num_steps tokens
+        # total; num_steps-1 forwards. Matches eager draft_forward exactly at
+        # topk=1.
+        input_ids = topk_index_init.reshape(bs)
+        # Seed hot_token_ids mapping was skipped in padding_for_decode (to keep
+        # that gather out of the eager host segment); apply it here in-graph.
+        # Mirrors eager: padding maps spec.topk_index, then draft_forward feeds
+        # the mapped seed into step 0. Subsequent steps map inside the loop.
+        if hot_token_ids is not None:
+            input_ids = hot_token_ids[input_ids]
+        hidden = hidden_init
+        tokens = [input_ids]  # token_list[:, 0] = seed
+        pools = draft_memory_pools
+        last_pool_updates = None
+
+        for i in range(num_steps - 1):
+            draft_forward_batch.input_ids = input_ids
+            draft_forward_batch.spec_info.hidden_states = _rep(hidden)
+            draft_forward_batch.positions = positions_base + i
+            draft_forward_batch.attn_backend.forward_metadata = metadata_per_step[i]
+
+            state = jax.tree_util.tree_unflatten(draft_model_state_def, draft_leaves)
+            model = nnx.merge(draft_model_def, state)
+            output, pool_updates, _, _ = model(
+                draft_forward_batch, pools, draft_logits_metadata
+            )
+            # EAGLE3 is autoregressive on ONE pool: step i+1 attention must read
+            # the KV that step i wrote. model returns pool_updates as a buffer
+            # dict ({"token_to_kv_pool": layers_kv_fused}), NOT a MemoryPools.
+            # Functionally fold the new buffer back into `pools` (replace_buffer
+            # is a trace-time list-slice assign) before the next step, and carry
+            # the dict out for the host replace_all.
+            last_pool_updates = pool_updates
+            pools.replace_all(pool_updates)
+
+            _, topk_index = topk_probs_from_logits(output.next_token_logits, topk)
+            if hot_token_ids is not None:
+                topk_index = hot_token_ids[topk_index]
+            input_ids = topk_index.reshape(bs)
+            tokens.append(input_ids)
+            hidden = output.hidden_states
+
+        token_list = jnp.stack(tokens, axis=1)  # (bs, num_steps)
+
+        # topk=1 linear chain verify inputs. Replicate the small index inputs
+        # first (avoids the illegal P("data","data") from a sharded 1-D->2-D
+        # reshape inside the helper; these are bs-scale int32).
+        tl, vid, vsl = _rep(token_list), _rep(verified_id), _rep(verified_seq_lens)
+        (
+            draft_tokens,
+            position,
+            retrive_index,
+            retrive_next_token,
+            retrive_next_sibling,
+        ) = _build_topk1_chain_verify_inputs_device_tuple(
+            verified_id=vid,
+            token_list=tl,
+            seq_lens=vsl,
+            num_verify_tokens=num_draft_tokens,
+            batch_size=bs,
+        )
+        return (
+            draft_tokens,
+            position,
+            retrive_index.reshape(bs, num_draft_tokens),
+            retrive_next_token.reshape(bs, num_draft_tokens),
+            retrive_next_sibling.reshape(bs, num_draft_tokens),
+            last_pool_updates,
+        )
+
+    return fused_eagle3_draft_forward
+
+
+def fused_eagle3_draft(draft_worker, model_worker_batch):
+    """Host entry: fused EAGLE3 topk=1 greedy draft (replaces draft_forward + chain build).
+
+    ``padding_for_decode`` (host numpy) must have already run. Sets
+    ``model_worker_batch.spec_info_padded`` to the EagleVerifyInput consumed by
+    verify(), identical in structure to the eager ``draft()`` topk=1 path.
+    """
+    from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode
+    from sgl_jax.srt.speculative.eagle_util import EagleDraftInput, EagleVerifyInput
+    from sgl_jax.srt.utils.jax_utils import device_array
+
+    mr = draft_worker.draft_model_runner
+    spec = model_worker_batch.spec_info_padded  # EagleDraftInput (post padding_for_decode)
+    bs = model_worker_batch.seq_lens.shape[0]
+    topk = draft_worker.topk
+    num_steps = draft_worker.speculative_num_steps
+    n = draft_worker.speculative_num_draft_tokens
+
+    metadata_per_step = mr.attn_backend.get_eagle_multi_step_metadata(model_worker_batch)
+    logits_metadata = _logits_metadata_from_model_worker_batch_preserve_device(
+        model_worker_batch, draft_worker.mesh, include_accept_lens=False
+    )
+
+    forward_batch = _forward_batch_init_new_preserve_device(model_worker_batch, mr)
+    forward_batch.bid = model_worker_batch.bid
+    # Use host np.empty for these placeholders: jnp.empty lowers to
+    # full+convert_element_type+broadcast_in_dim eager ops (3 stray modules per
+    # call). They are overwritten inside the JIT anyway, so a host array that is
+    # device_put once (no module) is enough.
+    forward_batch.out_cache_loc = np.empty((1,))
+    forward_batch.cache_loc = np.empty((1,))
+    forward_batch.spec_info = EagleDraftInput()
+    forward_batch.spec_info.hidden_states = np.empty(
+        (bs * topk, spec.hidden_states.shape[1]), dtype=np.float32
+    )
+
+    positions_base = device_array(
+        np.repeat(model_worker_batch.seq_lens, topk),
+        sharding=NamedSharding(draft_worker.mesh, P()),
+    )
+    verified_seq_lens = model_worker_batch.seq_lens - 1
+    verified_id = spec.verified_id
+
+    if not hasattr(draft_worker, "_fused_draft_forward_jit_fn"):
+        draft_worker._fused_draft_forward_jit_fn = _build_fused_eagle3_draft_forward_jit(
+            num_steps, topk, n, draft_worker.mesh
+        )
+
+    with jax.set_mesh(draft_worker.mesh):
+        (
+            draft_tokens,
+            position,
+            retrive_index,
+            retrive_next_token,
+            retrive_next_sibling,
+            pool_updates,
+        ) = draft_worker._fused_draft_forward_jit_fn(
+            mr._model_def,
+            mr._model_state_def,
+            tuple(mr.model_state_leaves),
+            forward_batch,
+            mr.memory_pools,
+            logits_metadata,
+            tuple(metadata_per_step),
+            spec.topk_p,
+            spec.topk_index,
+            spec.hidden_states,
+            verified_id,
+            verified_seq_lens,
+            positions_base,
+            draft_worker.hot_token_ids,
+            num_steps=num_steps,
+            topk=topk,
+            num_draft_tokens=n,
+        )
+
+    if pool_updates is not None:
+        mr.memory_pools.replace_all(pool_updates)
+
+    model_worker_batch.spec_info_padded = EagleVerifyInput(
+        draft_token=draft_tokens,
+        custom_mask=None,
+        positions=position,
+        retrive_index=retrive_index,
+        retrive_next_token=retrive_next_token,
+        retrive_next_sibling=retrive_next_sibling,
+        retrive_cum_len=None,
+        spec_steps=num_steps,
+        topk=topk,
+        draft_token_num=n,
+        capture_hidden_mode=CaptureHiddenMode.LAST,
+        seq_lens_sum=model_worker_batch.seq_lens_sum,
+        seq_lens_cpu=model_worker_batch.seq_lens,
+    )
+
+
+# ---------------------------------------------------------------------------
+# JIT-C: fuse the EAGLE3 draft_extend_for_decode forward + replicate + topk
+# capture into one named jit (fused_eagle3_draft_extend). The select-index
+# gather stays on host (numpy, no TPU op, matches eager). topk=1 greedy only.
+# ---------------------------------------------------------------------------
+
+
+def _build_fused_eagle3_draft_extend_jit(mesh):
+    from sgl_jax.srt.speculative.eagle_draft_worker import topk_probs_from_logits
+
+    @partial(
+        jax.jit,
+        donate_argnames=["draft_memory_pools"],
+        static_argnames=["draft_model_state_def", "topk"],
+    )
+    def fused_eagle3_draft_extend(
+        draft_model_def,
+        draft_model_state_def,
+        draft_leaves,
+        draft_forward_batch,
+        draft_memory_pools,
+        draft_logits_metadata,
+        *,
+        topk,
+    ):
+        state = jax.tree_util.tree_unflatten(draft_model_state_def, draft_leaves)
+        model = nnx.merge(draft_model_def, state)
+        output, pool_updates, _, _ = model(
+            draft_forward_batch, draft_memory_pools, draft_logits_metadata
+        )
+        rep = NamedSharding(mesh, P())
+        rep_logits = jax.sharding.reshard(output.next_token_logits, rep)
+        rep_hidden = jax.sharding.reshard(output.hidden_states, rep)
+        topk_p, topk_index = topk_probs_from_logits(rep_logits, topk)
+        return topk_p, topk_index, rep_hidden, pool_updates
+
+    return fused_eagle3_draft_extend
+
+
+def fused_eagle3_draft_extend_decode(draft_worker, model_worker_batch, batch_output):
+    """Host entry: fused EAGLE3 draft_extend_for_decode (forward + topk capture).
+
+    Drop-in replacement for the eager ``EagleDraftWorker.draft_extend_for_decode``
+    greedy topk=1 path. The forward + replicate + topk run in one named jit; the
+    select-index gather to real_bs stays on host (numpy, no TPU op).
+    """
+    import numpy as np
+
+    from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+    from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
+
+    if batch_output.next_draft_input.verified_id.shape[0] <= 0:
+        return
+
+    mr = draft_worker.draft_model_runner
+    draft_input = EagleDraftInput(
+        hidden_states=batch_output.logits_output.hidden_states,
+        allocate_lens=batch_output.allocate_lens,
+    )
+    model_worker_batch, logits_metadata = draft_input.prepare_for_extend_after_verify(
+        model_worker_batch,
+        mr,
+        batch_output,
+        draft_worker.speculative_num_draft_tokens,
+    )
+    if model_worker_batch.input_ids.shape[0] <= 0:
+        return
+
+    forward_batch = _forward_batch_init_new_preserve_device(model_worker_batch, mr)
+    forward_batch.bid = model_worker_batch.bid
+    draft_logits_metadata = _logits_metadata_from_model_worker_batch_preserve_device(
+        model_worker_batch, draft_worker.mesh
+    )
+
+    if not hasattr(draft_worker, "_fused_draft_extend_jit_fn"):
+        draft_worker._fused_draft_extend_jit_fn = _build_fused_eagle3_draft_extend_jit(
+            draft_worker.mesh
+        )
+
+    with jax.set_mesh(draft_worker.mesh):
+        topk_p, topk_index, rep_hidden, pool_updates = draft_worker._fused_draft_extend_jit_fn(
+            mr._model_def,
+            mr._model_state_def,
+            tuple(mr.model_state_leaves),
+            forward_batch,
+            mr.memory_pools,
+            draft_logits_metadata,
+            topk=draft_worker.topk,
+        )
+
+    mr.memory_pools.replace_all(pool_updates)
+
+    sel = np.asarray(model_worker_batch.logits_indices_selector)
+    accept_host = np.asarray(jax.device_get(batch_output.accept_lens))
+    select_index = sel * (draft_worker.speculative_num_steps + 1) + accept_host[sel] - 1
+    verified_id_arr = batch_output.next_draft_input.verified_id
+
+    jax.copy_to_host_async(topk_p)
+    jax.copy_to_host_async(topk_index)
+    jax.copy_to_host_async(rep_hidden)
+    if hasattr(verified_id_arr, "copy_to_host_async"):
+        jax.copy_to_host_async(verified_id_arr)
+
+    batch_output.next_draft_input.topk_p = np.asarray(topk_p)[sel]
+    batch_output.next_draft_input.topk_index = np.asarray(topk_index)[sel]
+    batch_output.next_draft_input.hidden_states = np.asarray(rep_hidden)[select_index]
+    batch_output.next_draft_input.verified_id = np.asarray(verified_id_arr)[select_index]
+    batch_output.allocate_lens = batch_output.allocate_lens[: model_worker_batch.real_bs]
+    batch_output.accept_lens = accept_host

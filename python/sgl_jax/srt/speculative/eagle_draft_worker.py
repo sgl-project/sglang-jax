@@ -135,7 +135,29 @@ class EagleDraftWorker(BaseDraftWorker):
     # -- BaseDraftWorker interface --
 
     def draft(self, model_worker_batch: ModelWorkerBatch) -> None:
-        self.padding_for_decode(model_worker_batch)
+        # Greedy topk=1 fast path: fuse the draft autoregressive forward loop +
+        # chain verify-input build into one JIT (JIT-B). Falls back to the eager
+        # draft_forward + build_chain otherwise.
+        from sgl_jax.srt.speculative.eagle_util import SIMULATE_ACC_LEN
+
+        sampling_info = getattr(model_worker_batch, "sampling_info", None)
+        use_fused = (
+            self.topk == 1
+            and not SIMULATE_ACC_LEN
+            and sampling_info is not None
+            and sampling_info.is_all_greedy
+        )
+
+        # In the fused path the hot_token_ids seed mapping is folded into JIT-B
+        # (keeps that gather out of the eager host segment), so skip it here.
+        self.padding_for_decode(model_worker_batch, skip_hot_token_map=use_fused)
+
+        if use_fused:
+            from sgl_jax.srt.speculative.draft_extend_fused import fused_eagle3_draft
+
+            fused_eagle3_draft(self, model_worker_batch)
+            return
+
         score_list, token_list, parents_list = self.draft_forward(model_worker_batch)
         verified_seq_lens = model_worker_batch.seq_lens - 1
         bs = model_worker_batch.seq_lens.shape[0]
@@ -276,6 +298,25 @@ class EagleDraftWorker(BaseDraftWorker):
     ) -> None:
         if batch_output.next_draft_input.verified_id.shape[0] <= 0:
             return
+
+        # Greedy topk=1 fast path: fuse the draft_extend forward + replicate +
+        # topk capture into one named jit (JIT-C). Falls back to eager otherwise.
+        from sgl_jax.srt.speculative.eagle_util import SIMULATE_ACC_LEN
+
+        sampling_info = getattr(model_worker_batch, "sampling_info", None)
+        if (
+            self.topk == 1
+            and not SIMULATE_ACC_LEN
+            and sampling_info is not None
+            and sampling_info.is_all_greedy
+        ):
+            from sgl_jax.srt.speculative.draft_extend_fused import (
+                fused_eagle3_draft_extend_decode,
+            )
+
+            fused_eagle3_draft_extend_decode(self, model_worker_batch, batch_output)
+            return
+
         draft_input = EagleDraftInput(
             hidden_states=batch_output.logits_output.hidden_states,
             allocate_lens=batch_output.allocate_lens,
@@ -342,7 +383,7 @@ class EagleDraftWorker(BaseDraftWorker):
         draft_input.topk_index = topk_index
         draft_input.hidden_states = hidden
 
-    def padding_for_decode(self, model_worker_batch: ModelWorkerBatch):
+    def padding_for_decode(self, model_worker_batch: ModelWorkerBatch, skip_hot_token_map=False):
         # At dp>1 the incoming mwb is already DP-padded to total_bs (== a bucket
         # value, see _get_spec_decode_mwb_dp); use the larger of real_bs and the
         # incoming seq_lens length so we don't shrink below the DP layout.
@@ -402,7 +443,7 @@ class EagleDraftWorker(BaseDraftWorker):
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
 
         topk_index = spec_info.topk_index
-        if self.hot_token_ids is not None:
+        if self.hot_token_ids is not None and not skip_hot_token_map:
             model_worker_batch.spec_info_padded.topk_index = self.hot_token_ids[topk_index]
         if self.topk > 1:
             self.draft_model_runner.attn_backend.forward_metadata.custom_mask = (
