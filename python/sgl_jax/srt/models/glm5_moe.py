@@ -380,8 +380,9 @@ class Glm5Attention(nnx.Module):
             preferred_element_type=preferred_dtype,
         )
         
-        # Summing over the sharded head dimension (axis 1) automatically triggers the RowParallel All-Reduce (psum)
-        output = jnp.sum(o_local, axis=1).astype(q_nope.dtype)
+        # Summing over the sharded head dimension (axis 0, since batch dimension H is placed first by dot_general)
+        # automatically triggers the RowParallel All-Reduce (psum) and yields shape [T, C]
+        output = jnp.sum(o_local, axis=0).astype(q_nope.dtype)
         return output, kv_fused
 
     def _forward_mha(
