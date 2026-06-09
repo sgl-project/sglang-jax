@@ -23,6 +23,52 @@ def publish_spec_decode_new_seq_lens(batch_output):
     return new_seq_lens
 
 
+def defer_spec_decode_new_seq_lens(batch, new_seq_lens):
+    if new_seq_lens is None:
+        return None
+    entries = []
+    per_dp_bs = batch.per_dp_bs_size
+    for dp_rank, info in enumerate(batch.reqs_info):
+        if not info.reqs:
+            continue
+        base = dp_rank * per_dp_bs
+        entries.extend((req, base + i) for i, req in enumerate(info.reqs))
+    return (new_seq_lens, entries) if entries else None
+
+
+def resolve_deferred_spec_decode_new_seq_lens(deferred, *batches):
+    if deferred is None:
+        return None
+    new_seq_lens, entries = deferred
+    new_seq_lens_host = np.asarray(jax.device_get(new_seq_lens))
+    seq_lens_by_req_id = {id(req): int(new_seq_lens_host[flat_slot]) for req, flat_slot in entries}
+    for batch in batches:
+        _refresh_batch_seq_lens(batch, seq_lens_by_req_id)
+    return None
+
+
+def _refresh_batch_seq_lens(batch, seq_lens_by_req_id):
+    if batch is None:
+        return
+    for info in batch.reqs_info:
+        if not info.reqs:
+            continue
+        if info.seq_lens is not None and len(info.seq_lens) == len(info.reqs):
+            seq_lens = np.asarray(info.seq_lens, dtype=np.int32).copy()
+        else:
+            seq_lens = np.array([len(req.fill_ids) for req in info.reqs], dtype=np.int32)
+        changed = False
+        for i, req in enumerate(info.reqs):
+            seq_len = seq_lens_by_req_id.get(id(req))
+            if seq_len is None:
+                continue
+            seq_lens[i] = seq_len
+            changed = True
+        if changed:
+            info.seq_lens = seq_lens
+            info.seq_lens_sum = int(seq_lens.sum())
+
+
 def can_use_spec_decode_overlap(enable_overlap, spec_algorithm, batch) -> bool:
     if not enable_overlap:
         return False
