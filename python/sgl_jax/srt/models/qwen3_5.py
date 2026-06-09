@@ -264,7 +264,7 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
             jnp.zeros((self.num_v_heads,), dtype=jnp.float32, out_sharding=P("tensor"))
         )
         self.dt_bias = nnx.Param(
-            jnp.ones((self.num_v_heads,), dtype=jnp.float32, out_sharding=P("tensor"))
+            jnp.ones((self.num_v_heads,), dtype=dtype, out_sharding=P("tensor"))
         )
 
         # GDN output norm: plain RMSNorm over head_v_dim, then explicit silu(z)
@@ -300,9 +300,25 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
         # across "tensor" (each TP rank gets its head shard). No-op at TP=1.
         return jax.sharding.reshard(x, P("data", "tensor"))
 
+    def _norm_gate(self, core_out, z):
+        """Per-head RMSNorm over head_v_dim, then a silu(z) gate (silu, NOT the
+        sigmoid of torch RMSNormGated). A method so the activation is unit-tested.
+        """
+        T = core_out.shape[0]
+        core_out = core_out.reshape(
+            T,
+            self.num_v_heads,
+            self.head_v_dim,
+            out_sharding=NamedSharding(self.mesh, P("data", "tensor", None)),
+        )
+        core_out = self.norm(core_out)
+        core_out = core_out.reshape(
+            T, self.value_dim, out_sharding=NamedSharding(self.mesh, P("data", "tensor"))
+        )
+        return core_out * jax.nn.silu(z)
+
     def __call__(self, positions, hidden_states, forward_batch, recurrent_state_pool):
         del positions  # GDN is position-agnostic.
-        T = hidden_states.shape[0]
         qkvz, _ = self.in_proj_qkvz(hidden_states)  # [T, 2*key_dim + 2*value_dim]
         ba, _ = self.in_proj_ba(hidden_states)  # [T, 2*num_v_heads]
 
@@ -315,18 +331,8 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
         a = self._shard_dt(ba[:, self.num_v_heads :])
 
         core_out, attn_state = self.self_attn(forward_batch, q, k, v, a, b, recurrent_state_pool)
-        # core_out: [T, value_dim]. Per-head RMSNorm then silu(z) gate.
-        core_out = core_out.reshape(
-            T,
-            self.num_v_heads,
-            self.head_v_dim,
-            out_sharding=NamedSharding(self.mesh, P("data", "tensor", None)),
-        )
-        core_out = self.norm(core_out)
-        core_out = core_out.reshape(
-            T, self.value_dim, out_sharding=NamedSharding(self.mesh, P("data", "tensor"))
-        )
-        core_out = core_out * jax.nn.silu(z)
+        # core_out: [T, value_dim] -> per-head RMSNorm + silu(z) gate.
+        core_out = self._norm_gate(core_out, z)
         out, _ = self.out_proj(core_out)
         return out, attn_state
 
@@ -417,22 +423,7 @@ class Qwen3_5DecoderLayer(nnx.Module):
         dtype: jnp.dtype = jnp.bfloat16,
     ):
         text_cfg = config.text_config
-        interval = int(text_cfg.full_attention_interval)
-        self.is_full_attn = ((layer_id + 1) % interval) == 0
-
-        # One-shot cross-check that the interval-derived schedule matches HF's
-        # explicit layer_types (only on layer 0 to avoid 40x duplicate logs).
-        if layer_id == 0:
-            derived = [
-                "full_attention" if ((i + 1) % interval == 0) else "linear_attention"
-                for i in range(text_cfg.num_hidden_layers)
-            ]
-            declared = list(text_cfg.layer_types)
-            assert derived == declared, (
-                "Qwen3.5 layer_types mismatch — interval-derived vs HF text_config:\n"
-                f"  derived  = {derived}\n"
-                f"  declared = {declared}"
-            )
+        self.is_full_attn = layer_id in text_cfg.full_attention_layer_ids
 
         if self.is_full_attn:
             self.self_attn = Qwen3_5Attention(config, mesh, layer_id, dtype=dtype)
@@ -686,9 +677,8 @@ class Qwen3_5MoeForConditionalGeneration(nnx.Module):
 
         hf_config = model_config.hf_config
         tc = hf_config.text_config
-        interval = int(tc.full_attention_interval)
         num_layers = int(tc.num_hidden_layers)
-        gdn_layers = [i for i in range(num_layers) if ((i + 1) % interval) != 0]
+        gdn_layers = list(tc.linear_layer_ids)
 
         mappings, visual_skip, mtp_skip = _create_qwen3_5_weight_mappings(hf_config)
 
@@ -767,8 +757,8 @@ def _create_qwen3_5_weight_mappings(hf_config):
     rooted at the multimodal wrapper's ``language_model.model.*`` prefix.
     """
     tc = hf_config.text_config
-    interval = int(tc.full_attention_interval)
     num_layers = int(tc.num_hidden_layers)
+    full_attn_ids = set(tc.full_attention_layer_ids)
     key_dim = tc.linear_num_key_heads * tc.linear_key_head_dim
     value_dim = tc.linear_num_value_heads * tc.linear_value_head_dim
     conv_dim = 2 * key_dim + value_dim
@@ -794,7 +784,7 @@ def _create_qwen3_5_weight_mappings(hf_config):
     )
 
     for i in range(num_layers):
-        is_full = ((i + 1) % interval) == 0
+        is_full = i in full_attn_ids
         src = f"model.language_model.layers.{i}"
         dst = f"language_model.model.layers.{i}"
 

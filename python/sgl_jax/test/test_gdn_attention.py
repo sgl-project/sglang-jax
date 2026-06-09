@@ -594,6 +594,34 @@ class TestGDNAttention(unittest.TestCase):
             initial_conv_state=conv,
         )
 
+    def test_extend_short_request_no_state_ignores_poisoned_slot(self):
+        """Fresh prefill (has_initial_state=False) of a request shorter than K-1
+        must zero-pad its conv final-state, not leak the slot. We poison the slot
+        and assert the sentinel never appears (run_test also compares the gathered
+        state to the zero-masked reference).
+        """
+        K = self.CONV_KERNEL_SIZE
+        T = K - 2  # shorter than the K-1 conv window
+        conv_dim = 2 * self.NUM_K_HEADS * self.HEAD_K_DIM + self.NUM_V_HEADS * self.HEAD_V_DIM
+        poison = 1.0e4
+        poison_conv = jnp.full((1, conv_dim, K - 1), poison, dtype=self.DTYPE)
+
+        _, pool, recurrent_indices, _, conv_buffer_list = self.run_test(
+            "prefill",
+            [T],
+            all_have_initial_state=False,
+            initial_conv_state=poison_conv,
+        )
+
+        final_conv = np.asarray(
+            gather_conv(pool, conv_buffer_list[0], recurrent_indices), dtype=np.float32
+        )
+        # Real state holds the request's own tokens (~0.1); the 1e4 sentinel must not appear.
+        self.assertFalse(
+            bool(np.any(np.abs(final_conv) > poison / 2)),
+            "stale poisoned slot leaked into the conv final-state",
+        )
+
     def test_single_step_decode(self):
         ssm, conv = self.random_states(batch_size=1)
         self.run_test(

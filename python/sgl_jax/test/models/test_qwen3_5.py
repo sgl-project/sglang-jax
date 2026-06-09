@@ -22,6 +22,7 @@ from pathlib import Path
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from huggingface_hub import hf_hub_download
 from transformers import AutoConfig
 
@@ -84,6 +85,29 @@ class TestQwen3_5(unittest.TestCase):
         ]
         self.assertEqual(derived, list(tc.layer_types))
 
+    # --- 2b: decoder layer picks attention type from layer_types ---
+    def test_decoder_layer_attention_type_from_layer_types(self):
+        """Qwen3_5DecoderLayer selects full vs GDN attention via
+        full_attention_layer_ids (layer_types), not a hard-coded interval.
+        Exercises the path the dropped runtime assert used to guard.
+        """
+        from sgl_jax.srt.models.qwen3_5 import (
+            Qwen3_5Attention,
+            Qwen3_5DecoderLayer,
+            Qwen3_5GatedDeltaNet,
+        )
+
+        full_ids = self.cfg.text_config.full_attention_layer_ids
+        self.assertIn(3, full_ids)  # interval=4 -> full at 3, 7, ...
+        self.assertNotIn(0, full_ids)
+
+        full_layer = Qwen3_5DecoderLayer(self.cfg, self.mesh, layer_id=full_ids[0])
+        gdn_layer = Qwen3_5DecoderLayer(self.cfg, self.mesh, layer_id=0)
+        self.assertTrue(full_layer.is_full_attn)
+        self.assertIsInstance(full_layer.self_attn, Qwen3_5Attention)
+        self.assertFalse(gdn_layer.is_full_attn)
+        self.assertIsInstance(gdn_layer.self_attn, Qwen3_5GatedDeltaNet)
+
     # --- 3: full-attn output-gate layout ---
     def test_q_proj_output_gate_layout(self):
         from sgl_jax.srt.models.qwen3_5 import Qwen3_5Attention
@@ -129,6 +153,45 @@ class TestQwen3_5(unittest.TestCase):
         )
         self.assertEqual(gdn.A_log.value.shape, (tc.linear_num_value_heads,))
         self.assertEqual(gdn.dt_bias.value.shape, (tc.linear_num_value_heads,))
+
+    # --- 5b: GDN output gate is norm-before-gate SILU (not sigmoid) ---
+    def test_gdn_output_norm_gate_is_silu(self):
+        """GDN output gate is RMSNorm(core) * silu(z) — silu, NOT sigmoid.
+
+        Re-adds the deleted RmsGateTest; a silu->sigmoid swap passes shape tests
+        but tanks accuracy. CPU-safe (no fused kernel).
+        """
+        from sgl_jax.srt.models.qwen3_5 import Qwen3_5GatedDeltaNet
+
+        tc = self.cfg.text_config
+        gdn = Qwen3_5GatedDeltaNet(self.cfg, self.mesh, layer_id=0)
+        n_v, d_v = tc.linear_num_value_heads, tc.linear_value_head_dim
+        value_dim = n_v * d_v
+        T = 4
+        core = jax.random.normal(jax.random.key(0), (T, n_v, d_v), dtype=jnp.bfloat16)
+        z = jax.random.normal(jax.random.key(1), (T, value_dim), dtype=jnp.bfloat16)
+
+        got = gdn._norm_gate(core, z)
+        normed = gdn.norm(core).reshape(T, value_dim)
+        expected_silu = normed * jax.nn.silu(z)
+        expected_sigmoid = normed * jax.nn.sigmoid(z)
+
+        self.assertEqual(got.shape, (T, value_dim))
+        np.testing.assert_allclose(
+            np.asarray(got, dtype=np.float32),
+            np.asarray(expected_silu, dtype=np.float32),
+            rtol=2e-2,
+            atol=1e-2,
+        )
+        # silu and sigmoid must differ here, else the match above is vacuous.
+        self.assertFalse(
+            np.allclose(
+                np.asarray(expected_silu, dtype=np.float32),
+                np.asarray(expected_sigmoid, dtype=np.float32),
+                rtol=2e-2,
+                atol=1e-2,
+            )
+        )
 
     # --- 6: weight-mapping coverage vs the real safetensors index ---
     def test_weight_mapping_covers_ckpt_keys(self):
