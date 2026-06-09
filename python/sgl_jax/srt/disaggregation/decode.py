@@ -6,7 +6,6 @@ import logging
 import threading
 from contextlib import suppress
 from dataclasses import dataclass
-from functools import partial
 from typing import TYPE_CHECKING
 
 import jax
@@ -25,30 +24,6 @@ if TYPE_CHECKING:
     from sgl_jax.srt.managers.scheduler import Scheduler
 
 logger = logging.getLogger(__name__)
-
-
-@partial(jax.jit, static_argnames=("out_sharding",), donate_argnums=(0,))
-def _jit_scatter_one_layer(buf, page_indices, vals, out_sharding):
-    """Scatter ``vals`` into a single per-layer KV buffer at ``page_indices``.
-
-    The scatter output is the *entire* layer buffer (~884 MB on Qwen-1.5B),
-    so it must update ``buf`` in place — a fresh allocation that large OOMs a
-    v6e single chip whose HBM is already filled by the model + KV pool.
-
-    In-place requires two things together:
-
-    * ``donate_argnums=(0,)`` so XLA may alias the output onto ``buf``'s storage.
-    * ``out_sharding`` **equal to ``buf``'s own sharding** (the caller passes
-      ``kv_pool.kv_sharding``). XLA only aliases a donated input when the output
-      sharding matches the input's; a mismatched ``out_sharding`` (e.g. the
-      ``P(None, ...)`` used on the read/gather side, whose output is small)
-      defeats aliasing and forces the full-layer fresh allocation that OOMs.
-
-    Without both, the eager ``buf.at[idx].set(...)`` double-allocates the layer
-    and wedges the single-threaded decode event loop in an XLA OOM-retry.
-    """
-
-    return buf.at[page_indices].set(vals, out_sharding=out_sharding)
 
 
 @dataclass
@@ -425,7 +400,7 @@ class SchedulerDisaggregationDecodeMixin:
         return jax.ShapeDtypeStruct(shape, kv_pool.dtype, sharding=sharding)
 
     def _write_kv_to_pool(self: Scheduler, req: Req, kv_indices, kv: jax.Array) -> None:
-        """Scatter pulled KV into the local paged pool."""
+        """Write pulled KV into the local paged pool (in place)."""
 
         if kv_indices is None:
             raise RuntimeError(
@@ -435,6 +410,8 @@ class SchedulerDisaggregationDecodeMixin:
         import numpy as np
         from jax.sharding import NamedSharding, PartitionSpec
 
+        from sgl_jax.srt.mem_cache.memory_pool import _set_fused_kv_buffer
+
         kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
         page_size = kv_pool.page_size
         seqlen = len(req.origin_input_ids)
@@ -442,60 +419,49 @@ class SchedulerDisaggregationDecodeMixin:
         kv_indices_np = (
             np.asarray(kv_indices) if not isinstance(kv_indices, np.ndarray) else kv_indices
         )
+        padded_pages = kv.shape[1]
+        # page_ids_padded is only needed by the debug verifier below; the write
+        # itself is token-level via ``loc``. Pad the tail by repeating the last
+        # valid page id (padding tokens carry loc=-1 so they never write).
         page_ids_np = kv_indices_np[::page_size] // page_size
         page_ids_np = page_ids_np[:num_pages]
-        # Pad page ids to bucket size by repeating the last valid id.
-        padded_pages = kv.shape[1]
         if num_pages < padded_pages:
             pad = np.full(padded_pages - num_pages, page_ids_np[-1], dtype=page_ids_np.dtype)
             page_ids_padded = np.concatenate([page_ids_np, pad])
-            # Duplicate last valid page's payload so stale tail
-            # rows don't overwrite the final real page.
-            valid_prefix = jax.lax.slice_in_dim(
-                kv,
-                start_index=0,
-                limit_index=num_pages,
-                axis=1,
-            )
-            last_valid = jax.lax.dynamic_slice_in_dim(
-                valid_prefix,
-                start_index=num_pages - 1,
-                slice_size=1,
-                axis=1,
-            )
-            padded_tail = jnp.repeat(
-                last_valid,
-                padded_pages - num_pages,
-                axis=1,
-            )
-            padded_tail = jax.device_put(
-                padded_tail,
-                valid_prefix.sharding,
-            )
-            kv = jnp.concatenate(
-                [
-                    valid_prefix,
-                    padded_tail,
-                ],
-                axis=1,
-            )
         else:
             page_ids_padded = page_ids_np
-        idx_sharding = NamedSharding(kv_pool.mesh, PartitionSpec(None))
-        page_ids_jax = jax.device_put(page_ids_padded, idx_sharding)
-        # Pass the buffer's OWN sharding so the donated input can be aliased
-        # in place; a different out_sharding would force a fresh full-layer
-        # allocation and OOM the chip. See _jit_scatter_one_layer.
-        out_sharding = kv_pool.kv_sharding
+
+        # Write via the same in-place Pallas kernel the forward path uses
+        # (``update_fused_kv_cache_vectorized`` with ``input_output_aliases``).
+        # Unlike ``.at[page_ids].set(...)`` — whose scatter XLA:TPU refuses to
+        # alias, forcing a fresh full-layer (~884 MB) buffer that OOMs a v6e
+        # single chip and wedges the decode loop — this kernel updates the pool
+        # in place with a footprint proportional to the tokens written.
+        # ``loc`` is per-token absolute pool slots; -1 marks padding tokens that
+        # are skipped, so no tail-repeat payload duplication is needed.
+        total_tokens = padded_pages * page_size
+        loc_np = np.full(total_tokens, -1, dtype=np.int32)
+        loc_np[:seqlen] = kv_indices_np[:seqlen]
+        loc = jax.device_put(
+            jnp.asarray(loc_np),
+            NamedSharding(
+                kv_pool.mesh, PartitionSpec(kv_pool.attention_data_partition_axis)
+            ),
+        )
         for i, layer_id in enumerate(
             range(kv_pool.start_layer, kv_pool.start_layer + kv_pool.layer_num)
         ):
             layer_idx = layer_id - kv_pool.start_layer
-            kv_pool.kv_buffer[layer_idx] = _jit_scatter_one_layer(
-                kv_pool.kv_buffer[layer_idx],
-                page_ids_jax,
-                kv[i],
-                out_sharding,
+            layer_kv = kv[i]  # [padded_pages, page_size, H, packing, head_dim]
+            fused = layer_kv.reshape((total_tokens, 1) + layer_kv.shape[2:])
+            kv_pool.kv_buffer[layer_idx] = _set_fused_kv_buffer(
+                fused_kv=fused,
+                loc=loc,
+                kv_cache=kv_pool.kv_buffer[layer_idx],
+                page_size=page_size,
+                kv_partition_axis=kv_pool.kv_partition_axis,
+                attention_data_partition_axis=kv_pool.attention_data_partition_axis,
+                mesh=kv_pool.mesh,
             )
         # Set prefix_indices to all-but-last so extend_input_len=1.
         valid_slots = kv_indices_np[:seqlen]
