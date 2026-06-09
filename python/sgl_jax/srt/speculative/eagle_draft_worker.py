@@ -380,27 +380,29 @@ class EagleDraftWorker(BaseDraftWorker):
         per_dp_bs = model_worker_batch.per_dp_bs_size if dp_size > 1 else len(seq_lens_cpu)
         assert total_cache_loc_size % dp_size == 0
         per_dp_cache_len = total_cache_loc_size // dp_size
-        cache_loc_cpu = np.zeros(total_cache_loc_size, dtype=np.int32)
+        per_dp_page_len = per_dp_cache_len // page_size
+        page_indices_cpu = np.zeros(total_cache_loc_size // page_size, dtype=np.int32)
         valid_mask = seq_lens_cpu > 0
         if np.any(valid_mask):
             valid_indices = np.where(valid_mask)[0]
             valid_allocate_lens = spec_info.allocate_lens[valid_mask]
             aligned_lengths = ((valid_allocate_lens + page_size - 1) // page_size) * page_size
-            intra_rank_off = np.zeros(dp_size, dtype=np.int64)
+            intra_rank_pages = np.zeros(dp_size, dtype=np.int64)
             for seq_idx, allocate_len, aligned_len in zip(
                 valid_indices, valid_allocate_lens, aligned_lengths
             ):
                 r = int(seq_idx) // per_dp_bs
-                base = r * per_dp_cache_len + intra_rank_off[r]
+                pages = int(aligned_len // page_size)
+                base = r * per_dp_page_len + intra_rank_pages[r]
                 assert (
-                    base + aligned_len <= (r + 1) * per_dp_cache_len
-                ), f"rank {r} cache_loc overflow: {intra_rank_off[r]+aligned_len} > {per_dp_cache_len}"
-                cache_loc_cpu[base : base + allocate_len] = token_indices_with_all_reqs[
-                    seq_idx, :allocate_len
-                ]
-                intra_rank_off[r] += aligned_len
+                    base + pages <= (r + 1) * per_dp_page_len
+                ), f"rank {r} page_indices overflow: {intra_rank_pages[r]+pages} > {per_dp_page_len}"
+                page_locs = token_indices_with_all_reqs[seq_idx, :allocate_len:page_size]
+                page_indices_cpu[base : base + len(page_locs)] = page_locs // page_size
+                intra_rank_pages[r] += pages
 
-        model_worker_batch.cache_loc = cache_loc_cpu
+        model_worker_batch.cache_loc = np.zeros(total_cache_loc_size, dtype=np.int32)
+        model_worker_batch.eagle_page_indices = page_indices_cpu
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
 
         topk_index = spec_info.topk_index
