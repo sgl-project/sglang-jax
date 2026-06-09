@@ -129,3 +129,33 @@ def make_dp_valid_mask(real_bs_per_dp, *, total_bs: int, per_dp_bs: int) -> np.n
             start = dp_rank * per_dp_bs
             mask[start : start + int(real_bs)] = True
     return mask
+
+
+def gather_relay_state_for_model_worker_batch(
+    model_worker_batch,
+    relay_buffers: SpecRelayBuffers,
+    mesh,
+) -> bool:
+    spec_info = getattr(model_worker_batch, "spec_info_padded", None)
+    future_indices = getattr(spec_info, "future_indices", None)
+    if future_indices is None:
+        return False
+    if getattr(spec_info, "topk_index", None) is not None:
+        return False
+
+    safe_indices = np.asarray(future_indices, dtype=np.int32)
+    safe_indices = np.where(safe_indices >= 0, safe_indices, 0)
+    future_indices_device = jax.device_put(
+        safe_indices,
+        NamedSharding(mesh, P("data")),
+    )
+    topk_index, hidden_states, verified_id = gather_spec_relay_buffers(
+        relay_buffers,
+        future_indices_device,
+        dp_size=model_worker_batch.dp_size,
+    )
+    spec_info.topk_p = jnp.ones_like(topk_index, dtype=jnp.float32)
+    spec_info.topk_index = topk_index
+    spec_info.hidden_states = hidden_states
+    spec_info.verified_id = verified_id
+    return True

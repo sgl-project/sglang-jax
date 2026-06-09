@@ -792,23 +792,11 @@ class EagleDraftInput:
             self.allocate_lens = _slice(restored.allocate_lens)
             return
 
-        from sgl_jax.srt.speculative.draft_extend_fused import (
-            restore_spec_decode_pending_draft_extend_result,
-        )
-
-        restored_batch_output = restore_spec_decode_pending_draft_extend_result(pending)
         self.pending_draft_extend_result = None
-        if restored_batch_output is None:
-            return
-
-        restored = restored_batch_output.next_draft_input
-        self.topk_p = _slice(restored.topk_p)
-        self.topk_index = _slice(restored.topk_index)
-        self.hidden_states = _slice(restored.hidden_states)
-        self.verified_id = _slice(restored.verified_id)
-        self.allocate_lens = _slice(restored.allocate_lens)
-        self.accept_length = _slice(restored_batch_output.accept_lens)
-        self.accept_length_cpu = self.accept_length
+        raise RuntimeError(
+            "Unexpected decode pending_draft_extend_result. Decode overlap must use "
+            "req-granularity relay buffers; only prefill pending results may be resolved here."
+        )
 
     @classmethod
     def create_idle_input(

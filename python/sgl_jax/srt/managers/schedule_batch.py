@@ -2392,24 +2392,10 @@ class ScheduleBatch:
         # aligns with seq_lens[i]. Returns a new object — does not mutate
         # the per-rank cross-round state on reqs_info[r].spec_info.
         flat_spec = self._concat_spec_info_per_rank([info.spec_info for info in self.reqs_info])
-        if getattr(flat_spec, "pending_draft_extend_result", None) is not None:
-            from sgl_jax.srt.speculative.draft_extend_fused import (
-                build_padded_draft_input_from_pending,
-            )
-
-            spec_info = build_padded_draft_input_from_pending(
-                flat_spec, logits_indices_selector, total_bs
-            )
-            if spec_info is None:
-                flat_spec.resolve_pending_draft_extend_result()
-                spec_info = self._scatter_spec_info_to_dp_slots(
-                    flat_spec, logits_indices_selector, total_bs, mesh=self.mesh
-                )
-        else:
-            flat_spec.resolve_pending_draft_extend_result()
-            spec_info = self._scatter_spec_info_to_dp_slots(
-                flat_spec, logits_indices_selector, total_bs, mesh=self.mesh
-            )
+        flat_spec.resolve_pending_draft_extend_result()
+        spec_info = self._scatter_spec_info_to_dp_slots(
+            flat_spec, logits_indices_selector, total_bs, mesh=self.mesh
+        )
         # Per-rank out_cache_loc chunks (set in spec prepare_for_decode) have
         # variable length (∝ accept_len). DP-segment: pad each to max_len with
         # -1 so the P("data") shard in ForwardBatch.init_new gives rank r its

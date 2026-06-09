@@ -45,47 +45,6 @@ class FusedDraftExtendPendingResult(NamedTuple):
     sel: np.ndarray
 
 
-class SpecDecodePendingDraftExtendResult(NamedTuple):
-    draft_worker: object
-    model_worker_batch: object
-    pending_result: FusedDraftExtendPendingResult | None
-
-
-def build_padded_draft_input_from_pending(flat_spec, selector: np.ndarray, total_bs: int):
-    """Build next decode's DP-padded draft state without host-restoring tensors."""
-    pending = getattr(flat_spec, "pending_draft_extend_result", None)
-    if pending is None or getattr(pending, "pending_result", None) is None:
-        return None
-
-    from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
-
-    pending_result = pending.pending_result
-    data_sharding = NamedSharding(pending.draft_worker.mesh, P("data"))
-    topk_index = jax.device_put(pending_result.topk_index_stacked, data_sharding)
-    hidden_states = pending_result.selected_layer0_hidden
-    accept_lens = pending_result.accept_lens
-    verified_id = pending_result.next_verified_id
-
-    def _scatter_host(arr):
-        if arr is None:
-            return None
-        a = np.asarray(arr)
-        out = np.zeros((total_bs,) + a.shape[1:], dtype=a.dtype)
-        out[selector] = a
-        return out
-
-    return EagleDraftInput(
-        topk_p=np.ones(topk_index.shape, dtype=np.float32),
-        topk_index=topk_index,
-        hidden_states=hidden_states,
-        verified_id=verified_id,
-        accept_length=accept_lens,
-        allocate_lens=_scatter_host(flat_spec.allocate_lens),
-        new_seq_lens=_scatter_host(flat_spec.new_seq_lens),
-        capture_hidden_mode=flat_spec.capture_hidden_mode,
-    )
-
-
 def _take_with_index_sharding(values, index):
     index_sharding = jax.typeof(index).sharding
     if isinstance(index_sharding, NamedSharding):
@@ -866,24 +825,6 @@ def restore_fused_draft_extend_result(draft_worker, model_worker_batch, pending_
     batch_output.accept_lens = accept_host
 
 
-def restore_spec_decode_pending_draft_extend_result(pending_draft_extend_result):
-    if pending_draft_extend_result is None:
-        return None
-    if pending_draft_extend_result.pending_result is None:
-        return None
-
-    batch_output = pending_draft_extend_result.pending_result.batch_output
-    if getattr(batch_output.next_draft_input, "topk_index", None) is not None:
-        return batch_output
-
-    restore_fused_draft_extend_result(
-        pending_draft_extend_result.draft_worker,
-        pending_draft_extend_result.model_worker_batch,
-        pending_draft_extend_result.pending_result,
-    )
-    return batch_output
-
-
 def draft_extend_for_decode_fused(draft_worker, model_worker_batch, batch_output):
     """Drop-in replacement for MultiLayerDraftWorker.draft_extend_for_decode.
 
@@ -1130,17 +1071,43 @@ def spec_decode(spec_worker, model_worker_batch, cur_allocate_lens):
 def spec_decode_overlap(spec_worker, model_worker_batch, cur_allocate_lens):
     """Launch decode verify and draft-extend without restoring draft results inline."""
     batch_output = spec_decode_verify_phase(spec_worker, model_worker_batch, cur_allocate_lens)
-    pending_draft_extend_result = SpecDecodePendingDraftExtendResult(
-        draft_worker=spec_worker.draft_worker,
-        model_worker_batch=model_worker_batch,
-        pending_result=launch_fused_draft_extend_for_decode(
-            spec_worker.draft_worker,
-            model_worker_batch,
-            batch_output,
-        ),
-    )
+    sel = np.asarray(model_worker_batch.logits_indices_selector)
+    batch_output.next_draft_input.future_indices = np.asarray(model_worker_batch.req_pool_indices)[
+        sel
+    ]
+
     from sgl_jax.srt.speculative.overlap_worker import publish_spec_decode_new_seq_lens
+    from sgl_jax.srt.speculative.relay_buffer import (
+        make_dp_valid_mask,
+        update_spec_relay_buffers,
+    )
 
     published_new_seq_lens = publish_spec_decode_new_seq_lens(batch_output)
-    batch_output.next_draft_input.pending_draft_extend_result = pending_draft_extend_result
+    batch_output.next_draft_input.new_seq_lens = None
+    pending_result = launch_fused_draft_extend_for_decode(
+        spec_worker.draft_worker,
+        model_worker_batch,
+        batch_output,
+    )
+    if pending_result is not None:
+        valid_mask = make_dp_valid_mask(
+            model_worker_batch.real_bs_per_dp,
+            total_bs=model_worker_batch.req_pool_indices.shape[0],
+            per_dp_bs=model_worker_batch.per_dp_bs_size,
+        )
+        safe_indices = np.where(
+            valid_mask,
+            np.asarray(model_worker_batch.req_pool_indices, dtype=np.int32),
+            0,
+        )
+        data_sharding = NamedSharding(spec_worker.mesh, P("data"))
+        spec_worker.spec_relay_buffers = update_spec_relay_buffers(
+            spec_worker.spec_relay_buffers,
+            jax.device_put(safe_indices, data_sharding),
+            jax.device_put(valid_mask, data_sharding),
+            pending_result.topk_index_stacked,
+            pending_result.selected_layer0_hidden,
+            pending_result.next_verified_id,
+            dp_size=model_worker_batch.dp_size,
+        )
     return batch_output, published_new_seq_lens

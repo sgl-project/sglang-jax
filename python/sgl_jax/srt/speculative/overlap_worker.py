@@ -10,6 +10,7 @@ import psutil
 from jax.sharding import NamedSharding, PartitionSpec
 
 from sgl_jax.srt.managers.utils import resolve_future_token_ids, set_future_token_ids
+from sgl_jax.srt.speculative.relay_buffer import create_spec_relay_buffers
 from sgl_jax.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -65,6 +66,16 @@ class SpecWorkerClient:
         self.worker = worker
         self.mesh = worker.mesh
         self.max_running_requests = worker.target_worker.max_running_requests
+        hidden_dtype = jnp.bfloat16 if worker.server_args.dtype == "bfloat16" else jnp.float32
+        self.spec_relay_buffers = create_spec_relay_buffers(
+            self.mesh,
+            worker.target_worker.model_runner.req_to_token_pool,
+            dp_size=worker.server_args.dp_size,
+            num_steps=worker.speculative_num_steps,
+            hidden_size=worker.target_worker.model_config.hidden_size,
+            hidden_dtype=hidden_dtype,
+        )
+        self.worker.spec_relay_buffers = self.spec_relay_buffers
         self.prefill_token_relay_ct = 0
         self.prefill_token_relay_limit = self.max_running_requests * 3
         self.prefill_token_relay_map = jnp.zeros((self.max_running_requests * 5,), dtype=jnp.int32)
