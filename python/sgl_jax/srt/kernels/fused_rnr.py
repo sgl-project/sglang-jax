@@ -18,7 +18,7 @@ import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 
 
-@functools.partial(jax.jit, static_argnums=(4, 5, 6, 7))
+@functools.partial(jax.jit, static_argnums=(4, 5, 6, 7, 8))
 def apply_fused_rnr(
     attn_out: jax.Array,
     res: jax.Array,
