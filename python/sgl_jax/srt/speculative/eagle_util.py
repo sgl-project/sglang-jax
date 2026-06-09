@@ -660,10 +660,40 @@ class EagleDraftInput:
 
         draft_model_runner.attn_backend.forward_metadata = forward_metadata
         from sgl_jax.srt.layers.logits_processor import LogitsMetadata
+        from sgl_jax.srt.utils.jax_utils import device_array
 
-        logits_metadata = LogitsMetadata.from_model_worker_batch(
-            model_worker_batch, draft_model_runner.mesh
-        )
+        if model_worker_batch.return_logprob:
+            logits_metadata = LogitsMetadata.from_model_worker_batch(
+                model_worker_batch, draft_model_runner.mesh
+            )
+        else:
+            sharding = NamedSharding(draft_model_runner.mesh, P("data"))
+
+            def _to_device(value):
+                if value is None:
+                    return None
+                if isinstance(value, jax.Array):
+                    return jax.device_put(value, sharding)
+                return device_array(value, sharding=sharding)
+
+            logits_metadata = LogitsMetadata(
+                forward_mode=model_worker_batch.forward_mode,
+                capture_hidden_mode=model_worker_batch.capture_hidden_mode,
+                extend_return_logprob=False,
+                extend_return_top_logprob=False,
+                extend_token_ids_logprob=False,
+                extend_seq_lens=_to_device(model_worker_batch.extend_seq_lens),
+                logits_indices=_to_device(model_worker_batch.logits_indices),
+                accept_lens=_to_device(model_worker_batch.spec_info_padded.accept_length),
+                extend_seq_lens_cpu=None,
+                extend_logprob_start_lens_cpu=None,
+                extend_logprob_pruned_lens_cpu=None,
+                top_logprobs_nums=model_worker_batch.top_logprobs_nums,
+                token_ids_logprobs=model_worker_batch.token_ids_logprobs,
+                extend_input_logprob_token_ids_device=_to_device(
+                    model_worker_batch.extend_input_logprob_token_ids
+                ),
+            )
         return model_worker_batch, logits_metadata
 
     def prepare_for_decode(self, schedule_batch: ScheduleBatch):
