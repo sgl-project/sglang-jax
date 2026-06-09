@@ -211,20 +211,36 @@ class EAGLEWorker(BaseSpecWorker):
                 else:
                     topk_shape = (bs, num_steps, self.topk) if is_multi_layer else (bs, self.topk)
                 data_sharding = NamedSharding(self.mesh, P("data"))
-                spec_info = EagleDraftInput(
-                    topk_p=jax.device_put(np.ones(topk_shape, dtype=np.float32), data_sharding),
-                    topk_index=jax.device_put(np.ones(topk_shape, dtype=np.int32), data_sharding),
-                    hidden_states=np.ones(
-                        (bs, self.draft_worker.model_config.hidden_size),
-                        dtype=jnp.bfloat16 if self.server_args.dtype == "bfloat16" else np.float32,
-                    ),
-                    verified_id=jax.device_put(np.ones((bs,), dtype=np.int32), data_sharding),
-                    capture_hidden_mode=CaptureHiddenMode.FULL,
-                    num_tokens_per_batch=np.asarray(1, dtype=np.int32),
-                    num_tokens_for_logprob_per_batch=np.asarray(1, dtype=np.int32),
-                    allocate_lens=model_worker_batch.seq_lens
-                    + EagleDraftInput.ALLOC_LEN_PER_DECODE,
-                )
+                if hasattr(self, "spec_relay_buffers"):
+                    spec_info = EagleDraftInput(
+                        future_indices=np.asarray(
+                            model_worker_batch.req_pool_indices, dtype=np.int32
+                        ),
+                        capture_hidden_mode=CaptureHiddenMode.FULL,
+                        num_tokens_per_batch=np.asarray(1, dtype=np.int32),
+                        num_tokens_for_logprob_per_batch=np.asarray(1, dtype=np.int32),
+                        allocate_lens=model_worker_batch.seq_lens
+                        + EagleDraftInput.ALLOC_LEN_PER_DECODE,
+                    )
+                else:
+                    spec_info = EagleDraftInput(
+                        topk_p=jax.device_put(np.ones(topk_shape, dtype=np.float32), data_sharding),
+                        topk_index=jax.device_put(
+                            np.ones(topk_shape, dtype=np.int32), data_sharding
+                        ),
+                        hidden_states=np.ones(
+                            (bs, self.draft_worker.model_config.hidden_size),
+                            dtype=(
+                                jnp.bfloat16 if self.server_args.dtype == "bfloat16" else np.float32
+                            ),
+                        ),
+                        verified_id=jax.device_put(np.ones((bs,), dtype=np.int32), data_sharding),
+                        capture_hidden_mode=CaptureHiddenMode.FULL,
+                        num_tokens_per_batch=np.asarray(1, dtype=np.int32),
+                        num_tokens_for_logprob_per_batch=np.asarray(1, dtype=np.int32),
+                        allocate_lens=model_worker_batch.seq_lens
+                        + EagleDraftInput.ALLOC_LEN_PER_DECODE,
+                    )
                 model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
                 model_worker_batch.spec_info_padded = spec_info
                 model_worker_batch.speculative_eagle_topk = self.topk
@@ -241,7 +257,11 @@ class EAGLEWorker(BaseSpecWorker):
                             np.full(pad_len, -1, dtype=np.int32),
                         ]
                     )
-                self.forward_batch_speculative_generation(model_worker_batch)
+                if hasattr(self, "spec_relay_buffers"):
+                    self.forward_batch_speculative_decode_overlap(model_worker_batch)
+                    jax.block_until_ready(self.spec_relay_buffers)
+                else:
+                    self.forward_batch_speculative_generation(model_worker_batch)
 
         end_time = time.perf_counter()
         logger.info("[SPEC_DECODE] Precompile finished in %.0f secs", end_time - start_time)

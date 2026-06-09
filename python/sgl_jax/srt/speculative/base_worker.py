@@ -145,17 +145,6 @@ class BaseSpecWorker:
         sel = model_worker_batch.logits_indices_selector
         cur_allocate_lens = np.asarray(model_worker_batch.spec_info_padded.allocate_lens)[sel]
 
-        if getattr(model_worker_batch.spec_info_padded, "future_indices", None) is not None:
-            from sgl_jax.srt.speculative.relay_buffer import (
-                gather_relay_state_for_model_worker_batch,
-            )
-
-            gather_relay_state_for_model_worker_batch(
-                model_worker_batch,
-                self.spec_relay_buffers,
-                self.mesh,
-            )
-
         from sgl_jax.srt.speculative.draft_extend_fused import spec_decode_overlap
 
         result = spec_decode_overlap(self, model_worker_batch, cur_allocate_lens)
