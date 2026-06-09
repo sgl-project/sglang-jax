@@ -11,7 +11,11 @@ import numpy as np
 
 from sgl_jax.srt.managers.schedule_batch import Req, ScheduleBatch
 from sgl_jax.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
-from sgl_jax.srt.mem_cache.base_prefix_cache import BasePrefixCache
+from sgl_jax.srt.mem_cache.base_prefix_cache import (
+    BasePrefixCache,
+    InsertParams,
+    MatchPrefixParams,
+)
 from sgl_jax.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 
 if TYPE_CHECKING:
@@ -147,12 +151,15 @@ class SchedulePolicy:
             prefix_ids = r.adjust_max_prefix_ids()
             extra_key = r.extra_key
             # NOTE: the prefix_indices must always be aligned with last_node
-            r.prefix_indices, r.last_node, r.last_host_node, r.host_hit_length = (
-                self.tree_cache.match_prefix(
-                    rid=r.rid,
-                    key=RadixKey(token_ids=prefix_ids, extra_key=extra_key, dp_rank=r.dp_rank),
+            match_result = self.tree_cache.match_prefix(
+                MatchPrefixParams(
+                    key=RadixKey(token_ids=prefix_ids, extra_key=extra_key, dp_rank=r.dp_rank)
                 )
             )
+            r.prefix_indices = match_result.device_indices
+            r.last_node = match_result.last_device_node
+            r.last_host_node = match_result.last_host_node
+            r.host_hit_length = match_result.host_hit_length
 
             # NOTE(sang): This logic is for in-batch prefix caching;
             # If there are more than 1 request that have small matching prefix from
@@ -162,10 +169,12 @@ class SchedulePolicy:
             # threshold means we cannot use in-batch prefix caching for short prefixes.
             # It is kind of common when the engine is long running (e.g., imagine the prefix "the").
             if len(r.prefix_indices) <= IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD:
-                in_batch_matching_prefixes, _, _, _ = self.waiting_queue_radix_tree.match_prefix(
-                    rid=r.rid,
-                    key=RadixKey(token_ids=prefix_ids, extra_key=extra_key, dp_rank=r.dp_rank),
+                in_batch_match = self.waiting_queue_radix_tree.match_prefix(
+                    MatchPrefixParams(
+                        key=RadixKey(token_ids=prefix_ids, extra_key=extra_key, dp_rank=r.dp_rank)
+                    )
                 )
+                in_batch_matching_prefixes = in_batch_match.device_indices
                 if (
                     len(in_batch_matching_prefixes)
                     >= IN_BATCH_PREFIX_CACHING_DEPRIORITIZE_THRESHOLD
@@ -174,8 +183,12 @@ class SchedulePolicy:
                 else:
                     # Insert with a dummy key
                     self.waiting_queue_radix_tree.insert(
-                        RadixKey(token_ids=prefix_ids, extra_key=extra_key, dp_rank=r.dp_rank),
-                        np.empty(len(prefix_ids), dtype=np.bool_),
+                        InsertParams(
+                            key=RadixKey(
+                                token_ids=prefix_ids, extra_key=extra_key, dp_rank=r.dp_rank
+                            ),
+                            value=np.empty(len(prefix_ids), dtype=np.bool_),
+                        )
                     )
         return temporary_deprioritized
 
@@ -470,18 +483,11 @@ class PrefillAdder:
 
     @contextmanager
     def _lock_node(self, last_node: TreeNode):
-        if self.is_hybrid:
-            try:
-                swa_uuid_for_lock = self.tree_cache.inc_lock_ref(last_node)
-                yield None
-            finally:
-                self.tree_cache.dec_lock_ref(last_node, swa_uuid_for_lock)
-        else:
-            try:
-                self.tree_cache.inc_lock_ref(last_node)
-                yield None
-            finally:
-                self.tree_cache.dec_lock_ref(last_node)
+        res = self.tree_cache.inc_lock_ref(last_node)
+        try:
+            yield None
+        finally:
+            self.tree_cache.dec_lock_ref(last_node, res.to_dec_params())
 
     def add_one_req_ignore_eos(self, req: Req):
         dp_rank = req.dp_rank if req.dp_rank is not None else 0
@@ -630,11 +636,8 @@ class PrefillAdder:
             ):
                 # Non-chunked prefill
                 self.can_run_list[dp_rank].append(req)
-                if self.is_hybrid:
-                    swa_uuid_for_lock = self.tree_cache.inc_lock_ref(req.last_node)
-                    req.swa_uuid_for_lock = swa_uuid_for_lock
-                else:
-                    self.tree_cache.inc_lock_ref(req.last_node)
+                res = self.tree_cache.inc_lock_ref(req.last_node)
+                req.swa_uuid_for_lock = res.swa_uuid_for_lock
                 self._update_prefill_budget(
                     prefix_len,
                     input_tokens,
@@ -656,11 +659,8 @@ class PrefillAdder:
 
                 self.can_run_list[dp_rank].append(req)
                 self.new_chunked_reqs[dp_rank] = req
-                if self.is_hybrid:
-                    swa_uuid_for_lock = self.tree_cache.inc_lock_ref(req.last_node)
-                    req.swa_uuid_for_lock = swa_uuid_for_lock
-                else:
-                    self.tree_cache.inc_lock_ref(req.last_node)
+                res = self.tree_cache.inc_lock_ref(req.last_node)
+                req.swa_uuid_for_lock = res.swa_uuid_for_lock
                 self._update_prefill_budget(prefix_len, trunc_len, 0, dp_rank)
 
         return self._budget_state_after_add(dp_rank)

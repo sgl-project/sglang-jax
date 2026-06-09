@@ -12,7 +12,16 @@ import jax.numpy as jnp
 import numpy as np
 
 from sgl_jax.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-from sgl_jax.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
+from sgl_jax.srt.mem_cache.base_prefix_cache import (
+    BasePrefixCache,
+    DecLockRefParams,
+    EvictParams,
+    EvictResult,
+    IncLockRefResult,
+    InsertParams,
+    MatchPrefixParams,
+    MatchResult,
+)
 from sgl_jax.srt.mem_cache.memory_pool import ReqToTokenPool
 
 if TYPE_CHECKING:
@@ -203,12 +212,8 @@ class RadixCache(BasePrefixCache):
         self.evictable_size_ = defaultdict(int)
         self.protected_size_ = defaultdict(int)
 
-    def match_prefix(self, key: RadixKey | list[int], **kwargs) -> MatchResult:
-        # Support both RadixKey and plain list for backward compatibility
-        if not isinstance(key, RadixKey):
-            extra_key = kwargs.get("extra_key")
-            dp_rank = kwargs.get("dp_rank")
-            key = RadixKey(key, extra_key, dp_rank)
+    def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
+        key = params.key
 
         if self.disable or len(key) == 0:
             empty_array = np.empty((0,), dtype=np.int32)
@@ -217,6 +222,7 @@ class RadixCache(BasePrefixCache):
                 device_indices=empty_array,
                 last_device_node=self.root_node,
                 last_host_node=self.root_node,
+                best_match_node=self.root_node,
                 host_hit_length=0,
             )
 
@@ -249,10 +255,14 @@ class RadixCache(BasePrefixCache):
             device_indices=matched_tokens,
             last_device_node=last_node,
             last_host_node=last_node,
+            best_match_node=last_node,
             host_hit_length=0,
         )
 
-    def insert(self, key: RadixKey | list, value=None):
+    def insert(self, params: InsertParams) -> int:
+        key = params.key
+        value = params.value
+
         if self.disable:
             return 0
 
@@ -315,8 +325,10 @@ class RadixCache(BasePrefixCache):
         if is_insert:
             # Radix Cache takes over one reference from memory pool
             new_prefix_len = self.insert(
-                RadixKey(token_ids[:page_aligned_token_len], req.extra_key, req.dp_rank),
-                page_aligned_kv_indices,
+                InsertParams(
+                    key=RadixKey(token_ids[:page_aligned_token_len], req.extra_key, req.dp_rank),
+                    value=page_aligned_kv_indices,
+                )
             )
             self.token_to_kv_pool_allocator.free(
                 kv_indices[old_prefix_len:new_prefix_len], dp_rank=dp_rank
@@ -361,13 +373,13 @@ class RadixCache(BasePrefixCache):
 
         # Radix Cache takes over one reference from memory pool
         radix_key = RadixKey(page_aligned_token_ids, req.extra_key, req.dp_rank)
-        new_prefix_len = self.insert(radix_key, page_aligned_kv_indices)
+        new_prefix_len = self.insert(InsertParams(key=radix_key, value=page_aligned_kv_indices))
         self.token_to_kv_pool_allocator.free(
             kv_indices[old_prefix_len:new_prefix_len], dp_rank=dp_rank
         )
 
         # Prefix indices may have been updated, reuse them
-        new_match_result = self.match_prefix(radix_key)
+        new_match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
         new_indices = new_match_result.device_indices  # cpu
         new_last_node = new_match_result.last_device_node
 
@@ -403,9 +415,12 @@ class RadixCache(BasePrefixCache):
     def total_size(self):
         return self._total_size_helper()
 
-    def evict(self, num_tokens: int, dp_rank: int | None = None):
+    def evict(self, params: EvictParams) -> EvictResult:
+        num_tokens = params.num_tokens
+        dp_rank = params.dp_rank
+
         if self.disable:
-            return
+            return EvictResult()
 
         leaves = self._collect_leaves()
         heapq.heapify(leaves)
@@ -433,9 +448,11 @@ class RadixCache(BasePrefixCache):
             if len(x.parent.children) == 0:
                 heapq.heappush(leaves, x.parent)
 
-    def inc_lock_ref(self, node: TreeNode):
+        return EvictResult(num_tokens_evicted=num_evicted)
+
+    def inc_lock_ref(self, node: TreeNode) -> IncLockRefResult:
         if self.disable:
-            return 0
+            return IncLockRefResult(delta=0)
 
         delta = 0
         while node != self.root_node:
@@ -447,9 +464,9 @@ class RadixCache(BasePrefixCache):
                 delta -= len(node.value)
             node.lock_ref += 1
             node = node.parent
-        return delta
+        return IncLockRefResult(delta=delta)
 
-    def dec_lock_ref(self, node: TreeNode, swa_uuid_for_lock: str | None = None):
+    def dec_lock_ref(self, node: TreeNode, params: DecLockRefParams | None = None):
         if self.disable:
             return 0
 
