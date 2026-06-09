@@ -616,7 +616,15 @@ def _prepare_topk1_verify_placeholders_from_draft_state(draft_worker, model_work
     previous_verified_id = draft_input.verified_id
     if isinstance(previous_verified_id, np.ndarray):
         previous_verified_id = np.asarray(previous_verified_id, dtype=np.int32)
-    previous_token_list = draft_input.topk_index[:, :, 0]
+    topk_index = draft_input.topk_index
+    if len(topk_index.shape) == 3 and topk_index.shape[-1] == 1:
+        previous_token_list = (
+            np.squeeze(topk_index, axis=-1)
+            if isinstance(topk_index, np.ndarray)
+            else jnp.squeeze(topk_index, axis=-1)
+        )
+    else:
+        previous_token_list = topk_index[:, :, 0]
     if isinstance(previous_token_list, np.ndarray):
         previous_token_list = np.asarray(previous_token_list, dtype=np.int32)
     else:
