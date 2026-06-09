@@ -267,11 +267,18 @@ class TestFormatRegressionSummary(unittest.TestCase):
         self.assertIn("*Root cause*\n• gate flipped below threshold", summary)
         self.assertIn("*Suggested fix*\n• loosen the gate", summary)
 
-    def test_field_not_truncated(self):
-        long_cause = "• " + "word " * 200  # long but under the Slack hard cap
-        summary = format_regression_summary("abc1234", "https://run/1", "job-a", long_cause, "fix")
-        self.assertIn(long_cause.strip(), summary)
+    def test_short_field_kept_whole(self):
+        summary = format_regression_summary(
+            "abc1234", "https://run/1", "job-a", "• short cause", "• fix"
+        )
+        self.assertIn("• short cause", summary)
         self.assertNotIn("…", summary)
+
+    def test_runaway_field_clamped(self):
+        long_cause = "word " * 300  # ~1500 chars: model ignored the brief prompt
+        summary = format_regression_summary("abc1234", "https://run/1", "job-a", long_cause, "fix")
+        self.assertIn("…", summary)
+        self.assertLess(len(summary), 900)
 
     def test_empty_fields_omit_sections(self):
         summary = format_regression_summary("abc1234", "https://run/1", "job-a", "", "")

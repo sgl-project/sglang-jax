@@ -7,6 +7,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "utils"))
 from ci_common import (
+    clamp,
     escape_mrkdwn,
     issue_for_job,
     load_ai_analysis,
@@ -47,7 +48,7 @@ def format_slack_summary(
         lines.append(f"• {ft['emoji']} {job_ref} [{ft['label']}]{issue_text}")
         a = analysis.get(job["name"])
         if a and a.get("root_cause"):
-            lines.append(f"      ↳ {escape_mrkdwn(a['root_cause'])}")
+            lines.append(f"      ↳ {escape_mrkdwn(clamp(a['root_cause']))}")
 
     text = "\n".join(lines)
     if len(text) > 2900:

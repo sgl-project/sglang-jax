@@ -7,6 +7,7 @@ import subprocess
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "utils"))
+from ci_common import clamp
 from ci_common import escape_mrkdwn as _escape_mrkdwn
 from failure_classifier import is_finish_gate
 from github_output import write_github_output
@@ -50,9 +51,9 @@ def format_regression_summary(
         f"*Failed jobs:* {_escape_mrkdwn(failed_jobs)}",
     ]
     if root_cause.strip():
-        lines += ["", "*Root cause*", _escape_mrkdwn(root_cause.strip())]
+        lines += ["", "*Root cause*", _escape_mrkdwn(clamp(root_cause))]
     if suggested_fix.strip():
-        lines += ["", "*Suggested fix*", _escape_mrkdwn(suggested_fix.strip())]
+        lines += ["", "*Suggested fix*", _escape_mrkdwn(clamp(suggested_fix))]
 
     text = "\n".join(lines)
     if len(text) > 2900:

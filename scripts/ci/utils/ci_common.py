@@ -25,6 +25,15 @@ def escape_mrkdwn(text: Any) -> str:
     return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def clamp(text: str, limit: int = 600) -> str:
+    """Backstop an AI field at a word boundary; only fires if the model ignores
+    the 'be brief' prompt, so a runaway wall can't flood the message."""
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit].rsplit(" ", 1)[0].rstrip() + " …"
+
+
 def gh(
     args: list[str], *, input_text: str | None = None, timeout: int = 180, check: bool = True
 ) -> str:

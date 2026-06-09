@@ -29,6 +29,19 @@ class TestEscapeMrkdwn(unittest.TestCase):
         self.assertEqual(ci_common.escape_mrkdwn(123), "123")
 
 
+class TestClamp(unittest.TestCase):
+    def test_short_unchanged(self):
+        self.assertEqual(ci_common.clamp("short text"), "short text")
+
+    def test_long_truncated_at_word_boundary(self):
+        out = ci_common.clamp("word " * 300, limit=100)
+        self.assertTrue(out.endswith("…"))
+        self.assertLessEqual(len(out), 104)
+
+    def test_none_safe(self):
+        self.assertEqual(ci_common.clamp(None), "")
+
+
 class TestGhJson(unittest.TestCase):
     @patch.object(ci_common.subprocess, "run")
     def test_parses_json_stdout(self, run):
