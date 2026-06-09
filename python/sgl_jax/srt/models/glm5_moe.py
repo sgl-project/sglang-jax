@@ -617,6 +617,7 @@ class Glm5DecoderLayer(nnx.Module):
                 hidden_size=self.hidden_size,
                 num_experts=self.moe_gate.kernel.value.shape[1],
                 eps=self.post_attention_layernorm.epsilon,
+                mesh=self.mesh,
             )
             if self.shared_experts is not None:
                 shared_output = self.shared_experts(hidden_states)
