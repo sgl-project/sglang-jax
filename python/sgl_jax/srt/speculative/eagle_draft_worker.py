@@ -359,9 +359,6 @@ class EagleDraftWorker(BaseDraftWorker):
         seq_lens_cpu = model_worker_batch.seq_lens
         page_size = self.page_size
         req_to_token_pool, _ = self.target_worker_ref.get_memory_pool()
-        token_indices_with_all_reqs = req_to_token_pool.req_to_token[
-            model_worker_batch.req_pool_indices
-        ]
         spec_info = model_worker_batch.spec_info_padded
         assert isinstance(spec_info, EagleDraftInput)
         # At dp>1 spec_info arrays arrive at (real_bs,) but seq_lens_cpu is
@@ -395,8 +392,9 @@ class EagleDraftWorker(BaseDraftWorker):
                 assert (
                     base + aligned_len <= (r + 1) * per_dp_cache_len
                 ), f"rank {r} cache_loc overflow: {intra_rank_off[r]+aligned_len} > {per_dp_cache_len}"
-                cache_loc_cpu[base : base + allocate_len] = token_indices_with_all_reqs[
-                    seq_idx, :allocate_len
+                page_offsets = np.arange(0, aligned_len, page_size)
+                cache_loc_cpu[base + page_offsets] = req_to_token_pool.req_to_token[
+                    model_worker_batch.req_pool_indices[seq_idx], page_offsets
                 ]
                 intra_rank_off[r] += aligned_len
 
