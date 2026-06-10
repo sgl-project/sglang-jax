@@ -1646,7 +1646,8 @@ class Scheduler(
         if len(all_can_run_reqs) == 0:
             return None
 
-        self.waiting_queue = [x for x in self.waiting_queue if x not in set(all_can_run_reqs)]
+        can_run_set = set(all_can_run_reqs)
+        self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_set]
 
         # Update chunked requests for each DP rank
         for dp_rank in range(self.dp_size):

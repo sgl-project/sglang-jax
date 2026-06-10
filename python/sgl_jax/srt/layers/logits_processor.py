@@ -201,6 +201,20 @@ class LogitsMetadata:
             extend_logprob_pruned_lens_cpu = extend_seq_lens_cpu = None
 
         sharding = NamedSharding(mesh, P("data"))
+        (
+            extend_seq_lens_device,
+            logits_indices_device,
+            extend_input_logprob_token_ids_device,
+            input_logprob_indices_device,
+        ) = device_array(
+            (
+                batch.extend_seq_lens,
+                batch.logits_indices,
+                batch.extend_input_logprob_token_ids,
+                batch.input_logprob_indices,
+            ),
+            sharding=sharding,
+        )
 
         return cls(
             forward_mode=batch.forward_mode,
@@ -208,8 +222,8 @@ class LogitsMetadata:
             extend_return_logprob=extend_return_logprob,
             extend_return_top_logprob=extend_return_top_logprob,
             extend_token_ids_logprob=extend_token_ids_logprob,
-            extend_seq_lens=device_array(batch.extend_seq_lens, sharding=sharding),
-            logits_indices=device_array(batch.logits_indices, sharding=sharding),
+            extend_seq_lens=extend_seq_lens_device,
+            logits_indices=logits_indices_device,
             accept_lens=(
                 device_array(batch.spec_info_padded.accept_length, sharding=sharding)
                 if batch.forward_mode.is_draft_extend()
@@ -227,12 +241,8 @@ class LogitsMetadata:
             extend_logprob_pruned_lens_cpu=extend_logprob_pruned_lens_cpu,
             top_logprobs_nums=batch.top_logprobs_nums,
             token_ids_logprobs=batch.token_ids_logprobs,
-            extend_input_logprob_token_ids_device=device_array(
-                batch.extend_input_logprob_token_ids, sharding=sharding
-            ),
-            input_logprob_indices_device=device_array(
-                batch.input_logprob_indices, sharding=sharding
-            ),
+            extend_input_logprob_token_ids_device=extend_input_logprob_token_ids_device,
+            input_logprob_indices_device=input_logprob_indices_device,
         )
 
 

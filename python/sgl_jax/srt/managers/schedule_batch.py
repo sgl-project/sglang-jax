@@ -18,6 +18,7 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 """
 
 import dataclasses
+import itertools
 import logging
 import os
 import threading
@@ -396,21 +397,31 @@ class Req:
         self,
         tree_cache: BasePrefixCache | None = None,
     ):
-        self.fill_ids = self.origin_input_ids + self.output_ids
+        self.fill_ids = (
+            self.origin_input_ids + self.output_ids if self.output_ids else self.origin_input_ids
+        )
         if tree_cache is not None:
-            (
-                self.prefix_indices,
-                self.last_node,
-                self.last_host_node,
-                self.host_hit_length,
-            ) = tree_cache.match_prefix(
-                key=RadixKey(self.adjust_max_prefix_ids(), self.extra_key, self.dp_rank),
-            )
+            if getattr(tree_cache, "disable", False):
+                self.prefix_indices = np.empty((0,), dtype=np.int32)
+                self.last_node = tree_cache.root_node
+                self.last_host_node = tree_cache.root_node
+                self.host_hit_length = 0
+            else:
+                (
+                    self.prefix_indices,
+                    self.last_node,
+                    self.last_host_node,
+                    self.host_hit_length,
+                ) = tree_cache.match_prefix(
+                    key=RadixKey(self.adjust_max_prefix_ids(), self.extra_key, self.dp_rank),
+                )
             self.last_matched_prefix_len = len(self.prefix_indices)
         self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
 
     def adjust_max_prefix_ids(self):
-        self.fill_ids = self.origin_input_ids + self.output_ids
+        self.fill_ids = (
+            self.origin_input_ids + self.output_ids if self.output_ids else self.origin_input_ids
+        )
         input_len = len(self.fill_ids)
 
         # FIXME: To work around some bugs in logprob computation, we need to ensure each
@@ -996,14 +1007,19 @@ class ScheduleBatch:
             req_pool_indices = self.alloc_req_slots(reqs)
 
             # Init arrays
-            input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
-            extend_num_tokens = sum(len(ids) for ids in input_ids)
             seq_lens = [len(r.fill_ids) for r in reqs]
             prefix_lens = [len(r.prefix_indices) for r in reqs]
             extend_lens = [r.extend_input_len for r in reqs]
+            extend_num_tokens = sum(extend_lens)
 
             req_pool_indices_cpu = np.array(req_pool_indices, dtype=np.int32)
-            input_ids_cpu = np.array(sum(input_ids, []), dtype=np.int32)
+            input_ids_cpu = np.fromiter(
+                itertools.chain.from_iterable(
+                    r.fill_ids[pre_len:] for r, pre_len in zip(reqs, prefix_lens)
+                ),
+                dtype=np.int32,
+                count=extend_num_tokens,
+            )
             seq_lens_cpu = np.array(seq_lens, dtype=np.int32)
             prefix_lens_cpu = np.array(prefix_lens, dtype=np.int32)
 
@@ -1836,10 +1852,11 @@ class ScheduleBatch:
             # Build positions for this DP rank
             if self.forward_mode.is_extend():
                 # For extend: positions are [prefix_len, prefix_len+1, ..., seq_len-1] for each request
-                dp_positions = []
+                pt = offset
                 for seq_len, prefix_len in zip(info.seq_lens, info.prefix_lens):
-                    dp_positions.extend(range(prefix_len, seq_len))
-                positions_cpu[offset : offset + len(dp_positions)] = dp_positions
+                    next_pt = pt + (seq_len - prefix_len)
+                    positions_cpu[pt:next_pt] = np.arange(prefix_len, seq_len, dtype=np.int32)
+                    pt = next_pt
             else:
                 # For decode: positions are [seq_len-1] for each request
                 dp_positions = info.seq_lens - 1
