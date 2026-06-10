@@ -147,6 +147,9 @@ class SchedulerDisaggregationPrefillMixin:
             self.cur_batch = batch
 
             if batch:
+                for req in batch.reqs:
+                    if req.bootstrap_room is not None:
+                        self._pd_mark_time(req, "forward_start")
                 result = self.run_batch(batch)
                 self.process_prefill_chunk(batch, result)
             else:
@@ -165,6 +168,9 @@ class SchedulerDisaggregationPrefillMixin:
         if not pd_reqs:
             self.process_batch_result(batch, result)
             return
+
+        for req in pd_reqs:
+            self._pd_mark_time(req, "forward_done")
 
         self.set_next_batch_sampling_info_done(batch)
 

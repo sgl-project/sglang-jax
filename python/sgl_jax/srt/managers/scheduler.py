@@ -1404,6 +1404,10 @@ class Scheduler(
     def _add_request_to_queue(self, req: Req):
         req.queue_time_start = time.perf_counter()
         self.waiting_queue.append(req)
+        if req.bootstrap_room is not None:
+            mark = getattr(self, "_pd_mark_time", None)
+            if mark is not None:
+                mark(req, "queue_entry")
 
     def _extend_requests_to_queue(self, reqs: list[Req], is_retracted: bool = False):
         self.waiting_queue.extend(reqs)

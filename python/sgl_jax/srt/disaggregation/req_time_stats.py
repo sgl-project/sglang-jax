@@ -25,6 +25,7 @@ _PHASE_SPECS: dict[str, tuple[tuple[str, str, str], ...]] = {
     "prefill": (
         ("queue_entry", "forward_start", "queue"),
         ("forward_start", "forward_done", "forward"),
+        ("forward_done", "transfer_start", "stage"),
         ("transfer_start", "transfer_done", "transfer"),
         ("queue_entry", "transfer_done", "total"),
     ),
