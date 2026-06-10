@@ -665,8 +665,11 @@ class EagleDraftInput:
                 continue
             bs_r = len(info.seq_lens)
             seq_r = np.asarray(info.seq_lens)
-            new_r = seq_r + self.ALLOC_LEN_PER_DECODE - 1
             old_r = self.allocate_lens[flat_off : flat_off + bs_r]
+            # Chain → fallback transition: chain prep used optimistic seq (+ndt)
+            # so old_r may already exceed seq+ndt-1. Clamp new_r ≥ old_r so
+            # ext_r ≥ 0 (already-allocated slots cover this round's verify).
+            new_r = np.maximum(seq_r + self.ALLOC_LEN_PER_DECODE - 1, old_r)
             ext_r = int((new_r - old_r).sum())
             if page_size == 1:
                 ocl_r = alloc_token_slots(schedule_batch.tree_cache, ext_r, dp_rank=dp_rank)
