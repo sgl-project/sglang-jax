@@ -867,6 +867,12 @@ class Scheduler(
 
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and Accelerator computation."""
+        if (
+            os.path.exists("/tmp/p2a-chain")
+            and self.spec_algorithm is not None
+            and self.spec_algorithm.is_eagle()
+        ):
+            return self._event_loop_overlap_chain()
         self.result_queue = deque()
         self._spec_pending = None
 
@@ -934,6 +940,146 @@ class Scheduler(
                 self.new_token_ratio = self.init_new_token_ratio
 
             self.last_batch = batch
+
+    def _event_loop_overlap_chain(self):
+        """Spec-decode chain variant: prep_{k+1}+dispatch_{k+1} runs ∥ jit_k.
+
+        Two paths per iteration:
+        - chain: prepped_k was dispatched at loop k-1 end. finalize_{k-1}
+          (skip_spec_info=True so prep_k's allocate_lens isn't overwritten),
+          then prep_{k+1} with optimistic seq_lens (+ndt) ∥ jit_k.
+        - fallback (first round / batch reshape): standard finalize → get_batch
+          → run_batch → proc_res. Host spec_info written normally so
+          use_chain=False has real hidden/topk.
+        Batch reshape detection: per-rank reqs count changed OR last_batch was
+        extend (merge) → fallback next round (one ~7ms idle, amortized).
+        """
+        self.result_queue = deque()
+        self._spec_pending = None
+        ndt = self.draft_worker.speculative_num_draft_tokens
+        prepped = None  # (batch, copy, result, real_bs_per_dp)
+        fallback_batch = None  # get_next_batch() result carried to next loop's fallback path
+
+        def _real_bs(b):
+            return tuple(len(i.reqs) if i.reqs else 0 for i in b.reqs_info)
+
+        while True:
+            recv_reqs = (
+                self._comm_backend.recv_requests()
+                if self._comm_backend is not None
+                else self.recv_requests()
+            )
+            recv_reqs = self.select_dp_for_request(recv_reqs)
+            self.process_input_requests(recv_reqs)
+            if self._engine_paused:
+                continue
+
+            on_chain = prepped is not None
+            if on_chain:
+                batch, batch_copy, result, bs_k = prepped
+                self.result_queue.append((batch_copy, result))
+                self.cur_batch = batch
+                # finalize_{k-1}: skip_spec_info so prep_k's allocate_lens
+                # (written at loop k-1 end) survives for prep_{k+1}'s old_r.
+                self._finalize_pending_spec(skip_spec_info=True)
+                self._drain_deferred_spec_release()
+                if getattr(result, "spec_pending", None) is not None:
+                    self._spec_pending = (batch, batch_copy, result)
+            else:
+                # Fallback / first round: standard order.
+                self._finalize_pending_spec(skip_spec_info=False)
+                self._drain_deferred_spec_release()
+                if fallback_batch is not None:
+                    batch = fallback_batch
+                    fallback_batch = None
+                else:
+                    batch = self.get_next_batch_to_run()
+                self.cur_batch = batch
+                if batch:
+                    batch.launch_done = threading.Event()
+                    result = self.run_batch(batch)
+                    batch_copy = batch.copy()
+                    self.result_queue.append((batch_copy, result))
+                    if getattr(result, "spec_pending", None) is not None:
+                        self._spec_pending = (batch, batch_copy, result)
+                    bs_k = _real_bs(batch)
+                else:
+                    result = batch_copy = bs_k = None
+                if self.last_batch is None and batch:
+                    tmp = ScheduleBatch.init_new(
+                        reqs=[[] for _ in range(self.dp_size)],
+                        req_to_token_pool=self.req_to_token_pool,
+                        token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                        tree_cache=self.tree_cache,
+                        model_config=self.model_config,
+                        enable_overlap=self.enable_overlap,
+                        dp_size=self.dp_size,
+                        spec_algorithm=self.spec_algorithm,
+                        mesh=self.mesh,
+                    )
+                    tmp.forward_mode = ForwardMode.DUMMY_FIRST
+                    tmp.next_batch_sampling_info = getattr(
+                        self.tp_worker, "cur_sampling_info", None
+                    )
+                    self.process_batch_result(tmp, None, batch.launch_done)
+
+            if self.last_batch:
+                tmp_batch, tmp_result = self.result_queue.popleft()
+                tmp_batch.next_batch_sampling_info = (
+                    getattr(self.tp_worker, "cur_sampling_info", None) if batch else None
+                )
+                self.process_batch_result(
+                    tmp_batch, tmp_result, batch.launch_done if batch else None
+                )
+            elif batch is None:
+                self.check_memory()
+                self.check_tree_cache()
+                self.new_token_ratio = self.init_new_token_ratio
+
+            self.last_batch = batch
+            prepped = None
+
+            # prep_{k+1} (∥ jit_k) — only if batch_k is spec decode AND next
+            # round won't reshape. Reshape prediction (BEFORE get_next_batch,
+            # so no alloc to roll back): any finished req still in running
+            # (proc_res_{k-1} just marked) OR pending prefill in waiting_queue
+            # OR chunked req. If reshape → fallback next loop (one ~7ms idle).
+            if (
+                batch is not None
+                and batch.forward_mode.is_decode()
+                and getattr(result, "spec_pending", None) is not None
+            ):
+                will_reshape = (
+                    len(self.waiting_queue) > 0
+                    or any(c is not None for c in self.chunked_reqs)
+                    or any(
+                        r.finished()
+                        for info in self.running_batch.reqs_info
+                        for r in (info.reqs or [])
+                    )
+                )
+                if not will_reshape:
+                    # Optimistic bump for in-flight round k (CPU mock test
+                    # verified ext=accept when bump is BEFORE prepare_for_decode).
+                    bumped = []
+                    for info in self.running_batch.reqs_info:
+                        if info.seq_lens is not None and len(info.seq_lens) > 0:
+                            info.seq_lens = info.seq_lens + ndt
+                            bumped.append(info)
+                    next_batch = self.get_next_batch_to_run()
+                    for info in bumped:
+                        info.seq_lens = info.seq_lens - ndt
+                    if (
+                        next_batch is not None
+                        and next_batch.forward_mode.is_decode()
+                        and _real_bs(next_batch) == bs_k
+                    ):
+                        next_batch.launch_done = threading.Event()
+                        next_result = self.run_batch(next_batch)
+                        prepped = (next_batch, next_batch.copy(), next_result, bs_k)
+                    elif next_batch is not None:
+                        # will_reshape mispredicted (rare): hand to fallback.
+                        fallback_batch = next_batch
 
     def run_publisher(self, recv_reqs):
         retry_count = 0
@@ -1834,7 +1980,9 @@ class Scheduler(
                     dp_rank * per_dp_bs_size : dp_rank * per_dp_bs_size + num_real_reqs
                 ]
 
-    def _apply_spec_decode_result(self, batch, batch_output, per_dp_bs, real_bs_per_dp=None):
+    def _apply_spec_decode_result(
+        self, batch, batch_output, per_dp_bs, real_bs_per_dp=None, skip_spec_info=False
+    ):
         cur_bs = [len(i.reqs) if i.reqs else 0 for i in batch.reqs_info]
         if real_bs_per_dp is None:
             real_bs_per_dp = cur_bs
@@ -1843,11 +1991,12 @@ class Scheduler(
                 f"reqs drift between dispatch and finalize: "
                 f"dispatch={list(real_bs_per_dp)} now={cur_bs}"
             )
-        per_rank_spec = ScheduleBatch._split_spec_info_per_rank(
-            batch_output.next_draft_input, real_bs_per_dp
-        )
-        for r, s in enumerate(per_rank_spec):
-            batch.reqs_info[r].spec_info = s
+        if not skip_spec_info:
+            per_rank_spec = ScheduleBatch._split_spec_info_per_rank(
+                batch_output.next_draft_input, real_bs_per_dp
+            )
+            for r, s in enumerate(per_rank_spec):
+                batch.reqs_info[r].spec_info = s
         accept = batch_output.accept_lens
         if accept is not None:
             accept = np.asarray(accept)
@@ -1860,7 +2009,7 @@ class Scheduler(
             else:
                 info.seq_lens = info.seq_lens + 1
 
-    def _finalize_pending_spec(self):
+    def _finalize_pending_spec(self, skip_spec_info=False):
         """Materialize the deferred spec-decode round before next-round prep.
 
         Called at the top of event_loop_overlap, after process_batch_result(N-1)
@@ -1876,7 +2025,11 @@ class Scheduler(
         with jax.profiler.TraceAnnotation("spec_finalize_pending"):
             batch_output = pending.finalize()
         self._apply_spec_decode_result(
-            batch, batch_output, pending.per_dp_bs, real_bs_per_dp=pending.real_bs_per_dp
+            batch,
+            batch_output,
+            pending.per_dp_bs,
+            real_bs_per_dp=pending.real_bs_per_dp,
+            skip_spec_info=skip_spec_info,
         )
         for r in range(self.dp_size):
             batch_copy.reqs_info[r].spec_info = batch.reqs_info[r].spec_info
