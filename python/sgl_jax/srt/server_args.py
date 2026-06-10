@@ -1437,12 +1437,24 @@ class ServerArgs:
         """
         import sys
 
+        raw_argv = list(argv) if argv else sys.argv[1:]
+        # The multimodal ServerArgs extension (MultimodalServerArgs) self-registers when the
+        # multimodal package is imported (register_server_args_extension at import time). Arg
+        # parsing runs before launch imports that package, so trigger registration here when
+        # --multimodal is requested. M1 decoupled this from a static srt->multimodal import;
+        # this runtime import is the hook that keeps the staged --multimodal launch working
+        # without re-introducing a static edge.
+        if get_server_args_extension() is None and "--multimodal" in raw_argv:
+            import importlib
+
+            importlib.import_module("sgl_jax.srt.multimodal.common.ServerArgs")
+
         parser = argparse.ArgumentParser()
         cls.add_cli_args(parser)
         ext = get_server_args_extension()
         if ext is not None:
             ext.add_cli_args(parser)
-        return cls.from_cli_args(parser.parse_args(argv or sys.argv[1:]))
+        return cls.from_cli_args(parser.parse_args(raw_argv))
 
     def url(self):
         if is_valid_ipv6_address(self.host):
