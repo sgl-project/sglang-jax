@@ -216,6 +216,7 @@ class Req:
         self.bootstrap_port: int | None = None
         self.bootstrap_room: int | None = None
         self.disagg_transfer_id: str | None = None
+        self.disagg_host_buffer_id: int | None = None
 
         # Memory pool info
         self.req_pool_idx: int | None = None
