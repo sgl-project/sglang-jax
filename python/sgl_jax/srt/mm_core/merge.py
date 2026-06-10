@@ -69,8 +69,8 @@ def merge(
         item i's placeholders. Used to build the placeholder membership mask.
       input_ids: ``[seq]`` int array; placeholder rows hold their item's pad_value.
       deepstack: optional precomputed deepstack side-channel, carried through to the result.
-      mesh: optional embed mesh; when set, operands are constrained to full replication
-        before the scatter (contract rule 3).
+      mesh: optional embed mesh; when set, operands are resharded to full replication
+        (jax.sharding.reshard) before the scatter (contract rule 3).
 
     Returns:
       :class:`FusedEmbed` whose ``embed`` is ``[seq, hidden]`` with placeholder rows
@@ -85,11 +85,16 @@ def merge(
     all_features = jnp.concatenate(mod_embeds, axis=0)  # [sum_i N_i, hidden], item order
     placeholder = jnp.asarray(list(pad_values), dtype=input_ids.dtype)
 
-    # Contract rule 3: full replication before scatter on a sharded embed mesh.
+    # Contract rule 3: full replication before scatter on a sharded embed mesh. Use
+    # jax.sharding.reshard (NOT with_sharding_constraint): under the standard AR mesh whose
+    # axes are all type Explicit, with_sharding_constraint acts as an *assert* on the input's
+    # existing sharding rather than re-sharding it, so a 'data'-sharded text_embed (the real
+    # in-model case) would fail the assert. reshard actually replicates and works under both
+    # Auto and Explicit axis types.
     if mesh is not None:
         repl = NamedSharding(mesh, PartitionSpec())
-        text_embed = jax.lax.with_sharding_constraint(text_embed, repl)
-        all_features = jax.lax.with_sharding_constraint(all_features, repl)
+        text_embed = jax.sharding.reshard(text_embed, repl)
+        all_features = jax.sharding.reshard(all_features, repl)
 
     seq_len = text_embed.shape[0]
     # Contract rules 1+2: placeholder mask by pad_value membership, ordered positions.
