@@ -11,6 +11,7 @@ from jax.sharding import NamedSharding, PartitionSpec
 
 from sgl_jax.srt.managers.utils import resolve_future_token_ids, set_future_token_ids
 from sgl_jax.srt.speculative.relay_buffer import create_spec_relay_buffers
+from sgl_jax.srt.speculative.state_dump import dump_state
 from sgl_jax.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -40,10 +41,20 @@ def resolve_deferred_spec_decode_new_seq_lens(deferred, *batches):
     if deferred is None:
         return None
     new_seq_lens, entries = deferred
+    for i, batch in enumerate(batches):
+        dump_state(f"current.resolve_new_seq_lens.before.batch{i}", batch=batch)
+    dump_state(
+        "current.resolve_new_seq_lens.device",
+        new_seq_lens=new_seq_lens,
+        entry_slots=[flat_slot for _req, flat_slot in entries],
+    )
     new_seq_lens_host = np.asarray(jax.device_get(new_seq_lens))
     seq_lens_by_req_id = {id(req): int(new_seq_lens_host[flat_slot]) for req, flat_slot in entries}
     for batch in batches:
         _refresh_batch_seq_lens(batch, seq_lens_by_req_id)
+    dump_state("current.resolve_new_seq_lens.host", new_seq_lens_host=new_seq_lens_host)
+    for i, batch in enumerate(batches):
+        dump_state(f"current.resolve_new_seq_lens.after.batch{i}", batch=batch)
     return None
 
 

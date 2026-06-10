@@ -63,28 +63,26 @@ def update_spec_relay_buffers(
     indices = future_indices.reshape((dp_size, per_dp_bs))
     valid = valid_mask.reshape((dp_size, per_dp_bs))
     dp_indices = jnp.arange(dp_size, dtype=jnp.int32)[:, None]
+    scatter_indices = jnp.where(valid, indices, buffers.topk_index.shape[1])
 
     topk_index = topk_index.reshape((dp_size, per_dp_bs) + topk_index.shape[1:])
     hidden_states = hidden_states.reshape((dp_size, per_dp_bs) + hidden_states.shape[1:])
     verified_id = verified_id.reshape((dp_size, per_dp_bs))
 
-    old_topk_index = buffers.topk_index.at[dp_indices, indices].get(out_sharding=RELAY_STATE_SPEC)
-    old_hidden_states = buffers.hidden_states.at[dp_indices, indices].get(
-        out_sharding=RELAY_STATE_SPEC
-    )
-    old_verified_id = buffers.verified_id.at[dp_indices, indices].get(out_sharding=RELAY_ID_SPEC)
-
     return SpecRelayBuffers(
-        topk_index=buffers.topk_index.at[dp_indices, indices].set(
-            jnp.where(valid[..., None], topk_index, old_topk_index),
+        topk_index=buffers.topk_index.at[dp_indices, scatter_indices].set(
+            topk_index,
+            mode="drop",
             out_sharding=RELAY_STATE_SPEC,
         ),
-        hidden_states=buffers.hidden_states.at[dp_indices, indices].set(
-            jnp.where(valid[..., None], hidden_states, old_hidden_states),
+        hidden_states=buffers.hidden_states.at[dp_indices, scatter_indices].set(
+            hidden_states,
+            mode="drop",
             out_sharding=RELAY_STATE_SPEC,
         ),
-        verified_id=buffers.verified_id.at[dp_indices, indices].set(
-            jnp.where(valid, verified_id, old_verified_id),
+        verified_id=buffers.verified_id.at[dp_indices, scatter_indices].set(
+            verified_id,
+            mode="drop",
             out_sharding=RELAY_ID_SPEC,
         ),
     )

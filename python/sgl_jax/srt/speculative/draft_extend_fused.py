@@ -17,6 +17,7 @@ from sgl_jax.srt.speculative.relay_buffer import (
     gather_spec_relay_buffers,
     update_spec_relay_buffers,
 )
+from sgl_jax.srt.speculative.state_dump import dump_state
 
 
 class GreedyDraftInputs(NamedTuple):
@@ -307,14 +308,18 @@ def _build_fused_draft_extend_jit(num_layers: int, topk: int):
 
         select_index = jnp.arange(sel_pos.shape[0], dtype=jnp.int32) * (num_layers + 1) + sel_pos
         selected_layer0_hidden = _gather_rows_preserve_sharding(layer0_hidden, select_index)
-        # Force P() replicated sharding on outputs that must be cross-process
-        # consistent. Without this, donate_argnames may let XLA alias output
-        # buffers with donated P("data")-sharded pool buffers, silently making
-        # np.asarray() return per-process-different values.
         if topk == 1:
             stacked_idx = jnp.stack([idx[:, 0] for idx in all_topk_index], axis=1)
         else:
             stacked_idx = jnp.stack(all_topk_index, axis=1)
+
+        relay_hidden = selected_layer0_hidden
+        relay_topk_index = stacked_idx
+        relay_verified_id_for_update = relay_verified_id
+
+        # Force P() replicated sharding only on outputs that may still be
+        # materialized on host by the debug/legacy restore path. Relay buffers
+        # are DP-local and must be updated with the original data-sharded values.
         if mesh is not None:
             rep = NamedSharding(mesh, P())
             selected_layer0_hidden = jax.sharding.reshard(selected_layer0_hidden, rep)
@@ -326,9 +331,9 @@ def _build_fused_draft_extend_jit(num_layers: int, topk: int):
                 relay_buffers,
                 relay_future_indices,
                 relay_valid_mask,
-                stacked_idx,
-                selected_layer0_hidden,
-                relay_verified_id,
+                relay_topk_index,
+                relay_hidden,
+                relay_verified_id_for_update,
                 dp_size=dp_size,
             )
 
@@ -795,6 +800,13 @@ def launch_fused_draft_extend_for_decode(
     """Launch fused MTP draft extend and return deferred host restore state."""
     from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
 
+    dump_state(
+        "current.draft_extend_decode.input",
+        batch=model_worker_batch,
+        result=batch_output,
+        relay_future_indices=relay_future_indices,
+        relay_valid_mask=relay_valid_mask,
+    )
     if batch_output.next_draft_input.verified_id.shape[0] <= 0:
         return None
     target_hidden = batch_output.logits_output.hidden_states
@@ -873,6 +885,16 @@ def launch_fused_draft_extend_for_decode(
     for i, w in enumerate(draft_worker._workers):
         w.model_runner.memory_pools.replace_all(all_pool_updates[i])
 
+    dump_state(
+        "current.draft_extend_decode.output",
+        batch=model_worker_batch,
+        result=batch_output,
+        relay_future_indices=relay_future_indices,
+        relay_valid_mask=relay_valid_mask,
+        selected_layer0_hidden=selected_layer0_hidden,
+        topk_index_stacked=topk_index_stacked,
+        next_verified_id=batch_output.next_draft_input.next_verified_id,
+    )
     return FusedDraftExtendPendingResult(
         batch_output=batch_output,
         selected_layer0_hidden=selected_layer0_hidden,
@@ -1045,7 +1067,7 @@ def spec_prefill(spec_worker, model_worker_batch, launch_done=None):
     model_worker_batch.spec_info_padded.allocate_lens = np.asarray(model_worker_batch.seq_lens)[sel]
     model_worker_batch.spec_info_padded.verified_id = np.asarray(host_next_token_ids)[sel]
 
-    return GenerationBatchResult(
+    result = GenerationBatchResult(
         logits_output=logits_output,
         next_token_ids=relay_next_token_ids if launch_done is not None else host_next_token_ids,
         next_draft_input=model_worker_batch.spec_info_padded,
@@ -1054,6 +1076,8 @@ def spec_prefill(spec_worker, model_worker_batch, launch_done=None):
         extend_input_len_per_req=None,
         extend_logprob_start_len_per_req=None,
     )
+    dump_state("current.spec_prefill.output", batch=model_worker_batch, result=result)
+    return result
 
 
 def spec_decode_verify_phase(spec_worker, model_worker_batch, cur_allocate_lens):
@@ -1076,6 +1100,14 @@ def spec_decode_verify_phase(spec_worker, model_worker_batch, cur_allocate_lens)
         relay_future_indices = np.where(relay_future_indices >= 0, relay_future_indices, 0)
     previous_verified_id, previous_token_list = _prepare_topk1_verify_placeholders_from_draft_state(
         draft_worker, model_worker_batch
+    )
+    dump_state(
+        "current.spec_decode_verify.input",
+        batch=model_worker_batch,
+        previous_verified_id=previous_verified_id,
+        previous_token_list=previous_token_list,
+        relay_future_indices=relay_future_indices,
+        cur_allocate_lens=cur_allocate_lens,
     )
     spec_info = model_worker_batch.spec_info_padded
     return_target_logits = bool(
@@ -1159,6 +1191,13 @@ def spec_decode_verify_phase(spec_worker, model_worker_batch, cur_allocate_lens)
         extend_logprob_start_len_per_req=None,
     )
     model_worker_batch.spec_info_padded = next_draft_input
+    dump_state(
+        "current.spec_decode_verify.output",
+        batch=model_worker_batch,
+        result=batch_output,
+        prepared_positions=prepared_positions,
+        prepared_predict=prepared_predict,
+    )
     return batch_output
 
 
@@ -1181,6 +1220,9 @@ def spec_decode_overlap(spec_worker, model_worker_batch, cur_allocate_lens):
     batch_output.next_draft_input.future_indices = np.asarray(model_worker_batch.req_pool_indices)[
         sel
     ]
+    dump_state(
+        "current.spec_decode_overlap.after_verify", batch=model_worker_batch, result=batch_output
+    )
 
     from sgl_jax.srt.speculative.overlap_worker import publish_spec_decode_new_seq_lens
     from sgl_jax.srt.speculative.relay_buffer import make_dp_valid_mask
@@ -1207,4 +1249,20 @@ def spec_decode_overlap(spec_worker, model_worker_batch, cur_allocate_lens):
     )
     if pending_result is not None:
         spec_worker.spec_relay_buffers = pending_result.updated_relay_buffers
+        data_sharding = NamedSharding(spec_worker.mesh, P("data"))
+        with jax.set_mesh(spec_worker.mesh):
+            relay_topk, relay_hidden, relay_verified = gather_spec_relay_buffers(
+                spec_worker.spec_relay_buffers,
+                _device_array_preserve_device(safe_indices, data_sharding),
+                dp_size=model_worker_batch.dp_size,
+            )
+        dump_state(
+            "current.relay.after_update_gather",
+            batch=model_worker_batch,
+            relay_future_indices=safe_indices,
+            topk_index=relay_topk,
+            hidden_states=relay_hidden,
+            verified_id=relay_verified,
+        )
+    dump_state("current.spec_decode_overlap.output", batch=model_worker_batch, result=batch_output)
     return batch_output, published_new_seq_lens
