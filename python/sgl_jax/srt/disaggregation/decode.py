@@ -413,7 +413,8 @@ class SchedulerDisaggregationDecodeMixin:
 
         ts = req.pd_time_stats
         if ts is None:
-            ts = TimeStats("decode")
+            role = getattr(self.server_args, "disaggregation_mode", "decode")
+            ts = TimeStats(role)
             req.pd_time_stats = ts
         ts.mark(name)
 

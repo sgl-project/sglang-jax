@@ -263,7 +263,8 @@ class SchedulerDisaggregationPrefillMixin:
 
         ts = req.pd_time_stats
         if ts is None:
-            ts = TimeStats("prefill")
+            role = getattr(self.server_args, "disaggregation_mode", "prefill")
+            ts = TimeStats(role)
             req.pd_time_stats = ts
         ts.mark(name)
 
