@@ -95,6 +95,10 @@ def merge(
         repl = NamedSharding(mesh, PartitionSpec())
         text_embed = jax.sharding.reshard(text_embed, repl)
         all_features = jax.sharding.reshard(all_features, repl)
+        # input_ids must be replicated too: it feeds the placeholder mask, and jnp.nonzero
+        # on a 'data'-sharded mask fails (its bincount/scatter internals can't resolve the
+        # 'data' spec under this mesh). Replicating here keeps mask/positions/scatter aligned.
+        input_ids = jax.sharding.reshard(input_ids, repl)
 
     seq_len = text_embed.shape[0]
     # Contract rules 1+2: placeholder mask by pad_value membership, ordered positions.
