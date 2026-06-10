@@ -64,10 +64,15 @@ class OpenAIServingChat(OpenAIServingBase):
     ) -> tuple[GenerateReqInput | GenerateOmniReqInput, ChatCompletionRequest]:
         """Convert OpenAI chat completion request to internal format"""
         model_config = getattr(self.tokenizer_manager, "model_config", None)
-        is_multimodal = (
-            model_config.is_multimodal
-            if model_config is not None
-            else self.tokenizer_manager.server_args.multimodal
+        server_args = self.tokenizer_manager.server_args
+        # The staged generation server (--multimodal) builds an omni request routed to the
+        # GlobalScheduler. In-model understanding (refactor M3) runs on the STANDARD server:
+        # multimodal message processing still applies (extract media + build a prompt with
+        # vision markers), but the request is a standard GenerateReqInput handled by the
+        # standard TokenizerManager's processor.
+        use_staged = server_args.multimodal
+        is_multimodal = use_staged or (
+            model_config is not None and getattr(model_config, "is_multimodal", False)
         )
 
         # Process messages and apply chat template
@@ -78,16 +83,7 @@ class OpenAIServingChat(OpenAIServingBase):
             request, processed_messages.stop, processed_messages.tool_call_constraint
         )
 
-        if is_multimodal:
-            prompt_kwargs = {"text": processed_messages.prompt}
-        else:
-            # Handle single vs multiple requests
-            if isinstance(processed_messages.prompt_ids, str):
-                prompt_kwargs = {"text": processed_messages.prompt_ids}
-            else:
-                prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
-
-        if is_multimodal:
+        if use_staged:
             # logprobs/top_logprobs are not yet plumbed through the omni AR stage.
             # Fail loudly instead of silently dropping them (review D5-5).
             if request.logprobs or (request.top_logprobs or 0) > 0:
@@ -110,6 +106,16 @@ class OpenAIServingChat(OpenAIServingBase):
                 stop=request.stop,
             )
         else:
+            # Standard server: text-only OR in-model understanding multimodal. For the
+            # latter, pass the templated text (with vision markers) as `text` so the
+            # standard TokenizerManager's processor runs the HF AutoProcessor + bakes
+            # pad_values; media flows via image_data/video_data.
+            if is_multimodal:
+                prompt_kwargs = {"text": processed_messages.prompt}
+            elif isinstance(processed_messages.prompt_ids, str):
+                prompt_kwargs = {"text": processed_messages.prompt_ids}
+            else:
+                prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
             adapted_request = GenerateReqInput(
                 **prompt_kwargs,
                 image_data=processed_messages.image_data,
