@@ -631,5 +631,7 @@ class FusedEPMoEV2(FusedEPMoE):
             tp_axis_name="tensor",
         )
 
-        output = jax.sharding.reshard(output, NamedSharding(self.mesh, P("data", None)))
+        output = jax.sharding.reshard(
+            output, jax.sharding.NamedSharding(self.mesh, P("data", None))
+        )
         return output
