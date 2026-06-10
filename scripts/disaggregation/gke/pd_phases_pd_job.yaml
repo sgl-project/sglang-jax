@@ -1,0 +1,221 @@
+# Clean per-phase PD profiling on GKE (PD path): bootstrap + P + D + mini_lb router.
+#
+# Pod 0: bootstrap server + prefill server
+# Pod 1: decode server + router (mini_lb) + bench_pd_phases.py driver
+#
+# Drives conc=1 sequential streaming /generate (output=1) through the router
+# -- the production handshake, NO 0.5s client sleep -- with radix cache
+# DISABLED and per-request unique prompts, so TTFT is uncontaminated. Both
+# servers run with --enable-request-time-stats-logging, so the real per-phase
+# breakdown (prefill: stage/transfer, decode: kv_wait) lands in the server
+# logs; pull them after the run and parse with `bench_pd_phases.py parse`.
+#
+# D2H_ENABLE=false -> unstaged (path B, register HBM directly)
+# D2H_ENABLE=true  -> staged   (path A, copy_from_device to pinned host first)
+#
+# Both pods sleep after the driver finishes so logs can be pulled before
+# teardown; delete the Job manually when done.
+#
+# Placeholders: <JOB_NAME>, <SSH_KEY_B64>, <GH_ORG>, <BRANCH>, <D2H_ENABLE>
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: <JOB_NAME>-headless-svc
+spec:
+  clusterIP: None
+  selector:
+    job-name: <JOB_NAME>
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: <JOB_NAME>
+spec:
+  completionMode: Indexed
+  parallelism: 2
+  completions: 2
+  backoffLimit: 0
+  template:
+    metadata:
+      annotations:
+        gke-gcsfuse/volumes: "true"
+    spec:
+      subdomain: <JOB_NAME>-headless-svc
+      restartPolicy: Never
+      nodeSelector:
+        cloud.google.com/gke-tpu-accelerator: tpu-v6e-slice
+        cloud.google.com/gke-tpu-topology: "1x1"
+        cloud.google.com/gke-nodepool: pd-v6e-1
+      tolerations:
+      - key: google.com/tpu
+        operator: Exists
+        effect: NoSchedule
+      serviceAccountName: gcs-account
+      containers:
+      - name: jax-tpu
+        image: python:3.12
+        securityContext:
+          privileged: true
+        env:
+        - name: P_HOST
+          value: "<JOB_NAME>-0.<JOB_NAME>-headless-svc"
+        - name: MODEL_PATH
+          value: "/models/DeepSeek-R1-Distill-Qwen-1.5B"
+        - name: D2H_ENABLE
+          value: "<D2H_ENABLE>"
+        - name: INPUT_LENS
+          value: "512,1024,2048,4096"
+        command:
+        - bash
+        - -c
+        - |
+          set -ex
+
+          pip install -U --pre jax jaxlib libtpu requests \
+            -i https://us-python.pkg.dev/ml-oss-artifacts-published/jax/simple/ \
+            -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+
+          mkdir -p ~/.ssh
+          echo "<SSH_KEY_B64>" | base64 -d > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+
+          apt-get update && apt-get install -y iproute2 tmux vim
+
+          export UV_CACHE_DIR="/tmp/tpu_logs/uv_cache"
+          export UV_PYTHON_INSTALL_DIR="/tmp/tpu_logs/python"
+          export TMPDIR="/tmp/tpu_logs"
+          mkdir -p "$TMPDIR"
+          pip install uv && uv venv /tmp/tpu_logs/venv && source /tmp/tpu_logs/venv/bin/activate
+          uv pip install pip
+          git clone git@github.com:<GH_ORG>/sglang-jax.git --branch <BRANCH>
+          cd sglang-jax && uv pip install -e python[all]
+
+          D2H_FLAG=""
+          if [ "$D2H_ENABLE" = "true" ]; then D2H_FLAG="--disaggregation-enable-d2h"; fi
+          echo "=== D2H_ENABLE=$D2H_ENABLE -> D2H_FLAG='$D2H_FLAG' ==="
+
+          INDEX=${JOB_COMPLETION_INDEX}
+          echo "=== Pod index: $INDEX ==="
+
+          if [ "$INDEX" = "0" ]; then
+            # ========== POD 0: Bootstrap + Prefill ==========
+            python -m sgl_jax.srt.disaggregation.run_bootstrap \
+              --host 0.0.0.0 --port 8998 &
+            sleep 3
+
+            python -m sgl_jax.launch_server \
+              --model-path "$MODEL_PATH" \
+              --host 0.0.0.0 \
+              --port 10000 \
+              --page-size 128 \
+              --disable-radix-cache \
+              --enable-request-time-stats-logging \
+              --disaggregation-mode prefill \
+              --disaggregation-bootstrap-url "http://${P_HOST}:8998" \
+              $D2H_FLAG \
+              2>&1 | tee /tmp/prefill_server.log &
+            P_PID=$!
+
+            echo "Waiting for prefill server to be ready..."
+            for i in $(seq 1 300); do
+              curl -sf http://localhost:10000/health && break
+              sleep 2
+            done
+            echo "Prefill server ready. Keeping alive for log pull..."
+            wait $P_PID
+
+          else
+            # ========== POD 1: Decode + Router + Driver ==========
+            echo "Waiting for bootstrap at ${P_HOST}:8998..."
+            for i in $(seq 1 300); do
+              curl -sf "http://${P_HOST}:8998/health" && break
+              sleep 2
+            done
+            echo "Waiting for prefill at ${P_HOST}:10000..."
+            for i in $(seq 1 300); do
+              curl -sf "http://${P_HOST}:10000/health" && break
+              sleep 2
+            done
+
+            python -m sgl_jax.launch_server \
+              --model-path "$MODEL_PATH" \
+              --host 0.0.0.0 \
+              --port 10001 \
+              --page-size 128 \
+              --disable-radix-cache \
+              --enable-request-time-stats-logging \
+              --disaggregation-mode decode \
+              --disaggregation-bootstrap-url "http://${P_HOST}:8998" \
+              $D2H_FLAG \
+              2>&1 | tee /tmp/decode_server.log &
+
+            echo "Waiting for decode server to be ready..."
+            for i in $(seq 1 300); do
+              curl -sf http://localhost:10001/health && break
+              sleep 2
+            done
+
+            echo "Starting router (mini_lb)..."
+            python -m sgl_jax.srt.disaggregation.launch_router \
+              --pd-disaggregation --mini-lb \
+              --prefill "http://${P_HOST}:10000" 8998 \
+              --decode http://localhost:10001 \
+              --prefill-bootstrap-host "${P_HOST}" \
+              --host 0.0.0.0 --port 30000 \
+              2>&1 | tee /tmp/router.log &
+
+            echo "Waiting for router to be ready..."
+            for i in $(seq 1 60); do
+              curl -sf http://localhost:30000/health && break
+              sleep 2
+            done
+
+            echo "=========================================="
+            echo "Driving clean per-phase profiling (D2H=$D2H_ENABLE)"
+            echo "=========================================="
+            python scripts/disaggregation/bench_pd_phases.py drive \
+              --url http://localhost:30000 \
+              --model-path "$MODEL_PATH" \
+              --input-lens "$INPUT_LENS" \
+              --warmup 3 --measure 10 \
+              --output-file /tmp/client_ttft.json || true
+
+            echo "=========================================="
+            echo "Decode per-phase (in-pod parse of /tmp/decode_server.log)"
+            echo "=========================================="
+            python scripts/disaggregation/bench_pd_phases.py parse \
+              --log /tmp/decode_server.log --role decode \
+              --input-lens "$INPUT_LENS" --warmup 3 --measure 10 || true
+
+            echo "=========================================="
+            echo "Driver done. Sleeping so prefill+decode logs can be pulled."
+            echo "Pull: kubectl exec <pod0> -- cat /tmp/prefill_server.log"
+            echo "      kubectl exec <pod1> -- cat /tmp/decode_server.log"
+            echo "=========================================="
+            sleep 7200
+          fi
+        resources:
+          requests:
+            ephemeral-storage: 38Gi
+            google.com/tpu: 1
+          limits:
+            ephemeral-storage: 38Gi
+            google.com/tpu: 1
+        volumeMounts:
+        - name: dshm
+          mountPath: /dev/shm
+        - name: model-storage
+          mountPath: /models
+      volumes:
+      - name: model-storage
+        csi:
+          driver: gcsfuse.csi.storage.gke.io
+          volumeAttributes:
+            bucketName: model-storage-sglang
+            mountOptions: "implicit-dirs,metadata-cache:ttl-secs:-1,metadata-cache:stat-cache-max-size-mb:512,metadata-cache:type-cache-max-size-mb:64,file-cache:max-size-mb:5120,file-cache:cache-file-for-range-read:true,file-system:kernel-list-cache-ttl-secs:-1,file-cache:enable-parallel-downloads:true,file-cache:parallel-downloads-per-file:32"
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 32Gi

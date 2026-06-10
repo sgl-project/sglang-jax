@@ -1,0 +1,120 @@
+# Clean TTFT baseline on GKE (no-PD): single colocated server, no router.
+#
+# One pod, one v6e chip. Runs a normal (non-disaggregated) server with radix
+# cache DISABLED, then drives conc=1 sequential streaming /generate (output=1)
+# with per-request unique prompts. This is the floor TTFT to compare the PD
+# unstaged / staged configs against. No PD-TIME-STATS here (mode=null) -- the
+# only metric is client-observed TTFT.
+#
+# Placeholders: <JOB_NAME>, <SSH_KEY_B64>, <GH_ORG>, <BRANCH>
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: <JOB_NAME>
+spec:
+  completionMode: Indexed
+  parallelism: 1
+  completions: 1
+  backoffLimit: 0
+  template:
+    metadata:
+      annotations:
+        gke-gcsfuse/volumes: "true"
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        cloud.google.com/gke-tpu-accelerator: tpu-v6e-slice
+        cloud.google.com/gke-tpu-topology: "1x1"
+        cloud.google.com/gke-nodepool: pd-v6e-1
+      tolerations:
+      - key: google.com/tpu
+        operator: Exists
+        effect: NoSchedule
+      serviceAccountName: gcs-account
+      containers:
+      - name: jax-tpu
+        image: python:3.12
+        securityContext:
+          privileged: true
+        env:
+        - name: MODEL_PATH
+          value: "/models/DeepSeek-R1-Distill-Qwen-1.5B"
+        - name: INPUT_LENS
+          value: "512,1024,2048,4096"
+        command:
+        - bash
+        - -c
+        - |
+          set -ex
+
+          pip install -U --pre jax jaxlib libtpu requests \
+            -i https://us-python.pkg.dev/ml-oss-artifacts-published/jax/simple/ \
+            -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+
+          mkdir -p ~/.ssh
+          echo "<SSH_KEY_B64>" | base64 -d > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+
+          apt-get update && apt-get install -y iproute2 tmux vim
+
+          export UV_CACHE_DIR="/tmp/tpu_logs/uv_cache"
+          export UV_PYTHON_INSTALL_DIR="/tmp/tpu_logs/python"
+          export TMPDIR="/tmp/tpu_logs"
+          mkdir -p "$TMPDIR"
+          pip install uv && uv venv /tmp/tpu_logs/venv && source /tmp/tpu_logs/venv/bin/activate
+          uv pip install pip
+          git clone git@github.com:<GH_ORG>/sglang-jax.git --branch <BRANCH>
+          cd sglang-jax && uv pip install -e python[all]
+
+          echo "Starting colocated (no-PD) server..."
+          python -m sgl_jax.launch_server \
+            --model-path "$MODEL_PATH" \
+            --host 0.0.0.0 \
+            --port 10000 \
+            --page-size 128 \
+            --disable-radix-cache \
+            2>&1 | tee /tmp/server.log &
+
+          echo "Waiting for server to be ready..."
+          for i in $(seq 1 300); do
+            curl -sf http://localhost:10000/health && break
+            sleep 2
+          done
+
+          echo "=========================================="
+          echo "Driving clean TTFT baseline (no-PD)"
+          echo "=========================================="
+          python scripts/disaggregation/bench_pd_phases.py drive \
+            --url http://localhost:10000 \
+            --model-path "$MODEL_PATH" \
+            --input-lens "$INPUT_LENS" \
+            --warmup 3 --measure 10 \
+            --output-file /tmp/client_ttft_nopd.json
+
+          echo "no-PD baseline done."
+          sleep 600
+        resources:
+          requests:
+            ephemeral-storage: 38Gi
+            google.com/tpu: 1
+          limits:
+            ephemeral-storage: 38Gi
+            google.com/tpu: 1
+        volumeMounts:
+        - name: dshm
+          mountPath: /dev/shm
+        - name: model-storage
+          mountPath: /models
+      volumes:
+      - name: model-storage
+        csi:
+          driver: gcsfuse.csi.storage.gke.io
+          volumeAttributes:
+            bucketName: model-storage-sglang
+            mountOptions: "implicit-dirs,metadata-cache:ttl-secs:-1,metadata-cache:stat-cache-max-size-mb:512,metadata-cache:type-cache-max-size-mb:64,file-cache:max-size-mb:5120,file-cache:cache-file-for-range-read:true,file-system:kernel-list-cache-ttl-secs:-1,file-cache:enable-parallel-downloads:true,file-cache:parallel-downloads-per-file:32"
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 32Gi
