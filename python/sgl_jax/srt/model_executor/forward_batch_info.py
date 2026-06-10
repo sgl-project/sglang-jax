@@ -204,6 +204,20 @@ class ForwardBatch:
     # Recurrent state indices [batch_size]
     recurrent_indices: jax.Array | None = None
 
+    # In-model multimodal inputs (refactor M3): raw modality features reach the model's
+    # forward so encode + mm_core.merge() run in-forward (no staged embed-stage handoff).
+    # pixel_values are traced (pytree children); grid_thw / pad_values are static (aux_data),
+    # so the jit specializes per shape -- matching the as-is ViT static_argname behavior.
+    mm_pixel_values: jax.Array | None = None
+    mm_pixel_values_videos: jax.Array | None = None
+    mm_grid_thw: tuple | None = None
+    mm_video_grid_thw: tuple | None = None
+    mm_pad_values: tuple | None = None
+
+    def contains_mm_inputs(self) -> bool:
+        """True if this batch carries raw multimodal features for in-forward encode+merge."""
+        return self.mm_pixel_values is not None or self.mm_pixel_values_videos is not None
+
     def tree_flatten(self):
         children = (
             self.input_ids,
@@ -226,6 +240,8 @@ class ForwardBatch:
             self.apply_for_deepstack,
             self.deepstack_visual_embedding,
             self.recurrent_indices,
+            self.mm_pixel_values,
+            self.mm_pixel_values_videos,
         )
 
         aux_data = {
@@ -234,6 +250,9 @@ class ForwardBatch:
             "spec_algorithm": self.spec_algorithm,
             "capture_hidden_mode": self.capture_hidden_mode,
             "deterministic": self.deterministic,
+            "mm_grid_thw": self.mm_grid_thw,
+            "mm_video_grid_thw": self.mm_video_grid_thw,
+            "mm_pad_values": self.mm_pad_values,
         }
         return (children, aux_data)
 
@@ -270,6 +289,11 @@ class ForwardBatch:
         obj.apply_for_deepstack = children[17]
         obj.deepstack_visual_embedding = children[18]
         obj.recurrent_indices = children[19]
+        obj.mm_pixel_values = children[20]
+        obj.mm_pixel_values_videos = children[21]
+        obj.mm_grid_thw = aux_data.get("mm_grid_thw")
+        obj.mm_video_grid_thw = aux_data.get("mm_video_grid_thw")
+        obj.mm_pad_values = aux_data.get("mm_pad_values")
         return obj
 
     def __repr__(self) -> str:
