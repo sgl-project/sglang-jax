@@ -76,7 +76,7 @@ class JaxTransferWrapper:
         # ``_pending`` is mutated from ``register_pull`` and from the
         # side-channel ack path, so access is serialized with a lock.
         self._pending_lock = threading.Lock()
-        self._pending: dict[str, jax.Array] = {}
+        self._pending: dict[str, Any] = {}
         self._links: dict[str, Any] = {}
 
     @property
@@ -133,8 +133,13 @@ class JaxTransferWrapper:
             )
         return self._server
 
-    def register_pull(self, uuid: str, data: jax.Array) -> None:
+    def register_pull(self, uuid: str, data: Any) -> None:
         """Register ``data`` for a future remote pull keyed by ``uuid``.
+
+        ``data`` may be a single ``jax.Array`` or any pytree of arrays
+        (e.g. a per-layer ``list`` of KV buffers). The underlying
+        ``await_pull`` flattens/unflattens internally, so the pytree is
+        passed through unchanged.
 
         Non-blocking: returns as soon as the underlying API has registered
         the buffer. Caller must keep ``data`` alive (the wrapper holds a
@@ -171,29 +176,34 @@ class JaxTransferWrapper:
                 PD_TRANSFER_BYTES_TOTAL,
             )
 
-            PD_TRANSFER_BYTES_TOTAL.labels(direction="net", role="prefill").inc(int(data.nbytes))
+            PD_TRANSFER_BYTES_TOTAL.labels(direction="net", role="prefill").inc(
+                int(sum(int(leaf.nbytes) for leaf in jax.tree.leaves(data)))
+            )
         except Exception:  # noqa: BLE001
             pass
 
     def pull(
         self,
         uuid: str,
-        spec: jax.ShapeDtypeStruct,
+        spec: Any,
         remote_addr: str | None = None,
-    ) -> jax.Array:
+    ) -> Any:
         """Pull a previously registered buffer from ``remote_addr``.
 
-        ``spec.sharding`` MUST be set; the underlying JAX transfer API
-        requires it and would otherwise fail deep inside with a
-        ``NoneType has no attribute 'device_set'`` error.
+        ``spec`` may be a single ``jax.ShapeDtypeStruct`` or any pytree of
+        them (e.g. a per-layer ``list``). Every leaf's ``sharding`` MUST be
+        set; the underlying JAX transfer API requires it and would
+        otherwise fail deep inside with a ``NoneType has no attribute
+        'device_set'`` error.
         """
 
-        if spec.sharding is None:
-            raise ValueError(
-                "JaxTransferWrapper.pull requires spec.sharding; "
-                "jax.experimental.transfer needs an explicit sharding "
-                "for every ShapeDtypeStruct."
-            )
+        for leaf in jax.tree.leaves(spec):
+            if getattr(leaf, "sharding", None) is None:
+                raise ValueError(
+                    "JaxTransferWrapper.pull requires sharding on every leaf; "
+                    "jax.experimental.transfer needs an explicit sharding "
+                    "for every ShapeDtypeStruct."
+                )
         if not self._started:
             raise RuntimeError("JaxTransferWrapper.start() must be called before pull()")
         if remote_addr is None:
@@ -202,7 +212,7 @@ class JaxTransferWrapper:
                 "process-level wrapper supports multiple peers."
             )
         link = self._connect(remote_addr)
-        return link.pull(_uuid_to_int(uuid), [spec])[0]
+        return link.pull(_uuid_to_int(uuid), spec)
 
     def release(self, uuid: str) -> None:
         """Drop the wrapper's reference to a previously registered buffer.
