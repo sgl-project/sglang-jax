@@ -621,6 +621,12 @@ class Qwen3OmniMoeVisionEncoder(nnx.Module):
 
             pos_embed = emb_tl * w_tl + emb_tr * w_tr + emb_bl * w_bl + emb_br * w_br
 
+            # ViT runs replicated under the multi-chip AR mesh (design 3.3.5): the pos_embed
+            # gather auto-shards the spatial dim on 'data', which breaks the spatial-merge
+            # reshape below (reshape can't resolve the output sharding). Reshard to replicated.
+            if self.mesh is not None:
+                pos_embed = jax.sharding.reshard(pos_embed, NamedSharding(self.mesh, P()))
+
             # Repeat for temporal and apply spatial-merge permutation
             pos_embed = jnp.broadcast_to(
                 pos_embed[None, :, :], (t_val, h_val * w_val, pos_embed.shape[-1])
