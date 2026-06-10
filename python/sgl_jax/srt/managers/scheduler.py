@@ -959,6 +959,8 @@ class Scheduler(
         ndt = self.draft_worker.speculative_num_draft_tokens
         prepped = None  # (batch, copy, result, real_bs_per_dp)
         fallback_batch = None  # get_next_batch() result carried to next loop's fallback path
+        _chain_stat = {"hit": 0, "miss_reshape": 0, "miss_mismatch": 0, "n": 0}
+        _chain_relax = os.path.exists("/tmp/p2a-chain-relax")
 
         def _real_bs(b):
             return tuple(len(i.reqs) if i.reqs else 0 for i in b.reqs_info)
@@ -1049,15 +1051,36 @@ class Scheduler(
                 and batch.forward_mode.is_decode()
                 and getattr(result, "spec_pending", None) is not None
             ):
-                will_reshape = (
-                    len(self.waiting_queue) > 0
-                    or any(c is not None for c in self.chunked_reqs)
-                    or any(
-                        r.finished()
-                        for info in self.running_batch.reqs_info
-                        for r in (info.reqs or [])
-                    )
+                _has_chunked = any(c is not None for c in self.chunked_reqs)
+                _has_finished = any(
+                    r.finished()
+                    for info in self.running_batch.reqs_info
+                    for r in (info.reqs or [])
                 )
+                if _chain_relax:
+                    _all_full = all(
+                        i.batch_is_full for i in self.running_batch.reqs_info
+                    )
+                    will_reshape = (
+                        _has_chunked
+                        or _has_finished
+                        or (len(self.waiting_queue) > 0 and not _all_full)
+                    )
+                else:
+                    will_reshape = (
+                        len(self.waiting_queue) > 0 or _has_chunked or _has_finished
+                    )
+                _chain_stat["n"] += 1
+                if will_reshape:
+                    _chain_stat["miss_reshape"] += 1
+                if _chain_stat["n"] % 200 == 0:
+                    logger.info(
+                        "chain-stat n=%d hit=%d miss_reshape=%d miss_mismatch=%d",
+                        _chain_stat["n"],
+                        _chain_stat["hit"],
+                        _chain_stat["miss_reshape"],
+                        _chain_stat["miss_mismatch"],
+                    )
                 if not will_reshape:
                     # Optimistic bump for in-flight round k. Must stay bumped
                     # through BOTH prepare_for_decode (allocate_lens) AND
@@ -1079,9 +1102,11 @@ class Scheduler(
                         next_batch.launch_done = threading.Event()
                         next_result = self.run_batch(next_batch)
                         prepped = (next_batch, next_batch.copy(), next_result, bs_k)
+                        _chain_stat["hit"] += 1
                     elif next_batch is not None:
                         # will_reshape mispredicted (rare): hand to fallback.
                         fallback_batch = next_batch
+                        _chain_stat["miss_mismatch"] += 1
                     for info in bumped:
                         info.seq_lens = info.seq_lens - ndt
 
