@@ -54,18 +54,16 @@ fastokens = [
     "fastokens>=0.1.1,<0.2.0",
 ]
 tpu = [
-    "jax[tpu]==0.8.2",
-    "libtpu==0.0.38",
+    "jax[tpu]==0.8.1",
 ]
 gpu = [
-    "jax[cuda12]==0.8.2",
+    "jax[cuda12]==0.8.1",
 ]
 cpu = [
-    "jax[cpu]==0.8.2",
+    "jax[cpu]==0.8.1",
 ]
 all = [
-    "jax[tpu]==0.8.2",
-    "libtpu==0.0.38",
+    "jax[tpu]==0.8.1",
     "fastokens>=0.1.1,<0.2.0",
 ]
 multimodal = [
@@ -193,8 +191,3 @@ explicit = true
 torch = { index = "pytorch-cpu" }
 torchvision = { index = "pytorch-cpu" }
 torchaudio = { index = "pytorch-cpu" }
-
-[tool.uv]
-override-dependencies = [
-    "libtpu==0.0.38",
-]
