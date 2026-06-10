@@ -17,6 +17,7 @@ from __future__ import annotations
 import abc
 import logging
 import threading
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -260,6 +261,7 @@ class QueueHostKVPool(HostKVPool):
         # source ``layers`` are already device-resident and the host-side
         # intermediates live in host RAM, so deferring the block adds no HBM
         # pressure.
+        _t0 = time.perf_counter()
         for i, layer in enumerate(layers):
             host_layer = jax.device_put(layer, self._host_sharding)
             updated = entry[i].at[:padded_pages].set(
@@ -268,8 +270,22 @@ class QueueHostKVPool(HostKVPool):
             entry[i] = updated
             array_pytree.append(updated[:padded_pages])
             total_bytes += int(layer.nbytes)
+        _t1 = time.perf_counter()
         jax.block_until_ready(array_pytree)
+        _t2 = time.perf_counter()
         self._record_d2h_bytes(total_bytes)
+        logger.info(
+            "D2H-STAGE-TIME buffer_id=%d layers=%d padded_pages=%d "
+            "buf_pages=%d bytes=%d dispatch_ms=%.1f block_ms=%.1f total_ms=%.1f",
+            buffer_id,
+            len(layers),
+            padded_pages,
+            self._max_padded_pages,
+            total_bytes,
+            (_t1 - _t0) * 1000,
+            (_t2 - _t1) * 1000,
+            (_t2 - _t0) * 1000,
+        )
         return StagedData(buffer_id=buffer_id, array_pytree=array_pytree)
 
     def available_size(self) -> int:
