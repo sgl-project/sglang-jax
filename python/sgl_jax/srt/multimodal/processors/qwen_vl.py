@@ -11,7 +11,10 @@ mm_core ProcessorRegistry; the standard TokenizerManager resolves it for underst
 
 from __future__ import annotations
 
+import base64
+import io
 import logging
+import os
 
 import numpy as np
 
@@ -58,6 +61,38 @@ def _to_list(v):
     return v.tolist() if hasattr(v, "tolist") else list(v)
 
 
+def _load_image(source):
+    """Load one image source into a PIL RGB image (design §3.5.1: loading is the
+    processor's job, not the TokenizerManager's). Accepts a pre-loaded PIL image, raw
+    bytes, a local path, an http(s) URL, a data: URI, or a bare base64 string. Ported
+    from MultimodalTokenizer._load_image_from_source (PIL passthrough added)."""
+    from PIL import Image
+
+    if isinstance(source, Image.Image):
+        return source.convert("RGB")
+    if isinstance(source, dict) and "url" in source:
+        source = source["url"]
+    if hasattr(source, "url"):
+        source = source.url
+    if isinstance(source, bytes):
+        return Image.open(io.BytesIO(source)).convert("RGB")
+    if isinstance(source, str) and os.path.exists(source):
+        return Image.open(source).convert("RGB")
+    if isinstance(source, str) and source.startswith(("http://", "https://")):
+        import requests
+
+        resp = requests.get(source, timeout=10)
+        resp.raise_for_status()
+        return Image.open(io.BytesIO(resp.content)).convert("RGB")
+    if isinstance(source, str) and source.startswith("data:") and "base64," in source:
+        payload = source.split("base64,", 1)[1]
+        return Image.open(io.BytesIO(base64.b64decode(payload))).convert("RGB")
+    try:
+        return Image.open(io.BytesIO(base64.b64decode(source, validate=True))).convert("RGB")
+    except Exception as exc:
+        raise ValueError("Unsupported image source format") from exc
+
+
 class Qwen2_5_VLProcessor(BaseMultimodalProcessor):
     """Image (+video) understanding processor for Qwen2.5-VL (text-out)."""
 
@@ -78,6 +113,9 @@ class Qwen2_5_VLProcessor(BaseMultimodalProcessor):
     def process(self, *, images=None, videos=None, audios=None, text=None):
         if audios:
             raise NotImplementedError("Qwen2.5-VL processor does not handle audio")
+        # Load raw image sources (URL/path/base64/bytes) -> PIL; pre-loaded PIL pass through.
+        if images:
+            images = [_load_image(s) for s in images]
         out = self.hf_processor(
             text=[text] if isinstance(text, str) else text,
             images=images or None,
