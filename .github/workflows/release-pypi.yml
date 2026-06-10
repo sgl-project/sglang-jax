@@ -1,31 +1,6 @@
 name: Release PyPI
 
 on:
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: "Git tag to publish from (e.g. v0.0.3rc0)"
-        required: true
-        type: string
-      version:
-        description: "Version string without v prefix (e.g. 0.0.3rc0)"
-        required: true
-        type: string
-      dry_run:
-        description: "If true, build but do not publish"
-        required: true
-        default: true
-        type: boolean
-      skip_nightly_check:
-        description: "Emergency override for the nightly health gate"
-        required: false
-        default: false
-        type: boolean
-      emergency_justification:
-        description: "Required when skip_nightly_check is true"
-        required: false
-        default: ""
-        type: string
   workflow_call:
     inputs:
       tag:
@@ -77,26 +52,6 @@ jobs:
     runs-on: ubuntu-latest
     environment: prod
     steps:
-      - name: Validate release inputs
-        env:
-          TAG: ${{ inputs.tag }}
-          VERSION: ${{ inputs.version }}
-        run: |
-          set -euo pipefail
-          if [[ ! "$TAG" =~ ^v[0-9]+[.][0-9]+[.][0-9]+([a-zA-Z0-9.+-]*)?$ ]]; then
-            echo "::error::tag '$TAG' must look like v1.2.3 or v1.2.3rc0"
-            exit 1
-          fi
-          if [[ ! "$VERSION" =~ ^[0-9]+[.][0-9]+[.][0-9]+([a-zA-Z0-9.+-]*)?$ ]]; then
-            echo "::error::version '$VERSION' must look like 1.2.3 or 1.2.3rc0"
-            exit 1
-          fi
-          expected="${TAG#v}"
-          if [ "$expected" != "$VERSION" ]; then
-            echo "::error::version input '$VERSION' does not match tag '$TAG' (expected '$expected')"
-            exit 1
-          fi
-
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
