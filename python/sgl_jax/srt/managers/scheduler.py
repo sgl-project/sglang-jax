@@ -901,12 +901,13 @@ class Scheduler(
             if self._engine_paused:
                 continue
 
-            _D("finalize.pre")
+            if self._spec_pending is not None:
+                _D("finalize.pre")
             self._finalize_pending_spec()
-            _D("finalize.post")
             self._drain_deferred_spec_release()
             batch = self.get_next_batch_to_run()
-            _D("get_batch.post", batch)
+            if batch is not None:
+                _D("get_batch.post", batch)
             self.cur_batch = batch
 
             if batch:
