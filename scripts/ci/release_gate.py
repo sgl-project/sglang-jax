@@ -11,6 +11,7 @@ from typing import Any
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "utils"))
 from ci_common import gh_json, index_failure_issues, lookup_issue, utc_now
+from failure_classifier import is_finish_gate
 
 DEFAULT_OUTPUT = "nightly-status.json"
 
@@ -54,6 +55,8 @@ def normalize_failed_jobs(
     index = index_failure_issues(failure_issues)
     failed = []
     for job in classification.get("failed_jobs", []):
+        if is_finish_gate(job.get("name", "")):
+            continue
         failure_type = job.get("failure_type", "bug")
         issue = lookup_issue(index, job.get("name", ""), failure_type) or {}
         failed.append(

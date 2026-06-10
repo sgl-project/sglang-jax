@@ -32,9 +32,6 @@ on:
       gateway-status:
         description: "pass, fail, or emergency"
         value: ${{ jobs.gateway.outputs.gateway-status }}
-      audit-issue-number:
-        description: "Audit issue number for emergency overrides"
-        value: ${{ jobs.gateway.outputs.audit-issue-number }}
 
 permissions:
   actions: read
@@ -47,7 +44,6 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       gateway-status: ${{ steps.check.outputs.gateway_status }}
-      audit-issue-number: ${{ steps.check.outputs.audit_issue_number }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
@@ -116,10 +112,8 @@ jobs:
           rc=$?
           printf '%s\n' "$output"
           gateway_status=$(printf '%s\n' "$output" | awk -F= '/^gateway-status=/{print $2; exit}')
-          audit_issue_number=$(printf '%s\n' "$output" | awk -F= '/^audit-issue-number=/{print $2; exit}')
           if [ -z "$gateway_status" ]; then
             gateway_status=fail
           fi
           echo "gateway_status=$gateway_status" >> "$GITHUB_OUTPUT"
-          echo "audit_issue_number=$audit_issue_number" >> "$GITHUB_OUTPUT"
           exit "$rc"
