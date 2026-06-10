@@ -45,7 +45,7 @@ class TestAssembleInModelMM(unittest.TestCase):
     assemble = staticmethod(ScheduleBatch._assemble_inmodel_mm)  # unbound
 
     def test_text_only_all_none(self):
-        self.assertEqual(self.assemble(None, [_req(), _req()]), (None, None, None, None, None))
+        self.assertEqual(self.assemble(None, [_req(), _req()]), (None,) * 8)
 
     def test_staged_precomputed_embedding_excluded(self):
         staged = _req(
@@ -55,11 +55,11 @@ class TestAssembleInModelMM(unittest.TestCase):
             },
             multimodal_embedding=object(),
         )
-        self.assertEqual(self.assemble(None, [staged]), (None, None, None, None, None))
+        self.assertEqual(self.assemble(None, [staged]), (None,) * 8)
 
     def test_single_image(self):
         img = _FakeItem("image", np.ones((4, 2), np.float32), pad_value=1000007)
-        px, pxv, gthw, vthw, pads = self.assemble(
+        px, pxv, gthw, vthw, pads, visual_pads, aud, aud_lens = self.assemble(
             None, [_req(mm_inputs={"mm_items": [img], "image_grid_thw": [[1, 2, 2]]})]
         )
         self.assertIsNotNone(px)
@@ -68,13 +68,16 @@ class TestAssembleInModelMM(unittest.TestCase):
         self.assertEqual(gthw, ((1, 2, 2),))
         self.assertIsNone(vthw)
         self.assertEqual(pads, (1000007,))
+        self.assertEqual(visual_pads, (1000007,))  # image-only: visual == all pad_values
+        self.assertIsNone(aud)
+        self.assertIsNone(aud_lens)
 
     def test_image_video_pad_ordering(self):
         # Video listed FIRST -> pads must come out image-then-video (matches the model
         # forward's encode_image->encode_video concatenation and merge() keying).
         vid = _FakeItem("video", np.ones((6, 2), np.float32), pad_value=2000009)
         img = _FakeItem("image", np.ones((4, 2), np.float32), pad_value=1000007)
-        px, pxv, gthw, vthw, pads = self.assemble(
+        px, pxv, gthw, vthw, pads, visual_pads, aud, aud_lens = self.assemble(
             None,
             [
                 _req(
@@ -113,10 +116,26 @@ class TestAssembleInModelMM(unittest.TestCase):
                 "image_grid_thw": [[1, 1, 2]],
             }
         )
-        px, pxv, gthw, vthw, pads = self.assemble(None, [r_a, r_b])
+        px, pxv, gthw, vthw, pads, visual_pads, aud, aud_lens = self.assemble(None, [r_a, r_b])
         self.assertEqual(px.shape, (6, 2))  # 4 + 2 rows concatenated
         self.assertEqual(gthw, ((1, 2, 2), (1, 1, 2)))
         self.assertEqual(pads, (11, 22))
+
+    def test_audio_only(self):
+        # Continuous-mel audio item -> audio_features [f, t] + per-audio mel length; audio
+        # pad_value is in pad_values (for merge) but NOT in visual_pad_values (deepstack).
+        aud = _FakeItem("audio", np.ones((8, 5), np.float32), pad_value=3000001)
+        px, pxv, gthw, vthw, pads, visual_pads, aud_feats, aud_lens = self.assemble(
+            None,
+            [_req(mm_inputs={"mm_items": [aud], "audio_feature_attention_mask": np.ones((1, 5))})],
+        )
+        self.assertIsNone(px)
+        self.assertIsNone(pxv)
+        self.assertIsNotNone(aud_feats)
+        self.assertEqual(aud_feats.shape, (8, 5))  # [f, t]
+        self.assertEqual(aud_lens, (5,))  # mel length = mask.sum()
+        self.assertEqual(pads, (3000001,))  # audio pad in all pad_values
+        self.assertIsNone(visual_pads)  # deepstack excludes audio
 
 
 if __name__ == "__main__":

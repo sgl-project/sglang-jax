@@ -15,6 +15,7 @@ import base64
 import io
 import logging
 import os
+import tempfile
 
 import numpy as np
 
@@ -93,6 +94,44 @@ def _load_image(source):
         raise ValueError("Unsupported image source format") from exc
 
 
+def _load_audio(source, sampling_rate):
+    """Decode an audio source -> mono waveform at sampling_rate. Accepts a pre-loaded np
+    waveform, raw bytes, a base64 / data: URI, a local path, or an http(s) URL. Ported from
+    MultimodalTokenizer._load_audio_from_source (librosa lazy-imported)."""
+    if isinstance(source, np.ndarray):
+        return source
+    import librosa
+
+    def _from_bytes(b):
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
+            tmp.write(b)
+            path = tmp.name
+        try:
+            wav, _ = librosa.load(path, sr=sampling_rate)
+            return wav
+        finally:
+            os.unlink(path)
+
+    if isinstance(source, dict) and "url" in source:
+        source = source["url"]
+    if hasattr(source, "url"):
+        source = source.url
+    if isinstance(source, bytes):
+        return _from_bytes(source)
+    if isinstance(source, str) and source.startswith("data:") and "base64," in source:
+        return _from_bytes(base64.b64decode(source.split("base64,", 1)[1]))
+    if isinstance(source, str) and os.path.exists(source):
+        wav, _ = librosa.load(source, sr=sampling_rate)
+        return wav
+    if isinstance(source, str) and source.startswith(("http://", "https://")):
+        import requests
+
+        return _from_bytes(requests.get(source, timeout=10).content)
+    if isinstance(source, str):
+        return _from_bytes(base64.b64decode(source, validate=True))
+    raise ValueError("Unsupported audio source format")
+
+
 class Qwen2_5_VLProcessor(BaseMultimodalProcessor):
     """Image (+video) understanding processor for Qwen2.5-VL (text-out)."""
 
@@ -117,23 +156,31 @@ class Qwen2_5_VLProcessor(BaseMultimodalProcessor):
         return self.hf_processor.apply_chat_template(*args, **kwargs)
 
     def process(self, *, images=None, videos=None, audios=None, text=None):
-        if audios:
-            raise NotImplementedError("Qwen2.5-VL processor does not handle audio")
+        audio_token_id = getattr(self, "audio_token_id", None)
         # Load raw image sources (URL/path/base64/bytes) -> PIL; pre-loaded PIL pass through.
         if images:
             images = [_load_image(s) for s in images]
-        out = self.hf_processor(
+        proc_kwargs = dict(
             text=[text] if isinstance(text, str) else text,
             images=images or None,
             videos=videos or None,
             return_tensors="pt",
         )
+        # Audio (continuous mel) only for processors that declare an audio_token_id (Qwen3-Omni);
+        # Qwen2.5-VL leaves it None and skips audio.
+        if audios and audio_token_id is not None:
+            sr = self.hf_processor.feature_extractor.sampling_rate
+            proc_kwargs["audio"] = [_load_audio(s, sr) for s in audios]
+        out = self.hf_processor(**proc_kwargs)
+
         input_ids = _to_list(out["input_ids"][0])
         pixel_values = _strip_batch_dim(out.get("pixel_values"))
         pixel_values_videos = _strip_batch_dim(out.get("pixel_values_videos"))
         image_grid_thw = _to_grid_list(out.get("image_grid_thw"))
         video_grid_thw = _to_grid_list(out.get("video_grid_thw"))
         second_per_grid_ts = out.get("second_per_grid_ts")
+        audio_features = _strip_batch_dim(out.get("input_features"))
+        audio_feature_attention_mask = _strip_batch_dim(out.get("feature_attention_mask"))
 
         # mRoPE FIRST -- it scans the raw image/video token ids in input_ids to locate spans.
         mrope_positions = mrope_position_delta = None
@@ -157,6 +204,8 @@ class Qwen2_5_VLProcessor(BaseMultimodalProcessor):
             mm_items.append(
                 MultimodalDataItem(modality=Modality.VIDEO, feature=pixel_values_videos)
             )
+        if audio_features is not None:
+            mm_items.append(MultimodalDataItem(modality=Modality.AUDIO, feature=audio_features))
         for item in mm_items:
             item.set_pad_value()
 
@@ -167,6 +216,7 @@ class Qwen2_5_VLProcessor(BaseMultimodalProcessor):
             mm_items,
             im_token_id=self.image_token_id,
             video_token_id=self.video_token_id,
+            audio_token_id=audio_token_id,
         )
 
         return {
@@ -175,8 +225,10 @@ class Qwen2_5_VLProcessor(BaseMultimodalProcessor):
                 "mm_items": mm_items,
                 "im_token_id": self.image_token_id,
                 "video_token_id": self.video_token_id,
+                "audio_token_id": audio_token_id,
                 "image_grid_thw": image_grid_thw,
                 "video_grid_thw": video_grid_thw,
+                "audio_feature_attention_mask": audio_feature_attention_mask,
                 "mrope_positions": mrope_positions,
                 "mrope_position_delta": mrope_position_delta,
                 "second_per_grid_ts": (

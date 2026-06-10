@@ -137,11 +137,20 @@ class Qwen3OmniMoeForConditionalGeneration(nnx.Module):
                 multiscale = (
                     vstack if multiscale is None else jnp.concatenate([multiscale, vstack], axis=1)
                 )
+            if forward_batch.mm_audio_features is not None:
+                # Continuous-mel audio; feature lengths are static (the tower chunks by them).
+                mod_embeds.append(
+                    self.encode_audio(
+                        forward_batch.mm_audio_features,
+                        np.asarray(forward_batch.mm_audio_feature_lengths),
+                    )
+                )
 
             pad_values = list(forward_batch.mm_pad_values or ())
-            # deepstack is visual-only -> key densify on the visual items' pad_values (here all
-            # of mm_pad_values, which are image/video; audio pad_values are not yet plumbed).
-            deepstack = (multiscale, pad_values) if multiscale is not None else None
+            # deepstack is visual-only -> key the densify on the VISUAL items' pad_values
+            # (image+video), so audio placeholder rows are excluded.
+            visual_pad_values = list(forward_batch.mm_visual_pad_values or ())
+            deepstack = (multiscale, visual_pad_values) if multiscale is not None else None
             fused = merge(
                 text_embed,
                 mod_embeds,

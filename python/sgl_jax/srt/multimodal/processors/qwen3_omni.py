@@ -30,6 +30,7 @@ class Qwen3OmniMoeProcessor(Qwen2_5_VLProcessor):
         thinker = getattr(self.hf_config, "thinker_config", self.hf_config)
         self.image_token_id = getattr(thinker, "image_token_id", None)
         self.video_token_id = getattr(thinker, "video_token_id", None)
+        self.audio_token_id = getattr(thinker, "audio_token_id", None)
         self.vision_start_token_id = getattr(thinker, "vision_start_token_id", None)
         vision = getattr(thinker, "vision_config", None)
         self.spatial_merge_size = getattr(vision, "spatial_merge_size", 2)

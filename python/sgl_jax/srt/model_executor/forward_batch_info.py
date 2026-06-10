@@ -213,10 +213,19 @@ class ForwardBatch:
     mm_grid_thw: tuple | None = None
     mm_video_grid_thw: tuple | None = None
     mm_pad_values: tuple | None = None
+    # M5: visual-only pad_values (image+video) for the deepstack densify; audio continuous-mel
+    # features (traced child) + per-audio mel lengths (static, the audio tower chunks by it).
+    mm_visual_pad_values: tuple | None = None
+    mm_audio_features: jax.Array | None = None
+    mm_audio_feature_lengths: tuple | None = None
 
     def contains_mm_inputs(self) -> bool:
         """True if this batch carries raw multimodal features for in-forward encode+merge."""
-        return self.mm_pixel_values is not None or self.mm_pixel_values_videos is not None
+        return (
+            self.mm_pixel_values is not None
+            or self.mm_pixel_values_videos is not None
+            or self.mm_audio_features is not None
+        )
 
     def tree_flatten(self):
         children = (
@@ -242,6 +251,7 @@ class ForwardBatch:
             self.recurrent_indices,
             self.mm_pixel_values,
             self.mm_pixel_values_videos,
+            self.mm_audio_features,
         )
 
         aux_data = {
@@ -253,6 +263,8 @@ class ForwardBatch:
             "mm_grid_thw": self.mm_grid_thw,
             "mm_video_grid_thw": self.mm_video_grid_thw,
             "mm_pad_values": self.mm_pad_values,
+            "mm_visual_pad_values": self.mm_visual_pad_values,
+            "mm_audio_feature_lengths": self.mm_audio_feature_lengths,
         }
         return (children, aux_data)
 
@@ -291,9 +303,12 @@ class ForwardBatch:
         obj.recurrent_indices = children[19]
         obj.mm_pixel_values = children[20]
         obj.mm_pixel_values_videos = children[21]
+        obj.mm_audio_features = children[22]
         obj.mm_grid_thw = aux_data.get("mm_grid_thw")
         obj.mm_video_grid_thw = aux_data.get("mm_video_grid_thw")
         obj.mm_pad_values = aux_data.get("mm_pad_values")
+        obj.mm_visual_pad_values = aux_data.get("mm_visual_pad_values")
+        obj.mm_audio_feature_lengths = aux_data.get("mm_audio_feature_lengths")
         return obj
 
     def __repr__(self) -> str:
@@ -408,7 +423,7 @@ class ForwardBatch:
                 sharding=(NamedSharding(model_runner.mesh, PartitionSpec("data"))),
             )
         else:
-            (lora_scalings, lora_token_indices, lora_ranks) = (
+            lora_scalings, lora_token_indices, lora_ranks = (
                 batch.lora_scalings,
                 batch.lora_token_indices,
                 batch.lora_ranks,
@@ -450,6 +465,15 @@ class ForwardBatch:
                 sharding=(NamedSharding(model_runner.mesh, PartitionSpec(None, None))),
             )
             mm_pixel_values_videos = mm_pixel_values_videos.astype(jnp.bfloat16)
+        # M5: audio continuous-mel features [f, t] device-put replicated (the audio tower runs
+        # replicated like the ViT); feature lengths are static.
+        mm_audio_features = None
+        if getattr(batch, "mm_audio_features", None) is not None:
+            (mm_audio_features,) = device_array(
+                (batch.mm_audio_features,),
+                sharding=(NamedSharding(model_runner.mesh, PartitionSpec(None, None))),
+            )
+            mm_audio_features = mm_audio_features.astype(jnp.bfloat16)
 
         obj = cls(
             bid=batch.bid,
@@ -482,6 +506,9 @@ class ForwardBatch:
             mm_grid_thw=getattr(batch, "mm_grid_thw", None),
             mm_video_grid_thw=getattr(batch, "mm_video_grid_thw", None),
             mm_pad_values=getattr(batch, "mm_pad_values", None),
+            mm_visual_pad_values=getattr(batch, "mm_visual_pad_values", None),
+            mm_audio_features=mm_audio_features,
+            mm_audio_feature_lengths=getattr(batch, "mm_audio_feature_lengths", None),
         )
 
         # Auto-generate attention mask for Encoder-only models (e.g. UMT5Encoder, BERT)
