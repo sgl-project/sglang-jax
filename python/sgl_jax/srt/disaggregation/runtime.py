@@ -79,23 +79,42 @@ def install_disaggregation_wiring(scheduler: Scheduler, server_args: ServerArgs)
         shared_secret=shared_secret,
     )
     notifier.start()
+    host_pool = None
+    if server_args.disaggregation_enable_d2h and mode == "prefill":
+        from sgl_jax.srt.disaggregation.prefill import _KV_GATHER_PAGE_BUCKETS
+        from sgl_jax.srt.mem_cache.host_kv_pool import QueueHostKVPool
+
+        kv_pool = scheduler.token_to_kv_pool_allocator.get_kvcache()
+        per_layer_shape = tuple(int(d) for d in kv_pool.kv_buffer[0].shape[1:])
+        host_pool = QueueHostKVPool(
+            pool_size=server_args.disaggregation_d2h_pool_size,
+            max_padded_pages=_KV_GATHER_PAGE_BUCKETS[-1],
+            layer_num=kv_pool.layer_num,
+            per_layer_shape=per_layer_shape,
+            dtype=kv_pool.dtype,
+            mesh=kv_pool.mesh,
+            partition_spec=kv_pool.kv_sharding.spec,
+            pool_name="pd_prefill",
+        )
+        logger.info(
+            "D2H host pool wired: pool_size=%d max_padded_pages=%d layer_num=%d "
+            "per_layer_shape=%s",
+            server_args.disaggregation_d2h_pool_size,
+            _KV_GATHER_PAGE_BUCKETS[-1],
+            kv_pool.layer_num,
+            per_layer_shape,
+        )
+
     scheduler.disagg_kv_manager = JaxTransferKVManager(
         wrapper,
         notifier,
-        host_pool=None,
+        host_pool=host_pool,
         ack_timeout_seconds=server_args.disaggregation_ack_timeout_seconds,
         pull_timeout_seconds=server_args.disaggregation_pull_timeout_seconds,
         reaper_interval_seconds=(server_args.disaggregation_orphan_reaper_interval_seconds),
     )
     scheduler.disagg_kv_manager.start_reaper()
     scheduler.disagg_use_d2h_staging = server_args.disaggregation_enable_d2h
-    if scheduler.disagg_use_d2h_staging:
-        raise RuntimeError(
-            "--disaggregation-enable-d2h=true requires a wired "
-            "QueueHostKVPool on the JaxTransferKVManager. Currently "
-            "host_pool=None, so producer_handoff() would crash. "
-            "Run with --no-disaggregation-enable-d2h."
-        )
 
     scheduler.disagg_bootstrap_client = BootstrapClient(
         server_args.disaggregation_bootstrap_url,
