@@ -58,7 +58,6 @@ from sgl_jax.srt.precision_tracer import (
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sgl_jax.srt.sampling.sampling_params import DEFAULT_SAMPLING_SEED, SamplingParams
 from sgl_jax.srt.server_args import ServerArgs
-from sgl_jax.srt.speculative.state_dump import dump_state
 from sgl_jax.srt.utils.common_utils import get_bool_env_var, pad_to_bucket
 
 if TYPE_CHECKING:
@@ -1626,11 +1625,6 @@ class ScheduleBatch:
             keep_indices: Optional dict mapping dp_rank -> list of indices to keep for that rank.
                          If None, automatically calculates based on finished() status.
         """
-        dump_state(
-            "current.schedule_batch.filter.before",
-            batch=self,
-            keep_indices=keep_indices,
-        )
         # Normalize exclusion dict
         if chunked_req_to_exclude is None:
             chunked_req_to_exclude = {}
@@ -1743,15 +1737,12 @@ class ScheduleBatch:
             self.return_output_logprob_only = False
             self.has_stream = False
             self.has_grammar = False
-        dump_state("current.schedule_batch.filter.after", batch=self)
 
     def merge_batch(self, other: ScheduleBatch):
         """Merge another batch into this batch (unified for all dp_size >= 1).
 
         Merge each DP rank independently.
         """
-        dump_state("current.schedule_batch.merge.before.self", batch=self)
-        dump_state("current.schedule_batch.merge.before.other", batch=other)
         # Ensure both batches have same dp_size
         assert (
             self.dp_size == other.dp_size
@@ -1845,7 +1836,6 @@ class ScheduleBatch:
         self.has_stream |= other.has_stream
         self.has_grammar |= other.has_grammar
         self.return_hidden_states |= other.return_hidden_states
-        dump_state("current.schedule_batch.merge.after", batch=self)
 
     def _compute_global_padding_sizes(
         self,
@@ -2472,8 +2462,6 @@ class ScheduleBatch:
             tree_cache=self.tree_cache,
             mrope_positions=None,
         )
-        dump_state("current.get_spec_decode_mwb.schedule", batch=self)
-        dump_state("current.get_spec_decode_mwb.mwb", batch=model_worker_batch)
         return model_worker_batch
 
     @staticmethod

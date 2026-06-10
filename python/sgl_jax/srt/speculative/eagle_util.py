@@ -18,7 +18,6 @@ from jax.sharding import PartitionSpec as P
 from jax.tree_util import register_pytree_node_class
 
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
-from sgl_jax.srt.speculative.state_dump import dump_state
 
 if TYPE_CHECKING:
     from sgl_jax.srt.managers.scheduler import GenerationBatchResult
@@ -840,12 +839,6 @@ class EagleDraftInput:
 
     def filter_batch(self, new_indices: np.ndarray, has_been_filtered: bool = True):
         new_indices = np.asarray(new_indices)
-        dump_state(
-            "current.eagle_input.filter.before",
-            spec=self,
-            new_indices=new_indices,
-            has_been_filtered=has_been_filtered,
-        )
         if self.future_indices is not None:
             src = np.asarray(self.future_indices)
             idx = (
@@ -860,7 +853,6 @@ class EagleDraftInput:
                 self.new_seq_lens = np.asarray(self.new_seq_lens)[idx]
             if self.accept_length_cpu is not None:
                 self.accept_length_cpu = np.asarray(self.accept_length_cpu)[idx]
-            dump_state("current.eagle_input.filter.after", spec=self)
             return
 
         self.resolve_pending_draft_extend_result()
@@ -883,7 +875,6 @@ class EagleDraftInput:
                 self.allocate_lens = np.asarray(self.allocate_lens)[new_indices]
             if self.new_seq_lens is not None:
                 self.new_seq_lens = np.asarray(self.new_seq_lens)[new_indices]
-        dump_state("current.eagle_input.filter.after", spec=self)
 
     def trim_to_length(self, n: int):
         self.resolve_pending_draft_extend_result()
@@ -904,8 +895,6 @@ class EagleDraftInput:
                 setattr(self, f, np.asarray(v)[:n])
 
     def merge_batch(self, spec_info: EagleDraftInput):
-        dump_state("current.eagle_input.merge.before.self", spec=self)
-        dump_state("current.eagle_input.merge.before.other", spec=spec_info)
         if self.future_indices is not None or spec_info.future_indices is not None:
             assert self.future_indices is not None and spec_info.future_indices is not None, (
                 "merge_batch requires both EagleDraftInput objects to carry future_indices "
@@ -936,7 +925,6 @@ class EagleDraftInput:
                 )
             else:
                 self.accept_length_cpu = None
-            dump_state("current.eagle_input.merge.after", spec=self)
             return
 
         self.resolve_pending_draft_extend_result()
@@ -948,10 +936,8 @@ class EagleDraftInput:
             self.topk_index = spec_info.topk_index
             self.allocate_lens = spec_info.allocate_lens
             self.new_seq_lens = spec_info.new_seq_lens
-            dump_state("current.eagle_input.merge.after", spec=self)
             return
         if spec_info.hidden_states is None:
-            dump_state("current.eagle_input.merge.after", spec=self)
             return
         self._ensure_host()
         spec_info._ensure_host()
@@ -966,7 +952,6 @@ class EagleDraftInput:
             )
         else:
             self.new_seq_lens = None
-        dump_state("current.eagle_input.merge.after", spec=self)
 
 
 @dataclass

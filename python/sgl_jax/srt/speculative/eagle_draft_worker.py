@@ -26,7 +26,6 @@ from sgl_jax.srt.speculative.eagle_util import (
     build_tree_mask_for_draft_decode,
 )
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
-from sgl_jax.srt.speculative.state_dump import dump_state
 from sgl_jax.srt.utils.common_utils import get_bool_env_var
 from sgl_jax.srt.utils.jax_utils import device_array
 
@@ -452,7 +451,6 @@ class EagleDraftWorker(BaseDraftWorker):
         model_worker_batch.speculative_num_draft_tokens = self.speculative_num_draft_tokens
         model_worker_batch.input_ids = np.empty(bs * self.topk, np.int32)
         model_worker_batch.positions = np.empty(bs * self.topk, np.int32)
-        dump_state("current.padding_for_decode.after", batch=model_worker_batch)
 
     def draft_forward(self, model_worker_batch: ModelWorkerBatch):
         topk_p, topk_index, hidden_states = (
