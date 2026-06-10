@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any, Literal
 import numpy as np
 
 from sgl_jax.srt.managers.schedule_batch import BaseFinishReason
-from sgl_jax.srt.multimodal.common.modality_enum import flatten_nested_list
+from sgl_jax.srt.utils.common_utils import flatten_nested_list
 
 # Handle serialization of Image for pydantic
 if TYPE_CHECKING:
@@ -30,6 +30,39 @@ def has_valid_data(data) -> bool:
 class ImageData:
     url: str
     detail: Literal["auto", "low", "high"] | None = "auto"
+
+
+@dataclass
+class GenerateOmniReqInput:
+    """Input request for Omni/VLM chat/completions.
+
+    Relocated from sgl_jax.srt.multimodal.manager.io_struct for srt<->multimodal
+    decoupling (refactor M1). Transitional: the in-model understanding path will
+    converge onto the standard GenerateReqInput; kept here until then so srt's
+    serving layer does not import the multimodal package.
+    """
+
+    rid: str | None = None
+    prompt: str | None = None
+    input_ids: list[int] | None = None
+    image_data: list[str] | str | None = None
+    video_data: list[str] | str | None = None
+    audio_data: list[str] | str | None = None
+    stream: bool = False
+    n: int | None = 1
+    sampling_params: dict | None = None
+    stop: str | list[str] | None = None
+    # Carried from the OpenAI request so the multimodal path does not silently drop
+    # them (see review D5-5). logprobs are not yet plumbed through the omni AR stage;
+    # serving_chat raises an explicit error when they are requested.
+    return_logprob: bool = False
+    logprob_start_len: int = -1
+    top_logprobs_num: int = 0
+    extra_key: str | None = None
+
+    def __post_init__(self):
+        if self.rid is None:
+            self.rid = uuid.uuid4().hex
 
 
 @dataclass

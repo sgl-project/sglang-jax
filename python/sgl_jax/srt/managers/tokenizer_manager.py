@@ -60,7 +60,6 @@ from sgl_jax.srt.managers.io_struct import (
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
 )
-from sgl_jax.srt.multimodal.tokenizer_utils import resolve_tokenizer_subdir
 from sgl_jax.srt.sampling.sampling_params import SamplingParams
 from sgl_jax.srt.server_args import PortArgs, ServerArgs
 from sgl_jax.srt.utils import (
@@ -69,6 +68,7 @@ from sgl_jax.srt.utils import (
     get_zmq_socket,
     kill_process_tree,
 )
+from sgl_jax.srt.utils.common_utils import resolve_tokenizer_subdir
 from sgl_jax.utils import TypeBasedDispatcher, get_exception_traceback
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())

@@ -70,7 +70,6 @@ from sgl_jax.srt.mem_cache.chunk_cache import ChunkCache
 from sgl_jax.srt.mem_cache.kv_cache_builder import build_kv_cache
 from sgl_jax.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
-from sgl_jax.srt.multimodal.tokenizer_utils import resolve_tokenizer_subdir
 from sgl_jax.srt.precision_tracer import precision_tracer
 from sgl_jax.srt.server_args import PortArgs, ServerArgs
 from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
@@ -81,6 +80,7 @@ from sgl_jax.srt.utils.common_utils import (
     get_zmq_socket,
     kill_itself_when_parent_died,
     pyspy_dump_schedulers,
+    resolve_tokenizer_subdir,
     set_random_seed,
 )
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh

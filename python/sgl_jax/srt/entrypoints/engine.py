@@ -53,7 +53,7 @@ from sgl_jax.srt.managers.scheduler import (
 from sgl_jax.srt.managers.template_manager import TemplateManager
 from sgl_jax.srt.managers.tokenizer_manager import TokenizerManager
 from sgl_jax.srt.sampling.sampling_params import SamplingParams
-from sgl_jax.srt.server_args import PortArgs, ServerArgs
+from sgl_jax.srt.server_args import PortArgs, ServerArgs, get_server_args_extension
 from sgl_jax.srt.utils import (
     configure_logger,
     get_zmq_socket,
@@ -97,11 +97,13 @@ class Engine(EngineBase):
                 kwargs["log_level"] = "error"
 
             if kwargs.get("multimodal", False):
-                from sgl_jax.srt.multimodal.common.ServerArgs import (
-                    MultimodalServerArgs,
-                )
-
-                server_args = MultimodalServerArgs(**kwargs)
+                ext = get_server_args_extension()
+                if ext is None:
+                    raise RuntimeError(
+                        "multimodal=True but no ServerArgs extension is registered. "
+                        "Import the multimodal package before constructing the Engine."
+                    )
+                server_args = ext(**kwargs)
             else:
                 server_args = ServerArgs(**kwargs)
 

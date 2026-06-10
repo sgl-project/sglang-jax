@@ -28,6 +28,26 @@ from sgl_jax.srt.utils.common_utils import (
 logger = logging.getLogger(__name__)
 
 GRAMMAR_BACKEND_CHOICES = ["llguidance", "none"]
+
+
+# srt<->multimodal decoupling (refactor M1): the multimodal package registers its
+# ServerArgs subclass here at import time via register_server_args_extension(), so srt
+# does not import the multimodal package by name. None until the multimodal package is
+# imported (MultimodalServerArgs carries generation-plane args: DiT/VAE/CFG/precompile).
+_SERVER_ARGS_EXTENSION = None
+
+
+def register_server_args_extension(cls) -> None:
+    """Register a ServerArgs subclass (e.g. MultimodalServerArgs) for multimodal serving."""
+    global _SERVER_ARGS_EXTENSION
+    _SERVER_ARGS_EXTENSION = cls
+
+
+def get_server_args_extension():
+    """Return the registered ServerArgs extension class, or None if unregistered."""
+    return _SERVER_ARGS_EXTENSION
+
+
 _REJECTED_PD_HOST_ALIASES = frozenset({"localhost"})
 
 
@@ -1392,9 +1412,14 @@ class ServerArgs:
         args.tp_size = args.tensor_parallel_size
         args.dp_size = args.data_parallel_size
         if cls is ServerArgs and getattr(args, "multimodal", False):
-            from sgl_jax.srt.multimodal.common.ServerArgs import MultimodalServerArgs
-
-            return MultimodalServerArgs.from_cli_args(args)
+            ext = get_server_args_extension()
+            if ext is None:
+                raise RuntimeError(
+                    "multimodal=True but no ServerArgs extension is registered. "
+                    "Import the multimodal package (it registers MultimodalServerArgs "
+                    "via register_server_args_extension) before parsing args."
+                )
+            return ext.from_cli_args(args)
 
         attrs = [attr.name for attr in dataclasses.fields(cls)]
         return cls(**{attr: getattr(args, attr) for attr in attrs})
@@ -1414,9 +1439,9 @@ class ServerArgs:
 
         parser = argparse.ArgumentParser()
         cls.add_cli_args(parser)
-        from sgl_jax.srt.multimodal.common.ServerArgs import MultimodalServerArgs
-
-        MultimodalServerArgs.add_cli_args(parser)
+        ext = get_server_args_extension()
+        if ext is not None:
+            ext.add_cli_args(parser)
         return cls.from_cli_args(parser.parse_args(argv or sys.argv[1:]))
 
     def url(self):

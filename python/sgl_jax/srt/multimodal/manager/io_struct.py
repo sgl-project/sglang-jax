@@ -7,6 +7,10 @@ from enum import Enum, auto
 import numpy as np
 from pydantic import BaseModel
 
+# GenerateOmniReqInput was relocated to srt for srt<->multimodal decoupling (refactor M1);
+# re-exported here for back-compat with existing multimodal imports.
+from sgl_jax.srt.managers.io_struct import GenerateOmniReqInput  # noqa: F401
+
 
 class ImageGenerationsRequest(BaseModel):
     prompt: str
@@ -136,31 +140,8 @@ class GenerateMMReqInput:
         self.rid = uuid.uuid4().hex
 
 
-@dataclasses.dataclass
-class GenerateOmniReqInput:
-    """Input request for Omni/VLM chat/completions."""
-
-    rid: str | None = None
-    prompt: str | None = None
-    input_ids: list[int] | None = None
-    image_data: list[str] | str | None = None
-    video_data: list[str] | str | None = None
-    audio_data: list[str] | str | None = None
-    stream: bool = False
-    n: int | None = 1
-    sampling_params: dict | None = None
-    stop: str | list[str] | None = None
-    # Carried from the OpenAI request so the multimodal path does not silently drop
-    # them (see review D5-5). logprobs are not yet plumbed through the omni AR stage;
-    # serving_chat raises an explicit error when they are requested.
-    return_logprob: bool = False
-    logprob_start_len: int = -1
-    top_logprobs_num: int = 0
-    extra_key: str | None = None
-
-    def __post_init__(self):
-        if self.rid is None:
-            self.rid = uuid.uuid4().hex
+# GenerateOmniReqInput relocated to sgl_jax.srt.managers.io_struct (refactor M1);
+# imported / re-exported at the top of this module.
 
 
 @dataclasses.dataclass

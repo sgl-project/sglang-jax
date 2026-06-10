@@ -14,13 +14,13 @@ import zmq
 
 from sgl_jax.srt.hf_transformers_utils import get_tokenizer
 from sgl_jax.srt.managers.io_struct import BatchStrOut, BatchTokenIDOut
-from sgl_jax.srt.multimodal.tokenizer_utils import resolve_tokenizer_subdir
 from sgl_jax.srt.server_args import PortArgs, ServerArgs
 from sgl_jax.srt.utils import (
     configure_logger,
     get_zmq_socket,
     kill_itself_when_parent_died,
 )
+from sgl_jax.srt.utils.common_utils import resolve_tokenizer_subdir
 from sgl_jax.utils import (
     TypeBasedDispatcher,
     find_printable_text,

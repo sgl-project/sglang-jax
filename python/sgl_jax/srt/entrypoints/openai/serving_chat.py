@@ -39,10 +39,9 @@ from sgl_jax.srt.entrypoints.openai.utils import (
 )
 from sgl_jax.srt.function_call.function_call_parser import FunctionCallParser
 from sgl_jax.srt.jinja_template_utils import process_content_for_template_format
-from sgl_jax.srt.managers.io_struct import GenerateReqInput
+from sgl_jax.srt.managers.io_struct import GenerateOmniReqInput, GenerateReqInput
 from sgl_jax.srt.managers.template_manager import TemplateManager
 from sgl_jax.srt.managers.tokenizer_manager import TokenizerManager
-from sgl_jax.srt.multimodal.manager.io_struct import GenerateOmniReqInput
 from sgl_jax.srt.reasoning_parser import ReasoningParser
 from sgl_jax.utils import convert_json_schema_to_str
 

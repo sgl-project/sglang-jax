@@ -2,7 +2,7 @@ import argparse
 import dataclasses
 from dataclasses import field
 
-from sgl_jax.srt.server_args import ServerArgs
+from sgl_jax.srt.server_args import ServerArgs, register_server_args_extension
 
 
 @dataclasses.dataclass
@@ -131,3 +131,8 @@ class MultimodalServerArgs(ServerArgs):
     def from_cli_args(cls, args: argparse.Namespace):
         attrs = [attr.name for attr in dataclasses.fields(cls)]
         return cls(**{attr: getattr(args, attr) for attr in attrs})
+
+
+# Register with srt so srt code can dispatch to this subclass without importing the
+# multimodal package by name (srt<->multimodal decoupling, refactor M1).
+register_server_args_extension(MultimodalServerArgs)

@@ -8,13 +8,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-
-def flatten_nested_list(nested_list):
-    if isinstance(nested_list, list):
-        return [item for sublist in nested_list for item in flatten_nested_list(sublist)]
-    else:
-        return [nested_list]
-
+# Relocated to sgl_jax.srt.utils.common_utils for srt<->multimodal decoupling (refactor M1).
+# Re-exported here for back-compat with existing multimodal imports.
+from sgl_jax.srt.utils.common_utils import flatten_nested_list  # noqa: F401
 
 # TODO(mick): nccl
 # cuda_ipc: for intranode tensor sharing
