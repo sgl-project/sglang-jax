@@ -152,7 +152,6 @@ ignore = [
 # importing local kernels, and benchmark closures capture loop-state values.
 "sgl_jax/srt/kernels/fused_moe/v2/bench_compare.py" = ["B023", "E402"]
 "sgl_jax/srt/kernels/fused_moe/v2/bench_v2.py" = ["B023", "E402"]
-"sgl_jax/srt/kernels/fused_moe/v2/test_debug.py" = ["E402"]
 
 [tool.ruff.format]
 docstring-code-format = true

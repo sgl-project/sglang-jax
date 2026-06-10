@@ -40,6 +40,28 @@ class MoEBackend(str, Enum):
     AUTO = "auto"  # Automatically select based on ep_size
 
 
+_FUSED_MOE_V2_SUPPORTED_ARCHITECTURES = frozenset(
+    {
+        "BailingMoEForCausalLM",
+        "BailingMoeForCausalLM",
+        "BailingMoeV2ForCausalLM",
+        "BailingMoeV2_5ForCausalLM",
+        "MiMoV2ForCausalLM",
+        "MiMoV2FlashForCausalLM",
+    }
+)
+
+
+def _assert_fused_moe_v2_supported(moe_backend: MoEBackend, architectures: list[str]) -> None:
+    if moe_backend != MoEBackend.FUSED_V2:
+        return
+
+    assert any(arch in _FUSED_MOE_V2_SUPPORTED_ARCHITECTURES for arch in architectures), (
+        "moe_backend='fused_v2' only supports Bailing/MiMo model architectures for now; "
+        f"got architectures={architectures}"
+    )
+
+
 class ModelConfig:
     def __init__(
         self,
@@ -60,7 +82,6 @@ class ModelConfig:
         moe_backend: str | MoEBackend = MoEBackend.AUTO,
         model_sub_dir: str | None = None,
     ) -> None:
-
         self.model_path = model_path
         self.model_sub_dir = model_sub_dir
         self.revision = revision
@@ -104,6 +125,13 @@ class ModelConfig:
             **kwargs,
         )
 
+        if not getattr(self.hf_config, "architectures", None):
+            raise ValueError(
+                f"Invalid model config for {model_path!r}: missing `architectures`. "
+                "Check that the model path points to a valid Hugging Face model directory."
+            )
+        _assert_fused_moe_v2_supported(self.moe_backend, self.hf_config.architectures)
+
         # Unify quantization config handling:
         # 1. User provided config path -> use it
         # 2. HF model has fp8 dict config -> auto-convert to QuantizationConfig
@@ -127,12 +155,6 @@ class ModelConfig:
 
         self.hf_text_config = get_hf_text_config(self.hf_config)
         self.sliding_window = getattr(self.hf_text_config, "sliding_window", None)
-
-        if not getattr(self.hf_config, "architectures", None):
-            raise ValueError(
-                f"Invalid model config for {model_path!r}: missing `architectures`. "
-                "Check that the model path points to a valid Hugging Face model directory."
-            )
 
         if is_draft_model and self.hf_config.architectures[0] == "DeepseekV3ForCausalLM":
             self.hf_config.architectures[0] = "DeepseekV3ForCausalLMNextN"
@@ -403,8 +425,7 @@ class ModelConfig:
                     )
                     if weight_strategy not in (None, "channel", "block", "tensor"):
                         raise NotImplementedError(
-                            f"Unsupported compressed-tensors weight strategy: "
-                            f"{weight_strategy!r}"
+                            f"Unsupported compressed-tensors weight strategy: {weight_strategy!r}"
                         )
 
                     # Read ignore list (e.g. router gates, lm_head, MTP layer).

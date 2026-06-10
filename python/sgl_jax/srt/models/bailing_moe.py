@@ -793,7 +793,7 @@ class BailingMoEForCausalLM(nnx.Module):
                             "weight_block_size",
                             None,
                         )
-                        is_per_channel = _wbs is None
+                        is_per_channel = _wbs is None and moe_backend == "fused_v2"
                         num_blocks = 1 if is_per_channel else in_dim // BLOCK_SIZE
                         # Use physical experts count for reshape (after redundant expert cloning)
                         scale_reshape = (num_physical_experts, 1, 1, out_dim)
