@@ -187,7 +187,7 @@ jobs:
           if [ -f failure_issues.json ]; then
             args+=(--failure-issues failure_issues.json)
           fi
-          python3 scripts/ci/nightly_status.py "${args[@]}"
+          python3 scripts/ci/release_gate.py "${args[@]}"
 
       - name: Publish nightly status
         if: >-

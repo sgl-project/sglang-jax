@@ -112,7 +112,7 @@ jobs:
               --version "$RELEASE_VERSION"
             )
           fi
-          output=$(python3 scripts/ci/nightly_status.py "${args[@]}" 2>&1)
+          output=$(python3 scripts/ci/release_gate.py "${args[@]}" 2>&1)
           rc=$?
           printf '%s\n' "$output"
           gateway_status=$(printf '%s\n' "$output" | awk -F= '/^gateway-status=/{print $2; exit}')
