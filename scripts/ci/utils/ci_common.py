@@ -28,25 +28,18 @@ def clamp(text: str, limit: int = 600) -> str:
     return text[:limit].rsplit(" ", 1)[0].rstrip() + " …"
 
 
-def gh(
-    args: list[str], *, input_text: str | None = None, timeout: int = 180, check: bool = True
-) -> str:
-    """Run a ``gh`` CLI command and return its stripped stdout."""
+def gh_json(args: list[str], *, input_text: str | None = None, timeout: int = 180) -> Any:
+    """Run a ``gh`` command and parse its stdout as JSON (``{}`` when empty)."""
     result = subprocess.run(
         ["gh"] + args,
         input=input_text,
         capture_output=True,
         text=True,
-        check=check,
+        check=True,
         timeout=timeout,
     )
-    return result.stdout.strip()
-
-
-def gh_json(args: list[str], *, input_text: str | None = None, timeout: int = 180) -> Any:
-    """Run a ``gh`` command and parse its stdout as JSON (``{}`` when empty)."""
-    output = gh(args, input_text=input_text, timeout=timeout)
-    return json.loads(output) if output else {}
+    out = result.stdout.strip()
+    return json.loads(out) if out else {}
 
 
 def index_failure_issues(

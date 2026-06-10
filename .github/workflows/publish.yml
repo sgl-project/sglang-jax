@@ -50,7 +50,6 @@ on:
 permissions:
   actions: read
   contents: write
-  issues: write
 
 concurrency:
   group: release-${{ inputs.tag || github.ref_name }}
@@ -106,6 +105,12 @@ jobs:
 
   publish-pypi:
     needs: metadata
+    # Only this job reaches the nightly gateway, which needs issues:write to
+    # open an emergency audit issue. Keep that grant off the other jobs.
+    permissions:
+      actions: read
+      contents: read
+      issues: write
     uses: ./.github/workflows/release-pypi.yml
     secrets: inherit
     with:

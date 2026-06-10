@@ -254,7 +254,7 @@ def main() -> None:
             tag=args.tag,
             version=args.version,
         )
-        print(f"gateway-status=emergency")
+        print("gateway-status=emergency")
         print(f"audit-issue-number={audit['number']}")
         print(f"audit-issue-url={audit['url']}")
         return
