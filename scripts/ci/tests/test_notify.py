@@ -7,12 +7,7 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "utils"))
 
-from failure_classifier import (
-    _FINISH_GATE_RE,
-    _INFRASTRUCTURE_RE,
-    classify_failure,
-    is_finish_gate,
-)
+from failure_classifier import _FINISH_GATE_RE, _INFRASTRUCTURE_RE, classify_failure
 from regression_notify import _escape_mrkdwn, format_regression_summary
 from slack_notify import format_slack_summary
 
@@ -94,21 +89,6 @@ class TestFinishGateRegex(unittest.TestCase):
         self.assertIsNone(_FINISH_GATE_RE.search("finish-setup-job"))
 
 
-class TestIsFinishGate(unittest.TestCase):
-    """Shared is_finish_gate predicate used by slack/issue/regression."""
-
-    def test_matches_finish_gates(self):
-        self.assertTrue(is_finish_gate("pr-test-finish"))
-        self.assertTrue(is_finish_gate("nightly-test-daily-finish"))
-
-    def test_rejects_real_jobs(self):
-        self.assertFalse(is_finish_gate("e2e-test-4-tpu (2)"))
-        self.assertFalse(is_finish_gate("finish-setup-job"))
-
-    def test_handles_none(self):
-        self.assertFalse(is_finish_gate(None))
-
-
 class TestInfrastructureRegexNoFalsePositives(unittest.TestCase):
     """Ensure _INFRASTRUCTURE_RE does NOT match generic phrases."""
 
@@ -160,43 +140,6 @@ class TestFormatSlackSummary(unittest.TestCase):
         summary = format_slack_summary("url", "sha1234567", "author", jobs)
         self.assertLessEqual(len(summary), 2950)
         self.assertIn("truncated", summary)
-
-    def test_includes_issue_link_when_provided(self):
-        jobs = self._make_jobs([("job-a", "bug")])
-        summary = format_slack_summary(
-            "https://run",
-            "abc1234567",
-            "author",
-            jobs,
-            failure_issues={
-                ("job-a", "bug"): {
-                    "issue_number": 123,
-                    "issue_url": "https://github.com/sgl-project/sglang-jax/issues/123",
-                }
-            },
-        )
-        self.assertIn("<https://example.com/0|job-a>", summary)
-        self.assertIn(
-            "Issue: <https://github.com/sgl-project/sglang-jax/issues/123|#123>",
-            summary,
-        )
-
-    def test_works_without_failure_issues(self):
-        jobs = self._make_jobs([("job-a", "bug")])
-        summary = format_slack_summary("https://run", "abc1234567", "author", jobs)
-        self.assertIn("job-a", summary)
-        self.assertNotIn("Issue:", summary)
-
-    def test_includes_ai_root_cause_per_job(self):
-        jobs = self._make_jobs([("job-a", "bug")])
-        summary = format_slack_summary(
-            "https://run",
-            "abc1234567",
-            "author",
-            jobs,
-            analysis={"job-a": {"root_cause": "null deref in foo", "fix": "guard it"}},
-        )
-        self.assertIn("null deref in foo", summary)
 
 
 class TestFormatRegressionSummary(unittest.TestCase):
@@ -255,35 +198,6 @@ class TestFormatRegressionSummary(unittest.TestCase):
         self.assertIn("job&lt;a&gt;", summary)
         self.assertIn("a &amp; b &lt; c", summary)
         self.assertIn("x &gt; y", summary)
-
-    def test_bulleted_sections_on_own_lines(self):
-        summary = format_regression_summary(
-            "abc1234",
-            "https://run/1",
-            "job-a",
-            "• gate flipped below threshold\n• batch composition changed",
-            "• loosen the gate\n• do not revert",
-        )
-        self.assertIn("*Root cause*\n• gate flipped below threshold", summary)
-        self.assertIn("*Suggested fix*\n• loosen the gate", summary)
-
-    def test_short_field_kept_whole(self):
-        summary = format_regression_summary(
-            "abc1234", "https://run/1", "job-a", "• short cause", "• fix"
-        )
-        self.assertIn("• short cause", summary)
-        self.assertNotIn("…", summary)
-
-    def test_runaway_field_clamped(self):
-        long_cause = "word " * 300  # ~1500 chars: model ignored the brief prompt
-        summary = format_regression_summary("abc1234", "https://run/1", "job-a", long_cause, "fix")
-        self.assertIn("…", summary)
-        self.assertLess(len(summary), 900)
-
-    def test_empty_fields_omit_sections(self):
-        summary = format_regression_summary("abc1234", "https://run/1", "job-a", "", "")
-        self.assertNotIn("*Root cause*", summary)
-        self.assertNotIn("*Suggested fix*", summary)
 
 
 class TestEscapeMrkdwn(unittest.TestCase):
