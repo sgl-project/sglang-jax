@@ -62,11 +62,14 @@ def index_failure_issues(
 
 
 def load_failure_issues(path: str | None) -> dict[tuple[str, str], dict[str, Any]]:
-    """Read ``failure_issues.json`` from ``path`` and return its issue index."""
-    if not path:
+    """Read ``failure_issues.json`` from ``path``; {} when absent/malformed."""
+    if not path or not os.path.isfile(path):
         return {}
-    with open(path) as f:
-        data = json.load(f)
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
     return index_failure_issues(data)
 
 

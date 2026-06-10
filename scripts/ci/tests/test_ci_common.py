@@ -102,6 +102,16 @@ class TestFailureIssueAssociation(unittest.TestCase):
     def test_load_failure_issues_empty_path(self):
         self.assertEqual(ci_common.load_failure_issues(None), {})
 
+    def test_load_failure_issues_malformed_returns_empty(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "failure_issues.json")
+            with open(path, "w") as f:
+                f.write("not json{{")
+            self.assertEqual(ci_common.load_failure_issues(path), {})
+        self.assertEqual(ci_common.load_failure_issues("/no/such/file.json"), {})
+
 
 class TestLoadAiAnalysis(unittest.TestCase):
     def test_indexes_by_job_name(self):
