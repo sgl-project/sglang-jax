@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec
 
 from sgl_jax.srt.disaggregation.base.kv_manager import KVPoll
@@ -439,10 +440,8 @@ class SchedulerDisaggregationDecodeMixin:
             except Exception:
                 logger.exception("failed to free kv_indices=%r", kv_indices)
 
-    def _build_kv_spec_for_req(self: Scheduler, req: Req) -> jax.ShapeDtypeStruct:
-        """Build ShapeDtypeStruct matching P's KV layout for the receiver."""
-
-        from jax.sharding import NamedSharding, PartitionSpec
+    def _build_kv_spec_for_req(self: Scheduler, req: Req) -> list[jax.ShapeDtypeStruct]:
+        """Build per-layer ShapeDtypeStructs matching P's KV layout."""
 
         from sgl_jax.srt.disaggregation.prefill import _pad_to_page_bucket
 
@@ -452,11 +451,12 @@ class SchedulerDisaggregationDecodeMixin:
         num_pages = (seqlen + page_size - 1) // page_size
         padded_pages = _pad_to_page_bucket(num_pages)
         per_layer_tail = kv_pool.kv_buffer[0].shape[1:]
-        shape = (kv_pool.layer_num, padded_pages) + per_layer_tail
-        base_spec = kv_pool.kv_sharding.spec
-        stacked_spec = PartitionSpec(None, *base_spec)
-        sharding = NamedSharding(kv_pool.kv_sharding.mesh, stacked_spec)
-        return jax.ShapeDtypeStruct(shape, kv_pool.dtype, sharding=sharding)
+        shape = (padded_pages, *per_layer_tail)
+        sharding = kv_pool.kv_sharding
+        return [
+            jax.ShapeDtypeStruct(shape, kv_pool.dtype, sharding=sharding)
+            for _ in range(kv_pool.layer_num)
+        ]
 
     def _write_kv_to_pool(self: Scheduler, req: Req, kv_indices, kv: jax.Array) -> None:
         """Write pulled KV into the local paged pool (in place)."""
@@ -466,7 +466,6 @@ class SchedulerDisaggregationDecodeMixin:
                 f"_write_kv_to_pool: kv_indices is None for req "
                 f"{req.rid!r}; allocator may have OOM'd"
             )
-        import numpy as np
 
         kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
         page_size = kv_pool.page_size
@@ -475,17 +474,24 @@ class SchedulerDisaggregationDecodeMixin:
         kv_indices_np = (
             np.asarray(kv_indices) if not isinstance(kv_indices, np.ndarray) else kv_indices
         )
-        padded_pages = kv.shape[1]
-        # page_ids_padded is only needed by the debug verifier below; the write
-        # itself is token-level via ``loc``. Pad the tail by repeating the last
-        # valid page id (padding tokens carry loc=-1 so they never write).
-        page_ids_np = kv_indices_np[::page_size] // page_size
-        page_ids_np = page_ids_np[:num_pages]
-        if num_pages < padded_pages:
-            pad = np.full(padded_pages - num_pages, page_ids_np[-1], dtype=page_ids_np.dtype)
-            page_ids_padded = np.concatenate([page_ids_np, pad])
+        padded_pages = kv[0].shape[0]
+        # page_ids_padded is only consumed by the debug verifier below, which is
+        # a no-op unless SGL_JAX_PD_DEBUG_KV is set. The write itself is
+        # token-level via ``loc``, so skip this numpy work on the production path.
+        from sgl_jax.srt.disaggregation.debug_utils import kv_debug_enabled
+
+        if kv_debug_enabled(req.rid):
+            page_ids_np = kv_indices_np[::page_size] // page_size
+            page_ids_np = page_ids_np[:num_pages]
+            if num_pages < padded_pages:
+                pad = np.full(
+                    padded_pages - num_pages, page_ids_np[-1], dtype=page_ids_np.dtype
+                )
+                page_ids_padded = np.concatenate([page_ids_np, pad])
+            else:
+                page_ids_padded = page_ids_np
         else:
-            page_ids_padded = page_ids_np
+            page_ids_padded = None
 
         # Write via the same in-place Pallas kernel the forward path uses
         # (``update_fused_kv_cache_vectorized`` with ``input_output_aliases``).
@@ -589,8 +595,11 @@ class SchedulerDisaggregationDecodeMixin:
                 PD_TRANSFER_BYTES_TOTAL,
             )
 
-            if kv is not None and hasattr(kv, "nbytes"):
-                PD_TRANSFER_BYTES_TOTAL.labels(direction="h2d", role="decode").inc(int(kv.nbytes))
+            if not kv:
+                return
+            leaves = jax.tree.leaves(kv)
+            total = int(sum(int(x.nbytes) for x in leaves))
+            PD_TRANSFER_BYTES_TOTAL.labels(direction="h2d", role="decode").inc(total)
 
     def _maybe_log_decode_pull_debug(self, req: Req, kv) -> None:
         from sgl_jax.srt.disaggregation.debug_utils import (
