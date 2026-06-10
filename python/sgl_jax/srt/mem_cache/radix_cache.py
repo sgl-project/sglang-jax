@@ -288,7 +288,7 @@ class RadixCache(BasePrefixCache):
             self.token_to_kv_pool_allocator.free(kv_indices, dp_rank=dp_rank)
             return
 
-        token_ids = (req.origin_input_ids + req.output_ids)[:committed_kv_len]
+        token_ids = (req.radix_key_ids + req.output_ids)[:committed_kv_len]
         # For EAGLE radix cache, we will convert the key to bigram key, e.g. [1,2,3,4] -> [(1,2), (2,3), (3,4)], the length will -1. ((len([(1,2), (2,3), (3,4)]) = len([1,2,3,4]) - 1))
         # So for the corresponding kv length should also -1. Then we get the actual_kv_len, and use it to do later calculation and slicing.
         actual_kv_len = committed_kv_len - 1 if self.is_eagle else committed_kv_len
@@ -334,7 +334,10 @@ class RadixCache(BasePrefixCache):
             return
 
         dp_rank = req.dp_rank if req.dp_rank is not None else 0
-        token_ids = req.fill_ids
+        # Scheme B: key on radix_key_ids (cache_input_ids for mm, origin for text) so the
+        # insert namespace matches the match key (adjust_max_prefix_ids); same length as
+        # fill_ids (== origin_input_ids + output_ids), so the kv-len math is unchanged.
+        token_ids = req.radix_key_ids + req.output_ids
         all_token_len = len(token_ids)
         # For EAGLE radix cache, we will convert the key to bigram key, e.g. [1,2,3,4] -> [(1,2), (2,3), (3,4)], the length will -1. ((len([(1,2), (2,3), (3,4)]) = len([1,2,3,4]) - 1))
         # So for the corresponding kv length should also -1. Then we get the actual_kv_len, and use it to do later calculation and slicing.

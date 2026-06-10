@@ -32,7 +32,6 @@ from sgl_jax.srt.layers.embeddings import ParallelLMHead
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.mem_cache.memory_pool import MemoryPools
 from sgl_jax.srt.mm_core.merge import merge
-from sgl_jax.srt.mm_core.pad_value import MM_PAD_SHIFT_VALUE
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.multimodal.configs.config_registry import qwen_vl_vision_config_from_hf
 from sgl_jax.srt.multimodal.models.qwen2_5VL.qwen2_5_vit import (
@@ -117,15 +116,12 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
     ):
         is_extend = forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
         if is_extend and forward_batch.contains_mm_inputs():
-            # Placeholder rows carry pad_values (>= MM_PAD_SHIFT_VALUE, out of vocab range
-            # after pad_input_tokens). Clamp them to a safe in-vocab id for the embed_tokens
-            # lookup -- merge() overwrites those exact rows with the real modality features,
-            # so the dummy text embedding there is discarded. merge() still receives the
-            # ORIGINAL pad-value-laden input_ids to build its isin() placeholder mask.
-            safe_ids = jnp.where(
-                forward_batch.input_ids >= MM_PAD_SHIFT_VALUE, 0, forward_batch.input_ids
-            )
-            text_embed = self.model.embed_tokens(safe_ids)
+            # Scheme B (design §5.1.2): input_ids stays clean -- placeholder rows hold the raw
+            # image/video token id (in-vocab), never a pad_value (those live only in the radix
+            # cache key). So embed_tokens(input_ids) is safe directly (no clamp), and merge()
+            # locates placeholder rows by isin(input_ids, [image/video_token_id]). The dummy
+            # embedding at those rows is overwritten by the real modality features.
+            text_embed = self.model.embed_tokens(forward_batch.input_ids)
             mod_embeds = []
             if forward_batch.mm_pixel_values is not None:
                 mod_embeds.append(
@@ -137,11 +133,13 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
                         forward_batch.mm_pixel_values_videos, forward_batch.mm_video_grid_thw
                     )
                 )
-            pad_values = list(forward_batch.mm_pad_values or ())
+            placeholder_ids = [
+                t for t in (self.image_token_id, self.video_token_id) if t is not None
+            ]
             fused = merge(
                 text_embed,
                 mod_embeds,
-                pad_values,
+                placeholder_ids,
                 forward_batch.input_ids,
                 mesh=self.mesh,
             ).embed

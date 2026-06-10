@@ -11,11 +11,15 @@ implementation supersedes the as-is divergent copies (design doc §1.7 / §1.12 
 
 Three contract rules (must NOT drift into per-model code) — design doc §3.3.2:
   1. Single primitive = scatter-by-mask: locate placeholder rows with
-     `jnp.isin(input_ids, pad_values)`, write with `.at[idx].set(..., mode="drop")`.
+     `jnp.isin(input_ids, placeholder_ids)`, write with `.at[idx].set(..., mode="drop")`.
      (The discarded cumsum-gather trick existed only to dodge a sharding issue that
      rule 3 removes.)
-  2. Key by per-item `pad_value` (NOT raw token id), matching the RadixAttention cache
-     key so per-image cache reuse works.
+  2. Key by the raw modality placeholder token id (image/video/audio_token_id) — NOT a
+     pad_value. Under Scheme B (design §5.1.2) input_ids stays clean (placeholder rows hold
+     the real in-vocab token id), so merge keys directly on it; the per-image radix cache key
+     is decoupled and lives in `Req.cache_input_ids`. (The clamp contract rule the review
+     proposed is therefore unnecessary: forward input never holds an out-of-vocab id. It
+     would only re-apply if one ever switched to Scheme A.)
   3. Full-replication before scatter: under a sharded embed mesh, constrain operands to
      `PartitionSpec()` or the scatter cannot resolve an output sharding (the real bug
      that forced `with_sharding_constraint` in the as-is code).
@@ -52,7 +56,7 @@ class FusedEmbed:
 def merge(
     text_embed: jax.Array,
     mod_embeds: list[jax.Array],
-    pad_values: list[int],
+    placeholder_ids: list[int],
     input_ids: jax.Array,
     deepstack: tuple | None = None,
     *,
@@ -65,16 +69,18 @@ def merge(
       mod_embeds: per-item encoded features, each ``[N_i, hidden]``. Must be ordered the
         same as their placeholder rows appear in ``input_ids`` (sequence order); they are
         concatenated and assigned to placeholder rows in that order.
-      pad_values: per-item pad_value ints; rows where ``input_ids == pad_values[i]`` are
-        item i's placeholders. Used to build the placeholder membership mask.
-      input_ids: ``[seq]`` int array; placeholder rows hold their item's pad_value.
-      deepstack: optional ``(features, visual_pad_values)`` for models with deepstack visual
-        embeddings (Qwen3-VL/Omni). ``features`` is ``[num_levels, n_visual_tokens, hidden]``
-        (per-level multi-scale visual features, ordered like the visual placeholder rows);
-        ``visual_pad_values`` are the pad_values of the VISUAL items only. merge densifies
-        these into ``FusedEmbed.deepstack_embed`` = ``[num_levels, seq, hidden]`` (visual rows
-        hold the features, all other rows 0) so the AR body can add level i to hidden states
-        after layer i. None for non-deepstack models.
+      placeholder_ids: the raw modality placeholder token ids (image/video/audio_token_id);
+        rows where ``input_ids`` is one of them are modality placeholders. Used to build the
+        placeholder membership mask. (Scheme B: these are real in-vocab token ids, not
+        pad_values.)
+      input_ids: ``[seq]`` int array; placeholder rows hold their modality token id.
+      deepstack: optional ``(features, visual_placeholder_ids)`` for models with deepstack
+        visual embeddings (Qwen3-VL/Omni). ``features`` is ``[num_levels, n_visual_tokens,
+        hidden]`` (per-level multi-scale visual features, ordered like the visual placeholder
+        rows); ``visual_placeholder_ids`` are the VISUAL token ids only (image/video). merge
+        densifies these into ``FusedEmbed.deepstack_embed`` = ``[num_levels, seq, hidden]``
+        (visual rows hold the features, all other rows 0) so the AR body can add level i to
+        hidden states after layer i. None for non-deepstack models.
       mesh: optional embed mesh; when set, operands are resharded to full replication
         (jax.sharding.reshard) before the scatter (contract rule 3).
 
@@ -89,10 +95,10 @@ def merge(
         return FusedEmbed(embed=text_embed)
 
     all_features = jnp.concatenate(mod_embeds, axis=0)  # [sum_i N_i, hidden], item order
-    placeholder = jnp.asarray(list(pad_values), dtype=input_ids.dtype)
-    ds_features = ds_pad_values = None
+    placeholder = jnp.asarray(list(placeholder_ids), dtype=input_ids.dtype)
+    ds_features = ds_placeholder_ids = None
     if deepstack is not None:
-        ds_features, ds_pad_values = deepstack
+        ds_features, ds_placeholder_ids = deepstack
 
     # Contract rule 3: full replication before scatter on a sharded embed mesh. Use
     # jax.sharding.reshard (NOT with_sharding_constraint): under the standard AR mesh whose
@@ -112,7 +118,7 @@ def merge(
             ds_features = jax.sharding.reshard(ds_features, repl)
 
     seq_len = text_embed.shape[0]
-    # Contract rules 1+2: placeholder mask by pad_value membership, ordered positions.
+    # Contract rules 1+2: placeholder mask by modality-token-id membership, ordered positions.
     mask = jnp.isin(input_ids, placeholder)  # [seq] bool
     # Static size = #features (a traced shape). Surplus/short slots map to OOB (seq_len)
     # and are dropped by mode="drop" -> a count mismatch never overwrites a text row.
@@ -120,12 +126,12 @@ def merge(
     fused = text_embed.at[positions, :].set(all_features, mode="drop")
 
     # Deepstack side-channel: densify per-level visual features into [num_levels, seq, hidden]
-    # aligned to the visual placeholder rows (keyed by the visual items' pad_values, so audio
+    # aligned to the visual placeholder rows (keyed by the visual token ids, so audio
     # placeholders are excluded). Non-visual rows stay 0 -> the AR's per-layer add is a no-op
     # there.
     deepstack_embed = None
     if ds_features is not None:
-        ds_placeholder = jnp.asarray(list(ds_pad_values), dtype=input_ids.dtype)
+        ds_placeholder = jnp.asarray(list(ds_placeholder_ids), dtype=input_ids.dtype)
         ds_positions = jnp.nonzero(
             jnp.isin(input_ids, ds_placeholder),
             size=ds_features.shape[1],

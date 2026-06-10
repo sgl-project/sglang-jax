@@ -32,7 +32,6 @@ import numpy as np
 from flax import nnx
 
 from sgl_jax.srt.mm_core.merge import merge
-from sgl_jax.srt.mm_core.pad_value import MM_PAD_SHIFT_VALUE
 from sgl_jax.srt.multimodal.models.qwen3_omni_moe.audio_encoder import (
     Qwen3OmniMoeAudioEncoder,
 )
@@ -113,12 +112,10 @@ class Qwen3OmniMoeForConditionalGeneration(nnx.Module):
     def __call__(self, forward_batch, memory_pools, logits_metadata):
         is_extend = forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
         if is_extend and forward_batch.contains_mm_inputs():
-            # Placeholder rows carry pad_values (>= MM_PAD_SHIFT_VALUE, out of vocab). Clamp for
-            # the embed lookup; merge() overwrites those rows with the real features.
-            safe_ids = jnp.where(
-                forward_batch.input_ids >= MM_PAD_SHIFT_VALUE, 0, forward_batch.input_ids
-            )
-            text_embed = self.model.model.embed_tokens(safe_ids)
+            # Scheme B (design §5.1.2): input_ids stays clean -- placeholder rows hold the raw
+            # image/video/audio token id (in-vocab), never a pad_value. embed_tokens is safe
+            # directly (no clamp); merge() locates rows by isin(input_ids, [token ids]).
+            text_embed = self.model.model.embed_tokens(forward_batch.input_ids)
 
             mod_embeds = []
             multiscale = None  # [num_levels, N_visual, hidden]
@@ -146,15 +143,19 @@ class Qwen3OmniMoeForConditionalGeneration(nnx.Module):
                     )
                 )
 
-            pad_values = list(forward_batch.mm_pad_values or ())
-            # deepstack is visual-only -> key the densify on the VISUAL items' pad_values
-            # (image+video), so audio placeholder rows are excluded.
-            visual_pad_values = list(forward_batch.mm_visual_pad_values or ())
-            deepstack = (multiscale, visual_pad_values) if multiscale is not None else None
+            placeholder_ids = [
+                t
+                for t in (self.image_token_id, self.video_token_id, self.audio_token_id)
+                if t is not None
+            ]
+            # deepstack is visual-only -> key the densify on the VISUAL token ids (image+video)
+            # so audio placeholder rows are excluded.
+            visual_ids = [t for t in (self.image_token_id, self.video_token_id) if t is not None]
+            deepstack = (multiscale, visual_ids) if multiscale is not None else None
             fused = merge(
                 text_embed,
                 mod_embeds,
-                pad_values,
+                placeholder_ids,
                 forward_batch.input_ids,
                 deepstack=deepstack,
                 mesh=self.mesh,

@@ -1019,6 +1019,10 @@ class Scheduler(
         req.tokenizer = self.tokenizer
         if hasattr(recv_req, "mm_inputs") and recv_req.mm_inputs:
             req.mm_inputs = recv_req.mm_inputs
+            # Scheme B (design §5.1.2): the padded copy (placeholder rows -> per-item pad_value)
+            # rides in mm_inputs and lands here; it is used ONLY to build the per-image radix
+            # cache key (see Req.radix_key_ids). origin_input_ids stays clean.
+            req.cache_input_ids = recv_req.mm_inputs.get("cache_input_ids")
             multimodal_embedding = recv_req.mm_inputs.get("multimodal_embedding")
             req.multimodal_embedding = multimodal_embedding
             if (

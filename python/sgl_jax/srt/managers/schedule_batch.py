@@ -392,6 +392,24 @@ class Req:
         # Whether request reached finished condition
         return self.finished_reason is not None
 
+    @property
+    def radix_key_ids(self) -> list[int]:
+        """Token ids used to build the radix cache key (Scheme B, design §5.1.2).
+
+        For a multimodal request this is ``cache_input_ids`` -- placeholder rows hold each
+        item's pad_value (a per-image content signature), so different images don't collide on
+        the clean ``origin_input_ids``. For a text request ``cache_input_ids`` is None and this
+        IS ``origin_input_ids``, so the text path is byte-identical to before. Same length as
+        ``origin_input_ids`` (pad_input_tokens replaces ids in place). Both the radix *match*
+        (adjust_max_prefix_ids) and *insert* (RadixCache.cache_{un,}finished_req) read this, so
+        the two key namespaces stay consistent.
+        """
+        if self.cache_input_ids is not None and len(self.cache_input_ids) == len(
+            self.origin_input_ids
+        ):
+            return self.cache_input_ids
+        return self.origin_input_ids
+
     def init_next_round_input(
         self,
         tree_cache: BasePrefixCache | None = None,
@@ -425,7 +443,10 @@ class Req:
             max_prefix_len = min(max_prefix_len, self.logprob_start_len)
 
         max_prefix_len = max(max_prefix_len, 0)
-        return self.fill_ids[:max_prefix_len]
+        # Scheme B: the radix key keys on radix_key_ids (cache_input_ids for mm, origin for
+        # text); fill_ids stays origin-based since the actual tokens to prefill are clean.
+        key_ids = self.radix_key_ids + self.output_ids
+        return key_ids[:max_prefix_len]
 
     def pop_committed_kv_cache(self) -> int:
         assert (

@@ -404,7 +404,7 @@ class SWARadixCache(BasePrefixCache):
             self.token_to_kv_pool_allocator.free(kv_indices, dp_rank=dp_rank)
             return
 
-        token_ids = (req.origin_input_ids + req.output_ids)[:committed_kv_len]
+        token_ids = (req.radix_key_ids + req.output_ids)[:committed_kv_len]
         kv_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx, : len(token_ids)]
 
         if self.page_size != 1:
@@ -443,7 +443,9 @@ class SWARadixCache(BasePrefixCache):
             req.prefix_indices = kv_indices.copy()
             return
 
-        token_ids = req.fill_ids
+        # Scheme B: key on radix_key_ids (cache_input_ids for mm, origin for text); same length
+        # as fill_ids so the kv-index read below is unchanged.
+        token_ids = req.radix_key_ids + req.output_ids
         kv_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx, : len(token_ids)]
 
         if self.page_size != 1:

@@ -2,11 +2,12 @@
 
 Productionizes the validated front-end transform (tmp/refactor/frontend_transform.py):
 real HF AutoProcessor -> input_ids (placeholders) + pixel_values + grid_thw -> mm_items ->
-set_pad_value -> mRoPE -> pad_input_tokens. pad_input_tokens runs AFTER mRoPE because mRoPE
-locates vision spans by the *raw* image/video token id in input_ids; it bakes each item's
-pad_value into the placeholder rows so the in-model merge()'s isin(input_ids, pad_values)
-finds exactly those rows (== the ViT output rows). Registered by HF arch name into the
-mm_core ProcessorRegistry; the standard TokenizerManager resolves it for understanding reqs.
+set_pad_value -> mRoPE -> pad_input_tokens. Scheme B (design §5.1.2): input_ids stays clean
+(raw image/video/audio token ids); pad_input_tokens produces a separate padded copy
+(cache_input_ids) used only for the per-image radix cache key. The in-model merge() locates
+placeholder rows by isin(input_ids, [image/video/audio_token_id]) on the clean ids; the
+forward + detokenizer never see a pad_value. Registered by HF arch name into the mm_core
+ProcessorRegistry; the standard TokenizerManager resolves it for understanding reqs.
 """
 
 from __future__ import annotations
@@ -211,9 +212,12 @@ class Qwen2_5_VLProcessor(BaseMultimodalProcessor):
         for item in mm_items:
             item.set_pad_value()
 
-        # pad_input_tokens AFTER mRoPE: bake per-item pad_value into placeholder rows so the
-        # in-model merge() can key on them.
-        padded_input_ids = pad_input_tokens(
+        # Scheme B (design §5.1.2): input_ids stays CLEAN (raw placeholder token ids, all
+        # in-vocab). pad_input_tokens produces a separate padded copy (per-item pad_value baked
+        # into the placeholder rows) that travels only in cache_input_ids and is consumed
+        # solely to build the per-image radix cache key. The model forward and the detokenizer
+        # never see a pad_value, so no clamp / unpadded-copy bookkeeping is needed.
+        cache_input_ids = pad_input_tokens(
             input_ids,
             mm_items,
             im_token_id=self.image_token_id,
@@ -222,9 +226,10 @@ class Qwen2_5_VLProcessor(BaseMultimodalProcessor):
         )
 
         return {
-            "input_ids": padded_input_ids,
+            "input_ids": input_ids,
             "mm_inputs": {
                 "mm_items": mm_items,
+                "cache_input_ids": cache_input_ids,
                 "im_token_id": self.image_token_id,
                 "video_token_id": self.video_token_id,
                 "audio_token_id": audio_token_id,

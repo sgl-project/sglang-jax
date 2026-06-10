@@ -163,11 +163,16 @@ class TokenizerManager:
             # Understanding multimodal (in-model, refactor M3): resolve an arch-keyed
             # processor via the mm_core registry. import_processor_classes does a RUNTIME
             # scan of the multimodal processors package -> no static srt->multimodal edge.
+            from sgl_jax.srt.mm_core.pad_value import sanity_check_mm_pad_shift_value
             from sgl_jax.srt.mm_core.processor import (
                 get_processor_cls,
                 import_processor_classes,
             )
 
+            # P0-2 (design §3.6.3): assert the pad-shift base sits above the vocab, so a
+            # pad_value (baked into cache_input_ids for the radix key) can never collide with a
+            # real token id and cause a cross-request false prefix hit.
+            sanity_check_mm_pad_shift_value(self.model_config.vocab_size)
             import_processor_classes("sgl_jax.srt.multimodal.processors")
             architectures = getattr(self.model_config.hf_config, "architectures", [])
             proc_cls = get_processor_cls(architectures)
