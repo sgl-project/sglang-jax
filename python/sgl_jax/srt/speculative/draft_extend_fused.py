@@ -55,6 +55,35 @@ def _dump_dext_round(tag, **arrays):
     _DUMP["k"] += 1
 
 
+class SpecChainState(NamedTuple):
+    """Device-resident outputs of round k passed as round k+1 inputs.
+
+    Stored with whatever sharding the fused JIT produced (NOT resharded —
+    that cost ~1.5ms/round in v1). Round k+1 reshards in-JIT to the target
+    sharding (rep→P("data") = split, no cross-host comm).
+    """
+
+    new_seq_lens: jax.Array  # (padded_bs,) — seq_lens + accept (post-verify)
+    stacked_idx: jax.Array  # (padded_bs, num_steps, 1) — draft topk_index
+    predict: jax.Array  # (padded_bs * ndt,) — verify argmax
+    accept_lens: jax.Array  # (padded_bs,)
+
+
+def _zeros_chain_state(padded_bs, num_steps, ndt, mesh):
+    from sgl_jax.srt.utils.jax_utils import device_array
+
+    d1 = NamedSharding(mesh, P("data"))
+    return SpecChainState(
+        new_seq_lens=device_array(np.zeros((padded_bs,), np.int32), sharding=d1),
+        stacked_idx=device_array(
+            np.zeros((padded_bs, num_steps, 1), np.int32),
+            sharding=NamedSharding(mesh, P("data", None, None)),
+        ),
+        predict=device_array(np.zeros((padded_bs * ndt,), np.int32), sharding=d1),
+        accept_lens=device_array(np.zeros((padded_bs,), np.int32), sharding=d1),
+    )
+
+
 class GreedyDraftInputs(NamedTuple):
     hidden_states: jax.Array
     positions: jax.Array
@@ -334,6 +363,7 @@ def _build_fused_greedy_decode_jit(num_layers: int, topk: int):
             "speculative_num_draft_tokens",
             "return_target_logits",
             "return_target_hidden",
+            "use_chain",
         ],
     )
     def fused_greedy_decode(
@@ -351,7 +381,9 @@ def _build_fused_greedy_decode_jit(num_layers: int, topk: int):
         draft_logits_metadata,
         previous_verified_id,
         previous_token_list,
+        prev_chain,
         *,
+        use_chain,
         num_layers,
         speculative_num_steps,
         speculative_num_draft_tokens,
@@ -359,6 +391,46 @@ def _build_fused_greedy_decode_jit(num_layers: int, topk: int):
         return_target_hidden,
     ):
         target_bs = target_forward_batch.seq_lens.shape[0]
+        ndt = speculative_num_draft_tokens
+        # Device-chain resolve: when batch layout is unchanged from prev round
+        # (use_chain static), derive verified_id/token_list/seq_lens from
+        # prev_chain (jit_{k-1} device outputs) instead of host-uploaded values.
+        # Reshard prev_chain in-JIT to match host-value shardings (rep→P("data")
+        # is a per-host split, no cross-host comm; P("data")→P("data") is no-op).
+        # Host metadata (cu_kv_lens/page_indices/out_cache_loc) used optimistic
+        # seq_lens (+ndt); kernel masks via kv_lens (overridden below) so the
+        # ≤ndt-token over-fetch (= 0 pages at page_size=256) is harmless.
+        if use_chain:
+            d1 = jax.typeof(target_forward_batch.seq_lens).sharding
+            mesh_ = d1.mesh if isinstance(d1, NamedSharding) else None
+            d2 = NamedSharding(mesh_, P("data", None)) if mesh_ else d1
+            d3 = NamedSharding(mesh_, P("data", None, None)) if mesh_ else d1
+            seq_lens_real = jax.sharding.reshard(
+                prev_chain.new_seq_lens.astype(jnp.int32), d1
+            )
+            prev_acc = jax.sharding.reshard(prev_chain.accept_lens.astype(jnp.int32), d1)
+            prev_pred = jax.sharding.reshard(prev_chain.predict.astype(jnp.int32), d1)
+            prev_last = jnp.clip(prev_acc - 1, 0, ndt - 1)
+            verified_id_real = jnp.take_along_axis(
+                prev_pred.reshape(target_bs, ndt), prev_last[:, None], axis=1
+            ).squeeze(1)
+            token_list_real = jax.sharding.reshard(
+                prev_chain.stacked_idx.astype(jnp.int32), d3
+            )[:, :, 0]
+            is_real = (seq_lens_real > 0).astype(jnp.int32)
+            target_forward_batch.seq_lens = seq_lens_real
+            target_forward_batch.attn_backend.forward_metadata.seq_lens = (
+                seq_lens_real + is_real * ndt
+            )
+            draft_forward_batch.seq_lens = seq_lens_real + is_real * (ndt - 1)
+            draft_forward_batch.attn_backend.forward_metadata.seq_lens = (
+                seq_lens_real + is_real * (ndt - 1)
+            )
+        else:
+            verified_id_real = previous_verified_id
+            token_list_real = previous_token_list
+            seq_lens_real = target_forward_batch.seq_lens
+
         (
             draft_tokens,
             positions,
@@ -366,9 +438,9 @@ def _build_fused_greedy_decode_jit(num_layers: int, topk: int):
             retrive_next_token_flat,
             retrive_next_sibling_flat,
         ) = _build_topk1_chain_verify_inputs_device_tuple(
-            verified_id=previous_verified_id,
-            token_list=previous_token_list,
-            seq_lens=target_forward_batch.seq_lens,
+            verified_id=verified_id_real,
+            token_list=token_list_real,
+            seq_lens=seq_lens_real,
             num_verify_tokens=speculative_num_draft_tokens,
             batch_size=target_bs,
         )
@@ -458,6 +530,14 @@ def _build_fused_greedy_decode_jit(num_layers: int, topk: int):
         )
         target_logits_for_host = target_logits if return_target_logits else None
         target_hidden_for_host = target_hidden if return_target_hidden else None
+        # chain_out: capture BEFORE host-facing reshard-to-rep so next round's
+        # in-JIT reshard is split/no-op (no cross-host all-gather).
+        chain_out = SpecChainState(
+            new_seq_lens=prepared.new_seq_lens,
+            stacked_idx=stacked_idx,
+            predict=prepared.predict,
+            accept_lens=prepared.accept_lens,
+        )
         if mesh is not None:
             rep = NamedSharding(mesh, P())
             selected_layer0_hidden = jax.sharding.reshard(selected_layer0_hidden, rep)
@@ -481,6 +561,7 @@ def _build_fused_greedy_decode_jit(num_layers: int, topk: int):
             prepared_predict,
             target_logits_for_host,
             target_hidden_for_host,
+            chain_out,
         )
 
     return fused_greedy_decode
@@ -874,6 +955,30 @@ def spec_decode(spec_worker, model_worker_batch, cur_allocate_lens):
             topk=draft_worker.topk,
         )
 
+    # Device-chain: when batch padded layout is unchanged from prev round
+    # (same req_pool_indices), pass prev round's device outputs so the JIT
+    # resolves verified_id/token_list/seq_lens device-side. use_chain is a
+    # python bool → static arg → 2 compiled variants (no jnp.where sharding
+    # mismatch). Step1: event_loop not reordered yet, so host seq_lens ==
+    # prev_chain.new_seq_lens (correctness check only, no perf gain).
+    padded_bs = int(model_worker_batch.seq_lens.shape[0])
+    rpi_host = np.asarray(model_worker_batch.req_pool_indices)
+    prev = getattr(spec_worker, "_chain_state", None)
+    use_chain = bool(
+        prev is not None
+        and prev[0].shape == rpi_host.shape
+        and np.array_equal(prev[0], rpi_host)
+    )
+    if use_chain:
+        prev_chain = prev[1]
+    else:
+        prev_chain = _zeros_chain_state(
+            padded_bs,
+            draft_worker.speculative_num_steps,
+            draft_worker.speculative_num_draft_tokens,
+            spec_worker.mesh,
+        )
+
     with jax.set_mesh(draft_worker.mesh):
         (
             layer0_hidden,
@@ -884,6 +989,7 @@ def spec_decode(spec_worker, model_worker_batch, cur_allocate_lens):
             predict_device,
             target_logits,
             target_hidden,
+            chain_out,
         ) = draft_worker._fused_greedy_decode_jit_fn(
             target_mr._model_def,
             target_mr._model_state_def,
@@ -899,6 +1005,8 @@ def spec_decode(spec_worker, model_worker_batch, cur_allocate_lens):
             draft_logits_metadata,
             previous_verified_id,
             previous_token_list,
+            prev_chain,
+            use_chain=use_chain,
             num_layers=draft_worker.speculative_num_steps,
             speculative_num_steps=draft_worker.speculative_num_steps,
             speculative_num_draft_tokens=draft_worker.speculative_num_draft_tokens,
@@ -906,6 +1014,7 @@ def spec_decode(spec_worker, model_worker_batch, cur_allocate_lens):
             return_target_hidden=return_target_hidden,
         )
 
+    spec_worker._chain_state = (rpi_host, chain_out)
     target_mr.memory_pools.replace_all(target_pool_updates)
     for i, w in enumerate(draft_worker._workers):
         w.model_runner.memory_pools.replace_all(all_pool_updates[i])
