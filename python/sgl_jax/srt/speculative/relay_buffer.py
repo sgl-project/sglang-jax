@@ -16,6 +16,7 @@ class SpecRelayBuffers(NamedTuple):
     topk_index: jax.Array
     hidden_states: jax.Array
     verified_id: jax.Array
+    new_seq_lens: jax.Array
 
 
 def create_spec_relay_buffers(
@@ -45,6 +46,10 @@ def create_spec_relay_buffers(
             jnp.zeros((dp_size, capacity), dtype=jnp.int32),
             id_sharding,
         ),
+        new_seq_lens=jax.device_put(
+            jnp.zeros((dp_size, capacity), dtype=jnp.int32),
+            id_sharding,
+        ),
     )
 
 
@@ -55,6 +60,7 @@ def update_spec_relay_buffers(
     topk_index,
     hidden_states,
     verified_id,
+    new_seq_lens,
     *,
     dp_size: int,
 ) -> SpecRelayBuffers:
@@ -68,6 +74,7 @@ def update_spec_relay_buffers(
     topk_index = topk_index.reshape((dp_size, per_dp_bs) + topk_index.shape[1:])
     hidden_states = hidden_states.reshape((dp_size, per_dp_bs) + hidden_states.shape[1:])
     verified_id = verified_id.reshape((dp_size, per_dp_bs))
+    new_seq_lens = new_seq_lens.reshape((dp_size, per_dp_bs))
 
     return SpecRelayBuffers(
         topk_index=buffers.topk_index.at[dp_indices, scatter_indices].set(
@@ -82,6 +89,11 @@ def update_spec_relay_buffers(
         ),
         verified_id=buffers.verified_id.at[dp_indices, scatter_indices].set(
             verified_id,
+            mode="drop",
+            out_sharding=RELAY_ID_SPEC,
+        ),
+        new_seq_lens=buffers.new_seq_lens.at[dp_indices, scatter_indices].set(
+            new_seq_lens,
             mode="drop",
             out_sharding=RELAY_ID_SPEC,
         ),
@@ -107,6 +119,9 @@ def gather_spec_relay_buffers(
         .get(out_sharding=RELAY_STATE_SPEC)
         .reshape(future_indices.shape + buffers.hidden_states.shape[2:]),
         buffers.verified_id.at[dp_indices, indices]
+        .get(out_sharding=RELAY_ID_SPEC)
+        .reshape(future_indices.shape),
+        buffers.new_seq_lens.at[dp_indices, indices]
         .get(out_sharding=RELAY_ID_SPEC)
         .reshape(future_indices.shape),
     )

@@ -271,6 +271,7 @@ def _build_fused_draft_extend_jit(num_layers: int, topk: int):
         relay_future_indices,
         relay_valid_mask,
         relay_verified_id,
+        relay_new_seq_lens,
         *,
         num_layers,
         update_relay,
@@ -333,6 +334,7 @@ def _build_fused_draft_extend_jit(num_layers: int, topk: int):
                 relay_topk_index,
                 relay_hidden,
                 relay_verified_id_for_update,
+                relay_new_seq_lens,
                 dp_size=dp_size,
             )
 
@@ -344,6 +346,124 @@ def _build_fused_draft_extend_jit(num_layers: int, topk: int):
         )
 
     return fused_draft_extend
+
+
+def _per_dp_cumsum_device(lens, dp_size: int):
+    per_dp_bs = lens.shape[0] // dp_size
+    lens_2d = lens.reshape((dp_size, per_dp_bs))
+    zeros = jnp.zeros((dp_size, 1), dtype=jnp.int32)
+    return jnp.concatenate([zeros, jnp.cumsum(lens_2d, axis=1, dtype=jnp.int32)], axis=1).reshape(
+        (dp_size * (per_dp_bs + 1),)
+    )
+
+
+def _repack_page_indices_from_allocated_lens(
+    page_indices,
+    allocated_lens,
+    metadata_seq_lens,
+    *,
+    page_size: int,
+    dp_size: int,
+):
+    total_bs = metadata_seq_lens.shape[0]
+    per_dp_bs = total_bs // dp_size
+    pages_per_dp = page_indices.shape[0] // dp_size
+
+    allocated_pages = ((allocated_lens + page_size - 1) // page_size).astype(jnp.int32)
+    needed_pages = ((metadata_seq_lens + page_size - 1) // page_size).astype(jnp.int32)
+    allocated_pages = allocated_pages.reshape((dp_size, per_dp_bs))
+    needed_pages = needed_pages.reshape((dp_size, per_dp_bs))
+
+    src_offsets = jnp.cumsum(allocated_pages, axis=1, dtype=jnp.int32) - allocated_pages
+    dst_offsets = jnp.cumsum(needed_pages, axis=1, dtype=jnp.int32) - needed_pages
+
+    local_page_ids = jnp.arange(pages_per_dp, dtype=jnp.int32)[None, :, None]
+    in_req = (local_page_ids >= dst_offsets[:, None, :]) & (
+        local_page_ids < (dst_offsets + needed_pages)[:, None, :]
+    )
+    slot_ids = jnp.argmax(in_req.astype(jnp.int32), axis=2).astype(jnp.int32)
+    valid = jnp.any(in_req, axis=2)
+
+    dp_ids = jnp.arange(dp_size, dtype=jnp.int32)[:, None]
+    offsets_sharding = jax.typeof(src_offsets).sharding
+    offsets_out_sharding = offsets_sharding if isinstance(offsets_sharding, NamedSharding) else None
+    src_slot_offsets = src_offsets.at[dp_ids, slot_ids].get(out_sharding=offsets_out_sharding)
+    dst_slot_offsets = dst_offsets.at[dp_ids, slot_ids].get(out_sharding=offsets_out_sharding)
+    gather_src = (
+        dp_ids * pages_per_dp
+        + src_slot_offsets
+        + (jnp.arange(pages_per_dp, dtype=jnp.int32)[None, :] - dst_slot_offsets)
+    )
+    page_sharding = jax.typeof(page_indices).sharding
+    out_sharding = page_sharding if isinstance(page_sharding, NamedSharding) else None
+    gathered = (
+        page_indices.at[gather_src.reshape(-1)]
+        .get(
+            mode="fill",
+            fill_value=0,
+            out_sharding=out_sharding,
+        )
+        .reshape((dp_size, pages_per_dp))
+    )
+    return jnp.where(valid, gathered, jnp.zeros_like(gathered)).reshape(page_indices.shape)
+
+
+def _make_target_verify_metadata_from_device_seq_lens(
+    old_metadata,
+    verify_seq_lens,
+    allocated_lens,
+    *,
+    speculative_num_draft_tokens: int,
+    page_size: int,
+    dp_size: int,
+):
+    from sgl_jax.srt.layers.attention.flashattention_backend import (
+        FlashAttentionMetadata,
+    )
+
+    valid = verify_seq_lens > 0
+    extend_seq_lens = jnp.where(
+        valid,
+        jnp.full_like(verify_seq_lens, speculative_num_draft_tokens),
+        jnp.zeros_like(verify_seq_lens),
+    )
+    cu_q_lens = _per_dp_cumsum_device(extend_seq_lens, dp_size)
+    metadata_seq_lens = verify_seq_lens + extend_seq_lens
+    aligned_seq_lens = ((metadata_seq_lens + page_size - 1) // page_size) * page_size
+    cu_kv_lens = _per_dp_cumsum_device(aligned_seq_lens, dp_size)
+    page_indices = _repack_page_indices_from_allocated_lens(
+        old_metadata.page_indices,
+        allocated_lens,
+        metadata_seq_lens,
+        page_size=page_size,
+        dp_size=dp_size,
+    )
+    swa_page_indices = None
+    if old_metadata.swa_page_indices is not None:
+        swa_page_indices = _repack_page_indices_from_allocated_lens(
+            old_metadata.swa_page_indices,
+            allocated_lens,
+            metadata_seq_lens,
+            page_size=page_size,
+            dp_size=dp_size,
+        )
+
+    per_dp_bs = verify_seq_lens.shape[0] // dp_size
+    local_num_seqs = jnp.sum(valid.reshape((dp_size, per_dp_bs)).astype(jnp.int32), axis=1)
+    distribution = jnp.stack(
+        [jnp.zeros_like(local_num_seqs), local_num_seqs, local_num_seqs],
+        axis=1,
+    ).reshape((dp_size * 3,))
+
+    return FlashAttentionMetadata(
+        cu_q_lens=cu_q_lens,
+        cu_kv_lens=cu_kv_lens,
+        page_indices=page_indices,
+        swa_page_indices=swa_page_indices,
+        seq_lens=metadata_seq_lens,
+        distribution=distribution,
+        custom_mask=old_metadata.custom_mask,
+    )
 
 
 def _build_fused_greedy_verify_jit(topk: int):
@@ -373,6 +493,7 @@ def _build_fused_greedy_verify_jit(topk: int):
         previous_token_list,
         relay_buffers,
         relay_future_indices,
+        verify_allocate_lens,
         *,
         speculative_num_steps,
         speculative_num_draft_tokens,
@@ -381,10 +502,26 @@ def _build_fused_greedy_verify_jit(topk: int):
         dp_size,
     ):
         if use_relay_state:
-            relay_topk_index, _, relay_verified_id = gather_spec_relay_buffers(
+            relay_topk_index, _, relay_verified_id, relay_new_seq_lens = gather_spec_relay_buffers(
                 relay_buffers,
                 relay_future_indices,
                 dp_size=dp_size,
+            )
+            valid_seq_lens = target_forward_batch.seq_lens > 0
+            target_forward_batch.seq_lens = jnp.where(
+                valid_seq_lens,
+                relay_new_seq_lens.astype(jnp.int32) - 1,
+                jnp.zeros_like(target_forward_batch.seq_lens),
+            )
+            target_forward_batch.attn_backend.forward_metadata = (
+                _make_target_verify_metadata_from_device_seq_lens(
+                    target_forward_batch.attn_backend.forward_metadata,
+                    target_forward_batch.seq_lens,
+                    verify_allocate_lens,
+                    speculative_num_draft_tokens=speculative_num_draft_tokens,
+                    page_size=target_forward_batch.attn_backend.page_size,
+                    dp_size=dp_size,
+                )
             )
             previous_verified_id = relay_verified_id
             previous_token_list = relay_topk_index
@@ -869,6 +1006,7 @@ def launch_fused_draft_extend_for_decode(
             relay_future_indices,
             relay_valid_mask,
             batch_output.next_draft_input.next_verified_id,
+            batch_output.next_draft_input.new_seq_lens,
             num_layers=draft_worker.speculative_num_steps,
             update_relay=update_relay,
             dp_size=model_worker_batch.dp_size,
@@ -1092,6 +1230,8 @@ def spec_decode_verify_phase(spec_worker, model_worker_batch, cur_allocate_lens)
     target_mr.attn_backend.forward_metadata = target_mr.attn_backend.get_eagle_forward_metadata(
         model_worker_batch
     )
+    if use_relay_state and target_mr.attn_backend.forward_metadata.custom_mask is not None:
+        raise NotImplementedError("Spec decode overlap relay path does not support custom_mask.")
     target_forward_batch = _forward_batch_init_new_preserve_device(model_worker_batch, target_mr)
     target_forward_batch.bid = model_worker_batch.bid
     target_logits_metadata = _logits_metadata_from_model_worker_batch_preserve_device(
@@ -1101,6 +1241,9 @@ def spec_decode_verify_phase(spec_worker, model_worker_batch, cur_allocate_lens)
     if relay_future_indices is None:
         relay_future_indices = np.zeros(model_worker_batch.seq_lens.shape, dtype=np.int32)
     relay_future_indices = _device_array_preserve_device(relay_future_indices, data_sharding)
+    verify_allocate_lens = np.zeros_like(model_worker_batch.seq_lens, dtype=np.int32)
+    verify_allocate_lens[model_worker_batch.logits_indices_selector] = cur_allocate_lens
+    verify_allocate_lens = _device_array_preserve_device(verify_allocate_lens, data_sharding)
 
     if not hasattr(draft_worker, "_fused_greedy_verify_jit_fn"):
         draft_worker._fused_greedy_verify_jit_fn = _build_fused_greedy_verify_jit(
@@ -1130,6 +1273,7 @@ def spec_decode_verify_phase(spec_worker, model_worker_batch, cur_allocate_lens)
             previous_token_list,
             getattr(spec_worker, "spec_relay_buffers", None),
             relay_future_indices,
+            verify_allocate_lens,
             speculative_num_steps=draft_worker.speculative_num_steps,
             speculative_num_draft_tokens=draft_worker.speculative_num_draft_tokens,
             return_target_logits=return_target_logits,
@@ -1190,7 +1334,6 @@ def spec_decode_overlap(spec_worker, model_worker_batch, cur_allocate_lens):
     from sgl_jax.srt.speculative.relay_buffer import make_dp_valid_mask
 
     published_new_seq_lens = publish_spec_decode_new_seq_lens(batch_output)
-    batch_output.next_draft_input.new_seq_lens = None
     valid_mask = make_dp_valid_mask(
         model_worker_batch.real_bs_per_dp,
         total_bs=model_worker_batch.req_pool_indices.shape[0],
@@ -1211,4 +1354,5 @@ def spec_decode_overlap(spec_worker, model_worker_batch, cur_allocate_lens):
     )
     if pending_result is not None:
         spec_worker.spec_relay_buffers = pending_result.updated_relay_buffers
+    batch_output.next_draft_input.new_seq_lens = None
     return batch_output, published_new_seq_lens

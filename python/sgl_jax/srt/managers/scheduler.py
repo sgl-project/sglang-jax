@@ -79,9 +79,7 @@ from sgl_jax.srt.server_args import PortArgs, ServerArgs
 from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
 from sgl_jax.srt.speculative.overlap_worker import (
     can_use_spec_decode_overlap,
-    defer_spec_decode_new_seq_lens,
     publish_spec_decode_new_seq_lens,
-    resolve_deferred_spec_decode_new_seq_lens,
 )
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 from sgl_jax.srt.utils.common_utils import (
@@ -401,7 +399,6 @@ class Scheduler(
         self.cur_batch: ScheduleBatch | None = None
         # The last forward batch
         self.last_batch: ScheduleBatch | None = None
-        self.pending_spec_new_seq_lens = None
         self.forward_ct = 0
         self.forward_ct_decode = 0
         self.num_generated_tokens = 0
@@ -1376,7 +1373,6 @@ class Scheduler(
         # Reset scheduling state
         self.cur_batch = None
         self.last_batch = None
-        self.pending_spec_new_seq_lens = None
         self.running_batch = ScheduleBatch.init_new(
             reqs=[[] for _ in range(self.dp_size)],
             req_to_token_pool=self.req_to_token_pool,
@@ -1522,13 +1518,6 @@ class Scheduler(
         )
 
     def get_next_batch_to_run(self) -> ScheduleBatch | None:
-        self.pending_spec_new_seq_lens = resolve_deferred_spec_decode_new_seq_lens(
-            self.pending_spec_new_seq_lens,
-            self.last_batch,
-            self.running_batch,
-            self.cur_batch,
-        )
-
         # Process chunked requests for each DP rank
         chunked_req_to_exclude = {}
         for dp_rank in range(self.dp_size):
@@ -1968,11 +1957,7 @@ class Scheduler(
                 )
                 for r, s in enumerate(per_rank_spec):
                     batch.reqs_info[r].spec_info = s
-            if use_spec_decode_overlap:
-                self.pending_spec_new_seq_lens = defer_spec_decode_new_seq_lens(
-                    batch, published_new_seq_lens
-                )
-            else:
+            if not use_spec_decode_overlap:
                 new_seq_lens = (
                     np.asarray(jax.device_get(published_new_seq_lens))
                     if published_new_seq_lens is not None

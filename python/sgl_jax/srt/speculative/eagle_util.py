@@ -529,6 +529,17 @@ class EagleDraftInput:
     def get_verify_token_num(self, bs: int) -> int:
         return 0
 
+    def new_tokens_required_next_decode(self, requests, page_size: int) -> int:
+        target_alloc = self.ALLOC_LEN_PER_DECODE * 2
+        total = 0
+        for req in requests:
+            cur = req.kv_allocated_len
+            nxt = max(cur, req.kv_committed_len + target_alloc)
+            total += ((nxt + page_size - 1) // page_size) * page_size - (
+                (cur + page_size - 1) // page_size
+            ) * page_size
+        return total
+
     def tree_flatten(self):
         accept_length_cpu_arr = (
             np.empty((0,), dtype=np.int32)
@@ -716,9 +727,9 @@ class EagleDraftInput:
             if info.seq_lens is None or len(info.seq_lens) == 0:
                 continue
             bs_r = len(info.seq_lens)
-            seq_r = np.asarray(info.seq_lens)
-            new_r = seq_r + self.ALLOC_LEN_PER_DECODE - 1
-            old_r = self.allocate_lens[flat_off : flat_off + bs_r]
+            old_r = np.asarray([req.kv_allocated_len for req in info.reqs], dtype=np.int32)
+            committed_r = np.asarray([req.kv_committed_len for req in info.reqs], dtype=np.int32)
+            new_r = np.maximum(old_r, committed_r + 2 * self.ALLOC_LEN_PER_DECODE)
             ext_r = int((new_r - old_r).sum())
             if page_size == 1:
                 ocl_r = alloc_token_slots(schedule_batch.tree_cache, ext_r, dp_rank=dp_rank)
@@ -746,6 +757,7 @@ class EagleDraftInput:
             for req, allocated_len in zip(info.reqs, new_r):
                 req.decode_batch_idx += 1
                 req.kv_allocated_len = int(allocated_len)
+                req.kv_committed_len += 1
             flat_off += bs_r
             info.seq_lens_sum = np.sum(info.seq_lens).item()
 

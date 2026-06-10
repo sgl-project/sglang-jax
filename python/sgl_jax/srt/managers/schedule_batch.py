@@ -1222,6 +1222,10 @@ class ScheduleBatch:
             info.reqs if selected_indices is None else [info.reqs[i] for i in selected_indices]
         )
 
+        spec_info = getattr(info, "spec_info", None)
+        if spec_info is not None and hasattr(spec_info, "new_tokens_required_next_decode"):
+            return spec_info.new_tokens_required_next_decode(requests, page_size)
+
         new_pages = sum(1 for r in requests if r.kv_committed_len % page_size == 0)
         return new_pages * page_size
 
