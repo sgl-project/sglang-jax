@@ -338,6 +338,23 @@ class TokenizerManager:
             )
             input_ids = result["input_ids"]
             mm_inputs = result["mm_inputs"]
+        elif (
+            getattr(self.model_config, "is_multimodal", False)
+            and hasattr(obj, "contains_mm_input")
+            and obj.contains_mm_input()
+        ):
+            # G3-③ (design §5.7): the model is multimodal and the request carries
+            # image/video/audio, but no in-model processor is registered for this
+            # architecture (mm_processor is None). Falling through to the text branch would
+            # silently drop the media and answer blind -- the "silent-degradation quadrant".
+            # Fail loudly so the missing-processor wiring is caught at request time.
+            architectures = getattr(self.model_config.hf_config, "architectures", [])
+            raise ValueError(
+                f"Model {architectures} is multimodal and the request carries multimodal "
+                f"input, but no in-model multimodal processor is registered for it. Register "
+                f"a processor (mm_core ProcessorRegistry, models=[arch]) for this architecture, "
+                f"or remove the multimodal input from the request."
+            )
         elif input_ids is None and input_text is not None:
             if self.tokenizer is None:
                 raise ValueError(
