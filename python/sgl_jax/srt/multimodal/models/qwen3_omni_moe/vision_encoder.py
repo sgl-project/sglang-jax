@@ -203,11 +203,12 @@ class VisionAttention(nnx.Module):
 
         qkv, _ = self.qkv_proj(hidden_states)
 
-        # Reshape with explicit sharding for TP compatibility
+        # Reshape replicated: the in-model ViT runs fully replicated on the multi-chip AR mesh
+        # (design 3.3.5). On the staged 1-device mesh P() is equivalent to the old TP spec.
         qkv = jax.lax.reshape(
             qkv,
             (seq_len, 3, self.num_heads, self.head_dim),
-            out_sharding=NamedSharding(self.mesh, P(None, None, "tensor", None)),
+            out_sharding=NamedSharding(self.mesh, P()),
         )
         q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]
 
@@ -240,11 +241,11 @@ class VisionAttention(nnx.Module):
         )
         attn_output = jnp.transpose(attn_output, (1, 0, 2))  # (q_len, heads, head_dim)
 
-        # Reshape with explicit sharding for TP compatibility
+        # Reshape replicated (see qkv reshape above).
         attn_output = jax.lax.reshape(
             attn_output,
             (seq_len, self.hidden_size),
-            out_sharding=NamedSharding(self.mesh, P(None, "tensor")),
+            out_sharding=NamedSharding(self.mesh, P()),
         )
         output, _ = self.o_proj(attn_output)
 
@@ -408,6 +409,7 @@ class VisionPatchMerger(nnx.Module):
         self.spatial_merge_size = config.spatial_merge_size
         self.out_hidden_size = config.out_hidden_size
         self.use_postshuffle_norm = use_postshuffle_norm
+        self.mesh = mesh
 
         merged_hidden_size = config.hidden_size * (config.spatial_merge_size**2)
         norm_size = merged_hidden_size if use_postshuffle_norm else config.hidden_size
@@ -448,6 +450,13 @@ class VisionPatchMerger(nnx.Module):
             output: (seq_len, out_hidden_size)
         """
         merged_hidden_size = self.hidden_size * (self.spatial_merge_size**2)
+
+        # ViT runs fully replicated (design 3.3.5): the transformer blocks leave hidden states
+        # 'data'-sharded on the patch dim, which the spatial-merge reshape (seq -> seq/merge^2)
+        # below cannot resolve. Reshard to replicated first. Covers the final merger + the 3
+        # deepstack mergers (same class).
+        if self.mesh is not None:
+            hidden_states = jax.sharding.reshard(hidden_states, NamedSharding(self.mesh, P()))
 
         if self.use_postshuffle_norm:
             hidden_states = hidden_states.reshape(-1, merged_hidden_size)
@@ -811,6 +820,13 @@ class Qwen3OmniMoeVisionEncoder(nnx.Module):
 
         # 1. Patch Embedding
         hidden_states = self.patch_embed(pixel_values)  # (total_patches, hidden_size)
+
+        # ViT runs fully replicated on the multi-chip AR mesh (design 3.3.5): reshard the
+        # hidden states to replicated so all downstream blocks / spatial reshapes / mergers
+        # resolve (no auto 'data'/'tensor' sharding on the patch dim). Combined with replicated
+        # weights + the replicated attention out_sharding, the whole tower stays replicated.
+        if self.mesh is not None:
+            hidden_states = jax.sharding.reshard(hidden_states, NamedSharding(self.mesh, P()))
 
         # 2. Add Position Embeddings
         pos_embeds = self.interpolate_pos_embed(grid_thw)

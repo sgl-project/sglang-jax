@@ -168,8 +168,28 @@ class Qwen3OmniMoeForConditionalGeneration(nnx.Module):
         )
         emb = Qwen3OmniMoeThinkerEmbedding
         mappings = {}
-        mappings.update(emb._create_visual_weight_mappings(self.thinker_config.vision_config))
-        mappings.update(emb._create_audio_tower_weight_mappings(self.thinker_config.audio_config))
+
+        # The towers run fully replicated under the multi-chip AR mesh (design 3.3.5), so load
+        # their weights replicated (override any TP sharding to all-None). With replicated
+        # kernels + the ViT's replicated out_sharding, the whole vision/audio compute stays
+        # replicated -- no mid-tower reshards. The staged path loaded these on a 1-device mesh
+        # where the original sharding was already trivial.
+        def _replicated(towers):
+            return {
+                k: (
+                    dataclasses.replace(m, sharding=tuple(None for _ in m.sharding))
+                    if getattr(m, "sharding", None)
+                    else m
+                )
+                for k, m in towers.items()
+            }
+
+        mappings.update(
+            _replicated(emb._create_visual_weight_mappings(self.thinker_config.vision_config))
+        )
+        mappings.update(
+            _replicated(emb._create_audio_tower_weight_mappings(self.thinker_config.audio_config))
+        )
         # AR mappings target paths relative to the ForCausalLM (model.* / lm_head.*); from this
         # wrapper self.model IS that module, so prepend "model.". For MoE mappings the loader
         # treats target_path as [model_target, *source_hf_keys] (weight_utils uses
