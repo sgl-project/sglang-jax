@@ -845,6 +845,9 @@ def _materialize_fused_greedy_batch_output_for_scheduler(
     """Materialize the scheduler-facing fields after the single fused decode JIT."""
     from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
 
+    import os as _os
+
+    _DBG = _os.path.exists("/tmp/p2a-dbg-retract")
     with jax.profiler.TraceAnnotation("fused_greedy_batch_output_d2h"):
         jax.copy_to_host_async(layer0_hidden)
         jax.copy_to_host_async(topk_index_stacked)
@@ -855,7 +858,17 @@ def _materialize_fused_greedy_batch_output_for_scheduler(
             next_token_logits=target_logits,
             hidden_states=target_hidden,
         )
+        if _DBG:
+            _lg = logging.getLogger(__name__)
+            _lg.info(
+                "DBGRT mat.d2h.pre l0h.sh=%s acc.sh=%s pred.sh=%s",
+                getattr(layer0_hidden, "sharding", None),
+                getattr(accept_lens_device, "sharding", None),
+                getattr(predict_device, "sharding", None),
+            )
         batch_output.next_draft_input.hidden_states = np.asarray(layer0_hidden)[selector]
+        if _DBG:
+            _lg.info("DBGRT mat.d2h.post")
         topk_index = np.asarray(topk_index_stacked)[selector]
         batch_output.next_draft_input.topk_p = np.ones(topk_index.shape, dtype=np.float32)
         batch_output.next_draft_input.topk_index = topk_index

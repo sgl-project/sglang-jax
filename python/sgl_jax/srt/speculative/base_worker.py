@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING
 
 import jax
+
+logger = logging.getLogger(__name__)
 import numpy as np
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
@@ -108,6 +111,9 @@ class BaseSpecWorker:
         from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 
         if model_worker_batch.forward_mode.is_extend():
+            import os as _os
+
+            _DBG = _os.path.exists("/tmp/p2a-dbg-retract")
             if model_worker_batch.sampling_info.temperatures.ndim == 1:
                 model_worker_batch.sampling_info.temperatures = (
                     model_worker_batch.sampling_info.temperatures[:, None]
@@ -118,16 +124,41 @@ class BaseSpecWorker:
                 self.mesh,
                 vocab_size=self.target_worker.model_config.vocab_size,
             )
+            if _DBG:
+                logger.info(
+                    "DBGRT spec_ext.target_fwd.pre padded_bs=%d real_bs=%d",
+                    len(model_worker_batch.seq_lens),
+                    model_worker_batch.real_bs,
+                )
             logits_output, next_token_ids, cache_miss_count, bid, _seq_lens = (
                 self.forward_target_extend(model_worker_batch, sampling_metadata)
             )
+            if _DBG:
+                logger.info(
+                    "DBGRT spec_ext.target_fwd.post nti.shape=%s",
+                    getattr(next_token_ids, "shape", None),
+                )
             if model_worker_batch.dp_size > 1:
                 from jax.experimental.multihost_utils import process_allgather
 
+                if _DBG:
+                    logger.info(
+                        "DBGRT spec_ext.block_ready.pre sharding=%s",
+                        getattr(next_token_ids, "sharding", None),
+                    )
+                    jax.block_until_ready(next_token_ids)
+                    logger.info("DBGRT spec_ext.block_ready.post")
+                    logger.info("DBGRT spec_ext.allgather.pre")
                 next_token_ids = process_allgather(next_token_ids, tiled=True)
+                if _DBG:
+                    logger.info("DBGRT spec_ext.allgather.post")
+            if _DBG:
+                logger.info("DBGRT spec_ext.draft_ext.pre")
             self.draft_worker.draft_extend_for_prefill(
                 model_worker_batch, logits_output.hidden_states, next_token_ids
             )
+            if _DBG:
+                logger.info("DBGRT spec_ext.draft_ext.post")
             return GenerationBatchResult(
                 logits_output=logits_output,
                 next_token_ids=next_token_ids,

@@ -1954,6 +1954,21 @@ class Scheduler(
             retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(self.server_args)
             num_retracted_reqs = len(retracted_reqs)
             self.new_token_ratio = new_token_ratio
+            if (
+                self.enable_overlap
+                and self.spec_algorithm is not None
+                and not self.spec_algorithm.is_none()
+            ):
+                # KNOWN ISSUE: spec+overlap retract can deadlock device
+                # collectives on multi-host (fused spec-decode JIT → next
+                # extend). Not a host-timing bug (barrier+sync doesn't help).
+                # Production should size swa-full-tokens-ratio to avoid
+                # retract. Tracked for root-cause via xprof (follow-up).
+                logger.error(
+                    "retract under spec+overlap may deadlock on multi-host; "
+                    "increase --swa-full-tokens-ratio or --mem-fraction-static "
+                    "to avoid KV retract in production"
+                )
 
             # Send abort responses so clients get an error instead of a hung connection
             for req in reqs_to_abort:
