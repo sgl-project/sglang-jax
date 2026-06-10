@@ -3168,6 +3168,15 @@ class ModelWorkerBatch:
     # Whether each request has prior recurrent state (lazy zero-on-read)
     has_initial_state: np.ndarray | None = None
 
+    # In-model multimodal raw inputs (refactor M3): assembled per-batch from req.mm_inputs
+    # for the in-model encode+merge path (vs the staged precomputed multimodal_embedding).
+    # ForwardBatch.init_new consumes these; None for text-only / staged batches.
+    mm_pixel_values: np.ndarray | None = None
+    mm_pixel_values_videos: np.ndarray | None = None
+    mm_grid_thw: tuple | None = None
+    mm_video_grid_thw: tuple | None = None
+    mm_pad_values: tuple | None = None
+
     def get_original_input_len(self):
         """
         return unpadded tokens number for prefill and real batch size for decode
