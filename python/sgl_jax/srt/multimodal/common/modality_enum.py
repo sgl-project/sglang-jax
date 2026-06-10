@@ -8,6 +8,12 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+# Canonical pad_value derivation (refactor M2): pad_values live in
+# [MM_PAD_SHIFT_VALUE, +2**30), provably disjoint from the vocab id space so merge()'s
+# isin(input_ids, pad_values) only matches placeholder rows. multimodal -> mm_core is the
+# allowed (forward) dependency direction.
+from sgl_jax.srt.mm_core.pad_value import derive_pad_value
+
 # Relocated to sgl_jax.srt.utils.common_utils for srt<->multimodal decoupling (refactor M1).
 # Re-exported here for back-compat with existing multimodal imports.
 from sgl_jax.srt.utils.common_utils import flatten_nested_list  # noqa: F401
@@ -218,10 +224,12 @@ class MultimodalDataItem:
                 hashed_feature = self.precomputed_embeddings
             self.hash = hash_feature(hashed_feature)
         assert self.hash is not None
-        # Use a smaller modulo to keep pad_value in a reasonable range
-        # The pad_value is used for radix cache differentiation, not for embedding lookup
-        # We use a 24-bit range which gives ~16M unique values, sufficient for cache keys
-        self.pad_value = self.hash % (1 << 24)
+        # Canonical derivation (refactor M2): pad_value in [MM_PAD_SHIFT_VALUE, +2**30),
+        # disjoint from the vocab id space. This is the single authority for pad_value;
+        # pad_input_tokens writes it into input_ids and merge() keys on it (same source ->
+        # consistent). The prior ``hash % (1 << 24)`` could collide with real token ids,
+        # which would make merge()'s isin() false-match text tokens.
+        self.pad_value = derive_pad_value(self.hash)
 
     def is_modality(self, modality: Modality) -> bool:
         return self.modality == modality

@@ -32,6 +32,7 @@ from sgl_jax.srt.layers.embeddings import ParallelLMHead
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.mem_cache.memory_pool import MemoryPools
 from sgl_jax.srt.mm_core.merge import merge
+from sgl_jax.srt.mm_core.pad_value import MM_PAD_SHIFT_VALUE
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.multimodal.configs.qwen_vl.qwen_2_5_vl_config import (
     QwenVLModelVitConfig,
@@ -116,7 +117,15 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
     ):
         is_extend = forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
         if is_extend and forward_batch.contains_mm_inputs():
-            text_embed = self.model.embed_tokens(forward_batch.input_ids)
+            # Placeholder rows carry pad_values (>= MM_PAD_SHIFT_VALUE, out of vocab range
+            # after pad_input_tokens). Clamp them to a safe in-vocab id for the embed_tokens
+            # lookup -- merge() overwrites those exact rows with the real modality features,
+            # so the dummy text embedding there is discarded. merge() still receives the
+            # ORIGINAL pad-value-laden input_ids to build its isin() placeholder mask.
+            safe_ids = jnp.where(
+                forward_batch.input_ids >= MM_PAD_SHIFT_VALUE, 0, forward_batch.input_ids
+            )
+            text_embed = self.model.embed_tokens(safe_ids)
             mod_embeds = []
             if forward_batch.mm_pixel_values is not None:
                 mod_embeds.append(
