@@ -11,7 +11,6 @@ from http import HTTPStatus
 from typing import TYPE_CHECKING
 
 import jax
-import jax.numpy as jnp
 
 from sgl_jax.srt.disaggregation.base.kv_manager import KVPoll
 from sgl_jax.srt.disaggregation.jax_transfer.conn import (
@@ -203,6 +202,7 @@ class SchedulerDisaggregationPrefillMixin:
                 sender.attach_payload(
                     {"kv": device_kv},
                     use_d2h_staging=self.disagg_use_d2h_staging,
+                    buffer_id=getattr(req, "disagg_host_buffer_id", None),
                 )
                 self._pd_mark_time(req, "transfer_start")
                 sender.send()
@@ -264,7 +264,7 @@ class SchedulerDisaggregationPrefillMixin:
     def _extract_req_kv(self: Scheduler, req: Req):
         """Gather prefilled KV from the paged pool for ``req``.
 
-        Returns shape ``(layer_num, padded_pages, page_size, ...)``.
+        Returns a per-layer list of ``(padded_pages, page_size, ...)`` arrays.
         """
 
         req_to_token = self.req_to_token_pool.req_to_token
@@ -299,7 +299,7 @@ class SchedulerDisaggregationPrefillMixin:
             )
         ]
         layer_kvs = _jit_gather_all_layers(layer_buffers, page_indices, gather_out_sharding)
-        return jnp.stack(layer_kvs, axis=0)
+        return layer_kvs
 
     def _release_prefill_req_resources(self: Scheduler, req: Req) -> None:
         """Release prefill-side KV and request-pool resources."""
@@ -307,6 +307,18 @@ class SchedulerDisaggregationPrefillMixin:
         from sgl_jax.srt.mem_cache.common import release_kv_cache
 
         release_kv_cache(req, self.tree_cache)
+        self._release_prefill_host_buffer(req)
+
+    def _release_prefill_host_buffer(self: Scheduler, req: Req) -> None:
+        buffer_id = getattr(req, "disagg_host_buffer_id", None)
+        if buffer_id is None:
+            return
+        req.disagg_host_buffer_id = None
+        mgr = getattr(self, "disagg_kv_manager", None)
+        pool = mgr.host_pool if mgr is not None else None
+        if pool is not None:
+            with suppress(Exception):
+                pool.release(buffer_id)
 
     def _record_prefill_transfer_failure(self, reason: str) -> None:
         with suppress(Exception):
