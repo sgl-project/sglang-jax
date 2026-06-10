@@ -25,11 +25,16 @@ def sanitize_marker_value(value: str) -> str:
     return str(value).replace("\n", " ").replace("--", "-").strip()
 
 
-def build_marker(workflow_name: str, job_name: str, failure_type: str) -> str:
+def build_marker(workflow_name: str, job_name: str) -> str:
+    """Dedupe marker keyed by (workflow, job) only.
+
+    failure_type is intentionally excluded: a flaky job whose inferred type
+    shifts (timeout one night, assertion the next) must still map to one issue.
+    The current type lives in the issue title/body instead.
+    """
     workflow = sanitize_marker_value(workflow_name)
     job = sanitize_marker_value(job_name)
-    kind = sanitize_marker_value(failure_type)
-    return f"<!-- {ISSUE_MARKER_PREFIX}:workflow={workflow};job={job};failure_type={kind} -->"
+    return f"<!-- {ISSUE_MARKER_PREFIX}:workflow={workflow};job={job} -->"
 
 
 def load_classification(path: str) -> list[dict[str, Any]]:
@@ -216,7 +221,7 @@ def process_failed_jobs(
     for job in failed_jobs:
         if is_finish_gate(job["name"]):
             continue
-        marker = build_marker(workflow_name, job["name"], job["failure_type"])
+        marker = build_marker(workflow_name, job["name"])
         job_analysis = analysis.get(job["name"])
         try:
             existing = find_open_issue(repo, marker)
