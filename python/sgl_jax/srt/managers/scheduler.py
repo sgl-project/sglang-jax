@@ -1059,7 +1059,8 @@ class Scheduler(
                 )
                 if _chain_relax:
                     _all_full = all(
-                        i.batch_is_full for i in self.running_batch.reqs_info
+                        len(i.reqs or []) >= self.per_dp_max_running_requests
+                        for i in self.running_batch.reqs_info
                     )
                     will_reshape = (
                         _has_chunked
