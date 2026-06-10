@@ -1020,10 +1020,7 @@ def _mla_ragged_paged_attention_kernel(
                 _update_kv_cache(start_seq_idx, b, bkv_sem_idx, offset, update_sz, wait=True)
 
     def load_bq(bq_sem_idx, *, actual_bq_sz=bq_sz):
-        q_nope_ref = (
-            bq_nope_x2_ref.bitcast(jnp.uint32)
-            .at[bq_sem_idx]
-        )
+        q_nope_ref = bq_nope_x2_ref.bitcast(jnp.uint32).at[bq_sem_idx]
         q_nope_val = q_nope_ref[...]
         q_nope_val = q_nope_val.reshape(batch_size, bq_sz * num_q_heads_per_q_packing, lkv_dim)
         q_nope_vec = pltpu.bitcast(
@@ -1031,10 +1028,7 @@ def _mla_ragged_paged_attention_kernel(
             q_dtype,
         ).reshape(batch_size, actual_bq_sz * num_q_heads, lkv_dim)
 
-        q_rope_ref = (
-            bq_rope_x2_ref.bitcast(jnp.uint32)
-            .at[bq_sem_idx]
-        )
+        q_rope_ref = bq_rope_x2_ref.bitcast(jnp.uint32).at[bq_sem_idx]
         q_rope_val = q_rope_ref[...]
         q_rope_val = q_rope_val.reshape(batch_size, bq_sz * num_q_heads_per_q_packing, r_dim)
         q_rope_vec = pltpu.bitcast(
@@ -1048,16 +1042,10 @@ def _mla_ragged_paged_attention_kernel(
         bkvc_vecs = []
         bkpe_vecs = []
         for b in range(batch_size):
-            bkvc_ref = (
-                bkvc_x2_ref.bitcast(jnp.uint32)
-                .at[bkv_sem_idx, b, :bkv_sz_per_kv_packing]
-            )
+            bkvc_ref = bkvc_x2_ref.bitcast(jnp.uint32).at[bkv_sem_idx, b, :bkv_sz_per_kv_packing]
             bkvc_vec = pltpu.bitcast(bkvc_ref[...], kv_dtype).reshape(bkv_sz, lkv_dim)
 
-            bkpe_ref = (
-                bkpe_x2_ref.bitcast(jnp.uint32)
-                .at[bkv_sem_idx, b, :bkv_sz_per_kv_packing]
-            )
+            bkpe_ref = bkpe_x2_ref.bitcast(jnp.uint32).at[bkv_sem_idx, b, :bkv_sz_per_kv_packing]
             bkpe_vec = pltpu.bitcast(bkpe_ref[...], kv_dtype).reshape(bkv_sz, r_dim)
             bkvc_vecs.append(bkvc_vec)
             bkpe_vecs.append(bkpe_vec)

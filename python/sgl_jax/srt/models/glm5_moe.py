@@ -9,6 +9,7 @@ from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig, MoEBackend
 from sgl_jax.srt.eplb.expert_location import ExpertLocationMetadata
+from sgl_jax.srt.kernels.fused_mlp import apply_fused_mlp_with_padding
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, RotaryEmbedding
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
@@ -21,7 +22,6 @@ from sgl_jax.srt.layers.moe import (
     create_moe_weights_mapping,
 )
 from sgl_jax.srt.layers.radix_attention import RadixAttention
-from sgl_jax.srt.kernels.fused_mlp import apply_fused_mlp_with_padding
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
@@ -501,7 +501,7 @@ class Glm5MLP(nnx.Module):
         if use_fused:
             tp_size = mesh.shape["tensor"]
             local_inter_size = intermediate_size // tp_size
-            
+
             # Dynamically choose block size (B_INTER) based on local intermediate size
             # to ensure that num_blocks is always a multiple of the TP size.
             if local_inter_size >= 128:
@@ -529,15 +529,15 @@ class Glm5MLP(nnx.Module):
     def post_load_weights(self):
         if not self.use_fused:
             return
-        
+
         wg = self.gate_proj.weight.value
         wu = self.up_proj.weight.value
         wd = self.down_proj.weight.value
-        
+
         # Use dynamically chosen block size
         b_inter = self.b_inter
         hidden_size, local_inter_size = wg.shape
-        
+
         # Pad local intermediate dimension to a multiple of b_inter
         pad_inter = (b_inter - (local_inter_size % b_inter)) % b_inter
         if pad_inter > 0:
@@ -550,19 +550,23 @@ class Glm5MLP(nnx.Module):
         # specify the sharding for the split/merged dimensions under JAX SPMD.
         num_blocks = local_inter_size // b_inter
         sharding_3d = jax.sharding.NamedSharding(self.mesh, P(None, "tensor", None))
-        wg_reshaped = jax.lax.reshape(wg, (hidden_size, num_blocks, b_inter), out_sharding=sharding_3d)
-        wu_reshaped = jax.lax.reshape(wu, (hidden_size, num_blocks, b_inter), out_sharding=sharding_3d)
-        
+        wg_reshaped = jax.lax.reshape(
+            wg, (hidden_size, num_blocks, b_inter), out_sharding=sharding_3d
+        )
+        wu_reshaped = jax.lax.reshape(
+            wu, (hidden_size, num_blocks, b_inter), out_sharding=sharding_3d
+        )
+
         # Concat along block dimension and flatten
         w_gu = jnp.concatenate([wg_reshaped, wu_reshaped], axis=-1)
-        
+
         sharding_2d = jax.sharding.NamedSharding(self.mesh, P(None, "tensor"))
         w_gu = jax.lax.reshape(w_gu, (hidden_size, local_inter_size * 2), out_sharding=sharding_2d)
-        
+
         # Assign values directly to pre-allocated sharded parameters
         self.w_gu.value = w_gu
         self.w_d.value = wd
-        
+
         # Free original projection modules to save HBM
         self.gate_proj = None
         self.up_proj = None
@@ -581,7 +585,7 @@ class Glm5MLP(nnx.Module):
                 b_seq=b_seq,
                 b_inter=self.b_inter,
             )
-            
+
         # Fallback non-fused path
         a1, _ = self.gate_proj(hidden_states)
         a2, _ = self.up_proj(hidden_states)
@@ -895,7 +899,11 @@ class Glm5ForCausalLM(nnx.Module):
             layer.self_attn.post_load_weights()
             if hasattr(layer, "mlp") and hasattr(layer.mlp, "post_load_weights"):
                 layer.mlp.post_load_weights()
-            if hasattr(layer, "shared_experts") and layer.shared_experts is not None and hasattr(layer.shared_experts, "post_load_weights"):
+            if (
+                hasattr(layer, "shared_experts")
+                and layer.shared_experts is not None
+                and hasattr(layer.shared_experts, "post_load_weights")
+            ):
                 layer.shared_experts.post_load_weights()
         logger.info("Absorbed MLA weights and Fused MLP weights processed successfully!")
 

@@ -18,6 +18,7 @@ from transformers import (
     PreTrainedTokenizerBase,
     PreTrainedTokenizerFast,
 )
+from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
 from sgl_jax.srt.configs.bailing_hybrid import BailingHybridConfig
@@ -35,8 +36,6 @@ class GlmMoeDsaConfig(PretrainedConfig):
     model_type = "glm_moe_dsa"
 
 
-from transformers.models.auto.configuration_auto import CONFIG_MAPPING
-
 _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
     cls.model_type: cls
     for cls in [
@@ -50,7 +49,8 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
 if "glm_moe_dsa" not in CONFIG_MAPPING:
     with contextlib.suppress(Exception):
         from transformers.models.auto.tokenization_auto import TOKENIZER_MAPPING
-        TOKENIZER_MAPPING._reverse_config_mapping['GlmMoeDsaConfig'] = 'gpt2'
+
+        TOKENIZER_MAPPING._reverse_config_mapping["GlmMoeDsaConfig"] = "gpt2"
 
 # Register local configs; suppress() defers to stock on a name clash (fine for
 # bailing/kimi which don't clash, and for the glm stub where stock is preferable).
@@ -294,10 +294,11 @@ def get_tokenizer(
     # Workaround: Intercept TokenizersBackend and list-type extra_special_tokens
     # to prevent loading failure in transformers < 5.0
     import json
+
     tokenizer_config_path = os.path.join(tokenizer_name, "tokenizer_config.json")
     if os.path.exists(tokenizer_config_path):
         try:
-            with open(tokenizer_config_path, "r", encoding="utf-8") as f:
+            with open(tokenizer_config_path, encoding="utf-8") as f:
                 config_data = json.load(f)
             is_patched = False
             if config_data.get("tokenizer_class") == "TokenizersBackend":
@@ -308,14 +309,27 @@ def get_tokenizer(
                 is_patched = True
 
             # Simplify dict-valued special tokens to strings to avoid transformers TypeError
-            special_token_keys = ["bos_token", "eos_token", "unk_token", "pad_token", "sep_token", "cls_token", "mask_token"]
+            special_token_keys = [
+                "bos_token",
+                "eos_token",
+                "unk_token",
+                "pad_token",
+                "sep_token",
+                "cls_token",
+                "mask_token",
+            ]
             for key in special_token_keys:
-                if key in config_data and isinstance(config_data[key], dict):
-                    if "content" in config_data[key]:
-                        config_data[key] = config_data[key]["content"]
-                        is_patched = True
-            
-            if "additional_special_tokens" in config_data and isinstance(config_data["additional_special_tokens"], list):
+                if (
+                    key in config_data
+                    and isinstance(config_data[key], dict)
+                    and "content" in config_data[key]
+                ):
+                    config_data[key] = config_data[key]["content"]
+                    is_patched = True
+
+            if "additional_special_tokens" in config_data and isinstance(
+                config_data["additional_special_tokens"], list
+            ):
                 new_additional = []
                 for token in config_data["additional_special_tokens"]:
                     if isinstance(token, dict) and "content" in token:

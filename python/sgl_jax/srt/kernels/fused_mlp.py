@@ -7,11 +7,12 @@ into a single pipelined TPU kernel, completely eliminating intermediate HBM traf
 from __future__ import annotations
 
 import functools
+
 import jax
+import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.shard_map import shard_map
-import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 
 
@@ -34,9 +35,7 @@ def inner_mlp_kernel(
         w_gu_sram = w_gu_tile[...].astype(x_tile.dtype)
 
         # 2. Matmul 1 (x @ W_in)
-        hu_sram = jnp.matmul(
-            x_tile[...], w_gu_sram, preferred_element_type=jnp.float32
-        )
+        hu_sram = jnp.matmul(x_tile[...], w_gu_sram, preferred_element_type=jnp.float32)
 
         # Split and Activate (SiLU Swish-gated activation)
         h_sram = hu_sram[:, :b_inter]
@@ -46,15 +45,10 @@ def inner_mlp_kernel(
 
         # 3. Matmul 2 (a @ W_out)
         wd_sram = wd_tile[...].astype(x_tile.dtype)
-        y_current_sram = jnp.matmul(
-            a_tile, wd_sram, preferred_element_type=jnp.float32
-        )
+        y_current_sram = jnp.matmul(a_tile, wd_sram, preferred_element_type=jnp.float32)
 
         # 4. Accumulate
-        if is_first:
-            acc = y_current_sram
-        else:
-            acc = y_scratch[...] + y_current_sram
+        acc = y_current_sram if is_first else y_scratch[...] + y_current_sram
 
         if is_last:
             y_tile[...] = acc.astype(y_tile.dtype)
@@ -89,9 +83,7 @@ def inner_mlp_kernel(
     )
 
 
-def mlp_kernel_main(
-    x_hbm, w_gu_hbm, wd_hbm, y_hbm, y_scratch, *, b_seq, b_inter, hidden_size
-):
+def mlp_kernel_main(x_hbm, w_gu_hbm, wd_hbm, y_hbm, y_scratch, *, b_seq, b_inter, hidden_size):
     """Entry point for Pallas grid. Wires up HBM references to the pipeline."""
     seq_idx = pl.program_id(0)
     num_inter = w_gu_hbm.shape[1] // (2 * b_inter)
@@ -155,7 +147,7 @@ def apply_fused_mlp_sharded(
     )
     def local_fused_mlp(x_loc, w_gu_loc, wd_loc):
         seq_len, hidden_size = x_loc.shape
-        
+
         # 1D outer grid (parallelizing sequence length across TPU cores)
         grid = (seq_len // b_seq,)
 

@@ -1,6 +1,6 @@
 import functools
-from math import inf
 import sys
+from math import inf
 
 import jax
 import jax.numpy as jnp
@@ -141,11 +141,15 @@ def benchmark_backend(
 
 def main():
     import os
+
     coordinator_address = os.environ.get("JAX_COORDINATOR_ADDRESS", None)
     num_processes = int(os.environ.get("JAX_PROCESS_COUNT", 1))
     process_id = int(os.environ.get("JAX_PROCESS_INDEX", 0))
     if coordinator_address:
-        print(f"Initializing JAX distributed explicitly: coordinator={coordinator_address}, num_processes={num_processes}, process_id={process_id}", flush=True)
+        print(
+            f"Initializing JAX distributed explicitly: coordinator={coordinator_address}, num_processes={num_processes}, process_id={process_id}",
+            flush=True,
+        )
         jax.distributed.initialize(
             coordinator_address=coordinator_address,
             num_processes=num_processes,
@@ -166,25 +170,21 @@ def main():
     if tune_only_glm5:
         print("Tuning exclusively for GLM-5.1 (TP=32) configuration.")
         page_size_config = [64, 128, 256]
-        max_num_batched_tokens_config = [
-            1, 2, 4, 8, 16, 32, 64, 8192, 16384
-        ]
+        max_num_batched_tokens_config = [1, 2, 4, 8, 16, 32, 64, 8192, 16384]
         # Query heads per rank: 64 total heads / TP size (TP=32 -> 2)
-        q_head_num_config = [2] 
+        q_head_num_config = [2]
         kv_lora_rank_config = [512]
         qk_rope_head_dim_config = [64]
     else:
         page_size_config = [128, 256]
-        max_num_batched_tokens_config = [
-            1, 4, 16, 64, 256, 1024, 4096, 8192
-        ]
+        max_num_batched_tokens_config = [1, 4, 16, 64, 256, 1024, 4096, 8192]
         q_head_num_config = [2, 4, 8, 16]
         kv_lora_rank_config = [512]
         qk_rope_head_dim_config = [64]
 
     max_kv_cache_tokens_config = [600000]
     max_context_len = 40960
-    
+
     all_combinations = []
     for q_head_num in q_head_num_config:
         for kv_lora_rank in kv_lora_rank_config:
@@ -266,9 +266,13 @@ def main():
                 err_str = str(e)
                 if "RESOURCE_EXHAUSTED" in err_str or "vmem limit" in err_str:
                     if jax.process_index() == 0:
-                        print(f"  [Skipped OOM] (num_kv_pages_per_blk={num_kv_pages_per_blk}, num_queries_per_block={num_queries_per_block}) due to Vector Memory (VMEM) limits.", flush=True)
+                        print(
+                            f"  [Skipped OOM] (num_kv_pages_per_blk={num_kv_pages_per_blk}, num_queries_per_block={num_queries_per_block}) due to Vector Memory (VMEM) limits.",
+                            flush=True,
+                        )
                 else:
                     import traceback
+
                     traceback.print_exc()
         if jax.process_index() == 0 and best_config:
             # Output in the new upstream format for easy copying to tuned_block_sizes.py
@@ -277,7 +281,7 @@ def main():
                 value_str = f"({best_config[0]}, 1, 4)"
             else:
                 value_str = f"({best_config[0]}, {best_config[1]})"
-            
+
             print(
                 f"        ('{case_label}', '{q_dtype}', '{k_dtype}', {q_head_num}, {kv_lora_rank}, {qk_rope_head_dim}, {page_size}, {max_num_batched_tokens}): {value_str},  # Best latency: {best_output:.4f} ms",
                 flush=True,
