@@ -11,26 +11,15 @@ matharena strict_parsing=False fallback to the last bare integer, then
 normalization to the 0..999 integer range.
 """
 
-import argparse
-import json
-import os
 import re
-import sys
-import time
-from pathlib import Path
-
-if __package__ in (None, ""):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import eval.simple_eval_common as common
 from eval.simple_eval_common import (
     HTML_JINJA,
-    ChatCompletionSampler,
     Eval,
     EvalResult,
     SamplerBase,
     SingleEvalResult,
-    make_report,
 )
 
 QUERY_TEMPLATE = """Put your final answer within \\boxed{{}}.
@@ -152,80 +141,3 @@ class AIME26Eval(Eval):
 
         results = common.map_with_progress(fn, self.examples, num_threads=self.num_threads)
         return common.aggregate_results(results)
-
-
-def get_openai_base_url(args: argparse.Namespace) -> str:
-    if args.base_url:
-        base_url = args.base_url.rstrip("/")
-    else:
-        base_url = f"http://{args.host}:{args.port}"
-    return base_url if base_url.endswith("/v1") else f"{base_url}/v1"
-
-
-def build_chat_completion_sampler(args: argparse.Namespace) -> ChatCompletionSampler:
-    extra_body = {}
-    if args.top_k is not None:
-        extra_body["top_k"] = args.top_k
-
-    return ChatCompletionSampler(
-        base_url=get_openai_base_url(args),
-        model=args.model,
-        temperature=args.temperature,
-        max_tokens=args.max_tokens,
-        top_p=args.top_p,
-        extra_body=extra_body or None,
-    )
-
-
-def run_eval(args: argparse.Namespace) -> dict[str, float]:
-    common.set_ulimit()
-    if "OPENAI_API_KEY" not in os.environ:
-        os.environ["OPENAI_API_KEY"] = "EMPTY"
-
-    eval_obj = AIME26Eval(args.num_examples, args.num_threads)
-    sampler = build_chat_completion_sampler(args)
-
-    tic = time.perf_counter()
-    result = eval_obj(sampler)
-    latency = time.perf_counter() - tic
-
-    metrics = result.metrics | {"score": result.score}
-    model_name = sampler.model.replace("/", "_")
-    report_filename = f"/tmp/aime26_{model_name}.html"
-    with open(report_filename, "w") as fh:
-        fh.write(make_report(result))
-    print(f"Writing report to {report_filename}")
-
-    result_filename = f"/tmp/aime26_{model_name}.json"
-    with open(result_filename, "w") as f:
-        f.write(json.dumps(metrics, indent=2))
-    print(f"Writing results to {result_filename}")
-
-    print(metrics)
-    print(f"Total latency: {latency:.3f} s")
-    print(f"Score: {metrics['score']:.3f}")
-    return metrics
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run the AIME 2026 simple eval.")
-    parser.add_argument(
-        "--base-url",
-        type=str,
-        default=None,
-        help="Server base URL, with or without a trailing /v1.",
-    )
-    parser.add_argument("--host", type=str, default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=30000)
-    parser.add_argument("--model", type=str, default=None)
-    parser.add_argument("--num-examples", type=int, default=None)
-    parser.add_argument("--num-threads", type=int, default=64)
-    parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--max-tokens", type=int, default=2048)
-    parser.add_argument("--top-p", type=float, default=None)
-    parser.add_argument("--top-k", type=int, default=None)
-    return parser.parse_args()
-
-
-if __name__ == "__main__":
-    run_eval(parse_args())
