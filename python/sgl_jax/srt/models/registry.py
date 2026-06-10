@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 # ``sgl_jax.srt.models`` and removes this list.
 _UNDERSTANDING_MM_MODEL_MODULES = [
     "sgl_jax.srt.multimodal.models.qwen2_5VL.qwen2_5_vl",
+    "sgl_jax.srt.multimodal.models.qwen3_omni_moe.qwen3_omni_inmodel",
 ]
 
 

@@ -1,0 +1,177 @@
+"""In-model Qwen3-Omni Thinker (understanding, text-out) — refactor M5.
+
+Mirrors the Qwen2.5-VL in-model template (srt/multimodal/models/qwen2_5VL/qwen2_5_vl.py):
+vision (and audio) are encoded inside the model forward and fused via mm_core.merge() on the
+standard srt control plane -- no staged GlobalScheduler / embed stage / host roundtrip.
+
+What's new vs Qwen2.5-VL (see tmp/refactor/m5-qwen3omni-map.md):
+  - DEEPSTACK: the vision encoder emits 3 multi-scale feature levels; merge() densifies them
+    into FusedEmbed.deepstack_embed = [num_levels, seq, hidden]; the wrapper stamps
+    forward_batch.deepstack_visual_embedding + apply_for_deepstack, and the AR body adds
+    level i to the hidden states after layer i (Qwen3OmniMoeThinkerTextModel already does this,
+    so no AR change).
+  - self.model is the complete Qwen3OmniMoeThinkerTextForConditionalGeneration (embed -> AR ->
+    logits, already reads input_embedding / deepstack / mrope), so the wrapper only stamps the
+    ForwardBatch fields and passes through.
+  - MoE AR body (launch with --moe-backend epmoe; moe_intermediate_size=768 crashes fused).
+
+NOTE (validation status): structure mirrors the staged stage + the validated Qwen2.5-VL
+template; construct(eval_shape)/weight-load/forward are validated incrementally on the TPU
+dev pod. Audio (continuous-mel tower, audio_kind="features") is built for weight-load but the
+forward audio path is a follow-up that needs ForwardBatch audio plumbing (mm_audio_features).
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import logging
+
+import jax
+import jax.numpy as jnp
+from flax import nnx
+
+from sgl_jax.srt.mm_core.merge import merge
+from sgl_jax.srt.mm_core.pad_value import MM_PAD_SHIFT_VALUE
+from sgl_jax.srt.multimodal.models.qwen3_omni_moe.audio_encoder import (
+    Qwen3OmniMoeAudioEncoder,
+)
+from sgl_jax.srt.multimodal.models.qwen3_omni_moe.qwen3_omni_thinker import (
+    Qwen3OmniMoeThinkerTextForConditionalGeneration,
+)
+from sgl_jax.srt.multimodal.models.qwen3_omni_moe.qwen3_omni_thinker_embedding import (
+    Qwen3OmniMoeThinkerEmbedding,
+)
+from sgl_jax.srt.multimodal.models.qwen3_omni_moe.vision_encoder import (
+    Qwen3OmniMoeVisionEncoder,
+)
+
+logger = logging.getLogger(__name__)
+
+
+def _thinker_config(config):
+    """The HF Qwen3-Omni config nests everything under thinker_config."""
+    return getattr(config, "thinker_config", config)
+
+
+class Qwen3OmniMoeForConditionalGeneration(nnx.Module):
+    """Image/video (+audio) understanding, text-out, in-model on the standard scheduler.
+
+    Named to match hf_config.architectures (['Qwen3OmniMoeForConditionalGeneration']) so the
+    standard ModelRegistry resolves it. Serves the Thinker (understanding / text-out) path;
+    the Talker (speech-out) is generation-plane and out of scope here.
+    """
+
+    audio_kind = "features"  # continuous mel (vs MiMo's "codes")
+    has_deepstack = True
+
+    def __init__(self, config=None, dtype=None, mesh=None):
+        super().__init__()
+        self.mesh = mesh
+        self.config = config
+        self.dtype = dtype or jnp.bfloat16
+        thinker = _thinker_config(config)
+        self.thinker_config = thinker
+
+        # Vision tower -> {pooler_output, deepstack_features: [tuple of per-level [N, hidden]]}.
+        self.visual = Qwen3OmniMoeVisionEncoder(
+            thinker.vision_config, mesh=mesh, dtype=self.dtype, rngs=None
+        )
+        # Audio tower (continuous mel). Built for weight-load; forward audio path is a follow-up.
+        self.audio_tower = Qwen3OmniMoeAudioEncoder(
+            thinker.audio_config, mesh=mesh, dtype=self.dtype, rngs=None
+        )
+        # AR body = the complete Thinker ForCausalLM (embed -> AR -> logits; reads
+        # input_embedding / deepstack_visual_embedding / apply_for_deepstack / mrope).
+        self.model = Qwen3OmniMoeThinkerTextForConditionalGeneration(
+            thinker.text_config, mesh=mesh, dtype=self.dtype
+        )
+
+        self.image_token_id = getattr(thinker, "image_token_id", None)
+        self.video_token_id = getattr(thinker, "video_token_id", None)
+        self.audio_token_id = getattr(thinker, "audio_token_id", None)
+
+    # ---- per-modality encoders (model-owned towers) ----
+
+    def encode_image(self, pixel_values: jax.Array, grid_thw):
+        """[total_patches, in_dim] + grid_thw -> (pooler [N, hidden], [per-level [N, hidden]])."""
+        out = self.visual(pixel_values, grid_thw)
+        return out["pooler_output"], list(out["deepstack_features"])
+
+    def encode_audio(self, input_features: jax.Array, feature_lens):
+        """Continuous-mel audio -> [N_audio, hidden]. Follow-up: needs ForwardBatch audio fields."""
+        return self.audio_tower(input_features, feature_lens)
+
+    def __call__(self, forward_batch, memory_pools, logits_metadata):
+        is_extend = forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
+        if is_extend and forward_batch.contains_mm_inputs():
+            # Placeholder rows carry pad_values (>= MM_PAD_SHIFT_VALUE, out of vocab). Clamp for
+            # the embed lookup; merge() overwrites those rows with the real features.
+            safe_ids = jnp.where(
+                forward_batch.input_ids >= MM_PAD_SHIFT_VALUE, 0, forward_batch.input_ids
+            )
+            text_embed = self.model.model.embed_tokens(safe_ids)
+
+            mod_embeds = []
+            multiscale = None  # [num_levels, N_visual, hidden]
+            if forward_batch.mm_pixel_values is not None:
+                pool, ds_levels = self.encode_image(
+                    forward_batch.mm_pixel_values, forward_batch.mm_grid_thw
+                )
+                mod_embeds.append(pool)
+                multiscale = jnp.stack(ds_levels, axis=0)
+            if forward_batch.mm_pixel_values_videos is not None:
+                vpool, vds = self.encode_image(
+                    forward_batch.mm_pixel_values_videos, forward_batch.mm_video_grid_thw
+                )
+                mod_embeds.append(vpool)
+                vstack = jnp.stack(vds, axis=0)
+                multiscale = (
+                    vstack if multiscale is None else jnp.concatenate([multiscale, vstack], axis=1)
+                )
+
+            pad_values = list(forward_batch.mm_pad_values or ())
+            # deepstack is visual-only -> key densify on the visual items' pad_values (here all
+            # of mm_pad_values, which are image/video; audio pad_values are not yet plumbed).
+            deepstack = (multiscale, pad_values) if multiscale is not None else None
+            fused = merge(
+                text_embed,
+                mod_embeds,
+                pad_values,
+                forward_batch.input_ids,
+                deepstack=deepstack,
+                mesh=self.mesh,
+            )
+            forward_batch.input_embedding = fused.embed
+            if fused.deepstack_embed is not None:
+                forward_batch.deepstack_visual_embedding = fused.deepstack_embed
+                forward_batch.apply_for_deepstack = True
+
+        return self.model(forward_batch, memory_pools, logits_metadata)
+
+    def load_weights(self, model_config):
+        """Compose the 3 towers' weight mappings: visual.* + audio_tower.* (reused from the
+        staged stage, prefixes already match) + the AR ForCausalLM's mappings under `model.`.
+        """
+        from sgl_jax.srt.utils.weight_utils import WeightLoader
+
+        loader = WeightLoader(
+            model=self, model_config=model_config, mesh=self.mesh, dtype=self.dtype
+        )
+        emb = Qwen3OmniMoeThinkerEmbedding
+        mappings = {}
+        mappings.update(emb._create_visual_weight_mappings(self.thinker_config.vision_config))
+        mappings.update(emb._create_audio_tower_weight_mappings(self.thinker_config.audio_config))
+        # AR mappings target paths relative to the ForCausalLM (model.* / lm_head.*); from this
+        # wrapper self.model IS that module, so prepend "model.".
+        for src, m in self.model._create_qwen3_omni_moe_weight_mappings().items():
+            mappings[src] = dataclasses.replace(m, target_path="model." + m.target_path)
+
+        if self.mesh is not None:
+            with self.mesh:
+                loader.load_weights_from_safetensors(mappings)
+        else:
+            loader.load_weights_from_safetensors(mappings)
+        logger.info("Qwen3-Omni Thinker (in-model) weights loaded: %d mappings", len(mappings))
+
+
+EntryClass = [Qwen3OmniMoeForConditionalGeneration]
