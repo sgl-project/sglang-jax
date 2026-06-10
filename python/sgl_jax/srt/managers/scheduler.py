@@ -1059,16 +1059,18 @@ class Scheduler(
                     )
                 )
                 if not will_reshape:
-                    # Optimistic bump for in-flight round k (CPU mock test
-                    # verified ext=accept when bump is BEFORE prepare_for_decode).
+                    # Optimistic bump for in-flight round k. Must stay bumped
+                    # through BOTH prepare_for_decode (allocate_lens) AND
+                    # run_batch (mwb.seq_lens → cu_kv_lens), so cache_loc stride
+                    # (aligned(allocate_lens)) == cu_kv_lens stride
+                    # (aligned(seq_lens+ndt)). Unbumping before run_batch (v2
+                    # bug) desyncs them by ndt → per_dp>1 page-index drift.
                     bumped = []
                     for info in self.running_batch.reqs_info:
                         if info.seq_lens is not None and len(info.seq_lens) > 0:
                             info.seq_lens = info.seq_lens + ndt
                             bumped.append(info)
                     next_batch = self.get_next_batch_to_run()
-                    for info in bumped:
-                        info.seq_lens = info.seq_lens - ndt
                     if (
                         next_batch is not None
                         and next_batch.forward_mode.is_decode()
@@ -1080,6 +1082,8 @@ class Scheduler(
                     elif next_batch is not None:
                         # will_reshape mispredicted (rare): hand to fallback.
                         fallback_batch = next_batch
+                    for info in bumped:
+                        info.seq_lens = info.seq_lens - ndt
 
     def run_publisher(self, recv_reqs):
         retry_count = 0
