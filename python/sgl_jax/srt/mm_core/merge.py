@@ -54,7 +54,7 @@ def merge(
     mod_embeds: list[jax.Array],
     pad_values: list[int],
     input_ids: jax.Array,
-    deepstack: jax.Array | None = None,
+    deepstack: tuple | None = None,
     *,
     mesh: jax.sharding.Mesh | None = None,
 ) -> FusedEmbed:
@@ -68,7 +68,13 @@ def merge(
       pad_values: per-item pad_value ints; rows where ``input_ids == pad_values[i]`` are
         item i's placeholders. Used to build the placeholder membership mask.
       input_ids: ``[seq]`` int array; placeholder rows hold their item's pad_value.
-      deepstack: optional precomputed deepstack side-channel, carried through to the result.
+      deepstack: optional ``(features, visual_pad_values)`` for models with deepstack visual
+        embeddings (Qwen3-VL/Omni). ``features`` is ``[num_levels, n_visual_tokens, hidden]``
+        (per-level multi-scale visual features, ordered like the visual placeholder rows);
+        ``visual_pad_values`` are the pad_values of the VISUAL items only. merge densifies
+        these into ``FusedEmbed.deepstack_embed`` = ``[num_levels, seq, hidden]`` (visual rows
+        hold the features, all other rows 0) so the AR body can add level i to hidden states
+        after layer i. None for non-deepstack models.
       mesh: optional embed mesh; when set, operands are resharded to full replication
         (jax.sharding.reshard) before the scatter (contract rule 3).
 
@@ -80,10 +86,13 @@ def merge(
     """
     # No multimodal items -> pure-text passthrough.
     if not mod_embeds:
-        return FusedEmbed(embed=text_embed, deepstack_embed=deepstack)
+        return FusedEmbed(embed=text_embed)
 
     all_features = jnp.concatenate(mod_embeds, axis=0)  # [sum_i N_i, hidden], item order
     placeholder = jnp.asarray(list(pad_values), dtype=input_ids.dtype)
+    ds_features = ds_pad_values = None
+    if deepstack is not None:
+        ds_features, ds_pad_values = deepstack
 
     # Contract rule 3: full replication before scatter on a sharded embed mesh. Use
     # jax.sharding.reshard (NOT with_sharding_constraint): under the standard AR mesh whose
@@ -99,6 +108,8 @@ def merge(
         # on a 'data'-sharded mask fails (its bincount/scatter internals can't resolve the
         # 'data' spec under this mesh). Replicating here keeps mask/positions/scatter aligned.
         input_ids = jax.sharding.reshard(input_ids, repl)
+        if ds_features is not None:
+            ds_features = jax.sharding.reshard(ds_features, repl)
 
     seq_len = text_embed.shape[0]
     # Contract rules 1+2: placeholder mask by pad_value membership, ordered positions.
@@ -107,4 +118,21 @@ def merge(
     # and are dropped by mode="drop" -> a count mismatch never overwrites a text row.
     positions = jnp.nonzero(mask, size=all_features.shape[0], fill_value=seq_len)[0]
     fused = text_embed.at[positions, :].set(all_features, mode="drop")
-    return FusedEmbed(embed=fused, deepstack_embed=deepstack)
+
+    # Deepstack side-channel: densify per-level visual features into [num_levels, seq, hidden]
+    # aligned to the visual placeholder rows (keyed by the visual items' pad_values, so audio
+    # placeholders are excluded). Non-visual rows stay 0 -> the AR's per-layer add is a no-op
+    # there.
+    deepstack_embed = None
+    if ds_features is not None:
+        ds_placeholder = jnp.asarray(list(ds_pad_values), dtype=input_ids.dtype)
+        ds_positions = jnp.nonzero(
+            jnp.isin(input_ids, ds_placeholder),
+            size=ds_features.shape[1],
+            fill_value=seq_len,
+        )[0]
+        num_levels, _, hidden = ds_features.shape
+        ds_dense = jnp.zeros((num_levels, seq_len, hidden), dtype=ds_features.dtype)
+        deepstack_embed = ds_dense.at[:, ds_positions, :].set(ds_features, mode="drop")
+
+    return FusedEmbed(embed=fused, deepstack_embed=deepstack_embed)
