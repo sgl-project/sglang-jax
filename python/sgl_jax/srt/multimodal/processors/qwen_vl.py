@@ -15,7 +15,6 @@ import base64
 import io
 import logging
 import os
-import tempfile
 
 import numpy as np
 
@@ -95,40 +94,43 @@ def _load_image(source):
 
 
 def _load_audio(source, sampling_rate):
-    """Decode an audio source -> mono waveform at sampling_rate. Accepts a pre-loaded np
-    waveform, raw bytes, a base64 / data: URI, a local path, or an http(s) URL. Ported from
-    MultimodalTokenizer._load_audio_from_source (librosa lazy-imported)."""
+    """Decode an audio source -> mono float32 waveform at sampling_rate. Accepts a pre-loaded
+    np waveform, raw bytes, a base64 / data: URI, a local path, or an http(s) URL. Uses
+    soundfile (libsndfile) -- robust and avoids librosa's msgpack-version fragility on some
+    images; resamples via linear interp when the source rate differs."""
     if isinstance(source, np.ndarray):
-        return source
-    import librosa
+        return source.astype("float32")
+    import soundfile as sf
 
-    def _from_bytes(b):
-        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
-            tmp.write(b)
-            path = tmp.name
-        try:
-            wav, _ = librosa.load(path, sr=sampling_rate)
-            return wav
-        finally:
-            os.unlink(path)
+    def _decode(raw):
+        data, sr = sf.read(io.BytesIO(raw), dtype="float32", always_2d=False)
+        if getattr(data, "ndim", 1) > 1:
+            data = data.mean(axis=1)
+        if sr != sampling_rate and len(data) > 0:
+            n = int(round(len(data) * sampling_rate / sr))
+            data = np.interp(
+                np.linspace(0, len(data), n, endpoint=False),
+                np.arange(len(data)),
+                data,
+            ).astype("float32")
+        return data
 
     if isinstance(source, dict) and "url" in source:
         source = source["url"]
     if hasattr(source, "url"):
         source = source.url
     if isinstance(source, bytes):
-        return _from_bytes(source)
+        return _decode(source)
     if isinstance(source, str) and source.startswith("data:") and "base64," in source:
-        return _from_bytes(base64.b64decode(source.split("base64,", 1)[1]))
+        return _decode(base64.b64decode(source.split("base64,", 1)[1]))
     if isinstance(source, str) and os.path.exists(source):
-        wav, _ = librosa.load(source, sr=sampling_rate)
-        return wav
+        return _decode(open(source, "rb").read())
     if isinstance(source, str) and source.startswith(("http://", "https://")):
         import requests
 
-        return _from_bytes(requests.get(source, timeout=10).content)
+        return _decode(requests.get(source, timeout=10).content)
     if isinstance(source, str):
-        return _from_bytes(base64.b64decode(source, validate=True))
+        return _decode(base64.b64decode(source, validate=True))
     raise ValueError("Unsupported audio source format")
 
 
