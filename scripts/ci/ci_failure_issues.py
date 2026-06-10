@@ -220,6 +220,11 @@ def process_failed_jobs(
         job_analysis = analysis.get(job["name"])
         try:
             existing = find_open_issue(repo, marker)
+            if not existing:
+                # Re-check right before creating: narrows (does not close —
+                # GitHub has no atomic issue upsert) the window where a manual
+                # rerun races the automatic workflow_run.
+                existing = find_open_issue(repo, marker)
             if existing:
                 add_issue_comment(
                     repo,
@@ -240,47 +245,24 @@ def process_failed_jobs(
                 issue_number = int(existing["number"])
                 issue_url = existing["url"]
             else:
-                # Re-check immediately before create to reduce duplicate issues
-                # when a manual rerun overlaps the automatic workflow_run.
-                existing = find_open_issue(repo, marker)
-                if existing:
-                    add_issue_comment(
-                        repo,
-                        int(existing["number"]),
-                        comment_body(
-                            workflow_name=workflow_name,
-                            run_id=run_id,
-                            run_url=run_url,
-                            job=job,
-                            commit_sha=commit_sha,
-                            commit_author=commit_author,
-                            marker=marker,
-                            timestamp=timestamp,
-                            analysis=job_analysis,
-                        ),
-                    )
-                    action = "updated"
-                    issue_number = int(existing["number"])
-                    issue_url = existing["url"]
-                else:
-                    created = create_issue(
-                        repo,
-                        issue_payload(
-                            workflow_name=workflow_name,
-                            run_id=run_id,
-                            run_url=run_url,
-                            job=job,
-                            commit_sha=commit_sha,
-                            commit_author=commit_author,
-                            marker=marker,
-                            timestamp=timestamp,
-                            assignees=assignees,
-                            analysis=job_analysis,
-                        ),
-                    )
-                    action = "created"
-                    issue_number = int(created["number"])
-                    issue_url = created["url"]
+                created = create_issue(
+                    repo,
+                    issue_payload(
+                        workflow_name=workflow_name,
+                        run_id=run_id,
+                        run_url=run_url,
+                        job=job,
+                        commit_sha=commit_sha,
+                        commit_author=commit_author,
+                        marker=marker,
+                        timestamp=timestamp,
+                        assignees=assignees,
+                        analysis=job_analysis,
+                    ),
+                )
+                action = "created"
+                issue_number = int(created["number"])
+                issue_url = created["url"]
 
             records.append(
                 {
