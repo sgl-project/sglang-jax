@@ -329,9 +329,11 @@ class TokenizerManager:
             # GlobalScheduler / staged pipeline.
             img = obj.image_data
             vid = obj.video_data
+            aud = obj.audio_data
             result = self.mm_processor.process(
                 images=(img if isinstance(img, list) else [img]) if img else None,
                 videos=(vid if isinstance(vid, list) else [vid]) if vid else None,
+                audios=(aud if isinstance(aud, list) else [aud]) if aud else None,
                 text=input_text,
             )
             input_ids = result["input_ids"]

@@ -1,9 +1,12 @@
 import math
 
 import jax
+import numpy as np
 from flax import nnx
 from jax import numpy as jnp
 from jax.lax import Precision
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
     Qwen3OmniMoeAudioEncoderConfig,
 )
@@ -29,6 +32,7 @@ class Qwen3OmniMoeAudioAttention(nnx.Module):
         self.head_dim = self.embed_dim // self.num_heads
         self.num_key_value_groups = 1  # needed for eager attention
         self.config = config
+        self.mesh = mesh
 
         if (self.head_dim * self.num_heads) != self.embed_dim:
             raise ValueError(
@@ -78,9 +82,24 @@ class Qwen3OmniMoeAudioAttention(nnx.Module):
     ) -> tuple[jax.Array, jax.Array | None, tuple[jax.Array] | None]:
         seq_length, _ = hidden_states.shape
 
-        query_states = self.q_proj(hidden_states)[0].reshape(1, seq_length, self.num_heads, -1)
-        key_states = self.k_proj(hidden_states)[0].reshape(1, seq_length, self.num_heads, -1)
-        value_states = self.v_proj(hidden_states)[0].reshape(1, seq_length, self.num_heads, -1)
+        # Replicated reshapes (audio tower runs replicated on the AR mesh): a multi-axis split
+        # reshape under the explicit mesh needs an explicit out_sharding (cf. the ViT attention).
+        repl = NamedSharding(self.mesh, P()) if self.mesh is not None else None
+        query_states = jax.lax.reshape(
+            self.q_proj(hidden_states)[0],
+            (1, seq_length, self.num_heads, self.head_dim),
+            out_sharding=repl,
+        )
+        key_states = jax.lax.reshape(
+            self.k_proj(hidden_states)[0],
+            (1, seq_length, self.num_heads, self.head_dim),
+            out_sharding=repl,
+        )
+        value_states = jax.lax.reshape(
+            self.v_proj(hidden_states)[0],
+            (1, seq_length, self.num_heads, self.head_dim),
+            out_sharding=repl,
+        )
 
         attn_output = simple_attention(
             query_states,
@@ -90,7 +109,7 @@ class Qwen3OmniMoeAudioAttention(nnx.Module):
             causal=False,
         )
 
-        attn_output = attn_output.reshape(seq_length, -1)
+        attn_output = jax.lax.reshape(attn_output, (seq_length, self.embed_dim), out_sharding=repl)
         attn_output, _ = self.out_proj(attn_output)
 
         return attn_output
@@ -234,34 +253,40 @@ class Qwen3OmniMoeAudioEncoder(nnx.Module):
     def __call__(self, input_features: jax.Array, feature_lens=None):
         r"""
         input_features: [f, t]
-        feature_lens: mel length
+        feature_lens: per-audio mel length (static / concrete)
         """
-        chunk_num = (feature_lens + self.n_window * 2 - 1) // (self.n_window * 2)
-        chunk_lengths = jnp.full(chunk_num.sum(), self.n_window * 2, dtype=jnp.int32)
+        # The chunk/length bookkeeping is shape+index logic over the static feature_lens, so do
+        # it in numpy (concrete). Under the in-model jit, jnp dynamic shapes (jnp.full(sum)),
+        # traced boolean indices, and .tolist() are illegal; numpy keeps these as compile-time
+        # constants. The tensor ops below stay in jnp. (Staged eager path: numpy is equivalent.)
+        feature_lens = np.asarray(feature_lens).astype(np.int64)
+        win = self.n_window * 2
+        chunk_num = (feature_lens + win - 1) // win
+        chunk_lengths = np.full(int(chunk_num.sum()), win, dtype=np.int32)
 
-        tail_chunk_index = jnp.pad(chunk_num, (1, 0), constant_values=-1).cumsum(0)[1:]
-        chunk_lengths = chunk_lengths.at[tail_chunk_index].set(feature_lens % (self.n_window * 2))
-        chunk_lengths = chunk_lengths.at[chunk_lengths == 0].set(self.n_window * 2)
+        tail_chunk_index = np.pad(chunk_num, (1, 0), constant_values=-1).cumsum(0)[1:]
+        chunk_lengths[tail_chunk_index] = feature_lens % win
+        chunk_lengths[chunk_lengths == 0] = win
 
-        split_indices = jnp.cumsum(chunk_lengths)[:-1]
+        split_indices = np.cumsum(chunk_lengths)[:-1]
         chunk_list = jnp.split(
             input_features.T, split_indices.tolist(), axis=0
         )  # list of [chunk_len, mel_freq]
         padded_feature = jnp.stack(
-            [jnp.pad(x, ((0, self.n_window * 2 - x.shape[0]), (0, 0))) for x in chunk_list]
+            [jnp.pad(x, ((0, win - x.shape[0]), (0, 0))) for x in chunk_list]
         ).swapaxes(
             1, 2
         )  # [b, f, t]
 
-        feature_lens_after_cnn = self._get_feat_extract_output_lengths(chunk_lengths)
+        feature_lens_after_cnn = np.asarray(self._get_feat_extract_output_lengths(chunk_lengths))
         padded_mask_after_cnn = (
-            jnp.arange(jnp.max(feature_lens_after_cnn))[None, :] < feature_lens_after_cnn[:, None]
-        )  # [b, t]
+            np.arange(int(feature_lens_after_cnn.max()))[None, :] < feature_lens_after_cnn[:, None]
+        )  # [b, t] concrete bool
         padded_feature = jnp.expand_dims(padded_feature, axis=3)  # [b, f, t, c]
         # Split to chunk to avoid OOM during convolution
         padded_embeds = []
-        conv_chunk_indices = jnp.arange(
-            self.conv_chunksize, padded_feature.shape[0], self.conv_chunksize
+        conv_chunk_indices = list(
+            range(self.conv_chunksize, padded_feature.shape[0], self.conv_chunksize)
         )
         for chunk in jnp.split(padded_feature, conv_chunk_indices, axis=0):
             # Now chunk shape is [b, f, t, c]
@@ -275,14 +300,22 @@ class Qwen3OmniMoeAudioEncoder(nnx.Module):
         pos_embed_slice = self.positional_embedding(padded_embed.shape[1])
         positional_embedding = jnp.expand_dims(pos_embed_slice, axis=0).astype(padded_embed.dtype)
         padded_embed = padded_embed + positional_embedding
+        # Audio tower runs replicated under the multi-chip AR mesh (design 3.3.5): the conv
+        # output auto-shards on 'data', which the concrete-mask gather below can't resolve.
+        # Reshard to replicated (kernels are already (None,None)) so the rest stays replicated.
+        if self.mesh is not None:
+            padded_embed = jax.sharding.reshard(padded_embed, NamedSharding(self.mesh, P()))
         hidden_states = padded_embed[padded_mask_after_cnn]
 
+        repl = NamedSharding(self.mesh, P()) if self.mesh is not None else None
         for encoder_layer in self.layers:
-            layer_outputs = encoder_layer(
-                hidden_states,
-            )
-
-            hidden_states = layer_outputs
+            # Keep the tower fully replicated: the mask-gather output (and each layer's output)
+            # auto-shards on 'data' under the AR mesh, breaking the attention's head reshape.
+            if repl is not None:
+                hidden_states = jax.sharding.reshard(hidden_states, repl)
+            hidden_states = encoder_layer(hidden_states)
+        if repl is not None:
+            hidden_states = jax.sharding.reshard(hidden_states, repl)
 
         hidden_states = self.ln_post(hidden_states)
         hidden_states, _ = self.proj1(hidden_states)
