@@ -875,6 +875,17 @@ class Scheduler(
             return self._event_loop_overlap_chain()
         self.result_queue = deque()
         self._spec_pending = None
+        _DBG = os.path.exists("/tmp/p2a-dbg-retract")
+
+        def _D(tag, b=None):
+            if not _DBG:
+                return
+            sh = (
+                f"mode={b.forward_mode.name} bs={[len(i.reqs or []) for i in b.reqs_info]}"
+                if b
+                else ""
+            )
+            logger.info("DBGRT %s %s", tag, sh)
 
         while True:
             recv_reqs = (
@@ -890,15 +901,20 @@ class Scheduler(
             if self._engine_paused:
                 continue
 
+            _D("finalize.pre")
             self._finalize_pending_spec()
+            _D("finalize.post")
             self._drain_deferred_spec_release()
             batch = self.get_next_batch_to_run()
+            _D("get_batch.post", batch)
             self.cur_batch = batch
 
             if batch:
                 batch.launch_done = threading.Event()
                 with jax.profiler.TraceAnnotation("run_batch"):
+                    _D("run_batch.pre", batch)
                     result = self.run_batch(batch)
+                    _D("run_batch.post", batch)
                 batch_copy = batch.copy()
                 self.result_queue.append((batch_copy, result))
                 if getattr(result, "spec_pending", None) is not None:
@@ -930,9 +946,11 @@ class Scheduler(
                     getattr(self.tp_worker, "cur_sampling_info", None) if batch else None
                 )
                 # NOTE: we should use current launched batch's launch_done event Instead of the last batch's
+                _D("proc.pre", tmp_batch)
                 self.process_batch_result(
                     tmp_batch, tmp_result, batch.launch_done if batch else None
                 )
+                _D("proc.post")
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.check_memory()
