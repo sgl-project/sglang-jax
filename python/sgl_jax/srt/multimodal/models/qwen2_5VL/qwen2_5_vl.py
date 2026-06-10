@@ -160,11 +160,18 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
     # ---- weight loading: merge ViT (visual.*) + LLM (model.* / lm_head) mappings ----
 
     def load_weights(self, model_config: ModelConfig):
+        from sgl_jax.srt.mm_core.weights import assert_replicated, replicate_mappings
+
         loader = WeightLoader(
             model=self, model_config=model_config, mesh=self.mesh, dtype=self.dtype
         )
         mappings = {}
-        mappings.update(self._vit_weight_mappings())
+        # ViT runs fully replicated under the AR mesh (design §3.3.5 / §5.7 G2-a): force the
+        # visual.* mappings replicated via the CORE helper and assert it, so a future mapping
+        # that forgets all-None can't silently TP-shard the tower.
+        vit_mappings = replicate_mappings(self._vit_weight_mappings())
+        assert_replicated(vit_mappings, where="Qwen2.5-VL visual tower")
+        mappings.update(vit_mappings)
         mappings.update(self._llm_weight_mappings())
         if self.mesh is not None:
             with self.mesh:
