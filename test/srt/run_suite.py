@@ -307,6 +307,8 @@ suites = {
         TestFile("python/sgl_jax/test/mem_cache/test_swa_allocator.py", 1),
         TestFile("python/sgl_jax/test/mem_cache/test_swa_radix_cache.py", 1),
         TestFile("python/sgl_jax/test/mem_cache/test_radix_cache.py", 1),
+        TestFile("python/sgl_jax/test/mem_cache/test_unified_radix_cache.py", 1),
+        TestFile("python/sgl_jax/test/mem_cache/test_unified_radix_tree_flag.py", 1),
         TestFile("python/sgl_jax/test/mem_cache/test_paged_allocator_multi_dp.py", 1),
         TestFile("python/sgl_jax/test/test_kv_cache_builder.py", 0.1, runner="pytest"),
         TestFile("test/srt/function_call/test_qwen3_coder_detector.py", 0.1),
