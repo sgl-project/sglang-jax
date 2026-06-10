@@ -110,6 +110,12 @@ class Qwen2_5_VLProcessor(BaseMultimodalProcessor):
         self.spatial_merge_size = getattr(vision, "spatial_merge_size", 2)
         self.tokens_per_second = getattr(vision, "tokens_per_second", None)
 
+    def apply_chat_template(self, *args, **kwargs):
+        """Delegate to the HF processor's chat template (serving_chat calls this on the
+        mm_processor). The HF processor carries the model's chat_template even when the bare
+        tokenizer does not (e.g. Qwen3-Omni)."""
+        return self.hf_processor.apply_chat_template(*args, **kwargs)
+
     def process(self, *, images=None, videos=None, audios=None, text=None):
         if audios:
             raise NotImplementedError("Qwen2.5-VL processor does not handle audio")

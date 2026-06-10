@@ -802,12 +802,17 @@ def is_multimodal_model(hf_config) -> bool:
     Routing on this generic config signal (rather than enumerating model_type strings)
     keeps the OpenAI omni entry model-agnostic: MiMo-V2.5 omni has top-level
     vision_config + audio_config, while text-only variants (MiMo-V2.5-Pro/Flash) have
-    neither and stay on the text path.
+    neither and stay on the text path. Qwen3-Omni nests vision_config/audio_config under
+    ``thinker_config``, so check that too.
     """
-    return (
-        getattr(hf_config, "vision_config", None) is not None
-        or getattr(hf_config, "audio_config", None) is not None
-    )
+
+    def _has_mm(cfg) -> bool:
+        return cfg is not None and (
+            getattr(cfg, "vision_config", None) is not None
+            or getattr(cfg, "audio_config", None) is not None
+        )
+
+    return _has_mm(hf_config) or _has_mm(getattr(hf_config, "thinker_config", None))
 
 
 multimodal_model_archs = [

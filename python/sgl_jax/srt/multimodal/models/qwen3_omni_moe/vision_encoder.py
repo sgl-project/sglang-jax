@@ -1,5 +1,6 @@
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import nnx
 from jax.lax import Precision
 from jax.sharding import NamedSharding
@@ -767,14 +768,14 @@ class Qwen3OmniMoeVisionEncoder(nnx.Module):
         """
         merge_size = self.spatial_merge_size
 
-        # Check height divisibility
-        h_rem = grid_thw[:, 1] % merge_size
-        if jnp.any(h_rem != 0):
+        # grid_thw is static (concrete) in both paths: the staged embed stage runs eager, and
+        # the in-model forward passes a concrete np array. Validate with numpy so the Python
+        # `if` stays jit-safe (jnp.any would become a tracer under the in-model jit and raise
+        # TracerBoolConversionError).
+        grid = np.asarray(grid_thw)
+        if np.any(grid[:, 1] % merge_size != 0):
             raise ValueError(f"Input height must be divisible by spatial_merge_size {merge_size}")
-
-        # Check width divisibility
-        w_rem = grid_thw[:, 2] % merge_size
-        if jnp.any(w_rem != 0):
+        if np.any(grid[:, 2] % merge_size != 0):
             raise ValueError(f"Input width must be divisible by spatial_merge_size {merge_size}")
 
     def __call__(

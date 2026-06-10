@@ -28,6 +28,7 @@ import logging
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import nnx
 
 from sgl_jax.srt.mm_core.merge import merge
@@ -72,13 +73,17 @@ class Qwen3OmniMoeForConditionalGeneration(nnx.Module):
         thinker = _thinker_config(config)
         self.thinker_config = thinker
 
+        # The Qwen3-Omni vision/audio towers' norm layers call rngs.params() unconditionally
+        # (unlike the Qwen2.5-VL ViT which tolerates None), so pass a real Rngs. eval_shape
+        # abstracts the actual init; nnx.Rngs(0) is the same fallback the as-is towers use.
+        rngs = nnx.Rngs(0)
         # Vision tower -> {pooler_output, deepstack_features: [tuple of per-level [N, hidden]]}.
         self.visual = Qwen3OmniMoeVisionEncoder(
-            thinker.vision_config, mesh=mesh, dtype=self.dtype, rngs=None
+            thinker.vision_config, mesh=mesh, dtype=self.dtype, rngs=rngs
         )
         # Audio tower (continuous mel). Built for weight-load; forward audio path is a follow-up.
         self.audio_tower = Qwen3OmniMoeAudioEncoder(
-            thinker.audio_config, mesh=mesh, dtype=self.dtype, rngs=None
+            thinker.audio_config, mesh=mesh, dtype=self.dtype, rngs=rngs
         )
         # AR body = the complete Thinker ForCausalLM (embed -> AR -> logits; reads
         # input_embedding / deepstack_visual_embedding / apply_for_deepstack / mrope).
@@ -93,8 +98,12 @@ class Qwen3OmniMoeForConditionalGeneration(nnx.Module):
     # ---- per-modality encoders (model-owned towers) ----
 
     def encode_image(self, pixel_values: jax.Array, grid_thw):
-        """[total_patches, in_dim] + grid_thw -> (pooler [N, hidden], [per-level [N, hidden]])."""
-        out = self.visual(pixel_values, grid_thw)
+        """[total_patches, in_dim] + grid_thw -> (pooler [N, hidden], [per-level [N, hidden]]).
+
+        The Qwen3-Omni ViT indexes grid_thw as a 2D array (grid_thw[:, 1]); ForwardBatch carries
+        it as a static tuple-of-tuples, so materialize a concrete [num_images, 3] np array.
+        """
+        out = self.visual(pixel_values.astype(self.dtype), np.asarray(grid_thw))
         return out["pooler_output"], list(out["deepstack_features"])
 
     def encode_audio(self, input_features: jax.Array, feature_lens):
@@ -162,9 +171,14 @@ class Qwen3OmniMoeForConditionalGeneration(nnx.Module):
         mappings.update(emb._create_visual_weight_mappings(self.thinker_config.vision_config))
         mappings.update(emb._create_audio_tower_weight_mappings(self.thinker_config.audio_config))
         # AR mappings target paths relative to the ForCausalLM (model.* / lm_head.*); from this
-        # wrapper self.model IS that module, so prepend "model.".
+        # wrapper self.model IS that module, so prepend "model.". For MoE mappings the loader
+        # treats target_path as [model_target, *source_hf_keys] (weight_utils uses
+        # target_path[1:] as the checkpoint keys), so prefix ONLY index 0 -- the source keys
+        # must stay as-is. Plain str targets are prefixed whole.
         for src, m in self.model._create_qwen3_omni_moe_weight_mappings().items():
-            mappings[src] = dataclasses.replace(m, target_path="model." + m.target_path)
+            tp = m.target_path
+            new_tp = "model." + tp if isinstance(tp, str) else type(tp)(["model." + tp[0], *tp[1:]])
+            mappings[src] = dataclasses.replace(m, target_path=new_tp)
 
         if self.mesh is not None:
             with self.mesh:
