@@ -571,12 +571,7 @@ class Glm5MLP(nnx.Module):
     def __call__(self, hidden_states: jax.Array):
         if self.use_fused and hasattr(self, "w_gu"):
             seq_len, _ = hidden_states.shape
-            if seq_len <= 32:
-                b_seq = 32
-            elif seq_len <= 128:
-                b_seq = 64
-            else:
-                b_seq = 128
+            b_seq = 64 if seq_len <= 8 else 256
 
             return apply_fused_mlp_with_padding(
                 hidden_states,
