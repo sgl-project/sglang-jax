@@ -8,6 +8,16 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+# Transitional (refactor M3): understanding-plane in-model VLMs that currently live under
+# the staged ``sgl_jax.srt.multimodal`` package (reusing its ViT tower) but must register
+# in the standard ModelRegistry. Imported by runtime string (importlib) below, so NO static
+# srt->multimodal import edge / cycle is introduced (only understanding LLMs belong here;
+# staged generation models register via stage.py). M6 consolidates these into
+# ``sgl_jax.srt.models`` and removes this list.
+_UNDERSTANDING_MM_MODEL_MODULES = [
+    "sgl_jax.srt.multimodal.models.qwen2_5VL.qwen2_5_vl",
+]
+
 
 @dataclass
 class _ModelRegistry:
@@ -93,6 +103,22 @@ def import_model_classes():
                         entry.__name__ not in model_arch_name_to_cls
                     ), f"Duplicated model implementation for {entry.__name__}"
                     model_arch_name_to_cls[entry.__name__] = entry
+
+    # Transitional understanding-plane VLM registration (see _UNDERSTANDING_MM_MODEL_MODULES).
+    for modname in _UNDERSTANDING_MM_MODEL_MODULES:
+        try:
+            module = importlib.import_module(modname)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Ignore import error when loading %s. %s", modname, e)
+            continue
+        entry = getattr(module, "EntryClass", None)
+        if entry is None:
+            continue
+        for tmp in entry if isinstance(entry, list) else [entry]:
+            assert (
+                tmp.__name__ not in model_arch_name_to_cls
+            ), f"Duplicated model implementation for {tmp.__name__}"
+            model_arch_name_to_cls[tmp.__name__] = tmp
 
     return model_arch_name_to_cls
 
