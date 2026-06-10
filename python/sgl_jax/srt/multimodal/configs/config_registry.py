@@ -121,6 +121,49 @@ def _apply_qwen_vl_vision_overrides(
     return config
 
 
+def qwen_vl_vision_config_from_hf(hf_config) -> QwenVLModelVitConfig:
+    """Build a QwenVLModelVitConfig from a parsed HF Qwen2.5-VL config object.
+
+    Mirrors :func:`_apply_qwen_vl_vision_overrides` but sources the already-parsed
+    ``hf_config.vision_config`` (robust to ``model_path`` being a hub id rather than a
+    local dir). Used by the in-model Qwen2.5-VL (refactor M3): without this override the
+    bare ``QwenVLModelVitConfig()`` default ``hidden_size=3584`` is wrong for the 7B ViT
+    (real vision width is 1280; 3584 is the post-merger LLM dim), so the ViT patch_embed
+    reshape fails. ``out_hidden_size`` falls back to the top-level ``hidden_size``.
+    """
+    config = QwenVLModelVitConfig()
+    vision = getattr(hf_config, "vision_config", None)
+    if vision is None:
+        return config
+    vision_cfg = vision.to_dict() if hasattr(vision, "to_dict") else dict(vars(vision))
+    if not isinstance(vision_cfg, dict):
+        return config
+
+    updated_fields: set[str] = set()
+    for src_key, dst_attr in _QWEN_VL_VISION_KEY_MAP.items():
+        if src_key not in vision_cfg:
+            continue
+        value = vision_cfg[src_key]
+        if dst_attr in _QWEN_VL_VISION_INT_FIELDS:
+            with contextlib.suppress(Exception):
+                value = int(value)
+        elif dst_attr in _QWEN_VL_VISION_FLOAT_FIELDS:
+            with contextlib.suppress(Exception):
+                value = float(value)
+        elif dst_attr in _QWEN_VL_VISION_LIST_FIELDS and not isinstance(value, list):
+            value = list(value)
+        setattr(config, dst_attr, value)
+        updated_fields.add(dst_attr)
+
+    if "out_hidden_size" not in updated_fields:
+        top_hidden_size = getattr(hf_config, "hidden_size", None)
+        if top_hidden_size is not None:
+            with contextlib.suppress(Exception):
+                top_hidden_size = int(top_hidden_size)
+            config.out_hidden_size = top_hidden_size
+    return config
+
+
 class DiffusionConfigRegistry:
     """Registry that maps model names to their diffusion model configs.
 

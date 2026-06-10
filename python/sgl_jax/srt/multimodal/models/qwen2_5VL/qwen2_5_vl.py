@@ -13,11 +13,11 @@ Reuses the existing ViT tower (`Qwen2_5_VL_VisionTransformer`) and the AR LLM bo
 (`Qwen2_5_VL_Model`), replacing the staged `vit_model_runner` cumsum-gather with merge().
 See design doc §3.3 and tmp/refactor/m3-plan.md.
 
-NOTE (validation status): import / construct(eval_shape) targeted first; weight-load,
-forward smoke and ViT precompile/HBM behaviour (m3-plan risk 1) are validated iteratively
-on the TPU dev pod. Vision config uses QwenVLModelVitConfig() (7B values; matches the
-as-is vit-stage via get_qwen_vl_config) — deriving from hf_config.vision_config for
-3B/72B generality is a follow-up.
+NOTE (validation status): import / construct(eval_shape) / weight-load are validated on
+the TPU dev pod. The vision config is derived from the checkpoint's vision_config via
+qwen_vl_vision_config_from_hf (hidden_size=1280 for 7B; the bare QwenVLModelVitConfig()
+default 3584 is the post-merger LLM dim and breaks the patch_embed reshape). ViT
+precompile/HBM behaviour (m3-plan risk 1) is observed via the encode+merge forward smoke.
 """
 
 import logging
@@ -34,9 +34,7 @@ from sgl_jax.srt.mem_cache.memory_pool import MemoryPools
 from sgl_jax.srt.mm_core.merge import merge
 from sgl_jax.srt.mm_core.pad_value import MM_PAD_SHIFT_VALUE
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
-from sgl_jax.srt.multimodal.configs.qwen_vl.qwen_2_5_vl_config import (
-    QwenVLModelVitConfig,
-)
+from sgl_jax.srt.multimodal.configs.config_registry import qwen_vl_vision_config_from_hf
 from sgl_jax.srt.multimodal.models.qwen2_5VL.qwen2_5_vit import (
     Qwen2_5_VL_VisionTransformer,
 )
@@ -62,8 +60,10 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
         self.text_config = get_hf_text_config(config) or config
         self.dtype = dtype or jnp.bfloat16
 
-        # ViT tower (reused as-is). 7B vision config; matches the as-is vit-stage.
-        self.vision_config = QwenVLModelVitConfig()
+        # ViT tower (reused as-is). Vision config is derived from the checkpoint's
+        # vision_config (hidden_size=1280 for 7B); the bare QwenVLModelVitConfig() default
+        # (hidden_size=3584) is the post-merger LLM dim and breaks the patch_embed reshape.
+        self.vision_config = qwen_vl_vision_config_from_hf(config)
         self.visual = Qwen2_5_VL_VisionTransformer(
             config=self.vision_config,
             dtype=self.dtype,
