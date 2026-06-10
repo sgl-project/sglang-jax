@@ -6,31 +6,49 @@ import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "utils"))
-from failure_classifier import FAILURE_TYPES, classify_jobs, get_failed_jobs
+from ci_common import (
+    clamp,
+    escape_mrkdwn,
+    issue_for_job,
+    load_ai_analysis,
+    load_failure_issues,
+)
+from failure_classifier import (
+    FAILURE_TYPES,
+    classify_jobs,
+    get_failed_jobs,
+    is_finish_gate,
+)
 from github_output import write_github_output
 
 
-def format_slack_summary(run_url, commit_sha, author, failed_jobs, ai_analysis=""):
-    """Format compact Slack mrkdwn summary."""
-    display_jobs = [j for j in failed_jobs if not j["name"].endswith("-finish")]
+def format_slack_summary(
+    run_url, commit_sha, author, failed_jobs, analysis=None, failure_issues=None
+):
+    """Compact Slack summary: one bullet per job with its issue link and AI root cause."""
+    analysis = analysis or {}
+    failure_issues = failure_issues or {}
+    display_jobs = [j for j in failed_jobs if not is_finish_gate(j["name"])]
     short_sha = commit_sha[:7] if len(commit_sha) >= 7 else commit_sha
     job_word = "job" if len(display_jobs) == 1 else "jobs"
     lines = [
-        f":red_circle: *Nightly CI Failure* — {len(display_jobs)} {job_word} failed  |  <{run_url}|View run>"
+        f":red_circle: *Nightly CI Failure* — {len(display_jobs)} {job_word} failed  |  <{run_url}|View run>",
+        f"`{short_sha}` by {escape_mrkdwn(author)}",
+        "",
     ]
-    safe_author = author.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    lines.append(f"`{short_sha}` by {safe_author}")
-    lines.append("")
     for job in display_jobs:
         ft = FAILURE_TYPES.get(job["failure_type"], FAILURE_TYPES["bug"])
-        safe_name = job["name"].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        safe_name = safe_name.replace("|", "/")
-        lines.append(f"• {ft['emoji']} {safe_name} [{ft['label']}]")
-
-    if ai_analysis:
-        lines.append("")
-        lines.append("*AI Analysis:*")
-        lines.append(ai_analysis)
+        safe_name = escape_mrkdwn(job["name"]).replace("|", "/")
+        job_url = job.get("html_url")
+        job_ref = f"<{job_url}|{safe_name}>" if job_url else safe_name
+        issue = issue_for_job(job, failure_issues)
+        issue_text = ""
+        if issue and issue.get("issue_number") and issue.get("issue_url"):
+            issue_text = f" — Issue: <{issue['issue_url']}|#{issue['issue_number']}>"
+        lines.append(f"• {ft['emoji']} {job_ref} [{ft['label']}]{issue_text}")
+        a = analysis.get(job["name"])
+        if a and a.get("root_cause"):
+            lines.append(f"      ↳ {escape_mrkdwn(clamp(a['root_cause']))}")
 
     text = "\n".join(lines)
     if len(text) > 2900:
@@ -55,14 +73,17 @@ def main():
     parser.add_argument(
         "--ai-analysis",
         type=str,
-        help="Path to file containing AI analysis text to include in summary",
+        help="ai_analysis.json from the AI analysis step",
+    )
+    parser.add_argument(
+        "--failure-issues",
+        type=str,
+        help="failure_issues.json from ci_failure_issues.py",
     )
     args = parser.parse_args()
 
-    ai_analysis = ""
-    if args.ai_analysis and os.path.isfile(args.ai_analysis):
-        with open(args.ai_analysis) as f:
-            ai_analysis = f.read().strip()
+    analysis = load_ai_analysis(args.ai_analysis)
+    failure_issue_map = load_failure_issues(args.failure_issues)
 
     if args.from_classification:
         with open(args.from_classification) as f:
@@ -99,6 +120,7 @@ def main():
                     "name": j["name"],
                     "id": j["id"],
                     "html_url": j["html_url"],
+                    "conclusion": j.get("conclusion", "failure"),
                     "failure_type": j["failure_type"],
                 }
                 for j in failed_jobs
@@ -115,7 +137,8 @@ def main():
         args.commit_sha,
         args.commit_author,
         failed_jobs,
-        ai_analysis,
+        analysis,
+        failure_issue_map,
     )
 
     if args.slack_output:
@@ -131,9 +154,16 @@ def main():
             f.write(f"**Commit:** {args.commit_sha[:7]} by {args.commit_author}\n\n")
             f.write(f"**Failed jobs ({len(failed_jobs)}):**\n\n")
             for job in failed_jobs:
-                f.write(f"- [{job['name']}]({job['html_url']}) — {job['failure_type']}\n")
-            if ai_analysis:
-                f.write(f"\n**AI Analysis:**\n\n{ai_analysis}\n")
+                issue = issue_for_job(job, failure_issue_map)
+                issue_text = ""
+                if issue and issue.get("issue_number") and issue.get("issue_url"):
+                    issue_text = f" — Issue: [#{issue['issue_number']}]({issue['issue_url']})"
+                f.write(
+                    f"- [{job['name']}]({job['html_url']}) — {job['failure_type']}{issue_text}\n"
+                )
+                a = analysis.get(job["name"])
+                if a and a.get("root_cause"):
+                    f.write(f"  - {a['root_cause']}\n")
         print("Report appended to GITHUB_STEP_SUMMARY.")
 
 

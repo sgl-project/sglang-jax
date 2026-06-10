@@ -15,6 +15,16 @@ on:
         required: false
         default: false
         type: boolean
+      skip_nightly_check:
+        description: "Emergency override for the PyPI nightly health gate"
+        required: false
+        default: false
+        type: boolean
+      emergency_justification:
+        description: "Required when skip_nightly_check is true"
+        required: false
+        default: ""
+        type: string
   workflow_call:
     inputs:
       tag:
@@ -26,8 +36,19 @@ on:
         required: false
         default: false
         type: boolean
+      skip_nightly_check:
+        description: "Emergency override for the PyPI nightly health gate"
+        required: false
+        default: false
+        type: boolean
+      emergency_justification:
+        description: "Required when skip_nightly_check is true"
+        required: false
+        default: ""
+        type: string
 
 permissions:
+  actions: read
   contents: write
 
 concurrency:
@@ -84,12 +105,20 @@ jobs:
 
   publish-pypi:
     needs: metadata
+    # Only this job reaches the nightly gateway, which needs issues:write to
+    # open an emergency audit issue. Keep that grant off the other jobs.
+    permissions:
+      actions: read
+      contents: read
+      issues: write
     uses: ./.github/workflows/release-pypi.yml
     secrets: inherit
     with:
       tag: ${{ needs.metadata.outputs.tag }}
       version: ${{ needs.metadata.outputs.version }}
       dry_run: ${{ needs.metadata.outputs.dry_run == 'true' }}
+      skip_nightly_check: ${{ inputs.skip_nightly_check || false }}
+      emergency_justification: ${{ inputs.emergency_justification || '' }}
 
   publish-docker:
     needs: metadata

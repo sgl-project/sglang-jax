@@ -15,10 +15,40 @@ on:
         description: "If true, build but do not publish"
         required: true
         type: boolean
+      skip_nightly_check:
+        description: "Emergency override for the nightly health gate"
+        required: false
+        default: false
+        type: boolean
+      emergency_justification:
+        description: "Required when skip_nightly_check is true"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
 
 jobs:
+  gateway:
+    if: github.repository == 'sgl-project/sglang-jax' && ! inputs.dry_run
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+    uses: ./.github/workflows/nightly-release-gateway.yml
+    with:
+      skip_nightly_check: ${{ inputs.skip_nightly_check }}
+      emergency_justification: ${{ inputs.emergency_justification }}
+      tag: ${{ inputs.tag }}
+      version: ${{ inputs.version }}
+
   publish:
-    if: github.repository == 'sgl-project/sglang-jax'
+    needs: gateway
+    if: >-
+      always() &&
+      github.repository == 'sgl-project/sglang-jax' &&
+      (inputs.dry_run || contains(fromJSON('["pass","emergency"]'), needs.gateway.outputs.gateway-status))
     runs-on: ubuntu-latest
     environment: prod
     steps:
@@ -35,6 +65,7 @@ jobs:
 
       - name: Build wheel and sdist
         env:
+          VERSION: ${{ inputs.version }}
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
@@ -43,15 +74,17 @@ jobs:
           python -m pip install --upgrade pip build
           python -m build
           ls -la dist
-          test -f "dist/sglang_jax-${{ inputs.version }}-py3-none-any.whl"
+          test -f "dist/sglang_jax-${VERSION}-py3-none-any.whl"
 
       - name: Smoke test wheel
+        env:
+          VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
           python -m venv /tmp/venv
           /tmp/venv/bin/pip install --upgrade pip
-          /tmp/venv/bin/pip install "python/dist/sglang_jax-${{ inputs.version }}-py3-none-any.whl"
-          /tmp/venv/bin/python -c "import sgl_jax; print('sgl_jax version:', sgl_jax.__version__); assert sgl_jax.__version__ == '${{ inputs.version }}', sgl_jax.__version__"
+          /tmp/venv/bin/pip install "python/dist/sglang_jax-${VERSION}-py3-none-any.whl"
+          /tmp/venv/bin/python -c 'import os, sgl_jax; expected = os.environ["VERSION"]; print("sgl_jax version:", sgl_jax.__version__); assert sgl_jax.__version__ == expected, sgl_jax.__version__'
 
       - name: Publish to PyPI
         if: ${{ ! inputs.dry_run }}
