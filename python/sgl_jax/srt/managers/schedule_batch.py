@@ -2507,6 +2507,61 @@ class ScheduleBatch:
                 kwargs[f] = np.concatenate(nonnull, axis=0)
         return type(nonempty[0])(**kwargs)
 
+    def _assemble_inmodel_mm(self, reqs):
+        """Assemble raw multimodal inputs for the in-model encode+merge path (refactor M3).
+
+        For reqs carrying raw mm (``req.mm_inputs`` with pixels) and NO precomputed
+        ``multimodal_embedding``, assemble per-modality pixel_values + grid_thw and collect
+        per-item pad_values -- IMAGE items first then VIDEO, matching the model forward's
+        ``encode_image`` -> ``encode_video`` concatenation and ``merge()`` keying (see
+        tmp/refactor/m3-integration-remaining.md). Returns
+        ``(pixel_values, pixel_values_videos, grid_thw, video_grid_thw, pad_values)`` or
+        all-None when no req carries raw mm (text / staged precomputed-embedding path
+        stays 0-diff).
+        """
+        raw = [
+            r
+            for r in reqs
+            if getattr(r, "mm_inputs", None) and getattr(r, "multimodal_embedding", None) is None
+        ]
+        if not raw:
+            return (None, None, None, None, None)
+        # Runtime import keeps srt free of a static srt->multimodal import edge
+        # (M6 relocates assemble_mm_inputs into mm_core).
+        import importlib
+
+        assemble = importlib.import_module(
+            "sgl_jax.srt.multimodal.manager.mm_assembly"
+        ).assemble_mm_inputs
+        img_px, vid_px, img_thw, vid_thw, img_pads, vid_pads = [], [], [], [], [], []
+        for r in raw:
+            a = assemble(r.mm_inputs)
+            if a["pixel_values_images"] is not None:
+                img_px.append(a["pixel_values_images"])
+                for row in a["image_grid_thw"] or []:
+                    img_thw.append(tuple(int(x) for x in row))
+            if a["pixel_values_videos"] is not None:
+                vid_px.append(a["pixel_values_videos"])
+                for row in a["video_grid_thw"] or []:
+                    vid_thw.append(tuple(int(x) for x in row))
+            for it in r.mm_inputs.get("mm_items") or []:
+                if getattr(it, "pad_value", None) is None and hasattr(it, "set_pad_value"):
+                    it.set_pad_value()
+                pv = getattr(it, "pad_value", None)
+                if pv is None:
+                    continue
+                if it.is_image():
+                    img_pads.append(pv)
+                elif it.is_video():
+                    vid_pads.append(pv)
+        return (
+            np.concatenate(img_px, axis=0) if img_px else None,
+            np.concatenate(vid_px, axis=0) if vid_px else None,
+            tuple(img_thw) or None,
+            tuple(vid_thw) or None,
+            (tuple(img_pads) + tuple(vid_pads)) or None,
+        )
+
     def get_model_worker_batch(
         self,
         token_paddings: list,
@@ -2612,6 +2667,17 @@ class ScheduleBatch:
         mrope_positions = _mm["mrope_positions"]
         apply_for_deepstack = _mm["apply_for_deepstack"]
         deepstack_visual_embedding = _mm["deepstack_visual_embedding"]
+
+        # In-model raw-mm path (refactor M3): for reqs carrying raw mm (no precomputed
+        # multimodal_embedding), assemble pixels/grid + per-item pad_values onto the worker
+        # batch so the model encodes + merges in-forward. All-None for text/staged batches.
+        (
+            mm_pixel_values,
+            mm_pixel_values_videos,
+            mm_grid_thw,
+            mm_video_grid_thw,
+            mm_pad_values,
+        ) = self._assemble_inmodel_mm(all_reqs[:real_bs])
 
         # Merge per-DP top_logprobs_nums / token_ids_logprobs with the same
         # offset_bs += per_dp_bs_padding padding scheme used in _merge_batch_metadata.
@@ -2721,6 +2787,11 @@ class ScheduleBatch:
             recurrent_indices=recurrent_indices_cpu,
             has_initial_state=has_initial_state_cpu,
             spec_algorithm=self.spec_algorithm,
+            mm_pixel_values=mm_pixel_values,
+            mm_pixel_values_videos=mm_pixel_values_videos,
+            mm_grid_thw=mm_grid_thw,
+            mm_video_grid_thw=mm_video_grid_thw,
+            mm_pad_values=mm_pad_values,
         )
 
     def get_spec_model_worker_batch(
