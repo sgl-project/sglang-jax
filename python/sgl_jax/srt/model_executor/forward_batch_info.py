@@ -432,6 +432,25 @@ class ForwardBatch:
                 sharding=(NamedSharding(model_runner.mesh, PartitionSpec("data"))),
             )
 
+        # In-model multimodal raw inputs (refactor M3): pixels are device-put replicated
+        # (the ViT runs replicated, satisfying merge()'s full-replication constraint);
+        # grid_thw / pad_values are static and passed through. getattr(..., None) keeps
+        # text-only / staged worker batches 0-diff (they lack these attrs).
+        mm_pixel_values = None
+        if getattr(batch, "mm_pixel_values", None) is not None:
+            (mm_pixel_values,) = device_array(
+                (batch.mm_pixel_values,),
+                sharding=(NamedSharding(model_runner.mesh, PartitionSpec(None, None))),
+            )
+            mm_pixel_values = mm_pixel_values.astype(jnp.bfloat16)
+        mm_pixel_values_videos = None
+        if getattr(batch, "mm_pixel_values_videos", None) is not None:
+            (mm_pixel_values_videos,) = device_array(
+                (batch.mm_pixel_values_videos,),
+                sharding=(NamedSharding(model_runner.mesh, PartitionSpec(None, None))),
+            )
+            mm_pixel_values_videos = mm_pixel_values_videos.astype(jnp.bfloat16)
+
         obj = cls(
             bid=batch.bid,
             forward_mode=batch.forward_mode,
@@ -458,6 +477,11 @@ class ForwardBatch:
             deepstack_visual_embedding=deepstack_visual_embedding,
             expert_location_metadata=expert_location_metadata,
             recurrent_indices=recurrent_indices,
+            mm_pixel_values=mm_pixel_values,
+            mm_pixel_values_videos=mm_pixel_values_videos,
+            mm_grid_thw=getattr(batch, "mm_grid_thw", None),
+            mm_video_grid_thw=getattr(batch, "mm_video_grid_thw", None),
+            mm_pad_values=getattr(batch, "mm_pad_values", None),
         )
 
         # Auto-generate attention mask for Encoder-only models (e.g. UMT5Encoder, BERT)

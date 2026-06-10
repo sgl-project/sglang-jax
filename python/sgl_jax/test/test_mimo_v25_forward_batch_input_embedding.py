@@ -74,7 +74,9 @@ class TestMiMoV25ForwardBatchInputEmbedding(unittest.TestCase):
             ),
         )
 
-    def _new_worker_batch(self, *, input_embedding):
+    def _new_worker_batch(
+        self, *, input_embedding, mm_pixel_values=None, mm_grid_thw=None, mm_pad_values=None
+    ):
         return SimpleNamespace(
             bid="bid",
             forward_mode=object(),
@@ -98,6 +100,11 @@ class TestMiMoV25ForwardBatchInputEmbedding(unittest.TestCase):
             apply_for_deepstack=False,
             deepstack_visual_embedding=None,
             recurrent_indices=None,
+            mm_pixel_values=mm_pixel_values,
+            mm_pixel_values_videos=None,
+            mm_grid_thw=mm_grid_thw,
+            mm_video_grid_thw=None,
+            mm_pad_values=mm_pad_values,
         )
 
     def test_init_new_preserves_and_casts_input_embedding(self):
@@ -125,6 +132,28 @@ class TestMiMoV25ForwardBatchInputEmbedding(unittest.TestCase):
         )
 
         self.assertIsNone(forward_batch.input_embedding)
+
+    def test_init_new_populates_mm_fields(self):
+        # M3: raw multimodal inputs flow worker-batch -> ForwardBatch.mm_* for in-forward merge.
+        px = np.arange(8, dtype=np.float64).reshape(4, 2)
+        batch = self._new_worker_batch(
+            input_embedding=None,
+            mm_pixel_values=px,
+            mm_grid_thw=((1, 2, 2),),
+            mm_pad_values=(1000007,),
+        )
+        fb = ForwardBatch.init_new(batch, self._new_model_runner())
+        self.assertIsNotNone(fb.mm_pixel_values)
+        self.assertEqual(fb.mm_pixel_values.dtype, np.float32)  # cast to bf16 (stubbed -> f32)
+        self.assertEqual(fb.mm_grid_thw, ((1, 2, 2),))  # static aux passed through
+        self.assertEqual(fb.mm_pad_values, (1000007,))
+        self.assertTrue(fb.contains_mm_inputs())
+
+    def test_init_new_text_only_has_no_mm(self):
+        batch = self._new_worker_batch(input_embedding=None)
+        fb = ForwardBatch.init_new(batch, self._new_model_runner())
+        self.assertIsNone(fb.mm_pixel_values)
+        self.assertFalse(fb.contains_mm_inputs())
 
 
 if __name__ == "__main__":
