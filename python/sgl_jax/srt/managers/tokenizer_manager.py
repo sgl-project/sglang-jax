@@ -159,6 +159,27 @@ class TokenizerManager:
         self._cond = asyncio.Condition()
 
         self.mm_processor = None
+        if self.model_config is not None and getattr(self.model_config, "is_multimodal", False):
+            # Understanding multimodal (in-model, refactor M3): resolve an arch-keyed
+            # processor via the mm_core registry. import_processor_classes does a RUNTIME
+            # scan of the multimodal processors package -> no static srt->multimodal edge.
+            from sgl_jax.srt.mm_core.processor import (
+                get_processor_cls,
+                import_processor_classes,
+            )
+
+            import_processor_classes("sgl_jax.srt.multimodal.processors")
+            architectures = getattr(self.model_config.hf_config, "architectures", [])
+            proc_cls = get_processor_cls(architectures)
+            if proc_cls is not None:
+                self.mm_processor = proc_cls(self.model_path)
+                logger.info("Initialized in-model multimodal processor %s", proc_cls.__name__)
+            else:
+                logger.warning(
+                    "Model is multimodal (%s) but no processor is registered; image/video "
+                    "inputs will not be handled in-model.",
+                    architectures,
+                )
 
         if server_args.skip_tokenizer_init:
             self.tokenizer = self.processor = None
@@ -296,7 +317,26 @@ class TokenizerManager:
         # Tokenize
         input_text = obj.text
         input_ids = obj.input_ids
-        if input_ids is None and input_text is not None:
+        mm_inputs = None
+        if (
+            self.mm_processor is not None
+            and hasattr(obj, "contains_mm_input")
+            and obj.contains_mm_input()
+        ):
+            # In-model understanding multimodal (refactor M3): the processor produces
+            # input_ids (pad_values baked into placeholder rows) + mm_inputs (mm_items,
+            # grid_thw, mrope). The standard Scheduler/ForwardBatch consume mm_inputs; no
+            # GlobalScheduler / staged pipeline.
+            img = obj.image_data
+            vid = obj.video_data
+            result = self.mm_processor.process(
+                images=(img if isinstance(img, list) else [img]) if img else None,
+                videos=(vid if isinstance(vid, list) else [vid]) if vid else None,
+                text=input_text,
+            )
+            input_ids = result["input_ids"]
+            mm_inputs = result["mm_inputs"]
+        elif input_ids is None and input_text is not None:
             if self.tokenizer is None:
                 raise ValueError(
                     "Tokenizer is not initialized but input_text requires tokenization"
@@ -304,7 +344,7 @@ class TokenizerManager:
             encoded = self.tokenizer(input_text)
             input_ids = encoded["input_ids"]
         self._validate_one_request(obj, input_ids)
-        return self._create_tokenized_object(obj, input_text, input_ids)
+        return self._create_tokenized_object(obj, input_text, input_ids, mm_inputs=mm_inputs)
 
     def _validate_one_request(
         self, obj: GenerateReqInput | EmbeddingReqInput, input_ids: list[int]
@@ -343,6 +383,7 @@ class TokenizerManager:
         obj: GenerateReqInput,
         input_text: str,
         input_ids: list[int],
+        mm_inputs: dict | None = None,
     ) -> TokenizedGenerateReqInput:
         """Create a tokenized request object from common parameters."""
         # Parse sampling parameters
@@ -372,6 +413,7 @@ class TokenizerManager:
             obj.lora_id,
             obj.extra_key,
             obj.return_routed_experts,
+            mm_inputs=mm_inputs,
         )
         # note: When only `return_logprob` is specified, we assume that only the output probability is required.
         if (
