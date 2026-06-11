@@ -7,15 +7,13 @@ from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 from flax import nnx
 from jax.lax import Precision
 from safetensors import safe_open
 from transformers import modeling_flax_utils
 
 if TYPE_CHECKING:
-    from sgl_jax.srt.utils.weight_utils import WeightMapping
-
+    pass
 
 
 def apply_rotary_pos_emb_vision(
@@ -225,49 +223,52 @@ class MiMoVisionAttention(nnx.Module):
         cos, sin = position_embeddings
         query, key = apply_rotary_pos_emb_vision(query, key, cos, sin)
 
-        lengths = np.asarray(cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
-        query_chunks = jnp.split(query, np.cumsum(lengths)[:-1], axis=0)
-        key_chunks = jnp.split(key, np.cumsum(lengths)[:-1], axis=0)
-        value_chunks = jnp.split(value, np.cumsum(lengths)[:-1], axis=0)
+        # V-4 (design §5.3.3): jit-safe single-pass segment-masked attention. The previous form
+        # `.tolist()`-ed cu_seqlens to the host and ran a Python loop of per-image variable-length
+        # attention -- a host readback + data-dependent trip count that cannot be jitted. Instead
+        # run ONE batched attention over the whole packed sequence and block out cross-image keys
+        # with a segment mask derived from cu_seqlens (searchsorted, all jnp). Within a contiguous
+        # segment the global token distance equals the old chunk-local distance, so the window mask
+        # is identical; the attention sink (originally added to each chunk's column 0) is scattered
+        # onto each segment's first key. Numerically equivalent to the loop (masked softmax over the
+        # same key set), just jittable.
+        q = jnp.transpose(query[None, ...], (0, 2, 1, 3))  # [1, n, seq, h]
+        k = jnp.transpose(key[None, ...], (0, 2, 1, 3))
+        v = jnp.transpose(value[None, ...], (0, 2, 1, 3))
+        if self.num_heads != self.num_kv_heads:
+            num_groups = self.num_heads // self.num_kv_heads
+            k = jnp.repeat(k, num_groups, axis=1)
+            v = jnp.repeat(v, num_groups, axis=1)
 
-        outputs = []
-        for query_chunk, key_chunk, value_chunk in zip(query_chunks, key_chunks, value_chunks):
-            query_chunk = jnp.transpose(query_chunk[None, ...], (0, 2, 1, 3))
-            key_chunk = jnp.transpose(key_chunk[None, ...], (0, 2, 1, 3))
-            value_chunk = jnp.transpose(value_chunk[None, ...], (0, 2, 1, 3))
+        attn_weights = jnp.einsum("bnth,bnsh->bnts", q, k) * self.scale  # [1, n, seq, seq]
+        neg = jnp.finfo(attn_weights.dtype).min
 
-            if self.num_heads != self.num_kv_heads:
-                num_groups = self.num_heads // self.num_kv_heads
-                key_chunk = jnp.repeat(key_chunk, num_groups, axis=1)
-                value_chunk = jnp.repeat(value_chunk, num_groups, axis=1)
+        positions = jnp.arange(seq_len)
+        seg_id = jnp.searchsorted(cu_seqlens[1:], positions, side="right")  # per-token segment
+        mask = seg_id[:, None] != seg_id[None, :]  # block out cross-image keys
+        window_size = (
+            self.window_size[0] if isinstance(self.window_size, tuple) else self.window_size
+        )
+        if not full_attn and window_size > 0:
+            distance = jnp.abs(positions[:, None] - positions[None, :])
+            mask = mask | (distance > window_size)
+        attn_weights = jnp.where(mask[None, None, :, :], neg, attn_weights)
 
-            attn_weights = jnp.einsum("bnth,bnsh->bnts", query_chunk, key_chunk) * self.scale
-            window_size = (
-                self.window_size[0] if isinstance(self.window_size, tuple) else self.window_size
+        if self.use_sink and self.sinks is not None:
+            # Original added the sink to each chunk's column 0 (the chunk's first key), AFTER the
+            # window mask. Here: each query's segment-start key. Masked start-keys stay ~neg.
+            seg_start = cu_seqlens[seg_id]  # [seq] start index of each query's segment
+            is_start_key = positions[None, :] == seg_start[:, None]  # [seq(q), seq(k)]
+            sink = self.sinks[...][None, :, None, None].astype(attn_weights.dtype)  # [1, n, 1, 1]
+            attn_weights = attn_weights + sink * is_start_key[None, None, :, :].astype(
+                attn_weights.dtype
             )
-            if not full_attn and window_size > 0:
-                chunk_len = query_chunk.shape[2]
-                positions = jnp.arange(chunk_len)
-                distance = jnp.abs(positions[:, None] - positions[None, :])
-                mask = distance > window_size
-                attn_weights = jnp.where(
-                    mask[None, None, :, :],
-                    jnp.finfo(attn_weights.dtype).min,
-                    attn_weights,
-                )
-            if self.use_sink and self.sinks is not None:
-                sink = jnp.broadcast_to(
-                    self.sinks[...][None, :, None].astype(attn_weights.dtype),
-                    (1, self.num_heads, query_chunk.shape[2]),
-                )
-                attn_weights = attn_weights.at[..., 0].add(sink)
-            attn_weights = jax.nn.softmax(attn_weights.astype(jnp.float32), axis=-1).astype(
-                hidden_states.dtype
-            )
-            attn_output = jnp.einsum("bnts,bnsh->bnth", attn_weights, value_chunk)
-            outputs.append(jnp.transpose(attn_output[0], (1, 0, 2)))
 
-        attn_output = jnp.concatenate(outputs, axis=0)
+        attn_weights = jax.nn.softmax(attn_weights.astype(jnp.float32), axis=-1).astype(
+            hidden_states.dtype
+        )
+        attn_output = jnp.einsum("bnts,bnsh->bnth", attn_weights, v)  # [1, n, seq, h]
+        attn_output = jnp.transpose(attn_output[0], (1, 0, 2))  # [seq, n, h]
         attn_output = attn_output.reshape(seq_len, self.num_heads * self.head_dim)
         return self.proj(attn_output)
 
@@ -553,8 +554,6 @@ class MiMoVisionTransformer(nnx.Module):
 
     def load_weights_from_safetensors(self, model_path: str, config=None) -> None:
         load_weights_from_safetensors(self, model_path, config or self.config)
-
-
 
 
 def load_weights_from_safetensors(model: nnx.Module, model_path: str, config) -> None:

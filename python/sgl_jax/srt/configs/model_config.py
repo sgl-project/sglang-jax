@@ -157,6 +157,20 @@ class ModelConfig:
                 ignored = list(self.quantization_config.ignored_layers or [])
                 ignored.extend(["model.eh_proj", "model.mtp_block.self_attn.o_proj"])
                 self.quantization_config.ignored_layers = ignored
+
+        # MiMo-V2.5 multimodal ships hf_config.architectures = ["MiMoV2ForCausalLM"] (the bare
+        # backbone) with vision_config/audio_config nested. Route it to the in-model multimodal
+        # wrapper so the standard ModelRegistry resolves the towers+embed_mm class, not the
+        # text-only backbone (mirrors the draft-model remaps above; mutually exclusive with them).
+        # Text-only MiMoV2 (no vision_config) stays the backbone.
+        if (
+            not is_draft_model
+            and self.hf_config.architectures
+            and self.hf_config.architectures[0] in ("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM")
+            and getattr(self.hf_config, "vision_config", None) is not None
+        ):
+            self.hf_config.architectures[0] = "MiMoV2_5ForConditionalGeneration"
+
         # Check model type
         self.is_generation = is_generation_model(self.hf_config.architectures, is_embedding)
         self.is_multimodal = is_multimodal_model(self.hf_config)

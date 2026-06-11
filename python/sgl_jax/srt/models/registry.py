@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 _UNDERSTANDING_MM_MODEL_MODULES = [
     "sgl_jax.srt.multimodal.models.qwen2_5VL.qwen2_5_vl",
     "sgl_jax.srt.multimodal.models.qwen3_omni_moe.qwen3_omni_inmodel",
+    "sgl_jax.srt.multimodal.models.mimo_v2_5.mimo_v2_5_inmodel",
 ]
 
 

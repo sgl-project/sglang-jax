@@ -301,6 +301,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             mm_audio_feature_lengths,
             mm_real_llm_dims=None,
             mm_real_video_llm_dims=None,
+            mm_audio_codes=None,
         ):
             model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
             model = nnx.merge(model_def, model_state)
@@ -314,6 +315,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 mm_audio_feature_lengths,
                 mm_real_llm_dims=mm_real_llm_dims,
                 mm_real_video_llm_dims=mm_real_video_llm_dims,
+                mm_audio_codes=mm_audio_codes,
             )
 
         if hasattr(self.model, "embed_mm"):
@@ -328,6 +330,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 mm_audio_feature_lengths,
                 mm_real_llm_dims=None,
                 mm_real_video_llm_dims=None,
+                mm_audio_codes=None,
             ):
                 return jitted_embed_mm(
                     model_def,
@@ -342,6 +345,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                     mm_audio_feature_lengths,
                     mm_real_llm_dims=mm_real_llm_dims,
                     mm_real_video_llm_dims=mm_real_video_llm_dims,
+                    mm_audio_codes=mm_audio_codes,
                 )
 
             self.jitted_embed_mm = embed_mm_wrapper
@@ -693,7 +697,8 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 a = assemble(r.mm_inputs)
                 img_px, vid_px = a.get("pixel_values_images"), a.get("pixel_values_videos")
                 aud_feats = a.get("audio_features")
-                if img_px is None and vid_px is None and aud_feats is None:
+                aud_codes = a.get("audio_codes")  # MiMo-V2.5 RVQ discrete codes (int)
+                if img_px is None and vid_px is None and aud_feats is None and aud_codes is None:
                     continue
                 # Audio: continuous-mel features (traced) + per-audio length (static; the tower
                 # chunks by it). Derive lengths from the attention mask (per-audio mel length).
@@ -752,6 +757,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                         _put(aud_feats, bf16=True),
                         aud_len,
                         mm_real_llm_dims=real_llm_dims,
+                        mm_audio_codes=_put(aud_codes),  # int RVQ codes (MiMo); no bf16 cast
                     )
                 if _vit_compiles() > 0:
                     logger.info(
