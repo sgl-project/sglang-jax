@@ -43,6 +43,32 @@ def validate_input_length(
     return None
 
 
+def validate_pd_no_chunked_prefill(
+    req: Req, disaggregation_mode: str, chunked_prefill_size: int | None
+) -> str | None:
+    """Reject PD requests whose prompt would be chunked.
+
+    PD disaggregation does not support chunked prefill: process_prefill_chunk
+    replaces process_batch_result for PD batches, so a chunked req never
+    advances past its first chunk and leaks KV until OOM. Guard against it
+    until chunk-prefill-transfer lands.
+
+    Returns an error message if the request must be rejected, else None.
+    """
+    if disaggregation_mode == "null":
+        return None
+    if not chunked_prefill_size or chunked_prefill_size <= 0:
+        return None
+    if len(req.origin_input_ids) > chunked_prefill_size:
+        return (
+            f"Input length ({len(req.origin_input_ids)} tokens) exceeds "
+            f"chunked_prefill_size ({chunked_prefill_size} tokens). PD "
+            f"disaggregation does not support chunked prefill; raise "
+            f"--chunked-prefill-size or use a shorter input."
+        )
+    return None
+
+
 @jax.jit(static_argnames=("mesh"))
 def resolve_future_token_ids(input_ids, future_token_ids_map, mesh):
     input_ids_global = jax.sharding.reshard(input_ids, NamedSharding(mesh, P()))

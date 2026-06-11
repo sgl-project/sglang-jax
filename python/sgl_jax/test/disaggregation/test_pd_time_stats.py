@@ -68,6 +68,7 @@ class TestPrefillPhases:
         phases = ts.phases()
         assert phases["queue"] == pytest.approx(0.1)
         assert phases["forward"] == pytest.approx(0.2)
+        assert phases["stage"] == pytest.approx(0.05)
         assert phases["transfer"] == pytest.approx(0.3)
         assert phases["total"] == pytest.approx(0.65)
 

@@ -222,6 +222,7 @@ class Req:
         self.bootstrap_port: int | None = None
         self.bootstrap_room: int | None = None
         self.disagg_transfer_id: str | None = None
+        self.disagg_host_buffer_id: int | None = None
 
         # Memory pool info
         self.req_pool_idx: int | None = None
@@ -476,17 +477,18 @@ class Req:
         return self.fill_ids[:max_prefix_len]
 
     def pop_committed_kv_cache(self) -> int:
-        assert (
-            not self.kv_committed_freed
-        ), f"Committed KV cache already freed ({self.kv_committed_len=})"
+        # Idempotent: the PD prefill abort path can run release a second time
+        # (cache_finished_req) after a handoff failure already freed the KV.
+        # Return 0 on repeat so the caller frees an empty slice instead of
+        # crashing the scheduler on a double-free assertion.
+        if self.kv_committed_freed:
+            return 0
         self.kv_committed_freed = True
         return self.kv_committed_len
 
     def pop_overallocated_kv_cache(self) -> tuple[int, int]:
-        assert not self.kv_overallocated_freed, (
-            "Overallocated KV cache already freed, "
-            f"{self.kv_committed_len=}, {self.kv_allocated_len=}"
-        )
+        if self.kv_overallocated_freed:
+            return 0, 0
         self.kv_overallocated_freed = True
         return self.kv_committed_len, self.kv_allocated_len
 

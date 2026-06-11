@@ -37,7 +37,7 @@ from sgl_jax.srt.disaggregation.common.metrics import (
 )
 from sgl_jax.srt.disaggregation.common.zmq_notifier import ZmqPullNotifier
 from sgl_jax.srt.disaggregation.jax_transfer.wrapper import JaxTransferWrapper
-from sgl_jax.srt.mem_cache.host_kv_pool import HostKVPool, StagedData
+from sgl_jax.srt.mem_cache.host_kv_pool import HostKVPool
 
 __all__ = [
     "JaxTransferKVManager",
@@ -74,8 +74,9 @@ class TransferStatus:
     ``uuid`` is the wire-level base uuid for this request.
     ``sub_uuids`` lists all per-entry uuids registered with the
     backend (format: ``f"{uuid}:{entry_name}"``).
-    ``on_done`` is the composite cleanup hook (path A returns all
-    host buffers to the pool; path B is a no-op).
+    ``on_done`` is currently a no-op for both path A and path B. The
+    host-pool slot reserved for D2H staging is released exactly once by
+    the scheduler's prefill-terminal callback (single-owner), NOT here.
     """
 
     uuid: str
@@ -137,6 +138,7 @@ class JaxTransferKVManager(CommonKVManager):
         payload: dict[str, jax.Array],
         *,
         use_d2h_staging: bool,
+        buffer_id: int | None = None,
     ) -> TransferStatus:
         """Register ``payload`` entries for remote pull under sub-uuids.
 
@@ -159,30 +161,28 @@ class JaxTransferKVManager(CommonKVManager):
             if self._host_pool is None:
                 raise RuntimeError(
                     "use_d2h_staging=True requires a host_pool on the "
-                    "manager; pass one via JaxTransferKVManager("
-                    "..., host_pool=...)"
+                    "manager; pass one via JaxTransferKVManager(..., host_pool=...)"
+                )
+            if buffer_id is None:
+                raise RuntimeError(
+                    "use_d2h_staging=True requires a reserved buffer_id "
+                    "(reserved at admission in get_new_batch_prefill)"
                 )
             pool = self._host_pool
-            buffer_ids: list[int] = []
             try:
-                for name, arr in payload.items():
+                for name, arr_pytree in payload.items():
                     sub = f"{uuid}:{name}"
-                    staged: StagedData = pool.copy_from_device(arr)
-                    self._wrapper.register_pull(sub, staged.array)
+                    staged = pool.copy_from_device(arr_pytree, buffer_id)
+                    self._wrapper.register_pull(sub, staged.array_pytree)
                     sub_uuids.append(sub)
-                    buffer_ids.append(staged.buffer_id)
             except Exception:
+                # Roll back wrapper registrations only. The pool slot is owned
+                # by the scheduler prefill-terminal callback, which releases it
+                # during the abort that follows this raise.
                 for sub_uuid in sub_uuids:
                     self._wrapper.release(sub_uuid)
-                for bid in buffer_ids:
-                    pool.put_buffer(bid)
                 raise
-
-            def _on_done() -> None:
-                for _bid in buffer_ids:
-                    pool.put_buffer(_bid)
-
-            return TransferStatus(uuid=uuid, sub_uuids=tuple(sub_uuids), on_done=_on_done)
+            return TransferStatus(uuid=uuid, sub_uuids=tuple(sub_uuids), on_done=lambda: None)
 
         # path B: direct from HBM
         try:
@@ -231,6 +231,7 @@ class JaxTransferKVSender(KVSender, StateHolder):
         self._transfer_id: str | None = None
         self._payload: dict[str, jax.Array] | None = None
         self._use_d2h_staging: bool | None = None
+        self._buffer_id: int | None = None
         self._status: TransferStatus | None = None
         self._state_lock = threading.Lock()
         self._ack_timer: object | None = None
@@ -253,13 +254,16 @@ class JaxTransferKVSender(KVSender, StateHolder):
             self._transfer_id = transfer_id or self._req_id
             self._transition_to(KVPoll.WAITING_FOR_INPUT)
 
-    def attach_payload(self, payload: dict[str, jax.Array], *, use_d2h_staging: bool) -> None:
+    def attach_payload(
+        self, payload: dict[str, jax.Array], *, use_d2h_staging: bool, buffer_id: int | None = None
+    ) -> None:
         if self._payload is not None:
             raise RuntimeError(f"sender {self._req_id!r} payload already attached")
         if not payload:
             raise ValueError(f"sender {self._req_id!r} payload must be non-empty")
         self._payload = payload
         self._use_d2h_staging = use_d2h_staging
+        self._buffer_id = buffer_id
 
     def send(self) -> None:
         if self._payload is None:
@@ -278,6 +282,7 @@ class JaxTransferKVSender(KVSender, StateHolder):
                     self.uuid,
                     self._payload,
                     use_d2h_staging=self._use_d2h_staging,
+                    buffer_id=self._buffer_id,
                 )
             except Exception:
                 self._mgr.zmq_notifier.unregister_callback(callback_uuid)
@@ -531,7 +536,11 @@ class JaxTransferKVReceiver(KVReceiver, StateHolder):
         if state == KVPoll.TRANSFERRING:
             if self._results is None:
                 return state
-            if not all(r.is_ready() for r in self._results.values()):
+            if not all(
+                leaf.is_ready()
+                for r in self._results.values()
+                for leaf in jax.tree.leaves(r)
+            ):
                 return state
             assert self._metadata is not None
             with self._state_lock:
