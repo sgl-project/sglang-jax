@@ -370,17 +370,6 @@ Mean ITL (ms):                           9.83
 ==================================================
 ```
 
-## 5. Troubleshooting
-
-| Symptom | Likely cause | Fix |
-|---|---|---|
-| `ValueError: Expected intermediate_size=768 to be aligned to bf=512` at startup (30B-A3B) | `--moe-backend fused` requires `moe_intermediate_size % 512 == 0`; Qwen3-30B-A3B has 768 | Switch to `--moe-backend epmoe`. See §2.4 MoE Backend. |
-| OOM at startup | `--mem-fraction-static` too high | Lower by 0.02. Verify `--tp-size 16` matches v6e-16 chip count (4 × 4 = 16). |
-| Tool calls return empty arguments | `--tool-call-parser` not set | Add `--tool-call-parser qwen25`. |
-| No `reasoning_content` in response | `--reasoning-parser` not set | Add `--reasoning-parser qwen3`. |
-| Multi-node hang at init | `--dist-init-addr` unreachable | Verify the rank-0 internal IP and that the chosen port is open. |
-| First request takes ~4 min per node | JIT cache empty | Persist `JAX_COMPILATION_CACHE_DIR`; mount a shared PVC across nodes for amortized compilation. |
-
 ## Additional Resources
 
 - [Qwen3-30B-A3B model card](https://huggingface.co/Qwen/Qwen3-30B-A3B)

@@ -467,17 +467,6 @@ The fused MoE tuned-config table covers the EP=8 shapes (server logs report `Usi
 
 **Other workload cells**: _Pending_ — additional v6e-16 (ISL, OSL, concurrency) combinations not yet measured. PR the full `============ Serving Benchmark Result ============` block from `bench_serving` when measured.
 
-## 5. Troubleshooting
-
-| Symptom | Likely cause | Fix |
-|---|---|---|
-| OOM at startup | Weights don't fit | Lower `--mem-fraction-static` to 0.90; verify `--tp-size` matches device count (8 for v7x-8, 16 for v6e-16). |
-| SWA pool exhaustion at runtime | Too much concurrent decode demand on SWA layers | Lower `--max-running-requests`, or raise `--swa-full-tokens-ratio`. Observe `swa token usage` in server logs. |
-| Full-attention pool exhaustion | Long full-attention KV demand exceeds budget | Lower `--swa-full-tokens-ratio` (shifts pool toward full layers), or shorten `--context-length`. |
-| First request takes ~4 min | JIT cache empty | Persist `JAX_COMPILATION_CACHE_DIR` across restarts (host volume mount in Docker; PVC in GKE). |
-| Multi-node hang at `jax.distributed.initialize` | `--dist-init-addr` unreachable | Verify rank-0 IP and port reachable from all nodes; check firewall on the JAX init port. |
-| `fused` MoE backend slower than `epmoe` on single-host v7x-8 | Expected — see §4.2 measurements | Use `--moe-backend epmoe` for EP ≤ 8; `fused` is the right pick at EP ≥ 16. |
-
 ## Additional Resources
 
 - [MiMo-V2-Flash Model Card](https://huggingface.co/XiaomiMiMo/MiMo-V2-Flash)

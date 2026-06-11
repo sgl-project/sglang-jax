@@ -20,13 +20,14 @@ End-to-end recipes for serving specific models on specific TPU (or GPU) topologi
 
 ## Conventions
 
-Every recipe follows the **same five-section template** so you can scan any page the same way:
+Every recipe follows the **same four-section template** so you can scan any page the same way:
 
 1. **Model Introduction** — variants, parameter sizes, HuggingFace links, license, recommended sampling params.
 2. **Deployment** — 2.1 Hardware Matrix · 2.2 Environment · 2.3 Launch (single-host + multi-host) · 2.4 Configuration Tips.
 3. **Invocation** — basic `curl` / OpenAI-compatible request examples; reasoning / tool-call patterns where applicable.
 4. **Benchmark** — accuracy (`evalscope`) and throughput (`bench_serving`) commands with reference numbers.
-5. **Troubleshooting** — model-specific symptom → cause → fix table. Generic issues go to [`troubleshooting.md`](troubleshooting.md).
+
+Model-specific constraints are documented inline in each recipe's §2.4 Configuration Tips; cross-cutting startup / multi-node / runtime failures live in [`troubleshooting.md`](troubleshooting.md).
 
 Recipes carry one of five status banners at the top:
 
@@ -79,7 +80,7 @@ Vision-language and diffusion rows are constrained by SGL-JAX's built-in staged 
    - Validated multi-host reference: [`autoregressive/Moonshotai/Kimi-Linear.md`](autoregressive/Moonshotai/Kimi-Linear.md) shows the complete multi-host benchmark / accuracy structure.
    - Partially validated large-MoE pattern: [`autoregressive/Xiaomi/MiMo-V2.5-Pro.md`](autoregressive/Xiaomi/MiMo-V2.5-Pro.md) is the broadest GKE / multi-host reference, with some benchmark cells still pending.
    - Starter pattern: [`autoregressive/Llama/Llama3.1.md`](autoregressive/Llama/Llama3.1.md) is the smallest skeleton.
-2. Copy its five-section structure.
+2. Copy its four-section structure.
 3. Place the new file under `autoregressive/<Vendor>/` (PascalCase, matching upstream [sgl-cookbook](https://github.com/sgl-project/sgl-cookbook/tree/main/docs/autoregressive) naming). Create a new vendor subdir if needed.
 4. Mark the top banner **Starter** until you have measured numbers; then upgrade to **Partially validated** or **Validated** based on the status legend.
 5. Fill in real `evalscope` and `bench_serving` outputs — do not leave `_Pending_` cells in a Validated recipe's claimed primary path.

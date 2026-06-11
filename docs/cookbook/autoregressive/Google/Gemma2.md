@@ -187,15 +187,6 @@ Mean ITL (ms):                           14.48
 ==================================================
 ```
 
-## 5. Troubleshooting
-
-| Symptom | Likely cause | Fix |
-|---|---|---|
-| Gemma 2 27B OOM at startup | `--mem-fraction-static 0.88` (default) too high for dual KV pools | Lower to 0.85 or 0.8. Verify `--tp-size 4` matches v6e-4 chip count. |
-| Output throughput stuck near single-stream (~150 tok/s); TTFT > 5 s under concurrent load | `--page-size` defaulted to 1 → scheduler logs `Final max_running_requests: 1` and serializes requests | Add `--page-size 128 --max-running-requests 64` (see §2.4 Paging / concurrency). |
-| Sliding-window pool exhaustion at high concurrency | `--swa-full-tokens-ratio` mismatches workload sequence-length distribution | Lower the ratio to give the sliding pool more capacity. See [troubleshooting §SWA pool exhaustion](../../troubleshooting.md#swa-pool-exhaustion-mimo-hybrid-attention-models). |
-| First request takes ~4 min | JIT cache empty | Persist `JAX_COMPILATION_CACHE_DIR` across restarts. |
-
 ## Additional Resources
 
 - [Gemma 2 27B-it model card](https://huggingface.co/google/gemma-2-27b-it)

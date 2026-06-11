@@ -101,6 +101,9 @@ For temporary v6e experiments, advanced users can adapt [SkyPilot launcher](../.
 - `--page-size 128` reduces KV page-table overhead.
 - `--chunked-prefill-size 2048` bounds peak HBM during long-prompt prefill — Kimi-Linear's linear-attention benefit is most visible on long prompts.
 
+**Multi-host launch:**
+- Dispatch all ranks within seconds of each other — a >5-min stagger between ranks trips the JAX distributed service's RPC deadline (`RegisterTask DEADLINE_EXCEEDED`) on the early-arriving ranks. Fan the launch out (parallel `kubectl exec`) rather than starting ranks one by one.
+
 **Compilation Cache Hygiene:**
 - `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache` is mandatory — without it, first request blocks ~4 min per node.
 - Mount a shared PVC across the cluster's 4 nodes to amortize compilation.
@@ -217,17 +220,6 @@ Within the ±2.3 pp sampling-noise band at limit=200; v6e-32 doubling TP does no
 | TPU v6e-32 | sglang-jax 0.1.0 | 140.55 | 1457.14 | 728.57 | 19.72 | 526.89 |
 
 v6e-32 delivers ~5% throughput / 13% TTFT improvement over v6e-16. Scaling is sublinear because Kimi-Linear's sparse 3B-activated MoE caps the per-token chip utilization — the larger slice's main win is HBM headroom for long-context recurrent state, not raw token throughput.
-
-## 5. Troubleshooting
-
-| Symptom | Likely cause | Fix |
-|---|---|---|
-| `AssertionError: Hybrid recurrent state models require --disable-radix-cache` at startup | Prefix / radix caching for hybrid recurrent models is planned but not yet shipped. | Pass `--disable-radix-cache` (mandatory for Kimi-Linear until the caching path lands) — see §2.4. |
-| `RegisterTask DEADLINE_EXCEEDED` (5 min) on multi-host launch | Ranks dispatched too far apart — the JAX distributed service has a 5-min RPC deadline | Dispatch all ranks within seconds of each other (parallel `kubectl exec`); a >5-min stagger between ranks fails registration on the early-arriving ranks. |
-| OOM at startup | Recurrent state + KV exceed budget | Lower `--recurrent-state-memory-ratio` (e.g. to 0.7) and/or `--mem-fraction-static` to 0.88. |
-| Long-prompt requests stall | KV cache exhausted before recurrent state | Lower `--recurrent-state-memory-ratio` to give the KV cache more headroom. |
-| Multi-node hang at init | `--dist-init-addr` unreachable from non-rank-0 nodes | Verify the rank-0 internal IP and that the chosen port is open. |
-| First request takes ~4 min per node | JIT cache empty | Persist `JAX_COMPILATION_CACHE_DIR`; mount a shared PVC across nodes for amortized compilation. |
 
 ## Additional Resources
 
