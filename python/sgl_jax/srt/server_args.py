@@ -189,6 +189,13 @@ class ServerArgs:
 
     disable_precompile: bool = False
 
+    # G1 (design §5.7): HBM (bytes) to reserve for the in-model vision/audio encoder's peak
+    # activations, subtracted from the KV-cache budget so a large-vision request can't OOM the
+    # KV pool. 0 = off (single-image fits comfortably under mem_fraction_static; the auto-sized
+    # AOT memory_analysis variant -- design option (3) -- is a follow-up). Set for video / many-
+    # image production workloads.
+    vision_activation_reserve_bytes: int = 0
+
     # Speculative decoding
     speculative_algorithm: str | None = None
     speculative_draft_model_path: str | None = None
@@ -1091,6 +1098,14 @@ class ServerArgs:
             "--disable-precompile",
             action="store_true",
             help="whether disable precompile",
+        )
+        parser.add_argument(
+            "--vision-activation-reserve-bytes",
+            type=int,
+            default=ServerArgs.vision_activation_reserve_bytes,
+            help="HBM bytes to reserve for the in-model vision/audio encoder's peak activations "
+            "(subtracted from the KV-cache budget so large-vision requests can't OOM the pool). "
+            "0 = off; set for video / many-image workloads.",
         )
         # Kernel backend
         parser.add_argument(

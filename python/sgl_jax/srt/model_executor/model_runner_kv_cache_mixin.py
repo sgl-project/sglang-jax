@@ -222,6 +222,13 @@ class ModelRunnerKVCacheMixin:
         """Profile available bytes for KV cache (+ recurrent state)."""
         available_device_memory = self.get_available_device_memory()
         rest_memory = available_device_memory - total_device_memory * (1 - self.mem_fraction_static)
+        # G1 (design §5.7): reserve HBM for the in-model vision/audio encoder's peak activations
+        # (a separate jit from the AR -- the KV pool is otherwise blind to it). Subtract before
+        # sizing the KV pool so a large-vision request can't OOM it. 0 = off (the auto-sized AOT
+        # memory_analysis variant is a follow-up); set for video / many-image workloads.
+        vision_reserve = getattr(self.server_args, "vision_activation_reserve_bytes", 0) or 0
+        if vision_reserve > 0:
+            rest_memory -= vision_reserve
         if rest_memory <= 0:
             raise RuntimeError("Not enough memory. Please try to increase --mem-fraction-static.")
 
