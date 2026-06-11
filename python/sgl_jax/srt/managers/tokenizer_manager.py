@@ -306,6 +306,23 @@ class TokenizerManager:
                 )
             encoded = self.tokenizer(input_text)
             input_ids = encoded["input_ids"]
+
+        if hasattr(input_ids, "input_ids"):
+            input_ids = input_ids.input_ids
+        elif isinstance(input_ids, dict) and "input_ids" in input_ids:
+            input_ids = input_ids["input_ids"]
+        if hasattr(input_ids, "tolist"):
+            input_ids = input_ids.tolist()
+        if (
+            isinstance(input_ids, (list, tuple))
+            and len(input_ids) > 0
+            and isinstance(input_ids[0], (list, tuple))
+        ):
+            if len(input_ids) > 1:
+                raise ValueError("Nested batch input is not supported for a single request.")
+            input_ids = input_ids[0]
+        input_ids = list(input_ids)
+
         self._validate_one_request(obj, input_ids)
         return self._create_tokenized_object(obj, input_text, input_ids)
 

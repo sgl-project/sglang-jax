@@ -253,12 +253,7 @@ Assistant: {% endif %}"""
                 **chat_template_kwargs,
             )
 
-        if (
-            hasattr(prompt_ids, "get")
-            and "input_ids" in prompt_ids
-            or isinstance(prompt_ids, dict)
-            and "input_ids" in prompt_ids
-        ):
+        if isinstance(prompt_ids, dict) and "input_ids" in prompt_ids:
             prompt_ids = prompt_ids["input_ids"]
         if hasattr(prompt_ids, "tolist"):
             prompt_ids = prompt_ids.tolist()

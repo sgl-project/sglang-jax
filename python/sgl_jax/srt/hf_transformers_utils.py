@@ -69,7 +69,7 @@ def download_from_hf(
         return model_path
 
     if allow_patterns is _UNSET:
-        allow_patterns = ["*.json", "*.bin", "*.model", "*.py", "*.tiktoken"]
+        allow_patterns = ["*.json", "*.bin", "*.model", "*.py", "*.tiktoken", "*.jinja"]
     return snapshot_download(model_path, allow_patterns=allow_patterns, cache_dir=cache_dir)
 
 
@@ -294,8 +294,8 @@ def get_tokenizer(
                 model_config_data = json.load(f)
                 if model_config_data.get("model_type") == "gemma4":
                     kwargs.setdefault("extra_special_tokens", {})
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("Failed to inspect config.json for extra_special_tokens workaround: %s", e)
     if sub_dir:
         # Only append sub_dir if it actually exists
         sub_dir_path = tokenizer_name + "/" + sub_dir
@@ -318,8 +318,8 @@ def get_tokenizer(
             if os.path.exists(jinja_template_path):
                 with open(jinja_template_path) as f:
                     tokenizer.chat_template = f.read()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Failed to load chat_template.jinja: %s", e)
 
     except Exception as e:
         if tokenizer_backend == "fastokens":

@@ -158,8 +158,8 @@ class Gemma4Attention(nnx.Module):
         if not self.is_sliding:
             self.head_dim = getattr(
                 config,
-                "global_head_dim",
-                getattr(config, "head_dim", self.hidden_size // self.num_heads),
+                "head_dim",
+                self.hidden_size // self.num_heads,
             )
         else:
             self.head_dim = getattr(
@@ -172,8 +172,8 @@ class Gemma4Attention(nnx.Module):
         if self.use_k_eq_v:
             self.num_kv_heads = getattr(
                 config,
-                "num_global_key_value_heads",
-                getattr(config, "num_key_value_heads", self.num_heads),
+                "num_key_value_heads",
+                self.num_heads,
             )
         else:
             self.num_kv_heads = getattr(
