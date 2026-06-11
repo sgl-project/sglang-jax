@@ -222,6 +222,14 @@ class JaxTransferWrapper:
         link = self._connect(remote_addr)
         return link.pull(_uuid_to_int(uuid), spec)
 
+    def connect(self, remote_addr: str) -> None:
+        """Eagerly establish (and cache) a link to ``remote_addr`` so a later
+        latency-sensitive ``pull`` does not pay connection setup inline."""
+
+        if not self._started:
+            raise RuntimeError("JaxTransferWrapper.start() must be called before connect()")
+        self._connect(remote_addr)
+
     def release(self, uuid: str) -> None:
         """Drop the wrapper's reference to a previously registered buffer.
 
