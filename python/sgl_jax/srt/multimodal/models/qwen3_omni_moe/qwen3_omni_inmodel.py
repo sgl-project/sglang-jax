@@ -155,6 +155,14 @@ class Qwen3OmniMoeForConditionalGeneration(nnx.Module):
         fused = merge(text_embed, mod_embeds, placeholder_ids, input_ids, mesh=self.mesh).embed
         deepstack = visual_pos_mask = None
         if multiscale is not None:
+            # A12(5) guard: the AR injects deepstack level i after layer i, deriving the level
+            # count from this tensor's leading dim. Assert it matches the configured target layers
+            # so an encoder/config drift fails loudly instead of silently mis-injecting.
+            expected_levels = len(self.thinker_config.vision_config.deepstack_visual_indexes)
+            assert multiscale.shape[0] == expected_levels, (
+                f"deepstack level count mismatch: encoder emitted {multiscale.shape[0]} levels, "
+                f"vision_config.deepstack_visual_indexes has {expected_levels}"
+            )
             visual_ids = jnp.asarray(
                 [t for t in (self.image_token_id, self.video_token_id) if t is not None],
                 dtype=input_ids.dtype,

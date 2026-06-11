@@ -171,6 +171,16 @@ class SchedulerOutputProcessorMixin:
 
                 if req.is_chunked <= 0:
                     req.output_ids.append(next_token_id)
+                    # C-3 (design §5.2): prefill is fully done -> free the host-held fused
+                    # embedding + deepstack arrays. Decode never slices them (ScheduleBatch.
+                    # _merge_multimodal is extend-only), so they are dead weight from here. Keep
+                    # mm_items.feature: a retracted req re-prefills and encode_mm_reqs rebuilds
+                    # multimodal_embedding from it (it only rebuilds when multimodal_embedding is
+                    # None, which freeing here restores). Memory hygiene; correctness unaffected.
+                    if getattr(req, "multimodal_embedding", None) is not None:
+                        req.multimodal_embedding = None
+                        req.deepstack_visual_embedding = None
+                        req.deepstack_visual_pos_mask = None
                     req.check_finished()
                     if req.finished():
                         self.maybe_collect_routed_experts(req)
