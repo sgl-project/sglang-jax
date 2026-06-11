@@ -124,12 +124,6 @@ class BaseSpecWorker:
     def _can_use_fused_spec_prefill(self, model_worker_batch: ModelWorkerBatch) -> bool:
         if os.getenv("SGL_JAX_DISABLE_FUSED_SPEC_PREFILL") == "1":
             return False
-        real_bs_per_dp = getattr(model_worker_batch, "real_bs_per_dp", None)
-        if real_bs_per_dp is not None and any(bs == 0 for bs in real_bs_per_dp):
-            # Fused spec prefill currently trips the p256 RPA kernel when a
-            # runtime prefill batch has empty DP ranks. Keep decode overlap
-            # enabled while falling back to the proven prefill path.
-            return False
         sampling_info = model_worker_batch.sampling_info
         penalizer = getattr(sampling_info, "penalizer_orchestrator", None)
         has_penalty = getattr(sampling_info, "linear_penalty", None) is not None or bool(
