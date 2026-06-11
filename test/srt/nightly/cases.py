@@ -10,6 +10,8 @@ Multi-host-only types (``RuntimeConfig``, ``ModelRun``, ``MultiHostSuite``, the
 launch-profile validators) stay in ``test/srt/nightly/multi_host/multi_host_suite.py``.
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -155,3 +157,8 @@ class AccuracyCase:
     limit: int | None = None
     timeout: int | None = None
     score_threshold: float | None = None
+
+
+# Default gsm8k sampling (greedy). Lives here (host-neutral, stdlib-only) so the
+# suite catalog can build cases without importing the jax-backed case runners.
+GSM8K_GENERATION_CONFIG = {"temperature": 0.0, "max_tokens": 2048}

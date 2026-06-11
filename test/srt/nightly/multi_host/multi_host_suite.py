@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import sys
 from dataclasses import dataclass
@@ -9,11 +11,10 @@ for _p in (_TEST_SRT, _NIGHTLY_DIR, _SELF_DIR):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-# Host-neutral contracts live in test/srt/nightly/{cases,profiles}.py.
-# Re-exported here so existing `from multi_host_suite import ...` imports across
-# the multi_host package keep working unchanged.
+# Re-export the host-neutral case contracts from cases.py so `from multi_host_suite
+# import ...` keeps working. Kept stdlib-only (no profiles/pydantic) so suite_runner.py's
+# module import stays light (e.g. for --dry-run); RuntimeConfig comes from profiles where used.
 from cases import AccuracyCase, PerfCase, SuiteError  # noqa: E402,F401
-from profiles import RuntimeConfig  # noqa: E402,F401
 
 
 @dataclass(frozen=True)

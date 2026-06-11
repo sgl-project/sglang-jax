@@ -60,6 +60,13 @@ re-running the entire workflow.
 - `OWNER`, `MEMBER`, `COLLABORATOR` — allowed
 - All other associations — rejected with a reply comment
 
+> **Fork-PR safety:** these commands run the PR HEAD code on a runner with elevated
+> permissions (`pull-requests: write`, GKE/GCP OIDC, inherited secrets). The only
+> gate is the permission model above — same trust model as `/rerun-group` /
+> `/rerun-stage`. **Review a fork PR's diff before commenting `/run-nightly` (or any
+> rerun command) on it**, since you are authorizing untrusted code to run with those
+> permissions.
+
 *Supported Commands:*
 
 | Command | Description |
@@ -68,6 +75,16 @@ re-running the entire workflow.
 | `/test perf` | Add the `test:perf` label — the label event triggers CI with perf tests enabled |
 | `/rerun-group <suite>` | Run a specific test suite on the matching runner via `rerun-test.yml`. Suite names from `test/srt/run_suite.py`; runner derived from suffix (`-v6e-1`, `-v6e-4`, `-cpu`) |
 | `/rerun-stage <stage>` | Dispatch all suites in a stage independently via `rerun-test.yml`. Stage: `1`/`fast` (unit), `2`/`medium` (e2e+accuracy), `3`/`heavy` (performance) |
+| `/run-nightly <case_key>` | Run a single nightly case against the PR HEAD via `nightly-test-daily.yml` (`job_filter` + `--cases`); the result is posted back on the PR. `<case_key>` is a case name (e.g. `qwen3-8b-fa`). A 🚀 reaction marks the nightly as started (it comments PASS/FAIL back); an invalid key gets 😕 plus the valid list; a failed case also gets an AI bisect comment |
+| `/run-nightly` or `/run-nightly ?` | List the available `case_key`s (grouped by job). Use this to discover what you can run |
+
+*Where the case_keys come from:* not a hand-maintained list — the slash parser enumerates the single-host suite runner's catalog by invoking its `--caselist` (`test/srt/nightly/single_host/suite_runner.py`, a subprocess; the case list is dependency-light and needs no jax, so it runs on the CPU runner), so **adding a case to a suite makes it runnable via `/run-nightly` with nothing else to update**. It exposes all accuracy cases plus each perf model's representative point (`PerfCase.capture_trace`), since the sweep's other points only make sense as a set. Multi-host is not wired into `/run-nightly` — its nightly job stays `if: false` until CI has 4-node v6e capacity. The parser holds only a single-host suite→job map; any suite the runner exposes but the map doesn't name is silently skipped.
+
+*Using `/run-nightly` (maintainers):*
+- **Discover:** comment `/run-nightly ?` (or bare `/run-nightly`) → it replies with the runnable `case_key`s, grouped by job.
+- **Run one case:** comment `/run-nightly <case_key>` — e.g. `/run-nightly qwen3-8b-fa` (an accuracy case) or `/run-nightly qwen3-32b-c32-i4096-o1024` (a perf representative point). It runs that one case against the PR HEAD.
+- **Who can trigger:** `OWNER` / `MEMBER` / `COLLABORATOR` only (the shared slash-command permission gate); anyone else is rejected. Review a fork PR's diff first — this runs PR-HEAD code with elevated permissions.
+- **What you get:** a 🚀 reaction when the run starts, then a `PASS`/`FAIL` comment (with a run link) when it finishes. An invalid `case_key` gets a 😕 reaction plus the list of valid keys; a failed case also gets an AI root-cause (`ci-auto-bisect`) comment.
 
 *Architecture:*
 - `scripts/ci/slash_command_parse.py` — pure-Python parser (stdlib only), reads
@@ -77,7 +94,15 @@ re-running the entire workflow.
   loops through each suite in the stage and dispatches `rerun-test.yml` independently
 - `rerun-test.yml` — `workflow_dispatch` workflow for `/rerun-group` and `/rerun-stage`,
   accepts suite name, runner label, and git ref as inputs
-- The handler workflow reacts with thumbs-up and posts result comments on the PR
+- `nightly-test-daily.yml` — exposes `workflow_call`; `/run-nightly` invokes it as a
+  reusable workflow (`uses:` from slash-command.yml) with `ref=refs/pull/<N>/head`
+  (resolves for fork PRs too), `job_filter`, `cases`, and `pr_number`. Running it via
+  `uses:` keeps the nightly part of the Slash Command Handler run, so it never appears
+  as a standalone "Nightly Test Daily" run for the notifier / auto-bisect to mistake
+  for the scheduled nightly. The run job (read-only, no write token) executes the case; a separate clean job posts PASS/FAIL back to the PR
+- Most commands react 👍 and post result comments; `/run-nightly` instead reacts
+  🚀 when the nightly starts / 😕 on an invalid key, to keep the PR thread quiet — only
+  the final PASS/FAIL (and the on-demand case list) are comments
 
 ### PR Review (pr-review.yml)
 

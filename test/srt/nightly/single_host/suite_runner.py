@@ -13,6 +13,8 @@ Pass/fail is conveyed through the process exit code (same tagged codes as the
 multi-host runner) so CI can classify the result.
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import os
@@ -26,26 +28,17 @@ for _p in (_TEST_SRT, _NIGHTLY_DIR, _SELF_DIR):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from accuracy_case_runner import (  # noqa: E402
-    GSM8K_GENERATION_CONFIG,
-    load_profile_file,
-    profile_server_spec,
-    run_accuracy_case,
-)
 from cases import (  # noqa: E402
+    GSM8K_GENERATION_CONFIG,
     AccuracyCase,
     PerfCase,
     PerfParams,
     SuiteError,
     perf_sweep_cases,
 )
-from perf_case_runner import run_perf_case  # noqa: E402
 
-from sgl_jax.srt.utils import kill_process_tree  # noqa: E402
-from sgl_jax.test.test_utils import (  # noqa: E402
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    popen_launch_server,
-)
+# Case runners and sgl_jax are imported lazily in run_one(), not here, so
+# --caselist can enumerate cases without jax (it runs on a plain CPU runner).
 
 # Exit codes consumed by CI (same scheme as multi_host/suite_runner.py).
 EXIT_OK = 0
@@ -241,6 +234,20 @@ def run_one(run: SingleHostRun) -> None:
     load, server launch) propagate as-is. ``AccuracyCase`` and ``PerfCase`` are
     dispatched by type to their case runner.
     """
+    # Lazy: pull jax in only to actually run a case (keeps --caselist jax-free).
+    from accuracy_case_runner import (
+        load_profile_file,
+        profile_server_spec,
+        run_accuracy_case,
+    )
+    from perf_case_runner import run_perf_case
+
+    from sgl_jax.srt.utils import kill_process_tree
+    from sgl_jax.test.test_utils import (
+        DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+        popen_launch_server,
+    )
+
     profile = load_profile_file(run.launch_profile)
     spec = profile_server_spec(profile)
     _log(f"launching {profile.name} (model={spec['model']}, base_url={spec['base_url']})")
@@ -329,14 +336,37 @@ def _dry_run(suite: SingleHostSuite) -> dict:
     }
 
 
+def _caselist() -> list[dict]:
+    """Runnable /run-nightly cases across all suites, as [{"suite", "case"}].
+
+    Perf exposes only its representative point (PerfCase.capture_trace) — the
+    sweep's other points only make sense as a set; accuracy cases have no such
+    attr so all are listed. Touches only the stdlib `cases` catalog (no jax), so
+    the slash handler can call this on a plain CPU runner.
+    """
+    out: list[dict] = []
+    for suite_name, suite in SUITES.items():
+        for run in suite.runs:
+            for case in run.cases:
+                if getattr(case, "capture_trace", True) is False:
+                    continue
+                out.append({"suite": suite_name, "case": case.name})
+    return out
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run single-host SGL-JAX nightly suites")
-    parser.add_argument("--suite", required=True, choices=sorted(SUITES))
+    parser.add_argument("--suite", choices=sorted(SUITES))
     parser.add_argument(
         "--cases",
-        help="Comma-separated case_keys; run only these (e.g. for /run-nightly targeting).",
+        help="Comma-separated case names; run only these (e.g. for /run-nightly targeting).",
     )
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--caselist",
+        action="store_true",
+        help="Print runnable case_keys as JSON and exit (no jax needed).",
+    )
     return parser.parse_args()
 
 
@@ -358,6 +388,11 @@ def _select_cases(suite: SingleHostSuite, cases: str | None) -> SingleHostSuite:
 
 def main() -> int:
     args = parse_args()
+    if args.caselist:
+        print(json.dumps(_caselist(), indent=2, sort_keys=True))
+        return EXIT_OK
+    if not args.suite:
+        raise SystemExit("--suite is required (unless --caselist)")
     suite = _select_cases(SUITES[args.suite], args.cases)
     if args.dry_run:
         print(json.dumps(_dry_run(suite), indent=2, sort_keys=True))
