@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import logging
-import os
 from functools import partial
 from typing import NamedTuple
 
@@ -13,46 +11,6 @@ import numpy as np
 from flax import nnx
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
-
-# step0-gap instrument: per-step conditional hit accumulator (gated)
-_SH = {"uncond": None, "cond": None, "n": 0, "on": os.path.exists("/tmp/p2a-stephit")}
-_DUMP = {
-    "on": os.path.exists("/tmp/p2a-dext-dump"),
-    "dir": "/tmp/dext-dump",
-    "k": 0,
-}
-
-
-def _log_step_hit(draft_2d, predict_2d, sel):
-    """draft_2d/predict_2d: (padded_bs, n) host int32; sel: real-req indices."""
-    if not _SH["on"]:
-        return
-    d, t = draft_2d[sel], predict_2d[sel]
-    hit = d[:, 1:] == t[:, :-1]
-    cond = np.cumprod(hit, axis=1)
-    if _SH["uncond"] is None:
-        _SH["uncond"] = np.zeros(hit.shape[1], dtype=np.int64)
-        _SH["cond"] = np.zeros(hit.shape[1], dtype=np.int64)
-    _SH["uncond"] += hit.sum(0)
-    _SH["cond"] += cond.sum(0)
-    _SH["n"] += len(sel)
-    if _SH["n"] % 200 < len(sel):
-        n = _SH["n"]
-        logging.getLogger(__name__).info(
-            "[stephit] n=%d uncond=%s cond=%s E[accept]=%.3f",
-            n,
-            (_SH["uncond"] / n).round(3).tolist(),
-            (_SH["cond"] / n).round(3).tolist(),
-            1.0 + (_SH["cond"] / n).sum(),
-        )
-
-
-def _dump_dext_round(tag, **arrays):
-    if not _DUMP["on"]:
-        return
-    os.makedirs(_DUMP["dir"], exist_ok=True)
-    np.savez(f"{_DUMP['dir']}/{tag}-r{_DUMP['k']:04d}.npz", **arrays)
-    _DUMP["k"] += 1
 
 
 class SpecChainState(NamedTuple):
@@ -845,9 +803,6 @@ def _materialize_fused_greedy_batch_output_for_scheduler(
     """Materialize the scheduler-facing fields after the single fused decode JIT."""
     from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
 
-    import os as _os
-
-    _DBG = _os.path.exists("/tmp/p2a-dbg-retract")
     with jax.profiler.TraceAnnotation("fused_greedy_batch_output_d2h"):
         jax.copy_to_host_async(layer0_hidden)
         jax.copy_to_host_async(topk_index_stacked)
@@ -858,17 +813,7 @@ def _materialize_fused_greedy_batch_output_for_scheduler(
             next_token_logits=target_logits,
             hidden_states=target_hidden,
         )
-        if _DBG:
-            _lg = logging.getLogger(__name__)
-            _lg.info(
-                "DBGRT mat.d2h.pre l0h.sh=%s acc.sh=%s pred.sh=%s",
-                getattr(layer0_hidden, "sharding", None),
-                getattr(accept_lens_device, "sharding", None),
-                getattr(predict_device, "sharding", None),
-            )
         batch_output.next_draft_input.hidden_states = np.asarray(layer0_hidden)[selector]
-        if _DBG:
-            _lg.info("DBGRT mat.d2h.post")
         topk_index = np.asarray(topk_index_stacked)[selector]
         batch_output.next_draft_input.topk_p = np.ones(topk_index.shape, dtype=np.float32)
         batch_output.next_draft_input.topk_index = topk_index
@@ -1056,13 +1001,6 @@ def spec_decode(spec_worker, model_worker_batch, cur_allocate_lens):
             target_logits=target_logits,
             target_hidden=target_hidden,
         )
-        if _SH["on"]:
-            padded_bs = result.accept_lens.shape[0]
-            prev_vid = np.asarray(previous_verified_id, dtype=np.int32).reshape(padded_bs, 1)
-            prev_tl = np.asarray(previous_token_list, dtype=np.int32)[:, : n_draft - 1]
-            draft_2d = np.concatenate([prev_vid, prev_tl], axis=1)
-            predict_2d = np.asarray(result.next_token_ids).reshape(padded_bs, n_draft)
-            _log_step_hit(draft_2d, predict_2d, selector)
         return result
 
     pending = SpecDecodePending(

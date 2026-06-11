@@ -156,6 +156,7 @@ class ServerArgs:
     speculative_num_draft_tokens: int = 4
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
+    enable_spec_device_chain: bool = False
 
     # For deterministic sampling
     enable_deterministic_sampling: bool = False
@@ -1033,6 +1034,16 @@ class ServerArgs:
             type=float,
             help="The accept probability of a draft token is raised from its target probability p to min(1, p / threshold_acc).",
             default=ServerArgs.speculative_accept_threshold_acc,
+        )
+        parser.add_argument(
+            "--enable-spec-device-chain",
+            action="store_true",
+            help=(
+                "Under overlap scheduler with speculative decoding, keep verify "
+                "results on device and resolve them inside the next round's fused "
+                "JIT (avoids the d2h→h2d round-trip between rounds). Requires "
+                "--speculative-algorithm and overlap scheduler enabled."
+            ),
         )
 
         # For deterministic sampling

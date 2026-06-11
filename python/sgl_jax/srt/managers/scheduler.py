@@ -868,24 +868,13 @@ class Scheduler(
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and Accelerator computation."""
         if (
-            os.path.exists("/tmp/p2a-chain")
+            self.server_args.enable_spec_device_chain
             and self.spec_algorithm is not None
             and self.spec_algorithm.is_eagle()
         ):
             return self._event_loop_overlap_chain()
         self.result_queue = deque()
         self._spec_pending = None
-        _DBG = os.path.exists("/tmp/p2a-dbg-retract")
-
-        def _D(tag, b=None):
-            if not _DBG:
-                return
-            sh = (
-                f"mode={b.forward_mode.name} bs={[len(i.reqs or []) for i in b.reqs_info]}"
-                if b
-                else ""
-            )
-            logger.info("DBGRT %s %s", tag, sh)
 
         while True:
             recv_reqs = (
@@ -901,21 +890,15 @@ class Scheduler(
             if self._engine_paused:
                 continue
 
-            if self._spec_pending is not None:
-                _D("finalize.pre")
             self._finalize_pending_spec()
             self._drain_deferred_spec_release()
             batch = self.get_next_batch_to_run()
-            if batch is not None:
-                _D("get_batch.post", batch)
             self.cur_batch = batch
 
             if batch:
                 batch.launch_done = threading.Event()
                 with jax.profiler.TraceAnnotation("run_batch"):
-                    _D("run_batch.pre", batch)
                     result = self.run_batch(batch)
-                    _D("run_batch.post", batch)
                 batch_copy = batch.copy()
                 self.result_queue.append((batch_copy, result))
                 if getattr(result, "spec_pending", None) is not None:
@@ -947,11 +930,9 @@ class Scheduler(
                     getattr(self.tp_worker, "cur_sampling_info", None) if batch else None
                 )
                 # NOTE: we should use current launched batch's launch_done event Instead of the last batch's
-                _D("proc.pre", tmp_batch)
                 self.process_batch_result(
                     tmp_batch, tmp_result, batch.launch_done if batch else None
                 )
-                _D("proc.post")
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.check_memory()
@@ -979,7 +960,6 @@ class Scheduler(
         prepped = None  # (batch, copy, result, real_bs_per_dp)
         fallback_batch = None  # get_next_batch() result carried to next loop's fallback path
         _chain_stat = {"hit": 0, "miss_reshape": 0, "miss_mismatch": 0, "n": 0}
-        _chain_relax = os.path.exists("/tmp/p2a-chain-relax")
 
         def _real_bs(b):
             return tuple(len(i.reqs) if i.reqs else 0 for i in b.reqs_info)
@@ -1076,20 +1056,15 @@ class Scheduler(
                     for info in self.running_batch.reqs_info
                     for r in (info.reqs or [])
                 )
-                if _chain_relax:
-                    _all_full = all(
-                        len(i.reqs or []) >= self.per_dp_max_running_requests
-                        for i in self.running_batch.reqs_info
-                    )
-                    will_reshape = (
-                        _has_chunked
-                        or _has_finished
-                        or (len(self.waiting_queue) > 0 and not _all_full)
-                    )
-                else:
-                    will_reshape = (
-                        len(self.waiting_queue) > 0 or _has_chunked or _has_finished
-                    )
+                _all_full = all(
+                    len(i.reqs or []) >= self.per_dp_max_running_requests
+                    for i in self.running_batch.reqs_info
+                )
+                will_reshape = (
+                    _has_chunked
+                    or _has_finished
+                    or (len(self.waiting_queue) > 0 and not _all_full)
+                )
                 _chain_stat["n"] += 1
                 if will_reshape:
                     _chain_stat["miss_reshape"] += 1
@@ -2050,11 +2025,6 @@ class Scheduler(
         cur_bs = [len(i.reqs) if i.reqs else 0 for i in batch.reqs_info]
         if real_bs_per_dp is None:
             real_bs_per_dp = cur_bs
-        elif os.path.exists("/tmp/p2a-kvdbg"):
-            assert list(real_bs_per_dp) == cur_bs, (
-                f"reqs drift between dispatch and finalize: "
-                f"dispatch={list(real_bs_per_dp)} now={cur_bs}"
-            )
         if not skip_spec_info:
             per_rank_spec = ScheduleBatch._split_spec_info_per_rank(
                 batch_output.next_draft_input, real_bs_per_dp

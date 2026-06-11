@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import threading
 from typing import TYPE_CHECKING
 
@@ -321,11 +320,6 @@ class SchedulerOutputProcessorMixin:
         ]
         kv_indices = kv_indices[kv_indices != 0]
         self.token_to_kv_pool_allocator.free(kv_indices, dp_rank)
-        if os.path.exists("/tmp/p2a-kvdbg"):
-            logger.info(
-                "[kvdbg] release rid=%s dp=%d committed=%d alloc=%d freed=%d",
-                req.rid[:8], dp_rank, req.kv_committed_len, req.kv_allocated_len, len(kv_indices),
-            )
         req.kv_allocated_len = req.kv_committed_len
         release_kv_cache(req, self.tree_cache)
 
