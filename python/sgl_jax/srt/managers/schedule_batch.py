@@ -410,6 +410,20 @@ class Req:
             return self.cache_input_ids
         return self.origin_input_ids
 
+    def radix_fill_ids(self) -> list[int]:
+        """Cache-keyed equivalent of the CURRENT ``fill_ids`` (Scheme B). ``fill_ids`` is
+        ``origin_input_ids[:n_prompt] + output_ids`` and gets TRUNCATED per chunk during chunked
+        prefill, so the insert key must track that length -- substitute ``cache_input_ids`` only
+        into the prompt portion and keep the output tail. Returns a list of ``len(fill_ids)``.
+        (Using the full ``radix_key_ids`` here would insert a full-length key for a partial chunk's
+        KV and corrupt the tree -> later chunks falsely match the whole sequence.)"""
+        if self.cache_input_ids is not None and len(self.cache_input_ids) == len(
+            self.origin_input_ids
+        ):
+            n_prompt = len(self.fill_ids) - len(self.output_ids)
+            return list(self.cache_input_ids[:n_prompt]) + list(self.fill_ids[n_prompt:])
+        return self.fill_ids
+
     def init_next_round_input(
         self,
         tree_cache: BasePrefixCache | None = None,
@@ -443,9 +457,10 @@ class Req:
             max_prefix_len = min(max_prefix_len, self.logprob_start_len)
 
         max_prefix_len = max(max_prefix_len, 0)
-        # Scheme B: the radix key keys on radix_key_ids (cache_input_ids for mm, origin for
-        # text); fill_ids stays origin-based since the actual tokens to prefill are clean.
-        key_ids = self.radix_key_ids + self.output_ids
+        # Scheme B: the radix MATCH key uses the same cache-keyed source as the insert
+        # (radix_fill_ids); here fill_ids was just reset to the full origin+output, so this is
+        # the full cache-keyed sequence. The actual tokens to prefill stay origin-based (clean).
+        key_ids = self.radix_fill_ids()
         return key_ids[:max_prefix_len]
 
     def pop_committed_kv_cache(self) -> int:

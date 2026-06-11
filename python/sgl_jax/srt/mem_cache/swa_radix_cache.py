@@ -443,9 +443,10 @@ class SWARadixCache(BasePrefixCache):
             req.prefix_indices = kv_indices.copy()
             return
 
-        # Scheme B: key on radix_key_ids (cache_input_ids for mm, origin for text); same length
-        # as fill_ids so the kv-index read below is unchanged.
-        token_ids = req.radix_key_ids + req.output_ids
+        # Scheme B: key on the cache-keyed equivalent of the CURRENT (chunk-truncated) fill_ids
+        # (radix_fill_ids); same length as fill_ids so the kv-index read below is unchanged.
+        # Full radix_key_ids would mismatch the chunked KV length and corrupt the tree.
+        token_ids = req.radix_fill_ids()
         kv_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx, : len(token_ids)]
 
         if self.page_size != 1:

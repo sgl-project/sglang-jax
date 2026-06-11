@@ -334,10 +334,12 @@ class RadixCache(BasePrefixCache):
             return
 
         dp_rank = req.dp_rank if req.dp_rank is not None else 0
-        # Scheme B: key on radix_key_ids (cache_input_ids for mm, origin for text) so the
-        # insert namespace matches the match key (adjust_max_prefix_ids); same length as
-        # fill_ids (== origin_input_ids + output_ids), so the kv-len math is unchanged.
-        token_ids = req.radix_key_ids + req.output_ids
+        # Scheme B: key on the cache-keyed equivalent of the CURRENT (chunk-truncated) fill_ids
+        # so the insert namespace matches the match key AND the length matches the KV computed
+        # this chunk. radix_fill_ids() substitutes cache_input_ids into the prompt portion only;
+        # for text it IS fill_ids (byte-identical). Using full radix_key_ids here would mismatch
+        # the chunked KV length and corrupt the tree (later chunks falsely match the whole seq).
+        token_ids = req.radix_fill_ids()
         all_token_len = len(token_ids)
         # For EAGLE radix cache, we will convert the key to bigram key, e.g. [1,2,3,4] -> [(1,2), (2,3), (3,4)], the length will -1. ((len([(1,2), (2,3), (3,4)]) = len([1,2,3,4]) - 1))
         # So for the corresponding kv length should also -1. Then we get the actual_kv_len, and use it to do later calculation and slicing.
