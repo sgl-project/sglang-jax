@@ -20,6 +20,11 @@ def escape_mrkdwn(text: Any) -> str:
     return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def sanitize_marker_value(value: Any) -> str:
+    """Flatten a value for a hidden ``<!-- ... -->`` dedup marker (drop newlines/``--``)."""
+    return str(value).replace("\n", " ").replace("--", "-").strip()
+
+
 def clamp(text: str, limit: int = 600) -> str:
     """Truncate at a word boundary — backstop for when the model ignores the brief-output prompt."""
     text = (text or "").strip()
@@ -40,6 +45,64 @@ def gh_json(args: list[str], *, input_text: str | None = None, timeout: int = 18
     )
     out = result.stdout.strip()
     return json.loads(out) if out else {}
+
+
+def find_open_issue(repo: str, marker: str, labels: str | None = None) -> dict[str, Any] | None:
+    """Find an open issue whose body carries ``marker`` (shared dedup model).
+
+    ``labels`` narrows the scan to that label's open issues; ``None`` scans all.
+    Returns ``{number, url, title}`` or ``None``.
+    """
+    page = 1
+    while True:
+        args = [
+            "api",
+            f"repos/{repo}/issues",
+            "--method",
+            "GET",
+            "-f",
+            "state=open",
+            "-f",
+            "per_page=100",
+            "-f",
+            f"page={page}",
+        ]
+        if labels:
+            args += ["-f", f"labels={labels}"]
+        issues = gh_json(args)
+        if not isinstance(issues, list):
+            return None
+        for item in issues:
+            if item.get("pull_request"):
+                continue
+            if marker in (item.get("body") or ""):
+                return {
+                    "number": item["number"],
+                    "url": item["html_url"],
+                    "title": item.get("title", ""),
+                }
+        if len(issues) < 100:
+            return None
+        page += 1
+
+
+def create_issue(repo: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Create an issue from ``payload`` (title/body/labels/...). Returns {number, url}."""
+    data = gh_json(
+        ["api", f"repos/{repo}/issues", "--method", "POST", "--input", "-"],
+        input_text=json.dumps(payload),
+    )
+    if "number" not in data or "html_url" not in data:
+        raise RuntimeError("GitHub issue create response missing number/html_url")
+    return {"number": data["number"], "url": data["html_url"]}
+
+
+def add_issue_comment(repo: str, issue_number: int, body: str) -> None:
+    """Append a comment to an existing issue."""
+    gh_json(
+        ["api", f"repos/{repo}/issues/{issue_number}/comments", "--method", "POST", "--input", "-"],
+        input_text=json.dumps({"body": body}),
+    )
 
 
 def index_failure_issues(

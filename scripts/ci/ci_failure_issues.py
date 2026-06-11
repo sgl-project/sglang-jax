@@ -14,15 +14,18 @@ import sys
 from typing import Any
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "utils"))
-from ci_common import gh_json, load_ai_analysis, utc_now
+from ci_common import (
+    add_issue_comment,
+    create_issue,
+    find_open_issue,
+    load_ai_analysis,
+    sanitize_marker_value,
+    utc_now,
+)
 from failure_classifier import is_finish_gate
 
 ISSUE_MARKER_PREFIX = "ci-failure-monitor"
 DEFAULT_OUTPUT = "failure_issues.json"
-
-
-def sanitize_marker_value(value: str) -> str:
-    return str(value).replace("\n", " ").replace("--", "-").strip()
 
 
 def build_marker(workflow_name: str, job_name: str) -> str:
@@ -46,40 +49,6 @@ def load_classification(path: str) -> list[dict[str, Any]]:
 def fallback_assignees() -> list[str]:
     raw = os.environ.get("CI_FAILURE_FALLBACK_ASSIGNEES", "")
     return [item.strip().lstrip("@") for item in raw.split(",") if item.strip()]
-
-
-def find_open_issue(repo: str, marker: str) -> dict[str, Any] | None:
-    page = 1
-    while True:
-        issues = gh_json(
-            [
-                "api",
-                f"repos/{repo}/issues",
-                "--method",
-                "GET",
-                "-f",
-                "state=open",
-                "-f",
-                "per_page=100",
-                "-f",
-                f"page={page}",
-            ]
-        )
-        if not isinstance(issues, list):
-            return None
-        for item in issues:
-            if item.get("pull_request"):
-                continue
-            if marker in (item.get("body") or ""):
-                return {
-                    "number": item["number"],
-                    "url": item["html_url"],
-                    "title": item.get("title", ""),
-                }
-        if len(issues) < 100:
-            break
-        page += 1
-    return None
 
 
 def failure_table(
@@ -183,23 +152,6 @@ def comment_body(
         parts += ["", block]
     parts += [""]
     return "\n".join(parts)
-
-
-def create_issue(repo: str, payload: dict[str, Any]) -> dict[str, Any]:
-    data = gh_json(
-        ["api", f"repos/{repo}/issues", "--method", "POST", "--input", "-"],
-        input_text=json.dumps(payload),
-    )
-    if "number" not in data or "html_url" not in data:
-        raise RuntimeError("GitHub issue create response missing number/html_url")
-    return {"number": data["number"], "url": data["html_url"]}
-
-
-def add_issue_comment(repo: str, issue_number: int, body: str) -> None:
-    gh_json(
-        ["api", f"repos/{repo}/issues/{issue_number}/comments", "--method", "POST", "--input", "-"],
-        input_text=json.dumps({"body": body}),
-    )
 
 
 def process_failed_jobs(
