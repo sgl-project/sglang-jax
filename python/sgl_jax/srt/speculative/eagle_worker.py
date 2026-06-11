@@ -188,15 +188,36 @@ class EAGLEWorker(BaseSpecWorker):
                     // self.page_size
                     * self.page_size
                 )
-                model_worker_batch = self.draft_worker.compilation_manager._make_dummy_batch(
-                    bs,
-                    bs,
-                    ForwardMode.DECODE,
-                    aligned_cache_loc_size,
-                    speculative_algorithm=self.speculative_algorithm,
-                    dp_size=dp_size,
-                    per_dp_bs_size=per_dp_bs,
-                )
+
+                def _make_decode_batch(
+                    *,
+                    bs=bs,
+                    per_dp_bs=per_dp_bs,
+                    aligned_cache_loc_size=aligned_cache_loc_size,
+                ):
+                    batch = self.draft_worker.compilation_manager._make_dummy_batch(
+                        bs,
+                        bs,
+                        ForwardMode.DECODE,
+                        aligned_cache_loc_size,
+                        speculative_algorithm=self.speculative_algorithm,
+                        dp_size=dp_size,
+                        per_dp_bs_size=per_dp_bs,
+                    )
+                    # Pad out_cache_loc to bs * draft_token_num so verify/draft_extend
+                    # forward see the same shape runtime _get_spec_decode_mwb_dp emits.
+                    ocl_target = bs * self.speculative_num_draft_tokens
+                    if batch.out_cache_loc.shape[0] < ocl_target:
+                        pad_len = ocl_target - batch.out_cache_loc.shape[0]
+                        batch.out_cache_loc = np.concatenate(
+                            [
+                                np.asarray(batch.out_cache_loc, dtype=np.int32),
+                                np.full(pad_len, -1, dtype=np.int32),
+                            ]
+                        )
+                    return batch
+
+                model_worker_batch = _make_decode_batch()
                 assert not model_worker_batch.return_logprob
                 assert not model_worker_batch.return_output_logprob_only
                 assert model_worker_batch.sampling_info.is_all_greedy
@@ -211,30 +232,38 @@ class EAGLEWorker(BaseSpecWorker):
                 else:
                     topk_shape = (bs, num_steps, self.topk) if is_multi_layer else (bs, self.topk)
                 data_sharding = NamedSharding(self.mesh, P("data"))
+                spec_info = EagleDraftInput(
+                    topk_p=jax.device_put(np.ones(topk_shape, dtype=np.float32), data_sharding),
+                    topk_index=jax.device_put(np.ones(topk_shape, dtype=np.int32), data_sharding),
+                    hidden_states=np.ones(
+                        (bs, self.draft_worker.model_config.hidden_size),
+                        dtype=(
+                            jnp.bfloat16 if self.server_args.dtype == "bfloat16" else np.float32
+                        ),
+                    ),
+                    verified_id=jax.device_put(np.ones((bs,), dtype=np.int32), data_sharding),
+                    capture_hidden_mode=CaptureHiddenMode.FULL,
+                    num_tokens_per_batch=np.asarray(1, dtype=np.int32),
+                    num_tokens_for_logprob_per_batch=np.asarray(1, dtype=np.int32),
+                    allocate_lens=model_worker_batch.seq_lens
+                    + EagleDraftInput.ALLOC_LEN_PER_DECODE,
+                )
                 if hasattr(self, "spec_relay_buffers"):
+                    model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
+                    model_worker_batch.spec_info_padded = spec_info
+                    model_worker_batch.speculative_eagle_topk = self.topk
+                    model_worker_batch.speculative_num_draft_tokens = (
+                        self.speculative_num_draft_tokens
+                    )
+                    model_worker_batch.speculative_num_steps = self.speculative_num_steps
+                    self.forward_batch_speculative_decode_overlap(model_worker_batch)
+                    jax.block_until_ready(self.spec_relay_buffers)
+
+                    model_worker_batch = _make_decode_batch()
                     spec_info = EagleDraftInput(
                         future_indices=np.asarray(
                             model_worker_batch.req_pool_indices, dtype=np.int32
                         ),
-                        capture_hidden_mode=CaptureHiddenMode.FULL,
-                        num_tokens_per_batch=np.asarray(1, dtype=np.int32),
-                        num_tokens_for_logprob_per_batch=np.asarray(1, dtype=np.int32),
-                        allocate_lens=model_worker_batch.seq_lens
-                        + EagleDraftInput.ALLOC_LEN_PER_DECODE,
-                    )
-                else:
-                    spec_info = EagleDraftInput(
-                        topk_p=jax.device_put(np.ones(topk_shape, dtype=np.float32), data_sharding),
-                        topk_index=jax.device_put(
-                            np.ones(topk_shape, dtype=np.int32), data_sharding
-                        ),
-                        hidden_states=np.ones(
-                            (bs, self.draft_worker.model_config.hidden_size),
-                            dtype=(
-                                jnp.bfloat16 if self.server_args.dtype == "bfloat16" else np.float32
-                            ),
-                        ),
-                        verified_id=jax.device_put(np.ones((bs,), dtype=np.int32), data_sharding),
                         capture_hidden_mode=CaptureHiddenMode.FULL,
                         num_tokens_per_batch=np.asarray(1, dtype=np.int32),
                         num_tokens_for_logprob_per_batch=np.asarray(1, dtype=np.int32),
@@ -246,17 +275,6 @@ class EAGLEWorker(BaseSpecWorker):
                 model_worker_batch.speculative_eagle_topk = self.topk
                 model_worker_batch.speculative_num_draft_tokens = self.speculative_num_draft_tokens
                 model_worker_batch.speculative_num_steps = self.speculative_num_steps
-                # Pad out_cache_loc to bs * draft_token_num so verify/draft_extend
-                # forward see the same shape runtime _get_spec_decode_mwb_dp emits.
-                ocl_target = bs * self.speculative_num_draft_tokens
-                if model_worker_batch.out_cache_loc.shape[0] < ocl_target:
-                    pad_len = ocl_target - model_worker_batch.out_cache_loc.shape[0]
-                    model_worker_batch.out_cache_loc = np.concatenate(
-                        [
-                            np.asarray(model_worker_batch.out_cache_loc, dtype=np.int32),
-                            np.full(pad_len, -1, dtype=np.int32),
-                        ]
-                    )
                 if hasattr(self, "spec_relay_buffers"):
                     self.forward_batch_speculative_decode_overlap(model_worker_batch)
                     jax.block_until_ready(self.spec_relay_buffers)

@@ -267,11 +267,14 @@ def _build_fused_draft_extend_jit(num_layers: int, topk: int):
         logits_metadata,
         target_hidden,
         sel_pos,
+        draft_logits_indices,
         relay_buffers,
         relay_future_indices,
         relay_valid_mask,
         relay_verified_id,
         relay_new_seq_lens,
+        draft_verify_seq_lens,
+        draft_allocate_lens,
         *,
         num_layers,
         update_relay,
@@ -282,6 +285,22 @@ def _build_fused_draft_extend_jit(num_layers: int, topk: int):
         layer0_hidden = None
         mesh = None
         input_ids = forward_batch.input_ids
+        if draft_verify_seq_lens is not None:
+            valid_draft_slots = draft_verify_seq_lens > 0
+            forward_batch.seq_lens = jnp.where(
+                valid_draft_slots,
+                draft_verify_seq_lens + num_layers,
+                jnp.zeros_like(draft_verify_seq_lens),
+            )
+            forward_batch.attn_backend.forward_metadata = (
+                _make_draft_extend_metadata_from_device_seq_lens(
+                    forward_batch.attn_backend.forward_metadata,
+                    forward_batch.seq_lens,
+                    draft_allocate_lens,
+                    page_size=forward_batch.attn_backend.page_size,
+                    dp_size=dp_size,
+                )
+            )
 
         for i in range(num_layers):
             state = jax.tree_util.tree_unflatten(model_state_def, all_leaves[i])
@@ -306,8 +325,16 @@ def _build_fused_draft_extend_jit(num_layers: int, topk: int):
                 ext_lens = forward_batch.extend_seq_lens
                 input_ids = _device_rotate_input_ids(input_ids, ext_lens, sel_pos, topk_idx[:, 0])
 
-        select_index = jnp.arange(sel_pos.shape[0], dtype=jnp.int32) * (num_layers + 1) + sel_pos
-        selected_layer0_hidden = _gather_rows_preserve_sharding(layer0_hidden, select_index)
+        last_idx = draft_logits_indices
+        if logits_metadata.accept_lens is not None:
+            last_idx = last_idx - (forward_batch.extend_seq_lens - logits_metadata.accept_lens)
+            last_idx = jnp.where(forward_batch.extend_seq_lens > 0, last_idx, 0)
+        if dp_size > 1:
+            per_dp_tokens = layer0_hidden.shape[0] // dp_size
+            per_dp_bs = last_idx.shape[0] // dp_size
+            rank_ids = jnp.arange(last_idx.shape[0], dtype=jnp.int32) // per_dp_bs
+            last_idx = last_idx + rank_ids * per_dp_tokens
+        selected_layer0_hidden = _gather_rows_preserve_sharding(layer0_hidden, last_idx)
         if topk == 1:
             stacked_idx = jnp.stack([idx[:, 0] for idx in all_topk_index], axis=1)
         else:
@@ -466,6 +493,60 @@ def _make_target_verify_metadata_from_device_seq_lens(
     )
 
 
+def _make_draft_extend_metadata_from_device_seq_lens(
+    old_metadata,
+    draft_seq_lens,
+    allocated_lens,
+    *,
+    page_size: int,
+    dp_size: int,
+):
+    from sgl_jax.srt.layers.attention.flashattention_backend import (
+        FlashAttentionMetadata,
+    )
+
+    valid = draft_seq_lens > 0
+    # DRAFT_EXTEND always runs a fixed number of query tokens per request. The
+    # host metadata already has the correct DP-padded query cumsum shape; only
+    # seq_lens/page_indices need to be rebuilt from the actual verify base.
+    cu_q_lens = old_metadata.cu_q_lens
+    aligned_seq_lens = ((draft_seq_lens + page_size - 1) // page_size) * page_size
+    cu_kv_lens = _per_dp_cumsum_device(aligned_seq_lens, dp_size)
+    page_indices = _repack_page_indices_from_allocated_lens(
+        old_metadata.page_indices,
+        allocated_lens,
+        draft_seq_lens,
+        page_size=page_size,
+        dp_size=dp_size,
+    )
+    swa_page_indices = None
+    if old_metadata.swa_page_indices is not None:
+        swa_page_indices = _repack_page_indices_from_allocated_lens(
+            old_metadata.swa_page_indices,
+            allocated_lens,
+            draft_seq_lens,
+            page_size=page_size,
+            dp_size=dp_size,
+        )
+
+    per_dp_bs = draft_seq_lens.shape[0] // dp_size
+    local_num_seqs = jnp.sum(valid.reshape((dp_size, per_dp_bs)).astype(jnp.int32), axis=1)
+    distribution = jnp.stack(
+        [jnp.zeros_like(local_num_seqs), local_num_seqs, local_num_seqs],
+        axis=1,
+    ).reshape((dp_size * 3,))
+
+    return FlashAttentionMetadata(
+        cu_q_lens=cu_q_lens,
+        cu_kv_lens=cu_kv_lens,
+        page_indices=page_indices,
+        swa_page_indices=swa_page_indices,
+        seq_lens=draft_seq_lens,
+        distribution=distribution,
+        custom_mask=old_metadata.custom_mask,
+    )
+
+
 def _build_fused_greedy_verify_jit(topk: int):
     """Build target verify JIT for greedy NEXTN decode."""
     assert topk == 1, "Fused greedy verify only supports topk=1"
@@ -510,7 +591,7 @@ def _build_fused_greedy_verify_jit(topk: int):
             valid_seq_lens = target_forward_batch.seq_lens > 0
             target_forward_batch.seq_lens = jnp.where(
                 valid_seq_lens,
-                relay_new_seq_lens.astype(jnp.int32) - 1,
+                relay_new_seq_lens - 1,
                 jnp.zeros_like(target_forward_batch.seq_lens),
             )
             target_forward_batch.attn_backend.forward_metadata = (
@@ -595,6 +676,7 @@ def _build_fused_greedy_verify_jit(topk: int):
         prepared_sel_pos = prepared.sel_pos
         prepared_predict = prepared.predict
         prepared_positions = prepared.positions
+        prepared_verify_seq_lens = target_forward_batch.seq_lens
 
         if mesh is not None:
             rep = NamedSharding(mesh, P())
@@ -620,6 +702,7 @@ def _build_fused_greedy_verify_jit(topk: int):
             prepared_sel_pos,
             prepared_predict,
             prepared_positions,
+            prepared_verify_seq_lens,
             target_logits_for_host,
         )
 
@@ -939,11 +1022,14 @@ def launch_fused_draft_extend_for_decode(
     if batch_output.next_draft_input.verified_id.shape[0] <= 0:
         return None
     target_hidden = batch_output.logits_output.hidden_states
+    update_relay = relay_buffers is not None
 
     draft_input = EagleDraftInput(
         hidden_states=target_hidden,
         allocate_lens=batch_output.next_draft_input.allocate_lens,
     )
+    if getattr(batch_output.next_draft_input, "verify_seq_lens", None) is not None:
+        draft_input.device_seq_lens_for_draft_extend = True
     mwb, logits_metadata = draft_input.prepare_for_extend_after_verify(
         model_worker_batch,
         draft_worker.draft_model_runner,
@@ -973,14 +1059,18 @@ def launch_fused_draft_extend_for_decode(
 
     data_sharding = NamedSharding(draft_worker.mesh, P("data"))
     sel_pos_device = _device_array_preserve_device(sel_pos, data_sharding)
-    update_relay = relay_buffers is not None
+    draft_logits_indices = _device_array_preserve_device(mwb.logits_indices, data_sharding)
+    draft_allocate_lens = np.zeros_like(model_worker_batch.seq_lens, dtype=np.int32)
+    draft_allocate_lens[sel] = np.asarray(batch_output.next_draft_input.allocate_lens)
+    draft_allocate_lens = _device_array_preserve_device(draft_allocate_lens, data_sharding)
+    draft_verify_seq_lens = getattr(batch_output.next_draft_input, "verify_seq_lens", None)
+    draft_verify_seq_lens = _device_array_preserve_device(draft_verify_seq_lens, data_sharding)
     if relay_future_indices is None:
         relay_future_indices = np.zeros(model_worker_batch.req_pool_indices.shape, dtype=np.int32)
     if relay_valid_mask is None:
         relay_valid_mask = np.zeros(model_worker_batch.req_pool_indices.shape, dtype=np.bool_)
     relay_future_indices = _device_array_preserve_device(relay_future_indices, data_sharding)
     relay_valid_mask = _device_array_preserve_device(relay_valid_mask, data_sharding)
-
     if not hasattr(draft_worker, "_fused_jit_fn"):
         draft_worker._fused_jit_fn = _build_fused_draft_extend_jit(
             num_layers=draft_worker.speculative_num_steps,
@@ -1002,11 +1092,14 @@ def launch_fused_draft_extend_for_decode(
             logits_metadata,
             target_hidden,
             sel_pos_device,
+            draft_logits_indices,
             relay_buffers,
             relay_future_indices,
             relay_valid_mask,
             batch_output.next_draft_input.next_verified_id,
             batch_output.next_draft_input.new_seq_lens,
+            draft_verify_seq_lens,
+            draft_allocate_lens,
             num_layers=draft_worker.speculative_num_steps,
             update_relay=update_relay,
             dp_size=model_worker_batch.dp_size,
@@ -1261,6 +1354,7 @@ def spec_decode_verify_phase(spec_worker, model_worker_batch, cur_allocate_lens)
             prepared_sel_pos,
             prepared_predict,
             prepared_positions,
+            prepared_verify_seq_lens,
             target_logits,
         ) = draft_worker._fused_greedy_verify_jit_fn(
             target_mr._model_def,
@@ -1293,6 +1387,7 @@ def spec_decode_verify_phase(spec_worker, model_worker_batch, cur_allocate_lens)
     next_draft_input.next_verified_id = prepared_next_verified_id
     next_draft_input.sel_pos = prepared_sel_pos
     next_draft_input.positions = prepared_positions
+    next_draft_input.verify_seq_lens = prepared_verify_seq_lens
     batch_output = GenerationBatchResult(
         logits_output=LogitsProcessorOutput(
             next_token_logits=target_logits,

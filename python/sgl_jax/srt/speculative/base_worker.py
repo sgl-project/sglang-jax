@@ -7,6 +7,7 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
@@ -107,6 +108,12 @@ class BaseSpecWorker:
     def _can_use_fused_spec_prefill(self, model_worker_batch: ModelWorkerBatch) -> bool:
         if os.getenv("SGL_JAX_DISABLE_FUSED_SPEC_PREFILL") == "1":
             return False
+        real_bs_per_dp = getattr(model_worker_batch, "real_bs_per_dp", None)
+        if real_bs_per_dp is not None and any(bs == 0 for bs in real_bs_per_dp):
+            # Fused spec prefill currently trips the p256 RPA kernel when a
+            # runtime prefill batch has empty DP ranks. Keep decode overlap
+            # enabled while falling back to the proven prefill path.
+            return False
         sampling_info = model_worker_batch.sampling_info
         penalizer = getattr(sampling_info, "penalizer_orchestrator", None)
         has_penalty = getattr(sampling_info, "linear_penalty", None) is not None or bool(
@@ -183,9 +190,19 @@ class BaseSpecWorker:
                 self.mesh,
                 vocab_size=self.target_worker.model_config.vocab_size,
             )
-            logits_output, next_token_ids, cache_miss_count, bid, _seq_lens = (
-                self.forward_target_extend(model_worker_batch, sampling_metadata)
-            )
+            if model_worker_batch.sampling_info.is_all_greedy:
+                logits_output, _, cache_miss_count, bid, _seq_lens = self.forward_target_extend(
+                    model_worker_batch,
+                    sampling_metadata,
+                    skip_sample=True,
+                )
+                next_token_ids = jnp.argmax(logits_output.next_token_logits, axis=-1).astype(
+                    jnp.int32
+                )
+            else:
+                logits_output, next_token_ids, cache_miss_count, bid, _seq_lens = (
+                    self.forward_target_extend(model_worker_batch, sampling_metadata)
+                )
             if model_worker_batch.dp_size > 1:
                 from jax.experimental.multihost_utils import process_allgather
 
@@ -225,14 +242,21 @@ class BaseSpecWorker:
             launch_done.set()
         return batch_output
 
-    def forward_target_extend(self, model_worker_batch: ModelWorkerBatch, sampling_metadata):
+    def forward_target_extend(
+        self,
+        model_worker_batch: ModelWorkerBatch,
+        sampling_metadata,
+        *,
+        skip_sample: bool = False,
+    ):
         from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode
 
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
-        logits_output, next_token_ids, cache_miss_count = (
-            self.target_worker.forward_batch_generation(
-                model_worker_batch, sampling_metadata=sampling_metadata
-            )
+        target_worker = getattr(self.target_worker, "worker", self.target_worker)
+        logits_output, next_token_ids, cache_miss_count = target_worker.forward_batch_generation(
+            model_worker_batch,
+            sampling_metadata=sampling_metadata,
+            skip_sample=skip_sample,
         )
         return (
             logits_output,

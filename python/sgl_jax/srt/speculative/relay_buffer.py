@@ -69,7 +69,11 @@ def update_spec_relay_buffers(
     indices = future_indices.reshape((dp_size, per_dp_bs))
     valid = valid_mask.reshape((dp_size, per_dp_bs))
     dp_indices = jnp.arange(dp_size, dtype=jnp.int32)[:, None]
-    scatter_indices = jnp.where(valid, indices, buffers.topk_index.shape[1])
+    scatter_indices = jnp.where(
+        valid,
+        indices,
+        jnp.full_like(indices, buffers.topk_index.shape[1]),
+    )
 
     topk_index = topk_index.reshape((dp_size, per_dp_bs) + topk_index.shape[1:])
     hidden_states = hidden_states.reshape((dp_size, per_dp_bs) + hidden_states.shape[1:])
