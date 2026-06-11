@@ -672,15 +672,31 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                     else:
                         aud_len = (int(np.asarray(aud_feats).shape[-1]),)
                 input_ids = _put(np.asarray(r.origin_input_ids, dtype=np.int32))
-                fused, deepstack, pos_mask = self.jitted_embed_mm(
-                    input_ids,
-                    _put(img_px, bf16=True),
-                    _thw(a.get("image_grid_thw")),
-                    _put(vid_px, bf16=True),
-                    _thw(a.get("video_grid_thw")),
-                    _put(aud_feats, bf16=True),
-                    aud_len,
-                )
+                # V-2 probe (design §5.3): count vision-encode jit (re)compiles. A miss = a
+                # distinct grid geometry that triggered an XLA compile. First-seen resolutions
+                # miss once (expected); a sustained stream of misses = unbounded vision shapes
+                # (the recompile storm patch bucketing would bound). Surfacing it makes the
+                # V-3 "compile count <= bucket count" gate observable.
+                import jax._src.test_util as jtu
+
+                with jtu.count_pjit_cpp_cache_miss() as _vit_compiles:
+                    fused, deepstack, pos_mask = self.jitted_embed_mm(
+                        input_ids,
+                        _put(img_px, bf16=True),
+                        _thw(a.get("image_grid_thw")),
+                        _put(vid_px, bf16=True),
+                        _thw(a.get("video_grid_thw")),
+                        _put(aud_feats, bf16=True),
+                        aud_len,
+                    )
+                if _vit_compiles() > 0:
+                    logger.info(
+                        "V-2 probe: vision encode jit compiled for new geometry "
+                        "(image_grid=%s, video_grid=%s, audio_len=%s)",
+                        a.get("image_grid_thw"),
+                        a.get("video_grid_thw"),
+                        aud_len,
+                    )
                 r.multimodal_embedding = np.asarray(jax.device_get(fused))
                 # Deepstack (Qwen3-Omni): attach the SPARSE per-level visual features + the
                 # full-prompt visual mask; _merge_multimodal densifies them per chunk.

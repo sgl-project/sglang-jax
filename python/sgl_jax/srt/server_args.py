@@ -191,10 +191,14 @@ class ServerArgs:
 
     # G1 (design §5.7): HBM (bytes) to reserve for the in-model vision/audio encoder's peak
     # activations, subtracted from the KV-cache budget so a large-vision request can't OOM the
-    # KV pool. 0 = off (single-image fits comfortably under mem_fraction_static; the auto-sized
-    # AOT memory_analysis variant -- design option (3) -- is a follow-up). Set for video / many-
-    # image production workloads.
+    # KV pool. 0 = off (single-image fits comfortably under mem_fraction_static). Usually leave
+    # this 0 and set --vision-max-patches instead (auto-sizes the reserve from the ViT geometry).
     vision_activation_reserve_bytes: int = 0
+    # G1 auto-sizing: the largest #patches a single vision request may produce (t*h*w). When >0
+    # on a multimodal model, the reserve is auto-computed from this + the ViT config (the dense
+    # [heads, T, T] attention activation dominates). 0 = off. Opt-in: it reserves for the WORST
+    # case, so only set it for large-image / video workloads.
+    vision_max_patches: int = 0
 
     # Speculative decoding
     speculative_algorithm: str | None = None
@@ -1106,6 +1110,14 @@ class ServerArgs:
             help="HBM bytes to reserve for the in-model vision/audio encoder's peak activations "
             "(subtracted from the KV-cache budget so large-vision requests can't OOM the pool). "
             "0 = off; set for video / many-image workloads.",
+        )
+        parser.add_argument(
+            "--vision-max-patches",
+            type=int,
+            default=ServerArgs.vision_max_patches,
+            help="G1 auto-sizing: largest #patches (t*h*w) a single vision request may produce. "
+            ">0 on a multimodal model auto-computes the vision HBM reserve from the ViT config. "
+            "0 = off. Reserves for the worst case, so set only for large-image / video workloads.",
         )
         # Kernel backend
         parser.add_argument(

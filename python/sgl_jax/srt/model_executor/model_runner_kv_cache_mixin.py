@@ -218,16 +218,49 @@ class ModelRunnerKVCacheMixin:
             * dtype_size
         )
 
+    def _vision_activation_reserve_bytes(self: ModelRunner) -> int:
+        """G1 (design §5.7): HBM to reserve for the in-model vision encoder's peak activation,
+        subtracted from the KV budget (the encoder is a separate jit; the KV pool is otherwise
+        blind to it). Explicit ``--vision-activation-reserve-bytes`` wins; else auto-size from
+        ``--vision-max-patches`` + the ViT config -- the dense ``[heads, T, T]`` attention matrix
+        (replicated per chip under §3.3.5) dominates one layer's scratch. A conservative
+        over-estimate is safe (KV pool slightly smaller, never OOM). 0 when both unset / no ViT
+        config. (An AOT XLA memory_analysis probe could replace the closed form for tighter
+        sizing; the closed form is robust and needs no on-device compile at startup.)"""
+        sa = self.server_args
+        explicit = getattr(sa, "vision_activation_reserve_bytes", 0) or 0
+        if explicit > 0:
+            return explicit
+        max_patches = getattr(sa, "vision_max_patches", 0) or 0
+        if max_patches <= 0:
+            return 0
+        hf = getattr(self.model_config, "hf_config", None)
+        vcfg = getattr(hf, "vision_config", None) or getattr(
+            getattr(hf, "thinker_config", None), "vision_config", None
+        )
+        if vcfg is None:
+            return 0
+        heads = getattr(vcfg, "num_heads", None) or getattr(vcfg, "num_attention_heads", 16)
+        hidden = getattr(vcfg, "hidden_size", 1280)
+        T = int(max_patches)
+        # Peak ~= one ViT layer's dense attention matrix [heads, T, T] (fp32 softmax) + a few
+        # [T, hidden] bf16 hidden-state buffers; 20% headroom.
+        attn = int(heads) * T * T * 4
+        hidden_bufs = T * int(hidden) * 2 * 6
+        return int((attn + hidden_bufs) * 1.2)
+
     def _profile_available_bytes(self: ModelRunner, total_device_memory: int) -> int:
         """Profile available bytes for KV cache (+ recurrent state)."""
         available_device_memory = self.get_available_device_memory()
         rest_memory = available_device_memory - total_device_memory * (1 - self.mem_fraction_static)
-        # G1 (design §5.7): reserve HBM for the in-model vision/audio encoder's peak activations
-        # (a separate jit from the AR -- the KV pool is otherwise blind to it). Subtract before
-        # sizing the KV pool so a large-vision request can't OOM it. 0 = off (the auto-sized AOT
-        # memory_analysis variant is a follow-up); set for video / many-image workloads.
-        vision_reserve = getattr(self.server_args, "vision_activation_reserve_bytes", 0) or 0
+        # G1 (design §5.7): reserve HBM for the in-model vision encoder's peak activations before
+        # sizing the KV pool, so a large-vision request can't OOM it.
+        vision_reserve = self._vision_activation_reserve_bytes()
         if vision_reserve > 0:
+            logger.info(
+                "G1: reserving %.2f GiB HBM for vision encoder activations (KV budget -= it)",
+                vision_reserve / (1024**3),
+            )
             rest_memory -= vision_reserve
         if rest_memory <= 0:
             raise RuntimeError("Not enough memory. Please try to increase --mem-fraction-static.")
