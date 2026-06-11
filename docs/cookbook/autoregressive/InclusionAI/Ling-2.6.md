@@ -4,7 +4,7 @@ title: "Ling 2.6"
 
 # Ling-2.6 on SGL-JAX
 
-> **Validated recipe** — TPU v6e-64 path validated on sglang-jax 0.1.0: server starts, greedy + raw completion correct, GSM8K accuracy 98.5% (200 examples, see §4.1), `bench_serving` numbers in §4.2. Pin to sglang-jax 0.1.0 (or any commit that includes the channel-wise FP8 QKV split fix); earlier builds crash at weight load.
+> **Validated recipe** — TPU v6e-64 path validated on sglang-jax 0.1.0: server starts, greedy + raw completion correct, GSM8K accuracy 98.5% (200 examples, see §4.1), `bench_serving` numbers in §4.3. Pin to sglang-jax 0.1.0 (or any commit that includes the channel-wise FP8 QKV split fix); earlier builds crash at weight load.
 
 ## 1. Model Introduction
 
@@ -26,12 +26,13 @@ title: "Ling 2.6"
 | Model | TPU | Topology | Nodes | Chips | `--tp-size` | `--dp-size` | `--ep-size` | Notes |
 |---|---|---|---|---|---|---|---|---|
 | Ling-2.6-1T | **v6e-64** | 8x8 | 16 | 64 | 64 | 8 | 64 | This is the slice we measured on. Trillion-scale; multi-host mandatory. `dp=8` required (GLA `num_groups=8` ≤ tensor axis); `--disable-radix-cache` required (hybrid recurrent state). |
+| Ling-2.6-1T | **v7x-16** | 2×2×4 | 4 | 16 | 32 | 8 | 32 | v7x exposes 2 JAX devices/chip, so `--tp-size` = 16 chips × 2 = 32. Runs the V2 fused MoE kernel (`--moe-backend fused_v2`), which cuts MoE-layer prefill latency ~53% vs V1. Same `dp=8` and `--disable-radix-cache` constraints as v6e-64. |
 
 See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation reference. For other slices (larger v6e, v7x variants, scaled-down configs), see [Adapting to other topologies](../../base/tpu-topology-reference.md#adapting-to-other-topologies).
 
 ### 2.2 Environment
 
-Install per [Install guide](../../../get_started/install.md). **Build pin**: use sglang-jax 0.1.0 or later — earlier builds crash at weight load on Ling-2.6's compressed-tensors FP8 QKV split (see §5 Troubleshooting). Multi-host required — use [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) as the primary user-facing path. Advanced users running temporary v6e experiments can adapt [SkyPilot launcher](../../deployment/skypilot.md).
+Install per [Install guide](../../../get_started/install.md). **Build pin**: use sglang-jax 0.1.0 or later — earlier builds crash at weight load on Ling-2.6's compressed-tensors FP8 QKV split. Multi-host required — use [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md). Advanced users running temporary v6e experiments can adapt [SkyPilot launcher](../../deployment/skypilot.md).
 
 For evaluation, additionally install `evalscope` in the client environment:
 
@@ -43,13 +44,17 @@ pip install evalscope==0.17.1
 
 #### Multi-host — TPU v6e-64
 
-Use [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) with `<JOB>=ling-2-6`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=8x8`, `parallelism: 16`, `completions: 16`, and `backoffLimit: 16`. Put these model-specific flags into `<LAUNCH_FLAGS>`:
+Launch the server on **every node**, varying `${NODE_RANK}` (`0..15`) and pointing all nodes at the rank-0 host via `--dist-init-addr`:
 
 ```bash
+python3 -u -m sgl_jax.launch_server \
   --model-path inclusionAI/Ling-2.6-1T \
   --trust-remote-code \
   --tp-size 64 --dp-size 8 --ep-size 64 \
   --moe-backend fused \
+  --nnodes 16 --node-rank ${NODE_RANK} \
+  --dist-init-addr ${MASTER_IP}:10011 \
+  --host 0.0.0.0 --port 30000 \
   --recurrent-state-memory-ratio 0.9 \
   --disable-radix-cache \
   --device tpu \
@@ -61,9 +66,39 @@ Use [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) with `<JOB>=
   --skip-server-warmup
 ```
 
-Mount a shared `JAX_COMPILATION_CACHE_DIR` on the same PVC as the model weights — first-time compile is ~9 minutes total (EXTEND ~7 min + DECODE ~2 min) at this build because the GLA chunk kernel has many distinct shape configurations; subsequent restarts with the same mesh shape skip almost all of that.
+> `--moe-backend` is tunable — `epmoe` (megablox GMM), `fused` (Pallas fused MoE V1), or `fused_v2` (Pallas fused MoE V2, double-buffered); the fused kernels require full EP (`--ep-size` = `--tp-size`). See §2.4.
 
-For temporary v6e experiments, advanced users can adapt [SkyPilot launcher](../../deployment/skypilot.md) with the same launch flags. The model recipe does not require users to run repository-local SkyPilot helper scripts.
+On GKE, use the [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) with `<JOB>=ling-2-6`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=8x8`, `parallelism: 16`, `completions: 16`, and `backoffLimit: 16`; the launcher injects `--nnodes`, `--node-rank`, `--dist-init-addr`, `--host`, and `--port`, so drop those and put the remaining model flags into `<LAUNCH_FLAGS>`. For temporary v6e experiments, advanced users can adapt the [SkyPilot launcher](../../deployment/skypilot.md) with the same flags.
+
+#### Multi-host — TPU v7x-16 (fused MoE V2)
+
+On a `v7x-16` slice (`2×2×4`, 4 nodes, 16 chips → 32 JAX devices) serve Ling-2.6-1T with the V2 fused MoE kernel (`--moe-backend fused_v2`), which packs scatter, expert FFN, and gather into one Pallas call with double buffering and activation quantization — cutting MoE-layer prefill latency ~53% vs V1. Launch the server on **every node**, varying `${NODE_RANK}` (`0..3`) and pointing all nodes at the rank-0 host via `--dist-init-addr`:
+
+```bash
+python3 -u -m sgl_jax.launch_server \
+  --model-path inclusionAI/Ling-2.6-1T \
+  --trust-remote-code \
+  --tp-size 32 --dp-size 8 --ep-size 32 \
+  --moe-backend fused_v2 \
+  --nnodes 4 --node-rank ${NODE_RANK} \
+  --dist-init-addr ${MASTER_IP}:10011 \
+  --host 0.0.0.0 --port 30000 \
+  --page-size 256 \
+  --context-length 262144 \
+  --chunked-prefill-size 2048 \
+  --dtype bfloat16 \
+  --mem-fraction-static 0.85 \
+  --max-running-requests 512 \
+  --dp-schedule-policy round_robin \
+  --attention-backend fa \
+  --disable-radix-cache \
+  --skip-server-warmup \
+  --log-level info
+```
+
+> `--moe-backend` is tunable — `epmoe` (megablox GMM), `fused` (Pallas fused MoE V1), or `fused_v2` (Pallas fused MoE V2, double-buffered); the fused kernels require full EP (`--ep-size` = `--tp-size`). See §2.4.
+
+All nodes must sit in the same TPU slice and reach each other on the `--dist-init-addr` port (`10011` here, plus the handful of ports just above it that JAX derives for coordination — up to `dist_init_port + 6`) and the TPU process port (`8471`). The `dp=8` / `--disable-radix-cache` constraints from §2.4 apply here too. Beyond the v7x device count (`tp = ep = 32`) and `--moe-backend fused_v2`, this path also retunes several serving knobs vs. v6e-64 — `--page-size 256`, `--mem-fraction-static 0.85`, `--max-running-requests 512`, `--dp-schedule-policy round_robin`, `--attention-backend fa`, and `--context-length 262144` — so treat it as its own recipe rather than a one-flag diff.
 
 ### 2.4 Configuration Tips
 
@@ -77,7 +112,7 @@ For temporary v6e experiments, advanced users can adapt [SkyPilot launcher](../.
 - The GLA linear attention layer has a per-group RMSNorm with `num_groups=8`, sharded along the "tensor" mesh axis. **Effective tensor axis must be ≤ 8.** On v6e-64 that forces `--tp-size 64 --dp-size 8` (tensor axis = `tp/dp` = 8). Setting `--dp-size 1` builds tensor=64 and JIT trace crashes with `Sharding spec ('tensor',) implies that array axis 1 is partitioned 64 times, but does not evenly divide the dimension size 8`.
 
 **MoE Backend:**
-- `--moe-backend fused` for `--ep-size ≥ 16` (both configs above). The fused EP size = mesh `data * tensor` = 8 * 8 = 64 on v6e-64, matching `--ep-size 64`. Switch to `epmoe` only at EP ≤ 8.
+- `--moe-backend` selects the EP MoE implementation: `epmoe` (megablox GMM), `fused` (Pallas fused MoE V1), or `fused_v2` (Pallas fused MoE V2 — double-buffered with activation quantization, ~53% lower MoE-layer prefill latency vs V1). The v6e-64 recipe uses `fused`; the v7x-16 recipe uses `fused_v2`. The fused kernels (`fused` / `fused_v2`) require **full expert parallelism** — they treat the entire `data × tensor` mesh as the EP group, so set `--ep-size` equal to the total JAX device count (`--tp-size`): 64 on v6e-64, 32 on v7x-16.
 
 **FP8 Quantization (compressed-tensors):**
 - Ling-2.6 ships compressed-tensors FP8 with `strategy="channel"` (per-output channel weight scales, dynamic per-token activation). The runtime auto-detects this — no `--quantization` flag needed. `--dtype bfloat16` controls runtime compute dtype, not weight residency.
@@ -97,8 +132,7 @@ For temporary v6e experiments, advanced users can adapt [SkyPilot launcher](../.
 - `--chunked-prefill-size 2048` bounds peak HBM during long-prompt prefill.
 
 **Compilation Cache Hygiene:**
-- `JAX_COMPILATION_CACHE_DIR` is mandatory — without it, first request blocks ~9 min per node (GLA chunk kernel ships many distinct shape configurations).
-- Mount a shared PVC across the cluster's nodes to amortize compilation. Mesh shape (`data × tensor`) is part of the cache key; changing `--dp-size` invalidates the cache.
+- Set `JAX_COMPILATION_CACHE_DIR` to a shared path (same PVC across all nodes) to persist the JIT cache across restarts.
 
 For full flag definitions see [Launch flags reference](../../base/launch-flags-reference.md).
 
@@ -170,19 +204,7 @@ For non-streaming requests, the field appears on `response.choices[0].message.re
 
 ### 4.1 Accuracy — GSM8K
 
-**Test Environment**
-
-| Field | Value |
-|---|---|
-| Hardware | TPU v6e-64 (16 nodes × 4 chips) |
-| Model | inclusionAI/Ling-2.6-1T (compressed-tensors FP8 native; runtime dtype bfloat16) |
-| Tensor Parallelism | 64 (effective tensor axis 8 via `--dp-size 8`) |
-| Data Parallelism | 8 |
-| Expert Parallelism | 64 |
-| Recurrent State Memory Ratio | 0.9 |
-| Tested build | sglang-jax 0.1.0 |
-
-**Deployment Command** — same as [§2.3 Multi-host (v6e-64)](#multi-host-gke-indexed-job--tpu-v6e-64).
+**Deployment Command** — launch a server per [§2.3 Launch](#23-launch).
 
 **Benchmark Command**
 
@@ -206,7 +228,36 @@ evalscope eval \
 
 > Recommended additional datasets: AIME 2025, GPQA Diamond (reasoning); MMLU (general); RULER (long-context linear-attention).
 
-### 4.2 Speed
+### 4.2 Accuracy — AIME 2026
+
+Sanity-checks the quantized fused-MoE serving path on competition math: AIME 2026 (`MathArena/aime_2026`, 30 problems, pass@1; extracted answers exact-matched against the reference). Point `test/srt/run_eval.py` at the served Ling-2.6-1T endpoint.
+
+**Deployment Command** — launch a server per [§2.3 Launch](#23-launch).
+
+**Benchmark Command**
+
+```bash
+python test/srt/run_eval.py \
+  --base-url http://127.0.0.1:30000 \
+  --model Ling-2.6-1T \
+  --eval-name aime26 \
+  --num-examples 30 \
+  --num-threads 16 \
+  --temperature 0.6 \
+  --top-p 0.95 \
+  --top-k 20 \
+  --max-tokens 32768
+```
+
+**Test Results**
+
+| Model | Dataset | Metric | Num | Score |
+|:---|:---|:---|:---|:---|
+| Ling-2.6-1T | aime26 | pass@1 | 30 | **0.867** (26 / 30) |
+
+> Zero request errors; every response terminated normally (`finish_reason=stop`, no truncation at 32768 tokens) — the four misses are reasoning errors, not generation cutoffs. The quantized fused-MoE serving path therefore preserves competition-math accuracy.
+
+### 4.3 Speed
 
 > **Layout F — single-workload sweep (one data point).** Standard chat (ISL=1000, OSL=1000), `max_concurrency=16`, 80 prompts, `seed=42`. Future PRs can add long-context (OSL=4096+) and concurrency sweeps to validate the GLA long-context advantage.
 
@@ -221,7 +272,7 @@ evalscope eval \
 | Expert Parallelism | 64 |
 | Tested build | sglang-jax 0.1.0 |
 
-**Deployment Command** — same as [§2.3 Multi-host (v6e-64)](#multi-host-gke-indexed-job--tpu-v6e-64).
+**Deployment Command** — same as [§2.3 Multi-host — TPU v6e-64](#multi-host--tpu-v6e-64).
 
 **Benchmark Command**
 
@@ -278,20 +329,6 @@ Max ITL (ms):                            1293.91
 ```
 
 > Ling-2.6-1T throughput on this v6e-64 mesh is bound by the GLA recurrent state pool overhead and the linear-attention chunk kernel at decode — the trillion-parameter total weight (vs Ling-2.6's hybrid linear / full attention layers) leaves narrow per-chip activation headroom on v6e (32 GB/chip).
-
-## 5. Troubleshooting
-
-| Symptom | Likely cause | Fix |
-|---|---|---|
-| `TypeError: 'NoneType' object is not subscriptable` during QKV weight split at startup | Build pre-dates the channel-wise FP8 QKV split fix; checkpoint has `weight_block_size=None` (compressed-tensors `strategy="channel"`). | Pin sglang-jax to 0.1.0 or later. |
-| `AssertionError: Hybrid recurrent state models require --disable-radix-cache` at startup | Missing `--disable-radix-cache`. | Add `--disable-radix-cache` to the launch flags — it's mandatory for any hybrid recurrent state model, not optional. |
-| `ValueError: ... axis 1 is partitioned 64 times, but does not evenly divide the dimension size 8` during JIT trace | Effective tensor axis (`tp_size / dp_size`) > GLA `num_groups=8`. | Set `--dp-size` such that `tp_size / dp_size <= 8`. On v6e-64 use `--dp-size 8`. |
-| `RESOURCE_EXHAUSTED: ... Used 31.37G of 31.25G hbm. Exceeded hbm capacity by ~130M` during EXTEND precompile | `--mem-fraction-static 0.92` overshoots HBM at `dp=8` mesh trace peak. | Drop `--mem-fraction-static` to `0.88` (current default). For more headroom also lower `--chunked-prefill-size` to 1024 or `--max-running-requests` to 128. |
-| OOM at startup | Recurrent state + KV exceed budget | Lower `--recurrent-state-memory-ratio` (e.g. to 0.7) and/or `--mem-fraction-static` to 0.85. |
-| Long-prompt requests stall | KV cache exhausted before recurrent state | Lower `--recurrent-state-memory-ratio` to give the KV cache more headroom. |
-| MoE throughput plateau at EP ≥ 16 | Wrong `--moe-backend` | Switch to `--moe-backend fused`. |
-| Multi-node hang at init | `--dist-init-addr` unreachable from non-rank-0 nodes | Verify the rank-0 internal IP and that the chosen port is open. |
-| First request takes ~9 min per node | JIT cache empty | Persist `JAX_COMPILATION_CACHE_DIR` on a shared PVC; the GLA chunk kernel ships many distinct shape configurations so cold compile is slower than dense models. |
 
 ## Additional Resources
 
