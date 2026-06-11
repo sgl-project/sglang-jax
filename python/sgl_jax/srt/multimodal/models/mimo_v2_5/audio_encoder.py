@@ -218,13 +218,9 @@ class MiMoV25AudioUnderstandingEncoder(nnx.Module):
         # Keep the tiny audio tower fully replicated: the data-axis sharding that the
         # embed mesh attaches to hidden makes these group/proj reshapes unsupported
         # without an explicit out_sharding. Re-pin to replicated before each reshape.
-        hidden = self._replicate(hidden).reshape(
-            batch * groups, group_size, self.input_local_dim
-        )
+        hidden = self._replicate(hidden).reshape(batch * groups, group_size, self.input_local_dim)
         hidden, _, _ = self.input_local_transformer(hidden, positions)
-        hidden = self._replicate(hidden).reshape(
-            batch, groups, self.input_local_dim * group_size
-        )
+        hidden = self._replicate(hidden).reshape(batch, groups, self.input_local_dim * group_size)
         hidden, _ = self.proj_fc1(hidden)
         # HF AudioProjection uses nn.GELU() = exact erf (modeling_mimo_v2.py:924); jax.nn.gelu
         # defaults to the tanh approximation. Match HF (the vision merger already uses erf).
@@ -237,6 +233,11 @@ class MiMoV25AudioUnderstandingEncoder(nnx.Module):
         mesh = getattr(self, "mesh", None)
         if mesh is None:
             return x
-        return jax.lax.with_sharding_constraint(
+        # Use jax.sharding.reshard, NOT with_sharding_constraint: under the in-model AR mesh whose
+        # axes are Explicit, with_sharding_constraint acts as an ASSERT on the input's existing
+        # sharding (a 'data'-sharded input then fails) rather than re-sharding it. reshard actually
+        # replicates and works under both Auto and Explicit axis types. (Staged ran on a trivial
+        # 1-device mesh where this was a no-op; mirrors the mm_core.merge rule-3 fix.)
+        return jax.sharding.reshard(
             x, jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
         )
