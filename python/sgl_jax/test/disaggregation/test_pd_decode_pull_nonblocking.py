@@ -6,8 +6,10 @@ blocks until the transfer completes. Dispatching it inline inside
 handed to a single long-lived background worker owned by the manager.
 These tests pin that contract:
 
-  * ``init()`` pre-connects the link to the remote peer so the latency of
-    the first ``server.connect`` never lands inside ``poll()``.
+  * ``init()`` only records metadata and arms the receiver. It does NOT
+    connect — the transfer link is a native handle that must be created and
+    used on the same thread, so the worker connects lazily inside its own
+    pull (see ``test_init_does_not_connect`` / ``test_worker_connects_then_pulls``).
   * the first ``poll()`` transitions WAITING_FOR_INPUT -> TRANSFERRING and
     *enqueues* the receiver — it does NOT pull. ``poll()`` spawns no thread
     and stays non-blocking.
@@ -57,6 +59,10 @@ class _Wrapper:
 
     def pull(self, uuid, spec, remote_addr=None):
         self.calls += 1
+        # Mirror the real wrapper: ``pull`` lazily connects (and caches) the
+        # link on the calling thread before fetching.
+        if remote_addr is not None and remote_addr not in self.connected:
+            self.connected.append(remote_addr)
         if self._raise:
             raise RuntimeError("pull boom")
         return _Leaf(self)
@@ -119,9 +125,10 @@ def _make_receiver(**kw):
     return mgr, recv
 
 
-def test_init_preconnects():
+def test_init_does_not_connect():
     mgr, recv = _make_receiver()
-    assert mgr.wrapper.connected == ["1.2.3.4:5000"]
+    # init must NOT touch the link: connect+pull stay on the worker thread.
+    assert mgr.wrapper.connected == []
     assert recv.state == KVPoll.WAITING_FOR_INPUT
 
 
@@ -142,10 +149,13 @@ def test_poll_enqueues_without_pulling():
 def test_worker_pull_then_success():
     mgr, recv = _make_receiver()
     assert recv.poll() == KVPoll.TRANSFERRING
+    # Enqueue does not connect; the link is created on the worker thread.
+    assert mgr.wrapper.connected == []
 
     # The background worker performs the blocking pull and stores results.
     recv._run_pull()
     assert mgr.wrapper.calls == 1
+    assert mgr.wrapper.connected == ["1.2.3.4:5000"]
     assert recv.result is not None
 
     # Next poll drives ack -> SUCCESS once every leaf is ready.

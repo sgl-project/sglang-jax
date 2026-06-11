@@ -77,9 +77,9 @@ class JaxTransferWrapper:
         # side-channel ack path, so access is serialized with a lock.
         self._pending_lock = threading.Lock()
         self._pending: dict[str, Any] = {}
-        # ``_links`` is read/written from the decode event-loop thread
-        # (``init`` pre-connect) and the background pull worker thread, so
-        # access is serialized.
+        # ``_links`` is created and used only on the background pull worker
+        # thread (lazy connect inside ``pull``). The lock is kept as a cheap
+        # guard in case a future caller pulls from another thread.
         self._links_lock = threading.Lock()
         self._links: dict[str, Any] = {}
 
@@ -225,14 +225,6 @@ class JaxTransferWrapper:
             )
         link = self._connect(remote_addr)
         return link.pull(_uuid_to_int(uuid), spec)
-
-    def connect(self, remote_addr: str) -> None:
-        """Eagerly establish (and cache) a link to ``remote_addr`` so a later
-        latency-sensitive ``pull`` does not pay connection setup inline."""
-
-        if not self._started:
-            raise RuntimeError("JaxTransferWrapper.start() must be called before connect()")
-        self._connect(remote_addr)
 
     def release(self, uuid: str) -> None:
         """Drop the wrapper's reference to a previously registered buffer.

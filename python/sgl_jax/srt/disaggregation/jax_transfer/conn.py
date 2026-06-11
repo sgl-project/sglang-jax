@@ -522,7 +522,11 @@ class JaxTransferKVReceiver(KVReceiver, StateHolder):
         if not isinstance(p_metadata, PMetadata):
             raise TypeError(f"p_metadata must be PMetadata, got " f"{type(p_metadata).__name__}")
         self._metadata = p_metadata
-        self._mgr.wrapper.connect(p_metadata.remote_addr)
+        # Do NOT pre-connect here: the link is a native handle and must be
+        # created and used on the same thread. ``_run_pull`` connects lazily
+        # on the pull worker so connect+pull share that thread; pre-connecting
+        # on the decode event-loop thread and pulling on the worker hangs the
+        # native transfer.
         self._transition_to(KVPoll.WAITING_FOR_INPUT)
 
     def poll(self) -> KVPoll:
