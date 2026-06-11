@@ -258,10 +258,15 @@ class Scheduler(
 
             self.recv_from_rpc = get_zmq_socket(context, zmq.DEALER, port_args.rpc_ipc_name, False)
             if self.nnodes > 1:
-                self.publisher = get_zmq_socket(context, zmq.PUB, self.pub_sub_addr, bind=True)
-                self.publisher_sync = get_zmq_socket(
-                    context, zmq.REP, self.pub_sub_sync_addr, bind=True
-                )
+                # A PUB/REP socket must bind to a LOCAL interface; pub_sub_addr carries the
+                # dist-host hostname that SUBSCRIBERS (other ranks) connect to. Binding
+                # tcp://<remote-host>:port fails with ENODEV, so bind on the wildcard (same port).
+                # (Multi-host standard-server path; the staged GlobalScheduler used jax.distributed
+                # and never exercised this pub/sub.)
+                pub_bind = "tcp://*:" + self.pub_sub_addr.rsplit(":", 1)[1]
+                sync_bind = "tcp://*:" + self.pub_sub_sync_addr.rsplit(":", 1)[1]
+                self.publisher = get_zmq_socket(context, zmq.PUB, pub_bind, bind=True)
+                self.publisher_sync = get_zmq_socket(context, zmq.REP, sync_bind, bind=True)
                 self.num_subscribers = self.nnodes - 1
         else:
             self.recv_from_tokenizer = None

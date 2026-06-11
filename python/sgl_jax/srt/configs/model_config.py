@@ -170,6 +170,17 @@ class ModelConfig:
             and getattr(self.hf_config, "vision_config", None) is not None
         ):
             self.hf_config.architectures[0] = "MiMoV2_5ForConditionalGeneration"
+            # G2-b: only the AR backbone is fp8; the vision/audio towers are bf16. The fp8 config
+            # synthesizes a catch-all linear-quant rule (module_path ".*") that would ALSO wrap the
+            # towers' Linears in QuantizedLinear (renaming .weight -> .weight_q, breaking their bf16
+            # load). The wrapper nests the AR under self.model, so the quant walk's slash-path for AR
+            # linears starts with "model/" while towers are "audio_encoder/..."/"visual/...". Scope
+            # the rule to the AR subtree so the towers stay LinearBase.
+            qc = self.quantization_config
+            if qc is not None and getattr(qc, "linear_rules", None):
+                for rule in qc.linear_rules:
+                    if isinstance(rule, dict) and rule.get("module_path") == ".*":
+                        rule["module_path"] = "model/.*"
 
         # Check model type
         self.is_generation = is_generation_model(self.hf_config.architectures, is_embedding)
