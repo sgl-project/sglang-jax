@@ -73,6 +73,7 @@ def vision_attention(
     v: jax.Array,
     scale: float,
     window_size: int = -1,
+    valid_mask: jax.Array | None = None,
 ) -> jax.Array:
     """
     Compute vision attention using flash attention on GPU or native attention on TPU.
@@ -127,6 +128,14 @@ def vision_attention(
             window_mask = distance > window_size
             attn_weights = jnp.where(
                 window_mask[None, None, :, :], jnp.finfo(attn_weights.dtype).min, attn_weights
+            )
+
+        # V-2 bucketing: mask out padding-patch keys (so real patches never attend to the
+        # padding added to reach a canonical bucket grid). valid_mask is [T] bool (in the
+        # block-processing / window-permuted order); None when bucketing is off (0-diff).
+        if valid_mask is not None:
+            attn_weights = jnp.where(
+                ~valid_mask[None, None, None, :], jnp.finfo(attn_weights.dtype).min, attn_weights
             )
 
         attn_weights = jax.nn.softmax(attn_weights, axis=-1)
@@ -267,6 +276,7 @@ class Qwen2_5_VisionAttention(nnx.Module):
         rotary_pos_emb: jax.Array,
         cu_window_seqlens: jax.Array | None = None,
         use_fullattn: bool = True,
+        valid_mask: jax.Array | None = None,
     ) -> jax.Array:
         T, B, D = x.shape
         assert B == 1, "Vision attention currently only supports batch size 1"
@@ -289,8 +299,8 @@ class Qwen2_5_VisionAttention(nnx.Module):
         if not use_fullattn and cu_window_seqlens is not None:
             window_size = self._window_token_size
 
-        # Compute attention using the backend function
-        output = vision_attention(q, k, v, self.scale, window_size)
+        # Compute attention using the backend function (valid_mask masks V-2 padding patches)
+        output = vision_attention(q, k, v, self.scale, window_size, valid_mask=valid_mask)
 
         # Reshape back: [B, T, N, H] -> [T, B, D]
         output = output.transpose(1, 0, 2, 3).reshape(T, B, D)
@@ -327,8 +337,11 @@ class Qwen2_5_VisionBlock(nnx.Module):
         rotary_pos_emb: jax.Array,
         cu_window_seqlens: jax.Array | None = None,
         use_fullattn: bool = True,
+        valid_mask: jax.Array | None = None,
     ) -> jax.Array:
-        x = x + self.attn(self.norm1(x), rotary_pos_emb, cu_window_seqlens, use_fullattn)
+        x = x + self.attn(
+            self.norm1(x), rotary_pos_emb, cu_window_seqlens, use_fullattn, valid_mask=valid_mask
+        )
         x = x + self.mlp(self.norm2(x))
         return x
 
@@ -561,6 +574,7 @@ class Qwen2_5_VL_VisionTransformer(nnx.Module):
         rotary_pos_emb: jax.Array,
         cu_seqlens: jax.Array,
         cu_window_seqlens: jax.Array,
+        valid_mask: jax.Array | None = None,
     ) -> jax.Array:
         hidden_states = self.patch_embed(x)
 
@@ -582,6 +596,7 @@ class Qwen2_5_VL_VisionTransformer(nnx.Module):
                     rotary_pos_emb=rotary_pos_emb,
                     cu_window_seqlens=cu_seqlens,
                     use_fullattn=True,
+                    valid_mask=valid_mask,
                 )
             else:
                 hidden_states = blk(
@@ -589,6 +604,7 @@ class Qwen2_5_VL_VisionTransformer(nnx.Module):
                     rotary_pos_emb=rotary_pos_emb,
                     cu_window_seqlens=cu_window_seqlens,
                     use_fullattn=False,
+                    valid_mask=valid_mask,
                 )
 
         # adapter
@@ -597,6 +613,61 @@ class Qwen2_5_VL_VisionTransformer(nnx.Module):
         reverse_indices = jnp.argsort(window_index)
         hidden_states = hidden_states[reverse_indices, :]
         return hidden_states
+
+    def _compute_valid_units(
+        self,
+        grid_thw: tuple[tuple[int, int, int]],
+        real_llm_dims: jax.Array,
+    ) -> jax.Array:
+        """V-2 bucketing: per-merge-unit bool mask (in canonical (t, llm_h, llm_w) row-major
+        order) marking which units are real vs. bucket padding. A unit at LLM-grid (row, col)
+        is real iff row < real_llm_h and col < real_llm_w. real_llm_dims is a *traced* [num_grids, 2]
+        array (real_llm_h, real_llm_w per grid) -- traced, NOT static, so the encode jit compiles
+        only on the *padded* (canonical) grid, never on the real size (that is the whole point of
+        bucketing: bound the recompiles)."""
+        m = self.spatial_merge_size
+        valid_units = []
+        for i, (t, h, w) in enumerate(grid_thw):
+            llm_h, llm_w = h // m, w // m
+            real_llm_h = real_llm_dims[i, 0]
+            real_llm_w = real_llm_dims[i, 1]
+            rows = jnp.arange(llm_h)[:, None] < real_llm_h
+            cols = jnp.arange(llm_w)[None, :] < real_llm_w
+            unit = jnp.broadcast_to((rows & cols)[None, :, :], (t, llm_h, llm_w)).reshape(
+                -1
+            )  # (t, llm_h, llm_w) row-major -> matches window_index unit ordering
+            valid_units.append(unit)
+        return jnp.concatenate(valid_units, axis=0)  # [sum_i t*llm_h*llm_w] bool
+
+    def encode_bucketed(
+        self,
+        x: jax.Array,
+        grid_thw: tuple[tuple[int, int, int]],
+        real_llm_dims: jax.Array,
+    ) -> tuple[jax.Array, jax.Array]:
+        """V-2 bucketing entry point. ``x``/``grid_thw`` are padded to a canonical bucket grid
+        (static); ``real_llm_dims`` (traced [num_grids, 2]) gives each image's true LLM-grid size.
+        Returns ``(hidden_padded [num_units, out], valid_units [num_units] bool)`` in canonical
+        (t, llm_h, llm_w) row-major order. Bucket-padding units are masked out of the ViT attention
+        (so real patches never attend to them) and flagged in ``valid_units`` so the caller can
+        compact them out before merge. Window tiling is anchored at origin in fixed wsize-blocks,
+        so a real patch keeps its exact window membership in the padded grid -> bit-equivalent to
+        no-bucketing. ``__call__`` (the non-bucketed path) is untouched."""
+        window_index, rotary_pos_emb, cu_seqlens, cu_window_seqlens = self.compute_aux_arrays(
+            grid_thw
+        )
+        valid_units = self._compute_valid_units(grid_thw, real_llm_dims)  # canonical order
+        # Expand per-unit validity to per-patch (window order). Use broadcast+reshape, NOT
+        # jnp.repeat: under the Explicit-axis AR mesh jnp.repeat demands an out_sharding, whereas
+        # broadcast_to (new replicated axis) + reshape propagate the replicated sharding cleanly.
+        vu = valid_units[window_index]  # [num_units] bool, window order
+        valid_mask = jnp.broadcast_to(vu[:, None], (vu.shape[0], self.spatial_merge_unit)).reshape(
+            -1
+        )  # per-patch [seq]
+        hidden_states = self.compute_hidden_states(
+            x, window_index, rotary_pos_emb, cu_seqlens, cu_window_seqlens, valid_mask=valid_mask
+        )
+        return hidden_states, valid_units
 
     def __call__(self, x: jax.Array, grid_thw: tuple[tuple[int, int, int]]) -> jax.Array:
         # x: pixel_values: jax.Array

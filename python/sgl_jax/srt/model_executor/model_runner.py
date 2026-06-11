@@ -298,6 +298,8 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             mm_video_grid_thw,
             mm_audio_features,
             mm_audio_feature_lengths,
+            mm_real_llm_dims=None,
+            mm_real_video_llm_dims=None,
         ):
             model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
             model = nnx.merge(model_def, model_state)
@@ -309,6 +311,8 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 mm_video_grid_thw,
                 mm_audio_features,
                 mm_audio_feature_lengths,
+                mm_real_llm_dims=mm_real_llm_dims,
+                mm_real_video_llm_dims=mm_real_video_llm_dims,
             )
 
         if hasattr(self.model, "embed_mm"):
@@ -321,6 +325,8 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 mm_video_grid_thw,
                 mm_audio_features,
                 mm_audio_feature_lengths,
+                mm_real_llm_dims=None,
+                mm_real_video_llm_dims=None,
             ):
                 return jitted_embed_mm(
                     model_def,
@@ -333,6 +339,8 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                     mm_video_grid_thw,
                     mm_audio_features,
                     mm_audio_feature_lengths,
+                    mm_real_llm_dims=mm_real_llm_dims,
+                    mm_real_video_llm_dims=mm_real_video_llm_dims,
                 )
 
             self.jitted_embed_mm = embed_mm_wrapper
@@ -653,6 +661,49 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         def _thw(rows):
             return tuple(tuple(int(v) for v in row) for row in rows) if rows else None
 
+        # V-2 bucketing: pad each image's LLM-grid to a multiple of the bucket edge so the encode
+        # jit sees a canonical (bounded) set of grid geometries. Returns (padded_px, padded_grids,
+        # real_llm_dims[num,2]); the ViT masks the bucket padding (traced real dims -> no compile
+        # on the real size) and the model compacts it out before merge. Only for Qwen2.5-VL (its
+        # ViT exposes encode_bucketed); 0/absent -> off (validated path untouched).
+        bucket_s = int(getattr(self.server_args, "vision_bucket_size", 0) or 0)
+        merge_m = int(getattr(self.model, "spatial_merge_size", 0) or 0)
+        bucketing_on = (
+            bucket_s > 0
+            and merge_m > 0
+            and hasattr(getattr(self.model, "visual", None), "encode_bucketed")
+        )
+
+        def _bucket_pad(px, grids):
+            px = np.asarray(px)
+            dim = px.shape[-1]
+            out_px, padded_grids, real_dims = [], [], []
+            cur = 0
+            for t, h, w in grids:
+                t, h, w = int(t), int(h), int(w)
+                size = t * h * w
+                unit = px[cur : cur + size]
+                cur += size
+                llm_h, llm_w = h // merge_m, w // merge_m
+                pad_llm_h = ((llm_h + bucket_s - 1) // bucket_s) * bucket_s
+                pad_llm_w = ((llm_w + bucket_s - 1) // bucket_s) * bucket_s
+                real_dims.append((llm_h, llm_w))
+                if pad_llm_h == llm_h and pad_llm_w == llm_w:
+                    out_px.append(unit)
+                    padded_grids.append((t, h, w))
+                    continue
+                mu = merge_m * merge_m
+                u = unit.reshape(t, llm_h, llm_w, mu, dim)
+                padded = np.zeros((t, pad_llm_h, pad_llm_w, mu, dim), dtype=u.dtype)
+                padded[:, :llm_h, :llm_w, :, :] = u
+                out_px.append(padded.reshape(t * pad_llm_h * pad_llm_w * mu, dim))
+                padded_grids.append((t, pad_llm_h * merge_m, pad_llm_w * merge_m))
+            return (
+                np.concatenate(out_px, axis=0),
+                tuple(padded_grids),
+                np.asarray(real_dims, dtype=np.int32),
+            )
+
         try:
             ctx = jax.sharding.use_mesh(self.mesh)
         except AttributeError:
@@ -687,33 +738,60 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                         )
                     else:
                         aud_len = (int(np.asarray(aud_feats).shape[-1]),)
-                input_ids = _put(np.asarray(r.origin_input_ids, dtype=np.int32))
+                # V-2 bucketing: the encode jit is keyed by BOTH the vision grid AND the
+                # input_ids length (text-embed + merge shapes). Grid bucketing alone leaves the
+                # seq dimension unbounded (two images of different real size -> different #image
+                # placeholder tokens -> different prompt length -> recompile). So also pad the
+                # prompt up to a seq bucket; the extra tail rows are sliced off the fused output
+                # below (consumer sees the real length). Together this bounds the encode recompiles
+                # to (#grid buckets x #seq buckets). Off (default): raw length, validated path.
+                ids_np = np.asarray(r.origin_input_ids, dtype=np.int32)
+                real_len = int(ids_np.shape[0])
+                if bucketing_on:
+                    seq_bucket = 256
+                    padded_len = ((real_len + seq_bucket - 1) // seq_bucket) * seq_bucket
+                    if padded_len > real_len:
+                        ids_np = np.pad(ids_np, (0, padded_len - real_len))
+                input_ids = _put(ids_np)
+                # V-2 bucketing (images only): pad to a canonical grid + carry traced real dims.
+                img_grid = a.get("image_grid_thw")
+                img_px_dev = _put(img_px, bf16=True)
+                real_llm_dims = None
+                if bucketing_on and img_px is not None and img_grid is not None:
+                    img_px_b, img_grid, real_dims_np = _bucket_pad(img_px, img_grid)
+                    img_px_dev = _put(img_px_b, bf16=True)
+                    real_llm_dims = _put(real_dims_np)
                 # V-2 probe (design §5.3): count vision-encode jit (re)compiles. A miss = a
                 # distinct grid geometry that triggered an XLA compile. First-seen resolutions
                 # miss once (expected); a sustained stream of misses = unbounded vision shapes
-                # (the recompile storm patch bucketing would bound). Surfacing it makes the
-                # V-3 "compile count <= bucket count" gate observable.
+                # (the recompile storm bucketing bounds -- with --vision-bucket-size the padded
+                # grids collapse to the bucket multiples, so the probe goes quiet after warmup).
+                # Surfacing it makes the V-3 "compile count <= bucket count" gate observable.
                 import jax._src.test_util as jtu
 
                 with jtu.count_pjit_cpp_cache_miss() as _vit_compiles:
                     fused, deepstack, pos_mask = self.jitted_embed_mm(
                         input_ids,
-                        _put(img_px, bf16=True),
-                        _thw(a.get("image_grid_thw")),
+                        img_px_dev,
+                        _thw(img_grid),
                         _put(vid_px, bf16=True),
                         _thw(a.get("video_grid_thw")),
                         _put(aud_feats, bf16=True),
                         aud_len,
+                        mm_real_llm_dims=real_llm_dims,
                     )
                 if _vit_compiles() > 0:
                     logger.info(
                         "V-2 probe: vision encode jit compiled for new geometry "
-                        "(image_grid=%s, video_grid=%s, audio_len=%s)",
-                        a.get("image_grid_thw"),
+                        "(image_grid=%s, video_grid=%s, audio_len=%s, bucketing=%s)",
+                        _thw(img_grid),
                         a.get("video_grid_thw"),
                         aud_len,
+                        bucketing_on,
                     )
-                r.multimodal_embedding = np.asarray(jax.device_get(fused))
+                # Slice off any seq-bucket padding tail so the held embedding matches the real
+                # prompt length (the scheduler slices it per chunk over [0, real_len)).
+                r.multimodal_embedding = np.asarray(jax.device_get(fused))[:real_len]
                 # Deepstack (Qwen3-Omni): attach the SPARSE per-level visual features + the
                 # full-prompt visual mask; _merge_multimodal densifies them per chunk.
                 if deepstack is not None and pos_mask is not None:

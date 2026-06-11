@@ -199,6 +199,11 @@ class ServerArgs:
     # [heads, T, T] attention activation dominates). 0 = off. Opt-in: it reserves for the WORST
     # case, so only set it for large-image / video workloads.
     vision_max_patches: int = 0
+    # V-2 patch bucketing (design §5.3): pad every image's LLM-grid (h//merge, w//merge) to a
+    # canonical (S, S) where S = this value, so the vision encode jit compiles ONE graph for all
+    # resolutions (bounds the recompile storm). Padding patches are masked in the ViT attention
+    # and sliced off the output -> bit-equivalent to no-bucketing. 0 = off. Qwen2.5-VL only.
+    vision_bucket_size: int = 0
 
     # Speculative decoding
     speculative_algorithm: str | None = None
@@ -1118,6 +1123,14 @@ class ServerArgs:
             help="G1 auto-sizing: largest #patches (t*h*w) a single vision request may produce. "
             ">0 on a multimodal model auto-computes the vision HBM reserve from the ViT config. "
             "0 = off. Reserves for the worst case, so set only for large-image / video workloads.",
+        )
+        parser.add_argument(
+            "--vision-bucket-size",
+            type=int,
+            default=ServerArgs.vision_bucket_size,
+            help="V-2 bucketing: pad every image's LLM-grid (h//merge, w//merge) to (S, S) so the "
+            "vision encode jit compiles ONE graph for all resolutions (bounds recompiles). Padding "
+            "is masked + sliced off (bit-equivalent to off). 0 = off. Qwen2.5-VL only.",
         )
         # Kernel backend
         parser.add_argument(

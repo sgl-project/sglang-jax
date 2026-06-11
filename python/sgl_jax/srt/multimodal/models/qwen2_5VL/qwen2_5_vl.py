@@ -89,22 +89,44 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
 
     # ---- per-modality encoders (model-owned tower; capability U3) ----
 
-    def _encode(self, pixel_values: jax.Array, grid_thw: tuple) -> jax.Array:
-        """Encode one modality's pixels into [N, hidden], one ViT call per item."""
+    def _encode(
+        self, pixel_values: jax.Array, grid_thw: tuple, real_llm_dims: jax.Array | None = None
+    ):
+        """Encode one modality's pixels, one ViT call per item. Returns ``(hidden [N, out], valid)``
+        where ``valid`` is None unless V-2 bucketing is active. When ``real_llm_dims`` (traced
+        [num_items, 2] of real (llm_h, llm_w)) is given, grid_thw/pixel_values are padded to a
+        canonical bucket; the ViT masks the bucket padding and returns it + a per-unit valid mask
+        (the caller compacts the padding out before merge). The compile keys only on the canonical
+        (padded) grid, never on the real size -> bounded recompiles."""
         embeds = []
+        valids = []
         cur = 0
-        for thw in grid_thw:
+        for idx, thw in enumerate(grid_thw):
             t, h, w = thw
             size = int(t) * int(h) * int(w)
-            embeds.append(self.visual(pixel_values[cur : cur + size, :], (thw,)))
+            px = pixel_values[cur : cur + size, :]
             cur += size
-        return jnp.concatenate(embeds, axis=0)
+            if real_llm_dims is not None:
+                hidden, valid = self.visual.encode_bucketed(
+                    px, (thw,), real_llm_dims[idx : idx + 1]
+                )
+                embeds.append(hidden)
+                valids.append(valid)
+            else:
+                embeds.append(self.visual(px, (thw,)))
+        hidden = jnp.concatenate(embeds, axis=0)
+        valid = jnp.concatenate(valids, axis=0) if real_llm_dims is not None else None
+        return hidden, valid
 
-    def encode_image(self, pixel_values: jax.Array, grid_thw: tuple) -> jax.Array:
-        return self._encode(pixel_values, grid_thw)
+    def encode_image(
+        self, pixel_values: jax.Array, grid_thw: tuple, real_llm_dims: jax.Array | None = None
+    ):
+        return self._encode(pixel_values, grid_thw, real_llm_dims)
 
-    def encode_video(self, pixel_values: jax.Array, grid_thw: tuple) -> jax.Array:
-        return self._encode(pixel_values, grid_thw)
+    def encode_video(
+        self, pixel_values: jax.Array, grid_thw: tuple, real_llm_dims: jax.Array | None = None
+    ):
+        return self._encode(pixel_values, grid_thw, real_llm_dims)
 
     # ---- forward: in-forward encode + merge, then reuse the AR body ----
 
@@ -117,6 +139,8 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
         mm_video_grid_thw=None,
         mm_audio_features=None,
         mm_audio_feature_lengths=None,
+        mm_real_llm_dims=None,
+        mm_real_video_llm_dims=None,
     ):
         """Full-sequence text-embed + ViT encode + merge (C-1, design §5.2). Returns the uniform
         encode-pass tuple ``(fused [seq, hidden], deepstack_sparse_or_None, visual_pos_mask_or_None)``
@@ -126,13 +150,42 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
         holds the result on ``req.multimodal_embedding`` so the scheduler slices it per chunk -- no
         per-chunk re-encode, no chunk-boundary merge misalignment (B1/B2/B8). Scheme B: input_ids
         is clean; merge keys by the raw image/video token id. (mm_audio_* accepted for a uniform
-        signature with the audio models; unused here.)"""
+        signature with the audio models; unused here.) mm_real_llm_dims / mm_real_video_llm_dims
+        carry the *traced* real (llm_h, llm_w) per item when V-2 bucketing pads pixels to a
+        canonical bucket (None = off); the padded visual rows are then compacted valid-to-front
+        so merge fills the real placeholders and drops the trailing bucket padding."""
         text_embed = self.model.embed_tokens(input_ids)
-        mod_embeds = []
+        visuals = []
+        valids = []
         if mm_pixel_values is not None:
-            mod_embeds.append(self.encode_image(mm_pixel_values, mm_grid_thw))
+            hidden, valid = self.encode_image(
+                mm_pixel_values, mm_grid_thw, real_llm_dims=mm_real_llm_dims
+            )
+            visuals.append(hidden)
+            valids.append(valid)
         if mm_pixel_values_videos is not None:
-            mod_embeds.append(self.encode_video(mm_pixel_values_videos, mm_video_grid_thw))
+            hidden, valid = self.encode_video(
+                mm_pixel_values_videos, mm_video_grid_thw, real_llm_dims=mm_real_video_llm_dims
+            )
+            visuals.append(hidden)
+            valids.append(valid)
+        mod_embeds = []
+        if visuals:
+            all_v = jnp.concatenate(visuals, axis=0)
+            # V-2 bucketing: if any modality was padded to a bucket, compact the real rows to the
+            # front (stable) so merge -- whose scatter is sized to the padded row count and uses
+            # mode="drop" -- fills the real placeholders in order and discards the trailing bucket
+            # padding. Off (no real dims): all-True masks -> identity, byte-equivalent.
+            if any(v is not None for v in valids):
+                masks = [
+                    v if v is not None else jnp.ones((h.shape[0],), dtype=bool)
+                    for h, v in zip(visuals, valids)
+                ]
+                all_m = jnp.concatenate(masks, axis=0)
+                n = all_m.shape[0]
+                order = jnp.argsort(jnp.where(all_m, jnp.arange(n), n + jnp.arange(n)))
+                all_v = all_v[order]
+            mod_embeds = [all_v]
         placeholder_ids = [t for t in (self.image_token_id, self.video_token_id) if t is not None]
         fused = merge(text_embed, mod_embeds, placeholder_ids, input_ids, mesh=self.mesh).embed
         return fused, None, None
