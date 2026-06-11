@@ -259,6 +259,61 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
 
         self.jitted_run_model = run_model_wrapper
 
+        # C-1 (design §5.2): standalone full-sequence multimodal encode+merge, invoked once per
+        # req on the host BEFORE chunked prefill (model_runner.encode_mm_reqs). Its [seq, hidden]
+        # result is held on req.multimodal_embedding and sliced per chunk by
+        # ScheduleBatch._merge_multimodal -> no per-chunk re-encode (B8) and no chunk-boundary
+        # merge misalignment (B1/B2). grid_thw fixes the ViT shapes -> static (recompiles per
+        # distinct geometry; patch bucketing is the deferred V-2 optimization). Only built for
+        # models that expose embed_mm (the in-model VLMs); None otherwise.
+        @partial(
+            jax.jit,
+            static_argnames=["model_state_def", "mm_grid_thw", "mm_video_grid_thw"],
+        )
+        def jitted_embed_mm(
+            model_def,
+            model_state_def,
+            model_state_leaves,
+            input_ids,
+            mm_pixel_values,
+            mm_grid_thw,
+            mm_pixel_values_videos,
+            mm_video_grid_thw,
+        ):
+            model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
+            model = nnx.merge(model_def, model_state)
+            return model.embed_mm(
+                input_ids,
+                mm_pixel_values,
+                mm_grid_thw,
+                mm_pixel_values_videos,
+                mm_video_grid_thw,
+            )
+
+        if hasattr(self.model, "embed_mm"):
+
+            def embed_mm_wrapper(
+                input_ids,
+                mm_pixel_values,
+                mm_grid_thw,
+                mm_pixel_values_videos,
+                mm_video_grid_thw,
+            ):
+                return jitted_embed_mm(
+                    model_def,
+                    model_state_def,
+                    self.model_state_leaves,
+                    input_ids,
+                    mm_pixel_values,
+                    mm_grid_thw,
+                    mm_pixel_values_videos,
+                    mm_video_grid_thw,
+                )
+
+            self.jitted_embed_mm = embed_mm_wrapper
+        else:
+            self.jitted_embed_mm = None
+
         self.jitted_sampler = partial(
             jitted_sampler,
             sampler_def,
@@ -541,6 +596,63 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode}")
 
         return ret
+
+    def encode_mm_reqs(self, reqs):
+        """C-1 (design §5.2): for each req carrying raw multimodal input and NO precomputed
+        embedding, run the FULL-sequence encode+merge once and attach the ``[seq, hidden]``
+        fused embedding (host ``np.ndarray``) to ``req.multimodal_embedding``. The scheduler's
+        ``_merge_multimodal`` then slices it per chunk into ``input_embedding`` and the in-forward
+        encode self-disables (``_assemble_inmodel_mm`` skips the req -> ``contains_mm_inputs()``
+        turns False) -> no per-chunk re-encode (B8) and no chunk-boundary merge misalignment
+        (B1/B2). No-op for non-mm models (``jitted_embed_mm is None``) and for reqs without raw
+        image/video (audio-only / deepstack models keep the legacy in-forward path until their
+        ``embed_mm`` is added)."""
+        if self.jitted_embed_mm is None or not reqs:
+            return
+        import importlib
+
+        assemble = importlib.import_module(
+            "sgl_jax.srt.multimodal.manager.mm_assembly"
+        ).assemble_mm_inputs
+        repl = jax.sharding.NamedSharding(self.mesh, jax.sharding.PartitionSpec())
+
+        def _put(x, bf16=False):
+            if x is None:
+                return None
+            y = jax.device_put(np.asarray(x), repl)
+            return y.astype(jnp.bfloat16) if bf16 else y
+
+        def _thw(rows):
+            return tuple(tuple(int(v) for v in row) for row in rows) if rows else None
+
+        try:
+            ctx = jax.sharding.use_mesh(self.mesh)
+        except AttributeError:
+            try:
+                ctx = jax.set_mesh(self.mesh)
+            except AttributeError:
+                ctx = self.mesh
+
+        with ctx:
+            for r in reqs:
+                if (
+                    not getattr(r, "mm_inputs", None)
+                    or getattr(r, "multimodal_embedding", None) is not None
+                ):
+                    continue
+                a = assemble(r.mm_inputs)
+                img_px, vid_px = a.get("pixel_values_images"), a.get("pixel_values_videos")
+                if img_px is None and vid_px is None:
+                    continue
+                input_ids = _put(np.asarray(r.origin_input_ids, dtype=np.int32))
+                fused = self.jitted_embed_mm(
+                    input_ids,
+                    _put(img_px, bf16=True),
+                    _thw(a.get("image_grid_thw")),
+                    _put(vid_px, bf16=True),
+                    _thw(a.get("video_grid_thw")),
+                )
+                r.multimodal_embedding = np.asarray(jax.device_get(fused))
 
     def sample(
         self,

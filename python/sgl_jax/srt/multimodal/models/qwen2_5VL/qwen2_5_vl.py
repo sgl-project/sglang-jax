@@ -108,6 +108,30 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
 
     # ---- forward: in-forward encode + merge, then reuse the AR body ----
 
+    def embed_mm(
+        self,
+        input_ids,
+        mm_pixel_values=None,
+        mm_grid_thw=None,
+        mm_pixel_values_videos=None,
+        mm_video_grid_thw=None,
+    ):
+        """Full-sequence text-embed + ViT encode + merge -> fused ``[seq, hidden]`` (C-1,
+        design §5.2). The single source of truth for the in-model encode+merge: called both
+        in-forward by ``__call__`` (legacy per-batch path) and once-per-req by the host-side
+        encode pass (model_runner.encode_mm_reqs), which runs it over the FULL input_ids+pixels
+        and holds the result on ``req.multimodal_embedding`` so the scheduler slices it per
+        chunk -- no per-chunk re-encode and no chunk-boundary merge misalignment (B1/B2/B8).
+        Scheme B: input_ids is clean; merge keys by the raw image/video token id."""
+        text_embed = self.model.embed_tokens(input_ids)
+        mod_embeds = []
+        if mm_pixel_values is not None:
+            mod_embeds.append(self.encode_image(mm_pixel_values, mm_grid_thw))
+        if mm_pixel_values_videos is not None:
+            mod_embeds.append(self.encode_video(mm_pixel_values_videos, mm_video_grid_thw))
+        placeholder_ids = [t for t in (self.image_token_id, self.video_token_id) if t is not None]
+        return merge(text_embed, mod_embeds, placeholder_ids, input_ids, mesh=self.mesh).embed
+
     def __call__(
         self,
         forward_batch: ForwardBatch,
@@ -116,36 +140,18 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
     ):
         is_extend = forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
         if is_extend and forward_batch.contains_mm_inputs():
-            # Scheme B (design §5.1.2): input_ids stays clean -- placeholder rows hold the raw
-            # image/video token id (in-vocab), never a pad_value (those live only in the radix
-            # cache key). So embed_tokens(input_ids) is safe directly (no clamp), and merge()
-            # locates placeholder rows by isin(input_ids, [image/video_token_id]). The dummy
-            # embedding at those rows is overwritten by the real modality features.
-            text_embed = self.model.embed_tokens(forward_batch.input_ids)
-            mod_embeds = []
-            if forward_batch.mm_pixel_values is not None:
-                mod_embeds.append(
-                    self.encode_image(forward_batch.mm_pixel_values, forward_batch.mm_grid_thw)
-                )
-            if forward_batch.mm_pixel_values_videos is not None:
-                mod_embeds.append(
-                    self.encode_video(
-                        forward_batch.mm_pixel_values_videos, forward_batch.mm_video_grid_thw
-                    )
-                )
-            placeholder_ids = [
-                t for t in (self.image_token_id, self.video_token_id) if t is not None
-            ]
-            fused = merge(
-                text_embed,
-                mod_embeds,
-                placeholder_ids,
+            # Legacy per-batch encode path (used when req.multimodal_embedding was NOT
+            # pre-computed by the host-side encode pass). Reuses embed_mm so the encode+merge
+            # logic stays single-sourced. When C-1's encode pass runs, req.multimodal_embedding
+            # is set -> _assemble_inmodel_mm skips raw pixels -> contains_mm_inputs() is False
+            # here -> this block is skipped and the AR reads the per-chunk-sliced input_embedding.
+            forward_batch.input_embedding = self.embed_mm(
                 forward_batch.input_ids,
-                mesh=self.mesh,
-            ).embed
-            # Stamp the fused embedding; the AR body reads forward_batch.input_embedding
-            # in extend mode (no AR signature change needed -- m3-plan step1 decision).
-            forward_batch.input_embedding = fused
+                forward_batch.mm_pixel_values,
+                forward_batch.mm_grid_thw,
+                forward_batch.mm_pixel_values_videos,
+                forward_batch.mm_video_grid_thw,
+            )
 
         token_to_kv_pool = memory_pools.token_to_kv_pool
         hidden_states, layers_kv_fused, layers_callback_flag = self.model(

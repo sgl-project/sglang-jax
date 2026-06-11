@@ -383,6 +383,12 @@ class ModelWorker:
             sampling_metadata.apply_vocab_mask = True
             sampling_metadata.vocab_mask = batch.sampling_info.vocab_mask
 
+    def encode_mm_reqs(self, reqs):
+        """C-1 (design §5.2): host-side once-per-req multimodal encode. Delegates to the model
+        runner, which runs the full-sequence encode+merge and attaches the [seq, hidden] fused
+        embedding to req.multimodal_embedding (then sliced per chunk by _merge_multimodal)."""
+        self.model_runner.encode_mm_reqs(reqs)
+
     def forward_batch_generation(
         self,
         model_worker_batch: ModelWorkerBatch,

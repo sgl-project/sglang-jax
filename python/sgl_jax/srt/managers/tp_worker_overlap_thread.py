@@ -79,6 +79,15 @@ class ModelWorkerClient:
     def get_kv_cache(self):
         return self.worker.model_runner.token_to_kv_pool
 
+    def encode_mm_reqs(self, reqs):
+        """C-1 (design §5.2): host-side once-per-req multimodal encode. Runs SYNCHRONOUSLY on
+        the caller (scheduler) thread -- it must finish before get_model_worker_batch so
+        _merge_multimodal can slice the held embedding. JAX serializes device execution and the
+        model params are immutable, so dispatching this concurrently with an in-flight forward
+        on the forward_thread is safe; it just blocks the scheduler thread on the device
+        round-trip. No-op for non-mm models / reqs already encoded."""
+        self.worker.encode_mm_reqs(reqs)
+
     def get_max_padded_size(self):
         return self.worker.get_max_padded_size()
 

@@ -1827,6 +1827,14 @@ class Scheduler(
 
         # Run forward
         assert self.is_generation
+        # C-1 (design §5.2): on prefill, run the once-per-req multimodal encode on the host
+        # BEFORE building the worker batch, so ScheduleBatch._merge_multimodal slices the held
+        # [seq, hidden] fused embedding per chunk into input_embedding -> no per-chunk re-encode
+        # and no chunk-boundary merge misalignment (B1/B2/B8). No-op for non-mm models and for
+        # reqs already encoded (multimodal_embedding set on an earlier chunk).
+        if batch.forward_mode.is_extend():
+            mm_reqs = [r for info in batch.reqs_info for r in (info.reqs or [])]
+            self.tp_worker.encode_mm_reqs(mm_reqs)
         (
             precompile_token_paddings,
             precompile_bs_paddings,
