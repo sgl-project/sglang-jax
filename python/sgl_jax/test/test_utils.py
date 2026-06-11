@@ -118,12 +118,19 @@ def _validate_local_snapshot(d: Path) -> bool:
     return has_single_weight_file
 
 
-def _local_or_hf(repo: str, required: bool = True) -> str:
+def _local_or_hf(repo: str, required: bool = True, validate: bool = True) -> str:
     cache = os.environ.get(_MODEL_CACHE_ENV)
     if not cache:
         return repo
     local = Path(cache) / repo
-    if _validate_local_snapshot(local):
+    # validate=False trusts any non-empty cached directory without checking for a
+    # tokenizer or a complete weight set. It is used for EAGLE3 draft models, which
+    # ship without a tokenizer (they reuse the target model's) and therefore can
+    # never satisfy _validate_local_snapshot.
+    cached = (
+        _validate_local_snapshot(local) if validate else (local.is_dir() and any(local.iterdir()))
+    )
+    if cached:
         return str(local)
     if required and is_in_ci():
         raise RuntimeError(
@@ -170,13 +177,12 @@ _MODEL_REPOS: dict[str, str] = {
 }
 _RESOLVED_MODEL_PATHS: dict[str, str] = {}
 
-# Constants that are allowed to fall back to an HF download even in CI, instead
-# of hard-failing on a cache miss. EAGLE3 draft models ship without a tokenizer
-# (they reuse the target model's tokenizer), so they can never satisfy
-# _validate_local_snapshot; the speculative-decoding test also pins them to a
-# specific small revision fetched on the fly. Keep the pre-existing fallback for
-# these rather than forcing them into the cache.
-_CI_HF_FALLBACK_ALLOWED: set[str] = {"QWEN3_32B_EAGLE3"}
+# Constants whose cached snapshot is trusted as-is (no _validate_local_snapshot).
+# EAGLE3 draft models ship without a tokenizer, so they can never pass the normal
+# validation; cache them and skip the check instead. The cached directory must
+# contain the *.safetensors weights (the speculative-decoding test pins the draft
+# model to the revision that provides them).
+_SKIP_VALIDATION: set[str] = {"QWEN3_32B_EAGLE3"}
 
 # Hardcoded local-only path (no HF fallback); kept as an eager constant.
 QWEN3_5_35B_A3B = "/models/Qwen3.5-35B-A3B/"
@@ -187,9 +193,7 @@ def __getattr__(name: str) -> str:
     if repo is None:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
     if name not in _RESOLVED_MODEL_PATHS:
-        _RESOLVED_MODEL_PATHS[name] = _local_or_hf(
-            repo, required=name not in _CI_HF_FALLBACK_ALLOWED
-        )
+        _RESOLVED_MODEL_PATHS[name] = _local_or_hf(repo, validate=name not in _SKIP_VALIDATION)
     return _RESOLVED_MODEL_PATHS[name]
 
 
