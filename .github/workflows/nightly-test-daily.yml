@@ -177,6 +177,7 @@ jobs:
       TZ: Asia/Shanghai
       JAX_COMPILATION_CACHE_DIR: /xla-cache
       SGLANG_JAX_MODEL_CACHE: /models/model_scope
+      RESULTS_DIR: ${{ github.workspace }}/test/nightly_test_output/accuracy
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -194,6 +195,23 @@ jobs:
         run: |
           cd test/srt
           python3 nightly/single_host/suite_runner.py --suite accuracy-text-models-v6e-4 ${CASES:+--cases "$CASES"}
+      - name: Publish accuracy JSON to observability dashboard mount (main only)
+        # !cancelled() so a below-gate run (non-zero exit) still publishes its real data for the trend monitor.
+        if: ${{ !cancelled() && github.ref == 'refs/heads/main' && github.repository == 'sgl-project/sglang-jax' && inputs.pr_number == '' }}
+        run: |
+          DATE=$(date +'%Y-%m-%d')
+          DEST="/observability-storage/${DATE}/single-host-accuracy-${{ github.run_id }}"
+          mkdir -p "$DEST"
+          shopt -s nullglob
+          files=( ${{ github.workspace }}/test/nightly_test_output/accuracy/*.json )
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "::warning::No accuracy JSON to publish"
+          else
+            # A real cp failure must fail the step under set -e, not be hidden as
+            # "nothing to publish" (which feeds the monitor a truncated night).
+            cp "${files[@]}" "$DEST"/
+            echo "Published ${#files[@]} accuracy JSON file(s) to $DEST"
+          fi
 
   nightly-test-accuracy-4-tpu-comment:
     # Posts PASS/FAIL from a clean job (no PR-HEAD code ran here) so the write token
@@ -288,16 +306,24 @@ jobs:
             echo "::warning::No perf traces to publish"
           fi
       - name: Publish perf JSON to observability dashboard mount (main only)
-        if: github.ref == 'refs/heads/main' && github.repository == 'sgl-project/sglang-jax' && inputs.pr_number == ''
+        # !cancelled() so a below-gate run (non-zero exit) still publishes its real data for the trend monitor.
+        if: ${{ !cancelled() && github.ref == 'refs/heads/main' && github.repository == 'sgl-project/sglang-jax' && inputs.pr_number == '' }}
         run: |
           # observability bucket is gcsfuse-mounted (like /models), so this is a
           # plain copy; layout matches multi-host, single-host- prefix marks source.
           DATE=$(date +'%Y-%m-%d')
           DEST="/observability-storage/${DATE}/single-host-perf-${{ github.run_id }}"
           mkdir -p "$DEST"
-          cp ${{ github.workspace }}/test/nightly_test_output/perf/*.json "$DEST"/ 2>/dev/null \
-            && echo "Published perf JSON to $DEST" \
-            || echo "No perf JSON to publish"
+          shopt -s nullglob
+          files=( ${{ github.workspace }}/test/nightly_test_output/perf/*.json )
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "::warning::No perf JSON to publish"
+          else
+            # A real cp failure must fail the step under set -e, not be hidden as
+            # "nothing to publish" (which feeds the monitor a truncated night).
+            cp "${files[@]}" "$DEST"/
+            echo "Published ${#files[@]} perf JSON file(s) to $DEST"
+          fi
       - name: Upload perf results (per-model CSV + xprof traces)
         if: always()
         uses: actions/upload-artifact@v4
@@ -331,6 +357,77 @@ jobs:
           gh pr comment "$PR_NUMBER" --repo "$REPO" \
             --body "> **Nightly (perf)** [\`$CASE_KEY\`]($RUN_URL): **$status** — see the run's step summary."
 
+  # Trend drift: detect on v6e-4 (only it can read the /observability-storage
+  # mount), alert from ubuntu (has gh), connected by a drift.json artifact.
+  # Both continue-on-error so monitoring never fails the nightly run.
+  nightly-trend-monitor:
+    needs:
+      - nightly-test-accuracy-text-models-4-tpu-daily
+      - nightly-test-perf-text-models-4-tpu-daily
+    if: always() && github.ref == 'refs/heads/main' && github.repository == 'sgl-project/sglang-jax' && inputs.pr_number == ''
+    runs-on: arc-runner-v6e-4
+    continue-on-error: true
+    timeout-minutes: 20
+    env:
+      TZ: Asia/Shanghai
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Detect trend drift
+        # stdlib-only on purpose — no setup-venv. A 3rd-party import would
+        # ImportError here, silently swallowed by continue-on-error.
+        run: |
+          if [ ! -d /observability-storage ]; then
+            echo "::warning::/observability-storage not mounted; emitting empty drift report"
+            echo '{"schema_version": 1, "configs": {}}' > drift.json
+          else
+            python3 scripts/ci/check_trend_threshold.py \
+              --data-dir /observability-storage --output drift.json
+          fi
+      - name: Upload drift report
+        uses: actions/upload-artifact@v4
+        with:
+          name: trend-drift-${{ github.run_id }}
+          path: drift.json
+          if-no-files-found: warn
+
+  nightly-trend-alert:
+    needs: nightly-trend-monitor
+    if: always() && github.ref == 'refs/heads/main' && github.repository == 'sgl-project/sglang-jax' && inputs.pr_number == ''
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      issues: write
+    env:
+      TZ: Asia/Shanghai
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Download drift report
+        uses: actions/download-artifact@v4
+        # Tolerate a missing artifact (monitor crash) so the next step still
+        # runs and warns, instead of the job silently vanishing.
+        continue-on-error: true
+        with:
+          name: trend-drift-${{ github.run_id }}
+      - name: Open/update issues + Slack
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          # The script warns + exits 0 on missing/corrupt drift.json — a
+          # transport failure is loud, not a silent "no drift".
+          python3 scripts/ci/trend_alert_issues.py \
+            --repo "${{ github.repository }}" --drift drift.json --slack-output slack.txt
+          if [ -s slack.txt ] && [ -n "$SLACK_WEBHOOK_URL" ]; then
+            jq -Rs '{text: .}' slack.txt | curl --fail-with-body -X POST -H 'Content-type: application/json' -d @- "$SLACK_WEBHOOK_URL"
+          else
+            echo "No drift or no webhook; skipping Slack."
+          fi
+
   nightly-test-daily-finish:
     needs: [
       nightly-test-accuracy-text-models-1-tpu-daily,
@@ -340,6 +437,8 @@ jobs:
       nightly-infra-smoke-1-tpu-daily,
       nightly-test-accuracy-text-models-4-tpu-daily,
       nightly-test-perf-text-models-4-tpu-daily,
+      nightly-trend-monitor,
+      nightly-trend-alert,
     ]
     if: always() && github.repository == 'sgl-project/sglang-jax' && (inputs.job_filter == '' || inputs.job_filter == 'all')
     runs-on: ubuntu-latest
@@ -354,6 +453,10 @@ jobs:
           echo "infra-smoke-1-tpu-daily: ${{ needs.nightly-infra-smoke-1-tpu-daily.result }}"
           echo "accuracy-4-tpu-daily: ${{ needs.nightly-test-accuracy-text-models-4-tpu-daily.result }}"
           echo "perf-4-tpu-daily: ${{ needs.nightly-test-perf-text-models-4-tpu-daily.result }}"
+          # Visibility only, NOT gated: by design (continue-on-error) monitoring
+          # never changes the nightly conclusion; a 'failure' just flags it broke.
+          echo "trend-monitor (not gated): ${{ needs.nightly-trend-monitor.result }}"
+          echo "trend-alert (not gated): ${{ needs.nightly-trend-alert.result }}"
           echo ""
 
           has_failure=false
