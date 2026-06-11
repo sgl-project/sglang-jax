@@ -6,9 +6,9 @@ produces correct per-round ext (= accept, no cumulative drift) and that
 the optimistic alloc upper bound covers the real verify KV-write range.
 Does NOT exercise the fused JIT (device-only); that's TPU-gated.
 """
+
 import numpy as np
 import pytest
-
 
 NDT = 4
 
@@ -65,13 +65,13 @@ def test_chain_ext_equals_accept_no_drift():
         # ext must equal accept (no drift)
         np.testing.assert_array_equal(ext, acc), f"round {k}: ext={ext} != accept={acc}"
         # alloc upper bound must cover verify write range [real:real+ndt]
-        assert np.all(verify_hi - 1 <= new_r), (
-            f"round {k}: verify_hi-1={verify_hi-1} > alloc new_r={new_r} (under-alloc)"
-        )
+        assert np.all(
+            verify_hi - 1 <= new_r
+        ), f"round {k}: verify_hi-1={verify_hi-1} > alloc new_r={new_r} (under-alloc)"
         # alloc must not over-shoot by more than ndt (bounded over-alloc)
-        assert np.all(new_r - (verify_hi - 1) <= NDT), (
-            f"round {k}: over-alloc {new_r - (verify_hi-1)} > ndt"
-        )
+        assert np.all(
+            new_r - (verify_hi - 1) <= NDT
+        ), f"round {k}: over-alloc {new_r - (verify_hi-1)} > ndt"
 
 
 def test_chain_first_round_from_prefill():

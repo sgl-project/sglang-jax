@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from functools import partial
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -361,28 +361,25 @@ def _build_fused_greedy_decode_jit(num_layers: int, topk: int):
         if use_chain:
             d1 = jax.typeof(target_forward_batch.seq_lens).sharding
             mesh_ = d1.mesh if isinstance(d1, NamedSharding) else None
-            d2 = NamedSharding(mesh_, P("data", None)) if mesh_ else d1
             d3 = NamedSharding(mesh_, P("data", None, None)) if mesh_ else d1
-            seq_lens_real = jax.sharding.reshard(
-                prev_chain.new_seq_lens.astype(jnp.int32), d1
-            )
+            seq_lens_real = jax.sharding.reshard(prev_chain.new_seq_lens.astype(jnp.int32), d1)
             prev_acc = jax.sharding.reshard(prev_chain.accept_lens.astype(jnp.int32), d1)
             prev_pred = jax.sharding.reshard(prev_chain.predict.astype(jnp.int32), d1)
             prev_last = jnp.clip(prev_acc - 1, 0, ndt - 1)
             verified_id_real = jnp.take_along_axis(
                 prev_pred.reshape(target_bs, ndt), prev_last[:, None], axis=1
             ).squeeze(1)
-            token_list_real = jax.sharding.reshard(
-                prev_chain.stacked_idx.astype(jnp.int32), d3
-            )[:, :, 0]
+            token_list_real = jax.sharding.reshard(prev_chain.stacked_idx.astype(jnp.int32), d3)[
+                :, :, 0
+            ]
             is_real = (seq_lens_real > 0).astype(jnp.int32)
             target_forward_batch.seq_lens = seq_lens_real
             target_forward_batch.attn_backend.forward_metadata.seq_lens = (
                 seq_lens_real + is_real * ndt
             )
             draft_forward_batch.seq_lens = seq_lens_real + is_real * (ndt - 1)
-            draft_forward_batch.attn_backend.forward_metadata.seq_lens = (
-                seq_lens_real + is_real * (ndt - 1)
+            draft_forward_batch.attn_backend.forward_metadata.seq_lens = seq_lens_real + is_real * (
+                ndt - 1
             )
         else:
             verified_id_real = previous_verified_id
@@ -923,9 +920,7 @@ def spec_decode(spec_worker, model_worker_batch, cur_allocate_lens):
     rpi_host = np.asarray(model_worker_batch.req_pool_indices)
     prev = getattr(spec_worker, "_chain_state", None)
     use_chain = bool(
-        prev is not None
-        and prev[0].shape == rpi_host.shape
-        and np.array_equal(prev[0], rpi_host)
+        prev is not None and prev[0].shape == rpi_host.shape and np.array_equal(prev[0], rpi_host)
     )
     if use_chain:
         prev_chain = prev[1]

@@ -919,7 +919,9 @@ class Scheduler(
                         mesh=self.mesh,
                     )
                     tmp_batch.forward_mode = ForwardMode.DUMMY_FIRST
-                    tmp_batch.next_batch_sampling_info = getattr(self.tp_worker, "cur_sampling_info", None)
+                    tmp_batch.next_batch_sampling_info = getattr(
+                        self.tp_worker, "cur_sampling_info", None
+                    )
                     with jax.profiler.TraceAnnotation("process_batch_result"):
                         self.process_batch_result(tmp_batch, None, batch.launch_done)
 
@@ -1052,18 +1054,14 @@ class Scheduler(
             ):
                 _has_chunked = any(c is not None for c in self.chunked_reqs)
                 _has_finished = any(
-                    r.finished()
-                    for info in self.running_batch.reqs_info
-                    for r in (info.reqs or [])
+                    r.finished() for info in self.running_batch.reqs_info for r in (info.reqs or [])
                 )
                 _all_full = all(
                     len(i.reqs or []) >= self.per_dp_max_running_requests
                     for i in self.running_batch.reqs_info
                 )
                 will_reshape = (
-                    _has_chunked
-                    or _has_finished
-                    or (len(self.waiting_queue) > 0 and not _all_full)
+                    _has_chunked or _has_finished or (len(self.waiting_queue) > 0 and not _all_full)
                 )
                 _chain_stat["n"] += 1
                 if will_reshape:
@@ -2078,7 +2076,7 @@ class Scheduler(
         """Release finished spec reqs whose KV release was deferred under overlap.
 
         process_batch_result_decode marks a req finished one round after it was
-        already re-dispatched (or skipped, if a prefill batch pre-empted decode
+        already re-dispatched (or skipped, if a prefill batch preempted decode
         that round). The req is then dropped by filter_batch and never revisited
         by process_batch_result. Sweep running_batch here — before filter_batch —
         and release any finished req still holding req_pool_idx.
