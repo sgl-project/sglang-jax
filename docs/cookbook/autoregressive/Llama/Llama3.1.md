@@ -174,14 +174,6 @@ Mean ITL (ms):                           9.87
 ==================================================
 ```
 
-## 5. Troubleshooting
-
-| Symptom | Likely cause | Fix |
-|---|---|---|
-| OOM at startup | Weights + KV exceed budget at chosen `--mem-fraction-static` | Lower to 0.85. Verify `--tp-size 4` matches v6e-4 chip count. |
-| First request takes ~4 min | JIT cache empty | Persist `JAX_COMPILATION_CACHE_DIR` across restarts (host volume mount in Docker). |
-| Bench shows ~150 tok/s output and ~50s TTFT at concurrency=16 | `--page-size` defaulted to 1 → `Final max_running_requests: 1` (visible in launch log), requests serialize | Add `--page-size 128 --max-running-requests 64` to the launch command. See §2.4. |
-
 ## Additional Resources
 
 - [Llama 3.1 8B-Instruct model card](https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct)

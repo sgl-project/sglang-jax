@@ -466,18 +466,6 @@ Max ITL (ms):                            1290.76
 ==================================================
 ```
 
-## 5. Troubleshooting
-
-| Symptom | Likely cause | Fix |
-|---|---|---|
-| OOM at startup on v6e-64 | `--mem-fraction-static 0.95` too aggressive for v6e's smaller per-chip HBM | Use `0.92` on v6e-64 (already the value in §2.3); also lower `--swa-full-tokens-ratio` to 0.15 to shift KV pool to full-attention layers. |
-| SWA pool exhaustion (`swa token usage` near 100%) | Long generation traffic outgrows SWA per-layer budget | Raise `--swa-full-tokens-ratio` to 0.30+ or lower `--max-running-requests`. |
-| Full-attention pool exhaustion (`full token usage` near 100%) | Long-context full-attention KV outgrows budget | Lower `--swa-full-tokens-ratio` (shifts pool toward full layers) or shorten `--context-length`. |
-| First request takes ~4 min on each new launch | JIT cache empty | Persist `JAX_COMPILATION_CACHE_DIR` across restarts (host volume mount in Docker; PVC in GKE). Don't share a cache dir across recipes with different `--page-size` / `--tp-size` / etc. |
-| Speculative decoding refuses to start | Overlap scheduler conflict | Add `--disable-overlap-schedule` — required whenever `--speculative-algorithm` is set. |
-| Multi-node hang at `jax.distributed.initialize` | `${MASTER_ADDR}` unreachable from non-rank-0 nodes | Verify rank-0 IP + port `5000` reachable from all nodes; check firewall and headless Service DNS resolution (GKE) or `sky status -a` (SkyPilot). |
-| `Mismatched TPU process count` at first step | `TPU_PROCESS_ADDRESSES` length ≠ `--nnodes` | `echo $TPU_PROCESS_ADDRESSES | tr ',' '\n' | wc -l` should equal `${NNODES}`. The v6e-64 manifest expects 16 entries — make sure the GKE Indexed Job manifest matches the slice. |
-
 ## Additional Resources
 
 - [MiMo-V2.5-Pro Model Card](https://huggingface.co/XiaomiMiMo/MiMo-V2.5-Pro)

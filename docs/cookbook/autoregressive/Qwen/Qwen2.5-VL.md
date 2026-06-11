@@ -93,6 +93,9 @@ For Qwen2.5-VL-3B or Qwen2.5-VL-7B, use the same command shape but set `--model-
 **Multimodal Attention Backend:**
 - The vision-language attention path runs on the default `--attention-backend fa` (FlashAttention on Pallas) — no override needed.
 
+**Remote media URLs:**
+- `image_url` / `video_url` inputs must be fetchable **from the TPU host** — a URL that loads in your browser can still fail server-side on auth / region / firewall. Stage the media on a mounted volume and pass `file:///path/to/media`, or use a publicly reachable URL.
+
 **Compilation Cache Hygiene:**
 - `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache` is mandatory — without it, first request blocks ~4 min per stage while XLA/Pallas re-compiles every kernel (ViT and AR each compile independently).
 - The cache keys on full kernel shape: changing `--page-size`, `--tp-size`, image resolution buckets, or `--context-length` invalidates cached entries.
@@ -232,17 +235,6 @@ print(response.choices[0].message.content)
 > Benchmark section is intentionally omitted — Qwen2.5-VL is a Starter recipe (banner). All §4.1 Accuracy / §4.2 Speed cells are pending real PR-back measurements. When you run a numbered MMMU / MMMU Pro Vision / DocVQA / ChartQA eval against the model on TPU, file a PR adding the §4 block back with the actual numbers and upgrade the banner to Partially validated or Validated. For the canonical four-part §4 form (Test Environment / Deployment Command / Benchmark Command / Test Results) see any Validated recipe in [Autoregressive index](../index.md).
 >
 > Note: `bench_serving` does not have native multimodal input support today, so §4.2 Speed needs a custom OpenAI-client load test driving the §3.2 multi-image / video patterns; PR back full TTFT / ITL / output tok/s along with the image resolution and prompt template used.
-
-## 5. Troubleshooting
-
-| Symptom | Likely cause | Fix |
-|---|---|---|
-| Server rejects `image_url` / `video_url` content blocks | `--multimodal` not set | Add `--multimodal` to the launch command; the text-only server cannot parse vision content blocks. |
-| 72B multi-host launch fails or hangs | Current SGL-JAX staging and multimodal AR multi-host broadcast are not ready for a followable 72B recipe | Do not use 72B as a followable target until a 72B multi-host path and scheduler fix land. |
-| OOM at startup (32B) | Default `--mem-fraction-static` too high once ViT / AR weights load | Lower to 0.8, reduce `--max-running-requests`, and keep the recipe's `--tp-size 4`. |
-| OOM at request-time on multi-image input | Vision embeddings push KV demand past budget at chosen `--max-running-requests` | Lower `--max-running-requests` to 16 or 8; raise `--context-length` if available to spread KV per request. |
-| First request takes 6+ min (vs 4 min text-only) | Both ViT and AR stages JIT-compile separately on first request | Persist `JAX_COMPILATION_CACHE_DIR` across restarts — both stages share the same cache dir. |
-| Video URL works in browser but server rejects it | URL not directly fetchable from the TPU host (auth / region / firewall) | Stage the video on a mounted volume and pass `file:///path/to/video.mp4` instead, or use a publicly reachable URL. |
 
 ## Additional Resources
 

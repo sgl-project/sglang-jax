@@ -4,7 +4,7 @@ title: "GLM-4.5"
 
 # GLM-4.5 MoE on SGL-JAX
 
-> **Validated recipe** — GLM-4.5-Air (106B) validated on TPU v6e-32 with sglang-jax 0.1.0; sanity + GSM8K + bench all pass. If using a pre-0.1.0 build see §5 Troubleshooting.
+> **Validated recipe** — GLM-4.5-Air (106B) validated on TPU v6e-32 with sglang-jax 0.1.0; sanity + GSM8K + bench all pass. Pin to sglang-jax 0.1.0+ — earlier builds have a stale `q_proj` weight-transpose mapping that fails at first prefill.
 
 ## 1. Model Introduction
 
@@ -284,18 +284,6 @@ Mean TTFT (ms):           576.77
 Mean TPOT (ms):           13.35
 ==================================================
 ```
-
-## 5. Troubleshooting
-
-| Symptom | Likely cause | Fix |
-|---|---|---|
-| Startup assert `tile_n` divisibility failure (GLM-4.5-Air) | `--moe-backend fused` with `moe_intermediate_size=1408 % 512 ≠ 0` | Use `--moe-backend epmoe` for GLM-4.5-Air (mandatory). |
-| `dot_general` contracting shape mismatch in `q_proj` during first prefill | Pre-0.1.0 build with stale weight transpose mappings | Upgrade to sglang-jax 0.1.0; the transpose fix is merged. |
-| Tool calls return empty arguments | `--tool-call-parser` not set | Add `--tool-call-parser glm45` to the launch command. |
-| No `reasoning_content` in response | `--reasoning-parser` not set | Add `--reasoning-parser glm45` to launch. |
-| OOM at startup (GLM-4.5-Air) | `--mem-fraction-static 0.9` too high for this slice | Lower to 0.88. Verify `--tp-size 32` matches v6e-32 chip count (4 × 8 = 32). |
-| Multi-node hang at init | `--dist-init-addr` unreachable from non-rank-0 nodes | Verify the rank-0 internal IP and that the chosen port is open. |
-| First request takes ~4 min per node | JIT cache empty | Persist `JAX_COMPILATION_CACHE_DIR`; mount a shared PVC across nodes for amortized compilation. |
 
 ## Additional Resources
 

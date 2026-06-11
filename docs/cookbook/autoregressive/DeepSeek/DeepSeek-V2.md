@@ -159,14 +159,6 @@ Mean TPOT (ms):                          7.41
 ==================================================
 ```
 
-## 5. Troubleshooting
-
-| Symptom | Likely cause | Fix |
-|---|---|---|
-| MoE throughput plateau | Wrong `--moe-backend` for EP size | V2-Lite uses `epmoe` at EP=4. |
-| OOM at startup (V2-Lite) | `--mem-fraction-static` too high | Lower from default 0.88 to 0.85. Verify `--tp-size 4` matches v6e-4 chip count. |
-| First request takes ~4 min | JIT cache empty | Persist `JAX_COMPILATION_CACHE_DIR` across restarts. |
-
 ## Additional Resources
 
 - [DeepSeek-V2-Lite model card](https://huggingface.co/deepseek-ai/DeepSeek-V2-Lite)

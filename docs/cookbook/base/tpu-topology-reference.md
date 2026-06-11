@@ -139,7 +139,7 @@ Before you hit "go", verify against `python/sgl_jax/srt/configs/model_config.py`
 | 5 | Hybrid recurrent models (Ling-2.6, Kimi-Linear) require `--disable-radix-cache` | Server asserts on startup | Recipe §2.4 |
 | 6 | MLA models (DeepSeek family) require `--page-size >= 2` | MLA backend asserts on startup | Recipe §2.4 |
 
-The recipe's §5 Troubleshooting table will have a symptom row for each — start there if launch fails.
+The recipe's §2.4 Configuration Tips covers these constraints; see the [central Troubleshooting page](../troubleshooting.md) if launch still fails.
 
 ### Step 4 — If launch hits OOM
 

@@ -381,14 +381,6 @@ Max ITL (ms):                            38.99
 ==================================================
 ```
 
-## 5. Troubleshooting
-
-| Symptom | Likely cause | Fix |
-|---|---|---|
-| Tool calls return empty arguments | `--tool-call-parser` not set | Add `--tool-call-parser mimo` to the launch command. |
-| No `reasoning_content` in response | `--reasoning-parser` not set, or `enable_thinking` not passed | Add `--reasoning-parser mimo` to launch; pass `extra_body={"chat_template_kwargs":{"enable_thinking":true}}` per request. |
-| First request takes ~4 min | JIT cache empty | Persist `JAX_COMPILATION_CACHE_DIR` across restarts. |
-
 ## Additional Resources
 
 - [MiMo-7B-RL model card](https://huggingface.co/XiaomiMiMo/MiMo-7B-RL)

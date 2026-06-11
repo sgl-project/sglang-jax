@@ -279,21 +279,6 @@ Max ITL (ms):                            2518.61
 
 > R1's throughput on this workload reflects MoE + MLA + FP8 block-quant on the validated `dp=8` mesh; future PRs can add reasoning-typical workloads (OSL=4096+) for trace-heavy scenarios.
 
-## 5. Troubleshooting
-
-| Symptom | Likely cause | Fix |
-|---|---|---|
-| Response contains raw `<think>` text instead of `reasoning_content` | `--reasoning-parser` not set | Add `--reasoning-parser deepseek-r1` to the launch command. |
-| Truncated thinking trace at low `max_tokens` | R1 thinking budgets are 2k-3k tokens before the final answer; client requests with `max_tokens=512` get cut off mid-trace | Set client `max_tokens >= 4096`. For accuracy benchmarks (AIME / MATH / GPQA), use `max_tokens >= 8192`. |
-| `ValueError: dimension 0 must be divisible by tensor=64` during `_shard_weight` on `model.layers.0.mlp.gate_proj.weight_scale_inv (144, 56)` | Tensor axis too large for the dense MLP block-quant scale grid. 144 = `intermediate_size(18432) / block_size(128)`. | Add `--dp-size 8` (or another `dp` that makes `tp_size/dp_size` a divisor of 144). |
-| Server up but **all outputs are a single repeating token** (e.g., "爲了爲了爲了…") | Per-rank `out_dim` of the shared expert `gate_proj`/`up_proj` equals `block_size_out=128`, hitting the block-wise quant kernel's accuracy-collapse regime. At `dp=4` on v6e-64, `2048/16 = 128`. | Use `--dp-size 8` (gives `2048/8 = 256 > 128`). The `epmoe` path will assert explicitly; the `fused` path is silent — see §2.4 MoE Backend. |
-| `RuntimeError: Block-wise kernel does not support out_dim=128 with block_size_out=128 (known to cause accuracy collapse)` | Same as above, surfaced by the `epmoe` assertion. | Same fix: `--dp-size 8`. Do **not** set `allow_narrow_n_blockwise=True` — it suppresses the guard, not the bug. |
-| `RESOURCE_EXHAUSTED: Ran out of memory in memory space hbm. Used 31.68G of 31.25G hbm. Exceeded hbm capacity by ~440M.` during EXTEND precompile | At `dp=8`, the per-rank trace peak with `--chunked-prefill-size 2048` overshoots HBM. | Drop `--chunked-prefill-size` to 1024. Lowering `--max-running-requests` alone does not help — the peak is in prefill, not decode. |
-| `ValueError: Expected local_num_tokens=1 to be aligned to t_packing=2` | Using `--moe-backend fused` at low effective per-rank token count during decode precompile. | Switch to `--moe-backend epmoe` (current recommended default), or raise `--max-running-requests` until `(max / dp_size) / (ep_size / dp_size) >= t_packing`. |
-| Multi-node hang at init | `--dist-init-addr` unreachable from non-rank-0 nodes | Verify the rank-0 internal IP and that the chosen port (default 5000 in the cookbook manifest) is open between nodes. |
-| First request takes ~4 min per node | JIT cache empty | Persist `JAX_COMPILATION_CACHE_DIR` on a shared PVC across all 16 nodes and across pod restarts (mesh-shape-keyed; safe across `backoffLimit` retries). |
-| GKE control-plane blip evicts all 16 pods mid-run (`kube-root-ca.crt not registered` / `gcsfuse.csi.storage.gke.io not found`) | Transient kube-system flap tainted nodes with NoExecute; default `backoffLimit: 0` collapsed the Job. | Set `backoffLimit: 16` (or higher) in the GKE Indexed Job manifest. Pods get replacements and the server comes back; JIT cache hit keeps recovery time short. |
-
 ## Additional Resources
 
 - [DeepSeek-R1 model card](https://huggingface.co/deepseek-ai/DeepSeek-R1)

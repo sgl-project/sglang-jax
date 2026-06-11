@@ -203,14 +203,6 @@ Max ITL (ms):                            154.39
 ==================================================
 ```
 
-## 5. Troubleshooting
-
-| Symptom | Likely cause | Fix |
-|---|---|---|
-| OOM at startup | Weights + KV cache exceed budget | Lower `--max-prefill-tokens` to 4096, or `--mem-fraction-static` to 0.75. Verify `--tp-size 4` matches v6e-4 chip count. |
-| First request takes ~4 min | JIT cache empty | Persist `JAX_COMPILATION_CACHE_DIR` across restarts (host volume mount in Docker). |
-| Low throughput at high concurrency | `--page-size 1` overhead dominates | Raise `--page-size` to 16 or 32 for long-sequence high-concurrency workloads. |
-
 ## Additional Resources
 
 - [Qwen Model Cards](https://huggingface.co/Qwen)

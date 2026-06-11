@@ -72,6 +72,7 @@ For temporary v6e experiments, advanced users can adapt [SkyPilot launcher](../.
 **Tensor Parallelism:**
 - `--tp-size 16` on v6e-16 fully shards Llama 3.3 70B's GQA `num_kv_heads=8` (tensor axis must be a divisor of 8 — 16 maps cleanly: 2 chips per KV head). All ranks must be in the same TPU slice; verify `--nnodes` matches the slice node count.
 - Multi-host coordination: every rank runs the same launch command; only `${NODE_RANK}` and `${MASTER_ADDR}` vary. Dispatch all ranks within seconds of each other (a >5-min stagger trips the JAX distributed RPC deadline).
+- Stale libtpu lock: if a prior multi-host launch on the same pod failed, run `rm -f /tmp/libtpu_lockfile` on every rank before relaunching — a leftover lock surfaces as `Internal error when accessing libtpu multi-process lockfile` on rank 0. Worth scripting into the launch wrapper.
 
 **Compilation Cache Hygiene:**
 - `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache` is mandatory — without it, first request blocks ~4 min per node.
@@ -187,15 +188,6 @@ Median TPOT (ms):                        16.47
 Mean ITL (ms):                           16.30
 ==================================================
 ```
-
-## 5. Troubleshooting
-
-| Symptom | Likely cause | Fix |
-|---|---|---|
-| OOM at startup | Weights + KV exceed budget at chosen `--mem-fraction-static` | Lower to 0.85 (or 0.8). Verify `--tp-size` matches the chip count (v6e-16 → 16, v6e-32 → 32). |
-| `Internal error when accessing libtpu multi-process lockfile` on rank 0 | Stale `/tmp/libtpu_lockfile` from a prior failed launch on the same pod | `rm -f /tmp/libtpu_lockfile` on every rank before relaunching. Worth scripting into the launch wrapper since multi-host failures often leave stale locks. |
-| Multi-node hang at init | `--dist-init-addr` unreachable from non-rank-0 nodes | Verify the rank-0 internal IP and that the chosen port is open. |
-| First request takes ~4 min per node | JIT cache empty | Persist `JAX_COMPILATION_CACHE_DIR`; mount a shared PVC across all 8 nodes for amortized compilation. |
 
 ## Additional Resources
 

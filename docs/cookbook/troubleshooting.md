@@ -4,7 +4,7 @@ title: "Troubleshooting"
 
 # Troubleshooting
 
-Common failure modes across all SGL-JAX cookbook recipes, with the fix and what to grep in logs to confirm. Model-specific gotchas live in each recipe's §7; this page covers everything else.
+Common failure modes across all SGL-JAX cookbook recipes, with the fix and what to grep in logs to confirm. Model-specific constraints live in each recipe's §2 Deployment / Configuration Tips; this page covers everything else.
 
 ## Startup
 

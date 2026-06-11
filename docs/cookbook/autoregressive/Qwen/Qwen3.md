@@ -446,15 +446,6 @@ Mean E2E Latency (ms):                   8948.78
 
 Lower than the 1977 tok/s c=64 table cell because c=16 leaves the batch under-filled — included only to confirm the recipe still launches and decodes cleanly on the current build. The Sept-2025 sweep above remains the canonical SGL-JAX-vs-vLLM comparison.
 
-## 5. Troubleshooting
-
-| Symptom | Likely cause | Fix |
-|---|---|---|
-| OOM at startup with Qwen3-32B | `--mem-fraction-static 0.8` still too high for 32B + large `--max-running-requests` | Lower `--max-running-requests` to 128, or `--mem-fraction-static` to 0.75. Verify `--tp-size 4` matches v6e-4 chip count. |
-| First request takes ~4 min | JIT cache empty | Persist `JAX_COMPILATION_CACHE_DIR` across restarts (host volume mount in Docker). |
-| Throughput plateaus below benchmark numbers | RadixAttention prefix caching helping (or not) | If reproducing the §4.2 vLLM comparison, ensure `--disable-radix-cache` is set. For production, leave it off — it's a free win on repeated prefixes. |
-| Tool calls return empty arguments | `--tool-call-parser` not set | Add `--tool-call-parser qwen25` to the launch command. |
-
 ## Additional Resources
 
 - [Qwen Model Cards](https://huggingface.co/Qwen)

@@ -17,7 +17,7 @@ title: "Wan 2.1 T2V"
 
 **Recommended Generation Parameters** (request body, not launch flags):
 
-- `size` - `720*1280` (default), `480*832` (lower-cost), or another precompiled bucket. **Format is `WIDTH*HEIGHT` (asterisk-separated), the same syntax as `--precompile-width-heights`.** Sending `WIDTHxHEIGHT` (lowercase `x`) raises `ValueError: invalid literal for int() with base 10: ...` and crashes the GlobalScheduler — see [§5 Troubleshooting](#5-troubleshooting). Must match a precompiled bucket; see [§2.4 Configuration Tips](#24-configuration-tips).
+- `size` - `720*1280` (default), `480*832` (lower-cost), or another precompiled bucket. **Format is `WIDTH*HEIGHT` (asterisk-separated), the same syntax as `--precompile-width-heights`.** Sending `WIDTHxHEIGHT` (lowercase `x`) raises `ValueError: invalid literal for int() with base 10: ...` and crashes the GlobalScheduler. Must match a precompiled bucket; see [§2.4 Configuration Tips](#24-configuration-tips).
 - `num_frames` - defaults to the model-card recommended count, commonly 41 for Wan 2.1.
 - `num_inference_steps` - defaults to the model-card recommended count.
 - `seconds` / `fps` - alternative way to specify frame count; the server resolves to `num_frames`.
@@ -212,19 +212,6 @@ Video diffusion latency is dominated by `num_inference_steps x DiT step time x n
 | sglang-jax 0.1.0 | Wan2.1-T2V-14B-Diffusers | TPU v6e-4 (TP=2) | `480*832` | 41 | default (50) | 1 | ~4 min 19 s |
 
 This is a single-shot smoke datapoint, not a throughput sweep. Throughput sweeps require the custom driver above.
-
-## 5. Troubleshooting
-
-| Symptom | Likely cause | Fix |
-|---|---|---|
-| `/api/v1/videos/generation` returns 404 | `--multimodal` not set at launch | Add `--multimodal` to the launch command. |
-| `ValueError: invalid literal for int() with base 10: '480x832'` and `GlobalScheduler hit an exception` (server crashes) | Request body used `WIDTHxHEIGHT` (lowercase `x`); server parses `size` as `WIDTH*HEIGHT` (asterisk-separated) | Send `"size": "480*832"` (asterisk-separated). Also restart the server — the GlobalScheduler exits on this exception. |
-| Response body is `{"success": true, "meta_info": {}}` with no `path`/`url` | Expected behavior — the videos / images endpoints persist the file to the server's `cwd` and only acknowledge success in the response | Locate the MP4 by the `Saved output to <uuid>.mp4` line in the server log, or run the server with a known `cwd` and mount that directory. |
-| First request blocks on every new resolution | Resolution not in `--precompile-width-heights` | Add the size you serve (`WIDTH*HEIGHT`) to `--precompile-width-heights` and relaunch. |
-| First request blocks on every new frame count | Frame count not in `--precompile-frame-paddings` | Add the frame count to `--precompile-frame-paddings` and relaunch. |
-| OOM during VAE decode at high resolution | Full VAE decode too large for HBM despite tiling | Lower the request `size` or split the request; VAE tiling is already on by default. |
-| Video response `path` not accessible to client | Server-written file lives on TPU host only | Mount a shared output volume and serve via a separate file server, or stream the file back from the TPU host. |
-| Slow throughput at moderate concurrency | DiT is the bottleneck | Lower request `num_inference_steps` to trade quality for throughput. |
 
 ## Additional Resources
 

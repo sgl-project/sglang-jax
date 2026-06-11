@@ -4,7 +4,7 @@ title: "Grok-2"
 
 # Grok-2 on SGL-JAX
 
-> **Validated recipe** — TPU v6e-64 path validated on sglang-jax 0.1.0: server starts, sanity output correct, `bench_serving` numbers in §4.1. **Accuracy intentionally omitted** — Grok-2 is a base model (no chat template; see §1) and the cookbook follows design §6.F: base model recipes skip §4.1 Accuracy (chat-format datasets via `/v1/chat/completions` mis-extract on base models — see §5 troubleshooting for the underlying chat-template + evalscope-extractor interaction). **Cookbook used `--moe-backend epmoe`** because the fused MoE backend fails to init on this small-EP large-mesh layout (8 experts on 64 chips) (see §5). **Grok-2 architecture**: `config.json` declares `num_local_experts=8 num_experts_per_tok=2` under `Grok1ForCausalLM` — i.e. **MoE with 8 experts, 2 active per token** (not dense). Launch flags below assume MoE (`--ep-size 8 --moe-backend epmoe`).
+> **Validated recipe** — TPU v6e-64 path validated on sglang-jax 0.1.0: server starts, sanity output correct, `bench_serving` numbers in §4.1. **Accuracy intentionally omitted** — Grok-2 is a base model (no chat template; see §1) and the cookbook follows design §6.F: base model recipes skip §4.1 Accuracy (chat-format datasets via `/v1/chat/completions` mis-extract on base models — see §3.1 for the underlying chat-template + evalscope-extractor interaction). **Cookbook used `--moe-backend epmoe`** because the fused MoE backend fails to init on this small-EP large-mesh layout (8 experts on 64 chips) (see §2.4). **Grok-2 architecture**: `config.json` declares `num_local_experts=8 num_experts_per_tok=2` under `Grok1ForCausalLM` — i.e. **MoE with 8 experts, 2 active per token** (not dense). Launch flags below assume MoE (`--ep-size 8 --moe-backend epmoe`).
 
 ## 1. Model Introduction
 
@@ -137,7 +137,7 @@ resp = client.completions.create(
 print(resp.choices[0].text)
 ```
 
-> **Why not `/v1/chat/completions`?** Grok-2 has no chat template — sending `messages` either fails (no template registered) or wraps the prompt in a community-grafted template the model wasn't trained on. The community-template path looks superficially OK on single-turn sanity prompts but silently degrades accuracy on chat-format eval datasets: the model doesn't emit EOS at the end of a short answer and continues in-context with self-generated follow-ups (see §5 troubleshooting; per design §6.F base models skip §4 Accuracy entirely).
+> **Why not `/v1/chat/completions`?** Grok-2 has no chat template — sending `messages` either fails (no template registered) or wraps the prompt in a community-grafted template the model wasn't trained on. The community-template path looks superficially OK on single-turn sanity prompts but silently degrades accuracy on chat-format eval datasets: the model doesn't emit EOS at the end of a short answer and continues in-context with self-generated follow-ups (per design §6.F base models skip §4 Accuracy entirely).
 
 > Grok-2 has no hybrid reasoning or native tool-calling format. For those workloads, see the **Parser key reference** in [Parser key reference](../index.md#parser-key-reference) for the list of cookbook recipes with reasoning / tool-call parsers registered.
 
@@ -145,7 +145,7 @@ print(resp.choices[0].text)
 
 > Benchmark data below is a snapshot pinned to the `Tested build` listed in each Test Environment; not refreshed on every release.
 >
-> Accuracy section is omitted by design — see banner + §5 for why base models skip it (per design §6.F).
+> Accuracy section is omitted by design — see the banner + §1 for why base models skip it (per design §6.F).
 
 ### 4.1 Speed — single workload (low-concurrency latency baseline)
 
@@ -216,22 +216,7 @@ Max ITL (ms):                            1270.39
 ==================================================
 ```
 
-> Grok-2 throughput on this v6e-64 mesh is bottlenecked by small-EP MoE underutilization: with only 8 experts on 64 chips, the `--moe-backend epmoe` fallback (forced because `fused` crashes on this mesh, see §5) leaves most chips idle per token. This is a known limitation of the current fused MoE backend assumes large-EP; Grok-2's 8-expert layout sits below that assumption.
-
-## 5. Troubleshooting
-
-| Symptom | Likely cause | Fix |
-|---|---|---|
-| `--moe-backend fused` crashes at init with a sharding-spec `ValueError` on the (data, tensor) mesh | fused MoE backend assumes the expert axis aligns with the combined (data × tensor) mesh; this small-EP / large-mesh layout (8 experts on 64 chips) doesn't satisfy that | Use `--moe-backend epmoe` (current cookbook default) — slower than fused for large-EP models but is the only working choice on this slice. |
-| `/v1/chat/completions` returns empty / nonsense, or evalscope chat-format datasets (GSM8K few-shot / MT-Bench) score 10-30% despite sanity prompts working | Grok-2 is a base model — `tokenizer_config.json` has no `chat_template`. Sending `messages` either fails outright or wraps the prompt in a community-grafted template the model wasn't trained on; without that training the model fails to emit EOS at the "right" place and continues in-context with self-generated Q→A chains. evalscope's "last number in output" extractor then grabs a number from the model's self-generated follow-up question instead of the actual answer, marking correct cases as failed. | Use `/v1/completions` with raw prompts (see [§3.1](#31-basic-text-completion-base-model)) and **completion-style datasets** (MMLU / HellaSwag / BBH / ARC). For GSM8K specifically, use `python -m sglang.test.few_shot_gsm8k --num-questions 200` which constructs a raw 5-shot prompt and stops on `\nQuestion:`. **Never** run `evalscope ... --api-url http://.../v1/chat/completions` against a base model — full rule in [`cookbook-recipe-design.md` §6.F](../../cookbook-recipe-design.md). |
-| Server outputs garbage / silent accuracy collapse | `--ep-size` missing or wrong; Grok-2 is MoE (8 experts, 2 active), not dense. Without `--ep-size 8 --moe-backend epmoe` (or `fused` once the upstream fused crash is fixed) the loader will route experts incorrectly. | Always set `--ep-size 8 --moe-backend epmoe`. The cookbook §2.3 template is correct; reject any "dense Grok-2" recipe variant. |
-| Weight loader fails to align pre-sharded TP files | `--tp-size` not a multiple of 8. The checkpoint is pre-sharded `pytorch_model-NNNNN-TP-{000..007}.safetensors` so the loader expects to slice along 8 TP partitions. | Use `--tp-size` ∈ {8, 16, 24, 32, 40, ..., 64}. On v6e-64 use 64; on v6e-32 use 32; on v6e-16 (if attempted) needs dp to avoid breaking the constraint. |
-| Tokenizer load fails at startup | `--tokenizer-path` missing or unreachable | Add `--tokenizer-path alvarobartt/grok-2-tokenizer`; if HF rate-limited, set `HF_TOKEN` env. |
-| Multi-node hang at `jax.distributed.initialize` | `--dist-init-addr` unreachable from non-rank-0 nodes | Verify the rank-0 internal IP / pod DNS (`<JOB>-0.<JOB>-headless-svc:5000` on GKE) and that the chosen port is open between nodes. |
-| OOM at startup | `--mem-fraction-static` too high relative to available HBM | Drop to `0.85`. Verify `--tp-size` matches the chip count expected by the slice. |
-| MoE throughput plateau / very slow decode (~190 ms TPOT) | Inherent to small-EP MoE on large mesh. With 8 experts on 64 chips, only 16 chips fully utilized per token; epmoe path doesn't have a fused kernel. | This is a known limitation pending upstream fix for small-EP shapes. Until then, expect ~140 tok/s total throughput on v6e-64. |
-| Slow cold start (~5-10 min per node) on every launch | JIT cache empty (`JAX_COMPILATION_CACHE_DIR` not persisted across launches) | Mount a shared PVC at the cache directory across all nodes. Mesh shape is part of the cache key; changing `--tp-size`/`--ep-size` invalidates it. |
-| GKE control-plane blip evicts pods mid-run | Default `backoffLimit: 0` collapses the Job on transient node taint | Set `backoffLimit: 16` in the GKE Indexed Job manifest. Replacements pick up the warm JIT cache. |
+> Grok-2 throughput on this v6e-64 mesh is bottlenecked by small-EP MoE underutilization: with only 8 experts on 64 chips, the `--moe-backend epmoe` fallback (forced because `fused` crashes on this mesh, see §2.4) leaves most chips idle per token. This is a known limitation of the current fused MoE backend assumes large-EP; Grok-2's 8-expert layout sits below that assumption.
 
 ## Additional Resources
 
