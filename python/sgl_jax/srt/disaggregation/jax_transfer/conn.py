@@ -426,7 +426,6 @@ class JaxTransferKVReceiver(KVReceiver, StateHolder):
         self._pull_timer: object | None = None
         self._transfer_started_at: float | None = None
         self._state_lock = threading.Lock()
-        self._pull_thread: threading.Thread | None = None
 
     @property
     def req_id(self) -> str:
@@ -487,6 +486,7 @@ class JaxTransferKVReceiver(KVReceiver, StateHolder):
         if not isinstance(p_metadata, PMetadata):
             raise TypeError(f"p_metadata must be PMetadata, got " f"{type(p_metadata).__name__}")
         self._metadata = p_metadata
+        self._mgr.wrapper.connect(p_metadata.remote_addr)
         self._transition_to(KVPoll.WAITING_FOR_INPUT)
 
     def poll(self) -> KVPoll:
@@ -507,12 +507,33 @@ class JaxTransferKVReceiver(KVReceiver, StateHolder):
                 self._pull_timer = time_phase("pull", "decode")
                 self._pull_timer.__enter__()
                 self._transfer_started_at = _time.monotonic()
-                self._pull_thread = threading.Thread(
-                    target=self._run_pull,
-                    daemon=True,
-                    name=f"pd-pull-{self._req_id}",
-                )
-                self._pull_thread.start()
+                try:
+                    results: dict[str, jax.Array] = {}
+                    for name, spec in self._metadata.specs.items():
+                        sub_uuid = f"{self._metadata.uuid}:{name}"
+                        results[name] = self._mgr.wrapper.pull(
+                            sub_uuid,
+                            spec,
+                            remote_addr=self._metadata.remote_addr,
+                        )
+                    self._results = results
+                    pull_failed = False
+                except Exception:
+                    self._transition_to(KVPoll.FAILED)
+                    self._close_pull_timer()
+                    self._transfer_started_at = None
+                    self._mgr.record_terminal(
+                        self._req_id,
+                        role="decode",
+                        transfer_id=self._metadata.uuid,
+                        state=KVPoll.FAILED,
+                        reason="pull_init",
+                    )
+                    pull_failed = True
+            if pull_failed:
+                with suppress(Exception):
+                    PD_TRANSFER_FAILURES_TOTAL.labels(reason="pull_init", role="decode").inc()
+                self._mgr._prune_receiver(self._req_id)
             return self.state
 
         if state == KVPoll.TRANSFERRING:
@@ -561,40 +582,6 @@ class JaxTransferKVReceiver(KVReceiver, StateHolder):
                     return self.state
             self._mgr._prune_receiver(self._req_id)
         return self.state
-
-    def _run_pull(self) -> None:
-        assert self._metadata is not None
-        try:
-            results: dict[str, jax.Array] = {}
-            for name, spec in self._metadata.specs.items():
-                sub_uuid = f"{self._metadata.uuid}:{name}"
-                results[name] = self._mgr.wrapper.pull(
-                    sub_uuid,
-                    spec,
-                    remote_addr=self._metadata.remote_addr,
-                )
-        except Exception:
-            with self._state_lock:
-                if self.state != KVPoll.TRANSFERRING:
-                    return
-                self._transition_to(KVPoll.FAILED)
-                self._close_pull_timer()
-                self._transfer_started_at = None
-                self._mgr.record_terminal(
-                    self._req_id,
-                    role="decode",
-                    transfer_id=self._metadata.uuid,
-                    state=KVPoll.FAILED,
-                    reason="pull_init",
-                )
-            with suppress(Exception):
-                PD_TRANSFER_FAILURES_TOTAL.labels(reason="pull_init", role="decode").inc()
-            self._mgr._prune_receiver(self._req_id)
-            return
-        with self._state_lock:
-            if self.state != KVPoll.TRANSFERRING:
-                return
-            self._results = results
 
     def _close_pull_timer(self) -> None:
         timer = self._pull_timer
