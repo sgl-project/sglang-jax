@@ -6,13 +6,13 @@ import unittest
 import numpy as np
 
 from sgl_jax.srt.entrypoints.engine import Engine
-from sgl_jax.test.test_utils import QWEN3_4B, CustomTestCase
+from sgl_jax.test.test_utils import QWEN3_4B, QWEN3_4B_LORA_MODEL, CustomTestCase
 
 LORA_SETS = [
     {
         "base": QWEN3_4B,
         "lora": [
-            "y9760210/Qwen3-4B-lora_model",
+            QWEN3_4B_LORA_MODEL,
         ],
     },
 ]

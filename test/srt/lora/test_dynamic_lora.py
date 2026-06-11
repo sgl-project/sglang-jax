@@ -30,6 +30,8 @@ from sgl_jax.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     QWEN3_4B,
+    QWEN3_4B_LORA_MODEL,
+    QWEN3_4B_LORA_V2,
     CustomTestCase,
     kill_process_tree,
     popen_launch_server,
@@ -39,8 +41,8 @@ LORA_SETS = [
     {
         "base": QWEN3_4B,
         "loras": [
-            "nissenj/Qwen3-4B-lora-v2",
-            "y9760210/Qwen3-4B-lora_model",
+            QWEN3_4B_LORA_V2,
+            QWEN3_4B_LORA_MODEL,
         ],
     },
 ]

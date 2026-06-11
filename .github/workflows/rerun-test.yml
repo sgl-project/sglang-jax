@@ -26,6 +26,11 @@ permissions:
   contents: read
   pull-requests: write
 
+# Force HuggingFace Hub offline so uncached test models fail fast instead of
+# triggering an on-the-fly download (see pr-test.yml for rationale).
+env:
+  HF_HUB_OFFLINE: "1"
+
 jobs:
   rerun:
     runs-on: ${{ inputs.runner }}

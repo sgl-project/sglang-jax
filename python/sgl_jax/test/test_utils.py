@@ -174,15 +174,23 @@ _MODEL_REPOS: dict[str, str] = {
     "MIMO_AUDIO_7B_INSTRUCT": "XiaomiMiMo/MiMo-Audio-7B-Instruct",
     "UMT5_BASE": "google/umt5-base",
     "QWEN3_OMNI_30B_A3B_INSTRUCT": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+    # LoRA adapters (no tokenizer/standard snapshot; see _SKIP_VALIDATION).
+    "QWEN3_4B_LORA_V2": "nissenj/Qwen3-4B-lora-v2",
+    "QWEN3_4B_LORA_MODEL": "y9760210/Qwen3-4B-lora_model",
 }
 _RESOLVED_MODEL_PATHS: dict[str, str] = {}
 
 # Constants whose cached snapshot is trusted as-is (no _validate_local_snapshot).
-# EAGLE3 draft models ship without a tokenizer, so they can never pass the normal
-# validation; cache them and skip the check instead. The cached directory must
-# contain the *.safetensors weights (the speculative-decoding test pins the draft
-# model to the revision that provides them).
-_SKIP_VALIDATION: set[str] = {"QWEN3_32B_EAGLE3"}
+# EAGLE3 draft models and LoRA adapters ship without a tokenizer, so they can
+# never pass the normal validation; cache them and skip the check instead. The
+# cached directory must contain the weights the loader expects (EAGLE3 draft:
+# *.safetensors at the pinned revision; LoRA: adapter_config.json + adapter
+# weights).
+_SKIP_VALIDATION: set[str] = {
+    "QWEN3_32B_EAGLE3",
+    "QWEN3_4B_LORA_V2",
+    "QWEN3_4B_LORA_MODEL",
+}
 
 # Hardcoded local-only path (no HF fallback); kept as an eager constant.
 QWEN3_5_35B_A3B = "/models/Qwen3.5-35B-A3B/"
