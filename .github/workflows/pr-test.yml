@@ -15,6 +15,13 @@ concurrency:
   group: pr-test-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+# Force HuggingFace Hub into offline mode for the whole workflow: test models
+# must come from the pre-populated cache (SGLANG_JAX_MODEL_CACHE); an uncached
+# model fails fast instead of triggering an on-the-fly download that can exhaust
+# the runner's local disk.
+env:
+  HF_HUB_OFFLINE: "1"
+
 jobs:
   # =============================================== coordinator ====================================================
   coordinator:
