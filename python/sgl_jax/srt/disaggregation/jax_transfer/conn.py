@@ -14,6 +14,8 @@ ack after a successful pull.
 
 from __future__ import annotations
 
+import logging
+import queue as _queue
 import threading
 from collections.abc import Callable
 from contextlib import suppress
@@ -47,6 +49,9 @@ __all__ = [
     "TerminalTransferRecord",
     "TransferStatus",
 ]
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -111,6 +116,37 @@ class JaxTransferKVManager(CommonKVManager):
         self._wrapper = wrapper
         self._zmq_notifier = zmq_notifier
         self._host_pool = host_pool
+        # A single long-lived worker drains the pull queue and runs the
+        # blocking ``wrapper.pull`` off the decode event-loop thread. On TPU
+        # ``link.pull`` is synchronous, so dispatching it inline in ``poll()``
+        # would freeze the single-threaded decode event loop. The worker is
+        # created once here (not per-request) and lives for the process.
+        self._pull_queue: _queue.Queue[JaxTransferKVReceiver | None] = _queue.Queue()
+        self._pull_worker = threading.Thread(
+            target=self._pull_worker_loop,
+            name="jax-kv-pull-worker",
+            daemon=True,
+        )
+        self._pull_worker.start()
+
+    def enqueue_pull(self, receiver: JaxTransferKVReceiver) -> None:
+        """Hand a TRANSFERRING receiver to the background pull worker.
+
+        Non-blocking: the queue is unbounded and ``put`` returns at once,
+        so the decode event loop never stalls behind a pull.
+        """
+
+        self._pull_queue.put(receiver)
+
+    def _pull_worker_loop(self) -> None:
+        while True:
+            receiver = self._pull_queue.get()
+            if receiver is None:
+                return
+            try:
+                receiver._run_pull()
+            except Exception:  # noqa: BLE001
+                logger.exception("jax-kv-pull-worker: receiver pull crashed")
 
     # ------------------------------------------------------------------
     # Component access
@@ -507,33 +543,10 @@ class JaxTransferKVReceiver(KVReceiver, StateHolder):
                 self._pull_timer = time_phase("pull", "decode")
                 self._pull_timer.__enter__()
                 self._transfer_started_at = _time.monotonic()
-                try:
-                    results: dict[str, jax.Array] = {}
-                    for name, spec in self._metadata.specs.items():
-                        sub_uuid = f"{self._metadata.uuid}:{name}"
-                        results[name] = self._mgr.wrapper.pull(
-                            sub_uuid,
-                            spec,
-                            remote_addr=self._metadata.remote_addr,
-                        )
-                    self._results = results
-                    pull_failed = False
-                except Exception:
-                    self._transition_to(KVPoll.FAILED)
-                    self._close_pull_timer()
-                    self._transfer_started_at = None
-                    self._mgr.record_terminal(
-                        self._req_id,
-                        role="decode",
-                        transfer_id=self._metadata.uuid,
-                        state=KVPoll.FAILED,
-                        reason="pull_init",
-                    )
-                    pull_failed = True
-            if pull_failed:
-                with suppress(Exception):
-                    PD_TRANSFER_FAILURES_TOTAL.labels(reason="pull_init", role="decode").inc()
-                self._mgr._prune_receiver(self._req_id)
+            # Hand the blocking pull to the background worker. ``poll()`` stays
+            # non-blocking; a later poll drives ``is_ready()`` -> ack -> SUCCESS
+            # once the worker has stored the results.
+            self._mgr.enqueue_pull(self)
             return self.state
 
         if state == KVPoll.TRANSFERRING:
@@ -582,6 +595,52 @@ class JaxTransferKVReceiver(KVReceiver, StateHolder):
                     return self.state
             self._mgr._prune_receiver(self._req_id)
         return self.state
+
+    def _run_pull(self) -> None:
+        """Run the blocking pull on the background worker thread.
+
+        On TPU ``wrapper.pull`` blocks until the transfer completes, so it
+        must never run on the decode event-loop thread. Results are stored
+        under ``_state_lock`` and only if the receiver is still TRANSFERRING;
+        a reaper ``fail()`` that already moved the state to FAILED wins, and
+        the late results are dropped.
+        """
+
+        assert self._metadata is not None
+        try:
+            results: dict[str, jax.Array] = {}
+            for name, spec in self._metadata.specs.items():
+                sub_uuid = f"{self._metadata.uuid}:{name}"
+                results[name] = self._mgr.wrapper.pull(
+                    sub_uuid,
+                    spec,
+                    remote_addr=self._metadata.remote_addr,
+                )
+        except Exception:
+            with self._state_lock:
+                if self.state != KVPoll.TRANSFERRING:
+                    return
+                self._transition_to(KVPoll.FAILED)
+                self._close_pull_timer()
+                self._transfer_started_at = None
+                self._mgr.record_terminal(
+                    self._req_id,
+                    role="decode",
+                    transfer_id=self._metadata.uuid,
+                    state=KVPoll.FAILED,
+                    reason="pull_init",
+                )
+            with suppress(Exception):
+                PD_TRANSFER_FAILURES_TOTAL.labels(reason="pull_init", role="decode").inc()
+            self._mgr._prune_receiver(self._req_id)
+            return
+
+        with self._state_lock:
+            if self.state != KVPoll.TRANSFERRING:
+                # Reaper timed the transfer out while we were pulling; the
+                # terminal state wins and the results are discarded.
+                return
+            self._results = results
 
     def _close_pull_timer(self) -> None:
         timer = self._pull_timer

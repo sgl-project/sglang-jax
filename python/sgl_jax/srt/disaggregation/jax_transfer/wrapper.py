@@ -77,6 +77,10 @@ class JaxTransferWrapper:
         # side-channel ack path, so access is serialized with a lock.
         self._pending_lock = threading.Lock()
         self._pending: dict[str, Any] = {}
+        # ``_links`` is read/written from the decode event-loop thread
+        # (``init`` pre-connect) and the background pull worker thread, so
+        # access is serialized.
+        self._links_lock = threading.Lock()
         self._links: dict[str, Any] = {}
 
     @property
@@ -245,11 +249,12 @@ class JaxTransferWrapper:
             self._pending.pop(uuid, None)
 
     def _connect(self, remote_addr: str) -> Any:
-        if remote_addr in self._links:
-            return self._links[remote_addr]
-        link = self._server.connect(remote_addr)
-        self._links[remote_addr] = link
-        return link
+        with self._links_lock:
+            if remote_addr in self._links:
+                return self._links[remote_addr]
+            link = self._server.connect(remote_addr)
+            self._links[remote_addr] = link
+            return link
 
 
 def get_or_create_wrapper(
