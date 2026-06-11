@@ -77,10 +77,6 @@ def test_bootstrap_registry_gauge_set():
     M.PD_BOOTSTRAP_REGISTRY_SIZE.set(0)
 
 
-def test_is_prometheus_available_is_bool():
-    assert isinstance(M.is_prometheus_available(), bool)
-
-
 def test_noop_when_prom_missing(monkeypatch):
     class _BoomMetric:
         def labels(self, **_):
@@ -331,3 +327,48 @@ def test_pd_shared_secret_env_overrides_args(monkeypatch):
 def test_pd_host_ip_rejects_bind_and_loopback_addresses(bad_host_ip):
     with pytest.raises(ValueError, match="disaggregation-host-ip"):
         _make_server_args(disaggregation_host_ip=bad_host_ip)
+
+
+def test_pd_invalid_mode_raises():
+    with pytest.raises(ValueError, match="disaggregation-mode"):
+        _make_server_args(disaggregation_mode="proxy")
+
+
+def test_pd_mode_requires_bootstrap_url():
+    with pytest.raises(ValueError, match="bootstrap-url"):
+        _make_server_args(disaggregation_mode="prefill")
+    with pytest.raises(ValueError, match="bootstrap-url"):
+        _make_server_args(disaggregation_mode="decode")
+
+
+def test_pd_mode_rejects_small_page_size():
+    with pytest.raises(ValueError, match=r"page-size=1 is below the PD minimum"):
+        _make_server_args(
+            disaggregation_mode="prefill",
+            disaggregation_bootstrap_url="http://127.0.0.1:8998",
+        )
+    with pytest.raises(ValueError, match=r"page-size=64 is below the PD minimum"):
+        _make_server_args(
+            disaggregation_mode="decode",
+            disaggregation_bootstrap_url="http://127.0.0.1:8998",
+            page_size=64,
+        )
+
+
+def test_pd_null_mode_warns_on_override(caplog):
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        _make_server_args(
+            disaggregation_mode="null",
+            disaggregation_bootstrap_url="http://127.0.0.1:8998",
+        )
+    assert any("ignores PD options" in rec.getMessage() for rec in caplog.records)
+
+
+def test_pd_null_mode_no_warning_at_defaults(caplog):
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        _make_server_args()
+    assert not any("ignores PD options" in rec.getMessage() for rec in caplog.records)

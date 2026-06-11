@@ -172,11 +172,11 @@ def test_sender_fail_cancels_pending_callback(notifiers):
     sender.attach_payload({"kv": jnp.zeros(4, dtype=jnp.float32)}, use_d2h_staging=False)
     sender.send()
     assert sender.poll() == KVPoll.TRANSFERRING
-    assert p_notifier.pending_count() == 1
+    assert len(p_notifier._callbacks) == 1
 
     sender.fail()
     assert sender.poll() == KVPoll.FAILED
-    assert p_notifier.pending_count() == 0
+    assert len(p_notifier._callbacks) == 0
     assert "req-fail" not in mgr._senders
     # release should have been called.
     assert wrapper.release.call_count == 1
@@ -245,9 +245,9 @@ def test_send_ack_race_safe(notifiers):
     send_thread = threading.Thread(target=run_send)
     send_thread.start()
 
-    assert _wait_until(lambda: p_notifier.pending_count() == 1)
+    assert _wait_until(lambda: len(p_notifier._callbacks) == 1)
     d_notifier.send_done(b"req-race", "127.0.0.1", p_notifier.port)
-    assert _wait_until(lambda: p_notifier.pending_count() == 0)
+    assert _wait_until(lambda: len(p_notifier._callbacks) == 0)
 
     barrier.set()
     assert send_done.wait(timeout=3.0)

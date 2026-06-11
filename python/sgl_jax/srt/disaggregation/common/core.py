@@ -1,14 +1,4 @@
-"""Shared KV manager implementation for PD disaggregation backends.
-
-``CommonKVManager`` extends the base :class:`KVManager` ABC with
-sender / receiver registries, bounded terminal-record bookkeeping,
-an orphan reaper, and graceful shutdown. It knows nothing about KV
-caches, host staging, or JAX arrays — those concerns belong to
-concrete backend subclasses (e.g. ``JaxTransferKVManager``).
-
-Follows the same three-layer pattern as sglang:
-``BaseKVManager`` → ``CommonKVManager`` → ``<Backend>KVManager``.
-"""
+"""Shared KV manager: sender/receiver registries, orphan reaper, graceful shutdown."""
 
 from __future__ import annotations
 

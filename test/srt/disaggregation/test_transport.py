@@ -6,7 +6,6 @@ import pytest
 
 from sgl_jax.srt.disaggregation.base.kv_manager import (
     LEGAL_TRANSITIONS,
-    TERMINAL_STATES,
     KVPoll,
     StateHolder,
     is_legal_transition,
@@ -35,10 +34,6 @@ def test_legal_transitions_set_matches_rfc():
         )
         == LEGAL_TRANSITIONS
     )
-
-
-def test_terminal_states():
-    assert frozenset({KVPoll.SUCCESS, KVPoll.FAILED}) == TERMINAL_STATES
 
 
 @pytest.mark.parametrize(

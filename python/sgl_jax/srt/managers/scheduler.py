@@ -28,6 +28,9 @@ from sgl_jax.srt.constrained.base_grammar_backend import (
     INVALID_GRAMMAR_OBJ,
     create_grammar_backend,
 )
+from sgl_jax.srt.disaggregation.decode import SchedulerDisaggregationDecodeMixin
+from sgl_jax.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
+from sgl_jax.srt.disaggregation.runtime import install_disaggregation_wiring
 from sgl_jax.srt.hf_transformers_utils import get_tokenizer
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
 from sgl_jax.srt.managers.communication import CommunicationBackend
@@ -128,6 +131,8 @@ class Scheduler(
     SchedulerOutputProcessorMixin,
     SchedulerProfilerMixin,
     SchedulerMetricsMixin,
+    SchedulerDisaggregationPrefillMixin,
+    SchedulerDisaggregationDecodeMixin,
 ):
     """
     A scheduler that manages a tensor parallel TPU worker, which managaes fixed multi TPU devices.
@@ -146,58 +151,7 @@ class Scheduler(
         if stage_sub_dir is not None:
             server_args = dataclasses.replace(server_args)
             server_args.model_sub_dir = stage_sub_dir
-        # set jit cache
-        jit_cache_dir = os.getenv("JAX_COMPILATION_CACHE_DIR", None)
-        device_indexes = server_args.device_indexes
-        # Report the effective persistent-cache state after resolving overrides below.
-        cache_status = None
-        # libtpu (tpu-v6e + libtpu 0.0.30) crashes during JAX persistent
-        # compilation-cache use when the device subset does not start at
-        # device 0 (e.g. device_indexes=[2, 3]). Disable the cache for
-        # such schedulers and override any cache config a sibling
-        # scheduler may have set in the same process. See
-        # sgl-project/sglang-jax#1216.
-        if (
-            jit_cache_dir is not None
-            and device_indexes is not None
-            and min(device_indexes, default=0) > 0
-        ):
-            jax.config.update("jax_compilation_cache_dir", "")
-            jit_cache_dir = None
-            # jax.config.update alone does not take effect once the
-            # compilation_cache module's _cache_initialized flag is set
-            # by an earlier sibling scheduler in the same process; that
-            # flag is one-shot. cc.reset_cache() is the only public API
-            # that clears it, forcing the next cache lookup to re-read
-            # the (now-empty) cache_dir config and stay disabled.
-            from jax.experimental.compilation_cache import compilation_cache as cc
-
-            cc.reset_cache()
-            cache_status = (
-                f"disabled for non-zero-base device subset: device_indexes={device_indexes}"
-            )
-        if jit_cache_dir is not None:
-            jax.config.update("jax_compilation_cache_dir", jit_cache_dir)
-            # Default the compile-time write threshold to 0 (cache every compile) for
-            # local/dev. When JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS is set (CI sets
-            # it to 1 to skip tiny entries and cut small-file GCS writes), defer to JAX's
-            # own parsing so the behavior — including validation of bad values — matches
-            # upstream JAX.
-            if "JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS" not in os.environ:
-                jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
-            # Disable the size gate; the compile-time threshold still controls writes.
-            jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
-            # Include XLA sub-caches such as kernel/autotune data.
-            jax.config.update("jax_persistent_cache_enable_xla_caches", "all")
-            from jax.experimental.compilation_cache import compilation_cache as cc
-
-            cc.set_cache_dir(jit_cache_dir)
-            min_compile_time = jax.config.jax_persistent_cache_min_compile_time_secs
-            cache_status = f"enabled, dir={jit_cache_dir}, min_compile_time={min_compile_time}s"
-
-        if cache_status is None:
-            cache_status = "not configured (JAX_COMPILATION_CACHE_DIR unset)"
-        logger.info("XLA persistent compilation cache: %s", cache_status)
+        self._setup_jit_cache(server_args)
 
         # Parse args
         self.server_args = server_args
@@ -219,7 +173,23 @@ class Scheduler(
         if server_args.multimodal:
             logger.info("Multimodal mode enabled, disabling overlap schedule")
             self.enable_overlap = False
+        if server_args.disaggregation_mode != "null":
+            logger.info("PD disaggregation mode enabled, disabling overlap schedule")
+            self.enable_overlap = False
         self.spec_algorithm = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
+
+        # PD disaggregation runtime attributes. They are populated by
+        # install_disaggregation_wiring() when disaggregation_mode != "null".
+        self.disagg_kv_manager = None
+        self.disagg_bootstrap_client = None
+        self.disagg_bootstrap_server = None
+        self.disagg_heartbeat = None
+        self.disagg_bootstrap_key = None
+        self.disagg_shutdown = None
+        self.disagg_use_d2h_staging = False
+        self.disagg_prefill_queue = None
+        self.disagg_prealloc_queue = None
+        self.disagg_transfer_queue = None
 
         # LoRA configurations
         self.lora_paths = server_args.lora_paths
@@ -500,6 +470,58 @@ class Scheduler(
                 logger.info("[Scheduler] Begins to run spec_decode worker precompile.")
                 self.draft_worker.run_spec_decode_precompile()
                 logger.info("[Scheduler] Completes spec_decode worker precompile.")
+
+    def _setup_jit_cache(self, server_args: ServerArgs) -> None:
+        jit_cache_dir = os.getenv("JAX_COMPILATION_CACHE_DIR", None)
+        device_indexes = server_args.device_indexes
+        cache_status = None
+        # libtpu (tpu-v6e + libtpu 0.0.30) crashes during JAX persistent
+        # compilation-cache use when the device subset does not start at
+        # device 0 (e.g. device_indexes=[2, 3]). Disable the cache for
+        # such schedulers and override any cache config a sibling
+        # scheduler may have set in the same process. See
+        # sgl-project/sglang-jax#1216.
+        if (
+            jit_cache_dir is not None
+            and device_indexes is not None
+            and min(device_indexes, default=0) > 0
+        ):
+            jax.config.update("jax_compilation_cache_dir", "")
+            jit_cache_dir = None
+            # jax.config.update alone does not take effect once the
+            # compilation_cache module's _cache_initialized flag is set
+            # by an earlier sibling scheduler in the same process; that
+            # flag is one-shot. cc.reset_cache() is the only public API
+            # that clears it, forcing the next cache lookup to re-read
+            # the (now-empty) cache_dir config and stay disabled.
+            from jax.experimental.compilation_cache import compilation_cache as cc
+
+            cc.reset_cache()
+            cache_status = (
+                f"disabled for non-zero-base device subset: device_indexes={device_indexes}"
+            )
+        if jit_cache_dir is not None:
+            jax.config.update("jax_compilation_cache_dir", jit_cache_dir)
+            # Default the compile-time write threshold to 0 (cache every compile) for
+            # local/dev. When JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS is set (CI sets
+            # it to 1 to skip tiny entries and cut small-file GCS writes), defer to JAX's
+            # own parsing so the behavior — including validation of bad values — matches
+            # upstream JAX.
+            if "JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS" not in os.environ:
+                jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
+            # Disable the size gate; the compile-time threshold still controls writes.
+            jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
+            # Include XLA sub-caches such as kernel/autotune data.
+            jax.config.update("jax_persistent_cache_enable_xla_caches", "all")
+            from jax.experimental.compilation_cache import compilation_cache as cc
+
+            cc.set_cache_dir(jit_cache_dir)
+            min_compile_time = jax.config.jax_persistent_cache_min_compile_time_secs
+            cache_status = f"enabled, dir={jit_cache_dir}, min_compile_time={min_compile_time}s"
+
+        if cache_status is None:
+            cache_status = "not configured (JAX_COMPILATION_CACHE_DIR unset)"
+        logger.info("XLA persistent compilation cache: %s", cache_status)
 
     def sync_pub(self):
         logger.info(
@@ -1015,6 +1037,11 @@ class Scheduler(
             return_hidden_states=recv_req.return_hidden_states,
         )
         req.tokenizer = self.tokenizer
+        # PD disaggregation routing keys.
+        req.bootstrap_host = recv_req.bootstrap_host
+        req.bootstrap_port = recv_req.bootstrap_port
+        req.bootstrap_room = recv_req.bootstrap_room
+        req.disagg_transfer_id = recv_req.disagg_transfer_id or req.rid
         if hasattr(recv_req, "mm_inputs") and recv_req.mm_inputs:
             req.mm_inputs = recv_req.mm_inputs
             multimodal_embedding = recv_req.mm_inputs.get("multimodal_embedding")
@@ -1206,6 +1233,11 @@ class Scheduler(
         ret["new_token_ratio"] = self.new_token_ratio
         ret["init_new_token_ratio"] = self.init_new_token_ratio
 
+        # PD disaggregation queues
+        ret["disagg_prefill_queue_size"] = len(self.disagg_prefill_queue or ())
+        ret["disagg_prealloc_queue_size"] = len(self.disagg_prealloc_queue or ())
+        ret["disagg_transfer_queue_size"] = len(self.disagg_transfer_queue or ())
+
         return GetInternalStateReqOutput(internal_state=ret)
 
     def set_internal_state(self, recv_req: SetInternalStateReq):
@@ -1303,12 +1335,18 @@ class Scheduler(
             or pending_results > 0
         )
 
+        pd_prefill = len(self.disagg_prefill_queue or ())
+        pd_prealloc = len(self.disagg_prealloc_queue or ())
+        pd_transfer = len(self.disagg_transfer_queue or ())
+        has_pending = has_pending or pd_prefill > 0 or pd_prealloc > 0 or pd_transfer > 0
+
         if has_pending:
             msg = (
                 "Cache not flushed because there are pending requests. "
                 f"waiting={waiting_reqs}, pending_dp={pending_dp_reqs}, running={running_reqs}, "
                 f"cur_batch={current_batch_reqs}, last_batch={last_batch_reqs}, "
-                f"chunked={chunked_pending}, pending_results={pending_results}"
+                f"chunked={chunked_pending}, pending_results={pending_results}, "
+                f"pd_prefill={pd_prefill}, pd_prealloc={pd_prealloc}, pd_transfer={pd_transfer}"
             )
             return False, msg
 
@@ -2061,6 +2099,41 @@ class Scheduler(
                 logger.debug("Abort running request. rid=%s", req.rid)
                 req.to_finish = FINISH_ABORT()
 
+        # Abort PD disaggregation queues
+        prefill_q = self.disagg_prefill_queue
+        if prefill_q is not None:
+            for entry in prefill_q.abort_matching(recv_req.rid, recv_req.abort_all):
+                logger.debug("Abort prefill queue request. rid=%s", entry.req_id)
+                entry.sender.abort()
+                if entry.on_terminal is not None:
+                    try:
+                        entry.on_terminal()
+                    except Exception:
+                        logger.exception(
+                            "on_terminal for aborted prefill req_id=%s raised",
+                            entry.req_id,
+                        )
+
+        prealloc_q = self.disagg_prealloc_queue
+        if prealloc_q is not None:
+            for entry in prealloc_q.abort_matching(recv_req.rid, recv_req.abort_all):
+                logger.debug("Abort prealloc queue request. rid=%s", entry.req_id)
+                if entry.receiver is not None:
+                    entry.receiver.abort()
+                if entry.kv_indices is not None:
+                    self._release_decode_kv_indices(entry.kv_indices)
+                self._abort_decode_request(entry.req, "abort_request")
+
+        transfer_q = self.disagg_transfer_queue
+        if transfer_q is not None:
+            for entry in transfer_q.abort_matching(recv_req.rid, recv_req.abort_all):
+                logger.debug("Abort transfer queue request. rid=%s", entry.req_id)
+                if entry.receiver is not None:
+                    entry.receiver.abort()
+                if entry.kv_indices is not None:
+                    self._release_decode_kv_indices(entry.kv_indices)
+                self._abort_decode_request(entry.req, "abort_request")
+
     def pause_generation(self, recv_req: PauseGenerationReqInput):
         self._engine_paused = True
 
@@ -2092,6 +2165,20 @@ class Scheduler(
         logger.info("Generation continued")
 
 
+def dispatch_scheduler_event_loop(scheduler: Scheduler, server_args: ServerArgs) -> None:
+    """Choose and run the appropriate scheduler event loop."""
+
+    mode = server_args.disaggregation_mode
+    if mode == "prefill":
+        scheduler.event_loop_normal_disagg_prefill()
+    elif mode == "decode":
+        scheduler.event_loop_normal_disagg_decode()
+    elif scheduler.enable_overlap:
+        scheduler.event_loop_overlap()
+    else:
+        scheduler.event_loop_normal()
+
+
 def run_scheduler_process(
     server_args: ServerArgs,
     port_args: PortArgs,
@@ -2115,6 +2202,7 @@ def run_scheduler_process(
     # Create a scheduler and run the event loop
     try:
         scheduler = Scheduler(server_args, port_args)
+        install_disaggregation_wiring(scheduler, server_args)
         pipe_writer.send(
             {
                 "status": "ready",
@@ -2123,10 +2211,7 @@ def run_scheduler_process(
             }
         )
 
-        if scheduler.enable_overlap:
-            scheduler.event_loop_overlap()
-        else:
-            scheduler.event_loop_normal()
+        dispatch_scheduler_event_loop(scheduler, server_args)
 
     except Exception:
         traceback = get_exception_traceback()
@@ -2142,6 +2227,7 @@ def run_scheduler_loop_thread_after_create(
     # Create a scheduler and run the event loop
     try:
         scheduler = Scheduler(server_args, port_args)
+        install_disaggregation_wiring(scheduler, server_args)
         scheduler_thread = threading.Thread(
             target=scheduler_loop_after_create,
             args=(server_args, scheduler),
@@ -2175,10 +2261,7 @@ def scheduler_loop_after_create(server_args, scheduler):
     # Configure the logger
     configure_logger(server_args, prefix=prefix)
     try:
-        if scheduler.enable_overlap:
-            scheduler.event_loop_overlap()
-        else:
-            scheduler.event_loop_normal()
+        dispatch_scheduler_event_loop(scheduler, server_args)
     except Exception:
         traceback = get_exception_traceback()
         logger.error("Scheduler hit an exception: %s", traceback)

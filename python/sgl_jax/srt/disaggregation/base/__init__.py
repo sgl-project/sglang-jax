@@ -1,6 +1,5 @@
 from sgl_jax.srt.disaggregation.base.kv_manager import (
     LEGAL_TRANSITIONS,
-    TERMINAL_STATES,
     KVManager,
     KVPoll,
     KVReceiver,
@@ -15,7 +14,6 @@ __all__ = [
     "KVReceiver",
     "KVSender",
     "LEGAL_TRANSITIONS",
-    "TERMINAL_STATES",
     "StateHolder",
     "is_legal_transition",
 ]
