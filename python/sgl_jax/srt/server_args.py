@@ -252,6 +252,13 @@ class ServerArgs:
     # single loop tick exceeds this many seconds. 0 disables it. Opt-in
     # for stress runs; off by default in production.
     disaggregation_decode_watchdog_seconds: float = 0.0
+    # Decode-side admission headroom: per in-flight/running request, this
+    # many KV tokens are held back when admitting a queued PD request, so a
+    # running decode step can always alloc its next token even when every
+    # other request is mid-transfer (transfer-queue reqs cannot be
+    # retracted). Insufficient capacity defers admission (FIFO requeue),
+    # never aborts. Mirrors sglang's num_reserved_decode_tokens.
+    disaggregation_num_reserved_decode_tokens: int = 512
 
     def __post_init__(self):
         # Set missing default values
@@ -1389,6 +1396,15 @@ class ServerArgs:
             "event-loop phase + backlog snapshot + main-thread "
             "traceback when one loop tick exceeds this many seconds. "
             "0 disables it (default). Opt-in for stress debugging.",
+        )
+        parser.add_argument(
+            "--disaggregation-num-reserved-decode-tokens",
+            type=int,
+            default=ServerArgs.disaggregation_num_reserved_decode_tokens,
+            help="Decode-side admission headroom (KV tokens) held back per "
+            "in-flight/running request when admitting a queued PD request, "
+            "so running decode steps never OOM while others are mid-transfer. "
+            "Insufficient capacity defers admission (FIFO requeue), never aborts.",
         )
         parser.add_argument(
             "--disaggregation-shared-secret",

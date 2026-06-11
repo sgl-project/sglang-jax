@@ -100,10 +100,19 @@ class DecodeBookkeeping:
     # Set by _drain_transfer_queue_synced on multi-host so downstream
     # does not re-poll (a poll() that raised would re-raise and desync).
     synced_state: KVPoll | None = None
+    # Prefill-side info from bootstrap, stashed at intake so KV alloc +
+    # receiver setup can be deferred to the capacity-gated admission step.
+    p_info: dict | None = None
 
 
 class DecodePreallocQueue:
-    """Requests awaiting KV pull start. Thread-safe."""
+    """PD reqs awaiting capacity-gated KV alloc. FIFO, thread-safe.
+
+    Entries enter at intake holding only ``p_info`` (no KV indices, no
+    receiver). The decode loop's admission gate pops them in FIFO order
+    once the paged pool has room; reqs that don't fit stay queued and are
+    retried next tick (deferral, never abort).
+    """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -119,11 +128,17 @@ class DecodePreallocQueue:
                 raise ValueError(f"DecodePreallocQueue already tracks " f"req_id={entry.req_id!r}")
             self._entries[entry.req_id] = entry
 
-    def pop_all(self) -> list[DecodeBookkeeping]:
+    def items_fifo(self) -> list[DecodeBookkeeping]:
+        """FIFO snapshot for the admission gate (does not remove)."""
+
         with self._lock:
-            out = list(self._entries.values())
-            self._entries.clear()
-            return out
+            return list(self._entries.values())
+
+    def remove(self, req_id: str) -> None:
+        """Drop an admitted (or failed) entry by id."""
+
+        with self._lock:
+            self._entries.pop(req_id, None)
 
     def abort_matching(self, rid_prefix: str, abort_all: bool) -> list[DecodeBookkeeping]:
         out: list[DecodeBookkeeping] = []
@@ -268,7 +283,6 @@ class SchedulerDisaggregationDecodeMixin:
 
                 self._pd_mark_time(req, "bootstrap_start")
                 with time_phase("bootstrap", "decode"):
-                with time_phase("bootstrap", "decode"):
                     if jax.process_count() > 1:
                         p_info = self._pick_prefill_peer_for_this_host()
                     else:
@@ -303,41 +317,16 @@ class SchedulerDisaggregationDecodeMixin:
                 self._abort_decode_request(req, "config_mismatch")
                 continue
 
-            kv_indices = None
-            try:
-                self._pd_mark_time(req, "prealloc_entry")
-                kv_indices = self._prealloc_decode_kv_indices(req)
-                receiver = self.disagg_kv_manager.create_receiver(req.rid)
-                spec = self._build_kv_spec_for_req(req)
-                receiver.init(
-                    PMetadata(
-                        remote_addr=(f"{p_info['host']}:{p_info['transfer_port']}"),
-                        uuid=req.disagg_transfer_id or req.rid,
-                        specs={"kv": spec},
-                        p_side_channel_host=str(p_info["host"]),
-                        p_side_channel_port=int(p_info["side_channel_port"]),
-                    )
-                )
-            except Exception:
-                logger.exception(
-                    "failed to set up KVReceiver for req_id=%s",
-                    req.rid,
-                )
-                self._record_decode_transfer_failure("receiver_init")
-                # Release any slots we allocated before the failure.
-                if kv_indices is not None:
-                    self._release_decode_kv_indices(kv_indices)
-                self._abort_decode_request(req, "receiver_init")
-                continue
-
+            # KV alloc + receiver setup are deferred to the capacity-gated
+            # admission step (process_decode_queue). At intake the entry holds
+            # only p_info and consumes no paged-pool slots, so a backlog of
+            # waiting reqs cannot exhaust decode KV cache.
             entry = DecodeBookkeeping(
                 req_id=req.rid,
                 req=req,
-                receiver=receiver,
-                kv_indices=kv_indices,
-                started=True,
+                p_info=p_info,
             )
-            self._pd_mark_time(req, "transfer_entry")
+            self._pd_mark_time(req, "prealloc_entry")
             self.disagg_prealloc_queue.add(entry)
 
     def _extract_pd_reqs_from_waiting_queue(self: Scheduler, rids: set) -> list[Req]:
@@ -358,8 +347,7 @@ class SchedulerDisaggregationDecodeMixin:
     def process_decode_queue(self: Scheduler) -> None:
         """Drive prealloc -> transfer -> ready transitions."""
 
-        for entry in self.disagg_prealloc_queue.pop_all():
-            self.disagg_transfer_queue.add(entry)
+        self._admit_decode_prealloc()
 
         for entry in self._drain_transfer_queue_synced():
             assert entry.receiver is not None
@@ -473,6 +461,74 @@ class SchedulerDisaggregationDecodeMixin:
                     out.append(e)
         return out
 
+    def _admit_decode_prealloc(self: Scheduler) -> None:
+        """Capacity-gated FIFO admission of preallocated PD reqs.
+
+        Pops reqs from the prealloc queue into the transfer queue only while
+        the paged pool has room, reserving ``num_reserved_decode_tokens`` of
+        headroom per in-flight/running request so a running decode step can
+        always alloc its next token even when every other req is mid-transfer
+        (transfer-queue reqs cannot be retracted). KV indices are allocated
+        here, not at intake. Reqs that don't fit stay queued and retry next
+        tick — deferral, never abort.
+        """
+
+        allocator = self.token_to_kv_pool_allocator
+        if allocator is None:
+            return
+
+        page_size = allocator.page_size
+        reserved_per = self.server_args.disaggregation_num_reserved_decode_tokens
+        n_running = len(self.running_batch.reqs) if self.running_batch is not None else 0
+        n_transfer = len(self.disagg_transfer_queue)
+        admitted = 0
+
+        for entry in self.disagg_prealloc_queue.items_fifo():
+            seqlen = len(entry.req.origin_input_ids)
+            page_aligned = ((seqlen + page_size - 1) // page_size) * page_size
+            reserved = reserved_per * (n_running + n_transfer + admitted)
+            if page_aligned + reserved > allocator.available_size():
+                # Insufficient capacity: defer this and all later (FIFO) reqs.
+                break
+
+            kv_indices = allocator.alloc(page_aligned)
+            if kv_indices is None:
+                # Budget check should prevent this; treat a surprise shortfall
+                # as transient and retry next tick rather than abort.
+                break
+
+            try:
+                receiver = self.disagg_kv_manager.create_receiver(entry.req.rid)
+                spec = self._build_kv_spec_for_req(entry.req)
+                p_info = entry.p_info
+                receiver.init(
+                    PMetadata(
+                        remote_addr=(f"{p_info['host']}:{p_info['transfer_port']}"),
+                        uuid=entry.req.disagg_transfer_id or entry.req.rid,
+                        specs={"kv": spec},
+                        p_side_channel_host=str(p_info["host"]),
+                        p_side_channel_port=int(p_info["side_channel_port"]),
+                    )
+                )
+            except Exception:
+                logger.exception(
+                    "failed to set up KVReceiver for req_id=%s",
+                    entry.req.rid,
+                )
+                self._record_decode_transfer_failure("receiver_init")
+                self._release_decode_kv_indices(kv_indices)
+                self.disagg_prealloc_queue.remove(entry.req_id)
+                self._abort_decode_request(entry.req, "receiver_init")
+                continue
+
+            entry.kv_indices = kv_indices
+            entry.receiver = receiver
+            entry.started = True
+            self._pd_mark_time(entry.req, "transfer_entry")
+            self.disagg_prealloc_queue.remove(entry.req_id)
+            self.disagg_transfer_queue.add(entry)
+            admitted += 1
+
     # ------------------------------------------------------------------
     # Overridable / test-friendly hooks
     # ------------------------------------------------------------------
@@ -490,17 +546,6 @@ class SchedulerDisaggregationDecodeMixin:
             ts = TimeStats(role)
             req.pd_time_stats = ts
         ts.mark(name)
-
-    def _prealloc_decode_kv_indices(self: Scheduler, req: Req):
-        """Reserve page-aligned KV slots in the paged pool for ``req``."""
-
-        seqlen = len(req.origin_input_ids)
-        allocator = self.token_to_kv_pool_allocator
-        if allocator is None:
-            return None
-        page_size = allocator.page_size
-        page_aligned = ((seqlen + page_size - 1) // page_size) * page_size
-        return allocator.alloc(page_aligned)
 
     def _release_decode_kv_indices(self: Scheduler, kv_indices) -> None:
         """Release KV indices back to the allocator."""
