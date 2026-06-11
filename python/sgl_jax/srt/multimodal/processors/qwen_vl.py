@@ -140,11 +140,13 @@ class Qwen2_5_VLProcessor(BaseMultimodalProcessor):
 
     models = ["Qwen2_5_VLForConditionalGeneration"]
 
-    def __init__(self, model_path: str):
+    def __init__(self, model_path: str, trust_remote_code: bool = False):
         from transformers import AutoConfig, AutoProcessor
 
-        self.hf_processor = AutoProcessor.from_pretrained(model_path)
-        self.hf_config = AutoConfig.from_pretrained(model_path)
+        self.hf_processor = AutoProcessor.from_pretrained(
+            model_path, trust_remote_code=trust_remote_code
+        )
+        self.hf_config = AutoConfig.from_pretrained(model_path, trust_remote_code=trust_remote_code)
         self.image_token_id = getattr(self.hf_config, "image_token_id", None)
         self.video_token_id = getattr(self.hf_config, "video_token_id", None)
         self.vision_start_token_id = getattr(self.hf_config, "vision_start_token_id", None)
