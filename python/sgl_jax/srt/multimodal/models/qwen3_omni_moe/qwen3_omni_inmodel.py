@@ -1,15 +1,19 @@
 """In-model Qwen3-Omni Thinker (understanding, text-out) — refactor M5.
 
 Mirrors the Qwen2.5-VL in-model template (srt/multimodal/models/qwen2_5VL/qwen2_5_vl.py):
-vision (and audio) are encoded inside the model forward and fused via mm_core.merge() on the
-standard srt control plane -- no staged GlobalScheduler / embed stage / host roundtrip.
+vision (and audio) are encoded via embed_mm() + mm_core.merge() on the standard srt control
+plane -- no staged GlobalScheduler / embed stage. Under C-1 (design §5.2) the encode runs ONCE
+per req on the host (model_runner.encode_mm_reqs) and the result is sliced per chunk; there is
+no in-forward encode.
 
 What's new vs Qwen2.5-VL (see tmp/refactor/m5-qwen3omni-map.md):
-  - DEEPSTACK: the vision encoder emits 3 multi-scale feature levels; merge() densifies them
-    into FusedEmbed.deepstack_embed = [num_levels, seq, hidden]; the wrapper stamps
-    forward_batch.deepstack_visual_embedding + apply_for_deepstack, and the AR body adds
-    level i to the hidden states after layer i (Qwen3OmniMoeThinkerTextModel already does this,
-    so no AR change).
+  - DEEPSTACK: the vision encoder emits 3 multi-scale feature levels; embed_mm returns them
+    SPARSE ([num_levels, num_visual, hidden]) + a visual placeholder mask, which the encode pass
+    attaches to req.deepstack_visual_embedding / deepstack_visual_pos_mask. ScheduleBatch.
+    _merge_multimodal densifies them per chunk into forward_batch.deepstack_visual_embedding +
+    apply_for_deepstack, and the AR body adds level i after layer i (Qwen3OmniMoeThinkerTextModel
+    already does this, so no AR change). (Deepstack densify lives only here -- merge() does not
+    densify; that avoids a second device-side implementation.)
   - self.model is the complete Qwen3OmniMoeThinkerTextForConditionalGeneration (embed -> AR ->
     logits, already reads input_embedding / deepstack / mrope), so the wrapper only stamps the
     ForwardBatch fields and passes through.
@@ -160,61 +164,16 @@ class Qwen3OmniMoeForConditionalGeneration(nnx.Module):
         return fused, deepstack, visual_pos_mask
 
     def __call__(self, forward_batch, memory_pools, logits_metadata):
-        is_extend = forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
-        if is_extend and forward_batch.contains_mm_inputs():
-            # Scheme B (design §5.1.2): input_ids stays clean -- placeholder rows hold the raw
-            # image/video/audio token id (in-vocab), never a pad_value. embed_tokens is safe
-            # directly (no clamp); merge() locates rows by isin(input_ids, [token ids]).
-            text_embed = self.model.model.embed_tokens(forward_batch.input_ids)
-
-            mod_embeds = []
-            multiscale = None  # [num_levels, N_visual, hidden]
-            if forward_batch.mm_pixel_values is not None:
-                pool, ds_levels = self.encode_image(
-                    forward_batch.mm_pixel_values, forward_batch.mm_grid_thw
-                )
-                mod_embeds.append(pool)
-                multiscale = jnp.stack(ds_levels, axis=0)
-            if forward_batch.mm_pixel_values_videos is not None:
-                vpool, vds = self.encode_image(
-                    forward_batch.mm_pixel_values_videos, forward_batch.mm_video_grid_thw
-                )
-                mod_embeds.append(vpool)
-                vstack = jnp.stack(vds, axis=0)
-                multiscale = (
-                    vstack if multiscale is None else jnp.concatenate([multiscale, vstack], axis=1)
-                )
-            if forward_batch.mm_audio_features is not None:
-                # Continuous-mel audio; feature lengths are static (the tower chunks by them).
-                mod_embeds.append(
-                    self.encode_audio(
-                        forward_batch.mm_audio_features,
-                        np.asarray(forward_batch.mm_audio_feature_lengths),
-                    )
-                )
-
-            placeholder_ids = [
-                t
-                for t in (self.image_token_id, self.video_token_id, self.audio_token_id)
-                if t is not None
-            ]
-            # deepstack is visual-only -> key the densify on the VISUAL token ids (image+video)
-            # so audio placeholder rows are excluded.
-            visual_ids = [t for t in (self.image_token_id, self.video_token_id) if t is not None]
-            deepstack = (multiscale, visual_ids) if multiscale is not None else None
-            fused = merge(
-                text_embed,
-                mod_embeds,
-                placeholder_ids,
-                forward_batch.input_ids,
-                deepstack=deepstack,
-                mesh=self.mesh,
-            )
-            forward_batch.input_embedding = fused.embed
-            if fused.deepstack_embed is not None:
-                forward_batch.deepstack_visual_embedding = fused.deepstack_embed
-                forward_batch.apply_for_deepstack = True
-
+        # In-model multimodal (C-1, design §5.2): the fused embedding AND the sparse deepstack
+        # (+ visual pos mask) are produced once per req by the host-side encode pass
+        # (model_runner.encode_mm_reqs -> embed_mm) and held on req.{multimodal_embedding,
+        # deepstack_visual_embedding, deepstack_visual_pos_mask}; ScheduleBatch._merge_multimodal
+        # slices/densifies them per chunk into forward_batch.{input_embedding,
+        # deepstack_visual_embedding}, which the AR reads. There is NO in-forward encode here --
+        # the earlier per-chunk in-forward path re-encoded every chunk and stamped a dense
+        # chunk-keyed deepstack that did NOT slice the chunk window (B1/B2 misalignment for both
+        # the embed and the deepstack); C-1 supersedes it. embed_mm above is the single encode
+        # source, invoked only by the encode pass.
         return self.model(forward_batch, memory_pools, logits_metadata)
 
     def load_weights(self, model_config):

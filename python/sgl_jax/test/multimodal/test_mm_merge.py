@@ -75,36 +75,6 @@ class TestMerge(unittest.TestCase):
         self.assertEqual(out.embed.shape, (3, 2))
         self.assertTrue(bool(jnp.array_equal(out.embed[1], feats[0])))
 
-    def test_deepstack_densify_into_visual_rows(self):
-        # seq 4: [text, visual(PAD_A), visual(PAD_A), text]; 2 visual tokens, 2 levels.
-        t = jnp.zeros((4, 3), dtype=jnp.float32)
-        ids = jnp.array([1, PAD_A, PAD_A, 2])
-        vfeat = jnp.arange(6, dtype=jnp.float32).reshape(2, 3)
-        ds = jnp.stack([jnp.full((2, 3), 10.0), jnp.full((2, 3), 20.0)])  # [2 levels, 2, 3]
-        out = merge(t, [vfeat], [PAD_A], ids, deepstack=(ds, [PAD_A]))
-        self.assertEqual(out.deepstack_embed.shape, (2, 4, 3))
-        # visual rows (1,2) hold per-level features; text rows (0,3) stay 0
-        self.assertTrue(bool(jnp.all(out.deepstack_embed[0, 1] == 10.0)))
-        self.assertTrue(bool(jnp.all(out.deepstack_embed[1, 2] == 20.0)))
-        self.assertTrue(bool(jnp.all(out.deepstack_embed[:, 0] == 0.0)))
-        self.assertTrue(bool(jnp.all(out.deepstack_embed[:, 3] == 0.0)))
-
-    def test_deepstack_excludes_audio_rows(self):
-        # [text, visual(PAD_A), audio(PAD_B), text]; deepstack keyed on the visual item only.
-        t = jnp.zeros((4, 2), dtype=jnp.float32)
-        ids = jnp.array([1, PAD_A, PAD_B, 2])
-        vfeat = jnp.ones((1, 2), dtype=jnp.float32)
-        afeat = jnp.full((1, 2), 5.0, dtype=jnp.float32)
-        ds = jnp.full((1, 1, 2), 9.0)  # [1 level, 1 visual token, 2]
-        out = merge(t, [vfeat, afeat], [PAD_A, PAD_B], ids, deepstack=(ds, [PAD_A]))
-        self.assertTrue(bool(jnp.all(out.deepstack_embed[0, 1] == 9.0)))  # visual row
-        self.assertTrue(bool(jnp.all(out.deepstack_embed[0, 2] == 0.0)))  # audio row untouched
-
-    def test_no_deepstack_is_none(self):
-        t = jnp.zeros((2, 2), dtype=jnp.float32)
-        out = merge(t, [jnp.ones((1, 2))], [PAD_A], jnp.array([PAD_A, 1]))
-        self.assertIsNone(out.deepstack_embed)
-
 
 if __name__ == "__main__":
     unittest.main()

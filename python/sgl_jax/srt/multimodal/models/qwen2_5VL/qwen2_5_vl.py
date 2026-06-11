@@ -143,21 +143,13 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
         memory_pools: MemoryPools,
         logits_metadata: LogitsMetadata,
     ):
-        is_extend = forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
-        if is_extend and forward_batch.contains_mm_inputs():
-            # Legacy per-batch encode path (used when req.multimodal_embedding was NOT
-            # pre-computed by the host-side encode pass). Reuses embed_mm so the encode+merge
-            # logic stays single-sourced. When C-1's encode pass runs, req.multimodal_embedding
-            # is set -> _assemble_inmodel_mm skips raw pixels -> contains_mm_inputs() is False
-            # here -> this block is skipped and the AR reads the per-chunk-sliced input_embedding.
-            forward_batch.input_embedding = self.embed_mm(
-                forward_batch.input_ids,
-                forward_batch.mm_pixel_values,
-                forward_batch.mm_grid_thw,
-                forward_batch.mm_pixel_values_videos,
-                forward_batch.mm_video_grid_thw,
-            )[0]
-
+        # In-model multimodal (C-1, design §5.2): the fused embedding is produced once per req by
+        # the host-side encode pass (model_runner.encode_mm_reqs -> embed_mm) and sliced per chunk
+        # into forward_batch.input_embedding by ScheduleBatch._merge_multimodal; the AR body reads
+        # it in extend mode. There is NO in-forward encode here -- the earlier per-chunk in-forward
+        # path re-encoded every chunk and misaligned the merge at chunk boundaries (B1/B2),
+        # superseded by C-1's single full-sequence encode + per-chunk slice. (embed_mm above is
+        # the single encode source, invoked by the encode pass.)
         token_to_kv_pool = memory_pools.token_to_kv_pool
         hidden_states, layers_kv_fused, layers_callback_flag = self.model(
             forward_batch, token_to_kv_pool

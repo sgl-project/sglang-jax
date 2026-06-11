@@ -43,14 +43,14 @@ from jax.sharding import NamedSharding, PartitionSpec
 class FusedEmbed:
     """Output of :func:`merge`.
 
-    `embed` is the per-token input embedding handed to the LLM (placeholder rows
-    replaced by modality features). `deepstack_*` is an optional side-channel for
-    models with deepstack visual embeddings (Qwen3-VL/Omni); None otherwise.
+    `embed` is the per-token input embedding handed to the LLM (placeholder rows replaced by
+    modality features). (Deepstack visual embeddings, for Qwen3-VL/Omni, are NOT densified here:
+    under C-1 (design §5.2) the encoder returns the SPARSE per-level features + a visual mask,
+    and ScheduleBatch._merge_multimodal densifies them per chunk on the host -- a single densify
+    implementation, not duplicated in this device-side merge.)
     """
 
     embed: jax.Array
-    deepstack_embed: jax.Array | None = None
-    deepstack_pos_mask: jax.Array | None = None
 
 
 def merge(
@@ -58,7 +58,6 @@ def merge(
     mod_embeds: list[jax.Array],
     placeholder_ids: list[int],
     input_ids: jax.Array,
-    deepstack: tuple | None = None,
     *,
     mesh: jax.sharding.Mesh | None = None,
 ) -> FusedEmbed:
@@ -74,13 +73,6 @@ def merge(
         placeholder membership mask. (Scheme B: these are real in-vocab token ids, not
         pad_values.)
       input_ids: ``[seq]`` int array; placeholder rows hold their modality token id.
-      deepstack: optional ``(features, visual_placeholder_ids)`` for models with deepstack
-        visual embeddings (Qwen3-VL/Omni). ``features`` is ``[num_levels, n_visual_tokens,
-        hidden]`` (per-level multi-scale visual features, ordered like the visual placeholder
-        rows); ``visual_placeholder_ids`` are the VISUAL token ids only (image/video). merge
-        densifies these into ``FusedEmbed.deepstack_embed`` = ``[num_levels, seq, hidden]``
-        (visual rows hold the features, all other rows 0) so the AR body can add level i to
-        hidden states after layer i. None for non-deepstack models.
       mesh: optional embed mesh; when set, operands are resharded to full replication
         (jax.sharding.reshard) before the scatter (contract rule 3).
 
@@ -89,6 +81,11 @@ def merge(
       replaced by ``concat(mod_embeds)`` in order. A count mismatch is safe: surplus
       placeholder slots map to an out-of-bounds index and ``mode="drop"`` discards them
       (no silent overwrite of row 0).
+
+    Deepstack (Qwen3-VL/Omni) is NOT handled here: the encoder returns the sparse per-level
+    visual features + a visual placeholder mask, and ScheduleBatch._merge_multimodal densifies
+    them per chunk on the host (C-1, design §5.2). Keeping the densify out of merge avoids a
+    second, device-side densify implementation.
     """
     # No multimodal items -> pure-text passthrough.
     if not mod_embeds:
@@ -96,9 +93,6 @@ def merge(
 
     all_features = jnp.concatenate(mod_embeds, axis=0)  # [sum_i N_i, hidden], item order
     placeholder = jnp.asarray(list(placeholder_ids), dtype=input_ids.dtype)
-    ds_features = ds_placeholder_ids = None
-    if deepstack is not None:
-        ds_features, ds_placeholder_ids = deepstack
 
     # Contract rule 3: full replication before scatter on a sharded embed mesh. Use
     # jax.sharding.reshard (NOT with_sharding_constraint): under the standard AR mesh whose
@@ -114,8 +108,6 @@ def merge(
         # on a 'data'-sharded mask fails (its bincount/scatter internals can't resolve the
         # 'data' spec under this mesh). Replicating here keeps mask/positions/scatter aligned.
         input_ids = jax.sharding.reshard(input_ids, repl)
-        if ds_features is not None:
-            ds_features = jax.sharding.reshard(ds_features, repl)
 
     seq_len = text_embed.shape[0]
     # Contract rules 1+2: placeholder mask by modality-token-id membership, ordered positions.
@@ -125,20 +117,4 @@ def merge(
     positions = jnp.nonzero(mask, size=all_features.shape[0], fill_value=seq_len)[0]
     fused = text_embed.at[positions, :].set(all_features, mode="drop")
 
-    # Deepstack side-channel: densify per-level visual features into [num_levels, seq, hidden]
-    # aligned to the visual placeholder rows (keyed by the visual token ids, so audio
-    # placeholders are excluded). Non-visual rows stay 0 -> the AR's per-layer add is a no-op
-    # there.
-    deepstack_embed = None
-    if ds_features is not None:
-        ds_placeholder = jnp.asarray(list(ds_placeholder_ids), dtype=input_ids.dtype)
-        ds_positions = jnp.nonzero(
-            jnp.isin(input_ids, ds_placeholder),
-            size=ds_features.shape[1],
-            fill_value=seq_len,
-        )[0]
-        num_levels, _, hidden = ds_features.shape
-        ds_dense = jnp.zeros((num_levels, seq_len, hidden), dtype=ds_features.dtype)
-        deepstack_embed = ds_dense.at[:, ds_positions, :].set(ds_features, mode="drop")
-
-    return FusedEmbed(embed=fused, deepstack_embed=deepstack_embed)
+    return FusedEmbed(embed=fused)
