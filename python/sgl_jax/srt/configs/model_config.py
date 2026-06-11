@@ -804,6 +804,15 @@ def is_multimodal_model(hf_config) -> bool:
     vision_config + audio_config, while text-only variants (MiMo-V2.5-Pro/Flash) have
     neither and stay on the text path. Qwen3-Omni nests vision_config/audio_config under
     ``thinker_config``, so check that too.
+
+    Single source of truth (U3, design §3.5.1): the PER-CLASS capability declaration
+    ``mm_core.capability.is_multimodal_arch(model_cls)`` (a model is multimodal iff it
+    declares an ``encode_<modality>`` method / explicit marker). This function is the
+    *config-time proxy* of that fact -- it must run before the model class is resolved
+    (tokenizer/serving build ModelConfig early), so it reads the equivalent hf_config
+    signal instead. The two must agree for any registered understanding model. (The former
+    standalone ``multimodal_model_archs`` enumeration was a third, uncoordinated source and
+    has been removed -- it had no consumers.)
     """
 
     def _has_mm(cfg) -> bool:
@@ -813,34 +822,6 @@ def is_multimodal_model(hf_config) -> bool:
         )
 
     return _has_mm(hf_config) or _has_mm(getattr(hf_config, "thinker_config", None))
-
-
-multimodal_model_archs = [
-    "CLIPModel",
-    "DeepseekVL2ForCausalLM",
-    "Gemma3ForConditionalGeneration",
-    "Gemma3nForConditionalGeneration",
-    "Grok1VForCausalLM",
-    "Grok1AForCausalLM",
-    "LlavaLlamaForCausalLM",
-    "Llama4ForConditionalGeneration",
-    "LlavaMistralForCausalLM",
-    "LlavaQwenForCausalLM",
-    "LlavaForConditionalGeneration",
-    "LlavaVidForCausalLM",
-    "MiniCPMO",
-    "MiniCPMV",
-    "Mistral3ForConditionalGeneration",
-    "MultiModalityCausalLM",
-    "MllamaForConditionalGeneration",
-    "Qwen2AudioForConditionalGeneration",
-    "Qwen2VLForConditionalGeneration",
-    "Qwen2_5_VLForConditionalGeneration",
-    "KimiVLForConditionalGeneration",
-    "InternVLChatModel",
-    "Phi4MMForCausalLM",
-    "VILAForConditionalGeneration",
-]
 
 
 # Models that require attention_mask for padding token handling
