@@ -2543,84 +2543,6 @@ class ScheduleBatch:
                 kwargs[f] = np.concatenate(nonnull, axis=0)
         return type(nonempty[0])(**kwargs)
 
-    def _assemble_inmodel_mm(self, reqs):
-        """Assemble raw multimodal inputs for the in-model encode+merge path (refactor M3/M5).
-
-        For reqs carrying raw mm (``req.mm_inputs``) and NO precomputed ``multimodal_embedding``,
-        assemble per-modality features + collect per-item pad_values -- IMAGE then VIDEO then
-        AUDIO, matching the model forward's encode order and ``merge()`` keying. Returns the
-        8-tuple ``(pixel_values, pixel_values_videos, grid_thw, video_grid_thw, pad_values,
-        visual_pad_values, audio_features, audio_feature_lengths)`` or all-None when no req
-        carries raw mm (text / staged precomputed-embedding path stays 0-diff).
-
-        ``pad_values`` are all items (image+video+audio) for merge()'s main scatter;
-        ``visual_pad_values`` are image+video only, for the deepstack densify (audio rows must
-        be excluded). ``audio_features`` is the continuous-mel ``input_features`` ([f, total_t]
-        concatenated over audios); ``audio_feature_lengths`` is the per-audio mel length (static,
-        the audio tower chunks by it via .tolist()).
-        """
-        raw = [
-            r
-            for r in reqs
-            if getattr(r, "mm_inputs", None) and getattr(r, "multimodal_embedding", None) is None
-        ]
-        if not raw:
-            return (None,) * 8
-        # Runtime import keeps srt free of a static srt->multimodal import edge
-        # (M6 relocates assemble_mm_inputs into mm_core).
-        import importlib
-
-        assemble = importlib.import_module(
-            "sgl_jax.srt.multimodal.manager.mm_assembly"
-        ).assemble_mm_inputs
-        img_px, vid_px, img_thw, vid_thw = [], [], [], []
-        img_pads, vid_pads, aud_pads = [], [], []
-        aud_feats, aud_lens = [], []
-        for r in raw:
-            a = assemble(r.mm_inputs)
-            if a["pixel_values_images"] is not None:
-                img_px.append(a["pixel_values_images"])
-                for row in a["image_grid_thw"] or []:
-                    img_thw.append(tuple(int(x) for x in row))
-            if a["pixel_values_videos"] is not None:
-                vid_px.append(a["pixel_values_videos"])
-                for row in a["video_grid_thw"] or []:
-                    vid_thw.append(tuple(int(x) for x in row))
-            if a["audio_features"] is not None:
-                aud_feats.append(np.asarray(a["audio_features"]))
-                mask = a.get("audio_feature_attention_mask")
-                if mask is not None:
-                    m = np.asarray(mask)
-                    if m.ndim <= 1:
-                        aud_lens.append(int(m.sum()))
-                    else:
-                        aud_lens.extend(int(x) for x in m.sum(axis=-1))
-                else:
-                    aud_lens.append(int(np.asarray(a["audio_features"]).shape[-1]))
-            for it in r.mm_inputs.get("mm_items") or []:
-                if getattr(it, "pad_value", None) is None and hasattr(it, "set_pad_value"):
-                    it.set_pad_value()
-                pv = getattr(it, "pad_value", None)
-                if pv is None:
-                    continue
-                if it.is_image():
-                    img_pads.append(pv)
-                elif it.is_video():
-                    vid_pads.append(pv)
-                elif it.is_audio():
-                    aud_pads.append(pv)
-        visual_pads = tuple(img_pads) + tuple(vid_pads)
-        return (
-            np.concatenate(img_px, axis=0) if img_px else None,
-            np.concatenate(vid_px, axis=0) if vid_px else None,
-            tuple(img_thw) or None,
-            tuple(vid_thw) or None,
-            (visual_pads + tuple(aud_pads)) or None,
-            visual_pads or None,
-            np.concatenate(aud_feats, axis=-1) if aud_feats else None,
-            tuple(aud_lens) or None,
-        )
-
     def get_model_worker_batch(
         self,
         token_paddings: list,
@@ -2726,20 +2648,6 @@ class ScheduleBatch:
         mrope_positions = _mm["mrope_positions"]
         apply_for_deepstack = _mm["apply_for_deepstack"]
         deepstack_visual_embedding = _mm["deepstack_visual_embedding"]
-
-        # In-model raw-mm path (refactor M3): for reqs carrying raw mm (no precomputed
-        # multimodal_embedding), assemble pixels/grid + per-item pad_values onto the worker
-        # batch so the model encodes + merges in-forward. All-None for text/staged batches.
-        (
-            mm_pixel_values,
-            mm_pixel_values_videos,
-            mm_grid_thw,
-            mm_video_grid_thw,
-            mm_pad_values,
-            mm_visual_pad_values,
-            mm_audio_features,
-            mm_audio_feature_lengths,
-        ) = self._assemble_inmodel_mm(all_reqs[:real_bs])
 
         # Merge per-DP top_logprobs_nums / token_ids_logprobs with the same
         # offset_bs += per_dp_bs_padding padding scheme used in _merge_batch_metadata.
@@ -2849,14 +2757,6 @@ class ScheduleBatch:
             recurrent_indices=recurrent_indices_cpu,
             has_initial_state=has_initial_state_cpu,
             spec_algorithm=self.spec_algorithm,
-            mm_pixel_values=mm_pixel_values,
-            mm_pixel_values_videos=mm_pixel_values_videos,
-            mm_grid_thw=mm_grid_thw,
-            mm_video_grid_thw=mm_video_grid_thw,
-            mm_pad_values=mm_pad_values,
-            mm_visual_pad_values=mm_visual_pad_values,
-            mm_audio_features=mm_audio_features,
-            mm_audio_feature_lengths=mm_audio_feature_lengths,
         )
 
     def get_spec_model_worker_batch(
@@ -3303,20 +3203,6 @@ class ModelWorkerBatch:
 
     # Whether each request has prior recurrent state (lazy zero-on-read)
     has_initial_state: np.ndarray | None = None
-
-    # In-model multimodal raw inputs (refactor M3): assembled per-batch from req.mm_inputs
-    # for the in-model encode+merge path (vs the staged precomputed multimodal_embedding).
-    # ForwardBatch.init_new consumes these; None for text-only / staged batches.
-    mm_pixel_values: np.ndarray | None = None
-    mm_pixel_values_videos: np.ndarray | None = None
-    mm_grid_thw: tuple | None = None
-    mm_video_grid_thw: tuple | None = None
-    mm_pad_values: tuple | None = None
-    # visual-only pad_values (image+video) for the deepstack densify (audio excluded); audio
-    # continuous-mel features + per-audio mel lengths (M5).
-    mm_visual_pad_values: tuple | None = None
-    mm_audio_features: np.ndarray | None = None
-    mm_audio_feature_lengths: tuple | None = None
 
     def get_original_input_len(self):
         """

@@ -613,13 +613,12 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
     def encode_mm_reqs(self, reqs):
         """C-1 (design §5.2): for each req carrying raw multimodal input and NO precomputed
         embedding, run the FULL-sequence encode+merge once and attach the ``[seq, hidden]``
-        fused embedding (host ``np.ndarray``) to ``req.multimodal_embedding``. The scheduler's
-        ``_merge_multimodal`` then slices it per chunk into ``input_embedding`` and the in-forward
-        encode self-disables (``_assemble_inmodel_mm`` skips the req -> ``contains_mm_inputs()``
-        turns False) -> no per-chunk re-encode (B8) and no chunk-boundary merge misalignment
+        fused embedding (host ``np.ndarray``) to ``req.multimodal_embedding`` (+ sparse deepstack
+        for Omni). The scheduler's ``_merge_multimodal`` then slices it per chunk into
+        ``input_embedding``; the model ``__call__`` does NO in-forward encode (it just reads the
+        sliced embedding) -> no per-chunk re-encode (B8) and no chunk-boundary merge misalignment
         (B1/B2). No-op for non-mm models (``jitted_embed_mm is None``) and for reqs without raw
-        image/video (audio-only / deepstack models keep the legacy in-forward path until their
-        ``embed_mm`` is added)."""
+        image/video/audio."""
         if self.jitted_embed_mm is None or not reqs:
             return
         import importlib
@@ -659,7 +658,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 if img_px is None and vid_px is None and aud_feats is None:
                     continue
                 # Audio: continuous-mel features (traced) + per-audio length (static; the tower
-                # chunks by it). Derive lengths from the attention mask like _assemble_inmodel_mm.
+                # chunks by it). Derive lengths from the attention mask (per-audio mel length).
                 aud_len = None
                 if aud_feats is not None:
                     mask = a.get("audio_feature_attention_mask")
