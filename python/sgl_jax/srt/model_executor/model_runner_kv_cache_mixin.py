@@ -219,14 +219,16 @@ class ModelRunnerKVCacheMixin:
         )
 
     def _vision_activation_reserve_bytes(self: ModelRunner) -> int:
-        """G1 (design §5.7): HBM to reserve for the in-model vision encoder's peak activation,
-        subtracted from the KV budget (the encoder is a separate jit; the KV pool is otherwise
-        blind to it). Explicit ``--vision-activation-reserve-bytes`` wins; else auto-size from
-        ``--vision-max-patches`` + the ViT config -- the dense ``[heads, T, T]`` attention matrix
-        (replicated per chip under §3.3.5) dominates one layer's scratch. A conservative
-        over-estimate is safe (KV pool slightly smaller, never OOM). 0 when both unset / no ViT
-        config. (An AOT XLA memory_analysis probe could replace the closed form for tighter
-        sizing; the closed form is robust and needs no on-device compile at startup.)"""
+        """G1 (design §5.7): HBM to reserve for the in-model encoder's peak activation, subtracted
+        from the KV budget (the encoder is a separate jit; the KV pool is otherwise blind to it).
+        Explicit ``--vision-activation-reserve-bytes`` wins; else auto-size from
+        ``--vision-max-patches`` + the ViT/audio config. The reserve is VISION + AUDIO (separate
+        towers, additive): the dense ``[heads, T, T]`` attention matrix (replicated per chip under
+        §3.3.5) dominates each tower's scratch. Vision uses the AOT-measured temp_size when the
+        startup probe succeeded (tight), else a conservative closed form; audio is always closed
+        form (the AOT probe is image-only, so it does NOT cover the audio tower -- HIGH-2). A
+        conservative over-estimate is safe (KV pool slightly smaller, never OOM). 0 when unset /
+        no config."""
         sa = self.server_args
         explicit = getattr(sa, "vision_activation_reserve_bytes", 0) or 0
         if explicit > 0:
@@ -234,25 +236,40 @@ class ModelRunnerKVCacheMixin:
         max_patches = getattr(sa, "vision_max_patches", 0) or 0
         if max_patches <= 0:
             return 0
-        # Prefer the AOT-measured temp_size (tight) when the startup probe succeeded; else the
-        # conservative closed form below.
+        hf = getattr(self.model_config, "hf_config", None)
+        thinker = getattr(hf, "thinker_config", None)
+        vcfg = getattr(hf, "vision_config", None) or getattr(thinker, "vision_config", None)
+        acfg = getattr(hf, "audio_config", None) or getattr(thinker, "audio_config", None)
+
+        def _tower_bytes(heads: int, hidden: int, T: int) -> int:
+            # ~= one layer's dense attention matrix [heads, T, T] (fp32 softmax) + a few
+            # [T, hidden] bf16 hidden-state buffers; 20% headroom.
+            return int((int(heads) * T * T * 4 + T * int(hidden) * 2 * 6) * 1.2)
+
+        # Vision: prefer the AOT-measured temp_size (tight) when the probe succeeded; else closed.
         aot = getattr(self, "_aot_vision_reserve", 0) or 0
         if aot > 0:
-            return aot
-        hf = getattr(self.model_config, "hf_config", None)
-        vcfg = getattr(hf, "vision_config", None) or getattr(
-            getattr(hf, "thinker_config", None), "vision_config", None
-        )
-        if vcfg is None:
-            return 0
-        heads = getattr(vcfg, "num_heads", None) or getattr(vcfg, "num_attention_heads", 16)
-        hidden = getattr(vcfg, "hidden_size", 1280)
-        T = int(max_patches)
-        # Peak ~= one ViT layer's dense attention matrix [heads, T, T] (fp32 softmax) + a few
-        # [T, hidden] bf16 hidden-state buffers; 20% headroom.
-        attn = int(heads) * T * T * 4
-        hidden_bufs = T * int(hidden) * 2 * 6
-        return int((attn + hidden_bufs) * 1.2)
+            vision = aot
+        elif vcfg is not None:
+            heads = getattr(vcfg, "num_heads", None) or getattr(vcfg, "num_attention_heads", 16)
+            hidden = getattr(vcfg, "hidden_size", 1280)
+            vision = _tower_bytes(heads, hidden, int(max_patches))
+        else:
+            vision = 0
+
+        # Audio (HIGH-2): the audio tower is a SEPARATE activation the vision probe never exercises
+        # (AOT passes audio=None). Bound it by the tower's architectural max_source_positions (it
+        # cannot attend over more frames than its positional table). Closed form, additive.
+        audio = 0
+        if acfg is not None:
+            a_heads = getattr(acfg, "encoder_attention_heads", None) or getattr(
+                acfg, "num_attention_heads", 16
+            )
+            a_hidden = getattr(acfg, "d_model", None) or getattr(acfg, "hidden_size", 1280)
+            a_T = int(getattr(acfg, "max_source_positions", 1500))
+            audio = _tower_bytes(a_heads, a_hidden, a_T)
+
+        return vision + audio
 
     def _profile_available_bytes(self: ModelRunner, total_device_memory: int) -> int:
         """Profile available bytes for KV cache (+ recurrent state)."""

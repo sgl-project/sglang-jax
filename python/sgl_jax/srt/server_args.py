@@ -1120,9 +1120,11 @@ class ServerArgs:
             "--vision-max-patches",
             type=int,
             default=ServerArgs.vision_max_patches,
-            help="G1 auto-sizing: largest #patches (t*h*w) a single vision request may produce. "
-            ">0 on a multimodal model auto-computes the vision HBM reserve from the ViT config. "
-            "0 = off. Reserves for the worst case, so set only for large-image / video workloads.",
+            help="G1: largest #patches (t*h*w) of ANY single vision item (image/video) -- the ViT "
+            "encodes one item at a time, so the peak is the largest item, not the request total. "
+            ">0 on a multimodal model auto-sizes the vision HBM reserve AND enforces admission: a "
+            "request whose largest item exceeds this is rejected at the tokenizer (clear error) "
+            "instead of OOMing mid-forward. 0 = off (no reserve, no admission control).",
         )
         parser.add_argument(
             "--vision-bucket-size",

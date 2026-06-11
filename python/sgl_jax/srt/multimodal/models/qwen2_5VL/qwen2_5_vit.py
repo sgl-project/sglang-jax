@@ -651,8 +651,11 @@ class Qwen2_5_VL_VisionTransformer(nnx.Module):
         (t, llm_h, llm_w) row-major order. Bucket-padding units are masked out of the ViT attention
         (so real patches never attend to them) and flagged in ``valid_units`` so the caller can
         compact them out before merge. Window tiling is anchored at origin in fixed wsize-blocks,
-        so a real patch keeps its exact window membership in the padded grid -> bit-equivalent to
-        no-bucketing. ``__call__`` (the non-bucketed path) is untouched."""
+        so a real patch keeps its exact window membership in the padded grid; with masked keys
+        contributing exp(finfo.min)=0 this is mathematically equal to no-bucketing, and in practice
+        numerically equivalent at the float-rounding level (XLA's shape-dependent reduction order
+        may differ by ULPs -- not guaranteed bit-identical; validated by identical greedy outputs).
+        ``__call__`` (the non-bucketed path) is untouched."""
         window_index, rotary_pos_emb, cu_seqlens, cu_window_seqlens = self.compute_aux_arrays(
             grid_thw
         )

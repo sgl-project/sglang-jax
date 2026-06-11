@@ -34,6 +34,7 @@ from sgl_jax.srt.model_executor.model_runner_kv_cache_mixin import (
     ModelRunnerKVCacheMixin,
     _build_non_hybrid_memory_pools,
 )
+from sgl_jax.srt.model_executor.vision_bucketing import bucket_pad_images
 from sgl_jax.srt.model_loader.loader import get_model_loader
 from sgl_jax.srt.precision_tracer import precision_tracer
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
@@ -674,36 +675,6 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             and hasattr(getattr(self.model, "visual", None), "encode_bucketed")
         )
 
-        def _bucket_pad(px, grids):
-            px = np.asarray(px)
-            dim = px.shape[-1]
-            out_px, padded_grids, real_dims = [], [], []
-            cur = 0
-            for t, h, w in grids:
-                t, h, w = int(t), int(h), int(w)
-                size = t * h * w
-                unit = px[cur : cur + size]
-                cur += size
-                llm_h, llm_w = h // merge_m, w // merge_m
-                pad_llm_h = ((llm_h + bucket_s - 1) // bucket_s) * bucket_s
-                pad_llm_w = ((llm_w + bucket_s - 1) // bucket_s) * bucket_s
-                real_dims.append((llm_h, llm_w))
-                if pad_llm_h == llm_h and pad_llm_w == llm_w:
-                    out_px.append(unit)
-                    padded_grids.append((t, h, w))
-                    continue
-                mu = merge_m * merge_m
-                u = unit.reshape(t, llm_h, llm_w, mu, dim)
-                padded = np.zeros((t, pad_llm_h, pad_llm_w, mu, dim), dtype=u.dtype)
-                padded[:, :llm_h, :llm_w, :, :] = u
-                out_px.append(padded.reshape(t * pad_llm_h * pad_llm_w * mu, dim))
-                padded_grids.append((t, pad_llm_h * merge_m, pad_llm_w * merge_m))
-            return (
-                np.concatenate(out_px, axis=0),
-                tuple(padded_grids),
-                np.asarray(real_dims, dtype=np.int32),
-            )
-
         try:
             ctx = jax.sharding.use_mesh(self.mesh)
         except AttributeError:
@@ -758,7 +729,9 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 img_px_dev = _put(img_px, bf16=True)
                 real_llm_dims = None
                 if bucketing_on and img_px is not None and img_grid is not None:
-                    img_px_b, img_grid, real_dims_np = _bucket_pad(img_px, img_grid)
+                    img_px_b, img_grid, real_dims_np = bucket_pad_images(
+                        img_px, img_grid, merge_m, bucket_s
+                    )
                     img_px_dev = _put(img_px_b, bf16=True)
                     real_llm_dims = _put(real_dims_np)
                 # V-2 probe (design §5.3): count vision-encode jit (re)compiles. A miss = a
@@ -818,7 +791,18 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             chans = int(getattr(vcfg, "in_channels", None) or getattr(vcfg, "num_channels", 3))
             merge = int(getattr(vcfg, "spatial_merge_size", 2))
             patch_dim = chans * tpatch * patch * patch
-            side = max(merge, (int(max_patches**0.5) // merge) * merge)
+            # Round the probe side UP so side^2 >= max_patches (a sqrt-floor would under-measure,
+            # and T^2 attention amplifies even a small under-count past the 10% headroom -- MED-1).
+            s = int(max_patches**0.5)
+            if s * s < max_patches:
+                s += 1
+            side = max(merge, ((s + merge - 1) // merge) * merge)  # multiple of merge
+            # When V-2 bucketing is on, the runtime worst compile shape is the largest canonical
+            # bucket grid -> round the LLM-grid side up to a bucket multiple to match it.
+            bucket_s = int(getattr(self.server_args, "vision_bucket_size", 0) or 0)
+            if bucket_s > 0:
+                llm = ((side // merge + bucket_s - 1) // bucket_s) * bucket_s
+                side = llm * merge
             patches = side * side
             grid = ((1, side, side),)
             seq = patches // (merge * merge) + 16

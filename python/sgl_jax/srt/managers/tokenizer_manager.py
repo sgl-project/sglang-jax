@@ -343,6 +343,7 @@ class TokenizerManager:
             )
             input_ids = result["input_ids"]
             mm_inputs = result["mm_inputs"]
+            self._guard_vision_input_cap(mm_inputs)
         elif (
             getattr(self.model_config, "is_multimodal", False)
             and hasattr(obj, "contains_mm_input")
@@ -369,6 +370,31 @@ class TokenizerManager:
             input_ids = encoded["input_ids"]
         self._validate_one_request(obj, input_ids)
         return self._create_tokenized_object(obj, input_text, input_ids, mm_inputs=mm_inputs)
+
+    def _guard_vision_input_cap(self, mm_inputs: dict | None) -> None:
+        """G1 admission control (design §5.7): the vision HBM reserve is sized from
+        ``--vision-max-patches``; enforce that same cap here so an over-cap request is rejected at
+        the door (clear request-level error) instead of silently blowing through the reserve and
+        OOMing the server mid-forward -- the "sized-but-not-enforced" gap. Per-item: the ViT
+        encodes one item at a time, so the peak (and the cap) is the largest single item, not the
+        request total. Reads grids straight off ``mm_inputs`` (no multimodal import -> M1-safe).
+        No-op when the cap is unset (default). NOTE: audio length has no cap here yet -- the audio
+        tower is budgeted in the reserve from ``audio_config.max_source_positions``, but an audio
+        input cap (U1 audio tier) is still TODO; see g1-v2-budget-review HIGH-2."""
+        cap = getattr(self.server_args, "vision_max_patches", 0) or 0
+        if cap <= 0 or not mm_inputs:
+            return
+        for key in ("image_grid_thw", "video_grid_thw"):
+            for thw in mm_inputs.get(key) or []:
+                t, h, w = (int(x) for x in thw)
+                patches = t * h * w
+                if patches > cap:
+                    raise ValueError(
+                        f"Vision item exceeds --vision-max-patches: {patches} patches "
+                        f"(grid t={t},h={h},w={w}) > cap {cap}. The vision HBM reserve is sized "
+                        f"for <= {cap} patches/item; a larger item risks OOM. Reduce the input "
+                        f"resolution, or raise --vision-max-patches (and the HBM reserve)."
+                    )
 
     def _validate_one_request(
         self, obj: GenerateReqInput | EmbeddingReqInput, input_ids: list[int]
