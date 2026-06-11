@@ -65,6 +65,7 @@ class FusedEPMoE(nnx.Module):
         num_shared_experts: int = 0,
         moe_shared_expert_intermediate_size: int | None = None,
         quantization_config=None,
+        enable_act_quant: bool = True,
         # Profiling / ablation flags (primarily for microbenching).
         disable_a2a: bool = False,
         disable_dynamic_ffn1: bool = False,
@@ -123,6 +124,9 @@ class FusedEPMoE(nnx.Module):
         self.activation_quantized_dtype = (
             quantization_config.get_moe_activation_dtype() if quantization_config else None
         )
+        # Optional explicit disable for in-kernel activation quantization. The
+        # positive signal comes from quantization_config.moe_activation_dtype.
+        self.enable_act_quant_cfg = enable_act_quant
 
         # Initialize weights.
         self.w1 = nnx.Param(
@@ -209,8 +213,14 @@ class FusedEPMoE(nnx.Module):
         if self.quantized_dtype is None:
             return
 
-        # Default quant_block_k to 256 if not explicitly set.
-        wsz = self.quant_block_k if self.quant_block_k is not None else 256
+        # Determine quant_block_k. The v1 kernel requires a block size when
+        # scales are provided, so per-channel fp8 must tile to block-256; the v2
+        # kernel accepts per-channel (None).
+        wsz = (
+            self.quant_block_k
+            if self.quant_block_k is not None
+            else (None if isinstance(self, FusedEPMoEV2) else 256)
+        )
         if hasattr(self, "quant_block_k"):
             del self.quant_block_k
         self.quant_block_k = wsz
@@ -219,24 +229,36 @@ class FusedEPMoE(nnx.Module):
             if is_static:
                 ep_scale_sharding = P(("data", "tensor"), None, None, None)
 
-                # Scale placeholder shapes are (E, K//block_k, 1, N) for both
-                # 1D sub-channel and 2D block-wise quantization.  In the 2D case,
-                # _expand_moe_block_scale() expands the compact (E, K//bk, N//bn)
-                # scales to the same (E, K//bk, 1, N) layout at weight-loading
-                # time, so the kernel always sees the unified 1D shape.
-                w1_scale_shape = (
-                    self.num_experts,
-                    self.hidden_size // wsz,
-                    1,
-                    self.intermediate_dim,
-                )
-                w3_scale_shape = w1_scale_shape
-                w2_scale_shape = (
-                    self.num_experts,
-                    self.intermediate_dim // wsz,
-                    1,
-                    self.hidden_size,
-                )
+                if wsz is None:
+                    # Per-channel: scale shape (E, 1, 1, N)
+                    w1_scale_shape = (
+                        self.num_experts,
+                        1,
+                        1,
+                        self.intermediate_dim,
+                    )
+                    w3_scale_shape = w1_scale_shape
+                    w2_scale_shape = (
+                        self.num_experts,
+                        1,
+                        1,
+                        self.hidden_size,
+                    )
+                else:
+                    # Block-wise: scale shape (E, K//block_k, 1, N)
+                    w1_scale_shape = (
+                        self.num_experts,
+                        self.hidden_size // wsz,
+                        1,
+                        self.intermediate_dim,
+                    )
+                    w3_scale_shape = w1_scale_shape
+                    w2_scale_shape = (
+                        self.num_experts,
+                        self.intermediate_dim // wsz,
+                        1,
+                        self.hidden_size,
+                    )
 
                 if hasattr(self, "w1_scale"):
                     del self.w1_scale
@@ -507,4 +529,118 @@ class FusedEPMoE(nnx.Module):
         if out_sharding is None:
             out_sharding = jax.sharding.NamedSharding(self.mesh, P(*([None] * output.ndim)))
         output = jax.sharding.reshard(output, out_sharding)
+        return output
+
+
+class FusedEPMoEV2(FusedEPMoE):
+    """V2 fused EP-MoE layer using the Strix-style double-buffer kernel.
+
+    Inherits weight init and quantization from FusedEPMoE. Overrides __call__
+    to dispatch to fused_ep_moe_v2 with v2-specific flags.
+    """
+
+    def __call__(
+        self,
+        hidden_states: jax.Array,
+        topk_weights: jax.Array,
+        topk_ids: jax.Array,
+        *,
+        block_config=None,
+        out_sharding: jax.sharding.Sharding | None = None,
+    ) -> jax.Array:
+        from sgl_jax.srt.kernels.fused_moe.v2.kernel import fused_ep_moe_v2
+        from sgl_jax.srt.kernels.fused_moe.v2.tuned_block_configs import (
+            get_tuned_fused_moe_v2_block_config,
+        )
+
+        assert hidden_states.ndim == 2
+
+        w1_scale = self.w1_scale.value if self.w1_scale is not None else None
+        w3_scale = self.w3_scale.value if self.w3_scale is not None else None
+        w2_scale = self.w2_scale.value if self.w2_scale is not None else None
+
+        w1_shared_val = self.w1_shared.value if self.w1_shared is not None else None
+        w3_shared_val = self.w3_shared.value if self.w3_shared is not None else None
+        w2_shared_val = self.w2_shared.value if self.w2_shared is not None else None
+
+        # SE per-channel scales are stored 3D (1, 1, out); the v2 kernel reads them
+        # 2D (1, out). Squeeze here (not in quantize_weights, which the v1 path and
+        # the weight mapping consume in 3D form). None for bf16 SE weights (Mode 3).
+        w1_shared_scale = (
+            self.w1_shared_scale.value[:, 0, :] if self.w1_shared_scale is not None else None
+        )
+        w3_shared_scale = (
+            self.w3_shared_scale.value[:, 0, :] if self.w3_shared_scale is not None else None
+        )
+        w2_shared_scale = (
+            self.w2_shared_scale.value[:, 0, :] if self.w2_shared_scale is not None else None
+        )
+        # In-kernel act-quant (fp8 token, Mode 1) needs both a quant-config
+        # activation dtype and fp8 weights. Weight-only fp8 checkpoints stay in
+        # Mode 2 (bf16 token x fp8 weight).
+        enable_act_quant = (
+            self.activation_quantized_dtype is not None and self.enable_act_quant_cfg is not False
+        ) and (w1_scale is not None)
+
+        if block_config is None:
+            block_config = get_tuned_fused_moe_v2_block_config(
+                num_tokens=hidden_states.shape[0],
+                num_experts=self.num_experts,
+                top_k=self.num_experts_per_tok,
+                hidden_size=self.hidden_size,
+                intermediate_size=self.intermediate_dim,
+                dtype=hidden_states.dtype,
+                weight_dtype=self.w1.value.dtype,
+                ep_size=self.ep_size,
+                use_shared_expert=self.w1_shared is not None,
+                use_grouped_topk=self.use_grouped_topk,
+                enable_act_quant=enable_act_quant,
+            )
+
+        direct_scaled_dot = w1_scale is not None
+
+        output = fused_ep_moe_v2(
+            self.mesh,
+            hidden_states,
+            self.w1.value,
+            self.w2.value,
+            self.w3.value,
+            topk_weights,
+            topk_ids,
+            self.num_experts_per_tok,
+            act_fn=self.activation,
+            block_config=block_config,
+            disable_a2a=self.disable_a2a,
+            disable_dynamic_ffn1=self.disable_dynamic_ffn1,
+            disable_dynamic_ffn2=self.disable_dynamic_ffn2,
+            disable_weight_load=self.disable_weight_load,
+            disable_shared_expert=self.disable_shared_expert,
+            disable_sync_barrier=self.disable_sync_barrier,
+            quant_block_k=self.quant_block_k if hasattr(self, "quant_block_k") else None,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            w3_scale=w3_scale,
+            w1_shared=w1_shared_val,
+            w2_shared=w2_shared_val,
+            w3_shared=w3_shared_val,
+            w1_shared_scale=w1_shared_scale,
+            w2_shared_scale=w2_shared_scale,
+            w3_shared_scale=w3_shared_scale,
+            enable_act_quant=enable_act_quant,
+            direct_scaled_dot=direct_scaled_dot,
+            dp_axis_name="data",
+            tp_axis_name="tensor",
+        )
+
+        # Reshard the MoE output to the caller-requested layout. Under sequence
+        # parallelism out_sharding carries the SP-aware reduce_sharding
+        # (('data','tensor') on the scatter dim); without it we fall back to the
+        # plain DP layout P('data', None). b79f9951 dropped this arg and hardcoded
+        # the DP layout, which silently broke SP for MoE layers — restored here.
+        if out_sharding is not None:
+            output = jax.sharding.reshard(output, out_sharding)
+        else:
+            output = jax.sharding.reshard(
+                output, jax.sharding.NamedSharding(self.mesh, P("data", None))
+            )
         return output

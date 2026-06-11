@@ -1,0 +1,180 @@
+"""Auto-tuned block configs for fused_moe v2.
+
+Same lookup approach as v1/tuned_block_configs.py but with v2's simpler
+5-field FusedMoEBlockConfig (bt, bf, btc, bse, bts).
+"""
+
+# ruff: noqa: E501
+
+from __future__ import annotations
+
+import logging
+
+import jax.numpy as jnp
+
+from sgl_jax.srt.utils.jax_utils import get_device_name
+
+from .kernel import FusedMoEBlockConfig
+
+logger = logging.getLogger(__name__)
+
+# Key (without device_name):
+#   (tokens_dtype, weight_dtype, num_tokens, num_experts, top_k,
+#    hidden_size, intermediate_size, ep_size, use_shared_expert, use_grouped_topk,
+#    enable_act_quant)
+# enable_act_quant is the last field (Mode 1 fp8-token vs Mode 2 bf16-token want
+# different configs, esp. for shared-expert prefill). Lookup falls back to the
+# legacy 10-field key (no enable_act_quant) for pre-existing entries.
+#
+# Value: (bt, bf, btc, bse, bts)
+# fmt: off
+TUNED_BLOCK_CONFIGS: dict[str, dict[tuple, tuple[int, ...]]] = {
+    "TPU v7": {
+        # MiMo V2 Pro: E=384, H=6144, I=2048, top_k=8, fp8 e4m3, ep=32
+        # Decode configs (tuned 2026-05-21)
+        ('bfloat16', 'float8_e4m3fn', 64, 384, 8, 6144, 2048, 32, False, False): (8, 512, 8, 256, 8),
+        ('bfloat16', 'float8_e4m3fn', 128, 384, 8, 6144, 2048, 32, False, False): (8, 512, 8, 256, 8),
+        ('bfloat16', 'float8_e4m3fn', 256, 384, 8, 6144, 2048, 32, False, False): (8, 512, 16, 256, 16),
+        ('bfloat16', 'float8_e4m3fn', 512, 384, 8, 6144, 2048, 32, False, False): (16, 1024, 32, 256, 32),
+        # Prefill configs
+        ('bfloat16', 'float8_e4m3fn', 2048, 384, 8, 6144, 2048, 32, False, False): (128, 512, 128, 256, None),
+        ('bfloat16', 'float8_e4m3fn', 4096, 384, 8, 6144, 2048, 32, False, False): (128, 512, 128, 256, None),
+        ('bfloat16', 'float8_e4m3fn', 8192, 384, 8, 6144, 2048, 32, False, False): (128, 1024, 56, 256, 112),
+        ('bfloat16', 'float8_e4m3fn', 16384, 384, 8, 6144, 2048, 32, False, False): (256, 1024, 72, 256, 216),
+        # MiMo V2 Pro: E=384, H=6144, I=2048, top_k=8, fp8 e4m3, ep=8
+        # Decode configs (tuned on bench-4 single-host v7x-16, 2026-05-21)
+        ('bfloat16', 'float8_e4m3fn', 512, 384, 8, 6144, 2048, 8, False, False): (64, 1024, 32, 256, 32),
+        # Ling 2.6-1T: E=256, H=8192, I=2048, top_k=8, fp8 e4m3 per-channel, ep=32
+        # Tuned 2026-05-27
+        ('bfloat16', 'float8_e4m3fn', 64, 256, 8, 8192, 2048, 32, False, True): (8, 256, 8, 256, 8),
+        ('bfloat16', 'float8_e4m3fn', 128, 256, 8, 8192, 2048, 32, False, True): (8, 256, 8, 256, 8),
+        ('bfloat16', 'float8_e4m3fn', 256, 256, 8, 8192, 2048, 32, False, True): (8, 256, 16, 256, 16),
+        ('bfloat16', 'float8_e4m3fn', 512, 256, 8, 8192, 2048, 32, False, True): (16, 1024, 32, 256, 32),
+        ('bfloat16', 'float8_e4m3fn', 8192, 256, 8, 8192, 2048, 32, False, True): (128, 512, 160, 256, 160),
+        ('bfloat16', 'float8_e4m3fn', 16384, 256, 8, 8192, 2048, 32, False, True): (128, 512, 80, 256, 160),
+        # Ling 2.6-1T with in-kernel shared expert, act_quant ON (Mode 1: fp8 token
+        # x fp8 weight). 11-field key (last = enable_act_quant); use_grouped_topk=True
+        # because Ling routes with n_group=8. Tuned 2026-05-31. SE-on vs no-SE: same
+        # routed shape, bse maxed (per-block SE weight-DMA is the dominant SE cost).
+        # act-OFF (W8A16, bf16 token) is a different VMEM regime, not tuned here ->
+        # falls back to the legacy key / DEFAULT.
+        ('bfloat16', 'float8_e4m3fn', 64, 256, 8, 8192, 2048, 32, True, True, True): (8, 256, 8, 128, 8),
+        ('bfloat16', 'float8_e4m3fn', 128, 256, 8, 8192, 2048, 32, True, True, True): (8, 512, 16, 128, 16),
+        ('bfloat16', 'float8_e4m3fn', 256, 256, 8, 8192, 2048, 32, True, True, True): (8, 256, 16, 128, 16),
+        ('bfloat16', 'float8_e4m3fn', 512, 256, 8, 8192, 2048, 32, True, True, True): (16, 1024, 32, 1024, 32),
+        ('bfloat16', 'float8_e4m3fn', 8192, 256, 8, 8192, 2048, 32, True, True, True): (128, 512, 80, 512, 160),
+        ('bfloat16', 'float8_e4m3fn', 16384, 256, 8, 8192, 2048, 32, True, True, True): (128, 512, 80, 512, 160),
+    },
+    "*": {},
+}
+# fmt: on
+
+DEFAULT_V2_BLOCK_CONFIG = FusedMoEBlockConfig(
+    bt=32,
+    bf=512,
+    btc=32,
+    bse=256,
+)
+
+
+def get_simplified_key(
+    *,
+    dtype: jnp.dtype,
+    weight_dtype: jnp.dtype,
+    num_tokens: int,
+    num_experts: int,
+    top_k: int,
+    hidden_size: int,
+    intermediate_size: int,
+    ep_size: int,
+    use_shared_expert: bool,
+    use_grouped_topk: bool,
+    enable_act_quant: bool = False,
+) -> tuple:
+    if ep_size <= 0:
+        raise ValueError(f"Expected {ep_size=} to be > 0.")
+    if num_tokens % ep_size != 0:
+        raise ValueError(f"Expected {num_tokens=} to be aligned to {ep_size=}.")
+
+    device = get_device_name()
+    dtype_name = jnp.dtype(dtype).name
+    weight_dtype_name = jnp.dtype(weight_dtype).name
+    return (
+        device,
+        dtype_name,
+        weight_dtype_name,
+        num_tokens,
+        num_experts,
+        top_k,
+        hidden_size,
+        intermediate_size,
+        ep_size,
+        bool(use_shared_expert),
+        bool(use_grouped_topk),
+        bool(enable_act_quant),
+    )
+
+
+def get_tuned_fused_moe_v2_block_config(
+    *,
+    num_tokens: int,
+    num_experts: int,
+    top_k: int,
+    hidden_size: int,
+    intermediate_size: int,
+    dtype: jnp.dtype,
+    weight_dtype: jnp.dtype,
+    ep_size: int,
+    use_shared_expert: bool = False,
+    use_grouped_topk: bool = False,
+    enable_act_quant: bool = False,
+) -> FusedMoEBlockConfig:
+    keys = get_simplified_key(
+        dtype=dtype,
+        weight_dtype=weight_dtype,
+        num_tokens=num_tokens,
+        num_experts=num_experts,
+        top_k=top_k,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        ep_size=ep_size,
+        use_shared_expert=use_shared_expert,
+        use_grouped_topk=use_grouped_topk,
+        enable_act_quant=enable_act_quant,
+    )
+    device_name = keys[0]
+    table_key = keys[1:]  # includes enable_act_quant (last element)
+    # Backward compatible: prefer the act_quant-specific key, then fall back to
+    # the legacy key (without enable_act_quant) so pre-existing entries still hit.
+    table_key_legacy = table_key[:-1]
+
+    def _lookup(k):
+        cfg = None
+        if device_name in TUNED_BLOCK_CONFIGS:
+            cfg = TUNED_BLOCK_CONFIGS[device_name].get(k)
+        if cfg is None:
+            cfg = TUNED_BLOCK_CONFIGS.get("*", {}).get(k)
+        return cfg
+
+    cfg_tuple = _lookup(table_key)
+    if cfg_tuple is None:
+        cfg_tuple = _lookup(table_key_legacy)
+
+    if cfg_tuple is None:
+        return DEFAULT_V2_BLOCK_CONFIG
+
+    if len(cfg_tuple) != 5:
+        raise ValueError(f"Unexpected v2 tuned config tuple length: {len(cfg_tuple)}")
+
+    bt, bf, btc, bse, bts = cfg_tuple
+    logger.info(
+        "Using v2 tuned block config: num_tokens=%d bt=%d bf=%d btc=%d bse=%d bts=%s",
+        num_tokens,
+        bt,
+        bf,
+        btc,
+        bse,
+        bts,
+    )
+
+    return FusedMoEBlockConfig(bt=bt, bf=bf, btc=btc, bse=bse, bts=bts)

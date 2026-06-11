@@ -12,7 +12,7 @@ from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, get_rope
-from sgl_jax.srt.layers.fused_moe import FusedEPMoE
+from sgl_jax.srt.layers.fused_moe import FusedEPMoE, FusedEPMoEV2
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
@@ -106,14 +106,29 @@ class MiMoV2Moe(nnx.Module):
             self.correction_bias = None
 
         self.moe_backend = getattr(config, "moe_backend", "epmoe")
-        self.use_fused = self.moe_backend == "fused"
+        self.use_fused = self.moe_backend in ("fused", "fused_v2")
 
         self.topk = TopK(
             topk=num_experts_per_tok,
             renormalize=getattr(config, "norm_topk_prob", True),
         )
 
-        if self.use_fused:
+        if self.moe_backend == "fused_v2":
+            self.experts = FusedEPMoEV2(
+                hidden_size=config.hidden_size,
+                num_experts=num_experts,
+                num_experts_per_tok=num_experts_per_tok,
+                intermediate_dim=moe_intermediate_size,
+                mesh=mesh,
+                activation="silu",
+                ep_size=config.ep_size,
+                weight_dtype=dtype,
+                dtype=dtype,
+                layer_id=layer_id,
+                renormalize_topk_logits=getattr(config, "norm_topk_prob", True),
+                quantization_config=getattr(config, "quantization_config", None),
+            )
+        elif self.use_fused:
             self.experts = FusedEPMoE(
                 hidden_size=config.hidden_size,
                 num_experts=num_experts,
@@ -805,7 +820,7 @@ class MiMoV2FlashForCausalLM(nnx.Module):
                 # FusedEPMoE scales must live on the model mesh (data, tensor)
                 # to avoid expert-mesh NamedSharding conflicts in shard_map.
                 # EPMoE scales stay on the expert mesh.
-                use_model_mesh_for_scale = moe_backend == "fused"
+                use_model_mesh_for_scale = moe_backend in ("fused", "fused_v2")
                 for key, mapping in moe_mappings.items():
                     augmented[key] = mapping
                     # Add scale mapping for each MoE group

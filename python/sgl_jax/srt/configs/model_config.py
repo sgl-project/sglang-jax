@@ -36,7 +36,30 @@ class MoEBackend(str, Enum):
 
     EPMOE = "epmoe"  # Native Expert Parallel MoE (default)
     FUSED = "fused"  # Fused Kernel (TPU-optimized)
+    FUSED_V2 = "fused_v2"  # Fused Kernel V2 (Strix-style double-buffer)
     AUTO = "auto"  # Automatically select based on ep_size
+
+
+_FUSED_MOE_V2_SUPPORTED_ARCHITECTURES = frozenset(
+    {
+        "BailingMoEForCausalLM",
+        "BailingMoeForCausalLM",
+        "BailingMoeV2ForCausalLM",
+        "BailingMoeV2_5ForCausalLM",
+        "MiMoV2ForCausalLM",
+        "MiMoV2FlashForCausalLM",
+    }
+)
+
+
+def _assert_fused_moe_v2_supported(moe_backend: MoEBackend, architectures: list[str]) -> None:
+    if moe_backend != MoEBackend.FUSED_V2:
+        return
+
+    assert any(arch in _FUSED_MOE_V2_SUPPORTED_ARCHITECTURES for arch in architectures), (
+        "moe_backend='fused_v2' only supports Bailing/MiMo model architectures for now; "
+        f"got architectures={architectures}"
+    )
 
 
 class ModelConfig:
@@ -59,7 +82,6 @@ class ModelConfig:
         moe_backend: str | MoEBackend = MoEBackend.AUTO,
         model_sub_dir: str | None = None,
     ) -> None:
-
         self.model_path = model_path
         self.model_sub_dir = model_sub_dir
         self.revision = revision
@@ -103,6 +125,13 @@ class ModelConfig:
             **kwargs,
         )
 
+        if not getattr(self.hf_config, "architectures", None):
+            raise ValueError(
+                f"Invalid model config for {model_path!r}: missing `architectures`. "
+                "Check that the model path points to a valid Hugging Face model directory."
+            )
+        _assert_fused_moe_v2_supported(self.moe_backend, self.hf_config.architectures)
+
         # Unify quantization config handling:
         # 1. User provided config path -> use it
         # 2. HF model has fp8 dict config -> auto-convert to QuantizationConfig
@@ -126,12 +155,6 @@ class ModelConfig:
 
         self.hf_text_config = get_hf_text_config(self.hf_config)
         self.sliding_window = getattr(self.hf_text_config, "sliding_window", None)
-
-        if not getattr(self.hf_config, "architectures", None):
-            raise ValueError(
-                f"Invalid model config for {model_path!r}: missing `architectures`. "
-                "Check that the model path points to a valid Hugging Face model directory."
-            )
 
         if is_draft_model and self.hf_config.architectures[0] == "DeepseekV3ForCausalLM":
             self.hf_config.architectures[0] = "DeepseekV3ForCausalLMNextN"
@@ -232,6 +255,19 @@ class ModelConfig:
             config, "image_token_index", None
         )
 
+    def _get_hf_quant_config(self):
+        hf_quant_config = getattr(self.hf_config, "quantization_config", None)
+        if hf_quant_config is None:
+            # compressed-tensors may use a separate compression_config field.
+            hf_quant_config = getattr(self.hf_config, "compression_config", None)
+        if (
+            hf_quant_config is not None
+            and not isinstance(hf_quant_config, (dict, QuantizationConfig))
+            and hasattr(hf_quant_config, "to_dict")
+        ):
+            hf_quant_config = hf_quant_config.to_dict()
+        return hf_quant_config
+
     def _resolve_quantization_config(self) -> QuantizationConfig | None:
         """Resolve and unify quantization config from multiple sources.
 
@@ -247,14 +283,18 @@ class ModelConfig:
         if self.quantization_config is not None:
             logger.info("Using user-provided quantization config")
             # Check if HF model also has fp8 config
-            hf_quant_config = getattr(self.hf_config, "quantization_config", None)
-            if isinstance(hf_quant_config, dict) and hf_quant_config.get("quant_method") == "fp8":
+            hf_quant_config = self._get_hf_quant_config()
+            if isinstance(hf_quant_config, dict) and hf_quant_config.get("quant_method") in (
+                "fp8",
+                "compressed-tensors",
+                "compressed_tensors",
+            ):
                 logger.info("Model has fp8 checkpoint, setting is_static_checkpoint=True")
                 self.quantization_config.is_static_checkpoint = True
             return self.quantization_config
 
         # 2. Check if HF model has quantization config
-        hf_quant_config = getattr(self.hf_config, "quantization_config", None)
+        hf_quant_config = self._get_hf_quant_config()
         # If it's already a QuantizationConfig object (from previous instantiation or cache)
         if isinstance(hf_quant_config, QuantizationConfig):
             return hf_quant_config
@@ -268,6 +308,13 @@ class ModelConfig:
                 ignored_layers = hf_quant_config.get("ignored_layers") or hf_quant_config.get(
                     "modules_to_not_convert"
                 )
+                moe_activation_dtype = None
+                if hf_quant_config.get("activation_scheme") == "dynamic":
+                    logger.info(
+                        "Detected dynamic FP8 activation scheme in checkpoint, "
+                        "enabling MoE activation quantization"
+                    )
+                    moe_activation_dtype = jnp.float8_e4m3fn
                 weight_block_size = hf_quant_config.get("weight_block_size")
                 if isinstance(weight_block_size, (list, tuple)) and len(weight_block_size) == 2:
                     weight_block_size = (int(weight_block_size[0]), int(weight_block_size[1]))
@@ -283,7 +330,7 @@ class ModelConfig:
                         }
                     ],
                     moe_weight_dtype=jnp.float8_e4m3fn,
-                    moe_activation_dtype=None,
+                    moe_activation_dtype=moe_activation_dtype,
                     ignored_layers=ignored_layers,
                     weight_block_size=weight_block_size,
                     # Static block scales are correct; the narrow-N guard targets
@@ -297,7 +344,7 @@ class ModelConfig:
                     )
                 return quant_config
 
-            elif quant_method == "compressed-tensors":
+            elif quant_method in ("compressed-tensors", "compressed_tensors"):
                 # Check if it's float-quantized (fp8)
                 format_type = hf_quant_config.get("format")
                 if format_type == "float-quantized":
@@ -312,7 +359,13 @@ class ModelConfig:
                         dynamic = cfg.get("dynamic", False)
                         type_ = cfg.get("type", "")
                         num_bits = cfg.get("num_bits", 0)
-                        return dynamic is True and type_ == "float" and num_bits == 8
+                        strategy = cfg.get("strategy")
+                        return (
+                            dynamic is True
+                            and type_ == "float"
+                            and num_bits == 8
+                            and strategy in (None, "token")
+                        )
 
                     # Check for 'input_activations' at the top level or in config_groups
                     found_act_config = False
@@ -334,14 +387,13 @@ class ModelConfig:
                                     found_act_config = True
                                     break
 
+                    moe_activation_dtype = None
                     if found_act_config:
-                        # Align with sglang `CompressedTensorsW8A16Fp8`: log the
-                        # checkpoint's dynamic activation config but skip enabling
-                        # it — we run weight-only FP8 (BF16 activations).
                         logger.info(
                             "Detected dynamic per-token FP8 activation in checkpoint, "
-                            "but using weight-only mode (W8A16) for this run"
+                            "enabling MoE activation quantization"
                         )
+                        moe_activation_dtype = jnp.float8_e4m3fn
 
                     # Detect weight strategy from config_groups (per-channel vs block).
                     # Ling-2.6-1T uses strategy="channel" → weight_block_size=None.
@@ -373,8 +425,7 @@ class ModelConfig:
                     )
                     if weight_strategy not in (None, "channel", "block", "tensor"):
                         raise NotImplementedError(
-                            f"Unsupported compressed-tensors weight strategy: "
-                            f"{weight_strategy!r}"
+                            f"Unsupported compressed-tensors weight strategy: {weight_strategy!r}"
                         )
 
                     # Read ignore list (e.g. router gates, lm_head, MTP layer).
@@ -395,7 +446,7 @@ class ModelConfig:
                             }
                         ],
                         moe_weight_dtype=jnp.float8_e4m3fn,
-                        moe_activation_dtype=None,
+                        moe_activation_dtype=moe_activation_dtype,
                         ignored_layers=list(ignored_layers),
                         weight_block_size=weight_block_size,
                     )
