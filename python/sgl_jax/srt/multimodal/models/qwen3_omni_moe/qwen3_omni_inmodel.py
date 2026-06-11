@@ -109,6 +109,56 @@ class Qwen3OmniMoeForConditionalGeneration(nnx.Module):
         """Continuous-mel audio -> [N_audio, hidden]. Follow-up: needs ForwardBatch audio fields."""
         return self.audio_tower(input_features, feature_lens)
 
+    def embed_mm(
+        self,
+        input_ids,
+        mm_pixel_values=None,
+        mm_grid_thw=None,
+        mm_pixel_values_videos=None,
+        mm_video_grid_thw=None,
+        mm_audio_features=None,
+        mm_audio_feature_lengths=None,
+    ):
+        """C-1 (design §5.2): full-sequence encode for the host encode pass. Returns the uniform
+        tuple ``(fused [seq, hidden], deepstack_sparse [num_levels, num_visual, hidden] or None,
+        visual_pos_mask [seq] bool or None)``. The deepstack is returned SPARSE (the per-level
+        visual features, NOT densified) plus a full-prompt visual placeholder mask, exactly the
+        format ScheduleBatch._merge_multimodal densifies per chunk via req.deepstack_visual_embedding
+        + req.deepstack_visual_pos_mask. Scheme B: input_ids clean; merge keys by token id."""
+        text_embed = self.model.model.embed_tokens(input_ids)
+        mod_embeds = []
+        multiscale = None
+        if mm_pixel_values is not None:
+            pool, ds_levels = self.encode_image(mm_pixel_values, mm_grid_thw)
+            mod_embeds.append(pool)
+            multiscale = jnp.stack(ds_levels, axis=0)
+        if mm_pixel_values_videos is not None:
+            vpool, vds = self.encode_image(mm_pixel_values_videos, mm_video_grid_thw)
+            mod_embeds.append(vpool)
+            vstack = jnp.stack(vds, axis=0)
+            multiscale = (
+                vstack if multiscale is None else jnp.concatenate([multiscale, vstack], axis=1)
+            )
+        if mm_audio_features is not None:
+            mod_embeds.append(
+                self.encode_audio(mm_audio_features, np.asarray(mm_audio_feature_lengths))
+            )
+        placeholder_ids = [
+            t
+            for t in (self.image_token_id, self.video_token_id, self.audio_token_id)
+            if t is not None
+        ]
+        fused = merge(text_embed, mod_embeds, placeholder_ids, input_ids, mesh=self.mesh).embed
+        deepstack = visual_pos_mask = None
+        if multiscale is not None:
+            visual_ids = jnp.asarray(
+                [t for t in (self.image_token_id, self.video_token_id) if t is not None],
+                dtype=input_ids.dtype,
+            )
+            visual_pos_mask = jnp.isin(input_ids, visual_ids)
+            deepstack = multiscale  # [num_levels, num_visual, hidden], sparse
+        return fused, deepstack, visual_pos_mask
+
     def __call__(self, forward_batch, memory_pools, logits_metadata):
         is_extend = forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
         if is_extend and forward_batch.contains_mm_inputs():

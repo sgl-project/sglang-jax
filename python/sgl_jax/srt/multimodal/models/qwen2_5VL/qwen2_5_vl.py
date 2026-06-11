@@ -115,14 +115,18 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
         mm_grid_thw=None,
         mm_pixel_values_videos=None,
         mm_video_grid_thw=None,
+        mm_audio_features=None,
+        mm_audio_feature_lengths=None,
     ):
-        """Full-sequence text-embed + ViT encode + merge -> fused ``[seq, hidden]`` (C-1,
-        design §5.2). The single source of truth for the in-model encode+merge: called both
-        in-forward by ``__call__`` (legacy per-batch path) and once-per-req by the host-side
-        encode pass (model_runner.encode_mm_reqs), which runs it over the FULL input_ids+pixels
-        and holds the result on ``req.multimodal_embedding`` so the scheduler slices it per
-        chunk -- no per-chunk re-encode and no chunk-boundary merge misalignment (B1/B2/B8).
-        Scheme B: input_ids is clean; merge keys by the raw image/video token id."""
+        """Full-sequence text-embed + ViT encode + merge (C-1, design §5.2). Returns the uniform
+        encode-pass tuple ``(fused [seq, hidden], deepstack_sparse_or_None, visual_pos_mask_or_None)``
+        (Qwen2.5-VL has no deepstack -> last two are None). The single source of truth for the
+        in-model encode+merge: called in-forward by ``__call__`` and once-per-req by the host-side
+        encode pass (model_runner.encode_mm_reqs), which runs it over the FULL input_ids+pixels and
+        holds the result on ``req.multimodal_embedding`` so the scheduler slices it per chunk -- no
+        per-chunk re-encode, no chunk-boundary merge misalignment (B1/B2/B8). Scheme B: input_ids
+        is clean; merge keys by the raw image/video token id. (mm_audio_* accepted for a uniform
+        signature with the audio models; unused here.)"""
         text_embed = self.model.embed_tokens(input_ids)
         mod_embeds = []
         if mm_pixel_values is not None:
@@ -130,7 +134,8 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
         if mm_pixel_values_videos is not None:
             mod_embeds.append(self.encode_video(mm_pixel_values_videos, mm_video_grid_thw))
         placeholder_ids = [t for t in (self.image_token_id, self.video_token_id) if t is not None]
-        return merge(text_embed, mod_embeds, placeholder_ids, input_ids, mesh=self.mesh).embed
+        fused = merge(text_embed, mod_embeds, placeholder_ids, input_ids, mesh=self.mesh).embed
+        return fused, None, None
 
     def __call__(
         self,
@@ -151,7 +156,7 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
                 forward_batch.mm_grid_thw,
                 forward_batch.mm_pixel_values_videos,
                 forward_batch.mm_video_grid_thw,
-            )
+            )[0]
 
         token_to_kv_pool = memory_pools.token_to_kv_pool
         hidden_states, layers_kv_fused, layers_callback_flag = self.model(

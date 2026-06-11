@@ -268,7 +268,12 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         # models that expose embed_mm (the in-model VLMs); None otherwise.
         @partial(
             jax.jit,
-            static_argnames=["model_state_def", "mm_grid_thw", "mm_video_grid_thw"],
+            static_argnames=[
+                "model_state_def",
+                "mm_grid_thw",
+                "mm_video_grid_thw",
+                "mm_audio_feature_lengths",
+            ],
         )
         def jitted_embed_mm(
             model_def,
@@ -279,6 +284,8 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             mm_grid_thw,
             mm_pixel_values_videos,
             mm_video_grid_thw,
+            mm_audio_features,
+            mm_audio_feature_lengths,
         ):
             model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
             model = nnx.merge(model_def, model_state)
@@ -288,6 +295,8 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 mm_grid_thw,
                 mm_pixel_values_videos,
                 mm_video_grid_thw,
+                mm_audio_features,
+                mm_audio_feature_lengths,
             )
 
         if hasattr(self.model, "embed_mm"):
@@ -298,6 +307,8 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 mm_grid_thw,
                 mm_pixel_values_videos,
                 mm_video_grid_thw,
+                mm_audio_features,
+                mm_audio_feature_lengths,
             ):
                 return jitted_embed_mm(
                     model_def,
@@ -308,6 +319,8 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                     mm_grid_thw,
                     mm_pixel_values_videos,
                     mm_video_grid_thw,
+                    mm_audio_features,
+                    mm_audio_feature_lengths,
                 )
 
             self.jitted_embed_mm = embed_mm_wrapper
@@ -642,17 +655,40 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                     continue
                 a = assemble(r.mm_inputs)
                 img_px, vid_px = a.get("pixel_values_images"), a.get("pixel_values_videos")
-                if img_px is None and vid_px is None:
+                aud_feats = a.get("audio_features")
+                if img_px is None and vid_px is None and aud_feats is None:
                     continue
+                # Audio: continuous-mel features (traced) + per-audio length (static; the tower
+                # chunks by it). Derive lengths from the attention mask like _assemble_inmodel_mm.
+                aud_len = None
+                if aud_feats is not None:
+                    mask = a.get("audio_feature_attention_mask")
+                    if mask is not None:
+                        m = np.asarray(mask)
+                        aud_len = (
+                            (int(m.sum()),)
+                            if m.ndim <= 1
+                            else tuple(int(x) for x in m.sum(axis=-1))
+                        )
+                    else:
+                        aud_len = (int(np.asarray(aud_feats).shape[-1]),)
                 input_ids = _put(np.asarray(r.origin_input_ids, dtype=np.int32))
-                fused = self.jitted_embed_mm(
+                fused, deepstack, pos_mask = self.jitted_embed_mm(
                     input_ids,
                     _put(img_px, bf16=True),
                     _thw(a.get("image_grid_thw")),
                     _put(vid_px, bf16=True),
                     _thw(a.get("video_grid_thw")),
+                    _put(aud_feats, bf16=True),
+                    aud_len,
                 )
                 r.multimodal_embedding = np.asarray(jax.device_get(fused))
+                # Deepstack (Qwen3-Omni): attach the SPARSE per-level visual features + the
+                # full-prompt visual mask; _merge_multimodal densifies them per chunk.
+                if deepstack is not None and pos_mask is not None:
+                    r.deepstack_visual_embedding = np.asarray(jax.device_get(deepstack))
+                    r.deepstack_visual_pos_mask = np.asarray(jax.device_get(pos_mask)).astype(bool)
+                    r.apply_for_deepstack = True
 
     def sample(
         self,
