@@ -152,6 +152,18 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         if not self.is_draft_worker:
             self.initialize_jit()
 
+        # G1 AOT-auto (design §5.7 option 3): when a vision max-patches bound is set, AOT-measure
+        # the encode jit's peak scratch (temp_size) for a tight HBM reserve. Best-effort -> 0 on
+        # failure, and _vision_activation_reserve_bytes falls back to the conservative closed form.
+        # Must run before init_memory_pool (it sizes the KV pool minus this reserve).
+        self._aot_vision_reserve = 0
+        if (
+            not self.is_draft_worker
+            and getattr(self, "jitted_embed_mm", None) is not None
+            and (getattr(server_args, "vision_max_patches", 0) or 0) > 0
+        ):
+            self._aot_vision_reserve = self._aot_vision_reserve_bytes()
+
         # Init memory pool and attention backends
         self.init_memory_pool(
             server_args.max_running_requests,
@@ -324,8 +336,12 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 )
 
             self.jitted_embed_mm = embed_mm_wrapper
+            # G1 AOT (design §5.7 option 3): handle to AOT-lower the encode jit at the max vision
+            # shape and read its XLA temp_size for a tight HBM reserve (best-effort).
+            self._embed_mm_aot = (jitted_embed_mm, model_def, model_state_def)
         else:
             self.jitted_embed_mm = None
+            self._embed_mm_aot = None
 
         self.jitted_sampler = partial(
             jitted_sampler,
@@ -704,6 +720,53 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                     r.deepstack_visual_embedding = np.asarray(jax.device_get(deepstack))
                     r.deepstack_visual_pos_mask = np.asarray(jax.device_get(pos_mask)).astype(bool)
                     r.apply_for_deepstack = True
+
+    def _aot_vision_reserve_bytes(self) -> int:
+        """G1 (design §5.7 option 3): AOT-lower the encode jit at the max vision shape and read
+        its XLA temp_size -> a tight HBM reserve. Best-effort: returns 0 on any failure so the
+        caller falls back to the conservative closed form. Runs once at startup."""
+        handle = getattr(self, "_embed_mm_aot", None)
+        max_patches = getattr(self.server_args, "vision_max_patches", 0) or 0
+        if handle is None or max_patches <= 0:
+            return 0
+        try:
+            jit_fn, model_def, model_state_def = handle
+            hf = self.model_config.hf_config
+            vcfg = getattr(hf, "vision_config", None) or getattr(
+                getattr(hf, "thinker_config", None), "vision_config", None
+            )
+            patch = int(getattr(vcfg, "patch_size", 14))
+            tpatch = int(getattr(vcfg, "temporal_patch_size", 2))
+            chans = int(getattr(vcfg, "in_channels", None) or getattr(vcfg, "num_channels", 3))
+            merge = int(getattr(vcfg, "spatial_merge_size", 2))
+            patch_dim = chans * tpatch * patch * patch
+            side = max(merge, (int(max_patches**0.5) // merge) * merge)
+            patches = side * side
+            grid = ((1, side, side),)
+            seq = patches // (merge * merge) + 16
+            repl = jax.sharding.NamedSharding(self.mesh, jax.sharding.PartitionSpec())
+            ids = jax.ShapeDtypeStruct((seq,), jnp.int32, sharding=repl)
+            px = jax.ShapeDtypeStruct((patches, patch_dim), jnp.bfloat16, sharding=repl)
+            compiled = jit_fn.lower(
+                model_def,
+                model_state_def,
+                self.model_state_leaves,
+                ids,
+                px,
+                grid,
+                None,
+                None,
+                None,
+                None,
+            ).compile()
+            temp = int(compiled.memory_analysis().temp_size_in_bytes)
+            logger.info(
+                "G1 AOT: vision encode temp_size=%.2f GiB @ %d patches", temp / (1024**3), patches
+            )
+            return int(temp * 1.1)  # 10% headroom
+        except Exception as e:  # noqa: BLE001 - best-effort probe; closed-form is the fallback
+            logger.warning("G1 AOT vision reserve probe failed (%s); using closed-form estimate", e)
+            return 0
 
     def sample(
         self,

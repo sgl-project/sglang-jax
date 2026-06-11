@@ -234,6 +234,11 @@ class ModelRunnerKVCacheMixin:
         max_patches = getattr(sa, "vision_max_patches", 0) or 0
         if max_patches <= 0:
             return 0
+        # Prefer the AOT-measured temp_size (tight) when the startup probe succeeded; else the
+        # conservative closed form below.
+        aot = getattr(self, "_aot_vision_reserve", 0) or 0
+        if aot > 0:
+            return aot
         hf = getattr(self.model_config, "hf_config", None)
         vcfg = getattr(hf, "vision_config", None) or getattr(
             getattr(hf, "thinker_config", None), "vision_config", None
