@@ -1563,8 +1563,10 @@ class Scheduler(
             if not self.last_batch.is_empty() and not self.last_batch.is_prefill_only:
                 if self.running_batch.is_empty():
                     self.running_batch = self.last_batch
-                elif not self._is_spec_decode_enabled():
-                    # Merge running_batch with prefill batch
+                elif not self._is_spec_decode_enabled() or self.enable_overlap:
+                    # Spec overlap keeps prefill and decode as separate forwards, but
+                    # once prefill has produced req-granular relay state it can join
+                    # the next decode batch through the normal batch merge.
                     self.running_batch.merge_batch(self.last_batch)
 
         # For prefill-only batch, filter out finished requests since they
@@ -1596,7 +1598,11 @@ class Scheduler(
 
         # Handle the cases where prefill is not allowed
         has_chunked_reqs = any(req is not None for req in self.chunked_reqs)
-        if self._is_spec_decode_enabled() and not self.running_batch.is_empty():
+        if (
+            self._is_spec_decode_enabled()
+            and not self.enable_overlap
+            and not self.running_batch.is_empty()
+        ):
             return None
         if (
             self.running_batch.batch_is_full or len(self.waiting_queue) == 0
