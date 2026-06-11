@@ -52,7 +52,7 @@ jobs:
               - ".github/workflows/coordinator.yml"
               - ".github/actions/**"
             pallas_kernel:
-              - "python/sgl_jax/kernels/**"
+              - "python/sgl_jax/srt/kernels/**"
               - "benchmark/kernels/**"
               - ".github/workflows/pr-test.yml"
               - ".github/workflows/coordinator.yml"
