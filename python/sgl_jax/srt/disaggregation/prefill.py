@@ -198,6 +198,9 @@ class SchedulerDisaggregationPrefillMixin:
             self.cur_batch = batch
 
             if batch:
+                for req in batch.reqs:
+                    if req.bootstrap_room is not None:
+                        self._pd_mark_time(req, "forward_start")
                 result = self.run_batch(batch)
                 self.process_prefill_chunk(batch, result)
             else:
@@ -220,6 +223,9 @@ class SchedulerDisaggregationPrefillMixin:
         if not pd_reqs:
             self.process_batch_result(batch, result)
             return
+
+        for req in pd_reqs:
+            self._pd_mark_time(req, "forward_done")
 
         self.set_next_batch_sampling_info_done(batch)
 
@@ -248,6 +254,26 @@ class SchedulerDisaggregationPrefillMixin:
                     metric_reason="kv_extraction",
                 )
                 continue
+            if (
+                self.disagg_use_d2h_staging
+                and getattr(req, "disagg_host_buffer_id", None) is None
+            ):
+                # Admission normally reserves the host slot in
+                # get_new_batch_prefill, but chunked-continuation and
+                # retract-readmit paths can reach handoff without one. Reserve
+                # lazily at this consumption choke point so the staging
+                # invariant holds by construction; release stays owned by the
+                # terminal callback via req.disagg_host_buffer_id.
+                pool = getattr(self.disagg_kv_manager, "host_pool", None)
+                bid = pool.reserve() if pool is not None else None
+                if bid is None:
+                    self._abort_prefill_req(
+                        req,
+                        f"host KV pool exhausted; cannot stage req_id={req_id!r}",
+                        metric_reason="host_pool_exhausted",
+                    )
+                    continue
+                req.disagg_host_buffer_id = bid
             sender = None
             try:
                 self._maybe_log_prefill_extract_debug(
@@ -263,6 +289,7 @@ class SchedulerDisaggregationPrefillMixin:
                 sender.attach_payload(
                     {"kv": device_kv},
                     use_d2h_staging=self.disagg_use_d2h_staging,
+                    buffer_id=getattr(req, "disagg_host_buffer_id", None),
                 )
                 self._pd_mark_time(req, "transfer_start")
                 sender.send()
@@ -293,6 +320,18 @@ class SchedulerDisaggregationPrefillMixin:
                 released = True
             else:
                 released = False
+                if self.disagg_use_d2h_staging:
+                    # D2H is done (copy_from_device blocks) and the pull is now
+                    # registered against the host buffer, so the prefill device
+                    # KV pool slot is no longer referenced. Free it here —
+                    # instead of waiting for the decode ack in the terminal
+                    # callback — to reclaim HBM early. This is what makes staging
+                    # actually relieve HBM pressure; the bounded host pool
+                    # provides admission backpressure. The host buffer stays
+                    # reserved until terminal. Idempotent vs the terminal
+                    # release: release_kv_cache no-ops once req_pool_idx is
+                    # cleared.
+                    self._release_prefill_kv_pool(req)
 
             def _on_terminal(req_obj=req, sender_obj=sender, _released=released):
                 self._on_prefill_transfer_terminal(req_obj, sender_obj, already_released=_released)
@@ -328,14 +367,15 @@ class SchedulerDisaggregationPrefillMixin:
 
         ts = req.pd_time_stats
         if ts is None:
-            ts = TimeStats("prefill")
+            role = getattr(self.server_args, "disaggregation_mode", "prefill")
+            ts = TimeStats(role)
             req.pd_time_stats = ts
         ts.mark(name)
 
     def _extract_req_kv(self: Scheduler, req: Req):
         """Gather prefilled KV from the paged pool for ``req``.
 
-        Returns shape ``(layer_num, padded_pages, page_size, ...)``.
+        Returns a per-layer list of ``(padded_pages, page_size, ...)`` arrays.
         """
 
         req_to_token = self.req_to_token_pool.req_to_token
@@ -375,22 +415,45 @@ class SchedulerDisaggregationPrefillMixin:
             )
         ]
         layer_kvs = _jit_gather_all_layers(layer_buffers, page_indices, gather_out_sharding)
-        stacked = jnp.stack(layer_kvs, axis=0)
         if jax.process_count() > 1:
-            # The gather output is TP-sharded across the global mesh. Expose
-            # only this host's shard as a fully-addressable local-mesh array;
-            # each P host registers its own 1/nproc slice and the matching D
-            # host (same jax_process_index) pulls exactly that slice.
+            # Multi-host: expose only this host's TP shard as a fully-addressable
+            # local-mesh array; each P host registers its 1/nproc slice and the
+            # matching D host (same jax_process_index) pulls exactly that slice.
+            stacked = jnp.stack(layer_kvs, axis=0)
             stacked.block_until_ready()
             return _global_to_local_shard(stacked)
-        return stacked
+        # Single-host: return the per-layer list. The D2H staging path
+        # (copy_from_device) consumes a ``list[jax.Array]``.
+        return layer_kvs
 
-    def _release_prefill_req_resources(self: Scheduler, req: Req) -> None:
-        """Release prefill-side KV and request-pool resources."""
+    def _release_prefill_kv_pool(self: Scheduler, req: Req) -> None:
+        """Release the prefill device KV cache + request-pool slot.
+
+        Idempotent: ``release_kv_cache`` no-ops once ``req.req_pool_idx`` is
+        cleared, so calling this both at staged D2H completion and again at the
+        terminal callback is safe.
+        """
 
         from sgl_jax.srt.mem_cache.common import release_kv_cache
 
         release_kv_cache(req, self.tree_cache)
+
+    def _release_prefill_req_resources(self: Scheduler, req: Req) -> None:
+        """Release prefill-side KV and request-pool resources."""
+
+        self._release_prefill_kv_pool(req)
+        self._release_prefill_host_buffer(req)
+
+    def _release_prefill_host_buffer(self: Scheduler, req: Req) -> None:
+        buffer_id = getattr(req, "disagg_host_buffer_id", None)
+        if buffer_id is None:
+            return
+        req.disagg_host_buffer_id = None
+        mgr = getattr(self, "disagg_kv_manager", None)
+        pool = mgr.host_pool if mgr is not None else None
+        if pool is not None:
+            with suppress(Exception):
+                pool.release(buffer_id)
 
     def _record_prefill_transfer_failure(self, reason: str) -> None:
         with suppress(Exception):

@@ -1286,10 +1286,8 @@ class ServerArgs:
             action=argparse.BooleanOptionalAction,
             default=ServerArgs.disaggregation_enable_d2h,
             help="Enable D2H staging on the prefill side: KV is copied into "
-            "a pinned-host buffer before remote pull. The current "
-            "default remains OFF until QueueHostKVPool is wired "
-            "end-to-end; use --disaggregation-enable-d2h only after "
-            "path A is fully plumbed.",
+            "an unpinned host-memory buffer before remote pull, bounding "
+            "prefill HBM pressure via the host pool. Default OFF.",
         )
         parser.add_argument(
             "--disaggregation-side-channel-port",
