@@ -126,6 +126,8 @@ class GenerationBatchResult:
     cache_miss_count: int
     # relay path: forward stream -> next step forward
     next_draft_input: EagleDraftInput | None = None
+    spec_relay_buffers: object | None = None
+    prefill_relay_future_indices: object | None = None
 
     num_accepted_tokens: int | None = None
     accept_lens: np.ndarray | None = None
@@ -2038,6 +2040,10 @@ class Scheduler(
             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
             bid=bid,
             cache_miss_count=cache_miss_count,
+            spec_relay_buffers=getattr(batch_output, "spec_relay_buffers", None),
+            prefill_relay_future_indices=getattr(
+                batch_output, "prefill_relay_future_indices", None
+            ),
         )
         if (
             self.spec_algorithm is not None

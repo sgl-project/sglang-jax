@@ -209,9 +209,9 @@ class EAGLEWorker(BaseSpecWorker):
                         dp_size=dp_size,
                         per_dp_bs_size=per_dp_bs,
                     )
-                    # Pad out_cache_loc to bs * draft_token_num so verify/draft_extend
-                    # forward see the same shape runtime _get_spec_decode_mwb_dp emits.
-                    ocl_target = bs * self.speculative_num_draft_tokens
+                    # Pad out_cache_loc to the conservative decode allocation
+                    # bucket used by runtime _get_spec_decode_mwb_dp.
+                    ocl_target = bs * self.speculative_num_draft_tokens * 2
                     if batch.out_cache_loc.shape[0] < ocl_target:
                         pad_len = ocl_target - batch.out_cache_loc.shape[0]
                         batch.out_cache_loc = np.concatenate(

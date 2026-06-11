@@ -21,6 +21,7 @@ import pytest
 from sgl_jax.srt.managers.schedule_batch import ScheduleBatch, ScheduleReqsInfo
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
+from sgl_jax.srt.speculative.overlap_utils import resolve_spec_prefill_token_ids
 from sgl_jax.srt.speculative.overlap_worker import resolve_spec_decode_token_ids
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 
@@ -159,6 +160,38 @@ def test_get_spec_decode_mwb_dp_shapes(dp, bs_per_rank):
         assert np.all(seg[:bs] > 0), f"rank {r} real slots zero: {seg}"
         assert np.all(seg[bs:] == 0), f"rank {r} pad slots nonzero: {seg}"
     assert mwb.spec_info_padded is not None
+
+
+def test_get_spec_decode_mwb_uses_conservative_bucket_for_out_cache_loc():
+    sb = _mk_batch(4, [2, 2, 2, 2])
+    sb.reqs_info[1].out_cache_loc = np.arange(2000, 2232, dtype=np.int32)
+
+    mwb = sb.get_spec_model_worker_batch(
+        token_paddings=[128],
+        bs_paddings=[128],
+        cache_loc_paddings=[1024],
+        page_size=256,
+        draft_token_num=DRAFT_N,
+    )
+
+    assert len(mwb.out_cache_loc) == 1024
+    ocl = np.asarray(mwb.out_cache_loc).reshape(4, 256)
+    assert list(ocl[1, :232]) == list(range(2000, 2232))
+    assert np.all(ocl[1, 232:] == -1)
+
+
+def test_get_spec_decode_mwb_rejects_out_cache_loc_bucket_escape():
+    sb = _mk_batch(4, [2, 2, 2, 2])
+    sb.reqs_info[1].out_cache_loc = np.arange(2000, 2257, dtype=np.int32)
+
+    with pytest.raises(AssertionError, match="escaped precompile bucket"):
+        sb.get_spec_model_worker_batch(
+            token_paddings=[128],
+            bs_paddings=[128],
+            cache_loc_paddings=[1024],
+            page_size=256,
+            draft_token_num=DRAFT_N,
+        )
 
 
 @pytest.mark.parametrize(
@@ -497,6 +530,66 @@ def test_resolve_spec_decode_token_ids(dp, bs_per_rank, accept_per_slot):
                 ), f"slot {slot}: got {out[slot]}, want {a} tokens from {slot*1000}"
             else:
                 assert out[slot] == [], f"pad slot {slot} should be []"
+
+
+def test_resolve_spec_prefill_token_ids_uses_prepared_result_tokens(monkeypatch):
+    sb = _mk_batch(4, [2, 1, 0, 1])
+
+    def fail_gather(*args, **kwargs):
+        raise AssertionError("prefill output resolver must not gather relay buffers")
+
+    monkeypatch.setattr(
+        "sgl_jax.srt.speculative.relay_buffer.gather_spec_relay_verified_id",
+        fail_gather,
+    )
+    result = SimpleNamespace(
+        bid=7,
+        next_token_ids=np.asarray([11, 12, 0, 21, 0, 0, 0, 41], dtype=np.int32),
+    )
+
+    out = resolve_spec_prefill_token_ids(result, sb, relay_buffers=object(), mesh=None)
+
+    assert out == [11, 12, 0, 21, 0, 0, 0, 41]
+
+
+def test_resolve_spec_prefill_token_ids_requires_prepared_result_tokens():
+    sb = _mk_batch(2, [1, 1])
+    result = SimpleNamespace(
+        bid=8,
+        next_token_ids=None,
+    )
+
+    with pytest.raises(RuntimeError, match="prepared next_token_ids"):
+        resolve_spec_prefill_token_ids(result, sb, relay_buffers=object(), mesh=None)
+
+
+def test_resolve_spec_prefill_token_ids_prefetches_prepared_result_tokens():
+    sb = _mk_batch(2, [1, 1])
+
+    class PreparedTokens:
+        def __init__(self):
+            self.prefetched = False
+            self.values = np.asarray([3, 4], dtype=np.int32)
+
+        @property
+        def shape(self):
+            return self.values.shape
+
+        def copy_to_host_async(self):
+            self.prefetched = True
+
+        def __array__(self, dtype=None, copy=None):
+            if dtype is not None:
+                return self.values.astype(dtype, copy=False)
+            return self.values
+
+    prepared = PreparedTokens()
+    result = SimpleNamespace(bid=9, next_token_ids=prepared)
+
+    out = resolve_spec_prefill_token_ids(result, sb, relay_buffers=object(), mesh=None)
+
+    assert prepared.prefetched
+    assert out == [3, 4]
 
 
 # ---------------------------------------------------------------------------

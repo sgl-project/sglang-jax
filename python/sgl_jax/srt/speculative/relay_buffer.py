@@ -131,6 +131,23 @@ def gather_spec_relay_buffers(
     )
 
 
+def gather_spec_relay_verified_id(
+    buffers: SpecRelayBuffers,
+    future_indices,
+    *,
+    dp_size: int,
+):
+    """Gather DP-padded verified ids from the relay buffer."""
+    per_dp_bs = future_indices.shape[0] // dp_size
+    indices = future_indices.reshape((dp_size, per_dp_bs))
+    dp_indices = jnp.arange(dp_size, dtype=jnp.int32)[:, None]
+    return (
+        buffers.verified_id.at[dp_indices, indices]
+        .get(out_sharding=RELAY_ID_SPEC)
+        .reshape(future_indices.shape)
+    )
+
+
 def scatter_future_indices_to_dp_slots(
     per_dp_indices,
     *,

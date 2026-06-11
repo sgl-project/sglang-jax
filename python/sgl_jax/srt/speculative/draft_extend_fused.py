@@ -52,6 +52,18 @@ class FusedDraftExtendPendingResult(NamedTuple):
     updated_relay_buffers: object | None
 
 
+def _prepare_spec_prefill_output_token_ids(draft_worker, next_token_ids):
+    if draft_worker.mesh is None:
+        return next_token_ids
+    if not hasattr(draft_worker, "_spec_prefill_output_gather_fn"):
+        replicated_sharding = NamedSharding(draft_worker.mesh, P())
+        draft_worker._spec_prefill_output_gather_fn = jax.jit(
+            lambda x: x,
+            out_shardings=replicated_sharding,
+        )
+    return draft_worker._spec_prefill_output_gather_fn(next_token_ids)
+
+
 def _take_with_index_sharding(values, index):
     index_sharding = jax.typeof(index).sharding
     if isinstance(index_sharding, NamedSharding):
@@ -815,7 +827,7 @@ def _build_fused_greedy_prefill_jit(num_layers: int, topk: int):
         relay_topk_index = stacked_idx
         relay_verified_id = next_token_ids
         relay_new_seq_lens = target_forward_batch.seq_lens + 1
-        if mesh is not None:
+        if mesh is not None and not update_relay:
             rep = NamedSharding(mesh, P())
             next_token_ids = jax.sharding.reshard(jnp.copy(next_token_ids), rep)
             selected_layer0_hidden = jax.sharding.reshard(selected_layer0_hidden, rep)
@@ -1296,6 +1308,14 @@ def spec_prefill(spec_worker, model_worker_batch, launch_done=None, *, update_re
             update_relay=update_relay,
         )
         cache_miss_count = count()
+    prefill_output_token_ids = None
+    if update_relay:
+        prefill_output_token_ids = _prepare_spec_prefill_output_token_ids(
+            draft_worker,
+            next_token_ids,
+        )
+        if hasattr(prefill_output_token_ids, "copy_to_host_async"):
+            prefill_output_token_ids.copy_to_host_async()
 
     if launch_done is not None:
         launch_done.set()
@@ -1310,7 +1330,6 @@ def spec_prefill(spec_worker, model_worker_batch, launch_done=None, *, update_re
     if update_relay:
         from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
 
-        jax.copy_to_host_async(next_token_ids)
         future_indices = np.asarray(model_worker_batch.req_pool_indices, dtype=np.int32)[sel]
         model_worker_batch.spec_info_padded = EagleDraftInput(
             future_indices=future_indices,
@@ -1321,8 +1340,10 @@ def spec_prefill(spec_worker, model_worker_batch, launch_done=None, *, update_re
         )
         return GenerationBatchResult(
             logits_output=logits_output,
-            next_token_ids=next_token_ids,
+            next_token_ids=prefill_output_token_ids,
             next_draft_input=model_worker_batch.spec_info_padded,
+            spec_relay_buffers=updated_relay_buffers,
+            prefill_relay_future_indices=relay_future_indices,
             bid=model_worker_batch.bid,
             cache_miss_count=cache_miss_count,
             extend_input_len_per_req=None,

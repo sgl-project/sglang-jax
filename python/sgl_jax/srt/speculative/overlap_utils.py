@@ -1,9 +1,17 @@
 import numpy as np
 
 
-def resolve_spec_prefill_token_ids(result, batch):
-    """Resolve prefill next-token ids after the next batch has been launched."""
-    return np.asarray(result.next_token_ids).tolist()
+def resolve_spec_prefill_token_ids(result, batch, relay_buffers, mesh):
+    """Resolve prefill next-token ids prepared by the producer path."""
+    token_ids_arr = result.next_token_ids
+    if token_ids_arr is None:
+        raise RuntimeError(
+            "Spec prefill overlap result is missing prepared next_token_ids "
+            f"for bid={getattr(result, 'bid', None)}"
+        )
+    if hasattr(token_ids_arr, "copy_to_host_async"):
+        token_ids_arr.copy_to_host_async()
+    return np.asarray(token_ids_arr).tolist()
 
 
 def publish_spec_decode_new_seq_lens(batch_output):

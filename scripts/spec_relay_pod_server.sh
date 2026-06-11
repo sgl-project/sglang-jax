@@ -107,6 +107,9 @@ pids="$(
     | awk '
       /\/opt\/venv\/bin\/python -u -m sgl_jax\.launch_server/ {print $1}
       /bash -lc cd \/tmp\/sglang-jax .*sgl_jax\.launch_server.*nohup/ {print $1}
+      /sglang::scheduler/ {print $1}
+      /sglang-jax::detokenizer/ {print $1}
+      /evalscope eval/ {print $1}
     ' \
     | sort -u
 )"

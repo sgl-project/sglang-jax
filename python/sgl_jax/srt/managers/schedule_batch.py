@@ -2415,10 +2415,18 @@ class ScheduleBatch:
             )
             for i in self.reqs_info
         ]
-        # Pad each rank's out_cache_loc to per_dp_bs * draft_token_num so the
-        # merged shape is stable across runtime bs. max_chunk_len defensive.
+        # Spec prepare_for_decode conservatively reserves up to
+        # 2 * ALLOC_LEN_PER_DECODE tokens per request. Keep the JIT-visible
+        # out_cache_loc shape on that same conservative bucket instead of the
+        # smaller draft-token count, otherwise high-running batches can escape
+        # precompile with shapes like 656/928/1024.
         max_chunk_len = max((len(c) for c in ocl_chunks), default=0)
-        target_per_rank_ocl = max(per_dp_bs * draft_token_num, max_chunk_len)
+        target_per_rank_ocl = per_dp_bs * draft_token_num * 2
+        assert max_chunk_len <= target_per_rank_ocl, (
+            "spec decode out_cache_loc escaped precompile bucket: "
+            f"max_chunk_len={max_chunk_len}, bucket_per_rank={target_per_rank_ocl}, "
+            f"per_dp_bs={per_dp_bs}, draft_token_num={draft_token_num}"
+        )
         out_cache_loc = (
             np.concatenate(
                 [
