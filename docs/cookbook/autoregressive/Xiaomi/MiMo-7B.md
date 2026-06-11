@@ -1,0 +1,396 @@
+---
+title: "MiMo-7B"
+---
+
+# MiMo-7B on SGL-JAX
+
+> **Validated recipe** — MiMo-7B-RL has TPU v6e-4 speed and GSM8K results.
+
+## 1. Model Introduction
+
+[**XiaomiMiMo/MiMo-7B-RL**](https://huggingface.co/XiaomiMiMo/MiMo-7B-RL) is Xiaomi's RL-tuned 7B-parameter dense decoder trained with reasoning-oriented objectives — built on the Qwen 2 base architecture. Fits comfortably on a single TPU v6e-4 host.
+
+**Key Features**:
+
+- **Compact 7B dense decoder**: BF16 weights ~14 GB — fits comfortably on a single TPU v6e-4 host. Lowest-cost reasoning-capable model in the cookbook.
+- **RL-tuned for reasoning**: Reinforcement-learning post-training maximizes chain-of-thought quality on math benchmarks; default choice for reasoning workloads. GSM8K **0.920** (§4.1).
+- **Hybrid Reasoning**: thinking-on (default) and thinking-off via `chat_template_kwargs.enable_thinking` per-request — use `--reasoning-parser mimo` to expose `reasoning_content` (§3.2).
+- **OpenAI-compatible tool calling**: `--tool-call-parser mimo` exposes `tool_calls` on the response — see §3.3 for streaming + multi-turn examples.
+
+**Recommended Generation Parameters**: `temperature=0.7`, `top_p=0.95`, `max_tokens=2048+` (give room for reasoning).
+
+**License**: see the [MiMo-7B-RL model card](https://huggingface.co/XiaomiMiMo/MiMo-7B-RL) for the authoritative license terms.
+
+## 2. Deployment
+
+### 2.1 Hardware Matrix
+
+| Model | TPU | Topology | Chips | `--tp-size` | Notes |
+|---|---|---|---|---|---|
+| MiMo-7B-RL | **v6e-4** | 2x2 | 4 | 4 | This is the slice we measured on. BF16 weights ~14 GB — fits with headroom; single-host serving. |
+
+See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation reference. For other slices (larger v6e, v7x variants), see [Adapting to other topologies](../../base/tpu-topology-reference.md#adapting-to-other-topologies).
+
+### 2.2 Environment
+
+Install per [Install guide](../../../get_started/install.md) and use [Single-host Docker template](../../deployment/single-host-docker.md) for the container setup.
+
+### 2.3 Launch
+
+#### Single-host — TPU v6e-4
+
+```bash
+JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -m sgl_jax.launch_server \
+  --model-path XiaomiMiMo/MiMo-7B-RL \
+  --trust-remote-code \
+  --tp-size 4 \
+  --device tpu \
+  --dtype bfloat16 \
+  --mem-fraction-static 0.88 \
+  --skip-server-warmup \
+  --host 0.0.0.0 --port 30000
+```
+
+### 2.4 Configuration Tips
+
+**Memory Management:**
+- `--mem-fraction-static 0.88` is the TPU default. Raise to `0.9` for dedicated serving / higher concurrency.
+
+**Tool Calling:**
+- MiMo-7B-RL uses the `mimo` tool-call parser format. Add `--tool-call-parser mimo` when using the OpenAI tools API. See [§3.3](#33-tool-calling) for the request/response pattern.
+
+**Reasoning Parser:**
+- MiMo-7B-RL uses `--reasoning-parser mimo` (alias of the `qwen3` reasoning parser — same `<think>...</think>` format + `enable_thinking` switch). Append to the §2.3 launch command to expose `reasoning_content` separated from `content`.
+- Pass `extra_body={"chat_template_kwargs": {"enable_thinking": true}}` per-request to unlock chain-of-thought outputs.
+- See §3.2 for the streaming Python client showing the reasoning / content section split.
+
+**Compilation Cache Hygiene:**
+- `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache` is mandatory — without it, first request blocks ~4 min while XLA/Pallas re-compiles.
+
+For full flag definitions see [Launch flags reference](../../base/launch-flags-reference.md).
+
+## 3. Invocation
+
+### 3.1 Basic Chat Completion
+
+For full cURL + native `/generate` patterns see [Basic API usage](../../base/basic-api-usage.md). For thinking + content streaming see §3.2, for tool calling see §3.3.
+
+Short Python OpenAI client example:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:30000/v1", api_key="EMPTY")
+
+resp = client.chat.completions.create(
+    model="XiaomiMiMo/MiMo-7B-RL",
+    messages=[{"role": "user", "content": "Hello, who are you?"}],
+    temperature=0.7,
+    top_p=0.95,
+    max_tokens=2048,
+)
+print(resp.choices[0].message.content)
+```
+
+### 3.2 Reasoning (thinking-on default, thinking-off optional)
+
+MiMo-7B-RL uses the `mimo` reasoning parser. Append `--reasoning-parser mimo` to the §2.3 launch command. Thinking-on is the default; turn it off per-request via `chat_template_kwargs`.
+
+#### Thinking-on (default) — streaming with separated reasoning/content
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://127.0.0.1:30000/v1", api_key="EMPTY")
+
+response = client.chat.completions.create(
+    model="XiaomiMiMo/MiMo-7B-RL",
+    messages=[{"role": "user", "content": "Solve step by step: what is 15% of 240?"}],
+    extra_body={"chat_template_kwargs": {"enable_thinking": True}},
+    stream=True,
+)
+
+thinking_started = False
+content_started = False
+for chunk in response:
+    if not chunk.choices:
+        continue
+    delta = chunk.choices[0].delta
+    if hasattr(delta, "reasoning_content") and delta.reasoning_content:
+        if not thinking_started:
+            print("=============== Thinking =================", flush=True)
+            thinking_started = True
+        print(delta.reasoning_content, end="", flush=True)
+    if delta.content:
+        if thinking_started and not content_started:
+            print("\n=============== Content =================", flush=True)
+            content_started = True
+        print(delta.content, end="", flush=True)
+print()
+```
+
+**Output Example:**
+
+```text
+=============== Thinking =================
+The user is asking how many seconds in a day.
+A day has 24 hours. Each hour has 60 minutes. Each minute has 60 seconds.
+So: 24 × 60 × 60 = 24 × 3600 = 86400.
+=============== Content =================
+
+There are **86,400 seconds in a day**.
+```
+
+#### Thinking-off (instant answer)
+
+```python
+response = client.chat.completions.create(
+    model="XiaomiMiMo/MiMo-7B-RL",
+    messages=[{"role": "user", "content": "What's the capital of France?"}],
+    extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+)
+print(response.choices[0].message.content)
+```
+
+### 3.3 Tool Calling
+
+MiMo-7B-RL uses the `mimo` tool-call parser (same key as the reasoning parser). Append `--tool-call-parser mimo` to the §2.3 launch command. Pass `tools=[...]` per the OpenAI function-calling schema:
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://127.0.0.1:30000/v1", api_key="EMPTY")
+
+tools = [{
+    "type": "function",
+    "function": {
+        "name": "get_weather",
+        "description": "Get the current weather for a location",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "location": {"type": "string", "description": "City name"},
+                "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]},
+            },
+            "required": ["location"],
+        },
+    },
+}]
+
+response = client.chat.completions.create(
+    model="XiaomiMiMo/MiMo-7B-RL",
+    messages=[{"role": "user", "content": "What's the weather in Beijing?"}],
+    tools=tools,
+    tool_choice="auto",
+    stream=True,
+)
+
+tool_calls_accumulator = {}
+for chunk in response:
+    if not chunk.choices:
+        continue
+    delta = chunk.choices[0].delta
+    if hasattr(delta, "tool_calls") and delta.tool_calls:
+        for tc in delta.tool_calls:
+            acc = tool_calls_accumulator.setdefault(tc.index, {"name": None, "arguments": ""})
+            if tc.function:
+                if tc.function.name:
+                    acc["name"] = tc.function.name
+                if tc.function.arguments:
+                    acc["arguments"] += tc.function.arguments
+    if delta.content:
+        print(delta.content, end="", flush=True)
+
+for idx, tc in sorted(tool_calls_accumulator.items()):
+    print(f"🔧 Tool Call: {tc['name']}")
+    print(f"   Arguments: {tc['arguments']}")
+print()
+```
+
+**Output Example:**
+
+```text
+=============== Thinking =================
+The user asked about Beijing weather. I should call get_weather with location="Beijing".
+The unit isn't specified — Beijing uses celsius, I'll go with that.
+=============== Content =================
+
+🔧 Tool Call: get_weather
+   Arguments: {"location": "Beijing", "unit": "celsius"}
+```
+
+#### Handling Tool Call Results (multi-turn)
+
+After the model returns a tool call, run the function locally and send the result back as a `tool` role message so the model can produce a natural-language answer:
+
+```python
+import json
+
+def get_weather(location, unit="celsius"):
+    return f"22°{unit[0].upper()} and sunny"
+
+first_idx = sorted(tool_calls_accumulator.keys())[0]
+first_call = tool_calls_accumulator[first_idx]
+args = json.loads(first_call["arguments"])
+tool_result = get_weather(**args)
+
+messages = [
+    {"role": "user", "content": "What's the weather in Beijing?"},
+    {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [{
+            "id": "call_1",
+            "type": "function",
+            "function": {
+                "name": first_call["name"],
+                "arguments": first_call["arguments"],
+            },
+        }],
+    },
+    {"role": "tool", "tool_call_id": "call_1", "content": tool_result},
+]
+
+final = client.chat.completions.create(
+    model="XiaomiMiMo/MiMo-7B-RL",
+    messages=messages,
+)
+# On thinking-on hybrid models, the final response may put text in reasoning_content
+# alongside (or instead of) content — print both to avoid misleading None output.
+print("Reasoning:", final.choices[0].message.reasoning_content)
+print("Content:  ", final.choices[0].message.content)
+```
+
+**Output Example:**
+
+```text
+Reasoning: The weather tool returned 22°C and sunny — a comfortable day for outdoor activities.
+I should give a concise natural-language answer.
+Content:   It's currently 22°C and sunny in Beijing.
+```
+
+To see the full set of `--reasoning-parser` / `--tool-call-parser` keys available in your build, run `python -m sgl_jax.launch_server --help`.
+
+## 4. Benchmark
+
+> Benchmark data below is a snapshot pinned to the `Tested build`; not refreshed on every release.
+
+### 4.1 Accuracy — GSM8K
+
+**Test Environment**
+
+| Field | Value |
+|---|---|
+| Hardware | TPU v6e-4 (single host, 4 chips) |
+| Model | XiaomiMiMo/MiMo-7B-RL (BF16) |
+| Tensor Parallelism | 4 |
+| Reasoning Parser | `mimo` (thinking-on per-request via `chat_template_kwargs.enable_thinking=true`) |
+| Tested build | sglang-jax 0.1.0 |
+
+**Deployment Command** — same as [§2.3](#single-host-docker--tpu-v6e-4) plus `--reasoning-parser mimo --tool-call-parser mimo`.
+
+**Benchmark Command**
+
+```bash
+evalscope eval \
+  --model XiaomiMiMo/MiMo-7B-RL \
+  --api-url http://127.0.0.1:30000/v1/chat/completions \
+  --api-key EMPTY \
+  --eval-type service \
+  --datasets gsm8k \
+  --eval-batch-size 8 \
+  --limit 500 \
+  --generation-config '{"chat_template_kwargs": {"enable_thinking": true}, "max_tokens": 4096}'
+```
+
+Recommended additional datasets for reasoning variants: AIME 2025, MATH.
+
+**Test Results**
+
+| Model | Dataset | Metric | Subset | Num | Score |
+|:---|:---|:---|:---|:---|:---|
+| MiMo-7B-RL | gsm8k | AverageAccuracy | main | 500 | 0.920 |
+
+### 4.2 Speed
+
+> **Layout B — single-workload latency baseline.**
+
+**Test Environment**
+
+| Field | Value |
+|---|---|
+| Hardware | TPU v6e-4 (single host, 4 chips) |
+| Model | XiaomiMiMo/MiMo-7B-RL (BF16) |
+| Tensor Parallelism | 4 |
+| Tested build | sglang-jax 0.1.0 |
+
+**Deployment Command** — same as [§2.3](#single-host-docker--tpu-v6e-4).
+
+**Benchmark Command**
+
+```bash
+python -m sgl_jax.bench_serving \
+  --backend sgl-jax \
+  --dataset-name random \
+  --num-prompts 100 \
+  --random-input 512 \
+  --random-output 128 \
+  --max-concurrency 8 \
+  --random-range-ratio 1 \
+  --warmup-requests 0 \
+  --tokenizer XiaomiMiMo/MiMo-7B-RL
+```
+
+**Test Results**
+
+```text
+============ Serving Benchmark Result ============
+Backend:                                 sgl-jax
+Traffic request rate:                    inf
+Max request concurrency:                 8
+Successful requests:                     100
+Benchmark duration (s):                  27.64
+Total input tokens:                      51200
+Total input text tokens:                 51200
+Total generated tokens:                  12800
+Total generated tokens (retokenized):    12789
+Request throughput (req/s):              3.62
+Input token throughput (tok/s):          1852.20
+Output token throughput (tok/s):         463.05
+Peak output token throughput (tok/s):    484.00
+Peak concurrent requests:                12
+Total token throughput (tok/s):          2315.26
+Concurrency:                             7.83
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   2165.35
+Median E2E Latency (ms):                 2204.56
+P90 E2E Latency (ms):                    2205.63
+P99 E2E Latency (ms):                    2264.84
+---------------Time to First Token----------------
+Mean TTFT (ms):                          1116.00
+Median TTFT (ms):                        1155.78
+P99 TTFT (ms):                           1216.67
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          8.26
+Median TPOT (ms):                        8.26
+P99 TPOT (ms):                           8.36
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           8.26
+Median ITL (ms):                         8.26
+P95 ITL (ms):                            8.40
+P99 ITL (ms):                            8.64
+Max ITL (ms):                            38.99
+==================================================
+```
+
+## 5. Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| Tool calls return empty arguments | `--tool-call-parser` not set | Add `--tool-call-parser mimo` to the launch command. |
+| No `reasoning_content` in response | `--reasoning-parser` not set, or `enable_thinking` not passed | Add `--reasoning-parser mimo` to launch; pass `extra_body={"chat_template_kwargs":{"enable_thinking":true}}` per request. |
+| First request takes ~4 min | JIT cache empty | Persist `JAX_COMPILATION_CACHE_DIR` across restarts. |
+
+## Additional Resources
+
+- [MiMo-7B-RL model card](https://huggingface.co/XiaomiMiMo/MiMo-7B-RL)
+- [Launch flags reference](../../base/launch-flags-reference.md)
+- [Cross-recipe troubleshooting](../../troubleshooting.md) — cross-recipe generic issues.

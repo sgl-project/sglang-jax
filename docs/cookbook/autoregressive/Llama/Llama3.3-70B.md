@@ -1,0 +1,204 @@
+---
+title: "Llama 3.3 70B"
+---
+
+# Llama 3.3 70B on SGL-JAX
+
+> **Validated recipe** — empirically validated on TPU v6e-16 with sglang-jax 0.1.0; see §4 for measured numbers.
+
+## 1. Model Introduction
+
+[**meta-llama/Llama-3.3-70B-Instruct**](https://huggingface.co/meta-llama/Llama-3.3-70B-Instruct) is Meta's 70B dense decoder from the Llama 3.3 release — multi-host serving required at BF16.
+
+For Llama 4 see the upstream sgl-cookbook (`Llama/Llama4.md`).
+
+**Key Features**:
+
+- **70B dense decoder, multi-host required**: BF16 weights ~140 GB — needs v6e-16 minimum (validated, see §4).
+- **Llama 3.3 Instruct**: Instruction-tuned chat model — strong general-purpose assistant; non-reasoning, no native tool-call format.
+- **Grouped-Query Attention (GQA)**: `num_kv_heads=8` shrinks the KV cache vs full MHA, leaving more HBM headroom for concurrency and longer prompts.
+- **128K context window**: Supports long-document inputs out of the box; pair with `--chunked-prefill-size 2048` to bound peak HBM on long prefills.
+- **Production-validated**: GSM8K **0.950** on TPU v6e-16 with sglang-jax 0.1.0 (§4.1).
+
+**Recommended Generation Parameters**: `temperature=0.6`, `top_p=0.9`, `max_tokens=1024` (Llama 3 Instruct defaults).
+
+**License**: see the [Llama model card](https://huggingface.co/meta-llama) for the authoritative Meta Llama Community License terms.
+
+## 2. Deployment
+
+### 2.1 Hardware Matrix
+
+| Model | TPU | Topology | Nodes | Chips | `--tp-size` | Notes |
+|---|---|---|---|---|---|---|
+| Llama 3.3 70B | **v6e-16** | 4x4 | 4 | 16 | 16 | This is the slice we measured on. BF16 ~140 GB — fits with `--mem-fraction-static 0.85` (~8.75 GB weights/chip + ample KV headroom). |
+
+See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation reference. For other slices (larger v6e, v7x variants), see [Adapting to other topologies](../../base/tpu-topology-reference.md#adapting-to-other-topologies).
+
+### 2.2 Environment
+
+Install per [Install guide](../../../get_started/install.md). Multi-host required — use [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) as the primary user-facing path. Advanced users running temporary v6e experiments can adapt [SkyPilot launcher](../../deployment/skypilot.md).
+
+### 2.3 Launch
+
+#### Multi-host — TPU v6e-16
+
+Use [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) with `<JOB>=llama-70b`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=4x4`, `parallelism: 4`, and `completions: 4`. Put these model-specific flags into `<LAUNCH_FLAGS>`:
+
+```bash
+  --model-path meta-llama/Llama-3.3-70B-Instruct \
+  --trust-remote-code \
+  --tp-size 16 \
+  --device tpu \
+  --dtype bfloat16 \
+  --mem-fraction-static 0.85 \
+  --chunked-prefill-size 2048 \
+  --page-size 128 \
+  --max-running-requests 256 \
+  --skip-server-warmup
+```
+
+For temporary v6e experiments, advanced users can adapt [SkyPilot launcher](../../deployment/skypilot.md) with the same launch flags. The model recipe does not require users to run repository-local SkyPilot helper scripts.
+
+### 2.4 Configuration Tips
+
+**Memory Management:**
+- v6e-16 (TP=16): `--mem-fraction-static 0.85` validated; ~8.75 GB weights per chip leaves ~18 GB headroom for KV at 32 GB HBM.
+
+**Throughput vs Latency:**
+- `--page-size 128` reduces KV page-table overhead at 70B scale.
+- `--chunked-prefill-size 2048` bounds peak HBM during prefill on long prompts.
+- `--max-running-requests 256` caps concurrent decodes; lower for tighter latency tails.
+
+**Tensor Parallelism:**
+- `--tp-size 16` on v6e-16 fully shards Llama 3.3 70B's GQA `num_kv_heads=8` (tensor axis must be a divisor of 8 — 16 maps cleanly: 2 chips per KV head). All ranks must be in the same TPU slice; verify `--nnodes` matches the slice node count.
+- Multi-host coordination: every rank runs the same launch command; only `${NODE_RANK}` and `${MASTER_ADDR}` vary. Dispatch all ranks within seconds of each other (a >5-min stagger trips the JAX distributed RPC deadline).
+
+**Compilation Cache Hygiene:**
+- `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache` is mandatory — without it, first request blocks ~4 min per node.
+- The cache is per-node; mount a shared PVC at the cache directory to amortize compilation across all 4 nodes.
+
+For full flag definitions see [Launch flags reference](../../base/launch-flags-reference.md).
+
+## 3. Invocation
+
+### 3.1 Basic Chat Completion
+
+For full cURL + native `/generate` patterns see [Basic API usage](../../base/basic-api-usage.md).
+
+Short Python OpenAI client example (replace `<rank0-ip>` with your rank-0 internal IP):
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://<rank0-ip>:30000/v1", api_key="EMPTY")
+
+resp = client.chat.completions.create(
+    model="meta-llama/Llama-3.3-70B-Instruct",
+    messages=[{"role": "user", "content": "Hello, who are you?"}],
+    temperature=0.6,
+    top_p=0.9,
+    max_tokens=1024,
+)
+print(resp.choices[0].message.content)
+```
+
+> Llama 3 Instruct is non-reasoning and has no native tool-call format. For those workloads, see the **Parser key reference** in [Parser key reference](../index.md#parser-key-reference) for the list of cookbook recipes with reasoning / tool-call parsers registered.
+
+## 4. Benchmark
+
+> Benchmark data below is a snapshot pinned to the `Tested build`; not refreshed on every release.
+
+### 4.1 Accuracy
+
+**Test Environment**
+
+| Field | Value |
+|---|---|
+| Hardware | TPU v6e-16 (4 nodes × 4 chips) |
+| Model | meta-llama/Llama-3.3-70B-Instruct (BF16) |
+| Tensor Parallelism | 16 |
+| Tested build | sglang-jax 0.1.0 |
+
+**Deployment Command** — same as [§2.3 v6e-16](#multi-host-gke-indexed-job--tpu-v6e-16-minimum).
+
+**Benchmark Command** — example for GSM8K:
+
+```bash
+evalscope eval \
+  --model meta-llama/Llama-3.3-70B-Instruct \
+  --api-url http://127.0.0.1:30000/v1/chat/completions \
+  --api-key EMPTY \
+  --eval-type service \
+  --datasets gsm8k \
+  --eval-batch-size 16 \
+  --limit 200
+```
+
+Recommended additional datasets: MMLU, GPQA Diamond, IFEval.
+
+**Test Results**
+
+| Dataset | Subset | Samples | Score |
+|---|---|---|---|
+| gsm8k | main | 200 | **0.950** |
+
+### 4.2 Speed
+
+> **Layout B — measured baseline.** TPU v6e-16 (4 nodes × 4 chips, TP=16), sglang-jax 0.1.0. sgl-jax-only; no vLLM-on-TPU comparison.
+
+**Test Environment**
+
+| Field | Value |
+|---|---|
+| Hardware | TPU v6e-16 (4 nodes × 4 chips) |
+| Model | meta-llama/Llama-3.3-70B-Instruct (BF16) |
+| Tensor Parallelism | 16 |
+| Tested build | sglang-jax 0.1.0 |
+
+**Benchmark Command**
+
+```bash
+python3 -m sgl_jax.bench_serving \
+  --backend sglang \
+  --model meta-llama/Llama-3.3-70B-Instruct \
+  --tokenizer meta-llama/Llama-3.3-70B-Instruct \
+  --dataset-name random --random-input-len 1024 --random-output-len 1024 \
+  --num-prompts 100 --max-concurrency 16 \
+  --host 127.0.0.1 --port 30000
+```
+
+**Test Results**
+
+```
+============ Serving Benchmark Result ============
+Successful requests:                     100
+Benchmark duration (s):                  59.45
+Total input tokens:                      50561
+Total generated tokens:                  52444
+Request throughput (req/s):              1.68
+Input token throughput (tok/s):          850.49
+Output token throughput (tok/s):         882.17
+Peak output token throughput (tok/s):    1040.00
+Total token throughput (tok/s):          1732.66
+Mean E2E Latency (ms):                   8647.20
+Mean TTFT (ms):                          113.86
+Mean TPOT (ms):                          16.33
+Median TPOT (ms):                        16.47
+Mean ITL (ms):                           16.30
+==================================================
+```
+
+## 5. Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| OOM at startup | Weights + KV exceed budget at chosen `--mem-fraction-static` | Lower to 0.85 (or 0.8). Verify `--tp-size` matches the chip count (v6e-16 → 16, v6e-32 → 32). |
+| `Internal error when accessing libtpu multi-process lockfile` on rank 0 | Stale `/tmp/libtpu_lockfile` from a prior failed launch on the same pod | `rm -f /tmp/libtpu_lockfile` on every rank before relaunching. Worth scripting into the launch wrapper since multi-host failures often leave stale locks. |
+| Multi-node hang at init | `--dist-init-addr` unreachable from non-rank-0 nodes | Verify the rank-0 internal IP and that the chosen port is open. |
+| First request takes ~4 min per node | JIT cache empty | Persist `JAX_COMPILATION_CACHE_DIR`; mount a shared PVC across all 8 nodes for amortized compilation. |
+
+## Additional Resources
+
+- [Llama 3.3 70B model card](https://huggingface.co/meta-llama/Llama-3.3-70B-Instruct)
+- [Launch flags reference](../../base/launch-flags-reference.md)
+- [Cross-recipe troubleshooting](../../troubleshooting.md) — cross-recipe generic issues.
