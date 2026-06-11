@@ -1,6 +1,11 @@
 import numpy as np
 
 
+def resolve_spec_prefill_token_ids(result, batch):
+    """Resolve prefill next-token ids after the next batch has been launched."""
+    return np.asarray(result.next_token_ids).tolist()
+
+
 def publish_spec_decode_new_seq_lens(batch_output):
     new_seq_lens = batch_output.next_draft_input.new_seq_lens
     if new_seq_lens is not None and hasattr(new_seq_lens, "copy_to_host_async"):

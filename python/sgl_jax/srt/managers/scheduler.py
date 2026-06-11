@@ -1985,7 +1985,9 @@ class Scheduler(
                 and self.spec_algorithm is not None
                 and not self.spec_algorithm.is_none()
             )
-            if not defer_spec_decode_output:
+            defer_spec_prefill_output = use_spec_prefill_overlap
+            defer_spec_output = defer_spec_decode_output or defer_spec_prefill_output
+            if not defer_spec_output:
                 next_token_ids = np.asarray(jax.device_get(batch_output.next_token_ids))
                 self._extract_dp_output_ids(next_token_ids, model_worker_batch, batch)
             logits_output = batch_output.logits_output
@@ -2021,7 +2023,7 @@ class Scheduler(
                 if (
                     self.spec_algorithm is not None
                     and self.spec_algorithm.is_eagle()
-                    and batch.forward_mode.is_decode()
+                    and (batch.forward_mode.is_decode() or defer_spec_prefill_output)
                     and self.enable_overlap
                 )
                 else next_token_ids.tolist()

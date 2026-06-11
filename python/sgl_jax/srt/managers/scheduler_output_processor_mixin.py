@@ -14,6 +14,7 @@ from sgl_jax.srt.managers.io_struct import AbortReq, BatchTokenIDOut
 from sgl_jax.srt.managers.schedule_batch import BaseFinishReason, Req, ScheduleBatch
 from sgl_jax.srt.mem_cache.common import release_kv_cache
 from sgl_jax.srt.precision_tracer import precision_tracer
+from sgl_jax.srt.speculative.overlap_utils import resolve_spec_prefill_token_ids
 
 if TYPE_CHECKING:
     from sgl_jax.srt.managers.scheduler import (
@@ -115,6 +116,7 @@ class SchedulerOutputProcessorMixin:
         )
         if self.enable_overlap:
             if self.spec_algorithm is not None and not self.spec_algorithm.is_none():
+                next_token_ids = resolve_spec_prefill_token_ids(result, batch)
                 if launch_done is not None:
                     launch_done.wait()
             else:

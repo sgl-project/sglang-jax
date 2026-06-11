@@ -817,8 +817,7 @@ def _build_fused_greedy_prefill_jit(num_layers: int, topk: int):
         relay_new_seq_lens = target_forward_batch.seq_lens + 1
         if mesh is not None:
             rep = NamedSharding(mesh, P())
-            data_sharding = NamedSharding(mesh, P("data"))
-            next_token_ids = jax.sharding.reshard(jnp.copy(next_token_ids), data_sharding)
+            next_token_ids = jax.sharding.reshard(jnp.copy(next_token_ids), rep)
             selected_layer0_hidden = jax.sharding.reshard(selected_layer0_hidden, rep)
             stacked_idx = jax.sharding.reshard(stacked_idx, rep)
 
@@ -1307,17 +1306,11 @@ def spec_prefill(spec_worker, model_worker_batch, launch_done=None, *, update_re
     if update_relay:
         spec_worker.spec_relay_buffers = updated_relay_buffers
 
-    relay_next_token_ids = next_token_ids
-    host_next_token_ids = next_token_ids
-    if model_worker_batch.dp_size > 1:
-        from jax.experimental.multihost_utils import process_allgather
-
-        host_next_token_ids = process_allgather(host_next_token_ids, tiled=True)
-
     sel = np.asarray(model_worker_batch.logits_indices_selector)
     if update_relay:
         from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
 
+        jax.copy_to_host_async(next_token_ids)
         future_indices = np.asarray(model_worker_batch.req_pool_indices, dtype=np.int32)[sel]
         model_worker_batch.spec_info_padded = EagleDraftInput(
             future_indices=future_indices,
@@ -1328,13 +1321,20 @@ def spec_prefill(spec_worker, model_worker_batch, launch_done=None, *, update_re
         )
         return GenerationBatchResult(
             logits_output=logits_output,
-            next_token_ids=relay_next_token_ids if launch_done is not None else host_next_token_ids,
+            next_token_ids=next_token_ids,
             next_draft_input=model_worker_batch.spec_info_padded,
             bid=model_worker_batch.bid,
             cache_miss_count=cache_miss_count,
             extend_input_len_per_req=None,
             extend_logprob_start_len_per_req=None,
         )
+
+    relay_next_token_ids = next_token_ids
+    host_next_token_ids = next_token_ids
+    if model_worker_batch.dp_size > 1:
+        from jax.experimental.multihost_utils import process_allgather
+
+        host_next_token_ids = process_allgather(host_next_token_ids, tiled=True)
 
     jax.copy_to_host_async(host_next_token_ids)
     jax.copy_to_host_async(layer0_hidden)
