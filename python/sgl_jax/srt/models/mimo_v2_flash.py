@@ -509,7 +509,14 @@ class MiMoV2Model(nnx.Module):
 
     def __call__(self, forward_batch: ForwardBatch, token_to_kv_pool: KVCache):
         residual = None
-        hidden_states = self.embed_tokens(forward_batch.input_ids)
+        input_embeds = (
+            forward_batch.input_embedding
+            if forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
+            else None
+        )
+        hidden_states = (
+            self.embed_tokens(forward_batch.input_ids) if input_embeds is None else input_embeds
+        )
 
         layers_kv_fused = []
         layers_topk_ids = []

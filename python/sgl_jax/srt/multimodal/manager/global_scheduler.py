@@ -6,6 +6,7 @@ import signal
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
+import jax
 import numpy as np
 import psutil
 import setproctitle
@@ -17,10 +18,6 @@ from sgl_jax.srt.managers.io_struct import (
     BatchTokenIDOut,
     ProfileReq,
     ProfileReqOutput,
-)
-from sgl_jax.srt.multimodal.common.modality_enum import (
-    MultimodalDataItem,
-    pad_input_tokens,
 )
 from sgl_jax.srt.multimodal.manager.device_manager import DeviceManager
 from sgl_jax.srt.multimodal.manager.io_struct import (
@@ -90,6 +87,7 @@ class GlobalScheduler:
         """
         context = zmq.Context(2)
         self.server_args = server_args
+        self.port_args = port_args
         self.recv_from_tokenizer = get_zmq_socket(
             context, zmq.PULL, port_args.scheduler_input_ipc_name, False
         )
@@ -118,7 +116,12 @@ class GlobalScheduler:
 
         def _build_stage(idx_cfg: tuple[int, Any]) -> tuple[int, Stage]:
             idx, cfg = idx_cfg
-            return idx, Stage(cfg, device_manager=self.device_manager, server_args=self.server_args)
+            return idx, Stage(
+                cfg,
+                device_manager=self.device_manager,
+                server_args=self.server_args,
+                port_args=self.port_args,
+            )
 
         with ThreadPoolExecutor(
             max_workers=min(len(self.stage_configs), max(1, os.cpu_count() or 1))
@@ -292,57 +295,13 @@ class GlobalScheduler:
         req.origin_input_text = input.prompt
         req.origin_input_ids = input.input_ids
         req.omni_inputs = input.mm_inputs
-        if input.mm_inputs:
-            mm_items = input.mm_inputs.get("mm_items", [])
-            image_items = []
-            video_items = []
-            audio_items = []
-            all_mm_items = []
-            for item in mm_items:
-                if isinstance(item, MultimodalDataItem):
-                    all_mm_items.append(item)
-                    if item.is_image():
-                        image_items.append(item)
-                    elif item.is_video():
-                        video_items.append(item)
-                    elif item.is_audio():
-                        audio_items.append(item)
-                elif isinstance(item, dict):
-                    item_obj = MultimodalDataItem.from_dict(item)
-                    all_mm_items.append(item_obj)
-                    if item_obj.is_image():
-                        image_items.append(item_obj)
-                    elif item_obj.is_video():
-                        video_items.append(item_obj)
-                    elif item_obj.is_audio():
-                        audio_items.append(item_obj)
-
-            pixel_values_list = []
-            pixel_values_images_list = []
-            pixel_values_videos_list = []
-            audio_values_list = []
-            for item in image_items:
-                if item.feature is not None:
-                    pixel_values_list.append(np.asarray(item.feature))
-                    pixel_values_images_list.append(np.asarray(item.feature))
-            for item in video_items:
-                if item.feature is not None:
-                    pixel_values_list.append(np.asarray(item.feature))
-                    pixel_values_videos_list.append(np.asarray(item.feature))
-            for item in audio_items:
-                if item.feature is not None:
-                    audio_values_list.append(np.asarray(item.feature))
-
-            if pixel_values_list:
-                req.pixel_values = np.concatenate(pixel_values_list, axis=0)
-            if pixel_values_images_list:
-                req.pixel_values_images = np.concatenate(pixel_values_images_list, axis=0)
-            if pixel_values_videos_list:
-                req.pixel_values_videos = np.concatenate(pixel_values_videos_list, axis=0)
-            if audio_values_list:
-                req.audio_features = np.concatenate(audio_values_list, axis=0)
-
-            image_grid_thw = input.mm_inputs.get("image_grid_thw")
+        mm_inputs = req.omni_inputs if isinstance(req.omni_inputs, dict) else None
+        if mm_inputs is not None:
+            # P1: mm_items is the single source of truth; feature assembly (mm_items ->
+            # model kwargs) happens in the executors, so the scheduler no longer flattens
+            # features into req.pixel_values_*/audio_features. It only transports grid_thw
+            # for downstream mrope/vision use.
+            image_grid_thw = mm_inputs.get("image_grid_thw")
             if image_grid_thw is not None:
                 if isinstance(image_grid_thw, np.ndarray):
                     image_grid_thw = tuple(map(tuple, image_grid_thw.tolist()))
@@ -352,7 +311,7 @@ class GlobalScheduler:
                     )
             req.image_grid_thw = image_grid_thw
 
-            video_grid_thw = input.mm_inputs.get("video_grid_thw")
+            video_grid_thw = mm_inputs.get("video_grid_thw")
             if video_grid_thw is not None:
                 if isinstance(video_grid_thw, np.ndarray):
                     video_grid_thw = tuple(map(tuple, video_grid_thw.tolist()))
@@ -361,18 +320,6 @@ class GlobalScheduler:
                         tuple(x) if isinstance(x, list) else x for x in video_grid_thw
                     )
             req.video_grid_thw = video_grid_thw
-
-            im_token_id = input.mm_inputs.get("im_token_id")
-            video_token_id = input.mm_inputs.get("video_token_id")
-            audio_token_id = input.mm_inputs.get("audio_token_id")
-            if req.input_ids:
-                req.cache_input_ids = pad_input_tokens(
-                    input_ids=list(req.input_ids),
-                    mm_items=all_mm_items,
-                    im_token_id=im_token_id,
-                    video_token_id=video_token_id,
-                    audio_token_id=audio_token_id,
-                )
         if input.sampling_params is not None:
             req.extra["sampling_params"] = input.sampling_params
         req.extra["stream"] = bool(getattr(input, "stream", False))
@@ -389,17 +336,33 @@ class GlobalScheduler:
         Spawns a thread per `Stage` running `Stage.run_stage` and then blocks
         on each stage's output queue for a readiness message. Raises if a
         stage fails to initialize.
+
+        Multi-host (SPMD): stages load weights via JAX cross-host collectives
+        (multihost_utils.broadcast_one_to_all), which require every process to
+        issue them in the same global order. Starting all stage threads at once
+        lets Stage-0 and Stage-1 interleave their collectives nondeterministically
+        across hosts and deadlocks. So when nnodes>1 we start each stage thread
+        only after the previous one has signaled ready, serializing the
+        per-stage collective sequence identically on every rank.
         """
 
         import threading
 
-        for stage in self.stage_list:
+        serialize = getattr(self.server_args, "nnodes", 1) > 1
+        threads = []
+        for i, stage in enumerate(self.stage_list):
             thread = threading.Thread(target=stage.run_stage)
             thread.start()
-        for i, q in enumerate(self.out_queues):
-            status = q.get()
-            if status["status"] != "ready":
-                raise Exception(f"stage {i} init failed")
+            threads.append(thread)
+            if serialize:
+                status = self.out_queues[i].get()
+                if status["status"] != "ready":
+                    raise Exception(f"stage {i} init failed")
+        if not serialize:
+            for i, q in enumerate(self.out_queues):
+                status = q.get()
+                if status["status"] != "ready":
+                    raise Exception(f"stage {i} init failed")
 
     def recv_request(self):
         """Non-blockingly drain incoming requests from the tokenizer socket.
@@ -514,6 +477,22 @@ def run_global_scheduler_process(
     setproctitle.setproctitle("sglang-jax::global_scheduler")
     configure_logger(server_args)
     parent_process = psutil.Process().parent()
+
+    # Multi-host (SPMD): bring up the JAX distributed cluster BEFORE constructing the
+    # GlobalScheduler, so DeviceManager()=jax.devices() sees the full cross-host device
+    # set (e.g. 16 chips over 4 hosts) instead of only the local 4. Without this,
+    # device_manager.allocate(num_tpus) for the AR stage raises "device is not enough".
+    # See prework appendix "multi-host (SPMD)" §D.2.
+    nnodes = getattr(server_args, "nnodes", 1)
+    if nnodes > 1 and not jax.distributed.is_initialized():
+        logger.info(
+            "Initializing JAX distributed: addr=%s nnodes=%s node_rank=%s",
+            server_args.dist_init_addr,
+            nnodes,
+            server_args.node_rank,
+        )
+        jax.distributed.initialize(server_args.dist_init_addr, nnodes, server_args.node_rank)
+        logger.info("JAX distributed ready: %s global devices visible", len(jax.devices()))
 
     try:
         scheduler = GlobalScheduler(server_args, port_args)

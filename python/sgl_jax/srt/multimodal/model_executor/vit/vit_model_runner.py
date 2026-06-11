@@ -8,6 +8,7 @@ from sgl_jax.srt.model_executor.base_model_runner import BaseModelRunner
 from sgl_jax.srt.model_loader.loader import get_model_loader
 from sgl_jax.srt.multimodal.common.ServerArgs import MultimodalServerArgs
 from sgl_jax.srt.multimodal.configs.config_registry import get_qwen_vl_config
+from sgl_jax.srt.multimodal.manager.mm_assembly import assemble_mm_inputs
 from sgl_jax.srt.multimodal.manager.schedule_batch import Req
 
 
@@ -139,12 +140,15 @@ class VitModelRunner(BaseModelRunner):
         return jnp.where(condition, update_values, text_embeds)
 
     def forward(self, batch: Req, mesh: jax.sharding.Mesh):
-        vision_embeds = self.jitted_encode_vision(
-            pixel_values=batch.pixel_values,
-            image_grid_thw=batch.image_grid_thw,
-            video_grid_thw=batch.video_grid_thw,
-        )
         mm_inputs = batch.omni_inputs if isinstance(batch.omni_inputs, dict) else None
+        # P1: assemble vision inputs from mm_items (single source of truth).
+        assembled = assemble_mm_inputs(mm_inputs)
+        pixel_values = assembled["pixel_values"]
+        vision_embeds = self.jitted_encode_vision(
+            pixel_values=jnp.asarray(pixel_values) if pixel_values is not None else None,
+            image_grid_thw=assembled["image_grid_thw"],
+            video_grid_thw=assembled["video_grid_thw"],
+        )
         if mm_inputs is not None:
             input_ids = batch.input_ids or batch.origin_input_ids
             if input_ids is not None:

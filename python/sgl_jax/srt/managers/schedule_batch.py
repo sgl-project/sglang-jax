@@ -1959,6 +1959,17 @@ class ScheduleBatch:
                 mm_emb = getattr(req, "multimodal_embedding", None)
                 if mm_emb is not None:
                     mm_full = np.asarray(mm_emb)
+                    if mm_full.ndim != 2:
+                        raise ValueError(
+                            "multimodal_embedding must be a 2D array [seq_len, hidden], "
+                            f"got shape={mm_full.shape} for rid={getattr(req, 'rid', None)}"
+                        )
+                    if mm_full.shape[0] < end:
+                        raise ValueError(
+                            "multimodal_embedding length mismatch: "
+                            f"rid={getattr(req, 'rid', None)}, shape={mm_full.shape}, "
+                            f"required at least {end} rows for extend window [{start}, {end})"
+                        )
                     chunk = mm_full[start:end]
                     if emb is None:
                         emb = np.zeros((total_token_size, mm_full.shape[1]), dtype=mm_full.dtype)

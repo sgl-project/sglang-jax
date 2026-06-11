@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import copy
 import json
 import logging
@@ -86,19 +88,42 @@ class OpenAIServingChat(OpenAIServingBase):
             else:
                 prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
 
-        adapted_request = GenerateReqInput(
-            **prompt_kwargs,
-            image_data=processed_messages.image_data,
-            video_data=processed_messages.video_data,
-            audio_data=processed_messages.audio_data,
-            sampling_params=sampling_params,
-            return_logprob=request.logprobs,
-            logprob_start_len=-1,
-            top_logprobs_num=request.top_logprobs or 0,
-            stream=request.stream,
-            extra_key=request.extra_key,
-            rid=request.rid,
-        )
+        if is_multimodal:
+            # logprobs/top_logprobs are not yet plumbed through the omni AR stage.
+            # Fail loudly instead of silently dropping them (review D5-5).
+            if request.logprobs or (request.top_logprobs or 0) > 0:
+                raise ValueError(
+                    "logprobs / top_logprobs are not supported for multimodal chat "
+                    "requests yet; omit them or use a text-only model."
+                )
+            adapted_request = GenerateOmniReqInput(
+                prompt=processed_messages.prompt,
+                image_data=processed_messages.image_data,
+                video_data=processed_messages.video_data,
+                audio_data=processed_messages.audio_data,
+                sampling_params=sampling_params,
+                # logprobs/top_logprobs already rejected above; leave the omni request's
+                # logprob fields at their defaults (review R2-18) rather than passing
+                # values the AR stage doesn't consume yet.
+                extra_key=request.extra_key,
+                stream=request.stream,
+                rid=request.rid,
+                stop=request.stop,
+            )
+        else:
+            adapted_request = GenerateReqInput(
+                **prompt_kwargs,
+                image_data=processed_messages.image_data,
+                video_data=processed_messages.video_data,
+                audio_data=processed_messages.audio_data,
+                sampling_params=sampling_params,
+                return_logprob=request.logprobs,
+                logprob_start_len=-1,
+                top_logprobs_num=request.top_logprobs or 0,
+                stream=request.stream,
+                extra_key=request.extra_key,
+                rid=request.rid,
+            )
 
         return adapted_request, request
 

@@ -159,7 +159,7 @@ class ModelConfig:
                 self.quantization_config.ignored_layers = ignored
         # Check model type
         self.is_generation = is_generation_model(self.hf_config.architectures, is_embedding)
-        self.is_multimodal = False
+        self.is_multimodal = is_multimodal_model(self.hf_config)
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
 
         # Derive context length
@@ -794,6 +794,20 @@ def is_generation_model(model_architectures: list[str], is_embedding: bool = Fal
         return False
     else:
         return not is_embedding
+
+
+def is_multimodal_model(hf_config) -> bool:
+    """A checkpoint is multimodal when it carries a vision/audio understanding config.
+
+    Routing on this generic config signal (rather than enumerating model_type strings)
+    keeps the OpenAI omni entry model-agnostic: MiMo-V2.5 omni has top-level
+    vision_config + audio_config, while text-only variants (MiMo-V2.5-Pro/Flash) have
+    neither and stay on the text path.
+    """
+    return (
+        getattr(hf_config, "vision_config", None) is not None
+        or getattr(hf_config, "audio_config", None) is not None
+    )
 
 
 multimodal_model_archs = [

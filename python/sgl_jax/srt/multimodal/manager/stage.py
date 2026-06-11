@@ -7,8 +7,9 @@ from typing import Any
 import jax
 import psutil
 
-from sgl_jax.srt.managers.communication import QueueBackend
+from sgl_jax.srt.managers.communication import MultiHostQueueBackend, QueueBackend
 from sgl_jax.srt.managers.scheduler import Scheduler as AutoRegressiveScheduler
+from sgl_jax.srt.models.mimo_v2_pro import MiMoV2ForCausalLM
 from sgl_jax.srt.models.qwen2 import Qwen2ForCausalLM
 from sgl_jax.srt.models.umt5 import UMT5EncoderModel
 from sgl_jax.srt.multimodal.manager.device_manager import DeviceManager
@@ -32,6 +33,7 @@ from sgl_jax.srt.multimodal.models.mimo_audio.mimo_audio_backbone import (
 from sgl_jax.srt.multimodal.models.mimo_audio.mimo_audio_tokenizer import (
     MiMoAudioTokenizer,
 )
+from sgl_jax.srt.multimodal.models.mimo_v2_5.embedding import MiMoV2_5Embedding
 from sgl_jax.srt.multimodal.models.qwen2_5VL.qwen2_5_vit import Qwen2_5_VL_VisionModel
 from sgl_jax.srt.multimodal.models.qwen2_5VL.qwen2_5_vl_generation import (
     Qwen2_5_VL_Generation,
@@ -74,7 +76,12 @@ class Stage:
     """
 
     def __init__(
-        self, stage_config: Any, *, device_manager: DeviceManager, server_args: ServerArgs
+        self,
+        stage_config: Any,
+        *,
+        device_manager: DeviceManager,
+        server_args: ServerArgs,
+        port_args: Any = None,
     ):
         """Initialize stage resources and create the device mesh.
 
@@ -83,9 +90,11 @@ class Stage:
                 scheduler information).
             device_manager: `DeviceManager` used to reserve device indices.
             server_args: Global server arguments passed to schedulers.
+            port_args: Port arguments (carries pub_sub_addr for multi-host stages).
         """
         self._in_queue = None
         self._out_queue = None
+        self.port_args = port_args
         runtime = stage_config.runtime
         device_kind = getattr(runtime, "device_kind", "tpu")
         num_devices = runtime.num_tpus
@@ -158,7 +167,25 @@ class Stage:
             )
             # todo according to config to decide which scheduler to use
             scheduler_class = get_scheduler_class(self.stage_config.scheduler)
-            comm_backend = QueueBackend(in_queue=self._in_queue, out_queue=self._out_queue)
+            # Multi-host: the AR stage runs SPMD across hosts, so every rank's scheduler
+            # must receive the same batch each loop turn. A plain QueueBackend only feeds
+            # rank0 (whose GlobalScheduler owns request IO); MultiHostQueueBackend locksteps
+            # all ranks via pub/sub so the cross-host jitted forward never deadlocks.
+            nnodes = getattr(self.server_args, "nnodes", 1)
+            pub_sub_addr = getattr(self.port_args, "pub_sub_addr", None)
+            if (
+                nnodes > 1
+                and self.stage_config.scheduler == "auto_regressive"
+                and pub_sub_addr is not None
+            ):
+                comm_backend = MultiHostQueueBackend(
+                    in_queue=self._in_queue,
+                    out_queue=self._out_queue,
+                    node_rank=getattr(self.server_args, "node_rank", 0),
+                    pub_sub_addr=pub_sub_addr,
+                )
+            else:
+                comm_backend = QueueBackend(in_queue=self._in_queue, out_queue=self._out_queue)
             model_class = get_model_class(self.stage_config.model_class)
             stage_sub_dir = getattr(self.stage_config, "stage_sub_dir", None)
             precompile_params = getattr(self.stage_config, "precompile_params", None)
@@ -251,6 +278,8 @@ def get_model_class(name: str) -> type | list[type]:
         ),
         "MiMoAudioTokenizer": MiMoAudioTokenizer,
         "MiMoAudioForCausalLM": MiMoAudioForCausalLM,
+        "MiMoV2_5Embedding": MiMoV2_5Embedding,
+        "MiMoV2ForCausalLM": MiMoV2ForCausalLM,
         "CLIPTextModel": CLIPTextModel,
         "T5EncoderModel": T5EncoderModel,
         "FluxTransformer2DModel": FluxTransformer2DModel,

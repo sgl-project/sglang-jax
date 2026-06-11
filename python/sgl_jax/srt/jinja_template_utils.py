@@ -79,6 +79,11 @@ def process_content_for_template_format(
                     audio_data.append(chunk["audio_url"]["url"])
                     # Normalize to simple 'audio' type
                     processed_content_parts.append({"type": "audio"})
+                elif chunk_type == "input_audio":
+                    input_audio = chunk["input_audio"]
+                    audio_data.append(input_audio["data"])
+                    # Normalize to simple 'audio' type
+                    processed_content_parts.append({"type": "audio"})
                 else:
                     # Keep other content as-is (text, etc.)
                     processed_content_parts.append(chunk)

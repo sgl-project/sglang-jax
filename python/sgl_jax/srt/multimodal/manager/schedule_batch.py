@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import logging
 from dataclasses import dataclass, field
 from typing import Any
@@ -86,14 +88,10 @@ class Req:
 
     # Omni/VLM inputs/outputs
     omni_inputs: OmniInputs | None = None
-    audio_features: jax.Array | np.ndarray | None = None
-    pixel_values_images: jax.Array | np.ndarray | None = None
-    pixel_values_videos: jax.Array | np.ndarray | None = None
     vision_embeds: jax.Array | None = None
     input_embeds: jax.Array | None = None
     image_grid_thw: tuple | None = None
     video_grid_thw: tuple | None = None
-    cache_input_ids: list[int] | None = None
 
     # Batch info
     num_outputs_per_prompt: int = 1
@@ -218,11 +216,10 @@ class Req:
 
     def to_stage_reqs(self, scheduler: str):
         logger.debug(
-            "to_stage_reqs: scheduler=%s, rid=%s, output=%s, audio_codes=%s, input_ids=%s",
+            "to_stage_reqs: scheduler=%s, rid=%s, output=%s, input_ids=%s",
             scheduler,
             self.rid,
             self.output is not None,
-            self.audio_codes is not None,
             self.input_ids is not None,
         )
         if scheduler == "auto_regressive":

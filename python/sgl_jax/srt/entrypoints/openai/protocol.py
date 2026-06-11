@@ -1,5 +1,7 @@
 """Pydantic models for OpenAI API protocol"""
 
+from __future__ import annotations
+
 import time
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -255,6 +257,11 @@ class ChatCompletionMessageContentAudioURL(BaseModel):
     url: str
 
 
+class ChatCompletionMessageContentInputAudio(BaseModel):
+    data: str
+    format: str | None = None
+
+
 class ChatCompletionMessageContentImagePart(BaseModel):
     type: Literal["image_url"]
     image_url: ChatCompletionMessageContentImageURL
@@ -271,11 +278,17 @@ class ChatCompletionMessageContentAudioPart(BaseModel):
     audio_url: ChatCompletionMessageContentAudioURL
 
 
+class ChatCompletionMessageContentInputAudioPart(BaseModel):
+    type: Literal["input_audio"]
+    input_audio: ChatCompletionMessageContentInputAudio
+
+
 ChatCompletionMessageContentPart = (
     ChatCompletionMessageContentTextPart
     | ChatCompletionMessageContentImagePart
     | ChatCompletionMessageContentVideoPart
     | ChatCompletionMessageContentAudioPart
+    | ChatCompletionMessageContentInputAudioPart
 )
 
 

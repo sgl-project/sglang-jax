@@ -270,16 +270,29 @@ def dataclass_to_string_truncated(data, max_length=2048, skip_names: set[str] | 
         else:
             return f"{repr(data)}"
     elif isinstance(data, (list, tuple)):
+
+        def format_sequence(items):
+            values = [
+                dataclass_to_string_truncated(item, max_length, skip_names=skip_names)
+                for item in items
+            ]
+            if isinstance(data, tuple):
+                suffix = "," if len(values) == 1 else ""
+                return "(" + ", ".join(values) + suffix + ")"
+            return "[" + ", ".join(values) + "]"
+
         if len(data) > max_length:
             half_length = max_length // 2
-            return str(data[:half_length]) + " ... " + str(data[-half_length:])
+            return (
+                format_sequence(data[:half_length]) + " ... " + format_sequence(data[-half_length:])
+            )
         else:
-            return str(data)
+            return format_sequence(data)
     elif isinstance(data, dict):
         return (
             "{"
             + ", ".join(
-                f"'{k}': {dataclass_to_string_truncated(v, max_length)}"
+                f"'{k}': {dataclass_to_string_truncated(v, max_length, skip_names=skip_names)}"
                 for k, v in data.items()
                 if k not in skip_names
             )
@@ -290,7 +303,8 @@ def dataclass_to_string_truncated(data, max_length=2048, skip_names: set[str] | 
         return (
             f"{data.__class__.__name__}("
             + ", ".join(
-                f"{f.name}={dataclass_to_string_truncated(getattr(data, f.name), max_length)}"
+                f"{f.name}="
+                f"{dataclass_to_string_truncated(getattr(data, f.name), max_length, skip_names=skip_names)}"
                 for f in fields
                 if f.name not in skip_names
             )

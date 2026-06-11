@@ -229,38 +229,40 @@ class Scheduler(
         context = zmq.Context(2)
         self._comm_backend = None
 
-        if self.node_rank == 0:
+        # Stage mode (multimodal): a communication_backend is injected on EVERY rank.
+        # Cross-host coordination is owned by that backend (MultiHostQueueBackend does the
+        # rank0-publish / non-rank0-subscribe lockstep), so the scheduler must NOT set up
+        # or sync its own ZMQ pub/sub here (that path leaves num_subscribers unset on the
+        # stage path and double-coordinates). See prework appendix "multi-host (SPMD)".
+        if communication_backend is not None:
+            self._comm_backend = communication_backend
+        elif self.node_rank == 0:
             # todo: support multi host
-            if communication_backend is not None:
-                self._comm_backend = communication_backend
-            else:
-                self.recv_from_tokenizer = get_zmq_socket(
-                    context, zmq.PULL, port_args.scheduler_input_ipc_name, False
-                )
-                self.send_to_tokenizer = get_zmq_socket(
+            self.recv_from_tokenizer = get_zmq_socket(
+                context, zmq.PULL, port_args.scheduler_input_ipc_name, False
+            )
+            self.send_to_tokenizer = get_zmq_socket(
+                context, zmq.PUSH, port_args.tokenizer_ipc_name, False
+            )
+
+            if server_args.skip_tokenizer_init:
+                # Directly send to the TokenizerManager
+                self.send_to_detokenizer = get_zmq_socket(
                     context, zmq.PUSH, port_args.tokenizer_ipc_name, False
                 )
-
-                if server_args.skip_tokenizer_init:
-                    # Directly send to the TokenizerManager
-                    self.send_to_detokenizer = get_zmq_socket(
-                        context, zmq.PUSH, port_args.tokenizer_ipc_name, False
-                    )
-                else:
-                    # Send to the DetokenizerManager
-                    self.send_to_detokenizer = get_zmq_socket(
-                        context, zmq.PUSH, port_args.detokenizer_ipc_name, False
-                    )
-
-                self.recv_from_rpc = get_zmq_socket(
-                    context, zmq.DEALER, port_args.rpc_ipc_name, False
+            else:
+                # Send to the DetokenizerManager
+                self.send_to_detokenizer = get_zmq_socket(
+                    context, zmq.PUSH, port_args.detokenizer_ipc_name, False
                 )
-                if self.nnodes > 1:
-                    self.publisher = get_zmq_socket(context, zmq.PUB, self.pub_sub_addr, bind=True)
-                    self.publisher_sync = get_zmq_socket(
-                        context, zmq.REP, self.pub_sub_sync_addr, bind=True
-                    )
-                    self.num_subscribers = self.nnodes - 1
+
+            self.recv_from_rpc = get_zmq_socket(context, zmq.DEALER, port_args.rpc_ipc_name, False)
+            if self.nnodes > 1:
+                self.publisher = get_zmq_socket(context, zmq.PUB, self.pub_sub_addr, bind=True)
+                self.publisher_sync = get_zmq_socket(
+                    context, zmq.REP, self.pub_sub_sync_addr, bind=True
+                )
+                self.num_subscribers = self.nnodes - 1
         else:
             self.recv_from_tokenizer = None
             self.recv_from_rpc = None
@@ -274,7 +276,7 @@ class Scheduler(
                     context, zmq.REQ, self.pub_sub_sync_addr, bind=False
                 )
 
-        if self.nnodes > 1:
+        if self.nnodes > 1 and self._comm_backend is None:
             self.sync_pub_sub()
 
         # Init tokenizer
