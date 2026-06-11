@@ -125,6 +125,13 @@ def _local_or_hf(repo: str) -> str:
     local = Path(cache) / repo
     if _validate_local_snapshot(local):
         return str(local)
+    if is_in_ci():
+        raise RuntimeError(
+            f"[test_utils] model {repo!r} is not cached under {cache} "
+            f"(expected a valid snapshot at {local}). Pre-download it into the "
+            f"model cache before running this test in CI; falling back to an HF "
+            f"download can exhaust the runner's local disk."
+        )
     if repo not in _LOCAL_MODEL_LOG_ONCE:
         _LOCAL_MODEL_LOG_ONCE.add(repo)
         print(
@@ -135,32 +142,46 @@ def _local_or_hf(repo: str) -> str:
     return repo
 
 
-DEFAULT_MODEL_NAME_FOR_TEST = _local_or_hf("Qwen/Qwen3-8B")
-DEFAULT_SMALL_MODEL_NAME_FOR_TEST = _local_or_hf("Qwen/Qwen3-1.7B")
-QWEN3_8B = _local_or_hf("Qwen/Qwen3-8B")
-QWEN_7B = _local_or_hf("Qwen/Qwen-7B")
-QWEN3_4B = _local_or_hf("Qwen/Qwen3-4B")
+# Public model-name constants map to their HuggingFace repo ids and are resolved
+# lazily via the module-level __getattr__ below (PEP 562). Resolving lazily means
+# a model that is missing from the cache only fails the test that actually
+# requests it, instead of breaking import of this module for every test suite.
+_MODEL_REPOS: dict[str, str] = {
+    "DEFAULT_MODEL_NAME_FOR_TEST": "Qwen/Qwen3-8B",
+    "DEFAULT_SMALL_MODEL_NAME_FOR_TEST": "Qwen/Qwen3-1.7B",
+    "QWEN3_8B": "Qwen/Qwen3-8B",
+    "QWEN_7B": "Qwen/Qwen-7B",
+    "QWEN3_4B": "Qwen/Qwen3-4B",
+    "QWEN3_MOE_30B": "Qwen/Qwen3-30B-A3B",
+    "QWEN2_5_7B_INSTRUCT": "Qwen/Qwen2.5-7B-Instruct",
+    "QWEN3_CODER_30B_A3B_INSTRUCT": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+    "GEMMA2_2B_IT": "google/gemma-2-2b-it",
+    "BAILING_MOE": "inclusionAI/Ling-mini-2.0",
+    "DEEPSEEK_R1_DISTILL_QWEN_1_5B": "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
+    "DEEPSEEK_V2_LITE": "deepseek-ai/DeepSeek-V2-Lite",
+    "DEEPSEEK_CODER_V2_LITE_INSTRUCT": "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct",
+    "QWEN3_32B": "Qwen/Qwen3-32B",
+    "QWEN3_32B_EAGLE3": "AngelSlim/Qwen3-32B_eagle3",
+    "WAN2_1_T2V_1_3B": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+    "WAN2_1_T2V_14B": "Wan-AI/Wan2.1-T2V-14B-Diffusers",
+    "MIMO_AUDIO_7B_INSTRUCT": "XiaomiMiMo/MiMo-Audio-7B-Instruct",
+    "UMT5_BASE": "google/umt5-base",
+    "QWEN3_OMNI_30B_A3B_INSTRUCT": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+}
+_RESOLVED_MODEL_PATHS: dict[str, str] = {}
 
-QWEN3_MOE_30B = _local_or_hf("Qwen/Qwen3-30B-A3B")
+# Hardcoded local-only path (no HF fallback); kept as an eager constant.
 QWEN3_5_35B_A3B = "/models/Qwen3.5-35B-A3B/"
-QWEN2_5_7B_INSTRUCT = _local_or_hf("Qwen/Qwen2.5-7B-Instruct")
-QWEN3_CODER_30B_A3B_INSTRUCT = _local_or_hf("Qwen/Qwen3-Coder-30B-A3B-Instruct")
-GEMMA2_2B_IT = _local_or_hf("google/gemma-2-2b-it")
 
-BAILING_MOE = _local_or_hf("inclusionAI/Ling-mini-2.0")
-DEEPSEEK_R1_DISTILL_QWEN_1_5B = _local_or_hf("deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B")
-DEEPSEEK_V2_LITE = _local_or_hf("deepseek-ai/DeepSeek-V2-Lite")
-DEEPSEEK_CODER_V2_LITE_INSTRUCT = _local_or_hf("deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct")
 
-QWEN3_32B = _local_or_hf("Qwen/Qwen3-32B")
-QWEN3_32B_EAGLE3 = _local_or_hf("AngelSlim/Qwen3-32B_eagle3")
+def __getattr__(name: str) -> str:
+    repo = _MODEL_REPOS.get(name)
+    if repo is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    if name not in _RESOLVED_MODEL_PATHS:
+        _RESOLVED_MODEL_PATHS[name] = _local_or_hf(repo)
+    return _RESOLVED_MODEL_PATHS[name]
 
-WAN2_1_T2V_1_3B = _local_or_hf("Wan-AI/Wan2.1-T2V-1.3B-Diffusers")
-WAN2_1_T2V_14B = _local_or_hf("Wan-AI/Wan2.1-T2V-14B-Diffusers")
-
-MIMO_AUDIO_7B_INSTRUCT = _local_or_hf("XiaomiMiMo/MiMo-Audio-7B-Instruct")
-UMT5_BASE = _local_or_hf("google/umt5-base")
-QWEN3_OMNI_30B_A3B_INSTRUCT = _local_or_hf("Qwen/Qwen3-Omni-30B-A3B-Instruct")
 
 DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 600
 
