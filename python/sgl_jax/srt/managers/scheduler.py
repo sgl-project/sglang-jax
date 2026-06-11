@@ -565,6 +565,15 @@ class Scheduler(
         server_args = self.server_args
         self.model_config = ModelConfig.from_server_args(server_args)
         self.is_generation = self.model_config.is_generation
+        # In-model multimodal (e.g. MiMo-V2.5 / Qwen2.5-VL routed via the standard server WITHOUT
+        # --multimodal) must also run with overlap schedule OFF: the per-req encode pass
+        # (encode_mm_reqs) runs synchronously on the scheduler thread before the batch, which does
+        # not compose with the overlapped (pipelined) decode -> corrupted decode (degenerate
+        # output). Mirror the --multimodal disable above for the is_multimodal case. (The staged
+        # path got this for free via the --multimodal flag.)
+        if getattr(self.model_config, "is_multimodal", False) and self.enable_overlap:
+            logger.info("In-model multimodal: disabling overlap schedule")
+            self.enable_overlap = False
         if server_args.skip_tokenizer_init:
             self.tokenizer = self.processor = None
         else:
