@@ -114,6 +114,7 @@ class EAGLEWorker(BaseSpecWorker):
     # -- Precompilation --
 
     def run_spec_decode_precompile(self):
+        self.init_spec_relay_buffers()
         self.precompile_spec_extend()
         self.precompile_spec_decode()
         # FIXME precompile some kernel
@@ -159,7 +160,11 @@ class EAGLEWorker(BaseSpecWorker):
                         "[SPEC_EXTEND] skip fused precompile because fused spec prefill is disabled"
                     )
                     continue
-                self.forward_batch_speculative_generation(model_worker_batch)
+                if self.spec_relay_buffers is not None:
+                    self.forward_batch_speculative_prefill_overlap(model_worker_batch)
+                    jax.block_until_ready(self.spec_relay_buffers)
+                else:
+                    self.forward_batch_speculative_generation(model_worker_batch)
         end_time = time.perf_counter()
         logger.info("[SPEC_EXTEND] Precompile finished in %.0f secs", end_time - start_time)
 
@@ -248,7 +253,7 @@ class EAGLEWorker(BaseSpecWorker):
                     allocate_lens=model_worker_batch.seq_lens
                     + EagleDraftInput.ALLOC_LEN_PER_DECODE,
                 )
-                if hasattr(self, "spec_relay_buffers"):
+                if self.spec_relay_buffers is not None:
                     model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
                     model_worker_batch.spec_info_padded = spec_info
                     model_worker_batch.speculative_eagle_topk = self.topk
@@ -275,7 +280,7 @@ class EAGLEWorker(BaseSpecWorker):
                 model_worker_batch.speculative_eagle_topk = self.topk
                 model_worker_batch.speculative_num_draft_tokens = self.speculative_num_draft_tokens
                 model_worker_batch.speculative_num_steps = self.speculative_num_steps
-                if hasattr(self, "spec_relay_buffers"):
+                if self.spec_relay_buffers is not None:
                     self.forward_batch_speculative_decode_overlap(model_worker_batch)
                     jax.block_until_ready(self.spec_relay_buffers)
                 else:

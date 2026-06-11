@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from typing import TYPE_CHECKING
 
@@ -114,20 +115,8 @@ class SchedulerOutputProcessorMixin:
         )
         if self.enable_overlap:
             if self.spec_algorithm is not None and not self.spec_algorithm.is_none():
-                from sgl_jax.srt.speculative.overlap_worker import PendingPrefillResult
-
-                pending = (
-                    getattr(result.next_draft_input, "pending_draft_extend_result", None)
-                    if result.next_draft_input is not None
-                    else None
-                )
-                if isinstance(pending, PendingPrefillResult):
-                    result = pending.materialize(launch_done)
-                else:
-                    result = self.draft_worker.resolve_last_prefill_result(launch_done)
-                logits_output = result.logits_output
-                next_token_ids = result.next_token_ids
-                cache_miss_count = result.cache_miss_count
+                if launch_done is not None:
+                    launch_done.wait()
             else:
                 logits_output, next_token_ids, cache_miss_count = (
                     self.tp_worker.resolve_last_batch_result(launch_done)
@@ -320,6 +309,13 @@ class SchedulerOutputProcessorMixin:
             )
             for r, s in enumerate(per_rank_spec):
                 batch.reqs_info[r].spec_info = s
+            if os.getenv("SGL_JAX_SPEC_RELAY_DEBUG_ASSERT") == "1":
+                for info in batch.reqs_info:
+                    if info.reqs:
+                        assert (
+                            info.spec_info is not None
+                            and getattr(info.spec_info, "future_indices", None) is not None
+                        ), "spec relay prefill output must carry future_indices"
 
     def process_batch_result_decode(
         self: Scheduler,
@@ -334,7 +330,7 @@ class SchedulerOutputProcessorMixin:
         )
         is_spec_decode = self.spec_algorithm is not None and not self.spec_algorithm.is_none()
         if is_spec_decode:
-            from sgl_jax.srt.speculative.overlap_worker import (
+            from sgl_jax.srt.speculative.overlap_utils import (
                 resolve_spec_decode_token_ids,
             )
 

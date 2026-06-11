@@ -15,6 +15,7 @@ from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.speculative.relay_buffer import (
     gather_spec_relay_buffers,
+    make_dp_valid_mask,
     update_spec_relay_buffers,
 )
 
@@ -722,6 +723,7 @@ def _build_fused_greedy_prefill_jit(num_layers: int, topk: int):
             "num_layers",
             "dp_size",
             "per_dp_bs",
+            "update_relay",
         ],
     )
     def fused_greedy_prefill(
@@ -738,10 +740,14 @@ def _build_fused_greedy_prefill_jit(num_layers: int, topk: int):
         draft_logits_indices,
         all_memory_pools,
         draft_logits_metadata,
+        relay_buffers,
+        relay_future_indices,
+        relay_valid_mask,
         *,
         num_layers,
         dp_size,
         per_dp_bs,
+        update_relay,
     ):
         target_state = jax.tree_util.tree_unflatten(target_model_state_def, target_leaves)
         target_model = nnx.merge(target_model_def, target_state)
@@ -805,12 +811,29 @@ def _build_fused_greedy_prefill_jit(num_layers: int, topk: int):
             stacked_idx = jnp.stack([idx[:, 0] for idx in all_topk_index], axis=1)
         else:
             stacked_idx = jnp.stack(all_topk_index, axis=1)
+        relay_hidden = selected_layer0_hidden
+        relay_topk_index = stacked_idx
+        relay_verified_id = next_token_ids
+        relay_new_seq_lens = target_forward_batch.seq_lens + 1
         if mesh is not None:
             rep = NamedSharding(mesh, P())
             data_sharding = NamedSharding(mesh, P("data"))
             next_token_ids = jax.sharding.reshard(jnp.copy(next_token_ids), data_sharding)
             selected_layer0_hidden = jax.sharding.reshard(selected_layer0_hidden, rep)
             stacked_idx = jax.sharding.reshard(stacked_idx, rep)
+
+        updated_relay_buffers = relay_buffers
+        if update_relay:
+            updated_relay_buffers = update_spec_relay_buffers(
+                relay_buffers,
+                relay_future_indices,
+                relay_valid_mask,
+                relay_topk_index,
+                relay_hidden,
+                relay_verified_id,
+                relay_new_seq_lens,
+                dp_size=dp_size,
+            )
 
         return (
             target_output,
@@ -819,6 +842,7 @@ def _build_fused_greedy_prefill_jit(num_layers: int, topk: int):
             tuple(all_pool_updates),
             selected_layer0_hidden,
             stacked_idx,
+            updated_relay_buffers,
         )
 
     return fused_greedy_prefill
@@ -1160,7 +1184,7 @@ def draft_extend_for_decode_fused(draft_worker, model_worker_batch, batch_output
     restore_fused_draft_extend_result(draft_worker, model_worker_batch, pending_result)
 
 
-def spec_prefill(spec_worker, model_worker_batch, launch_done=None):
+def spec_prefill(spec_worker, model_worker_batch, launch_done=None, *, update_relay=False):
     """Run greedy prefill target forward and MTP draft-extend in one JIT."""
     from sgl_jax.srt.managers.scheduler import GenerationBatchResult
     from sgl_jax.srt.model_executor.forward_batch_info import (
@@ -1226,6 +1250,21 @@ def spec_prefill(spec_worker, model_worker_batch, launch_done=None):
             topk=draft_worker.topk,
         )
 
+    data_sharding = NamedSharding(draft_worker.mesh, P("data"))
+    relay_buffers = getattr(spec_worker, "spec_relay_buffers", None)
+    valid_mask = make_dp_valid_mask(
+        model_worker_batch.real_bs_per_dp,
+        total_bs=model_worker_batch.req_pool_indices.shape[0],
+        per_dp_bs=model_worker_batch.per_dp_bs_size,
+    )
+    safe_indices = np.where(
+        valid_mask,
+        np.asarray(model_worker_batch.req_pool_indices, dtype=np.int32),
+        0,
+    )
+    relay_future_indices = _device_array_preserve_device(safe_indices, data_sharding)
+    relay_valid_mask = _device_array_preserve_device(valid_mask, data_sharding)
+
     with jax.set_mesh(draft_worker.mesh), jtu.count_pjit_cpp_cache_miss() as count:
         (
             logits_output,
@@ -1234,6 +1273,7 @@ def spec_prefill(spec_worker, model_worker_batch, launch_done=None):
             all_pool_updates,
             layer0_hidden,
             topk_index_stacked,
+            updated_relay_buffers,
         ) = draft_worker._fused_greedy_prefill_jit_fn(
             target_mr._model_def,
             target_mr._model_state_def,
@@ -1248,9 +1288,13 @@ def spec_prefill(spec_worker, model_worker_batch, launch_done=None):
             draft_logits_indices,
             tuple(all_memory_pools),
             draft_logits_metadata,
+            relay_buffers,
+            relay_future_indices,
+            relay_valid_mask,
             num_layers=draft_worker.speculative_num_steps,
             dp_size=model_worker_batch.dp_size,
             per_dp_bs=model_worker_batch.per_dp_bs_size,
+            update_relay=update_relay,
         )
         cache_miss_count = count()
 
@@ -1260,6 +1304,8 @@ def spec_prefill(spec_worker, model_worker_batch, launch_done=None):
     target_mr.memory_pools.replace_all(target_pool_updates)
     for i, w in enumerate(draft_worker._workers):
         w.model_runner.memory_pools.replace_all(all_pool_updates[i])
+    if update_relay:
+        spec_worker.spec_relay_buffers = updated_relay_buffers
 
     relay_next_token_ids = next_token_ids
     host_next_token_ids = next_token_ids
@@ -1269,6 +1315,27 @@ def spec_prefill(spec_worker, model_worker_batch, launch_done=None):
         host_next_token_ids = process_allgather(host_next_token_ids, tiled=True)
 
     sel = np.asarray(model_worker_batch.logits_indices_selector)
+    if update_relay:
+        from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
+
+        future_indices = np.asarray(model_worker_batch.req_pool_indices, dtype=np.int32)[sel]
+        model_worker_batch.spec_info_padded = EagleDraftInput(
+            future_indices=future_indices,
+            allocate_lens=np.asarray(model_worker_batch.seq_lens, dtype=np.int32)[sel],
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+            num_tokens_per_batch=np.asarray(1, dtype=np.int32),
+            num_tokens_for_logprob_per_batch=np.asarray(1, dtype=np.int32),
+        )
+        return GenerationBatchResult(
+            logits_output=logits_output,
+            next_token_ids=relay_next_token_ids if launch_done is not None else host_next_token_ids,
+            next_draft_input=model_worker_batch.spec_info_padded,
+            bid=model_worker_batch.bid,
+            cache_miss_count=cache_miss_count,
+            extend_input_len_per_req=None,
+            extend_logprob_start_len_per_req=None,
+        )
+
     jax.copy_to_host_async(host_next_token_ids)
     jax.copy_to_host_async(layer0_hidden)
     jax.copy_to_host_async(topk_index_stacked)
@@ -1289,6 +1356,10 @@ def spec_prefill(spec_worker, model_worker_batch, launch_done=None):
         extend_input_len_per_req=None,
         extend_logprob_start_len_per_req=None,
     )
+
+
+def spec_prefill_overlap(spec_worker, model_worker_batch):
+    return spec_prefill(spec_worker, model_worker_batch, update_relay=True)
 
 
 def spec_decode_verify_phase(spec_worker, model_worker_batch, cur_allocate_lens):
@@ -1425,7 +1496,7 @@ def spec_decode_overlap(spec_worker, model_worker_batch, cur_allocate_lens):
         sel
     ]
 
-    from sgl_jax.srt.speculative.overlap_worker import publish_spec_decode_new_seq_lens
+    from sgl_jax.srt.speculative.overlap_utils import publish_spec_decode_new_seq_lens
     from sgl_jax.srt.speculative.relay_buffer import make_dp_valid_mask
 
     published_new_seq_lens = publish_spec_decode_new_seq_lens(batch_output)

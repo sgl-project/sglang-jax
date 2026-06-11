@@ -77,8 +77,9 @@ from sgl_jax.srt.multimodal.tokenizer_utils import resolve_tokenizer_subdir
 from sgl_jax.srt.precision_tracer import precision_tracer
 from sgl_jax.srt.server_args import PortArgs, ServerArgs
 from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
-from sgl_jax.srt.speculative.overlap_worker import (
+from sgl_jax.srt.speculative.overlap_utils import (
     can_use_spec_decode_overlap,
+    can_use_spec_prefill_overlap,
     publish_spec_decode_new_seq_lens,
 )
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -338,10 +339,8 @@ class Scheduler(
                 server_args=server_args,
                 target_worker=self.tp_worker,
             )
-            if self.enable_overlap:
-                from sgl_jax.srt.speculative.overlap_worker import SpecWorkerClient
-
-                self.draft_worker = SpecWorkerClient(self.draft_worker)
+            if self.enable_overlap and hasattr(self.draft_worker, "init_spec_relay_buffers"):
+                self.draft_worker.init_spec_relay_buffers()
 
         # Get token and memory info from the model worker
         (
@@ -1938,10 +1937,18 @@ class Scheduler(
             use_spec_decode_overlap = can_use_spec_decode_overlap(
                 self.enable_overlap, self.spec_algorithm, batch
             )
+            use_spec_prefill_overlap = can_use_spec_prefill_overlap(
+                self.enable_overlap, self.spec_algorithm, batch
+            )
             if use_spec_decode_overlap:
                 batch_output, published_new_seq_lens = (
                     self.draft_worker.forward_batch_speculative_decode_overlap(model_worker_batch)
                 )
+            elif use_spec_prefill_overlap:
+                batch_output = self.draft_worker.forward_batch_speculative_prefill_overlap(
+                    model_worker_batch
+                )
+                published_new_seq_lens = None
             else:
                 batch_output = self.draft_worker.forward_batch_speculative_generation(
                     model_worker_batch

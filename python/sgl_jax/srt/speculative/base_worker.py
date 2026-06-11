@@ -96,6 +96,7 @@ class BaseSpecWorker:
             self.precompile_bs_paddings,
             self.precompile_cache_loc_paddings,
         ) = target_worker.get_precompile_paddings()
+        self.spec_relay_buffers = None
 
     @property
     def target_worker(self) -> ModelWorker:
@@ -104,6 +105,21 @@ class BaseSpecWorker:
     @property
     def draft_worker(self) -> BaseDraftWorker:
         return self._draft_worker
+
+    def init_spec_relay_buffers(self):
+        if self.spec_relay_buffers is not None:
+            return
+        from sgl_jax.srt.speculative.relay_buffer import create_spec_relay_buffers
+
+        hidden_dtype = jnp.bfloat16 if self.server_args.dtype == "bfloat16" else jnp.float32
+        self.spec_relay_buffers = create_spec_relay_buffers(
+            self.mesh,
+            self.req_to_token_pool,
+            dp_size=self.server_args.dp_size,
+            num_steps=self.speculative_num_steps,
+            hidden_size=self.target_worker.model_config.hidden_size,
+            hidden_dtype=hidden_dtype,
+        )
 
     def _can_use_fused_spec_prefill(self, model_worker_batch: ModelWorkerBatch) -> bool:
         if os.getenv("SGL_JAX_DISABLE_FUSED_SPEC_PREFILL") == "1":
@@ -148,6 +164,7 @@ class BaseSpecWorker:
         if not (self._can_use_fused_spec_decode and model_worker_batch.sampling_info.is_all_greedy):
             raise NotImplementedError("Spec overlap entry only supports fused greedy decode.")
 
+        self.init_spec_relay_buffers()
         self._prepare_overlap_sampling_info(model_worker_batch)
         sel = model_worker_batch.logits_indices_selector
         cur_allocate_lens = np.asarray(model_worker_batch.spec_info_padded.allocate_lens)[sel]
@@ -155,6 +172,28 @@ class BaseSpecWorker:
         from sgl_jax.srt.speculative.draft_extend_fused import spec_decode_overlap
 
         result = spec_decode_overlap(self, model_worker_batch, cur_allocate_lens)
+        launch_done = getattr(model_worker_batch, "launch_done", None)
+        if launch_done is not None:
+            launch_done.set()
+        return result
+
+    def forward_batch_speculative_prefill_overlap(self, model_worker_batch: ModelWorkerBatch):
+        if not model_worker_batch.forward_mode.is_extend():
+            raise NotImplementedError("Spec prefill-overlap entry only supports extend batches.")
+        if not self._can_use_fused_spec_prefill(model_worker_batch):
+            raise NotImplementedError("Spec prefill overlap only supports fused greedy prefill.")
+
+        self.init_spec_relay_buffers()
+        self._prepare_overlap_sampling_info(model_worker_batch)
+
+        from sgl_jax.srt.speculative.draft_extend_fused import (
+            prepare_spec_prefill_forward_batch,
+            spec_prefill_overlap,
+        )
+
+        if getattr(model_worker_batch, "forward_batch", None) is None:
+            prepare_spec_prefill_forward_batch(self, model_worker_batch)
+        result = spec_prefill_overlap(self, model_worker_batch)
         launch_done = getattr(model_worker_batch, "launch_done", None)
         if launch_done is not None:
             launch_done.set()

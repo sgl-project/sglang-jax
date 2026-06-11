@@ -1527,7 +1527,7 @@ class ScheduleBatch:
                 ):
                     info.spec_info.trim_to_length(len(info.reqs))
             flat_spec = self._concat_spec_info_per_rank([info.spec_info for info in self.reqs_info])
-            if getattr(flat_spec, "pending_draft_extend_result", None) is None:
+            if getattr(flat_spec, "pending_draft_extend_result", None) is not None:
                 flat_spec.resolve_pending_draft_extend_result()
             flat_spec.prepare_for_decode(self)
             real_bs_per_dp = [len(info.reqs) if info.reqs else 0 for info in self.reqs_info]
@@ -2398,7 +2398,8 @@ class ScheduleBatch:
         # aligns with seq_lens[i]. Returns a new object — does not mutate
         # the per-rank cross-round state on reqs_info[r].spec_info.
         flat_spec = self._concat_spec_info_per_rank([info.spec_info for info in self.reqs_info])
-        flat_spec.resolve_pending_draft_extend_result()
+        if getattr(flat_spec, "pending_draft_extend_result", None) is not None:
+            flat_spec.resolve_pending_draft_extend_result()
         spec_info = self._scatter_spec_info_to_dp_slots(
             flat_spec, logits_indices_selector, total_bs, mesh=self.mesh
         )
@@ -2505,7 +2506,6 @@ class ScheduleBatch:
             accept_length_cpu=_scatter1(flat.accept_length_cpu),
             new_seq_lens=_scatter1(flat.new_seq_lens),
             future_indices=_scatter1(flat.future_indices),
-            pending_draft_extend_result=flat.pending_draft_extend_result,
         )
 
     @staticmethod
@@ -2519,9 +2519,10 @@ class ScheduleBatch:
         if flat is None:
             return [None] * len(real_bs_per_dp)
 
-        has_pending_draft_extend = flat.pending_draft_extend_result is not None
         has_future_indices = getattr(flat, "future_indices", None) is not None
-        if not has_pending_draft_extend and not has_future_indices:
+        if getattr(flat, "pending_draft_extend_result", None) is not None:
+            flat.resolve_pending_draft_extend_result()
+        if not has_future_indices:
             flat._ensure_host()
             required_fields = ("topk_p", "topk_index", "hidden_states", "verified_id")
             missing = [f for f in required_fields if getattr(flat, f, None) is None]
@@ -2576,7 +2577,7 @@ class ScheduleBatch:
             kwargs = {"capture_hidden_mode": flat.capture_hidden_mode}
             for f in per_req_fields:
                 v = getattr(flat, f, None)
-                if (has_pending_draft_extend or has_future_indices) and f not in (
+                if has_future_indices and f not in (
                     "allocate_lens",
                     "new_seq_lens",
                     "accept_length_cpu",
@@ -2585,12 +2586,6 @@ class ScheduleBatch:
                     kwargs[f] = None
                 else:
                     kwargs[f] = None if v is None else v[offset : offset + n]
-            if has_pending_draft_extend:
-                kwargs["pending_draft_extend_result"] = flat.make_pending_draft_extend_slice(
-                    flat.pending_draft_extend_result,
-                    offset,
-                    n,
-                )
             out.append(type(flat)(**kwargs))
             offset += n
         return out
@@ -2607,7 +2602,6 @@ class ScheduleBatch:
         if not nonempty:
             return None
 
-        pending = None
         has_future_indices = any(getattr(s, "future_indices", None) is not None for s in nonempty)
         if has_future_indices:
             assert all(getattr(s, "future_indices", None) is not None for s in nonempty), (
@@ -2615,19 +2609,8 @@ class ScheduleBatch:
                 "future_indices on the relay-buffer path"
             )
         elif any(getattr(s, "pending_draft_extend_result", None) is not None for s in nonempty):
-            from sgl_jax.srt.speculative.eagle_util import PendingDraftExtendResultSlice
-
-            pending_values = []
             for spec_info in nonempty:
-                p = getattr(spec_info, "pending_draft_extend_result", None)
-                if isinstance(p, PendingDraftExtendResultSlice):
-                    p = p.pending_draft_extend_result
-                pending_values.append(p)
-            if all(p is not None and p is pending_values[0] for p in pending_values):
-                pending = pending_values[0]
-            else:
-                for spec_info in nonempty:
-                    spec_info.resolve_pending_draft_extend_result()
+                spec_info.resolve_pending_draft_extend_result()
         else:
             for spec_info in nonempty:
                 spec_info.resolve_pending_draft_extend_result()
@@ -2646,7 +2629,6 @@ class ScheduleBatch:
 
         kwargs = {
             "capture_hidden_mode": nonempty[0].capture_hidden_mode,
-            "pending_draft_extend_result": pending,
         }
         for f in per_req_fields:
             vals = [getattr(s, f, None) for s in nonempty]

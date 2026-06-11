@@ -438,13 +438,6 @@ def build_tree_kernel_efficient(
     )
 
 
-@dataclass
-class PendingDraftExtendResultSlice:
-    pending_draft_extend_result: object
-    offset: int
-    length: int
-
-
 @register_pytree_node_class
 @dataclass
 class EagleDraftInput:
@@ -499,14 +492,6 @@ class EagleDraftInput:
     #: host ``(b,)`` — req_pool_indices used to gather relay-buffer state.
     future_indices: np.ndarray | None = None
     pending_draft_extend_result: object | None = None
-
-    @staticmethod
-    def make_pending_draft_extend_slice(pending_draft_extend_result, offset: int, length: int):
-        return PendingDraftExtendResultSlice(
-            pending_draft_extend_result=pending_draft_extend_result,
-            offset=offset,
-            length=length,
-        )
 
     # ---- SpecInput protocol -------------------------------------------------
     def is_draft_input(self) -> bool:
@@ -776,39 +761,8 @@ class EagleDraftInput:
         if self.pending_draft_extend_result is None:
             return
 
-        from sgl_jax.srt.speculative.overlap_worker import PendingPrefillResult
-
-        pending = self.pending_draft_extend_result
-        slice_obj = None
-        if isinstance(pending, PendingDraftExtendResultSlice):
-            slice_obj = slice(pending.offset, pending.offset + pending.length)
-            pending = pending.pending_draft_extend_result
-
-        def _slice(v):
-            if v is None:
-                return None
-            if slice_obj is None:
-                return v
-            return v[slice_obj]
-
-        if isinstance(pending, PendingPrefillResult):
-            batch_output = pending.resolve()
-            self.pending_draft_extend_result = None
-            if batch_output is None:
-                return
-            restored = batch_output.next_draft_input
-            self.topk_p = _slice(restored.topk_p)
-            self.topk_index = _slice(restored.topk_index)
-            self.hidden_states = _slice(restored.hidden_states)
-            self.verified_id = _slice(restored.verified_id)
-            self.allocate_lens = _slice(restored.allocate_lens)
-            return
-
         self.pending_draft_extend_result = None
-        raise RuntimeError(
-            "Unexpected decode pending_draft_extend_result. Decode overlap must use "
-            "req-granularity relay buffers; only prefill pending results may be resolved here."
-        )
+        raise RuntimeError("Spec overlap relay path must not carry pending_draft_extend_result.")
 
     @classmethod
     def create_idle_input(

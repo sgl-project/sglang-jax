@@ -26,7 +26,7 @@ FILES_TO_SYNC=(
   "python/sgl_jax/srt/speculative/base_worker.py"
   "python/sgl_jax/srt/speculative/eagle_util.py"
   "python/sgl_jax/srt/speculative/eagle_worker.py"
-  "python/sgl_jax/srt/speculative/overlap_worker.py"
+  "python/sgl_jax/srt/speculative/overlap_utils.py"
   "python/sgl_jax/srt/speculative/relay_buffer.py"
 )
 
