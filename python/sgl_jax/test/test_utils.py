@@ -118,14 +118,14 @@ def _validate_local_snapshot(d: Path) -> bool:
     return has_single_weight_file
 
 
-def _local_or_hf(repo: str) -> str:
+def _local_or_hf(repo: str, required: bool = True) -> str:
     cache = os.environ.get(_MODEL_CACHE_ENV)
     if not cache:
         return repo
     local = Path(cache) / repo
     if _validate_local_snapshot(local):
         return str(local)
-    if is_in_ci():
+    if required and is_in_ci():
         raise RuntimeError(
             f"[test_utils] model {repo!r} is not cached under {cache} "
             f"(expected a valid snapshot at {local}). Pre-download it into the "
@@ -170,6 +170,14 @@ _MODEL_REPOS: dict[str, str] = {
 }
 _RESOLVED_MODEL_PATHS: dict[str, str] = {}
 
+# Constants that are allowed to fall back to an HF download even in CI, instead
+# of hard-failing on a cache miss. EAGLE3 draft models ship without a tokenizer
+# (they reuse the target model's tokenizer), so they can never satisfy
+# _validate_local_snapshot; the speculative-decoding test also pins them to a
+# specific small revision fetched on the fly. Keep the pre-existing fallback for
+# these rather than forcing them into the cache.
+_CI_HF_FALLBACK_ALLOWED: set[str] = {"QWEN3_32B_EAGLE3"}
+
 # Hardcoded local-only path (no HF fallback); kept as an eager constant.
 QWEN3_5_35B_A3B = "/models/Qwen3.5-35B-A3B/"
 
@@ -179,7 +187,9 @@ def __getattr__(name: str) -> str:
     if repo is None:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
     if name not in _RESOLVED_MODEL_PATHS:
-        _RESOLVED_MODEL_PATHS[name] = _local_or_hf(repo)
+        _RESOLVED_MODEL_PATHS[name] = _local_or_hf(
+            repo, required=name not in _CI_HF_FALLBACK_ALLOWED
+        )
     return _RESOLVED_MODEL_PATHS[name]
 
 
