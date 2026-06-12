@@ -40,9 +40,7 @@ class TestMiMoVisionAttentionV4(unittest.TestCase):
     HEAD_DIM = 8
 
     def _build(self):
-        from sgl_jax.srt.multimodal.models.mimo_v2_5.vision_encoder import (
-            MiMoVisionAttention,
-        )
+        from sgl_jax.srt.models.mimo_v2_5.vision_encoder import MiMoVisionAttention
 
         return MiMoVisionAttention(
             hidden_size=self.HIDDEN,

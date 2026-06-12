@@ -11,7 +11,7 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
 
 from sgl_jax.srt.configs.load_config import LoadConfig
 from sgl_jax.srt.model_loader import get_model_loader
-from sgl_jax.srt.multimodal.models.qwen3_omni_moe.qwen3_omni_thinker_embedding import (
+from sgl_jax.srt.models.qwen3_omni_moe.qwen3_omni_thinker_embedding import (
     Qwen3OmniMoeThinkerEmbedding,
 )
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh

@@ -10,13 +10,9 @@ from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.layers.embeddings import Embed
-from sgl_jax.srt.multimodal.models.qwen3_omni_moe.audio_encoder import (
-    Qwen3OmniMoeAudioEncoder,
-)
-from sgl_jax.srt.multimodal.models.qwen3_omni_moe.vision_encoder import (
-    Qwen3OmniMoeVisionEncoder,
-)
-from sgl_jax.srt.multimodal.models.qwen3_omni_moe.weights_mapping import (
+from sgl_jax.srt.models.qwen3_omni_moe.audio_encoder import Qwen3OmniMoeAudioEncoder
+from sgl_jax.srt.models.qwen3_omni_moe.vision_encoder import Qwen3OmniMoeVisionEncoder
+from sgl_jax.srt.models.qwen3_omni_moe.weights_mapping import (
     create_audio_tower_weight_mappings,
     create_visual_weight_mappings,
 )

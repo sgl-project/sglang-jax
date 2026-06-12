@@ -63,7 +63,7 @@ def _install_import_stubs():
 
 _install_import_stubs()
 
-from sgl_jax.srt.multimodal.models.mimo_v2_5.audio_encoder import (  # noqa: E402
+from sgl_jax.srt.models.mimo_v2_5.audio_encoder import (  # noqa: E402
     MiMoV25AudioUnderstandingEncoder,
 )
 

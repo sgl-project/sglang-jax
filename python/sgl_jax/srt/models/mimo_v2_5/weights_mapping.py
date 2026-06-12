@@ -120,7 +120,7 @@ def create_mimo_vision_weight_mappings(
     config,
     source_prefix: str = "visual",
     target_prefix: str = "",
-) -> dict[str, "WeightMapping"]:
+) -> dict[str, WeightMapping]:
     from sgl_jax.srt.utils.weight_utils import WeightMapping
 
     mappings: dict[str, WeightMapping] = {

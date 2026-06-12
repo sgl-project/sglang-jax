@@ -29,15 +29,13 @@ import jax.numpy as jnp
 from flax import nnx
 
 from sgl_jax.srt.mm_core.merge import merge
-from sgl_jax.srt.models.mimo_v2_pro import MiMoV2ForCausalLM
-from sgl_jax.srt.multimodal.models.mimo_v2_5.audio_encoder import (
-    MiMoV25AudioUnderstandingEncoder,
-)
-from sgl_jax.srt.multimodal.models.mimo_v2_5.config_utils import (
+from sgl_jax.srt.models.mimo_v2_5.audio_encoder import MiMoV25AudioUnderstandingEncoder
+from sgl_jax.srt.models.mimo_v2_5.config_utils import (
     get_config_value,
     normalize_vision_config,
 )
-from sgl_jax.srt.multimodal.models.mimo_v2_5.vision_encoder import MiMoVisionTransformer
+from sgl_jax.srt.models.mimo_v2_5.vision_encoder import MiMoVisionTransformer
+from sgl_jax.srt.models.mimo_v2_pro import MiMoV2ForCausalLM
 
 logger = logging.getLogger(__name__)
 
@@ -150,7 +148,7 @@ class MiMoV2_5ForConditionalGeneration(nnx.Module):
         import copy
 
         from sgl_jax.srt.mm_core.weights import assert_replicated, replicate_mappings
-        from sgl_jax.srt.multimodal.models.mimo_v2_5.weights_mapping import (
+        from sgl_jax.srt.models.mimo_v2_5.weights_mapping import (
             build_input_local_mapping,
             build_projection_mapping,
             build_speech_embeddings_mapping,

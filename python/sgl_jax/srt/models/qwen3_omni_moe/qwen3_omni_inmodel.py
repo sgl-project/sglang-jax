@@ -1,6 +1,6 @@
 """In-model Qwen3-Omni Thinker (understanding, text-out) — refactor M5.
 
-Mirrors the Qwen2.5-VL in-model template (srt/multimodal/models/qwen2_5VL/qwen2_5_vl.py):
+Mirrors the Qwen2.5-VL in-model template (srt/models/qwen2_5VL/qwen2_5_vl.py):
 vision (and audio) are encoded via embed_mm() + mm_core.merge() on the standard srt control
 plane -- no staged GlobalScheduler / embed stage. Under C-1 (design §5.2) the encode runs ONCE
 per req on the host (model_runner.encode_mm_reqs) and the result is sliced per chunk; there is
@@ -36,16 +36,12 @@ import numpy as np
 from flax import nnx
 
 from sgl_jax.srt.mm_core.merge import merge
-from sgl_jax.srt.multimodal.models.qwen3_omni_moe.audio_encoder import (
-    Qwen3OmniMoeAudioEncoder,
-)
-from sgl_jax.srt.multimodal.models.qwen3_omni_moe.qwen3_omni_thinker import (
+from sgl_jax.srt.models.qwen3_omni_moe.audio_encoder import Qwen3OmniMoeAudioEncoder
+from sgl_jax.srt.models.qwen3_omni_moe.qwen3_omni_thinker import (
     Qwen3OmniMoeThinkerTextForConditionalGeneration,
 )
-from sgl_jax.srt.multimodal.models.qwen3_omni_moe.vision_encoder import (
-    Qwen3OmniMoeVisionEncoder,
-)
-from sgl_jax.srt.multimodal.models.qwen3_omni_moe.weights_mapping import (
+from sgl_jax.srt.models.qwen3_omni_moe.vision_encoder import Qwen3OmniMoeVisionEncoder
+from sgl_jax.srt.models.qwen3_omni_moe.weights_mapping import (
     create_audio_tower_weight_mappings,
     create_visual_weight_mappings,
 )

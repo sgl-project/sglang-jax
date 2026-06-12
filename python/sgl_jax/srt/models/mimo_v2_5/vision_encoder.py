@@ -557,7 +557,7 @@ class MiMoVisionTransformer(nnx.Module):
 
 
 def load_weights_from_safetensors(model: nnx.Module, model_path: str, config) -> None:
-    from sgl_jax.srt.multimodal.models.mimo_v2_5.weights_mapping import (
+    from sgl_jax.srt.models.mimo_v2_5.weights_mapping import (
         create_mimo_vision_weight_mappings,
     )
 

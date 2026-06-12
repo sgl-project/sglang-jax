@@ -11,10 +11,10 @@ import unittest
 
 import numpy as np
 
-from sgl_jax.srt.multimodal.common.modality_enum import Modality
-from sgl_jax.srt.multimodal.models.mimo_v2_5.audio_codec_processor import (
+from sgl_jax.srt.models.mimo_v2_5.audio_codec_processor import (
     MiMoV25AudioCodecProcessor,
 )
+from sgl_jax.srt.multimodal.common.modality_enum import Modality
 from sgl_jax.srt.multimodal.processors.mimo_v2_5 import MiMoV2_5Processor
 
 AUDIO_TOKEN_ID = 151669

@@ -34,12 +34,8 @@ from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.mem_cache.memory_pool import MemoryPools
 from sgl_jax.srt.mm_core.merge import merge
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
-from sgl_jax.srt.multimodal.models.qwen2_5VL.qwen2_5_vit import (
-    Qwen2_5_VL_VisionTransformer,
-)
-from sgl_jax.srt.multimodal.models.qwen2_5VL.qwen2_5_vl_generation import (
-    Qwen2_5_VL_Model,
-)
+from sgl_jax.srt.models.qwen2_5VL.qwen2_5_vit import Qwen2_5_VL_VisionTransformer
+from sgl_jax.srt.models.qwen2_5VL.qwen2_5_vl_generation import Qwen2_5_VL_Model
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)

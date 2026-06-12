@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from sgl_jax.srt.multimodal.models.mimo_v2_5.audio_codec_processor import (
+from sgl_jax.srt.models.mimo_v2_5.audio_codec_processor import (
     MiMoV25AudioCodecProcessor,
     MiMoV25AudioPayload,
 )

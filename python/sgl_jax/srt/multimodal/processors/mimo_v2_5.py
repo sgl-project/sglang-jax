@@ -54,7 +54,7 @@ class MiMoV2_5Processor(Qwen2_5_VLProcessor):
 
     def _get_codec(self):
         if self._codec is None:
-            from sgl_jax.srt.multimodal.models.mimo_v2_5.audio_codec_processor import (
+            from sgl_jax.srt.models.mimo_v2_5.audio_codec_processor import (
                 MiMoV25AudioCodecProcessor,
             )
 
@@ -71,7 +71,7 @@ class MiMoV2_5Processor(Qwen2_5_VLProcessor):
         if not audios:
             return out
 
-        from sgl_jax.srt.multimodal.models.mimo_v2_5.audio_codec_processor import (
+        from sgl_jax.srt.models.mimo_v2_5.audio_codec_processor import (
             MiMoV25AudioCodecProcessor,
         )
 
