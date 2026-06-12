@@ -12,14 +12,12 @@ __all__ = [
     "MiMoV25AudioUnderstandingEncoder",
     "MiMoV25AudioCodecProcessor",
     "MiMoV25AudioPayload",
-    "MiMoV25Processor",
 ]
 
 _LAZY = {
     "MiMoV25AudioUnderstandingEncoder": ("audio_encoder", "MiMoV25AudioUnderstandingEncoder"),
     "MiMoV25AudioCodecProcessor": ("audio_codec_processor", "MiMoV25AudioCodecProcessor"),
     "MiMoV25AudioPayload": ("audio_codec_processor", "MiMoV25AudioPayload"),
-    "MiMoV25Processor": ("processor", "MiMoV25Processor"),
 }
 
 

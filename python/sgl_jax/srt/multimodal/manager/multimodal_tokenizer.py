@@ -36,7 +36,6 @@ from sgl_jax.srt.managers.io_struct import (
 )
 from sgl_jax.srt.managers.tokenizer_manager import ReqState, TokenizerManager
 from sgl_jax.srt.multimodal.common.modality_enum import Modality, MultimodalDataItem
-from sgl_jax.srt.multimodal.manager.host_processor import resolve_host_processor
 from sgl_jax.srt.multimodal.manager.io_struct import (
     AudioSpeechRequest,
     AudioTranscriptionRequest,
@@ -320,17 +319,6 @@ class MultimodalTokenizer(TokenizerManager):
                     logger.warning("Failed to load processor/config from %s: %s", candidate, exc)
 
         self.wait_timeout = int(os.environ.get("SGLANG_WAIT_TIMEOUT", "600"))
-
-        # Some omni models need a composed host processor (e.g. MiMo-V2.5 wraps the
-        # vision-only Qwen2.5-VL processor + a host RVQ audio codec). resolve_host_processor
-        # returns the original mm_processor unchanged for models on the generic path.
-        if self.mm_processor is not None:
-            self.mm_processor = resolve_host_processor(
-                self.mm_config,
-                model_path,
-                self.mm_processor,
-                trust_remote_code=getattr(server_args, "trust_remote_code", True),
-            )
 
         self.prompt_builder = MultimodalPromptBuilder(tokenizer=self.tokenizer)
 
