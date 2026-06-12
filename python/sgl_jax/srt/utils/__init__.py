@@ -3,6 +3,7 @@ from .common_utils import (
     ConcurrentCounter,
     RWLock,
     add_api_key_middleware,
+    add_prometheus_middleware,
     cdiv,
     configure_logger,
     dataclass_to_string_truncated,
@@ -14,5 +15,6 @@ from .common_utils import (
     launch_dummy_health_check_server,
     prepare_model_and_tokenizer,
     set_ulimit,
+    set_prometheus_multiproc_dir,
     set_uvicorn_logging_configs,
 )

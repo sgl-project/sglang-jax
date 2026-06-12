@@ -75,8 +75,10 @@ from sgl_jax.srt.reasoning_parser import ReasoningParser
 from sgl_jax.srt.server_args import ServerArgs
 from sgl_jax.srt.utils import (
     add_api_key_middleware,
+    add_prometheus_middleware,
     get_bool_env_var,
     kill_process_tree,
+    set_prometheus_multiproc_dir,
     set_uvicorn_logging_configs,
 )
 from sgl_jax.utils import get_exception_traceback
@@ -803,6 +805,12 @@ def launch(
     # Initialize precision tracer enable state in HTTP server process
     precision_tracer.set_enable_precision_tracer(server_args.enable_precision_tracer)
 
+    # Set the prometheus multiprocess dir before spawning subprocesses so that
+    # the scheduler subprocess inherits the env var and writes its PD metrics
+    # into the shared mmap directory that the front-end /metrics aggregates.
+    if server_args.enable_metrics:
+        set_prometheus_multiproc_dir()
+
     tokenizer_manager, template_manager, scheduler_info = _launch_subprocesses_or_threads(
         server_args=server_args, port_args=None
     )
@@ -820,6 +828,10 @@ def launch(
     # Add api key authorization
     if server_args.api_key:
         add_api_key_middleware(app, server_args.api_key)
+
+    # Expose PD prometheus metrics on /metrics (multiprocess aggregation).
+    if server_args.enable_metrics:
+        add_prometheus_middleware(app)
 
     # Send a warmup request - we will create the thread launch it
     # in the lifespan after all other warmups have fired.
