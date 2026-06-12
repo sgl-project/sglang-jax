@@ -7,7 +7,12 @@ from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.eplb.expert_location import get_global_expert_location_metadata
-from sgl_jax.srt.kernels.fused_moe.v1.kernel import FusedMoEBlockConfig, fused_ep_moe
+from sgl_jax.srt.kernels.fused_moe.v1.kernel import (
+    FusedMoEBlockConfig,
+    fused_ep_moe,
+    get_dtype_packing,
+    get_ep_size,
+)
 from sgl_jax.srt.utils.quantization.quantization_utils import quantize_tensor
 
 
@@ -470,6 +475,36 @@ class FusedEPMoE(nnx.Module):
         """Forward pass through the fused MoE layer."""
         assert hidden_states.ndim == 2
 
+        # The fused kernel requires num_tokens to be a multiple of
+        # ep_size * t_packing: it shards tokens across ep_size devices and the
+        # per-device token count (local_num_tokens) must align to t_packing
+        # (2 for bf16, 4 for fp8). Small decode batches (e.g. bs=8 with ep=8 ->
+        # local_num_tokens=1) violate this. Pad the token axis up to the next
+        # valid multiple with zero-weight rows (they select expert 0 but
+        # contribute nothing), then slice the real tokens back out.
+        #
+        # ep_size must match what the kernel derives from the mesh
+        # (get_ep_size = dp * tp), NOT self.ep_size — the latter comes from the
+        # model config (often defaulting to 1) and would under-pad.
+        num_tokens = hidden_states.shape[0]
+        t_packing = get_dtype_packing(self.dtype)
+        kernel_ep_size = get_ep_size(self.mesh, "data", "tensor")
+        token_multiple = kernel_ep_size * t_packing
+        pad = (-num_tokens) % token_multiple
+        if pad:
+            hidden_states = jnp.concatenate(
+                [hidden_states, jnp.zeros((pad, hidden_states.shape[1]), hidden_states.dtype)],
+                axis=0,
+            )
+            topk_weights = jnp.concatenate(
+                [topk_weights, jnp.zeros((pad, topk_weights.shape[1]), topk_weights.dtype)],
+                axis=0,
+            )
+            topk_ids = jnp.concatenate(
+                [topk_ids, jnp.zeros((pad, topk_ids.shape[1]), topk_ids.dtype)],
+                axis=0,
+            )
+
         w1_shared_val = self.w1_shared.value if self.w1_shared is not None else None
         w3_shared_val = self.w3_shared.value if self.w3_shared is not None else None
         w2_shared_val = self.w2_shared.value if self.w2_shared is not None else None
@@ -529,6 +564,8 @@ class FusedEPMoE(nnx.Module):
         if out_sharding is None:
             out_sharding = jax.sharding.NamedSharding(self.mesh, P(*([None] * output.ndim)))
         output = jax.sharding.reshard(output, out_sharding)
+        if pad:
+            output = output[:num_tokens]
         return output
 
 
