@@ -1959,7 +1959,7 @@ def calculate_metrics(
     use_retokenized_itl = (
         accept_length is not None
         and accept_length > 0
-        and backend in ("sglang-oai", "sglang-oai-chat")
+        and backend in ("sglang-oai", "sglang-oai-chat", "vllm", "vllm-chat")
     )
 
     for i in range(len(outputs)):
