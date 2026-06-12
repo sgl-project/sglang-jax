@@ -201,6 +201,8 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
+      issues: write
+      id-token: write
     uses: ./.github/workflows/nightly-test-daily.yml
     with:
       ref: ${{ needs.handle-command.outputs.pull_ref }}
