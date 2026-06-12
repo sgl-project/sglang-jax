@@ -15,6 +15,9 @@ concurrency:
   group: pr-test-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+permissions:
+  contents: read
+
 jobs:
   # =============================================== coordinator ====================================================
   coordinator:
@@ -158,7 +161,7 @@ jobs:
         part: [0]
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Python environment
         uses: ./.github/actions/setup-venv
@@ -187,7 +190,7 @@ jobs:
         part: [0]
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Python environment
         uses: ./.github/actions/setup-venv
@@ -272,7 +275,7 @@ jobs:
         part: [0]
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Python environment
         uses: ./.github/actions/setup-venv
@@ -300,7 +303,7 @@ jobs:
         part: [0, 1]
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Python environment
         uses: ./.github/actions/setup-venv
