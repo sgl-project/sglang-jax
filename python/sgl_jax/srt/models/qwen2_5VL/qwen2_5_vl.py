@@ -137,6 +137,7 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
         mm_video_grid_thw=None,
         mm_audio_features=None,
         mm_audio_feature_lengths=None,
+        mm_audio_codes=None,  # uniform embed_mm contract; Qwen2.5-VL has no audio -> always None
         mm_real_llm_dims=None,
         mm_real_video_llm_dims=None,
     ):

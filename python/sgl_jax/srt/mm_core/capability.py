@@ -27,6 +27,24 @@ _MODALITY_ENCODERS = {
     "audio": "encode_audio",
 }
 
+# The keyword params ModelRunner.encode_mm_reqs / jitted_embed_mm pass to EVERY model.embed_mm
+# (beyond the positional input_ids). The "uniform embed_mm signature" the model docstrings promise
+# is otherwise unenforced: V-2 added mm_real_* and M5 added mm_audio_codes without updating the
+# other two models, so their media requests TypeError'd at encode (review H-1). reconcile_mm_capability
+# asserts at startup that every mm-capable model accepts all of these (or **kwargs). Keep in lockstep
+# with model_runner.jitted_embed_mm.
+EMBED_MM_CONTRACT_PARAMS = (
+    "mm_pixel_values",
+    "mm_grid_thw",
+    "mm_pixel_values_videos",
+    "mm_video_grid_thw",
+    "mm_audio_features",
+    "mm_audio_feature_lengths",
+    "mm_audio_codes",
+    "mm_real_llm_dims",
+    "mm_real_video_llm_dims",
+)
+
 
 def supported_modalities(model_cls) -> set[str]:
     """Modalities a model class can encode.
@@ -121,6 +139,29 @@ def find_capability_inconsistencies(
             f"multimodal model archs declare capability but have no registered processor: "
             f"{missing} -- register a BaseMultimodalProcessor(models=[...]) for each"
         )
+
+    # (3) Uniform embed_mm contract (review H-1): ModelRunner.encode_mm_reqs calls model.embed_mm
+    # with a fixed kwarg set (EMBED_MM_CONTRACT_PARAMS); every mm-capable model must accept all of
+    # them (or **kwargs), else media requests TypeError at the first encode trace. Enforce here so
+    # the "uniform signature" the docstrings promise can never silently drift again.
+    import inspect
+
+    for arch, cls in registered_archs.items():
+        if not is_multimodal_arch(cls):
+            continue
+        fn = getattr(cls, "embed_mm", None)
+        if fn is None:
+            errors.append(f"{arch!r} is multimodal but defines no embed_mm")
+            continue
+        params = inspect.signature(fn).parameters
+        if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+            continue  # **kwargs accepts the whole contract
+        missing_kw = [k for k in EMBED_MM_CONTRACT_PARAMS if k not in params]
+        if missing_kw:
+            errors.append(
+                f"{arch!r}.embed_mm is missing encode-pass params {missing_kw}; the uniform "
+                f"embed_mm contract requires {list(EMBED_MM_CONTRACT_PARAMS)} (or **kwargs)"
+            )
     return errors
 
 

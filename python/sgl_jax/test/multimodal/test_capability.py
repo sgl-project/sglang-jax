@@ -16,6 +16,9 @@ class _ImageVLM:
     def encode_image(self, items):  # noqa: D401 - test stub
         return None
 
+    def embed_mm(self, input_ids, **kwargs):  # satisfies the EMBED_MM contract (review H-1)
+        return None
+
 
 class _OmniVLM:
     audio_kind = "features"
@@ -28,6 +31,9 @@ class _OmniVLM:
         return None
 
     def encode_audio(self, items):
+        return None
+
+    def embed_mm(self, input_ids, **kwargs):
         return None
 
 
@@ -44,6 +50,54 @@ class _ExplicitMarker:
 
 class _ExplicitModalities:
     supported_modalities = ("image",)  # explicit override; no encode_image method
+
+
+class _ExplicitContractVLM:
+    """Spells out the whole EMBED_MM contract explicitly (no **kwargs) -> must pass (review H-1)."""
+
+    def encode_image(self, items):
+        return None
+
+    def embed_mm(
+        self,
+        input_ids,
+        mm_pixel_values=None,
+        mm_grid_thw=None,
+        mm_pixel_values_videos=None,
+        mm_video_grid_thw=None,
+        mm_audio_features=None,
+        mm_audio_feature_lengths=None,
+        mm_audio_codes=None,
+        mm_real_llm_dims=None,
+        mm_real_video_llm_dims=None,
+    ):
+        return None
+
+
+class _DriftedEmbedMM:
+    """embed_mm predating M5/V-2: missing mm_audio_codes/mm_real_*, no **kwargs -> the H-1 drift."""
+
+    def encode_image(self, items):
+        return None
+
+    def embed_mm(
+        self,
+        input_ids,
+        mm_pixel_values=None,
+        mm_grid_thw=None,
+        mm_pixel_values_videos=None,
+        mm_video_grid_thw=None,
+        mm_audio_features=None,
+        mm_audio_feature_lengths=None,
+    ):
+        return None
+
+
+class _NoEmbedMM:
+    """Declares a modality encoder (mm-capable) but never defines embed_mm at all."""
+
+    def encode_image(self, items):
+        return None
 
 
 class TestCapability(unittest.TestCase):
@@ -106,6 +160,36 @@ class TestReconcile(unittest.TestCase):
         self.assertIn("Img", joined)
         self.assertIn("Omni", joined)
         self.assertNotIn("Txt", joined)
+
+    # ----- (3) uniform embed_mm contract drift (review H-1) -----
+
+    def test_kwargs_embed_mm_satisfies_contract(self):
+        # _ImageVLM/_OmniVLM use **kwargs -> accept the whole contract, no contract error.
+        registered = {"Img": _ImageVLM, "Omni": _OmniVLM}
+        errs = cap.find_capability_inconsistencies(registered, {"Img", "Omni"}, ["Img"], True)
+        self.assertFalse(any("embed_mm" in e for e in errs), errs)
+
+    def test_explicit_full_contract_passes(self):
+        # A model that spells out all contract params (no **kwargs) must not be flagged.
+        errs = cap.find_capability_inconsistencies(
+            {"Full": _ExplicitContractVLM}, {"Full"}, [], False
+        )
+        self.assertFalse(any("embed_mm" in e for e in errs), errs)
+
+    def test_drifted_embed_mm_flagged(self):
+        # The exact H-1 failure: embed_mm missing the M5/V-2 params and no **kwargs.
+        errs = cap.find_capability_inconsistencies({"Drift": _DriftedEmbedMM}, {"Drift"}, [], False)
+        contract_errs = [e for e in errs if "Drift" in e and "embed_mm" in e]
+        self.assertTrue(contract_errs, errs)
+        msg = contract_errs[0]
+        self.assertIn("mm_audio_codes", msg)
+        self.assertIn("mm_real_llm_dims", msg)
+        self.assertIn("mm_real_video_llm_dims", msg)
+
+    def test_missing_embed_mm_flagged(self):
+        # mm-capable but no embed_mm method at all.
+        errs = cap.find_capability_inconsistencies({"NoEmbed": _NoEmbedMM}, {"NoEmbed"}, [], False)
+        self.assertTrue(any("NoEmbed" in e and "no embed_mm" in e for e in errs), errs)
 
 
 if __name__ == "__main__":

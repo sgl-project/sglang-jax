@@ -119,6 +119,9 @@ class Qwen3OmniMoeForConditionalGeneration(nnx.Module):
         mm_video_grid_thw=None,
         mm_audio_features=None,
         mm_audio_feature_lengths=None,
+        mm_audio_codes=None,  # uniform embed_mm contract; Qwen3-Omni audio is continuous mel
+        mm_real_llm_dims=None,  # (mm_audio_features), not RVQ codes, and its ViT is not bucketed
+        mm_real_video_llm_dims=None,  # -> these three are always None here (accepted for uniformity)
     ):
         """C-1 (design §5.2): full-sequence encode for the host encode pass. Returns the uniform
         tuple ``(fused [seq, hidden], deepstack_sparse [num_levels, num_visual, hidden] or None,
