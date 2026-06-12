@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import os
-import re
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -35,18 +34,6 @@ class StageConfigRegistry:
         "Wan2.2-T2V-A14B-Diffusers": "wan2_2_stage_config.yaml",
         "Wan-AI/Wan2.2-I2V-A14B-Diffusers": "wan2_2_stage_config.yaml",
         "Wan2.2-I2V-A14B-Diffusers": "wan2_2_stage_config.yaml",
-        # Qwen2.5-VL series
-        "Qwen/Qwen2.5-VL-7B-Instruct": "qwen2_5_vl_stage_config.yaml",
-        "Qwen2.5-VL-7B-Instruct": "qwen2_5_vl_stage_config.yaml",
-        "Qwen/Qwen2.5-VL-32B-Instruct": "qwen2_5_vl_stage_config_tp4.yaml",
-        "Qwen2.5-VL-32B-Instruct": "qwen2_5_vl_stage_config_tp4.yaml",
-        "Qwen/Qwen2.5-VL-72B-Instruct": "qwen2_5_vl_stage_config_tp4.yaml",
-        "Qwen2.5-VL-72B-Instruct": "qwen2_5_vl_stage_config_tp4.yaml",
-        # qwen3-omni
-        "Qwen/Qwen3-Omni-30B-A3B-Instruct": "qwen3_omni_stage_config.yaml",
-        # MiMo-V2.5 omni
-        "XiaomiMiMo/MiMo-V2.5": "mimo_v2_5_stage_config.yaml",
-        "MiMo-V2.5": "mimo_v2_5_stage_config.yaml",
         # MiMo Audio series
         "XiaomiMiMo/MiMo-Audio-7B-Instruct": "mimo_audio_stage_config.yaml",
         "XiaomiMiMo/MiMo-Audio-7B-Base": "mimo_audio_stage_config.yaml",
@@ -54,37 +41,16 @@ class StageConfigRegistry:
     }
 
     # Keyword patterns for fallback matching (order matters - more specific first).
-    # NOTE: MiMo-V2.5 is handled separately (see _match_mimo_v25_omni) so the broad
-    # "mimo-v2.5" substring does not also route the text-only "MiMo-V2.5-Pro/Flash"
-    # variants to the omni two-stage config.
+    # M6: understanding models (Qwen2.5-VL / Qwen3-Omni / MiMo-V2.5) run in-model, not staged --
+    # only generation models (Wan / FLUX / MiMo-Audio) have stage configs now, so "matches the
+    # StageConfigRegistry" == "generation plane".
     _KEYWORD_PATTERNS: list[tuple[str, str]] = [
         ("Wan2.2", "wan2_2_stage_config.yaml"),
         ("Wan2.1", "wan2_1_stage_config.yaml"),
-        ("Qwen2.5-VL", "qwen2_5_vl_stage_config.yaml"),
-        ("Qwen3-Omni", "qwen3_omni_stage_config.yaml"),
         ("MiMo-Audio-7B-Instruct", "mimo_audio_stage_config.yaml"),
         ("MiMo-Audio-7B-Base", "mimo_audio_stage_config.yaml"),
         ("FLUX.1-dev", "flux1_dev_stage_config.yaml"),
     ]
-
-    # Text-only MiMo-V2.5 variants that must NOT route to the omni stage config.
-    # Matched as whole tokens (word boundaries) so an incidental substring in an
-    # unrelated path segment (e.g. ".../prod/...", ".../flashattn/...") does not
-    # wrongly exclude the omni model (review R2-17).
-    _MIMO_V25_TEXT_ONLY_MARKERS: tuple[str, ...] = ("pro", "flash")
-
-    @classmethod
-    def _match_mimo_v25_omni(cls, model_name: str, model_path: str) -> str | None:
-        """Resolve MiMo-V2.5 omni by substring, excluding text-only variants."""
-        haystack = f"{model_name} {model_path}".lower()
-        if "mimo-v2.5" not in haystack:
-            return None
-        if any(
-            re.search(rf"(?<![a-z0-9]){re.escape(marker)}(?![a-z0-9])", haystack)
-            for marker in cls._MIMO_V25_TEXT_ONLY_MARKERS
-        ):
-            return None
-        return "mimo_v2_5_stage_config.yaml"
 
     @classmethod
     def register(cls, model_name: str, yaml_filename: str) -> None:
@@ -128,12 +94,6 @@ class StageConfigRegistry:
         # Try keyword pattern matching
         model_name_lower = model_name.lower()
         model_path_lower = model_path.lower()
-
-        # MiMo-V2.5 omni needs a variant-aware check (exclude Pro/Flash text-only)
-        mimo_v25_yaml = cls._match_mimo_v25_omni(model_name, model_path)
-        if mimo_v25_yaml:
-            logger.debug("Found MiMo-V2.5 omni match for model '%s'", model_name)
-            return _STATIC_CONFIGS_DIR / mimo_v25_yaml
 
         for keyword, yaml_file in cls._KEYWORD_PATTERNS:
             keyword_lower = keyword.lower()

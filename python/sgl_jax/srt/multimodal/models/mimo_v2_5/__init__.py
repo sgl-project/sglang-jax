@@ -2,14 +2,13 @@
 
 Exports use lazy attribute loading (PEP 562) so importing the package does not
 pull the jax/flax model stack until a model class is actually accessed. The audio
-tower (``audio_encoder``) and ViT (``vision_encoder``) live alongside ``embedding``
-here; ``embedding`` imports both lazily.
+tower (``audio_encoder``) and ViT (``vision_encoder``) feed the in-model wrapper
+(``mimo_v2_5_inmodel``).
 """
 
 from __future__ import annotations
 
 __all__ = [
-    "MiMoV2_5Embedding",
     "MiMoV25AudioUnderstandingEncoder",
     "MiMoV25AudioCodecProcessor",
     "MiMoV25AudioPayload",
@@ -17,7 +16,6 @@ __all__ = [
 ]
 
 _LAZY = {
-    "MiMoV2_5Embedding": ("embedding", "MiMoV2_5Embedding"),
     "MiMoV25AudioUnderstandingEncoder": ("audio_encoder", "MiMoV25AudioUnderstandingEncoder"),
     "MiMoV25AudioCodecProcessor": ("audio_codec_processor", "MiMoV25AudioCodecProcessor"),
     "MiMoV25AudioPayload": ("audio_codec_processor", "MiMoV25AudioPayload"),
