@@ -23,10 +23,12 @@ from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
 )
 
 from sgl_jax.srt.configs.model_config import _get_and_verify_dtype
-from sgl_jax.srt.models.qwen3_omni_moe.qwen3_omni_moe_encoder import (
-    Qwen3OmniMoeThinkerEmbedding,
+from sgl_jax.srt.models.qwen3_omni_moe.vision_encoder import Qwen3OmniMoeVisionEncoder
+from sgl_jax.srt.models.qwen3_omni_moe.weights_mapping import (
+    create_visual_weight_mappings,
 )
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
+from sgl_jax.srt.utils.weight_utils import WeightLoader
 
 # Ensure JAX uses float32 precision for matmul
 jax.config.update("jax_default_matmul_precision", "highest")
@@ -185,14 +187,24 @@ class TestQwen3OmniMoeVisionEncoderPrecision(unittest.TestCase):
         jax_config.model_path = MODEL_PATH
         jax_config.revision = None
         jax_config.dtype = jax_dtype
-        jax_config.model_class = Qwen3OmniMoeThinkerEmbedding
+
+        # M6: build the vision tower directly + load its `thinker.visual.*` weights via the shared
+        # create_visual_weight_mappings builder (the same load path the in-model wrapper uses),
+        # instead of the deleted staged Qwen3OmniMoeThinkerEmbedding scaffold. A tiny holder gives
+        # the WeightLoader the `visual.*` attribute the mappings target.
+        class _VisualOnly(nnx.Module):
+            def __init__(self, mesh, dtype):
+                self.mesh = mesh
+                self.dtype = dtype
+                self.visual = Qwen3OmniMoeVisionEncoder(
+                    vision_config, mesh=mesh, dtype=dtype, rngs=nnx.Rngs(0)
+                )
 
         with jax.set_mesh(cls.mesh):
-            jax_model = Qwen3OmniMoeThinkerEmbedding(
-                config=jax_config, mesh=cls.mesh, rngs=nnx.Rngs(0), dtype=jax_dtype
-            )
-        jax_model.load_weights(jax_config)
-        return jax_model.visual
+            holder = _VisualOnly(cls.mesh, jax_dtype)
+        loader = WeightLoader(model=holder, model_config=jax_config, mesh=cls.mesh, dtype=jax_dtype)
+        loader.load_weights_from_safetensors(create_visual_weight_mappings(vision_config))
+        return holder.visual
 
     # =========================================================================
     # Helper Methods
