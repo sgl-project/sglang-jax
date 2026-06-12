@@ -65,10 +65,12 @@ class OpenAIServingChat(OpenAIServingBase):
         """Convert OpenAI chat completion request to internal format"""
         model_config = getattr(self.tokenizer_manager, "model_config", None)
         server_args = self.tokenizer_manager.server_args
-        # The staged generation server (--multimodal) builds an omni request routed to the
-        # GlobalScheduler. In-model understanding (refactor M3) runs on the STANDARD server:
-        # multimodal message processing still applies (extract media + build a prompt with
-        # vision markers), but the request is a standard GenerateReqInput handled by the
+        # `--multimodal` selects the staged runtime (generation plane). After M6 the understanding
+        # plane is in-model only: a staged understanding server can no longer launch (its stage-config
+        # YAMLs were deleted), so on the standard server `server_args.multimodal` is False and the
+        # use_staged branch below is effectively generation-only. In-model understanding runs here on
+        # the STANDARD server -- multimodal message processing still applies (extract media + build a
+        # prompt with vision markers), but the request is a standard GenerateReqInput handled by the
         # standard TokenizerManager's processor.
         use_staged = server_args.multimodal
         is_multimodal = use_staged or (
