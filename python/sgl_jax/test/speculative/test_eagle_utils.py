@@ -478,6 +478,18 @@ class TestVerifyTree(CustomTestCase):
         )
         self.assertLess(guard_pos, relay_pos)
 
+    def test_scheduler_hybrid_swa_retries_prefill_after_full_batch(self):
+        from sgl_jax.srt.managers.scheduler import Scheduler
+
+        source = inspect.getsource(Scheduler.get_new_batch_prefill)
+        full_return_pos = source.index("self.running_batch.batch_is_full")
+        hybrid_reset_pos = source.index("if self.is_hybrid:")
+        reset_source = source[hybrid_reset_pos:full_return_pos]
+
+        self.assertLess(hybrid_reset_pos, full_return_pos)
+        self.assertIn("for info in self.running_batch.reqs_info", reset_source)
+        self.assertIn("info.batch_is_full = False", reset_source)
+
     def test_overlap_scheduler_uses_spec_sampling_info_owner(self):
         from sgl_jax.srt.managers.scheduler import Scheduler
 

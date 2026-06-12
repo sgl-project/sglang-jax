@@ -1600,6 +1600,10 @@ class Scheduler(
 
         # Handle the cases where prefill is not allowed
         has_chunked_reqs = any(req is not None for req in self.chunked_reqs)
+        if self.is_hybrid:
+            for info in self.running_batch.reqs_info:
+                info.batch_is_full = False
+
         if (
             self._is_spec_decode_enabled()
             and not self.enable_overlap
