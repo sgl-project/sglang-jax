@@ -114,7 +114,8 @@ class EAGLEWorker(BaseSpecWorker):
     # -- Precompilation --
 
     def run_spec_decode_precompile(self):
-        self.init_spec_relay_buffers()
+        if not self.server_args.disable_overlap_schedule:
+            self.init_spec_relay_buffers()
         self.precompile_spec_extend()
         self.precompile_spec_decode()
         # FIXME precompile some kernel

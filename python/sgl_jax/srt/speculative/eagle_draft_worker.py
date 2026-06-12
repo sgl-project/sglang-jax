@@ -403,7 +403,7 @@ class EagleDraftWorker(BaseDraftWorker):
 
         topk_index = spec_info.topk_index
         if self.hot_token_ids is not None:
-            model_worker_batch.spec_info_padded.topk_index = self.hot_token_ids[topk_index]
+            model_worker_batch.spec_info_padded.topk_index = self._map_hot_token_ids(topk_index)
         if self.topk > 1:
             self.draft_model_runner.attn_backend.forward_metadata.custom_mask = (
                 build_tree_mask_for_draft_decode(
@@ -508,10 +508,14 @@ class EagleDraftWorker(BaseDraftWorker):
             topk_p, topk_index = topk_probs_from_logits(logits_output.next_token_logits, self.topk)
 
             if self.hot_token_ids is not None:
-                topk_index = self.hot_token_ids[topk_index]
+                topk_index = self._map_hot_token_ids(topk_index)
             hidden_states = replicate_to_mesh(self.mesh, logits_output.hidden_states)
 
         return score_list, token_list, parents_list
+
+    def _map_hot_token_ids(self, topk_index):
+        out_sharding = jax.typeof(topk_index).sharding
+        return self.hot_token_ids.at[topk_index].get(out_sharding=out_sharding)
 
     def _pick_context_len(self, max_seq_len: int) -> int:
         if self.precompile_token_paddings:
@@ -611,21 +615,28 @@ def update_eagle_lists(
 ):
     bs = score_list.shape[0]
     scores_update, tokens_update, parents_update = tree_info
+    score_sharding = jax.typeof(scores_update).sharding
+    token_sharding = jax.typeof(tokens_update).sharding
+    parent_sharding = jax.typeof(parents_update).sharding
     if i == 0:
-        score_list = score_list.at[:bs, :1, :].set(scores_update[:bs])
-        token_list = token_list.at[:bs, :topk].set(tokens_update[:bs])
-        parents_list = parents_list.at[:bs, : topk + 1].set(parents_update[:bs])
+        score_list = score_list.at[:bs, :1, :].set(scores_update[:bs], out_sharding=score_sharding)
+        token_list = token_list.at[:bs, :topk].set(tokens_update[:bs], out_sharding=token_sharding)
+        parents_list = parents_list.at[:bs, : topk + 1].set(
+            parents_update[:bs], out_sharding=parent_sharding
+        )
     else:
         score_start = 1 + (i - 1) * topk
         token_start = topk + (i - 1) * topk * topk
         parent_start = topk + 1 + (i - 1) * topk
 
-        score_list = score_list.at[:bs, score_start : score_start + topk, :].set(scores_update[:bs])
+        score_list = score_list.at[:bs, score_start : score_start + topk, :].set(
+            scores_update[:bs], out_sharding=score_sharding
+        )
         token_list = token_list.at[:bs, token_start : token_start + topk * topk].set(
-            tokens_update[:bs]
+            tokens_update[:bs], out_sharding=token_sharding
         )
         parents_list = parents_list.at[:bs, parent_start : parent_start + topk].set(
-            parents_update[:bs]
+            parents_update[:bs], out_sharding=parent_sharding
         )
     return score_list, token_list, parents_list
 
@@ -708,7 +719,9 @@ def select_top_k_tokens_step_greater_0(
         selected_input_index = topk_cs_index.flatten() // topk + jnp.repeat(
             jnp.arange(0, hidden_states.shape[0], topk), topk
         )
-        hidden_states = hidden_states[selected_input_index, :]
+        hidden_states = hidden_states.at[selected_input_index, :].get(
+            out_sharding=jax.typeof(hidden_states).sharding
+        )
     tree_info = (
         expand_scores,
         topk_index,
