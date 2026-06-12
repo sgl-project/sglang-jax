@@ -32,7 +32,7 @@ class KimiK25ForConditionalGeneration(DeepseekV3ForCausalLM):
         self.mesh = mesh
 
         # text_config.quantization_config is a raw dict from the JSON.
-        # ModelConfig already handles quantization at the top-level hf_config, but 
+        # ModelConfig already handles quantization at the top-level hf_config, but
         # due to quantization config being nested in text_config, it still in JSON
         # Clear it here so FusedMoE doesn't receive a raw dict as the config contains 'pack-quantized'
         # format which isn't yet supported.
