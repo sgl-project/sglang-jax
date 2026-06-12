@@ -18,6 +18,8 @@ Env vars:
   BENCH_WARMUP  — warmup iterations (default: 2)
   BENCH_ITERS   — timed iterations (default: 5)
   BENCH_CHECK   — 1 to run correctness check (single-host only)
+  BENCH_SWIGLU_LIMIT — SwiGLU clamp limit for routed experts (default: off)
+  BENCH_SHARED_SWIGLU_LIMIT — SwiGLU clamp limit for the shared expert (default: off)
   BENCH_D/F/E/TOPK — model dims (default: MiMo V2 Pro)
 """
 
@@ -234,6 +236,14 @@ se_inter = int(os.environ.get("BENCH_SE_INTER", str(f)))
 warmup = int(os.environ.get("BENCH_WARMUP", "2"))
 iters = int(os.environ.get("BENCH_ITERS", "5"))
 check_correctness = os.environ.get("BENCH_CHECK", "0") == "1"
+SWIGLU_LIMIT = (
+    float(os.environ["BENCH_SWIGLU_LIMIT"]) if os.environ.get("BENCH_SWIGLU_LIMIT") else None
+)
+SHARED_SWIGLU_LIMIT = (
+    float(os.environ["BENCH_SHARED_SWIGLU_LIMIT"])
+    if os.environ.get("BENCH_SHARED_SWIGLU_LIMIT")
+    else None
+)
 use_fp8 = os.environ.get("BENCH_FP8", "0") == "1"
 _qbk_str = os.environ.get("BENCH_QBK", "128")
 quant_block_k = None if _qbk_str.lower() == "none" else int(_qbk_str)
@@ -1051,6 +1061,8 @@ for num_tokens in token_candidates:
                 topk_idx,
                 top_k,
                 block_config=bc,
+                swiglu_limit=SWIGLU_LIMIT,
+                shared_swiglu_limit=SHARED_SWIGLU_LIMIT,
                 quant_block_k=qbk_arg,
                 w1_scale=w1_scale_s,
                 w2_scale=w2_scale_s,
@@ -1187,6 +1199,8 @@ if check_correctness:
             tidx,
             top_k,
             block_config=bc0,
+            swiglu_limit=SWIGLU_LIMIT,
+            shared_swiglu_limit=SHARED_SWIGLU_LIMIT,
             quant_block_k=qbk_arg,
             w1_scale=w1_scale_s,
             w2_scale=w2_scale_s,
@@ -1202,7 +1216,7 @@ if check_correctness:
             interleave_bt=interleave_bt_modes[0],
             enable_bt_scatter_overlap=enable_bt_scatter_overlap,
         )
-        ref_kwargs = {}
+        ref_kwargs = {"swiglu_limit": SWIGLU_LIMIT, "shared_swiglu_limit": SHARED_SWIGLU_LIMIT}
         if use_fp8:
             ref_kwargs["quant_block_k"] = quant_block_k
             ref_kwargs["w1_scale"] = jax.device_get(w1_scale_s)

@@ -547,6 +547,8 @@ class FusedEPMoEV2(FusedEPMoE):
         *,
         block_config=None,
         out_sharding: jax.sharding.Sharding | None = None,
+        swiglu_limit: float | None = None,
+        shared_swiglu_limit: float | None = None,
     ) -> jax.Array:
         from sgl_jax.srt.kernels.fused_moe.v2.kernel import fused_ep_moe_v2
         from sgl_jax.srt.kernels.fused_moe.v2.tuned_block_configs import (
@@ -609,6 +611,8 @@ class FusedEPMoEV2(FusedEPMoE):
             topk_ids,
             self.num_experts_per_tok,
             act_fn=self.activation,
+            swiglu_limit=swiglu_limit,
+            shared_swiglu_limit=shared_swiglu_limit,
             block_config=block_config,
             disable_a2a=self.disable_a2a,
             disable_dynamic_ffn1=self.disable_dynamic_ffn1,
