@@ -37,9 +37,10 @@ class GenerateOmniReqInput:
     """Input request for Omni/VLM chat/completions.
 
     Relocated from sgl_jax.srt.multimodal.manager.io_struct for srt<->multimodal
-    decoupling (refactor M1). Transitional: the in-model understanding path will
-    converge onto the standard GenerateReqInput; kept here until then so srt's
-    serving layer does not import the multimodal package.
+    decoupling (refactor M1). The understanding plane has since converged onto the standard
+    GenerateReqInput (in-model); this request type is now used by the staged GENERATION plane
+    (e.g. MiMo-Audio chat) and is kept in srt so the serving layer need not import the
+    multimodal package.
     """
 
     rid: str | None = None

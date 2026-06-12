@@ -783,10 +783,9 @@ class Qwen3OmniMoeVisionEncoder(nnx.Module):
         """
         merge_size = self.spatial_merge_size
 
-        # grid_thw is static (concrete) in both paths: the staged embed stage runs eager, and
-        # the in-model forward passes a concrete np array. Validate with numpy so the Python
-        # `if` stays jit-safe (jnp.any would become a tracer under the in-model jit and raise
-        # TracerBoolConversionError).
+        # grid_thw is static (concrete) here: the in-model forward passes a concrete np array.
+        # Validate with numpy so the Python `if` stays jit-safe (jnp.any would become a tracer
+        # under the in-model jit and raise TracerBoolConversionError).
         grid = np.asarray(grid_thw)
         if np.any(grid[:, 1] % merge_size != 0):
             raise ValueError(f"Input height must be divisible by spatial_merge_size {merge_size}")

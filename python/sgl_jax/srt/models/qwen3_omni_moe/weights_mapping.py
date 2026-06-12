@@ -1,10 +1,10 @@
-"""Qwen3-Omni Thinker tower weight mappings (neutral, shared by in-model + staged embed stage).
+"""Qwen3-Omni Thinker tower weight-mapping builders (vision + audio), used by the in-model wrapper.
 
-Extracted from ``Qwen3OmniMoeThinkerEmbedding`` static methods in M6-S2 so the in-model wrapper
-(``qwen3_omni_inmodel.py``) no longer imports the staged embed class purely for these mapping
-builders -- that lets the staged embed model be deleted in M6-S5 without touching the in-model path.
-Builders only (the staged-only text-embed mapping stays on the staged class, which the in-model
-wrapper does not use: it reuses the AR backbone's embed_tokens).
+Originally extracted from the staged ``Qwen3OmniMoeThinkerEmbedding`` static methods (M6-S2) so the
+in-model wrapper (``qwen3_omni_inmodel.py``) didn't import the staged embed class for them; that
+staged embed model has since been removed (M6-S5/S7). These build the HF -> JAX weight maps for the
+visual + audio towers; the in-model wrapper reuses the AR backbone's embed_tokens, so there is no
+text-embed mapping here.
 """
 
 from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (

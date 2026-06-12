@@ -1,7 +1,9 @@
 """Qwen2.5-VL in-model (refactor M3).
 
 A single model registered on the standard srt LLM runtime (no staged ViT/AR pipeline).
-Its forward encodes vision in-forward and merges via the canonical mm_core.merge():
+Its multimodal embedding (encode + merge) runs ONCE PER REQUEST on the host encode pass
+(C-1, ``ModelRunner.encode_mm_reqs`` -> ``embed_mm``), NOT inside the forward; the AR forward
+then reads the prepared ``input_embedding``:
 
     text_embed = self.model.embed_tokens(input_ids)
     mod_embeds = encode_image/encode_video(self.visual, pixel_values, grid_thw)
@@ -124,7 +126,7 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
     ):
         return self._encode(pixel_values, grid_thw, real_llm_dims)
 
-    # ---- forward: in-forward encode + merge, then reuse the AR body ----
+    # ---- embed_mm: host-side once-per-req encode + merge (C-1); AR body reuse ----
 
     def embed_mm(
         self,
@@ -141,8 +143,9 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
         """Full-sequence text-embed + ViT encode + merge (C-1, design §5.2). Returns the uniform
         encode-pass tuple ``(fused [seq, hidden], deepstack_sparse_or_None, visual_pos_mask_or_None)``
         (Qwen2.5-VL has no deepstack -> last two are None). The single source of truth for the
-        in-model encode+merge: called in-forward by ``__call__`` and once-per-req by the host-side
-        encode pass (model_runner.encode_mm_reqs), which runs it over the FULL input_ids+pixels and
+        in-model encode+merge: called once-per-req by the host-side encode pass
+        (model_runner.encode_mm_reqs) -- NOT by ``__call__`` -- which runs it over the FULL
+        input_ids+pixels and
         holds the result on ``req.multimodal_embedding`` so the scheduler slices it per chunk -- no
         per-chunk re-encode, no chunk-boundary merge misalignment (B1/B2/B8). Scheme B: input_ids
         is clean; merge keys by the raw image/video token id. (mm_audio_* accepted for a uniform

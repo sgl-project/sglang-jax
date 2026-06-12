@@ -1,21 +1,19 @@
 """Multimodal pad_value derivation (refactor M2 / design doc §3.6.3).
 
-A per-item ``pad_value`` is baked into the placeholder rows of ``input_ids`` and serves
-two roles: (a) the :func:`sgl_jax.srt.mm_core.merge.merge` scatter key, and (b) the
-RadixAttention prefix-cache key (same media -> same hash -> same pad_value -> cache hit).
+A per-item ``pad_value`` is the RadixAttention prefix-cache key for a media item: same media ->
+same hash -> same pad_value -> radix prefix hit. Under Scheme B (design §5.1.2) it is baked ONLY
+into a SEPARATE padded copy of the ids (``cache_input_ids``, produced by :func:`pad_input_tokens`)
+that is consumed solely to build the per-item radix key; the real ``input_ids`` stay CLEAN (raw
+placeholder token ids) and :func:`sgl_jax.srt.mm_core.merge.merge` locates placeholder rows via
+``isin(input_ids, token_ids)`` -- NOT via pad_value. So a pad_value never reaches the forward or
+the detokenizer.
 
 This ports upstream's ``MM_PAD_SHIFT`` regime to fix the as-is ``pad_value = hash % 2**24``
 (`modality_enum.py`), which has no anti-collision guard: with a large vocab a pad_value
 could equal a real text token id. The ``+ MM_PAD_SHIFT_VALUE`` base offset guarantees
 every pad_value sits above the real token-id range.
 
-Pure int math — no jax — so it is unit-testable on any interpreter.
-
-WIRING NOTE (coordinated change, do together): pad_value is consumed in three places that
-must agree — where it is written into input_ids (`pad_input_tokens`), where merge() reads
-it (the scatter key), and the radix cache key. Swapping the as-is ``hash % 2**24`` for this
-must update all three atomically and be validated (a multimodal request still scatters
-correctly and still gets radix hits). See design doc §3.6.3 / Ch4 M2.
+Pure int math -- no jax -- so it is unit-testable on any interpreter.
 """
 
 from __future__ import annotations

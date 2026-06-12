@@ -1,10 +1,10 @@
 """CPU unit tests for the IN-MODEL MiMoV2_5Processor (refactor M4 / review P3-1).
 
-Distinct from test_mimo_v25_processor.py, which covers the STAGED `MiMoV25Processor` (a different
-class). This exercises the in-model `multimodal.processors.mimo_v2_5.MiMoV2_5Processor`: the
+Exercises the in-model `multimodal.processors.mimo_v2_5.MiMoV2_5Processor`: the
 Qwen2.5-VL-derived vision/text path plus the RVQ-codes audio merge, the mRoPE capability gate
 (uses_mrope=False), the is_codes AUDIO item, and the cache_input_ids rebuild. Fakes are injected
-for the HF processor + codec so no checkpoint is needed on disk.
+for the HF processor + codec so no checkpoint is needed on disk. (The old staged MiMoV25Processor
+and its test were removed in M6-S5.)
 """
 
 import unittest

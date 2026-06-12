@@ -1,8 +1,8 @@
-"""MiMo-V2.5 config helpers (neutral, shared by the in-model wrapper + the staged embed stage).
+"""MiMo-V2.5 config helpers, used by the in-model wrapper.
 
-Extracted from ``MiMoV2_5Embedding`` static methods in M6-S2 so the in-model wrapper
-(``mimo_v2_5_inmodel.py``) no longer imports the staged embed class purely for these helpers --
-that lets the staged embed model be deleted in M6-S5 without touching the in-model path. Pure python.
+Originally extracted from the staged ``MiMoV2_5Embedding`` static methods (M6-S2) so the in-model
+wrapper (``mimo_v2_5_inmodel.py``) didn't import the staged embed class for them; that staged embed
+model has since been removed (M6-S5). Pure python.
 """
 
 from __future__ import annotations

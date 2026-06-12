@@ -154,8 +154,9 @@ class WeightLoader:
         if hasattr(model_config, "num_attention_heads"):
             self.num_heads = model_config.num_attention_heads
             # Use original count for replication logic. The AR ModelConfig exposes
-            # get_total_num_kv_heads(); the embed stage passes a raw HF config (audio
-            # tower, no LLM KV replication) -> fall back to its num_key_value_heads.
+            # get_total_num_kv_heads(); a tower/stage runner that passes a raw HF config (e.g. a
+            # generation audio/encoder tower, no LLM KV replication) -> fall back to its
+            # num_key_value_heads.
             if hasattr(model_config, "get_total_num_kv_heads"):
                 self.num_kv_heads = model_config.get_total_num_kv_heads()
             else:
@@ -1141,7 +1142,7 @@ class WeightLoader:
                 return _load_slice
 
             # Pass dtype explicitly: when this host has no addressable shard for the
-            # given sharding (e.g. the embed stage's single-CPU-device mesh on non-rank0
+            # given sharding (e.g. a single-device stage mesh on non-rank0
             # hosts), jax.make_array_from_callback cannot infer dtype from the callback
             # (which is never invoked here) and raises. target_dtype is the load dtype.
             lazy_array = jax.make_array_from_callback(

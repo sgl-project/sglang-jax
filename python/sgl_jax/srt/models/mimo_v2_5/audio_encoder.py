@@ -191,14 +191,14 @@ class MiMoV25AudioUnderstandingEncoder(nnx.Module):
         if audio_codes is None:
             if input_features is not None:
                 raise ValueError(
-                    "MiMo-V2.5 embed stage expects host-side RVQ audio_codes; "
-                    "mel/input_features codec encoding is not supported in the JAX embed stage."
+                    "MiMo-V2.5 in-model encode pass expects host-side RVQ audio_codes; "
+                    "mel/input_features codec encoding is not supported in the JAX encode pass."
                 )
             return None
 
         codes = self._ensure_channel_first_audio_codes(audio_codes).astype(jnp.int32)
-        # The audio understanding tower is tiny and runs replicated on the embed device.
-        # Under the embed stage's explicit-sharding mesh the incoming codes may carry a
+        # The audio understanding tower is tiny and runs replicated on the encode device.
+        # Under the in-model encode mesh's explicit sharding the incoming codes may carry a
         # data-axis sharding, which makes the group/proj reshapes unsupported without an
         # out_sharding. Pin to fully replicated so every downstream reshape is local.
         codes = self._replicate(codes)

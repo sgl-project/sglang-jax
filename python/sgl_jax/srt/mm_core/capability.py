@@ -60,8 +60,10 @@ def is_multimodal_arch(model_cls) -> bool:
 def audio_kind(model_cls) -> str | None:
     """Model-level audio kind: ``"codes"`` (discrete RVQ) | ``"features"`` (continuous) | None.
 
-    Replaces the as-is per-item runtime flag ``_is_codes_audio`` (design §3.6.2): a model's
-    audio is uniformly one kind, so dispatch keys off this declaration, not a runtime field.
+    A model's audio is uniformly one kind, so this is the intended model-level declaration for audio
+    routing (design §3.6.2). NOTE (not yet wired): the host assembler still dispatches per item via
+    ``mm_assembly._is_codes_audio`` (the ``is_codes`` mm_item meta flag); consolidating routing onto
+    this declaration is a follow-up.
     """
     return getattr(model_cls, "audio_kind", None)
 
