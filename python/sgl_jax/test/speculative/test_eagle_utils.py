@@ -1,5 +1,4 @@
 import unittest
-from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
@@ -44,9 +43,10 @@ class TestVerifyTree(CustomTestCase):
         self.assertIsInstance(scalar, np.ndarray)
         self.assertEqual(scalar.dtype, np.int32)
         np.testing.assert_array_equal(listed, np.array([4, 5], dtype=np.int32))
-        self.assertIsInstance(children[9], np.ndarray)
-        self.assertEqual(children[9].dtype, np.int32)
-        self.assertEqual(children[9].shape, (0,))
+        self.assertIsNone(children[9])
+        self.assertIsInstance(children[10], np.ndarray)
+        self.assertEqual(children[10].dtype, np.int32)
+        self.assertEqual(children[10].shape, (0,))
 
         device_arr = jnp.array([6], dtype=jnp.int32)
         self.assertIs(eagle_util._as_int32_array(device_arr), device_arr)
@@ -175,40 +175,28 @@ class TestVerifyTree(CustomTestCase):
         )
 
         np.testing.assert_array_equal(np.asarray(out.accept_lens), np.array([0, 3]))
-        np.testing.assert_array_equal(np.asarray(out.new_seq_lens), np.array([0, 13]))
+        np.testing.assert_array_equal(np.asarray(out.new_seq_lens), np.array([1, 14]))
         np.testing.assert_array_equal(np.asarray(out.sel_pos), np.array([0, 2]))
 
-    def test_fused_materialize_uses_original_seq_lens_for_new_seq_lens(self):
+    def test_greedy_prepare_uses_original_seq_lens_for_new_seq_lens(self):
         from sgl_jax.srt.speculative.draft_extend_fused import (
-            _materialize_fused_greedy_batch_output_for_scheduler,
+            _greedy_prepare_draft_inputs,
         )
 
-        batch_output = SimpleNamespace(
-            logits_output=None,
-            next_draft_input=SimpleNamespace(),
-            allocate_lens=np.array([9, 8, 7], dtype=np.int32),
-            accept_lens=None,
-            next_token_ids=None,
-        )
-        out = _materialize_fused_greedy_batch_output_for_scheduler(
-            batch_output=batch_output,
-            selector=np.array([0, 2], dtype=np.int32),
-            real_bs=2,
-            seq_lens_host=np.array([103, 203, 303], dtype=np.int32),
-            layer0_hidden=jnp.arange(12 * 2, dtype=jnp.float32).reshape(12, 2),
-            topk_index_stacked=jnp.array(
-                [[[11], [12], [13]], [[21], [22], [23]], [[31], [32], [33]]]
-            ),
-            accept_lens_device=jnp.array([1, 2, 4], dtype=jnp.int32),
-            predict_device=jnp.arange(12, dtype=jnp.int32),
+        out = _greedy_prepare_draft_inputs(
+            hidden_states=jnp.arange(12 * 2, dtype=jnp.float32).reshape(12, 2),
+            positions=jnp.arange(12, dtype=jnp.int32),
+            seq_lens=jnp.array([103, 303], dtype=jnp.int32),
+            accept_index=jnp.array([0, -1, -1, -1, 8, 9, 10, 11], dtype=jnp.int32),
+            accept_length=jnp.array([1, 4], dtype=jnp.int32),
+            verified_id=jnp.arange(8, dtype=jnp.int32),
+            speculative_num_steps=3,
             speculative_num_draft_tokens=4,
-            target_logits=None,
-            target_hidden=None,
         )
 
         np.testing.assert_array_equal(
-            out.next_draft_input.new_seq_lens,
-            np.array([101, 304], dtype=np.int32),
+            np.asarray(out.new_seq_lens),
+            np.array([105, 308], dtype=np.int32),
         )
 
     def test_verify_tree_greedy(self):
