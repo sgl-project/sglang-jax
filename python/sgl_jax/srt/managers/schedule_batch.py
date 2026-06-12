@@ -35,7 +35,11 @@ from sgl_jax.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
 )
-from sgl_jax.srt.mem_cache.base_prefix_cache import BasePrefixCache
+from sgl_jax.srt.mem_cache.base_prefix_cache import (
+    BasePrefixCache,
+    EvictParams,
+    MatchPrefixParams,
+)
 from sgl_jax.srt.mem_cache.chunk_cache import ChunkCache
 from sgl_jax.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
@@ -435,14 +439,15 @@ class Req:
                 self.last_host_node = tree_cache.root_node
                 self.host_hit_length = 0
             else:
-                (
-                    self.prefix_indices,
-                    self.last_node,
-                    self.last_host_node,
-                    self.host_hit_length,
-                ) = tree_cache.match_prefix(
-                    key=RadixKey(self.adjust_max_prefix_ids(), self.extra_key, self.dp_rank),
+                match_result = tree_cache.match_prefix(
+                    MatchPrefixParams(
+                        key=RadixKey(self.adjust_max_prefix_ids(), self.extra_key, self.dp_rank)
+                    )
                 )
+                self.prefix_indices = match_result.device_indices
+                self.last_node = match_result.last_device_node
+                self.last_host_node = match_result.last_host_node
+                self.host_hit_length = match_result.host_hit_length
             self.last_matched_prefix_len = len(self.prefix_indices)
         self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
 
@@ -2858,11 +2863,13 @@ class ScheduleBatch:
                 if (full_available < num_tokens or swa_available < num_tokens) and self.tree_cache:
                     full_num = max(0, num_tokens - full_available)
                     swa_num = max(0, num_tokens - swa_available)
-                    self.tree_cache.evict(full_num, swa_num, dp_rank=dp_rank)
+                    self.tree_cache.evict(
+                        EvictParams(num_tokens=full_num, swa_num_tokens=swa_num, dp_rank=dp_rank)
+                    )
             else:
                 available = self.token_to_kv_pool_allocator.available_size(dp_rank=dp_rank)
                 if available < num_tokens and self.tree_cache:
-                    self.tree_cache.evict(num_tokens, dp_rank=dp_rank)
+                    self.tree_cache.evict(EvictParams(num_tokens=num_tokens, dp_rank=dp_rank))
 
     def _is_available_size_sufficient(self, num_tokens_per_dp: dict[int, int]) -> bool:
         """Check if sufficient memory available across all DP ranks.

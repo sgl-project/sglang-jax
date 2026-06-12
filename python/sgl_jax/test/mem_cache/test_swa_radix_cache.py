@@ -14,6 +14,12 @@ import numpy as np
 from jax.sharding import Mesh
 
 from sgl_jax.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
+from sgl_jax.srt.mem_cache.base_prefix_cache import (
+    DecLockRefParams,
+    EvictParams,
+    InsertParams,
+    MatchPrefixParams,
+)
 from sgl_jax.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     ReqToTokenPool,
@@ -174,11 +180,11 @@ class TestSWARadixCache(CustomTestCase):
         val_a = self._alloc_indices(len(key_a))
         val_b = self._alloc_indices(len(key_b))
 
-        cache.insert(key_a, value=val_a, prev_prefix_len=0)
-        cache.insert(key_b, value=val_b, prev_prefix_len=0)
+        cache.insert(InsertParams(key=key_a, value=val_a, prev_prefix_len=0))
+        cache.insert(InsertParams(key=key_b, value=val_b, prev_prefix_len=0))
 
         # SWA-evict: evict the shared internal node (LRU, oldest access)
-        cache.evict(full_num_tokens=0, swa_num_tokens=len(shared))
+        cache.evict(EvictParams(num_tokens=0, swa_num_tokens=len(shared)))
 
         return cache, key_a, val_a, key_b, val_b
 
@@ -191,24 +197,28 @@ class TestSWARadixCache(CustomTestCase):
         key = list(range(100, 110))
         value = self._alloc_indices(len(key))
 
-        prefix_len = self.cache.insert(key, value=value, prev_prefix_len=0)
+        prefix_len = self.cache.insert(InsertParams(key=key, value=value, prev_prefix_len=0))
         self.assertEqual(prefix_len, 0)
 
-        match = self.cache.match_prefix(key)
+        match = self.cache.match_prefix(MatchPrefixParams(key=RadixKey(key)))
         np.testing.assert_array_equal(np.asarray(match.device_indices), value)
         self.assertEqual(len(match.device_indices), len(key))
         self.assertIs(match.last_device_node, match.last_host_node)
+        # full hit: best_match_node is the last matched device node (HiCache off)
+        self.assertIs(match.best_match_node, match.last_device_node)
 
     def test_insert_and_match_shorter_prefix(self):
         """Insert a sequence and match a shorter prefix."""
         key = list(range(200, 200 + 8))
         value = self._alloc_indices(len(key))
-        self.cache.insert(key, value=value, prev_prefix_len=0)
+        self.cache.insert(InsertParams(key=key, value=value, prev_prefix_len=0))
 
         prefix_key = key[:5]
-        match = self.cache.match_prefix(prefix_key)
+        match = self.cache.match_prefix(MatchPrefixParams(key=RadixKey(prefix_key)))
         np.testing.assert_array_equal(np.asarray(match.device_indices), value[: len(prefix_key)])
         self.assertEqual(len(match.device_indices), len(prefix_key))
+        # partial match (node split): best_match_node is the last matched device node
+        self.assertIs(match.best_match_node, match.last_device_node)
 
     def test_evict_and_reset_basic(self):
         """Evict some tokens and then reset the cache."""
@@ -217,14 +227,14 @@ class TestSWARadixCache(CustomTestCase):
         val1 = self._alloc_indices(len(key1))
         val2 = self._alloc_indices(len(key2))
 
-        self.cache.insert(key1, value=val1, prev_prefix_len=0)
-        self.cache.insert(key2, value=val2, prev_prefix_len=0)
+        self.cache.insert(InsertParams(key=key1, value=val1, prev_prefix_len=0))
+        self.cache.insert(InsertParams(key=key2, value=val2, prev_prefix_len=0))
 
         total_before, swa_before = self.cache.total_size()
         self.assertGreater(total_before, 0)
         self.assertEqual(total_before, swa_before)
 
-        self.cache.evict(full_num_tokens=8, swa_num_tokens=0)
+        self.cache.evict(EvictParams(num_tokens=8, swa_num_tokens=0))
         total_after, swa_after = self.cache.total_size()
         self.assertLess(total_after, total_before)
         self.assertLessEqual(swa_after, total_after)
@@ -239,21 +249,21 @@ class TestSWARadixCache(CustomTestCase):
         # First sequence A
         key_A = list(range(1000, 1000 + 6))  # [1000..1005]
         val_A = self._alloc_indices(len(key_A))
-        self.cache.insert(key_A, value=val_A, prev_prefix_len=0)
+        self.cache.insert(InsertParams(key=key_A, value=val_A, prev_prefix_len=0))
 
         # Second sequence B shares first 4 tokens with A, then diverges
         shared = key_A[:4]
         suffix_B = list(range(2000, 2000 + 4))
         key_B = shared + suffix_B  # length 8
         val_B = self._alloc_indices(len(key_B))
-        self.cache.insert(key_B, value=val_B, prev_prefix_len=0)
+        self.cache.insert(InsertParams(key=key_B, value=val_B, prev_prefix_len=0))
 
         # Matching A should return exactly val_A
-        match_A = self.cache.match_prefix(key_A)
+        match_A = self.cache.match_prefix(MatchPrefixParams(key=RadixKey(key_A)))
         np.testing.assert_array_equal(np.asarray(match_A.device_indices), val_A)
 
         # Matching B should reuse A's prefix indices and use B's suffix indices
-        match_B = self.cache.match_prefix(key_B)
+        match_B = self.cache.match_prefix(MatchPrefixParams(key=RadixKey(key_B)))
         matched_B = np.asarray(match_B.device_indices)
         self.assertEqual(len(matched_B), len(key_B))
         np.testing.assert_array_equal(matched_B[: len(shared)], val_A[: len(shared)])
@@ -263,30 +273,30 @@ class TestSWARadixCache(CustomTestCase):
         """Lock a leaf node; eviction should skip it until unlocked."""
         key = list(range(500, 500 + 8))
         value = self._alloc_indices(len(key))
-        self.cache.insert(key, value=value, prev_prefix_len=0)
+        self.cache.insert(InsertParams(key=key, value=value, prev_prefix_len=0))
 
         total_before, _ = self.cache.total_size()
         self.assertEqual(total_before, len(key))
         self.assertEqual(self.cache.full_evictable_size(), len(key))
 
         # Lock the leaf node
-        match = self.cache.match_prefix(key)
+        match = self.cache.match_prefix(MatchPrefixParams(key=RadixKey(key)))
         leaf = match.last_device_node
-        swa_uuid = self.cache.inc_lock_ref(leaf)
+        swa_uuid = self.cache.inc_lock_ref(leaf).swa_uuid_for_lock
         self.assertEqual(self.cache.full_protected_size(), len(key))
         self.assertEqual(self.cache.full_evictable_size(), 0)
 
         # Eviction should have no effect while locked
-        self.cache.evict(full_num_tokens=len(key), swa_num_tokens=0)
+        self.cache.evict(EvictParams(num_tokens=len(key), swa_num_tokens=0))
         total_after_lock_evict, _ = self.cache.total_size()
         self.assertEqual(total_after_lock_evict, total_before)
 
         # Unlock and then evict; tokens should be removed
-        self.cache.dec_lock_ref(leaf, swa_uuid)
+        self.cache.dec_lock_ref(leaf, DecLockRefParams(swa_uuid_for_lock=swa_uuid))
         self.assertEqual(self.cache.full_protected_size(), 0)
         self.assertEqual(self.cache.full_evictable_size(), len(key))
 
-        self.cache.evict(full_num_tokens=len(key), swa_num_tokens=0)
+        self.cache.evict(EvictParams(num_tokens=len(key), swa_num_tokens=0))
         total_after_unlock_evict, _ = self.cache.total_size()
         self.assertEqual(total_after_unlock_evict, 0)
 
@@ -303,15 +313,15 @@ class TestSWARadixCache(CustomTestCase):
 
         key = list(range(600, 600 + 8))  # length 8
         value = self._alloc_indices(len(key))
-        paged_cache.insert(key, value=value, prev_prefix_len=0)
+        paged_cache.insert(InsertParams(key=key, value=value, prev_prefix_len=0))
 
         # Exact match still returns full value
-        match_full = paged_cache.match_prefix(key)
+        match_full = paged_cache.match_prefix(MatchPrefixParams(key=RadixKey(key)))
         np.testing.assert_array_equal(np.asarray(match_full.device_indices), value)
 
         # Shorter key of length 6 should be truncated to 4 (page-aligned)
         partial_key = key[:6]
-        match_partial = paged_cache.match_prefix(partial_key)
+        match_partial = paged_cache.match_prefix(MatchPrefixParams(key=RadixKey(partial_key)))
         matched_partial = np.asarray(match_partial.device_indices)
         self.assertEqual(len(matched_partial), 4)
         np.testing.assert_array_equal(matched_partial, value[:4])
@@ -330,15 +340,17 @@ class TestSWARadixCache(CustomTestCase):
         value = self._alloc_indices(len(key))
 
         # Insert should report zero prefix and not change size
-        prefix_len = disabled_cache.insert(key, value=value, prev_prefix_len=0)
+        prefix_len = disabled_cache.insert(InsertParams(key=key, value=value, prev_prefix_len=0))
         self.assertEqual(prefix_len, 0)
         total_size, swa_size = disabled_cache.total_size()
         self.assertEqual(total_size, 0)
         self.assertEqual(swa_size, 0)
 
         # Match should always return empty
-        match = disabled_cache.match_prefix(key)
+        match = disabled_cache.match_prefix(MatchPrefixParams(key=RadixKey(key)))
         self.assertEqual(len(match.device_indices), 0)
+        # empty/disabled hit: best_match_node anchors at the root
+        self.assertIs(match.best_match_node, disabled_cache.root_node)
 
     def test_extra_key_namespace_isolation(self):
         """Test that same tokens with different extra_keys don't share cache in SWA"""
@@ -346,18 +358,22 @@ class TestSWARadixCache(CustomTestCase):
 
         # Insert with extra_key="adapter_a"
         value_a = self._alloc_indices(len(key))
-        self.cache.insert(RadixKey(key, "adapter_a"), value=value_a, prev_prefix_len=0)
+        self.cache.insert(
+            InsertParams(key=RadixKey(key, "adapter_a"), value=value_a, prev_prefix_len=0)
+        )
 
         # Insert with extra_key="adapter_b"
         value_b = self._alloc_indices(len(key))
-        self.cache.insert(RadixKey(key, "adapter_b"), value=value_b, prev_prefix_len=0)
+        self.cache.insert(
+            InsertParams(key=RadixKey(key, "adapter_b"), value=value_b, prev_prefix_len=0)
+        )
 
         # Match with "adapter_a" should return value_a
-        match_a = self.cache.match_prefix(RadixKey(key, "adapter_a"))
+        match_a = self.cache.match_prefix(MatchPrefixParams(key=RadixKey(key, "adapter_a")))
         np.testing.assert_array_equal(np.asarray(match_a.device_indices), value_a)
 
         # Match with "adapter_b" should return value_b
-        match_b = self.cache.match_prefix(RadixKey(key, "adapter_b"))
+        match_b = self.cache.match_prefix(MatchPrefixParams(key=RadixKey(key, "adapter_b")))
         np.testing.assert_array_equal(np.asarray(match_b.device_indices), value_b)
 
         # Verify they don't share cache (different values)
@@ -368,20 +384,26 @@ class TestSWARadixCache(CustomTestCase):
         # Insert short sequence with extra_key
         key_short = [10, 20, 30]
         value_short = self._alloc_indices(len(key_short))
-        self.cache.insert(RadixKey(key_short, "shared_key"), value=value_short, prev_prefix_len=0)
+        self.cache.insert(
+            InsertParams(
+                key=RadixKey(key_short, "shared_key"), value=value_short, prev_prefix_len=0
+            )
+        )
 
         # Insert longer sequence with same extra_key should reuse prefix
         key_long = [10, 20, 30, 40, 50]
         value_long = self._alloc_indices(len(key_long))
         prefix_len = self.cache.insert(
-            RadixKey(key_long, "shared_key"), value=value_long, prev_prefix_len=0
+            InsertParams(key=RadixKey(key_long, "shared_key"), value=value_long, prev_prefix_len=0)
         )
 
         # Should have matched the first 3 tokens from cache
         self.assertGreater(prefix_len, 0)
 
         # Matching the short key should still work
-        match_short = self.cache.match_prefix(RadixKey(key_short, "shared_key"))
+        match_short = self.cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(key_short, "shared_key"))
+        )
         self.assertEqual(len(match_short.device_indices), len(key_short))
 
     def test_extra_key_none_vs_string(self):
@@ -390,18 +412,22 @@ class TestSWARadixCache(CustomTestCase):
 
         # Insert with extra_key=None
         value_none = self._alloc_indices(len(key))
-        self.cache.insert(RadixKey(key, None), value=value_none, prev_prefix_len=0)
+        self.cache.insert(
+            InsertParams(key=RadixKey(key, None), value=value_none, prev_prefix_len=0)
+        )
 
         # Insert with extra_key="test"
         value_test = self._alloc_indices(len(key))
-        self.cache.insert(RadixKey(key, "test"), value=value_test, prev_prefix_len=0)
+        self.cache.insert(
+            InsertParams(key=RadixKey(key, "test"), value=value_test, prev_prefix_len=0)
+        )
 
         # Match with None should return value_none
-        match_none = self.cache.match_prefix(RadixKey(key, None))
+        match_none = self.cache.match_prefix(MatchPrefixParams(key=RadixKey(key, None)))
         np.testing.assert_array_equal(np.asarray(match_none.device_indices), value_none)
 
         # Match with "test" should return value_test
-        match_test = self.cache.match_prefix(RadixKey(key, "test"))
+        match_test = self.cache.match_prefix(MatchPrefixParams(key=RadixKey(key, "test")))
         np.testing.assert_array_equal(np.asarray(match_test.device_indices), value_test)
 
         # They should be different
@@ -413,15 +439,15 @@ class TestSWARadixCache(CustomTestCase):
         value = self._alloc_indices(len(key))
 
         # Insert with plain list
-        prefix_len = self.cache.insert(key, value=value, prev_prefix_len=0)
+        prefix_len = self.cache.insert(InsertParams(key=key, value=value, prev_prefix_len=0))
         self.assertEqual(prefix_len, 0)
 
         # Match with plain list
-        match_plain = self.cache.match_prefix(key)
+        match_plain = self.cache.match_prefix(MatchPrefixParams(key=RadixKey(key)))
         np.testing.assert_array_equal(np.asarray(match_plain.device_indices), value)
 
         # Match with RadixKey(key, None) should give same result
-        match_radix = self.cache.match_prefix(RadixKey(key, None))
+        match_radix = self.cache.match_prefix(MatchPrefixParams(key=RadixKey(key, None)))
         np.testing.assert_array_equal(
             np.asarray(match_plain.device_indices), np.asarray(match_radix.device_indices)
         )
@@ -432,18 +458,22 @@ class TestSWARadixCache(CustomTestCase):
 
         # Insert with dp_rank=0
         value_rank0 = self._alloc_indices(len(key))
-        self.cache.insert(RadixKey(key, None, 0), value=value_rank0, prev_prefix_len=0)
+        self.cache.insert(
+            InsertParams(key=RadixKey(key, None, 0), value=value_rank0, prev_prefix_len=0)
+        )
 
         # Insert with dp_rank=1
         value_rank1 = self._alloc_indices(len(key))
-        self.cache.insert(RadixKey(key, None, 1), value=value_rank1, prev_prefix_len=0)
+        self.cache.insert(
+            InsertParams(key=RadixKey(key, None, 1), value=value_rank1, prev_prefix_len=0)
+        )
 
         # Match with dp_rank=0 should return value_rank0
-        match_rank0 = self.cache.match_prefix(RadixKey(key, None, 0))
+        match_rank0 = self.cache.match_prefix(MatchPrefixParams(key=RadixKey(key, None, 0)))
         np.testing.assert_array_equal(np.asarray(match_rank0.device_indices), value_rank0)
 
         # Match with dp_rank=1 should return value_rank1
-        match_rank1 = self.cache.match_prefix(RadixKey(key, None, 1))
+        match_rank1 = self.cache.match_prefix(MatchPrefixParams(key=RadixKey(key, None, 1)))
         np.testing.assert_array_equal(np.asarray(match_rank1.device_indices), value_rank1)
 
         # Verify values are different (different cache namespaces)
@@ -455,17 +485,21 @@ class TestSWARadixCache(CustomTestCase):
 
         # Insert with dp_rank=None
         value_none = self._alloc_indices(len(key))
-        self.cache.insert(RadixKey(key, None, None), value=value_none, prev_prefix_len=0)
+        self.cache.insert(
+            InsertParams(key=RadixKey(key, None, None), value=value_none, prev_prefix_len=0)
+        )
 
         # Match with dp_rank=None should hit cache
-        match = self.cache.match_prefix(RadixKey(key, None, None))
+        match = self.cache.match_prefix(MatchPrefixParams(key=RadixKey(key, None, None)))
         np.testing.assert_array_equal(np.asarray(match.device_indices), value_none)
 
         # Insert longer sequence with dp_rank=None should reuse prefix
         longer_key = [10, 20, 30, 40, 50]
         longer_value = self._alloc_indices(len(longer_key))
         prefix_len = self.cache.insert(
-            RadixKey(longer_key, None, None), value=longer_value, prev_prefix_len=0
+            InsertParams(
+                key=RadixKey(longer_key, None, None), value=longer_value, prev_prefix_len=0
+            )
         )
         self.assertEqual(prefix_len, 3)  # Reused 3 tokens from cache
 
@@ -475,18 +509,22 @@ class TestSWARadixCache(CustomTestCase):
 
         # Insert with dp_rank=None
         value_none = self._alloc_indices(len(key))
-        self.cache.insert(RadixKey(key, None, None), value=value_none, prev_prefix_len=0)
+        self.cache.insert(
+            InsertParams(key=RadixKey(key, None, None), value=value_none, prev_prefix_len=0)
+        )
 
         # Insert with dp_rank=0
         value_rank0 = self._alloc_indices(len(key))
-        self.cache.insert(RadixKey(key, None, 0), value=value_rank0, prev_prefix_len=0)
+        self.cache.insert(
+            InsertParams(key=RadixKey(key, None, 0), value=value_rank0, prev_prefix_len=0)
+        )
 
         # Match with None should return value_none
-        match_none = self.cache.match_prefix(RadixKey(key, None, None))
+        match_none = self.cache.match_prefix(MatchPrefixParams(key=RadixKey(key, None, None)))
         np.testing.assert_array_equal(np.asarray(match_none.device_indices), value_none)
 
         # Match with 0 should return value_rank0
-        match_rank0 = self.cache.match_prefix(RadixKey(key, None, 0))
+        match_rank0 = self.cache.match_prefix(MatchPrefixParams(key=RadixKey(key, None, 0)))
         np.testing.assert_array_equal(np.asarray(match_rank0.device_indices), value_rank0)
 
         # Verify they are different
@@ -498,28 +536,44 @@ class TestSWARadixCache(CustomTestCase):
 
         # Create 4 different cache namespaces
         value_lora_a_rank0 = self._alloc_indices(len(key))
-        self.cache.insert(RadixKey(key, "lora_a", 0), value=value_lora_a_rank0, prev_prefix_len=0)
+        self.cache.insert(
+            InsertParams(
+                key=RadixKey(key, "lora_a", 0), value=value_lora_a_rank0, prev_prefix_len=0
+            )
+        )
 
         value_lora_a_rank1 = self._alloc_indices(len(key))
-        self.cache.insert(RadixKey(key, "lora_a", 1), value=value_lora_a_rank1, prev_prefix_len=0)
+        self.cache.insert(
+            InsertParams(
+                key=RadixKey(key, "lora_a", 1), value=value_lora_a_rank1, prev_prefix_len=0
+            )
+        )
 
         value_lora_b_rank0 = self._alloc_indices(len(key))
-        self.cache.insert(RadixKey(key, "lora_b", 0), value=value_lora_b_rank0, prev_prefix_len=0)
+        self.cache.insert(
+            InsertParams(
+                key=RadixKey(key, "lora_b", 0), value=value_lora_b_rank0, prev_prefix_len=0
+            )
+        )
 
         value_lora_b_rank1 = self._alloc_indices(len(key))
-        self.cache.insert(RadixKey(key, "lora_b", 1), value=value_lora_b_rank1, prev_prefix_len=0)
+        self.cache.insert(
+            InsertParams(
+                key=RadixKey(key, "lora_b", 1), value=value_lora_b_rank1, prev_prefix_len=0
+            )
+        )
 
         # Verify each combination returns its own value
-        match = self.cache.match_prefix(RadixKey(key, "lora_a", 0))
+        match = self.cache.match_prefix(MatchPrefixParams(key=RadixKey(key, "lora_a", 0)))
         np.testing.assert_array_equal(np.asarray(match.device_indices), value_lora_a_rank0)
 
-        match = self.cache.match_prefix(RadixKey(key, "lora_a", 1))
+        match = self.cache.match_prefix(MatchPrefixParams(key=RadixKey(key, "lora_a", 1)))
         np.testing.assert_array_equal(np.asarray(match.device_indices), value_lora_a_rank1)
 
-        match = self.cache.match_prefix(RadixKey(key, "lora_b", 0))
+        match = self.cache.match_prefix(MatchPrefixParams(key=RadixKey(key, "lora_b", 0)))
         np.testing.assert_array_equal(np.asarray(match.device_indices), value_lora_b_rank0)
 
-        match = self.cache.match_prefix(RadixKey(key, "lora_b", 1))
+        match = self.cache.match_prefix(MatchPrefixParams(key=RadixKey(key, "lora_b", 1)))
         np.testing.assert_array_equal(np.asarray(match.device_indices), value_lora_b_rank1)
 
         # Verify all values are different
@@ -581,7 +635,7 @@ class TestSWARadixCache(CustomTestCase):
     def test_evictable_size_returns_min(self):
         cache = self.cache
         indices = self._alloc_indices(10)
-        cache.insert(RadixKey(list(range(10)), None), indices)
+        cache.insert(InsertParams(key=RadixKey(list(range(10)), None), value=indices))
         self.assertEqual(cache.evictable_size(), 10)
 
     # ------------------------------------------------------------------ #
@@ -598,15 +652,15 @@ class TestSWARadixCache(CustomTestCase):
         val_a = self._alloc_indices(len(key_a))
         val_b = self._alloc_indices(len(key_b))
 
-        cache.insert(key_a, value=val_a, prev_prefix_len=0)
-        cache.insert(key_b, value=val_b, prev_prefix_len=0)
+        cache.insert(InsertParams(key=key_a, value=val_a, prev_prefix_len=0))
+        cache.insert(InsertParams(key=key_b, value=val_b, prev_prefix_len=0))
 
         full_before, swa_before = cache.total_size()
         self.assertEqual(full_before, swa_before)  # no tombstones yet
         swa_evictable_before = cache.swa_evictable_size()
 
         # SWA evict the shared prefix
-        cache.evict(full_num_tokens=0, swa_num_tokens=len(shared))
+        cache.evict(EvictParams(num_tokens=0, swa_num_tokens=len(shared)))
 
         full_after, swa_after = cache.total_size()
         # Full tokens unchanged (tombstone keeps full), SWA tokens decreased
@@ -630,10 +684,10 @@ class TestSWARadixCache(CustomTestCase):
         cache, key_a, val_a, key_b, val_b = self._make_tree_with_tombstone()
 
         # With sliding_window_size=4 and suffix length=5 (>4), matching should still work
-        match_a = cache.match_prefix(key_a)
+        match_a = cache.match_prefix(MatchPrefixParams(key=RadixKey(key_a)))
         self.assertEqual(len(match_a.device_indices), len(key_a))
 
-        match_b = cache.match_prefix(key_b)
+        match_b = cache.match_prefix(MatchPrefixParams(key=RadixKey(key_b)))
         self.assertEqual(len(match_b.device_indices), len(key_b))
 
     def test_tombstone_healing_branch1(self):
@@ -647,7 +701,9 @@ class TestSWARadixCache(CustomTestCase):
 
         # Re-insert key_a with swa_evicted_seqlen=0 (Branch 1: not evicted)
         new_val = self._alloc_indices(len(key_a))
-        cache.insert(key_a, value=new_val, prev_prefix_len=0, swa_evicted_seqlen=0)
+        cache.insert(
+            InsertParams(key=key_a, value=new_val, prev_prefix_len=0, swa_evicted_seqlen=0)
+        )
 
         # The tombstone should be healed (revived)
         healed_node = cache.root_node.children[child_key]
@@ -667,7 +723,9 @@ class TestSWARadixCache(CustomTestCase):
         # Re-insert with swa_evicted_seqlen=5 (in the middle of shared[0:10])
         # Branch 2: split at position 5, revive [5:10], keep [0:5] as tombstone
         new_val = self._alloc_indices(len(key_a))
-        cache.insert(key_a, value=new_val, prev_prefix_len=0, swa_evicted_seqlen=5)
+        cache.insert(
+            InsertParams(key=key_a, value=new_val, prev_prefix_len=0, swa_evicted_seqlen=5)
+        )
 
         # Walk tree: root → [0:5] (tombstone) → [5:10] (revived) → {[10:15], [20:24]}
         front_node = cache.root_node.children[child_key]
@@ -697,7 +755,9 @@ class TestSWARadixCache(CustomTestCase):
         # Re-insert with swa_evicted_seqlen=15 (>= node_end=10)
         # Branch 3: entire node already evicted → keep tombstone
         new_val = self._alloc_indices(len(key_a))
-        cache.insert(key_a, value=new_val, prev_prefix_len=0, swa_evicted_seqlen=15)
+        cache.insert(
+            InsertParams(key=key_a, value=new_val, prev_prefix_len=0, swa_evicted_seqlen=15)
+        )
 
         # The shared prefix should still be tombstone
         self.assertTrue(cache.root_node.children[child_key].swa_tombstone)
@@ -711,7 +771,7 @@ class TestSWARadixCache(CustomTestCase):
         full_before, _ = cache.total_size()
 
         # Evict enough full tokens to delete all leaves, which cascade to tombstone parent
-        cache.evict(full_num_tokens=full_before, swa_num_tokens=0)
+        cache.evict(EvictParams(num_tokens=full_before, swa_num_tokens=0))
 
         full_after, swa_after = cache.total_size()
         self.assertEqual(full_after, 0)
@@ -727,26 +787,26 @@ class TestSWARadixCache(CustomTestCase):
 
         # Insert all
         for k, v in zip(keys, vals):
-            cache.insert(k, value=v, prev_prefix_len=0)
+            cache.insert(InsertParams(key=k, value=v, prev_prefix_len=0))
             self._verify_size_consistency_for(cache, f"after insert {k[0]}")
 
         # SWA evict some
-        cache.evict(full_num_tokens=0, swa_num_tokens=20)
+        cache.evict(EvictParams(num_tokens=0, swa_num_tokens=20))
         self._verify_size_consistency_for(cache, "after swa evict 20")
 
         # Full evict some
-        cache.evict(full_num_tokens=20, swa_num_tokens=0)
+        cache.evict(EvictParams(num_tokens=20, swa_num_tokens=0))
         self._verify_size_consistency_for(cache, "after full evict 20")
 
         # Insert more (reuse prefix)
         new_key = keys[0] + [999, 998, 997]
         new_val = self._alloc_indices(len(new_key))
-        cache.insert(new_key, value=new_val, prev_prefix_len=0)
+        cache.insert(InsertParams(key=new_key, value=new_val, prev_prefix_len=0))
         self._verify_size_consistency_for(cache, "after re-insert with extension")
 
         # Evict everything
         full_total, _ = cache.total_size()
-        cache.evict(full_num_tokens=full_total, swa_num_tokens=0)
+        cache.evict(EvictParams(num_tokens=full_total, swa_num_tokens=0))
         self._verify_size_consistency_for(cache, "after evict all")
 
     def test_protected_prefix_basic(self):
@@ -756,22 +816,24 @@ class TestSWARadixCache(CustomTestCase):
         val_first = self._alloc_indices(len(key))
 
         # First insert: puts everything into tree
-        cache.insert(key, value=val_first, prev_prefix_len=0)
+        cache.insert(InsertParams(key=key, value=val_first, prev_prefix_len=0))
 
         # Match to confirm
-        match = cache.match_prefix(key)
+        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(key)))
         self.assertEqual(len(match.device_indices), 20)
 
         # SWA-evict to create tombstone
-        cache.evict(full_num_tokens=0, swa_num_tokens=20)
+        cache.evict(EvictParams(num_tokens=0, swa_num_tokens=20))
 
         # Second insert with protected_prefix_len=10 (prev_prefix_len) and swa_evicted_seqlen=5
         # Branch 2 applies: swa_evicted_seqlen(5) < node_end(20), split at 5, revive [5:20]
         val_second = self._alloc_indices(len(key))
-        cache.insert(key, value=val_second, prev_prefix_len=10, swa_evicted_seqlen=5)
+        cache.insert(
+            InsertParams(key=key, value=val_second, prev_prefix_len=10, swa_evicted_seqlen=5)
+        )
 
         # Match should still return 20 tokens (sliding_window=4, suffix > 4)
-        match2 = cache.match_prefix(key)
+        match2 = cache.match_prefix(MatchPrefixParams(key=RadixKey(key)))
         self.assertEqual(len(match2.device_indices), 20)
 
         self._verify_size_consistency_for(cache, "after protected prefix insert")
@@ -784,7 +846,7 @@ class TestSWARadixCache(CustomTestCase):
 
         # Insert with swa_evicted_seqlen=10 → new node should be split:
         # [0:10] as tombstone + [10:20] as non-tombstone
-        cache.insert(key, value=val, prev_prefix_len=0, swa_evicted_seqlen=10)
+        cache.insert(InsertParams(key=key, value=val, prev_prefix_len=0, swa_evicted_seqlen=10))
 
         full_total, swa_total = cache.total_size()
         self.assertEqual(full_total, 20)
@@ -806,7 +868,7 @@ class TestSWARadixCache(CustomTestCase):
         self.assertEqual(len(leaf_node.value), 10)
 
         # Match should return all 20 tokens (sliding_window=4, non-tombstone suffix=10 > 4)
-        match = cache.match_prefix(key)
+        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(key)))
         self.assertEqual(len(match.device_indices), 20)
 
         self._verify_size_consistency_for(cache, "after new node tombstone split")
@@ -820,21 +882,21 @@ class TestSWARadixCache(CustomTestCase):
         val_a = self._alloc_indices(len(key_a))
         val_b = self._alloc_indices(len(key_b))
 
-        cache.insert(key_a, value=val_a, prev_prefix_len=0)
-        cache.insert(key_b, value=val_b, prev_prefix_len=0)
+        cache.insert(InsertParams(key=key_a, value=val_a, prev_prefix_len=0))
+        cache.insert(InsertParams(key=key_b, value=val_b, prev_prefix_len=0))
 
         full_before, swa_before = cache.total_size()
         self.assertEqual(full_before, swa_before)
 
         # Phase 2 SWA evict: should tombstone the shared prefix
-        cache.evict(full_num_tokens=0, swa_num_tokens=len(shared))
+        cache.evict(EvictParams(num_tokens=0, swa_num_tokens=len(shared)))
         full_mid, swa_mid = cache.total_size()
         self.assertEqual(full_mid, full_before)  # full unchanged
         self.assertLess(swa_mid, swa_before)  # SWA decreased
         self._verify_size_consistency_for(cache, "after phase 2 evict")
 
         # Phase 1 full evict: should delete leaf + cascade tombstone
-        cache.evict(full_num_tokens=8, swa_num_tokens=0)
+        cache.evict(EvictParams(num_tokens=8, swa_num_tokens=0))
         full_after, swa_after = cache.total_size()
         self.assertLess(full_after, full_mid)
         self._verify_size_consistency_for(cache, "after phase 1 evict")
@@ -846,21 +908,23 @@ class TestSWARadixCache(CustomTestCase):
         for cycle in range(5):
             key = list(range(cycle * 100, cycle * 100 + 16))
             val = self._alloc_indices(len(key))
-            cache.insert(key, value=val, prev_prefix_len=0)
+            cache.insert(InsertParams(key=key, value=val, prev_prefix_len=0))
             self._verify_size_consistency_for(cache, f"cycle {cycle} insert")
 
             # SWA evict some
-            cache.evict(full_num_tokens=0, swa_num_tokens=8)
+            cache.evict(EvictParams(num_tokens=0, swa_num_tokens=8))
             self._verify_size_consistency_for(cache, f"cycle {cycle} swa evict")
 
             # Re-insert with new values (simulating healing)
             new_val = self._alloc_indices(len(key))
-            cache.insert(key, value=new_val, prev_prefix_len=0, swa_evicted_seqlen=0)
+            cache.insert(
+                InsertParams(key=key, value=new_val, prev_prefix_len=0, swa_evicted_seqlen=0)
+            )
             self._verify_size_consistency_for(cache, f"cycle {cycle} re-insert")
 
         # Final full evict
         full_total, _ = cache.total_size()
-        cache.evict(full_num_tokens=full_total + 100, swa_num_tokens=0)
+        cache.evict(EvictParams(num_tokens=full_total + 100, swa_num_tokens=0))
         full_final, swa_final = cache.total_size()
         self.assertEqual(full_final, 0, "full size should be 0 after evict all")
         self.assertEqual(swa_final, 0, "swa size should be 0 after evict all")
@@ -882,17 +946,19 @@ class TestSWARadixCache(CustomTestCase):
                 val = self._alloc_indices(length)
                 swa_evicted = rng.choice([0, 0, 0, rng.randint(0, length)])
                 cache.insert(
-                    key,
-                    value=val,
-                    prev_prefix_len=0,
-                    swa_evicted_seqlen=swa_evicted,
+                    InsertParams(
+                        key=key,
+                        value=val,
+                        prev_prefix_len=0,
+                        swa_evicted_seqlen=swa_evicted,
+                    )
                 )
             elif op == "evict_swa":
                 amount = rng.randint(1, 16)
-                cache.evict(full_num_tokens=0, swa_num_tokens=amount)
+                cache.evict(EvictParams(num_tokens=0, swa_num_tokens=amount))
             else:
                 amount = rng.randint(1, 16)
-                cache.evict(full_num_tokens=amount, swa_num_tokens=0)
+                cache.evict(EvictParams(num_tokens=amount, swa_num_tokens=0))
 
             self._verify_size_consistency_for(cache, f"fuzz step {step} op={op}")
 
@@ -925,12 +991,12 @@ class TestSWARadixCache(CustomTestCase):
         val_a = self._alloc_indices(len(key_a))
         val_b = self._alloc_indices(len(key_b))
 
-        cache.insert(key_a, value=val_a, prev_prefix_len=0)
-        cache.insert(key_b, value=val_b, prev_prefix_len=0)
+        cache.insert(InsertParams(key=key_a, value=val_a, prev_prefix_len=0))
+        cache.insert(InsertParams(key=key_b, value=val_b, prev_prefix_len=0))
 
         # SWA-evict both shared prefixes: first [0..4], then [5..9]
         # This creates two consecutive tombstone nodes
-        cache.evict(full_num_tokens=0, swa_num_tokens=10)
+        cache.evict(EvictParams(num_tokens=0, swa_num_tokens=10))
 
         # Walk tree to verify two tombstones
         child_key_0 = cache.get_child_key_fn(RadixKey([0], None))
@@ -938,7 +1004,7 @@ class TestSWARadixCache(CustomTestCase):
         self.assertTrue(node_0_4.swa_tombstone, "First shared prefix should be tombstone")
 
         # Match should still work: suffix (5 tokens) > sliding_window (4)
-        match_a = cache.match_prefix(key_a)
+        match_a = cache.match_prefix(MatchPrefixParams(key=RadixKey(key_a)))
         # Even with two consecutive tombstones, the suffix after the last tombstone
         # should be enough to match if it exceeds sliding_window_size
         self.assertGreater(len(match_a.device_indices), 0)
@@ -958,7 +1024,7 @@ class TestSWARadixCache(CustomTestCase):
 
         # Insert with swa_evicted_seqlen=20 (>> total_prefix_length + len(key) = 10)
         # Upstream behavior: free value, return early, no node created
-        cache.insert(key, value=val, prev_prefix_len=0, swa_evicted_seqlen=20)
+        cache.insert(InsertParams(key=key, value=val, prev_prefix_len=0, swa_evicted_seqlen=20))
 
         full_total, swa_total = cache.total_size()
         # No node created → tree is empty
@@ -981,7 +1047,7 @@ class TestSWARadixCache(CustomTestCase):
         val = self._alloc_indices(len(key))
 
         # swa_evicted_seqlen == total_prefix_length(0) + len(key)(10) = 10
-        cache.insert(key, value=val, prev_prefix_len=0, swa_evicted_seqlen=10)
+        cache.insert(InsertParams(key=key, value=val, prev_prefix_len=0, swa_evicted_seqlen=10))
 
         full_total, swa_total = cache.total_size()
         # No node created → tree is empty
@@ -1004,15 +1070,15 @@ class TestSWARadixCache(CustomTestCase):
         val_a = self._alloc_indices(len(key_a))
         val_b = self._alloc_indices(len(key_b))
 
-        cache.insert(key_a, value=val_a, prev_prefix_len=0)
-        cache.insert(key_b, value=val_b, prev_prefix_len=0)
+        cache.insert(InsertParams(key=key_a, value=val_a, prev_prefix_len=0))
+        cache.insert(InsertParams(key=key_b, value=val_b, prev_prefix_len=0))
 
         full_before, swa_before = cache.total_size()
         self.assertEqual(full_before, 15)  # 5 shared + 5 suffix_a + 5 suffix_b
 
         # The tree has: root → [0..4] (internal) → {[10..14] (leaf A), [20..24] (leaf B)}
         # Evict one leaf by full eviction
-        cache.evict(full_num_tokens=5, swa_num_tokens=0)
+        cache.evict(EvictParams(num_tokens=5, swa_num_tokens=0))
 
         full_after, swa_after = cache.total_size()
         self.assertLess(full_after, full_before)
@@ -1028,7 +1094,7 @@ class TestSWARadixCache(CustomTestCase):
         full_before, _ = cache.total_size()
 
         # Full evict everything — should cascade delete tombstone parent via _delete_tombstone_leaf
-        cache.evict(full_num_tokens=full_before, swa_num_tokens=0)
+        cache.evict(EvictParams(num_tokens=full_before, swa_num_tokens=0))
 
         full_after, swa_after = cache.total_size()
         self.assertEqual(full_after, 0)
@@ -1043,8 +1109,8 @@ class TestSWARadixCache(CustomTestCase):
         cache = self._make_small_cache(sliding_window_size=4)
         key = list(range(0, 20))
         tree_indices = self._alloc_indices(len(key))
-        cache.insert(key, value=tree_indices, prev_prefix_len=0)
-        match = cache.match_prefix(key)
+        cache.insert(InsertParams(key=key, value=tree_indices, prev_prefix_len=0))
+        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(key)))
 
         tail_indices = self._alloc_indices(10)
         req_indices = np.concatenate([tree_indices, tail_indices])
@@ -1080,8 +1146,8 @@ class TestSWARadixCache(CustomTestCase):
 
         key = list(range(0, 8))
         tree_indices = self._alloc_indices(len(key))
-        paged_cache.insert(key, value=tree_indices, prev_prefix_len=0)
-        match = paged_cache.match_prefix(key)
+        paged_cache.insert(InsertParams(key=key, value=tree_indices, prev_prefix_len=0))
+        match = paged_cache.match_prefix(MatchPrefixParams(key=RadixKey(key)))
 
         tail_indices = self._alloc_indices(12)
         req_indices = np.concatenate([tree_indices, tail_indices])
@@ -1121,14 +1187,16 @@ class TestSWARadixCache(CustomTestCase):
         val_a = self._alloc_indices(len(key_a))
         val_b = self._alloc_indices(len(key_b))
 
-        paged_cache.insert(key_a, value=val_a, prev_prefix_len=0)
-        paged_cache.insert(key_b, value=val_b, prev_prefix_len=0)
-        paged_cache.evict(full_num_tokens=0, swa_num_tokens=8)
+        paged_cache.insert(InsertParams(key=key_a, value=val_a, prev_prefix_len=0))
+        paged_cache.insert(InsertParams(key=key_b, value=val_b, prev_prefix_len=0))
+        paged_cache.evict(EvictParams(num_tokens=0, swa_num_tokens=8))
 
         # Re-inserting with non-page-aligned swa_evicted_seqlen should assert
         new_val = self._alloc_indices(len(key_a))
         with self.assertRaises(AssertionError):
-            paged_cache.insert(key_a, value=new_val, prev_prefix_len=0, swa_evicted_seqlen=3)
+            paged_cache.insert(
+                InsertParams(key=key_a, value=new_val, prev_prefix_len=0, swa_evicted_seqlen=3)
+            )
 
     def test_cache_unfinished_req_writeback_range(self):
         """T22: cache_unfinished_req writes back from last_matched_prefix_len, not len(prefix_indices)."""
@@ -1137,19 +1205,21 @@ class TestSWARadixCache(CustomTestCase):
         # Simulate first insert (initial request)
         key_part1 = list(range(0, 10))
         val1 = self._alloc_indices(len(key_part1))
-        cache.insert(key_part1, value=val1, prev_prefix_len=0)
+        cache.insert(InsertParams(key=key_part1, value=val1, prev_prefix_len=0))
 
         # After first insert, match should return all 10 tokens
-        match1 = cache.match_prefix(key_part1)
+        match1 = cache.match_prefix(MatchPrefixParams(key=RadixKey(key_part1)))
         self.assertEqual(len(match1.device_indices), 10)
 
         # Insert extended sequence (simulating cache_unfinished_req)
         key_full = list(range(0, 20))
         val2 = self._alloc_indices(len(key_full))
-        cache.insert(key_full, value=val2, prev_prefix_len=10, swa_evicted_seqlen=0)
+        cache.insert(
+            InsertParams(key=key_full, value=val2, prev_prefix_len=10, swa_evicted_seqlen=0)
+        )
 
         # Match the full key
-        match2 = cache.match_prefix(key_full)
+        match2 = cache.match_prefix(MatchPrefixParams(key=RadixKey(key_full)))
         self.assertEqual(len(match2.device_indices), 20)
 
         # Verify old cached indices are preserved (not overwritten)

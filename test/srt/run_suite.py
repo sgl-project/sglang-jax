@@ -307,6 +307,8 @@ suites = {
         TestFile("python/sgl_jax/test/mem_cache/test_swa_allocator.py", 1),
         TestFile("python/sgl_jax/test/mem_cache/test_swa_radix_cache.py", 1),
         TestFile("python/sgl_jax/test/mem_cache/test_radix_cache.py", 1),
+        TestFile("python/sgl_jax/test/mem_cache/test_unified_radix_cache.py", 1),
+        TestFile("python/sgl_jax/test/mem_cache/test_unified_radix_tree_flag.py", 1),
         TestFile("python/sgl_jax/test/mem_cache/test_paged_allocator_multi_dp.py", 1),
         TestFile("python/sgl_jax/test/test_kv_cache_builder.py", 0.1, runner="pytest"),
         TestFile("test/srt/function_call/test_qwen3_coder_detector.py", 0.1),
@@ -376,6 +378,7 @@ suites = {
         TestFile("test/srt/lora/test_bgmv_backend.py", 6),
         TestFile("test/srt/lora/test_dynamic_lora.py", 10),
         TestFile("test/srt/lora/test_static_lora.py", 10),
+        TestFile("test/srt/test_unified_radix_cache_serving.py", 8),
     ],
     "e2e-test-tpu-v6e-4": [
         TestFile("test/srt/openai_server/basic/test_tool_calls.py", 2),

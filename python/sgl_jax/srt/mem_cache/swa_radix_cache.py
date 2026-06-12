@@ -10,7 +10,16 @@ import jax.numpy as jnp
 import numpy as np
 
 from sgl_jax.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
-from sgl_jax.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
+from sgl_jax.srt.mem_cache.base_prefix_cache import (
+    BasePrefixCache,
+    DecLockRefParams,
+    EvictParams,
+    EvictResult,
+    IncLockRefResult,
+    InsertParams,
+    MatchPrefixParams,
+    MatchResult,
+)
 from sgl_jax.srt.mem_cache.memory_pool import ReqToTokenPool
 from sgl_jax.srt.mem_cache.radix_cache import RadixKey
 from sgl_jax.srt.mem_cache.radix_cache import (
@@ -332,7 +341,7 @@ class SWARadixCache(BasePrefixCache):
         self.full_lru_list = LRUList(swa=False)
         self.swa_lru_list = LRUList(swa=True)
 
-    def match_prefix(self, key: RadixKey | list[int], **kwargs) -> MatchResult:
+    def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         """Find the matching prefix from the radix tree.
         Args:
             key: A RadixKey or list of token IDs to find a matching prefix.
@@ -343,11 +352,7 @@ class SWARadixCache(BasePrefixCache):
             The last node create a new child if the prefix is shorter
             than the last node's value.
         """
-        # Support both RadixKey and plain list for backward compatibility
-        if not isinstance(key, RadixKey):
-            extra_key = kwargs.get("extra_key")
-            dp_rank = kwargs.get("dp_rank")
-            key = RadixKey(key, extra_key, dp_rank)
+        key = params.key
 
         if self.disable or len(key) == 0:
             return MatchResult(
@@ -357,6 +362,7 @@ class SWARadixCache(BasePrefixCache):
                 ),
                 last_device_node=self.root_node,
                 last_host_node=self.root_node,
+                best_match_node=self.root_node,
             )
 
         if self.page_size != 1:
@@ -369,15 +375,15 @@ class SWARadixCache(BasePrefixCache):
             device_indices=value,
             last_device_node=last_node,
             last_host_node=last_node,
+            best_match_node=last_node,
         )
 
-    def insert(
-        self,
-        key: RadixKey | list,
-        value=None,
-        prev_prefix_len: int = 0,
-        swa_evicted_seqlen: int = 0,
-    ) -> int:
+    def insert(self, params: InsertParams) -> int:
+        key = params.key
+        value = params.value
+        prev_prefix_len = params.prev_prefix_len
+        swa_evicted_seqlen = params.swa_evicted_seqlen
+
         if self.disable:
             return 0
 
@@ -420,10 +426,12 @@ class SWARadixCache(BasePrefixCache):
             # Radix Cache takes one ref in memory pool
             # Note: the insert function already frees the overlapped kv_indices
             self.insert(
-                RadixKey(token_ids[:page_aligned_len], req.extra_key, req.dp_rank),
-                page_aligned_kv_indices,
-                req.cache_protected_len,
-                swa_evicted_seqlen=req.swa_evicted_seqlen,
+                InsertParams(
+                    key=RadixKey(token_ids[:page_aligned_len], req.extra_key, req.dp_rank),
+                    value=page_aligned_kv_indices,
+                    prev_prefix_len=req.cache_protected_len,
+                    swa_evicted_seqlen=req.swa_evicted_seqlen,
+                )
             )
         else:
             # cache_protected_len, not len(prefix_indices); see RadixCache.cache_finished_req.
@@ -433,7 +441,7 @@ class SWARadixCache(BasePrefixCache):
                     kv_indices[old_prefix_len:page_aligned_len], dp_rank=dp_rank
                 )
 
-        self.dec_lock_ref(req.last_node, req.swa_uuid_for_lock)
+        self.dec_lock_ref(req.last_node, DecLockRefParams(swa_uuid_for_lock=req.swa_uuid_for_lock))
 
     def cache_unfinished_req(self, req: Req, chunked=False) -> None:
         """Cache request when it is unfinished."""
@@ -458,14 +466,16 @@ class SWARadixCache(BasePrefixCache):
         # Note: the insert function already frees the overlapped kv_indices
         old_prefix_len = req.cache_protected_len
         new_prefix_len = self.insert(
-            RadixKey(page_aligned_token_ids, req.extra_key, req.dp_rank),
-            page_aligned_kv_indices,
-            old_prefix_len,
-            swa_evicted_seqlen=req.swa_evicted_seqlen,
+            InsertParams(
+                key=RadixKey(page_aligned_token_ids, req.extra_key, req.dp_rank),
+                value=page_aligned_kv_indices,
+                prev_prefix_len=old_prefix_len,
+                swa_evicted_seqlen=req.swa_evicted_seqlen,
+            )
         )
 
         match_result = self.match_prefix(
-            RadixKey(page_aligned_token_ids, req.extra_key, req.dp_rank)
+            MatchPrefixParams(key=RadixKey(page_aligned_token_ids, req.extra_key, req.dp_rank))
         )
         new_indices = match_result.device_indices
         new_last_node = match_result.last_device_node
@@ -476,8 +486,8 @@ class SWARadixCache(BasePrefixCache):
             new_indices[old_prefix_len:],
         )
 
-        self.dec_lock_ref(req.last_node, req.swa_uuid_for_lock)
-        swa_uuid_for_lock = self.inc_lock_ref(new_last_node)
+        self.dec_lock_ref(req.last_node, DecLockRefParams(swa_uuid_for_lock=req.swa_uuid_for_lock))
+        swa_uuid_for_lock = self.inc_lock_ref(new_last_node).swa_uuid_for_lock
 
         if self.page_size != 1:
             req.prefix_indices = np.concatenate([new_indices, kv_indices[len(new_indices) :]])
@@ -496,11 +506,13 @@ class SWARadixCache(BasePrefixCache):
     def total_size(self) -> tuple[int, int]:
         return self._total_size_helper()
 
-    def evict(
-        self, full_num_tokens: int, swa_num_tokens: int = 0, dp_rank: int | None = None
-    ) -> None:
+    def evict(self, params: EvictParams) -> EvictResult:
+        full_num_tokens = params.num_tokens
+        swa_num_tokens = params.swa_num_tokens
+        dp_rank = params.dp_rank
+
         if self.disable:
-            return
+            return EvictResult()
 
         full_num_evicted = 0
         swa_num_evicted = 0
@@ -600,7 +612,11 @@ class SWARadixCache(BasePrefixCache):
 
                 x = x_next
 
-    def inc_lock_ref(self, node: TreeNode) -> int | None:
+        return EvictResult(
+            num_tokens_evicted=full_num_evicted, swa_num_tokens_evicted=swa_num_evicted
+        )
+
+    def inc_lock_ref(self, node: TreeNode) -> IncLockRefResult:
         """
         Increment the lock reference count for the node. Returns the swa_uuid_for_lock, which needs
         to be passed to dec_lock_ref.
@@ -608,7 +624,7 @@ class SWARadixCache(BasePrefixCache):
         It locks the swa_lock_ref for nodes between the [last node, swa_uuid_for_lock], inclusive.
         """
         if self.disable:
-            return None
+            return IncLockRefResult()
 
         swa_lock_size = 0
         swa_uuid_for_lock = None
@@ -642,15 +658,16 @@ class SWARadixCache(BasePrefixCache):
                         node.swa_uuid = gen_swa_uuid()
                     swa_uuid_for_lock = node.swa_uuid
             node = node.parent
-        return swa_uuid_for_lock
+        return IncLockRefResult(swa_uuid_for_lock=swa_uuid_for_lock)
 
-    def dec_lock_ref(self, node: TreeNode, swa_uuid_for_lock: int | None = None):
+    def dec_lock_ref(self, node: TreeNode, params: DecLockRefParams | None = None):
         """
         Decrement the lock reference count for the node.
         It unlocks the full_lock_ref for nodes between the [last node, root), exclusive.
         It unlocks the swa_lock_ref for nodes between the [last node, swa_uuid_for_lock], inclusive.
         If swa_uuid_for_lock is None, it unlocks to the root, exclusive.
         """
+        swa_uuid_for_lock = params.swa_uuid_for_lock if params is not None else None
         if self.disable:
             return
 

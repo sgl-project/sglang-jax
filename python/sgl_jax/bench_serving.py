@@ -105,6 +105,7 @@ class RequestFuncOutput:
     prompt_len: int = 0
     error: str = ""
     output_len: int = 0
+    cached_tokens: int = 0
     start_time: float = 0.0
 
     @staticmethod
@@ -608,6 +609,7 @@ async def async_request_sglang_generate(
                                 timestamp = time.perf_counter()
                                 generated_text = data["text"]
                                 output_len = data["meta_info"]["completion_tokens"]
+                                output.cached_tokens = data["meta_info"].get("cached_tokens", 0)
 
                                 # First token
                                 if ttft == 0.0:
@@ -915,6 +917,8 @@ class BenchmarkMetrics:
     concurrency: float
     max_output_tokens_per_s: float = 0.0
     max_concurrent_requests: int = 0
+    total_cached_tokens: int = 0
+    cache_hit_rate: float = 0.0
 
 
 SHAREGPT_REPO_ID = "anon8231489123/ShareGPT_Vicuna_unfiltered"
@@ -1943,6 +1947,8 @@ def calculate_metrics(
     total_input = 0
     total_input_text = 0
     total_input_vision = 0
+    total_cached = 0
+    total_prompt_tokens = 0
     completed = 0
     itls: list[float] = []
     tpots: list[float] = []
@@ -1964,6 +1970,8 @@ def calculate_metrics(
                 tokenizer.encode(outputs[i].generated_text, add_special_tokens=False)
             )
             retokenized_output_lens.append(retokenized_output_len)
+            total_cached += outputs[i].cached_tokens
+            total_prompt_tokens += outputs[i].prompt_len
             if input_requests is not None:
                 total_input += input_requests[i].prompt_len
                 total_input_text += input_requests[i].text_prompt_len
@@ -2092,6 +2100,8 @@ def calculate_metrics(
         concurrency=np.sum(e2e_latencies) / dur_s,
         max_output_tokens_per_s=max_output_tokens_per_s,
         max_concurrent_requests=max_concurrent_requests,
+        total_cached_tokens=total_cached,
+        cache_hit_rate=total_cached / total_prompt_tokens if total_prompt_tokens > 0 else 0.0,
     )
 
     return metrics, output_lens
@@ -2401,6 +2411,8 @@ async def benchmark(
             "Total generated tokens (retokenized):", metrics.total_output_retokenized
         )
     )
+    print("{:<40} {:<10}".format("Total cached tokens:", metrics.total_cached_tokens))
+    print("{:<40} {:<10.4f}".format("Cache hit rate:", metrics.cache_hit_rate))
     print("{:<40} {:<10.2f}".format("Request throughput (req/s):", metrics.request_throughput))
     print("{:<40} {:<10.2f}".format("Input token throughput (tok/s):", metrics.input_throughput))
     print("{:<40} {:<10.2f}".format("Output token throughput (tok/s):", metrics.output_throughput))
@@ -2464,6 +2476,8 @@ async def benchmark(
             "total_input_vision_tokens": metrics.total_input_vision,
             "total_output_tokens": metrics.total_output,
             "total_output_tokens_retokenized": metrics.total_output_retokenized,
+            "total_cached_tokens": metrics.total_cached_tokens,
+            "cache_hit_rate": metrics.cache_hit_rate,
             "request_throughput": metrics.request_throughput,
             "input_throughput": metrics.input_throughput,
             "output_throughput": metrics.output_throughput,
@@ -2514,6 +2528,7 @@ async def benchmark(
     result_details = {
         "input_lens": [output.prompt_len for output in outputs],
         "output_lens": output_lens,
+        "cached_tokens": [output.cached_tokens for output in outputs],
         "ttfts": [output.ttft for output in outputs],
         "itls": [output.itl for output in outputs],
         "generated_texts": [output.generated_text for output in outputs],

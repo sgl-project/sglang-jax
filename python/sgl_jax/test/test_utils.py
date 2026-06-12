@@ -465,6 +465,13 @@ def get_benchmark_args(
     backend="sgl-jax",
     warmup_requests=1,
     return_routed_experts=False,
+    gsp_num_groups=64,
+    gsp_prompts_per_group=16,
+    gsp_system_prompt_len=2048,
+    gsp_question_len=128,
+    gsp_output_len=256,
+    gsp_range_ratio=1.0,
+    flush_cache=False,
 ):
     return SimpleNamespace(
         backend=backend,
@@ -501,6 +508,13 @@ def get_benchmark_args(
         pd_separated=pd_separated,
         warmup_requests=warmup_requests,
         return_routed_experts=return_routed_experts,
+        gsp_num_groups=gsp_num_groups,
+        gsp_prompts_per_group=gsp_prompts_per_group,
+        gsp_system_prompt_len=gsp_system_prompt_len,
+        gsp_question_len=gsp_question_len,
+        gsp_output_len=gsp_output_len,
+        gsp_range_ratio=gsp_range_ratio,
+        flush_cache=flush_cache,
     )
 
 

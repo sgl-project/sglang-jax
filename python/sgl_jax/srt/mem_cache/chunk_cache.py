@@ -8,7 +8,15 @@ from sgl_jax.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
 )
-from sgl_jax.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
+from sgl_jax.srt.mem_cache.base_prefix_cache import (
+    BasePrefixCache,
+    DecLockRefParams,
+    EvictParams,
+    EvictResult,
+    IncLockRefResult,
+    MatchPrefixParams,
+    MatchResult,
+)
 from sgl_jax.srt.mem_cache.memory_pool import ReqToTokenPool
 
 if TYPE_CHECKING:
@@ -29,11 +37,12 @@ class ChunkCache(BasePrefixCache):
     def reset(self):
         pass
 
-    def match_prefix(self, **unused_kwargs) -> MatchResult:
+    def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         return MatchResult(
             device_indices=np.empty((0,), dtype=np.int32),
             last_device_node=None,
             last_host_node=None,
+            best_match_node=None,
         )
 
     def cache_finished_req(self, req: Req, is_insert: bool = True):
@@ -52,18 +61,13 @@ class ChunkCache(BasePrefixCache):
             req.req_pool_idx, : len(req.fill_ids)
         ].copy()
 
-    def evict(
-        self,
-        num_tokens: int,
-        swa_num_tokens: int = 0,
-        dp_rank: int | None = None,
-    ):
-        pass
+    def evict(self, params: EvictParams) -> EvictResult:
+        return EvictResult()
 
-    def inc_lock_ref(self, node: Any):
-        return 0
+    def inc_lock_ref(self, node: Any) -> IncLockRefResult:
+        return IncLockRefResult(delta=0)
 
-    def dec_lock_ref(self, node: Any, swa_uuid_for_lock: str | None = None):
+    def dec_lock_ref(self, node: Any, params: DecLockRefParams | None = None):
         return 0
 
     def pretty_print(self):

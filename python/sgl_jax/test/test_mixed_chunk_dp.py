@@ -5,6 +5,7 @@ import numpy as np
 
 from sgl_jax.srt.managers.schedule_batch import Req, ScheduleBatch
 from sgl_jax.srt.managers.schedule_policy import AddReqResult, PrefillAdder
+from sgl_jax.srt.mem_cache.base_prefix_cache import IncLockRefResult
 from sgl_jax.srt.sampling.sampling_params import SamplingParams
 
 
@@ -27,9 +28,9 @@ class _DummyRadixCache:
         return 0
 
     def inc_lock_ref(self, node):
-        return None
+        return IncLockRefResult(delta=0)
 
-    def dec_lock_ref(self, node, swa_uuid_for_lock=None):
+    def dec_lock_ref(self, node, params=None):
         pass
 
 
