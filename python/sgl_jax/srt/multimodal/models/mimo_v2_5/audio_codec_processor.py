@@ -14,12 +14,15 @@ import importlib.machinery
 import importlib.util
 import io
 import json
+import logging
 import math
 import os
 import types
 import urllib.request
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 
 @dataclasses.dataclass
@@ -630,9 +633,7 @@ class MiMoV25AudioCodecProcessor:
         # instead of a separately hand-built torchaudio front-end (avoids melscale_fbanks
         # vs mel_filter_bank numeric drift). Cached; lazy import avoids a module cycle.
         if getattr(self, "_mel_processor", None) is None:
-            from sgl_jax.srt.multimodal.manager.multimodal_tokenizer import (
-                MiMoAudioProcessor,
-            )
+            from sgl_jax.srt.mm_core.audio_processor import MiMoAudioProcessor
 
             self._mel_processor = MiMoAudioProcessor()
         return self._mel_processor

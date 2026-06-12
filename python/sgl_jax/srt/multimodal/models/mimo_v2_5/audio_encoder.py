@@ -16,9 +16,7 @@ from transformers import PretrainedConfig
 
 from sgl_jax.srt.layers.embeddings import Embed
 from sgl_jax.srt.layers.linear import LinearBase
-from sgl_jax.srt.multimodal.models.mimo_audio.mimo_audio_backbone import (
-    MiMoAudioTransformer,
-)
+from sgl_jax.srt.layers.mimo_audio_transformer import MiMoAudioTransformer
 
 
 class MiMoV25AudioUnderstandingEncoder(nnx.Module):

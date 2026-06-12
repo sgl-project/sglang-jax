@@ -12,7 +12,43 @@ from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
 )
 
 from sgl_jax.srt.layers.linear import LinearBase
-from sgl_jax.srt.multimodal.layers.attention.layer import simple_attention
+
+
+def simple_attention(query, key, value, scale=None, causal=False):
+    """Simple dot-product attention for diffusion models (no KV cache).
+
+    Args:
+        query: [B, S, H, D]
+        key: [B, S, H, D]
+        value: [B, S, H, D]
+        scale: softmax scale, default 1/sqrt(D)
+        causal: whether to apply causal mask
+    Returns:
+        output: [B, S, H, D]
+    """
+    if scale is None:
+        scale = 1.0 / math.sqrt(query.shape[-1])
+
+    # [B, H, S, D]
+    q = jnp.transpose(query, (0, 2, 1, 3))
+    k = jnp.transpose(key, (0, 2, 1, 3))
+    v = jnp.transpose(value, (0, 2, 1, 3))
+
+    # [B, H, S, S]
+    attn_weights = jnp.einsum("bhsd,bhtd->bhst", q, k) * scale
+
+    if causal:
+        seq_len = query.shape[1]
+        mask = jnp.tril(jnp.ones((seq_len, seq_len)))
+        attn_weights = jnp.where(mask == 0, float("-inf"), attn_weights)
+
+    attn_weights = jax.nn.softmax(attn_weights, axis=-1)
+
+    # [B, H, S, D]
+    output = jnp.einsum("bhst,bhtd->bhsd", attn_weights, v)
+
+    # [B, S, H, D]
+    return jnp.transpose(output, (0, 2, 1, 3))
 
 
 class Qwen3OmniMoeAudioAttention(nnx.Module):

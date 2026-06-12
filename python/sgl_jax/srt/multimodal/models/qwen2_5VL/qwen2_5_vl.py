@@ -27,13 +27,13 @@ import jax.numpy as jnp
 from flax import nnx
 
 from sgl_jax.srt.configs.model_config import ModelConfig
+from sgl_jax.srt.configs.qwen_vl.config_helpers import qwen_vl_vision_config_from_hf
 from sgl_jax.srt.hf_transformers_utils import get_hf_text_config
 from sgl_jax.srt.layers.embeddings import ParallelLMHead
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.mem_cache.memory_pool import MemoryPools
 from sgl_jax.srt.mm_core.merge import merge
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
-from sgl_jax.srt.multimodal.configs.config_registry import qwen_vl_vision_config_from_hf
 from sgl_jax.srt.multimodal.models.qwen2_5VL.qwen2_5_vit import (
     Qwen2_5_VL_VisionTransformer,
 )

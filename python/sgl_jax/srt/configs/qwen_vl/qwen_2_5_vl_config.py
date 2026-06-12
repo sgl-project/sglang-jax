@@ -1,10 +1,17 @@
 import dataclasses
 
-from sgl_jax.srt.multimodal.configs.multimodal_base_config import MultiModalModelConfigs
+import jax.numpy as jnp
 
 
 @dataclasses.dataclass
-class QwenVLModelVitConfig(MultiModalModelConfigs):
+class QwenVLModelVitConfig:
+    # Base fields previously inherited from MultiModalModelConfigs (inlined here so this
+    # srt-side config does not import sgl_jax.srt.multimodal — preserving the M1 discipline
+    # that srt must not statically depend on multimodal).
+    model_path: str | None = None
+    revision: str | None = None
+    dtype: jnp.dtype = jnp.bfloat16
+
     model_type = "qwen2_5_vl"
     base_config_key = "vision_config"
 

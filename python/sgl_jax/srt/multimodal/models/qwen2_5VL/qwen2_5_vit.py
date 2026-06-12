@@ -11,10 +11,8 @@ from flax import nnx
 from jax.sharding import Mesh
 from transformers import modeling_flax_utils
 
+from sgl_jax.srt.configs.qwen_vl.qwen_2_5_vl_config import QwenVLModelVitConfig
 from sgl_jax.srt.layers.embeddings import Embed
-from sgl_jax.srt.multimodal.configs.qwen_vl.qwen_2_5_vl_config import (
-    QwenVLModelVitConfig,
-)
 from sgl_jax.srt.utils.jax_utils import is_tpu_runtime
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
