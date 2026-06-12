@@ -181,7 +181,6 @@ class Req:
         # Input and output info
         self.rid = rid
         self.origin_input_text = origin_input_text
-        origin_input_ids = list(origin_input_ids)
 
         self.origin_input_ids_unpadded = (
             origin_input_ids_unpadded

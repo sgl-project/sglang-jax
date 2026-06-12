@@ -733,12 +733,18 @@ def get_model(pretrained_model_name_or_path: str) -> str:
     return pretrained_model_name_or_path
 
 
+# Model families that require custom tokenizer handling or workarounds (e.g., gemma4 extra_special_tokens)
+_CUSTOM_TOKENIZER_MODEL_FAMILIES = ("gemma-4",)
+
+
 def get_tokenizer(
     pretrained_model_name_or_path: str,
 ) -> PreTrainedTokenizer | PreTrainedTokenizerFast:
     assert pretrained_model_name_or_path is not None and pretrained_model_name_or_path != ""
-    if pretrained_model_name_or_path.endswith(".json") or pretrained_model_name_or_path.endswith(
-        ".model"
+    if (
+        pretrained_model_name_or_path.endswith(".json")
+        or pretrained_model_name_or_path.endswith(".model")
+        or any(k in pretrained_model_name_or_path.lower() for k in _CUSTOM_TOKENIZER_MODEL_FAMILIES)
     ):
         from sgl_jax.srt.hf_transformers_utils import get_tokenizer
 

@@ -1,8 +1,6 @@
 import unittest
 from types import SimpleNamespace
 
-from transformers import AutoTokenizer
-
 from sgl_jax.bench_serving import run_benchmark
 from sgl_jax.srt.utils import kill_process_tree
 from sgl_jax.test.test_utils import (
@@ -16,17 +14,6 @@ from sgl_jax.test.test_utils import (
     popen_launch_server,
     write_github_step_summary,
 )
-
-_orig_from_pretrained = AutoTokenizer.from_pretrained
-
-
-def _patched_from_pretrained(pretrained_model_name_or_path, *args, **kwargs):
-    if "gemma-4" in str(pretrained_model_name_or_path):
-        kwargs["extra_special_tokens"] = {}
-    return _orig_from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
-
-
-AutoTokenizer.from_pretrained = _patched_from_pretrained
 
 
 class TestGemma4Model(CustomTestCase):
@@ -55,7 +42,7 @@ class TestGemma4Model(CustomTestCase):
                 "--mem-fraction-static",
                 "0.8",
                 "--load-format",
-                "dummy",
+                "auto",
                 "--precompile-bs-paddings",
                 "32",
                 "--precompile-token-paddings",
@@ -155,7 +142,7 @@ class TestGemma4MoEModel(CustomTestCase):
                 "--mem-fraction-static",
                 "0.8",
                 "--load-format",
-                "dummy",
+                "auto",
                 "--precompile-bs-paddings",
                 "32",
                 "--precompile-token-paddings",
