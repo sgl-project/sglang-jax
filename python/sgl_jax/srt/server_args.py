@@ -124,6 +124,7 @@ class ServerArgs:
     log_requests_level: int = 0
     crash_dump_folder: str | None = None
     show_time_cost: bool = False
+    enable_metrics: bool = False
     bucket_time_to_first_token: list[float] | None = None
     bucket_inter_token_latency: list[float] | None = None
     bucket_e2e_request_latency: list[float] | None = None
