@@ -19,3 +19,8 @@ jobs:
         run: |
           source .venv/bin/activate
           pre-commit run --all-files --show-diff-on-failure
+
+      - name: CI script unit tests
+        run: |
+          source .venv/bin/activate
+          python scripts/ci/tests/test_ci_scripts.py -v

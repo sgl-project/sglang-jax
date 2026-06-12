@@ -1,140 +1,488 @@
 name: Nightly Test Daily
 
+# Inputs (ref/job_filter/cases/pr_number) drive a single-case run on a PR. run-name
+# tags manual workflow_dispatch runs by PR + case; under /run-nightly this is invoked
+# as a reusable workflow, where the run is named by the caller (Slash Command Handler).
+run-name: >-
+  ${{ inputs.pr_number != '' && format('Nightly Test Daily — PR #{0} {1}', inputs.pr_number, inputs.cases || inputs.job_filter) || 'Nightly Test Daily' }}
+
+# NOTE: The daily nightly suites are currently empty shells. Coverage will be
+# redefined as part of the nightly vs daily split decision. The workflow is
+# kept so any new daily case can be added by populating run_suite.py without
+# restructuring CI.
+
 on:
   schedule:
-    - cron: '0 16 * * *'
+    - cron: '0 18 * * *'
   push:
     branches:
       - main
     paths:
       - "python/sgl_jax/version.py"
   workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to test (PR HEAD for /run-nightly). Empty = this workflow's ref."
+        required: false
+        type: string
+      job_filter:
+        description: "Run only this job (its name). Empty or 'all' runs every daily job."
+        required: false
+        type: string
+        default: "all"
+      cases:
+        description: "Comma-separated case name(s) for single_host/suite_runner.py --cases. Empty = whole suite."
+        required: false
+        type: string
+      pr_number:
+        description: "PR number to comment results on (for /run-nightly). Empty = no comment."
+        required: false
+        type: string
+  # Reusable entry for /run-nightly: invoked via `uses:` from slash-command.yml, so a
+  # PR-triggered nightly is part of the Slash Command Handler run — no standalone
+  # "Nightly Test Daily" run, so the notifier / auto-bisect that watch it don't fire.
+  workflow_call:
+    inputs:
+      ref:
+        description: "Git ref to test (PR HEAD for /run-nightly). Empty = this workflow's ref."
+        required: false
+        type: string
+      job_filter:
+        description: "Run only this job (its name). Empty or 'all' runs every daily job."
+        required: false
+        type: string
+        default: "all"
+      cases:
+        description: "Comma-separated case name(s) for single_host/suite_runner.py --cases. Empty = whole suite."
+        required: false
+        type: string
+      pr_number:
+        description: "PR number to comment results on (for /run-nightly). Empty = no comment."
+        required: false
+        type: string
+
 concurrency:
-  group: nightly-test-${{ github.ref }}
+  # Key by tested ref + job + case: a /run-nightly never cancels the scheduled main
+  # run, and two cases mapping to the same job don't cancel each other (only a repeat
+  # of the same case collapses).
+  group: nightly-test-daily-${{ inputs.ref || github.ref }}-${{ inputs.job_filter || 'all' }}-${{ inputs.cases || 'all' }}
   cancel-in-progress: true
+
+permissions:
+  contents: read
 
 jobs:
 
   nightly-test-accuracy-text-models-1-tpu-daily:
-    if: github.repository == 'sgl-project/sglang-jax'
+    if: github.repository == 'sgl-project/sglang-jax' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-accuracy-text-models-1-tpu-daily')
     runs-on: arc-runner-v6e-1
-    continue-on-error: true
     env:
       TZ: Asia/Shanghai
+      JAX_COMPILATION_CACHE_DIR: /xla-cache
+      JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS: "1"
+      SGLANG_JAX_MODEL_CACHE: /models/model_scope
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-      - name: Run eval test for text models
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          HF_HUB_DOWNLOAD_TIMEOUT: ${{ vars.HF_HUB_DOWNLOAD_TIMEOUT }}
-        timeout-minutes: 3000
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - name: Setup Python environment
+        uses: ./.github/actions/setup-venv
+      - name: Run accuracy daily suite
+        timeout-minutes: 10
         run: |
-          python3.12 -m venv .venv
-          source .venv/bin/activate
-          pip install uv
-          uv pip install -e "python[all]"
-          uv pip install evalscope==1.0.0
-
-          export OUTPUT_DIR_NAME=$(date +'%Y-%m-%d')
-          export BENCH_OUTPUT_DIR="$GITHUB_WORKSPACE/test/nightly_test_output/benchmark/$OUTPUT_DIR_NAME"
-          echo "BENCH_OUTPUT_DIR=$BENCH_OUTPUT_DIR" >> $GITHUB_ENV
-          mkdir -p $BENCH_OUTPUT_DIR
-
-          bash scripts/killall_sglang.sh
           cd test/srt
           python3 run_suite.py --suite nightly-test-accuracy-text-models-tpu-v6e-1-daily
-      - name: Publish traces to storage repo
-        env:
-          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
-          GITHUB_RUN_NUMBER: ${{ github.run_number }}
-        run: |
-          python3 scripts/ci/publish_bench_and_perf.py --source-dir ./test/nightly_test_output
-
 
   nightly-test-perf-text-models-1-tpu-daily:
-    if: github.repository == 'sgl-project/sglang-jax'
+    if: github.repository == 'sgl-project/sglang-jax' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-perf-text-models-1-tpu-daily')
     runs-on: arc-runner-v6e-1
-    continue-on-error: true
     env:
       TZ: Asia/Shanghai
+      JAX_COMPILATION_CACHE_DIR: /xla-cache
+      JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS: "1"
+      SGLANG_JAX_MODEL_CACHE: /models/model_scope
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-      - name: Run performance test for text models
-        timeout-minutes: 1800
-        env:
-
-          TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
-          PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          HF_HUB_DOWNLOAD_TIMEOUT: ${{ vars.HF_HUB_DOWNLOAD_TIMEOUT }}
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - name: Setup Python environment
+        uses: ./.github/actions/setup-venv
+      - name: Run perf daily suite
+        timeout-minutes: 10
         run: |
-          python3.12 -m venv .venv
-          source .venv/bin/activate
-          pip install uv
-          uv pip install -e "python[all]"
-
-          export OUTPUT_DIR_NAME=$(date +'%Y-%m-%d')
-          export PERF_OUTPUT_DIR="$GITHUB_WORKSPACE/test/nightly_test_output/perf/$OUTPUT_DIR_NAME"
-          echo "PERF_OUTPUT_DIR=$PERF_OUTPUT_DIR" >> $GITHUB_ENV
-          mkdir -p $PERF_OUTPUT_DIR
-
-
-
-          bash scripts/killall_sglang.sh
           cd test/srt
           python3 run_suite.py --suite nightly-test-perf-text-models-tpu-v6e-1-daily
 
-      - name: Publish traces to storage repo
+  nightly-test-openai-api-surface-1-tpu-daily:
+    if: github.repository == 'sgl-project/sglang-jax' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-openai-api-surface-1-tpu-daily')
+    runs-on: arc-runner-v6e-1
+    env:
+      TZ: Asia/Shanghai
+      JAX_COMPILATION_CACHE_DIR: /xla-cache
+      JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS: "1"
+      SGLANG_JAX_MODEL_CACHE: /models/model_scope
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - name: Setup Python environment
+        uses: ./.github/actions/setup-venv
+      - name: Run OpenAI API surface tests
+        timeout-minutes: 15
+        run: |
+          cd test/srt
+          python3 run_suite.py --suite nightly-test-openai-api-surface-tpu-v6e-1-daily
+
+  multi-host-test-mimo-flash-daily:
+    # Temporarily skipped until CI has 4-node v6e capacity for this multi-host suite.
+    if: false
+    uses: ./.github/workflows/multi-host-test.yml
+    permissions:
+      contents: read
+      id-token: write
+    secrets: inherit
+
+  nightly-infra-smoke-1-tpu-daily:
+    if: github.repository == 'sgl-project/sglang-jax' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-infra-smoke-1-tpu-daily')
+    runs-on: arc-runner-v6e-1
+    env:
+      TZ: Asia/Shanghai
+      JAX_COMPILATION_CACHE_DIR: /xla-cache
+      JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS: "1"
+      SGLANG_JAX_MODEL_CACHE: /models/model_scope
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - name: Setup Python environment
+        uses: ./.github/actions/setup-venv
+      - name: Run infra smoke tests
+        timeout-minutes: 30
+        run: |
+          cd test/srt
+          python3 run_suite.py --suite nightly-infra-smoke-tpu-v6e-1
+
+  nightly-test-accuracy-text-models-4-tpu-daily:
+    if: github.repository == 'sgl-project/sglang-jax' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-accuracy-text-models-4-tpu-daily')
+    runs-on: arc-runner-v6e-4
+    # Read-only + persist-credentials:false — this job runs PR-HEAD code, so it must not
+    # hold a write token; PASS/FAIL is posted from the separate comment job below.
+    permissions:
+      contents: read
+    env:
+      TZ: Asia/Shanghai
+      JAX_COMPILATION_CACHE_DIR: /xla-cache
+      SGLANG_JAX_MODEL_CACHE: /models/model_scope
+      RESULTS_DIR: ${{ github.workspace }}/test/nightly_test_output/accuracy
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          persist-credentials: false
+      - name: Setup Python environment
+        uses: ./.github/actions/setup-venv
+      - name: Run 4-TPU accuracy daily suite
+        id: run
+        timeout-minutes: 150
+        env:
+          # /run-nightly passes a single case name here; empty runs the whole suite.
+          CASES: ${{ inputs.cases }}
+        run: |
+          cd test/srt
+          python3 nightly/single_host/suite_runner.py --suite accuracy-text-models-v6e-4 ${CASES:+--cases "$CASES"}
+      - name: Publish accuracy JSON to observability dashboard mount (main only)
+        # !cancelled() so a below-gate run (non-zero exit) still publishes its real data for the trend monitor.
+        if: ${{ !cancelled() && github.ref == 'refs/heads/main' && github.repository == 'sgl-project/sglang-jax' && inputs.pr_number == '' }}
+        run: |
+          DATE=$(date +'%Y-%m-%d')
+          DEST="/observability-storage/${DATE}/single-host-accuracy-${{ github.run_id }}"
+          mkdir -p "$DEST"
+          shopt -s nullglob
+          files=( ${{ github.workspace }}/test/nightly_test_output/accuracy/*.json )
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "::warning::No accuracy JSON to publish"
+          else
+            # A real cp failure must fail the step under set -e, not be hidden as
+            # "nothing to publish" (which feeds the monitor a truncated night).
+            cp "${files[@]}" "$DEST"/
+            echo "Published ${#files[@]} accuracy JSON file(s) to $DEST"
+          fi
+
+  nightly-test-accuracy-4-tpu-comment:
+    # Posts PASS/FAIL from a clean job (no PR-HEAD code ran here) so the write token
+    # never shares an environment the PR could have tampered with. Skips cancelled
+    # (superseded) / skipped runs.
+    needs: nightly-test-accuracy-text-models-4-tpu-daily
+    if: >-
+      always() && inputs.pr_number != ''
+      && contains(fromJSON('["success", "failure"]'), needs.nightly-test-accuracy-text-models-4-tpu-daily.result)
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Comment result on PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          CASE_KEY: ${{ inputs.cases || 'accuracy-text-models-v6e-4' }}
+          RESULT: ${{ needs.nightly-test-accuracy-text-models-4-tpu-daily.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ "$RESULT" = "success" ]; then status="PASS"; else status="FAIL"; fi
+          gh pr comment "$PR_NUMBER" --repo "$REPO" \
+            --body "> **Nightly** [\`$CASE_KEY\`]($RUN_URL): **$status** — see the run's step summary for the score."
+
+  nightly-test-perf-text-models-4-tpu-daily:
+    if: github.repository == 'sgl-project/sglang-jax' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-perf-text-models-4-tpu-daily')
+    runs-on: arc-runner-v6e-4
+    # Read-only + persist-credentials:false — runs PR-HEAD code, no write token here;
+    # PASS/FAIL is posted from the separate comment job below.
+    permissions:
+      contents: read
+    env:
+      TZ: Asia/Shanghai
+      JAX_COMPILATION_CACHE_DIR: /xla-cache
+      SGLANG_JAX_MODEL_CACHE: /models/model_scope
+      SGLANG_JAX_PROFILER_DIR: ${{ github.workspace }}/test/nightly_test_output/perf/traces
+      RESULTS_DIR: ${{ github.workspace }}/test/nightly_test_output/perf
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          persist-credentials: false
+      - name: Setup Python environment
+        uses: ./.github/actions/setup-venv
+      - name: Run 4-TPU perf daily suite
+        id: run
+        timeout-minutes: 480
+        env:
+          # ci-data reads for the trailing-baseline gate (anonymous API gets
+          # rate-limited, disabling that gate). Scheduled runs only — never hand the
+          # PAT to PR-HEAD code, which a /run-nightly dispatch executes here.
+          GITHUB_TOKEN: ${{ inputs.pr_number == '' && secrets.GH_PAT_FOR_NIGHTLY_CI_DATA || '' }}
+          # /run-nightly passes a single case name here; empty runs the whole suite.
+          CASES: ${{ inputs.cases }}
+        run: |
+          cd test/srt
+          python3 nightly/single_host/suite_runner.py --suite perf-text-models-v6e-4 ${CASES:+--cases "$CASES"}
+      - name: Publish perf CSV to ci-data (main only)
+        if: github.ref == 'refs/heads/main' && github.repository == 'sgl-project/sglang-jax' && inputs.pr_number == ''
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
           GITHUB_RUN_ID: ${{ github.run_id }}
           GITHUB_RUN_NUMBER: ${{ github.run_number }}
         run: |
+          # Stage as perf/<date>/<file>.csv — publish.py preserves the path under
+          # --source-dir, landing at ci-data perf/<date>/ (caller owns the layout).
+          DATE=$(date +'%Y-%m-%d')
+          STAGE=./perf_csv_stage/perf/$DATE
+          mkdir -p "$STAGE"
+          if cp ${{ github.workspace }}/test/nightly_test_output/perf/*.csv "$STAGE"/ 2>/dev/null; then
+            python3 scripts/ci/publish.py --data-type perf --source-dir ./perf_csv_stage
+          else
+            echo "::warning::No perf CSV to publish — suite produced no per-model CSV"
+          fi
+      - name: Publish perf traces to ci-data (main only)
+        if: github.ref == 'refs/heads/main' && github.repository == 'sgl-project/sglang-jax' && inputs.pr_number == ''
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          # Namespace traces by date/run so runs don't pile up at the ci-data root.
+          DATE=$(date +'%Y-%m-%d')
+          STAGE=./perf_trace_stage/traces/$DATE/single-host-perf-${{ github.run_id }}
+          mkdir -p "$STAGE"
+          if cp -r ${{ github.workspace }}/test/nightly_test_output/perf/traces/. "$STAGE"/ 2>/dev/null; then
+            python3 scripts/ci/publish.py --data-type trace --source-dir ./perf_trace_stage
+          else
+            echo "::warning::No perf traces to publish"
+          fi
+      - name: Publish perf JSON to observability dashboard mount (main only)
+        # !cancelled() so a below-gate run (non-zero exit) still publishes its real data for the trend monitor.
+        if: ${{ !cancelled() && github.ref == 'refs/heads/main' && github.repository == 'sgl-project/sglang-jax' && inputs.pr_number == '' }}
+        run: |
+          # observability bucket is gcsfuse-mounted (like /models), so this is a
+          # plain copy; layout matches multi-host, single-host- prefix marks source.
+          DATE=$(date +'%Y-%m-%d')
+          DEST="/observability-storage/${DATE}/single-host-perf-${{ github.run_id }}"
+          mkdir -p "$DEST"
+          shopt -s nullglob
+          files=( ${{ github.workspace }}/test/nightly_test_output/perf/*.json )
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "::warning::No perf JSON to publish"
+          else
+            # A real cp failure must fail the step under set -e, not be hidden as
+            # "nothing to publish" (which feeds the monitor a truncated night).
+            cp "${files[@]}" "$DEST"/
+            echo "Published ${#files[@]} perf JSON file(s) to $DEST"
+          fi
+      - name: Upload perf results (per-model CSV + xprof traces)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-results-v6e-4-${{ github.run_id }}
+          path: ${{ github.workspace }}/test/nightly_test_output/perf
+          if-no-files-found: warn
+          retention-days: 30
 
-          python3 scripts/ci/publish_bench_and_perf.py --source-dir ./test/nightly_test_output
+  nightly-test-perf-4-tpu-comment:
+    # Same trust-boundary split as the accuracy comment job: PASS/FAIL posted from a
+    # clean job that never ran PR-HEAD code. Skips cancelled (superseded) / skipped.
+    needs: nightly-test-perf-text-models-4-tpu-daily
+    if: >-
+      always() && inputs.pr_number != ''
+      && contains(fromJSON('["success", "failure"]'), needs.nightly-test-perf-text-models-4-tpu-daily.result)
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Comment result on PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          CASE_KEY: ${{ inputs.cases || 'perf-text-models-v6e-4' }}
+          RESULT: ${{ needs.nightly-test-perf-text-models-4-tpu-daily.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ "$RESULT" = "success" ]; then status="PASS"; else status="FAIL"; fi
+          gh pr comment "$PR_NUMBER" --repo "$REPO" \
+            --body "> **Nightly (perf)** [\`$CASE_KEY\`]($RUN_URL): **$status** — see the run's step summary."
 
-
-  nightly-test-perf-trace-text-models-1-tpu-daily:
-    if: github.repository == 'sgl-project/sglang-jax'
-    runs-on: arc-runner-v6e-1
+  # Trend drift: detect on v6e-4 (only it can read the /observability-storage
+  # mount), alert from ubuntu (has gh), connected by a drift.json artifact.
+  # Both continue-on-error so monitoring never fails the nightly run.
+  nightly-trend-monitor:
+    needs:
+      - nightly-test-accuracy-text-models-4-tpu-daily
+      - nightly-test-perf-text-models-4-tpu-daily
+    if: always() && github.ref == 'refs/heads/main' && github.repository == 'sgl-project/sglang-jax' && inputs.pr_number == ''
+    runs-on: arc-runner-v6e-4
     continue-on-error: true
+    timeout-minutes: 20
     env:
       TZ: Asia/Shanghai
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-      - name: Run performance test for text models
-        timeout-minutes: 18000
-        env:
-
-          TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
-          PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          HF_HUB_DOWNLOAD_TIMEOUT: ${{ vars.HF_HUB_DOWNLOAD_TIMEOUT }}
+      - name: Detect trend drift
+        # stdlib-only on purpose — no setup-venv. A 3rd-party import would
+        # ImportError here, silently swallowed by continue-on-error.
         run: |
-          python3.12 -m venv .venv
-          source .venv/bin/activate
-          pip install uv
-          uv pip install -e "python[all]"
+          if [ ! -d /observability-storage ]; then
+            echo "::warning::/observability-storage not mounted; emitting empty drift report"
+            echo '{"schema_version": 1, "configs": {}}' > drift.json
+          else
+            python3 scripts/ci/check_trend_threshold.py \
+              --data-dir /observability-storage --output drift.json
+          fi
+      - name: Upload drift report
+        uses: actions/upload-artifact@v4
+        with:
+          name: trend-drift-${{ github.run_id }}
+          path: drift.json
+          if-no-files-found: warn
 
-          export OUTPUT_DIR_NAME=$(date +'%Y-%m-%d')
-          export PERF_OUTPUT_DIR="$GITHUB_WORKSPACE/test/nightly_test_output/trace/$OUTPUT_DIR_NAME"
-          echo "PERF_OUTPUT_DIR=$PERF_OUTPUT_DIR" >> $GITHUB_ENV
-          mkdir -p $PERF_OUTPUT_DIR
-
-
-
-          bash scripts/killall_sglang.sh
-          cd test/srt
-          python3 run_suite.py --suite nightly-test-perf-trace-text-models-tpu-v6e-1-daily
-
-      - name: Publish traces to storage repo
+  nightly-trend-alert:
+    needs: nightly-trend-monitor
+    if: always() && github.ref == 'refs/heads/main' && github.repository == 'sgl-project/sglang-jax' && inputs.pr_number == ''
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      issues: write
+    env:
+      TZ: Asia/Shanghai
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Download drift report
+        uses: actions/download-artifact@v4
+        # Tolerate a missing artifact (monitor crash) so the next step still
+        # runs and warns, instead of the job silently vanishing.
+        continue-on-error: true
+        with:
+          name: trend-drift-${{ github.run_id }}
+      - name: Open/update issues + Slack
+        if: always()
         env:
-          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
-          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+          GH_TOKEN: ${{ github.token }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
-          python3 scripts/ci/publish_traces.py --traces-dir ./test/nightly_test_output
+          # The script warns + exits 0 on missing/corrupt drift.json — a
+          # transport failure is loud, not a silent "no drift".
+          python3 scripts/ci/trend_alert_issues.py \
+            --repo "${{ github.repository }}" --drift drift.json --slack-output slack.txt
+          if [ -s slack.txt ] && [ -n "$SLACK_WEBHOOK_URL" ]; then
+            jq -Rs '{text: .}' slack.txt | curl --fail-with-body -X POST -H 'Content-type: application/json' -d @- "$SLACK_WEBHOOK_URL"
+          else
+            echo "No drift or no webhook; skipping Slack."
+          fi
+
+  nightly-test-daily-finish:
+    needs: [
+      nightly-test-accuracy-text-models-1-tpu-daily,
+      nightly-test-perf-text-models-1-tpu-daily,
+      nightly-test-openai-api-surface-1-tpu-daily,
+      multi-host-test-mimo-flash-daily,
+      nightly-infra-smoke-1-tpu-daily,
+      nightly-test-accuracy-text-models-4-tpu-daily,
+      nightly-test-perf-text-models-4-tpu-daily,
+      nightly-trend-monitor,
+      nightly-trend-alert,
+    ]
+    if: always() && github.repository == 'sgl-project/sglang-jax' && (inputs.job_filter == '' || inputs.job_filter == 'all')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check all daily job statuses
+        run: |
+          echo "=== Daily Test Results ==="
+          echo "accuracy-1-tpu-daily: ${{ needs.nightly-test-accuracy-text-models-1-tpu-daily.result }}"
+          echo "perf-text-1-tpu-daily: ${{ needs.nightly-test-perf-text-models-1-tpu-daily.result }}"
+          echo "openai-api-surface-1-tpu-daily: ${{ needs.nightly-test-openai-api-surface-1-tpu-daily.result }}"
+          echo "multi-host-mimo-flash-daily: ${{ needs.multi-host-test-mimo-flash-daily.result }}"
+          echo "infra-smoke-1-tpu-daily: ${{ needs.nightly-infra-smoke-1-tpu-daily.result }}"
+          echo "accuracy-4-tpu-daily: ${{ needs.nightly-test-accuracy-text-models-4-tpu-daily.result }}"
+          echo "perf-4-tpu-daily: ${{ needs.nightly-test-perf-text-models-4-tpu-daily.result }}"
+          # Visibility only, NOT gated: by design (continue-on-error) monitoring
+          # never changes the nightly conclusion; a 'failure' just flags it broke.
+          echo "trend-monitor (not gated): ${{ needs.nightly-trend-monitor.result }}"
+          echo "trend-alert (not gated): ${{ needs.nightly-trend-alert.result }}"
+          echo ""
+
+          has_failure=false
+          for job_result in \
+            "accuracy-1-tpu-daily=${{ needs.nightly-test-accuracy-text-models-1-tpu-daily.result }}" \
+            "perf-text-1-tpu-daily=${{ needs.nightly-test-perf-text-models-1-tpu-daily.result }}" \
+            "openai-api-surface-1-tpu-daily=${{ needs.nightly-test-openai-api-surface-1-tpu-daily.result }}" \
+            "multi-host-mimo-flash-daily=${{ needs.multi-host-test-mimo-flash-daily.result }}" \
+            "infra-smoke-1-tpu-daily=${{ needs.nightly-infra-smoke-1-tpu-daily.result }}" \
+            "accuracy-4-tpu-daily=${{ needs.nightly-test-accuracy-text-models-4-tpu-daily.result }}" \
+            "perf-4-tpu-daily=${{ needs.nightly-test-perf-text-models-4-tpu-daily.result }}"; do
+            job_name="${job_result%%=*}"
+            result="${job_result#*=}"
+            if [ "$job_name" = "multi-host-mimo-flash-daily" ] && [ "$result" = "skipped" ]; then
+              echo "${job_name} temporarily skipped: multi-host CI capacity unavailable"
+              continue
+            fi
+            if [ "$result" != "success" ]; then
+              echo "::error::${job_name} did not succeed: ${result}"
+              has_failure=true
+            fi
+          done
+
+          if [ "$has_failure" = "true" ]; then
+            echo "::error::One or more daily test jobs failed"
+            exit 1
+          fi
+
+          echo "All daily test jobs passed"

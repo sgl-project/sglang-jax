@@ -1,0 +1,158 @@
+name: Publish Artifacts
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag created by tag.yml (e.g. v0.0.3rc0). Must already exist on origin unless dry_run is true."
+        required: true
+        type: string
+      dry_run:
+        description: "If true, build artifacts but skip PyPI/Docker publish and GitHub Release creation"
+        required: false
+        default: false
+        type: boolean
+      skip_nightly_check:
+        description: "Emergency override for the PyPI nightly health gate"
+        required: false
+        default: false
+        type: boolean
+      emergency_justification:
+        description: "Required when skip_nightly_check is true"
+        required: false
+        default: ""
+        type: string
+  workflow_call:
+    inputs:
+      tag:
+        description: "Tag to publish from (must already exist on origin)"
+        required: true
+        type: string
+      dry_run:
+        description: "If true, build artifacts but skip publish"
+        required: false
+        default: false
+        type: boolean
+      skip_nightly_check:
+        description: "Emergency override for the PyPI nightly health gate"
+        required: false
+        default: false
+        type: boolean
+      emergency_justification:
+        description: "Required when skip_nightly_check is true"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  metadata:
+    if: github.repository == 'sgl-project/sglang-jax'
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.compute.outputs.tag }}
+      version: ${{ steps.compute.outputs.version }}
+      is_prerelease: ${{ steps.compute.outputs.is_prerelease }}
+      update_latest: ${{ steps.compute.outputs.update_latest }}
+      dry_run: ${{ steps.compute.outputs.dry_run }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install packaging
+        run: python -m pip install --upgrade packaging
+
+      - name: Compute tag / version / flags
+        id: compute
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            TAG="${INPUT_TAG}"
+            DRY_RUN="${INPUT_DRY_RUN}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+            DRY_RUN="false"
+          fi
+          if [[ "${DRY_RUN}" == "true" ]]; then
+            python scripts/ci/release_metadata.py from-tag --tag "${TAG}" --dry-run
+          else
+            python scripts/ci/release_metadata.py from-tag --tag "${TAG}"
+          fi
+
+      - name: Verify tag exists
+        if: ${{ steps.compute.outputs.dry_run != 'true' }}
+        run: |
+          set -euo pipefail
+          git ls-remote --exit-code --tags "https://github.com/${{ github.repository }}.git" "refs/tags/${{ steps.compute.outputs.tag }}" >/dev/null
+
+  publish-pypi:
+    needs: metadata
+    # Only this job reaches the nightly gateway, which needs issues:write to
+    # open an emergency audit issue. Keep that grant off the other jobs.
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+    uses: ./.github/workflows/release-pypi.yml
+    secrets: inherit
+    with:
+      tag: ${{ needs.metadata.outputs.tag }}
+      version: ${{ needs.metadata.outputs.version }}
+      dry_run: ${{ needs.metadata.outputs.dry_run == 'true' }}
+      skip_nightly_check: ${{ inputs.skip_nightly_check || false }}
+      emergency_justification: ${{ inputs.emergency_justification || '' }}
+
+  publish-docker:
+    needs: metadata
+    uses: ./.github/workflows/release-docker.yml
+    secrets: inherit
+    with:
+      tag: ${{ needs.metadata.outputs.tag }}
+      version: ${{ needs.metadata.outputs.version }}
+      update_latest: ${{ needs.metadata.outputs.update_latest == 'true' }}
+      dry_run: ${{ needs.metadata.outputs.dry_run == 'true' }}
+
+  github-release:
+    needs: [metadata, publish-pypi, publish-docker]
+    runs-on: ubuntu-latest
+    environment: prod
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.metadata.outputs.dry_run == 'true' && github.ref || needs.metadata.outputs.tag }}
+
+      - name: Create GitHub Release
+        if: ${{ needs.metadata.outputs.dry_run != 'true' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.metadata.outputs.tag }}
+          name: sglang-jax ${{ needs.metadata.outputs.tag }}
+          generate_release_notes: true
+          prerelease: ${{ needs.metadata.outputs.is_prerelease == 'true' }}
+          fail_on_unmatched_files: false
+
+      - name: Dry-run summary
+        if: ${{ needs.metadata.outputs.dry_run == 'true' }}
+        run: |
+          echo "::notice::Dry-run mode: GitHub Release will NOT be created."
+          echo "Publish dry-run completed for ${{ needs.metadata.outputs.tag }}." >> "$GITHUB_STEP_SUMMARY"

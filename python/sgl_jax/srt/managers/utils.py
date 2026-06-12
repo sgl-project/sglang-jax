@@ -2,6 +2,8 @@ import logging
 
 import jax
 from jax import numpy as jnp
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.managers.schedule_batch import Req
 
@@ -41,16 +43,19 @@ def validate_input_length(
     return None
 
 
-@jax.jit
-def resolve_future_token_ids(input_ids, future_token_ids_map):
-    return jnp.where(
-        input_ids < 0,
-        future_token_ids_map[jnp.clip(-input_ids, a_min=0)],
-        input_ids,
+@jax.jit(static_argnames=("mesh"))
+def resolve_future_token_ids(input_ids, future_token_ids_map, mesh):
+    input_ids_global = jax.sharding.reshard(input_ids, NamedSharding(mesh, P()))
+    input_ids_global = jnp.where(
+        input_ids_global < 0,
+        future_token_ids_map[jnp.clip(-input_ids_global, a_min=0)],
+        input_ids_global,
     )
+    return jax.sharding.reshard(input_ids_global, NamedSharding(mesh, P("data")))
 
 
-@jax.jit
-def set_future_token_ids(future_token_ids_map, future_token_ids_ct, next_token_ids):
+@jax.jit(static_argnames=("mesh"))
+def set_future_token_ids(future_token_ids_map, future_token_ids_ct, next_token_ids, mesh):
+    next_token_ids_global = jax.sharding.reshard(next_token_ids, NamedSharding(mesh, P()))
     start_indices = (future_token_ids_ct + 1,)
-    return jax.lax.dynamic_update_slice(future_token_ids_map, next_token_ids, start_indices)
+    return jax.lax.dynamic_update_slice(future_token_ids_map, next_token_ids_global, start_indices)

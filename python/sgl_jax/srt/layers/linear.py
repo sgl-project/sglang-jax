@@ -1,3 +1,4 @@
+import logging
 from collections.abc import Sequence
 from functools import partial
 
@@ -13,6 +14,21 @@ from sgl_jax.srt.kernels.quantized_matmul.blockwise_utils import expand_block_sc
 from sgl_jax.srt.kernels.quantized_matmul.kernel import xla_quantized_matmul_local
 from sgl_jax.srt.utils.profiling_utils import named_scope
 from sgl_jax.srt.utils.quantization.quantization_utils import quantize_tensor
+
+logger = logging.getLogger(__name__)
+
+
+def _shard_map_output_partition_dim(
+    sharding: jax.sharding.Sharding, axis_name: str | None
+) -> int | None:
+    if axis_name is None:
+        return None
+    for dim, axis in enumerate(sharding.spec):
+        if axis == axis_name:
+            return dim
+        if isinstance(axis, tuple) and axis_name in axis:
+            return dim
+    return None
 
 
 class LinearBase(nnx.Module):
@@ -68,22 +84,115 @@ class LinearBase(nnx.Module):
             self.bias = None
 
     @named_scope
-    def __call__(self, x: jax.Array) -> tuple[jax.Array, jax.Array | None]:
-        """Forward pass of the linear layer."""
-        output_pspec = P(*([None] * (x.ndim - 1)), self.kernel_axes[-1])
-        output_sharding = NamedSharding(self.mesh, output_pspec)
+    def __call__(
+        self,
+        x: jax.Array,
+        *,
+        out_sharding: jax.sharding.Sharding | None = None,
+    ) -> tuple[jax.Array, jax.Array | None]:
+        """Forward pass. If ``out_sharding`` is None, falls back to the
+        standard TP layout derived from ``kernel_axes`` (col-parallel →
+        ``P("data", "tensor")``, row-parallel → ``P("data", None)``).
+        SP-aware callers must pass an explicit ``out_sharding``.
+        """
+        target = out_sharding or NamedSharding(
+            self.mesh,
+            P("data", *([None] * (x.ndim - 2)), self.kernel_axes[-1]),
+        )
         out = lax.dot_general(
             x,
             self.weight.value,
             (((x.ndim - 1,), (0,)), ((), ())),
             preferred_element_type=self.params_dtype,
-            out_sharding=output_sharding,
+            out_sharding=target,
         )
         if self.skip_bias_add:
             return out, self.bias
         if self.bias is not None:
             out = out + self.bias.value
         return out, None
+
+
+class MergedColumnParallelLinear(LinearBase):
+    """Column-parallel linear with multiple logical outputs merged into one weight.
+
+    Equivalent to ``N`` independent column-parallel ``LinearBase``s with the
+    same ``input_size`` but different ``output_size``, fused into one larger
+    GEMM. A single large matmul on TPU's MXU is consistently faster than ``N``
+    smaller ones — fewer kernel launches, better pipelining of weight reads,
+    and a single MXU pass amortizes the input-side broadcast.
+
+    Sharding contract (mirrors sglang / vLLM's ``MergedColumnParallelLinear``):
+    each device's local weight columns hold
+    ``[comp_0_my_heads | comp_1_my_heads | ...]`` block-concat. Splitting the
+    merged output into per-component pieces must therefore happen on
+    per-device data (typically inside :func:`jax.shard_map`) using **per-shard**
+    sizes — the global merged tensor is stripe-interleaved across devices,
+    not a true ``[comp_0 | comp_1 | ...]`` block-concat.
+
+    Each entry of ``output_sizes`` must be divisible by the mesh's ``"tensor"``
+    axis size so the per-shard block-concat boundary aligns with the TP cut.
+    Without this, GQA-style projections (where components have different
+    head counts) would put a shard boundary mid-component — exactly the
+    failure mode this layer exists to avoid.
+
+    Weight loading is the caller's responsibility — there's no built-in
+    loader yet because the simple host-side scatter (collect HF tensors,
+    stripe them per-rank on host, single ``device_put``) costs N host
+    buffers and a full-tensor staging copy. A device-side scatter
+    (writing each HF tensor into a sharded merged param via
+    ``jax.lax.dynamic_update_slice`` under the right sharding context)
+    is the right shape for production but needs more design — left as a
+    follow-up.
+
+    Args:
+        input_size: Input dimension.
+        output_sizes: Per-component output dimensions. Must each be
+            divisible by the mesh's ``"tensor"`` axis size.
+        mesh: Device mesh (must expose a ``"tensor"`` axis for sharding;
+            falls back to TP=1 if absent or ``mesh is None``).
+        use_bias / skip_bias_add / params_dtype: forwarded to ``LinearBase``.
+        scope_name: profiling scope.
+    """
+
+    @staticmethod
+    def _mesh_tp_size(mesh: jax.sharding.Mesh | None) -> int:
+        """TP size = mesh size on the ``"tensor"`` axis (1 if absent)."""
+        if mesh is None:
+            return 1
+        shape = getattr(mesh, "shape", None)
+        if shape is None or "tensor" not in shape:
+            return 1
+        return int(shape["tensor"])
+
+    def __init__(
+        self,
+        input_size: int,
+        output_sizes: Sequence[int],
+        mesh: jax.sharding.Mesh,
+        use_bias: bool = False,
+        skip_bias_add: bool = False,
+        params_dtype: jnp.dtype | None = jnp.bfloat16,
+        scope_name: str = "merged_column_parallel_linear",
+    ):
+        self.output_sizes = list(output_sizes)
+        tp_size = self._mesh_tp_size(mesh)
+        for i, sz in enumerate(self.output_sizes):
+            if sz % tp_size != 0:
+                raise ValueError(
+                    f"MergedColumnParallelLinear: output_sizes[{i}]={sz} must be "
+                    f"divisible by TP={tp_size} for clean per-shard block-concat layout."
+                )
+        super().__init__(
+            input_size=input_size,
+            output_size=sum(self.output_sizes),
+            mesh=mesh,
+            use_bias=use_bias,
+            skip_bias_add=skip_bias_add,
+            params_dtype=params_dtype,
+            kernel_axes=(None, "tensor"),
+            scope_name=scope_name,
+        )
 
 
 class QuantizedLinear(nnx.Module):
@@ -127,6 +236,7 @@ class QuantizedLinear(nnx.Module):
         params_dtype: jnp.dtype | None = jnp.bfloat16,
         compute_dtype: jnp.dtype | None = None,
         weight_block_size: tuple[int, int] | None = None,
+        allow_narrow_n_blockwise: bool = False,
         scope_name: str = "quantized_linear",
     ):
         """Initialize the quantized linear layer with pre-quantized weights."""
@@ -153,6 +263,7 @@ class QuantizedLinear(nnx.Module):
         self.params_dtype = params_dtype
         self.compute_dtype = compute_dtype
         self.weight_block_size = weight_block_size
+        self.allow_narrow_n_blockwise = allow_narrow_n_blockwise
         self.name = scope_name
 
     @classmethod
@@ -163,6 +274,7 @@ class QuantizedLinear(nnx.Module):
         activation_dtype: jnp.dtype | None = None,
         is_static_input: bool = False,
         weight_block_size: Sequence[int] | None = None,
+        allow_narrow_n_blockwise: bool = False,
     ) -> "QuantizedLinear":
         """Convert a LinearBase layer to a QuantizedLinear layer.
 
@@ -186,19 +298,13 @@ class QuantizedLinear(nnx.Module):
             tuple(weight_block_size) if weight_block_size is not None else None
         )
 
+        kernel_axes = linear.kernel_axes or (None, None)
         if is_static_input:
             # Static checkpoint already stores pre-quantized weights and scales.
             weight = linear.weight.value
 
             if isinstance(weight, jax.ShapeDtypeStruct):
                 in_features, out_features = map(int, weight.shape)
-                kernel_axes = linear.kernel_axes or (None, None)
-                wq_sharding = NamedSharding(linear.mesh, P(kernel_axes[1], kernel_axes[0]))
-                weight_q = jax.ShapeDtypeStruct(
-                    shape=(out_features, in_features),
-                    dtype=weight_dtype,
-                    sharding=wq_sharding,
-                )
 
                 if (
                     effective_weight_block_size is not None
@@ -208,6 +314,26 @@ class QuantizedLinear(nnx.Module):
                         effective_weight_block_size[1]
                     )
                     in_blocks = (in_features + block_k - 1) // block_k
+                    # Row-parallel block-wise layers shard the reduce axis, so
+                    # the in_blocks dimension of the [in_blocks, 1, n_out]
+                    # scale must also tile across TP. When it doesn't (e.g.
+                    # GLM-5.1 dense/shared down_proj: 96/16 blocks vs TP=64),
+                    # fall back to a replicated reduce axis for this layer
+                    # only. The original LinearBase keeps row-parallel.
+                    input_axis = kernel_axes[0]
+                    tp = linear.mesh.shape.get(input_axis, 1) if input_axis else 1
+                    if input_axis is not None and in_blocks % tp != 0:
+                        logger.warning(
+                            "QuantizedLinear %s [in=%d, out=%d]: in_blocks=%d not "
+                            "divisible by TP=%d on axis %r; replicating reduce axis",
+                            linear.name,
+                            in_features,
+                            out_features,
+                            in_blocks,
+                            tp,
+                            input_axis,
+                        )
+                        kernel_axes = (None, kernel_axes[1])
                     # Pre-expanded kernel-ready layout: [in_blocks, 1, n_out].
                     scale_sharding = NamedSharding(
                         linear.mesh, P(kernel_axes[0], None, kernel_axes[1])
@@ -222,6 +348,12 @@ class QuantizedLinear(nnx.Module):
                     weight_scale = jax.ShapeDtypeStruct(
                         shape=(out_features,), dtype=jnp.float32, sharding=scale_sharding
                     )
+                wq_sharding = NamedSharding(linear.mesh, P(kernel_axes[1], kernel_axes[0]))
+                weight_q = jax.ShapeDtypeStruct(
+                    shape=(out_features, in_features),
+                    dtype=weight_dtype,
+                    sharding=wq_sharding,
+                )
                 bias = linear.bias.value if linear.bias is not None else None
             else:
                 if weight.dtype != weight_dtype:
@@ -285,19 +417,28 @@ class QuantizedLinear(nnx.Module):
             bias=bias,
             activation_dtype=activation_dtype,
             mesh=linear.mesh,
-            kernel_axes=linear.kernel_axes,
+            kernel_axes=kernel_axes,
             skip_bias_add=linear.skip_bias_add,
             params_dtype=linear.params_dtype,
             weight_block_size=effective_weight_block_size,
+            allow_narrow_n_blockwise=allow_narrow_n_blockwise,
             scope_name=f"quantized_{linear.name}",
         )
 
     @named_scope
-    def __call__(self, x: jax.Array) -> tuple[jax.Array, jax.Array | None]:
-        """Forward pass using quantized matmul.
+    def __call__(
+        self,
+        x: jax.Array,
+        *,
+        out_sharding: jax.sharding.Sharding | None = None,
+    ) -> tuple[jax.Array, jax.Array | None]:
+        """Forward pass using quantized matmul. If ``out_sharding`` is None,
+        falls back to standard TP layout derived from ``kernel_axes``.
+        SP-aware callers must pass an explicit ``out_sharding``.
 
         Args:
             x: Input tensor [..., input_size]
+            out_sharding: Optional output sharding override.
 
         Returns:
             Tuple of (output, bias) where output is [..., output_size]
@@ -328,8 +469,10 @@ class QuantizedLinear(nnx.Module):
         else:
             # Per-channel scale: [n_out]
             w_scale_spec = P(output_axis)
-        in_specs = (P(None, input_axis), P(output_axis, input_axis), w_scale_spec)
-        out_specs = P(None, output_axis)
+        in_specs = (P("data", input_axis), P(output_axis, input_axis), w_scale_spec)
+
+        target = out_sharding or NamedSharding(self.mesh, P("data", output_axis))
+        output_partition_dim = _shard_map_output_partition_dim(target, input_axis)
 
         output = shard_map(
             partial(
@@ -339,10 +482,12 @@ class QuantizedLinear(nnx.Module):
                 compute_dtype=self.compute_dtype,
                 weight_block_size=self.weight_block_size,
                 activation_quant_dtype=self.activation_dtype,
+                allow_narrow_n_blockwise=self.allow_narrow_n_blockwise,
+                output_scatter_dimension=output_partition_dim,
             ),
             mesh=self.mesh,
             in_specs=in_specs,
-            out_specs=out_specs,
+            out_specs=target.spec,
             check_vma=False,
         )(x_2d, self.weight_q.value, scale_val)
 

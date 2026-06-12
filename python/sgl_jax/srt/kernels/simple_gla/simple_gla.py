@@ -1,4 +1,5 @@
 # Adapted from https://github.com/primatrix/pallas-kernel (rev 41431b1, release/v0.4)
+# Patch: feat/gla_varlen @ a7682e72 — caller no longer needs per-seq chunk padding.
 # Vendored to remove external dependency after the upstream repository went private.
 #
 # This file merges the following modules into a single file:
@@ -7,7 +8,7 @@
 #   - tops/ops/simple_gla/fused_recurrent.py (fused_recurrent_simple_gla)
 #   - tops/ops/common/chunk_h.py (_build_chunk_map, _chunk_fwd_h_kernel_varlen, chunk_fwd_h_kernel_varlen)
 #   - tops/ops/common/chunk_o.py (_chunk_fwd_o_kernel, _chunk_fwd_o_pl, chunk_fwd_o)
-#   - tops/ops/simple_gla/chunk.py (chunk_simple_gla_fwd_varlen)
+#   - tops/ops/simple_gla/chunk.py (chunk_simple_gla_fwd_varlen + align/unalign helpers)
 #   - tops/ops/simple_gla/__init__.py (SimpleGLAKernelMode, simple_gla_fwd)
 
 from __future__ import annotations
@@ -35,8 +36,8 @@ def assert_shape_or_none(
 ):
     if x is None:
         return
-    if isinstance(x, (list, tuple)):
-        has_names = isinstance(name, (list, tuple)) and len(name) == len(x)
+    if isinstance(x, list | tuple):
+        has_names = isinstance(name, list | tuple) and len(name) == len(x)
         for i, tensor in enumerate(x):
             if tensor is not None:
                 curr_name = name[i] if has_names else f"{name}_{i}"
@@ -52,8 +53,8 @@ def assert_shape(
     expected_shape: list[int] | tuple[int, ...],
     name: str | list[str] | tuple[str, ...] = "tensor",
 ):
-    if isinstance(x, (list, tuple)):
-        has_names = isinstance(name, (list, tuple)) and len(name) == len(x)
+    if isinstance(x, list | tuple):
+        has_names = isinstance(name, list | tuple) and len(name) == len(x)
         for i, tensor in enumerate(x):
             curr_name = name[i] if has_names else f"{name}_{i}"
             assert (
@@ -311,7 +312,9 @@ def _build_chunk_map(cu_seqlens, T_sum, BT):
     NT = T_sum // BT
     chunk_ids = lax.iota(jnp.int32, NT)
     chunk_pos = chunk_ids * BT
+    N = cu_seqlens.shape[-1] - 1
     seq_idx = jnp.searchsorted(cu_seqlens[1:], chunk_pos, side="right")
+    seq_idx = jnp.clip(seq_idx, 0, N - 1)
     return seq_idx
 
 
@@ -323,6 +326,7 @@ def _chunk_fwd_h_kernel_varlen(
     g_gamma_ref,  # [H,]
     cu_seqlens_ref,  # [num_seq+1]
     chunk_to_seq,  # [T_sum/BT]
+    seq_real_lens_ref,  # [N] real (non-padded) seq length, or None
     h_ref,  # [NS, 1, BK, BV]
     ht_ref,  # [N, 1, BK , BV]
     scratch_ref,  # [BK, BV]
@@ -368,12 +372,22 @@ def _chunk_fwd_h_kernel_varlen(
         v_tile = v_ref[(0, slice(None), slice(None))]  # [BT,BV]
 
         if g_gamma_ref is not None:
+            # Use real (non-padded) length when seq_real_lens is provided so b_g_last
+            # only covers real tokens — sequences padded to chunk_size internally
+            # would otherwise accumulate decay over zero-padding tail.
+            if seq_real_lens_ref is not None:
+                real_eos = bos + seq_real_lens_ref[seq_idx]
+                effective_remaining = jnp.maximum(real_eos - t0, 0)
+            else:
+                effective_remaining = eos - t0
             # tpu not support scalar bf16 mul
-            b_g_last = (
-                g_gamma_ref[i_h].astype(jnp.float32) * jnp.minimum(BT, eos - i_t * BT)
-            ).astype(g_gamma_ref.dtype)
+            L_chunk = jnp.minimum(BT, effective_remaining)
+            b_g_last = (g_gamma_ref[i_h].astype(jnp.float32) * L_chunk).astype(g_gamma_ref.dtype)
             scratch_ref[...] *= exp(b_g_last)
-            v_tile = (v_tile * exp(b_g_last - b_g)[:, None]).astype(v_tile.dtype)
+            # Mask exponent to avoid NaN (0 * inf) in padding positions
+            v_decay_exp = b_g_last - b_g
+            v_decay_exp = jnp.where(jnp.arange(BT) < L_chunk, v_decay_exp, -1e9)
+            v_tile = (v_tile * exp(v_decay_exp)[:, None]).astype(v_tile.dtype)
 
         if gk_ref is not None:
             gk_tile = gk_ref[(0, slice(None), slice(None))]  # BT * BK
@@ -403,7 +417,6 @@ def _chunk_fwd_h_kernel_varlen(
         "chunk_size",
         "split_size",
         "states_in_fp32",
-        "interpret",
     ],
 )
 def chunk_fwd_h_kernel_varlen(
@@ -419,8 +432,9 @@ def chunk_fwd_h_kernel_varlen(
     chunk_size: int = 128,
     split_size: int | None = None,
     states_in_fp32: bool = False,
-    interpret: bool = False,
+    seq_real_lens: jax.Array | None = None,  # [N]
 ):
+    interpret = get_interpret()
     assert g is None, "g should be None."
     assert gv is None, "gv should be None."
     BK = 128
@@ -504,6 +518,10 @@ def chunk_fwd_h_kernel_varlen(
 
     in_specs.append(pl.BlockSpec(memory_space=pltpu.SMEM))
     in_specs.append(pl.BlockSpec(memory_space=pltpu.SMEM))
+    if seq_real_lens is not None:
+        in_specs.append(pl.BlockSpec(memory_space=pltpu.SMEM))
+    else:
+        in_specs.append(None)
     scratch = pltpu.VMEM((BK, BV), jnp.float32)
     scratch_shapes = [scratch]
     kernel = functools.partial(
@@ -531,7 +549,7 @@ def chunk_fwd_h_kernel_varlen(
             ),
             vmem_limit_bytes=128 * 1024 * 1024,
         ),
-    )(k, v, h0, gk, g_gamma, cu_seqlens_dev, chunk_to_seq)
+    )(k, v, h0, gk, g_gamma, cu_seqlens_dev, chunk_to_seq, seq_real_lens)
     if output_final_state:
         return h, ht
     return h, None
@@ -776,6 +794,65 @@ def chunk_fwd_o(
 # =============================================================================
 
 
+def _build_align_gather_idx(cu_seqlens, aligned_cu, T_aligned):
+    """For each position in the aligned layout, return (orig_pos, is_valid).
+    Padding positions are mapped to 0 with is_valid=False; caller masks them."""
+    N = cu_seqlens.shape[0] - 1
+    real_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+    pos = jnp.arange(T_aligned, dtype=jnp.int32)
+    seq_idx = jnp.searchsorted(aligned_cu[1:], pos, side="right")
+    seq_idx = jnp.clip(seq_idx, 0, N - 1)
+    offset_in_seq = pos - aligned_cu[seq_idx]
+    orig_pos = cu_seqlens[seq_idx] + offset_in_seq
+    is_valid = offset_in_seq < real_lens[seq_idx]
+    gather_idx = jnp.where(is_valid, orig_pos, jnp.int32(0))
+    return gather_idx, is_valid
+
+
+def _compute_t_aligned(T_orig, N, chunk_size):
+    """Static upper bound for the per-seq-aligned packed length."""
+    BT = chunk_size
+    T_max = T_orig + N * (BT - 1)
+    return ((T_max + BT - 1) // BT) * BT
+
+
+def _align_varlen_inputs(q, k, v, cu_seqlens_dev, chunk_size, T_aligned):
+    """Pad each sequence to a multiple of chunk_size and rebuild cu_seqlens."""
+    BT = chunk_size
+    N = cu_seqlens_dev.shape[0] - 1
+    real_lens = cu_seqlens_dev[1:] - cu_seqlens_dev[:-1]
+    aligned_lens = ((real_lens + BT - 1) // BT) * BT
+    aligned_cu = jnp.zeros(N + 1, dtype=jnp.int32)
+    aligned_cu = aligned_cu.at[1:].set(jnp.cumsum(aligned_lens))
+    gather_idx, is_valid = _build_align_gather_idx(cu_seqlens_dev, aligned_cu, T_aligned)
+
+    def _gather_and_mask(x):
+        gathered = x[0, gather_idx]
+        gathered = jnp.where(is_valid[:, None, None], gathered, 0)
+        return gathered[None]
+
+    q_a = _gather_and_mask(q)
+    k_a = _gather_and_mask(k)
+    v_a = _gather_and_mask(v)
+    return q_a, k_a, v_a, aligned_cu, real_lens
+
+
+def _unalign_output(o_aligned, cu_seqlens_orig, aligned_cu, T_orig):
+    """Scatter the aligned-layout output back to the original packed layout."""
+    T_aligned = o_aligned.shape[1]
+    gather_idx, is_valid = _build_align_gather_idx(cu_seqlens_orig, aligned_cu, T_aligned)
+    o_out = jnp.zeros(
+        (1, T_orig, o_aligned.shape[2], o_aligned.shape[3]),
+        dtype=o_aligned.dtype,
+    )
+    o_out = o_out.at[0, gather_idx].add(jnp.where(is_valid[:, None, None], o_aligned[0], 0))
+    return o_out
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=["scale", "use_ht", "chunk_size"],
+)
 def chunk_simple_gla_fwd_varlen(
     q: jax.Array,
     k: jax.Array,
@@ -789,26 +866,34 @@ def chunk_simple_gla_fwd_varlen(
     cu_seqlens_cpu: jax.Array | None = None,
     cu_seqlens_dev: jax.Array | None = None,
     chunk_size: int = 64,
-    interpret: bool | None = None,
 ) -> tuple[jax.Array, jax.Array | None]:
-    B, T, H, K, V = *q.shape, v.shape[-1]
+    B, T_orig, H, K, V = *q.shape, v.shape[-1]
     N = cu_seqlens_dev.shape[0] - 1 if cu_seqlens_dev is not None else B
 
-    assert_shape(q, (B, T, H, K))
-    assert_shape(k, (B, T, H, K))
-    assert_shape(v, (B, T, H, V))
-    assert_shape_or_none(g, (B, T, H))
+    assert_shape(q, (B, T_orig, H, K))
+    assert_shape(k, (B, T_orig, H, K))
+    assert_shape(v, (B, T_orig, H, V))
+    assert_shape_or_none(g, (B, T_orig, H))
     assert_shape_or_none(g_gamma, (H,))
     assert_shape_or_none(h0, (N, H, K, V))
-    assert T % chunk_size == 0
-    assert cu_seqlens_cpu is None, "cu_seqlens_cpu is None."
-    assert cu_seqlens_dev is not None, "cu_seqlens_dev is not None."
+    assert cu_seqlens_cpu is None, "cu_seqlens_cpu must be None."
+    assert cu_seqlens_dev is not None, "cu_seqlens_dev must not be None."
     assert (K % 128 == 0) and (V % 128 == 0)
     assert B == 1, "B must be 1."
 
+    T_aligned = _compute_t_aligned(T_orig, N, chunk_size)
+    q_a, k_a, v_a, aligned_cu, real_seq_lens = _align_varlen_inputs(
+        q,
+        k,
+        v,
+        cu_seqlens_dev,
+        chunk_size,
+        T_aligned,
+    )
+
     h, ht = chunk_fwd_h_kernel_varlen(
-        k=k,
-        v=v,
+        k=k_a,
+        v=v_a,
         g=g,
         g_gamma=g_gamma,
         gk=None,
@@ -816,21 +901,34 @@ def chunk_simple_gla_fwd_varlen(
         h0=h0,
         output_final_state=use_ht,
         states_in_fp32=False,
-        cu_seqlens_dev=cu_seqlens_dev,
+        cu_seqlens_dev=aligned_cu,
         chunk_size=chunk_size,
+        seq_real_lens=real_seq_lens,
     )
+    # Pallas output buffers are NOT zero-initialized on TPU. Zero-length
+    # sequences are skipped by @pl.when(bos != eos), leaving their ht
+    # entries undefined. Replace with h0 (or zeros) so downstream scatter
+    # doesn't write garbage into the recurrent state pool.
+    if use_ht and ht is not None:
+        zero_len_mask = (real_seq_lens == 0)[:, None, None, None]
+        if h0 is not None:
+            ht = jnp.where(zero_len_mask, h0, ht)
+        else:
+            ht = jnp.where(zero_len_mask, 0.0, ht)
     o = chunk_fwd_o(
-        q=q,
-        k=k,
-        v=v,
+        q=q_a,
+        k=k_a,
+        v=v_a,
         g=g,
         g_gamma=g_gamma,
         h=h,
         scale=scale,
         cu_seqlens_cpu=cu_seqlens_cpu,
-        cu_seqlens_dev=cu_seqlens_dev,
+        cu_seqlens_dev=aligned_cu,
         chunk_size=chunk_size,
     )
+
+    o = _unalign_output(o, cu_seqlens_dev, aligned_cu, T_orig)
     return o, ht
 
 

@@ -50,8 +50,13 @@ class FusedMoEBlockConfig:
         ep_size: int,
         dtype: jnp.dtype,
         quant_block_k: int | None = None,
+        intermediate_size: int | None = None,
     ) -> FusedMoEBlockConfig:
         """Return the *effective* config after applying kernel override rules.
+
+        If *intermediate_size* is given and ``self.bf`` does not divide it,
+        ``bf`` (and correspondingly ``bfc``) are jointly reduced to the largest
+        multiple of 128 that satisfies both divisibility constraints.
 
         Important: validate after overrides, because these overrides affect the
         actual compiled kernel shapes/scratch.
@@ -96,12 +101,40 @@ class FusedMoEBlockConfig:
             bfc = max(bfc, min_bfc)
             bfc -= bfc % min_bfc
 
-        bse = self.bf if self.bse is None else self.bse
+        bf = self.bf
+        if intermediate_size is not None and intermediate_size % bf != 0:
+            # Joint search: each bf candidate must also admit a feasible bfc,
+            # since quant_block_k can make some (bf, bfc) pairs impossible.
+            reduced = False
+            for bf_candidate in range(bf - 128, 0, -128):
+                if intermediate_size % bf_candidate != 0:
+                    continue
+                bfc_candidate = min(bfc, bf_candidate)
+                while bfc_candidate > 128 and (
+                    bf_candidate % bfc_candidate != 0
+                    or (quant_block_k is not None and bfc_candidate % quant_block_k != 0)
+                ):
+                    bfc_candidate -= 128
+                if bf_candidate % bfc_candidate == 0 and (
+                    quant_block_k is None or bfc_candidate % quant_block_k == 0
+                ):
+                    bf = bf_candidate
+                    bfc = bfc_candidate
+                    reduced = True
+                    break
+            if not reduced:
+                quant_info = f" with {quant_block_k=}" if quant_block_k is not None else ""
+                raise ValueError(
+                    f"Cannot find a valid bf (multiple of 128) that divides "
+                    f"{intermediate_size=} with a feasible bfc{quant_info}."
+                )
+
+        bse = bf if self.bse is None else self.bse
 
         return FusedMoEBlockConfig(
             bt=bt,
             bts=bts,
-            bf=self.bf,
+            bf=bf,
             bd1=self.bd1,
             bd2=self.bd2,
             btc=btc,
@@ -510,6 +543,9 @@ def _fused_ep_moe_kernel(
     w1_shared_scale_hbm,  # None | (1, 1, se_inter)
     w3_shared_scale_hbm,  # None | (1, 1, se_inter)
     w2_shared_scale_hbm,  # None | (1, 1, hidden_size)
+    metadata_starts_hbm,  # None | (num_bt, 1, padded_num_experts) int32
+    metadata_sizes_hbm,  # None | (num_bt, 1, padded_num_experts) int32
+    metadata_d2e_counts_hbm,  # None | (num_bt, num_devices, 1, padded_num_experts) int32
     # Output
     output_hbm,  # (local_num_tokens, hidden_size)
     # Scratch
@@ -570,6 +606,7 @@ def _fused_ep_moe_kernel(
     disable_shared_expert: bool = False,
     disable_all_reduce_metadata: bool = False,
     disable_sync_barrier: bool = False,
+    use_jax_allreduce_metadata: bool = True,
     quant_block_k: int | None = None,
     # Kernel tuning params.
     bt: int,  # Outer token tile size (output tiling).
@@ -703,9 +740,88 @@ def _fused_ep_moe_kernel(
             sem=local_sems.at[bt_sem_id, 13],
         ).wait()
 
-    def all_reduce_metadata(*, bt_sem_id, t2e_routing, starts, sizes):
+    def all_reduce_metadata(*, bt_id, bt_sem_id, t2e_routing, starts, sizes):
         send_sem = send_x2_sems.at[0]
         recv_sem = recv_x2_sems.at[0]
+
+        if use_jax_allreduce_metadata and metadata_starts_hbm is not None:
+            metadata_starts_sem = local_sems.at[bt_sem_id, 14]
+            metadata_sizes_sem = local_sems.at[bt_sem_id, 15]
+            metadata_counts_sem = local_sems.at[bt_sem_id, 16]
+            metadata_offsets_sem = local_sems.at[bt_sem_id, 17]
+            metadata_routing_sem = local_sems.at[bt_sem_id, 18]
+
+            def _copy_precomputed(
+                t2e_routing_vmem,
+                d2e_count_vmem,
+                offsets_vmem,
+                starts_vmem,
+                sizes_vmem,
+            ):
+                offsets_vmem[...] = jnp.zeros_like(offsets_vmem)
+                t2e_routing_vmem[...] = t2e_routing
+
+                starts_load = pltpu.async_copy(
+                    src_ref=metadata_starts_hbm.at[bt_id],
+                    dst_ref=starts_vmem,
+                    sem=metadata_starts_sem,
+                )
+                sizes_load = pltpu.async_copy(
+                    src_ref=metadata_sizes_hbm.at[bt_id],
+                    dst_ref=sizes_vmem,
+                    sem=metadata_sizes_sem,
+                )
+                d2e_count_load = pltpu.async_copy(
+                    src_ref=metadata_d2e_counts_hbm.at[bt_id],
+                    dst_ref=d2e_count_vmem,
+                    sem=metadata_counts_sem,
+                )
+
+                offsets_copy = pltpu.async_copy(
+                    src_ref=offsets_vmem,
+                    dst_ref=expert_offsets_x2_smem.at[bt_sem_id],
+                    sem=metadata_offsets_sem,
+                )
+                t2e_routing_copy = pltpu.async_copy(
+                    src_ref=t2e_routing_vmem,
+                    dst_ref=t2e_routing_x2_smem.at[bt_sem_id],
+                    sem=metadata_routing_sem,
+                )
+
+                starts_load.wait()
+                sizes_load.wait()
+                d2e_count_load.wait()
+                starts_copy = pltpu.async_copy(
+                    src_ref=starts_vmem,
+                    dst_ref=expert_starts_x2_smem.at[bt_sem_id],
+                    sem=metadata_starts_sem,
+                )
+                sizes_copy = pltpu.async_copy(
+                    src_ref=sizes_vmem,
+                    dst_ref=expert_sizes_x2_smem.at[bt_sem_id],
+                    sem=metadata_sizes_sem,
+                )
+                d2e_count_copy = pltpu.async_copy(
+                    src_ref=d2e_count_vmem,
+                    dst_ref=d2e_count_x2_smem.at[bt_sem_id],
+                    sem=metadata_counts_sem,
+                )
+
+                t2e_routing_copy.wait()
+                d2e_count_copy.wait()
+                offsets_copy.wait()
+                starts_copy.wait()
+                sizes_copy.wait()
+
+            pl.run_scoped(
+                _copy_precomputed,
+                pltpu.VMEM(t2e_routing_x2_smem.shape[1:], t2e_routing_x2_smem.dtype),
+                pltpu.VMEM(d2e_count_x2_smem.shape[1:], d2e_count_x2_smem.dtype),
+                pltpu.VMEM(expert_offsets_x2_smem.shape[1:], expert_offsets_x2_smem.dtype),
+                pltpu.VMEM(expert_starts_x2_smem.shape[1:], expert_starts_x2_smem.dtype),
+                pltpu.VMEM(expert_sizes_x2_smem.shape[1:], expert_sizes_x2_smem.dtype),
+            )
+            return
 
         # Local-only metadata path for profiling. Not correct for multi-device routing;
         # only use when A2A is disabled (or on ep_size=1).
@@ -957,6 +1073,81 @@ def _fused_ep_moe_kernel(
             unroll=False,
         )
         a2a_s_sends_x2_smem[e_sem_id] = send_sz
+
+    def start_a2a_scatter_batch(*, bt_sem_id, bt_start):
+        if disable_a2a:
+            return
+        for slot in range(expert_buffer_count):
+            a2a_s_sends_x2_smem[slot] = jnp.int32(0)
+
+        def _scatter_one_batch(t_id, _, bt_start=bt_start):
+            src_t_id = bt_start + t_id
+            for k_id in range(top_k):
+                e_id = t2e_routing_x2_smem[bt_sem_id, t_id, k_id]
+                is_valid = e_id >= 0
+                e_id_safe = lax.select(is_valid, e_id, jnp.int32(0))
+                e_sem_id_k = e_id_safe % jnp.int32(local_num_experts)
+                recv_id = e_id_safe // local_num_experts
+                offset = expert_offsets_x2_smem[bt_sem_id, 0, e_id_safe]
+                sz = lax.select(is_valid, jnp.int32(1), jnp.int32(0))
+                is_local = recv_id == my_id
+                local_sz = lax.select(is_local, sz, jnp.int32(0))
+                remote_sz = lax.select(is_local, jnp.int32(0), sz)
+                expert_offsets_x2_smem[bt_sem_id, 0, e_id_safe] = offset + local_sz + remote_sz
+                start = expert_starts_x2_smem[bt_sem_id, 0, e_id_safe] + offset
+                cur_sends = a2a_s_sends_x2_smem[e_sem_id_k]
+                a2a_s_sends_x2_smem[e_sem_id_k] = cur_sends + remote_sz
+
+                @pl.when(local_sz != 0)
+                def _local_copy(
+                    src_t_id=src_t_id, start=start, local_sz=local_sz, e_sem_id_k=e_sem_id_k
+                ):
+                    pltpu.make_async_copy(
+                        src_ref=tokens_hbm.at[pl.ds(src_t_id, local_sz)],
+                        dst_ref=a2a_s_x2_hbm.at[e_sem_id_k, pl.ds(start, local_sz)],
+                        sem=recv_x2_sems.at[e_sem_id_k],
+                    ).start()
+
+                @pl.when(remote_sz != 0)
+                def _remote_copy(
+                    src_t_id=src_t_id,
+                    start=start,
+                    remote_sz=remote_sz,
+                    e_sem_id_k=e_sem_id_k,
+                    recv_id=recv_id,
+                ):
+                    pltpu.make_async_remote_copy(
+                        src_ref=tokens_hbm.at[pl.ds(src_t_id, remote_sz)],
+                        dst_ref=a2a_s_x2_hbm.at[e_sem_id_k, pl.ds(start, remote_sz)],
+                        send_sem=send_x2_sems.at[e_sem_id_k],
+                        recv_sem=recv_x2_sems.at[e_sem_id_k],
+                        device_id=get_mesh_device_id(recv_id),
+                        device_id_type=pltpu.DeviceIdType.MESH,
+                    ).start()
+
+            return None
+
+        lax.fori_loop(0, bt, _scatter_one_batch, None, unroll=False)
+
+    def wait_a2a_scatter_send_batch():
+        if disable_a2a:
+            return
+
+        def _wait_one(slot, _):
+            scatter_send_sz = a2a_s_sends_x2_smem[slot]
+
+            @pl.when(scatter_send_sz != 0)
+            def _():
+                ref = a2a_s_x2_hbm.at[slot, pl.ds(0, scatter_send_sz)]
+                pltpu.make_async_copy(
+                    src_ref=ref,
+                    dst_ref=ref,
+                    sem=send_x2_sems.at[slot],
+                ).wait()
+
+            return None
+
+        lax.fori_loop(0, jnp.int32(expert_buffer_count), _wait_one, None, unroll=False)
 
     def wait_a2a_scatter_recv(*, bt_sem_id, e_sem_id, local_e_id):
         if disable_a2a:
@@ -2585,134 +2776,209 @@ def _fused_ep_moe_kernel(
         # Prepare t2e_routing
         t2e_routing = b_topk_ids_x2_vmem[bt_sem_id]
 
-        expert_iota = jax.lax.broadcasted_iota(jnp.int32, (1, 1, padded_num_experts), 2)
-        routing_expanded = jnp.expand_dims(t2e_routing[:, :top_k], axis=2)
-        mask = (routing_expanded == expert_iota).astype(jnp.int32)
-        expert_sizes = jnp.sum(mask, axis=(0, 1), keepdims=True).reshape(1, padded_num_experts)
+        if use_jax_allreduce_metadata and metadata_starts_hbm is not None:
+            expert_sizes = jnp.zeros((1, padded_num_experts), dtype=jnp.int32)
+        else:
+            expert_iota = jax.lax.broadcasted_iota(jnp.int32, (1, 1, padded_num_experts), 2)
+            routing_expanded = jnp.expand_dims(t2e_routing[:, :top_k], axis=2)
+            mask = (routing_expanded == expert_iota).astype(jnp.int32)
+            expert_sizes = jnp.sum(mask, axis=(0, 1), keepdims=True).reshape(1, padded_num_experts)
 
         expert_starts = jnp.zeros_like(expert_sizes)
 
         all_reduce_metadata(
+            bt_id=bt_id,
             bt_sem_id=bt_sem_id,
             t2e_routing=t2e_routing,
             starts=expert_starts,
             sizes=expert_sizes,
         )
-        sync_barrier()
 
         wait_store_output(bt_id=bt_id - 2)
 
-        start_a2a_scatter(bt_sem_id=bt_sem_id, e_sem_id=e_sem_id, local_e_id=0, bt_start=bt_start)
-
-        init_carry = (e_sem_id, jnp.int32(0))
-
-        def run_per_expert_pipelined(local_e_id, carry):
-            curr_e_sem_id, curr_se_block = carry
-
-            @pl.when(local_e_id == 0)
-            def _first_load():
-                e_id = my_id * local_num_experts + local_e_id
-                sz = expert_sizes_x2_smem[bt_sem_id, 0, e_id]
-
-                @pl.when(sz != 0)
-                def _():
-                    start_fetch_bw1(local_e_id, bw1_sem_id=0, bf_id=0, bd1_id=0)
-                    start_fetch_bw3(local_e_id, bw3_sem_id=0, bf_id=0, bd3_id=0)
-
-            @pl.when(curr_se_block == 0)
-            def _():
-                run_shared_expert_slice(0, bt_id, bt_sem_id, out_buf_id)
-
-            curr_se_block = lax.select(curr_se_block == 0, jnp.int32(1), curr_se_block)
-
-            next_e_sem_id = (curr_e_sem_id + jnp.int32(1)) % jnp.int32(expert_buffer_count)
-            next_local_e_id = local_e_id + 1
-
-            @pl.when(next_local_e_id < local_num_experts)
-            def _():
-                # A single barrier at each full-ring boundary is sufficient:
-                # it guarantees ALL devices have finished with the previous
-                # round of experts that occupied these buffers, so every
-                # buffer in the ring can be safely reused for the next round.
-                # With expert_buffer_count=B, barriers fire at expert IDs
-                # B, 2B, 3B, ... — saving (B-1) barriers per round compared
-                # to the previous per-expert barrier.
-                @pl.when(
-                    (next_local_e_id >= expert_buffer_count)
-                    & (next_local_e_id % expert_buffer_count == 0)
-                )
-                def _wait_before_buffer_reuse():
-                    sync_barrier()
-
-                start_a2a_scatter(
-                    bt_sem_id=bt_sem_id,
-                    e_sem_id=next_e_sem_id,
-                    local_e_id=next_local_e_id,
-                    bt_start=bt_start,
-                )
-
-            run_shared_expert_slice(curr_se_block, bt_id, bt_sem_id, out_buf_id)
-            curr_se_block += 1
-
-            wait_a2a_scatter_recv(
-                bt_sem_id=bt_sem_id, e_sem_id=curr_e_sem_id, local_e_id=local_e_id
-            )
-            expert_ffn(bt_sem_id, curr_e_sem_id, local_e_id)
-
-            start_a2a_gather(bt_sem_id=bt_sem_id, e_sem_id=curr_e_sem_id, local_e_id=local_e_id)
-
-            run_shared_expert_slice(curr_se_block, bt_id, bt_sem_id, out_buf_id)
-            curr_se_block += 1
-
-            wait_a2a_scatter_send(
-                bt_sem_id=bt_sem_id,
-                e_sem_id=curr_e_sem_id,
-                local_e_id=local_e_id,
-            )
-            # Expert A2A scratch uses a ring buffer.  A single barrier at each
-            # full-ring boundary (every `expert_buffer_count` experts) is
-            # sufficient to prevent buffer reuse races across devices.
-            return (next_e_sem_id, curr_se_block)
-
-        final_carry = lax.fori_loop(
-            0, local_num_experts, run_per_expert_pipelined, init_carry, unroll=False
+        se_per_expert = (
+            max(2, cdiv(se_total_blocks, local_num_experts)) if se_total_blocks > 0 else 2
         )
-        final_e_sem_id, final_se_block = final_carry
+        se_before = se_per_expert // 2
+        se_after = se_per_expert - se_before
 
-        def cleanup_body(block_idx, _):
-            run_shared_expert_slice(block_idx, bt_id, bt_sem_id, out_buf_id)
-            return None
+        if expert_buffer_count >= local_num_experts:
+            # === BATCH SCATTER PATH ===
+            # Issue all scatter DMAs in one token-loop pass (bt iterations
+            # instead of bt * local_num_experts), then run a tight compute loop
+            # where each expert waits only its own recv semaphore.
+            start_a2a_scatter_batch(bt_sem_id=bt_sem_id, bt_start=bt_start)
 
-        lax.fori_loop(final_se_block, se_total_blocks, cleanup_body, None)
+            init_carry = jnp.int32(0)
 
-        wait_a2a_gather_recv_all(bt_sem_id=bt_sem_id)
-        sync_barrier()
+            def compute_expert_batch(local_e_id, curr_se_block):
+                e_sem_id_local = local_e_id
 
-        acc_and_store_output(bt_sem_id=bt_sem_id, out_buf_id=out_buf_id)
+                @pl.when(local_e_id == 0)
+                def _first_load():
+                    e_id = my_id * local_num_experts
+                    sz = expert_sizes_x2_smem[bt_sem_id, 0, e_id]
 
-        start_send_bo(bt_id=bt_id)
+                    @pl.when(sz != 0)
+                    def _():
+                        start_fetch_bw1(0, bw1_sem_id=0, bf_id=0, bd1_id=0)
+                        start_fetch_bw3(0, bw3_sem_id=0, bf_id=0, bd3_id=0)
 
-        # Do NOT re-wait scatter send semaphores here. The per-expert pipeline already
-        # drains scatter sends via `wait_a2a_scatter_send(...)`. Re-waiting can
-        # deadlock when the semaphore has been fully consumed.
-        #
-        # Gather sends are drained when their accumulator buffer is reused. Flush the
-        # tail experts whose buffers are not reused within this bt tile.
-        tail_start = max(local_num_experts - expert_buffer_count, 0)
-        for tail_local_e_id in range(tail_start, local_num_experts):
-            tail_sem_id = (e_sem_id + tail_local_e_id) % expert_buffer_count
-            wait_a2a_gather_send(
-                bt_sem_id=bt_sem_id,
-                e_sem_id=tail_sem_id,
-                local_e_id=tail_local_e_id,
+                for _ in range(se_before):
+                    run_shared_expert_slice(curr_se_block, bt_id, bt_sem_id, out_buf_id)
+                    curr_se_block += 1
+
+                wait_a2a_scatter_recv(
+                    bt_sem_id=bt_sem_id,
+                    e_sem_id=e_sem_id_local,
+                    local_e_id=local_e_id,
+                )
+                expert_ffn(bt_sem_id, e_sem_id_local, local_e_id)
+
+                start_a2a_gather(
+                    bt_sem_id=bt_sem_id,
+                    e_sem_id=e_sem_id_local,
+                    local_e_id=local_e_id,
+                )
+
+                for _ in range(se_after):
+                    run_shared_expert_slice(curr_se_block, bt_id, bt_sem_id, out_buf_id)
+                    curr_se_block += 1
+
+                return curr_se_block
+
+            final_se_block = lax.fori_loop(
+                0, local_num_experts, compute_expert_batch, init_carry, unroll=False
             )
 
-        # The end-of-bt barrier ensures gather-send completion is visible to
-        # the next bt tile's metadata exchange.  For the very last tile there is
-        # no next iteration, so the barrier is unnecessary.
-        @pl.when(bt_id + 1 < num_bt)
-        def _():
+            def cleanup_body_batch(block_idx, _):
+                run_shared_expert_slice(block_idx, bt_id, bt_sem_id, out_buf_id)
+                return None
+
+            lax.fori_loop(final_se_block, se_total_blocks, cleanup_body_batch, None)
+
+            wait_a2a_scatter_send_batch()
+            wait_a2a_gather_recv_all(bt_sem_id=bt_sem_id)
             sync_barrier()
+
+            acc_and_store_output(bt_sem_id=bt_sem_id, out_buf_id=out_buf_id)
+
+            start_send_bo(bt_id=bt_id)
+
+            tail_start = max(local_num_experts - expert_buffer_count, 0)
+            for tail_local_e_id in range(tail_start, local_num_experts):
+                wait_a2a_gather_send(
+                    bt_sem_id=bt_sem_id,
+                    e_sem_id=tail_local_e_id,
+                    local_e_id=tail_local_e_id,
+                )
+
+            @pl.when(bt_id + 1 < num_bt)
+            def _():
+                sync_barrier()
+
+            final_e_sem_id = e_sem_id
+
+        else:
+            # === EXISTING PIPELINED PATH ===
+            start_a2a_scatter(
+                bt_sem_id=bt_sem_id, e_sem_id=e_sem_id, local_e_id=0, bt_start=bt_start
+            )
+
+            init_carry = (e_sem_id, jnp.int32(0))
+
+            def run_per_expert_pipelined(local_e_id, carry):
+                curr_e_sem_id, curr_se_block = carry
+
+                @pl.when(local_e_id == 0)
+                def _first_load():
+                    e_id = my_id * local_num_experts + local_e_id
+                    sz = expert_sizes_x2_smem[bt_sem_id, 0, e_id]
+
+                    @pl.when(sz != 0)
+                    def _():
+                        start_fetch_bw1(local_e_id, bw1_sem_id=0, bf_id=0, bd1_id=0)
+                        start_fetch_bw3(local_e_id, bw3_sem_id=0, bf_id=0, bd3_id=0)
+
+                @pl.when(curr_se_block == 0)
+                def _():
+                    run_shared_expert_slice(0, bt_id, bt_sem_id, out_buf_id)
+
+                curr_se_block = lax.select(curr_se_block == 0, jnp.int32(1), curr_se_block)
+
+                next_e_sem_id = (curr_e_sem_id + jnp.int32(1)) % jnp.int32(expert_buffer_count)
+                next_local_e_id = local_e_id + 1
+
+                @pl.when(next_local_e_id < local_num_experts)
+                def _():
+                    @pl.when(
+                        (next_local_e_id >= expert_buffer_count)
+                        & (next_local_e_id % expert_buffer_count == 0)
+                    )
+                    def _wait_before_buffer_reuse():
+                        sync_barrier()
+
+                    start_a2a_scatter(
+                        bt_sem_id=bt_sem_id,
+                        e_sem_id=next_e_sem_id,
+                        local_e_id=next_local_e_id,
+                        bt_start=bt_start,
+                    )
+
+                for _ in range(se_before):
+                    run_shared_expert_slice(curr_se_block, bt_id, bt_sem_id, out_buf_id)
+                    curr_se_block += 1
+
+                wait_a2a_scatter_recv(
+                    bt_sem_id=bt_sem_id, e_sem_id=curr_e_sem_id, local_e_id=local_e_id
+                )
+                expert_ffn(bt_sem_id, curr_e_sem_id, local_e_id)
+
+                start_a2a_gather(bt_sem_id=bt_sem_id, e_sem_id=curr_e_sem_id, local_e_id=local_e_id)
+
+                for _ in range(se_after):
+                    run_shared_expert_slice(curr_se_block, bt_id, bt_sem_id, out_buf_id)
+                    curr_se_block += 1
+
+                wait_a2a_scatter_send(
+                    bt_sem_id=bt_sem_id,
+                    e_sem_id=curr_e_sem_id,
+                    local_e_id=local_e_id,
+                )
+                return (next_e_sem_id, curr_se_block)
+
+            final_carry = lax.fori_loop(
+                0, local_num_experts, run_per_expert_pipelined, init_carry, unroll=False
+            )
+            final_e_sem_id, final_se_block = final_carry
+
+            def cleanup_body(block_idx, _):
+                run_shared_expert_slice(block_idx, bt_id, bt_sem_id, out_buf_id)
+                return None
+
+            lax.fori_loop(final_se_block, se_total_blocks, cleanup_body, None)
+
+            wait_a2a_gather_recv_all(bt_sem_id=bt_sem_id)
+            sync_barrier()
+
+            acc_and_store_output(bt_sem_id=bt_sem_id, out_buf_id=out_buf_id)
+
+            start_send_bo(bt_id=bt_id)
+
+            tail_start = max(local_num_experts - expert_buffer_count, 0)
+            for tail_local_e_id in range(tail_start, local_num_experts):
+                tail_sem_id = (e_sem_id + tail_local_e_id) % expert_buffer_count
+                wait_a2a_gather_send(
+                    bt_sem_id=bt_sem_id,
+                    e_sem_id=tail_sem_id,
+                    local_e_id=tail_local_e_id,
+                )
+
+            @pl.when(bt_id + 1 < num_bt)
+            def _():
+                sync_barrier()
+
+            final_e_sem_id = final_e_sem_id
 
         return final_e_sem_id
 
@@ -2930,6 +3196,76 @@ def _validate_fused_ep_moe_args(
                     raise ValueError("w2_shared_scale must be float32")
 
 
+def compute_local_expert_sizes(topk_ids: jax.Array, num_experts: int) -> jax.Array:
+    """Count routed tokens per expert for one local token tile.
+
+    Must be called inside shard_map, where topk_ids is the device-local slice.
+    Invalid/padded expert ids are accumulated into a sentinel bucket and dropped.
+    """
+    flat_ids = topk_ids.flatten()
+    valid = (flat_ids >= 0) & (flat_ids < num_experts)
+    safe_ids = jnp.where(valid, flat_ids, num_experts)
+    counts = jnp.bincount(safe_ids, length=num_experts + 1)[:num_experts]
+    return counts[None, :].astype(jnp.int32)
+
+
+def jax_allreduce_metadata_by_bt(
+    topk_ids: jax.Array,  # (num_tokens, top_k) int32
+    num_experts: int,
+    bt: int,
+    num_devices: int,
+    dp_axis_name: str,
+    tp_axis_name: str,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Compute the per-bt metadata normally produced inside the Pallas kernel.
+
+    Returns:
+        starts: (num_bt, 1, num_experts) int32
+        sizes: (num_bt, 1, num_experts) int32
+        d2e_counts: (num_bt, num_devices, 1, num_experts) int32
+    """
+    num_tokens = topk_ids.shape[0]
+    if num_tokens % bt != 0:
+        raise ValueError(f"Expected local topk_ids tokens ({num_tokens}) to be divisible by {bt=}.")
+
+    topk_ids_by_bt = topk_ids.reshape(num_tokens // bt, bt, topk_ids.shape[-1])
+    local_sizes = jax.vmap(compute_local_expert_sizes, in_axes=(0, None))(
+        topk_ids_by_bt,
+        num_experts,
+    )
+
+    all_sizes = lax.all_gather(
+        local_sizes,
+        axis_name=(dp_axis_name, tp_axis_name),
+        axis=1,
+        tiled=True,
+    )
+    all_sizes = all_sizes.astype(jnp.int32)
+    if all_sizes.shape[1] != num_devices:
+        raise ValueError(
+            f"Expected gathered metadata axis to be {num_devices}, got {all_sizes.shape}."
+        )
+
+    sizes = jnp.sum(all_sizes, axis=1, keepdims=True).astype(jnp.int32)
+
+    dp_rank = lax.axis_index(dp_axis_name)
+    tp_rank = lax.axis_index(tp_axis_name)
+    tp_size = lax.axis_size(tp_axis_name)
+    my_id = dp_rank * tp_size + tp_rank
+    # Only this device's prefix is consumed by the Pallas kernel. Computing
+    # starts for every device adds decode-side work without changing outputs.
+    device_ids = lax.broadcasted_iota(jnp.int32, (num_devices,), 0)
+    prefix_mask = device_ids < my_id
+    starts = jnp.sum(
+        jnp.where(prefix_mask[None, :, None], all_sizes, jnp.zeros_like(all_sizes)),
+        axis=1,
+        keepdims=True,
+    ).astype(jnp.int32)
+
+    d2e_counts = all_sizes[:, :, None, :]
+    return starts, sizes, d2e_counts
+
+
 @functools.partial(
     jax.jit,
     static_argnames=[
@@ -2950,6 +3286,7 @@ def _validate_fused_ep_moe_args(
         "disable_shared_expert",
         "disable_all_reduce_metadata",
         "disable_sync_barrier",
+        "use_jax_allreduce_metadata",
         "quant_block_k",
         "block_config",
         "dp_axis_name",
@@ -2982,6 +3319,7 @@ def fused_ep_moe(
     disable_shared_expert: bool = False,
     disable_all_reduce_metadata: bool = False,
     disable_sync_barrier: bool = False,
+    use_jax_allreduce_metadata: bool = True,
     # Quantization block size along the K (reduction) dimension.  Models with
     # 2D block-wise quantization (block_k, block_n) have their scales expanded
     # to 1D format at weight-loading time by _expand_moe_block_scale(), so the
@@ -3015,11 +3353,11 @@ def fused_ep_moe(
                 "disable_sync_barrier is only supported with disable_a2a=True or ep_size=1."
             )
 
+    num_experts, intermediate_size, _ = w2.shape
     if block_config is None:
         from .tuned_block_configs import get_tuned_fused_moe_block_config
 
         num_tokens, hidden_size = tokens.shape
-        num_experts, intermediate_size, _ = w2.shape
         block_config = get_tuned_fused_moe_block_config(
             num_tokens=num_tokens,
             num_experts=num_experts,
@@ -3037,6 +3375,7 @@ def fused_ep_moe(
         ep_size=ep_size,
         dtype=tokens.dtype,
         quant_block_k=quant_block_k,
+        intermediate_size=intermediate_size,
     )
     _validate_fused_ep_moe_args(
         mesh=mesh,
@@ -3068,7 +3407,6 @@ def fused_ep_moe(
     num_devices = ep_size
 
     num_tokens, hidden_size = tokens.shape
-    num_experts, intermediate_size, _ = w2.shape
     local_num_experts = num_experts // ep_size
     se_inter_size = w2_shared.shape[0] if w2_shared is not None else 0
 
@@ -3076,6 +3414,7 @@ def fused_ep_moe(
     bt = block_config.bt
     if bt <= 0:
         raise ValueError(f"Expected {bt=} to be > 0.")
+    needs_jax_allreduce = use_jax_allreduce_metadata and ep_size > 1 and not disable_a2a
     padded_num_experts = align_to(num_experts, 128)
     padded_top_k = align_to(top_k, 128)
     t_dtype = tokens.dtype
@@ -3232,7 +3571,7 @@ def fused_ep_moe(
         # Semaphores.
         pltpu.SemaphoreType.DMA((2,)),  # token_stage_x2_sems
         pltpu.SemaphoreType.DMA((3,)),  # acc_stage_x3_sems
-        pltpu.SemaphoreType.DMA((2, 14)),  # local_sems
+        pltpu.SemaphoreType.DMA((2, 19)),  # local_sems
         pltpu.SemaphoreType.DMA((expert_buffer_count,)),  # send_x2_sems
         pltpu.SemaphoreType.DMA((expert_buffer_count,)),  # recv_x2_sems
         pltpu.SemaphoreType.DMA((expert_buffer_count,)),  # gather_send_x2_sems
@@ -3258,6 +3597,7 @@ def fused_ep_moe(
                 disable_shared_expert=disable_shared_expert,
                 disable_all_reduce_metadata=disable_all_reduce_metadata,
                 disable_sync_barrier=disable_sync_barrier,
+                use_jax_allreduce_metadata=use_jax_allreduce_metadata,
                 quant_block_k=quant_block_k,
                 bt=bt,
                 bf=block_config.bf,
@@ -3295,6 +3635,9 @@ def fused_ep_moe(
                     None if w1_shared_scale is None else hbm_block_spec,  # w1_shared_scale_hbm
                     None if w3_shared_scale is None else hbm_block_spec,  # w3_shared_scale_hbm
                     None if w2_shared_scale is None else hbm_block_spec,  # w2_shared_scale_hbm
+                    None if not needs_jax_allreduce else hbm_block_spec,  # metadata_starts_hbm
+                    None if not needs_jax_allreduce else hbm_block_spec,  # metadata_sizes_hbm
+                    None if not needs_jax_allreduce else hbm_block_spec,  # metadata_d2e_counts_hbm
                 ],
                 out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM),
                 scratch_shapes=scratch_shapes,
@@ -3409,6 +3752,26 @@ def fused_ep_moe(
         w3_shared_scale=None,
         w2_shared_scale=None,
     ):
+        if needs_jax_allreduce:
+            metadata_starts, metadata_sizes, metadata_d2e_counts = jax_allreduce_metadata_by_bt(
+                topk_ids[:, :top_k],
+                padded_num_experts,
+                bt,
+                num_devices,
+                dp_axis_name,
+                tp_axis_name,
+            )
+            metadata_starts_arg = pltpu.with_memory_space_constraint(metadata_starts, pltpu.HBM)
+            metadata_sizes_arg = pltpu.with_memory_space_constraint(metadata_sizes, pltpu.HBM)
+            metadata_d2e_counts_arg = pltpu.with_memory_space_constraint(
+                metadata_d2e_counts,
+                pltpu.HBM,
+            )
+        else:
+            metadata_starts_arg = None
+            metadata_sizes_arg = None
+            metadata_d2e_counts_arg = None
+
         local_output = fused_moe(
             pltpu.with_memory_space_constraint(tokens, pltpu.HBM),  # tokens_hbm
             pltpu.with_memory_space_constraint(w1, pltpu.HBM),  # w1_hbm
@@ -3469,6 +3832,9 @@ def fused_ep_moe(
                 if w2_shared_scale is None
                 else pltpu.with_memory_space_constraint(w2_shared_scale, pltpu.HBM)
             ),
+            metadata_starts_arg,
+            metadata_sizes_arg,
+            metadata_d2e_counts_arg,
         )
         return local_output
 

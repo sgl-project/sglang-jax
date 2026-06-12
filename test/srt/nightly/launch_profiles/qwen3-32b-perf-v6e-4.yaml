@@ -1,0 +1,27 @@
+# Qwen3-32B (bf16) on v6e-4, TP4, attention-backend fa. Perf sweep; radix cache
+# disabled so hit-rate cannot skew the baseline.
+name: qwen3_32b-perf-tp4
+target: v6e-4
+model_path: Qwen/Qwen3-32B
+tp_size: 4
+dp_size: 1
+port: 30060
+server_args:
+  - --skip-server-warmup
+  - --random-seed
+  - "3"
+  - --mem-fraction-static
+  - "0.9"
+  - --max-prefill-tokens
+  - "8192"
+  - --download-dir
+  - /dev/shm/
+  - --dtype
+  - bfloat16
+  - --attention-backend
+  - fa
+  - --page-size
+  - "256"
+  - --max-running-requests
+  - "256"
+  - --disable-radix-cache

@@ -201,6 +201,9 @@ class ForwardBatch:
     apply_for_deepstack: bool = False
     deepstack_visual_embedding: jax.Array | None = None
 
+    # Recurrent state indices [batch_size]
+    recurrent_indices: jax.Array | None = None
+
     def tree_flatten(self):
         children = (
             self.input_ids,
@@ -222,6 +225,7 @@ class ForwardBatch:
             self.mrope_positions,
             self.apply_for_deepstack,
             self.deepstack_visual_embedding,
+            self.recurrent_indices,
         )
 
         aux_data = {
@@ -259,13 +263,13 @@ class ForwardBatch:
         obj.lora_ranks = children[11]
         obj.spec_info = children[12]
         obj.expert_location_metadata = children[13]
-
         obj.attention_mask = children[14]
         obj.input_embedding = children[15]
         obj.mrope_positions = children[16]
 
         obj.apply_for_deepstack = children[17]
         obj.deepstack_visual_embedding = children[18]
+        obj.recurrent_indices = children[19]
         return obj
 
     def __repr__(self) -> str:
@@ -293,18 +297,35 @@ class ForwardBatch:
         jax_arrays_str = ", ".join(jax_array_fields)
         return f"ForwardBatch(forward_mode={self.forward_mode}, batch_size={self.batch_size}, {jax_arrays_str})"
 
-    def get_token_valid_mask(self, num_tokens: int) -> jax.Array | None:
+    def get_token_valid_mask(
+        self,
+        num_tokens: int,
+        out_sharding: NamedSharding | None = None,
+    ) -> jax.Array | None:
         """Return a per-token validity mask for padded batches.
 
         Prefer using `out_cache_loc` when available because it aligns with the
         token dimension in both decode and extend: padded tokens are marked as
         `-1` in `out_cache_loc`.
+
+        If ``out_sharding`` is provided, the mask is resharded to it before
+        return (caller's responsibility to construct a 1D sharding compatible
+        with their downstream broadcast operands).
         """
         if self.out_cache_loc is not None and self.out_cache_loc.shape == (num_tokens,):
-            return self.out_cache_loc > 0
-        if self.seq_lens is None or self.seq_lens.ndim != 1 or num_tokens != self.seq_lens.shape[0]:
+            mask = self.out_cache_loc > 0
+        elif (
+            self.seq_lens is not None
+            and self.seq_lens.ndim == 1
+            and num_tokens == self.seq_lens.shape[0]
+        ):
+            mask = self.seq_lens > 0
+        else:
             return None
-        return self.seq_lens > 0
+
+        if out_sharding is not None:
+            mask = jax.sharding.reshard(mask, out_sharding)
+        return mask
 
     @classmethod
     def init_new(
@@ -332,31 +353,19 @@ class ForwardBatch:
                 batch.extend_prefix_lens,
                 batch.extend_seq_lens,
             ),
-            sharding=(
-                NamedSharding(model_runner.mesh, PartitionSpec())
-                if jax.process_count() == 1
-                else None
-            ),
+            sharding=(NamedSharding(model_runner.mesh, PartitionSpec("data"))),
         )
         mrope_positions = None
         if batch.mrope_positions is not None:
             (mrope_positions,) = device_array(
                 (batch.mrope_positions,),
-                sharding=(
-                    NamedSharding(model_runner.mesh, PartitionSpec(None, None))
-                    if jax.process_count() == 1
-                    else None
-                ),
+                sharding=(NamedSharding(model_runner.mesh, PartitionSpec(None, None))),
             )
         input_embedding = None
         if batch.input_embedding is not None:
             (input_embedding,) = device_array(
                 (batch.input_embedding,),
-                sharding=(
-                    NamedSharding(model_runner.mesh, PartitionSpec(None, None))
-                    if jax.process_count() == 1
-                    else None
-                ),
+                sharding=(NamedSharding(model_runner.mesh, PartitionSpec(None, None))),
             )
         if input_embedding is not None:
             input_embedding = input_embedding.astype(jnp.bfloat16)
@@ -372,11 +381,7 @@ class ForwardBatch:
                     batch.lora_token_indices,
                     batch.lora_ranks,
                 ),
-                sharding=(
-                    NamedSharding(model_runner.mesh, PartitionSpec())
-                    if jax.process_count() == 1
-                    else None
-                ),
+                sharding=(NamedSharding(model_runner.mesh, PartitionSpec("data"))),
             )
         else:
             (lora_scalings, lora_token_indices, lora_ranks) = (
@@ -389,16 +394,19 @@ class ForwardBatch:
         if batch.apply_for_deepstack:
             (deepstack_visual_embedding,) = device_array(
                 (batch.deepstack_visual_embedding,),
-                sharding=(
-                    NamedSharding(model_runner.mesh, PartitionSpec(None, None))
-                    if jax.process_count() == 1
-                    else None
-                ),
+                sharding=(NamedSharding(model_runner.mesh, PartitionSpec(None, None))),
             )
         if deepstack_visual_embedding is not None:
             deepstack_visual_embedding = deepstack_visual_embedding.astype(jnp.bfloat16)
 
         expert_location_metadata = get_global_expert_location_metadata()
+
+        recurrent_indices = None
+        if batch.recurrent_indices is not None:
+            (recurrent_indices,) = device_array(
+                (batch.recurrent_indices,),
+                sharding=(NamedSharding(model_runner.mesh, PartitionSpec("data"))),
+            )
 
         obj = cls(
             bid=batch.bid,
@@ -418,13 +426,14 @@ class ForwardBatch:
             lora_token_indices=lora_token_indices,
             lora_ranks=lora_ranks,
             attn_backend=model_runner.attn_backend,
-            spec_info=batch.spec_info,
+            spec_info=batch.spec_info_padded,
             spec_algorithm=batch.spec_algorithm,
             capture_hidden_mode=batch.capture_hidden_mode,
             input_embedding=input_embedding,
             apply_for_deepstack=batch.apply_for_deepstack,
             deepstack_visual_embedding=deepstack_visual_embedding,
             expert_location_metadata=expert_location_metadata,
+            recurrent_indices=recurrent_indices,
         )
 
         # Auto-generate attention mask for Encoder-only models (e.g. UMT5Encoder, BERT)

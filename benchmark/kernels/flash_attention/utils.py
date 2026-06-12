@@ -57,11 +57,12 @@ def create_prefill_uniform_data(
     page_size=128,
     dtype=jnp.bfloat16,
     seed=42,
+    chunk_prefill_size: int = 4096,
 ):
-    if max_num_batched_tokens > 2048:
-        batch_size = cdiv(max_num_batched_tokens, 2048)
-        seq_lens_list = [2048] * (batch_size - 1) + [
-            max_num_batched_tokens - 2048 * (batch_size - 1)
+    if max_num_batched_tokens > chunk_prefill_size:
+        batch_size = cdiv(max_num_batched_tokens, chunk_prefill_size)
+        seq_lens_list = [chunk_prefill_size] * (batch_size - 1) + [
+            max_num_batched_tokens - chunk_prefill_size * (batch_size - 1)
         ]
     else:
         batch_size = 1

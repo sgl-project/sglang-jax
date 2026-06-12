@@ -1,0 +1,274 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 1800" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#334155"/>
+    </marker>
+    <marker id="arrowBlue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#0e7490"/>
+    </marker>
+    <marker id="arrowGreen" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#15803d"/>
+    </marker>
+    <marker id="arrowPurple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#7c3aed"/>
+    </marker>
+    <style>
+      .title    { font-size: 22px; font-weight: 800; fill: #0f172a; }
+      .subtitle { font-size: 13px; fill: #475569; }
+      .phaseTitle { font-size: 18px; font-weight: 700; fill: #0f172a; }
+      .stepTitle { font-size: 15px; font-weight: 700; fill: #0f172a; }
+      .stepSub  { font-size: 13px; fill: #1e293b; }
+      .code     { font-size: 12px; fill: #0f172a; font-family: 'SF Mono', Menlo, Consolas, monospace; }
+      .codeKey  { font-size: 12px; fill: #b45309; font-family: 'SF Mono', Menlo, Consolas, monospace; font-weight: 700; }
+      .edge     { font-size: 12px; fill: #1e293b; font-weight: 600; }
+      .note     { font-size: 11.5px; fill: #64748b; font-style: italic; }
+      .tag      { font-size: 10.5px; font-weight: 700; fill: #ffffff; }
+    </style>
+  </defs>
+
+  <!-- Title -->
+  <text x="40" y="40" class="title">Model Loading &amp; Forward Pipeline</text>
+  <text x="40" y="62" class="subtitle">ModelRunner init → JAX NNX Graph-State separation → JIT compile → Runtime Forward loop</text>
+
+  <!-- ============== PHASE 1: INITIALIZATION ============== -->
+  <g>
+    <rect x="40" y="100" width="700" height="1200" rx="10" fill="#f0f9ff" stroke="#0284c7" stroke-width="3" stroke-dasharray="8,4"/>
+    <text x="60" y="130" class="phaseTitle">Phase 1: Initialization (ModelRunner.__init__ → initialize())</text>
+  </g>
+
+  <!-- Step 1: HF Download -->
+  <g>
+    <rect x="60" y="150" width="660" height="90" rx="8" fill="#dbeafe" stroke="#0284c7" stroke-width="2"/>
+    <rect x="60" y="150" width="660" height="26" rx="8" fill="#0284c7"/>
+    <text x="76" y="168" class="tag">STEP 1 · HuggingFace Model Download</text>
+    <text x="76" y="196" class="stepTitle">DefaultModelLoader.download_model()</text>
+    <text x="76" y="216" class="stepSub">• Download safetensors weight files from HuggingFace Hub</text>
+    <text x="76" y="234" class="stepSub">• Cache locally to <tspan class="code">~/.cache/huggingface/</tspan></text>
+  </g>
+
+  <path d="M 390 240 L 390 270" stroke="#334155" stroke-width="2.5" fill="none" marker-end="url(#arrow)"/>
+
+  <!-- Step 2: Shape-only Model -->
+  <g>
+    <rect x="60" y="278" width="660" height="110" rx="8" fill="#dbeafe" stroke="#0284c7" stroke-width="2"/>
+    <rect x="60" y="278" width="660" height="26" rx="8" fill="#0284c7"/>
+    <text x="76" y="296" class="tag">STEP 2 · Shape-only Model Creation</text>
+    <text x="76" y="322" class="stepTitle">JAXModelLoader._get_model()</text>
+    <text x="76" y="342" class="code">model = nnx.eval_shape(lambda: ModelClass(config, dtype, mesh))</text>
+    <text x="76" y="362" class="stepSub">• Trace parameter shapes only, no actual memory allocation (zero-memory creation)</text>
+    <text x="76" y="380" class="note">nnx.eval_shape is JAX's shape-inference mechanism, avoiding memory peak during init</text>
+  </g>
+
+  <path d="M 390 388 L 390 418" stroke="#334155" stroke-width="2.5" fill="none" marker-end="url(#arrow)"/>
+
+  <!-- Step 3: Quantization (Optional) -->
+  <g>
+    <rect x="60" y="426" width="660" height="90" rx="8" fill="#dbeafe" stroke="#0284c7" stroke-width="2"/>
+    <rect x="60" y="426" width="660" height="26" rx="8" fill="#0284c7"/>
+    <text x="76" y="444" class="tag">STEP 3 · Quantization Restructuring (Optional)</text>
+    <text x="76" y="470" class="stepTitle">apply_moe_quantization() / apply_linear_quantization()</text>
+    <text x="76" y="490" class="stepSub">• Replace <tspan class="code">LinearBase</tspan> with <tspan class="code">QuantizedLinear</tspan></text>
+    <text x="76" y="508" class="note">Only when loading a static-quantized checkpoint</text>
+  </g>
+
+  <path d="M 390 516 L 390 546" stroke="#334155" stroke-width="2.5" fill="none" marker-end="url(#arrow)"/>
+
+  <!-- Step 4: Weight Loading -->
+  <g>
+    <rect x="60" y="554" width="660" height="110" rx="8" fill="#dbeafe" stroke="#0284c7" stroke-width="2"/>
+    <rect x="60" y="554" width="660" height="26" rx="8" fill="#0284c7"/>
+    <text x="76" y="572" class="tag">STEP 4 · Weight Loading</text>
+    <text x="76" y="598" class="stepTitle">model.load_weights(model_config)</text>
+    <text x="76" y="618" class="code">safe_open(file, framework="flax") → jax.device_put(weights)</text>
+    <text x="76" y="638" class="stepSub">• Read weights from safetensors, load directly into device HBM</text>
+    <text x="76" y="656" class="note">Multi-thread loading supported (default 8 threads), accelerates large model init</text>
+  </g>
+
+  <path d="M 390 664 L 390 694" stroke="#15803d" stroke-width="2.5" fill="none" marker-end="url(#arrowGreen)"/>
+  <text x="402" y="686" class="edge">Key transition →</text>
+
+  <!-- Step 5: NNX Split (Graph-State Separation) -->
+  <g>
+    <rect x="60" y="702" width="660" height="150" rx="8" fill="#dcfce7" stroke="#15803d" stroke-width="2"/>
+    <rect x="60" y="702" width="660" height="26" rx="8" fill="#15803d"/>
+    <text x="76" y="720" class="tag">STEP 5 · JAX NNX Graph-State Separation</text>
+    <text x="76" y="746" class="stepTitle">initialize_jit() → nnx.split(model)</text>
+    <text x="76" y="766" class="code">model_def, model_state = nnx.split(self.model)</text>
+    <text x="76" y="786" class="code">state_leaves, state_def = jax.tree_util.tree_flatten(model_state)</text>
+    <text x="76" y="806" class="stepSub">• <tspan class="codeKey">model_def</tspan>: computation graph structure (Static, captured in JIT closure)</text>
+    <text x="76" y="824" class="stepSub">• <tspan class="codeKey">state_leaves</tspan>: weight parameter leaf nodes (Dynamic, JIT inputs)</text>
+    <text x="76" y="842" class="note">Graph-State separation is fundamental to JAX JIT: Module objects can't be JIT'd directly, must split into static graph + dynamic params</text>
+  </g>
+
+  <path d="M 390 852 L 390 882" stroke="#7c3aed" stroke-width="2.5" fill="none" marker-end="url(#arrowPurple)"/>
+
+  <!-- Step 6: JIT Compilation -->
+  <g>
+    <rect x="60" y="890" width="660" height="170" rx="8" fill="#f3e8ff" stroke="#7c3aed" stroke-width="2"/>
+    <rect x="60" y="890" width="660" height="26" rx="8" fill="#7c3aed"/>
+    <text x="76" y="908" class="tag">STEP 6 · JIT Compilation</text>
+    <text x="76" y="934" class="stepTitle">Create jitted_run_model and jitted_sampler</text>
+    <text x="76" y="954" class="code">@jax.jit(donate_argnames=["memory_pools"], static_argnames=["model_state_def"])</text>
+    <text x="76" y="974" class="code">def jitted_run_model(model_def, state_def, state_leaves, forward_batch, ...):</text>
+    <text x="76" y="994" class="code">    model_state = jax.tree_util.tree_unflatten(state_def, state_leaves)</text>
+    <text x="76" y="1014" class="code">    model = nnx.merge(model_def, model_state)  # rebuild Module</text>
+    <text x="76" y="1034" class="code">    return model(forward_batch, memory_pools, logits_metadata)</text>
+    <text x="76" y="1052" class="note">donate_argnames enables in-place KV Cache update (zero-copy); static_argnames avoids recompile on tree-structure change</text>
+  </g>
+
+  <path d="M 390 1060 L 390 1090" stroke="#334155" stroke-width="2.5" fill="none" marker-end="url(#arrow)"/>
+
+  <!-- Step 7: Memory Pool Init -->
+  <g>
+    <rect x="60" y="1098" width="660" height="110" rx="8" fill="#dbeafe" stroke="#0284c7" stroke-width="2"/>
+    <rect x="60" y="1098" width="660" height="26" rx="8" fill="#0284c7"/>
+    <text x="76" y="1116" class="tag">STEP 7 · KV Cache Memory Pool Init</text>
+    <text x="76" y="1142" class="stepTitle">init_memory_pool()</text>
+    <text x="76" y="1162" class="stepSub">• Compute per-token KV Cache footprint (cell_size)</text>
+    <text x="76" y="1180" class="stepSub">• Create <tspan class="code">MHATokenToKVPool</tspan> / <tspan class="code">MLATokenToKVPool</tspan> / <tspan class="code">SWAKVPool</tspan></text>
+    <text x="76" y="1198" class="note">max_total_num_tokens = available_kv_cache_bytes // cell_size</text>
+  </g>
+
+  <path d="M 390 1208 L 390 1238" stroke="#334155" stroke-width="2.5" fill="none" marker-end="url(#arrow)"/>
+
+  <!-- Step 8: Precompilation -->
+  <g>
+    <rect x="60" y="1246" width="660" height="90" rx="8" fill="#dbeafe" stroke="#0284c7" stroke-width="2"/>
+    <rect x="60" y="1246" width="660" height="26" rx="8" fill="#0284c7"/>
+    <text x="76" y="1264" class="tag">STEP 8 · Shape Bucketing Precompile</text>
+    <text x="76" y="1290" class="stepTitle">Trigger JIT compilation in advance for common bucket sizes</text>
+    <text x="76" y="1310" class="stepSub">• Extend: [64, 128, 256, 512, 1024, 2048, 4096, 8192]</text>
+    <text x="76" y="1328" class="stepSub">• Decode: [1, 2, 4, 8, 16, 32, 64, 128, 256]</text>
+  </g>
+
+  <!-- ============== PHASE 2: RUNTIME FORWARD ============== -->
+  <g>
+    <rect x="820" y="100" width="740" height="1200" rx="10" fill="#fef3c7" stroke="#b45309" stroke-width="3" stroke-dasharray="8,4"/>
+    <text x="840" y="130" class="phaseTitle">Phase 2: Runtime Forward Loop</text>
+  </g>
+
+  <!-- Runtime Step 1: ModelWorkerBatch -->
+  <g>
+    <rect x="840" y="150" width="700" height="100" rx="8" fill="#fef3c7" stroke="#b45309" stroke-width="2"/>
+    <rect x="840" y="150" width="700" height="26" rx="8" fill="#b45309"/>
+    <text x="856" y="168" class="tag">RUNTIME 1 · Scheduler Builds Batch</text>
+    <text x="856" y="196" class="stepTitle">Scheduler.get_next_batch_to_run() → ModelWorkerBatch</text>
+    <text x="856" y="216" class="stepSub">• CPU-side data: <tspan class="code">input_ids, req_pool_indices, seq_lens, positions, ...</tspan></text>
+    <text x="856" y="236" class="note">See 03-scheduler.md for batch building flow</text>
+  </g>
+
+  <path d="M 1190 250 L 1190 280" stroke="#0e7490" stroke-width="2.5" fill="none" marker-end="url(#arrowBlue)"/>
+
+  <!-- Runtime Step 2: ForwardBatch.init_new() -->
+  <g>
+    <rect x="840" y="288" width="700" height="120" rx="8" fill="#cffafe" stroke="#0e7490" stroke-width="2"/>
+    <rect x="840" y="288" width="700" height="26" rx="8" fill="#0e7490"/>
+    <text x="856" y="306" class="tag">RUNTIME 2 · CPU → Device Transfer</text>
+    <text x="856" y="332" class="stepTitle">ForwardBatch.init_new(batch, model_runner)</text>
+    <text x="856" y="352" class="code">jax.device_put(input_ids, NamedSharding(mesh, PartitionSpec()))</text>
+    <text x="856" y="372" class="stepSub">• Convert CPU numpy arrays to device-side JAX Array</text>
+    <text x="856" y="390" class="stepSub">• Apply TP Sharding (e.g. <tspan class="code">P("tensor")</tspan> shards along Head dim)</text>
+  </g>
+
+  <path d="M 1190 408 L 1190 438" stroke="#15803d" stroke-width="2.5" fill="none" marker-end="url(#arrowGreen)"/>
+
+  <!-- Runtime Step 3: Attention Metadata -->
+  <g>
+    <rect x="840" y="446" width="700" height="90" rx="8" fill="#dcfce7" stroke="#15803d" stroke-width="2"/>
+    <rect x="840" y="446" width="700" height="26" rx="8" fill="#15803d"/>
+    <text x="856" y="464" class="tag">RUNTIME 3 · Attention Metadata Computation</text>
+    <text x="856" y="490" class="stepTitle">attn_backend.get_forward_metadata(forward_batch)</text>
+    <text x="856" y="510" class="stepSub">• FlashAttention: compute <tspan class="code">q_seq_lens, kv_seq_lens, block_tables</tspan></text>
+    <text x="856" y="528" class="note">MLA Backend computes Latent KV metadata</text>
+  </g>
+
+  <path d="M 1190 536 L 1190 566" stroke="#7c3aed" stroke-width="2.5" fill="none" marker-end="url(#arrowPurple)"/>
+  <text x="1202" y="558" class="edge">JIT Forward →</text>
+
+  <!-- Runtime Step 4: jitted_run_model -->
+  <g>
+    <rect x="840" y="574" width="700" height="170" rx="8" fill="#f3e8ff" stroke="#7c3aed" stroke-width="2"/>
+    <rect x="840" y="574" width="700" height="26" rx="8" fill="#7c3aed"/>
+    <text x="856" y="592" class="tag">RUNTIME 4 · Model Forward Inference</text>
+    <text x="856" y="618" class="stepTitle">model_runner.forward() → jitted_run_model(...)</text>
+    <text x="856" y="638" class="code">model = nnx.merge(model_def, state)  # rebuild Module</text>
+    <text x="856" y="658" class="code">output, layers_kv_fused, _, layers_topk_ids = model(forward_batch, ...)</text>
+    <text x="856" y="678" class="stepSub">• Execute Transformer Forward (Attention + FFN/MoE)</text>
+    <text x="856" y="698" class="stepSub">• In-place KV Cache update via Pallas Kernel (donate_argnames)</text>
+    <text x="856" y="718" class="stepSub">• Returns Logits and updated KV Buffer</text>
+    <text x="856" y="736" class="note">Shape Bucketing: pad input to nearest power of 2 (64, 128, 256, ...) to avoid recompile</text>
+  </g>
+
+  <path d="M 1190 744 L 1190 774" stroke="#334155" stroke-width="2.5" fill="none" marker-end="url(#arrow)"/>
+
+  <!-- Runtime Step 5: Sampling -->
+  <g>
+    <rect x="840" y="782" width="700" height="130" rx="8" fill="#fef3c7" stroke="#b45309" stroke-width="2"/>
+    <rect x="840" y="782" width="700" height="26" rx="8" fill="#b45309"/>
+    <text x="856" y="800" class="tag">RUNTIME 5 · Sampling</text>
+    <text x="856" y="826" class="stepTitle">model_runner.sample(logits_output, sampling_metadata)</text>
+    <text x="856" y="846" class="code">jitted_sampler(logits, temperatures, top_ps, top_ks, ...)</text>
+    <text x="856" y="866" class="stepSub">• Top-p / Top-k / Temperature Sampling</text>
+    <text x="856" y="886" class="stepSub">• Returns <tspan class="code">next_token_ids</tspan> (device-side JAX Array)</text>
+    <text x="856" y="904" class="note">RNG strategy: jax.random.fold_in(base_key, step) avoids Host-Device sync</text>
+  </g>
+
+  <path d="M 1190 912 L 1190 942" stroke="#334155" stroke-width="2.5" fill="none" marker-end="url(#arrow)"/>
+
+  <!-- Runtime Step 6: D2H Transfer -->
+  <g>
+    <rect x="840" y="950" width="700" height="90" rx="8" fill="#fef3c7" stroke="#b45309" stroke-width="2"/>
+    <rect x="840" y="950" width="700" height="26" rx="8" fill="#b45309"/>
+    <text x="856" y="968" class="tag">RUNTIME 6 · Device → CPU Transfer</text>
+    <text x="856" y="994" class="stepTitle">next_token_ids.copy_to_host_async()</text>
+    <text x="856" y="1014" class="stepSub">• Asynchronously transfer Token IDs to CPU (needed by Detokenizer)</text>
+    <text x="856" y="1032" class="note">Overlap mode: uses Future Token ID mechanism, Scheduler need not wait for transfer</text>
+  </g>
+
+  <path d="M 1190 1040 L 1190 1070" stroke="#334155" stroke-width="2.5" fill="none" marker-end="url(#arrow)"/>
+
+  <!-- Runtime Step 7: Loop -->
+  <g>
+    <rect x="840" y="1078" width="700" height="90" rx="8" fill="#fef3c7" stroke="#b45309" stroke-width="2"/>
+    <rect x="840" y="1078" width="700" height="26" rx="8" fill="#b45309"/>
+    <text x="856" y="1096" class="tag">RUNTIME 7 · Loop</text>
+    <text x="856" y="1122" class="stepTitle">Scheduler appends next_token_ids to sequence</text>
+    <text x="856" y="1142" class="stepSub">• Update <tspan class="code">req.output_ids</tspan>, check EOS</text>
+    <text x="856" y="1160" class="stepSub">• Return to RUNTIME 1, build next Decode Batch</text>
+  </g>
+
+  <!-- Connecting arrow from Phase 1 to Phase 2 -->
+  <path d="M 730 700 L 845 700" stroke="#15803d" stroke-width="3" fill="none" marker-end="url(#arrowGreen)" stroke-dasharray="6,3"/>
+  <rect x="747" y="678" width="80" height="20" rx="4" fill="#ffffff" stroke="#15803d" stroke-width="1"/>
+  <text x="787" y="692" class="edge" fill="#15803d" text-anchor="middle">Init done</text>
+
+  <!-- Footer notes -->
+  <g>
+    <rect x="40" y="1340" width="1520" height="420" rx="10" fill="#e0e7ff" stroke="#4f46e5" stroke-width="2"/>
+    <rect x="40" y="1340" width="1520" height="28" rx="10" fill="#4f46e5"/>
+    <text x="56" y="1360" class="tag">Key Design Notes</text>
+
+    <text x="56" y="1392" class="stepTitle">Why Graph-State separation?</text>
+    <text x="56" y="1412" class="stepSub">• JAX JIT requires inputs to be pure pytrees (arrays + nested containers); Flax NNX Module is a Python object with methods, can't be JIT'd directly</text>
+    <text x="56" y="1430" class="stepSub">• <tspan class="code">nnx.split()</tspan> splits Module into static graph (<tspan class="codeKey">model_def</tspan>, captured in closure) and dynamic params (<tspan class="codeKey">state_leaves</tspan>, JIT inputs)</text>
+    <text x="56" y="1448" class="stepSub">• Inside JIT, <tspan class="code">nnx.merge(model_def, state)</tspan> rebuilds the Module to execute Forward</text>
+
+    <text x="56" y="1476" class="stepTitle">Why flatten params into a leaf list?</text>
+    <text x="56" y="1496" class="stepSub">• <tspan class="code">jax.tree_util.tree_flatten(model_state)</tspan> flattens the param tree into <tspan class="codeKey">state_leaves</tspan> (leaf list) + <tspan class="codeKey">state_def</tspan> (tree structure def)</text>
+    <text x="56" y="1514" class="stepSub">• Exposing the leaf list enables the following features:</text>
+    <text x="76" y="1532" class="stepSub">1. LoRA weight hot-swap — directly replace array references in <tspan class="code">state_leaves</tspan>, no re-JIT needed</text>
+    <text x="76" y="1550" class="stepSub">2. EPLB Expert relocation — dynamically reassign expert weights at runtime</text>
+    <text x="76" y="1568" class="stepSub">3. KV Cache in-place update — <tspan class="code">donate_argnames=["memory_pools"]</tspan> transfers buffer ownership to XLA, zero-copy write</text>
+    <text x="76" y="1586" class="stepSub">4. Avoid recompile — <tspan class="code">state_def</tspan> marked as <tspan class="code">static_argnames</tspan>; as long as tree structure is unchanged (only array values change), JIT cache always hits</text>
+
+    <text x="56" y="1614" class="stepTitle">Shape Bucketing Strategy</text>
+    <text x="56" y="1634" class="stepSub">• JAX JIT caches compiled artifacts keyed by input shape; each new shape triggers a full compile (seconds to minutes on TPU)</text>
+    <text x="56" y="1652" class="stepSub">• Pad inputs to predefined power-of-2 buckets (64, 128, 256, 512, ...), reducing possible shape count from O(N) to O(log N)</text>
+    <text x="56" y="1670" class="stepSub">• Powers of 2 align with TPU hardware tile size (128/256), avoiding extra Pad/Unpad instructions inserted by XLA</text>
+
+    <text x="56" y="1698" class="stepTitle">Runtime Forward Loop</text>
+    <text x="56" y="1718" class="stepSub">• Prefill phase: process full prompt at once (Extend Mode), write KV Cache</text>
+    <text x="56" y="1736" class="stepSub">• Decode phase: generate token-by-token (Decode Mode); each Forward only processes 1 new token, reusing cached KV</text>
+  </g>
+</svg>

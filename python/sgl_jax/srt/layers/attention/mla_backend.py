@@ -92,18 +92,30 @@ class MLAAttentionBackend(AttentionBackend):
         v_head_dim: int,
         page_size: int = 1,
         mesh: jax.sharding.Mesh = None,
-        vmem_limit_bytes: int = 100 * (1 << 20),
-        num_kv_pages_per_block: tuple[int, int, int] = (3, 1, 1),
-        num_queries_per_block: tuple[int, int, int] = (1, 16, 16),
+        attention_data_partition_axis: str = "data",
+        vmem_limit_bytes: int | None = None,
+        # Default block params to None so the kernel's auto-tuned-table
+        # lookup path triggers (see kernel.py mla_ragged_paged_attention
+        # entry). Callers (e.g. accuracy tests) can still pass explicit
+        # tuples to bypass lookup.
+        num_kv_pages_per_block: tuple[int, int, int] | None = None,
+        num_queries_per_block: tuple[int, int, int] | None = None,
         # decode_batch_size: kernel-internal microbatch for the BATCHED_DECODE
         # branch. The v2 kernel runs `floor(num_decode_seqs / decode_batch_size)
         # * decode_batch_size` requests through a batched path (q_len=1, q-tile
         # of size `decode_batch_size`) to keep the MXU busy on MLA's MQA-on-
         # latent decode (single q row per seq otherwise underutilizes the q
         # axis); the remainder falls back to per-seq decode.
-        # TODO(tuner): hardcoded 4, matches upstream — should be autotuned.
+        # When num_kv_pages_per_block is None, the kernel's lookup path also
+        # overrides this with the tuned value if the "decode" entry hits.
         decode_batch_size: int = 4,
     ):
+        assert page_size > 1, (
+            "MLA attention backend does not support page_size=1. "
+            "The MLA v2 kernel packs KV slots and infers the effective page size "
+            "from cache_kv.shape[1] * kv_packing, which makes page_size=1 "
+            "inconsistent with allocator and metadata page semantics."
+        )
         self.num_heads = num_attn_heads
         self.kv_lora_rank = kv_lora_rank
         self.qk_nope_head_dim = qk_nope_head_dim
@@ -111,6 +123,11 @@ class MLAAttentionBackend(AttentionBackend):
         self.v_head_dim = v_head_dim
         self.page_size = page_size
         self.mesh = mesh
+        self.attention_data_partition_axis = attention_data_partition_axis
+        if vmem_limit_bytes is None:
+            from jax.experimental.pallas import tpu as pltpu
+
+            vmem_limit_bytes = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.9)
         self.vmem_limit_bytes = vmem_limit_bytes
         self.num_kv_pages_per_block = num_kv_pages_per_block
         self.num_queries_per_block = num_queries_per_block
@@ -119,23 +136,44 @@ class MLAAttentionBackend(AttentionBackend):
         self.forward_metadata = nnx.data(MLAAttentionMetadata())
 
     def get_forward_metadata(self, batch: ModelWorkerBatch):
-        """Build per-batch metadata. Mirrors `FlashAttention.get_forward_metadata`
-        without the SWA / custom_mask branches.
+        """Build per-batch metadata, DP-aware.
+
+        Mirrors `FlashAttention.get_forward_metadata`: reshapes all per-request
+        arrays to `(dp_size, per_dp_bs_size)` and computes cumsums per DP rank
+        so each rank's metadata is independent.
         """
         metadata = MLAAttentionMetadata()
 
-        indices = np.arange(0, len(batch.cache_loc), self.page_size)
-        page_indices = (batch.cache_loc[indices] // self.page_size).astype(np.int32)
+        if batch.dp_size <= 0:
+            raise ValueError(f"Invalid dp_size: {batch.dp_size}")
+        if batch.per_dp_bs_size <= 0:
+            raise ValueError(f"Invalid per_dp_bs_size: {batch.per_dp_bs_size}")
+        if batch.per_dp_bs_size * batch.dp_size != len(batch.seq_lens):
+            raise ValueError(
+                "Inconsistent DP batch metadata: expected per_dp_bs_size * dp_size == len(seq_lens), "
+                f"got {batch.per_dp_bs_size} * {batch.dp_size} != {len(batch.seq_lens)}"
+            )
+        if len(batch.cache_loc) % batch.dp_size != 0:
+            raise ValueError(
+                "Inconsistent cache_loc layout for DP sharding: "
+                f"len(cache_loc)={len(batch.cache_loc)} is not divisible by dp_size={batch.dp_size}"
+            )
+
+        total_loc_len = len(batch.cache_loc)
+        per_dp_loc_len = total_loc_len // batch.dp_size
+
+        cache_loc_2d = batch.cache_loc.reshape(batch.dp_size, per_dp_loc_len)
+        strided_2d = cache_loc_2d[:, :: self.page_size]
+        page_indices = (strided_2d // self.page_size).ravel()
 
         if batch.forward_mode == ForwardMode.EXTEND:
-            cu_q_lens = np.concatenate(
-                [
-                    np.array([0], dtype=np.int32),
-                    np.cumsum(batch.extend_seq_lens, dtype=np.int32),
-                ]
-            )
+            ext_2d = batch.extend_seq_lens.reshape(batch.dp_size, batch.per_dp_bs_size)
+            cu_q_2d = np.zeros((batch.dp_size, batch.per_dp_bs_size + 1), dtype=np.int32)
+            cu_q_2d[:, 1:] = np.cumsum(ext_2d, axis=1)
+            cu_q_lens = cu_q_2d.ravel()
         elif batch.forward_mode == ForwardMode.DECODE:
-            cu_q_lens = np.arange(len(batch.seq_lens) + 1, dtype=np.int32)
+            single_cu = np.arange(batch.per_dp_bs_size + 1, dtype=np.int32)
+            cu_q_lens = np.tile(single_cu, batch.dp_size)
         else:
             raise ValueError(f"Invalid forward mode: {batch.forward_mode}")
 
@@ -143,20 +181,20 @@ class MLAAttentionBackend(AttentionBackend):
         aligned_seq_lens = (
             (batch.seq_lens + self.page_size - 1) // self.page_size
         ) * self.page_size
-        cu_kv_lens = np.concatenate(
-            [
-                np.array([0], dtype=np.int32),
-                np.cumsum(aligned_seq_lens, dtype=np.int32),
-            ]
-        )
 
-        num_seqs = np.sum(batch.seq_lens > 0, dtype=np.int32)
+        aligned_2d = aligned_seq_lens.reshape(batch.dp_size, batch.per_dp_bs_size)
+        cu_kv_2d = np.zeros((batch.dp_size, batch.per_dp_bs_size + 1), dtype=np.int32)
+        cu_kv_2d[:, 1:] = np.cumsum(aligned_2d, axis=1)
+        cu_kv_lens = cu_kv_2d.ravel()
+
+        seq_lens_2d = batch.seq_lens.reshape(batch.dp_size, batch.per_dp_bs_size)
+        local_num_seqs = np.sum(seq_lens_2d > 0, axis=1, dtype=np.int32)
         if batch.forward_mode == ForwardMode.DECODE:
-            distribution = np.array([num_seqs, num_seqs, num_seqs], dtype=np.int32)
+            distribution = np.repeat(local_num_seqs, 3)
         elif batch.forward_mode == ForwardMode.EXTEND:
-            # MLA v2 kernel skips the chunked-prefill-only branch (sequences[i:j]);
-            # route all extend seqs through the mixed branch (sequences[j:k]).
-            distribution = np.array([0, 0, num_seqs], dtype=np.int32)
+            distribution = np.column_stack(
+                [np.zeros_like(local_num_seqs), np.zeros_like(local_num_seqs), local_num_seqs]
+            ).ravel()
         else:
             raise ValueError(f"Invalid forward mode: {batch.forward_mode}")
 
@@ -168,7 +206,7 @@ class MLAAttentionBackend(AttentionBackend):
             metadata.distribution,
         ) = device_array(
             (cu_q_lens, cu_kv_lens, page_indices, seq_lens, distribution),
-            sharding=(NamedSharding(self.mesh, P()) if jax.process_count() == 1 else None),
+            sharding=(NamedSharding(self.mesh, P(self.attention_data_partition_axis))),
         )
         return metadata
 
@@ -181,6 +219,8 @@ class MLAAttentionBackend(AttentionBackend):
             "qk_rope_head_dim": self.qk_rope_head_dim,
             "v_head_dim": self.v_head_dim,
             "page_size": self.page_size,
+            "mesh": self.mesh,
+            "attention_data_partition_axis": self.attention_data_partition_axis,
             "vmem_limit_bytes": self.vmem_limit_bytes,
             "num_kv_pages_per_block": self.num_kv_pages_per_block,
             "num_queries_per_block": self.num_queries_per_block,
@@ -197,7 +237,8 @@ class MLAAttentionBackend(AttentionBackend):
             qk_rope_head_dim=aux_data["qk_rope_head_dim"],
             v_head_dim=aux_data["v_head_dim"],
             page_size=aux_data["page_size"],
-            mesh=None,
+            mesh=aux_data.get("mesh"),
+            attention_data_partition_axis=aux_data.get("attention_data_partition_axis", "data"),
             vmem_limit_bytes=aux_data["vmem_limit_bytes"],
             num_kv_pages_per_block=aux_data["num_kv_pages_per_block"],
             num_queries_per_block=aux_data["num_queries_per_block"],
@@ -264,21 +305,23 @@ class MLAAttentionBackend(AttentionBackend):
         sliding_window = layer.sliding_window_size if layer is not None else None
         soft_cap = layer.logit_cap if layer is not None else None
 
+        dpa = self.attention_data_partition_axis
+
         in_specs = (
-            P(None, "tensor", None),  # ql_nope    [T, n_h/tp, lkv]
-            P(None, "tensor", None),  # q_pe       [T, n_h/tp, r]
-            P(None, None),  # new_kv_c   [T, lkv]  (replicated — single latent)
-            P(None, None),  # new_k_pe   [T, r]    (replicated)
-            P(None, None, None, None),  # cache (replicated, RFC §3.1)
-            P(),  # seq_lens
-            P(),  # page_indices
-            P(),  # cu_q_lens
-            P(),  # cu_kv_lens
-            P(),  # distribution
+            P(dpa, "tensor", None),  # ql_nope    [T, n_h/tp, lkv]
+            P(dpa, "tensor", None),  # q_pe       [T, n_h/tp, r]
+            P(dpa, None),  # new_kv_c   [T, lkv]  (single latent, no head axis)
+            P(dpa, None),  # new_k_pe   [T, r]    (single latent)
+            P(dpa, None, None, None),  # cache (page axis sharded by data)
+            P(dpa),  # seq_lens
+            P(dpa),  # page_indices
+            P(dpa),  # cu_q_lens
+            P(dpa),  # cu_kv_lens
+            P(dpa),  # distribution
         )
         out_specs = (
-            P(None, "tensor", None),  # o_latent       [T, n_h/tp, lkv]
-            P(None, None, None, None),  # updated cache  4D (replicated)
+            P(dpa, "tensor", None),  # o_latent       [T, n_h/tp, lkv]
+            P(dpa, None, None, None),  # updated cache  4D
         )
 
         def _run(

@@ -1,0 +1,25 @@
+name: kimi_linear-hybrid_linear-tp4
+target: v6e-4
+model_path: moonshotai/Kimi-Linear-48B-A3B-Instruct
+tp_size: 4
+dp_size: 1
+port: 30040
+server_args:
+  - --skip-server-warmup
+  - --random-seed
+  - "3"
+  - --mem-fraction-static
+  - "0.85"
+  - --max-prefill-tokens
+  - "4096"
+  - --download-dir
+  - /dev/shm/
+  - --dtype
+  - bfloat16
+  - --attention-backend
+  - fa
+  - --page-size
+  - "256"
+  - --max-running-requests
+  - "64"
+  - --disable-radix-cache

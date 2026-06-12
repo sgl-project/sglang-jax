@@ -93,6 +93,41 @@ class NDRotaryEmbedding(nnx.Module):
                 )
             )
 
+    def forward_from_positions(self, pos: jax.Array) -> tuple[jax.Array, jax.Array]:
+        """
+        Calculates n-d rotary embeddings for explicit token coordinates.
+
+        Args:
+            pos: Tensor of shape [num_tokens, ndim] containing the coordinate of
+                each token on every rotary axis.
+
+        Returns:
+            A tuple of (cos, sin) tensors compatible with FLUX rotary apply.
+        """
+        if pos.ndim != 2:
+            raise ValueError(
+                "pos must have shape [num_tokens, ndim] for NDRotaryEmbedding. "
+                f"Got shape {pos.shape}."
+            )
+        if pos.shape[1] != self.ndim:
+            raise ValueError(f"Expected pos.shape[1] == {self.ndim}, got {pos.shape[1]}.")
+
+        cos_list = []
+        sin_list = []
+        pos = pos.astype(self.dtype)
+
+        for axis_idx in range(self.ndim):
+            cos_1d, sin_1d = self.rope_generators[axis_idx](pos[:, axis_idx])
+            cos_list.append(cos_1d)
+            sin_list.append(sin_1d)
+
+        cos = jnp.concatenate(cos_list, axis=-1)
+        sin = jnp.concatenate(sin_list, axis=-1)
+        return cos.astype(jnp.float32), sin.astype(jnp.float32)
+
+    def __call__(self, pos: jax.Array) -> tuple[jax.Array, jax.Array]:
+        return self.forward_from_positions(pos)
+
     def forward_from_grid(
         self,
         grid_size: tuple[int, ...],

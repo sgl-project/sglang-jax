@@ -58,9 +58,6 @@ class TestToolCalls(CustomTestCase):
                 "--tp-size",
                 "4",
             ],
-            env={
-                "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
-            },
         )
         cls.base_url += "/v1"
         cls.tokenizer = get_tokenizer(QWEN3_CODER_30B_A3B_INSTRUCT, trust_remote_code=True)

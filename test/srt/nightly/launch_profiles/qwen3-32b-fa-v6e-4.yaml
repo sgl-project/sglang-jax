@@ -1,0 +1,27 @@
+# Qwen3-32B dense on v6e-4, TP4, fa — correctness gate for the perf sweep's 32B
+# config (same model/TP/precision/attention). Runtime knobs (max-running-requests,
+# radix cache) follow accuracy convention; they affect throughput, not correctness.
+name: qwen3_32b-fa-tp4
+target: v6e-4
+model_path: Qwen/Qwen3-32B
+tp_size: 4
+dp_size: 1
+port: 30011
+server_args:
+  - --skip-server-warmup
+  - --random-seed
+  - "3"
+  - --download-dir
+  - /dev/shm/
+  - --dtype
+  - bfloat16
+  - --page-size
+  - "256"
+  - --attention-backend
+  - fa
+  - --mem-fraction-static
+  - "0.9"
+  - --max-prefill-tokens
+  - "8192"
+  - --max-running-requests
+  - "128"

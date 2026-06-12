@@ -1,0 +1,447 @@
+"""Standalone A/B serving benchmark for HiCache Stage 1 (S1c).
+
+Compares three cache configurations on a single TPU pod:
+  - ``no-cache``  (``--disable-radix-cache``): no prefix reuse, the floor.
+  - ``radix``     (default RadixCache): the current production baseline.
+  - ``unified``   (``--enable-unified-radix-tree``): the S1c UnifiedRadixCache.
+
+For each (config x workload) it launches one server, runs ``bench_serving``
+``--repeats`` times (cold each rep via ``/flush_cache``), drops the first
+``--drop-first`` warmup reps, then reports pooled TTFT percentiles, mean+/-std
+throughput, and mean cache-hit-rate, plus a few soft acceptance checks.
+
+This is M1 throughput/TTFT evidence for S1c. It is run MANUALLY on a v6e-4
+host (e.g. sky-yh-v6e4); it is NOT registered in CI. Servers are launched
+sequentially -- one TPU pod, never two servers at once.
+
+Usage (on the TPU host, from the repo root)::
+
+    python benchmark/hicache/bench_unified_radix_ab.py \
+        --model Qwen/Qwen3-8B --tp-size 4 --page-size 128 --port 20000 \
+        --configs no-cache radix unified --workloads random gsp \
+        --output-json /tmp/s1c_ab.json
+
+MoE usage (Qwen3-MoE under tp/ep/dp)::
+
+    python benchmark/hicache/bench_unified_radix_ab.py \
+        --model /models/Qwen3-30B-A3B --tp-size 4 --ep-size 4 --moe-backend epmoe \
+        --page-size 256 --configs radix unified --output-json /tmp/moe_ab.json
+
+Multi-chip note:
+    --tp-size is the TOTAL chip count; --dp-size sub-partitions it (attention runs
+    at tp_size // dp_size). At --tp-size > 1, --precompile-bs-paddings values must be
+    divisible by --tp-size (validated at startup): a decode batch not divisible by the
+    device count hits a pre-existing tp>1 sampler lax.cond sharding bug. Widen the set
+    to cover higher --max-concurrency.
+
+GSP disk-cache warning:
+    The generated-shared-prefix dataset is pickled under ``~/.cache/sglang``
+    keyed by the GSP shape, ``--seed``, and tokenizer *class* (not the model), so
+    switching models with the same tokenizer class reuses stale prompts -- use a
+    fresh ``--seed`` or cache dir.
+"""
+
+import argparse
+import json
+import time
+
+import numpy as np
+
+CONFIG_ARGS = {
+    "no-cache": ["--disable-radix-cache"],
+    "radix": [],
+    "unified": ["--enable-unified-radix-tree"],
+}
+
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        description="A/B serving benchmark: no-cache / RadixCache / UnifiedRadixCache (S1c).",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    p.add_argument("--model", default="Qwen/Qwen3-8B")
+    p.add_argument("--tp-size", type=int, default=4)
+    p.add_argument("--ep-size", type=int, default=1)
+    p.add_argument("--dp-size", type=int, default=1)
+    p.add_argument("--moe-backend", default=None, help="e.g. epmoe; emitted only when set")
+    p.add_argument("--page-size", type=int, default=128)
+    p.add_argument("--port", type=int, default=20000)
+    p.add_argument("--repeats", type=int, default=5)
+    p.add_argument("--drop-first", type=int, default=2)
+    p.add_argument(
+        "--configs",
+        nargs="+",
+        choices=["no-cache", "radix", "unified"],
+        default=["no-cache", "radix", "unified"],
+    )
+    p.add_argument(
+        "--workloads",
+        nargs="+",
+        choices=["random", "gsp"],
+        default=["random", "gsp"],
+    )
+    p.add_argument("--max-concurrency", type=int, default=64)
+    p.add_argument("--num-prompts", type=int, default=256)
+    p.add_argument("--random-input-len", type=int, default=1024)
+    p.add_argument("--random-output-len", type=int, default=128)
+    p.add_argument("--gsp-num-groups", type=int, default=16)
+    p.add_argument("--gsp-prompts-per-group", type=int, default=8)
+    p.add_argument("--gsp-system-prompt-len", type=int, default=2048)
+    p.add_argument("--gsp-question-len", type=int, default=128)
+    p.add_argument("--gsp-output-len", type=int, default=128)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--mem-fraction-static", type=float, default=0.8)
+    p.add_argument("--attention-backend", default="fa")
+    p.add_argument(
+        "--precompile-bs-paddings",
+        nargs="+",
+        type=int,
+        default=[8, 16, 32, 64],
+        help=(
+            "Decode batch buckets the running batch pads up to. At --tp-size > 1 "
+            "every value must be divisible by --tp-size (a non-divisible decode "
+            "batch hits a pre-existing tp>1 sampler sharding bug); cover the "
+            "concurrency range."
+        ),
+    )
+    p.add_argument(
+        "--precompile-token-paddings",
+        nargs="+",
+        type=int,
+        default=[2048],
+        help="Prefill token buckets to precompile (off-bucket shapes JIT on demand).",
+    )
+    p.add_argument("--output-json", default=None)
+    p.add_argument(
+        "--strict",
+        action="store_true",
+        help="Exit non-zero if any soft-target check fails.",
+    )
+    p.add_argument(
+        "--dataset-random-ids",
+        action="store_true",
+        help=(
+            "Use dataset_name 'random-ids' instead of 'random' (synthetic token "
+            "ids) when the host has no ShareGPT access."
+        ),
+    )
+    args = p.parse_args()
+    assert args.page_size >= 128, f"--page-size must be >= 128, got {args.page_size}"
+    if args.tp_size > 1:
+        bad = [b for b in args.precompile_bs_paddings if b % args.tp_size != 0]
+        assert not bad, (
+            f"--precompile-bs-paddings {bad} not divisible by --tp-size "
+            f"{args.tp_size} (hits the tp>1 sampler sharding bug)"
+        )
+    return args
+
+
+def _per_run_args(args, base_url, workload):
+    """Build a per-run bench_serving SimpleNamespace via get_benchmark_args."""
+    from sgl_jax.test.test_utils import get_benchmark_args
+
+    if workload == "random":
+        run_args = get_benchmark_args(
+            base_url=base_url,
+            dataset_name="random-ids" if args.dataset_random_ids else "random",
+            device="tpu",
+            tokenizer=args.model,
+            num_prompts=args.num_prompts,
+            random_input_len=args.random_input_len,
+            random_output_len=args.random_output_len,
+            random_range_ratio=1.0,
+            max_concurrency=args.max_concurrency,
+            seed=args.seed,
+            warmup_requests=1,
+        )
+    elif workload == "gsp":
+        num_prompts = args.gsp_num_groups * args.gsp_prompts_per_group
+        run_args = get_benchmark_args(
+            base_url=base_url,
+            dataset_name="generated-shared-prefix",
+            device="tpu",
+            tokenizer=args.model,
+            num_prompts=num_prompts,
+            max_concurrency=args.max_concurrency,
+            seed=args.seed,
+            warmup_requests=1,
+            gsp_num_groups=args.gsp_num_groups,
+            gsp_prompts_per_group=args.gsp_prompts_per_group,
+            gsp_system_prompt_len=args.gsp_system_prompt_len,
+            gsp_question_len=args.gsp_question_len,
+            gsp_output_len=args.gsp_output_len,
+            gsp_range_ratio=1.0,
+        )
+    else:
+        raise ValueError(f"unknown workload {workload!r}")
+
+    # run_benchmark always appends a per-run JSONL; metrics come from its return
+    # value, so /dev/null avoids stray files without losing data.
+    run_args.output_file = "/dev/null"
+    run_args.flush_cache = True  # flush after warmup -> each rep starts cold
+    return run_args
+
+
+def run_config(args, config):
+    """Launch one server for ``config`` and run all workloads x repeats."""
+    from sgl_jax.bench_serving import run_benchmark
+    from sgl_jax.srt.utils import kill_process_tree
+    from sgl_jax.test.test_utils import popen_launch_server
+
+    base_url = f"http://127.0.0.1:{args.port}"
+    common = [
+        "--trust-remote-code",
+        "--skip-server-warmup",
+        "--dtype",
+        "bfloat16",
+        "--random-seed",
+        "3",
+        "--mem-fraction-static",
+        str(args.mem_fraction_static),
+        "--max-running-requests",
+        "256",
+        "--page-size",
+        str(args.page_size),
+        "--tp-size",
+        str(args.tp_size),
+        "--attention-backend",
+        args.attention_backend,
+        "--download-dir",
+        "/dev/shm/",
+    ]
+    common += ["--precompile-bs-paddings", *[str(b) for b in args.precompile_bs_paddings]]
+    common += ["--precompile-token-paddings", *[str(t) for t in args.precompile_token_paddings]]
+    # Emit parallelism/MoE flags only when set, so the default dense command stays
+    # byte-identical and main-compatible. --tp-size is the TOTAL chip count;
+    # --dp-size sub-partitions it (attention runs at tp_size // dp_size).
+    if args.dp_size > 1:
+        common += ["--dp-size", str(args.dp_size)]
+    if args.ep_size > 1:
+        common += ["--ep-size", str(args.ep_size)]
+    if args.moe_backend:
+        common += ["--moe-backend", args.moe_backend]
+
+    # config -> {workload -> [res dict per rep]}
+    results = {w: [] for w in args.workloads}
+
+    process = popen_launch_server(
+        args.model,
+        base_url=base_url,
+        timeout=1800,
+        other_args=common + CONFIG_ARGS[config],
+        check_cache_miss=False,
+        # A stray SGLANG_JAX_ENABLE_UNIFIED_RADIX_TREE=1 in the caller's env
+        # would silently turn the baselines into unified (env can only force
+        # the flag ON); pin it off -- "unified" gets the flag via CLI.
+        env={"SGLANG_JAX_ENABLE_UNIFIED_RADIX_TREE": "0"},
+    )
+    try:
+        for workload in args.workloads:
+            for rep in range(args.repeats):
+                print(
+                    f"\n=== config={config} workload={workload} "
+                    f"rep={rep + 1}/{args.repeats} ===",
+                    flush=True,
+                )
+                run_args = _per_run_args(args, base_url, workload)
+                try:
+                    res = run_benchmark(run_args)
+                except Exception as e:  # noqa: BLE001
+                    # Don't let one failed rep (OOM, transient hiccup, or
+                    # run_benchmark's NameError on zero completions) abort the sweep.
+                    print(
+                        f"!!! rep failed (config={config} workload={workload} "
+                        f"rep={rep + 1}): {e!r}; skipping this rep",
+                        flush=True,
+                    )
+                    continue
+                # A partially-failed rep would skew stats (failed requests carry
+                # ttft=0.0 and missing tokens); count it as failed instead.
+                completed = res.get("completed", 0)
+                if completed != run_args.num_prompts:
+                    print(
+                        f"!!! rep incomplete (config={config} workload={workload} "
+                        f"rep={rep + 1}): completed={completed}/{run_args.num_prompts}; "
+                        "skipping this rep",
+                        flush=True,
+                    )
+                    continue
+                results[workload].append(res)
+    finally:
+        kill_process_tree(process.pid)
+        process.wait()
+        time.sleep(10)  # let the TPU free before the next config
+
+    return results
+
+
+def _sample_std(x):
+    """Sample std (ddof=1); 0.0 for a single kept rep (ddof=1 would be nan)."""
+    return float(x.std(ddof=1)) if len(x) > 1 else 0.0
+
+
+def aggregate(args, raw):
+    """Aggregate raw[config][workload] = [res, ...] into per-cell stats."""
+    agg = {}
+    for config, by_workload in raw.items():
+        agg[config] = {}
+        for workload, reps in by_workload.items():
+            kept = reps[args.drop_first :]
+            if not kept:
+                continue
+            pooled_ttft = []
+            for res in kept:
+                # bench_serving's per-request ttfts are unfiltered: failed
+                # requests carry the 0.0 default, which would fake-improve
+                # percentiles. Reps are already completeness-checked; this
+                # guards the per-request layer.
+                pooled_ttft.extend(t for t in (res.get("ttfts") or []) if t > 0)
+            if pooled_ttft:
+                p50, p95, p99 = np.percentile(pooled_ttft, [50, 95, 99]) * 1000.0
+            else:
+                p50 = p95 = p99 = float("nan")
+
+            out_tps = np.array([res["output_throughput"] for res in kept], dtype=float)
+            total_tps = np.array([res["total_throughput"] for res in kept], dtype=float)
+            hit_rate = np.array([res.get("cache_hit_rate", 0.0) for res in kept], dtype=float)
+
+            agg[config][workload] = {
+                "p50_ttft_ms": float(p50),
+                "p95_ttft_ms": float(p95),
+                "p99_ttft_ms": float(p99),
+                "out_tok_s_mean": float(out_tps.mean()),
+                "out_tok_s_std": _sample_std(out_tps),
+                "total_tok_s_mean": float(total_tps.mean()),
+                "total_tok_s_std": _sample_std(total_tps),
+                "hit_rate_mean": float(hit_rate.mean()),
+                "kept_reps": len(kept),
+            }
+    return agg
+
+
+def print_table(args, agg):
+    header = (
+        f"{'workload':<10} {'config':<10} {'p50_ttft':>10} {'p95_ttft':>10} "
+        f"{'p99_ttft':>10} {'out_tok/s':>20} {'total_tok/s':>20} {'hit_rate':>9}"
+    )
+    print("\n" + "=" * len(header))
+    print(header)
+    print("-" * len(header))
+    for workload in args.workloads:
+        for config in args.configs:
+            cell = agg.get(config, {}).get(workload)
+            if cell is None:
+                continue
+            out_str = f"{cell['out_tok_s_mean']:.1f}+/-{cell['out_tok_s_std']:.1f}"
+            total_str = f"{cell['total_tok_s_mean']:.1f}+/-{cell['total_tok_s_std']:.1f}"
+            print(
+                f"{workload:<10} {config:<10} "
+                f"{cell['p50_ttft_ms']:>10.2f} {cell['p95_ttft_ms']:>10.2f} "
+                f"{cell['p99_ttft_ms']:>10.2f} {out_str:>20} "
+                f"{total_str:>20} {cell['hit_rate_mean']:>9.4f}"
+            )
+    print("=" * len(header))
+
+
+def check_sweep_complete(args, raw):
+    """Fail loudly if any requested (config, workload) cell lacks enough reps.
+
+    Failed reps are skipped, and empty cells drop out of the table + soft-target
+    checks -- so without this an all-failed cell would look like a clean pass.
+    Every requested cell needs >= drop_first + 1 successful reps (>= 1 survives
+    the warmup drop); fewer is a sweep failure.
+    """
+    print("\n--- sweep completeness ---")
+    min_required = args.drop_first + 1
+    complete = True
+    for config in args.configs:
+        for workload in args.workloads:
+            n = len(raw.get(config, {}).get(workload, []))
+            if n < min_required:
+                complete = False
+                tag = "FAIL"
+            elif n < args.repeats:
+                tag = "WARN"
+            else:
+                tag = "PASS"
+            print(
+                f"[{tag}] {config}/{workload}: {n}/{args.repeats} reps ok (need >= {min_required})"
+            )
+    return complete
+
+
+def soft_targets(args, agg):
+    """Print PASS/WARN per check. Returns True if all checks passed."""
+    print("\n--- soft-target report ---")
+    all_pass = True
+
+    def have(config, workload):
+        return agg.get(config, {}).get(workload) is not None
+
+    # 1. random: unified degradation < 5% vs radix total throughput.
+    if "random" in args.workloads and have("unified", "random") and have("radix", "random"):
+        u = agg["unified"]["random"]["total_tok_s_mean"]
+        r = agg["radix"]["random"]["total_tok_s_mean"]
+        ok = u >= 0.95 * r
+        all_pass = all_pass and ok
+        print(
+            f"[{'PASS' if ok else 'WARN'}] random: unified.total_tok/s ({u:.1f}) "
+            f">= 0.95 * radix.total_tok/s ({0.95 * r:.1f})"
+        )
+
+    # 2. gsp: unified hit-rate >= radix hit-rate.
+    if "gsp" in args.workloads and have("unified", "gsp") and have("radix", "gsp"):
+        u = agg["unified"]["gsp"]["hit_rate_mean"]
+        r = agg["radix"]["gsp"]["hit_rate_mean"]
+        ok = u >= r
+        all_pass = all_pass and ok
+        print(
+            f"[{'PASS' if ok else 'WARN'}] gsp: unified.hit_rate ({u:.4f}) "
+            f">= radix.hit_rate ({r:.4f})"
+        )
+
+    # 3. gsp: unified p50 TTFT < no-cache p50 TTFT (warn if ratio >= 0.9).
+    if "gsp" in args.workloads and have("unified", "gsp") and have("no-cache", "gsp"):
+        u = agg["unified"]["gsp"]["p50_ttft_ms"]
+        nc = agg["no-cache"]["gsp"]["p50_ttft_ms"]
+        ratio = u / nc if nc else float("nan")
+        ok = ratio < 0.9
+        all_pass = all_pass and ok
+        print(
+            f"[{'PASS' if ok else 'WARN'}] gsp: unified.p50_ttft ({u:.2f}) "
+            f"vs no-cache.p50_ttft ({nc:.2f}), ratio={ratio:.3f} (want < 0.9)"
+        )
+
+    return all_pass
+
+
+def main():
+    args = parse_args()
+    print(f"args={args}\n", flush=True)
+
+    raw = {}
+    for config in args.configs:
+        raw[config] = run_config(args, config)
+
+    agg = aggregate(args, raw)
+    print_table(args, agg)
+    complete = check_sweep_complete(args, raw)
+    targets_pass = soft_targets(args, agg)
+    all_pass = complete and targets_pass
+
+    if args.output_json:
+        payload = {
+            "args": vars(args),
+            "raw": raw,
+            "aggregates": agg,
+        }
+        with open(args.output_json, "w") as f:
+            json.dump(payload, f, indent=2, default=str)
+        print(f"\nWrote results to {args.output_json}")
+
+    if args.strict and not all_pass:
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    main()

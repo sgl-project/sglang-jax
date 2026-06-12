@@ -1,0 +1,230 @@
+name: Slash Command Handler
+
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  handle-command:
+    if: >-
+      github.event.issue.pull_request &&
+      startsWith(github.event.comment.body, '/')
+    runs-on: ubuntu-latest
+    # Per-job least privilege: handle-command parses untrusted comment text, so it gets
+    # only what its own steps need (reactions, replies, dispatching rerun-test).
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+      actions: write
+    outputs:
+      action: ${{ steps.parse.outputs.action }}
+      pull_ref: ${{ steps.pr.outputs.pull_ref }}
+      nightly_job: ${{ steps.parse.outputs.nightly_job }}
+      nightly_cases: ${{ steps.parse.outputs.nightly_cases }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          # test/srt/nightly: the slash parser enumerates the suite catalog by
+          # running suite_runner.py --caselist to derive /run-nightly cases.
+          sparse-checkout: |
+            scripts/ci
+            test/srt/nightly
+
+      - name: Get PR head branch
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          # pull_ref (refs/pull/<N>/head) is what /run-nightly dispatches against —
+          # a fork PR's branch name isn't in the base repo. head_ref is for display.
+          head_ref=$(gh pr view "$PR_NUMBER" --json headRefName --jq .headRefName)
+          echo "head_ref=$head_ref" >> "$GITHUB_OUTPUT"
+          echo "pull_ref=refs/pull/$PR_NUMBER/head" >> "$GITHUB_OUTPUT"
+
+      - name: Parse slash command
+        id: parse
+        env:
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          ACTOR: ${{ github.event.comment.user.login }}
+          ACTOR_ASSOCIATION: ${{ github.event.comment.author_association }}
+        run: python3 scripts/ci/slash_command_parse.py
+
+      - name: React to comment
+        # run-nightly gets 🚀 from its own step below (not 👍), so exclude it here.
+        if: steps.parse.outputs.valid == 'true' && steps.parse.outputs.permitted == 'true' && steps.parse.outputs.command != 'run-nightly'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh api repos/"$REPO"/issues/comments/"$COMMENT_ID"/reactions \
+            -f content='+1' --silent
+
+      - name: Reply on permission denied
+        if: steps.parse.outputs.valid == 'true' && steps.parse.outputs.permitted == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          ERROR_MSG: ${{ steps.parse.outputs.error }}
+        run: |
+          gh pr comment "$PR_NUMBER" \
+            --body "> **Slash command rejected**: $ERROR_MSG"
+
+      - name: Reply on command error
+        if: >-
+          steps.parse.outputs.valid == 'true' &&
+          steps.parse.outputs.permitted == 'true' &&
+          steps.parse.outputs.error != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          ERROR_MSG: ${{ steps.parse.outputs.error }}
+        run: |
+          gh pr comment "$PR_NUMBER" \
+            --body "> **Slash command error**: $ERROR_MSG"
+
+      - name: React confused on invalid run-nightly
+        # Bad case_key: 😕 for an at-a-glance signal; the "Reply on command error"
+        # comment above carries the detail (valid chars / valid keys).
+        if: >-
+          steps.parse.outputs.valid == 'true' &&
+          steps.parse.outputs.permitted == 'true' &&
+          steps.parse.outputs.command == 'run-nightly' &&
+          steps.parse.outputs.error != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh api repos/"$REPO"/issues/comments/"$COMMENT_ID"/reactions \
+            -f content='confused' --silent
+
+      - name: Rerun failed jobs
+        if: >-
+          steps.parse.outputs.valid == 'true' &&
+          steps.parse.outputs.permitted == 'true' &&
+          steps.parse.outputs.action == 'rerun_failed'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          HEAD_REF: ${{ steps.pr.outputs.head_ref }}
+          REPO: ${{ github.repository }}
+        run: python3 scripts/ci/slash_command_dispatch.py
+
+      - name: Add label
+        if: >-
+          steps.parse.outputs.valid == 'true' &&
+          steps.parse.outputs.permitted == 'true' &&
+          steps.parse.outputs.action == 'add_label'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          LABELS_CSV: ${{ steps.parse.outputs.labels_csv }}
+        run: |
+          gh pr edit "$PR_NUMBER" --add-label "$LABELS_CSV"
+          gh pr comment "$PR_NUMBER" \
+            --body "> **Slash command**: Added label(s) \`$LABELS_CSV\` — CI will be triggered by the label event"
+
+      - name: Rerun test group
+        if: >-
+          steps.parse.outputs.valid == 'true' &&
+          steps.parse.outputs.permitted == 'true' &&
+          steps.parse.outputs.action == 'rerun_group'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          HEAD_REF: ${{ steps.pr.outputs.head_ref }}
+          SUITE: ${{ steps.parse.outputs.suite }}
+          RUNNER: ${{ steps.parse.outputs.runner }}
+        run: |
+          gh workflow run rerun-test.yml --ref main \
+            -f suite="$SUITE" \
+            -f runner="$RUNNER" \
+            -f ref="$HEAD_REF" \
+            -f pr_number="$PR_NUMBER"
+          gh pr comment "$PR_NUMBER" \
+            --body "> **Slash command**: Dispatched \`$SUITE\` on \`$RUNNER\` for branch \`$HEAD_REF\`"
+
+      - name: Rerun stage
+        if: >-
+          steps.parse.outputs.valid == 'true' &&
+          steps.parse.outputs.permitted == 'true' &&
+          steps.parse.outputs.action == 'rerun_stage'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          HEAD_REF: ${{ steps.pr.outputs.head_ref }}
+          STAGE: ${{ steps.parse.outputs.stage }}
+          STAGE_SUITES_JSON: ${{ steps.parse.outputs.stage_suites_json }}
+        run: python3 scripts/ci/slash_command_stage_dispatch.py
+
+      - name: List nightly cases
+        # `/run-nightly` (no arg) or `/run-nightly ?` → reply with the available
+        # case_keys. An on-demand answer (so a comment is fine, not noise),
+        # derived from the suite catalog so it can't drift.
+        if: >-
+          steps.parse.outputs.valid == 'true' &&
+          steps.parse.outputs.permitted == 'true' &&
+          steps.parse.outputs.action == 'list_nightly'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          set -euo pipefail
+          body=$(python3 -c "import sys; sys.path.insert(0, 'scripts/ci'); from slash_command_parse import format_nightly_list; print(format_nightly_list())")
+          gh pr comment "$PR_NUMBER" --body "$body"
+
+      - name: React rocket on run-nightly
+        # 🚀 = the nightly started; it comments PASS/FAIL back when done. The actual
+        # run is the run-nightly job below (a reusable workflow). Bad keys got 😕 above.
+        if: >-
+          steps.parse.outputs.valid == 'true' &&
+          steps.parse.outputs.permitted == 'true' &&
+          steps.parse.outputs.action == 'run_nightly'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh api repos/"$REPO"/issues/comments/"$COMMENT_ID"/reactions \
+            -f content='rocket' --silent
+
+  run-nightly:
+    # One nightly case on the PR HEAD, run as a reusable workflow so it stays part of
+    # this run — no standalone "Nightly Test Daily" run for the notifier/auto-bisect to
+    # mistake for the scheduled nightly. Comments PASS/FAIL back via pr_number.
+    needs: handle-command
+    if: needs.handle-command.outputs.action == 'run_nightly'
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      id-token: write
+    uses: ./.github/workflows/nightly-test-daily.yml
+    with:
+      ref: ${{ needs.handle-command.outputs.pull_ref }}
+      job_filter: ${{ needs.handle-command.outputs.nightly_job }}
+      cases: ${{ needs.handle-command.outputs.nightly_cases }}
+      pr_number: ${{ github.event.issue.number }}
+    secrets: inherit
+
+  bisect-on-nightly-failure:
+    # On a failed /run-nightly, dispatch ci-auto-bisect to analyze this run and comment
+    # the root cause on the PR. issue_number is explicit (this run's head_branch=main).
+    needs: run-nightly
+    if: always() && needs.run-nightly.result == 'failure'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - name: Trigger AI bisect on the failed nightly run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run ci-auto-bisect.yml \
+            -f run_id=${{ github.run_id }} \
+            -f issue_number=${{ github.event.issue.number }}

@@ -1,6 +1,7 @@
 # Adapted from https://github.com/openai/simple-evals/
 
 import os
+import re
 import resource
 import time
 from collections import defaultdict
@@ -92,6 +93,8 @@ class ChatCompletionSampler(SamplerBase):
         system_message: str | None = None,
         temperature: float = 0.0,
         max_tokens: int = 2048,
+        top_p: float | None = None,
+        extra_body: dict | None = None,
     ):
         self.client = OpenAI(base_url=base_url, http_client=LargerHttpxClient())
 
@@ -102,6 +105,8 @@ class ChatCompletionSampler(SamplerBase):
         self.system_message = system_message
         self.temperature = temperature
         self.max_tokens = max_tokens
+        self.top_p = top_p
+        self.extra_body = extra_body
         self.image_format = "url"
 
     def _handle_image(
@@ -131,12 +136,17 @@ class ChatCompletionSampler(SamplerBase):
         trial = 0
         while True:
             try:
-                response = self.client.chat.completions.create(
+                kwargs = dict(
                     model=self.model,
                     messages=message_list,
                     temperature=self.temperature,
                     max_tokens=self.max_tokens,
                 )
+                if self.top_p is not None:
+                    kwargs["top_p"] = self.top_p
+                if self.extra_body:
+                    kwargs["extra_body"] = self.extra_body
+                response = self.client.chat.completions.create(**kwargs)
                 return response.choices[0].message.content
             # NOTE: BadRequestError is triggered once for MMMU, please uncomment if you are rerunning MMMU
             except openai.BadRequestError as e:
@@ -166,6 +176,27 @@ D) {D}
 
 ANSWER_PATTERN_MULTICHOICE = r"(?i)Answer\s*:\s*([A-D])"
 ANSWER_PATTERN = r"(?i)Answer\s*:\s*([^\n]+)"
+
+_REASONING_RE_BOTH = re.compile(r"<think>.*?</think>", flags=re.DOTALL)
+_REASONING_RE_CLOSE_ONLY = re.compile(r"^.*?</think>", flags=re.DOTALL)
+
+
+def strip_reasoning(text: str) -> str:
+    """Drop the reasoning span before multichoice answer extraction.
+
+    Handles both shapes:
+    - Full ``<think>...</think>`` block in the response (some templates).
+    - Bare ``</think>`` only (Qwen-style: the opening ``<think>\\n`` is
+      injected by the chat template into the prompt, so the server's
+      content field starts directly with reasoning text and only emits
+      the closing tag).
+    """
+    if not text:
+        return text
+    text = _REASONING_RE_BOTH.sub("", text)
+    if "</think>" in text:
+        text = _REASONING_RE_CLOSE_ONLY.sub("", text, count=1)
+    return text.strip()
 
 
 EQUALITY_TEMPLATE = r"""

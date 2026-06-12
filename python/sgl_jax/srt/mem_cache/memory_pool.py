@@ -1,6 +1,9 @@
+from __future__ import annotations
+
 import abc
 import logging
 import time
+from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
@@ -8,6 +11,9 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 from jax.tree_util import register_pytree_node_class
+
+if TYPE_CHECKING:
+    from sgl_jax.srt.managers.schedule_batch import Req
 
 from sgl_jax.srt.kernels.ragged_paged_attention.util import get_dtype_packing
 from sgl_jax.srt.kernels.update_kv_cache.update_kv_cache import (
@@ -79,6 +85,17 @@ class ReqToTokenPool:
         # Use simple list to manage free slots
         self.free_slots = list(range(size))
 
+        # Persistent host scratch buffer reused by
+        # ScheduleBatch._merge_cache_loc to avoid a fresh np.zeros every step.
+        # Allocated once at startup via init_cache_loc_host_buffer (its size is
+        # only known after the precompile cache_loc buckets are computed).
+        self.cache_loc_host_buf = None
+
+    def init_cache_loc_host_buffer(self, size: int):
+        """Ensure the persistent cache_loc host buffer has enough capacity."""
+        if self.cache_loc_host_buf is None or self.cache_loc_host_buf.shape[0] < size:
+            self.cache_loc_host_buf = np.zeros(size, dtype=np.int32)
+
     def tree_flatten(self):
         children = (self.req_to_token,)
         aux_data = {
@@ -99,6 +116,10 @@ class ReqToTokenPool:
         obj.free_slots = aux_data["free_slots"]
 
         obj.req_to_token = children[0]
+        # Host scratch buffer is transient host memory, not model state, so it
+        # is not carried through the pytree. The live serving pool keeps its
+        # init-time buffer; _merge_cache_loc never runs on a reconstructed pool.
+        obj.cache_loc_host_buf = None
 
         return obj
 
@@ -121,25 +142,106 @@ class ReqToTokenPool:
         """Return number of available request slots"""
         return len(self.free_slots)
 
-    def alloc(self, need_size: int = 1) -> list[int]:
-        """Allocate request slots"""
+    def alloc(self, reqs: list[Req]) -> list[int] | None:
+        """Allocate request slots, reusing existing slot for chunked reqs."""
+        chunked = [i for i, r in enumerate(reqs) if r.req_pool_idx is not None]
+        assert len(chunked) <= 1, "only one chunked request may reuse req_pool_idx in a batch"
+        assert all(
+            reqs[i].is_chunked > 0 or reqs[i].kv_committed_len > 0 for i in chunked
+        ), "request has req_pool_idx but is not chunked"
+
+        need_size = len(reqs) - len(chunked)
         if need_size > len(self.free_slots):
             return None
-
         select_indices = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
-        return select_indices
+        offset = 0
+        for r in reqs:
+            if r.req_pool_idx is None:
+                r.req_pool_idx = select_indices[offset]
+                offset += 1
+        return [r.req_pool_idx for r in reqs]
 
-    def free(self, free_index: int | list[int]):
-        """Free request slots"""
-        if isinstance(free_index, int):
-            self.free_slots.append(free_index)
-        else:
-            self.free_slots.extend(free_index)
+    def free(self, req: Req):
+        """Free request slot and clear req.req_pool_idx."""
+        assert req.req_pool_idx is not None, "request must have req_pool_idx"
+        self.free_slots.append(req.req_pool_idx)
+        req.req_pool_idx = None
 
     def clear(self):
         """Clear all allocation states"""
         self.free_slots = list(range(self.size))
+
+
+class HybridReqToTokenPool(ReqToTokenPool):
+    """Coordinates KV slot + recurrent state slot allocation for hybrid models."""
+
+    def __init__(
+        self,
+        size: int,
+        max_context_len: int,
+        dtype: np.dtype,
+        recurrent_state_pool,
+        dp_size: int = 1,
+    ):
+        super().__init__(size=size, max_context_len=max_context_len, dtype=dtype)
+        self.recurrent_state_pool = recurrent_state_pool
+        self.dp_size = dp_size
+        # recurrent_state_pool.size is global (mirrors MHATokenToKVPool).
+        # Divisibility is asserted inside RecurrentStatePool.__init__.
+        self.slots_per_rank = recurrent_state_pool.size // dp_size
+        self.recurrent_free_slots: list[list[int]] = [
+            list(range(1, self.slots_per_rank + 1)) for _ in range(dp_size)
+        ]
+        self.req_index_to_recurrent_index_mapping = np.zeros(size, dtype=np.int32)
+
+    def alloc(self, reqs: list[Req]) -> list[int] | None:
+        # dp_rank from reqs[0]: callers (prepare_for_extend/decode) iterate per-DP,
+        # so all reqs in a single alloc() call share the same dp_rank.
+        dp_rank = reqs[0].dp_rank if reqs and reqs[0].dp_rank is not None else 0
+        needed = sum(1 for r in reqs if r.recurrent_pool_idx is None)
+        if needed > len(self.recurrent_free_slots[dp_rank]):
+            return None
+
+        result = super().alloc(reqs)
+        if result is None:
+            return None
+
+        new_indices = []
+        for r in reqs:
+            if r.recurrent_pool_idx is None:
+                slot = self.recurrent_free_slots[dp_rank].pop(0)
+                r.recurrent_pool_idx = slot
+                self.req_index_to_recurrent_index_mapping[r.req_pool_idx] = slot
+                new_indices.append(slot)
+
+        return result
+
+    def free(self, req: Req):
+        self.free_recurrent_cache(req)
+        super().free(req)
+
+    def free_recurrent_cache(self, req: Req):
+        recurrent_idx = req.recurrent_pool_idx
+        if recurrent_idx is None:
+            return
+        dp_rank = req.dp_rank if req.dp_rank is not None else 0
+        self.recurrent_free_slots[dp_rank].append(recurrent_idx)
+        self.req_index_to_recurrent_index_mapping[req.req_pool_idx] = 0
+        req.recurrent_pool_idx = None
+
+    def get_linear_recurrent_indices(self, req_pool_indices) -> np.ndarray:
+        return self.req_index_to_recurrent_index_mapping[req_pool_indices]
+
+    def recurrent_available_size(self, dp_rank: int = 0) -> int:
+        return len(self.recurrent_free_slots[dp_rank])
+
+    def clear(self):
+        super().clear()
+        self.recurrent_state_pool.clear()
+        for rank in range(self.dp_size):
+            self.recurrent_free_slots[rank] = list(range(1, self.slots_per_rank + 1))
+        self.req_index_to_recurrent_index_mapping.fill(0)
 
 
 @register_pytree_node_class
@@ -216,7 +318,7 @@ class KVCache(abc.ABC):
         raise NotImplementedError()
 
     @abc.abstractmethod
-    def replace_kv_buffer(self, kv_buffer: list[jax.Array]) -> None:
+    def replace_buffer(self, kv_buffer: list[jax.Array]) -> None:
         """Replace the internal KV buffer with a new one.
 
         This method is essential for JAX jit compatibility since JAX functions
@@ -258,13 +360,16 @@ class MHATokenToKVPool(KVCache):
         head_dim: int,
         layer_num: int,
         mesh: Mesh,
+        dp_size: int = 1,
         start_layer: int | None = None,
         end_layer: int | None = None,
     ):
         super().__init__(size, page_size, dtype, layer_num, mesh, start_layer, end_layer)
         self.head_num = head_num
         self.head_dim = head_dim
+        self.dp_size = dp_size
         self.kv_partition_axis = "tensor"
+        self.attention_data_partition_axis = "data"
 
         self._create_buffers()
         self._calculate_memory_usage()
@@ -277,7 +382,9 @@ class MHATokenToKVPool(KVCache):
             **parent_aux_data,
             "head_num": self.head_num,
             "head_dim": self.head_dim,
+            "dp_size": self.dp_size,
             "kv_partition_axis": self.kv_partition_axis,
+            "attention_data_partition_axis": self.attention_data_partition_axis,
             "kv_sharding": self.kv_sharding,
         }
         return (children, aux_data)
@@ -304,7 +411,9 @@ class MHATokenToKVPool(KVCache):
 
         obj.head_num = aux_data["head_num"]
         obj.head_dim = aux_data["head_dim"]
+        obj.dp_size = aux_data.get("dp_size", 1)
         obj.kv_partition_axis = aux_data["kv_partition_axis"]
+        obj.attention_data_partition_axis = aux_data.get("attention_data_partition_axis", "data")
         obj.kv_sharding = aux_data["kv_sharding"]
 
         obj.kv_buffer = kv_buffer
@@ -315,20 +424,20 @@ class MHATokenToKVPool(KVCache):
         """Create sharded fused KV cache buffers with proper distributed allocation"""
         self.kv_sharding = NamedSharding(
             self.mesh,
-            P(None, None, self.kv_partition_axis, None, None),
+            P(self.attention_data_partition_axis, None, self.kv_partition_axis, None, None),
         )
 
         logger.info("Creating fused KV buffers for %s layers", self.layer_num)
         start_time = time.time()
 
         assert (
-            self.size % self.page_size == 0
+            self.size % self.dp_size == 0 and self.size % self.page_size == 0
         ), "Cache size must be divisible by dp_size and size must be divisible by page size"
 
         # Hack: this shape is more friendly to rpav3
         packing = get_dtype_packing(self.dtype)
         fused_buffer_shape = (
-            (self.size + self.page_size) // self.page_size,
+            (self.size + self.page_size * self.dp_size) // self.page_size,
             self.page_size,
             self.head_num * 2 // packing,  # [K0,V0,K1,V1,...]
             packing,
@@ -368,7 +477,7 @@ class MHATokenToKVPool(KVCache):
     def _calculate_memory_usage(self):
         """Calculate memory usage for fused KV cache"""
         fused_kv_size = (
-            (self.size + self.page_size)
+            (self.size + self.page_size * self.dp_size)
             * self.head_num  # num_kv_heads
             * self.head_dim
             * 2  # num_heads * 2 (head interleaving)
@@ -386,7 +495,7 @@ class MHATokenToKVPool(KVCache):
     def get_kv_size_bytes(self):
         """Calculate KV cache size in bytes for fused format"""
         fused_kv_size = (
-            (self.size + self.page_size)
+            (self.size + self.page_size * self.dp_size)
             * self.head_num  # num_kv_heads
             * self.head_dim
             * 2  # num_heads * 2 (head interleaving)
@@ -436,11 +545,11 @@ class MHATokenToKVPool(KVCache):
             kv_cache=self.kv_buffer[layer_idx],
             page_size=page_size,
             kv_partition_axis=self.kv_partition_axis,
-            attention_data_partition_axis=None,
+            attention_data_partition_axis=self.attention_data_partition_axis,
             mesh=self.mesh,
         )
 
-    def replace_kv_buffer(self, fused_kv_buffer: list[jax.Array]) -> None:
+    def replace_buffer(self, fused_kv_buffer: list[jax.Array]) -> None:
         self.kv_buffer[self.start_layer : self.start_layer + len(fused_kv_buffer)] = fused_kv_buffer
 
     def get_cpu_copy(self, indices):
@@ -503,13 +612,19 @@ class MHATokenToKVPool(KVCache):
         )
 
         safe_loc = jnp.where(loc >= 0, loc, jnp.int32(total_cache_tokens))
-        updated_3d = cache_3d.at[safe_loc].set(fused_kv_3d, mode="drop")
+        updated_3d = cache_3d.at[safe_loc].set(
+            fused_kv_3d,
+            mode="drop",
+            out_sharding=P(None, self.kv_partition_axis, None),
+        )
 
         # Reshape back to 5D
         return jax.lax.reshape(
             updated_3d,
             (num_pages, page_size, heads_x2_per_pack, packing, head_dim),
-            out_sharding=P(None, None, self.kv_partition_axis, None, None),
+            out_sharding=P(
+                self.attention_data_partition_axis, None, self.kv_partition_axis, None, None
+            ),
         )
 
 
@@ -521,6 +636,7 @@ class SWAKVPool(KVCache):
         self,
         size: int,
         size_swa: int,
+        page_size: int,
         swa_attention_layer_ids: list[int],
         full_attention_layer_ids: list[int],
         token_to_kv_pool_class: KVCache = MHATokenToKVPool,
@@ -529,10 +645,13 @@ class SWAKVPool(KVCache):
     ):
         self.size = size
         self.size_swa = size_swa
+        self.page_size = page_size
         self.swa_layer_nums = len(swa_attention_layer_ids)
         self.full_layer_nums = len(full_attention_layer_ids)
         self.mesh = kwargs["mesh"]
+        self.dp_size = kwargs.get("dp_size", 1)
         self.kv_partition_axis = "tensor"
+        kwargs["page_size"] = page_size
 
         # If SWA layers have different KV head count, create separate kwargs
         if swa_head_num is not None and swa_head_num != kwargs.get("head_num"):
@@ -568,11 +687,9 @@ class SWAKVPool(KVCache):
         self.mem_usage = (k_size + v_size) / GB
 
     def tree_flatten(self):
-        children = (
-            self.swa_kv_pool,
-            self.full_kv_pool,
-            self.full_to_swa_index_mapping,
-        )
+        mapping = self.full_to_swa_index_mapping
+        mapping_children = tuple(mapping) if isinstance(mapping, list) else (mapping,)
+        children = (self.swa_kv_pool, self.full_kv_pool) + mapping_children
         aux_data = {
             "size": self.size,
             "size_swa": self.size_swa,
@@ -580,6 +697,9 @@ class SWAKVPool(KVCache):
             "full_layer_nums": self.full_layer_nums,
             "layers_mapping": self.layers_mapping,
             "mem_usage": self.mem_usage,
+            "dp_size": self.dp_size,
+            "page_size": self.page_size,
+            "mapping_count": len(mapping_children),
         }
         return (children, aux_data)
 
@@ -593,10 +713,17 @@ class SWAKVPool(KVCache):
         obj.full_layer_nums = aux_data["full_layer_nums"]
         obj.layers_mapping = aux_data["layers_mapping"]
         obj.mem_usage = aux_data["mem_usage"]
+        obj.dp_size = aux_data.get("dp_size", 1)
+        obj.page_size = aux_data.get("page_size", 1)
 
         obj.swa_kv_pool = children[0]
         obj.full_kv_pool = children[1]
-        obj.full_to_swa_index_mapping = children[2]
+
+        mc = aux_data.get("mapping_count", 1)
+        if mc == 1:
+            obj.full_to_swa_index_mapping = children[2]
+        else:
+            obj.full_to_swa_index_mapping = list(children[2 : 2 + mc])
 
         return obj
 
@@ -617,10 +744,26 @@ class SWAKVPool(KVCache):
             return self.swa_kv_pool.get_fused_kv_buffer(layer_id_pool)
         return self.full_kv_pool.get_fused_kv_buffer(layer_id_pool)
 
-    def _remap_swa_loc(self, loc):
-        """Remap full-pool locations to SWA-pool locations via the index mapping."""
-        mapping = jnp.asarray(self.full_to_swa_index_mapping)
-        return mapping[loc].astype(jnp.int32)
+    def _remap_swa_loc(self, loc: jax.Array) -> jax.Array:
+        """Remap full-pool indices to SWA-pool indices, handling both DP=1 and DP>1.
+
+        In DP>1, full_to_swa_index_mapping is a list of per-rank numpy arrays.
+        We stack them and do per-rank gather via take_along_axis.
+        """
+        mapping = self.full_to_swa_index_mapping
+        if mapping is None:
+            return loc
+        if isinstance(mapping, list):
+            # DP>1: stack per-rank mappings → [dp_size, size_per_rank+1]
+            stacked = jnp.stack([jnp.asarray(m) for m in mapping])
+            tokens_per_rank = loc.shape[0] // self.dp_size
+            loc_2d = loc.reshape(self.dp_size, tokens_per_rank)
+            # Per-rank gather: each rank's loc indexes into its own mapping
+            remapped = jnp.take_along_axis(stacked, loc_2d.astype(jnp.int64), axis=1)
+            return remapped.reshape(-1).astype(jnp.int32)
+        else:
+            # DP=1: simple 1D gather
+            return jnp.asarray(mapping)[loc].astype(jnp.int32)
 
     def set_kv_buffer(
         self,
@@ -632,13 +775,12 @@ class SWAKVPool(KVCache):
     ):
         layer_id_pool, is_swa = self.layers_mapping[layer_id]
         if is_swa:
-            if self.full_to_swa_index_mapping is not None:
-                loc = self._remap_swa_loc(loc)
+            loc = self._remap_swa_loc(loc)
             self.swa_kv_pool.set_kv_buffer(layer_id_pool, loc, cache_k, cache_v, is_decode)
         else:
             self.full_kv_pool.set_kv_buffer(layer_id_pool, loc, cache_k, cache_v, is_decode)
 
-    def replace_kv_buffer(self, kv_buffer: list[jax.Array]):
+    def replace_buffer(self, kv_buffer: list[jax.Array]):
         assert len(kv_buffer) == len(self.layers_mapping)
 
         full_kv_buffer = []
@@ -650,8 +792,8 @@ class SWAKVPool(KVCache):
             else:
                 full_kv_buffer.append(layer_kv_buffer)
 
-        self.swa_kv_pool.replace_kv_buffer(swa_kv_buffer)
-        self.full_kv_pool.replace_kv_buffer(full_kv_buffer)
+        self.swa_kv_pool.replace_buffer(swa_kv_buffer)
+        self.full_kv_pool.replace_buffer(full_kv_buffer)
 
     def remap_cache_loc(self, loc: jax.Array, layer_id: int) -> jax.Array:
         """
@@ -668,12 +810,7 @@ class SWAKVPool(KVCache):
         _, is_swa = self.layers_mapping[layer_id]
         if not is_swa:
             return loc
-        if self.full_to_swa_index_mapping is None:
-            # No mapping available yet; return as-is to avoid crash. Caller may handle.
-            return loc
-        # Convert host mapping to jax array and gather
-        mapping_jax = jnp.asarray(self.full_to_swa_index_mapping, dtype=jnp.int32)
-        return mapping_jax[loc]
+        return self._remap_swa_loc(loc)
 
 
 def _set_fused_kv_buffer(
@@ -682,7 +819,7 @@ def _set_fused_kv_buffer(
     kv_cache: jax.Array,
     page_size: int,
     kv_partition_axis: str = "tensor",
-    attention_data_partition_axis: str = None,
+    attention_data_partition_axis: str = "data",
     mesh: Mesh = None,
 ) -> jax.Array:
     """
@@ -715,7 +852,7 @@ def update_fused_kv_cache(
     kv_cache: jax.Array,  # [num_pages, page_size, heads*2//packing, packing, head_dim]
     page_size: int = 1,
     kv_partition_axis: str = "tensor",
-    data_partition_axis: str = None,
+    data_partition_axis: str = "data",
     mesh: Mesh = None,
 ) -> jax.Array:
     """
@@ -769,6 +906,7 @@ def update_kv_cache_vectorized(
     # Use original logic for page_size = 1: one slice per token
     kv_cache_locs = jnp.where(loc == -1, 0, loc).astype(jnp.int32)
     new_kv_locs = jnp.arange(total_tokens, dtype=jnp.int32)
+    new_kv_locs = jax.sharding.reshard(new_kv_locs, loc.sharding)
     slice_lens = jnp.where(loc == -1, 0, 1).astype(jnp.int32)
     num_slices = total_tokens
 
@@ -817,7 +955,7 @@ def update_fused_kv_cache_vectorized(
     kv_cache: jax.Array,  # [num_pages, page_size, heads*2//packing, packing, head_dim]
     page_size: int,
     kv_partition_axis: str = "tensor",
-    data_partition_axis: str = None,
+    data_partition_axis: str = "data",
     mesh: Mesh = None,
 ) -> jax.Array:
     """
@@ -896,7 +1034,8 @@ class MLATokenToKVPool(KVCache):
         qk_rope_head_dim: int,
         layer_num: int,
         mesh: Mesh,
-        kv_partition_axis: str = "data",  # ignored: MLA cache is replicated
+        kv_partition_axis: str = "data",
+        dp_size: int = 1,
         start_layer: int | None = None,
         end_layer: int | None = None,
     ):
@@ -904,6 +1043,7 @@ class MLATokenToKVPool(KVCache):
         self.kv_lora_rank = kv_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim
         self.kv_partition_axis = kv_partition_axis
+        self.dp_size = dp_size
 
         from sgl_jax.srt.kernels.mla.v2.kernel import align_to
 
@@ -923,6 +1063,7 @@ class MLATokenToKVPool(KVCache):
             "kv_lora_rank": self.kv_lora_rank,
             "qk_rope_head_dim": self.qk_rope_head_dim,
             "kv_partition_axis": self.kv_partition_axis,
+            "dp_size": self.dp_size,
             "nope_dim": self.nope_dim,
             "rope_dim": self.rope_dim,
             "kv_dim": self.kv_dim,
@@ -953,6 +1094,7 @@ class MLATokenToKVPool(KVCache):
         obj.kv_lora_rank = aux_data["kv_lora_rank"]
         obj.qk_rope_head_dim = aux_data["qk_rope_head_dim"]
         obj.kv_partition_axis = aux_data["kv_partition_axis"]
+        obj.dp_size = aux_data.get("dp_size", 1)
         obj.nope_dim = aux_data["nope_dim"]
         obj.rope_dim = aux_data["rope_dim"]
         obj.kv_dim = aux_data["kv_dim"]
@@ -981,12 +1123,12 @@ class MLATokenToKVPool(KVCache):
         """
         from sgl_jax.srt.kernels.mla.v2.kernel import get_kv_cache_shape
 
-        # MLA cache has no head axis to shard; replicate across the mesh.
-        self.kv_sharding = NamedSharding(self.mesh, P(None, None, None, None))
+        # MLA cache has no head axis to shard; page axis is sharded by DP.
+        self.kv_sharding = NamedSharding(self.mesh, P("data", None, None, None))
 
         assert self.size % self.page_size == 0, "Cache size must be divisible by page size"
 
-        total_num_pages = (self.size + self.page_size) // self.page_size
+        total_num_pages = (self.size + self.page_size * self.dp_size) // self.page_size
         buffer_shape = get_kv_cache_shape(
             total_num_pages=total_num_pages,
             page_size=self.page_size,
@@ -1029,7 +1171,7 @@ class MLATokenToKVPool(KVCache):
         )
 
     def _buffer_bytes(self) -> int:
-        total_num_pages = (self.size + self.page_size) // self.page_size
+        total_num_pages = (self.size + self.page_size * self.dp_size) // self.page_size
         from sgl_jax.srt.kernels.mla.v2.kernel import get_kv_cache_shape
 
         shape = get_kv_cache_shape(
@@ -1072,7 +1214,7 @@ class MLATokenToKVPool(KVCache):
             "the MLA v2 kernel writes the cache in-place via input_output_aliases."
         )
 
-    def replace_kv_buffer(self, kv_buffer: list[jax.Array]) -> None:
+    def replace_buffer(self, kv_buffer: list[jax.Array]) -> None:
         self.kv_buffer[self.start_layer : self.start_layer + len(kv_buffer)] = kv_buffer
 
     def get_cpu_copy(self, indices):
@@ -1092,3 +1234,175 @@ class MLATokenToKVPool(KVCache):
             kv_host = kv_cache_host[layer_id]
             kv_device = jax.device_put(kv_host, self.kv_sharding)
             self.kv_buffer[layer_id] = self.kv_buffer[layer_id].at[indices].set(kv_device)
+
+
+@register_pytree_node_class
+class HybridLinearKVPool(KVCache):
+    """KV cache wrapper for hybrid linear-recurrent models (e.g. Kimi-Linear).
+
+    Composition + global->physical id translation. Owns ONE inner KV pool
+    sized to len(full_attention_layer_ids); KDA / linear-recurrent layers do
+    not allocate KV slots here (they live in RecurrentStatePool).
+
+    Translates GLOBAL layer_id -> inner-pool physical index in every
+    accessor, so attention backends and models stay global-`layer_id`-aware.
+    """
+
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        dtype: jnp.dtype,
+        full_attention_layer_ids: list[int],
+        mesh: Mesh,
+        token_to_kv_pool_class: type[KVCache] = MHATokenToKVPool,
+        **kvcache_kwargs,
+    ):
+        self.mesh = mesh
+        self.full_attention_layer_ids = list(full_attention_layer_ids)
+        self.full_layer_nums = len(self.full_attention_layer_ids)
+
+        self.full_kv_pool = token_to_kv_pool_class(
+            size=size,
+            page_size=page_size,
+            dtype=dtype,
+            layer_num=self.full_layer_nums,
+            mesh=mesh,
+            **kvcache_kwargs,
+        )
+
+        self.full_attention_layer_id_mapping: dict[int, int] = {
+            global_id: i for i, global_id in enumerate(self.full_attention_layer_ids)
+        }
+        self._sync_inner_pool_attrs()
+
+    def _sync_inner_pool_attrs(self) -> None:
+        """Sync public attributes from inner pool for interface compatibility."""
+        self.size = self.full_kv_pool.size
+        self.page_size = self.full_kv_pool.page_size
+        self.dtype = self.full_kv_pool.dtype
+        self.layer_num = self.full_kv_pool.layer_num
+        self.mesh = self.full_kv_pool.mesh
+        self.start_layer = self.full_kv_pool.start_layer
+        self.end_layer = self.full_kv_pool.end_layer
+        self.mem_usage = self.full_kv_pool.mem_usage
+        self.kv_sharding = self.full_kv_pool.kv_sharding
+
+    def _to_physical(self, layer_id: int) -> int:
+        if layer_id not in self.full_attention_layer_id_mapping:
+            raise ValueError(
+                f"layer_id {layer_id} is not a full-attention layer "
+                f"(KDA/linear-recurrent layers do not use the KV pool); "
+                f"full_attention_layer_ids={self.full_attention_layer_ids}"
+            )
+        return self.full_attention_layer_id_mapping[layer_id]
+
+    def get_fused_kv_buffer(self, layer_id: int) -> jax.Array:
+        return self.full_kv_pool.get_fused_kv_buffer(self._to_physical(layer_id))
+
+    def get_kv_buffer(self, layer_id: int):
+        return self.full_kv_pool.get_kv_buffer(self._to_physical(layer_id))
+
+    def set_kv_buffer(
+        self,
+        layer_id: int,
+        loc: jax.Array,
+        cache_k: jax.Array,
+        cache_v: jax.Array = None,
+        is_decode: bool = False,
+    ) -> None:
+        self.full_kv_pool.set_kv_buffer(
+            self._to_physical(layer_id), loc, cache_k, cache_v, is_decode
+        )
+
+    def replace_buffer(self, kv_buffer: list[jax.Array]) -> None:
+        """Accept COMPACTED list (length L_full, in full_attention_layer_ids order).
+
+        Differs from SWAKVPool.replace_buffer which expects full-length input —
+        KDA layers don't write KV pool, so the model emits a compacted list.
+        """
+        if len(kv_buffer) != self.full_layer_nums:
+            raise ValueError(
+                f"HybridLinearKVPool.replace_buffer expects compacted list of "
+                f"length {self.full_layer_nums} "
+                f"(= len(full_attention_layer_ids)={self.full_attention_layer_ids}), "
+                f"got {len(kv_buffer)}"
+            )
+        self.full_kv_pool.replace_buffer(kv_buffer)
+
+    def get_kv_size_bytes(self):
+        return self.full_kv_pool.get_kv_size_bytes()
+
+    def get_cpu_copy(self, indices):
+        return self.full_kv_pool.get_cpu_copy(indices)
+
+    def load_cpu_copy(self, kv_cache_host, indices):
+        return self.full_kv_pool.load_cpu_copy(kv_cache_host, indices)
+
+    def clear_cache(self, indices: jax.Array):
+        return self.full_kv_pool.clear_cache(indices)
+
+    # full_kv_pool MUST be a pytree child (not aux_data): MemoryPools'
+    # donate_argnames=["memory_pools"] needs the inner KV buffers as leaves.
+
+    def tree_flatten(self):
+        children = (self.full_kv_pool,)
+        aux_data = {
+            "mesh": self.mesh,
+            "mem_usage": self.mem_usage,
+            "full_attention_layer_ids": tuple(self.full_attention_layer_ids),
+            "full_layer_nums": self.full_layer_nums,
+            "full_attention_layer_id_mapping": tuple(
+                sorted(self.full_attention_layer_id_mapping.items())
+            ),
+        }
+        return (children, aux_data)
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        obj = object.__new__(cls)
+        obj.mesh = aux_data["mesh"]
+        obj.mem_usage = aux_data["mem_usage"]
+        obj.full_attention_layer_ids = list(aux_data["full_attention_layer_ids"])
+        obj.full_layer_nums = aux_data["full_layer_nums"]
+        obj.full_attention_layer_id_mapping = dict(aux_data["full_attention_layer_id_mapping"])
+        obj.full_kv_pool = children[0]
+        obj._sync_inner_pool_attrs()
+        return obj
+
+
+@register_pytree_node_class
+class MemoryPools:
+    """Pytree container that uniformly manages multiple pool replace operations."""
+
+    def __init__(self, **pools):
+        self._pools = pools
+
+    def __getattr__(self, name):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        try:
+            return self._pools[name]
+        except KeyError:
+            raise AttributeError(
+                f"MemoryPools has no pool '{name}'. " f"Available pools: {sorted(self._pools)}"
+            ) from None
+
+    def tree_flatten(self):
+        keys = sorted(self._pools.keys())
+        return [self._pools[k] for k in keys], tuple(keys)
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        return cls(**dict(zip(aux_data, children)))
+
+    def replace_all(self, updates) -> None:
+        if isinstance(updates, list):
+            updates = {"token_to_kv_pool": updates}
+        if set(updates.keys()) != set(self._pools.keys()):
+            raise ValueError(
+                f"replace_all: updates keys {sorted(updates.keys())} "
+                f"must exactly match MemoryPools keys {sorted(self._pools.keys())}"
+            )
+        for key, value in updates.items():
+            self._pools[key].replace_buffer(value)
