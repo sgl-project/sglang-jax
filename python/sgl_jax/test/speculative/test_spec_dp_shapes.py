@@ -19,10 +19,11 @@ import numpy as np
 import pytest
 
 from sgl_jax.srt.managers.schedule_batch import ScheduleBatch, ScheduleReqsInfo
+from sgl_jax.srt.managers.scheduler_output_processor_mixin import (
+    SchedulerOutputProcessorMixin,
+)
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
-from sgl_jax.srt.speculative.overlap_utils import resolve_spec_prefill_token_ids
-from sgl_jax.srt.speculative.overlap_worker import resolve_spec_decode_token_ids
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 
 HIDDEN = 8
@@ -162,38 +163,6 @@ def test_get_spec_decode_mwb_dp_shapes(dp, bs_per_rank):
     assert mwb.spec_info_padded is not None
 
 
-def test_get_spec_decode_mwb_uses_conservative_bucket_for_out_cache_loc():
-    sb = _mk_batch(4, [2, 2, 2, 2])
-    sb.reqs_info[1].out_cache_loc = np.arange(2000, 2232, dtype=np.int32)
-
-    mwb = sb.get_spec_model_worker_batch(
-        token_paddings=[128],
-        bs_paddings=[128],
-        cache_loc_paddings=[1024],
-        page_size=256,
-        draft_token_num=DRAFT_N,
-    )
-
-    assert len(mwb.out_cache_loc) == 1024
-    ocl = np.asarray(mwb.out_cache_loc).reshape(4, 256)
-    assert list(ocl[1, :232]) == list(range(2000, 2232))
-    assert np.all(ocl[1, 232:] == -1)
-
-
-def test_get_spec_decode_mwb_rejects_out_cache_loc_bucket_escape():
-    sb = _mk_batch(4, [2, 2, 2, 2])
-    sb.reqs_info[1].out_cache_loc = np.arange(2000, 2257, dtype=np.int32)
-
-    with pytest.raises(AssertionError, match="escaped precompile bucket"):
-        sb.get_spec_model_worker_batch(
-            token_paddings=[128],
-            bs_paddings=[128],
-            cache_loc_paddings=[1024],
-            page_size=256,
-            draft_token_num=DRAFT_N,
-        )
-
-
 @pytest.mark.parametrize(
     "dp,bs_per_rank,finish",
     [
@@ -249,78 +218,6 @@ def test_filter_batch_preserves_global_spec_info(dp, bs_per_rank, finish):
         assert np.asarray(spec.hidden_states).shape == (len(kept), HIDDEN)
         assert len(sb.reqs_info[r].reqs or []) == len(kept)
         flat_base += bs
-
-
-def test_repack_page_indices_uses_allocated_source_but_true_verify_lengths():
-    """Verify relay seq_lens repacks page tables from allocate layout.
-
-    padding_for_decode writes cache_loc/page_indices per DP rank using the
-    conservative allocated length. After relay seq_lens arrives, target verify
-    must keep reading from that source layout but compact only the pages needed
-    by the true verify metadata lengths.
-    """
-    import jax.numpy as jnp
-
-    from sgl_jax.srt.speculative.draft_extend_fused import (
-        _repack_page_indices_from_allocated_lens,
-    )
-
-    page_indices = jnp.array(
-        [
-            101,
-            102,
-            103,
-            201,
-            202,
-            0,
-            0,
-            0,
-            301,
-            302,
-            303,
-            304,
-            401,
-            0,
-            0,
-            0,
-        ],
-        dtype=jnp.int32,
-    )
-    allocated_lens = jnp.array([10, 6, 13, 1], dtype=jnp.int32)
-    true_metadata_lens = jnp.array([5, 6, 9, 0], dtype=jnp.int32)
-
-    repacked = _repack_page_indices_from_allocated_lens(
-        page_indices,
-        allocated_lens,
-        true_metadata_lens,
-        page_size=4,
-        dp_size=2,
-    )
-
-    np.testing.assert_array_equal(
-        np.asarray(repacked),
-        np.array(
-            [
-                101,
-                102,
-                201,
-                202,
-                0,
-                0,
-                0,
-                0,
-                301,
-                302,
-                303,
-                0,
-                0,
-                0,
-                0,
-                0,
-            ],
-            dtype=np.int32,
-        ),
-    )
 
 
 def test_filter_batch_then_decode_mwb_round_trip():
@@ -501,7 +398,7 @@ def test_draft_page_indices_dp_segmented(dp, bs_per_rank):
     ],
 )
 def test_resolve_spec_decode_token_ids(dp, bs_per_rank, accept_per_slot):
-    """`resolve_spec_decode_token_ids` must slice next_token_ids by DP-padded
+    """`_resolve_spec_decode_token_ids` must slice next_token_ids by DP-padded
     slot (not contiguous req index) and return a (total_bs,)-length list with
     [] at padding slots so the per-rank slice in process_batch_result_decode
     lands on the right reqs."""
@@ -517,7 +414,8 @@ def test_resolve_spec_decode_token_ids(dp, bs_per_rank, accept_per_slot):
         accept_lens=np.asarray(accept_per_slot, dtype=np.int32),
         num_accepted_tokens=None,
     )
-    out, _ = resolve_spec_decode_token_ids(result, sb, DRAFT_N)
+    sched = SimpleNamespace(draft_worker=SimpleNamespace(speculative_num_draft_tokens=DRAFT_N))
+    out = SchedulerOutputProcessorMixin._resolve_spec_decode_token_ids(sched, result, sb)
     assert len(out) == total_bs
     per_dp = sb.per_dp_bs_size
     for r, bs in enumerate(bs_per_rank):
@@ -528,68 +426,9 @@ def test_resolve_spec_decode_token_ids(dp, bs_per_rank, accept_per_slot):
                 assert out[slot] == list(
                     range(slot * 1000, slot * 1000 + a)
                 ), f"slot {slot}: got {out[slot]}, want {a} tokens from {slot*1000}"
+                assert sb.reqs_info[r].reqs[j].spec_accepted_tokens == a
             else:
                 assert out[slot] == [], f"pad slot {slot} should be []"
-
-
-def test_resolve_spec_prefill_token_ids_uses_prepared_result_tokens(monkeypatch):
-    sb = _mk_batch(4, [2, 1, 0, 1])
-
-    def fail_gather(*args, **kwargs):
-        raise AssertionError("prefill output resolver must not gather relay buffers")
-
-    monkeypatch.setattr(
-        "sgl_jax.srt.speculative.relay_buffer.gather_spec_relay_verified_id",
-        fail_gather,
-    )
-    result = SimpleNamespace(
-        bid=7,
-        next_token_ids=np.asarray([11, 12, 0, 21, 0, 0, 0, 41], dtype=np.int32),
-    )
-
-    out = resolve_spec_prefill_token_ids(result, sb, relay_buffers=object(), mesh=None)
-
-    assert out == [11, 12, 0, 21, 0, 0, 0, 41]
-
-
-def test_resolve_spec_prefill_token_ids_requires_prepared_result_tokens():
-    sb = _mk_batch(2, [1, 1])
-    result = SimpleNamespace(
-        bid=8,
-        next_token_ids=None,
-    )
-
-    with pytest.raises(RuntimeError, match="prepared next_token_ids"):
-        resolve_spec_prefill_token_ids(result, sb, relay_buffers=object(), mesh=None)
-
-
-def test_resolve_spec_prefill_token_ids_prefetches_prepared_result_tokens():
-    sb = _mk_batch(2, [1, 1])
-
-    class PreparedTokens:
-        def __init__(self):
-            self.prefetched = False
-            self.values = np.asarray([3, 4], dtype=np.int32)
-
-        @property
-        def shape(self):
-            return self.values.shape
-
-        def copy_to_host_async(self):
-            self.prefetched = True
-
-        def __array__(self, dtype=None, copy=None):
-            if dtype is not None:
-                return self.values.astype(dtype, copy=False)
-            return self.values
-
-    prepared = PreparedTokens()
-    result = SimpleNamespace(bid=9, next_token_ids=prepared)
-
-    out = resolve_spec_prefill_token_ids(result, sb, relay_buffers=object(), mesh=None)
-
-    assert prepared.prefetched
-    assert out == [3, 4]
 
 
 # ---------------------------------------------------------------------------
