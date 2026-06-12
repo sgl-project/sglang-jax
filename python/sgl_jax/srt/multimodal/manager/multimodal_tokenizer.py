@@ -582,15 +582,7 @@ class MultimodalTokenizer(TokenizerManager):
         processor = self.mm_processor
         if processor is None:
             return False
-        # Consider both the processor itself and any HF processor it wraps, so a
-        # composed host processor (e.g. MiMoV25Processor over Qwen2.5-VL) still routes
-        # video through Qwen preprocessing. `wrapped_hf_processor` is the wrapping
-        # convention; plain processors don't expose it.
-        names = {processor.__class__.__name__}
-        wrapped = getattr(processor, "wrapped_hf_processor", None)
-        if wrapped is not None:
-            names.add(wrapped.__class__.__name__)
-        return bool(names & self._QWEN_VIDEO_PROCESSORS)
+        return bool({processor.__class__.__name__} & self._QWEN_VIDEO_PROCESSORS)
 
     def _build_qwen_video_config(self, obj: GenerateMMReqInput | GenerateOmniReqInput) -> dict:
         video_config: dict[str, Any] = {}

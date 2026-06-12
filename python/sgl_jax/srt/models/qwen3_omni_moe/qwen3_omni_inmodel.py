@@ -224,6 +224,3 @@ class Qwen3OmniMoeForConditionalGeneration(nnx.Module):
         else:
             loader.load_weights_from_safetensors(mappings)
         logger.info("Qwen3-Omni Thinker (in-model) weights loaded: %d mappings", len(mappings))
-
-
-EntryClass = [Qwen3OmniMoeForConditionalGeneration]

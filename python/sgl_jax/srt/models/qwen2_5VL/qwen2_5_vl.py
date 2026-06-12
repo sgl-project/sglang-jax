@@ -388,6 +388,3 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
                         kv_head_padding=kvpad,
                     )
         return m
-
-
-EntryClass = [Qwen2_5_VLForConditionalGeneration]

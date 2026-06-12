@@ -215,6 +215,3 @@ class MiMoV2_5ForConditionalGeneration(nnx.Module):
             logger.debug(
                 "G2-b dtype check skipped (tower param path changed); mapping check passed"
             )
-
-
-EntryClass = [MiMoV2_5ForConditionalGeneration]

@@ -55,7 +55,6 @@ def assemble_mm_inputs(mm_inputs: dict | None) -> dict[str, Any]:
     ``image_grid_thw``, ``video_grid_thw``.
     """
     out: dict[str, Any] = {
-        "pixel_values": None,
         "pixel_values_images": None,
         "pixel_values_videos": None,
         "audio_codes": None,
@@ -81,8 +80,6 @@ def assemble_mm_inputs(mm_inputs: dict | None) -> dict[str, Any]:
     video_feats = [it.feature for it in videos]
     out["pixel_values_images"] = _concat(image_feats)
     out["pixel_values_videos"] = _concat(video_feats)
-    # combined image+video features, for the vit stage which takes a single pixel_values
-    out["pixel_values"] = _concat(image_feats + video_feats)
     # A model's audio is either discrete codes or continuous features, not both.
     out["audio_codes"] = _concat([it.feature for it in codes_audio])
     out["audio_features"] = _concat([it.feature for it in cont_audio])
