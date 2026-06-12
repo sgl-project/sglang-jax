@@ -41,10 +41,24 @@ class ModelWorkerClient:
         self.max_running_requests = self.worker.max_running_requests
         self.device = self.worker.device
 
-        # Init future mappings
+        # Init future mappings.
+        # Size the map/limit by the largest decode WRITE WIDTH, NOT max_running_requests: every
+        # overlap step writes -- and steps future_token_ids_ct by -- the full PADDED batch width
+        # (= len(model_worker_batch.seq_lens), bounded by the largest decode bs bucket). When that
+        # width exceeds the old mrr*3 limit, future_token_ids_ct wraps by bs%limit, adjacent steps'
+        # writes overlap in the map, and a prior step's padding-slot token overwrites the next
+        # step's real token -> degenerate repeating decode that never hits EOS. This bit MiMo-V2.5
+        # in-model (fused-MoE ep-align pushed the decode bs bucket to 32 while a 1M context_len
+        # squeezed mrr to 8 -> limit 24 < 32), but it is GENERAL: any config with a decode bs
+        # bucket > mrr*3 (incl. pure-text MoE) corrupts. Root cause + TPU verification:
+        # tmp/refactor/m4-mimo-review.md §8b. Bound by both so neither term under-sizes the map.
+        # TODO: also make set_future_token_ids write only the real rows (not the padded tail) as
+        # defense in depth, so padding ids never enter the map regardless of sizing.
+        max_bs_bucket = max(self.worker.get_precompile_paddings()[1])
+        fut_base = max(self.max_running_requests, max_bs_bucket)
         self.future_token_ids_ct = 0
-        self.future_token_ids_limit = self.max_running_requests * 3
-        self.future_token_ids_map = jnp.zeros((self.max_running_requests * 5,), dtype=jnp.int32)
+        self.future_token_ids_limit = fut_base * 3
+        self.future_token_ids_map = jnp.zeros((fut_base * 5,), dtype=jnp.int32)
         self.mesh = mesh
         sharding = NamedSharding(mesh, PartitionSpec(None))
         self.future_token_ids_map = jax.device_put(self.future_token_ids_map, sharding)

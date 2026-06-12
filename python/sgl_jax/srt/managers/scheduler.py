@@ -565,24 +565,22 @@ class Scheduler(
         server_args = self.server_args
         self.model_config = ModelConfig.from_server_args(server_args)
         self.is_generation = self.model_config.is_generation
-        # In-model multimodal (e.g. MiMo-V2.5 / Qwen2.5-VL routed via the standard server WITHOUT
-        # --multimodal) must also run with overlap schedule OFF: the per-req encode pass
-        # (encode_mm_reqs) runs synchronously on the scheduler thread before the batch, which does
-        # not compose with the overlapped (pipelined) decode -> corrupted decode (degenerate
-        # output). Mirror the --multimodal disable above for the is_multimodal case. (The staged
-        # path got this for free via the --multimodal flag.)
+        # TEMPORARY (pending re-validation): disable overlap for in-model multimodal.
         #
-        # NOTE: this is a blunt instrument -- it disables overlap for ALL in-model multimodal,
-        # single-host included, so a pure-decode throughput win that overlap would give is forgone
-        # even on requests with no media in flight. The precise pollution mechanism (encode-jit
-        # device queue interleaving vs the overlap thread's in-flight forward) is not yet pinned.
-        # TODO(overlap×encode 专项): locate the root cause, then re-enable overlap behind a fine
-        # gate (only disable while an encode pass is actually pending, or move encode to an
-        # overlap-safe injection point / its own pipeline stage). When encode and decode run
-        # concurrently again, G1's max()-based vision reserve assumption (design §5.7) must revert
-        # to additive -- see _vision_activation_reserve_bytes.
+        # CORRECTION: the original attribution here -- "the synchronous encode_mm_reqs pass corrupts
+        # the overlapped decode" -- was WRONG. The real root cause was a future_token_ids_map sizing
+        # bug (the map was sized by max_running_requests but each overlap step writes the full padded
+        # decode bs bucket; when bucket > mrr*3 the wrap overwrote real tokens with padding ->
+        # degenerate decode). That is now fixed at the source in tp_worker_overlap_thread.py (size by
+        # the max decode bs bucket), so this disable is no longer the actual fix -- it is retained
+        # only as a conservative measure until overlap-ON is re-validated end-to-end for in-model
+        # multimodal on TPU. Full analysis + TPU verification: tmp/refactor/m4-mimo-review.md §8b.
+        # TODO: remove this gate after the overlap-ON re-validation passes (encode is innocent --
+        # it never runs on decode steps; pure-decode VLM throughput is forgone meanwhile). When the
+        # gate is removed and overlap can run with an encode pass, recheck G1's max()-based vision
+        # reserve (design §5.7) -- it only matters under --vision-max-patches, unused today.
         if getattr(self.model_config, "is_multimodal", False) and self.enable_overlap:
-            logger.info("In-model multimodal: disabling overlap schedule")
+            logger.info("In-model multimodal: disabling overlap schedule (temporary, see §8b)")
             self.enable_overlap = False
         if server_args.skip_tokenizer_init:
             self.tokenizer = self.processor = None
