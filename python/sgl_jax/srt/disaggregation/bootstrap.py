@@ -362,6 +362,13 @@ class BootstrapClient:
         self._register_retries = register_retries
         self._register_retry_delay_s = register_retry_delay_s
         self._shared_secret = shared_secret
+        # Reuse one client (and its connection pool + SSL context) across
+        # calls. ``httpx.get``/``httpx.post`` build a throwaway client per
+        # call, which rebuilds the SSL context every time; under load that
+        # blocked the single-threaded decode event loop inside
+        # ``get_prefill_info``. ``httpx.Client`` is thread-safe, so the prefill
+        # heartbeat daemon and the decode loop can share this instance.
+        self._client = httpx.Client(timeout=timeout_s)
 
     @property
     def base_url(self) -> str:
@@ -373,7 +380,7 @@ class BootstrapClient:
         return bearer_header(self._shared_secret)
 
     def health(self) -> bool:
-        r = httpx.get(f"{self._base_url}/health", timeout=self._timeout_s)
+        r = self._client.get(f"{self._base_url}/health", timeout=self._timeout_s)
         return r.status_code == 200
 
     def register_prefill(
@@ -409,7 +416,7 @@ class BootstrapClient:
         last_err: Exception | None = None
         for attempt in range(self._register_retries):
             try:
-                r = httpx.post(
+                r = self._client.post(
                     f"{self._base_url}/register_prefill",
                     json=payload,
                     timeout=self._timeout_s,
@@ -435,7 +442,7 @@ class BootstrapClient:
         )
 
     def heartbeat(self, bootstrap_key: str) -> None:
-        r = httpx.post(
+        r = self._client.post(
             f"{self._base_url}/heartbeat",
             json={"bootstrap_key": bootstrap_key},
             timeout=self._timeout_s,
@@ -444,7 +451,7 @@ class BootstrapClient:
         r.raise_for_status()
 
     def unregister_prefill(self, bootstrap_key: str) -> None:
-        r = httpx.post(
+        r = self._client.post(
             f"{self._base_url}/unregister_prefill",
             json={"bootstrap_key": bootstrap_key},
             timeout=self._timeout_s,
@@ -453,7 +460,7 @@ class BootstrapClient:
         r.raise_for_status()
 
     def list_prefills(self) -> list[dict[str, object]]:
-        r = httpx.get(
+        r = self._client.get(
             f"{self._base_url}/list_prefills",
             timeout=self._timeout_s,
             headers=self._headers(),
@@ -462,7 +469,7 @@ class BootstrapClient:
         return r.json()["prefills"]
 
     def get_prefill_info(self, bootstrap_room: int) -> dict[str, object]:
-        r = httpx.get(
+        r = self._client.get(
             f"{self._base_url}/get_prefill_info",
             params={"bootstrap_room": bootstrap_room},
             timeout=self._timeout_s,

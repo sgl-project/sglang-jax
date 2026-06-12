@@ -107,6 +107,7 @@ class JaxTransferKVManager(CommonKVManager):
         ack_timeout_seconds: float = 60.0,
         pull_timeout_seconds: float = 30.0,
         reaper_interval_seconds: float = 5.0,
+        pull_worker_count: int = 4,
     ) -> None:
         super().__init__(
             ack_timeout_seconds=ack_timeout_seconds,
@@ -116,18 +117,26 @@ class JaxTransferKVManager(CommonKVManager):
         self._wrapper = wrapper
         self._zmq_notifier = zmq_notifier
         self._host_pool = host_pool
-        # A single long-lived worker drains the pull queue and runs the
-        # blocking ``wrapper.pull`` off the decode event-loop thread. On TPU
-        # ``link.pull`` is synchronous, so dispatching it inline in ``poll()``
-        # would freeze the single-threaded decode event loop. The worker is
-        # created once here (not per-request) and lives for the process.
+        # A small pool of long-lived workers drains the pull queue and runs
+        # the blocking ``wrapper.pull`` off the decode event-loop thread. On
+        # TPU ``link.pull`` (``_pull_flat``) is a synchronous native call, so
+        # dispatching it inline in ``poll()`` would freeze the single-threaded
+        # decode event loop. A *single* worker is not enough either: one slow
+        # or stalled pull would head-of-line-block every queued pull. With N
+        # workers (``pull_worker_count``, matched to the transfer engine's
+        # ``max_num_parallel_copies``) concurrent pulls proceed in parallel and
+        # a stalled pull only ties up one worker until its ``timeout`` fires.
+        self._pull_worker_count = max(1, int(pull_worker_count))
         self._pull_queue: _queue.Queue[JaxTransferKVReceiver | None] = _queue.Queue()
-        self._pull_worker = threading.Thread(
-            target=self._pull_worker_loop,
-            name="jax-kv-pull-worker",
-            daemon=True,
-        )
-        self._pull_worker.start()
+        self._pull_workers: list[threading.Thread] = []
+        for i in range(self._pull_worker_count):
+            t = threading.Thread(
+                target=self._pull_worker_loop,
+                name=f"jax-kv-pull-worker-{i}",
+                daemon=True,
+            )
+            t.start()
+            self._pull_workers.append(t)
 
     def enqueue_pull(self, receiver: JaxTransferKVReceiver) -> None:
         """Hand a TRANSFERRING receiver to the background pull worker.
@@ -324,6 +333,15 @@ class JaxTransferKVSender(KVSender, StateHolder):
                 self._mgr.zmq_notifier.unregister_callback(callback_uuid)
                 raise
             self._status = status
+            if self._use_d2h_staging:
+                # Staging copied the payload to host (copy_from_device blocks)
+                # and registered the HOST arrays for pull, so the device gather
+                # output is no longer referenced by the transfer. Drop our ref
+                # to free that HBM now; otherwise every sender still queued for
+                # the decode ack keeps its device KV alive, accumulating until
+                # prefill OOMs. Path B registers HBM arrays directly, so those
+                # must stay alive until the ack.
+                self._payload = None
             self._transition_to(KVPoll.TRANSFERRING)
             self._ack_timer = time_phase("ack", "prefill")
             self._ack_timer.__enter__()
@@ -601,13 +619,11 @@ class JaxTransferKVReceiver(KVReceiver, StateHolder):
         return self.state
 
     def _run_pull(self) -> None:
-        """Run the blocking pull on the background worker thread.
-
-        On TPU ``wrapper.pull`` blocks until the transfer completes, so it
-        must never run on the decode event-loop thread. Results are stored
-        under ``_state_lock`` and only if the receiver is still TRANSFERRING;
-        a reaper ``fail()`` that already moved the state to FAILED wins, and
-        the late results are dropped.
+        """Run the pull on a background worker thread, off the decode
+        event-loop thread. Results are stored under ``_state_lock`` and only
+        if the receiver is still TRANSFERRING; a reaper ``fail()`` that
+        already moved the state to FAILED wins, and the late results are
+        dropped.
         """
 
         assert self._metadata is not None

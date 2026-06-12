@@ -225,17 +225,19 @@ def test_poll_never_spawns_thread():
     assert threading.active_count() == before
 
 
-def test_manager_owns_one_persistent_pull_worker():
-    """The manager starts exactly one long-lived worker that drains the
-    queue and runs each receiver's blocking pull off the event loop."""
+def test_manager_owns_persistent_pull_worker_pool():
+    """The manager starts a pool of long-lived workers that drain the queue
+    and run each receiver's blocking pull off the event loop."""
 
-    mgr = JaxTransferKVManager(wrapper=object(), zmq_notifier=object())
+    mgr = JaxTransferKVManager(
+        wrapper=object(), zmq_notifier=object(), pull_worker_count=4
+    )
 
     worker_threads = [
-        t for t in threading.enumerate() if t.name == "jax-kv-pull-worker"
+        t for t in threading.enumerate() if t.name.startswith("jax-kv-pull-worker")
     ]
-    assert len(worker_threads) == 1
-    assert worker_threads[0].daemon
+    assert len(worker_threads) == 4
+    assert all(t.daemon for t in worker_threads)
 
     ran = threading.Event()
 
