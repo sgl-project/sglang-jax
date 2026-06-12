@@ -2023,6 +2023,13 @@ class Scheduler(
                     )
         else:
             extend_logprob_start_len_per_req = None
+        spec_relay_buffers = None
+        prefill_relay_future_indices = None
+        if self.spec_algorithm is not None and not self.spec_algorithm.is_none():
+            spec_relay_buffers = getattr(batch_output, "spec_relay_buffers", None)
+            prefill_relay_future_indices = getattr(
+                batch_output, "prefill_relay_future_indices", None
+            )
 
         ret = GenerationBatchResult(
             logits_output=logits_output,
@@ -2040,10 +2047,8 @@ class Scheduler(
             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
             bid=bid,
             cache_miss_count=cache_miss_count,
-            spec_relay_buffers=getattr(batch_output, "spec_relay_buffers", None),
-            prefill_relay_future_indices=getattr(
-                batch_output, "prefill_relay_future_indices", None
-            ),
+            spec_relay_buffers=spec_relay_buffers,
+            prefill_relay_future_indices=prefill_relay_future_indices,
         )
         if (
             self.spec_algorithm is not None

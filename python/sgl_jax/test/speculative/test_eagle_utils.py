@@ -453,6 +453,31 @@ class TestVerifyTree(CustomTestCase):
         self.assertLess(defer_pos, extract_pos)
         self.assertNotIn("accept_lens", source[defer_pos:extract_pos])
 
+    def test_scheduler_no_spec_path_does_not_read_spec_batch_output(self):
+        from sgl_jax.srt.managers.scheduler import Scheduler
+
+        source = inspect.getsource(Scheduler.run_batch)
+        ret_pos = source.index("ret = GenerationBatchResult")
+        ret_source = source[ret_pos:]
+        relay_pos = source.index(
+            'spec_relay_buffers = getattr(batch_output, "spec_relay_buffers", None)'
+        )
+        guard_pos = source.rindex(
+            "if self.spec_algorithm is not None and not self.spec_algorithm.is_none():",
+            0,
+            relay_pos,
+        )
+
+        self.assertNotIn(
+            'spec_relay_buffers=getattr(batch_output, "spec_relay_buffers", None)',
+            ret_source,
+        )
+        self.assertNotIn(
+            'batch_output, "prefill_relay_future_indices", None',
+            ret_source,
+        )
+        self.assertLess(guard_pos, relay_pos)
+
     def test_overlap_scheduler_uses_spec_sampling_info_owner(self):
         from sgl_jax.srt.managers.scheduler import Scheduler
 
