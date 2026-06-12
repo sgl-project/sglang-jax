@@ -32,6 +32,10 @@ from sgl_jax.srt.layers.embeddings import Embed
 from sgl_jax.srt.multimodal.models.mimo_v2_5.audio_encoder import (
     MiMoV25AudioUnderstandingEncoder,
 )
+from sgl_jax.srt.multimodal.models.mimo_v2_5.config_utils import (
+    get_config_value,
+    normalize_vision_config,
+)
 from sgl_jax.srt.multimodal.models.mimo_v2_5.weights_mapping import (
     build_embedding_weight_mappings,
     create_mimo_vision_weight_mappings,
@@ -56,20 +60,6 @@ class MiMoV2_5Embedding(nnx.Module):
     # the runner applies MiMo-V2.5 host-side audio payload/codes validation. Audio is
     # OPTIONAL — text-only / vision-only / any-subset requests skip the audio path.
     uses_mimo_v25_audio_contract: bool = True
-
-    @staticmethod
-    def _get_config_value(config: PretrainedConfig, key: str, default=None):
-        # MiMo-V2.5 keeps several token ids (e.g. audio_token_id) only inside
-        # processor_config, so fall back to it when the top-level attr is missing.
-        value = getattr(config, key, None)
-        if value is not None:
-            return value
-        processor_config = getattr(config, "processor_config", None)
-        if isinstance(processor_config, dict):
-            return processor_config.get(key, default)
-        if processor_config is not None:
-            return getattr(processor_config, key, default)
-        return default
 
     def __init__(
         self,
@@ -112,7 +102,7 @@ class MiMoV2_5Embedding(nnx.Module):
             )
 
             self.visual = MiMoVisionTransformer(
-                self._normalize_vision_config(vision_config),
+                normalize_vision_config(vision_config),
                 dtype=dtype,
                 rngs=rngs,
             )
@@ -120,36 +110,10 @@ class MiMoV2_5Embedding(nnx.Module):
             self.visual = None
 
         # --- Per-modality scatter token ids ---
-        audio_token_id = self._get_config_value(config, "audio_token_id", 151669)
+        audio_token_id = get_config_value(config, "audio_token_id", 151669)
         self.audio_token_id = int(audio_token_id) if audio_token_id is not None else None
-        self.image_token_id = self._get_config_value(config, "image_token_id")
-        self.video_token_id = self._get_config_value(config, "video_token_id")
-
-    @staticmethod
-    def _normalize_vision_config(vision_config):
-        """Adapt the checkpoint's vision_config to what MiMoVisionTransformer expects.
-
-        The HF checkpoint stores ``in_chans`` (not ``in_channels``) and omits
-        ``qk_channels``; the real ViT head_dim is ``qk_channels`` default 64 (review
-        D1-1: 1280/32=40 is wrong — the model uses getattr(config,"qk_channels",64) and
-        vision_config has no qk_channels). Wrap the config to supply both without
-        mutating the shared hf_config. A wrong head_dim is caught at weight load (the
-        qkv shape won't match), so this is fail-safe.
-        """
-        from types import SimpleNamespace
-
-        def g(key, default=None):
-            if isinstance(vision_config, dict):
-                return vision_config.get(key, default)
-            return getattr(vision_config, key, default)
-
-        in_channels = g("in_channels", g("in_chans", 3))
-        qk_channels = g("qk_channels", 64)
-        # Carry every original field through, then override the two normalized names.
-        base = dict(vision_config) if isinstance(vision_config, dict) else dict(vars(vision_config))
-        base["in_channels"] = int(in_channels)
-        base["qk_channels"] = int(qk_channels)
-        return SimpleNamespace(**base)
+        self.image_token_id = get_config_value(config, "image_token_id")
+        self.video_token_id = get_config_value(config, "video_token_id")
 
     @classmethod
     def get_embed_model_config(cls, model_config: PretrainedConfig) -> PretrainedConfig:

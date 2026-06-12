@@ -42,11 +42,12 @@ from sgl_jax.srt.multimodal.models.qwen3_omni_moe.audio_encoder import (
 from sgl_jax.srt.multimodal.models.qwen3_omni_moe.qwen3_omni_thinker import (
     Qwen3OmniMoeThinkerTextForConditionalGeneration,
 )
-from sgl_jax.srt.multimodal.models.qwen3_omni_moe.qwen3_omni_thinker_embedding import (
-    Qwen3OmniMoeThinkerEmbedding,
-)
 from sgl_jax.srt.multimodal.models.qwen3_omni_moe.vision_encoder import (
     Qwen3OmniMoeVisionEncoder,
+)
+from sgl_jax.srt.multimodal.models.qwen3_omni_moe.weights_mapping import (
+    create_audio_tower_weight_mappings,
+    create_visual_weight_mappings,
 )
 
 logger = logging.getLogger(__name__)
@@ -194,7 +195,6 @@ class Qwen3OmniMoeForConditionalGeneration(nnx.Module):
         loader = WeightLoader(
             model=self, model_config=model_config, mesh=self.mesh, dtype=self.dtype
         )
-        emb = Qwen3OmniMoeThinkerEmbedding
         mappings = {}
 
         # The towers run fully replicated under the multi-chip AR mesh (design §3.3.5 / §5.7
@@ -206,8 +206,8 @@ class Qwen3OmniMoeForConditionalGeneration(nnx.Module):
         # original sharding was already trivial.
         tower_mappings = replicate_mappings(
             {
-                **emb._create_visual_weight_mappings(self.thinker_config.vision_config),
-                **emb._create_audio_tower_weight_mappings(self.thinker_config.audio_config),
+                **create_visual_weight_mappings(self.thinker_config.vision_config),
+                **create_audio_tower_weight_mappings(self.thinker_config.audio_config),
             }
         )
         assert_replicated(tower_mappings, where="Qwen3-Omni visual + audio tower")

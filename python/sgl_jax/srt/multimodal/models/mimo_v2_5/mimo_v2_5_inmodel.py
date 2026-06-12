@@ -33,7 +33,10 @@ from sgl_jax.srt.models.mimo_v2_pro import MiMoV2ForCausalLM
 from sgl_jax.srt.multimodal.models.mimo_v2_5.audio_encoder import (
     MiMoV25AudioUnderstandingEncoder,
 )
-from sgl_jax.srt.multimodal.models.mimo_v2_5.embedding import MiMoV2_5Embedding
+from sgl_jax.srt.multimodal.models.mimo_v2_5.config_utils import (
+    get_config_value,
+    normalize_vision_config,
+)
 from sgl_jax.srt.multimodal.models.mimo_v2_5.vision_encoder import MiMoVisionTransformer
 
 logger = logging.getLogger(__name__)
@@ -63,11 +66,11 @@ class MiMoV2_5ForConditionalGeneration(nnx.Module):
             audio_config, mesh=mesh, dtype=self.dtype, rngs=rngs
         )
         # MiMoVL ViT shared by image + video (HF `visual.*`); normalize config (in_chans->in_channels,
-        # qk_channels default 64) via the staged stage's helper to stay in sync.
+        # qk_channels default 64) via the shared config helper to stay in sync with the checkpoint.
         vision_config = getattr(config, "vision_config", None)
         if vision_config is not None:
             self.visual = MiMoVisionTransformer(
-                MiMoV2_5Embedding._normalize_vision_config(vision_config),
+                normalize_vision_config(vision_config),
                 dtype=self.dtype,
                 rngs=rngs,
             )
@@ -75,10 +78,10 @@ class MiMoV2_5ForConditionalGeneration(nnx.Module):
             self.visual = None
 
         # Per-modality placeholder token ids (audio_token_id may live only in processor_config).
-        self.audio_token_id = MiMoV2_5Embedding._get_config_value(config, "audio_token_id", 151669)
+        self.audio_token_id = get_config_value(config, "audio_token_id", 151669)
         self.audio_token_id = int(self.audio_token_id) if self.audio_token_id is not None else None
-        self.image_token_id = MiMoV2_5Embedding._get_config_value(config, "image_token_id")
-        self.video_token_id = MiMoV2_5Embedding._get_config_value(config, "video_token_id")
+        self.image_token_id = get_config_value(config, "image_token_id")
+        self.video_token_id = get_config_value(config, "video_token_id")
 
     # ---- per-modality encoders (model-owned towers) ----
 
