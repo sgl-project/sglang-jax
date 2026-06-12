@@ -1056,6 +1056,24 @@ class Scheduler(
                 req.deepstack_visual_embedding = recv_req.mm_inputs.get(
                     "deepstack_visual_embedding"
                 )
+        # Scheme B invariant (review M-4): the padded radix-key copy (cache_input_ids) MUST stay
+        # length-aligned with the clean origin_input_ids -- pad_input_tokens only substitutes
+        # placeholder ids in place, never changes the count. A mismatch means the processor's
+        # cache_input_ids rebuild is broken; silently keying the radix tree on origin_input_ids
+        # instead (the old fallback in Req.radix_key_ids) would let different-media requests that
+        # share a text prefix collide on the same cache key -> wrong KV reuse, cross-request
+        # answer bleed, zero logs. Abort this request loudly rather than corrupt the cache.
+        if req.cache_input_ids is not None and len(req.cache_input_ids) != len(
+            req.origin_input_ids
+        ):
+            req.set_finish_with_abort(
+                f"multimodal cache_input_ids length {len(req.cache_input_ids)} != input length "
+                f"{len(req.origin_input_ids)}; the Scheme-B radix key must stay length-aligned "
+                "with the clean ids (pad_input_tokens substitutes in place). This is a processor "
+                "bug -- aborting to avoid an unsafe radix cache key."
+            )
+            self._add_request_to_queue(req)
+            return
         # Validate prompt length
         error_msg = validate_input_length(
             req,

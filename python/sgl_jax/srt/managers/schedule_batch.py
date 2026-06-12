@@ -404,11 +404,19 @@ class Req:
         (adjust_max_prefix_ids) and *insert* (RadixCache.cache_{un,}finished_req) read this, so
         the two key namespaces stay consistent.
         """
-        if self.cache_input_ids is not None and len(self.cache_input_ids) == len(
-            self.origin_input_ids
-        ):
-            return self.cache_input_ids
-        return self.origin_input_ids
+        if self.cache_input_ids is None:
+            return self.origin_input_ids  # text request: byte-identical to the as-is path
+        # The length invariant is enforced loudly at intake (Scheduler.handle_generate_request,
+        # review M-4): a length-mismatched mm request is aborted there and never reaches the radix
+        # path. This assert is a tripwire for any future code path that sets cache_input_ids
+        # without going through intake -- it must never silently fall back to origin_input_ids
+        # (the old behaviour), which would collide different-media requests on a shared text
+        # prefix -> wrong KV reuse.
+        assert len(self.cache_input_ids) == len(self.origin_input_ids), (
+            f"cache_input_ids length {len(self.cache_input_ids)} != origin_input_ids "
+            f"{len(self.origin_input_ids)} (Scheme-B radix-key invariant, review M-4)"
+        )
+        return self.cache_input_ids
 
     def radix_fill_ids(self) -> list[int]:
         """Cache-keyed equivalent of the CURRENT ``fill_ids`` (Scheme B). ``fill_ids`` is
@@ -417,12 +425,15 @@ class Req:
         into the prompt portion and keep the output tail. Returns a list of ``len(fill_ids)``.
         (Using the full ``radix_key_ids`` here would insert a full-length key for a partial chunk's
         KV and corrupt the tree -> later chunks falsely match the whole sequence.)"""
-        if self.cache_input_ids is not None and len(self.cache_input_ids) == len(
-            self.origin_input_ids
-        ):
-            n_prompt = len(self.fill_ids) - len(self.output_ids)
-            return list(self.cache_input_ids[:n_prompt]) + list(self.fill_ids[n_prompt:])
-        return self.fill_ids
+        if self.cache_input_ids is None:
+            return self.fill_ids  # text request
+        # Length invariant enforced at intake (review M-4); tripwire as in radix_key_ids.
+        assert len(self.cache_input_ids) == len(self.origin_input_ids), (
+            f"cache_input_ids length {len(self.cache_input_ids)} != origin_input_ids "
+            f"{len(self.origin_input_ids)} (Scheme-B radix-key invariant, review M-4)"
+        )
+        n_prompt = len(self.fill_ids) - len(self.output_ids)
+        return list(self.cache_input_ids[:n_prompt]) + list(self.fill_ids[n_prompt:])
 
     def init_next_round_input(
         self,
