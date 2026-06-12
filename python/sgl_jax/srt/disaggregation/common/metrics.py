@@ -66,11 +66,13 @@ PD_TRANSFER_INFLIGHT = Gauge(
     "pd_transfer_inflight",
     "Currently in-flight PD transfers",
     labelnames=("role",),
+    multiprocess_mode="livesum",
 )
 PD_HOST_POOL_USED_BUFFERS = Gauge(
     "pd_host_pool_used_buffers",
     "QueueHostKVPool buffers currently allocated",
     labelnames=("pool_name",),
+    multiprocess_mode="livesum",
 )
 PD_TRANSFER_FAILURES_TOTAL = Counter(
     "pd_transfer_failures_total",
@@ -80,6 +82,7 @@ PD_TRANSFER_FAILURES_TOTAL = Counter(
 PD_BOOTSTRAP_REGISTRY_SIZE = Gauge(
     "pd_bootstrap_registry_size",
     "Number of P registrations in the bootstrap registry",
+    multiprocess_mode="mostrecent",
 )
 
 

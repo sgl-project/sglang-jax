@@ -6,6 +6,7 @@ import logging
 import threading
 import time
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import asdict, dataclass, field
 
 import httpx
@@ -266,6 +267,20 @@ def build_app(
                 detail="no prefill workers registered",
             )
         return info.to_dict()
+
+    # Bootstrap runs as a standalone single process and does NOT inherit
+    # PROMETHEUS_MULTIPROC_DIR, so it exposes its own default-registry
+    # /metrics (single-process) carrying pd_bootstrap_registry_size.
+    with suppress(ImportError):
+        from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+        from fastapi.responses import Response
+
+        @app.get("/metrics")
+        def metrics() -> Response:
+            return Response(
+                content=generate_latest(),
+                media_type=CONTENT_TYPE_LATEST,
+            )
 
     return app, registry
 
