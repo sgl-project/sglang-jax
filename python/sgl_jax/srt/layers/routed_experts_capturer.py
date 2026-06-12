@@ -12,6 +12,7 @@ import os
 import threading
 import time
 from abc import ABC, abstractmethod
+from typing import Any
 
 import jax
 import numpy as np
@@ -376,8 +377,8 @@ class _ExpertBalanceAnalyzer:
             "total_assignments",
             "experts_count",
         ]
-        self._file = None
-        self._writer = None
+        self._file: Any = None
+        self._writer: Any = None
         self._open_writer(write_header=True)
 
     def _open_writer(self, write_header: bool):

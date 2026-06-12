@@ -143,7 +143,7 @@ class QWenAttention(nnx.Module):
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
         layer_id: int,
-    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+    ) -> tuple[jax.Array, jax.Array]:
         q, _ = self.q_proj(hidden_states)
         k, _ = self.k_proj(hidden_states)
         v, _ = self.v_proj(hidden_states)

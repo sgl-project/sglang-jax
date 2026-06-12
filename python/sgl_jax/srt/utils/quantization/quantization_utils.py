@@ -321,7 +321,7 @@ def quantize_tensor(
     dtype: jnp.dtype,
     tensor: jax.Array,
     axis: int | list[int] | tuple | None = -1,
-    block_size: int | list[int] | None = None,
+    block_size: int | list[int] | tuple[int, ...] | None = None,
     pad_tensor: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Quantize tensor.

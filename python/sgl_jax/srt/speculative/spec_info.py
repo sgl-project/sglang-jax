@@ -82,7 +82,7 @@ class SpeculativeAlgorithm(IntEnum):
         return self == SpeculativeAlgorithm.STANDALONE
 
     @staticmethod
-    def from_string(name: str):
+    def from_string(name: str | None):
         name_map = {
             "EAGLE": SpeculativeAlgorithm.EAGLE,
             "EAGLE3": SpeculativeAlgorithm.EAGLE3,

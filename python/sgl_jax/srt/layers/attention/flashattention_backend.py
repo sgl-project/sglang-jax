@@ -1,5 +1,6 @@
 import logging
 from dataclasses import dataclass
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -17,7 +18,7 @@ from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
+from sgl_jax.srt.speculative.eagle_util import EagleDraftInput, EagleVerifyInput
 from sgl_jax.srt.utils import cdiv
 from sgl_jax.srt.utils.jax_utils import device_array
 from sgl_jax.srt.utils.profiling_utils import named_scope
@@ -64,7 +65,7 @@ class FlashAttentionMetadata:
             self.custom_mask,
         )
 
-        aux_data = {}
+        aux_data: dict[str, Any] = {}
         return (children, aux_data)
 
     @classmethod
@@ -156,6 +157,7 @@ class FlashAttention(AttentionBackend):
 
         # cu_q_lens per DP rank section (each section starts from 0)
         if batch.forward_mode == ForwardMode.EXTEND:
+            assert batch.extend_seq_lens is not None
             ext_2d = batch.extend_seq_lens.reshape(batch.dp_size, batch.per_dp_bs_size)
             cu_q_2d = np.zeros((batch.dp_size, batch.per_dp_bs_size + 1), dtype=np.int32)
             cu_q_2d[:, 1:] = np.cumsum(ext_2d, axis=1)
@@ -212,26 +214,31 @@ class FlashAttention(AttentionBackend):
         page_indices = (selected_cache_locs // self.page_size).astype(np.int32)
 
         if batch.forward_mode == ForwardMode.TARGET_VERIFY:
+            assert isinstance(batch.spec_info_padded, EagleVerifyInput)
+            verify_info = batch.spec_info_padded
             # convert custom_mask from bool to int32, because dma not support bool type
-            if batch.spec_info_padded.custom_mask.dtype == jnp.bool:
+            if verify_info.custom_mask.dtype == jnp.bool:
                 # FIXME(pc) rm this dtype convert
                 logger.warning(
                     "batch.spec_info_padded.custom_mask type is  %s, it may make performance very low",
-                    batch.spec_info_padded.custom_mask.dtype,
+                    verify_info.custom_mask.dtype,
                 )
-                metadata.custom_mask = batch.spec_info_padded.custom_mask.astype(jnp.int32)
+                metadata.custom_mask = verify_info.custom_mask.astype(jnp.int32)
             else:
-                metadata.custom_mask = batch.spec_info_padded.custom_mask
+                metadata.custom_mask = verify_info.custom_mask
         else:
             metadata.custom_mask = None
 
         dp_size = batch.dp_size
         per_dp_bs = batch.per_dp_bs_size if dp_size > 1 else len(batch.seq_lens)
         if batch.forward_mode.is_target_verify():
+            assert isinstance(batch.spec_info_padded, EagleVerifyInput)
+            verify_info = batch.spec_info_padded
             padded_batch_size = len(batch.seq_lens)
             extend_seq_lens = np.zeros(padded_batch_size, dtype=np.int32)
-            extend_seq_lens[batch.logits_indices_selector] = batch.spec_info_padded.draft_token_num
+            extend_seq_lens[batch.logits_indices_selector] = verify_info.draft_token_num
         else:
+            assert batch.extend_seq_lens is not None
             extend_seq_lens = batch.extend_seq_lens
         cu_q_lens = _per_dp_cumsum(extend_seq_lens, dp_size, per_dp_bs)
 
@@ -249,7 +256,9 @@ class FlashAttention(AttentionBackend):
             # to a single rank chunk; dp>1 keeps the per-rank repack from
             # #1108 P1-7.
             if metadata.custom_mask is not None:
-                q = batch.spec_info_padded.draft_token_num
+                assert isinstance(batch.spec_info_padded, EagleVerifyInput)
+                verify_info = batch.spec_info_padded
+                q = verify_info.draft_token_num
                 cm = np.asarray(jax.device_get(metadata.custom_mask))
                 # Pin per-rank mask target from the pre-repacking mask capacity
                 # (tree_mask_capacity from build_tree, already bucket-stable).
@@ -291,11 +300,13 @@ class FlashAttention(AttentionBackend):
         cu_kv_lens = _per_dp_cumsum(aligned_seq_lens, dp_size, per_dp_bs)
 
         if batch.forward_mode == ForwardMode.DRAFT_EXTEND:
+            assert isinstance(batch.spec_info_padded, EagleDraftInput)
+            draft_info = batch.spec_info_padded
             # Truncate each req's page list from allocate_len → seq_len, keeping
             # the DP-segmented layout from padding_for_decode (rank r's pages
             # at [r*per_dp_pg : ...]). page_indices (line 212) is already
             # cache_loc[::page_size]//page_size, so re-gather from it per-rank.
-            allocate_lens = batch.spec_info_padded.allocate_lens
+            allocate_lens = draft_info.allocate_lens
             if hasattr(allocate_lens, "device"):
                 allocate_lens = jax.device_get(allocate_lens)
             allocate_lens = np.asarray(allocate_lens)
@@ -373,7 +384,9 @@ class FlashAttention(AttentionBackend):
         # (== selector order), so the per-req gather below stays aligned.
         sel = np.asarray(batch.logits_indices_selector)
         current_seq_lens = np.asarray(batch.seq_lens)[sel]
-        allocate_lens = np.asarray(batch.spec_info_padded.allocate_lens)[sel]
+        assert isinstance(batch.spec_info_padded, EagleDraftInput)
+        draft_info = batch.spec_info_padded
+        allocate_lens = np.asarray(draft_info.allocate_lens)[sel]
 
         draft_allocs = allocate_lens - current_seq_lens
 

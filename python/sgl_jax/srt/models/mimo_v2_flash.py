@@ -173,6 +173,7 @@ class MiMoV2Moe(nnx.Module):
                 hidden_states.shape[0],
                 out_sharding=NamedSharding(self.mesh, P(out_sharding.spec[0])),
             )
+            assert token_valid_mask is not None
             topk_ids = jnp.where(token_valid_mask[:, None], topk_ids, -1)
             mlp_output = self.experts(
                 hidden_states,
@@ -468,7 +469,7 @@ class MiMoV2DecoderLayer(nnx.Module):
                 out_sharding=reduce_sharding,
             )
         else:
-            hidden_states = self.mlp(hidden_states, out_sharding=reduce_sharding)
+            hidden_states = self.mlp(hidden_states, out_sharding=reduce_sharding)  # type: ignore[call-arg]
         residual = jax.sharding.reshard(residual, reduce_sharding)
 
         return hidden_states, residual, kv_fused, topk_ids

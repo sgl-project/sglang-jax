@@ -34,7 +34,7 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
             mesh=mesh,
         )
 
-    def __call__(
+    def __call__(  # type: ignore[override]
         self,
         q: jax.Array,
         k: jax.Array,
@@ -50,6 +50,9 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         ssm_states, conv_states = self.get_state(
             recurrent_state_pool, layer.layer_id, recurrent_indices
         )
+        assert layer.q_conv1d is not None
+        assert layer.k_conv1d is not None
+        assert layer.v_conv1d is not None
         q_conv_w = layer.q_conv1d.weight.value
         k_conv_w = layer.k_conv1d.weight.value
         v_conv_w = layer.v_conv1d.weight.value

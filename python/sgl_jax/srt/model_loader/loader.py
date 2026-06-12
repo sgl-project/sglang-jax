@@ -28,7 +28,7 @@ class BaseModelLoader(ABC):
         self.load_config = load_config
 
     @abstractmethod
-    def download_model(self, model_config: ModelConfig) -> None:
+    def download_model(self, model_config: ModelConfig) -> str | None:
         """Download a model so that it can be immediately loaded."""
         raise NotImplementedError
 
@@ -76,6 +76,7 @@ class DefaultModelLoader(BaseModelLoader):
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
         extra_config = load_config.model_loader_extra_config
+        assert isinstance(extra_config, dict)
         allowed_keys = {"enable_multithread_load", "num_threads"}
         unexpected_keys = set(extra_config.keys()) - allowed_keys
 
@@ -86,11 +87,12 @@ class DefaultModelLoader(BaseModelLoader):
                 f"{unexpected_keys}"
             )
 
-    def download_model(self, model_config: ModelConfig) -> None:
+    def download_model(self, model_config: ModelConfig) -> str | None:
         self._prepare_weights(
             model_config.model_path,
             model_config.revision,
         )
+        return None
 
     def load_model(
         self,
@@ -118,9 +120,7 @@ class DefaultModelLoader(BaseModelLoader):
             return model_path
         return None
 
-    def _prepare_weights(
-        self, model_name_or_path: str, revision: str | None
-    ) -> tuple[str, list[str]]:
+    def _prepare_weights(self, model_name_or_path: str, revision: str | None) -> str:
         model_path = self._maybe_download_from_modelscope(model_name_or_path, revision)
         if model_path is not None:
             model_name_or_path = model_path

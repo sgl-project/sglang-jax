@@ -35,7 +35,10 @@ class _ModelRegistry:
         if model_arch not in self.models:
             return None
 
-        return self.models[model_arch]
+        model_cls = self.models[model_arch]
+        if isinstance(model_cls, str):
+            return None
+        return model_cls
 
     def _normalize_archs(
         self,

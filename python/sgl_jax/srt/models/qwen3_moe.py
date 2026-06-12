@@ -40,7 +40,7 @@ class QWen3MoeAttention(nnx.Module):
         rope_theta: float = 10000,
         rope_scaling: dict[str, Any] | None = None,
         head_dim: int | None = None,
-        rms_norm_eps: float = None,
+        rms_norm_eps: float | None = None,
         layer_id: int = 0,
         attention_bias: bool = False,
         dtype: jnp.dtype = jnp.bfloat16,
@@ -195,6 +195,10 @@ class QWen3MoeDecoderLayer(nnx.Module):
             mesh=mesh,
         )
 
+        self.mlp: Any
+        self.moe_gate: GateLogit | None = None
+        self.topk: TopK | None = None
+
         if not self.is_moe_layer:
             self.mlp = Qwen3MLP(
                 hidden_size=config.hidden_size,
@@ -292,6 +296,8 @@ class QWen3MoeDecoderLayer(nnx.Module):
 
         topk_ids = None
         if self.is_moe_layer:
+            assert self.moe_gate is not None
+            assert self.topk is not None
             router_logits = self.moe_gate(hidden_states)
             topk_weights, topk_ids = self.topk(router_logits, dispatch_info=dispatch_info)
             if self.use_fused:
@@ -299,6 +305,7 @@ class QWen3MoeDecoderLayer(nnx.Module):
                     hidden_states.shape[0],
                     out_sharding=NamedSharding(self.mesh, P(reduce_sharding.spec[0])),
                 )
+                assert token_valid_mask is not None
                 topk_ids = jnp.where(token_valid_mask[:, None], topk_ids, -1)
                 hidden_states = self.mlp(
                     hidden_states,
@@ -362,7 +369,7 @@ class QWen3MoeModel(nnx.Module):
         self,
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
-    ) -> tuple[jax.Array, list[jax.Array]]:
+    ) -> tuple[jax.Array, list[jax.Array], list[Any]]:
         hidden_states = self.embed_tokens(forward_batch.input_ids)
         residual = None
         layers_kv_fused = []

@@ -197,7 +197,7 @@ class RotaryEmbedding:
         head_size: int,
         rotary_dim: int,
         max_position_embeddings: int,
-        base: int,
+        base: int | float,
         is_neox_style: bool,
         dtype: jnp.dtype,
         mesh: jax.sharding.Mesh | None = None,
@@ -311,7 +311,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         head_size: int,
         rotary_dim: int,
         max_position_embeddings: int,
-        base: int,
+        base: int | float,
         is_neox_style: bool,
         dtype: jnp.dtype,
         mrope_section: list[int] | None = None,
@@ -403,6 +403,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         if self.mrope_interleaved:
             # --- Interleaved Mode ---
             # Direct manipulation on the [3, N, D] tensor
+            assert self.mrope_section is not None
             cos = apply_interleaved_rope(cos_all, self.mrope_section)
             sin = apply_interleaved_rope(sin_all, self.mrope_section)
         else:
@@ -459,7 +460,7 @@ class Llama3RotaryEmbedding(RotaryEmbedding):
         head_size: int,
         rotary_dim: int,
         max_position_embeddings: int,
-        base: int,
+        base: int | float,
         is_neox_style: bool,
         dtype: jnp.dtype,
         scaling_factor: float,
@@ -567,7 +568,7 @@ def get_rope(
     head_size: int,
     rotary_dim: int,
     max_position: int,
-    base: int,
+    base: int | float,
     is_neox_style: bool = True,
     rope_scaling: dict[str, Any] | None = None,
     dtype: jnp.dtype | None = jnp.bfloat16,
@@ -681,7 +682,7 @@ def _grok_yarn_get_mscale(scaling_factor: float) -> float:
 
 # Inverse dim formula to find dim based on number of rotations
 def _yarn_find_correction_dim(
-    num_rotations: int,
+    num_rotations: float,
     dim: int,
     base: float = 10000,
     max_position_embeddings: int = 2048,
@@ -692,10 +693,10 @@ def _yarn_find_correction_dim(
 
 
 def _yarn_find_correction_range(
-    low_rot: int,
-    high_rot: int,
+    low_rot: float,
+    high_rot: float,
     dim: int,
-    base: int,
+    base: int | float,
     max_position_embeddings: int,
 ) -> tuple[float, float]:
     low = math.floor(_yarn_find_correction_dim(low_rot, dim, base, max_position_embeddings))
@@ -723,7 +724,7 @@ class YarnRotaryEmbedding(RotaryEmbedding):
         head_size: int,
         rotary_dim: int,
         max_position_embeddings: int,
-        base: int,
+        base: int | float,
         is_neox_style: bool,
         dtype: jnp.dtype,
         scaling_factor: float,

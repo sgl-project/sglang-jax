@@ -1,5 +1,5 @@
 import dataclasses
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import jax
 import jax.nn as nn
@@ -68,7 +68,7 @@ class LogitsProcessorOutput:
             self.input_token_ids_logprobs_idx,
         )
 
-        aux_data = {}
+        aux_data: dict[str, Any] = {}
         return (children, aux_data)
 
     @classmethod
@@ -96,7 +96,7 @@ class LogitsProcessorOutput:
 @dataclasses.dataclass
 class LogitsMetadata:
     forward_mode: "ForwardMode"
-    capture_hidden_mode: "CaptureHiddenMode" = None
+    capture_hidden_mode: "CaptureHiddenMode | None" = None
 
     extend_return_logprob: bool = False
     extend_return_top_logprob: bool = False
@@ -182,7 +182,13 @@ class LogitsMetadata:
 
     @classmethod
     def from_model_worker_batch(cls, batch: "ModelWorkerBatch", mesh: Mesh = None):
+        extend_logprob_pruned_lens_cpu: list[int] | None
+        extend_seq_lens_cpu: list[int] | None
         if batch.forward_mode.is_extend() and batch.return_logprob:
+            assert batch.extend_seq_lens is not None
+            assert batch.top_logprobs_nums is not None
+            assert batch.token_ids_logprobs is not None
+            assert batch.extend_logprob_start_lens is not None
             extend_seq_lens_cpu = batch.extend_seq_lens.tolist()
 
             extend_return_top_logprob = any(x > 0 for x in batch.top_logprobs_nums)
@@ -359,6 +365,8 @@ class LogitsProcessor(nnx.Module):
                 input_logprob_indices = []
                 pt, pruned_states = 0, []
 
+                assert logits_metadata.extend_logprob_start_lens_cpu is not None
+                assert logits_metadata.extend_seq_lens_cpu is not None
                 for extend_logprob_start_len, extend_len in zip(
                     logits_metadata.extend_logprob_start_lens_cpu,
                     logits_metadata.extend_seq_lens_cpu,
@@ -394,6 +402,7 @@ class LogitsProcessor(nnx.Module):
         )
 
         hidden_states_to_store: jax.Array | None = None
+        assert logits_metadata.capture_hidden_mode is not None
         if logits_metadata.capture_hidden_mode.need_capture():
             if logits_metadata.capture_hidden_mode.is_full():
                 if aux_hidden_states is not None and len(aux_hidden_states) > 0:
@@ -435,6 +444,7 @@ class LogitsProcessor(nnx.Module):
 
             # Normalize the logprob w/o temperature, top-p
             if logits_metadata.temp_scaled_logprobs or logits_metadata.top_p_normalized_logprobs:
+                assert logits_metadata.extend_logprob_pruned_lens_cpu is not None
                 pruned_lens = device_array(
                     np.array(
                         logits_metadata.extend_logprob_pruned_lens_cpu,
@@ -459,6 +469,7 @@ class LogitsProcessor(nnx.Module):
             if logits_metadata.extend_return_top_logprob:
                 from sgl_jax.srt.layers.sampler import get_top_logprobs
 
+                assert logits_metadata.top_logprobs_nums is not None
                 input_top_logprobs_val, input_top_logprobs_idx = get_top_logprobs(
                     input_logprobs, logits_metadata.top_logprobs_nums, self.mesh
                 )

@@ -50,7 +50,7 @@ class LinearBase(nnx.Module):
         input_size: int,
         output_size: int,
         mesh: jax.sharding.Mesh,
-        use_bias: bool = True,
+        use_bias: bool | None = True,
         skip_bias_add: bool = False,
         params_dtype: jnp.dtype | None = jnp.bfloat16,
         kernel_axes: Sequence[str | None] | None = None,
@@ -59,7 +59,7 @@ class LinearBase(nnx.Module):
         """Initialize parameters and quantization method."""
         self.skip_bias_add = skip_bias_add
         self.params_dtype = params_dtype
-        self.kernel_axes = kernel_axes
+        self.kernel_axes = kernel_axes or (None, None)
         self.mesh = mesh
         self.name = scope_name
 
@@ -68,7 +68,7 @@ class LinearBase(nnx.Module):
                 jax.random.PRNGKey(0),
                 (input_size, output_size),
                 dtype=params_dtype,
-                out_sharding=P(*kernel_axes),
+                out_sharding=P(*self.kernel_axes),
             ),
         )
         if use_bias:
@@ -77,7 +77,7 @@ class LinearBase(nnx.Module):
                     jax.random.PRNGKey(0),
                     (output_size,),
                     dtype=params_dtype,
-                    out_sharding=P(kernel_axes[-1]),
+                    out_sharding=P(self.kernel_axes[-1]),
                 ),
             )
         else:
@@ -258,7 +258,7 @@ class QuantizedLinear(nnx.Module):
         self.bias = nnx.Param(bias) if bias is not None else None
         self.activation_dtype = activation_dtype
         self.mesh = mesh
-        self.kernel_axes = kernel_axes
+        self.kernel_axes = kernel_axes or (None, None)
         self.skip_bias_add = skip_bias_add
         self.params_dtype = params_dtype
         self.compute_dtype = compute_dtype
@@ -294,9 +294,10 @@ class QuantizedLinear(nnx.Module):
         Returns:
             A new QuantizedLinear layer with quantized weights.
         """
-        effective_weight_block_size = (
-            tuple(weight_block_size) if weight_block_size is not None else None
-        )
+        effective_weight_block_size: tuple[int, int] | None = None
+        if weight_block_size is not None:
+            assert len(weight_block_size) == 2
+            effective_weight_block_size = (int(weight_block_size[0]), int(weight_block_size[1]))
 
         kernel_axes = linear.kernel_axes or (None, None)
         if is_static_input:

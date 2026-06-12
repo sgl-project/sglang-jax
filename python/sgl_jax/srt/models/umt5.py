@@ -228,7 +228,7 @@ class UMT5Attention(nnx.Module):
         x,
         forward_batch: ForwardBatch,
         encoder_hidden_states=None,
-        token_to_kv_pool: KVCache = None,
+        token_to_kv_pool: KVCache | None = None,
         deterministic=True,
     ):
         dtype = x.dtype

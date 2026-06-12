@@ -163,11 +163,11 @@ class ForwardBatch:
     # decode token position in kv cache
     out_cache_loc: jax.Array
     # Position information [total_tokens]
-    positions: jax.Array = None
+    positions: jax.Array | None = None
 
-    attn_backend: AttentionBackend = None
+    attn_backend: AttentionBackend | None = None
 
-    cache_loc: jax.Array = None
+    cache_loc: jax.Array | None = None
 
     # For extend
     extend_prefix_lens: jax.Array | None = None
@@ -175,9 +175,9 @@ class ForwardBatch:
 
     # For LoRA
     lora_ids: list[str] | None = None
-    lora_scalings: jax.Array = None
-    lora_token_indices: jax.Array = None
-    lora_ranks: jax.Array = None
+    lora_scalings: jax.Array | None = None
+    lora_token_indices: jax.Array | None = None
+    lora_ranks: jax.Array | None = None
 
     # For EPLB
     expert_location_metadata: ExpertLocationMetadata | None = None
@@ -186,8 +186,8 @@ class ForwardBatch:
     trace_request_objects: list | None = None
 
     spec_info: EagleVerifyInput | EagleDraftInput | None = None
-    spec_algorithm: SpeculativeAlgorithm = None
-    capture_hidden_mode: CaptureHiddenMode = None
+    spec_algorithm: SpeculativeAlgorithm | None = None
+    capture_hidden_mode: CaptureHiddenMode | None = None
 
     # Encoder-Decoder specific fields
     attention_mask: jax.Array | None = None

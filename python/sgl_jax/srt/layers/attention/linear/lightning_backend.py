@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import jax
 import jax.numpy as jnp
@@ -29,11 +29,13 @@ from sgl_jax.srt.utils.profiling_utils import named_scope
 
 logger = logging.getLogger(__name__)
 
+simple_gla_fwd: Any
 try:
     from sgl_jax.srt.kernels.simple_gla.simple_gla import simple_gla_fwd
 except ModuleNotFoundError:
     simple_gla_fwd = None
 
+decode_simple_gla_fused: Any
 try:
     from sgl_jax.srt.kernels.simple_gla.simple_gla_fused import decode_simple_gla_fused
 except ModuleNotFoundError:
@@ -128,7 +130,7 @@ class LightningAttnBackend(LinearRecurrentAttnBackend):
         else:
             self.tp_slope = nnx.data({})
 
-    def __call__(
+    def __call__(  # type: ignore[override]
         self,
         q: jax.Array,
         k: jax.Array,

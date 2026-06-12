@@ -56,6 +56,7 @@ class FusedEPMoE(nnx.Module):
         weight_dtype: jnp.dtype = jnp.bfloat16,
         dtype: jnp.dtype = jnp.bfloat16,
         activation: str = "silu",
+        activation_fn: str | None = None,
         layer_id: int = 0,
         use_grouped_topk: bool = False,
         num_groups: int = 1,
@@ -85,7 +86,7 @@ class FusedEPMoE(nnx.Module):
         self.dtype = dtype
         self.layer_id = layer_id
         self.ep_size = ep_size
-        self.activation = activation
+        self.activation = activation_fn or activation
         self.use_grouped_topk = use_grouped_topk
         self.num_groups = num_groups
         self.top_k_groups = top_k_groups
@@ -201,6 +202,8 @@ class FusedEPMoE(nnx.Module):
         weight_block_size = (
             getattr(quantization_config, "weight_block_size", None) if quantization_config else None
         )
+        self.quant_block_k: int | None
+        self.quant_block_n: int | None
         if weight_block_size is not None and len(weight_block_size) == 2:
             self.quant_block_k = int(weight_block_size[1])  # block_k
             self.quant_block_n = int(weight_block_size[0])  # block_n

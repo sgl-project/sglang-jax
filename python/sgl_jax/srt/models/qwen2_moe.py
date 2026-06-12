@@ -297,7 +297,7 @@ class Qwen2MoeDecoderLayer(nnx.Module):
         # Optional shared expert path
         shared_sz = getattr(config, "shared_expert_intermediate_size", 0)
         if shared_sz and shared_sz > 0:
-            self.shared_experts = Qwen2MoeMLP(
+            self.shared_experts: Qwen2MoeMLP | None = Qwen2MoeMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=shared_sz,
                 layer_id=layer_id,
@@ -305,7 +305,7 @@ class Qwen2MoeDecoderLayer(nnx.Module):
                 gate_up_down_bias=False,
                 mesh=mesh,
             )
-            self.shared_expert_gate = LinearBase(
+            self.shared_expert_gate: LinearBase | None = LinearBase(
                 input_size=config.hidden_size,
                 output_size=1,
                 use_bias=False,
@@ -336,7 +336,7 @@ class Qwen2MoeDecoderLayer(nnx.Module):
         token_to_kv_pool: KVCache,
         residual: jax.Array | None = None,
         dispatch_info: ExpertLocationMetadata | None = None,
-    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+    ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
 
         if residual is None:
             residual = hidden_states
@@ -371,6 +371,7 @@ class Qwen2MoeDecoderLayer(nnx.Module):
 
         if self.use_fused:
             token_valid_mask = forward_batch.get_token_valid_mask(hidden_states.shape[0])
+            assert token_valid_mask is not None
             topk_ids = jnp.where(token_valid_mask[:, None], topk_ids, -1)
         else:
             pass

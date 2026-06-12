@@ -33,7 +33,7 @@ class RadixAttention(nnx.Module):
         num_kv_heads: int,
         layer_id: int,
         v_head_dim: int = -1,
-        sliding_window_size: int = 0,
+        sliding_window_size: int | None = 0,
         logit_cap: float = 0,
         attn_type: AttentionType = AttentionType.DECODER,
     ):
@@ -61,13 +61,14 @@ class RadixAttention(nnx.Module):
     ):
         assert k is not None
         assert v is not None
+        assert forward_batch.attn_backend is not None
         attn_output, kv_fused = forward_batch.attn_backend(
             q,
             k,
             v,
             self,
             forward_batch,
-            token_to_kv_pool,
+            token_to_kv_pool=token_to_kv_pool,
             **kwargs,
         )
         return attn_output, kv_fused

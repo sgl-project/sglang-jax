@@ -36,7 +36,7 @@ class QWen3Attention(nnx.Module):
         rope_theta: float = 10000,
         rope_scaling: dict[str, Any] | None = None,
         head_dim: int | None = None,
-        rms_norm_eps: float = None,
+        rms_norm_eps: float | None = None,
         layer_id: int = 0,
         attention_bias: bool = False,
         dtype: jnp.dtype = jnp.bfloat16,
@@ -342,7 +342,7 @@ class QWen3Model(nnx.Module):
             scope_name="norm",
         )
         # For EAGLE3 support
-        self.layers_to_capture = []
+        self.layers_to_capture: list[int] = []
 
     def __call__(
         self,

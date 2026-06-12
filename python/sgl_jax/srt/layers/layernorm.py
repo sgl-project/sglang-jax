@@ -32,7 +32,7 @@ class RMSNorm(nnx.Module):
         self,
         num_features: int,
         *,
-        epsilon: float = 1e-6,
+        epsilon: float | None = 1e-6,
         dtype: Dtype | None = None,
         param_dtype: Dtype = jnp.float32,
         use_scale: bool = True,
@@ -61,7 +61,7 @@ class RMSNorm(nnx.Module):
             self.scale = None
 
         self.num_features = num_features
-        self.epsilon = epsilon
+        self.epsilon = 1e-6 if epsilon is None else epsilon
         self.dtype = dtype
         self.param_dtype = param_dtype
         self.use_scale = use_scale

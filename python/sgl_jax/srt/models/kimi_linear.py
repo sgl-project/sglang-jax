@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -310,6 +311,11 @@ class KimiDecoderLayer(nnx.Module):
                 layer_idx=layer_idx,
             )
         else:
+            assert config.kv_lora_rank is not None
+            assert config.qk_nope_head_dim is not None
+            assert config.qk_rope_head_dim is not None
+            assert config.v_head_dim is not None
+            assert config.mla_use_nope is not None
             self.self_attn = KimiMLAAttention(
                 hidden_size=config.hidden_size,
                 num_heads=config.num_attention_heads,
@@ -334,6 +340,11 @@ class KimiDecoderLayer(nnx.Module):
         self.is_moe_layer = is_moe
         self.moe_backend = getattr(config, "moe_backend", MoEBackend.EPMOE)
         self.use_fused = self.moe_backend == "fused"
+        self.mlp: Any
+        self.moe_gate: GateLogit | None = None
+        self.topk: TopK | None = None
+        self.block_sparse_moe: Any = None
+        self.shared_experts: KimiMLP | None = None
 
         if not is_moe:
             self.mlp = KimiMLP(
@@ -342,8 +353,13 @@ class KimiDecoderLayer(nnx.Module):
                 mesh=mesh,
                 dtype=dtype,
             )
-            self.moe_gate = None
         else:
+            assert config.num_experts is not None
+            assert config.num_experts_per_token is not None
+            assert config.moe_intermediate_size is not None
+            assert config.num_expert_group is not None
+            assert config.topk_group is not None
+            assert config.num_shared_experts is not None
             # Gate
             self.moe_gate = GateLogit(
                 input_size=config.hidden_size,
@@ -457,6 +473,9 @@ class KimiDecoderLayer(nnx.Module):
 
         # MLP (MoE or dense)
         if self.is_moe_layer:
+            assert self.moe_gate is not None
+            assert self.topk is not None
+            assert self.block_sparse_moe is not None
             if self.shared_experts is not None:
                 shared_output = self.shared_experts(hidden_states)
             else:
@@ -470,6 +489,7 @@ class KimiDecoderLayer(nnx.Module):
 
             if self.use_fused:
                 token_valid_mask = forward_batch.get_token_valid_mask(hidden_states.shape[0])
+                assert token_valid_mask is not None
                 topk_ids = jnp.where(token_valid_mask[:, None], topk_ids, -1)
 
             hidden_states = self.block_sparse_moe(hidden_states, topk_weights, topk_ids)
@@ -526,7 +546,7 @@ class KimiModel(nnx.Module):
         self,
         forward_batch: ForwardBatch,
         memory_pools,
-    ) -> tuple[jax.Array, list, list, list]:
+    ) -> tuple[jax.Array, list, tuple[list, list], list]:
         hidden_states = self.embed_tokens(forward_batch.input_ids)
 
         residual = None
@@ -714,6 +734,7 @@ class KimiLinearForCausalLM(nnx.Module):
             )
             # Conv1d weights: HF shape (projection_size, 1, conv_size) -> JAX (conv_size, projection_size) -> (projection_size, conv_size)
             # These live under self_attn.attn (RadixLinearAttention), not self_attn directly.
+            assert self.config.linear_attn_config is not None
             conv_size = self.config.linear_attn_config["short_conv_kernel_size"]
             num_heads = self.config.linear_attn_config["num_heads"]
             head_dim = self.config.linear_attn_config["head_dim"]
@@ -799,6 +820,7 @@ class KimiLinearForCausalLM(nnx.Module):
 
             # Expert weights
             num_logical_experts = self.config.num_experts
+            assert num_logical_experts is not None
 
             from sgl_jax.srt.eplb.expert_location import (
                 get_global_expert_location_metadata,

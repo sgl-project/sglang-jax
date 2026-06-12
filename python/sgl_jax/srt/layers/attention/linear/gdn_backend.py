@@ -118,7 +118,7 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
     # Dispatch
     # ------------------------------------------------------------------
 
-    def __call__(
+    def __call__(  # type: ignore[override]
         self,
         q: jax.Array,  # [T, key_dim]   sliced from in_proj_qkvz upstream
         k: jax.Array,  # [T, key_dim]
@@ -155,6 +155,9 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
         ).reshape(T, self.conv_dim)
         mixed_qkv = jax.sharding.reshard(mixed_qkv, P("data", "tensor"))
 
+        assert layer.conv1d is not None
+        assert layer.A_log is not None
+        assert layer.dt_bias is not None
         conv1d_weight = layer.conv1d.weight.value
         A_log = layer.A_log.value
         dt_bias = layer.dt_bias.value

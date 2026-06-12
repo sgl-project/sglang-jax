@@ -764,9 +764,8 @@ def create_moe_weights_mapping(
         "up_proj",
         "down_proj",
     ),  # expert source names [gate, up, down]
-    expert_concat_axis_map: dict[
-        str, int
-    ] = None,  # Map from source weight name to its concatenation axis (default is None)
+    expert_concat_axis_map: dict[str, int] | None = None,
+    # Map from source weight name to its concatenation axis (default is None)
     moe_backend: str = "epmoe",
     moe_path: str = "mlp",
     source_expert_pattern: str = "experts.{i}",
@@ -806,7 +805,7 @@ def create_moe_weights_mapping(
             # Weights are transposed from HF [n, k] to [k, n], stacked to [g, k, n].
             # wi_0/wi_1: [g, hidden_size, intermediate_dim] -> P("expert", None, "tensor")
             # wo:        [g, intermediate_dim, hidden_size] -> P("expert", "tensor", None)
-            sharding = (
+            sharding: tuple[str | tuple[str, str] | None, ...] = (
                 ("expert", "tensor", None) if target_name == "wo" else ("expert", None, "tensor")
             )
             transpose = True

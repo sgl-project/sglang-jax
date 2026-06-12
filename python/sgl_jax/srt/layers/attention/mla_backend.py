@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import jax
 import jax.numpy as jnp
@@ -65,7 +65,7 @@ class MLAAttentionMetadata:
             self.seq_lens,
             self.distribution,
         )
-        aux_data = {}
+        aux_data: dict[str, Any] = {}
         return (children, aux_data)
 
     @classmethod
@@ -167,6 +167,7 @@ class MLAAttentionBackend(AttentionBackend):
         page_indices = (strided_2d // self.page_size).ravel()
 
         if batch.forward_mode == ForwardMode.EXTEND:
+            assert batch.extend_seq_lens is not None
             ext_2d = batch.extend_seq_lens.reshape(batch.dp_size, batch.per_dp_bs_size)
             cu_q_2d = np.zeros((batch.dp_size, batch.per_dp_bs_size + 1), dtype=np.int32)
             cu_q_2d[:, 1:] = np.cumsum(ext_2d, axis=1)

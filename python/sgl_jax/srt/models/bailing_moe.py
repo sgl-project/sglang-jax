@@ -44,7 +44,7 @@ class BailingMoEAttention(nnx.Module):
         rope_theta: float = 10000,
         rope_scaling: dict[str, Any] | None = None,
         head_dim: int | None = None,
-        rms_norm_eps: float = None,
+        rms_norm_eps: float | None = None,
         use_qk_norm: bool = True,
         rotary_dim: int = 0,
         layer_id: int = 0,
@@ -64,6 +64,8 @@ class BailingMoEAttention(nnx.Module):
         self.scaling = self.head_dim**-0.5
 
         self.use_qk_norm = use_qk_norm
+        self.q_norm: RMSNorm | None
+        self.k_norm: RMSNorm | None
 
         if use_qk_norm:
             self.q_norm = RMSNorm(
@@ -177,6 +179,8 @@ class BailingMoEAttention(nnx.Module):
         )
 
         if self.use_qk_norm:
+            assert self.q_norm is not None
+            assert self.k_norm is not None
             q = self.q_norm(q)
             k = self.k_norm(k)
 
@@ -254,6 +258,7 @@ class BailingMoEDecoderLayer(nnx.Module):
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 40960)
         self.head_dim = getattr(config, "head_dim", None)
+        assert self.head_dim is not None
         use_qk_norm = getattr(config, "use_qk_norm", False)
         if hasattr(config, "partial_rotary_factor"):
             rotary_dim = int(self.head_dim * config.partial_rotary_factor)
@@ -280,6 +285,10 @@ class BailingMoEDecoderLayer(nnx.Module):
         )
 
         first_k_dense_replace = getattr(config, "first_k_dense_replace", 0)
+        self.mlp: Any
+        self.moe_gate: GateLogit | None = None
+        self.topk: TopK | None = None
+        self.shared_experts: BailingMoEMLP | None = None
 
         if layer_id < first_k_dense_replace:
             self.mlp = BailingMoEMLP(
@@ -437,6 +446,8 @@ class BailingMoEDecoderLayer(nnx.Module):
                 shared_output = self.shared_experts(hidden_states)
             else:
                 shared_output = None
+            assert self.moe_gate is not None
+            assert self.topk is not None
             router_logits = self.moe_gate(hidden_states)
 
             correction_bias = self.moe_gate.bias.value if self.moe_gate.bias is not None else None
@@ -448,10 +459,11 @@ class BailingMoEDecoderLayer(nnx.Module):
 
             if self.use_fused:
                 token_valid_mask = forward_batch.get_token_valid_mask(hidden_states.shape[0])
+                assert token_valid_mask is not None
                 topk_ids = jnp.where(token_valid_mask[:, None], topk_ids, -1)
             else:
                 pass
-            hidden_states = self.mlp(hidden_states, topk_weights, topk_ids)
+            hidden_states = self.mlp(hidden_states, topk_weights, topk_ids)  # type: ignore[call-arg]
 
             if shared_output is not None:
                 hidden_states = hidden_states + shared_output
@@ -459,7 +471,7 @@ class BailingMoEDecoderLayer(nnx.Module):
             hidden_states = self.mlp(hidden_states)
             topk_ids = None
 
-        return hidden_states, residual, kv_fused, topk_ids
+        return hidden_states, residual, kv_fused, topk_ids  # type: ignore[return-value]
 
 
 class BailingMoEModel(nnx.Module):
@@ -800,7 +812,7 @@ class BailingMoEForCausalLM(nnx.Module):
                         logger.info("scale_reshape: %s", scale_reshape)
                         scale_repeat = None if is_per_channel else (1, num_blocks)
 
-                        scale_sharding = None
+                        scale_sharding: tuple[Any, ...] | None = None
                         if mapping.sharding:
                             scale_sharding = (
                                 mapping.sharding[0],
@@ -875,12 +887,12 @@ class BailingMoEForCausalLM(nnx.Module):
                             )
                             out_dim = hidden_size if is_w2 else se_inter
 
-                            scale_reshape = (1, 1, out_dim)
+                            shared_scale_reshape = (1, 1, out_dim)
 
                             mappings[scale_key] = WeightMapping(
                                 target_path=target_path + "_scale",
                                 sharding=(None, None, None),
-                                reshape=scale_reshape,
+                                reshape=shared_scale_reshape,
                                 transpose=False,
                             )
                         else:

@@ -38,6 +38,7 @@ class RadixLightningAttention(nnx.Module):
         v: jax.Array,
         recurrent_state_pool,
     ):
+        assert forward_batch.attn_backend is not None
         output, recurrent_state_pool = forward_batch.attn_backend(
             q=q,
             k=k,

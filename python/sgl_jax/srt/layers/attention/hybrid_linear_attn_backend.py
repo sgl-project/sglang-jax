@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import jax
 import numpy as np
@@ -35,7 +35,7 @@ class LinearRecurrentAttnBackendMetadata:
 
     def tree_flatten(self):
         children = (self.cu_q_lens, self.recurrent_indices, self.has_initial_state)
-        aux_data = {}
+        aux_data: dict[str, Any] = {}
         return children, aux_data
 
     @classmethod
@@ -76,6 +76,7 @@ class LinearRecurrentAttnBackend(AttentionBackend):
 
         # Unified 2D reshape logic for all dp_size (including dp_size=1)
         if batch.forward_mode == ForwardMode.EXTEND:
+            assert batch.extend_seq_lens is not None
             ext_2d = batch.extend_seq_lens.reshape(batch.dp_size, batch.per_dp_bs_size)
             cu_q_2d = np.zeros((batch.dp_size, batch.per_dp_bs_size + 1), dtype=np.int32)
             cu_q_2d[:, 1:] = np.cumsum(ext_2d, axis=1)
@@ -100,7 +101,7 @@ class LinearRecurrentAttnBackend(AttentionBackend):
 
     def tree_flatten(self):
         children = (self.forward_metadata,)
-        aux_data = {}
+        aux_data: dict[str, Any] = {}
         return children, aux_data
 
     @classmethod
@@ -132,8 +133,8 @@ class HybridLinearAttnBackendMetadata:
     fields and assigns them to the corresponding sub-backend's forward_metadata.
     """
 
-    full_attn_metadata: AttentionBackendMetadata = field(default=None)
-    linear_attn_metadata: LinearRecurrentAttnBackendMetadata = field(default=None)
+    full_attn_metadata: AttentionBackendMetadata | None = field(default=None)
+    linear_attn_metadata: LinearRecurrentAttnBackendMetadata | None = field(default=None)
 
     def tree_flatten(self):
         return ((self.full_attn_metadata, self.linear_attn_metadata), {})
@@ -182,7 +183,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         self.full_attn_backend.forward_metadata = value.full_attn_metadata
         self.linear_attn_backend.forward_metadata = value.linear_attn_metadata
 
-    def __call__(
+    def __call__(  # type: ignore[override]
         self,
         q: jax.Array,
         k: jax.Array,
@@ -224,7 +225,7 @@ class HybridLinearAttnBackend(AttentionBackend):
             **kwargs,
         )
 
-    def get_max_running_reqests(self, max_context_len, page_size):
+    def get_max_running_reqests(self, max_context_len, page_size):  # type: ignore[override]
         return self.full_attn_backend.get_max_running_reqests(max_context_len, page_size)
 
 

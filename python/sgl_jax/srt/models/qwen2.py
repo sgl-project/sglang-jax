@@ -219,7 +219,7 @@ class Qwen2DecoderLayer(nnx.Module):
         token_to_kv_pool: KVCache,
         residual: jax.Array | None = None,
     ):
-        layer_callback_flag = []
+        layer_callback_flag: list[Any] = []
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)

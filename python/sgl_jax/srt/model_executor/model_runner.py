@@ -2,6 +2,7 @@
 
 import logging
 from functools import partial
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -83,8 +84,20 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         self.server_args = server_args
         self.is_generation = model_config.is_generation
         self.page_size = server_args.page_size
-        self.req_to_token_pool = req_to_token_pool
-        self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+        self.req_to_token_pool: ReqToTokenPool | None = req_to_token_pool
+        self.token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator | None = (
+            token_to_kv_pool_allocator
+        )
+        self.token_to_kv_pool: Any = None
+        self.memory_pools: Any = None
+        self.attn_backend: Any = None
+        self.model: Any = None
+        self.dtype: Any = None
+        self.kv_cache_dtype: Any = None
+        self.sliding_window_size: int | None = None
+        self.max_total_num_tokens = 0
+        self.full_max_total_num_tokens = 0
+        self.swa_max_total_num_tokens = 0
         self.is_hybrid = False
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
         self.spec_algorithm = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
@@ -373,6 +386,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             try:
                 # get the aux layer from draft model config
                 eagle_config = getattr(self.model_config.hf_config, "eagle_config", None)
+                assert eagle_config is not None
                 eagle_aux_hidden_state_layer_ids = eagle_config["eagle_aux_hidden_state_layer_ids"]
             except Exception as e:
                 logger.warning("get the aux layer from draft model config %s", e)
@@ -659,6 +673,10 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         """Initialize LoRA manager for LoRA adapter support."""
         from sgl_jax.srt.lora.lora_manager import LoRAManager
 
+        target_modules = self.server_args.lora_target_modules
+        if isinstance(target_modules, list):
+            target_modules = set(target_modules)
+
         self.lora_manager = LoRAManager(
             base_model=self.model,
             base_hf_config=self.model_config.hf_config,
@@ -666,8 +684,8 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             dtype=self.dtype,
             mesh=self.mesh,
             max_lora_rank=self.server_args.max_lora_rank,
-            target_modules=self.server_args.lora_target_modules,
-            lora_paths=self.server_args.lora_paths,
+            target_modules=target_modules,
+            lora_paths=self.server_args.lora_paths,  # type: ignore[arg-type]
             server_args=self.server_args,
             model_config=self.model_config,
         )
@@ -679,8 +697,9 @@ class MockModelRunner(ModelRunner):
         model_config: ModelConfig | MockModelConfig,
         rngs: nnx.Rngs = None,
         mesh: mesh_lib.Mesh = None,
-        server_args: ServerArgs = None,
+        server_args: ServerArgs | None = None,
     ):
+        assert server_args is not None
         self.server_args = server_args
         self.tp_size = server_args.tp_size
         self.dp_size = server_args.dp_size

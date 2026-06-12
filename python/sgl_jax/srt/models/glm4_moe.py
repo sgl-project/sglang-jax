@@ -38,7 +38,7 @@ class Glm4MoeAttention(nnx.Module):
         rope_theta: float = 10000,
         rope_scaling: dict[str, Any] | None = None,
         head_dim: int | None = None,
-        rms_norm_eps: float = None,
+        rms_norm_eps: float | None = None,
         use_qk_norm: bool = True,
         rotary_dim: int = 0,
         layer_id: int = 0,
@@ -57,6 +57,8 @@ class Glm4MoeAttention(nnx.Module):
         self.scaling = self.head_dim**-0.5
 
         self.use_qk_norm = use_qk_norm
+        self.q_norm: RMSNorm | None
+        self.k_norm: RMSNorm | None
 
         if use_qk_norm:
             self.q_norm = RMSNorm(
@@ -138,6 +140,8 @@ class Glm4MoeAttention(nnx.Module):
         v = v.reshape(-1, self.kv_head_num, self.head_dim)
 
         if self.use_qk_norm:
+            assert self.q_norm is not None
+            assert self.k_norm is not None
             q = rmsnorm_forward(q, None, self.q_norm.scale, self.q_norm.epsilon)
             k = rmsnorm_forward(k, None, self.k_norm.scale, self.k_norm.epsilon)
 
@@ -240,6 +244,10 @@ class Glm4MoeDecoderLayer(nnx.Module):
         )
 
         first_k_dense_replace = getattr(config, "first_k_dense_replace", 0)
+        self.mlp: Any
+        self.moe_gate: GateLogit | None = None
+        self.topk: TopK | None = None
+        self.shared_experts: Glm4MoeMLP | None = None
 
         if layer_id < first_k_dense_replace:
             self.mlp = Glm4MoeMLP(
@@ -374,6 +382,8 @@ class Glm4MoeDecoderLayer(nnx.Module):
         )
 
         if self.is_moe_layer:
+            assert self.moe_gate is not None
+            assert self.topk is not None
             if self.shared_experts is not None:
                 shared_output = self.shared_experts(hidden_states)
             else:
@@ -390,15 +400,16 @@ class Glm4MoeDecoderLayer(nnx.Module):
             if self.use_fused and token_valid_mask is not None:
                 topk_ids = jnp.where(token_valid_mask[:, None], topk_ids, -1)
 
-            hidden_states = self.mlp(hidden_states, topk_weights, topk_ids)
+            hidden_states = self.mlp(hidden_states, topk_weights, topk_ids)  # type: ignore[call-arg]
 
             if shared_output is not None:
                 hidden_states = hidden_states + shared_output
         else:
+            assert self.mlp is not None
             hidden_states = self.mlp(hidden_states)
             topk_ids = None
 
-        return hidden_states, residual, kv_fused, topk_ids
+        return hidden_states, residual, kv_fused, topk_ids  # type: ignore[return-value]
 
 
 class Glm4MoeModel(nnx.Module):
@@ -735,7 +746,7 @@ class Glm4MoeForCausalLM(nnx.Module):
                         scale_reshape = (num_physical_experts, 1, 1, out_dim)
                         scale_repeat = (1, num_blocks)
 
-                        scale_sharding = None
+                        scale_sharding: tuple[Any, ...] | None = None
                         if mapping.sharding:
                             scale_sharding = (
                                 mapping.sharding[0],

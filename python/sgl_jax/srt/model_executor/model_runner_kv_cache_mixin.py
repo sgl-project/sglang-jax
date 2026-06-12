@@ -10,16 +10,13 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import TYPE_CHECKING
+from typing import Any
 
 import jax.numpy as jnp
 import numpy as np
 
 from sgl_jax.srt.mem_cache.memory_pool import HybridReqToTokenPool, MemoryPools
 from sgl_jax.srt.mem_cache.recurrent_state_pool import RecurrentStatePool
-
-if TYPE_CHECKING:
-    from sgl_jax.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
 
@@ -192,8 +189,10 @@ def _build_non_hybrid_memory_pools(token_to_kv_pool) -> MemoryPools:
 
 
 class ModelRunnerKVCacheMixin:
+    req_to_token_pool: Any
+    token_to_kv_pool_allocator: Any
 
-    def _compute_cell_size(self: ModelRunner) -> int:
+    def _compute_cell_size(self: Any) -> int:
         """Per-token KV cache cost in bytes per device, summed across layers."""
 
         def align128(x: int) -> int:
@@ -222,7 +221,7 @@ class ModelRunnerKVCacheMixin:
             * dtype_size
         )
 
-    def _profile_available_bytes(self: ModelRunner, total_device_memory: int) -> int:
+    def _profile_available_bytes(self: Any, total_device_memory: int) -> int:
         """Profile available bytes for KV cache (+ recurrent state)."""
         available_device_memory = self.get_available_device_memory()
         rest_memory = available_device_memory - total_device_memory * (1 - self.mem_fraction_static)
@@ -234,7 +233,7 @@ class ModelRunnerKVCacheMixin:
 
         return int(rest_memory)
 
-    def handle_recurrent_cache(self: ModelRunner, total_rest_memory: int) -> int:
+    def handle_recurrent_cache(self: Any, total_rest_memory: int) -> int:
         """Split HBM between recurrent state and KV cache.
 
         Resolves server_args.max_recurrent_state_size to a **global** value
@@ -295,7 +294,7 @@ class ModelRunnerKVCacheMixin:
 
         return kv_budget
 
-    def profile_max_num_token(self: ModelRunner, total_device_memory: int) -> int:
+    def profile_max_num_token(self: Any, total_device_memory: int) -> int:
         """Profile the maximum number of tokens that can fit in memory."""
         available_kv_cache_bytes = self._profile_available_bytes(total_device_memory)
 
@@ -311,7 +310,7 @@ class ModelRunnerKVCacheMixin:
 
         return max_tokens
 
-    def _init_kv_cache_dtype(self: ModelRunner):
+    def _init_kv_cache_dtype(self: Any):
         """Resolve kv_cache_dtype from server_args."""
         if self.server_args.kv_cache_dtype == "auto":
             self.kv_cache_dtype = self.dtype
@@ -322,7 +321,7 @@ class ModelRunnerKVCacheMixin:
         logger.info("ModelRunner kv_cache_dtype: %s", self.kv_cache_dtype)
 
     def _apply_token_constraints(
-        self: ModelRunner,
+        self: Any,
         token_capacity: int,
         max_total_tokens: int | None,
         dp_size: int,
@@ -357,7 +356,7 @@ class ModelRunnerKVCacheMixin:
 
         return token_capacity
 
-    def _resolve_max_num_reqs(self: ModelRunner, max_num_reqs: int | None) -> int:
+    def _resolve_max_num_reqs(self: Any, max_num_reqs: int | None) -> int:
         """Compute max concurrent requests."""
         if max_num_reqs is None:
             max_num_reqs = min(
@@ -386,7 +385,7 @@ class ModelRunnerKVCacheMixin:
         return max_num_reqs
 
     def _maybe_wrap_hybrid_kv_pool(
-        self: ModelRunner,
+        self: Any,
         token_to_kv_pool_class: type,
         **kvcache_kwargs,
     ):
@@ -421,7 +420,7 @@ class ModelRunnerKVCacheMixin:
             **kvcache_kwargs,
         )
 
-    def _init_pools(self: ModelRunner, max_num_reqs: int, dp_size: int):
+    def _init_pools(self: Any, max_num_reqs: int, dp_size: int):
         """Create ReqToTokenPool, KV pool, allocator, and MemoryPools."""
         from sgl_jax.srt.mem_cache.allocator import (
             PagedTokenToKVPoolAllocator,
@@ -538,7 +537,7 @@ class ModelRunnerKVCacheMixin:
                 )
 
     def init_memory_pool(
-        self: ModelRunner,
+        self: Any,
         max_num_reqs: int | None = None,
         max_total_tokens: int | None = None,
         total_device_memory: int | None = None,
@@ -547,6 +546,8 @@ class ModelRunnerKVCacheMixin:
         """Initialize memory pool for KV cache (+ recurrent state if hybrid)."""
         # 1. kv_cache_dtype
         self._init_kv_cache_dtype()
+        if total_device_memory is None:
+            total_device_memory = self.get_available_device_memory()
 
         # 2. Enforce constraints for hybrid recurrent
         if self.linear_recurrent_config is not None:
@@ -608,25 +609,25 @@ class ModelRunnerKVCacheMixin:
     # ── Properties ──
 
     @property
-    def kimi_linear_config(self: ModelRunner):
+    def kimi_linear_config(self: Any):
         from sgl_jax.srt.configs.kimi_linear import get_kimi_linear_config
 
         return get_kimi_linear_config(self.model_config.hf_config)
 
     @property
-    def lightning_config(self: ModelRunner):
+    def lightning_config(self: Any):
         from sgl_jax.srt.configs.bailing_hybrid import get_bailing_hybrid_config
 
         return get_bailing_hybrid_config(self.model_config.hf_config)
 
     @property
-    def qwen3_5_hybrid_config(self: ModelRunner):
+    def qwen3_5_hybrid_config(self: Any):
         from sgl_jax.srt.configs.qwen3_5 import get_qwen3_5_hybrid_config
 
         return get_qwen3_5_hybrid_config(self.model_config.hf_config)
 
     @property
-    def linear_recurrent_config(self: ModelRunner):
+    def linear_recurrent_config(self: Any):
         """Return linear recurrent config if the model has linear attention, else None."""
         if self.kimi_linear_config is not None:
             return self.kimi_linear_config
@@ -634,7 +635,7 @@ class ModelRunnerKVCacheMixin:
             return self.qwen3_5_hybrid_config.text_config
         return self.lightning_config
 
-    def _kv_pool_layer_count(self: ModelRunner):
+    def _kv_pool_layer_count(self: Any):
         """Layer count for KV pool sizing.
 
         For hybrid recurrent models, only full-attention layers need KV cache.

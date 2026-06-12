@@ -27,12 +27,9 @@ from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsProcessor
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
-from sgl_jax.srt.models.llama import (
-    LlamaDecoderLayer,
-    LlamaForCausalLM,
-    LlamaMLP,
-    LlamaModel,
-)
+from sgl_jax.srt.models.llama import LlamaDecoderLayer as BaseLlamaDecoderLayer
+from sgl_jax.srt.models.llama import LlamaForCausalLM, LlamaMLP, LlamaModel
+from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 # Adapted from
@@ -43,7 +40,7 @@ from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 logger = logging.getLogger(__name__)
 
 
-class LlamaDecoderLayer(LlamaDecoderLayer):
+class LlamaDecoderLayer(BaseLlamaDecoderLayer):
     def __init__(
         self,
         config: LlamaConfig,
@@ -94,7 +91,7 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
 
         self.hidden_norm = RMSNorm(num_features=config.hidden_size, epsilon=config.rms_norm_eps)
 
-    def __call__(
+    def __call__(  # type: ignore[override]
         self,
         positions: jax.Array,
         embeds: jax.Array,
@@ -102,7 +99,7 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
         residual: jax.Array | None,
-    ) -> tuple[jax.Array, jax.Array]:
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
 
         residual = hidden_states
         embeds = self.input_layernorm(embeds)
@@ -197,7 +194,8 @@ class LlamaEagleModel(LlamaModel):
             # positions = forward_batch.mrope_positions
             pass
 
-        if forward_batch.spec_info is None or forward_batch.spec_info.hidden_states is None:
+        assert isinstance(forward_batch.spec_info, EagleDraftInput)
+        if forward_batch.spec_info.hidden_states is None:
             raise ValueError("EAGLE3 draft model expects speculative hidden states.")
         hidden_states = forward_batch.spec_info.hidden_states
 

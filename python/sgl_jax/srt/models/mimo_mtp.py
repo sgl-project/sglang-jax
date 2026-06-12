@@ -13,6 +13,7 @@ from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.mem_cache.memory_pool import KVCache, MemoryPools
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.models.qwen2 import Qwen2DecoderLayer
+from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
@@ -56,10 +57,13 @@ class MiMoMTPLayer(nnx.Module):
     def __call__(self, forward_batch: ForwardBatch, token_to_kv_pool: KVCache):
         hidden_states = self.embed_tokens(forward_batch.input_ids)
         # Mask out padding tokens without scatter to avoid TPU custom-call issues.
+        assert forward_batch.positions is not None
         token_mask = (forward_batch.positions != 0).astype(hidden_states.dtype)[:, None]
         hidden_states = hidden_states * token_mask
         layers_kv_fused = []
 
+        assert isinstance(forward_batch.spec_info, EagleDraftInput)
+        assert forward_batch.spec_info.hidden_states is not None
         hidden_states, _ = self.input_proj(
             jnp.concatenate(
                 (

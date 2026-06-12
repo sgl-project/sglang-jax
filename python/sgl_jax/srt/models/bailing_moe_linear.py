@@ -1,5 +1,6 @@
 import copy
 import logging
+from typing import Any
 
 import jax
 import numpy as np
@@ -66,6 +67,8 @@ class BailingMoELinearAttention(nnx.Module):
         self.mesh = mesh
         self.linear_silu = getattr(config, "use_linear_silu", getattr(config, "linear_silu", False))
         self.linear_rope = getattr(config, "linear_rope", True)
+        self.q_norm: RMSNorm | None = None
+        self.k_norm: RMSNorm | None = None
 
         inner_size = self.num_heads * self.head_dim
         qkv_bias = getattr(config, "use_bias", False) or getattr(config, "use_qkv_bias", False)
@@ -131,9 +134,6 @@ class BailingMoELinearAttention(nnx.Module):
                 param_dtype=dtype,
                 scope_name="key_layernorm",
             )
-        else:
-            self.q_norm = None
-            self.k_norm = None
 
         if hasattr(config, "rotary_dim"):
             rotary_dim = config.rotary_dim
@@ -197,6 +197,7 @@ class BailingMoELinearAttention(nnx.Module):
         )
 
         if self.q_norm is not None:
+            assert self.k_norm is not None
             q = self.q_norm(q)
             k = self.k_norm(k)
 
@@ -232,6 +233,8 @@ class BailingMoEGQAAttention(nnx.Module):
         self.q_size = self.q_head_num * self.head_dim
         self.kv_size = self.kv_head_num * self.head_dim
         self.use_qk_norm = getattr(config, "use_qk_norm", False)
+        self.q_norm: RMSNorm | None = None
+        self.k_norm: RMSNorm | None = None
 
         qkv_bias = getattr(config, "use_bias", False) or getattr(config, "use_qkv_bias", False)
         self.qkv_proj = LinearBase(
@@ -265,9 +268,6 @@ class BailingMoEGQAAttention(nnx.Module):
                 param_dtype=dtype,
                 scope_name="key_layernorm",
             )
-        else:
-            self.q_norm = None
-            self.k_norm = None
 
         if hasattr(config, "rotary_dim"):
             rotary_dim = config.rotary_dim
@@ -306,6 +306,8 @@ class BailingMoEGQAAttention(nnx.Module):
         v = v.reshape(-1, self.kv_head_num, self.head_dim)
 
         if self.use_qk_norm:
+            assert self.q_norm is not None
+            assert self.k_norm is not None
             q = self.q_norm(q)
             k = self.k_norm(k)
 
@@ -333,6 +335,7 @@ class BailingMoELinearDecoderLayer(nnx.Module):
             0 if is_linear_layer(layer_id, getattr(config, "layer_group_size", 1)) else 1,
         )
         self.use_mla = getattr(config, "full_attention_type", "mla") == "mla"
+        self.self_attn: Any
 
         if self.attention_type == 0:
             self.self_attn = BailingMoELinearAttention(
@@ -401,6 +404,11 @@ class BailingMoELinearDecoderLayer(nnx.Module):
         layer_id: int,
         dtype: jnp.dtype,
     ) -> None:
+        self.mlp: Any
+        self.moe_gate: GateLogit | None = None
+        self.topk: TopK | None = None
+        self.shared_experts: DeepseekV3MLP | None = None
+        self.use_fused = False
         first_k_dense_replace = getattr(config, "first_k_dense_replace", 0)
         num_experts = getattr(config, "num_experts", 1)
         if num_experts == 1 or layer_id < first_k_dense_replace:
@@ -411,8 +419,6 @@ class BailingMoELinearDecoderLayer(nnx.Module):
                 dtype=dtype,
             )
             self.is_moe_layer = False
-            self.moe_gate = None
-            self.shared_experts = None
             return
 
         router_dtype = getattr(config, "router_dtype", None)
@@ -556,6 +562,8 @@ class BailingMoELinearDecoderLayer(nnx.Module):
         hidden_states = self.post_attention_layernorm(hidden_states)
 
         if self.is_moe_layer:
+            assert self.moe_gate is not None
+            assert self.topk is not None
             shared_output = self.shared_experts(hidden_states) if self.shared_experts else None
             router_logits = self.moe_gate(hidden_states)
             correction_bias = self.moe_gate.bias.value if self.moe_gate.bias is not None else None
@@ -566,8 +574,9 @@ class BailingMoELinearDecoderLayer(nnx.Module):
             )
             if self.use_fused:
                 token_valid_mask = forward_batch.get_token_valid_mask(hidden_states.shape[0])
+                assert token_valid_mask is not None
                 topk_ids = jnp.where(token_valid_mask[:, None], topk_ids, -1)
-            hidden_states = self.mlp(hidden_states, topk_weights, topk_ids)
+            hidden_states = self.mlp(hidden_states, topk_weights, topk_ids)  # type: ignore[call-arg]
             if shared_output is not None:
                 hidden_states = hidden_states + shared_output
         else:
@@ -645,7 +654,7 @@ class BailingMoELinearModel(nnx.Module):
         layers_topk_ids = []
 
         recurrent_state_pool = getattr(memory_pools, "recurrent_state_pool", None)
-        recurrent_updates = None
+        recurrent_updates: list[Any] | None = None
         conv_updates = None
         if recurrent_state_pool is not None:
             recurrent_updates = list(recurrent_state_pool.recurrent_buffers)
@@ -666,6 +675,7 @@ class BailingMoELinearModel(nnx.Module):
             if pool_update is not None:
                 if recurrent_state_pool is None:
                     raise ValueError("Linear Bailing layer requires recurrent_state_pool")
+                assert recurrent_updates is not None
                 layer_idx = recurrent_state_pool.layers_mapping[layer.layer_id]
                 recurrent_updates[layer_idx] = pool_update[0]
             layers_topk_ids.append(topk_ids)
@@ -675,7 +685,7 @@ class BailingMoELinearModel(nnx.Module):
         hidden_states = self.norm(hidden_states)
 
         if recurrent_state_pool is None:
-            pool_updates = layers_kv_fused
+            pool_updates: Any = layers_kv_fused
         else:
             pool_updates = {
                 "token_to_kv_pool": layers_kv_fused,

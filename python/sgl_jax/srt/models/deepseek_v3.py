@@ -9,6 +9,7 @@ reusing existing modules: RadixAttention, GateLogit, TopK, EPMoE/FusedEPMoE.
 """
 
 import logging
+from typing import Any
 
 import jax
 import numpy as np
@@ -22,6 +23,7 @@ from sgl_jax.srt.eplb.expert_location import ExpertLocationMetadata
 from sgl_jax.srt.layers.embeddings import (
     Embed,
     ParallelLMHead,
+    RotaryEmbedding,
     _deepseek_yarn_get_mscale,
     get_rope,
 )
@@ -177,7 +179,7 @@ class DeepseekV3Attention(nnx.Module):
             scope_name="kv_a_proj",
         )
         self.kv_a_layernorm = RMSNorm(kv_lora_rank, dtype=dtype)
-        self.kv_b_proj = LinearBase(
+        self.kv_b_proj: Any | None = LinearBase(
             kv_lora_rank,
             num_heads * (qk_nope_head_dim + v_head_dim),
             mesh,
@@ -198,7 +200,7 @@ class DeepseekV3Attention(nnx.Module):
         )
 
         if not skip_rope:
-            self.rotary_emb = get_rope(
+            self.rotary_emb: RotaryEmbedding | None = get_rope(
                 head_size=qk_rope_head_dim,
                 rotary_dim=qk_rope_head_dim,
                 max_position=max_position_embeddings,
@@ -224,6 +226,8 @@ class DeepseekV3Attention(nnx.Module):
         # weight loading: w_uk[R, n_h, D_k] folds W_UK into Q, w_uv[R, n_h, D_v]
         # folds W_UV into the output. Placeholders here so nnx tracks them in
         # the model state tree; sharded on the head dim like kv_b_proj.weight.
+        self.w_uk: Any | None = None
+        self.w_uv: Any | None = None
         if use_absorbed:
             uk_axes = (None, "tensor", None)
             self.w_uk = nnx.Param(
@@ -310,6 +314,7 @@ class DeepseekV3Attention(nnx.Module):
         """
         if not self.use_absorbed:
             return
+        assert self.kv_b_proj is not None
         if hasattr(self.kv_b_proj, "weight"):
             # Non-quantized LinearBase: weight is [kv_lora_rank, n_h * (qk_nope+v)]
             raw_weight = self.kv_b_proj.weight.value
@@ -333,6 +338,8 @@ class DeepseekV3Attention(nnx.Module):
             self.num_heads,
             self.qk_nope_head_dim + self.v_head_dim,
         )
+        assert self.w_uk is not None
+        assert self.w_uv is not None
         self.w_uk.value = w_kv[:, :, : self.qk_nope_head_dim]
         self.w_uv.value = w_kv[:, :, self.qk_nope_head_dim :]
         self.kv_b_proj = None
@@ -347,6 +354,8 @@ class DeepseekV3Attention(nnx.Module):
         token_to_kv_pool: KVCache,
     ) -> tuple[jax.Array, jax.Array]:
         # ql_nope[t, h, r] = sum_d q_nope[t, h, d] * w_uk[r, h, d]
+        assert self.w_uk is not None
+        assert self.w_uv is not None
         ql_nope = jnp.einsum("thd,rhd->thr", q_nope, self.w_uk.value)
 
         # Latent K/V are a single shared head — pack into [T, 1, *] for MQA.
@@ -377,6 +386,7 @@ class DeepseekV3Attention(nnx.Module):
         token_to_kv_pool: KVCache,
     ) -> tuple[jax.Array, jax.Array]:
         # Decompress latent c_kv into per-head K-nope and V via kv_b_proj.
+        assert self.kv_b_proj is not None
         kv, _ = self.kv_b_proj(compressed)
         kv = kv.reshape(-1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
         k_nope, v = jnp.split(kv, [self.qk_nope_head_dim], axis=-1)
@@ -469,6 +479,8 @@ class DeepseekV3DecoderLayer(nnx.Module):
             and layer_id % moe_layer_freq == 0
         )
         self.is_moe_layer = is_moe
+        self.mlp: Any
+        self.moe_gate: GateLogit | None = None
 
         if not is_moe:
             self.mlp = DeepseekV3MLP(
@@ -572,7 +584,7 @@ class DeepseekV3DecoderLayer(nnx.Module):
 
         # Shared experts (non-fused: separate MLP; fused: built into FusedEPMoE)
         if n_shared_experts and n_shared_experts > 0 and not self.use_fused:
-            self.shared_experts = DeepseekV3MLP(
+            self.shared_experts: DeepseekV3MLP | None = DeepseekV3MLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=moe_intermediate_size * n_shared_experts,
                 mesh=mesh,
@@ -614,6 +626,7 @@ class DeepseekV3DecoderLayer(nnx.Module):
 
         # MLP (MoE or dense)
         if self.is_moe_layer:
+            assert self.moe_gate is not None
             if self.shared_experts is not None:
                 shared_output = self.shared_experts(hidden_states)
             else:
@@ -627,9 +640,10 @@ class DeepseekV3DecoderLayer(nnx.Module):
 
             if self.use_fused:
                 token_valid_mask = forward_batch.get_token_valid_mask(hidden_states.shape[0])
+                assert token_valid_mask is not None
                 topk_ids = jnp.where(token_valid_mask[:, None], topk_ids, -1)
 
-            hidden_states = self.mlp(hidden_states, topk_weights, topk_ids)
+            hidden_states = self.mlp(hidden_states, topk_weights, topk_ids)  # type: ignore[call-arg]
 
             if shared_output is not None:
                 hidden_states = hidden_states + shared_output

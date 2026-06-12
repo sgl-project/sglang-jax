@@ -8,6 +8,7 @@ Reference: https://huggingface.co/MiniMaxAI/MiniMax-M2/blob/main/modeling_minima
 """
 
 import logging
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -209,6 +210,9 @@ class MiniMaxM2DecoderLayer(nnx.Module):
         )
 
         moe_cls = FusedEPMoE if self.use_fused else EPMoE
+        fused_kwargs: dict[str, Any] = (
+            {"activation": "silu", "renormalize_topk_logits": True} if self.use_fused else {}
+        )
         self.block_sparse_moe = moe_cls(
             hidden_size=config.hidden_size,
             num_experts=num_experts,
@@ -220,7 +224,7 @@ class MiniMaxM2DecoderLayer(nnx.Module):
             dtype=dtype,
             layer_id=layer_id,
             quantization_config=getattr(config, "quantization_config", None),
-            **({"activation": "silu", "renormalize_topk_logits": True} if self.use_fused else {}),
+            **fused_kwargs,
         )
 
         self.input_layernorm = RMSNorm(
@@ -262,6 +266,7 @@ class MiniMaxM2DecoderLayer(nnx.Module):
         )
         if self.use_fused:
             mask = forward_batch.get_token_valid_mask(hidden_states.shape[0])
+            assert mask is not None
             topk_ids = jnp.where(mask[:, None], topk_ids, -1)
         hidden_states = self.block_sparse_moe(hidden_states, topk_weights, topk_ids)
 

@@ -639,7 +639,7 @@ class SWAKVPool(KVCache):
         page_size: int,
         swa_attention_layer_ids: list[int],
         full_attention_layer_ids: list[int],
-        token_to_kv_pool_class: KVCache = MHATokenToKVPool,
+        token_to_kv_pool_class: type[KVCache] = MHATokenToKVPool,
         swa_head_num: int | None = None,
         **kwargs,
     ):

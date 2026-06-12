@@ -335,7 +335,7 @@ class LlamaModel(nnx.Module):
                 epsilon=config.rms_norm_eps,
                 param_dtype=dtype,
             )
-        self.layers_to_capture = []
+        self.layers_to_capture: list[int] = []
 
     def __call__(
         self,

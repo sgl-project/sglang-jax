@@ -23,6 +23,7 @@ from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.mem_cache.memory_pool import KVCache, MemoryPools
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.models.mimo_v2_flash import MiMoV2Attention, MiMoV2MLP
+from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
@@ -145,7 +146,9 @@ class MiMoV2ModelNextN(nnx.Module):
         self, forward_batch: ForwardBatch, token_to_kv_pool: KVCache
     ) -> tuple[jax.Array, list[jax.Array]]:
         embed = self.embed_tokens(forward_batch.input_ids)
+        assert isinstance(forward_batch.spec_info, EagleDraftInput)
         hidden_in = forward_batch.spec_info.hidden_states
+        assert hidden_in is not None
         emb_sh = jax.typeof(embed).sharding
         if isinstance(emb_sh, jax.sharding.NamedSharding):
             hidden_in = jax.sharding.reshard(hidden_in, emb_sh)

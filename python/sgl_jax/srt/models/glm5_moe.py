@@ -153,7 +153,7 @@ class Glm5Attention(nnx.Module):
         rope_theta: float = 1000000,
         rope_scaling: dict[str, Any] | None = None,
         head_dim: int | None = None,
-        rms_norm_eps: float = None,
+        rms_norm_eps: float | None = None,
         use_qk_norm: bool = True,
         rotary_dim: int = 0,
         layer_id: int = 0,
@@ -177,6 +177,8 @@ class Glm5Attention(nnx.Module):
         self.scaling = 256**-0.5
 
         self.use_qk_norm = use_qk_norm
+        self.q_norm: RMSNorm | None
+        self.k_norm: RMSNorm | None
 
         if use_qk_norm:
             self.q_norm = RMSNorm(256, epsilon=rms_norm_eps, param_dtype=dtype, scope_name="q_norm")
@@ -219,7 +221,7 @@ class Glm5Attention(nnx.Module):
             self.kv_lora_rank, epsilon=rms_norm_eps, param_dtype=dtype, scope_name="kv_a_layernorm"
         )
 
-        self.kv_b_proj = LinearBase(
+        self.kv_b_proj: Any | None = LinearBase(
             input_size=self.kv_lora_rank,
             output_size=num_heads * (self.qk_nope_head_dim + self.v_head_dim),
             use_bias=False,
@@ -259,6 +261,9 @@ class Glm5Attention(nnx.Module):
         )
 
         self.use_absorbed = use_absorbed
+        self.w_uk: Any | None
+        self.w_uv: Any | None
+        self.attn_mqa: RadixAttention | None
 
         if use_absorbed:
             uk_axes = (None, "tensor", None)
@@ -322,6 +327,8 @@ class Glm5Attention(nnx.Module):
             self.num_heads,
             self.qk_nope_head_dim + self.v_head_dim,
         )
+        assert self.w_uk is not None
+        assert self.w_uv is not None
         self.w_uk.value = w_kv[:, :, : self.qk_nope_head_dim]
         self.w_uv.value = w_kv[:, :, self.qk_nope_head_dim :]
         self.kv_b_proj = None
@@ -335,6 +342,9 @@ class Glm5Attention(nnx.Module):
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
     ) -> tuple[jax.Array, jax.Array]:
+        assert self.w_uk is not None
+        assert self.w_uv is not None
+        assert self.attn_mqa is not None
         ql_nope = jnp.einsum("thd,rhd->thr", q_nope, self.w_uk.value)
         c_kv_3d = compressed[:, None, :]
         attn_output, kv_fused = self.attn_mqa(
@@ -359,6 +369,7 @@ class Glm5Attention(nnx.Module):
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
     ) -> tuple[jax.Array, jax.Array]:
+        assert self.kv_b_proj is not None
         kv, _ = self.kv_b_proj(compressed)
         kv = kv.reshape(-1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
         k_nope, v = jnp.split(kv, [self.qk_nope_head_dim], axis=-1)
@@ -504,6 +515,10 @@ class Glm5DecoderLayer(nnx.Module):
         )
 
         first_k_dense_replace = getattr(config, "first_k_dense_replace", 0)
+        self.mlp: Any
+        self.moe_gate: GateLogit | None = None
+        self.topk: TopK | None = None
+        self.shared_experts: Glm5MLP | None = None
 
         if layer_id < first_k_dense_replace:
             self.mlp = Glm5MLP(
@@ -629,6 +644,8 @@ class Glm5DecoderLayer(nnx.Module):
                 shared_output = self.shared_experts(hidden_states)
             else:
                 shared_output = None
+            assert self.moe_gate is not None
+            assert self.topk is not None
             router_logits = self.moe_gate(hidden_states)
 
             correction_bias = self.moe_gate.bias.value if self.moe_gate.bias is not None else None
@@ -638,7 +655,7 @@ class Glm5DecoderLayer(nnx.Module):
                 dispatch_info=dispatch_info,
             )
 
-            hidden_states = self.mlp(hidden_states, topk_weights, topk_ids)
+            hidden_states = self.mlp(hidden_states, topk_weights, topk_ids)  # type: ignore[call-arg]
 
             if shared_output is not None:
                 hidden_states = hidden_states + shared_output
@@ -646,7 +663,7 @@ class Glm5DecoderLayer(nnx.Module):
             hidden_states = self.mlp(hidden_states)
             topk_ids = None
 
-        return hidden_states, residual, kv_fused, topk_ids
+        return hidden_states, residual, kv_fused, topk_ids  # type: ignore[return-value]
 
 
 class Glm5Model(nnx.Module):
