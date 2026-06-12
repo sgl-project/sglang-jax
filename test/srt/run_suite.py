@@ -260,7 +260,7 @@ suites = {
         TestFile("python/sgl_jax/test/test_mla_attention.py", 2.5),
         TestFile("python/sgl_jax/test/test_moe_topk.py", 0.3),
         TestFile("python/sgl_jax/test/kernels/fused_moe_v1_test.py", 9),
-        TestFile("python/sgl_jax/test/kernels/fused_moe_v2_test.py", 5),
+        TestFile("python/sgl_jax/test/kernels/fused_moe_v2_test.py", 3),
         TestFile("python/sgl_jax/test/test_sampler.py", 0.2),
         TestFile("python/sgl_jax/test/test_utils.py", 0.1),
         TestFile("python/sgl_jax/test/mem_cache/test_kv_cache.py", 0.7),
