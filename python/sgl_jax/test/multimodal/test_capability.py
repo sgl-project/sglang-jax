@@ -75,5 +75,38 @@ class TestCapability(unittest.TestCase):
         self.assertTrue(cap.is_multimodal_arch(_ExplicitModalities))
 
 
+class TestReconcile(unittest.TestCase):
+    """★5 startup reconciliation (design §3.5.5), via the pure find_capability_inconsistencies."""
+
+    def test_consistent_passes(self):
+        registered = {"Img": _ImageVLM, "Txt": _TextOnly}
+        # mm-capable _ImageVLM has a processor; served proxy True matches its capability True.
+        errs = cap.find_capability_inconsistencies(registered, {"Img"}, ["Img"], True)
+        self.assertEqual(errs, [])
+
+    def test_served_proxy_mismatch_flagged(self):
+        # config-proxy said NOT multimodal, but the served class declares capability -> drift.
+        errs = cap.find_capability_inconsistencies({"Img": _ImageVLM}, {"Img"}, ["Img"], False)
+        self.assertTrue(any("mismatch" in e for e in errs), errs)
+
+    def test_missing_processor_flagged(self):
+        # mm-capable model with no registered processor -> media would be silently dropped.
+        errs = cap.find_capability_inconsistencies({"Img": _ImageVLM}, set(), ["Img"], True)
+        self.assertTrue(any("no registered processor" in e for e in errs), errs)
+
+    def test_text_only_needs_no_processor(self):
+        errs = cap.find_capability_inconsistencies({"Txt": _TextOnly}, set(), ["Txt"], False)
+        self.assertEqual(errs, [])
+
+    def test_multiple_missing_processors_listed(self):
+        registered = {"Img": _ImageVLM, "Omni": _OmniVLM, "Txt": _TextOnly}
+        errs = cap.find_capability_inconsistencies(registered, set(), ["Txt"], False)
+        # both mm-capable archs reported missing; text-only excluded
+        joined = " ".join(errs)
+        self.assertIn("Img", joined)
+        self.assertIn("Omni", joined)
+        self.assertNotIn("Txt", joined)
+
+
 if __name__ == "__main__":
     unittest.main()

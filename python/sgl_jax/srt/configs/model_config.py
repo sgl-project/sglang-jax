@@ -841,9 +841,11 @@ def is_multimodal_model(hf_config) -> bool:
     declares an ``encode_<modality>`` method / explicit marker). This function is the
     *config-time proxy* of that fact -- it must run before the model class is resolved
     (tokenizer/serving build ModelConfig early), so it reads the equivalent hf_config
-    signal instead. The two must agree for any registered understanding model. (The former
-    standalone ``multimodal_model_archs`` enumeration was a third, uncoordinated source and
-    has been removed -- it had no consumers.)
+    signal instead. Agreement between this proxy and the per-class capability is ENFORCED at
+    startup by ``mm_core.capability.reconcile_mm_capability`` (design §3.5.5 ★5), which also
+    asserts every mm-capable registered model has a processor -- so the proxy is a verified
+    stand-in, not an independent third source. (The former standalone ``multimodal_model_archs``
+    enumeration was a third, uncoordinated source and has been removed -- it had no consumers.)
     """
 
     def _has_mm(cfg) -> bool:

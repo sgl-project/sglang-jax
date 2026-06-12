@@ -174,6 +174,14 @@ class TokenizerManager:
             # real token id and cause a cross-request false prefix hit.
             sanity_check_mm_pad_shift_value(self.model_config.vocab_size)
             import_processor_classes("sgl_jax.srt.multimodal.processors")
+            # ★5 (design §3.5.5): now that both the srt ModelRegistry and the mm ProcessorRegistry
+            # are populated, reconcile the per-class capability truth source -- assert it agrees
+            # with the hf_config proxy is_multimodal used at ModelConfig build, and that every
+            # mm-capable model has a processor (fail loudly here, not silently drop media at
+            # request time).
+            from sgl_jax.srt.mm_core.capability import reconcile_mm_capability
+
+            reconcile_mm_capability(self.model_config)
             architectures = getattr(self.model_config.hf_config, "architectures", [])
             proc_cls = get_processor_cls(architectures)
             if proc_cls is not None:
