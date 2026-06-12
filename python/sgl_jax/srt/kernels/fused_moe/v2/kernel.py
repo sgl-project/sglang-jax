@@ -97,15 +97,23 @@ def swigluoai(
     return (up + 1.0) * glu
 
 
-def activation_fn(acc1, acc3, act_fn):
-    if act_fn == "silu":
-        return jax.nn.silu(acc1) * acc3
-    elif act_fn == "gelu":
-        return jax.nn.gelu(acc1) * acc3
-    elif act_fn == "swigluoai":
+def activation_fn(acc1, acc3, act_fn, swiglu_limit=None):
+    if act_fn == "swigluoai":
         return swigluoai(acc1, acc3)
+    if act_fn == "silu":
+        act = jax.nn.silu(acc1)
+    elif act_fn == "gelu":
+        act = jax.nn.gelu(acc1)
     else:
         raise RuntimeError(f"Unsupported activation: {act_fn}")
+    # Optional SwiGLU clamp (e.g. maxtext-trained models such as Ling3-Flash clamp
+    # the gated activation on their late layers). Cap the post-activation gate
+    # single-sided and the up branch double-sided before the multiply. None =
+    # disabled (default), preserving prior behavior bit-for-bit.
+    if swiglu_limit is not None:
+        act = jnp.clip(act, a_max=swiglu_limit)
+        acc3 = jnp.clip(acc3, a_min=-swiglu_limit, a_max=swiglu_limit)
+    return act * acc3
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -140,6 +148,8 @@ def ref_moe(
     top_k,
     *,
     act_fn="silu",
+    swiglu_limit=None,
+    shared_swiglu_limit=None,
     w1_shared=None,
     w2_shared=None,
     w3_shared=None,
@@ -180,7 +190,7 @@ def ref_moe(
             up = x @ _dequant(
                 w3[e_id], w3_scale[e_id] if w3_scale is not None else None, quant_block_k
             )
-            act = activation_fn(gate, up, act_fn)
+            act = activation_fn(gate, up, act_fn, swiglu_limit)
             out = act @ _dequant(
                 w2[e_id], w2_scale[e_id] if w2_scale is not None else None, quant_block_k
             )
@@ -194,7 +204,7 @@ def ref_moe(
 
         gate_se = tokens_f32 @ _deq_se(w1_shared, w1_shared_scale)
         up_se = tokens_f32 @ _deq_se(w3_shared, w3_shared_scale)
-        act_se = activation_fn(gate_se, up_se, act_fn)
+        act_se = activation_fn(gate_se, up_se, act_fn, shared_swiglu_limit)
         out_se = act_se @ _deq_se(w2_shared, w2_shared_scale)
         output = output + out_se
 
@@ -323,6 +333,8 @@ def _fused_ep_moe_kernel(
     dp_axis_name: str,
     tp_axis_name: str,
     act_fn: str,
+    swiglu_limit: float | None = None,
+    shared_swiglu_limit: float | None = None,
     disable_a2a: bool = False,
     disable_a2a_scatter: bool = False,
     disable_a2a_scatter_local_copy: bool = False,
@@ -1514,7 +1526,7 @@ def _fused_ep_moe_kernel(
                         if not use_direct_w2:
                             gate = b_gate_acc_vmem[pl.ds(btc_id * btc, btc), pl.ds(0, bf)]
                             up_val = b_up_acc_vmem[pl.ds(btc_id * btc, btc), pl.ds(0, bf)]
-                            act = activation_fn(gate, up_val, act_fn)
+                            act = activation_fn(gate, up_val, act_fn, swiglu_limit)
                         if not disable_dynamic_ffn2:
                             for p_id in range(out_packing):
                                 if use_direct_w2:
@@ -1529,7 +1541,9 @@ def _fused_ep_moe_kernel(
                                             pl.ds(btc_id * btc, btc),
                                             pl.ds(sg_off, ffn2_qbk),
                                         ]
-                                        act_slice = activation_fn(gate_slice, up_slice, act_fn)
+                                        act_slice = activation_fn(
+                                            gate_slice, up_slice, act_fn, swiglu_limit
+                                        )
                                         w2_tile = b_w2_x2_vmem[
                                             slot,
                                             p_id,
@@ -1929,7 +1943,7 @@ def _fused_ep_moe_kernel(
                 up_acc = up_acc * (ts * s3)
             # Mode 2/3: the dot already yields the correctly-scaled f32 result.
 
-            act = activation_fn(gate_acc, up_acc, act_fn)  # (bt, bse) f32
+            act = activation_fn(gate_acc, up_acc, act_fn, shared_swiglu_limit)  # (bt, bse) f32
 
             # ----- FFN2 (down), accumulate into b_output -----
             if se_tok_fp8 and se_w_quant:
@@ -2296,6 +2310,8 @@ def _fused_ep_moe_kernel(
         "mesh",
         "top_k",
         "act_fn",
+        "swiglu_limit",
+        "shared_swiglu_limit",
         "disable_a2a",
         "disable_a2a_scatter",
         "disable_a2a_gather",
@@ -2345,6 +2361,8 @@ def fused_ep_moe_v2(
     top_k: int,
     *,
     act_fn: str = "silu",
+    swiglu_limit: float | None = None,
+    shared_swiglu_limit: float | None = None,
     disable_a2a: bool = False,
     disable_a2a_scatter: bool = False,
     disable_a2a_scatter_local_copy: bool = False,
@@ -2716,6 +2734,8 @@ def fused_ep_moe_v2(
                 dp_axis_name=dp_axis_name,
                 tp_axis_name=tp_axis_name,
                 act_fn=act_fn,
+                swiglu_limit=swiglu_limit,
+                shared_swiglu_limit=shared_swiglu_limit,
                 disable_a2a=disable_a2a,
                 disable_a2a_scatter=disable_a2a_scatter,
                 disable_a2a_scatter_local_copy=disable_a2a_scatter_local_copy,
