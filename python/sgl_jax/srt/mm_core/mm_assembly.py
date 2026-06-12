@@ -1,11 +1,12 @@
-"""Shared assembly of stage0 model inputs from `mm_items`.
+"""Shared assembly of per-modality model inputs from ``mm_items`` (neutral mm CORE).
 
-P1 design (see design doc §4.3.5): `mm_items` is the single source of truth for
-multimodal features. The GlobalScheduler only transports `mm_items`; this helper —
-shared by the embed/vit model runners — turns them into the per-modality host-side
-kwargs bundle the embed model consumes. No model-specific logic lives here: audio
-routing (discrete codes vs continuous features) is decided by a generic per-item
-flag, and each model still owns its own forward.
+Relocated from ``multimodal/manager/mm_assembly.py`` in M6-S1: it is shared by the in-model
+understanding path (``ModelRunner.encode_mm_reqs``) and -- until M6-S5 removes them -- the staged
+embed/vit model runners, so it belongs in the neutral ``mm_core`` layer that ``srt`` may import
+directly (the old location forced an ``importlib`` workaround to dodge the srt->multimodal reverse
+import). ``mm_items`` is the single source of truth for multimodal features; this helper turns them
+into the per-modality host-side kwargs bundle the encoders consume. No model-specific logic: audio
+routing (discrete codes vs continuous features) is a generic per-item flag.
 
 Pure numpy (no jax) so it is unit-testable without the model stack. Items may be
 ``MultimodalDataItem`` objects or their transport dicts.

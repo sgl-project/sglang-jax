@@ -4,7 +4,7 @@ import unittest
 
 import numpy as np
 
-from sgl_jax.srt.multimodal.manager.mm_assembly import assemble_mm_inputs
+from sgl_jax.srt.mm_core.mm_assembly import assemble_mm_inputs
 
 
 class _Item:

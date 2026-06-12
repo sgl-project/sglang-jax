@@ -650,11 +650,10 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         image/video/audio."""
         if self.jitted_embed_mm is None or not reqs:
             return
-        import importlib
+        # mm_assembly now lives in the neutral mm_core layer (M6-S1), which srt may import directly
+        # -- no more importlib workaround to dodge the (now-removed) srt->multimodal reverse import.
+        from sgl_jax.srt.mm_core.mm_assembly import assemble_mm_inputs as assemble
 
-        assemble = importlib.import_module(
-            "sgl_jax.srt.multimodal.manager.mm_assembly"
-        ).assemble_mm_inputs
         repl = jax.sharding.NamedSharding(self.mesh, jax.sharding.PartitionSpec())
 
         def _put(x, bf16=False):

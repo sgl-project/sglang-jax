@@ -4,11 +4,11 @@ import numpy as np
 from flax import nnx
 
 from sgl_jax.srt.configs.load_config import LoadConfig
+from sgl_jax.srt.mm_core.mm_assembly import assemble_mm_inputs
 from sgl_jax.srt.model_executor.base_model_runner import BaseModelRunner
 from sgl_jax.srt.model_loader.loader import get_model_loader
 from sgl_jax.srt.multimodal.common.ServerArgs import MultimodalServerArgs
 from sgl_jax.srt.multimodal.configs.config_registry import get_qwen_vl_config
-from sgl_jax.srt.multimodal.manager.mm_assembly import assemble_mm_inputs
 from sgl_jax.srt.multimodal.manager.schedule_batch import Req
 
 

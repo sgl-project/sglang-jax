@@ -8,10 +8,10 @@ from flax import nnx
 from transformers import AutoConfig
 
 from sgl_jax.srt.configs.load_config import LoadConfig
+from sgl_jax.srt.mm_core.mm_assembly import assemble_mm_inputs
 from sgl_jax.srt.model_executor.base_model_runner import BaseModelRunner
 from sgl_jax.srt.model_loader.loader import get_model_loader
 from sgl_jax.srt.multimodal.common.ServerArgs import MultimodalServerArgs
-from sgl_jax.srt.multimodal.manager.mm_assembly import assemble_mm_inputs
 from sgl_jax.srt.multimodal.manager.schedule_batch import Req
 
 
@@ -158,9 +158,7 @@ class EmbedModelRunner(BaseModelRunner):
         # contracts before the forward. Models without the hook skip it.
         validate_inputs = getattr(getattr(self, "model", None), "validate_embed_inputs", None)
         if validate_inputs is not None:
-            validate_inputs(
-                input_ids=input_ids, omni_inputs=omni_inputs, audio_codes=audio_codes
-            )
+            validate_inputs(input_ids=input_ids, omni_inputs=omni_inputs, audio_codes=audio_codes)
         audio_feature_lengths = None
         # Continuous-audio models (e.g. Qwen3-Omni mel) densify via feature_attention_mask;
         # discrete-codes audio sets audio_features=None and skips this generically.
