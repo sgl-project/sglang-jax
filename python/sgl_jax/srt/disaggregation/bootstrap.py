@@ -62,6 +62,23 @@ class PrefillInfo:
         return asdict(self)
 
 
+def _reject_if_below_protocol_floor(info: dict[str, object]) -> None:
+    """Raise ``RuntimeError`` if a prefill peer reports a protocol version
+    below ``MIN_COMPATIBLE_VERSION``. Shared by the per-request lookup and
+    the decode-side :class:`PrefillInfoCache` so both reject stale peers
+    identically."""
+
+    peer_version = int(info.get("protocol_version", 0))
+    if peer_version < MIN_COMPATIBLE_VERSION:
+        raise RuntimeError(
+            f"prefill peer {info.get('bootstrap_key')!r} reports "
+            f"protocol_version={peer_version} below "
+            f"MIN_COMPATIBLE_VERSION={MIN_COMPATIBLE_VERSION}; "
+            "rolling upgrade must finish before this peer can be "
+            "used"
+        )
+
+
 def check_prefill_compat(
     info: dict[str, object],
     *,
@@ -478,15 +495,76 @@ class BootstrapClient:
         r.raise_for_status()
         info = r.json()
         # Reject peers below the supported protocol floor.
-        peer_version = int(info.get("protocol_version", 0))
-        if peer_version < MIN_COMPATIBLE_VERSION:
-            raise RuntimeError(
-                f"prefill peer {info.get('bootstrap_key')!r} reports "
-                f"protocol_version={peer_version} below "
-                f"MIN_COMPATIBLE_VERSION={MIN_COMPATIBLE_VERSION}; "
-                "rolling upgrade must finish before this peer can be "
-                "used"
-            )
+        _reject_if_below_protocol_floor(info)
+        return info
+
+
+class PrefillInfoCache:
+    """Decode-side cache of the prefill registry.
+
+    Resolves per-room selection LOCALLY — mirroring the server's
+    ``_Registry.pick_for_room`` (``sorted(keys)[room % len]``) — so a warm
+    cache serves every request with **zero** network round-trips. This
+    replaces the per-request synchronous ``get_prefill_info`` GET that, under
+    high concurrency, serialized on and froze the single-threaded decode event
+    loop.
+
+    The full registry is fetched via ``list_prefills`` at most once per
+    ``refresh_interval_s`` (rate-limited). A cache miss (no prefill resolvable
+    for a room) triggers at most one rate-limited refresh, then re-resolves;
+    if the registry is still empty it returns ``None`` so the caller defers the
+    request and retries next tick (never abort). This is sglang's design:
+    resolve locally from a cached cluster layout, hit the network only on miss.
+    """
+
+    def __init__(
+        self,
+        client: BootstrapClient,
+        *,
+        refresh_interval_s: float = 1.0,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._client = client
+        self._refresh_interval_s = refresh_interval_s
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._by_key: dict[str, dict[str, object]] = {}
+        self._sorted_keys: list[str] = []
+        # -inf so the very first lookup always refreshes regardless of clock.
+        self._last_refresh: float = float("-inf")
+
+    def _refresh_locked(self) -> None:
+        prefills = self._client.list_prefills()
+        by_key = {str(p["bootstrap_key"]): p for p in prefills}
+        self._by_key = by_key
+        self._sorted_keys = sorted(by_key)
+        self._last_refresh = self._clock()
+
+    def _pick_locked(self, bootstrap_room: int) -> dict[str, object] | None:
+        if not self._sorted_keys:
+            return None
+        chosen = self._sorted_keys[bootstrap_room % len(self._sorted_keys)]
+        return self._by_key[chosen]
+
+    def pick_for_room(self, bootstrap_room: int) -> dict[str, object] | None:
+        """Return prefill info for ``bootstrap_room``, or ``None`` if no
+        prefill is registered yet (caller should defer + retry).
+
+        Resolves from the warm cache first; on miss, performs at most one
+        rate-limited ``list_prefills`` refresh, then resolves again. Raises
+        ``RuntimeError`` if the chosen peer is below the protocol floor.
+        """
+
+        with self._lock:
+            info = self._pick_locked(bootstrap_room)
+            if info is None:
+                now = self._clock()
+                if now - self._last_refresh >= self._refresh_interval_s:
+                    self._refresh_locked()
+                    info = self._pick_locked(bootstrap_room)
+        if info is None:
+            return None
+        _reject_if_below_protocol_floor(info)
         return info
 
 

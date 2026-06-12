@@ -194,6 +194,10 @@ class Scheduler(
         self.disagg_prealloc_queue = None
         self.disagg_transfer_queue = None
         self.disagg_decode_watchdog = None
+        # Decode-side cache of prefill registry (sglang-style local per-room
+        # resolution) + reqs deferred because no prefill was registered yet.
+        self.disagg_prefill_info_cache = None
+        self._pd_pending_bootstrap = []
 
         # LoRA configurations
         self.lora_paths = server_args.lora_paths

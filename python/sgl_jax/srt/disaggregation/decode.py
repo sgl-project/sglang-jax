@@ -15,7 +15,7 @@ import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec
 
 from sgl_jax.srt.disaggregation.base.kv_manager import KVPoll
-from sgl_jax.srt.disaggregation.bootstrap import BootstrapClient
+from sgl_jax.srt.disaggregation.bootstrap import BootstrapClient, PrefillInfoCache
 from sgl_jax.srt.disaggregation.jax_transfer.conn import (
     JaxTransferKVManager,
     JaxTransferKVReceiver,
@@ -193,6 +193,7 @@ class SchedulerDisaggregationDecodeMixin:
 
     disagg_kv_manager: JaxTransferKVManager
     disagg_bootstrap_client: BootstrapClient
+    disagg_prefill_info_cache: PrefillInfoCache
     disagg_prealloc_queue: DecodePreallocQueue
     disagg_transfer_queue: DecodeTransferQueue
 
@@ -273,10 +274,19 @@ class SchedulerDisaggregationDecodeMixin:
             for r in recv_reqs
             if getattr(r, "bootstrap_room", None) is not None
         }
-        if not recv_pd_rids:
+        new_pd_reqs = (
+            self._extract_pd_reqs_from_waiting_queue(recv_pd_rids) if recv_pd_rids else []
+        )
+
+        # Retry reqs deferred on a previous tick because no prefill was
+        # registered yet (bootstrap cache miss). They go ahead of new reqs so
+        # FIFO ordering is preserved across deferrals.
+        pending = self._pd_pending_bootstrap
+        self._pd_pending_bootstrap = []
+        pd_reqs = pending + new_pd_reqs
+        if not pd_reqs:
             return
 
-        pd_reqs = self._extract_pd_reqs_from_waiting_queue(recv_pd_rids)
         for req in pd_reqs:
             try:
                 from sgl_jax.srt.disaggregation.common.metrics import time_phase
@@ -284,9 +294,14 @@ class SchedulerDisaggregationDecodeMixin:
                 self._pd_mark_time(req, "bootstrap_start")
                 with time_phase("bootstrap", "decode"):
                     if jax.process_count() > 1:
+                        # Multi-host caches the matched peer after the first
+                        # lookup, so this does no per-request network I/O.
                         p_info = self._pick_prefill_peer_for_this_host()
                     else:
-                        p_info = self.disagg_bootstrap_client.get_prefill_info(req.bootstrap_room)
+                        # Local cache resolution (sglang-style): a warm cache
+                        # does zero network I/O, so this no longer blocks the
+                        # event loop.
+                        p_info = self.disagg_prefill_info_cache.pick_for_room(req.bootstrap_room)
                 self._pd_mark_time(req, "bootstrap_done")
             except Exception:
                 logger.exception(
@@ -297,6 +312,12 @@ class SchedulerDisaggregationDecodeMixin:
                 )
                 self._record_decode_transfer_failure("bootstrap_lookup")
                 self._abort_decode_request(req, "bootstrap_lookup")
+                continue
+
+            if p_info is None:
+                # No prefill registered yet (or the rate-limited refresh was
+                # skipped this tick). Defer and retry next tick — never abort.
+                self._pd_pending_bootstrap.append(req)
                 continue
 
             try:

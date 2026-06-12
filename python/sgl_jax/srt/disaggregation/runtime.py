@@ -34,6 +34,7 @@ def install_disaggregation_wiring(scheduler: Scheduler, server_args: ServerArgs)
         BootstrapClient,
         BootstrapServer,
         HeartbeatDaemon,
+        PrefillInfoCache,
     )
     from sgl_jax.srt.disaggregation.common.zmq_notifier import ZmqPullNotifier
     from sgl_jax.srt.disaggregation.decode import (
@@ -147,6 +148,9 @@ def install_disaggregation_wiring(scheduler: Scheduler, server_args: ServerArgs)
         scheduler.disagg_heartbeat.start()
         scheduler.disagg_bootstrap_key = bootstrap_key
     else:
+        scheduler.disagg_prefill_info_cache = PrefillInfoCache(
+            scheduler.disagg_bootstrap_client
+        )
         scheduler.disagg_prealloc_queue = DecodePreallocQueue()
         scheduler.disagg_transfer_queue = DecodeTransferQueue()
         scheduler.disagg_decode_watchdog = EventLoopWatchdog(
