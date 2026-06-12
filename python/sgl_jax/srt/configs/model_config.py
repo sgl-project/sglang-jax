@@ -163,6 +163,12 @@ class ModelConfig:
         # wrapper so the standard ModelRegistry resolves the towers+embed_mm class, not the
         # text-only backbone (mirrors the draft-model remaps above; mutually exclusive with them).
         # Text-only MiMoV2 (no vision_config) stays the backbone.
+        #
+        # TODO(M6 收口): this static remap is a THIRD dispatch mechanism alongside the
+        # `is_multimodal_model(hf_config)` config-proxy and the wrapper's capability triple. Its
+        # semantics ("checkpoint declares the AR arch name but the class to build is the MM wrapper")
+        # belong in the ModelRegistry resolution layer; fold it in when §3.5.5 capability delegation
+        # lands so model_config stops mutating architectures[0].
         if (
             not is_draft_model
             and self.hf_config.architectures

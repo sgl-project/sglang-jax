@@ -29,6 +29,72 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
+def _cfg_get(cfg, *keys, default=None):
+    """Read the first present key from a config that may be an HF object OR a raw dict.
+
+    Some checkpoints (notably MiMo-V2.5) ship nested vision_config / audio_config that AutoConfig
+    leaves as plain dicts rather than wrapping them in sub-config objects, so plain getattr()
+    silently misses every field and the caller degrades to defaults. Try each candidate name
+    against both dict keys and object attributes."""
+    for k in keys:
+        v = cfg.get(k) if isinstance(cfg, dict) else getattr(cfg, k, None)
+        if v is not None:
+            return v
+    return default
+
+
+def _tower_attn_reserve_bytes(heads, hidden, seq) -> int:
+    """~ one tower layer's dense attention matrix [heads, seq, seq] (fp32 softmax) + a few
+    [seq, hidden] bf16 hidden-state buffers; 20% headroom."""
+    return int((int(heads) * int(seq) * int(seq) * 4 + int(seq) * int(hidden) * 2 * 6) * 1.2)
+
+
+def _audio_activation_reserve_bytes(acfg, max_patches) -> int:
+    """Audio tower activation reserve, sized by tower FORM (the AOT vision probe passes audio=None,
+    so it never exercises the audio tower -- HIGH-2). acfg may be an HF object OR a raw dict.
+
+    - codes form (MiMo-V2.5: has ``input_local_dim``): attention is block-local over ``group_size``
+      (a tiny constant), so the T x T term is negligible; the peak is the per-audio-token hidden
+      buffers ``[tokens, input_local_dim]``. No dedicated audio-token cap knob exists yet, so bound
+      the token count by ``max_patches`` (the shared multimodal-activation-token ceiling).
+      TODO(U1 audio cap): size from an explicit --audio-max-tokens instead of the vision proxy.
+    - whisper form (Qwen3-Omni: has ``d_model`` / ``encoder_attention_heads``): full
+      ``[heads, T, T]`` attention bounded by ``max_source_positions`` (the positional table)."""
+    if acfg is None:
+        return 0
+    input_local_dim = _cfg_get(acfg, "input_local_dim", default=None)
+    if input_local_dim is not None:  # codes tower (MiMo-V2.5)
+        heads = _cfg_get(acfg, "input_local_attn_heads", default=16)
+        group_size = int(_cfg_get(acfg, "group_size", default=4))
+        attn = int(heads) * group_size * group_size * 4  # block-local [heads, gs, gs] fp32
+        buffers = int(max_patches) * int(input_local_dim) * 2 * 6  # per-token hidden, bf16, copies
+        return int((attn + buffers) * 1.2)
+    a_heads = _cfg_get(acfg, "encoder_attention_heads", "num_attention_heads", default=16)
+    a_hidden = _cfg_get(acfg, "d_model", "hidden_size", default=1280)
+    a_T = int(_cfg_get(acfg, "max_source_positions", default=1500))
+    return _tower_attn_reserve_bytes(a_heads, a_hidden, a_T)
+
+
+def _mm_activation_reserve_bytes(vcfg, acfg, max_patches, aot_vision) -> int:
+    """G1 (design §5.7) pure sizing core: HBM to reserve for the in-model encoder towers' peak
+    activation = VISION + AUDIO (separate towers, additive). vcfg/acfg may be HF objects OR raw
+    dicts (read via _cfg_get -- dict configs are NOT silently degraded to defaults). Vision uses the
+    AOT-measured temp_size when the startup probe succeeded (tight), else a conservative closed
+    form; audio is always closed form. 0 when max_patches <= 0. Pure -> unit-testable without a
+    ModelRunner (test_vision_activation_reserve.py)."""
+    if max_patches <= 0:
+        return 0
+    if aot_vision and aot_vision > 0:
+        vision = int(aot_vision)
+    elif vcfg is not None:
+        heads = _cfg_get(vcfg, "num_heads", "num_attention_heads", default=16)
+        hidden = _cfg_get(vcfg, "hidden_size", default=1280)
+        vision = _tower_attn_reserve_bytes(heads, hidden, max_patches)
+    else:
+        vision = 0
+    return vision + _audio_activation_reserve_bytes(acfg, max_patches)
+
+
 def _compute_recurrent_per_req_bytes(
     num_layers: int,
     num_heads: int,
@@ -219,57 +285,23 @@ class ModelRunnerKVCacheMixin:
         )
 
     def _vision_activation_reserve_bytes(self: ModelRunner) -> int:
-        """G1 (design §5.7): HBM to reserve for the in-model encoder's peak activation, subtracted
-        from the KV budget (the encoder is a separate jit; the KV pool is otherwise blind to it).
-        Explicit ``--vision-activation-reserve-bytes`` wins; else auto-size from
-        ``--vision-max-patches`` + the ViT/audio config. The reserve is VISION + AUDIO (separate
-        towers, additive): the dense ``[heads, T, T]`` attention matrix (replicated per chip under
-        §3.3.5) dominates each tower's scratch. Vision uses the AOT-measured temp_size when the
-        startup probe succeeded (tight), else a conservative closed form; audio is always closed
-        form (the AOT probe is image-only, so it does NOT cover the audio tower -- HIGH-2). A
-        conservative over-estimate is safe (KV pool slightly smaller, never OOM). 0 when unset /
-        no config."""
+        """G1 (design §5.7): HBM to reserve for the in-model encoder towers' peak activation,
+        subtracted from the KV budget (the encoders are separate jits; the KV pool is otherwise
+        blind to them). Explicit ``--vision-activation-reserve-bytes`` wins; else auto-size from
+        ``--vision-max-patches`` + the ViT/audio config via the pure
+        ``_mm_activation_reserve_bytes`` (unit-tested; dict-form nested configs are read correctly
+        instead of degrading to defaults). 0 when unset / no config / no max-patches."""
         sa = self.server_args
         explicit = getattr(sa, "vision_activation_reserve_bytes", 0) or 0
         if explicit > 0:
             return explicit
         max_patches = getattr(sa, "vision_max_patches", 0) or 0
-        if max_patches <= 0:
-            return 0
         hf = getattr(self.model_config, "hf_config", None)
         thinker = getattr(hf, "thinker_config", None)
         vcfg = getattr(hf, "vision_config", None) or getattr(thinker, "vision_config", None)
         acfg = getattr(hf, "audio_config", None) or getattr(thinker, "audio_config", None)
-
-        def _tower_bytes(heads: int, hidden: int, T: int) -> int:
-            # ~= one layer's dense attention matrix [heads, T, T] (fp32 softmax) + a few
-            # [T, hidden] bf16 hidden-state buffers; 20% headroom.
-            return int((int(heads) * T * T * 4 + T * int(hidden) * 2 * 6) * 1.2)
-
-        # Vision: prefer the AOT-measured temp_size (tight) when the probe succeeded; else closed.
         aot = getattr(self, "_aot_vision_reserve", 0) or 0
-        if aot > 0:
-            vision = aot
-        elif vcfg is not None:
-            heads = getattr(vcfg, "num_heads", None) or getattr(vcfg, "num_attention_heads", 16)
-            hidden = getattr(vcfg, "hidden_size", 1280)
-            vision = _tower_bytes(heads, hidden, int(max_patches))
-        else:
-            vision = 0
-
-        # Audio (HIGH-2): the audio tower is a SEPARATE activation the vision probe never exercises
-        # (AOT passes audio=None). Bound it by the tower's architectural max_source_positions (it
-        # cannot attend over more frames than its positional table). Closed form, additive.
-        audio = 0
-        if acfg is not None:
-            a_heads = getattr(acfg, "encoder_attention_heads", None) or getattr(
-                acfg, "num_attention_heads", 16
-            )
-            a_hidden = getattr(acfg, "d_model", None) or getattr(acfg, "hidden_size", 1280)
-            a_T = int(getattr(acfg, "max_source_positions", 1500))
-            audio = _tower_bytes(a_heads, a_hidden, a_T)
-
-        return vision + audio
+        return _mm_activation_reserve_bytes(vcfg, acfg, max_patches, aot)
 
     def _profile_available_bytes(self: ModelRunner, total_device_memory: int) -> int:
         """Profile available bytes for KV cache (+ recurrent state)."""

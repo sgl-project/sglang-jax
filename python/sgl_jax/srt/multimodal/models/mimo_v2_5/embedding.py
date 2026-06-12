@@ -191,8 +191,7 @@ class MiMoV2_5Embedding(nnx.Module):
             # activation x tensor-sharded kernel) and crashes. Force every vision weight to
             # fully-replicated sharding so the tower computes locally on the embed device.
             vision_mappings = {
-                hf_key: _dc.replace(m, sharding=())
-                for hf_key, m in vision_mappings.items()
+                hf_key: _dc.replace(m, sharding=()) for hf_key, m in vision_mappings.items()
             }
             mappings.update(vision_mappings)
         # Hard-fail on a missing audio-tower key (review R2-5). load_weights_from_safetensors
@@ -293,11 +292,16 @@ class MiMoV2_5Embedding(nnx.Module):
         # scatter cannot resolve an output sharding (operand [seq@data,H] vs replicated
         # updates [N,H]). The embed sequence is short; replicate operand + updates so the
         # scatter is unambiguous and local. forward() slices to real seq len afterwards.
+        # Use jax.sharding.reshard, NOT with_sharding_constraint: under an Explicit-axis mesh WSC
+        # ASSERTS the input's existing sharding (a data-sharded operand then fails) instead of
+        # re-sharding. The staged embed stage runs on a trivial 1-device mesh where the two are
+        # equivalent, but reshard is correct on any mesh -- mirrors the merge / audio_encoder fixes
+        # (rule-3) so this staged scatter doesn't become the 4th real-mesh WSC failure.
         mesh = getattr(self, "mesh", None)
         if mesh is not None:
             replicated = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
-            input_embeds = jax.lax.with_sharding_constraint(input_embeds, replicated)
-            modality_embeds = jax.lax.with_sharding_constraint(modality_embeds, replicated)
+            input_embeds = jax.sharding.reshard(input_embeds, replicated)
+            modality_embeds = jax.sharding.reshard(modality_embeds, replicated)
         return input_embeds.at[positions, :].set(modality_embeds, mode="drop")
 
     def __call__(

@@ -139,14 +139,33 @@ class Qwen2_5_VLProcessor(BaseMultimodalProcessor):
     """Image (+video) understanding processor for Qwen2.5-VL (text-out)."""
 
     models = ["Qwen2_5_VLForConditionalGeneration"]
+    # Whether the model consumes mRoPE positions. Qwen2.5-VL/Qwen3-Omni do; subclasses whose AR
+    # reads raw forward_batch.positions instead (e.g. MiMo-V2.5) set this False so process() skips
+    # the mrope computation entirely rather than computing it and throwing it away.
+    uses_mrope = True
 
-    def __init__(self, model_path: str, trust_remote_code: bool = False):
+    def __init__(
+        self,
+        model_path: str,
+        trust_remote_code: bool = False,
+        *,
+        hf_processor=None,
+        hf_config=None,
+    ):
         from transformers import AutoConfig, AutoProcessor
 
-        self.hf_processor = AutoProcessor.from_pretrained(
-            model_path, trust_remote_code=trust_remote_code
+        # hf_processor / hf_config injection is a test seam (mirrors the staged MiMoV25Processor):
+        # tests pass fakes to exercise process() without a real checkpoint on disk.
+        self.hf_processor = (
+            hf_processor
+            if hf_processor is not None
+            else AutoProcessor.from_pretrained(model_path, trust_remote_code=trust_remote_code)
         )
-        self.hf_config = AutoConfig.from_pretrained(model_path, trust_remote_code=trust_remote_code)
+        self.hf_config = (
+            hf_config
+            if hf_config is not None
+            else AutoConfig.from_pretrained(model_path, trust_remote_code=trust_remote_code)
+        )
         self.image_token_id = getattr(self.hf_config, "image_token_id", None)
         self.video_token_id = getattr(self.hf_config, "video_token_id", None)
         self.vision_start_token_id = getattr(self.hf_config, "vision_start_token_id", None)
@@ -188,8 +207,14 @@ class Qwen2_5_VLProcessor(BaseMultimodalProcessor):
         audio_feature_attention_mask = _strip_batch_dim(out.get("feature_attention_mask"))
 
         # mRoPE FIRST -- it scans the raw image/video token ids in input_ids to locate spans.
+        # Gated on uses_mrope: a subclass whose AR reads raw positions (MiMo-V2.5) skips this so it
+        # isn't computed and then discarded (and can't go stale after later placeholder expansion).
         mrope_positions = mrope_position_delta = None
-        if self.vision_start_token_id is not None and self.image_token_id is not None:
+        if (
+            self.uses_mrope
+            and self.vision_start_token_id is not None
+            and self.image_token_id is not None
+        ):
             mrope_positions, mrope_position_delta = compute_mrope_positions(
                 input_ids=input_ids,
                 image_grid_thw=image_grid_thw,

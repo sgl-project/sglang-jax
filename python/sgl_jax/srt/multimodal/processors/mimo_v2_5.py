@@ -26,11 +26,22 @@ class MiMoV2_5Processor(Qwen2_5_VLProcessor):
     """Image/video + RVQ-codes audio (text-out) processor for in-model MiMo-V2.5."""
 
     models = ["MiMoV2_5ForConditionalGeneration"]
+    # MiMo's AR uses standard positions (forward_batch.positions, mimo_v2_flash.py), NOT mRoPE (the
+    # staged AR config sets mrope:False) -> tell the Qwen2.5-VL parent to skip mrope entirely. The
+    # parent's vision-span mrope is both unused by MiMo and, being keyed to the pre-expansion
+    # length, would go stale after the audio placeholder expansion below (broke _merge_multimodal).
+    uses_mrope = False
 
-    def __init__(self, model_path: str):
+    def __init__(self, model_path: str, *, hf_processor=None, hf_config=None, codec=None):
         # MiMo-V2.5 ships a custom HF processor/config -> trust_remote_code=True (the bare
-        # Qwen2.5-VL parent defaults to False since its processor is built-in).
-        super().__init__(model_path, trust_remote_code=True)
+        # Qwen2.5-VL parent defaults to False since its processor is built-in). hf_processor /
+        # hf_config / codec are injectable for unit tests (no checkpoint on disk).
+        super().__init__(
+            model_path,
+            trust_remote_code=True,
+            hf_processor=hf_processor,
+            hf_config=hf_config,
+        )
         self._model_path = model_path
         self.audio_token_id = getattr(self.hf_config, "audio_token_id", None)
         if self.audio_token_id is None:
@@ -39,7 +50,7 @@ class MiMoV2_5Processor(Qwen2_5_VLProcessor):
                 self.audio_token_id = proc_cfg.get("audio_token_id", 151669)
             else:
                 self.audio_token_id = 151669
-        self._codec = None
+        self._codec = codec
 
     def _get_codec(self):
         if self._codec is None:
@@ -54,15 +65,9 @@ class MiMoV2_5Processor(Qwen2_5_VLProcessor):
 
     def process(self, *, images=None, videos=None, audios=None, text=None):
         # Vision + text via the Qwen2.5-VL parent (its audio path is gated on audio_token_id being
-        # set on the HF call; MiMo audio is codes, handled below -- so pass audios=None here).
+        # set on the HF call; MiMo audio is codes, handled below -- so pass audios=None here). mrope
+        # is already None here because uses_mrope=False (see class docstring), so no clearing needed.
         out = super().process(images=images, videos=videos, audios=None, text=text)
-        # MiMo-V2.5 uses standard positions (forward_batch.positions), NOT mRoPE: its AR reads
-        # `positions` (mimo_v2_flash.py:526) and the staged AR config sets mrope:False. The
-        # Qwen2.5-VL parent computes mrope from vision spans -> unused by MiMo, and (since it's keyed
-        # to the pre-expansion length) stale after the audio placeholder expansion below, which broke
-        # _merge_multimodal. Clear it.
-        out["mm_inputs"]["mrope_positions"] = None
-        out["mm_inputs"]["mrope_position_delta"] = None
         if not audios:
             return out
 

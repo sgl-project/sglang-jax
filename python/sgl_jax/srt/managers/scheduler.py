@@ -571,6 +571,16 @@ class Scheduler(
         # not compose with the overlapped (pipelined) decode -> corrupted decode (degenerate
         # output). Mirror the --multimodal disable above for the is_multimodal case. (The staged
         # path got this for free via the --multimodal flag.)
+        #
+        # NOTE: this is a blunt instrument -- it disables overlap for ALL in-model multimodal,
+        # single-host included, so a pure-decode throughput win that overlap would give is forgone
+        # even on requests with no media in flight. The precise pollution mechanism (encode-jit
+        # device queue interleaving vs the overlap thread's in-flight forward) is not yet pinned.
+        # TODO(overlap×encode 专项): locate the root cause, then re-enable overlap behind a fine
+        # gate (only disable while an encode pass is actually pending, or move encode to an
+        # overlap-safe injection point / its own pipeline stage). When encode and decode run
+        # concurrently again, G1's max()-based vision reserve assumption (design §5.7) must revert
+        # to additive -- see _vision_activation_reserve_bytes.
         if getattr(self.model_config, "is_multimodal", False) and self.enable_overlap:
             logger.info("In-model multimodal: disabling overlap schedule")
             self.enable_overlap = False
