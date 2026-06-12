@@ -83,7 +83,7 @@ jobs:
       SGLANG_JAX_MODEL_CACHE: /models/model_scope
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: ${{ inputs.ref || github.ref }}
       - name: Setup Python environment
@@ -104,7 +104,7 @@ jobs:
       SGLANG_JAX_MODEL_CACHE: /models/model_scope
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: ${{ inputs.ref || github.ref }}
       - name: Setup Python environment
@@ -125,7 +125,7 @@ jobs:
       SGLANG_JAX_MODEL_CACHE: /models/model_scope
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: ${{ inputs.ref || github.ref }}
       - name: Setup Python environment
@@ -155,7 +155,7 @@ jobs:
       SGLANG_JAX_MODEL_CACHE: /models/model_scope
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: ${{ inputs.ref || github.ref }}
       - name: Setup Python environment
@@ -180,7 +180,7 @@ jobs:
       RESULTS_DIR: ${{ github.workspace }}/test/nightly_test_output/accuracy
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: ${{ inputs.ref || github.ref }}
           persist-credentials: false
@@ -253,7 +253,7 @@ jobs:
       RESULTS_DIR: ${{ github.workspace }}/test/nightly_test_output/perf
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: ${{ inputs.ref || github.ref }}
           persist-credentials: false
@@ -326,7 +326,7 @@ jobs:
           fi
       - name: Upload perf results (per-model CSV + xprof traces)
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: perf-results-v6e-4-${{ github.run_id }}
           path: ${{ github.workspace }}/test/nightly_test_output/perf
@@ -372,7 +372,7 @@ jobs:
       TZ: Asia/Shanghai
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
       - name: Detect trend drift
         # stdlib-only on purpose — no setup-venv. A 3rd-party import would
         # ImportError here, silently swallowed by continue-on-error.
@@ -385,7 +385,7 @@ jobs:
               --data-dir /observability-storage --output drift.json
           fi
       - name: Upload drift report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: trend-drift-${{ github.run_id }}
           path: drift.json
@@ -404,9 +404,9 @@ jobs:
       TZ: Asia/Shanghai
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
       - name: Download drift report
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         # Tolerate a missing artifact (monitor crash) so the next step still
         # runs and warns, instead of the job silently vanishing.
         continue-on-error: true
