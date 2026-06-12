@@ -11,7 +11,7 @@ import time
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import jax
 import jax.numpy as jnp
@@ -1023,7 +1023,7 @@ class WeightLoader:
                 raise RuntimeError(f"Cannot find any *.safetensors files in {model_path}")
 
             weights_files.sort()
-            weight_info = {}
+            weight_info: dict[str, list[dict[str, Any]]] = {}
 
             logger.info(
                 "Scanning metadata for %s model files (single host only)...", len(weights_files)
@@ -1339,7 +1339,7 @@ class WeightLoader:
                 logical_indices = physical_indices
 
             # Build task list: (logical_idx, list of physical positions that need it)
-            logical_to_positions = {}
+            logical_to_positions: dict[int, list[int]] = {}
             for phys_pos, log_idx in enumerate(logical_indices):
                 if log_idx not in logical_to_positions:
                     logical_to_positions[log_idx] = []
@@ -1552,7 +1552,7 @@ class WeightLoader:
             out_array = np.empty(out_shape, dtype=first_chunk.dtype)
             out_array[0] = first_chunk
 
-            logical_to_positions = {}
+            logical_to_positions: dict[int, list[int]] = {}
             for phys_pos in range(1, sliced_num_physical):
                 log_idx = logical_indices_to_load[phys_pos]
                 if log_idx == first_log_idx:
@@ -1561,7 +1561,7 @@ class WeightLoader:
                     logical_to_positions.setdefault(log_idx, []).append(phys_pos)
 
             # Per-thread timing accumulators
-            _thread_stats = {
+            _thread_stats: dict[str, list[Any]] = {
                 "get_handle": [],
                 "get_slice": [],
                 "fp8": [],
@@ -1662,7 +1662,7 @@ class WeightLoader:
                         all_logical.add(p)
 
             # Group by file for bulk reading
-            file_groups = {}
+            file_groups: dict[str, list[tuple[Any, Any, Any]]] = {}
             for log_idx in all_logical:
                 hf_key = expected_hf_keys[log_idx]
                 info = weight_info[hf_key][0]
@@ -1859,19 +1859,16 @@ class WeightLoader:
                     match = re.search(key_as_regex, weight_info_key)
                     if match:
                         matched_parts = match.groups()
-
+                        replaced_mapping: str | list[Any] | tuple[Any, ...] | WeightMapping
                         if isinstance(mapping, str):
                             format_template = mapping.replace("*", "{}")
                             replaced_mapping = format_template.format(*matched_parts)
-                        elif isinstance(mapping, list):
+                        elif isinstance(mapping, list | tuple):
                             format_template = mapping[0].replace("*", "{}")
                             replaced_str = format_template.format(*matched_parts)
                             replaced_mapping = [replaced_str, *mapping[1:]]
-                        elif isinstance(mapping, tuple):
-                            format_template = mapping[0].replace("*", "{}")
-                            replaced_str = format_template.format(*matched_parts)
-                            replaced_mapping = (replaced_str, *mapping[1:])
                         elif isinstance(mapping, WeightMapping):
+                            assert isinstance(mapping.target_path, str)
                             format_template = mapping.target_path.replace("*", "{}")
                             replaced_path = format_template.format(*matched_parts)
                             replaced_mapping = copy.copy(mapping)
@@ -1922,6 +1919,7 @@ class WeightLoader:
                 )
 
                 if can_optimize:
+                    assert mapping.sharding is not None
                     try:
                         if mapping.transpose and len(mapping.sharding) == 2:
                             # Swap: (dim0, dim1) -> (dim1, dim0)
@@ -1935,6 +1933,7 @@ class WeightLoader:
                         lazy_weight = None
 
                         if is_split_weight:
+                            assert isinstance(mapping.concat_axis, int)
                             lazy_weight = self._create_split_lazy_tensor(
                                 hf_key,
                                 infos,
@@ -1966,6 +1965,7 @@ class WeightLoader:
                             )
 
                         target_path = mapping.target_path
+                        assert isinstance(target_path, str)
                         model_param = self._get_param(params, target_path)
 
                         # Expand 2D block-quant scale to 3D kernel-ready layout.
@@ -2263,7 +2263,7 @@ class WeightLoader:
     def _load_dummy_weights(
         self,
         params: nnx.State,
-        weight_mappings: dict[str, str | list[str] | WeightMapping],
+        weight_mappings: Mapping[str, str | list[str] | WeightMapping],
         seed: int = 1234,
     ):
         logger.info("Generating dummy weights with proper sharding from weight mappings")
@@ -2353,6 +2353,7 @@ class WeightLoader:
 
             collected_weights = []
             for expert_idx in range(num_experts):
+                expert_sharding_tuple: tuple[Any, ...] | None
                 if mapping.sharding and "expert" in mapping.sharding:
                     expert_sharding_tuple = tuple(s for s in mapping.sharding if s != "expert")
                 else:
@@ -2447,6 +2448,7 @@ class WeightLoader:
         self, params: nnx.State, hf_key: str, weight: jax.Array, mapping: WeightMapping
     ):
         jax_path = mapping.target_path
+        assert isinstance(jax_path, str)
         processed_weight = weight
 
         # Handle fused KV buffer storage (used by MiMo-V2-Flash per-head dequant).
@@ -2774,7 +2776,7 @@ class WeightLoader:
             logger.debug("Split %s -> %s, shape: %s", hf_key, jax_path, processed_weight.shape)
 
     def _shard_weight(
-        self, weight: jax.Array, sharding_spec: tuple, mesh: jax.sharding.Mesh = None
+        self, weight: jax.Array, sharding_spec: tuple | None, mesh: jax.sharding.Mesh = None
     ) -> jax.Array:
         if mesh is None:
             mesh = self.mesh

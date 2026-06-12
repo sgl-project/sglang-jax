@@ -16,7 +16,7 @@ def create_device_mesh(
     ici_parallelism: Sequence[int],
     dcn_parallelism: Sequence[int],
     devices=None,
-    device_indexes: list[int] = None,
+    device_indexes: list[int] | None = None,
     num_slices: int = 1,
     allow_split_physical_axes: bool = True,
     use_explicit_sharding: bool = True,
@@ -65,7 +65,9 @@ def create_device_mesh(
     return mesh
 
 
-def fill_unspecified_parallelism(parallelism: Sequence[int], num_devices: int) -> Sequence[int]:
+def fill_unspecified_parallelism(parallelism: Sequence[int], num_devices: int) -> list[int]:
+    parallelism = list(parallelism)
+
     if -1 not in parallelism:
         return parallelism
 

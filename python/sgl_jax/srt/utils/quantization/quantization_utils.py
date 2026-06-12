@@ -296,6 +296,9 @@ def quantize_tensor_simple(
     x: jax.Array, dtype: jnp.dtype, dim: int = -1, out_dtype: jnp.dtype = jnp.float32
 ):
     """Simple per-token quantization for activations."""
+    max_val: int | float
+    min_val: int | float
+
     if jnp.issubdtype(dtype, jnp.integer):
         dtype_info = jnp.iinfo(dtype)
         max_val = int(dtype_info.max)
@@ -317,8 +320,8 @@ def quantize_tensor_simple(
 def quantize_tensor(
     dtype: jnp.dtype,
     tensor: jax.Array,
-    axis: int | tuple | None = -1,
-    block_size: int | None = None,
+    axis: int | list[int] | tuple | None = -1,
+    block_size: int | list[int] | None = None,
     pad_tensor: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Quantize tensor.
@@ -346,6 +349,8 @@ def quantize_tensor(
     if block_size is not None:
         if isinstance(block_size, int):
             block_size = [block_size] * len(axis)
+        else:
+            assert len(block_size) == len(axis)
 
         blocked_shape = [[i] for i in orig_shape]
         pad_width = [[0, 0] for _ in range(tensor.ndim)]
@@ -363,7 +368,7 @@ def quantize_tensor(
             pad_width[i][1] = padding_size
             has_padding = has_padding or padding_size != 0
 
-            blocked_shape[i] = (num_blocks, block)
+            blocked_shape[i] = [num_blocks, block]
 
         # In order to avoid padded values affecting scale value, we pad it
         # using edge value of the tensor.
@@ -425,7 +430,7 @@ def quantize_tensor(
 def dequantize_tensor(
     tensor_q: jax.Array,
     scale: jax.Array,
-    axis: int | None | tuple = -1,
+    axis: int | None | tuple[int, ...] | list[int] = -1,
     out_dtype: jnp.dtype = jnp.bfloat16,
 ) -> jax.Array:
     """Dequantize a quantized tensor
@@ -458,7 +463,7 @@ def dequantize_tensor(
                 )
             block_size = tensor_q.shape[i] // num_blocks
 
-            blocked_shape[i] = (num_blocks, block_size)
+            blocked_shape[i] = [num_blocks, block_size]
 
         # Convert all axis into positive values.
         axis = sorted([(i + tensor_q.ndim) % tensor_q.ndim for i in axis])
