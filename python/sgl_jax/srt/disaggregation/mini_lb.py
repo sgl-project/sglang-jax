@@ -28,6 +28,9 @@ class MiniLoadBalancer:
         self.prefill_bootstrap_host = router_args.prefill_bootstrap_host
         self.prefill_dp_size = None
         self.decode_dp_size = None
+        self.max_concurrent_requests = getattr(
+            router_args, "max_concurrent_requests", None
+        )
 
     def _validate_router_args(self, router_args) -> None:
         if getattr(router_args, "policy", "random") != "random":
@@ -44,8 +47,10 @@ class MiniLoadBalancer:
     def start(self) -> None:
         import uvicorn
 
-        global lb
+        global lb, _admission_sem
         lb = self
+        if self.max_concurrent_requests:
+            _admission_sem = asyncio.Semaphore(self.max_concurrent_requests)
         uvicorn.run(app, host=self.host, port=self.port)
 
     async def _ensure_dp_sizes(self) -> None:
@@ -232,7 +237,7 @@ class MiniLoadBalancer:
 
 try:
     from fastapi import FastAPI, HTTPException
-    from fastapi.responses import ORJSONResponse, Response
+    from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 
     from sgl_jax.srt.disaggregation.mini_lb_helpers import (
         inject_bootstrap_fields,
@@ -240,6 +245,7 @@ try:
 
     app = FastAPI()
     lb: MiniLoadBalancer | None = None
+    _admission_sem: asyncio.Semaphore | None = None
 
     async def fetch_backend_json(
         session,
@@ -353,7 +359,7 @@ try:
     async def get_model_info():
         return await _get_model_info_impl()
 
-    async def _forward_to_backend(request_data: dict, endpoint_name: str):
+    async def _do_forward(request_data: dict, endpoint_name: str):
         prefill_server, bootstrap_port, decode_server = lb.select_pair()
         modified_request = inject_bootstrap_fields(
             request_data,
@@ -374,6 +380,37 @@ try:
             decode_server,
             endpoint=endpoint_name,
         )
+
+    async def _forward_to_backend(request_data: dict, endpoint_name: str):
+        if _admission_sem is None:
+            return await _do_forward(request_data, endpoint_name)
+
+        # Pending admission: hold the permit while the request runs. Excess
+        # requests await the semaphore (held pending at the proxy) and are
+        # never rejected or aborted.
+        await _admission_sem.acquire()
+        released = False
+        try:
+            resp = await _do_forward(request_data, endpoint_name)
+            if isinstance(resp, StreamingResponse):
+                # Streaming returns immediately; the real work happens while the
+                # body is drained. Transfer permit ownership to the iterator so
+                # it is released only after the stream fully completes.
+                original_iter = resp.body_iterator
+
+                async def _release_after_stream():
+                    try:
+                        async for chunk in original_iter:
+                            yield chunk
+                    finally:
+                        _admission_sem.release()
+
+                resp.body_iterator = _release_after_stream()
+                released = True
+            return resp
+        finally:
+            if not released:
+                _admission_sem.release()
 
     @app.post("/generate")
     async def handle_generate_request(request_data: dict):

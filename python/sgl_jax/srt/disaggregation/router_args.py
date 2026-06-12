@@ -22,6 +22,8 @@ class RouterArgs:
 
     prefill_bootstrap_host: str | None = None
 
+    max_concurrent_requests: int | None = None
+
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser) -> None:
         parser.add_argument("--host", default=RouterArgs.host)
@@ -63,6 +65,14 @@ class RouterArgs:
             "Useful when the router talks to prefill via localhost but "
             "decode must see the pod IP.",
         )
+        parser.add_argument(
+            "--max-concurrent-requests",
+            type=int,
+            default=RouterArgs.max_concurrent_requests,
+            help="Upper bound on PD requests running concurrently through the "
+            "router. Excess requests are held pending at the proxy (never "
+            "returned as client errors, never aborted). Unset = no limit.",
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace) -> RouterArgs:
@@ -82,6 +92,9 @@ class RouterArgs:
             ),
             prefill_bootstrap_host=getattr(
                 args, "prefill_bootstrap_host", None
+            ),
+            max_concurrent_requests=getattr(
+                args, "max_concurrent_requests", None
             ),
         )
 
