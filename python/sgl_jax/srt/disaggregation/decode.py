@@ -479,11 +479,20 @@ class SchedulerDisaggregationDecodeMixin:
 
         page_size = allocator.page_size
         reserved_per = self.server_args.disaggregation_num_reserved_decode_tokens
+        max_inflight = self.server_args.disaggregation_max_inflight_transfers
         n_running = len(self.running_batch.reqs) if self.running_batch is not None else 0
         n_transfer = len(self.disagg_transfer_queue)
         admitted = 0
 
         for entry in self.disagg_prealloc_queue.items_fifo():
+            # In-flight transfer cap: each admitted transfer holds a pulled KV
+            # destination buffer on decode HBM (untracked by the paged-pool
+            # budget below) until it is scattered. Stop admitting once the cap
+            # is reached so a burst of concurrent requests cannot allocate that
+            # many transient buffers at once and OOM. Excess reqs stay queued
+            # and retry next tick (deferral, never abort).
+            if max_inflight > 0 and (n_transfer + admitted) >= max_inflight:
+                break
             seqlen = len(entry.req.origin_input_ids)
             page_aligned = ((seqlen + page_size - 1) // page_size) * page_size
             reserved = reserved_per * (n_running + n_transfer + admitted)

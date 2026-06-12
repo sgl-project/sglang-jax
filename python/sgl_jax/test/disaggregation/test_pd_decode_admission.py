@@ -58,8 +58,9 @@ class _KVManager:
 
 
 class _ServerArgs:
-    def __init__(self, reserved):
+    def __init__(self, reserved, max_inflight=0):
         self.disaggregation_num_reserved_decode_tokens = reserved
+        self.disaggregation_max_inflight_transfers = max_inflight
         self.enable_request_time_stats_logging = False
 
 
@@ -78,9 +79,9 @@ class _Batch:
 class _FakeScheduler:
     _admit_decode_prealloc = SchedulerDisaggregationDecodeMixin._admit_decode_prealloc
 
-    def __init__(self, capacity, reserved, page_size=1, n_running=0, raise_on_init=False):
+    def __init__(self, capacity, reserved, page_size=1, n_running=0, raise_on_init=False, max_inflight=0):
         self.token_to_kv_pool_allocator = _Allocator(capacity, page_size)
-        self.server_args = _ServerArgs(reserved)
+        self.server_args = _ServerArgs(reserved, max_inflight=max_inflight)
         self.running_batch = _Batch(n_running)
         self.disagg_prealloc_queue = DecodePreallocQueue()
         self.disagg_transfer_queue = DecodeTransferQueue()
@@ -183,3 +184,57 @@ def test_receiver_init_failure_aborts_and_frees():
     assert sched.aborted == [("a", "receiver_init")]
     assert sched.failures == ["receiver_init"]
     assert len(sched.token_to_kv_pool_allocator.freed) == 1
+
+
+def test_inflight_cap_defers_excess_without_abort():
+    # Capacity is ample (each req needs 4, capacity 100), so only the in-flight
+    # cap can stop admission. cap=2 means at most 2 transfers admitted per tick;
+    # the 3rd+ stay queued (deferral), are not aborted, and KV is not allocated
+    # for them (no transient pull buffer reserved beyond the cap).
+    sched = _FakeScheduler(capacity=100, reserved=0, max_inflight=2)
+    _enqueue(sched, "a", seqlen=4)
+    _enqueue(sched, "b", seqlen=4)
+    _enqueue(sched, "c", seqlen=4)
+
+    sched._admit_decode_prealloc()
+
+    assert len(sched.disagg_transfer_queue) == 2  # a, b admitted up to cap
+    assert len(sched.disagg_prealloc_queue) == 1  # c deferred, still queued
+    assert sched.aborted == []
+    # Only 2 reqs' KV allocated (8 tokens); c's was not reserved.
+    assert sched.token_to_kv_pool_allocator.available_size() == 92
+
+
+def test_inflight_cap_counts_existing_transfers():
+    # An already-occupied transfer queue counts against the cap. With one entry
+    # in flight and cap=2, only one more may be admitted this tick.
+    sched = _FakeScheduler(capacity=100, reserved=0, max_inflight=2)
+    # Pre-load the transfer queue with a placeholder to simulate one in-flight.
+    existing = DecodeBookkeeping(req_id="x", req=_Req("x", 4), p_info=_p_info())
+    sched.disagg_transfer_queue.add(existing)
+    _enqueue(sched, "a", seqlen=4)
+    _enqueue(sched, "b", seqlen=4)
+
+    sched._admit_decode_prealloc()
+
+    assert len(sched.disagg_transfer_queue) == 2  # placeholder + a
+    assert len(sched.disagg_prealloc_queue) == 1  # b deferred
+    assert sched.aborted == []
+
+
+def test_inflight_cap_recovers_after_transfer_drains():
+    sched = _FakeScheduler(capacity=100, reserved=0, max_inflight=2)
+    _enqueue(sched, "a", seqlen=4)
+    _enqueue(sched, "b", seqlen=4)
+    _enqueue(sched, "c", seqlen=4)
+
+    sched._admit_decode_prealloc()
+    assert len(sched.disagg_transfer_queue) == 2
+    assert len(sched.disagg_prealloc_queue) == 1
+
+    # A transfer drains (removed from the transfer queue), freeing a slot.
+    sched.disagg_transfer_queue.abort_matching("a", abort_all=False)
+
+    sched._admit_decode_prealloc()
+    assert len(sched.disagg_transfer_queue) == 2  # "c" now admitted
+    assert len(sched.disagg_prealloc_queue) == 0

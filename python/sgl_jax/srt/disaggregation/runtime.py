@@ -112,6 +112,7 @@ def install_disaggregation_wiring(scheduler: Scheduler, server_args: ServerArgs)
         ack_timeout_seconds=server_args.disaggregation_ack_timeout_seconds,
         pull_timeout_seconds=server_args.disaggregation_pull_timeout_seconds,
         reaper_interval_seconds=(server_args.disaggregation_orphan_reaper_interval_seconds),
+        pull_worker_count=server_args.disaggregation_channel_number,
     )
     scheduler.disagg_kv_manager.start_reaper()
     scheduler.disagg_use_d2h_staging = server_args.disaggregation_enable_d2h

@@ -259,6 +259,15 @@ class ServerArgs:
     # retracted). Insufficient capacity defers admission (FIFO requeue),
     # never aborts. Mirrors sglang's num_reserved_decode_tokens.
     disaggregation_num_reserved_decode_tokens: int = 512
+    # Max concurrent in-flight KV transfers admitted on the decode side.
+    # Each in-flight pull allocates a destination buffer of the request's
+    # KV shape on decode HBM that lives until the buffer is scattered into
+    # the paged pool. The paged-pool budget gate does not account for these
+    # transient buffers, so without this cap a burst of concurrent requests
+    # allocates that many destination buffers at once and OOMs decode HBM.
+    # Excess requests stay in the prealloc queue and retry next tick
+    # (deferral, never abort). 0 disables the cap (unbounded).
+    disaggregation_max_inflight_transfers: int = 8
 
     def __post_init__(self):
         # Set missing default values
@@ -1405,6 +1414,17 @@ class ServerArgs:
             "in-flight/running request when admitting a queued PD request, "
             "so running decode steps never OOM while others are mid-transfer. "
             "Insufficient capacity defers admission (FIFO requeue), never aborts.",
+        )
+        parser.add_argument(
+            "--disaggregation-max-inflight-transfers",
+            type=int,
+            default=ServerArgs.disaggregation_max_inflight_transfers,
+            help="Max concurrent in-flight KV transfers admitted on the decode "
+            "side. Each in-flight pull allocates a destination KV buffer on "
+            "decode HBM until it is scattered into the paged pool; this cap "
+            "bounds that transient HBM so a burst of concurrent requests does "
+            "not OOM decode. Excess requests defer (FIFO requeue), never abort. "
+            "0 disables the cap (unbounded).",
         )
         parser.add_argument(
             "--disaggregation-shared-secret",
