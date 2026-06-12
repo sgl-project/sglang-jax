@@ -45,6 +45,40 @@ from sgl_jax.srt.utils.jax_utils import get_available_device_memory
 
 logger = logging.getLogger(__name__)
 
+# JAX's pjit C++ cache-miss counter lives in jax._src.test_util -- a PRIVATE/test-only module that
+# can be renamed or removed across JAX versions (review M-8). It was previously imported INSIDE the
+# per-call forward (_forward) and per-request mm encode (encode_mm_reqs) loops, so a JAX upgrade
+# that moved it would break both hot paths at runtime. Import it once here, guarded, and expose a
+# small context manager that degrades to a no-op probe (count 0) when the private API is absent --
+# the recompile probes are observability only, never functional, so losing them must not crash.
+import contextlib  # noqa: E402
+
+try:
+    from jax._src.test_util import (
+        count_pjit_cpp_cache_miss as _count_pjit_cpp_cache_miss,
+    )
+except Exception:  # pragma: no cover - depends on JAX internals
+    _count_pjit_cpp_cache_miss = None
+
+
+@contextlib.contextmanager
+def _count_jit_compiles():
+    """Yield a callable returning #pjit C++ cache misses inside the block (0 if JAX's private
+    counter API is unavailable). Centralizes the one fragile jax._src.test_util dependency."""
+    if _count_pjit_cpp_cache_miss is None:
+        yield lambda: 0
+        return
+    with _count_pjit_cpp_cache_miss() as count:
+        yield count
+
+
+# V-2 prompt-length bucket edge (review M-8): when vision bucketing is on, the encode jit is keyed
+# by BOTH the vision grid AND the input_ids length, so the prompt is padded up to a multiple of this
+# edge to bound seq-dimension recompiles. Named here rather than inlined as a bare 256 in
+# encode_mm_reqs. (Follow-up: make this a server_args field so it is same-source with
+# --vision-bucket-size instead of a separate constant -- recorded as backlog.)
+_VISION_SEQ_BUCKET = 256
+
 
 class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
     """ModelRunner runs the forward passes of the models."""
@@ -578,9 +612,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         logits_metadata: LogitsMetadata,
     ):
         cache_miss_count = 0
-        import jax._src.test_util as jtu
-
-        with jtu.count_pjit_cpp_cache_miss() as count:
+        with _count_jit_compiles() as count:
             output, pool_updates, _, layers_topk_ids = self.jitted_run_model(
                 forward_batch, logits_metadata
             )
@@ -723,7 +755,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 ids_np = np.asarray(r.origin_input_ids, dtype=np.int32)
                 real_len = int(ids_np.shape[0])
                 if bucketing_on:
-                    seq_bucket = 256
+                    seq_bucket = _VISION_SEQ_BUCKET
                     padded_len = ((real_len + seq_bucket - 1) // seq_bucket) * seq_bucket
                     if padded_len > real_len:
                         ids_np = np.pad(ids_np, (0, padded_len - real_len))
@@ -744,9 +776,9 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 # (the recompile storm bucketing bounds -- with --vision-bucket-size the padded
                 # grids collapse to the bucket multiples, so the probe goes quiet after warmup).
                 # Surfacing it makes the V-3 "compile count <= bucket count" gate observable.
-                import jax._src.test_util as jtu
-
-                with jtu.count_pjit_cpp_cache_miss() as _vit_compiles:
+                # _count_jit_compiles centralizes the (private, version-fragile) JAX counter API
+                # and degrades to a no-op probe when it is unavailable (review M-8).
+                with _count_jit_compiles() as _vit_compiles:
                     fused, deepstack, pos_mask = self.jitted_embed_mm(
                         input_ids,
                         img_px_dev,
