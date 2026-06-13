@@ -109,6 +109,10 @@ def run_eval(args):
             max_tokens=8,
         )
         eval_obj = ChineseSimpleQAEval(grader, args.num_examples, args.num_threads)
+    elif args.eval_name == "mmmu_pro":
+        from eval.simple_eval_mmmu_pro import MMMUProVLMEval
+
+        eval_obj = MMMUProVLMEval(args.num_examples, args.num_threads)
     else:
         raise ValueError(f"Invalid eval name: {args.eval_name}")
 

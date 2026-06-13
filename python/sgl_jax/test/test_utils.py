@@ -144,6 +144,7 @@ QWEN3_4B = _local_or_hf("Qwen/Qwen3-4B")
 QWEN3_MOE_30B = _local_or_hf("Qwen/Qwen3-30B-A3B")
 QWEN3_5_35B_A3B = "/models/Qwen3.5-35B-A3B/"
 QWEN2_5_7B_INSTRUCT = _local_or_hf("Qwen/Qwen2.5-7B-Instruct")
+QWEN2_5_VL_3B_INSTRUCT = "Qwen2.5-VL-3B-Instruct"
 QWEN3_CODER_30B_A3B_INSTRUCT = _local_or_hf("Qwen/Qwen3-Coder-30B-A3B-Instruct")
 GEMMA2_2B_IT = _local_or_hf("google/gemma-2-2b-it")
 
