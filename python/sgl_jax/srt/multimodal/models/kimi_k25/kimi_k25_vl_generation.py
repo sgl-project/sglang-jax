@@ -7,7 +7,6 @@ import numpy as np
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.eplb.expert_location import get_global_expert_location_metadata
 from sgl_jax.srt.hf_transformers_utils import get_hf_text_config
-from sgl_jax.srt.layers.embeddings import ParallelLMHead
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata
 from sgl_jax.srt.layers.moe import create_moe_weights_mapping
 from sgl_jax.srt.mem_cache.memory_pool import MemoryPools
@@ -45,15 +44,6 @@ class KimiK25ForConditionalGeneration(DeepseekV3ForCausalLM):
             dtype=self.dtype,
         )
 
-        if not getattr(self.text_config, "tie_word_embeddings", False):
-            self.lm_head = ParallelLMHead(
-                self.text_config.vocab_size,
-                self.text_config.hidden_size,
-                dtype=self.dtype,
-                param_dtype=dtype,
-                kernel_axes=("tensor", None),
-            )
-
     def __call__(
         self,
         forward_batch: ForwardBatch,
@@ -65,11 +55,7 @@ class KimiK25ForConditionalGeneration(DeepseekV3ForCausalLM):
             forward_batch, token_to_kv_pool
         )
 
-        if not getattr(self.text_config, "tie_word_embeddings", False):
-            output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
-        else:
-            output = self.logits_processor(hidden_states, self.model.embed_tokens, logits_metadata)
-
+        output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
         return output, {"token_to_kv_pool": layers_kv_fused}, True, layers_topk_ids
 
     def load_weights(self, model_config: ModelConfig):
