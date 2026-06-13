@@ -306,6 +306,11 @@ class TokenizerManager:
                 )
             encoded = self.tokenizer(input_text)
             input_ids = encoded["input_ids"]
+        if input_ids is None and getattr(obj, "input_embeds", None) is not None:
+            # Pure input_embeds request: synthesize placeholder ids so the
+            # length-based scheduling/validation works; the decoder uses
+            # forward_batch.input_embedding instead of these ids.
+            input_ids = [0] * len(obj.input_embeds)
 
         self._validate_one_request(obj, input_ids)
         return self._create_tokenized_object(obj, input_text, input_ids)
@@ -377,6 +382,12 @@ class TokenizerManager:
             obj.extra_key,
             obj.return_routed_experts,
         )
+
+        # Forward pre-computed multimodal inputs (e.g. vision embeddings passed
+        # as {"multimodal_embedding": [[...]]}) to the scheduler, which wires
+        # them onto Req.multimodal_embedding -> ForwardBatch.input_embedding.
+        if getattr(obj, "mm_inputs", None) is not None:
+            tokenized_obj.mm_inputs = obj.mm_inputs
 
         # PD disaggregation passthrough. When the engine is
         # running in disaggregation_mode=decode, the request body MUST
