@@ -42,7 +42,9 @@ def _load_vision_weights(model_dir, num_layers):
         by_file.setdefault(index[k], []).append(k)
     tensors = {}
     for fname, keys in by_file.items():
-        with safe_open(f"{model_dir}/{fname}", framework="np") as f:
+        # framework="pt": HF state_dict consumes torch tensors directly; the
+        # JAX side converts via .float().numpy() (np can't hold bf16 -> torch).
+        with safe_open(f"{model_dir}/{fname}", framework="pt") as f:
             for k in keys:
                 tensors[k] = f.get_tensor(k)
     return tensors, mappings
@@ -64,9 +66,7 @@ class TestGemma4VisionAlignment(CustomTestCase):
         # HF reference
         hf = Gemma4VisionModel(vcfg).to(torch.bfloat16).eval()
         tensors, mappings = _load_vision_weights(GEMMA4_31B_IT, vcfg.num_hidden_layers)
-        sd = {
-            k.removeprefix("model.vision_tower."): torch.from_numpy(v) for k, v in tensors.items()
-        }
+        sd = {k.removeprefix("model.vision_tower."): v for k, v in tensors.items()}
         hf.load_state_dict(sd, strict=True)
         with torch.no_grad():
             hf_out = (
@@ -82,7 +82,7 @@ class TestGemma4VisionAlignment(CustomTestCase):
         enc = Gemma4VisionEncoder(vcfg, dtype=jnp.bfloat16)
         state = nnx.state(enc)
         for k, dst in mappings.items():
-            w = tensors[k]
+            w = tensors[k].float().numpy()
             if dst.endswith(".kernel"):
                 w = w.T
             _set_by_path(state, dst, jnp.asarray(w))
