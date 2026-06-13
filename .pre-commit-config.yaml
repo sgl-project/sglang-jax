@@ -77,28 +77,5 @@ repos:
     rev: 9f70dc58c23dfcca1b97af99eaeee3140a807c7e
     hooks:
       - id: mypy
-        additional_dependencies: [
-          # package list reference: python/sgl_jax/check_env.py, python/pyproject.toml
-          jax,
-          flax
-          # jaxlib,
-          # triton,
-          # transformers,
-          # numpy,
-          # aiohttp,
-          # fastapi,
-          # huggingface_hub,
-          # modelscope,
-          # orjson,
-          # packaging,
-          # psutil,
-          # pydantic,
-          # python-multipart,
-          # pyzmq,
-          # uvicorn,
-          # uvloop,
-          # openai,
-          # tiktoken,
-        ]
         args: ["--config", "python/pyproject.toml"]
         pass_filenames: false
