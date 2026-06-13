@@ -953,9 +953,7 @@ class Gemma4ForConditionalGeneration(Gemma4ForCausalLM):
 
         vision_config = getattr(config, "vision_config", None)
         if vision_config is None:
-            raise ValueError(
-                "Gemma4ForConditionalGeneration requires config.vision_config"
-            )
+            raise ValueError("Gemma4ForConditionalGeneration requires config.vision_config")
         self.vision_config = vision_config
         self.vision_tower = Gemma4VisionEncoder(vision_config, dtype=dtype)
         self.embed_vision = Gemma4MultimodalEmbedder(
