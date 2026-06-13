@@ -453,6 +453,45 @@ class MRotaryEmbedding(RotaryEmbedding):
         return query, key
 
 
+class ProportionalRotaryEmbedding(RotaryEmbedding):
+    """Proportional RoPE (Gemma4 full-attention layers).
+
+    Unlike standard partial-rotary which scales inv_freq by ``rotary_dim``,
+    proportional keeps the inv_freq denominator as the full ``head_size`` and
+    zero-pads the tail so the unrotated dims see cos=1/sin=0.
+    Matches HF ``_compute_proportional_rope_parameters``.
+    """
+
+    def __init__(
+        self,
+        head_size: int,
+        max_position_embeddings: int,
+        base: float,
+        is_neox_style: bool,
+        dtype: jnp.dtype,
+        partial_rotary_factor: float = 1.0,
+        factor: float = 1.0,
+    ):
+        super().__init__(
+            head_size=head_size,
+            rotary_dim=head_size,
+            max_position_embeddings=max_position_embeddings,
+            base=base,
+            is_neox_style=is_neox_style,
+            dtype=dtype,
+        )
+        rope_angles = int(partial_rotary_factor * head_size // 2)
+        nope_angles = head_size // 2 - rope_angles
+        inv_freq_rotated = 1.0 / (
+            base ** (np.arange(0, 2 * rope_angles, 2, dtype=np.float32) / head_size)
+        )
+        if nope_angles > 0:
+            inv_freq = np.concatenate([inv_freq_rotated, np.zeros(nope_angles, dtype=np.float32)])
+        else:
+            inv_freq = inv_freq_rotated
+        self._inv_freq_np = inv_freq / factor
+
+
 class Llama3RotaryEmbedding(RotaryEmbedding):
     def __init__(
         self,
@@ -625,6 +664,18 @@ def get_rope(
             # equivalent to rope_scaling=None.  Fall back to plain RotaryEmbedding.
             rotary_emb = RotaryEmbedding(
                 head_size, rotary_dim, max_position, base, is_neox_style, dtype
+            )
+        elif scaling_type == "proportional":
+            rotary_emb = ProportionalRotaryEmbedding(
+                head_size,
+                max_position,
+                base,
+                is_neox_style,
+                dtype,
+                partial_rotary_factor=rope_scaling.get(
+                    "partial_rotary_factor", partial_rotary_factor
+                ),
+                factor=rope_scaling.get("factor", 1.0),
             )
         elif scaling_type == "llama3":
             scaling_factor = rope_scaling["factor"]

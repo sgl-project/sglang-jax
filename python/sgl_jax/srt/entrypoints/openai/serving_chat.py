@@ -253,6 +253,9 @@ Assistant: {% endif %}"""
                 **chat_template_kwargs,
             )
 
+        if isinstance(prompt_ids, dict) and "input_ids" in prompt_ids:
+            prompt_ids = prompt_ids["input_ids"]
+
         if assistant_prefix:
             encoded = self.tokenizer_manager.tokenizer.encode(assistant_prefix)
             if encoded and encoded[0] == self.tokenizer_manager.tokenizer.bos_token_id:
@@ -345,6 +348,10 @@ Assistant: {% endif %}"""
     ) -> dict[str, Any]:
         """Build sampling parameters for the request"""
 
+        skip_special = request.skip_special_tokens
+        if self.tokenizer_manager.server_args.reasoning_parser == "gemma4":
+            skip_special = False
+
         sampling_params = {
             "temperature": request.temperature,
             "max_new_tokens": request.max_tokens or request.max_completion_tokens,
@@ -362,7 +369,7 @@ Assistant: {% endif %}"""
             "n": request.n,
             "no_stop_trim": request.no_stop_trim,
             "ignore_eos": request.ignore_eos,
-            "skip_special_tokens": request.skip_special_tokens,
+            "skip_special_tokens": skip_special,
             "logit_bias": request.logit_bias,
         }
 

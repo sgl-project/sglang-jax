@@ -177,6 +177,7 @@ class TokenizerManager:
                 revision=server_args.revision,
                 tokenizer_backend=server_args.tokenizer_backend,
                 sub_dir=tokenizer_subdir,
+                download_dir=server_args.download_dir,
             )
 
         # Store states
@@ -305,6 +306,7 @@ class TokenizerManager:
                 )
             encoded = self.tokenizer(input_text)
             input_ids = encoded["input_ids"]
+
         self._validate_one_request(obj, input_ids)
         return self._create_tokenized_object(obj, input_text, input_ids)
 

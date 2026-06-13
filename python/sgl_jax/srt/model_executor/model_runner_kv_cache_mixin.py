@@ -214,6 +214,32 @@ class ModelRunnerKVCacheMixin:
             per_token = kv_dim * aligned_ps * dtype_size // self.page_size
             return per_token * num_layers
 
+        swa_num_kv_heads = getattr(self.model_config.hf_config, "swa_num_key_value_heads", None)
+        if swa_num_kv_heads is not None:
+            from sgl_jax.srt.utils.jax_utils import get_num_kv_heads_by_tp
+
+            full_heads_per_device = self.model_config.get_num_kv_heads(self.attention_tp_size)
+            swa_heads_per_device = get_num_kv_heads_by_tp(swa_num_kv_heads, self.attention_tp_size)
+            swa_layers, full_layers = self.model_config.get_hybrid_layer_counts()
+
+            full_cost = (
+                full_heads_per_device
+                * align128(self.model_config.head_dim)
+                * 2
+                * full_layers
+                * dtype_size
+            )
+            swa_cost = (
+                swa_heads_per_device
+                * align128(
+                    getattr(self.model_config.hf_config, "swa_head_dim", self.model_config.head_dim)
+                )
+                * 2
+                * swa_layers
+                * dtype_size
+            )
+            return int(full_cost + swa_cost)
+
         return (
             self.model_config.get_num_kv_heads(self.attention_tp_size)
             * align128(self.model_config.head_dim)
@@ -451,6 +477,15 @@ class ModelRunnerKVCacheMixin:
                 swa_head_num = max(swa_num_kv_heads, self.attention_tp_size)
             else:
                 swa_head_num = None
+
+            full_head_dim = self.model_config.head_dim
+            full_head_num = self.model_config.get_total_num_kv_heads_with_replication(
+                self.attention_tp_size
+            )
+            swa_head_dim = getattr(self.model_config.hf_config, "swa_head_dim", None)
+            if swa_head_dim is not None:
+                swa_head_dim = (swa_head_dim + 127) // 128 * 128
+
             self.token_to_kv_pool = SWAKVPool(
                 size=self.full_max_total_num_tokens,
                 size_swa=self.swa_max_total_num_tokens,
@@ -459,11 +494,10 @@ class ModelRunnerKVCacheMixin:
                 full_attention_layer_ids=self.model_config.full_attention_layer_ids,
                 token_to_kv_pool_class=MHATokenToKVPool,
                 dtype=self.kv_cache_dtype,
-                head_num=self.model_config.get_total_num_kv_heads_with_replication(
-                    self.attention_tp_size
-                ),
-                head_dim=(self.model_config.head_dim + 127) // 128 * 128,
+                head_num=full_head_num,
+                head_dim=(full_head_dim + 127) // 128 * 128,
                 swa_head_num=swa_head_num,
+                swa_head_dim=swa_head_dim,
                 mesh=self.mesh,
                 dp_size=dp_size,
             )

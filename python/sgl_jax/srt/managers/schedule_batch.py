@@ -185,6 +185,7 @@ class Req:
         # Input and output info
         self.rid = rid
         self.origin_input_text = origin_input_text
+
         self.origin_input_ids_unpadded = (
             origin_input_ids_unpadded
             if origin_input_ids_unpadded

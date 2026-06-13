@@ -21,6 +21,7 @@ from transformers import (
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
 from sgl_jax.srt.configs.bailing_hybrid import BailingHybridConfig
+from sgl_jax.srt.configs.gemma4 import Gemma4Config
 from sgl_jax.srt.configs.kimi_linear import KimiLinearConfig
 from sgl_jax.srt.configs.qwen3_5 import Qwen3_5HybridConfig
 from sgl_jax.srt.managers.tiktoken_tokenizer import TiktokenTokenizer
@@ -42,6 +43,7 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
         KimiLinearConfig,
         GlmMoeDsaConfig,
         Qwen3_5HybridConfig,
+        Gemma4Config,
     ]
 }
 
@@ -60,13 +62,15 @@ AutoConfig.register("qwen3_5_moe", Qwen3_5HybridConfig, exist_ok=True)
 _UNSET = object()
 
 
-def download_from_hf(model_path: str, allow_patterns: list[str] | None = _UNSET):
+def download_from_hf(
+    model_path: str, allow_patterns: list[str] | None = _UNSET, cache_dir: str | None = None
+):
     if os.path.exists(model_path):
         return model_path
 
     if allow_patterns is _UNSET:
-        allow_patterns = ["*.json", "*.bin", "*.model", "*.py", "*.tiktoken"]
-    return snapshot_download(model_path, allow_patterns=allow_patterns)
+        allow_patterns = ["*.json", "*.bin", "*.model", "*.py", "*.tiktoken", "*.jinja"]
+    return snapshot_download(model_path, allow_patterns=allow_patterns, cache_dir=cache_dir)
 
 
 def get_hf_text_config(config: PretrainedConfig):
@@ -246,6 +250,7 @@ def get_tokenizer(
     tokenizer_revision: str | None = None,
     tokenizer_backend: str = "huggingface",
     sub_dir: str = "",
+    download_dir: str | None = None,
     **kwargs,
 ) -> PreTrainedTokenizer | PreTrainedTokenizerFast | TiktokenTokenizer:
     """Gets a tokenizer for the given model name via Huggingface."""
@@ -276,7 +281,21 @@ def get_tokenizer(
             f"Remote URLs are not supported in JAX implementation. "
             f"Please use a local path or HuggingFace model name instead: {tokenizer_name}"
         )
-    tokenizer_name = download_from_hf(tokenizer_name)
+    tokenizer_name = download_from_hf(tokenizer_name, cache_dir=download_dir)
+    # Workaround: older versions of the transformers library (like ~=4.57.1) will crash when
+    # loading tokenizers containing list-format extra_special_tokens (e.g. google/gemma-4).
+    # Overriding it to an empty dict avoids the validation crash while keeping all vocab tokens intact.
+    try:
+        config_path = os.path.join(tokenizer_name, "config.json")
+        if os.path.exists(config_path):
+            with open(config_path) as f:
+                import json
+
+                model_config_data = json.load(f)
+                if model_config_data.get("model_type") == "gemma4":
+                    kwargs.setdefault("extra_special_tokens", {})
+    except Exception as e:
+        logger.debug("Failed to inspect config.json for extra_special_tokens workaround: %s", e)
     if sub_dir:
         # Only append sub_dir if it actually exists
         sub_dir_path = tokenizer_name + "/" + sub_dir
@@ -292,6 +311,16 @@ def get_tokenizer(
             clean_up_tokenization_spaces=False,
             **kwargs,
         )
+        # Workaround: older transformers versions only read chat_template from tokenizer_config.json
+        # and do not search for chat_template.jinja files. Explicitly load it if present in model files.
+        try:
+            jinja_template_path = os.path.join(tokenizer_name, "chat_template.jinja")
+            if os.path.exists(jinja_template_path):
+                with open(jinja_template_path) as f:
+                    tokenizer.chat_template = f.read()
+        except Exception as e:
+            logger.debug("Failed to load chat_template.jinja: %s", e)
+
     except Exception as e:
         if tokenizer_backend == "fastokens":
             _raise_fastokens_load_error(tokenizer_name, e)
