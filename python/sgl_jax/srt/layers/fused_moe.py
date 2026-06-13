@@ -315,24 +315,26 @@ class FusedEPMoE(nnx.Module):
 
             # Replace original weights with quantized versions
             if self.quant_block_n is not None:
+                assert self.quant_block_k is not None
+                block_size = [self.quant_block_k, self.quant_block_n]
                 # 2D block-wise quantization: scale shape (E, K//block_k, N//block_n)
                 w1_value, w1_scale = quantize_tensor(
                     self.quantized_dtype,
                     self.w1.value,
                     axis=(1, 2),
-                    block_size=[self.quant_block_k, self.quant_block_n],
+                    block_size=block_size,
                 )
                 w3_value, w3_scale = quantize_tensor(
                     self.quantized_dtype,
                     self.w3.value,
                     axis=(1, 2),
-                    block_size=[self.quant_block_k, self.quant_block_n],
+                    block_size=block_size,
                 )
                 w2_value, w2_scale = quantize_tensor(
                     self.quantized_dtype,
                     self.w2.value,
                     axis=(1, 2),
-                    block_size=[self.quant_block_k, self.quant_block_n],
+                    block_size=block_size,
                 )
             else:
                 # 1D sub-channel quantization: scale shape (E, K//wsz, N)
