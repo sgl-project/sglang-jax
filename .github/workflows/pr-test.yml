@@ -163,7 +163,7 @@ jobs:
       - name: Setup Python environment
         uses: ./.github/actions/setup-venv
       - name: Evaluate accuracy
-        timeout-minutes: 20
+        timeout-minutes: 40
         shell: bash
         env:
           SGLANG_JAX_IS_IN_CI: true
