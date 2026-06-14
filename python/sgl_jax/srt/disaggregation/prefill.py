@@ -57,21 +57,16 @@ def _global_to_local_shard(arr: jax.Array) -> jax.Array:
     spec = arr.sharding.spec
     sharded_dims = [i for i, s in enumerate(spec) if s is not None]
     if len(sharded_dims) != 1:
-        raise ValueError(
-            f"_global_to_local_shard expects exactly one sharded dim, got spec={spec}"
-        )
+        raise ValueError(f"_global_to_local_shard expects exactly one sharded dim, got spec={spec}")
     sd = sharded_dims[0]
     ldev = jax.local_devices()
     shards = [s.data for s in arr.addressable_shards]
     lshape = tuple(
-        shards[0].shape[i] * len(ldev) if i == sd else shards[0].shape[i]
-        for i in range(arr.ndim)
+        shards[0].shape[i] * len(ldev) if i == sd else shards[0].shape[i] for i in range(arr.ndim)
     )
     lmesh = _Mesh(_np.asarray(ldev), ("_local",))
     lspec = _P(*("_local" if i == sd else None for i in range(arr.ndim)))
-    return jax.make_array_from_single_device_arrays(
-        lshape, _NamedSharding(lmesh, lspec), shards
-    )
+    return jax.make_array_from_single_device_arrays(lshape, _NamedSharding(lmesh, lspec), shards)
 
 
 def local_kv_spec_for_pool(kv_pool, layer_num: int, padded_pages: int) -> jax.ShapeDtypeStruct:
@@ -193,7 +188,9 @@ class SchedulerDisaggregationPrefillMixin:
             self.send_kv_chunk()
             # PD reqs are finished and released inside process_prefill_chunk;
             # do not merge them into running_batch.
-            self.last_batch = None if batch and any(r.bootstrap_room is not None for r in batch.reqs) else batch
+            self.last_batch = (
+                None if batch and any(r.bootstrap_room is not None for r in batch.reqs) else batch
+            )
 
     def process_prefill_chunk(self: Scheduler, batch, result) -> None:
         """Extract KV for PD reqs and hand off to sender."""

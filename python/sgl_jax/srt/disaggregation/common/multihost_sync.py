@@ -9,7 +9,7 @@ buffer shape — safe even when the in-flight set differs across NPs.
 
 from __future__ import annotations
 
-from typing import Callable, Iterable
+from collections.abc import Callable, Iterable
 
 import numpy as np
 
