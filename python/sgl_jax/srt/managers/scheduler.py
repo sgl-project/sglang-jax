@@ -834,8 +834,8 @@ class Scheduler(
             flops_util = after_input / flops_cap
             hbm_util = after_output / hbm_cap
 
-        2. Compute inflation factor (driven by bottleneck dimension):
-            inflation = max(flops_cap / after_input, hbm_cap / after_output)
+        2. Compute inflation factor (driven by bottleneck dimension - the one with higher utilization):
+            inflation = min(flops_cap / after_input, hbm_cap / after_output)
 
         3. Compute stranding (wasted capacity) per dimension:
             flops_stranding = 1 - inflation * flops_util
@@ -893,8 +893,8 @@ class Scheduler(
             flops_util = after_input / flops_cap
             hbm_util = after_output / hbm_cap
 
-            # Inflation factor (driven by bottleneck dimension)
-            inflation = max(
+            # Inflation factor (driven by bottleneck dimension - the one with higher utilization)
+            inflation = min(
                 flops_cap / max(after_input, 1),
                 hbm_cap / max(after_output, 1),
             )
