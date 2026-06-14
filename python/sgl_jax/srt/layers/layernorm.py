@@ -192,12 +192,13 @@ class GemmaRMSNorm(nnx.Module):
         hidden_size: int,
         epsilon: float = 1e-6,
         kernel_axes: Sequence[str] | None = None,
+        add_unit_offset: bool = True,
     ):
         self.epsilon = epsilon
+        self.add_unit_offset = add_unit_offset
+        init_fn = nnx.initializers.ones if not add_unit_offset else nnx.initializers.zeros
         self.weight = nnx.Param(
-            nnx.with_partitioning(nnx.initializers.zeros, kernel_axes)(
-                jax.random.PRNGKey(0), (hidden_size,)
-            )
+            nnx.with_partitioning(init_fn, kernel_axes)(jax.random.PRNGKey(0), (hidden_size,))
         )
 
     @named_scope
@@ -212,7 +213,10 @@ class GemmaRMSNorm(nnx.Module):
         x = x.astype(jnp.float32)
         variance = jnp.mean(lax.square(x), axis=-1, keepdims=True)
         x = x * lax.rsqrt(variance + self.epsilon)
-        x = x * (1.0 + jnp.asarray(self.weight, jnp.float32))
+        if self.add_unit_offset:
+            x = x * (1.0 + jnp.asarray(self.weight, jnp.float32))
+        else:
+            x = x * jnp.asarray(self.weight, jnp.float32)
         x = x.astype(orig_dtype)
         return x if residual is None else (x, residual)
 

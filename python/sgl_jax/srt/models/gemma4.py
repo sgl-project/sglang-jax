@@ -534,6 +534,7 @@ class Gemma4Model(nnx.Module):
         )
         self.hidden_size = config.hidden_size
         self.layers_to_capture: list[int] = []
+        self.layers_to_capture = []
 
     def __call__(
         self,
