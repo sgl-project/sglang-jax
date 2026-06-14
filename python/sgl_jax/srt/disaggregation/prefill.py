@@ -205,8 +205,14 @@ class SchedulerDisaggregationPrefillMixin:
 
         self.set_next_batch_sampling_info_done(batch)
 
+        chunked_now = tuple(r for r in getattr(self, "chunked_reqs", ()) if r is not None)
         for req in batch.reqs:
             if req.bootstrap_room is None:
+                continue
+            if any(req is cr for cr in chunked_now):
+                # Still mid-chunk: KV is incomplete, and releasing the
+                # req_pool_idx here would leak the slot the next chunk
+                # round re-allocates. Extract on the final chunk.
                 continue
             req_id = req.rid
             if req_id in self.disagg_prefill_queue._entries:
