@@ -19,17 +19,26 @@ logger = logging.getLogger(__name__)
 
 
 # Cache the TPU v7x check at the module level to avoid per-call overhead.
-# This guards against the XLA DotStrengthReduction lowering bug described in #1036,
-# which causes a 1-ulp precision mismatch between MXU (FP32) and VPU (BF16) at batch=1.
-_USE_FP32_ACCUM_FOR_TPU_V7X: bool = False
-try:
-    _devs = jax.devices()
-    if len(_devs) > 0 and _devs[0].platform == "tpu":
-        _device_kind = getattr(_devs[0], "device_kind", "")
-        if "7x" in _device_kind or _device_kind == "TPU7x":
-            _USE_FP32_ACCUM_FOR_TPU_V7X = True
-except Exception:
-    pass
+# We initialize it to None and query it lazily on the first call to prevent
+# early JAX/XLA backend initialization before jax.distributed.initialize() is called.
+_USE_FP32_ACCUM_FOR_TPU_V7X: bool | None = None
+
+
+def _check_use_fp32_accum_for_tpu_v7x() -> bool:
+    global _USE_FP32_ACCUM_FOR_TPU_V7X
+    if _USE_FP32_ACCUM_FOR_TPU_V7X is not None:
+        return _USE_FP32_ACCUM_FOR_TPU_V7X
+
+    _USE_FP32_ACCUM_FOR_TPU_V7X = False
+    try:
+        _devs = jax.devices()
+        if len(_devs) > 0 and _devs[0].platform == "tpu":
+            _device_kind = getattr(_devs[0], "device_kind", "")
+            if "7x" in _device_kind or _device_kind == "TPU7x":
+                _USE_FP32_ACCUM_FOR_TPU_V7X = True
+    except Exception:
+        pass
+    return _USE_FP32_ACCUM_FOR_TPU_V7X
 
 
 def _shard_map_output_partition_dim(
@@ -115,7 +124,7 @@ class LinearBase(nnx.Module):
         )
 
         preferred_dtype = self.params_dtype
-        if _USE_FP32_ACCUM_FOR_TPU_V7X:
+        if _check_use_fp32_accum_for_tpu_v7x():
             preferred_dtype = jnp.float32
 
         out = lax.dot_general(
