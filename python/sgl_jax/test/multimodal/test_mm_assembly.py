@@ -71,5 +71,37 @@ class TestAssembleMMInputs(unittest.TestCase):
         self.assertEqual(out["video_grid_thw"], [(1, 4, 4)])
 
 
+class TestVisionTokenCount(unittest.TestCase):
+    """K-2 placeholder-count guard helpers."""
+
+    def test_expected_count_single(self):
+        from sgl_jax.srt.mm_core.mm_assembly import expected_vision_placeholder_count
+
+        # grid (1,4,4)=16 patches, merge=2 -> 16//4 = 4 placeholder tokens
+        self.assertEqual(expected_vision_placeholder_count([(1, 4, 4)], 2), 4)
+
+    def test_expected_count_multi_item_sum(self):
+        from sgl_jax.srt.mm_core.mm_assembly import expected_vision_placeholder_count
+
+        # (1,4,4)->4 + (1,2,2)=4 patches ->1  => 5; accepts a flat np array too
+        self.assertEqual(expected_vision_placeholder_count([(1, 4, 4), (1, 2, 2)], 2), 5)
+        self.assertEqual(expected_vision_placeholder_count(np.array([[1, 4, 4], [1, 2, 2]]), 2), 5)
+
+    def test_spatial_merge_size_lookup(self):
+        import types
+
+        from sgl_jax.srt.mm_core.mm_assembly import vision_spatial_merge_size
+
+        top = types.SimpleNamespace(vision_config=types.SimpleNamespace(spatial_merge_size=2))
+        self.assertEqual(vision_spatial_merge_size(top), 2)
+        nested = types.SimpleNamespace(
+            thinker_config=types.SimpleNamespace(
+                vision_config=types.SimpleNamespace(spatial_merge_size=2)
+            )
+        )
+        self.assertEqual(vision_spatial_merge_size(nested), 2)
+        self.assertIsNone(vision_spatial_merge_size(types.SimpleNamespace()))
+
+
 if __name__ == "__main__":
     unittest.main()

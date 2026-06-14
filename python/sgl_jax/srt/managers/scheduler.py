@@ -1074,6 +1074,47 @@ class Scheduler(
             )
             self._add_request_to_queue(req)
             return
+        # Merge count invariant (review K-2): merge scatters per modality with mode="drop", so a
+        # placeholder-vs-feature count mismatch silently drops/misplaces features (garbage output,
+        # zero logs). Verify the processor's own invariant on host -- bucketing-SAFE because it uses
+        # the REAL grid (mm_inputs) and the clean origin_input_ids, not the padded encode-jit copy:
+        # #vision placeholders == sum(prod(grid)//merge^2). (audio is model-specific -- codes vs mel
+        # downsample -- so not checked here; merge's mode="drop" still bounds the damage.)
+        if req.mm_inputs is not None:
+            from sgl_jax.srt.mm_core.mm_assembly import (
+                expected_vision_placeholder_count,
+                vision_spatial_merge_size,
+            )
+
+            merge_sz = vision_spatial_merge_size(self.model_config.hf_config)
+            if merge_sz:
+                bad = None
+                for grid_key, tok_key in (
+                    ("image_grid_thw", "im_token_id"),
+                    ("video_grid_thw", "video_token_id"),
+                ):
+                    grid = req.mm_inputs.get(grid_key)
+                    tok = req.mm_inputs.get(tok_key)
+                    if grid is None or tok is None:
+                        continue
+                    try:
+                        expected = expected_vision_placeholder_count(grid, merge_sz)
+                    except Exception:
+                        # Unexpected grid shape -> can't run the best-effort guard; don't crash
+                        # intake over it (merge's mode="drop" still bounds any real mismatch).
+                        continue
+                    actual = sum(1 for t in req.origin_input_ids if t == tok)
+                    if expected != actual:
+                        bad = (
+                            f"multimodal {grid_key} implies {expected} placeholder tokens but the "
+                            f"prompt has {actual} {tok_key}={tok} tokens; merge would silently "
+                            "drop/misplace features (processor/grid inconsistency, review K-2)."
+                        )
+                        break
+                if bad is not None:
+                    req.set_finish_with_abort(bad)
+                    self._add_request_to_queue(req)
+                    return
         # Validate prompt length
         error_msg = validate_input_length(
             req,

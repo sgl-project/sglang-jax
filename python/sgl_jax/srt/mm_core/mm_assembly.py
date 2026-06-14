@@ -87,3 +87,26 @@ def assemble_mm_inputs(mm_inputs: dict | None) -> dict[str, Any]:
     out["image_grid_thw"] = mm_inputs.get("image_grid_thw")
     out["video_grid_thw"] = mm_inputs.get("video_grid_thw")
     return out
+
+
+def vision_spatial_merge_size(hf_config) -> int | None:
+    """spatial_merge_size of the served vision tower (top-level or nested under thinker_config),
+    or None when absent. Used by the K-2 placeholder-count guard; None -> guard skips (no
+    false-positive on a model whose merge size isn't exposed)."""
+    for cfg in (
+        getattr(hf_config, "vision_config", None),
+        getattr(getattr(hf_config, "thinker_config", None), "vision_config", None),
+    ):
+        m = getattr(cfg, "spatial_merge_size", None) if cfg is not None else None
+        if m:
+            return int(m)
+    return None
+
+
+def expected_vision_placeholder_count(grid_thw, spatial_merge_size: int) -> int:
+    """Qwen-VL-family invariant: the number of placeholder tokens a vision grid expands to is
+    ``sum over items of prod(t, h, w) // spatial_merge_size**2`` (review K-2). ``grid_thw`` is the
+    real (un-bucketed) ``[num_items, 3]`` grid the processor emitted. Pure arithmetic on host."""
+    g = np.asarray(grid_thw).reshape(-1, 3)
+    m2 = int(spatial_merge_size) * int(spatial_merge_size)
+    return int(((g[:, 0] * g[:, 1] * g[:, 2]) // m2).sum())
