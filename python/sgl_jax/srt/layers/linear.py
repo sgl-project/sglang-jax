@@ -32,7 +32,6 @@ except Exception:
     pass
 
 
-
 def _shard_map_output_partition_dim(
     sharding: jax.sharding.Sharding, axis_name: str | None
 ) -> int | None:
