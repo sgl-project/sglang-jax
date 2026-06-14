@@ -57,8 +57,8 @@ class Glm4MoeAttention(nnx.Module):
         self.scaling = self.head_dim**-0.5
 
         self.use_qk_norm = use_qk_norm
-        self.q_norm: RMSNorm | None
-        self.k_norm: RMSNorm | None
+        self.q_norm: RMSNorm | None = nnx.data(None)
+        self.k_norm: RMSNorm | None = nnx.data(None)
 
         if use_qk_norm:
             self.q_norm = RMSNorm(
@@ -245,9 +245,9 @@ class Glm4MoeDecoderLayer(nnx.Module):
 
         first_k_dense_replace = getattr(config, "first_k_dense_replace", 0)
         self.mlp: Any
-        self.moe_gate: GateLogit | None = None
-        self.topk: TopK | None = None
-        self.shared_experts: Glm4MoeMLP | None = None
+        self.moe_gate: GateLogit | None = nnx.data(None)
+        self.topk: TopK | None = nnx.data(None)
+        self.shared_experts: Glm4MoeMLP | None = nnx.data(None)
 
         if layer_id < first_k_dense_replace:
             self.mlp = Glm4MoeMLP(
@@ -259,6 +259,8 @@ class Glm4MoeDecoderLayer(nnx.Module):
             )
             self.is_moe_layer = False
             self.moe_gate = None
+            self.topk = None
+            self.shared_experts = None
         else:
             router_dtype = getattr(config, "router_dtype", jnp.float32)
             self.moe_gate = GateLogit(

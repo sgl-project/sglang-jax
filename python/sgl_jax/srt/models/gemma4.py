@@ -356,12 +356,12 @@ class Gemma4DecoderLayer(nnx.Module):
         )
 
         self.enable_moe_block = getattr(config, "enable_moe_block", False)
-        self.router: Gemma4Router | None
-        self.topk: TopK | None
-        self.experts: EPMoE | None
-        self.post_feedforward_layernorm_1: GemmaRMSNorm | None
-        self.post_feedforward_layernorm_2: GemmaRMSNorm | None
-        self.pre_feedforward_layernorm_2: GemmaRMSNorm | None
+        self.router: Gemma4Router | None = nnx.data(None)
+        self.topk: TopK | None = nnx.data(None)
+        self.experts: EPMoE | None = nnx.data(None)
+        self.post_feedforward_layernorm_1: GemmaRMSNorm | None = nnx.data(None)
+        self.post_feedforward_layernorm_2: GemmaRMSNorm | None = nnx.data(None)
+        self.pre_feedforward_layernorm_2: GemmaRMSNorm | None = nnx.data(None)
         if self.enable_moe_block:
             num_experts = getattr(config, "num_experts", 128)
             num_experts_per_tok = getattr(

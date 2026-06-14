@@ -224,10 +224,10 @@ class DeepseekV3Attention(nnx.Module):
         self.use_absorbed = use_absorbed
         # Absorbed-MLA fused projections, populated by post_load_weights() after
         # weight loading: w_uk[R, n_h, D_k] folds W_UK into Q, w_uv[R, n_h, D_v]
-        # folds W_UV into the output. Placeholders here so nnx tracks them in
-        # the model state tree; sharded on the head dim like kv_b_proj.weight.
-        self.w_uk: Any | None = None
-        self.w_uv: Any | None = None
+        # folds W_UV into the output. When populated, nnx tracks them in the
+        # model state tree; sharded on the head dim like kv_b_proj.weight.
+        self.w_uk: Any | None = nnx.data(None)
+        self.w_uv: Any | None = nnx.data(None)
         if use_absorbed:
             uk_axes = (None, "tensor", None)
             self.w_uk = nnx.Param(
@@ -244,6 +244,9 @@ class DeepseekV3Attention(nnx.Module):
                     out_sharding=P(*uk_axes),
                 )
             )
+        else:
+            self.w_uk = None
+            self.w_uv = None
         # Non-absorbed (MHA) RadixAttention: every Q head has its own K/V,
         # head_dim is the concatenated nope+rope dim. We pad V to the same
         # head_dim before calling FlashAttention (RPA v3 requires k/v share
@@ -480,7 +483,7 @@ class DeepseekV3DecoderLayer(nnx.Module):
         )
         self.is_moe_layer = is_moe
         self.mlp: Any
-        self.moe_gate: GateLogit | None = None
+        self.moe_gate: GateLogit | None = nnx.data(None)
 
         if not is_moe:
             self.mlp = DeepseekV3MLP(

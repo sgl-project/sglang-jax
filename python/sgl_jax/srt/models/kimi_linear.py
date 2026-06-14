@@ -341,10 +341,10 @@ class KimiDecoderLayer(nnx.Module):
         self.moe_backend = getattr(config, "moe_backend", MoEBackend.EPMOE)
         self.use_fused = self.moe_backend == "fused"
         self.mlp: Any
-        self.moe_gate: GateLogit | None = None
-        self.topk: TopK | None = None
-        self.block_sparse_moe: Any = None
-        self.shared_experts: KimiMLP | None = None
+        self.moe_gate: GateLogit | None = nnx.data(None)
+        self.topk: TopK | None = nnx.data(None)
+        self.block_sparse_moe: Any = nnx.data(None)
+        self.shared_experts: KimiMLP | None = nnx.data(None)
 
         if not is_moe:
             self.mlp = KimiMLP(
@@ -353,6 +353,10 @@ class KimiDecoderLayer(nnx.Module):
                 mesh=mesh,
                 dtype=dtype,
             )
+            self.moe_gate = None
+            self.topk = None
+            self.block_sparse_moe = None
+            self.shared_experts = None
         else:
             assert config.num_experts is not None
             assert config.num_experts_per_token is not None

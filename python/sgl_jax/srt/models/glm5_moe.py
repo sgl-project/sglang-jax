@@ -177,8 +177,8 @@ class Glm5Attention(nnx.Module):
         self.scaling = 256**-0.5
 
         self.use_qk_norm = use_qk_norm
-        self.q_norm: RMSNorm | None
-        self.k_norm: RMSNorm | None
+        self.q_norm: RMSNorm | None = nnx.data(None)
+        self.k_norm: RMSNorm | None = nnx.data(None)
 
         if use_qk_norm:
             self.q_norm = RMSNorm(256, epsilon=rms_norm_eps, param_dtype=dtype, scope_name="q_norm")
@@ -261,9 +261,9 @@ class Glm5Attention(nnx.Module):
         )
 
         self.use_absorbed = use_absorbed
-        self.w_uk: Any | None
-        self.w_uv: Any | None
-        self.attn_mqa: RadixAttention | None
+        self.w_uk: Any | None = nnx.data(None)
+        self.w_uv: Any | None = nnx.data(None)
+        self.attn_mqa: RadixAttention | None = nnx.data(None)
 
         if use_absorbed:
             uk_axes = (None, "tensor", None)
@@ -516,9 +516,9 @@ class Glm5DecoderLayer(nnx.Module):
 
         first_k_dense_replace = getattr(config, "first_k_dense_replace", 0)
         self.mlp: Any
-        self.moe_gate: GateLogit | None = None
-        self.topk: TopK | None = None
-        self.shared_experts: Glm5MLP | None = None
+        self.moe_gate: GateLogit | None = nnx.data(None)
+        self.topk: TopK | None = nnx.data(None)
+        self.shared_experts: Glm5MLP | None = nnx.data(None)
 
         if layer_id < first_k_dense_replace:
             self.mlp = Glm5MLP(
@@ -530,6 +530,8 @@ class Glm5DecoderLayer(nnx.Module):
             )
             self.is_moe_layer = False
             self.moe_gate = None
+            self.topk = None
+            self.shared_experts = None
         else:
             router_dtype = jnp.float32
             self.moe_gate = GateLogit(

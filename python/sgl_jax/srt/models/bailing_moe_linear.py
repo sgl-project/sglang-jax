@@ -67,8 +67,8 @@ class BailingMoELinearAttention(nnx.Module):
         self.mesh = mesh
         self.linear_silu = getattr(config, "use_linear_silu", getattr(config, "linear_silu", False))
         self.linear_rope = getattr(config, "linear_rope", True)
-        self.q_norm: RMSNorm | None = None
-        self.k_norm: RMSNorm | None = None
+        self.q_norm: RMSNorm | None = nnx.data(None)
+        self.k_norm: RMSNorm | None = nnx.data(None)
 
         inner_size = self.num_heads * self.head_dim
         qkv_bias = getattr(config, "use_bias", False) or getattr(config, "use_qkv_bias", False)
@@ -134,6 +134,9 @@ class BailingMoELinearAttention(nnx.Module):
                 param_dtype=dtype,
                 scope_name="key_layernorm",
             )
+        else:
+            self.q_norm = None
+            self.k_norm = None
 
         if hasattr(config, "rotary_dim"):
             rotary_dim = config.rotary_dim
@@ -233,8 +236,8 @@ class BailingMoEGQAAttention(nnx.Module):
         self.q_size = self.q_head_num * self.head_dim
         self.kv_size = self.kv_head_num * self.head_dim
         self.use_qk_norm = getattr(config, "use_qk_norm", False)
-        self.q_norm: RMSNorm | None = None
-        self.k_norm: RMSNorm | None = None
+        self.q_norm: RMSNorm | None = nnx.data(None)
+        self.k_norm: RMSNorm | None = nnx.data(None)
 
         qkv_bias = getattr(config, "use_bias", False) or getattr(config, "use_qkv_bias", False)
         self.qkv_proj = LinearBase(
@@ -268,6 +271,9 @@ class BailingMoEGQAAttention(nnx.Module):
                 param_dtype=dtype,
                 scope_name="key_layernorm",
             )
+        else:
+            self.q_norm = None
+            self.k_norm = None
 
         if hasattr(config, "rotary_dim"):
             rotary_dim = config.rotary_dim
@@ -405,9 +411,9 @@ class BailingMoELinearDecoderLayer(nnx.Module):
         dtype: jnp.dtype,
     ) -> None:
         self.mlp: Any
-        self.moe_gate: GateLogit | None = None
-        self.topk: TopK | None = None
-        self.shared_experts: DeepseekV3MLP | None = None
+        self.moe_gate: GateLogit | None = nnx.data(None)
+        self.topk: TopK | None = nnx.data(None)
+        self.shared_experts: DeepseekV3MLP | None = nnx.data(None)
         self.use_fused = False
         first_k_dense_replace = getattr(config, "first_k_dense_replace", 0)
         num_experts = getattr(config, "num_experts", 1)
@@ -419,6 +425,9 @@ class BailingMoELinearDecoderLayer(nnx.Module):
                 dtype=dtype,
             )
             self.is_moe_layer = False
+            self.moe_gate = None
+            self.topk = None
+            self.shared_experts = None
             return
 
         router_dtype = getattr(config, "router_dtype", None)

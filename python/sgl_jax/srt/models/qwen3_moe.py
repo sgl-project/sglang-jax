@@ -196,8 +196,8 @@ class QWen3MoeDecoderLayer(nnx.Module):
         )
 
         self.mlp: Any
-        self.moe_gate: GateLogit | None = None
-        self.topk: TopK | None = None
+        self.moe_gate: GateLogit | None = nnx.data(None)
+        self.topk: TopK | None = nnx.data(None)
 
         if not self.is_moe_layer:
             self.mlp = Qwen3MLP(
@@ -208,6 +208,7 @@ class QWen3MoeDecoderLayer(nnx.Module):
                 mesh=mesh,
             )
             self.moe_gate = None
+            self.topk = None
         else:
             num_experts = getattr(config, "num_experts", 128)
             num_experts_per_tok = getattr(config, "num_experts_per_tok", 8)
