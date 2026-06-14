@@ -154,6 +154,18 @@ class JaxTransferWrapper:
             raise RuntimeError(
                 "JaxTransferWrapper.start() must be called before " "register_pull()"
             )
+        sharding = getattr(data, "sharding", None)
+        if sharding is not None and not data.is_fully_addressable:
+            raise ValueError(
+                f"register_pull: array is sharded across "
+                f"{len(sharding.device_set)} devices but only "
+                f"{jax.local_device_count()} are local to this process. "
+                f"jax.experimental.transfer.await_pull only registers "
+                f"process-local shards, so a remote pull would receive "
+                f"partial/misaligned data. All-gather to a fully-"
+                f"addressable sharding first (see issue #1240 for the "
+                f"per-host coordination plan)."
+            )
         with self._pending_lock:
             if uuid in self._pending:
                 raise RuntimeError(

@@ -163,6 +163,23 @@ def test_register_pull_rejects_duplicate_uuid():
     assert fake_server.await_pull.call_count == 2
 
 
+def test_register_pull_rejects_non_fully_addressable():
+    fake_server = mock.MagicMock()
+    with (
+        _shim_transfer_module(fake_server),
+        mock.patch.object(jtw_mod.jax, "local_devices", return_value=[mock.MagicMock()]),
+    ):
+        wrapper = JaxTransferWrapper("127.0.0.1", 31007)
+        wrapper.start()
+
+    arr = mock.MagicMock()
+    arr.is_fully_addressable = False
+    arr.sharding.device_set = {mock.MagicMock() for _ in range(8)}
+    with pytest.raises(ValueError, match="only registers process-local shards"):
+        wrapper.register_pull("mh", arr)
+    assert fake_server.await_pull.call_count == 0
+
+
 def test_singleton_rejects_rebinding():
     w1 = get_or_create_wrapper("10.0.0.1", 31010, channel_number=1)
     w2 = get_or_create_wrapper("10.0.0.1", 31010, channel_number=1)

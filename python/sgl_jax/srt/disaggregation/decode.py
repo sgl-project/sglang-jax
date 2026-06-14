@@ -311,9 +311,17 @@ class SchedulerDisaggregationDecodeMixin:
         padded_pages = _pad_to_page_bucket(num_pages)
         per_layer_tail = kv_pool.kv_buffer[0].shape[1:]
         shape = (kv_pool.layer_num, padded_pages) + per_layer_tail
-        base_spec = kv_pool.kv_sharding.spec
-        stacked_spec = PartitionSpec(None, *base_spec)
-        sharding = NamedSharding(kv_pool.kv_sharding.mesh, stacked_spec)
+        if jax.process_count() > 1:
+            # P registers a single fully-addressable buffer per host (see
+            # prefill._extract_req_kv); pull onto one local device and
+            # let _write_kv_to_pool reshard onto the pool mesh.
+            from jax.sharding import SingleDeviceSharding
+
+            sharding = SingleDeviceSharding(jax.local_devices()[0])
+        else:
+            base_spec = kv_pool.kv_sharding.spec
+            stacked_spec = PartitionSpec(None, *base_spec)
+            sharding = NamedSharding(kv_pool.kv_sharding.mesh, stacked_spec)
         return jax.ShapeDtypeStruct(shape, kv_pool.dtype, sharding=sharding)
 
     def _write_kv_to_pool(self: Scheduler, req: Req, kv_indices, kv: jax.Array) -> None:
@@ -328,6 +336,14 @@ class SchedulerDisaggregationDecodeMixin:
         from jax.sharding import NamedSharding, PartitionSpec
 
         kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
+        if jax.process_count() > 1 and kv.is_fully_addressable:
+            # Each decode host pulled the same single-device buffer; lift
+            # it onto the pool mesh as replicated so the per-layer scatter
+            # below can reshard via out_sharding without cross-host gaps.
+            kv = jax.make_array_from_process_local_data(
+                NamedSharding(kv_pool.mesh, PartitionSpec()),
+                np.asarray(kv),
+            )
         page_size = kv_pool.page_size
         seqlen = len(req.origin_input_ids)
         num_pages = (seqlen + page_size - 1) // page_size

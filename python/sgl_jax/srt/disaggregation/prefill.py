@@ -252,10 +252,18 @@ class SchedulerDisaggregationPrefillMixin:
             _np.asarray(page_id_source) // page_size,
             idx_sharding,
         )
-        # out_sharding describes the gather output, not the pool.
+        # out_sharding describes the gather output, not the pool. On a
+        # multi-host process the gather output MUST be fully addressable
+        # because jax.experimental.transfer only registers process-local
+        # shards (see wrapper.register_pull). All-gathering to replicated
+        # here is the cheapest correct path until per-host coordination
+        # (#1240) lands; the ICI all-gather is sub-millisecond at typical
+        # KV sizes.
         pool_pspec = kv_pool.kv_sharding.spec
-        gather_pspec = _P(None, *pool_pspec[1:])
-        gather_out_sharding = _NamedSharding(kv_pool.mesh, gather_pspec)
+        if jax.process_count() > 1:
+            gather_out_sharding = _NamedSharding(kv_pool.mesh, _P())
+        else:
+            gather_out_sharding = _NamedSharding(kv_pool.mesh, _P(None, *pool_pspec[1:]))
         layer_buffers = [
             kv_pool.get_kv_buffer(layer_id)
             for layer_id in range(
@@ -264,7 +272,11 @@ class SchedulerDisaggregationPrefillMixin:
             )
         ]
         layer_kvs = _jit_gather_all_layers(layer_buffers, page_indices, gather_out_sharding)
-        return jnp.stack(layer_kvs, axis=0)
+        stacked = jnp.stack(layer_kvs, axis=0)
+        if jax.process_count() > 1:
+            stacked.block_until_ready()
+            return stacked.addressable_data(0)
+        return stacked
 
     def _release_prefill_req_resources(self: Scheduler, req: Req) -> None:
         """Release prefill-side KV and request-pool resources."""
