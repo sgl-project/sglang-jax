@@ -75,6 +75,29 @@ class TestMerge(unittest.TestCase):
         self.assertEqual(out.embed.shape, (3, 2))
         self.assertTrue(bool(jnp.array_equal(out.embed[1], feats[0])))
 
+    def test_interleaved_modalities_align(self):
+        # K-1: modalities INTERLEAVED in the sequence (A, B, A). The model builds mod_embeds in
+        # block order ([a0, a1], [b0]); a flat concat + global mask would pair sequence position 1
+        # (a B placeholder) with the 2nd block feature a1 and cross-wire. Per-modality scatter must
+        # send each modality's features only to its own placeholders.
+        ids = jnp.array([PAD_A, PAD_B, PAD_A])
+        t = jnp.zeros((3, 2), dtype=jnp.float32)
+        fa = jnp.array([[1, 1], [2, 2]], dtype=jnp.float32)  # two A features, sequence order
+        fb = jnp.array([[3, 3]], dtype=jnp.float32)  # one B feature
+        out = merge(t, [fa, fb], [PAD_A, PAD_B], ids)
+        self.assertTrue(bool(jnp.array_equal(out.embed[0], fa[0])))  # first A placeholder
+        self.assertTrue(bool(jnp.array_equal(out.embed[1], fb[0])))  # B placeholder (NOT fa[1])
+        self.assertTrue(bool(jnp.array_equal(out.embed[2], fa[1])))  # second A placeholder
+
+    def test_mismatched_pair_lengths_raise(self):
+        # The 1:1 contract: a feature-block count != placeholder-id count is a caller bug, not a
+        # silent flatten.
+        ids = jnp.array([0, PAD_A, PAD_B])
+        t = jnp.zeros((3, 2), dtype=jnp.float32)
+        feats = jnp.array([[1, 1]], dtype=jnp.float32)
+        with self.assertRaises(ValueError):
+            merge(t, [feats], [PAD_A, PAD_B], ids)
+
 
 if __name__ == "__main__":
     unittest.main()

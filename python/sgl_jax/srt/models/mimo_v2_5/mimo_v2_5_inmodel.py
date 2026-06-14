@@ -119,21 +119,19 @@ class MiMoV2_5ForConditionalGeneration(nnx.Module):
         merge keys by the raw image/video/audio token id. (mm_audio_features / *_lengths accepted for
         signature uniformity with Qwen3-Omni but unused -- MiMo audio is discrete codes.)"""
         text_embed = self.model.model.embed_tokens(input_ids)
+        # Build 1:1 (features, placeholder_id) per PRESENT modality so merge scatters each into its
+        # own placeholder rows -- keeps interleaved image/video/audio prompts aligned (review K-1).
         mod_embeds = []
-        # Order must match the modalities' appearance order in input_ids (merge scatters
-        # concat(mod_embeds) into the sorted placeholder positions). Single-modality requests
-        # (the common case) are always aligned regardless of order.
-        if mm_audio_codes is not None:
+        placeholder_ids = []
+        if mm_audio_codes is not None and self.audio_token_id is not None:
             mod_embeds.append(self.encode_audio(mm_audio_codes))
-        if mm_pixel_values is not None:
+            placeholder_ids.append(self.audio_token_id)
+        if mm_pixel_values is not None and self.image_token_id is not None:
             mod_embeds.append(self.encode_image(mm_pixel_values, mm_grid_thw))
-        if mm_pixel_values_videos is not None:
+            placeholder_ids.append(self.image_token_id)
+        if mm_pixel_values_videos is not None and self.video_token_id is not None:
             mod_embeds.append(self.encode_image(mm_pixel_values_videos, mm_video_grid_thw))
-        placeholder_ids = [
-            t
-            for t in (self.audio_token_id, self.image_token_id, self.video_token_id)
-            if t is not None
-        ]
+            placeholder_ids.append(self.video_token_id)
         fused = merge(text_embed, mod_embeds, placeholder_ids, input_ids, mesh=self.mesh).embed
         return fused, None, None
 

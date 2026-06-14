@@ -44,7 +44,8 @@ logger = logging.getLogger(__name__)
 
 
 class Qwen2_5_VLForConditionalGeneration(nnx.Module):
-    """In-model Qwen2.5-VL: owns the ViT + LLM and merges in-forward (refactor M3)."""
+    """In-model Qwen2.5-VL: owns the ViT + LLM; encode+merge runs once per req on the host
+    encode pass (C-1), not in-forward (refactor M3)."""
 
     # Multimodal capability declarations (mm_core.capability / U3). supported_modalities is the
     # authoritative, method-name-independent declaration (review code-review.md §11.6): is_multimodal
@@ -158,38 +159,34 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
         canonical bucket (None = off); the padded visual rows are then compacted valid-to-front
         so merge fills the real placeholders and drops the trailing bucket padding."""
         text_embed = self.model.embed_tokens(input_ids)
-        visuals = []
-        valids = []
-        if mm_pixel_values is not None:
+
+        def _compact(hidden, valid):
+            # V-2 bucketing: move real rows to the front (stable) so the per-modality scatter --
+            # sized to the padded row count, mode="drop" -- fills the real placeholders in order
+            # and discards the trailing bucket padding. valid is None (bucketing off) -> identity.
+            if valid is None:
+                return hidden
+            n = valid.shape[0]
+            order = jnp.argsort(jnp.where(valid, jnp.arange(n), n + jnp.arange(n)))
+            return hidden[order]
+
+        # Build 1:1 (features, placeholder_id) per PRESENT modality so merge scatters each into its
+        # own placeholder rows -- image and video kept separate (a fused block would cross-wire an
+        # image/video interleaved prompt, review K-1).
+        mod_embeds = []
+        placeholder_ids = []
+        if mm_pixel_values is not None and self.image_token_id is not None:
             hidden, valid = self.encode_image(
                 mm_pixel_values, mm_grid_thw, real_llm_dims=mm_real_llm_dims
             )
-            visuals.append(hidden)
-            valids.append(valid)
-        if mm_pixel_values_videos is not None:
+            mod_embeds.append(_compact(hidden, valid))
+            placeholder_ids.append(self.image_token_id)
+        if mm_pixel_values_videos is not None and self.video_token_id is not None:
             hidden, valid = self.encode_video(
                 mm_pixel_values_videos, mm_video_grid_thw, real_llm_dims=mm_real_video_llm_dims
             )
-            visuals.append(hidden)
-            valids.append(valid)
-        mod_embeds = []
-        if visuals:
-            all_v = jnp.concatenate(visuals, axis=0)
-            # V-2 bucketing: if any modality was padded to a bucket, compact the real rows to the
-            # front (stable) so merge -- whose scatter is sized to the padded row count and uses
-            # mode="drop" -- fills the real placeholders in order and discards the trailing bucket
-            # padding. Off (no real dims): all-True masks -> identity, byte-equivalent.
-            if any(v is not None for v in valids):
-                masks = [
-                    v if v is not None else jnp.ones((h.shape[0],), dtype=bool)
-                    for h, v in zip(visuals, valids)
-                ]
-                all_m = jnp.concatenate(masks, axis=0)
-                n = all_m.shape[0]
-                order = jnp.argsort(jnp.where(all_m, jnp.arange(n), n + jnp.arange(n)))
-                all_v = all_v[order]
-            mod_embeds = [all_v]
-        placeholder_ids = [t for t in (self.image_token_id, self.video_token_id) if t is not None]
+            mod_embeds.append(_compact(hidden, valid))
+            placeholder_ids.append(self.video_token_id)
         fused = merge(text_embed, mod_embeds, placeholder_ids, input_ids, mesh=self.mesh).embed
         return fused, None, None
 
