@@ -162,6 +162,8 @@ jobs:
 
       - name: Setup Python environment
         uses: ./.github/actions/setup-venv
+        with:
+          install-target: python[all,multimodal]
       - name: Evaluate accuracy
         timeout-minutes: 40
         shell: bash
