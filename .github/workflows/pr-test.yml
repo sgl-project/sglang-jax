@@ -162,10 +162,8 @@ jobs:
 
       - name: Setup Python environment
         uses: ./.github/actions/setup-venv
-        with:
-          install-target: python[all,multimodal]
       - name: Evaluate accuracy
-        timeout-minutes: 40
+        timeout-minutes: 20
         shell: bash
         env:
           SGLANG_JAX_IS_IN_CI: true
@@ -193,8 +191,10 @@ jobs:
 
       - name: Setup Python environment
         uses: ./.github/actions/setup-venv
+        with:
+          install-target: python[all,multimodal]
       - name: Evaluate MoE accuracy (TP=4)
-        timeout-minutes: 50
+        timeout-minutes: 90
         shell: bash
         env:
           SGLANG_JAX_IS_IN_CI: true
