@@ -18,6 +18,21 @@ from sgl_jax.srt.utils.quantization.quantization_utils import quantize_tensor
 logger = logging.getLogger(__name__)
 
 
+# Cache the TPU v7x check at the module level to avoid per-call overhead.
+# This guards against the XLA DotStrengthReduction lowering bug described in #1036,
+# which causes a 1-ulp precision mismatch between MXU (FP32) and VPU (BF16) at batch=1.
+_USE_FP32_ACCUM_FOR_TPU_V7X: bool = False
+try:
+    _devs = jax.devices()
+    if len(_devs) > 0 and _devs[0].platform == "tpu":
+        _device_kind = getattr(_devs[0], "device_kind", "")
+        if "7x" in _device_kind or _device_kind == "TPU7x":
+            _USE_FP32_ACCUM_FOR_TPU_V7X = True
+except Exception:
+    pass
+
+
+
 def _shard_map_output_partition_dim(
     sharding: jax.sharding.Sharding, axis_name: str | None
 ) -> int | None:
@@ -101,15 +116,8 @@ class LinearBase(nnx.Module):
         )
 
         preferred_dtype = self.params_dtype
-        try:
-            # Check if running on TPU v7x (Ironwood)
-            devs = jax.devices()
-            if len(devs) > 0 and devs[0].platform == "tpu":
-                device_kind = getattr(devs[0], "device_kind", "")
-                if "7x" in device_kind or device_kind == "TPU7x":
-                    preferred_dtype = jnp.float32
-        except Exception:
-            pass
+        if _USE_FP32_ACCUM_FOR_TPU_V7X:
+            preferred_dtype = jnp.float32
 
         out = lax.dot_general(
             x,
