@@ -10,9 +10,14 @@ Capability attributes a multimodal model class may declare (all optional, sane d
   - ``audio_kind``: ``"codes" | "features" | None`` — replaces the as-is per-item
     runtime flag ``_is_codes_audio`` (design §3.6.2).
   - ``has_deepstack``: ``bool`` — whether :func:`merge` produces a deepstack side-channel.
-  - ``encode_image`` / ``encode_video`` / ``encode_audio`` — per-model tower encoders;
-    their presence also derives ``supported_modalities`` and ``is_multimodal``.
-  - ``supported_modalities`` (optional explicit override of the derivation).
+  - ``supported_modalities`` — the RECOMMENDED authoritative declaration (review code-review.md
+    §11.6): an explicit set/tuple like ``("image", "video", "audio")``. Declaring it decouples
+    capability from method names, so an encoder can be renamed (or video can ride ``encode_image``
+    with no ``encode_video``) without ``is_multimodal`` silently going wrong. ``is_multimodal`` and
+    the modality set derive from it when present.
+  - ``encode_image`` / ``encode_video`` / ``encode_audio`` — per-model tower encoders. When a class
+    does NOT declare ``supported_modalities``, their presence is the fallback derivation of
+    ``supported_modalities`` and ``is_multimodal`` (ergonomic default; method-name dependent).
   - ``is_multimodal`` (optional explicit marker; rarely needed).
 
 Pure python — unit-testable on any interpreter.

@@ -43,6 +43,9 @@ logger = logging.getLogger(__name__)
 class MiMoV2_5ForConditionalGeneration(nnx.Module):
     """MiMo-V2.5 image/video + RVQ-audio understanding, text-out, in-model on the standard scheduler."""
 
+    # Authoritative capability declaration (mm_core.capability / U3, review §11.6). Video is encoded
+    # via encode_image (no separate encode_video method), so declare the set explicitly.
+    supported_modalities = ("image", "video", "audio")
     audio_kind = "codes"  # RVQ discrete codes (vs Qwen3-Omni's continuous "features")
     has_deepstack = False
 

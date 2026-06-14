@@ -164,11 +164,14 @@ class ModelConfig:
         # text-only backbone (mirrors the draft-model remaps above; mutually exclusive with them).
         # Text-only MiMoV2 (no vision_config) stays the backbone.
         #
-        # TODO(M6 收口): this static remap is a THIRD dispatch mechanism alongside the
-        # `is_multimodal_model(hf_config)` config-proxy and the wrapper's capability triple. Its
-        # semantics ("checkpoint declares the AR arch name but the class to build is the MM wrapper")
-        # belong in the ModelRegistry resolution layer; fold it in when §3.5.5 capability delegation
-        # lands so model_config stops mutating architectures[0].
+        # TODO(M6 收口): this static remap is a config-key dispatch ("checkpoint declares the AR arch
+        # name but nests vision_config, so build the MM wrapper instead"). It runs BEFORE
+        # is_multimodal_model below, which is why that function (now capability-first) sees the
+        # wrapper arch and resolves the right class. The remap itself still carries the same
+        # flat-config blind spot the capability rewrite removed from is_multimodal (a MiMo-like
+        # checkpoint without vision_config would not remap); its semantics belong in the
+        # ModelRegistry resolution layer -- fold it in so model_config stops mutating
+        # architectures[0]. (review code-review.md §11)
         if (
             not is_draft_model
             and self.hf_config.architectures
@@ -828,25 +831,62 @@ def is_generation_model(model_architectures: list[str], is_embedding: bool = Fal
 
 
 def is_multimodal_model(hf_config) -> bool:
-    """A checkpoint is multimodal when it carries a vision/audio understanding config.
+    """A model is multimodal iff its served model class declares the capability (review §11).
 
-    Routing on this generic config signal (rather than enumerating model_type strings)
-    keeps the OpenAI omni entry model-agnostic: MiMo-V2.5 omni has top-level
-    vision_config + audio_config, while text-only variants (MiMo-V2.5-Pro/Flash) have
-    neither and stay on the text path. Qwen3-Omni nests vision_config/audio_config under
-    ``thinker_config``, so check that too.
+    Source of truth (U3, design §3.5.1): the per-class capability
+    ``mm_core.capability.is_multimodal_arch(model_cls)`` -- a model is multimodal iff its class
+    declares ``supported_modalities`` / an ``encode_<modality>`` method / an ``is_multimodal``
+    marker. We resolve the served ``architectures[0]`` to its registered model class and read that
+    capability. The ModelRegistry eager-imports every model class at startup, so this is a dict
+    lookup (no extra import cost); it covers 100% of servable models with zero drift -- sgl-jax has
+    no transformers fallback backend (``resolve_model_cls`` raises for any unregistered arch), so
+    every servable model has a native class, and the class that *does* the encoding is the one that
+    declares the capability.
 
-    Single source of truth (U3, design §3.5.1): the PER-CLASS capability declaration
-    ``mm_core.capability.is_multimodal_arch(model_cls)`` (a model is multimodal iff it
-    declares an ``encode_<modality>`` method / explicit marker). This function is the
-    *config-time proxy* of that fact -- it must run before the model class is resolved
-    (tokenizer/serving build ModelConfig early), so it reads the equivalent hf_config
-    signal instead. Agreement between this proxy and the per-class capability is ENFORCED at
-    startup by ``mm_core.capability.reconcile_mm_capability`` (design §3.5.5 ★5), which also
-    asserts every mm-capable registered model has a processor -- so the proxy is a verified
-    stand-in, not an independent third source. (The former standalone ``multimodal_model_archs``
-    enumeration was a third, uncoordinated source and has been removed -- it had no consumers.)
+    The former hf_config-key heuristic (``vision_config``/``audio_config`` present) is a class-free
+    proxy that both false-NEGATIVES on flat-config VLMs (Fuyu / Phi-3.5-vision / Phi-4-multimodal
+    carry no ``vision_config`` -> media silently dropped at request time) and false-POSITIVES on
+    text models whose config auto-injects a vision_config (grok-2). It is kept ONLY as a best-effort
+    fallback for an arch that cannot be resolved to a class -- which means the model is not natively
+    servable and would raise at load anyway. (Upstream sgl keys on an arch-name table because it has
+    a transformers backend serving classless models; sgl-jax has none, so that table -- a third
+    hand-synced source -- is unnecessary and was removed. Full reasoning: code-review.md §9-§11.)
+
+    NB: MiMo-V2.5's ``architectures[0]`` is remapped to the in-model wrapper class name earlier in
+    ``ModelConfig.__init__`` (when its checkpoint nests vision_config), so by the time this runs the
+    arch already names the registered class whose capability we read.
     """
+    archs = getattr(hf_config, "architectures", None) or []
+    cls = _resolve_served_model_cls(archs)
+    if cls is not None:
+        from sgl_jax.srt.mm_core.capability import is_multimodal_arch
+
+        return is_multimodal_arch(cls)
+    # Fallback: arch not in the registry (not natively servable) -> best-effort config-key proxy.
+    return _config_signal_is_multimodal(hf_config)
+
+
+def _resolve_served_model_cls(architectures):
+    """Resolve the first registered model class for ``architectures`` (None if unresolvable).
+
+    Guarded: a ModelConfig built outside a serving context (or a registry import error) must never
+    crash this -- it just falls back to the config-key proxy.
+    """
+    try:
+        from sgl_jax.srt.models.registry import ModelRegistry
+    except Exception:
+        return None
+    for arch in architectures:
+        cls = ModelRegistry.models.get(arch)
+        if isinstance(cls, type):
+            return cls
+    return None
+
+
+def _config_signal_is_multimodal(hf_config) -> bool:
+    """Best-effort class-free fallback (see :func:`is_multimodal_model`): a checkpoint carries a
+    vision/audio understanding config at the top level or nested under ``thinker_config``. Used only
+    for archs not resolvable to a registered class."""
 
     def _has_mm(cfg) -> bool:
         return cfg is not None and (

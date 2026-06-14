@@ -62,6 +62,10 @@ class Qwen3OmniMoeForConditionalGeneration(nnx.Module):
     the Talker (speech-out) is generation-plane and out of scope here.
     """
 
+    # Authoritative capability declaration (mm_core.capability / U3, review §11.6). Video is encoded
+    # via encode_image (no separate encode_video method), so an explicit set is needed -- method-name
+    # derivation would miss video.
+    supported_modalities = ("image", "video", "audio")
     audio_kind = "features"  # continuous mel (vs MiMo's "codes")
     has_deepstack = True
 

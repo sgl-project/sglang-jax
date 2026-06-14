@@ -46,7 +46,10 @@ logger = logging.getLogger(__name__)
 class Qwen2_5_VLForConditionalGeneration(nnx.Module):
     """In-model Qwen2.5-VL: owns the ViT + LLM and merges in-forward (refactor M3)."""
 
-    # Multimodal capability declarations (mm_core.capability / U3).
+    # Multimodal capability declarations (mm_core.capability / U3). supported_modalities is the
+    # authoritative, method-name-independent declaration (review code-review.md §11.6): is_multimodal
+    # and the modality set derive from it, not from probing encode_<modality> names.
+    supported_modalities = ("image", "video")
     audio_kind = None
     has_deepstack = False
 
