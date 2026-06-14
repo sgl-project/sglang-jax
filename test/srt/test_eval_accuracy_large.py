@@ -113,6 +113,7 @@ class TestMMMUProAccuracyLarge(CustomTestCase):
             other_args=[
                 "--trust-remote-code",
                 "--skip-server-warmup",
+                "--multimodal",
                 "--dist-init-addr",
                 "0.0.0.0:10011",
                 "--nnodes",
