@@ -314,6 +314,23 @@ suites = {
         TestFile("test/srt/test_reasoning_parser.py", 0.1),
         TestFile("test/srt/eval/test_simple_eval_common.py", 0.1, runner="pytest"),
         TestFile("test/srt/test_server_info.py", 0.1),
+        # In-model multimodal (understanding) CPU gate tests (review K-18). These were written but
+        # unmounted; run_suite runs each file in its own subprocess, so the sys.modules-stub tests
+        # (K-20) can't cross-contaminate here. merge/assembly/capability/radix/is_multimodal are the
+        # correctness gates for K-1/K-2/M-4/capability-first; the rest are processor/codec units.
+        TestFile("python/sgl_jax/test/multimodal/test_mm_merge.py", 0.1),
+        TestFile("python/sgl_jax/test/multimodal/test_mm_assembly.py", 0.1),
+        TestFile("python/sgl_jax/test/multimodal/test_pad_value.py", 0.1),
+        TestFile("python/sgl_jax/test/multimodal/test_capability.py", 0.1),
+        TestFile("python/sgl_jax/test/multimodal/test_radix_key_ids.py", 0.1),
+        TestFile("python/sgl_jax/test/multimodal/test_is_multimodal_model.py", 0.2),
+        TestFile("python/sgl_jax/test/multimodal/test_processor_registry.py", 0.1),
+        TestFile("python/sgl_jax/test/multimodal/test_qwen_vl_processor_registry.py", 0.1),
+        TestFile("python/sgl_jax/test/multimodal/test_mimo_v25_audio_codec_processor.py", 0.1),
+        TestFile("python/sgl_jax/test/multimodal/test_mimo_v25_audio_codec_v1.py", 0.1),
+        TestFile("python/sgl_jax/test/multimodal/test_mimo_v25_inmodel_processor.py", 0.2),
+        TestFile("python/sgl_jax/test/multimodal/test_mimo_v25_vision_attention.py", 0.2),
+        TestFile("python/sgl_jax/test/multimodal/test_inmodel_qwen25vl.py", 0.2),
     ],
     "unit-test-tpu-v6e-4": [
         TestFile("python/sgl_jax/test/test_mesh.py", 0.4),
