@@ -44,6 +44,61 @@ def _jit_gather_all_layers(buffers, page_indices, out_sharding):
     return [buf.at[page_indices].get(out_sharding=out_sharding) for buf in buffers]
 
 
+def _global_to_local_shard(arr: jax.Array) -> jax.Array:
+    """View this host's addressable shards of a globally-sharded ``arr`` as a
+    fully-addressable array on a 1-D local mesh. Assumes ``arr`` is sharded
+    along exactly one dimension (the KV head axis). Zero-copy.
+    """
+    import numpy as _np
+    from jax.sharding import Mesh as _Mesh
+    from jax.sharding import NamedSharding as _NamedSharding
+    from jax.sharding import PartitionSpec as _P
+
+    spec = arr.sharding.spec
+    sharded_dims = [i for i, s in enumerate(spec) if s is not None]
+    if len(sharded_dims) != 1:
+        raise ValueError(
+            f"_global_to_local_shard expects exactly one sharded dim, got spec={spec}"
+        )
+    sd = sharded_dims[0]
+    ldev = jax.local_devices()
+    shards = [s.data for s in arr.addressable_shards]
+    lshape = tuple(
+        shards[0].shape[i] * len(ldev) if i == sd else shards[0].shape[i]
+        for i in range(arr.ndim)
+    )
+    lmesh = _Mesh(_np.asarray(ldev), ("_local",))
+    lspec = _P(*("_local" if i == sd else None for i in range(arr.ndim)))
+    return jax.make_array_from_single_device_arrays(
+        lshape, _NamedSharding(lmesh, lspec), shards
+    )
+
+
+def local_kv_spec_for_pool(kv_pool, layer_num: int, padded_pages: int) -> jax.ShapeDtypeStruct:
+    """Build the ShapeDtypeStruct that D should pull on a multi-host process:
+    this host's 1/nproc slice of the stacked KV, on a 1-D local mesh.
+    """
+    import numpy as _np
+    from jax.sharding import Mesh as _Mesh
+    from jax.sharding import NamedSharding as _NamedSharding
+    from jax.sharding import PartitionSpec as _P
+
+    pool_pspec = kv_pool.kv_sharding.spec
+    per_layer_tail = kv_pool.kv_buffer[0].shape[1:]
+    gshape = (layer_num, padded_pages) + per_layer_tail
+    gspec = (None, None) + tuple(pool_pspec[1:])
+    sharded_dims = [i for i, s in enumerate(gspec) if s is not None]
+    if len(sharded_dims) != 1:
+        raise ValueError(f"expected one sharded dim in KV spec, got {gspec}")
+    sd = sharded_dims[0]
+    ldev = jax.local_devices()
+    nproc = jax.process_count()
+    lshape = tuple(gshape[i] // nproc if i == sd else gshape[i] for i in range(len(gshape)))
+    lmesh = _Mesh(_np.asarray(ldev), ("_local",))
+    lspec = _P(*("_local" if i == sd else None for i in range(len(gshape))))
+    return jax.ShapeDtypeStruct(lshape, kv_pool.dtype, sharding=_NamedSharding(lmesh, lspec))
+
+
 @dataclass
 class PrefillBookkeeping:
     """Per-request prefill-side state tracked by the Mixin."""
@@ -136,7 +191,9 @@ class SchedulerDisaggregationPrefillMixin:
                     self._comm_backend.wait_for_new_requests(0.001)
 
             self.send_kv_chunk()
-            self.last_batch = batch
+            # PD reqs are finished and released inside process_prefill_chunk;
+            # do not merge them into running_batch.
+            self.last_batch = None if batch and any(r.bootstrap_room is not None for r in batch.reqs) else batch
 
     def process_prefill_chunk(self: Scheduler, batch, result) -> None:
         """Extract KV for PD reqs and hand off to sender."""
@@ -201,8 +258,19 @@ class SchedulerDisaggregationPrefillMixin:
                 )
                 continue
 
-            def _on_terminal(req_obj=req, sender_obj=sender):
-                self._on_prefill_transfer_terminal(req_obj, sender_obj)
+            if jax.process_count() > 1:
+                # The gather output is a fresh buffer, so pool pages can be
+                # released here — the same SPMD point on every NP — keeping
+                # allocator state identical across NPs without a cross-host
+                # control-plane sync. Single-host keeps the original
+                # release-on-ack behaviour.
+                self._release_prefill_req_resources(req)
+                released = True
+            else:
+                released = False
+
+            def _on_terminal(req_obj=req, sender_obj=sender, _released=released):
+                self._on_prefill_transfer_terminal(req_obj, sender_obj, already_released=_released)
 
             self.disagg_prefill_queue.add(req_id, sender, on_terminal=_on_terminal)
 
@@ -238,20 +306,25 @@ class SchedulerDisaggregationPrefillMixin:
         seqlen = len(req.origin_input_ids)
         num_pages = (seqlen + page_size - 1) // page_size
         padded_pages = _pad_to_page_bucket(num_pages)
+        # Only the first num_pages slots of req_to_token are written for this
+        # req; the bucket-padding region holds whatever the previous occupant
+        # left. Slice the real pages and zero-pad so device_put's cross-process
+        # assert_equal sees identical indices on every NP.
         page_id_source = req_to_token[
             req.req_pool_idx,
-            : padded_pages * page_size : page_size,
+            : num_pages * page_size : page_size,
         ]
         import numpy as _np
         from jax.sharding import NamedSharding as _NamedSharding
         from jax.sharding import PartitionSpec as _P
 
-        # Indices must be placed on the same mesh as the KV pool.
+        page_ids = _np.asarray(page_id_source) // page_size
+        if padded_pages > num_pages:
+            page_ids = _np.concatenate(
+                [page_ids, _np.zeros(padded_pages - num_pages, dtype=page_ids.dtype)]
+            )
         idx_sharding = _NamedSharding(kv_pool.mesh, _P(None))
-        page_indices = jax.device_put(
-            _np.asarray(page_id_source) // page_size,
-            idx_sharding,
-        )
+        page_indices = jax.device_put(page_ids, idx_sharding)
         # out_sharding describes the gather output, not the pool.
         pool_pspec = kv_pool.kv_sharding.spec
         gather_pspec = _P(None, *pool_pspec[1:])
@@ -264,7 +337,15 @@ class SchedulerDisaggregationPrefillMixin:
             )
         ]
         layer_kvs = _jit_gather_all_layers(layer_buffers, page_indices, gather_out_sharding)
-        return jnp.stack(layer_kvs, axis=0)
+        stacked = jnp.stack(layer_kvs, axis=0)
+        if jax.process_count() > 1:
+            # The gather output is TP-sharded across the global mesh. Expose
+            # only this host's shard as a fully-addressable local-mesh array;
+            # each P host registers its own 1/nproc slice and the matching D
+            # host (same jax_process_index) pulls exactly that slice.
+            stacked.block_until_ready()
+            return _global_to_local_shard(stacked)
+        return stacked
 
     def _release_prefill_req_resources(self: Scheduler, req: Req) -> None:
         """Release prefill-side KV and request-pool resources."""
@@ -308,7 +389,11 @@ class SchedulerDisaggregationPrefillMixin:
         self._release_prefill_req_resources(req)
 
     def _on_prefill_transfer_terminal(
-        self: Scheduler, req: Req, sender: JaxTransferKVSender
+        self: Scheduler,
+        req: Req,
+        sender: JaxTransferKVSender,
+        *,
+        already_released: bool = False,
     ) -> None:
         try:
             if sender.poll() == KVPoll.SUCCESS:
@@ -317,7 +402,8 @@ class SchedulerDisaggregationPrefillMixin:
                 self._finish_prefill_only_failure(req, sender)
         finally:
             sender.clear()
-            self._release_prefill_req_resources(req)
+            if not already_released:
+                self._release_prefill_req_resources(req)
 
     def _finish_prefill_only_success(self: Scheduler, req: Req) -> None:
         from sgl_jax.srt.managers.schedule_batch import FINISH_LENGTH

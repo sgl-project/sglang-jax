@@ -103,6 +103,8 @@ def install_disaggregation_wiring(scheduler: Scheduler, server_args: ServerArgs)
     )
 
     if mode == "prefill":
+        import jax
+
         scheduler.disagg_prefill_queue = PrefillBootstrapQueue()
         bootstrap_key = f"{local_host}:{transfer_port}"
         scheduler.disagg_bootstrap_client.register_prefill(
@@ -113,6 +115,8 @@ def install_disaggregation_wiring(scheduler: Scheduler, server_args: ServerArgs)
             tp_rank=server_args.node_rank,
             tp_size=server_args.tp_size,
             system_dp_rank=0,
+            jax_process_index=jax.process_index(),
+            jax_process_count=jax.process_count(),
         )
         scheduler.disagg_heartbeat = HeartbeatDaemon(
             scheduler.disagg_bootstrap_client, bootstrap_key
