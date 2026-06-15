@@ -739,6 +739,7 @@ class DeepseekV3ForCausalLM(nnx.Module):
         self.config = config
         self.dtype = dtype
         self.model = DeepseekV3Model(config, mesh=mesh, dtype=dtype)
+        self.hf_weight_prefix = ""
 
         self.lm_head = ParallelLMHead(
             config.vocab_size,
@@ -780,17 +781,17 @@ class DeepseekV3ForCausalLM(nnx.Module):
         is_static_quant = quant_config is not None and quant_config.is_static_checkpoint
 
         mappings = {
-            "model.embed_tokens.weight": WeightMapping(
+            f"{self.hf_weight_prefix}model.embed_tokens.weight": WeightMapping(
                 target_path="model.embed_tokens.embedding",
                 sharding=("tensor", None),
                 transpose=False,
             ),
-            "model.norm.weight": WeightMapping(
+            f"{self.hf_weight_prefix}model.norm.weight": WeightMapping(
                 target_path="model.norm.scale",
                 sharding=(None,),
                 transpose=False,
             ),
-            "lm_head.weight": WeightMapping(
+            f"{self.hf_weight_prefix}lm_head.weight": WeightMapping(
                 target_path="lm_head.embedding",
                 sharding=("tensor", None),
                 transpose=False,
@@ -824,7 +825,7 @@ class DeepseekV3ForCausalLM(nnx.Module):
         use_fused: bool,
         is_static_quant: bool = False,
     ) -> dict:
-        prefix = f"model.layers.{layer_idx}"
+        prefix = f"{self.hf_weight_prefix}model.layers.{layer_idx}"
         target = f"model.layers.{layer_idx}"
         mappings: dict = {}
 
