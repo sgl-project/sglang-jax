@@ -324,6 +324,7 @@ suites = {
         TestFile("python/sgl_jax/test/multimodal/test_capability.py", 0.1),
         TestFile("python/sgl_jax/test/multimodal/test_radix_key_ids.py", 0.1),
         TestFile("python/sgl_jax/test/multimodal/test_is_multimodal_model.py", 0.2),
+        TestFile("python/sgl_jax/test/multimodal/test_qwen_vl_config.py", 0.2),
         TestFile("python/sgl_jax/test/multimodal/test_processor_registry.py", 0.1),
         TestFile("python/sgl_jax/test/multimodal/test_qwen_vl_processor_registry.py", 0.1),
         TestFile("python/sgl_jax/test/multimodal/test_mimo_v25_audio_codec_processor.py", 0.1),

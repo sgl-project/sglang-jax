@@ -9,7 +9,6 @@ from flax import nnx
 from jax.sharding import Mesh
 from transformers import modeling_flax_utils
 
-from sgl_jax.srt.configs.qwen_vl.qwen_2_5_vl_config import QwenVLModelVitConfig
 from sgl_jax.srt.utils.jax_utils import is_tpu_runtime
 
 _FLASH_MHA = None
@@ -176,7 +175,7 @@ class Qwen2_5_VisionRotaryEmbedding(nnx.Module):
 
 
 class Qwen2_5_VisionMLP(nnx.Module):
-    def __init__(self, config: QwenVLModelVitConfig, dtype: jnp.dtype, rngs: nnx.Rngs = None):
+    def __init__(self, config, dtype: jnp.dtype, rngs: nnx.Rngs = None):
         in_features = config.hidden_size
         hidden_features = config.intermediate_size
         act_fn = modeling_flax_utils.ACT2FN[config.hidden_act]
@@ -217,7 +216,7 @@ class Qwen2_5_VisionMLP(nnx.Module):
 class Qwen2_5_VisionAttention(nnx.Module):
     def __init__(
         self,
-        config: QwenVLModelVitConfig,
+        config,
         dtype: jnp.dtype,
         rngs: nnx.Rngs = None,
         mesh: Mesh = None,
@@ -290,7 +289,7 @@ class Qwen2_5_VisionAttention(nnx.Module):
 class Qwen2_5_VisionBlock(nnx.Module):
     def __init__(
         self,
-        config: QwenVLModelVitConfig,
+        config,
         dtype: jnp.dtype,
         rngs: nnx.Rngs = None,
         mesh: Mesh = None,
@@ -372,7 +371,7 @@ class Qwen2_5_VL_VisionTransformer(nnx.Module):
 
     def __init__(
         self,
-        config: QwenVLModelVitConfig,
+        config,
         dtype: jnp.dtype,
         rngs: nnx.Rngs = None,
         mesh: Mesh = None,

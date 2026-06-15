@@ -1,159 +1,99 @@
-"""Qwen-VL vision-config helpers (srt-side).
+"""Qwen-VL vision-config normalization (srt-side, in-model).
 
-Moved out of ``multimodal/configs/config_registry.py`` so the in-model Qwen2.5-VL
-wrapper (``srt/models/qwen2_5VL``) can build its vision config without an
-``srt -> multimodal`` import edge. The generation-side ``config_registry``
-re-imports these helpers (``multimodal -> srt`` is allowed).
+The in-model Qwen2.5-VL wrapper (``srt/models/qwen2_5VL``) builds its ViT directly from the parsed
+HF ``hf_config.vision_config`` -- no per-model dataclass with hardcoded defaults (review code-review
+§2/§13). Variant-varying dims (``hidden_size`` / ``num_heads`` / ``depth`` / ...) MUST come from the
+checkpoint; a missing one RAISES rather than silently using a wrong constant -- the deleted
+``QwenVLModelVitConfig`` defaulted ``hidden_size=3584`` (the 7B post-merger LLM dim), which silently
+loaded then crashed the 7B ViT's patch_embed at first forward. We read the *parsed* vision_config (an
+HF config object, so HF has already filled its own field defaults), so for any real checkpoint every
+field is present with the real value; the raise is a safety net for a genuinely malformed config.
+
+Naming: Qwen2.5-VL checkpoints already use the canonical field names the ViT reads
+(``depth`` / ``num_heads`` / ``out_hidden_size`` / ``fullatt_block_indexes``); the aliases below cover
+sibling Qwen-VL configs. The one field HF's vision_config does not carry is the RMSNorm eps -- a fixed
+architecture constant, not a per-variant dim.
 """
 
-import contextlib
-import json
-import logging
-import os
+from __future__ import annotations
 
-from sgl_jax.srt.configs.qwen_vl.qwen_2_5_vl_config import QwenVLModelVitConfig
+import logging
+from types import SimpleNamespace
 
 logger = logging.getLogger(__name__)
 
+# Qwen2.5-VL vision RMSNorm eps. HF's Qwen2_5_VLVisionConfig does not expose it; preserve the value
+# the M3-validated path used (the old QwenVLModelVitConfig default). NOTE: the merger reads this via
+# the wrapper's norm_eps kwarg and the blocks via config.rms_norm_eps -- keep them in sync here.
+_QWEN_VL_VISION_RMS_NORM_EPS = 1e-5
 
-_QWEN_VL_VISION_KEY_MAP = {
-    "depth": "depth",
-    "num_hidden_layers": "depth",
-    "hidden_size": "hidden_size",
-    "intermediate_size": "intermediate_size",
-    "num_attention_heads": "num_heads",
-    "num_heads": "num_heads",
-    "in_channels": "in_channels",
-    "patch_size": "patch_size",
-    "spatial_merge_size": "spatial_merge_size",
-    "temporal_patch_size": "temporal_patch_size",
-    "tokens_per_second": "tokens_per_second",
-    "window_size": "window_size",
-    "out_hidden_size": "out_hidden_size",
-    "output_hidden_size": "out_hidden_size",
-    "rms_norm_eps": "rms_norm_eps",
-    "initializer_range": "initializer_range",
-    "fullatt_block_indexes": "fullatt_block_indexes",
-    "full_attn_block_indexes": "fullatt_block_indexes",
-}
-_QWEN_VL_VISION_INT_FIELDS = {
-    "depth",
-    "hidden_size",
-    "intermediate_size",
-    "num_heads",
-    "in_channels",
-    "patch_size",
-    "spatial_merge_size",
-    "temporal_patch_size",
-    "tokens_per_second",
-    "window_size",
-    "out_hidden_size",
-}
-_QWEN_VL_VISION_FLOAT_FIELDS = {
-    "initializer_range",
-    "rms_norm_eps",
-}
-_QWEN_VL_VISION_LIST_FIELDS = {
-    "fullatt_block_indexes",
+# Canonical ViT field name -> HF vision_config key(s) it may appear under (first present wins). All
+# are variant-varying dims: a missing one is an error, never defaulted.
+_REQUIRED_INT_FIELDS = {
+    "depth": ("depth", "num_hidden_layers"),
+    "hidden_size": ("hidden_size",),
+    "intermediate_size": ("intermediate_size",),
+    "num_heads": ("num_heads", "num_attention_heads"),
+    "in_channels": ("in_channels", "in_chans"),
+    "patch_size": ("patch_size",),
+    "spatial_merge_size": ("spatial_merge_size",),
+    "temporal_patch_size": ("temporal_patch_size",),
+    "window_size": ("window_size",),
 }
 
 
-def _load_local_config_dict(model_path: str) -> dict | None:
-    if not isinstance(model_path, str):
-        return None
-    config_path = os.path.join(model_path, "config.json")
-    if not os.path.isfile(config_path):
-        return None
-    try:
-        with open(config_path, encoding="utf-8") as f:
-            return json.load(f)
-    except Exception as exc:
-        logger.warning("Failed to read config.json from %s: %s", config_path, exc)
-        return None
+def _first(d: dict, keys):
+    for k in keys:
+        if k in d and d[k] is not None:
+            return d[k]
+    return None
 
 
-def _apply_qwen_vl_vision_overrides(
-    config: QwenVLModelVitConfig, model_path: str
-) -> QwenVLModelVitConfig:
-    config_dict = _load_local_config_dict(model_path)
-    if not config_dict:
-        return config
-
-    vision_cfg = (
-        config_dict.get("vision_config")
-        or config_dict.get("vision_config_dict")
-        or config_dict.get("vision_cfg")
-    )
-    if not isinstance(vision_cfg, dict):
-        return config
-
-    updated_fields: set[str] = set()
-    for src_key, dst_attr in _QWEN_VL_VISION_KEY_MAP.items():
-        if src_key not in vision_cfg:
-            continue
-        value = vision_cfg[src_key]
-        if dst_attr in _QWEN_VL_VISION_INT_FIELDS:
-            with contextlib.suppress(Exception):
-                value = int(value)
-        elif dst_attr in _QWEN_VL_VISION_FLOAT_FIELDS:
-            with contextlib.suppress(Exception):
-                value = float(value)
-        elif dst_attr in _QWEN_VL_VISION_LIST_FIELDS and not isinstance(value, list):
-            value = list(value)
-        setattr(config, dst_attr, value)
-        updated_fields.add(dst_attr)
-
-    if (
-        "out_hidden_size" not in updated_fields
-        and (top_hidden_size := config_dict.get("hidden_size")) is not None
-    ):
-        with contextlib.suppress(Exception):
-            top_hidden_size = int(top_hidden_size)
-        config.out_hidden_size = top_hidden_size
-
-    if updated_fields:
-        logger.info("Loaded QwenVL vision config overrides from %s", model_path)
-    return config
-
-
-def qwen_vl_vision_config_from_hf(hf_config) -> QwenVLModelVitConfig:
-    """Build a QwenVLModelVitConfig from a parsed HF Qwen2.5-VL config object.
-
-    Mirrors :func:`_apply_qwen_vl_vision_overrides` but sources the already-parsed
-    ``hf_config.vision_config`` (robust to ``model_path`` being a hub id rather than a
-    local dir). Used by the in-model Qwen2.5-VL (refactor M3): without this override the
-    bare ``QwenVLModelVitConfig()`` default ``hidden_size=3584`` is wrong for the 7B ViT
-    (real vision width is 1280; 3584 is the post-merger LLM dim), so the ViT patch_embed
-    reshape fails. ``out_hidden_size`` falls back to the top-level ``hidden_size``.
+def normalize_qwen_vl_vision_config(hf_config) -> SimpleNamespace:
+    """Normalize the parsed HF Qwen2.5-VL ``vision_config`` into the attribute set the in-model ViT
+    reads. Sources every value from the checkpoint (no value defaults for variant dims -- a missing
+    one raises). ``out_hidden_size`` falls back to the top-level LLM ``hidden_size`` (merger out dim
+    == LLM in dim). ``rms_norm_eps`` is the one HF-absent architecture constant. Returns a
+    SimpleNamespace so the ViT keeps reading ``config.<field>``.
     """
-    config = QwenVLModelVitConfig()
     vision = getattr(hf_config, "vision_config", None)
     if vision is None:
-        return config
-    vision_cfg = vision.to_dict() if hasattr(vision, "to_dict") else dict(vars(vision))
-    if not isinstance(vision_cfg, dict):
-        return config
+        raise ValueError(
+            "Qwen2.5-VL hf_config has no vision_config -- cannot build the in-model ViT "
+            "(a text-only checkpoint must not reach the VLM wrapper)."
+        )
+    vcfg = vision.to_dict() if hasattr(vision, "to_dict") else dict(vars(vision))
 
-    updated_fields: set[str] = set()
-    for src_key, dst_attr in _QWEN_VL_VISION_KEY_MAP.items():
-        if src_key not in vision_cfg:
-            continue
-        value = vision_cfg[src_key]
-        if dst_attr in _QWEN_VL_VISION_INT_FIELDS:
-            with contextlib.suppress(Exception):
-                value = int(value)
-        elif dst_attr in _QWEN_VL_VISION_FLOAT_FIELDS:
-            with contextlib.suppress(Exception):
-                value = float(value)
-        elif dst_attr in _QWEN_VL_VISION_LIST_FIELDS and not isinstance(value, list):
-            value = list(value)
-        setattr(config, dst_attr, value)
-        updated_fields.add(dst_attr)
+    out: dict = {}
+    for field, keys in _REQUIRED_INT_FIELDS.items():
+        val = _first(vcfg, keys)
+        if val is None:
+            raise ValueError(
+                f"Qwen2.5-VL vision_config is missing required field {field!r} (looked under "
+                f"{keys}); refusing to guess a default (the old hidden_size=3584 default was the "
+                "bug this removes)."
+            )
+        out[field] = int(val)
 
-    if "out_hidden_size" not in updated_fields:
-        top_hidden_size = getattr(hf_config, "hidden_size", None)
-        if top_hidden_size is not None:
-            with contextlib.suppress(Exception):
-                top_hidden_size = int(top_hidden_size)
-            config.out_hidden_size = top_hidden_size
-    return config
+    # hidden_act: present in HF vision_config (e.g. "silu").
+    out["hidden_act"] = _first(vcfg, ("hidden_act",)) or "silu"
+
+    # out_hidden_size (merger output dim): read, else fall back to the top-level LLM hidden_size.
+    out_hidden = _first(vcfg, ("out_hidden_size", "output_hidden_size"))
+    if out_hidden is None:
+        out_hidden = getattr(hf_config, "hidden_size", None)
+    if out_hidden is None:
+        raise ValueError(
+            "Qwen2.5-VL: neither vision_config.out_hidden_size nor top-level hidden_size present."
+        )
+    out["out_hidden_size"] = int(out_hidden)
+
+    # fullatt_block_indexes: windowed-attention full-attn layer indices.
+    fullatt = _first(vcfg, ("fullatt_block_indexes", "full_attn_block_indexes"))
+    out["fullatt_block_indexes"] = list(fullatt) if fullatt is not None else []
+
+    # rms_norm_eps: HF vision_config omits it -> fixed architecture constant.
+    eps = _first(vcfg, ("rms_norm_eps",))
+    out["rms_norm_eps"] = float(eps) if eps is not None else _QWEN_VL_VISION_RMS_NORM_EPS
+
+    return SimpleNamespace(**out)
