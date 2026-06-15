@@ -16,10 +16,10 @@ Reuses the existing ViT tower (`Qwen2_5_VL_VisionTransformer`) and the AR LLM bo
 See design doc §3.3 and tmp/refactor/m3-plan.md.
 
 NOTE (validation status): import / construct(eval_shape) / weight-load are validated on
-the TPU dev pod. The vision config is read directly from the checkpoint's parsed vision_config
-via normalize_qwen_vl_vision_config (hidden_size=1280 for 7B; no per-model defaults -- a missing
-dim raises instead of the old 3584 trap that broke the patch_embed reshape). ViT
-precompile/HBM behaviour (m3-plan risk 1) is observed via the encode+merge forward smoke.
+the TPU dev pod. The vision tower consumes the native HF ``Qwen2_5_VLVisionConfig`` directly
+(upstream-aligned; no per-model dataclass, no defaults), so the 7B vision width (1280) comes
+straight from the checkpoint. ViT precompile/HBM behaviour (m3-plan risk 1) is observed via the
+encode+merge forward smoke.
 """
 
 import logging
@@ -29,7 +29,6 @@ import jax.numpy as jnp
 from flax import nnx
 
 from sgl_jax.srt.configs.model_config import ModelConfig
-from sgl_jax.srt.configs.qwen_vl.config_helpers import normalize_qwen_vl_vision_config
 from sgl_jax.srt.hf_transformers_utils import get_hf_text_config
 from sgl_jax.srt.layers.embeddings import ParallelLMHead
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
@@ -61,17 +60,19 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
         self.text_config = get_hf_text_config(config) or config
         self.dtype = dtype or jnp.bfloat16
 
-        # ViT tower (reused as-is). Vision config is read directly from the checkpoint's parsed
-        # vision_config (hidden_size=1280 for 7B), with NO per-model defaults -- the deleted
-        # QwenVLModelVitConfig defaulted hidden_size=3584 (post-merger LLM dim) and broke the 7B
-        # patch_embed; normalize_qwen_vl_vision_config raises on a missing dim instead.
-        self.vision_config = normalize_qwen_vl_vision_config(config)
+        # ViT tower. Aligned with upstream sglang (models/qwen2_5_vl.py): the vision tower consumes
+        # the native HF ``Qwen2_5_VLVisionConfig`` directly -- no per-model dataclass, no field
+        # renaming, no overridden defaults (review code-review §2/§13). The ViT reads the canonical
+        # HF field names (depth/hidden_size/num_heads/out_hidden_size/fullatt_block_indexes/...).
+        # The RMSNorm eps is NOT in vision_config; upstream passes the top-level rms_norm_eps
+        # (fallback 1e-6) as norm_eps, which the blocks + merger use.
+        self.vision_config = config.vision_config
         self.visual = Qwen2_5_VL_VisionTransformer(
             config=self.vision_config,
             dtype=self.dtype,
             rngs=None,
             mesh=mesh,
-            norm_eps=getattr(self.vision_config, "rms_norm_eps", 1e-6),
+            norm_eps=getattr(config, "rms_norm_eps", 1e-6),
         )
 
         # AR LLM body (reused as-is; reads forward_batch.input_embedding).

@@ -293,11 +293,12 @@ class Qwen2_5_VisionBlock(nnx.Module):
         dtype: jnp.dtype,
         rngs: nnx.Rngs = None,
         mesh: Mesh = None,
+        norm_eps: float = 1e-6,
     ):
         dim = config.hidden_size
         norm_layer = partial(
             nnx.RMSNorm,
-            epsilon=config.rms_norm_eps,
+            epsilon=norm_eps,
             scale_init=nnx.with_partitioning(init_fn, (None,)),
         )
 
@@ -399,6 +400,7 @@ class Qwen2_5_VL_VisionTransformer(nnx.Module):
                     dtype=dtype,
                     rngs=rngs,
                     mesh=mesh,
+                    norm_eps=norm_eps,
                 )
                 for _ in range(config.depth)
             ]
