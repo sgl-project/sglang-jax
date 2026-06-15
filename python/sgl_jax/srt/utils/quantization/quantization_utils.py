@@ -195,6 +195,9 @@ def apply_linear_quantization(
                             activation_dtype=rule["activation_dtype"],
                             is_static_input=is_static_input,
                             weight_block_size=rule["weight_block_size"],
+                            allow_narrow_n_blockwise=getattr(
+                                quant_config, "allow_narrow_n_blockwise", False
+                            ),
                         )
                         # Replace the attribute and free old weights
                         setattr(obj, attr_name, quantized_linear)
@@ -242,6 +245,19 @@ def apply_moe_quantization(
     # Walk through the model and quantize all EPMoE/FusedEPMoE modules
     # Models with MoE typically have: model.model.layers[i].block_sparse_moe.experts
     # or similar structure. We recursively search for EPMoE/FusedEPMoE instances.
+    ignored_layers = quant_config.ignored_layers or []
+
+    def _is_ignored(log_path: str) -> bool:
+        if not ignored_layers:
+            return False
+        # Walker emits paths like "model/layers[5]/mlp" — normalize to dot
+        # form ("model.layers.5.mlp") so it can be compared against HF
+        # ignore entries which use dot notation.
+        normalized = log_path.replace("/", ".")
+        normalized = re.sub(r"\.\[(\d+)\]", r".\1", normalized)
+        normalized = re.sub(r"\[(\d+)\]", r".\1", normalized)
+        return any(normalized == ig or normalized.endswith(f".{ig}") for ig in ignored_layers)
+
     def _quantize_moe_recursive(obj, path: str = "", visited=None):
         if visited is None:
             visited = set()
@@ -253,6 +269,9 @@ def apply_moe_quantization(
 
         if isinstance(obj, (EPMoE, FusedEPMoE)):
             log_path = path or obj.name
+            if _is_ignored(log_path):
+                logger.info("Skipping MoE quantization for %s (matched ignored_layers)", log_path)
+                return
             logger.debug("Quantizing MoE weights path=%s", log_path)
             obj.quantize_weights(is_static=is_static_input)
             return

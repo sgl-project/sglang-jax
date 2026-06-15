@@ -105,6 +105,27 @@ class QuantizationConfig:
     is_static_checkpoint: bool = False
     ignored_layers: list[str] | None = None
     weight_block_size: tuple[int, int] | None = None
+    allow_narrow_n_blockwise: bool = False
+
+    def to_dict(self) -> dict:
+        # Required by transformers.PretrainedConfig.to_json_string when this
+        # object is attached as hf_config.quantization_config and the config is
+        # repr'd (e.g. inside JAX_EXPLAIN_CACHE_MISSES diagnostics).
+        return {
+            "linear_rules": self.linear_rules,
+            "moe_weight_dtype": (
+                str(self.moe_weight_dtype) if self.moe_weight_dtype is not None else None
+            ),
+            "moe_activation_dtype": (
+                str(self.moe_activation_dtype) if self.moe_activation_dtype is not None else None
+            ),
+            "is_static_checkpoint": self.is_static_checkpoint,
+            "ignored_layers": self.ignored_layers,
+            "weight_block_size": (
+                list(self.weight_block_size) if self.weight_block_size is not None else None
+            ),
+            "allow_narrow_n_blockwise": self.allow_narrow_n_blockwise,
+        }
 
     @classmethod
     def from_yaml(cls, yaml_path: str) -> "QuantizationConfig":
@@ -159,6 +180,7 @@ class QuantizationConfig:
         moe_activation_dtype = _str_to_dtype(moe_section.get("activation_dtype"))
         is_static_checkpoint = quant.get("is_static_checkpoint", False)
         weight_block_size = normalize_weight_block_size(quant.get("weight_block_size"))
+        allow_narrow_n_blockwise = quant.get("allow_narrow_n_blockwise", False)
 
         return cls(
             linear_rules=linear_rules,
@@ -167,6 +189,7 @@ class QuantizationConfig:
             is_static_checkpoint=is_static_checkpoint,
             ignored_layers=ignored_layers,
             weight_block_size=weight_block_size,
+            allow_narrow_n_blockwise=allow_narrow_n_blockwise,
         )
 
     @classmethod

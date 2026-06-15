@@ -58,9 +58,6 @@ class TestParamsValidation(CustomTestCase):
                 "--context-length",
                 "1000",
             ],
-            env={
-                "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
-            },
         )
 
     @classmethod

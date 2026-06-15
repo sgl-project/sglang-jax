@@ -6,6 +6,8 @@ import jax
 import jax.lax
 from flax import nnx
 from jax import numpy as jnp
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig
@@ -31,8 +33,10 @@ from sgl_jax.srt.layers.logits_processor import (
 )
 from sgl_jax.srt.layers.moe import EPMoE, create_moe_weights_mapping
 from sgl_jax.srt.layers.radix_attention import RadixAttention
-from sgl_jax.srt.mem_cache.memory_pool import KVCache
+from sgl_jax.srt.mem_cache.memory_pool import KVCache, MemoryPools
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+from sgl_jax.srt.utils.debug_utils import log_shardings
+from sgl_jax.srt.utils.parallel_utils import make_reduce_sharding
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
@@ -165,6 +169,8 @@ class Grok1MLP(nnx.Module):
         mesh: jax.sharding.Mesh,
         dtype: jnp.dtype = jnp.bfloat16,
         reduce_results: bool = True,
+        enable_sequence_parallel: bool = False,
+        input_sharding: jax.sharding.Sharding | None = None,
     ) -> None:
         super().__init__()
 
@@ -195,12 +201,20 @@ class Grok1MLP(nnx.Module):
         self.act_fn = GeluAndMul(approximate="tanh")
         self.layer_id = layer_id
         self.reduce_results = reduce_results
+        self.mesh = mesh
+        self.enable_sequence_parallel = enable_sequence_parallel
+        self.input_sharding = input_sharding
 
+    @log_shardings("GrokMLP")
     def __call__(self, x: jax.Array) -> jax.Array:
-        gate, _ = self.gate_proj(x)
-        up, _ = self.up_proj(x)
+        if self.input_sharding is not None:
+            x = jax.sharding.reshard(x, self.input_sharding)
+
+        gate, _ = self.gate_proj(x, out_sharding=NamedSharding(self.mesh, P("data", "tensor")))
+        up, _ = self.up_proj(x, out_sharding=NamedSharding(self.mesh, P("data", "tensor")))
         x, _ = self.act_fn(gate, up)
-        x, _ = self.down_proj(x)
+        down_target = make_reduce_sharding(x, self.mesh, enable_sp=self.enable_sequence_parallel)
+        x, _ = self.down_proj(x, out_sharding=down_target)
         return x
 
 
@@ -223,6 +237,7 @@ class Grok1MoE(nnx.Module):
         intermediate_size: int,
         mesh: jax.sharding.Mesh,
         dtype: jnp.dtype = jnp.bfloat16,
+        input_sharding: jax.sharding.Sharding | None = None,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -230,6 +245,7 @@ class Grok1MoE(nnx.Module):
         self.top_k = top_k
         self.layer_id = layer_id
         self.mesh = mesh
+        self.input_sharding = input_sharding
 
         # Gate always runs at full precision for stability
         # (see https://arxiv.org/pdf/2101.03961)
@@ -277,14 +293,30 @@ class Grok1MoE(nnx.Module):
                 layer_id=layer_id,
                 quantization_config=getattr(config, "quantization_config", None),
             )
+        self.enable_sequence_parallel = getattr(config, "enable_sequence_parallel", False)
 
+    @log_shardings("GrokMoE")
     def __call__(
         self,
         hidden_states: jax.Array,
         dispatch_info: ExpertLocationMetadata | None = None,
     ) -> tuple[jax.Array, jax.Array | None]:
-        # Router computation with soft capping
-        router_logits, _ = self.gate(hidden_states)
+        hidden_states = (
+            jax.sharding.reshard(hidden_states, self.input_sharding)
+            if self.input_sharding is not None
+            else hidden_states
+        )
+
+        # Per-call SP target: respects should_scatter threshold so small
+        # batches (decode) gracefully fall back to DP.
+        experts_out_sharding = make_reduce_sharding(
+            hidden_states, self.mesh, enable_sp=self.enable_sequence_parallel
+        )
+
+        # Router computation with soft capping. Match the gate output to the
+        # experts' token-dim sharding so router_logits / topk arrays land on the
+        # same axis as ``hidden_states`` going into the fused MoE kernel.
+        router_logits, _ = self.gate(hidden_states, out_sharding=experts_out_sharding)
 
         # Apply soft capping for stability (matching sglang implementation)
         if self.router_logit_softcapping != 0:
@@ -305,11 +337,27 @@ class Grok1MoE(nnx.Module):
         if self.use_fused:
             # Fused kernel: pass pre-computed topk_weights/indices
             assert isinstance(self.experts, FusedEPMoE)
-            return self.experts(hidden_states, top_k_weights, top_k_indices), top_k_indices
+            return (
+                self.experts(
+                    hidden_states,
+                    top_k_weights,
+                    top_k_indices,
+                    out_sharding=experts_out_sharding,
+                ),
+                top_k_indices,
+            )
         else:
             # EPMoE: pass pre-computed topk_weights/indices
             assert isinstance(self.experts, EPMoE)
-            return self.experts(hidden_states, top_k_weights, top_k_indices), top_k_indices
+            return (
+                self.experts(
+                    hidden_states,
+                    top_k_weights,
+                    top_k_indices,
+                    out_sharding=experts_out_sharding,
+                ),
+                top_k_indices,
+            )
 
     def _custom_topk(
         self,
@@ -381,6 +429,8 @@ class Grok1Attention(nnx.Module):
         layer_id: int = 0,
         max_position: int = 4096 * 32,
         rope_theta: float = 10000,
+        enable_sequence_parallel: bool = False,
+        input_sharding: jax.sharding.Sharding | None = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -396,6 +446,8 @@ class Grok1Attention(nnx.Module):
         self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
         self.mesh = mesh
+        self.enable_sequence_parallel = enable_sequence_parallel
+        self.input_sharding = input_sharding
 
         rope_scaling = get_rope_scaling(config)
         self.rope_rotate_half_dims = getattr(config, "rope_rotate_half_dims", False)
@@ -472,6 +524,7 @@ class Grok1Attention(nnx.Module):
         )
         self.attn.xai_temperature_len = getattr(config, "attn_temperature_len", -1)
 
+    @log_shardings("GrokAttention")
     def __call__(
         self,
         positions: jax.Array,
@@ -483,24 +536,73 @@ class Grok1Attention(nnx.Module):
         if hidden_states.shape[0] == 0:
             return hidden_states, hidden_states
 
+        hidden_states = (
+            jax.sharding.reshard(hidden_states, self.input_sharding)
+            if self.input_sharding is not None
+            else hidden_states
+        )
+
         # Project Q, K, V separately
-        q, _ = self.q_proj(hidden_states)
-        k, _ = self.k_proj(hidden_states)
-        v, _ = self.v_proj(hidden_states)
+        q, _ = self.q_proj(
+            hidden_states, out_sharding=NamedSharding(self.mesh, P("data", "tensor"))
+        )
+        k, _ = self.k_proj(
+            hidden_states, out_sharding=NamedSharding(self.mesh, P("data", "tensor"))
+        )
+        v, _ = self.v_proj(
+            hidden_states, out_sharding=NamedSharding(self.mesh, P("data", "tensor"))
+        )
 
         # Apply rotary position embeddings
         q, k = self.rotary_emb(positions, q, k)
 
-        q = q.reshape(-1, self.num_heads, self.head_dim)
-        k = k.reshape(-1, self.num_kv_heads, self.head_dim)
-        v = v.reshape(-1, self.num_kv_heads, self.head_dim)
+        q = q.reshape(
+            -1,
+            self.num_heads,
+            self.head_dim,
+            out_sharding=NamedSharding(
+                self.mesh,
+                P(
+                    "data",
+                    "tensor",
+                ),
+            ),
+        )
+        k = k.reshape(
+            -1,
+            self.num_kv_heads,
+            self.head_dim,
+            out_sharding=NamedSharding(
+                self.mesh,
+                P(
+                    "data",
+                    "tensor",
+                ),
+            ),
+        )
+        v = v.reshape(
+            -1,
+            self.num_kv_heads,
+            self.head_dim,
+            out_sharding=NamedSharding(
+                self.mesh,
+                P(
+                    "data",
+                    "tensor",
+                ),
+            ),
+        )
 
         # Apply attention (backend may return tuple)
         attn_ret, kv_fused = self.attn(q, k, v, forward_batch, token_to_kv_pool)
         attn_output = attn_ret[0] if isinstance(attn_ret, tuple) else attn_ret
 
         # Project output
-        output, _ = self.o_proj(attn_output)
+        o_target = make_reduce_sharding(
+            attn_output, self.mesh, enable_sp=self.enable_sequence_parallel
+        )
+        output, _ = self.o_proj(attn_output, out_sharding=o_target)
+
         return output, kv_fused
 
 
@@ -522,6 +624,16 @@ class Grok1DecoderLayer(nnx.Module):
 
         # Self-attention
         rope_theta = getattr(config, "rope_theta", 10000)
+        enable_sequence_parallel = getattr(config, "enable_sequence_parallel", False)
+        self.enable_sequence_parallel = enable_sequence_parallel
+        # Don't force-replicate inputs at sub-module entry: when SP is on, the
+        # caller hands us hidden_states already on the SP-scattered layout, and
+        # downstream LinearBase / FusedEPMoE rely on the same axis being carried
+        # all the way through (matches qwen3_moe / mimo_v2_flash). An explicit
+        # reshard to P() here would drop that alignment and force the fused MoE
+        # kernel to consume hidden_states on a different physical layout than
+        # topk arrays, which is what triggered the v8/v10 TPU HandleFatalError.
+        block_input_sharding = None
         self.self_attn = Grok1Attention(
             config=config,
             hidden_size=self.hidden_size,
@@ -535,6 +647,8 @@ class Grok1DecoderLayer(nnx.Module):
             layer_id=layer_id,
             rope_theta=rope_theta,
             mesh=mesh,
+            enable_sequence_parallel=enable_sequence_parallel,
+            input_sharding=block_input_sharding,
         )
 
         # Feed-forward networks
@@ -556,6 +670,7 @@ class Grok1DecoderLayer(nnx.Module):
                 hidden_size=config.hidden_size,
                 intermediate_size=intermediate_size,
                 mesh=mesh,
+                input_sharding=block_input_sharding,
             )
             if self.residual_moe:
                 self.mlp = Grok1MLP(
@@ -564,6 +679,8 @@ class Grok1DecoderLayer(nnx.Module):
                     layer_id=layer_id,
                     reduce_results=False,
                     mesh=mesh,
+                    enable_sequence_parallel=enable_sequence_parallel,
+                    input_sharding=block_input_sharding,
                 )
         else:
             raise NotImplementedError()
@@ -621,6 +738,9 @@ class Grok1DecoderLayer(nnx.Module):
         deferred_norm: RMSNorm | None = None,
         dispatch_info: ExpertLocationMetadata | None = None,
     ) -> tuple[jax.Array, jax.Array, RMSNorm, jax.Array, jax.Array | None]:
+        reduce_sharding = make_reduce_sharding(
+            hidden_states, self.mesh, enable_sp=self.enable_sequence_parallel
+        )
 
         # Self Attention block (matching PyTorch logic exactly)
         if deferred_norm is not None:
@@ -647,6 +767,9 @@ class Grok1DecoderLayer(nnx.Module):
             token_to_kv_pool=token_to_kv_pool,
         )
 
+        # Align residual with attn output sharding before the fused add inside dual_rmsnorm_forward.
+        residual = jax.sharding.reshard(residual, reduce_sharding)
+
         # # Apply post-attention norm and pre-MoE norm (matching PyTorch fused_dual_residual_rmsnorm)
         assert self.post_attn_norm.scale is not None
         assert self.pre_moe_norm.scale is not None
@@ -667,8 +790,16 @@ class Grok1DecoderLayer(nnx.Module):
                 dispatch_info=dispatch_info,
             )
 
+        residual = jax.sharding.reshard(residual, reduce_sharding)
+
         # Return with deferred post-MoE norm (matching PyTorch)
-        return hidden_states, residual, self.post_moe_norm, kv_fused, topk_ids
+        return (
+            hidden_states,
+            residual,
+            self.post_moe_norm,
+            kv_fused,
+            topk_ids,
+        )
 
 
 class Grok1Model(nnx.Module):
@@ -843,22 +974,28 @@ class Grok1ForCausalLM(nnx.Module):
     def __call__(
         self,
         forward_batch: ForwardBatch,
-        token_to_kv_pool: KVCache,
+        memory_pools: MemoryPools,
         logits_metadata: LogitsMetadata,
-    ) -> tuple[LogitsProcessorOutput, list[jax.Array], bool, list[jax.Array | None]]:
+    ) -> tuple[LogitsProcessorOutput, dict, bool, list[jax.Array | None]]:
         """Forward pass through the model using unified forward_batch API."""
+        kv_pool = memory_pools.token_to_kv_pool
         input_ids = forward_batch.input_ids
         positions = forward_batch.positions
         hidden_states, layers_kv_fused, layers_topk_ids = self.model(
             input_ids,
             positions,
             forward_batch,
-            token_to_kv_pool,
+            kv_pool,
             None,
         )
+
+        # Unshard activations if sequence parallel enabled, otherwise no-op
+        with jax.sharding.use_abstract_mesh(self.mesh.abstract_mesh):
+            hidden_states = jax.sharding.reshard(hidden_states, jax.sharding.PartitionSpec(None))
+
         output = self.logits_processor(hidden_states, cast(Embed, self.lm_head), logits_metadata)
 
-        return output, layers_kv_fused, True, layers_topk_ids
+        return output, {"token_to_kv_pool": layers_kv_fused}, True, layers_topk_ids
 
     def load_weights(self, model_config: ModelConfig) -> None:
         loader = WeightLoader(

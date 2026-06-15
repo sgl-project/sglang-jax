@@ -4,6 +4,8 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 from flax import nnx
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig
@@ -12,7 +14,7 @@ from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.layers.radix_attention import RadixAttention
-from sgl_jax.srt.mem_cache.memory_pool import KVCache
+from sgl_jax.srt.mem_cache.memory_pool import KVCache, MemoryPools
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.precision_tracer import precision_tracer
 from sgl_jax.srt.utils.profiling_utils import named_scope
@@ -48,6 +50,7 @@ class QWen3Attention(nnx.Module):
         self.q_size = num_heads * self.head_dim
         self.kv_size = num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
+        self.mesh = mesh
 
         self.q_norm = RMSNorm(
             self.head_dim, epsilon=rms_norm_eps, param_dtype=dtype, scope_name="q_norm"
@@ -116,14 +119,31 @@ class QWen3Attention(nnx.Module):
         hidden_states: jax.Array,
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
+        *,
+        out_sharding: jax.sharding.Sharding | None = None,
     ) -> jax.Array:
         q, _ = self.q_proj(hidden_states)
         k, _ = self.k_proj(hidden_states)
         v, _ = self.v_proj(hidden_states)
 
-        q = q.reshape(-1, self.q_head_num, self.head_dim)
-        k = k.reshape(-1, self.kv_head_num, self.head_dim)
-        v = v.reshape(-1, self.kv_head_num, self.head_dim)
+        q = q.reshape(
+            -1,
+            self.q_head_num,
+            self.head_dim,
+            out_sharding=NamedSharding(self.mesh, P("data", "tensor", None)),
+        )
+        k = k.reshape(
+            -1,
+            self.kv_head_num,
+            self.head_dim,
+            out_sharding=NamedSharding(self.mesh, P("data", "tensor", None)),
+        )
+        v = v.reshape(
+            -1,
+            self.kv_head_num,
+            self.head_dim,
+            out_sharding=NamedSharding(self.mesh, P("data", "tensor", None)),
+        )
 
         q = self.q_norm(q)
         k = self.k_norm(k)
@@ -131,7 +151,7 @@ class QWen3Attention(nnx.Module):
         q, k = self.rotary_emb(positions, q, k)
         attn_output, kv_fused = self.attn(q, k, v, forward_batch, token_to_kv_pool)
 
-        output, _ = self.o_proj(attn_output)
+        output, _ = self.o_proj(attn_output, out_sharding=out_sharding)
         return output, kv_fused
 
 
@@ -179,11 +199,16 @@ class Qwen3MLP(nnx.Module):
         self.act_fn = jax.nn.silu
 
     @named_scope
-    def __call__(self, hidden_states: jnp.ndarray):
+    def __call__(
+        self,
+        hidden_states: jnp.ndarray,
+        *,
+        out_sharding: jax.sharding.Sharding | None = None,
+    ):
         a1, _ = self.gate_proj(hidden_states)
         a2, _ = self.up_proj(hidden_states)
         intermediate_parallel = a2 * self.act_fn(a1)
-        output, _ = self.down_proj(intermediate_parallel)
+        output, _ = self.down_proj(intermediate_parallel, out_sharding=out_sharding)
         return output
 
 
@@ -552,11 +577,12 @@ class Qwen3ForCausalLM(nnx.Module):
     def __call__(
         self,
         forward_batch: ForwardBatch,
-        token_to_kv_pool: KVCache,
+        memory_pools: MemoryPools,
         logits_metadata: LogitsMetadata,
     ):
+        kv_pool = memory_pools.token_to_kv_pool
         hidden_states, aux_hidden_states, layers_kv_fused, layers_callback_flag = self.model(
-            forward_batch, token_to_kv_pool
+            forward_batch, kv_pool
         )
         if not getattr(self.config, "tie_word_embeddings", False):
             output = self.logits_processor(
@@ -570,7 +596,7 @@ class Qwen3ForCausalLM(nnx.Module):
                 aux_hidden_states=aux_hidden_states,
             )
 
-        return output, layers_kv_fused, layers_callback_flag, None
+        return output, {"token_to_kv_pool": layers_kv_fused}, layers_callback_flag, None
 
 
 EntryClass = Qwen3ForCausalLM

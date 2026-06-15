@@ -12,20 +12,20 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from sgl_jax.srt.utils import kill_process_tree
 from sgl_jax.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
+    QWEN3_8B,
     CustomTestCase,
     popen_launch_server,
 )
 
 
 class TestW8Int8DynamicBlockQuant(CustomTestCase):
-    model = "Qwen/Qwen3-8B"
+    model = QWEN3_8B
     quantization_config_path = "int8_block_128_dynamic.yaml"
     other_args = [
         "--tp-size=4",
         "--download-dir=/dev/shm",
         "--max-running-requests=128",
         "--page-size=64",
-        "--disable-precompile",
     ]
 
     @classmethod
@@ -41,7 +41,6 @@ class TestW8Int8DynamicBlockQuant(CustomTestCase):
             cls.base_url,
             timeout=1200,
             other_args=other_args,
-            check_cache_miss=False,
         )
 
     @classmethod

@@ -49,9 +49,6 @@ class TestQwen1_5Model(CustomTestCase):
                 "--load-format",
                 "dummy",
             ],
-            env={
-                "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
-            },
         )
 
     @classmethod

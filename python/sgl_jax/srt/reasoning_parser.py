@@ -15,11 +15,13 @@ class BaseReasoningFormatDetector:
         think_end_token: str,
         force_reasoning: bool = False,
         stream_reasoning: bool = True,
+        tool_start_token: str | None = None,
     ):
         self.think_start_token = think_start_token
         self.think_end_token = think_end_token
         self._in_reasoning = force_reasoning
         self.stream_reasoning = stream_reasoning
+        self.tool_start_token = tool_start_token
 
         self._buffer = ""
         self.stripped_think_start = False
@@ -38,6 +40,12 @@ class BaseReasoningFormatDetector:
         processed_text = text.replace(self.think_start_token, "").strip()
 
         if self.think_end_token not in processed_text:
+            # Check for tool_start_token interruption
+            if self.tool_start_token is not None and self.tool_start_token in processed_text:
+                tool_idx = processed_text.find(self.tool_start_token)
+                reasoning_text = processed_text[:tool_idx].strip()
+                normal_text = processed_text[tool_idx:]
+                return StreamingParseResult(normal_text=normal_text, reasoning_text=reasoning_text)
             # Assume reasoning was truncated before `</think>` token
             return StreamingParseResult(reasoning_text=processed_text)
 
@@ -62,9 +70,11 @@ class BaseReasoningFormatDetector:
         current_text = self._buffer
 
         # If the current text is a prefix of the think token, keep buffering
+        tokens_to_check = [self.think_start_token, self.think_end_token]
+        if self.tool_start_token:
+            tokens_to_check.append(self.tool_start_token)
         if any(
-            token.startswith(current_text) and token != current_text
-            for token in [self.think_start_token, self.think_end_token]
+            token.startswith(current_text) and token != current_text for token in tokens_to_check
         ):
             return StreamingParseResult()
 
@@ -90,6 +100,14 @@ class BaseReasoningFormatDetector:
 
         # Continue with reasoning content
         if self._in_reasoning:
+            # Check for tool_start_token interruption
+            if self.tool_start_token and self.tool_start_token in current_text:
+                tool_idx = current_text.find(self.tool_start_token)
+                reasoning_text = current_text[:tool_idx]
+                normal_text = current_text[tool_idx:]
+                self._buffer = ""
+                self._in_reasoning = False
+                return StreamingParseResult(normal_text=normal_text, reasoning_text=reasoning_text)
             if self.stream_reasoning:
                 # Stream the content immediately
                 self._buffer = ""
@@ -170,6 +188,113 @@ class KimiDetector(BaseReasoningFormatDetector):
         )
 
 
+class Glm45Detector(BaseReasoningFormatDetector):
+    """
+    Detector for GLM-4.5 / 4.6 / 4.7 models.
+    Assumes reasoning format:
+      (<think>)*(.*)</think>
+
+    GLM models use `<tool_call>` as the tool start token to switch from reasoning mode to normal mode.
+
+    Args:
+        stream_reasoning (bool): If False, accumulates reasoning content until the end tag.
+            If True, streams reasoning content as it arrives.
+    """
+
+    def __init__(self, stream_reasoning: bool = True, force_reasoning: bool = False):
+        super().__init__(
+            "<think>",
+            "</think>",
+            force_reasoning=force_reasoning,
+            stream_reasoning=stream_reasoning,
+            tool_start_token="<tool_call>",
+        )
+
+
+class Gemma4Detector(BaseReasoningFormatDetector):
+    """
+    Detector for Gemma 4 model.
+    Assumes reasoning format:
+      <|channel>thought\n*(.*)<channel|>
+    """
+
+    def __init__(self, stream_reasoning: bool = True):
+        super().__init__(
+            "<|channel>thought\n",
+            "<channel|>",
+            force_reasoning=False,
+            stream_reasoning=stream_reasoning,
+        )
+
+    def detect_and_parse(self, text: str) -> StreamingParseResult:
+        if text.startswith("<|channel>thought\n"):
+            text = text[len("<|channel>thought\n") :]
+            self._in_reasoning = True
+        elif text.startswith("thought\n"):
+            text = text[len("thought\n") :]
+            self._in_reasoning = True
+
+        if not self._in_reasoning and "<channel|>" in text:
+            self._in_reasoning = True
+
+        if not self._in_reasoning:
+            return StreamingParseResult(normal_text=text)
+
+        processed_text = text.strip()
+
+        if self.think_end_token not in processed_text:
+            return StreamingParseResult(reasoning_text=processed_text)
+
+        splits = processed_text.split(self.think_end_token, maxsplit=1)
+        reasoning_text = splits[0].strip()
+        normal_text = splits[1].strip()
+
+        return StreamingParseResult(normal_text=normal_text, reasoning_text=reasoning_text)
+
+    def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
+        self._buffer += new_text
+        current_text = self._buffer
+
+        tokens_to_check = [self.think_start_token, "thought\n", self.think_end_token]
+        if any(
+            token.startswith(current_text) and token != current_text for token in tokens_to_check
+        ):
+            return StreamingParseResult()
+
+        if not self.stripped_think_start:
+            if current_text.startswith("<|channel>thought\n"):
+                current_text = current_text[len("<|channel>thought\n") :]
+                self.stripped_think_start = True
+                self._in_reasoning = True
+            elif current_text.startswith("thought\n"):
+                current_text = current_text[len("thought\n") :]
+                self.stripped_think_start = True
+                self._in_reasoning = True
+
+        if self._in_reasoning and self.think_end_token in current_text:
+            end_idx = current_text.find(self.think_end_token)
+            reasoning_text = current_text[:end_idx]
+            self._buffer = ""
+            self._in_reasoning = False
+            normal_text = current_text[end_idx + len(self.think_end_token) :]
+            return StreamingParseResult(
+                normal_text=normal_text, reasoning_text=reasoning_text.rstrip()
+            )
+
+        if self._in_reasoning:
+            if self.stream_reasoning:
+                self._buffer = ""
+                return StreamingParseResult(reasoning_text=current_text)
+            else:
+                return StreamingParseResult()
+
+        if not self._in_reasoning:
+            self._buffer = ""
+            return StreamingParseResult(normal_text=new_text)
+
+        return StreamingParseResult()
+
+
 class ReasoningParser:
     """
     Parser that handles both streaming and non-streaming scenarios for extracting
@@ -184,7 +309,10 @@ class ReasoningParser:
     DetectorMap: dict[str, type[BaseReasoningFormatDetector]] = {
         "deepseek-r1": DeepSeekR1Detector,
         "qwen3": Qwen3Detector,
+        "mimo": Qwen3Detector,
         "kimi": KimiDetector,
+        "glm45": Glm45Detector,
+        "gemma4": Gemma4Detector,
     }
 
     def __init__(self, model_type: str | None = None, stream_reasoning: bool = True):

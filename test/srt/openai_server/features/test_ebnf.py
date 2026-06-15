@@ -55,9 +55,6 @@ class TestOpenAIServerEBNF(CustomTestCase):
                 "--grammar-backend",
                 "llguidance",
             ],
-            env={
-                "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
-            },
         )
         cls.base_url += "/v1"
         cls.tokenizer = get_tokenizer(DEFAULT_SMALL_MODEL_NAME_FOR_TEST)

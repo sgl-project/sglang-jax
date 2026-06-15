@@ -6,6 +6,7 @@ import os
 import pathlib
 import random
 import re
+import shutil
 import string
 from typing import Any
 
@@ -87,16 +88,18 @@ def multiple_iteration_timeit_from_trace(
     trace_name = f"{task}_" + "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
     trace_dir = os.path.join(trace_root, trace_name)
     os.makedirs(trace_dir, exist_ok=True)
+    try:
+        with jax.profiler.trace(trace_dir):
+            for i in range(tries):
+                data_args = data_generator()
+                with (
+                    jax.profiler.StepTraceAnnotation(task, step_num=i),
+                    jax.named_scope(f"{MARKER}_{i}"),
+                ):
+                    out = compute_func(*data_args)
+                    jax.block_until_ready(out)
 
-    with jax.profiler.trace(trace_dir):
-        for i in range(tries):
-            data_args = data_generator()
-            with (
-                jax.profiler.StepTraceAnnotation(task, step_num=i),
-                jax.named_scope(f"{MARKER}_{i}"),
-            ):
-                out = compute_func(*data_args)
-                jax.block_until_ready(out)
-
-    trace = _load_trace(trace_dir)
-    return _extract_marker_durations_ms(trace, task=task)
+        trace = _load_trace(trace_dir)
+        return _extract_marker_durations_ms(trace, task=task)
+    finally:
+        shutil.rmtree(trace_dir, ignore_errors=True)

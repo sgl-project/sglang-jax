@@ -1,0 +1,137 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1400 1520" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#334155"/>
+    </marker>
+    <marker id="arrowGreen" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#15803d"/>
+    </marker>
+    <style>
+      .title    { font-size: 22px; font-weight: 800; fill: #0f172a; }
+      .subtitle { font-size: 13px; fill: #475569; }
+      .modTitle { font-size: 15px; font-weight: 700; fill: #0f172a; }
+      .modSub   { font-size: 13px; fill: #1e293b; }
+      .modPath  { font-size: 11.5px; fill: #475569; font-family: 'SF Mono', Menlo, Consolas, monospace; }
+      .code     { font-size: 13px; fill: #0f172a; font-family: 'SF Mono', Menlo, Consolas, monospace; }
+      .codeKey  { font-size: 13px; fill: #b45309; font-family: 'SF Mono', Menlo, Consolas, monospace; font-weight: 700; }
+      .edge     { font-size: 12px; fill: #1e293b; font-weight: 600; }
+      .note     { font-size: 11.5px; fill: #64748b; font-style: italic; }
+      .tag      { font-size: 10.5px; font-weight: 700; fill: #ffffff; }
+    </style>
+  </defs>
+
+  <!-- title -->
+  <text x="40" y="40" class="title">TokenizerManager Tokenization Flow</text>
+  <text x="40" y="62" class="subtitle">Full conversion flow from GenerateReqInput to TokenizedGenerateReqInput</text>
+
+  <!-- ============== STEP 1: Receive Request ============== -->
+  <g>
+    <rect x="40" y="100" width="1320" height="100" rx="10" fill="#ede9fe" stroke="#6d28d9" stroke-width="2"/>
+    <rect x="40" y="100" width="1320" height="28" rx="10" fill="#6d28d9"/>
+    <text x="56" y="120" class="tag">STEP 1 · Receive Request</text>
+    <text x="56" y="152" class="modTitle">TokenizerManager.generate_request(obj, request)</text>
+    <text x="56" y="172" class="modPath">managers/tokenizer_manager.py</text>
+    <text x="56" y="190" class="modSub">Receive <tspan class="codeKey">GenerateReqInput</tspan> from HTTP Server or Python API</text>
+  </g>
+
+  <path d="M 700 200 L 700 230" stroke="#334155" stroke-width="2.5" fill="none" marker-end="url(#arrow)"/>
+
+  <!-- ============== STEP 2: Apply Chat Template ============== -->
+  <g>
+    <rect x="40" y="238" width="1320" height="140" rx="10" fill="#dcfce7" stroke="#15803d" stroke-width="2"/>
+    <rect x="40" y="238" width="1320" height="28" rx="10" fill="#15803d"/>
+    <text x="56" y="258" class="tag">STEP 2 · Apply Chat Template</text>
+    <text x="56" y="290" class="modTitle">apply_chat_template(messages)</text>
+    <text x="56" y="310" class="modPath">entrypoints/openai/serving_chat.py</text>
+    <text x="56" y="330" class="modSub">• If <tspan class="codeKey">obj.text</tspan> exists, use directly</text>
+    <text x="56" y="350" class="modSub">• If <tspan class="codeKey">obj.input_ids</tspan> exists, skip Tokenization</text>
+    <text x="56" y="370" class="modSub">• Otherwise use <tspan class="codeKey">tokenizer.apply_chat_template(obj.messages)</tspan> to convert to text</text>
+  </g>
+
+  <path d="M 700 378 L 700 408" stroke="#334155" stroke-width="2.5" fill="none" marker-end="url(#arrow)"/>
+
+  <!-- ============== STEP 3: Tokenization ============== -->
+  <g>
+    <rect x="40" y="416" width="1320" height="160" rx="10" fill="#dcfce7" stroke="#15803d" stroke-width="2"/>
+    <rect x="40" y="416" width="1320" height="28" rx="10" fill="#15803d"/>
+    <text x="56" y="436" class="tag">STEP 3 · Tokenization</text>
+    <text x="56" y="468" class="modTitle">tokenizer.encode(text)</text>
+    <text x="56" y="488" class="modPath">HuggingFace Tokenizer</text>
+    <text x="56" y="508" class="modSub">• Uses HuggingFace <tspan class="codeKey">PreTrainedTokenizerFast</tspan></text>
+    <text x="56" y="528" class="modSub">• Convert text to token IDs: <tspan class="codeKey">List[int]</tspan></text>
+    <text x="56" y="548" class="modSub">• If <tspan class="codeKey">add_special_tokens=True</tspan>, automatically add BOS/EOS</text>
+    <text x="56" y="568" class="modSub">• Return <tspan class="codeKey">input_ids</tspan></text>
+  </g>
+
+  <path d="M 700 576 L 700 606" stroke="#334155" stroke-width="2.5" fill="none" marker-end="url(#arrow)"/>
+
+  <!-- ============== STEP 4: Create ReqState ============== -->
+  <g>
+    <rect x="40" y="614" width="1320" height="180" rx="10" fill="#fef3c7" stroke="#b45309" stroke-width="2"/>
+    <rect x="40" y="614" width="1320" height="28" rx="10" fill="#b45309"/>
+    <text x="56" y="634" class="tag">STEP 4 · Create Request State</text>
+    <text x="56" y="666" class="modTitle">ReqState(out_list, finished, event, obj, ...)</text>
+    <text x="56" y="686" class="modPath">managers/tokenizer_manager.py</text>
+
+    <rect x="56" y="702" width="1208" height="78" rx="6" fill="#fffbeb" stroke="#fbbf24"/>
+    <text x="72" y="724" class="code">ReqState key fields:</text>
+    <text x="72" y="744" class="modSub"><tspan class="codeKey">• out_list: list[dict]</tspan> — incremental output accumulator list</text>
+    <text x="72" y="764" class="modSub"><tspan class="codeKey">• finished: bool · event: asyncio.Event</tspan> — completion flag and async notification</text>
+    <text x="72" y="784" class="modSub"><tspan class="codeKey">• obj: GenerateReqInput | EmbeddingReqInput</tspan> — original request object (rid → ReqState via rid_to_state)</text>
+  </g>
+
+  <path d="M 700 794 L 700 824" stroke="#334155" stroke-width="2.5" fill="none" marker-end="url(#arrow)"/>
+
+  <!-- ============== STEP 5: Create TokenizedGenerateReqInput ============== -->
+  <g>
+    <rect x="40" y="832" width="1320" height="180" rx="10" fill="#fef3c7" stroke="#b45309" stroke-width="2"/>
+    <rect x="40" y="832" width="1320" height="28" rx="10" fill="#b45309"/>
+    <text x="56" y="852" class="tag">STEP 5 · Build Tokenized Request</text>
+    <text x="56" y="884" class="modTitle">TokenizedGenerateReqInput(...)</text>
+    <text x="56" y="904" class="modPath">managers/io_struct.py</text>
+
+    <rect x="56" y="920" width="1208" height="78" rx="6" fill="#fffbeb" stroke="#fbbf24"/>
+    <text x="72" y="942" class="code">Inherits from GenerateReqInput, adds:</text>
+    <text x="72" y="962" class="modSub"><tspan class="codeKey">• input_ids: List[int]</tspan> — Token IDs</text>
+    <text x="72" y="982" class="modSub"><tspan class="codeKey">• sampling_params: SamplingParams</tspan> — sampling parameters</text>
+    <text x="72" y="1002" class="note">Preserves all fields of the original GenerateReqInput (rid, text, messages, ...)</text>
+  </g>
+
+  <path d="M 700 1012 L 700 1042" stroke="#15803d" stroke-width="2.5" fill="none" marker-end="url(#arrowGreen)"/>
+  <text x="712" y="1034" class="edge">ZMQ PUSH →</text>
+
+  <!-- ============== STEP 6: Send to Scheduler ============== -->
+  <g>
+    <rect x="40" y="1050" width="1320" height="120" rx="10" fill="#dcfce7" stroke="#15803d" stroke-width="2"/>
+    <rect x="40" y="1050" width="1320" height="28" rx="10" fill="#15803d"/>
+    <text x="56" y="1070" class="tag">STEP 6 · Send to Scheduler</text>
+    <text x="56" y="1102" class="modTitle">send_to_scheduler.send_pyobj(tokenized_obj)</text>
+    <text x="56" y="1122" class="modPath">ZMQ PUSH Socket</text>
+    <text x="56" y="1142" class="modSub">Send <tspan class="codeKey">TokenizedGenerateReqInput</tspan> to Scheduler process via ZMQ IPC</text>
+    <text x="56" y="1160" class="modSub">Scheduler creates <tspan class="codeKey">Req</tspan> object and adds to waiting_queue</text>
+  </g>
+
+  <!-- Footer notes -->
+  <g>
+    <rect x="40" y="1200" width="1320" height="280" rx="10" fill="#e0e7ff" stroke="#4f46e5" stroke-width="2"/>
+    <rect x="40" y="1200" width="1320" height="28" rx="10" fill="#4f46e5"/>
+    <text x="56" y="1220" class="tag">Key Design Notes</text>
+
+    <text x="56" y="1252" class="modTitle">Data Structure Transformation</text>
+    <text x="56" y="1272" class="modSub"><tspan class="codeKey">GenerateReqInput</tspan> (HTTP/Python API) → <tspan class="codeKey">TokenizedGenerateReqInput</tspan> (ZMQ) → <tspan class="codeKey">Req</tspan> (Scheduler)</text>
+
+    <text x="56" y="1300" class="modTitle">Chat Template Handling</text>
+    <text x="56" y="1320" class="modSub">• Supports three input modes: <tspan class="code">text</tspan> / <tspan class="code">messages</tspan> / <tspan class="code">input_ids</tspan></text>
+    <text x="56" y="1338" class="modSub">• <tspan class="code">messages</tspan> mode uses Jinja2 Template to convert to text (e.g. ChatML, Llama-3 format)</text>
+    <text x="56" y="1356" class="modSub">• Template defined by <tspan class="code">chat_template</tspan> field in <tspan class="code">tokenizer_config.json</tspan></text>
+
+    <text x="56" y="1384" class="modTitle">ReqState Management</text>
+    <text x="56" y="1404" class="modSub">• TokenizerManager maintains <tspan class="codeKey">rid_to_state: Dict[str, ReqState]</tspan> mapping</text>
+    <text x="56" y="1422" class="modSub">• Used to aggregate incremental output from Detokenizer and build final response</text>
+    <text x="56" y="1440" class="modSub">• In Streaming mode, each token returned incrementally via SSE; non-Streaming returns once at completion</text>
+
+    <text x="56" y="1468" class="modTitle">Inter-process Communication</text>
+    <text x="56" y="1488" class="modSub">• TokenizerManager (Main Process) → Scheduler (Subprocess 1): <tspan class="codeKey">TokenizedGenerateReqInput</tspan></text>
+  </g>
+</svg>

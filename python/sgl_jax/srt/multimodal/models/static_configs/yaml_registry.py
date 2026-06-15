@@ -44,6 +44,7 @@ class StageConfigRegistry:
         # MiMo Audio series
         "XiaomiMiMo/MiMo-Audio-7B-Instruct": "mimo_audio_stage_config.yaml",
         "XiaomiMiMo/MiMo-Audio-7B-Base": "mimo_audio_stage_config.yaml",
+        "black-forest-labs/FLUX.1-dev": "flux1_dev_stage_config.yaml",
     }
 
     # Keyword patterns for fallback matching (order matters - more specific first)
@@ -54,6 +55,7 @@ class StageConfigRegistry:
         ("Qwen3-Omni", "qwen3_omni_stage_config.yaml"),
         ("MiMo-Audio-7B-Instruct", "mimo_audio_stage_config.yaml"),
         ("MiMo-Audio-7B-Base", "mimo_audio_stage_config.yaml"),
+        ("FLUX.1-dev", "flux1_dev_stage_config.yaml"),
     ]
 
     @classmethod

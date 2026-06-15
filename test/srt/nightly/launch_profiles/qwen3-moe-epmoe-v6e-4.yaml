@@ -1,0 +1,29 @@
+# Qwen3-MoE-30B-A3B (bf16) on v6e-4, TP4/EP4, moe-backend epmoe
+# (issue #1200, 1.1.3).
+name: qwen3_moe-epmoe-tp4-ep4
+target: v6e-4
+model_path: Qwen/Qwen3-30B-A3B
+tp_size: 4
+dp_size: 1
+ep_size: 4
+port: 30030
+server_args:
+  - --skip-server-warmup
+  - --random-seed
+  - "3"
+  - --mem-fraction-static
+  - "0.8"
+  - --max-prefill-tokens
+  - "8192"
+  - --download-dir
+  - /dev/shm/
+  - --dtype
+  - bfloat16
+  - --attention-backend
+  - fa
+  - --page-size
+  - "256"
+  - --max-running-requests
+  - "64"
+  - --moe-backend
+  - epmoe

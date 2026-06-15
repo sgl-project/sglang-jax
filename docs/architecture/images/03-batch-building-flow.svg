@@ -1,0 +1,166 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1400 1780" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#334155"/>
+    </marker>
+    <marker id="arrowGreen" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#15803d"/>
+    </marker>
+    <marker id="arrowOrange" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#b45309"/>
+    </marker>
+    <style>
+      .title    { font-size: 22px; font-weight: 800; fill: #0f172a; }
+      .subtitle { font-size: 13px; fill: #475569; }
+      .modTitle { font-size: 15px; font-weight: 700; fill: #0f172a; }
+      .modSub   { font-size: 13px; fill: #1e293b; }
+      .modPath  { font-size: 11.5px; fill: #475569; font-family: 'SF Mono', Menlo, Consolas, monospace; }
+      .code     { font-size: 13px; fill: #0f172a; font-family: 'SF Mono', Menlo, Consolas, monospace; }
+      .codeKey  { font-size: 13px; fill: #b45309; font-family: 'SF Mono', Menlo, Consolas, monospace; font-weight: 700; }
+      .edge     { font-size: 12px; fill: #1e293b; font-weight: 600; }
+      .note     { font-size: 11.5px; fill: #64748b; font-style: italic; }
+      .tag      { font-size: 10.5px; font-weight: 700; fill: #ffffff; }
+    </style>
+  </defs>
+
+  <!-- title -->
+  <text x="40" y="40" class="title">Scheduler Batch Building Flow (get_next_batch_to_run)</text>
+  <text x="40" y="62" class="subtitle">Selects requests from waiting_queue and running_batch to build Prefill or Decode Batch</text>
+
+  <!-- ============== STEP 1: Check Chunked Prefill ============== -->
+  <g>
+    <rect x="40" y="100" width="1320" height="120" rx="10" fill="#ede9fe" stroke="#6d28d9" stroke-width="2"/>
+    <rect x="40" y="100" width="1320" height="28" rx="10" fill="#6d28d9"/>
+    <text x="56" y="120" class="tag">STEP 1 · Check Chunked Prefill</text>
+    <text x="56" y="152" class="modTitle">if any(req is not None for req in self.chunked_reqs):</text>
+    <text x="56" y="172" class="modPath">managers/scheduler.py:get_next_batch_to_run()</text>
+    <text x="56" y="192" class="modSub">• If any DP rank has a pending Chunked Prefill request, prioritize continuing it</text>
+    <text x="56" y="210" class="modSub">• Returns Chunked Prefill Batch (ForwardMode.EXTEND)</text>
+  </g>
+
+  <path d="M 700 220 L 700 250" stroke="#334155" stroke-width="2.5" fill="none" marker-end="url(#arrow)"/>
+
+  <!-- ============== STEP 2: Try Build Prefill Batch ============== -->
+  <g>
+    <rect x="40" y="258" width="1320" height="160" rx="10" fill="#dcfce7" stroke="#15803d" stroke-width="2"/>
+    <rect x="40" y="258" width="1320" height="28" rx="10" fill="#15803d"/>
+    <text x="56" y="278" class="tag">STEP 2 · Try Build Prefill Batch</text>
+    <text x="56" y="310" class="modTitle">PrefillAdder.add_one_req() / add_chunked_req()</text>
+    <text x="56" y="330" class="modPath">managers/schedule_policy.py</text>
+    <text x="56" y="350" class="modSub">• Call <tspan class="codeKey">req.init_next_round_input()</tspan>, internally runs <tspan class="codeKey">tree_cache.match_prefix(key)</tspan> to find reusable Prefix</text>
+    <text x="56" y="370" class="modSub">• Check token budget: <tspan class="code">prefill_tokens + decode_tokens ≤ max_prefill_tokens</tspan></text>
+    <text x="56" y="390" class="modSub">• Check KV Cache capacity: whether <tspan class="code">alloc_token_slots()</tspan> succeeds</text>
+    <text x="56" y="410" class="modSub">• On success, add request to Prefill Batch; on failure, attempt Retract or skip</text>
+  </g>
+
+  <path d="M 700 418 L 700 448" stroke="#334155" stroke-width="2.5" fill="none" marker-end="url(#arrow)"/>
+
+  <!-- ============== STEP 3: Allocate KV Cache ============== -->
+  <g>
+    <rect x="40" y="456" width="1320" height="160" rx="10" fill="#cffafe" stroke="#0e7490" stroke-width="2"/>
+    <rect x="40" y="456" width="1320" height="28" rx="10" fill="#0e7490"/>
+    <text x="56" y="476" class="tag">STEP 3 · Allocate KV Cache</text>
+    <text x="56" y="508" class="modTitle">alloc_token_slots(req, num_tokens)</text>
+    <text x="56" y="528" class="modPath">mem_cache/common.py</text>
+    <text x="56" y="548" class="modSub">• Upstream STEP 2 has performed prefix matching via <tspan class="codeKey">req.init_next_round_input()</tspan></text>
+    <text x="56" y="568" class="modSub">• Unconditionally calls <tspan class="codeKey">evict_from_tree_cache()</tspan>; it internally decides whether LRU eviction is needed</text>
+    <text x="56" y="588" class="modSub">• Allocate new Token Slots via <tspan class="codeKey">allocator.alloc()</tspan></text>
+    <text x="56" y="608" class="modSub">• Returns <tspan class="codeKey">out_cache_loc</tspan> (write position) and <tspan class="codeKey">cache_loc</tspan> (read position)</text>
+  </g>
+
+  <path d="M 700 616 L 700 646" stroke="#334155" stroke-width="2.5" fill="none" marker-end="url(#arrow)"/>
+
+  <!-- ============== STEP 4: Build Prefill or Decode ============== -->
+  <g>
+    <rect x="40" y="654" width="640" height="180" rx="10" fill="#fef3c7" stroke="#b45309" stroke-width="2"/>
+    <rect x="40" y="654" width="640" height="28" rx="10" fill="#b45309"/>
+    <text x="56" y="674" class="tag">STEP 4a · Prefill Batch</text>
+    <text x="56" y="706" class="modTitle">if prefill_reqs:</text>
+    <text x="56" y="726" class="modPath">Build EXTEND Batch</text>
+
+    <rect x="56" y="742" width="608" height="78" rx="6" fill="#fffbeb" stroke="#fbbf24"/>
+    <text x="72" y="764" class="code">ScheduleBatch(</text>
+    <text x="72" y="784" class="codeKey">  forward_mode=ForwardMode.EXTEND,</text>
+    <text x="72" y="804" class="codeKey">  reqs=prefill_reqs,</text>
+    <text x="72" y="824" class="code">  ...)</text>
+  </g>
+
+  <g>
+    <rect x="720" y="654" width="640" height="180" rx="10" fill="#fef3c7" stroke="#b45309" stroke-width="2"/>
+    <rect x="720" y="654" width="640" height="28" rx="10" fill="#b45309"/>
+    <text x="736" y="674" class="tag">STEP 4b · Decode Batch</text>
+    <text x="736" y="706" class="modTitle">else: (running_batch)</text>
+    <text x="736" y="726" class="modPath">Build DECODE Batch</text>
+
+    <rect x="736" y="742" width="608" height="78" rx="6" fill="#fffbeb" stroke="#fbbf24"/>
+    <text x="752" y="764" class="code">ScheduleBatch(</text>
+    <text x="752" y="784" class="codeKey">  forward_mode=ForwardMode.DECODE,</text>
+    <text x="752" y="804" class="codeKey">  reqs=running_batch.reqs,</text>
+    <text x="752" y="824" class="code">  ...)</text>
+  </g>
+
+  <path d="M 360 834 L 360 884 L 700 884 L 700 914" stroke="#b45309" stroke-width="2.5" fill="none" marker-end="url(#arrowOrange)"/>
+  <path d="M 1040 834 L 1040 884 L 700 884" stroke="#b45309" stroke-width="2.5" fill="none"/>
+
+  <!-- ============== STEP 5: Prepare Batch Data ============== -->
+  <g>
+    <rect x="40" y="922" width="1320" height="200" rx="10" fill="#dcfce7" stroke="#15803d" stroke-width="2"/>
+    <rect x="40" y="922" width="1320" height="28" rx="10" fill="#15803d"/>
+    <text x="56" y="942" class="tag">STEP 5 · Prepare Batch Data</text>
+    <text x="56" y="974" class="modTitle">ScheduleBatch key fields</text>
+    <text x="56" y="994" class="modPath">managers/schedule_batch.py</text>
+
+    <rect x="56" y="1010" width="1208" height="98" rx="6" fill="#f0fdf4" stroke="#86efac"/>
+    <text x="72" y="1032" class="modSub"><tspan class="codeKey">• input_ids: np.ndarray</tspan> — input Token IDs (Prefill: full sequence; Decode: previous step's generated token)</text>
+    <text x="72" y="1052" class="modSub"><tspan class="codeKey">• positions: np.ndarray</tspan> — Position IDs (Prefill: [0, 1, ..., L-1]; Decode: [L])</text>
+    <text x="72" y="1072" class="modSub"><tspan class="codeKey">• req_pool_indices: np.ndarray</tspan> — indices in ReqToTokenPool</text>
+    <text x="72" y="1092" class="modSub"><tspan class="codeKey">• out_cache_loc / cache_loc: np.ndarray</tspan> — KV Cache write/read positions</text>
+    <text x="72" y="1112" class="note">All arrays padded to bucket sizes, ready to feed JIT-compiled model</text>
+  </g>
+
+  <path d="M 700 1122 L 700 1152" stroke="#15803d" stroke-width="2.5" fill="none" marker-end="url(#arrowGreen)"/>
+
+  <!-- ============== STEP 6: Return Batch ============== -->
+  <g>
+    <rect x="40" y="1160" width="1320" height="100" rx="10" fill="#dcfce7" stroke="#15803d" stroke-width="2"/>
+    <rect x="40" y="1160" width="1320" height="28" rx="10" fill="#15803d"/>
+    <text x="56" y="1180" class="tag">STEP 6 · Return Batch</text>
+    <text x="56" y="1212" class="modTitle">return batch</text>
+    <text x="56" y="1232" class="modPath">Returns ScheduleBatch or None</text>
+    <text x="56" y="1250" class="modSub">• If Batch built successfully, returns <tspan class="codeKey">ScheduleBatch</tspan></text>
+    <text x="56" y="1268" class="modSub">• If no schedulable request or out of memory, returns <tspan class="code">None</tspan></text>
+  </g>
+
+  <!-- Footer notes -->
+  <g>
+    <rect x="40" y="1300" width="1320" height="440" rx="10" fill="#e0e7ff" stroke="#4f46e5" stroke-width="2"/>
+    <rect x="40" y="1300" width="1320" height="28" rx="10" fill="#4f46e5"/>
+    <text x="56" y="1320" class="tag">Key Design Notes</text>
+
+    <text x="56" y="1352" class="modTitle">Scheduling Policies</text>
+    <text x="56" y="1372" class="modSub">• <tspan class="codeKey">FCFS</tspan> (CacheAgnostic): First-Come-First-Serve, by arrival order</text>
+    <text x="56" y="1390" class="modSub">• <tspan class="codeKey">LOF</tspan> (CacheAgnostic): Longest-Output-First, prioritize requests with longest expected output</text>
+    <text x="56" y="1408" class="modSub">• <tspan class="codeKey">RANDOM</tspan> (CacheAgnostic): random selection</text>
+    <text x="56" y="1426" class="modSub">• <tspan class="codeKey">LPM</tspan> (CacheAware): Longest-Prefix-Match, prioritize requests with longest prefix match</text>
+    <text x="56" y="1444" class="modSub">• <tspan class="codeKey">DFS_WEIGHT</tspan> (CacheAware): DFS-weighted, balances Prefix reuse and fairness</text>
+
+    <text x="56" y="1472" class="modTitle">Prefill vs Decode Priority</text>
+    <text x="56" y="1492" class="modSub">• Prefill Batch takes priority over Decode Batch (reduces TTFT - Time To First Token)</text>
+    <text x="56" y="1510" class="modSub">• If waiting_queue non-empty and resources available, prioritize building Prefill Batch</text>
+    <text x="56" y="1528" class="modSub">• Otherwise continue running_batch's Decode</text>
+
+    <text x="56" y="1556" class="modTitle">Chunked Prefill</text>
+    <text x="56" y="1576" class="modSub">• Long Prefill sequences split into multiple Chunks (default 8192 tokens/chunk)</text>
+    <text x="56" y="1594" class="modSub">• Each Chunk runs as independent EXTEND Batch, interleaved with Decode steps</text>
+    <text x="56" y="1612" class="modSub">• Balances throughput (Prefill) and latency (Decode)</text>
+
+    <text x="56" y="1640" class="modTitle">Memory Management</text>
+    <text x="56" y="1660" class="modSub">• <tspan class="codeKey">new_token_ratio</tspan>: memory ratio reserved for Decode (dynamic decay: 0.4 → 0.05)</text>
+    <text x="56" y="1678" class="modSub">• On OOM, trigger Retract: free latest request from running_batch to make room for Prefill</text>
+    <text x="56" y="1696" class="modSub">• If still insufficient after Retract, Abort some requests</text>
+
+    <text x="56" y="1724" class="modTitle">Continuous Batching</text>
+    <text x="56" y="1744" class="modSub">• After each forward step, completed requests removed from running_batch</text>
+  </g>
+</svg>

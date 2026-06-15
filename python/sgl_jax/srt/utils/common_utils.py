@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import bisect
 import contextlib
 import ctypes
 import dataclasses
@@ -36,6 +37,28 @@ logger = logging.getLogger(__name__)
 
 PRECOMPILE_DEFAULT_TOKEN_PADDINGS = [1 << i for i in range(6, 14)]
 PRECOMPILE_DEFAULT_BS_PADDINGS = [1 << i for i in range(0, 9)]
+
+
+def pad_to_bucket(value: int, buckets: list[int]) -> tuple[int, int]:
+    """Return the smallest bucket >= value and its index.
+
+    Args:
+        value: The actual size to pad.
+        buckets: Sorted list of bucket sizes.
+
+    Returns:
+        (padded_size, index) into *buckets*.
+
+    Raises:
+        ValueError: If value exceeds all buckets.
+    """
+    idx = bisect.bisect_left(buckets, value)
+    if idx < len(buckets):
+        return buckets[idx], idx
+    raise ValueError(
+        f"No bucket >= {value}. Available: {buckets}. " f"Increase bucket sizes or max capacity."
+    )
+
 
 _warned_bool_env_var_keys = set()
 

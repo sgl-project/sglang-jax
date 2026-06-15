@@ -271,7 +271,9 @@ class AudioBackboneScheduler:
         if input_ids is None:
             raise ValueError("input_ids must be provided")
 
-        if not jnp.issubdtype(input_ids.dtype, jnp.integer):
+        if isinstance(input_ids, (list, tuple)):
+            input_ids = jnp.array(input_ids, dtype=jnp.int32)
+        elif not jnp.issubdtype(input_ids.dtype, jnp.integer):
             input_ids = input_ids.astype(jnp.int32)
 
         if input_ids.ndim == 2:

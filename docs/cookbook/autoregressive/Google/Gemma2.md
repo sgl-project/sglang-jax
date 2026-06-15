@@ -1,0 +1,194 @@
+---
+title: "Gemma 2"
+---
+
+# Gemma 2 on SGL-JAX
+
+> **Validated recipe** — Gemma 2 27B-it validated on TPU v6e-4 with sglang-jax 0.1.0; see §4 for measured numbers.
+
+## 1. Model Introduction
+
+[**google/gemma-2-27b-it**](https://huggingface.co/google/gemma-2-27b-it) is Google's instruction-tuned 27B Gemma 2 — a dense decoder with **hybrid attention** (alternating global 8K and sliding-window 4K layers) and soft-cap attention/logits. Fits on a single TPU v6e-4 host (BF16 ~54 GB).
+
+**Key Features**:
+
+- **Dense decoder, single-host fit**: 27B in BF16 (~54 GB) on a single TPU v6e-4 host. No multi-host complexity.
+- **Hybrid Attention**: Alternating global (8K) and sliding-window (4K) layers — SGL-JAX manages two KV pools (global + sliding), giving stronger long-context behavior than uniform-attention models at the same parameter count.
+- **Soft-cap attention/logits**: Gemma 2's signature stability tweak — caps attention logits and output logits to reduce extreme activations.
+- **Instruction-tuned for chat**: `27b-it` is the post-trained chat model — non-reasoning, no native tool-call format.
+- **Open weights under Gemma Terms of Use**: see [Gemma model card](https://huggingface.co/google/gemma-2-27b-it).
+
+**Recommended Generation Parameters**: `temperature=0.7`, `top_p=0.95`, `top_k=64`, `max_tokens=1024` (Gemma 2 model-card defaults).
+
+**License**: see the [Gemma model card](https://huggingface.co/google/gemma-2-27b-it) for the authoritative Gemma Terms of Use.
+
+## 2. Deployment
+
+### 2.1 Hardware Matrix
+
+| Model | TPU | Topology | Chips | `--tp-size` | Notes |
+|---|---|---|---|---|---|
+| Gemma 2 27B-it | **v6e-4** | 2x2 | 4 | 4 | This is the slice we measured on. BF16 ~54 GB — fits with `--mem-fraction-static 0.85` (~13.5 GB weights/chip + dual KV pools). |
+
+See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation reference. For other slices (larger v6e, v7x variants), see [Adapting to other topologies](../../base/tpu-topology-reference.md#adapting-to-other-topologies).
+
+### 2.2 Environment
+
+Install per [Install guide](../../../get_started/install.md) and use [Single-host Docker template](../../deployment/single-host-docker.md) for the container setup.
+
+### 2.3 Launch
+
+#### Single-host — TPU v6e-4 (Gemma 2 27B-it)
+
+```bash
+JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -m sgl_jax.launch_server \
+  --model-path google/gemma-2-27b-it \
+  --trust-remote-code \
+  --tp-size 4 \
+  --device tpu \
+  --dtype bfloat16 \
+  --mem-fraction-static 0.85 \
+  --chunked-prefill-size 2048 \
+  --page-size 128 \
+  --max-running-requests 64 \
+  --skip-server-warmup \
+  --host 0.0.0.0 --port 30000
+```
+
+The 27B-it `--mem-fraction-static 0.85` leaves room for the dual (global + sliding) KV pools.
+
+
+### 2.4 Configuration Tips
+
+**Memory Management:**
+- 27B-it: `--mem-fraction-static 0.85` validated; ~13.5 GB weights/chip leaves enough HBM for both KV pools at `--max-running-requests 64`. Drop to `0.8` if you raise concurrency further and hit OOM.
+
+**Paging / concurrency (mandatory):**
+- `--page-size 128` is required. Without it (default = 1) the scheduler silently caps `Final max_running_requests: 1`, serializing all requests. `--max-running-requests 64` then sets the actual concurrency ceiling.
+- `--chunked-prefill-size 2048` bounds peak HBM during prefill on long prompts.
+
+**Hybrid Attention (Gemma-specific):**
+- Gemma 2 alternates global (8K context) and sliding-window (4K) attention layers. SGL-JAX manages two KV pools — global and sliding — which is more memory-sensitive than uniform-attention models at the same parameter count.
+- `--swa-full-tokens-ratio` (default 0.8) controls the per-layer ratio of sliding-window vs full-attention layers and gates pool sizing. If you see sliding-window pool exhaustion at high concurrency, lower this ratio to give the sliding pool more capacity. See [troubleshooting §SWA pool exhaustion](../../troubleshooting.md#swa-pool-exhaustion-mimo-hybrid-attention-models).
+
+**Compilation Cache Hygiene:**
+- `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache` is mandatory — without it, first request blocks ~4 min while XLA/Pallas re-compiles.
+- The cache keys on full kernel shape: changing `--page-size`, `--tp-size`, or `--swa-full-tokens-ratio` invalidates cached entries.
+
+For full flag definitions see [Launch flags reference](../../base/launch-flags-reference.md).
+
+## 3. Invocation
+
+### 3.1 Basic Chat Completion
+
+For full cURL + native `/generate` patterns see [Basic API usage](../../base/basic-api-usage.md). Pass `top_k` via `extra_body={"top_k": 64}` since the OpenAI schema does not include it.
+
+Short Python OpenAI client example:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:30000/v1", api_key="EMPTY")
+
+resp = client.chat.completions.create(
+    model="google/gemma-2-27b-it",
+    messages=[{"role": "user", "content": "Hello, who are you?"}],
+    temperature=0.7,
+    top_p=0.95,
+    max_tokens=1024,
+    extra_body={"top_k": 64},
+)
+print(resp.choices[0].message.content)
+```
+
+> Gemma 2 is non-reasoning and has no native tool-call format. For those workloads, see the **Parser key reference** in [Parser key reference](../index.md#parser-key-reference) for the list of cookbook recipes with reasoning / tool-call parsers registered.
+
+## 4. Benchmark
+
+> Benchmark data below is a snapshot pinned to the `Tested build`; not refreshed on every release.
+
+### 4.1 Accuracy
+
+**Test Environment**
+
+| Field | Value |
+|---|---|
+| Hardware | TPU v6e-4 (single host, 4 chips) |
+| Model | google/gemma-2-27b-it (BF16) |
+| Tensor Parallelism | 4 |
+| Tested build | sglang-jax 0.1.0 |
+
+**Deployment Command** — same as [§2.3 27B-it](#single-host-docker--tpu-v6e-4-gemma-2-27b-it).
+
+**Benchmark Command** — example for GSM8K:
+
+```bash
+evalscope eval \
+  --model google/gemma-2-27b-it \
+  --api-url http://127.0.0.1:30000/v1/chat/completions \
+  --api-key EMPTY \
+  --eval-type service \
+  --datasets gsm8k \
+  --eval-batch-size 16 \
+  --limit 200
+```
+
+Recommended additional datasets: MMLU, GPQA Diamond.
+
+**Test Results**
+
+| Dataset | Subset | Samples | Score |
+|---|---|---|---|
+| gsm8k | main | 200 | **0.865** |
+
+### 4.2 Speed
+
+> **Layout B — measured baseline.** TPU v6e-4 (single host, 4 chips, TP=4), sglang-jax 0.1.0. sgl-jax-only; no vLLM-on-TPU comparison.
+
+**Test Environment**
+
+| Field | Value |
+|---|---|
+| Hardware | TPU v6e-4 (single host, 4 chips) |
+| Model | google/gemma-2-27b-it (BF16) |
+| Tensor Parallelism | 4 |
+| Tested build | sglang-jax 0.1.0 |
+
+**Benchmark Command**
+
+```bash
+python3 -m sgl_jax.bench_serving \
+  --backend sglang \
+  --model google/gemma-2-27b-it \
+  --tokenizer google/gemma-2-27b-it \
+  --dataset-name random --random-input-len 1024 --random-output-len 1024 \
+  --num-prompts 100 --max-concurrency 16 \
+  --host 127.0.0.1 --port 30000
+```
+
+**Test Results**
+
+```
+============ Serving Benchmark Result ============
+Successful requests:                     100
+Benchmark duration (s):                  53.81
+Total input tokens:                      50561
+Total generated tokens:                  52444
+Request throughput (req/s):              1.86
+Input token throughput (tok/s):          939.58
+Output token throughput (tok/s):         974.57
+Peak output token throughput (tok/s):    1159.00
+Total token throughput (tok/s):          1914.15
+Mean E2E Latency (ms):                   7654.91
+Mean TTFT (ms):                          77.57
+Mean TPOT (ms):                          14.47
+Median TPOT (ms):                        14.53
+Mean ITL (ms):                           14.48
+==================================================
+```
+
+## Additional Resources
+
+- [Gemma 2 27B-it model card](https://huggingface.co/google/gemma-2-27b-it)
+- [Launch flags reference](../../base/launch-flags-reference.md)
+- [Cross-recipe troubleshooting](../../troubleshooting.md) — cross-recipe generic issues including the SWA pool exhaustion note.

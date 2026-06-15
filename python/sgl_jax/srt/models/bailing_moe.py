@@ -5,6 +5,8 @@ import jax
 import numpy as np
 from flax import nnx
 from jax import numpy as jnp
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig, MoEBackend
@@ -16,12 +18,13 @@ from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.layers.moe import (
     EPMoE,
     FusedEPMoE,
+    FusedEPMoEV2,
     GateLogit,
     TopK,
     create_moe_weights_mapping,
 )
 from sgl_jax.srt.layers.radix_attention import RadixAttention
-from sgl_jax.srt.mem_cache.memory_pool import KVCache
+from sgl_jax.srt.mem_cache.memory_pool import KVCache, MemoryPools
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
@@ -48,6 +51,7 @@ class BailingMoEAttention(nnx.Module):
         attention_bias: bool = False,
         dtype: jnp.dtype = jnp.bfloat16,
     ):
+        self.mesh = mesh
         self.layer_id = layer_id
         assert num_heads % num_kv_heads == 0
 
@@ -135,9 +139,42 @@ class BailingMoEAttention(nnx.Module):
         k, _ = self.k_proj(hidden_states)
         v, _ = self.v_proj(hidden_states)
 
-        q = q.reshape(-1, self.q_head_num, self.head_dim)
-        k = k.reshape(-1, self.kv_head_num, self.head_dim)
-        v = v.reshape(-1, self.kv_head_num, self.head_dim)
+        q = q.reshape(
+            -1,
+            self.q_head_num,
+            self.head_dim,
+            out_sharding=NamedSharding(
+                self.mesh,
+                P(
+                    "data",
+                    "tensor",
+                ),
+            ),
+        )
+        k = k.reshape(
+            -1,
+            self.kv_head_num,
+            self.head_dim,
+            out_sharding=NamedSharding(
+                self.mesh,
+                P(
+                    "data",
+                    "tensor",
+                ),
+            ),
+        )
+        v = v.reshape(
+            -1,
+            self.kv_head_num,
+            self.head_dim,
+            out_sharding=NamedSharding(
+                self.mesh,
+                P(
+                    "data",
+                    "tensor",
+                ),
+            ),
+        )
 
         if self.use_qk_norm:
             q = self.q_norm(q)
@@ -272,12 +309,14 @@ class BailingMoEDecoderLayer(nnx.Module):
             )
 
             self.moe_backend = getattr(config, "moe_backend", MoEBackend.EPMOE)
-            self.use_fused = self.moe_backend == MoEBackend.FUSED
+            self.use_fused = self.moe_backend in (MoEBackend.FUSED, MoEBackend.FUSED_V2)
             moe_shared_expert_intermediate_size = getattr(
                 config,
                 "moe_shared_expert_intermediate_size",
                 config.moe_intermediate_size,
             )
+            use_inkernel_se = self.moe_backend == MoEBackend.FUSED_V2 and num_shared_experts > 0
+            self.use_inkernel_se = use_inkernel_se
 
             self.topk = TopK(
                 topk=config.num_experts_per_tok,
@@ -288,7 +327,27 @@ class BailingMoEDecoderLayer(nnx.Module):
                 layer_id=layer_id,
             )
 
-            if self.use_fused:
+            if self.moe_backend == MoEBackend.FUSED_V2:
+                self.mlp = FusedEPMoEV2(
+                    hidden_size=config.hidden_size,
+                    num_experts=config.num_experts,
+                    num_experts_per_tok=config.num_experts_per_tok,
+                    intermediate_dim=config.moe_intermediate_size,
+                    mesh=mesh,
+                    activation="silu",
+                    ep_size=config.ep_size,
+                    weight_dtype=dtype,
+                    dtype=dtype,
+                    layer_id=layer_id,
+                    renormalize_topk_logits=config.norm_topk_prob,
+                    use_grouped_topk=config.n_group > 0,
+                    num_groups=config.n_group,
+                    top_k_groups=config.topk_group,
+                    num_shared_experts=num_shared_experts if use_inkernel_se else 0,
+                    moe_shared_expert_intermediate_size=moe_shared_expert_intermediate_size,
+                    quantization_config=getattr(config, "quantization_config", None),
+                )
+            elif self.use_fused:
                 self.mlp = FusedEPMoE(
                     hidden_size=config.hidden_size,
                     num_experts=config.num_experts,
@@ -304,8 +363,7 @@ class BailingMoEDecoderLayer(nnx.Module):
                     use_grouped_topk=config.n_group > 0,
                     num_groups=config.n_group,
                     top_k_groups=config.topk_group,
-                    num_shared_experts=num_shared_experts,
-                    moe_shared_expert_intermediate_size=moe_shared_expert_intermediate_size,
+                    num_shared_experts=0,
                     quantization_config=getattr(config, "quantization_config", None),
                 )
             else:
@@ -322,7 +380,7 @@ class BailingMoEDecoderLayer(nnx.Module):
                     quantization_config=getattr(config, "quantization_config", None),
                 )
 
-            if num_shared_experts > 0 and not self.use_fused:
+            if num_shared_experts > 0 and not use_inkernel_se:
                 self.shared_experts = BailingMoEMLP(
                     hidden_size=config.hidden_size,
                     intermediate_size=moe_shared_expert_intermediate_size * num_shared_experts,
@@ -662,7 +720,7 @@ class BailingMoEForCausalLM(nnx.Module):
 
             num_logical_experts = getattr(self.config, "num_experts", 256)
             moe_backend = getattr(self.config, "moe_backend", "epmoe")
-            use_fused = moe_backend == "fused"
+            use_fused = moe_backend in ("fused", "fused_v2")
 
             BLOCK_SIZE = 256
             hidden_size = self.config.hidden_size
@@ -729,11 +787,18 @@ class BailingMoEForCausalLM(nnx.Module):
 
                     if use_fused:
                         in_dim = inter_size if is_w2 else hidden_size
-                        num_blocks = in_dim // BLOCK_SIZE
+                        # Per-channel when no weight_block_size in quant config
+                        _wbs = getattr(
+                            getattr(self.config, "quantization_config", None),
+                            "weight_block_size",
+                            None,
+                        )
+                        is_per_channel = _wbs is None and moe_backend == "fused_v2"
+                        num_blocks = 1 if is_per_channel else in_dim // BLOCK_SIZE
                         # Use physical experts count for reshape (after redundant expert cloning)
                         scale_reshape = (num_physical_experts, 1, 1, out_dim)
                         logger.info("scale_reshape: %s", scale_reshape)
-                        scale_repeat = (1, num_blocks)
+                        scale_repeat = None if is_per_channel else (1, num_blocks)
 
                         scale_sharding = None
                         if mapping.sharding:
@@ -783,7 +848,8 @@ class BailingMoEForCausalLM(nnx.Module):
 
             num_shared = getattr(self.config, "num_shared_experts", 0)
             if num_shared > 0:
-                if use_fused:
+                use_fused_shared = moe_backend == "fused_v2" and num_shared > 0
+                if use_fused_shared:
                     shared_map = [
                         ("gate_proj", "w1_shared"),
                         ("up_proj", "w3_shared"),
@@ -870,18 +936,19 @@ class BailingMoEForCausalLM(nnx.Module):
     def __call__(
         self,
         forward_batch: ForwardBatch,
-        token_to_kv_pool: KVCache,
+        memory_pools: MemoryPools,
         logits_metadata: LogitsMetadata,
     ):
+        kv_pool = memory_pools.token_to_kv_pool
         hidden_states, layers_kv_fused, layers_topk_ids = self.model(
             forward_batch,
-            token_to_kv_pool,
+            kv_pool,
         )
         if not getattr(self.config, "tie_word_embeddings", False):
             output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
         else:
             output = self.logits_processor(hidden_states, self.model.embed_tokens, logits_metadata)
-        return output, layers_kv_fused, True, layers_topk_ids
+        return output, {"token_to_kv_pool": layers_kv_fused}, True, layers_topk_ids
 
 
 class BailingMoeForCausalLM(BailingMoEForCausalLM):

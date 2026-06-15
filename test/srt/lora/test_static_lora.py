@@ -3,7 +3,7 @@ from typing import List
 
 from sgl_jax.srt.entrypoints.engine import Engine
 from sgl_jax.srt.hf_transformers_utils import get_tokenizer
-from sgl_jax.test.test_utils import CustomTestCase
+from sgl_jax.test.test_utils import QWEN3_4B, CustomTestCase
 
 DTYPE = "bfloat16"
 
@@ -20,11 +20,9 @@ They're used to make predictions on text.
 class TestStaticLoRA(CustomTestCase):
     def test_diff_after_apply_dummy(self):
         print("=================== test_diff_after_apply_dummy =======================")
-        model_path = "Qwen/Qwen3-4B"
+        model_path = QWEN3_4B
         lora_target_modules = ["gate_proj"]
-        import os
 
-        os.environ["JAX_COMPILATION_CACHE_DIR"] = "/tmp/jit_cache"
         engine = Engine(
             model_path=model_path,
             trust_remote_code=True,

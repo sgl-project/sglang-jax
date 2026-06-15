@@ -108,6 +108,12 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         embeds = self.input_layernorm(embeds)
         hidden_states = self.hidden_norm(hidden_states)
 
+        # spec_info.hidden_states arrives with the target's output sharding
+        # (P('data', None)); align to embeds so explicit-sharding concat passes.
+        emb_sh = jax.typeof(embeds).sharding
+        if isinstance(emb_sh, jax.sharding.NamedSharding):
+            hidden_states = jax.sharding.reshard(hidden_states, emb_sh)
+            residual = jax.sharding.reshard(residual, emb_sh)
         hidden_states = jnp.concatenate([embeds, hidden_states], axis=-1, dtype=jnp.bfloat16)
         # Self Attention
         hidden_states, kv_fused = self.self_attn(

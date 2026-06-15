@@ -16,6 +16,7 @@ from sgl_jax.srt.configs.load_config import LoadConfig, LoadFormat
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.model_loader.arch import get_model_architecture
 from sgl_jax.srt.utils.common_utils import get_bool_env_var
+from sgl_jax.srt.utils.debug_utils import print_parameter_shardings
 
 logger = logging.getLogger(__name__)
 
@@ -260,6 +261,9 @@ class JAXModelLoader(DefaultModelLoader):
         else:
             logger.info("No quantization config found. Skipping quantization.")
         model.load_weights(model_config)
+
+        print_parameter_shardings(model)
+
         return model
 
 
