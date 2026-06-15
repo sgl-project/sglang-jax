@@ -99,13 +99,11 @@ class LinearBase(nnx.Module):
             self.mesh,
             P("data", *([None] * (x.ndim - 2)), self.kernel_axes[-1]),
         )
-        preferred_dtype = self.params_dtype
-
         out = lax.dot_general(
             x,
             self.weight.value,
             (((x.ndim - 1,), (0,)), ((), ())),
-            preferred_element_type=preferred_dtype,
+            preferred_element_type=self.params_dtype,
             out_sharding=target,
         )
 
