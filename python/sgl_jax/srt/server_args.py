@@ -1356,9 +1356,10 @@ class ServerArgs:
             "--disaggregation-d2h-max-tokens",
             type=int,
             default=ServerArgs.disaggregation_d2h_max_tokens,
-            help="Per-buffer token capacity for QueueHostKVPool. "
-            "Defaults to max_total_num_tokens / pool_size at engine "
-            "init time.",
+            help="Per-buffer token capacity for QueueHostKVPool (path A). "
+            "Each buffer is sized to hold one request's padded KV up to this "
+            "many tokens; must be >= your longest PD prompt. Defaults to "
+            "max_total_num_tokens at engine init time.",
         )
         parser.add_argument(
             "--disaggregation-host-ip",

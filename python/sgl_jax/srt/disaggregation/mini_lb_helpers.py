@@ -27,6 +27,18 @@ def get_request_batch_size(request: dict[str, Any]) -> int | None:
     return None
 
 
+def _expand_identity_field(value: Any, batch_size: int) -> list[str]:
+    """Expand a scalar id into ``batch_size`` aligned per-item ids.
+
+    Mirrors ``GenerateReqInput._normalize_rid``'s ``"{rid}_{i}"`` scheme so an
+    already-list value is left untouched and a scalar becomes per-item unique.
+    """
+
+    if isinstance(value, list):
+        return value
+    return [f"{value}_{i}" for i in range(batch_size)]
+
+
 def ensure_request_identity_fields(
     request_data: dict[str, Any],
 ) -> dict[str, Any]:
@@ -46,6 +58,15 @@ def ensure_request_identity_fields(
         rid = disagg_transfer_id
     elif disagg_transfer_id is None:
         disagg_transfer_id = rid
+
+    # For batched requests GenerateReqInput expands a scalar rid into per-item
+    # ids ("{rid}_{i}") but indexes disagg_transfer_id as-is, so a scalar
+    # transfer id would be shared by every element and the prefill side would
+    # register colliding uuid:kv entries. Expand both to aligned per-item lists
+    # here so each element carries a unique, P/D-consistent transfer id.
+    if batch_size is not None:
+        rid = _expand_identity_field(rid, batch_size)
+        disagg_transfer_id = _expand_identity_field(disagg_transfer_id, batch_size)
 
     modified_request["rid"] = rid
     modified_request["disagg_transfer_id"] = disagg_transfer_id

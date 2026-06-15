@@ -321,12 +321,16 @@ class SchedulerDisaggregationDecodeMixin:
                 continue
 
             try:
-                from sgl_jax.srt.disaggregation.bootstrap import check_prefill_compat
+                from sgl_jax.srt.disaggregation.bootstrap import (
+                    check_prefill_compat,
+                    resolve_kv_dtype_name,
+                )
 
+                local_kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
                 check_prefill_compat(
                     p_info,
                     local_page_size=self.server_args.page_size,
-                    local_kv_dtype=self.server_args.kv_cache_dtype,
+                    local_kv_dtype=resolve_kv_dtype_name(local_kv_pool.dtype),
                 )
             except ValueError as exc:
                 logger.error(

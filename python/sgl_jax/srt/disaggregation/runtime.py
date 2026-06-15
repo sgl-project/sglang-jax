@@ -35,6 +35,7 @@ def install_disaggregation_wiring(scheduler: Scheduler, server_args: ServerArgs)
         BootstrapServer,
         HeartbeatDaemon,
         PrefillInfoCache,
+        resolve_kv_dtype_name,
     )
     from sgl_jax.srt.disaggregation.common.zmq_notifier import ZmqPullNotifier
     from sgl_jax.srt.disaggregation.decode import (
@@ -82,14 +83,30 @@ def install_disaggregation_wiring(scheduler: Scheduler, server_args: ServerArgs)
     notifier.start()
     host_pool = None
     if server_args.disaggregation_enable_d2h and mode == "prefill":
-        from sgl_jax.srt.disaggregation.prefill import _KV_GATHER_PAGE_BUCKETS
+        from sgl_jax.srt.disaggregation.prefill import (
+            _KV_GATHER_PAGE_BUCKETS,
+            _pad_to_page_bucket,
+        )
         from sgl_jax.srt.mem_cache.host_kv_pool import QueueHostKVPool
 
         kv_pool = scheduler.token_to_kv_pool_allocator.get_kvcache()
         per_layer_shape = tuple(int(d) for d in kv_pool.kv_buffer[0].shape[1:])
+        # Size each host buffer to the largest single-request KV that can be
+        # staged. A buffer must hold one request's padded pages; the cap is the
+        # D2H max-token setting when given, else the device KV budget (no single
+        # request can exceed max_total_num_tokens). Round up via the same bucket
+        # logic as gather so copy_from_device never rejects an admissible req.
+        d2h_max_tokens = server_args.disaggregation_d2h_max_tokens
+        if d2h_max_tokens is None:
+            d2h_max_tokens = scheduler.max_total_num_tokens
+        page_size = server_args.page_size
+        max_request_pages = (d2h_max_tokens + page_size - 1) // page_size
+        max_padded_pages = max(
+            _pad_to_page_bucket(max_request_pages), _KV_GATHER_PAGE_BUCKETS[-1]
+        )
         host_pool = QueueHostKVPool(
             pool_size=server_args.disaggregation_d2h_pool_size,
-            max_padded_pages=_KV_GATHER_PAGE_BUCKETS[-1],
+            max_padded_pages=max_padded_pages,
             layer_num=kv_pool.layer_num,
             per_layer_shape=per_layer_shape,
             dtype=kv_pool.dtype,
@@ -101,7 +118,7 @@ def install_disaggregation_wiring(scheduler: Scheduler, server_args: ServerArgs)
             "D2H host pool wired: pool_size=%d max_padded_pages=%d layer_num=%d "
             "per_layer_shape=%s",
             server_args.disaggregation_d2h_pool_size,
-            _KV_GATHER_PAGE_BUCKETS[-1],
+            max_padded_pages,
             kv_pool.layer_num,
             per_layer_shape,
         )
@@ -129,6 +146,7 @@ def install_disaggregation_wiring(scheduler: Scheduler, server_args: ServerArgs)
 
         scheduler.disagg_prefill_queue = PrefillBootstrapQueue()
         bootstrap_key = f"{local_host}:{transfer_port}"
+        prefill_kv_pool = scheduler.token_to_kv_pool_allocator.get_kvcache()
         scheduler.disagg_bootstrap_client.register_prefill(
             bootstrap_key=bootstrap_key,
             host=local_host,
@@ -140,7 +158,7 @@ def install_disaggregation_wiring(scheduler: Scheduler, server_args: ServerArgs)
             jax_process_index=jax.process_index(),
             jax_process_count=jax.process_count(),
             page_size=server_args.page_size,
-            kv_dtype=server_args.kv_cache_dtype,
+            kv_dtype=resolve_kv_dtype_name(prefill_kv_pool.dtype),
         )
         scheduler.disagg_heartbeat = HeartbeatDaemon(
             scheduler.disagg_bootstrap_client, bootstrap_key

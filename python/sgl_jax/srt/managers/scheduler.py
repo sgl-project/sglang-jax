@@ -2168,6 +2168,20 @@ class Scheduler(
                     self._release_decode_kv_indices(entry.kv_indices)
                 self._abort_decode_request(entry.req, "abort_request")
 
+        # Decode reqs deferred because no prefill was registered yet hold no KV
+        # or receiver, but abort_request must still drop them so a cancelled
+        # request is not re-admitted on the next decode tick.
+        pending_bootstrap = getattr(self, "_pd_pending_bootstrap", None)
+        if pending_bootstrap:
+            survivors = []
+            for req in pending_bootstrap:
+                if recv_req.abort_all or req.rid.startswith(recv_req.rid):
+                    logger.debug("Abort pending-bootstrap request. rid=%s", req.rid)
+                    self._abort_decode_request(req, "abort_request")
+                else:
+                    survivors.append(req)
+            self._pd_pending_bootstrap = survivors
+
     def pause_generation(self, recv_req: PauseGenerationReqInput):
         self._engine_paused = True
 
