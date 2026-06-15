@@ -434,25 +434,25 @@ class FlashAttention(AttentionBackend):
         distribution = np.column_stack(
             [np.zeros_like(local_n), np.zeros_like(local_n), local_n]
         ).ravel()
+        sharding = NamedSharding(self.mesh, P("data"))
+        n = batch.speculative_num_steps
+        all_host = (
+            (cu_q_lens, distribution)
+            + tuple(cu_kv_lens)
+            + tuple(page_indices)
+            + tuple(seq_lens_list)
+        )
+        all_dev = device_array(all_host, sharding=sharding)
+        cu_q_dev = all_dev[0]
+        dist_dev = all_dev[1]
         metadata = []
-        for i in range(batch.speculative_num_steps):
+        for i in range(n):
             metadata_tmp = FlashAttentionMetadata()
-            (
-                metadata_tmp.cu_q_lens,
-                metadata_tmp.cu_kv_lens,
-                metadata_tmp.page_indices,
-                metadata_tmp.seq_lens,
-                metadata_tmp.distribution,
-            ) = device_array(
-                (
-                    cu_q_lens,
-                    cu_kv_lens[i],
-                    page_indices[i],
-                    seq_lens_list[i],
-                    distribution,
-                ),
-                sharding=(NamedSharding(self.mesh, P("data"))),
-            )
+            metadata_tmp.cu_q_lens = cu_q_dev
+            metadata_tmp.cu_kv_lens = all_dev[2 + i]
+            metadata_tmp.page_indices = all_dev[2 + n + i]
+            metadata_tmp.seq_lens = all_dev[2 + 2 * n + i]
+            metadata_tmp.distribution = dist_dev
             metadata.append(metadata_tmp)
         return metadata
 
