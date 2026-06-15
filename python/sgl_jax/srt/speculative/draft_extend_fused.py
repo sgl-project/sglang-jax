@@ -1374,6 +1374,7 @@ def fused_eagle3_draft_extend_decode(draft_worker, model_worker_batch, batch_out
         mr,
         batch_output,
         draft_worker.speculative_num_draft_tokens,
+        skip_logits_metadata=True,
     )
     if model_worker_batch.input_ids.shape[0] <= 0:
         return

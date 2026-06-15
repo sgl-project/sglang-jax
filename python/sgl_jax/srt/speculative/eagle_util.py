@@ -607,6 +607,7 @@ class EagleDraftInput:
         draft_model_runner: Any,
         batch_output: GenerationBatchResult,
         speculative_num_draft_tokens: int,
+        skip_logits_metadata: bool = False,
     ):
         model_worker_batch.spec_info_padded = self
         sel = model_worker_batch.logits_indices_selector
@@ -641,11 +642,14 @@ class EagleDraftInput:
         )
 
         draft_model_runner.attn_backend.forward_metadata = forward_metadata
-        from sgl_jax.srt.layers.logits_processor import LogitsMetadata
+        if not skip_logits_metadata:
+            from sgl_jax.srt.layers.logits_processor import LogitsMetadata
 
-        logits_metadata = LogitsMetadata.from_model_worker_batch(
-            model_worker_batch, draft_model_runner.mesh
-        )
+            logits_metadata = LogitsMetadata.from_model_worker_batch(
+                model_worker_batch, draft_model_runner.mesh
+            )
+        else:
+            logits_metadata = None
         return model_worker_batch, logits_metadata
 
     def prepare_for_decode(self, schedule_batch: ScheduleBatch):
