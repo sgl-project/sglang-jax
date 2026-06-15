@@ -29,24 +29,7 @@ from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 logger = logging.getLogger(__name__)
 
 
-_USE_FP32_ACCUM_FOR_TPU_V7X = None
-
-
-def _get_preferred_dtype(params_dtype) -> jnp.dtype:
-    global _USE_FP32_ACCUM_FOR_TPU_V7X
-    if _USE_FP32_ACCUM_FOR_TPU_V7X is not None:
-        return jnp.float32 if _USE_FP32_ACCUM_FOR_TPU_V7X else params_dtype
-
-    _USE_FP32_ACCUM_FOR_TPU_V7X = False
-    try:
-        devs = jax.devices()
-        if len(devs) > 0 and devs[0].platform == "tpu":
-            device_kind = getattr(devs[0], "device_kind", "")
-            if "7x" in device_kind or device_kind == "TPU7x":
-                _USE_FP32_ACCUM_FOR_TPU_V7X = True
-    except Exception:
-        pass
-    return jnp.float32 if _USE_FP32_ACCUM_FOR_TPU_V7X else params_dtype
+# No-op: FP32 accumulation logic removed to keep native BF16 execution.
 
 
 class GlmNorm(nnx.Module):
@@ -356,15 +339,13 @@ class Glm5Attention(nnx.Module):
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
     ) -> tuple[jax.Array, jax.Array]:
-        preferred_dtype = _get_preferred_dtype(q_nope.dtype)
         # "thd,rhd->thr"
         ql_nope = jax.lax.dot_general(
             q_nope,
             self.w_uk.value,
             (((2,), (2,)), ((1,), (1,))),
-            preferred_element_type=preferred_dtype,
         )
-        ql_nope = ql_nope.transpose(1, 0, 2).astype(q_nope.dtype)
+        ql_nope = ql_nope.transpose(1, 0, 2)
 
         c_kv_3d = compressed[:, None, :]
         attn_output, kv_fused = self.attn_mqa(
@@ -381,9 +362,8 @@ class Glm5Attention(nnx.Module):
             attn_output,
             self.w_uv.value,
             (((2,), (0,)), ((1,), (1,))),
-            preferred_element_type=preferred_dtype,
         )
-        o_v = o_v.transpose(1, 0, 2).astype(q_nope.dtype)
+        o_v = o_v.transpose(1, 0, 2)
         attn_output = o_v.reshape(-1, self.num_heads * self.v_head_dim)
         return attn_output, kv_fused
 
