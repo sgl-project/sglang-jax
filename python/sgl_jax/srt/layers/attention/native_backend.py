@@ -109,6 +109,7 @@ class NativeAttention(AttentionBackend):
             xai_temperature_len=xai_temp_len,
             attention_sink=attention_sink,
             sliding_window_size=layer.sliding_window_size,
+            softmax_dtype=layer.softmax_dtype,
         )
 
         # Return full fused KV buffer for this layer so that caller can persist it outside JIT
@@ -183,6 +184,7 @@ def forward_attention(
     xai_temperature_len: float | None = None,
     attention_sink: jax.Array | None = None,
     sliding_window_size: int | None = None,
+    softmax_dtype: jnp.dtype | None = None,
 ):
     """
     Forward pass using native JAX implementation with block-diagonal attention.
@@ -296,6 +298,10 @@ def forward_attention(
         attn_logits = _apply_decode_mask(attn_logits, seq_lengths, sliding_window_size, mesh=mesh)
 
     # Softmax (with optional attention sink)
+    # Cast to softmax_dtype if specified for improved numerical stability
+    if softmax_dtype is not None:
+        attn_logits = attn_logits.astype(softmax_dtype)
+
     max_logit = jnp.max(attn_logits, axis=-1, keepdims=True)
     attn_logits = attn_logits - max_logit
     exp_logits = jnp.exp(attn_logits)
@@ -308,6 +314,10 @@ def forward_attention(
         sum_exp = sum_exp + sink_term
 
     attn_weights = exp_logits / sum_exp
+
+    # Cast back to original dtype if softmax was in higher precision
+    if softmax_dtype is not None and attn_weights.dtype != v_heads.dtype:
+        attn_weights = attn_weights.astype(v_heads.dtype)
 
     # attn_output: [num_tokens, num_heads, v_head_dim]
     attn_output = jnp.einsum("qhk,khd->qhd", attn_weights, v_heads)

@@ -1641,6 +1641,7 @@ def get_vmem_limit():
         "k_scale",
         "v_scale",
         "xai_temperature_len",
+        "softmax_dtype",
         "chunk_prefill_size",
         "d_block_sizes",
         "p_block_sizes",

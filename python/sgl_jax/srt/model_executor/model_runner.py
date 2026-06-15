@@ -432,6 +432,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         elif backend == "fa" and self.use_mla_backend:
             from sgl_jax.srt.layers.attention.mla_backend import MLAAttentionBackend
 
+            logger.warning("Softmax dtype is not configurable for MLA backend through DtypeConfig.")
             cfg = self.model_config.hf_text_config
             full_attn_backend = MLAAttentionBackend(
                 num_attn_heads=self.num_attn_heads,

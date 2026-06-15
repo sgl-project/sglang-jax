@@ -1,6 +1,7 @@
 import copy
 import dataclasses
 import glob
+import inspect
 import logging
 import os
 from abc import ABC, abstractmethod
@@ -231,8 +232,6 @@ class JAXModelLoader(DefaultModelLoader):
         else:
             config = model_config.hf_config
 
-        import inspect
-
         kwargs = {"dtype": model_config.dtype, "mesh": self.mesh}
         if "dtype_config" in inspect.signature(model_class.__init__).parameters:
             kwargs["dtype_config"] = getattr(model_config, "dtype_config", None)
@@ -298,8 +297,6 @@ class JAXDummyModelLoader(BaseModelLoader):
         model_config: ModelConfig,
     ) -> Any:
         model_class = self._initialize_model(model_config)
-
-        import inspect
 
         kwargs = {"dtype": model_config.dtype, "mesh": self.mesh}
         if "dtype_config" in inspect.signature(model_class.__init__).parameters:

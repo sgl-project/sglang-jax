@@ -25,6 +25,13 @@ class DtypeConfig:
         # Resolve the default dtype for this level
         self.default_dtype = self.config_dict.get("default", jnp.dtype(default_dtype))
 
+    def __repr__(self) -> str:
+        """Return a concise representation including config_dict and default_dtype."""
+        return (
+            f"DtypeConfig(config_dict={self.config_dict!r}, "
+            f"default_dtype={self.default_dtype!r})"
+        )
+
     def _parse_dict(self, d: dict[str, Any]) -> dict[str, Any]:
         """Recursively parses a dictionary, converting string dtypes to jnp.dtype."""
         parsed = {}
@@ -48,10 +55,30 @@ class DtypeConfig:
         )
 
     def get_dtype(self, key: str) -> jnp.dtype | None:
-        """Returns the specific dtype, or falls back to the default."""
+        """Returns the specific dtype, or falls back to the default.
+
+        This is ideal for weights like q_proj, gate_proj, etc. that should always
+        have a dtype (defaulting to the model's default dtype if not explicitly set).
+        """
         val = self.config_dict.get(key, self.default_dtype)
         if isinstance(val, dict):
             return self.default_dtype
+        if val is None:
+            return None
+        return jnp.dtype(val)
+
+    def get_optional_dtype(self, key: str) -> jnp.dtype | None:
+        """Returns the specific dtype, or None if the key is not explicitly set.
+
+        This is ideal for optional parameters like softmax_dtype that should only
+        be used if explicitly configured. Returns None if the key is not present
+        in the config_dict.
+        """
+        if key not in self.config_dict:
+            return None
+        val = self.config_dict[key]
+        if isinstance(val, dict):
+            return None
         if val is None:
             return None
         return jnp.dtype(val)

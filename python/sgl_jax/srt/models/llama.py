@@ -53,10 +53,6 @@ class LlamaMLP(nnx.Module):
         self.layer_id = layer_id
         if dtype_config is None:
             dtype_config = DtypeConfig(default_dtype=dtype)
-        elif dtype != dtype_config.default_dtype:
-            raise ValueError(
-                f"Global dtype ({dtype}) is not the same as the default dtype provided in dtype_config ({dtype_config.default_dtype})."
-            )
 
         self.gate_proj = LinearBase(
             input_size=hidden_size,
@@ -120,10 +116,6 @@ class LlamaAttention(nnx.Module):
 
         if dtype_config is None:
             dtype_config = DtypeConfig(default_dtype=dtype)
-        elif dtype != dtype_config.default_dtype:
-            raise ValueError(
-                f"Global dtype ({dtype}) is not the same as the default dtype provided in dtype_config ({dtype_config.default_dtype})."
-            )
 
         if partial_rotary_factor is None:
             partial_rotary_factor = 1
@@ -183,7 +175,7 @@ class LlamaAttention(nnx.Module):
             scaling=self.scaling,
             num_kv_heads=num_kv_heads,
             layer_id=layer_id,
-            softmax_dtype=dtype_config.get_dtype("softmax"),
+            softmax_dtype=dtype_config.get_optional_dtype("softmax"),
         )
 
     def __call__(
@@ -224,10 +216,6 @@ class LlamaDecoderLayer(nnx.Module):
         self.layer_id = layer_id
         if dtype_config is None:
             dtype_config = DtypeConfig(default_dtype=dtype)
-        elif dtype != dtype_config.default_dtype:
-            raise ValueError(
-                f"Global dtype ({dtype}) is not the same as the default dtype provided in dtype_config ({dtype_config.default_dtype})."
-            )
 
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
@@ -338,10 +326,6 @@ class LlamaModel(nnx.Module):
         self.vocab_size = config.vocab_size
         if dtype_config is None:
             dtype_config = DtypeConfig(default_dtype=dtype)
-        elif dtype != dtype_config.default_dtype:
-            raise ValueError(
-                f"Global dtype ({dtype}) is not the same as the default dtype provided in dtype_config ({dtype_config.default_dtype})."
-            )
 
         if not is_draft_model:
             self.embed_tokens = Embed(
