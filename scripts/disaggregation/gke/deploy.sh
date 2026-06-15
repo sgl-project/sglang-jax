@@ -14,7 +14,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 JOB_NAME="pd-e2e-test"
 GH_ORG="sgl-project"
 BRANCH="pd/scheduler"
-TEMPLATE="${SCRIPT_DIR}/pd_e2e_job.yaml"
+TEMPLATE="${SCRIPT_DIR}/pd_router_e2e_job.yaml"
 GENERATED="/tmp/${JOB_NAME}.yaml"
 
 export USE_GKE_GCLOUD_AUTH_PLUGIN=True
