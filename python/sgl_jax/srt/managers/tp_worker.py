@@ -196,6 +196,10 @@ class ModelWorker:
         if server_args.moe_backend == "fused" and server_args.ep_size > 1:
             from sgl_jax.srt.utils.common_utils import align_bs_for_fused_ep
 
+            assert server_args.ep_size % dp_size == 0, (
+                f"fused MoE requires ep_size ({server_args.ep_size}) to be a multiple "
+                f"of dp_size ({dp_size}) so the ep-aligned cap stays dp-aligned"
+            )
             aligned = align_bs_for_fused_ep(self.max_running_requests, server_args.ep_size)
             if aligned != self.max_running_requests:
                 logger.warning(

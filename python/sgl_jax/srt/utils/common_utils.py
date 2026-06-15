@@ -51,6 +51,11 @@ def align_bs_for_fused_ep(bs: int, ep_size: int) -> int:
     if ep_size <= 1:
         return bs
     local = bs // ep_size
+    if local < 2:
+        raise ValueError(
+            f"max_running_requests={bs} is below the fused-MoE minimum "
+            f"(2 * ep_size = {2 * ep_size}); reduce ep_size or increase capacity."
+        )
     local = (local // 8) * 8 if local >= 8 else (4 if local >= 4 else 2)
     return local * ep_size
 

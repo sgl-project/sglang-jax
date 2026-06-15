@@ -21,6 +21,12 @@ class TestAlignBsForFusedEp(unittest.TestCase):
         self.assertEqual(align_bs_for_fused_ep(100, 32), 64)  # local=3→2
         self.assertEqual(align_bs_for_fused_ep(200, 32), 128)  # local=6→4
 
+    def test_below_minimum_raises(self):
+        with self.assertRaises(ValueError):
+            align_bs_for_fused_ep(10, 32)  # local=0, would up-align past bs
+        with self.assertRaises(ValueError):
+            align_bs_for_fused_ep(63, 32)  # local=1
+
     def test_ep_le_1_passthrough(self):
         self.assertEqual(align_bs_for_fused_ep(408, 1), 408)
         self.assertEqual(align_bs_for_fused_ep(408, 0), 408)
