@@ -939,6 +939,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             )
 
         cum = {"image": 0, "video": 0}
+        pending = []  # (r, fused_device) -- merges dispatched async, gathered in ONE device_get
         for r, ids, rows, aud in plan:
             kw = {}
             for m in ("image", "video"):
@@ -952,7 +953,16 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             if not kw:
                 continue  # mm_inputs but no encodable feature -> treated as text (no embedding)
             fused, _, _ = self.jitted_merge_mm(_put(ids), **kw)
-            r.multimodal_embedding = np.asarray(jax.device_get(fused))
+            pending.append((r, fused))
+        # Partial 甲->乙 (design §5.2.2): gather all reqs' fused embeddings in ONE device_get instead
+        # of a blocking per-req device_get inside the loop -> the N merge jits dispatch async and
+        # their D2H copies overlap, removing the serial sync that stalled the encode loop. (The full
+        # device-resident handoff -- no D2H at all -- needs a multi-host-SPMD-aware device-side
+        # assembly in _merge_multimodal/forward_batch_info and is a scoped follow-up; design §7.)
+        if pending:
+            host_embeds = jax.device_get([f for _, f in pending])
+            for (r, _), emb in zip(pending, host_embeds):
+                r.multimodal_embedding = np.asarray(emb)
 
     def _aot_vision_reserve_bytes(self) -> int:
         """G1 (design §5.7 option 3): AOT-lower the encode jit at the max vision shape and read
