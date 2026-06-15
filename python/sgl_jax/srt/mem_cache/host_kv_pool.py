@@ -56,24 +56,6 @@ def _make_host_sharding(mesh: Mesh, partition_spec: PartitionSpec) -> NamedShard
 
 
 @dataclass
-class HostBufferHandle:
-    """Handle for an in-use host buffer.
-
-    ``buffer`` is the reserved slot's per-layer list of host arrays (one
-    ``jax.Array`` per layer), i.e. the same ``self._buffers[buffer_id]``
-    list the pool holds. The individual per-layer arrays are replaced
-    functionally (via ``.at[].set()``) on each
-    :meth:`HostKVPool.copy_from_device`, so the list contents may change;
-    callers should index through the handle rather than caching the
-    elements across multiple ``copy_from_device`` calls.
-    """
-
-    buffer_id: int
-    num_tokens: int
-    buffer: list[jax.Array]
-
-
-@dataclass
 class StagedData:
     """Result of a successful D2H staging copy.
 
@@ -112,27 +94,6 @@ class HostKVPool(abc.ABC):
         """Return a reserved slot to the pool by id."""
 
     @abc.abstractmethod
-    def alloc(self, num_tokens: int) -> HostBufferHandle | None:
-        """Reserve one pool entry.
-
-        Returns ``None`` if the pool is empty. The returned handle's
-        ``buffer`` field is the un-modified pre-allocated per-layer
-        entry; use :meth:`copy_from_device` if you want it filled.
-        """
-
-    @abc.abstractmethod
-    def free(self, handle: HostBufferHandle) -> None:
-        """Return ``handle``'s entry to the pool."""
-
-    @abc.abstractmethod
-    def get_buffer(self) -> tuple[int, HostBufferHandle]:
-        """Low-level: pull one entry."""
-
-    @abc.abstractmethod
-    def put_buffer(self, buffer_id: int) -> None:
-        """Low-level: return an entry by id."""
-
-    @abc.abstractmethod
     def copy_from_device(self, layers: list[jax.Array], buffer_id: int) -> StagedData:
         """D2H staging primitive used by PD ``producer_handoff``.
 
@@ -156,8 +117,8 @@ class QueueHostKVPool(HostKVPool):
     """FIFO-queue implementation of :class:`HostKVPool`.
 
     Short-lived borrows only — no LRU, no eviction, no lock_ref. Borrow
-    via :meth:`alloc` or :meth:`copy_from_device`, return via
-    :meth:`free` or :meth:`put_buffer`. ``self._lock`` protects only the
+    via :meth:`reserve`, fill via :meth:`copy_from_device`, return via
+    :meth:`release`. ``self._lock`` protects only the
     ``_free_ids`` free-list (reserve/release); the per-slot buffer writes
     in :meth:`copy_from_device` are NOT lock-protected and rely instead on
     the caller holding an exclusive reservation of that ``buffer_id``. The
@@ -242,29 +203,6 @@ class QueueHostKVPool(HostKVPool):
         return buffer_id
 
     def release(self, buffer_id: int) -> None:
-        self._release(buffer_id)
-
-    # Legacy methods (alloc/free/get_buffer/put_buffer + HostBufferHandle) are
-    # retained only for the legacy ``conn.put_buffer`` path and are slated for
-    # removal once that caller is migrated to reserve/copy_from_device/release.
-    def alloc(self, num_tokens: int) -> HostBufferHandle | None:  # noqa: ARG002
-        bid = self.reserve()
-        if bid is None:
-            return None
-        return HostBufferHandle(buffer_id=bid, num_tokens=0, buffer=self._buffers[bid])
-
-    def free(self, handle: HostBufferHandle) -> None:
-        self._release(handle.buffer_id)
-
-    def get_buffer(self) -> tuple[int, HostBufferHandle]:
-        bid = self.reserve()
-        if bid is None:
-            raise RuntimeError(
-                "QueueHostKVPool is empty; caller should have checked available_size() first"
-            )
-        return bid, HostBufferHandle(buffer_id=bid, num_tokens=0, buffer=self._buffers[bid])
-
-    def put_buffer(self, buffer_id: int) -> None:
         self._release(buffer_id)
 
     def copy_from_device(self, layers: list[jax.Array], buffer_id: int) -> StagedData:

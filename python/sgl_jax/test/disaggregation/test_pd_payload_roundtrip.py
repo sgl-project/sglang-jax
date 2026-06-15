@@ -35,9 +35,6 @@ class _FakePool:
     def release(self, buffer_id):
         self.released.append(buffer_id)
 
-    def put_buffer(self, buffer_id):
-        self.released.append(buffer_id)
-
 
 def test_path_a_uses_reserved_buffer_and_no_op_on_done():
     w = _FakeWrapper()
