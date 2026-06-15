@@ -80,6 +80,25 @@ def _reject_if_below_protocol_floor(info: dict[str, object]) -> None:
         )
 
 
+def resolve_kv_dtype_name(dtype: object) -> str:
+    """Canonical dtype name for KV-layout compatibility advertising.
+
+    Both peers must publish the dtype actually used by their initialized KV
+    pool — not the CLI literal (often ``"auto"``) — otherwise two peers with
+    different resolved dtypes but both configured ``auto`` would pass the
+    compatibility check, and an ``auto`` peer could reject a compatible one.
+    """
+
+    if dtype is None:
+        return ""
+    try:
+        import jax.numpy as jnp
+
+        return str(jnp.dtype(dtype).name)
+    except Exception:
+        return str(dtype)
+
+
 def check_prefill_compat(
     info: dict[str, object],
     *,
@@ -525,11 +544,13 @@ class PrefillInfoCache:
     loop.
 
     The full registry is fetched via ``list_prefills`` at most once per
-    ``refresh_interval_s`` (rate-limited). A cache miss (no prefill resolvable
-    for a room) triggers at most one rate-limited refresh, then re-resolves;
-    if the registry is still empty it returns ``None`` so the caller defers the
-    request and retries next tick (never abort). This is sglang's design:
-    resolve locally from a cached cluster layout, hit the network only on miss.
+    ``refresh_interval_s`` (rate-limited), on the first lookup after the
+    interval elapses — whether or not the room currently resolves. This evicts
+    prefills that have died or unregistered instead of pinning routing to a
+    stale entry. If the registry is empty the room returns ``None`` so the
+    caller defers the request and retries next tick (never abort). This is
+    sglang's design: resolve locally from a cached cluster layout, refreshing
+    the layout on a bounded interval.
     """
 
     def __init__(
@@ -565,18 +586,18 @@ class PrefillInfoCache:
         """Return prefill info for ``bootstrap_room``, or ``None`` if no
         prefill is registered yet (caller should defer + retry).
 
-        Resolves from the warm cache first; on miss, performs at most one
-        rate-limited ``list_prefills`` refresh, then resolves again. Raises
-        ``RuntimeError`` if the chosen peer is below the protocol floor.
+        Refreshes the warm cache whenever ``refresh_interval_s`` has elapsed
+        (rate-limited), regardless of hit/miss, so a prefill that has died or
+        unregistered is evicted instead of being served from a stale entry.
+        Within the interval, a hit returns from cache with zero network I/O.
+        Raises ``RuntimeError`` if the chosen peer is below the protocol floor.
         """
 
         with self._lock:
+            now = self._clock()
+            if now - self._last_refresh >= self._refresh_interval_s:
+                self._refresh_locked()
             info = self._pick_locked(bootstrap_room)
-            if info is None:
-                now = self._clock()
-                if now - self._last_refresh >= self._refresh_interval_s:
-                    self._refresh_locked()
-                    info = self._pick_locked(bootstrap_room)
         if info is None:
             return None
         _reject_if_below_protocol_floor(info)

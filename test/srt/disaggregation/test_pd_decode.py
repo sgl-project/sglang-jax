@@ -561,6 +561,13 @@ class _ServerArgs:
     kv_cache_dtype = ""
     enable_request_time_stats_logging = False
 
+class _NoopKVCache:
+    dtype = None
+
+class _NoopAllocator:
+    def get_kvcache(self):
+        return _NoopKVCache()
+
 class _FakeCache:
     """Returns queued results per ``pick_for_room`` call (dict or None)."""
 
@@ -588,6 +595,7 @@ class _FakeScheduler:
         self._pd_pending_bootstrap = []
         self.aborted = []
         self.failures = []
+        self.token_to_kv_pool_allocator = _NoopAllocator()
 
     def process_input_requests(self, recv_reqs):
         self.waiting_queue.extend(recv_reqs)
