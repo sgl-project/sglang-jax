@@ -386,9 +386,79 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             # G1 AOT (design §5.7 option 3): handle to AOT-lower the encode jit at the max vision
             # shape and read its XLA temp_size for a tight HBM reserve (best-effort).
             self._embed_mm_aot = (jitted_embed_mm, model_def, model_state_def)
+
+            # L-k (design §7): batched vision encode. encode_mm runs ONE tower pass over all images
+            # of all reqs in the batch (patches concatenated; the ViT segments per-image so this is
+            # equivalent to one req with more images), then merge_mm merges per req. Built only for
+            # models exposing the split (no-deepstack VLMs: MiMo, Qwen2.5-VL). encode_mm_reqs uses
+            # this batched path when V-2 bucketing is off; else falls back to per-req embed_mm.
+            if hasattr(self.model, "encode_mm") and hasattr(self.model, "merge_mm"):
+
+                @partial(
+                    jax.jit,
+                    static_argnames=[
+                        "model_state_def",
+                        "mm_grid_thw",
+                        "mm_video_grid_thw",
+                        "mm_audio_feature_lengths",
+                    ],
+                )
+                def jitted_encode_mm(
+                    model_def,
+                    model_state_def,
+                    model_state_leaves,
+                    mm_pixel_values=None,
+                    mm_grid_thw=None,
+                    mm_pixel_values_videos=None,
+                    mm_video_grid_thw=None,
+                    mm_audio_features=None,
+                    mm_audio_feature_lengths=None,
+                    mm_audio_codes=None,
+                ):
+                    model = nnx.merge(
+                        model_def,
+                        jax.tree_util.tree_unflatten(model_state_def, model_state_leaves),
+                    )
+                    return model.encode_mm(
+                        mm_pixel_values=mm_pixel_values,
+                        mm_grid_thw=mm_grid_thw,
+                        mm_pixel_values_videos=mm_pixel_values_videos,
+                        mm_video_grid_thw=mm_video_grid_thw,
+                        mm_audio_features=mm_audio_features,
+                        mm_audio_feature_lengths=mm_audio_feature_lengths,
+                        mm_audio_codes=mm_audio_codes,
+                    )
+
+                @partial(jax.jit, static_argnames=["model_state_def"])
+                def jitted_merge_mm(
+                    model_def,
+                    model_state_def,
+                    model_state_leaves,
+                    input_ids,
+                    image=None,
+                    video=None,
+                    audio=None,
+                ):
+                    model = nnx.merge(
+                        model_def,
+                        jax.tree_util.tree_unflatten(model_state_def, model_state_leaves),
+                    )
+                    return model.merge_mm(input_ids, image=image, video=video, audio=audio)
+
+                self.jitted_encode_mm = lambda **kw: jitted_encode_mm(
+                    model_def, model_state_def, self.model_state_leaves, **kw
+                )
+                self.jitted_merge_mm = lambda input_ids, **kw: jitted_merge_mm(
+                    model_def, model_state_def, self.model_state_leaves, input_ids, **kw
+                )
+            else:
+                self.jitted_encode_mm = None
+                self.jitted_merge_mm = None
         else:
             self.jitted_embed_mm = None
             self._embed_mm_aot = None
+            self.jitted_encode_mm = None
+            self.jitted_merge_mm = None
 
         self.jitted_sampler = partial(
             jitted_sampler,
@@ -718,13 +788,25 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             except AttributeError:
                 ctx = self.mesh
 
+        enc_reqs = [
+            r
+            for r in reqs
+            if getattr(r, "mm_inputs", None) and getattr(r, "multimodal_embedding", None) is None
+        ]
+        if not enc_reqs:
+            return
+
         with ctx:
-            for r in reqs:
-                if (
-                    not getattr(r, "mm_inputs", None)
-                    or getattr(r, "multimodal_embedding", None) is not None
-                ):
-                    continue
+            # L-k (design §7): batched vision encode -- ONE tower pass over all reqs' images (patches
+            # concatenated; the ViT segments per-image via cu_seqlens, so cross-req concat == one req
+            # with more images), then per-req merge. Used when the model exposes encode_mm/merge_mm
+            # AND V-2 bucketing is off (bucketing's per-image valid masks key recompiles on the
+            # canonical grid and don't compose with a concatenated cross-req encode -> per-req
+            # fallback). MiMo / Qwen2.5-VL only; Qwen3-Omni (deepstack) lacks encode_mm -> per-req.
+            if self.jitted_encode_mm is not None and not bucketing_on:
+                self._encode_mm_batched(enc_reqs, assemble, _put, _thw)
+                return
+            for r in enc_reqs:
                 a = assemble(r.mm_inputs)
                 img_px, vid_px = a.get("pixel_values_images"), a.get("pixel_values_videos")
                 aud_feats = a.get("audio_features")
@@ -808,6 +890,69 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                     r.deepstack_visual_embedding = np.asarray(jax.device_get(deepstack))
                     r.deepstack_visual_pos_mask = np.asarray(jax.device_get(pos_mask)).astype(bool)
                     r.apply_for_deepstack = True
+
+    def _encode_mm_batched(self, enc_reqs, assemble, _put, _thw):
+        """L-k (design §7): batch the VISION tower over ALL reqs needing encode (one ViT call for
+        every image/video across the batch), then merge per req. Correctness rests on (a) the ViT
+        segmenting per-image via cu_seqlens -- cross-req patch concat == one req with more images,
+        no leakage (design §7.4) -- and (b) merge being 1:1 placeholder<->feature, so each req's
+        per-modality feature-row count equals its placeholder count in the clean input_ids (the K-2
+        invariant, exact under non-bucketing). Audio is encoded PER-REQ (the RVQ/mel tower's
+        per-clip segmentation is not yet asserted, so cross-req audio concat is conservatively
+        avoided); audio batching is a follow-up. Caller guarantees jitted_encode_mm + bucketing-off.
+        """
+        img_tok = getattr(self.model, "image_token_id", None)
+        vid_tok = getattr(self.model, "video_token_id", None)
+        aud_tok = getattr(self.model, "audio_token_id", None)
+
+        img_px, img_grids, vid_px, vid_grids = [], [], [], []
+        plan = []  # per req: (r, input_ids_np, {modality: nrows}, audio_codes_or_None)
+        for r in enc_reqs:
+            a = assemble(r.mm_inputs)
+            ids = np.asarray(r.origin_input_ids, dtype=np.int32)
+            rows, aud = {}, None
+            ip = a.get("pixel_values_images")
+            if ip is not None and img_tok is not None:
+                img_px.append(np.asarray(ip))
+                img_grids.extend(a.get("image_grid_thw") or [])
+                rows["image"] = int(np.count_nonzero(ids == img_tok))
+            vp = a.get("pixel_values_videos")
+            if vp is not None and vid_tok is not None:
+                vid_px.append(np.asarray(vp))
+                vid_grids.extend(a.get("video_grid_thw") or [])
+                rows["video"] = int(np.count_nonzero(ids == vid_tok))
+            ac = a.get("audio_codes")
+            if ac is not None and aud_tok is not None:
+                aud = np.asarray(ac)
+            plan.append((r, ids, rows, aud))
+
+        # One batched ViT pass over all reqs' image+video patches.
+        vfeats = {}
+        if img_px or vid_px:
+            vfeats = self.jitted_encode_mm(
+                mm_pixel_values=_put(np.concatenate(img_px, 0), bf16=True) if img_px else None,
+                mm_grid_thw=_thw(img_grids) if img_grids else None,
+                mm_pixel_values_videos=(
+                    _put(np.concatenate(vid_px, 0), bf16=True) if vid_px else None
+                ),
+                mm_video_grid_thw=_thw(vid_grids) if vid_grids else None,
+            )
+
+        cum = {"image": 0, "video": 0}
+        for r, ids, rows, aud in plan:
+            kw = {}
+            for m in ("image", "video"):
+                n = rows.get(m)
+                if n:
+                    kw[m] = vfeats[m][cum[m] : cum[m] + n]
+                    cum[m] += n
+            if aud is not None:
+                # Audio per-req (batch of 1) -- conservatively not concatenated across reqs.
+                kw["audio"] = self.jitted_encode_mm(mm_audio_codes=_put(aud))["audio"]
+            if not kw:
+                continue  # mm_inputs but no encodable feature -> treated as text (no embedding)
+            fused, _, _ = self.jitted_merge_mm(_put(ids), **kw)
+            r.multimodal_embedding = np.asarray(jax.device_get(fused))
 
     def _aot_vision_reserve_bytes(self) -> int:
         """G1 (design §5.7 option 3): AOT-lower the encode jit at the max vision shape and read

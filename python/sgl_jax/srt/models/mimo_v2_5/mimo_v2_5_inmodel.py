@@ -106,6 +106,52 @@ class MiMoV2_5ForConditionalGeneration(nnx.Module):
             input_features=None, audio_feature_lengths=None, audio_codes=audio_codes
         )
 
+    def encode_mm(
+        self,
+        mm_pixel_values=None,
+        mm_grid_thw=None,
+        mm_pixel_values_videos=None,
+        mm_video_grid_thw=None,
+        mm_audio_features=None,
+        mm_audio_feature_lengths=None,
+        mm_audio_codes=None,
+        mm_real_llm_dims=None,
+        mm_real_video_llm_dims=None,
+    ):
+        """Batched per-modality tower encode (L-k, design §7): NO text_embed, NO merge. Inputs are the
+        per-modality tensors concatenated across the whole encode batch; returns a dict
+        ``{modality: features [Σrows, hidden]}`` for present modalities. The towers segment per-image
+        / per-audio internally, so concatenating across requests is equivalent to one request with
+        more items -- no cross-request leakage (design §7.4). Reused per-req (embed_mm) AND batched
+        across reqs (model_runner.encode_mm_reqs)."""
+        feats = {}
+        if mm_audio_codes is not None and self.audio_token_id is not None:
+            feats["audio"] = self.encode_audio(mm_audio_codes)
+        if mm_pixel_values is not None and self.image_token_id is not None:
+            feats["image"] = self.encode_image(mm_pixel_values, mm_grid_thw)
+        if mm_pixel_values_videos is not None and self.video_token_id is not None:
+            feats["video"] = self.encode_image(mm_pixel_values_videos, mm_video_grid_thw)
+        return feats
+
+    def merge_mm(self, input_ids, image=None, video=None, audio=None):
+        """Per-req merge (L-k): text_embed(input_ids) + scatter the pre-encoded per-modality features
+        into their placeholders. Returns ``(fused, None, None)`` (MiMo has no deepstack). Per-modality
+        scatter keeps interleaved prompts aligned (review K-1)."""
+        text_embed = self.model.model.embed_tokens(input_ids)
+        mod_embeds = []
+        placeholder_ids = []
+        if audio is not None and self.audio_token_id is not None:
+            mod_embeds.append(audio)
+            placeholder_ids.append(self.audio_token_id)
+        if image is not None and self.image_token_id is not None:
+            mod_embeds.append(image)
+            placeholder_ids.append(self.image_token_id)
+        if video is not None and self.video_token_id is not None:
+            mod_embeds.append(video)
+            placeholder_ids.append(self.video_token_id)
+        fused = merge(text_embed, mod_embeds, placeholder_ids, input_ids, mesh=self.mesh).embed
+        return fused, None, None
+
     def embed_mm(
         self,
         input_ids,
@@ -119,26 +165,19 @@ class MiMoV2_5ForConditionalGeneration(nnx.Module):
         mm_real_llm_dims=None,
         mm_real_video_llm_dims=None,
     ):
-        """C-1 (design §5.2): full-sequence text-embed + tower encode + merge. Returns the uniform
-        ``(fused [seq, hidden], None, None)`` (MiMo has no deepstack). Scheme B: input_ids is clean;
-        merge keys by the raw image/video/audio token id. (mm_audio_features / *_lengths accepted for
-        signature uniformity with Qwen3-Omni but unused -- MiMo audio is discrete codes.)"""
-        text_embed = self.model.model.embed_tokens(input_ids)
-        # Build 1:1 (features, placeholder_id) per PRESENT modality so merge scatters each into its
-        # own placeholder rows -- keeps interleaved image/video/audio prompts aligned (review K-1).
-        mod_embeds = []
-        placeholder_ids = []
-        if mm_audio_codes is not None and self.audio_token_id is not None:
-            mod_embeds.append(self.encode_audio(mm_audio_codes))
-            placeholder_ids.append(self.audio_token_id)
-        if mm_pixel_values is not None and self.image_token_id is not None:
-            mod_embeds.append(self.encode_image(mm_pixel_values, mm_grid_thw))
-            placeholder_ids.append(self.image_token_id)
-        if mm_pixel_values_videos is not None and self.video_token_id is not None:
-            mod_embeds.append(self.encode_image(mm_pixel_values_videos, mm_video_grid_thw))
-            placeholder_ids.append(self.video_token_id)
-        fused = merge(text_embed, mod_embeds, placeholder_ids, input_ids, mesh=self.mesh).embed
-        return fused, None, None
+        """Per-req encode+merge (C-1) = ``merge_mm ∘ encode_mm`` for a single request. The host encode
+        pass batches across reqs via encode_mm + merge_mm directly (L-k); this single-req composite is
+        the reference / fallback (e.g. V-2 bucketing path) and the bit-equivalence oracle."""
+        feats = self.encode_mm(
+            mm_pixel_values=mm_pixel_values,
+            mm_grid_thw=mm_grid_thw,
+            mm_pixel_values_videos=mm_pixel_values_videos,
+            mm_video_grid_thw=mm_video_grid_thw,
+            mm_audio_codes=mm_audio_codes,
+        )
+        return self.merge_mm(
+            input_ids, image=feats.get("image"), video=feats.get("video"), audio=feats.get("audio")
+        )
 
     def __call__(self, forward_batch, memory_pools, logits_metadata):
         # AR-only (C-1): the fused embedding is produced once per req by the host encode pass and

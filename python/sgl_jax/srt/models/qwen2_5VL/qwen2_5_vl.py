@@ -134,6 +134,65 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
 
     # ---- embed_mm: host-side once-per-req encode + merge (C-1); AR body reuse ----
 
+    def encode_mm(
+        self,
+        mm_pixel_values=None,
+        mm_grid_thw=None,
+        mm_pixel_values_videos=None,
+        mm_video_grid_thw=None,
+        mm_audio_features=None,
+        mm_audio_feature_lengths=None,
+        mm_audio_codes=None,
+        mm_real_llm_dims=None,
+        mm_real_video_llm_dims=None,
+    ):
+        """Batched per-modality ViT encode (L-k, design §7): NO text_embed, NO merge. Inputs are the
+        pixels/grids concatenated across the whole encode batch; returns ``{modality: features
+        [Σrows, hidden]}`` for present modalities, already compacted valid-to-front under V-2
+        bucketing. The ViT segments per-image (cu_seqlens), so concatenating across requests is
+        equivalent to one request with more images -- no cross-request leakage (design §7.4).
+        (mm_audio_* accepted for signature uniformity; Qwen2.5-VL has no audio.)"""
+
+        def _compact(hidden, valid):
+            # V-2 bucketing: move real rows to the front (stable) so the per-modality scatter --
+            # sized to the padded row count, mode="drop" -- fills the real placeholders in order
+            # and discards the trailing bucket padding. valid is None (bucketing off) -> identity.
+            if valid is None:
+                return hidden
+            n = valid.shape[0]
+            order = jnp.argsort(jnp.where(valid, jnp.arange(n), n + jnp.arange(n)))
+            return hidden[order]
+
+        feats = {}
+        if mm_pixel_values is not None and self.image_token_id is not None:
+            hidden, valid = self.encode_image(
+                mm_pixel_values, mm_grid_thw, real_llm_dims=mm_real_llm_dims
+            )
+            feats["image"] = _compact(hidden, valid)
+        if mm_pixel_values_videos is not None and self.video_token_id is not None:
+            hidden, valid = self.encode_video(
+                mm_pixel_values_videos, mm_video_grid_thw, real_llm_dims=mm_real_video_llm_dims
+            )
+            feats["video"] = _compact(hidden, valid)
+        return feats
+
+    def merge_mm(self, input_ids, image=None, video=None, audio=None):
+        """Per-req merge (L-k): text_embed(input_ids) + scatter the pre-encoded image/video features
+        into their placeholders (per-modality, keeps interleaved prompts aligned -- K-1). Returns
+        ``(fused, None, None)`` (Qwen2.5-VL has no deepstack). (audio accepted for uniformity, unused.)
+        """
+        text_embed = self.model.embed_tokens(input_ids)
+        mod_embeds = []
+        placeholder_ids = []
+        if image is not None and self.image_token_id is not None:
+            mod_embeds.append(image)
+            placeholder_ids.append(self.image_token_id)
+        if video is not None and self.video_token_id is not None:
+            mod_embeds.append(video)
+            placeholder_ids.append(self.video_token_id)
+        fused = merge(text_embed, mod_embeds, placeholder_ids, input_ids, mesh=self.mesh).embed
+        return fused, None, None
+
     def embed_mm(
         self,
         input_ids,
@@ -159,38 +218,19 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
         signature with the audio models; unused here.) mm_real_llm_dims / mm_real_video_llm_dims
         carry the *traced* real (llm_h, llm_w) per item when V-2 bucketing pads pixels to a
         canonical bucket (None = off); the padded visual rows are then compacted valid-to-front
-        so merge fills the real placeholders and drops the trailing bucket padding."""
-        text_embed = self.model.embed_tokens(input_ids)
-
-        def _compact(hidden, valid):
-            # V-2 bucketing: move real rows to the front (stable) so the per-modality scatter --
-            # sized to the padded row count, mode="drop" -- fills the real placeholders in order
-            # and discards the trailing bucket padding. valid is None (bucketing off) -> identity.
-            if valid is None:
-                return hidden
-            n = valid.shape[0]
-            order = jnp.argsort(jnp.where(valid, jnp.arange(n), n + jnp.arange(n)))
-            return hidden[order]
-
-        # Build 1:1 (features, placeholder_id) per PRESENT modality so merge scatters each into its
-        # own placeholder rows -- image and video kept separate (a fused block would cross-wire an
-        # image/video interleaved prompt, review K-1).
-        mod_embeds = []
-        placeholder_ids = []
-        if mm_pixel_values is not None and self.image_token_id is not None:
-            hidden, valid = self.encode_image(
-                mm_pixel_values, mm_grid_thw, real_llm_dims=mm_real_llm_dims
-            )
-            mod_embeds.append(_compact(hidden, valid))
-            placeholder_ids.append(self.image_token_id)
-        if mm_pixel_values_videos is not None and self.video_token_id is not None:
-            hidden, valid = self.encode_video(
-                mm_pixel_values_videos, mm_video_grid_thw, real_llm_dims=mm_real_video_llm_dims
-            )
-            mod_embeds.append(_compact(hidden, valid))
-            placeholder_ids.append(self.video_token_id)
-        fused = merge(text_embed, mod_embeds, placeholder_ids, input_ids, mesh=self.mesh).embed
-        return fused, None, None
+        so merge fills the real placeholders and drops the trailing bucket padding. Per-req
+        encode+merge = ``merge_mm ∘ encode_mm`` (the host pass batches across reqs via those two
+        directly, L-k/design §7); this composite is the single-req reference / V-2-bucketing fallback
+        and the bit-equivalence oracle."""
+        feats = self.encode_mm(
+            mm_pixel_values=mm_pixel_values,
+            mm_grid_thw=mm_grid_thw,
+            mm_pixel_values_videos=mm_pixel_values_videos,
+            mm_video_grid_thw=mm_video_grid_thw,
+            mm_real_llm_dims=mm_real_llm_dims,
+            mm_real_video_llm_dims=mm_real_video_llm_dims,
+        )
+        return self.merge_mm(input_ids, image=feats.get("image"), video=feats.get("video"))
 
     def __call__(
         self,
