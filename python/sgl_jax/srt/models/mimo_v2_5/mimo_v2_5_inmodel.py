@@ -31,8 +31,8 @@ from flax import nnx
 from sgl_jax.srt.mm_core.merge import merge
 from sgl_jax.srt.models.mimo_v2_5.audio_encoder import MiMoV25AudioUnderstandingEncoder
 from sgl_jax.srt.models.mimo_v2_5.config_utils import (
+    MiMoVLVisionConfig,
     get_config_value,
-    normalize_vision_config,
 )
 from sgl_jax.srt.models.mimo_v2_5.vision_encoder import MiMoVisionTransformer
 from sgl_jax.srt.models.mimo_v2_pro import MiMoV2ForCausalLM
@@ -66,12 +66,17 @@ class MiMoV2_5ForConditionalGeneration(nnx.Module):
         self.audio_encoder = MiMoV25AudioUnderstandingEncoder(
             audio_config, mesh=mesh, dtype=self.dtype, rngs=rngs
         )
-        # MiMoVL ViT shared by image + video (HF `visual.*`); normalize config (in_chans->in_channels,
-        # qk_channels default 64) via the shared config helper to stay in sync with the checkpoint.
+        # MiMoVL ViT shared by image + video (HF `visual.*`). Aligned with upstream sglang
+        # (models/mimo_v2.py): rebuild the vision config via MiMoVLVisionConfig.from_dict(vision_dict)
+        # -- field names + defaults match the checkpoint, so the checkpoint's own values flow through
+        # and defaults only fill genuinely-absent fields (qk_channels; in_channels for the in_chans
+        # checkpoints). norm_eps stays the ViT default 1e-6 (the checkpoint carries no rms_norm_eps).
         vision_config = getattr(config, "vision_config", None)
         if vision_config is not None:
+            if hasattr(vision_config, "to_dict"):
+                vision_config = vision_config.to_dict()
             self.visual = MiMoVisionTransformer(
-                normalize_vision_config(vision_config),
+                MiMoVLVisionConfig.from_dict(vision_config),
                 dtype=self.dtype,
                 rngs=rngs,
             )
