@@ -565,23 +565,16 @@ class Scheduler(
         server_args = self.server_args
         self.model_config = ModelConfig.from_server_args(server_args)
         self.is_generation = self.model_config.is_generation
-        # TEMPORARY (pending re-validation): disable overlap for in-model multimodal.
-        #
-        # CORRECTION: the original attribution here -- "the synchronous encode_mm_reqs pass corrupts
-        # the overlapped decode" -- was WRONG. The real root cause was a future_token_ids_map sizing
-        # bug (the map was sized by max_running_requests but each overlap step writes the full padded
-        # decode bs bucket; when bucket > mrr*3 the wrap overwrote real tokens with padding ->
-        # degenerate decode). That is now fixed at the source in tp_worker_overlap_thread.py (size by
-        # the max decode bs bucket), so this disable is no longer the actual fix -- it is retained
-        # only as a conservative measure until overlap-ON is re-validated end-to-end for in-model
-        # multimodal on TPU. Full analysis + TPU verification: tmp/refactor/m4-mimo-review.md §8b.
-        # TODO: remove this gate after the overlap-ON re-validation passes (encode is innocent --
-        # it never runs on decode steps; pure-decode VLM throughput is forgone meanwhile). When the
-        # gate is removed and overlap can run with an encode pass, recheck G1's max()-based vision
-        # reserve (design §5.7) -- it only matters under --vision-max-patches, unused today.
-        if getattr(self.model_config, "is_multimodal", False) and self.enable_overlap:
-            logger.info("In-model multimodal: disabling overlap schedule (temporary, see §8b)")
-            self.enable_overlap = False
+        # NOTE (K-14, re-validated 2026-06-15): in-model multimodal now runs WITH overlap schedule
+        # like any text model. The earlier TEMPORARY disable was a conservative guard after a
+        # future_token_ids_map sizing bug degraded overlapped decode (the map was sized by
+        # max_running_requests but each overlap step writes the full padded decode bs bucket; when
+        # bucket > mrr*3 the wrap overwrote real tokens with padding -> degenerate decode). That root
+        # cause is fixed at the source (tp_worker_overlap_thread.py sizes by the max decode bs
+        # bucket); the encode pass never runs on decode steps, so it cannot corrupt overlapped
+        # decode. Overlap-ON correctness re-validated end-to-end on MiMo-V2.5 (v6e, multi-host):
+        # concurrent decode stays coherent. Overlap now follows the standard
+        # --disable-overlap-schedule flag for mm too.
         if server_args.skip_tokenizer_init:
             self.tokenizer = self.processor = None
         else:
