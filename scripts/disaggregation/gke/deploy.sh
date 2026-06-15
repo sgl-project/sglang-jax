@@ -6,7 +6,7 @@
 #
 # Prerequisites:
 #   - gcloud + kubectl configured, USE_GKE_GCLOUD_AUTH_PLUGIN=True
-#   - Cluster ainfer-tpu-test with node pool pd-v6e-1 (2 x ct6e-standard-1t)
+#   - Cluster ainfer-tpu-bench with node pool pd-v6e-1 (2 x ct6e-standard-1t)
 #   - SSH key at ~/.ssh/id_rsa for repo clone
 set -euo pipefail
 
@@ -20,7 +20,7 @@ GENERATED="/tmp/${JOB_NAME}.yaml"
 export USE_GKE_GCLOUD_AUTH_PLUGIN=True
 
 # Ensure we have the right cluster context
-gcloud container clusters get-credentials ainfer-tpu-test \
+gcloud container clusters get-credentials ainfer-tpu-bench \
   --zone asia-northeast1-b --project tpu-service-473302 2>/dev/null
 
 # Clean up any previous run
