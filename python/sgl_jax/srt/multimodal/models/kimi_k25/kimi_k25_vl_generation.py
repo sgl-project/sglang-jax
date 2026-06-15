@@ -1,18 +1,14 @@
 import logging
 
-import jax
 import jax.numpy as jnp
-import numpy as np
 
 from sgl_jax.srt.configs.model_config import ModelConfig
-from sgl_jax.srt.eplb.expert_location import get_global_expert_location_metadata
 from sgl_jax.srt.hf_transformers_utils import get_hf_text_config
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata
-from sgl_jax.srt.layers.moe import create_moe_weights_mapping
 from sgl_jax.srt.mem_cache.memory_pool import MemoryPools
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.models.deepseek_v3 import DeepseekV3ForCausalLM
-from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
+from sgl_jax.srt.utils.weight_utils import WeightLoader
 
 logger = logging.getLogger(__name__)
 
