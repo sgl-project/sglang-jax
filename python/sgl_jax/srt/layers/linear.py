@@ -106,7 +106,6 @@ class LinearBase(nnx.Module):
             preferred_element_type=self.params_dtype,
             out_sharding=target,
         )
-
         if self.skip_bias_add:
             return out, self.bias
         if self.bias is not None:
