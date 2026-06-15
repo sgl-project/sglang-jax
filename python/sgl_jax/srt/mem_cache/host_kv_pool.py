@@ -1,7 +1,7 @@
 """Host-staging KV pool for PD disaggregation.
 
-The pool predefines ``pool_size`` independent host arrays (unpinned host
-memory, via an explicit ``memory_kind="unpinned_host"`` — see
+The pool predefines ``pool_size`` independent host arrays (pinned host
+memory, via an explicit ``memory_kind="pinned_host"`` — see
 ``_make_host_sharding``) and hands them out / takes them back via a
 FIFO queue. There is no LRU, no lock_ref, no retention — every borrow is
 intended to live for one transfer.
@@ -30,21 +30,26 @@ logger = logging.getLogger(__name__)
 
 
 def _make_host_sharding(mesh: Mesh, partition_spec: PartitionSpec) -> NamedSharding:
-    """Build an unpinned-host sharding.
+    """Build a pinned-host sharding.
 
-    Requests host memory explicitly via ``memory_kind="unpinned_host"``. A
-    plain ``NamedSharding(mesh, spec)`` with no ``memory_kind`` resolves to
-    ``device`` (HBM) on TPU, which would keep the "staged" KV on the prefill
-    HBM and defeat the whole point of staging — so the kind must be stated
-    explicitly. Falls back to a plain (device) sharding if the platform (e.g.
-    CPU jaxlib) does not support host memory kinds.
+    Requests host memory explicitly via ``memory_kind="pinned_host"``. A plain
+    ``NamedSharding(mesh, spec)`` with no ``memory_kind`` resolves to ``device``
+    (HBM) on TPU, which would keep the "staged" KV on the prefill HBM and defeat
+    the whole point of staging — so the kind must be stated explicitly.
+
+    ``pinned_host`` (not ``unpinned_host``): ``jax.experimental.transfer`` pulls
+    a bf16 array registered from an unpinned-host source with a 4-byte stride,
+    reading every other element (``got[i] == src[2i]``) and corrupting the KV.
+    pinned_host transfers bit-exact; it is also what tpu-inference stages
+    through (tpu_connector.py). Falls back to a plain (device) sharding if the
+    platform (e.g. CPU jaxlib) does not support host memory kinds.
     """
 
     try:
-        return NamedSharding(mesh, partition_spec, memory_kind="unpinned_host")
+        return NamedSharding(mesh, partition_spec, memory_kind="pinned_host")
     except (TypeError, ValueError):
         logger.warning(
-            "unpinned_host memory_kind unavailable on this platform; "
+            "pinned_host memory_kind unavailable on this platform; "
             "falling back to default sharding."
         )
         return NamedSharding(mesh, partition_spec)
