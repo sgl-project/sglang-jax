@@ -1,12 +1,68 @@
+from __future__ import annotations
+
 import abc
+import dataclasses
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import jax
 
 if TYPE_CHECKING:
-    from sgl_jax.srt.mem_cache.radix_cache import TreeNode
+    from sgl_jax.srt.mem_cache.radix_cache import RadixKey, TreeNode
 else:
-    TreeNode = Any  # Placeholder for TreeNode type when not type checking
+    TreeNode = Any
+
+
+@dataclasses.dataclass
+class MatchPrefixParams:
+    """Unified parameters for match_prefix across cache types."""
+
+    key: RadixKey
+
+
+@dataclasses.dataclass
+class InsertParams:
+    """Unified parameters for insert across cache types."""
+
+    key: RadixKey | None = None
+    value: Any = None
+    # SWA-specific: consumed by SWARadixCache, ignored by RadixCache.
+    prev_prefix_len: int = 0
+    swa_evicted_seqlen: int = 0
+
+
+@dataclasses.dataclass
+class EvictParams:
+    """Unified parameters for evict across cache types."""
+
+    num_tokens: int = 0
+    swa_num_tokens: int = 0
+    dp_rank: int | None = None
+
+
+@dataclasses.dataclass
+class EvictResult:
+    """Result of an evict operation."""
+
+    num_tokens_evicted: int = 0
+    swa_num_tokens_evicted: int = 0
+
+
+@dataclasses.dataclass
+class DecLockRefParams:
+    """Parameters for dec_lock_ref."""
+
+    swa_uuid_for_lock: int | None = None
+
+
+@dataclasses.dataclass
+class IncLockRefResult:
+    """Result of inc_lock_ref."""
+
+    delta: int | None = None
+    swa_uuid_for_lock: int | None = None
+
+    def to_dec_params(self) -> DecLockRefParams:
+        return DecLockRefParams(swa_uuid_for_lock=self.swa_uuid_for_lock)
 
 
 class MatchResult(NamedTuple):
@@ -18,6 +74,8 @@ class MatchResult(NamedTuple):
         last_host_node  :   The last TreeNode on the host that was matched.
                             Note that if HiCache is not enabled,
                             this **must** be the same as `last_device_node`.
+        best_match_node :   Deepest node accepted by the match;
+                            equals last_device_node when HiCache is off.
         host_hit_length :   Length of the KV cache hit on the host, if applicable.
                             0 if HiCache is not enabled.
     """
@@ -25,6 +83,7 @@ class MatchResult(NamedTuple):
     device_indices: jax.Array
     last_device_node: TreeNode | None
     last_host_node: TreeNode | None
+    best_match_node: TreeNode | None
     host_hit_length: int = 0
 
 
@@ -36,7 +95,7 @@ class BasePrefixCache(abc.ABC):
         pass
 
     @abc.abstractmethod
-    def match_prefix(self, key: list[int], **kwargs) -> MatchResult:
+    def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         pass
 
     @abc.abstractmethod
@@ -48,27 +107,27 @@ class BasePrefixCache(abc.ABC):
         pass
 
     @abc.abstractmethod
-    def evict(self, num_tokens: int):
+    def evict(self, params: EvictParams) -> EvictResult:
         pass
 
     @abc.abstractmethod
-    def inc_lock_ref(self, node: Any):
+    def inc_lock_ref(self, node: Any) -> IncLockRefResult:
         pass
 
     @abc.abstractmethod
-    def dec_lock_ref(self, node: Any, swa_uuid_for_lock: str | None = None):
+    def dec_lock_ref(self, node: Any, params: DecLockRefParams | None = None):
         pass
 
-    def evictable_size(self):
+    def evictable_size(self, dp_rank: int = 0):
         return 0
 
-    def full_evictable_size(self):
+    def full_evictable_size(self, dp_rank: int = 0):
         return 0
 
-    def swa_evictable_size(self):
+    def swa_evictable_size(self, dp_rank: int = 0):
         return 0
 
-    def protected_size(self):
+    def protected_size(self, dp_rank: int = 0):
         return 0
 
     def full_protected_size(self):

@@ -13,7 +13,11 @@ from sgl_jax.srt.utils import get_bool_env_var
 from sgl_jax.srt.utils.jax_utils import device_array
 
 if TYPE_CHECKING:
-    from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
+    from sgl_jax.srt.managers.schedule_batch import (
+        ModelWorkerBatch,
+        ScheduleBatch,
+        ScheduleReqsInfo,
+    )
 
 import threading
 
@@ -110,7 +114,7 @@ class SamplingMetadata:
         mesh: Mesh = None,
         vocab_size: int = 32000,
     ) -> SamplingMetadata:
-        sharding = NamedSharding(mesh, PartitionSpec()) if jax.process_count() == 1 else None
+        sharding = NamedSharding(mesh, PartitionSpec("data"))
         if batch.sampling_info.sampling_seeds is not None:
             sampling_seeds_device = device_array(
                 batch.sampling_info.sampling_seeds, sharding=sharding
@@ -136,9 +140,7 @@ class SamplingMetadata:
         # Extract penalty information from penalizer orchestrator
         linear_penalty_device = None
         do_penalties = False
-        linear_penalty_sharding = (
-            NamedSharding(mesh, PartitionSpec(None, "tensor")) if jax.process_count() == 1 else None
-        )
+        linear_penalty_sharding = NamedSharding(mesh, PartitionSpec("data", "tensor"))
 
         # Handle linear penalty independently (created by update_penalties)
         if (
@@ -271,10 +273,6 @@ class SamplingBatchInfo:
     penalizer_orchestrator: penaltylib.BatchedPenalizerOrchestrator | None = None
     linear_penalty: np.ndarray = None
 
-    # Grammar-constrained decoding
-    grammars: list | None = None  # list[BaseGrammarObject | None]
-    vocab_mask: np.ndarray | None = None  # Shape: [batch_size, vocab_size // 32]
-
     @classmethod
     def _get_global_server_args_dict(cls):
         from sgl_jax.srt.managers.schedule_batch import global_server_args_dict
@@ -296,9 +294,6 @@ class SamplingBatchInfo:
         else:
             sampling_seeds = None
 
-        num_int32_per_vocab = (vocab_size + 31) // 32
-        vocab_mask = np.zeros((bs, num_int32_per_vocab), dtype=np.int32)
-
         ret = cls(
             temperatures=temperatures.reshape(-1, 1),
             top_ps=top_ps,
@@ -313,7 +308,6 @@ class SamplingBatchInfo:
             sampling_seeds=sampling_seeds,
             penalizer_orchestrator=None,
             linear_penalty=None,
-            vocab_mask=vocab_mask,
         )
         return ret
 
@@ -350,16 +344,17 @@ class SamplingBatchInfo:
     @classmethod
     def from_schedule_batch(
         cls,
-        batch: ScheduleBatch,
+        info: ScheduleReqsInfo,
         vocab_size: int,
+        batch: ScheduleBatch = None,  # Unused; kept for backward-compat with callers
     ):
         global_server_args_dict = cls._get_global_server_args_dict()
         enable_deterministic = global_server_args_dict["enable_deterministic_sampling"]
-        reqs = batch.reqs
+        reqs = info.reqs
         temperatures = np.array(
             [r.sampling_params.temperature for r in reqs],
             dtype=np.float32,
-        )
+        ).reshape(-1, 1)
         top_ps = np.array([r.sampling_params.top_p for r in reqs], dtype=np.float32)
         top_ks = np.array([r.sampling_params.top_k for r in reqs], dtype=np.int32)
         min_ps = np.array([r.sampling_params.min_p for r in reqs], dtype=np.float32)
@@ -373,10 +368,10 @@ class SamplingBatchInfo:
             else None
         )
 
-        # Initialize penalty orchestrator
+        # Per-DP penalty orchestrator: scoped to this rank's reqs only.
         penalizer_orchestrator = penaltylib.BatchedPenalizerOrchestrator(
             vocab_size=vocab_size,
-            batch=batch,
+            reqs_info=info,
             penalizers={
                 penaltylib.BatchedFrequencyPenalizer,
                 penaltylib.BatchedMinNewTokensPenalizer,
@@ -424,12 +419,6 @@ class SamplingBatchInfo:
             if value is not None:
                 setattr(self, item, value[keep_indices])
 
-        # Filter grammars and vocab_mask
-        if self.grammars is not None:
-            self.grammars = [self.grammars[i] for i in keep_indices]
-        if self.vocab_mask is not None:
-            self.vocab_mask = self.vocab_mask[keep_indices]
-
     def merge_batch(self, other: SamplingBatchInfo):
         if self.penalizer_orchestrator is not None:
             self.penalizer_orchestrator.merge(other.penalizer_orchestrator)
@@ -453,17 +442,6 @@ class SamplingBatchInfo:
         self.need_top_k_sampling |= other.need_top_k_sampling
         self.need_min_p_sampling |= other.need_min_p_sampling
 
-        # Merge grammars and vocab_mask
-        if self.grammars is not None and other.grammars is not None:
-            self.grammars.extend(other.grammars)
-        elif other.grammars is not None:
-            self.grammars = other.grammars
-
-        if self.vocab_mask is not None and other.vocab_mask is not None:
-            self.vocab_mask = np.concat([self.vocab_mask, other.vocab_mask])
-        elif other.vocab_mask is not None:
-            self.vocab_mask = other.vocab_mask
-
     def cumulate_output_tokens(self, output_ids: jax.Array):
         """
         Feed the output tokens to the penalty orchestrator.
@@ -473,26 +451,3 @@ class SamplingBatchInfo:
         """
         if self.penalizer_orchestrator and self.penalizer_orchestrator.is_required:
             self.penalizer_orchestrator.cumulate_output_tokens(output_ids)
-
-    def update_grammar_vocab_mask(self):
-        """Update vocabulary masks from grammars before sampling."""
-        if not self.grammars:
-            self.vocab_mask = None
-            return
-
-        # Find first non-None grammar from the list
-        first_grammar = next((g for g in self.grammars if g), None)
-        if first_grammar is None:
-            self.vocab_mask = None
-            return
-
-        # Allocate bitmask using the grammar object's method
-        self.vocab_mask = first_grammar.allocate_vocab_mask(
-            vocab_size=self.vocab_size,
-            batch_size=len(self.temperatures),
-        )
-
-        # Fill mask for each request with active grammar
-        for i, grammar in enumerate(self.grammars):
-            if grammar and not grammar.finished and not grammar.is_terminated():
-                grammar.fill_vocab_mask(self.vocab_mask, i)

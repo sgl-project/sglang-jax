@@ -27,6 +27,9 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+
+# setuptools-scm generated version file (regenerated each build)
+python/sgl_jax/_version.py
 test/temp/*.json
 
 # PyInstaller

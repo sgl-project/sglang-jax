@@ -14,10 +14,12 @@ import sys
 import threading
 import time
 import uuid
+import zlib
 from collections import deque
 from datetime import datetime
 from http import HTTPStatus
 from typing import Any
+from urllib.parse import urlparse
 
 import fastapi
 import jax
@@ -173,7 +175,9 @@ class TokenizerManager:
                 tokenizer_mode=server_args.tokenizer_mode,
                 trust_remote_code=server_args.trust_remote_code,
                 revision=server_args.revision,
+                tokenizer_backend=server_args.tokenizer_backend,
                 sub_dir=tokenizer_subdir,
+                download_dir=server_args.download_dir,
             )
 
         # Store states
@@ -196,20 +200,12 @@ class TokenizerManager:
         self.current_load_lock = asyncio.Lock()
 
         # Communicators
-        self.release_memory_occupation_communicator = _Communicator(
-            self.send_to_scheduler, server_args.dp_size
-        )
-        self.resume_memory_occupation_communicator = _Communicator(
-            self.send_to_scheduler, server_args.dp_size
-        )
-        self.flush_cache_communicator = _Communicator(self.send_to_scheduler, server_args.dp_size)
-        self.profile_communicator = _Communicator(self.send_to_scheduler, server_args.dp_size)
-        self.get_internal_state_communicator = _Communicator(
-            self.send_to_scheduler, server_args.dp_size
-        )
-        self.set_internal_state_communicator = _Communicator(
-            self.send_to_scheduler, server_args.dp_size
-        )
+        self.release_memory_occupation_communicator = _Communicator(self.send_to_scheduler, 1)
+        self.resume_memory_occupation_communicator = _Communicator(self.send_to_scheduler, 1)
+        self.flush_cache_communicator = _Communicator(self.send_to_scheduler, 1)
+        self.profile_communicator = _Communicator(self.send_to_scheduler, 1)
+        self.get_internal_state_communicator = _Communicator(self.send_to_scheduler, 1)
+        self.set_internal_state_communicator = _Communicator(self.send_to_scheduler, 1)
 
         # LoRA
         self.lora_registry = LoRARegistry(self.server_args.lora_paths)
@@ -310,6 +306,7 @@ class TokenizerManager:
                 )
             encoded = self.tokenizer(input_text)
             input_ids = encoded["input_ids"]
+
         self._validate_one_request(obj, input_ids)
         return self._create_tokenized_object(obj, input_text, input_ids)
 
@@ -380,6 +377,46 @@ class TokenizerManager:
             obj.extra_key,
             obj.return_routed_experts,
         )
+
+        # PD disaggregation passthrough. When the engine is
+        # running in disaggregation_mode=decode, the request body MUST
+        # carry bootstrap_{host,port,room}.
+        #
+        # If the request didn't carry bootstrap_* fields but the engine
+        # knows its bootstrap URL, auto-derive them.
+        if getattr(self.server_args, "disaggregation_mode", "null") == "decode":
+            bootstrap_url = getattr(self.server_args, "disaggregation_bootstrap_url", None)
+            if (
+                obj.bootstrap_host is None or obj.bootstrap_port is None
+            ) and bootstrap_url is not None:
+                parsed = urlparse(bootstrap_url)
+                if parsed.hostname is not None and parsed.port is not None:
+                    if obj.bootstrap_host is None:
+                        host = parsed.hostname
+                        if ":" in host:
+                            host = f"[{host}]"
+                        obj.bootstrap_host = host
+                    if obj.bootstrap_port is None:
+                        obj.bootstrap_port = parsed.port
+            if obj.bootstrap_room is None and obj.rid is not None:
+                obj.bootstrap_room = zlib.crc32(str(obj.rid).encode("utf-8"))
+            missing = [
+                name
+                for name in ("bootstrap_host", "bootstrap_port", "bootstrap_room")
+                if getattr(obj, name, None) is None
+            ]
+            if missing:
+                raise ValueError(
+                    "disaggregation_mode=decode requires the request "
+                    f"to provide {missing}; got obj.bootstrap_host="
+                    f"{obj.bootstrap_host!r}, "
+                    f"obj.bootstrap_port={obj.bootstrap_port!r}, "
+                    f"obj.bootstrap_room={obj.bootstrap_room!r}"
+                )
+        tokenized_obj.bootstrap_host = getattr(obj, "bootstrap_host", None)
+        tokenized_obj.bootstrap_port = getattr(obj, "bootstrap_port", None)
+        tokenized_obj.bootstrap_room = getattr(obj, "bootstrap_room", None)
+        tokenized_obj.disagg_transfer_id = getattr(obj, "disagg_transfer_id", None)
         # note: When only `return_logprob` is specified, we assume that only the output probability is required.
         if (
             tokenized_obj.return_logprob
@@ -456,21 +493,28 @@ class TokenizerManager:
         return state
 
     def _notify_state_event(self, state: ReqState) -> None:
-        """Thread-safe wrapper around state.event.set().
+        """Wake the consumer waiting on ``state.event``.
 
-        If enable_engine_loop_run_forever_daemon was enabled, handle_loop would run on the daemon_loop thread, but the asyncio.Event's
-        internal Future belongs to the eval_loop (the loop that called
-        _send_one_request).  Calling fut.set_result() from the wrong thread
-        does not wake up eval_loop's selector.  call_soon_threadsafe writes to
-        the self-pipe so the selector returns from epoll_wait immediately.
+        Same-loop callers set the event directly to avoid a
+        schedule-after-clear race in ``_wait_one_response``. Cross-loop
+        callers (``enable_engine_loop_run_forever_daemon``) must go through
+        ``call_soon_threadsafe`` because ``Future.set_result`` from the
+        wrong thread cannot wake the eval-loop's selector.
         """
         loop = state.event_loop
-        if loop is not None:
+        if loop is None:
+            state.event.set()
+            return
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is loop:
+            state.event.set()
+        else:
             with contextlib.suppress(RuntimeError):
                 # RuntimeError: loop is already closed (request timed-out / cancelled).
                 loop.call_soon_threadsafe(state.event.set)
-        else:
-            state.event.set()
 
     async def _wait_one_response(
         self,
@@ -497,10 +541,19 @@ class TokenizerManager:
                         ) from e
                 continue
 
-            out = state.out_list[-1]
-
+            # Drain in one sync block so a deferred cross-loop set cannot
+            # wake the next wait_for against an empty list.
+            out_list = state.out_list
             state.out_list = []
-            if state.finished:
+            finished = state.finished
+            state.event.clear()
+
+            if not out_list:
+                continue
+
+            out = out_list[-1]
+
+            if finished:
                 if self.log_requests:
                     max_length, skip_names, out_skip_names = self.log_request_metadata
                     msg = f"Finish: obj={dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}, out={dataclass_to_string_truncated(out, max_length, skip_names=out_skip_names)}"
@@ -517,8 +570,6 @@ class TokenizerManager:
 
                 yield out
                 break
-
-            state.event.clear()
 
             if obj.stream:
                 yield out
@@ -637,7 +688,7 @@ class TokenizerManager:
         host_tracer_level: int | None = None,
         python_tracer_level: int | None = None,
         stage_id: int | None = None,
-        profile_by_stage: bool = False,
+        profile_by_stage: bool | None = False,
         profile_stages: list[str] | None = None,
     ):
         self.auto_create_handle_loop()

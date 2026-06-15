@@ -1,0 +1,28 @@
+# DeepSeek-Coder-V2-Lite-Instruct on v6e-4, DP4xTP4, fa = absorbed MLA
+# (issue #1200, 1.1.2).
+name: ds_v2_lite-mla-dp4-tp4
+target: v6e-4
+model_path: deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct
+tp_size: 4
+dp_size: 4
+port: 30020
+server_args:
+  - --skip-server-warmup
+  - --random-seed
+  - "3"
+  - --mem-fraction-static
+  - "0.8"
+  - --max-prefill-tokens
+  - "8192"
+  - --download-dir
+  - /dev/shm/
+  - --dtype
+  - bfloat16
+  - --page-size
+  - "256"
+  - --context-length
+  - "8192"
+  - --max-running-requests
+  - "128"
+  - --attention-backend
+  - fa

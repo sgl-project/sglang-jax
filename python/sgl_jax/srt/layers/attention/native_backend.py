@@ -1,6 +1,6 @@
 import jax
 import jax.numpy as jnp
-from jax.sharding import NamedSharding
+from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -105,6 +105,7 @@ class NativeAttention(AttentionBackend):
             is_causal,
             forward_batch.forward_mode,
             self.kv_sharding,
+            mesh=self.mesh,
             xai_temperature_len=xai_temp_len,
             attention_sink=attention_sink,
             sliding_window_size=layer.sliding_window_size,
@@ -178,6 +179,7 @@ def forward_attention(
     is_causal=True,
     mode=ForwardMode.DECODE,
     kv_sharding=None,
+    mesh: Mesh | None = None,
     xai_temperature_len: float | None = None,
     attention_sink: jax.Array | None = None,
     sliding_window_size: int | None = None,
@@ -245,16 +247,15 @@ def forward_attention(
         k_heads = jnp.repeat(k_heads, num_copies, axis=1, out_sharding=kv_sharding)
         v_heads = jnp.repeat(v_heads, num_copies, axis=1, out_sharding=kv_sharding)
 
-    # Transpose for matmul: [num_heads, num_tokens, head_dim]
-    q_t = jnp.transpose(q_heads, (1, 0, 2))
-    k_t = jnp.transpose(k_heads, (1, 0, 2))
-    v_t = jnp.transpose(v_heads, (1, 0, 2))
-
     if scale is None:
         scale = 1.0 / jnp.sqrt(head_dim)
-    attn_logits = jnp.einsum("hqd,hkd->hqk", q_t, k_t) * scale
+    # (Q, H, K) layout: avoids broadcasting K-axis sharding into the Q-axis position
+    # under Explicit-axis mesh + DP-sharded q_heads.
+    attn_logits = jnp.einsum("qhd,khd->qhk", q_heads, k_heads) * scale
     neg_inf = jnp.asarray(jnp.finfo(attn_logits.dtype).min, attn_logits.dtype)
-    is_valid = loc > 0
+    # Reshard `loc` to replicated so the K-axis broadcast doesn't re-introduce
+    # the `data` mesh axis (Q-axis already carries `data` under DP).
+    is_valid = jax.sharding.reshard(loc, NamedSharding(mesh, P())) > 0
     attn_logits = jnp.where(is_valid[jnp.newaxis, jnp.newaxis, :], attn_logits, neg_inf)
 
     # ** Apply XAI temperature scaling if specified **
@@ -277,8 +278,8 @@ def forward_attention(
         temp_factor = log_pos * xai_scale
         regulator = jnp.where(q_positions > xai_temperature_len, temp_factor, 1.0)
 
-        # Broadcast regulator from [num_tokens] to [1, num_tokens, 1] to scale weights
-        attn_logits = attn_logits * regulator[None, :, None]
+        # Broadcast regulator from [num_tokens] to [num_tokens, 1, 1] to scale weights
+        attn_logits = attn_logits * regulator[:, None, None]
 
     # Apply appropriate masking
     if mode == ForwardMode.EXTEND:
@@ -289,9 +290,10 @@ def forward_attention(
             extend_seq_lens,
             is_causal,
             sliding_window_size,
+            mesh=mesh,
         )
     else:
-        attn_logits = _apply_decode_mask(attn_logits, seq_lengths, sliding_window_size)
+        attn_logits = _apply_decode_mask(attn_logits, seq_lengths, sliding_window_size, mesh=mesh)
 
     # Softmax (with optional attention sink)
     max_logit = jnp.max(attn_logits, axis=-1, keepdims=True)
@@ -301,14 +303,14 @@ def forward_attention(
 
     if attention_sink is not None:
         # attention_sink: [num_heads] — acts as a phantom token in the softmax denominator.
-        # Broadcast sink from [num_heads] to [num_heads, 1, 1] to match (H, Q, K) layout
-        sink_term = jnp.exp(attention_sink[:, None, None] - max_logit)
+        # Broadcast sink from [num_heads] to [1, num_heads, 1] to match (Q, H, K) layout
+        sink_term = jnp.exp(attention_sink[None, :, None] - max_logit)
         sum_exp = sum_exp + sink_term
 
     attn_weights = exp_logits / sum_exp
 
-    attn_output = jnp.matmul(attn_weights, v_t)
-    attn_output = jnp.transpose(attn_output, (1, 0, 2))
+    # attn_output: [num_tokens, num_heads, v_head_dim]
+    attn_output = jnp.einsum("qhk,khd->qhd", attn_weights, v_heads)
 
     # Use v_head_dim from V (may differ from head_dim for split K/V models)
     v_head_dim = v_heads.shape[-1]
@@ -322,12 +324,20 @@ def _apply_extend_mask(
     extend_seq_lens: jax.Array,
     is_causal: bool = True,
     sliding_window_size: int | None = None,
+    mesh: Mesh | None = None,
 ):
     """
     Applies a block-diagonal and optionally a causal/SWA mask in a unified,
     efficient way, correctly handling padding.
     """
-    _, query_len, key_len = attn_weights.shape
+    query_len, _, key_len = attn_weights.shape
+
+    # Reshard inputs to replicated: under DP these arrive as P("data"),
+    # but we use them as scatter indices into [query_len]/[key_len] arrays
+    # whose mesh has no `data` axis, which trips a jax 0.8.1 .at[].set() check.
+    extend_seq_lens = jax.sharding.reshard(extend_seq_lens, NamedSharding(mesh, P()))
+    seq_lengths = jax.sharding.reshard(seq_lengths, NamedSharding(mesh, P()))
+    extend_prefix_lens = jax.sharding.reshard(extend_prefix_lens, NamedSharding(mesh, P()))
 
     # --- Create validity masks to handle padding ---
     q_valid_mask = jnp.arange(query_len) < jnp.sum(extend_seq_lens)
@@ -371,16 +381,24 @@ def _apply_extend_mask(
     final_mask = final_mask & q_valid_mask[:, None] & k_valid_mask[None, :]
 
     mask_value = jnp.finfo(attn_weights.dtype).min
-    final_mask = final_mask[None, :, :]
+    # Broadcast from [Q, K] to [Q, 1, K] to match attn_weights [Q, H, K]
+    final_mask = final_mask[:, None, :]
     return jnp.where(final_mask, attn_weights, mask_value)
 
 
 def _apply_decode_mask(
-    attn_weights: jax.Array, seq_lengths: jax.Array, sliding_window_size: int | None = None
+    attn_weights: jax.Array,
+    seq_lengths: jax.Array,
+    sliding_window_size: int | None = None,
+    mesh: Mesh | None = None,
 ):
     """Create a sequence mask that ensures tokens only attend within their sequence and window."""
-    _, query_len, key_len = attn_weights.shape
+    query_len, _, key_len = attn_weights.shape
     num_seqs = len(seq_lengths)
+
+    # Reshard to replicated: avoids jax 0.8.1 .at[].set() check failure when
+    # seq_lengths is P("data") under DP and used as scatter indices.
+    seq_lengths = jax.sharding.reshard(seq_lengths, NamedSharding(mesh, P()))
 
     def create_decode_sequence_mask():
         total_prefix_len = key_len
@@ -402,5 +420,6 @@ def _apply_decode_mask(
     final_mask = final_mask.at[:num_seqs, :].set(per_sequence_mask)
 
     mask_value = jnp.finfo(attn_weights.dtype).min
-    final_mask = final_mask[None, :, :]
+    # Broadcast from [Q, K] to [Q, 1, K] to match attn_weights [Q, H, K]
+    final_mask = final_mask[:, None, :]
     return jnp.where(final_mask, attn_weights, mask_value)

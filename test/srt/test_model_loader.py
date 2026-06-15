@@ -20,6 +20,7 @@ from sgl_jax.srt.configs.load_config import LoadConfig, LoadFormat
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.model_loader.loader import JAXModelLoader, get_model_loader
 from sgl_jax.srt.models.qwen import QWenLMHeadModel
+from sgl_jax.test.test_utils import QWEN_7B
 
 
 class TestModelLoader(unittest.TestCase):
@@ -177,7 +178,7 @@ class TestModelLoaderWithRealModel(unittest.TestCase):
             str: Either a local path or a HuggingFace model ID
         """
         # Check environment variable first
-        env_path = os.environ.get("TEST_MODEL_PATH", "Qwen/Qwen-7B-Chat")
+        env_path = os.environ.get("TEST_MODEL_PATH", QWEN_7B)
         if env_path:
             # If it's a local path and exists, use it
             if os.path.exists(env_path):

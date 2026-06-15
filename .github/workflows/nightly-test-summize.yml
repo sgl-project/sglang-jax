@@ -10,14 +10,12 @@ on:
       - "python/sgl_jax/version.py"
   workflow_dispatch:
 concurrency:
-  group: nightly-test-${{ github.ref }}
+  group: nightly-test-summize-${{ github.ref }}
   cancel-in-progress: true
 
 
 permissions:
   contents: write
-  pull-requests: write
-  issues: write
 
 jobs:
   generate-summary:
@@ -28,7 +26,7 @@ jobs:
       TZ: Asia/Shanghai
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
 
       - name: Set current date
@@ -121,7 +119,7 @@ jobs:
           '
 
       - name: Upload Trend Images Artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         if: always()
         with:
           name: trend-charts

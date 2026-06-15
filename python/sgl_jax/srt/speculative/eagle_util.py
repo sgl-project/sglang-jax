@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import functools
 import logging
 import os
 from collections.abc import Sequence
@@ -12,7 +13,8 @@ import jax.numpy as jnp
 import numpy
 import numpy as np
 from flax import nnx
-from jax.sharding import Mesh
+from jax.sharding import Mesh, NamedSharding
+from jax.sharding import PartitionSpec as P
 from jax.tree_util import register_pytree_node_class
 
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
@@ -24,7 +26,6 @@ from sgl_jax.srt.kernels.speculative.build_eagle_tree_structure_kernel import (
     build_eagle_tree_structure,
 )
 from sgl_jax.srt.kernels.speculative.kernel import (
-    create_extend_after_decode_spec_info,
     top_k_renorm_prob,
     top_p_renorm_prob,
     tree_speculative_sampling_target_only,
@@ -179,7 +180,9 @@ def get_last_loc_large_page_size_large_top_k(
     return prefix_lens, new_seq_lens, last_loc, num_new_pages_per_topk, extend_lens
 
 
-@jax.jit(static_argnames=["num_verify_tokens", "batch_size", "speculative_num_steps"])
+@functools.partial(
+    jax.jit, static_argnames=["num_verify_tokens", "batch_size", "speculative_num_steps"]
+)
 def build_tree_kernel_efficient_preprocess(
     verified_id: jax.Array,
     scores: jax.Array,
@@ -323,6 +326,10 @@ def build_tree_kernel_efficient(
         tuple of (tree_mask, positions, retrive_index, retrive_next_token,
                  retrive_next_sibling, draft_tokens)
     """
+    rep = NamedSharding(mesh, P())
+    verified_id, score_list, token_list, parents_list, seq_lens = jax.device_put(
+        (verified_id, score_list, token_list, parents_list, seq_lens), rep
+    )
     parent_list, top_scores_index, draft_tokens = build_tree_kernel_efficient_preprocess(
         verified_id,
         score_list,
@@ -371,42 +378,75 @@ def build_tree_kernel_efficient(
 @register_pytree_node_class
 @dataclass
 class EagleDraftInput:
-    # Constant: alloc length per decode step
+    """Next-round draft state — the only persistent cross-round spec state.
+
+    Implements ``SpecInput``. MUST NOT hold worker/runner/pool/future handles.
+    Under DP (Route 1), per-request fields use DP-padded order.
+    """
+
     ALLOC_LEN_PER_DECODE: ClassVar[int] = None
 
-    # The inputs for decode
-    # shape: (b, topk)
-    topk_p: np.ndarray = None
-    topk_index: np.ndarray = None
-    # shape: (b, hidden_size)
-    hidden_states: np.ndarray = None
+    # --- Cross-round draft state (device arrays, consumed by next draft) ---
+    #: device ``(b, topk)`` — top-k probs from previous draft/draft_extend.
+    topk_p: jax.Array | None = None
+    #: device ``(b, topk)`` — top-k token ids.
+    topk_index: jax.Array | None = None
+    #: device ``(b, hidden_size)`` — minimal hidden state for next draft step.
+    #: Multi-layer MTP keeps per-step hidden locally inside one
+    #: ``MultiLayerDraftWorker.draft()``; only this cross-round slice persists.
+    hidden_states: jax.Array | None = None
+    #: static metadata (pytree aux); changing it triggers a new compile shape.
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL
 
-    # Inputs for extend
-    # shape: (b,)
-    verified_id: np.ndarray = None
-    accept_length: np.ndarray = None
+    # --- Draft-extend inputs (device unless ``_cpu`` suffixed) ---
+    #: device ``(b,)`` — verified token starting the next draft.
+    verified_id: jax.Array | None = None
+    #: device ``(b,)`` — accepted length used to select hidden in draft-extend.
+    accept_length: jax.Array | None = None
+    #: host ``(b,)`` int32 mirror of ``accept_length`` for scheduler bookkeeping.
     accept_length_cpu: np.ndarray | None = None
 
-    # Inputs for the attention backends
-    # shape: (b + 1,)
-    kv_indptr: np.ndarray = None
-    kv_indices: np.ndarray = None
+    # --- Attention-backend metadata (host, participates in metadata build) ---
+    kv_indptr: np.ndarray | None = None
+    kv_indices: np.ndarray | None = None
 
-    # Shape info for padding
+    # --- Padding shape (static; participates in JIT cache key) ---
     num_tokens_per_batch: int = -1
     num_tokens_for_logprob_per_batch: int = -1
 
-    # Inputs for draft extend
-    # shape: (b,)
-    seq_lens_for_draft_extend: np.ndarray = None
-    req_pool_indices_for_draft_extend: np.ndarray = None
+    # --- Draft-extend bookkeeping (host) ---
+    seq_lens_for_draft_extend: np.ndarray | None = None
+    req_pool_indices_for_draft_extend: np.ndarray | None = None
 
-    # Inputs for V2 overlap worker
-    # future_indices: Optional[FutureIndices] = None
+    # --- KV lifetime (host, scheduler-visible) ---
+    #: host ``(b,)`` — KV length already allocated in ``req_to_token_pool`` for
+    #: next-round pre-allocation and over-allocated slot release. Distinct from
+    #: ``accept_length`` (logical) and ``new_seq_lens`` (scheduler-visible).
     allocate_lens: np.ndarray | None = None
+    #: host ``(b,)`` — scheduler-visible logical length after verify. May be
+    #: derived from ``old_seq_lens + accept_length`` if not stored.
     new_seq_lens: np.ndarray | None = None
-    # verify_done: Optional[torch.cuda.Event] = None
+
+    # ---- SpecInput protocol -------------------------------------------------
+    def is_draft_input(self) -> bool:
+        return True
+
+    def is_verify_input(self) -> bool:
+        return False
+
+    def get_spec_adjust_token_coefficient(self) -> int:
+        return EagleDraftInput.ALLOC_LEN_PER_DECODE or 1
+
+    def get_logical_token_num(self, bs: int) -> np.ndarray:
+        if self.accept_length_cpu is not None:
+            return self.accept_length_cpu
+        return np.ones(bs, dtype=np.int32)
+
+    def get_allocated_token_num(self) -> np.ndarray | None:
+        return self.allocate_lens
+
+    def get_verify_token_num(self, bs: int) -> int:
+        return 0
 
     def tree_flatten(self):
         accept_length_cpu_arr = (
@@ -468,16 +508,35 @@ class EagleDraftInput:
             self.verified_id.shape[0] == model_worker_batch.real_bs
         ), f"{self.verified_id.shape=} {model_worker_batch.real_bs=}"
 
-        pt = 0
-        for i in range(model_worker_batch.real_bs):
-            extend_len = model_worker_batch.extend_seq_lens[i]
-            input_ids = model_worker_batch.input_ids[pt : pt + extend_len]
-
-            # TODO: batch.input_ids should on tpu
-            model_worker_batch.input_ids[pt : pt + extend_len] = np.concatenate(
-                (input_ids[1:], self.verified_id[i].reshape(1))
-            )
-            pt += extend_len
+        # Walk the DP-padded layout in (rank, slot) order so token offsets line
+        # up with mwb.input_ids' token-major DP layout. Iterating real_bs and
+        # indexing extend_seq_lens by `i` skipped real reqs whose padded slot
+        # index > i (e.g. dp>1 prefill with only rank>0 active).
+        dp_size = model_worker_batch.dp_size
+        # per_dp_bs_size already covers both dp=1 (= total_bs) and dp>1
+        # (= total_bs / dp). Hardcoding 1 here drops dp=1 multi-req.
+        per_dp_bs = model_worker_batch.per_dp_bs_size
+        total_tok = len(model_worker_batch.input_ids)
+        per_dp_tok = total_tok // dp_size
+        extend_seq_lens = model_worker_batch.extend_seq_lens
+        flat_idx = 0  # index into self.verified_id (cross-rank flat)
+        for dp_rank in range(dp_size):
+            pt = dp_rank * per_dp_tok
+            for slot_in_rank in range(per_dp_bs):
+                slot = dp_rank * per_dp_bs + slot_in_rank
+                extend_len = int(extend_seq_lens[slot])
+                if extend_len == 0:
+                    continue
+                input_ids = model_worker_batch.input_ids[pt : pt + extend_len]
+                model_worker_batch.input_ids[pt : pt + extend_len] = np.concatenate(
+                    (input_ids[1:], self.verified_id[flat_idx].reshape(1))
+                )
+                pt += extend_len
+                flat_idx += 1
+        assert flat_idx == model_worker_batch.real_bs, (
+            f"prepare_for_extend_after_target_prefill mismatch: walked {flat_idx} "
+            f"real reqs but real_bs={model_worker_batch.real_bs}"
+        )
 
     def prepare_for_extend_after_verify(
         self,
@@ -486,22 +545,33 @@ class EagleDraftInput:
         batch_output: GenerationBatchResult,
         speculative_num_draft_tokens: int,
     ):
-        model_worker_batch.spec_info = self
-        model_worker_batch.seq_lens[: model_worker_batch.real_bs] = (
-            model_worker_batch.seq_lens[: model_worker_batch.real_bs]
-            + speculative_num_draft_tokens
-            - 1
+        model_worker_batch.spec_info_padded = self
+        sel = model_worker_batch.logits_indices_selector
+        model_worker_batch.seq_lens[sel] = (
+            model_worker_batch.seq_lens[sel] + speculative_num_draft_tokens - 1
         )
         bs = batch_output.accept_lens.shape[0]
         step_plus_1 = model_worker_batch.input_ids.shape[0] // bs
         model_worker_batch.positions = model_worker_batch.positions
-        model_worker_batch.extend_seq_lens = np.full((bs,), step_plus_1, dtype=np.int32)
-        model_worker_batch.extend_seq_lens[model_worker_batch.real_bs :] = 0
+        model_worker_batch.extend_seq_lens = np.zeros((bs,), dtype=np.int32)
+        model_worker_batch.extend_seq_lens[sel] = step_plus_1
+        # Per-rank-local cumsum: _select_hidden_states is a shard_map rank-local
+        # gather, so indices must be offsets into each rank's own hidden shard.
+        dp = model_worker_batch.dp_size
+        per_dp = model_worker_batch.per_dp_bs_size if dp > 1 else bs
+        model_worker_batch.logits_indices = (
+            model_worker_batch.extend_seq_lens.reshape(dp, per_dp)
+            .cumsum(axis=1, dtype=np.int32)
+            .ravel()
+            - 1
+        )
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
-        model_worker_batch.spec_info.capture_hidden_mode = CaptureHiddenMode.FULL
+        model_worker_batch.spec_info_padded.capture_hidden_mode = CaptureHiddenMode.FULL
         model_worker_batch.forward_mode = ForwardMode.DRAFT_EXTEND
-        model_worker_batch.spec_info.hidden_states = batch_output.next_draft_input.hidden_states
-        model_worker_batch.spec_info.accept_length = batch_output.accept_lens
+        model_worker_batch.spec_info_padded.hidden_states = (
+            batch_output.next_draft_input.hidden_states
+        )
+        model_worker_batch.spec_info_padded.accept_length = batch_output.accept_lens
         model_worker_batch.input_ids = batch_output.next_draft_input.verified_id
         forward_metadata = draft_model_runner.attn_backend.get_eagle_forward_metadata(
             model_worker_batch
@@ -516,43 +586,52 @@ class EagleDraftInput:
         return model_worker_batch, logits_metadata
 
     def prepare_for_decode(self, schedule_batch: ScheduleBatch):
-        new_allocate_lens = schedule_batch.seq_lens + self.ALLOC_LEN_PER_DECODE - 1
+        # spec_info / allocate_lens are global (flat across DP ranks). Allocate
+        # per-rank (allocator + swa_mapping are per-dp_rank at dp>1); concat
+        # back to global-flat. (#1053 P1-5b — was dp_rank=0 for all, so rank>0
+        # reqs allocated from rank 0's pool / updated swa_mapping[0].)
         bs = schedule_batch.batch_size()
         assert (
             self.allocate_lens.shape[0] == bs
         ), f" {self.allocate_lens.shape[0]=} but batch_size is {bs} "
         page_size = schedule_batch.token_to_kv_pool_allocator.page_size
-
-        if page_size == 1:
-            num_needed_tokens = (new_allocate_lens - self.allocate_lens).sum().item()
-            out_cache_loc = alloc_token_slots(schedule_batch.tree_cache, num_needed_tokens)
-        else:
-            last_loc = get_last_loc(
-                schedule_batch.req_to_token_pool.req_to_token,
-                schedule_batch.req_pool_indices,
-                self.allocate_lens,
+        new_alloc_chunks = []
+        flat_off = 0
+        for dp_rank, info in enumerate(schedule_batch.reqs_info):
+            if info.seq_lens is None or len(info.seq_lens) == 0:
+                continue
+            bs_r = len(info.seq_lens)
+            seq_r = np.asarray(info.seq_lens)
+            new_r = seq_r + self.ALLOC_LEN_PER_DECODE - 1
+            old_r = self.allocate_lens[flat_off : flat_off + bs_r]
+            ext_r = int((new_r - old_r).sum())
+            if page_size == 1:
+                ocl_r = alloc_token_slots(schedule_batch.tree_cache, ext_r, dp_rank=dp_rank)
+            else:
+                last_loc_r = get_last_loc(
+                    schedule_batch.req_to_token_pool.req_to_token,
+                    info.req_pool_indices,
+                    old_r,
+                )
+                ocl_r = alloc_paged_token_slots_extend(
+                    schedule_batch.tree_cache,
+                    old_r,
+                    new_r,
+                    last_loc_r,
+                    ext_r,
+                    dp_rank=dp_rank,
+                )
+            assign_req_to_token_pool(
+                info.req_pool_indices, schedule_batch.req_to_token_pool, old_r, new_r, ocl_r
             )
-            extend_num_tokens = sum(new_allocate_lens - self.allocate_lens).item()
-            out_cache_loc = alloc_paged_token_slots_extend(
-                schedule_batch.tree_cache,
-                self.allocate_lens,
-                new_allocate_lens,
-                last_loc,
-                extend_num_tokens,
-            )
+            new_alloc_chunks.append(new_r)
+            # Per-rank store (matches nospec extend); _get_spec_decode_mwb_dp
+            # DP-segments these so each rank's P("data") shard = its own slots.
+            info.out_cache_loc = np.asarray(ocl_r, dtype=np.int32)
+            flat_off += bs_r
+            info.seq_lens_sum = np.sum(info.seq_lens).item()
 
-        assign_req_to_token_pool(
-            schedule_batch.req_pool_indices,
-            schedule_batch.req_to_token_pool,
-            self.allocate_lens,
-            new_allocate_lens,
-            out_cache_loc,
-        )
-
-        self.allocate_lens = new_allocate_lens
-
-        schedule_batch.seq_lens_sum = np.sum(schedule_batch.seq_lens).item()
-        schedule_batch.out_cache_loc = out_cache_loc
+        self.allocate_lens = np.concatenate(new_alloc_chunks)
 
     def prepare_for_draft_decode(
         self, model_worker_batch: ModelWorkerBatch, topk: int, num_steps: int
@@ -581,67 +660,44 @@ class EagleDraftInput:
             accept_length_cpu=np.empty((0,), dtype=np.int32),
         )
 
-    @DeprecationWarning
-    def prepare_extend_after_decode(
-        self,
-        batch: ScheduleBatch,
-    ):
-        if batch.forward_mode.is_idle():
-            return
+    def _ensure_host(self):
+        """Move device arrays to host (numpy) to avoid variable-shape device ops.
 
-        batch.input_ids = self.verified_id
-        accept_length_cpu_arr = batch.spec_info.accept_length_cpu
-        if accept_length_cpu_arr is None:
-            accept_length_cpu_host = np.asarray([], dtype=np.int32)
-        else:
-            accept_length_cpu_host = accept_length_cpu_arr
-        batch.extend_lens = (accept_length_cpu_host + 1).tolist()
-        batch.extend_num_tokens = sum(batch.extend_lens)
-        batch.seq_lens = batch.spec_info.seq_lens_for_draft_extend
-        batch.seq_lens_sum = batch.seq_lens.sum().item()
-        batch.req_pool_indices = batch.spec_info.req_pool_indices_for_draft_extend
-        batch.return_logprob = False
-        batch.return_hidden_states = False
-
-        self.capture_hidden_mode = CaptureHiddenMode.LAST
-        self.accept_length = self.accept_length + 1
-        self.positions = np.empty_like(batch.input_ids, dtype=np.int32)
-        self.verified_id = np.empty_like(self.accept_length, dtype=np.int32)
-
-        self.positions, self.verified_id = create_extend_after_decode_spec_info(
-            batch.input_ids,
-            batch.seq_lens,
-            self.accept_length,
-            self.positions,
-            self.verified_id,
-        )
-
-        self.accept_length_cpu = np.asarray(accept_length_cpu_host, dtype=np.int32)
+        Spec decode postprocessing (filter_batch, merge_batch, split/concat)
+        operates on per-request arrays whose size varies with real_bs. Keeping
+        these as jax.Array triggers implicit JIT compilation for each new shape.
+        Converting to numpy first and re-uploading at bucket-padded size in
+        _scatter_spec_info_to_dp_slots eliminates those persistent cache misses.
+        """
+        device_fields = ("topk_p", "topk_index", "hidden_states", "verified_id", "accept_length")
+        to_copy = []
+        for f in device_fields:
+            v = getattr(self, f, None)
+            if v is not None and hasattr(v, "copy_to_host_async"):
+                jax.copy_to_host_async(v)
+                to_copy.append(f)
+        for f in to_copy:
+            setattr(self, f, np.asarray(getattr(self, f)))
 
     def filter_batch(self, new_indices: np.ndarray, has_been_filtered: bool = True):
-
-        if has_been_filtered:
-            # in eagle_utils.py:verify, we have already filtered the batch by `unfinished_index`
-            # therefore, we don't need to filter the batch again in scheduler
-            if len(new_indices) != len(self.topk_p):
-                logger.warning(
-                    "length of new_indices: %d != length of topk_p: %d, this should not happen",
-                    len(new_indices),
-                    len(self.topk_p),
-                )
+        new_indices = np.asarray(new_indices)
+        self._ensure_host()
+        if has_been_filtered and len(new_indices) == len(self.topk_p):
             self.topk_p = self.topk_p[: len(new_indices)]
             self.topk_index = self.topk_index[: len(new_indices)]
             self.hidden_states = self.hidden_states[: len(new_indices)]
             self.verified_id = self.verified_id[: len(new_indices)]
+            if self.allocate_lens is not None:
+                self.allocate_lens = np.asarray(self.allocate_lens)[: len(new_indices)]
         else:
-            # in some cases(e.g draft_extend), we have not filtered the batch by `unfinished_index`
             self.topk_p = self.topk_p[new_indices]
             self.topk_index = self.topk_index[new_indices]
             self.hidden_states = self.hidden_states[new_indices]
             self.verified_id = self.verified_id[new_indices]
+            if self.allocate_lens is not None:
+                self.allocate_lens = np.asarray(self.allocate_lens)[new_indices]
 
     def merge_batch(self, spec_info: EagleDraftInput):
-        # FIXME(pc) need support overlap here
         if self.hidden_states is None:
             self.hidden_states = spec_info.hidden_states
             self.verified_id = spec_info.verified_id
@@ -650,7 +706,8 @@ class EagleDraftInput:
             return
         if spec_info.hidden_states is None:
             return
-        # FIXME(pc) this operate should be put on cpu
+        self._ensure_host()
+        spec_info._ensure_host()
         self.hidden_states = np.concatenate([self.hidden_states, spec_info.hidden_states], axis=0)
         self.verified_id = np.concatenate([self.verified_id, spec_info.verified_id], axis=0)
         self.topk_p = np.concatenate([self.topk_p, spec_info.topk_p])
@@ -675,22 +732,65 @@ class EagleVerifyOutput:
 @register_pytree_node_class
 @dataclass
 class EagleVerifyInput:
-    # container type for pytree
+    """Target-verify input. Implements ``SpecInput``.
+
+    Fully describes token/position/mask/tree-index for verify so
+    ``BaseSpecWorker.verify()`` never reads draft-worker internal state.
+    Under DP (Route 1), per-request fields use DP-padded order; verify
+    metadata must reshape to per-DP view before generating cu_q/kv_lens.
+    """
+
+    # --- Device arrays (enter target verify forward / sampling) ---
+    #: device ``(b*draft_token_num,)`` — flattened draft tokens to verify.
     draft_token: jax.Array
+    #: device ``(sum(q_i*kv_i),)`` — tree attention mask; shape participates
+    #: in the JIT cache key.
     custom_mask: jax.Array
+    #: device ``(b*draft_token_num,)`` — verify positions (follows
+    #: ``ForwardBatch`` host/device convention).
     positions: jax.Array
+    #: device — tree verify index (sampling-kernel convention).
     retrive_index: jax.Array
+    #: device — tree child pointer for tree sampling.
     retrive_next_token: jax.Array
+    #: device — tree sibling pointer for tree sampling.
     retrive_next_sibling: jax.Array
     retrive_cum_len: jax.Array
+    #: host ``(b,)`` — for verify attention metadata + DP token accounting.
     seq_lens_cpu: np.ndarray
-    # common type for pytree
+
+    # --- Static metadata (pytree aux; changes trigger new compile shape) ---
     spec_steps: int
     topk: int
+    #: per-request verify token count (constant within a precompile shape).
     draft_token_num: int
     seq_lens_sum: int
     capture_hidden_mode: CaptureHiddenMode
-    # grammar: BaseGrammarObject = None
+
+    # ---- SpecInput protocol -------------------------------------------------
+    def is_draft_input(self) -> bool:
+        return False
+
+    def is_verify_input(self) -> bool:
+        return True
+
+    def get_spec_adjust_token_coefficient(self) -> int:
+        return self.draft_token_num
+
+    def get_logical_token_num(self, bs: int) -> np.ndarray:
+        return np.ones(bs, dtype=np.int32)
+
+    def get_allocated_token_num(self) -> np.ndarray | None:
+        return None
+
+    def get_verify_token_num(self, bs: int) -> int:
+        return bs * self.draft_token_num
+
+    def filter_batch(self, new_indices: np.ndarray, has_been_filtered: bool = True) -> None:
+        raise NotImplementedError("EagleVerifyInput is consumed within one round")
+
+    def merge_batch(self, other) -> None:
+        raise NotImplementedError("EagleVerifyInput is consumed within one round")
 
     def tree_flatten(self):
         seq_lens_sum_arr = _as_int32_array(self.seq_lens_sum, fallback=0)
@@ -741,9 +841,8 @@ class EagleVerifyInput:
         if model_worker_batch.forward_mode.is_idle():
             return
 
-        model_worker_batch.seq_lens[: model_worker_batch.real_bs] = (
-            model_worker_batch.seq_lens[: model_worker_batch.real_bs] - 1
-        )
+        sel = model_worker_batch.logits_indices_selector
+        model_worker_batch.seq_lens[sel] = model_worker_batch.seq_lens[sel] - 1
         model_worker_batch.input_ids = self.draft_token
         model_worker_batch.positions = self.positions
         # bs = batch.batch_size()
@@ -752,7 +851,7 @@ class EagleVerifyInput:
         # extend_lens = jnp.array([self.draft_token_num] * bs)
         model_worker_batch.return_hidden_states = False
         model_worker_batch.forward_mode = ForwardMode.TARGET_VERIFY
-        model_worker_batch.spec_info = self
+        model_worker_batch.spec_info_padded = self
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
         model_worker_batch.extend_seq_lens = self.draft_token
         # assert model_worker_batch.capture_hidden_mode == spec_info.capture_hidden_mode

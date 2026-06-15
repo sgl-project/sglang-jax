@@ -50,12 +50,11 @@ class TestBenchServingDenseTp4(CustomTestCase):
                 "--max-running-requests",
                 "256",
                 "--page-size",
-                "128",
+                "256",
                 "--disable-radix-cache",
+                "--context-length",
+                "3072",
             ],
-            env={
-                "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
-            },
         )
 
     @classmethod
@@ -90,7 +89,7 @@ class TestBenchServingDenseTp4(CustomTestCase):
             base_url=self.base_url,
             dataset_name="random",
             device="tpu",
-            num_prompts=500,
+            num_prompts=512,
             request_rate=float("inf"),
             random_input_len=1,
             random_output_len=1024,
@@ -98,14 +97,14 @@ class TestBenchServingDenseTp4(CustomTestCase):
             random_range_ratio=1,
         )
         res = run_benchmark(args)
-        assert res["completed"] == 500
+        assert res["completed"] == 512
 
         if is_in_ci():
             write_github_step_summary(
                 f"### test_output_throughput_default_tp_4\n"
                 f"Output throughput: {res['output_throughput']:.2f} token/s\n"
             )
-            self.assertGreater(res["output_throughput"], 9866)
+            self.assertGreater(res["output_throughput"], 11000)
 
     def test_ttft_default_tp_4(self):
         args = get_benchmark_args(

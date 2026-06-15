@@ -47,9 +47,6 @@ class TestQwenModel(CustomTestCase):
                 "--chunked-prefill-size",
                 "4096",
             ],
-            env={
-                "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
-            },
         )
 
     @classmethod

@@ -14,8 +14,6 @@ from utils import create_decode_uniform_data, create_prefill_uniform_data
 
 from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention_v3 import (
     RpaCase,
-    get_default_block_sizes,
-    get_vmem_limit,
     ragged_paged_attention,
 )
 from sgl_jax.srt.kernels.utils.perf import multiple_iteration_timeit_from_trace
@@ -58,6 +56,10 @@ def benchmark_backend(
             kv_head_num,
             head_dim,
             page_size=page_size,
+            # Keep the historical 2048 chunk split so the perf-guard workload
+            # (and its baselines) are unchanged; the param default is 4096 for
+            # the tuner, which must match the production chunked_prefill_size.
+            chunk_prefill_size=2048,
         )
     elif mode == "decode":
         (
@@ -121,23 +123,7 @@ def benchmark_backend(
         )
 
     # Benchmark
-    max_num_seqs = kv_lens.shape[0]
-    pages_per_seq = page_indices.shape[0] // max_num_seqs
     rpa_case = RpaCase.DECODE if mode == "decode" else RpaCase.MIXED
-    block_sizes = get_default_block_sizes(
-        q.dtype,
-        k.dtype,
-        q_head_num,
-        kv_head_num,
-        head_dim,
-        page_size,
-        max_num_batched_tokens,
-        max_num_seqs,
-        pages_per_seq,
-        case=rpa_case,
-        vmem_limit_bytes=get_vmem_limit(),
-        sliding_window=sliding_window,
-    )
     attn = functools.partial(
         jitted_attn,
         q,
@@ -156,13 +142,13 @@ def benchmark_backend(
     # Warmup
     output = attn()
     jax.block_until_ready(output)
-    scope_name = (
-        f"RPA{rpa_case.symbol}-p_{page_size}"
-        f"-bq_{block_sizes["bq_sz"]}_{block_sizes["bq_csz"]}"
-        f"-bkv_{block_sizes["bkv_sz"]}_{block_sizes["bkv_csz"]}"
-    )
-    if sliding_window is not None:
-        scope_name += f"-sw_{sliding_window}"
+    # Match the kernel's pallas op by stage + page_size prefix only. The kernel
+    # encodes its actually-selected block sizes into the op name
+    # ("RPA{d,p,m}-p_{ps}-bq_..-bkv_.."), which differ between the heuristic and
+    # tuned paths; matching the full block-encoded name would miss the op (and
+    # silently fall back to whole-call timing). The stage+page prefix is stable
+    # regardless of which block config the kernel picks.
+    scope_name = f"RPA{rpa_case.symbol}-p_{page_size}-"
 
     times = multiple_iteration_timeit_from_trace(
         compute_func=lambda: attn(),
