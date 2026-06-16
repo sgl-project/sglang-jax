@@ -196,6 +196,8 @@ def _sampling_sample_and_prepare_draft_inputs_chain_from_logits(
     coin_f,
     threshold_single,
     threshold_acc,
+    enable_top_k,
+    enable_top_p,
     speculative_num_steps,
     speculative_num_draft_tokens,
 ):
@@ -227,17 +229,19 @@ def _sampling_sample_and_prepare_draft_inputs_chain_from_logits(
     coins_r = _rep(coins.astype(jnp.float32))
     coin_f_r = _rep(coin_f.astype(jnp.float32))
 
-    # target probs: temperature scale, then top_k/top_p renorm (per request).
+    # target probs: temperature scale, then optional top_k/top_p renorm.
     # Everything is replicated here, so the renorm kernels behave exactly like
-    # the non-overlap reference path (eagle_util.sample).
+    # the non-overlap reference path (eagle_util.sample) when enabled.
     probs_3d = jax.nn.softmax(tl.reshape(bs, n, vocab) / temp[:, :, None], axis=-1)
-    tk = _rep(top_ks.astype(jnp.int32))
-    tk = jnp.where(tk <= 0, jnp.int32(vocab), tk)  # top_k<=0 means "no top-k"
-    tp = _rep(top_ps.astype(jnp.float32))
-    tk_flat = jnp.broadcast_to(tk[:, None], (bs, n)).reshape(bs * n)
-    tp_flat = jnp.broadcast_to(tp[:, None], (bs, n)).reshape(bs * n)
-    probs_2d = top_k_renorm_prob(probs_3d.reshape(bs * n, vocab), tk_flat)
-    probs_2d = top_p_renorm_prob(probs_2d, tp_flat)
+    probs_2d = probs_3d.reshape(bs * n, vocab)
+    if enable_top_k:
+        tk = _rep(top_ks.astype(jnp.int32))
+        tk_flat = jnp.broadcast_to(tk[:, None], (bs, n)).reshape(bs * n)
+        probs_2d = top_k_renorm_prob(probs_2d, tk_flat)
+    if enable_top_p:
+        tp = _rep(top_ps.astype(jnp.float32))
+        tp_flat = jnp.broadcast_to(tp[:, None], (bs, n)).reshape(bs * n)
+        probs_2d = top_p_renorm_prob(probs_2d, tp_flat)
     probs_3d = probs_2d.reshape(bs, n, vocab)
 
     cand = draft_2d[:, 1:]  # (bs, n-1) candidate tokens d1..d_{n-1}
@@ -701,6 +705,8 @@ def _build_fused_greedy_verify_jit(topk: int):
             "is_greedy",
             "threshold_single",
             "threshold_acc",
+            "enable_top_k",
+            "enable_top_p",
         ],
     )
     def fused_greedy_verify(
@@ -729,6 +735,8 @@ def _build_fused_greedy_verify_jit(topk: int):
         is_greedy=True,
         threshold_single=1.0,
         threshold_acc=1.0,
+        enable_top_k=False,
+        enable_top_p=False,
     ):
         if use_relay_state:
             relay_topk_index, _, relay_verified_id, relay_new_seq_lens = gather_spec_relay_buffers(
@@ -822,6 +830,8 @@ def _build_fused_greedy_verify_jit(topk: int):
                 coin_f=coin_f,
                 threshold_single=threshold_single,
                 threshold_acc=threshold_acc,
+                enable_top_k=enable_top_k,
+                enable_top_p=enable_top_p,
                 speculative_num_steps=speculative_num_steps,
                 speculative_num_draft_tokens=speculative_num_draft_tokens,
             )
@@ -1592,6 +1602,8 @@ def spec_decode_verify_phase(spec_worker, model_worker_batch, cur_allocate_lens)
     _sv_tbs = target_forward_batch.seq_lens.shape[0]
     _sv_nm1 = int(draft_worker.speculative_num_draft_tokens) - 1
     _sv_rep = NamedSharding(spec_worker.mesh, P())
+    _sv_enable_top_k = False
+    _sv_enable_top_p = False
     if _sv_is_greedy:
         _sv_coins = _device_array_preserve_device(
             np.zeros((_sv_tbs, _sv_nm1), np.float32), _sv_rep
@@ -1615,6 +1627,9 @@ def spec_decode_verify_phase(spec_worker, model_worker_batch, cur_allocate_lens)
         _tv = float(_t[0]) if _t.size else 1.0
         _kv = int(_k[0]) if (_k is not None and _k.size) else 0
         _pv = float(_p[0]) if (_p is not None and _p.size) else 1.0
+        _sv_vocab = int(target_worker.model_config.vocab_size)
+        _sv_enable_top_k = 0 < _kv < _sv_vocab
+        _sv_enable_top_p = _pv < 1.0
         _sv_coins = _device_array_preserve_device(
             np.random.random((_sv_tbs, _sv_nm1)).astype(np.float32), _sv_rep
         )
@@ -1671,6 +1686,8 @@ def spec_decode_verify_phase(spec_worker, model_worker_batch, cur_allocate_lens)
             is_greedy=_sv_is_greedy,
             threshold_single=_sv_thr_single,
             threshold_acc=_sv_thr_acc,
+            enable_top_k=_sv_enable_top_k,
+            enable_top_p=_sv_enable_top_p,
         )
         cache_miss_count = count()
 
