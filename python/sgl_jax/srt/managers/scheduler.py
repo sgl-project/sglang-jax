@@ -598,6 +598,8 @@ class Scheduler(
             )
 
     def init_memory_pool_and_cache(self):
+        from sgl_jax.srt.mem_cache.memory_pool import HybridReqToTokenPool
+
         self.req_to_token_pool, self.token_to_kv_pool_allocator = self.tp_worker.get_memory_pool()
         self.tree_cache = build_kv_cache(
             server_args=self.server_args,
@@ -606,6 +608,7 @@ class Scheduler(
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             page_size=self.page_size,
             is_hybrid=self.is_hybrid,
+            is_hybrid_recurrent=isinstance(self.req_to_token_pool, HybridReqToTokenPool),
             sliding_window_size=self.sliding_window_size,
             tp_size=self.tp_size,
             spec_algorithm=self.spec_algorithm,

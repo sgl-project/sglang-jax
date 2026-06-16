@@ -151,6 +151,7 @@ class ServerArgs:
     # Optimization/debug options
     disable_radix_cache: bool = False
     enable_unified_radix_tree: bool = False
+    enable_mamba_extra_buffer: bool = False
     allow_auto_truncate: bool = False
     enable_tokenizer_batch_encode: bool = False
     disable_overlap_schedule: bool = False
@@ -1004,6 +1005,13 @@ class ServerArgs:
             help="Route non-hybrid (full-attention) models to UnifiedRadixCache "
             "(component-agnostic prefix cache). Default off; hybrid models are "
             "unaffected.",
+        )
+        parser.add_argument(
+            "--enable-mamba-extra-buffer",
+            action="store_true",
+            help="Recurrent radix cache: use the page-aligned ping-pong track "
+            "buffer for page_size>=128 (PR#2). Off by default; PR#1 supports "
+            "page_size=1 only.",
         )
         parser.add_argument(
             "--allow-auto-truncate",
