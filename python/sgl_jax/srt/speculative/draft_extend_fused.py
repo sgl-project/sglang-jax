@@ -204,10 +204,10 @@ def _sampling_sample_and_prepare_draft_inputs_chain_from_logits(
     """Non-greedy counterpart of the greedy chain verify.
 
     Mirrors `tree_speculative_sampling_target_only` (eagle_util.py) for the
-    pure topk=1 chain: target-only typical acceptance (draft_probs == 0), so
-    we never need the draft probabilities q. Accepted slots emit the accepted
-    draft token; the first rejected / bonus slot emits an inverse-CDF sample
-    from the (renormalized) target distribution.
+    pure topk=1 chain: target-only typical acceptance. Accepted slots emit the
+    accepted draft token; the first rejected slot samples from the residual
+    target distribution, while the all-accepted bonus slot samples from the
+    full target distribution.
     """
     bs = seq_lens.shape[0]
     n = speculative_num_draft_tokens
@@ -247,8 +247,7 @@ def _sampling_sample_and_prepare_draft_inputs_chain_from_logits(
     cand = draft_2d[:, 1:]  # (bs, n-1) candidate tokens d1..d_{n-1}
     p_cand = jnp.take_along_axis(probs_3d[:, : n - 1, :], cand[:, :, None], axis=-1)[:, :, 0]
 
-    prob_acc = jnp.cumsum(p_cand, axis=1)
-    accept_mask = (coins_r <= prob_acc / threshold_acc) | (p_cand >= threshold_single)
+    accept_mask = (coins_r <= p_cand / threshold_acc) | (p_cand >= threshold_single)
 
     is_padding = seq_lens_r == 0
     accepted_children = jnp.cumprod(accept_mask.astype(jnp.int32), axis=1).astype(jnp.bool_)
@@ -259,9 +258,16 @@ def _sampling_sample_and_prepare_draft_inputs_chain_from_logits(
     # residual / bonus sampling at emit position = accept_length_raw
     emit_pos = accept_length_raw.astype(jnp.int32)  # (bs,) in [0, n-1]
     p_emit = jnp.take_along_axis(probs_3d, emit_pos[:, None, None], axis=1)[:, 0, :]  # (bs, vocab)
-    cdf = jnp.cumsum(p_emit, axis=-1)
+    has_rejected_child = emit_pos < (n - 1)
+    safe_reject_pos = jnp.minimum(emit_pos, n - 2)
+    rejected_token = jnp.take_along_axis(cand, safe_reject_pos[:, None], axis=1)[:, 0]
+    vocab_ids = jnp.arange(vocab, dtype=jnp.int32)[None, :]
+    residual_probs = jnp.where(vocab_ids == rejected_token[:, None], 0.0, p_emit)
+    final_probs = jnp.where(has_rejected_child[:, None], residual_probs, p_emit)
+    cdf = jnp.cumsum(final_probs, axis=-1)
     u = coin_f_r * cdf[:, -1]
-    sampled = jnp.sum((cdf < u[:, None]).astype(jnp.int32), axis=-1).astype(jnp.int32)  # (bs,)
+    sampled = jnp.sum((cdf <= u[:, None]).astype(jnp.int32), axis=-1).astype(jnp.int32)
+    sampled = jnp.minimum(sampled, jnp.int32(vocab - 1))  # (bs,)
 
     # predict_2d[:, k] = cand[:, k] (=d_{k+1}); override emit_pos slot with sampled
     predict_2d = jnp.concatenate([cand, jnp.zeros((bs, 1), dtype=jnp.int32)], axis=1).astype(jnp.int32)
