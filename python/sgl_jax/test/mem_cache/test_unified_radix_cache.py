@@ -21,8 +21,13 @@ from sgl_jax.srt.mem_cache.base_prefix_cache import (
     InsertParams,
     MatchPrefixParams,
 )
-from sgl_jax.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
+from sgl_jax.srt.mem_cache.memory_pool import (
+    HybridReqToTokenPool,
+    MHATokenToKVPool,
+    ReqToTokenPool,
+)
 from sgl_jax.srt.mem_cache.radix_cache import RadixCache, RadixKey
+from sgl_jax.srt.mem_cache.recurrent_state_pool import RecurrentStatePool
 from sgl_jax.srt.mem_cache.unified_cache_components import ComponentType
 from sgl_jax.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
@@ -114,7 +119,7 @@ class TestUnifiedRadixCache(CustomTestCase):
 
         key = [1, 2, 3, 4, 5, 6, 7, 8]
         value = np.arange(100, 108, dtype=np.int32)
-        prefix_len = cache.insert(InsertParams(key=RadixKey(key), value=value))
+        prefix_len = cache.insert(InsertParams(key=RadixKey(key), value=value)).prefix_len
         self.assertEqual(prefix_len, 0)  # new inserted, no prefix
 
         # full hit returns all 8 indices
@@ -124,7 +129,7 @@ class TestUnifiedRadixCache(CustomTestCase):
         self.assertIs(match_result.best_match_node, match_result.last_device_node)
 
         # second insert of the same key matches the full prefix
-        prefix_len = cache.insert(InsertParams(key=RadixKey(key), value=value.copy()))
+        prefix_len = cache.insert(InsertParams(key=RadixKey(key), value=value.copy())).prefix_len
         self.assertEqual(prefix_len, 8)
         self.assertEqual(cache.total_size(), 8)
 
@@ -146,7 +151,7 @@ class TestUnifiedRadixCache(CustomTestCase):
 
         # inserting the diverging key reuses the 4-token shared prefix
         value2 = np.arange(200, 208, dtype=np.int32)
-        prefix_len = cache.insert(InsertParams(key=RadixKey(key2), value=value2))
+        prefix_len = cache.insert(InsertParams(key=RadixKey(key2), value=value2)).prefix_len
         self.assertEqual(prefix_len, 4)
         self.assertEqual(cache.total_size(), 12)
 
@@ -174,7 +179,7 @@ class TestUnifiedRadixCache(CustomTestCase):
         cache = self._create_unified_cache(req_pool, allocator, disable=True)
 
         key = [1, 2, 3, 4, 5]
-        insert_result = cache.insert(InsertParams(key=RadixKey(key)))
+        insert_result = cache.insert(InsertParams(key=RadixKey(key))).prefix_len
         self.assertEqual(insert_result, 0)
 
         match_result = cache.match_prefix(MatchPrefixParams(key=RadixKey(key)))
@@ -270,7 +275,9 @@ class TestUnifiedRadixCache(CustomTestCase):
             (key_c, value_c, 0),
         ):
             radix_prefix = radix.insert(InsertParams(key=RadixKey(key), value=value.copy()))
-            unified_prefix = unified.insert(InsertParams(key=RadixKey(key), value=value.copy()))
+            unified_prefix = unified.insert(
+                InsertParams(key=RadixKey(key), value=value.copy())
+            ).prefix_len
             self.assertEqual(radix_prefix, unified_prefix)
             self.assertEqual(radix_prefix, expected_prefix)
             self._assert_sizes_equal(radix, unified)
@@ -344,7 +351,9 @@ class TestUnifiedRadixCache(CustomTestCase):
         radix_prefix = radix.insert(
             InsertParams(key=RadixKey(key_a[:aligned_len]), value=value_a.copy())
         )
-        unified_prefix = unified.insert(InsertParams(key=RadixKey(key_a), value=value_a.copy()))
+        unified_prefix = unified.insert(
+            InsertParams(key=RadixKey(key_a), value=value_a.copy())
+        ).prefix_len
         self.assertEqual(radix_prefix, unified_prefix)
         self.assertEqual(radix_prefix, 0)
         self.assertEqual(unified.total_size(), 256)
@@ -365,7 +374,9 @@ class TestUnifiedRadixCache(CustomTestCase):
         radix_prefix = radix.insert(
             InsertParams(key=RadixKey(key_a[:aligned_len]), value=value_a.copy())
         )
-        unified_prefix = unified.insert(InsertParams(key=RadixKey(key_a), value=value_a.copy()))
+        unified_prefix = unified.insert(
+            InsertParams(key=RadixKey(key_a), value=value_a.copy())
+        ).prefix_len
         self.assertEqual(radix_prefix, unified_prefix)
         self.assertEqual(radix_prefix, 256)
         self._assert_sizes_equal(radix, unified)
@@ -376,7 +387,9 @@ class TestUnifiedRadixCache(CustomTestCase):
         radix_prefix = radix.insert(
             InsertParams(key=RadixKey(key_c[:aligned_len]), value=value_c.copy())
         )
-        unified_prefix = unified.insert(InsertParams(key=RadixKey(key_c), value=value_c.copy()))
+        unified_prefix = unified.insert(
+            InsertParams(key=RadixKey(key_c), value=value_c.copy())
+        ).prefix_len
         self.assertEqual(radix_prefix, unified_prefix)
         self.assertEqual(radix_prefix, 128)
         self.assertEqual(unified.total_size(), 384)
@@ -740,6 +753,297 @@ class TestUnifiedRadixCacheWithRequests(CustomTestCase):
             disabled_cache.cache_unfinished_req(mock_req)
         except Exception as e:
             self.fail(f"cache_unfinished_req raised an exception: {e}")
+
+
+class _CowReq:
+    """Minimal Req surrogate for recurrent CoW match recording."""
+
+    def __init__(self, dp_rank=0):
+        self.dp_rank = dp_rank
+        self.recurrent_cow_src_index = None
+
+
+class TestUnifiedRadixCacheRecurrent(CustomTestCase):
+    """Cache-level recurrent component: commit / match-CoW / evict / lock /
+    slot ledger, all at page_size=1 (PR#1 scope)."""
+
+    def setUp(self):
+        self.kv_head_num = 8
+        self.head_dim = 64
+        self.layer_num = 2
+        self.max_seq_len = 2048
+        self.dtype = jnp.bfloat16
+        self.pool_size = 8192
+        self.recurrent_size = 8  # global recurrent slots
+        self.rec_num_heads = 8
+        self.rec_head_dim = 16
+        self.conv_kernel_size = 4
+
+    def _create_recurrent_setup(self, dp_size: int = 1):
+        state_pool = RecurrentStatePool(
+            linear_recurrent_layer_ids=[0, 1],
+            size=self.recurrent_size,
+            num_heads=self.rec_num_heads,
+            head_dim=self.rec_head_dim,
+            conv_kernel_size=self.conv_kernel_size,
+            mesh=mesh,
+            dp_size=dp_size,
+        )
+        hybrid_pool = HybridReqToTokenPool(
+            size=64,
+            max_context_len=self.max_seq_len,
+            dtype=np.int32,
+            recurrent_state_pool=state_pool,
+            dp_size=dp_size,
+        )
+        kv_cache = MHATokenToKVPool(
+            size=self.pool_size,
+            page_size=1,
+            dtype=self.dtype,
+            head_num=self.kv_head_num,
+            head_dim=self.head_dim,
+            layer_num=self.layer_num,
+            mesh=mesh,
+            dp_size=dp_size,
+        )
+        allocator = TokenToKVPoolAllocator(size=self.pool_size, kvcache=kv_cache, dp_size=dp_size)
+        cache = UnifiedRadixCache(
+            req_to_token_pool=hybrid_pool,
+            token_to_kv_pool_allocator=allocator,
+            page_size=1,
+            disable=False,
+            kv_head_num=self.kv_head_num,
+            head_dim=self.head_dim,
+            layer_num=self.layer_num,
+            max_seq_len=self.max_seq_len,
+            dtype=self.dtype,
+            tree_components=(ComponentType.FULL, ComponentType.RECURRENT),
+        )
+        return state_pool, hybrid_pool, allocator, cache
+
+    def _commit(self, cache, pool, key, value):
+        """Simulate a finished-request recurrent commit: pop a running slot and
+        donate it to the tree via insert (mirrors cache_finished_req)."""
+        slot = pool.alloc_recurrent_slot(0)
+        params = InsertParams(
+            key=RadixKey(key, None, 0),
+            value=value,
+            recurrent_value=pool.recurrent_value_from_slot(slot),
+        )
+        result = cache.insert(params)
+        return slot, result
+
+    def test_supports_recurrent(self):
+        _, _, _, cache = self._create_recurrent_setup()
+        self.assertTrue(cache.supports_recurrent())
+
+    def test_commit_match_cow_evict_ledger(self):
+        state_pool, pool, _, cache = self._create_recurrent_setup()
+        slots = pool.slots_per_rank
+
+        key = [1, 2, 3, 4]
+        value = np.arange(100, 104, dtype=np.int32)
+        slot, result = self._commit(cache, pool, key, value)
+
+        # The tree took ownership: committed leaf holds the slot.
+        self.assertTrue(result.recurrent_committed)
+        self.assertEqual(cache.component_evictable_size_[ComponentType.RECURRENT][0], 1)
+        # active=0 (no live request), tree_owned=1, free=slots-1.
+        self.assertEqual(cache.assert_recurrent_slot_ledger(0), 0)
+        self.assertEqual(pool.recurrent_available_size(0), slots - 1)
+
+        # A prefix hit records the src slot for CoW (no allocation at match).
+        req = _CowReq(dp_rank=0)
+        match = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(key, None, 0), cow_recurrent=True, req=req)
+        )
+        self.assertTrue(np.array_equal(match.device_indices, value))
+        self.assertEqual(req.recurrent_cow_src_index, slot)
+
+        # Eviction frees the recurrent slot and reports it.
+        evict_result = cache.evict(EvictParams(recurrent_num=1, dp_rank=0))
+        self.assertEqual(evict_result.recurrent_num_evicted, 1)
+        self.assertEqual(cache.component_evictable_size_[ComponentType.RECURRENT][0], 0)
+        self.assertEqual(pool.recurrent_available_size(0), slots)
+        self.assertEqual(cache.assert_recurrent_slot_ledger(0), 0)
+
+    def test_shorter_prefix_after_longer_skips_internal(self):
+        """Caching AB after ABCD lands on internal node B: recurrent is leaf-only,
+        so it is not committed there (no orphan); the running slot is freed by
+        the caller (recurrent_committed=False)."""
+        state_pool, pool, _, cache = self._create_recurrent_setup()
+
+        long_key = [1, 2, 3, 4]
+        long_val = np.arange(10, 14, dtype=np.int32)
+        long_slot, long_res = self._commit(cache, pool, long_key, long_val)
+        self.assertTrue(long_res.recurrent_committed)
+
+        short_key = [1, 2]
+        short_val = np.arange(20, 22, dtype=np.int32)
+        short_slot, short_res = self._commit(cache, pool, short_key, short_val)
+
+        # Internal target → not committed; the longer leaf keeps its recurrent.
+        self.assertFalse(short_res.recurrent_committed)
+        self.assertEqual(cache.component_evictable_size_[ComponentType.RECURRENT][0], 1)
+        # The short slot is still request-owned (caller frees it).
+        pool.free_recurrent_slot(short_slot, 0)
+        self.assertEqual(cache.assert_recurrent_slot_ledger(0), 0)
+
+    def test_lock_protects_recurrent_leaf(self):
+        state_pool, pool, _, cache = self._create_recurrent_setup()
+        key = [7, 8, 9, 10]
+        value = np.arange(50, 54, dtype=np.int32)
+        slot, _ = self._commit(cache, pool, key, value)
+
+        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(key, None, 0)))
+        leaf = match.last_device_node
+        lock_result = cache.inc_lock_ref(leaf)
+
+        # Recurrent value moved evictable → protected.
+        self.assertEqual(cache.component_evictable_size_[ComponentType.RECURRENT][0], 0)
+        self.assertEqual(cache.component_protected_size_[ComponentType.RECURRENT][0], 1)
+
+        # Locked leaf survives eviction.
+        evict_result = cache.evict(EvictParams(recurrent_num=1, dp_rank=0))
+        self.assertEqual(evict_result.recurrent_num_evicted, 0)
+
+        # Unlock restores, then eviction frees.
+        cache.dec_lock_ref(leaf, lock_result.to_dec_params())
+        self.assertEqual(cache.component_evictable_size_[ComponentType.RECURRENT][0], 1)
+        self.assertEqual(cache.component_protected_size_[ComponentType.RECURRENT][0], 0)
+        evict_result = cache.evict(EvictParams(recurrent_num=1, dp_rank=0))
+        self.assertEqual(evict_result.recurrent_num_evicted, 1)
+        self.assertEqual(pool.recurrent_available_size(0), pool.slots_per_rank)
+
+    def test_longer_prefix_after_shorter_frees_parent(self):
+        """Caching AB (leaf) then ABCD makes AB internal via _add_new_node; its
+        recurrent value must be dropped (not stranded on the unevictable internal
+        node), so eviction can reclaim every slot (regression for B1)."""
+        state_pool, pool, _, cache = self._create_recurrent_setup()
+        slots = pool.slots_per_rank
+
+        ab_slot, ab_res = self._commit(cache, pool, [1, 2], np.arange(10, 12, dtype=np.int32))
+        self.assertTrue(ab_res.recurrent_committed)
+        _, abcd_res = self._commit(cache, pool, [1, 2, 3, 4], np.arange(20, 24, dtype=np.int32))
+        self.assertTrue(abcd_res.recurrent_committed)
+
+        # AB became internal → its slot was freed; only ABCD's leaf is tree-owned.
+        self.assertEqual(cache.component_evictable_size_[ComponentType.RECURRENT][0], 1)
+        self.assertEqual(pool.recurrent_available_size(0), slots - 1)
+        self.assertEqual(cache.assert_recurrent_slot_ledger(0), 0)
+
+        evict_result = cache.evict(EvictParams(recurrent_num=1, dp_rank=0))
+        self.assertEqual(evict_result.recurrent_num_evicted, 1)
+        self.assertEqual(pool.recurrent_available_size(0), slots)
+
+    def test_internal_transition_while_locked_frees_on_unlock(self):
+        """If a node becomes internal while its recurrent value is locked (a CoW
+        src this round), the free is deferred to the final unlock (B1)."""
+        state_pool, pool, _, cache = self._create_recurrent_setup()
+        self._commit(cache, pool, [1, 2], np.arange(10, 12, dtype=np.int32))
+        ab = cache.match_prefix(MatchPrefixParams(key=RadixKey([1, 2], None, 0))).last_device_node
+
+        lock = cache.inc_lock_ref(ab)  # AB recurrent: evictable → protected
+        self.assertEqual(cache.component_protected_size_[ComponentType.RECURRENT][0], 1)
+
+        # Cache ABCD → AB gains a child while locked; recurrent free is deferred.
+        self._commit(cache, pool, [1, 2, 3, 4], np.arange(20, 24, dtype=np.int32))
+        self.assertIsNotNone(ab.component_data[ComponentType.RECURRENT].value)
+        free_before = pool.recurrent_available_size(0)
+
+        cache.dec_lock_ref(ab, lock.to_dec_params())  # final unlock frees it
+        self.assertIsNone(ab.component_data[ComponentType.RECURRENT].value)
+        self.assertEqual(pool.recurrent_available_size(0), free_before + 1)
+        self.assertEqual(cache.component_protected_size_[ComponentType.RECURRENT][0], 0)
+        self.assertEqual(cache.assert_recurrent_slot_ledger(0), 0)
+
+    def test_copy_slots_bitwise_clone_all_layers(self):
+        """copy_slots clones src→dst bitwise across all recurrent + conv layers;
+        src==0 rows are no-ops. This is the page=1 building block of CoW
+        equivalence (full KL==0 model parity is the TPU test)."""
+        state_pool, _, _, _ = self._create_recurrent_setup()
+        src, dst = 2, 5
+
+        # Seed distinct per-layer data into the src slot; leave dst zeroed.
+        # out_sharding is required because the test runs under an explicit mesh.
+        rec_spec = state_pool.recurrent_sharding.spec
+        conv_spec = state_pool.conv_sharding.spec
+        for layer in range(state_pool.num_linear_recurrent_layers):
+            state_pool.recurrent_buffers[layer] = (
+                state_pool.recurrent_buffers[layer]
+                .at[src]
+                .set(float(layer + 1), out_sharding=rec_spec)
+            )
+            state_pool.conv_buffers[layer][0] = (
+                state_pool.conv_buffers[layer][0]
+                .at[src]
+                .set(float(layer + 7), out_sharding=conv_spec)
+            )
+
+        # Indices arrive P("data")-sharded in production (forward metadata);
+        # mirror that here so copy_slots' shard_map in_specs match. copy_slots
+        # runs under jit in production (jitted_run_model) so the in-kernel
+        # gather/scatter enter shard_map's manual mode.
+        data_sh = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("data"))
+        src_idx = jax.device_put(np.array([src], dtype=np.int32), data_sh)
+        dst_idx = jax.device_put(np.array([dst], dtype=np.int32), data_sh)
+        copy = jax.jit(state_pool.copy_slots)
+        new_rec, new_conv = copy(src_idx, dst_idx)
+
+        for layer in range(state_pool.num_linear_recurrent_layers):
+            rec = np.asarray(new_rec[layer])
+            conv = np.asarray(new_conv[layer][0])
+            src_rec = np.asarray(state_pool.recurrent_buffers[layer])[src]
+            src_conv = np.asarray(state_pool.conv_buffers[layer][0])[src]
+            np.testing.assert_array_equal(rec[dst], src_rec)
+            np.testing.assert_array_equal(conv[dst], src_conv)
+            # src is untouched (the tree's value is preserved).
+            np.testing.assert_array_equal(rec[src], src_rec)
+
+        # src==0 → no clone: dst keeps its (zero) content.
+        zero_idx = jax.device_put(np.array([0], dtype=np.int32), data_sh)
+        noop_rec, _ = copy(zero_idx, dst_idx)
+        for layer in range(state_pool.num_linear_recurrent_layers):
+            dst_before = np.asarray(state_pool.recurrent_buffers[layer])[dst]
+            np.testing.assert_array_equal(np.asarray(noop_rec[layer])[dst], dst_before)
+
+    def test_copy_slots_multi_dp_locality(self):
+        """copy_slots under dp_size=2: src/dst are per-rank-LOCAL slot indices, so
+        the clone must stay within each DP shard (no cross-rank corruption).
+        (plan §6 multi-DP / reviewer S1)"""
+        dp_mesh = create_device_mesh(ici_parallelism=[2, -1], dcn_parallelism=[1, 1])
+        with jax.sharding.set_mesh(dp_mesh):
+            state_pool = RecurrentStatePool(
+                linear_recurrent_layer_ids=[0],
+                size=8,  # 4 slots/rank, total_slots=10 (rank0 rows 0-4, rank1 5-9)
+                num_heads=8,
+                head_dim=16,
+                conv_kernel_size=self.conv_kernel_size,
+                mesh=dp_mesh,
+                dp_size=2,
+            )
+            buf = state_pool.recurrent_buffers[0]
+            # Seed global row i = i, so each rank's local slot has distinct data.
+            seed = np.broadcast_to(
+                np.arange(buf.shape[0], dtype=np.float32).reshape(-1, 1, 1, 1), buf.shape
+            )
+            state_pool.recurrent_buffers[0] = jax.device_put(
+                seed.astype(np.asarray(buf).dtype), state_pool.recurrent_sharding
+            )
+
+            data_sh = jax.sharding.NamedSharding(dp_mesh, jax.sharding.PartitionSpec("data"))
+            # Both ranks clone LOCAL slot 2 → LOCAL slot 3 (global 2→3 on rank0,
+            # global 7→8 on rank1).
+            src = jax.device_put(np.array([2, 2], dtype=np.int32), data_sh)
+            dst = jax.device_put(np.array([3, 3], dtype=np.int32), data_sh)
+            new_rec, _ = jax.jit(state_pool.copy_slots)(src, dst)
+            rec = np.asarray(new_rec[0])
+
+        # rank0 local-3 (global 3) == its local-2 (global 2) == 2.0;
+        # rank1 local-3 (global 8) == its local-2 (global 7) == 7.0.
+        # Cross-rank leakage would make global 3 == 7.0 (or vice versa).
+        self.assertEqual(float(rec[3].reshape(-1)[0]), 2.0)
+        self.assertEqual(float(rec[8].reshape(-1)[0]), 7.0)
 
 
 if __name__ == "__main__":
