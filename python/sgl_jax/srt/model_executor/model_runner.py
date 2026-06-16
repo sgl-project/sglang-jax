@@ -45,6 +45,26 @@ from sgl_jax.srt.utils.jax_utils import get_available_device_memory
 logger = logging.getLogger(__name__)
 
 
+def _maybe_apply_recurrent_cow(forward_batch, memory_pools):
+    """One-shot recurrent copy-on-write, run exactly once per forward before any
+    recurrent layer reads state. Clones each prefix-hit request's matched tree
+    slot into its running slot: src = forward_batch.recurrent_cow_src_indices
+    (0 = no clone), dst = forward_batch.recurrent_indices. Returns a memory_pools
+    whose recurrent_state_pool holds the cloned buffers (functional; the result
+    flows to model() and out via pool_updates). No-op when no CoW is pending.
+    """
+    src = getattr(forward_batch, "recurrent_cow_src_indices", None)
+    if src is None or forward_batch.recurrent_indices is None:
+        return memory_pools
+    rsp = memory_pools.recurrent_state_pool
+    new_recurrent, new_conv = rsp.copy_slots(src, forward_batch.recurrent_indices)
+    _, aux = rsp.tree_flatten()
+    new_rsp = type(rsp).tree_unflatten(aux, (new_recurrent, new_conv))
+    pools = dict(memory_pools._pools)
+    pools["recurrent_state_pool"] = new_rsp
+    return type(memory_pools)(**pools)
+
+
 class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
     """ModelRunner runs the forward passes of the models."""
 
@@ -218,6 +238,8 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         ):
             model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
             model = nnx.merge(model_def, model_state)
+            # One-shot recurrent CoW before any recurrent layer reads state.
+            memory_pools = _maybe_apply_recurrent_cow(forward_batch, memory_pools)
             with LoraBatchContext.set_batch(forward_batch):
                 return model(forward_batch, memory_pools, logits_metadata)
 
