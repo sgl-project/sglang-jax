@@ -204,6 +204,19 @@ class ServerArgs:
     # resolutions (bounds the recompile storm). Padding patches are masked in the ViT attention
     # and sliced off the output -> bit-equivalent to no-bucketing. 0 = off. Qwen2.5-VL only.
     vision_bucket_size: int = 0
+    # L-k OOM guard (decouple encode HBM from concurrency): the batched vision encode
+    # (model_runner._encode_mm_batched) concatenated ALL concurrently-scheduled requests' image
+    # patches into ONE ViT jit call. The MiMoVL ViT does DENSE full attention whose activation
+    # scales with (total patches)^2, so under continuous batching (CONC>1) the per-call peak grew
+    # with the number of co-scheduled images and OOM'd (RESOURCE_EXHAUSTED jit_jitted_encode_mm,
+    # ~11 GiB at 8 concurrent large images). This caps how many patches may be concatenated into a
+    # SINGLE encode jit call: when a scheduler step has more mm patches than this, the encode is
+    # CHUNKED into multiple sequential jit calls (decode/forward still batches the whole step, so
+    # the decode throughput win is untouched). 0 = auto: defaults to max(vision_max_patches, ...)
+    # so one chunk fits ~one worst-case image -- i.e. the per-encode-call peak fits the SAME HBM the
+    # G1 vision reserve already set aside for one image, regardless of concurrency. Set explicitly to
+    # trade encode latency (fewer, larger chunks) against encode peak HBM.
+    vision_max_patches_per_encode: int = 0
 
     # Speculative decoding
     speculative_algorithm: str | None = None
@@ -1133,6 +1146,20 @@ class ServerArgs:
             help="V-2 bucketing: pad every image's LLM-grid (h//merge, w//merge) to (S, S) so the "
             "vision encode jit compiles ONE graph for all resolutions (bounds recompiles). Padding "
             "is masked + sliced off (bit-equivalent to off). 0 = off. Qwen2.5-VL only.",
+        )
+        parser.add_argument(
+            "--vision-max-patches-per-encode",
+            type=int,
+            default=ServerArgs.vision_max_patches_per_encode,
+            help="L-k OOM guard: max #patches concatenated into a SINGLE batched vision-encode jit "
+            "call. The ViT does dense full attention (activation ~ (total patches)^2), so "
+            "concatenating all co-scheduled requests' images into one call made the encode peak HBM "
+            "grow with concurrency and OOM (RESOURCE_EXHAUSTED jit_jitted_encode_mm). When a "
+            "scheduler step exceeds this, the encode is CHUNKED into multiple sequential jit calls "
+            "(bit-identical merged features; the ViT segment-masks per image, so a chunk boundary on "
+            "an image boundary changes nothing but the score-matrix size). Decode/forward still "
+            "batches the whole step -> decode throughput is unchanged. 0 = auto (~one worst-case "
+            "image per call, tied to --vision-max-patches / the G1 reserve).",
         )
         # Kernel backend
         parser.add_argument(

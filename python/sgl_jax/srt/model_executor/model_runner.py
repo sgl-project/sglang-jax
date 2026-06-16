@@ -33,6 +33,7 @@ from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.model_executor.model_runner_kv_cache_mixin import (
     ModelRunnerKVCacheMixin,
     _build_non_hybrid_memory_pools,
+    _vision_probe_geometry,
 )
 from sgl_jax.srt.model_executor.vision_bucketing import bucket_pad_images
 from sgl_jax.srt.model_loader.loader import get_model_loader
@@ -78,6 +79,56 @@ def _count_jit_compiles():
 # encode_mm_reqs. (Follow-up: make this a server_args field so it is same-source with
 # --vision-bucket-size instead of a separate constant -- recorded as backlog.)
 _VISION_SEQ_BUCKET = 256
+
+# L-k OOM guard fallback bound (decouple encode HBM from concurrency): when neither
+# --vision-max-patches-per-encode nor --vision-max-patches is set, cap the per-encode-call patch
+# count at this so a single ViT jit call's dense [heads, T, T] attention activation can never grow
+# unbounded with concurrency. 8192 ≈ one large image (e.g. a 28x28-pixel-patch image at the common
+# max resolution) -- the same single-image worst case the G1 reserve is sized for. Chosen
+# conservatively: better to chunk an extra time than to risk RESOURCE_EXHAUSTED.
+_DEFAULT_MAX_PATCHES_PER_ENCODE = 8192
+
+
+def _resolve_max_patches_per_encode(server_args) -> int:
+    """L-k: resolve the per-encode-call patch bound that decouples encode peak HBM from concurrency.
+
+    Priority: explicit ``--vision-max-patches-per-encode`` > ``--vision-max-patches`` (the
+    worst-case single-image patch count the G1 vision reserve is ALREADY sized for, so one chunk
+    fits the reserved HBM) > the conservative ``_DEFAULT_MAX_PATCHES_PER_ENCODE`` fallback. Always
+    returns a positive int. Pure (no device / per-rank state) so every rank derives the identical
+    bound from the identical broadcast server_args -> identical chunking (multi-host lockstep)."""
+    explicit = int(getattr(server_args, "vision_max_patches_per_encode", 0) or 0)
+    if explicit > 0:
+        return explicit
+    max_patches = int(getattr(server_args, "vision_max_patches", 0) or 0)
+    if max_patches > 0:
+        return max_patches
+    return _DEFAULT_MAX_PATCHES_PER_ENCODE
+
+
+def _chunk_by_patch_budget(item_patch_counts, max_patches_per_encode):
+    """L-k: split a list of per-item patch counts into contiguous chunks, each with total patches
+    <= ``max_patches_per_encode`` (greedy, order-preserving). A single item larger than the bound
+    gets its own (over-budget) chunk -- the bound can't subdivide one image, and admission control
+    (--vision-max-patches) already rejects an item bigger than the reserve upstream.
+
+    Returns a list of ``(start, end)`` half-open index ranges over the item list. DETERMINISTIC and
+    a pure function of the (broadcast-identical) item_patch_counts + bound -> every rank computes
+    the SAME chunk boundaries in the SAME order (multi-host lockstep; no per-rank or device state).
+    """
+    chunks = []
+    start = 0
+    running = 0
+    for i, n in enumerate(item_patch_counts):
+        n = int(n)
+        if i > start and running + n > max_patches_per_encode:
+            chunks.append((start, i))
+            start = i
+            running = 0
+        running += n
+    if start < len(item_patch_counts):
+        chunks.append((start, len(item_patch_counts)))
+    return chunks
 
 
 class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
@@ -759,10 +810,28 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         repl = jax.sharding.NamedSharding(self.mesh, jax.sharding.PartitionSpec())
 
         def _put(x, bf16=False):
+            # Multi-host SPMD lockstep (CRITICAL): build the fully-replicated input WITHOUT a
+            # cross-process collective. ``jax.device_put(np_array, replicated_sharding)`` in
+            # multi-controller JAX silently runs ``multihost_utils.assert_equal`` -> a
+            # ``process_allgather`` over all ranks to verify the host array is identical everywhere.
+            # That implicit collective is dispatched on the scheduler thread while the overlap
+            # forward thread is concurrently issuing the previous batch's TP/MoE collectives on the
+            # SAME mesh; under continuous batching the two collective streams interleave in a
+            # host-divergent order and the XLA runtime halts ("program continuator has halted").
+            # The encode inputs are ALREADY identical on every rank (the scheduler broadcasts
+            # recv_reqs from rank0 via broadcast_pyobj), so the verification is pure overhead AND a
+            # lockstep hazard. ``make_array_from_process_local_data`` places the (identical) host
+            # numpy onto this process's replicated shards locally -- no allgather, no assert_equal --
+            # so the host encode pass issues NO cross-process collective that can race the forward
+            # stream. (The encode/merge jits run on fully-replicated towers/operands, so they too
+            # contain no cross-process collective; the implicit assert_equal in _put was the only
+            # one.) Cast to bf16 on the host before the build so no extra eager device op is emitted.
             if x is None:
                 return None
-            y = jax.device_put(np.asarray(x), repl)
-            return y.astype(jnp.bfloat16) if bf16 else y
+            arr = np.asarray(x)
+            if bf16:
+                arr = arr.astype(jnp.bfloat16)
+            return jax.make_array_from_process_local_data(repl, arr)
 
         def _thw(rows):
             return tuple(tuple(int(v) for v in row) for row in rows) if rows else None
@@ -892,51 +961,96 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                     r.apply_for_deepstack = True
 
     def _encode_mm_batched(self, enc_reqs, assemble, _put, _thw):
-        """L-k (design §7): batch the VISION tower over ALL reqs needing encode (one ViT call for
-        every image/video across the batch), then merge per req. Correctness rests on (a) the ViT
-        segmenting per-image via cu_seqlens -- cross-req patch concat == one req with more images,
-        no leakage (design §7.4) -- and (b) merge being 1:1 placeholder<->feature, so each req's
-        per-modality feature-row count equals its placeholder count in the clean input_ids (the K-2
-        invariant, exact under non-bucketing). Audio is encoded PER-REQ (the RVQ/mel tower's
-        per-clip segmentation is not yet asserted, so cross-req audio concat is conservatively
-        avoided); audio batching is a follow-up. Caller guarantees jitted_encode_mm + bucketing-off.
-        """
+        """L-k (design §7): batch the VISION tower over reqs needing encode, then merge per req.
+        Correctness rests on (a) the ViT segmenting per-image via cu_seqlens -- cross-req patch
+        concat == one req with more images, no leakage (design §7.4) -- and (b) merge being 1:1
+        placeholder<->feature, so each req's per-modality feature-row count equals its placeholder
+        count in the clean input_ids (the K-2 invariant, exact under non-bucketing). Audio is encoded
+        PER-REQ (the RVQ/mel tower's per-clip segmentation is not yet asserted, so cross-req audio
+        concat is conservatively avoided); audio batching is a follow-up. Caller guarantees
+        jitted_encode_mm + bucketing-off.
+
+        L-k OOM guard (decouple encode HBM from concurrency): the ViT does DENSE full attention whose
+        activation scales with (Σ patches)^2, so concatenating ALL co-scheduled reqs' images into one
+        jit call made the encode peak grow with concurrency and OOM (RESOURCE_EXHAUSTED
+        jit_jitted_encode_mm). We CHUNK the encode: at most ``max_patches_per_encode`` patches per
+        ViT jit call (``_resolve_max_patches_per_encode`` -- tied to the G1 vision reserve so one
+        chunk fits the reserved HBM), running multiple sequential jit calls when a step exceeds it.
+        Because the ViT segment-masks per image, a chunk boundary placed ON an image boundary changes
+        NOTHING but the (bounded) score-matrix size -> the concatenated per-image features are
+        bit-identical to the single-call path (verified by test_mm_encode_chunking). Decode/forward
+        still processes the WHOLE step in one batch (encode_mm_reqs runs before get_model_worker_batch
+        and only fills req.multimodal_embedding) -> the decode throughput win is untouched, only the
+        encode peak HBM is bounded. Multi-host lockstep: the chunk boundaries are a pure function of
+        the broadcast-identical per-image patch counts + the broadcast-identical server_args bound, so
+        every rank runs the SAME number of chunks in the SAME order; each chunk's encode/merge is
+        collective-free (fully-replicated towers; _put issues no allgather), so no rank can skip a
+        collective the others run."""
         img_tok = getattr(self.model, "image_token_id", None)
         vid_tok = getattr(self.model, "video_token_id", None)
         aud_tok = getattr(self.model, "audio_token_id", None)
 
-        img_px, img_grids, vid_px, vid_grids = [], [], [], []
+        # Per-IMAGE (not per-req) flat lists so the encode can be chunked on image boundaries: each
+        # entry is one image's (pixel_values[rows, dim], grid_thw (t,h,w), patch_count). A req's px
+        # array concatenates that req's images, split here by each grid's t*h*w patch count.
+        img_items, vid_items = [], []  # each: (px_np, grid_tuple, patch_count)
         plan = []  # per req: (r, input_ids_np, {modality: nrows}, audio_codes_or_None)
+
+        def _split_per_image(px, grids):
+            px = np.asarray(px)
+            out, off = [], 0
+            for g in grids:
+                t, h, w = (int(v) for v in g)
+                cnt = t * h * w
+                out.append((px[off : off + cnt], (t, h, w), cnt))
+                off += cnt
+            return out
+
         for r in enc_reqs:
             a = assemble(r.mm_inputs)
             ids = np.asarray(r.origin_input_ids, dtype=np.int32)
             rows, aud = {}, None
             ip = a.get("pixel_values_images")
             if ip is not None and img_tok is not None:
-                img_px.append(np.asarray(ip))
-                img_grids.extend(a.get("image_grid_thw") or [])
+                img_items.extend(_split_per_image(ip, a.get("image_grid_thw") or []))
                 rows["image"] = int(np.count_nonzero(ids == img_tok))
             vp = a.get("pixel_values_videos")
             if vp is not None and vid_tok is not None:
-                vid_px.append(np.asarray(vp))
-                vid_grids.extend(a.get("video_grid_thw") or [])
+                vid_items.extend(_split_per_image(vp, a.get("video_grid_thw") or []))
                 rows["video"] = int(np.count_nonzero(ids == vid_tok))
             ac = a.get("audio_codes")
             if ac is not None and aud_tok is not None:
                 aud = np.asarray(ac)
             plan.append((r, ids, rows, aud))
 
-        # One batched ViT pass over all reqs' image+video patches.
+        # L-k OOM guard: chunk each modality's images so no single ViT jit call exceeds the bound.
+        max_pp = _resolve_max_patches_per_encode(self.server_args)
+
+        def _encode_modality_chunked(items, px_kw, grid_kw, feat_key):
+            """Run jitted_encode_mm over ``items`` in patch-budget chunks; return the concatenated
+            [Σrows, hidden] feature for ``feat_key`` (or None). Chunk boundaries are deterministic
+            (pure function of the per-image patch counts + bound) -> identical on every rank."""
+            if not items:
+                return None
+            counts = [c for _, _, c in items]
+            parts = []
+            for s, e in _chunk_by_patch_budget(counts, max_pp):
+                chunk = items[s:e]
+                px = np.concatenate([p for p, _, _ in chunk], 0)
+                grids = [g for _, g, _ in chunk]
+                feats = self.jitted_encode_mm(**{px_kw: _put(px, bf16=True), grid_kw: _thw(grids)})
+                parts.append(feats[feat_key])
+            return parts[0] if len(parts) == 1 else jnp.concatenate(parts, 0)
+
         vfeats = {}
-        if img_px or vid_px:
-            vfeats = self.jitted_encode_mm(
-                mm_pixel_values=_put(np.concatenate(img_px, 0), bf16=True) if img_px else None,
-                mm_grid_thw=_thw(img_grids) if img_grids else None,
-                mm_pixel_values_videos=(
-                    _put(np.concatenate(vid_px, 0), bf16=True) if vid_px else None
-                ),
-                mm_video_grid_thw=_thw(vid_grids) if vid_grids else None,
-            )
+        img_feat = _encode_modality_chunked(img_items, "mm_pixel_values", "mm_grid_thw", "image")
+        if img_feat is not None:
+            vfeats["image"] = img_feat
+        vid_feat = _encode_modality_chunked(
+            vid_items, "mm_pixel_values_videos", "mm_video_grid_thw", "video"
+        )
+        if vid_feat is not None:
+            vfeats["video"] = vid_feat
 
         cum = {"image": 0, "video": 0}
         pending = []  # (r, fused_device) -- merges dispatched async, gathered in ONE device_get
@@ -978,26 +1092,11 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             vcfg = getattr(hf, "vision_config", None) or getattr(
                 getattr(hf, "thinker_config", None), "vision_config", None
             )
-            patch = int(getattr(vcfg, "patch_size", 14))
-            tpatch = int(getattr(vcfg, "temporal_patch_size", 2))
-            chans = int(getattr(vcfg, "in_channels", None) or getattr(vcfg, "num_channels", 3))
-            merge = int(getattr(vcfg, "spatial_merge_size", 2))
-            patch_dim = chans * tpatch * patch * patch
-            # Round the probe side UP so side^2 >= max_patches (a sqrt-floor would under-measure,
-            # and T^2 attention amplifies even a small under-count past the 10% headroom -- MED-1).
-            s = int(max_patches**0.5)
-            if s * s < max_patches:
-                s += 1
-            side = max(merge, ((s + merge - 1) // merge) * merge)  # multiple of merge
-            # When V-2 bucketing is on, the runtime worst compile shape is the largest canonical
-            # bucket grid -> round the LLM-grid side up to a bucket multiple to match it.
+            # Resolve the worst-case ViT input geometry dict-safe (MiMo-V2.5 nests vision_config as a
+            # plain dict; the patch_embed input-shape contract is patch_dim == in_chans*tpatch*ps^2 ==
+            # 1536, NOT the 1176 the old getattr-default build produced). See _vision_probe_geometry.
             bucket_s = int(getattr(self.server_args, "vision_bucket_size", 0) or 0)
-            if bucket_s > 0:
-                llm = ((side // merge + bucket_s - 1) // bucket_s) * bucket_s
-                side = llm * merge
-            patches = side * side
-            grid = ((1, side, side),)
-            seq = patches // (merge * merge) + 16
+            patches, patch_dim, grid, seq = _vision_probe_geometry(vcfg, max_patches, bucket_s)
             repl = jax.sharding.NamedSharding(self.mesh, jax.sharding.PartitionSpec())
             ids = jax.ShapeDtypeStruct((seq,), jnp.int32, sharding=repl)
             px = jax.ShapeDtypeStruct((patches, patch_dim), jnp.bfloat16, sharding=repl)

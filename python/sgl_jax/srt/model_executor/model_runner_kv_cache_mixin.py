@@ -44,9 +44,54 @@ def _cfg_get(cfg, *keys, default=None):
 
 
 def _tower_attn_reserve_bytes(heads, hidden, seq) -> int:
-    """~ one tower layer's dense attention matrix [heads, seq, seq] (fp32 softmax) + a few
-    [seq, hidden] bf16 hidden-state buffers; 20% headroom."""
-    return int((int(heads) * int(seq) * int(seq) * 4 + int(seq) * int(hidden) * 2 * 6) * 1.2)
+    """Closed-form bound for one ViT/audio tower layer's peak activation (the AOT probe is the tight
+    primary; this is the fallback when the probe can't run).
+
+    Sized to the dense full-attention activation, which dominates: the MiMoVL ViT materializes the
+    FULL ``[1, heads, seq, seq]`` score matrix in EVERY layer and only masks it -- windowed layers
+    build the same matrix then add a window/segment mask, so they are NOT cheaper in activation peak
+    (only the full-attn block-indexes differ in the mask, not the buffer size). XLA holds two copies
+    of that matrix live across the softmax: the bf16 einsum output (Q@K^T) and the fp32 softmax
+    buffer -> ``heads*seq*seq*(4+2)`` bytes; plus a handful of ``[seq, hidden]`` bf16 hidden-state /
+    residual buffers. 15% headroom. (Empirically ~4.6 GiB at seq=4688 / num_heads=32, matching the
+    observed MiMo-V2.5 encode peak; the old ``*4`` form counted only the fp32 buffer and UNDER-sized
+    the per-image peak by ~30%.)"""
+    return int((int(heads) * int(seq) * int(seq) * (4 + 2) + int(seq) * int(hidden) * 2 * 6) * 1.15)
+
+
+def _vision_probe_geometry(vcfg, max_patches, bucket_size=0):
+    """Pure ViT-geometry resolver for the G1 AOT vision reserve probe: returns
+    ``(patches, patch_dim, grid_thw, seq)`` for a worst-case single image of ``max_patches`` patches.
+
+    Split out of ``ModelRunner._aot_vision_reserve_bytes`` so the patch-embed input-shape CONTRACT is
+    unit-testable without jax/TPU. The contract that the probe previously violated: the ViT
+    ``patch_embed`` requires the dummy pixel_values' last dim to equal the flattened patch dim
+    ``in_chans * temporal_patch_size * patch_size**2`` (1536 for MiMo-V2.5 = 3*2*16*16). ``vcfg`` may
+    be an HF object OR a plain dict (MiMo nests it as a dict), so EVERY field is read dict-safe via
+    ``_cfg_get`` -- a bare ``getattr(dict, "patch_size", 14)`` silently returned the default 14 and
+    produced patch_dim 1176, which the patch_embed rejected ("Expected flattened patch dim 1536, got
+    input shape (N, 1176)") and the probe fell back to the (over-estimating-at-8192) closed form."""
+    patch = int(_cfg_get(vcfg, "patch_size", default=14))
+    tpatch = int(_cfg_get(vcfg, "temporal_patch_size", default=2))
+    chans = int(_cfg_get(vcfg, "in_channels", "in_chans", "num_channels", default=3))
+    merge = int(_cfg_get(vcfg, "spatial_merge_size", default=2))
+    patch_dim = chans * tpatch * patch * patch
+    # Round the probe side UP so side^2 >= max_patches (a sqrt-floor would under-measure, and T^2
+    # attention amplifies even a small under-count past the headroom -- MED-1).
+    s = int(max_patches**0.5)
+    if s * s < max_patches:
+        s += 1
+    side = max(merge, ((s + merge - 1) // merge) * merge)  # multiple of merge
+    # When V-2 bucketing is on, the runtime worst compile shape is the largest canonical bucket grid
+    # -> round the LLM-grid side up to a bucket multiple to match it.
+    bucket_s = int(bucket_size or 0)
+    if bucket_s > 0:
+        llm = ((side // merge + bucket_s - 1) // bucket_s) * bucket_s
+        side = llm * merge
+    patches = side * side
+    grid = ((1, side, side),)
+    seq = patches // (merge * merge) + 16  # LLM token count after spatial merge (+ slack)
+    return patches, patch_dim, grid, seq
 
 
 def _audio_activation_reserve_bytes(acfg, max_patches) -> int:

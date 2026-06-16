@@ -27,6 +27,28 @@ from jax import lax
 from jax import numpy as jnp
 
 
+def _align_sharding(arr: jax.Array, target: jax.sharding.Sharding) -> jax.Array:
+    """Reshard ``arr`` to ``target`` when ``target`` carries a real (non-empty) mesh; no-op
+    otherwise.
+
+    BUG B (multi-host sampler): under the in-model VLM mesh the sampler reshards logits to
+    ``P('data', None)`` (sampler._regular_sampling), so the predicate the binary search evaluates
+    (a vocab-axis reduction over the data-sharded logits) returns a ``P('data')`` array, while the
+    search *state* (``jnp.zeros(batch_shape)`` inside ``int32_bsearch``) and the masks derived from
+    it (``is_finite`` / ``predicate_on_nonfinite``) are replicated ``P(None)``. ``jnp.where`` over a
+    ``P('data')`` case and ``P(None)`` cases raises ``ShardingTypeError`` ("select cases must have
+    the same shardings") under the all-Explicit mesh (it surfaces in the overlap-off / event_loop
+    normal sampling path). We align the replicated masks to the predicate's sharding -- a
+    replicated->'data' reshard is a pure local slice (no cross-process collective; verified on a
+    proxy 1x4 Explicit mesh), so the multi-host data-parallel sampling stays collective-free and
+    correct. The guard keeps the single-device / non-sharded path (empty mesh) untouched: there is
+    no mismatch there and ``jax.sharding.reshard`` rejects an empty-mesh target."""
+    mesh = getattr(target, "mesh", None)
+    if mesh is None or getattr(mesh, "empty", False) or len(getattr(mesh, "axis_names", ())) == 0:
+        return arr
+    return jax.sharding.reshard(arr, target)
+
+
 def int32_bsearch(batch_shape: Sequence[int], predicate: Callable[[jax.Array], jax.Array]):
     """Batched binary search over int32 values.
 
@@ -145,7 +167,16 @@ def float32_bsearch(batch_shape, predicate):
         # predicate. x>=0 is an easy way to achieve that.
         predicate_on_nonfinite = x >= 0
         x_float32 = lax.bitcast_convert_type(x, jnp.float32)
-        return jnp.where(is_finite, predicate(x_float32), predicate_on_nonfinite)
+        # BUG B: align the replicated search-state masks to the predicate's sharding before the
+        # select. The predicate output inherits the (data-sharded) batch layout of the caller's
+        # logits, whereas is_finite / predicate_on_nonfinite come from the replicated search state;
+        # jnp.where requires matching shardings under the Explicit mesh. _align_sharding does a
+        # collective-free replicated->batch reshard (no-op off-mesh). See _align_sharding docstring.
+        predicate_satisfied = predicate(x_float32)
+        target = jax.typeof(predicate_satisfied).sharding
+        is_finite = _align_sharding(is_finite, target)
+        predicate_on_nonfinite = _align_sharding(predicate_on_nonfinite, target)
+        return jnp.where(is_finite, predicate_satisfied, predicate_on_nonfinite)
 
     # We search over bit patterns, which requires bit shifting and ordering of bit
     # patterns. This is natively supported on int32 but not on float32.

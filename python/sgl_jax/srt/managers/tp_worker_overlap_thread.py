@@ -65,6 +65,24 @@ class ModelWorkerClient:
         # Launch threads
         self.input_queue = Queue()
         self.output_queue = Queue()
+        # Multi-host mm lockstep barrier (BUG A): tracks whether a forward is in flight on the
+        # forward_thread. The host multimodal encode (encode_mm_reqs) issues a cross-process
+        # collective inside jitted_merge_mm -- the AR backbone's embed_tokens gather over the
+        # TENSOR-sharded vocab table compiles to an all-reduce over the 'tensor' axis (the axis
+        # that spans all 4 processes). If that encode all-reduce is dispatched from the SCHEDULER
+        # thread while the forward_thread is concurrently dispatching the previous batch's forward
+        # collectives (TP all-reduce, MoE all-to-all, the future-token-map reshards) on the SAME
+        # mesh, the two independent collective-bearing executables can be globally ordered
+        # DIFFERENTLY across the 4 processes -> the XLA runtime halts ("program continuator has
+        # halted") with a C-level fatal and NO Python traceback. This is the same class of hazard
+        # the _put fix removed from the encode-input build, but the merge gather's all-reduce is a
+        # SECOND collective that _put could not address. We serialize: encode_mm_reqs blocks until
+        # the in-flight forward drains (forward_idle is set), so the encode collective never
+        # overlaps a forward collective. The barrier is a pure per-process thread Event (no
+        # cross-process op); all 4 ranks process identical broadcast batches (recv_requests
+        # broadcasts from rank0 when nnodes>1) so they serialize at the SAME points -> lockstep.
+        self.forward_idle = threading.Event()
+        self.forward_idle.set()  # idle until the first forward is enqueued
         # JAX handles device execution automatically, no need for explicit streams
         self.forward_thread = threading.Thread(
             target=self.forward_thread_func,
@@ -96,10 +114,24 @@ class ModelWorkerClient:
     def encode_mm_reqs(self, reqs):
         """C-1 (design §5.2): host-side once-per-req multimodal encode. Runs SYNCHRONOUSLY on
         the caller (scheduler) thread -- it must finish before get_model_worker_batch so
-        _merge_multimodal can slice the held embedding. JAX serializes device execution and the
-        model params are immutable, so dispatching this concurrently with an in-flight forward
-        on the forward_thread is safe; it just blocks the scheduler thread on the device
-        round-trip. No-op for non-mm models / reqs already encoded."""
+        _merge_multimodal can slice the held embedding.
+
+        BUG A (multi-host lockstep): the encode's merge step (jitted_merge_mm) runs the AR
+        backbone's embed_tokens gather over the TENSOR-sharded vocab table, which compiles to an
+        all-reduce over the 'tensor' axis spanning all 4 processes. Dispatching that collective
+        from THIS (scheduler) thread while the forward_thread is concurrently dispatching the
+        previous batch's forward collectives on the same mesh lets the two executables be ordered
+        differently across processes -> XLA "program continuator has halted" (C-level fatal, no
+        Python traceback). We block until the in-flight forward drains so the encode collective is
+        issued only when the forward stream is quiescent. The wait is a local thread Event (no
+        cross-process op); since every rank runs the identical broadcast batch sequence, all ranks
+        serialize at the same point -> lockstep-safe. Non-mm models / fully-cached reqs make
+        encode_mm_reqs a no-op, and the wait is cheap (the forward is usually already done by the
+        time the next prefill is scheduled). The wait is UNCONDITIONAL (not gated on "will encode
+        actually issue a collective") on purpose: gating would duplicate the worker's req-filter
+        here and risk drift -- a gate that disagreed with the worker could let a merge collective
+        slip through unbarriered. No-op for non-mm models / reqs already encoded."""
+        self.forward_idle.wait()
         self.worker.encode_mm_reqs(reqs)
 
     def get_max_padded_size(self):
@@ -127,31 +159,45 @@ class ModelWorkerClient:
             if not model_worker_batch:
                 break
 
-            # Resolve future tokens in the input
-            input_ids = model_worker_batch.forward_batch.input_ids
-            model_worker_batch.forward_batch.input_ids = resolve_future_token_ids(
-                input_ids, self.future_token_ids_map, self.mesh
-            )
-
-            # Run forward
-            with jax.profiler.TraceAnnotation(f"forward_batch_generation {model_worker_batch.bid}"):
-                logits_output, next_token_ids, cache_miss_count = (
-                    self.worker.forward_batch_generation(
-                        model_worker_batch,
-                        model_worker_batch.launch_done,
-                        sampling_metadata=sampling_metadata,
-                        forward_metadata=forward_metadata,
-                    )
+            # BUG A barrier: a forward is now executing on this thread -> the encode (scheduler
+            # thread) must not issue its merge all-reduce until this drains. Cleared by
+            # forward_batch_generation before the enqueue (so the gap between enqueue and pickup is
+            # also covered); re-asserted in the finally below once all of this batch's collectives
+            # (forward + future-token-map reshards) have been DISPATCHED.
+            self.forward_idle.clear()
+            try:
+                # Resolve future tokens in the input
+                input_ids = model_worker_batch.forward_batch.input_ids
+                model_worker_batch.forward_batch.input_ids = resolve_future_token_ids(
+                    input_ids, self.future_token_ids_map, self.mesh
                 )
-            next_token_ids = self.async_gather_fn(next_token_ids)
-            # Update the future token ids map
-            self.future_token_ids_map = set_future_token_ids(
-                self.future_token_ids_map,
-                future_token_ids_ct,
-                next_token_ids,
-                self.mesh,
-            )
-            self.output_queue.put((None, logits_output, next_token_ids, cache_miss_count))
+
+                # Run forward
+                with jax.profiler.TraceAnnotation(
+                    f"forward_batch_generation {model_worker_batch.bid}"
+                ):
+                    logits_output, next_token_ids, cache_miss_count = (
+                        self.worker.forward_batch_generation(
+                            model_worker_batch,
+                            model_worker_batch.launch_done,
+                            sampling_metadata=sampling_metadata,
+                            forward_metadata=forward_metadata,
+                        )
+                    )
+                next_token_ids = self.async_gather_fn(next_token_ids)
+                # Update the future token ids map
+                self.future_token_ids_map = set_future_token_ids(
+                    self.future_token_ids_map,
+                    future_token_ids_ct,
+                    next_token_ids,
+                    self.mesh,
+                )
+                self.output_queue.put((None, logits_output, next_token_ids, cache_miss_count))
+            finally:
+                # All cross-process collectives for this batch have been DISPATCHED (JAX is async,
+                # but dispatch order on THIS process is now fixed and no further forward collective
+                # will be issued until the next batch). Safe to let the encode collective run.
+                self.forward_idle.set()
 
     def resolve_last_batch_result(self, launch_done: threading.Event | None = None):
         """
@@ -230,6 +276,11 @@ class ModelWorkerClient:
             model_worker_batch, self.worker.get_model_runner()
         )
 
+        # BUG A barrier: mark forward in flight BEFORE the enqueue (scheduler thread), so the next
+        # iteration's encode_mm_reqs cannot slip its merge all-reduce into the window between this
+        # enqueue and the forward thread picking the batch up. The forward thread re-asserts
+        # forward_idle once this batch's collectives are dispatched.
+        self.forward_idle.clear()
         # Push a new batch to the queue (JAX handles synchronization automatically)
         self.input_queue.put(
             (

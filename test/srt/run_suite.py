@@ -320,6 +320,7 @@ suites = {
         # correctness gates for K-1/K-2/M-4/capability-first; the rest are processor/codec units.
         TestFile("python/sgl_jax/test/multimodal/test_mm_merge.py", 0.1),
         TestFile("python/sgl_jax/test/multimodal/test_mm_assembly.py", 0.1),
+        TestFile("python/sgl_jax/test/multimodal/test_mm_encode_chunking.py", 0.1),
         TestFile("python/sgl_jax/test/multimodal/test_pad_value.py", 0.1),
         TestFile("python/sgl_jax/test/multimodal/test_capability.py", 0.1),
         TestFile("python/sgl_jax/test/multimodal/test_radix_key_ids.py", 0.1),
