@@ -43,6 +43,7 @@ from sgl_jax.srt.mem_cache.unified_cache_components import (
     EvictLayer,
     FullComponent,
     InsertResult,
+    RecurrentComponent,
     TreeComponent,
     get_and_increase_time_counter,
 )
@@ -83,6 +84,7 @@ class UnifiedTreeNode:
 
 COMPONENT_REGISTRY: dict[ComponentType, type[TreeComponent]] = {
     ComponentType.FULL: FullComponent,
+    ComponentType.RECURRENT: RecurrentComponent,
 }
 
 
@@ -101,6 +103,7 @@ class UnifiedRadixCache(BasePrefixCache):
         enable_kv_cache_events: bool = False,
         is_eagle: bool = False,
         tree_components: tuple[ComponentType, ...] = (ComponentType.FULL,),
+        enable_mamba_extra_buffer: bool = False,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -112,6 +115,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self.max_seq_len = max_seq_len
         self.dtype = dtype
         self.enable_kv_cache_events = enable_kv_cache_events
+        self.enable_mamba_extra_buffer = enable_mamba_extra_buffer
         self.kv_event_queue: list = []
 
         self.process_id = jax.process_index()
@@ -165,12 +169,14 @@ class UnifiedRadixCache(BasePrefixCache):
         if len(converted_key) == 0:
             return self._empty_match_result()
 
-        value, best_match_node, best_value_len = self._match_prefix_helper(converted_key)
+        value, best_match_node, best_value_len = self._match_prefix_helper(
+            converted_key, full_only=params.full_only
+        )
         return self._match_post_processor(params, value, best_match_node, best_value_len)
 
-    def insert(self, params: InsertParams) -> int:
+    def insert(self, params: InsertParams) -> InsertResult:
         if self.disable:
-            return 0
+            return InsertResult(prefix_len=0)
 
         key = params.key
         value = params.value
@@ -210,7 +216,30 @@ class UnifiedRadixCache(BasePrefixCache):
         return EvictResult(
             num_tokens_evicted=tracker[BASE_COMPONENT_TYPE],
             swa_num_tokens_evicted=tracker.get(ComponentType.SWA, 0),
+            recurrent_num_evicted=tracker.get(ComponentType.RECURRENT, 0),
         )
+
+    def supports_recurrent(self) -> bool:
+        return ComponentType.RECURRENT in self.components
+
+    def assert_recurrent_slot_ledger(self, dp_rank: int = 0) -> int:
+        """Per-rank invariant ``active + tree_owned + free == slots_per_rank``;
+        returns the derived ``active`` (request-owned) count. Tree-owned =
+        recurrent evictable + protected; free = recurrent free-list length."""
+        ct = ComponentType.RECURRENT
+        rtp = self.req_to_token_pool
+        free = len(rtp.recurrent_free_slots[dp_rank])
+        tree_owned = (
+            self.component_evictable_size_[ct][dp_rank]
+            + self.component_protected_size_[ct][dp_rank]
+        )
+        slots = rtp.slots_per_rank
+        active = slots - tree_owned - free
+        assert active >= 0, (
+            f"recurrent slot ledger broken (dp={dp_rank}): free={free} "
+            f"tree_owned={tree_owned} > slots_per_rank={slots}"
+        )
+        return active
 
     def inc_lock_ref(self, node: UnifiedTreeNode) -> IncLockRefResult:
         if self.disable:
@@ -284,8 +313,8 @@ class UnifiedRadixCache(BasePrefixCache):
                     req, insert_params, len(token_ids), is_finished=True
                 )
             # Radix cache takes over one reference from the memory pool.
-            new_prefix_len = self.insert(insert_params)
-            insert_result = InsertResult(prefix_len=new_prefix_len)
+            insert_result = self.insert(insert_params)
+            new_prefix_len = insert_result.prefix_len
             self.token_to_kv_pool_allocator.free(
                 kv_indices[old_prefix_len:new_prefix_len], dp_rank=dp_rank
             )
@@ -337,14 +366,16 @@ class UnifiedRadixCache(BasePrefixCache):
         for component in self._components_tuple:
             component.prepare_for_caching_req(req, insert_params, all_token_len, is_finished=False)
         # Radix cache takes over one reference from the memory pool.
-        new_prefix_len = self.insert(insert_params)
-        insert_result = InsertResult(prefix_len=new_prefix_len)
+        insert_result = self.insert(insert_params)
+        new_prefix_len = insert_result.prefix_len
         self.token_to_kv_pool_allocator.free(
             kv_indices[old_prefix_len:new_prefix_len], dp_rank=dp_rank
         )
 
-        # Prefix indices may have been updated, reuse them.
-        new_match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
+        # Prefix indices may have been updated, reuse them. FULL-only: this
+        # request's own prefix bookkeeping must not be gated on recurrent state
+        # (it lives in the running slot, not the tree).
+        new_match_result = self.match_prefix(MatchPrefixParams(key=radix_key, full_only=True))
         new_indices = new_match_result.device_indices
         new_last_node = new_match_result.last_device_node
 
@@ -431,7 +462,9 @@ class UnifiedRadixCache(BasePrefixCache):
             host_hit_length=0,
         )
 
-    def _match_prefix_helper(self, key: RadixKey) -> tuple[list[np.ndarray], UnifiedTreeNode, int]:
+    def _match_prefix_helper(
+        self, key: RadixKey, full_only: bool = False
+    ) -> tuple[list[np.ndarray], UnifiedTreeNode, int]:
         node = self.root_node
         node.last_access_time = get_and_increase_time_counter()
         child_key = self.get_child_key_fn(key)
@@ -443,9 +476,18 @@ class UnifiedRadixCache(BasePrefixCache):
         best_value_len = 0
         # Stage 1 has no host tier: device-only matching is the only mode, so
         # the best match and the best device match coincide.
-        validators = tuple(
-            comp.create_match_validator(match_device_only=True) for comp in self._components_tuple
-        )
+        # full_only: a request's own FULL-prefix bookkeeping (cache_unfinished_req
+        # re-match) must not be gated on aux components (e.g. recurrent state,
+        # which lives in the running slot, not the tree).
+        if full_only:
+            validators = (
+                self.components[BASE_COMPONENT_TYPE].create_match_validator(match_device_only=True),
+            )
+        else:
+            validators = tuple(
+                comp.create_match_validator(match_device_only=True)
+                for comp in self._components_tuple
+            )
 
         def _update_best_if_valid(candidate: UnifiedTreeNode):
             nonlocal best_match_node, best_value_len
@@ -544,6 +586,11 @@ class UnifiedRadixCache(BasePrefixCache):
         node_dp_rank = key.dp_rank if key.dp_rank is not None else 0
         self.component_evictable_size_[BASE_COMPONENT_TYPE][node_dp_rank] += len(value)
 
+        # parent just gained a child: leaf-only components must drop their data
+        # so it is not stranded on an unevictable internal node.
+        for component in self._components_tuple:
+            component.on_parent_gains_child(parent)
+
         self._update_evictable_leaf_sets(new_node)
         self._update_evictable_leaf_sets(parent)
         return new_node
@@ -554,10 +601,10 @@ class UnifiedRadixCache(BasePrefixCache):
         key: RadixKey,
         value: np.ndarray,
         params: InsertParams,
-    ) -> int:
+    ) -> InsertResult:
         node.last_access_time = get_and_increase_time_counter()
         if len(key) == 0:
-            return 0
+            return InsertResult(prefix_len=0)
 
         child_key = self.get_child_key_fn(key)
         total_prefix_length = 0
@@ -600,7 +647,7 @@ class UnifiedRadixCache(BasePrefixCache):
             ):
                 node_dp_rank = key.dp_rank if key.dp_rank is not None else 0
                 self.token_to_kv_pool_allocator.free(value, dp_rank=node_dp_rank)
-                return total_prefix_length
+                return InsertResult(prefix_len=total_prefix_length)
             target_node = self._add_new_node(node, key, value)
             is_new_leaf = True
 
@@ -614,7 +661,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 result=result,
             )
 
-        return total_prefix_length
+        return result
 
     ##### Evict Helpers #####
 

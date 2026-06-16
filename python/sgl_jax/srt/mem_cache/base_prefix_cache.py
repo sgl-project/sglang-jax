@@ -17,6 +17,16 @@ class MatchPrefixParams:
     """Unified parameters for match_prefix across cache types."""
 
     key: RadixKey
+    # Recurrent CoW: when True and the deepest match holds a recurrent value,
+    # finalize_match_result records the src slot on ``req`` for a copy-on-write
+    # clone into the request's running slot during the next forward.
+    cow_recurrent: bool = False
+    req: Any = None
+    # Match only the base (FULL) component's boundary, ignoring aux-component
+    # validators. Used by cache_unfinished_req's internal re-match: a request's
+    # own FULL-prefix bookkeeping must not be gated on recurrent state (which
+    # lives in the request's running slot, not the tree).
+    full_only: bool = False
 
 
 @dataclasses.dataclass
@@ -28,6 +38,9 @@ class InsertParams:
     # SWA-specific: consumed by SWARadixCache, ignored by RadixCache.
     prev_prefix_len: int = 0
     swa_evicted_seqlen: int = 0
+    # Recurrent: length-1 np.int32 array (a RecurrentStatePool slot index)
+    # donated to the tree node at commit; set by RecurrentComponent.
+    recurrent_value: Any = None
 
 
 @dataclasses.dataclass
@@ -37,6 +50,8 @@ class EvictParams:
     num_tokens: int = 0
     swa_num_tokens: int = 0
     dp_rank: int | None = None
+    # Recurrent: number of recurrent slots to free from the tree.
+    recurrent_num: int = 0
 
 
 @dataclasses.dataclass
@@ -45,6 +60,7 @@ class EvictResult:
 
     num_tokens_evicted: int = 0
     swa_num_tokens_evicted: int = 0
+    recurrent_num_evicted: int = 0
 
 
 @dataclasses.dataclass
@@ -52,6 +68,9 @@ class DecLockRefParams:
     """Parameters for dec_lock_ref."""
 
     swa_uuid_for_lock: int | None = None
+    # Per-component node ids that were tombstones when inc_lock_ref ran, so
+    # release_component_lock must skip them (no lock was acquired there).
+    skip_lock_node_ids: dict = dataclasses.field(default_factory=dict)
 
 
 @dataclasses.dataclass
@@ -60,9 +79,13 @@ class IncLockRefResult:
 
     delta: int | None = None
     swa_uuid_for_lock: int | None = None
+    skip_lock_node_ids: dict = dataclasses.field(default_factory=dict)
 
     def to_dec_params(self) -> DecLockRefParams:
-        return DecLockRefParams(swa_uuid_for_lock=self.swa_uuid_for_lock)
+        return DecLockRefParams(
+            swa_uuid_for_lock=self.swa_uuid_for_lock,
+            skip_lock_node_ids=self.skip_lock_node_ids,
+        )
 
 
 class MatchResult(NamedTuple):
@@ -85,6 +108,9 @@ class MatchResult(NamedTuple):
     last_host_node: TreeNode | None
     best_match_node: TreeNode | None
     host_hit_length: int = 0
+    # Recurrent: aligned branching length for partial-prefix CoW. PR#1 always
+    # clones the full match (None); branch truncation is a follow-up.
+    recurrent_branching_seqlen: int | None = None
 
 
 class BasePrefixCache(abc.ABC):
@@ -120,6 +146,10 @@ class BasePrefixCache(abc.ABC):
 
     def evictable_size(self, dp_rank: int = 0):
         return 0
+
+    def supports_recurrent(self) -> bool:
+        """True for caches that manage recurrent (linear-recurrent) state."""
+        return False
 
     def full_evictable_size(self, dp_rank: int = 0):
         return 0

@@ -209,6 +209,58 @@ class RecurrentStatePool:
             for inner in range(len(self.conv_buffers[layer])):
                 self.conv_buffers[layer][inner] = jnp.zeros_like(self.conv_buffers[layer][inner])
 
+    def copy_slots(self, src_indices, dst_indices):
+        """Copy-on-write clone of recurrent + conv state from ``src_indices`` to
+        ``dst_indices`` across all layers. Rows with ``src==0`` are no-ops (the
+        dst slot keeps its content), covering padding and non-cloned requests.
+
+        Returns new ``(recurrent_buffers, conv_buffers)`` lists; the caller folds
+        them into the donated pool. Sharding mirrors KDAAttnBackend.set_ssm_state;
+        ``src``/``dst`` are per-request LOCAL slot indices within one DP rank.
+        """
+        mesh = self.mesh
+        data_axis = self.data_partition_axis
+
+        def _temporal(buf, src, dst):
+            val = jnp.where((src == 0).reshape(-1, 1, 1, 1), buf[dst], buf[src])
+            return buf.at[dst].set(val)
+
+        def _conv(buf, src, dst):
+            val = jnp.where((src == 0).reshape(-1, 1, 1), buf[dst], buf[src])
+            return buf.at[dst].set(val)
+
+        copy_temporal = jax.shard_map(
+            _temporal,
+            mesh=mesh,
+            in_specs=(
+                P(data_axis, self.recurrent_partition_axis, None, None),
+                P(data_axis),
+                P(data_axis),
+            ),
+            out_specs=P(data_axis, self.recurrent_partition_axis, None, None),
+            check_vma=False,
+        )
+        copy_conv = jax.shard_map(
+            _conv,
+            mesh=mesh,
+            in_specs=(
+                P(data_axis, self.conv_partition_axis, None),
+                P(data_axis),
+                P(data_axis),
+            ),
+            out_specs=P(data_axis, self.conv_partition_axis, None),
+            check_vma=False,
+        )
+
+        new_recurrent = [
+            copy_temporal(buf, src_indices, dst_indices) for buf in self.recurrent_buffers
+        ]
+        new_conv = [
+            [copy_conv(cbuf, src_indices, dst_indices) for cbuf in inner]
+            for inner in self.conv_buffers
+        ]
+        return new_recurrent, new_conv
+
     # --- pytree ---
     def tree_flatten(self):
         children = (self.recurrent_buffers, self.conv_buffers)

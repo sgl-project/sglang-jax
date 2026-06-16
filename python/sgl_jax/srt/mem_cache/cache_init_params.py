@@ -17,3 +17,6 @@ class CacheInitParams:
     is_eagle: bool = False
 
     sliding_window_size: int | None = None
+
+    # Recurrent radix: page-aligned ping-pong track buffer for page>=128 (PR#2).
+    enable_mamba_extra_buffer: bool = False

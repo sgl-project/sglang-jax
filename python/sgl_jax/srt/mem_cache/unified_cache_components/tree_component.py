@@ -4,7 +4,7 @@ Stage 1 ships only the FULL (full-attention) component. The seam surface is
 deliberately wider than what stage 1 exercises: CacheTransferPhase /
 LRURefreshPhase / next_component_uuid / eviction_priority /
 recover_after_unevict / value_len / the ComponentType.is_* helpers and the
-unused ``params`` ctor arg exist so SWA / Mamba / HiCache components can land
+unused ``params`` ctor arg exist so SWA / Recurrent / HiCache components can land
 against a stable contract without re-touching this module.
 """
 
@@ -41,7 +41,7 @@ class ComponentType(IntEnum):
 
     FULL = 0
     SWA = 1
-    MAMBA = 2
+    RECURRENT = 2
 
     def __str__(self) -> str:  # keep human-readable logging
         return self.name.lower()
@@ -55,8 +55,8 @@ class ComponentType(IntEnum):
         return self == ComponentType.SWA
 
     @property
-    def is_mamba(self) -> bool:
-        return self == ComponentType.MAMBA
+    def is_recurrent(self) -> bool:
+        return self == ComponentType.RECURRENT
 
 
 BASE_COMPONENT_TYPE = ComponentType.FULL
@@ -82,6 +82,12 @@ class InsertResult:
     used only in component seam annotations."""
 
     prefix_len: int = 0
+    # Recurrent: True iff the target node already held a recurrent value
+    # (duplicate insert). recurrent_committed: True iff this insert attached
+    # the request's recurrent slot to a fresh leaf (tree took ownership);
+    # cleanup_after_caching_req keys its donate-vs-free decision on it.
+    recurrent_exist: bool = False
+    recurrent_committed: bool = False
 
 
 class EvictLayer(IntFlag):
@@ -152,7 +158,7 @@ class TreeComponent(ABC):
         - Full: returns True if the node has full component data.
         - SWA: tracks accumulated length since last gap; returns True only
           when the contiguous window reaches swa_sliding_window_size.
-        - Mamba: returns True iff the node has mamba component data."""
+        - Recurrent: returns True iff the node has recurrent component data."""
         ...
 
     def finalize_match_result(
@@ -164,8 +170,8 @@ class TreeComponent(ABC):
     ) -> MatchResult:
         """Post-process the match result after prefix matching completes.
         - Full & SWA: pass through unchanged.
-        - Mamba: performs copy-on-write — allocates a new mamba slot, copies
-          the matched node's mamba state into the request pool, and records
+        - Recurrent: performs copy-on-write — allocates a new recurrent slot, copies
+          the matched node's recurrent state into the request pool, and records
           branching_seqlen in result."""
         return result
 
@@ -208,6 +214,13 @@ class TreeComponent(ABC):
         their entry is still tombstoned. Default no-op."""
         return None
 
+    def on_parent_gains_child(self, node: UnifiedTreeNode) -> None:
+        """Hook: ``node`` just gained its first child (leaf→internal transition
+        in _add_new_node). Leaf-only components (Recurrent) drop their per-leaf
+        data here so it is not stranded on an unevictable internal node. Default
+        no-op (Full keeps internal-node data)."""
+        return None
+
     def commit_insert_component_data(
         self,
         node: UnifiedTreeNode,
@@ -224,7 +237,7 @@ class TreeComponent(ABC):
           child (the deeper portion) receives SWA data. If the entire node
           is within the window, sets SWA directly. If entirely outside,
           leaves SWA as None (tombstone).
-        - Mamba: sets the mamba component value from params and increments
+        - Recurrent: sets the recurrent component value from params and increments
           evictable size."""
         return None
 
@@ -236,8 +249,8 @@ class TreeComponent(ABC):
         - SWA: slices (or copies) the swa value for new_parent, copies
           lock_ref and the swa component_uuid, then syncs child's swa
           value with its (now-trimmed) full_value.
-        - Mamba: sets new_parent's mamba value to None and lock_ref to 0
-          (mamba data stays on the original leaf, not on prefix nodes)."""
+        - Recurrent: sets new_parent's recurrent value to None and lock_ref to 0
+          (recurrent data stays on the original leaf, not on prefix nodes)."""
         ...
 
     @abstractmethod
@@ -270,23 +283,23 @@ class TreeComponent(ABC):
         Leaf: all components equal (0) — evicting any cascades to all,
         because the node will be deleted.
 
-        Internal: full=2 > swa=1 > mamba=0.
-        Why swa > mamba: SWA data on internal nodes is *path data* —
+        Internal: full=2 > swa=1 > recurrent=0.
+        Why swa > recurrent: SWA data on internal nodes is *path data* —
         the sliding window needs continuous SWA coverage along the path
         from root to the match boundary. E.g. A->B->C->D->E where C
-        and E both have mamba and the window covers C->E: if C's mamba
+        and E both have recurrent and the window covers C->E: if C's recurrent
         is evicted, C's SWA must stay so E remains reachable.
-        Mamba data, by contrast, is only meaningful at the match
+        Recurrent data, by contrast, is only meaningful at the match
         boundary node; on internal nodes it
         contributes nothing to the path. So SWA is more valuable to
         keep and should be evicted later.
 
         Cascade consequences:
-        - Mamba evict internal: no cascade.
-        - SWA evict internal: cascades to Mamba. SWA gone -> SWA
-          validator fails -> mamba data is useless (match requires all
+        - Recurrent evict internal: no cascade.
+        - SWA evict internal: cascades to Recurrent. SWA gone -> SWA
+          validator fails -> recurrent data is useless (match requires all
           validators to pass).
-        - Full evict internal: cascades to SWA + Mamba."""
+        - Full evict internal: cascades to SWA + Recurrent."""
         return 0
 
     @abstractmethod
@@ -298,7 +311,7 @@ class TreeComponent(ABC):
         Updates the shared tracker with freed amounts for all components.
         - Full: walks evictable device leaves, evicts full then cascades
           the entire leaf.
-        - Mamba: walks internal/leaf candidates; tombstones internal nodes
+        - Recurrent: walks internal/leaf candidates; tombstones internal nodes
           (with cascade to equal-priority components like swa), cascades
           leaves to all."""
         ...
@@ -317,13 +330,13 @@ class TreeComponent(ABC):
         - SWA: path-lock — walks upward collecting swa values until the
           sliding window is filled; records a component_uuid at the
           boundary for release_component_lock to know where to stop.
-        - Mamba: single-node lock — only increments lock_ref on the
-          node itself (mamba state is per-leaf, not per-path).
+        - Recurrent: single-node lock — only increments lock_ref on the
+          node itself (recurrent state is per-leaf, not per-path).
 
         When ``lock_host`` is True, the lock applies to host-side state:
         - Full: single-node host lock.
         - SWA: host window-lock with a dedicated host UUID boundary.
-        - Mamba: single-node host lock."""
+        - Recurrent: single-node host lock."""
         ...
 
     @abstractmethod
@@ -339,7 +352,7 @@ class TreeComponent(ABC):
           lock_ref on every ancestor.
         - SWA: path-unlock — walks upward, stopping at the node whose
           component_uuid matches the one recorded during acquire.
-        - Mamba: single-node unlock — only decrements lock_ref on the
+        - Recurrent: single-node unlock — only decrements lock_ref on the
           node itself.
 
         When ``lock_host`` is True, the inverse host-side semantics apply."""
@@ -358,8 +371,8 @@ class TreeComponent(ABC):
         return int >= 0 for effective cache length.
         - Full: no-op, returns None.
         - SWA: sets insert_params.swa_evicted_seqlen on finished; returns None.
-        - Mamba: prepares mamba_value (finished from ping-pong buffer,
-          unfinished fork from req); returns mamba_last_track_seqlen."""
+        - Recurrent: prepares recurrent_value (finished from ping-pong buffer,
+          unfinished fork from req); returns recurrent_last_track_seqlen."""
         return None
 
     def cleanup_after_caching_req(
