@@ -292,11 +292,20 @@ def get_tokenizer(
         # else: use the root path, tokenizer might be in model root
 
     # Workaround: Intercept TokenizersBackend and list-type extra_special_tokens
-    # to prevent loading failure in transformers < 5.0
+    # to prevent loading failure in transformers < 5.0.
+    # TODO(notabee): Clean this workaround up when transformers 5.0 is the minimum version.
     import json
+    import tempfile
 
+    import transformers
+    from packaging.version import Version
+
+    need_patch = Version(transformers.__version__) < Version("5.0.0")
     tokenizer_config_path = os.path.join(tokenizer_name, "tokenizer_config.json")
-    if os.path.exists(tokenizer_config_path):
+    tokenizer_load_path = tokenizer_name
+    temp_dir_obj = None
+
+    if need_patch and os.path.exists(tokenizer_config_path):
         try:
             with open(tokenizer_config_path, encoding="utf-8") as f:
                 config_data = json.load(f)
@@ -340,12 +349,37 @@ def get_tokenizer(
                 config_data["additional_special_tokens"] = new_additional
 
             if is_patched:
-                with open(tokenizer_config_path, "w", encoding="utf-8") as f:
-                    json.dump(config_data, f, indent=2)
-                warnings.warn(
-                    f"Patched tokenizer_config.json in {tokenizer_config_path} to maintain compatibility with your transformers library version.",
-                    stacklevel=2,
-                )
+                # Create a temporary directory and symlink all files from tokenizer_name,
+                # writing the patched config inside the temporary directory.
+                temp_dir_obj = tempfile.TemporaryDirectory()
+                temp_dir = temp_dir_obj.name
+                try:
+                    for item in os.listdir(tokenizer_name):
+                        src_path = os.path.join(tokenizer_name, item)
+                        dst_path = os.path.join(temp_dir, item)
+                        if item == "tokenizer_config.json":
+                            continue
+                        os.symlink(src_path, dst_path)
+
+                    patched_config_path = os.path.join(temp_dir, "tokenizer_config.json")
+                    with open(patched_config_path, "w", encoding="utf-8") as f:
+                        json.dump(config_data, f, indent=2)
+
+                    tokenizer_load_path = temp_dir
+                    warnings.warn(
+                        f"Created patched tokenizer config workaround in temporary directory: {temp_dir} "
+                        "to maintain compatibility with your transformers library version.",
+                        stacklevel=2,
+                    )
+                except Exception as symlink_err:
+                    tokenizer_load_path = tokenizer_name
+                    temp_dir_obj.cleanup()
+                    temp_dir_obj = None
+                    warnings.warn(
+                        f"Failed to create temporary directory for patched tokenizer config: {symlink_err}. "
+                        "Falling back to default tokenizer directory.",
+                        stacklevel=2,
+                    )
         except Exception as e:
             warnings.warn(
                 f"Failed to dynamically patch tokenizer_config.json: {e}",
@@ -354,7 +388,7 @@ def get_tokenizer(
 
     try:
         tokenizer = AutoTokenizer.from_pretrained(
-            tokenizer_name,
+            tokenizer_load_path,
             *args,
             trust_remote_code=trust_remote_code,
             tokenizer_revision=tokenizer_revision,
@@ -391,8 +425,10 @@ def get_tokenizer(
                 "or using the `--trust-remote-code` flag in the CLI."
             )
             raise RuntimeError(err_msg) from e
-
-        raise
+        raise e
+    finally:
+        if temp_dir_obj is not None:
+            temp_dir_obj.cleanup()
 
     if not isinstance(tokenizer, PreTrainedTokenizerFast):
         warnings.warn(
