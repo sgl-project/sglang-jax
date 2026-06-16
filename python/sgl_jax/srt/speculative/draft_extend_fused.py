@@ -13,6 +13,10 @@ from flax import nnx
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
+from sgl_jax.srt.kernels.speculative.kernel import (
+    top_k_renorm_prob,
+    top_p_renorm_prob,
+)
 from sgl_jax.srt.speculative.relay_buffer import (
     gather_spec_relay_buffers,
     make_dp_valid_mask,
@@ -151,6 +155,126 @@ def _greedy_sample_and_prepare_draft_inputs_chain_from_predict(
         jnp.zeros_like(accept_index)
         + jnp.arange(accept_index.shape[0], dtype=jnp.int32) // accept_width
     )
+    per_req_last = req_ids * speculative_num_draft_tokens + speculative_num_draft_tokens - 1
+    safe_index = jnp.where(accept_index >= 0, accept_index, per_req_last)
+    safe_predict = _take_with_index_sharding(predict, safe_index)
+    verified_id = jnp.where(accept_index >= 0, safe_predict, jnp.zeros_like(safe_predict))
+    prepared = _greedy_prepare_draft_inputs(
+        target_hidden,
+        positions,
+        seq_lens,
+        accept_index,
+        accept_length,
+        verified_id,
+        speculative_num_steps=speculative_num_steps,
+        speculative_num_draft_tokens=speculative_num_draft_tokens,
+    )
+    return GreedySampleAndPrepareOutput(
+        hidden_states=prepared.hidden_states,
+        positions=prepared.positions,
+        new_seq_lens=prepared.new_seq_lens,
+        select_index=prepared.select_index,
+        safe_index=safe_index,
+        verified_id=prepared.verified_id,
+        accept_lens=prepared.accept_lens,
+        sel_pos=prepared.sel_pos,
+        predict=predict,
+    )
+
+
+def _sampling_sample_and_prepare_draft_inputs_chain_from_logits(
+    *,
+    target_hidden,
+    positions,
+    seq_lens,
+    draft_tokens,
+    target_logits,
+    temperatures,
+    top_ks,
+    top_ps,
+    coins,
+    coin_f,
+    threshold_single,
+    threshold_acc,
+    speculative_num_steps,
+    speculative_num_draft_tokens,
+):
+    """Non-greedy counterpart of the greedy chain verify.
+
+    Mirrors `tree_speculative_sampling_target_only` (eagle_util.py) for the
+    pure topk=1 chain: target-only typical acceptance (draft_probs == 0), so
+    we never need the draft probabilities q. Accepted slots emit the accepted
+    draft token; the first rejected / bonus slot emits an inverse-CDF sample
+    from the (renormalized) target distribution.
+    """
+    bs = seq_lens.shape[0]
+    n = speculative_num_draft_tokens
+    width = speculative_num_steps + 1
+    vocab = target_logits.shape[-1]
+
+    # v1: replicate the working set so explicit-sharding never has to resolve
+    # gather/cumsum shardings. Correctness over speed for now. top_k/top_p TODO.
+    sh = jax.typeof(target_logits).sharding
+    mesh = sh.mesh if isinstance(sh, NamedSharding) else None
+
+    def _rep(x):
+        return jax.sharding.reshard(x, NamedSharding(mesh, P())) if mesh is not None else x
+
+    tl = _rep(target_logits.astype(jnp.float32))
+    draft_2d = _rep(draft_tokens.reshape(bs, n).astype(jnp.int32))
+    seq_lens_r = _rep(seq_lens.astype(jnp.int32))
+    temp = _rep(temperatures.reshape(bs, 1).astype(jnp.float32))
+    coins_r = _rep(coins.astype(jnp.float32))
+    coin_f_r = _rep(coin_f.astype(jnp.float32))
+
+    # target probs: temperature scale, then top_k/top_p renorm (per request).
+    # Everything is replicated here, so the renorm kernels behave exactly like
+    # the non-overlap reference path (eagle_util.sample).
+    probs_3d = jax.nn.softmax(tl.reshape(bs, n, vocab) / temp[:, :, None], axis=-1)
+    tk = _rep(top_ks.astype(jnp.int32))
+    tk = jnp.where(tk <= 0, jnp.int32(vocab), tk)  # top_k<=0 means "no top-k"
+    tp = _rep(top_ps.astype(jnp.float32))
+    tk_flat = jnp.broadcast_to(tk[:, None], (bs, n)).reshape(bs * n)
+    tp_flat = jnp.broadcast_to(tp[:, None], (bs, n)).reshape(bs * n)
+    probs_2d = top_k_renorm_prob(probs_3d.reshape(bs * n, vocab), tk_flat)
+    probs_2d = top_p_renorm_prob(probs_2d, tp_flat)
+    probs_3d = probs_2d.reshape(bs, n, vocab)
+
+    cand = draft_2d[:, 1:]  # (bs, n-1) candidate tokens d1..d_{n-1}
+    p_cand = jnp.take_along_axis(probs_3d[:, : n - 1, :], cand[:, :, None], axis=-1)[:, :, 0]
+
+    prob_acc = jnp.cumsum(p_cand, axis=1)
+    accept_mask = (coins_r <= prob_acc / threshold_acc) | (p_cand >= threshold_single)
+
+    is_padding = seq_lens_r == 0
+    accepted_children = jnp.cumprod(accept_mask.astype(jnp.int32), axis=1).astype(jnp.bool_)
+    accepted_children = jnp.where(is_padding[:, None], False, accepted_children)
+    accept_length_raw = jnp.sum(accepted_children.astype(jnp.int32), axis=1)
+    accept_length = jnp.where(is_padding, 0, accept_length_raw + 1)
+
+    # residual / bonus sampling at emit position = accept_length_raw
+    emit_pos = accept_length_raw.astype(jnp.int32)  # (bs,) in [0, n-1]
+    p_emit = jnp.take_along_axis(probs_3d, emit_pos[:, None, None], axis=1)[:, 0, :]  # (bs, vocab)
+    cdf = jnp.cumsum(p_emit, axis=-1)
+    u = coin_f_r * cdf[:, -1]
+    sampled = jnp.sum((cdf < u[:, None]).astype(jnp.int32), axis=-1).astype(jnp.int32)  # (bs,)
+
+    # predict_2d[:, k] = cand[:, k] (=d_{k+1}); override emit_pos slot with sampled
+    predict_2d = jnp.concatenate([cand, jnp.zeros((bs, 1), dtype=jnp.int32)], axis=1).astype(jnp.int32)
+    predict_2d = predict_2d.at[jnp.arange(bs), emit_pos].set(sampled)
+    predict = predict_2d.reshape(-1)
+
+    # --- accept_index machinery (identical to greedy path) ---
+    row_ids = jnp.arange(bs, dtype=jnp.int32)
+    base = row_ids[:, None] * n
+    child_offsets = jnp.arange(1, width, dtype=jnp.int32)[None, :]
+    accept_index_children = jnp.where(accepted_children, base + child_offsets, -1)
+    accept_index_2d = jnp.concatenate([base, accept_index_children], axis=1)
+    accept_index_2d = jnp.where(is_padding[:, None], -1, accept_index_2d)
+    accept_index = accept_index_2d.reshape(-1)
+
+    accept_width = speculative_num_steps + 1
+    req_ids = jnp.arange(accept_index.shape[0], dtype=jnp.int32) // accept_width
     per_req_last = req_ids * speculative_num_draft_tokens + speculative_num_draft_tokens - 1
     safe_index = jnp.where(accept_index >= 0, accept_index, per_req_last)
     safe_predict = _take_with_index_sharding(predict, safe_index)
@@ -391,7 +515,7 @@ def _build_fused_draft_extend_jit(num_layers: int, topk: int):
 def _per_dp_cumsum_device(lens, dp_size: int):
     per_dp_bs = lens.shape[0] // dp_size
     lens_2d = lens.reshape((dp_size, per_dp_bs))
-    zeros = jnp.zeros((dp_size, 1), dtype=jnp.int32)
+    zeros = jnp.zeros_like(lens_2d[:, :1], dtype=jnp.int32)
     return jnp.concatenate([zeros, jnp.cumsum(lens_2d, axis=1, dtype=jnp.int32)], axis=1).reshape(
         (dp_size * (per_dp_bs + 1),)
     )
@@ -574,6 +698,9 @@ def _build_fused_greedy_verify_jit(topk: int):
             "return_target_logits",
             "use_relay_state",
             "dp_size",
+            "is_greedy",
+            "threshold_single",
+            "threshold_acc",
         ],
     )
     def fused_greedy_verify(
@@ -588,12 +715,20 @@ def _build_fused_greedy_verify_jit(topk: int):
         relay_buffers,
         relay_future_indices,
         verify_allocate_lens,
+        coins,
+        coin_f,
+        temperatures,
+        top_ks,
+        top_ps,
         *,
         speculative_num_steps,
         speculative_num_draft_tokens,
         return_target_logits,
         use_relay_state,
         dp_size,
+        is_greedy=True,
+        threshold_single=1.0,
+        threshold_acc=1.0,
     ):
         if use_relay_state:
             relay_topk_index, _, relay_verified_id, relay_new_seq_lens = gather_spec_relay_buffers(
@@ -662,17 +797,34 @@ def _build_fused_greedy_verify_jit(topk: int):
         mesh = sh.mesh if isinstance(sh, NamedSharding) else None
         target_logits = target_output.next_token_logits
         target_hidden = target_output.hidden_states
-        target_predict = jnp.argmax(target_logits, axis=-1).astype(jnp.int32).reshape(-1)
-
-        prepared = _greedy_sample_and_prepare_draft_inputs_chain_from_predict(
-            target_hidden=target_hidden,
-            positions=target_forward_batch.positions,
-            seq_lens=target_forward_batch.seq_lens,
-            draft_tokens=draft_tokens,
-            target_predict=target_predict,
-            speculative_num_steps=speculative_num_steps,
-            speculative_num_draft_tokens=speculative_num_draft_tokens,
-        )
+        if is_greedy:
+            target_predict = jnp.argmax(target_logits, axis=-1).astype(jnp.int32).reshape(-1)
+            prepared = _greedy_sample_and_prepare_draft_inputs_chain_from_predict(
+                target_hidden=target_hidden,
+                positions=target_forward_batch.positions,
+                seq_lens=target_forward_batch.seq_lens,
+                draft_tokens=draft_tokens,
+                target_predict=target_predict,
+                speculative_num_steps=speculative_num_steps,
+                speculative_num_draft_tokens=speculative_num_draft_tokens,
+            )
+        else:
+            prepared = _sampling_sample_and_prepare_draft_inputs_chain_from_logits(
+                target_hidden=target_hidden,
+                positions=target_forward_batch.positions,
+                seq_lens=target_forward_batch.seq_lens,
+                draft_tokens=draft_tokens,
+                target_logits=target_logits,
+                temperatures=temperatures,
+                top_ks=top_ks,
+                top_ps=top_ps,
+                coins=coins,
+                coin_f=coin_f,
+                threshold_single=threshold_single,
+                threshold_acc=threshold_acc,
+                speculative_num_steps=speculative_num_steps,
+                speculative_num_draft_tokens=speculative_num_draft_tokens,
+            )
 
         target_logits_for_host = (
             _gather_rows_preserve_sharding(target_logits, prepared.safe_index)
@@ -1435,6 +1587,52 @@ def spec_decode_verify_phase(spec_worker, model_worker_batch, cur_allocate_lens)
             topk=draft_worker.topk,
         )
 
+    si = model_worker_batch.sampling_info
+    _sv_is_greedy = bool(getattr(si, "is_all_greedy", True))
+    _sv_tbs = target_forward_batch.seq_lens.shape[0]
+    _sv_nm1 = int(draft_worker.speculative_num_draft_tokens) - 1
+    _sv_rep = NamedSharding(spec_worker.mesh, P())
+    if _sv_is_greedy:
+        _sv_coins = _device_array_preserve_device(
+            np.zeros((_sv_tbs, _sv_nm1), np.float32), _sv_rep
+        )
+        _sv_coinf = _device_array_preserve_device(np.zeros((_sv_tbs,), np.float32), _sv_rep)
+        _sv_temps = _device_array_preserve_device(np.ones((_sv_tbs, 1), np.float32), data_sharding)
+        _sv_topks = _device_array_preserve_device(np.zeros((_sv_tbs,), np.int32), data_sharding)
+        _sv_topps = _device_array_preserve_device(np.ones((_sv_tbs,), np.float32), data_sharding)
+    else:
+        _t = np.asarray(si.temperatures, np.float32).reshape(-1)
+        _k = (
+            np.asarray(getattr(si, "top_ks", None)).reshape(-1)
+            if getattr(si, "top_ks", None) is not None
+            else None
+        )
+        _p = (
+            np.asarray(getattr(si, "top_ps", None), np.float32).reshape(-1)
+            if getattr(si, "top_ps", None) is not None
+            else None
+        )
+        _tv = float(_t[0]) if _t.size else 1.0
+        _kv = int(_k[0]) if (_k is not None and _k.size) else 0
+        _pv = float(_p[0]) if (_p is not None and _p.size) else 1.0
+        _sv_coins = _device_array_preserve_device(
+            np.random.random((_sv_tbs, _sv_nm1)).astype(np.float32), _sv_rep
+        )
+        _sv_coinf = _device_array_preserve_device(
+            np.random.random((_sv_tbs,)).astype(np.float32), _sv_rep
+        )
+        _sv_temps = _device_array_preserve_device(
+            np.full((_sv_tbs, 1), _tv, np.float32), data_sharding
+        )
+        _sv_topks = _device_array_preserve_device(np.full((_sv_tbs,), _kv, np.int32), data_sharding)
+        _sv_topps = _device_array_preserve_device(
+            np.full((_sv_tbs,), _pv, np.float32), data_sharding
+        )
+    _sv_thr_single = float(
+        getattr(spec_worker.server_args, "speculative_accept_threshold_single", 1.0)
+    )
+    _sv_thr_acc = float(getattr(spec_worker.server_args, "speculative_accept_threshold_acc", 1.0))
+
     with jax.set_mesh(draft_worker.mesh), jtu.count_pjit_cpp_cache_miss() as count:
         (
             target_pool_updates,
@@ -1460,11 +1658,19 @@ def spec_decode_verify_phase(spec_worker, model_worker_batch, cur_allocate_lens)
             getattr(spec_worker, "spec_relay_buffers", None),
             relay_future_indices,
             verify_allocate_lens,
+            _sv_coins,
+            _sv_coinf,
+            _sv_temps,
+            _sv_topks,
+            _sv_topps,
             speculative_num_steps=draft_worker.speculative_num_steps,
             speculative_num_draft_tokens=draft_worker.speculative_num_draft_tokens,
             return_target_logits=return_target_logits,
             use_relay_state=use_relay_state,
             dp_size=model_worker_batch.dp_size,
+            is_greedy=_sv_is_greedy,
+            threshold_single=_sv_thr_single,
+            threshold_acc=_sv_thr_acc,
         )
         cache_miss_count = count()
 

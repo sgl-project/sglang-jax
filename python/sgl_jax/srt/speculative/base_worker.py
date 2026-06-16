@@ -131,7 +131,6 @@ class BaseSpecWorker:
         )
         return (
             self._can_use_fused_spec_decode
-            and sampling_info.is_all_greedy
             and not has_penalty
             and getattr(sampling_info, "vocab_mask", None) is None
             and not getattr(model_worker_batch, "return_logprob", False)
@@ -155,8 +154,8 @@ class BaseSpecWorker:
                 "Spec decode-overlap entry only supports decode batches; "
                 "prefill overlap uses forward_batch_speculative_generation()."
             )
-        if not (self._can_use_fused_spec_decode and model_worker_batch.sampling_info.is_all_greedy):
-            raise NotImplementedError("Spec overlap entry only supports fused greedy decode.")
+        if not self._can_use_fused_spec_decode:
+            raise NotImplementedError("Spec overlap entry only supports fused NEXTN topk=1 decode.")
 
         self.init_spec_relay_buffers()
         self._prepare_overlap_sampling_info(model_worker_batch)
