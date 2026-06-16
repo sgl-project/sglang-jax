@@ -77,6 +77,11 @@ from sgl_jax.srt.multimodal.tokenizer_utils import resolve_tokenizer_subdir
 from sgl_jax.srt.precision_tracer import precision_tracer
 from sgl_jax.srt.server_args import PortArgs, ServerArgs
 from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
+from sgl_jax.srt.speculative.overlap_utils import (
+    can_use_spec_decode_overlap,
+    can_use_spec_prefill_overlap,
+    publish_spec_decode_new_seq_lens,
+)
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 from sgl_jax.srt.utils.common_utils import (
     configure_logger,
@@ -114,15 +119,16 @@ class ReceiveDataError(Exception):
 @dataclass
 class GenerationBatchResult:
     logits_output: LogitsProcessorOutput | None
-    next_token_ids: list[int] | None
+    next_token_ids: object | None
     extend_input_len_per_req: list[int]
     extend_logprob_start_len_per_req: list[int]
     bid: int
     cache_miss_count: int
     # relay path: forward stream -> next step forward
     next_draft_input: EagleDraftInput | None = None
+    spec_relay_buffers: object | None = None
+    prefill_relay_future_indices: object | None = None
 
-    allocate_lens: np.ndarray | None = None
     num_accepted_tokens: int | None = None
     accept_lens: np.ndarray | None = None
 
@@ -335,6 +341,8 @@ class Scheduler(
                 server_args=server_args,
                 target_worker=self.tp_worker,
             )
+            if self.enable_overlap and hasattr(self.draft_worker, "init_spec_relay_buffers"):
+                self.draft_worker.init_spec_relay_buffers()
 
         # Get token and memory info from the model worker
         (
@@ -522,6 +530,9 @@ class Scheduler(
         if cache_status is None:
             cache_status = "not configured (JAX_COMPILATION_CACHE_DIR unset)"
         logger.info("XLA persistent compilation cache: %s", cache_status)
+
+    def _is_spec_decode_enabled(self) -> bool:
+        return self.spec_algorithm is not None and not self.spec_algorithm.is_none()
 
     def sync_pub(self):
         logger.info(
@@ -913,7 +924,9 @@ class Scheduler(
                         mesh=self.mesh,
                     )
                     tmp_batch.forward_mode = ForwardMode.DUMMY_FIRST
-                    tmp_batch.next_batch_sampling_info = self.tp_worker.cur_sampling_info
+                    tmp_batch.next_batch_sampling_info = (
+                        self._current_sampling_info_owner().cur_sampling_info
+                    )
                     with jax.profiler.TraceAnnotation("process_batch_result"):
                         self.process_batch_result(tmp_batch, None, batch.launch_done)
 
@@ -921,7 +934,7 @@ class Scheduler(
                 # Process the results of the last batch
                 tmp_batch, tmp_result = self.result_queue.popleft()
                 tmp_batch.next_batch_sampling_info = (
-                    self.tp_worker.cur_sampling_info if batch else None
+                    self._current_sampling_info_owner().cur_sampling_info if batch else None
                 )
                 # NOTE: we should use current launched batch's launch_done event Instead of the last batch's
                 self.process_batch_result(
@@ -1552,8 +1565,10 @@ class Scheduler(
             if not self.last_batch.is_empty() and not self.last_batch.is_prefill_only:
                 if self.running_batch.is_empty():
                     self.running_batch = self.last_batch
-                else:
-                    # Merge running_batch with prefill batch
+                elif not self._is_spec_decode_enabled() or self.enable_overlap:
+                    # Spec overlap keeps prefill and decode as separate forwards, but
+                    # once prefill has produced req-granular relay state it can join
+                    # the next decode batch through the normal batch merge.
                     self.running_batch.merge_batch(self.last_batch)
 
         # For prefill-only batch, filter out finished requests since they
@@ -1585,6 +1600,16 @@ class Scheduler(
 
         # Handle the cases where prefill is not allowed
         has_chunked_reqs = any(req is not None for req in self.chunked_reqs)
+        if self.is_hybrid:
+            for info in self.running_batch.reqs_info:
+                info.batch_is_full = False
+
+        if (
+            self._is_spec_decode_enabled()
+            and not self.enable_overlap
+            and not self.running_batch.is_empty()
+        ):
+            return None
         if (
             self.running_batch.batch_is_full or len(self.waiting_queue) == 0
         ) and not has_chunked_reqs:
@@ -1727,6 +1752,7 @@ class Scheduler(
         # Mixed-style chunked prefill
         if (
             self.is_mixed_chunk
+            and not self._is_spec_decode_enabled()
             and not self.running_batch.is_empty()
             and not (new_batch.return_logprob or self.running_batch.return_logprob)
         ):
@@ -1920,28 +1946,62 @@ class Scheduler(
                     self.server_args.enable_static_lora,
                     draft_token_num=self.draft_worker.speculative_num_draft_tokens,
                 )
-            batch_output = self.draft_worker.forward_batch_speculative_generation(
-                model_worker_batch
+            use_spec_decode_overlap = can_use_spec_decode_overlap(
+                self.enable_overlap, self.spec_algorithm, batch
             )
-            per_rank_spec = ScheduleBatch._split_spec_info_per_rank(
-                batch_output.next_draft_input, model_worker_batch.real_bs_per_dp
+            use_spec_prefill_overlap = can_use_spec_prefill_overlap(
+                self.enable_overlap, self.spec_algorithm, batch
             )
-            for r, s in enumerate(per_rank_spec):
-                batch.reqs_info[r].spec_info = s
-            accept = batch_output.accept_lens
-            if accept is not None:
-                accept = np.asarray(jax.device_get(accept))
-            per_dp_bs = model_worker_batch.per_dp_bs_size
-            for dp_rank, info in enumerate(batch.reqs_info):
-                if info.seq_lens is None or len(info.seq_lens) == 0:
-                    continue
-                if accept is not None:
-                    off = dp_rank * per_dp_bs
-                    info.seq_lens = info.seq_lens + accept[off : off + len(info.seq_lens)]
-                else:
-                    info.seq_lens = info.seq_lens + 1
-            next_token_ids = np.asarray(jax.device_get(batch_output.next_token_ids))
-            self._extract_dp_output_ids(next_token_ids, model_worker_batch, batch)
+            if use_spec_decode_overlap:
+                batch_output, published_new_seq_lens = (
+                    self.draft_worker.forward_batch_speculative_decode_overlap(model_worker_batch)
+                )
+            elif use_spec_prefill_overlap:
+                batch_output = self.draft_worker.forward_batch_speculative_prefill_overlap(
+                    model_worker_batch
+                )
+                published_new_seq_lens = None
+            else:
+                batch_output = self.draft_worker.forward_batch_speculative_generation(
+                    model_worker_batch
+                )
+                published_new_seq_lens = (
+                    publish_spec_decode_new_seq_lens(batch_output)
+                    if batch.forward_mode.is_decode()
+                    else None
+                )
+            if batch_output.next_draft_input is not None:
+                per_rank_spec = ScheduleBatch._split_spec_info_per_rank(
+                    batch_output.next_draft_input, model_worker_batch.real_bs_per_dp
+                )
+                for r, s in enumerate(per_rank_spec):
+                    batch.reqs_info[r].spec_info = s
+            if not use_spec_decode_overlap:
+                new_seq_lens = (
+                    np.asarray(jax.device_get(published_new_seq_lens))
+                    if published_new_seq_lens is not None
+                    else None
+                )
+                per_dp_bs = model_worker_batch.per_dp_bs_size
+                for dp_rank, info in enumerate(batch.reqs_info):
+                    if info.seq_lens is None or len(info.seq_lens) == 0:
+                        continue
+                    if new_seq_lens is not None:
+                        off = dp_rank * per_dp_bs
+                        info.seq_lens = new_seq_lens[off : off + len(info.seq_lens)]
+                    else:
+                        info.seq_lens = info.seq_lens + 1
+            defer_spec_decode_output = (
+                self.enable_overlap
+                and batch.forward_mode.is_decode()
+                and self.spec_algorithm is not None
+                and not self.spec_algorithm.is_none()
+            )
+            defer_spec_prefill_output = use_spec_prefill_overlap
+            defer_spec_output = defer_spec_decode_output or defer_spec_prefill_output
+            if not defer_spec_output:
+                next_token_ids = np.asarray(jax.device_get(batch_output.next_token_ids))
+                self._extract_dp_output_ids(next_token_ids, model_worker_batch, batch)
             logits_output = batch_output.logits_output
             cache_miss_count = batch_output.cache_miss_count
         bid = model_worker_batch.bid
@@ -1967,20 +2027,41 @@ class Scheduler(
                     )
         else:
             extend_logprob_start_len_per_req = None
+        spec_relay_buffers = None
+        prefill_relay_future_indices = None
+        if self.spec_algorithm is not None and not self.spec_algorithm.is_none():
+            spec_relay_buffers = getattr(batch_output, "spec_relay_buffers", None)
+            prefill_relay_future_indices = getattr(
+                batch_output, "prefill_relay_future_indices", None
+            )
 
         ret = GenerationBatchResult(
             logits_output=logits_output,
-            next_token_ids=next_token_ids.tolist(),
+            next_token_ids=(
+                batch_output.next_token_ids
+                if (
+                    self.spec_algorithm is not None
+                    and self.spec_algorithm.is_eagle()
+                    and (batch.forward_mode.is_decode() or defer_spec_prefill_output)
+                    and self.enable_overlap
+                )
+                else next_token_ids.tolist()
+            ),
             extend_input_len_per_req=extend_input_len_per_req,
             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
             bid=bid,
             cache_miss_count=cache_miss_count,
+            spec_relay_buffers=spec_relay_buffers,
+            prefill_relay_future_indices=prefill_relay_future_indices,
         )
-        if self.spec_algorithm is not None and self.spec_algorithm.is_eagle():
+        if (
+            self.spec_algorithm is not None
+            and self.spec_algorithm.is_eagle()
+            and batch_output.next_draft_input is not None
+        ):
             assert isinstance(batch_output.next_draft_input, EagleDraftInput)
             ret.next_draft_input = batch_output.next_draft_input
             ret.accept_lens = batch_output.accept_lens
-            ret.allocate_lens = batch_output.allocate_lens
         return ret
 
     def process_batch_result(
@@ -2026,6 +2107,11 @@ class Scheduler(
             if batch.next_batch_sampling_info.grammars is not None:
                 batch.next_batch_sampling_info.update_grammar_vocab_mask()
             batch.next_batch_sampling_info.sampling_info_done.set()
+
+    def _current_sampling_info_owner(self):
+        if self.spec_algorithm is not None and not self.spec_algorithm.is_none():
+            return self.draft_worker
+        return self.tp_worker
 
     def watchdog_thread(self):
         """A watch dog thread that will try to kill the server itself if one forward batch takes too long."""

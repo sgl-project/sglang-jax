@@ -1460,12 +1460,21 @@ class ServerArgs:
         # Check LoRA configuration
         self.check_lora_server_args()
 
-        # Disallow overlap scheduler when speculative decoding is enabled
+        # Speculative overlap is currently implemented for the fused NEXTN
+        # topk=1 path only.
         if self.speculative_algorithm is not None and not self.disable_overlap_schedule:
-            raise ValueError(
-                "Speculative decoding does not support overlap scheduler. "
-                "Please pass --disable-overlap-schedule when using --speculative-algorithm."
+            supports_spec_overlap = (
+                self.speculative_algorithm == "NEXTN"
+                and self.speculative_eagle_topk == 1
+                and self.speculative_num_draft_tokens == self.speculative_num_steps + 1
             )
+            if not supports_spec_overlap:
+                raise ValueError(
+                    "Speculative overlap scheduler only supports NEXTN with "
+                    "--speculative-eagle-topk=1 and "
+                    "--speculative-num-draft-tokens == --speculative-num-steps + 1. "
+                    "Please pass --disable-overlap-schedule for other speculative configs."
+                )
 
     def check_lora_server_args(self):
         """Validate and normalize LoRA-related server arguments."""

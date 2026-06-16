@@ -442,6 +442,15 @@ class PrefillAdder:
             )
         if _rem_tokens <= 0:
             if self.is_hybrid:
+                # Caller already ran init_next_round_input(), which reset
+                # fill_ids to the full input. If we return here without
+                # scheduling, the next round's cache_unfinished_req() will
+                # treat that full length as committed prefix, then compute
+                # extend_input_len==0 and schedule a zero-extend chunked req.
+                # A q_len==0 seq inside the RPA kernel's [start_seq, end_seq)
+                # range deadlocks the DMA pipeline (#1266). Restore fill_ids
+                # to the actually-committed prefix before bailing.
+                req.fill_ids = req.fill_ids[: len(req.prefix_indices)]
                 return req
             _rem_tokens = self.rem_chunk_tokens_list[dp_rank]
         truncated = req.extend_input_len > _rem_tokens

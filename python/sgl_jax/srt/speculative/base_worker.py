@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import dataclasses
+import os
+import threading
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
@@ -92,6 +96,7 @@ class BaseSpecWorker:
             self.precompile_bs_paddings,
             self.precompile_cache_loc_paddings,
         ) = target_worker.get_precompile_paddings()
+        self.spec_relay_buffers = None
 
     @property
     def target_worker(self) -> ModelWorker:
@@ -101,13 +106,113 @@ class BaseSpecWorker:
     def draft_worker(self) -> BaseDraftWorker:
         return self._draft_worker
 
+    def init_spec_relay_buffers(self):
+        if self.spec_relay_buffers is not None:
+            return
+        from sgl_jax.srt.speculative.relay_buffer import create_spec_relay_buffers
+
+        hidden_dtype = jnp.bfloat16 if self.server_args.dtype == "bfloat16" else jnp.float32
+        self.spec_relay_buffers = create_spec_relay_buffers(
+            self.mesh,
+            self.req_to_token_pool,
+            dp_size=self.server_args.dp_size,
+            num_steps=self.speculative_num_steps,
+            hidden_size=self.target_worker.model_config.hidden_size,
+            hidden_dtype=hidden_dtype,
+        )
+
+    def _can_use_fused_spec_prefill(self, model_worker_batch: ModelWorkerBatch) -> bool:
+        if os.getenv("SGL_JAX_DISABLE_FUSED_SPEC_PREFILL") == "1":
+            return False
+        sampling_info = model_worker_batch.sampling_info
+        penalizer = getattr(sampling_info, "penalizer_orchestrator", None)
+        has_penalty = getattr(sampling_info, "linear_penalty", None) is not None or bool(
+            getattr(penalizer, "is_required", False)
+        )
+        return (
+            self._can_use_fused_spec_decode
+            and sampling_info.is_all_greedy
+            and not has_penalty
+            and getattr(sampling_info, "vocab_mask", None) is None
+            and not getattr(model_worker_batch, "return_logprob", False)
+            and not getattr(model_worker_batch, "return_output_logprob_only", False)
+        )
+
     # -- Main entry point --
 
-    def forward_batch_speculative_generation(self, model_worker_batch: ModelWorkerBatch):
+    def _prepare_overlap_sampling_info(self, model_worker_batch: ModelWorkerBatch):
+        sampling_info = model_worker_batch.sampling_info
+        sampling_info.update_penalties()
+        model_worker_batch.sampling_info = self.cur_sampling_info = dataclasses.replace(
+            sampling_info,
+            sampling_info_done=threading.Event(),
+            penalizer_orchestrator=None,
+        )
+
+    def forward_batch_speculative_decode_overlap(self, model_worker_batch: ModelWorkerBatch):
+        if not model_worker_batch.forward_mode.is_decode():
+            raise NotImplementedError(
+                "Spec decode-overlap entry only supports decode batches; "
+                "prefill overlap uses forward_batch_speculative_generation()."
+            )
+        if not (self._can_use_fused_spec_decode and model_worker_batch.sampling_info.is_all_greedy):
+            raise NotImplementedError("Spec overlap entry only supports fused greedy decode.")
+
+        self.init_spec_relay_buffers()
+        self._prepare_overlap_sampling_info(model_worker_batch)
+        sel = model_worker_batch.logits_indices_selector
+        cur_allocate_lens = np.asarray(model_worker_batch.spec_info_padded.allocate_lens)[sel]
+
+        from sgl_jax.srt.speculative.draft_extend_fused import spec_decode_overlap
+
+        result = spec_decode_overlap(self, model_worker_batch, cur_allocate_lens)
+        launch_done = getattr(model_worker_batch, "launch_done", None)
+        if launch_done is not None:
+            launch_done.set()
+        return result
+
+    def forward_batch_speculative_prefill_overlap(self, model_worker_batch: ModelWorkerBatch):
+        if not model_worker_batch.forward_mode.is_extend():
+            raise NotImplementedError("Spec prefill-overlap entry only supports extend batches.")
+        if not self._can_use_fused_spec_prefill(model_worker_batch):
+            raise NotImplementedError("Spec prefill overlap only supports fused greedy prefill.")
+
+        self.init_spec_relay_buffers()
+        self._prepare_overlap_sampling_info(model_worker_batch)
+
+        from sgl_jax.srt.speculative.draft_extend_fused import (
+            prepare_spec_prefill_forward_batch,
+            spec_prefill_overlap,
+        )
+
+        if getattr(model_worker_batch, "forward_batch", None) is None:
+            prepare_spec_prefill_forward_batch(self, model_worker_batch)
+        result = spec_prefill_overlap(self, model_worker_batch)
+        launch_done = getattr(model_worker_batch, "launch_done", None)
+        if launch_done is not None:
+            launch_done.set()
+        return result
+
+    def forward_batch_speculative_generation(
+        self, model_worker_batch: ModelWorkerBatch, launch_done=None
+    ):
         from sgl_jax.srt.managers.scheduler import GenerationBatchResult
         from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 
+        if launch_done is None:
+            self._prepare_overlap_sampling_info(model_worker_batch)
+
         if model_worker_batch.forward_mode.is_extend():
+            if self._can_use_fused_spec_prefill(model_worker_batch):
+                from sgl_jax.srt.speculative.draft_extend_fused import (
+                    prepare_spec_prefill_forward_batch,
+                    spec_prefill,
+                )
+
+                if getattr(model_worker_batch, "forward_batch", None) is None:
+                    prepare_spec_prefill_forward_batch(self, model_worker_batch)
+                return spec_prefill(self, model_worker_batch, launch_done=launch_done)
+
             if model_worker_batch.sampling_info.temperatures.ndim == 1:
                 model_worker_batch.sampling_info.temperatures = (
                     model_worker_batch.sampling_info.temperatures[:, None]
@@ -118,9 +223,19 @@ class BaseSpecWorker:
                 self.mesh,
                 vocab_size=self.target_worker.model_config.vocab_size,
             )
-            logits_output, next_token_ids, cache_miss_count, bid, _seq_lens = (
-                self.forward_target_extend(model_worker_batch, sampling_metadata)
-            )
+            if model_worker_batch.sampling_info.is_all_greedy:
+                logits_output, _, cache_miss_count, bid, _seq_lens = self.forward_target_extend(
+                    model_worker_batch,
+                    sampling_metadata,
+                    skip_sample=True,
+                )
+                next_token_ids = jnp.argmax(logits_output.next_token_logits, axis=-1).astype(
+                    jnp.int32
+                )
+            else:
+                logits_output, next_token_ids, cache_miss_count, bid, _seq_lens = (
+                    self.forward_target_extend(model_worker_batch, sampling_metadata)
+                )
             if model_worker_batch.dp_size > 1:
                 from jax.experimental.multihost_utils import process_allgather
 
@@ -132,9 +247,6 @@ class BaseSpecWorker:
                 logits_output=logits_output,
                 next_token_ids=next_token_ids,
                 next_draft_input=model_worker_batch.spec_info_padded,
-                allocate_lens=np.asarray(model_worker_batch.seq_lens)[
-                    model_worker_batch.logits_indices_selector
-                ],
                 bid=bid,
                 cache_miss_count=cache_miss_count,
                 extend_input_len_per_req=None,
@@ -150,20 +262,34 @@ class BaseSpecWorker:
             # decode paths can be folded into this entry point over time.
             from sgl_jax.srt.speculative.draft_extend_fused import spec_decode
 
-            return spec_decode(self, model_worker_batch, cur_allocate_lens)
+            batch_output = spec_decode(self, model_worker_batch, cur_allocate_lens)
+            launch_done = getattr(model_worker_batch, "launch_done", None)
+            if launch_done is not None:
+                launch_done.set()
+            return batch_output
         self.draft_worker.draft(model_worker_batch)
         batch_output = self.verify(model_worker_batch, cur_allocate_lens)
         self.draft_worker.draft_extend_for_decode(model_worker_batch, batch_output)
+        launch_done = getattr(model_worker_batch, "launch_done", None)
+        if launch_done is not None:
+            launch_done.set()
         return batch_output
 
-    def forward_target_extend(self, model_worker_batch: ModelWorkerBatch, sampling_metadata):
+    def forward_target_extend(
+        self,
+        model_worker_batch: ModelWorkerBatch,
+        sampling_metadata,
+        *,
+        skip_sample: bool = False,
+    ):
         from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode
 
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
-        logits_output, next_token_ids, cache_miss_count = (
-            self.target_worker.forward_batch_generation(
-                model_worker_batch, sampling_metadata=sampling_metadata
-            )
+        target_worker = getattr(self.target_worker, "worker", self.target_worker)
+        logits_output, next_token_ids, cache_miss_count = target_worker.forward_batch_generation(
+            model_worker_batch,
+            sampling_metadata=sampling_metadata,
+            skip_sample=skip_sample,
         )
         return (
             logits_output,
@@ -217,7 +343,7 @@ class BaseSpecWorker:
         logits_output.next_token_logits = logits_output.next_token_logits[safe_index, :]
         logits_output.hidden_states = logits_output.hidden_states[safe_index, :]
         model_worker_batch.positions = model_worker_batch.positions[safe_index]
-        new_seq_lens = model_worker_batch.seq_lens + accept_length
+        new_seq_lens = model_worker_batch.seq_lens + accept_length + 1
         next_draft_input = EagleDraftInput(
             verified_id=verified_id,
             new_seq_lens=new_seq_lens,
@@ -231,8 +357,6 @@ class BaseSpecWorker:
             next_token_ids=predict,
             next_draft_input=next_draft_input,
             accept_lens=accept_length,
-            # FIXME(pc) this field is for overlap
-            allocate_lens=cur_allocate_lens,
             bid=model_worker_batch.bid,
             cache_miss_count=cache_miss_count,
             extend_input_len_per_req=None,

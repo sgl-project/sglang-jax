@@ -489,6 +489,9 @@ class EagleDraftInput:
     #: host ``(b,)`` — scheduler-visible logical length after verify. May be
     #: derived from ``old_seq_lens + accept_length`` if not stored.
     new_seq_lens: np.ndarray | None = None
+    #: host ``(b,)`` — req_pool_indices used to gather relay-buffer state.
+    future_indices: np.ndarray | None = None
+    pending_draft_extend_result: object | None = None
 
     # ---- SpecInput protocol -------------------------------------------------
     def is_draft_input(self) -> bool:
@@ -511,6 +514,17 @@ class EagleDraftInput:
     def get_verify_token_num(self, bs: int) -> int:
         return 0
 
+    def new_tokens_required_next_decode(self, requests, page_size: int) -> int:
+        target_alloc = self.ALLOC_LEN_PER_DECODE * 2
+        total = 0
+        for req in requests:
+            cur = req.kv_allocated_len
+            nxt = max(cur, req.kv_committed_len + target_alloc)
+            total += ((nxt + page_size - 1) // page_size) * page_size - (
+                (cur + page_size - 1) // page_size
+            ) * page_size
+        return total
+
     def tree_flatten(self):
         accept_length_cpu_arr = (
             np.empty((0,), dtype=np.int32)
@@ -531,6 +545,7 @@ class EagleDraftInput:
             self.kv_indices,
             self.seq_lens_for_draft_extend,
             self.req_pool_indices_for_draft_extend,
+            self.future_indices,
             accept_length_cpu_arr,
             num_tokens_per_batch_arr,
             num_tokens_for_logprob_arr,
@@ -554,10 +569,11 @@ class EagleDraftInput:
         obj.kv_indices = children[6]
         obj.seq_lens_for_draft_extend = children[7]
         obj.req_pool_indices_for_draft_extend = children[8]
+        obj.future_indices = children[9]
 
-        obj.accept_length_cpu = children[9]
-        obj.num_tokens_per_batch = children[10]
-        obj.num_tokens_for_logprob_per_batch = children[11]
+        obj.accept_length_cpu = children[10]
+        obj.num_tokens_per_batch = children[11]
+        obj.num_tokens_for_logprob_per_batch = children[12]
 
         return obj
 
@@ -615,7 +631,9 @@ class EagleDraftInput:
         )
         bs = batch_output.accept_lens.shape[0]
         step_plus_1 = model_worker_batch.input_ids.shape[0] // bs
-        model_worker_batch.positions = model_worker_batch.positions
+        positions = getattr(batch_output.next_draft_input, "positions", None)
+        if positions is not None:
+            model_worker_batch.positions = positions
         model_worker_batch.extend_seq_lens = np.zeros((bs,), dtype=np.int32)
         model_worker_batch.extend_seq_lens[sel] = step_plus_1
         # Per-rank-local cumsum: _select_hidden_states is a shard_map rank-local
@@ -642,10 +660,40 @@ class EagleDraftInput:
 
         draft_model_runner.attn_backend.forward_metadata = forward_metadata
         from sgl_jax.srt.layers.logits_processor import LogitsMetadata
+        from sgl_jax.srt.utils.jax_utils import device_array
 
-        logits_metadata = LogitsMetadata.from_model_worker_batch(
-            model_worker_batch, draft_model_runner.mesh
-        )
+        if model_worker_batch.return_logprob:
+            logits_metadata = LogitsMetadata.from_model_worker_batch(
+                model_worker_batch, draft_model_runner.mesh
+            )
+        else:
+            sharding = NamedSharding(draft_model_runner.mesh, P("data"))
+
+            def _to_device(value):
+                if value is None:
+                    return None
+                if isinstance(value, jax.Array):
+                    return jax.device_put(value, sharding)
+                return device_array(value, sharding=sharding)
+
+            logits_metadata = LogitsMetadata(
+                forward_mode=model_worker_batch.forward_mode,
+                capture_hidden_mode=model_worker_batch.capture_hidden_mode,
+                extend_return_logprob=False,
+                extend_return_top_logprob=False,
+                extend_token_ids_logprob=False,
+                extend_seq_lens=_to_device(model_worker_batch.extend_seq_lens),
+                logits_indices=_to_device(model_worker_batch.logits_indices),
+                accept_lens=_to_device(model_worker_batch.spec_info_padded.accept_length),
+                extend_seq_lens_cpu=None,
+                extend_logprob_start_lens_cpu=None,
+                extend_logprob_pruned_lens_cpu=None,
+                top_logprobs_nums=model_worker_batch.top_logprobs_nums,
+                token_ids_logprobs=model_worker_batch.token_ids_logprobs,
+                extend_input_logprob_token_ids_device=_to_device(
+                    model_worker_batch.extend_input_logprob_token_ids
+                ),
+            )
         return model_worker_batch, logits_metadata
 
     def prepare_for_decode(self, schedule_batch: ScheduleBatch):
@@ -664,9 +712,9 @@ class EagleDraftInput:
             if info.seq_lens is None or len(info.seq_lens) == 0:
                 continue
             bs_r = len(info.seq_lens)
-            seq_r = np.asarray(info.seq_lens)
-            new_r = seq_r + self.ALLOC_LEN_PER_DECODE - 1
-            old_r = self.allocate_lens[flat_off : flat_off + bs_r]
+            old_r = np.asarray([req.kv_allocated_len for req in info.reqs], dtype=np.int32)
+            committed_r = np.asarray([req.kv_committed_len for req in info.reqs], dtype=np.int32)
+            new_r = np.maximum(old_r, committed_r + 2 * self.ALLOC_LEN_PER_DECODE)
             ext_r = int((new_r - old_r).sum())
             if page_size == 1:
                 ocl_r = alloc_token_slots(schedule_batch.tree_cache, ext_r, dp_rank=dp_rank)
@@ -691,6 +739,10 @@ class EagleDraftInput:
             # Per-rank store (matches nospec extend); _get_spec_decode_mwb_dp
             # DP-segments these so each rank's P("data") shard = its own slots.
             info.out_cache_loc = np.asarray(ocl_r, dtype=np.int32)
+            for req, allocated_len in zip(info.reqs, new_r):
+                req.decode_batch_idx += 1
+                req.kv_allocated_len = int(allocated_len)
+                req.kv_committed_len += 1
             flat_off += bs_r
             info.seq_lens_sum = np.sum(info.seq_lens).item()
 
@@ -704,6 +756,13 @@ class EagleDraftInput:
         self.num_tokens_for_logprob_per_batch = topk
         model_worker_batch.return_hidden_states = False
         model_worker_batch.seq_lens_sum = np.sum(model_worker_batch.seq_lens)
+
+    def resolve_pending_draft_extend_result(self):
+        if self.pending_draft_extend_result is None:
+            return
+
+        self.pending_draft_extend_result = None
+        raise RuntimeError("Spec overlap relay path must not carry pending_draft_extend_result.")
 
     @classmethod
     def create_idle_input(
@@ -746,6 +805,23 @@ class EagleDraftInput:
 
     def filter_batch(self, new_indices: np.ndarray, has_been_filtered: bool = True):
         new_indices = np.asarray(new_indices)
+        if self.future_indices is not None:
+            src = np.asarray(self.future_indices)
+            idx = (
+                slice(0, len(new_indices))
+                if has_been_filtered and len(new_indices) == len(src)
+                else new_indices
+            )
+            self.future_indices = src[idx]
+            if self.allocate_lens is not None:
+                self.allocate_lens = np.asarray(self.allocate_lens)[idx]
+            if self.new_seq_lens is not None:
+                self.new_seq_lens = np.asarray(self.new_seq_lens)[idx]
+            if self.accept_length_cpu is not None:
+                self.accept_length_cpu = np.asarray(self.accept_length_cpu)[idx]
+            return
+
+        self.resolve_pending_draft_extend_result()
         self._ensure_host()
         if has_been_filtered and len(new_indices) == len(self.topk_p):
             self.topk_p = self.topk_p[: len(new_indices)]
@@ -754,6 +830,8 @@ class EagleDraftInput:
             self.verified_id = self.verified_id[: len(new_indices)]
             if self.allocate_lens is not None:
                 self.allocate_lens = np.asarray(self.allocate_lens)[: len(new_indices)]
+            if self.new_seq_lens is not None:
+                self.new_seq_lens = np.asarray(self.new_seq_lens)[: len(new_indices)]
         else:
             self.topk_p = self.topk_p[new_indices]
             self.topk_index = self.topk_index[new_indices]
@@ -761,13 +839,69 @@ class EagleDraftInput:
             self.verified_id = self.verified_id[new_indices]
             if self.allocate_lens is not None:
                 self.allocate_lens = np.asarray(self.allocate_lens)[new_indices]
+            if self.new_seq_lens is not None:
+                self.new_seq_lens = np.asarray(self.new_seq_lens)[new_indices]
+
+    def trim_to_length(self, n: int):
+        self.resolve_pending_draft_extend_result()
+        self._ensure_host()
+        for f in (
+            "topk_p",
+            "topk_index",
+            "hidden_states",
+            "verified_id",
+            "allocate_lens",
+            "new_seq_lens",
+            "accept_length",
+            "accept_length_cpu",
+            "future_indices",
+        ):
+            v = getattr(self, f, None)
+            if v is not None and len(v) != n:
+                setattr(self, f, np.asarray(v)[:n])
 
     def merge_batch(self, spec_info: EagleDraftInput):
+        if self.future_indices is not None or spec_info.future_indices is not None:
+            assert self.future_indices is not None and spec_info.future_indices is not None, (
+                "merge_batch requires both EagleDraftInput objects to carry future_indices "
+                "on the relay-buffer path"
+            )
+            self.future_indices = np.concatenate(
+                [np.asarray(self.future_indices), np.asarray(spec_info.future_indices)],
+                axis=0,
+            )
+            if self.allocate_lens is not None and spec_info.allocate_lens is not None:
+                self.allocate_lens = np.concatenate(
+                    [np.asarray(self.allocate_lens), np.asarray(spec_info.allocate_lens)],
+                    axis=0,
+                )
+            else:
+                self.allocate_lens = None
+            if self.new_seq_lens is not None and spec_info.new_seq_lens is not None:
+                self.new_seq_lens = np.concatenate(
+                    [np.asarray(self.new_seq_lens), np.asarray(spec_info.new_seq_lens)],
+                    axis=0,
+                )
+            else:
+                self.new_seq_lens = None
+            if self.accept_length_cpu is not None and spec_info.accept_length_cpu is not None:
+                self.accept_length_cpu = np.concatenate(
+                    [np.asarray(self.accept_length_cpu), np.asarray(spec_info.accept_length_cpu)],
+                    axis=0,
+                )
+            else:
+                self.accept_length_cpu = None
+            return
+
+        self.resolve_pending_draft_extend_result()
+        spec_info.resolve_pending_draft_extend_result()
         if self.hidden_states is None:
             self.hidden_states = spec_info.hidden_states
             self.verified_id = spec_info.verified_id
             self.topk_p = spec_info.topk_p
             self.topk_index = spec_info.topk_index
+            self.allocate_lens = spec_info.allocate_lens
+            self.new_seq_lens = spec_info.new_seq_lens
             return
         if spec_info.hidden_states is None:
             return
@@ -778,6 +912,12 @@ class EagleDraftInput:
         self.topk_p = np.concatenate([self.topk_p, spec_info.topk_p])
         self.topk_index = np.concatenate([self.topk_index, spec_info.topk_index])
         self.allocate_lens = np.concatenate([self.allocate_lens, spec_info.allocate_lens])
+        if self.new_seq_lens is not None and spec_info.new_seq_lens is not None:
+            self.new_seq_lens = np.concatenate(
+                [np.asarray(self.new_seq_lens), np.asarray(spec_info.new_seq_lens)]
+            )
+        else:
+            self.new_seq_lens = None
 
 
 @dataclass

@@ -71,6 +71,7 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "device",
     "chunked_prefill_size",
     "disable_radix_cache",
+    "speculative_algorithm",
     "speculative_accept_threshold_single",
     "speculative_accept_threshold_acc",
     "enable_deterministic_sampling",
@@ -1221,6 +1222,10 @@ class ScheduleBatch:
             info.reqs if selected_indices is None else [info.reqs[i] for i in selected_indices]
         )
 
+        spec_info = getattr(info, "spec_info", None)
+        if spec_info is not None and hasattr(spec_info, "new_tokens_required_next_decode"):
+            return spec_info.new_tokens_required_next_decode(requests, page_size)
+
         new_pages = sum(1 for r in requests if r.kv_committed_len % page_size == 0)
         return new_pages * page_size
 
@@ -1514,7 +1519,16 @@ class ScheduleBatch:
                     info.seq_lens = None
                     info.out_cache_loc = None
                     info.seq_lens_sum = 0
+                    info.spec_info = None
+                elif (
+                    info.spec_info is not None
+                    and getattr(info.spec_info, "allocate_lens", None) is not None
+                    and len(info.spec_info.allocate_lens) != len(info.reqs)
+                ):
+                    info.spec_info.trim_to_length(len(info.reqs))
             flat_spec = self._concat_spec_info_per_rank([info.spec_info for info in self.reqs_info])
+            if getattr(flat_spec, "pending_draft_extend_result", None) is not None:
+                flat_spec.resolve_pending_draft_extend_result()
             flat_spec.prepare_for_decode(self)
             real_bs_per_dp = [len(info.reqs) if info.reqs else 0 for info in self.reqs_info]
             per_rank_spec = self._split_spec_info_per_rank(flat_spec, real_bs_per_dp)
@@ -1660,6 +1674,14 @@ class ScheduleBatch:
 
             # Early exit: No filtering needed if all requests kept
             if len(keep_indices_dp) == len(info.reqs):
+                spec_info_len = (
+                    None
+                    if info.spec_info is None
+                    or getattr(info.spec_info, "allocate_lens", None) is None
+                    else len(info.spec_info.allocate_lens)
+                )
+                if spec_info_len is not None and spec_info_len != len(info.reqs):
+                    info.spec_info.trim_to_length(len(info.reqs))
                 continue
 
             # Filter reqs list
@@ -1792,7 +1814,8 @@ class ScheduleBatch:
                     and other_info.top_logprobs_nums is not None
                 ):
                     self_info.top_logprobs_nums.extend(other_info.top_logprobs_nums)
-                    self_info.token_ids_logprobs.extend(other_info.token_ids_logprobs)
+                self_info.token_ids_logprobs.extend(other_info.token_ids_logprobs)
+
             elif self.return_logprob and self_info.top_logprobs_nums is not None:
                 self_info.top_logprobs_nums.extend([0] * len(other_info.reqs))
                 self_info.token_ids_logprobs.extend([None] * len(other_info.reqs))
@@ -2360,13 +2383,25 @@ class ScheduleBatch:
             logits_indices_selector,
         ) = self._merge_batch_metadata(per_dp_bs, total_bs)
         sampling_info = self._merge_sampling_info(per_dp_bs, total_bs)
+        for dp_rank, info in enumerate(self.reqs_info):
+            spec_info_dp = info.spec_info
+            future_indices = getattr(spec_info_dp, "future_indices", None)
+            if future_indices is None:
+                continue
+            num_reqs = len(info.reqs) if info.reqs is not None else 0
+            assert len(future_indices) == num_reqs, (
+                f"future_indices length mismatch on dp_rank={dp_rank}: "
+                f"{len(future_indices)=}, {num_reqs=}"
+            )
         # Concat per-rank spec_info into a cross-rank-flat EagleDraftInput,
         # then scatter into DP-padded (total_bs, ...) slots so spec_info[i]
         # aligns with seq_lens[i]. Returns a new object — does not mutate
         # the per-rank cross-round state on reqs_info[r].spec_info.
         flat_spec = self._concat_spec_info_per_rank([info.spec_info for info in self.reqs_info])
+        if getattr(flat_spec, "pending_draft_extend_result", None) is not None:
+            flat_spec.resolve_pending_draft_extend_result()
         spec_info = self._scatter_spec_info_to_dp_slots(
-            flat_spec, logits_indices_selector, total_bs
+            flat_spec, logits_indices_selector, total_bs, mesh=self.mesh
         )
         # Per-rank out_cache_loc chunks (set in spec prepare_for_decode) have
         # variable length (∝ accept_len). DP-segment: pad each to max_len with
@@ -2380,10 +2415,18 @@ class ScheduleBatch:
             )
             for i in self.reqs_info
         ]
-        # Pad each rank's out_cache_loc to per_dp_bs * draft_token_num so the
-        # merged shape is stable across runtime bs. max_chunk_len defensive.
+        # Spec prepare_for_decode conservatively reserves up to
+        # 2 * ALLOC_LEN_PER_DECODE tokens per request. Keep the JIT-visible
+        # out_cache_loc shape on that same conservative bucket instead of the
+        # smaller draft-token count, otherwise high-running batches can escape
+        # precompile with shapes like 656/928/1024.
         max_chunk_len = max((len(c) for c in ocl_chunks), default=0)
-        target_per_rank_ocl = max(per_dp_bs * draft_token_num, max_chunk_len)
+        target_per_rank_ocl = per_dp_bs * draft_token_num * 2
+        assert max_chunk_len <= target_per_rank_ocl, (
+            "spec decode out_cache_loc escaped precompile bucket: "
+            f"max_chunk_len={max_chunk_len}, bucket_per_rank={target_per_rank_ocl}, "
+            f"per_dp_bs={per_dp_bs}, draft_token_num={draft_token_num}"
+        )
         out_cache_loc = (
             np.concatenate(
                 [
@@ -2394,7 +2437,7 @@ class ScheduleBatch:
             if target_per_rank_ocl > 0
             else np.empty(0, dtype=np.int32)
         )
-        return ModelWorkerBatch(
+        model_worker_batch = ModelWorkerBatch(
             bid=acc_global_bid(),
             forward_mode=self.forward_mode,
             input_ids=np.empty(0, dtype=np.int32),
@@ -2432,9 +2475,12 @@ class ScheduleBatch:
             tree_cache=self.tree_cache,
             mrope_positions=None,
         )
+        return model_worker_batch
 
     @staticmethod
-    def _scatter_spec_info_to_dp_slots(flat, selector: np.ndarray, total_bs: int):
+    def _scatter_spec_info_to_dp_slots(
+        flat, selector: np.ndarray, total_bs: int, mesh: mesh_lib.Mesh = None
+    ):
         """Scatter global-flat spec_info arrays into DP-padded ``(total_bs, …)``.
 
         ``selector[k]`` is the DP-padded slot of the k-th global-flat req
@@ -2442,23 +2488,32 @@ class ScheduleBatch:
         the cross-round flat state on ``reqs_info[r].spec_info`` is unchanged.
         """
 
-        def _scatter1(arr):
+        def _scatter1(arr, *, require_selector_len: bool = True, data_sharded: bool = False):
             if arr is None:
                 return None
             a = np.asarray(arr)
+            if require_selector_len and a.shape[0] != len(selector):
+                return None
             out = np.zeros((total_bs,) + a.shape[1:], dtype=a.dtype)
             out[selector] = a
+            if data_sharded and mesh is not None:
+                from jax.sharding import NamedSharding
+                from jax.sharding import PartitionSpec as P
+
+                return jax.device_put(out, NamedSharding(mesh, P("data")))
             return out
 
         return type(flat)(
-            topk_p=_scatter1(flat.topk_p),
-            topk_index=_scatter1(flat.topk_index),
+            topk_p=_scatter1(flat.topk_p, data_sharded=True),
+            topk_index=_scatter1(flat.topk_index, data_sharded=True),
             hidden_states=_scatter1(flat.hidden_states),
-            verified_id=_scatter1(flat.verified_id),
+            verified_id=_scatter1(flat.verified_id, data_sharded=True),
             allocate_lens=_scatter1(flat.allocate_lens),
             capture_hidden_mode=flat.capture_hidden_mode,
-            accept_length=flat.accept_length,
-            accept_length_cpu=flat.accept_length_cpu,
+            accept_length=_scatter1(flat.accept_length),
+            accept_length_cpu=_scatter1(flat.accept_length_cpu),
+            new_seq_lens=_scatter1(flat.new_seq_lens),
+            future_indices=_scatter1(flat.future_indices),
         )
 
     @staticmethod
@@ -2472,7 +2527,42 @@ class ScheduleBatch:
         if flat is None:
             return [None] * len(real_bs_per_dp)
 
-        flat._ensure_host()
+        has_future_indices = getattr(flat, "future_indices", None) is not None
+        if getattr(flat, "pending_draft_extend_result", None) is not None:
+            flat.resolve_pending_draft_extend_result()
+        if not has_future_indices:
+            flat._ensure_host()
+            required_fields = ("topk_p", "topk_index", "hidden_states", "verified_id")
+            missing = [f for f in required_fields if getattr(flat, f, None) is None]
+            if missing:
+
+                def _field_state(v):
+                    if v is None:
+                        return None
+                    shape = getattr(v, "shape", None)
+                    if shape is not None:
+                        return shape
+                    return len(v)
+
+                field_states = {
+                    f: _field_state(getattr(flat, f, None))
+                    for f in (
+                        "topk_p",
+                        "topk_index",
+                        "hidden_states",
+                        "verified_id",
+                        "allocate_lens",
+                        "accept_length",
+                        "accept_length_cpu",
+                        "new_seq_lens",
+                        "future_indices",
+                    )
+                }
+                raise RuntimeError(
+                    "_split_spec_info_per_rank got incomplete EagleDraftInput "
+                    f"without pending_draft_extend_result; missing={missing}, "
+                    f"field_states={field_states}, real_bs_per_dp={real_bs_per_dp}"
+                )
 
         per_req_fields = (
             "topk_p",
@@ -2482,6 +2572,8 @@ class ScheduleBatch:
             "allocate_lens",
             "accept_length",
             "accept_length_cpu",
+            "new_seq_lens",
+            "future_indices",
         )
 
         out = []
@@ -2493,7 +2585,15 @@ class ScheduleBatch:
             kwargs = {"capture_hidden_mode": flat.capture_hidden_mode}
             for f in per_req_fields:
                 v = getattr(flat, f, None)
-                kwargs[f] = None if v is None else v[offset : offset + n]
+                if has_future_indices and f not in (
+                    "allocate_lens",
+                    "new_seq_lens",
+                    "accept_length_cpu",
+                    "future_indices",
+                ):
+                    kwargs[f] = None
+                else:
+                    kwargs[f] = None if v is None else v[offset : offset + n]
             out.append(type(flat)(**kwargs))
             offset += n
         return out
@@ -2510,6 +2610,19 @@ class ScheduleBatch:
         if not nonempty:
             return None
 
+        has_future_indices = any(getattr(s, "future_indices", None) is not None for s in nonempty)
+        if has_future_indices:
+            assert all(getattr(s, "future_indices", None) is not None for s in nonempty), (
+                "_concat_spec_info_per_rank requires every nonempty rank to carry "
+                "future_indices on the relay-buffer path"
+            )
+        elif any(getattr(s, "pending_draft_extend_result", None) is not None for s in nonempty):
+            for spec_info in nonempty:
+                spec_info.resolve_pending_draft_extend_result()
+        else:
+            for spec_info in nonempty:
+                spec_info.resolve_pending_draft_extend_result()
+
         per_req_fields = (
             "topk_p",
             "topk_index",
@@ -2518,13 +2631,20 @@ class ScheduleBatch:
             "allocate_lens",
             "accept_length",
             "accept_length_cpu",
+            "new_seq_lens",
+            "future_indices",
         )
 
-        kwargs = {"capture_hidden_mode": nonempty[0].capture_hidden_mode}
+        kwargs = {
+            "capture_hidden_mode": nonempty[0].capture_hidden_mode,
+        }
         for f in per_req_fields:
             vals = [getattr(s, f, None) for s in nonempty]
             nonnull = [v for v in vals if v is not None]
             if not nonnull:
+                kwargs[f] = None
+                continue
+            if f in ("accept_length", "accept_length_cpu") and len(nonnull) != len(nonempty):
                 kwargs[f] = None
                 continue
             # All nonempty ranks should agree on which optional fields they
@@ -2827,6 +2947,7 @@ class ScheduleBatch:
             # _input_logprob_lens_per_dp, which reads these.
             new_info.extend_lens = info.extend_lens
             new_info.extend_logprob_start_lens = info.extend_logprob_start_lens
+            new_info.spec_info = info.spec_info
             copied_reqs_info.append(new_info)
 
         return ScheduleBatch(

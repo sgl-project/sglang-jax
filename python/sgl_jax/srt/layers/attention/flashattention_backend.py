@@ -281,7 +281,9 @@ class FlashAttention(AttentionBackend):
             ) * self.page_size
         cu_kv_lens = _per_dp_cumsum(aligned_seq_lens, dp_size, per_dp_bs)
 
-        if batch.forward_mode == ForwardMode.DRAFT_EXTEND:
+        if batch.forward_mode == ForwardMode.DRAFT_EXTEND and not getattr(
+            batch.spec_info_padded, "device_seq_lens_for_draft_extend", False
+        ):
             # Truncate each req's page list from allocate_len → seq_len, keeping
             # the DP-segmented layout from padding_for_decode (rank r's pages
             # at [r*per_dp_pg : ...]). page_indices (line 212) is already

@@ -64,6 +64,14 @@ class ModelWorkerClient:
     def get_model_runner(self):
         return self.worker.get_model_runner()
 
+    @property
+    def model_config(self):
+        return self.worker.model_config
+
+    @property
+    def model_runner(self):
+        return self.worker.model_runner
+
     def get_worker_info(self):
         return self.worker.get_worker_info()
 
