@@ -222,12 +222,17 @@ class RecurrentStatePool:
         data_axis = self.data_partition_axis
 
         def _temporal(buf, src, dst):
+            # Donated-pool aliasing barrier (see gated_delta.py): buf is donated,
+            # so under multi-host SPMD the scatter races the gather and corrupts
+            # reused slots (NaN). optimization_barrier is value-preserving.
+            buf = jax.lax.optimization_barrier(buf)
             val = jnp.where((src == 0).reshape(-1, 1, 1, 1), buf[dst], buf[src])
-            return buf.at[dst].set(val)
+            return jax.lax.optimization_barrier(buf.at[dst].set(val))
 
         def _conv(buf, src, dst):
+            buf = jax.lax.optimization_barrier(buf)
             val = jnp.where((src == 0).reshape(-1, 1, 1), buf[dst], buf[src])
-            return buf.at[dst].set(val)
+            return jax.lax.optimization_barrier(buf.at[dst].set(val))
 
         copy_temporal = jax.shard_map(
             _temporal,
