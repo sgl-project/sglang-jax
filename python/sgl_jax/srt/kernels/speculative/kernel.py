@@ -90,12 +90,22 @@ def verify_tree_greedy(
     return accept_index, accept_token_num, predicts
 
 
-def top_k_renorm_prob(probs, top_k_values):
+# Partial-selection width for top-k / top-p renorm. Sampling almost never keeps
+# more than this many tokens, so a `jax.lax.top_k` of this width replaces a full
+# vocab-wide sort -- which dominated device time in profiling (a single
+# sort(f32[256,152576]) cost ~34ms, ~49% of the verify step). Rows that need a
+# wider support fall back to "keep everything" (see below).
+RENORM_MAX_TOPK = 1024
+
+
+def top_k_renorm_prob(probs, top_k_values, max_k: int = RENORM_MAX_TOPK):
     """Renormalizing probabilities by top-k thresholding.
 
     Args:
       probs: probabilities, shape: (batch_size, num_classes).
       top_k_values: the top-k threshold for re-normalizing probabilities, shape: (batch_size, 1).
+      max_k: static upper bound on the partial selection width. Requested k values
+        above ``max_k`` (e.g. the "whole vocabulary" sentinel) keep every token.
 
     Returns:
       Renormalized probabilities, shape ``(batch_size, num_classes)``.
@@ -105,22 +115,28 @@ def top_k_renorm_prob(probs, top_k_values):
         probs.shape[0] == top_k_values.shape[0]
     ), f"probs.shape[0]: {probs.shape[0]} should equal to top_k_values.shape[0]: {top_k_values.shape}"
 
-    # TODO: optimize alg of top_k by avoiding sort
-    def process_single_sample(prob_row, k):
-        ranks = jnp.argsort(jnp.argsort(prob_row)[::-1])
-        mask = ranks < k
-        masked_probs = jnp.where(mask, prob_row, 0.0)
-        return masked_probs / jnp.sum(masked_probs)
+    # Partial top-k selection instead of a full sort: the k-th largest value is the
+    # inclusion threshold, so we keep every prob >= pivot.
+    k = min(max_k, probs.shape[-1])
+    topk_vals, _ = jax.lax.top_k(probs, k)  # (batch_size, k), descending
+    top_k_values = top_k_values.reshape(-1, 1)
+    kth_idx = jnp.clip(top_k_values - 1, 0, k - 1).astype(jnp.int32)
+    pivot = jnp.take_along_axis(topk_vals, kth_idx, axis=-1)
+    # Requested k beyond the partial-selection width -> keep everything.
+    pivot = jnp.where(top_k_values > k, 0.0, pivot)
 
-    return jax.vmap(process_single_sample, in_axes=(0, 0))(probs, top_k_values)
+    masked_probs = jnp.where(probs >= pivot, probs, 0.0)
+    return masked_probs / jnp.sum(masked_probs, axis=-1, keepdims=True)
 
 
-def top_p_renorm_prob(probs, top_p_values):
+def top_p_renorm_prob(probs, top_p_values, max_k: int = RENORM_MAX_TOPK):
     """Renormalizing probabilities by top-p thresholding.
 
     Args:
       probs: probabilities, shape: (batch_size, num_classes).
       top_p_values: the top-p threshold for re-normalizing probabilities, shape: (batch_size, 1).
+      max_k: static upper bound on the partial selection width. If the top ``max_k``
+        tokens of a row do not reach top_p, that row keeps every token.
 
     Returns:
       Renormalized probabilities, shape ``(batch_size, num_classes)``.
@@ -130,22 +146,21 @@ def top_p_renorm_prob(probs, top_p_values):
         probs.shape[0] == top_p_values.shape[0]
     ), f"probs.shape[0]: {probs.shape[0]} should equal to top_k_values.shape[0]: {top_p_values.shape}"
 
-    # TODO: optimize alg of top_p by avoiding sort
-    def process_single_sample(prob_row, top_p):
-        sorted_indices = jnp.argsort(prob_row)[::-1]
-        sorted_probs = prob_row[sorted_indices]
+    # Partial top-k selection instead of a full sort over the whole vocab: top_p
+    # keeps only the highest-prob tokens, which almost always fall inside the top
+    # max_k. cutoff_idx is the first position whose cumulative prob reaches top_p,
+    # and the prob there is the inclusion threshold (keep every prob >= pivot).
+    k = min(max_k, probs.shape[-1])
+    topk_vals, _ = jax.lax.top_k(probs, k)  # (batch_size, k), descending
+    cumsum_probs = jnp.cumsum(topk_vals, axis=-1)
+    reaches = cumsum_probs >= top_p_values.reshape(-1, 1)
+    cutoff_idx = jnp.argmax(reaches, axis=-1)
+    pivot = jnp.take_along_axis(topk_vals, cutoff_idx[:, None], axis=-1)
+    # Top max_k did not reach top_p (e.g. flat distribution or top_p == 1) -> keep all.
+    pivot = jnp.where(jnp.any(reaches, axis=-1, keepdims=True), pivot, 0.0)
 
-        cumsum_probs = jnp.cumsum(sorted_probs)
-        cutoff_idx = jnp.argmax(cumsum_probs >= top_p)
-
-        ranks = jnp.argsort(jnp.argsort(prob_row)[::-1])
-
-        mask = ranks <= cutoff_idx
-
-        masked_probs = jnp.where(mask, prob_row, 0.0)
-        return masked_probs / jnp.sum(masked_probs)
-
-    return jax.vmap(process_single_sample, in_axes=(0, 0))(probs, top_p_values)
+    masked_probs = jnp.where(probs >= pivot, probs, 0.0)
+    return masked_probs / jnp.sum(masked_probs, axis=-1, keepdims=True)
 
 
 def _sampling_from_prob(probs: jax.Array, threshold: jax.Array):
