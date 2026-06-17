@@ -1,10 +1,12 @@
 """Host-staging KV pool for PD disaggregation.
 
-The pool predefines ``pool_size`` independent host arrays (pinned host
-memory, via an explicit ``memory_kind="pinned_host"`` — see
-``_make_host_sharding``) and hands them out / takes them back via a
-FIFO queue. There is no LRU, no lock_ref, no retention — every borrow is
-intended to live for one transfer.
+The pool is a bounded counting semaphore: it hands out / takes back
+``pool_size`` slot ids via a FIFO queue, capping how many D2H transfers
+are in flight at once. It does not pre-allocate storage — each
+:meth:`QueueHostKVPool.copy_from_device` stages into fresh host arrays
+(pinned host memory, via an explicit ``memory_kind="pinned_host"`` — see
+``_make_host_sharding``). There is no LRU, no lock_ref, no retention —
+every borrow is intended to live for one transfer.
 
 The :class:`HostKVPool` ABC is the surface that HiCache's
 ``LRUHostKVPool`` will also implement in its own RFC; keeping the ABC
@@ -22,7 +24,6 @@ from dataclasses import dataclass
 from typing import Any
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
@@ -152,11 +153,8 @@ class QueueHostKVPool(HostKVPool):
         self._partition_spec = partition_spec
         self._pool_name = pool_name
         self._host_sharding = _make_host_sharding(mesh, partition_spec)
-        self._layer_shape = (max_padded_pages, *self._per_layer_shape)
 
         self._lock = threading.Lock()
-        # Each entry is a list of ``layer_num`` host arrays.
-        self._buffers: list[list[jax.Array]] = self._allocate_buffers()
         self._free_ids: list[int] = list(range(pool_size))
         # Backpressure observability: peak concurrent occupancy and the number
         # of reserve() calls that hit an empty pool (each is an admission
@@ -165,15 +163,6 @@ class QueueHostKVPool(HostKVPool):
         self._peak_used = 0
         self._exhaust_count = 0
         self._last_exhaust_log = 0.0
-
-    def _allocate_buffers(self) -> list[list[jax.Array]]:
-        zeros = jnp.zeros(self._layer_shape, dtype=self._dtype)
-        host_zero = jax.device_put(zeros, self._host_sharding)
-        host_zero.block_until_ready()
-        entries: list[list[jax.Array]] = []
-        for _ in range(self._pool_size):
-            entries.append([host_zero for _ in range(self._layer_num)])
-        return entries
 
     # ------------------------------------------------------------------
     # HostKVPool ABC
