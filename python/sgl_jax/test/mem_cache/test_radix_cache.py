@@ -15,7 +15,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from sgl_jax.srt.mem_cache.allocator import TokenToKVPoolAllocator
+from sgl_jax.srt.mem_cache.allocator import (
+    PagedTokenToKVPoolAllocator,
+    TokenToKVPoolAllocator,
+)
 from sgl_jax.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
 from sgl_jax.srt.mem_cache.radix_cache import (
     RadixCache,
@@ -575,6 +578,15 @@ class MockRequest:
         # so default to len(prefix_indices) (== matched prefix in the simple
         # mock setup; no unaligned tail because tests use page_size=1).
         self.cache_protected_len = len(prefix_indices)
+        # The page-aligned tree-matched prefix length. In real reqs this is set
+        # by init_next_round_input / cache_(un)finished_req; default to the same
+        # value used for cache_protected_len in the simple page_size=1 mock.
+        self.last_matched_prefix_len = len(prefix_indices)
+
+    @property
+    def radix_key_ids(self):
+        # Text-request equivalent of radix_key_ids: the origin input ids.
+        return self.origin_input_ids
 
     def pop_committed_kv_cache(self) -> int:
         assert not self.kv_committed_freed
@@ -694,6 +706,165 @@ class TestRadixCacheWithRequests(CustomTestCase):
             disabled_cache.cache_unfinished_req(mock_req)
         except Exception as e:
             self.fail(f"cache_unfinished_req raised an exception: {e}")
+
+    def _build_paged_cache(self, page_size, pool_size):
+        req_pool = ReqToTokenPool(
+            size=4,
+            max_context_len=pool_size,
+            dtype=np.int32,
+        )
+        kv_cache = MHATokenToKVPool(
+            size=pool_size,
+            page_size=page_size,
+            dtype=self.dtype,
+            head_num=self.kv_head_num,
+            head_dim=self.head_dim,
+            layer_num=self.layer_num,
+            mesh=mesh,
+        )
+        allocator = PagedTokenToKVPoolAllocator(
+            size=pool_size,
+            page_size=page_size,
+            kvcache=kv_cache,
+        )
+        cache = RadixCache(
+            req_to_token_pool=req_pool,
+            token_to_kv_pool_allocator=allocator,
+            page_size=page_size,
+            kv_head_num=self.kv_head_num,
+            head_dim=self.head_dim,
+            layer_num=self.layer_num,
+            max_seq_len=self.max_seq_len,
+            dtype=self.dtype,
+        )
+        return req_pool, allocator, cache
+
+    def _run_chunked_tail_retract(
+        self, page_size, pool_size, cache_protected_len_value
+    ):
+        """Reproduce retraction-release of a request that finished a chunked,
+        page-tail prefill and was decoding.
+
+        Returns the cache/allocator so the caller can assert conservation.
+        ``cache_protected_len_value`` lets the caller drive both the FIXED value
+        (page-aligned tree prefix) and the BUGGY value (len(prefix_indices),
+        i.e. including the request-owned unaligned tail) to prove the test
+        actually discriminates between leak / no-leak.
+        """
+        req_pool, allocator, cache = self._build_paged_cache(page_size, pool_size)
+
+        # 1) A page-aligned prefix lives in the radix tree (2 pages).
+        tree_len = 2 * page_size
+        tree_token_ids = list(range(tree_len))
+        tree_indices = allocator.alloc(tree_len)
+        cache.insert(RadixKey(tree_token_ids, None, 0), tree_indices)
+
+        # 2) The request matched that tree prefix and locked it (protected).
+        match = cache.match_prefix(RadixKey(tree_token_ids, None, 0))
+        cache.inc_lock_ref(match.last_device_node)
+        self.assertEqual(len(match.device_indices), tree_len)
+        self.assertEqual(cache.protected_size(dp_rank=0), tree_len)
+
+        # 3) Beyond the tree prefix the request owns more KV that the tree does
+        #    NOT track: 2 more pages. After a chunked prefill, prefix_indices
+        #    carried [tree_prefix + unaligned_tail], while last_matched_prefix_len
+        #    stayed at the page-aligned tree length.
+        req_owned_len = 2 * page_size
+        req_owned_indices = allocator.alloc(req_owned_len)
+        committed_kv_len = tree_len + req_owned_len  # page-aligned exact
+
+        full_indices = np.concatenate([match.device_indices, req_owned_indices])
+        # The unaligned request-owned tail (one page) that the buggy code would
+        # have folded into prefix_indices -> cache_protected_len.
+        unaligned_tail = req_owned_indices[: page_size]
+        prefix_indices = np.concatenate([match.device_indices, unaligned_tail])
+
+        req = MockRequest(
+            req_pool_idx=0,
+            origin_input_ids=list(range(committed_kv_len)),
+            output_ids=[],
+            fill_ids=list(range(committed_kv_len)),
+            prefix_indices=prefix_indices,
+            last_node=match.last_device_node,
+            dp_rank=0,
+        )
+        # Real reqs reach this exact state: committed == allocated == full seq,
+        # last_matched_prefix_len == page-aligned tree prefix.
+        req.kv_committed_len = committed_kv_len
+        req.kv_allocated_len = committed_kv_len
+        req.last_matched_prefix_len = tree_len
+        req.cache_protected_len = cache_protected_len_value
+        req_pool.write(
+            (req.req_pool_idx, slice(0, committed_kv_len)), full_indices
+        )
+
+        # 4) Retraction-release path: release_kv_cache(is_insert=False) ->
+        #    cache_finished_req(is_insert=False) frees [old_prefix_len:aligned].
+        cache.cache_finished_req(req, is_insert=False)
+
+        return cache, allocator, tree_len
+
+    def test_chunked_tail_retract_no_leak_with_fix(self):
+        """The fix (cache_protected_len = page-aligned tree prefix) must free
+        the entire request-owned region on retract, conserving allocator size."""
+        page_size = 4
+        pool_size = 64
+        tree_len = 2 * page_size
+        # FIXED value: page-aligned tree prefix length.
+        cache, allocator, tree_len = self._run_chunked_tail_retract(
+            page_size, pool_size, cache_protected_len_value=tree_len
+        )
+
+        # Only the tree prefix remains held (protected); everything else freed.
+        self.assertEqual(
+            allocator.available_size(dp_rank=0), pool_size - tree_len
+        )
+        # The scheduler's leak invariant: available + evictable + protected == size.
+        self.assertEqual(
+            allocator.available_size(dp_rank=0)
+            + cache.evictable_size(dp_rank=0)
+            + cache.protected_size(dp_rank=0),
+            allocator.size_per_rank,
+        )
+
+    def test_chunked_tail_retract_buggy_value_leaks(self):
+        """Guard: the OLD value (len(prefix_indices), including the unaligned
+        request-owned tail) under-frees on retract and trips the leak invariant.
+        Proves this test genuinely catches the bug the fix addresses."""
+        page_size = 4
+        pool_size = 64
+        tree_len = 2 * page_size
+        # BUGGY value: tree prefix + one unaligned tail page.
+        buggy_value = tree_len + page_size
+        cache, allocator, tree_len = self._run_chunked_tail_retract(
+            page_size, pool_size, cache_protected_len_value=buggy_value
+        )
+
+        invariant = (
+            allocator.available_size(dp_rank=0)
+            + cache.evictable_size(dp_rank=0)
+            + cache.protected_size(dp_rank=0)
+        )
+        # One tail page leaks: the invariant falls short of size_per_rank.
+        self.assertEqual(invariant, allocator.size_per_rank - page_size)
+
+    def test_chunked_tail_retract_no_leak_page_size_128(self):
+        """Same fix holds at the production page_size=128 (MiMo server config)."""
+        page_size = 128
+        pool_size = 128 * 8
+        tree_len = 2 * page_size
+        cache, allocator, tree_len = self._run_chunked_tail_retract(
+            page_size, pool_size, cache_protected_len_value=tree_len
+        )
+        self.assertEqual(
+            allocator.available_size(dp_rank=0), pool_size - tree_len
+        )
+        self.assertEqual(
+            allocator.available_size(dp_rank=0)
+            + cache.evictable_size(dp_rank=0)
+            + cache.protected_size(dp_rank=0),
+            allocator.size_per_rank,
+        )
 
 
 if __name__ == "__main__":

@@ -1072,7 +1072,9 @@ class ScheduleBatch:
 
                 req.kv_committed_len = seq_len
                 req.kv_allocated_len = seq_len
-                req.cache_protected_len = pre_len
+                # Chunked prefill can carry an unaligned request-owned tail in
+                # prefix_indices; only the tree-owned matched prefix is protected.
+                req.cache_protected_len = req.last_matched_prefix_len
 
                 prefix_indices = req.prefix_indices
                 if pre_len > 0:
