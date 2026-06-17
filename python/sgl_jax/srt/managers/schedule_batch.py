@@ -625,6 +625,16 @@ class Req:
         self.latest_bid = None
         self.cache_protected_len = 0
         self.recurrent_pool_idx = None
+        # Retraction-resume MM fix: drop the host-held fused multimodal embedding so the
+        # resumed prefill re-runs encode_mm_reqs (it only rebuilds when this is None) and
+        # rebuilds it over the new [0, seq_len) window — seq grows by output_ids on resume,
+        # so the stale prompt-only embedding would be too short for _merge_multimodal's slice.
+        # Mirrors the prefill-finish cleanup in scheduler_output_processor_mixin. Keep
+        # mm_inputs (raw material needed to re-encode) and cache_input_ids (radix key).
+        self.multimodal_embedding = None
+        self.deepstack_visual_embedding = None
+        self.deepstack_visual_pos_mask = None
+        self.apply_for_deepstack = False
 
     def set_finish_with_abort(self, error_msg: str):
         # set it to one token to skip the long prefill

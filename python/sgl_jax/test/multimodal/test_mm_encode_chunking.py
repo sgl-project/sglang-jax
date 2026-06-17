@@ -147,6 +147,9 @@ class _Req:
         n_ph = sum(rows for _, rows in images)
         # input_ids: n_ph placeholder rows (== IMG_TOK) then one trailing text token.
         self.origin_input_ids = np.array([IMG_TOK] * n_ph + [1], dtype=np.int32)
+        # _encode_mm_batched encodes over origin_input_ids + output_ids (resume-after-retract
+        # coverage); on the initial prefill output_ids is empty -> unchanged behavior here.
+        self.output_ids = []
         self.mm_inputs = {"_rid": rid}  # opaque; the stub assemble keys off the bound req
         self.multimodal_embedding = None
 

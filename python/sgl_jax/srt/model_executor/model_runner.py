@@ -903,7 +903,13 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 # prompt up to a seq bucket; the extra tail rows are sliced off the fused output
                 # below (consumer sees the real length). Together this bounds the encode recompiles
                 # to (#grid buckets x #seq buckets). Off (default): raw length, validated path.
-                ids_np = np.asarray(r.origin_input_ids, dtype=np.int32)
+                # Encode over the FULL logical sequence (prompt + already-generated output) so
+                # the fused embedding covers a resumed prefill's [0, seq_len) window after a KV
+                # retraction. output_ids is [] on the initial prefill (unchanged behavior); on
+                # resume it carries the decoded tokens (text-only; mm placeholders live in prompt).
+                ids_np = np.asarray(
+                    list(r.origin_input_ids) + list(r.output_ids), dtype=np.int32
+                )
                 real_len = int(ids_np.shape[0])
                 if bucketing_on:
                     seq_bucket = _VISION_SEQ_BUCKET
@@ -1008,7 +1014,9 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
 
         for r in enc_reqs:
             a = assemble(r.mm_inputs)
-            ids = np.asarray(r.origin_input_ids, dtype=np.int32)
+            # Full logical sequence (prompt + output) for resume-after-retract coverage; see
+            # the fallback path above. output_ids=[] on first prefill (unchanged).
+            ids = np.asarray(list(r.origin_input_ids) + list(r.output_ids), dtype=np.int32)
             rows, aud = {}, None
             ip = a.get("pixel_values_images")
             if ip is not None and img_tok is not None:
