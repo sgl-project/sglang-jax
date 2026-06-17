@@ -208,6 +208,20 @@ class QueueHostKVPool(HostKVPool):
             raise ValueError(
                 f"layer has {padded_pages} pages > max_padded_pages={self._max_padded_pages}"
             )
+        expected_shape = (padded_pages, *self._per_layer_shape)
+        expected_dtype = np.dtype(self._dtype)
+        for i, layer in enumerate(layers):
+            # Validate every layer, not just layers[0]: a ragged list (e.g. a
+            # later layer shaped differently) would otherwise stage mismatched
+            # arrays and silently corrupt the pulled KV on the decode side.
+            if layer.shape != expected_shape:
+                raise ValueError(
+                    f"layer {i} shape {layer.shape} != expected {expected_shape}"
+                )
+            if np.dtype(layer.dtype) != expected_dtype:
+                raise ValueError(
+                    f"layer {i} dtype {layer.dtype} != expected {expected_dtype}"
+                )
         array_pytree: list[jax.Array] = []
         total_bytes = 0
         # Right-sized staging: device_put each per-layer array straight to the

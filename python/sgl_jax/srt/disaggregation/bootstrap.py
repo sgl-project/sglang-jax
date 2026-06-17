@@ -568,6 +568,9 @@ class PrefillInfoCache:
         self._sorted_keys: list[str] = []
         # -inf so the very first lookup always refreshes regardless of clock.
         self._last_refresh: float = float("-inf")
+        # Transient-failure bookkeeping (throttled logging).
+        self._refresh_failures = 0
+        self._last_fail_log: float = float("-inf")
 
     def _refresh_locked(self) -> None:
         prefills = self._client.list_prefills()
@@ -596,7 +599,28 @@ class PrefillInfoCache:
         with self._lock:
             now = self._clock()
             if now - self._last_refresh >= self._refresh_interval_s:
-                self._refresh_locked()
+                try:
+                    self._refresh_locked()
+                except Exception as exc:  # noqa: BLE001
+                    # A transient bootstrap-server failure (timeout / 5xx /
+                    # connection reset) must NOT propagate: the decode intake
+                    # catches any exception here as an abort, which would
+                    # violate the never-abort contract over a momentary blip.
+                    # Back off for the interval (so we neither hammer a down
+                    # server nor re-block the event loop every tick) and serve
+                    # from the existing — possibly stale — cache. An empty
+                    # cache returns None below, so the caller defers + retries.
+                    self._last_refresh = now
+                    self._refresh_failures += 1
+                    if now - self._last_fail_log >= 5.0:
+                        self._last_fail_log = now
+                        logger.warning(
+                            "PrefillInfoCache refresh failed (%d total); serving "
+                            "%d cached prefill(s): %s",
+                            self._refresh_failures,
+                            len(self._sorted_keys),
+                            exc,
+                        )
             info = self._pick_locked(bootstrap_room)
         if info is None:
             return None

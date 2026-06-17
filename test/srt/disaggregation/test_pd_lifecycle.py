@@ -334,14 +334,15 @@ class TestDecodePhases:
         ts.mark("transfer_entry")
         clk.advance(0.5)
         ts.mark("first_token")
-        clk.advance(1.0)
-        ts.mark("completion")
         phases = ts.phases()
         assert phases["bootstrap"] == pytest.approx(0.02)
         assert phases["prealloc_wait"] == pytest.approx(0.04)
         assert phases["kv_wait"] == pytest.approx(0.5)
-        assert phases["decode"] == pytest.approx(1.0)
-        assert phases["total"] == pytest.approx(1.57)
+        # Decode-side PD diagnostics terminate at first_token (where the
+        # handoff completes and normal decoding begins); total spans
+        # bootstrap_start -> first_token.
+        assert phases["total"] == pytest.approx(0.57)
+        assert "decode" not in phases
 
 
 class TestFormatting:
