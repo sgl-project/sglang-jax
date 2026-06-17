@@ -490,6 +490,13 @@ class MultimodalTokenizer(TokenizerManager):
                 videos = [self._preprocess_qwen_video(item, video_config) for item in video_data]
                 processor_kwargs["videos_kwargs"] = {"do_sample_frames": False}
                 processor_kwargs["videos_kwargs"]["fps"] = video_config.get("fps", _QWEN_FPS)
+            elif self._is_kimi_processor():
+                medias = []
+                if images:
+                    medias.extend([{"type": "image", "image": img} for img in images])
+                processor_kwargs["medias"] = medias
+                images = None
+                videos = None
             else:
                 videos = [self._load_video_from_source(item) for item in video_data]
             audios = [self._load_audio_from_source(item) for item in audio_data]
@@ -504,8 +511,26 @@ class MultimodalTokenizer(TokenizerManager):
             if "input_ids" in processor_out:
                 input_ids = processor_out["input_ids"][0].tolist()
 
-            image_grid_thw = self._to_grid_list(processor_out.get("image_grid_thw"))
+            image_grid_thw = self._to_grid_list(
+                processor_out.get("image_grid_thw") or processor_out.get("grid_thws")
+            )
             video_grid_thw = self._to_grid_list(processor_out.get("video_grid_thw"))
+
+            if self._is_kimi_processor() and image_grid_thw and input_ids is not None:
+                mm_token_id = getattr(self.mm_config, "media_placeholder_token_id", None)
+                merge_kernel_size = getattr(self.mm_config, "merge_kernel_size", 2)
+                if mm_token_id is not None:
+                    grid_iter = iter(image_grid_thw)
+                    expanded = []
+                    for tok in input_ids:
+                        if tok == mm_token_id:
+                            t, h, w = next(grid_iter)
+                            n_visual = (t * h * w) // (merge_kernel_size**2)
+                            expanded.extend([mm_token_id] * n_visual)
+                        else:
+                            expanded.append(tok)
+                    input_ids = expanded
+
             second_per_grid_ts = processor_out.get("second_per_grid_ts")
             if second_per_grid_ts is None:
                 second_per_grid_ts = processor_out.get("video_second_per_grid")
@@ -581,7 +606,8 @@ class MultimodalTokenizer(TokenizerManager):
                 "mm_items": mm_items,
                 "im_start_id": getattr(self.mm_config, "vision_start_token_id", None),
                 "im_end_id": getattr(self.mm_config, "vision_end_token_id", None),
-                "im_token_id": getattr(self.mm_config, "image_token_id", None),
+                "im_token_id": getattr(self.mm_config, "image_token_id", None)
+                or getattr(self.mm_config, "media_placeholder_token_id", None),
                 "video_token_id": getattr(self.mm_config, "video_token_id", None),
                 "audio_token_id": getattr(self.mm_config, "audio_token_id", None),
                 "mrope_positions": mrope_positions,
@@ -628,6 +654,11 @@ class MultimodalTokenizer(TokenizerManager):
             "Qwen2_5_VLProcessor",
             "Qwen3OmniMoeProcessor",
         }
+
+    def _is_kimi_processor(self) -> bool:
+        if self.mm_processor is None:
+            return False
+        return self.mm_processor.__class__.__name__ == "KimiK25Processor"
 
     def _build_qwen_video_config(self, obj: GenerateMMReqInput | GenerateOmniReqInput) -> dict:
         video_config: dict[str, Any] = {}
