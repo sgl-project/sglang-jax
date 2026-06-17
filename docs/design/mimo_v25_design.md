@@ -1,5 +1,8 @@
 # MiMo-V2.5 omni integration · final design
 
+> **⚠️ DEPRECATED — the multi-stage (staged) adaptation described below has been superseded by the in-model VLM approach.**
+> MiMo-V2.5 no longer uses the two-stage / staged runtime described in this document. It now runs **in-model** on the standard LLM control plane (the understanding plane): registered as a standard `srt` model at `python/sgl_jax/srt/models/mimo_v2_5/` (top-level shell `srt/models/mimo_v2_5_mm.py`), with encode + merge on a host encode pass and the AR `forward` reusing the standard `Scheduler` / RadixAttention / KV pool / multi-host SPMD. This file is kept for historical reference only — the "final design", "current code", code paths (`srt/multimodal/models/mimo_v2_5/`), and status statements below all describe the **deprecated staged adaptation**. For the current architecture see [`multimodal_architecture_overview.md`](./multimodal_architecture_overview.md) (Part 3 understanding-plane design; Part 4 milestone M3 = MiMo-V2.5 in-model).
+
 > This is the **final design** for integrating the MiMo-V2.5 omni model into sglang-jax, consolidated from the step1/step2/implementation-notes/review/vision working docs. It reflects the **current code** and **real-hardware test results**; process material (review rounds, incremental implementation logs, milestone narrative) has been removed.
 >
 > Status: **text / audio / image / video → text — all modalities implemented and verified end-to-end on real v6e-16 hardware.**
