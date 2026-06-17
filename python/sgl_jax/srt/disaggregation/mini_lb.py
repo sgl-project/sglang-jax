@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
-import warnings
 from http import HTTPStatus
 from itertools import chain
 
@@ -164,12 +163,17 @@ class MiniLoadBalancer:
     ):
         import aiohttp
         import orjson
+        from fastapi import HTTPException
         from fastapi.responses import StreamingResponse
 
         if self.test_external_dp_routing:
-            warnings.warn(
-                "--test-external-dp-routing is not supported with streaming",
-                stacklevel=2,
+            # The stream path does not fork per-side DP requests nor verify the
+            # returned dp_rank (unlike generate()), so honoring the flag here
+            # would silently skip the routing enforcement and check. Fail loudly
+            # instead of emitting a warning that is easy to miss in a long log.
+            raise HTTPException(
+                status_code=400,
+                detail="--test-external-dp-routing is not supported with streaming",
             )
 
         assert endpoint[0] != "/", f"Endpoint should not start with '/': {endpoint}"
