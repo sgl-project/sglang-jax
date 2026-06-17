@@ -1636,14 +1636,11 @@ def spec_decode_verify_phase(spec_worker, model_worker_batch, cur_allocate_lens)
         _sv_vocab = int(target_worker.model_config.vocab_size)
         _sv_enable_top_k = 0 < _kv < _sv_vocab
         _sv_enable_top_p = _pv < 1.0
-        target_mr._sampler_step += 1
-        _sv_rng = jax.random.fold_in(target_mr._sampler_base_rng, target_mr._sampler_step)
-        _, _sv_coin_key, _sv_coinf_key = jax.random.split(_sv_rng, 3)
         _sv_coins = _device_array_preserve_device(
-            jax.random.uniform(_sv_coin_key, (_sv_tbs, _sv_nm1), dtype=jnp.float32), _sv_rep
+            np.random.random((_sv_tbs, _sv_nm1)).astype(np.float32), _sv_rep
         )
         _sv_coinf = _device_array_preserve_device(
-            jax.random.uniform(_sv_coinf_key, (_sv_tbs,), dtype=jnp.float32), _sv_rep
+            np.random.random((_sv_tbs,)).astype(np.float32), _sv_rep
         )
         _sv_temps = _device_array_preserve_device(
             np.full((_sv_tbs, 1), _tv, np.float32), data_sharding
