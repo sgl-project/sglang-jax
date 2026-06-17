@@ -305,6 +305,59 @@ def test_stale_protocol_peer_rejected():
         cache.pick_for_room(0)
 
 
+class _FlakyClient:
+    """list_prefills raises while ``fail`` is set, else returns ``prefills``."""
+
+    def __init__(self, prefills) -> None:
+        self.prefills = list(prefills)
+        self.fail = False
+        self.list_calls = 0
+
+    def list_prefills(self):
+        self.list_calls += 1
+        if self.fail:
+            raise ConnectionError("bootstrap server unreachable")
+        return list(self.prefills)
+
+
+def test_transient_refresh_failure_serves_stale_never_raises():
+    # A momentary bootstrap-server blip must not propagate (decode intake would
+    # turn it into an abort, violating never-abort). Serve the warm cache.
+    clock = _Clock()
+    client = _FlakyClient([_pf("a")])
+    cache = PrefillInfoCache(client, refresh_interval_s=1.0, clock=clock)
+
+    assert cache.pick_for_room(0)["bootstrap_key"] == "a"  # warm
+
+    # Interval elapses, refresh now fails: must return the stale entry, not raise.
+    client.fail = True
+    clock.t += 1.0
+    assert cache.pick_for_room(0)["bootstrap_key"] == "a"
+    assert client.list_calls == 2  # the failed refresh was attempted
+
+    # Failure backs off for the interval: same instant does not re-refresh.
+    assert cache.pick_for_room(0)["bootstrap_key"] == "a"
+    assert client.list_calls == 2
+
+    # Server recovers; next interval refreshes cleanly.
+    client.fail = False
+    client.prefills = [_pf("b")]
+    clock.t += 1.0
+    assert cache.pick_for_room(0)["bootstrap_key"] == "b"
+    assert client.list_calls == 3
+
+
+def test_transient_refresh_failure_on_cold_cache_returns_none():
+    # No warm entry + refresh fails -> defer (None), never raise.
+    clock = _Clock()
+    client = _FlakyClient([])
+    client.fail = True
+    cache = PrefillInfoCache(client, refresh_interval_s=1.0, clock=clock)
+
+    assert cache.pick_for_room(0) is None
+    assert client.list_calls == 1
+
+
 # ---- from test_host_kv_pool_per_request.py ----
 
 _LAYER_NUM = 4
