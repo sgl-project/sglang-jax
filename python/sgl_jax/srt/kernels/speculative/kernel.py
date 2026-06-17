@@ -90,22 +90,40 @@ def verify_tree_greedy(
     return accept_index, accept_token_num, predicts
 
 
-# Partial-selection width for top-k / top-p renorm. Sampling almost never keeps
-# more than this many tokens, so a `jax.lax.top_k` of this width replaces a full
-# vocab-wide sort -- which dominated device time in profiling (a single
-# sort(f32[256,152576]) cost ~34ms, ~49% of the verify step). Rows that need a
-# wider support fall back to "keep everything" (see below).
-RENORM_MAX_TOPK = 1024
+# top-k / top-p renorm only need an inclusion *threshold* (keep every prob >= t),
+# not a sorted order. Finding t by sorting the whole vocab is what dominated device
+# time in profiling -- and on TPU a `jax.lax.top_k(k=1024)` lowers to the same full
+# sort(f32[256,152576]) (~29-34ms, ~48% of the verify step). The kept set is order
+# independent, so we find t by bisection on the threshold instead: mass/count above
+# t is monotone in t, so each step is a single reduction (no sort). ~25 iterations
+# already reproduce the sort-based result exactly; 30 leaves a safety margin.
+RENORM_BISECT_ITERS = 30
 
 
-def top_k_renorm_prob(probs, top_k_values, max_k: int = RENORM_MAX_TOPK):
+def _bisect_keep_threshold(probs, satisfied_fn, iters):
+    """Per-row largest threshold ``t`` for which ``satisfied_fn(t)`` still holds.
+
+    ``satisfied_fn(t)`` returns a ``(batch_size, 1)`` boolean for whether keeping
+    ``probs >= t`` still meets the target (enough mass for top-p / enough tokens for
+    top-k). Both targets are monotone decreasing in ``t``, so plain bisection on
+    ``[0, max_prob]`` converges to the cutoff using one reduction per step.
+    """
+    lo = jnp.zeros((probs.shape[0], 1), dtype=probs.dtype)
+    hi = jnp.max(probs, axis=-1, keepdims=True)
+    for _ in range(iters):
+        mid = (lo + hi) * 0.5
+        keep = satisfied_fn(mid)  # threshold still satisfies the target -> can go higher
+        lo = jnp.where(keep, mid, lo)
+        hi = jnp.where(keep, hi, mid)
+    return lo
+
+
+def top_k_renorm_prob(probs, top_k_values):
     """Renormalizing probabilities by top-k thresholding.
 
     Args:
       probs: probabilities, shape: (batch_size, num_classes).
       top_k_values: the top-k threshold for re-normalizing probabilities, shape: (batch_size, 1).
-      max_k: static upper bound on the partial selection width. Requested k values
-        above ``max_k`` (e.g. the "whole vocabulary" sentinel) keep every token.
 
     Returns:
       Renormalized probabilities, shape ``(batch_size, num_classes)``.
@@ -115,28 +133,28 @@ def top_k_renorm_prob(probs, top_k_values, max_k: int = RENORM_MAX_TOPK):
         probs.shape[0] == top_k_values.shape[0]
     ), f"probs.shape[0]: {probs.shape[0]} should equal to top_k_values.shape[0]: {top_k_values.shape}"
 
-    # Partial top-k selection instead of a full sort: the k-th largest value is the
-    # inclusion threshold, so we keep every prob >= pivot.
-    k = min(max_k, probs.shape[-1])
-    topk_vals, _ = jax.lax.top_k(probs, k)  # (batch_size, k), descending
-    top_k_values = top_k_values.reshape(-1, 1)
-    kth_idx = jnp.clip(top_k_values - 1, 0, k - 1).astype(jnp.int32)
-    pivot = jnp.take_along_axis(topk_vals, kth_idx, axis=-1)
-    # Requested k beyond the partial-selection width -> keep everything.
-    pivot = jnp.where(top_k_values > k, 0.0, pivot)
+    num_classes = probs.shape[-1]
+    k = top_k_values.reshape(-1, 1)
+
+    # Largest threshold whose kept count is still >= k (i.e. the k-th largest value).
+    def satisfied(t):
+        cnt = jnp.sum((probs >= t).astype(jnp.int32), axis=-1, keepdims=True)
+        return cnt >= k
+
+    pivot = _bisect_keep_threshold(probs, satisfied, RENORM_BISECT_ITERS)
+    # k covering the whole vocabulary (e.g. the TOP_K_ALL sentinel) keeps everything.
+    pivot = jnp.where(k >= num_classes, jnp.zeros_like(pivot), pivot)
 
     masked_probs = jnp.where(probs >= pivot, probs, 0.0)
     return masked_probs / jnp.sum(masked_probs, axis=-1, keepdims=True)
 
 
-def top_p_renorm_prob(probs, top_p_values, max_k: int = RENORM_MAX_TOPK):
+def top_p_renorm_prob(probs, top_p_values):
     """Renormalizing probabilities by top-p thresholding.
 
     Args:
       probs: probabilities, shape: (batch_size, num_classes).
       top_p_values: the top-p threshold for re-normalizing probabilities, shape: (batch_size, 1).
-      max_k: static upper bound on the partial selection width. If the top ``max_k``
-        tokens of a row do not reach top_p, that row keeps every token.
 
     Returns:
       Renormalized probabilities, shape ``(batch_size, num_classes)``.
@@ -146,18 +164,16 @@ def top_p_renorm_prob(probs, top_p_values, max_k: int = RENORM_MAX_TOPK):
         probs.shape[0] == top_p_values.shape[0]
     ), f"probs.shape[0]: {probs.shape[0]} should equal to top_k_values.shape[0]: {top_p_values.shape}"
 
-    # Partial top-k selection instead of a full sort over the whole vocab: top_p
-    # keeps only the highest-prob tokens, which almost always fall inside the top
-    # max_k. cutoff_idx is the first position whose cumulative prob reaches top_p,
-    # and the prob there is the inclusion threshold (keep every prob >= pivot).
-    k = min(max_k, probs.shape[-1])
-    topk_vals, _ = jax.lax.top_k(probs, k)  # (batch_size, k), descending
-    cumsum_probs = jnp.cumsum(topk_vals, axis=-1)
-    reaches = cumsum_probs >= top_p_values.reshape(-1, 1)
-    cutoff_idx = jnp.argmax(reaches, axis=-1)
-    pivot = jnp.take_along_axis(topk_vals, cutoff_idx[:, None], axis=-1)
-    # Top max_k did not reach top_p (e.g. flat distribution or top_p == 1) -> keep all.
-    pivot = jnp.where(jnp.any(reaches, axis=-1, keepdims=True), pivot, 0.0)
+    p = top_p_values.reshape(-1, 1).astype(probs.dtype)
+
+    # Largest threshold whose kept probability mass is still >= top_p.
+    def satisfied(t):
+        mass = jnp.sum(jnp.where(probs >= t, probs, 0.0), axis=-1, keepdims=True)
+        return mass >= p
+
+    pivot = _bisect_keep_threshold(probs, satisfied, RENORM_BISECT_ITERS)
+    # top_p >= 1 keeps everything (guards against the softmax sum drifting past 1.0).
+    pivot = jnp.where(p >= 1.0, jnp.zeros_like(pivot), pivot)
 
     masked_probs = jnp.where(probs >= pivot, probs, 0.0)
     return masked_probs / jnp.sum(masked_probs, axis=-1, keepdims=True)
