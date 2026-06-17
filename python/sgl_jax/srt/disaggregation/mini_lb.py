@@ -20,17 +20,13 @@ class MiniLoadBalancer:
         self.port = router_args.port
         self.timeout = router_args.request_timeout_secs
         self.prefill_urls = [url[0] for url in router_args.prefill_urls]
-        self.prefill_bootstrap_ports = [
-            url[1] for url in router_args.prefill_urls
-        ]
+        self.prefill_bootstrap_ports = [url[1] for url in router_args.prefill_urls]
         self.decode_urls = router_args.decode_urls
         self.test_external_dp_routing = router_args.test_external_dp_routing
         self.prefill_bootstrap_host = router_args.prefill_bootstrap_host
         self.prefill_dp_size = None
         self.decode_dp_size = None
-        self.max_concurrent_requests = getattr(
-            router_args, "max_concurrent_requests", None
-        )
+        self.max_concurrent_requests = getattr(router_args, "max_concurrent_requests", None)
 
     def _validate_router_args(self, router_args) -> None:
         if getattr(router_args, "policy", "random") != "random":
@@ -40,9 +36,7 @@ class MiniLoadBalancer:
         if not getattr(router_args, "pd_disaggregation", False):
             raise ValueError("MiniLB only supports PD disaggregation mode")
         if len(router_args.prefill_urls) == 0 or len(router_args.decode_urls) == 0:
-            raise ValueError(
-                "MiniLB requires at least one prefill and one decode server"
-            )
+            raise ValueError("MiniLB requires at least one prefill and one decode server")
 
     def start(self) -> None:
         import uvicorn
@@ -185,12 +179,8 @@ class MiniLoadBalancer:
                 timeout=aiohttp.ClientTimeout(total=self.timeout)
             ) as session:
                 tasks = [
-                    session.post(
-                        f"{prefill_server}/{endpoint}", json=modified_request
-                    ),
-                    session.post(
-                        f"{decode_server}/{endpoint}", json=modified_request
-                    ),
+                    session.post(f"{prefill_server}/{endpoint}", json=modified_request),
+                    session.post(f"{decode_server}/{endpoint}", json=modified_request),
                 ]
                 prefill_response, decode_response = await asyncio.gather(*tasks)
 
@@ -199,9 +189,7 @@ class MiniLoadBalancer:
                     async for chunk in prefill_response.content:
                         prefill_chunks.append(chunk)
 
-                    first_prefill_chunk = (
-                        prefill_chunks[0].decode("utf-8")[5:].strip("\n")
-                    )
+                    first_prefill_chunk = prefill_chunks[0].decode("utf-8")[5:].strip("\n")
                     first_prefill_chunk_json = orjson.loads(first_prefill_chunk)
 
                     async for chunk in decode_response.content:
@@ -211,13 +199,9 @@ class MiniLoadBalancer:
                             and decoded_chunk.startswith("data:")
                             and "[DONE]" not in decoded_chunk
                         ):
-                            ret_json = orjson.loads(
-                                decoded_chunk[5:].strip("\n")
-                            )
+                            ret_json = orjson.loads(decoded_chunk[5:].strip("\n"))
                             ret_json["meta_info"]["input_token_logprobs"] = (
-                                first_prefill_chunk_json["meta_info"][
-                                    "input_token_logprobs"
-                                ]
+                                first_prefill_chunk_json["meta_info"]["input_token_logprobs"]
                                 + ret_json["meta_info"]["input_token_logprobs"]
                             )
                             yield b"data: " + orjson.dumps(ret_json) + b"\n\n"
@@ -239,9 +223,7 @@ try:
     from fastapi import FastAPI, HTTPException
     from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 
-    from sgl_jax.srt.disaggregation.mini_lb_helpers import (
-        inject_bootstrap_fields,
-    )
+    from sgl_jax.srt.disaggregation.mini_lb_helpers import inject_bootstrap_fields
 
     app = FastAPI()
     lb: MiniLoadBalancer | None = None
@@ -325,9 +307,11 @@ try:
                     all_internal_states.extend(info_json["internal_states"])
 
         return {
-            "internal_states": all_internal_states
-            if all_internal_states
-            else [{"last_gen_throughput": 0.0, "avg_spec_accept_length": None}],
+            "internal_states": (
+                all_internal_states
+                if all_internal_states
+                else [{"last_gen_throughput": 0.0, "avg_spec_accept_length": None}]
+            ),
             "prefill": prefill_infos,
             "decode": decode_infos,
         }

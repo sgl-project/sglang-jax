@@ -17,17 +17,11 @@ class CustomHelpFormatter(
 
 
 def launch_router(args: argparse.Namespace | RouterArgs) -> None:
-    router_args = (
-        args if isinstance(args, RouterArgs) else RouterArgs.from_cli_args(args)
-    )
+    router_args = args if isinstance(args, RouterArgs) else RouterArgs.from_cli_args(args)
     if not router_args.mini_lb:
-        raise RuntimeError(
-            "Only --mini-lb is supported in sgl-jax Stage 3 router"
-        )
+        raise RuntimeError("Only --mini-lb is supported in sgl-jax Stage 3 router")
     if not router_args.pd_disaggregation:
-        raise RuntimeError(
-            "sgl-jax Stage 3 router requires --pd-disaggregation"
-        )
+        raise RuntimeError("sgl-jax Stage 3 router requires --pd-disaggregation")
     MiniLoadBalancer(router_args).start()
 
 

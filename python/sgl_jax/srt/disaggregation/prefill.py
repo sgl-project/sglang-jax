@@ -60,9 +60,7 @@ def _jit_gather_all_layers(buffers, page_indices, out_sharding):
     ~1.2 GB footprint. The 36 kernel launches add ~1.8ms total overhead
     (negligible vs transfer + E2E latency).
     """
-    return [
-        _jit_gather_one_layer(buf, page_indices, out_sharding) for buf in buffers
-    ]
+    return [_jit_gather_one_layer(buf, page_indices, out_sharding) for buf in buffers]
 
 
 def _global_to_local_shard(arr: jax.Array) -> jax.Array:
@@ -254,10 +252,7 @@ class SchedulerDisaggregationPrefillMixin:
                     metric_reason="kv_extraction",
                 )
                 continue
-            if (
-                self.disagg_use_d2h_staging
-                and getattr(req, "disagg_host_buffer_id", None) is None
-            ):
+            if self.disagg_use_d2h_staging and getattr(req, "disagg_host_buffer_id", None) is None:
                 # Admission normally reserves the host slot in
                 # get_new_batch_prefill, but chunked-continuation and
                 # retract-readmit paths can reach handoff without one. Reserve
@@ -508,9 +503,7 @@ class SchedulerDisaggregationPrefillMixin:
             maybe_log_time_stats(
                 req.pd_time_stats,
                 req_id=req.rid,
-                enabled=getattr(
-                    self.server_args, "enable_request_time_stats_logging", False
-                ),
+                enabled=getattr(self.server_args, "enable_request_time_stats_logging", False),
             )
             sender.clear()
             if not already_released:

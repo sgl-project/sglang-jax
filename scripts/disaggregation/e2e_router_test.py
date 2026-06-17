@@ -18,9 +18,7 @@ import argparse
 import json
 import sys
 import time
-import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 
@@ -81,7 +79,9 @@ def test_r2_server_info(router_url: str) -> TestResult:
         info = _get_json(f"{router_url}/get_server_info")
         if "prefill" not in info or "decode" not in info:
             return TestResult("R2-server-info", False, f"missing keys: {list(info.keys())}")
-        return TestResult("R2-server-info", True, f"prefill={len(info['prefill'])}, decode={len(info['decode'])}")
+        return TestResult(
+            "R2-server-info", True, f"prefill={len(info['prefill'])}, decode={len(info['decode'])}"
+        )
     except Exception as e:
         return TestResult("R2-server-info", False, str(e))
 
@@ -142,7 +142,9 @@ def test_r4_generate_concurrent(router_url: str) -> TestResult:
                     errors.append(str(e))
 
         if errors:
-            return TestResult("R4-concurrent", False, f"{len(errors)} failures: {'; '.join(errors)}")
+            return TestResult(
+                "R4-concurrent", False, f"{len(errors)} failures: {'; '.join(errors)}"
+            )
         detail = "; ".join(f"req{i}={t!r}" for i, t in sorted(results))
         return TestResult("R4-concurrent", True, detail)
     except Exception as e:
@@ -251,7 +253,9 @@ def test_r9_bootstrap_injection(router_url: str, bootstrap_url: str | None) -> T
         )
         text = resp.get("text", "")
         if text:
-            return TestResult("R9-bootstrap-inject", True, f"request succeeded through bootstrap path")
+            return TestResult(
+                "R9-bootstrap-inject", True, "request succeeded through bootstrap path"
+            )
         return TestResult("R9-bootstrap-inject", False, "empty response")
     except Exception as e:
         return TestResult("R9-bootstrap-inject", False, str(e))

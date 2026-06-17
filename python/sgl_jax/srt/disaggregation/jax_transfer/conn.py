@@ -575,9 +575,7 @@ class JaxTransferKVReceiver(KVReceiver, StateHolder):
             if self._results is None:
                 return state
             if not all(
-                leaf.is_ready()
-                for r in self._results.values()
-                for leaf in jax.tree.leaves(r)
+                leaf.is_ready() for r in self._results.values() for leaf in jax.tree.leaves(r)
             ):
                 return state
             assert self._metadata is not None
