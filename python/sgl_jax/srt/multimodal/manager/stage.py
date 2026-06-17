@@ -21,6 +21,7 @@ from sgl_jax.srt.multimodal.manager.scheduler.diffusion_scheduler import (
 )
 from sgl_jax.srt.multimodal.manager.scheduler.encoder_scheduler import EncoderScheduler
 from sgl_jax.srt.multimodal.manager.scheduler.vae_scheduler import VaeScheduler
+from sgl_jax.srt.multimodal.manager.scheduler.vit_scheduler import VitScheduler
 from sgl_jax.srt.multimodal.models.dits.flux import FluxTransformer2DModel
 from sgl_jax.srt.multimodal.models.encoders.clip import CLIPTextModel
 from sgl_jax.srt.multimodal.models.encoders.t5 import T5EncoderModel
@@ -29,6 +30,10 @@ from sgl_jax.srt.multimodal.models.mimo_audio.mimo_audio_backbone import (
 )
 from sgl_jax.srt.multimodal.models.mimo_audio.mimo_audio_tokenizer import (
     MiMoAudioTokenizer,
+)
+from sgl_jax.srt.multimodal.models.qwen2_5VL.qwen2_5_vit import Qwen2_5_VL_VisionModel
+from sgl_jax.srt.multimodal.models.qwen2_5VL.qwen2_5_vl_generation import (
+    Qwen2_5_VL_Generation,
 )
 from sgl_jax.srt.multimodal.models.vaes.autoencoder import AutoencoderKL
 from sgl_jax.srt.multimodal.models.wan.diffusion.wan_dit import (
@@ -235,6 +240,8 @@ def get_scheduler_class(name: str):
     elif name == "vae":
         # TODO add eventloop for VAE scheduler
         return VaeScheduler
+    elif name == "vit":
+        return VitScheduler
     elif name in ["audio_encoder", "audio_decoder"]:
         return AudioScheduler
     elif name == "audio_backbone":
@@ -252,6 +259,8 @@ def get_model_class(name: str) -> type | list[type]:
         "WanTransformer3DModel": WanTransformer3DModel,
         "WanDualTransformer3DModel": WanDualTransformer3DModel,
         "Qwen2ForCausalLM": Qwen2ForCausalLM,
+        "Qwen2_5_VL_VisionModel": Qwen2_5_VL_VisionModel,
+        "Qwen2_5_VL_Generation": Qwen2_5_VL_Generation,
         "MiMoAudioTokenizer": MiMoAudioTokenizer,
         "MiMoAudioForCausalLM": MiMoAudioForCausalLM,
         "CLIPTextModel": CLIPTextModel,

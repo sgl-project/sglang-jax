@@ -38,18 +38,27 @@ class StageConfigRegistry:
         "XiaomiMiMo/MiMo-Audio-7B-Instruct": "mimo_audio_stage_config.yaml",
         "XiaomiMiMo/MiMo-Audio-7B-Base": "mimo_audio_stage_config.yaml",
         "black-forest-labs/FLUX.1-dev": "flux1_dev_stage_config.yaml",
+        # Qwen2.5-VL series (staged understanding: vit -> auto_regressive)
+        "Qwen/Qwen2.5-VL-7B-Instruct": "qwen2_5_vl_stage_config.yaml",
+        "Qwen2.5-VL-7B-Instruct": "qwen2_5_vl_stage_config.yaml",
+        "Qwen/Qwen2.5-VL-32B-Instruct": "qwen2_5_vl_stage_config_tp4.yaml",
+        "Qwen2.5-VL-32B-Instruct": "qwen2_5_vl_stage_config_tp4.yaml",
+        "Qwen/Qwen2.5-VL-72B-Instruct": "qwen2_5_vl_stage_config_tp4.yaml",
+        "Qwen2.5-VL-72B-Instruct": "qwen2_5_vl_stage_config_tp4.yaml",
     }
 
     # Keyword patterns for fallback matching (order matters - more specific first).
-    # M6: understanding models (Qwen2.5-VL / Qwen3-Omni / MiMo-V2.5) run in-model, not staged --
-    # only generation models (Wan / FLUX / MiMo-Audio) have stage configs now, so "matches the
-    # StageConfigRegistry" == "generation plane".
+    # epic/support_mimo_v2.5_vlm: only MiMo-V2.5 runs in-model; Qwen2.5-VL and Qwen3-Omni are
+    # reverted to the staged understanding path, so they DO have stage configs here (matching the
+    # StageConfigRegistry => staged runtime, launched with --multimodal). Generation models
+    # (Wan / FLUX / MiMo-Audio) are staged as before.
     _KEYWORD_PATTERNS: list[tuple[str, str]] = [
         ("Wan2.2", "wan2_2_stage_config.yaml"),
         ("Wan2.1", "wan2_1_stage_config.yaml"),
         ("MiMo-Audio-7B-Instruct", "mimo_audio_stage_config.yaml"),
         ("MiMo-Audio-7B-Base", "mimo_audio_stage_config.yaml"),
         ("FLUX.1-dev", "flux1_dev_stage_config.yaml"),
+        ("Qwen2.5-VL", "qwen2_5_vl_stage_config.yaml"),
     ]
 
     @classmethod
