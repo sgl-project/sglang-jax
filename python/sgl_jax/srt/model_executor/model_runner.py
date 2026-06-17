@@ -321,6 +321,18 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         if self.server_args.ep_dispatch_algorithm:
             with jax.set_mesh(self.mesh):
                 init_expert_location_metadata(self.server_args, self.model_config)
+            from sgl_jax.srt.eplb.expert_location import get_global_expert_location_metadata
+
+            md = get_global_expert_location_metadata()
+            if md is not None:
+                rep = jax.NamedSharding(self.mesh, jax.P())
+                for attr in (
+                    "logical_to_rank_dispatch_physical_map",
+                    "logical_to_all_physical_map",
+                    "logical_to_all_physical_map_num_valid",
+                    "physical_to_logical_map",
+                ):
+                    setattr(md, attr, jax.device_put(getattr(md, attr), rep))
 
         self.model = self.model_loader.load_model(
             model_config=self.model_config,
