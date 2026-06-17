@@ -46,6 +46,7 @@ def alloc_paged_token_slots_extend(
     extend_num_tokens: int,
     backup_state: bool = False,
     dp_rank: int = 0,
+    raise_on_oom: bool = True,
 ):
     allocator = tree_cache.token_to_kv_pool_allocator
     num_tokens = extend_num_tokens + len(seq_lens) * allocator.page_size
@@ -62,7 +63,14 @@ def alloc_paged_token_slots_extend(
             f"{available_and_evictable_str(tree_cache=tree_cache, dp_rank=dp_rank)}"
         )
         logger.error(error_msg)
-        raise RuntimeError(error_msg)
+        # Caller-controlled fallback: when raise_on_oom is False the caller takes
+        # responsibility for handling the shortfall gracefully (e.g. aborting the
+        # offending request) instead of crashing the scheduler. The leaked None is
+        # the signal. Default stays True to preserve the historical fail-loud
+        # behavior for callers that have no recovery path.
+        if raise_on_oom:
+            raise RuntimeError(error_msg)
+        return (None, state) if backup_state else None
     if backup_state:
         return out_cache_loc, state
     else:

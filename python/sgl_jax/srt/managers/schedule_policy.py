@@ -443,8 +443,18 @@ class PrefillAdder:
     ):
         extend_input_len = self.ceil_paged_tokens(extend_input_len)
 
-        self.rem_total_token_offset[dp_rank] += extend_input_len + max_new_tokens
-        self.cur_rem_token_offset[dp_rank] += extend_input_len
+        # alloc_paged_token_slots_extend reserves an extra page_size per request
+        # per allocation (num_tokens = extend_num_tokens + len(seq_lens)*page_size),
+        # since a request's extend tail can straddle a page boundary. Reserve the
+        # same page-overhead here so admission never over-commits relative to the
+        # actual paged allocation. Without this, under sustained retraction (pool
+        # near-full, re-prefilling resumed reqs) alloc_extend returns None and the
+        # uncaught "Prefill out of memory" RuntimeError kills the scheduler.
+        # Mirrors upstream sglang PrefillAdder._update_prefill_budget. page_size==1
+        # has no page-straddle overhead, so reserve nothing there.
+        page_overhead = self.page_size if self.page_size > 1 else 0
+        self.rem_total_token_offset[dp_rank] += extend_input_len + max_new_tokens + page_overhead
+        self.cur_rem_token_offset[dp_rank] += extend_input_len + page_overhead
         self.rem_input_tokens -= extend_input_len
         if self.rem_chunk_tokens_list is not None:
             self.rem_chunk_tokens_list[dp_rank] -= extend_input_len
@@ -564,8 +574,16 @@ class PrefillAdder:
             return self.add_one_req_ignore_eos(req)
 
         dp_rank = req.dp_rank if req.dp_rank is not None else 0
-        total_tokens = req.extend_input_len + min(
-            req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS_ESTIMATION
+        # Reserve one page_size of page-alignment overhead per request, matching
+        # the deduction in _update_prefill_budget and the per-request reservation
+        # in alloc_paged_token_slots_extend. Without it, admission is more
+        # optimistic than the actual paged allocation and over-admits when the
+        # pool is near-full (the retraction Prefill-OOM crash). Mirrors upstream.
+        page_overhead = self.page_size if self.page_size > 1 else 0
+        total_tokens = (
+            req.extend_input_len
+            + min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS_ESTIMATION)
+            + page_overhead
         )
 
         # adjusting the input_tokens based on host_hit_length and page_size

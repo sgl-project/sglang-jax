@@ -13,6 +13,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass
+from http import HTTPStatus
 from types import SimpleNamespace
 
 import jax
@@ -66,7 +67,9 @@ from sgl_jax.srt.managers.scheduler_profiler_mixing import SchedulerProfilerMixi
 from sgl_jax.srt.managers.tp_worker import ModelWorker
 from sgl_jax.srt.managers.tp_worker_overlap_thread import ModelWorkerClient
 from sgl_jax.srt.managers.utils import validate_input_length
+from sgl_jax.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 from sgl_jax.srt.mem_cache.chunk_cache import ChunkCache
+from sgl_jax.srt.mem_cache.common import evict_from_tree_cache
 from sgl_jax.srt.mem_cache.kv_cache_builder import build_kv_cache
 from sgl_jax.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
@@ -75,6 +78,7 @@ from sgl_jax.srt.server_args import PortArgs, ServerArgs
 from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 from sgl_jax.srt.utils.common_utils import (
+    cdiv,
     configure_logger,
     get_bool_env_var,
     get_zmq_socket,
@@ -1621,6 +1625,110 @@ class Scheduler(
 
         return ret
 
+    def _abort_unfittable_prefills(self, adder) -> None:
+        """Abort admitted prefills that won't fit the actual paged allocation.
+
+        The PrefillAdder's conservative-admission budget (page_overhead +
+        new_token_ratio headroom reserved for the running decode batch) almost
+        always keeps prefill within the real allocator capacity. But under
+        sustained retraction the pool can be near-full and a multi-request
+        prefill batch can still exceed what alloc_paged_token_slots_extend can
+        allocate (it needs ceil_paged(extend) + one page per request). Rather
+        than let that allocation raise an uncaught RuntimeError that crashes the
+        whole scheduler (SIGQUIT), abort the largest offending request(s) here.
+
+        A just-admitted, not-yet-prefilled request holds only a radix lock_ref
+        (taken in PrefillAdder.add_one_req) and a slot in adder.can_run_list — no
+        KV slots and no req_to_token_pool slot yet — so releasing it is just a
+        dec_lock_ref + dropping it from the lists. Continuing/new chunked reqs
+        are already truncated to fit and are never aborted here.
+
+        Deterministic across hosts: identical request stream + identical
+        allocator state on every replica means every host aborts the same reqs,
+        keeping SPMD control flow in lockstep.
+        """
+        page_size = self.page_size
+        allocator = self.token_to_kv_pool_allocator
+        is_hybrid = isinstance(allocator, SWATokenToKVPoolAllocator)
+        aborted = []
+
+        for dp_rank in range(self.dp_size):
+            run_list = adder.can_run_list.get(dp_rank, [])
+            if not run_list:
+                continue
+
+            def fits(reqs) -> bool:
+                if not reqs:
+                    return True
+                extend_tokens = sum(
+                    cdiv(r.extend_input_len, page_size) * page_size for r in reqs
+                )
+                num_tokens = extend_tokens + len(reqs) * page_size
+                # evict_from_tree_cache mutates the tree to free space; this is
+                # exactly what alloc_paged_token_slots_extend does before alloc,
+                # so the available_size below reflects the real post-evict state.
+                evict_from_tree_cache(self.tree_cache, num_tokens, dp_rank=dp_rank)
+                if is_hybrid:
+                    return allocator.full_available_size(dp_rank=dp_rank) >= num_tokens
+                return allocator.available_size(dp_rank=dp_rank) >= num_tokens
+
+            if fits(run_list):
+                continue
+
+            # Aborting chunked reqs mid-stream would corrupt their state and the
+            # scheduler.chunked_reqs bookkeeping; they are already truncated to
+            # fit, so only plain reqs are abort candidates.
+            chunked_set = {
+                id(r) for r in self.chunked_reqs if r is not None
+            } | {id(r) for r in adder.new_chunked_reqs if r is not None}
+
+            # Largest first: removing the biggest req frees the most and aborts
+            # the fewest requests. Iterate a fixed snapshot (sorted by size) and
+            # test membership, since run_list is mutated by remove() below.
+            candidates = sorted(
+                run_list, key=lambda r: r.extend_input_len, reverse=True
+            )
+            for req in candidates:
+                if fits(run_list):
+                    break
+                if id(req) in chunked_set or req not in run_list:
+                    continue
+                run_list.remove(req)
+                # Release the radix lock the adder took at admission.
+                try:
+                    self.tree_cache.dec_lock_ref(req.last_node, req.swa_uuid_for_lock)
+                except TypeError:
+                    self.tree_cache.dec_lock_ref(req.last_node)
+                req.to_finish = FINISH_ABORT(
+                    "Prefill out of memory: aborted because the request could not "
+                    "fit even after evicting the cache and admitting fewer prefills. "
+                    "Try lowering --max-running-requests or raising --mem-fraction-static.",
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    "ServiceUnavailable",
+                )
+                aborted.append(req)
+                logger.warning(
+                    "Prefill OOM: aborted request %s (extend_input_len=%d) in DP rank %d "
+                    "to keep the scheduler alive.",
+                    req.rid,
+                    req.extend_input_len,
+                    dp_rank,
+                )
+
+        if not aborted:
+            return
+
+        # Drop aborted reqs from the waiting queue so they are not retried, and
+        # send abort responses so clients get an error instead of a hang.
+        aborted_ids = {id(r) for r in aborted}
+        self.waiting_queue = [r for r in self.waiting_queue if id(r) not in aborted_ids]
+        for req in aborted:
+            abort_out = AbortReq(rid=req.rid)
+            if self._comm_backend is not None:
+                self._comm_backend.send_pyobj(abort_out)
+            else:
+                self.send_to_tokenizer.send_pyobj(abort_out)
+
     def get_new_batch_prefill(self) -> ScheduleBatch | None:
         if self.grammar_queue:
             self.move_ready_grammar_requests()
@@ -1719,6 +1827,15 @@ class Scheduler(
                 else:
                     # OTHER: Global budget exhausted, stop entirely
                     break
+
+        # Safety net: even with the conservative-admission budget (page_overhead
+        # + new_token_ratio), a multi-request prefill can occasionally exceed the
+        # actual paged allocation when the pool is near-full after sustained
+        # retraction. Abort the offending requests here so prepare_for_extend ->
+        # alloc_paged_token_slots_extend never raises an uncaught RuntimeError
+        # that kills the scheduler. Deterministic across hosts (identical batch +
+        # allocator state), so SPMD control flow stays in lockstep.
+        self._abort_unfittable_prefills(adder)
 
         # Update waiting queue
         # Flatten can_run_list for operations that need all requests
