@@ -136,9 +136,15 @@ def _load_audio(source, sampling_rate):
 
 
 class Qwen2_5_VLProcessor(BaseMultimodalProcessor):
-    """Image (+video) understanding processor for Qwen2.5-VL (text-out)."""
+    """Image (+video) understanding processor for Qwen2.5-VL (text-out).
 
-    models = ["Qwen2_5_VLForConditionalGeneration"]
+    NOTE: not registered for an in-model arch on this branch -- Qwen2.5-VL runs on the staged path
+    (its processor is the plain HF AutoProcessor loaded by MultimodalTokenizer). This class is kept
+    only as the shared base for the in-model MiMo-V2.5 processor (MiMoV2_5Processor subclasses it).
+    Hence ``models = []``: the registry scan finds the class but registers nothing for it.
+    """
+
+    models: list[str] = []
     # Whether the model consumes mRoPE positions. Qwen2.5-VL/Qwen3-Omni do; subclasses whose AR
     # reads raw forward_batch.positions instead (e.g. MiMo-V2.5) set this False so process() skips
     # the mrope computation entirely rather than computing it and throwing it away.

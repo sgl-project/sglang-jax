@@ -327,12 +327,10 @@ suites = {
         TestFile("python/sgl_jax/test/multimodal/test_is_multimodal_model.py", 0.2),
         TestFile("python/sgl_jax/test/multimodal/test_vision_config_alignment.py", 0.2),
         TestFile("python/sgl_jax/test/multimodal/test_processor_registry.py", 0.1),
-        TestFile("python/sgl_jax/test/multimodal/test_qwen_vl_processor_registry.py", 0.1),
         TestFile("python/sgl_jax/test/multimodal/test_mimo_v25_audio_codec_processor.py", 0.1),
         TestFile("python/sgl_jax/test/multimodal/test_mimo_v25_audio_codec_v1.py", 0.1),
         TestFile("python/sgl_jax/test/multimodal/test_mimo_v25_inmodel_processor.py", 0.2),
         TestFile("python/sgl_jax/test/multimodal/test_mimo_v25_vision_attention.py", 0.2),
-        TestFile("python/sgl_jax/test/multimodal/test_inmodel_qwen25vl.py", 0.2),
     ],
     "unit-test-tpu-v6e-4": [
         TestFile("python/sgl_jax/test/test_mesh.py", 0.4),

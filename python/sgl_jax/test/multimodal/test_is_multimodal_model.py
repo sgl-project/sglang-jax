@@ -75,11 +75,12 @@ class TestIsMultimodalModelCapabilityFirst(unittest.TestCase):
 
 
 class TestSupportedModalitiesDeclarations(unittest.TestCase):
-    """The 3 in-model VLMs declare explicit supported_modalities (review §11.6 hardening)."""
+    """The in-model VLM declares explicit supported_modalities (review §11.6 hardening).
+
+    Only MiMo-V2.5 runs in-model on this branch; Qwen2.5-VL / Qwen3-Omni are staged (multi-stage)
+    and so are not registered in the in-model ModelRegistry here."""
 
     EXPECTED = {
-        "Qwen2_5_VLForConditionalGeneration": {"image", "video"},
-        "Qwen3OmniMoeForConditionalGeneration": {"image", "video", "audio"},
         "MiMoV2_5ForConditionalGeneration": {"image", "video", "audio"},
     }
 

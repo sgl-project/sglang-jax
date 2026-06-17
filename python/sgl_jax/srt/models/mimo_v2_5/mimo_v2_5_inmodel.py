@@ -1,11 +1,12 @@
 """In-model MiMo-V2.5 (vision + RVQ-codes audio understanding, text-out) — refactor M4.
 
-Mirrors the in-model template (qwen3_omni_inmodel.py / qwen2_5_vl.py): the towers are encoded via
+Follows the in-model VLM template: the towers are encoded via
 embed_mm() + mm_core.merge() on the standard srt control plane -- no staged GlobalScheduler / embed
 stage. Under C-1 (design §5.2) the encode runs ONCE per req on the host (model_runner.encode_mm_reqs)
 and the result is sliced per chunk; there is no in-forward encode.
 
-MiMo-V2.5 vs the Qwen3-Omni template:
+MiMo-V2.5 is the only in-model VLM on this branch (Qwen2.5-VL / Qwen3-Omni run staged); compared to
+the omni-style in-model template:
   - NO deepstack (the MiMoVL ViT has a self-contained merger) -> embed_mm returns (fused, None, None).
   - AUDIO = RVQ DISCRETE codes (audio_kind="codes"), not continuous mel: encode_audio consumes an
     int `audio_codes` array via the RVQ codebook tower (per-channel Embed lookup + group transformer
