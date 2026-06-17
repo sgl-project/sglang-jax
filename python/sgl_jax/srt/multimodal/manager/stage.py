@@ -19,6 +19,7 @@ from sgl_jax.srt.multimodal.manager.scheduler.audio_scheduler import AudioSchedu
 from sgl_jax.srt.multimodal.manager.scheduler.diffusion_scheduler import (
     DiffusionScheduler,
 )
+from sgl_jax.srt.multimodal.manager.scheduler.embed_scheduler import EmbedScheduler
 from sgl_jax.srt.multimodal.manager.scheduler.encoder_scheduler import EncoderScheduler
 from sgl_jax.srt.multimodal.manager.scheduler.vae_scheduler import VaeScheduler
 from sgl_jax.srt.multimodal.manager.scheduler.vit_scheduler import VitScheduler
@@ -34,6 +35,12 @@ from sgl_jax.srt.multimodal.models.mimo_audio.mimo_audio_tokenizer import (
 from sgl_jax.srt.multimodal.models.qwen2_5VL.qwen2_5_vit import Qwen2_5_VL_VisionModel
 from sgl_jax.srt.multimodal.models.qwen2_5VL.qwen2_5_vl_generation import (
     Qwen2_5_VL_Generation,
+)
+from sgl_jax.srt.multimodal.models.qwen3_omni_moe.qwen3_omni_thinker import (
+    Qwen3OmniMoeThinkerTextForConditionalGeneration,
+)
+from sgl_jax.srt.multimodal.models.qwen3_omni_moe.qwen3_omni_thinker_embedding import (
+    Qwen3OmniMoeThinkerEmbedding,
 )
 from sgl_jax.srt.multimodal.models.vaes.autoencoder import AutoencoderKL
 from sgl_jax.srt.multimodal.models.wan.diffusion.wan_dit import (
@@ -242,6 +249,8 @@ def get_scheduler_class(name: str):
         return VaeScheduler
     elif name == "vit":
         return VitScheduler
+    elif name == "embedding":
+        return EmbedScheduler
     elif name in ["audio_encoder", "audio_decoder"]:
         return AudioScheduler
     elif name == "audio_backbone":
@@ -261,6 +270,10 @@ def get_model_class(name: str) -> type | list[type]:
         "Qwen2ForCausalLM": Qwen2ForCausalLM,
         "Qwen2_5_VL_VisionModel": Qwen2_5_VL_VisionModel,
         "Qwen2_5_VL_Generation": Qwen2_5_VL_Generation,
+        "Qwen3OmniMoeThinkerEmbedding": Qwen3OmniMoeThinkerEmbedding,
+        "Qwen3OmniMoeThinkerTextForConditionalGeneration": (
+            Qwen3OmniMoeThinkerTextForConditionalGeneration
+        ),
         "MiMoAudioTokenizer": MiMoAudioTokenizer,
         "MiMoAudioForCausalLM": MiMoAudioForCausalLM,
         "CLIPTextModel": CLIPTextModel,

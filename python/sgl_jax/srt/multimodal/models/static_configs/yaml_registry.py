@@ -45,6 +45,8 @@ class StageConfigRegistry:
         "Qwen2.5-VL-32B-Instruct": "qwen2_5_vl_stage_config_tp4.yaml",
         "Qwen/Qwen2.5-VL-72B-Instruct": "qwen2_5_vl_stage_config_tp4.yaml",
         "Qwen2.5-VL-72B-Instruct": "qwen2_5_vl_stage_config_tp4.yaml",
+        # Qwen3-Omni series (staged understanding: embedding -> auto_regressive)
+        "Qwen/Qwen3-Omni-30B-A3B-Instruct": "qwen3_omni_stage_config.yaml",
     }
 
     # Keyword patterns for fallback matching (order matters - more specific first).
@@ -59,6 +61,7 @@ class StageConfigRegistry:
         ("MiMo-Audio-7B-Base", "mimo_audio_stage_config.yaml"),
         ("FLUX.1-dev", "flux1_dev_stage_config.yaml"),
         ("Qwen2.5-VL", "qwen2_5_vl_stage_config.yaml"),
+        ("Qwen3-Omni", "qwen3_omni_stage_config.yaml"),
     ]
 
     @classmethod
