@@ -291,8 +291,8 @@ def build_app(
     # PROMETHEUS_MULTIPROC_DIR, so it exposes its own default-registry
     # /metrics (single-process) carrying pd_bootstrap_registry_size.
     with suppress(ImportError):
-        from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
         from fastapi.responses import Response
+        from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
         @app.get("/metrics")
         def metrics() -> Response:

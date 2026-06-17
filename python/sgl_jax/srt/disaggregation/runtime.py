@@ -101,9 +101,7 @@ def install_disaggregation_wiring(scheduler: Scheduler, server_args: ServerArgs)
             d2h_max_tokens = scheduler.max_total_num_tokens
         page_size = server_args.page_size
         max_request_pages = (d2h_max_tokens + page_size - 1) // page_size
-        max_padded_pages = max(
-            _pad_to_page_bucket(max_request_pages), _KV_GATHER_PAGE_BUCKETS[-1]
-        )
+        max_padded_pages = max(_pad_to_page_bucket(max_request_pages), _KV_GATHER_PAGE_BUCKETS[-1])
         host_pool = QueueHostKVPool(
             pool_size=server_args.disaggregation_d2h_pool_size,
             max_padded_pages=max_padded_pages,
@@ -166,9 +164,7 @@ def install_disaggregation_wiring(scheduler: Scheduler, server_args: ServerArgs)
         scheduler.disagg_heartbeat.start()
         scheduler.disagg_bootstrap_key = bootstrap_key
     else:
-        scheduler.disagg_prefill_info_cache = PrefillInfoCache(
-            scheduler.disagg_bootstrap_client
-        )
+        scheduler.disagg_prefill_info_cache = PrefillInfoCache(scheduler.disagg_bootstrap_client)
         scheduler.disagg_prealloc_queue = DecodePreallocQueue()
         scheduler.disagg_transfer_queue = DecodeTransferQueue()
         scheduler.disagg_decode_watchdog = EventLoopWatchdog(

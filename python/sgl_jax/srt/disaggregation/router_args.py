@@ -15,9 +15,7 @@ class RouterArgs:
     request_timeout_secs: int = 1800
     policy: str = "random"
 
-    prefill_urls: list[tuple[str, int | None]] = dataclasses.field(
-        default_factory=list
-    )
+    prefill_urls: list[tuple[str, int | None]] = dataclasses.field(default_factory=list)
     decode_urls: list[str] = dataclasses.field(default_factory=list)
 
     prefill_bootstrap_host: str | None = None
@@ -84,18 +82,10 @@ class RouterArgs:
             pd_disaggregation=args.pd_disaggregation,
             request_timeout_secs=args.request_timeout_secs,
             policy=args.policy,
-            prefill_urls=cls._parse_prefill_urls(
-                getattr(args, "prefill", None)
-            ),
-            decode_urls=cls._parse_decode_urls(
-                getattr(args, "decode", None)
-            ),
-            prefill_bootstrap_host=getattr(
-                args, "prefill_bootstrap_host", None
-            ),
-            max_concurrent_requests=getattr(
-                args, "max_concurrent_requests", None
-            ),
+            prefill_urls=cls._parse_prefill_urls(getattr(args, "prefill", None)),
+            decode_urls=cls._parse_decode_urls(getattr(args, "decode", None)),
+            prefill_bootstrap_host=getattr(args, "prefill_bootstrap_host", None),
+            max_concurrent_requests=getattr(args, "max_concurrent_requests", None),
         )
 
     @staticmethod
@@ -112,9 +102,7 @@ class RouterArgs:
                 parsed.append(
                     (
                         url,
-                        None
-                        if bootstrap_port.lower() == "none"
-                        else int(bootstrap_port),
+                        None if bootstrap_port.lower() == "none" else int(bootstrap_port),
                     )
                 )
                 continue
@@ -123,9 +111,7 @@ class RouterArgs:
             if len(prefill_args) >= 2:
                 bootstrap_port_str = prefill_args[1]
                 bootstrap_port = (
-                    None
-                    if bootstrap_port_str.lower() == "none"
-                    else int(bootstrap_port_str)
+                    None if bootstrap_port_str.lower() == "none" else int(bootstrap_port_str)
                 )
             else:
                 bootstrap_port = None

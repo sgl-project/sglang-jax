@@ -1,11 +1,12 @@
 """Tests for mini_lb router: helpers, generate, backend fetch, admission, launch args, OpenAI PD fields."""
 
 import asyncio
-import pytest
-import sgl_jax.srt.disaggregation.mini_lb as m
+from unittest.mock import AsyncMock, MagicMock, patch
 
-from sgl_jax.srt.disaggregation.mini_lb import MiniLoadBalancer, app
-from sgl_jax.srt.disaggregation.mini_lb import fetch_backend_json
+import pytest
+
+import sgl_jax.srt.disaggregation.mini_lb as m
+from sgl_jax.srt.disaggregation.mini_lb import MiniLoadBalancer, app, fetch_backend_json
 from sgl_jax.srt.disaggregation.mini_lb_helpers import (
     ensure_request_identity_fields,
     generate_bootstrap_room,
@@ -18,11 +19,9 @@ from sgl_jax.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     CompletionRequest,
 )
-from unittest.mock import AsyncMock, patch
-from unittest.mock import MagicMock, patch
-
 
 # ---- from test_mini_lb_helpers.py ----
+
 
 class TestMaybeWrapIpv6:
     def test_ipv4_unchanged(self):
@@ -37,6 +36,7 @@ class TestMaybeWrapIpv6:
     def test_full_ipv6_wrapped(self):
         assert maybe_wrap_ipv6_address("2001:db8::1") == "[2001:db8::1]"
 
+
 class TestGenerateBootstrapRoom:
     def test_room_is_int(self):
         room = generate_bootstrap_room()
@@ -46,6 +46,7 @@ class TestGenerateBootstrapRoom:
         for _ in range(100):
             room = generate_bootstrap_room()
             assert 0 <= room < 2**63
+
 
 class TestGetRequestBatchSize:
     def test_single_text(self):
@@ -63,6 +64,7 @@ class TestGetRequestBatchSize:
     def test_no_prompt_field(self):
         assert get_request_batch_size({"other": "value"}) is None
 
+
 class TestEnsureRequestIdentityFields:
     def test_generates_rid_and_transfer_id(self):
         result = ensure_request_identity_fields({"text": "hello"})
@@ -77,9 +79,7 @@ class TestEnsureRequestIdentityFields:
         assert result["disagg_transfer_id"] == "abc123"
 
     def test_preserves_existing_transfer_id(self):
-        result = ensure_request_identity_fields(
-            {"text": "hello", "disagg_transfer_id": "tid123"}
-        )
+        result = ensure_request_identity_fields({"text": "hello", "disagg_transfer_id": "tid123"})
         assert result["rid"] == "tid123"
         assert result["disagg_transfer_id"] == "tid123"
 
@@ -94,6 +94,7 @@ class TestEnsureRequestIdentityFields:
         result = ensure_request_identity_fields(original)
         assert "rid" not in original
         assert "rid" in result
+
 
 class TestInjectBootstrapFields:
     def test_single_request(self):
@@ -143,7 +144,9 @@ class TestInjectBootstrapFields:
         )
         assert result["bootstrap_port"] is None
 
+
 # ---- from test_mini_lb_generate.py ----
+
 
 @pytest.fixture
 def router_args():
@@ -156,6 +159,7 @@ def router_args():
         decode_urls=["http://decode:30200"],
     )
 
+
 @pytest.fixture
 def lb_instance(router_args):
     import sgl_jax.srt.disaggregation.mini_lb as mini_lb_module
@@ -165,43 +169,54 @@ def lb_instance(router_args):
     yield instance
     mini_lb_module.lb = None
 
+
 @pytest.fixture
 def client(lb_instance):
     from fastapi.testclient import TestClient
+
     return TestClient(app)
+
 
 class TestValidation:
     def test_requires_pd_disaggregation(self):
         with pytest.raises(ValueError, match="PD disaggregation"):
-            MiniLoadBalancer(RouterArgs(
-                mini_lb=True,
-                pd_disaggregation=False,
-                prefill_urls=[("http://p:30100", 8998)],
-                decode_urls=["http://d:30200"],
-            ))
+            MiniLoadBalancer(
+                RouterArgs(
+                    mini_lb=True,
+                    pd_disaggregation=False,
+                    prefill_urls=[("http://p:30100", 8998)],
+                    decode_urls=["http://d:30200"],
+                )
+            )
 
     def test_requires_prefill_urls(self):
         with pytest.raises(ValueError, match="at least one"):
-            MiniLoadBalancer(RouterArgs(
-                mini_lb=True,
-                pd_disaggregation=True,
-                prefill_urls=[],
-                decode_urls=["http://d:30200"],
-            ))
+            MiniLoadBalancer(
+                RouterArgs(
+                    mini_lb=True,
+                    pd_disaggregation=True,
+                    prefill_urls=[],
+                    decode_urls=["http://d:30200"],
+                )
+            )
 
     def test_requires_decode_urls(self):
         with pytest.raises(ValueError, match="at least one"):
-            MiniLoadBalancer(RouterArgs(
-                mini_lb=True,
-                pd_disaggregation=True,
-                prefill_urls=[("http://p:30100", 8998)],
-                decode_urls=[],
-            ))
+            MiniLoadBalancer(
+                RouterArgs(
+                    mini_lb=True,
+                    pd_disaggregation=True,
+                    prefill_urls=[("http://p:30100", 8998)],
+                    decode_urls=[],
+                )
+            )
+
 
 class TestHealthEndpoint:
     def test_health(self, client):
         response = client.get("/health")
         assert response.status_code == 200
+
 
 class TestSelectPair:
     def test_select_pair_returns_tuple(self, lb_instance):
@@ -230,6 +245,7 @@ class TestSelectPair:
         assert len(seen_prefills) == 2
         assert len(seen_decodes) == 2
 
+
 class TestGenerateEndpoint:
     @patch("aiohttp.ClientSession")
     def test_generate_non_stream(self, mock_session_cls, client, lb_instance):
@@ -244,22 +260,24 @@ class TestGenerateEndpoint:
         mock_session.__aexit__ = AsyncMock(return_value=False)
         mock_session_cls.return_value = mock_session
 
-        response = client.post("/generate", json={
-            "text": "hello",
-            "sampling_params": {"max_new_tokens": 16},
-        })
+        response = client.post(
+            "/generate",
+            json={
+                "text": "hello",
+                "sampling_params": {"max_new_tokens": 16},
+            },
+        )
         assert response.status_code == 200
         data = response.json()
         assert data == {"text": "hello world"}
+
 
 class TestV1ChatCompletionsEndpoint:
     @patch("aiohttp.ClientSession")
     def test_chat_completions(self, mock_session_cls, client, lb_instance):
         mock_response = AsyncMock()
         mock_response.status = 200
-        mock_response.json = AsyncMock(return_value={
-            "choices": [{"message": {"content": "hi"}}]
-        })
+        mock_response.json = AsyncMock(return_value={"choices": [{"message": {"content": "hi"}}]})
 
         mock_session = AsyncMock()
         mock_session.post = AsyncMock(return_value=mock_response)
@@ -267,20 +285,22 @@ class TestV1ChatCompletionsEndpoint:
         mock_session.__aexit__ = AsyncMock(return_value=False)
         mock_session_cls.return_value = mock_session
 
-        response = client.post("/v1/chat/completions", json={
-            "model": "test",
-            "messages": [{"role": "user", "content": "hello"}],
-        })
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test",
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        )
         assert response.status_code == 200
+
 
 class TestV1CompletionsEndpoint:
     @patch("aiohttp.ClientSession")
     def test_completions(self, mock_session_cls, client, lb_instance):
         mock_response = AsyncMock()
         mock_response.status = 200
-        mock_response.json = AsyncMock(return_value={
-            "choices": [{"text": "world"}]
-        })
+        mock_response.json = AsyncMock(return_value={"choices": [{"text": "world"}]})
 
         mock_session = AsyncMock()
         mock_session.post = AsyncMock(return_value=mock_response)
@@ -288,11 +308,15 @@ class TestV1CompletionsEndpoint:
         mock_session.__aexit__ = AsyncMock(return_value=False)
         mock_session_cls.return_value = mock_session
 
-        response = client.post("/v1/completions", json={
-            "model": "test",
-            "prompt": "hello",
-        })
+        response = client.post(
+            "/v1/completions",
+            json={
+                "model": "test",
+                "prompt": "hello",
+            },
+        )
         assert response.status_code == 200
+
 
 class TestBootstrapInjection:
     @patch("aiohttp.ClientSession")
@@ -352,6 +376,7 @@ class TestBootstrapInjection:
         mock_session_cls.return_value = mock_session
 
         from fastapi.testclient import TestClient
+
         test_client = TestClient(app)
         response = test_client.post("/generate", json={"text": "hello"})
         assert response.status_code == 200
@@ -361,7 +386,9 @@ class TestBootstrapInjection:
 
         mini_lb_module.lb = None
 
+
 # ---- from test_mini_lb_backend_fetch.py ----
+
 
 class _FakeResponse:
     def __init__(self, status, json_data=None, text=""):
@@ -381,6 +408,7 @@ class _FakeResponse:
     async def __aexit__(self, *args):
         pass
 
+
 class _FakeSession:
     def __init__(self, responses: dict[str, _FakeResponse]):
         self._responses = responses
@@ -391,10 +419,13 @@ class _FakeSession:
                 return resp
         return _FakeResponse(404, text="not found")
 
+
 def test_first_candidate_succeeds():
-    session = _FakeSession({
-        "get_server_info": _FakeResponse(200, {"model": "test"}),
-    })
+    session = _FakeSession(
+        {
+            "get_server_info": _FakeResponse(200, {"model": "test"}),
+        }
+    )
 
     async def _run():
         return await fetch_backend_json(
@@ -404,11 +435,14 @@ def test_first_candidate_succeeds():
     result = asyncio.run(_run())
     assert result == {"model": "test"}
 
+
 def test_fallback_to_second_candidate():
-    session = _FakeSession({
-        "get_server_info": _FakeResponse(404, text="not found"),
-        "server_info": _FakeResponse(200, {"model": "fallback"}),
-    })
+    session = _FakeSession(
+        {
+            "get_server_info": _FakeResponse(404, text="not found"),
+            "server_info": _FakeResponse(200, {"model": "fallback"}),
+        }
+    )
 
     async def _run():
         return await fetch_backend_json(
@@ -418,13 +452,16 @@ def test_fallback_to_second_candidate():
     result = asyncio.run(_run())
     assert result == {"model": "fallback"}
 
+
 def test_all_candidates_fail_raises():
     from fastapi import HTTPException
 
-    session = _FakeSession({
-        "get_server_info": _FakeResponse(500, text="error1"),
-        "server_info": _FakeResponse(503, text="error2"),
-    })
+    session = _FakeSession(
+        {
+            "get_server_info": _FakeResponse(500, text="error1"),
+            "server_info": _FakeResponse(503, text="error2"),
+        }
+    )
 
     async def _run():
         return await fetch_backend_json(
@@ -435,20 +472,23 @@ def test_all_candidates_fail_raises():
         asyncio.run(_run())
     assert exc_info.value.status_code == 502
 
+
 def test_single_candidate():
-    session = _FakeSession({
-        "server_info": _FakeResponse(200, {"status": "ok"}),
-    })
+    session = _FakeSession(
+        {
+            "server_info": _FakeResponse(200, {"status": "ok"}),
+        }
+    )
 
     async def _run():
-        return await fetch_backend_json(
-            session, "http://host:8000", ("server_info",)
-        )
+        return await fetch_backend_json(session, "http://host:8000", ("server_info",))
 
     result = asyncio.run(_run())
     assert result == {"status": "ok"}
 
+
 # ---- from test_mini_lb_admission.py ----
+
 
 @pytest.fixture(autouse=True)
 def reset_sem():
@@ -456,6 +496,7 @@ def reset_sem():
     m._admission_sem = None
     yield
     m._admission_sem = saved
+
 
 def test_no_cap_passthrough(monkeypatch):
     """No cap -> semaphore is None and the request passes straight through."""
@@ -467,6 +508,7 @@ def test_no_cap_passthrough(monkeypatch):
     assert m._admission_sem is None
     result = asyncio.run(m._forward_to_backend({}, "generate"))
     assert result == "OK"
+
 
 def test_cap_serializes_excess(monkeypatch):
     """cap=1: the second request stays pending until the first releases, then
@@ -507,6 +549,7 @@ def test_cap_serializes_excess(monkeypatch):
     assert {r1, r2} == {"done-1", "done-2"}
     assert sorted(finished) == [1, 2]
 
+
 def test_stream_holds_until_drained(monkeypatch):
     """Streaming: the permit is released only after body_iterator is fully
     drained, not when the StreamingResponse object is first returned."""
@@ -536,6 +579,7 @@ def test_stream_holds_until_drained(monkeypatch):
     collected = asyncio.run(scenario())
     assert collected == [b"a", b"b"]
 
+
 def test_no_client_error_on_excess(monkeypatch):
     """Many concurrent requests over a small cap all succeed (never 4xx/5xx)."""
 
@@ -548,15 +592,15 @@ def test_no_client_error_on_excess(monkeypatch):
     monkeypatch.setattr(m, "_do_forward", fake_forward)
 
     async def scenario():
-        tasks = [
-            m._forward_to_backend({"id": i}, "generate") for i in range(10)
-        ]
+        tasks = [m._forward_to_backend({"id": i}, "generate") for i in range(10)]
         return await asyncio.gather(*tasks)
 
     results = asyncio.run(scenario())
     assert sorted(results) == sorted(f"ok-{i}" for i in range(10))
 
+
 # ---- from test_launch_router_args.py ----
+
 
 def _parse(argv: list[str]) -> RouterArgs:
     import argparse
@@ -564,6 +608,7 @@ def _parse(argv: list[str]) -> RouterArgs:
     parser = argparse.ArgumentParser()
     RouterArgs.add_cli_args(parser)
     return RouterArgs.from_cli_args(parser.parse_args(argv))
+
 
 class TestPrefillUrlParsing:
     def test_single_prefill_with_bootstrap_port_space_separated(self):
@@ -587,14 +632,21 @@ class TestPrefillUrlParsing:
         assert args.prefill_urls == [("http://p1:30100", None)]
 
     def test_multiple_prefill_urls(self):
-        args = _parse([
-            "--prefill", "http://p1:30100", "8998",
-            "--prefill", "http://p2:30100", "9998",
-        ])
+        args = _parse(
+            [
+                "--prefill",
+                "http://p1:30100",
+                "8998",
+                "--prefill",
+                "http://p2:30100",
+                "9998",
+            ]
+        )
         assert args.prefill_urls == [
             ("http://p1:30100", 8998),
             ("http://p2:30100", 9998),
         ]
+
 
 class TestDecodeUrlParsing:
     def test_single_decode_url(self):
@@ -602,15 +654,20 @@ class TestDecodeUrlParsing:
         assert args.decode_urls == ["http://d1:30200"]
 
     def test_multiple_decode_urls(self):
-        args = _parse([
-            "--decode", "http://d1:30200",
-            "--decode", "http://d2:30200",
-        ])
+        args = _parse(
+            [
+                "--decode",
+                "http://d1:30200",
+                "--decode",
+                "http://d2:30200",
+            ]
+        )
         assert args.decode_urls == ["http://d1:30200", "http://d2:30200"]
 
     def test_no_decode_urls(self):
         args = _parse([])
         assert args.decode_urls == []
+
 
 class TestOtherArgs:
     def test_defaults(self):
@@ -638,7 +695,9 @@ class TestOtherArgs:
         args = _parse(["--prefill-bootstrap-host", "10.0.0.1"])
         assert args.prefill_bootstrap_host == "10.0.0.1"
 
+
 # ---- from test_openai_pd_fields.py ----
+
 
 class TestProtocolFields:
     def test_chat_completion_request_has_bootstrap_fields(self):
@@ -679,6 +738,7 @@ class TestProtocolFields:
         assert req.bootstrap_room is None
         assert req.disagg_transfer_id is None
 
+
 class TestServingChatPassthrough:
     def test_chat_passes_bootstrap_fields(self):
         from sgl_jax.srt.entrypoints.openai.serving_chat import OpenAIServingChat
@@ -715,6 +775,7 @@ class TestServingChatPassthrough:
         assert adapted.bootstrap_host == "10.0.0.1"
         assert adapted.bootstrap_port == 8998
         assert adapted.bootstrap_room == 42
+
 
 class TestServingCompletionsPassthrough:
     def test_completions_passes_bootstrap_fields(self):

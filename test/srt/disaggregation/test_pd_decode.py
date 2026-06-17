@@ -13,10 +13,6 @@ from sgl_jax.srt.disaggregation.decode import (
     DecodeTransferQueue,
     SchedulerDisaggregationDecodeMixin,
 )
-from sgl_jax.srt.disaggregation.decode import (
-    DecodePreallocQueue,
-    SchedulerDisaggregationDecodeMixin,
-)
 from sgl_jax.srt.disaggregation.decode_watchdog import EventLoopWatchdog
 from sgl_jax.srt.disaggregation.jax_transfer.conn import (
     JaxTransferKVManager,
@@ -24,8 +20,8 @@ from sgl_jax.srt.disaggregation.jax_transfer.conn import (
     PMetadata,
 )
 
-
 # ---- from test_decode_watchdog.py ----
+
 
 class _Clock:
     def __init__(self, t=0.0):
@@ -33,6 +29,7 @@ class _Clock:
 
     def __call__(self):
         return self.t
+
 
 def _make(threshold=5.0, clock=None, snapshot=None):
     dumped = {"n": 0}
@@ -48,6 +45,7 @@ def _make(threshold=5.0, clock=None, snapshot=None):
     )
     return wd, dumped
 
+
 class TestEnabled:
     def test_positive_threshold_enabled(self):
         wd, _ = _make(threshold=5.0)
@@ -62,6 +60,7 @@ class TestEnabled:
         wd, _ = _make(threshold=0.0, clock=clock)
         wd.start()
         assert wd._thread is None
+
 
 class TestStallDetection:
     def test_no_report_within_threshold(self):
@@ -103,6 +102,7 @@ class TestStallDetection:
         assert wd.check_once() is True
         assert dumped["n"] == 2
 
+
 class TestSnapshot:
     def test_snapshot_provider_included_and_dumped(self):
         clock = _Clock()
@@ -132,7 +132,9 @@ class TestSnapshot:
         assert wd.check_once() is True
         assert dumped["n"] == 1
 
+
 # ---- from test_pd_decode_pull_nonblocking.py ----
+
 
 class _Leaf:
     """Stand-in for a pulled jax.Array leaf; a custom object is a pytree leaf.
@@ -146,6 +148,7 @@ class _Leaf:
 
     def is_ready(self) -> bool:
         return self._wrapper.ready
+
 
 class _Wrapper:
     def __init__(self, *, raise_exc: bool = False, ready: bool = True):
@@ -167,12 +170,14 @@ class _Wrapper:
             raise RuntimeError("pull boom")
         return _Leaf(self)
 
+
 class _Notifier:
     def __init__(self):
         self.sent = []
 
     def send_done(self, uuid_bytes, host, port):
         self.sent.append((uuid_bytes, host, port))
+
 
 class _FakeMgr:
     """Stands in for the manager. ``enqueue_pull`` records the receiver but
@@ -205,6 +210,7 @@ class _FakeMgr:
     def _prune_receiver(self, req_id):
         self.pruned.append(req_id)
 
+
 def _pmeta():
     return PMetadata(
         remote_addr="1.2.3.4:5000",
@@ -214,17 +220,20 @@ def _pmeta():
         p_side_channel_port=5001,
     )
 
+
 def _make_receiver(**kw):
     mgr = _FakeMgr(**kw)
     recv = JaxTransferKVReceiver(mgr, "req-a")
     recv.init(_pmeta())
     return mgr, recv
 
+
 def test_init_does_not_connect():
     mgr, recv = _make_receiver()
     # init must NOT touch the link: connect+pull stay on the worker thread.
     assert mgr.wrapper.connected == []
     assert recv.state == KVPoll.WAITING_FOR_INPUT
+
 
 def test_poll_enqueues_without_pulling():
     mgr, recv = _make_receiver()
@@ -238,6 +247,7 @@ def test_poll_enqueues_without_pulling():
     # Polling again before the worker runs stays TRANSFERRING, no ack.
     assert recv.poll() == KVPoll.TRANSFERRING
     assert mgr._notifier.sent == []
+
 
 def test_worker_pull_then_success():
     mgr, recv = _make_receiver()
@@ -257,6 +267,7 @@ def test_worker_pull_then_success():
     assert mgr._notifier.sent
     assert ("req-a", "decode", KVPoll.SUCCESS, "ack_send") in mgr.terminal
 
+
 def test_poll_waits_for_ready():
     mgr, recv = _make_receiver(ready=False)
 
@@ -269,6 +280,7 @@ def test_poll_waits_for_ready():
     mgr.wrapper.ready = True
     assert recv.poll() == KVPoll.SUCCESS
     assert mgr._notifier.sent
+
 
 def test_pull_exception_transitions_failed():
     mgr, recv = _make_receiver(raise_exc=True)
@@ -283,6 +295,7 @@ def test_pull_exception_transitions_failed():
 
     # A subsequent poll stays FAILED.
     assert recv.poll() == KVPoll.FAILED
+
 
 def test_reaper_fail_then_worker_drops_results():
     mgr, recv = _make_receiver()
@@ -305,6 +318,7 @@ def test_reaper_fail_then_worker_drops_results():
     assert recv.poll() == KVPoll.FAILED
     assert mgr._notifier.sent == []
 
+
 def test_poll_never_spawns_thread():
     mgr, recv = _make_receiver()
 
@@ -313,17 +327,14 @@ def test_poll_never_spawns_thread():
     recv.poll()
     assert threading.active_count() == before
 
+
 def test_manager_owns_persistent_pull_worker_pool():
     """The manager starts a pool of long-lived workers that drain the queue
     and run each receiver's blocking pull off the event loop."""
 
-    mgr = JaxTransferKVManager(
-        wrapper=object(), zmq_notifier=object(), pull_worker_count=4
-    )
+    mgr = JaxTransferKVManager(wrapper=object(), zmq_notifier=object(), pull_worker_count=4)
 
-    worker_threads = [
-        t for t in threading.enumerate() if t.name.startswith("jax-kv-pull-worker")
-    ]
+    worker_threads = [t for t in threading.enumerate() if t.name.startswith("jax-kv-pull-worker")]
     assert len(worker_threads) == 4
     assert all(t.daemon for t in worker_threads)
 
@@ -336,7 +347,9 @@ def test_manager_owns_persistent_pull_worker_pool():
     mgr.enqueue_pull(_Stub())
     assert ran.wait(timeout=5.0)
 
+
 # ---- from test_pd_decode_admission.py ----
+
 
 class _Allocator:
     def __init__(self, capacity, page_size=1):
@@ -357,6 +370,7 @@ class _Allocator:
     def free(self, idx):
         self.freed.append(idx)
 
+
 class _Receiver:
     def __init__(self, raise_on_init=False):
         self._raise = raise_on_init
@@ -366,6 +380,7 @@ class _Receiver:
         if self._raise:
             raise RuntimeError("boom")
         self.inited = pmeta
+
 
 class _KVManager:
     def __init__(self, raise_on_init=False):
@@ -377,11 +392,13 @@ class _KVManager:
         self.created.append((rid, r))
         return r
 
+
 class _AdmServerArgs:
     def __init__(self, reserved, max_inflight=0):
         self.disaggregation_num_reserved_decode_tokens = reserved
         self.disaggregation_max_inflight_transfers = max_inflight
         self.enable_request_time_stats_logging = False
+
 
 class _AdmReq:
     def __init__(self, rid, seqlen):
@@ -389,14 +406,18 @@ class _AdmReq:
         self.disagg_transfer_id = None
         self.origin_input_ids = list(range(seqlen))
 
+
 class _Batch:
     def __init__(self, n):
         self.reqs = list(range(n))
 
+
 class _AdmScheduler:
     _admit_decode_prealloc = SchedulerDisaggregationDecodeMixin._admit_decode_prealloc
 
-    def __init__(self, capacity, reserved, page_size=1, n_running=0, raise_on_init=False, max_inflight=0):
+    def __init__(
+        self, capacity, reserved, page_size=1, n_running=0, raise_on_init=False, max_inflight=0
+    ):
         self.token_to_kv_pool_allocator = _Allocator(capacity, page_size)
         self.server_args = _AdmServerArgs(reserved, max_inflight=max_inflight)
         self.running_batch = _Batch(n_running)
@@ -421,13 +442,16 @@ class _AdmScheduler:
     def _abort_decode_request(self, req, reason):
         self.aborted.append((req.rid, reason))
 
+
 def _adm_p_info():
     return {"host": "1.2.3.4", "transfer_port": 5000, "side_channel_port": 5001}
+
 
 def _enqueue(sched, rid, seqlen):
     entry = DecodeBookkeeping(req_id=rid, req=_AdmReq(rid, seqlen), p_info=_adm_p_info())
     sched.disagg_prealloc_queue.add(entry)
     return entry
+
 
 def test_admit_when_capacity_sufficient():
     sched = _AdmScheduler(capacity=100, reserved=0)
@@ -440,6 +464,7 @@ def test_admit_when_capacity_sufficient():
     assert len(sched.disagg_transfer_queue) == 2
     assert sched.aborted == []
 
+
 def test_defer_when_capacity_insufficient_does_not_abort():
     sched = _AdmScheduler(capacity=4, reserved=0)
     _enqueue(sched, "a", seqlen=8)  # needs 8 > 4
@@ -451,6 +476,7 @@ def test_defer_when_capacity_insufficient_does_not_abort():
     assert len(sched.disagg_transfer_queue) == 0
     assert sched.aborted == []
     assert sched.token_to_kv_pool_allocator.available_size() == 4
+
 
 def test_reserved_headroom_blocks_over_admission():
     # capacity 10, but 2 running reqs each reserve 4 tokens of headroom, so
@@ -465,6 +491,7 @@ def test_reserved_headroom_blocks_over_admission():
     assert len(sched.disagg_transfer_queue) == 1
     assert len(sched.disagg_prealloc_queue) == 1
     assert sched.aborted == []
+
 
 def test_recovery_admits_after_capacity_frees():
     sched = _AdmScheduler(capacity=4, reserved=0)
@@ -482,6 +509,7 @@ def test_recovery_admits_after_capacity_frees():
     assert len(sched.disagg_transfer_queue) == 2  # "b" now admitted
     assert len(sched.disagg_prealloc_queue) == 0
 
+
 def test_receiver_init_failure_aborts_and_frees():
     sched = _AdmScheduler(capacity=100, reserved=0, raise_on_init=True)
     _enqueue(sched, "a", seqlen=4)
@@ -494,6 +522,7 @@ def test_receiver_init_failure_aborts_and_frees():
     assert sched.aborted == [("a", "receiver_init")]
     assert sched.failures == ["receiver_init"]
     assert len(sched.token_to_kv_pool_allocator.freed) == 1
+
 
 def test_inflight_cap_defers_excess_without_abort():
     # Capacity is ample (each req needs 4, capacity 100), so only the in-flight
@@ -513,6 +542,7 @@ def test_inflight_cap_defers_excess_without_abort():
     # Only 2 reqs' KV allocated (8 tokens); c's was not reserved.
     assert sched.token_to_kv_pool_allocator.available_size() == 92
 
+
 def test_inflight_cap_counts_existing_transfers():
     # An already-occupied transfer queue counts against the cap. With one entry
     # in flight and cap=2, only one more may be admitted this tick.
@@ -528,6 +558,7 @@ def test_inflight_cap_counts_existing_transfers():
     assert len(sched.disagg_transfer_queue) == 2  # placeholder + a
     assert len(sched.disagg_prealloc_queue) == 1  # b deferred
     assert sched.aborted == []
+
 
 def test_inflight_cap_recovers_after_transfer_drains():
     sched = _AdmScheduler(capacity=100, reserved=0, max_inflight=2)
@@ -546,7 +577,9 @@ def test_inflight_cap_recovers_after_transfer_drains():
     assert len(sched.disagg_transfer_queue) == 2  # "c" now admitted
     assert len(sched.disagg_prealloc_queue) == 0
 
+
 # ---- from test_pd_decode_bootstrap_cache.py ----
+
 
 class _Req:
     def __init__(self, rid, room=0):
@@ -555,18 +588,22 @@ class _Req:
         self.disagg_transfer_id = None
         self.origin_input_ids = [1, 2, 3, 4]
 
+
 class _ServerArgs:
     # page_size/kv_dtype left falsy so check_prefill_compat is a no-op.
     page_size = 0
     kv_cache_dtype = ""
     enable_request_time_stats_logging = False
 
+
 class _NoopKVCache:
     dtype = None
+
 
 class _NoopAllocator:
     def get_kvcache(self):
         return _NoopKVCache()
+
 
 class _FakeCache:
     """Returns queued results per ``pick_for_room`` call (dict or None)."""
@@ -578,6 +615,7 @@ class _FakeCache:
     def pick_for_room(self, room):
         self.calls += 1
         return self._results.pop(0) if self._results else None
+
 
 class _FakeScheduler:
     process_input_requests_disagg_decode = (
@@ -609,8 +647,10 @@ class _FakeScheduler:
     def _abort_decode_request(self, req, reason):
         self.aborted.append((req.rid, reason))
 
+
 def _p_info():
     return {"host": "1.2.3.4", "transfer_port": 5000, "side_channel_port": 5001}
+
 
 def test_cache_hit_routes_to_prealloc():
     sched = _FakeScheduler(_FakeCache([_p_info()]))
@@ -619,6 +659,7 @@ def test_cache_hit_routes_to_prealloc():
     assert len(sched.disagg_prealloc_queue) == 1
     assert sched._pd_pending_bootstrap == []
     assert sched.aborted == []
+
 
 def test_cache_miss_defers_without_abort_then_retries():
     # First call: cache miss -> deferred, not aborted, not enqueued.
@@ -640,6 +681,7 @@ def test_cache_miss_defers_without_abort_then_retries():
     assert sched._pd_pending_bootstrap == []
     assert sched.aborted == []
 
+
 def test_pending_retried_ahead_of_new_reqs():
     cache = _FakeCache([None])
     sched = _FakeScheduler(cache)
@@ -654,7 +696,9 @@ def test_pending_retried_ahead_of_new_reqs():
     assert [e.req_id for e in admitted] == ["old", "new"]
     assert sched._pd_pending_bootstrap == []
 
+
 # ---- from test_orphan_reaper.py ----
+
 
 class _FakeParticipant:
     """Duck-types the (transfer_started_at, fail) contract the reaper needs."""
@@ -666,6 +710,7 @@ class _FakeParticipant:
     def fail(self, *, reason):
         self.failed_reason = reason
 
+
 class _Mgr(CommonKVManager):
     def create_sender(self, req_id):  # pragma: no cover - unused
         raise NotImplementedError
@@ -673,12 +718,14 @@ class _Mgr(CommonKVManager):
     def create_receiver(self, req_id):  # pragma: no cover - unused
         raise NotImplementedError
 
+
 def _mgr(**kw):
     return _Mgr(
         ack_timeout_seconds=kw.get("ack", 10.0),
         pull_timeout_seconds=kw.get("pull", 5.0),
         reaper_interval_seconds=kw.get("interval", 0.01),
     )
+
 
 class TestReapOnce:
     def test_sender_past_ack_timeout_is_failed(self):
@@ -722,6 +769,7 @@ class TestReapOnce:
         assert timed_out_s == []
         assert s.failed_reason is None
 
+
 class TestRegistry:
     def test_duplicate_sender_raises(self):
         m = _mgr()
@@ -739,6 +787,7 @@ class TestRegistry:
         m.register_receiver("d1", _FakeParticipant(1.0))
         m.register_receiver("d2", _FakeParticipant(1.0))
         assert m.inflight_count() == (1, 2)
+
 
 class TestReaperLifecycle:
     def test_start_then_stop(self):
@@ -767,6 +816,7 @@ class TestReaperLifecycle:
             m.stop_reaper()
         assert s.failed_reason == "timeout"
 
+
 class TestTerminalRecords:
     def test_record_and_get(self):
         m = _mgr()
@@ -784,8 +834,6 @@ class TestTerminalRecords:
 
     def test_register_clears_prior_terminal_record(self):
         m = _mgr()
-        m.record_terminal(
-            "r1", role="prefill", transfer_id="t1", state=KVPoll.FAILED, reason="x"
-        )
+        m.record_terminal("r1", role="prefill", transfer_id="t1", state=KVPoll.FAILED, reason="x")
         m.register_sender("r1", _FakeParticipant(1.0))
         assert m.get_terminal_record("r1", role="prefill") is None

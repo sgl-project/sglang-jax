@@ -81,9 +81,7 @@ def inject_bootstrap_fields(
     bootstrap_host_override: str | None = None,
 ) -> dict[str, Any]:
     parsed = urllib.parse.urlparse(prefill_server)
-    hostname = bootstrap_host_override or maybe_wrap_ipv6_address(
-        parsed.hostname or ""
-    )
+    hostname = bootstrap_host_override or maybe_wrap_ipv6_address(parsed.hostname or "")
     room = generate_bootstrap_room()
     modified_request = ensure_request_identity_fields(request_data)
 

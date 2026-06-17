@@ -274,9 +274,7 @@ class SchedulerDisaggregationDecodeMixin:
             for r in recv_reqs
             if getattr(r, "bootstrap_room", None) is not None
         }
-        new_pd_reqs = (
-            self._extract_pd_reqs_from_waiting_queue(recv_pd_rids) if recv_pd_rids else []
-        )
+        new_pd_reqs = self._extract_pd_reqs_from_waiting_queue(recv_pd_rids) if recv_pd_rids else []
 
         # Retry reqs deferred on a previous tick because no prefill was
         # registered yet (bootstrap cache miss). They go ahead of new reqs so
@@ -653,9 +651,7 @@ class SchedulerDisaggregationDecodeMixin:
             page_ids_np = kv_indices_np[::page_size] // page_size
             page_ids_np = page_ids_np[:num_pages]
             if num_pages < padded_pages:
-                pad = np.full(
-                    padded_pages - num_pages, page_ids_np[-1], dtype=page_ids_np.dtype
-                )
+                pad = np.full(padded_pages - num_pages, page_ids_np[-1], dtype=page_ids_np.dtype)
                 page_ids_padded = np.concatenate([page_ids_np, pad])
             else:
                 page_ids_padded = page_ids_np
@@ -675,9 +671,7 @@ class SchedulerDisaggregationDecodeMixin:
         loc_np[:seqlen] = kv_indices_np[:seqlen]
         loc = jax.device_put(
             jnp.asarray(loc_np),
-            NamedSharding(
-                kv_pool.mesh, PartitionSpec(kv_pool.attention_data_partition_axis)
-            ),
+            NamedSharding(kv_pool.mesh, PartitionSpec(kv_pool.attention_data_partition_axis)),
         )
         # Each layer write goes through the module-level ``_jit_write_one_layer``
         # so the Pallas write kernel compiles once per shape and caches, instead

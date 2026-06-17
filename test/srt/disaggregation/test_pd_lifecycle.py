@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
-import httpx
-import numpy as np
-import pytest
 import socket
 import time
 import unittest
 
+import httpx
+import numpy as np
+import pytest
 from fastapi.testclient import TestClient
+
 from sgl_jax.srt.disaggregation.bootstrap import (
     MIN_COMPATIBLE_VERSION,
     PROTOCOL_VERSION,
@@ -30,8 +31,8 @@ from sgl_jax.srt.managers.schedule_batch import Req
 from sgl_jax.srt.managers.scheduler import _reserve_host_slot_for_pd
 from sgl_jax.srt.sampling.sampling_params import SamplingParams
 
-
 # ---- from test_protocol_version.py ----
+
 
 def _free_port() -> int:
     s = socket.socket()
@@ -40,6 +41,7 @@ def _free_port() -> int:
     s.close()
     return port
 
+
 class TestConstants:
     def test_min_compatible_not_above_current(self):
         assert MIN_COMPATIBLE_VERSION <= PROTOCOL_VERSION
@@ -47,6 +49,7 @@ class TestConstants:
     def test_prefill_info_defaults_to_current_version(self):
         info = PrefillInfo(bootstrap_key="h:1", host="h", transfer_port=1, side_channel_port=2)
         assert info.protocol_version == PROTOCOL_VERSION
+
 
 class TestServerRoundTrip:
     def test_version_preserved_through_registry(self):
@@ -64,6 +67,7 @@ class TestServerRoundTrip:
         )
         body = client.get("/get_prefill_info", params={"bootstrap_room": 0}).json()
         assert body["protocol_version"] == PROTOCOL_VERSION
+
 
 class TestClientVersionGate:
     @pytest.fixture
@@ -102,7 +106,9 @@ class TestClientVersionGate:
         with pytest.raises(httpx.HTTPStatusError):
             client.get_prefill_info(0)
 
+
 # ---- from test_disagg_shutdown_handler.py ----
+
 
 class _Participant:
     def __init__(self, started_at=None):
@@ -112,12 +118,14 @@ class _Participant:
     def fail(self, *, reason):
         self.failed_reason = reason
 
+
 class _Mgr(CommonKVManager):
     def create_sender(self, req_id):  # pragma: no cover - unused
         raise NotImplementedError
 
     def create_receiver(self, req_id):  # pragma: no cover - unused
         raise NotImplementedError
+
 
 class TestGracefulShutdown:
     def test_drains_when_no_inflight(self):
@@ -152,12 +160,14 @@ class TestGracefulShutdown:
         aborted_s, aborted_r = m.graceful_shutdown(drain_timeout_seconds=1.0)
         assert (aborted_s, aborted_r) == (0, 0)
 
+
 class _FakeBootstrapClient:
     def __init__(self):
         self.unregistered = []
 
     def unregister_prefill(self, key):
         self.unregistered.append(key)
+
 
 class _FakeHeartbeat:
     def __init__(self):
@@ -166,12 +176,14 @@ class _FakeHeartbeat:
     def stop(self):
         self.stopped = True
 
+
 class _FakeZmqNotifier:
     def __init__(self):
         self.stopped = False
 
     def stop(self):
         self.stopped = True
+
 
 class _FakeManager:
     def __init__(self):
@@ -182,6 +194,7 @@ class _FakeManager:
         self.shutdown_calls += 1
         return 0, 0
 
+
 class _FakeScheduler:
     def __init__(self):
         self.disagg_bootstrap_key = "h:1"
@@ -189,6 +202,7 @@ class _FakeScheduler:
         self.disagg_heartbeat = _FakeHeartbeat()
         self.disagg_kv_manager = _FakeManager()
         self.disagg_decode_watchdog = None
+
 
 class TestRuntimeShutdownClosure:
     def test_prefill_unregisters_and_stops_heartbeat(self):
@@ -229,7 +243,9 @@ class TestRuntimeShutdownClosure:
         shutdown()
         assert sched.disagg_kv_manager.shutdown_calls == 1
 
+
 # ---- from test_pd_time_stats.py ----
+
 
 class _FakeClock:
     def __init__(self) -> None:
@@ -240,6 +256,7 @@ class _FakeClock:
 
     def advance(self, dt: float) -> None:
         self.t += dt
+
 
 class TestMarks:
     def test_mark_records_clock_value(self):
@@ -269,6 +286,7 @@ class TestMarks:
         ts = TimeStats("prefill", clock=_FakeClock())
         ts.mark("forward_start")
         assert ts.duration("forward_start", "forward_done") is None
+
 
 class TestPrefillPhases:
     def test_prefill_phase_breakdown(self):
@@ -302,6 +320,7 @@ class TestPrefillPhases:
         assert "forward" not in phases
         assert "total" not in phases
 
+
 class TestDecodePhases:
     def test_decode_phase_breakdown(self):
         clk = _FakeClock()
@@ -323,6 +342,7 @@ class TestDecodePhases:
         assert phases["kv_wait"] == pytest.approx(0.5)
         assert phases["decode"] == pytest.approx(1.0)
         assert phases["total"] == pytest.approx(1.57)
+
 
 class TestFormatting:
     def test_format_contains_role_and_phases(self):
@@ -349,6 +369,7 @@ class TestFormatting:
         s = format_time_stats(ts, req_id="r")
         assert "weird" in s
 
+
 class TestMaybeLog:
     def test_disabled_does_not_log(self, caplog):
         ts = TimeStats("prefill", clock=_FakeClock())
@@ -372,13 +393,16 @@ class TestMaybeLog:
             maybe_log_time_stats(None, req_id="r", enabled=True)
         assert caplog.text == ""
 
+
 # ---- from test_kv_cache_pop_idempotent.py ----
+
 
 def _make_req() -> Req:
     req = Req("rid", "text", [1, 2, 3], SamplingParams(max_new_tokens=1))
     req.kv_committed_len = 10
     req.kv_allocated_len = 10
     return req
+
 
 class TestKVCachePopIdempotent(unittest.TestCase):
     def test_pop_committed_idempotent(self):
@@ -394,10 +418,12 @@ class TestKVCachePopIdempotent(unittest.TestCase):
         self.assertEqual(req.pop_overallocated_kv_cache(), (0, 0))
         self.assertEqual(req.pop_overallocated_kv_cache(), (0, 0))
 
+
 if __name__ == "__main__":
     unittest.main()
 
 # ---- from test_kv_debug_snapshot_list.py ----
+
 
 def test_list_matches_stacked():
     rng = np.random.default_rng(0)
@@ -409,7 +435,9 @@ def test_list_matches_stacked():
     assert snap_list.global_digest == snap_stack.global_digest
     assert snap_list.page_digests == snap_stack.page_digests
 
+
 # ---- from test_pd_admission.py ----
+
 
 class _Pool:
     def __init__(self, n):
@@ -418,10 +446,12 @@ class _Pool:
     def reserve(self):
         return self._free.pop(0) if self._free else None
 
+
 class _Req:
     def __init__(self, room):
         self.bootstrap_room = room
         self.disagg_host_buffer_id = None
+
 
 def test_non_pd_req_not_gated():
     pool = _Pool(1)
@@ -429,17 +459,20 @@ def test_non_pd_req_not_gated():
     ok, bid = _reserve_host_slot_for_pd(pool, True, req)
     assert ok is True and bid is None  # admitted, no reservation
 
+
 def test_pd_req_reserves_slot():
     pool = _Pool(1)
     req = _Req(room=7)
     ok, bid = _reserve_host_slot_for_pd(pool, True, req)
     assert ok is True and bid == 0
 
+
 def test_pd_req_blocked_when_pool_full():
     pool = _Pool(0)
     req = _Req(room=7)
     ok, bid = _reserve_host_slot_for_pd(pool, True, req)
     assert ok is False and bid is None  # caller must `continue` (stay in queue)
+
 
 def test_disabled_or_no_pool_not_gated():
     req = _Req(room=7)
