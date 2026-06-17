@@ -9,6 +9,7 @@ def _make_server_args(**overrides):
     args.disable_radix_cache = False
     args.chunked_prefill_size = None
     args.max_seq_len = 4096
+    args.enable_unified_radix_tree = False
     for k, v in overrides.items():
         setattr(args, k, v)
     return args
@@ -38,6 +39,22 @@ class TestBuildKVCache(unittest.TestCase):
         from sgl_jax.srt.mem_cache.radix_cache import RadixCache
 
         self.assertIsInstance(cache, RadixCache)
+
+    def test_enable_unified_radix_tree_returns_unified_radix_cache(self):
+        cache = build_kv_cache(
+            server_args=_make_server_args(enable_unified_radix_tree=True),
+            model_config=_make_model_config(),
+            req_to_token_pool=MagicMock(),
+            token_to_kv_pool_allocator=MagicMock(),
+            page_size=1,
+            is_hybrid=False,
+            sliding_window_size=None,
+            tp_size=1,
+            spec_algorithm=None,
+        )
+        from sgl_jax.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        self.assertIsInstance(cache, UnifiedRadixCache)
 
     def test_disable_radix_no_chunked_prefill_returns_disabled_radix(self):
         cache = build_kv_cache(

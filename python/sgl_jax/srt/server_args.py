@@ -150,6 +150,7 @@ class ServerArgs:
 
     # Optimization/debug options
     disable_radix_cache: bool = False
+    enable_unified_radix_tree: bool = False
     allow_auto_truncate: bool = False
     enable_tokenizer_batch_encode: bool = False
     disable_overlap_schedule: bool = False
@@ -326,6 +327,9 @@ class ServerArgs:
         os.environ["SGLANG_ENABLE_DETERMINISTIC_SAMPLING"] = (
             "1" if self.enable_deterministic_sampling else "0"
         )
+
+        if os.getenv("SGLANG_JAX_ENABLE_UNIFIED_RADIX_TREE", "0") == "1":
+            self.enable_unified_radix_tree = True
 
         if self.nnodes > 1 and self.device_indexes is not None:
             logger.warning("In a multi-machine scenario, device_indexes will be set to None.")
@@ -995,6 +999,13 @@ class ServerArgs:
             help="Disable RadixAttention for prefix caching.",
         )
         parser.add_argument(
+            "--enable-unified-radix-tree",
+            action="store_true",
+            help="Route non-hybrid (full-attention) models to UnifiedRadixCache "
+            "(component-agnostic prefix cache). Default off; hybrid models are "
+            "unaffected.",
+        )
+        parser.add_argument(
             "--allow-auto-truncate",
             action="store_true",
             help="Allow automatically truncating requests that exceed the maximum input length instead of returning an error.",
@@ -1093,7 +1104,7 @@ class ServerArgs:
         parser.add_argument(
             "--moe-backend",
             type=str,
-            choices=["epmoe", "fused", "auto"],
+            choices=["epmoe", "fused", "fused_v2", "auto"],
             default=ServerArgs.moe_backend,
             help="The backend to use for MoE models.",
         )

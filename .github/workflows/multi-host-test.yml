@@ -322,7 +322,7 @@ jobs:
                     python3 -m pip install --upgrade pip
                     python3 -m pip install -e "python[all]"
                     python3 -m pip install evalscope
-                    python3 test/srt/multi_host/suite_runner.py
+                    python3 test/srt/nightly/multi_host/suite_runner.py
                   env:
                   - name: JOB_COMPLETION_INDEX
                     valueFrom:
@@ -360,6 +360,8 @@ jobs:
                     value: "/models/model_scope"
                   - name: JAX_COMPILATION_CACHE_DIR
                     value: "/xla-cache"
+                  - name: JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS
+                    value: "1"
                   - name: HF_HUB_DOWNLOAD_TIMEOUT
                     value: "600"
                   - name: REPO_REF

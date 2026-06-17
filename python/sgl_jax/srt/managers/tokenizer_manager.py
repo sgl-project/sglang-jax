@@ -14,10 +14,12 @@ import sys
 import threading
 import time
 import uuid
+import zlib
 from collections import deque
 from datetime import datetime
 from http import HTTPStatus
 from typing import Any
+from urllib.parse import urlparse
 
 import fastapi
 import jax
@@ -175,6 +177,7 @@ class TokenizerManager:
                 revision=server_args.revision,
                 tokenizer_backend=server_args.tokenizer_backend,
                 sub_dir=tokenizer_subdir,
+                download_dir=server_args.download_dir,
             )
 
         # Store states
@@ -303,6 +306,7 @@ class TokenizerManager:
                 )
             encoded = self.tokenizer(input_text)
             input_ids = encoded["input_ids"]
+
         self._validate_one_request(obj, input_ids)
         return self._create_tokenized_object(obj, input_text, input_ids)
 
@@ -373,6 +377,46 @@ class TokenizerManager:
             obj.extra_key,
             obj.return_routed_experts,
         )
+
+        # PD disaggregation passthrough. When the engine is
+        # running in disaggregation_mode=decode, the request body MUST
+        # carry bootstrap_{host,port,room}.
+        #
+        # If the request didn't carry bootstrap_* fields but the engine
+        # knows its bootstrap URL, auto-derive them.
+        if getattr(self.server_args, "disaggregation_mode", "null") == "decode":
+            bootstrap_url = getattr(self.server_args, "disaggregation_bootstrap_url", None)
+            if (
+                obj.bootstrap_host is None or obj.bootstrap_port is None
+            ) and bootstrap_url is not None:
+                parsed = urlparse(bootstrap_url)
+                if parsed.hostname is not None and parsed.port is not None:
+                    if obj.bootstrap_host is None:
+                        host = parsed.hostname
+                        if ":" in host:
+                            host = f"[{host}]"
+                        obj.bootstrap_host = host
+                    if obj.bootstrap_port is None:
+                        obj.bootstrap_port = parsed.port
+            if obj.bootstrap_room is None and obj.rid is not None:
+                obj.bootstrap_room = zlib.crc32(str(obj.rid).encode("utf-8"))
+            missing = [
+                name
+                for name in ("bootstrap_host", "bootstrap_port", "bootstrap_room")
+                if getattr(obj, name, None) is None
+            ]
+            if missing:
+                raise ValueError(
+                    "disaggregation_mode=decode requires the request "
+                    f"to provide {missing}; got obj.bootstrap_host="
+                    f"{obj.bootstrap_host!r}, "
+                    f"obj.bootstrap_port={obj.bootstrap_port!r}, "
+                    f"obj.bootstrap_room={obj.bootstrap_room!r}"
+                )
+        tokenized_obj.bootstrap_host = getattr(obj, "bootstrap_host", None)
+        tokenized_obj.bootstrap_port = getattr(obj, "bootstrap_port", None)
+        tokenized_obj.bootstrap_room = getattr(obj, "bootstrap_room", None)
+        tokenized_obj.disagg_transfer_id = getattr(obj, "disagg_transfer_id", None)
         # note: When only `return_logprob` is specified, we assume that only the output probability is required.
         if (
             tokenized_obj.return_logprob
@@ -644,7 +688,7 @@ class TokenizerManager:
         host_tracer_level: int | None = None,
         python_tracer_level: int | None = None,
         stage_id: int | None = None,
-        profile_by_stage: bool = False,
+        profile_by_stage: bool | None = False,
         profile_stages: list[str] | None = None,
     ):
         self.auto_create_handle_loop()

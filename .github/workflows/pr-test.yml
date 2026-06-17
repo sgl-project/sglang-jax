@@ -15,6 +15,9 @@ concurrency:
   group: pr-test-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+permissions:
+  contents: read
+
 jobs:
   # =============================================== coordinator ====================================================
   coordinator:
@@ -28,7 +31,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        part: [0, 1, 2]
+        part: [0, 1, 2, 3, 4]
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
@@ -40,13 +43,14 @@ jobs:
         env:
           SGLANG_JAX_IS_IN_CI: true
           JAX_COMPILATION_CACHE_DIR: /xla-cache
+          JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS: "1"
           SGLANG_JAX_MODEL_CACHE: /models/model_scope
         run: |
-          python test/srt/run_suite.py --suite unit-test-tpu-v6e-1 --auto-partition-id ${{ matrix.part }} --auto-partition-size 3
+          python test/srt/run_suite.py --suite unit-test-tpu-v6e-1 --auto-partition-id ${{ matrix.part }} --auto-partition-size 5
 
   # =============================================== Stage 2: multi-chip + e2e + accuracy ============================
   unit-test-4-tpu:
-    needs: [coordinator, unit-test-1-tpu]
+    needs: [coordinator, unit-test-1-tpu, unit-test-cpu]
     if: needs.coordinator.outputs.run_main_test == 'true'
     runs-on: arc-runner-v6e-4
     strategy:
@@ -64,6 +68,7 @@ jobs:
         env:
           SGLANG_JAX_IS_IN_CI: true
           JAX_COMPILATION_CACHE_DIR: /xla-cache
+          JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS: "1"
           SGLANG_JAX_MODEL_CACHE: /models/model_scope
         run: |
           bash scripts/killall_sglang.sh
@@ -90,7 +95,7 @@ jobs:
           python test/srt/run_suite.py --suite unit-test-cpu
 
   e2e-test-1-tpu:
-    needs: [coordinator, unit-test-1-tpu]
+    needs: [coordinator, unit-test-1-tpu, unit-test-cpu]
     if: needs.coordinator.outputs.run_main_test == 'true'
     runs-on: arc-runner-v6e-1
     strategy:
@@ -108,6 +113,7 @@ jobs:
         env:
           SGLANG_JAX_IS_IN_CI: true
           JAX_COMPILATION_CACHE_DIR: /xla-cache
+          JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS: "1"
           SGLANG_JAX_MODEL_CACHE: /models/model_scope
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_DOWNLOAD_TIMEOUT: 300
@@ -117,7 +123,7 @@ jobs:
 
 
   e2e-test-4-tpu:
-    needs: [coordinator, unit-test-1-tpu]
+    needs: [coordinator, unit-test-1-tpu, unit-test-cpu]
     if: needs.coordinator.outputs.run_main_test == 'true'
     runs-on: arc-runner-v6e-4
     strategy:
@@ -137,6 +143,7 @@ jobs:
         env:
           SGLANG_JAX_IS_IN_CI: true
           JAX_COMPILATION_CACHE_DIR: /xla-cache
+          JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS: "1"
           SGLANG_JAX_MODEL_CACHE: /models/model_scope
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_DOWNLOAD_TIMEOUT: 300
@@ -145,7 +152,7 @@ jobs:
           python test/srt/run_suite.py --suite e2e-test-tpu-v6e-4 --auto-partition-id ${{ matrix.part }} --auto-partition-size 3
 
   accuracy-test-1-tpu:
-    needs: [coordinator, unit-test-1-tpu]
+    needs: [coordinator, unit-test-1-tpu, unit-test-cpu]
     if: needs.coordinator.outputs.run_main_test == 'true'
     runs-on: arc-runner-v6e-1
     strategy:
@@ -154,7 +161,7 @@ jobs:
         part: [0]
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Python environment
         uses: ./.github/actions/setup-venv
@@ -164,6 +171,7 @@ jobs:
         env:
           SGLANG_JAX_IS_IN_CI: true
           JAX_COMPILATION_CACHE_DIR: /xla-cache
+          JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS: "1"
           SGLANG_JAX_MODEL_CACHE: /models/model_scope
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_DOWNLOAD_TIMEOUT: 300
@@ -172,7 +180,7 @@ jobs:
           python test/srt/run_suite.py --suite accuracy-test-tpu-v6e-1 --auto-partition-id ${{ matrix.part }} --auto-partition-size 1
 
   accuracy-test-4-tpu:
-    needs: [coordinator, unit-test-1-tpu]
+    needs: [coordinator, unit-test-1-tpu, unit-test-cpu]
     if: needs.coordinator.outputs.run_main_test == 'true'
 
     runs-on: arc-runner-v6e-4
@@ -182,7 +190,7 @@ jobs:
         part: [0]
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Python environment
         uses: ./.github/actions/setup-venv
@@ -192,6 +200,7 @@ jobs:
         env:
           SGLANG_JAX_IS_IN_CI: true
           JAX_COMPILATION_CACHE_DIR: /xla-cache
+          JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS: "1"
           SGLANG_JAX_MODEL_CACHE: /models/model_scope
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_DOWNLOAD_TIMEOUT: 300
@@ -201,7 +210,7 @@ jobs:
 
   # ---- Stage 2 optional: multi-chip-extra (label test:multi-chip or test:full) ----
   multi-chip-extra-test-4-tpu:
-    needs: [coordinator, unit-test-1-tpu]
+    needs: [coordinator, unit-test-1-tpu, unit-test-cpu]
     if: >-
       needs.coordinator.outputs.run_main_test == 'true' &&
       (needs.coordinator.outputs.requires_4tpu == 'true' || needs.coordinator.outputs.run_full == 'true')
@@ -219,6 +228,7 @@ jobs:
         env:
           SGLANG_JAX_IS_IN_CI: true
           JAX_COMPILATION_CACHE_DIR: /xla-cache
+          JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS: "1"
           SGLANG_JAX_MODEL_CACHE: /models/model_scope
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_DOWNLOAD_TIMEOUT: 300
@@ -228,7 +238,7 @@ jobs:
 
   # ---- Stage 2 optional: accuracy-extra (label test:accuracy-extra or test:full) ----
   accuracy-extra-test-1-tpu:
-    needs: [coordinator, unit-test-1-tpu]
+    needs: [coordinator, unit-test-1-tpu, unit-test-cpu]
     if: >-
       needs.coordinator.outputs.run_main_test == 'true' &&
       (needs.coordinator.outputs.run_accuracy_extra == 'true' || needs.coordinator.outputs.run_full == 'true')
@@ -246,6 +256,7 @@ jobs:
         env:
           SGLANG_JAX_IS_IN_CI: true
           JAX_COMPILATION_CACHE_DIR: /xla-cache
+          JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS: "1"
           SGLANG_JAX_MODEL_CACHE: /models/model_scope
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_DOWNLOAD_TIMEOUT: 300
@@ -264,7 +275,7 @@ jobs:
         part: [0]
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Python environment
         uses: ./.github/actions/setup-venv
@@ -274,6 +285,7 @@ jobs:
         env:
           SGLANG_JAX_IS_IN_CI: true
           JAX_COMPILATION_CACHE_DIR: /xla-cache
+          JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS: "1"
           SGLANG_JAX_MODEL_CACHE: /models/model_scope
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_DOWNLOAD_TIMEOUT: 300
@@ -291,7 +303,7 @@ jobs:
         part: [0, 1]
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Python environment
         uses: ./.github/actions/setup-venv
@@ -301,6 +313,7 @@ jobs:
         env:
           SGLANG_JAX_IS_IN_CI: true
           JAX_COMPILATION_CACHE_DIR: /xla-cache
+          JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS: "1"
           SGLANG_JAX_MODEL_CACHE: /models/model_scope
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_DOWNLOAD_TIMEOUT: 300
@@ -326,6 +339,7 @@ jobs:
         env:
           SGLANG_JAX_IS_IN_CI: true
           JAX_COMPILATION_CACHE_DIR: /xla-cache
+          JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS: "1"
           SGLANG_JAX_MODEL_CACHE: /models/model_scope
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_DOWNLOAD_TIMEOUT: 300
@@ -354,6 +368,7 @@ jobs:
         env:
           SGLANG_JAX_IS_IN_CI: true
           JAX_COMPILATION_CACHE_DIR: /xla-cache
+          JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS: "1"
           SGLANG_JAX_MODEL_CACHE: /models/model_scope
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_DOWNLOAD_TIMEOUT: 300

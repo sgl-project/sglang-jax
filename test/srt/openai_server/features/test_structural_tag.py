@@ -51,9 +51,6 @@ def setup_class(cls, backend: str):
             "--grammar-backend",
             backend,
         ],
-        env={
-            "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
-        },
     )
 
 

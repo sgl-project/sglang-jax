@@ -58,6 +58,27 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
             page_size=params.page_size,
         )
 
+    if (
+        ctx.server_args.enable_unified_radix_tree
+        and not ctx.is_hybrid_swa
+        and not ctx.disable_radix_cache
+    ):
+        from sgl_jax.srt.mem_cache.unified_cache_components import ComponentType
+        from sgl_jax.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        return UnifiedRadixCache(
+            req_to_token_pool=params.req_to_token_pool,
+            token_to_kv_pool_allocator=params.token_to_kv_pool_allocator,
+            page_size=params.page_size,
+            disable=False,
+            kv_head_num=ctx.model_config.get_num_kv_heads(ctx.tp_size),
+            head_dim=ctx.model_config.head_dim,
+            layer_num=ctx.model_config.num_hidden_layers,
+            max_seq_len=ctx.server_args.max_seq_len,
+            is_eagle=params.is_eagle,
+            tree_components=(ComponentType.FULL,),
+        )
+
     from sgl_jax.srt.mem_cache.radix_cache import RadixCache
 
     return RadixCache(

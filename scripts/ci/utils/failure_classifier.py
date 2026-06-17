@@ -165,10 +165,15 @@ def fetch_job_logs(repo, job_id, max_lines=500):
 _FINISH_GATE_RE = re.compile(r"-finish$", re.IGNORECASE)
 
 
+def is_finish_gate(name):
+    """True if ``name`` is a matrix ``*-finish`` aggregation gate (noise, not a real failure)."""
+    return bool(_FINISH_GATE_RE.search(name or ""))
+
+
 def classify_jobs(repo, failed_jobs):
     """Fetch logs and classify each failed job. Mutates jobs in-place, adding 'failure_type'."""
     for job in failed_jobs:
-        if _FINISH_GATE_RE.search(job["name"]):
+        if is_finish_gate(job["name"]):
             job["failure_type"] = "infrastructure"
             print(f"  {job['name']}: infrastructure (finish gate)")
             continue

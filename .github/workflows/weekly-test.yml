@@ -29,10 +29,11 @@ jobs:
     env:
       TZ: Asia/Shanghai
       JAX_COMPILATION_CACHE_DIR: /xla-cache
+      JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS: "1"
       SGLANG_JAX_MODEL_CACHE: /models/model_scope
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
       - name: Setup Python environment
         uses: ./.github/actions/setup-venv
         with:
@@ -93,10 +94,11 @@ jobs:
     env:
       TZ: Asia/Shanghai
       JAX_COMPILATION_CACHE_DIR: /xla-cache
+      JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS: "1"
       SGLANG_JAX_MODEL_CACHE: /models/model_scope
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
       - name: Setup Python environment
         uses: ./.github/actions/setup-venv
         with:
@@ -131,10 +133,11 @@ jobs:
     env:
       TZ: Asia/Shanghai
       JAX_COMPILATION_CACHE_DIR: /xla-cache
+      JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS: "1"
       SGLANG_JAX_MODEL_CACHE: /models/model_scope
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
       - name: Setup Python environment
         uses: ./.github/actions/setup-venv
       - name: Run performance test for text models
@@ -174,10 +177,11 @@ jobs:
     env:
       TZ: Asia/Shanghai
       JAX_COMPILATION_CACHE_DIR: /xla-cache
+      JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS: "1"
       SGLANG_JAX_MODEL_CACHE: /models/model_scope
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Python environment
         uses: ./.github/actions/setup-venv
@@ -239,10 +243,11 @@ jobs:
       env:
         TZ: Asia/Shanghai
         JAX_COMPILATION_CACHE_DIR: /xla-cache
+        JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS: "1"
         SGLANG_JAX_MODEL_CACHE: /models/model_scope
       steps:
         - name: Checkout code
-          uses: actions/checkout@v4
+          uses: actions/checkout@v5
 
         - name: Setup Python environment
           uses: ./.github/actions/setup-venv
@@ -282,10 +287,11 @@ jobs:
         env:
           TZ: Asia/Shanghai
           JAX_COMPILATION_CACHE_DIR: /xla-cache
+          JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS: "1"
           SGLANG_JAX_MODEL_CACHE: /models/model_scope
         steps:
           - name: Checkout code
-            uses: actions/checkout@v4
+            uses: actions/checkout@v5
 
           - name: Setup Python environment
             uses: ./.github/actions/setup-venv

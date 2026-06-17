@@ -22,6 +22,9 @@ on:
         description: "Run Pallas kernel benchmark (requires secrets)"
         value: ${{ jobs.decide.outputs.run_pallas_bench }}
 
+permissions:
+  contents: read
+
 jobs:
   decide:
     runs-on: ubuntu-latest
@@ -34,13 +37,13 @@ jobs:
       run_pallas_bench: ${{ steps.decide.outputs.run_pallas_bench }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Detect file changes
         id: filter
-        uses: dorny/paths-filter@v3
+        uses: dorny/paths-filter@v4
         with:
           filters: |
             main_package:
@@ -52,7 +55,7 @@ jobs:
               - ".github/workflows/coordinator.yml"
               - ".github/actions/**"
             pallas_kernel:
-              - "python/sgl_jax/kernels/**"
+              - "python/sgl_jax/srt/kernels/**"
               - "benchmark/kernels/**"
               - ".github/workflows/pr-test.yml"
               - ".github/workflows/coordinator.yml"

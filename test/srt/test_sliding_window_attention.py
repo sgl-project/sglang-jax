@@ -43,9 +43,6 @@ class TestSlidingWindowAttention(CustomTestCase):
                 "--swa-full-tokens-ratio",
                 "0.2",
             ],
-            env={
-                "JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache",
-            },
         )
 
     @classmethod

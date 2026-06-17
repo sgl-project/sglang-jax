@@ -83,7 +83,7 @@ curl -X POST http://127.0.0.1:30000/v1/chat/completions \
 
 ## Method 4: Using Kubernetes
 
-🚧 **Under Construction** 🚧
+For deploying SGLang-Jax on Google Kubernetes Engine (GKE) with Cloud TPUs, please follow our [GKE TPU Getting Started Guide](gke-tpu-install.md).
 
 ## Method 5: Run on Cloud TPU with SkyPilot
 

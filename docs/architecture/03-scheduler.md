@@ -164,7 +164,7 @@ Waiting ──(picked by PrefillAdder)──→ Prefilling ──(prefill done)�
    └─────────────────────────(OOM Retract)────────────────────────────┘
 ```
 
-**Waiting** — The request sits in `waiting_queue` waiting to be scheduled. `init_next_round_input()` computes prefix matching (`tree_cache.match_prefix()`) to determine `prefix_indices` and `extend_input_len`.
+**Waiting** — The request sits in `waiting_queue` waiting to be scheduled. `init_next_round_input()` builds `fill_ids`, then determines `prefix_indices` and `extend_input_len`. When Tree Cache is enabled, it computes prefix matching via `tree_cache.match_prefix()`; when Tree Cache is disabled, it uses an empty prefix and the cache root node.
 
 **Prefilling** — The request is selected into a Prefill batch by `PrefillAdder`. `prepare_for_extend()` allocates KV Cache, and the model forward inference processes the input token sequence.
 
@@ -266,17 +266,24 @@ Data Parallel does not change the number of Scheduler processes. After receiving
 
 **Request admission logic** (`add_one_req()`):
 
-1. Compute `total_tokens = extend_input_len + min(max_new_tokens, 4096)`
-2. Check whether `total_tokens` exceeds `rem_total_tokens` and `rem_input_tokens`
-3. Lock the Radix Tree node to prevent the prefix from being evicted during admission
-4. If Chunked Prefill is needed, truncate `extend_input_len` to `rem_chunk_tokens` (aligned to `page_size`)
-5. Update each budget dimension
+1. Resolve the request's target `dp_rank`
+2. Compute `total_tokens = extend_input_len + min(max_new_tokens, 4096)`
+3. Check whether the request fits within that DP rank's remaining full-KV budget
+4. For hybrid SWA models, check whether the request also fits within that DP rank's SWA budget
+5. Check the global prefill input-token budget, using paged input length and accounting for host prefix hits
+6. Lock the Radix Tree node to prevent the prefix from being evicted during admission
+7. If Chunked Prefill is needed, truncate `extend_input_len` to the target rank's remaining chunk budget, aligned to `page_size`
+8. Update the relevant global and per-rank budget counters
 
-**Budget state** (`budget_state()`):
+**Budget state** (`budget_state()` / `_budget_state_after_add()`):
 
-- `NO_TOKEN` — Total or current tokens exhausted; stop admitting
-- `OTHER` — Input/chunk budget exhausted; stop admitting
-- `CONTINUE` — Continue admitting
+`PrefillAdder` reports whether request admission should continue after each attempted add:
+
+- `NO_TOKEN` — Token capacity is exhausted for the relevant DP rank. The Scheduler marks that rank as full and continues scanning `waiting_queue` for requests assigned to other ranks. For hybrid SWA models, this can happen when the target rank's SWA budget is exhausted.
+- `OTHER` — A global prefill limit is exhausted, such as `rem_input_tokens` or the chunked-prefill token budget. The Scheduler stops building the current Prefill batch.
+- `CONTINUE` — Continue admitting requests.
+
+The general `budget_state()` view uses the minimum remaining full-KV budget across DP ranks for compatibility. After a request is admitted, `add_one_req()` uses a rank-aware post-add check so one exhausted DP rank does not unnecessarily stop admission on other ranks.
 
 ### Prefill Batch Construction Flow (`get_new_batch_prefill()`)
 
@@ -286,8 +293,7 @@ Data Parallel does not change the number of Scheduler processes. After receiving
 4. Create a `PrefillAdder`, set the token budget
 5. Iterate over the sorted `waiting_queue`:
    - `req.init_next_round_input(tree_cache)` — Compute prefix match
-   - `adder.add_one_req(req)` — Try to admit
-   - Stop if budget is exhausted
+   - `adder.add_one_req(req)` — Try to admit; `NO_TOKEN` only marks the request's DP rank full, while `OTHER` stops the Prefill batch construction loop
 6. `ScheduleBatch.init_new()` → `prepare_for_extend()` — Allocate KV Cache per DP rank, build per-DP batch arrays
 
 ### Decode Batch Update (`update_running_batch()`)

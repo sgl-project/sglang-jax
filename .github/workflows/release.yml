@@ -35,6 +35,10 @@ jobs:
   publish:
     needs: tag
     if: ${{ ! inputs.dry_run }}
+    permissions:
+      actions: read
+      contents: write
+      issues: write
     uses: ./.github/workflows/publish.yml
     secrets: inherit
     with:

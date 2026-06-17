@@ -142,9 +142,12 @@ QWEN_7B = _local_or_hf("Qwen/Qwen-7B")
 QWEN3_4B = _local_or_hf("Qwen/Qwen3-4B")
 
 QWEN3_MOE_30B = _local_or_hf("Qwen/Qwen3-30B-A3B")
+QWEN3_5_35B_A3B = "/models/Qwen3.5-35B-A3B/"
 QWEN2_5_7B_INSTRUCT = _local_or_hf("Qwen/Qwen2.5-7B-Instruct")
 QWEN3_CODER_30B_A3B_INSTRUCT = _local_or_hf("Qwen/Qwen3-Coder-30B-A3B-Instruct")
 GEMMA2_2B_IT = _local_or_hf("google/gemma-2-2b-it")
+GEMMA4_31B_IT = _local_or_hf("google/gemma-4-31B-it")
+GEMMA4_26B_A4B_IT = _local_or_hf("google/gemma-4-26B-A4B-it")
 
 BAILING_MOE = _local_or_hf("inclusionAI/Ling-mini-2.0")
 DEEPSEEK_R1_DISTILL_QWEN_1_5B = _local_or_hf("deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B")
@@ -464,6 +467,13 @@ def get_benchmark_args(
     backend="sgl-jax",
     warmup_requests=1,
     return_routed_experts=False,
+    gsp_num_groups=64,
+    gsp_prompts_per_group=16,
+    gsp_system_prompt_len=2048,
+    gsp_question_len=128,
+    gsp_output_len=256,
+    gsp_range_ratio=1.0,
+    flush_cache=False,
 ):
     return SimpleNamespace(
         backend=backend,
@@ -500,6 +510,13 @@ def get_benchmark_args(
         pd_separated=pd_separated,
         warmup_requests=warmup_requests,
         return_routed_experts=return_routed_experts,
+        gsp_num_groups=gsp_num_groups,
+        gsp_prompts_per_group=gsp_prompts_per_group,
+        gsp_system_prompt_len=gsp_system_prompt_len,
+        gsp_question_len=gsp_question_len,
+        gsp_output_len=gsp_output_len,
+        gsp_range_ratio=gsp_range_ratio,
+        flush_cache=flush_cache,
     )
 
 
@@ -813,3 +830,13 @@ class KDAAttnBackendForTest:
 
     def __setattr__(self, name, value):
         setattr(self._backend, name, value)
+
+
+class GDNAttnBackendForTest(KDAAttnBackendForTest):
+    """Test wrapper for GDNAttnBackend with the same ``pool=`` translation.
+
+    Identical contract to :class:`KDAAttnBackendForTest`. Kept as a distinct
+    class for symmetry with the GDN test files (mirrors the KDA naming)
+    and to make ``test_gdn_attention*.py`` self-contained without leaking
+    KDA-specific imports.
+    """

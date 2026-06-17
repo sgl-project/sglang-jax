@@ -4,7 +4,8 @@ from types import SimpleNamespace
 import numpy as np
 
 from sgl_jax.srt.managers.schedule_batch import Req, ScheduleBatch
-from sgl_jax.srt.managers.schedule_policy import PrefillAdder
+from sgl_jax.srt.managers.schedule_policy import AddReqResult, PrefillAdder
+from sgl_jax.srt.mem_cache.base_prefix_cache import IncLockRefResult
 from sgl_jax.srt.sampling.sampling_params import SamplingParams
 
 
@@ -16,6 +17,21 @@ class _DummyAllocator:
 class _DummyTreeCache:
     def evictable_size(self, dp_rank: int = 0):
         return 0
+
+
+class _DummyRadixCache:
+    """Tree cache with disable=False so add_one_req takes the radix path."""
+
+    disable = False
+
+    def evictable_size(self, dp_rank: int = 0):
+        return 0
+
+    def inc_lock_ref(self, node):
+        return IncLockRefResult(delta=0)
+
+    def dec_lock_ref(self, node, params=None):
+        pass
 
 
 def _make_req(rid: str, dp_rank: int, input_len: int = 4, output_len: int = 2) -> Req:
@@ -163,6 +179,41 @@ class TestMixedChunkDP(unittest.TestCase):
         self.assertEqual(adder.cur_rem_token_offset, [3, 1])
         self.assertEqual(adder.rem_input_tokens, 96)
         self.assertEqual(adder.rem_chunk_tokens_list, [17, 19])
+
+    def test_add_one_req_chunked_admits_all_dp_ranks_with_radix(self):
+        # Regression for #1239: with radix enabled (tree_cache.disable=False) +
+        # chunked prefill + dp>1 + extend_input_len >= max_prefill_tokens, the
+        # untruncated rem_input_tokens gate would return OTHER on the second
+        # rank, serializing prefill to one DP rank per round.
+        dp_size = 4
+        adder = PrefillAdder(
+            page_size=256,
+            tree_cache=_DummyRadixCache(),
+            token_to_kv_pool_allocator=_DummyAllocator(),
+            running_batch=None,
+            new_token_ratio=1.0,
+            rem_input_tokens=16384,
+            rem_chunk_tokens=2048,
+            dp_size=dp_size,
+        )
+        for dp in range(dp_size):
+            req = _make_req(f"r{dp}", dp_rank=dp, input_len=16384)
+            req.sampling_params.ignore_eos = True
+            req.fill_ids = req.origin_input_ids
+            req.extend_input_len = len(req.fill_ids)
+            req.prefix_indices = []
+            req.host_hit_length = 0
+            req.last_node = object()
+            res = adder.add_one_req(req)
+            self.assertEqual(
+                res,
+                AddReqResult.CONTINUE,
+                f"dp_rank={dp} got {res}; chunked admission must not serialize across DP ranks",
+            )
+        for dp in range(dp_size):
+            self.assertEqual(len(adder.can_run_list[dp]), 1)
+            self.assertIs(adder.new_chunked_reqs[dp], adder.can_run_list[dp][0])
+            self.assertEqual(adder.can_run_list[dp][0].extend_input_len, 2048)
 
 
 if __name__ == "__main__":

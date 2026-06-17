@@ -36,7 +36,8 @@ More details in [architecture](https://github.com/sgl-project/sglang-jax/blob/ma
 ## Getting Started
 
 - [Install SGL-JAX](https://github.com/sgl-project/sglang-jax/blob/main/docs/get_started/install.md)
-- [Quick Start](https://github.com/sgl-project/sglang-jax/blob/main/docs/basic_usage/qwen.md)
+- [Cookbook (model recipes)](https://github.com/sgl-project/sglang-jax/blob/main/docs/cookbook/index.md)
+- [Quick Start (Qwen3 on TPU v6e-4)](https://github.com/sgl-project/sglang-jax/blob/main/docs/cookbook/autoregressive/qwen3.md)
 - [Benchmark and Profiling](https://github.com/sgl-project/sglang-jax/blob/main/docs/developer_guide/benchmark_and_profiling.md)
 - [Contribution Guide](https://github.com/sgl-project/sglang-jax/blob/main/docs/developer_guide/contribution_guide.md)
 

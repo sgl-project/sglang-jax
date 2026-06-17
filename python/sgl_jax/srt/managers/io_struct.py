@@ -167,6 +167,14 @@ class TokenizedGenerateReqInput:
     mm_inputs: dict | None = None
     # The data parallel rank for this request
     dp_rank: int | None = None
+    # PD disaggregation routing keys.
+    bootstrap_host: str | None = None
+    bootstrap_port: int | None = None
+    bootstrap_room: int | None = None
+    # Optional wire-level transfer identity. When omitted we fall back
+    # to ``rid``; callers that may reuse ``rid`` across retries should
+    # provide a per-attempt value to isolate late acks.
+    disagg_transfer_id: str | None = None
 
 
 @dataclass
@@ -306,6 +314,12 @@ class GenerateReqInput:
     extra_key: list[str] | str | None = None
 
     return_routed_experts: list[bool] | bool | None = None
+
+    # PD disaggregation routing keys.
+    bootstrap_host: list[str] | str | None = None
+    bootstrap_port: list[int] | int | None = None
+    bootstrap_room: list[int] | int | None = None
+    disagg_transfer_id: list[str] | str | None = None
 
     def contains_mm_input(self) -> bool:
         return (
@@ -542,6 +556,28 @@ class GenerateReqInput:
             lora_path=self.lora_path[i] if self.lora_path is not None else None,
             lora_id=self.lora_id[i] if self.lora_id is not None else None,
             return_routed_experts=self.return_routed_experts[i],
+            # PD disaggregation passthrough.
+            # Supports both scalar and list shapes.
+            bootstrap_host=(
+                self.bootstrap_host[i]
+                if isinstance(self.bootstrap_host, list)
+                else self.bootstrap_host
+            ),
+            bootstrap_port=(
+                self.bootstrap_port[i]
+                if isinstance(self.bootstrap_port, list)
+                else self.bootstrap_port
+            ),
+            bootstrap_room=(
+                self.bootstrap_room[i]
+                if isinstance(self.bootstrap_room, list)
+                else self.bootstrap_room
+            ),
+            disagg_transfer_id=(
+                self.disagg_transfer_id[i]
+                if isinstance(self.disagg_transfer_id, list)
+                else self.disagg_transfer_id
+            ),
         )
 
 
@@ -656,7 +692,9 @@ class ProfileReqInput:
     # 1: Enables Python tracing (this is the default).
     python_tracer_level: int | None = None
     stage_id: int | None = None  # Which stage to count steps for (multimodal only)
-    profile_by_stage: bool = False  # Whether to profile prefill/decode separately
+    # Accept None from clients (e.g. bench_serving) that omit this field; None is
+    # treated as False (no per-stage profiling) by the scheduler boolean check.
+    profile_by_stage: bool | None = False  # Whether to profile prefill/decode separately
     profile_stages: list[str] | None = None  # Stages to profile, e.g. ["prefill", "decode"]
 
 
@@ -676,7 +714,7 @@ class ProfileReq:
     python_tracer_level: int | None = None
     profile_id: str | None = None
     stage_id: int | None = None
-    profile_by_stage: bool = False
+    profile_by_stage: bool | None = False
     profile_stages: list[str] | None = None
 
 

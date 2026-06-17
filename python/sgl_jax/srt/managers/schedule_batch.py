@@ -18,6 +18,7 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 """
 
 import dataclasses
+import itertools
 import logging
 import os
 import threading
@@ -34,7 +35,11 @@ from sgl_jax.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
 )
-from sgl_jax.srt.mem_cache.base_prefix_cache import BasePrefixCache
+from sgl_jax.srt.mem_cache.base_prefix_cache import (
+    BasePrefixCache,
+    EvictParams,
+    MatchPrefixParams,
+)
 from sgl_jax.srt.mem_cache.chunk_cache import ChunkCache
 from sgl_jax.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
@@ -180,6 +185,7 @@ class Req:
         # Input and output info
         self.rid = rid
         self.origin_input_text = origin_input_text
+
         self.origin_input_ids_unpadded = (
             origin_input_ids_unpadded
             if origin_input_ids_unpadded
@@ -210,6 +216,12 @@ class Req:
         self.extra_key = extra_key
         self.lora_id = lora_id if lora_id is not None else "0"
         self.dp_rank = dp_rank
+
+        # PD disaggregation routing keys.
+        self.bootstrap_host: str | None = None
+        self.bootstrap_port: int | None = None
+        self.bootstrap_room: int | None = None
+        self.disagg_transfer_id: str | None = None
 
         # Memory pool info
         self.req_pool_idx: int | None = None
@@ -396,21 +408,54 @@ class Req:
         self,
         tree_cache: BasePrefixCache | None = None,
     ):
-        self.fill_ids = self.origin_input_ids + self.output_ids
+        self.fill_ids = (
+            self.origin_input_ids + self.output_ids if self.output_ids else self.origin_input_ids
+        )
+        # PD decode-side: KV was written externally; skip tree_cache.match_prefix
+        # for this req's first decode iter.
+        if getattr(self, "_pd_skip_prefix_match", False):
+            self._pd_skip_prefix_match = False
+            root = getattr(tree_cache, "root_node", None) if tree_cache is not None else None
+            self.last_node = root
+            self.last_host_node = root
+            self.host_hit_length = 0
+            self.last_matched_prefix_len = len(self.prefix_indices)
+            self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
+            return
+        # PD req with empty output_ids: skip match_prefix to avoid
+        # stale radix cache hits.
+        if getattr(self, "bootstrap_room", None) is not None and not self.output_ids:
+            self.prefix_indices = []
+            self.last_matched_prefix_len = 0
+            self.extend_input_len = len(self.fill_ids)
+            root = getattr(tree_cache, "root_node", None) if tree_cache is not None else None
+            self.last_node = root
+            self.last_host_node = root
+            self.host_hit_length = 0
+            return
         if tree_cache is not None:
-            (
-                self.prefix_indices,
-                self.last_node,
-                self.last_host_node,
-                self.host_hit_length,
-            ) = tree_cache.match_prefix(
-                key=RadixKey(self.adjust_max_prefix_ids(), self.extra_key, self.dp_rank),
-            )
+            if getattr(tree_cache, "disable", False):
+                self.prefix_indices = np.empty((0,), dtype=np.int32)
+                self.last_node = tree_cache.root_node
+                self.last_host_node = tree_cache.root_node
+                self.host_hit_length = 0
+            else:
+                match_result = tree_cache.match_prefix(
+                    MatchPrefixParams(
+                        key=RadixKey(self.adjust_max_prefix_ids(), self.extra_key, self.dp_rank)
+                    )
+                )
+                self.prefix_indices = match_result.device_indices
+                self.last_node = match_result.last_device_node
+                self.last_host_node = match_result.last_host_node
+                self.host_hit_length = match_result.host_hit_length
             self.last_matched_prefix_len = len(self.prefix_indices)
         self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
 
     def adjust_max_prefix_ids(self):
-        self.fill_ids = self.origin_input_ids + self.output_ids
+        self.fill_ids = (
+            self.origin_input_ids + self.output_ids if self.output_ids else self.origin_input_ids
+        )
         input_len = len(self.fill_ids)
 
         # FIXME: To work around some bugs in logprob computation, we need to ensure each
@@ -996,14 +1041,19 @@ class ScheduleBatch:
             req_pool_indices = self.alloc_req_slots(reqs)
 
             # Init arrays
-            input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
-            extend_num_tokens = sum(len(ids) for ids in input_ids)
             seq_lens = [len(r.fill_ids) for r in reqs]
             prefix_lens = [len(r.prefix_indices) for r in reqs]
             extend_lens = [r.extend_input_len for r in reqs]
+            extend_num_tokens = sum(extend_lens)
 
             req_pool_indices_cpu = np.array(req_pool_indices, dtype=np.int32)
-            input_ids_cpu = np.array(sum(input_ids, []), dtype=np.int32)
+            input_ids_cpu = np.fromiter(
+                itertools.chain.from_iterable(
+                    r.fill_ids[pre_len:] for r, pre_len in zip(reqs, prefix_lens)
+                ),
+                dtype=np.int32,
+                count=extend_num_tokens,
+            )
             seq_lens_cpu = np.array(seq_lens, dtype=np.int32)
             prefix_lens_cpu = np.array(prefix_lens, dtype=np.int32)
 
@@ -1836,10 +1886,11 @@ class ScheduleBatch:
             # Build positions for this DP rank
             if self.forward_mode.is_extend():
                 # For extend: positions are [prefix_len, prefix_len+1, ..., seq_len-1] for each request
-                dp_positions = []
+                pt = offset
                 for seq_len, prefix_len in zip(info.seq_lens, info.prefix_lens):
-                    dp_positions.extend(range(prefix_len, seq_len))
-                positions_cpu[offset : offset + len(dp_positions)] = dp_positions
+                    next_pt = pt + (seq_len - prefix_len)
+                    positions_cpu[pt:next_pt] = np.arange(prefix_len, seq_len, dtype=np.int32)
+                    pt = next_pt
             else:
                 # For decode: positions are [seq_len-1] for each request
                 dp_positions = info.seq_lens - 1
@@ -2813,11 +2864,13 @@ class ScheduleBatch:
                 if (full_available < num_tokens or swa_available < num_tokens) and self.tree_cache:
                     full_num = max(0, num_tokens - full_available)
                     swa_num = max(0, num_tokens - swa_available)
-                    self.tree_cache.evict(full_num, swa_num, dp_rank=dp_rank)
+                    self.tree_cache.evict(
+                        EvictParams(num_tokens=full_num, swa_num_tokens=swa_num, dp_rank=dp_rank)
+                    )
             else:
                 available = self.token_to_kv_pool_allocator.available_size(dp_rank=dp_rank)
                 if available < num_tokens and self.tree_cache:
-                    self.tree_cache.evict(num_tokens, dp_rank=dp_rank)
+                    self.tree_cache.evict(EvictParams(num_tokens=num_tokens, dp_rank=dp_rank))
 
     def _is_available_size_sufficient(self, num_tokens_per_dp: dict[int, int]) -> bool:
         """Check if sufficient memory available across all DP ranks.
