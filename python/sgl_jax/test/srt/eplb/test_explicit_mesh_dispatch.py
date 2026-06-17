@@ -1,7 +1,8 @@
-"""CPU-only regression test for #<ISSUE_NUM>: EPLB dispatch under explicit-axis Mesh.
+"""CPU-only regression test for #1370: EPLB dispatch under explicit-axis Mesh.
 
 Run: XLA_FLAGS=--xla_force_host_platform_device_count=16 JAX_PLATFORMS=cpu pytest <this>
 """
+
 import os
 
 import numpy as np
@@ -11,7 +12,8 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ.setdefault("XLA_FLAGS", "--xla_force_host_platform_device_count=16")
 
 import jax  # noqa: E402
-from jax.sharding import NamedSharding, PartitionSpec as P  # noqa: E402
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P  # noqa: E402
 
 from sgl_jax.srt.eplb.expert_location import (  # noqa: E402
     ExpertLocationMetadata,

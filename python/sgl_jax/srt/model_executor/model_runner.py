@@ -321,7 +321,9 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         if self.server_args.ep_dispatch_algorithm:
             with jax.set_mesh(self.mesh):
                 init_expert_location_metadata(self.server_args, self.model_config)
-            from sgl_jax.srt.eplb.expert_location import get_global_expert_location_metadata
+            from sgl_jax.srt.eplb.expert_location import (
+                get_global_expert_location_metadata,
+            )
 
             md = get_global_expert_location_metadata()
             if md is not None:
