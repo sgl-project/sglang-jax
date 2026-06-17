@@ -37,6 +37,9 @@ class DecodeBookkeeping:
     kv_indices: object | None = None
     # Whether the receiver has been initialized + poll started.
     started: bool = False
+    # Set by _drain_transfer_queue_synced on multi-host so downstream
+    # does not re-poll (a poll() that raised would re-raise and desync).
+    synced_state: KVPoll | None = None
 
 
 class DecodePreallocQueue:
@@ -243,7 +246,13 @@ class SchedulerDisaggregationDecodeMixin:
 
         for entry in self._drain_transfer_queue_synced():
             assert entry.receiver is not None
-            state = entry.receiver.poll()
+            state = entry.synced_state
+            if state is None:
+                try:
+                    state = entry.receiver.poll()
+                except Exception:
+                    logger.exception("receiver.poll() raised for req_id=%s", entry.req_id)
+                    state = KVPoll.FAILED
             if state == KVPoll.SUCCESS:
                 try:
                     kv_result = entry.receiver.result
@@ -323,12 +332,13 @@ class SchedulerDisaggregationDecodeMixin:
                 room = getattr(e.req, "bootstrap_room", None)
                 if room in failed:
                     self.disagg_transfer_queue._entries.pop(rid, None)
-                    if e.receiver.poll() != KVPoll.FAILED:
-                        with suppress(Exception):
-                            e.receiver.fail(reason="peer_np_failed")
+                    with suppress(Exception):
+                        e.receiver.fail(reason="peer_np_failed")
+                    e.synced_state = KVPoll.FAILED
                     out.append(e)
                 elif room in success:
                     self.disagg_transfer_queue._entries.pop(rid, None)
+                    e.synced_state = KVPoll.SUCCESS
                     out.append(e)
         return out
 
