@@ -727,8 +727,8 @@ def _build_fused_greedy_verify_jit(topk: int):
         relay_buffers,
         relay_future_indices,
         verify_allocate_lens,
-        coins,
-        coin_f,
+        sampling_base_rng,
+        sampling_step,
         temperatures,
         top_ks,
         top_ps,
@@ -823,6 +823,19 @@ def _build_fused_greedy_verify_jit(topk: int):
                 speculative_num_draft_tokens=speculative_num_draft_tokens,
             )
         else:
+            # Generate rejection-sampling coins inside the JIT: avoids building them
+            # on host and copying (tbs, n-1)+(tbs,) arrays in every step, and keeps
+            # the threefry/uniform ops fused into this module instead of becoming
+            # standalone eager dispatches (the reason the earlier host-side jax.random
+            # attempt was reverted).
+            sampling_rng = jax.random.fold_in(sampling_base_rng, sampling_step)
+            coins_key, coin_f_key = jax.random.split(sampling_rng)
+            coins = jax.random.uniform(
+                coins_key,
+                (target_bs, speculative_num_draft_tokens - 1),
+                dtype=jnp.float32,
+            )
+            coin_f = jax.random.uniform(coin_f_key, (target_bs,), dtype=jnp.float32)
             prepared = _sampling_sample_and_prepare_draft_inputs_chain_from_logits(
                 target_hidden=target_hidden,
                 positions=target_forward_batch.positions,
@@ -1606,15 +1619,9 @@ def spec_decode_verify_phase(spec_worker, model_worker_batch, cur_allocate_lens)
     si = model_worker_batch.sampling_info
     _sv_is_greedy = bool(getattr(si, "is_all_greedy", True))
     _sv_tbs = target_forward_batch.seq_lens.shape[0]
-    _sv_nm1 = int(draft_worker.speculative_num_draft_tokens) - 1
-    _sv_rep = NamedSharding(spec_worker.mesh, P())
     _sv_enable_top_k = False
     _sv_enable_top_p = False
     if _sv_is_greedy:
-        _sv_coins = _device_array_preserve_device(
-            np.zeros((_sv_tbs, _sv_nm1), np.float32), _sv_rep
-        )
-        _sv_coinf = _device_array_preserve_device(np.zeros((_sv_tbs,), np.float32), _sv_rep)
         _sv_temps = _device_array_preserve_device(np.ones((_sv_tbs, 1), np.float32), data_sharding)
         _sv_topks = _device_array_preserve_device(np.zeros((_sv_tbs,), np.int32), data_sharding)
         _sv_topps = _device_array_preserve_device(np.ones((_sv_tbs,), np.float32), data_sharding)
@@ -1636,23 +1643,38 @@ def spec_decode_verify_phase(spec_worker, model_worker_batch, cur_allocate_lens)
         _sv_vocab = int(target_worker.model_config.vocab_size)
         _sv_enable_top_k = 0 < _kv < _sv_vocab
         _sv_enable_top_p = _pv < 1.0
-        _sv_coins = _device_array_preserve_device(
-            np.random.random((_sv_tbs, _sv_nm1)).astype(np.float32), _sv_rep
-        )
-        _sv_coinf = _device_array_preserve_device(
-            np.random.random((_sv_tbs,)).astype(np.float32), _sv_rep
-        )
-        _sv_temps = _device_array_preserve_device(
-            np.full((_sv_tbs, 1), _tv, np.float32), data_sharding
-        )
-        _sv_topks = _device_array_preserve_device(np.full((_sv_tbs,), _kv, np.int32), data_sharding)
-        _sv_topps = _device_array_preserve_device(
-            np.full((_sv_tbs,), _pv, np.float32), data_sharding
-        )
+        # temps/topks/topps are constant across decode steps for a given batch
+        # (they only depend on tbs and the per-batch sampling scalars), so building
+        # + transferring them every step is wasted H2D dispatch. Cache the device
+        # arrays keyed by (tbs, temp, top_k, top_p) and reuse until the batch changes.
+        _const_sig = (_sv_tbs, _tv, _kv, _pv)
+        _const_cache = getattr(target_mr, "_sv_sampling_const_cache", None)
+        if _const_cache is None or _const_cache[0] != _const_sig:
+            _sv_temps = _device_array_preserve_device(
+                np.full((_sv_tbs, 1), _tv, np.float32), data_sharding
+            )
+            _sv_topks = _device_array_preserve_device(
+                np.full((_sv_tbs,), _kv, np.int32), data_sharding
+            )
+            _sv_topps = _device_array_preserve_device(
+                np.full((_sv_tbs,), _pv, np.float32), data_sharding
+            )
+            target_mr._sv_sampling_const_cache = (
+                _const_sig,
+                _sv_temps,
+                _sv_topks,
+                _sv_topps,
+            )
+        else:
+            _, _sv_temps, _sv_topks, _sv_topps = _const_cache
     _sv_thr_single = float(
         getattr(spec_worker.server_args, "speculative_accept_threshold_single", 1.0)
     )
     _sv_thr_acc = float(getattr(spec_worker.server_args, "speculative_accept_threshold_acc", 1.0))
+
+    # Advance the per-step sampling RNG; coins are generated inside the verify JIT
+    # from (base_rng, step), so only this small int crosses the host->device boundary.
+    target_mr._sampler_step += 1
 
     with jax.set_mesh(draft_worker.mesh), jtu.count_pjit_cpp_cache_miss() as count:
         (
@@ -1679,8 +1701,8 @@ def spec_decode_verify_phase(spec_worker, model_worker_batch, cur_allocate_lens)
             getattr(spec_worker, "spec_relay_buffers", None),
             relay_future_indices,
             verify_allocate_lens,
-            _sv_coins,
-            _sv_coinf,
+            target_mr._sampler_base_rng,
+            target_mr._sampler_step,
             _sv_temps,
             _sv_topks,
             _sv_topps,
