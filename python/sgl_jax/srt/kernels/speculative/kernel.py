@@ -1,6 +1,8 @@
 import jax
 import jax.numpy as jnp
 
+from sgl_jax.srt.layers.binary_search import float32_bsearch, topk_mask
+
 
 def create_extend_after_decode_spec_info(
     verified_id,
@@ -91,31 +93,11 @@ def verify_tree_greedy(
 
 
 # top-k / top-p renorm only need an inclusion *threshold* (keep every prob >= t),
-# not a sorted order. Finding t by sorting the whole vocab is what dominated device
-# time in profiling -- and on TPU a `jax.lax.top_k(k=1024)` lowers to the same full
-# sort(f32[256,152576]) (~29-34ms, ~48% of the verify step). The kept set is order
-# independent, so we find t by bisection on the threshold instead: mass/count above
-# t is monotone in t, so each step is a single reduction (no sort). ~25 iterations
-# already reproduce the sort-based result exactly; 30 leaves a safety margin.
-RENORM_BISECT_ITERS = 30
-
-
-def _bisect_keep_threshold(probs, satisfied_fn, iters):
-    """Per-row largest threshold ``t`` for which ``satisfied_fn(t)`` still holds.
-
-    ``satisfied_fn(t)`` returns a ``(batch_size, 1)`` boolean for whether keeping
-    ``probs >= t`` still meets the target (enough mass for top-p / enough tokens for
-    top-k). Both targets are monotone decreasing in ``t``, so plain bisection on
-    ``[0, max_prob]`` converges to the cutoff using one reduction per step.
-    """
-    lo = jnp.zeros((probs.shape[0], 1), dtype=probs.dtype)
-    hi = jnp.max(probs, axis=-1, keepdims=True)
-    for _ in range(iters):
-        mid = (lo + hi) * 0.5
-        keep = satisfied_fn(mid)  # threshold still satisfies the target -> can go higher
-        lo = jnp.where(keep, mid, lo)
-        hi = jnp.where(keep, hi, mid)
-    return lo
+# not a sorted order -- and on TPU a sort / large-k top_k over the vocab dominated
+# device time (~29ms, ~48% of the verify step). We reuse the shared, TPU-tuned
+# bit-exact binary search from layers/binary_search.py (the same primitive the
+# regular sampler's mask path uses): mass/count above t is monotone in t, so the
+# threshold is found with a fixed bit-search and no sort.
 
 
 def top_k_renorm_prob(probs, top_k_values):
@@ -133,19 +115,9 @@ def top_k_renorm_prob(probs, top_k_values):
         probs.shape[0] == top_k_values.shape[0]
     ), f"probs.shape[0]: {probs.shape[0]} should equal to top_k_values.shape[0]: {top_k_values.shape}"
 
-    num_classes = probs.shape[-1]
-    k = top_k_values.reshape(-1, 1)
-
-    # Largest threshold whose kept count is still >= k (i.e. the k-th largest value).
-    def satisfied(t):
-        cnt = jnp.sum((probs >= t).astype(jnp.int32), axis=-1, keepdims=True)
-        return cnt >= k
-
-    pivot = _bisect_keep_threshold(probs, satisfied, RENORM_BISECT_ITERS)
-    # k covering the whole vocabulary (e.g. the TOP_K_ALL sentinel) keeps everything.
-    pivot = jnp.where(k >= num_classes, jnp.zeros_like(pivot), pivot)
-
-    masked_probs = jnp.where(probs >= pivot, probs, 0.0)
+    # topk_mask keeps the largest k values per row (ties may keep >k) and zeros the
+    # rest; k covering the whole vocabulary (TOP_K_ALL) keeps everything.
+    masked_probs = topk_mask(probs, top_k_values.reshape(-1), replace_val=0.0)
     return masked_probs / jnp.sum(masked_probs, axis=-1, keepdims=True)
 
 
@@ -164,18 +136,20 @@ def top_p_renorm_prob(probs, top_p_values):
         probs.shape[0] == top_p_values.shape[0]
     ), f"probs.shape[0]: {probs.shape[0]} should equal to top_k_values.shape[0]: {top_p_values.shape}"
 
-    p = top_p_values.reshape(-1, 1).astype(probs.dtype)
+    # Largest threshold whose kept probability mass is still >= top_p, via the shared
+    # bit-exact float32 binary search. The vocab axis is moved to second-to-last so
+    # the per-step reductions don't run across vector lanes (slow on TPU) -- the same
+    # layout trick as binary_search.topp_mask.
+    p = top_p_values.reshape(-1)
+    probs_t = jnp.swapaxes(probs, -1, -2)
 
-    # Largest threshold whose kept probability mass is still >= top_p.
-    def satisfied(t):
-        mass = jnp.sum(jnp.where(probs >= t, probs, 0.0), axis=-1, keepdims=True)
-        return mass >= p
+    def predicate(threshold):
+        threshold = jax.lax.expand_dims(threshold, (0,))
+        mass = jnp.sum(jnp.where(probs_t >= threshold, probs_t, 0.0), axis=0)
+        return mass < p
 
-    pivot = _bisect_keep_threshold(probs, satisfied, RENORM_BISECT_ITERS)
-    # top_p >= 1 keeps everything (guards against the softmax sum drifting past 1.0).
-    pivot = jnp.where(p >= 1.0, jnp.zeros_like(pivot), pivot)
-
-    masked_probs = jnp.where(probs >= pivot, probs, 0.0)
+    threshold = float32_bsearch((probs.shape[0],), predicate)
+    masked_probs = jnp.where(probs >= threshold[:, None], probs, 0.0)
     return masked_probs / jnp.sum(masked_probs, axis=-1, keepdims=True)
 
 
