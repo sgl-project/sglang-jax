@@ -164,6 +164,7 @@ class Glm5Attention(nnx.Module):
         attention_bias: bool = False,
         dtype: jnp.dtype = jnp.bfloat16,
         use_absorbed: bool = True,
+        has_indexer: bool = True,
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -243,15 +244,18 @@ class Glm5Attention(nnx.Module):
             scope_name="o_proj",
         )
 
-        self.indexer = GlmDsaIndexer(
-            hidden_size=hidden_size,
-            q_lora_rank=self.q_lora_rank,
-            index_head_dim=128,
-            index_n_heads=32,
-            mesh=mesh,
-            dtype=dtype,
-            scope_name="indexer",
-        )
+        if has_indexer:
+            self.indexer = GlmDsaIndexer(
+                hidden_size=hidden_size,
+                q_lora_rank=self.q_lora_rank,
+                index_head_dim=128,
+                index_n_heads=32,
+                mesh=mesh,
+                dtype=dtype,
+                scope_name="indexer",
+            )
+        else:
+            self.indexer = None
         self.rotary_emb = RotaryEmbedding(
             head_size=self.qk_rope_head_dim,
             rotary_dim=self.qk_rope_head_dim,
@@ -407,7 +411,8 @@ class Glm5Attention(nnx.Module):
         q, _ = self.q_b_proj(q_compressed)
         q = q.reshape(-1, self.num_heads, self.qk_head_dim)
 
-        _ = self.indexer(hidden_states, q_compressed, positions, self.rotary_emb)
+        if self.indexer is not None:
+            _ = self.indexer(hidden_states, q_compressed, positions, self.rotary_emb)
 
         q_nope = q[:, :, : self.qk_nope_head_dim]
         q_rope = q[:, :, self.qk_nope_head_dim :]
@@ -584,7 +589,8 @@ class Glm5DecoderLayer(nnx.Module):
     ):
         self.layer_id = layer_id
         self.hidden_size = config.hidden_size
-        rope_theta = getattr(config, "rope_theta", 1000000)
+        rope_params = getattr(config, "rope_parameters", None) or {}
+        rope_theta = getattr(config, "rope_theta", None) or rope_params.get("rope_theta", 1000000)
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 131072)
         self.head_dim = getattr(config, "head_dim", None) or 128
@@ -592,6 +598,12 @@ class Glm5DecoderLayer(nnx.Module):
 
         partial_rotary_factor = getattr(config, "partial_rotary_factor", 0.5)
         rotary_dim = int(self.head_dim * partial_rotary_factor)
+
+        # GLM-5.2 IndexShare: layers tagged "shared" reuse the previous "full"
+        # layer's top-k and ship no indexer weights. Dense MLA discards indexer
+        # output anyway, so just skip building the module on shared layers.
+        indexer_types = getattr(config, "indexer_types", None)
+        has_indexer = indexer_types is None or indexer_types[layer_id] == "full"
 
         self.self_attn = Glm5Attention(
             hidden_size=config.hidden_size,
@@ -609,6 +621,7 @@ class Glm5DecoderLayer(nnx.Module):
             dtype=dtype,
             mesh=mesh,
             use_absorbed=True,
+            has_indexer=has_indexer,
         )
 
         first_k_dense_replace = getattr(config, "first_k_dense_replace", 0)
@@ -912,6 +925,7 @@ class Glm5ForCausalLM(nnx.Module):
 
         num_layers = self.config.num_hidden_layers
         first_k_dense_replace = getattr(self.config, "first_k_dense_replace", 0)
+        indexer_types = getattr(self.config, "indexer_types", None)
 
         quant_config = getattr(model_config, "quantization_config", None)
         is_static_quant = quant_config is not None and quant_config.is_static_checkpoint
@@ -924,13 +938,19 @@ class Glm5ForCausalLM(nnx.Module):
                 target_idx,
                 target_idx < first_k_dense_replace,
                 is_static_quant=is_static_quant,
+                has_indexer=indexer_types is None or indexer_types[target_idx] == "full",
             )
             mappings.update(layer_mappings)
 
         return mappings
 
     def _create_moe_layer_mappings(
-        self, layer_idx: int, target_idx: int, is_mlp_layer: bool, is_static_quant: bool = False
+        self,
+        layer_idx: int,
+        target_idx: int,
+        is_mlp_layer: bool,
+        is_static_quant: bool = False,
+        has_indexer: bool = True,
     ) -> dict:
         prefix = f"model.layers.{target_idx}"
         target_prefix = f"model.layers.{layer_idx}"
@@ -989,21 +1009,22 @@ class Glm5ForCausalLM(nnx.Module):
         add_linear(f"{ap}.kv_b_proj", f"{tp}.kv_b_proj", (None, "tensor"))
         add_linear(f"{ap}.o_proj", f"{tp}.o_proj", ("tensor", None))
 
-        add_linear(f"{ap}.indexer.wq_b", f"{tp}.indexer.wq_b", (None, None))
-        add_linear(f"{ap}.indexer.wk", f"{tp}.indexer.wk", (None, None))
-        # weights_proj is in modules_to_not_convert (HF: indexers_proj) → unquantized.
-        add_linear(
-            f"{ap}.indexer.weights_proj",
-            f"{tp}.indexer.weights_proj",
-            (None, None),
-            force_unquant=True,
-        )
-        mappings[f"{ap}.indexer.k_norm.weight"] = WeightMapping(
-            target_path=f"{tp}.indexer.k_norm.weight", sharding=(None,)
-        )
-        mappings[f"{ap}.indexer.k_norm.bias"] = WeightMapping(
-            target_path=f"{tp}.indexer.k_norm.bias", sharding=(None,)
-        )
+        if has_indexer:
+            add_linear(f"{ap}.indexer.wq_b", f"{tp}.indexer.wq_b", (None, None))
+            add_linear(f"{ap}.indexer.wk", f"{tp}.indexer.wk", (None, None))
+            # weights_proj is in modules_to_not_convert (HF: indexers_proj) → unquantized.
+            add_linear(
+                f"{ap}.indexer.weights_proj",
+                f"{tp}.indexer.weights_proj",
+                (None, None),
+                force_unquant=True,
+            )
+            mappings[f"{ap}.indexer.k_norm.weight"] = WeightMapping(
+                target_path=f"{tp}.indexer.k_norm.weight", sharding=(None,)
+            )
+            mappings[f"{ap}.indexer.k_norm.bias"] = WeightMapping(
+                target_path=f"{tp}.indexer.k_norm.bias", sharding=(None,)
+            )
 
         if is_mlp_layer:
             add_linear(
