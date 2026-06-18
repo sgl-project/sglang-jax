@@ -300,7 +300,7 @@ def test_client_rejects_below_min_version(monkeypatch):
         "side_channel_port": 9600,
         "protocol_version": MIN_COMPATIBLE_VERSION - 1,
     }
-    monkeypatch.setattr(httpx, "get", lambda *a, **k: fake)
+    monkeypatch.setattr(client._client, "get", lambda *a, **k: fake)
 
     with pytest.raises(RuntimeError, match="protocol_version"):
         client.get_prefill_info(42)
@@ -317,7 +317,7 @@ def test_client_accepts_current_version(monkeypatch):
         "side_channel_port": 9600,
         "protocol_version": PROTOCOL_VERSION,
     }
-    monkeypatch.setattr(httpx, "get", lambda *a, **k: fake)
+    monkeypatch.setattr(client._client, "get", lambda *a, **k: fake)
     info = client.get_prefill_info(42)
     assert info["host"] == "10.0.0.1"
 
@@ -359,7 +359,7 @@ def test_register_prefill_succeeds_after_transient_failures(monkeypatch):
         resp.raise_for_status.return_value = None
         return resp
 
-    monkeypatch.setattr(httpx, "post", _mock_post)
+    monkeypatch.setattr(client._client, "post", _mock_post)
     client.register_prefill(
         host="10.0.0.1",
         transfer_port=30001,
@@ -377,7 +377,7 @@ def test_register_prefill_exhausts_retries_and_raises(monkeypatch):
         register_retry_delay_s=0,
     )
     monkeypatch.setattr(
-        httpx,
+        client._client,
         "post",
         mock.MagicMock(side_effect=httpx.ConnectError("refused")),
     )
