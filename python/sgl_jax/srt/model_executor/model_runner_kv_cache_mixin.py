@@ -280,6 +280,13 @@ def _build_hybrid_pools(
 
 def _build_non_hybrid_memory_pools(token_to_kv_pool) -> MemoryPools:
     """Wrap a single KV pool in MemoryPools."""
+    from sgl_jax.srt.mem_cache.memory_pool import MSAIndexKProxy, MSATokenToKVPool
+
+    if isinstance(token_to_kv_pool, MSATokenToKVPool):
+        return MemoryPools(
+            token_to_kv_pool=token_to_kv_pool,
+            msa_index_k=MSAIndexKProxy(token_to_kv_pool),
+        )
     return MemoryPools(token_to_kv_pool=token_to_kv_pool)
 
 
@@ -337,13 +344,19 @@ class ModelRunnerKVCacheMixin:
             )
             return int(full_cost + swa_cost)
 
-        return (
+        main_kv = (
             self.model_config.get_num_kv_heads(self.attention_tp_size)
             * align128(self.model_config.head_dim)
             * 2
             * num_layers
             * dtype_size
         )
+        sa = getattr(self.model_config.hf_text_config, "sparse_attention_config", None)
+        if isinstance(sa, dict) and sa.get("use_sparse_attention"):
+            n_sparse = sum(1 for f in sa["sparse_attention_freq"] if f)
+            # ik_buf: 1 head, not tensor-sharded; ik_pooled: same shape per-page (1/page_size per-token)
+            main_kv += n_sparse * align128(sa["sparse_index_dim"]) * dtype_size
+        return main_kv
 
     def _profile_available_bytes(self: ModelRunner, total_device_memory: int) -> int:
         """Profile available bytes for KV cache (+ recurrent state)."""
@@ -692,14 +705,29 @@ class ModelRunnerKVCacheMixin:
                 dp_size=dp_size,
             )
         else:
-            self.token_to_kv_pool = self._maybe_wrap_hybrid_kv_pool(
-                MHATokenToKVPool,
+            mha_kwargs = dict(
                 head_num=self.model_config.get_total_num_kv_heads_with_replication(
                     self.attention_tp_size
                 ),
                 head_dim=(self.model_config.head_dim + 127) // 128 * 128,
                 dp_size=dp_size,
             )
+            sa = getattr(self.model_config.hf_text_config, "sparse_attention_config", None)
+            self._is_msa = isinstance(sa, dict) and sa.get("use_sparse_attention")
+            if self._is_msa:
+                from sgl_jax.srt.mem_cache.memory_pool import MSATokenToKVPool
+
+                freq = sa["sparse_attention_freq"]
+                self.token_to_kv_pool = self._maybe_wrap_hybrid_kv_pool(
+                    MSATokenToKVPool,
+                    sparse_layer_ids=[i for i, f in enumerate(freq) if f],
+                    index_head_dim=sa["sparse_index_dim"],
+                    **mha_kwargs,
+                )
+            else:
+                self.token_to_kv_pool = self._maybe_wrap_hybrid_kv_pool(
+                    MHATokenToKVPool, **mha_kwargs
+                )
 
         # --- MemoryPools wrapper (+ hybrid ReqToTokenPool) ---
         if has_recurrent_state:
