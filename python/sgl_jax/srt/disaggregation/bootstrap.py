@@ -49,6 +49,8 @@ class PrefillInfo:
     tp_rank: int = 0
     tp_size: int = 1
     system_dp_rank: int = 0
+    jax_process_index: int = 0
+    jax_process_count: int = 1
     protocol_version: int = PROTOCOL_VERSION
 
     def to_dict(self) -> dict[str, object]:
@@ -63,6 +65,8 @@ class RegisterPrefillRequest(BaseModel):
     tp_rank: int = 0
     tp_size: int = 1
     system_dp_rank: int = 0
+    jax_process_index: int = 0
+    jax_process_count: int = 1
     protocol_version: int = PROTOCOL_VERSION
 
 
@@ -346,6 +350,8 @@ class BootstrapClient:
         tp_rank: int = 0,
         tp_size: int = 1,
         system_dp_rank: int = 0,
+        jax_process_index: int = 0,
+        jax_process_count: int = 1,
         protocol_version: int = PROTOCOL_VERSION,
     ) -> None:
         payload = {
@@ -356,6 +362,8 @@ class BootstrapClient:
             "tp_rank": tp_rank,
             "tp_size": tp_size,
             "system_dp_rank": system_dp_rank,
+            "jax_process_index": jax_process_index,
+            "jax_process_count": jax_process_count,
             "protocol_version": protocol_version,
         }
         last_err: Exception | None = None

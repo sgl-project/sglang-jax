@@ -154,6 +154,14 @@ class JaxTransferWrapper:
             raise RuntimeError(
                 "JaxTransferWrapper.start() must be called before " "register_pull()"
             )
+        sharding = getattr(data, "sharding", None)
+        if sharding is not None and not data.is_fully_addressable:
+            raise ValueError(
+                f"register_pull: array spans {len(sharding.device_set)} "
+                f"devices but only {jax.local_device_count()} are local. "
+                f"await_pull only registers process-local shards; pass the "
+                f"per-host shard (see prefill._global_to_local_shard)."
+            )
         with self._pending_lock:
             if uuid in self._pending:
                 raise RuntimeError(
