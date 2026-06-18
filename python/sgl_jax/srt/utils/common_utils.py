@@ -88,7 +88,7 @@ def set_random_seed(seed: int) -> None:
     np.random.seed(seed)
 
 
-def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = None):
+def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int | None = None):
     """Kill the process and all its child processes."""
     # Remove sigchld handler to avoid spammy logs.
     if threading.current_thread() is threading.main_thread():
@@ -449,7 +449,7 @@ def lru_cache_frozenset(maxsize=128):
                 raise TypeError(f"Cannot make hashable: {type(o)}") from None
 
     def decorator(func):
-        cache = OrderedDict()
+        cache: OrderedDict[tuple[Any, Any], Any] = OrderedDict()
 
         @functools.wraps(func)
         def wrapper(*args, **kwargs):

@@ -158,7 +158,8 @@ docstring-code-format = true
 
 [tool.mypy]
 files = [
-    "python/sgl_jax/srt/models/grok.py"
+    "python/sgl_jax/srt/models/grok.py",
+    "python/sgl_jax/srt/utils/*.py"
 ]
 
 python_version = "3.12"

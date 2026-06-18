@@ -11,17 +11,19 @@ import time
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
 import jax
 import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
+import numpy.typing as npt
 from flax import nnx
 from jax.experimental import multihost_utils
 
 if TYPE_CHECKING:
     from sgl_jax.srt.layers.linear import LinearBase
+
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 from safetensors import safe_open
@@ -35,7 +37,6 @@ if not hasattr(np, "float8_e4m3fn"):
     np.float8_e4m3fn = ml_dtypes.float8_e4m3fn
 if not hasattr(np, "float8_e5m2"):
     np.float8_e5m2 = ml_dtypes.float8_e5m2
-
 
 # safetensors header stores tensor dtype as a string. Map to jax dtype.
 # Kept in one place because multiple callers used to inline the same dict.
@@ -64,8 +65,8 @@ def _reinterpret_dtype_if_needed(data: np.ndarray, target_dtype: jnp.dtype) -> n
 
 @dataclass
 class WeightMapping:
-    target_path: str | list[str]
-    sharding: tuple | None = None
+    target_path: str | list[str] | tuple[str]
+    sharding: tuple[Any] | tuple[Any, Any] | None = None
     transpose: bool = False
     transpose_axes: tuple[int, ...] | None = (
         None  # For multi-dimensional transpose (e.g., conv weights)
@@ -82,8 +83,10 @@ class WeightMapping:
         if self.sharding is None:
             self.sharding = self._infer_default_sharding()
 
-    def _infer_default_sharding(self) -> tuple:
-        path = self.target_path[0] if isinstance(self.target_path, list) else self.target_path
+    def _infer_default_sharding(self) -> tuple[Any] | tuple[Any, Any]:
+        path = (
+            self.target_path[0] if isinstance(self.target_path, list | tuple) else self.target_path
+        )
 
         if any(pattern in path for pattern in ["embedding", "lm_head"]):
             return (None, None)
@@ -107,6 +110,9 @@ class WeightMapping:
             return (None,)
         else:
             return (None,)
+
+
+WeightMappingSpec = str | list[str] | tuple[Any, ...] | WeightMapping
 
 
 class SequentialSafetensorManager:
@@ -682,12 +688,12 @@ class WeightLoader:
                     np.concatenate(parts, axis=1).astype(ml_dtypes.bfloat16)
                 )
                 del parts[:]
+
                 # Bind merged via default arg to avoid late-binding closure issue.
-                weight = jax.make_array_from_callback(
-                    merged.shape,
-                    tp_sharding,
-                    lambda idx, m=merged: jnp.array(m[idx]),
-                )
+                def fn(idx, m=merged):
+                    return jnp.array(m[idx])
+
+                weight = jax.make_array_from_callback(merged.shape, tp_sharding, fn)
                 del merged
                 setattr(
                     attn,
@@ -1023,7 +1029,7 @@ class WeightLoader:
                 raise RuntimeError(f"Cannot find any *.safetensors files in {model_path}")
 
             weights_files.sort()
-            weight_info = {}
+            weight_info: dict[str, list[dict[str, Any]]] = {}
 
             logger.info(
                 "Scanning metadata for %s model files (single host only)...", len(weights_files)
@@ -1103,7 +1109,7 @@ class WeightLoader:
         hf_key: str,
         infos: list[dict],
         file_manager: SequentialSafetensorManager,
-        target_sharding: jax.sharding.NamedSharding = None,
+        target_sharding: jax.sharding.NamedSharding | None = None,
     ) -> list[jax.Array]:
         """
         Create a list of JAX arrays that lazy load data from safetensors via callback.
@@ -1147,7 +1153,7 @@ class WeightLoader:
         infos: list[dict],
         file_manager: SequentialSafetensorManager,
         concat_axis: int,
-        target_sharding: jax.sharding.NamedSharding = None,
+        target_sharding: jax.sharding.NamedSharding | None = None,
     ) -> jax.Array:
         """
         Lazy loader for TP-Split weights (e.g., Grok Attention/MLP).
@@ -1238,7 +1244,7 @@ class WeightLoader:
         file_manager: SequentialSafetensorManager,
         concat_axis: int,
         do_transpose: bool = False,
-        target_sharding: jax.sharding.NamedSharding = None,
+        target_sharding: jax.sharding.NamedSharding | None = None,
         physical_to_logical_map: np.ndarray | None = None,
     ) -> jax.Array:
         """
@@ -1339,7 +1345,7 @@ class WeightLoader:
                 logical_indices = physical_indices
 
             # Build task list: (logical_idx, list of physical positions that need it)
-            logical_to_positions = {}
+            logical_to_positions: dict[int, list[int]] = {}
             for phys_pos, log_idx in enumerate(logical_indices):
                 if log_idx not in logical_to_positions:
                     logical_to_positions[log_idx] = []
@@ -1369,7 +1375,9 @@ class WeightLoader:
 
             return out_array
 
-        result = jax.make_array_from_callback(stacked_shape, sharding, _load_stacked_slice)
+        result: jax.Array = jax.make_array_from_callback(
+            stacked_shape, sharding, _load_stacked_slice
+        )
         if result.dtype != target_dtype:
             result = result.astype(target_dtype)
         if do_transpose and result.ndim >= 3:
@@ -1382,7 +1390,7 @@ class WeightLoader:
         weight_info: dict,
         file_manager: SequentialSafetensorManager,
         do_transpose: bool = False,
-        target_sharding: jax.sharding.NamedSharding = None,
+        target_sharding: jax.sharding.NamedSharding | None = None,
         physical_to_logical_map: np.ndarray | None = None,
     ) -> jax.Array:
         first_key = expected_hf_keys[0]
@@ -1446,7 +1454,7 @@ class WeightLoader:
             )
 
         # Map safetensors dtype strings to numpy dtypes for raw reads
-        _st_to_np_dtype = {
+        _st_to_np_dtype: dict[str, npt.DTypeLike] = {
             "F32": np.float32,
             "F16": np.float16,
             "BF16": np.dtype("V2"),  # 2-byte view, reinterpret later
@@ -1456,7 +1464,7 @@ class WeightLoader:
             "F8_E4M3": np.uint8,
             "F8_E5M2": np.uint8,
         }
-        np_read_dtype = _st_to_np_dtype.get(st_dtype, np.uint8)
+        np_read_dtype: npt.DTypeLike = _st_to_np_dtype.get(st_dtype, np.uint8)
 
         if do_transpose and not defer_transpose and len(single_expert_shape) >= 2:
             final_single_shape = list(single_expert_shape)
@@ -1552,7 +1560,7 @@ class WeightLoader:
             out_array = np.empty(out_shape, dtype=first_chunk.dtype)
             out_array[0] = first_chunk
 
-            logical_to_positions = {}
+            logical_to_positions: dict[int, list[int]] = {}
             for phys_pos in range(1, sliced_num_physical):
                 log_idx = logical_indices_to_load[phys_pos]
                 if log_idx == first_log_idx:
@@ -1561,7 +1569,7 @@ class WeightLoader:
                     logical_to_positions.setdefault(log_idx, []).append(phys_pos)
 
             # Per-thread timing accumulators
-            _thread_stats = {
+            _thread_stats: dict[str, list[Any]] = {
                 "get_handle": [],
                 "get_slice": [],
                 "fp8": [],
@@ -1662,7 +1670,7 @@ class WeightLoader:
                         all_logical.add(p)
 
             # Group by file for bulk reading
-            file_groups = {}
+            file_groups: dict[str, list[tuple[int, int, Any]]] = {}
             for log_idx in all_logical:
                 hf_key = expected_hf_keys[log_idx]
                 info = weight_info[hf_key][0]
@@ -1751,7 +1759,7 @@ class WeightLoader:
                 per_device_arrays = list(ex.map(_build_and_put, range(n_local)))
             t_assemble = time.monotonic() - t_assemble_start
 
-            result = jax.make_array_from_single_device_arrays(
+            result: jax.Array = jax.make_array_from_single_device_arrays(
                 stacked_shape,
                 sharding,
                 per_device_arrays,
@@ -1830,7 +1838,7 @@ class WeightLoader:
 
     def load_weights_from_safetensors(
         self,
-        weight_mappings: Mapping[str, str | list[str] | WeightMapping],
+        weight_mappings: Mapping[str, WeightMappingSpec],
         safetensors_partition=1,
         dummy=False,
     ):
@@ -1860,6 +1868,7 @@ class WeightLoader:
                     if match:
                         matched_parts = match.groups()
 
+                        replaced_mapping: WeightMappingSpec
                         if isinstance(mapping, str):
                             format_template = mapping.replace("*", "{}")
                             replaced_mapping = format_template.format(*matched_parts)
@@ -1872,8 +1881,16 @@ class WeightLoader:
                             replaced_str = format_template.format(*matched_parts)
                             replaced_mapping = (replaced_str, *mapping[1:])
                         elif isinstance(mapping, WeightMapping):
-                            format_template = mapping.target_path.replace("*", "{}")
-                            replaced_path = format_template.format(*matched_parts)
+                            replaced_path: str | list[str]
+                            if isinstance(mapping.target_path, str):
+                                format_template = mapping.target_path.replace("*", "{}")
+                                replaced_path = format_template.format(*matched_parts)
+                            else:
+                                format_template = mapping.target_path[0].replace("*", "{}")
+                                replaced_path = [
+                                    format_template.format(*matched_parts),
+                                    *mapping.target_path[1:],
+                                ]
                             replaced_mapping = copy.copy(mapping)
                             replaced_mapping.target_path = replaced_path
                         else:
@@ -1904,7 +1921,7 @@ class WeightLoader:
 
                 infos = weight_info[hf_key]
 
-                if isinstance(mapping, str | list):
+                if not isinstance(mapping, WeightMapping):
                     mapping = WeightMapping(target_path=mapping)
 
                 is_split_weight = len(infos) > 1 and mapping.concat_axis is not None
@@ -1923,6 +1940,8 @@ class WeightLoader:
 
                 if can_optimize:
                     try:
+                        assert mapping.sharding
+                        sharding_tuple: tuple[Any] | tuple[Any, Any]
                         if mapping.transpose and len(mapping.sharding) == 2:
                             # Swap: (dim0, dim1) -> (dim1, dim0)
                             sharding_tuple = mapping.sharding[::-1]
@@ -1935,6 +1954,7 @@ class WeightLoader:
                         lazy_weight = None
 
                         if is_split_weight:
+                            assert isinstance(mapping.concat_axis, int)
                             lazy_weight = self._create_split_lazy_tensor(
                                 hf_key,
                                 infos,
@@ -1965,6 +1985,7 @@ class WeightLoader:
                                 * self.model_config.hf_config.output_multiplier_scale
                             )
 
+                        assert isinstance(mapping.target_path, str)
                         target_path = mapping.target_path
                         model_param = self._get_param(params, target_path)
 
@@ -2009,7 +2030,8 @@ class WeightLoader:
                 if hf_key == "d2t":
                     base = jnp.arange(lazy_weight.shape[0], dtype=lazy_weight.dtype)
                     hot_ids = (lazy_weight + base).astype(jnp.int32)
-                    params["hot_token_ids"].value = hot_ids
+                    hot_tokens_ids = self._get_param(params, "hot_token_ids")
+                    hot_tokens_ids.value = hot_ids
                     continue
 
                 self._process_and_assign_weight(params, hf_key, lazy_weight, mapping)
@@ -2263,7 +2285,7 @@ class WeightLoader:
     def _load_dummy_weights(
         self,
         params: nnx.State,
-        weight_mappings: dict[str, str | list[str] | WeightMapping],
+        weight_mappings: Mapping[str, WeightMappingSpec],
         seed: int = 1234,
     ):
         logger.info("Generating dummy weights with proper sharding from weight mappings")
@@ -2278,7 +2300,7 @@ class WeightLoader:
 
         for hf_key, mapping in regular_mappings.items():
 
-            if isinstance(mapping, str | list):
+            if not isinstance(mapping, WeightMapping):
                 mapping = WeightMapping(target_path=mapping)
 
             target_path = (
@@ -2312,14 +2334,17 @@ class WeightLoader:
 
                 rng = np.random.default_rng(seed)
                 if jnp.issubdtype(dtype, jnp.floating):
+                    gen_dtype: np.dtype[Any]
                     if dtype == jnp.bfloat16:
-                        gen_dtype = np.float32
+                        gen_dtype = np.dtype(np.float32)
                     else:
-                        gen_dtype = {
-                            jnp.float16: np.float16,
-                            jnp.float32: np.float32,
-                            jnp.float64: np.float64,
-                        }.get(dtype, np.float32)
+                        gen_dtype = np.dtype(
+                            {
+                                jnp.float16: np.float16,
+                                jnp.float32: np.float32,
+                                jnp.float64: np.float64,
+                            }.get(dtype, np.float32)
+                        )
                     arr_np = rng.uniform(-1e-3, 1e-3, size=shard_shape).astype(gen_dtype)
                     return jnp.asarray(arr_np, dtype=dtype)
                 else:
@@ -2335,7 +2360,7 @@ class WeightLoader:
             )
 
         for moe_key, mapping in moe_mappings.items():
-            if isinstance(mapping, str | list):
+            if not isinstance(mapping, WeightMapping):
                 mapping = WeightMapping(target_path=mapping)
 
             target_path = mapping.target_path[0]
@@ -2353,6 +2378,7 @@ class WeightLoader:
 
             collected_weights = []
             for expert_idx in range(num_experts):
+                expert_sharding_tuple: tuple[Any, ...] | None
                 if mapping.sharding and "expert" in mapping.sharding:
                     expert_sharding_tuple = tuple(s for s in mapping.sharding if s != "expert")
                 else:
@@ -2446,7 +2472,8 @@ class WeightLoader:
     def _handle_single_weight(
         self, params: nnx.State, hf_key: str, weight: jax.Array, mapping: WeightMapping
     ):
-        jax_path = mapping.target_path
+        assert isinstance(mapping.target_path, str)
+        jax_path: str = mapping.target_path
         processed_weight = weight
 
         # Handle fused KV buffer storage (used by MiMo-V2-Flash per-head dequant).
@@ -2508,6 +2535,7 @@ class WeightLoader:
         if mapping.kv_head_padding:
             processed_weight = self._apply_kv_head_padding(processed_weight, hf_key)
 
+        assert mapping.sharding is not None
         sharded_weight = self._shard_weight(processed_weight, mapping.sharding)
 
         try:
@@ -2757,6 +2785,7 @@ class WeightLoader:
             if mapping.kv_head_padding and ("k_proj" in jax_path or "v_proj" in jax_path):
                 processed_weight = self._apply_kv_head_padding(processed_weight, jax_path)
 
+            assert mapping.sharding is not None
             sharded_weight = self._shard_weight(processed_weight, mapping.sharding)
 
             model_param = self._get_param(params, jax_path)
@@ -2774,7 +2803,7 @@ class WeightLoader:
             logger.debug("Split %s -> %s, shape: %s", hf_key, jax_path, processed_weight.shape)
 
     def _shard_weight(
-        self, weight: jax.Array, sharding_spec: tuple, mesh: jax.sharding.Mesh = None
+        self, weight: jax.Array, sharding_spec: tuple, mesh: jax.sharding.Mesh | None = None
     ) -> jax.Array:
         if mesh is None:
             mesh = self.mesh
@@ -2785,9 +2814,9 @@ class WeightLoader:
         # However, for the optimized path, we skip this method entirely.
         return jax.device_put(weight, target_sharding)
 
-    def _get_param(self, params: nnx.State, path: str) -> nnx.State:
+    def _get_param(self, params: nnx.State, path: str) -> nnx.Variable[jax.Array]:
         keys = path.split(".")
-        current_level = params
+        current_level: Any = params
 
         for key in keys:
             if key.isdigit():
@@ -2800,7 +2829,7 @@ class WeightLoader:
                 else:
                     raise ValueError(f"{path} is not a valid param path")
 
-        return current_level
+        return cast(nnx.Variable[jax.Array], current_level)
 
     def _apply_kv_head_padding(self, weight: jax.Array, hf_key: str) -> jax.Array:
         """Apply KV head padding/replication when tp_size > total_kv_heads.
