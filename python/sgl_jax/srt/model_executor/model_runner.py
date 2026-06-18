@@ -317,6 +317,19 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         self.model_config.hf_config.enable_sequence_parallel = (
             self.server_args.enable_sequence_parallel
         )
+        # EPLB reads num_experts/num_hidden_layers from hf_config; for VL models
+        # (e.g. M3) these live under text_config — propagate so init_by_mapping works.
+        text_cfg = getattr(self.model_config, "hf_text_config", self.model_config.hf_config)
+        if not getattr(self.model_config.hf_config, "num_experts", 0):
+            self.model_config.hf_config.num_experts = (
+                getattr(text_cfg, "num_experts", 0)
+                or getattr(text_cfg, "num_local_experts", 0)
+                or getattr(text_cfg, "n_routed_experts", 0)
+            )
+        if not getattr(self.model_config.hf_config, "num_hidden_layers", 0):
+            self.model_config.hf_config.num_hidden_layers = getattr(
+                text_cfg, "num_hidden_layers", 0
+            )
 
         if self.server_args.ep_dispatch_algorithm:
             with jax.set_mesh(self.mesh):
@@ -464,6 +477,24 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 page_size=self.page_size,
                 mesh=self.mesh,
             )
+            # MSA ctx-bucket precompile (G3): trace decode at multiple
+            # pages_per_seq so a max_ctx=64K server still uses small ik_buf
+            # gathers for short requests. Buckets = [topk, 4*topk, max_pages]
+            # capped at max_pages and deduped; topk-sized bucket compiles the
+            # `pages_per_seq <= topk` (skip-select ≡ dense) branch.
+            sa = getattr(self.model_config.hf_text_config, "sparse_attention_config", None)
+            if isinstance(sa, dict) and sa.get("use_sparse_attention"):
+                topk = int(sa["sparse_topk_blocks"])
+                max_pages = (self.model_config.context_len + self.page_size - 1) // self.page_size
+                raw = (topk, 4 * topk, max_pages)
+                full_attn_backend.msa_ctx_page_buckets = sorted(
+                    {min(b, max_pages) for b in raw if b > 0}
+                )
+                logger.info(
+                    "[MSA] decode ctx page buckets = %s (pages_per_seq)",
+                    full_attn_backend.msa_ctx_page_buckets,
+                )
+            self.msa_ctx_page_buckets = full_attn_backend.msa_ctx_page_buckets
 
         else:
             raise ValueError(f"Unsupported attention backend: {self.server_args.attention_backend}")

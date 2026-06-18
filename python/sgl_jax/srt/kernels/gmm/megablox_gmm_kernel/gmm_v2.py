@@ -670,8 +670,11 @@ def calculate_tiling(
     tile_m = min(tile_m, dims.size_m)
 
     # Calculate vmem limit for a single rhs buffer when using triple buffers.
+    # Reserve ~8MiB for lhs/out double-buffers, fp32 acc, zero_ref, compiler
+    # temps — otherwise the heuristic gives 100% to rhs and overflows on v7x
+    # (64MiB chiplet) by ~200KiB at k=6144 n=3072 bf16.
     num_rhs_buffers = 3
-    rhs_vmem_target = vmem_limit_bytes // num_rhs_buffers
+    rhs_vmem_target = max(vmem_limit_bytes - 8 * 1024 * 1024, 1) // num_rhs_buffers
     base_rhs_size_bytes = dims.size_k * dims.size_n * rhs_bits // 8
 
     # To avoid stalling MXU, we add some buffer room where tile_n cannot go
