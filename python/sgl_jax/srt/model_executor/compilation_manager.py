@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 import logging
 import threading
 import time
@@ -135,6 +136,7 @@ class CompilationManager:
         supports_recurrent_cow: bool = False,
         supports_recurrent_track: bool = False,
         moe_backend: str | None = None,
+        msa_ctx_page_buckets: list[int] | None = None,
     ):
         self.dp_size = dp_size
         self.tp_size = tp_size
@@ -156,6 +158,9 @@ class CompilationManager:
         self.moe_backend = moe_backend if moe_backend is not None else server_args.moe_backend
         self.enable_static_lora = server_args.enable_static_lora
         self.precompile_num_threads = server_args.precompile_num_threads
+        # MSA G3: per-seq page-count buckets for decode precompile. None for
+        # non-MSA models → single ctx variant per bs (original behaviour).
+        self.msa_ctx_page_buckets = msa_ctx_page_buckets
 
         self.token_buckets = self._compute_token_buckets(server_args.precompile_token_paddings)
         self.bs_buckets = self._compute_bs_buckets(server_args.precompile_bs_paddings)
@@ -582,19 +587,25 @@ class CompilationManager:
 
         start_time = time.perf_counter()
         self._compile_model_buckets(model_runner, ForwardMode.DECODE)
+        # MSA G3: cross bs_buckets × ctx_page_buckets so each (bs, pages_per_seq)
+        # decode shape is pre-traced. dummy_seq_len = bucket*page_size - 1 lands
+        # max(seq_pages) exactly on `bucket`, so fa_backend.get_forward_metadata
+        # truncates page_indices to that bucket. ctx=[None] → seq_len=1 (legacy).
+        # (Parallel _compile_model_buckets above only covers the ctx=None shapes;
+        # the ctx variants are compiled by this loop.)
+        ctx_buckets = self.msa_ctx_page_buckets or [None]
         logger.info(
-            "[DECODE] Begin to precompile bs_paddings=%s",
+            "[DECODE] Begin to precompile bs_paddings=%s ctx_page_buckets=%s",
             self.bs_buckets,
+            self.msa_ctx_page_buckets,
         )
 
-        with tqdm(
-            self.iter_model_shapes(ForwardMode.DECODE),
-            desc="[DECODE] PRECOMPILE",
-            leave=False,
-            total=len(self.bs_buckets),
-        ) as pbar:
-            for bs_val, num_tokens, aligned_cache_loc_size in pbar:
-                pbar.set_postfix(bs=bs_val)
+        # Cross main's serving shapes with MSA ctx_page_buckets (None → legacy seq_len=1).
+        shapes = list(itertools.product(self.iter_model_shapes(ForwardMode.DECODE), ctx_buckets))
+        with tqdm(shapes, desc="[DECODE] PRECOMPILE", leave=False) as pbar:
+            for (bs_val, num_tokens, aligned_cache_loc_size), ctx_pages in pbar:
+                pbar.set_postfix(bs=bs_val, ctx_pages=ctx_pages)
+                dummy_seq_len = 1 if ctx_pages is None else ctx_pages * self.page_size - 1
                 batch = self._make_dummy_batch(
                     bs_val,
                     num_tokens,
@@ -602,6 +613,7 @@ class CompilationManager:
                     aligned_cache_loc_size,
                     dp_size=self.dp_size,
                     per_dp_bs_size=bs_val // self.dp_size,
+                    dummy_seq_len=dummy_seq_len,
                 )
                 if prepare_lora_fn is not None:
                     prepare_lora_fn(batch)
@@ -655,6 +667,7 @@ class CompilationManager:
         speculative_algorithm=None,
         dp_size: int = 1,
         per_dp_bs_size: int = 0,
+        dummy_seq_len: int = 1,
     ):
         import jax.numpy as jnp
 
@@ -709,7 +722,7 @@ class CompilationManager:
             real_input_ids_len=len(valid_input_ids),
             real_bs=bs,
             req_pool_indices=np.arange(bs, dtype=np.int32),
-            seq_lens=np.array([1] * bs, dtype=np.int32),
+            seq_lens=np.full(bs, dummy_seq_len, dtype=np.int32),
             out_cache_loc=np.concat([valid_out_cache_loc, invalid_out_cache_loc], axis=0),
             return_logprob=False,
             return_output_logprob_only=return_output_logprob_only,
