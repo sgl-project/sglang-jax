@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import copy
 import functools
-import logging
 import os
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -43,8 +42,6 @@ from sgl_jax.srt.mem_cache.common import (
     alloc_token_slots,
 )
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
-
-logger = logging.getLogger(__name__)
 
 SIMULATE_ACC_LEN = os.environ.get("SIMULATE_ACC_LEN")
 SIMULATE_ACC_METHOD = os.environ.get("SIMULATE_ACC_METHOD", "multinomial")
@@ -652,7 +649,8 @@ class EagleDraftInput:
         model_worker_batch.spec_info_padded.hidden_states = (
             batch_output.next_draft_input.hidden_states
         )
-        model_worker_batch.spec_info_padded.accept_length = batch_output.accept_lens
+        if model_worker_batch.spec_info_padded.accept_length is None:
+            model_worker_batch.spec_info_padded.accept_length = batch_output.accept_lens
         model_worker_batch.input_ids = batch_output.next_draft_input.verified_id
         forward_metadata = draft_model_runner.attn_backend.get_eagle_forward_metadata(
             model_worker_batch
@@ -669,12 +667,30 @@ class EagleDraftInput:
         else:
             sharding = NamedSharding(draft_model_runner.mesh, P("data"))
 
-            def _to_device(value):
+            def _to_device(name, value):
                 if value is None:
                     return None
                 if isinstance(value, jax.Array):
+                    current_sharding = value.sharding
+                    if current_sharding == sharding:
+                        return value
                     return jax.device_put(value, sharding)
                 return device_array(value, sharding=sharding)
+
+            extend_seq_lens_for_logits = getattr(
+                model_worker_batch.spec_info_padded,
+                "extend_seq_lens_for_draft_extend",
+                None,
+            )
+            if extend_seq_lens_for_logits is None:
+                extend_seq_lens_for_logits = model_worker_batch.extend_seq_lens
+            logits_indices_for_logits = getattr(
+                model_worker_batch.spec_info_padded,
+                "logits_indices_for_draft_extend",
+                None,
+            )
+            if logits_indices_for_logits is None:
+                logits_indices_for_logits = model_worker_batch.logits_indices
 
             logits_metadata = LogitsMetadata(
                 forward_mode=model_worker_batch.forward_mode,
@@ -682,16 +698,19 @@ class EagleDraftInput:
                 extend_return_logprob=False,
                 extend_return_top_logprob=False,
                 extend_token_ids_logprob=False,
-                extend_seq_lens=_to_device(model_worker_batch.extend_seq_lens),
-                logits_indices=_to_device(model_worker_batch.logits_indices),
-                accept_lens=_to_device(model_worker_batch.spec_info_padded.accept_length),
+                extend_seq_lens=_to_device("extend_seq_lens", extend_seq_lens_for_logits),
+                logits_indices=_to_device("logits_indices", logits_indices_for_logits),
+                accept_lens=_to_device(
+                    "accept_lens", model_worker_batch.spec_info_padded.accept_length
+                ),
                 extend_seq_lens_cpu=None,
                 extend_logprob_start_lens_cpu=None,
                 extend_logprob_pruned_lens_cpu=None,
                 top_logprobs_nums=model_worker_batch.top_logprobs_nums,
                 token_ids_logprobs=model_worker_batch.token_ids_logprobs,
                 extend_input_logprob_token_ids_device=_to_device(
-                    model_worker_batch.extend_input_logprob_token_ids
+                    "extend_input_logprob_token_ids",
+                    model_worker_batch.extend_input_logprob_token_ids,
                 ),
             )
         return model_worker_batch, logits_metadata
