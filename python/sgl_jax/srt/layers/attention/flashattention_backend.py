@@ -681,6 +681,10 @@ class FlashAttention(AttentionBackend):
                 ik_new_l,
                 out_loc_l,
             ) = args
+            # out_cache_loc pads with -1 (schedule_batch.py:1865); -1//128=-1 wraps
+            # to the last *allocatable* page (allocator reserves page 0, not -1).
+            # Clamp to page 0 slot 0 so padding writes land on the reserved page.
+            out_loc_l = jnp.maximum(out_loc_l, 0)
             q_page = out_loc_l // page_size
             slot_in_page = out_loc_l % page_size
             ik_cast = ik_new_l[:, 0].astype(ik_buf_l.dtype)
