@@ -45,10 +45,8 @@ def _pad_to_page_bucket(num_pages: int) -> int:
 def _jit_gather_one_layer(buf, page_indices, out_sharding):
     """Gather ``page_indices`` from a single per-layer KV buffer.
 
-    Split from the original all-layers-in-one-jit to avoid XLA compile-time
-    OOM when layer_num * per_layer_size exceeds HBM (e.g. 36 layers × 684 MB
-    = 24.6 GB input → ~45 GB compile footprint on v6e-1).
-    Per-layer compile footprint is ~1.2 GB regardless of layer count.
+    Gathered per layer to cap the XLA compile-time HBM footprint (~1.2 GB
+    per layer regardless of layer count).
     """
     return buf.at[page_indices].get(out_sharding=out_sharding)
 
@@ -56,9 +54,7 @@ def _jit_gather_one_layer(buf, page_indices, out_sharding):
 def _jit_gather_all_layers(buffers, page_indices, out_sharding):
     """Gather ``page_indices`` from every per-layer KV buffer.
 
-    Dispatches per-layer jit calls. Each call compiles independently with
-    ~1.2 GB footprint. The 36 kernel launches add ~1.8ms total overhead
-    (negligible vs transfer + E2E latency).
+    Dispatches an independent per-layer jit call so each compiles separately.
     """
     return [_jit_gather_one_layer(buf, page_indices, out_sharding) for buf in buffers]
 
@@ -316,16 +312,12 @@ class SchedulerDisaggregationPrefillMixin:
             else:
                 released = False
                 if self.disagg_use_d2h_staging:
-                    # D2H is done (copy_from_device blocks) and the pull is now
-                    # registered against the host buffer, so the prefill device
-                    # KV pool slot is no longer referenced. Free it here —
-                    # instead of waiting for the decode ack in the terminal
-                    # callback — to reclaim HBM early. This is what makes staging
-                    # actually relieve HBM pressure; the bounded host pool
-                    # provides admission backpressure. The host buffer stays
-                    # reserved until terminal. Idempotent vs the terminal
-                    # release: release_kv_cache no-ops once req_pool_idx is
-                    # cleared.
+                    # D2H already copied the KV to the host buffer and the pull
+                    # is registered against it, so free the device KV slot now
+                    # (instead of on the decode ack) to reclaim HBM early. The
+                    # host buffer stays reserved until terminal. Idempotent vs
+                    # the terminal release: release_kv_cache no-ops once
+                    # req_pool_idx is cleared.
                     self._release_prefill_kv_pool(req)
 
             def _on_terminal(req_obj=req, sender_obj=sender, _released=released):

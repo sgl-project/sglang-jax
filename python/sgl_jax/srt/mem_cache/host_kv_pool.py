@@ -8,10 +8,8 @@ are in flight at once. It does not pre-allocate storage — each
 ``_make_host_sharding``). There is no LRU, no lock_ref, no retention —
 every borrow is intended to live for one transfer.
 
-The :class:`HostKVPool` ABC is the surface that HiCache's
-``LRUHostKVPool`` will also implement in its own RFC; keeping the ABC
-backend-agnostic now means HiCache can drop in without re-shaping the
-contract.
+The :class:`HostKVPool` ABC is kept backend-agnostic so an LRU host pool
+can implement the same contract later.
 """
 
 from __future__ import annotations
@@ -76,9 +74,7 @@ class HostKVPool(abc.ABC):
     Sizing is per-request entry: each entry is a list of ``layer_num``
     host arrays, each large enough to hold one request's padded pages.
     Concrete shapes (per-layer K/V split, head count, head dim) live on
-    the implementing class. The ABC keeps the surface small so HiCache's
-    LRU variant can implement the same contract without inheriting Queue
-    semantics.
+    the implementing class.
     """
 
     @abc.abstractmethod
@@ -224,14 +220,8 @@ class QueueHostKVPool(HostKVPool):
                 )
         array_pytree: list[jax.Array] = []
         total_bytes = 0
-        # Right-sized staging: device_put each per-layer array straight to the
-        # host sharding and hand it back directly. Scattering into a fixed
-        # max-page pool buffer (``entry[i].at[:n].set(...)``) would copy the
-        # whole buffer every call regardless of payload size; donation is not
-        # viable because the pre-allocated slots share one buffer object. The
-        # pool's reserve/release still bounds concurrency by slot COUNT;
-        # ``register_pull`` keeps each staged array alive until release. Issue
-        # all per-layer copies before blocking so they pipeline.
+        # device_put each per-layer array straight to the right-sized host
+        # sharding. Issue all per-layer copies before blocking so they pipeline.
         for layer in layers:
             host_layer = jax.device_put(layer, self._host_sharding)
             array_pytree.append(host_layer)
