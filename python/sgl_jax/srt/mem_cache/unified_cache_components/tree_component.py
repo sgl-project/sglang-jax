@@ -170,9 +170,9 @@ class TreeComponent(ABC):
     ) -> MatchResult:
         """Post-process the match result after prefix matching completes.
         - Full & SWA: pass through unchanged.
-        - Recurrent: performs copy-on-write — allocates a new recurrent slot, copies
-          the matched node's recurrent state into the request pool, and records
-          branching_seqlen in result."""
+        - Recurrent: records the matched node's recurrent slot as the request's
+          copy-on-write source and sets branching_seqlen in result; the state copy
+          itself happens lazily in the forward pass, not here."""
         return result
 
     def update_component_on_insert_overlap(

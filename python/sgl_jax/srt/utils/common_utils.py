@@ -38,6 +38,12 @@ logger = logging.getLogger(__name__)
 PRECOMPILE_DEFAULT_TOKEN_PADDINGS = [1 << i for i in range(6, 14)]
 PRECOMPILE_DEFAULT_BS_PADDINGS = [1 << i for i in range(0, 9)]
 
+# Largest EXTEND per-DP batch size that compiles correctly for the recurrent
+# (HybridReqToTokenPool, page_size=1) attention path under multi-host SPMD.
+# Beyond this, the RPA executable miscompiles and emits NaN from finite inputs
+# (validated 2026-06-18: per_dp_bs 8 coherent, 16 garbage, 12 inconclusive).
+SAFE_EXTEND_PER_DP_BS = 8
+
 
 def pad_to_bucket(value: int, buckets: list[int]) -> tuple[int, int]:
     """Return the smallest bucket >= value and its index.
@@ -58,6 +64,27 @@ def pad_to_bucket(value: int, buckets: list[int]) -> tuple[int, int]:
     raise ValueError(
         f"No bucket >= {value}. Available: {buckets}. " f"Increase bucket sizes or max capacity."
     )
+
+
+def projected_per_dp_bucket(active: int, dp_size: int, bs_paddings: list[int]) -> int:
+    """Per-DP batch size of the bs bucket that would be selected for `active`
+    requests per DP rank. A value beyond the largest bucket is returned as-is
+    (treated as unsafe by callers) instead of raising, so this never throws."""
+    total = max(active, 1) * dp_size
+    if total > bs_paddings[-1]:
+        return total // dp_size
+    bucket, _ = pad_to_bucket(total, bs_paddings)
+    return bucket // dp_size
+
+
+def selected_extend_per_dp_bs(
+    active_per_dp: list[int], dp_size: int, bs_paddings: list[int]
+) -> int:
+    """Per-DP bs bucket runtime selects for an EXTEND batch holding
+    `active_per_dp[r]` requests on each DP rank. Matches
+    `_compute_global_padding_sizes`: the bucket is keyed to the GLOBAL max active
+    count across ranks (not any single rank)."""
+    return projected_per_dp_bucket(max(active_per_dp, default=0), dp_size, bs_paddings)
 
 
 _warned_bool_env_var_keys = set()

@@ -867,6 +867,46 @@ class TestUnifiedRadixCacheRecurrent(CustomTestCase):
         self.assertEqual(pool.recurrent_available_size(0), slots)
         self.assertEqual(cache.assert_recurrent_slot_ledger(0), 0)
 
+    def test_continuation_match_hits_committed_leaf(self):
+        """Serving reuse path: a follow-up whose prompt extends a committed
+        sequence (multi-turn / P -> P+suffix) walks past and stops on the
+        committed leaf, so recurrent hits the full committed length and records
+        the CoW src. This is the case cross-request recurrent reuse is built for.
+        """
+        state_pool, pool, _, cache = self._create_recurrent_setup()
+        key = [1, 2, 3, 4, 5, 6, 7, 8]
+        value = np.arange(200, 208, dtype=np.int32)
+        slot, result = self._commit(cache, pool, key, value)
+        self.assertTrue(result.recurrent_committed)
+
+        req = _CowReq(dp_rank=0)
+        match = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(key + [9, 10], None, 0), cow_recurrent=True, req=req)
+        )
+        self.assertTrue(np.array_equal(match.device_indices, value))
+        self.assertEqual(req.recurrent_cow_src_index, slot)
+
+    def test_shorter_match_misses_recurrent_leaf(self):
+        """A match stopping one token short of the committed leaf (the universal
+        adjust_max_prefix_ids = input_len - 1, i.e. an identical-prompt resubmit)
+        lands on a recurrent-less split parent. Match requires every component's
+        validator to accept the same node, so the whole match -- FULL KV included
+        -- falls back to root. This is why repeated-identical prompts report
+        cached-token 0; matchable intermediate snapshots are PR#2 scope.
+        """
+        state_pool, pool, _, cache = self._create_recurrent_setup()
+        key = [1, 2, 3, 4, 5, 6, 7, 8]
+        value = np.arange(200, 208, dtype=np.int32)
+        slot, result = self._commit(cache, pool, key, value)
+        self.assertTrue(result.recurrent_committed)
+
+        req = _CowReq(dp_rank=0)
+        match = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(key[:-1], None, 0), cow_recurrent=True, req=req)
+        )
+        self.assertEqual(len(match.device_indices), 0)
+        self.assertIsNone(req.recurrent_cow_src_index)
+
     def test_shorter_prefix_after_longer_skips_internal(self):
         """Caching AB after ABCD lands on internal node B: recurrent is leaf-only,
         so it is not committed there (no orphan); the running slot is freed by
