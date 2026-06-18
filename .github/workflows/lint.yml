@@ -7,7 +7,7 @@ jobs:
     runs-on: arc-runner-cpu
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
       - name: Install pre-commit hook
         run: |
           python3.12 -m venv .venv

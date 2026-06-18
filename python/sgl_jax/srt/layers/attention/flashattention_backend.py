@@ -604,9 +604,9 @@ class FlashAttention(AttentionBackend):
             out_specs=out_specs,
             check_vma=False,
         )(
-            q.reshape(q.shape[0], -1, self.head_dim),
-            k.reshape(k.shape[0], -1, self.head_dim),
-            v.reshape(v.shape[0], -1, self.head_dim),
+            q.reshape(q.shape[0], -1, getattr(layer, "head_dim", self.head_dim)),
+            k.reshape(k.shape[0], -1, getattr(layer, "head_dim", self.head_dim)),
+            v.reshape(v.shape[0], -1, getattr(layer, "head_dim", self.head_dim)),
             kv_cache_fused,
             self.forward_metadata.seq_lens,
             page_indices_arg,

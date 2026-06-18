@@ -256,6 +256,8 @@ class ModelConfig:
                 self.num_hidden_layers = model_layer_nums
                 # Also update hf_config to ensure consistency across all components
                 self.hf_config.num_hidden_layers = model_layer_nums
+                if hasattr(self, "hf_text_config") and self.hf_text_config is not None:
+                    self.hf_text_config.num_hidden_layers = model_layer_nums
 
         # Cache attributes
         self.hf_eos_token_id = self.get_hf_eos_token_id()
@@ -587,6 +589,11 @@ class ModelConfig:
 
     def needs_kv_head_replication(self, tensor_parallel_size: int) -> bool:
         """Returns True if KV heads need to be replicated across devices."""
+        if hasattr(self, "_original_swa_num_key_value_heads"):
+            return (
+                tensor_parallel_size > self._original_swa_num_key_value_heads
+                or tensor_parallel_size > getattr(self, "_original_hf_num_key_value_heads", 1)
+            )
         total_num_kv_heads = self.get_total_num_kv_heads()
         return tensor_parallel_size > total_num_kv_heads
 
@@ -663,8 +670,52 @@ class ModelConfig:
         """Returns True if this is a Grouped Query Attention model."""
         return self.get_total_num_kv_heads() < self.num_attention_heads
 
+    def get_hybrid_layer_counts(self) -> tuple[int, int]:
+        """Resolves the number of sliding window (SWA) and full attention layers.
+
+        Returns:
+            tuple: (swa_layers, full_layers)
+        """
+        layer_types = getattr(self.hf_config, "layer_types", None)
+        if layer_types is not None:
+            swa_layers = sum(1 for lt in layer_types if lt == "sliding_attention")
+            full_layers = len(layer_types) - swa_layers
+        else:
+            pattern = getattr(self.hf_config, "hybrid_layer_pattern", None)
+            if pattern is None:
+                swa_layers = 0
+                full_layers = self.num_hidden_layers
+            else:
+                swa_layers = sum(1 for p in pattern if p == 1)
+                full_layers = sum(1 for p in pattern if p == 0)
+        return swa_layers, full_layers
+
+    def get_swa_weight_params(self):
+        """Retrieves head dimensions, original checkpoint head counts, and target sharded head boundaries required for lazy weight loader tensor replication.
+
+        Returns:
+            tuple: (full_head_dim, swa_head_dim, original_swa_heads, original_full_heads, target_heads)
+        """
+        cfg = getattr(self, "hf_text_config", self.hf_config)
+        orig_full_heads = getattr(
+            self,
+            "_original_hf_num_key_value_heads",
+            getattr(self, "_original_num_key_value_heads", 4),
+        )
+        orig_swa_heads = getattr(self, "_original_swa_num_key_value_heads", orig_full_heads)
+        target_heads = getattr(cfg, "num_key_value_heads", orig_full_heads)
+        return (
+            cfg.head_dim,
+            getattr(cfg, "swa_head_dim", cfg.head_dim),
+            orig_swa_heads,
+            orig_full_heads,
+            target_heads,
+        )
+
     def get_kv_padding_strategy(self) -> str:
         """Returns the padding strategy for KV heads."""
+        if hasattr(self, "_original_swa_num_key_value_heads"):
+            return "replicate"
         if self.is_gqa_model():
             # GQA models should replicate existing kv heads to maintain attention semantics
             return "replicate"
@@ -876,6 +927,7 @@ multimodal_model_archs = [
     "InternVLChatModel",
     "Phi4MMForCausalLM",
     "VILAForConditionalGeneration",
+    "KimiK25ForConditionalGeneration",
 ]
 
 

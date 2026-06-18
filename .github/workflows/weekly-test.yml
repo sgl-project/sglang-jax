@@ -33,7 +33,7 @@ jobs:
       SGLANG_JAX_MODEL_CACHE: /models/model_scope
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
       - name: Setup Python environment
         uses: ./.github/actions/setup-venv
         with:
@@ -98,7 +98,7 @@ jobs:
       SGLANG_JAX_MODEL_CACHE: /models/model_scope
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
       - name: Setup Python environment
         uses: ./.github/actions/setup-venv
         with:
@@ -137,7 +137,7 @@ jobs:
       SGLANG_JAX_MODEL_CACHE: /models/model_scope
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
       - name: Setup Python environment
         uses: ./.github/actions/setup-venv
       - name: Run performance test for text models
@@ -181,7 +181,7 @@ jobs:
       SGLANG_JAX_MODEL_CACHE: /models/model_scope
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Python environment
         uses: ./.github/actions/setup-venv
@@ -247,7 +247,7 @@ jobs:
         SGLANG_JAX_MODEL_CACHE: /models/model_scope
       steps:
         - name: Checkout code
-          uses: actions/checkout@v4
+          uses: actions/checkout@v5
 
         - name: Setup Python environment
           uses: ./.github/actions/setup-venv
@@ -291,7 +291,7 @@ jobs:
           SGLANG_JAX_MODEL_CACHE: /models/model_scope
         steps:
           - name: Checkout code
-            uses: actions/checkout@v4
+            uses: actions/checkout@v5
 
           - name: Setup Python environment
             uses: ./.github/actions/setup-venv

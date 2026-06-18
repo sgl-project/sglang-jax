@@ -398,15 +398,13 @@ def top_k_top_p_min_p_sampling_from_probs_jax_with_sort(args):
         min_p_operands,
     )
 
+    # Static predicate (None vs array changes the input pytree): use `if`, not
+    # lax.cond -- the branches' output shardings differ and cannot be unified.
     multinomial_operands = (probs_sort, sampling_seeds, positions, rng)
-    multinomial_with_seed_fn = lambda op: multinomial_with_seed((*op, True))
-    multinomial_fn = lambda op: multinomial((*op, True))
-    sampled_index = lax.cond(
-        sampling_seeds is not None,
-        multinomial_with_seed_fn,
-        multinomial_fn,
-        multinomial_operands,
-    )
+    if sampling_seeds is not None:
+        sampled_index = multinomial_with_seed((*multinomial_operands, True))
+    else:
+        sampled_index = multinomial((*multinomial_operands, True))
 
     probs_idx = probs_idx.astype(jnp.int32)
     return jnp.take_along_axis(probs_idx, axis=1, indices=sampled_index).flatten()
@@ -441,15 +439,12 @@ def top_k_top_p_min_p_sampling_from_probs_jax_with_mask(args):
         min_p_operands,
     )
 
+    # Static predicate -- use `if`, not lax.cond (see sort path).
     multinomial_operands = (logits, sampling_seeds, positions, rng)
-    multinomial_with_seed_fn = lambda op: multinomial_with_seed((*op, False))
-    multinomial_fn = lambda op: multinomial((*op, False))
-    sampled_index = lax.cond(
-        sampling_seeds is not None,
-        multinomial_with_seed_fn,
-        multinomial_fn,
-        multinomial_operands,
-    )
+    if sampling_seeds is not None:
+        sampled_index = multinomial_with_seed((*multinomial_operands, False))
+    else:
+        sampled_index = multinomial((*multinomial_operands, False))
 
     return sampled_index.flatten()
 

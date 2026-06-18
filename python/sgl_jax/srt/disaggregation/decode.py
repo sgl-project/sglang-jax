@@ -37,6 +37,9 @@ class DecodeBookkeeping:
     kv_indices: object | None = None
     # Whether the receiver has been initialized + poll started.
     started: bool = False
+    # Set by _drain_transfer_queue_synced on multi-host so downstream
+    # does not re-poll (a poll() that raised would re-raise and desync).
+    synced_state: KVPoll | None = None
 
 
 class DecodePreallocQueue:
@@ -170,7 +173,10 @@ class SchedulerDisaggregationDecodeMixin:
                 from sgl_jax.srt.disaggregation.common.metrics import time_phase
 
                 with time_phase("bootstrap", "decode"):
-                    p_info = self.disagg_bootstrap_client.get_prefill_info(req.bootstrap_room)
+                    if jax.process_count() > 1:
+                        p_info = self._pick_prefill_peer_for_this_host()
+                    else:
+                        p_info = self.disagg_bootstrap_client.get_prefill_info(req.bootstrap_room)
             except Exception:
                 logger.exception(
                     "bootstrap lookup failed for req_id=%s "
@@ -238,9 +244,15 @@ class SchedulerDisaggregationDecodeMixin:
         for entry in self.disagg_prealloc_queue.pop_all():
             self.disagg_transfer_queue.add(entry)
 
-        for entry in self.disagg_transfer_queue.drain_terminal():
+        for entry in self._drain_transfer_queue_synced():
             assert entry.receiver is not None
-            state = entry.receiver.poll()
+            state = entry.synced_state
+            if state is None:
+                try:
+                    state = entry.receiver.poll()
+                except Exception:
+                    logger.exception("receiver.poll() raised for req_id=%s", entry.req_id)
+                    state = KVPoll.FAILED
             if state == KVPoll.SUCCESS:
                 try:
                     kv_result = entry.receiver.result
@@ -269,6 +281,66 @@ class SchedulerDisaggregationDecodeMixin:
                 if entry.kv_indices is not None:
                     self._release_decode_kv_indices(entry.kv_indices)
                 self._abort_decode_request(entry.req, "receiver_terminal_failed")
+
+    def _pick_prefill_peer_for_this_host(self: Scheduler) -> dict[str, object]:
+        """Multi-host: find the P host whose jax_process_index matches ours.
+        That host's local KV shard is exactly the slice this D host needs.
+        Requires P/D to have the same nproc (same-TP constraint).
+        """
+        if getattr(self, "_disagg_prefill_peer", None) is not None:
+            return self._disagg_prefill_peer
+        my_pidx = jax.process_index()
+        my_nproc = jax.process_count()
+        all_p = self.disagg_bootstrap_client.list_prefills()
+        for p in all_p:
+            if int(p.get("jax_process_index", -1)) == my_pidx:
+                if int(p.get("jax_process_count", 0)) != my_nproc:
+                    raise RuntimeError(
+                        f"P/D process_count mismatch: P={p.get('jax_process_count')} "
+                        f"D={my_nproc}. Per-host shard transfer requires same nproc."
+                    )
+                self._disagg_prefill_peer = p
+                return p
+        raise RuntimeError(
+            f"no prefill host with jax_process_index={my_pidx} registered "
+            f"(got {[(p.get('host'), p.get('jax_process_index')) for p in all_p]})"
+        )
+
+    def _drain_transfer_queue_synced(self: Scheduler) -> list[DecodeBookkeeping]:
+        """On multi-host, only drain entries whose receiver has reached a
+        terminal state on every NP — _write_kv_to_pool issues a cross-host
+        jit and all NPs must enter it for the same set of reqs.
+        """
+        if jax.process_count() <= 1:
+            return self.disagg_transfer_queue.drain_terminal()
+        from sgl_jax.srt.disaggregation.common.multihost_sync import (
+            synced_terminal_rooms,
+        )
+
+        with self.disagg_transfer_queue._lock:
+            entries = list(self.disagg_transfer_queue._entries.values())
+        success, failed = synced_terminal_rooms(
+            entries,
+            poll_fn=lambda e: e.receiver.poll(),
+            room_fn=lambda e: getattr(e.req, "bootstrap_room", None),
+        )
+        if not success and not failed:
+            return []
+        out: list[DecodeBookkeeping] = []
+        with self.disagg_transfer_queue._lock:
+            for rid, e in list(self.disagg_transfer_queue._entries.items()):
+                room = getattr(e.req, "bootstrap_room", None)
+                if room in failed:
+                    self.disagg_transfer_queue._entries.pop(rid, None)
+                    with suppress(Exception):
+                        e.receiver.fail(reason="peer_np_failed")
+                    e.synced_state = KVPoll.FAILED
+                    out.append(e)
+                elif room in success:
+                    self.disagg_transfer_queue._entries.pop(rid, None)
+                    e.synced_state = KVPoll.SUCCESS
+                    out.append(e)
+        return out
 
     # ------------------------------------------------------------------
     # Overridable / test-friendly hooks
@@ -309,6 +381,10 @@ class SchedulerDisaggregationDecodeMixin:
         seqlen = len(req.origin_input_ids)
         num_pages = (seqlen + page_size - 1) // page_size
         padded_pages = _pad_to_page_bucket(num_pages)
+        if jax.process_count() > 1:
+            from sgl_jax.srt.disaggregation.prefill import local_kv_spec_for_pool
+
+            return local_kv_spec_for_pool(kv_pool, kv_pool.layer_num, padded_pages)
         per_layer_tail = kv_pool.kv_buffer[0].shape[1:]
         shape = (kv_pool.layer_num, padded_pages) + per_layer_tail
         base_spec = kv_pool.kv_sharding.spec
@@ -328,6 +404,18 @@ class SchedulerDisaggregationDecodeMixin:
         from jax.sharding import NamedSharding, PartitionSpec
 
         kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
+        if jax.process_count() > 1 and kv.is_fully_addressable:
+            # Pulled KV is this host's local shard on a 1-D local mesh.
+            # Assemble it into the global pool sharding (zero-copy: each NP
+            # contributes its own addressable_shards).
+            pool_pspec = kv_pool.kv_sharding.spec
+            stacked_spec = PartitionSpec(None, None, *pool_pspec[1:])
+            gsh = NamedSharding(kv_pool.mesh, stacked_spec)
+            per_layer_tail = kv_pool.kv_buffer[0].shape[1:]
+            gshape = (kv.shape[0], kv.shape[1]) + per_layer_tail
+            kv = jax.make_array_from_single_device_arrays(
+                gshape, gsh, [s.data for s in kv.addressable_shards]
+            )
         page_size = kv_pool.page_size
         seqlen = len(req.origin_input_ids)
         num_pages = (seqlen + page_size - 1) // page_size
