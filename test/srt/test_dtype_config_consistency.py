@@ -19,27 +19,7 @@ class TestDtypeConfigConsistency(CustomTestCase):
         hidden_size = 256
         intermediate_size = 512
 
-        def cast_params(params, target_dtype, float32_paths=None):
-            float32_paths = float32_paths or ()
-
-            def _cast(tree, path=()):
-                if hasattr(tree, "items"):
-                    return type(tree)({k: _cast(v, path + (k,)) for k, v in tree.items()})
-
-                if isinstance(tree, (list, tuple)):
-                    return type(tree)(_cast(v, path + (str(i),)) for i, v in enumerate(tree))
-
-                if hasattr(tree, "astype"):
-                    name = "/".join(path)
-                    if any(p in name for p in float32_paths):
-                        return tree.astype(jnp.float32)
-                    return tree.astype(target_dtype)
-
-                return tree
-
-            return _cast(params)
-
-        # Create fp32 model and reuse its weights for the bf16 and mixed-precision models.
+        # Create Models
         model_fp32 = LlamaMLP(
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
@@ -47,15 +27,12 @@ class TestDtypeConfigConsistency(CustomTestCase):
             mesh=mesh,
         )
 
-        params_fp32 = model_fp32.params
-
         model_bf16 = LlamaMLP(
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             dtype=jnp.bfloat16,
             mesh=mesh,
         )
-        model_bf16.params = cast_params(params_fp32, jnp.bfloat16)
 
         dtype_config = DtypeConfig(
             default_dtype=jnp.bfloat16,
@@ -66,14 +43,25 @@ class TestDtypeConfigConsistency(CustomTestCase):
         model_mixed = LlamaMLP(
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
+            dtype=jnp.bfloat16,
             dtype_config=dtype_config,
             mesh=mesh,
         )
-        model_mixed.params = cast_params(
-            params_fp32,
-            jnp.bfloat16,
-            float32_paths=("gate_proj",),
-        )
+
+        # Align weights by casting the fp32 model's initialized weights to match each target model's dtype.
+        # This ensures all three models start with the exact same weight values (modulo dtype truncation),
+        # preventing differences in output caused by separate random initialization paths or seed-to-dtype truncation.
+        state_fp32 = nnx.state(model_fp32)
+
+        def cast_state_like(source_state, target_state):
+            return jax.tree.map(
+                lambda src, tgt: src.astype(tgt.dtype) if hasattr(tgt, "dtype") else src,
+                source_state,
+                target_state,
+            )
+
+        nnx.update(model_bf16, cast_state_like(state_fp32, nnx.state(model_bf16)))
+        nnx.update(model_mixed, cast_state_like(state_fp32, nnx.state(model_mixed)))
 
         # Generate dummy input
         x = jax.random.uniform(jax.random.PRNGKey(0), (1, hidden_size), dtype=jnp.float32)
