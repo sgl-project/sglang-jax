@@ -211,13 +211,9 @@ class QueueHostKVPool(HostKVPool):
             # later layer shaped differently) would otherwise stage mismatched
             # arrays and silently corrupt the pulled KV on the decode side.
             if layer.shape != expected_shape:
-                raise ValueError(
-                    f"layer {i} shape {layer.shape} != expected {expected_shape}"
-                )
+                raise ValueError(f"layer {i} shape {layer.shape} != expected {expected_shape}")
             if np.dtype(layer.dtype) != expected_dtype:
-                raise ValueError(
-                    f"layer {i} dtype {layer.dtype} != expected {expected_dtype}"
-                )
+                raise ValueError(f"layer {i} dtype {layer.dtype} != expected {expected_dtype}")
         array_pytree: list[jax.Array] = []
         total_bytes = 0
         # device_put each per-layer array straight to the right-sized host
