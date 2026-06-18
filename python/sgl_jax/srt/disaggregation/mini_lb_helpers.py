@@ -59,11 +59,9 @@ def ensure_request_identity_fields(
     elif disagg_transfer_id is None:
         disagg_transfer_id = rid
 
-    # For batched requests GenerateReqInput expands a scalar rid into per-item
-    # ids ("{rid}_{i}") but indexes disagg_transfer_id as-is, so a scalar
-    # transfer id would be shared by every element and the prefill side would
-    # register colliding uuid:kv entries. Expand both to aligned per-item lists
-    # here so each element carries a unique, P/D-consistent transfer id.
+    # GenerateReqInput expands a scalar rid into per-item ids ("{rid}_{i}") but
+    # uses disagg_transfer_id as-is. Expand both to aligned per-item lists so
+    # each element carries a unique, P/D-consistent transfer id.
     if batch_size is not None:
         rid = _expand_identity_field(rid, batch_size)
         disagg_transfer_id = _expand_identity_field(disagg_transfer_id, batch_size)

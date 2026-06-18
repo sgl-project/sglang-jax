@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Deploy PD e2e test job on GKE.
+# Deploy the PD single-host eval/benchmark job on GKE.
 #
 # Usage:
 #   ./scripts/disaggregation/gke/deploy.sh [--delete-only]
@@ -11,10 +11,10 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-JOB_NAME="pd-e2e-test"
-GH_ORG="sgl-project"
-BRANCH="pd/scheduler"
-TEMPLATE="${SCRIPT_DIR}/pd_router_e2e_job.yaml"
+JOB_NAME="pd-singlehost-eval"
+GH_ORG="cjx0709"
+BRANCH="pd/probe-pull-timing-0611"
+TEMPLATE="${SCRIPT_DIR}/pd_singlehost_eval_job.yaml"
 GENERATED="/tmp/${JOB_NAME}.yaml"
 
 export USE_GKE_GCLOUD_AUTH_PLUGIN=True

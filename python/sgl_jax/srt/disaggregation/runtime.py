@@ -24,11 +24,21 @@ def install_disaggregation_wiring(scheduler: Scheduler, server_args: ServerArgs)
     if server_args.dp_size > 1:
         raise RuntimeError(
             f"PD disaggregation does not yet support dp_size>1 "
-            f"(got dp_size={server_args.dp_size}). This will be "
-            f"supported in a future PR."
+            f"(got dp_size={server_args.dp_size})."
         )
     if server_args.disaggregation_bootstrap_url is None:
         raise RuntimeError("disaggregation_mode != null requires bootstrap_url")
+
+    import jax
+
+    if jax.process_count() > 1 and server_args.disaggregation_enable_d2h:
+        raise RuntimeError(
+            "PD D2H host staging (--disaggregation-enable-d2h) is single-host "
+            "only. The host KV pool is built on the global kv_pool mesh, but "
+            "multi-host prefill extracts a local-mesh shard, so copy_from_device "
+            "would reshard-fail. Run multi-host without d2h (path B: direct HBM "
+            "transfer)."
+        )
 
     from sgl_jax.srt.disaggregation.bootstrap import (
         BootstrapClient,

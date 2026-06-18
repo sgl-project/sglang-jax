@@ -167,10 +167,8 @@ class MiniLoadBalancer:
         from fastapi.responses import StreamingResponse
 
         if self.test_external_dp_routing:
-            # The stream path does not fork per-side DP requests nor verify the
-            # returned dp_rank (unlike generate()), so honoring the flag here
-            # would silently skip the routing enforcement and check. Fail loudly
-            # instead of emitting a warning that is easy to miss in a long log.
+            # Streaming cannot enforce or verify per-side DP routing the way
+            # generate() does, so fail loudly instead of silently skipping it.
             raise HTTPException(
                 status_code=400,
                 detail="--test-external-dp-routing is not supported with streaming",

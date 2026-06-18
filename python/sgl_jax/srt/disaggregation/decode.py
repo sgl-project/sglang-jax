@@ -50,12 +50,9 @@ def _jit_write_one_layer(
 ):
     """One-layer PD KV write, wrapped in a module-level ``jax.jit``.
 
-    ``update_fused_kv_cache_vectorized`` builds its ``jax.shard_map`` as a nested
-    closure that is recreated on every call, so an eager call never hits JAX's
-    compilation cache — the ~9s Pallas write kernel recompiles per layer per
-    request and trips the scheduler watchdog. Wrapping the call in this stable
-    module-level ``jax.jit`` makes the trace cache hit on shape + static args, so
-    the kernel compiles once per write shape and is reused thereafter.
+    The stable module-level ``jax.jit`` makes the trace cache hit on shape +
+    static args so the Pallas write kernel compiles once per write shape and is
+    reused thereafter.
     """
     from sgl_jax.srt.mem_cache.memory_pool import _set_fused_kv_buffer
 
@@ -658,14 +655,10 @@ class SchedulerDisaggregationDecodeMixin:
         else:
             page_ids_padded = None
 
-        # Write via the same in-place Pallas kernel the forward path uses
-        # (``update_fused_kv_cache_vectorized`` with ``input_output_aliases``).
-        # Unlike ``.at[page_ids].set(...)`` — whose scatter XLA:TPU refuses to
-        # alias, forcing a fresh full-layer (~884 MB) buffer that OOMs a v6e
-        # single chip and wedges the decode loop — this kernel updates the pool
-        # in place with a footprint proportional to the tokens written.
-        # ``loc`` is per-token absolute pool slots; -1 marks padding tokens that
-        # are skipped, so no tail-repeat payload duplication is needed.
+        # Write via the in-place Pallas kernel (``update_fused_kv_cache_vectorized``
+        # with ``input_output_aliases``), so the footprint scales with the tokens
+        # written. ``loc`` is per-token absolute pool slots; -1 marks padding
+        # tokens that are skipped.
         total_tokens = padded_pages * page_size
         loc_np = np.full(total_tokens, -1, dtype=np.int32)
         loc_np[:seqlen] = kv_indices_np[:seqlen]
@@ -673,9 +666,6 @@ class SchedulerDisaggregationDecodeMixin:
             jnp.asarray(loc_np),
             NamedSharding(kv_pool.mesh, PartitionSpec(kv_pool.attention_data_partition_axis)),
         )
-        # Each layer write goes through the module-level ``_jit_write_one_layer``
-        # so the Pallas write kernel compiles once per shape and caches, instead
-        # of recompiling per layer per request (which trips the watchdog).
         for i, layer_id in enumerate(
             range(kv_pool.start_layer, kv_pool.start_layer + kv_pool.layer_num)
         ):

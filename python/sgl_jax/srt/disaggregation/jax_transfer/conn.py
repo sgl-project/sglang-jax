@@ -117,15 +117,12 @@ class JaxTransferKVManager(CommonKVManager):
         self._wrapper = wrapper
         self._zmq_notifier = zmq_notifier
         self._host_pool = host_pool
-        # A small pool of long-lived workers drains the pull queue and runs
-        # the blocking ``wrapper.pull`` off the decode event-loop thread. On
-        # TPU ``link.pull`` (``_pull_flat``) is a synchronous native call, so
-        # dispatching it inline in ``poll()`` would freeze the single-threaded
-        # decode event loop. A *single* worker is not enough either: one slow
-        # or stalled pull would head-of-line-block every queued pull. With N
-        # workers (``pull_worker_count``, matched to the transfer engine's
-        # ``max_num_parallel_copies``) concurrent pulls proceed in parallel and
-        # a stalled pull only ties up one worker until its ``timeout`` fires.
+        # A pool of long-lived workers drains the pull queue and runs the
+        # blocking ``wrapper.pull`` off the decode event-loop thread (on TPU
+        # ``link.pull`` is a synchronous native call). ``pull_worker_count`` is
+        # matched to the transfer engine's ``max_num_parallel_copies`` so
+        # concurrent pulls run in parallel and a stalled pull only ties up one
+        # worker until its ``timeout`` fires (no head-of-line blocking).
         self._pull_worker_count = max(1, int(pull_worker_count))
         self._pull_queue: _queue.Queue[JaxTransferKVReceiver | None] = _queue.Queue()
         self._pull_workers: list[threading.Thread] = []
@@ -334,13 +331,10 @@ class JaxTransferKVSender(KVSender, StateHolder):
                 raise
             self._status = status
             if self._use_d2h_staging:
-                # Staging copied the payload to host (copy_from_device blocks)
-                # and registered the HOST arrays for pull, so the device gather
-                # output is no longer referenced by the transfer. Drop our ref
-                # to free that HBM now; otherwise every sender still queued for
-                # the decode ack keeps its device KV alive, accumulating until
-                # prefill OOMs. Path B registers HBM arrays directly, so those
-                # must stay alive until the ack.
+                # Staging copied the payload to host and registered the host
+                # arrays for pull, so drop our ref to free the device gather
+                # output's HBM now. Path B registers HBM arrays directly, so
+                # those must stay alive until the ack.
                 self._payload = None
             self._transition_to(KVPoll.TRANSFERRING)
             self._ack_timer = time_phase("ack", "prefill")

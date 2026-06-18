@@ -413,12 +413,10 @@ class BootstrapClient:
         self._register_retries = register_retries
         self._register_retry_delay_s = register_retry_delay_s
         self._shared_secret = shared_secret
-        # Reuse one client (and its connection pool + SSL context) across
-        # calls. ``httpx.get``/``httpx.post`` build a throwaway client per
-        # call, which rebuilds the SSL context every time; under load that
-        # blocked the single-threaded decode event loop inside
-        # ``get_prefill_info``. ``httpx.Client`` is thread-safe, so the prefill
-        # heartbeat daemon and the decode loop can share this instance.
+        # Reuse one thread-safe ``httpx.Client`` (and its connection pool + SSL
+        # context) across calls; building a throwaway client per call rebuilds
+        # the SSL context every time, which under load blocked the decode event
+        # loop inside ``get_prefill_info``.
         self._client = httpx.Client(timeout=timeout_s)
 
     @property
@@ -538,19 +536,10 @@ class PrefillInfoCache:
 
     Resolves per-room selection LOCALLY — mirroring the server's
     ``_Registry.pick_for_room`` (``sorted(keys)[room % len]``) — so a warm
-    cache serves every request with **zero** network round-trips. This
-    replaces the per-request synchronous ``get_prefill_info`` GET that, under
-    high concurrency, serialized on and froze the single-threaded decode event
-    loop.
-
-    The full registry is fetched via ``list_prefills`` at most once per
-    ``refresh_interval_s`` (rate-limited), on the first lookup after the
-    interval elapses — whether or not the room currently resolves. This evicts
-    prefills that have died or unregistered instead of pinning routing to a
-    stale entry. If the registry is empty the room returns ``None`` so the
-    caller defers the request and retries next tick (never abort). This is
-    sglang's design: resolve locally from a cached cluster layout, refreshing
-    the layout on a bounded interval.
+    cache serves requests with zero network round-trips. The full registry is
+    refreshed via ``list_prefills`` at most once per ``refresh_interval_s`` to
+    evict dead/unregistered prefills. If the registry is empty the room returns
+    ``None`` so the caller defers and retries next tick (never abort).
     """
 
     def __init__(

@@ -16,10 +16,8 @@ The wrapper does NOT lock to a specific JAX version. The contract tests
 in ``test_jax_transfer_wrapper`` will fail loudly if a future JAX
 release breaks any of the above assumptions.
 
-Multi-peer note: the RFC sketch lists ``pull(uuid, spec)`` only, but a
-process-level wrapper that fans out to multiple peers needs to know
-*which* peer to pull from. We extend the signature with an explicit
-``remote_addr`` argument and cache one ``link`` per remote.
+``pull()`` takes an explicit ``remote_addr`` and caches one ``link`` per
+remote peer.
 """
 
 from __future__ import annotations
@@ -42,14 +40,8 @@ def _uuid_to_int(uuid: str) -> int:
     """Stable mapping from a public ``str`` uuid to the 32-bit int that the
     underlying JAX transfer API expects. ``zlib.crc32`` is deterministic
     across processes and Python versions, which is what we need for
-    cross-pod pull/register pairing.
-
-    32 bits gives a birthday-bound collision risk at roughly 65k
-    concurrent uuids. That is acceptable for a bounded number of
-    in-flight transfers, but a wider hash would reduce the risk further.
-    The :py:meth:`JaxTransferWrapper.register_pull` duplicate check
-    catches repeated string uuids, but it cannot detect a ``crc32``
-    collision between two distinct strings.
+    cross-pod pull/register pairing. 32-bit collision risk is acceptable
+    for the bounded number of in-flight transfers.
     """
 
     return zlib.crc32(uuid.encode("utf-8")) & 0xFFFFFFFF

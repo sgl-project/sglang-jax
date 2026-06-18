@@ -1,12 +1,8 @@
-# Stage 3 Router E2E test on GKE: headless Service + Indexed Job (2 pods, each 1 v6e chip)
-#
-# Pod 0: bootstrap server + prefill server
-# Pod 1: decode server + router (mini_lb) + e2e test client
-#
-# Tests the full Stage 3 router path:
-#   client -> router (mini_lb) -> [P, D] -> response
-#
-# Placeholders: <JOB_NAME>, <SSH_KEY_B64>, <GH_ORG>, <BRANCH>
+# Single-host PD eval/benchmark job on GKE.
+# DeepSeek-R1-Distill-Qwen-1.5B, TP=1 per role on pd-v6e-1 (single chip/host).
+# Pod 0 runs bootstrap + prefill; pod 1 runs decode + router + a driver that
+# runs GSM8K (correctness) then a bench_serving smoke (in4k/out1k conc64).
+# Rendered by deploy.sh, which injects <JOB_NAME>/<SSH_KEY_B64>/<GH_ORG>/<BRANCH>.
 ---
 apiVersion: v1
 kind: Service
@@ -50,24 +46,36 @@ spec:
         env:
         - name: P_HOST
           value: "<JOB_NAME>-0.<JOB_NAME>-headless-svc"
-        - name: D_HOST
-          value: "<JOB_NAME>-1.<JOB_NAME>-headless-svc"
         - name: MODEL_PATH
-          value: "/models/Qwen/Qwen3-8B-Base"
-        - name: BOOTSTRAP_URL
-          value: "http://<JOB_NAME>-0.<JOB_NAME>-headless-svc:8998"
+          value: "/models/DeepSeek-R1-Distill-Qwen-1.5B"
+        - name: BRANCH
+          value: "<BRANCH>"
+        - name: CAP
+          value: "8"
+        - name: CONCURRENCY
+          value: "64"
+        - name: NUM_PROMPTS
+          value: "64"
+        - name: INPUT_LEN
+          value: "4096"
+        - name: OUTPUT_LEN
+          value: "1024"
+        - name: GSM_Q
+          value: "200"
+        - name: GSM_PAR
+          value: "16"
+        - name: GSM_MAXTOK
+          value: "512"
         command:
         - bash
         - -c
         - |
           set -ex
 
-          # --- Install JAX + libtpu ---
-          pip install -U --pre jax jaxlib libtpu requests \
+          pip install -U --pre jax jaxlib libtpu requests aiohttp tqdm numpy py-spy \
             -i https://us-python.pkg.dev/ml-oss-artifacts-published/jax/simple/ \
             -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
 
-          # --- SSH key for private repo clone ---
           mkdir -p ~/.ssh
           echo "<SSH_KEY_B64>" | base64 -d > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
@@ -75,118 +83,141 @@ spec:
 
           apt-get update && apt-get install -y iproute2 tmux vim
 
-          # --- Clone repo + install ---
           export UV_CACHE_DIR="/tmp/tpu_logs/uv_cache"
           export UV_PYTHON_INSTALL_DIR="/tmp/tpu_logs/python"
           export TMPDIR="/tmp/tpu_logs"
           mkdir -p "$TMPDIR"
           pip install uv && uv venv /tmp/tpu_logs/venv && source /tmp/tpu_logs/venv/bin/activate
-          uv pip install pip
-          git clone git@github.com:<GH_ORG>/sglang-jax.git --branch <BRANCH>
-          cd sglang-jax && uv pip install -e python[all]
+          uv pip install pip py-spy
+          git clone git@github.com:<GH_ORG>/sglang-jax.git --branch "${BRANCH}"
+          cd sglang-jax && uv pip install -e python[all] && uv pip install datasets
 
           INDEX=${JOB_COMPLETION_INDEX}
-          echo "=== Pod index: $INDEX ==="
+          echo "=== Pod index: $INDEX BRANCH=${BRANCH} (single-host PD, DeepSeek-1.5B TP=1) ==="
 
           if [ "$INDEX" = "0" ]; then
-            # ========== POD 0: Bootstrap + Prefill ==========
-            echo "Starting bootstrap server..."
             python -m sgl_jax.srt.disaggregation.run_bootstrap \
               --host 0.0.0.0 --port 8998 &
-            BOOTSTRAP_PID=$!
             sleep 3
 
-            echo "Starting prefill server..."
             python -m sgl_jax.launch_server \
               --model-path "$MODEL_PATH" \
               --host 0.0.0.0 \
               --port 10000 \
               --page-size 128 \
+              --disable-radix-cache \
+              --enable-request-time-stats-logging \
               --disaggregation-mode prefill \
               --disaggregation-bootstrap-url "http://${P_HOST}:8998" \
+              --chunked-prefill-size 16384 \
+              --disaggregation-enable-d2h \
+              --enable-metrics \
               2>&1 | tee /tmp/prefill_server.log &
-            P_PID=$!
 
-            # Wait for P server health
             echo "Waiting for prefill server to be ready..."
             for i in $(seq 1 300); do
               curl -sf http://localhost:10000/health && break
               sleep 2
             done
-
-            echo "Prefill server ready. Waiting for job to complete..."
-            wait $P_PID
+            echo "Prefill ready. Staying up (bounded) for the whole bench..."
+            sleep 3600
+            echo "pod0 bounded sleep done, exiting to free node."
 
           else
-            # ========== POD 1: Decode + Router + Test Client ==========
-            echo "Waiting for bootstrap server at ${P_HOST}:8998..."
+            echo "Waiting for bootstrap at ${P_HOST}:8998..."
             for i in $(seq 1 300); do
               curl -sf "http://${P_HOST}:8998/health" && break
               sleep 2
             done
-            echo "Bootstrap server ready."
-
-            echo "Waiting for prefill server at ${P_HOST}:10000..."
+            echo "Waiting for prefill at ${P_HOST}:10000..."
             for i in $(seq 1 300); do
               curl -sf "http://${P_HOST}:10000/health" && break
               sleep 2
             done
-            echo "Prefill server ready."
 
-            echo "Starting decode server..."
             python -m sgl_jax.launch_server \
               --model-path "$MODEL_PATH" \
               --host 0.0.0.0 \
               --port 10001 \
               --page-size 128 \
+              --disable-radix-cache \
+              --enable-request-time-stats-logging \
               --disaggregation-mode decode \
               --disaggregation-bootstrap-url "http://${P_HOST}:8998" \
+              --chunked-prefill-size 16384 \
+              --disaggregation-enable-d2h \
+              --disaggregation-max-inflight-transfers ${CAP} \
+              --mem-fraction-static 0.80 \
+              --enable-metrics \
               2>&1 | tee /tmp/decode_server.log &
-            D_PID=$!
 
-            echo "Waiting for decode server to be ready..."
             for i in $(seq 1 300); do
               curl -sf http://localhost:10001/health && break
               sleep 2
             done
-            echo "Decode server ready."
 
-            # ========== Start Router (mini_lb) ==========
-            echo "Starting router (mini_lb)..."
             python -m sgl_jax.srt.disaggregation.launch_router \
               --pd-disaggregation --mini-lb \
               --prefill "http://${P_HOST}:10000" 8998 \
               --decode http://localhost:10001 \
               --prefill-bootstrap-host "${P_HOST}" \
+              --max-concurrent-requests 64 \
               --host 0.0.0.0 --port 30000 \
               2>&1 | tee /tmp/router.log &
-            ROUTER_PID=$!
 
-            echo "Waiting for router to be ready..."
             for i in $(seq 1 60); do
               curl -sf http://localhost:30000/health && break
               sleep 2
             done
-            echo "Router ready."
 
             echo "=========================================="
-            echo "Running Stage 3 Router E2E test suite..."
+            echo "GSM8K (PRIMARY correctness) BRANCH=${BRANCH} q=${GSM_Q} par=${GSM_PAR} maxtok=${GSM_MAXTOK}"
             echo "=========================================="
-            python scripts/disaggregation/e2e_router_test.py \
-              --router-url http://localhost:30000 \
-              --bootstrap-url "http://${P_HOST}:8998" \
-              --skip-health-check \
-              --timeout 300
-            TEST_EXIT=$?
+            set +e
+            timeout 1800 python benchmark/gsm8k/bench_sglang_jax.py \
+              --base-url http://localhost:30000 \
+              --num-questions ${GSM_Q} \
+              --num-shots 5 \
+              --max-new-tokens ${GSM_MAXTOK} \
+              --parallel ${GSM_PAR} \
+              --result-file /tmp/gsm8k_result.jsonl \
+              --output-file /tmp/gsm8k_outputs.txt
+            GSM_RC=$?
+            set -e
+            echo "--- GSM8K summary (BRANCH=${BRANCH}) ---"
+            cat /tmp/gsm8k_result.jsonl 2>/dev/null || echo "(no gsm8k result, rc=${GSM_RC})"
 
             echo "=========================================="
-            echo "Test exit code: $TEST_EXIT"
+            echo "SMOKE conc=${CONCURRENCY} n=${NUM_PROMPTS} in=${INPUT_LEN} out=${OUTPUT_LEN} CAP=${CAP}"
             echo "=========================================="
+            set +e
+            timeout 1800 python -m sgl_jax.bench_serving \
+              --backend sgl-jax \
+              --base-url http://localhost:30000 \
+              --model "$MODEL_PATH" \
+              --dataset-name random \
+              --random-input-len ${INPUT_LEN} \
+              --random-output-len ${OUTPUT_LEN} \
+              --random-range-ratio 1.0 \
+              --num-prompts ${NUM_PROMPTS} \
+              --max-concurrency ${CONCURRENCY} \
+              --warmup-requests 4 \
+              --output-file /tmp/bench_smoke.jsonl
+            SMOKE_RC=$?
+            set -e
+            echo "--- smoke result (BRANCH=${BRANCH}) ---"
+            cat /tmp/bench_smoke.jsonl 2>/dev/null || echo "(no smoke result, rc=${SMOKE_RC})"
 
-            # Cleanup
-            kill $ROUTER_PID 2>/dev/null || true
-            sleep 10
-            exit $TEST_EXIT
+            echo "=========================================="
+            echo "OOM/abort markers (decode): "
+            grep -cE "RESOURCE_EXHAUSTED|failed to extract KV|aborting|Traceback" /tmp/decode_server.log || echo "(decode: none)"
+            echo "OOM/abort markers (prefill): "
+            grep -cE "RESOURCE_EXHAUSTED|failed to extract KV|aborting|Traceback" /tmp/prefill_server.log || echo "(prefill: none)"
+
+            echo "=========================================="
+            echo "Driver done. Sleeping (bounded) so logs can be pulled."
+            echo "=========================================="
+            sleep 3600
           fi
         resources:
           requests:
