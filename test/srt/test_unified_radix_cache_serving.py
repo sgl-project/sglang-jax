@@ -13,10 +13,11 @@ to UnifiedRadixCache via the registry. The ``/get_server_info`` assertion in
 behavior is checked.
 
 ``TestUnifiedRadixCacheServingRecurrent`` covers the recurrent (GDN-hybrid)
-path at ``--page-size 1``: a Qwen3.5-27B model routes to UnifiedRadixCache with
-a recurrent component, and the cache-hit run must stay byte-identical to a
-``--disable-radix-cache`` baseline (PR#1's KL==0 guarantee at page_size=1). It
-needs 4 chips and runs in the ``e2e-test-tpu-v6e-4`` suite, not v6e-1.
+path at ``--page-size 1``: a Qwen3.5-35B-A3B (qwen3_5_moe) model routes to
+UnifiedRadixCache with a recurrent component, and the cache-hit run must stay
+byte-identical to a ``--disable-radix-cache`` baseline (PR#1's KL==0 guarantee
+at page_size=1). It needs 4 chips and runs in the ``e2e-test-tpu-v6e-4`` suite,
+not v6e-1.
 """
 
 import os
@@ -37,9 +38,9 @@ from sgl_jax.test.test_utils import (
 _PAGE_SIZE = 64
 
 # Recurrent (GDN-hybrid) checkpoint for the page=1 serving test. Overridable so
-# CI and the dev VM can each resolve a local path; the controller pins the
-# 27B GDN-hybrid checkpoint, the smallest recurrent model that fits 4 chips.
-RECURRENT_MODEL_PATH = os.environ.get("SGLANG_RECURRENT_TEST_MODEL", "/models/Qwen3.5-27B")
+# CI and the dev VM can each resolve a local path. Pinned to the qwen3_5_moe
+# (GDN-hybrid) checkpoint this branch registers; it fits 4 chips at tp=4.
+RECURRENT_MODEL_PATH = os.environ.get("SGLANG_RECURRENT_TEST_MODEL", "/models/Qwen3.5-35B-A3B")
 _RECURRENT_PAGE_SIZE = 1
 _RECURRENT_TP_SIZE = 4
 
@@ -178,7 +179,7 @@ class TestUnifiedRadixCacheServing(CustomTestCase):
 class TestUnifiedRadixCacheServingRecurrent(CustomTestCase):
     """Recurrent (GDN-hybrid) page=1 serving determinism.
 
-    A Qwen3.5-27B model under ``--enable-unified-radix-tree --page-size 1``
+    A Qwen3.5-35B-A3B (qwen3_5_moe) model under ``--enable-unified-radix-tree --page-size 1``
     routes to UnifiedRadixCache with a recurrent component. The cache-hit run
     must be byte-identical to a ``--disable-radix-cache`` baseline, proving
     PR#1's KL==0 guarantee holds for recurrent state at page_size=1.
