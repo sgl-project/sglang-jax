@@ -205,6 +205,11 @@ class TestUnifiedRadixCacheServingRecurrent(CustomTestCase):
         "0.0.0.0:10011",
         "--mem-fraction-static",
         "0.8",
+        # Bound the context so the heavy recurrent model leaves room for
+        # running requests on 4 chips (its full context would force
+        # max_running_requests to 0). The test prompt is far under this.
+        "--context-length",
+        "8192",
         "--chunked-prefill-size",
         "512",
         "--page-size",
