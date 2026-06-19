@@ -642,13 +642,6 @@ class TestKDAAttention(unittest.TestCase):
                 np.asarray(gather_conv(pool, pool.conv_buffers[layer_idx][0], src_idx)),
             )
 
-    @unittest.skip(
-        "KDA 4-device track-scatter equivalence is blocked by a test-harness mesh-context "
-        "issue: RecurrentStatePool's no-input out_shardings jit runs under a single-device "
-        "context here (works in production under the startup mesh). The track-scatter "
-        "mechanism is validated on TPU via the GDN single-device equivalence test and on "
-        "CPU via test_recurrent_track_scatter.py. TODO: fix the 4-device test mesh context."
-    )
     def test_track_scatter_equivalence(self):
         """S5a PR#2 track writeback: a prefill that lands on a track boundary
         scatters the SAME final state into the request's track slot AND its
@@ -658,34 +651,37 @@ class TestKDAAttention(unittest.TestCase):
         Uses a pool sized larger than the batch so distinct free track slots
         exist (``create_test_data`` ties pool size to batch size, leaving no
         spare slot)."""
-        seq_lens = [64, 32]
-        batch_size = len(seq_lens)
-        (
-            forward_batch,
-            _pool,
-            layer,
-            q,
-            k,
-            v,
-            a,
-            b,
-            _initial_ssm_ref,
-            _initial_conv_ref,
-            recurrent_indices,
-        ) = create_test_data(
-            "prefill",
-            seq_lens,
-            self.NUM_HEADS,
-            self.HEAD_DIM,
-            self.CONV_KERNEL_SIZE,
-            self.DTYPE,
-            self.rng,
-        )
-        # Fresh, larger pool so track slots are distinct free slots. Fresh
-        # prefill (has_initial_state=False) needs no initial-state write.
-        # Pool buffers + forward run under the 4-device context so the pool's
-        # internal ``with self.mesh:`` jit out_shardings match the jit context.
-        with jax.sharding.set_mesh(mesh):
+        # Pin the 4-device mesh for the whole test via jax.set_mesh (the
+        # codebase-standard context, see moe.py / weight_utils). This keeps the
+        # test correct even when another test module's import-time set_mesh has
+        # left a different global mesh active (e.g. test_gdn_attention sets a
+        # single-device mesh); CI already isolates files in separate subprocesses.
+        with jax.set_mesh(mesh):
+            seq_lens = [64, 32]
+            batch_size = len(seq_lens)
+            (
+                forward_batch,
+                _pool,
+                layer,
+                q,
+                k,
+                v,
+                a,
+                b,
+                _initial_ssm_ref,
+                _initial_conv_ref,
+                recurrent_indices,
+            ) = create_test_data(
+                "prefill",
+                seq_lens,
+                self.NUM_HEADS,
+                self.HEAD_DIM,
+                self.CONV_KERNEL_SIZE,
+                self.DTYPE,
+                self.rng,
+            )
+            # Fresh, larger pool so track slots are distinct free slots. Fresh
+            # prefill (has_initial_state=False) needs no initial-state write.
             pool = RecurrentStatePool(
                 linear_recurrent_layer_ids=[layer.layer_id],
                 size=8,
@@ -718,10 +714,10 @@ class TestKDAAttention(unittest.TestCase):
                 jax.device_put(b, head_sharding),
                 pool,
             )
-        run_ssm = np.asarray(gather_ssm(pool, recurrent_buffer, running))
-        trk_ssm = np.asarray(gather_ssm(pool, recurrent_buffer, track))
-        run_conv = np.asarray(gather_conv(pool, conv_buffer_list[0], running))
-        trk_conv = np.asarray(gather_conv(pool, conv_buffer_list[0], track))
+            run_ssm = np.asarray(gather_ssm(pool, recurrent_buffer, running))
+            trk_ssm = np.asarray(gather_ssm(pool, recurrent_buffer, track))
+            run_conv = np.asarray(gather_conv(pool, conv_buffer_list[0], running))
+            trk_conv = np.asarray(gather_conv(pool, conv_buffer_list[0], track))
         np.testing.assert_array_equal(trk_ssm, run_ssm)
         np.testing.assert_array_equal(trk_conv, run_conv)
 
