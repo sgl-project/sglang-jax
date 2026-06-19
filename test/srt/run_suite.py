@@ -385,7 +385,13 @@ suites = {
         TestFile("test/srt/lora/test_bgmv_backend.py", 6),
         TestFile("test/srt/lora/test_dynamic_lora.py", 10),
         TestFile("test/srt/lora/test_static_lora.py", 10),
-        TestFile("test/srt/test_unified_radix_cache_serving.py", 8),
+        # Dense (non-hybrid) classes only; the recurrent class needs 4 chips and
+        # runs in e2e-test-tpu-v6e-4.
+        TestFile(
+            "test/srt/test_unified_radix_cache_serving.py",
+            8,
+            ["TestUnifiedRadixCacheServing"],
+        ),
     ],
     "e2e-test-tpu-v6e-4": [
         TestFile("test/srt/openai_server/basic/test_tool_calls.py", 2),
@@ -418,6 +424,15 @@ suites = {
         TestFile("test/srt/rl/test_multi_engines_in_one_process.py", 1),
         TestFile("test/srt/multimodal/test_wan2_1_models.py", 4),
         TestFile("test/srt/multimodal/test_flux1_dev_models.py", 2),
+        # Recurrent (GDN-hybrid) page=1 UnifiedRadixCache determinism. The dense
+        # cases of this file run in e2e-test-tpu-v6e-1; the recurrent class needs
+        # 4 chips (smallest recurrent checkpoint is 27B), so only its method runs
+        # here.
+        TestFile(
+            "test/srt/test_unified_radix_cache_serving.py",
+            10,
+            ["TestUnifiedRadixCacheServingRecurrent.test_recurrent_hit_flush_determinism"],
+        ),
     ],
 }
 

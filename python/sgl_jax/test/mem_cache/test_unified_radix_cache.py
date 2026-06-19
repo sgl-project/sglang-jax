@@ -21,6 +21,7 @@ from sgl_jax.srt.mem_cache.base_prefix_cache import (
     InsertParams,
     MatchPrefixParams,
 )
+from sgl_jax.srt.mem_cache.common import release_kv_cache
 from sgl_jax.srt.mem_cache.memory_pool import (
     HybridReqToTokenPool,
     MHATokenToKVPool,
@@ -763,6 +764,40 @@ class _CowReq:
         self.recurrent_cow_src_index = None
 
 
+class _ReleaseReq:
+    """Req surrogate carrying a request-owned recurrent slot, enough to drive
+    the production release entry point ``release_kv_cache`` (the scheduler's
+    abort and retract paths both funnel through it)."""
+
+    def __init__(self, req_pool_idx, recurrent_pool_idx, origin_input_ids, dp_rank=0):
+        self.req_pool_idx = req_pool_idx
+        self.recurrent_pool_idx = recurrent_pool_idx
+        self.origin_input_ids = list(origin_input_ids)
+        self.output_ids = []
+        self.fill_ids = list(origin_input_ids)
+        self.dp_rank = dp_rank
+        self.extra_key = None
+        self.last_node = None
+        self.rid = "release-req"
+        self.kv_committed_len = len(origin_input_ids)
+        self.kv_allocated_len = self.kv_committed_len
+        # No matched prefix: the whole committed range is request-owned.
+        self.cache_protected_len = 0
+        self.last_matched_prefix_len = 0
+        self.kv_committed_freed = False
+        self.kv_overallocated_freed = False
+
+    def pop_committed_kv_cache(self) -> int:
+        assert not self.kv_committed_freed
+        self.kv_committed_freed = True
+        return self.kv_committed_len
+
+    def pop_overallocated_kv_cache(self):
+        assert not self.kv_overallocated_freed
+        self.kv_overallocated_freed = True
+        return self.kv_committed_len, self.kv_allocated_len
+
+
 class TestUnifiedRadixCacheRecurrent(CustomTestCase):
     """Cache-level recurrent component: commit / match-CoW / evict / lock /
     slot ledger, all at page_size=1 (PR#1 scope)."""
@@ -833,6 +868,21 @@ class TestUnifiedRadixCacheRecurrent(CustomTestCase):
         result = cache.insert(params)
         return slot, result
 
+    def _admit(self, cache, allocator, pool, key, dp_rank=0):
+        """Admit a running recurrent request: grab a req slot + a request-owned
+        recurrent running slot + KV indices, and wire them into the pools the way
+        prefill does, so the production release path can free them."""
+        req = _ReleaseReq(
+            req_pool_idx=None, recurrent_pool_idx=None, origin_input_ids=key, dp_rank=dp_rank
+        )
+        pool.alloc([req])  # assigns req_pool_idx + a recurrent running slot
+        kv_indices = allocator.alloc(len(key), dp_rank=dp_rank)
+        self.assertIsNotNone(kv_indices)
+        pool.write((req.req_pool_idx, slice(0, len(key))), kv_indices)
+        # No prefix was matched/locked: the lock release walks from root (no-op).
+        req.last_node = cache.root_node
+        return req
+
     def test_supports_recurrent(self):
         _, _, _, cache = self._create_recurrent_setup()
         self.assertTrue(cache.supports_recurrent())
@@ -864,6 +914,56 @@ class TestUnifiedRadixCacheRecurrent(CustomTestCase):
         evict_result = cache.evict(EvictParams(recurrent_num=1, dp_rank=0))
         self.assertEqual(evict_result.recurrent_num_evicted, 1)
         self.assertEqual(cache.component_evictable_size_[ComponentType.RECURRENT][0], 0)
+        self.assertEqual(pool.recurrent_available_size(0), slots)
+        self.assertEqual(cache.assert_recurrent_slot_ledger(0), 0)
+
+    def test_abort_and_retract_release_recurrent_slots(self):
+        """Aborting a request mid-decode and retracting another must return their
+        request-owned recurrent slots to the free list, leaving no leak: the
+        ledger ``active + tree_owned + free == slots_per_rank`` recovers to full
+        (active == 0). Both production release paths funnel through
+        ``release_kv_cache``: abort uses ``is_insert=True`` (a duplicate of an
+        existing leaf is not re-committed, so the slot is freed), retract uses
+        ``is_insert=False`` (no insert at all).
+        """
+        state_pool, pool, allocator, cache = self._create_recurrent_setup()
+        slots = pool.slots_per_rank
+
+        # A committed tree leaf so the aborted request's sequence is a duplicate
+        # (recurrent_exist -> not re-committed -> request slot is freed).
+        committed_key = [1, 2, 3, 4]
+        committed_val = np.arange(100, 104, dtype=np.int32)
+        _, commit_res = self._commit(cache, pool, committed_key, committed_val)
+        self.assertTrue(commit_res.recurrent_committed)
+        self.assertEqual(pool.recurrent_available_size(0), slots - 1)  # tree owns 1
+
+        # Admit two running requests; each takes a request-owned recurrent slot.
+        abort_req = self._admit(cache, allocator, pool, committed_key)  # duplicate seq
+        retract_req = self._admit(cache, allocator, pool, [9, 10, 11])  # distinct seq
+        self.assertIsNotNone(abort_req.recurrent_pool_idx)
+        self.assertIsNotNone(retract_req.recurrent_pool_idx)
+        # tree_owned=1, active=2 -> free = slots - 3.
+        self.assertEqual(pool.recurrent_available_size(0), slots - 3)
+        self.assertEqual(cache.assert_recurrent_slot_ledger(0), 2)
+
+        # Abort: finished release with insert; the duplicate leaf is not
+        # re-committed, so the running slot is freed (not donated).
+        release_kv_cache(abort_req, cache, is_insert=True)
+        self.assertIsNone(abort_req.recurrent_pool_idx)
+        self.assertEqual(cache.assert_recurrent_slot_ledger(0), 1)
+
+        # Retract: release without insert; the running slot is freed directly.
+        release_kv_cache(retract_req, cache, is_insert=False)
+        self.assertIsNone(retract_req.recurrent_pool_idx)
+
+        # No request-owned slots remain; only the tree leaf is still held.
+        self.assertEqual(cache.assert_recurrent_slot_ledger(0), 0)
+        self.assertEqual(cache.component_evictable_size_[ComponentType.RECURRENT][0], 1)
+        self.assertEqual(pool.recurrent_available_size(0), slots - 1)
+
+        # Evicting the tree leaf returns the ledger to fully free.
+        evict_result = cache.evict(EvictParams(recurrent_num=1, dp_rank=0))
+        self.assertEqual(evict_result.recurrent_num_evicted, 1)
         self.assertEqual(pool.recurrent_available_size(0), slots)
         self.assertEqual(cache.assert_recurrent_slot_ledger(0), 0)
 
