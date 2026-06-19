@@ -161,6 +161,7 @@ def _build_hybrid_pools(
     mesh,
     dp_size: int = 1,
     state_size: int | None = None,
+    enable_mamba_extra_buffer: bool = False,
 ) -> tuple:
     """Build RecurrentStatePool + HybridReqToTokenPool + MemoryPools.
 
@@ -198,6 +199,7 @@ def _build_hybrid_pools(
         dtype=np.int32,
         recurrent_state_pool=rsp,
         dp_size=dp_size,
+        enable_mamba_extra_buffer=enable_mamba_extra_buffer,
     )
     mp = MemoryPools(
         token_to_kv_pool=token_to_kv_pool,
@@ -584,6 +586,7 @@ class ModelRunnerKVCacheMixin:
                 mesh=self.mesh,
                 dp_size=dp_size,
                 state_size=state_size,
+                enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer,
             )
         else:
             self.memory_pools = _build_non_hybrid_memory_pools(self.token_to_kv_pool)

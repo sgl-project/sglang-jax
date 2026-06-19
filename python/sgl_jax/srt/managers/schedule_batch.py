@@ -230,6 +230,15 @@ class Req:
         # Set during match (finalize_match_result), consumed at prepare_for_extend,
         # reset at the top of every init_next_round_input and on retract.
         self.recurrent_cow_src_index: int | None = None
+        # Extra-buffer ping-pong track slots (PR#2; dormant unless
+        # enable_mamba_extra_buffer). The two request-owned slots hold
+        # materialized page-boundary snapshots; allocated by HybridReqToTokenPool.
+        self.recurrent_ping_pong_track_buffer: list[int] | None = None
+        # Which buffer slot (0/1) the NEXT track scatter overwrites.
+        self.recurrent_next_track_idx: int | None = None
+        # Watermark seqlen of the last materialized track slot; set ONLY by a real
+        # track scatter (later task), never from a prefix match.
+        self.recurrent_last_track_seqlen: int | None = None
 
         # Check finish
         self.tokenizer = None
@@ -633,6 +642,9 @@ class Req:
         self.cache_protected_len = 0
         self.recurrent_pool_idx = None
         self.recurrent_cow_src_index = None
+        self.recurrent_ping_pong_track_buffer = None
+        self.recurrent_next_track_idx = None
+        self.recurrent_last_track_seqlen = None
 
     def set_finish_with_abort(self, error_msg: str):
         # set it to one token to skip the long prefill

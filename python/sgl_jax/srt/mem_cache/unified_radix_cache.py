@@ -222,10 +222,15 @@ class UnifiedRadixCache(BasePrefixCache):
     def supports_recurrent(self) -> bool:
         return ComponentType.RECURRENT in self.components
 
-    def assert_recurrent_slot_ledger(self, dp_rank: int = 0) -> int:
+    def assert_recurrent_slot_ledger(self, dp_rank: int = 0, live_reqs: list | None = None) -> int:
         """Per-rank invariant ``active + tree_owned + free == slots_per_rank``;
         returns the derived ``active`` (request-owned) count. Tree-owned =
-        recurrent evictable + protected; free = recurrent free-list length."""
+        recurrent evictable + protected; free = recurrent free-list length.
+
+        When ``live_reqs`` is given, the structurally-derived ``active`` is
+        cross-checked against the slots those requests actually hold (running +
+        ping-pong track), so a leaked track slot is caught rather than silently
+        absorbed into the tautological subtraction."""
         ct = ComponentType.RECURRENT
         rtp = self.req_to_token_pool
         free = len(rtp.recurrent_free_slots[dp_rank])
@@ -239,6 +244,13 @@ class UnifiedRadixCache(BasePrefixCache):
             f"recurrent slot ledger broken (dp={dp_rank}): free={free} "
             f"tree_owned={tree_owned} > slots_per_rank={slots}"
         )
+        if live_reqs is not None:
+            owned = rtp.count_request_owned_recurrent_slots(live_reqs, dp_rank)
+            assert owned == active, (
+                f"recurrent slot leak (dp={dp_rank}): request-owned={owned} != "
+                f"active={active} (free={free} tree_owned={tree_owned} "
+                f"slots_per_rank={slots})"
+            )
         return active
 
     def inc_lock_ref(self, node: UnifiedTreeNode) -> IncLockRefResult:

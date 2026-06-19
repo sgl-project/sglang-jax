@@ -43,6 +43,17 @@ class FakeReq:
         self.kv_committed_len = kv_committed_len
         self.dp_rank = dp_rank
         self.recurrent_pool_idx = recurrent_pool_idx
+        # Extra-buffer ping-pong track fields (PR#2).
+        self.recurrent_ping_pong_track_buffer = None
+        self.recurrent_next_track_idx = None
+        self.recurrent_last_track_seqlen = None
+
+    def reset_for_retract(self):
+        """Mirror Req.reset_for_retract clears for the ping-pong fields."""
+        self.recurrent_pool_idx = None
+        self.recurrent_ping_pong_track_buffer = None
+        self.recurrent_next_track_idx = None
+        self.recurrent_last_track_seqlen = None
 
 
 # ---------------------------------------------------------------------------
@@ -411,6 +422,242 @@ class TestHybridPoolRecurrentSlotAPI(CustomTestCase):
         self.pool.free(reqs[1])
         self.pool.free(reqs[2])
         self.assertEqual(self.pool.recurrent_available_size(0), slots)
+
+
+class TestHybridPoolExtraBufferAPI(CustomTestCase):
+    """Ping-pong track-slot API used by the extra-buffer recurrent path (PR#2).
+
+    Dormant unless ``enable_mamba_extra_buffer=True``: with it off the pool must
+    behave byte-identically to the PR#1 page=1 path (running slot only).
+    """
+
+    def _make_pool(self, enable_mamba_extra_buffer, dp_size=1, size=16):
+        state_pool = FakeRecurrentStatePool(size=size)
+        return HybridReqToTokenPool(
+            size=size,
+            max_context_len=32,
+            dtype=np.int32,
+            recurrent_state_pool=state_pool,
+            dp_size=dp_size,
+            enable_mamba_extra_buffer=enable_mamba_extra_buffer,
+        )
+
+    # --- Case: extra-buffer OFF is a strict no-op (PR#1 path unchanged) ---
+
+    def test_extra_buffer_off_allocs_only_running_slot(self):
+        pool = self._make_pool(enable_mamba_extra_buffer=False)
+        free_before = pool.recurrent_available_size(0)
+        req = FakeReq(dp_rank=0)
+
+        pool.alloc([req])
+
+        # Only the running slot is consumed; no track slots, no fields set.
+        self.assertIsNotNone(req.recurrent_pool_idx)
+        self.assertIsNone(req.recurrent_ping_pong_track_buffer)
+        self.assertIsNone(req.recurrent_next_track_idx)
+        self.assertIsNone(req.recurrent_last_track_seqlen)
+        self.assertEqual(pool.recurrent_available_size(0), free_before - 1)
+        # Track mapping row untouched (all zeros).
+        np.testing.assert_array_equal(
+            pool.req_index_to_recurrent_ping_pong_track_buffer_mapping[req.req_pool_idx],
+            np.zeros(2, dtype=np.int32),
+        )
+
+    # --- Case 1: alloc gives running + 2 track slots (3 total) ---
+
+    def test_alloc_allocates_running_plus_two_track(self):
+        pool = self._make_pool(enable_mamba_extra_buffer=True)
+        free_before = pool.recurrent_available_size(0)
+        req = FakeReq(dp_rank=0)
+
+        pool.alloc([req])
+
+        self.assertIsNotNone(req.recurrent_pool_idx)
+        self.assertIsNotNone(req.recurrent_ping_pong_track_buffer)
+        self.assertEqual(len(req.recurrent_ping_pong_track_buffer), 2)
+        # Free list dropped by 3 (1 running + 2 track).
+        self.assertEqual(pool.recurrent_available_size(0), free_before - 3)
+        # next_track_idx starts at 0; last_track_seqlen stays None (no scatter yet).
+        self.assertEqual(req.recurrent_next_track_idx, 0)
+        self.assertIsNone(req.recurrent_last_track_seqlen)
+        # Three distinct non-null slots, none is slot 0.
+        used = {req.recurrent_pool_idx, *req.recurrent_ping_pong_track_buffer}
+        self.assertEqual(len(used), 3)
+        self.assertNotIn(0, used)
+        # Mapping row reflects the buffer.
+        np.testing.assert_array_equal(
+            pool.req_index_to_recurrent_ping_pong_track_buffer_mapping[req.req_pool_idx],
+            np.array(req.recurrent_ping_pong_track_buffer, dtype=np.int32),
+        )
+
+    def test_alloc_returns_none_when_below_three_free(self):
+        # 4 slots/rank; one req takes 3, leaving 1 < 3 for the next.
+        pool = self._make_pool(enable_mamba_extra_buffer=True, size=4)
+        first = FakeReq(dp_rank=0)
+        self.assertIsNotNone(pool.alloc([first]))
+        self.assertEqual(pool.recurrent_available_size(0), 1)
+
+        overflow = FakeReq(dp_rank=0)
+        self.assertIsNone(pool.alloc([overflow]))
+        self.assertIsNone(overflow.req_pool_idx)
+        self.assertIsNone(overflow.recurrent_pool_idx)
+        self.assertIsNone(overflow.recurrent_ping_pong_track_buffer)
+
+    # --- Case 2: donate keep slot + keep/other index helpers ---
+
+    def test_donate_keep_slot_replaces_and_returns_value(self):
+        pool = self._make_pool(enable_mamba_extra_buffer=True)
+        req = FakeReq(dp_rank=0)
+        pool.alloc([req])
+
+        # next=0 -> overwrite slot 0; keep slot is the other (index 1).
+        self.assertEqual(req.recurrent_next_track_idx, 0)
+        keep_idx = pool.get_recurrent_ping_pong_keep_idx(req)
+        self.assertEqual(keep_idx, 1)
+        self.assertEqual(pool.get_recurrent_ping_pong_other_idx(0), 1)
+        self.assertEqual(pool.get_recurrent_ping_pong_other_idx(1), 0)
+
+        keep_slot = req.recurrent_ping_pong_track_buffer[keep_idx]
+        new_slot = pool.alloc_recurrent_slot(0)
+
+        value = pool.donate_recurrent_ping_pong_slot(req, new_slot)
+
+        # Returned the keep slot's len-1 int32 value.
+        self.assertIsInstance(value, np.ndarray)
+        self.assertEqual(value.dtype, np.int32)
+        self.assertEqual(value.shape, (1,))
+        self.assertEqual(int(value[0]), keep_slot)
+        # Keep slot replaced by new slot in buffer + mapping.
+        self.assertEqual(req.recurrent_ping_pong_track_buffer[keep_idx], new_slot)
+        self.assertEqual(
+            pool.req_index_to_recurrent_ping_pong_track_buffer_mapping[req.req_pool_idx, keep_idx],
+            new_slot,
+        )
+
+    def test_set_recurrent_ping_pong_slot_updates_buffer_and_mapping(self):
+        pool = self._make_pool(enable_mamba_extra_buffer=True)
+        req = FakeReq(dp_rank=0)
+        pool.alloc([req])
+        new_slot = pool.alloc_recurrent_slot(0)
+
+        pool.set_recurrent_ping_pong_slot(req, 1, new_slot)
+
+        self.assertEqual(req.recurrent_ping_pong_track_buffer[1], new_slot)
+        self.assertEqual(
+            pool.req_index_to_recurrent_ping_pong_track_buffer_mapping[req.req_pool_idx, 1],
+            new_slot,
+        )
+
+    # --- Case 3: free_recurrent_cache frees running + both track slots ---
+
+    def test_free_recurrent_cache_frees_running_and_track(self):
+        pool = self._make_pool(enable_mamba_extra_buffer=True)
+        free_full = pool.recurrent_available_size(0)
+        req = FakeReq(dp_rank=0)
+        pool.alloc([req])
+        running = req.recurrent_pool_idx
+        track = list(req.recurrent_ping_pong_track_buffer)
+        req_pool_idx = req.req_pool_idx
+
+        pool.free_recurrent_cache(req)
+
+        # All 3 slots back; mapping rows zeroed; fields cleared.
+        self.assertEqual(pool.recurrent_available_size(0), free_full)
+        self.assertIn(running, pool.recurrent_free_slots[0])
+        for slot in track:
+            self.assertIn(slot, pool.recurrent_free_slots[0])
+        self.assertEqual(pool.req_index_to_recurrent_index_mapping[req_pool_idx], 0)
+        np.testing.assert_array_equal(
+            pool.req_index_to_recurrent_ping_pong_track_buffer_mapping[req_pool_idx],
+            np.zeros(2, dtype=np.int32),
+        )
+        self.assertIsNone(req.recurrent_pool_idx)
+        self.assertIsNone(req.recurrent_ping_pong_track_buffer)
+        self.assertIsNone(req.recurrent_next_track_idx)
+        self.assertIsNone(req.recurrent_last_track_seqlen)
+
+    # --- Case 4: retract clears the ping-pong fields after free ---
+
+    def test_retract_clears_ping_pong_fields_for_requeue(self):
+        pool = self._make_pool(enable_mamba_extra_buffer=True)
+        req = FakeReq(dp_rank=0)
+        pool.alloc([req])
+
+        pool.free_recurrent_cache(req)
+        req.reset_for_retract()
+
+        self.assertIsNone(req.recurrent_pool_idx)
+        self.assertIsNone(req.recurrent_ping_pong_track_buffer)
+        self.assertIsNone(req.recurrent_next_track_idx)
+        self.assertIsNone(req.recurrent_last_track_seqlen)
+
+        # A requeued req reallocates fresh track slots.
+        requeued = FakeReq(dp_rank=0)
+        pool.alloc([requeued])
+        self.assertIsNotNone(requeued.recurrent_ping_pong_track_buffer)
+        self.assertEqual(len(requeued.recurrent_ping_pong_track_buffer), 2)
+
+    # --- Case 5: ledger counts request-owned running + track for dp1 and dp2 ---
+
+    def _assert_ledger(self, pool, live_reqs, dp_rank, tree_owned=0):
+        slots = pool.slots_per_rank
+        free = pool.recurrent_available_size(dp_rank)
+        owned = pool.count_request_owned_recurrent_slots(live_reqs, dp_rank)
+        # owned (request) + tree_owned (donated, off-pool) + free == slots.
+        self.assertEqual(owned + tree_owned + free, slots)
+
+    def test_ledger_invariant_dp1(self):
+        pool = self._make_pool(enable_mamba_extra_buffer=True, dp_size=1, size=16)
+        reqs = [FakeReq(dp_rank=0), FakeReq(dp_rank=0)]
+        pool.alloc(reqs)
+        self._assert_ledger(pool, reqs, 0)
+
+        # donate moves the keep slot to the tree and consumes a fresh free slot
+        # for the buffer: request-owned count is unchanged, +1 tree-owned slot.
+        new_slot = pool.alloc_recurrent_slot(0)
+        donated = pool.donate_recurrent_ping_pong_slot(reqs[0], new_slot)
+        self._assert_ledger(pool, reqs, 0, tree_owned=1)
+
+        # Simulate tree eviction returning the donated slot.
+        pool.free_recurrent_slot(int(donated[0]), 0)
+        self._assert_ledger(pool, reqs, 0)
+
+        pool.free_recurrent_cache(reqs[0])
+        live = [reqs[1]]
+        self._assert_ledger(pool, live, 0)
+
+    def test_ledger_invariant_dp2(self):
+        pool = self._make_pool(enable_mamba_extra_buffer=True, dp_size=2, size=16)
+        r0 = FakeReq(dp_rank=0)
+        r1 = FakeReq(dp_rank=1)
+        pool.alloc([r0])
+        pool.alloc([r1])
+
+        self._assert_ledger(pool, [r0], 0)
+        self._assert_ledger(pool, [r1], 1)
+
+        pool.free_recurrent_cache(r0)
+        self._assert_ledger(pool, [], 0)
+        self._assert_ledger(pool, [r1], 1)
+
+    def test_ledger_detects_leaked_track_slot(self):
+        """A track slot left allocated but not returned to the free list must make
+        owned + free != slots_per_rank (the leak is caught)."""
+        pool = self._make_pool(enable_mamba_extra_buffer=True, dp_size=1, size=16)
+        req = FakeReq(dp_rank=0)
+        pool.alloc([req])
+
+        # Simulate a leak: free only the running slot, drop the req handle without
+        # returning its track slots.
+        pool.free_recurrent_slot(req.recurrent_pool_idx, 0)
+        leaked = list(req.recurrent_ping_pong_track_buffer)
+        live_reqs = []  # request gone, but its track slots never freed
+
+        slots = pool.slots_per_rank
+        free = pool.recurrent_available_size(0)
+        owned = pool.count_request_owned_recurrent_slots(live_reqs, 0)
+        self.assertEqual(len(leaked), 2)
+        self.assertNotEqual(owned + free, slots)
 
 
 if __name__ == "__main__":
