@@ -2,7 +2,7 @@
 
 Stage 1 ports the FULL-attention subset of upstream sglang's UnifiedRadixCache.
 All per-component behavior (matching, locking, eviction, split redistribution)
-is delegated to TreeComponent implementations so that later stages (SWA, Mamba,
+is delegated to TreeComponent implementations so that later stages (SWA, recurrent,
 HiCache) plug in without touching the core walk.
 """
 
@@ -103,8 +103,8 @@ class UnifiedRadixCache(BasePrefixCache):
         enable_kv_cache_events: bool = False,
         is_eagle: bool = False,
         tree_components: tuple[ComponentType, ...] = (ComponentType.FULL,),
-        enable_mamba_extra_buffer: bool = False,
-        mamba_track_interval: int | None = None,
+        enable_recurrent_extra_buffer: bool = False,
+        recurrent_track_interval: int | None = None,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -116,8 +116,8 @@ class UnifiedRadixCache(BasePrefixCache):
         self.max_seq_len = max_seq_len
         self.dtype = dtype
         self.enable_kv_cache_events = enable_kv_cache_events
-        self.enable_mamba_extra_buffer = enable_mamba_extra_buffer
-        self.mamba_track_interval = mamba_track_interval
+        self.enable_recurrent_extra_buffer = enable_recurrent_extra_buffer
+        self.recurrent_track_interval = recurrent_track_interval
         self.kv_event_queue: list = []
 
         self.process_id = jax.process_index()
@@ -227,8 +227,8 @@ class UnifiedRadixCache(BasePrefixCache):
     def recurrent_extra_buffer_active(self) -> bool:
         return (
             self.supports_recurrent()
-            and self.enable_mamba_extra_buffer
-            and self.mamba_track_interval is not None
+            and self.enable_recurrent_extra_buffer
+            and self.recurrent_track_interval is not None
         )
 
     def assert_recurrent_slot_ledger(self, dp_rank: int = 0, live_reqs: list | None = None) -> int:

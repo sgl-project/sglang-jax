@@ -32,14 +32,14 @@ class _RecurrentRadixCache:
 
     def __init__(self, extra_buffer: bool, interval: int | None):
         self._extra_buffer = extra_buffer
-        self.mamba_track_interval = interval
-        self.enable_mamba_extra_buffer = extra_buffer
+        self.recurrent_track_interval = interval
+        self.enable_recurrent_extra_buffer = extra_buffer
 
     def supports_recurrent(self) -> bool:
         return True
 
     def recurrent_extra_buffer_active(self) -> bool:
-        return self._extra_buffer and self.mamba_track_interval is not None
+        return self._extra_buffer and self.recurrent_track_interval is not None
 
     def evictable_size(self, dp_rank: int = 0):
         return 0

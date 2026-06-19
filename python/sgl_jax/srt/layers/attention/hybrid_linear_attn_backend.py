@@ -64,7 +64,7 @@ class LinearRecurrentAttnBackendMetadata:
 
 @dataclass
 class LinearRecurrentAttnBackend(AttentionBackend):
-    """Base class for linear recurrent attention backends (KDA, GDN, Mamba2).
+    """Base class for linear recurrent attention backends (e.g. KDA, GDN).
 
     Provides metadata computation and pytree infrastructure.
     Subclasses implement ``__call__`` with model-specific forward logic.

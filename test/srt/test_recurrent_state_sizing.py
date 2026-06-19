@@ -2,7 +2,7 @@
 
 Covers the pure ``_recurrent_slot_factor`` helper (slots per concurrent request)
 and the ``ServerArgs`` static validation / normalization for the new
-``--mamba-track-interval`` knob gated by ``--enable-mamba-extra-buffer``. No
+``--recurrent-track-interval`` knob gated by ``--enable-recurrent-extra-buffer``. No
 server launch: direct ``ServerArgs(...)`` construction and a plain namespace for
 the helper.
 """
@@ -21,12 +21,12 @@ def _factor_args(
     *,
     disable_radix_cache=False,
     enable_unified_radix_tree=False,
-    enable_mamba_extra_buffer=False,
+    enable_recurrent_extra_buffer=False,
 ):
     return SimpleNamespace(
         disable_radix_cache=disable_radix_cache,
         enable_unified_radix_tree=enable_unified_radix_tree,
-        enable_mamba_extra_buffer=enable_mamba_extra_buffer,
+        enable_recurrent_extra_buffer=enable_recurrent_extra_buffer,
     )
 
 
@@ -47,7 +47,7 @@ class TestRecurrentSlotFactor(unittest.TestCase):
             _recurrent_slot_factor(
                 _factor_args(
                     enable_unified_radix_tree=True,
-                    enable_mamba_extra_buffer=True,
+                    enable_recurrent_extra_buffer=True,
                 )
             ),
             3,
@@ -58,7 +58,7 @@ class TestRecurrentSlotFactor(unittest.TestCase):
         # there and rejected by server_args / constraints elsewhere.
         self.assertEqual(
             _recurrent_slot_factor(
-                _factor_args(disable_radix_cache=True, enable_mamba_extra_buffer=True)
+                _factor_args(disable_radix_cache=True, enable_recurrent_extra_buffer=True)
             ),
             1,
         )
@@ -68,7 +68,7 @@ def _server_args(**overrides):
     kwargs = dict(
         model_path="dummy",
         enable_unified_radix_tree=True,
-        enable_mamba_extra_buffer=True,
+        enable_recurrent_extra_buffer=True,
         page_size=128,
     )
     kwargs.update(overrides)
@@ -76,27 +76,27 @@ def _server_args(**overrides):
 
 
 class TestExtraBufferStaticValidation(unittest.TestCase):
-    """``__post_init__`` static checks gated by ``enable_mamba_extra_buffer``."""
+    """``__post_init__`` static checks gated by ``enable_recurrent_extra_buffer``."""
 
     def test_extra_buffer_requires_page_size_gt_1(self):
         with self.assertRaises((ValueError, AssertionError)):
             _server_args(page_size=1)
 
     def test_track_interval_none_resolves_to_page_size(self):
-        sa = _server_args(mamba_track_interval=None, page_size=256)
-        self.assertEqual(sa.mamba_track_interval, 256)
+        sa = _server_args(recurrent_track_interval=None, page_size=256)
+        self.assertEqual(sa.recurrent_track_interval, 256)
 
     def test_track_interval_zero_rejected(self):
         with self.assertRaises((ValueError, AssertionError)):
-            _server_args(mamba_track_interval=0)
+            _server_args(recurrent_track_interval=0)
 
     def test_track_interval_not_divisible_by_page_size_rejected(self):
         with self.assertRaises((ValueError, AssertionError)):
-            _server_args(mamba_track_interval=200, page_size=128)
+            _server_args(recurrent_track_interval=200, page_size=128)
 
     def test_track_interval_multiple_of_page_size_ok(self):
-        sa = _server_args(mamba_track_interval=256, page_size=128)
-        self.assertEqual(sa.mamba_track_interval, 256)
+        sa = _server_args(recurrent_track_interval=256, page_size=128)
+        self.assertEqual(sa.recurrent_track_interval, 256)
 
     def test_extra_buffer_with_speculative_rejected(self):
         with self.assertRaises((ValueError, AssertionError)):
@@ -111,9 +111,9 @@ class TestExtraBufferStaticValidation(unittest.TestCase):
         sa = ServerArgs(
             model_path="dummy",
             page_size=1,
-            enable_mamba_extra_buffer=False,
+            enable_recurrent_extra_buffer=False,
         )
-        self.assertIsNone(sa.mamba_track_interval)
+        self.assertIsNone(sa.recurrent_track_interval)
 
 
 class TestRecurrentStateConstraints(unittest.TestCase):
@@ -137,7 +137,7 @@ class TestRecurrentStateConstraints(unittest.TestCase):
         sa = ServerArgs(
             model_path="dummy",
             enable_unified_radix_tree=True,
-            enable_mamba_extra_buffer=False,
+            enable_recurrent_extra_buffer=False,
             page_size=128,
         )
         with self.assertRaises(AssertionError):

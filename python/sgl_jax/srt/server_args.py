@@ -93,7 +93,7 @@ class ServerArgs:
     swa_full_tokens_ratio: float = 0.8
     recurrent_state_memory_ratio: float = 0.9
     max_recurrent_state_size: int | None = None
-    mamba_track_interval: int | None = None
+    recurrent_track_interval: int | None = None
     disable_hybrid_swa_memory: bool = False
 
     # Runtime options
@@ -152,7 +152,7 @@ class ServerArgs:
     # Optimization/debug options
     disable_radix_cache: bool = False
     enable_unified_radix_tree: bool = False
-    enable_mamba_extra_buffer: bool = False
+    enable_recurrent_extra_buffer: bool = False
     allow_auto_truncate: bool = False
     enable_tokenizer_batch_encode: bool = False
     disable_overlap_schedule: bool = False
@@ -330,34 +330,34 @@ class ServerArgs:
         # normalization. Gated on the flag so non-recurrent / PR#1 launches
         # are untouched. Model-dependent checks (radix routing) live in
         # _enforce_recurrent_state_server_constraints.
-        if self.enable_mamba_extra_buffer:
+        if self.enable_recurrent_extra_buffer:
             if self.page_size <= 1:
                 raise ValueError(
-                    "--enable-mamba-extra-buffer requires --page-size > 1 "
+                    "--enable-recurrent-extra-buffer requires --page-size > 1 "
                     f"(recurrent radix caching uses page-boundary track slots); "
                     f"got page_size={self.page_size}."
                 )
-            if self.mamba_track_interval is None:
-                self.mamba_track_interval = self.page_size
-            if self.mamba_track_interval <= 0:
+            if self.recurrent_track_interval is None:
+                self.recurrent_track_interval = self.page_size
+            if self.recurrent_track_interval <= 0:
                 raise ValueError(
-                    "--mamba-track-interval must be > 0 when "
-                    f"--enable-mamba-extra-buffer is set; got {self.mamba_track_interval}."
+                    "--recurrent-track-interval must be > 0 when "
+                    f"--enable-recurrent-extra-buffer is set; got {self.recurrent_track_interval}."
                 )
-            if self.mamba_track_interval % self.page_size != 0:
+            if self.recurrent_track_interval % self.page_size != 0:
                 raise ValueError(
-                    f"--mamba-track-interval ({self.mamba_track_interval}) must be a "
+                    f"--recurrent-track-interval ({self.recurrent_track_interval}) must be a "
                     f"multiple of --page-size ({self.page_size})."
                 )
             if self.speculative_algorithm is not None:
                 raise ValueError(
-                    "--enable-mamba-extra-buffer does not support speculative "
+                    "--enable-recurrent-extra-buffer does not support speculative "
                     f"decoding yet; got --speculative-algorithm={self.speculative_algorithm}. "
                     "Disable one of them."
                 )
             if self.enable_mixed_chunk:
                 raise ValueError(
-                    "--enable-mamba-extra-buffer does not support mixed chunked "
+                    "--enable-recurrent-extra-buffer does not support mixed chunked "
                     "prefill yet (the track snapshot is scoped to pure extend / "
                     "pure decode forwards). Disable --enable-mixed-chunk."
                 )
@@ -755,11 +755,11 @@ class ServerArgs:
             "Must be divisible by dp_size when set explicitly.",
         )
         parser.add_argument(
-            "--mamba-track-interval",
+            "--recurrent-track-interval",
             type=int,
-            default=ServerArgs.mamba_track_interval,
+            default=ServerArgs.recurrent_track_interval,
             help="Recurrent radix cache (PR#2): page-boundary interval at which a "
-            "recurrent track state is committed. Requires --enable-mamba-extra-buffer "
+            "recurrent track state is committed. Requires --enable-recurrent-extra-buffer "
             "and must be a positive multiple of --page-size. Defaults to --page-size "
             "when extra-buffer is enabled.",
         )
@@ -1053,7 +1053,7 @@ class ServerArgs:
             "unaffected.",
         )
         parser.add_argument(
-            "--enable-mamba-extra-buffer",
+            "--enable-recurrent-extra-buffer",
             action="store_true",
             help="Recurrent radix cache: use the page-aligned ping-pong track "
             "buffer for page_size>=128 (PR#2). Off by default; PR#1 supports "

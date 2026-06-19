@@ -53,7 +53,7 @@ class RecurrentComponent(TreeComponent):
             f"RecurrentComponent requires HybridReqToTokenPool, "
             f"got {type(cache.req_to_token_pool)}"
         )
-        if not getattr(cache, "enable_mamba_extra_buffer", False):
+        if not getattr(cache, "enable_recurrent_extra_buffer", False):
             assert cache.page_size == 1, (
                 f"RecurrentComponent requires page_size=1 when the extra buffer "
                 f"is off (PR#1), got {cache.page_size}"
@@ -61,7 +61,7 @@ class RecurrentComponent(TreeComponent):
         super().__init__(cache, params)
         self.req_to_token_pool = cache.req_to_token_pool
         self.recurrent_state_pool = cache.req_to_token_pool.recurrent_state_pool
-        self.enable_mamba_extra_buffer = getattr(cache, "enable_mamba_extra_buffer", False)
+        self.enable_recurrent_extra_buffer = getattr(cache, "enable_recurrent_extra_buffer", False)
 
     # ---- matching -----------------------------------------------------------
 
@@ -149,7 +149,7 @@ class RecurrentComponent(TreeComponent):
         token_ids_len: int,
         is_finished: bool,
     ) -> int | None:
-        if not self.enable_mamba_extra_buffer:
+        if not self.enable_recurrent_extra_buffer:
             # PR#1 page_size=1: only finished requests donate. The running slot is
             # already the final, materialized state, so the tree value is the slot
             # itself (no copy). Unfinished/fork donation is deferred (PR#2) to avoid
@@ -205,7 +205,7 @@ class RecurrentComponent(TreeComponent):
         insert_params: InsertParams | None = None,
     ) -> None:
         committed = insert_result.recurrent_committed if insert_result is not None else False
-        if not self.enable_mamba_extra_buffer:
+        if not self.enable_recurrent_extra_buffer:
             # PR#1: sole owner of the finished donate-vs-free decision. Unfinished
             # requests donate nothing and keep their running slot (the live state);
             # ownership-based release frees it later if needed.

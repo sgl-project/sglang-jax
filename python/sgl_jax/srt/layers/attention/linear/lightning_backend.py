@@ -145,7 +145,7 @@ class LightningAttnBackend(LinearRecurrentAttnBackend):
         # track boundary somehow reaches this backend.
         if md.recurrent_track_indices is not None:
             raise NotImplementedError(
-                "recurrent extra-buffer (--enable-mamba-extra-buffer) is not "
+                "recurrent extra-buffer (--enable-recurrent-extra-buffer) is not "
                 "supported with the GLA/Lightning backend in PR#2"
             )
         recurrent_buffer, _ = self.get_layer_cache(recurrent_state_pool, layer.layer_id)

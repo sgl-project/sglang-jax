@@ -427,11 +427,11 @@ class TestHybridPoolRecurrentSlotAPI(CustomTestCase):
 class TestHybridPoolExtraBufferAPI(CustomTestCase):
     """Ping-pong track-slot API used by the extra-buffer recurrent path (PR#2).
 
-    Dormant unless ``enable_mamba_extra_buffer=True``: with it off the pool must
+    Dormant unless ``enable_recurrent_extra_buffer=True``: with it off the pool must
     behave byte-identically to the PR#1 page=1 path (running slot only).
     """
 
-    def _make_pool(self, enable_mamba_extra_buffer, dp_size=1, size=16):
+    def _make_pool(self, enable_recurrent_extra_buffer, dp_size=1, size=16):
         state_pool = FakeRecurrentStatePool(size=size)
         return HybridReqToTokenPool(
             size=size,
@@ -439,13 +439,13 @@ class TestHybridPoolExtraBufferAPI(CustomTestCase):
             dtype=np.int32,
             recurrent_state_pool=state_pool,
             dp_size=dp_size,
-            enable_mamba_extra_buffer=enable_mamba_extra_buffer,
+            enable_recurrent_extra_buffer=enable_recurrent_extra_buffer,
         )
 
     # --- Case: extra-buffer OFF is a strict no-op (PR#1 path unchanged) ---
 
     def test_extra_buffer_off_allocs_only_running_slot(self):
-        pool = self._make_pool(enable_mamba_extra_buffer=False)
+        pool = self._make_pool(enable_recurrent_extra_buffer=False)
         free_before = pool.recurrent_available_size(0)
         req = FakeReq(dp_rank=0)
 
@@ -466,7 +466,7 @@ class TestHybridPoolExtraBufferAPI(CustomTestCase):
     # --- Case 1: alloc gives running + 2 track slots (3 total) ---
 
     def test_alloc_allocates_running_plus_two_track(self):
-        pool = self._make_pool(enable_mamba_extra_buffer=True)
+        pool = self._make_pool(enable_recurrent_extra_buffer=True)
         free_before = pool.recurrent_available_size(0)
         req = FakeReq(dp_rank=0)
 
@@ -492,7 +492,7 @@ class TestHybridPoolExtraBufferAPI(CustomTestCase):
 
     def test_alloc_returns_none_when_below_three_free(self):
         # 4 slots/rank; one req takes 3, leaving 1 < 3 for the next.
-        pool = self._make_pool(enable_mamba_extra_buffer=True, size=4)
+        pool = self._make_pool(enable_recurrent_extra_buffer=True, size=4)
         first = FakeReq(dp_rank=0)
         self.assertIsNotNone(pool.alloc([first]))
         self.assertEqual(pool.recurrent_available_size(0), 1)
@@ -506,7 +506,7 @@ class TestHybridPoolExtraBufferAPI(CustomTestCase):
     # --- Case 2: donate keep slot + keep/other index helpers ---
 
     def test_donate_keep_slot_replaces_and_returns_value(self):
-        pool = self._make_pool(enable_mamba_extra_buffer=True)
+        pool = self._make_pool(enable_recurrent_extra_buffer=True)
         req = FakeReq(dp_rank=0)
         pool.alloc([req])
 
@@ -535,7 +535,7 @@ class TestHybridPoolExtraBufferAPI(CustomTestCase):
         )
 
     def test_set_recurrent_ping_pong_slot_updates_buffer_and_mapping(self):
-        pool = self._make_pool(enable_mamba_extra_buffer=True)
+        pool = self._make_pool(enable_recurrent_extra_buffer=True)
         req = FakeReq(dp_rank=0)
         pool.alloc([req])
         new_slot = pool.alloc_recurrent_slot(0)
@@ -551,7 +551,7 @@ class TestHybridPoolExtraBufferAPI(CustomTestCase):
     # --- Case 3: free_recurrent_cache frees running + both track slots ---
 
     def test_free_recurrent_cache_frees_running_and_track(self):
-        pool = self._make_pool(enable_mamba_extra_buffer=True)
+        pool = self._make_pool(enable_recurrent_extra_buffer=True)
         free_full = pool.recurrent_available_size(0)
         req = FakeReq(dp_rank=0)
         pool.alloc([req])
@@ -579,7 +579,7 @@ class TestHybridPoolExtraBufferAPI(CustomTestCase):
     # --- Case 4: retract clears the ping-pong fields after free ---
 
     def test_retract_clears_ping_pong_fields_for_requeue(self):
-        pool = self._make_pool(enable_mamba_extra_buffer=True)
+        pool = self._make_pool(enable_recurrent_extra_buffer=True)
         req = FakeReq(dp_rank=0)
         pool.alloc([req])
 
@@ -607,7 +607,7 @@ class TestHybridPoolExtraBufferAPI(CustomTestCase):
         self.assertEqual(owned + tree_owned + free, slots)
 
     def test_ledger_invariant_dp1(self):
-        pool = self._make_pool(enable_mamba_extra_buffer=True, dp_size=1, size=16)
+        pool = self._make_pool(enable_recurrent_extra_buffer=True, dp_size=1, size=16)
         reqs = [FakeReq(dp_rank=0), FakeReq(dp_rank=0)]
         pool.alloc(reqs)
         self._assert_ledger(pool, reqs, 0)
@@ -627,7 +627,7 @@ class TestHybridPoolExtraBufferAPI(CustomTestCase):
         self._assert_ledger(pool, live, 0)
 
     def test_ledger_invariant_dp2(self):
-        pool = self._make_pool(enable_mamba_extra_buffer=True, dp_size=2, size=16)
+        pool = self._make_pool(enable_recurrent_extra_buffer=True, dp_size=2, size=16)
         r0 = FakeReq(dp_rank=0)
         r1 = FakeReq(dp_rank=1)
         pool.alloc([r0])
@@ -643,7 +643,7 @@ class TestHybridPoolExtraBufferAPI(CustomTestCase):
     def test_ledger_detects_leaked_track_slot(self):
         """A track slot left allocated but not returned to the free list must make
         owned + free != slots_per_rank (the leak is caught)."""
-        pool = self._make_pool(enable_mamba_extra_buffer=True, dp_size=1, size=16)
+        pool = self._make_pool(enable_recurrent_extra_buffer=True, dp_size=1, size=16)
         req = FakeReq(dp_rank=0)
         pool.alloc([req])
 

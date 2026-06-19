@@ -231,7 +231,7 @@ class Req:
         # reset at the top of every init_next_round_input and on retract.
         self.recurrent_cow_src_index: int | None = None
         # Extra-buffer ping-pong track slots (PR#2; dormant unless
-        # enable_mamba_extra_buffer). The two request-owned slots hold
+        # enable_recurrent_extra_buffer). The two request-owned slots hold
         # materialized page-boundary snapshots; allocated by HybridReqToTokenPool.
         self.recurrent_ping_pong_track_buffer: list[int] | None = None
         # Which buffer slot (0/1) the NEXT track scatter overwrites.
@@ -1000,7 +1000,7 @@ class ScheduleBatch:
             and self.tree_cache.supports_recurrent()
         ):
             dp_rank = reqs[0].dp_rank if reqs and reqs[0].dp_rank is not None else 0
-            per_req = 3 if self.tree_cache.enable_mamba_extra_buffer else 1
+            per_req = 3 if self.tree_cache.enable_recurrent_extra_buffer else 1
             demand = per_req * sum(1 for r in reqs if r.recurrent_pool_idx is None)
             available = self.req_to_token_pool.recurrent_available_size(dp_rank)
             if available < demand:
@@ -1316,7 +1316,7 @@ class ScheduleBatch:
                 # a boundary or is a non-final chunk, so seq_len % interval == 0
                 # iff the snapshot should be taken this round.
                 if self.tree_cache is not None and self.tree_cache.recurrent_extra_buffer_active():
-                    interval = self.tree_cache.mamba_track_interval
+                    interval = self.tree_cache.recurrent_track_interval
                     (
                         info.recurrent_track_indices,
                         info.recurrent_track_mask,
@@ -1742,7 +1742,7 @@ class ScheduleBatch:
                 # interval. (The spec path already `continue`d above, so this is
                 # normal-decode only.)
                 if self.tree_cache is not None and self.tree_cache.recurrent_extra_buffer_active():
-                    interval = self.tree_cache.mamba_track_interval
+                    interval = self.tree_cache.recurrent_track_interval
                     new_seq_lens = [int(s) for s in info.seq_lens]
                     (
                         info.recurrent_track_indices,

@@ -183,12 +183,12 @@ class HybridReqToTokenPool(ReqToTokenPool):
         dtype: np.dtype,
         recurrent_state_pool,
         dp_size: int = 1,
-        enable_mamba_extra_buffer: bool = False,
+        enable_recurrent_extra_buffer: bool = False,
     ):
         super().__init__(size=size, max_context_len=max_context_len, dtype=dtype)
         self.recurrent_state_pool = recurrent_state_pool
         self.dp_size = dp_size
-        self.enable_mamba_extra_buffer = enable_mamba_extra_buffer
+        self.enable_recurrent_extra_buffer = enable_recurrent_extra_buffer
         # recurrent_state_pool.size is global (mirrors MHATokenToKVPool).
         # Divisibility is asserted inside RecurrentStatePool.__init__.
         self.slots_per_rank = recurrent_state_pool.size // dp_size
@@ -208,7 +208,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         dp_rank = reqs[0].dp_rank if reqs and reqs[0].dp_rank is not None else 0
         # Each new req needs 1 running slot, plus 2 ping-pong track slots under
         # extra-buffer (1 running + 2 track = 3 total).
-        per_req = 3 if self.enable_mamba_extra_buffer else 1
+        per_req = 3 if self.enable_recurrent_extra_buffer else 1
         needed = per_req * sum(1 for r in reqs if r.recurrent_pool_idx is None)
         if needed > len(self.recurrent_free_slots[dp_rank]):
             return None
@@ -222,7 +222,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 slot = self.alloc_recurrent_slot(dp_rank)
                 r.recurrent_pool_idx = slot
                 self.req_index_to_recurrent_index_mapping[r.req_pool_idx] = slot
-                if self.enable_mamba_extra_buffer:
+                if self.enable_recurrent_extra_buffer:
                     self._alloc_ping_pong_buffer(r, dp_rank)
 
         return result

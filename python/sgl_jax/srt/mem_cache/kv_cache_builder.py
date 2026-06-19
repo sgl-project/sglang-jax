@@ -36,8 +36,8 @@ def build_kv_cache(
         page_size=page_size,
         is_eagle=spec_algorithm is not None and spec_algorithm.is_eagle(),
         sliding_window_size=sliding_window_size,
-        enable_mamba_extra_buffer=server_args.enable_mamba_extra_buffer,
-        mamba_track_interval=server_args.mamba_track_interval,
+        enable_recurrent_extra_buffer=server_args.enable_recurrent_extra_buffer,
+        recurrent_track_interval=server_args.recurrent_track_interval,
     )
 
     return create_tree_cache(

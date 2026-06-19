@@ -1623,7 +1623,7 @@ class TestUnifiedRadixCacheRecurrentExtraBuffer(CustomTestCase):
             dtype=np.int32,
             recurrent_state_pool=state_pool,
             dp_size=dp_size,
-            enable_mamba_extra_buffer=True,
+            enable_recurrent_extra_buffer=True,
         )
         kv_cache = MHATokenToKVPool(
             size=self.pool_size,
@@ -1647,8 +1647,8 @@ class TestUnifiedRadixCacheRecurrentExtraBuffer(CustomTestCase):
             max_seq_len=self.max_seq_len,
             dtype=self.dtype,
             tree_components=(ComponentType.FULL, ComponentType.RECURRENT),
-            enable_mamba_extra_buffer=True,
-            mamba_track_interval=self.track_interval,
+            enable_recurrent_extra_buffer=True,
+            recurrent_track_interval=self.track_interval,
         )
         return state_pool, hybrid_pool, allocator, cache
 

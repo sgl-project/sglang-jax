@@ -411,7 +411,7 @@ class PrefillAdder:
         recurrent caching is inactive (no cap)."""
         if not self.tree_cache.recurrent_extra_buffer_active():
             return None
-        interval = self.tree_cache.mamba_track_interval
+        interval = self.tree_cache.recurrent_track_interval
         first_boundary = (prefix_len // interval + 1) * interval
         return first_boundary - prefix_len
 

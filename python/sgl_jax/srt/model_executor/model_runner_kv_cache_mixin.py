@@ -112,16 +112,16 @@ def _per_req_state_bytes_from_config(cfg, tp_size: int) -> int:
 
 def _enforce_recurrent_state_server_constraints(server_args) -> None:
     """Assert server constraints for hybrid recurrent state models."""
-    if server_args.enable_mamba_extra_buffer:
+    if server_args.enable_recurrent_extra_buffer:
         # Extra-buffer (PR#2) needs the recurrent radix path; the legacy 1:1
         # disable_radix_cache branch has no track slots. Check before the
         # early return below so the combo fails loudly.
         assert not server_args.disable_radix_cache, (
-            "--enable-mamba-extra-buffer is incompatible with --disable-radix-cache "
+            "--enable-recurrent-extra-buffer is incompatible with --disable-radix-cache "
             "(the legacy 1:1 path has no recurrent track slots)."
         )
         assert server_args.enable_unified_radix_tree, (
-            "--enable-mamba-extra-buffer requires --enable-unified-radix-tree "
+            "--enable-recurrent-extra-buffer requires --enable-unified-radix-tree "
             "(recurrent radix caching)."
         )
     if server_args.disable_radix_cache:
@@ -130,10 +130,10 @@ def _enforce_recurrent_state_server_constraints(server_args) -> None:
         "Hybrid recurrent state models require --disable-radix-cache (legacy) "
         "or --enable-unified-radix-tree (recurrent radix caching)."
     )
-    if not server_args.enable_mamba_extra_buffer:
+    if not server_args.enable_recurrent_extra_buffer:
         assert server_args.page_size == 1, (
             "Recurrent radix caching requires --page-size 1 unless "
-            "--enable-mamba-extra-buffer (PR#2)."
+            "--enable-recurrent-extra-buffer (PR#2)."
         )
 
 
@@ -147,7 +147,7 @@ def _recurrent_slot_factor(server_args) -> int:
     """
     if server_args.disable_radix_cache or not server_args.enable_unified_radix_tree:
         return 1
-    if server_args.enable_mamba_extra_buffer:
+    if server_args.enable_recurrent_extra_buffer:
         return 3
     return 2
 
@@ -161,7 +161,7 @@ def _build_hybrid_pools(
     mesh,
     dp_size: int = 1,
     state_size: int | None = None,
-    enable_mamba_extra_buffer: bool = False,
+    enable_recurrent_extra_buffer: bool = False,
 ) -> tuple:
     """Build RecurrentStatePool + HybridReqToTokenPool + MemoryPools.
 
@@ -199,7 +199,7 @@ def _build_hybrid_pools(
         dtype=np.int32,
         recurrent_state_pool=rsp,
         dp_size=dp_size,
-        enable_mamba_extra_buffer=enable_mamba_extra_buffer,
+        enable_recurrent_extra_buffer=enable_recurrent_extra_buffer,
     )
     mp = MemoryPools(
         token_to_kv_pool=token_to_kv_pool,
@@ -586,7 +586,7 @@ class ModelRunnerKVCacheMixin:
                 mesh=self.mesh,
                 dp_size=dp_size,
                 state_size=state_size,
-                enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer,
+                enable_recurrent_extra_buffer=self.server_args.enable_recurrent_extra_buffer,
             )
         else:
             self.memory_pools = _build_non_hybrid_memory_pools(self.token_to_kv_pool)
