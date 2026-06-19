@@ -1055,6 +1055,29 @@ class _ReleaseReq:
         return self.kv_committed_len, self.kv_allocated_len
 
 
+class _RunningRecurrentReq:
+    """Req surrogate for a running recurrent request mid chunked-prefill: it owns
+    a running recurrent slot (``recurrent_pool_idx`` set) and carries the cache
+    bookkeeping ``cache_unfinished_req`` reads/writes."""
+
+    def __init__(self, req_pool_idx, recurrent_pool_idx, fill_ids, dp_rank=0):
+        self.req_pool_idx = req_pool_idx
+        self.recurrent_pool_idx = recurrent_pool_idx
+        self.origin_input_ids = list(fill_ids)
+        self.output_ids = []
+        self.fill_ids = list(fill_ids)
+        self.dp_rank = dp_rank
+        self.extra_key = None
+        self.last_node = None
+        self.rid = "running-rec"
+        self.prefix_indices = np.empty((0,), dtype=np.int32)
+        self.cache_protected_len = 0
+        self.last_matched_prefix_len = 0
+        self.recurrent_cow_src_index = None
+        self.kv_committed_freed = False
+        self.kv_overallocated_freed = False
+
+
 class TestUnifiedRadixCacheRecurrent(CustomTestCase):
     """Cache-level recurrent component: commit / match-CoW / evict / lock /
     slot ledger, all at page_size=1 (PR#1 scope)."""
@@ -1242,6 +1265,98 @@ class TestUnifiedRadixCacheRecurrent(CustomTestCase):
         )
         self.assertTrue(np.array_equal(match.device_indices, value))
         self.assertEqual(req.recurrent_cow_src_index, slot)
+
+    def test_page1_running_recurrent_chunked_continuation_full_only_preserves_prefix(self):
+        """page=1 regression floor for the PR#1 Step 5.4 full_only rematch
+        (schedule_batch.init_next_round_input). A RUNNING recurrent request owns
+        its recurrent state in its running slot, so during chunked-prefill its
+        OWN unfinished FULL prefix lives in the tree as recurrent-LESS interior
+        nodes. The scheduler's next-round re-match must use full_only=True /
+        cow_recurrent=False, else the leaf-only recurrent validator rejects those
+        nodes and the request's whole FULL prefix collapses to root (re-prefilled
+        from scratch / KV double-counted).
+
+        This drives the REAL UnifiedRadixCache (the param-only TestFullOnlyRematch
+        asserts the flags; here the prefix preservation is genuinely exercised):
+          (a) full_only=True (the fix's params) preserves the entire FULL prefix
+              and does NOT set a recurrent_cow_src_index (no re-clone);
+          (b) the WRONG params full_only=False / cow_recurrent=True truncate that
+              same prefix to 0 -- proving the flag is load-bearing, not cosmetic;
+          (c) a second chunked-continuation cache_unfinished_req grows and keeps
+              cache_protected_len, with the slot ledger balanced throughout.
+        """
+        state_pool, pool, allocator, cache = self._create_recurrent_setup()
+
+        # --- Admit a running recurrent request (req slot + a running slot). ---
+        chunk1 = list(range(1, 9))  # 8-token first chunk
+        req = _RunningRecurrentReq(req_pool_idx=None, recurrent_pool_idx=None, fill_ids=chunk1)
+        pool.alloc([req])  # assigns req_pool_idx + a running recurrent slot
+        self.assertIsNotNone(req.recurrent_pool_idx)
+        running_slot = req.recurrent_pool_idx
+        # active=1 (this running req), tree_owned=0, free=slots-1.
+        self.assertEqual(cache.assert_recurrent_slot_ledger(0, live_reqs=[req]), 1)
+
+        # --- Chunk 1: write KV, cache the unfinished prefix into the tree. ---
+        kv1 = allocator.alloc(len(chunk1), dp_rank=0)
+        self.assertIsNotNone(kv1)
+        pool.write((req.req_pool_idx, slice(0, len(chunk1))), kv1)
+        req.last_node = cache.root_node
+        cache.cache_unfinished_req(req)
+
+        # Unfinished page=1 donates no recurrent value: the running slot stays
+        # request-owned, the cached FULL nodes hold NO recurrent value.
+        self.assertEqual(req.recurrent_pool_idx, running_slot)
+        self.assertEqual(req.cache_protected_len, len(chunk1))
+        self.assertEqual(len(req.prefix_indices), len(chunk1))
+        self.assertEqual(cache.component_evictable_size_[ComponentType.RECURRENT][0], 0)
+        self.assertEqual(cache.assert_recurrent_slot_ledger(0, live_reqs=[req]), 1)
+
+        prefix_key = RadixKey(chunk1, None, 0)
+
+        # --- (a) The fix's params: full_only=True / cow_recurrent=False. ---
+        cow_probe = _CowReq(dp_rank=0)
+        fixed = cache.match_prefix(
+            MatchPrefixParams(key=prefix_key, full_only=True, cow_recurrent=False, req=cow_probe)
+        )
+        # The whole FULL prefix survives -- it is NOT gated on recurrent state.
+        self.assertEqual(len(fixed.device_indices), len(chunk1))
+        self.assertTrue(np.array_equal(fixed.device_indices, np.asarray(req.prefix_indices)))
+        # No re-clone: a running req owns its slot, so no CoW src is recorded.
+        self.assertIsNone(cow_probe.recurrent_cow_src_index)
+
+        # --- (b) The WRONG params a new-prefill would use on this same key. ---
+        # full_only=False + cow_recurrent=True makes the leaf-only recurrent
+        # validator reject the recurrent-less FULL nodes, collapsing the match
+        # to root -- this is the regression the fix prevents.
+        wrong_probe = _CowReq(dp_rank=0)
+        wrong = cache.match_prefix(
+            MatchPrefixParams(key=prefix_key, full_only=False, cow_recurrent=True, req=wrong_probe)
+        )
+        self.assertEqual(len(wrong.device_indices), 0)
+        self.assertIsNone(wrong_probe.recurrent_cow_src_index)
+
+        # --- (c) Second chunked-continuation: prefix preserved + ledger sound. ---
+        chunk2 = list(range(9, 13))  # 4 more tokens
+        req.fill_ids = chunk1 + chunk2
+        kv2 = allocator.alloc(len(chunk2), dp_rank=0)
+        self.assertIsNotNone(kv2)
+        pool.write((req.req_pool_idx, slice(len(chunk1), len(chunk1) + len(chunk2))), kv2)
+        protected_before = req.cache_protected_len
+        cache.cache_unfinished_req(req)
+
+        # The continuation extends the protected prefix (never truncates it) and
+        # still does not clone or donate a recurrent slot.
+        self.assertEqual(req.cache_protected_len, len(chunk1) + len(chunk2))
+        self.assertGreater(req.cache_protected_len, protected_before)
+        self.assertEqual(len(req.prefix_indices), len(chunk1) + len(chunk2))
+        self.assertEqual(req.recurrent_pool_idx, running_slot)
+        self.assertEqual(cache.component_evictable_size_[ComponentType.RECURRENT][0], 0)
+        self.assertEqual(cache.assert_recurrent_slot_ledger(0, live_reqs=[req]), 1)
+
+        # The extended FULL prefix is still fully matchable full_only.
+        full_key = RadixKey(chunk1 + chunk2, None, 0)
+        again = cache.match_prefix(MatchPrefixParams(key=full_key, full_only=True))
+        self.assertEqual(len(again.device_indices), len(chunk1) + len(chunk2))
 
     def test_shorter_match_misses_recurrent_leaf(self):
         """A match stopping one token short of the committed leaf (the universal
