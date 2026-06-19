@@ -451,7 +451,13 @@ class ModelRunnerKVCacheMixin:
             and self.server_args.max_recurrent_state_size is not None
         ):
             factor = _recurrent_slot_factor(self.server_args)
-            max_num_reqs = min(max_num_reqs, self.server_args.max_recurrent_state_size // factor)
+            budget_cap = self.server_args.max_recurrent_state_size // factor
+            # Admission is sharded evenly across dp ranks (_build_hybrid_pools
+            # asserts max_num_reqs % dp_size == 0), but floor-dividing the state
+            # budget by factor can land off the dp grid (e.g. 128 // 3 = 42 with
+            # dp_size=4). Round down so the cap stays dp-aligned.
+            budget_cap -= budget_cap % self.dp_size
+            max_num_reqs = min(max_num_reqs, budget_cap)
 
         return max_num_reqs
 
