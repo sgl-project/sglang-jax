@@ -122,5 +122,44 @@ class TestExtendBsGuard(unittest.TestCase):
         self.assertEqual(per_dp_bs, 32)
 
 
+class TestExtendBsGuardScopedToPageSizeOne(TestExtendBsGuard):
+    """The multi-host safe-EXTEND bucket guard exists only because the page_size=1
+    EXTEND attention executable miscompiles RPA at per_dp_bs>8 under multi-host SPMD.
+    The S5a PR#2 extra-buffer recurrent path runs at page_size>=128, where that guard
+    must NOT activate -- it bucketed cache_loc to the bs bucket, which is wrong for
+    large-page EXTEND. Assert the activation predicate is keyed on page_size==1."""
+
+    def _extend_active_bucket(self, batch, page_size, extend_guard_per_dp_bs=8):
+        _, _, _, active = batch._resolve_extend_paddings(
+            [8, 16, 32], [4, 8, 16, 64], [16, 32, 64, 256], page_size, extend_guard_per_dp_bs
+        )
+        return active
+
+    def test_extra_buffer_large_page_does_not_activate_guard(self):
+        # Recurrent batch (extra-buffer serves at page_size>=128): guard stays off.
+        batch = self._extend_batch(dp_size=2, is_hybrid_recurrent=True)
+        for page_size in (128, 256):
+            self.assertFalse(
+                self._extend_active_bucket(batch, page_size),
+                f"safe-EXTEND guard must stay scoped to page_size=1, not {page_size}",
+            )
+
+    def test_page_size_one_recurrent_still_activates_guard(self):
+        # The legacy page_size=1 recurrent path is unchanged: guard still fires.
+        batch = self._extend_batch(dp_size=2, is_hybrid_recurrent=True)
+        self.assertTrue(self._extend_active_bucket(batch, 1))
+
+    def test_large_page_keeps_legacy_largest_bucket(self):
+        # Guard off -> EXTEND keeps the legacy largest-bucket cache_loc selection,
+        # identical to the non-recurrent path (no accidental page_size=1 behavior).
+        batch = self._extend_batch(dp_size=2, is_hybrid_recurrent=True)
+        _, bs_paddings, cache_loc_paddings, active = batch._resolve_extend_paddings(
+            [8, 16, 32], [4, 8, 16, 64], [16, 32, 64, 256], 128, 8
+        )
+        self.assertFalse(active)
+        self.assertEqual(bs_paddings, [64])
+        self.assertEqual(cache_loc_paddings, [256])
+
+
 if __name__ == "__main__":
     unittest.main()

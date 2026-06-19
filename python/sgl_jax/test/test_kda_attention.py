@@ -676,38 +676,41 @@ class TestKDAAttention(unittest.TestCase):
         )
         # Fresh, larger pool so track slots are distinct free slots. Fresh
         # prefill (has_initial_state=False) needs no initial-state write.
-        pool = RecurrentStatePool(
-            linear_recurrent_layer_ids=[layer.layer_id],
-            size=8,
-            num_heads=self.NUM_HEADS,
-            head_dim=self.HEAD_DIM,
-            conv_kernel_size=self.CONV_KERNEL_SIZE,
-            mesh=mesh,
-            dp_size=1,
-            recurrent_partition_axis="tensor",
-            conv_partition_axis="tensor",
-            data_partition_axis="data",
-            temporal_dtype=jnp.float32,
-            conv_dtype=self.DTYPE,
-        )
-        running = np.asarray(recurrent_indices)  # [1, 2]
-        track = running + batch_size  # [3, 4] (free slots)
-        data_sh = NamedSharding(mesh, P("data"))
-        md = forward_batch.attn_backend.forward_metadata
-        md.recurrent_track_indices = jax.device_put(track.astype(np.int32), data_sh)
-        md.recurrent_track_mask = jax.device_put(np.ones(batch_size, dtype=np.int32), data_sh)
+        # Pool buffers + forward run under the 4-device context so the pool's
+        # internal ``with self.mesh:`` jit out_shardings match the jit context.
+        with jax.sharding.set_mesh(mesh):
+            pool = RecurrentStatePool(
+                linear_recurrent_layer_ids=[layer.layer_id],
+                size=8,
+                num_heads=self.NUM_HEADS,
+                head_dim=self.HEAD_DIM,
+                conv_kernel_size=self.CONV_KERNEL_SIZE,
+                mesh=mesh,
+                dp_size=1,
+                recurrent_partition_axis="tensor",
+                conv_partition_axis="tensor",
+                data_partition_axis="data",
+                temporal_dtype=jnp.float32,
+                conv_dtype=self.DTYPE,
+            )
+            running = np.asarray(recurrent_indices)  # [1, 2]
+            track = running + batch_size  # [3, 4] (free slots)
+            data_sh = NamedSharding(mesh, P("data"))
+            md = forward_batch.attn_backend.forward_metadata
+            md.recurrent_track_indices = jax.device_put(track.astype(np.int32), data_sh)
+            md.recurrent_track_mask = jax.device_put(np.ones(batch_size, dtype=np.int32), data_sh)
 
-        hidden_sharding = NamedSharding(mesh, P("data", "tensor"))
-        head_sharding = NamedSharding(mesh, P("data", "tensor"))
-        _, (recurrent_buffer, conv_buffer_list) = layer(
-            forward_batch,
-            jax.device_put(q, hidden_sharding),
-            jax.device_put(k, hidden_sharding),
-            jax.device_put(v, hidden_sharding),
-            jax.device_put(a, hidden_sharding),
-            jax.device_put(b, head_sharding),
-            pool,
-        )
+            hidden_sharding = NamedSharding(mesh, P("data", "tensor"))
+            head_sharding = NamedSharding(mesh, P("data", "tensor"))
+            _, (recurrent_buffer, conv_buffer_list) = layer(
+                forward_batch,
+                jax.device_put(q, hidden_sharding),
+                jax.device_put(k, hidden_sharding),
+                jax.device_put(v, hidden_sharding),
+                jax.device_put(a, hidden_sharding),
+                jax.device_put(b, head_sharding),
+                pool,
+            )
         run_ssm = np.asarray(gather_ssm(pool, recurrent_buffer, running))
         trk_ssm = np.asarray(gather_ssm(pool, recurrent_buffer, track))
         run_conv = np.asarray(gather_conv(pool, conv_buffer_list[0], running))
