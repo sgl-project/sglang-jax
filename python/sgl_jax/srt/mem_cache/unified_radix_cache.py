@@ -284,15 +284,6 @@ class UnifiedRadixCache(BasePrefixCache):
         kv_indices = self.req_to_token_pool.read(req.req_pool_idx, committed_kv_len)
         kv_indices = kv_indices[kv_indices != 0]
 
-        if self.page_size != 1:
-            page_aligned_len = actual_kv_len // self.page_size * self.page_size
-            page_aligned_kv_indices = kv_indices[:page_aligned_len].copy()
-            self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:], dp_rank=dp_rank)
-        else:
-            page_aligned_len = actual_kv_len
-            page_aligned_kv_indices = kv_indices[:page_aligned_len].copy()
-
-        page_aligned_token_len = page_aligned_len + 1 if self.is_eagle else page_aligned_len
         # cache_protected_len, not len(prefix_indices): the latter may include
         # an unaligned tail owned by the req but not by the tree.
         old_prefix_len = req.cache_protected_len
@@ -301,24 +292,57 @@ class UnifiedRadixCache(BasePrefixCache):
             # unmatched token; -1 so its kv can be freed without leaking.
             old_prefix_len -= 1
 
-        insert_params = None
-        insert_result = None
+        # Let each component fill its insert fields and return an effective
+        # cache length; the inserted key is capped to the min across components.
+        # All components return None today, so this leaves the full length.
+        insert_params = InsertParams() if is_insert else None
+        effective_cache_len = len(token_ids)
         if is_insert:
-            insert_params = InsertParams(
-                key=RadixKey(token_ids[:page_aligned_token_len], req.extra_key, req.dp_rank),
-                value=page_aligned_kv_indices,
-            )
             for component in self._components_tuple:
-                component.prepare_for_caching_req(
+                cl = component.prepare_for_caching_req(
                     req, insert_params, len(token_ids), is_finished=True
                 )
+                if cl is not None:
+                    effective_cache_len = min(effective_cache_len, cl)
+
+        capped_kv_len = min(actual_kv_len, effective_cache_len)
+        if self.page_size != 1:
+            page_aligned_len = capped_kv_len // self.page_size * self.page_size
+        else:
+            page_aligned_len = capped_kv_len
+        page_aligned_kv_indices = kv_indices[:page_aligned_len].copy()
+        page_aligned_token_len = page_aligned_len + 1 if self.is_eagle else page_aligned_len
+
+        # Free the uncached tail: the page-alignment remainder plus any KV
+        # dropped by capping. Clamp the lower bound to old_prefix_len so the
+        # tree-protected prefix is never freed (matters only when capping below
+        # the prefix; otherwise page_aligned_len >= old_prefix_len). The upper
+        # bound preserves the original page=1 behavior of keeping the EAGLE +1
+        # token (kv_indices[actual_kv_len:] stays request-owned).
+        tail_start = max(page_aligned_len, old_prefix_len)
+        if self.page_size != 1:
+            self.token_to_kv_pool_allocator.free(kv_indices[tail_start:], dp_rank=dp_rank)
+        else:
+            self.token_to_kv_pool_allocator.free(
+                kv_indices[tail_start:actual_kv_len], dp_rank=dp_rank
+            )
+
+        insert_result = None
+        if is_insert and effective_cache_len > 0:
+            insert_params.key = RadixKey(
+                token_ids[:page_aligned_token_len], req.extra_key, req.dp_rank
+            )
+            insert_params.value = page_aligned_kv_indices
             # Radix cache takes over one reference from the memory pool.
             insert_result = self.insert(insert_params)
             new_prefix_len = insert_result.prefix_len
             self.token_to_kv_pool_allocator.free(
                 kv_indices[old_prefix_len:new_prefix_len], dp_rank=dp_rank
             )
-        else:
+        elif not is_insert:
+            # Retract path: no insert at all. Free the request-owned range above
+            # the protected prefix (the tail above page_aligned_len is already
+            # freed; this covers [old_prefix_len:page_aligned_len]).
             self.token_to_kv_pool_allocator.free(
                 kv_indices[old_prefix_len:page_aligned_len], dp_rank=dp_rank
             )
@@ -345,26 +369,49 @@ class UnifiedRadixCache(BasePrefixCache):
         actual_kv_len = all_token_len - 1 if self.is_eagle else all_token_len
         kv_indices = self.req_to_token_pool.read(req.req_pool_idx, all_token_len)
 
-        if self.page_size != 1:
-            page_aligned_len = actual_kv_len // self.page_size * self.page_size
-            page_aligned_kv_indices = kv_indices[:page_aligned_len].copy()
-        else:
-            page_aligned_len = actual_kv_len
-            page_aligned_kv_indices = kv_indices
-
-        # For EAGLE, page_aligned_len is for the bigram key; the token len is +1.
-        page_aligned_token_len = page_aligned_len + 1 if self.is_eagle else page_aligned_len
-        page_aligned_token_ids = token_ids[:page_aligned_token_len]
-
         # cache_protected_len, not len(prefix_indices): see cache_finished_req.
         old_prefix_len = req.cache_protected_len
         if self.is_eagle and old_prefix_len > req.last_matched_prefix_len:
             old_prefix_len -= 1
 
-        radix_key = RadixKey(page_aligned_token_ids, req.extra_key, req.dp_rank)
-        insert_params = InsertParams(key=radix_key, value=page_aligned_kv_indices)
+        # Let each component fill its insert fields and return an effective
+        # cache length; the inserted key is capped to the min across components.
+        # All components return None today, so this leaves the full length.
+        insert_params = InsertParams()
+        effective_cache_len = all_token_len
         for component in self._components_tuple:
-            component.prepare_for_caching_req(req, insert_params, all_token_len, is_finished=False)
+            cl = component.prepare_for_caching_req(
+                req, insert_params, all_token_len, is_finished=False
+            )
+            if cl is not None:
+                effective_cache_len = min(effective_cache_len, cl)
+
+        if effective_cache_len <= 0:
+            # No new tree key materialized. The request is still running and
+            # keeps its full KV; mirror the disabled-cache cleanup path and
+            # leave the request's prefix bookkeeping (prefix_indices, last_node,
+            # cache_protected_len, locks) untouched.
+            for component in self._components_tuple:
+                component.cleanup_after_caching_req(
+                    req, is_finished=False, insert_result=None, insert_params=insert_params
+                )
+            return
+
+        capped_kv_len = min(actual_kv_len, effective_cache_len)
+        if self.page_size != 1:
+            page_aligned_len = capped_kv_len // self.page_size * self.page_size
+            page_aligned_kv_indices = kv_indices[:page_aligned_len].copy()
+        else:
+            page_aligned_len = capped_kv_len
+            page_aligned_kv_indices = kv_indices[:page_aligned_len]
+
+        # For EAGLE, page_aligned_len is for the bigram key; the token len is +1.
+        page_aligned_token_len = page_aligned_len + 1 if self.is_eagle else page_aligned_len
+        page_aligned_token_ids = token_ids[:page_aligned_token_len]
+
+        radix_key = RadixKey(page_aligned_token_ids, req.extra_key, req.dp_rank)
+        insert_params.key = radix_key
+        insert_params.value = page_aligned_kv_indices
         # Radix cache takes over one reference from the memory pool.
         insert_result = self.insert(insert_params)
         new_prefix_len = insert_result.prefix_len
@@ -389,11 +436,16 @@ class UnifiedRadixCache(BasePrefixCache):
         self.inc_lock_ref(new_last_node)
 
         # `req.prefix_indices` is used later in `PrefillAdder::add_chunked_req`.
+        # The still-running request retains its KV tail beyond the cached prefix
+        # (kv_indices[len(new_indices):]); this is empty when no component caps,
+        # so the page=1 non-EAGLE case stays byte-identical to plain new_indices.
         if self.page_size != 1:
             req.prefix_indices = np.concatenate([new_indices, kv_indices[len(new_indices) :]])
         elif self.is_eagle:
             # Attach the kv index of the last token for EAGLE chunked prefill.
             req.prefix_indices = np.concatenate([new_indices, kv_indices[actual_kv_len:]])
+        elif len(new_indices) < all_token_len:
+            req.prefix_indices = np.concatenate([new_indices, kv_indices[len(new_indices) :]])
         else:
             req.prefix_indices = new_indices
         req.last_node = new_last_node

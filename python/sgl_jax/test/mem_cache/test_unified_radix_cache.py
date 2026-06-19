@@ -756,6 +756,263 @@ class TestUnifiedRadixCacheWithRequests(CustomTestCase):
             self.fail(f"cache_unfinished_req raised an exception: {e}")
 
 
+class TestUnifiedRadixCacheEffectiveCacheLen(CustomTestCase):
+    """Effective-cache-length consumption in cache_finished_req /
+    cache_unfinished_req. A component returns an int from
+    prepare_for_caching_req to cap the inserted key; the cache must truncate
+    (and free the dropped KV tail) or skip the insert entirely when 0. All
+    components return None today, so capping is a no-op unless a stub injects
+    a value -- the truncation/skip tests drive that path with a monkeypatch."""
+
+    def setUp(self):
+        self.kv_head_num = 8
+        self.head_dim = 64
+        self.layer_num = 2
+        self.max_seq_len = 2048
+        self.dtype = jnp.bfloat16
+        self.pool_size = 8192
+
+    def _create_stack(self):
+        req_pool = ReqToTokenPool(
+            size=1024,
+            max_context_len=self.max_seq_len,
+            dtype=np.int32,
+        )
+        kv_cache = MHATokenToKVPool(
+            size=self.pool_size,
+            page_size=1,
+            dtype=self.dtype,
+            head_num=self.kv_head_num,
+            head_dim=self.head_dim,
+            layer_num=self.layer_num,
+            mesh=mesh,
+        )
+        allocator = TokenToKVPoolAllocator(size=self.pool_size, kvcache=kv_cache)
+        cache = UnifiedRadixCache(
+            req_to_token_pool=req_pool,
+            token_to_kv_pool_allocator=allocator,
+            page_size=1,
+            disable=False,
+            kv_head_num=self.kv_head_num,
+            head_dim=self.head_dim,
+            layer_num=self.layer_num,
+            max_seq_len=self.max_seq_len,
+            dtype=self.dtype,
+        )
+        return req_pool, allocator, cache
+
+    @staticmethod
+    def _cap_to(cache, cl):
+        """Monkeypatch the FULL component's prepare_for_caching_req to return a
+        fixed effective length, standing in for a future recurrent cap."""
+        full = cache.components[ComponentType.FULL]
+        full.prepare_for_caching_req = lambda req, insert_params, token_ids_len, is_finished: cl
+
+    def test_no_op_equivalence_unfinished_inserts_full_length(self):
+        # No component caps (all return None): the inserted key is the full
+        # page-aligned length, identical to today's behavior.
+        pool, allocator, cache = self._create_stack()
+        token_ids = list(range(1, 13))  # 12 tokens
+        kv_indices = allocator.alloc(len(token_ids), dp_rank=0)
+        pool.write((0, slice(0, len(token_ids))), kv_indices)
+        req = MockRequest(
+            req_pool_idx=0,
+            origin_input_ids=list(token_ids),
+            output_ids=[],
+            fill_ids=list(token_ids),
+            prefix_indices=np.empty((0,), dtype=np.int32),
+            last_node=cache.root_node,
+        )
+        req.last_matched_prefix_len = 0
+
+        cache.cache_unfinished_req(req)
+
+        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(token_ids)))
+        self.assertEqual(len(match.device_indices), 12)
+        self.assertEqual(cache.total_size(), 12)
+
+    def test_no_op_equivalence_finished_inserts_full_length(self):
+        pool, allocator, cache = self._create_stack()
+        token_ids = list(range(1, 13))
+        kv_indices = allocator.alloc(len(token_ids), dp_rank=0)
+        pool.write((0, slice(0, len(token_ids))), kv_indices)
+        req = MockRequest(
+            req_pool_idx=0,
+            origin_input_ids=list(token_ids),
+            output_ids=[],
+            fill_ids=list(token_ids),
+            prefix_indices=np.empty((0,), dtype=np.int32),
+            last_node=cache.root_node,
+        )
+        req.last_matched_prefix_len = 0
+        # committed_kv_len == len(token_ids): finished caches the full sequence.
+        req.kv_committed_len = len(token_ids)
+        req.kv_allocated_len = len(token_ids)
+
+        cache.cache_finished_req(req)
+
+        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(token_ids)))
+        self.assertEqual(len(match.device_indices), 12)
+        self.assertEqual(cache.total_size(), 12)
+
+    def test_truncation_caps_inserted_key_unfinished_keeps_tail(self):
+        # A running request whose tree key is capped keeps its full KV (it is
+        # still generating); only the tree key is shortened, the dropped tail is
+        # retained in prefix_indices, not freed.
+        pool, allocator, cache = self._create_stack()
+        token_ids = list(range(1, 13))  # 12 tokens
+        kv_indices = allocator.alloc(len(token_ids), dp_rank=0)
+        pool.write((0, slice(0, len(token_ids))), kv_indices)
+        req = MockRequest(
+            req_pool_idx=0,
+            origin_input_ids=list(token_ids),
+            output_ids=[],
+            fill_ids=list(token_ids),
+            prefix_indices=np.empty((0,), dtype=np.int32),
+            last_node=cache.root_node,
+        )
+        req.last_matched_prefix_len = 0
+
+        avail_before = allocator.available_size(0)
+        self._cap_to(cache, 8)  # cap 12 -> 8
+        cache.cache_unfinished_req(req)
+
+        # Only the first 8 tokens were materialized into the tree.
+        self.assertEqual(cache.total_size(), 8)
+        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(token_ids[:8])))
+        self.assertEqual(len(match.device_indices), 8)
+        # The full key no longer fully matches; only the capped prefix does.
+        full_match = cache.match_prefix(MatchPrefixParams(key=RadixKey(token_ids)))
+        self.assertEqual(len(full_match.device_indices), 8)
+        # The protected prefix tracks the capped length.
+        self.assertEqual(req.cache_protected_len, 8)
+        # The running request keeps its full KV (tail retained in prefix_indices,
+        # nothing freed beyond the duplicate overlap, which is 0 here).
+        self.assertEqual(allocator.available_size(0), avail_before)
+        self.assertEqual(len(req.prefix_indices), 12)
+
+    def test_truncation_caps_inserted_key_and_frees_tail_finished(self):
+        pool, allocator, cache = self._create_stack()
+        token_ids = list(range(1, 13))
+        kv_indices = allocator.alloc(len(token_ids), dp_rank=0)
+        pool.write((0, slice(0, len(token_ids))), kv_indices)
+        req = MockRequest(
+            req_pool_idx=0,
+            origin_input_ids=list(token_ids),
+            output_ids=[],
+            fill_ids=list(token_ids),
+            prefix_indices=np.empty((0,), dtype=np.int32),
+            last_node=cache.root_node,
+        )
+        req.last_matched_prefix_len = 0
+        req.kv_committed_len = len(token_ids)
+        req.kv_allocated_len = len(token_ids)
+
+        avail_before = allocator.available_size(0)
+        self._cap_to(cache, 8)
+        cache.cache_finished_req(req)
+
+        self.assertEqual(cache.total_size(), 8)
+        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(token_ids[:8])))
+        self.assertEqual(len(match.device_indices), 8)
+        # 4 dropped tail slots freed.
+        self.assertEqual(allocator.available_size(0), avail_before + 4)
+
+    def test_skip_insert_on_zero_unfinished(self):
+        # Unfinished skip mirrors the disabled-cache path: no tree key, cleanup
+        # runs, and the still-running request keeps its KV and prefix
+        # bookkeeping untouched (it has not finished generating).
+        pool, allocator, cache = self._create_stack()
+        token_ids = list(range(1, 13))
+        kv_indices = allocator.alloc(len(token_ids), dp_rank=0)
+        pool.write((0, slice(0, len(token_ids))), kv_indices)
+        prior_prefix = np.empty((0,), dtype=np.int32)
+        req = MockRequest(
+            req_pool_idx=0,
+            origin_input_ids=list(token_ids),
+            output_ids=[],
+            fill_ids=list(token_ids),
+            prefix_indices=prior_prefix,
+            last_node=cache.root_node,
+        )
+        req.last_matched_prefix_len = 0
+        req.cache_protected_len = 0
+
+        cleanup_calls = []
+        full = cache.components[ComponentType.FULL]
+        orig_cleanup = full.cleanup_after_caching_req
+        full.cleanup_after_caching_req = lambda *a, **k: cleanup_calls.append(True) or orig_cleanup(
+            *a, **k
+        )
+
+        avail_before = allocator.available_size(0)
+        self._cap_to(cache, 0)
+        cache.cache_unfinished_req(req)
+
+        # No node was materialized; the request still points at root.
+        self.assertEqual(cache.total_size(), 0)
+        self.assertIs(req.last_node, cache.root_node)
+        # cleanup still ran.
+        self.assertTrue(cleanup_calls)
+        # The running request keeps its KV and prefix bookkeeping intact.
+        self.assertEqual(allocator.available_size(0), avail_before)
+        self.assertIs(req.prefix_indices, prior_prefix)
+        self.assertEqual(req.cache_protected_len, 0)
+
+    def test_skip_insert_on_zero_unfinished_preserves_protected_prefix(self):
+        # With a protected prefix, the unfinished skip path still frees nothing
+        # and preserves the protected prefix bookkeeping.
+        pool, allocator, cache = self._create_stack()
+        token_ids = list(range(1, 13))
+        kv_indices = allocator.alloc(len(token_ids), dp_rank=0)
+        pool.write((0, slice(0, len(token_ids))), kv_indices)
+        req = MockRequest(
+            req_pool_idx=0,
+            origin_input_ids=list(token_ids),
+            output_ids=[],
+            fill_ids=list(token_ids),
+            prefix_indices=np.empty((0,), dtype=np.int32),
+            last_node=cache.root_node,
+        )
+        req.last_matched_prefix_len = 4
+        req.cache_protected_len = 4  # first 4 KV slots are tree-protected
+
+        avail_before = allocator.available_size(0)
+        self._cap_to(cache, 0)
+        cache.cache_unfinished_req(req)
+
+        self.assertEqual(cache.total_size(), 0)
+        # Nothing freed; the protected [0:4] prefix and the running tail persist.
+        self.assertEqual(allocator.available_size(0), avail_before)
+        self.assertEqual(req.cache_protected_len, 4)
+
+    def test_skip_insert_on_zero_finished(self):
+        pool, allocator, cache = self._create_stack()
+        token_ids = list(range(1, 13))
+        kv_indices = allocator.alloc(len(token_ids), dp_rank=0)
+        pool.write((0, slice(0, len(token_ids))), kv_indices)
+        req = MockRequest(
+            req_pool_idx=0,
+            origin_input_ids=list(token_ids),
+            output_ids=[],
+            fill_ids=list(token_ids),
+            prefix_indices=np.empty((0,), dtype=np.int32),
+            last_node=cache.root_node,
+        )
+        req.last_matched_prefix_len = 0
+        req.kv_committed_len = len(token_ids)
+        req.kv_allocated_len = len(token_ids)
+        req.cache_protected_len = 0
+
+        avail_before = allocator.available_size(0)
+        self._cap_to(cache, 0)
+        cache.cache_finished_req(req)
+
+        self.assertEqual(cache.total_size(), 0)
+        # Entire committed range freed (old_prefix_len=0 upward).
+        self.assertEqual(allocator.available_size(0), avail_before + 12)
+
+
 class _CowReq:
     """Minimal Req surrogate for recurrent CoW match recording."""
 
