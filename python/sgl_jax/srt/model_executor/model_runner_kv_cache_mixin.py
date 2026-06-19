@@ -112,6 +112,18 @@ def _per_req_state_bytes_from_config(cfg, tp_size: int) -> int:
 
 def _enforce_recurrent_state_server_constraints(server_args) -> None:
     """Assert server constraints for hybrid recurrent state models."""
+    if server_args.enable_mamba_extra_buffer:
+        # Extra-buffer (PR#2) needs the recurrent radix path; the legacy 1:1
+        # disable_radix_cache branch has no track slots. Check before the
+        # early return below so the combo fails loudly.
+        assert not server_args.disable_radix_cache, (
+            "--enable-mamba-extra-buffer is incompatible with --disable-radix-cache "
+            "(the legacy 1:1 path has no recurrent track slots)."
+        )
+        assert server_args.enable_unified_radix_tree, (
+            "--enable-mamba-extra-buffer requires --enable-unified-radix-tree "
+            "(recurrent radix caching)."
+        )
     if server_args.disable_radix_cache:
         return  # legacy 1:1 path (no prefix sharing)
     assert server_args.enable_unified_radix_tree, (
@@ -126,11 +138,18 @@ def _enforce_recurrent_state_server_constraints(server_args) -> None:
 
 
 def _recurrent_slot_factor(server_args) -> int:
-    """Recurrent slots per concurrent request. Radix caching needs 2 (1 running
-    + 1 for the tree-owned / transient clone headroom); legacy 1:1 needs 1."""
-    if server_args.enable_unified_radix_tree and not server_args.disable_radix_cache:
-        return 2
-    return 1
+    """Recurrent slots reserved per concurrent request.
+
+    - 3 with extra-buffer (PR#2): 1 running + two ping-pong track slots.
+    - 2 for unified-radix recurrent without extra-buffer: 1 running + 1 for the
+      tree-owned / transient clone headroom.
+    - 1 otherwise (legacy 1:1 path; radix disabled).
+    """
+    if server_args.disable_radix_cache or not server_args.enable_unified_radix_tree:
+        return 1
+    if server_args.enable_mamba_extra_buffer:
+        return 3
+    return 2
 
 
 def _build_hybrid_pools(
@@ -291,6 +310,7 @@ class ModelRunnerKVCacheMixin:
         sa = self.server_args
         dp_size = self.dp_size
         per_req_state = _per_req_state_bytes_from_config(cfg, self.attention_tp_size)
+        factor = _recurrent_slot_factor(sa)
 
         if sa.max_recurrent_state_size is not None:
             assert sa.max_recurrent_state_size % dp_size == 0, (
@@ -314,22 +334,27 @@ class ModelRunnerKVCacheMixin:
                     f"(default 0.9)."
                 )
             # _split_state_kv_budget runs against per-device memory, so its
-            # output is per-rank — multiply back to global.
+            # output is per-rank — multiply back to global. The budget holds
+            # `factor` slots per concurrent request (admission divides by
+            # factor in _resolve_max_num_reqs), so scale by factor to keep the
+            # effective concurrency at state_max_reqs_per_rank * dp_size.
             state_max_reqs_per_rank, _ = _split_state_kv_budget(
                 total_rest_memory, ratio, per_req_state
             )
-            sa.max_recurrent_state_size = state_max_reqs_per_rank * dp_size
+            sa.max_recurrent_state_size = state_max_reqs_per_rank * dp_size * factor
 
         state_memory_per_rank = (sa.max_recurrent_state_size // dp_size) * per_req_state
         kv_budget = total_rest_memory - state_memory_per_rank
 
         logger.info(
-            "Hybrid recurrent budget: per_req_state=%d bytes, "
+            "Hybrid recurrent budget: per_req_state=%d bytes, slot_factor=%d, "
             "max_recurrent_state_size=%d (global) / %d per dp rank, "
-            "kv_budget=%.1f GB",
+            "effective_max_reqs=%d (global), kv_budget=%.1f GB",
             per_req_state,
+            factor,
             sa.max_recurrent_state_size,
             sa.max_recurrent_state_size // dp_size,
+            sa.max_recurrent_state_size // factor,
             kv_budget / (1024**3),
         )
 

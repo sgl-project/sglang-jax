@@ -328,6 +328,7 @@ suites = {
         TestFile("test/srt/eval/test_simple_eval_common.py", 0.1, runner="pytest"),
         TestFile("test/srt/test_server_info.py", 0.1),
         TestFile("test/srt/test_recurrent_cow_metadata.py", 0.2),
+        TestFile("test/srt/test_recurrent_state_sizing.py", 0.2),
         TestFile("test/srt/test_extend_bs_guard.py", 0.2),
     ],
     "unit-test-tpu-v6e-4": [

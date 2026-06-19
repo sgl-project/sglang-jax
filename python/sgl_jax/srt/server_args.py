@@ -93,6 +93,7 @@ class ServerArgs:
     swa_full_tokens_ratio: float = 0.8
     recurrent_state_memory_ratio: float = 0.9
     max_recurrent_state_size: int | None = None
+    mamba_track_interval: int | None = None
     disable_hybrid_swa_memory: bool = False
 
     # Runtime options
@@ -324,6 +325,36 @@ class ServerArgs:
         # Normalize speculative_algorithm: treat empty string as None
         if isinstance(self.speculative_algorithm, str) and self.speculative_algorithm.strip() == "":
             self.speculative_algorithm = None
+
+        # Recurrent extra-buffer (PR#2) static validation + track-interval
+        # normalization. Gated on the flag so non-recurrent / PR#1 launches
+        # are untouched. Model-dependent checks (radix routing) live in
+        # _enforce_recurrent_state_server_constraints.
+        if self.enable_mamba_extra_buffer:
+            if self.page_size <= 1:
+                raise ValueError(
+                    "--enable-mamba-extra-buffer requires --page-size > 1 "
+                    f"(recurrent radix caching uses page-boundary track slots); "
+                    f"got page_size={self.page_size}."
+                )
+            if self.mamba_track_interval is None:
+                self.mamba_track_interval = self.page_size
+            if self.mamba_track_interval <= 0:
+                raise ValueError(
+                    "--mamba-track-interval must be > 0 when "
+                    f"--enable-mamba-extra-buffer is set; got {self.mamba_track_interval}."
+                )
+            if self.mamba_track_interval % self.page_size != 0:
+                raise ValueError(
+                    f"--mamba-track-interval ({self.mamba_track_interval}) must be a "
+                    f"multiple of --page-size ({self.page_size})."
+                )
+            if self.speculative_algorithm is not None:
+                raise ValueError(
+                    "--enable-mamba-extra-buffer does not support speculative "
+                    f"decoding yet; got --speculative-algorithm={self.speculative_algorithm}. "
+                    "Disable one of them."
+                )
 
         os.environ["SGLANG_ENABLE_DETERMINISTIC_SAMPLING"] = (
             "1" if self.enable_deterministic_sampling else "0"
@@ -716,6 +747,15 @@ class ServerArgs:
             "Resolution priority: (1) this flag, (2) --max-running-requests when --disable-radix-cache, "
             "(3) derived from --recurrent-state-memory-ratio and available HBM. "
             "Must be divisible by dp_size when set explicitly.",
+        )
+        parser.add_argument(
+            "--mamba-track-interval",
+            type=int,
+            default=ServerArgs.mamba_track_interval,
+            help="Recurrent radix cache (PR#2): page-boundary interval at which a "
+            "recurrent track state is committed. Requires --enable-mamba-extra-buffer "
+            "and must be a positive multiple of --page-size. Defaults to --page-size "
+            "when extra-buffer is enabled.",
         )
         parser.add_argument(
             "--disable-hybrid-swa-memory",
