@@ -92,6 +92,27 @@ def _scatter_idx0_safe(buf: jax.Array, state_indices: jax.Array, val: jax.Array)
     return buf.at[state_indices].set(safe_val)
 
 
+def _scatter_track(
+    buf: jax.Array,
+    track_indices: jax.Array,
+    track_mask: jax.Array,
+    val: jax.Array,
+) -> jax.Array:
+    """Scatter ``val`` into the request track slots (S5a PR#2 extra-buffer).
+
+    Operates on the buffer RETURNED by :func:`_scatter_idx0_safe` so the
+    running slot and the track slot both persist. Keep-mask preserves slots at
+    ``track_idx == 0`` (padding/dummy) and ``track_mask == 0`` (non-boundary
+    rows). The result is wrapped in ``optimization_barrier`` because the pool
+    buffer is donated under multi-host SPMD (PR#1 aliasing lesson).
+    """
+    val = val.astype(buf.dtype)
+    keep = ((track_indices == 0) | (track_mask == 0)).reshape((-1,) + (1,) * (buf.ndim - 1))
+    safe_val = jnp.where(keep, buf[track_indices], val)
+    new_buf = buf.at[track_indices].set(safe_val)
+    return jax.lax.optimization_barrier(new_buf)
+
+
 def jax_causal_conv1d_prefill(
     x: jax.Array,  # [D, T]  packed activations
     weight: jax.Array,  # [D, kernel_size]  depthwise weight
@@ -101,6 +122,8 @@ def jax_causal_conv1d_prefill(
     state_indices: jax.Array | None = None,  # [B] req → slot
     has_initial_state: jax.Array | None = None,  # [B] bool
     activation: str | None = None,
+    track_indices: jax.Array | None = None,  # [B] req → track slot (None = OFF)
+    track_mask: jax.Array | None = None,  # [B] bool boundary mask
 ) -> tuple[jax.Array, jax.Array]:
     """Depthwise causal conv1d over a ragged-batched packed sequence.
 
@@ -244,6 +267,8 @@ def jax_causal_conv1d_prefill(
     # slice as-is for tests that don't construct a pool.
     if conv_state is not None:
         new_conv_state = _scatter_idx0_safe(conv_state, state_indices, final_state)
+        if track_indices is not None:
+            new_conv_state = _scatter_track(new_conv_state, track_indices, track_mask, final_state)
     else:
         new_conv_state = final_state
     return y, new_conv_state
@@ -257,6 +282,8 @@ def jax_causal_conv1d_update(
     bias: jax.Array | None = None,  # [D]
     activation: str | None = None,
     has_initial_state: jax.Array | None = None,  # [B] bool
+    track_indices: jax.Array | None = None,  # [B] req → track slot (None = OFF)
+    track_mask: jax.Array | None = None,  # [B] bool boundary mask
 ) -> tuple[jax.Array, jax.Array]:
     """Single-token causal conv1d update.
 
@@ -311,6 +338,8 @@ def jax_causal_conv1d_update(
 
     # Scatter the per-request new state back into the full pool table.
     new_conv_state = _scatter_idx0_safe(conv_state, state_indices, new_state)
+    if track_indices is not None:
+        new_conv_state = _scatter_track(new_conv_state, track_indices, track_mask, new_state)
     # Pin the scatter result across the aliasing boundary (see entry barrier).
     new_conv_state, y = jax.lax.optimization_barrier((new_conv_state, y))
     return y, new_conv_state
@@ -336,6 +365,8 @@ def ragged_gated_delta_rule_ref(
     n_v: int,
     d_k: int,
     d_v: int,
+    track_indices: jax.Array | None = None,
+    track_mask: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Ragged gated delta-rule forward (extend / chunked-prefill).
 
@@ -468,6 +499,10 @@ def ragged_gated_delta_rule_ref(
     # carries fp32; the pool is typically fp32 too, but
     # ``SGLANG_JAX_RECURRENT_STATE_DTYPE=bfloat16`` can override).
     new_recurrent_state = _scatter_idx0_safe(recurrent_state, state_indices, new_state_buf)
+    if track_indices is not None:
+        new_recurrent_state = _scatter_track(
+            new_recurrent_state, track_indices, track_mask, new_state_buf
+        )
     return new_recurrent_state, output
 
 
@@ -485,6 +520,8 @@ def decode_gated_delta_rule_ref(
     d_k: int,
     d_v: int,
     has_initial_state: jax.Array | None = None,
+    track_indices: jax.Array | None = None,
+    track_mask: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Decode-only gated delta-rule (parallel single-step across the batch).
 
@@ -556,6 +593,10 @@ def decode_gated_delta_rule_ref(
 
     # Scatter the per-request new state back into the full pool table.
     new_recurrent_state = _scatter_idx0_safe(recurrent_state, state_indices, new_state)
+    if track_indices is not None:
+        new_recurrent_state = _scatter_track(
+            new_recurrent_state, track_indices, track_mask, new_state
+        )
     # Pin the scatter result across the aliasing boundary (see entry barrier).
     new_recurrent_state, out = jax.lax.optimization_barrier((new_recurrent_state, out))
     return new_recurrent_state, out.astype(mixed_qkv.dtype)

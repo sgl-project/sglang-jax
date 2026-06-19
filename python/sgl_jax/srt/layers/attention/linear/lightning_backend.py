@@ -139,6 +139,15 @@ class LightningAttnBackend(LinearRecurrentAttnBackend):
         **kwargs,
     ) -> tuple[jax.Array, tuple]:
         md = self.forward_metadata
+        # GLA decode is a fused Pallas kernel (in-kernel DMA gather/scatter), so
+        # a masked recurrent track scatter cannot be added cleanly. The
+        # recurrent extra-buffer (S5a PR#2) is gated OFF for GLA; fail fast if a
+        # track boundary somehow reaches this backend.
+        if md.recurrent_track_indices is not None:
+            raise NotImplementedError(
+                "recurrent extra-buffer (--enable-mamba-extra-buffer) is not "
+                "supported with the GLA/Lightning backend in PR#2"
+            )
         recurrent_buffer, _ = self.get_layer_cache(recurrent_state_pool, layer.layer_id)
 
         try:
