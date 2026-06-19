@@ -206,6 +206,11 @@ class ForwardBatch:
     # Recurrent CoW src slots [batch_size] (0 = no clone); clone dst =
     # recurrent_indices. Set on extend batches with a prefix hit; None otherwise.
     recurrent_cow_src_indices: jax.Array | None = None
+    # Recurrent track metadata [batch_size] (extra-buffer snapshot at track
+    # boundaries). Dormant until a later task adds the builder; None otherwise.
+    recurrent_track_indices: jax.Array | None = None
+    recurrent_track_mask: jax.Array | None = None
+    recurrent_track_seqlens: jax.Array | None = None
 
     def tree_flatten(self):
         children = (
@@ -230,6 +235,9 @@ class ForwardBatch:
             self.deepstack_visual_embedding,
             self.recurrent_indices,
             self.recurrent_cow_src_indices,
+            self.recurrent_track_indices,
+            self.recurrent_track_mask,
+            self.recurrent_track_seqlens,
         )
 
         aux_data = {
@@ -275,6 +283,9 @@ class ForwardBatch:
         obj.deepstack_visual_embedding = children[18]
         obj.recurrent_indices = children[19]
         obj.recurrent_cow_src_indices = children[20]
+        obj.recurrent_track_indices = children[21]
+        obj.recurrent_track_mask = children[22]
+        obj.recurrent_track_seqlens = children[23]
         return obj
 
     def __repr__(self) -> str:
@@ -420,6 +431,27 @@ class ForwardBatch:
                 sharding=(NamedSharding(model_runner.mesh, PartitionSpec("data"))),
             )
 
+        recurrent_track_indices = None
+        if batch.recurrent_track_indices is not None:
+            (recurrent_track_indices,) = device_array(
+                (batch.recurrent_track_indices,),
+                sharding=(NamedSharding(model_runner.mesh, PartitionSpec("data"))),
+            )
+
+        recurrent_track_mask = None
+        if batch.recurrent_track_mask is not None:
+            (recurrent_track_mask,) = device_array(
+                (batch.recurrent_track_mask,),
+                sharding=(NamedSharding(model_runner.mesh, PartitionSpec("data"))),
+            )
+
+        recurrent_track_seqlens = None
+        if batch.recurrent_track_seqlens is not None:
+            (recurrent_track_seqlens,) = device_array(
+                (batch.recurrent_track_seqlens,),
+                sharding=(NamedSharding(model_runner.mesh, PartitionSpec("data"))),
+            )
+
         obj = cls(
             bid=batch.bid,
             forward_mode=batch.forward_mode,
@@ -447,6 +479,9 @@ class ForwardBatch:
             expert_location_metadata=expert_location_metadata,
             recurrent_indices=recurrent_indices,
             recurrent_cow_src_indices=recurrent_cow_src_indices,
+            recurrent_track_indices=recurrent_track_indices,
+            recurrent_track_mask=recurrent_track_mask,
+            recurrent_track_seqlens=recurrent_track_seqlens,
         )
 
         # Auto-generate attention mask for Encoder-only models (e.g. UMT5Encoder, BERT)

@@ -722,6 +722,12 @@ class ScheduleReqsInfo:
     # recurrent_indices (the clone destination = the running slot).
     recurrent_cow_src_indices: np.ndarray | None = None
 
+    # Recurrent track metadata per DP (extra-buffer snapshot at track boundaries;
+    # dormant until a later task adds the builder). All padded to total_bs, P("data").
+    recurrent_track_indices: np.ndarray | None = None
+    recurrent_track_mask: np.ndarray | None = None
+    recurrent_track_seqlens: np.ndarray | None = None
+
 
 def _build_recurrent_cow_src_indices(reqs: list[Req]) -> np.ndarray | None:
     """Recurrent CoW src slots for a per-DP req list, or None when no request
@@ -2749,6 +2755,46 @@ class ScheduleBatch:
             ):
                 recurrent_cow_src_indices_cpu = None
 
+        # Step 5.5c: Merge recurrent track metadata (extra-buffer snapshot at
+        # page/track boundaries). Dormant until a later task adds the builder;
+        # all three stay None end-to-end today. Mirrors the CoW merge above.
+        recurrent_track_indices_cpu = None
+        recurrent_track_mask_cpu = None
+        recurrent_track_seqlens_cpu = None
+        if any(info.recurrent_track_mask is not None for info in self.reqs_info):
+            recurrent_track_indices_cpu = np.zeros(total_bs, dtype=np.int32)
+            recurrent_track_mask_cpu = np.zeros(total_bs, dtype=np.int32)
+            recurrent_track_seqlens_cpu = np.zeros(total_bs, dtype=np.int32)
+            offset_bs = 0
+            for dp_rank in range(self.dp_size):
+                info = self.reqs_info[dp_rank]
+                if info.seq_lens is not None and len(info.seq_lens) > 0:
+                    dp_bs = len(info.seq_lens)
+                    if info.recurrent_track_indices is not None:
+                        recurrent_track_indices_cpu[offset_bs : offset_bs + dp_bs] = (
+                            info.recurrent_track_indices
+                        )
+                    if info.recurrent_track_mask is not None:
+                        recurrent_track_mask_cpu[offset_bs : offset_bs + dp_bs] = (
+                            info.recurrent_track_mask
+                        )
+                    if info.recurrent_track_seqlens is not None:
+                        recurrent_track_seqlens_cpu[offset_bs : offset_bs + dp_bs] = (
+                            info.recurrent_track_seqlens
+                        )
+                offset_bs += per_dp_bs_padding
+            # One-shot consumption so later forwards never replay the snapshot.
+            for info in self.reqs_info:
+                info.recurrent_track_indices = None
+                info.recurrent_track_mask = None
+                info.recurrent_track_seqlens = None
+            # Backstop: no boundary hit this batch -> drop all three to None so
+            # the backend skips the snapshot path entirely.
+            if not recurrent_track_mask_cpu.any():
+                recurrent_track_indices_cpu = None
+                recurrent_track_mask_cpu = None
+                recurrent_track_seqlens_cpu = None
+
         # Step 5.6: has_initial_state[i] = True iff slot i already holds
         # prior KV/recurrent state (extend with prefix, or any decode slot).
         has_initial_state_cpu = np.ones(total_bs, dtype=np.bool_)
@@ -2897,6 +2943,9 @@ class ScheduleBatch:
             deepstack_visual_embedding=deepstack_visual_embedding,
             recurrent_indices=recurrent_indices_cpu,
             recurrent_cow_src_indices=recurrent_cow_src_indices_cpu,
+            recurrent_track_indices=recurrent_track_indices_cpu,
+            recurrent_track_mask=recurrent_track_mask_cpu,
+            recurrent_track_seqlens=recurrent_track_seqlens_cpu,
             has_initial_state=has_initial_state_cpu,
             spec_algorithm=self.spec_algorithm,
         )
@@ -3347,6 +3396,12 @@ class ModelWorkerBatch:
 
     # Recurrent CoW src slot per req (0 = no clone); clone dst = recurrent_indices.
     recurrent_cow_src_indices: np.ndarray | None = None
+
+    # Recurrent track metadata (extra-buffer snapshot at track boundaries;
+    # dormant until a later task adds the builder). Padded to total_bs, P("data").
+    recurrent_track_indices: np.ndarray | None = None
+    recurrent_track_mask: np.ndarray | None = None
+    recurrent_track_seqlens: np.ndarray | None = None
 
     # Whether each request has prior recurrent state (lazy zero-on-read)
     has_initial_state: np.ndarray | None = None
