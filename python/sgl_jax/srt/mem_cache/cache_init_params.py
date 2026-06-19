@@ -20,3 +20,7 @@ class CacheInitParams:
 
     # Recurrent radix: page-aligned ping-pong track buffer for page>=128 (PR#2).
     enable_mamba_extra_buffer: bool = False
+
+    # Track-boundary interval (multiple of page_size) for extra-buffer snapshots;
+    # resolved to page_size by ServerArgs when extra-buffer is on.
+    mamba_track_interval: int | None = None

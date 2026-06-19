@@ -79,6 +79,7 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
             is_eagle=params.is_eagle,
             tree_components=(ComponentType.FULL, ComponentType.RECURRENT),
             enable_mamba_extra_buffer=params.enable_mamba_extra_buffer,
+            mamba_track_interval=params.mamba_track_interval,
         )
 
     if (

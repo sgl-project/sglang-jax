@@ -329,6 +329,7 @@ suites = {
         TestFile("test/srt/test_server_info.py", 0.1),
         TestFile("test/srt/test_recurrent_cow_metadata.py", 0.2),
         TestFile("test/srt/test_recurrent_track_metadata.py", 0.2),
+        TestFile("test/srt/test_recurrent_boundary_split.py", 0.2),
         TestFile("test/srt/test_recurrent_state_sizing.py", 0.2),
         TestFile("test/srt/test_extend_bs_guard.py", 0.2),
     ],

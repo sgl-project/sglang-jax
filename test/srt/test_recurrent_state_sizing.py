@@ -102,6 +102,10 @@ class TestExtraBufferStaticValidation(unittest.TestCase):
         with self.assertRaises((ValueError, AssertionError)):
             _server_args(speculative_algorithm="EAGLE")
 
+    def test_extra_buffer_with_mixed_chunk_rejected(self):
+        with self.assertRaises((ValueError, AssertionError)):
+            _server_args(enable_mixed_chunk=True)
+
     def test_no_extra_buffer_skips_static_checks(self):
         # Page size 1 + speculative are fine when extra-buffer is off.
         sa = ServerArgs(

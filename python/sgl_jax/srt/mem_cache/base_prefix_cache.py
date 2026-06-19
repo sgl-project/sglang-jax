@@ -151,6 +151,12 @@ class BasePrefixCache(abc.ABC):
         """True for caches that manage recurrent (linear-recurrent) state."""
         return False
 
+    def recurrent_extra_buffer_active(self) -> bool:
+        """True when this cache materializes page-boundary recurrent snapshots
+        (extra-buffer recurrent, PR#2). Drives scheduler boundary splitting and
+        track-entry computation; False keeps the path byte-identical to today."""
+        return False
+
     def full_evictable_size(self, dp_rank: int = 0):
         return 0
 

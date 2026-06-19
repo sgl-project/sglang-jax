@@ -355,6 +355,12 @@ class ServerArgs:
                     f"decoding yet; got --speculative-algorithm={self.speculative_algorithm}. "
                     "Disable one of them."
                 )
+            if self.enable_mixed_chunk:
+                raise ValueError(
+                    "--enable-mamba-extra-buffer does not support mixed chunked "
+                    "prefill yet (the track snapshot is scoped to pure extend / "
+                    "pure decode forwards). Disable --enable-mixed-chunk."
+                )
 
         os.environ["SGLANG_ENABLE_DETERMINISTIC_SAMPLING"] = (
             "1" if self.enable_deterministic_sampling else "0"

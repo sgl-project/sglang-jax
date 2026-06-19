@@ -104,6 +104,7 @@ class UnifiedRadixCache(BasePrefixCache):
         is_eagle: bool = False,
         tree_components: tuple[ComponentType, ...] = (ComponentType.FULL,),
         enable_mamba_extra_buffer: bool = False,
+        mamba_track_interval: int | None = None,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -116,6 +117,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self.dtype = dtype
         self.enable_kv_cache_events = enable_kv_cache_events
         self.enable_mamba_extra_buffer = enable_mamba_extra_buffer
+        self.mamba_track_interval = mamba_track_interval
         self.kv_event_queue: list = []
 
         self.process_id = jax.process_index()
@@ -221,6 +223,13 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def supports_recurrent(self) -> bool:
         return ComponentType.RECURRENT in self.components
+
+    def recurrent_extra_buffer_active(self) -> bool:
+        return (
+            self.supports_recurrent()
+            and self.enable_mamba_extra_buffer
+            and self.mamba_track_interval is not None
+        )
 
     def assert_recurrent_slot_ledger(self, dp_rank: int = 0, live_reqs: list | None = None) -> int:
         """Per-rank invariant ``active + tree_owned + free == slots_per_rank``;

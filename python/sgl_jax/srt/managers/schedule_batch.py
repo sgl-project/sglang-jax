@@ -23,7 +23,7 @@ import logging
 import os
 import threading
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
 
 import jax
 import numpy as np
@@ -456,10 +456,21 @@ class Req:
                 self.last_host_node = tree_cache.root_node
                 self.host_hit_length = 0
             else:
+                # A running recurrent req already OWNS its recurrent state (its
+                # running slot), so it must not re-clone (cow_recurrent=False) and
+                # must match only the FULL component -- its own unfinished FULL
+                # prefix isn't gated on recurrent-tree validation. New cross-request
+                # prefills keep full_only=False, cow_recurrent=True.
+                is_running_recurrent = (
+                    tree_cache.supports_recurrent() and self.recurrent_pool_idx is not None
+                )
                 match_result = tree_cache.match_prefix(
                     MatchPrefixParams(
                         key=RadixKey(self.adjust_max_prefix_ids(), self.extra_key, self.dp_rank),
-                        cow_recurrent=tree_cache.supports_recurrent(),
+                        cow_recurrent=(
+                            tree_cache.supports_recurrent() and not is_running_recurrent
+                        ),
+                        full_only=is_running_recurrent,
                         req=self,
                     )
                 )
@@ -738,6 +749,61 @@ def _build_recurrent_cow_src_indices(reqs: list[Req]) -> np.ndarray | None:
     if not any(vals):
         return None
     return np.asarray(vals, dtype=np.int32)
+
+
+class _RecurrentTrackEntry(NamedTuple):
+    track_mask: bool
+    track_index: int
+    track_seqlen: int
+
+
+def _recurrent_track_entry(
+    req: Req, final_seq_len: int, *, interval: int, pool, is_extend: bool
+) -> _RecurrentTrackEntry:
+    """Per-req extra-buffer track entry for the forward at ``final_seq_len``.
+
+    On a real track boundary, reads the ping-pong slot at ``recurrent_next_track_idx``
+    BEFORE flipping it (read-then-flip), records the watermark seqlen, and flips
+    the next-scatter target. Off a boundary, returns a dormant (0, -1) entry and
+    leaves the req's bookkeeping untouched."""
+    if is_extend:
+        track_mask = req.extend_input_len > 0 and final_seq_len % interval == 0
+    else:
+        # Decode always advances seq_len by 1 (>0).
+        track_mask = final_seq_len % interval == 0
+    if not track_mask:
+        return _RecurrentTrackEntry(False, 0, -1)
+    idx = req.recurrent_next_track_idx
+    track_index = req.recurrent_ping_pong_track_buffer[idx]  # read BEFORE flipping
+    req.recurrent_last_track_seqlen = final_seq_len
+    req.recurrent_next_track_idx = pool.get_recurrent_ping_pong_other_idx(idx)
+    return _RecurrentTrackEntry(True, track_index, final_seq_len)
+
+
+def _build_recurrent_track_entries(
+    reqs: list[Req], final_seq_lens: list[int], *, interval: int, pool, is_extend: bool
+):
+    """Three np.int32 arrays (indices, mask as 0/1, seqlens) aligned with ``reqs``,
+    or ``(None, None, None)`` when no req hits a boundary -- mirroring
+    ``_build_recurrent_cow_src_indices``'s one-shot None return so the backend
+    skips the snapshot path entirely on a boundary-free batch."""
+    indices: list[int] = []
+    mask: list[int] = []
+    seqlens: list[int] = []
+    for req, final_seq_len in zip(reqs, final_seq_lens):
+        entry = _recurrent_track_entry(
+            req, final_seq_len, interval=interval, pool=pool, is_extend=is_extend
+        )
+        indices.append(entry.track_index)
+        mask.append(1 if entry.track_mask else 0)
+        seqlens.append(entry.track_seqlen)
+    if not any(mask):
+        return None, None, None
+    return (
+        np.asarray(indices, dtype=np.int32),
+        np.asarray(mask, dtype=np.int32),
+        np.asarray(seqlens, dtype=np.int32),
+    )
 
 
 @dataclasses.dataclass
@@ -1242,6 +1308,24 @@ class ScheduleBatch:
                 # Only when the tree does CoW (legacy disable-radix has none).
                 if self.tree_cache is not None and self.tree_cache.supports_recurrent():
                     info.recurrent_cow_src_indices = _build_recurrent_cow_src_indices(reqs)
+                # Extra-buffer track snapshot: a forward whose FINAL state lands
+                # on a track boundary publishes the running slot to the tree.
+                # Boundary splitting (PrefillAdder) guarantees an EXTEND ends on
+                # a boundary or is a non-final chunk, so seq_len % interval == 0
+                # iff the snapshot should be taken this round.
+                if self.tree_cache is not None and self.tree_cache.recurrent_extra_buffer_active():
+                    interval = self.tree_cache.mamba_track_interval
+                    (
+                        info.recurrent_track_indices,
+                        info.recurrent_track_mask,
+                        info.recurrent_track_seqlens,
+                    ) = _build_recurrent_track_entries(
+                        reqs,
+                        seq_lens,
+                        interval=interval,
+                        pool=self.req_to_token_pool,
+                        is_extend=True,
+                    )
 
             # Write to req_to_token_pool
             pt = 0
@@ -1651,6 +1735,24 @@ class ScheduleBatch:
                 # Decode never initiates a prefix-hit clone (the running slot
                 # already holds the advanced state).
                 info.recurrent_cow_src_indices = None
+                # Extra-buffer track snapshot: decode advances seq_len by 1, so a
+                # boundary is hit exactly when the new seq_len is a multiple of the
+                # interval. (The spec path already `continue`d above, so this is
+                # normal-decode only.)
+                if self.tree_cache is not None and self.tree_cache.recurrent_extra_buffer_active():
+                    interval = self.tree_cache.mamba_track_interval
+                    new_seq_lens = [int(s) for s in info.seq_lens]
+                    (
+                        info.recurrent_track_indices,
+                        info.recurrent_track_mask,
+                        info.recurrent_track_seqlens,
+                    ) = _build_recurrent_track_entries(
+                        reqs,
+                        new_seq_lens,
+                        interval=interval,
+                        pool=self.req_to_token_pool,
+                        is_extend=False,
+                    )
 
             # Allocate memory for this DP rank
             if self.token_to_kv_pool_allocator.page_size == 1:
