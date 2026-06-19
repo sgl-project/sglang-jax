@@ -990,16 +990,18 @@ class ScheduleBatch:
         return self.batch_size() == 0
 
     def alloc_req_slots(self, reqs: list[Req]):
-        # Recurrent radix: each new req needs one running slot. Evict exactly the
-        # shortfall from the tree (frees FULL KV + recurrent atomically at page=1)
-        # so the pool alloc below never runs out of recurrent slots.
+        # Recurrent radix: each new req needs one running slot (plus two ping-pong
+        # track slots under extra-buffer = 3 total). Evict exactly the shortfall
+        # from the tree (frees FULL KV + recurrent atomically at page=1) so the
+        # pool alloc below never runs out of recurrent slots.
         if (
             self.is_hybrid_recurrent
             and self.tree_cache is not None
             and self.tree_cache.supports_recurrent()
         ):
             dp_rank = reqs[0].dp_rank if reqs and reqs[0].dp_rank is not None else 0
-            demand = sum(1 for r in reqs if r.recurrent_pool_idx is None)
+            per_req = 3 if self.tree_cache.enable_mamba_extra_buffer else 1
+            demand = per_req * sum(1 for r in reqs if r.recurrent_pool_idx is None)
             available = self.req_to_token_pool.recurrent_available_size(dp_rank)
             if available < demand:
                 self.tree_cache.evict(

@@ -61,6 +61,7 @@ class RecurrentComponent(TreeComponent):
         super().__init__(cache, params)
         self.req_to_token_pool = cache.req_to_token_pool
         self.recurrent_state_pool = cache.req_to_token_pool.recurrent_state_pool
+        self.enable_mamba_extra_buffer = getattr(cache, "enable_mamba_extra_buffer", False)
 
     # ---- matching -----------------------------------------------------------
 
@@ -148,16 +149,53 @@ class RecurrentComponent(TreeComponent):
         token_ids_len: int,
         is_finished: bool,
     ) -> int | None:
-        # PR#1 page_size=1: only finished requests donate. The running slot is
-        # already the final, materialized state, so the tree value is the slot
-        # itself (no copy). Unfinished/fork donation is deferred (PR#2) to avoid
-        # the publish-before-materialize race.
-        if not is_finished or req.recurrent_pool_idx is None:
+        if not self.enable_mamba_extra_buffer:
+            # PR#1 page_size=1: only finished requests donate. The running slot is
+            # already the final, materialized state, so the tree value is the slot
+            # itself (no copy). Unfinished/fork donation is deferred (PR#2) to avoid
+            # the publish-before-materialize race.
+            if not is_finished or req.recurrent_pool_idx is None:
+                return None
+            insert_params.recurrent_value = self.req_to_token_pool.recurrent_value_from_slot(
+                req.recurrent_pool_idx
+            )
             return None
-        insert_params.recurrent_value = self.req_to_token_pool.recurrent_value_from_slot(
-            req.recurrent_pool_idx
+
+        # Extra-buffer (page>=128): donate the materialized page-boundary snapshot
+        # held by the KEEP ping-pong slot, capping the tree key at that boundary.
+        cache_len = req.recurrent_last_track_seqlen
+        if cache_len is None:
+            # No materialized boundary this request: donate/commit nothing. Cleanup
+            # frees only request-owned slots (free_recurrent_cache on finished).
+            return 0
+
+        keep_idx = self.req_to_token_pool.get_recurrent_ping_pong_keep_idx(req)
+        keep_slot = req.recurrent_ping_pong_track_buffer[keep_idx]
+        if is_finished:
+            # The keep slot IS the final boundary state; donate it directly. Cleanup
+            # transfers ownership (do NOT remove it from the buffer here).
+            insert_params.recurrent_value = self.req_to_token_pool.recurrent_value_from_slot(
+                keep_slot
+            )
+            return cache_len
+
+        # Unfinished: secure a fresh REPLACEMENT track slot FIRST, then donate the
+        # keep slot. A mid-flight request must always retain two owned track slots,
+        # so never donate without a secured replacement.
+        dp = req.dp_rank if req.dp_rank is not None else 0
+        replacement_slot = self.req_to_token_pool.alloc_recurrent_slot(dp)
+        if replacement_slot is None:
+            self.cache.evict(EvictParams(recurrent_num=1, dp_rank=dp))
+            replacement_slot = self.req_to_token_pool.alloc_recurrent_slot(dp)
+        if replacement_slot is None:
+            # All candidates locked: skip the donation, keep the buffer + watermark
+            # intact. The request keeps both track slots and may publish later.
+            insert_params.recurrent_value = None
+            return 0
+        insert_params.recurrent_value = self.req_to_token_pool.donate_recurrent_ping_pong_slot(
+            req, replacement_slot
         )
-        return None
+        return cache_len
 
     def cleanup_after_caching_req(
         self,
@@ -166,17 +204,52 @@ class RecurrentComponent(TreeComponent):
         insert_result: InsertResult | None = None,
         insert_params: InsertParams | None = None,
     ) -> None:
-        # Sole owner of the finished donate-vs-free decision. Unfinished requests
-        # donate nothing in PR#1 and keep their running slot (the live state);
-        # ownership-based release frees it later if needed.
-        if not is_finished:
-            return
         committed = insert_result.recurrent_committed if insert_result is not None else False
+        if not self.enable_mamba_extra_buffer:
+            # PR#1: sole owner of the finished donate-vs-free decision. Unfinished
+            # requests donate nothing and keep their running slot (the live state);
+            # ownership-based release frees it later if needed.
+            if not is_finished:
+                return
+            if committed:
+                # Tree owns the running slot now (its content is the final state).
+                self.req_to_token_pool.commit_to_tree(req)
+            # else: internal-target / duplicate / no-insert → leave
+            # req.recurrent_pool_idx set so the ownership-based release frees it.
+            return
+
+        # Extra-buffer: the donated value is the KEEP ping-pong slot, not the
+        # running slot. Do NOT use commit_to_tree (page=1 running-slot donation).
+        dp = req.dp_rank if req.dp_rank is not None else 0
+        if is_finished:
+            if committed:
+                # Tree now owns the keep slot. Zero the keep position so
+                # free_recurrent_cache skips it, then free running + the non-keep
+                # track slot. Net: 3 req-owned → 1 tree-owned + 2 free.
+                keep_idx = self.req_to_token_pool.get_recurrent_ping_pong_keep_idx(req)
+                self.req_to_token_pool.set_recurrent_ping_pong_slot(req, keep_idx, 0)
+                self.req_to_token_pool.free_recurrent_cache(req)
+            else:
+                # Nothing donated to the tree (duplicate/internal/no-insert): free
+                # running + BOTH track slots.
+                self.req_to_token_pool.free_recurrent_cache(req)
+            return
+
+        # Unfinished: the request stays live, keeping running + the other track
+        # slot in the buffer (free nothing here).
         if committed:
-            # Tree owns the running slot now (its content is the final state).
-            self.req_to_token_pool.commit_to_tree(req)
-        # else: internal-target / duplicate / no-insert → leave
-        # req.recurrent_pool_idx set so the ownership-based release frees it.
+            # Tree owns the donated slot; the buffer already holds the replacement.
+            # No request-owned track slot represents that boundary anymore.
+            req.recurrent_last_track_seqlen = None
+        elif insert_params is not None and insert_params.recurrent_value is not None:
+            # A donation was attempted but the tree rejected it: the donated slot
+            # was swapped OUT of the buffer (replacement took its place) and is now
+            # orphaned. Free it and invalidate the watermark.
+            self.req_to_token_pool.free_recurrent_slot(int(insert_params.recurrent_value[0]), dp)
+            req.recurrent_last_track_seqlen = None
+        # else: donation was SKIPPED (replacement alloc failed, recurrent_value
+        # None) → buffer and watermark intact; the request keeps both track slots
+        # and may publish later.
 
     # ---- eviction -----------------------------------------------------------
 
