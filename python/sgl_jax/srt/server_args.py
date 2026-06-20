@@ -337,8 +337,22 @@ class ServerArgs:
                     f"(recurrent radix caching uses page-boundary track slots); "
                     f"got page_size={self.page_size}."
                 )
+            # Default the snapshot interval to the prefill chunk size, NOT
+            # page_size. A track interval below chunked_prefill_size forces the
+            # scheduler to split prefill into sub-chunks so each forward ends on
+            # a snapshot boundary (see _recurrent_boundary_cap). Chunked prefill
+            # is numerically chunk-size-sensitive in the full-attention/MoE path
+            # (smaller chunks -> more bf16 boundary rounding -> measurably lower
+            # accuracy: ~3.5pp on GPQA at interval=128 vs chunk=512, bit-identical
+            # to a no-radix run forced to chunk at 128). Snapshotting at the
+            # page-aligned chunk boundaries that already exist adds no extra
+            # splitting. Finer page-granular snapshots without splitting need
+            # mid-forward state extraction (S5b).
             if self.recurrent_track_interval is None:
-                self.recurrent_track_interval = self.page_size
+                if self.chunked_prefill_size and self.chunked_prefill_size > 0:
+                    self.recurrent_track_interval = self.chunked_prefill_size
+                else:
+                    self.recurrent_track_interval = self.page_size
             if self.recurrent_track_interval <= 0:
                 raise ValueError(
                     "--recurrent-track-interval must be > 0 when "
@@ -349,6 +363,30 @@ class ServerArgs:
                     f"--recurrent-track-interval ({self.recurrent_track_interval}) must be a "
                     f"multiple of --page-size ({self.page_size})."
                 )
+            if self.chunked_prefill_size and self.chunked_prefill_size > 0:
+                # A prefill chunk must be able to reach the next snapshot
+                # boundary within the chunk budget; otherwise chunks never land
+                # on a track boundary and the scheduler stalls (observed hang at
+                # interval=32768, chunk=512).
+                if self.recurrent_track_interval > self.chunked_prefill_size:
+                    raise ValueError(
+                        f"--recurrent-track-interval ({self.recurrent_track_interval}) must be "
+                        f"<= --chunked-prefill-size ({self.chunked_prefill_size}); a larger "
+                        "interval cannot reach a snapshot boundary within one chunk and stalls "
+                        "the scheduler."
+                    )
+                if self.recurrent_track_interval < self.chunked_prefill_size:
+                    logger.warning(
+                        "--recurrent-track-interval (%d) < --chunked-prefill-size (%d): this "
+                        "force-splits prefill into %d-token sub-chunks so each forward ends on a "
+                        "snapshot boundary. Chunked prefill is chunk-size-sensitive in the "
+                        "full-attention/MoE path, so finer snapshots trade accuracy (~3.5pp on "
+                        "GPQA at interval=128 vs chunk=512) for recurrent-cache granularity. "
+                        "Prefer the default (= chunked_prefill_size) until S5b lands.",
+                        self.recurrent_track_interval,
+                        self.chunked_prefill_size,
+                        self.recurrent_track_interval,
+                    )
             if self.speculative_algorithm is not None:
                 raise ValueError(
                     "--enable-recurrent-extra-buffer does not support speculative "
