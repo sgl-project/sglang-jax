@@ -919,20 +919,22 @@ class TestUnifiedRadixCacheEffectiveCacheLen(CustomTestCase):
         self.assertEqual(allocator.available_size(0), avail_before + 4)
 
     def test_skip_insert_on_zero_unfinished(self):
-        # Unfinished skip mirrors the disabled-cache path: no tree key, cleanup
-        # runs, and the still-running request keeps its KV and prefix
-        # bookkeeping untouched (it has not finished generating).
+        # Unfinished skip: no tree key, cleanup runs, nothing freed this round.
+        # Leak fix: prefix_indices is ADVANCED to the committed KV so the next
+        # chunked round extends from here instead of re-allocating over it (which
+        # orphaned the chunk's pages -> token_to_kv_pool leak). cache_protected_len
+        # stays put (nothing entered the tree), so finishing later frees the full
+        # committed range -> balanced across the lifecycle.
         pool, allocator, cache = self._create_stack()
         token_ids = list(range(1, 13))
         kv_indices = allocator.alloc(len(token_ids), dp_rank=0)
         pool.write((0, slice(0, len(token_ids))), kv_indices)
-        prior_prefix = np.empty((0,), dtype=np.int32)
         req = MockRequest(
             req_pool_idx=0,
             origin_input_ids=list(token_ids),
             output_ids=[],
             fill_ids=list(token_ids),
-            prefix_indices=prior_prefix,
+            prefix_indices=np.empty((0,), dtype=np.int32),
             last_node=cache.root_node,
         )
         req.last_matched_prefix_len = 0
@@ -954,14 +956,23 @@ class TestUnifiedRadixCacheEffectiveCacheLen(CustomTestCase):
         self.assertIs(req.last_node, cache.root_node)
         # cleanup still ran.
         self.assertTrue(cleanup_calls)
-        # The running request keeps its KV and prefix bookkeeping intact.
+        # Nothing freed; protected length unchanged (nothing entered the tree).
         self.assertEqual(allocator.available_size(0), avail_before)
-        self.assertIs(req.prefix_indices, prior_prefix)
         self.assertEqual(req.cache_protected_len, 0)
+        # Leak fix: prefix_indices advanced to the committed KV (not left stale).
+        np.testing.assert_array_equal(req.prefix_indices, kv_indices)
+        # Finishing now frees the entire committed range -> no orphaned pages.
+        req.kv_committed_len = len(token_ids)
+        req.kv_allocated_len = len(token_ids)
+        self._cap_to(cache, 0)
+        cache.cache_finished_req(req)
+        self.assertEqual(allocator.available_size(0), avail_before + len(token_ids))
 
     def test_skip_insert_on_zero_unfinished_preserves_protected_prefix(self):
-        # With a protected prefix, the unfinished skip path still frees nothing
-        # and preserves the protected prefix bookkeeping.
+        # With a protected [0:4] prefix, the unfinished skip frees nothing and
+        # leaves cache_protected_len at 4 (nothing new entered the tree), but
+        # advances prefix_indices to the committed KV (leak fix). Finishing then
+        # frees only the request-owned tail [4:12]; the protected prefix persists.
         pool, allocator, cache = self._create_stack()
         token_ids = list(range(1, 13))
         kv_indices = allocator.alloc(len(token_ids), dp_rank=0)
@@ -982,9 +993,17 @@ class TestUnifiedRadixCacheEffectiveCacheLen(CustomTestCase):
         cache.cache_unfinished_req(req)
 
         self.assertEqual(cache.total_size(), 0)
-        # Nothing freed; the protected [0:4] prefix and the running tail persist.
+        # Nothing freed; the protected [0:4] prefix bookkeeping persists.
         self.assertEqual(allocator.available_size(0), avail_before)
         self.assertEqual(req.cache_protected_len, 4)
+        # Leak fix: prefix_indices advanced to the committed KV.
+        np.testing.assert_array_equal(req.prefix_indices, kv_indices)
+        # Finishing frees the request-owned tail above the protected prefix.
+        req.kv_committed_len = len(token_ids)
+        req.kv_allocated_len = len(token_ids)
+        self._cap_to(cache, 0)
+        cache.cache_finished_req(req)
+        self.assertEqual(allocator.available_size(0), avail_before + (len(token_ids) - 4))
 
     def test_skip_insert_on_zero_finished(self):
         pool, allocator, cache = self._create_stack()

@@ -408,10 +408,20 @@ class UnifiedRadixCache(BasePrefixCache):
                 effective_cache_len = min(effective_cache_len, cl)
 
         if effective_cache_len <= 0:
-            # No new tree key materialized. The request is still running and
-            # keeps its full KV; mirror the disabled-cache cleanup path and
-            # leave the request's prefix bookkeeping (prefix_indices, last_node,
-            # cache_protected_len, locks) untouched.
+            # No new tree key materialized this round, but the chunk's KV is
+            # committed and request-owned. Advance prefix_indices to the
+            # committed range (mirroring ChunkCache.cache_unfinished_req) so the
+            # next chunked round extends from here. The scheduler continues a
+            # chunked req via init_next_round_input() WITHOUT re-matching the
+            # tree, then prepare_for_extend allocates from len(prefix_indices);
+            # leaving it stale makes the next round re-allocate over this chunk's
+            # KV and orphan its pages (token_to_kv_pool leak). Only reachable
+            # when a chunk ends off a track boundary (e.g. recurrent_track_
+            # interval == chunked_prefill_size), so it never fired at interval ==
+            # page_size. Leave cache_protected_len / last_matched_prefix_len
+            # unchanged: nothing entered the tree, so the committed tail stays
+            # request-owned and is freed from old_prefix_len on finish/retract.
+            req.prefix_indices = kv_indices.copy()
             for component in self._components_tuple:
                 component.cleanup_after_caching_req(
                     req, is_finished=False, insert_result=None, insert_params=insert_params
