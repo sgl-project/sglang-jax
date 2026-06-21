@@ -1031,6 +1031,62 @@ class TestUnifiedRadixCacheEffectiveCacheLen(CustomTestCase):
         # Entire committed range freed (old_prefix_len=0 upward).
         self.assertEqual(allocator.available_size(0), avail_before + 12)
 
+    def test_zero_cache_len_skip_then_continuation_extends_without_overlap(self):
+        # The precise leak failure mode the prefix_indices advance fixes: a
+        # chunked round ends OFF a track boundary (effective_cache_len <= 0), then
+        # the NEXT round continues. The scheduler resets fill_ids to the full
+        # prompt and prepare_for_extend allocates the suffix starting at
+        # len(prefix_indices) WITHOUT re-matching the tree. A stale prefix ([]
+        # instead of the committed chunk) makes round 2 extend the whole prompt
+        # and write fresh KV over round 1's committed pages, orphaning them
+        # (token_to_kv_pool leak). This drives both rounds + finish and asserts
+        # the continuation extends only the suffix, never overlaps the committed
+        # chunk, and frees the full range -> balanced. The same off-boundary
+        # continuation is what every sub-interval chunk does, so it also covers
+        # a coarse recurrent_track_interval (>= chunked_prefill_size): such a
+        # request makes monotonic progress instead of stalling.
+        pool, allocator, cache = self._create_stack()
+        token_ids = list(range(1, 13))  # 12-token prompt, chunked 6 + 6
+        avail_start = allocator.available_size(0)
+
+        # --- Round 1: commit the first 6-token chunk, ending off a boundary. ---
+        chunk1 = allocator.alloc(6, dp_rank=0)
+        pool.write((0, slice(0, 6)), chunk1)
+        req = MockRequest(
+            req_pool_idx=0,
+            origin_input_ids=list(token_ids),
+            output_ids=[],
+            fill_ids=list(token_ids[:6]),  # only the committed chunk this round
+            prefix_indices=np.empty((0,), dtype=np.int32),
+            last_node=cache.root_node,
+        )
+        req.last_matched_prefix_len = 0
+        req.cache_protected_len = 0
+
+        self._cap_to(cache, 0)  # recurrent reports nothing cacheable (off boundary)
+        cache.cache_unfinished_req(req)
+
+        # prefix_indices advanced to the committed chunk (NOT left stale at []).
+        np.testing.assert_array_equal(req.prefix_indices, chunk1)
+
+        # --- Round 2: continue from the advanced prefix (mirror prepare_for_extend). ---
+        offset = len(req.prefix_indices)
+        extend_len = len(token_ids) - offset
+        self.assertEqual(offset, 6)  # extend starts AFTER the committed chunk
+        self.assertEqual(extend_len, 6)  # suffix only, not the whole prompt
+        chunk2 = allocator.alloc(extend_len, dp_rank=0)
+        # The continuation must not re-allocate over the committed chunk's pages.
+        self.assertEqual(set(chunk1.tolist()) & set(chunk2.tolist()), set())
+        pool.write((0, slice(offset, offset + extend_len)), chunk2)
+        req.fill_ids = list(token_ids)
+
+        # --- Finish: the whole committed range frees -> no orphaned pages. ---
+        req.kv_committed_len = len(token_ids)
+        req.kv_allocated_len = len(token_ids)
+        self._cap_to(cache, 0)
+        cache.cache_finished_req(req)
+        self.assertEqual(allocator.available_size(0), avail_start)
+
 
 class _CowReq:
     """Minimal Req surrogate for recurrent CoW match recording."""
