@@ -333,6 +333,7 @@ suites = {
         TestFile("test/srt/test_recurrent_state_sizing.py", 0.2),
         TestFile("test/srt/test_recurrent_track_scatter.py", 0.3),
         TestFile("test/srt/test_recurrent_split_equivalence.py", 0.3),
+        TestFile("test/srt/test_prepare_for_extend_protected_len.py", 0.2),
         TestFile("test/srt/test_extend_bs_guard.py", 0.2),
     ],
     "unit-test-tpu-v6e-4": [

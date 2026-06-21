@@ -1195,7 +1195,17 @@ class ScheduleBatch:
 
                 req.kv_committed_len = seq_len
                 req.kv_allocated_len = seq_len
-                req.cache_protected_len = pre_len
+                # cache_protected_len is the TREE-OWNED prefix (the free-from floor
+                # on finish/retract) = last_matched_prefix_len, NOT len(prefix_indices).
+                # They differ only when prefix_indices carries a request-owned,
+                # un-published tail: a recurrent off-boundary chunk skip advances it
+                # to the committed KV while last_matched stays at the last published
+                # boundary. Using pre_len marks that tail tree-protected, so a req
+                # finishing before it publishes (recurrent_track_interval > prompt)
+                # orphans [last_matched:pre_len] -> token_to_kv_pool leak. No-op for
+                # non-recurrent reqs (already equal); net-identical for EAGLE (its -1
+                # adjustment offset the +1 that pre_len carried).
+                req.cache_protected_len = req.last_matched_prefix_len
 
                 prefix_indices = req.prefix_indices
                 if pre_len > 0:
