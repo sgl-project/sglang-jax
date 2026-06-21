@@ -115,6 +115,14 @@ class TestExtraBufferStaticValidation(unittest.TestCase):
         with self.assertRaises((ValueError, AssertionError)):
             _server_args(recurrent_track_interval=200, page_size=128)
 
+    def test_default_interval_rejects_non_page_aligned_chunk(self):
+        # The interval auto-derives from chunked_prefill_size, so a non-page-aligned
+        # chunk must fail with a message naming chunked_prefill_size (not the
+        # auto-derived interval), even though check_server_args runs later.
+        with self.assertRaises(ValueError) as cm:
+            _server_args(recurrent_track_interval=None, chunked_prefill_size=1000, page_size=128)
+        self.assertIn("chunked-prefill-size", str(cm.exception))
+
     def test_track_interval_multiple_of_page_size_ok(self):
         sa = _server_args(recurrent_track_interval=256, page_size=128)
         self.assertEqual(sa.recurrent_track_interval, 256)

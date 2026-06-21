@@ -350,6 +350,18 @@ class ServerArgs:
             # mid-forward state extraction (S5b).
             if self.recurrent_track_interval is None:
                 if self.chunked_prefill_size and self.chunked_prefill_size > 0:
+                    # The interval defaults to chunked_prefill_size, so it must be
+                    # page-aligned too. check_server_args() asserts this for chunked
+                    # prefill in general, but that runs later -- without this guard a
+                    # non-page-aligned chunk would trip the interval check below with
+                    # a message blaming the auto-derived interval, not the chunk.
+                    if self.chunked_prefill_size % self.page_size != 0:
+                        raise ValueError(
+                            f"--chunked-prefill-size ({self.chunked_prefill_size}) must be a "
+                            f"multiple of --page-size ({self.page_size}) when "
+                            "--enable-recurrent-extra-buffer is set (the recurrent track "
+                            "interval defaults to it)."
+                        )
                     self.recurrent_track_interval = self.chunked_prefill_size
                 else:
                     self.recurrent_track_interval = self.page_size
