@@ -93,11 +93,13 @@ class TestExtraBufferStaticValidation(unittest.TestCase):
         sa = _server_args(recurrent_track_interval=None, page_size=256, chunked_prefill_size=-1)
         self.assertEqual(sa.recurrent_track_interval, 256)
 
-    def test_track_interval_above_chunked_prefill_rejected(self):
-        # interval > chunk budget => a chunk can never reach a snapshot boundary
-        # => scheduler stalls. Must be rejected at config time.
-        with self.assertRaises((ValueError, AssertionError)):
-            _server_args(recurrent_track_interval=1024, chunked_prefill_size=512)
+    def test_track_interval_above_chunked_prefill_allowed(self):
+        # interval > chunk budget is ALLOWED (warns): a chunk never reaches a
+        # snapshot boundary, so sub-interval prompts cache nothing, but the
+        # request still progresses (the zero-cache-len chunk skip advances
+        # prefix_indices -- no stall). It must resolve to the requested value.
+        sa = _server_args(recurrent_track_interval=1024, chunked_prefill_size=512)
+        self.assertEqual(sa.recurrent_track_interval, 1024)
 
     def test_track_interval_below_chunked_prefill_allowed(self):
         # Smaller interval is allowed (finer cache granularity) but warns about

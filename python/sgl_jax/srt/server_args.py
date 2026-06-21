@@ -364,18 +364,30 @@ class ServerArgs:
                     f"multiple of --page-size ({self.page_size})."
                 )
             if self.chunked_prefill_size and self.chunked_prefill_size > 0:
-                # A prefill chunk must be able to reach the next snapshot
-                # boundary within the chunk budget; otherwise chunks never land
-                # on a track boundary and the scheduler stalls (observed hang at
-                # interval=32768, chunk=512).
                 if self.recurrent_track_interval > self.chunked_prefill_size:
-                    raise ValueError(
-                        f"--recurrent-track-interval ({self.recurrent_track_interval}) must be "
-                        f"<= --chunked-prefill-size ({self.chunked_prefill_size}); a larger "
-                        "interval cannot reach a snapshot boundary within one chunk and stalls "
-                        "the scheduler."
+                    # Coarser than the chunk size: a chunk can never reach a
+                    # snapshot boundary, so a prompt shorter than the interval
+                    # publishes no snapshot and caches NOTHING (its FULL key is
+                    # capped at the recurrent cache length, which never advances).
+                    # This does NOT stall: the zero-cache-len chunk skip advances
+                    # prefix_indices, so the request makes monotonic progress and
+                    # finishes (verified live at interval=4096, chunk=512), and a
+                    # prompt that does cross a boundary caches at it. It only
+                    # lowers hit rate, so warn rather than reject -- coarse
+                    # intervals are a valid memory-for-hit-rate trade on
+                    # long-shared-prefix workloads.
+                    logger.warning(
+                        "--recurrent-track-interval (%d) > --chunked-prefill-size (%d): recurrent "
+                        "snapshots are published only at interval boundaries, so any prompt shorter "
+                        "than the interval caches nothing and cross-request reuse is limited to "
+                        "prompts that cross a boundary. The request still progresses (no stall); "
+                        "this only lowers the recurrent-cache hit rate. Prefer the default "
+                        "(= chunked_prefill_size) unless you are deliberately trading hit rate for "
+                        "coarser, cheaper snapshots.",
+                        self.recurrent_track_interval,
+                        self.chunked_prefill_size,
                     )
-                if self.recurrent_track_interval < self.chunked_prefill_size:
+                elif self.recurrent_track_interval < self.chunked_prefill_size:
                     logger.warning(
                         "--recurrent-track-interval (%d) < --chunked-prefill-size (%d): this "
                         "force-splits prefill into %d-token sub-chunks so each forward ends on a "
