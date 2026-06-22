@@ -12,7 +12,11 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from sgl_jax.srt.kernels.grouped_topk.grouped_topk import grouped_topk_pallas
+from sgl_jax.srt.kernels.grouped_topk.grouped_topk import (
+    SAFE_AUTO_BT,
+    _largest_safe_divisor,
+    grouped_topk_pallas,
+)
 
 
 def ref_biased_grouped_topk(router_logits, correction_bias, *, num_expert_group, topk_group, topk):
@@ -96,6 +100,41 @@ def test_against_real_topk_module():
     )
     np.testing.assert_array_equal(np.array(ids_pal), np.array(ids_real))
     np.testing.assert_allclose(np.array(w_pal), np.array(w_real), rtol=0, atol=1e-6)
+
+
+@pytest.mark.parametrize(
+    "bs,expected",
+    [
+        (5000, 1000),  # 5000=2^3·5^4: 8-aligned divisors <=2048 are 8/40/200/1000 -> 1000
+        (4000, 2000),  # 4000=2^5·5^3: max 8-aligned divisor <=2048 is 2000
+        (2048, 2048),  # already a safe power-of-2 tile
+        (1024, 1024),
+        (5003, None),  # prime -> no 8-aligned divisor, caller falls back to whole batch
+        (100, None),  # 100=2^2·5^2 has no multiple-of-8 divisor
+    ],
+)
+def test_largest_safe_divisor(bs, expected):
+    """The auto fallback must pick a VMEM-safe, 8-aligned divisor of bs (or None)."""
+    d = _largest_safe_divisor(bs)
+    assert d == expected, f"bs={bs}: got {d}, want {expected}"
+    if d is not None:
+        assert bs % d == 0 and d % 8 == 0 and d <= SAFE_AUTO_BT
+
+
+def test_auto_block_tokens_nondivisible():
+    """`block_tokens='auto'` on an odd bucket (divisible by neither tuned BT nor 512) must still
+    produce a correct result — and not silently tile the whole batch (the Codex P2)."""
+    E, G, Gtop, k, bs = 256, 8, 4, 8, 1000  # 1000 % 512 != 0; on CPU the tuned lookup misses
+    logits = _logits(bs, E, seed=13)
+    bias = jax.random.normal(jax.random.PRNGKey(9), (E,), dtype=jnp.float32) * 0.1
+    w_ref, ids_ref = ref_biased_grouped_topk(
+        logits, bias, num_expert_group=G, topk_group=Gtop, topk=k
+    )
+    w_pal, ids_pal = grouped_topk_pallas(
+        logits, bias, num_expert_group=G, topk_group=Gtop, topk=k, interpret=True
+    )  # block_tokens defaults to "auto"
+    np.testing.assert_array_equal(np.array(ids_pal), np.array(ids_ref))
+    np.testing.assert_allclose(np.array(w_pal), np.array(w_ref), rtol=0, atol=1e-6)
 
 
 @pytest.mark.parametrize(

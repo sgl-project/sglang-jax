@@ -23,6 +23,7 @@ Renormalize / routed_scaling are left to the caller (as in `TopK.__call__`).
 from __future__ import annotations
 
 import functools
+import logging
 import os
 
 import jax
@@ -37,11 +38,32 @@ except Exception:  # noqa: BLE001  (e.g. base64-embedded standalone copy without
         return None
 
 
+logger = logging.getLogger(__name__)
+
 NEG_INF = -jnp.inf
+
+# Largest BT the multi-block (grid>1) path is known to fit in v7x VMEM (double-buffered [BT,E]
+# inputs; see tuned_block_sizes / analysis-zh.md). The "auto" path never tiles above this without
+# warning.
+SAFE_AUTO_BT = 2048
 
 
 def _align_to(x: int, a: int) -> int:
     return ((x + a - 1) // a) * a
+
+
+def _largest_safe_divisor(bs: int, cap: int = SAFE_AUTO_BT, align: int = 8) -> int | None:
+    """Largest d that divides bs with d <= cap and d % align == 0.
+
+    Pallas TPU tiling needs the token block to be a multiple of 8 (sublane), so an auto block size
+    must be both a divisor of bs (for an even grid) and 8-aligned. Returns None when bs has no such
+    divisor (e.g. bs is prime / not 8-aligned), so the caller can fall back to a single block.
+    """
+    hi = (min(cap, bs) // align) * align
+    for d in range(hi, 0, -align):
+        if bs % d == 0:
+            return d
+    return None
 
 
 def get_interpret() -> bool:
@@ -151,10 +173,22 @@ def grouped_topk_pallas(
         tuned = get_tuned_bt(bs, e, num_expert_group, topk_group, topk)
         if tuned is not None and bs % tuned == 0:
             bt = tuned
-        elif bs % min(512, bs) == 0:
-            bt = min(512, bs)  # safe default
+        elif bs % 512 == 0:
+            bt = min(512, bs)  # 512 divides bs -> safe default tile
         else:
-            bt = bs  # single block always divides
+            # Odd serving bucket (bs divisible by neither the tuned BT nor 512): pick the largest
+            # VMEM-safe divisor of bs rather than silently tiling the whole batch as one block.
+            bt = _largest_safe_divisor(bs) or bs
+        if bt > SAFE_AUTO_BT:
+            logger.warning(
+                "grouped_topk: auto block_tokens fell back to whole-batch BT=%d (BS=%d has no "
+                "VMEM-safe divisor); a single [%d,%d] tile may exceed VMEM. Pad local tokens to a "
+                "power-of-2 or a multiple of 512, or pass an explicit block_tokens.",
+                bt,
+                bs,
+                bs,
+                e,
+            )
     else:
         bt = min(block_tokens, bs)
         if bs % bt != 0:
