@@ -32,7 +32,11 @@ def _mock_req(rid):
     return req
 
 
-class TestExtendBsGuard(unittest.TestCase):
+class _ExtendBsGuardFixture:
+    """Shared setUp + batch builder for the EXTEND bs-guard tests. Mixed into the
+    concrete TestCase classes so the page-size-scope class can reuse the fixture
+    WITHOUT subclassing (and thus rerunning) the guard tests."""
+
     def setUp(self):
         self.pool = MagicMock()
         self.pool.req_to_token = np.arange(64, dtype=np.int32).reshape(8, 8)
@@ -76,6 +80,8 @@ class TestExtendBsGuard(unittest.TestCase):
             is_hybrid_recurrent=is_hybrid_recurrent,
         )
 
+
+class TestExtendBsGuard(_ExtendBsGuardFixture, unittest.TestCase):
     def test_backstop_raises_when_selected_per_dp_exceeds_safe(self):
         batch = self._extend_batch(dp_size=2)
         # Non-recurrent -> forced largest bucket 64 -> per_dp 32 > 8 -> raise.
@@ -122,7 +128,7 @@ class TestExtendBsGuard(unittest.TestCase):
         self.assertEqual(per_dp_bs, 32)
 
 
-class TestExtendBsGuardScopedToPageSizeOne(TestExtendBsGuard):
+class TestExtendBsGuardScopedToPageSizeOne(_ExtendBsGuardFixture, unittest.TestCase):
     """The multi-host safe-EXTEND bucket guard exists only because the page_size=1
     EXTEND attention executable miscompiles RPA at per_dp_bs>8 under multi-host SPMD.
     The S5a PR#2 extra-buffer recurrent path runs at page_size>=128, where that guard

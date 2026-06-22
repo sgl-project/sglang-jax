@@ -56,11 +56,13 @@ class TestPrepareForExtendProtectedLen(unittest.TestCase):
         # assignment, this value survives and the caller's assertion fails -- a
         # pre-assignment failure cannot be silently swallowed by the except below.
         req.cache_protected_len = -1
-        # cache_protected_len is set early in the per-req loop; tolerate only a
-        # later (positions/sampling) stage that needs a real model + mesh.
+        # cache_protected_len is set early in the per-req loop. The only stage we
+        # tolerate is the later token-slot allocation, which dereferences the
+        # (intentionally None) tree_cache and raises AttributeError. Narrowing to
+        # AttributeError keeps any unrelated later failure from being swallowed.
         try:
             batch.prepare_for_extend()
-        except Exception:
+        except AttributeError:
             pass
         self.assertNotEqual(
             req.cache_protected_len,

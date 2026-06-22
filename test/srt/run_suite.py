@@ -316,6 +316,7 @@ suites = {
         TestFile("python/sgl_jax/test/mem_cache/test_unified_radix_tree_flag.py", 1),
         TestFile("python/sgl_jax/test/mem_cache/test_paged_allocator_multi_dp.py", 1),
         TestFile("python/sgl_jax/test/test_kv_cache_builder.py", 0.1, runner="pytest"),
+        TestFile("python/sgl_jax/test/test_mixed_chunk_dp.py", 0.2),
         TestFile("test/srt/function_call/test_qwen3_coder_detector.py", 0.1),
         TestFile("test/srt/function_call/test_glm4_moe_detector.py", 0.1),
         TestFile("test/srt/function_call/test_qwen25_detector.py", 0.1),
