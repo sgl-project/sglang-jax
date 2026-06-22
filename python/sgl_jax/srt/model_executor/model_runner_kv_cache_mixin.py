@@ -110,9 +110,16 @@ def _per_req_state_bytes_from_config(cfg, tp_size: int) -> int:
     )
 
 
-def _enforce_recurrent_state_server_constraints(server_args) -> None:
+def _enforce_recurrent_state_server_constraints(server_args, is_lightning: bool = False) -> None:
     """Assert server constraints for hybrid recurrent state models."""
     if server_args.enable_recurrent_extra_buffer:
+        # GLA/Lightning decode is a fused Pallas kernel that cannot add a masked
+        # recurrent track scatter, so the extra-buffer path is unsupported. Reject
+        # at init (the LightningAttnBackend assert is a mid-serving backstop).
+        assert not is_lightning, (
+            "--enable-recurrent-extra-buffer is not supported with the GLA/Lightning "
+            "(bailing_hybrid) architecture."
+        )
         # Extra-buffer (PR#2) needs the recurrent radix path; the legacy 1:1
         # disable_radix_cache branch has no track slots. Check before the
         # early return below so the combo fails loudly.
@@ -635,7 +642,9 @@ class ModelRunnerKVCacheMixin:
 
         # 2. Enforce constraints for hybrid recurrent
         if self.linear_recurrent_config is not None:
-            _enforce_recurrent_state_server_constraints(self.server_args)
+            _enforce_recurrent_state_server_constraints(
+                self.server_args, is_lightning=self.lightning_config is not None
+            )
 
         # 3. Profile max tokens
         self.max_total_num_tokens = self.profile_max_num_token(total_device_memory)

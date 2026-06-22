@@ -162,6 +162,22 @@ class TestRecurrentStateConstraints(unittest.TestCase):
         sa = _server_args()
         _enforce_recurrent_state_server_constraints(sa)  # no raise
 
+    def test_extra_buffer_rejected_for_lightning(self):
+        # GLA/Lightning has no extra-buffer support; reject at init even though
+        # the radix/page constraints are otherwise satisfied.
+        sa = _server_args()
+        with self.assertRaises(AssertionError):
+            _enforce_recurrent_state_server_constraints(sa, is_lightning=True)
+
+    def test_lightning_without_extra_buffer_passes(self):
+        # A Lightning model on the non-extra-buffer recurrent radix path is fine.
+        sa = ServerArgs(
+            model_path="dummy",
+            enable_unified_radix_tree=True,
+            page_size=1,
+        )
+        _enforce_recurrent_state_server_constraints(sa, is_lightning=True)  # no raise
+
     def test_pr1_unified_radix_requires_page_size_1(self):
         sa = ServerArgs(
             model_path="dummy",
