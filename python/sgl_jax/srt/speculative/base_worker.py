@@ -180,12 +180,12 @@ class BaseSpecWorker:
         self._prepare_overlap_sampling_info(model_worker_batch)
 
         from sgl_jax.srt.speculative.draft_extend_fused import (
-            prepare_spec_prefill_forward_batch,
+            prepare_forward_batch_for_prefill,
             spec_prefill_overlap,
         )
 
         if getattr(model_worker_batch, "forward_batch", None) is None:
-            prepare_spec_prefill_forward_batch(self, model_worker_batch)
+            prepare_forward_batch_for_prefill(self, model_worker_batch)
         result = spec_prefill_overlap(self, model_worker_batch)
         launch_done = getattr(model_worker_batch, "launch_done", None)
         if launch_done is not None:
@@ -204,12 +204,12 @@ class BaseSpecWorker:
         if model_worker_batch.forward_mode.is_extend():
             if self._can_use_fused_spec_prefill(model_worker_batch):
                 from sgl_jax.srt.speculative.draft_extend_fused import (
-                    prepare_spec_prefill_forward_batch,
+                    prepare_forward_batch_for_prefill,
                     spec_prefill,
                 )
 
                 if getattr(model_worker_batch, "forward_batch", None) is None:
-                    prepare_spec_prefill_forward_batch(self, model_worker_batch)
+                    prepare_forward_batch_for_prefill(self, model_worker_batch)
                 return spec_prefill(self, model_worker_batch, launch_done=launch_done)
 
             if model_worker_batch.sampling_info.temperatures.ndim == 1:
