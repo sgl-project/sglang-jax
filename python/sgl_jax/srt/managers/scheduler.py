@@ -1926,84 +1926,20 @@ class Scheduler(
                 next_token_ids = np.array(jax.device_get(next_token_ids_device))
                 self._extract_dp_output_ids(next_token_ids, model_worker_batch, batch)
         else:
-            if batch.forward_mode.is_extend():
-                # Spec extend always uses the padded mwb so target and draft
-                # see identical shapes regardless of dp_size / multi-layer
-                # (#1090 + #1053 P1-5b assert dp>1 spec extend must go here).
-                model_worker_batch = batch.get_model_worker_batch(
-                    precompile_token_paddings,
-                    precompile_bs_paddings,
-                    precompile_cache_loc_paddings,
-                    self.page_size,
-                    self.server_args.enable_static_lora,
-                )
-            else:
-                model_worker_batch = batch.get_spec_model_worker_batch(
-                    precompile_token_paddings,
-                    precompile_bs_paddings,
-                    precompile_cache_loc_paddings,
-                    self.page_size,
-                    self.server_args.enable_static_lora,
-                    draft_token_num=self.draft_worker.speculative_num_draft_tokens,
-                )
-            use_spec_decode_overlap = can_use_spec_decode_overlap(
-                self.enable_overlap, self.spec_algorithm, batch
+            (
+                model_worker_batch,
+                batch_output,
+                next_token_ids,
+                logits_output,
+                cache_miss_count,
+                defer_spec_output,
+                defer_spec_prefill_output,
+            ) = self._run_speculative_batch(
+                batch,
+                precompile_token_paddings,
+                precompile_bs_paddings,
+                precompile_cache_loc_paddings,
             )
-            use_spec_prefill_overlap = can_use_spec_prefill_overlap(
-                self.enable_overlap, self.spec_algorithm, batch
-            )
-            if use_spec_decode_overlap:
-                batch_output, published_new_seq_lens = (
-                    self.draft_worker.forward_batch_speculative_decode_overlap(model_worker_batch)
-                )
-            elif use_spec_prefill_overlap:
-                batch_output = self.draft_worker.forward_batch_speculative_prefill_overlap(
-                    model_worker_batch
-                )
-                published_new_seq_lens = None
-            else:
-                batch_output = self.draft_worker.forward_batch_speculative_generation(
-                    model_worker_batch
-                )
-                published_new_seq_lens = (
-                    publish_spec_decode_new_seq_lens(batch_output)
-                    if batch.forward_mode.is_decode()
-                    else None
-                )
-            if batch_output.next_draft_input is not None:
-                per_rank_spec = ScheduleBatch._split_spec_info_per_rank(
-                    batch_output.next_draft_input, model_worker_batch.real_bs_per_dp
-                )
-                for r, s in enumerate(per_rank_spec):
-                    batch.reqs_info[r].spec_info = s
-            if not use_spec_decode_overlap:
-                new_seq_lens = (
-                    np.asarray(jax.device_get(published_new_seq_lens))
-                    if published_new_seq_lens is not None
-                    else None
-                )
-                per_dp_bs = model_worker_batch.per_dp_bs_size
-                for dp_rank, info in enumerate(batch.reqs_info):
-                    if info.seq_lens is None or len(info.seq_lens) == 0:
-                        continue
-                    if new_seq_lens is not None:
-                        off = dp_rank * per_dp_bs
-                        info.seq_lens = new_seq_lens[off : off + len(info.seq_lens)]
-                    else:
-                        info.seq_lens = info.seq_lens + 1
-            defer_spec_decode_output = (
-                self.enable_overlap
-                and batch.forward_mode.is_decode()
-                and self.spec_algorithm is not None
-                and not self.spec_algorithm.is_none()
-            )
-            defer_spec_prefill_output = use_spec_prefill_overlap
-            defer_spec_output = defer_spec_decode_output or defer_spec_prefill_output
-            if not defer_spec_output:
-                next_token_ids = np.asarray(jax.device_get(batch_output.next_token_ids))
-                self._extract_dp_output_ids(next_token_ids, model_worker_batch, batch)
-            logits_output = batch_output.logits_output
-            cache_miss_count = batch_output.cache_miss_count
         bid = model_worker_batch.bid
 
         # These 2 values are needed for processing the output, but the values can be
@@ -2081,26 +2017,6 @@ class Scheduler(
         elif batch.forward_mode.is_dummy_first():
             self.set_next_batch_sampling_info_done(batch)
 
-    def get_idle_batch(self):
-        # Create empty request lists for each DP rank
-        reqs_per_dp = [[] for _ in range(self.dp_size)]
-
-        idle_batch = ScheduleBatch.init_new(
-            reqs_per_dp,
-            self.req_to_token_pool,
-            self.token_to_kv_pool_allocator,
-            self.tree_cache,
-            self.model_config,
-            self.enable_overlap,
-            self.dp_size,
-            spec_algorithm=self.spec_algorithm,
-            enable_custom_logit_processor=self.server_args.enable_custom_logit_processor,
-            chunked_reqs=None,
-            mesh=self.mesh,
-        )
-        idle_batch.prepare_for_idle()
-        return idle_batch
-
     def set_next_batch_sampling_info_done(self, batch: ScheduleBatch):
         if batch.next_batch_sampling_info:
             # Update grammar vocab masks for next batch in overlap mode
@@ -2112,6 +2028,98 @@ class Scheduler(
         if self.spec_algorithm is not None and not self.spec_algorithm.is_none():
             return self.draft_worker
         return self.tp_worker
+
+    def _run_speculative_batch(
+        self,
+        batch: ScheduleBatch,
+        precompile_token_paddings,
+        precompile_bs_paddings,
+        precompile_cache_loc_paddings,
+    ):
+        if batch.forward_mode.is_extend():
+            # Spec extend always uses the padded mwb so target and draft
+            # see identical shapes regardless of dp_size / multi-layer
+            # (#1090 + #1053 P1-5b assert dp>1 spec extend must go here).
+            model_worker_batch = batch.get_model_worker_batch(
+                precompile_token_paddings,
+                precompile_bs_paddings,
+                precompile_cache_loc_paddings,
+                self.page_size,
+                self.server_args.enable_static_lora,
+            )
+        else:
+            model_worker_batch = batch.get_spec_model_worker_batch(
+                precompile_token_paddings,
+                precompile_bs_paddings,
+                precompile_cache_loc_paddings,
+                self.page_size,
+                self.server_args.enable_static_lora,
+                draft_token_num=self.draft_worker.speculative_num_draft_tokens,
+            )
+
+        use_spec_decode_overlap = can_use_spec_decode_overlap(
+            self.enable_overlap, self.spec_algorithm, batch
+        )
+        use_spec_prefill_overlap = can_use_spec_prefill_overlap(
+            self.enable_overlap, self.spec_algorithm, batch
+        )
+        if use_spec_decode_overlap:
+            batch_output, published_new_seq_lens = (
+                self.draft_worker.forward_batch_speculative_decode_overlap(model_worker_batch)
+            )
+        elif use_spec_prefill_overlap:
+            batch_output = self.draft_worker.forward_batch_speculative_prefill_overlap(
+                model_worker_batch
+            )
+            published_new_seq_lens = None
+        else:
+            batch_output = self.draft_worker.forward_batch_speculative_generation(
+                model_worker_batch
+            )
+            published_new_seq_lens = (
+                publish_spec_decode_new_seq_lens(batch_output)
+                if batch.forward_mode.is_decode()
+                else None
+            )
+
+        if batch_output.next_draft_input is not None:
+            per_rank_spec = ScheduleBatch._split_spec_info_per_rank(
+                batch_output.next_draft_input, model_worker_batch.real_bs_per_dp
+            )
+            for r, s in enumerate(per_rank_spec):
+                batch.reqs_info[r].spec_info = s
+
+        if not use_spec_decode_overlap:
+            new_seq_lens = (
+                np.asarray(jax.device_get(published_new_seq_lens))
+                if published_new_seq_lens is not None
+                else None
+            )
+            per_dp_bs = model_worker_batch.per_dp_bs_size
+            for dp_rank, info in enumerate(batch.reqs_info):
+                if info.seq_lens is None or len(info.seq_lens) == 0:
+                    continue
+                if new_seq_lens is not None:
+                    off = dp_rank * per_dp_bs
+                    info.seq_lens = new_seq_lens[off : off + len(info.seq_lens)]
+                else:
+                    info.seq_lens = info.seq_lens + 1
+
+        defer_spec_output = use_spec_decode_overlap or use_spec_prefill_overlap
+        next_token_ids = None
+        if not defer_spec_output:
+            next_token_ids = np.asarray(jax.device_get(batch_output.next_token_ids))
+            self._extract_dp_output_ids(next_token_ids, model_worker_batch, batch)
+
+        return (
+            model_worker_batch,
+            batch_output,
+            next_token_ids,
+            batch_output.logits_output,
+            batch_output.cache_miss_count,
+            defer_spec_output,
+            use_spec_prefill_overlap,
+        )
 
     def watchdog_thread(self):
         """A watch dog thread that will try to kill the server itself if one forward batch takes too long."""

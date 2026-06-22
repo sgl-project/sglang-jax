@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from functools import partial
 from typing import NamedTuple
 
 import jax
-import jax._src.test_util as jtu
 import jax.numpy as jnp
 import numpy as np
 from flax import nnx
@@ -51,6 +51,17 @@ class FusedDraftExtendPendingResult(NamedTuple):
     accept_lens: object
     sel: np.ndarray
     updated_relay_buffers: object | None
+
+
+@contextmanager
+def _count_pjit_cpp_cache_miss():
+    try:
+        import jax._src.test_util as jtu
+    except (ImportError, ModuleNotFoundError):
+        yield lambda: 0
+        return
+    with jtu.count_pjit_cpp_cache_miss() as count:
+        yield count
 
 
 def _prepare_spec_prefill_output_token_ids(draft_worker, next_token_ids):
@@ -1595,7 +1606,7 @@ def spec_prefill(spec_worker, model_worker_batch, launch_done=None, *, update_re
     )
     relay_valid_mask = _prepare_device_array(valid_mask, data_sharding, "prefill.relay_valid_mask")
 
-    with jax.set_mesh(draft_worker.mesh), jtu.count_pjit_cpp_cache_miss() as count:
+    with jax.set_mesh(draft_worker.mesh), _count_pjit_cpp_cache_miss() as count:
         (
             logits_output,
             next_token_ids,
@@ -1808,7 +1819,7 @@ def spec_decode_verify(spec_worker, model_worker_batch, cur_allocate_lens):
     # from (base_rng, step), so only this small int crosses the host->device boundary.
     target_mr._sampler_step += 1
 
-    with jax.set_mesh(draft_worker.mesh), jtu.count_pjit_cpp_cache_miss() as count:
+    with jax.set_mesh(draft_worker.mesh), _count_pjit_cpp_cache_miss() as count:
         (
             target_pool_updates,
             prepared_hidden,

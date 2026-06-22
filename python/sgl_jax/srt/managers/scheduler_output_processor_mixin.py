@@ -116,12 +116,7 @@ class SchedulerOutputProcessorMixin:
         )
         if self.enable_overlap:
             if self.spec_algorithm is not None and not self.spec_algorithm.is_none():
-                next_token_ids = resolve_spec_prefill_token_ids(
-                    result,
-                    batch,
-                    getattr(result, "spec_relay_buffers", None),
-                    getattr(self.draft_worker, "mesh", None),
-                )
+                next_token_ids = resolve_spec_prefill_token_ids(result)
                 if launch_done is not None:
                     launch_done.wait()
             else:

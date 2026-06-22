@@ -85,9 +85,7 @@ class TestVerifyTree(CustomTestCase):
         np.testing.assert_array_equal(np.asarray(packed), expected)
 
     def test_fused_chain_verify_matches_topk1_linear_reference(self):
-        from sgl_jax.srt.speculative.draft_extend_fused import (
-            _verify_greedy,
-        )
+        from sgl_jax.srt.speculative.draft_extend_fused import _verify_greedy
 
         speculative_num_steps = 3
         num_draft_tokens = 4
@@ -160,9 +158,7 @@ class TestVerifyTree(CustomTestCase):
         )
 
     def test_fused_chain_verify_zeroes_padding_accept_length(self):
-        from sgl_jax.srt.speculative.draft_extend_fused import (
-            _verify_greedy,
-        )
+        from sgl_jax.srt.speculative.draft_extend_fused import _verify_greedy
 
         out = _verify_greedy(
             target_hidden=jnp.arange(8 * 2, dtype=jnp.float32).reshape(8, 2),

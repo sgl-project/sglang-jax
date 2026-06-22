@@ -1276,35 +1276,6 @@ def _generate_simulated_accept_index(
     return sim_accept_index, accept_length, predict
 
 
-def get_src_tgt_cache_loc(
-    seq_lens: np.ndarray,
-    out_cache_loc: np.ndarray,
-    accept_index: np.ndarray,
-    accept_length: np.ndarray,
-    draft_token_num: int,
-    page_size: int,
-):
-    src_cache_loc = out_cache_loc[accept_index]
-    extended_len = seq_lens + draft_token_num
-    keep_len = np.minimum(
-        (seq_lens + accept_length + 1 + page_size - 1) // page_size * page_size,
-        extended_len,
-    )
-    to_free_num_slots = extended_len - keep_len
-    return src_cache_loc, to_free_num_slots
-
-
-def create_accept_length_filter(
-    accept_length: np.ndarray,
-    unfinished_index_device: np.ndarray,
-    seq_lens: np.ndarray,
-):
-    accept_length_filter = jnp.zeros_like(accept_length)
-    accept_length_filter[unfinished_index_device] = accept_length[unfinished_index_device] + 1
-    seq_lens.add_(accept_length + 1)
-    return accept_length_filter
-
-
 def assign_req_to_token_pool(
     req_pool_indices,
     req_to_token_pool,
