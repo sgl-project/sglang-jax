@@ -65,8 +65,8 @@ def _reinterpret_dtype_if_needed(data: np.ndarray, target_dtype: jnp.dtype) -> n
 
 @dataclass
 class WeightMapping:
-    target_path: str | list[str] | tuple[str]
-    sharding: tuple[Any] | tuple[Any, Any] | None = None
+    target_path: str | list[str]
+    sharding: tuple[Any, ...] | None = None
     transpose: bool = False
     transpose_axes: tuple[int, ...] | None = (
         None  # For multi-dimensional transpose (e.g., conv weights)
@@ -1921,8 +1921,10 @@ class WeightLoader:
 
                 infos = weight_info[hf_key]
 
-                if not isinstance(mapping, WeightMapping):
+                if isinstance(mapping, str | list):
                     mapping = WeightMapping(target_path=mapping)
+                elif not isinstance(mapping, WeightMapping):
+                    raise TypeError("Unsupported mapping type:", type(mapping))
 
                 is_split_weight = len(infos) > 1 and mapping.concat_axis is not None
 
@@ -2300,8 +2302,10 @@ class WeightLoader:
 
         for hf_key, mapping in regular_mappings.items():
 
-            if not isinstance(mapping, WeightMapping):
+            if isinstance(mapping, str | list):
                 mapping = WeightMapping(target_path=mapping)
+            elif not isinstance(mapping, WeightMapping):
+                raise TypeError("Unsupported mapping type:", type(mapping))
 
             target_path = (
                 mapping.target_path
@@ -2360,8 +2364,10 @@ class WeightLoader:
             )
 
         for moe_key, mapping in moe_mappings.items():
-            if not isinstance(mapping, WeightMapping):
+            if isinstance(mapping, str | list):
                 mapping = WeightMapping(target_path=mapping)
+            elif not isinstance(mapping, WeightMapping):
+                raise TypeError("Unsupported mapping type:", type(mapping))
 
             target_path = mapping.target_path[0]
 

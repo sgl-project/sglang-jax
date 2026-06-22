@@ -195,18 +195,19 @@ def get_available_device_memory(
     return int(free_gpu_memory * (1 << 10))
 
 
-def device_array(*data, sharding=None, **kwargs) -> jax.Array:
+def device_array(data, sharding=None, **kwargs) -> jax.Array:
     if sharding is None:
         return jax.device_put(data, device=sharding, **kwargs)
 
     def _to_device(arr):
+        arr = np.asarray(arr)
+
         def fn(idx, a=arr):
             return a[idx]
 
-        arr = np.asarray(arr)
         return jax.make_array_from_callback(arr.shape, sharding, fn)
 
-    return jax.tree.map(_to_device, *data)
+    return jax.tree.map(_to_device, data)
 
 
 _IS_TPU_RUNTIME_CACHED: bool | None = None
