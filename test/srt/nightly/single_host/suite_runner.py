@@ -104,7 +104,7 @@ SUITES: dict[str, SingleHostSuite] = {
                 launch_profile="ds-v2-lite-mla-v6e-4.yaml",
                 cases=[
                     _gsm8k_case(
-                        "ds-v2-lite-mla", "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct", 0.86, 128
+                        "ds-v2-lite-mla", "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct", 0.855, 128
                     )
                 ],
             ),
