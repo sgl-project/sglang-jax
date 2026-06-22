@@ -47,7 +47,7 @@ TUNED_BT: dict[str, dict[tuple, int]] = {
         (512, 256, 8, 4, 8): 512,
         (1024, 256, 8, 4, 8): 1024,
         (2048, 256, 8, 4, 8): 2048,
-        (4096, 256, 8, 4, 8): 4096,  # fits as a single block (grid=1, no double-buffer)
+        (4096, 256, 8, 4, 8): 2048,  # BT=4096 exceeds v7x scoped VMEM with padded outputs
         (8192, 256, 8, 4, 8): 2048,  # multi-block double-buffer caps BT at 2048
         (16384, 256, 8, 4, 8): 2048,
         (32768, 256, 8, 4, 8): 2048,
