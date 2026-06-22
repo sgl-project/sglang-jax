@@ -37,7 +37,7 @@ from sgl_jax.srt.disaggregation.common.metrics import (
 )
 from sgl_jax.srt.disaggregation.common.zmq_notifier import ZmqPullNotifier
 from sgl_jax.srt.disaggregation.jax_transfer.wrapper import JaxTransferWrapper
-from sgl_jax.srt.mem_cache.host_kv_pool import HostKVPool, StagedData
+from sgl_jax.srt.mem_cache.queue_host_kv_pool import HostKVPool, StagedData
 
 __all__ = [
     "JaxTransferKVManager",
