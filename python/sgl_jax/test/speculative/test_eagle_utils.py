@@ -85,9 +85,7 @@ class TestVerifyTree(CustomTestCase):
         np.testing.assert_array_equal(np.asarray(packed), expected)
 
     def test_fused_chain_verify_matches_topk1_linear_reference(self):
-        from sgl_jax.srt.speculative.draft_extend_fused import (
-            _greedy_sample_and_prepare_draft_inputs_chain_from_predict,
-        )
+        from sgl_jax.srt.speculative.draft_extend_fused import _verify_greedy
 
         speculative_num_steps = 3
         num_draft_tokens = 4
@@ -134,7 +132,7 @@ class TestVerifyTree(CustomTestCase):
             ],
             dtype=np.int32,
         )
-        chain = _greedy_sample_and_prepare_draft_inputs_chain_from_predict(
+        chain = _verify_greedy(
             target_hidden=jnp.arange(bs * num_draft_tokens * 2, dtype=jnp.float32).reshape(
                 bs * num_draft_tokens, 2
             ),
@@ -160,11 +158,9 @@ class TestVerifyTree(CustomTestCase):
         )
 
     def test_fused_chain_verify_zeroes_padding_accept_length(self):
-        from sgl_jax.srt.speculative.draft_extend_fused import (
-            _greedy_sample_and_prepare_draft_inputs_chain_from_predict,
-        )
+        from sgl_jax.srt.speculative.draft_extend_fused import _verify_greedy
 
-        out = _greedy_sample_and_prepare_draft_inputs_chain_from_predict(
+        out = _verify_greedy(
             target_hidden=jnp.arange(8 * 2, dtype=jnp.float32).reshape(8, 2),
             positions=jnp.arange(8, dtype=jnp.int32),
             seq_lens=jnp.array([0, 10], dtype=jnp.int32),
@@ -179,11 +175,9 @@ class TestVerifyTree(CustomTestCase):
         np.testing.assert_array_equal(np.asarray(out.sel_pos), np.array([0, 2]))
 
     def test_greedy_prepare_uses_original_seq_lens_for_new_seq_lens(self):
-        from sgl_jax.srt.speculative.draft_extend_fused import (
-            _greedy_prepare_draft_inputs,
-        )
+        from sgl_jax.srt.speculative.draft_extend_fused import _prepare_draft_inputs
 
-        out = _greedy_prepare_draft_inputs(
+        out = _prepare_draft_inputs(
             hidden_states=jnp.arange(12 * 2, dtype=jnp.float32).reshape(12, 2),
             positions=jnp.arange(12, dtype=jnp.int32),
             seq_lens=jnp.array([103, 303], dtype=jnp.int32),

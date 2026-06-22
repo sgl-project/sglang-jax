@@ -1,7 +1,7 @@
 import numpy as np
 
 
-def resolve_spec_prefill_token_ids(result, batch, relay_buffers, mesh):
+def resolve_spec_prefill_token_ids(result):
     """Resolve prefill next-token ids prepared by the producer path."""
     token_ids_arr = result.next_token_ids
     if token_ids_arr is None:

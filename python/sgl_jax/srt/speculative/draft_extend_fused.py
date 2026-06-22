@@ -2,17 +2,18 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from functools import partial
 from typing import NamedTuple
 
 import jax
-import jax._src.test_util as jtu
 import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
+from sgl_jax.srt.kernels.speculative.kernel import top_k_renorm_prob, top_p_renorm_prob
 from sgl_jax.srt.speculative.relay_buffer import (
     gather_spec_relay_buffers,
     make_dp_valid_mask,
@@ -52,6 +53,17 @@ class FusedDraftExtendPendingResult(NamedTuple):
     updated_relay_buffers: object | None
 
 
+@contextmanager
+def _count_pjit_cpp_cache_miss():
+    try:
+        import jax._src.test_util as jtu
+    except (ImportError, ModuleNotFoundError):
+        yield lambda: 0
+        return
+    with jtu.count_pjit_cpp_cache_miss() as count:
+        yield count
+
+
 def _prepare_spec_prefill_output_token_ids(draft_worker, next_token_ids):
     if draft_worker.mesh is None:
         return next_token_ids
@@ -71,7 +83,7 @@ def _take_with_index_sharding(values, index):
     return jnp.take(values.reshape(-1), index)
 
 
-def _greedy_prepare_draft_inputs(
+def _prepare_draft_inputs(
     hidden_states,
     positions,
     seq_lens,
@@ -114,7 +126,7 @@ def _greedy_prepare_draft_inputs(
     )
 
 
-def _greedy_sample_and_prepare_draft_inputs_chain_from_predict(
+def _verify_greedy(
     *,
     target_hidden,
     positions,
@@ -155,7 +167,7 @@ def _greedy_sample_and_prepare_draft_inputs_chain_from_predict(
     safe_index = jnp.where(accept_index >= 0, accept_index, per_req_last)
     safe_predict = _take_with_index_sharding(predict, safe_index)
     verified_id = jnp.where(accept_index >= 0, safe_predict, jnp.zeros_like(safe_predict))
-    prepared = _greedy_prepare_draft_inputs(
+    prepared = _prepare_draft_inputs(
         target_hidden,
         positions,
         seq_lens,
@@ -178,7 +190,139 @@ def _greedy_sample_and_prepare_draft_inputs_chain_from_predict(
     )
 
 
-def _build_topk1_chain_verify_inputs_device_tuple(
+def _verify_rejection_sampling(
+    *,
+    target_hidden,
+    positions,
+    seq_lens,
+    draft_tokens,
+    target_logits,
+    temperatures,
+    top_ks,
+    top_ps,
+    coins,
+    coin_f,
+    threshold_single,
+    threshold_acc,
+    enable_top_k,
+    enable_top_p,
+    speculative_num_steps,
+    speculative_num_draft_tokens,
+):
+    """Non-greedy counterpart of the greedy chain verify.
+
+    Mirrors `tree_speculative_sampling_target_only` (eagle_util.py) for the
+    pure topk=1 chain: target-only typical acceptance. Accepted slots emit the
+    accepted draft token; the first rejected slot samples from the residual
+    target distribution, while the all-accepted bonus slot samples from the
+    full target distribution.
+    """
+    bs = seq_lens.shape[0]
+    n = speculative_num_draft_tokens
+    width = speculative_num_steps + 1
+    vocab = target_logits.shape[-1]
+
+    # v1: replicate the working set so explicit-sharding never has to resolve
+    # gather/cumsum shardings. Correctness over speed for now. top_k/top_p TODO.
+    sh = jax.typeof(target_logits).sharding
+    mesh = sh.mesh if isinstance(sh, NamedSharding) else None
+
+    def _rep(x):
+        return jax.sharding.reshard(x, NamedSharding(mesh, P())) if mesh is not None else x
+
+    tl = _rep(target_logits.astype(jnp.float32))
+    draft_2d = _rep(draft_tokens.reshape(bs, n).astype(jnp.int32))
+    seq_lens_r = _rep(seq_lens.astype(jnp.int32))
+    temp = _rep(temperatures.reshape(bs, 1).astype(jnp.float32))
+    coins_r = _rep(coins.astype(jnp.float32))
+    coin_f_r = _rep(coin_f.astype(jnp.float32))
+
+    # target probs: temperature scale, then optional top_k/top_p renorm.
+    # Everything is replicated here, so the renorm kernels behave exactly like
+    # the non-overlap reference path (eagle_util.sample) when enabled.
+    probs_3d = jax.nn.softmax(tl.reshape(bs, n, vocab) / temp[:, :, None], axis=-1)
+    probs_2d = probs_3d.reshape(bs * n, vocab)
+    if enable_top_k:
+        tk = _rep(top_ks.astype(jnp.int32))
+        tk_flat = jnp.broadcast_to(tk[:, None], (bs, n)).reshape(bs * n)
+        probs_2d = top_k_renorm_prob(probs_2d, tk_flat)
+    if enable_top_p:
+        tp = _rep(top_ps.astype(jnp.float32))
+        tp_flat = jnp.broadcast_to(tp[:, None], (bs, n)).reshape(bs * n)
+        probs_2d = top_p_renorm_prob(probs_2d, tp_flat)
+    probs_3d = probs_2d.reshape(bs, n, vocab)
+
+    cand = draft_2d[:, 1:]  # (bs, n-1) candidate tokens d1..d_{n-1}
+    p_cand = jnp.take_along_axis(probs_3d[:, : n - 1, :], cand[:, :, None], axis=-1)[:, :, 0]
+
+    accept_mask = (coins_r <= p_cand / threshold_acc) | (p_cand >= threshold_single)
+
+    is_padding = seq_lens_r == 0
+    accepted_children = jnp.cumprod(accept_mask.astype(jnp.int32), axis=1).astype(jnp.bool_)
+    accepted_children = jnp.where(is_padding[:, None], False, accepted_children)
+    accept_length_raw = jnp.sum(accepted_children.astype(jnp.int32), axis=1)
+    accept_length = jnp.where(is_padding, 0, accept_length_raw + 1)
+
+    # residual / bonus sampling at emit position = accept_length_raw
+    emit_pos = accept_length_raw.astype(jnp.int32)  # (bs,) in [0, n-1]
+    p_emit = jnp.take_along_axis(probs_3d, emit_pos[:, None, None], axis=1)[:, 0, :]  # (bs, vocab)
+    has_rejected_child = emit_pos < (n - 1)
+    safe_reject_pos = jnp.minimum(emit_pos, n - 2)
+    rejected_token = jnp.take_along_axis(cand, safe_reject_pos[:, None], axis=1)[:, 0]
+    vocab_ids = jnp.arange(vocab, dtype=jnp.int32)[None, :]
+    residual_probs = jnp.where(vocab_ids == rejected_token[:, None], 0.0, p_emit)
+    final_probs = jnp.where(has_rejected_child[:, None], residual_probs, p_emit)
+    cdf = jnp.cumsum(final_probs, axis=-1)
+    u = coin_f_r * cdf[:, -1]
+    sampled = jnp.sum((cdf <= u[:, None]).astype(jnp.int32), axis=-1).astype(jnp.int32)
+    sampled = jnp.minimum(sampled, jnp.int32(vocab - 1))  # (bs,)
+
+    # predict_2d[:, k] = cand[:, k] (=d_{k+1}); override emit_pos slot with sampled
+    predict_2d = jnp.concatenate([cand, jnp.zeros((bs, 1), dtype=jnp.int32)], axis=1).astype(
+        jnp.int32
+    )
+    predict_2d = predict_2d.at[jnp.arange(bs), emit_pos].set(sampled)
+    predict = predict_2d.reshape(-1)
+
+    # --- accept_index machinery (identical to greedy path) ---
+    row_ids = jnp.arange(bs, dtype=jnp.int32)
+    base = row_ids[:, None] * n
+    child_offsets = jnp.arange(1, width, dtype=jnp.int32)[None, :]
+    accept_index_children = jnp.where(accepted_children, base + child_offsets, -1)
+    accept_index_2d = jnp.concatenate([base, accept_index_children], axis=1)
+    accept_index_2d = jnp.where(is_padding[:, None], -1, accept_index_2d)
+    accept_index = accept_index_2d.reshape(-1)
+
+    accept_width = speculative_num_steps + 1
+    req_ids = jnp.arange(accept_index.shape[0], dtype=jnp.int32) // accept_width
+    per_req_last = req_ids * speculative_num_draft_tokens + speculative_num_draft_tokens - 1
+    safe_index = jnp.where(accept_index >= 0, accept_index, per_req_last)
+    safe_predict = _take_with_index_sharding(predict, safe_index)
+    verified_id = jnp.where(accept_index >= 0, safe_predict, jnp.zeros_like(safe_predict))
+    prepared = _prepare_draft_inputs(
+        target_hidden,
+        positions,
+        seq_lens,
+        accept_index,
+        accept_length,
+        verified_id,
+        speculative_num_steps=speculative_num_steps,
+        speculative_num_draft_tokens=speculative_num_draft_tokens,
+    )
+    return GreedySampleAndPrepareOutput(
+        hidden_states=prepared.hidden_states,
+        positions=prepared.positions,
+        new_seq_lens=prepared.new_seq_lens,
+        select_index=prepared.select_index,
+        safe_index=safe_index,
+        verified_id=prepared.verified_id,
+        accept_lens=prepared.accept_lens,
+        sel_pos=prepared.sel_pos,
+        predict=predict,
+    )
+
+
+def _build_chain_verify_arrays(
     *,
     verified_id,
     token_list,
@@ -210,7 +354,7 @@ def _build_topk1_chain_verify_inputs_device_tuple(
     )
 
 
-def _device_rotate_input_ids(input_ids, ext_lens, sel_pos, new_tokens):
+def _rotate_input_ids(input_ids, ext_lens, sel_pos, new_tokens):
     """Mirror MultiLayerDraftWorker._rotate_ids on device for topk=1."""
     bs = ext_lens.shape[0]
     tokens_per_req = input_ids.shape[0] // bs
@@ -225,7 +369,7 @@ def _device_rotate_input_ids(input_ids, ext_lens, sel_pos, new_tokens):
     return shifted_2d.reshape(-1)
 
 
-def _device_rotate_prefill_input_ids(input_ids, extend_seq_lens, verified_id, dp_size, per_dp_bs):
+def _rotate_prefill_input_ids(input_ids, extend_seq_lens, verified_id, dp_size, per_dp_bs):
     per_dp_tokens = input_ids.shape[0] // dp_size
     ids = input_ids.reshape(dp_size, per_dp_tokens)
     ext = extend_seq_lens.reshape(dp_size, per_dp_bs)
@@ -257,12 +401,16 @@ def _gather_rows_preserve_sharding(values, index):
     return values[index, :]
 
 
+def _reshard_values(sharding, *values):
+    return tuple(jax.sharding.reshard(value, sharding) for value in values)
+
+
 def _topk1_index_from_logits(logits):
     topk_idx = jnp.argmax(logits, axis=-1).astype(jnp.int32)[:, None]
     return topk_idx
 
 
-def _build_fused_draft_extend_jit(num_layers: int, topk: int):
+def _build_draft_extend(num_layers: int, topk: int):
     """Build the fused JIT. Called once, result cached on draft_worker."""
     assert topk == 1, "Fused draft extend only supports topk=1"
 
@@ -305,14 +453,12 @@ def _build_fused_draft_extend_jit(num_layers: int, topk: int):
                 draft_verify_seq_lens + num_layers,
                 jnp.zeros_like(draft_verify_seq_lens),
             )
-            forward_batch.attn_backend.forward_metadata = (
-                _make_draft_extend_metadata_from_device_seq_lens(
-                    forward_batch.attn_backend.forward_metadata,
-                    forward_batch.seq_lens,
-                    draft_allocate_lens,
-                    page_size=forward_batch.attn_backend.page_size,
-                    dp_size=dp_size,
-                )
+            forward_batch.attn_backend.forward_metadata = _make_draft_extend_metadata(
+                forward_batch.attn_backend.forward_metadata,
+                forward_batch.seq_lens,
+                draft_allocate_lens,
+                page_size=forward_batch.attn_backend.page_size,
+                dp_size=dp_size,
             )
 
         for i in range(num_layers):
@@ -336,7 +482,7 @@ def _build_fused_draft_extend_jit(num_layers: int, topk: int):
 
             if i < num_layers - 1:
                 ext_lens = forward_batch.extend_seq_lens
-                input_ids = _device_rotate_input_ids(input_ids, ext_lens, sel_pos, topk_idx[:, 0])
+                input_ids = _rotate_input_ids(input_ids, ext_lens, sel_pos, topk_idx[:, 0])
 
         last_idx = draft_logits_indices
         if logits_metadata.accept_lens is not None:
@@ -391,13 +537,13 @@ def _build_fused_draft_extend_jit(num_layers: int, topk: int):
 def _per_dp_cumsum_device(lens, dp_size: int):
     per_dp_bs = lens.shape[0] // dp_size
     lens_2d = lens.reshape((dp_size, per_dp_bs))
-    zeros = jnp.zeros((dp_size, 1), dtype=jnp.int32)
+    zeros = jnp.zeros_like(lens_2d[:, :1], dtype=jnp.int32)
     return jnp.concatenate([zeros, jnp.cumsum(lens_2d, axis=1, dtype=jnp.int32)], axis=1).reshape(
         (dp_size * (per_dp_bs + 1),)
     )
 
 
-def _repack_page_indices_from_allocated_lens(
+def _repack_page_indices(
     page_indices,
     allocated_lens,
     metadata_seq_lens,
@@ -448,7 +594,7 @@ def _repack_page_indices_from_allocated_lens(
     return jnp.where(valid, gathered, jnp.zeros_like(gathered)).reshape(page_indices.shape)
 
 
-def _make_target_verify_metadata_from_device_seq_lens(
+def _make_target_verify_metadata(
     old_metadata,
     verify_seq_lens,
     allocated_lens,
@@ -471,7 +617,7 @@ def _make_target_verify_metadata_from_device_seq_lens(
     metadata_seq_lens = verify_seq_lens + extend_seq_lens
     aligned_seq_lens = ((metadata_seq_lens + page_size - 1) // page_size) * page_size
     cu_kv_lens = _per_dp_cumsum_device(aligned_seq_lens, dp_size)
-    page_indices = _repack_page_indices_from_allocated_lens(
+    page_indices = _repack_page_indices(
         old_metadata.page_indices,
         allocated_lens,
         metadata_seq_lens,
@@ -480,7 +626,7 @@ def _make_target_verify_metadata_from_device_seq_lens(
     )
     swa_page_indices = None
     if old_metadata.swa_page_indices is not None:
-        swa_page_indices = _repack_page_indices_from_allocated_lens(
+        swa_page_indices = _repack_page_indices(
             old_metadata.swa_page_indices,
             allocated_lens,
             metadata_seq_lens,
@@ -506,7 +652,7 @@ def _make_target_verify_metadata_from_device_seq_lens(
     )
 
 
-def _make_draft_extend_metadata_from_device_seq_lens(
+def _make_draft_extend_metadata(
     old_metadata,
     draft_seq_lens,
     allocated_lens,
@@ -525,7 +671,7 @@ def _make_draft_extend_metadata_from_device_seq_lens(
     cu_q_lens = old_metadata.cu_q_lens
     aligned_seq_lens = ((draft_seq_lens + page_size - 1) // page_size) * page_size
     cu_kv_lens = _per_dp_cumsum_device(aligned_seq_lens, dp_size)
-    page_indices = _repack_page_indices_from_allocated_lens(
+    page_indices = _repack_page_indices(
         old_metadata.page_indices,
         allocated_lens,
         draft_seq_lens,
@@ -534,7 +680,7 @@ def _make_draft_extend_metadata_from_device_seq_lens(
     )
     swa_page_indices = None
     if old_metadata.swa_page_indices is not None:
-        swa_page_indices = _repack_page_indices_from_allocated_lens(
+        swa_page_indices = _repack_page_indices(
             old_metadata.swa_page_indices,
             allocated_lens,
             draft_seq_lens,
@@ -560,7 +706,7 @@ def _make_draft_extend_metadata_from_device_seq_lens(
     )
 
 
-def _build_fused_greedy_verify_jit(topk: int):
+def _build_verify(topk: int):
     """Build target verify JIT for greedy NEXTN decode."""
     assert topk == 1, "Fused greedy verify only supports topk=1"
 
@@ -574,9 +720,14 @@ def _build_fused_greedy_verify_jit(topk: int):
             "return_target_logits",
             "use_relay_state",
             "dp_size",
+            "is_greedy",
+            "threshold_single",
+            "threshold_acc",
+            "enable_top_k",
+            "enable_top_p",
         ],
     )
-    def fused_greedy_verify(
+    def fused_verify(
         target_model_def,
         target_model_state_def,
         target_leaves,
@@ -588,12 +739,22 @@ def _build_fused_greedy_verify_jit(topk: int):
         relay_buffers,
         relay_future_indices,
         verify_allocate_lens,
+        sampling_base_rng,
+        sampling_step,
+        temperatures,
+        top_ks,
+        top_ps,
         *,
         speculative_num_steps,
         speculative_num_draft_tokens,
         return_target_logits,
         use_relay_state,
         dp_size,
+        is_greedy=True,
+        threshold_single=1.0,
+        threshold_acc=1.0,
+        enable_top_k=False,
+        enable_top_p=False,
     ):
         if use_relay_state:
             relay_topk_index, _, relay_verified_id, relay_new_seq_lens = gather_spec_relay_buffers(
@@ -607,15 +768,13 @@ def _build_fused_greedy_verify_jit(topk: int):
                 relay_new_seq_lens - 1,
                 jnp.zeros_like(target_forward_batch.seq_lens),
             )
-            target_forward_batch.attn_backend.forward_metadata = (
-                _make_target_verify_metadata_from_device_seq_lens(
-                    target_forward_batch.attn_backend.forward_metadata,
-                    target_forward_batch.seq_lens,
-                    verify_allocate_lens,
-                    speculative_num_draft_tokens=speculative_num_draft_tokens,
-                    page_size=target_forward_batch.attn_backend.page_size,
-                    dp_size=dp_size,
-                )
+            target_forward_batch.attn_backend.forward_metadata = _make_target_verify_metadata(
+                target_forward_batch.attn_backend.forward_metadata,
+                target_forward_batch.seq_lens,
+                verify_allocate_lens,
+                speculative_num_draft_tokens=speculative_num_draft_tokens,
+                page_size=target_forward_batch.attn_backend.page_size,
+                dp_size=dp_size,
             )
             previous_verified_id = relay_verified_id
             previous_token_list = relay_topk_index
@@ -627,7 +786,7 @@ def _build_fused_greedy_verify_jit(topk: int):
             retrive_index_flat,
             retrive_next_token_flat,
             retrive_next_sibling_flat,
-        ) = _build_topk1_chain_verify_inputs_device_tuple(
+        ) = _build_chain_verify_arrays(
             verified_id=previous_verified_id,
             token_list=previous_token_list,
             seq_lens=target_forward_batch.seq_lens,
@@ -662,17 +821,49 @@ def _build_fused_greedy_verify_jit(topk: int):
         mesh = sh.mesh if isinstance(sh, NamedSharding) else None
         target_logits = target_output.next_token_logits
         target_hidden = target_output.hidden_states
-        target_predict = jnp.argmax(target_logits, axis=-1).astype(jnp.int32).reshape(-1)
-
-        prepared = _greedy_sample_and_prepare_draft_inputs_chain_from_predict(
-            target_hidden=target_hidden,
-            positions=target_forward_batch.positions,
-            seq_lens=target_forward_batch.seq_lens,
-            draft_tokens=draft_tokens,
-            target_predict=target_predict,
-            speculative_num_steps=speculative_num_steps,
-            speculative_num_draft_tokens=speculative_num_draft_tokens,
-        )
+        if is_greedy:
+            target_predict = jnp.argmax(target_logits, axis=-1).astype(jnp.int32).reshape(-1)
+            prepared = _verify_greedy(
+                target_hidden=target_hidden,
+                positions=target_forward_batch.positions,
+                seq_lens=target_forward_batch.seq_lens,
+                draft_tokens=draft_tokens,
+                target_predict=target_predict,
+                speculative_num_steps=speculative_num_steps,
+                speculative_num_draft_tokens=speculative_num_draft_tokens,
+            )
+        else:
+            # Generate rejection-sampling coins inside the JIT: avoids building them
+            # on host and copying (tbs, n-1)+(tbs,) arrays in every step, and keeps
+            # the threefry/uniform ops fused into this module instead of becoming
+            # standalone eager dispatches (the reason the earlier host-side jax.random
+            # attempt was reverted).
+            sampling_rng = jax.random.fold_in(sampling_base_rng, sampling_step)
+            coins_key, coin_f_key = jax.random.split(sampling_rng)
+            coins = jax.random.uniform(
+                coins_key,
+                (target_bs, speculative_num_draft_tokens - 1),
+                dtype=jnp.float32,
+            )
+            coin_f = jax.random.uniform(coin_f_key, (target_bs,), dtype=jnp.float32)
+            prepared = _verify_rejection_sampling(
+                target_hidden=target_hidden,
+                positions=target_forward_batch.positions,
+                seq_lens=target_forward_batch.seq_lens,
+                draft_tokens=draft_tokens,
+                target_logits=target_logits,
+                temperatures=temperatures,
+                top_ks=top_ks,
+                top_ps=top_ps,
+                coins=coins,
+                coin_f=coin_f,
+                threshold_single=threshold_single,
+                threshold_acc=threshold_acc,
+                enable_top_k=enable_top_k,
+                enable_top_p=enable_top_p,
+                speculative_num_steps=speculative_num_steps,
+                speculative_num_draft_tokens=speculative_num_draft_tokens,
+            )
 
         target_logits_for_host = (
             _gather_rows_preserve_sharding(target_logits, prepared.safe_index)
@@ -681,27 +872,74 @@ def _build_fused_greedy_verify_jit(topk: int):
         )
         prepared_hidden = prepared.hidden_states
         prepared_verified_id = prepared.verified_id
+        prepared_verified_id_data = prepared.verified_id
         prepared_next_verified_id = _take_with_index_sharding(
             prepared.verified_id, prepared.select_index
         )
         prepared_new_seq_lens = prepared.new_seq_lens
-        prepared_accept_lens = prepared.accept_lens
+        prepared_accept_lens_host = prepared.accept_lens
+        prepared_accept_lens_data = prepared.accept_lens
+        prepared_extend_seq_lens = jnp.where(
+            target_forward_batch.seq_lens > 0,
+            jnp.full_like(target_forward_batch.seq_lens, speculative_num_draft_tokens),
+            jnp.zeros_like(target_forward_batch.seq_lens),
+        ).astype(jnp.int32)
+        prepared_logits_indices = (
+            jnp.cumsum(
+                prepared_extend_seq_lens.reshape(dp_size, target_bs // dp_size),
+                axis=1,
+            ).reshape(-1)
+            - 1
+        ).astype(jnp.int32)
         prepared_sel_pos = prepared.sel_pos
+        prepared_sel_pos_data = prepared.sel_pos
         prepared_predict = prepared.predict
         prepared_positions = prepared.positions
+        prepared_positions_data = prepared.positions
         prepared_verify_seq_lens = target_forward_batch.seq_lens
+        prepared_allocate_lens_data = verify_allocate_lens
 
         if mesh is not None:
             rep = NamedSharding(mesh, P())
             data = NamedSharding(mesh, P("data"))
-            prepared_hidden = jax.sharding.reshard(prepared_hidden, rep)
-            prepared_verified_id = jax.sharding.reshard(prepared_verified_id, rep)
-            prepared_next_verified_id = jax.sharding.reshard(prepared_next_verified_id, data)
-            prepared_new_seq_lens = jax.sharding.reshard(prepared_new_seq_lens, rep)
-            prepared_accept_lens = jax.sharding.reshard(prepared_accept_lens, rep)
-            prepared_sel_pos = jax.sharding.reshard(prepared_sel_pos, rep)
-            prepared_predict = jax.sharding.reshard(prepared_predict, rep)
-            prepared_positions = jax.sharding.reshard(prepared_positions, rep)
+            (
+                prepared_hidden,
+                prepared_verified_id,
+                prepared_new_seq_lens,
+                prepared_accept_lens_host,
+                prepared_sel_pos,
+                prepared_predict,
+                prepared_positions,
+            ) = _reshard_values(
+                rep,
+                prepared_hidden,
+                prepared_verified_id,
+                prepared_new_seq_lens,
+                prepared_accept_lens_host,
+                prepared_sel_pos,
+                prepared_predict,
+                prepared_positions,
+            )
+            (
+                prepared_verified_id_data,
+                prepared_next_verified_id,
+                prepared_accept_lens_data,
+                prepared_extend_seq_lens,
+                prepared_logits_indices,
+                prepared_sel_pos_data,
+                prepared_positions_data,
+                prepared_allocate_lens_data,
+            ) = _reshard_values(
+                data,
+                prepared_verified_id_data,
+                prepared_next_verified_id,
+                prepared_accept_lens_data,
+                prepared_extend_seq_lens,
+                prepared_logits_indices,
+                prepared_sel_pos_data,
+                prepared_positions_data,
+                prepared_allocate_lens_data,
+            )
             if return_target_logits:
                 target_logits_for_host = jax.sharding.reshard(target_logits_for_host, rep)
 
@@ -709,20 +947,27 @@ def _build_fused_greedy_verify_jit(topk: int):
             target_pool_updates,
             prepared_hidden,
             prepared_verified_id,
+            prepared_verified_id_data,
             prepared_next_verified_id,
             prepared_new_seq_lens,
-            prepared_accept_lens,
+            prepared_accept_lens_host,
+            prepared_accept_lens_data,
+            prepared_extend_seq_lens,
+            prepared_logits_indices,
             prepared_sel_pos,
+            prepared_sel_pos_data,
             prepared_predict,
             prepared_positions,
+            prepared_positions_data,
             prepared_verify_seq_lens,
+            prepared_allocate_lens_data,
             target_logits_for_host,
         )
 
-    return fused_greedy_verify
+    return fused_verify
 
 
-def _build_fused_greedy_prefill_jit(num_layers: int, topk: int):
+def _build_prefill(num_layers: int, topk: int):
     """Build prefill JIT: target extend + all MTP draft-extend layers."""
     assert topk == 1, "Fused greedy prefill only supports topk=1"
 
@@ -738,7 +983,7 @@ def _build_fused_greedy_prefill_jit(num_layers: int, topk: int):
             "update_relay",
         ],
     )
-    def fused_greedy_prefill(
+    def fused_prefill(
         target_model_def,
         target_model_state_def,
         target_leaves,
@@ -772,7 +1017,7 @@ def _build_fused_greedy_prefill_jit(num_layers: int, topk: int):
         target_logits = target_output.next_token_logits
         target_hidden = target_output.hidden_states
         next_token_ids = jnp.argmax(target_logits, axis=-1).astype(jnp.int32)
-        input_ids = _device_rotate_prefill_input_ids(
+        input_ids = _rotate_prefill_input_ids(
             draft_forward_batch.input_ids,
             draft_forward_batch.extend_seq_lens,
             next_token_ids,
@@ -804,7 +1049,7 @@ def _build_fused_greedy_prefill_jit(num_layers: int, topk: int):
             if i == 0:
                 layer0_hidden = output.hidden_states
             if i < num_layers - 1:
-                input_ids = _device_rotate_prefill_input_ids(
+                input_ids = _rotate_prefill_input_ids(
                     input_ids,
                     draft_forward_batch.extend_seq_lens,
                     topk_idx[:, 0],
@@ -856,10 +1101,10 @@ def _build_fused_greedy_prefill_jit(num_layers: int, topk: int):
             updated_relay_buffers,
         )
 
-    return fused_greedy_prefill
+    return fused_prefill
 
 
-def _prepare_topk1_verify_placeholders_from_draft_state(draft_worker, model_worker_batch):
+def _prepare_verify(draft_worker, model_worker_batch):
     """Prepare fixed-shape verify placeholders while keeping chain build inside JIT."""
     from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode
     from sgl_jax.srt.speculative.eagle_util import EagleVerifyInput
@@ -927,19 +1172,19 @@ def _prepare_topk1_verify_placeholders_from_draft_state(draft_worker, model_work
     return previous_verified_id, previous_token_list
 
 
-def _device_array_preserve_device(value, sharding):
+def _prepare_device_array(value, sharding, name: str | None = None):
     from sgl_jax.srt.utils.jax_utils import device_array
 
     if value is None:
         return None
     if isinstance(value, jax.Array):
+        if value.sharding == sharding:
+            return value
         return jax.device_put(value, sharding)
     return device_array(value, sharding=sharding)
 
 
-def _logits_metadata_from_model_worker_batch_preserve_device(
-    batch, mesh, *, include_accept_lens: bool = True
-):
+def _prepare_logits_metadata(batch, mesh, *, include_accept_lens: bool = True):
     from sgl_jax.srt.layers.logits_processor import LogitsMetadata
 
     sharding = NamedSharding(mesh, P("data"))
@@ -955,43 +1200,75 @@ def _logits_metadata_from_model_worker_batch_preserve_device(
         extend_return_logprob=False,
         extend_return_top_logprob=False,
         extend_token_ids_logprob=False,
-        extend_seq_lens=_device_array_preserve_device(batch.extend_seq_lens, sharding),
-        logits_indices=_device_array_preserve_device(batch.logits_indices, sharding),
-        accept_lens=_device_array_preserve_device(accept_lens, sharding),
+        extend_seq_lens=_prepare_device_array(
+            batch.extend_seq_lens, sharding, "logits.extend_seq_lens"
+        ),
+        logits_indices=_prepare_device_array(
+            batch.logits_indices, sharding, "logits.logits_indices"
+        ),
+        accept_lens=_prepare_device_array(accept_lens, sharding, "logits.accept_lens"),
         extend_seq_lens_cpu=None,
         extend_logprob_start_lens_cpu=None,
         extend_logprob_pruned_lens_cpu=None,
         top_logprobs_nums=getattr(batch, "top_logprobs_nums", None),
         token_ids_logprobs=getattr(batch, "token_ids_logprobs", None),
-        extend_input_logprob_token_ids_device=_device_array_preserve_device(
-            getattr(batch, "extend_input_logprob_token_ids", None), sharding
+        extend_input_logprob_token_ids_device=_prepare_device_array(
+            getattr(batch, "extend_input_logprob_token_ids", None),
+            sharding,
+            "logits.extend_input_logprob_token_ids",
         ),
     )
 
 
-def _forward_batch_init_new_preserve_device(batch, model_runner):
+def _make_forward_batch(batch, model_runner):
     from sgl_jax.srt.eplb.expert_location import get_global_expert_location_metadata
     from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 
     data_sharding = NamedSharding(model_runner.mesh, P("data"))
     replicated_2d = NamedSharding(model_runner.mesh, P(None, None))
+    spec_info = getattr(batch, "spec_info_padded", None)
+    input_ids = (
+        getattr(spec_info, "verified_id_for_draft_extend", None) if spec_info is not None else None
+    )
+    if input_ids is None:
+        input_ids = batch.input_ids
+    positions = (
+        getattr(spec_info, "positions_for_draft_extend", None) if spec_info is not None else None
+    )
+    if positions is None:
+        positions = batch.positions
+    extend_seq_lens = (
+        getattr(spec_info, "extend_seq_lens_for_draft_extend", None)
+        if spec_info is not None
+        else None
+    )
+    if extend_seq_lens is None:
+        extend_seq_lens = batch.extend_seq_lens
 
-    input_embedding = _device_array_preserve_device(batch.input_embedding, replicated_2d)
+    input_embedding = _prepare_device_array(
+        batch.input_embedding, replicated_2d, "forward.input_embedding"
+    )
     if input_embedding is not None:
         input_embedding = input_embedding.astype(jnp.bfloat16)
 
     deepstack_visual_embedding = None
     if getattr(batch, "apply_for_deepstack", False):
-        deepstack_visual_embedding = _device_array_preserve_device(
-            batch.deepstack_visual_embedding, replicated_2d
+        deepstack_visual_embedding = _prepare_device_array(
+            batch.deepstack_visual_embedding,
+            replicated_2d,
+            "forward.deepstack_visual_embedding",
         )
         if deepstack_visual_embedding is not None:
             deepstack_visual_embedding = deepstack_visual_embedding.astype(jnp.bfloat16)
 
     if batch.lora_scalings is not None:
-        lora_scalings = _device_array_preserve_device(batch.lora_scalings, data_sharding)
-        lora_token_indices = _device_array_preserve_device(batch.lora_token_indices, data_sharding)
-        lora_ranks = _device_array_preserve_device(batch.lora_ranks, data_sharding)
+        lora_scalings = _prepare_device_array(
+            batch.lora_scalings, data_sharding, "forward.lora_scalings"
+        )
+        lora_token_indices = _prepare_device_array(
+            batch.lora_token_indices, data_sharding, "forward.lora_token_indices"
+        )
+        lora_ranks = _prepare_device_array(batch.lora_ranks, data_sharding, "forward.lora_ranks")
     else:
         lora_scalings = batch.lora_scalings
         lora_token_indices = batch.lora_token_indices
@@ -1001,15 +1278,25 @@ def _forward_batch_init_new_preserve_device(batch, model_runner):
         bid=batch.bid,
         forward_mode=batch.forward_mode,
         batch_size=len(batch.seq_lens),
-        input_ids=_device_array_preserve_device(batch.input_ids, data_sharding),
-        seq_lens=_device_array_preserve_device(batch.seq_lens, data_sharding),
-        out_cache_loc=_device_array_preserve_device(batch.out_cache_loc, data_sharding),
-        positions=_device_array_preserve_device(batch.positions, data_sharding),
-        mrope_positions=_device_array_preserve_device(batch.mrope_positions, replicated_2d),
-        req_pool_indices=_device_array_preserve_device(batch.req_pool_indices, data_sharding),
-        cache_loc=_device_array_preserve_device(batch.cache_loc, data_sharding),
-        extend_prefix_lens=_device_array_preserve_device(batch.extend_prefix_lens, data_sharding),
-        extend_seq_lens=_device_array_preserve_device(batch.extend_seq_lens, data_sharding),
+        input_ids=_prepare_device_array(input_ids, data_sharding, "forward.input_ids"),
+        seq_lens=_prepare_device_array(batch.seq_lens, data_sharding, "forward.seq_lens"),
+        out_cache_loc=_prepare_device_array(
+            batch.out_cache_loc, data_sharding, "forward.out_cache_loc"
+        ),
+        positions=_prepare_device_array(positions, data_sharding, "forward.positions"),
+        mrope_positions=_prepare_device_array(
+            batch.mrope_positions, replicated_2d, "forward.mrope_positions"
+        ),
+        req_pool_indices=_prepare_device_array(
+            batch.req_pool_indices, data_sharding, "forward.req_pool_indices"
+        ),
+        cache_loc=_prepare_device_array(batch.cache_loc, data_sharding, "forward.cache_loc"),
+        extend_prefix_lens=_prepare_device_array(
+            batch.extend_prefix_lens, data_sharding, "forward.extend_prefix_lens"
+        ),
+        extend_seq_lens=_prepare_device_array(
+            extend_seq_lens, data_sharding, "forward.extend_seq_lens"
+        ),
         lora_ids=batch.lora_ids,
         lora_scalings=lora_scalings,
         lora_token_indices=lora_token_indices,
@@ -1022,11 +1309,13 @@ def _forward_batch_init_new_preserve_device(batch, model_runner):
         apply_for_deepstack=batch.apply_for_deepstack,
         deepstack_visual_embedding=deepstack_visual_embedding,
         expert_location_metadata=get_global_expert_location_metadata(),
-        recurrent_indices=_device_array_preserve_device(batch.recurrent_indices, data_sharding),
+        recurrent_indices=_prepare_device_array(
+            batch.recurrent_indices, data_sharding, "forward.recurrent_indices"
+        ),
     )
 
 
-def prepare_spec_prefill_forward_batch(spec_worker, model_worker_batch):
+def prepare_forward_batch_for_prefill(spec_worker, model_worker_batch):
     """Prepare the target ForwardBatch before speculative prefill is queued."""
     from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode
 
@@ -1035,9 +1324,7 @@ def prepare_spec_prefill_forward_batch(spec_worker, model_worker_batch):
     target_mr.attn_backend.forward_metadata = target_mr.attn_backend.get_forward_metadata(
         model_worker_batch
     )
-    model_worker_batch.forward_batch = _forward_batch_init_new_preserve_device(
-        model_worker_batch, target_mr
-    )
+    model_worker_batch.forward_batch = _make_forward_batch(model_worker_batch, target_mr)
     model_worker_batch.forward_batch.bid = model_worker_batch.bid
     return model_worker_batch.forward_batch
 
@@ -1062,6 +1349,25 @@ def launch_fused_draft_extend_for_decode(
     draft_input = EagleDraftInput(
         hidden_states=target_hidden,
         allocate_lens=batch_output.next_draft_input.allocate_lens,
+        accept_length=getattr(batch_output.next_draft_input, "accept_length", None),
+    )
+    draft_input.verified_id_for_draft_extend = getattr(
+        batch_output.next_draft_input, "verified_id_for_draft_extend", None
+    )
+    draft_input.extend_seq_lens_for_draft_extend = getattr(
+        batch_output.next_draft_input, "extend_seq_lens_for_draft_extend", None
+    )
+    draft_input.logits_indices_for_draft_extend = getattr(
+        batch_output.next_draft_input, "logits_indices_for_draft_extend", None
+    )
+    draft_input.positions_for_draft_extend = getattr(
+        batch_output.next_draft_input, "positions_for_draft_extend", None
+    )
+    draft_input.sel_pos_for_draft_extend = getattr(
+        batch_output.next_draft_input, "sel_pos_for_draft_extend", None
+    )
+    draft_input.allocate_lens_for_draft_extend = getattr(
+        batch_output.next_draft_input, "allocate_lens_for_draft_extend", None
     )
     if getattr(batch_output.next_draft_input, "verify_seq_lens", None) is not None:
         draft_input.device_seq_lens_for_draft_extend = True
@@ -1075,14 +1381,19 @@ def launch_fused_draft_extend_for_decode(
         return None
 
     sel = np.asarray(model_worker_batch.logits_indices_selector)
-    if hasattr(batch_output.next_draft_input, "sel_pos"):
+    sel_pos_for_draft_extend = getattr(
+        batch_output.next_draft_input, "sel_pos_for_draft_extend", None
+    )
+    if sel_pos_for_draft_extend is not None:
+        sel_pos = sel_pos_for_draft_extend
+    elif hasattr(batch_output.next_draft_input, "sel_pos"):
         sel_pos = batch_output.next_draft_input.sel_pos
     else:
         sel_pos = jnp.clip(batch_output.accept_lens - 1, 0, None).astype(jnp.int32)
 
     mr0 = draft_worker._workers[0].model_runner
     mwb.spec_info_padded.hidden_states = target_hidden
-    shared_fb = _forward_batch_init_new_preserve_device(mwb, mr0)
+    shared_fb = _make_forward_batch(mwb, mr0)
     shared_fb.bid = model_worker_batch.bid
 
     all_memory_pools = []
@@ -1093,21 +1404,41 @@ def launch_fused_draft_extend_for_decode(
         all_leaves.append(tuple(mr.model_state_leaves))
 
     data_sharding = NamedSharding(draft_worker.mesh, P("data"))
-    sel_pos_device = _device_array_preserve_device(sel_pos, data_sharding)
-    draft_logits_indices = _device_array_preserve_device(mwb.logits_indices, data_sharding)
-    draft_allocate_lens = np.zeros_like(model_worker_batch.seq_lens, dtype=np.int32)
-    draft_allocate_lens[sel] = np.asarray(batch_output.next_draft_input.allocate_lens)
-    draft_allocate_lens = _device_array_preserve_device(draft_allocate_lens, data_sharding)
+    sel_pos_device = _prepare_device_array(sel_pos, data_sharding, "draft_extend.sel_pos")
+    draft_logits_indices = _prepare_device_array(
+        (
+            getattr(mwb.spec_info_padded, "logits_indices_for_draft_extend", None)
+            if getattr(mwb.spec_info_padded, "logits_indices_for_draft_extend", None) is not None
+            else mwb.logits_indices
+        ),
+        data_sharding,
+        "draft_extend.logits_indices",
+    )
+    draft_allocate_lens = getattr(
+        batch_output.next_draft_input, "allocate_lens_for_draft_extend", None
+    )
+    if draft_allocate_lens is None:
+        draft_allocate_lens = np.zeros_like(model_worker_batch.seq_lens, dtype=np.int32)
+        draft_allocate_lens[sel] = np.asarray(batch_output.next_draft_input.allocate_lens)
+    draft_allocate_lens = _prepare_device_array(
+        draft_allocate_lens, data_sharding, "draft_extend.allocate_lens"
+    )
     draft_verify_seq_lens = getattr(batch_output.next_draft_input, "verify_seq_lens", None)
-    draft_verify_seq_lens = _device_array_preserve_device(draft_verify_seq_lens, data_sharding)
+    draft_verify_seq_lens = _prepare_device_array(
+        draft_verify_seq_lens, data_sharding, "draft_extend.verify_seq_lens"
+    )
     if relay_future_indices is None:
         relay_future_indices = np.zeros(model_worker_batch.req_pool_indices.shape, dtype=np.int32)
     if relay_valid_mask is None:
         relay_valid_mask = np.zeros(model_worker_batch.req_pool_indices.shape, dtype=np.bool_)
-    relay_future_indices = _device_array_preserve_device(relay_future_indices, data_sharding)
-    relay_valid_mask = _device_array_preserve_device(relay_valid_mask, data_sharding)
+    relay_future_indices = _prepare_device_array(
+        relay_future_indices, data_sharding, "draft_extend.relay_future_indices"
+    )
+    relay_valid_mask = _prepare_device_array(
+        relay_valid_mask, data_sharding, "draft_extend.relay_valid_mask"
+    )
     if not hasattr(draft_worker, "_fused_jit_fn"):
-        draft_worker._fused_jit_fn = _build_fused_draft_extend_jit(
+        draft_worker._fused_jit_fn = _build_draft_extend(
             num_layers=draft_worker.speculative_num_steps,
             topk=draft_worker.topk,
         )
@@ -1154,7 +1485,7 @@ def launch_fused_draft_extend_for_decode(
     )
 
 
-def restore_fused_draft_extend_result(draft_worker, model_worker_batch, pending_result):
+def restore_draft_extend_result(draft_worker, model_worker_batch, pending_result):
     if pending_result is None:
         return
 
@@ -1184,7 +1515,7 @@ def restore_fused_draft_extend_result(draft_worker, model_worker_batch, pending_
     batch_output.accept_lens = accept_host
 
 
-def draft_extend_for_decode_fused(draft_worker, model_worker_batch, batch_output):
+def draft_extend_for_decode(draft_worker, model_worker_batch, batch_output):
     """Drop-in replacement for MultiLayerDraftWorker.draft_extend_for_decode.
 
     Fuses all N MTP layer forwards into a single jit call.
@@ -1192,7 +1523,7 @@ def draft_extend_for_decode_fused(draft_worker, model_worker_batch, batch_output
     pending_result = launch_fused_draft_extend_for_decode(
         draft_worker, model_worker_batch, batch_output
     )
-    restore_fused_draft_extend_result(draft_worker, model_worker_batch, pending_result)
+    restore_draft_extend_result(draft_worker, model_worker_batch, pending_result)
 
 
 def spec_prefill(spec_worker, model_worker_batch, launch_done=None, *, update_relay=False):
@@ -1209,7 +1540,7 @@ def spec_prefill(spec_worker, model_worker_batch, launch_done=None, *, update_re
     target_mr = target_worker.model_runner
 
     if getattr(model_worker_batch, "forward_batch", None) is None:
-        target_forward_batch = prepare_spec_prefill_forward_batch(spec_worker, model_worker_batch)
+        target_forward_batch = prepare_forward_batch_for_prefill(spec_worker, model_worker_batch)
     else:
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
         target_mr.attn_backend.forward_metadata = target_mr.attn_backend.get_forward_metadata(
@@ -1217,9 +1548,7 @@ def spec_prefill(spec_worker, model_worker_batch, launch_done=None, *, update_re
         )
         target_forward_batch = model_worker_batch.forward_batch
         target_forward_batch.bid = model_worker_batch.bid
-    target_logits_metadata = _logits_metadata_from_model_worker_batch_preserve_device(
-        model_worker_batch, spec_worker.mesh
-    )
+    target_logits_metadata = _prepare_logits_metadata(model_worker_batch, spec_worker.mesh)
 
     hidden_size = target_worker.model_config.hidden_size
     model_worker_batch.spec_info_padded = EagleDraftInput(
@@ -1240,13 +1569,12 @@ def spec_prefill(spec_worker, model_worker_batch, launch_done=None, *, update_re
     draft_forward_batch = ForwardBatch.init_new(model_worker_batch, draft_mr0)
     draft_forward_batch.input_ids = target_forward_batch.input_ids
     draft_forward_batch.bid = model_worker_batch.bid
-    draft_logits_indices = _device_array_preserve_device(
+    draft_logits_indices = _prepare_device_array(
         model_worker_batch.logits_indices,
         NamedSharding(draft_worker.mesh, P("data")),
+        "prefill.logits_indices",
     )
-    draft_logits_metadata = _logits_metadata_from_model_worker_batch_preserve_device(
-        model_worker_batch, draft_worker.mesh
-    )
+    draft_logits_metadata = _prepare_logits_metadata(model_worker_batch, draft_worker.mesh)
 
     all_memory_pools = []
     all_leaves = []
@@ -1256,7 +1584,7 @@ def spec_prefill(spec_worker, model_worker_batch, launch_done=None, *, update_re
         all_leaves.append(tuple(mr.model_state_leaves))
 
     if not hasattr(draft_worker, "_fused_greedy_prefill_jit_fn"):
-        draft_worker._fused_greedy_prefill_jit_fn = _build_fused_greedy_prefill_jit(
+        draft_worker._fused_greedy_prefill_jit_fn = _build_prefill(
             num_layers=draft_worker.speculative_num_steps,
             topk=draft_worker.topk,
         )
@@ -1273,10 +1601,12 @@ def spec_prefill(spec_worker, model_worker_batch, launch_done=None, *, update_re
         np.asarray(model_worker_batch.req_pool_indices, dtype=np.int32),
         0,
     )
-    relay_future_indices = _device_array_preserve_device(safe_indices, data_sharding)
-    relay_valid_mask = _device_array_preserve_device(valid_mask, data_sharding)
+    relay_future_indices = _prepare_device_array(
+        safe_indices, data_sharding, "prefill.relay_future_indices"
+    )
+    relay_valid_mask = _prepare_device_array(valid_mask, data_sharding, "prefill.relay_valid_mask")
 
-    with jax.set_mesh(draft_worker.mesh), jtu.count_pjit_cpp_cache_miss() as count:
+    with jax.set_mesh(draft_worker.mesh), _count_pjit_cpp_cache_miss() as count:
         (
             logits_output,
             next_token_ids,
@@ -1383,7 +1713,7 @@ def spec_prefill_overlap(spec_worker, model_worker_batch):
     return spec_prefill(spec_worker, model_worker_batch, update_relay=True)
 
 
-def spec_decode_verify_phase(spec_worker, model_worker_batch, cur_allocate_lens):
+def spec_decode_verify(spec_worker, model_worker_batch, cur_allocate_lens):
     """Run target verify as the first speculative decode JIT."""
     from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
     from sgl_jax.srt.managers.scheduler import GenerationBatchResult
@@ -1401,9 +1731,7 @@ def spec_decode_verify_phase(spec_worker, model_worker_batch, cur_allocate_lens)
     if use_relay_state:
         relay_future_indices = np.asarray(draft_input.future_indices, dtype=np.int32)
         relay_future_indices = np.where(relay_future_indices >= 0, relay_future_indices, 0)
-    previous_verified_id, previous_token_list = _prepare_topk1_verify_placeholders_from_draft_state(
-        draft_worker, model_worker_batch
-    )
+    previous_verified_id, previous_token_list = _prepare_verify(draft_worker, model_worker_batch)
     spec_info = model_worker_batch.spec_info_padded
     return_target_logits = bool(
         getattr(model_worker_batch, "return_logprob", False)
@@ -1417,36 +1745,99 @@ def spec_decode_verify_phase(spec_worker, model_worker_batch, cur_allocate_lens)
     )
     if use_relay_state and target_mr.attn_backend.forward_metadata.custom_mask is not None:
         raise NotImplementedError("Spec decode overlap relay path does not support custom_mask.")
-    target_forward_batch = _forward_batch_init_new_preserve_device(model_worker_batch, target_mr)
+    target_forward_batch = _make_forward_batch(model_worker_batch, target_mr)
     target_forward_batch.bid = model_worker_batch.bid
-    target_logits_metadata = _logits_metadata_from_model_worker_batch_preserve_device(
-        model_worker_batch, spec_worker.mesh
-    )
+    target_logits_metadata = _prepare_logits_metadata(model_worker_batch, spec_worker.mesh)
     data_sharding = NamedSharding(spec_worker.mesh, P("data"))
     if relay_future_indices is None:
         relay_future_indices = np.zeros(model_worker_batch.seq_lens.shape, dtype=np.int32)
-    relay_future_indices = _device_array_preserve_device(relay_future_indices, data_sharding)
+    relay_future_indices = _prepare_device_array(
+        relay_future_indices, data_sharding, "verify.relay_future_indices"
+    )
     verify_allocate_lens = np.zeros_like(model_worker_batch.seq_lens, dtype=np.int32)
     verify_allocate_lens[model_worker_batch.logits_indices_selector] = cur_allocate_lens
-    verify_allocate_lens = _device_array_preserve_device(verify_allocate_lens, data_sharding)
+    verify_allocate_lens = _prepare_device_array(
+        verify_allocate_lens, data_sharding, "verify.allocate_lens"
+    )
 
     if not hasattr(draft_worker, "_fused_greedy_verify_jit_fn"):
-        draft_worker._fused_greedy_verify_jit_fn = _build_fused_greedy_verify_jit(
+        draft_worker._fused_greedy_verify_jit_fn = _build_verify(
             topk=draft_worker.topk,
         )
 
-    with jax.set_mesh(draft_worker.mesh), jtu.count_pjit_cpp_cache_miss() as count:
+    si = model_worker_batch.sampling_info
+    _sv_is_greedy = bool(getattr(si, "is_all_greedy", True))
+    _sv_tbs = target_forward_batch.seq_lens.shape[0]
+    _sv_enable_top_k = False
+    _sv_enable_top_p = False
+    if _sv_is_greedy:
+        _sv_temps = _prepare_device_array(np.ones((_sv_tbs, 1), np.float32), data_sharding)
+        _sv_topks = _prepare_device_array(np.zeros((_sv_tbs,), np.int32), data_sharding)
+        _sv_topps = _prepare_device_array(np.ones((_sv_tbs,), np.float32), data_sharding)
+    else:
+        _t = np.asarray(si.temperatures, np.float32).reshape(-1)
+        _k = (
+            np.asarray(getattr(si, "top_ks", None)).reshape(-1)
+            if getattr(si, "top_ks", None) is not None
+            else None
+        )
+        _p = (
+            np.asarray(getattr(si, "top_ps", None), np.float32).reshape(-1)
+            if getattr(si, "top_ps", None) is not None
+            else None
+        )
+        _tv = float(_t[0]) if _t.size else 1.0
+        _kv = int(_k[0]) if (_k is not None and _k.size) else 0
+        _pv = float(_p[0]) if (_p is not None and _p.size) else 1.0
+        _sv_vocab = int(target_worker.model_config.vocab_size)
+        _sv_enable_top_k = 0 < _kv < _sv_vocab
+        _sv_enable_top_p = _pv < 1.0
+        # temps/topks/topps are constant across decode steps for a given batch
+        # (they only depend on tbs and the per-batch sampling scalars), so building
+        # + transferring them every step is wasted H2D dispatch. Cache the device
+        # arrays keyed by (tbs, temp, top_k, top_p) and reuse until the batch changes.
+        _const_sig = (_sv_tbs, _tv, _kv, _pv)
+        _const_cache = getattr(target_mr, "_sv_sampling_const_cache", None)
+        if _const_cache is None or _const_cache[0] != _const_sig:
+            _sv_temps = _prepare_device_array(np.full((_sv_tbs, 1), _tv, np.float32), data_sharding)
+            _sv_topks = _prepare_device_array(np.full((_sv_tbs,), _kv, np.int32), data_sharding)
+            _sv_topps = _prepare_device_array(np.full((_sv_tbs,), _pv, np.float32), data_sharding)
+            target_mr._sv_sampling_const_cache = (
+                _const_sig,
+                _sv_temps,
+                _sv_topks,
+                _sv_topps,
+            )
+        else:
+            _, _sv_temps, _sv_topks, _sv_topps = _const_cache
+    _sv_thr_single = float(
+        getattr(spec_worker.server_args, "speculative_accept_threshold_single", 1.0)
+    )
+    _sv_thr_acc = float(getattr(spec_worker.server_args, "speculative_accept_threshold_acc", 1.0))
+
+    # Advance the per-step sampling RNG; coins are generated inside the verify JIT
+    # from (base_rng, step), so only this small int crosses the host->device boundary.
+    target_mr._sampler_step += 1
+
+    with jax.set_mesh(draft_worker.mesh), _count_pjit_cpp_cache_miss() as count:
         (
             target_pool_updates,
             prepared_hidden,
             prepared_verified_id,
+            prepared_verified_id_data,
             prepared_next_verified_id,
             prepared_new_seq_lens,
-            prepared_accept_lens,
+            prepared_accept_lens_host,
+            prepared_accept_lens_data,
+            prepared_extend_seq_lens,
+            prepared_logits_indices,
             prepared_sel_pos,
+            prepared_sel_pos_data,
             prepared_predict,
             prepared_positions,
+            prepared_positions_data,
             prepared_verify_seq_lens,
+            prepared_allocate_lens_data,
             target_logits,
         ) = draft_worker._fused_greedy_verify_jit_fn(
             target_mr._model_def,
@@ -1460,11 +1851,21 @@ def spec_decode_verify_phase(spec_worker, model_worker_batch, cur_allocate_lens)
             getattr(spec_worker, "spec_relay_buffers", None),
             relay_future_indices,
             verify_allocate_lens,
+            target_mr._sampler_base_rng,
+            target_mr._sampler_step,
+            _sv_temps,
+            _sv_topks,
+            _sv_topps,
             speculative_num_steps=draft_worker.speculative_num_steps,
             speculative_num_draft_tokens=draft_worker.speculative_num_draft_tokens,
             return_target_logits=return_target_logits,
             use_relay_state=use_relay_state,
             dp_size=model_worker_batch.dp_size,
+            is_greedy=_sv_is_greedy,
+            threshold_single=_sv_thr_single,
+            threshold_acc=_sv_thr_acc,
+            enable_top_k=_sv_enable_top_k,
+            enable_top_p=_sv_enable_top_p,
         )
         cache_miss_count = count()
 
@@ -1475,7 +1876,14 @@ def spec_decode_verify_phase(spec_worker, model_worker_batch, cur_allocate_lens)
         new_seq_lens=prepared_new_seq_lens,
         allocate_lens=cur_allocate_lens,
         hidden_states=prepared_hidden,
+        accept_length=prepared_accept_lens_data,
     )
+    next_draft_input.verified_id_for_draft_extend = prepared_verified_id_data
+    next_draft_input.extend_seq_lens_for_draft_extend = prepared_extend_seq_lens
+    next_draft_input.logits_indices_for_draft_extend = prepared_logits_indices
+    next_draft_input.positions_for_draft_extend = prepared_positions_data
+    next_draft_input.sel_pos_for_draft_extend = prepared_sel_pos_data
+    next_draft_input.allocate_lens_for_draft_extend = prepared_allocate_lens_data
     next_draft_input.next_verified_id = prepared_next_verified_id
     next_draft_input.sel_pos = prepared_sel_pos
     next_draft_input.positions = prepared_positions
@@ -1487,7 +1895,7 @@ def spec_decode_verify_phase(spec_worker, model_worker_batch, cur_allocate_lens)
         ),
         next_token_ids=prepared_predict,
         next_draft_input=next_draft_input,
-        accept_lens=prepared_accept_lens,
+        accept_lens=prepared_accept_lens_host,
         bid=model_worker_batch.bid,
         cache_miss_count=cache_miss_count,
         extend_input_len_per_req=None,
@@ -1497,7 +1905,7 @@ def spec_decode_verify_phase(spec_worker, model_worker_batch, cur_allocate_lens)
     return batch_output
 
 
-def spec_decode_draft_extend_phase(spec_worker, model_worker_batch, batch_output):
+def spec_decode_draft_extend(spec_worker, model_worker_batch, batch_output):
     """Run MTP draft extend as the second speculative decode JIT."""
     spec_worker.draft_worker.draft_extend_for_decode(model_worker_batch, batch_output)
     return batch_output
@@ -1505,13 +1913,13 @@ def spec_decode_draft_extend_phase(spec_worker, model_worker_batch, batch_output
 
 def spec_decode(spec_worker, model_worker_batch, cur_allocate_lens):
     """Run speculative decode as verify JIT followed by draft-extend JIT."""
-    batch_output = spec_decode_verify_phase(spec_worker, model_worker_batch, cur_allocate_lens)
-    return spec_decode_draft_extend_phase(spec_worker, model_worker_batch, batch_output)
+    batch_output = spec_decode_verify(spec_worker, model_worker_batch, cur_allocate_lens)
+    return spec_decode_draft_extend(spec_worker, model_worker_batch, batch_output)
 
 
 def spec_decode_overlap(spec_worker, model_worker_batch, cur_allocate_lens):
     """Launch decode verify and draft-extend without restoring draft results inline."""
-    batch_output = spec_decode_verify_phase(spec_worker, model_worker_batch, cur_allocate_lens)
+    batch_output = spec_decode_verify(spec_worker, model_worker_batch, cur_allocate_lens)
     sel = np.asarray(model_worker_batch.logits_indices_selector)
     batch_output.next_draft_input.future_indices = np.asarray(model_worker_batch.req_pool_indices)[
         sel

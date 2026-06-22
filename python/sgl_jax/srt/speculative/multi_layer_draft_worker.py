@@ -299,8 +299,6 @@ class MultiLayerDraftWorker(EagleDraftWorker):
         self, model_worker_batch: ModelWorkerBatch, batch_output: GenerationBatchResult
     ) -> None:
         """Decode-extend across all MTP layers."""
-        from sgl_jax.srt.speculative.draft_extend_fused import (
-            draft_extend_for_decode_fused,
-        )
+        from sgl_jax.srt.speculative.draft_extend_fused import draft_extend_for_decode
 
-        return draft_extend_for_decode_fused(self, model_worker_batch, batch_output)
+        return draft_extend_for_decode(self, model_worker_batch, batch_output)
