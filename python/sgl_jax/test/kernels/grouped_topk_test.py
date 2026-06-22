@@ -96,3 +96,29 @@ def test_against_real_topk_module():
     )
     np.testing.assert_array_equal(np.array(ids_pal), np.array(ids_real))
     np.testing.assert_allclose(np.array(w_pal), np.array(w_real), rtol=0, atol=1e-6)
+
+
+@pytest.mark.parametrize(
+    "E,G,Gtop,k,name",
+    [
+        (256, 8, 4, 8, "n_pad>0_k8"),  # padded_topk=128, n_pad=120 (filler-column path)
+        (256, 4, 4, 128, "n_pad==0_k128"),  # padded_topk=128, n_pad=0 (no filler)
+    ],
+)
+def test_topk_pad_boundary(E, G, Gtop, k, name):
+    """Exercise both the n_pad>0 (topk<128) and n_pad==0 (topk==128) output-padding paths,
+    and that the returned shape is sliced back to exactly (bs, topk)."""
+    bs = 512
+    logits = _logits(bs, E, seed=11)
+    bias = jax.random.normal(jax.random.PRNGKey(5), (E,), dtype=jnp.float32) * 0.1
+    w_ref, ids_ref = ref_biased_grouped_topk(
+        logits, bias, num_expert_group=G, topk_group=Gtop, topk=k
+    )
+    w_pal, ids_pal = grouped_topk_pallas(
+        logits, bias, num_expert_group=G, topk_group=Gtop, topk=k, block_tokens=256, interpret=True
+    )
+    assert ids_pal.shape == (bs, k), f"{name}: shape {ids_pal.shape} != {(bs, k)}"
+    np.testing.assert_array_equal(np.array(ids_pal), np.array(ids_ref), err_msg=f"{name}: ids")
+    np.testing.assert_allclose(
+        np.array(w_pal), np.array(w_ref), rtol=0, atol=1e-6, err_msg=f"{name}: weights"
+    )
