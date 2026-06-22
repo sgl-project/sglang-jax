@@ -822,8 +822,9 @@ class ServerArgs:
             default=ServerArgs.recurrent_track_interval,
             help="Recurrent radix cache (PR#2): page-boundary interval at which a "
             "recurrent track state is committed. Requires --enable-recurrent-extra-buffer "
-            "and must be a positive multiple of --page-size. Defaults to --page-size "
-            "when extra-buffer is enabled.",
+            "and must be a positive multiple of --page-size. Defaults to "
+            "--chunked-prefill-size when extra-buffer is enabled (falls back to "
+            "--page-size if chunked prefill is off).",
         )
         parser.add_argument(
             "--disable-hybrid-swa-memory",
@@ -1111,8 +1112,8 @@ class ServerArgs:
             "--enable-unified-radix-tree",
             action="store_true",
             help="Route non-hybrid (full-attention) models to UnifiedRadixCache "
-            "(component-agnostic prefix cache). Default off; hybrid models are "
-            "unaffected.",
+            "(component-agnostic prefix cache). Default off. Also required to route "
+            "hybrid recurrent models (e.g. Kimi-Linear) into UnifiedRadixCache.",
         )
         parser.add_argument(
             "--enable-recurrent-extra-buffer",

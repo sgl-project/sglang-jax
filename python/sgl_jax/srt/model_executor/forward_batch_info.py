@@ -207,7 +207,8 @@ class ForwardBatch:
     # recurrent_indices. Set on extend batches with a prefix hit; None otherwise.
     recurrent_cow_src_indices: jax.Array | None = None
     # Recurrent track metadata [batch_size] (extra-buffer snapshot at track
-    # boundaries). Dormant until a later task adds the builder; None otherwise.
+    # boundaries). Populated on extend batches that cross a track boundary; None
+    # otherwise.
     recurrent_track_indices: jax.Array | None = None
     recurrent_track_mask: jax.Array | None = None
 

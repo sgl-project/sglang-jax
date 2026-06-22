@@ -1,12 +1,13 @@
 """Recurrent track metadata must survive the pytree round-trip in lockstep.
 
 Stage 2 (PR#2) publishes a recurrent snapshot only at page/track boundaries.
-Two new per-request arrays -- recurrent_track_indices / recurrent_track_mask --
+Two per-request arrays -- recurrent_track_indices / recurrent_track_mask --
 ride the same plumbing as recurrent_cow_src_indices from the scheduler through
-ModelWorkerBatch -> ForwardBatch -> LinearRecurrentAttnBackendMetadata. They are
-dormant for now (no builder fills them), so they stay None end-to-end. These
-tests pin the wiring: each array flattens and unflattens to the same field
-(distinct sentinels catch a swapped index), and None round-trips to None.
+ModelWorkerBatch -> ForwardBatch -> LinearRecurrentAttnBackendMetadata. These
+tests cover both the builder (_recurrent_track_entry / _build_recurrent_track_entries
+populate the arrays only on a track boundary, None otherwise) and the wiring:
+each array flattens and unflattens to the same field (distinct sentinels catch a
+swapped index), and None round-trips to None.
 """
 
 import unittest

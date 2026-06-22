@@ -237,7 +237,7 @@ class Req:
         # Which buffer slot (0/1) the NEXT track scatter overwrites.
         self.recurrent_next_track_idx: int | None = None
         # Watermark seqlen of the last materialized track slot; set ONLY by a real
-        # track scatter (later task), never from a prefix match.
+        # track scatter, never from a prefix match.
         self.recurrent_last_track_seqlen: int | None = None
 
         # Check finish
@@ -734,7 +734,7 @@ class ScheduleReqsInfo:
     recurrent_cow_src_indices: np.ndarray | None = None
 
     # Recurrent track metadata per DP (extra-buffer snapshot at track boundaries;
-    # dormant until a later task adds the builder). All padded to total_bs, P("data").
+    # populated when a req crosses a track boundary). All padded to total_bs, P("data").
     recurrent_track_indices: np.ndarray | None = None
     recurrent_track_mask: np.ndarray | None = None
 
@@ -2863,8 +2863,8 @@ class ScheduleBatch:
                 recurrent_cow_src_indices_cpu = None
 
         # Step 5.5c: Merge recurrent track metadata (extra-buffer snapshot at
-        # page/track boundaries). Dormant until a later task adds the builder;
-        # both stay None end-to-end today. Mirrors the CoW merge above.
+        # page/track boundaries). Populated when a req crosses a track boundary;
+        # both stay None when no req does. Mirrors the CoW merge above.
         recurrent_track_indices_cpu = None
         recurrent_track_mask_cpu = None
         if any(info.recurrent_track_mask is not None for info in self.reqs_info):
@@ -3496,7 +3496,7 @@ class ModelWorkerBatch:
     recurrent_cow_src_indices: np.ndarray | None = None
 
     # Recurrent track metadata (extra-buffer snapshot at track boundaries;
-    # dormant until a later task adds the builder). Padded to total_bs, P("data").
+    # populated when a req crosses a track boundary). Padded to total_bs, P("data").
     recurrent_track_indices: np.ndarray | None = None
     recurrent_track_mask: np.ndarray | None = None
 

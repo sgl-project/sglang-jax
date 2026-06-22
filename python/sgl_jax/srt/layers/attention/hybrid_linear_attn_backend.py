@@ -33,7 +33,7 @@ class LinearRecurrentAttnBackendMetadata:
     recurrent_indices: jax.Array = None
     has_initial_state: jax.Array = None
     # Recurrent track metadata (extra-buffer snapshot at track boundaries).
-    # Optional: None until a later task populates the source.
+    # Optional: None when the batch crosses no track boundary.
     recurrent_track_indices: jax.Array = None
     recurrent_track_mask: jax.Array = None
 
@@ -108,7 +108,7 @@ class LinearRecurrentAttnBackend(AttentionBackend):
             sharding=NamedSharding(self.mesh, sharding_spec),
         )
 
-        # Optional track metadata: None until a later task populates the source,
+        # Optional track metadata: None when the batch crosses no track boundary,
         # so guard each device_array individually (leave None otherwise).
         if batch.recurrent_track_indices is not None:
             (metadata.recurrent_track_indices,) = device_array(

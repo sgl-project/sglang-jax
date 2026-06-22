@@ -6,7 +6,8 @@ RecurrentStatePool slot index), so this component is leaf-only: it rides the
 core's ``evictable_device_leaves`` and skips upstream's LRU-list machinery.
 
 PR#1 scope (page_size=1): finished-request commit + prefix-hit copy-on-write
-clone. Unfinished/fork donation and page>=128 (extra buffer) are deferred.
+clone. PR#2 adds page_size>=128 (page-aligned ping-pong extra buffer) and
+unfinished/fork donation.
 """
 
 from __future__ import annotations
