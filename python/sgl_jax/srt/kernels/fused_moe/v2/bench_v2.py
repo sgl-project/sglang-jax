@@ -251,6 +251,11 @@ log(f"initialized: {jax.device_count()} devices, {jax.process_count()} procs")
 
 from kernel import FusedMoEBlockConfig, fused_ep_moe_v2, ref_moe
 
+from sgl_jax.srt.kernels.fused_moe.v2.tuned_block_configs import (
+    DEFAULT_V2_BLOCK_CONFIG,
+    get_tuned_fused_moe_v2_block_config,
+)
+
 P = jax.sharding.PartitionSpec
 num_devices = jax.device_count()
 devices = np.array(jax.devices()).reshape(1, num_devices)
@@ -325,6 +330,16 @@ bf_candidates = parse_csv_int("BENCH_BF", [256])
 btc_candidates = parse_csv_int("BENCH_BTC", [128])
 bts_candidates = parse_csv_int_or_none("BENCH_BTS")
 token_candidates = parse_csv_int("BENCH_TOKENS", [4096])
+
+# Tuned-first defaulting: when the user did NOT explicitly pin any block-shape
+# param (BT/BF/BTC/BTS) and we're not sweeping (BENCH_TUNE), look the shape up in
+# tuned_block_configs per token count and use that. Falls back to the BENCH_BT/BF
+# defaults only when no tuned entry matches. Avoids silently benchmarking the
+# default bf=256 when a tuned (e.g. bf=1024) config exists for the shape.
+_explicit_block_shape = any(
+    os.environ.get(k) is not None for k in ("BENCH_BT", "BENCH_BF", "BENCH_BTC", "BENCH_BTS")
+)
+auto_tuned_block = (not tune_mode) and (not _explicit_block_shape)
 
 
 def _align_to(x, a):
@@ -917,7 +932,7 @@ for num_tokens in token_candidates:
         )
         block_configs_to_try = tune_configs
     else:
-        block_configs_to_try = [
+        _default_cfgs = [
             FusedMoEBlockConfig(bt=bt, bf=bf, btc=btc, bse=bse, bts=bts)
             for bt, bf, btc, bts in itertools.product(
                 bt_candidates,
@@ -926,6 +941,38 @@ for num_tokens in token_candidates:
                 bts_candidates,
             )
         ]
+        tuned_cfg = None
+        if auto_tuned_block:
+            try:
+                tuned_cfg = get_tuned_fused_moe_v2_block_config(
+                    num_tokens=num_tokens,
+                    num_experts=E,
+                    top_k=top_k,
+                    hidden_size=d,
+                    intermediate_size=f,
+                    dtype=jnp.bfloat16,
+                    weight_dtype=(jnp.float8_e4m3fn if use_fp8 else jnp.bfloat16),
+                    ep_size=ep_size,
+                    use_shared_expert=use_shared_expert,
+                    use_grouped_topk=False,
+                    enable_act_quant=enable_act_quant,
+                )
+            except Exception as e:  # e.g. num_tokens not aligned to ep_size
+                log(f"  tuned lookup skipped ({e}); using defaults")
+                tuned_cfg = None
+        if tuned_cfg is not None and tuned_cfg is not DEFAULT_V2_BLOCK_CONFIG:
+            log(
+                f"  tuned config HIT: bt={tuned_cfg.bt} bf={tuned_cfg.bf} "
+                f"btc={tuned_cfg.btc} bse={tuned_cfg.bse} bts={tuned_cfg.bts}"
+            )
+            block_configs_to_try = [tuned_cfg]
+        else:
+            if auto_tuned_block:
+                log(
+                    f"  no tuned config for tokens={num_tokens}; falling back to defaults "
+                    f"bt={bt_candidates} bf={bf_candidates} btc={btc_candidates} bts={bts_candidates}"
+                )
+            block_configs_to_try = _default_cfgs
 
     tokens = make_sharded(k1, (num_tokens, d), jnp.bfloat16)
     if routing_mode == "deterministic":
