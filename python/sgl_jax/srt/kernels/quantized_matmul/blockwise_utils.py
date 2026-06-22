@@ -367,8 +367,14 @@ def get_safe_blockwise_tuned_value(
     n_lane_multiplier = max(1, int(tuned.n_lane_multiplier))
     compute_tile_n = 256 * n_lane_multiplier
 
-    # batch: simply cap to actual batch size.
-    batch_block_size = max(1, min(int(tuned.batch_block_size), int(n_batch)))
+    # batch: cap to actual batch size, then enforce the Pallas TPU block-shape
+    # constraint (block_m % 8 == 0 OR block_m == array_m). When Tier-1 fuzzy
+    # match returns a small batch_block_size (e.g. 1 from a #1191 entry) but
+    # n_batch is in (1, 8), the unaligned block triggers a lowering ValueError.
+    n_batch_i = int(n_batch)
+    batch_block_size = max(1, min(int(tuned.batch_block_size), n_batch_i))
+    if batch_block_size < n_batch_i and batch_block_size % 8 != 0:
+        batch_block_size = n_batch_i if n_batch_i <= 8 else max(8, batch_block_size & ~7)
 
     # out (N): round up to compute_tile_n, cap to matrix N, then snap to
     # nearest power-of-two multiple for TPU alignment.
