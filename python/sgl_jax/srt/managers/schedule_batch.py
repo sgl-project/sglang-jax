@@ -58,6 +58,7 @@ from sgl_jax.srt.precision_tracer import (
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sgl_jax.srt.sampling.sampling_params import DEFAULT_SAMPLING_SEED, SamplingParams
 from sgl_jax.srt.server_args import ServerArgs
+from sgl_jax.srt.speculative.overlap_utils import use_legacy_eagle3_non_overlap
 from sgl_jax.srt.utils.common_utils import get_bool_env_var, pad_to_bucket
 
 if TYPE_CHECKING:
@@ -2400,8 +2401,15 @@ class ScheduleBatch:
         flat_spec = self._concat_spec_info_per_rank([info.spec_info for info in self.reqs_info])
         if getattr(flat_spec, "pending_draft_extend_result", None) is not None:
             flat_spec.resolve_pending_draft_extend_result()
+        legacy_eagle3_non_overlap = use_legacy_eagle3_non_overlap(
+            self.enable_overlap, self.spec_algorithm
+        )
         spec_info = self._scatter_spec_info_to_dp_slots(
-            flat_spec, logits_indices_selector, total_bs, mesh=self.mesh
+            flat_spec,
+            logits_indices_selector,
+            total_bs,
+            mesh=self.mesh,
+            legacy_host_scatter=legacy_eagle3_non_overlap,
         )
         # Per-rank out_cache_loc chunks (set in spec prepare_for_decode) have
         # variable length (∝ accept_len). DP-segment: pad each to max_len with
@@ -2421,12 +2429,15 @@ class ScheduleBatch:
         # smaller draft-token count, otherwise high-running batches can escape
         # precompile with shapes like 656/928/1024.
         max_chunk_len = max((len(c) for c in ocl_chunks), default=0)
-        target_per_rank_ocl = per_dp_bs * draft_token_num * 2
-        assert max_chunk_len <= target_per_rank_ocl, (
-            "spec decode out_cache_loc escaped precompile bucket: "
-            f"max_chunk_len={max_chunk_len}, bucket_per_rank={target_per_rank_ocl}, "
-            f"per_dp_bs={per_dp_bs}, draft_token_num={draft_token_num}"
-        )
+        if use_legacy_eagle3_non_overlap(self.enable_overlap, self.spec_algorithm):
+            target_per_rank_ocl = max(per_dp_bs * draft_token_num, max_chunk_len)
+        else:
+            target_per_rank_ocl = per_dp_bs * draft_token_num * 2
+            assert max_chunk_len <= target_per_rank_ocl, (
+                "spec decode out_cache_loc escaped precompile bucket: "
+                f"max_chunk_len={max_chunk_len}, bucket_per_rank={target_per_rank_ocl}, "
+                f"per_dp_bs={per_dp_bs}, draft_token_num={draft_token_num}"
+            )
         out_cache_loc = (
             np.concatenate(
                 [
@@ -2479,7 +2490,11 @@ class ScheduleBatch:
 
     @staticmethod
     def _scatter_spec_info_to_dp_slots(
-        flat, selector: np.ndarray, total_bs: int, mesh: mesh_lib.Mesh = None
+        flat,
+        selector: np.ndarray,
+        total_bs: int,
+        mesh: mesh_lib.Mesh = None,
+        legacy_host_scatter: bool = False,
     ):
         """Scatter global-flat spec_info arrays into DP-padded ``(total_bs, …)``.
 
@@ -2502,6 +2517,20 @@ class ScheduleBatch:
 
                 return jax.device_put(out, NamedSharding(mesh, P("data")))
             return out
+
+        if legacy_host_scatter:
+            return type(flat)(
+                topk_p=_scatter1(flat.topk_p),
+                topk_index=_scatter1(flat.topk_index),
+                hidden_states=_scatter1(flat.hidden_states),
+                verified_id=_scatter1(flat.verified_id),
+                allocate_lens=_scatter1(flat.allocate_lens),
+                capture_hidden_mode=flat.capture_hidden_mode,
+                accept_length=flat.accept_length,
+                accept_length_cpu=flat.accept_length_cpu,
+                new_seq_lens=_scatter1(flat.new_seq_lens),
+                future_indices=_scatter1(flat.future_indices),
+            )
 
         return type(flat)(
             topk_p=_scatter1(flat.topk_p, data_sharded=True),

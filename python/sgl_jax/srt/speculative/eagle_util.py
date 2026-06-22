@@ -42,6 +42,7 @@ from sgl_jax.srt.mem_cache.common import (
     alloc_token_slots,
 )
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
+from sgl_jax.srt.speculative.overlap_utils import use_legacy_eagle3_non_overlap
 
 SIMULATE_ACC_LEN = os.environ.get("SIMULATE_ACC_LEN")
 SIMULATE_ACC_METHOD = os.environ.get("SIMULATE_ACC_METHOD", "multinomial")
@@ -621,6 +622,11 @@ class EagleDraftInput:
         batch_output: GenerationBatchResult,
         speculative_num_draft_tokens: int,
     ):
+        legacy_non_overlap = (
+            model_worker_batch.spec_algorithm is not None
+            and model_worker_batch.spec_algorithm.is_eagle3()
+            and getattr(batch_output.next_draft_input, "future_indices", None) is None
+        )
         model_worker_batch.spec_info_padded = self
         sel = model_worker_batch.logits_indices_selector
         model_worker_batch.seq_lens[sel] = (
@@ -629,7 +635,7 @@ class EagleDraftInput:
         bs = batch_output.accept_lens.shape[0]
         step_plus_1 = model_worker_batch.input_ids.shape[0] // bs
         positions = getattr(batch_output.next_draft_input, "positions", None)
-        if positions is not None:
+        if positions is not None and not legacy_non_overlap:
             model_worker_batch.positions = positions
         model_worker_batch.extend_seq_lens = np.zeros((bs,), dtype=np.int32)
         model_worker_batch.extend_seq_lens[sel] = step_plus_1
@@ -649,7 +655,7 @@ class EagleDraftInput:
         model_worker_batch.spec_info_padded.hidden_states = (
             batch_output.next_draft_input.hidden_states
         )
-        if model_worker_batch.spec_info_padded.accept_length is None:
+        if legacy_non_overlap or model_worker_batch.spec_info_padded.accept_length is None:
             model_worker_batch.spec_info_padded.accept_length = batch_output.accept_lens
         model_worker_batch.input_ids = batch_output.next_draft_input.verified_id
         forward_metadata = draft_model_runner.attn_backend.get_eagle_forward_metadata(
@@ -660,7 +666,7 @@ class EagleDraftInput:
         from sgl_jax.srt.layers.logits_processor import LogitsMetadata
         from sgl_jax.srt.utils.jax_utils import device_array
 
-        if model_worker_batch.return_logprob:
+        if legacy_non_overlap or model_worker_batch.return_logprob:
             logits_metadata = LogitsMetadata.from_model_worker_batch(
                 model_worker_batch, draft_model_runner.mesh
             )
@@ -727,13 +733,23 @@ class EagleDraftInput:
         page_size = schedule_batch.token_to_kv_pool_allocator.page_size
         new_alloc_chunks = []
         flat_off = 0
+        legacy_non_overlap = use_legacy_eagle3_non_overlap(
+            schedule_batch.enable_overlap, schedule_batch.spec_algorithm
+        )
         for dp_rank, info in enumerate(schedule_batch.reqs_info):
             if info.seq_lens is None or len(info.seq_lens) == 0:
                 continue
             bs_r = len(info.seq_lens)
-            old_r = np.asarray([req.kv_allocated_len for req in info.reqs], dtype=np.int32)
-            committed_r = np.asarray([req.kv_committed_len for req in info.reqs], dtype=np.int32)
-            new_r = np.maximum(old_r, committed_r + 2 * self.ALLOC_LEN_PER_DECODE)
+            if legacy_non_overlap:
+                seq_r = np.asarray(info.seq_lens)
+                new_r = seq_r + self.ALLOC_LEN_PER_DECODE - 1
+                old_r = self.allocate_lens[flat_off : flat_off + bs_r]
+            else:
+                old_r = np.asarray([req.kv_allocated_len for req in info.reqs], dtype=np.int32)
+                committed_r = np.asarray(
+                    [req.kv_committed_len for req in info.reqs], dtype=np.int32
+                )
+                new_r = np.maximum(old_r, committed_r + 2 * self.ALLOC_LEN_PER_DECODE)
             ext_r = int((new_r - old_r).sum())
             if page_size == 1:
                 ocl_r = alloc_token_slots(schedule_batch.tree_cache, ext_r, dp_rank=dp_rank)
@@ -761,7 +777,8 @@ class EagleDraftInput:
             for req, allocated_len in zip(info.reqs, new_r):
                 req.decode_batch_idx += 1
                 req.kv_allocated_len = int(allocated_len)
-                req.kv_committed_len += 1
+                if not legacy_non_overlap:
+                    req.kv_committed_len += 1
             flat_off += bs_r
             info.seq_lens_sum = np.sum(info.seq_lens).item()
 

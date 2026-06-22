@@ -12,6 +12,8 @@ import numpy as np
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
+from sgl_jax.srt.speculative.overlap_utils import use_legacy_eagle3_non_overlap
+
 if TYPE_CHECKING:
     from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
     from sgl_jax.srt.managers.tp_worker import ModelWorker
@@ -198,7 +200,11 @@ class BaseSpecWorker:
         from sgl_jax.srt.managers.scheduler import GenerationBatchResult
         from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 
-        if launch_done is None:
+        legacy_non_overlap = use_legacy_eagle3_non_overlap(
+            not self.server_args.disable_overlap_schedule,
+            getattr(model_worker_batch, "spec_algorithm", None),
+        )
+        if launch_done is None and not legacy_non_overlap:
             self._prepare_overlap_sampling_info(model_worker_batch)
 
         if model_worker_batch.forward_mode.is_extend():
@@ -222,7 +228,7 @@ class BaseSpecWorker:
                 self.mesh,
                 vocab_size=self.target_worker.model_config.vocab_size,
             )
-            if model_worker_batch.sampling_info.is_all_greedy:
+            if model_worker_batch.sampling_info.is_all_greedy and not legacy_non_overlap:
                 logits_output, _, cache_miss_count, bid, _seq_lens = self.forward_target_extend(
                     model_worker_batch,
                     sampling_metadata,
@@ -328,21 +334,36 @@ class BaseSpecWorker:
             self.draft_worker.draft_model_runner.rngs,
             self.mesh,
         )
-        # accept_index uses -1 for rejected slots; gathering with -1 picks the
-        # global last element, so dext later writes rejected tokens' draft-KV at
-        # a foreign position inside each req's page (corrupts prefix KV for all
-        # but the last req at bs>1). Redirect -1 to each req's own last slot.
-        # accept_index has length bs*(spec_steps+1); the gathered tensors have
-        # length bs*draft_token_num — equal at topk=1, distinct at topk>1.
-        draft_n = self.speculative_num_draft_tokens
-        accept_width = self.speculative_num_steps + 1
-        req_ids = np.arange(len(accept_index)) // accept_width
-        per_req_last = req_ids * draft_n + draft_n - 1
-        safe_index = np.where(accept_index >= 0, accept_index, per_req_last)
+        legacy_non_overlap = use_legacy_eagle3_non_overlap(
+            not self.server_args.disable_overlap_schedule,
+            getattr(model_worker_batch, "spec_algorithm", None),
+        )
+        if legacy_non_overlap:
+            safe_index = accept_index
+        else:
+            # accept_index uses -1 for rejected slots; gathering with -1 picks the
+            # global last element, so dext later writes rejected tokens' draft-KV at
+            # a foreign position inside each req's page (corrupts prefix KV for all
+            # but the last req at bs>1). Redirect -1 to each req's own last slot.
+            # accept_index has length bs*(spec_steps+1); the gathered tensors have
+            # length bs*draft_token_num — equal at topk=1, distinct at topk>1.
+            draft_n = self.speculative_num_draft_tokens
+            accept_width = self.speculative_num_steps + 1
+            req_ids = np.arange(len(accept_index)) // accept_width
+            per_req_last = req_ids * draft_n + draft_n - 1
+            safe_index = np.where(accept_index >= 0, accept_index, per_req_last)
         logits_output.next_token_logits = logits_output.next_token_logits[safe_index, :]
         logits_output.hidden_states = logits_output.hidden_states[safe_index, :]
         model_worker_batch.positions = model_worker_batch.positions[safe_index]
-        new_seq_lens = model_worker_batch.seq_lens + accept_length + 1
+        if legacy_non_overlap:
+            # The legacy scheduler path advances seq_lens from accept_lens, as
+            # it did before the relay-buffer/new_seq_lens path was introduced.
+            new_seq_lens = None
+        else:
+            # prepare_for_verify decrements seq_lens before target verify.  The
+            # scheduler-visible length must advance from the original length by the
+            # accepted tokens, so add that slot back when publishing new_seq_lens.
+            new_seq_lens = model_worker_batch.seq_lens + accept_length + 1
         next_draft_input = EagleDraftInput(
             verified_id=verified_id,
             new_seq_lens=new_seq_lens,

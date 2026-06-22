@@ -81,6 +81,7 @@ from sgl_jax.srt.speculative.overlap_utils import (
     can_use_spec_decode_overlap,
     can_use_spec_prefill_overlap,
     publish_spec_decode_new_seq_lens,
+    use_legacy_eagle3_non_overlap,
 )
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 from sgl_jax.srt.utils.common_utils import (
@@ -1565,7 +1566,11 @@ class Scheduler(
             if not self.last_batch.is_empty() and not self.last_batch.is_prefill_only:
                 if self.running_batch.is_empty():
                     self.running_batch = self.last_batch
-                elif not self._is_spec_decode_enabled() or self.enable_overlap:
+                elif (
+                    not self._is_spec_decode_enabled()
+                    or self.enable_overlap
+                    or use_legacy_eagle3_non_overlap(self.enable_overlap, self.spec_algorithm)
+                ):
                     # Spec overlap keeps prefill and decode as separate forwards, but
                     # once prefill has produced req-granular relay state it can join
                     # the next decode batch through the normal batch merge.
@@ -1607,6 +1612,7 @@ class Scheduler(
         if (
             self._is_spec_decode_enabled()
             and not self.enable_overlap
+            and not use_legacy_eagle3_non_overlap(self.enable_overlap, self.spec_algorithm)
             and not self.running_batch.is_empty()
         ):
             return None
@@ -2063,6 +2069,9 @@ class Scheduler(
         use_spec_prefill_overlap = can_use_spec_prefill_overlap(
             self.enable_overlap, self.spec_algorithm, batch
         )
+        use_legacy_eagle3_decode = batch.forward_mode.is_decode() and use_legacy_eagle3_non_overlap(
+            self.enable_overlap, self.spec_algorithm
+        )
         if use_spec_decode_overlap:
             batch_output, published_new_seq_lens = (
                 self.draft_worker.forward_batch_speculative_decode_overlap(model_worker_batch)
@@ -2076,11 +2085,14 @@ class Scheduler(
             batch_output = self.draft_worker.forward_batch_speculative_generation(
                 model_worker_batch
             )
-            published_new_seq_lens = (
-                publish_spec_decode_new_seq_lens(batch_output)
-                if batch.forward_mode.is_decode()
-                else None
-            )
+            if use_legacy_eagle3_decode:
+                published_new_seq_lens = None
+            else:
+                published_new_seq_lens = (
+                    publish_spec_decode_new_seq_lens(batch_output)
+                    if batch.forward_mode.is_decode()
+                    else None
+                )
 
         if batch_output.next_draft_input is not None:
             per_rank_spec = ScheduleBatch._split_spec_info_per_rank(
@@ -2090,18 +2102,27 @@ class Scheduler(
                 batch.reqs_info[r].spec_info = s
 
         if not use_spec_decode_overlap:
-            new_seq_lens = (
-                np.asarray(jax.device_get(published_new_seq_lens))
-                if published_new_seq_lens is not None
-                else None
-            )
+            if use_legacy_eagle3_decode and batch_output.accept_lens is not None:
+                new_seq_lens = np.asarray(jax.device_get(batch_output.accept_lens))
+                advance_from_accept_lens = True
+            else:
+                new_seq_lens = (
+                    np.asarray(jax.device_get(published_new_seq_lens))
+                    if published_new_seq_lens is not None
+                    else None
+                )
+                advance_from_accept_lens = False
             per_dp_bs = model_worker_batch.per_dp_bs_size
             for dp_rank, info in enumerate(batch.reqs_info):
                 if info.seq_lens is None or len(info.seq_lens) == 0:
                     continue
                 if new_seq_lens is not None:
                     off = dp_rank * per_dp_bs
-                    info.seq_lens = new_seq_lens[off : off + len(info.seq_lens)]
+                    delta = new_seq_lens[off : off + len(info.seq_lens)]
+                    if advance_from_accept_lens:
+                        info.seq_lens = info.seq_lens + delta
+                    else:
+                        info.seq_lens = delta
                 else:
                     info.seq_lens = info.seq_lens + 1
 

@@ -45,6 +45,15 @@ def can_use_spec_prefill_overlap(enable_overlap, spec_algorithm, batch) -> bool:
     return not (batch.return_logprob or batch.return_output_logprob_only)
 
 
+def use_legacy_eagle3_non_overlap(enable_overlap, spec_algorithm) -> bool:
+    return (
+        not enable_overlap
+        and spec_algorithm is not None
+        and not spec_algorithm.is_none()
+        and spec_algorithm.is_eagle3()
+    )
+
+
 def resolve_spec_decode_token_ids(result, batch, draft_token_num: int):
     """Resolve per-request accepted token ids from a speculative verify result."""
     if hasattr(result.next_token_ids, "copy_to_host_async"):
