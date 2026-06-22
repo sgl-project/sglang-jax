@@ -311,38 +311,118 @@ class EPMoE(nnx.Module):
                 wi_scale_sharding = P("expert", None, None, "tensor")
                 wo_scale_sharding = P("expert", None, None, None)
 
-                if hasattr(self, "wi_0_scale"):
-                    del self.wi_0_scale
-                self.wi_0_scale = nnx.Param(
-                    jnp.zeros(
-                        (num_experts, k_blocks_wi, 1, intermediate_dim),
-                        dtype=jnp.float32,
-                        out_sharding=wi_scale_sharding,
-                    ),
-                    out_sharding=wi_scale_sharding,
-                )
+                wi_sharding = P("expert", None, "tensor")
+                wo_sharding = P("expert", "tensor", None)
 
-                if hasattr(self, "wi_1_scale"):
-                    del self.wi_1_scale
-                self.wi_1_scale = nnx.Param(
-                    jnp.zeros(
-                        (num_experts, k_blocks_wi, 1, intermediate_dim),
-                        dtype=jnp.float32,
-                        out_sharding=wi_scale_sharding,
-                    ),
-                    out_sharding=wi_scale_sharding,
-                )
+                is_abstract = isinstance(self.wi_0.value, jax.ShapeDtypeStruct)
 
-                if hasattr(self, "wo_scale"):
-                    del self.wo_scale
-                self.wo_scale = nnx.Param(
-                    jnp.zeros(
-                        (num_experts, k_blocks_wo, 1, hidden_size),
-                        dtype=jnp.float32,
+                if is_abstract:
+                    if hasattr(self, "wi_0_scale"):
+                        del self.wi_0_scale
+                    self.wi_0_scale = nnx.Param(
+                        jax.ShapeDtypeStruct(
+                            (num_experts, k_blocks_wi, 1, intermediate_dim),
+                            dtype=jnp.float32,
+                            sharding=jax.sharding.NamedSharding(self.moe_mesh, wi_scale_sharding),
+                        )
+                    )
+
+                    if hasattr(self, "wi_1_scale"):
+                        del self.wi_1_scale
+                    self.wi_1_scale = nnx.Param(
+                        jax.ShapeDtypeStruct(
+                            (num_experts, k_blocks_wi, 1, intermediate_dim),
+                            dtype=jnp.float32,
+                            sharding=jax.sharding.NamedSharding(self.moe_mesh, wi_scale_sharding),
+                        )
+                    )
+
+                    if hasattr(self, "wo_scale"):
+                        del self.wo_scale
+                    self.wo_scale = nnx.Param(
+                        jax.ShapeDtypeStruct(
+                            (num_experts, k_blocks_wo, 1, hidden_size),
+                            dtype=jnp.float32,
+                            sharding=jax.sharding.NamedSharding(self.moe_mesh, wo_scale_sharding),
+                        )
+                    )
+
+                    self.wi_0 = nnx.Param(
+                        jax.ShapeDtypeStruct(
+                            (num_experts, hidden_size, intermediate_dim),
+                            dtype=self.quantized_dtype,
+                            sharding=jax.sharding.NamedSharding(self.moe_mesh, wi_sharding),
+                        )
+                    )
+                    self.wi_1 = nnx.Param(
+                        jax.ShapeDtypeStruct(
+                            (num_experts, hidden_size, intermediate_dim),
+                            dtype=self.quantized_dtype,
+                            sharding=jax.sharding.NamedSharding(self.moe_mesh, wi_sharding),
+                        )
+                    )
+                    self.wo = nnx.Param(
+                        jax.ShapeDtypeStruct(
+                            (num_experts, intermediate_dim, hidden_size),
+                            dtype=self.quantized_dtype,
+                            sharding=jax.sharding.NamedSharding(self.moe_mesh, wo_sharding),
+                        )
+                    )
+                else:
+                    if hasattr(self, "wi_0_scale"):
+                        del self.wi_0_scale
+                    self.wi_0_scale = nnx.Param(
+                        jnp.zeros(
+                            (num_experts, k_blocks_wi, 1, intermediate_dim),
+                            dtype=jnp.float32,
+                            out_sharding=wi_scale_sharding,
+                        ),
+                        out_sharding=wi_scale_sharding,
+                    )
+
+                    if hasattr(self, "wi_1_scale"):
+                        del self.wi_1_scale
+                    self.wi_1_scale = nnx.Param(
+                        jnp.zeros(
+                            (num_experts, k_blocks_wi, 1, intermediate_dim),
+                            dtype=jnp.float32,
+                            out_sharding=wi_scale_sharding,
+                        ),
+                        out_sharding=wi_scale_sharding,
+                    )
+
+                    if hasattr(self, "wo_scale"):
+                        del self.wo_scale
+                    self.wo_scale = nnx.Param(
+                        jnp.zeros(
+                            (num_experts, k_blocks_wo, 1, hidden_size),
+                            dtype=jnp.float32,
+                            out_sharding=wo_scale_sharding,
+                        ),
                         out_sharding=wo_scale_sharding,
-                    ),
-                    out_sharding=wo_scale_sharding,
-                )
+                    )
+
+                    self.wi_0 = nnx.Param(
+                        jnp.zeros(
+                            (num_experts, hidden_size, intermediate_dim),
+                            dtype=self.quantized_dtype,
+                        ),
+                        out_sharding=wi_sharding,
+                    )
+                    self.wi_1 = nnx.Param(
+                        jnp.zeros(
+                            (num_experts, hidden_size, intermediate_dim),
+                            dtype=self.quantized_dtype,
+                        ),
+                        out_sharding=wi_sharding,
+                    )
+                    self.wo = nnx.Param(
+                        jnp.zeros(
+                            (num_experts, intermediate_dim, hidden_size),
+                            dtype=self.quantized_dtype,
+                        ),
+                        out_sharding=wo_sharding,
+                    )
                 return
 
             # Quantize weights along k-dim (axis=1 in [g, k, n] layout)
@@ -586,6 +666,13 @@ class EPMoE(nnx.Module):
         if token_indices.shape[0] == 0:
             return jnp.zeros((0, wo_kernel.shape[-1]), dtype=inputs_2d.dtype)
 
+        if w0_kernel.dtype in [jnp.int4, jnp.uint4]:
+            w0_kernel = w0_kernel.astype(jnp.int8)
+        if w1_kernel.dtype in [jnp.int4, jnp.uint4]:
+            w1_kernel = w1_kernel.astype(jnp.int8)
+        if wo_kernel.dtype in [jnp.int4, jnp.uint4]:
+            wo_kernel = wo_kernel.astype(jnp.int8)
+
         # indexed_gmm: gather sorted_inputs here instead of in _permute,
         # so XLA can fuse the gather with the matmul and avoid materializing
         # the full [M*top_k, D] sorted_inputs tensor at peak memory.
@@ -609,6 +696,20 @@ class EPMoE(nnx.Module):
         # (m=64 -> 128) and triggered an on-device SparseCore halt.
         group_sizes = group_sizes.astype(jnp.int32)
         act_q_dtype = self.activation_quantized_dtype
+
+        # 1. JAX Compilation/Tracing Stage Logger (fires during XLA compile)
+        import logging
+        moe_logger = logging.getLogger("sgl_jax.srt.layers.moe")
+        moe_logger.info(
+            "JAX Compile Tracing GMM Stage - "
+            "LHS activation shape: %s, dtype: %s | "
+            "RHS weight shape: %s, dtype: %s | "
+            "RHS scale shape: %s, dtype: %s",
+            x.shape, x.dtype,
+            w0_kernel.shape, w0_kernel.dtype,
+            w0_kernel_scale.shape if w0_kernel_scale is not None else "None",
+            w0_kernel_scale.dtype if w0_kernel_scale is not None else "None"
+        )
 
         gmm_kwargs = dict(
             group_sizes=group_sizes,
@@ -771,6 +872,7 @@ def create_moe_weights_mapping(
     moe_path: str = "mlp",
     source_expert_pattern: str = "experts.{i}",
     physical_to_logical_map=None,  # np.ndarray shape (num_physical,) or None
+    weight_suffix: str = "weight",
 ) -> dict:
     """Generate a unified mapping dictionary for MoE layer expert weights."""
     if moe_backend == "epmoe":
@@ -798,7 +900,7 @@ def create_moe_weights_mapping(
 
         # Source weight paths for logical experts only
         expert_keys = [
-            f"{prefix}.{moe_path}.{source_expert_pattern.format(i=i)}.{source_name}.weight"
+            f"{prefix}.{moe_path}.{source_expert_pattern.format(i=i)}.{source_name}.{weight_suffix}"
             for i in range(num_experts)
         ]
 
