@@ -737,7 +737,6 @@ class ScheduleReqsInfo:
     # dormant until a later task adds the builder). All padded to total_bs, P("data").
     recurrent_track_indices: np.ndarray | None = None
     recurrent_track_mask: np.ndarray | None = None
-    recurrent_track_seqlens: np.ndarray | None = None
 
 
 def _build_recurrent_cow_src_indices(reqs: list[Req]) -> np.ndarray | None:
@@ -754,7 +753,6 @@ def _build_recurrent_cow_src_indices(reqs: list[Req]) -> np.ndarray | None:
 class _RecurrentTrackEntry(NamedTuple):
     track_mask: bool
     track_index: int
-    track_seqlen: int
 
 
 def _recurrent_track_entry(
@@ -764,7 +762,7 @@ def _recurrent_track_entry(
 
     On a real track boundary, reads the ping-pong slot at ``recurrent_next_track_idx``
     BEFORE flipping it (read-then-flip), records the watermark seqlen, and flips
-    the next-scatter target. Off a boundary, returns a dormant (0, -1) entry and
+    the next-scatter target. Off a boundary, returns a dormant (0,) entry and
     leaves the req's bookkeeping untouched."""
     if is_extend:
         track_mask = req.extend_input_len > 0 and final_seq_len % interval == 0
@@ -772,37 +770,34 @@ def _recurrent_track_entry(
         # Decode always advances seq_len by 1 (>0).
         track_mask = final_seq_len % interval == 0
     if not track_mask:
-        return _RecurrentTrackEntry(False, 0, -1)
+        return _RecurrentTrackEntry(False, 0)
     idx = req.recurrent_next_track_idx
     track_index = req.recurrent_ping_pong_track_buffer[idx]  # read BEFORE flipping
     req.recurrent_last_track_seqlen = final_seq_len
     req.recurrent_next_track_idx = pool.get_recurrent_ping_pong_other_idx(idx)
-    return _RecurrentTrackEntry(True, track_index, final_seq_len)
+    return _RecurrentTrackEntry(True, track_index)
 
 
 def _build_recurrent_track_entries(
     reqs: list[Req], final_seq_lens: list[int], *, interval: int, pool, is_extend: bool
 ):
-    """Three np.int32 arrays (indices, mask as 0/1, seqlens) aligned with ``reqs``,
-    or ``(None, None, None)`` when no req hits a boundary -- mirroring
+    """Two np.int32 arrays (indices, mask as 0/1) aligned with ``reqs``, or
+    ``(None, None)`` when no req hits a boundary -- mirroring
     ``_build_recurrent_cow_src_indices``'s one-shot None return so the backend
     skips the snapshot path entirely on a boundary-free batch."""
     indices: list[int] = []
     mask: list[int] = []
-    seqlens: list[int] = []
     for req, final_seq_len in zip(reqs, final_seq_lens):
         entry = _recurrent_track_entry(
             req, final_seq_len, interval=interval, pool=pool, is_extend=is_extend
         )
         indices.append(entry.track_index)
         mask.append(1 if entry.track_mask else 0)
-        seqlens.append(entry.track_seqlen)
     if not any(mask):
-        return None, None, None
+        return None, None
     return (
         np.asarray(indices, dtype=np.int32),
         np.asarray(mask, dtype=np.int32),
-        np.asarray(seqlens, dtype=np.int32),
     )
 
 
@@ -1330,7 +1325,6 @@ class ScheduleBatch:
                     (
                         info.recurrent_track_indices,
                         info.recurrent_track_mask,
-                        info.recurrent_track_seqlens,
                     ) = _build_recurrent_track_entries(
                         reqs,
                         seq_lens,
@@ -1757,7 +1751,6 @@ class ScheduleBatch:
                     (
                         info.recurrent_track_indices,
                         info.recurrent_track_mask,
-                        info.recurrent_track_seqlens,
                     ) = _build_recurrent_track_entries(
                         reqs,
                         new_seq_lens,
@@ -2871,14 +2864,12 @@ class ScheduleBatch:
 
         # Step 5.5c: Merge recurrent track metadata (extra-buffer snapshot at
         # page/track boundaries). Dormant until a later task adds the builder;
-        # all three stay None end-to-end today. Mirrors the CoW merge above.
+        # both stay None end-to-end today. Mirrors the CoW merge above.
         recurrent_track_indices_cpu = None
         recurrent_track_mask_cpu = None
-        recurrent_track_seqlens_cpu = None
         if any(info.recurrent_track_mask is not None for info in self.reqs_info):
             recurrent_track_indices_cpu = np.zeros(total_bs, dtype=np.int32)
             recurrent_track_mask_cpu = np.zeros(total_bs, dtype=np.int32)
-            recurrent_track_seqlens_cpu = np.zeros(total_bs, dtype=np.int32)
             offset_bs = 0
             for dp_rank in range(self.dp_size):
                 info = self.reqs_info[dp_rank]
@@ -2892,22 +2883,16 @@ class ScheduleBatch:
                         recurrent_track_mask_cpu[offset_bs : offset_bs + dp_bs] = (
                             info.recurrent_track_mask
                         )
-                    if info.recurrent_track_seqlens is not None:
-                        recurrent_track_seqlens_cpu[offset_bs : offset_bs + dp_bs] = (
-                            info.recurrent_track_seqlens
-                        )
                 offset_bs += per_dp_bs_padding
             # One-shot consumption so later forwards never replay the snapshot.
             for info in self.reqs_info:
                 info.recurrent_track_indices = None
                 info.recurrent_track_mask = None
-                info.recurrent_track_seqlens = None
-            # Backstop: no boundary hit this batch -> drop all three to None so
+            # Backstop: no boundary hit this batch -> drop both to None so
             # the backend skips the snapshot path entirely.
             if not recurrent_track_mask_cpu.any():
                 recurrent_track_indices_cpu = None
                 recurrent_track_mask_cpu = None
-                recurrent_track_seqlens_cpu = None
 
         # Step 5.6: has_initial_state[i] = True iff slot i already holds
         # prior KV/recurrent state (extend with prefix, or any decode slot).
@@ -3059,7 +3044,6 @@ class ScheduleBatch:
             recurrent_cow_src_indices=recurrent_cow_src_indices_cpu,
             recurrent_track_indices=recurrent_track_indices_cpu,
             recurrent_track_mask=recurrent_track_mask_cpu,
-            recurrent_track_seqlens=recurrent_track_seqlens_cpu,
             has_initial_state=has_initial_state_cpu,
             spec_algorithm=self.spec_algorithm,
         )
@@ -3515,7 +3499,6 @@ class ModelWorkerBatch:
     # dormant until a later task adds the builder). Padded to total_bs, P("data").
     recurrent_track_indices: np.ndarray | None = None
     recurrent_track_mask: np.ndarray | None = None
-    recurrent_track_seqlens: np.ndarray | None = None
 
     # Whether each request has prior recurrent state (lazy zero-on-read)
     has_initial_state: np.ndarray | None = None

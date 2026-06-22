@@ -1,13 +1,12 @@
 """Recurrent track metadata must survive the pytree round-trip in lockstep.
 
 Stage 2 (PR#2) publishes a recurrent snapshot only at page/track boundaries.
-Three new per-request arrays -- recurrent_track_indices / recurrent_track_mask /
-recurrent_track_seqlens -- ride the same plumbing as recurrent_cow_src_indices
-from the scheduler through ModelWorkerBatch -> ForwardBatch ->
-LinearRecurrentAttnBackendMetadata. They are dormant for now (no builder fills
-them), so they stay None end-to-end. These tests pin the wiring: each array
-flattens and unflattens to the same field (distinct sentinels catch a swapped
-index), and None round-trips to None.
+Two new per-request arrays -- recurrent_track_indices / recurrent_track_mask --
+ride the same plumbing as recurrent_cow_src_indices from the scheduler through
+ModelWorkerBatch -> ForwardBatch -> LinearRecurrentAttnBackendMetadata. They are
+dormant for now (no builder fills them), so they stay None end-to-end. These
+tests pin the wiring: each array flattens and unflattens to the same field
+(distinct sentinels catch a swapped index), and None round-trips to None.
 """
 
 import unittest
@@ -36,7 +35,6 @@ class TestLinearRecurrentAttnBackendMetadataTrack(unittest.TestCase):
             has_initial_state=np.array([1, 0], dtype=np.int32),
             recurrent_track_indices=np.array([20, 21], dtype=np.int32),
             recurrent_track_mask=np.array([1, 0], dtype=np.int32),
-            recurrent_track_seqlens=np.array([128, 256], dtype=np.int32),
         )
 
         children, aux_data = md.tree_flatten()
@@ -51,9 +49,6 @@ class TestLinearRecurrentAttnBackendMetadataTrack(unittest.TestCase):
         np.testing.assert_array_equal(
             rebuilt.recurrent_track_mask, np.array([1, 0], dtype=np.int32)
         )
-        np.testing.assert_array_equal(
-            rebuilt.recurrent_track_seqlens, np.array([128, 256], dtype=np.int32)
-        )
 
     def test_track_arrays_none_round_trip(self):
         md = LinearRecurrentAttnBackendMetadata()
@@ -61,7 +56,6 @@ class TestLinearRecurrentAttnBackendMetadataTrack(unittest.TestCase):
 
         self.assertIsNone(rebuilt.recurrent_track_indices)
         self.assertIsNone(rebuilt.recurrent_track_mask)
-        self.assertIsNone(rebuilt.recurrent_track_seqlens)
 
 
 def _minimal_forward_batch(**overrides):
@@ -85,7 +79,6 @@ class TestForwardBatchTrackPytree(unittest.TestCase):
             recurrent_cow_src_indices=np.array([30, 31], dtype=np.int32),
             recurrent_track_indices=np.array([20, 21], dtype=np.int32),
             recurrent_track_mask=np.array([1, 0], dtype=np.int32),
-            recurrent_track_seqlens=np.array([128, 256], dtype=np.int32),
         )
 
         children, aux_data = fb.tree_flatten()
@@ -101,9 +94,6 @@ class TestForwardBatchTrackPytree(unittest.TestCase):
         np.testing.assert_array_equal(
             rebuilt.recurrent_track_mask, np.array([1, 0], dtype=np.int32)
         )
-        np.testing.assert_array_equal(
-            rebuilt.recurrent_track_seqlens, np.array([128, 256], dtype=np.int32)
-        )
 
     def test_track_arrays_none_round_trip(self):
         fb = _minimal_forward_batch()
@@ -113,7 +103,6 @@ class TestForwardBatchTrackPytree(unittest.TestCase):
 
         self.assertIsNone(rebuilt.recurrent_track_indices)
         self.assertIsNone(rebuilt.recurrent_track_mask)
-        self.assertIsNone(rebuilt.recurrent_track_seqlens)
 
 
 class _PingPongPool:
@@ -141,7 +130,6 @@ class TestRecurrentTrackEntryBuilder(unittest.TestCase):
         entry = _recurrent_track_entry(req, 256, interval=128, pool=_PingPongPool(), is_extend=True)
         self.assertTrue(entry.track_mask)
         self.assertEqual(entry.track_index, 40)  # slot BEFORE the flip
-        self.assertEqual(entry.track_seqlen, 256)
         self.assertEqual(req.recurrent_last_track_seqlen, 256)
         self.assertEqual(req.recurrent_next_track_idx, 1)  # flipped once
 
@@ -149,7 +137,7 @@ class TestRecurrentTrackEntryBuilder(unittest.TestCase):
         req = _FakeReq(extend_input_len=100, buffer=[40, 41], next_idx=0)
         entry = _recurrent_track_entry(req, 200, interval=128, pool=_PingPongPool(), is_extend=True)
         self.assertFalse(entry.track_mask)
-        self.assertEqual((entry.track_index, entry.track_seqlen), (0, -1))
+        self.assertEqual(entry.track_index, 0)
         self.assertIsNone(req.recurrent_last_track_seqlen)
         self.assertEqual(req.recurrent_next_track_idx, 0)  # untouched
 
@@ -180,7 +168,7 @@ class TestRecurrentTrackEntryBuilder(unittest.TestCase):
         out = _build_recurrent_track_entries(
             reqs, [200, 150], interval=128, pool=_PingPongPool(), is_extend=True
         )
-        self.assertEqual(out, (None, None, None))
+        self.assertEqual(out, (None, None))
         # No req mutated when nothing hit a boundary.
         self.assertTrue(all(r.recurrent_last_track_seqlen is None for r in reqs))
 
@@ -189,13 +177,11 @@ class TestRecurrentTrackEntryBuilder(unittest.TestCase):
             _FakeReq(extend_input_len=128, buffer=[40, 41], next_idx=0),  # hits 256
             _FakeReq(extend_input_len=50, buffer=[42, 43], next_idx=0),  # misses
         ]
-        indices, mask, seqlens = _build_recurrent_track_entries(
+        indices, mask = _build_recurrent_track_entries(
             reqs, [256, 150], interval=128, pool=_PingPongPool(), is_extend=True
         )
         np.testing.assert_array_equal(mask, np.array([1, 0], dtype=np.int32))
         np.testing.assert_array_equal(indices, np.array([40, 0], dtype=np.int32))
-        # track_seqlen == final_seq_len on the boundary row; -1 elsewhere.
-        np.testing.assert_array_equal(seqlens, np.array([256, -1], dtype=np.int32))
         # Only the hitting req flipped.
         self.assertEqual(reqs[0].recurrent_next_track_idx, 1)
         self.assertEqual(reqs[1].recurrent_next_track_idx, 0)

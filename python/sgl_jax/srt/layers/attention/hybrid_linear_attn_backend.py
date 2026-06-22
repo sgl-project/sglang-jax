@@ -36,7 +36,6 @@ class LinearRecurrentAttnBackendMetadata:
     # Optional: None until a later task populates the source.
     recurrent_track_indices: jax.Array = None
     recurrent_track_mask: jax.Array = None
-    recurrent_track_seqlens: jax.Array = None
 
     def tree_flatten(self):
         children = (
@@ -45,7 +44,6 @@ class LinearRecurrentAttnBackendMetadata:
             self.has_initial_state,
             self.recurrent_track_indices,
             self.recurrent_track_mask,
-            self.recurrent_track_seqlens,
         )
         aux_data = {}
         return children, aux_data
@@ -58,7 +56,6 @@ class LinearRecurrentAttnBackendMetadata:
             has_initial_state=children[2],
             recurrent_track_indices=children[3],
             recurrent_track_mask=children[4],
-            recurrent_track_seqlens=children[5],
         )
 
 
@@ -121,11 +118,6 @@ class LinearRecurrentAttnBackend(AttentionBackend):
         if batch.recurrent_track_mask is not None:
             (metadata.recurrent_track_mask,) = device_array(
                 (batch.recurrent_track_mask,),
-                sharding=NamedSharding(self.mesh, sharding_spec),
-            )
-        if batch.recurrent_track_seqlens is not None:
-            (metadata.recurrent_track_seqlens,) = device_array(
-                (batch.recurrent_track_seqlens,),
                 sharding=NamedSharding(self.mesh, sharding_spec),
             )
 
