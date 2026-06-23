@@ -1,4 +1,4 @@
-"""Tests for PD prefill side: sender release, prefill info validation/cache, host KV pool, jax transfer wrapper, KV gather, payload roundtrip, no-chunked-prefill guard."""
+"""Tests for PD prefill side: sender release, prefill info validation/cache, host KV pool, jax transfer wrapper, KV gather, payload roundtrip."""
 
 from __future__ import annotations
 
@@ -31,7 +31,6 @@ from sgl_jax.srt.disaggregation.prefill import (
     _jit_gather_one_layer,
     _pad_to_page_bucket,
 )
-from sgl_jax.srt.managers.utils import validate_pd_no_chunked_prefill
 from sgl_jax.srt.mem_cache.host_kv_pool import QueueHostKVPool, StagedData
 
 # ---- from test_pd_prefill_sender_release.py ----
@@ -722,37 +721,3 @@ def test_path_a_rollback_releases_only_registered_sub_uuids_no_double_free():
     assert w.released == ["uuid-1:a"]
     # pool slot was NEVER released (scheduler prefill-terminal callback owns it)
     assert pool.released == []
-
-
-# ---- from test_pd_no_chunked_prefill_guard.py ----
-
-
-def _req(seqlen: int) -> SimpleNamespace:
-    return SimpleNamespace(origin_input_ids=list(range(seqlen)))
-
-
-def test_non_pd_mode_never_rejects():
-    err = validate_pd_no_chunked_prefill(_req(100000), "null", 4096)
-    assert err is None
-
-
-def test_pd_under_limit_passes():
-    err = validate_pd_no_chunked_prefill(_req(4096), "prefill", 4096)
-    assert err is None
-
-
-def test_pd_over_limit_rejected():
-    err = validate_pd_no_chunked_prefill(_req(4097), "prefill", 4096)
-    assert err is not None
-    assert "chunked_prefill_size" in err
-
-
-def test_pd_decode_mode_over_limit_rejected():
-    err = validate_pd_no_chunked_prefill(_req(5000), "decode", 4096)
-    assert err is not None
-
-
-def test_disabled_chunked_prefill_never_rejects():
-    assert validate_pd_no_chunked_prefill(_req(100000), "prefill", None) is None
-    assert validate_pd_no_chunked_prefill(_req(100000), "prefill", 0) is None
-    assert validate_pd_no_chunked_prefill(_req(100000), "prefill", -1) is None

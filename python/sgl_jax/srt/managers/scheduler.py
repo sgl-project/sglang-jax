@@ -68,10 +68,7 @@ from sgl_jax.srt.managers.scheduler_output_processor_mixin import (
 from sgl_jax.srt.managers.scheduler_profiler_mixing import SchedulerProfilerMixin
 from sgl_jax.srt.managers.tp_worker import ModelWorker
 from sgl_jax.srt.managers.tp_worker_overlap_thread import ModelWorkerClient
-from sgl_jax.srt.managers.utils import (
-    validate_input_length,
-    validate_pd_no_chunked_prefill,
-)
+from sgl_jax.srt.managers.utils import validate_input_length
 from sgl_jax.srt.mem_cache.chunk_cache import ChunkCache
 from sgl_jax.srt.mem_cache.kv_cache_builder import build_kv_cache
 from sgl_jax.srt.mem_cache.swa_radix_cache import SWARadixCache
@@ -1068,17 +1065,6 @@ class Scheduler(
             req,
             self.max_req_input_len,
             self.server_args.allow_auto_truncate,
-        )
-        if error_msg:
-            req.set_finish_with_abort(error_msg)
-            self._add_request_to_queue(req)
-            return
-
-        # PD disaggregation does not support chunked prefill yet.
-        error_msg = validate_pd_no_chunked_prefill(
-            req,
-            self.server_args.disaggregation_mode,
-            self.server_args.chunked_prefill_size,
         )
         if error_msg:
             req.set_finish_with_abort(error_msg)

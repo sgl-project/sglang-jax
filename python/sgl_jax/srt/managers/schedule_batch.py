@@ -427,11 +427,16 @@ class Req:
             self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
             return
         # PD req with empty output_ids: skip match_prefix to avoid
-        # stale radix cache hits.
+        # stale radix cache hits, but preserve prefix_indices set by
+        # cache_unfinished_req for chunked-prefill continuation rounds
+        # (otherwise extend_input_len never shrinks and a req longer than
+        # chunked-prefill-size loops forever, and a budget-chunked short
+        # req leaks its first round's pages).
         if getattr(self, "bootstrap_room", None) is not None and not self.output_ids:
-            self.prefix_indices = []
-            self.last_matched_prefix_len = 0
-            self.extend_input_len = len(self.fill_ids)
+            if getattr(self, "is_chunked", 0) == 0:
+                self.prefix_indices = []
+                self.last_matched_prefix_len = 0
+            self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
             root = getattr(tree_cache, "root_node", None) if tree_cache is not None else None
             self.last_node = root
             self.last_host_node = root
