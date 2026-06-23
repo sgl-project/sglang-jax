@@ -97,9 +97,9 @@ The single-host eval/benchmark job is reproducible via
 | Capacity-gated decode admission | ✅ |
 | Prometheus metrics | ✅ |
 | Shared-secret auth (bootstrap / side channel) | ✅ |
-| Chunked prefill under PD | ✅ (validated with `--disable-radix-cache`) |
+| Chunked prefill under PD | ✅ (requires ChunkCache, i.e. `--disable-radix-cache`) |
 | `dp_size > 1` | ❌ |
-| Prefill radix / prefix cache reuse | ❌ |
+| Prefill radix / prefix cache reuse | ❌ (chunked prefill needs ChunkCache; RadixCache continuation is unimplemented) |
 | DP attention | ❌ |
 | Overlap / chunked transfer | ❌ |
 | SWA / MTP / EPD | ❌ |
