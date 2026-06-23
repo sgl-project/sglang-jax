@@ -7,6 +7,14 @@ Named blind spots explicitly covered:
 - RoPE multi-position I2 equivariance (relative-pair logit invariance)
 - gate broadcast axis (per-head sigmoid scaling, not transposed/mis-broadcast)
 - per-head QK RMS (each head normalized to RMS≈1, not just the flat projection)
+- SWA windowness (Q8 / RFC §6 caveat): naive-reference variant — out-of-window
+  tokens must not affect output at m; in-window changes must affect it.
+
+  NOTE: This SWA test uses a naive JAX reference (explicit sliding causal mask)
+  rather than the real RadixAttention/ragged_paged_attention kernel, because that
+  kernel is a Pallas/TPU kernel that cannot run under JAX_PLATFORMS=cpu.
+  # TODO(step3p5-plan4): add RadixAttention-backed single-layer windowness test
+  # when TPU execution is available and the kernel supports interpret mode.
 
 Run from python/ directory::
 
@@ -632,6 +640,229 @@ class TestHeadWiseGate(unittest.TestCase):
             self.attn_full.num_heads,
             self.attn_slide.num_heads,
             "full and sliding num_heads should differ in tiny config (4 vs 6)",
+        )
+
+
+# ===========================================================================
+# SWA windowness boundary test (Q8 / RFC §6 caveat) — naive-reference variant
+# ===========================================================================
+
+
+def _naive_sliding_attention_output(
+    hidden_states: np.ndarray,
+    positions: np.ndarray,
+    attn_module,
+    window: int,
+    mesh,
+) -> np.ndarray:
+    """Compute single-layer Step3p5Attention output using a naive JAX
+    reference (explicit sliding causal mask) instead of the RadixAttention
+    kernel.
+
+    This runs the module's own q/k/v projections, QK-norm, RoPE, and head-wise
+    gate exactly as Step3p5Attention.__call__ would, but replaces the
+    RadixAttention call (which delegates to a Pallas/TPU kernel) with plain
+    numpy einsum + softmax + an explicit sliding causal mask.
+
+    Sharded JAX arrays produced by the module sub-ops are converted to plain
+    numpy before the naive attention einsum to avoid JAX sharding constraint
+    violations on the intermediate [H, T_q, T_kv] logit tensor.
+
+    Returns: np.ndarray of shape [T, hidden_size].
+
+    # TODO(step3p5-plan4): replace this naive reference with a real
+    # RadixAttention-backed call once TPU execution (or Pallas interpret mode)
+    # is available in the test environment.
+    """
+    hs = jnp.array(hidden_states)  # [T, hidden_size]
+    pos = jnp.array(positions, dtype=jnp.int32)  # [T]
+    T = hs.shape[0]
+    head_dim = attn_module.head_dim
+    num_heads = attn_module.num_heads
+    num_kv_heads = attn_module.num_kv_heads
+
+    with jax.set_mesh(mesh):
+        # Gate (from attention INPUT, before projection)
+        gate_states_np: np.ndarray | None = None
+        if attn_module.use_head_wise_attn_gate:
+            gate_jax, _ = attn_module.g_proj(hs)  # [T, num_heads]
+            gate_states_np = np.asarray(gate_jax, dtype=np.float32)
+
+        # Projections + QK-norm + RoPE  (all within mesh context for sharding)
+        q_flat, _ = attn_module.q_proj(hs)  # [T, num_heads * head_dim]
+        k_flat, _ = attn_module.k_proj(hs)  # [T, num_kv_heads * head_dim]
+        v_flat, _ = attn_module.v_proj(hs)  # [T, num_kv_heads * head_dim]
+
+        q_jax = q_flat.reshape(T, num_heads, head_dim)
+        k_jax = k_flat.reshape(T, num_kv_heads, head_dim)
+        v_jax = v_flat.reshape(T, num_kv_heads, head_dim)
+
+        q_jax = attn_module.q_norm(q_jax)
+        k_jax = attn_module.k_norm(k_jax)
+
+        q_jax, k_jax = attn_module.rotary_emb(pos, q_jax, k_jax)
+
+    # Convert to plain numpy to avoid JAX sharding constraints in the
+    # naive [H, T_q, T_kv] attention computation.
+    q_np = np.asarray(q_jax, dtype=np.float32)  # [T, num_heads, head_dim]
+    k_np = np.asarray(k_jax, dtype=np.float32)  # [T, num_kv_heads, head_dim]
+    v_np = np.asarray(v_jax, dtype=np.float32)  # [T, num_kv_heads, head_dim]
+
+    # GQA expansion: [T, num_kv_heads, D] -> [T, num_heads, D]
+    num_query_per_kv = num_heads // num_kv_heads
+    k_exp = np.repeat(k_np, num_query_per_kv, axis=1)  # [T, num_heads, head_dim]
+    v_exp = np.repeat(v_np, num_query_per_kv, axis=1)  # [T, num_heads, head_dim]
+
+    # Naive causal attention with explicit sliding window mask (pure numpy)
+    scale = head_dim**-0.5
+    # attn_weights: [num_heads, T_q, T_kv]
+    attn_weights = np.einsum("qhd,khd->hqk", q_np, k_exp) * scale
+
+    # Build combined causal + sliding-window mask
+    q_idx = np.arange(T)  # [T]
+    k_idx = np.arange(T)  # [T]
+    causal_mask = q_idx[:, None] >= k_idx[None, :]  # causal: q >= k
+    window_mask = (q_idx[:, None] - k_idx[None, :]) < window  # in window: q - k < W
+    valid = causal_mask & window_mask  # [T, T]
+
+    mask_val = np.finfo(np.float32).min / 2
+    attn_weights = np.where(valid[None, :, :], attn_weights, mask_val)
+
+    # Numerically stable softmax over kv axis
+    attn_weights -= attn_weights.max(axis=-1, keepdims=True)
+    exp_w = np.exp(attn_weights)
+    attn_probs = (exp_w / exp_w.sum(axis=-1, keepdims=True)).astype(np.float32)
+
+    # attn_output: [T, num_heads, head_dim]
+    attn_out_np = np.einsum("hqk,khd->qhd", attn_probs, v_exp)  # [T, H, D]
+
+    # Head-wise gate and o_proj (back in JAX for the module's linear layer)
+    attn_out_jax = jnp.array(attn_out_np, dtype=jnp.float32)
+
+    with jax.set_mesh(mesh):
+        if attn_module.use_head_wise_attn_gate:
+            assert gate_states_np is not None
+            gate = jax.nn.sigmoid(jnp.array(gate_states_np))  # [T, num_heads]
+            attn_out_jax = attn_out_jax * gate[:, :, None]  # [T, H, D]
+
+        attn_out_flat = attn_out_jax.reshape(T, num_heads * head_dim)
+        output, _ = attn_module.o_proj(attn_out_flat)
+
+    return np.asarray(output, dtype=np.float32)  # [T, hidden_size]
+
+
+class TestSWAWindownessNaiveRef(unittest.TestCase):
+    """SWA windowness single-layer test (Q8 / RFC §6 caveat) — naive-reference variant.
+
+    Verifies that for a sliding_attention layer with window W over a prefill of
+    N > W tokens:
+    - (invariance)   changing tokens strictly outside position m's window
+                     [m-W+1, m] does NOT change the output at m.
+    - (positive ctrl) changing a token INSIDE m's window DOES change the output
+                     at m, confirming the test can actually fail if windowing
+                     is broken or absent.
+
+    Implementation uses a naive JAX attention with an explicit sliding causal
+    mask applied to the actual q/k/v computed by the module's own projections,
+    QK-norm, RoPE, and head-wise gate.  The RadixAttention kernel is NOT invoked.
+
+    # TODO(step3p5-plan4): complement with a RadixAttention-backed single-layer
+    # windowness test when the Pallas kernel supports CPU/interpret mode.
+    """
+
+    # Small window and sequence so the test is cheap and clearly crosses the
+    # window boundary.  W=4, N=12 means tokens 0..7 are outside the window of
+    # the last query (m=11): window is [8, 9, 10, 11].
+    _W = 4  # sliding window size
+    _N = 12  # prefill sequence length (must be > W)
+    # Query position under test: the last token in the sequence
+    _M = _N - 1  # = 11
+
+    def setUp(self):
+        # Build a sliding_attention layer (layer_id=1 in tiny config)
+        self.cfg = _tiny_full_config()
+        # Override sliding_window to our small W
+        self.cfg.sliding_window = self._W
+        self.mesh = _make_mesh()
+        with jax.set_mesh(self.mesh):
+            self.attn_slide = _build_attention(self.cfg, layer_id=1, mesh=self.mesh)
+
+        rng = np.random.default_rng(1234)
+        self.hidden_size = self.cfg.hidden_size
+        self.base_hs = rng.standard_normal((self._N, self.hidden_size)).astype(np.float32)
+        self.positions = np.arange(self._N, dtype=np.int32)
+
+    def _run(self, hidden_states: np.ndarray) -> np.ndarray:
+        """Run the naive-reference sliding attention, return [N, hidden_size] fp32."""
+        return _naive_sliding_attention_output(
+            hidden_states,
+            self.positions,
+            self.attn_slide,
+            window=self._W,
+            mesh=self.mesh,
+        )
+
+    def test_out_of_window_tokens_do_not_affect_output(self):
+        """Changing tokens outside [m-W+1, m] must NOT change output at m.
+
+        Invariance assertion: the sliding-window mask must prevent any
+        token strictly before position m-W+1 from influencing output[m].
+        """
+        m = self._M
+        W = self._W
+        # Window for m: [m - W + 1 .. m]  (inclusive both ends)
+        window_start = m - W + 1  # = 8
+
+        out_base = self._run(self.base_hs)
+
+        # Perturb every token strictly OUTSIDE the window (positions 0 .. window_start-1)
+        rng = np.random.default_rng(9999)
+        perturbed = self.base_hs.copy()
+        for pos in range(0, window_start):  # positions 0..7
+            perturbed[pos] = rng.standard_normal(self.hidden_size).astype(np.float32) * 5.0
+
+        out_perturbed = self._run(perturbed)
+
+        np.testing.assert_allclose(
+            out_perturbed[m],
+            out_base[m],
+            atol=1e-4,
+            err_msg=(
+                f"Output at position {m} changed after perturbing tokens outside "
+                f"window [{window_start}, {m}].  The sliding-window mask is not "
+                "correctly preventing out-of-window tokens from influencing this query."
+            ),
+        )
+
+    def test_in_window_token_change_does_affect_output(self):
+        """Changing a token INSIDE [m-W+1, m] MUST change output at m.
+
+        Positive control: if this fails, the test is not discriminative
+        (e.g. the layer is degenerate or the oracle is broken).
+        """
+        m = self._M
+        W = self._W
+        window_start = m - W + 1  # = 8
+        # Pick the token just inside the window boundary (window_start itself)
+        inside_pos = window_start
+
+        out_base = self._run(self.base_hs)
+
+        rng = np.random.default_rng(7777)
+        perturbed = self.base_hs.copy()
+        # Large perturbation to ensure it propagates
+        perturbed[inside_pos] = rng.standard_normal(self.hidden_size).astype(np.float32) * 10.0
+
+        out_perturbed = self._run(perturbed)
+
+        max_diff = float(np.abs(out_perturbed[m] - out_base[m]).max())
+        self.assertGreater(
+            max_diff,
+            1e-3,
+            f"Positive control FAILED: changing token {inside_pos} (inside window "
+            f"[{window_start}, {m}]) did not change output at position {m} "
+            f"(max_diff={max_diff:.2e}).  "
+            "Either the layer is degenerate or the naive-reference oracle is broken.",
         )
 
 
