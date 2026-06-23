@@ -183,10 +183,10 @@ def _build_checkpoint(cfg) -> dict[str, np.ndarray]:
             weights[f"{p}.moe.gate_proj.weight"] = _rand(E, M, H)
             weights[f"{p}.moe.up_proj.weight"] = _rand(E, M, H)
             weights[f"{p}.moe.down_proj.weight"] = _rand(E, H, M)
-            # Shared expert [out, in]
-            weights[f"{p}.moe.share_expert.gate_proj.weight"] = _rand(S, H)
-            weights[f"{p}.moe.share_expert.up_proj.weight"] = _rand(S, H)
-            weights[f"{p}.moe.share_expert.down_proj.weight"] = _rand(H, S)
+            # Shared expert [out, in] — real checkpoint key is share_expert.* (no moe. prefix).
+            weights[f"{p}.share_expert.gate_proj.weight"] = _rand(S, H)
+            weights[f"{p}.share_expert.up_proj.weight"] = _rand(S, H)
+            weights[f"{p}.share_expert.down_proj.weight"] = _rand(H, S)
 
     return weights
 
@@ -299,6 +299,23 @@ class TestStep3p5WeightLoading(unittest.TestCase):
             np.asarray(loaded_wi0),
             np.asarray(expected),
             err_msg="wi_0 must equal transpose(0,2,1) of checkpoint gate_proj",
+        )
+
+    def test_shared_expert_weight_loaded(self):
+        """MoE layer 2 shared-expert gate_proj is loaded (key is share_expert.*, not moe.*)."""
+        cfg = _make_config()
+        model, src = self._build_model_and_load(cfg)
+
+        src_gate = jnp.asarray(src["model.layers.2.share_expert.gate_proj.weight"]).astype(
+            jnp.bfloat16
+        )
+        # LinearBase transposes [out, in] → [in, out].
+        expected = jnp.transpose(src_gate, (1, 0))
+        loaded = jnp.asarray(model.model.layers[2].mlp.shared_experts.gate_proj.weight.value)
+        np.testing.assert_array_equal(
+            np.asarray(loaded),
+            np.asarray(expected),
+            err_msg="shared_experts.gate_proj must be loaded from share_expert.* (not random init)",
         )
 
     def test_lm_head_loaded(self):
