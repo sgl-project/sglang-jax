@@ -141,9 +141,9 @@ def _build_checkpoint_np() -> dict[str, np.ndarray]:
             w[f"{p}.moe.gate_proj.weight"] = _rand(E, M, H)
             w[f"{p}.moe.up_proj.weight"] = _rand(E, M, H)
             w[f"{p}.moe.down_proj.weight"] = _rand(E, H, M)
-            w[f"{p}.moe.share_expert.gate_proj.weight"] = _rand(S, H)
-            w[f"{p}.moe.share_expert.up_proj.weight"] = _rand(S, H)
-            w[f"{p}.moe.share_expert.down_proj.weight"] = _rand(H, S)
+            w[f"{p}.share_expert.gate_proj.weight"] = _rand(S, H)
+            w[f"{p}.share_expert.up_proj.weight"] = _rand(S, H)
+            w[f"{p}.share_expert.down_proj.weight"] = _rand(H, S)
     return w
 
 
@@ -438,14 +438,6 @@ def _print_alignment_table(
     print(f" First failing (layer, stage): {ff_str}")
     all_ok = all(v in ("pass", "MISSING") for _, _, _, _, _, v in rows)
     print(f" All stages within floor: {'YES' if all_ok else 'NO'}")
-    print(
-        "\n NOTE: JAX decoder input_layernorm/post_attention_layernorm use"
-        "\n   add_unit_offset=False => normed * weight."
-        "\n   HF Step3p5RMSNorm always does normed * (weight + 1)."
-        "\n   With same loaded weights this DIVERGES. ln_in/layer_out/final_norm"
-        "\n   stages are expected to EXCEED floor. This is a wiring discrepancy,"
-        "\n   not a harness bug."
-    )
     print(sep)
 
 
@@ -457,19 +449,13 @@ def _print_alignment_table(
 class TestStep3p5Alignment(unittest.TestCase):
     """Real HF eager oracle vs JAX naive fp32 forward — per-stage/layer error table.
 
-    NOTE: JAX decoder norms use add_unit_offset=False (normed * weight) while
-    HF Step3p5RMSNorm always does normed * (weight + 1). With the same checkpoint
-    weights, ln_in/layer_out/final_norm stages WILL diverge — this is a real wiring
-    discrepancy. The test documents it in the table and skips assertion for those stages.
+    Asserts embedding bit-exact and every stage within the fp32 implementation
+    floor. The first stage exceeding the floor localizes a wiring bug.
     """
 
     FLOOR = 2e-5
     SAFETY = 10.0
     NUM_TOKENS = 12
-
-    # Stages where HF and JAX diverge by design (layernorm formula mismatch).
-    # assert only on embed and attn (before layernorm formula affects downstream).
-    _DIVERGE_STAGES = {"ln_in", "layer_out", "final_norm", "attn"}
 
     def test_hf_jax_alignment(self) -> None:
         from sgl_jax.srt.models.step3p5 import Step3p5ForCausalLM
@@ -534,8 +520,7 @@ class TestStep3p5Alignment(unittest.TestCase):
             rel_err, cosine = _compute_error_metrics(hf_caps[key], jax_caps[key])
             exceeds = rel_err > self.FLOOR * self.SAFETY
             verdict = "EXCEED" if exceeds else "pass"
-            # Track first unexpected failure (diverge stages are expected to fail).
-            if exceeds and first_fail is None and stage not in self._DIVERGE_STAGES:
+            if exceeds and first_fail is None:
                 first_fail = key
             rows.append((stage, layer, rel_err, cosine, self.FLOOR, verdict))
 
@@ -544,35 +529,22 @@ class TestStep3p5Alignment(unittest.TestCase):
             rows, self.FLOOR, self.SAFETY, embed_bit_exact, first_fail, embed_max_diff
         )
 
-        # 10. Assertions.
+        # 10. Assertions — full gate, no per-stage exemptions.
         self.assertTrue(
             embed_bit_exact,
             f"Embedding NOT bit-exact: max_abs_diff={embed_max_diff:.3e}. "
             "Weight load mismatch for embed_tokens.",
         )
 
-        for stage, layer, rel_err, cosine, floor, verdict in rows:
-            if verdict in ("MISSING", "EXCEED"):
-                continue
-            # All stages marked "pass" must be within tolerance.
-            self.assertLessEqual(
-                rel_err,
-                floor * self.SAFETY,
-                f"Unexpected alignment failure at stage={stage}, layer={layer}: "
-                f"rel_err={rel_err:.3e} > {floor * self.SAFETY:.3e}",
-            )
-
-        # Emit summary for CI log visibility.
-        all_diverge = [
-            (stage_name, layer_id)
-            for stage_name, layer_id, re, cs, fl, v in rows
-            if v == "EXCEED" and stage_name not in self._DIVERGE_STAGES
-        ]
+        exceeded = [(s, lyr, re) for s, lyr, re, cs, fl, v in rows if v == "EXCEED"]
         self.assertEqual(
-            all_diverge,
+            exceeded,
             [],
-            f"Non-layernorm stages exceeded threshold: {all_diverge}. " "See table above.",
+            f"Stages exceeded fp32 floor (first = {first_fail}, the wiring-bug "
+            f"localization point): {exceeded}. See table above.",
         )
+        missing = [(s, lyr) for s, lyr, re, cs, fl, v in rows if v == "MISSING"]
+        self.assertEqual(missing, [], f"Stages not captured: {missing}. See table above.")
 
 
 if __name__ == "__main__":

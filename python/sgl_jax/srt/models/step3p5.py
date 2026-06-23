@@ -470,10 +470,10 @@ class Step3p5DecoderLayer(nnx.Module):
             )
 
         self.input_layernorm = GemmaRMSNorm(
-            config.hidden_size, epsilon=config.rms_norm_eps, add_unit_offset=False
+            config.hidden_size, epsilon=config.rms_norm_eps, add_unit_offset=True
         )
         self.post_attention_layernorm = GemmaRMSNorm(
-            config.hidden_size, epsilon=config.rms_norm_eps, add_unit_offset=False
+            config.hidden_size, epsilon=config.rms_norm_eps, add_unit_offset=True
         )
 
     def __call__(
@@ -552,7 +552,7 @@ class Step3p5Model(nnx.Module):
         )
 
         self.norm = GemmaRMSNorm(
-            config.hidden_size, epsilon=config.rms_norm_eps, add_unit_offset=False
+            config.hidden_size, epsilon=config.rms_norm_eps, add_unit_offset=True
         )
 
     def __call__(
@@ -779,13 +779,13 @@ class Step3p5ForCausalLM(nnx.Module):
                 transpose=True,
             )
 
-        # Shared expert (always-on): moe.share_expert.{gate,up,down}_proj.
+        # Shared expert (always-on): share_expert.{gate,up,down}_proj (HF path, no "moe." prefix).
         for proj, sharding in [
             ("gate_proj", (None, "tensor")),
             ("up_proj", (None, "tensor")),
             ("down_proj", ("tensor", None)),
         ]:
-            mappings[f"{prefix}.moe.share_expert.{proj}.weight"] = WeightMapping(
+            mappings[f"{prefix}.share_expert.{proj}.weight"] = WeightMapping(
                 target_path=f"{target}.mlp.shared_experts.{proj}.weight",
                 sharding=sharding,
                 transpose=True,
