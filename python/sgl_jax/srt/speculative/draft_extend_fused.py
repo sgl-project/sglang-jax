@@ -1816,9 +1816,7 @@ def spec_decode_verify(spec_worker, model_worker_batch, cur_allocate_lens):
     _sv_enable_top_p = False
     if _sv_is_greedy:
         _sv_temps = _prepare_device_array(np.ones((_sv_tbs, 1), np.float32), data_sharding)
-        _sv_topks = _prepare_device_array(
-            np.full((_sv_tbs,), TOP_K_ALL, np.int32), data_sharding
-        )
+        _sv_topks = _prepare_device_array(np.full((_sv_tbs,), TOP_K_ALL, np.int32), data_sharding)
         _sv_topps = _prepare_device_array(np.ones((_sv_tbs,), np.float32), data_sharding)
     else:
         (

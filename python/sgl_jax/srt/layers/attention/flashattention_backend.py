@@ -214,9 +214,9 @@ class FlashAttention(AttentionBackend):
         if batch.forward_mode == ForwardMode.TARGET_VERIFY:
             metadata.custom_mask = batch.spec_info_padded.custom_mask
             if metadata.custom_mask is not None:
-                assert metadata.custom_mask.dtype != jnp.bool_, (
-                    "custom_mask bool dtype is not supported; use int32 instead."
-                )
+                assert (
+                    metadata.custom_mask.dtype != jnp.bool_
+                ), "custom_mask bool dtype is not supported; use int32 instead."
         else:
             metadata.custom_mask = None
 
