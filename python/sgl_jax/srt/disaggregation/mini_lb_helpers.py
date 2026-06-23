@@ -20,11 +20,36 @@ def generate_bootstrap_room() -> int:
 
 
 def get_request_batch_size(request: dict[str, Any]) -> int | None:
+    base_size = _get_base_batch_size(request)
+    return None if base_size == 1 else base_size
+
+
+def _get_base_batch_size(request: dict[str, Any]) -> int:
     if (text := request.get("text")) is not None:
-        return None if isinstance(text, str) else len(text)
+        return 1 if isinstance(text, str) else len(text)
     if (input_ids := request.get("input_ids")) is not None:
-        return None if isinstance(input_ids[0], int) else len(input_ids)
-    return None
+        if not input_ids or isinstance(input_ids[0], int):
+            return 1
+        return len(input_ids)
+    if (prompt := request.get("prompt")) is not None:
+        if isinstance(prompt, str):
+            return 1
+        if not prompt or isinstance(prompt[0], int):
+            return 1
+        return len(prompt)
+    return 1
+
+
+def get_parallel_sample_num(request: dict[str, Any]) -> int:
+    if "n" in request:
+        return int(request.get("n") or 1)
+
+    sampling_params = request.get("sampling_params")
+    if isinstance(sampling_params, dict):
+        return int(sampling_params.get("n") or 1)
+    if isinstance(sampling_params, list) and sampling_params:
+        return int(sampling_params[0].get("n") or 1)
+    return 1
 
 
 def _expand_identity_field(value: Any, batch_size: int) -> list[str]:
@@ -48,22 +73,18 @@ def ensure_request_identity_fields(
     disagg_transfer_id = modified_request.get("disagg_transfer_id")
 
     if rid is None and disagg_transfer_id is None:
-        if batch_size is None:
-            rid = uuid.uuid4().hex
-            disagg_transfer_id = rid
-        else:
-            rid = [uuid.uuid4().hex for _ in range(batch_size)]
-            disagg_transfer_id = list(rid)
+        rid = uuid.uuid4().hex
+        disagg_transfer_id = rid
     elif rid is None:
         rid = disagg_transfer_id
     elif disagg_transfer_id is None:
         disagg_transfer_id = rid
 
     # GenerateReqInput expands a scalar rid into per-item ids ("{rid}_{i}") but
-    # uses disagg_transfer_id as-is. Expand both to aligned per-item lists so
-    # each element carries a unique, P/D-consistent transfer id.
+    # uses disagg_transfer_id as-is. Keep scalar rid on the existing path and
+    # expand only the transfer id so each element carries a unique,
+    # P/D-consistent transfer identity.
     if batch_size is not None:
-        rid = _expand_identity_field(rid, batch_size)
         disagg_transfer_id = _expand_identity_field(disagg_transfer_id, batch_size)
 
     modified_request["rid"] = rid

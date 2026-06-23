@@ -169,10 +169,10 @@ class CompletionRequest(BaseModel):
     session_params: dict | None = None
 
     # For PD disaggregation
-    bootstrap_host: str | None = None
-    bootstrap_port: int | None = None
-    bootstrap_room: int | None = None
-    disagg_transfer_id: str | None = None
+    bootstrap_host: list[str] | str | None = None
+    bootstrap_port: list[int] | int | None = None
+    bootstrap_room: list[int] | int | None = None
+    disagg_transfer_id: list[str] | str | None = None
 
     # For request id
     rid: list[str] | str | None = None

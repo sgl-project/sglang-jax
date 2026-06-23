@@ -225,7 +225,10 @@ try:
     from fastapi import FastAPI, HTTPException
     from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 
-    from sgl_jax.srt.disaggregation.mini_lb_helpers import inject_bootstrap_fields
+    from sgl_jax.srt.disaggregation.mini_lb_helpers import (
+        get_parallel_sample_num,
+        inject_bootstrap_fields,
+    )
 
     app = FastAPI()
     lb: MiniLoadBalancer | None = None
@@ -346,6 +349,11 @@ try:
         return await _get_model_info_impl()
 
     async def _do_forward(request_data: dict, endpoint_name: str):
+        if get_parallel_sample_num(request_data) > 1:
+            raise HTTPException(
+                status_code=400,
+                detail="PD mini_lb does not support parallel sampling (n > 1)",
+            )
         prefill_server, bootstrap_port, decode_server = lb.select_pair()
         modified_request = inject_bootstrap_fields(
             request_data,

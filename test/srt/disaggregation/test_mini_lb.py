@@ -61,6 +61,12 @@ class TestGetRequestBatchSize:
     def test_batch_input_ids(self):
         assert get_request_batch_size({"input_ids": [[1, 2], [3, 4], [5, 6]]}) == 3
 
+    def test_batch_prompt_strings(self):
+        assert get_request_batch_size({"prompt": ["hello", "world"]}) == 2
+
+    def test_batch_prompt_token_ids(self):
+        assert get_request_batch_size({"prompt": [[1, 2], [3, 4], [5, 6]]}) == 3
+
     def test_no_prompt_field(self):
         assert get_request_batch_size({"other": "value"}) is None
 
@@ -85,9 +91,17 @@ class TestEnsureRequestIdentityFields:
 
     def test_batch_generates_list(self):
         result = ensure_request_identity_fields({"text": ["a", "b", "c"]})
-        assert isinstance(result["rid"], list)
-        assert len(result["rid"]) == 3
-        assert result["rid"] == result["disagg_transfer_id"]
+        assert isinstance(result["rid"], str)
+        assert result["disagg_transfer_id"] == [
+            f"{result['rid']}_0",
+            f"{result['rid']}_1",
+            f"{result['rid']}_2",
+        ]
+
+    def test_completion_prompt_batch_generates_aligned_transfer_ids(self):
+        result = ensure_request_identity_fields({"prompt": ["a", "b"], "rid": "cmpl"})
+        assert result["rid"] == "cmpl"
+        assert result["disagg_transfer_id"] == ["cmpl_0", "cmpl_1"]
 
     def test_does_not_mutate_input(self):
         original = {"text": "hello"}
@@ -316,6 +330,18 @@ class TestV1CompletionsEndpoint:
             },
         )
         assert response.status_code == 200
+
+    def test_parallel_sampling_rejected(self, client):
+        response = client.post(
+            "/v1/completions",
+            json={
+                "model": "test",
+                "prompt": "hello",
+                "n": 2,
+            },
+        )
+        assert response.status_code == 400
+        assert "n > 1" in response.json()["detail"]
 
 
 class TestBootstrapInjection:
@@ -727,6 +753,20 @@ class TestProtocolFields:
         assert req.bootstrap_port == 9998
         assert req.bootstrap_room == 67890
         assert req.disagg_transfer_id == "tid-002"
+
+    def test_completion_request_accepts_batch_bootstrap_fields(self):
+        req = CompletionRequest(
+            model="test",
+            prompt=["hello", "world"],
+            bootstrap_host=["10.0.0.1", "10.0.0.1"],
+            bootstrap_port=[8998, 8998],
+            bootstrap_room=[1, 2],
+            disagg_transfer_id=["tid-0", "tid-1"],
+        )
+        assert req.bootstrap_host == ["10.0.0.1", "10.0.0.1"]
+        assert req.bootstrap_port == [8998, 8998]
+        assert req.bootstrap_room == [1, 2]
+        assert req.disagg_transfer_id == ["tid-0", "tid-1"]
 
     def test_bootstrap_fields_default_none(self):
         req = ChatCompletionRequest(

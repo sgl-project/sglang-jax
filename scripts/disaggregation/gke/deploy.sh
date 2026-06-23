@@ -4,6 +4,9 @@
 # Usage:
 #   ./scripts/disaggregation/gke/deploy.sh [--delete-only]
 #
+# Optional overrides:
+#   JOB_NAME=... GH_ORG=... BRANCH=... ./scripts/disaggregation/gke/deploy.sh
+#
 # Prerequisites:
 #   - gcloud + kubectl configured, USE_GKE_GCLOUD_AUTH_PLUGIN=True
 #   - Cluster ainfer-tpu-bench with node pool pd-v6e-1 (2 x ct6e-standard-1t)
@@ -11,9 +14,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-JOB_NAME="pd-singlehost-eval"
-GH_ORG="cjx0709"
-BRANCH="pd/probe-pull-timing-0611"
+JOB_NAME="${JOB_NAME:-pd-singlehost-eval}"
+GH_ORG="${GH_ORG:-sgl-project}"
+BRANCH="${BRANCH:-main}"
 TEMPLATE="${SCRIPT_DIR}/pd_singlehost_eval_job.yaml"
 GENERATED="/tmp/${JOB_NAME}.yaml"
 

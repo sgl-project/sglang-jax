@@ -97,7 +97,7 @@ The single-host eval/benchmark job is reproducible via
 | Capacity-gated decode admission | ✅ |
 | Prometheus metrics | ✅ |
 | Shared-secret auth (bootstrap / side channel) | ✅ |
-| Chunked prefill under PD | ❌ (guarded by `validate_pd_no_chunked_prefill`) |
+| Chunked prefill under PD | ✅ (validated with `--disable-radix-cache`) |
 | `dp_size > 1` | ❌ |
 | Prefill radix / prefix cache reuse | ❌ |
 | DP attention | ❌ |
