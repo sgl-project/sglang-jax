@@ -6,7 +6,10 @@ experts.{i}.gate_proj.weight keys used by earlier MoE models (e.g. Qwen3-MoE).
 
 Three test groups:
 1. Predicate hard-gate — mirrors the exact branch condition; self-contained.
-2. End-to-end loader — builds a tiny safetensors checkpoint, loads via
+2. Dispatch routing spy — patches the real loader methods to verify the actual
+   dispatch predicate (_tgt_param.value.shape[0]) routes correctly for both
+   positive (prestacked) and negative (fallthrough to stacked) cases.
+3. End-to-end loader — builds a tiny safetensors checkpoint, loads via
    WeightLoader, verifies the transposed result.
 
 The regression sentinel (test_qwen3_5.py — 9 passed) is run separately by
@@ -18,6 +21,7 @@ from __future__ import annotations
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from unittest.mock import patch
 
 import jax
 import jax.numpy as jnp
@@ -45,12 +49,26 @@ jax.sharding.set_mesh(_MESH)
 
 
 def _predicate(expected_hf_keys: list[str], weight_info: dict, num_experts: int) -> bool:
-    """Mirrors the dispatch condition in weight_utils.py.
+    """Mirrors the dispatch condition in WeightLoader.load_weights_from_safetensors.
+
+    See weight_utils.py, function load_weights_from_safetensors, the block starting
+    with ``if len(expected_hf_keys) == 1:`` (~line 2122).  The real predicate is::
+
+        len(expected_hf_keys) == 1
+        and len(_shape0) == 3
+        and _shape0[0] == _tgt_param.value.shape[0]
+
+    Here ``num_experts`` stands in for ``_tgt_param.value.shape[0]``.
+
+    IMPORTANT: This helper MUST stay in sync with the real dispatch predicate.
+    If the predicate in weight_utils.py changes, update this function to match.
+    The spy-based tests in TestDispatchRouting exercise the REAL predicate directly
+    and will catch drift that these unit tests cannot.
 
     Returns True iff:
       - exactly one source key, AND
       - that tensor is 3-D, AND
-      - its leading dim matches num_experts.
+      - its leading dim matches num_experts (== target param's leading dim).
     """
     if len(expected_hf_keys) != 1:
         return False
@@ -99,7 +117,155 @@ class TestPredicateTriggersOnlyOnSingle3dELeading:
 
 
 # ---------------------------------------------------------------------------
-# 2. End-to-end loader tests
+# 2. Dispatch routing spy tests (binds test to the REAL predicate)
+# ---------------------------------------------------------------------------
+
+
+class TestDispatchRouting:
+    """Verify the REAL dispatch predicate in load_weights_from_safetensors.
+
+    The predicate (weight_utils.py ~line 2122-2127) routes to
+    ``_create_prestacked_moe_lazy_tensor`` iff:
+      - len(expected_hf_keys) == 1
+      - len(_shape0) == 3
+      - _shape0[0] == _tgt_param.value.shape[0]
+
+    We patch both creator methods with spies to assert which one is called,
+    binding the tests to the actual ``_tgt_param.value.shape[0]`` comparison
+    rather than a hand-copied parallel predicate.
+    """
+
+    def _make_loader_and_model(self, tmp_dir: Path, E: int, out: int, in_: int, source_shape):
+        """Write a safetensors file with shape ``source_shape`` and build a
+        WeightLoader scaffold targeting a param of shape ``[E, in_, out]``."""
+        source = np.ones(source_shape, dtype=np.float32)
+        st_file = tmp_dir / "model.safetensors"
+        save_file({"moe.gate_proj.weight": source}, str(st_file))
+
+        model = _MinimalModel(E=E, in_=in_, out=out)
+
+        loader = object.__new__(WeightLoader)
+        loader.model = model
+        loader.model_config = _DummyModelConfig(model_path=str(tmp_dir))
+        loader.mesh = _MESH
+        loader.dtype = jnp.float32
+        loader.dummy_mode = False
+        loader._weight_info_cache = None
+        loader.sharding_size = 1
+        loader.moe_abstract_mesh = None
+        loader._maybe_convert_epmoe_scale_for_kernel = lambda w, _mp, _path: w
+        loader._is_excluded_layer_weight = lambda _k: False
+        loader._normalize_physical_to_logical_map = (
+            lambda *, physical_to_logical_map, **_kw: physical_to_logical_map
+        )
+
+        moe_key = "__MOE_EXPERTS__moe.gate_proj"
+        mapping = WeightMapping(
+            target_path=["experts.wi_0", "moe.gate_proj.weight"],
+            sharding=(None, None, None),
+            transpose=True,
+        )
+        return loader, moe_key, mapping
+
+    def test_positive_case_calls_prestacked(self):
+        """Single 3-D [E, out, in] source whose leading dim == param.shape[0]
+        must call _create_prestacked_moe_lazy_tensor."""
+        E, out, in_ = 4, 16, 8
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            loader, moe_key, mapping = self._make_loader_and_model(
+                tmp_dir, E=E, out=out, in_=in_, source_shape=(E, out, in_)
+            )
+
+            prestacked_calls = []
+            stacked_calls = []
+
+            real_prestacked = WeightLoader._create_prestacked_moe_lazy_tensor.__get__(
+                loader, WeightLoader
+            )
+            real_stacked = WeightLoader._create_stacked_moe_lazy_tensor.__get__(
+                loader, WeightLoader
+            )
+
+            def spy_prestacked(*args, **kwargs):
+                prestacked_calls.append(1)
+                return real_prestacked(*args, **kwargs)
+
+            def spy_stacked(*args, **kwargs):
+                stacked_calls.append(1)
+                return real_stacked(*args, **kwargs)
+
+            with (
+                patch.object(loader, "_create_prestacked_moe_lazy_tensor", spy_prestacked),
+                patch.object(loader, "_create_stacked_moe_lazy_tensor", spy_stacked),
+            ):
+                loader.load_weights_from_safetensors(
+                    weight_mappings={moe_key: mapping},
+                    safetensors_partition=1,
+                )
+
+            assert len(prestacked_calls) == 1, (
+                "Expected _create_prestacked_moe_lazy_tensor to be called once "
+                f"for a single 3-D [E={E}, out={out}, in_={in_}] source"
+            )
+            assert (
+                len(stacked_calls) == 0
+            ), "_create_stacked_moe_lazy_tensor must NOT be called for the prestacked path"
+
+    def test_negative_case_leading_dim_mismatch_calls_stacked(self):
+        """Single 2-D source (not a stacked pre-packed tensor) must NOT call
+        _create_prestacked_moe_lazy_tensor — it falls through to the stacked path.
+
+        A single 2-D source satisfies ``len(expected_hf_keys) == 1`` but fails
+        the ``len(_shape0) == 3`` check, exercising the real predicate branch
+        at weight_utils.py ~line 2126.
+        """
+        E, out, in_ = 4, 16, 8
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            # Use a 2-D source: shape[0] != 3-D, so the predicate must fail.
+            loader, moe_key, mapping = self._make_loader_and_model(
+                tmp_dir, E=E, out=out, in_=in_, source_shape=(out, in_)
+            )
+
+            prestacked_calls = []
+            stacked_calls = []
+
+            real_stacked = WeightLoader._create_stacked_moe_lazy_tensor.__get__(
+                loader, WeightLoader
+            )
+
+            def spy_prestacked(*args, **kwargs):
+                prestacked_calls.append(1)
+                # Should never reach here in this test.
+                raise AssertionError("prestacked must not be called")
+
+            def spy_stacked(*args, **kwargs):
+                stacked_calls.append(1)
+                return real_stacked(*args, **kwargs)
+
+            with (
+                patch.object(loader, "_create_prestacked_moe_lazy_tensor", spy_prestacked),
+                patch.object(loader, "_create_stacked_moe_lazy_tensor", spy_stacked),
+            ):
+                loader.load_weights_from_safetensors(
+                    weight_mappings={moe_key: mapping},
+                    safetensors_partition=1,
+                )
+
+            assert len(prestacked_calls) == 0, (
+                "_create_prestacked_moe_lazy_tensor must NOT be called for a 2-D source "
+                "(predicate requires 3-D with matching leading dim)"
+            )
+            assert (
+                len(stacked_calls) == 1
+            ), "_create_stacked_moe_lazy_tensor must be called as fallthrough"
+
+
+# ---------------------------------------------------------------------------
+# 3. End-to-end loader tests
 # ---------------------------------------------------------------------------
 
 
