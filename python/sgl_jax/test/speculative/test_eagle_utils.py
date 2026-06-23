@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
@@ -192,6 +193,67 @@ class TestVerifyTree(CustomTestCase):
             np.asarray(out.new_seq_lens),
             np.array([105, 308], dtype=np.int32),
         )
+
+    def test_verify_sampling_params_host_uses_per_request_values_and_masks_padding(self):
+        from sgl_jax.srt.sampling.sampling_params import TOP_K_ALL
+        from sgl_jax.srt.speculative.draft_extend_fused import (
+            _prepare_verify_sampling_params_host,
+        )
+
+        sampling_info = SimpleNamespace(
+            temperatures=np.array([[0.6], [0.2], [0.9], [1.1]], dtype=np.float32),
+            top_ks=np.array([0, 7, 5, 0], dtype=np.int32),
+            top_ps=np.array([1.0, 0.2, 0.8, 1.0], dtype=np.float32),
+        )
+        batch = SimpleNamespace(per_dp_bs_size=2, real_bs_per_dp=np.array([1, 2]))
+
+        temperatures, top_ks, top_ps, enable_top_k, enable_top_p = (
+            _prepare_verify_sampling_params_host(
+                sampling_info,
+                batch,
+                total_bs=4,
+                vocab_size=100,
+            )
+        )
+
+        np.testing.assert_array_equal(
+            temperatures,
+            np.array([[0.6], [1.0], [0.9], [1.1]], dtype=np.float32),
+        )
+        np.testing.assert_array_equal(
+            top_ks,
+            np.array([0, TOP_K_ALL, 5, 0], dtype=np.int32),
+        )
+        np.testing.assert_array_equal(top_ps, np.array([1.0, 1.0, 0.8, 1.0], dtype=np.float32))
+        self.assertTrue(enable_top_k)
+        self.assertTrue(enable_top_p)
+
+    def test_verify_sampling_params_host_ignores_padding_for_topk_topp_enable(self):
+        from sgl_jax.srt.sampling.sampling_params import TOP_K_ALL
+        from sgl_jax.srt.speculative.draft_extend_fused import (
+            _prepare_verify_sampling_params_host,
+        )
+
+        sampling_info = SimpleNamespace(
+            temperatures=np.array([[0.6], [0.2]], dtype=np.float32),
+            top_ks=np.array([TOP_K_ALL, 5], dtype=np.int32),
+            top_ps=np.array([1.0, 0.5], dtype=np.float32),
+        )
+        batch = SimpleNamespace(per_dp_bs_size=2, real_bs_per_dp=np.array([1]))
+
+        _temperatures, top_ks, top_ps, enable_top_k, enable_top_p = (
+            _prepare_verify_sampling_params_host(
+                sampling_info,
+                batch,
+                total_bs=2,
+                vocab_size=100,
+            )
+        )
+
+        np.testing.assert_array_equal(top_ks, np.array([TOP_K_ALL, TOP_K_ALL], dtype=np.int32))
+        np.testing.assert_array_equal(top_ps, np.array([1.0, 1.0], dtype=np.float32))
+        self.assertFalse(enable_top_k)
+        self.assertFalse(enable_top_p)
 
     def test_verify_tree_greedy(self):
         candidates = jnp.array(

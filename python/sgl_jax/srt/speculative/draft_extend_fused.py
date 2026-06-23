@@ -14,6 +14,7 @@ from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.kernels.speculative.kernel import top_k_renorm_prob, top_p_renorm_prob
+from sgl_jax.srt.sampling.sampling_params import TOP_K_ALL
 from sgl_jax.srt.speculative.relay_buffer import (
     gather_spec_relay_buffers,
     make_dp_valid_mask,
@@ -62,6 +63,49 @@ def _count_pjit_cpp_cache_miss():
         return
     with jtu.count_pjit_cpp_cache_miss() as count:
         yield count
+
+
+def _active_dp_slot_mask(batch, total_bs: int) -> np.ndarray:
+    mask = np.zeros(total_bs, dtype=bool)
+    per_dp_bs = int(getattr(batch, "per_dp_bs_size", total_bs))
+    real_bs_per_dp = getattr(batch, "real_bs_per_dp", None)
+    if real_bs_per_dp is None:
+        mask[: int(getattr(batch, "real_bs", total_bs))] = True
+        return mask
+    for dp_rank, real_bs in enumerate(real_bs_per_dp):
+        start = dp_rank * per_dp_bs
+        mask[start : start + int(real_bs)] = True
+    return mask
+
+
+def _prepare_verify_sampling_params_host(sampling_info, batch, total_bs: int, vocab_size: int):
+    temperatures = np.asarray(sampling_info.temperatures, dtype=np.float32).reshape(total_bs, 1)
+    top_ks_src = getattr(sampling_info, "top_ks", None)
+    top_ps_src = getattr(sampling_info, "top_ps", None)
+    top_ks = (
+        np.asarray(top_ks_src, dtype=np.int32).reshape(total_bs)
+        if top_ks_src is not None
+        else np.full(total_bs, TOP_K_ALL, dtype=np.int32)
+    )
+    top_ps = (
+        np.asarray(top_ps_src, dtype=np.float32).reshape(total_bs)
+        if top_ps_src is not None
+        else np.ones(total_bs, dtype=np.float32)
+    )
+
+    active = _active_dp_slot_mask(batch, total_bs)
+    temperatures = temperatures.copy()
+    top_ks = top_ks.copy()
+    top_ps = top_ps.copy()
+    temperatures[~active] = 1.0
+    top_ks[~active] = TOP_K_ALL
+    top_ps[~active] = 1.0
+
+    active_top_ks = top_ks[active]
+    active_top_ps = top_ps[active]
+    enable_top_k = bool(np.any((active_top_ks > 0) & (active_top_ks < vocab_size)))
+    enable_top_p = bool(np.any(active_top_ps < 1.0))
+    return temperatures, top_ks, top_ps, enable_top_k, enable_top_p
 
 
 def _prepare_spec_prefill_output_token_ids(draft_worker, next_token_ids):
@@ -223,7 +267,7 @@ def _verify_rejection_sampling(
     vocab = target_logits.shape[-1]
 
     # v1: replicate the working set so explicit-sharding never has to resolve
-    # gather/cumsum shardings. Correctness over speed for now. top_k/top_p TODO.
+    # gather/cumsum shardings. Correctness over speed for now.
     sh = jax.typeof(target_logits).sharding
     mesh = sh.mesh if isinstance(sh, NamedSharding) else None
 
@@ -1772,44 +1816,26 @@ def spec_decode_verify(spec_worker, model_worker_batch, cur_allocate_lens):
     _sv_enable_top_p = False
     if _sv_is_greedy:
         _sv_temps = _prepare_device_array(np.ones((_sv_tbs, 1), np.float32), data_sharding)
-        _sv_topks = _prepare_device_array(np.zeros((_sv_tbs,), np.int32), data_sharding)
+        _sv_topks = _prepare_device_array(
+            np.full((_sv_tbs,), TOP_K_ALL, np.int32), data_sharding
+        )
         _sv_topps = _prepare_device_array(np.ones((_sv_tbs,), np.float32), data_sharding)
     else:
-        _t = np.asarray(si.temperatures, np.float32).reshape(-1)
-        _k = (
-            np.asarray(getattr(si, "top_ks", None)).reshape(-1)
-            if getattr(si, "top_ks", None) is not None
-            else None
+        (
+            _sv_temps_host,
+            _sv_topks_host,
+            _sv_topps_host,
+            _sv_enable_top_k,
+            _sv_enable_top_p,
+        ) = _prepare_verify_sampling_params_host(
+            si,
+            model_worker_batch,
+            _sv_tbs,
+            int(target_worker.model_config.vocab_size),
         )
-        _p = (
-            np.asarray(getattr(si, "top_ps", None), np.float32).reshape(-1)
-            if getattr(si, "top_ps", None) is not None
-            else None
-        )
-        _tv = float(_t[0]) if _t.size else 1.0
-        _kv = int(_k[0]) if (_k is not None and _k.size) else 0
-        _pv = float(_p[0]) if (_p is not None and _p.size) else 1.0
-        _sv_vocab = int(target_worker.model_config.vocab_size)
-        _sv_enable_top_k = 0 < _kv < _sv_vocab
-        _sv_enable_top_p = _pv < 1.0
-        # temps/topks/topps are constant across decode steps for a given batch
-        # (they only depend on tbs and the per-batch sampling scalars), so building
-        # + transferring them every step is wasted H2D dispatch. Cache the device
-        # arrays keyed by (tbs, temp, top_k, top_p) and reuse until the batch changes.
-        _const_sig = (_sv_tbs, _tv, _kv, _pv)
-        _const_cache = getattr(target_mr, "_sv_sampling_const_cache", None)
-        if _const_cache is None or _const_cache[0] != _const_sig:
-            _sv_temps = _prepare_device_array(np.full((_sv_tbs, 1), _tv, np.float32), data_sharding)
-            _sv_topks = _prepare_device_array(np.full((_sv_tbs,), _kv, np.int32), data_sharding)
-            _sv_topps = _prepare_device_array(np.full((_sv_tbs,), _pv, np.float32), data_sharding)
-            target_mr._sv_sampling_const_cache = (
-                _const_sig,
-                _sv_temps,
-                _sv_topks,
-                _sv_topps,
-            )
-        else:
-            _, _sv_temps, _sv_topks, _sv_topps = _const_cache
+        _sv_temps = _prepare_device_array(_sv_temps_host, data_sharding)
+        _sv_topks = _prepare_device_array(_sv_topks_host, data_sharding)
+        _sv_topps = _prepare_device_array(_sv_topps_host, data_sharding)
     _sv_thr_single = float(
         getattr(spec_worker.server_args, "speculative_accept_threshold_single", 1.0)
     )
