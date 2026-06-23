@@ -96,10 +96,10 @@ class TestStep3p5Skeleton(unittest.TestCase):
         with jax.set_mesh(_mesh):
             model = Step3p5ForCausalLM(cfg, mesh=_mesh, dtype=jnp.bfloat16)
 
-        self.assertIsNotNone(model.embed_tokens)
+        self.assertIsNotNone(model.model.embed_tokens)
         self.assertIsNotNone(model.lm_head)
         self.assertIsNotNone(model.logits_processor)
-        self.assertIs(model.model, None)
+        self.assertIsNotNone(model.model)
 
     def test_embed_tokens_shape(self):
         """embed_tokens.embedding has shape (vocab, hidden)."""
@@ -109,7 +109,7 @@ class TestStep3p5Skeleton(unittest.TestCase):
         with jax.set_mesh(_mesh):
             model = Step3p5ForCausalLM(cfg, mesh=_mesh, dtype=jnp.bfloat16)
 
-        emb = model.embed_tokens.embedding[...]
+        emb = model.model.embed_tokens.embedding[...]
         self.assertEqual(emb.shape, (cfg.vocab_size, cfg.hidden_size))
 
     def test_lm_head_shape(self):
@@ -130,26 +130,6 @@ class TestStep3p5Skeleton(unittest.TestCase):
         mc = SimpleNamespace(head_dim=0)
         Step3p5ForCausalLM.patch_model_config(mc)
         self.assertEqual(mc.head_dim, 128)
-
-    def test_call_raises_not_implemented(self):
-        from sgl_jax.srt.models.step3p5 import Step3p5ForCausalLM
-
-        cfg = _tiny_config()
-        with jax.set_mesh(_mesh):
-            model = Step3p5ForCausalLM(cfg, mesh=_mesh, dtype=jnp.bfloat16)
-
-        with self.assertRaises(NotImplementedError):
-            model(None, None, None)
-
-    def test_load_weights_raises_not_implemented(self):
-        from sgl_jax.srt.models.step3p5 import Step3p5ForCausalLM
-
-        cfg = _tiny_config()
-        with jax.set_mesh(_mesh):
-            model = Step3p5ForCausalLM(cfg, mesh=_mesh, dtype=jnp.bfloat16)
-
-        with self.assertRaises(NotImplementedError):
-            model.load_weights(None)
 
 
 class TestStep3p5WorktreeSource(unittest.TestCase):
