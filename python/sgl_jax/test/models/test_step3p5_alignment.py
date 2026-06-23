@@ -95,7 +95,12 @@ _TINY_CFG_DICT: dict = {
     "use_cache": False,
 }
 
-_HF_SRC = "/Users/infiscale/develop"
+_HF_SRC = os.environ.get("STEP35_HF_SRC", "/Users/infiscale/develop")
+
+# Dev-local oracle: needs the HF modeling/config files present. Skip on CI where absent.
+_HF_AVAILABLE = os.path.isfile(os.path.join(_HF_SRC, "modeling_step3p5.py")) and os.path.isfile(
+    os.path.join(_HF_SRC, "configuration_step3p5.py")
+)
 
 # ---------------------------------------------------------------------------
 # Shared checkpoint generator (fp32, fixed seed)
@@ -446,6 +451,7 @@ def _print_alignment_table(
 # ---------------------------------------------------------------------------
 
 
+@unittest.skipUnless(_HF_AVAILABLE, "HF step3p5 source files not found (set STEP35_HF_SRC)")
 class TestStep3p5Alignment(unittest.TestCase):
     """Real HF eager oracle vs JAX naive fp32 forward — per-stage/layer error table.
 
