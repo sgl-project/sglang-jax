@@ -47,7 +47,6 @@ def get_device_name(num_devices: int | None = None):
 
 
 def get_device_hbm_limit() -> int:
-
     device_kind = get_device_name()
     if device_kind == "TPU v5p" or device_kind == "TPU v5":
         return 95 * GBYTES
@@ -64,7 +63,7 @@ def get_device_hbm_limit() -> int:
 
 
 def pathways_hbm_usage_gb(live_arrays, devices: Any) -> list[tuple[float, float]]:
-    hbm_used = defaultdict(int)
+    hbm_used: defaultdict[str, int] = defaultdict(int)
     hbm_limit = get_device_hbm_limit()
     for array in live_arrays:
         for buffer in array.addressable_shards:
@@ -113,7 +112,7 @@ def get_original_kv_head_id(tp_rank: int, total_num_kv_heads: int, tp_size: int)
 
 
 def get_available_device_memory(
-    device, distributed=False, empty_cache=True, device_indexes: list[int] = None
+    device, distributed=False, empty_cache=True, device_indexes: list[int] | None = None
 ):
     """
     Get available memory for device:device_id.
@@ -196,15 +195,19 @@ def get_available_device_memory(
     return int(free_gpu_memory * (1 << 10))
 
 
-def device_array(*data, sharding=None, **kwargs) -> jax.Array:
+def device_array(data, sharding=None, **kwargs) -> jax.Array:
     if sharding is None:
-        return jax.device_put(*data, device=sharding, **kwargs)
+        return jax.device_put(data, device=sharding, **kwargs)
 
     def _to_device(arr):
         arr = np.asarray(arr)
-        return jax.make_array_from_callback(arr.shape, sharding, lambda idx, a=arr: a[idx])
 
-    return jax.tree.map(_to_device, *data)
+        def fn(idx, a=arr):
+            return a[idx]
+
+        return jax.make_array_from_callback(arr.shape, sharding, fn)
+
+    return jax.tree.map(_to_device, data)
 
 
 _IS_TPU_RUNTIME_CACHED: bool | None = None

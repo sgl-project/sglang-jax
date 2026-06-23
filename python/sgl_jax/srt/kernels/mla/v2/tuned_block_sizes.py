@@ -139,6 +139,51 @@ TUNED_BLOCK_SIZES_MLA: dict[str, dict[tuple, tuple]] = {
         ("mixed", "bfloat16", "bfloat16", 16, 512, 64, 128, 512): (8, 128),
         ("mixed", "bfloat16", "bfloat16", 16, 512, 64, 128, 1024): (8, 128),
         ("mixed", "bfloat16", "bfloat16", 16, 512, 64, 128, 2048): (8, 128),
+        # ===== GLM-5.1 (TP=32) configurations on TPU v7 =====
+        # Decode & Mixed tuned for q_head_num=2 (TP=32 sharding)
+        ("decode", "bfloat16", "bfloat16", 2, 512, 64, 64, 1): (16, 1, 4),
+        ("decode", "bfloat16", "bfloat16", 2, 512, 64, 64, 2): (32, 1, 4),
+        ("decode", "bfloat16", "bfloat16", 2, 512, 64, 64, 4): (64, 1, 4),
+        ("decode", "bfloat16", "bfloat16", 2, 512, 64, 64, 8): (32, 1, 4),
+        ("decode", "bfloat16", "bfloat16", 2, 512, 64, 64, 16): (64, 1, 4),
+        ("decode", "bfloat16", "bfloat16", 2, 512, 64, 64, 32): (64, 1, 4),
+        ("decode", "bfloat16", "bfloat16", 2, 512, 64, 64, 64): (
+            64,
+            1,
+            4,
+        ),  # Capped from 128 to prevent VMEM OOM when dbs=4
+        ("mixed", "bfloat16", "bfloat16", 2, 512, 64, 64, 8192): (2, 256),
+        ("mixed", "bfloat16", "bfloat16", 2, 512, 64, 64, 16384): (2, 256),
+        ("decode", "bfloat16", "bfloat16", 2, 512, 64, 128, 1): (8, 1, 4),
+        ("decode", "bfloat16", "bfloat16", 2, 512, 64, 128, 2): (8, 1, 4),
+        ("decode", "bfloat16", "bfloat16", 2, 512, 64, 128, 4): (16, 1, 4),
+        ("decode", "bfloat16", "bfloat16", 2, 512, 64, 128, 8): (16, 1, 4),
+        ("decode", "bfloat16", "bfloat16", 2, 512, 64, 128, 16): (32, 1, 4),
+        ("decode", "bfloat16", "bfloat16", 2, 512, 64, 128, 32): (
+            32,
+            1,
+            4,
+        ),  # Capped from 64 to prevent VMEM OOM when dbs=4
+        ("decode", "bfloat16", "bfloat16", 2, 512, 64, 128, 64): (32, 1, 4),
+        ("mixed", "bfloat16", "bfloat16", 2, 512, 64, 128, 8192): (2, 256),
+        ("mixed", "bfloat16", "bfloat16", 2, 512, 64, 128, 16384): (1, 512),
+        ("decode", "bfloat16", "bfloat16", 2, 512, 64, 256, 1): (4, 1, 4),
+        ("decode", "bfloat16", "bfloat16", 2, 512, 64, 256, 2): (8, 1, 4),
+        ("decode", "bfloat16", "bfloat16", 2, 512, 64, 256, 4): (8, 1, 4),
+        ("decode", "bfloat16", "bfloat16", 2, 512, 64, 256, 8): (8, 1, 4),
+        ("decode", "bfloat16", "bfloat16", 2, 512, 64, 256, 16): (8, 1, 4),
+        ("decode", "bfloat16", "bfloat16", 2, 512, 64, 256, 32): (
+            16,
+            1,
+            4,
+        ),  # Capped from 32 to prevent VMEM OOM when dbs=4
+        ("decode", "bfloat16", "bfloat16", 2, 512, 64, 256, 64): (
+            16,
+            1,
+            4,
+        ),  # Capped from 32 to prevent VMEM OOM when dbs=4
+        ("mixed", "bfloat16", "bfloat16", 2, 512, 64, 256, 8192): (1, 512),
+        ("mixed", "bfloat16", "bfloat16", 2, 512, 64, 256, 16384): (1, 512),
     },
 }
 

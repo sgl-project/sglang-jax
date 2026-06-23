@@ -683,8 +683,18 @@ class DeepseekV3Model(nnx.Module):
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
     ) -> tuple[jax.Array, list, list]:
-        hidden_states = self.embed_tokens(forward_batch.input_ids)
+
         residual = None
+        input_embeds = (
+            forward_batch.input_embedding
+            if forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
+            else None
+        )
+
+        hidden_states = (
+            self.embed_tokens(forward_batch.input_ids) if input_embeds is None else input_embeds
+        )
+
         layers_kv_fused = []
         layers_topk_ids = []
 
@@ -729,6 +739,7 @@ class DeepseekV3ForCausalLM(nnx.Module):
         self.config = config
         self.dtype = dtype
         self.model = DeepseekV3Model(config, mesh=mesh, dtype=dtype)
+        self.hf_weight_prefix = ""
 
         self.lm_head = ParallelLMHead(
             config.vocab_size,
@@ -770,17 +781,17 @@ class DeepseekV3ForCausalLM(nnx.Module):
         is_static_quant = quant_config is not None and quant_config.is_static_checkpoint
 
         mappings = {
-            "model.embed_tokens.weight": WeightMapping(
+            f"{self.hf_weight_prefix}model.embed_tokens.weight": WeightMapping(
                 target_path="model.embed_tokens.embedding",
                 sharding=("tensor", None),
                 transpose=False,
             ),
-            "model.norm.weight": WeightMapping(
+            f"{self.hf_weight_prefix}model.norm.weight": WeightMapping(
                 target_path="model.norm.scale",
                 sharding=(None,),
                 transpose=False,
             ),
-            "lm_head.weight": WeightMapping(
+            f"{self.hf_weight_prefix}lm_head.weight": WeightMapping(
                 target_path="lm_head.embedding",
                 sharding=("tensor", None),
                 transpose=False,
@@ -814,7 +825,7 @@ class DeepseekV3ForCausalLM(nnx.Module):
         use_fused: bool,
         is_static_quant: bool = False,
     ) -> dict:
-        prefix = f"model.layers.{layer_idx}"
+        prefix = f"{self.hf_weight_prefix}model.layers.{layer_idx}"
         target = f"model.layers.{layer_idx}"
         mappings: dict = {}
 
