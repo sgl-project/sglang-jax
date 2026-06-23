@@ -40,7 +40,11 @@ class Step3p5Attention(nnx.Module):
         layer_id: int,
         mesh: jax.sharding.Mesh,
         dtype: jnp.dtype = jnp.bfloat16,
+        attn_impl: str = "flash",
     ) -> None:
+        # "flash" → RadixAttention (TPU kernel, production default).
+        # "naive" → pure-JAX fp32 oracle (CPU-runnable, Plan 4 reference).
+        self.attn_impl = attn_impl
         self.layer_id = layer_id
         self.dtype = dtype
         self.head_dim = _HEAD_DIM
@@ -145,6 +149,8 @@ class Step3p5Attention(nnx.Module):
 
         # sliding_window_size=0 means full attention (gemma2 convention).
         sliding_window_size = config.sliding_window if is_sliding else 0
+        # Keep a plain int copy for the naive path (RadixAttention stores 0→None).
+        self._naive_sliding_window: int | None = int(config.sliding_window) if is_sliding else None
         self.attn = RadixAttention(
             num_heads=self.num_heads,
             head_dim=_HEAD_DIM,
@@ -153,6 +159,68 @@ class Step3p5Attention(nnx.Module):
             sliding_window_size=sliding_window_size,
             layer_id=layer_id,
         )
+
+    def _naive_attention(
+        self,
+        q: jax.Array,
+        k: jax.Array,
+        v: jax.Array,
+    ) -> jax.Array:
+        """Pure-JAX fp32 attention oracle (CPU-runnable, single-sequence prefill).
+
+        Inputs post QK-norm + RoPE: q [T, num_heads, 128], k/v [T, num_kv_heads, 128].
+        Returns attn_output [T, num_heads * 128].
+
+        Window predicate (HF create_sliding_window_causal_mask / native_backend):
+          valid[q, k] := (k_pos <= q_pos) AND (q_pos - k_pos < W)
+        For full-attention layers W is absent (no window mask applied).
+
+        GQA: kv-heads repeated via np.repeat to match num_heads, same grouping order as
+        native_backend._apply_extend_mask (repeat_interleave along heads axis).
+
+        Softmax computed in fp32. Caution: this provides the naive==HF oracle (CPU);
+        flash==naive is completed in Plan 4 (TPU). Until then, the production flash
+        path is NOT yet verified end-to-end via naive==HF ∧ flash==naive ⇒ flash==HF.
+        """
+        T = q.shape[0]
+        q_fp = jnp.asarray(q, dtype=jnp.float32)  # [T, num_heads, 128]
+        k_fp = jnp.asarray(k, dtype=jnp.float32)  # [T, num_kv_heads, 128]
+        v_fp = jnp.asarray(v, dtype=jnp.float32)  # [T, num_kv_heads, 128]
+
+        # GQA: expand kv-heads to num_heads via repeat_interleave (axis=1).
+        num_q_per_kv = self.num_heads // self.num_kv_heads
+        k_exp = jnp.repeat(k_fp, num_q_per_kv, axis=1)  # [T, num_heads, 128]
+        v_exp = jnp.repeat(v_fp, num_q_per_kv, axis=1)  # [T, num_heads, 128]
+
+        # Scores: [T_q, num_heads, T_k] in fp32.
+        scores = (
+            jnp.einsum("qhd,khd->qhk", q_fp, k_exp, preferred_element_type=jnp.float32)
+            * self.scaling
+        )  # noqa: E501
+
+        # Causal mask: k_pos <= q_pos.
+        q_idx = jnp.arange(T, dtype=jnp.int32)
+        k_idx = jnp.arange(T, dtype=jnp.int32)
+        causal = q_idx[:, None] >= k_idx[None, :]  # [T, T]
+
+        if self._naive_sliding_window is not None:
+            window = q_idx[:, None] - k_idx[None, :] < self._naive_sliding_window
+            valid = causal & window
+        else:
+            valid = causal
+
+        neg_inf = jnp.finfo(jnp.float32).min / 2
+        # Broadcast valid [T, T] to [T, 1, T] for heads.
+        scores = jnp.where(valid[:, None, :], scores, neg_inf)
+
+        # Softmax over key axis in fp32.
+        scores = scores - jnp.max(scores, axis=-1, keepdims=True)
+        exp_s = jnp.exp(scores)
+        attn_w = exp_s / jnp.sum(exp_s, axis=-1, keepdims=True)  # [T, H, T]
+
+        # Weighted sum: [T, num_heads, 128].
+        out = jnp.einsum("qhk,khd->qhd", attn_w, v_exp, preferred_element_type=jnp.float32)
+        return out.reshape(T, self.num_heads * _HEAD_DIM)
 
     def __call__(
         self,
@@ -178,7 +246,14 @@ class Step3p5Attention(nnx.Module):
         q, k = self.rotary_emb(positions, q, k)
 
         v = v.reshape(-1, self.num_kv_heads, _HEAD_DIM)
-        attn_output, kv_fused = self.attn(q, k, v, forward_batch, token_to_kv_pool)
+
+        if self.attn_impl == "naive":
+            attn_output = self._naive_attention(q, k, v)
+            # kv_fused placeholder: callers (Step3p5 decoder, not yet built) store the
+            # fused KV buffer for the TPU kernel; naive path has no KV pool.
+            kv_fused = jnp.empty((0,), dtype=jnp.float32)
+        else:
+            attn_output, kv_fused = self.attn(q, k, v, forward_batch, token_to_kv_pool)
 
         # Per-head gate before o_proj (HF ref lines 528-531).
         if self.use_head_wise_attn_gate:
