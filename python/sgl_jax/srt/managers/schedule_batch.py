@@ -432,6 +432,10 @@ class Req:
         # (otherwise extend_input_len never shrinks and a req longer than
         # chunked-prefill-size loops forever, and a budget-chunked short
         # req leaks its first round's pages).
+        # TODO(pd-radix): PD chunked-prefill is currently validated with
+        # ChunkCache (--disable-radix-cache). If RadixCache support is added,
+        # continuation rounds must also preserve/update last_node and radix
+        # lock state, not just prefix_indices.
         if getattr(self, "bootstrap_room", None) is not None and not self.output_ids:
             if getattr(self, "is_chunked", 0) == 0:
                 self.prefix_indices = []
