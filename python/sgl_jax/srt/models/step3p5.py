@@ -18,6 +18,7 @@ from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, get_rope
 from sgl_jax.srt.layers.layernorm import GemmaRMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
+from sgl_jax.srt.layers.moe import EPMoE, GateLogit, TopK
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache, MemoryPools
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
@@ -263,6 +264,153 @@ class Step3p5Attention(nnx.Module):
 
         output, _ = self.o_proj(attn_output)
         return output, kv_fused
+
+
+class Step3p5MLP(nnx.Module):
+    """SwiGLU dense/shared-expert MLP.
+
+    down(silu(gate(x)) * up(x)), with optional asymmetric clamp matching HF Step3p5MLP.
+    ``swiglu_limit``: gate clamped upper-only, up double-sided. None = no clamp.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        mesh: jax.sharding.Mesh,
+        dtype: jnp.dtype = jnp.bfloat16,
+        swiglu_limit: float | None = None,
+    ) -> None:
+        self.swiglu_limit = swiglu_limit
+        self.gate_proj = LinearBase(
+            input_size=hidden_size,
+            output_size=intermediate_size,
+            kernel_axes=(None, "tensor"),
+            use_bias=False,
+            params_dtype=dtype,
+            mesh=mesh,
+            scope_name="gate_proj",
+        )
+        self.up_proj = LinearBase(
+            input_size=hidden_size,
+            output_size=intermediate_size,
+            kernel_axes=(None, "tensor"),
+            use_bias=False,
+            params_dtype=dtype,
+            mesh=mesh,
+            scope_name="up_proj",
+        )
+        self.down_proj = LinearBase(
+            input_size=intermediate_size,
+            output_size=hidden_size,
+            kernel_axes=("tensor", None),
+            use_bias=False,
+            params_dtype=dtype,
+            mesh=mesh,
+            scope_name="down_proj",
+        )
+
+    def __call__(self, hidden_states: jax.Array) -> jax.Array:
+        gate, _ = self.gate_proj(hidden_states)
+        up, _ = self.up_proj(hidden_states)
+        gate = jax.nn.silu(gate)
+        if self.swiglu_limit is not None:
+            gate = jnp.clip(gate, max=self.swiglu_limit)
+            up = jnp.clip(up, -self.swiglu_limit, self.swiglu_limit)
+        output, _ = self.down_proj(gate * up)
+        return output
+
+
+def _swiglu_limit_for(limits: list[float] | None, layer_id: int) -> float | None:
+    """Return per-layer swiglu limit or None if absent/zero (matches HF logic)."""
+    if limits is None or layer_id >= len(limits):
+        return None
+    v = limits[layer_id]
+    return float(v) if v else None
+
+
+def _moe_layer_ids(config: PretrainedConfig) -> list[int]:
+    """Return sorted list of MoE layer indices from config.moe_layers_enum."""
+    moe_enum = getattr(config, "moe_layers_enum", None)
+    if moe_enum is None:
+        return list(range(1, config.num_hidden_layers))
+    if isinstance(moe_enum, str):
+        return [int(i) for i in moe_enum.strip().split(",")]
+    return list(moe_enum)
+
+
+class Step3p5MoE(nnx.Module):
+    """Sigmoid-gated MoE with bias routing + always-on shared expert.
+
+    Mirrors HF Step3p5MoEMLP + separate share_expert in Step3p5DecoderLayer.
+    Forward: moe_out(hidden) + shared_experts(hidden).
+    """
+
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        layer_id: int,
+        mesh: jax.sharding.Mesh,
+        ep_size: int = 1,
+        dtype: jnp.dtype = jnp.bfloat16,
+    ) -> None:
+        hidden_size: int = config.hidden_size
+        num_experts: int = config.moe_num_experts
+        topk: int = config.moe_top_k
+        moe_intermediate_size: int = config.moe_intermediate_size
+        share_expert_dim: int = config.share_expert_dim
+        routed_scaling_factor: float = config.moe_router_scaling_factor
+        renormalize: bool = config.norm_expert_weight
+
+        # Gate: fp32 kernel, HIGHEST precision dot (need_fp32_gate).
+        # GateLogit already uses fp32 kernel + HIGHEST precision.
+        self.moe_gate = GateLogit(
+            input_size=hidden_size,
+            num_experts=num_experts,
+            score_func="sigmoid",
+            enable_expert_bias=config.use_moe_router_bias,
+            weight_dtype=dtype,
+        )
+
+        self.topk = TopK(
+            topk=topk,
+            renormalize=renormalize,
+            routed_scaling_factor=routed_scaling_factor,
+            layer_id=layer_id,
+        )
+
+        swiglu_limit_routed = _swiglu_limit_for(getattr(config, "swiglu_limits", None), layer_id)
+        self.experts = EPMoE(
+            hidden_size=hidden_size,
+            num_experts=num_experts,
+            num_experts_per_tok=topk,
+            intermediate_dim=moe_intermediate_size,
+            ep_size=ep_size,
+            mesh=mesh,
+            weight_dtype=dtype,
+            dtype=dtype,
+            layer_id=layer_id,
+            swiglu_limit=swiglu_limit_routed,
+        )
+
+        swiglu_limit_shared = _swiglu_limit_for(
+            getattr(config, "swiglu_limits_shared", None), layer_id
+        )
+        self.shared_experts = Step3p5MLP(
+            hidden_size=hidden_size,
+            intermediate_size=share_expert_dim,
+            mesh=mesh,
+            dtype=dtype,
+            swiglu_limit=swiglu_limit_shared,
+        )
+
+    def __call__(self, hidden_states: jax.Array) -> jax.Array:
+        router_logits = self.moe_gate(hidden_states)
+        correction_bias = self.moe_gate.bias.value if self.moe_gate.bias is not None else None
+        topk_weights, topk_ids = self.topk(router_logits, correction_bias)
+        moe_out = self.experts(hidden_states, topk_weights, topk_ids)
+        shared_out = self.shared_experts(hidden_states)
+        return moe_out + shared_out
 
 
 class Step3p5ForCausalLM(nnx.Module):
