@@ -11,6 +11,8 @@ import logging
 import jax
 import jax.numpy as jnp
 from flax import nnx
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig
@@ -22,6 +24,8 @@ from sgl_jax.srt.layers.moe import EPMoE, GateLogit, TopK
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache, MemoryPools
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+from sgl_jax.srt.precision_tracer import precision_tracer
+from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +53,7 @@ class Step3p5Attention(nnx.Module):
         self.layer_id = layer_id
         self.dtype = dtype
         self.head_dim = _HEAD_DIM
+        self.mesh = mesh
 
         layer_types = config.layer_types or []
         layer_type = layer_types[layer_id] if layer_id < len(layer_types) else "full_attention"
@@ -189,9 +194,11 @@ class Step3p5Attention(nnx.Module):
         v_fp = jnp.asarray(v, dtype=jnp.float32)  # [T, num_kv_heads, 128]
 
         # GQA: expand kv-heads to num_heads via repeat_interleave (axis=1).
+        # out_sharding required under explicit-sharding mesh mode.
         num_q_per_kv = self.num_heads // self.num_kv_heads
-        k_exp = jnp.repeat(k_fp, num_q_per_kv, axis=1)  # [T, num_heads, 128]
-        v_exp = jnp.repeat(v_fp, num_q_per_kv, axis=1)  # [T, num_heads, 128]
+        _unsharded_3d = NamedSharding(self.mesh, P(None, None, None))
+        k_exp = jnp.repeat(k_fp, num_q_per_kv, axis=1, out_sharding=_unsharded_3d)
+        v_exp = jnp.repeat(v_fp, num_q_per_kv, axis=1, out_sharding=_unsharded_3d)
 
         # Scores: [T_q, num_heads, T_k] in fp32.
         scores = (
@@ -413,8 +420,177 @@ class Step3p5MoE(nnx.Module):
         return moe_out + shared_out
 
 
+class Step3p5DecoderLayer(nnx.Module):
+    """Pre-norm fused-residual decoder layer (DeepSeek/M2 pattern).
+
+    Supports both dense (layers 0-2) and MoE (layers 3+) FFN blocks,
+    with per-layer attn_impl threading for CPU-runnable naive oracle.
+    """
+
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        layer_id: int,
+        mesh: jax.sharding.Mesh,
+        dtype: jnp.dtype = jnp.bfloat16,
+        attn_impl: str = "flash",
+    ) -> None:
+        self.layer_id = layer_id
+
+        self.self_attn = Step3p5Attention(
+            config=config,
+            layer_id=layer_id,
+            mesh=mesh,
+            dtype=dtype,
+            attn_impl=attn_impl,
+        )
+
+        moe_ids = _moe_layer_ids(config)
+        self.is_moe_layer = layer_id in moe_ids
+
+        if self.is_moe_layer:
+            self.mlp = Step3p5MoE(
+                config=config,
+                layer_id=layer_id,
+                mesh=mesh,
+                ep_size=getattr(config, "ep_size", 1),
+                dtype=dtype,
+            )
+        else:
+            # Dense MLP; shared swiglu limit applies (None for layers 0-2 per HF).
+            swiglu_limit = _swiglu_limit_for(
+                getattr(config, "swiglu_limits_shared", None), layer_id
+            )
+            self.mlp = Step3p5MLP(
+                hidden_size=config.hidden_size,
+                intermediate_size=config.intermediate_size,
+                mesh=mesh,
+                dtype=dtype,
+                swiglu_limit=swiglu_limit,
+            )
+
+        self.input_layernorm = GemmaRMSNorm(
+            config.hidden_size, epsilon=config.rms_norm_eps, add_unit_offset=False
+        )
+        self.post_attention_layernorm = GemmaRMSNorm(
+            config.hidden_size, epsilon=config.rms_norm_eps, add_unit_offset=False
+        )
+
+    def __call__(
+        self,
+        positions: jax.Array,
+        hidden_states: jax.Array,
+        forward_batch: ForwardBatch,
+        token_to_kv_pool: KVCache,
+        residual: jax.Array | None = None,
+    ) -> tuple[jax.Array, jax.Array, jax.Array, list]:
+        # Pre-norm fused residual (deepseek/M2 pattern).
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states = hidden_states + residual
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+
+        ln_flag = precision_tracer.jit_pure_callback_record(
+            hidden_states, "input_layernorm_output", "INPUT_LAYERNORM", self.layer_id
+        )
+
+        hidden_states, kv_fused = self.self_attn(
+            positions, hidden_states, forward_batch, token_to_kv_pool
+        )
+
+        attn_flag = precision_tracer.jit_pure_callback_record(
+            hidden_states, "self_attn_output", "SELF_ATTN", self.layer_id
+        )
+
+        hidden_states = hidden_states + residual
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+
+        hidden_states = self.mlp(hidden_states)
+
+        mlp_flag = precision_tracer.jit_pure_callback_record(
+            hidden_states, "mlp_output", "MLP", self.layer_id
+        )
+
+        return hidden_states, residual, kv_fused, [ln_flag, attn_flag, mlp_flag]
+
+
+class Step3p5Model(nnx.Module):
+    """Stack of Step3p5DecoderLayer + final GemmaRMSNorm."""
+
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        mesh: jax.sharding.Mesh,
+        dtype: jnp.dtype = jnp.bfloat16,
+        attn_impl: str = "flash",
+    ) -> None:
+        self.embed_tokens = Embed(
+            num_embeddings=config.vocab_size,
+            features=config.hidden_size,
+            dtype=dtype,
+            param_dtype=dtype,
+            kernel_axes=("tensor", None),
+            mesh=mesh,
+        )
+
+        # Only the first num_hidden_layers decoder layers; MTP layers 45/46/47 excluded.
+        self.layers = nnx.data(
+            [
+                Step3p5DecoderLayer(
+                    config=config,
+                    layer_id=i,
+                    mesh=mesh,
+                    dtype=dtype,
+                    attn_impl=attn_impl,
+                )
+                for i in range(config.num_hidden_layers)
+            ]
+        )
+
+        self.norm = GemmaRMSNorm(
+            config.hidden_size, epsilon=config.rms_norm_eps, add_unit_offset=False
+        )
+
+    def __call__(
+        self,
+        forward_batch: ForwardBatch,
+        token_to_kv_pool: KVCache,
+    ) -> tuple[jax.Array, list, list]:
+        hidden_states = self.embed_tokens(forward_batch.input_ids)
+        residual = None
+        layers_kv_fused: list = []
+        layers_callback_flags: list = []
+
+        for layer in self.layers:
+            hidden_states, residual, kv_fused, cb_flags = layer(
+                forward_batch.positions,
+                hidden_states,
+                forward_batch,
+                token_to_kv_pool,
+                residual,
+            )
+            layers_kv_fused.append(kv_fused)
+            layers_callback_flags.extend(cb_flags)
+
+        if residual is not None:
+            hidden_states = hidden_states + residual
+
+        hidden_states = self.norm(hidden_states)
+
+        xfmr_flag = precision_tracer.jit_pure_callback_record(
+            hidden_states, "transformer_output", "TRANSFORMER"
+        )
+        layers_callback_flags.append(xfmr_flag)
+
+        return hidden_states, layers_kv_fused, layers_callback_flags
+
+
 class Step3p5ForCausalLM(nnx.Module):
-    """Step 3.5 Flash causal LM. Decoder layers (``self.model``) land in a follow-up commit."""
+    """Step 3.5 Flash causal LM (untied lm_head, sigmoid MoE, hybrid SWA)."""
 
     @classmethod
     def patch_model_config(cls, mc: ModelConfig) -> None:
@@ -426,21 +602,17 @@ class Step3p5ForCausalLM(nnx.Module):
         config: PretrainedConfig,
         mesh: jax.sharding.Mesh,
         dtype: jnp.dtype = jnp.bfloat16,
+        attn_impl: str = "flash",
     ) -> None:
         self.config = config
         self.mesh = mesh
         self.dtype = dtype
-        logger.info("Step3p5ForCausalLM dtype=%s", dtype)
+        self.attn_impl = attn_impl
+        logger.info("Step3p5ForCausalLM dtype=%s attn_impl=%s", dtype, attn_impl)
+
+        self.model = Step3p5Model(config, mesh=mesh, dtype=dtype, attn_impl=attn_impl)
 
         # Untied lm_head (tie_word_embeddings=False).
-        self.embed_tokens = Embed(
-            num_embeddings=config.vocab_size,
-            features=config.hidden_size,
-            dtype=dtype,
-            param_dtype=dtype,
-            kernel_axes=("tensor", None),
-            mesh=mesh,
-        )
         self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.hidden_size,
@@ -450,18 +622,176 @@ class Step3p5ForCausalLM(nnx.Module):
         )
         self.logits_processor = LogitsProcessor(config.vocab_size, mesh=mesh)
 
-        self.model = None  # TODO(step3p5): build Step3p5Model
-
     def __call__(
         self,
         forward_batch: ForwardBatch,
         memory_pools: MemoryPools,
         logits_metadata: LogitsMetadata,
     ):
-        raise NotImplementedError("TODO(step3p5): forward pass not yet implemented")
+        kv_pool = memory_pools.token_to_kv_pool
+        hidden_states, layers_kv_fused, layers_callback_flags = self.model(forward_batch, kv_pool)
+        output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
+        return output, {"token_to_kv_pool": layers_kv_fused}, True, None
 
     def load_weights(self, model_config: ModelConfig) -> None:
-        raise NotImplementedError("TODO(step3p5): weight loading not yet implemented")
+        loader = WeightLoader(
+            model=self,
+            model_config=model_config,
+            mesh=self.mesh,
+            dtype=self.dtype,
+        )
+        weight_mappings = self._create_weight_mappings(model_config)
+        loader.load_weights_from_safetensors(weight_mappings)
+        logger.info("Step3p5 weights loaded successfully!")
+
+    def _create_weight_mappings(self, model_config: ModelConfig) -> dict:
+        mappings: dict = {
+            "model.embed_tokens.weight": WeightMapping(
+                target_path="model.embed_tokens.embedding",
+                sharding=("tensor", None),
+                transpose=False,
+            ),
+            "model.norm.weight": WeightMapping(
+                target_path="model.norm.weight",
+                sharding=(None,),
+                transpose=False,
+            ),
+            "lm_head.weight": WeightMapping(
+                target_path="lm_head.embedding",
+                sharding=("tensor", None),
+                transpose=False,
+            ),
+        }
+
+        moe_ids = set(_moe_layer_ids(self.config))
+        for layer_idx in range(self.config.num_hidden_layers):
+            is_moe = layer_idx in moe_ids
+            mappings.update(self._create_layer_mappings(layer_idx, is_moe))
+
+        return mappings
+
+    def _create_layer_mappings(self, layer_idx: int, is_moe: bool) -> dict:
+        prefix = f"model.layers.{layer_idx}"
+        target = f"model.layers.{layer_idx}"
+        mappings: dict = {}
+
+        # Layer norms: GemmaRMSNorm stores param as `.weight` (not `.scale`).
+        mappings[f"{prefix}.input_layernorm.weight"] = WeightMapping(
+            target_path=f"{target}.input_layernorm.weight",
+            sharding=(None,),
+            transpose=False,
+        )
+        mappings[f"{prefix}.post_attention_layernorm.weight"] = WeightMapping(
+            target_path=f"{target}.post_attention_layernorm.weight",
+            sharding=(None,),
+            transpose=False,
+        )
+
+        # Attention projections (uniform — shapes auto-resolve per layer_type).
+        ap = f"{prefix}.self_attn"
+        tp = f"{target}.self_attn"
+        mappings[f"{ap}.q_proj.weight"] = WeightMapping(
+            target_path=f"{tp}.q_proj.weight",
+            sharding=(None, "tensor"),
+            transpose=True,
+            kv_head_padding=False,
+        )
+        mappings[f"{ap}.k_proj.weight"] = WeightMapping(
+            target_path=f"{tp}.k_proj.weight",
+            sharding=(None, "tensor"),
+            transpose=True,
+            kv_head_padding=True,
+        )
+        mappings[f"{ap}.v_proj.weight"] = WeightMapping(
+            target_path=f"{tp}.v_proj.weight",
+            sharding=(None, "tensor"),
+            transpose=True,
+            kv_head_padding=True,
+        )
+        mappings[f"{ap}.o_proj.weight"] = WeightMapping(
+            target_path=f"{tp}.o_proj.weight",
+            sharding=("tensor", None),
+            transpose=True,
+            kv_head_padding=False,
+        )
+        mappings[f"{ap}.g_proj.weight"] = WeightMapping(
+            target_path=f"{tp}.g_proj.weight",
+            sharding=(None, "tensor"),
+            transpose=True,
+            kv_head_padding=False,
+        )
+        # QK-norm: GemmaRMSNorm → .weight; not head-sharded (head_dim only).
+        mappings[f"{ap}.q_norm.weight"] = WeightMapping(
+            target_path=f"{tp}.q_norm.weight",
+            sharding=(None,),
+            transpose=False,
+        )
+        mappings[f"{ap}.k_norm.weight"] = WeightMapping(
+            target_path=f"{tp}.k_norm.weight",
+            sharding=(None,),
+            transpose=False,
+        )
+
+        if not is_moe:
+            # Dense FFN (layers 0-2): mlp.{gate,up,down}_proj.
+            for proj, sharding in [
+                ("gate_proj", (None, "tensor")),
+                ("up_proj", (None, "tensor")),
+                ("down_proj", ("tensor", None)),
+            ]:
+                mappings[f"{prefix}.mlp.{proj}.weight"] = WeightMapping(
+                    target_path=f"{target}.mlp.{proj}.weight",
+                    sharding=sharding,
+                    transpose=True,
+                )
+            return mappings
+
+        # MoE router gate: [288, 4096] in HF → moe_gate.kernel [4096, 288] after transpose.
+        mappings[f"{prefix}.moe.gate.weight"] = WeightMapping(
+            target_path=f"{target}.mlp.moe_gate.kernel",
+            sharding=(None, None),
+            transpose=True,
+        )
+        # Router bias: float32 [288].
+        mappings[f"{prefix}.moe.router_bias"] = WeightMapping(
+            target_path=f"{target}.mlp.moe_gate.bias",
+            sharding=(None,),
+            transpose=False,
+        )
+
+        # Stacked expert weights via Plan 1 loader (__MOE_EXPERTS__ pattern).
+        # Checkpoint stores pre-stacked [E, out, in]; the loader detects 3D + shape[0]==E
+        # (single-source branch) and calls _create_prestacked_moe_lazy_tensor, which applies
+        # transpose(0,2,1): [E, out, in] → [E, in, out] matching EPMoE wi_0/wi_1/wo layout.
+        # Sharding is (None, None, None) so the prestacked loader uses the standard mesh
+        # (avoids the expert/tensor mesh context mismatch during transpose); the assignment
+        # to EPMoE params auto-reshards to the expert/tensor sharding they were initialized on.
+        for src_proj, tgt_name in [
+            ("gate_proj", "wi_0"),
+            ("up_proj", "wi_1"),
+            ("down_proj", "wo"),
+        ]:
+            tgt_base = f"{target}.mlp.experts.{tgt_name}"
+            src_key = f"{prefix}.moe.{src_proj}.weight"
+            mappings[f"__MOE_EXPERTS__{tgt_base}"] = WeightMapping(
+                target_path=[tgt_base, src_key],
+                sharding=(None, None, None),
+                transpose=True,
+            )
+
+        # Shared expert (always-on): moe.share_expert.{gate,up,down}_proj.
+        for proj, sharding in [
+            ("gate_proj", (None, "tensor")),
+            ("up_proj", (None, "tensor")),
+            ("down_proj", ("tensor", None)),
+        ]:
+            mappings[f"{prefix}.moe.share_expert.{proj}.weight"] = WeightMapping(
+                target_path=f"{target}.mlp.shared_experts.{proj}.weight",
+                sharding=sharding,
+                transpose=True,
+            )
+
+        return mappings
 
 
 EntryClass = [Step3p5ForCausalLM]
