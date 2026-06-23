@@ -279,6 +279,10 @@ suites = {
         TestFile("test/srt/lora/test_align_lora_accuracy.py", 5.5),
         TestFile("python/sgl_jax/test/kernels/simple_gla_fused_test.py", 1, runner="pytest"),
         TestFile("python/sgl_jax/test/layers/test_merged_column_parallel_linear.py", 0.1),
+        # Plan 4: flash==naive parity (closes flash==HF via naive==HF ∧ flash==naive).
+        TestFile("python/sgl_jax/test/models/test_step3p5_flash_vs_naive.py", 3.0, runner="pytest"),
+        # Plan 4: engine self-consistency skeletons (skip on CPU, run on TPU).
+        TestFile("python/sgl_jax/test/models/test_step3p5_engine.py", 0.5, runner="pytest"),
     ],
     # CPU-only unit tests — moved off arc-runner-v6e-1 to a dedicated
     # CPU runner so they don't consume TPU capacity. Either pure
@@ -332,6 +336,8 @@ suites = {
         TestFile("python/sgl_jax/test/models/test_step3p5_model.py", 2.0, runner="pytest"),
         TestFile("python/sgl_jax/test/models/test_step3p5_invariants.py", 1.0, runner="pytest"),
         TestFile("python/sgl_jax/test/models/test_step3p5_alignment.py", 5.0, runner="pytest"),
+        # Plan 4: bf16 propagation floor (CPU-verifiable, naive path only).
+        TestFile("python/sgl_jax/test/models/test_step3p5_bf16_floor.py", 1.0, runner="pytest"),
         TestFile(
             "python/sgl_jax/test/utils/test_weight_loader_prestacked_moe.py",
             0.1,
