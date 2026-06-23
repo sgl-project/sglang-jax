@@ -867,6 +867,253 @@ class TestSWAWindownessNaiveRef(unittest.TestCase):
 
 
 # ===========================================================================
+# Naive attention oracle tests (discipline 1 + 2)
+# ===========================================================================
+
+
+def _hf_eager_attention_np(
+    q_np: np.ndarray,
+    k_np: np.ndarray,
+    v_np: np.ndarray,
+    scaling: float,
+    window: int | None,
+) -> np.ndarray:
+    """Numpy fp32 port of HF eager_attention_forward for Step3p5.
+
+    Inputs: q/k/v each [T, num_heads, head_dim] (post GQA-expansion for k/v).
+    The HF attention mask is an additive mask (-inf for masked, 0 for unmasked);
+    create_sliding_window_causal_mask combines causal + window via AND logic,
+    which is equivalent to setting masked positions to -inf.
+
+    Window predicate (from create_sliding_window_causal_mask / sliding_window_overlay):
+      valid[q_idx, k_idx] := (k_idx <= q_idx) AND (k_idx > q_idx - W)
+      i.e., q_idx - k_idx < W AND k_idx <= q_idx
+    Softmax in fp32 (test uses float32 inputs throughout).
+    Returns attn_output [T, num_heads * head_dim].
+    """
+    T, num_heads, head_dim = q_np.shape
+
+    # HF layout: [batch, heads, seq, dim]; batch=1 here, squeezed in/out.
+    q = q_np[None].transpose(0, 2, 1, 3).astype(np.float32)  # [1, H, T, D]
+    k = k_np[None].transpose(0, 2, 1, 3).astype(np.float32)  # [1, H, T, D]
+    v = v_np[None].transpose(0, 2, 1, 3).astype(np.float32)  # [1, H, T, D]
+
+    attn_weights = np.matmul(q, k.transpose(0, 1, 3, 2)) * scaling  # [1, H, T, T]
+
+    # Build additive mask: 0 for valid, -inf for masked.
+    q_idx = np.arange(T)
+    k_idx = np.arange(T)
+    causal = k_idx[None, :] <= q_idx[:, None]  # [T, T]
+    if window is not None:
+        in_window = k_idx[None, :] > q_idx[:, None] - window  # [T, T]
+        valid = causal & in_window
+    else:
+        valid = causal
+    additive = np.where(valid, 0.0, np.finfo(np.float32).min / 2).astype(np.float32)
+    attn_weights = attn_weights + additive[None, None, :, :]  # broadcast over batch, heads
+
+    # Softmax in fp32 (numerically stable).
+    attn_weights -= attn_weights.max(axis=-1, keepdims=True)
+    exp_w = np.exp(attn_weights)
+    attn_weights = exp_w / exp_w.sum(axis=-1, keepdims=True)
+
+    out = np.matmul(attn_weights, v)  # [1, H, T, D]
+    out = out.transpose(0, 2, 1, 3).reshape(T, num_heads * head_dim)  # [T, H*D]
+    return out
+
+
+class TestNaiveAttentionDefaultUnchanged(unittest.TestCase):
+    """Discipline 2: default attn_impl=='flash' leaves RadixAttention construction intact."""
+
+    def setUp(self):
+        self.cfg = _tiny_full_config()
+        self.mesh = _make_mesh()
+
+    def test_default_is_flash_and_has_radix_attention(self):
+        """Default Step3p5Attention has attn_impl='flash' and builds RadixAttention."""
+        from sgl_jax.srt.layers.radix_attention import RadixAttention
+
+        with jax.set_mesh(self.mesh):
+            attn = _build_attention(self.cfg, layer_id=0, mesh=self.mesh)
+
+        self.assertEqual(attn.attn_impl, "flash")
+        self.assertIsInstance(attn.attn, RadixAttention)
+
+    def test_naive_does_not_change_projections(self):
+        """naive path does not alter q/k/v/o/g_proj or RoPE construction."""
+        from sgl_jax.srt.models.step3p5 import Step3p5Attention
+
+        with jax.set_mesh(self.mesh):
+            attn_flash = _build_attention(self.cfg, layer_id=0, mesh=self.mesh)
+            attn_naive = Step3p5Attention(
+                self.cfg, layer_id=0, mesh=self.mesh, dtype=jnp.float32, attn_impl="naive"
+            )
+
+        # Both have the same projection shapes.
+        self.assertEqual(attn_flash.q_proj.weight[...].shape, attn_naive.q_proj.weight[...].shape)
+        self.assertEqual(attn_flash.k_proj.weight[...].shape, attn_naive.k_proj.weight[...].shape)
+        self.assertEqual(attn_flash.o_proj.weight[...].shape, attn_naive.o_proj.weight[...].shape)
+        self.assertEqual(attn_flash.num_heads, attn_naive.num_heads)
+        self.assertEqual(attn_flash.num_kv_heads, attn_naive.num_kv_heads)
+        self.assertEqual(attn_flash.scaling, attn_naive.scaling)
+
+
+class TestNaiveAttentionOracleVsHF(unittest.TestCase):
+    """Discipline 1: _naive_attention matches HF eager_attention_forward fp32 semantics.
+
+    Covers a full-attention layer (no window) and a sliding-attention layer (window=4,
+    sequence N=12 so the window actually masks out-of-window positions).
+
+    We port HF eager_attention_forward to numpy fp32 and feed identical q/k/v
+    (post QK-norm + RoPE, extracted from the module sub-ops) to both the numpy
+    reference and Step3p5Attention._naive_attention, then assert equal within 2e-5.
+    The tolerance is slightly above 1e-5 to accommodate fp32 accumulation-order
+    differences between numpy matmul and jnp.einsum — both are semantically identical.
+    """
+
+    _ATOL = 2e-5
+
+    def _run_naive_and_hf(
+        self,
+        attn_module,
+        hidden_states: np.ndarray,
+        positions: np.ndarray,
+        mesh,
+        window: int | None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Run both _naive_attention and the numpy HF reference on the same q/k/v.
+
+        Extracts q/k/v after QK-norm + RoPE from the module's own sub-ops (same
+        inputs as what _naive_attention would receive in __call__).
+        Returns (naive_out, hf_out) both [T, num_heads * head_dim] fp32.
+        """
+        T = hidden_states.shape[0]
+        hs = jnp.array(hidden_states, dtype=jnp.float32)
+        pos = jnp.array(positions, dtype=jnp.int32)
+        num_heads = attn_module.num_heads
+        num_kv_heads = attn_module.num_kv_heads
+        head_dim = attn_module.head_dim
+
+        with jax.set_mesh(mesh):
+            q_flat, _ = attn_module.q_proj(hs)
+            k_flat, _ = attn_module.k_proj(hs)
+            v_flat, _ = attn_module.v_proj(hs)
+
+            q = q_flat.reshape(T, num_heads, head_dim)
+            k = k_flat.reshape(T, num_kv_heads, head_dim)
+            v = v_flat.reshape(T, num_kv_heads, head_dim)
+
+            q = attn_module.q_norm(q)
+            k = attn_module.k_norm(k)
+            q, k = attn_module.rotary_emb(pos, q, k)
+
+        q_np = np.asarray(q, dtype=np.float32)
+        k_np = np.asarray(k, dtype=np.float32)
+        v_np = np.asarray(v, dtype=np.float32)
+
+        # GQA expansion for HF reference (same as repeat_kv in modeling_step3p5.py).
+        num_q_per_kv = num_heads // num_kv_heads
+        k_exp = np.repeat(k_np, num_q_per_kv, axis=1)
+        v_exp = np.repeat(v_np, num_q_per_kv, axis=1)
+
+        hf_out = _hf_eager_attention_np(q_np, k_exp, v_exp, attn_module.scaling, window)
+
+        # Run _naive_attention via the module (it does the GQA expansion internally).
+        q_jax = jnp.array(q_np)
+        k_jax = jnp.array(k_np)
+        v_jax = jnp.array(v_np)
+        with jax.set_mesh(mesh):
+            naive_out_jax = attn_module._naive_attention(q_jax, k_jax, v_jax)
+        naive_out = np.asarray(naive_out_jax, dtype=np.float32)
+
+        return naive_out, hf_out
+
+    def test_full_attention_layer_matches_hf(self):
+        """Full-attention layer (no SWA): naive matches HF fp32 eager reference."""
+        cfg = _tiny_full_config()
+        mesh = _make_mesh()
+        with jax.set_mesh(mesh):
+            attn = _build_attention(cfg, layer_id=0, mesh=mesh)
+
+        T = 8
+        rng = np.random.default_rng(42)
+        hs = rng.standard_normal((T, cfg.hidden_size)).astype(np.float32)
+        pos = np.arange(T, dtype=np.int32)
+
+        naive_out, hf_out = self._run_naive_and_hf(attn, hs, pos, mesh, window=None)
+
+        np.testing.assert_allclose(
+            naive_out,
+            hf_out,
+            atol=self._ATOL,
+            err_msg="Full-attention layer: naive != HF fp32 reference. "
+            "Check scaling, GQA grouping, or causal mask.",
+        )
+
+    def test_sliding_attention_layer_matches_hf(self):
+        """Sliding-attention layer (window=4, N=12 > W): naive matches HF fp32 reference.
+
+        N=12, W=4: the last query (pos=11) should only attend to pos [8, 9, 10, 11];
+        any difference in window off-by-one would show up here.
+        Window predicate verified: valid[q,k] := k<=q AND q-k<W
+        (HF sliding_window_overlay: kv_idx > q_idx - W; same as q-k < W).
+        """
+        cfg = _tiny_full_config()
+        cfg.sliding_window = 4
+        mesh = _make_mesh()
+        with jax.set_mesh(mesh):
+            attn = _build_attention(cfg, layer_id=1, mesh=mesh)  # layer 1 = sliding
+
+        T = 12  # N > W so window actually masks
+        rng = np.random.default_rng(99)
+        hs = rng.standard_normal((T, cfg.hidden_size)).astype(np.float32)
+        pos = np.arange(T, dtype=np.int32)
+
+        naive_out, hf_out = self._run_naive_and_hf(attn, hs, pos, mesh, window=4)
+
+        np.testing.assert_allclose(
+            naive_out,
+            hf_out,
+            atol=self._ATOL,
+            err_msg="Sliding-attention layer (W=4, N=12): naive != HF fp32 reference. "
+            "Check SWA window predicate (off-by-one?) or GQA grouping.",
+        )
+
+    def test_sliding_layer_window_actually_masks(self):
+        """Positive control: perturbing out-of-window tokens changes HF ref but not naive (both mask).
+
+        This confirms the window mask is active (N=12 > W=4), not degenerate.
+        If both naive and HF are correct and mask consistently, perturbing
+        out-of-window tokens must NOT change output at the last query for either.
+        """
+        cfg = _tiny_full_config()
+        cfg.sliding_window = 4
+        mesh = _make_mesh()
+        with jax.set_mesh(mesh):
+            attn = _build_attention(cfg, layer_id=1, mesh=mesh)
+
+        T = 12
+        rng = np.random.default_rng(7)
+        hs_base = rng.standard_normal((T, cfg.hidden_size)).astype(np.float32)
+        pos = np.arange(T, dtype=np.int32)
+
+        naive_base, _ = self._run_naive_and_hf(attn, hs_base, pos, mesh, window=4)
+
+        # Perturb tokens strictly outside the last query's window (pos 0..7).
+        hs_perturbed = hs_base.copy()
+        hs_perturbed[:8] = rng.standard_normal((8, cfg.hidden_size)).astype(np.float32) * 5.0
+        naive_perturbed, _ = self._run_naive_and_hf(attn, hs_perturbed, pos, mesh, window=4)
+
+        np.testing.assert_allclose(
+            naive_perturbed[-1],
+            naive_base[-1],
+            atol=1e-4,
+            err_msg="naive: out-of-window perturbation changed output at last query — "
+            "window mask is not active or wrong window predicate.",
+        )
+
+
+# ===========================================================================
 # Worktree source guard
 # ===========================================================================
 
