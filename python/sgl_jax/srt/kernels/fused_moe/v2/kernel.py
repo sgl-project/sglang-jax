@@ -348,8 +348,6 @@ def _fused_ep_moe_kernel(
     bse: int,
     quant_block_k: int | None = None,
     enable_act_quant: bool = False,
-    compact_expert_loop: bool = False,
-    global_rolling_wb: bool = False,
 ):
     # ===== Dimension extraction =====
     dp_rank = lax.axis_index(dp_axis_name)
@@ -413,6 +411,10 @@ def _fused_ep_moe_kernel(
         num_pq_chunks = 0
 
     num_bf = cdiv(intermediate_size, bf)
+    # Global-rolling weight double-buffer applies only for a single bf block per
+    # expert (num_bf == 1); num_bf >= 2 (e.g. MiMo) uses
+    # the standard bf-id double-buffer.
+    global_rolling_wb = num_bf == 1
 
     per_channel = quant_block_k is None and w1_scale_hbm is not None
     ffn1_qbk = h_per_t if per_channel else quant_block_k
@@ -2071,20 +2073,18 @@ def _fused_ep_moe_kernel(
 
         init_carry = jnp.bool_(False)
 
-        if compact_expert_loop:
+        def _build_active(le, n):
+            e_id_b = my_id * local_num_experts + le
+            sz_b = expert_sizes_x2_smem[bt_sem_id, 0, e_id_b]
 
-            def _build_active(le, n):
-                e_id_b = my_id * local_num_experts + le
-                sz_b = expert_sizes_x2_smem[bt_sem_id, 0, e_id_b]
+            @pl.when(sz_b > 0)
+            def _():
+                active_ids_x2_smem[bt_sem_id, n] = le
 
-                @pl.when(sz_b > 0)
-                def _():
-                    active_ids_x2_smem[bt_sem_id, n] = le
+            return n + (sz_b > 0).astype(jnp.int32)
 
-                return n + (sz_b > 0).astype(jnp.int32)
-
-            n_act = lax.fori_loop(0, local_num_experts, _build_active, jnp.int32(0), unroll=False)
-            n_active_x2_smem[bt_sem_id, 0] = n_act
+        n_act = lax.fori_loop(0, local_num_experts, _build_active, jnp.int32(0), unroll=False)
+        n_active_x2_smem[bt_sem_id, 0] = n_act
 
         # ===== SE-first phase: compute all shared-expert blocks BEFORE the
         # routed expert loop, overlapping the scatter-recv / metadata window.
@@ -2099,79 +2099,42 @@ def _fused_ep_moe_kernel(
 
             lax.fori_loop(0, se_total_blocks, _se_body, None)
 
-        if compact_expert_loop:
-            n_active = n_active_x2_smem[bt_sem_id, 0]
+        n_active = n_active_x2_smem[bt_sem_id, 0]
 
-            def compute_expert_batch_compact(i, carry):
-                bf0_w13_prefetched = carry
-                local_e_id = active_ids_x2_smem[bt_sem_id, i]
-                e_sem_id_local = local_e_id
-                has_next = (i + jnp.int32(1)) < n_active
-                nxt_idx = lax.select(has_next, i + jnp.int32(1), i)
-                next_local_e_id = active_ids_x2_smem[bt_sem_id, nxt_idx]
-                wait_a2a_scatter_recv(
-                    bt_sem_id=bt_sem_id,
-                    e_sem_id=e_sem_id_local,
-                    local_e_id=local_e_id,
-                    a2a_bank_id=a2a_bank_id,
-                )
-                expert_slot = (i % jnp.int32(2)) if global_rolling_wb else None
-                next_bf0_w13_prefetched = expert_ffn(
-                    bt_sem_id,
-                    e_sem_id_local,
-                    local_e_id,
-                    bf0_w13_prefetched,
-                    a2a_bank_id,
-                    next_local_e_id=next_local_e_id,
-                    has_next=has_next,
-                    expert_slot=expert_slot,
-                )
-                start_a2a_gather(
-                    bt_sem_id=bt_sem_id,
-                    e_sem_id=e_sem_id_local,
-                    local_e_id=local_e_id,
-                    a2a_bank_id=a2a_bank_id,
-                    gather_bank_id=gather_bank_id,
-                )
-                return next_bf0_w13_prefetched
-
-            lax.fori_loop(0, n_active, compute_expert_batch_compact, init_carry, unroll=False)
-        else:
-
-            def compute_expert_batch(local_e_id, carry):
-                bf0_w13_prefetched = carry
-                e_sem_id_local = local_e_id
-
-                wait_a2a_scatter_recv(
-                    bt_sem_id=bt_sem_id,
-                    e_sem_id=e_sem_id_local,
-                    local_e_id=local_e_id,
-                    a2a_bank_id=a2a_bank_id,
-                )
-                next_bf0_w13_prefetched = expert_ffn(
-                    bt_sem_id,
-                    e_sem_id_local,
-                    local_e_id,
-                    bf0_w13_prefetched,
-                    a2a_bank_id,
-                )
-                start_a2a_gather(
-                    bt_sem_id=bt_sem_id,
-                    e_sem_id=e_sem_id_local,
-                    local_e_id=local_e_id,
-                    a2a_bank_id=a2a_bank_id,
-                    gather_bank_id=gather_bank_id,
-                )
-
-                return next_bf0_w13_prefetched
-
-            lax.fori_loop(
-                0,
-                local_num_experts,
-                compute_expert_batch,
-                init_carry,
-                unroll=False,
+        def compute_expert_batch_compact(i, carry):
+            bf0_w13_prefetched = carry
+            local_e_id = active_ids_x2_smem[bt_sem_id, i]
+            e_sem_id_local = local_e_id
+            has_next = (i + jnp.int32(1)) < n_active
+            nxt_idx = lax.select(has_next, i + jnp.int32(1), i)
+            next_local_e_id = active_ids_x2_smem[bt_sem_id, nxt_idx]
+            wait_a2a_scatter_recv(
+                bt_sem_id=bt_sem_id,
+                e_sem_id=e_sem_id_local,
+                local_e_id=local_e_id,
+                a2a_bank_id=a2a_bank_id,
             )
+            expert_slot = (i % jnp.int32(2)) if global_rolling_wb else None
+            next_bf0_w13_prefetched = expert_ffn(
+                bt_sem_id,
+                e_sem_id_local,
+                local_e_id,
+                bf0_w13_prefetched,
+                a2a_bank_id,
+                next_local_e_id=next_local_e_id,
+                has_next=has_next,
+                expert_slot=expert_slot,
+            )
+            start_a2a_gather(
+                bt_sem_id=bt_sem_id,
+                e_sem_id=e_sem_id_local,
+                local_e_id=local_e_id,
+                a2a_bank_id=a2a_bank_id,
+                gather_bank_id=gather_bank_id,
+            )
+            return next_bf0_w13_prefetched
+
+        lax.fori_loop(0, n_active, compute_expert_batch_compact, init_carry, unroll=False)
 
         if not skip_post_gather:
             wait_a2a_scatter_send_batch(a2a_bank_id=a2a_bank_id)
@@ -2404,8 +2367,6 @@ def fused_ep_moe_v2(
     num_tokens, hidden_size = tokens.shape
     num_experts, intermediate_size, _ = w2.shape
     local_num_experts = num_experts // ep_size
-    compact_expert_loop = _env_bool("SGLJAX_MOE_V2_COMPACT_EXPERT_LOOP", False)
-    global_rolling_wb_flag = _env_bool("SGLJAX_MOE_V2_GLOBAL_ROLLING_WB", False)
     se_inter_size = w2_shared.shape[0] if w2_shared is not None else 0
 
     local_num_tokens = num_tokens // ep_size
@@ -2434,9 +2395,6 @@ def fused_ep_moe_v2(
     bf = block_config.bf
     btc = block_config.btc
     bse = block_config.bse
-
-    num_bf = cdiv(intermediate_size, bf)
-    global_rolling_wb = compact_expert_loop and global_rolling_wb_flag and (num_bf == 1)
 
     if w1_shared is not None:
         # SE writes its weight tiles into the [:bse] slice of the width-bf routed
@@ -2694,8 +2652,6 @@ def fused_ep_moe_v2(
                 bts=bts,
                 bse=bse,
                 quant_block_k=quant_block_k,
-                compact_expert_loop=compact_expert_loop,
-                global_rolling_wb=global_rolling_wb,
             ),
             out_shape=jax.ShapeDtypeStruct((local_num_tokens, hidden_size), out_dtype),
             grid_spec=pltpu.PrefetchScalarGridSpec(
