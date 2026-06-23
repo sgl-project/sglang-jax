@@ -99,6 +99,7 @@ def _prepare_verify_sampling_params_host(sampling_info, batch, total_bs: int, vo
     top_ps = top_ps.copy()
     temperatures[~active] = 1.0
     top_ks[~active] = TOP_K_ALL
+    top_ks[top_ks <= 0] = TOP_K_ALL
     top_ps[~active] = 1.0
 
     active_top_ks = top_ks[active]
