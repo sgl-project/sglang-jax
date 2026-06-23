@@ -12,7 +12,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from sgl_jax.srt.kernels.grouped_topk.grouped_topk import (
+from sgl_jax.srt.kernels.grouped_topk.v1.kernel import (
     SAFE_AUTO_BT,
     _largest_safe_divisor,
     grouped_topk_pallas,
@@ -161,3 +161,36 @@ def test_topk_pad_boundary(E, G, Gtop, k, name):
     np.testing.assert_allclose(
         np.array(w_pal), np.array(w_ref), rtol=0, atol=1e-6, err_msg=f"{name}: weights"
     )
+
+
+def test_matches_ref_on_flat_ties():
+    """All scores equal -> reference returns the lowest indices in order; the kernel must match
+    (the stable lowest-index tie-break, vs the hardware argmax which would reorder on TPU)."""
+    E, G, Gtop, k, bs = 256, 8, 4, 8, 512
+    logits = jnp.full((bs, E), 0.5, dtype=jnp.float32)
+    bias = jnp.zeros((E,), dtype=jnp.float32)
+    w_ref, ids_ref = ref_biased_grouped_topk(
+        logits, bias, num_expert_group=G, topk_group=Gtop, topk=k
+    )
+    w_pal, ids_pal = grouped_topk_pallas(
+        logits, bias, num_expert_group=G, topk_group=Gtop, topk=k, block_tokens=bs, interpret=True
+    )
+    np.testing.assert_array_equal(np.array(ids_pal), np.array(ids_ref))
+    np.testing.assert_allclose(np.array(w_pal), np.array(w_ref), rtol=0, atol=1e-6)
+
+
+def test_matches_ref_on_partial_ties():
+    """Force a within-group tie (experts 3 and 5 share a score) with distinct pre-bias weights, so a
+    wrong tie-break would swap their topk positions / gathered weights. Must match the reference."""
+    E, G, Gtop, k, bs = 256, 8, 4, 8, 512
+    logits = _logits(bs, E, seed=11)
+    logits = logits.at[:, 5].set(logits[:, 3])
+    bias = jax.random.normal(jax.random.PRNGKey(5), (E,), dtype=jnp.float32) * 0.1
+    w_ref, ids_ref = ref_biased_grouped_topk(
+        logits, bias, num_expert_group=G, topk_group=Gtop, topk=k
+    )
+    w_pal, ids_pal = grouped_topk_pallas(
+        logits, bias, num_expert_group=G, topk_group=Gtop, topk=k, block_tokens=bs, interpret=True
+    )
+    np.testing.assert_array_equal(np.array(ids_pal), np.array(ids_ref))
+    np.testing.assert_allclose(np.array(w_pal), np.array(w_ref), rtol=0, atol=1e-6)

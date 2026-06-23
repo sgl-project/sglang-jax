@@ -1,46 +1,76 @@
-"""Stable (lowest-index tie-break) variant of the inference grouped top-k Pallas kernel.
+"""Standalone Pallas TPU kernel for biased grouped top-k MoE routing.
 
-V1 (`grouped_topk.py`) selects experts/groups with `jnp.argmax`. `jnp.argmax` is documented to
-return the lowest index on ties, but on TPU the Mosaic lane-reduction does NOT guarantee that — it
-can return a higher index — so experts/groups with equal post-bias scores can be emitted in a
-different ORDER than `jax.lax.top_k` (which breaks ties toward the lowest index). The model output
-is unchanged by a topk reorder (the {expert -> weight} set is identical and the combine sum is
-order-invariant), but exact id-for-id parity with `lax.top_k` matters for validation and for any
-consumer where the topk position is significant.
+This is the routing of `gate.py:TopK._biased_grouped_topk` (DeepSeek-V3 noaux_tc) done
+WITHOUT any `sort` — entirely via `max`/`argmax` selection, fully VMEM-resident inside one
+Pallas kernel. It mirrors the in-kernel `get_top_k` of the v1 fused-MoE kernel
+(`kernels/fused_moe/v1/kernel.py`) but is a self-contained, separately benchmarkable op.
 
-V2 keeps the exact same algorithm and still returns weights from the kernel (gathered from the
-PRE-bias logits at the selected id), but replaces each selection `argmax` with an explicit
-"max value, then smallest index achieving it" (`max` + masked `min`). This reproduces
-`jax.lax.top_k`'s lowest-index tie-break deterministically, independent of the hardware argmax
-tie-break. `group_top2` is unchanged: it only needs the SUM of the group's top-2 scores, which is
-identical regardless of which tied element is masked first.
+Why no sort: on TPU `jax.lax.top_k` lowers to a `stablehlo.sort` (a bitonic comparison
+network) that is bound by the VPU's cross-lane permute throughput (~8% of VPU peak). Selecting
+top-k by iterated `argmax` (+ masking the winner) is a sequence of plain reduces — it runs on
+the much faster reduce path and touches fewer elements for small k. See
+`work/group-topk-kernel/analysis-zh.md`.
 
-Separate module (not an in-place edit of `grouped_topk.py`) so V1/V2 can be A/B benchmarked.
+Algorithm (matches `_biased_grouped_topk` exactly, id-for-id):
+  scores = router_logits + correction_bias                         # post-bias "scores_for_choice"
+  ① group score = sum of top-2 per group, via 2-pass max           # no sort
+  ② select `topk_group` groups, via iterated argmax                # no sort
+  ③ mask dropped groups to -inf, select `topk` experts via argmax  # no sort
+  weights = router_logits[selected_ids]   (PRE-bias logits)        # like gate.py
+Renormalize / routed_scaling are left to the caller (as in `TopK.__call__`).
 """
 
 from __future__ import annotations
 
 import functools
+import logging
+import os
 
 import jax
 import jax.experimental.pallas as pl
 import jax.numpy as jnp
 
 try:
-    from sgl_jax.srt.kernels.grouped_topk.grouped_topk import (
-        NEG_INF,
-        SAFE_AUTO_BT,
-        _align_to,
-        _largest_safe_divisor,
-        get_interpret,
-        logger,
-    )
     from sgl_jax.srt.kernels.grouped_topk.tuned_block_sizes import get_tuned_bt
-except Exception:  # noqa: BLE001  (base64-embedded standalone copy: names already at module scope)
-    pass
+except Exception:  # noqa: BLE001  (e.g. base64-embedded standalone copy without the package)
+
+    def get_tuned_bt(*_a, **_k):  # noqa: ANN002, ANN003
+        return None
 
 
-def _grouped_topk_kernel_v2(
+logger = logging.getLogger(__name__)
+
+NEG_INF = -jnp.inf
+
+# Largest BT the multi-block (grid>1) path is known to fit in v7x VMEM (double-buffered [BT,E]
+# inputs; see tuned_block_sizes / analysis-zh.md). The "auto" path never tiles above this without
+# warning.
+SAFE_AUTO_BT = 2048
+
+
+def _align_to(x: int, a: int) -> int:
+    return ((x + a - 1) // a) * a
+
+
+def _largest_safe_divisor(bs: int, cap: int = SAFE_AUTO_BT, align: int = 8) -> int | None:
+    """Largest d that divides bs with d <= cap and d % align == 0.
+
+    Pallas TPU tiling needs the token block to be a multiple of 8 (sublane), so an auto block size
+    must be both a divisor of bs (for an even grid) and 8-aligned. Returns None when bs has no such
+    divisor (e.g. bs is prime / not 8-aligned), so the caller can fall back to a single block.
+    """
+    hi = (min(cap, bs) // align) * align
+    for d in range(hi, 0, -align):
+        if bs % d == 0:
+            return d
+    return None
+
+
+def get_interpret() -> bool:
+    return os.environ.get("PALLAS_INTERPRET", "").strip().lower() in ("1", "true")
+
+
+def _grouped_topk_kernel_argmax(
     logits_ref,  # [BT, E] f32  (router_logits, post-score-func, PRE-bias)
     bias_ref,  # [E]     f32  (correction_bias)
     w_ref,  # [BT, padded_topk] f32  out: weights
@@ -58,8 +88,7 @@ def _grouped_topk_kernel_v2(
         scores = logits + bias_ref[...][None, :]  # post-bias [BT, E]
     bt = scores.shape[0]
 
-    # ① group score = sum of top-2 within each group, via 2-pass max. Tie-invariant (the SUM of the
-    #    top-2 is the same regardless of which tied max is masked first), so it keeps the cheap argmax.
+    # ① group score = sum of top-2 within each group, via 2-pass max (no sort)
     with jax.named_scope("group_top2"):
         g_scores = []
         for g in range(n_group):
@@ -72,14 +101,13 @@ def _grouped_topk_kernel_v2(
             g_scores.append(v1 + v2)
         group_scores = jnp.concatenate(g_scores, axis=1)  # [BT, G]
 
-    # ② select `topk_group` groups, lowest-index tie-break (matches jax.lax.top_k).
+    # ② select `topk_group` groups, via iterated argmax (no sort)
     with jax.named_scope("group_select"):
         group_mask = jnp.zeros((bt, n_group), dtype=jnp.bool_)
         g_iota = jax.lax.broadcasted_iota(jnp.int32, (bt, n_group), 1)
         tmp = group_scores
         for _ in range(topk_group):
-            gmax = jnp.max(tmp, axis=1, keepdims=True)
-            gi = jnp.min(jnp.where(tmp == gmax, g_iota, n_group), axis=1, keepdims=True)
+            gi = jnp.argmax(tmp, axis=1, keepdims=True)
             m = g_iota == gi
             group_mask = jnp.logical_or(group_mask, m)
             tmp = jnp.where(m, NEG_INF, tmp)
@@ -92,17 +120,14 @@ def _grouped_topk_kernel_v2(
             masked_slices.append(jnp.where(gm, scores[:, g * S : (g + 1) * S], NEG_INF))
         masked = jnp.concatenate(masked_slices, axis=1)  # [BT, E]
 
-    # ③ select `topk` experts, lowest-index tie-break (matches jax.lax.top_k). Weight is taken from
-    #    the PRE-bias logits at the selected id (matches gate.py).
+    # ③ select `topk` experts, via iterated argmax (no sort).
+    #    weight is taken from the PRE-bias logits at the selected id (matches gate.py).
     with jax.named_scope("final_select"):
         e_iota = jax.lax.broadcasted_iota(jnp.int32, (bt, num_experts), 1)
         cur = masked
         id_cols, w_cols = [], []
         for k in range(topk):
-            cmax = jnp.max(cur, axis=1, keepdims=True)
-            idx = jnp.min(
-                jnp.where(cur == cmax, e_iota, num_experts), axis=1, keepdims=True
-            )  # [BT,1]
+            idx = jnp.argmax(cur, axis=1, keepdims=True)  # [BT, 1]
             sel = e_iota == idx  # [BT, E]
             wval = jnp.sum(jnp.where(sel, logits, 0.0), axis=1, keepdims=True)  # [BT, 1]
             id_cols.append(idx.astype(jnp.int32))
@@ -110,7 +135,9 @@ def _grouped_topk_kernel_v2(
             if k != topk - 1:
                 cur = jnp.where(sel, NEG_INF, cur)
 
-    # Pad the minor (lane) dim topk -> padded_topk (multiple of 128); wrapper slices [:, :topk].
+    # Pad the minor (lane) dim topk -> padded_topk (multiple of 128) so the output VMEM tile is
+    # lane-aligned on TPU. Filler ids = -1, filler weights = 0.0; the wrapper slices [:, :topk]
+    # outside the kernel, so the padding is transparent to callers.
     n_pad = padded_topk - topk
     if n_pad > 0:
         id_cols.append(jnp.full((bt, n_pad), -1, dtype=jnp.int32))
@@ -120,7 +147,7 @@ def _grouped_topk_kernel_v2(
     w_ref[...] = jnp.concatenate(w_cols, axis=1)  # [BT, padded_topk]
 
 
-def grouped_topk_pallas_v2(
+def grouped_topk_pallas_argmax(
     router_logits: jax.Array,  # [BS, E] (any float; cast to f32 inside)
     correction_bias: jax.Array,  # [E]
     *,
@@ -130,10 +157,13 @@ def grouped_topk_pallas_v2(
     block_tokens: int | str = "auto",
     interpret: bool | None = None,
 ):
-    """Biased grouped top-k via argmax-selection with a stable lowest-index tie-break.
+    """Biased grouped top-k via argmax-selection. Returns (topk_weights[BS,k], topk_ids[BS,k]).
 
-    Drop-in for `grouped_topk_pallas`; matches `jax.lax.top_k` id-for-id including on tied
-    post-bias scores. Returns (topk_weights[BS,k], topk_ids[BS,k]).
+    Drop-in for `gate.py:TopK._biased_grouped_topk` (renormalize / routed_scaling_factor are
+    applied by the caller, exactly as in `TopK.__call__`).
+
+    `block_tokens="auto"` (default) looks up the tuned BT for this device + (BS, E, G, Gtop, k)
+    and falls back to a safe default on a miss; an explicit int forces that block size.
     """
     bs, e = router_logits.shape
     router_logits = router_logits.astype(jnp.float32)
@@ -144,13 +174,16 @@ def grouped_topk_pallas_v2(
         if tuned is not None and bs % tuned == 0:
             bt = tuned
         elif bs % 512 == 0:
-            bt = min(512, bs)
+            bt = min(512, bs)  # 512 divides bs -> safe default tile
         else:
+            # Odd serving bucket (bs divisible by neither the tuned BT nor 512): pick the largest
+            # VMEM-safe divisor of bs rather than silently tiling the whole batch as one block.
             bt = _largest_safe_divisor(bs) or bs
         if bt > SAFE_AUTO_BT:
             logger.warning(
-                "grouped_topk_v2: auto block_tokens fell back to whole-batch BT=%d (BS=%d has no "
-                "VMEM-safe divisor); a single [%d,%d] tile may exceed VMEM.",
+                "grouped_topk: auto block_tokens fell back to whole-batch BT=%d (BS=%d has no "
+                "VMEM-safe divisor); a single [%d,%d] tile may exceed VMEM. Pad local tokens to a "
+                "power-of-2 or a multiple of 512, or pass an explicit block_tokens.",
                 bt,
                 bs,
                 bs,
@@ -163,9 +196,9 @@ def grouped_topk_pallas_v2(
     if interpret is None:
         interpret = get_interpret()
 
-    padded_topk = _align_to(topk, 128)
+    padded_topk = _align_to(topk, 128)  # TPU VMEM output tile needs a 128-multiple minor dim
     kernel = functools.partial(
-        _grouped_topk_kernel_v2,
+        _grouped_topk_kernel_argmax,
         n_group=num_expert_group,
         topk_group=topk_group,
         topk=topk,
@@ -188,6 +221,6 @@ def grouped_topk_pallas_v2(
             jax.ShapeDtypeStruct((bs, padded_topk), jnp.int32),
         ],
         interpret=interpret,
-        name="grouped-topk-v2",
+        name="grouped-topk-argmax",
     )(router_logits, bias)
     return weights[:, :topk], ids[:, :topk]

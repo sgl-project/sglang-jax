@@ -11,13 +11,17 @@ top-k by iterated `argmax` (+ masking the winner) is a sequence of plain reduces
 the much faster reduce path and touches fewer elements for small k. See
 `work/group-topk-kernel/analysis-zh.md`.
 
-Algorithm (matches `_biased_grouped_topk` exactly, id-for-id):
+Algorithm (matches `_biased_grouped_topk` exactly, id-for-id, INCLUDING ties):
   scores = router_logits + correction_bias                         # post-bias "scores_for_choice"
   ① group score = sum of top-2 per group, via 2-pass max           # no sort
-  ② select `topk_group` groups, via iterated argmax                # no sort
-  ③ mask dropped groups to -inf, select `topk` experts via argmax  # no sort
+  ② select `topk_group` groups, via max + masked-min               # no sort, lowest-index tie-break
+  ③ mask dropped groups to -inf, select `topk` experts likewise    # no sort, lowest-index tie-break
   weights = router_logits[selected_ids]   (PRE-bias logits)        # like gate.py
 Renormalize / routed_scaling are left to the caller (as in `TopK.__call__`).
+
+Tie-break: selection uses `max` + masked `min` (smallest index achieving the max) rather than
+`jnp.argmax`, because TPU Mosaic's lane-reduction argmax does NOT break ties toward the lowest
+index; this reproduces `jax.lax.top_k`'s lowest-index order exactly, even on equal scores.
 """
 
 from __future__ import annotations
@@ -101,13 +105,15 @@ def _grouped_topk_kernel(
             g_scores.append(v1 + v2)
         group_scores = jnp.concatenate(g_scores, axis=1)  # [BT, G]
 
-    # ② select `topk_group` groups, via iterated argmax (no sort)
+    # ② select `topk_group` groups, lowest-index tie-break (matches jax.lax.top_k). TPU Mosaic's
+    #    argmax does NOT break ties toward the lowest index, so use max + masked-min instead.
     with jax.named_scope("group_select"):
         group_mask = jnp.zeros((bt, n_group), dtype=jnp.bool_)
         g_iota = jax.lax.broadcasted_iota(jnp.int32, (bt, n_group), 1)
         tmp = group_scores
         for _ in range(topk_group):
-            gi = jnp.argmax(tmp, axis=1, keepdims=True)
+            gmax = jnp.max(tmp, axis=1, keepdims=True)
+            gi = jnp.min(jnp.where(tmp == gmax, g_iota, n_group), axis=1, keepdims=True)
             m = g_iota == gi
             group_mask = jnp.logical_or(group_mask, m)
             tmp = jnp.where(m, NEG_INF, tmp)
@@ -120,14 +126,17 @@ def _grouped_topk_kernel(
             masked_slices.append(jnp.where(gm, scores[:, g * S : (g + 1) * S], NEG_INF))
         masked = jnp.concatenate(masked_slices, axis=1)  # [BT, E]
 
-    # ③ select `topk` experts, via iterated argmax (no sort).
-    #    weight is taken from the PRE-bias logits at the selected id (matches gate.py).
+    # ③ select `topk` experts, lowest-index tie-break (matches jax.lax.top_k); weight is taken from
+    #    the PRE-bias logits at the selected id (matches gate.py).
     with jax.named_scope("final_select"):
         e_iota = jax.lax.broadcasted_iota(jnp.int32, (bt, num_experts), 1)
         cur = masked
         id_cols, w_cols = [], []
         for k in range(topk):
-            idx = jnp.argmax(cur, axis=1, keepdims=True)  # [BT, 1]
+            cmax = jnp.max(cur, axis=1, keepdims=True)
+            idx = jnp.min(
+                jnp.where(cur == cmax, e_iota, num_experts), axis=1, keepdims=True
+            )  # [BT,1]
             sel = e_iota == idx  # [BT, E]
             wval = jnp.sum(jnp.where(sel, logits, 0.0), axis=1, keepdims=True)  # [BT, 1]
             id_cols.append(idx.astype(jnp.int32))

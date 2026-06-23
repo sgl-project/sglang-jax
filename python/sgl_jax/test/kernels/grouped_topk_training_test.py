@@ -8,7 +8,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from sgl_jax.srt.kernels.grouped_topk.topk_v1_training import (
+from sgl_jax.srt.kernels.grouped_topk.legacy.topk_v1_training import (
     grouped_topk_ids_pallas,
     grouped_topk_pallas_training,
 )

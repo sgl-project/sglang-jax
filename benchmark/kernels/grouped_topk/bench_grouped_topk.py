@@ -26,7 +26,7 @@ import jax.numpy as jnp
 
 try:
     # Real path on a TPU host with sgl_jax installed.
-    from sgl_jax.srt.kernels.grouped_topk.grouped_topk import grouped_topk_pallas
+    from sgl_jax.srt.kernels.grouped_topk.v1.kernel import grouped_topk_pallas
 except Exception:  # noqa: BLE001
     # The falcon-embedded variant prepends the kernel source; `grouped_topk_pallas` is then already
     # defined at module scope, nothing to import.

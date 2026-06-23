@@ -20,10 +20,10 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 
-from sgl_jax.srt.kernels.grouped_topk.grouped_topk import grouped_topk_pallas
-from sgl_jax.srt.kernels.grouped_topk.topk_v1_training import (
+from sgl_jax.srt.kernels.grouped_topk.legacy.topk_v1_training import (
     grouped_topk_pallas_training,
 )
+from sgl_jax.srt.kernels.grouped_topk.v1.kernel import grouped_topk_pallas
 
 SCOPE_V1_FUSED = "bench_grouped_topk_v1_fused"
 SCOPE_V1_TRAINING_GATHER = "bench_grouped_topk_v1_training_gather"
