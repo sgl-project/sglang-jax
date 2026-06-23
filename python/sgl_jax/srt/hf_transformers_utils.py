@@ -25,6 +25,7 @@ from sgl_jax.srt.configs.bailing_hybrid import BailingHybridConfig
 from sgl_jax.srt.configs.gemma4 import Gemma4Config
 from sgl_jax.srt.configs.kimi_linear import KimiLinearConfig
 from sgl_jax.srt.configs.qwen3_5 import Qwen3_5DenseConfig, Qwen3_5HybridConfig
+from sgl_jax.srt.configs.step3p5 import Step3p5Config
 from sgl_jax.srt.managers.tiktoken_tokenizer import TiktokenTokenizer
 from sgl_jax.srt.utils.common_utils import is_remote_url, lru_cache_frozenset
 
@@ -46,6 +47,7 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
         Qwen3_5HybridConfig,
         Qwen3_5DenseConfig,
         Gemma4Config,
+        Step3p5Config,
     ]
 }
 
