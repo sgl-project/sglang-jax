@@ -106,6 +106,32 @@ def _extract_durations_ms(trace: dict[str, Any]) -> list[float]:
     return max(sorted(durations.items()), key=lambda kv: len(kv[1]))[1]
 
 
+def _build_xprof_counter_options():
+    """Periodic TPU TensorCore perf-counter sampling for xprof (notebook-style).
+
+    Enabled by BENCH_XPROF_COUNTERS=1. Requires jax>=0.9 / Ironwood runtime and
+    the LLO trace flags in LIBTPU_INIT_ARGS:
+        --xla_enable_custom_call_region_trace=true
+        --xla_xprof_register_llo_debug_info=true
+    Returns None (-> plain trace) when disabled.
+    """
+    if os.environ.get("BENCH_XPROF_COUNTERS", "0") != "1":
+        return None
+    opts = jax.profiler.ProfileOptions()
+    opts.advanced_configuration = {
+        "tpu_enable_periodic_counter_sampling": True,
+        "tpu_tc_perf_counter_sampling_options": (
+            "interval_us:1 scaling:0 counter_size_bits:1 "
+            "indices:1 indices:3 indices:4 indices:10 indices:11 "
+            "indices:31 indices:32 indices:33 indices:34 indices:35 "
+            "indices:37 indices:38 indices:56 indices:57 indices:58 "
+            "indices:73 indices:74 indices:75 indices:105"
+        ),
+        "num_tensor_cores_to_trace_per_device": 1,
+    }
+    return opts
+
+
 def trace_timeit(run_fn, warmup: int, iters: int) -> list[float]:
     """Warmup then profile *iters* calls, return per-iter device durations (ms)."""
     for _ in range(warmup):
@@ -116,7 +142,13 @@ def trace_timeit(run_fn, warmup: int, iters: int) -> list[float]:
     trace_dir = os.path.join(TRACE_ROOT, f"run_{tag}")
     os.makedirs(trace_dir, exist_ok=True)
 
-    with jax.profiler.trace(trace_dir):
+    prof_opts = _build_xprof_counter_options()
+    trace_cm = (
+        jax.profiler.trace(trace_dir, profiler_options=prof_opts)
+        if prof_opts is not None
+        else jax.profiler.trace(trace_dir)
+    )
+    with trace_cm:
         for i in range(iters):
             out = run_fn()
             jax.block_until_ready(out)
@@ -280,79 +312,6 @@ else:
     timeit_fn = wall_timeit if use_wall else trace_timeit
     timing_label = "wall" if use_wall else "trace"
 
-# Ablation flags
-all_disable = os.environ.get("FUSED_MOE_BENCHMARK_ALL_DISABLE", "0") == "1"
-disable_a2a = all_disable or os.environ.get("DISABLE_A2A", "0") == "1"
-disable_a2a_scatter = all_disable or os.environ.get("DISABLE_A2A_SCATTER", "0") == "1"
-disable_a2a_scatter_local_copy = (
-    all_disable or os.environ.get("DISABLE_A2A_SCATTER_LOCAL_COPY", "0") == "1"
-)
-disable_a2a_scatter_remote_copy = (
-    all_disable or os.environ.get("DISABLE_A2A_SCATTER_REMOTE_COPY", "0") == "1"
-)
-disable_a2a_scatter_recv_wait = (
-    all_disable or os.environ.get("DISABLE_A2A_SCATTER_RECV_WAIT", "0") == "1"
-)
-disable_a2a_scatter_send_wait = (
-    all_disable or os.environ.get("DISABLE_A2A_SCATTER_SEND_WAIT", "0") == "1"
-)
-disable_a2a_gather = all_disable or os.environ.get("DISABLE_A2A_GATHER", "0") == "1"
-disable_a2a_gather_local_copy = (
-    all_disable or os.environ.get("DISABLE_A2A_GATHER_LOCAL_COPY", "0") == "1"
-)
-disable_a2a_gather_remote_copy = (
-    all_disable or os.environ.get("DISABLE_A2A_GATHER_REMOTE_COPY", "0") == "1"
-)
-disable_sync_barrier = all_disable or os.environ.get("DISABLE_SYNC_BARRIER", "0") == "1"
-disable_weight_load = all_disable or os.environ.get("DISABLE_WEIGHT_LOAD", "0") == "1"
-disable_w1_load = all_disable or os.environ.get("DISABLE_W1_LOAD", "0") == "1"
-disable_w3_load = all_disable or os.environ.get("DISABLE_W3_LOAD", "0") == "1"
-disable_w2_load = all_disable or os.environ.get("DISABLE_W2_LOAD", "0") == "1"
-disable_expert_x_load = all_disable or os.environ.get("DISABLE_EXPERT_X_LOAD", "0") == "1"
-disable_expert_ffn = all_disable or os.environ.get("DISABLE_EXPERT_FFN", "0") == "1"
-disable_dynamic_ffn1 = all_disable or os.environ.get("DISABLE_DYNAMIC_FFN1", "0") == "1"
-disable_dynamic_ffn2 = all_disable or os.environ.get("DISABLE_DYNAMIC_FFN2", "0") == "1"
-disable_expert_store = all_disable or os.environ.get("DISABLE_EXPERT_STORE", "0") == "1"
-disable_expert_stage_writeback = (
-    all_disable or os.environ.get("DISABLE_EXPERT_STAGE_WRITEBACK", "0") == "1"
-)
-disable_expert_store_dma = all_disable or os.environ.get("DISABLE_EXPERT_STORE_DMA", "0") == "1"
-disable_expert_store_wait = all_disable or os.environ.get("DISABLE_EXPERT_STORE_WAIT", "0") == "1"
-disable_acc_load = all_disable or os.environ.get("DISABLE_ACC_LOAD", "0") == "1"
-disable_acc_compute = all_disable or os.environ.get("DISABLE_ACC_COMPUTE", "0") == "1"
-disable_acc_store_vmem = all_disable or os.environ.get("DISABLE_ACC_STORE_VMEM", "0") == "1"
-disable_output_store = all_disable or os.environ.get("DISABLE_OUTPUT_STORE", "0") == "1"
-ablation_flags = {
-    "disable_a2a": disable_a2a,
-    "disable_a2a_scatter": disable_a2a_scatter,
-    "disable_a2a_scatter_local_copy": disable_a2a_scatter_local_copy,
-    "disable_a2a_scatter_remote_copy": disable_a2a_scatter_remote_copy,
-    "disable_a2a_scatter_recv_wait": disable_a2a_scatter_recv_wait,
-    "disable_a2a_scatter_send_wait": disable_a2a_scatter_send_wait,
-    "disable_a2a_gather": disable_a2a_gather,
-    "disable_a2a_gather_local_copy": disable_a2a_gather_local_copy,
-    "disable_a2a_gather_remote_copy": disable_a2a_gather_remote_copy,
-    "disable_sync_barrier": disable_sync_barrier,
-    "disable_weight_load": disable_weight_load,
-    "disable_w1_load": disable_w1_load,
-    "disable_w3_load": disable_w3_load,
-    "disable_w2_load": disable_w2_load,
-    "disable_expert_x_load": disable_expert_x_load,
-    "disable_expert_ffn": disable_expert_ffn,
-    "disable_dynamic_ffn1": disable_dynamic_ffn1,
-    "disable_dynamic_ffn2": disable_dynamic_ffn2,
-    "disable_expert_store": disable_expert_store,
-    "disable_expert_stage_writeback": disable_expert_stage_writeback,
-    "disable_expert_store_dma": disable_expert_store_dma,
-    "disable_expert_store_wait": disable_expert_store_wait,
-    "disable_acc_load": disable_acc_load,
-    "disable_acc_compute": disable_acc_compute,
-    "disable_acc_store_vmem": disable_acc_store_vmem,
-    "disable_output_store": disable_output_store,
-}
-active_ablation = [k for k, v in ablation_flags.items() if v]
-if active_ablation:
-    log(f"ablation flags: {active_ablation}")
 if direct_scaled_dot:
     log("direct_scaled_dot=True (fp8 dot per quant group, scale after dot)")
 if enable_bt_scatter_overlap:
@@ -1073,32 +1032,6 @@ for num_tokens in token_candidates:
                 w1_shared_scale=w1_shared_scale,
                 w2_shared_scale=w2_shared_scale,
                 w3_shared_scale=w3_shared_scale,
-                disable_a2a=disable_a2a,
-                disable_a2a_scatter=disable_a2a_scatter,
-                disable_a2a_scatter_local_copy=disable_a2a_scatter_local_copy,
-                disable_a2a_scatter_remote_copy=disable_a2a_scatter_remote_copy,
-                disable_a2a_scatter_recv_wait=disable_a2a_scatter_recv_wait,
-                disable_a2a_scatter_send_wait=disable_a2a_scatter_send_wait,
-                disable_a2a_gather=disable_a2a_gather,
-                disable_a2a_gather_local_copy=disable_a2a_gather_local_copy,
-                disable_a2a_gather_remote_copy=disable_a2a_gather_remote_copy,
-                disable_sync_barrier=disable_sync_barrier,
-                disable_weight_load=disable_weight_load,
-                disable_w1_load=disable_w1_load,
-                disable_w3_load=disable_w3_load,
-                disable_w2_load=disable_w2_load,
-                disable_expert_x_load=disable_expert_x_load,
-                disable_expert_ffn=disable_expert_ffn,
-                disable_dynamic_ffn1=disable_dynamic_ffn1,
-                disable_dynamic_ffn2=disable_dynamic_ffn2,
-                disable_expert_store=disable_expert_store,
-                disable_expert_stage_writeback=disable_expert_stage_writeback,
-                disable_expert_store_dma=disable_expert_store_dma,
-                disable_expert_store_wait=disable_expert_store_wait,
-                disable_acc_load=disable_acc_load,
-                disable_acc_compute=disable_acc_compute,
-                disable_acc_store_vmem=disable_acc_store_vmem,
-                disable_output_store=disable_output_store,
                 direct_scaled_dot=direct_scaled_dot,
                 enable_act_quant=enable_act_quant,
                 cross_expert_prefetch_mode=xprefetch_mode,
