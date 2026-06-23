@@ -641,7 +641,9 @@ class Step3p5ForCausalLM(nnx.Module):
             dtype=self.dtype,
         )
         weight_mappings = self._create_weight_mappings(model_config)
-        loader.load_weights_from_safetensors(weight_mappings)
+        # Step 3.5 has no legitimately-derived params (no MLA absorb, no quant
+        # scales, untied lm_head — every nnx.Param must come from the checkpoint).
+        loader.load_weights_from_safetensors(weight_mappings, assert_all_assigned=True)
         logger.info("Step3p5 weights loaded successfully!")
 
     def _create_weight_mappings(self, model_config: ModelConfig) -> dict:
