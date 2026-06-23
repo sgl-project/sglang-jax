@@ -42,7 +42,12 @@ class DtypeConfig:
         self.config_dict = self._parse_dict(config_dict or {})
 
         # Resolve the default dtype for this level
-        self.default_dtype = self.config_dict.get("default", default_dtype)
+        if "default" in self.config_dict:
+            self.default_dtype = self.config_dict["default"]
+        else:
+            self.default_dtype = (
+                jnp.dtype(default_dtype) if default_dtype is not None else None
+            )
 
     def _parse_dict(self, d: dict[str, Any]) -> dict[str, Any]:
         """Recursively parses a dictionary, converting string dtypes to jnp.dtype."""

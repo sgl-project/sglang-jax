@@ -51,6 +51,12 @@ class RadixAttention(nnx.Module):
         self.logit_cap = logit_cap or None
         self.attn_type = attn_type
         self.xai_temperature_len = -1
+        if softmax_dtype is not None:
+            softmax_dtype = jnp.dtype(softmax_dtype)
+            if not jnp.issubdtype(softmax_dtype, jnp.floating):
+                raise ValueError(
+                    f"softmax_dtype must be a floating-point type, but got {softmax_dtype}."
+                )
         self.softmax_dtype = softmax_dtype
 
     def __call__(

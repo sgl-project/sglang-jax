@@ -61,6 +61,41 @@ class TestDtypeConfigLlama(CustomTestCase):
         self.assertEqual(layer.mlp.gate_proj.params_dtype, jnp.float32)
         self.assertEqual(layer.mlp.up_proj.params_dtype, jnp.bfloat16)
 
+    def test_llama_invalid_softmax_dtype(self):
+        config = LlamaConfig(
+            hidden_size=256,
+            intermediate_size=512,
+            num_attention_heads=8,
+            num_key_value_heads=2,
+            num_hidden_layers=1,
+            vocab_size=32000,
+        )
+        mesh = create_device_mesh(ici_parallelism=[1, -1], dcn_parallelism=[1, 1])
+        jax.sharding.set_mesh(mesh)
+
+        # Configure an invalid integer dtype for softmax
+        dtype_config = DtypeConfig(
+            default_dtype=jnp.bfloat16,
+            config_dict={
+                "model": {
+                    "layers": {
+                        "self_attn": {
+                            "softmax": "int8",
+                        },
+                    }
+                },
+            },
+        )
+
+        with self.assertRaises(ValueError) as ctx:
+            LlamaForCausalLM(
+                config=config,
+                mesh=mesh,
+                dtype=jnp.bfloat16,
+                dtype_config=dtype_config,
+            )
+        self.assertIn("softmax_dtype must be a floating-point type", str(ctx.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

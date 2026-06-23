@@ -113,10 +113,6 @@ def ref_ragged_paged_attention_fused(
 
         attn = jax.nn.softmax(attn, axis=-1)
 
-        # Cast to v.dtype if different for the next operation
-        if attn.dtype != v.dtype:
-            attn = attn.astype(v.dtype)
-
         out = jnp.einsum("hqk,khd->qhd", attn, v).astype(queries.dtype)
         outputs.append(out)
 
@@ -220,10 +216,6 @@ def ref_ragged_paged_attention(
             attn = attn.astype(softmax_dtype)
 
         attn = jax.nn.softmax(attn, axis=-1)
-
-        # Cast to v.dtype if different for the next operation
-        if attn.dtype != v.dtype:
-            attn = attn.astype(v.dtype)
 
         out = jnp.einsum("hqk,khd->qhd", attn, v).astype(queries.dtype)
         outputs.append(out)
