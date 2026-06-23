@@ -8,7 +8,7 @@ import pickle
 import re
 import struct
 import time
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
@@ -1885,9 +1885,18 @@ class WeightLoader:
         weight_mappings: Mapping[str, WeightMappingSpec],
         safetensors_partition=1,
         dummy=False,
+        assert_all_assigned: bool = False,
+        unassigned_whitelist: Iterable[str] = (),
     ):
-        """Load weights using JAX lazy evaluation and parallel I/O."""
+        """Load weights using JAX lazy evaluation and parallel I/O.
+
+        assert_all_assigned: if True, raises after loading if any nnx.Param in
+        the model was not assigned from the checkpoint. Pass unassigned_whitelist
+        to exclude legitimately-derived params (e.g. MLA absorbed weights).
+        Default False so existing models are unaffected.
+        """
         params = nnx.state(self.model)
+        _assigned_paths: set[str] = set()  # populated only when assert_all_assigned=True
 
         if dummy or self.dummy_mode:
             self._load_dummy_weights(params, weight_mappings)
@@ -2045,6 +2054,8 @@ class WeightLoader:
                         else:
                             model_param.value = lazy_weight.astype(model_param.value.dtype)
 
+                        if assert_all_assigned:
+                            _assigned_paths.add(target_path)
                         mode_str = "Split-Stitch" if is_split_weight else "Direct"
                         logger.debug(
                             "Fast Loading %s -> %s (%s), shape: %s",
@@ -2080,7 +2091,13 @@ class WeightLoader:
                     hot_tokens_ids.value = hot_ids
                     continue
 
-                self._process_and_assign_weight(params, hf_key, lazy_weight, mapping)
+                self._process_and_assign_weight(
+                    params,
+                    hf_key,
+                    lazy_weight,
+                    mapping,
+                    _assigned_paths if assert_all_assigned else None,
+                )
 
             # 3. Process MoE Weights (Lazy Pull)
             for moe_key, mapping in tqdm(moe_mappings.items(), desc="Loading MoE Weights"):
@@ -2211,6 +2228,8 @@ class WeightLoader:
                             model_param.value = stacked_weight
                         else:
                             model_param.value = stacked_weight.astype(model_param.value.dtype)
+                        if assert_all_assigned:
+                            _assigned_paths.add(target_path)
                         _t_assign = time.monotonic() - _t_assign_start
                         logger.debug(
                             "MoE group %s: load=%.2fs assign=%.2fs total=%.2fs "
@@ -2320,6 +2339,8 @@ class WeightLoader:
                             model_param.value = expert_weights
                         else:
                             model_param.value = expert_weights.astype(model_param.value.dtype)
+                        if assert_all_assigned:
+                            _assigned_paths.add(target_path)
                     except Exception as e:
                         logger.error(
                             "Failed Split-MoE assign group=%s target=%s loaded_shape=%s final_shape=%s "
@@ -2344,6 +2365,40 @@ class WeightLoader:
 
         nnx.update(self.model, params)
         logger.info("All weights loaded successfully.")
+
+        if assert_all_assigned:
+            self._check_all_params_assigned(_assigned_paths, unassigned_whitelist)
+
+    def _check_all_params_assigned(
+        self,
+        assigned_paths: set[str],
+        whitelist: Iterable[str],
+    ) -> None:
+        """Raise ValueError if any nnx.Param in the model was not assigned.
+
+        Enumerate all nnx.Param leaves, subtract assigned_paths and whitelist;
+        any remainder means a mapping key was missing or mis-keyed.
+        """
+        state = nnx.state(self.model)
+        flat = nnx.to_flat_state(state)
+        all_param_paths = {
+            ".".join(str(p) for p in path)
+            for path, leaf in zip(flat.paths, flat.leaves)
+            if isinstance(leaf, nnx.Param)
+        }
+        whitelist_set = set(whitelist)
+        unassigned = all_param_paths - assigned_paths - whitelist_set
+        if unassigned:
+            sorted_missing = sorted(unassigned)
+            raise ValueError(
+                f"assert_all_assigned: {len(sorted_missing)} model param(s) were not loaded "
+                f"from the checkpoint (possible mis-keyed mapping):\n"
+                + "\n".join(f"  {p}" for p in sorted_missing)
+            )
+        logger.info(
+            "assert_all_assigned: all %d params confirmed loaded from checkpoint.",
+            len(all_param_paths),
+        )
 
     def _load_dummy_weights(
         self,
@@ -2522,6 +2577,7 @@ class WeightLoader:
         hf_key: str,
         hf_weight: jax.Array,
         mapping: WeightMapping,
+        _assigned_paths: set[str] | None = None,
     ):
         processed_weight = hf_weight
 
@@ -2532,12 +2588,17 @@ class WeightLoader:
             processed_weight = jnp.transpose(processed_weight, (1, 0))
 
         if isinstance(mapping.target_path, list):
-            self._handle_split_weight(params, hf_key, processed_weight, mapping)
+            self._handle_split_weight(params, hf_key, processed_weight, mapping, _assigned_paths)
         else:
-            self._handle_single_weight(params, hf_key, processed_weight, mapping)
+            self._handle_single_weight(params, hf_key, processed_weight, mapping, _assigned_paths)
 
     def _handle_single_weight(
-        self, params: nnx.State, hf_key: str, weight: jax.Array, mapping: WeightMapping
+        self,
+        params: nnx.State,
+        hf_key: str,
+        weight: jax.Array,
+        mapping: WeightMapping,
+        _assigned_paths: set[str] | None = None,
     ):
         assert isinstance(mapping.target_path, str)
         jax_path: str = mapping.target_path
@@ -2624,17 +2685,29 @@ class WeightLoader:
                 model_param.value = sharded_weight
             else:
                 model_param.value = sharded_weight.astype(model_param.value.dtype)
+            if _assigned_paths is not None:
+                _assigned_paths.add(jax_path)
         except Exception as e:
             logger.error("Failed to load %s -> %s: %s", hf_key, jax_path, str(e))
             raise
 
     def _handle_split_weight(
-        self, params: nnx.State, hf_key: str, weight: jax.Array, mapping: WeightMapping
+        self,
+        params: nnx.State,
+        hf_key: str,
+        weight: jax.Array,
+        mapping: WeightMapping,
+        _assigned_paths: set[str] | None = None,
     ):
-        self._split_qkv_weight(params, hf_key, weight, mapping)
+        self._split_qkv_weight(params, hf_key, weight, mapping, _assigned_paths)
 
     def _split_qkv_weight(
-        self, params: nnx.State, hf_key: str, weight: jax.Array, mapping: WeightMapping
+        self,
+        params: nnx.State,
+        hf_key: str,
+        weight: jax.Array,
+        mapping: WeightMapping,
+        _assigned_paths: set[str] | None = None,
     ):
         jax_paths = mapping.target_path
 
@@ -2867,6 +2940,8 @@ class WeightLoader:
             else:
                 model_param.value = sharded_weight.astype(model_param.value.dtype)
 
+            if _assigned_paths is not None:
+                _assigned_paths.add(jax_path)
             logger.debug("Split %s -> %s, shape: %s", hf_key, jax_path, processed_weight.shape)
 
     def _shard_weight(
