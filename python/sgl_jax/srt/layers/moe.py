@@ -40,6 +40,7 @@ class EPMoE(nnx.Module):
         quantization_config=None,
         physical_to_logical_map: "jax.Array | None" = None,
         pre_gather_quant_dtype=None,
+        swiglu_limit: "float | None" = None,
     ):
         self.num_experts_per_tok = num_experts_per_tok
         self.physical_to_logical_map = physical_to_logical_map
@@ -59,6 +60,7 @@ class EPMoE(nnx.Module):
         self.original_mesh = mesh
         self.mesh = mesh
         self.activation = activation
+        self.swiglu_limit = swiglu_limit
         self.hidden_size = hidden_size
 
         # Get quantization settings from config
@@ -645,6 +647,9 @@ class EPMoE(nnx.Module):
             layer_act = jax.nn.gelu(layer_w0)
         else:
             raise ValueError(f"Unsupported activation function {self.activation}")
+        if self.swiglu_limit is not None:
+            layer_act = jnp.clip(layer_act, max=self.swiglu_limit)
+            layer_w1 = jnp.clip(layer_w1, -self.swiglu_limit, self.swiglu_limit)
         intermediate_layer = jnp.multiply(layer_act, layer_w1)
 
         # === GEMM2: intermediate @ wo ===
