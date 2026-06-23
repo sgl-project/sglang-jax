@@ -89,7 +89,7 @@ class TestSpeculativeDecoding(CustomTestCase):
         )
 
         metrics = run_eval(args)
-        print(f"mmlu metrics {metrics}")
+        self.assertGreater(metrics["score"], 0.45)
 
 
 @unittest.skipUnless(

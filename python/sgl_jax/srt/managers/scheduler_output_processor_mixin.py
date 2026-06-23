@@ -14,7 +14,10 @@ from sgl_jax.srt.managers.io_struct import AbortReq, BatchTokenIDOut
 from sgl_jax.srt.managers.schedule_batch import BaseFinishReason, Req, ScheduleBatch
 from sgl_jax.srt.mem_cache.common import release_kv_cache
 from sgl_jax.srt.precision_tracer import precision_tracer
-from sgl_jax.srt.speculative.overlap_utils import resolve_spec_prefill_token_ids
+from sgl_jax.srt.speculative.overlap_utils import (
+    resolve_spec_prefill_token_ids,
+    use_legacy_eagle3_non_overlap,
+)
 
 if TYPE_CHECKING:
     from sgl_jax.srt.managers.scheduler import (
@@ -331,6 +334,9 @@ class SchedulerOutputProcessorMixin:
             result.cache_miss_count,
         )
         is_spec_decode = self.spec_algorithm is not None and not self.spec_algorithm.is_none()
+        legacy_eagle3_non_overlap = use_legacy_eagle3_non_overlap(
+            self.enable_overlap, self.spec_algorithm
+        )
         if is_spec_decode:
             from sgl_jax.srt.speculative.overlap_utils import (
                 resolve_spec_decode_token_ids,
@@ -445,7 +451,12 @@ class SchedulerOutputProcessorMixin:
 
                 if req.finished():
                     self.maybe_collect_routed_experts(req)
-                    if is_spec_decode and self.spec_algorithm.is_eagle():
+                    if legacy_eagle3_non_overlap:
+                        actual_token_len = len(req.origin_input_ids) + max(
+                            len(req.output_ids) - 1, 0
+                        )
+                        req.kv_committed_len = actual_token_len
+                    elif is_spec_decode and self.spec_algorithm.is_eagle():
                         # prepare_for_decode pre-claims one bonus slot. Keep
                         # kv_allocated_len as the allocation upper bound and let
                         # release_kv_cache free the overallocated tail.
@@ -471,7 +482,11 @@ class SchedulerOutputProcessorMixin:
                         self.tree_cache,
                         allow_overallocated=is_spec_decode,
                     )
-                elif is_spec_decode and self.spec_algorithm.is_eagle():
+                elif (
+                    is_spec_decode
+                    and self.spec_algorithm.is_eagle()
+                    and not legacy_eagle3_non_overlap
+                ):
                     req.kv_committed_len += new_accepted_len - 1
 
                 if req.return_output_logprob_only:
