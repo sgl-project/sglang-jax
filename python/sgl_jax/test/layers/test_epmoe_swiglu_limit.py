@@ -64,7 +64,7 @@ def test_clamp_matches_naive_loop(mesh):
     np.testing.assert_allclose(np.asarray(got), np.asarray(ref), rtol=2e-3, atol=2e-3)
 
 
-def test_default_is_strict_noop(mesh):
+def test_default_matches_unclamped_loop(mesh):
     E, H, inter, T, K = 4, 16, 32, 6, 2
     rng = np.random.default_rng(1)
     m = _build_epmoe(mesh, E, H, inter, swiglu_limit=None)
