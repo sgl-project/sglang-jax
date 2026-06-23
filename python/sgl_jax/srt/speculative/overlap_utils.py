@@ -44,6 +44,12 @@ def can_use_spec_decode_overlap(enable_overlap, spec_algorithm, batch) -> bool:
 
 
 def can_use_spec_prefill_overlap(enable_overlap, spec_algorithm, batch) -> bool:
+    # Cheap pre-filter only. The authoritative check is
+    # EAGLEWorker._can_use_fused_spec_prefill(model_worker_batch), which the
+    # scheduler ANDs in before dispatching to the fused prefill overlap entry
+    # (it needs the merged model_worker_batch sampling_info plus the worker's
+    # NEXTN/topk/num_steps config). Keep this gate to the conditions decidable
+    # from the ScheduleBatch alone so the two never drift.
     if not enable_overlap:
         return False
     if spec_algorithm is None or spec_algorithm.is_none():
