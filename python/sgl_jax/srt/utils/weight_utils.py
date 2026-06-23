@@ -1854,6 +1854,11 @@ class WeightLoader:
         target_dtype = _SAFETENSORS_DTYPE_TO_JAX.get(st_dtype, jnp.float32)
         sharding = target_sharding or jax.sharding.NamedSharding(self.mesh, P())
         full_shape = tuple(info["shape"])  # [E, out, in]
+        # Assumption: every EPMoE stacked spec shards axis 0 ("expert") and
+        # leaves weight dims (axes 1+) unsharded (None).  The array is built
+        # at full_shape (pre-transpose) and transposed afterwards; this is only
+        # correct when weight dims are unsharded — each shard holds the full
+        # weight tile so the post-transpose view is contiguous and complete.
 
         if physical_to_logical_map is None:
 
@@ -1864,6 +1869,11 @@ class WeightLoader:
 
             result: jax.Array = jax.make_array_from_callback(full_shape, sharding, _load_slice)
         else:
+            physical_to_logical_map = self._normalize_physical_to_logical_map(
+                physical_to_logical_map=physical_to_logical_map,
+                num_logical_experts=full_shape[0],
+                context="prestacked_moe_loader",
+            )
             f = file_manager.get_handle(info["file"])
             host = np.asarray(f.get_slice(hf_key)[:, :, :])
             host = host[np.asarray(physical_to_logical_map)]
