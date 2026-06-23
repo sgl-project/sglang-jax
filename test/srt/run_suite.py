@@ -345,6 +345,14 @@ suites = {
             runner="pytest",
         ),
         TestFile("python/sgl_jax/test/models/test_qwen3_5.py", 2, runner="pytest"),
+        # step3p5 CPU tests (Plan 2 Tasks 5+6).
+        # Flash==naive / prefill==decode / SWA==full parity is Plan 4 (L1 completion).
+        TestFile("python/sgl_jax/test/models/test_step3p5_skeleton.py", 0.5, runner="pytest"),
+        TestFile("python/sgl_jax/test/models/test_step3p5_attention.py", 1.0, runner="pytest"),
+        TestFile("python/sgl_jax/test/models/test_step3p5_moe.py", 0.5, runner="pytest"),
+        TestFile("python/sgl_jax/test/models/test_step3p5_model.py", 2.0, runner="pytest"),
+        TestFile("python/sgl_jax/test/models/test_step3p5_invariants.py", 1.0, runner="pytest"),
+        TestFile("python/sgl_jax/test/models/test_step3p5_alignment.py", 5.0, runner="pytest"),
         TestFile(
             "python/sgl_jax/test/test_moe_weight_loader_sharding.py",
             0.2,
