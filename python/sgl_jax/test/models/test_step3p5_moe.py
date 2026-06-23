@@ -802,5 +802,89 @@ class TestMoEForward(unittest.TestCase):
         )
 
 
+# ---------------------------------------------------------------------------
+# Test: I2 expert-permutation invariance
+# ---------------------------------------------------------------------------
+
+
+class TestExpertPermutationInvariance(unittest.TestCase):
+    """I2: permuting expert numbering + remapping topk_ids leaves MoE output unchanged.
+
+    This verifies dispatch/gather index correctness independently of the GMM==loop test.
+    """
+
+    def setUp(self):
+        self.mesh = _make_mesh()
+
+    def _build_epmoe(self, num_experts=8, hidden=32, inter=16):
+        from sgl_jax.srt.layers.moe import EPMoE
+
+        with jax.set_mesh(self.mesh):
+            return EPMoE(
+                hidden_size=hidden,
+                num_experts=num_experts,
+                num_experts_per_tok=2,
+                ep_size=1,
+                mesh=self.mesh,
+                intermediate_dim=inter,
+                weight_dtype=jnp.float32,
+                dtype=jnp.float32,
+                swiglu_limit=None,
+            )
+
+    def test_expert_permutation_invariance(self):
+        """out1 == out2 when expert weights permuted along axis 0 and topk_ids remapped."""
+        E, H, inter, T, K = 8, 32, 16, 6, 2
+        rng = np.random.default_rng(123)
+
+        # Build base EPMoE with random fp32 weights.
+        m1 = self._build_epmoe(num_experts=E, hidden=H, inter=inter)
+        wi_0 = jnp.asarray(rng.normal(0, 1.5, (E, H, inter)), jnp.float32)
+        wi_1 = jnp.asarray(rng.normal(0, 1.5, (E, H, inter)), jnp.float32)
+        wo = jnp.asarray(rng.normal(0, 0.5, (E, inter, H)), jnp.float32)
+        m1.wi_0.value = wi_0
+        m1.wi_1.value = wi_1
+        m1.wo.value = wo
+
+        x = jnp.asarray(rng.normal(0, 1.0, (T, H)), jnp.float32)
+        topk_ids = jnp.asarray(rng.integers(0, E, (T, K)), jnp.int32)
+        topk_w = jnp.asarray(rng.uniform(0.1, 1.0, (T, K)), jnp.float32)
+
+        with jax.set_mesh(self.mesh):
+            out1 = np.asarray(m1(x, topk_w, topk_ids))
+
+        # Build permuted EPMoE: perm is a roll by 3 (deterministic, covers all positions).
+        perm = np.roll(np.arange(E), 3)  # perm[e] = new position for expert e
+        perm_jnp = jnp.asarray(perm, jnp.int32)
+
+        m2 = self._build_epmoe(num_experts=E, hidden=H, inter=inter)
+        # wi_0_perm[perm[e]] = wi_0[e], equivalently wi_0_perm = wi_0[inv_perm] at each slot
+        # Simpler: set m2.wi_0.value[perm[e]] = wi_0[e] for all e via index_update.
+        wi_0_perm = jnp.zeros_like(wi_0)
+        wi_1_perm = jnp.zeros_like(wi_1)
+        wo_perm = jnp.zeros_like(wo)
+        for e in range(E):
+            wi_0_perm = wi_0_perm.at[perm[e]].set(wi_0[e])
+            wi_1_perm = wi_1_perm.at[perm[e]].set(wi_1[e])
+            wo_perm = wo_perm.at[perm[e]].set(wo[e])
+        m2.wi_0.value = wi_0_perm
+        m2.wi_1.value = wi_1_perm
+        m2.wo.value = wo_perm
+
+        # Remap topk_ids: tokens that used expert e now use slot perm[e].
+        topk_ids_perm = perm_jnp[topk_ids]
+
+        with jax.set_mesh(self.mesh):
+            out2 = np.asarray(m2(x, topk_w, topk_ids_perm))
+
+        np.testing.assert_allclose(
+            out2,
+            out1,
+            rtol=2e-3,
+            atol=2e-3,
+            err_msg="EPMoE output must be invariant to expert permutation+topk_ids remap",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
