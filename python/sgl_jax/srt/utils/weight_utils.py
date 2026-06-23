@@ -1836,6 +1836,45 @@ class WeightLoader:
             )
         return result
 
+    def _create_prestacked_moe_lazy_tensor(
+        self,
+        hf_key: str,
+        weight_info: dict,
+        file_manager: "SequentialSafetensorManager",
+        do_transpose: bool = False,
+        target_sharding: jax.sharding.NamedSharding | None = None,
+        physical_to_logical_map: np.ndarray | None = None,
+    ) -> jax.Array:
+        """Load a checkpoint that already stores experts STACKED as one
+        [E, out, in] tensor (Step 3.5 moe.{gate,up,down}_proj.weight). Reuses the
+        same transpose(0,2,1) -> [E, in, out] convention as the per-expert stacked
+        loader. physical_to_logical_map reorders the expert (axis-0) dim for EPLB."""
+        info = weight_info[hf_key][0]
+        st_dtype = info["dtype"]
+        target_dtype = _SAFETENSORS_DTYPE_TO_JAX.get(st_dtype, jnp.float32)
+        sharding = target_sharding or jax.sharding.NamedSharding(self.mesh, P())
+        full_shape = tuple(info["shape"])  # [E, out, in]
+
+        if physical_to_logical_map is None:
+
+            def _load_slice(index):
+                f = file_manager.get_handle(info["file"])
+                arr = f.get_slice(hf_key)[index]
+                return _reinterpret_dtype_if_needed(arr, target_dtype)
+
+            result: jax.Array = jax.make_array_from_callback(full_shape, sharding, _load_slice)
+        else:
+            f = file_manager.get_handle(info["file"])
+            host = np.asarray(f.get_slice(hf_key)[:, :, :])
+            host = host[np.asarray(physical_to_logical_map)]
+            result = jax.device_put(_reinterpret_dtype_if_needed(host, target_dtype), sharding)
+
+        if result.dtype != target_dtype:
+            result = result.astype(target_dtype)
+        if do_transpose:
+            result = jnp.transpose(result, (0, 2, 1))
+        return result
+
     def load_weights_from_safetensors(
         self,
         weight_mappings: Mapping[str, WeightMappingSpec],
@@ -2103,14 +2142,31 @@ class WeightLoader:
 
                     # 2. Call creator
                     _t_load_start = time.monotonic()
-                    stacked_weight = self._create_stacked_moe_lazy_tensor(
-                        expected_hf_keys,
-                        weight_info,
-                        file_manager,
-                        do_transpose=mapping.transpose,  # CPU transpose
-                        target_sharding=final_sharding,  # Global loading
-                        physical_to_logical_map=mapping.physical_to_logical_map,
-                    )
+                    _is_prestacked = False
+                    if len(expected_hf_keys) == 1:
+                        _info0 = weight_info[expected_hf_keys[0]][0]
+                        _shape0 = tuple(_info0["shape"])
+                        _tgt_param = self._get_param(params, mapping.target_path[0])
+                        if len(_shape0) == 3 and _shape0[0] == _tgt_param.value.shape[0]:
+                            _is_prestacked = True
+                    if _is_prestacked:
+                        stacked_weight = self._create_prestacked_moe_lazy_tensor(
+                            expected_hf_keys[0],
+                            weight_info,
+                            file_manager,
+                            do_transpose=mapping.transpose,
+                            target_sharding=final_sharding,
+                            physical_to_logical_map=mapping.physical_to_logical_map,
+                        )
+                    else:
+                        stacked_weight = self._create_stacked_moe_lazy_tensor(
+                            expected_hf_keys,
+                            weight_info,
+                            file_manager,
+                            do_transpose=mapping.transpose,  # CPU transpose
+                            target_sharding=final_sharding,  # Global loading
+                            physical_to_logical_map=mapping.physical_to_logical_map,
+                        )
                     _t_load = time.monotonic() - _t_load_start
                     loaded_shape = stacked_weight.shape
 
