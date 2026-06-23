@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from fastapi.testclient import TestClient
+
+from sgl_jax.srt.disaggregation.bootstrap import build_app
 from sgl_jax.srt.disaggregation.pd_auth import (
     _ENV_VAR,
     bearer_header,
@@ -78,3 +81,36 @@ class TestBearer:
 
     def test_verify_bearer_rejects_empty(self):
         assert verify_bearer("tok", None) is False
+
+
+class TestBootstrapBearerEnforcement:
+    """End-to-end Bearer enforcement on a real bootstrap FastAPI app."""
+
+    def test_health_open_with_auth(self):
+        app, _ = build_app(shared_secret="shh")
+        with TestClient(app) as c:
+            assert c.get("/health").status_code == 200
+
+    def test_rejects_no_auth(self):
+        app, _ = build_app(shared_secret="shh")
+        with TestClient(app) as c:
+            assert c.get("/list_prefills").status_code == 401
+
+    def test_rejects_wrong_auth(self):
+        app, _ = build_app(shared_secret="shh")
+        with TestClient(app) as c:
+            r = c.get("/list_prefills", headers={"Authorization": "Bearer wrong"})
+            assert r.status_code == 401
+
+    def test_accepts_right_auth(self):
+        app, _ = build_app(shared_secret="shh")
+        with TestClient(app) as c:
+            r = c.get("/list_prefills", headers={"Authorization": "Bearer shh"})
+            assert r.status_code == 200
+
+    def test_disabled_auth_accepts_anything(self):
+        app, _ = build_app(shared_secret=None)
+        with TestClient(app) as c:
+            assert c.get("/list_prefills").status_code == 200
+            r2 = c.get("/list_prefills", headers={"Authorization": "Bearer anything"})
+            assert r2.status_code == 200

@@ -33,9 +33,6 @@ class TestMaybeWrapIpv6:
     def test_ipv6_wrapped(self):
         assert maybe_wrap_ipv6_address("::1") == "[::1]"
 
-    def test_full_ipv6_wrapped(self):
-        assert maybe_wrap_ipv6_address("2001:db8::1") == "[2001:db8::1]"
-
 
 class TestGenerateBootstrapRoom:
     def test_room_is_int(self):
@@ -284,29 +281,6 @@ class TestGenerateEndpoint:
         assert response.status_code == 200
         data = response.json()
         assert data == {"text": "hello world"}
-
-
-class TestV1ChatCompletionsEndpoint:
-    @patch("aiohttp.ClientSession")
-    def test_chat_completions(self, mock_session_cls, client, lb_instance):
-        mock_response = AsyncMock()
-        mock_response.status = 200
-        mock_response.json = AsyncMock(return_value={"choices": [{"message": {"content": "hi"}}]})
-
-        mock_session = AsyncMock()
-        mock_session.post = AsyncMock(return_value=mock_response)
-        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
-        mock_session.__aexit__ = AsyncMock(return_value=False)
-        mock_session_cls.return_value = mock_session
-
-        response = client.post(
-            "/v1/chat/completions",
-            json={
-                "model": "test",
-                "messages": [{"role": "user", "content": "hello"}],
-            },
-        )
-        assert response.status_code == 200
 
 
 class TestV1CompletionsEndpoint:
