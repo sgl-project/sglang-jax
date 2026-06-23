@@ -14,6 +14,8 @@ ack after a successful pull.
 
 from __future__ import annotations
 
+import logging
+import queue as _queue
 import threading
 from collections.abc import Callable
 from contextlib import suppress
@@ -37,7 +39,7 @@ from sgl_jax.srt.disaggregation.common.metrics import (
 )
 from sgl_jax.srt.disaggregation.common.zmq_notifier import ZmqPullNotifier
 from sgl_jax.srt.disaggregation.jax_transfer.wrapper import JaxTransferWrapper
-from sgl_jax.srt.mem_cache.host_kv_pool import HostKVPool, StagedData
+from sgl_jax.srt.mem_cache.host_kv_pool import HostKVPool
 
 __all__ = [
     "JaxTransferKVManager",
@@ -47,6 +49,9 @@ __all__ = [
     "TerminalTransferRecord",
     "TransferStatus",
 ]
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -74,8 +79,9 @@ class TransferStatus:
     ``uuid`` is the wire-level base uuid for this request.
     ``sub_uuids`` lists all per-entry uuids registered with the
     backend (format: ``f"{uuid}:{entry_name}"``).
-    ``on_done`` is the composite cleanup hook (path A returns all
-    host buffers to the pool; path B is a no-op).
+    ``on_done`` is currently a no-op for both path A and path B. The
+    host-pool slot reserved for D2H staging is released exactly once by
+    the scheduler's prefill-terminal callback (single-owner), NOT here.
     """
 
     uuid: str
@@ -101,6 +107,7 @@ class JaxTransferKVManager(CommonKVManager):
         ack_timeout_seconds: float = 60.0,
         pull_timeout_seconds: float = 30.0,
         reaper_interval_seconds: float = 5.0,
+        pull_worker_count: int = 4,
     ) -> None:
         super().__init__(
             ack_timeout_seconds=ack_timeout_seconds,
@@ -110,6 +117,42 @@ class JaxTransferKVManager(CommonKVManager):
         self._wrapper = wrapper
         self._zmq_notifier = zmq_notifier
         self._host_pool = host_pool
+        # A pool of long-lived workers drains the pull queue and runs the
+        # blocking ``wrapper.pull`` off the decode event-loop thread (on TPU
+        # ``link.pull`` is a synchronous native call). ``pull_worker_count`` is
+        # matched to the transfer engine's ``max_num_parallel_copies`` so
+        # concurrent pulls run in parallel and a stalled pull only ties up one
+        # worker until its ``timeout`` fires (no head-of-line blocking).
+        self._pull_worker_count = max(1, int(pull_worker_count))
+        self._pull_queue: _queue.Queue[JaxTransferKVReceiver | None] = _queue.Queue()
+        self._pull_workers: list[threading.Thread] = []
+        for i in range(self._pull_worker_count):
+            t = threading.Thread(
+                target=self._pull_worker_loop,
+                name=f"jax-kv-pull-worker-{i}",
+                daemon=True,
+            )
+            t.start()
+            self._pull_workers.append(t)
+
+    def enqueue_pull(self, receiver: JaxTransferKVReceiver) -> None:
+        """Hand a TRANSFERRING receiver to the background pull worker.
+
+        Non-blocking: the queue is unbounded and ``put`` returns at once,
+        so the decode event loop never stalls behind a pull.
+        """
+
+        self._pull_queue.put(receiver)
+
+    def _pull_worker_loop(self) -> None:
+        while True:
+            receiver = self._pull_queue.get()
+            if receiver is None:
+                return
+            try:
+                receiver._run_pull()
+            except Exception:  # noqa: BLE001
+                logger.exception("jax-kv-pull-worker: receiver pull crashed")
 
     # ------------------------------------------------------------------
     # Component access
@@ -137,6 +180,7 @@ class JaxTransferKVManager(CommonKVManager):
         payload: dict[str, jax.Array],
         *,
         use_d2h_staging: bool,
+        buffer_id: int | None = None,
     ) -> TransferStatus:
         """Register ``payload`` entries for remote pull under sub-uuids.
 
@@ -159,30 +203,28 @@ class JaxTransferKVManager(CommonKVManager):
             if self._host_pool is None:
                 raise RuntimeError(
                     "use_d2h_staging=True requires a host_pool on the "
-                    "manager; pass one via JaxTransferKVManager("
-                    "..., host_pool=...)"
+                    "manager; pass one via JaxTransferKVManager(..., host_pool=...)"
+                )
+            if buffer_id is None:
+                raise RuntimeError(
+                    "use_d2h_staging=True requires a reserved buffer_id "
+                    "(reserved at admission in get_new_batch_prefill)"
                 )
             pool = self._host_pool
-            buffer_ids: list[int] = []
             try:
-                for name, arr in payload.items():
+                for name, arr_pytree in payload.items():
                     sub = f"{uuid}:{name}"
-                    staged: StagedData = pool.copy_from_device(arr)
-                    self._wrapper.register_pull(sub, staged.array)
+                    staged = pool.copy_from_device(arr_pytree, buffer_id)
+                    self._wrapper.register_pull(sub, staged.array_pytree)
                     sub_uuids.append(sub)
-                    buffer_ids.append(staged.buffer_id)
             except Exception:
+                # Roll back wrapper registrations only. The pool slot is owned
+                # by the scheduler prefill-terminal callback, which releases it
+                # during the abort that follows this raise.
                 for sub_uuid in sub_uuids:
                     self._wrapper.release(sub_uuid)
-                for bid in buffer_ids:
-                    pool.put_buffer(bid)
                 raise
-
-            def _on_done() -> None:
-                for _bid in buffer_ids:
-                    pool.put_buffer(_bid)
-
-            return TransferStatus(uuid=uuid, sub_uuids=tuple(sub_uuids), on_done=_on_done)
+            return TransferStatus(uuid=uuid, sub_uuids=tuple(sub_uuids), on_done=lambda: None)
 
         # path B: direct from HBM
         try:
@@ -231,6 +273,7 @@ class JaxTransferKVSender(KVSender, StateHolder):
         self._transfer_id: str | None = None
         self._payload: dict[str, jax.Array] | None = None
         self._use_d2h_staging: bool | None = None
+        self._buffer_id: int | None = None
         self._status: TransferStatus | None = None
         self._state_lock = threading.Lock()
         self._ack_timer: object | None = None
@@ -253,13 +296,16 @@ class JaxTransferKVSender(KVSender, StateHolder):
             self._transfer_id = transfer_id or self._req_id
             self._transition_to(KVPoll.WAITING_FOR_INPUT)
 
-    def attach_payload(self, payload: dict[str, jax.Array], *, use_d2h_staging: bool) -> None:
+    def attach_payload(
+        self, payload: dict[str, jax.Array], *, use_d2h_staging: bool, buffer_id: int | None = None
+    ) -> None:
         if self._payload is not None:
             raise RuntimeError(f"sender {self._req_id!r} payload already attached")
         if not payload:
             raise ValueError(f"sender {self._req_id!r} payload must be non-empty")
         self._payload = payload
         self._use_d2h_staging = use_d2h_staging
+        self._buffer_id = buffer_id
 
     def send(self) -> None:
         if self._payload is None:
@@ -278,11 +324,18 @@ class JaxTransferKVSender(KVSender, StateHolder):
                     self.uuid,
                     self._payload,
                     use_d2h_staging=self._use_d2h_staging,
+                    buffer_id=self._buffer_id,
                 )
             except Exception:
                 self._mgr.zmq_notifier.unregister_callback(callback_uuid)
                 raise
             self._status = status
+            if self._use_d2h_staging:
+                # Staging copied the payload to host and registered the host
+                # arrays for pull, so drop our ref to free the device gather
+                # output's HBM now. Path B registers HBM arrays directly, so
+                # those must stay alive until the ack.
+                self._payload = None
             self._transition_to(KVPoll.TRANSFERRING)
             self._ack_timer = time_phase("ack", "prefill")
             self._ack_timer.__enter__()
@@ -481,6 +534,11 @@ class JaxTransferKVReceiver(KVReceiver, StateHolder):
         if not isinstance(p_metadata, PMetadata):
             raise TypeError(f"p_metadata must be PMetadata, got " f"{type(p_metadata).__name__}")
         self._metadata = p_metadata
+        # Do NOT pre-connect here: the link is a native handle and must be
+        # created and used on the same thread. ``_run_pull`` connects lazily
+        # on the pull worker so connect+pull share that thread; pre-connecting
+        # on the decode event-loop thread and pulling on the worker hangs the
+        # native transfer.
         self._transition_to(KVPoll.WAITING_FOR_INPUT)
 
     def poll(self) -> KVPoll:
@@ -501,37 +559,18 @@ class JaxTransferKVReceiver(KVReceiver, StateHolder):
                 self._pull_timer = time_phase("pull", "decode")
                 self._pull_timer.__enter__()
                 self._transfer_started_at = _time.monotonic()
-                try:
-                    results: dict[str, jax.Array] = {}
-                    for name, spec in self._metadata.specs.items():
-                        sub_uuid = f"{self._metadata.uuid}:{name}"
-                        results[name] = self._mgr.wrapper.pull(
-                            sub_uuid,
-                            spec,
-                            remote_addr=self._metadata.remote_addr,
-                        )
-                    self._results = results
-                except Exception:
-                    self._transition_to(KVPoll.FAILED)
-                    self._close_pull_timer()
-                    self._transfer_started_at = None
-                    self._mgr.record_terminal(
-                        self._req_id,
-                        role="decode",
-                        transfer_id=self._metadata.uuid,
-                        state=KVPoll.FAILED,
-                        reason="pull_init",
-                    )
-                    with suppress(Exception):
-                        PD_TRANSFER_FAILURES_TOTAL.labels(reason="pull_init", role="decode").inc()
-                    self._mgr._prune_receiver(self._req_id)
-                    return self.state
+            # Hand the blocking pull to the background worker. ``poll()`` stays
+            # non-blocking; a later poll drives ``is_ready()`` -> ack -> SUCCESS
+            # once the worker has stored the results.
+            self._mgr.enqueue_pull(self)
             return self.state
 
         if state == KVPoll.TRANSFERRING:
             if self._results is None:
                 return state
-            if not all(r.is_ready() for r in self._results.values()):
+            if not all(
+                leaf.is_ready() for r in self._results.values() for leaf in jax.tree.leaves(r)
+            ):
                 return state
             assert self._metadata is not None
             with self._state_lock:
@@ -570,6 +609,50 @@ class JaxTransferKVReceiver(KVReceiver, StateHolder):
                     return self.state
             self._mgr._prune_receiver(self._req_id)
         return self.state
+
+    def _run_pull(self) -> None:
+        """Run the pull on a background worker thread, off the decode
+        event-loop thread. Results are stored under ``_state_lock`` and only
+        if the receiver is still TRANSFERRING; a reaper ``fail()`` that
+        already moved the state to FAILED wins, and the late results are
+        dropped.
+        """
+
+        assert self._metadata is not None
+        try:
+            results: dict[str, jax.Array] = {}
+            for name, spec in self._metadata.specs.items():
+                sub_uuid = f"{self._metadata.uuid}:{name}"
+                results[name] = self._mgr.wrapper.pull(
+                    sub_uuid,
+                    spec,
+                    remote_addr=self._metadata.remote_addr,
+                )
+        except Exception:
+            with self._state_lock:
+                if self.state != KVPoll.TRANSFERRING:
+                    return
+                self._transition_to(KVPoll.FAILED)
+                self._close_pull_timer()
+                self._transfer_started_at = None
+                self._mgr.record_terminal(
+                    self._req_id,
+                    role="decode",
+                    transfer_id=self._metadata.uuid,
+                    state=KVPoll.FAILED,
+                    reason="pull_init",
+                )
+            with suppress(Exception):
+                PD_TRANSFER_FAILURES_TOTAL.labels(reason="pull_init", role="decode").inc()
+            self._mgr._prune_receiver(self._req_id)
+            return
+
+        with self._state_lock:
+            if self.state != KVPoll.TRANSFERRING:
+                # Reaper timed the transfer out while we were pulling; the
+                # terminal state wins and the results are discarded.
+                return
+            self._results = results
 
     def _close_pull_timer(self) -> None:
         timer = self._pull_timer

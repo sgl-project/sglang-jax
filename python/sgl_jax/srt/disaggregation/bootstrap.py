@@ -6,6 +6,7 @@ import logging
 import threading
 import time
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import asdict, dataclass, field
 
 import httpx
@@ -52,9 +53,79 @@ class PrefillInfo:
     jax_process_index: int = 0
     jax_process_count: int = 1
     protocol_version: int = PROTOCOL_VERSION
+    # KV layout. Decode must match these or the transferred KV would be
+    # silently misinterpreted. Defaults (0 / "") mean "not reported" so a
+    # peer predating these fields skips the check.
+    page_size: int = 0
+    kv_dtype: str = ""
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
+
+
+def _reject_if_below_protocol_floor(info: dict[str, object]) -> None:
+    """Raise ``RuntimeError`` if a prefill peer reports a protocol version
+    below ``MIN_COMPATIBLE_VERSION``. Shared by the per-request lookup and
+    the decode-side :class:`PrefillInfoCache` so both reject stale peers
+    identically."""
+
+    peer_version = int(info.get("protocol_version", 0))
+    if peer_version < MIN_COMPATIBLE_VERSION:
+        raise RuntimeError(
+            f"prefill peer {info.get('bootstrap_key')!r} reports "
+            f"protocol_version={peer_version} below "
+            f"MIN_COMPATIBLE_VERSION={MIN_COMPATIBLE_VERSION}; "
+            "rolling upgrade must finish before this peer can be "
+            "used"
+        )
+
+
+def resolve_kv_dtype_name(dtype: object) -> str:
+    """Canonical dtype name for KV-layout compatibility advertising.
+
+    Both peers must publish the dtype actually used by their initialized KV
+    pool — not the CLI literal (often ``"auto"``) — otherwise two peers with
+    different resolved dtypes but both configured ``auto`` would pass the
+    compatibility check, and an ``auto`` peer could reject a compatible one.
+    """
+
+    if dtype is None:
+        return ""
+    try:
+        import jax.numpy as jnp
+
+        return str(jnp.dtype(dtype).name)
+    except Exception:
+        return str(dtype)
+
+
+def check_prefill_compat(
+    info: dict[str, object],
+    *,
+    local_page_size: int,
+    local_kv_dtype: str,
+) -> None:
+    """Raise ``ValueError`` if the prefill peer's KV layout is incompatible.
+
+    Backward-compatible: a field is only checked when both sides report it
+    (peer value truthy and local value truthy), so older peers and
+    not-yet-initialized decoders never trigger a false rejection.
+    """
+
+    peer_page_size = int(info.get("page_size", 0) or 0)
+    if peer_page_size and local_page_size and peer_page_size != local_page_size:
+        raise ValueError(
+            f"prefill peer {info.get('bootstrap_key')!r} uses "
+            f"page_size={peer_page_size} but this decode uses "
+            f"page_size={local_page_size}; KV layout incompatible"
+        )
+    peer_kv_dtype = str(info.get("kv_dtype", "") or "")
+    if peer_kv_dtype and local_kv_dtype and peer_kv_dtype != local_kv_dtype:
+        raise ValueError(
+            f"prefill peer {info.get('bootstrap_key')!r} uses "
+            f"kv_dtype={peer_kv_dtype!r} but this decode uses "
+            f"kv_dtype={local_kv_dtype!r}; KV layout incompatible"
+        )
 
 
 class RegisterPrefillRequest(BaseModel):
@@ -68,6 +139,8 @@ class RegisterPrefillRequest(BaseModel):
     jax_process_index: int = 0
     jax_process_count: int = 1
     protocol_version: int = PROTOCOL_VERSION
+    page_size: int = 0
+    kv_dtype: str = ""
 
 
 class HeartbeatRequest(BaseModel):
@@ -214,6 +287,20 @@ def build_app(
             )
         return info.to_dict()
 
+    # Bootstrap runs as a standalone single process and does NOT inherit
+    # PROMETHEUS_MULTIPROC_DIR, so it exposes its own default-registry
+    # /metrics (single-process) carrying pd_bootstrap_registry_size.
+    with suppress(ImportError):
+        from fastapi.responses import Response
+        from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+
+        @app.get("/metrics")
+        def metrics() -> Response:
+            return Response(
+                content=generate_latest(),
+                media_type=CONTENT_TYPE_LATEST,
+            )
+
     return app, registry
 
 
@@ -326,6 +413,11 @@ class BootstrapClient:
         self._register_retries = register_retries
         self._register_retry_delay_s = register_retry_delay_s
         self._shared_secret = shared_secret
+        # Reuse one thread-safe ``httpx.Client`` (and its connection pool + SSL
+        # context) across calls; building a throwaway client per call rebuilds
+        # the SSL context every time, which under load blocked the decode event
+        # loop inside ``get_prefill_info``.
+        self._client = httpx.Client(timeout=timeout_s)
 
     @property
     def base_url(self) -> str:
@@ -337,7 +429,7 @@ class BootstrapClient:
         return bearer_header(self._shared_secret)
 
     def health(self) -> bool:
-        r = httpx.get(f"{self._base_url}/health", timeout=self._timeout_s)
+        r = self._client.get(f"{self._base_url}/health", timeout=self._timeout_s)
         return r.status_code == 200
 
     def register_prefill(
@@ -353,6 +445,8 @@ class BootstrapClient:
         jax_process_index: int = 0,
         jax_process_count: int = 1,
         protocol_version: int = PROTOCOL_VERSION,
+        page_size: int = 0,
+        kv_dtype: str = "",
     ) -> None:
         payload = {
             "bootstrap_key": bootstrap_key,
@@ -365,11 +459,13 @@ class BootstrapClient:
             "jax_process_index": jax_process_index,
             "jax_process_count": jax_process_count,
             "protocol_version": protocol_version,
+            "page_size": page_size,
+            "kv_dtype": kv_dtype,
         }
         last_err: Exception | None = None
         for attempt in range(self._register_retries):
             try:
-                r = httpx.post(
+                r = self._client.post(
                     f"{self._base_url}/register_prefill",
                     json=payload,
                     timeout=self._timeout_s,
@@ -395,7 +491,7 @@ class BootstrapClient:
         )
 
     def heartbeat(self, bootstrap_key: str) -> None:
-        r = httpx.post(
+        r = self._client.post(
             f"{self._base_url}/heartbeat",
             json={"bootstrap_key": bootstrap_key},
             timeout=self._timeout_s,
@@ -404,7 +500,7 @@ class BootstrapClient:
         r.raise_for_status()
 
     def unregister_prefill(self, bootstrap_key: str) -> None:
-        r = httpx.post(
+        r = self._client.post(
             f"{self._base_url}/unregister_prefill",
             json={"bootstrap_key": bootstrap_key},
             timeout=self._timeout_s,
@@ -413,7 +509,7 @@ class BootstrapClient:
         r.raise_for_status()
 
     def list_prefills(self) -> list[dict[str, object]]:
-        r = httpx.get(
+        r = self._client.get(
             f"{self._base_url}/list_prefills",
             timeout=self._timeout_s,
             headers=self._headers(),
@@ -422,7 +518,7 @@ class BootstrapClient:
         return r.json()["prefills"]
 
     def get_prefill_info(self, bootstrap_room: int) -> dict[str, object]:
-        r = httpx.get(
+        r = self._client.get(
             f"{self._base_url}/get_prefill_info",
             params={"bootstrap_room": bootstrap_room},
             timeout=self._timeout_s,
@@ -431,15 +527,93 @@ class BootstrapClient:
         r.raise_for_status()
         info = r.json()
         # Reject peers below the supported protocol floor.
-        peer_version = int(info.get("protocol_version", 0))
-        if peer_version < MIN_COMPATIBLE_VERSION:
-            raise RuntimeError(
-                f"prefill peer {info.get('bootstrap_key')!r} reports "
-                f"protocol_version={peer_version} below "
-                f"MIN_COMPATIBLE_VERSION={MIN_COMPATIBLE_VERSION}; "
-                "rolling upgrade must finish before this peer can be "
-                "used"
-            )
+        _reject_if_below_protocol_floor(info)
+        return info
+
+
+class PrefillInfoCache:
+    """Decode-side cache of the prefill registry.
+
+    Resolves per-room selection LOCALLY — mirroring the server's
+    ``_Registry.pick_for_room`` (``sorted(keys)[room % len]``) — so a warm
+    cache serves requests with zero network round-trips. The full registry is
+    refreshed via ``list_prefills`` at most once per ``refresh_interval_s`` to
+    evict dead/unregistered prefills. If the registry is empty the room returns
+    ``None`` so the caller defers and retries next tick (never abort).
+    """
+
+    def __init__(
+        self,
+        client: BootstrapClient,
+        *,
+        refresh_interval_s: float = 1.0,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._client = client
+        self._refresh_interval_s = refresh_interval_s
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._by_key: dict[str, dict[str, object]] = {}
+        self._sorted_keys: list[str] = []
+        # -inf so the very first lookup always refreshes regardless of clock.
+        self._last_refresh: float = float("-inf")
+        # Transient-failure bookkeeping (throttled logging).
+        self._refresh_failures = 0
+        self._last_fail_log: float = float("-inf")
+
+    def _refresh_locked(self) -> None:
+        prefills = self._client.list_prefills()
+        by_key = {str(p["bootstrap_key"]): p for p in prefills}
+        self._by_key = by_key
+        self._sorted_keys = sorted(by_key)
+        self._last_refresh = self._clock()
+
+    def _pick_locked(self, bootstrap_room: int) -> dict[str, object] | None:
+        if not self._sorted_keys:
+            return None
+        chosen = self._sorted_keys[bootstrap_room % len(self._sorted_keys)]
+        return self._by_key[chosen]
+
+    def pick_for_room(self, bootstrap_room: int) -> dict[str, object] | None:
+        """Return prefill info for ``bootstrap_room``, or ``None`` if no
+        prefill is registered yet (caller should defer + retry).
+
+        Refreshes the warm cache whenever ``refresh_interval_s`` has elapsed
+        (rate-limited), regardless of hit/miss, so a prefill that has died or
+        unregistered is evicted instead of being served from a stale entry.
+        Within the interval, a hit returns from cache with zero network I/O.
+        Raises ``RuntimeError`` if the chosen peer is below the protocol floor.
+        """
+
+        with self._lock:
+            now = self._clock()
+            if now - self._last_refresh >= self._refresh_interval_s:
+                try:
+                    self._refresh_locked()
+                except Exception as exc:  # noqa: BLE001
+                    # A transient bootstrap-server failure (timeout / 5xx /
+                    # connection reset) must NOT propagate: the decode intake
+                    # catches any exception here as an abort, which would
+                    # violate the never-abort contract over a momentary blip.
+                    # Back off for the interval (so we neither hammer a down
+                    # server nor re-block the event loop every tick) and serve
+                    # from the existing — possibly stale — cache. An empty
+                    # cache returns None below, so the caller defers + retries.
+                    self._last_refresh = now
+                    self._refresh_failures += 1
+                    if now - self._last_fail_log >= 5.0:
+                        self._last_fail_log = now
+                        logger.warning(
+                            "PrefillInfoCache refresh failed (%d total); serving "
+                            "%d cached prefill(s): %s",
+                            self._refresh_failures,
+                            len(self._sorted_keys),
+                            exc,
+                        )
+            info = self._pick_locked(bootstrap_room)
+        if info is None:
+            return None
+        _reject_if_below_protocol_floor(info)
         return info
 
 

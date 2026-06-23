@@ -222,6 +222,7 @@ class Req:
         self.bootstrap_port: int | None = None
         self.bootstrap_room: int | None = None
         self.disagg_transfer_id: str | None = None
+        self.disagg_host_buffer_id: int | None = None
 
         # Memory pool info
         self.req_pool_idx: int | None = None
@@ -362,6 +363,9 @@ class Req:
         self.has_log_time_stats: bool = False
         self.queue_time_start = None
         self.queue_time_end = None
+        # PD disaggregation per-request phase timing (None unless
+        # --enable-request-time-stats-logging and PD mode).
+        self.pd_time_stats = None
 
         # the start index of the sent kv cache
         # We want to send it chunk by chunk for chunked prefill.
@@ -423,11 +427,20 @@ class Req:
             self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
             return
         # PD req with empty output_ids: skip match_prefix to avoid
-        # stale radix cache hits.
+        # stale radix cache hits, but preserve prefix_indices set by
+        # cache_unfinished_req for chunked-prefill continuation rounds
+        # (otherwise extend_input_len never shrinks and a req longer than
+        # chunked-prefill-size loops forever, and a budget-chunked short
+        # req leaks its first round's pages).
+        # TODO(pd-radix): PD chunked-prefill is currently validated with
+        # ChunkCache (--disable-radix-cache). If RadixCache support is added,
+        # continuation rounds must also preserve/update last_node and radix
+        # lock state, not just prefix_indices.
         if getattr(self, "bootstrap_room", None) is not None and not self.output_ids:
-            self.prefix_indices = []
-            self.last_matched_prefix_len = 0
-            self.extend_input_len = len(self.fill_ids)
+            if getattr(self, "is_chunked", 0) == 0:
+                self.prefix_indices = []
+                self.last_matched_prefix_len = 0
+            self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
             root = getattr(tree_cache, "root_node", None) if tree_cache is not None else None
             self.last_node = root
             self.last_host_node = root
@@ -473,17 +486,18 @@ class Req:
         return self.fill_ids[:max_prefix_len]
 
     def pop_committed_kv_cache(self) -> int:
-        assert (
-            not self.kv_committed_freed
-        ), f"Committed KV cache already freed ({self.kv_committed_len=})"
+        # Idempotent: the PD prefill abort path can run release a second time
+        # (cache_finished_req) after a handoff failure already freed the KV.
+        # Return 0 on repeat so the caller frees an empty slice instead of
+        # crashing the scheduler on a double-free assertion.
+        if self.kv_committed_freed:
+            return 0
         self.kv_committed_freed = True
         return self.kv_committed_len
 
     def pop_overallocated_kv_cache(self) -> tuple[int, int]:
-        assert not self.kv_overallocated_freed, (
-            "Overallocated KV cache already freed, "
-            f"{self.kv_committed_len=}, {self.kv_allocated_len=}"
-        )
+        if self.kv_overallocated_freed:
+            return 0, 0
         self.kv_overallocated_freed = True
         return self.kv_committed_len, self.kv_allocated_len
 

@@ -190,6 +190,11 @@ class Scheduler(
         self.disagg_prefill_queue = None
         self.disagg_prealloc_queue = None
         self.disagg_transfer_queue = None
+        self.disagg_decode_watchdog = None
+        # Decode-side cache of prefill registry (sglang-style local per-room
+        # resolution) + reqs deferred because no prefill was registered yet.
+        self.disagg_prefill_info_cache = None
+        self._pd_pending_bootstrap = []
 
         # LoRA configurations
         self.lora_paths = server_args.lora_paths
@@ -1066,7 +1071,6 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
-        # Copy more attributes
         if recv_req.logprob_start_len == -1 or not recv_req.return_logprob:
             # By default, only return the logprobs for output tokens
             req.logprob_start_len = len(req.origin_input_ids) - 1
@@ -1403,6 +1407,10 @@ class Scheduler(
     def _add_request_to_queue(self, req: Req):
         req.queue_time_start = time.perf_counter()
         self.waiting_queue.append(req)
+        if req.bootstrap_room is not None:
+            mark = getattr(self, "_pd_mark_time", None)
+            if mark is not None:
+                mark(req, "queue_entry")
 
     def _extend_requests_to_queue(self, reqs: list[Req], is_retracted: bool = False):
         self.waiting_queue.extend(reqs)
@@ -1660,10 +1668,20 @@ class Scheduler(
             ):
                 break
 
+            mgr = getattr(self, "disagg_kv_manager", None)
+            _host_pool = mgr.host_pool if mgr is not None else None
+            _admit_ok, _reserved_bid = _reserve_host_slot_for_pd(
+                _host_pool, getattr(self, "disagg_use_d2h_staging", False), req
+            )
+            if not _admit_ok:
+                continue  # host pool full: leave req in waiting_queue, retry next round
+
             req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(req)
 
             if res != AddReqResult.CONTINUE:
+                if _reserved_bid is not None and _host_pool is not None:
+                    _host_pool.release(_reserved_bid)
                 if res == AddReqResult.NO_TOKEN:
                     # Mark this specific DP rank as exhausted
                     self.running_batch.reqs_info[dp_rank].batch_is_full = True
@@ -1677,6 +1695,8 @@ class Scheduler(
                 else:
                     # OTHER: Global budget exhausted, stop entirely
                     break
+            if _reserved_bid is not None:
+                req.disagg_host_buffer_id = _reserved_bid
 
         # Update waiting queue
         # Flatten can_run_list for operations that need all requests
@@ -2134,6 +2154,20 @@ class Scheduler(
                     self._release_decode_kv_indices(entry.kv_indices)
                 self._abort_decode_request(entry.req, "abort_request")
 
+        # Decode reqs deferred because no prefill was registered yet hold no KV
+        # or receiver, but abort_request must still drop them so a cancelled
+        # request is not re-admitted on the next decode tick.
+        pending_bootstrap = getattr(self, "_pd_pending_bootstrap", None)
+        if pending_bootstrap:
+            survivors = []
+            for req in pending_bootstrap:
+                if recv_req.abort_all or req.rid.startswith(recv_req.rid):
+                    logger.debug("Abort pending-bootstrap request. rid=%s", req.rid)
+                    self._abort_decode_request(req, "abort_request")
+                else:
+                    survivors.append(req)
+            self._pd_pending_bootstrap = survivors
+
     def pause_generation(self, recv_req: PauseGenerationReqInput):
         self._engine_paused = True
 
@@ -2163,6 +2197,27 @@ class Scheduler(
     def continue_generation(self, recv_req: ContinueGenerationReqInput):
         self._engine_paused = False
         logger.info("Generation continued")
+
+
+def _reserve_host_slot_for_pd(host_pool, use_d2h_staging, req):
+    """D1 admission. Returns (admit_ok, reserved_buffer_id).
+
+    For a D2H-staged PD req, reserve a host-pool slot. If the pool is
+    full, (False, None) tells the caller to skip the req this round so it
+    stays in the waiting queue (backpressure). Non-PD / non-staged reqs
+    are always admitted with no reservation.
+    """
+    if (
+        host_pool is None
+        or not use_d2h_staging
+        or getattr(req, "bootstrap_room", None) is None
+        or getattr(req, "disagg_host_buffer_id", None) is not None
+    ):
+        return True, None
+    buffer_id = host_pool.reserve()
+    if buffer_id is None:
+        return False, None
+    return True, buffer_id
 
 
 def dispatch_scheduler_event_loop(scheduler: Scheduler, server_args: ServerArgs) -> None:
