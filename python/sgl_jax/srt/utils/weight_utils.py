@@ -1884,20 +1884,15 @@ class WeightLoader:
         target_sharding: jax.sharding.NamedSharding | None = None,
         physical_to_logical_map: np.ndarray | None = None,
     ) -> jax.Array:
-        """Load a checkpoint that already stores experts STACKED as one
-        [E, out, in] tensor (Step 3.5 moe.{gate,up,down}_proj.weight). Reuses the
-        same transpose(0,2,1) -> [E, in, out] convention as the per-expert stacked
-        loader. physical_to_logical_map reorders the expert (axis-0) dim for EPLB."""
+        """Load experts pre-stacked as one [E, out, in] tensor (Step 3.5), reusing the
+        transpose(0,2,1) -> [E, in, out] + EPLB reorder convention of the per-expert loader."""
         info = weight_info[hf_key][0]
         st_dtype = info["dtype"]
         target_dtype = _SAFETENSORS_DTYPE_TO_JAX.get(st_dtype, jnp.float32)
         sharding = target_sharding or jax.sharding.NamedSharding(self.mesh, P())
         full_shape = tuple(info["shape"])  # [E, out, in]
-        # Assumption: every EPMoE stacked spec shards axis 0 ("expert") and
-        # leaves weight dims (axes 1+) unsharded (None).  The array is built
-        # at full_shape (pre-transpose) and transposed afterwards; this is only
-        # correct when weight dims are unsharded — each shard holds the full
-        # weight tile so the post-transpose view is contiguous and complete.
+        # Built at full_shape then transposed; correct only because EPMoE stacked
+        # specs shard axis 0 ("expert") and leave weight dims unsharded.
 
         if physical_to_logical_map is None:
 
