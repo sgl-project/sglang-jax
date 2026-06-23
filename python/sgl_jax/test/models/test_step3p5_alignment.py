@@ -553,5 +553,96 @@ class TestStep3p5Alignment(unittest.TestCase):
         self.assertEqual(missing, [], f"Stages not captured: {missing}. See table above.")
 
 
+@unittest.skipUnless(_HF_AVAILABLE, "HF step3p5 source files not found (set STEP35_HF_SRC)")
+class TestStep3p5DecisionAgreement(unittest.TestCase):
+    """E2: final-logits argmax + top-k overlap agree between HF and JAX per token.
+
+    Complements numeric alignment (TestStep3p5Alignment) with a decision-layer check:
+    greedy argmax and top-5 overlap must agree for all token positions.
+    """
+
+    NUM_TOKENS = 12
+    TOP_K = 5
+
+    def test_argmax_and_topk_agreement(self) -> None:
+        from sgl_jax.srt.models.step3p5 import Step3p5ForCausalLM
+
+        # 1. Build shared fp32 weights (same seed → bit-identical for HF and JAX).
+        weights_np = _build_checkpoint_np()
+
+        # 2. Load HF model and get all-token logits [T, vocab].
+        tmpdir = _make_hf_tmpdir(weights_np)
+        try:
+            hf_model = _load_hf_model(tmpdir, weights_np)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+        input_ids_np = np.arange(self.NUM_TOKENS, dtype=np.int32)
+        input_ids_torch = torch.from_numpy(input_ids_np).unsqueeze(0)  # [1, T]
+        with torch.no_grad():
+            hf_out = hf_model(input_ids=input_ids_torch)
+        hf_logits = hf_out.logits[0].float().numpy()  # [T, vocab]
+
+        # 3. Build JAX fp32 model, load weights, capture final_norm hidden states.
+        jax_cfg = _make_jax_config()
+        with jax.set_mesh(_mesh):
+            jax_model = Step3p5ForCausalLM(
+                jax_cfg, mesh=_mesh, dtype=jnp.float32, attn_impl="naive"
+            )
+        _load_jax_weights(jax_model, weights_np, jax_cfg)
+
+        fb = _make_forward_batch(input_ids_np)
+        jax_caps: dict = {}
+        with jax.set_mesh(_mesh):
+            _jax_instrumented_forward(jax_model, fb, jax_caps)
+
+        # 4. Compute JAX all-token logits from final_norm hidden states.
+        final_norm_np = jax_caps[("final_norm", None)]  # [T, hidden]
+        lm_emb = np.asarray(jax_model.lm_head.embedding.value).astype(np.float32)  # [vocab, H]
+        jax_logits = final_norm_np.astype(np.float32) @ lm_emb.T  # [T, vocab]
+
+        T, vocab = hf_logits.shape
+        assert jax_logits.shape == (
+            T,
+            vocab,
+        ), f"Shape mismatch: {jax_logits.shape} vs {hf_logits.shape}"
+
+        # 5. Per-token argmax agreement.
+        hf_argmax = np.argmax(hf_logits, axis=-1)  # [T]
+        jax_argmax = np.argmax(jax_logits, axis=-1)  # [T]
+        argmax_matches = int(np.sum(hf_argmax == jax_argmax))
+
+        mismatches = []
+        for t in range(T):
+            if hf_argmax[t] != jax_argmax[t]:
+                gap = float(abs(hf_logits[t, hf_argmax[t]] - hf_logits[t, jax_argmax[t]]))
+                mismatches.append((t, int(hf_argmax[t]), int(jax_argmax[t]), gap))
+
+        # 6. Per-token top-K overlap.
+        hf_topk = np.argsort(hf_logits, axis=-1)[:, -self.TOP_K :]
+        jax_topk = np.argsort(jax_logits, axis=-1)[:, -self.TOP_K :]
+        min_overlap = min(
+            len(set(hf_topk[t].tolist()) & set(jax_topk[t].tolist())) for t in range(T)
+        )
+
+        print(
+            f"\nE2 decision agreement: argmax {argmax_matches}/{T} tokens match, "
+            f"min top-{self.TOP_K} overlap={min_overlap}/{self.TOP_K}"
+        )
+        if mismatches:
+            print(f"  Argmax mismatches (token, hf_id, jax_id, logit_gap): {mismatches}")
+
+        self.assertEqual(
+            argmax_matches,
+            T,
+            f"Argmax mismatch at {len(mismatches)} token(s): {mismatches}",
+        )
+        self.assertGreaterEqual(
+            min_overlap,
+            self.TOP_K - 1,
+            f"Top-{self.TOP_K} overlap dropped to {min_overlap} — decision divergence detected",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
