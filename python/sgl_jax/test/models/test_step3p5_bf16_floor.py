@@ -310,7 +310,7 @@ class TestBf16Floor(unittest.TestCase):
         print(
             "  NOTE: real-model tolerance ≈ floor × sqrt(real_layers / test_layers) + e2e backstop"
         )
-        print(f"  Scaling factor for 40-layer model: ~{(40 / _NUM_LAYERS) ** 0.5:.1f}×")
+        print(f"  Scaling factor for 45-layer model: ~{(45 / _NUM_LAYERS) ** 0.5:.1f}×")
         print(sep)
 
         # Assert all stages are within sane band (propagation, not explosion).
