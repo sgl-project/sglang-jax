@@ -647,6 +647,10 @@ class EPMoE(nnx.Module):
             layer_act = jax.nn.gelu(layer_w0)
         else:
             raise ValueError(f"Unsupported activation function {self.activation}")
+        # Optional SwiGLU clamp (used by Step 3.5 Flash routed experts on layers
+        # 43/44). Asymmetry is intentional: gate (post-silu) is upper-only; up
+        # branch is double-sided. None = disabled, preserving prior behavior
+        # bit-for-bit. Mirrors FusedEPMoEV2 kernel logic.
         if self.swiglu_limit is not None:
             layer_act = jnp.clip(layer_act, max=self.swiglu_limit)
             layer_w1 = jnp.clip(layer_w1, -self.swiglu_limit, self.swiglu_limit)

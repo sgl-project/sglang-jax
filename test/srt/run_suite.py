@@ -273,6 +273,7 @@ suites = {
         TestFile("python/sgl_jax/test/multimodal/test_vae_scheduler.py", 0.2),
         TestFile("python/sgl_jax/test/multimodal/test_flash_attention_kernel.py", 0.1),
         TestFile("python/sgl_jax/test/layers/test_group_rmsnorm.py", 0.1, runner="pytest"),
+        TestFile("python/sgl_jax/test/layers/test_epmoe_swiglu_limit.py", 0.1, runner="pytest"),
         TestFile("test/srt/lora/test_bgmv_backend.py", 7),
         TestFile("test/srt/lora/test_align_lora_accuracy.py", 5.5),
         TestFile("python/sgl_jax/test/kernels/simple_gla_fused_test.py", 1, runner="pytest"),
