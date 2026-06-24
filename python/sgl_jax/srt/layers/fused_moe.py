@@ -684,33 +684,6 @@ class FusedEPMoEV2(FusedEPMoE):
             )
         return output
 
-    def reshape_weights_for_tp(self):
-        """EP→TP weight reshard for FusedTPMoEV4.
-
-        Gathers each expert weight from EP→replicated→TP, then deletes the
-        original EP reference + the replicated intermediate to avoid HBM peak
-        doubling (~6 GiB/weight on 512-expert 768×2560 config).
-        """
-        import jax
-
-        full_w1 = jax.device_put(self.w1.value, jax.sharding.NamedSharding(self.mesh, P()))
-        full_w1.block_until_ready()
-        self.w1_tp = nnx.Param(jax.device_put(full_w1, jax.sharding.NamedSharding(self.mesh, P(None, None, "tensor"))))
-        full_w1.delete()
-        delattr(self, "w1")
-
-        full_w3 = jax.device_put(self.w3.value, jax.sharding.NamedSharding(self.mesh, P()))
-        full_w3.block_until_ready()
-        self.w3_tp = nnx.Param(jax.device_put(full_w3, jax.sharding.NamedSharding(self.mesh, P(None, None, "tensor"))))
-        full_w3.delete()
-        delattr(self, "w3")
-
-        full_w2 = jax.device_put(self.w2.value, jax.sharding.NamedSharding(self.mesh, P()))
-        full_w2.block_until_ready()
-        self.w2_tp = nnx.Param(jax.device_put(full_w2, jax.sharding.NamedSharding(self.mesh, P(None, "tensor", None))))
-        full_w2.delete()
-        delattr(self, "w2")
-
 
 class FusedTPMoEV4(FusedEPMoE):
     """Tensor-Parallel MoE layer (v4 kernel, ported from AInfer).
@@ -741,6 +714,28 @@ class FusedTPMoEV4(FusedEPMoE):
         ):
             raise NotImplementedError("FUSED_V4 is bf16-only; quantization unsupported.")
         logger.info("FusedTPMoEV4 layer %d: initialized (bf16 TP-MoE)", self.layer_id)
+
+    def reshape_weights_for_tp(self):
+        """EP→TP weight reshard for FusedTPMoEV4."""
+        import jax
+
+        full_w1 = jax.device_put(self.w1.value, jax.sharding.NamedSharding(self.mesh, P()))
+        full_w1.block_until_ready()
+        self.w1_tp = nnx.Param(jax.device_put(full_w1, jax.sharding.NamedSharding(self.mesh, P(None, None, "tensor"))))
+        full_w1.delete()
+        delattr(self, "w1")
+
+        full_w3 = jax.device_put(self.w3.value, jax.sharding.NamedSharding(self.mesh, P()))
+        full_w3.block_until_ready()
+        self.w3_tp = nnx.Param(jax.device_put(full_w3, jax.sharding.NamedSharding(self.mesh, P(None, None, "tensor"))))
+        full_w3.delete()
+        delattr(self, "w3")
+
+        full_w2 = jax.device_put(self.w2.value, jax.sharding.NamedSharding(self.mesh, P()))
+        full_w2.block_until_ready()
+        self.w2_tp = nnx.Param(jax.device_put(full_w2, jax.sharding.NamedSharding(self.mesh, P(None, "tensor", None))))
+        full_w2.delete()
+        delattr(self, "w2")
 
     def __call__(
         self,
