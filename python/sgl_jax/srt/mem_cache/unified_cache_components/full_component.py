@@ -35,8 +35,17 @@ class FullComponent(TreeComponent):
     def create_match_validator(
         self, match_device_only: bool = False
     ) -> Callable[[UnifiedTreeNode], bool]:
-        # Stage 1 has no host tier, so device-only and default matching coincide.
-        return lambda node: node.component_data[self.component_type].value is not None
+        # HiCache: the default (host-aware) validator also accepts a node whose
+        # FULL KV lives only on host (value is None, host_value set), so the
+        # match can walk into the L2 tier. ``match_device_only`` keeps the strict
+        # device check for callers that need a device-resident boundary.
+        ct = self.component_type
+        if self.cache.hicache_enabled and not match_device_only:
+            return lambda node: (
+                node.component_data[ct].value is not None
+                or node.component_data[ct].host_value is not None
+            )
+        return lambda node: node.component_data[ct].value is not None
 
     def redistribute_on_node_split(self, new_parent: UnifiedTreeNode, child: UnifiedTreeNode):
         ct = self.component_type
@@ -46,6 +55,20 @@ class FullComponent(TreeComponent):
         if child_cd.value is not None:
             new_parent.component_data[ct].value = child_cd.value[:split_len].copy()
             child_cd.value = child_cd.value[split_len:].copy()
+        # HiCache: a backed-up node carries one host buffer_id per PAGE, so the
+        # host_value array splits at the PAGE boundary -- not at split_len, which
+        # is a TOKEN count. split_len is page-aligned (radix invariant), so
+        # split_pages = split_len // page_size folds it to the page unit. Using
+        # the token split_len here would slice past the (much shorter) page array
+        # and hand the whole host buffer to one side (the partial-match split bug).
+        if child_cd.host_value is not None:
+            PS = self.cache.page_size
+            assert split_len % PS == 0, (
+                f"node split at non-page-aligned len {split_len} (page_size={PS})"
+            )
+            split_pages = split_len // PS
+            new_parent.component_data[ct].host_value = child_cd.host_value[:split_pages].copy()
+            child_cd.host_value = child_cd.host_value[split_pages:].copy()
 
     def evict_component(
         self,
@@ -100,24 +123,29 @@ class FullComponent(TreeComponent):
         root = self.cache.root_node
         cur = node
 
-        # Stage 1 has no tombstones (device eviction deletes leaves), so a
-        # live node's FULL value is never None on a lock path.
+        # A lock path may cross tombstones (evicted-but-backuped nodes): with
+        # HiCache, partial load_back / re-insert can leave a live node below a
+        # still-demoted ancestor, and write_backup locks node->root through it.
+        # That mirrors sglang (inc_lock_ref tolerates evicted nodes on the path).
+        # Device-token accounting only applies to LIVE nodes: a tombstone was
+        # already removed from component_evictable_size_ at eviction and holds no
+        # device slots, so we just bump its lock_ref to protect it (eviction
+        # skips locked nodes, so a node's live/tombstone state cannot flip while
+        # locked -- acquire and release stay symmetric).
         delta = 0
         while cur is not root:
             cd = cur.component_data[ct]
-            assert (
-                cd.value is not None
-            ), f"FULL invariant broken: evicted node {cur.id} on lock path"
-            if cd.lock_ref == 0:
-                key_len = len(cd.value)
-                cur_dp_rank = cur.key.dp_rank if cur.key and cur.key.dp_rank is not None else 0
-                self.cache.component_evictable_size_[ct][cur_dp_rank] -= key_len
-                self.cache.component_protected_size_[ct][cur_dp_rank] += key_len
-                # This repo's convention (RadixCache.inc_lock_ref): delta is the
-                # evictable-size change, negative on acquire.
-                delta -= key_len
+            if cd.value is not None:
+                if cd.lock_ref == 0:
+                    key_len = len(cd.value)
+                    cur_dp_rank = cur.key.dp_rank if cur.key and cur.key.dp_rank is not None else 0
+                    self.cache.component_evictable_size_[ct][cur_dp_rank] -= key_len
+                    self.cache.component_protected_size_[ct][cur_dp_rank] += key_len
+                    # This repo's convention (RadixCache.inc_lock_ref): delta is the
+                    # evictable-size change, negative on acquire.
+                    delta -= key_len
+                self.cache.evictable_device_leaves.discard(cur)
             cd.lock_ref += 1
-            self.cache.evictable_device_leaves.discard(cur)
             cur = cur.parent
         result.delta = delta
         return result
@@ -137,14 +165,17 @@ class FullComponent(TreeComponent):
         cur = node
         while cur is not root:
             cd = cur.component_data[ct]
-            assert cd.value is not None
             assert cd.lock_ref > 0
 
-            if cd.lock_ref == 1:
-                key_len = len(cd.value)
-                cur_dp_rank = cur.key.dp_rank if cur.key and cur.key.dp_rank is not None else 0
-                self.cache.component_evictable_size_[ct][cur_dp_rank] += key_len
-                self.cache.component_protected_size_[ct][cur_dp_rank] -= key_len
+            # Mirror acquire: device-token accounting only for live nodes; a
+            # tombstone on the path just gets its lock_ref decremented. State
+            # cannot have flipped while locked, so this stays symmetric.
+            if cd.value is not None:
+                if cd.lock_ref == 1:
+                    key_len = len(cd.value)
+                    cur_dp_rank = cur.key.dp_rank if cur.key and cur.key.dp_rank is not None else 0
+                    self.cache.component_evictable_size_[ct][cur_dp_rank] += key_len
+                    self.cache.component_protected_size_[ct][cur_dp_rank] -= key_len
             cd.lock_ref -= 1
             if cd.lock_ref == 0:
                 self.cache._update_evictable_leaf_sets(cur)
