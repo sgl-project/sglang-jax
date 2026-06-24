@@ -1,27 +1,27 @@
-"""Standalone A/B serving benchmark for HiCache Stage 1 (S1c).
+"""Standalone A/B serving benchmark for the unified radix cache.
 
 Compares cache configurations on a single TPU pod:
   - ``no-cache``  (``--disable-radix-cache``): no prefix reuse, the floor.
   - ``radix``     (default RadixCache): the current production baseline.
-  - ``unified``   (``--enable-unified-radix-tree``): the S1c UnifiedRadixCache.
+  - ``unified``   (``--enable-unified-radix-tree``): the UnifiedRadixCache.
   - ``unified-recurrent`` (``--enable-unified-radix-tree
-    --enable-recurrent-extra-buffer``): the S5a hybrid-recurrent cache.
+    --enable-recurrent-extra-buffer``): the hybrid-recurrent cache.
 
 For each (config x workload) it launches one server, runs ``bench_serving``
 ``--repeats`` times (cold each rep via ``/flush_cache``), drops the first
 ``--drop-first`` warmup reps, then reports pooled TTFT percentiles, mean+/-std
 throughput, and mean cache-hit-rate, plus a few soft acceptance checks.
 
-This is M1 throughput/TTFT evidence for S1c. It is run MANUALLY on a v6e-4
-host (e.g. sky-yh-v6e4); it is NOT registered in CI. Servers are launched
-sequentially -- one TPU pod, never two servers at once.
+This is throughput/TTFT evidence for the unified radix cache. It is run
+MANUALLY on a v6e-4 host (e.g. sky-yh-v6e4); it is NOT registered in CI.
+Servers are launched sequentially -- one TPU pod, never two servers at once.
 
 Usage (on the TPU host, from the repo root)::
 
     python benchmark/hicache/bench_unified_radix_ab.py \
         --model Qwen/Qwen3-8B --tp-size 4 --page-size 128 --port 20000 \
         --configs no-cache radix unified --workloads random gsp \
-        --output-json /tmp/s1c_ab.json
+        --output-json /tmp/radix_ab.json
 
 MoE usage (Qwen3-MoE under tp/ep/dp)::
 
@@ -73,7 +73,7 @@ CONFIG_ARGS = {
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="A/B serving benchmark: no-cache / RadixCache / UnifiedRadixCache (S1c).",
+        description="A/B serving benchmark: no-cache / RadixCache / UnifiedRadixCache.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--model", default="Qwen/Qwen3-8B")
@@ -97,7 +97,14 @@ def parse_args():
         choices=["random", "gsp"],
         default=["random", "gsp"],
     )
-    p.add_argument("--max-concurrency", type=int, default=64)
+    p.add_argument(
+        "--max-concurrency",
+        type=int,
+        default=64,
+        help="Client-side in-flight request load (NOT a server capacity knob; the "
+        "server cap is --max-running-requests). With cache_aware DP routing, keep "
+        ">= dp_size so all ranks receive load.",
+    )
     p.add_argument("--num-prompts", type=int, default=256)
     p.add_argument("--random-input-len", type=int, default=1024)
     p.add_argument("--random-output-len", type=int, default=128)
@@ -170,7 +177,24 @@ def parse_args():
             "ids) when the host has no ShareGPT access."
         ),
     )
+    p.add_argument(
+        "--compare",
+        nargs="+",
+        default=None,
+        metavar="RESULT_JSON",
+        help=(
+            "Offline A/B gate: merge the 'aggregates' from two or more "
+            "--output-json files (each a single-config --server-url run) and run "
+            "the soft-target gate across them, no serving. This lets multi-host / "
+            "nightly external-server runs (which run one config at a time) form an "
+            "A/B gate. Combine with --strict to fail on a missed target."
+        ),
+    )
     args = p.parse_args()
+    if args.compare:
+        # Offline merge of prior results: no server is launched, so the
+        # server-shape validations below do not apply.
+        return args
     assert args.page_size >= 128, f"--page-size must be >= 128, got {args.page_size}"
     if args.tp_size > 1:
         bad = [b for b in args.precompile_bs_paddings if b % args.tp_size != 0]
@@ -446,9 +470,16 @@ def check_sweep_complete(args, raw):
 
 
 def soft_targets(args, agg):
-    """Print PASS/WARN per check. Returns True if all checks passed."""
+    """Print PASS/WARN per check. Returns ``(all_pass, n_gates_fired)``.
+
+    ``n_gates_fired`` counts the A/B comparison checks that actually ran (both
+    sides present). A run where no gate fired (e.g. only one config supplied)
+    must not be mistaken for a pass; callers using ``--strict`` should fail when
+    it is zero.
+    """
     print("\n--- soft-target report ---")
     all_pass = True
+    fired = 0
 
     def have(config, workload):
         return agg.get(config, {}).get(workload) is not None
@@ -459,6 +490,7 @@ def soft_targets(args, agg):
         r = agg["radix"]["random"]["total_tok_s_mean"]
         ok = u >= 0.95 * r
         all_pass = all_pass and ok
+        fired += 1
         print(
             f"[{'PASS' if ok else 'WARN'}] random: unified.total_tok/s ({u:.1f}) "
             f">= 0.95 * radix.total_tok/s ({0.95 * r:.1f})"
@@ -470,6 +502,7 @@ def soft_targets(args, agg):
         r = agg["radix"]["gsp"]["hit_rate_mean"]
         ok = u >= r
         all_pass = all_pass and ok
+        fired += 1
         print(
             f"[{'PASS' if ok else 'WARN'}] gsp: unified.hit_rate ({u:.4f}) "
             f">= radix.hit_rate ({r:.4f})"
@@ -482,6 +515,7 @@ def soft_targets(args, agg):
         ratio = u / nc if nc else float("nan")
         ok = ratio < 0.9
         all_pass = all_pass and ok
+        fired += 1
         print(
             f"[{'PASS' if ok else 'WARN'}] gsp: unified.p50_ttft ({u:.2f}) "
             f"vs no-cache.p50_ttft ({nc:.2f}), ratio={ratio:.3f} (want < 0.9)"
@@ -500,6 +534,7 @@ def soft_targets(args, agg):
             ratio = u / nc if nc else float("nan")
             ok = ratio < 0.9
             all_pass = all_pass and ok
+            fired += 1
             print(
                 f"[{'PASS' if ok else 'WARN'}] gsp: {rc}.p50_ttft ({u:.2f}) "
                 f"vs no-cache.p50_ttft ({nc:.2f}), ratio={ratio:.3f} (want < 0.9)"
@@ -512,16 +547,61 @@ def soft_targets(args, agg):
         nc = agg["no-cache"]["random"]["total_tok_s_mean"]
         ok = u >= 0.95 * nc
         all_pass = all_pass and ok
+        fired += 1
         print(
             f"[{'PASS' if ok else 'WARN'}] random: {rc}.total_tok/s ({u:.1f}) "
             f">= 0.95 * no-cache.total_tok/s ({0.95 * nc:.1f})"
         )
 
-    return all_pass
+    return all_pass, fired
+
+
+def compare_mode(args) -> tuple[bool, int]:
+    """Merge the aggregates from multiple result JSONs and run the A/B gate.
+
+    Each input is one single-config ``--server-url`` run; together they form the
+    A/B that a single external-server run cannot (one server serves one config).
+    Reuses ``print_table`` / ``soft_targets`` on the union of configs+workloads.
+    Returns ``(all_pass, n_gates_fired)``; a single-file compare fires no gate.
+    """
+    merged: dict = {}
+    workloads: list[str] = []
+    for path in args.compare:
+        with open(path) as f:
+            payload = json.load(f)
+        for config, by_workload in (payload.get("aggregates") or {}).items():
+            dst = merged.setdefault(config, {})
+            for workload, cell in by_workload.items():
+                dst[workload] = cell
+                if workload not in workloads:
+                    workloads.append(workload)
+    if not merged:
+        raise SystemExit(f"--compare: no 'aggregates' found in {args.compare}")
+    # print_table / soft_targets iterate these; drive them off the merged keys.
+    args.configs = list(merged.keys())
+    args.workloads = workloads
+    print(
+        f"compare: merged {len(args.compare)} file(s) -> "
+        f"configs={args.configs} workloads={workloads}\n"
+    )
+    print_table(args, merged)
+    return soft_targets(args, merged)
 
 
 def main():
     args = parse_args()
+    if args.compare:
+        ok, fired = compare_mode(args)
+        if fired == 0:
+            print(
+                "\nNOTE: no A/B gate fired — compare needs both sides of a pair "
+                "for the same workload (e.g. no-cache/gsp + unified-recurrent/gsp, "
+                "or radix/* + unified/*). Supply both result JSONs."
+            )
+        if args.strict and (not ok or fired == 0):
+            raise SystemExit(1)
+        return
+
     print(f"args={args}\n", flush=True)
 
     raw = {}
@@ -531,8 +611,17 @@ def main():
     agg = aggregate(args, raw)
     print_table(args, agg)
     complete = check_sweep_complete(args, raw)
-    targets_pass = soft_targets(args, agg)
+    targets_pass, _fired = soft_targets(args, agg)
     all_pass = complete and targets_pass
+
+    if args.server_url is not None and args.strict:
+        # Single-config external run: the A/B targets compare two configs, so none
+        # of them fire here. Say so, so --strict is not mistaken for a passed gate.
+        print(
+            "\nNOTE: single-config external run — the A/B targets need two configs "
+            "and did not run. Run each config separately, then gate with "
+            "`--compare run_a.json run_b.json --strict`."
+        )
 
     if args.output_json:
         payload = {

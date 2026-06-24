@@ -79,5 +79,29 @@ class TestDeriveActualCRank(unittest.TestCase):
         )
 
 
+class TestDetectKnee(unittest.TestCase):
+    def setUp(self):
+        self.bench = _load_bench_module()
+
+    @staticmethod
+    def _curve(pairs):
+        return [{"K": k, "reuse_frac": f} for k, f in pairs]
+
+    def test_knee_at_plateau_edge(self):
+        """Largest K still within plateau_frac * peak is the knee."""
+        curve = self._curve([(8, 0.5), (16, 0.5), (32, 0.2), (64, 0.05)])
+        # peak=0.5, plateau_frac=0.9 -> threshold 0.45; only K=8,16 qualify.
+        self.assertEqual(self.bench.detect_knee(curve, plateau_frac=0.9), 16)
+
+    def test_no_reuse_returns_none(self):
+        """All-zero reuse (no-cache / broken / all-miss) has no knee, not max K."""
+        curve = self._curve([(8, 0.0), (16, 0.0), (32, 0.0)])
+        self.assertIsNone(self.bench.detect_knee(curve, plateau_frac=0.9))
+
+    def test_tiny_noise_below_eps_is_no_reuse(self):
+        curve = self._curve([(8, 1e-12), (16, 0.0)])
+        self.assertIsNone(self.bench.detect_knee(curve, plateau_frac=0.9))
+
+
 if __name__ == "__main__":
     unittest.main()
