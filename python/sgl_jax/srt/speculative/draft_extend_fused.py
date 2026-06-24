@@ -78,7 +78,7 @@ def _active_dp_slot_mask(batch, total_bs: int) -> np.ndarray:
     return mask
 
 
-def _prepare_verify_sampling_params_host(sampling_info, batch, total_bs: int, vocab_size: int):
+def _prepare_rejection_sampling(sampling_info, batch, total_bs: int, vocab_size: int):
     temperatures = np.asarray(sampling_info.temperatures, dtype=np.float32).reshape(total_bs, 1)
     top_ks_src = getattr(sampling_info, "top_ks", None)
     top_ps_src = getattr(sampling_info, "top_ps", None)
@@ -1826,7 +1826,7 @@ def spec_decode_verify(spec_worker, model_worker_batch, cur_allocate_lens):
             _sv_topps_host,
             _sv_enable_top_k,
             _sv_enable_top_p,
-        ) = _prepare_verify_sampling_params_host(
+        ) = _prepare_rejection_sampling(
             si,
             model_worker_batch,
             _sv_tbs,
