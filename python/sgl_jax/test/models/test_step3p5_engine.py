@@ -561,10 +561,20 @@ class TestDecodeFlashVsNaive(unittest.TestCase):
             out, _ = attn_layer(positions, hidden, fb, kv_pool)
         return jnp.asarray(out, dtype=jnp.float32)
 
-    def _check_layer(self, layer_idx: int, label: str):
-        """Compare decode-mode flash output to naive on layer `layer_idx`."""
-        T = _PREFIX_LEN  # tokens in the prefix (prefill sequence length)
-        rng = np.random.default_rng(99 + layer_idx)
+    def _check_layer(
+        self, layer_idx: int, label: str, prefix_len: int = _PREFIX_LEN, page_size=None
+    ):
+        """Compare decode-mode flash output to naive on layer `layer_idx`.
+
+        prefix_len: tokens prefilled before the decode step. Set > sliding_window to
+            exercise the SWA window edge at DECODE time (early tokens fall outside
+            [k-W+1, k] and must be excluded).
+        page_size: KV pool page size. Set < prefix_len+1 so the decode reads KV across
+            MULTIPLE pages (the prefix fills earlier pages, the decode token lands in a
+            new page), exercising cross-page block indexing in decode mode.
+        """
+        T = prefix_len  # tokens in the prefix (prefill sequence length)
+        rng = np.random.default_rng(99 + layer_idx + prefix_len)
         hidden_np = rng.standard_normal((T + 1, self._cfg.hidden_size)).astype(np.float32)
         hidden_full = jnp.asarray(hidden_np)  # [T+1, H] for naive full sequence
         hidden_prefix = jnp.asarray(hidden_np[:T])  # [T, H] for prefill pass
@@ -576,7 +586,7 @@ class TestDecodeFlashVsNaive(unittest.TestCase):
 
         # Build flash model and kv_pool.
         flash_model = self._build_model("flash")
-        kv_pool = _make_kv_pool(self._cfg, self._mesh, jnp.float32, T + 1)
+        kv_pool = _make_kv_pool(self._cfg, self._mesh, jnp.float32, T + 1, page_size=page_size)
         flash_attn = flash_model.model.layers[layer_idx].self_attn
 
         # Step 1: prefill the T-token prefix to populate KV pool.
@@ -637,6 +647,27 @@ class TestDecodeFlashVsNaive(unittest.TestCase):
         predicate (k<=q)∧(q-k<W) as the naive oracle at DECODE time.
         """
         self._check_layer(1, "sliding_attention W=16")
+
+    def test_decode_flash_equals_naive_sliding_window_edge(self):
+        """(b2) Decode at the SWA window edge: prefix_len (20) > window (16).
+
+        The decode query at position 20 must attend only [20-15 .. 20] and EXCLUDE the
+        early tokens 0..4. The previous sliding decode test used prefix_len=8 < window,
+        so the window never truncated and the boundary predicate was untested in decode
+        mode. This drives the actual exclusion: flash decode must drop the same early
+        keys the naive oracle drops.
+        """
+        self._check_layer(1, "sliding W-edge prefix=20", prefix_len=20)
+
+    def test_decode_flash_equals_naive_multipage(self):
+        """(b1) Decode reading KV across MULTIPLE pages (page_size=4, prefix_len=8).
+
+        The prefix fills pages 0,1 (slots 0..7); the decode token lands in a new page 2
+        (slot 8) and the decode read spans pages 0,1,2. The previous decode tests used a
+        single page (page_size = num_tokens), so cross-page block indexing in decode mode
+        was untested. Layer 0 (full attention) isolates the paging from the window logic.
+        """
+        self._check_layer(0, "full multipage page_size=4", page_size=4)
 
 
 # ---------------------------------------------------------------------------
