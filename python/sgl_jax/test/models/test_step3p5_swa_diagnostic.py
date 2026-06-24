@@ -75,12 +75,12 @@ class TestSWADiagnostic(unittest.TestCase):
         jax.sharding.set_mesh(cls._mesh)
         cls._weights = _build_checkpoint(cls._cfg)
 
-    def _attn_module(self, layer_id):
+    def _attn_module(self, layer_id, attn_impl="flash"):
         from sgl_jax.srt.models.step3p5 import Step3p5ForCausalLM
 
         with jax.set_mesh(self._mesh):
             model = Step3p5ForCausalLM(
-                self._cfg, mesh=self._mesh, dtype=jnp.float32, attn_impl="flash"
+                self._cfg, mesh=self._mesh, dtype=jnp.float32, attn_impl=attn_impl
             )
         _load_weights(model, self._weights, self._cfg, self._mesh)
         return model.model.layers[layer_id].self_attn
@@ -128,6 +128,32 @@ class TestSWADiagnostic(unittest.TestCase):
         flash_out, naive_out = self._flash_vs_naive_attn(1)
         n_bad, max_rel = _per_position_report("layer1 SLIDING-attn", flash_out, naive_out)
         self.assertEqual(n_bad, 0, f"sliding flash != naive ({n_bad} positions).")
+
+    def test_attn_module_call_layer1(self):
+        """Full Step3p5Attention.__call__ (raw attn → gate → o_proj) flash vs naive, layer 1.
+
+        Bisects what's AFTER raw attn: raw attn already matches (test above), so if THIS
+        mismatches the divergence is in the head-wise gate or o_proj path; if it matches,
+        the divergence is downstream in the decoder layer (residual/MLP) or the
+        flash_vs_naive harness itself.
+        """
+        flash_attn = self._attn_module(1, "flash")
+        naive_attn = self._attn_module(1, "naive")
+        rng = np.random.default_rng(99)
+        hidden = jnp.asarray(rng.standard_normal((_NUM_TOKENS, self._cfg.hidden_size)), jnp.float32)
+        positions = jnp.arange(_NUM_TOKENS, dtype=jnp.int32)
+
+        with jax.set_mesh(self._mesh):
+            naive_out, _ = naive_attn(positions, hidden, _make_forward_batch(_NUM_TOKENS), None)
+            kv_pool = _make_kv_pool(self._cfg, self._mesh, jnp.float32, _NUM_TOKENS)
+            fb = _make_forward_batch(_NUM_TOKENS)
+            _attach_flash_backend(fb, self._cfg, self._mesh, kv_pool.page_size)
+            flash_out, _ = flash_attn(positions, hidden, fb, kv_pool)
+
+        n_bad, max_rel = _per_position_report(
+            "layer1 full __call__ (gate+o_proj)", np.asarray(flash_out), np.asarray(naive_out)
+        )
+        self.assertEqual(n_bad, 0, f"full attn-module __call__ flash != naive ({n_bad} positions).")
 
 
 if __name__ == "__main__":
