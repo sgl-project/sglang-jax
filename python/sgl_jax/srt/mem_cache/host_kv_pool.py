@@ -727,8 +727,7 @@ class LRUHostKVPool(HostKVPool):
         # ABC contract only — the HiCache upper layer never calls this (it uses
         # copy_into so no jax.Array crosses the boundary). Present so the class
         # is not abstract and so a non-retaining caller could still borrow.
-        if not (0 <= buffer_id < self._pool_size):
-            raise ValueError(f"buffer_id={buffer_id} outside pool range [0, {self._pool_size})")
+        self._require_allocated(buffer_id)
         if len(layers) != self._layer_num:
             raise ValueError(f"expected {self._layer_num} layers, got {len(layers)}")
         packed = jnp.stack(list(layers), axis=0)

@@ -146,6 +146,13 @@ class TestLRUHostKVPoolBoundaryInvariants(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.pool.stage_backup([0], [0])
 
+    def test_copy_from_device_rejects_unallocated_host_id(self):
+        # Same invariant on the ABC borrow path: a free-list id must not be
+        # written into _slots while alloc() can still hand it out.
+        layers = [self.pool._device_pool.kv_buffer[L][0] for L in range(3)]
+        with self.assertRaises(RuntimeError):
+            self.pool.copy_from_device(layers, 0)
+
     def test_inc_lock_ref_rejects_unallocated(self):
         with self.assertRaises(RuntimeError):
             self.pool.inc_lock_ref(0)
