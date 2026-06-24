@@ -326,8 +326,8 @@ class ServerArgs:
         if isinstance(self.speculative_algorithm, str) and self.speculative_algorithm.strip() == "":
             self.speculative_algorithm = None
 
-        # Recurrent extra-buffer (PR#2) static validation + track-interval
-        # normalization. Gated on the flag so non-recurrent / PR#1 launches
+        # Recurrent extra-buffer static validation + track-interval
+        # normalization. Gated on the flag so non-recurrent / base-path launches
         # are untouched. Model-dependent checks (radix routing) live in
         # _enforce_recurrent_state_server_constraints.
         if self.enable_recurrent_extra_buffer:
@@ -337,17 +337,10 @@ class ServerArgs:
                     f"(recurrent radix caching uses page-boundary track slots); "
                     f"got page_size={self.page_size}."
                 )
-            # Default the snapshot interval to the prefill chunk size, NOT
-            # page_size. A track interval below chunked_prefill_size forces the
-            # scheduler to split prefill into sub-chunks so each forward ends on
-            # a snapshot boundary (see _recurrent_boundary_cap). Chunked prefill
-            # is numerically chunk-size-sensitive in the full-attention/MoE path
-            # (smaller chunks -> more bf16 boundary rounding -> measurably lower
-            # accuracy: ~3.5pp on GPQA at interval=128 vs chunk=512, bit-identical
-            # to a no-radix run forced to chunk at 128). Snapshotting at the
-            # page-aligned chunk boundaries that already exist adds no extra
-            # splitting. Finer page-granular snapshots without splitting need
-            # mid-forward state extraction (S5b).
+            # Default the snapshot interval to the prefill chunk size: a smaller
+            # interval force-splits prefill into sub-chunks, and chunked prefill is
+            # chunk-size-sensitive (bf16 reduction order) -> ~3.5pp lower GPQA at
+            # 128 vs 512. Snapshotting at the existing chunk boundaries adds no split.
             if self.recurrent_track_interval is None:
                 if self.chunked_prefill_size and self.chunked_prefill_size > 0:
                     # The interval defaults to chunked_prefill_size, so it must be
@@ -377,17 +370,10 @@ class ServerArgs:
                 )
             if self.chunked_prefill_size and self.chunked_prefill_size > 0:
                 if self.recurrent_track_interval > self.chunked_prefill_size:
-                    # Coarser than the chunk size: a chunk can never reach a
-                    # snapshot boundary, so a prompt shorter than the interval
-                    # publishes no snapshot and caches NOTHING (its FULL key is
-                    # capped at the recurrent cache length, which never advances).
-                    # This does NOT stall: the zero-cache-len chunk skip advances
-                    # prefix_indices, so the request makes monotonic progress and
-                    # finishes (verified live at interval=4096, chunk=512), and a
-                    # prompt that does cross a boundary caches at it. It only
-                    # lowers hit rate, so warn rather than reject -- coarse
-                    # intervals are a valid memory-for-hit-rate trade on
-                    # long-shared-prefix workloads.
+                    # Coarser than the chunk: a prompt shorter than the interval
+                    # caches nothing, but does not stall (the zero-cache-len chunk
+                    # skip keeps progress; verified at interval=4096, chunk=512).
+                    # Warn, don't reject -- a valid memory-for-hit-rate trade.
                     logger.warning(
                         "--recurrent-track-interval (%d) > --chunked-prefill-size (%d): recurrent "
                         "snapshots are published only at interval boundaries, so any prompt shorter "
@@ -406,7 +392,7 @@ class ServerArgs:
                         "snapshot boundary. Chunked prefill is chunk-size-sensitive in the "
                         "full-attention/MoE path, so finer snapshots trade accuracy (~3.5pp on "
                         "GPQA at interval=128 vs chunk=512) for recurrent-cache granularity. "
-                        "Prefer the default (= chunked_prefill_size) until S5b lands.",
+                        "Prefer the default (= chunked_prefill_size).",
                         self.recurrent_track_interval,
                         self.chunked_prefill_size,
                         self.recurrent_track_interval,
@@ -820,7 +806,7 @@ class ServerArgs:
             "--recurrent-track-interval",
             type=int,
             default=ServerArgs.recurrent_track_interval,
-            help="Recurrent radix cache (PR#2): page-boundary interval at which a "
+            help="Recurrent radix cache: page-boundary interval at which a "
             "recurrent track state is committed. Requires --enable-recurrent-extra-buffer "
             "and must be a positive multiple of --page-size. Defaults to "
             "--chunked-prefill-size when extra-buffer is enabled (falls back to "
@@ -1071,9 +1057,14 @@ class ServerArgs:
         parser.add_argument(
             "--dp-schedule-policy",
             type=str,
-            choices=["round_robin", "min_running_queue"],
+            choices=["round_robin", "min_running_queue", "cache_aware"],
             default=ServerArgs.dp_schedule_policy,
-            help="DP scheduling policy for assigning dp_rank to new requests.",
+            help=(
+                "DP scheduling policy for assigning dp_rank to new requests. "
+                "'cache_aware' routes a request to the dp rank holding the longest "
+                "cached prefix (bounded by per-rank load), improving prefix reuse "
+                "under DP; it falls back to least-loaded when no rank has a match."
+            ),
         )
 
         # Multi-node distributed serving
@@ -1119,7 +1110,7 @@ class ServerArgs:
             "--enable-recurrent-extra-buffer",
             action="store_true",
             help="Recurrent radix cache: use the page-aligned ping-pong track "
-            "buffer for page_size>=128 (PR#2). Off by default; PR#1 supports "
+            "buffer for page_size>=128. Off by default; the base path supports "
             "page_size=1 only.",
         )
         parser.add_argument(
