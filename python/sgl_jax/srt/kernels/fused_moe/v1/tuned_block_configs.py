@@ -285,6 +285,36 @@ def get_simplified_key(
     )
 
 
+def _shape_aware_fallback(
+    *, num_tokens: int, hidden_size: int, intermediate_size: int, ep_size: int,
+) -> FusedMoEBlockConfig:
+    """Compute a shape-aware default block config (ported from AInfer v1
+    tuned_block_sizes.py:DEFAULT_BLOCK_SIZES).
+
+    Far better than DEFAULT_FUSED_MOE_BLOCK_CONFIG when the actual shape is
+    not in TUNED_BLOCK_CONFIGS — bf=384 for I=768 (3 tiles, no waste) vs the
+    hardcoded bf=512 (1.5 tiles, 33% waste).
+    """
+    h = hidden_size if hidden_size % 256 == 0 else ((hidden_size + 255) // 256) * 256
+    i = intermediate_size if intermediate_size % 256 == 0 else ((intermediate_size + 255) // 256) * 256
+    local_num_tokens = max(num_tokens // ep_size, 1)
+    d = h // 256
+    f = i // 256
+    bt = min(local_num_tokens, 128)
+    bf = min(256 * f // 2, 1024)
+    bd1 = min(256 * d // 2, 1024)
+    bd2 = min(256 * d // 2, 2048)
+    btc = min(local_num_tokens // 2 or 1, 64)
+    bfc = min(256 * f // 2, 1024)
+    bd1c = min(256 * d // 2, 1024)
+    bd2c = min(256 * d // 2, 2048)
+    return FusedMoEBlockConfig(
+        bt=bt, bf=bf, bd1=bd1, bd2=bd2,
+        btc=btc, bfc=bfc, bd1c=bd1c, bd2c=bd2c,
+        bse=min(256 * f // 2, 512),
+    )
+
+
 def get_tuned_fused_moe_block_config(
     *,
     num_tokens: int,
@@ -326,7 +356,22 @@ def get_tuned_fused_moe_block_config(
         cfg_tuple = TUNED_BLOCK_CONFIGS.get("*", {}).get(table_key)
 
     if cfg_tuple is None:
-        return DEFAULT_FUSED_MOE_BLOCK_CONFIG
+        # No exact tuning match — use AInfer-style shape-aware fallback (much
+        # better than the legacy DEFAULT for non-tuned shapes like
+        # ling_v3_flash E=512 H=2560 I=768 where DEFAULT bf=512 wastes 33%).
+        cfg = _shape_aware_fallback(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            ep_size=ep_size,
+        )
+        logger.info(
+            "v1 tuned lookup miss for %s, using shape-aware fallback: bt=%d bf=%d "
+            "bd1=%d bd2=%d btc=%d bfc=%d bd1c=%d bd2c=%d",
+            table_key, cfg.bt, cfg.bf, cfg.bd1, cfg.bd2,
+            cfg.btc, cfg.bfc, cfg.bd1c, cfg.bd2c,
+        )
+        return cfg
 
     if len(cfg_tuple) != 10:
         raise ValueError(f"Unexpected tuned config tuple length: {len(cfg_tuple)}")
