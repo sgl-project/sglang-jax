@@ -13,14 +13,14 @@ to UnifiedRadixCache via the registry. The ``/get_server_info`` assertion in
 behavior is checked.
 
 ``TestUnifiedRadixCacheServingRecurrent`` covers the recurrent (GDN-hybrid)
-path at ``--page-size 1``: a Qwen3.5-35B-A3B (qwen3_5_moe) model routes to
-UnifiedRadixCache with a recurrent component, and the cache-hit run must stay
-byte-identical to a ``--disable-radix-cache`` baseline (the KL==0 guarantee
-at page_size=1). It needs 4 chips and runs in the ``e2e-test-tpu-v6e-4`` suite,
-not v6e-1.
+production path at ``--page-size 128 --enable-recurrent-extra-buffer``: a
+Qwen3.5-35B-A3B (qwen3_5_moe) model routes to UnifiedRadixCache with a recurrent
+component, and the cache-hit run must stay byte-identical to a
+``--disable-radix-cache`` baseline (the KL==0 guarantee for the extra-buffer
+path). It needs 4 chips and a ~72GB checkpoint, so it is kept out of per-PR CI
+(run manually / on GKE; a nightly recurrent suite is Next Work).
 """
 
-import os
 import unittest
 
 import requests
@@ -31,17 +31,18 @@ from sgl_jax.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    QWEN3_5_35B_A3B,
     CustomTestCase,
     popen_launch_server,
 )
 
-_PAGE_SIZE = 64
+_PAGE_SIZE = 128
 
-# Recurrent (GDN-hybrid) checkpoint for the page=1 serving test. Overridable so
-# CI and the dev VM can each resolve a local path. Pinned to the qwen3_5_moe
-# (GDN-hybrid) checkpoint this branch registers; it fits 4 chips at tp=4.
-RECURRENT_MODEL_PATH = os.environ.get("SGLANG_RECURRENT_TEST_MODEL", "/models/Qwen3.5-35B-A3B")
-_RECURRENT_PAGE_SIZE = 1
+# Recurrent (GDN-hybrid) checkpoint for the extra-buffer serving test. Resolved
+# under SGLANG_JAX_MODEL_CACHE like the other model constants (qwen3_5_moe, fits
+# 4 chips at tp=4).
+RECURRENT_MODEL_PATH = QWEN3_5_35B_A3B
+_RECURRENT_PAGE_SIZE = 128
 _RECURRENT_TP_SIZE = 4
 
 # Do NOT add "--stream-output": the cache-hit kit assumes each chunk carries the
@@ -55,7 +56,7 @@ _SERVER_ARGS = [
     "--max-running-requests",
     "16",
     "--page-size",
-    "64",
+    str(_PAGE_SIZE),
     "--random-seed",
     "42",
     "--enable-unified-radix-tree",
@@ -141,14 +142,15 @@ class TestUnifiedRadixCacheServing(CustomTestCase):
         self.assertGreater(result["overall"]["cache_hit_rate"], 0.0)
 
     def test_hit_flush_determinism(self):
-        # paragraph * 6 tokenizes to well over one page.
+        # paragraph * 10 tokenizes to ~350 tokens, comfortably over two pages
+        # (page_size=128).
         paragraph = (
             "In the field of artificial intelligence, large language models have "
             "shown remarkable capabilities in natural language processing. These "
             "models can perform text generation, translation, summarization, and "
             "question answering. "
         )
-        prompt = paragraph * 6
+        prompt = paragraph * 10
 
         # 1. Cold: empty tree -> nothing cached.
         flush_cache(self.base_url)
@@ -177,16 +179,17 @@ class TestUnifiedRadixCacheServing(CustomTestCase):
 
 
 class TestUnifiedRadixCacheServingRecurrent(CustomTestCase):
-    """Recurrent (GDN-hybrid) page=1 serving determinism.
+    """Recurrent (GDN-hybrid) extra-buffer serving determinism.
 
-    A Qwen3.5-35B-A3B (qwen3_5_moe) model under ``--enable-unified-radix-tree --page-size 1``
-    routes to UnifiedRadixCache with a recurrent component. The cache-hit run
-    must be byte-identical to a ``--disable-radix-cache`` baseline, proving
-    the KL==0 guarantee holds for recurrent state at page_size=1.
+    A Qwen3.5-35B-A3B (qwen3_5_moe) model under ``--enable-unified-radix-tree
+    --enable-recurrent-extra-buffer --page-size 128`` routes to UnifiedRadixCache
+    with a recurrent component. The cache-hit run must be byte-identical to a
+    ``--disable-radix-cache`` baseline, proving the KL==0 guarantee holds for the
+    production extra-buffer recurrent path.
 
-    Sampler caveat: use greedy + ``--random-seed`` only; ``--page-size 1``
-    plus ``--precompile-bs-paddings`` pinned to multiples of tp_size (=4)
-    keeps the decode batch divisible by the device count. Do NOT add
+    Sampler caveat: use greedy + ``--random-seed`` only; ``--precompile-bs-paddings``
+    pinned to multiples of tp_size*t_packing (=8) keeps the decode batch divisible
+    by the device count and satisfies the fused MoE alignment. Do NOT add
     ``--enable-deterministic-sampling`` (it crashes on the sampler ``lax.cond``
     divisibility bug).
     """
@@ -219,10 +222,11 @@ class TestUnifiedRadixCacheServingRecurrent(CustomTestCase):
         "--random-seed",
         "42",
         "--disable-overlap-schedule",
-        # bs paddings pinned to multiples of tp_size (=4) so the decode batch
-        # stays divisible by the device count (sampler lax.cond requirement).
+        # bs paddings pinned to multiples of tp_size*t_packing (=8): keeps the
+        # decode batch divisible by the device count (sampler lax.cond) and gives
+        # each device >=2 tokens, satisfying the fused MoE t_packing=2 alignment
+        # for this qwen3_5_moe checkpoint at tp=4 (bs=4 -> 1 token/device fails).
         "--precompile-bs-paddings",
-        "4",
         "8",
         "16",
         "--precompile-token-paddings",
@@ -239,7 +243,18 @@ class TestUnifiedRadixCacheServingRecurrent(CustomTestCase):
             cls.model,
             base_url=cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=cls._COMMON_ARGS + ["--enable-unified-radix-tree"],
+            other_args=cls._COMMON_ARGS
+            + [
+                "--enable-unified-radix-tree",
+                "--enable-recurrent-extra-buffer",
+                # Cap the recurrent pool. The default ratio-based sizing reserves
+                # ~0.9 of HBM, which with the 35B weights on 4 chips leaves a
+                # negative KV budget. 96 slots (slot_factor=3 -> ~32 reqs) covers
+                # max_running_requests=16 and leaves ample KV. The baseline server
+                # uses --disable-radix-cache, which auto-sizes from max-running.
+                "--max-recurrent-state-size",
+                "96",
+            ],
             env=cls._ENV,
         )
 
@@ -325,7 +340,10 @@ class TestUnifiedRadixCacheServingRecurrent(CustomTestCase):
             "models can perform text generation, translation, summarization, and "
             "question answering. "
         )
-        prompt = paragraph * 6
+        # Long enough to cross a recurrent track boundary (track_interval
+        # defaults to chunked_prefill_size=512), so the recurrent snapshot is
+        # actually cached and reused on the hit -- not just the full-KV pages.
+        prompt = paragraph * 16
 
         # 1. Cold: empty tree -> nothing cached.
         flush_cache(self.base_url)
