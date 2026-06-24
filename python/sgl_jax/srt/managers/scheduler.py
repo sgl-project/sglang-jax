@@ -83,6 +83,12 @@ from sgl_jax.srt.multimodal.tokenizer_utils import resolve_tokenizer_subdir
 from sgl_jax.srt.precision_tracer import precision_tracer
 from sgl_jax.srt.server_args import PortArgs, ServerArgs
 from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
+from sgl_jax.srt.speculative.overlap_utils import (
+    can_use_spec_decode_overlap,
+    can_use_spec_prefill_overlap,
+    publish_spec_decode_new_seq_lens,
+    use_legacy_eagle3_non_overlap,
+)
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 from sgl_jax.srt.utils.common_utils import (
     SAFE_EXTEND_PER_DP_BS,
@@ -122,15 +128,16 @@ class ReceiveDataError(Exception):
 @dataclass
 class GenerationBatchResult:
     logits_output: LogitsProcessorOutput | None
-    next_token_ids: list[int] | None
+    next_token_ids: object | None
     extend_input_len_per_req: list[int]
     extend_logprob_start_len_per_req: list[int]
     bid: int
     cache_miss_count: int
     # relay path: forward stream -> next step forward
     next_draft_input: EagleDraftInput | None = None
+    spec_relay_buffers: object | None = None
+    prefill_relay_future_indices: object | None = None
 
-    allocate_lens: np.ndarray | None = None
     num_accepted_tokens: int | None = None
     accept_lens: np.ndarray | None = None
 
@@ -198,6 +205,11 @@ class Scheduler(
         self.disagg_prefill_queue = None
         self.disagg_prealloc_queue = None
         self.disagg_transfer_queue = None
+        self.disagg_decode_watchdog = None
+        # Decode-side cache of prefill registry (sglang-style local per-room
+        # resolution) + reqs deferred because no prefill was registered yet.
+        self.disagg_prefill_info_cache = None
+        self._pd_pending_bootstrap = []
 
         # LoRA configurations
         self.lora_paths = server_args.lora_paths
@@ -343,6 +355,8 @@ class Scheduler(
                 server_args=server_args,
                 target_worker=self.tp_worker,
             )
+            if self.enable_overlap and hasattr(self.draft_worker, "init_spec_relay_buffers"):
+                self.draft_worker.init_spec_relay_buffers()
 
         # Get token and memory info from the model worker
         (
@@ -530,6 +544,9 @@ class Scheduler(
         if cache_status is None:
             cache_status = "not configured (JAX_COMPILATION_CACHE_DIR unset)"
         logger.info("XLA persistent compilation cache: %s", cache_status)
+
+    def _is_spec_decode_enabled(self) -> bool:
+        return self.spec_algorithm is not None and not self.spec_algorithm.is_none()
 
     def sync_pub(self):
         logger.info(
@@ -995,7 +1012,9 @@ class Scheduler(
                         mesh=self.mesh,
                     )
                     tmp_batch.forward_mode = ForwardMode.DUMMY_FIRST
-                    tmp_batch.next_batch_sampling_info = self.tp_worker.cur_sampling_info
+                    tmp_batch.next_batch_sampling_info = (
+                        self._current_sampling_info_owner().cur_sampling_info
+                    )
                     with jax.profiler.TraceAnnotation("process_batch_result"):
                         self.process_batch_result(tmp_batch, None, batch.launch_done)
 
@@ -1003,7 +1022,7 @@ class Scheduler(
                 # Process the results of the last batch
                 tmp_batch, tmp_result = self.result_queue.popleft()
                 tmp_batch.next_batch_sampling_info = (
-                    self.tp_worker.cur_sampling_info if batch else None
+                    self._current_sampling_info_owner().cur_sampling_info if batch else None
                 )
                 # NOTE: we should use current launched batch's launch_done event Instead of the last batch's
                 self.process_batch_result(
@@ -1148,7 +1167,6 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
-        # Copy more attributes
         if recv_req.logprob_start_len == -1 or not recv_req.return_logprob:
             # By default, only return the logprobs for output tokens
             req.logprob_start_len = len(req.origin_input_ids) - 1
@@ -1485,6 +1503,10 @@ class Scheduler(
     def _add_request_to_queue(self, req: Req):
         req.queue_time_start = time.perf_counter()
         self.waiting_queue.append(req)
+        if req.bootstrap_room is not None:
+            mark = getattr(self, "_pd_mark_time", None)
+            if mark is not None:
+                mark(req, "queue_entry")
 
     def _extend_requests_to_queue(self, reqs: list[Req], is_retracted: bool = False):
         self.waiting_queue.extend(reqs)
@@ -1634,8 +1656,14 @@ class Scheduler(
             if not self.last_batch.is_empty() and not self.last_batch.is_prefill_only:
                 if self.running_batch.is_empty():
                     self.running_batch = self.last_batch
-                else:
-                    # Merge running_batch with prefill batch
+                elif (
+                    not self._is_spec_decode_enabled()
+                    or self.enable_overlap
+                    or use_legacy_eagle3_non_overlap(self.enable_overlap, self.spec_algorithm)
+                ):
+                    # Spec overlap keeps prefill and decode as separate forwards, but
+                    # once prefill has produced req-granular relay state it can join
+                    # the next decode batch through the normal batch merge.
                     self.running_batch.merge_batch(self.last_batch)
 
         # For prefill-only batch, filter out finished requests since they
@@ -1679,6 +1707,17 @@ class Scheduler(
 
         # Handle the cases where prefill is not allowed
         has_chunked_reqs = any(req is not None for req in self.chunked_reqs)
+        if self.is_hybrid:
+            for info in self.running_batch.reqs_info:
+                info.batch_is_full = False
+
+        if (
+            self._is_spec_decode_enabled()
+            and not self.enable_overlap
+            and not use_legacy_eagle3_non_overlap(self.enable_overlap, self.spec_algorithm)
+            and not self.running_batch.is_empty()
+        ):
+            return None
         if (
             self.running_batch.batch_is_full or len(self.waiting_queue) == 0
         ) and not has_chunked_reqs:
@@ -1762,10 +1801,20 @@ class Scheduler(
             ):
                 break
 
+            mgr = getattr(self, "disagg_kv_manager", None)
+            _host_pool = mgr.host_pool if mgr is not None else None
+            _admit_ok, _reserved_bid = _reserve_host_slot_for_pd(
+                _host_pool, getattr(self, "disagg_use_d2h_staging", False), req
+            )
+            if not _admit_ok:
+                continue  # host pool full: leave req in waiting_queue, retry next round
+
             req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(req)
 
             if res != AddReqResult.CONTINUE:
+                if _reserved_bid is not None and _host_pool is not None:
+                    _host_pool.release(_reserved_bid)
                 if res == AddReqResult.NO_TOKEN:
                     # Mark this specific DP rank as exhausted
                     self.running_batch.reqs_info[dp_rank].batch_is_full = True
@@ -1779,6 +1828,8 @@ class Scheduler(
                 else:
                     # OTHER: Global budget exhausted, stop entirely
                     break
+            if _reserved_bid is not None:
+                req.disagg_host_buffer_id = _reserved_bid
 
         # Update waiting queue
         # Flatten can_run_list for operations that need all requests
@@ -1834,6 +1885,7 @@ class Scheduler(
         if (
             self.is_mixed_chunk
             and not self._extend_bs_guard_active
+            and not self._is_spec_decode_enabled()
             and not self.running_batch.is_empty()
             and not (new_batch.return_logprob or self.running_batch.return_logprob)
         ):
@@ -2010,50 +2062,20 @@ class Scheduler(
                 next_token_ids = np.array(jax.device_get(next_token_ids_device))
                 self._extract_dp_output_ids(next_token_ids, model_worker_batch, batch)
         else:
-            if batch.forward_mode.is_extend():
-                # Spec extend always uses the padded mwb so target and draft
-                # see identical shapes regardless of dp_size / multi-layer
-                # (#1090 + #1053 P1-5b assert dp>1 spec extend must go here).
-                model_worker_batch = batch.get_model_worker_batch(
-                    precompile_token_paddings,
-                    precompile_bs_paddings,
-                    precompile_cache_loc_paddings,
-                    self.page_size,
-                    self.server_args.enable_static_lora,
-                )
-            else:
-                model_worker_batch = batch.get_spec_model_worker_batch(
-                    precompile_token_paddings,
-                    precompile_bs_paddings,
-                    precompile_cache_loc_paddings,
-                    self.page_size,
-                    self.server_args.enable_static_lora,
-                    draft_token_num=self.draft_worker.speculative_num_draft_tokens,
-                )
-            batch_output = self.draft_worker.forward_batch_speculative_generation(
-                model_worker_batch
+            (
+                model_worker_batch,
+                batch_output,
+                next_token_ids,
+                logits_output,
+                cache_miss_count,
+                defer_spec_output,
+                defer_spec_prefill_output,
+            ) = self._run_speculative_batch(
+                batch,
+                precompile_token_paddings,
+                precompile_bs_paddings,
+                precompile_cache_loc_paddings,
             )
-            per_rank_spec = ScheduleBatch._split_spec_info_per_rank(
-                batch_output.next_draft_input, model_worker_batch.real_bs_per_dp
-            )
-            for r, s in enumerate(per_rank_spec):
-                batch.reqs_info[r].spec_info = s
-            accept = batch_output.accept_lens
-            if accept is not None:
-                accept = np.asarray(jax.device_get(accept))
-            per_dp_bs = model_worker_batch.per_dp_bs_size
-            for dp_rank, info in enumerate(batch.reqs_info):
-                if info.seq_lens is None or len(info.seq_lens) == 0:
-                    continue
-                if accept is not None:
-                    off = dp_rank * per_dp_bs
-                    info.seq_lens = info.seq_lens + accept[off : off + len(info.seq_lens)]
-                else:
-                    info.seq_lens = info.seq_lens + 1
-            next_token_ids = np.asarray(jax.device_get(batch_output.next_token_ids))
-            self._extract_dp_output_ids(next_token_ids, model_worker_batch, batch)
-            logits_output = batch_output.logits_output
-            cache_miss_count = batch_output.cache_miss_count
         bid = model_worker_batch.bid
 
         # These 2 values are needed for processing the output, but the values can be
@@ -2077,20 +2099,41 @@ class Scheduler(
                     )
         else:
             extend_logprob_start_len_per_req = None
+        spec_relay_buffers = None
+        prefill_relay_future_indices = None
+        if self.spec_algorithm is not None and not self.spec_algorithm.is_none():
+            spec_relay_buffers = getattr(batch_output, "spec_relay_buffers", None)
+            prefill_relay_future_indices = getattr(
+                batch_output, "prefill_relay_future_indices", None
+            )
 
         ret = GenerationBatchResult(
             logits_output=logits_output,
-            next_token_ids=next_token_ids.tolist(),
+            next_token_ids=(
+                batch_output.next_token_ids
+                if (
+                    self.spec_algorithm is not None
+                    and self.spec_algorithm.is_eagle()
+                    and (batch.forward_mode.is_decode() or defer_spec_prefill_output)
+                    and self.enable_overlap
+                )
+                else next_token_ids.tolist()
+            ),
             extend_input_len_per_req=extend_input_len_per_req,
             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
             bid=bid,
             cache_miss_count=cache_miss_count,
+            spec_relay_buffers=spec_relay_buffers,
+            prefill_relay_future_indices=prefill_relay_future_indices,
         )
-        if self.spec_algorithm is not None and self.spec_algorithm.is_eagle():
+        if (
+            self.spec_algorithm is not None
+            and self.spec_algorithm.is_eagle()
+            and batch_output.next_draft_input is not None
+        ):
             assert isinstance(batch_output.next_draft_input, EagleDraftInput)
             ret.next_draft_input = batch_output.next_draft_input
             ret.accept_lens = batch_output.accept_lens
-            ret.allocate_lens = batch_output.allocate_lens
         return ret
 
     def process_batch_result(
@@ -2110,32 +2153,124 @@ class Scheduler(
         elif batch.forward_mode.is_dummy_first():
             self.set_next_batch_sampling_info_done(batch)
 
-    def get_idle_batch(self):
-        # Create empty request lists for each DP rank
-        reqs_per_dp = [[] for _ in range(self.dp_size)]
-
-        idle_batch = ScheduleBatch.init_new(
-            reqs_per_dp,
-            self.req_to_token_pool,
-            self.token_to_kv_pool_allocator,
-            self.tree_cache,
-            self.model_config,
-            self.enable_overlap,
-            self.dp_size,
-            spec_algorithm=self.spec_algorithm,
-            enable_custom_logit_processor=self.server_args.enable_custom_logit_processor,
-            chunked_reqs=None,
-            mesh=self.mesh,
-        )
-        idle_batch.prepare_for_idle()
-        return idle_batch
-
     def set_next_batch_sampling_info_done(self, batch: ScheduleBatch):
         if batch.next_batch_sampling_info:
             # Update grammar vocab masks for next batch in overlap mode
             if batch.next_batch_sampling_info.grammars is not None:
                 batch.next_batch_sampling_info.update_grammar_vocab_mask()
             batch.next_batch_sampling_info.sampling_info_done.set()
+
+    def _current_sampling_info_owner(self):
+        if self.spec_algorithm is not None and not self.spec_algorithm.is_none():
+            return self.draft_worker
+        return self.tp_worker
+
+    def _run_speculative_batch(
+        self,
+        batch: ScheduleBatch,
+        precompile_token_paddings,
+        precompile_bs_paddings,
+        precompile_cache_loc_paddings,
+    ):
+        if batch.forward_mode.is_extend():
+            # Spec extend always uses the padded mwb so target and draft
+            # see identical shapes regardless of dp_size / multi-layer
+            # (#1090 + #1053 P1-5b assert dp>1 spec extend must go here).
+            model_worker_batch = batch.get_model_worker_batch(
+                precompile_token_paddings,
+                precompile_bs_paddings,
+                precompile_cache_loc_paddings,
+                self.page_size,
+                self.server_args.enable_static_lora,
+            )
+        else:
+            model_worker_batch = batch.get_spec_model_worker_batch(
+                precompile_token_paddings,
+                precompile_bs_paddings,
+                precompile_cache_loc_paddings,
+                self.page_size,
+                self.server_args.enable_static_lora,
+                draft_token_num=self.draft_worker.speculative_num_draft_tokens,
+            )
+
+        use_spec_decode_overlap = can_use_spec_decode_overlap(
+            self.enable_overlap, self.spec_algorithm, batch
+        )
+        use_spec_prefill_overlap = can_use_spec_prefill_overlap(
+            self.enable_overlap, self.spec_algorithm, batch
+        ) and self.draft_worker._can_use_fused_spec_prefill(model_worker_batch)
+        use_legacy_eagle3_decode = batch.forward_mode.is_decode() and use_legacy_eagle3_non_overlap(
+            self.enable_overlap, self.spec_algorithm
+        )
+        if use_spec_decode_overlap:
+            batch_output, published_new_seq_lens = (
+                self.draft_worker.forward_batch_speculative_decode_overlap(model_worker_batch)
+            )
+        elif use_spec_prefill_overlap:
+            batch_output = self.draft_worker.forward_batch_speculative_prefill_overlap(
+                model_worker_batch
+            )
+            published_new_seq_lens = None
+        else:
+            batch_output = self.draft_worker.forward_batch_speculative_generation(
+                model_worker_batch
+            )
+            if use_legacy_eagle3_decode:
+                published_new_seq_lens = None
+            else:
+                published_new_seq_lens = (
+                    publish_spec_decode_new_seq_lens(batch_output)
+                    if batch.forward_mode.is_decode()
+                    else None
+                )
+
+        if batch_output.next_draft_input is not None:
+            per_rank_spec = ScheduleBatch._split_spec_info_per_rank(
+                batch_output.next_draft_input, model_worker_batch.real_bs_per_dp
+            )
+            for r, s in enumerate(per_rank_spec):
+                batch.reqs_info[r].spec_info = s
+
+        if not use_spec_decode_overlap:
+            if use_legacy_eagle3_decode and batch_output.accept_lens is not None:
+                new_seq_lens = np.asarray(jax.device_get(batch_output.accept_lens))
+                advance_from_accept_lens = True
+            else:
+                new_seq_lens = (
+                    np.asarray(jax.device_get(published_new_seq_lens))
+                    if published_new_seq_lens is not None
+                    else None
+                )
+                advance_from_accept_lens = False
+            per_dp_bs = model_worker_batch.per_dp_bs_size
+            for dp_rank, info in enumerate(batch.reqs_info):
+                if info.seq_lens is None or len(info.seq_lens) == 0:
+                    continue
+                if new_seq_lens is not None:
+                    off = dp_rank * per_dp_bs
+                    delta = new_seq_lens[off : off + len(info.seq_lens)]
+                    if advance_from_accept_lens:
+                        info.seq_lens = info.seq_lens + delta
+                    else:
+                        info.seq_lens = delta
+                else:
+                    info.seq_lens = info.seq_lens + 1
+
+        defer_spec_output = use_spec_decode_overlap or use_spec_prefill_overlap
+        next_token_ids = None
+        if not defer_spec_output:
+            next_token_ids = np.asarray(jax.device_get(batch_output.next_token_ids))
+            self._extract_dp_output_ids(next_token_ids, model_worker_batch, batch)
+
+        return (
+            model_worker_batch,
+            batch_output,
+            next_token_ids,
+            batch_output.logits_output,
+            batch_output.cache_miss_count,
+            defer_spec_output,
+            use_spec_prefill_overlap,
+        )
 
     def watchdog_thread(self):
         """A watch dog thread that will try to kill the server itself if one forward batch takes too long."""
@@ -2244,6 +2379,20 @@ class Scheduler(
                     self._release_decode_kv_indices(entry.kv_indices)
                 self._abort_decode_request(entry.req, "abort_request")
 
+        # Decode reqs deferred because no prefill was registered yet hold no KV
+        # or receiver, but abort_request must still drop them so a cancelled
+        # request is not re-admitted on the next decode tick.
+        pending_bootstrap = getattr(self, "_pd_pending_bootstrap", None)
+        if pending_bootstrap:
+            survivors = []
+            for req in pending_bootstrap:
+                if recv_req.abort_all or req.rid.startswith(recv_req.rid):
+                    logger.debug("Abort pending-bootstrap request. rid=%s", req.rid)
+                    self._abort_decode_request(req, "abort_request")
+                else:
+                    survivors.append(req)
+            self._pd_pending_bootstrap = survivors
+
     def pause_generation(self, recv_req: PauseGenerationReqInput):
         self._engine_paused = True
 
@@ -2273,6 +2422,27 @@ class Scheduler(
     def continue_generation(self, recv_req: ContinueGenerationReqInput):
         self._engine_paused = False
         logger.info("Generation continued")
+
+
+def _reserve_host_slot_for_pd(host_pool, use_d2h_staging, req):
+    """D1 admission. Returns (admit_ok, reserved_buffer_id).
+
+    For a D2H-staged PD req, reserve a host-pool slot. If the pool is
+    full, (False, None) tells the caller to skip the req this round so it
+    stays in the waiting queue (backpressure). Non-PD / non-staged reqs
+    are always admitted with no reservation.
+    """
+    if (
+        host_pool is None
+        or not use_d2h_staging
+        or getattr(req, "bootstrap_room", None) is None
+        or getattr(req, "disagg_host_buffer_id", None) is not None
+    ):
+        return True, None
+    buffer_id = host_pool.reserve()
+    if buffer_id is None:
+        return False, None
+    return True, buffer_id
 
 
 def dispatch_scheduler_event_loop(scheduler: Scheduler, server_args: ServerArgs) -> None:

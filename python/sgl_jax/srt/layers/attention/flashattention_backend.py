@@ -212,16 +212,11 @@ class FlashAttention(AttentionBackend):
         page_indices = (selected_cache_locs // self.page_size).astype(np.int32)
 
         if batch.forward_mode == ForwardMode.TARGET_VERIFY:
-            # convert custom_mask from bool to int32, because dma not support bool type
-            if batch.spec_info_padded.custom_mask.dtype == jnp.bool:
-                # FIXME(pc) rm this dtype convert
-                logger.warning(
-                    "batch.spec_info_padded.custom_mask type is  %s, it may make performance very low",
-                    batch.spec_info_padded.custom_mask.dtype,
-                )
-                metadata.custom_mask = batch.spec_info_padded.custom_mask.astype(jnp.int32)
-            else:
-                metadata.custom_mask = batch.spec_info_padded.custom_mask
+            metadata.custom_mask = batch.spec_info_padded.custom_mask
+            if metadata.custom_mask is not None:
+                assert (
+                    metadata.custom_mask.dtype != jnp.bool_
+                ), "custom_mask bool dtype is not supported; use int32 instead."
         else:
             metadata.custom_mask = None
 
@@ -290,7 +285,9 @@ class FlashAttention(AttentionBackend):
             ) * self.page_size
         cu_kv_lens = _per_dp_cumsum(aligned_seq_lens, dp_size, per_dp_bs)
 
-        if batch.forward_mode == ForwardMode.DRAFT_EXTEND:
+        if batch.forward_mode == ForwardMode.DRAFT_EXTEND and not getattr(
+            batch.spec_info_padded, "device_seq_lens_for_draft_extend", False
+        ):
             # Truncate each req's page list from allocate_len → seq_len, keeping
             # the DP-segmented layout from padding_for_decode (rank r's pages
             # at [r*per_dp_pg : ...]). page_indices (line 212) is already

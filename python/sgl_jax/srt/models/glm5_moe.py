@@ -612,6 +612,7 @@ class Glm5DecoderLayer(nnx.Module):
         )
 
         first_k_dense_replace = getattr(config, "first_k_dense_replace", 0)
+        use_fused_mlp = getattr(config, "_sgl_use_fused_mlp", True)
 
         if layer_id < first_k_dense_replace:
             self.mlp = Glm5MLP(
@@ -620,6 +621,7 @@ class Glm5DecoderLayer(nnx.Module):
                 layer_id=layer_id,
                 dtype=dtype,
                 mesh=mesh,
+                use_fused=use_fused_mlp,
             )
             self.is_moe_layer = False
             self.moe_gate = None
@@ -687,6 +689,7 @@ class Glm5DecoderLayer(nnx.Module):
                     layer_id=layer_id,
                     dtype=dtype,
                     mesh=mesh,
+                    use_fused=use_fused_mlp,
                 )
             else:
                 self.shared_experts = None
@@ -1100,6 +1103,14 @@ class GlmMoeDsaForCausalLM(Glm5ForCausalLM):
             # narrow-N guard would reject it but the indexer output is currently
             # discarded so accuracy is unaffected. Match deepseek_v3 config.
             mc.quantization_config.allow_narrow_n_blockwise = True
+        # Under dynamic (in-framework) quant, Glm5MLP.post_load_weights merges
+        # BF16 w_gu/w_d and nulls gate/up/down_proj *before* quantize_model
+        # runs, so the fused weights bypass quantization and regress decode
+        # TPOT on HBM-bound hardware (#1378). Keep the unfused path there so
+        # the LinearBase modules get quantized as before.
+        mc.hf_config._sgl_use_fused_mlp = (
+            mc.quantization_config is None or mc.quantization_config.is_static_checkpoint
+        )
 
 
 EntryClass = [Glm5ForCausalLM, GlmMoeDsaForCausalLM]

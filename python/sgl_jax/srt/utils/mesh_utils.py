@@ -1,4 +1,4 @@
-from collections.abc import Sequence
+from collections.abc import MutableSequence, Sequence
 
 import jax
 import numpy as np
@@ -13,10 +13,10 @@ default_mesh_axes = [
 
 
 def create_device_mesh(
-    ici_parallelism: Sequence[int],
-    dcn_parallelism: Sequence[int],
+    ici_parallelism: MutableSequence[int],
+    dcn_parallelism: MutableSequence[int],
     devices=None,
-    device_indexes: list[int] = None,
+    device_indexes: list[int] | None = None,
     num_slices: int = 1,
     allow_split_physical_axes: bool = True,
     use_explicit_sharding: bool = True,
@@ -65,7 +65,9 @@ def create_device_mesh(
     return mesh
 
 
-def fill_unspecified_parallelism(parallelism: Sequence[int], num_devices: int) -> Sequence[int]:
+def fill_unspecified_parallelism(
+    parallelism: MutableSequence[int], num_devices: int
+) -> MutableSequence[int]:
     if -1 not in parallelism:
         return parallelism
 
@@ -73,7 +75,7 @@ def fill_unspecified_parallelism(parallelism: Sequence[int], num_devices: int) -
     unspecified_axis_idx = parallelism.index(-1)
     determined_val = num_devices / np.prod(parallelism) * -1
     assert (
-        determined_val >= 1 and determined_val.is_integer
+        determined_val >= 1 and determined_val.is_integer()
     ), "Unspecified value unable to be determined with the given parallelism values"
     parallelism[unspecified_axis_idx] = int(determined_val)
     return parallelism

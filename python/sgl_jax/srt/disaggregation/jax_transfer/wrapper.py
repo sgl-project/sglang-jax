@@ -16,10 +16,8 @@ The wrapper does NOT lock to a specific JAX version. The contract tests
 in ``test_jax_transfer_wrapper`` will fail loudly if a future JAX
 release breaks any of the above assumptions.
 
-Multi-peer note: the RFC sketch lists ``pull(uuid, spec)`` only, but a
-process-level wrapper that fans out to multiple peers needs to know
-*which* peer to pull from. We extend the signature with an explicit
-``remote_addr`` argument and cache one ``link`` per remote.
+``pull()`` takes an explicit ``remote_addr`` and caches one ``link`` per
+remote peer.
 """
 
 from __future__ import annotations
@@ -42,14 +40,8 @@ def _uuid_to_int(uuid: str) -> int:
     """Stable mapping from a public ``str`` uuid to the 32-bit int that the
     underlying JAX transfer API expects. ``zlib.crc32`` is deterministic
     across processes and Python versions, which is what we need for
-    cross-pod pull/register pairing.
-
-    32 bits gives a birthday-bound collision risk at roughly 65k
-    concurrent uuids. That is acceptable for a bounded number of
-    in-flight transfers, but a wider hash would reduce the risk further.
-    The :py:meth:`JaxTransferWrapper.register_pull` duplicate check
-    catches repeated string uuids, but it cannot detect a ``crc32``
-    collision between two distinct strings.
+    cross-pod pull/register pairing. 32-bit collision risk is acceptable
+    for the bounded number of in-flight transfers.
     """
 
     return zlib.crc32(uuid.encode("utf-8")) & 0xFFFFFFFF
@@ -76,7 +68,11 @@ class JaxTransferWrapper:
         # ``_pending`` is mutated from ``register_pull`` and from the
         # side-channel ack path, so access is serialized with a lock.
         self._pending_lock = threading.Lock()
-        self._pending: dict[str, jax.Array] = {}
+        self._pending: dict[str, Any] = {}
+        # ``_links`` is created and used only on the background pull worker
+        # thread (lazy connect inside ``pull``). The lock is kept as a cheap
+        # guard in case a future caller pulls from another thread.
+        self._links_lock = threading.Lock()
         self._links: dict[str, Any] = {}
 
     @property
@@ -133,8 +129,13 @@ class JaxTransferWrapper:
             )
         return self._server
 
-    def register_pull(self, uuid: str, data: jax.Array) -> None:
+    def register_pull(self, uuid: str, data: Any) -> None:
         """Register ``data`` for a future remote pull keyed by ``uuid``.
+
+        ``data`` may be a single ``jax.Array`` or any pytree of arrays
+        (e.g. a per-layer ``list`` of KV buffers). The underlying
+        ``await_pull`` flattens/unflattens internally, so the pytree is
+        passed through unchanged.
 
         Non-blocking: returns as soon as the underlying API has registered
         the buffer. Caller must keep ``data`` alive (the wrapper holds a
@@ -179,29 +180,34 @@ class JaxTransferWrapper:
                 PD_TRANSFER_BYTES_TOTAL,
             )
 
-            PD_TRANSFER_BYTES_TOTAL.labels(direction="net", role="prefill").inc(int(data.nbytes))
+            PD_TRANSFER_BYTES_TOTAL.labels(direction="net", role="prefill").inc(
+                int(sum(int(leaf.nbytes) for leaf in jax.tree.leaves(data)))
+            )
         except Exception:  # noqa: BLE001
             pass
 
     def pull(
         self,
         uuid: str,
-        spec: jax.ShapeDtypeStruct,
+        spec: Any,
         remote_addr: str | None = None,
-    ) -> jax.Array:
+    ) -> Any:
         """Pull a previously registered buffer from ``remote_addr``.
 
-        ``spec.sharding`` MUST be set; the underlying JAX transfer API
-        requires it and would otherwise fail deep inside with a
-        ``NoneType has no attribute 'device_set'`` error.
+        ``spec`` may be a single ``jax.ShapeDtypeStruct`` or any pytree of
+        them (e.g. a per-layer ``list``). Every leaf's ``sharding`` MUST be
+        set; the underlying JAX transfer API requires it and would
+        otherwise fail deep inside with a ``NoneType has no attribute
+        'device_set'`` error.
         """
 
-        if spec.sharding is None:
-            raise ValueError(
-                "JaxTransferWrapper.pull requires spec.sharding; "
-                "jax.experimental.transfer needs an explicit sharding "
-                "for every ShapeDtypeStruct."
-            )
+        for leaf in jax.tree.leaves(spec):
+            if getattr(leaf, "sharding", None) is None:
+                raise ValueError(
+                    "JaxTransferWrapper.pull requires sharding on every leaf; "
+                    "jax.experimental.transfer needs an explicit sharding "
+                    "for every ShapeDtypeStruct."
+                )
         if not self._started:
             raise RuntimeError("JaxTransferWrapper.start() must be called before pull()")
         if remote_addr is None:
@@ -210,7 +216,7 @@ class JaxTransferWrapper:
                 "process-level wrapper supports multiple peers."
             )
         link = self._connect(remote_addr)
-        return link.pull(_uuid_to_int(uuid), [spec])[0]
+        return link.pull(_uuid_to_int(uuid), spec)
 
     def release(self, uuid: str) -> None:
         """Drop the wrapper's reference to a previously registered buffer.
@@ -227,11 +233,12 @@ class JaxTransferWrapper:
             self._pending.pop(uuid, None)
 
     def _connect(self, remote_addr: str) -> Any:
-        if remote_addr in self._links:
-            return self._links[remote_addr]
-        link = self._server.connect(remote_addr)
-        self._links[remote_addr] = link
-        return link
+        with self._links_lock:
+            if remote_addr in self._links:
+                return self._links[remote_addr]
+            link = self._server.connect(remote_addr)
+            self._links[remote_addr] = link
+            return link
 
 
 def get_or_create_wrapper(

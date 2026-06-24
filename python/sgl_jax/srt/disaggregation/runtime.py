@@ -24,22 +24,35 @@ def install_disaggregation_wiring(scheduler: Scheduler, server_args: ServerArgs)
     if server_args.dp_size > 1:
         raise RuntimeError(
             f"PD disaggregation does not yet support dp_size>1 "
-            f"(got dp_size={server_args.dp_size}). This will be "
-            f"supported in a future PR."
+            f"(got dp_size={server_args.dp_size})."
         )
     if server_args.disaggregation_bootstrap_url is None:
         raise RuntimeError("disaggregation_mode != null requires bootstrap_url")
+
+    import jax
+
+    if jax.process_count() > 1 and server_args.disaggregation_enable_d2h:
+        raise RuntimeError(
+            "PD D2H host staging (--disaggregation-enable-d2h) is single-host "
+            "only. The host KV pool is built on the global kv_pool mesh, but "
+            "multi-host prefill extracts a local-mesh shard, so copy_from_device "
+            "would reshard-fail. Run multi-host without d2h (path B: direct HBM "
+            "transfer)."
+        )
 
     from sgl_jax.srt.disaggregation.bootstrap import (
         BootstrapClient,
         BootstrapServer,
         HeartbeatDaemon,
+        PrefillInfoCache,
+        resolve_kv_dtype_name,
     )
     from sgl_jax.srt.disaggregation.common.zmq_notifier import ZmqPullNotifier
     from sgl_jax.srt.disaggregation.decode import (
         DecodePreallocQueue,
         DecodeTransferQueue,
     )
+    from sgl_jax.srt.disaggregation.decode_watchdog import EventLoopWatchdog
     from sgl_jax.srt.disaggregation.host_ip import resolve_host_ip
     from sgl_jax.srt.disaggregation.jax_transfer.conn import JaxTransferKVManager
     from sgl_jax.srt.disaggregation.jax_transfer.wrapper import get_or_create_wrapper
@@ -78,23 +91,57 @@ def install_disaggregation_wiring(scheduler: Scheduler, server_args: ServerArgs)
         shared_secret=shared_secret,
     )
     notifier.start()
+    host_pool = None
+    if server_args.disaggregation_enable_d2h and mode == "prefill":
+        from sgl_jax.srt.disaggregation.prefill import (
+            _KV_GATHER_PAGE_BUCKETS,
+            _pad_to_page_bucket,
+        )
+        from sgl_jax.srt.mem_cache.host_kv_pool import QueueHostKVPool
+
+        kv_pool = scheduler.token_to_kv_pool_allocator.get_kvcache()
+        per_layer_shape = tuple(int(d) for d in kv_pool.kv_buffer[0].shape[1:])
+        # Size each host buffer to the largest single-request KV that can be
+        # staged. A buffer must hold one request's padded pages; the cap is the
+        # D2H max-token setting when given, else the device KV budget (no single
+        # request can exceed max_total_num_tokens). Round up via the same bucket
+        # logic as gather so copy_from_device never rejects an admissible req.
+        d2h_max_tokens = server_args.disaggregation_d2h_max_tokens
+        if d2h_max_tokens is None:
+            d2h_max_tokens = scheduler.max_total_num_tokens
+        page_size = server_args.page_size
+        max_request_pages = (d2h_max_tokens + page_size - 1) // page_size
+        max_padded_pages = max(_pad_to_page_bucket(max_request_pages), _KV_GATHER_PAGE_BUCKETS[-1])
+        host_pool = QueueHostKVPool(
+            pool_size=server_args.disaggregation_d2h_pool_size,
+            max_padded_pages=max_padded_pages,
+            layer_num=kv_pool.layer_num,
+            per_layer_shape=per_layer_shape,
+            dtype=kv_pool.dtype,
+            mesh=kv_pool.mesh,
+            partition_spec=kv_pool.kv_sharding.spec,
+            pool_name="pd_prefill",
+        )
+        logger.info(
+            "D2H host pool wired: pool_size=%d max_padded_pages=%d layer_num=%d "
+            "per_layer_shape=%s",
+            server_args.disaggregation_d2h_pool_size,
+            max_padded_pages,
+            kv_pool.layer_num,
+            per_layer_shape,
+        )
+
     scheduler.disagg_kv_manager = JaxTransferKVManager(
         wrapper,
         notifier,
-        host_pool=None,
+        host_pool=host_pool,
         ack_timeout_seconds=server_args.disaggregation_ack_timeout_seconds,
         pull_timeout_seconds=server_args.disaggregation_pull_timeout_seconds,
         reaper_interval_seconds=(server_args.disaggregation_orphan_reaper_interval_seconds),
+        pull_worker_count=server_args.disaggregation_channel_number,
     )
     scheduler.disagg_kv_manager.start_reaper()
     scheduler.disagg_use_d2h_staging = server_args.disaggregation_enable_d2h
-    if scheduler.disagg_use_d2h_staging:
-        raise RuntimeError(
-            "--disaggregation-enable-d2h=true requires a wired "
-            "QueueHostKVPool on the JaxTransferKVManager. Currently "
-            "host_pool=None, so producer_handoff() would crash. "
-            "Run with --no-disaggregation-enable-d2h."
-        )
 
     scheduler.disagg_bootstrap_client = BootstrapClient(
         server_args.disaggregation_bootstrap_url,
@@ -107,6 +154,7 @@ def install_disaggregation_wiring(scheduler: Scheduler, server_args: ServerArgs)
 
         scheduler.disagg_prefill_queue = PrefillBootstrapQueue()
         bootstrap_key = f"{local_host}:{transfer_port}"
+        prefill_kv_pool = scheduler.token_to_kv_pool_allocator.get_kvcache()
         scheduler.disagg_bootstrap_client.register_prefill(
             bootstrap_key=bootstrap_key,
             host=local_host,
@@ -117,6 +165,8 @@ def install_disaggregation_wiring(scheduler: Scheduler, server_args: ServerArgs)
             system_dp_rank=0,
             jax_process_index=jax.process_index(),
             jax_process_count=jax.process_count(),
+            page_size=server_args.page_size,
+            kv_dtype=resolve_kv_dtype_name(prefill_kv_pool.dtype),
         )
         scheduler.disagg_heartbeat = HeartbeatDaemon(
             scheduler.disagg_bootstrap_client, bootstrap_key
@@ -124,8 +174,13 @@ def install_disaggregation_wiring(scheduler: Scheduler, server_args: ServerArgs)
         scheduler.disagg_heartbeat.start()
         scheduler.disagg_bootstrap_key = bootstrap_key
     else:
+        scheduler.disagg_prefill_info_cache = PrefillInfoCache(scheduler.disagg_bootstrap_client)
         scheduler.disagg_prealloc_queue = DecodePreallocQueue()
         scheduler.disagg_transfer_queue = DecodeTransferQueue()
+        scheduler.disagg_decode_watchdog = EventLoopWatchdog(
+            stall_threshold_s=server_args.disaggregation_decode_watchdog_seconds,
+            snapshot_provider=scheduler._decode_backlog_snapshot,
+        )
 
     scheduler.disagg_shutdown = _make_disagg_shutdown(scheduler, mode)
     try:
@@ -178,5 +233,8 @@ def _make_disagg_shutdown(scheduler: Scheduler, mode: str):
             )
         with suppress(Exception):
             scheduler.disagg_kv_manager.zmq_notifier.stop()
+        if scheduler.disagg_decode_watchdog is not None:
+            with suppress(Exception):
+                scheduler.disagg_decode_watchdog.stop()
 
     return _shutdown
