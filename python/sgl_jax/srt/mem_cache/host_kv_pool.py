@@ -329,6 +329,9 @@ class LRUHostKVPool(HostKVPool):
         self._free_ids: list[int] = list(range(pool_size))
         self._slots: list[jax.Array | None] = [None] * pool_size
         self._lock_ref: list[int] = [0] * pool_size
+        # Allocated-state mirror of the free-list (O(1) membership for the
+        # page-id boundary checks below; a bare ``in self._free_ids`` is O(n)).
+        self._allocated: list[bool] = [False] * pool_size
         self._peak_used = 0
         self._exhaust_count = 0
         self._last_exhaust_log = 0.0
@@ -366,6 +369,7 @@ class LRUHostKVPool(HostKVPool):
                     )
                 return None
             buffer_id = self._free_ids.pop(0)
+            self._allocated[buffer_id] = True
             used = self._pool_size - len(self._free_ids)
             if used > self._peak_used:
                 self._peak_used = used
@@ -374,9 +378,7 @@ class LRUHostKVPool(HostKVPool):
     def release(self, buffer_id: int) -> None:
         with self._lock:
             if not (0 <= buffer_id < self._pool_size):
-                raise ValueError(
-                    f"buffer_id={buffer_id} outside pool range [0, {self._pool_size})"
-                )
+                raise ValueError(f"buffer_id={buffer_id} outside pool range [0, {self._pool_size})")
             if buffer_id in self._free_ids:
                 raise RuntimeError(f"double free of buffer_id={buffer_id}")
             if self._lock_ref[buffer_id] != 0:
@@ -386,6 +388,7 @@ class LRUHostKVPool(HostKVPool):
                 )
             self._drop_pending(buffer_id)
             self._slots[buffer_id] = None
+            self._allocated[buffer_id] = False
             self._free_ids.append(buffer_id)
 
     # Page-batch alloc/free: the batched, page-addressed counterparts of
@@ -418,6 +421,8 @@ class LRUHostKVPool(HostKVPool):
                     )
                 return None
             pages = [self._free_ids.pop(0) for _ in range(need_pages)]
+            for pid in pages:
+                self._allocated[pid] = True
             used = self._pool_size - len(self._free_ids)
             if used > self._peak_used:
                 self._peak_used = used
@@ -436,9 +441,7 @@ class LRUHostKVPool(HostKVPool):
         with self._lock:
             for pid in unique:
                 if not (0 <= pid < self._pool_size):
-                    raise ValueError(
-                        f"page id={pid} outside pool range [0, {self._pool_size})"
-                    )
+                    raise ValueError(f"page id={pid} outside pool range [0, {self._pool_size})")
                 if pid in self._free_ids:
                     raise RuntimeError(f"double free of page id={pid}")
                 if self._lock_ref[pid] != 0:
@@ -447,11 +450,10 @@ class LRUHostKVPool(HostKVPool):
                     )
                 self._drop_pending(pid)
                 self._slots[pid] = None
+                self._allocated[pid] = False
                 self._free_ids.append(pid)
 
-    def stage_backup(
-        self, device_indices: list[int], host_buffer_ids: list[int]
-    ) -> None:
+    def stage_backup(self, device_indices: list[int], host_buffer_ids: list[int]) -> None:
         """D2H phase 1: gather live device pages into per-buffer staging arrays.
 
         Sync + on the KV-owning thread: the forward donates ``kv_buffer`` every
@@ -467,10 +469,8 @@ class LRUHostKVPool(HostKVPool):
         if not host_buffer_ids:
             return
         for buffer_id in host_buffer_ids:
-            if not (0 <= buffer_id < self._pool_size):
-                raise ValueError(
-                    f"buffer_id={buffer_id} outside pool range [0, {self._pool_size})"
-                )
+            self._require_allocated(buffer_id)
+        self._require_device_pages(device_indices)
         buffers = self._device_pool.kv_buffer
         n = len(device_indices)
         # Bucket the page count so each layer's gather compiles once per bucket
@@ -479,18 +479,12 @@ class LRUHostKVPool(HostKVPool):
         n_b = self._pad_to_page_bucket(n)
         dev_idx_np = np.asarray(device_indices, dtype=np.int32)
         if n_b > n:
-            dev_idx_np = np.concatenate(
-                [dev_idx_np, np.zeros(n_b - n, dtype=dev_idx_np.dtype)]
-            )
-        page_indices = jax.device_put(
-            dev_idx_np, NamedSharding(self._mesh, PartitionSpec(None))
-        )
+            dev_idx_np = np.concatenate([dev_idx_np, np.zeros(n_b - n, dtype=dev_idx_np.dtype)])
+        page_indices = jax.device_put(dev_idx_np, NamedSharding(self._mesh, PartitionSpec(None)))
         # One batched gather per layer (page axis back); keep the per-layer loop
         # so peak HBM stays at one layer's bucket (PD caps it this way too).
         per_layer = [
-            self._jit_gather_one_layer(
-                buffers[layer], page_indices, self._batched_layer_sharding
-            )
+            self._jit_gather_one_layer(buffers[layer], page_indices, self._batched_layer_sharding)
             for layer in range(self._layer_num)
         ]
         packed = jnp.stack(per_layer, axis=0)  # (layer_num, n_b, *per_layer_shape)
@@ -514,6 +508,7 @@ class LRUHostKVPool(HostKVPool):
         # array, which has no CPU implementation.
         staged: list[jax.Array] = []
         for buffer_id in host_buffer_ids:
+            self._require_allocated(buffer_id)
             with self._pending_lock:
                 packed = self._pending_gather.pop(buffer_id, None)
             if packed is None:
@@ -557,10 +552,7 @@ class LRUHostKVPool(HostKVPool):
         staged: list[jax.Array] = []
         loaded: dict[int, jax.Array] = {}
         for buffer_id in host_buffer_ids:
-            if not (0 <= buffer_id < self._pool_size):
-                raise ValueError(
-                    f"buffer_id={buffer_id} outside pool range [0, {self._pool_size})"
-                )
+            self._require_allocated(buffer_id)
             slot = self._slots[buffer_id]
             if slot is None:
                 raise RuntimeError(f"stage_load from empty buffer_id={buffer_id}")
@@ -587,11 +579,13 @@ class LRUHostKVPool(HostKVPool):
             )
         if not host_buffer_ids:
             return
+        self._require_device_pages(device_indices)
         from sgl_jax.srt.mem_cache.memory_pool import write_kv_layer
 
         PS = self._page_size
         staged_pages: list[jax.Array] = []
         for buffer_id in host_buffer_ids:
+            self._require_allocated(buffer_id)
             with self._pending_load_lock:
                 packed = self._pending_load.pop(buffer_id, None)
             if packed is None:
@@ -616,9 +610,7 @@ class LRUHostKVPool(HostKVPool):
         dev_pages = np.asarray(device_indices, dtype=np.int64)
         loc_np = (dev_pages[:, None] * PS + np.arange(PS, dtype=np.int64)).reshape(-1)
         if n_b > n:
-            loc_np = np.concatenate(
-                [loc_np, -np.ones((n_b - n) * PS, dtype=loc_np.dtype)]
-            )
+            loc_np = np.concatenate([loc_np, -np.ones((n_b - n) * PS, dtype=loc_np.dtype)])
         dp = self._device_pool
         loc = jax.device_put(
             jnp.asarray(loc_np, dtype=jnp.int32),
@@ -736,9 +728,7 @@ class LRUHostKVPool(HostKVPool):
         # copy_into so no jax.Array crosses the boundary). Present so the class
         # is not abstract and so a non-retaining caller could still borrow.
         if not (0 <= buffer_id < self._pool_size):
-            raise ValueError(
-                f"buffer_id={buffer_id} outside pool range [0, {self._pool_size})"
-            )
+            raise ValueError(f"buffer_id={buffer_id} outside pool range [0, {self._pool_size})")
         if len(layers) != self._layer_num:
             raise ValueError(f"expected {self._layer_num} layers, got {len(layers)}")
         packed = jnp.stack(list(layers), axis=0)
@@ -762,20 +752,33 @@ class LRUHostKVPool(HostKVPool):
         with self._pending_load_lock:
             self._pending_load.pop(buffer_id, None)
 
+    def _require_allocated(self, buffer_id: int) -> None:
+        # Page-id boundary invariant: an id handed to a transfer/lock op must be
+        # currently allocated. A free-list id would otherwise get _slots/_lock_ref
+        # written while still claimable by the next alloc() -> double ownership.
+        if not (0 <= buffer_id < self._pool_size):
+            raise ValueError(f"buffer_id={buffer_id} outside pool range [0, {self._pool_size})")
+        if not self._allocated[buffer_id]:
+            raise RuntimeError(f"buffer_id={buffer_id} is not allocated (in free-list)")
+
+    def _require_device_pages(self, device_indices) -> None:
+        # Reject out-of-range device page ids: a negative id would wrap (JAX
+        # negative indexing on D2H gather) or expand to negative loc on H2D
+        # (only -1 is treated as padding by the kernel; other negatives become
+        # real DMA targets and corrupt pages).
+        n_dev = int(self._device_pool.size) // self._page_size
+        for idx in device_indices:
+            if not (0 <= int(idx) < n_dev):
+                raise ValueError(f"device page id={idx} outside range [0, {n_dev})")
+
     def inc_lock_ref(self, buffer_id: int) -> None:
         with self._lock:
-            if not (0 <= buffer_id < self._pool_size):
-                raise ValueError(
-                    f"buffer_id={buffer_id} outside pool range [0, {self._pool_size})"
-                )
+            self._require_allocated(buffer_id)
             self._lock_ref[buffer_id] += 1
 
     def dec_lock_ref(self, buffer_id: int) -> None:
         with self._lock:
-            if not (0 <= buffer_id < self._pool_size):
-                raise ValueError(
-                    f"buffer_id={buffer_id} outside pool range [0, {self._pool_size})"
-                )
+            self._require_allocated(buffer_id)
             if self._lock_ref[buffer_id] <= 0:
                 raise RuntimeError(f"dec_lock_ref underflow on buffer_id={buffer_id}")
             self._lock_ref[buffer_id] -= 1

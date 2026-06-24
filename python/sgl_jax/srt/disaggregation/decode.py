@@ -15,12 +15,12 @@ from jax.sharding import NamedSharding, PartitionSpec
 
 from sgl_jax.srt.disaggregation.base.kv_manager import KVPoll
 from sgl_jax.srt.disaggregation.bootstrap import BootstrapClient, PrefillInfoCache
-from sgl_jax.srt.mem_cache.memory_pool import write_kv_layer
 from sgl_jax.srt.disaggregation.jax_transfer.conn import (
     JaxTransferKVManager,
     JaxTransferKVReceiver,
     PMetadata,
 )
+from sgl_jax.srt.mem_cache.memory_pool import write_kv_layer
 
 if TYPE_CHECKING:
     from sgl_jax.srt.managers.schedule_batch import Req

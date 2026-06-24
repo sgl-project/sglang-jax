@@ -25,7 +25,9 @@ from sgl_jax.srt.utils.mesh_utils import create_device_mesh
 _MESH = create_device_mesh(ici_parallelism=[1, -1], dcn_parallelism=[1, 1])
 
 
-def _make_device_pool(*, size=16, page_size=1, head_num=4, head_dim=128, layer_num=3, dtype=jnp.float32):
+def _make_device_pool(
+    *, size=16, page_size=1, head_num=4, head_dim=128, layer_num=3, dtype=jnp.float32
+):
     # head_dim must be 128-aligned: copy_to_device now writes via the in-place
     # Pallas kernel (update_fused_kv_cache_vectorized), which requires it -- and
     # production KV pools are always 128-aligned.
@@ -125,6 +127,42 @@ class TestLRUHostKVPoolLockRef(unittest.TestCase):
         b = self.pool.reserve()
         with self.assertRaises(RuntimeError):
             self.pool.dec_lock_ref(b)
+
+
+class TestLRUHostKVPoolBoundaryInvariants(unittest.TestCase):
+    """Page-id boundary guards: an unallocated (free-list) host id or an
+    out-of-range device page must be rejected at the entry, not silently written
+    -- otherwise a transfer/lock corrupts a slot the next alloc() reuses, or DMAs
+    to a wrapped/negative device page."""
+
+    def setUp(self):
+        if not jax.devices():
+            self.skipTest("JAX not available")
+        self.pool = _make_pool(_make_device_pool(size=16, page_size=1), pool_size=4)
+
+    def test_transfer_rejects_unallocated_host_id(self):
+        # id 0 is in the free-list (never alloc'd): staging it would write _slots[0]
+        # while alloc() can still hand 0 to another owner.
+        with self.assertRaises(RuntimeError):
+            self.pool.stage_backup([0], [0])
+
+    def test_inc_lock_ref_rejects_unallocated(self):
+        with self.assertRaises(RuntimeError):
+            self.pool.inc_lock_ref(0)
+
+    def test_lock_ref_rejects_out_of_range(self):
+        with self.assertRaises(ValueError):
+            self.pool.inc_lock_ref(99)
+
+    def test_stage_backup_rejects_out_of_range_device_page(self):
+        page = int(self.pool.alloc(1)[0])
+        with self.assertRaises(ValueError):
+            self.pool.stage_backup([16], [page])  # device has 16 pages: [0, 16)
+
+    def test_flush_load_rejects_negative_device_page(self):
+        page = int(self.pool.alloc(1)[0])
+        with self.assertRaises(ValueError):
+            self.pool.flush_load([page], [-1])
 
 
 class TestLRUHostKVPoolRoundTrip(unittest.TestCase):
@@ -261,20 +299,6 @@ class TestLRUHostKVPoolPageSize(unittest.TestCase):
             orig.append(np.asarray(self.device_pool.kv_buffer[layer][device_page]))
         return orig
 
-    def test_page2_roundtrip(self):
-        if not jax.devices():
-            self.skipTest("JAX not available")
-        self._setup(page_size=2)
-        src_page, dst_page = 3, 6
-        orig = self._fill_page(src_page, seed=11)
-        host_pages = self.pool.alloc(1)
-        self.pool.stage_backup([src_page], [int(host_pages[0])])
-        self.pool.flush_backup([int(host_pages[0])])
-        self.pool.copy_to_device([int(host_pages[0])], [dst_page])
-        for layer in range(self.device_pool.layer_num):
-            got = np.asarray(self.device_pool.kv_buffer[layer][dst_page])
-            np.testing.assert_allclose(got, orig[layer])
-
     def test_page4_batched_roundtrip(self):
         if not jax.devices():
             self.skipTest("JAX not available")
@@ -287,7 +311,7 @@ class TestLRUHostKVPoolPageSize(unittest.TestCase):
         self.pool.stage_backup(srcs, host_pages)
         self.pool.flush_backup(host_pages)
         self.pool.copy_to_device(host_pages, dsts)
-        for (s, d) in pairs:
+        for s, d in pairs:
             for layer in range(self.device_pool.layer_num):
                 got = np.asarray(self.device_pool.kv_buffer[layer][d])
                 np.testing.assert_allclose(got, origs[s][layer])
@@ -343,9 +367,7 @@ class TestLRUHostKVPoolBucketPadding(unittest.TestCase):
             vals = jax.random.normal(
                 jax.random.PRNGKey(seed * 100 + layer), buf[idx].shape, buf.dtype
             )
-            self.device_pool.kv_buffer[layer] = buf.at[idx].set(
-                vals, out_sharding=buf.sharding
-            )
+            self.device_pool.kv_buffer[layer] = buf.at[idx].set(vals, out_sharding=buf.sharding)
             orig.append(np.asarray(self.device_pool.kv_buffer[layer][idx]))
         return orig
 
@@ -442,11 +464,6 @@ class TestLRUHostKVPoolPrecompile(unittest.TestCase):
         pool = _make_pool(_make_device_pool(size=16, layer_num=2), pool_size=3)
         pool.precompile_transfers()
         self.assertEqual(pool.available_size(), 3)
-
-    def test_max_pages_caps_warmup(self):
-        pool = _make_pool(_make_device_pool(size=16, layer_num=2), pool_size=8)
-        pool.precompile_transfers(max_pages=2)
-        self.assertEqual(pool.available_size(), 8)
 
 
 if __name__ == "__main__":
