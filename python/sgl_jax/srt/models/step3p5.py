@@ -70,6 +70,16 @@ class Step3p5Attention(nnx.Module):
             self.num_heads = config.num_attention_heads
             self.num_kv_heads = config.num_attention_groups
 
+        # TP kv-head replication: when tensor parallelism exceeds the kv-head count,
+        # replicate kv heads so each tensor shard holds >=1 head (mirrors
+        # MiniMaxM2Attention). On tp=1 (CPU / naive) replicas=1, so num_kv_heads is
+        # unchanged and the naive GQA grouping is unaffected.
+        tp = mesh.shape.get("tensor", 1)
+        replicas = (
+            (tp + self.num_kv_heads - 1) // self.num_kv_heads if tp > self.num_kv_heads else 1
+        )
+        self.num_kv_heads = self.num_kv_heads * replicas
+
         self.q_size = self.num_heads * _HEAD_DIM
         self.kv_size = self.num_kv_heads * _HEAD_DIM
         self.scaling = _HEAD_DIM**-0.5
@@ -245,15 +255,20 @@ class Step3p5Attention(nnx.Module):
         k, _ = self.k_proj(hidden_states)
         v, _ = self.v_proj(hidden_states)
 
-        q = q.reshape(-1, self.num_heads, _HEAD_DIM)
-        k = k.reshape(-1, self.num_kv_heads, _HEAD_DIM)
+        # Reshape to heads. out_sharding is required under JAX 0.8 sharding-in-types:
+        # the proj output's last dim is sharded on "tensor", and JAX cannot infer the
+        # post-reshape sharding (mirrors qwen3/minimax_m2). The head dim carries the
+        # tensor sharding; kv heads are already replicated to >= tp (see __init__).
+        _head_sharding = NamedSharding(self.mesh, P("data", "tensor", None))
+        q = q.reshape(-1, self.num_heads, _HEAD_DIM, out_sharding=_head_sharding)
+        k = k.reshape(-1, self.num_kv_heads, _HEAD_DIM, out_sharding=_head_sharding)
 
         # QK-norm before RoPE.
         q = self.q_norm(q)
         k = self.k_norm(k)
         q, k = self.rotary_emb(positions, q, k)
 
-        v = v.reshape(-1, self.num_kv_heads, _HEAD_DIM)
+        v = v.reshape(-1, self.num_kv_heads, _HEAD_DIM, out_sharding=_head_sharding)
 
         if self.attn_impl == "naive":
             attn_output = self._naive_attention(q, k, v)
