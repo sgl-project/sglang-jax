@@ -447,11 +447,15 @@ suites = {
             8,
             ["TestUnifiedRadixCacheServing"],
         ),
+        # Step 3.5 serving self-consistency (microscale dummy weights, single chip).
+        TestFile("test/srt/test_step3p5_serving_e2e.py", 3, runner="pytest"),
     ],
     "e2e-test-tpu-v6e-4": [
         TestFile("test/srt/openai_server/basic/test_tool_calls.py", 2),
         TestFile("test/srt/test_features.py", 3),
         TestFile("test/srt/test_chunked_prefill_size.py", 2),
+        # Step 3.5 tp/dp invariance (microscale dummy weights, multi-chip).
+        TestFile("test/srt/test_step3p5_tp_dp.py", 3, runner="pytest"),
         # TestFile("test/srt/test_sliding_window_attention.py", 30), # add after gpt-oss supported
         TestFile("test/srt/test_logprobs_dp.py", 3),
         TestFile("test/srt/test_model_loader.py", 1),
