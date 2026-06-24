@@ -284,6 +284,7 @@ class MultimodalInputs:
 
     # List of data items
     mm_items: list[MultimodalDataItem]
+    input_ids: list[int] | None = None
     image_pad_len: list | None = None
     num_image_tokens: int | None = None
 

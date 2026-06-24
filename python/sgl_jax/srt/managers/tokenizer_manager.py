@@ -30,7 +30,11 @@ import zmq.asyncio
 from fastapi import BackgroundTasks
 
 from sgl_jax.srt.configs.model_config import ModelConfig
-from sgl_jax.srt.hf_transformers_utils import get_tokenizer
+from sgl_jax.srt.hf_transformers_utils import (
+    get_processor,
+    get_tokenizer,
+    get_tokenizer_from_processor,
+)
 from sgl_jax.srt.lora.lora_registry import LoRARegistry
 from sgl_jax.srt.managers.io_struct import (
     AbortReq,
@@ -61,6 +65,10 @@ from sgl_jax.srt.managers.io_struct import (
     SetInternalStateReqOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
+)
+from sgl_jax.srt.multimodal.manager.multimodal_processor import (
+    get_mm_processor_cls,
+    import_processors,
 )
 from sgl_jax.srt.multimodal.tokenizer_utils import resolve_tokenizer_subdir
 from sgl_jax.srt.sampling.sampling_params import SamplingParams
@@ -161,24 +169,53 @@ class TokenizerManager:
         self._cond = asyncio.Condition()
 
         self.mm_processor = None
+        self.processor = None
 
         if server_args.skip_tokenizer_init:
-            self.tokenizer = self.processor = None
+            self.tokenizer = None
         else:
             tokenizer_subdir = ""
             if server_args.multimodal:
                 tokenizer_subdir = resolve_tokenizer_subdir(
                     server_args.model_path, server_args.tokenizer_path
                 )
-            self.tokenizer = get_tokenizer(
-                server_args.tokenizer_path,
-                tokenizer_mode=server_args.tokenizer_mode,
-                trust_remote_code=server_args.trust_remote_code,
-                revision=server_args.revision,
-                tokenizer_backend=server_args.tokenizer_backend,
-                sub_dir=tokenizer_subdir,
-                download_dir=server_args.download_dir,
-            )
+
+            if self.model_config is not None and self.model_config.is_multimodal:
+                import_processors("sgl_jax.srt.multimodal.processors")
+                mm_processor_cls = get_mm_processor_cls(self.model_config.hf_config)
+            else:
+                mm_processor_cls = None
+
+            if mm_processor_cls is not None:
+                tokenizer_path = server_args.tokenizer_path
+                if tokenizer_subdir:
+                    tokenizer_path = os.path.join(tokenizer_path, tokenizer_subdir)
+                self.processor = get_processor(
+                    tokenizer_path,
+                    tokenizer_mode=server_args.tokenizer_mode,
+                    trust_remote_code=server_args.trust_remote_code,
+                    revision=server_args.revision,
+                )
+                self.mm_processor = mm_processor_cls(
+                    self.model_config.hf_config, server_args, self.processor
+                )
+                self.tokenizer = get_tokenizer_from_processor(self.processor)
+            else:
+                if self.model_config is not None and self.model_config.is_multimodal:
+                    logger.info(
+                        "No SGL-JAX multimodal processor registered for architectures %s; "
+                        "falling back to text tokenizer.",
+                        self.model_config.hf_config.architectures,
+                    )
+                self.tokenizer = get_tokenizer(
+                    server_args.tokenizer_path,
+                    tokenizer_mode=server_args.tokenizer_mode,
+                    trust_remote_code=server_args.trust_remote_code,
+                    revision=server_args.revision,
+                    tokenizer_backend=server_args.tokenizer_backend,
+                    sub_dir=tokenizer_subdir,
+                    download_dir=server_args.download_dir,
+                )
 
         # Store states
         self.no_create_loop = False
@@ -299,7 +336,27 @@ class TokenizerManager:
         # Tokenize
         input_text = obj.text
         input_ids = obj.input_ids
-        if input_ids is None and input_text is not None:
+        mm_inputs = None
+        if isinstance(obj, GenerateReqInput) and obj.contains_mm_input():
+            if self.mm_processor is None:
+                raise ValueError(
+                    "Multimodal input was provided, but the model has no multimodal processor."
+                )
+            if obj.video_data is not None or obj.audio_data is not None:
+                raise ValueError(
+                    "Only image input is supported by the current multimodal processor."
+                )
+            self._validate_mm_limits(obj)
+            mm_inputs = await self.mm_processor.process_mm_data_async(
+                image_data=obj.image_data,
+                input_text=input_text or input_ids,
+                request_obj=obj,
+            )
+            if mm_inputs is None:
+                raise ValueError("The multimodal processor produced no output.")
+            if mm_inputs.input_ids is not None:
+                input_ids = mm_inputs.input_ids
+        elif input_ids is None and input_text is not None:
             if self.tokenizer is None:
                 raise ValueError(
                     "Tokenizer is not initialized but input_text requires tokenization"
@@ -308,7 +365,7 @@ class TokenizerManager:
             input_ids = encoded["input_ids"]
 
         self._validate_one_request(obj, input_ids)
-        return self._create_tokenized_object(obj, input_text, input_ids)
+        return self._create_tokenized_object(obj, input_text, input_ids, mm_inputs)
 
     def _validate_one_request(
         self, obj: GenerateReqInput | EmbeddingReqInput, input_ids: list[int]
@@ -336,6 +393,18 @@ class TokenizerManager:
             )
             raise ValueError(error_msg)
 
+    def _validate_mm_limits(self, obj: GenerateReqInput | EmbeddingReqInput) -> None:
+        if not self.server_args.limit_mm_data_per_request:
+            return
+        for modality, limit in self.server_args.limit_mm_data_per_request.items():
+            data = getattr(obj, f"{modality}_data", None)
+            if data:
+                count = len(data) if isinstance(data, list) else 1
+                if count > limit:
+                    raise ValueError(
+                        f"{modality.capitalize()} count {count} exceeds limit {limit} per request."
+                    )
+
     def _validate_input_ids_in_vocab(self, input_ids: list[int], vocab_size: int) -> None:
         if any(id >= vocab_size for id in input_ids):
             raise ValueError(
@@ -347,6 +416,7 @@ class TokenizerManager:
         obj: GenerateReqInput,
         input_text: str,
         input_ids: list[int],
+        mm_inputs: object | None = None,
     ) -> TokenizedGenerateReqInput:
         """Create a tokenized request object from common parameters."""
         # Parse sampling parameters
@@ -363,19 +433,20 @@ class TokenizerManager:
         # Build return object
 
         tokenized_obj = TokenizedGenerateReqInput(
-            obj.rid,
-            input_text,
-            input_ids,
-            sampling_params,
-            obj.return_logprob,
-            obj.return_output_logprob_only,
-            obj.logprob_start_len,
-            obj.top_logprobs_num,
-            obj.token_ids_logprob,
-            obj.stream,
-            obj.lora_id,
-            obj.extra_key,
-            obj.return_routed_experts,
+            rid=obj.rid,
+            text=input_text,
+            input_ids=input_ids,
+            sampling_params=sampling_params,
+            return_logprob=obj.return_logprob,
+            return_output_logprob_only=obj.return_output_logprob_only,
+            logprob_start_len=obj.logprob_start_len,
+            top_logprobs_num=obj.top_logprobs_num,
+            token_ids_logprob=obj.token_ids_logprob,
+            stream=obj.stream,
+            lora_id=obj.lora_id,
+            extra_key=obj.extra_key,
+            return_routed_experts=obj.return_routed_experts,
+            mm_inputs=mm_inputs,
         )
 
         # PD disaggregation passthrough. When the engine is
