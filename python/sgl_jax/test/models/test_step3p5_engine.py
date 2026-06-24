@@ -357,7 +357,11 @@ def _run_prefill_all_positions(model, mesh, kv_pool, token_ids):
 def _run_decode_step(model, mesh, kv_pool, prefix_len, token_id):
     """Single DECODE step: 1 new token at position prefix_len.
 
-    The KV pool must already contain the prefix (written by the prefill run).
+    The KV pool must already hold positions 0..prefix_len-1 (from the prefix
+    prefill and any prior decode steps). The step reads 0..prefix_len, writes the
+    new token's KV at slot prefix_len, and — because JAX KV writes are functional
+    — persists the returned fused buffer via replace_buffer so the NEXT decode
+    step can read what this step wrote (true autoregressive accumulation).
     Returns logits [1, vocab] for the new position.
     """
     from sgl_jax.srt.layers.logits_processor import LogitsMetadata
@@ -381,7 +385,9 @@ def _run_decode_step(model, mesh, kv_pool, prefix_len, token_id):
 
     with jax.set_mesh(mesh):
         result = model(fb, _Pools(), lm)
-    output, _, _, _ = result
+    output, extras, _, _ = result
+    # Persist this step's KV write so the next decode step reads it.
+    kv_pool.replace_buffer(extras["token_to_kv_pool"])
     return jnp.asarray(output.next_token_logits, dtype=jnp.float32)  # [1, vocab]
 
 
@@ -430,41 +436,43 @@ class TestPrefillDecodeConsistency(unittest.TestCase):
         return model
 
     def test_prefill_equals_decode(self):
-        """Full-prefill logit[k] == incremental-decode logit[k] for k in last DECODE_STEPS.
+        """Full-prefill logit[k] == autoregressive-decode logit[k] for the last DECODE_STEPS.
 
         Protocol:
-          1. Full prefill of T = PREFIX_LEN + DECODE_STEPS tokens in one EXTEND pass →
-             logits_prefill[k] at every position k (via backbone hidden states + lm_head).
-          2. For each decode position k = PREFIX_LEN .. T-1:
-             a. Run DECODE forward on the SAME kv_pool (which already holds the prefix KV
-                from the prefill run) with the token at position k.
-             b. Capture decode logits[k] = next_token_logits.
-          3. Assert per-position argmax AGREES and numeric within _RTOL_ATTN (tighter than
-             _RTOL_LOGITS: flash-vs-flash on same kernel, single reduction-order source).
+          1. Reference: one full EXTEND prefill of T = PREFIX_LEN + DECODE_STEPS tokens
+             on its own pool → logits_prefill[k] at every position k.
+          2. Decode side (SEPARATE pool): prefill ONLY the prefix [0..PREFIX_LEN-1], then
+             run a TRUE autoregressive chain — decode k reads 0..k, writes its KV at slot
+             k, and persists it (replace_buffer) so decode k+1 reads what decode k wrote.
+             This exercises the decode KV-WRITE accumulation, not merely reading
+             pre-written KV; and because the decode pool never holds future-token KV
+             there is no same-page future-token contamination to confound the result.
+          3. Assert per-position argmax AGREES (decision hard gate) and numeric within
+             _RTOL_LOGITS (EXTEND vs DECODE are two flash reduction orders accumulating
+             over L layers + lm_head — the flash-vs-naive logits regime, √(L+1) growth).
         """
         T = _PREFIX_LEN + _DECODE_STEPS
         token_ids = jnp.array(np.random.default_rng(42).integers(0, _VOCAB, T), dtype=jnp.int32)
-        # Shared KV pool — the prefill populates it; decode reads from it.
-        kv_pool = _make_kv_pool(self._cfg, self._mesh, jnp.float32, T)
         model = self._build_and_load()
 
-        prefill_logits = _run_prefill_all_positions(model, self._mesh, kv_pool, token_ids)
+        # Reference side: full EXTEND prefill of all T tokens → per-position logits.
+        pool_ref = _make_kv_pool(self._cfg, self._mesh, jnp.float32, T)
+        prefill_logits = _run_prefill_all_positions(model, self._mesh, pool_ref, token_ids)
         jax.block_until_ready(prefill_logits)
 
-        # Collect ALL decode positions first, then print a diagnostic table, then
-        # assert — so the per-position growth is visible even when an assertion
-        # fails (pytest -x stops at the first failing assert). The growth pattern
-        # discriminates two hypotheses for any numeric gap:
-        #   * future-token-in-page contamination (REAL bug): pos 8 (2 future slots
-        #     9,10 sit in the same page as the decode read) >> pos 9 (1) >> pos 10
-        #     (0 future slots, clean).
-        #   * cross-forward-mode reduction-order noise (legit): all positions
-        #     similar, smooth, scaling with depth (_RTOL_LOGITS regime).
+        # Decode side: a SEPARATE pool holding only the prefix, then an autoregressive
+        # chain. _run_decode_step persists each step's KV so the next step reads it.
+        pool_dec = _make_kv_pool(self._cfg, self._mesh, jnp.float32, T)
+        _run_prefill_all_positions(model, self._mesh, pool_dec, token_ids[:_PREFIX_LEN])
+
+        # Collect all positions, then print, then assert — so the per-position growth is
+        # visible even under pytest -x. With the autoregressive chain the only expected
+        # gap is cross-forward-mode reduction-order noise (smooth, _RTOL_LOGITS regime).
         rows = []  # (k, argmax_p, argmax_d, max_abs, scale, rel)
         for step in range(_DECODE_STEPS):
             k = _PREFIX_LEN + step
             decode_token = int(np.asarray(token_ids)[k])
-            decode_logits = _run_decode_step(model, self._mesh, kv_pool, k, decode_token)
+            decode_logits = _run_decode_step(model, self._mesh, pool_dec, k, decode_token)
             jax.block_until_ready(decode_logits)
 
             p = np.asarray(prefill_logits[k], dtype=np.float64)
@@ -474,13 +482,12 @@ class TestPrefillDecodeConsistency(unittest.TestCase):
             rel = max_abs / (scale + 1e-9)
             rows.append((k, int(p.argmax()), int(d.argmax()), max_abs, scale, rel))
 
-        print("\n=== prefill==decode per-position (flash EXTEND vs flash DECODE) ===")
         print(
-            " pos | argmax p | argmax d | max_abs_diff |  scale  |  rel_err | future_slots_in_page"
+            "\n=== prefill==decode per-position (flash EXTEND vs autoregressive DECODE chain) ==="
         )
+        print(" pos | argmax p | argmax d | max_abs_diff |  scale  |  rel_err")
         for k, ap, ad, mx, sc, rl in rows:
-            future = T - 1 - k  # tokens after k still sitting in the single page
-            print(f" {k:>3} | {ap:>8} | {ad:>8} | {mx:>11.4e} | {sc:>7.3f} | {rl:>7.4f} | {future}")
+            print(f" {k:>3} | {ap:>8} | {ad:>8} | {mx:>11.4e} | {sc:>7.3f} | {rl:>7.4f}")
         print(
             f" bands: _RTOL_ATTN={_RTOL_ATTN} (single-stage)  _RTOL_LOGITS={_RTOL_LOGITS} (depth √(L+1))"
         )
