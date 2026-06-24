@@ -594,6 +594,28 @@ class FusedEPMoEV2(FusedEPMoE):
 
         assert hidden_states.ndim == 2
 
+        # Same ep_size*t_packing padding as FusedEPMoE.__call__: the v2 kernel
+        # asserts num_tokens % ep_size == 0 (kernel.py local_num_tokens > 0
+        # assertion). Without this, bs=1 with ep=4 crashes at compile.
+        num_tokens = hidden_states.shape[0]
+        t_packing = get_dtype_packing(self.dtype)
+        kernel_ep_size = get_ep_size(self.mesh, "data", "tensor")
+        token_multiple = kernel_ep_size * t_packing
+        pad = (-num_tokens) % token_multiple
+        if pad:
+            hidden_states = jnp.concatenate(
+                [hidden_states, jnp.zeros((pad, hidden_states.shape[1]), hidden_states.dtype)],
+                axis=0,
+            )
+            topk_weights = jnp.concatenate(
+                [topk_weights, jnp.zeros((pad, topk_weights.shape[1]), topk_weights.dtype)],
+                axis=0,
+            )
+            topk_ids = jnp.concatenate(
+                [topk_ids, jnp.zeros((pad, topk_ids.shape[1]), topk_ids.dtype)],
+                axis=0,
+            )
+
         w1_scale = self.w1_scale.value if self.w1_scale is not None else None
         w3_scale = self.w3_scale.value if self.w3_scale is not None else None
         w2_scale = self.w2_scale.value if self.w2_scale is not None else None
@@ -692,6 +714,8 @@ class FusedEPMoEV2(FusedEPMoE):
             output = jax.sharding.reshard(
                 output, jax.sharding.NamedSharding(self.mesh, P("data", None))
             )
+        if pad:
+            output = output[:num_tokens]
         return output
 
 
