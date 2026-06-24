@@ -1019,7 +1019,10 @@ class BailingMoeV3ForCausalLM(nnx.Module):
 
         # FusedTPMoEV4 replicates all experts on every chip; EPLB phy→log
         # remapping is meaningless and dangerous here.
-        if self.moe_backend == MoEBackend.FUSED_V4:
+        moe_backend = getattr(config, "moe_backend", None)
+        if moe_backend is None:
+            moe_backend = getattr(self, "moe_backend", None)
+        if moe_backend == MoEBackend.FUSED_V4:
             metadata = get_global_expert_location_metadata()
             if metadata is not None:
                 raise NotImplementedError(
