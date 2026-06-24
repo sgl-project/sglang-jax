@@ -343,9 +343,14 @@ def _run_prefill_all_positions(model, mesh, kv_pool, token_ids):
 
     with jax.set_mesh(mesh):
         # Run backbone only to get all T hidden states.
-        hidden, _, _ = model.model(fb, kv_pool)
+        hidden, layers_kv_fused, _ = model.model(fb, kv_pool)
         # Apply final norm then lm_head at every position.
         logits = model.logits_processor._get_logits(hidden, model.lm_head)
+    # KV writes are functional in JAX (the kernel returns the updated fused buffer
+    # via .at[].set(); it does NOT mutate the pool in place). Persist them exactly
+    # as the production model runner does — replace_buffer(layers_kv_fused) — so the
+    # subsequent decode steps read the prefix KV instead of an all-zero cache.
+    kv_pool.replace_buffer(layers_kv_fused)
     return jnp.asarray(logits, dtype=jnp.float32)  # [T, vocab]
 
 
@@ -545,7 +550,12 @@ class TestDecodeFlashVsNaive(unittest.TestCase):
         fb_prefill = _make_prefill_fb(T, prefix_token_ids)
         _attach_backend(fb_prefill, self._cfg, self._mesh, kv_pool.page_size, mode="prefill")
         with jax.set_mesh(self._mesh):
-            flash_attn(pos_prefix, hidden_prefix, fb_prefill, kv_pool)
+            _, kv_fused = flash_attn(pos_prefix, hidden_prefix, fb_prefill, kv_pool)
+        # KV writes are functional in JAX — the attention returns the updated fused
+        # buffer for this layer; it does NOT mutate the pool in place. Persist it (the
+        # production model runner does this via replace_buffer(layers_kv_fused)) so the
+        # decode step reads the prefix KV instead of an all-zero cache.
+        kv_pool.kv_buffer[layer_idx - kv_pool.start_layer] = kv_fused
 
         # Step 2: decode step for position T.
         fb_decode = _make_decode_fb(T, 0)
