@@ -218,31 +218,60 @@ class TestSWADiagnostic(unittest.TestCase):
     def test_moe_topk_selection(self):
         """Compare flash vs naive MoE expert SELECTION (topk_ids) at MoE layers 2,3,4.
 
-        Decisive for the logits 88.7%: if selections DIFFER, the continuous attention diff
-        (abs 0.5-1.0) flipped borderline top-k (notes ⑩ continuous→discrete) — flash/naive
-        both numerically correct but route to different experts. If selections MATCH, top-k
-        flip is refuted and the divergence is elsewhere.
+        Decisive for the logits 88.7%: if selections DIFFER, the accumulated hidden diff
+        (amplified to abs ~10 by dense layers) flipped borderline top-k (notes ⑩
+        continuous→discrete) — flash/naive both numerically correct but route to different
+        experts. If selections MATCH, top-k flip is refuted and the divergence is elsewhere.
+
+        topk_ids isn't returned by the model, so capture via a class-level monkeypatch of
+        Step3p5MoE.__call__ (records the router selection in forward order = layers 2,3,4).
+        Also reports the gate-score gap at flipped tokens: small gap = legitimate borderline
+        (fix = decision-tolerant comparison, notes P6); large gap = real routing bug.
         """
+        import sgl_jax.srt.models.step3p5 as m
+
+        def _capture(model, kv_pool):
+            recs = []  # (topk_ids, gate_probs) per MoE layer, in forward order
+            orig = m.Step3p5MoE.__call__
+
+            def patched(moe_self, hidden):
+                rl = moe_self.moe_gate(hidden)
+                cb = moe_self.moe_gate.bias.value if moe_self.moe_gate.bias is not None else None
+                tw, tid = moe_self.topk(rl, cb)
+                recs.append((np.asarray(tid), np.asarray(rl)))
+                return orig(moe_self, hidden)
+
+            m.Step3p5MoE.__call__ = patched
+            try:
+                self._run_full(model, kv_pool)
+            finally:
+                m.Step3p5MoE.__call__ = orig
+            return recs
+
         fm = self._model("flash")
         nm = self._model("naive")
         kv = _make_kv_pool(self._cfg, self._mesh, jnp.float32, _NUM_TOKENS)
-        n_res = self._run_full(nm, None)
-        f_res = self._run_full(fm, kv)
-        n_topk, f_topk = n_res[3], f_res[3]
+        f_recs = _capture(fm, kv)
+        n_recs = _capture(nm, None)
 
-        print("\n=== MoE topk_ids flash vs naive (per layer) ===")
+        print("\n=== MoE topk_ids flash vs naive (forward order = layers 2,3,4) ===")
         total_flipped = 0
-        for layer in (2, 3, 4):
-            nt = np.asarray(n_topk[layer])
-            ft = np.asarray(f_topk[layer])
-            # per-token set difference (sorted, since order within top-k is irrelevant)
-            diff_tokens = int(np.sum(np.any(np.sort(nt, -1) != np.sort(ft, -1), axis=-1)))
-            total_flipped += diff_tokens
-            print(f" layer {layer}: {diff_tokens}/{nt.shape[0]} tokens select different experts")
-        print(f" -> total {total_flipped} flipped-selection tokens across MoE layers")
-        # Not an assertion on correctness: this is diagnostic. If >0, top-k flip confirmed;
-        # the fix is decision-tolerant comparison (notes P6), not a real model bug.
-        print(" (>0 => top-k flip is the logits-divergence mechanism; 0 => look elsewhere)")
+        for idx, ((ft, fp), (nt, ntp)) in enumerate(zip(f_recs, n_recs)):
+            flipped = np.any(np.sort(ft, -1) != np.sort(nt, -1), axis=-1)
+            n_flip = int(np.sum(flipped))
+            total_flipped += n_flip
+            # gate-score gap at flipped tokens: margin between kth and (k+1)th expert (naive).
+            gaps = []
+            for t in np.where(flipped)[0]:
+                s = np.sort(ntp[t])[::-1]
+                k = nt.shape[1]
+                gaps.append(float(s[k - 1] - s[k]) if len(s) > k else 0.0)
+            gap_str = f"min_gap={min(gaps):.2e}" if gaps else "n/a"
+            print(f" moe#{idx}: {n_flip}/{ft.shape[0]} tokens flip experts; {gap_str}")
+        print(f" -> total {total_flipped} flipped-selection tokens")
+        print(
+            " (>0 + tiny gap => legitimate borderline flip; >0 + large gap => routing bug; 0 => look elsewhere)"
+        )
 
 
 if __name__ == "__main__":
