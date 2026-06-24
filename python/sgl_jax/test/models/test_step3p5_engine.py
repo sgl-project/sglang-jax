@@ -689,10 +689,10 @@ class TestSWAKVPoolVsFullMHA(unittest.TestCase):
 
     def test_swa_pool_equals_full_mha(self):
         self.skipTest(
-            "SWA==full needs ModelRunner for swa_index_mapping wiring "
-            "(model_runner_kv_cache_mixin.py:489 + 635-639). "
-            "Verified in real-model e2e (D/E/F). "
-            "Spec: output(MHATokenToKVPool) == output(SWAKVPool) atol=1e-2 (bf16)."
+            "Serving-level: SWAKVPool wiring needs ModelRunner (no real unit fixture "
+            "without 测假). Implemented as a real-server self-consistency test in "
+            "test/srt/test_step3p5_serving_e2e.py::TestStep3p5SWAEqualsFull "
+            "(microscale dummy weights — NOT the 398GB checkpoint)."
         )
 
 
@@ -707,8 +707,10 @@ class TestRadixCacheHitVsMiss(unittest.TestCase):
 
     def test_cache_hit_equals_miss(self):
         self.skipTest(
-            "Serving-level e2e: needs RadixCache + real checkpoint on TPU. "
-            "Assert: prefix-hit logits ≈ recomputed logits (atol=1e-2, bf16)."
+            "Serving-level (needs RadixCache + scheduler — no real unit fixture without "
+            "测假). Implemented as a real-server self-consistency test in "
+            "test/srt/test_step3p5_serving_e2e.py::TestStep3p5ServingSmokeAndCache "
+            "(microscale dummy weights — NOT the 398GB checkpoint)."
         )
 
 
@@ -718,8 +720,10 @@ class TestChunkedVsFullPrefill(unittest.TestCase):
 
     def test_chunked_equals_full_prefill(self):
         self.skipTest(
-            "Serving-level e2e: needs chunked-prefill scheduler + real checkpoint on TPU. "
-            "Assert: chunked logits ≈ full logits (atol=1e-2, bf16)."
+            "Serving-level (needs chunked-prefill scheduler — no real unit fixture "
+            "without 测假). Implemented as a real-server self-consistency test in "
+            "test/srt/test_step3p5_serving_e2e.py::TestStep3p5ChunkedEqualsFull "
+            "(microscale dummy weights — NOT the 398GB checkpoint)."
         )
 
 
