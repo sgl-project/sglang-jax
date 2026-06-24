@@ -173,7 +173,8 @@ class MiMoV2Moe(nnx.Module):
                 hidden_states.shape[0],
                 out_sharding=NamedSharding(self.mesh, P(out_sharding.spec[0])),
             )
-            topk_ids = jnp.where(token_valid_mask[:, None], topk_ids, -1)
+            if token_valid_mask is not None:
+                topk_ids = jnp.where(token_valid_mask[:, None], topk_ids, -1)
             mlp_output = self.experts(
                 hidden_states,
                 topk_weights,
