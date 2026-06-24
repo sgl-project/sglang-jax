@@ -284,7 +284,7 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
             has_initial_state,
         ]
         # OFF/no-boundary: track_indices is None -> keep the original shard_map
-        # call (no track args), byte-identical to the pre-PR#2 path. When a
+        # call (no track args), byte-identical to the no-track path. When a
         # boundary lands in this batch, add two P("data") track slices.
         if track_indices is not None:
             in_specs += [P("data"), P("data")]  # track_indices, track_mask
@@ -408,7 +408,7 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
             has_initial_state,
         ]
         # OFF/no-boundary: track_indices is None -> keep the original shard_map
-        # call (no track args), byte-identical to the pre-PR#2 path. When a
+        # call (no track args), byte-identical to the no-track path. When a
         # boundary lands in this batch, add two P("data") track slices.
         if track_indices is not None:
             in_specs += [P("data"), P("data")]  # track_indices, track_mask

@@ -1,4 +1,4 @@
-"""Recurrent state sizing config + validation (S5a Stage 2 / PR#2, Task 1).
+"""Recurrent state sizing config + validation (#1380).
 
 Covers the pure ``_recurrent_slot_factor`` helper (slots per concurrent request)
 and the ``ServerArgs`` static validation / normalization for the new

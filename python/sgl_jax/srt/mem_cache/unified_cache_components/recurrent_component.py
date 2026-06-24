@@ -5,9 +5,9 @@ across requests like full KV. Recurrent state is per-leaf (a single
 RecurrentStatePool slot index), so this component is leaf-only: it rides the
 core's ``evictable_device_leaves`` and skips upstream's LRU-list machinery.
 
-PR#1 scope (page_size=1): finished-request commit + prefix-hit copy-on-write
-clone. PR#2 adds page_size>=128 (page-aligned ping-pong extra buffer) and
-unfinished/fork donation.
+The base path (page_size=1): finished-request commit + prefix-hit
+copy-on-write clone. The extra-buffer path (page_size>=128) adds a
+page-aligned ping-pong extra buffer and unfinished/fork donation.
 """
 
 from __future__ import annotations
@@ -57,7 +57,7 @@ class RecurrentComponent(TreeComponent):
         if not getattr(cache, "enable_recurrent_extra_buffer", False):
             assert cache.page_size == 1, (
                 f"RecurrentComponent requires page_size=1 when the extra buffer "
-                f"is off (PR#1), got {cache.page_size}"
+                f"is off, got {cache.page_size}"
             )
         super().__init__(cache, params)
         self.req_to_token_pool = cache.req_to_token_pool
@@ -81,8 +81,8 @@ class RecurrentComponent(TreeComponent):
     ) -> MatchResult:
         # CoW decision only: record the src slot, do NOT allocate. The dst is the
         # request's running slot (allocated post-admission in alloc_req_slots);
-        # the copy runs in the next forward's one-shot pre-pass. PR#1 clones the
-        # full match (recurrent_branching_seqlen stays None).
+        # the copy runs in the next forward's one-shot pre-pass. The base path
+        # clones the full match (recurrent_branching_seqlen stays None).
         if not params.cow_recurrent:
             return result
         req = params.req
@@ -123,8 +123,9 @@ class RecurrentComponent(TreeComponent):
     ) -> None:
         ct = self.component_type
         if params.recurrent_value is None:
-            # No recurrent donation (unfinished/fork in PR#1, or the request had
-            # no running slot): leave the node's recurrent value untouched.
+            # No recurrent donation (unfinished/fork on the base path, or the
+            # request had no running slot): leave the node's recurrent value
+            # untouched.
             return
         cd = node.component_data[ct]
         if cd.value is not None:
@@ -151,10 +152,10 @@ class RecurrentComponent(TreeComponent):
         is_finished: bool,
     ) -> int | None:
         if not self.enable_recurrent_extra_buffer:
-            # PR#1 page_size=1: only finished requests donate. The running slot is
-            # already the final, materialized state, so the tree value is the slot
-            # itself (no copy). Unfinished/fork donation is deferred (PR#2) to avoid
-            # the publish-before-materialize race.
+            # Base path (page_size=1): only finished requests donate. The running
+            # slot is already the final, materialized state, so the tree value is
+            # the slot itself (no copy). Unfinished/fork donation is deferred to
+            # the extra-buffer path to avoid the publish-before-materialize race.
             if not is_finished or req.recurrent_pool_idx is None:
                 return None
             insert_params.recurrent_value = self.req_to_token_pool.recurrent_value_from_slot(
@@ -207,9 +208,9 @@ class RecurrentComponent(TreeComponent):
     ) -> None:
         committed = insert_result.recurrent_committed if insert_result is not None else False
         if not self.enable_recurrent_extra_buffer:
-            # PR#1: sole owner of the finished donate-vs-free decision. Unfinished
-            # requests donate nothing and keep their running slot (the live state);
-            # ownership-based release frees it later if needed.
+            # Base path: sole owner of the finished donate-vs-free decision.
+            # Unfinished requests donate nothing and keep their running slot (the
+            # live state); ownership-based release frees it later if needed.
             if not is_finished:
                 return
             if committed:

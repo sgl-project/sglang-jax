@@ -616,7 +616,7 @@ class TestKDAAttention(unittest.TestCase):
             pool.replace_buffer(([recurrent_buffer], [conv_buffer_list]))
 
     def test_recurrent_cow_copy_equivalence(self):
-        """S5a recurrent CoW: copy_slots clones a prefilled recurrent+conv state
+        """Recurrent CoW: copy_slots clones a prefilled recurrent+conv state
         into another slot bitwise-identically, so a decode from the clone matches
         a decode from the source (KL==0 at page_size=1)."""
         layer, pool, rec_idx, rec_buf, conv_buf_list = self.run_test("prefill", [128])
@@ -643,7 +643,7 @@ class TestKDAAttention(unittest.TestCase):
             )
 
     def test_track_scatter_equivalence(self):
-        """S5a PR#2 track writeback: a prefill that lands on a track boundary
+        """Recurrent track writeback: a prefill that lands on a track boundary
         scatters the SAME final state into the request's track slot AND its
         running slot. Assert the track slot equals the running slot bitwise
         (synthetic weights, no checkpoint). Controller-validated on TPU.

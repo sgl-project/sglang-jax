@@ -740,7 +740,7 @@ class TestGDNAttention(unittest.TestCase):
     # backend-specific track-scatter test below is kept.
 
     def test_track_scatter_equivalence(self):
-        """S5a PR#2 track writeback: a prefill that lands on a track boundary
+        """Recurrent track writeback: a prefill that lands on a track boundary
         scatters the SAME final state into the request's track slot AND its
         running slot. Assert the track slot equals the running slot bitwise
         (synthetic weights, no checkpoint). Controller-validated on TPU.

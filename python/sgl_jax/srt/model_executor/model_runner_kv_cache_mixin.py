@@ -120,7 +120,7 @@ def _enforce_recurrent_state_server_constraints(server_args, is_lightning: bool 
             "--enable-recurrent-extra-buffer is not supported with the GLA/Lightning "
             "(bailing_hybrid) architecture."
         )
-        # Extra-buffer (PR#2) needs the recurrent radix path; the legacy 1:1
+        # The extra-buffer path needs the recurrent radix path; the legacy 1:1
         # disable_radix_cache branch has no track slots. Check before the
         # early return below so the combo fails loudly.
         assert not server_args.disable_radix_cache, (
@@ -140,14 +140,14 @@ def _enforce_recurrent_state_server_constraints(server_args, is_lightning: bool 
     if not server_args.enable_recurrent_extra_buffer:
         assert server_args.page_size == 1, (
             "Recurrent radix caching requires --page-size 1 unless "
-            "--enable-recurrent-extra-buffer (PR#2)."
+            "--enable-recurrent-extra-buffer."
         )
 
 
 def _recurrent_slot_factor(server_args) -> int:
     """Recurrent slots reserved per concurrent request.
 
-    - 3 with extra-buffer (PR#2): 1 running + two ping-pong track slots.
+    - 3 with extra-buffer: 1 running + two ping-pong track slots.
     - 2 for unified-radix recurrent without extra-buffer: 1 running + 1 for the
       tree-owned / transient clone headroom.
     - 1 otherwise (legacy 1:1 path; radix disabled).

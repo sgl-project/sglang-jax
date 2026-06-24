@@ -43,7 +43,7 @@ class FakeReq:
         self.kv_committed_len = kv_committed_len
         self.dp_rank = dp_rank
         self.recurrent_pool_idx = recurrent_pool_idx
-        # Extra-buffer ping-pong track fields (PR#2).
+        # Extra-buffer ping-pong track fields.
         self.recurrent_ping_pong_track_buffer = None
         self.recurrent_next_track_idx = None
         self.recurrent_last_track_seqlen = None
@@ -425,10 +425,10 @@ class TestHybridPoolRecurrentSlotAPI(CustomTestCase):
 
 
 class TestHybridPoolExtraBufferAPI(CustomTestCase):
-    """Ping-pong track-slot API used by the extra-buffer recurrent path (PR#2).
+    """Ping-pong track-slot API used by the extra-buffer recurrent path.
 
     Dormant unless ``enable_recurrent_extra_buffer=True``: with it off the pool must
-    behave byte-identically to the PR#1 page=1 path (running slot only).
+    behave byte-identically to the base page=1 path (running slot only).
     """
 
     def _make_pool(self, enable_recurrent_extra_buffer, dp_size=1, size=16):
@@ -442,7 +442,7 @@ class TestHybridPoolExtraBufferAPI(CustomTestCase):
             enable_recurrent_extra_buffer=enable_recurrent_extra_buffer,
         )
 
-    # --- Case: extra-buffer OFF is a strict no-op (PR#1 path unchanged) ---
+    # --- Case: extra-buffer OFF is a strict no-op (base page=1 path unchanged) ---
 
     def test_extra_buffer_off_allocs_only_running_slot(self):
         pool = self._make_pool(enable_recurrent_extra_buffer=False)

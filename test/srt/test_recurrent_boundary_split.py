@@ -1,4 +1,4 @@
-"""Scheduler must split prefill chunks at recurrent track boundaries (PR#2).
+"""Scheduler must split prefill chunks at recurrent track boundaries.
 
 When extra-buffer recurrent caching is active, a scheduled EXTEND must never
 cross a track boundary: ``(len(prefix_indices) + extend_input_len) % interval``

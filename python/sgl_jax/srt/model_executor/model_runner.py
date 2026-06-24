@@ -46,12 +46,10 @@ logger = logging.getLogger(__name__)
 
 
 def _maybe_apply_recurrent_cow(forward_batch, memory_pools):
-    """One-shot recurrent copy-on-write, run exactly once per forward before any
-    recurrent layer reads state. Clones each prefix-hit request's matched tree
-    slot into its running slot: src = forward_batch.recurrent_cow_src_indices
-    (0 = no clone), dst = forward_batch.recurrent_indices. Returns a memory_pools
-    whose recurrent_state_pool holds the cloned buffers (functional; the result
-    flows to model() and out via pool_updates). No-op when no CoW is pending.
+    """Clone each prefix-hit request's matched tree slot (src =
+    recurrent_cow_src_indices, 0 = skip) into its running slot (dst =
+    recurrent_indices), once per forward before any recurrent read. Returns
+    memory_pools with the cloned recurrent_state_pool; no-op when none pending.
     """
     src = getattr(forward_batch, "recurrent_cow_src_indices", None)
     if src is None or forward_batch.recurrent_indices is None:

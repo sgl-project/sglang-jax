@@ -1032,19 +1032,12 @@ class TestUnifiedRadixCacheEffectiveCacheLen(CustomTestCase):
         self.assertEqual(allocator.available_size(0), avail_before + 12)
 
     def test_zero_cache_len_skip_then_continuation_extends_without_overlap(self):
-        # The precise leak failure mode the prefix_indices advance fixes: a
-        # chunked round ends OFF a track boundary (effective_cache_len <= 0), then
-        # the NEXT round continues. The scheduler resets fill_ids to the full
-        # prompt and prepare_for_extend allocates the suffix starting at
-        # len(prefix_indices) WITHOUT re-matching the tree. A stale prefix ([]
-        # instead of the committed chunk) makes round 2 extend the whole prompt
-        # and write fresh KV over round 1's committed pages, orphaning them
-        # (token_to_kv_pool leak). This drives both rounds + finish and asserts
-        # the continuation extends only the suffix, never overlaps the committed
-        # chunk, and frees the full range -> balanced. The same off-boundary
-        # continuation is what every sub-interval chunk does, so it also covers
-        # a coarse recurrent_track_interval (>= chunked_prefill_size): such a
-        # request makes monotonic progress instead of stalling.
+        # Leak repro: a chunked round ends OFF a track boundary (cache_len <= 0),
+        # then round 2 continues without re-matching the tree. If prefix_indices
+        # stays stale, round 2 re-extends the whole prompt over round 1's committed
+        # pages and orphans them (token_to_kv_pool leak). Asserts the continuation
+        # extends only the suffix and the full range frees. Also covers a coarse
+        # interval (>= chunked_prefill_size) making monotonic progress, not stalling.
         pool, allocator, cache = self._create_stack()
         token_ids = list(range(1, 13))  # 12-token prompt, chunked 6 + 6
         avail_start = allocator.available_size(0)
@@ -1155,7 +1148,7 @@ class _RunningRecurrentReq:
 
 class TestUnifiedRadixCacheRecurrent(CustomTestCase):
     """Cache-level recurrent component: commit / match-CoW / evict / lock /
-    slot ledger, all at page_size=1 (PR#1 scope)."""
+    slot ledger, all at page_size=1 (base path)."""
 
     def setUp(self):
         self.kv_head_num = 8
@@ -1342,23 +1335,14 @@ class TestUnifiedRadixCacheRecurrent(CustomTestCase):
         self.assertEqual(req.recurrent_cow_src_index, slot)
 
     def test_page1_running_recurrent_chunked_continuation_full_only_preserves_prefix(self):
-        """page=1 regression floor for the PR#1 Step 5.4 full_only rematch
-        (schedule_batch.init_next_round_input). A RUNNING recurrent request owns
-        its recurrent state in its running slot, so during chunked-prefill its
-        OWN unfinished FULL prefix lives in the tree as recurrent-LESS interior
-        nodes. The scheduler's next-round re-match must use full_only=True /
-        cow_recurrent=False, else the leaf-only recurrent validator rejects those
-        nodes and the request's whole FULL prefix collapses to root (re-prefilled
-        from scratch / KV double-counted).
-
-        This drives the REAL UnifiedRadixCache (the param-only TestFullOnlyRematch
-        asserts the flags; here the prefix preservation is genuinely exercised):
-          (a) full_only=True (the fix's params) preserves the entire FULL prefix
-              and does NOT set a recurrent_cow_src_index (no re-clone);
-          (b) the WRONG params full_only=False / cow_recurrent=True truncate that
-              same prefix to 0 -- proving the flag is load-bearing, not cosmetic;
-          (c) a second chunked-continuation cache_unfinished_req grows and keeps
-              cache_protected_len, with the slot ledger balanced throughout.
+        """page=1 regression floor for the full_only rematch
+        (schedule_batch.init_next_round_input). A RUNNING recurrent request's own
+        unfinished FULL prefix lives in the tree as recurrent-LESS interior nodes,
+        so the next-round re-match must use full_only=True / cow_recurrent=False,
+        else the leaf-only recurrent validator collapses the whole prefix to root
+        (re-prefilled from scratch). Drives the REAL cache: asserts the prefix is
+        preserved with the right params and truncated with the wrong ones (the
+        param-only check is TestFullOnlyRematch).
         """
         state_pool, pool, allocator, cache = self._create_recurrent_setup()
 
@@ -1439,7 +1423,7 @@ class TestUnifiedRadixCacheRecurrent(CustomTestCase):
         lands on a recurrent-less split parent. Match requires every component's
         validator to accept the same node, so the whole match -- FULL KV included
         -- falls back to root. This is why repeated-identical prompts report
-        cached-token 0; matchable intermediate snapshots are PR#2 scope.
+        cached-token 0; matchable intermediate snapshots are the extra-buffer path.
         """
         state_pool, pool, _, cache = self._create_recurrent_setup()
         key = [1, 2, 3, 4, 5, 6, 7, 8]
@@ -1505,7 +1489,7 @@ class TestUnifiedRadixCacheRecurrent(CustomTestCase):
     def test_longer_prefix_after_shorter_frees_parent(self):
         """Caching AB (leaf) then ABCD makes AB internal via _add_new_node; its
         recurrent value must be dropped (not stranded on the unevictable internal
-        node), so eviction can reclaim every slot (regression for B1)."""
+        node), so eviction can reclaim every slot."""
         state_pool, pool, _, cache = self._create_recurrent_setup()
         slots = pool.slots_per_rank
 
@@ -1525,7 +1509,7 @@ class TestUnifiedRadixCacheRecurrent(CustomTestCase):
 
     def test_internal_transition_while_locked_frees_on_unlock(self):
         """If a node becomes internal while its recurrent value is locked (a CoW
-        src this round), the free is deferred to the final unlock (B1)."""
+        src this round), the free is deferred to the final unlock."""
         state_pool, pool, _, cache = self._create_recurrent_setup()
         self._commit(cache, pool, [1, 2], np.arange(10, 12, dtype=np.int32))
         ab = cache.match_prefix(MatchPrefixParams(key=RadixKey([1, 2], None, 0))).last_device_node
@@ -1596,8 +1580,7 @@ class TestUnifiedRadixCacheRecurrent(CustomTestCase):
 
     def test_copy_slots_multi_dp_locality(self):
         """copy_slots under dp_size=2: src/dst are per-rank-LOCAL slot indices, so
-        the clone must stay within each DP shard (no cross-rank corruption).
-        (plan §6 multi-DP / reviewer S1)"""
+        the clone must stay within each DP shard (no cross-rank corruption)."""
         dp_mesh = create_device_mesh(ici_parallelism=[2, -1], dcn_parallelism=[1, 1])
         with jax.sharding.set_mesh(dp_mesh):
             state_pool = RecurrentStatePool(
@@ -1635,7 +1618,7 @@ class TestUnifiedRadixCacheRecurrent(CustomTestCase):
 
 class _ExtraBufferReq:
     """Req surrogate carrying the extra-buffer ping-pong fields, enough to drive
-    RecurrentComponent.prepare/cleanup directly (PR#2 page>=128 path)."""
+    RecurrentComponent.prepare/cleanup directly (extra-buffer page>=128 path)."""
 
     def __init__(self, dp_rank=0):
         self.dp_rank = dp_rank
@@ -1666,7 +1649,7 @@ class TestUnifiedRadixCacheRecurrentExtraBuffer(CustomTestCase):
     """Extra-buffer (page>=128) recurrent commit/donation: prepare caps the key at
     the materialized boundary; cleanup commits the KEEP ping-pong slot (finished)
     or donates it with a secured replacement (unfinished). Ledger balanced after
-    every transition. Step 10 slot-shortfall eviction is 3x new reqs."""
+    every transition. Slot-shortfall eviction reclaims 3x the new reqs."""
 
     def setUp(self):
         self.max_seq_len = 2048
@@ -1958,7 +1941,7 @@ class TestUnifiedRadixCacheRecurrentExtraBuffer(CustomTestCase):
         self.assertEqual(req.recurrent_ping_pong_track_buffer, buffer_before)
         self.assertEqual(cache.assert_recurrent_slot_ledger(0, live_reqs=[req]), 3)
 
-    # --- Case 6: Step 10 alloc_req_slots evicts the exact 3x shortfall ---
+    # --- Case 6: alloc_req_slots evicts the exact 3x shortfall ---
 
     def _seed_tree_leaves(self, comp, cache, pool, keys, dp_rank=0):
         """Commit one finished extra-buffer req per key, leaving each as a

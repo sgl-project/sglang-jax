@@ -1,4 +1,4 @@
-"""Offline oracle: single GDN forward == chained 128-token split (Task R1).
+"""Offline oracle: single GDN forward == chained 128-token split.
 
 When the recurrent extra-buffer cache is active at ``page_size=128``, the
 scheduler splits a prefill at 128-token track boundaries: instead of one
@@ -6,10 +6,10 @@ forward over the whole prompt, the GDN recurrence is computed as several
 chained forwards, each carrying recurrent + conv state through the pool tables
 between chunks. An e2e GPQA run showed a ~3.5pp accuracy drop at this config.
 
-Hypothesis H1: splitting the prefill changes the model's numerics vs a single
-forward. This file is the decisive, TPU-free oracle for H1 — it runs the SAME
-inputs as (a) one forward over N tokens and (b) chained 128-token chunks, then
-prints the deltas and asserts numerical equivalence.
+This file is the decisive, TPU-free oracle for whether splitting the prefill
+changes the model's numerics vs a single forward — it runs the SAME inputs as
+(a) one forward over N tokens and (b) chained 128-token chunks, then prints the
+deltas and asserts numerical equivalence.
 
 The GDN forward over one chunk = depthwise causal conv1d
 (``jax_causal_conv1d_prefill``) then token-by-token recurrence

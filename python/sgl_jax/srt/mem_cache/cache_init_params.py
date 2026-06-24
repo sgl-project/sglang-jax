@@ -18,7 +18,7 @@ class CacheInitParams:
 
     sliding_window_size: int | None = None
 
-    # Recurrent radix: page-aligned ping-pong track buffer for page>=128 (PR#2).
+    # Recurrent radix: page-aligned ping-pong track buffer for page>=128.
     enable_recurrent_extra_buffer: bool = False
 
     # Track-boundary interval (multiple of page_size) for extra-buffer snapshots;

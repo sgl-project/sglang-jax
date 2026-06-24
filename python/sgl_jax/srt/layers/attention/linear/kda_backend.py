@@ -142,12 +142,12 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
             recurrent_state_pool, layer.layer_id, recurrent_indices, new_conv_packed
         )
 
-        # Recurrent extra-buffer track snapshot (S5a PR#2): when a track
-        # boundary lands in this batch, also scatter the SAME final state into
-        # each request's track slot. Task 5 forces track boundaries to be
-        # forward ends, so the running-scatter value IS the boundary snapshot.
-        # None (extra-buffer off OR no boundary this batch) -> byte-identical
-        # to the no-track path: no extra shard_map runs.
+        # Recurrent extra-buffer track snapshot: when a track boundary lands in
+        # this batch, also scatter the SAME final state into each request's track
+        # slot. Track boundaries are forced to forward ends, so the
+        # running-scatter value IS the boundary snapshot. None (extra-buffer off
+        # OR no boundary this batch) -> byte-identical to the no-track path: no
+        # extra shard_map runs.
         track_indices = self.forward_metadata.recurrent_track_indices
         if track_indices is not None:
             track_mask = self.forward_metadata.recurrent_track_mask
@@ -251,7 +251,7 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         running slot and the track slot persist. Keep-mask preserves slots at
         ``track_idx == 0`` (padding/dummy) and ``track_mask == 0`` (non-boundary
         rows). Wrapped in ``optimization_barrier`` because the buffer is donated
-        (PR#1 multi-host aliasing lesson).
+        (donated-buffer multi-host aliasing guard).
         """
 
         def _scatter(buf, tidx, tmask, val):

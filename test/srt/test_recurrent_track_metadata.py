@@ -1,6 +1,6 @@
 """Recurrent track metadata must survive the pytree round-trip in lockstep.
 
-Stage 2 (PR#2) publishes a recurrent snapshot only at page/track boundaries.
+The extra-buffer recurrent path publishes a recurrent snapshot only at page/track boundaries.
 Two per-request arrays -- recurrent_track_indices / recurrent_track_mask --
 ride the same plumbing as recurrent_cow_src_indices from the scheduler through
 ModelWorkerBatch -> ForwardBatch -> LinearRecurrentAttnBackendMetadata. These
@@ -123,7 +123,7 @@ class _FakeReq:
 
 
 class TestRecurrentTrackEntryBuilder(unittest.TestCase):
-    """Component D: per-req track entries with read-then-flip bookkeeping."""
+    """Per-req track entries with read-then-flip bookkeeping."""
 
     def test_extend_on_boundary_reads_then_flips(self):
         # next_idx=0 -> read slot buffer[0]=40, then flip to 1.
@@ -226,7 +226,7 @@ def _bare_req(rid):
 
 
 class TestFullOnlyRematch(unittest.TestCase):
-    """Component C: a running recurrent req re-matches FULL-only, no re-clone."""
+    """A running recurrent req re-matches FULL-only, no re-clone."""
 
     def test_running_recurrent_req_full_only_no_clone(self):
         cache = _CapturingTreeCache()

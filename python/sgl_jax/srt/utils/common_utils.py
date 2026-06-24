@@ -41,7 +41,7 @@ PRECOMPILE_DEFAULT_BS_PADDINGS = [1 << i for i in range(0, 9)]
 # Largest EXTEND per-DP batch size that compiles correctly for the recurrent
 # (HybridReqToTokenPool, page_size=1) attention path under multi-host SPMD.
 # Beyond this, the RPA executable miscompiles and emits NaN from finite inputs
-# (validated 2026-06-18: per_dp_bs 8 coherent, 16 garbage, 12 inconclusive).
+# (per_dp_bs 8 verified safe; 16 produced NaN).
 SAFE_EXTEND_PER_DP_BS = 8
 
 

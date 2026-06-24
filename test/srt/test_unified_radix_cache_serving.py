@@ -1,6 +1,6 @@
 """Serving-level verification for ``--enable-unified-radix-tree``.
 
-HiCache Stage 1, S1c (#1337); recurrent page=1 backfill, S5a Stage 2 (#1380).
+unified radix tree (#1337); recurrent page=1 backfill (#1380).
 
 Scope is intentionally flag-on only: this per-PR test proves the enabled
 UnifiedRadixCache serving path is active and correct. The Radix / no-cache /
@@ -15,7 +15,7 @@ behavior is checked.
 ``TestUnifiedRadixCacheServingRecurrent`` covers the recurrent (GDN-hybrid)
 path at ``--page-size 1``: a Qwen3.5-35B-A3B (qwen3_5_moe) model routes to
 UnifiedRadixCache with a recurrent component, and the cache-hit run must stay
-byte-identical to a ``--disable-radix-cache`` baseline (PR#1's KL==0 guarantee
+byte-identical to a ``--disable-radix-cache`` baseline (the KL==0 guarantee
 at page_size=1). It needs 4 chips and runs in the ``e2e-test-tpu-v6e-4`` suite,
 not v6e-1.
 """
@@ -182,7 +182,7 @@ class TestUnifiedRadixCacheServingRecurrent(CustomTestCase):
     A Qwen3.5-35B-A3B (qwen3_5_moe) model under ``--enable-unified-radix-tree --page-size 1``
     routes to UnifiedRadixCache with a recurrent component. The cache-hit run
     must be byte-identical to a ``--disable-radix-cache`` baseline, proving
-    PR#1's KL==0 guarantee holds for recurrent state at page_size=1.
+    the KL==0 guarantee holds for recurrent state at page_size=1.
 
     Sampler caveat: use greedy + ``--random-seed`` only; ``--page-size 1``
     plus ``--precompile-bs-paddings`` pinned to multiples of tp_size (=4)

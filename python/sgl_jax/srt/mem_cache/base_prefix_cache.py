@@ -108,8 +108,8 @@ class MatchResult(NamedTuple):
     last_host_node: TreeNode | None
     best_match_node: TreeNode | None
     host_hit_length: int = 0
-    # Recurrent: aligned branching length for partial-prefix CoW. PR#1 always
-    # clones the full match (None); branch truncation is a follow-up.
+    # Recurrent: aligned branching length for partial-prefix CoW. The base path
+    # always clones the full match (None); branch truncation is a follow-up.
     recurrent_branching_seqlen: int | None = None
 
 
@@ -153,7 +153,7 @@ class BasePrefixCache(abc.ABC):
 
     def recurrent_extra_buffer_active(self) -> bool:
         """True when this cache materializes page-boundary recurrent snapshots
-        (extra-buffer recurrent, PR#2). Drives scheduler boundary splitting and
+        (extra-buffer recurrent path). Drives scheduler boundary splitting and
         track-entry computation; False keeps the path byte-identical to today."""
         return False
 

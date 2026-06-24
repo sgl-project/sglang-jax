@@ -1,4 +1,4 @@
-"""Backend track-slot writeback for the recurrent extra-buffer (S5a PR#2).
+"""Backend track-slot writeback for the recurrent extra-buffer.
 
 When a track boundary lands in a forward, the KDA / GDN backends scatter the
 SAME per-request FINAL state they already write to the running slot ALSO into
@@ -12,7 +12,7 @@ mesh (mirrors ``test_kda_attention`` / ``test_gdn_attention``):
   to the no-track path (no extra shard_map, same numerics + graph).
 * Lightning / GLA: track metadata present -> fail fast.
 
-Track boundaries are forward ends (Task 5), so the running-scatter value IS the
+Track boundaries are forward ends, so the running-scatter value IS the
 boundary snapshot — there is no mid-forward extraction here.
 """
 

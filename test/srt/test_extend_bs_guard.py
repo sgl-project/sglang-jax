@@ -1,4 +1,4 @@
-"""EXTEND bs-bucket selection + selected-shape backstop for the S5a multi-host
+"""EXTEND bs-bucket selection + selected-shape backstop for the recurrent multi-host
 recurrent path (per_dp_bs guard). See get_model_worker_batch / _merge_cache_loc
 in schedule_batch.py."""
 
@@ -131,7 +131,7 @@ class TestExtendBsGuard(_ExtendBsGuardFixture, unittest.TestCase):
 class TestExtendBsGuardScopedToPageSizeOne(_ExtendBsGuardFixture, unittest.TestCase):
     """The multi-host safe-EXTEND bucket guard exists only because the page_size=1
     EXTEND attention executable miscompiles RPA at per_dp_bs>8 under multi-host SPMD.
-    The S5a PR#2 extra-buffer recurrent path runs at page_size>=128, where that guard
+    The extra-buffer recurrent path runs at page_size>=128, where that guard
     must NOT activate -- it bucketed cache_loc to the bs bucket, which is wrong for
     large-page EXTEND. Assert the activation predicate is keyed on page_size==1."""
 

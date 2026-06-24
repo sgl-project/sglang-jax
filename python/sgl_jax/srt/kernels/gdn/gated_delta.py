@@ -98,13 +98,13 @@ def _scatter_track(
     track_mask: jax.Array,
     val: jax.Array,
 ) -> jax.Array:
-    """Scatter ``val`` into the request track slots (S5a PR#2 extra-buffer).
+    """Scatter ``val`` into the request track slots (extra-buffer path).
 
     Operates on the buffer RETURNED by :func:`_scatter_idx0_safe` so the
     running slot and the track slot both persist. Keep-mask preserves slots at
     ``track_idx == 0`` (padding/dummy) and ``track_mask == 0`` (non-boundary
     rows). The result is wrapped in ``optimization_barrier`` because the pool
-    buffer is donated under multi-host SPMD (PR#1 aliasing lesson).
+    buffer is donated under multi-host SPMD (donated-buffer aliasing guard).
     """
     val = val.astype(buf.dtype)
     keep = ((track_indices == 0) | (track_mask == 0)).reshape((-1,) + (1,) * (buf.ndim - 1))
