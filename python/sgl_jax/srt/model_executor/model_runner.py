@@ -417,6 +417,17 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         self.attn_backend = self._get_attention_backend()
 
     def _get_attention_backend(self):
+        def _has_softmax_dtype(config) -> bool:
+            from sgl_jax.srt.configs.dtype_config import DtypeConfig
+
+            if isinstance(config, DtypeConfig):
+                return _has_softmax_dtype(config.config_dict)
+            if isinstance(config, dict):
+                if "softmax" in config and config["softmax"] is not None:
+                    return True
+                return any(_has_softmax_dtype(v) for v in config.values())
+            return False
+
         backend = self.server_args.attention_backend
         if self.server_args.device == "cpu" and backend in ("fa", "fa_mha"):
             logger.warning(
@@ -432,7 +443,10 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         elif backend == "fa" and self.use_mla_backend:
             from sgl_jax.srt.layers.attention.mla_backend import MLAAttentionBackend
 
-            logger.warning("Softmax dtype is not configurable for MLA backend through DtypeConfig.")
+            if _has_softmax_dtype(self.model_config.dtype_config):
+                logger.warning(
+                    "Softmax dtype is not configurable for MLA backend through DtypeConfig."
+                )
             cfg = self.model_config.hf_text_config
             full_attn_backend = MLAAttentionBackend(
                 num_attn_heads=self.num_attn_heads,
