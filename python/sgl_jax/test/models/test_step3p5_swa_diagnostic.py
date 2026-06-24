@@ -155,6 +155,95 @@ class TestSWADiagnostic(unittest.TestCase):
         )
         self.assertEqual(n_bad, 0, f"full attn-module __call__ flash != naive ({n_bad} positions).")
 
+    def _model(self, attn_impl):
+        from sgl_jax.srt.models.step3p5 import Step3p5ForCausalLM
+
+        with jax.set_mesh(self._mesh):
+            m = Step3p5ForCausalLM(
+                self._cfg, mesh=self._mesh, dtype=jnp.float32, attn_impl=attn_impl
+            )
+        _load_weights(m, self._weights, self._cfg, self._mesh)
+        return m
+
+    def _run_full(self, model, kv_pool):
+        """Full ForCausalLM forward; return the raw result tuple (incl layers_topk_ids)."""
+        from sgl_jax.srt.layers.logits_processor import LogitsMetadata
+        from sgl_jax.srt.model_executor.forward_batch_info import (
+            CaptureHiddenMode,
+            ForwardMode,
+        )
+
+        fb = _make_forward_batch(_NUM_TOKENS)
+        if kv_pool is not None:
+            _attach_flash_backend(fb, model.config, self._mesh, kv_pool.page_size)
+        lm = LogitsMetadata(
+            forward_mode=ForwardMode.EXTEND,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+            logits_indices=jnp.array([_NUM_TOKENS - 1], dtype=jnp.int32),
+            extend_seq_lens=jnp.array([_NUM_TOKENS], dtype=jnp.int32),
+            extend_seq_lens_cpu=[_NUM_TOKENS],
+        )
+
+        class _MP:
+            token_to_kv_pool = kv_pool
+
+        with jax.set_mesh(self._mesh):
+            return model(fb, _MP(), lm)
+
+    def test_decoder_layer1_isolated(self):
+        """Full DecoderLayer 1 (sliding + DENSE) isolated: attn-module + residual + dense MLP.
+
+        Layer 1 has NO MoE (moe_layers_enum=2,3,4), so a mismatch here is residual / dense-MLP
+        / harness — NOT a top-k flip. Isolates the dense-layer 88.7% from the 2-layer
+        sequential run in flash_vs_naive (whether layer-0 propagation or this layer's wrapper).
+        """
+        fm = self._model("flash")
+        nm = self._model("naive")
+        rng = np.random.default_rng(123)
+        hidden = jnp.asarray(rng.standard_normal((_NUM_TOKENS, self._cfg.hidden_size)), jnp.float32)
+        pos = jnp.arange(_NUM_TOKENS, dtype=jnp.int32)
+        with jax.set_mesh(self._mesh):
+            nh, _, _, _ = nm.model.layers[1](
+                pos, hidden, _make_forward_batch(_NUM_TOKENS), None, None
+            )
+            kv = _make_kv_pool(self._cfg, self._mesh, jnp.float32, _NUM_TOKENS)
+            fb = _make_forward_batch(_NUM_TOKENS)
+            _attach_flash_backend(fb, self._cfg, self._mesh, kv.page_size)
+            fh, _, _, _ = fm.model.layers[1](pos, hidden, fb, kv, None)
+        n_bad, _ = _per_position_report(
+            "layer1 full DecoderLayer (dense)", np.asarray(fh), np.asarray(nh)
+        )
+        self.assertEqual(n_bad, 0, f"dense DecoderLayer 1 flash != naive ({n_bad} positions).")
+
+    def test_moe_topk_selection(self):
+        """Compare flash vs naive MoE expert SELECTION (topk_ids) at MoE layers 2,3,4.
+
+        Decisive for the logits 88.7%: if selections DIFFER, the continuous attention diff
+        (abs 0.5-1.0) flipped borderline top-k (notes ⑩ continuous→discrete) — flash/naive
+        both numerically correct but route to different experts. If selections MATCH, top-k
+        flip is refuted and the divergence is elsewhere.
+        """
+        fm = self._model("flash")
+        nm = self._model("naive")
+        kv = _make_kv_pool(self._cfg, self._mesh, jnp.float32, _NUM_TOKENS)
+        n_res = self._run_full(nm, None)
+        f_res = self._run_full(fm, kv)
+        n_topk, f_topk = n_res[3], f_res[3]
+
+        print("\n=== MoE topk_ids flash vs naive (per layer) ===")
+        total_flipped = 0
+        for layer in (2, 3, 4):
+            nt = np.asarray(n_topk[layer])
+            ft = np.asarray(f_topk[layer])
+            # per-token set difference (sorted, since order within top-k is irrelevant)
+            diff_tokens = int(np.sum(np.any(np.sort(nt, -1) != np.sort(ft, -1), axis=-1)))
+            total_flipped += diff_tokens
+            print(f" layer {layer}: {diff_tokens}/{nt.shape[0]} tokens select different experts")
+        print(f" -> total {total_flipped} flipped-selection tokens across MoE layers")
+        # Not an assertion on correctness: this is diagnostic. If >0, top-k flip confirmed;
+        # the fix is decision-tolerant comparison (notes P6), not a real model bug.
+        print(" (>0 => top-k flip is the logits-divergence mechanism; 0 => look elsewhere)")
+
 
 if __name__ == "__main__":
     unittest.main()
