@@ -323,5 +323,113 @@ class TestABCExtensionDoesNotBreakPD(unittest.TestCase):
             self.queue.copy_to_device([0], [0])
 
 
+class TestLRUHostKVPoolBucketPadding(unittest.TestCase):
+    """n between gather buckets (3 -> padded to 4): padded gather rows must be
+    discarded and padded scatter slots (loc=-1) skipped, so the round-trip stays
+    bit-exact AND untouched device pages (the padding target, page 0) are not
+    clobbered. All other tests use exactly 1/2 pages == bucket boundaries, so
+    this is the only coverage of the padding path that the batching work added."""
+
+    def setUp(self):
+        if not jax.devices():
+            self.skipTest("JAX not available")
+        self.device_pool = _make_device_pool(size=16, page_size=1, layer_num=3)
+        self.pool = _make_pool(self.device_pool, pool_size=4, page_size=1)
+
+    def _fill(self, idx, seed):
+        orig = []
+        for layer in range(self.device_pool.layer_num):
+            buf = self.device_pool.kv_buffer[layer]
+            vals = jax.random.normal(
+                jax.random.PRNGKey(seed * 100 + layer), buf[idx].shape, buf.dtype
+            )
+            self.device_pool.kv_buffer[layer] = buf.at[idx].set(
+                vals, out_sharding=buf.sharding
+            )
+            orig.append(np.asarray(self.device_pool.kv_buffer[layer][idx]))
+        return orig
+
+    def test_three_page_roundtrip_bit_exact(self):
+        self.assertEqual(self.pool._pad_to_page_bucket(3), 4)  # padding exercised
+        srcs, dsts = [1, 2, 3], [8, 9, 10]
+        origs = [self._fill(s, seed=s) for s in srcs]
+        host = [int(p) for p in self.pool.alloc(3)]
+        self.pool.stage_backup(srcs, host)
+        self.pool.flush_backup(host)
+        self.pool.copy_to_device(host, dsts)
+        for k, d in enumerate(dsts):
+            for layer in range(self.device_pool.layer_num):
+                got = np.asarray(self.device_pool.kv_buffer[layer][d])
+                np.testing.assert_allclose(got, origs[k][layer])
+
+    def test_padding_does_not_clobber_other_pages(self):
+        # Device page 0 is the gather/scatter padding target; a 3-page transfer
+        # excluding page 0 must leave it untouched (loc=-1 skip works).
+        guard = self._fill(0, seed=42)
+        srcs, dsts = [1, 2, 3], [8, 9, 10]
+        for s in srcs:
+            self._fill(s, seed=s)
+        host = [int(p) for p in self.pool.alloc(3)]
+        self.pool.stage_backup(srcs, host)
+        self.pool.flush_backup(host)
+        self.pool.copy_to_device(host, dsts)
+        for layer in range(self.device_pool.layer_num):
+            got = np.asarray(self.device_pool.kv_buffer[layer][0])
+            np.testing.assert_allclose(got, guard[layer])
+
+
+class TestLRUHostKVPoolStageDrainErrors(unittest.TestCase):
+    """The async two-phase contract: flush before stage must fail loudly rather
+    than silently transfer garbage."""
+
+    def setUp(self):
+        if not jax.devices():
+            self.skipTest("JAX not available")
+        self.pool = _make_pool(_make_device_pool(), pool_size=4)
+
+    def test_flush_backup_without_stage_raises(self):
+        b = self.pool.reserve()
+        with self.assertRaises(RuntimeError):
+            self.pool.flush_backup([b])
+
+    def test_flush_load_without_stage_raises(self):
+        b = self.pool.reserve()
+        with self.assertRaises(RuntimeError):
+            self.pool.flush_load([b], [0])
+
+    def test_stage_load_from_empty_slot_raises(self):
+        b = self.pool.reserve()
+        with self.assertRaises(RuntimeError):
+            self.pool.stage_load([b])
+
+
+class TestLRUHostKVPoolPrecompile(unittest.TestCase):
+    """precompile_transfers warms one shape per page count serving can hit and
+    must always restore the pool (free its scratch slots), never raise, and warm
+    the top partial bucket even when pool_size is not a bucket boundary."""
+
+    def setUp(self):
+        if not jax.devices():
+            self.skipTest("JAX not available")
+
+    def test_runs_and_restores_pool(self):
+        pool = _make_pool(_make_device_pool(size=16, layer_num=2), pool_size=8)
+        pool.precompile_transfers()
+        self.assertEqual(pool.available_size(), 8)
+
+    def test_non_bucket_pool_size_warms_without_alloc_failure(self):
+        # pool_size=3 is between buckets (2, 4). The real-count warmup must
+        # alloc 3 (which fits) instead of bucket 4 (which would not), so it
+        # warms fully and restores the pool with no "pool too small" early stop.
+        pool = _make_pool(_make_device_pool(size=16, layer_num=2), pool_size=3)
+        pool.precompile_transfers()
+        self.assertEqual(pool.available_size(), 3)
+
+    def test_max_pages_caps_warmup(self):
+        pool = _make_pool(_make_device_pool(size=16, layer_num=2), pool_size=8)
+        pool.precompile_transfers(max_pages=2)
+        self.assertEqual(pool.available_size(), 8)
+
+
 if __name__ == "__main__":
     unittest.main()

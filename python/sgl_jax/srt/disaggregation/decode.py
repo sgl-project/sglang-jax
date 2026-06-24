@@ -15,6 +15,7 @@ from jax.sharding import NamedSharding, PartitionSpec
 
 from sgl_jax.srt.disaggregation.base.kv_manager import KVPoll
 from sgl_jax.srt.disaggregation.bootstrap import BootstrapClient, PrefillInfoCache
+from sgl_jax.srt.mem_cache.memory_pool import write_kv_layer
 from sgl_jax.srt.disaggregation.jax_transfer.conn import (
     JaxTransferKVManager,
     JaxTransferKVReceiver,
@@ -611,7 +612,6 @@ class SchedulerDisaggregationDecodeMixin:
             jnp.asarray(loc_np),
             NamedSharding(kv_pool.mesh, PartitionSpec(kv_pool.attention_data_partition_axis)),
         )
-        from sgl_jax.srt.mem_cache.memory_pool import write_kv_layer
 
         for i, layer_id in enumerate(
             range(kv_pool.start_layer, kv_pool.start_layer + kv_pool.layer_num)
