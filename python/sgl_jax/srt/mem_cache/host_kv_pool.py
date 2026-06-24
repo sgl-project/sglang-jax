@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
@@ -108,6 +109,36 @@ class HostKVPool(abc.ABC):
     @abc.abstractmethod
     def total_size(self) -> int:
         """Total entries in the pool (free + in-use)."""
+
+    # ------------------------------------------------------------------
+    # Symmetric buffer_id-addressed transfer primitives (HiCache).
+    #
+    # Defaulted (NOT @abc.abstractmethod) so QueueHostKVPool stays concrete
+    # and the PD path is untouched: only the retaining LRUHostKVPool overrides
+    # these. Signatures are pure-integer index pairs, deliberately isomorphic
+    # to a future raiden ``d2h(src_offsets, dst_offsets)`` / ``h2d(...)`` so
+    # the storage backend can be swapped with zero upper-layer changes.
+    # ------------------------------------------------------------------
+
+    def copy_into(self, device_indices: list[int], host_buffer_ids: list[int]) -> None:
+        """Retaining D2H: copy device-pool page(s) into RESERVED slot(s).
+
+        ``device_indices[i]`` pairs with ``host_buffer_ids[i]``. Unlike
+        :meth:`copy_from_device` (which hands the staged ``array_pytree`` back
+        to the caller and retains nothing), the data STAYS in the slot until
+        :meth:`release`. No ``jax.Array`` crosses the boundary. Only
+        LRUHostKVPool overrides this.
+        """
+        raise NotImplementedError
+
+    def copy_to_device(self, host_buffer_ids: list[int], device_indices: list[int]) -> None:
+        """H2D: scatter slot(s) back into the device pool by index.
+
+        ``host_buffer_ids[i]`` pairs with ``device_indices[i]``. The existing
+        ABC has no local H2D (PD does not need it). Only LRUHostKVPool
+        overrides this.
+        """
+        raise NotImplementedError
 
 
 class QueueHostKVPool(HostKVPool):
@@ -268,6 +299,579 @@ class QueueHostKVPool(HostKVPool):
             host_pool_free(self._pool_name, 1)
         except Exception:  # noqa: BLE001
             pass
+
+
+class LRUHostKVPool(HostKVPool):
+    """Retaining host pool for HiCache L2.
+
+    Unlike :class:`QueueHostKVPool` (PD one-shot borrow), a slot here RETAINS
+    its data — staged via :meth:`copy_into`, read back via
+    :meth:`copy_to_device`, and held until :meth:`release`. Each slot stores one
+    KV page packed across all layers as a single pinned-host ``jax.Array`` of
+    shape ``(layer_num, *per_layer_shape)``; retention is just holding the
+    reference, so there is no ``dynamic_update_slice`` on sharded host memory
+    (which crashes multi-chip — the MegaScale issue from the HiCache+PD spike).
+
+    The control plane is PAGE-addressed: every ``int`` that crosses the
+    boundary is a page id (a ``buffer_id`` IS a host page-slot id, and the
+    paired device index is a device page index into ``kv_buffer``'s leading
+    axis). The radix layer folds its token-level ``node.value`` to pages
+    (``// page_size``) before calling in; this pool never sees tokens. Batched
+    page alloc/free go through :meth:`alloc` / :meth:`free`; one-shot borrows
+    through :meth:`reserve` / :meth:`release`. ``available_size`` / ``total_size``
+    count PAGES. No host ``jax.Array`` crosses the boundary, so the storage
+    backend is later raiden-switchable (its block interface is also page-grained)
+    with zero upper-layer changes.
+
+    ``self._lock`` protects only the ``_free_ids`` free-list and ``_lock_ref``
+    counters (reserve/release/inc_lock_ref/dec_lock_ref). The per-slot writes in
+    :meth:`copy_into` / reads in :meth:`copy_to_device` are NOT lock-protected
+    and rely on the caller holding an exclusive reservation of that buffer_id.
+    """
+
+    def __init__(
+        self,
+        device_pool: Any,
+        pool_size: int,
+        page_size: int,
+        layer_num: int,
+        per_layer_shape: tuple[int, ...],
+        dtype: Any,
+        mesh: Mesh,
+        partition_spec: PartitionSpec,
+        *,
+        pool_name: str = "hicache",
+    ) -> None:
+        if pool_size <= 0:
+            raise ValueError(f"pool_size must be positive, got {pool_size}")
+        self._device_pool = device_pool
+        self._pool_size = pool_size
+        self._page_size = page_size
+        self._layer_num = layer_num
+        self._per_layer_shape = tuple(per_layer_shape)
+        self._dtype = dtype
+        self._mesh = mesh
+        self._partition_spec = partition_spec
+        self._pool_name = pool_name
+
+        # A slot is the page packed over layers: prepend a replicated layer
+        # axis and drop the device pool's leading page/DP axis (a single
+        # gathered page is not DP-sharded). The TP axis on heads is preserved.
+        self._slot_spec = PartitionSpec(None, *tuple(partition_spec)[1:])
+        self._host_sharding = _make_host_sharding(mesh, self._slot_spec)
+        self._device_packed_sharding = NamedSharding(mesh, self._slot_spec)
+        # A single gathered page (one layer, page axis dropped). On multi-chip,
+        # plain ``arr[idx]`` cannot resolve the output sharding of a gather, so
+        # the explicit ``.at[idx].get(out_sharding=)`` form is required.
+        self._gathered_layer_sharding = NamedSharding(
+            mesh, PartitionSpec(*tuple(partition_spec)[1:])
+        )
+        # Batched gather output (one layer, MANY pages): the page axis is back,
+        # so this needs the leading axis named. The gathered pages are not
+        # DP-distributed (arbitrary indices into a contiguous output), so the
+        # leading axis is replicated (None) — same form PD's gather uses
+        # (disaggregation/prefill.py:393-396). TP on heads preserved.
+        self._batched_layer_sharding = NamedSharding(
+            mesh, PartitionSpec(None, *tuple(partition_spec)[1:])
+        )
+        # PD's bucketed batched-gather helpers, reused to bound compiled shapes
+        # (one kernel per page bucket, not per distinct page count). Imported
+        # here (runtime, post-module-load) to avoid a mem_cache<-disaggregation
+        # import cycle.
+        from sgl_jax.srt.disaggregation.prefill import (
+            _jit_gather_one_layer,
+            _pad_to_page_bucket,
+        )
+
+        self._jit_gather_one_layer = _jit_gather_one_layer
+        self._pad_to_page_bucket = _pad_to_page_bucket
+
+        self._lock = threading.Lock()
+        self._free_ids: list[int] = list(range(pool_size))
+        self._slots: list[jax.Array | None] = [None] * pool_size
+        self._lock_ref: list[int] = [0] * pool_size
+        self._peak_used = 0
+        self._exhaust_count = 0
+        self._last_exhaust_log = 0.0
+        # Pre-gathered device pages awaiting their (async) host transfer, keyed
+        # by buffer_id. Filled by stage_backup() on the buffer-owning thread,
+        # drained by flush_backup() on the D2H worker. See stage_backup() for
+        # why the gather must be synchronous.
+        self._pending_lock = threading.Lock()
+        self._pending_gather: dict[int, jax.Array] = {}
+        # Pre-staged host pages awaiting their (cheap) in-place scatter into the
+        # device KV buffer, keyed by buffer_id. Filled by stage_load() on the D2H
+        # worker (slow host->device device_put, never touches kv_buffer), drained
+        # by flush_load() on the buffer-owning thread (cheap aliased kernel write,
+        # must run in a donation-safe window). Mirrors _pending_gather (D2H).
+        self._pending_load_lock = threading.Lock()
+        self._pending_load: dict[int, jax.Array] = {}
+
+    # ------------------------------------------------------------------
+    # HostKVPool ABC
+    # ------------------------------------------------------------------
+
+    def reserve(self) -> int | None:
+        # Pure free-list pop; does NOT auto-evict. When full it returns None and
+        # the tree-cache layer is responsible for releasing an LRU slot before
+        # retry (RFC-1.0 §5.1) — the pool cannot evict because only the tree
+        # knows which buffer_id a node still points at.
+        with self._lock:
+            if not self._free_ids:
+                self._exhaust_count += 1
+                now = time.time()
+                if now - self._last_exhaust_log >= 1.0:
+                    self._last_exhaust_log = now
+                    logger.info(
+                        "host pool %s exhausted (size=%d, peak_used=%d, "
+                        "exhaust_count=%d); tree cache must evict before retry",
+                        self._pool_name,
+                        self._pool_size,
+                        self._peak_used,
+                        self._exhaust_count,
+                    )
+                return None
+            buffer_id = self._free_ids.pop(0)
+            used = self._pool_size - len(self._free_ids)
+            if used > self._peak_used:
+                self._peak_used = used
+            return buffer_id
+
+    def release(self, buffer_id: int) -> None:
+        with self._lock:
+            if not (0 <= buffer_id < self._pool_size):
+                raise ValueError(
+                    f"buffer_id={buffer_id} outside pool range [0, {self._pool_size})"
+                )
+            if buffer_id in self._free_ids:
+                raise RuntimeError(f"double free of buffer_id={buffer_id}")
+            if self._lock_ref[buffer_id] != 0:
+                raise RuntimeError(
+                    f"release of locked buffer_id={buffer_id} "
+                    f"(lock_ref={self._lock_ref[buffer_id]})"
+                )
+            self._slots[buffer_id] = None
+            self._free_ids.append(buffer_id)
+
+    # ------------------------------------------------------------------
+    # Page-batch alloc/free (HiCache control plane, page-addressed).
+    #
+    # The control plane (controller / tree cache) now speaks PAGE ids, not
+    # token ids: a "buffer_id" here IS a host page-slot id, and each slot
+    # physically holds exactly one device page (whole-page storage is forced
+    # by the sharded half-page-write constraint — see the class docstring).
+    # alloc/free are the batched, page-addressed counterparts of
+    # reserve/release: they let the radix layer grab/return N pages at once
+    # and map 1:1 onto a future raiden ``d2h``/``h2d`` block interface.
+    # ------------------------------------------------------------------
+
+    def alloc(self, need_pages: int) -> np.ndarray | None:
+        """Pop ``need_pages`` free page slots, returning their page ids.
+
+        All-or-nothing: returns ``None`` if the pool cannot satisfy the
+        request in full (no partial alloc, no auto-evict — the tree-cache
+        layer evicts an LRU node and retries, RFC-1.0 §5.1). The returned
+        ids index host page slots directly.
+        """
+        if need_pages <= 0:
+            raise ValueError(f"need_pages must be positive, got {need_pages}")
+        with self._lock:
+            if len(self._free_ids) < need_pages:
+                self._exhaust_count += 1
+                now = time.time()
+                if now - self._last_exhaust_log >= 1.0:
+                    self._last_exhaust_log = now
+                    logger.info(
+                        "host pool %s short on alloc (need=%d, free=%d, size=%d, "
+                        "exhaust_count=%d); tree cache must evict before retry",
+                        self._pool_name,
+                        need_pages,
+                        len(self._free_ids),
+                        self._pool_size,
+                        self._exhaust_count,
+                    )
+                return None
+            pages = [self._free_ids.pop(0) for _ in range(need_pages)]
+            used = self._pool_size - len(self._free_ids)
+            if used > self._peak_used:
+                self._peak_used = used
+        return np.asarray(pages, dtype=np.int64)
+
+    def free(self, host_page_ids) -> None:
+        """Release page slot(s) by id (deduplicated).
+
+        Batched, page-addressed counterpart of :meth:`release`. Rejects a
+        locked page (``lock_ref != 0``) or an already-free page. De-dupes the
+        input so a caller passing repeated ids (e.g. a token list folded to
+        pages elsewhere) does not double-free.
+        """
+        seen: set[int] = set()
+        unique: list[int] = []
+        for pid in host_page_ids:
+            pid = int(pid)
+            if pid not in seen:
+                seen.add(pid)
+                unique.append(pid)
+        with self._lock:
+            for pid in unique:
+                if not (0 <= pid < self._pool_size):
+                    raise ValueError(
+                        f"page id={pid} outside pool range [0, {self._pool_size})"
+                    )
+                if pid in self._free_ids:
+                    raise RuntimeError(f"double free of page id={pid}")
+                if self._lock_ref[pid] != 0:
+                    raise RuntimeError(
+                        f"free of locked page id={pid} (lock_ref={self._lock_ref[pid]})"
+                    )
+                self._slots[pid] = None
+                self._free_ids.append(pid)
+
+    def stage_backup(
+        self, device_indices: list[int], host_buffer_ids: list[int]
+    ) -> None:
+        """Synchronous device-side gather (the D2H read half of a backup).
+
+        Reads the live device KV pages for ``device_indices`` into materialized,
+        independent device arrays held per ``buffer_id`` in ``_pending_gather``.
+        MUST run on the thread that owns the device KV buffer (the scheduler /
+        forward thread), between forward steps: the forward writes KV with
+        donation, deleting the previous ``kv_buffer[layer]`` array every step,
+        so a gather issued on an off-thread worker races that deletion and
+        crashes with "Array has been deleted". Gathering synchronously here and
+        ``block_until_ready`` materializes the (small) pages before control
+        returns, after which the device buffer can be safely donated; the slow
+        host transfer is deferred to :meth:`flush_backup`.
+        """
+        if len(device_indices) != len(host_buffer_ids):
+            raise ValueError(
+                f"device_indices ({len(device_indices)}) and host_buffer_ids "
+                f"({len(host_buffer_ids)}) length mismatch"
+            )
+        if not host_buffer_ids:
+            return
+        for buffer_id in host_buffer_ids:
+            if not (0 <= buffer_id < self._pool_size):
+                raise ValueError(
+                    f"buffer_id={buffer_id} outside pool range [0, {self._pool_size})"
+                )
+        buffers = self._device_pool.kv_buffer
+        n = len(device_indices)
+        # Bucket the page count so each layer's gather compiles once per bucket
+        # (PD pattern), not once per distinct n. Pad with page 0; the padding
+        # rows are gathered then discarded by the per-buffer slice below.
+        n_b = self._pad_to_page_bucket(n)
+        dev_idx_np = np.asarray(device_indices, dtype=np.int32)
+        if n_b > n:
+            dev_idx_np = np.concatenate(
+                [dev_idx_np, np.zeros(n_b - n, dtype=dev_idx_np.dtype)]
+            )
+        page_indices = jax.device_put(
+            dev_idx_np, NamedSharding(self._mesh, PartitionSpec(None))
+        )
+        # One batched gather per layer (page axis back); keep the per-layer loop
+        # so peak HBM stays at one layer's bucket (PD caps it this way too).
+        per_layer = [
+            self._jit_gather_one_layer(
+                buffers[layer], page_indices, self._batched_layer_sharding
+            )
+            for layer in range(self._layer_num)
+        ]
+        packed = jnp.stack(per_layer, axis=0)  # (layer_num, n_b, *per_layer_shape)
+        jax.block_until_ready(packed)
+        # Slice the real pages back per buffer_id (cheap views on the now-
+        # materialized array); padding rows [n:] are dropped.
+        gathered = {bid: packed[:, i] for i, bid in enumerate(host_buffer_ids)}
+        with self._pending_lock:
+            self._pending_gather.update(gathered)
+
+    def flush_backup(self, host_buffer_ids: list[int]) -> None:
+        """Asynchronous host-side transfer (the D2H write half of a backup).
+
+        ``device_put`` the pages gathered by :meth:`stage_backup` into their
+        host slots. Touches only ``_pending_gather`` / ``_slots`` (never the
+        device KV buffer), so it is safe to run on the D2H worker thread while
+        the main thread keeps running forward steps.
+        """
+        if not host_buffer_ids:
+            return
+        # Per-slot host transfer. Runs on the D2H worker thread (off the scheduler
+        # hot path) and was never the profiled bottleneck, so it stays per-slot:
+        # batching here would require slicing a pinned-host array, which has no
+        # CPU implementation and is unnecessary for the critical path.
+        staged: list[jax.Array] = []
+        for buffer_id in host_buffer_ids:
+            with self._pending_lock:
+                packed = self._pending_gather.pop(buffer_id, None)
+            if packed is None:
+                raise RuntimeError(
+                    f"flush_backup with no staged gather for buffer_id={buffer_id}; "
+                    f"stage_backup() must run (synchronously) first"
+                )
+            host_packed = jax.device_put(packed, self._host_sharding)
+            self._slots[buffer_id] = host_packed
+            staged.append(host_packed)
+        jax.block_until_ready(staged)
+
+    def copy_into(self, device_indices: list[int], host_buffer_ids: list[int]) -> None:
+        # Synchronous convenience: gather + host transfer on one thread. Used by
+        # tests and any single-threaded caller. The async HiCache path instead
+        # calls stage_backup() (sync, forward thread) and flush_backup() (worker)
+        # separately so the device read cannot race the KV-buffer donation.
+        self.stage_backup(device_indices, host_buffer_ids)
+        self.flush_backup(host_buffer_ids)
+
+    def copy_to_device(self, host_buffer_ids: list[int], device_indices: list[int]) -> None:
+        # Synchronous convenience: stage (host->device) + scatter (device kernel
+        # write) on one thread. Used by tests and any single-threaded caller. The
+        # async HiCache path instead calls stage_load() (slow device_put, worker
+        # thread, never touches kv_buffer) and flush_load() (cheap aliased kernel
+        # write, buffer-owning thread, donation-safe window) separately so the
+        # slow transfer overlaps the forward and only the cheap scatter has to
+        # serialize with KV-buffer donation.
+        host_buffer_ids = list(host_buffer_ids)
+        self.stage_load(host_buffer_ids)
+        self.flush_load(host_buffer_ids, device_indices)
+
+    def stage_load(self, host_buffer_ids: list[int]) -> None:
+        """Asynchronous host-side read (the slow H2D half of a load-back).
+
+        ``device_put`` each host page slot onto the device into an independent
+        staging array held per ``buffer_id`` in ``_pending_load``. Touches only
+        ``_slots`` / ``_pending_load`` (never the device KV buffer), so it is safe
+        to run on the H2D worker thread while the main thread keeps running
+        forward steps with KV donation. The cheap scatter into ``kv_buffer`` is
+        deferred to :meth:`flush_load`.
+        """
+        if not host_buffer_ids:
+            return
+        # Per-slot host->device transfer. Runs on the H2D worker thread (off the
+        # scheduler hot path) and was never the profiled bottleneck, so it stays
+        # per-slot: batching here would require stacking pinned-host arrays, which
+        # has no CPU implementation and is unnecessary for the critical path.
+        staged: list[jax.Array] = []
+        loaded: dict[int, jax.Array] = {}
+        for buffer_id in host_buffer_ids:
+            if not (0 <= buffer_id < self._pool_size):
+                raise ValueError(
+                    f"buffer_id={buffer_id} outside pool range [0, {self._pool_size})"
+                )
+            slot = self._slots[buffer_id]
+            if slot is None:
+                raise RuntimeError(f"stage_load from empty buffer_id={buffer_id}")
+            packed_dev = jax.device_put(slot, self._device_packed_sharding)
+            loaded[buffer_id] = packed_dev
+            staged.append(packed_dev)
+        jax.block_until_ready(staged)
+        with self._pending_load_lock:
+            self._pending_load.update(loaded)
+
+    def flush_load(self, host_buffer_ids: list[int], device_indices: list[int]) -> None:
+        """Synchronous device scatter (the cheap H2D half of a load-back).
+
+        Writes the pages staged by :meth:`stage_load` into the device KV buffer
+        via the in-place aliased Pallas kernel (``write_kv_layer``), so the write
+        footprint scales with the loaded tokens (not the whole pool). MUST run on
+        the thread that owns the KV buffer, in a donation-safe window (no forward
+        in flight): it reads + reassigns ``kv_buffer[layer]``, which the forward
+        donates every step. ``device_indices`` are GLOBAL device PAGE ids; each is
+        expanded to ``page_size`` absolute token slots for the kernel ``loc``.
+        """
+        if len(host_buffer_ids) != len(device_indices):
+            raise ValueError(
+                f"host_buffer_ids ({len(host_buffer_ids)}) and device_indices "
+                f"({len(device_indices)}) length mismatch"
+            )
+        if not host_buffer_ids:
+            return
+        from sgl_jax.srt.mem_cache.memory_pool import write_kv_layer
+
+        PS = self._page_size
+        staged_pages: list[jax.Array] = []
+        for buffer_id in host_buffer_ids:
+            with self._pending_load_lock:
+                packed = self._pending_load.pop(buffer_id, None)
+            if packed is None:
+                raise RuntimeError(
+                    f"flush_load with no staged page for buffer_id={buffer_id}; "
+                    f"stage_load() must run first"
+                )
+            staged_pages.append(packed)
+
+        n = len(host_buffer_ids)
+        # Bucket the page count so write_kv_layer compiles once per bucket, not
+        # per distinct n. Pad pages by duplicating page 0; the padding tokens get
+        # loc=-1, which the kernel skips, so the duplicate data is never written.
+        n_b = self._pad_to_page_bucket(n)
+        sel = list(range(n)) + [0] * (n_b - n)
+        stack = jnp.stack(
+            [staged_pages[i] for i in sel], axis=0
+        )  # (n_b, layer_num, *per_layer_shape)
+
+        # Expand global page ids -> absolute device token slots (page*PS + offset),
+        # then pad to n_b pages with -1 (skipped by the kernel).
+        dev_pages = np.asarray(device_indices, dtype=np.int64)
+        loc_np = (dev_pages[:, None] * PS + np.arange(PS, dtype=np.int64)).reshape(-1)
+        if n_b > n:
+            loc_np = np.concatenate(
+                [loc_np, -np.ones((n_b - n) * PS, dtype=loc_np.dtype)]
+            )
+        dp = self._device_pool
+        loc = jax.device_put(
+            jnp.asarray(loc_np, dtype=jnp.int32),
+            NamedSharding(dp.mesh, PartitionSpec(dp.attention_data_partition_axis)),
+        )
+        total_tokens = n_b * PS
+        # layer_kv fed to write_kv_layer is [total_tokens, 1, *per_head_tail]. The
+        # fold of (n_b, page_size) -> total_tokens crosses replicated leading axes
+        # but keeps the tensor-sharded head axis, so the reshape needs an explicit
+        # out_sharding (matches write_kv_layer's own fused_sharding).
+        folded_sharding = NamedSharding(
+            dp.mesh,
+            PartitionSpec(
+                dp.attention_data_partition_axis,
+                None,
+                dp.kv_partition_axis,
+                None,
+                None,
+            ),
+        )
+        for layer in range(self._layer_num):
+            # One slice for the whole batch's layer (page axis kept), folded to
+            # tokens — no per-page gather/concatenate.
+            layer_kv = stack[:, layer]  # (n_b, page_size, *per_head_tail)
+            layer_kv = jax.lax.reshape(
+                layer_kv,
+                (total_tokens, 1) + tuple(layer_kv.shape[2:]),
+                out_sharding=folded_sharding,
+            )
+            dp.kv_buffer[layer] = write_kv_layer(
+                layer_kv,
+                loc,
+                dp.kv_buffer[layer],
+                PS,
+                dp.kv_partition_axis,
+                dp.attention_data_partition_axis,
+                dp.mesh,
+            )
+        jax.block_until_ready(dp.kv_buffer)
+
+    def precompile_transfers(self, max_pages: int | None = None) -> None:
+        """Warm up the JIT/Pallas compile of all four transfer kernels for every
+        page bucket up to ``max_pages``, so compilation never lands on the
+        scheduler thread during serving.
+
+        Without this, the first backup/load-back of each new page-bucket shape
+        triggers an XLA (and, for ``flush_load``, a Pallas/Mosaic) compile inline
+        on the scheduler hot path -- the dominant ON-vs-OFF latency gap. Here we
+        drive stage_backup -> flush_backup -> stage_load -> flush_load once per
+        bucket, exercising the exact compiled shapes the serving path will hit.
+        Device pages ``[0, b)`` are used as scratch: safe because serving starts
+        with an empty cache and overwrites every allocated page before any read.
+        """
+        from sgl_jax.srt.disaggregation.prefill import _KV_GATHER_PAGE_BUCKETS
+
+        # Cap at the device pool's PAGE capacity: a single backup/load-back can
+        # at most touch every device page, and no serving transfer ever exceeds
+        # that. ``device_pool.size`` is the token capacity (the same value
+        # kv_cache_builder folds into the host budget), so divide by page_size.
+        dev_pages_total = int(self._device_pool.size) // self._page_size
+        cap = min(self._pool_size, dev_pages_total)
+        if max_pages is not None:
+            cap = min(cap, int(max_pages))
+        if cap <= 0:
+            return
+        buckets = [b for b in _KV_GATHER_PAGE_BUCKETS if b <= cap]
+        if not buckets or buckets[-1] < cap:
+            buckets.append(self._pad_to_page_bucket(cap))
+        t0 = time.perf_counter()
+        warmed = 0
+        for b in buckets:
+            slots = self.alloc(b)
+            if slots is None:
+                logger.warning(
+                    "hicache precompile: host pool too small for bucket=%d "
+                    "(free=%d); stopping warmup early",
+                    b,
+                    self.available_size(),
+                )
+                break
+            host_ids = [int(x) for x in slots]
+            device_idx = list(range(b))
+            try:
+                self.stage_backup(device_idx, host_ids)
+                self.flush_backup(host_ids)
+                self.stage_load(host_ids)
+                self.flush_load(host_ids, device_idx)
+            except Exception as e:
+                # A bucket too large for the write_kv_layer Pallas kernel (SMEM
+                # overflow) must never crash the server: serving never drives a
+                # transfer that big either. Log and stop warming larger buckets.
+                self.free(slots)
+                logger.warning(
+                    "hicache precompile: bucket=%d failed to warm (%s); stopping "
+                    "warmup at the largest kernel-safe bucket",
+                    b,
+                    type(e).__name__,
+                )
+                break
+            self.free(slots)
+            warmed += 1
+        logger.info(
+            "hicache precompile: warmed %d buckets (max=%d pages) in %.1fs",
+            warmed,
+            buckets[warmed - 1] if warmed else 0,
+            time.perf_counter() - t0,
+        )
+
+    def available_size(self) -> int:
+        """Free page slots (HiCache control plane counts in pages)."""
+        with self._lock:
+            return len(self._free_ids)
+
+    def total_size(self) -> int:
+        """Total page slots in the pool (free + in-use)."""
+        return self._pool_size
+
+    def copy_from_device(self, layers: list[jax.Array], buffer_id: int) -> StagedData:
+        # ABC contract only — the HiCache upper layer never calls this (it uses
+        # copy_into so no jax.Array crosses the boundary). Present so the class
+        # is not abstract and so a non-retaining caller could still borrow.
+        if not (0 <= buffer_id < self._pool_size):
+            raise ValueError(
+                f"buffer_id={buffer_id} outside pool range [0, {self._pool_size})"
+            )
+        if len(layers) != self._layer_num:
+            raise ValueError(f"expected {self._layer_num} layers, got {len(layers)}")
+        packed = jnp.stack(list(layers), axis=0)
+        host_packed = jax.device_put(packed, self._host_sharding)
+        jax.block_until_ready(host_packed)
+        self._slots[buffer_id] = host_packed
+        return StagedData(buffer_id=buffer_id, array_pytree=[host_packed])
+
+    # ------------------------------------------------------------------
+    # LRU / lock_ref mechanism (private to this class, not in the ABC).
+    # The pool only provides the mechanism; victim selection lives in the
+    # tree cache (RFC-1.0 §10).
+    # ------------------------------------------------------------------
+
+    def inc_lock_ref(self, buffer_id: int) -> None:
+        with self._lock:
+            if not (0 <= buffer_id < self._pool_size):
+                raise ValueError(
+                    f"buffer_id={buffer_id} outside pool range [0, {self._pool_size})"
+                )
+            self._lock_ref[buffer_id] += 1
+
+    def dec_lock_ref(self, buffer_id: int) -> None:
+        with self._lock:
+            if not (0 <= buffer_id < self._pool_size):
+                raise ValueError(
+                    f"buffer_id={buffer_id} outside pool range [0, {self._pool_size})"
+                )
+            if self._lock_ref[buffer_id] <= 0:
+                raise RuntimeError(f"dec_lock_ref underflow on buffer_id={buffer_id}")
+            self._lock_ref[buffer_id] -= 1
 
 
 def make_unit_mesh() -> Mesh:

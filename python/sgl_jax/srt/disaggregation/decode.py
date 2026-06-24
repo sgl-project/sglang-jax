@@ -6,7 +6,6 @@ import logging
 import threading
 from contextlib import suppress
 from dataclasses import dataclass
-from functools import partial
 from typing import TYPE_CHECKING
 
 import jax
@@ -27,60 +26,6 @@ if TYPE_CHECKING:
     from sgl_jax.srt.managers.scheduler import Scheduler
 
 logger = logging.getLogger(__name__)
-
-
-@partial(
-    jax.jit,
-    static_argnames=(
-        "page_size",
-        "kv_partition_axis",
-        "attention_data_partition_axis",
-        "mesh",
-    ),
-    donate_argnames=("kv_cache",),
-)
-def _jit_write_one_layer(
-    layer_kv,
-    loc,
-    kv_cache,
-    page_size,
-    kv_partition_axis,
-    attention_data_partition_axis,
-    mesh,
-):
-    """One-layer PD KV write, wrapped in a module-level ``jax.jit``.
-
-    The stable module-level ``jax.jit`` makes the trace cache hit on shape +
-    static args so the Pallas write kernel compiles once per write shape and is
-    reused thereafter.
-    """
-    from sgl_jax.srt.mem_cache.memory_pool import _set_fused_kv_buffer
-
-    total_tokens = loc.shape[0]
-    fused_sharding = NamedSharding(
-        mesh,
-        PartitionSpec(
-            attention_data_partition_axis,
-            None,
-            kv_partition_axis,
-            None,
-            None,
-        ),
-    )
-    fused = jax.lax.reshape(
-        layer_kv,
-        (total_tokens, 1) + tuple(layer_kv.shape[2:]),
-        out_sharding=fused_sharding,
-    )
-    return _set_fused_kv_buffer(
-        fused_kv=fused,
-        loc=loc,
-        kv_cache=kv_cache,
-        page_size=page_size,
-        kv_partition_axis=kv_partition_axis,
-        attention_data_partition_axis=attention_data_partition_axis,
-        mesh=mesh,
-    )
 
 
 @dataclass
@@ -666,11 +611,13 @@ class SchedulerDisaggregationDecodeMixin:
             jnp.asarray(loc_np),
             NamedSharding(kv_pool.mesh, PartitionSpec(kv_pool.attention_data_partition_axis)),
         )
+        from sgl_jax.srt.mem_cache.memory_pool import write_kv_layer
+
         for i, layer_id in enumerate(
             range(kv_pool.start_layer, kv_pool.start_layer + kv_pool.layer_num)
         ):
             layer_idx = layer_id - kv_pool.start_layer
-            kv_pool.kv_buffer[layer_idx] = _jit_write_one_layer(
+            kv_pool.kv_buffer[layer_idx] = write_kv_layer(
                 kv[i],
                 loc,
                 kv_pool.kv_buffer[layer_idx],

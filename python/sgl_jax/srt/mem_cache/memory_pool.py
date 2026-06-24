@@ -3,6 +3,7 @@ from __future__ import annotations
 import abc
 import logging
 import time
+from functools import partial
 from typing import TYPE_CHECKING
 
 import jax
@@ -846,6 +847,63 @@ def _set_fused_kv_buffer(
     )
 
 
+@partial(
+    jax.jit,
+    static_argnames=(
+        "page_size",
+        "kv_partition_axis",
+        "attention_data_partition_axis",
+        "mesh",
+    ),
+    donate_argnames=("kv_cache",),
+)
+def write_kv_layer(
+    layer_kv,
+    loc,
+    kv_cache,
+    page_size,
+    kv_partition_axis,
+    attention_data_partition_axis,
+    mesh,
+):
+    """One-layer in-place KV write, wrapped in a module-level ``jax.jit``.
+
+    Shared by PD decode write-back and HiCache H2D load-back. ``layer_kv`` is
+    ``[total_tokens, *per_token_shape]``; ``loc`` is per-token absolute pool
+    slots (-1 marks padding, skipped). The write goes through the in-place
+    Pallas kernel (``_set_fused_kv_buffer`` -> ``update_fused_kv_cache_vectorized``
+    with ``input_output_aliases``), so the footprint scales with the tokens
+    written, not the whole pool. The stable module-level ``jax.jit`` makes the
+    trace cache hit on shape + static args so the kernel compiles once per write
+    shape and is reused thereafter.
+    """
+    total_tokens = loc.shape[0]
+    fused_sharding = NamedSharding(
+        mesh,
+        P(
+            attention_data_partition_axis,
+            None,
+            kv_partition_axis,
+            None,
+            None,
+        ),
+    )
+    fused = jax.lax.reshape(
+        layer_kv,
+        (total_tokens, 1) + tuple(layer_kv.shape[2:]),
+        out_sharding=fused_sharding,
+    )
+    return _set_fused_kv_buffer(
+        fused_kv=fused,
+        loc=loc,
+        kv_cache=kv_cache,
+        page_size=page_size,
+        kv_partition_axis=kv_partition_axis,
+        attention_data_partition_axis=attention_data_partition_axis,
+        mesh=mesh,
+    )
+
+
 def update_fused_kv_cache(
     fused_kv: jax.Array,  # [tokens, 1, heads*2//packing, packing, head_dim]
     loc: jax.Array,  # [total_tokens], -1 for padding
@@ -962,6 +1020,31 @@ def update_fused_kv_cache_vectorized(
     Vectorized fused KV cache update that handles padding and supports page_size > 1
     by grouping contiguous tokens into page-sized chunks for efficient updates.
     """
+
+    # CPU has no Mosaic backend, so the Pallas kernel below cannot lower there.
+    # Fall back to a pure-JAX scatter with identical semantics (write each token's
+    # fused KV into the flattened pool slot given by ``loc``; -1 is dropped). This
+    # keeps the fused write path runnable under unit tests on CPU; TPU still uses
+    # the in-place kernel.
+    if jax.default_backend() != "tpu":
+        flat_spec = P(data_partition_axis, kv_partition_axis, None, None)
+        cache_spec = P(data_partition_axis, None, kv_partition_axis, None, None)
+        if mesh is not None:
+            flat_out = NamedSharding(mesh, flat_spec)
+            cache_out = NamedSharding(mesh, cache_spec)
+        else:
+            flat_out, cache_out = flat_spec, cache_spec
+        flat = jax.lax.reshape(
+            kv_cache,
+            (kv_cache.shape[0] * kv_cache.shape[1],) + tuple(kv_cache.shape[2:]),
+            out_sharding=flat_out,
+        )
+        loc_i = loc.astype(jnp.int32)
+        safe = jnp.where(loc_i == -1, flat.shape[0], loc_i)
+        flat = flat.at[safe].set(
+            fused_kv[:, 0], mode="drop", out_sharding=flat_out
+        )
+        return jax.lax.reshape(flat, kv_cache.shape, out_sharding=cache_out)
 
     @jax.shard_map(
         in_specs=(
