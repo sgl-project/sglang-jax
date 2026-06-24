@@ -1114,25 +1114,6 @@ class TestNaiveAttentionOracleVsHF(unittest.TestCase):
 
 
 # ===========================================================================
-# Worktree source guard
-# ===========================================================================
-
-
-class TestStep3p5AttentionWorktreeSource(unittest.TestCase):
-    """Ensure worktree source is loaded."""
-
-    def test_source_is_from_worktree(self):
-        import inspect
-
-        from sgl_jax.srt.models import step3p5
-
-        src = inspect.getsourcefile(step3p5)
-        self.assertIsNotNone(src)
-        self.assertIn(
-            "step35-flash",
-            src,
-            f"step3p5 module not from worktree: {src!r}",
-        )
 
 
 if __name__ == "__main__":
