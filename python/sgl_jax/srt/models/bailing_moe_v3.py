@@ -47,6 +47,8 @@ from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.layers.moe import (
     EPMoE,
     FusedEPMoE,
+    FusedEPMoEV2,
+    FusedTPMoEV4,
     GateLogit,
     TopK,
     create_moe_weights_mapping,
@@ -365,7 +367,11 @@ class BailingMoeV3DecoderLayer(nnx.Module):
         )
         self.is_moe_layer = is_sparse
         self.moe_backend = getattr(config, "moe_backend", MoEBackend.EPMOE)
-        self.use_fused = self.moe_backend == MoEBackend.FUSED
+        self.use_fused = self.moe_backend in (
+            MoEBackend.FUSED,
+            MoEBackend.FUSED_V2,
+            MoEBackend.FUSED_V4,
+        )
 
         if not is_sparse:
             self.mlp = DeepseekV3MLP(
@@ -400,7 +406,13 @@ class BailingMoeV3DecoderLayer(nnx.Module):
                 # Named ``mlp`` (mutually exclusive with the dense path) so the
                 # MoE expert weight source path matches the Bailing checkpoint
                 # layout ``model.layers.N.mlp.experts.*``.
-                self.mlp = FusedEPMoE(
+                if self.moe_backend == MoEBackend.FUSED_V4:
+                    fused_cls = FusedTPMoEV4
+                elif self.moe_backend == MoEBackend.FUSED_V2:
+                    fused_cls = FusedEPMoEV2
+                else:
+                    fused_cls = FusedEPMoE
+                self.mlp = fused_cls(
                     hidden_size=config.hidden_size,
                     num_experts=config.num_experts,
                     num_experts_per_tok=config.num_experts_per_tok,
@@ -697,6 +709,13 @@ class BailingMoeV3ForCausalLM(nnx.Module):
 
     def _post_load_weights(self):
         """Split kv_b_proj into absorbed w_uk/w_uv for MLA layers; guard KDA gates."""
+        # FusedTPMoEV4 EP→TP reshard (must run before MLA/KDA post-load hooks
+        # that may null out weight attributes).
+        for layer in self.model.layers:
+            mlp = getattr(layer, "mlp", None)
+            if isinstance(mlp, FusedTPMoEV4):
+                mlp.reshape_weights_for_tp()
+
         for layer in self.model.layers:
             attn = layer.self_attn
             if hasattr(attn, "post_load_weights"):
@@ -997,6 +1016,17 @@ class BailingMoeV3ForCausalLM(nnx.Module):
         self, mappings: dict, prefix: str, target: str, layer_idx: int,
     ) -> None:
         config = self.config
+
+        # FusedTPMoEV4 replicates all experts on every chip; EPLB phy→log
+        # remapping is meaningless and dangerous here.
+        if self.moe_backend == MoEBackend.FUSED_V4:
+            metadata = get_global_expert_location_metadata()
+            if metadata is not None:
+                raise NotImplementedError(
+                    "moe_backend=fused_v4 is incompatible with EPLB expert metadata. "
+                    "FusedTPMoEV4 replicates all experts across chips; phy→log "
+                    "remapping has no valid semantics."
+                )
 
         # Router gate
         mappings[f"{prefix}.mlp.gate.weight"] = WeightMapping(

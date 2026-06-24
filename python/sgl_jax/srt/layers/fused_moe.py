@@ -1,5 +1,7 @@
 """Fused Expert-Parallel MoE layer using Pallas kernel."""
 
+import logging
+
 import jax
 from flax import nnx
 from jax import numpy as jnp
@@ -680,4 +682,105 @@ class FusedEPMoEV2(FusedEPMoE):
             output = jax.sharding.reshard(
                 output, jax.sharding.NamedSharding(self.mesh, P("data", None))
             )
+        return output
+
+    def reshape_weights_for_tp(self):
+        """EP→TP weight reshard for FusedTPMoEV4.
+
+        Gathers each expert weight from EP→replicated→TP, then deletes the
+        original EP reference + the replicated intermediate to avoid HBM peak
+        doubling (~6 GiB/weight on 512-expert 768×2560 config).
+        """
+        import jax
+
+        full_w1 = jax.device_put(self.w1.value, jax.sharding.NamedSharding(self.mesh, P()))
+        full_w1.block_until_ready()
+        self.w1_tp = nnx.Param(jax.device_put(full_w1, jax.sharding.NamedSharding(self.mesh, P(None, None, "tensor"))))
+        full_w1.delete()
+        delattr(self, "w1")
+
+        full_w3 = jax.device_put(self.w3.value, jax.sharding.NamedSharding(self.mesh, P()))
+        full_w3.block_until_ready()
+        self.w3_tp = nnx.Param(jax.device_put(full_w3, jax.sharding.NamedSharding(self.mesh, P(None, None, "tensor"))))
+        full_w3.delete()
+        delattr(self, "w3")
+
+        full_w2 = jax.device_put(self.w2.value, jax.sharding.NamedSharding(self.mesh, P()))
+        full_w2.block_until_ready()
+        self.w2_tp = nnx.Param(jax.device_put(full_w2, jax.sharding.NamedSharding(self.mesh, P(None, "tensor", None))))
+        full_w2.delete()
+        delattr(self, "w2")
+
+
+class FusedTPMoEV4(FusedEPMoE):
+    """Tensor-Parallel MoE layer (v4 kernel, ported from AInfer).
+
+    Holds ALL experts on every chip but with the intermediate dim TP-sharded
+    1/tp. Replaces the EP a2a / barrier with a single psum across the tp axis.
+    bf16-only; no quantization, no in-kernel shared expert, incompatible with
+    EPLB (TP replicates every expert).
+    """
+
+    def __init__(self, *args, **kwargs):
+        import logging
+
+        logger = logging.getLogger(__name__)
+
+        kwargs.setdefault("num_shared_experts", 0)
+        quantization_config = kwargs.get("quantization_config", None)
+
+        super().__init__(*args, **kwargs)
+
+        if get_global_expert_location_metadata() is not None:
+            raise NotImplementedError("FUSED_V4 incompatible with EPLB (TP replicates all experts).")
+        if self.num_shared_experts > 0:
+            raise NotImplementedError("FUSED_V4 expects external shared expert (num_shared_experts=0).")
+        if quantization_config is not None and (
+            quantization_config.get_moe_weight_dtype() is not None
+            or quantization_config.get_moe_activation_dtype() is not None
+        ):
+            raise NotImplementedError("FUSED_V4 is bf16-only; quantization unsupported.")
+        logger.info("FusedTPMoEV4 layer %d: initialized (bf16 TP-MoE)", self.layer_id)
+
+    def __call__(
+        self,
+        hidden_states: jax.Array,
+        topk_weights: jax.Array,
+        topk_ids: jax.Array,
+        *,
+        block_config=None,
+        out_sharding: jax.sharding.Sharding | None = None,
+    ) -> jax.Array:
+        from sgl_jax.srt.kernels.fused_moe.v4.kernel import tp_moe_per_device
+
+        assert hidden_states.ndim == 2
+        topk_ids = jnp.asarray(topk_ids, dtype=jnp.int32)
+
+        output = jax.shard_map(
+            tp_moe_per_device,
+            mesh=self.mesh,
+            in_specs=(
+                P("data", None),
+                P(None, None, "tensor"),
+                P(None, "tensor", None),
+                P(None, None, "tensor"),
+                P("data", None),
+                P("data", None),
+            ),
+            out_specs=P("data", None),
+            check_rep=False,
+        )(
+            hidden_states,
+            self.w1_tp.value,
+            self.w2_tp.value,
+            self.w3_tp.value,
+            topk_ids,
+            topk_weights,
+            num_experts=self.num_experts,
+            tp_axis_name="tensor",
+        )
+
+        output = jax.sharding.reshard(
+            output, jax.sharding.NamedSharding(self.mesh, P("data", None))
+        )
         return output
