@@ -785,8 +785,17 @@ class FusedTPMoEV4(FusedEPMoE):
         assert hidden_states.ndim == 2
         topk_ids = jnp.asarray(topk_ids, dtype=jnp.int32)
 
-        output = jax.shard_map(
+        # shard_map doesn't accept extra kwargs when called — bind static args
+        # via functools.partial before wrapping.
+        import functools
+        bound_kernel = functools.partial(
             tp_moe_per_device,
+            num_experts=self.num_experts,
+            tp_axis_name="tensor",
+        )
+
+        output = jax.shard_map(
+            bound_kernel,
             mesh=self.mesh,
             in_specs=(
                 P("data", None),
@@ -804,8 +813,6 @@ class FusedTPMoEV4(FusedEPMoE):
             self.w3_tp.value,
             topk_ids,
             topk_weights,
-            num_experts=self.num_experts,
-            tp_axis_name="tensor",
         )
 
         output = jax.sharding.reshard(
