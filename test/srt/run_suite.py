@@ -250,6 +250,16 @@ suites = {
     "nightly-infra-smoke-tpu-v6e-1": [
         TestFile("test_nightly_infra_smoke.py", 15),
     ],
+    # Recurrent extra-buffer serving determinism (Qwen3.5-35B-A3B, tp=4, page-128):
+    # cache-on output byte-identical to --disable-radix-cache. Too heavy for per-PR
+    # (2x 35B server launches) -> nightly on v6e-4.
+    "nightly-recurrent-e2e-tpu-v6e-4": [
+        TestFile(
+            "test/srt/test_unified_radix_cache_serving.py",
+            8,
+            ["TestUnifiedRadixCacheServingRecurrent.test_recurrent_hit_flush_determinism"],
+        ),
+    ],
     "sglang_dependency_test": [],
     "unit-test-tpu-v6e-1": [
         TestFile("python/sgl_jax/test/kernels/quantized_linear_test.py", 0.3, runner="pytest"),

@@ -357,6 +357,33 @@ jobs:
           gh pr comment "$PR_NUMBER" --repo "$REPO" \
             --body "> **Nightly (perf)** [\`$CASE_KEY\`]($RUN_URL): **$status** — see the run's step summary."
 
+  nightly-recurrent-e2e-4-tpu-daily:
+    if: github.repository == 'sgl-project/sglang-jax' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-recurrent-e2e-4-tpu-daily')
+    runs-on: arc-runner-v6e-4
+    # Runs PR-HEAD code under /run-nightly → read-only, no write token.
+    permissions:
+      contents: read
+    env:
+      TZ: Asia/Shanghai
+      JAX_COMPILATION_CACHE_DIR: /xla-cache
+      SGLANG_JAX_MODEL_CACHE: /models/model_scope
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          persist-credentials: false
+      - name: Setup Python environment
+        uses: ./.github/actions/setup-venv
+      - name: Run recurrent determinism e2e (v6e-4)
+        # Run from repo root (unlike the sibling daily jobs' `cd test/srt`) so the
+        # suite's test/srt-prefixed path also resolves under rerun-test.yml (/rerun-group).
+        # ~8-min test + 2x Qwen3.5-35B-A3B load & compile; load dominates and is bimodal
+        # (warm ~29s vs cold gcsfuse ~14-40min each), so keep timeout margin.
+        timeout-minutes: 90
+        run: |
+          python3 test/srt/run_suite.py --suite nightly-recurrent-e2e-tpu-v6e-4
+
   # Trend drift: detect on v6e-4 (only it can read the /observability-storage
   # mount), alert from ubuntu (has gh), connected by a drift.json artifact.
   # Both continue-on-error so monitoring never fails the nightly run.
@@ -437,6 +464,7 @@ jobs:
       nightly-infra-smoke-1-tpu-daily,
       nightly-test-accuracy-text-models-4-tpu-daily,
       nightly-test-perf-text-models-4-tpu-daily,
+      nightly-recurrent-e2e-4-tpu-daily,
       nightly-trend-monitor,
       nightly-trend-alert,
     ]
@@ -453,6 +481,7 @@ jobs:
           echo "infra-smoke-1-tpu-daily: ${{ needs.nightly-infra-smoke-1-tpu-daily.result }}"
           echo "accuracy-4-tpu-daily: ${{ needs.nightly-test-accuracy-text-models-4-tpu-daily.result }}"
           echo "perf-4-tpu-daily: ${{ needs.nightly-test-perf-text-models-4-tpu-daily.result }}"
+          echo "recurrent-e2e-4-tpu-daily: ${{ needs.nightly-recurrent-e2e-4-tpu-daily.result }}"
           # Visibility only, NOT gated: by design (continue-on-error) monitoring
           # never changes the nightly conclusion; a 'failure' just flags it broke.
           echo "trend-monitor (not gated): ${{ needs.nightly-trend-monitor.result }}"
@@ -467,7 +496,8 @@ jobs:
             "multi-host-mimo-flash-daily=${{ needs.multi-host-test-mimo-flash-daily.result }}" \
             "infra-smoke-1-tpu-daily=${{ needs.nightly-infra-smoke-1-tpu-daily.result }}" \
             "accuracy-4-tpu-daily=${{ needs.nightly-test-accuracy-text-models-4-tpu-daily.result }}" \
-            "perf-4-tpu-daily=${{ needs.nightly-test-perf-text-models-4-tpu-daily.result }}"; do
+            "perf-4-tpu-daily=${{ needs.nightly-test-perf-text-models-4-tpu-daily.result }}" \
+            "recurrent-e2e-4-tpu-daily=${{ needs.nightly-recurrent-e2e-4-tpu-daily.result }}"; do
             job_name="${job_result%%=*}"
             result="${job_result#*=}"
             if [ "$job_name" = "multi-host-mimo-flash-daily" ] && [ "$result" = "skipped" ]; then
