@@ -11,6 +11,7 @@ Run on TPU from python/ directory::
 
 from __future__ import annotations
 
+import math
 import os
 import tempfile
 import unittest
@@ -43,6 +44,25 @@ _HEAD_DIM = 128
 _NUM_LAYERS = 5
 _SLIDING_WIN = 16
 _NUM_TOKENS = 24  # > window so SWA boundary is exercised
+
+# --- Theory-derived flash-vs-naive tolerance (notes §2.1-2.2, §2.5) ---
+# flash (Pallas) and naive (einsum) matmuls both run on the TPU MXU at bf16 precision
+# (bf16×bf16→fp32 accumulate) but with DIFFERENT reduction order. Weight/activation
+# rounding to bf16 is identical for both paths (same inputs) so it cancels in the
+# difference; the floor is set by the bf16-MXU reduction-order disagreement:
+#   per-stage floor = √2 · ε_bf16   (two independent bf16 roundings, §2.5; ε_bf16=2⁻⁷≈7.8e-3)
+#                   ≈ 1.1e-2
+#   cross-depth     × √(depth)       (§2.2 推论二: ~√L random-walk, residual/norm suppressed)
+# Same constant applies to the fp32-weight and bf16-weight runs (the weight rounding cancels).
+# Tolerance = floor × safety(2). DECISION (argmax) is the hard gate (notes ⑭); the numeric
+# assert is a calibrated TRIPWIRE, not a pinned constant. Absolute atol = rtol × signal scale.
+# Real 45-layer model scales by √(46/6)≈2.8× → there the decision gate, not numeric, governs.
+_EPS_BF16 = 2.0**-7  # ≈ 7.8e-3 (ulp convention, notes §2.2)
+_PERSTAGE = math.sqrt(2.0) * _EPS_BF16  # ≈ 1.1e-2  single matmul, flash vs naive
+_RTOL_ATTN = round(_PERSTAGE * 2.0, 4)  # ≈ 0.022  single attention stage × safety
+_RTOL_LOGITS = round(
+    _PERSTAGE * math.sqrt(_NUM_LAYERS + 1) * 2.0, 4
+)  # ≈ 0.054  (5 layers + lm_head)
 
 _RNG = np.random.default_rng(7)
 
@@ -368,9 +388,15 @@ class TestFlashVsNaiveFp32(unittest.TestCase):
         self.assertEqual(int(f.argmax()), int(n.argmax()), "flash vs naive greedy token differs")
         f5, n5 = set(f.argsort()[-5:].tolist()), set(n.argsort()[-5:].tolist())
         self.assertGreaterEqual(len(f5 & n5), 4, f"top-5 overlap {len(f5 & n5)}/5 (flash vs naive)")
-        # Calibrated numeric tripwire (fp32 accumulation, not a 1e-3 constant).
+        # Theory-derived numeric tripwire (not 1e-3): rel = √2·ε_bf16·√(L+1)·safety = _RTOL_LOGITS.
+        # Absolute floor = rel × signal scale (so near-zero logits don't false-fail).
+        scale = float(np.max(np.abs(n)))
         np.testing.assert_allclose(
-            f, n, rtol=0.05, atol=0.4, err_msg="flash logits beyond calibrated fp32 band"
+            f,
+            n,
+            rtol=_RTOL_LOGITS,
+            atol=_RTOL_LOGITS * scale,
+            err_msg=f"flash logits beyond theory band rtol={_RTOL_LOGITS} (bf16-MXU reduction floor)",
         )
 
     def test_flash_equals_naive_fp32_swa_layer(self):
@@ -397,10 +423,11 @@ class TestFlashVsNaiveFp32(unittest.TestCase):
         np.testing.assert_allclose(
             np.asarray(flash_out),
             np.asarray(naive_out),
-            rtol=0.02,
-            atol=0.05,
+            rtol=_RTOL_ATTN,
+            atol=_RTOL_ATTN * float(np.max(np.abs(np.asarray(naive_out)))),
             err_msg=(
-                "flash SWA attention output != naive (W=16, T=24) beyond fp32 band. "
+                f"flash SWA attention output != naive (W=16, T=24) beyond theory band "
+                f"rtol={_RTOL_ATTN} (single-stage √2·ε_bf16·safety). "
                 "Positions outside the window must be masked as (k<=q)∧(q-k<W)."
             ),
         )
@@ -464,6 +491,16 @@ class TestFlashVsNaiveBf16(unittest.TestCase):
         )
         f5, n5 = set(f.argsort()[-5:].tolist()), set(n.argsort()[-5:].tolist())
         self.assertGreaterEqual(len(f5 & n5), 4, f"bf16 top-5 overlap {len(f5 & n5)}/5")
+        # Same theory band: weight bf16-rounding is identical for flash & naive (cancels in the
+        # diff); floor is the bf16-MXU reduction-order term = _RTOL_LOGITS. atol = rel × scale.
+        scale = float(np.max(np.abs(n)))
+        np.testing.assert_allclose(
+            f,
+            n,
+            rtol=_RTOL_LOGITS,
+            atol=_RTOL_LOGITS * scale,
+            err_msg=f"bf16 flash logits beyond theory band rtol={_RTOL_LOGITS}",
+        )
 
 
 if __name__ == "__main__":
