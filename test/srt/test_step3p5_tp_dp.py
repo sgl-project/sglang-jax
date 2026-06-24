@@ -50,6 +50,12 @@ def _launch(model_dir, dp):
         DEFAULT_URL_FOR_TEST,
         timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
         device="tpu",
+        # The evidence probe requests top-64 logprobs, an uncommon path that
+        # precompile does not cover → a JIT recompile (cache miss). That recompile
+        # is correct, just slow, so disable the cache-miss guard which would
+        # otherwise kill the server before the probe returns. (Production serving
+        # tests keep the guard; this is a diagnostic.)
+        check_cache_miss=False,
         other_args=_BASE_ARGS
         + [
             "--disable-radix-cache",
