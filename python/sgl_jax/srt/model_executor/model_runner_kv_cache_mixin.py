@@ -466,6 +466,26 @@ class ModelRunnerKVCacheMixin:
             budget_cap -= budget_cap % self.dp_size
             max_num_reqs = min(max_num_reqs, budget_cap)
 
+            # Snapshot headroom = pool slots left after the running reservation
+            # (max_num_reqs * factor). Near-zero headroom means the recurrent
+            # radix cache can't hold cross-request snapshots while running is
+            # saturated; admission then back-pressures. Warn so the operator can
+            # raise --max-recurrent-state-size for reuse.
+            snapshot_headroom = self.server_args.max_recurrent_state_size - max_num_reqs * factor
+            if snapshot_headroom < self.dp_size:
+                logger.warning(
+                    "Recurrent pool has near-zero snapshot headroom "
+                    "(max_recurrent_state_size=%d, max_running=%d, factor=%d -> "
+                    "%d slot(s) for cached snapshots). Cross-request reuse will "
+                    "be ~0 at saturation; raise --max-recurrent-state-size "
+                    "(e.g. > max_running*%d) to enable reuse.",
+                    self.server_args.max_recurrent_state_size,
+                    max_num_reqs,
+                    factor,
+                    snapshot_headroom,
+                    factor,
+                )
+
         return max_num_reqs
 
     def _maybe_wrap_hybrid_kv_pool(

@@ -1775,6 +1775,23 @@ class Scheduler(
             ):
                 continue
 
+            # Recurrent backpressure: a new req needs per_req recurrent slots
+            # (1 running, +2 ping-pong under extra-buffer) that the running
+            # reservation can't evict. If this rank's free + evictable recurrent
+            # slots can't cover the reqs already queued plus this one, defer it
+            # rather than let alloc_req_slots raise (the pool is non-evictable
+            # while in flight, so over-subscription must throttle, not crash).
+            if self.tree_cache is not None and self.tree_cache.supports_recurrent():
+                per_req = 3 if self.tree_cache.enable_recurrent_extra_buffer else 1
+                demand = per_req * (len(adder.can_run_list[dp_rank]) + 1)
+                free = self.req_to_token_pool.recurrent_available_size(dp_rank)
+                evictable = self.tree_cache.recurrent_evictable_size(dp_rank)
+                if free + evictable < demand:
+                    self.running_batch.reqs_info[dp_rank].batch_is_full = True
+                    if self.running_batch.batch_is_full:
+                        break
+                    continue
+
             # Affected recurrent multi-host path: defer reqs that would push the
             # GLOBAL selected EXTEND bucket past the safe per_dp_bs. Overflow stays
             # in the waiting queue and runs next iteration (clean split via deferral).

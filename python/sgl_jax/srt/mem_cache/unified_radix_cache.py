@@ -232,6 +232,11 @@ class UnifiedRadixCache(BasePrefixCache):
             and self.recurrent_track_interval is not None
         )
 
+    def recurrent_evictable_size(self, dp_rank: int = 0) -> int:
+        """Unlocked tree-owned recurrent slots on ``dp_rank`` — what ``evict``
+        can reclaim (protected/locked snapshots excluded)."""
+        return self.component_evictable_size_[ComponentType.RECURRENT][dp_rank]
+
     def assert_recurrent_slot_ledger(self, dp_rank: int = 0, live_reqs: list | None = None) -> int:
         """Per-rank invariant ``active + tree_owned + free == slots_per_rank``;
         returns the derived ``active`` (request-owned) count. Tree-owned =
