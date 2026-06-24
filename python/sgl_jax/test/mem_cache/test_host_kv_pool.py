@@ -402,6 +402,24 @@ class TestLRUHostKVPoolStageDrainErrors(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.pool.stage_load([b])
 
+    def test_free_drops_pending_gather(self):
+        # free() must drop a slot's orphaned D2H gather so a reused id can't have
+        # a later flush_backup pop stale data into it.
+        pages = [int(p) for p in self.pool.alloc(1)]
+        self.pool.stage_backup([0], pages)
+        self.pool.free(pages)
+        with self.assertRaises(RuntimeError):
+            self.pool.flush_backup(pages)
+
+    def test_release_drops_pending_load(self):
+        # release() must drop a slot's orphaned H2D staged page for the same reason.
+        b = self.pool.reserve()
+        self.pool.copy_into([0], [b])
+        self.pool.stage_load([b])
+        self.pool.release(b)
+        with self.assertRaises(RuntimeError):
+            self.pool.flush_load([b], [0])
+
 
 class TestLRUHostKVPoolPrecompile(unittest.TestCase):
     """precompile_transfers warms one shape per page count serving can hit and

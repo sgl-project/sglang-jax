@@ -1,11 +1,20 @@
 """Host-staging KV pools (pinned host memory).
 
-Two concrete pools share one ABC:
+    HostKVPool (ABC)              backend-agnostic contract; page-id boundary
+    │                            (every int crossing in/out is a page id,
+    │                             raiden-block-switchable; no jax.Array crosses)
+    ├── QueueHostKVPool          PD disaggregation: bounded FIFO, one-shot slots
+    │                            (reserve -> copy_from_device -> release; no LRU)
+    └── LRUHostKVPool            HiCache L2: slots RETAIN data until released;
+                                 page-addressed, lock_ref-protected
 
-- :class:`QueueHostKVPool` — PD disaggregation. A bounded FIFO of one-shot
-  slots; each borrow lives for a single D2H transfer (no retention, no LRU).
-- :class:`LRUHostKVPool` — HiCache L2. Slots RETAIN their data until released;
-  page-addressed control plane with lock_ref, ready for a raiden block backend.
+LRUHostKVPool transfers are two-phase, split by which thread may touch the live
+KV buffer (the forward donates it every step):
+
+    D2H backup:    stage_backup (sync gather, KV-owning thread)
+                   -> flush_backup (async host put, D2H worker)
+    H2D load-back: stage_load   (async device put, H2D worker)
+                   -> flush_load (sync scatter, KV-owning thread, donation-safe)
 """
 
 from __future__ import annotations
@@ -258,22 +267,15 @@ class QueueHostKVPool(HostKVPool):
 class LRUHostKVPool(HostKVPool):
     """Retaining host pool for HiCache L2.
 
-    A slot RETAINS its data (staged via :meth:`copy_into`, read back via
-    :meth:`copy_to_device`, held until :meth:`release`). Each slot holds one KV
-    page packed over all layers as a single pinned-host ``jax.Array`` of shape
-    ``(layer_num, *per_layer_shape)``; retention is just keeping the reference,
-    so there is no ``dynamic_update_slice`` on sharded host memory (which crashes
-    multi-chip — the MegaScale issue from the HiCache+PD spike).
-
-    The control plane is PAGE-addressed: every ``int`` crossing the boundary is a
-    page id (a ``buffer_id`` is a host page-slot id; the paired device index is a
-    page index into ``kv_buffer``). The radix layer folds token-level
-    ``node.value`` to pages before calling in. ``available_size`` / ``total_size``
-    count PAGES. No host ``jax.Array`` crosses the boundary, so the storage
-    backend is raiden-switchable (its block interface is also page-grained).
+    Each slot holds one KV page packed over all layers as a single pinned-host
+    ``jax.Array`` ``(layer_num, *per_layer_shape)``; retention = keeping the
+    reference, avoiding ``dynamic_update_slice`` on sharded host (multi-chip
+    crash, the MegaScale issue from the HiCache+PD spike). Page-addressed: every
+    ``int`` crossing the boundary is a page id, and ``available_size`` /
+    ``total_size`` count pages.
 
     ``self._lock`` guards only the free-list and ``_lock_ref``; per-slot
-    writes/reads rely on the caller holding an exclusive reservation.
+    reads/writes rely on the caller holding an exclusive reservation.
     """
 
     def __init__(
@@ -345,10 +347,9 @@ class LRUHostKVPool(HostKVPool):
     # ------------------------------------------------------------------
 
     def reserve(self) -> int | None:
-        # Pure free-list pop; does NOT auto-evict. When full it returns None and
-        # the tree-cache layer is responsible for releasing an LRU slot before
-        # retry (RFC-1.0 §5.1) — the pool cannot evict because only the tree
-        # knows which buffer_id a node still points at.
+        # Free-list pop, no auto-evict: returns None when full. The pool can't
+        # evict (only the tree cache knows which buffer_id a node points at), so
+        # the tree cache must release an LRU slot before retrying.
         with self._lock:
             if not self._free_ids:
                 self._exhaust_count += 1
@@ -383,6 +384,7 @@ class LRUHostKVPool(HostKVPool):
                     f"release of locked buffer_id={buffer_id} "
                     f"(lock_ref={self._lock_ref[buffer_id]})"
                 )
+            self._drop_pending(buffer_id)
             self._slots[buffer_id] = None
             self._free_ids.append(buffer_id)
 
@@ -394,8 +396,8 @@ class LRUHostKVPool(HostKVPool):
         """Pop ``need_pages`` free page slots, returning their ids.
 
         All-or-nothing: returns ``None`` if the request can't be satisfied in
-        full (no partial alloc, no auto-evict — the tree-cache layer evicts an
-        LRU node and retries, RFC-1.0 §5.1).
+        full (no partial alloc, no auto-evict — the tree cache evicts an LRU
+        node and retries).
         """
         if need_pages <= 0:
             raise ValueError(f"need_pages must be positive, got {need_pages}")
@@ -443,21 +445,19 @@ class LRUHostKVPool(HostKVPool):
                     raise RuntimeError(
                         f"free of locked page id={pid} (lock_ref={self._lock_ref[pid]})"
                     )
+                self._drop_pending(pid)
                 self._slots[pid] = None
                 self._free_ids.append(pid)
 
     def stage_backup(
         self, device_indices: list[int], host_buffer_ids: list[int]
     ) -> None:
-        """Synchronous device-side gather (D2H read half of a backup).
+        """D2H phase 1: gather live device pages into per-buffer staging arrays.
 
-        Gathers the live device KV pages for ``device_indices`` into independent
-        device arrays held per ``buffer_id`` in ``_pending_gather``. MUST run on
-        the thread owning the KV buffer, between forward steps: the forward
-        donates ``kv_buffer[layer]`` every step, so an off-thread gather races
-        that deletion ("Array has been deleted"). The sync ``block_until_ready``
-        materializes the pages before return (after which the buffer can be
-        donated); the slow host transfer is deferred to :meth:`flush_backup`.
+        Sync + on the KV-owning thread: the forward donates ``kv_buffer`` every
+        step, so an off-thread gather would race that deletion. ``block_until_ready``
+        materializes the pages before return; the slow host put is deferred to
+        :meth:`flush_backup`.
         """
         if len(device_indices) != len(host_buffer_ids):
             raise ValueError(
@@ -502,11 +502,10 @@ class LRUHostKVPool(HostKVPool):
             self._pending_gather.update(gathered)
 
     def flush_backup(self, host_buffer_ids: list[int]) -> None:
-        """Asynchronous host-side transfer (D2H write half of a backup).
+        """D2H phase 2: ``device_put`` the staged pages into their host slots.
 
-        ``device_put`` the pages gathered by :meth:`stage_backup` into their host
-        slots. Touches only ``_pending_gather`` / ``_slots`` (never the KV
-        buffer), so it is safe on the D2H worker while the main thread runs forward.
+        Touches only ``_pending_gather`` / ``_slots`` (never the KV buffer), so
+        it runs on the D2H worker concurrently with forward.
         """
         if not host_buffer_ids:
             return
@@ -544,12 +543,11 @@ class LRUHostKVPool(HostKVPool):
         self.flush_load(host_buffer_ids, device_indices)
 
     def stage_load(self, host_buffer_ids: list[int]) -> None:
-        """Asynchronous host-side read (slow H2D half of a load-back).
+        """H2D phase 1: ``device_put`` host slots onto the device into per-buffer
+        staging arrays.
 
-        ``device_put`` each host page slot onto the device into an independent
-        staging array held per ``buffer_id`` in ``_pending_load``. Touches only
-        ``_slots`` / ``_pending_load`` (never the KV buffer), so it is safe on
-        the H2D worker while the main thread runs forward. The cheap scatter is
+        Touches only ``_slots`` / ``_pending_load`` (never the KV buffer), so it
+        runs on the H2D worker concurrently with forward; the cheap scatter is
         deferred to :meth:`flush_load`.
         """
         if not host_buffer_ids:
@@ -574,13 +572,12 @@ class LRUHostKVPool(HostKVPool):
             self._pending_load.update(loaded)
 
     def flush_load(self, host_buffer_ids: list[int], device_indices: list[int]) -> None:
-        """Synchronous device scatter (cheap H2D half of a load-back).
+        """H2D phase 2: scatter the staged pages into the KV buffer via the
+        in-place aliased Pallas kernel (``write_kv_layer``).
 
-        Writes the pages staged by :meth:`stage_load` into the KV buffer via the
-        in-place aliased Pallas kernel (``write_kv_layer``). MUST run on the
-        thread owning the KV buffer, in a donation-safe window: it reads +
+        Sync + on the KV-owning thread, in a donation-safe window: it reads +
         reassigns ``kv_buffer[layer]``, which the forward donates every step.
-        ``device_indices`` are GLOBAL device PAGE ids, expanded to ``page_size``
+        ``device_indices`` are GLOBAL device page ids, expanded to ``page_size``
         token slots for the kernel ``loc``.
         """
         if len(host_buffer_ids) != len(device_indices):
@@ -663,15 +660,11 @@ class LRUHostKVPool(HostKVPool):
         jax.block_until_ready(dp.kv_buffer)
 
     def precompile_transfers(self, max_pages: int | None = None) -> None:
-        """Warm up the JIT/Pallas compile of all four transfer kernels for every
+        """Warm the JIT/Pallas compile of the four transfer kernels for every
         page bucket serving can hit, so compilation never lands on the scheduler
-        thread during serving.
-
-        Without this, the first backup/load-back of each new page-bucket shape
-        triggers an XLA (and, for ``flush_load``, a Pallas/Mosaic) compile inline
-        on the scheduler hot path -- the dominant ON-vs-OFF latency gap. Device
-        pages ``[0, r)`` are used as scratch: safe because serving starts with an
-        empty cache and overwrites every allocated page before any read.
+        thread mid-serving (the dominant ON-vs-OFF latency gap). Device pages
+        ``[0, r)`` are scratch: safe because serving starts with an empty cache
+        and overwrites every page before any read.
         """
         from sgl_jax.srt.disaggregation.prefill import _KV_GATHER_PAGE_BUCKETS
 
@@ -757,8 +750,17 @@ class LRUHostKVPool(HostKVPool):
     # ------------------------------------------------------------------
     # LRU / lock_ref mechanism (private to this class, not in the ABC).
     # The pool only provides the mechanism; victim selection lives in the
-    # tree cache (RFC-1.0 §10).
+    # tree cache.
     # ------------------------------------------------------------------
+
+    def _drop_pending(self, buffer_id: int) -> None:
+        # Drop any orphaned staged transfer for a slot being freed, so a later
+        # reuse of this id can't have flush_backup/flush_load pop stale data into
+        # the reused slot. Called under self._lock (lock order: _lock -> pending).
+        with self._pending_lock:
+            self._pending_gather.pop(buffer_id, None)
+        with self._pending_load_lock:
+            self._pending_load.pop(buffer_id, None)
 
     def inc_lock_ref(self, buffer_id: int) -> None:
         with self._lock:

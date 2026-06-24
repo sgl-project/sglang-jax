@@ -1021,31 +1021,6 @@ def update_fused_kv_cache_vectorized(
     by grouping contiguous tokens into page-sized chunks for efficient updates.
     """
 
-    # CPU has no Mosaic backend, so the Pallas kernel below cannot lower there.
-    # Fall back to a pure-JAX scatter with identical semantics (write each token's
-    # fused KV into the flattened pool slot given by ``loc``; -1 is dropped). This
-    # keeps the fused write path runnable under unit tests on CPU; TPU still uses
-    # the in-place kernel.
-    if jax.default_backend() != "tpu":
-        flat_spec = P(data_partition_axis, kv_partition_axis, None, None)
-        cache_spec = P(data_partition_axis, None, kv_partition_axis, None, None)
-        if mesh is not None:
-            flat_out = NamedSharding(mesh, flat_spec)
-            cache_out = NamedSharding(mesh, cache_spec)
-        else:
-            flat_out, cache_out = flat_spec, cache_spec
-        flat = jax.lax.reshape(
-            kv_cache,
-            (kv_cache.shape[0] * kv_cache.shape[1],) + tuple(kv_cache.shape[2:]),
-            out_sharding=flat_out,
-        )
-        loc_i = loc.astype(jnp.int32)
-        safe = jnp.where(loc_i == -1, flat.shape[0], loc_i)
-        flat = flat.at[safe].set(
-            fused_kv[:, 0], mode="drop", out_sharding=flat_out
-        )
-        return jax.lax.reshape(flat, kv_cache.shape, out_sharding=cache_out)
-
     @jax.shard_map(
         in_specs=(
             # fused_kv: 5D sharded by data and tensor
