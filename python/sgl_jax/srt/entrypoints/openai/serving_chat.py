@@ -98,6 +98,10 @@ class OpenAIServingChat(OpenAIServingBase):
             stream=request.stream,
             extra_key=request.extra_key,
             rid=request.rid,
+            bootstrap_host=request.bootstrap_host,
+            bootstrap_port=request.bootstrap_port,
+            bootstrap_room=request.bootstrap_room,
+            disagg_transfer_id=request.disagg_transfer_id,
         )
 
         return adapted_request, request

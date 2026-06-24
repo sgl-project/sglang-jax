@@ -125,6 +125,7 @@ class ServerArgs:
     log_requests_level: int = 0
     crash_dump_folder: str | None = None
     show_time_cost: bool = False
+    enable_metrics: bool = False
     bucket_time_to_first_token: list[float] | None = None
     bucket_inter_token_latency: list[float] | None = None
     bucket_e2e_request_latency: list[float] | None = None
@@ -248,6 +249,27 @@ class ServerArgs:
     # ``SGL_JAX_PD_SHARED_SECRET`` overrides this at process start.
     # ``None`` disables auth for backward compatibility.
     disaggregation_shared_secret: str | None = None
+    # Diagnostic: if > 0, a watchdog thread logs the stuck decode
+    # event-loop phase + backlog snapshot + main-thread traceback when a
+    # single loop tick exceeds this many seconds. 0 disables it. Opt-in
+    # for stress runs; off by default in production.
+    disaggregation_decode_watchdog_seconds: float = 0.0
+    # Decode-side admission headroom: per in-flight/running request, this
+    # many KV tokens are held back when admitting a queued PD request, so a
+    # running decode step can always alloc its next token even when every
+    # other request is mid-transfer (transfer-queue reqs cannot be
+    # retracted). Insufficient capacity defers admission (FIFO requeue),
+    # never aborts. Mirrors sglang's num_reserved_decode_tokens.
+    disaggregation_num_reserved_decode_tokens: int = 512
+    # Max concurrent in-flight KV transfers admitted on the decode side.
+    # Each in-flight pull allocates a destination buffer of the request's
+    # KV shape on decode HBM that lives until the buffer is scattered into
+    # the paged pool. The paged-pool budget gate does not account for these
+    # transient buffers, so without this cap a burst of concurrent requests
+    # allocates that many destination buffers at once and OOMs decode HBM.
+    # Excess requests stay in the prealloc queue and retry next tick
+    # (deferral, never abort). 0 disables the cap (unbounded).
+    disaggregation_max_inflight_transfers: int = 8
 
     def __post_init__(self):
         # Set missing default values
@@ -1295,10 +1317,8 @@ class ServerArgs:
             action=argparse.BooleanOptionalAction,
             default=ServerArgs.disaggregation_enable_d2h,
             help="Enable D2H staging on the prefill side: KV is copied into "
-            "a pinned-host buffer before remote pull. The current "
-            "default remains OFF until QueueHostKVPool is wired "
-            "end-to-end; use --disaggregation-enable-d2h only after "
-            "path A is fully plumbed.",
+            "an unpinned host-memory buffer before remote pull, bounding "
+            "prefill HBM pressure via the host pool. Default OFF.",
         )
         parser.add_argument(
             "--disaggregation-side-channel-port",
@@ -1350,9 +1370,10 @@ class ServerArgs:
             "--disaggregation-d2h-max-tokens",
             type=int,
             default=ServerArgs.disaggregation_d2h_max_tokens,
-            help="Per-buffer token capacity for QueueHostKVPool. "
-            "Defaults to max_total_num_tokens / pool_size at engine "
-            "init time.",
+            help="Per-buffer token capacity for QueueHostKVPool (path A). "
+            "Each buffer is sized to hold one request's padded KV up to this "
+            "many tokens; must be >= your longest PD prompt. Defaults to "
+            "max_total_num_tokens at engine init time.",
         )
         parser.add_argument(
             "--disaggregation-host-ip",
@@ -1391,6 +1412,35 @@ class ServerArgs:
             type=float,
             default=ServerArgs.disaggregation_orphan_reaper_interval_seconds,
             help="How often the background reaper scans for orphan " "senders/receivers.",
+        )
+        parser.add_argument(
+            "--disaggregation-decode-watchdog-seconds",
+            type=float,
+            default=ServerArgs.disaggregation_decode_watchdog_seconds,
+            help="Diagnostic: if > 0, a watchdog logs the stuck decode "
+            "event-loop phase + backlog snapshot + main-thread "
+            "traceback when one loop tick exceeds this many seconds. "
+            "0 disables it (default). Opt-in for stress debugging.",
+        )
+        parser.add_argument(
+            "--disaggregation-num-reserved-decode-tokens",
+            type=int,
+            default=ServerArgs.disaggregation_num_reserved_decode_tokens,
+            help="Decode-side admission headroom (KV tokens) held back per "
+            "in-flight/running request when admitting a queued PD request, "
+            "so running decode steps never OOM while others are mid-transfer. "
+            "Insufficient capacity defers admission (FIFO requeue), never aborts.",
+        )
+        parser.add_argument(
+            "--disaggregation-max-inflight-transfers",
+            type=int,
+            default=ServerArgs.disaggregation_max_inflight_transfers,
+            help="Max concurrent in-flight KV transfers admitted on the decode "
+            "side. Each in-flight pull allocates a destination KV buffer on "
+            "decode HBM until it is scattered into the paged pool; this cap "
+            "bounds that transient HBM so a burst of concurrent requests does "
+            "not OOM decode. Excess requests defer (FIFO requeue), never abort. "
+            "0 disables the cap (unbounded).",
         )
         parser.add_argument(
             "--disaggregation-shared-secret",
@@ -1474,12 +1524,21 @@ class ServerArgs:
         # Check LoRA configuration
         self.check_lora_server_args()
 
-        # Disallow overlap scheduler when speculative decoding is enabled
+        # Speculative overlap is currently implemented for the fused NEXTN
+        # topk=1 path only.
         if self.speculative_algorithm is not None and not self.disable_overlap_schedule:
-            raise ValueError(
-                "Speculative decoding does not support overlap scheduler. "
-                "Please pass --disable-overlap-schedule when using --speculative-algorithm."
+            supports_spec_overlap = (
+                self.speculative_algorithm == "NEXTN"
+                and self.speculative_eagle_topk == 1
+                and self.speculative_num_draft_tokens == self.speculative_num_steps + 1
             )
+            if not supports_spec_overlap:
+                raise ValueError(
+                    "Speculative overlap scheduler only supports NEXTN with "
+                    "--speculative-eagle-topk=1 and "
+                    "--speculative-num-draft-tokens == --speculative-num-steps + 1. "
+                    "Please pass --disable-overlap-schedule for other speculative configs."
+                )
 
     def check_lora_server_args(self):
         """Validate and normalize LoRA-related server arguments."""

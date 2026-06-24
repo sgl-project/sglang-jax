@@ -215,7 +215,7 @@ def inner_kernel(
     """
 
     def _matmul(is_first_k_step: bool, is_last_k_step: bool):
-        tiled_lhs = tiled_lhs_ref.reshape(-1, cfgs.tiles.tile_k)[...]
+        tiled_lhs = tiled_lhs_ref[...].reshape(-1, cfgs.tiles.tile_k)
         tiled_rhs = tiled_rhs_ref.weight[...]
 
         valid_k = cfgs.dims.size_k % cfgs.tiles.tile_k

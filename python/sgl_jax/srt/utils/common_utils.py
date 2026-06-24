@@ -20,6 +20,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -37,6 +38,27 @@ logger = logging.getLogger(__name__)
 
 PRECOMPILE_DEFAULT_TOKEN_PADDINGS = [1 << i for i in range(6, 14)]
 PRECOMPILE_DEFAULT_BS_PADDINGS = [1 << i for i in range(0, 9)]
+
+
+def align_bs_for_fused_ep(bs: int, ep_size: int) -> int:
+    """Down-align a global batch size so it is launchable by fused_ep_moe.
+
+    The fused MoE kernel requires ``bs % ep_size == 0`` and the per-EP local
+    batch ``bs // ep_size`` to be in ``{2, 4}`` or a multiple of 8. The
+    attention-backend / pool-derived ``max_running_requests`` is not ep-aware
+    (e.g. 408 on v7x-16 with ep=32), so callers must align it before it flows
+    into the scheduler and the precompile bucket list.
+    """
+    if ep_size <= 1:
+        return bs
+    local = bs // ep_size
+    if local < 2:
+        raise ValueError(
+            f"max_running_requests={bs} is below the fused-MoE minimum "
+            f"(2 * ep_size = {2 * ep_size}); reduce ep_size or increase capacity."
+        )
+    local = (local // 8) * 8 if local >= 8 else (4 if local >= 4 else 2)
+    return local * ep_size
 
 
 def pad_to_bucket(value: int, buckets: list[int]) -> tuple[int, int]:
@@ -88,7 +110,7 @@ def set_random_seed(seed: int) -> None:
     np.random.seed(seed)
 
 
-def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = None):
+def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int | None = None):
     """Kill the process and all its child processes."""
     # Remove sigchld handler to avoid spammy logs.
     if threading.current_thread() is threading.main_thread():
@@ -160,6 +182,38 @@ def add_api_key_middleware(app, api_key: str):
         if request.headers.get("Authorization") != "Bearer " + api_key:
             return ORJSONResponse(content={"error": "Unauthorized"}, status_code=401)
         return await call_next(request)
+
+
+def set_prometheus_multiproc_dir():
+    # Set prometheus multiprocess directory before importing prometheus_client.
+    # Subprocesses inherit the env var and write their own mmap files there so
+    # the front-end /metrics endpoint can aggregate across processes.
+    global prometheus_multiproc_dir
+    if "PROMETHEUS_MULTIPROC_DIR" in os.environ:
+        logger.debug(
+            "Reusing existing PROMETHEUS_MULTIPROC_DIR: %s",
+            os.environ["PROMETHEUS_MULTIPROC_DIR"],
+        )
+    else:
+        prometheus_multiproc_dir = tempfile.TemporaryDirectory()
+        os.environ["PROMETHEUS_MULTIPROC_DIR"] = prometheus_multiproc_dir.name
+        logger.debug(
+            "PROMETHEUS_MULTIPROC_DIR: %s",
+            os.environ["PROMETHEUS_MULTIPROC_DIR"],
+        )
+
+
+def add_prometheus_middleware(app):
+    from prometheus_client import CollectorRegistry, make_asgi_app, multiprocess
+    from starlette.routing import Mount
+
+    registry = CollectorRegistry()
+    multiprocess.MultiProcessCollector(registry)
+
+    metrics_route = Mount("/metrics", make_asgi_app(registry=registry))
+    # Workaround for 307 Redirect for /metrics.
+    metrics_route.path_regex = re.compile("^/metrics(?P<path>.*)$")
+    app.routes.append(metrics_route)
 
 
 def prepare_model_and_tokenizer(model_path: str, tokenizer_path: str):
@@ -449,7 +503,7 @@ def lru_cache_frozenset(maxsize=128):
                 raise TypeError(f"Cannot make hashable: {type(o)}") from None
 
     def decorator(func):
-        cache = OrderedDict()
+        cache: OrderedDict[tuple[Any, Any], Any] = OrderedDict()
 
         @functools.wraps(func)
         def wrapper(*args, **kwargs):

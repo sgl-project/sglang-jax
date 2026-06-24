@@ -21,6 +21,7 @@ dependencies = [
     "numpy~=2.2.6",
     "orjson~=3.11.1",
     "pillow~=11.3.0",
+    "prometheus-client>=0.20.0",
     "psutil~=7.0.0",
     "pydantic~=2.11.7",
     "python-multipart>=0.0.20",
@@ -158,7 +159,8 @@ docstring-code-format = true
 
 [tool.mypy]
 files = [
-    "python/sgl_jax/srt/models/grok.py"
+    "python/sgl_jax/srt/models/grok.py",
+    "python/sgl_jax/srt/utils/*.py"
 ]
 
 python_version = "3.12"

@@ -331,6 +331,36 @@ class MoEV2KernelTest(jtu.JaxTestCase):
             rtol=5e-2,
         )
 
+    # --------------------------------- num_bf==1 (global-rolling weight buffer)
+
+    def test_num_bf1_rolling_wb(self):
+        # bf == intermediate_size => num_bf == 1 => the global-rolling weight
+        # double-buffer path (expert-parity slot), now the default. Previously
+        # only reachable via the removed SGLJAX_MOE_V2_GLOBAL_ROLLING_WB flag.
+        self._test_moe(bf=256)
+
+    def test_num_bf1_rolling_wb_fp8_shared(self):
+        # num_bf==1 (single bf block per expert) + per-channel fp8 weights +
+        # in-kernel shared expert.
+        self._test_moe(
+            bf=256,
+            bse=256,
+            w_dtype=FP8,
+            quant_block_k=None,
+            direct_scaled_dot=True,
+            has_shared_expert=True,
+            atol=5e-2,
+            rtol=5e-2,
+        )
+
+    # ------------------------------------------ compact loop empty-expert skip
+
+    def test_compact_skip_empty_experts(self):
+        # Many experts + few tokens + top_k=1 => several local experts receive
+        # no tokens, exercising the compact active-expert list (n_active <
+        # local_num_experts).
+        self._test_moe(num_experts=32, num_tokens=16, top_k=1)
+
     # --------------------------------------------------- block config (no TPU)
 
     def test_effective_for_bt_gcd_reduction(self):

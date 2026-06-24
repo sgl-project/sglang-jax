@@ -6,13 +6,16 @@ import logging
 import threading
 from contextlib import suppress
 from dataclasses import dataclass
+from functools import partial
 from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
+import numpy as np
+from jax.sharding import NamedSharding, PartitionSpec
 
 from sgl_jax.srt.disaggregation.base.kv_manager import KVPoll
-from sgl_jax.srt.disaggregation.bootstrap import BootstrapClient
+from sgl_jax.srt.disaggregation.bootstrap import BootstrapClient, PrefillInfoCache
 from sgl_jax.srt.disaggregation.jax_transfer.conn import (
     JaxTransferKVManager,
     JaxTransferKVReceiver,
@@ -24,6 +27,60 @@ if TYPE_CHECKING:
     from sgl_jax.srt.managers.scheduler import Scheduler
 
 logger = logging.getLogger(__name__)
+
+
+@partial(
+    jax.jit,
+    static_argnames=(
+        "page_size",
+        "kv_partition_axis",
+        "attention_data_partition_axis",
+        "mesh",
+    ),
+    donate_argnames=("kv_cache",),
+)
+def _jit_write_one_layer(
+    layer_kv,
+    loc,
+    kv_cache,
+    page_size,
+    kv_partition_axis,
+    attention_data_partition_axis,
+    mesh,
+):
+    """One-layer PD KV write, wrapped in a module-level ``jax.jit``.
+
+    The stable module-level ``jax.jit`` makes the trace cache hit on shape +
+    static args so the Pallas write kernel compiles once per write shape and is
+    reused thereafter.
+    """
+    from sgl_jax.srt.mem_cache.memory_pool import _set_fused_kv_buffer
+
+    total_tokens = loc.shape[0]
+    fused_sharding = NamedSharding(
+        mesh,
+        PartitionSpec(
+            attention_data_partition_axis,
+            None,
+            kv_partition_axis,
+            None,
+            None,
+        ),
+    )
+    fused = jax.lax.reshape(
+        layer_kv,
+        (total_tokens, 1) + tuple(layer_kv.shape[2:]),
+        out_sharding=fused_sharding,
+    )
+    return _set_fused_kv_buffer(
+        fused_kv=fused,
+        loc=loc,
+        kv_cache=kv_cache,
+        page_size=page_size,
+        kv_partition_axis=kv_partition_axis,
+        attention_data_partition_axis=attention_data_partition_axis,
+        mesh=mesh,
+    )
 
 
 @dataclass
@@ -40,10 +97,19 @@ class DecodeBookkeeping:
     # Set by _drain_transfer_queue_synced on multi-host so downstream
     # does not re-poll (a poll() that raised would re-raise and desync).
     synced_state: KVPoll | None = None
+    # Prefill-side info from bootstrap, stashed at intake so KV alloc +
+    # receiver setup can be deferred to the capacity-gated admission step.
+    p_info: dict | None = None
 
 
 class DecodePreallocQueue:
-    """Requests awaiting KV pull start. Thread-safe."""
+    """PD reqs awaiting capacity-gated KV alloc. FIFO, thread-safe.
+
+    Entries enter at intake holding only ``p_info`` (no KV indices, no
+    receiver). The decode loop's admission gate pops them in FIFO order
+    once the paged pool has room; reqs that don't fit stay queued and are
+    retried next tick (deferral, never abort).
+    """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -59,11 +125,17 @@ class DecodePreallocQueue:
                 raise ValueError(f"DecodePreallocQueue already tracks " f"req_id={entry.req_id!r}")
             self._entries[entry.req_id] = entry
 
-    def pop_all(self) -> list[DecodeBookkeeping]:
+    def items_fifo(self) -> list[DecodeBookkeeping]:
+        """FIFO snapshot for the admission gate (does not remove)."""
+
         with self._lock:
-            out = list(self._entries.values())
-            self._entries.clear()
-            return out
+            return list(self._entries.values())
+
+    def remove(self, req_id: str) -> None:
+        """Drop an admitted (or failed) entry by id."""
+
+        with self._lock:
+            self._entries.pop(req_id, None)
 
     def abort_matching(self, rid_prefix: str, abort_all: bool) -> list[DecodeBookkeeping]:
         out: list[DecodeBookkeeping] = []
@@ -118,39 +190,74 @@ class SchedulerDisaggregationDecodeMixin:
 
     disagg_kv_manager: JaxTransferKVManager
     disagg_bootstrap_client: BootstrapClient
+    disagg_prefill_info_cache: PrefillInfoCache
     disagg_prealloc_queue: DecodePreallocQueue
     disagg_transfer_queue: DecodeTransferQueue
 
     def event_loop_normal_disagg_decode(self: Scheduler) -> None:
         """Decode event loop."""
 
+        wd = self.disagg_decode_watchdog
+        wd.start()
+
         while True:
+            wd.beat("recv_requests")
             recv_reqs = (
                 self._comm_backend.recv_requests()
                 if self._comm_backend is not None
                 else self.recv_requests()
             )
             recv_reqs = self.select_dp_for_request(recv_reqs)
+            wd.beat("process_input_requests")
             self.process_input_requests_disagg_decode(recv_reqs)
 
             if self._engine_paused:
                 continue
 
+            wd.beat("process_decode_queue")
             self.process_decode_queue()
 
+            wd.beat("get_next_batch")
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
 
             if batch:
+                wd.beat("run_batch")
                 result = self.run_batch(batch)
+                wd.beat("process_batch_result")
                 self.process_batch_result(batch, result)
             else:
+                wd.beat("idle")
                 # Skip check_memory / check_tree_cache for PD decode.
                 self.new_token_ratio = self.init_new_token_ratio
                 if self._comm_backend is not None:
                     self._comm_backend.wait_for_new_requests(0.001)
 
             self.last_batch = batch
+
+    def _decode_backlog_snapshot(self: Scheduler) -> str:
+        """One-line backlog snapshot for the watchdog stall report.
+
+        Cheap reads only; never raises (the watchdog suppresses, but a
+        clean string is more useful in the log than a swallowed error).
+        """
+
+        prealloc = len(self.disagg_prealloc_queue or ())
+        transfer = len(self.disagg_transfer_queue or ())
+        try:
+            ns, nr = self.disagg_kv_manager.inflight_count()
+        except Exception:
+            ns, nr = (-1, -1)
+        try:
+            kv_avail = self.token_to_kv_pool_allocator.available_size()
+        except Exception:
+            kv_avail = -1
+        running = len(self.running_batch.reqs) if self.running_batch is not None else 0
+        return (
+            f"prealloc_q={prealloc} transfer_q={transfer} "
+            f"inflight_send={ns} inflight_recv={nr} "
+            f"kv_avail={kv_avail} running_reqs={running}"
+        )
 
     def process_input_requests_disagg_decode(self: Scheduler, recv_reqs) -> None:
         """Decode-mode request intake. PD reqs are extracted from
@@ -164,19 +271,33 @@ class SchedulerDisaggregationDecodeMixin:
             for r in recv_reqs
             if getattr(r, "bootstrap_room", None) is not None
         }
-        if not recv_pd_rids:
+        new_pd_reqs = self._extract_pd_reqs_from_waiting_queue(recv_pd_rids) if recv_pd_rids else []
+
+        # Retry reqs deferred on a previous tick because no prefill was
+        # registered yet (bootstrap cache miss). They go ahead of new reqs so
+        # FIFO ordering is preserved across deferrals.
+        pending = self._pd_pending_bootstrap
+        self._pd_pending_bootstrap = []
+        pd_reqs = pending + new_pd_reqs
+        if not pd_reqs:
             return
 
-        pd_reqs = self._extract_pd_reqs_from_waiting_queue(recv_pd_rids)
         for req in pd_reqs:
             try:
                 from sgl_jax.srt.disaggregation.common.metrics import time_phase
 
+                self._pd_mark_time(req, "bootstrap_start")
                 with time_phase("bootstrap", "decode"):
                     if jax.process_count() > 1:
+                        # Multi-host caches the matched peer after the first
+                        # lookup, so this does no per-request network I/O.
                         p_info = self._pick_prefill_peer_for_this_host()
                     else:
-                        p_info = self.disagg_bootstrap_client.get_prefill_info(req.bootstrap_room)
+                        # Local cache resolution (sglang-style): a warm cache
+                        # does zero network I/O, so this no longer blocks the
+                        # event loop.
+                        p_info = self.disagg_prefill_info_cache.pick_for_room(req.bootstrap_room)
+                self._pd_mark_time(req, "bootstrap_done")
             except Exception:
                 logger.exception(
                     "bootstrap lookup failed for req_id=%s "
@@ -188,39 +309,44 @@ class SchedulerDisaggregationDecodeMixin:
                 self._abort_decode_request(req, "bootstrap_lookup")
                 continue
 
-            kv_indices = None
-            try:
-                kv_indices = self._prealloc_decode_kv_indices(req)
-                receiver = self.disagg_kv_manager.create_receiver(req.rid)
-                spec = self._build_kv_spec_for_req(req)
-                receiver.init(
-                    PMetadata(
-                        remote_addr=(f"{p_info['host']}:{p_info['transfer_port']}"),
-                        uuid=req.disagg_transfer_id or req.rid,
-                        specs={"kv": spec},
-                        p_side_channel_host=str(p_info["host"]),
-                        p_side_channel_port=int(p_info["side_channel_port"]),
-                    )
-                )
-            except Exception:
-                logger.exception(
-                    "failed to set up KVReceiver for req_id=%s",
-                    req.rid,
-                )
-                self._record_decode_transfer_failure("receiver_init")
-                # Release any slots we allocated before the failure.
-                if kv_indices is not None:
-                    self._release_decode_kv_indices(kv_indices)
-                self._abort_decode_request(req, "receiver_init")
+            if p_info is None:
+                # No prefill registered yet (or the rate-limited refresh was
+                # skipped this tick). Defer and retry next tick — never abort.
+                self._pd_pending_bootstrap.append(req)
                 continue
 
+            try:
+                from sgl_jax.srt.disaggregation.bootstrap import (
+                    check_prefill_compat,
+                    resolve_kv_dtype_name,
+                )
+
+                local_kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
+                check_prefill_compat(
+                    p_info,
+                    local_page_size=self.server_args.page_size,
+                    local_kv_dtype=resolve_kv_dtype_name(local_kv_pool.dtype),
+                )
+            except ValueError as exc:
+                logger.error(
+                    "prefill/decode KV layout mismatch for req_id=%s: %s",
+                    req.rid,
+                    exc,
+                )
+                self._record_decode_transfer_failure("config_mismatch")
+                self._abort_decode_request(req, "config_mismatch")
+                continue
+
+            # KV alloc + receiver setup are deferred to the capacity-gated
+            # admission step (process_decode_queue). At intake the entry holds
+            # only p_info and consumes no paged-pool slots, so a backlog of
+            # waiting reqs cannot exhaust decode KV cache.
             entry = DecodeBookkeeping(
                 req_id=req.rid,
                 req=req,
-                receiver=receiver,
-                kv_indices=kv_indices,
-                started=True,
+                p_info=p_info,
             )
+            self._pd_mark_time(req, "prealloc_entry")
             self.disagg_prealloc_queue.add(entry)
 
     def _extract_pd_reqs_from_waiting_queue(self: Scheduler, rids: set) -> list[Req]:
@@ -241,8 +367,7 @@ class SchedulerDisaggregationDecodeMixin:
     def process_decode_queue(self: Scheduler) -> None:
         """Drive prealloc -> transfer -> ready transitions."""
 
-        for entry in self.disagg_prealloc_queue.pop_all():
-            self.disagg_transfer_queue.add(entry)
+        self._admit_decode_prealloc()
 
         for entry in self._drain_transfer_queue_synced():
             assert entry.receiver is not None
@@ -261,6 +386,20 @@ class SchedulerDisaggregationDecodeMixin:
                     self._write_kv_to_pool(entry.req, entry.kv_indices, kv)
                     self._record_decode_transfer_bytes(kv)
                     self._enqueue_for_decode(entry.req)
+                    self._pd_mark_time(entry.req, "first_token")
+                    from sgl_jax.srt.disaggregation.req_time_stats import (
+                        maybe_log_time_stats,
+                    )
+
+                    maybe_log_time_stats(
+                        entry.req.pd_time_stats,
+                        req_id=entry.req_id,
+                        enabled=getattr(
+                            self.server_args,
+                            "enable_request_time_stats_logging",
+                            False,
+                        ),
+                    )
                 except Exception:
                     logger.exception(
                         "failed to install KV / enqueue decode for "
@@ -342,20 +481,100 @@ class SchedulerDisaggregationDecodeMixin:
                     out.append(e)
         return out
 
+    def _admit_decode_prealloc(self: Scheduler) -> None:
+        """Capacity-gated FIFO admission of preallocated PD reqs.
+
+        Pops reqs from the prealloc queue into the transfer queue only while
+        the paged pool has room, reserving ``num_reserved_decode_tokens`` of
+        headroom per in-flight/running request so a running decode step can
+        always alloc its next token even when every other req is mid-transfer
+        (transfer-queue reqs cannot be retracted). KV indices are allocated
+        here, not at intake. Reqs that don't fit stay queued and retry next
+        tick — deferral, never abort.
+        """
+
+        allocator = self.token_to_kv_pool_allocator
+        if allocator is None:
+            return
+
+        page_size = allocator.page_size
+        reserved_per = self.server_args.disaggregation_num_reserved_decode_tokens
+        max_inflight = self.server_args.disaggregation_max_inflight_transfers
+        n_running = len(self.running_batch.reqs) if self.running_batch is not None else 0
+        n_transfer = len(self.disagg_transfer_queue)
+        admitted = 0
+
+        for entry in self.disagg_prealloc_queue.items_fifo():
+            # In-flight transfer cap: each admitted transfer holds a pulled KV
+            # destination buffer on decode HBM (untracked by the paged-pool
+            # budget below) until it is scattered. Stop admitting once the cap
+            # is reached so a burst of concurrent requests cannot allocate that
+            # many transient buffers at once and OOM. Excess reqs stay queued
+            # and retry next tick (deferral, never abort).
+            if max_inflight > 0 and (n_transfer + admitted) >= max_inflight:
+                break
+            seqlen = len(entry.req.origin_input_ids)
+            page_aligned = ((seqlen + page_size - 1) // page_size) * page_size
+            reserved = reserved_per * (n_running + n_transfer + admitted)
+            if page_aligned + reserved > allocator.available_size():
+                # Insufficient capacity: defer this and all later (FIFO) reqs.
+                break
+
+            kv_indices = allocator.alloc(page_aligned)
+            if kv_indices is None:
+                # Budget check should prevent this; treat a surprise shortfall
+                # as transient and retry next tick rather than abort.
+                break
+
+            try:
+                receiver = self.disagg_kv_manager.create_receiver(entry.req.rid)
+                spec = self._build_kv_spec_for_req(entry.req)
+                p_info = entry.p_info
+                receiver.init(
+                    PMetadata(
+                        remote_addr=(f"{p_info['host']}:{p_info['transfer_port']}"),
+                        uuid=entry.req.disagg_transfer_id or entry.req.rid,
+                        specs={"kv": spec},
+                        p_side_channel_host=str(p_info["host"]),
+                        p_side_channel_port=int(p_info["side_channel_port"]),
+                    )
+                )
+            except Exception:
+                logger.exception(
+                    "failed to set up KVReceiver for req_id=%s",
+                    entry.req.rid,
+                )
+                self._record_decode_transfer_failure("receiver_init")
+                self._release_decode_kv_indices(kv_indices)
+                self.disagg_prealloc_queue.remove(entry.req_id)
+                self._abort_decode_request(entry.req, "receiver_init")
+                continue
+
+            entry.kv_indices = kv_indices
+            entry.receiver = receiver
+            entry.started = True
+            self._pd_mark_time(entry.req, "transfer_entry")
+            self.disagg_prealloc_queue.remove(entry.req_id)
+            self.disagg_transfer_queue.add(entry)
+            admitted += 1
+
     # ------------------------------------------------------------------
     # Overridable / test-friendly hooks
     # ------------------------------------------------------------------
 
-    def _prealloc_decode_kv_indices(self: Scheduler, req: Req):
-        """Reserve page-aligned KV slots in the paged pool for ``req``."""
+    def _pd_mark_time(self: Scheduler, req: Req, name: str) -> None:
+        """Record a PD lifecycle mark on ``req`` (no-op unless enabled)."""
 
-        seqlen = len(req.origin_input_ids)
-        allocator = self.token_to_kv_pool_allocator
-        if allocator is None:
-            return None
-        page_size = allocator.page_size
-        page_aligned = ((seqlen + page_size - 1) // page_size) * page_size
-        return allocator.alloc(page_aligned)
+        if not getattr(self.server_args, "enable_request_time_stats_logging", False):
+            return
+        from sgl_jax.srt.disaggregation.req_time_stats import TimeStats
+
+        ts = req.pd_time_stats
+        if ts is None:
+            role = getattr(self.server_args, "disaggregation_mode", "decode")
+            ts = TimeStats(role)
+            req.pd_time_stats = ts
+        ts.mark(name)
 
     def _release_decode_kv_indices(self: Scheduler, kv_indices) -> None:
         """Release KV indices back to the allocator."""
@@ -369,10 +588,8 @@ class SchedulerDisaggregationDecodeMixin:
             except Exception:
                 logger.exception("failed to free kv_indices=%r", kv_indices)
 
-    def _build_kv_spec_for_req(self: Scheduler, req: Req) -> jax.ShapeDtypeStruct:
-        """Build ShapeDtypeStruct matching P's KV layout for the receiver."""
-
-        from jax.sharding import NamedSharding, PartitionSpec
+    def _build_kv_spec_for_req(self: Scheduler, req: Req) -> list[jax.ShapeDtypeStruct]:
+        """Build per-layer ShapeDtypeStructs matching P's KV layout."""
 
         from sgl_jax.srt.disaggregation.prefill import _pad_to_page_bucket
 
@@ -386,22 +603,21 @@ class SchedulerDisaggregationDecodeMixin:
 
             return local_kv_spec_for_pool(kv_pool, kv_pool.layer_num, padded_pages)
         per_layer_tail = kv_pool.kv_buffer[0].shape[1:]
-        shape = (kv_pool.layer_num, padded_pages) + per_layer_tail
-        base_spec = kv_pool.kv_sharding.spec
-        stacked_spec = PartitionSpec(None, *base_spec)
-        sharding = NamedSharding(kv_pool.kv_sharding.mesh, stacked_spec)
-        return jax.ShapeDtypeStruct(shape, kv_pool.dtype, sharding=sharding)
+        shape = (padded_pages, *per_layer_tail)
+        sharding = kv_pool.kv_sharding
+        return [
+            jax.ShapeDtypeStruct(shape, kv_pool.dtype, sharding=sharding)
+            for _ in range(kv_pool.layer_num)
+        ]
 
     def _write_kv_to_pool(self: Scheduler, req: Req, kv_indices, kv: jax.Array) -> None:
-        """Scatter pulled KV into the local paged pool."""
+        """Write pulled KV into the local paged pool (in place)."""
 
         if kv_indices is None:
             raise RuntimeError(
                 f"_write_kv_to_pool: kv_indices is None for req "
                 f"{req.rid!r}; allocator may have OOM'd"
             )
-        import numpy as np
-        from jax.sharding import NamedSharding, PartitionSpec
 
         kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
         if jax.process_count() > 1 and kv.is_fully_addressable:
@@ -422,55 +638,46 @@ class SchedulerDisaggregationDecodeMixin:
         kv_indices_np = (
             np.asarray(kv_indices) if not isinstance(kv_indices, np.ndarray) else kv_indices
         )
-        page_ids_np = kv_indices_np[::page_size] // page_size
-        page_ids_np = page_ids_np[:num_pages]
-        # Pad page ids to bucket size by repeating the last valid id.
-        padded_pages = kv.shape[1]
-        if num_pages < padded_pages:
-            pad = np.full(padded_pages - num_pages, page_ids_np[-1], dtype=page_ids_np.dtype)
-            page_ids_padded = np.concatenate([page_ids_np, pad])
-            # Duplicate last valid page's payload so stale tail
-            # rows don't overwrite the final real page.
-            valid_prefix = jax.lax.slice_in_dim(
-                kv,
-                start_index=0,
-                limit_index=num_pages,
-                axis=1,
-            )
-            last_valid = jax.lax.dynamic_slice_in_dim(
-                valid_prefix,
-                start_index=num_pages - 1,
-                slice_size=1,
-                axis=1,
-            )
-            padded_tail = jnp.repeat(
-                last_valid,
-                padded_pages - num_pages,
-                axis=1,
-            )
-            padded_tail = jax.device_put(
-                padded_tail,
-                valid_prefix.sharding,
-            )
-            kv = jnp.concatenate(
-                [
-                    valid_prefix,
-                    padded_tail,
-                ],
-                axis=1,
-            )
+        padded_pages = kv[0].shape[0]
+        # page_ids_padded is only consumed by the debug verifier below, which is
+        # a no-op unless SGL_JAX_PD_DEBUG_KV is set. The write itself is
+        # token-level via ``loc``, so skip this numpy work on the production path.
+        from sgl_jax.srt.disaggregation.debug_utils import kv_debug_enabled
+
+        if kv_debug_enabled(req.rid):
+            page_ids_np = kv_indices_np[::page_size] // page_size
+            page_ids_np = page_ids_np[:num_pages]
+            if num_pages < padded_pages:
+                pad = np.full(padded_pages - num_pages, page_ids_np[-1], dtype=page_ids_np.dtype)
+                page_ids_padded = np.concatenate([page_ids_np, pad])
+            else:
+                page_ids_padded = page_ids_np
         else:
-            page_ids_padded = page_ids_np
-        idx_sharding = NamedSharding(kv_pool.mesh, PartitionSpec(None))
-        page_ids_jax = jax.device_put(page_ids_padded, idx_sharding)
+            page_ids_padded = None
+
+        # Write via the in-place Pallas kernel (``update_fused_kv_cache_vectorized``
+        # with ``input_output_aliases``), so the footprint scales with the tokens
+        # written. ``loc`` is per-token absolute pool slots; -1 marks padding
+        # tokens that are skipped.
+        total_tokens = padded_pages * page_size
+        loc_np = np.full(total_tokens, -1, dtype=np.int32)
+        loc_np[:seqlen] = kv_indices_np[:seqlen]
+        loc = jax.device_put(
+            jnp.asarray(loc_np),
+            NamedSharding(kv_pool.mesh, PartitionSpec(kv_pool.attention_data_partition_axis)),
+        )
         for i, layer_id in enumerate(
             range(kv_pool.start_layer, kv_pool.start_layer + kv_pool.layer_num)
         ):
             layer_idx = layer_id - kv_pool.start_layer
-            kv_pool.kv_buffer[layer_idx] = (
-                kv_pool.kv_buffer[layer_idx]
-                .at[page_ids_jax]
-                .set(kv[i], out_sharding=kv_pool.kv_sharding)
+            kv_pool.kv_buffer[layer_idx] = _jit_write_one_layer(
+                kv[i],
+                loc,
+                kv_pool.kv_buffer[layer_idx],
+                page_size,
+                kv_pool.kv_partition_axis,
+                kv_pool.attention_data_partition_axis,
+                kv_pool.mesh,
             )
         # Set prefix_indices to all-but-last so extend_input_len=1.
         valid_slots = kv_indices_np[:seqlen]
@@ -541,8 +748,11 @@ class SchedulerDisaggregationDecodeMixin:
                 PD_TRANSFER_BYTES_TOTAL,
             )
 
-            if kv is not None and hasattr(kv, "nbytes"):
-                PD_TRANSFER_BYTES_TOTAL.labels(direction="h2d", role="decode").inc(int(kv.nbytes))
+            if not kv:
+                return
+            leaves = jax.tree.leaves(kv)
+            total = int(sum(int(x.nbytes) for x in leaves))
+            PD_TRANSFER_BYTES_TOTAL.labels(direction="h2d", role="decode").inc(total)
 
     def _maybe_log_decode_pull_debug(self, req: Req, kv) -> None:
         from sgl_jax.srt.disaggregation.debug_utils import (
