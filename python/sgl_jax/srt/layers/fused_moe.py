@@ -797,7 +797,6 @@ class FusedTPMoEV4(FusedEPMoE):
                 P("data", None),
             ),
             out_specs=P("data", None),
-            check_rep=False,
         )(
             hidden_states,
             self.w1_tp.value,
