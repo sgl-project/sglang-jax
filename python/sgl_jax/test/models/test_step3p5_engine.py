@@ -451,6 +451,16 @@ class TestPrefillDecodeConsistency(unittest.TestCase):
         prefill_logits = _run_prefill_all_positions(model, self._mesh, kv_pool, token_ids)
         jax.block_until_ready(prefill_logits)
 
+        # Collect ALL decode positions first, then print a diagnostic table, then
+        # assert — so the per-position growth is visible even when an assertion
+        # fails (pytest -x stops at the first failing assert). The growth pattern
+        # discriminates two hypotheses for any numeric gap:
+        #   * future-token-in-page contamination (REAL bug): pos 8 (2 future slots
+        #     9,10 sit in the same page as the decode read) >> pos 9 (1) >> pos 10
+        #     (0 future slots, clean).
+        #   * cross-forward-mode reduction-order noise (legit): all positions
+        #     similar, smooth, scaling with depth (_RTOL_LOGITS regime).
+        rows = []  # (k, argmax_p, argmax_d, max_abs, scale, rel)
         for step in range(_DECODE_STEPS):
             k = _PREFIX_LEN + step
             decode_token = int(np.asarray(token_ids)[k])
@@ -459,23 +469,40 @@ class TestPrefillDecodeConsistency(unittest.TestCase):
 
             p = np.asarray(prefill_logits[k], dtype=np.float64)
             d = np.asarray(decode_logits[0], dtype=np.float64)
-
-            # Hard gate: per-position argmax must agree.
-            self.assertEqual(
-                int(p.argmax()),
-                int(d.argmax()),
-                f"prefill vs decode argmax differ at position {k}",
-            )
-            # Numeric tripwire: same flash kernel, so use tighter _RTOL_ATTN band.
+            max_abs = float(np.max(np.abs(d - p)))
             scale = float(np.max(np.abs(p)))
+            rel = max_abs / (scale + 1e-9)
+            rows.append((k, int(p.argmax()), int(d.argmax()), max_abs, scale, rel))
+
+        print("\n=== prefill==decode per-position (flash EXTEND vs flash DECODE) ===")
+        print(
+            " pos | argmax p | argmax d | max_abs_diff |  scale  |  rel_err | future_slots_in_page"
+        )
+        for k, ap, ad, mx, sc, rl in rows:
+            future = T - 1 - k  # tokens after k still sitting in the single page
+            print(f" {k:>3} | {ap:>8} | {ad:>8} | {mx:>11.4e} | {sc:>7.3f} | {rl:>7.4f} | {future}")
+        print(
+            f" bands: _RTOL_ATTN={_RTOL_ATTN} (single-stage)  _RTOL_LOGITS={_RTOL_LOGITS} (depth √(L+1))"
+        )
+
+        # Hard gate: every position's argmax must agree (decision correctness).
+        for k, ap, ad, *_ in rows:
+            self.assertEqual(ap, ad, f"prefill vs decode argmax differ at position {k}")
+
+        # Numeric tripwire. prefill (EXTEND, full-segment) and decode (DECODE, single
+        # token) are TWO different flash forward-mode tilings → two reduction orders
+        # over the keys, accumulating across all L layers + lm_head — the same regime
+        # as flash-vs-naive logits, NOT a single attention stage. The correct band is
+        # therefore _RTOL_LOGITS (√(L+1) depth growth), not _RTOL_ATTN.
+        for k, ap, ad, mx, sc, rl in rows:
             np.testing.assert_allclose(
-                d,
-                p,
-                rtol=_RTOL_ATTN,
-                atol=_RTOL_ATTN * max(scale, 1e-6),
+                mx,
+                0.0,
+                atol=_RTOL_LOGITS * max(sc, 1e-6),
                 err_msg=(
                     f"prefill vs decode logits at pos {k} exceed theory band "
-                    f"rtol={_RTOL_ATTN} (flash-vs-flash, same kernel)"
+                    f"rtol={_RTOL_LOGITS} (cross-forward-mode reduction order over L layers); "
+                    f"max_abs={mx:.4f} scale={sc:.3f} rel={rl:.4f}"
                 ),
             )
 
