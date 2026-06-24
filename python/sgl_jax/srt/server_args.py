@@ -153,6 +153,17 @@ class ServerArgs:
     # Optimization/debug options
     disable_radix_cache: bool = False
     enable_unified_radix_tree: bool = False
+
+    # HiCache (L1<->L2 KV cache offloading). hicache_storage: "disable" off,
+    # "none" enables L1+L2 (host pinned pool), "file" reserved for Stage 4 (L3).
+    hicache_storage: str = "disable"
+    hicache_ratio: float = 2.0
+    hicache_write_through_threshold: int = 1
+    # Write policy (aligned with sglang):
+    #   write_through            backup on hit_count >= threshold (default)
+    #   write_through_selective  same path, just a higher threshold
+    #   write_back               no backup on hit; back up only at device eviction
+    hicache_write_policy: str = "write_through"
     allow_auto_truncate: bool = False
     enable_tokenizer_batch_encode: bool = False
     disable_overlap_schedule: bool = False
@@ -360,6 +371,34 @@ class ServerArgs:
 
         if os.getenv("SGLANG_JAX_ENABLE_UNIFIED_RADIX_TREE", "0") == "1":
             self.enable_unified_radix_tree = True
+
+        if self.hicache_storage != "disable":
+            if self.hicache_storage not in ("none", "file"):
+                raise ValueError(
+                    f"hicache_storage must be one of disable/none/file, got {self.hicache_storage}"
+                )
+            if self.hicache_storage == "file":
+                raise ValueError("hicache_storage='file' (L3) is not supported yet (Stage 4)")
+            # HiCache rides on the component-based UnifiedRadixCache prefix tree.
+            self.enable_unified_radix_tree = True
+            self.disable_radix_cache = False
+            # DP>1 is supported at any page_size: device KV indices are per-rank
+            # local views, so the tree cache globalizes them at the controller
+            # boundary (UnifiedRadixCache._to_global_device_pages). That
+            # conversion is page-granular and dp-rank aware, so dp_size>1 +
+            # page_size>1 is correct.
+            if self.hicache_ratio <= 0:
+                raise ValueError(f"hicache_ratio must be positive, got {self.hicache_ratio}")
+            if self.hicache_write_policy not in (
+                "write_through",
+                "write_through_selective",
+                "write_back",
+            ):
+                raise ValueError(
+                    "hicache_write_policy must be one of write_through/"
+                    f"write_through_selective/write_back, got {self.hicache_write_policy}"
+                )
+
 
         if self.nnodes > 1 and self.device_indexes is not None:
             logger.warning("In a multi-machine scenario, device_indexes will be set to None.")
@@ -1046,6 +1085,37 @@ class ServerArgs:
             help="Route non-hybrid (full-attention) models to UnifiedRadixCache "
             "(component-agnostic prefix cache). Default off. Also required to route "
             "hybrid recurrent models (e.g. Kimi-Linear) into UnifiedRadixCache.",
+        )
+        parser.add_argument(
+            "--hicache-storage",
+            type=str,
+            choices=["disable", "none", "file"],
+            default=ServerArgs.hicache_storage,
+            help="HiCache KV offloading: 'disable' off, 'none' enables L1+L2 "
+            "(host pinned pool), 'file' reserved for Stage 4 (L3).",
+        )
+        parser.add_argument(
+            "--hicache-ratio",
+            type=float,
+            default=ServerArgs.hicache_ratio,
+            help="Host (L2) pool size as a multiple of the device KV pool size.",
+        )
+        parser.add_argument(
+            "--hicache-write-through-threshold",
+            type=int,
+            default=ServerArgs.hicache_write_through_threshold,
+            help="Min prefix hit_count before a node is backed up (D2H) to host.",
+        )
+        parser.add_argument(
+            "--hicache-write-policy",
+            type=str,
+            choices=["write_through", "write_through_selective", "write_back"],
+            default=ServerArgs.hicache_write_policy,
+            help="HiCache D2H backup policy: 'write_through' backs up on hit "
+            "(>= threshold); 'write_through_selective' is the same path with a "
+            "higher threshold; 'write_back' skips hit-time backup and only backs "
+            "up a node when its device KV is evicted (fewest D2H, best for slow "
+            "D2H links such as TPU).",
         )
         parser.add_argument(
             "--allow-auto-truncate",
