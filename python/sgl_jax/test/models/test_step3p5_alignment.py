@@ -17,7 +17,11 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 import jax
 import jax.numpy as jnp
 import numpy as np
-import torch
+
+try:
+    import torch
+except ImportError:  # torch is the HF reference oracle; absent in pure-JAX envs (pod/CI-cpu)
+    torch = None
 from safetensors.numpy import save_file as save_np_safetensors
 
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
@@ -98,8 +102,10 @@ _TINY_CFG_DICT: dict = {
 _HF_SRC = os.environ.get("STEP35_HF_SRC", "/Users/infiscale/develop")
 
 # Dev-local oracle: needs the HF modeling/config files present. Skip on CI where absent.
-_HF_AVAILABLE = os.path.isfile(os.path.join(_HF_SRC, "modeling_step3p5.py")) and os.path.isfile(
-    os.path.join(_HF_SRC, "configuration_step3p5.py")
+_HF_AVAILABLE = (
+    torch is not None
+    and os.path.isfile(os.path.join(_HF_SRC, "modeling_step3p5.py"))
+    and os.path.isfile(os.path.join(_HF_SRC, "configuration_step3p5.py"))
 )
 
 # ---------------------------------------------------------------------------
@@ -205,7 +211,7 @@ def _load_hf_model(tmpdir: str, weights_np: dict[str, np.ndarray]):
 # ---------------------------------------------------------------------------
 
 
-def _capture_hf_activations(hf_model, input_ids_torch: torch.Tensor) -> dict[tuple, np.ndarray]:
+def _capture_hf_activations(hf_model, input_ids_torch) -> dict[tuple, np.ndarray]:
     """Register forward hooks, run HF model, return dict of (stage, layer) -> np.ndarray."""
     caps: dict = {}
     hooks = []

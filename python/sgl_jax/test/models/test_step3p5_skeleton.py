@@ -13,7 +13,6 @@ Run from ``python/`` with::
 
 from __future__ import annotations
 
-import inspect
 import os
 import unittest
 from types import SimpleNamespace
@@ -130,23 +129,6 @@ class TestStep3p5Skeleton(unittest.TestCase):
         mc = SimpleNamespace(head_dim=0)
         Step3p5ForCausalLM.patch_model_config(mc)
         self.assertEqual(mc.head_dim, 128)
-
-
-class TestStep3p5WorktreeSource(unittest.TestCase):
-    """Ensure the worktree's source is loaded, not the editable-install main repo."""
-
-    def test_source_is_from_worktree(self):
-        from sgl_jax.srt.models import step3p5
-
-        src = inspect.getsourcefile(step3p5)
-        self.assertIsNotNone(src, "Could not determine source file for step3p5 module")
-        # The worktree path contains 'step35-flash'
-        self.assertIn(
-            "step35-flash",
-            src,
-            f"step3p5 module loaded from unexpected path: {src!r}. "
-            "Run with '-o pythonpath=.' from the worktree's python/ dir.",
-        )
 
 
 class TestStep3p5Config(unittest.TestCase):
