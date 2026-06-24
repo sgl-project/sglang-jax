@@ -204,14 +204,14 @@ class _DummyModelConfig:
         return 1
 
 
-def _make_kv_pool(cfg, mesh, dtype, num_tokens):
-    """Minimal MHATokenToKVPool large enough for num_tokens in a single page."""
+def _make_kv_pool(cfg, mesh, dtype, num_tokens, page_size=None):
+    """MHATokenToKVPool. page_size=None => single page; pass a smaller value for multi-page."""
     from sgl_jax.srt.mem_cache.memory_pool import MHATokenToKVPool
 
     # Use max kv_heads across all layers (full-attn layers may have more).
     num_kv = cfg.num_attention_groups
-    page_size = max(num_tokens, 1)
-    size = page_size  # one page suffices for a single-sequence prefill
+    page_size = page_size or max(num_tokens, 1)
+    size = ((num_tokens + page_size - 1) // page_size) * page_size  # enough slots for all pages
     return MHATokenToKVPool(
         size=size,
         page_size=page_size,
@@ -430,6 +430,33 @@ class TestFlashVsNaiveFp32(unittest.TestCase):
                 f"rtol={_RTOL_ATTN} (single-stage √2·ε_bf16·safety). "
                 "Positions outside the window must be masked as (k<=q)∧(q-k<W)."
             ),
+        )
+
+    def test_flash_equals_naive_multipage_fp32(self):
+        """Paged KV across MULTIPLE pages (page_size=8, T=24 → 3 pages): flash == naive.
+
+        The single-page tests verify kernel semantics; this exercises the page-table /
+        cross-page block indexing (reviewer point ①: the real gap beyond one page). Same
+        theory band + decision gate. naive ignores the pool (full attention); flash reads
+        the paged KV — equality proves paging is numerically inert.
+        """
+        kv = _make_kv_pool(self._cfg, self._mesh, jnp.float32, _NUM_TOKENS, page_size=8)
+        flash_model = self._build_and_load("flash", jnp.float32)
+        naive_model = self._build_and_load("naive", jnp.float32)
+        f = np.asarray(
+            _run_model(flash_model, self._mesh, kv, _NUM_TOKENS, jnp.float32), dtype=np.float64
+        ).ravel()
+        n = np.asarray(
+            _run_model(naive_model, self._mesh, None, _NUM_TOKENS, jnp.float32), dtype=np.float64
+        ).ravel()
+        self.assertEqual(int(f.argmax()), int(n.argmax()), "multipage greedy token differs")
+        scale = float(np.max(np.abs(n)))
+        np.testing.assert_allclose(
+            f,
+            n,
+            rtol=_RTOL_LOGITS,
+            atol=_RTOL_LOGITS * scale,
+            err_msg=f"multipage flash beyond theory band rtol={_RTOL_LOGITS} (page-table indexing?)",
         )
 
 
