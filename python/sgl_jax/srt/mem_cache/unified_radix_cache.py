@@ -1,9 +1,10 @@
 """Unified radix cache: a component-based radix tree over the device KV cache.
 
-Stage 1 ports the FULL-attention subset of upstream sglang's UnifiedRadixCache.
-All per-component behavior (matching, locking, eviction, split redistribution)
-is delegated to TreeComponent implementations so that later stages (SWA, recurrent,
-HiCache) plug in without touching the core walk.
+Ports upstream sglang's UnifiedRadixCache. Per-component behavior (matching,
+locking, eviction, split redistribution) is delegated to TreeComponent
+implementations: a FULL-attention component plus a leaf-only recurrent
+component (KDA / GDN). SWA / HiCache components plug into the same contract
+without touching the core walk.
 """
 
 from __future__ import annotations
@@ -315,7 +316,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
         # Let each component fill its insert fields and return an effective
         # cache length; the inserted key is capped to the min across components.
-        # All components return None today, so this leaves the full length.
+        # FULL returns None (full length); the recurrent component returns its
+        # effective cache len, capping the key to the recurrent boundary.
         insert_params = InsertParams() if is_insert else None
         effective_cache_len = len(token_ids)
         if is_insert:
@@ -397,7 +399,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
         # Let each component fill its insert fields and return an effective
         # cache length; the inserted key is capped to the min across components.
-        # All components return None today, so this leaves the full length.
+        # FULL returns None (full length); the recurrent component returns its
+        # effective cache len, capping the key to the recurrent boundary.
         insert_params = InsertParams()
         effective_cache_len = all_token_len
         for component in self._components_tuple:
@@ -550,8 +553,8 @@ class UnifiedRadixCache(BasePrefixCache):
         # Number of value CHUNKS accepted at the best match, not a token
         # count (upstream seam name kept for port parity).
         best_value_len = 0
-        # Stage 1 has no host tier: device-only matching is the only mode, so
-        # the best match and the best device match coincide.
+        # No host tier (HiCache unimplemented): device-only matching is the
+        # only mode, so the best match and the best device match coincide.
         # full_only: a request's own FULL-prefix bookkeeping (cache_unfinished_req
         # re-match) must not be gated on aux components (e.g. recurrent state,
         # which lives in the running slot, not the tree).
@@ -692,8 +695,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 node = self._split_node(node.key, node, prefix_len)
 
             # Let each component claim ownership of overlapping KV slots.
-            # FULL never consumes; duplicate frees stay in cache_*_req (this
-            # repo's convention), so the returned index is unused in stage 1.
+            # FULL never consumes and recurrent does not override this overlap
+            # hook; duplicate frees stay in cache_*_req (this repo's
+            # convention), so the returned index is currently unused.
             value_slice = value[:prefix_len]
             for component in self._components_tuple:
                 component.update_component_on_insert_overlap(
@@ -744,9 +748,10 @@ class UnifiedRadixCache(BasePrefixCache):
     def _cascade_evict(self, node: UnifiedTreeNode) -> None:
         """Tombstone the base value after all components have been driven.
 
-        Stage 1 collapses the upstream priority cascade: FULL is both the
-        trigger and the only component. The deferral contract puts
-        value = None here, not in FullComponent.evict_component."""
+        FULL is the eviction trigger (device-leaf status keys off its value);
+        the base-value tombstone is deferred to here -- after every component's
+        evict_component has run -- rather than inside FullComponent, so an aux
+        component (e.g. recurrent) can still read FULL.value while evicting."""
         node.component_data[BASE_COMPONENT_TYPE].value = None
         self._update_evictable_leaf_sets(node)
 

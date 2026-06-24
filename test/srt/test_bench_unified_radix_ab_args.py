@@ -5,6 +5,9 @@ the byte-identical dense default config, without launching any server. This
 file guards the manual benchmark's arg layer so the dense path stays unchanged.
 It is loaded by file path because the benchmark lives under benchmark/, not on
 the package path.
+
+Run locally/manually; not registered in run_suite.py -- it guards the
+benchmark CLI, not core runtime correctness.
 """
 
 import importlib.util

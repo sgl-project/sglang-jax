@@ -1,11 +1,11 @@
 """Component layer for UnifiedRadixCache.
 
-Stage 1 ships only the FULL (full-attention) component. The seam surface is
-deliberately wider than what stage 1 exercises: CacheTransferPhase /
-LRURefreshPhase / next_component_uuid / eviction_priority /
-recover_after_unevict / value_len / the ComponentType.is_* helpers and the
-unused ``params`` ctor arg exist so SWA / Recurrent / HiCache components can land
-against a stable contract without re-touching this module.
+Ships the FULL (full-attention) and recurrent (KDA / GDN) components. The seam
+surface is wider than those two exercise: CacheTransferPhase / LRURefreshPhase /
+next_component_uuid / eviction_priority / recover_after_unevict / value_len /
+the ComponentType.is_* helpers and the unused ``params`` ctor arg exist so SWA /
+HiCache components can land against a stable contract without re-touching this
+module.
 """
 
 from __future__ import annotations
@@ -78,7 +78,7 @@ class ComponentData:
 class InsertResult:
     """Result of an insert operation.
 
-    Lean stage-1 version (upstream keeps this in base_prefix_cache);
+    Lean local version (upstream keeps this in base_prefix_cache);
     used only in component seam annotations."""
 
     prefix_len: int = 0
@@ -187,10 +187,10 @@ class TreeComponent(ABC):
         Returns the index within value_slice from which this component
         consumed (took ownership of) the underlying KV pool slots.
         Returns prefix_len if nothing was consumed (default).
-        In stage 1 the core discards the return value (request-caching
-        callers free the duplicate overlap instead); once aux components
-        land, _insert_helper will use it to free only the non-consumed
-        duplicate portion: value_slice[dup_start:consumed_from]."""
+        The core currently discards the return value (request-caching
+        callers free the duplicate overlap instead); a future aux component
+        that consumes here would have _insert_helper use it to free only the
+        non-consumed duplicate portion: value_slice[dup_start:consumed_from]."""
         return prefix_len
 
     def should_skip_leaf_creation(
@@ -207,10 +207,11 @@ class TreeComponent(ABC):
         total_prefix_len: int,
         params: InsertParams,
     ) -> None:
-        """Later-stage hook (no-op in stage 1, which has no tombstones):
-        called after the core restores the base (Full) value on an evicted
-        node during insert. Aux components (e.g. SWA) override this to
-        rebuild their own data from the freshly assigned base value when
+        """Hook for a future tombstoning component (no-op today: device
+        eviction deletes leaves rather than tombstoning). Called after the
+        core restores the base (Full) value on an evicted node during insert.
+        Aux components (e.g. SWA) override this to rebuild their own data from
+        the freshly assigned base value when
         their entry is still tombstoned. Default no-op."""
         return None
 

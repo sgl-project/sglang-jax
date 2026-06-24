@@ -295,7 +295,6 @@ suites = {
         TestFile("test/srt/disaggregation/test_scheduler_mixins.py", 0.5, runner="pytest"),
         TestFile("test/srt/test_dp_schedule_policy.py", 0.2, runner="pytest"),
         TestFile("test/srt/test_bench_recurrent_reuse_sweep.py", 0.2, runner="pytest"),
-        TestFile("test/srt/test_bench_unified_radix_ab_args.py", 0.2, runner="pytest"),
         TestFile(
             "test/srt/disaggregation/test_tokenizer_bootstrap_passthrough.py",
             0.3,

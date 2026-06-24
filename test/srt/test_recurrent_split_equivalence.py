@@ -51,10 +51,12 @@ T_MAX = 384
 # slot the single + split runs both target (slot 0 is the dummy).
 SLOT = 1
 
-# (length, chunk sizes) — model GPQA prompts crossing 128 boundaries.
+# (length, chunk sizes) — model GPQA prompts crossing 128 boundaries. Two cases
+# cover the distinct splits: one clean boundary, and multi-boundary with a
+# partial final chunk. A multi-boundary all-clean case (e.g. 384) adds nothing:
+# the chunk-to-chunk carry is identical to the partial case minus the tail.
 PATTERNS = [
     (256, [128, 128]),  # one boundary
-    (384, [128, 128, 128]),  # two boundaries
     (300, [128, 128, 44]),  # two boundaries + partial final chunk (realistic)
 ]
 
@@ -220,9 +222,6 @@ class _SplitEquivalenceBase(unittest.TestCase):
 
     def test_len256_one_boundary(self):
         self._check_pattern(256, [128, 128])
-
-    def test_len384_two_boundaries(self):
-        self._check_pattern(384, [128, 128, 128])
 
     def test_len300_partial_final(self):
         self._check_pattern(300, [128, 128, 44])

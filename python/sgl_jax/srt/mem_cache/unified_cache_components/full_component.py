@@ -29,13 +29,13 @@ class FullComponent(TreeComponent):
     def __init__(self, cache: UnifiedRadixCache, params: CacheInitParams | None = None):
         super().__init__(cache, params)
         self._free_full = cache.token_to_kv_pool_allocator.free
-        # HiCache state: set to host KV pool when HiCache enabled (not in stage 1)
+        # HiCache state: set to host KV pool when HiCache enabled (unimplemented).
         self._full_kv_pool_host = None
 
     def create_match_validator(
         self, match_device_only: bool = False
     ) -> Callable[[UnifiedTreeNode], bool]:
-        # Stage 1 has no host tier, so device-only and default matching coincide.
+        # No host tier, so device-only and default matching coincide.
         return lambda node: node.component_data[self.component_type].value is not None
 
     def redistribute_on_node_split(self, new_parent: UnifiedTreeNode, child: UnifiedTreeNode):
@@ -93,15 +93,15 @@ class FullComponent(TreeComponent):
         lock_host: bool = False,
     ) -> IncLockRefResult:
         if lock_host:
-            # No host tier in stage 1.
+            # No host tier.
             return result
 
         ct = self.component_type
         root = self.cache.root_node
         cur = node
 
-        # Stage 1 has no tombstones (device eviction deletes leaves), so a
-        # live node's FULL value is never None on a lock path.
+        # No tombstones (device eviction deletes leaves), so a live node's
+        # FULL value is never None on a lock path.
         delta = 0
         while cur is not root:
             cd = cur.component_data[ct]
@@ -129,7 +129,7 @@ class FullComponent(TreeComponent):
         lock_host: bool = False,
     ) -> None:
         if lock_host:
-            # No host tier in stage 1.
+            # No host tier.
             return
 
         ct = self.component_type

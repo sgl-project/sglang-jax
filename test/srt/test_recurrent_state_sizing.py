@@ -174,7 +174,7 @@ class TestRecurrentStateConstraints(unittest.TestCase):
         )
         _enforce_recurrent_state_server_constraints(sa, is_lightning=True)  # no raise
 
-    def test_pr1_unified_radix_requires_page_size_1(self):
+    def test_unified_radix_without_extra_buffer_requires_page_size_1(self):
         sa = ServerArgs(
             model_path="dummy",
             enable_unified_radix_tree=True,
@@ -184,7 +184,7 @@ class TestRecurrentStateConstraints(unittest.TestCase):
         with self.assertRaises(AssertionError):
             _enforce_recurrent_state_server_constraints(sa)
 
-    def test_pr1_unified_radix_page_size_1_passes(self):
+    def test_unified_radix_without_extra_buffer_page_size_1_passes(self):
         sa = ServerArgs(
             model_path="dummy",
             enable_unified_radix_tree=True,
