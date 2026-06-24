@@ -273,6 +273,66 @@ class TestSWADiagnostic(unittest.TestCase):
             " (>0 + tiny gap => legitimate borderline flip; >0 + large gap => routing bug; 0 => look elsewhere)"
         )
 
+    def test_per_layer_growth_and_argmax(self):
+        """Decide: legitimate fp32 reduction-order noise vs a real sequential-only bug.
+
+        topk selection matches and every isolated stage matches, yet final logits exceed a
+        1e-3 atol (60/64, max 0.218). Two checks decide it WITHOUT loosening tolerance blindly:
+          (1) per-layer cumulative rel-err must grow SMOOTHLY (a JUMP at layer k => bug at k);
+          (2) final-logits ARGMAX must agree (decision layer, notes ⑭/P6).
+        Smooth growth + argmax agree => legitimate fp32 noise (flash Pallas-tiled vs naive
+        einsum summation order, notes §2.1); the 1e-3 constant is the wrong criterion and the
+        fix is calibrated/decision tolerance. JUMP or argmax disagree => real bug to localize.
+        """
+        import sgl_jax.srt.models.step3p5 as m
+
+        def _capture(model, kv_pool):
+            recs = []  # cumulative per-layer output (hidden + residual)
+            orig = m.Step3p5DecoderLayer.__call__
+
+            def patched(layer_self, positions, hidden, fb, pool, residual, *a, **k):
+                out = orig(layer_self, positions, hidden, fb, pool, residual, *a, **k)
+                h, r = out[0], out[1]
+                cum = h + r if r is not None else h
+                recs.append(np.asarray(jnp.asarray(cum, jnp.float32)))
+                return out
+
+            m.Step3p5DecoderLayer.__call__ = patched
+            try:
+                res = self._run_full(model, kv_pool)
+            finally:
+                m.Step3p5DecoderLayer.__call__ = orig
+            return recs, res
+
+        fm = self._model("flash")
+        nm = self._model("naive")
+        kv = _make_kv_pool(self._cfg, self._mesh, jnp.float32, _NUM_TOKENS)
+        f_layers, f_res = _capture(fm, kv)
+        n_layers, n_res = _capture(nm, None)
+
+        print("\n=== per-layer cumulative rel-err (flash vs naive), growth curve ===")
+        prev = 0.0
+        for i, (fl, nl) in enumerate(zip(f_layers, n_layers)):
+            rel = float(np.max(np.abs(fl - nl)) / (np.max(np.abs(nl)) + 1e-9))
+            jump = rel - prev
+            tag = "  <== JUMP" if jump > 0.05 else ""
+            print(f" layer {i}: rel_err={rel:.4f}  (delta={jump:+.4f}){tag}")
+            prev = rel
+
+        f_logits = np.asarray(f_res[0].next_token_logits, dtype=np.float64).ravel()
+        n_logits = np.asarray(n_res[0].next_token_logits, dtype=np.float64).ravel()
+        max_abs = float(np.max(np.abs(f_logits - n_logits)))
+        argmax_agree = int(np.argmax(f_logits)) == int(np.argmax(n_logits))
+        print("\n=== final logits: decision layer ===")
+        print(
+            f" max_abs_diff={max_abs:.4e}  argmax flash={int(np.argmax(f_logits))} "
+            f"naive={int(np.argmax(n_logits))}  AGREE={argmax_agree}"
+        )
+        print(
+            " smooth growth + argmax AGREE => fp32 noise (fix=calibrated/decision tol);"
+            " JUMP or DISAGREE => real bug"
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
