@@ -1063,17 +1063,20 @@ class Scheduler(
         req.disagg_transfer_id = recv_req.disagg_transfer_id or req.rid
         if hasattr(recv_req, "mm_inputs") and recv_req.mm_inputs:
             req.mm_inputs = recv_req.mm_inputs
-            multimodal_embedding = recv_req.mm_inputs.get("multimodal_embedding")
+            get_mm_value = (
+                recv_req.mm_inputs.get
+                if isinstance(recv_req.mm_inputs, dict)
+                else lambda key: getattr(recv_req.mm_inputs, key, None)
+            )
+            multimodal_embedding = get_mm_value("multimodal_embedding")
             req.multimodal_embedding = multimodal_embedding
             if (
-                recv_req.mm_inputs.get("deepstack_visual_pos_mask") is not None
-                and recv_req.mm_inputs.get("deepstack_visual_embedding") is not None
+                get_mm_value("deepstack_visual_pos_mask") is not None
+                and get_mm_value("deepstack_visual_embedding") is not None
             ):
                 req.apply_for_deepstack = True
-                req.deepstack_visual_pos_mask = recv_req.mm_inputs.get("deepstack_visual_pos_mask")
-                req.deepstack_visual_embedding = recv_req.mm_inputs.get(
-                    "deepstack_visual_embedding"
-                )
+                req.deepstack_visual_pos_mask = get_mm_value("deepstack_visual_pos_mask")
+                req.deepstack_visual_embedding = get_mm_value("deepstack_visual_embedding")
         # Validate prompt length
         error_msg = validate_input_length(
             req,

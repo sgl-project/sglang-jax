@@ -206,6 +206,7 @@ class ServerArgs:
 
     # Multimodal
     multimodal: bool = False
+    limit_mm_data_per_request: dict[str, int] | None = None
 
     enable_return_routed_experts: bool = False
     enable_expert_balance_debug: bool = False
@@ -366,6 +367,8 @@ class ServerArgs:
             self.device_indexes = None
         if self.multimodal:
             self.model_path = download_from_hf(self.model_path, allow_patterns=None)
+            if self.limit_mm_data_per_request is None:
+                self.limit_mm_data_per_request = {"image": 16}
 
         if self.ep_num_redundant_experts < 0:
             raise ValueError("ep_num_redundant_experts must be non-negative")
