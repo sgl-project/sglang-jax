@@ -2068,7 +2068,7 @@ class Scheduler(
         )
         use_spec_prefill_overlap = can_use_spec_prefill_overlap(
             self.enable_overlap, self.spec_algorithm, batch
-        )
+        ) and self.draft_worker._can_use_fused_spec_prefill(model_worker_batch)
         use_legacy_eagle3_decode = batch.forward_mode.is_decode() and use_legacy_eagle3_non_overlap(
             self.enable_overlap, self.spec_algorithm
         )

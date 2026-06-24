@@ -32,10 +32,24 @@ def can_use_spec_decode_overlap(enable_overlap, spec_algorithm, batch) -> bool:
         return False
     if any(info.decoding_reqs for info in batch.reqs_info):
         return False
+    # TODO(spec-overlap): neither the fused overlap verify kernel
+    # (draft_extend_fused.spec_decode_verify) nor the non-overlap verify path
+    # currently applies grammar / vocab_mask / penalty constraints during
+    # speculative verification. Batches carrying these constraints will have
+    # them silently ignored on the spec decode path. We do NOT exclude them in
+    # this gate because the non-overlap fallback has the same gap, so routing
+    # them off the overlap path would not make them correct. Revisit once
+    # constrained speculative verify is implemented.
     return not (batch.return_logprob or batch.return_output_logprob_only)
 
 
 def can_use_spec_prefill_overlap(enable_overlap, spec_algorithm, batch) -> bool:
+    # Cheap pre-filter only. The authoritative check is
+    # EAGLEWorker._can_use_fused_spec_prefill(model_worker_batch), which the
+    # scheduler ANDs in before dispatching to the fused prefill overlap entry
+    # (it needs the merged model_worker_batch sampling_info plus the worker's
+    # NEXTN/topk/num_steps config). Keep this gate to the conditions decidable
+    # from the ScheduleBatch alone so the two never drift.
     if not enable_overlap:
         return False
     if spec_algorithm is None or spec_algorithm.is_none():

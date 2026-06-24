@@ -576,10 +576,6 @@ class EagleDraftInput:
         return obj
 
     def prepare_for_extend_after_target_prefill(self, model_worker_batch: ModelWorkerBatch):
-
-        if model_worker_batch.forward_mode.is_idle():
-            return
-
         # Prefill only generate 1 token.
         assert (
             self.verified_id.shape[0] == model_worker_batch.real_bs
@@ -799,26 +795,6 @@ class EagleDraftInput:
 
         self.pending_draft_extend_result = None
         raise RuntimeError("Spec overlap relay path must not carry pending_draft_extend_result.")
-
-    @classmethod
-    def create_idle_input(
-        cls,
-        hidden_size: int,
-        dtype: np.dtype,
-        topk: int,
-        capture_hidden_mode: CaptureHiddenMode,
-        num_steps: int = 1,
-    ):
-        topk_shape = (0, num_steps, topk) if num_steps > 1 else (0, topk)
-        return cls(
-            verified_id=np.empty((0,), dtype=np.int32),
-            hidden_states=np.empty((0, hidden_size), dtype=dtype),
-            topk_p=np.empty(topk_shape, dtype=np.float32),
-            topk_index=np.empty(topk_shape, dtype=np.int32),
-            capture_hidden_mode=capture_hidden_mode,
-            accept_length=np.empty((0,), dtype=np.int32),
-            accept_length_cpu=np.empty((0,), dtype=np.int32),
-        )
 
     def _ensure_host(self):
         """Move device arrays to host (numpy) to avoid variable-shape device ops.
@@ -1079,9 +1055,6 @@ class EagleVerifyInput:
     def prepare_for_verify(
         self, model_worker_batch: ModelWorkerBatch, page_size: int, target_worker: ModelWorker
     ):
-        if model_worker_batch.forward_mode.is_idle():
-            return
-
         sel = model_worker_batch.logits_indices_selector
         model_worker_batch.seq_lens[sel] = model_worker_batch.seq_lens[sel] - 1
         model_worker_batch.input_ids = self.draft_token
@@ -1115,24 +1088,6 @@ class EagleVerifyInput:
         tokens. I.e., logits_output.next_token_logits only contains
         accepted token logits.
         """
-        if model_worker_batch.forward_mode.is_idle():
-            return EagleVerifyOutput(
-                draft_input=EagleDraftInput.create_idle_input(
-                    hidden_size=model_worker_batch.model_config.hidden_size,
-                    dtype=model_worker_batch.model_config.dtype,
-                    topk=self.topk,
-                    capture_hidden_mode=CaptureHiddenMode.LAST,
-                ),
-                logits_output=logits_output,
-                verified_id=jnp.empty(0, dtype=jnp.int32),
-                accept_length_per_req_cpu=[],
-                accepted_indices=jnp.full(
-                    (0, self.spec_steps + 1),
-                    -1,
-                    dtype=jnp.int32,
-                ),
-            )
-
         sampling_info = model_worker_batch.sampling_info
         bs = self.retrive_index.shape[0]
         if bs != len(sampling_info):
