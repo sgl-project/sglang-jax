@@ -30,6 +30,15 @@ logger = logging.getLogger(__name__)
 # fmt: off
 TUNED_BLOCK_CONFIGS: dict[str, dict[tuple, tuple[int, ...]]] = {
     "TPU v7": {
+        # Ling V3 Flash: E=512, H=2560, I=768, top_k=8, bf16, ep=4, grouped_topk
+        # I=768 is small — Strix double-buffer smem budget is tight. Keep bt
+        # low for decode to stay within 1MB smem.
+        ('bfloat16', 'bfloat16', 64, 512, 8, 2560, 768, 4, False, True): (8, 128, 8, 128, 8),
+        ('bfloat16', 'bfloat16', 128, 512, 8, 2560, 768, 4, False, True): (8, 128, 8, 128, 8),
+        ('bfloat16', 'bfloat16', 256, 512, 8, 2560, 768, 4, False, True): (8, 128, 16, 128, 16),
+        ('bfloat16', 'bfloat16', 512, 512, 8, 2560, 768, 4, False, True): (8, 128, 16, 128, 16),
+        ('bfloat16', 'bfloat16', 4096, 512, 8, 2560, 768, 4, False, True): (32, 128, 32, 128, None),
+
         # MiMo V2 Pro: E=384, H=6144, I=2048, top_k=8, fp8 e4m3, ep=32
         # Decode configs (tuned 2026-05-21)
         ('bfloat16', 'float8_e4m3fn', 64, 384, 8, 6144, 2048, 32, False, False): (8, 512, 8, 256, 8),
