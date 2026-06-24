@@ -1,10 +1,10 @@
 """CPU smoke tests for the bench_unified_radix_ab A/B harness.
 
 These cover argument parsing, the external-server single-config assertion, and
-the byte-identical dense default config, without launching any server. The
-harness is a MANUAL benchmark tool (not registered in run_suite.py); this file
-just guards its arg layer so the dense path stays unchanged. It is loaded by
-file path because the benchmark lives under benchmark/, not on the package path.
+the byte-identical dense default config, without launching any server. This
+file guards the manual benchmark's arg layer so the dense path stays unchanged.
+It is loaded by file path because the benchmark lives under benchmark/, not on
+the package path.
 """
 
 import importlib.util

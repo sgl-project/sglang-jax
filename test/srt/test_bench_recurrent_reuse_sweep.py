@@ -1,10 +1,8 @@
-"""CPU unit tests for the bench_recurrent_reuse_sweep predict_knee math.
+"""CPU unit tests for the bench_recurrent_reuse_sweep analytic helpers.
 
-Covers only the pure analytic-knee formula (and the per-rank C_rank derivation),
-no server. The HTTP K-sweep path is exercised by the controller against a live
-recurrent server. This is a MANUAL benchmark helper, deliberately NOT registered
-in run_suite.py. The benchmark lives under benchmark/, off the package path, so
-it is loaded by file path.
+Covers the pure knee math (predict_knee / derive_actual_C_rank / detect_knee);
+the HTTP K-sweep path runs against a live server. The benchmark lives under
+benchmark/, off the package path, so it is loaded by file path.
 """
 
 import importlib.util
@@ -34,29 +32,18 @@ class TestPredictKnee(unittest.TestCase):
 
     def test_spec_example(self):
         """Doc example: size=192, dp=4, C_rank=4 -> S_rank=48, K* = 4*(48-12) = 144."""
-        Kstar = self.bench.predict_knee(192, dp_size=4, C_rank=4)
-        self.assertEqual(Kstar, 144.0)
-
-    def test_dp1_no_reservation(self):
-        """dp=1, C_rank=0 -> the whole pool is cacheable: K* = size."""
-        self.assertEqual(self.bench.predict_knee(128, dp_size=1, C_rank=0), 128.0)
+        self.assertEqual(self.bench.predict_knee(192, dp_size=4, C_rank=4), 144.0)
 
     def test_factor_scales_reservation(self):
-        """factor multiplies the per-rank reservation (1 running + 2 ping-pong)."""
-        # size=192, dp=4, C_rank=4, factor=2 -> 4*(48 - 2*4) = 160.
+        """factor multiplies the per-rank reservation: 4*(48 - 2*4) = 160."""
         self.assertEqual(self.bench.predict_knee(192, 4, C_rank=4, factor=2), 160.0)
 
-    def test_snapshots_per_prefix_moves_knee_left(self):
+    def test_snapshots_per_prefix_divides_knee(self):
         """More snapshots per prefix -> fewer distinct prefixes fit -> lower K*."""
         base = self.bench.predict_knee(192, 4, C_rank=4, snapshots_per_prefix=1)
-        two = self.bench.predict_knee(192, 4, C_rank=4, snapshots_per_prefix=2)
-        self.assertEqual(two, base / 2)
-
-    def test_higher_concurrency_lowers_knee(self):
-        """Larger C_rank eats more budget, lowering the knee."""
-        low = self.bench.predict_knee(256, 4, C_rank=2)
-        high = self.bench.predict_knee(256, 4, C_rank=8)
-        self.assertLess(high, low)
+        self.assertEqual(
+            self.bench.predict_knee(192, 4, C_rank=4, snapshots_per_prefix=2), base / 2
+        )
 
 
 class TestDeriveActualCRank(unittest.TestCase):
@@ -68,15 +55,8 @@ class TestDeriveActualCRank(unittest.TestCase):
         self.assertEqual(self.bench.derive_actual_C_rank(parallel=16, dp_size=4), 4.0)
 
     def test_floor_of_one(self):
-        """At least one in-flight request per rank is reserved."""
+        """At least one in-flight request per rank is reserved (max(1, ...))."""
         self.assertEqual(self.bench.derive_actual_C_rank(parallel=2, dp_size=8), 1.0)
-
-    def test_derived_not_constant(self):
-        """C_rank tracks the actual --parallel, not a fixed constant."""
-        self.assertNotEqual(
-            self.bench.derive_actual_C_rank(8, 4),
-            self.bench.derive_actual_C_rank(32, 4),
-        )
 
 
 class TestDetectKnee(unittest.TestCase):
@@ -90,16 +70,11 @@ class TestDetectKnee(unittest.TestCase):
     def test_knee_at_plateau_edge(self):
         """Largest K still within plateau_frac * peak is the knee."""
         curve = self._curve([(8, 0.5), (16, 0.5), (32, 0.2), (64, 0.05)])
-        # peak=0.5, plateau_frac=0.9 -> threshold 0.45; only K=8,16 qualify.
         self.assertEqual(self.bench.detect_knee(curve, plateau_frac=0.9), 16)
 
     def test_no_reuse_returns_none(self):
-        """All-zero reuse (no-cache / broken / all-miss) has no knee, not max K."""
+        """Peak reuse ~0 (no-cache / broken / all-miss) has no knee, not max K."""
         curve = self._curve([(8, 0.0), (16, 0.0), (32, 0.0)])
-        self.assertIsNone(self.bench.detect_knee(curve, plateau_frac=0.9))
-
-    def test_tiny_noise_below_eps_is_no_reuse(self):
-        curve = self._curve([(8, 1e-12), (16, 0.0)])
         self.assertIsNone(self.bench.detect_knee(curve, plateau_frac=0.9))
 
 

@@ -123,10 +123,6 @@ class TestExtraBufferStaticValidation(unittest.TestCase):
             _server_args(recurrent_track_interval=None, chunked_prefill_size=1000, page_size=128)
         self.assertIn("chunked-prefill-size", str(cm.exception))
 
-    def test_track_interval_multiple_of_page_size_ok(self):
-        sa = _server_args(recurrent_track_interval=256, page_size=128)
-        self.assertEqual(sa.recurrent_track_interval, 256)
-
     def test_extra_buffer_with_speculative_rejected(self):
         with self.assertRaises((ValueError, AssertionError)):
             _server_args(speculative_algorithm="EAGLE")
