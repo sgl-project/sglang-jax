@@ -215,10 +215,62 @@ def _make_forward_batch(num_tokens: int):
         req_pool_indices=jnp.zeros(1, dtype=jnp.int32),
         seq_lens=jnp.array([num_tokens], dtype=jnp.int32),
         out_cache_loc=jnp.arange(num_tokens, dtype=jnp.int32),
+        cache_loc=jnp.arange(num_tokens, dtype=jnp.int32),
         positions=jnp.arange(num_tokens, dtype=jnp.int32),
         extend_prefix_lens=jnp.zeros(1, dtype=jnp.int32),
         extend_seq_lens=jnp.array([num_tokens], dtype=jnp.int32),
     )
+
+
+def _attach_flash_backend(fb, cfg, mesh, page_size):
+    """Wire a FlashAttention backend + forward metadata onto fb (flash path only).
+
+    Mirrors flashattention_common.create_test_data (the proven flash harness):
+    build the backend, a ModelWorkerBatch, and forward_metadata. Reduced config
+    has uniform heads (full==sliding==num_attention_heads) so one backend serves
+    all layers; real-model 64/96 head heterogeneity is a separate TPU concern.
+    NOTE: TPU-only — not CPU-verifiable; validated on TPU.
+    """
+    from sgl_jax.srt.layers.attention.flashattention_backend import FlashAttention
+    from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
+
+    n = int(fb.seq_lens.shape[0])
+    backend = FlashAttention(
+        cfg.num_attention_heads,
+        cfg.num_attention_groups,
+        _HEAD_DIM,
+        page_size=page_size,
+        mesh=mesh,
+    )
+    mwb = ModelWorkerBatch(
+        bid=0,
+        forward_mode=fb.forward_mode,
+        input_ids=np.asarray(fb.input_ids),
+        real_input_ids_len=int(fb.input_ids.shape[0]),
+        seq_lens=np.asarray(fb.seq_lens),
+        out_cache_loc=np.asarray(fb.out_cache_loc),
+        req_pool_indices=np.asarray(fb.req_pool_indices),
+        sampling_info=None,
+        positions=np.asarray(fb.positions),
+        cache_loc=np.asarray(fb.cache_loc),
+        extend_seq_lens=np.asarray(fb.extend_seq_lens),
+        extend_prefix_lens=np.asarray(fb.extend_prefix_lens),
+        return_logprob=False,
+        return_output_logprob_only=False,
+        top_logprobs_nums=None,
+        token_ids_logprobs=None,
+        extend_logprob_start_lens=None,
+        extend_input_logprob_token_ids=None,
+        logits_indices=np.asarray(fb.extend_seq_lens),
+        real_bs=n,
+        real_bs_per_dp=[n],
+        spec_info_padded=None,
+        dp_size=1,
+        per_dp_bs_size=n,
+    )
+    fb.attn_backend = backend
+    backend.forward_metadata = backend.get_forward_metadata(mwb)
+    return fb
 
 
 def _load_weights(model, weights, cfg, mesh):
@@ -238,6 +290,9 @@ def _run_model(model, mesh, kv_pool, num_tokens, dtype):
     )
 
     fb = _make_forward_batch(num_tokens)
+    # Flash path needs the FlashAttention backend + forward metadata; naive does not.
+    if kv_pool is not None:
+        _attach_flash_backend(fb, model.config, mesh, kv_pool.page_size)
     lm = LogitsMetadata(
         forward_mode=ForwardMode.EXTEND,
         capture_hidden_mode=CaptureHiddenMode.NULL,
@@ -321,10 +376,12 @@ class TestFlashVsNaiveFp32(unittest.TestCase):
         naive_model = self._build_and_load("naive", jnp.float32)
         flash_model = self._build_and_load("flash", jnp.float32)
         kv_pool = _make_kv_pool(self._cfg, self._mesh, jnp.float32, _NUM_TOKENS)
-        fb = _make_forward_batch(_NUM_TOKENS)
 
         def _layer1_hidden(model, pool):
             # Run embed → layer 0 → layer 1 (swa) and return that layer's attn output.
+            fb = _make_forward_batch(_NUM_TOKENS)
+            if pool is not None:  # flash path needs the backend wired
+                _attach_flash_backend(fb, model.config, self._mesh, pool.page_size)
             with jax.set_mesh(self._mesh):
                 hidden = model.model.embed_tokens(fb.input_ids)
                 residual = None
