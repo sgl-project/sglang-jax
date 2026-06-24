@@ -669,6 +669,16 @@ class FusedEPMoEV2(FusedEPMoE):
             direct_scaled_dot=direct_scaled_dot,
             dp_axis_name="data",
             tp_axis_name="tensor",
+            # sflag budget control: 512/4=128 local experts overflow 16KB sflag
+            cross_expert_prefetch_mode=(
+                "none" if self.num_experts // self.ep_size >= 64 else "full"
+            ),
+            enable_bt_scatter_overlap=(
+                False if self.num_experts // self.ep_size >= 64 else True
+            ),
+            interleave_bt=(
+                False if self.num_experts // self.ep_size >= 64 else True
+            ),
         )
 
         # Reshard the MoE output to the caller-requested layout. Under sequence
