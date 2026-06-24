@@ -206,9 +206,10 @@ class TestStep3p5ChunkedEqualsFull(CustomTestCase):
     def test_chunked_equals_full(self):
         model_dir = _config_dir()
 
-        # Chunked: force the 40-token prompt to be split (chunk size 8). Disable the
-        # radix cache so the only variable is the prefill chunking.
-        proc = _launch(model_dir, ["--chunked-prefill-size", "8", "--disable-radix-cache"])
+        # Chunked: force the 40-token prompt to be split. chunked-prefill-size must be
+        # a multiple of page_size (16); 16 splits the 40 tokens into 16+16+8 (3 chunks).
+        # Disable the radix cache so the only variable is the prefill chunking.
+        proc = _launch(model_dir, ["--chunked-prefill-size", "16", "--disable-radix-cache"])
         try:
             out_chunked = _generate(DEFAULT_URL_FOR_TEST, _INPUT_IDS)
         finally:
