@@ -63,6 +63,11 @@ class LaunchProfile(BaseModel):
     ep_size: int | None = Field(default=None, gt=0)
     port: int = 30000
     server_args: tuple[str, ...] = ()
+    # Strict precompile guard (SGLANG_JAX_ENABLE_CACHE_MISS_CHECK): crash the
+    # server if a request hits an un-precompiled shape. Right for fixed-shape perf
+    # sweeps; set False for client-driven benches with dynamic shapes (the
+    # recurrent reuse-sweep / A/B vary prompt length, batch, and K).
+    check_cache_miss: bool = True
 
     @field_validator("server_args")
     @classmethod

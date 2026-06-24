@@ -24,6 +24,11 @@ on:
         required: true
         default: "sgl-jax-ci-4x4-np"
         type: string
+      suite:
+        description: "Suite name for suite_runner.py --suite. Empty runs all suites matching TARGET."
+        required: false
+        default: ""
+        type: string
       namespace:
         description: "Namespace for Kubernetes RBAC checks."
         required: true
@@ -71,6 +76,10 @@ on:
         required: false
         type: string
         default: "sgl-jax-ci-4x4-np"
+      suite:
+        required: false
+        type: string
+        default: ""
       namespace:
         required: false
         type: string
@@ -131,6 +140,7 @@ jobs:
       K8S_SERVICE_ACCOUNT: ${{ inputs.service_account_name || vars.GKE_SERVICE_ACCOUNT || 'default' }}
       REPO_REF: ${{ inputs.repo_ref || github.sha }}
       WORKLOAD_NAME: gke-run-test-caces-${{ github.run_id }}
+      SUITE: ${{ inputs.suite }}
     steps:
       - name: Validate smoke test configuration
         shell: bash
@@ -322,7 +332,7 @@ jobs:
                     python3 -m pip install --upgrade pip
                     python3 -m pip install -e "python[all]"
                     python3 -m pip install evalscope
-                    python3 test/srt/nightly/multi_host/suite_runner.py
+                    python3 test/srt/nightly/multi_host/suite_runner.py ${SUITE:+--suite ${SUITE}}
                   env:
                   - name: JOB_COMPLETION_INDEX
                     valueFrom:

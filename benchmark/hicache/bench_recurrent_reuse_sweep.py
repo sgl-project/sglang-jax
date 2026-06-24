@@ -244,15 +244,24 @@ def run_k_point(args, tokenizer, generate_url, K, interval):
     wall = time.perf_counter() - t0
 
     ok = [r for r in results if r.success]
-    assert ok, f"K={K}: all probe requests failed"
+    n_fail = len(results) - len(ok)
+    # Past capacity the pool over-subscribes and retracts requests (their HTTP
+    # response comes back incomplete -> success=False). That IS the reuse collapse
+    # the sweep measures, so count failed probes as zero-reuse (each contributes
+    # its expected prompt length to the denominator, nothing to the numerator) and
+    # keep going, rather than aborting the whole sweep. A genuine all-points
+    # wipeout still surfaces: every K reads ~0 reuse, so detect_knee() returns None
+    # (no_reuse) and the gate fails.
+    expected_prompt = target_tokens + args.suffix_tokens
     total_cached = sum(r.cached_tokens for r in ok)
-    total_prompt = sum(r.prompt_len for r in ok)
-    ttfts = sorted(r.ttft for r in ok)
+    total_prompt = sum(r.prompt_len for r in ok) + n_fail * expected_prompt
+    ttfts = sorted(r.ttft for r in ok) or [0.0]
     return {
         "K": K,
         "reuse_frac": total_cached / total_prompt if total_prompt else 0.0,
         "cached_tokens": total_cached,
         "prompt_tokens": total_prompt,
+        "n_failed": n_fail,
         "ttft_p50_ms": statistics.median(ttfts) * 1000.0,
         "ttft_p90_ms": ttfts[min(len(ttfts) - 1, int(0.9 * len(ttfts)))] * 1000.0,
         "throughput_req_s": len(ok) / wall if wall else 0.0,
@@ -300,6 +309,7 @@ def main():
         print(
             f"K={K:>5}  reuse_frac={pt['reuse_frac']:.4f}  "
             f"cached={pt['cached_tokens']}/{pt['prompt_tokens']}  "
+            f"failed={pt['n_failed']}  "
             f"ttft_p50={pt['ttft_p50_ms']:.1f}ms  ttft_p90={pt['ttft_p90_ms']:.1f}ms  "
             f"tput={pt['throughput_req_s']:.1f}req/s",
             flush=True,

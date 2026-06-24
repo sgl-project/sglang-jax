@@ -2,18 +2,24 @@
 
 ``run_eval_for_case`` (accuracy) is shared by the single- and multi-host runners.
 ``run_benchmark_for_case`` (perf) is single-host only — the multi-host perf runner
-calls ``run_benchmark`` inline. Each host runner does its own logging / gating and
-feeds the returned metrics to ``results.py`` (``build_*_result`` + ``write_*``).
+calls ``run_benchmark`` inline. ``run_bench_for_case`` (BenchCase) shells out to a
+standalone ``benchmark/hicache`` bench and is shared by both host runners. Each host
+runner does its own logging / gating and feeds the returned metrics to ``results.py``
+(``build_*_result`` + ``write_*``).
 """
 
 import os
+import subprocess
 import sys
 
 _NIGHTLY_DIR = os.path.dirname(os.path.abspath(__file__))
 if _NIGHTLY_DIR not in sys.path:
     sys.path.insert(0, _NIGHTLY_DIR)
 
-from cases import AccuracyCase, PerfCase  # noqa: E402
+# Repo root = .../test/srt/nightly -> .../test/srt -> .../test -> repo root.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(_NIGHTLY_DIR)))
+
+from cases import AccuracyCase, BenchCase, PerfCase  # noqa: E402
 
 
 def run_eval_for_case(case: AccuracyCase, base_url: str):
@@ -96,3 +102,57 @@ def run_benchmark_for_case(
         args.profile_num_steps = profile_num_steps
 
     return run_benchmark(args)
+
+
+def run_bench_for_case(
+    case: BenchCase, base_url: str | None = None
+) -> tuple[dict, tuple[str, str] | None]:
+    """Run one BenchCase as a subprocess; gate on its exit code.
+
+    Builds ``python <repo>/<script> [--server-url ...] [--compare ...] <argv>
+    [--output-json ...]`` and runs it from the repo root with inherited stdio (so
+    a long sweep streams live to the CI log). The bench owns its own gate
+    (``--strict`` / a knee assert); this maps ``returncode != 0`` to a tagged
+    ``threshold`` failure. A dashboard record is written to ``$RESULTS_DIR``.
+
+    Returns ``(result, fail)`` where ``fail`` is ``None`` on pass or
+    ``("threshold", msg)`` on a nonzero exit, matching the other case drivers.
+    """
+    from results import write_result
+
+    results_dir = os.environ.get("RESULTS_DIR")
+    # The bench's own --output-json write (json.dump) does not create parents, so
+    # ensure RESULTS_DIR exists before the subprocess runs (write_result mkdirs
+    # too, but that is after the bench has already tried to write).
+    if results_dir:
+        os.makedirs(results_dir, exist_ok=True)
+    cmd = [sys.executable, os.path.join(_REPO_ROOT, case.script)]
+    if case.server == "runner":
+        if not base_url:
+            raise ValueError(f"{case.name}: server='runner' needs a base_url")
+        cmd += ["--server-url", base_url]
+    if case.compare_inputs:
+        if not results_dir:
+            raise RuntimeError(f"{case.name}: compare_inputs needs RESULTS_DIR to resolve inputs")
+        cmd += ["--compare", *[os.path.join(results_dir, n) for n in case.compare_inputs]]
+    cmd += list(case.argv)
+    if case.output_json and results_dir:
+        cmd += ["--output-json", os.path.join(results_dir, case.output_json)]
+
+    print(f"[bench-runner] {case.name}: {' '.join(cmd)}", flush=True)
+    rc = subprocess.run(cmd, cwd=_REPO_ROOT).returncode
+
+    result = {
+        "type": "bench",
+        "case": case.name,
+        "script": case.script,
+        "server": case.server,
+        "argv": list(case.argv),
+        "returncode": rc,
+        "passed": rc == 0,
+    }
+    write_result(result, case.name)
+
+    fail = None if rc == 0 else ("threshold", f"{case.name}: bench exited {rc} (see logs)")
+    print(f"[bench-runner] {case.name}: {'PASS' if rc == 0 else 'FAIL'} (exit {rc})", flush=True)
+    return result, fail

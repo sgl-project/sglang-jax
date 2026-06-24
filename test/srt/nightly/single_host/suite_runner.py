@@ -31,6 +31,7 @@ for _p in (_TEST_SRT, _NIGHTLY_DIR, _SELF_DIR):
 from cases import (  # noqa: E402
     GSM8K_GENERATION_CONFIG,
     AccuracyCase,
+    BenchCase,
     PerfCase,
     PerfParams,
     SuiteError,
@@ -55,10 +56,14 @@ class SingleHostRun:
     under ``launch_profiles/`` carrying the full server config (one profile per
     config — no per-run overrides), and ``cases`` are evaluated in order against
     the single launched server.
+
+    ``launch_profile`` may be ``None`` for a run of self-launching / offline
+    ``BenchCase``s (the single-host A/B bench launches its own servers): the runner
+    then launches nothing and just drives the cases.
     """
 
-    launch_profile: str
-    cases: tuple[AccuracyCase | PerfCase, ...]
+    launch_profile: str | None
+    cases: tuple[AccuracyCase | PerfCase | BenchCase, ...]
 
     def __post_init__(self):
         # Allow call sites to pass a list for readability; freeze to a tuple.
@@ -203,6 +208,66 @@ SUITES: dict[str, SingleHostSuite] = {
             ),
         ],
     ),
+    # Recurrent A/B perf gate (Next Work item 4, Phase 2): no-cache vs
+    # unified-recurrent on the GDN-hybrid Qwen3.5-35B-A3B, single-host dp=1 tp=4.
+    # The A/B bench self-launches both servers sequentially (one pod), so the run
+    # carries no launch_profile; its own --strict gate fires the soft targets
+    # (gsp p50-TTFT < 0.9x no-cache; random throughput >= 0.95x no-cache). Server
+    # knobs mirror the page-128 extra-buffer determinism e2e (context bounded so
+    # the 35B leaves a positive KV budget; bs-paddings divisible by tp*t_packing).
+    "recurrent-ab-perf-v6e-4": SingleHostSuite(
+        name="recurrent-ab-perf-v6e-4",
+        runs=[
+            SingleHostRun(
+                launch_profile=None,
+                cases=[
+                    BenchCase(
+                        name="recurrent-ab",
+                        script="benchmark/hicache/bench_unified_radix_ab.py",
+                        server="self",
+                        output_json="recurrent_ab.json",
+                        argv=(
+                            "--model",
+                            "Qwen/Qwen3.5-35B-A3B",
+                            "--tp-size",
+                            "4",
+                            "--page-size",
+                            "128",
+                            "--context-length",
+                            "8192",
+                            "--max-running-requests",
+                            "16",
+                            "--chunked-prefill-size",
+                            "512",
+                            "--max-recurrent-state-size",
+                            "96",
+                            "--mem-fraction-static",
+                            "0.8",
+                            "--configs",
+                            "no-cache",
+                            "unified-recurrent",
+                            "--workloads",
+                            "gsp",
+                            "random",
+                            "--max-concurrency",
+                            "16",
+                            "--num-prompts",
+                            "64",
+                            "--repeats",
+                            "3",
+                            "--drop-first",
+                            "1",
+                            "--disable-overlap-schedule",
+                            "--precompile-bs-paddings",
+                            "8",
+                            "16",
+                            "--strict",
+                        ),
+                    ),
+                ],
+            ),
+        ],
+    ),
 }
 
 
@@ -231,41 +296,60 @@ def run_one(run: SingleHostRun) -> None:
     and unexpected crashes from the case runner — and raises a single SuiteError
     tagged with the dominant kind (a crash maps to ``case`` so it surfaces as
     EXIT_CASE_CRASH, not retryable infra). Only genuine infra errors (profile
-    load, server launch) propagate as-is. ``AccuracyCase`` and ``PerfCase`` are
-    dispatched by type to their case runner.
+    load, server launch) propagate as-is. ``AccuracyCase`` / ``PerfCase`` are
+    dispatched by type to their case runner; ``BenchCase`` shells out to a
+    standalone bench (``run.launch_profile`` is ``None`` for a self-launching /
+    offline BenchCase run, so no server is launched here).
     """
-    # Lazy: pull jax in only to actually run a case (keeps --caselist jax-free).
-    from accuracy_case_runner import (
-        load_profile_file,
-        profile_server_spec,
-        run_accuracy_case,
-    )
-    from perf_case_runner import run_perf_case
+    from drivers import run_bench_for_case
 
     from sgl_jax.srt.utils import kill_process_tree
-    from sgl_jax.test.test_utils import (
-        DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-        popen_launch_server,
-    )
 
-    profile = load_profile_file(run.launch_profile)
-    spec = profile_server_spec(profile)
-    _log(f"launching {profile.name} (model={spec['model']}, base_url={spec['base_url']})")
-    process = popen_launch_server(
-        spec["model"],
-        spec["base_url"],
-        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-        other_args=spec["other_args"],
-    )
+    process = None
+    spec = None
+    profile = None
+    if run.launch_profile is not None:
+        # Lazy: pull jax in only when a server-backed case actually runs (keeps
+        # --caselist and BenchCase-only runs jax-free in the parent).
+        from accuracy_case_runner import load_profile_file, profile_server_spec
+
+        from sgl_jax.test.test_utils import (
+            DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            popen_launch_server,
+        )
+
+        profile = load_profile_file(run.launch_profile)
+        spec = profile_server_spec(profile)
+        _log(f"launching {profile.name} (model={spec['model']}, base_url={spec['base_url']})")
+        process = popen_launch_server(
+            spec["model"],
+            spec["base_url"],
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=spec["other_args"],
+        )
+    else:
+        _log(f"no launch profile — self-launching/offline cases ({len(run.cases)})")
+
     failures: list[tuple[str, str]] = []
     try:
         for case in run.cases:
             try:
-                if isinstance(case, PerfCase):
-                    result, fail = run_perf_case(
+                if isinstance(case, BenchCase):
+                    base_url = spec["base_url"] if (spec and case.server == "runner") else None
+                    _result, fail = run_bench_for_case(case, base_url)
+                elif isinstance(case, PerfCase):
+                    if spec is None:
+                        raise ValueError(f"{case.name}: PerfCase requires a launch_profile")
+                    from perf_case_runner import run_perf_case
+
+                    _result, fail = run_perf_case(
                         case, spec["base_url"], spec["model"], profile.name, profile.target
                     )
                 else:
+                    if spec is None:
+                        raise ValueError(f"{case.name}: AccuracyCase requires a launch_profile")
+                    from accuracy_case_runner import run_accuracy_case
+
                     result = run_accuracy_case(case, spec["base_url"], profile.name, profile.target)
                     fail = _gate_accuracy(case, result)
             except Exception as exc:  # noqa: BLE001 — a case crash is a bug, not infra
@@ -278,7 +362,8 @@ def run_one(run: SingleHostRun) -> None:
             else:
                 _log(f"{case.name}: PASS")
     finally:
-        kill_process_tree(process.pid)
+        if process is not None:
+            kill_process_tree(process.pid)
 
     if failures:
         kinds = {kind for kind, _ in failures}

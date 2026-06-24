@@ -14,13 +14,13 @@ for _p in (_TEST_SRT, _NIGHTLY_DIR, _SELF_DIR):
 # Re-export the host-neutral case contracts from cases.py so `from multi_host_suite
 # import ...` keeps working. Kept stdlib-only (no profiles/pydantic) so suite_runner.py's
 # module import stays light (e.g. for --dry-run); RuntimeConfig comes from profiles where used.
-from cases import AccuracyCase, PerfCase, SuiteError  # noqa: E402,F401
+from cases import AccuracyCase, BenchCase, PerfCase, SuiteError  # noqa: E402,F401
 
 
 @dataclass(frozen=True)
 class ModelRun:
     launch_profile: str  # filename under launch_profiles/; resolved to absolute path
-    cases: list[PerfCase | AccuracyCase]
+    cases: list[PerfCase | AccuracyCase | BenchCase]
 
 
 @dataclass(frozen=True)
@@ -54,8 +54,14 @@ def _dry_run_model_run(run: ModelRun) -> dict:
     }
 
 
-def _dry_run_case(case: PerfCase | AccuracyCase) -> dict:
+def _dry_run_case(case: PerfCase | AccuracyCase | BenchCase) -> dict:
+    if isinstance(case, BenchCase):
+        case_type = "bench"
+    elif isinstance(case, PerfCase):
+        case_type = "perf"
+    else:
+        case_type = "accuracy"
     return {
         "name": case.name,
-        "type": "perf" if isinstance(case, PerfCase) else "accuracy",
+        "type": case_type,
     }

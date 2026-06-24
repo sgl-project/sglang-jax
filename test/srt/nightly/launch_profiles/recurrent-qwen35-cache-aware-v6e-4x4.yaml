@@ -1,0 +1,50 @@
+name: qwen3_5_a3b-recurrent-cache_aware-tp16-dp4
+target: v6e-4x4
+# HF id; resolved against SGLANG_JAX_MODEL_CACHE by the runner (absolute paths
+# pass through). GDN-hybrid (recurrent) MoE, same checkpoint as the page-128 e2e.
+model_path: Qwen/Qwen3.5-35B-A3B
+tp_size: 16
+dp_size: 4
+port: 30050
+check_cache_miss: false  # dynamic-shape reuse-sweep / A/B benches
+server_args:
+  - --trust-remote-code
+  - --skip-server-warmup
+  - --dtype
+  - bfloat16
+  - --attention-backend
+  - fa
+  - --page-size
+  - "128"
+  # Bound the context so the 35B leaves a positive KV budget per dp group (each
+  # is tp4, mirroring the single-host e2e); its full context forces max_running=0.
+  - --context-length
+  - "8192"
+  - --chunked-prefill-size
+  - "512"
+  - --mem-fraction-static
+  - "0.8"
+  # Global cap; per dp rank = 32/4 = 8. Must be >= the t_packing-safe decode
+  # bucket (32 = 2 tokens/device at tp16) so decode pads up to it instead of
+  # running at 1 token/device (fused EP-MoE requires per-device count % 2 == 0).
+  # Pool 192 (48/rank) leaves 48 - 8*3 = 24 snapshot slots/rank, so reuse is real.
+  # The reuse-sweep drives parallel=32 -> knee K* = size - 3*parallel = 96.
+  - --max-running-requests
+  - "32"
+  - --random-seed
+  - "42"
+  - --disable-overlap-schedule
+  - --enable-unified-radix-tree
+  - --enable-recurrent-extra-buffer
+  - --max-recurrent-state-size
+  - "192"
+  - --dp-schedule-policy
+  - cache_aware
+  # Decode batch buckets: >=2 tokens/device for the fused-MoE t_packing at tp16,
+  # divisible by the device count (sampler lax.cond). Validate on first GKE run.
+  - --precompile-bs-paddings
+  - "32"
+  - "64"
+  - --precompile-token-paddings
+  - "512"
+  - "1024"

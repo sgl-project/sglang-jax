@@ -159,6 +159,47 @@ class AccuracyCase:
     score_threshold: float | None = None
 
 
+@dataclass(frozen=True)
+class BenchCase:
+    """Run a ``benchmark/hicache`` bench as a subprocess; gate on its exit code.
+
+    Unlike ``PerfCase``/``AccuracyCase`` (driven in-process against a server the
+    suite launched), a ``BenchCase`` shells out to a standalone bench that already
+    owns its own gate (``--strict`` / a knee ``assert``). The runner only injects
+    the runtime wiring and maps the exit code to the tagged suite exit codes:
+    ``returncode == 0`` -> pass, nonzero -> a ``threshold`` failure.
+
+    ``server`` selects how the bench gets its server:
+      - ``"runner"`` — the runner already launched one (multi-host ``ModelRun``);
+        the runner injects ``--server-url http://127.0.0.1:<port>``.
+      - ``"self"``   — the bench self-launches its own servers (the single-host
+        A/B launches one per ``--configs`` entry); the runner launches nothing.
+      - ``"none"``   — offline, no server (the A/B ``--compare`` gate that merges
+        per-policy result JSONs); the runner launches nothing.
+
+    ``output_json`` (a bare filename) makes the runner inject ``--output-json
+    $RESULTS_DIR/<output_json>`` so a later ``"none"`` compare case can read it.
+    ``compare_inputs`` (bare filenames) are resolved against ``$RESULTS_DIR`` and
+    injected as ``--compare <paths...>`` — the cross-policy A/B gate references the
+    same names the per-policy ``output_json`` runs wrote.
+    """
+
+    name: str
+    script: str  # repo-root-relative, e.g. benchmark/hicache/bench_unified_radix_ab.py
+    argv: tuple[str, ...] = ()
+    server: str = "runner"  # runner | self | none
+    output_json: str | None = None
+    compare_inputs: tuple[str, ...] = ()
+
+    def __post_init__(self):
+        if self.server not in ("runner", "self", "none"):
+            raise ValueError(f"BenchCase.server must be runner|self|none, got {self.server!r}")
+        if not isinstance(self.argv, tuple):
+            object.__setattr__(self, "argv", tuple(self.argv))
+        if not isinstance(self.compare_inputs, tuple):
+            object.__setattr__(self, "compare_inputs", tuple(self.compare_inputs))
+
+
 # Default gsm8k sampling (greedy). Lives here (host-neutral, stdlib-only) so the
 # suite catalog can build cases without importing the jax-backed case runners.
 GSM8K_GENERATION_CONFIG = {"temperature": 0.0, "max_tokens": 2048}

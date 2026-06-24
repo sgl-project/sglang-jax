@@ -1,0 +1,42 @@
+name: qwen3_5_a3b-recurrent-min_running-tp16-dp4
+target: v6e-4x4
+# A/B sibling of the cache_aware profile — identical except the routing policy
+# (min_running_queue, the default). The reuse contrast: min_running's reuse is
+# bounded by ~1/dp_size, so its knee falls far below predict_knee (curve-only).
+model_path: Qwen/Qwen3.5-35B-A3B
+tp_size: 16
+dp_size: 4
+port: 30051
+check_cache_miss: false  # dynamic-shape reuse-sweep / A/B benches
+server_args:
+  - --trust-remote-code
+  - --skip-server-warmup
+  - --dtype
+  - bfloat16
+  - --attention-backend
+  - fa
+  - --page-size
+  - "128"
+  - --context-length
+  - "8192"
+  - --chunked-prefill-size
+  - "512"
+  - --mem-fraction-static
+  - "0.8"
+  - --max-running-requests
+  - "32"
+  - --random-seed
+  - "42"
+  - --disable-overlap-schedule
+  - --enable-unified-radix-tree
+  - --enable-recurrent-extra-buffer
+  - --max-recurrent-state-size
+  - "192"
+  - --dp-schedule-policy
+  - min_running_queue
+  - --precompile-bs-paddings
+  - "32"
+  - "64"
+  - --precompile-token-paddings
+  - "512"
+  - "1024"

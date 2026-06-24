@@ -117,6 +117,28 @@ def parse_args():
     p.add_argument("--mem-fraction-static", type=float, default=0.8)
     p.add_argument("--attention-backend", default="fa")
     p.add_argument(
+        "--max-running-requests",
+        type=int,
+        default=256,
+        help="Server running-batch cap. Lower it for large models on few chips "
+        "(their KV budget can't hold 256 in flight).",
+    )
+    p.add_argument(
+        "--context-length",
+        type=int,
+        default=None,
+        help="Server --context-length; emitted only when set. Bound it for large "
+        "models — their full context can force max_running_requests to 0 on few chips.",
+    )
+    p.add_argument(
+        "--max-recurrent-state-size",
+        type=int,
+        default=None,
+        help="Server --max-recurrent-state-size, emitted only for the "
+        "unified-recurrent config. Cap it for large models: the default ratio-based "
+        "sizing reserves ~0.9 of HBM and leaves a negative KV budget.",
+    )
+    p.add_argument(
         "--chunked-prefill-size",
         type=int,
         default=512,
@@ -324,7 +346,7 @@ def run_config(args, config):
         "--mem-fraction-static",
         str(args.mem_fraction_static),
         "--max-running-requests",
-        "256",
+        str(args.max_running_requests),
         "--page-size",
         str(args.page_size),
         "--tp-size",
@@ -334,6 +356,8 @@ def run_config(args, config):
         "--download-dir",
         "/dev/shm/",
     ]
+    if args.context_length is not None:
+        common += ["--context-length", str(args.context_length)]
     common += ["--precompile-bs-paddings", *[str(b) for b in args.precompile_bs_paddings]]
     common += ["--precompile-token-paddings", *[str(t) for t in args.precompile_token_paddings]]
     # Emit parallelism/MoE flags only when set, so the default dense command stays
@@ -350,6 +374,8 @@ def run_config(args, config):
     # server default (4096) so their launch command stays byte-identical.
     if config == "unified-recurrent":
         common += ["--chunked-prefill-size", str(args.chunked_prefill_size)]
+        if args.max_recurrent_state_size is not None:
+            common += ["--max-recurrent-state-size", str(args.max_recurrent_state_size)]
     if args.disable_overlap_schedule:
         common += ["--disable-overlap-schedule"]
 
@@ -601,6 +627,14 @@ def main():
         if args.strict and (not ok or fired == 0):
             raise SystemExit(1)
         return
+
+    # Resolve the model against the test model cache (SGLANG_JAX_MODEL_CACHE) like
+    # the rest of the harness: a bare HF id picks up a local CI checkpoint, while
+    # absolute paths / cache misses pass through unchanged. Done after the compare
+    # branch so an offline --compare merge stays jax-free.
+    from sgl_jax.test.test_utils import _local_or_hf
+
+    args.model = _local_or_hf(args.model)
 
     print(f"args={args}\n", flush=True)
 
