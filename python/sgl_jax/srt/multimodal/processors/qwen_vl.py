@@ -33,7 +33,7 @@ class QwenVLProcessor(BaseMultimodalProcessor):
             text=[input_text],
             images=images,
             padding=True,
-            return_tensors="np",
+            return_tensors="pt",
         )
 
         input_ids_array = self._to_numpy(processor_output.get("input_ids"))
@@ -65,6 +65,7 @@ class QwenVLProcessor(BaseMultimodalProcessor):
             spatial_merge_size=vision_config.spatial_merge_size,
             tokens_per_second=None,
         )
+        mrope_position_delta = np.asarray([[mrope_position_delta]], dtype=np.int32)
 
         return MultimodalInputs(
             mm_items=mm_items,
