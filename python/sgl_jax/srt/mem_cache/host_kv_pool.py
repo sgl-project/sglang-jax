@@ -79,12 +79,6 @@ class HostKVPool(abc.ABC):
         """Return a reserved slot to the pool by id."""
 
     @abc.abstractmethod
-    def copy_from_device(self, layers: list[jax.Array], buffer_id: int) -> StagedData:
-        """D2H staging for PD ``producer_handoff``: write ``layers`` into the
-        pre-reserved ``buffer_id`` and return a :class:`StagedData`. Release is
-        owned by the caller."""
-
-    @abc.abstractmethod
     def available_size(self) -> int:
         """Entries currently free."""
 
@@ -92,10 +86,15 @@ class HostKVPool(abc.ABC):
     def total_size(self) -> int:
         """Total entries in the pool (free + in-use)."""
 
-    # Retaining transfer primitives (HiCache). Defaulted (not abstract) so
-    # QueueHostKVPool stays concrete and the PD path is untouched — only
-    # LRUHostKVPool overrides them. Pure integer index pairs, isomorphic to a
-    # future raiden ``d2h(src_offsets, dst_offsets)`` / ``h2d(...)``.
+    # Role-specific transfer primitives, all defaulted (not abstract) so each
+    # concrete pool implements only the ones its role needs and stays concrete:
+    # PD overrides copy_from_device; HiCache overrides copy_into/copy_to_device.
+
+    def copy_from_device(self, layers: list[jax.Array], buffer_id: int) -> StagedData:
+        """D2H staging for PD ``producer_handoff``: write ``layers`` into the
+        pre-reserved ``buffer_id`` and return a :class:`StagedData`. Release is
+        owned by the caller. PD-only; HiCache uses :meth:`copy_into`."""
+        raise NotImplementedError
 
     def copy_into(self, device_indices: list[int], host_buffer_ids: list[int]) -> None:
         """Retaining D2H: copy device page(s) into reserved slot(s), pairwise.
@@ -274,8 +273,12 @@ class LRUHostKVPool(HostKVPool):
     ``int`` crossing the boundary is a page id, and ``available_size`` /
     ``total_size`` count pages.
 
-    ``self._lock`` guards only the free-list and ``_lock_ref``; per-slot
-    reads/writes rely on the caller holding an exclusive reservation.
+    ``self._lock`` guards the free-list and ``_lock_ref``. Per-slot reads rely on
+    the caller holding an exclusive reservation, but the transfer write/publish
+    points (``_slots`` in flush_backup, ``_pending_*`` in stage_backup/stage_load)
+    re-check ``_allocated`` under ``_lock`` before publishing, so a concurrent
+    release()/free() can never resurrect data into a freed slot — it surfaces
+    loudly instead. Lock order is ``_lock -> _pending_lock``/``_pending_load_lock``.
     """
 
     def __init__(
@@ -492,8 +495,17 @@ class LRUHostKVPool(HostKVPool):
         # Slice the real pages back per buffer_id (cheap views on the now-
         # materialized array); padding rows [n:] are dropped.
         gathered = {bid: packed[:, i] for i, bid in enumerate(host_buffer_ids)}
-        with self._pending_lock:
-            self._pending_gather.update(gathered)
+        # Publish under _lock with an allocation re-check: a free()/release()
+        # may have run since the entry check above (its _drop_pending also takes
+        # _lock, so this serializes against it). Without the re-check a gather
+        # could land in _pending_gather for a slot already returned to the
+        # free-list, to be popped later into a reused slot. Lock order is
+        # _lock -> _pending_lock, matching free()/release().
+        with self._lock:
+            for buffer_id in host_buffer_ids:
+                self._require_allocated(buffer_id)
+            with self._pending_lock:
+                self._pending_gather.update(gathered)
 
     def flush_backup(self, host_buffer_ids: list[int]) -> None:
         """D2H phase 2: ``device_put`` the staged pages into their host slots.
@@ -508,7 +520,6 @@ class LRUHostKVPool(HostKVPool):
         # array, which has no CPU implementation.
         staged: list[jax.Array] = []
         for buffer_id in host_buffer_ids:
-            self._require_allocated(buffer_id)
             with self._pending_lock:
                 packed = self._pending_gather.pop(buffer_id, None)
             if packed is None:
@@ -517,7 +528,13 @@ class LRUHostKVPool(HostKVPool):
                     f"stage_backup() must run (synchronously) first"
                 )
             host_packed = jax.device_put(packed, self._host_sharding)
-            self._slots[buffer_id] = host_packed
+            # Re-check allocation under _lock before publishing into _slots: a
+            # release()/free() may have run after the pop above; writing here
+            # without the guard would resurrect data into a slot already on the
+            # free-list (claimable by the next alloc()).
+            with self._lock:
+                self._require_allocated(buffer_id)
+                self._slots[buffer_id] = host_packed
             staged.append(host_packed)
         jax.block_until_ready(staged)
 
@@ -560,8 +577,15 @@ class LRUHostKVPool(HostKVPool):
             loaded[buffer_id] = packed_dev
             staged.append(packed_dev)
         jax.block_until_ready(staged)
-        with self._pending_load_lock:
-            self._pending_load.update(loaded)
+        # Publish under _lock with an allocation re-check (same race as
+        # stage_backup): release()'s _drop_pending also takes _lock, so this
+        # serializes against a slot being freed mid-stage. Lock order
+        # _lock -> _pending_load_lock.
+        with self._lock:
+            for buffer_id in host_buffer_ids:
+                self._require_allocated(buffer_id)
+            with self._pending_load_lock:
+                self._pending_load.update(loaded)
 
     def flush_load(self, host_buffer_ids: list[int], device_indices: list[int]) -> None:
         """H2D phase 2: scatter the staged pages into the KV buffer via the
@@ -723,19 +747,6 @@ class LRUHostKVPool(HostKVPool):
         """Total page slots in the pool (free + in-use)."""
         return self._pool_size
 
-    def copy_from_device(self, layers: list[jax.Array], buffer_id: int) -> StagedData:
-        # ABC contract only — the HiCache upper layer never calls this (it uses
-        # copy_into so no jax.Array crosses the boundary). Present so the class
-        # is not abstract and so a non-retaining caller could still borrow.
-        self._require_allocated(buffer_id)
-        if len(layers) != self._layer_num:
-            raise ValueError(f"expected {self._layer_num} layers, got {len(layers)}")
-        packed = jnp.stack(list(layers), axis=0)
-        host_packed = jax.device_put(packed, self._host_sharding)
-        jax.block_until_ready(host_packed)
-        self._slots[buffer_id] = host_packed
-        return StagedData(buffer_id=buffer_id, array_pytree=[host_packed])
-
     # ------------------------------------------------------------------
     # LRU / lock_ref mechanism (private to this class, not in the ABC).
     # The pool only provides the mechanism; victim selection lives in the
@@ -765,7 +776,13 @@ class LRUHostKVPool(HostKVPool):
         # negative indexing on D2H gather) or expand to negative loc on H2D
         # (only -1 is treated as padding by the kernel; other negatives become
         # real DMA targets and corrupt pages).
-        n_dev = int(self._device_pool.size) // self._page_size
+        #
+        # Bound is the kv_buffer's page-axis length, NOT size // page_size: the
+        # fused buffer carries an extra sentinel page (memory_pool packs
+        # ``(size + page_size*dp_size) // page_size`` rows) and the allocator
+        # hands out 1-based page ids up to that top row, so ``size // page_size``
+        # would wrongly reject the highest legitimately-allocated page.
+        n_dev = int(self._device_pool.kv_buffer[0].shape[0])
         for idx in device_indices:
             if not (0 <= int(idx) < n_dev):
                 raise ValueError(f"device page id={idx} outside range [0, {n_dev})")

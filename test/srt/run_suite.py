@@ -343,6 +343,7 @@ suites = {
         TestFile("python/sgl_jax/test/test_gdn_attention_dp.py", 6),
         TestFile("python/sgl_jax/test/layers/test_lightning_backend.py", 8, runner="pytest"),
         TestFile("test/srt/test_moe_block_quant_e2e.py", 1.5, runner="pytest"),
+        TestFile("python/sgl_jax/test/mem_cache/test_host_kv_pool_tpu.py", 1, runner="pytest"),
     ],
     "kernel-performance-test-tpu-v6e-1": [
         TestFile("benchmark/kernels/flash_attention/bench_flashattention.py", 5),

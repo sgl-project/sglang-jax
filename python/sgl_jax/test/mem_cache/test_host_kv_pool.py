@@ -1,9 +1,10 @@
-"""Unit tests for :class:`LRUHostKVPool` (HiCache Stage 0).
+"""Unit tests for :class:`LRUHostKVPool` (HiCache Stage 0), CPU-runnable.
 
-CPU-runnable: ``_make_host_sharding`` falls back to default sharding when
-``pinned_host`` is unsupported, so the round-trip semantics are exercised
-without a TPU. The pinned-host in-place invariant is covered separately by
-``test_single_chip_host_pool`` on a real pod.
+``_make_host_sharding`` falls back to default sharding when ``pinned_host`` is
+unsupported, and ``conftest.py`` swaps the TPU-only fused-KV Pallas kernel for a
+pure-JAX scatter, so the round-trip semantics are exercised here without a TPU.
+The real kernel, true pinned-host placement, and dp>1 page-axis sharding are
+covered on hardware by ``test_host_kv_pool_tpu.py`` (``unit-test-tpu-v6e-4``).
 """
 
 from __future__ import annotations
@@ -146,12 +147,14 @@ class TestLRUHostKVPoolBoundaryInvariants(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.pool.stage_backup([0], [0])
 
-    def test_copy_from_device_rejects_unallocated_host_id(self):
-        # Same invariant on the ABC borrow path: a free-list id must not be
-        # written into _slots while alloc() can still hand it out.
+    def test_lru_copy_from_device_not_implemented(self):
+        # LRUHostKVPool is the retaining HiCache pool: it transfers via copy_into
+        # (no jax.Array crosses the boundary), so the PD-only copy_from_device
+        # default-raises rather than carrying a dead implementation.
+        b = self.pool.reserve()
         layers = [self.pool._device_pool.kv_buffer[L][0] for L in range(3)]
-        with self.assertRaises(RuntimeError):
-            self.pool.copy_from_device(layers, 0)
+        with self.assertRaises(NotImplementedError):
+            self.pool.copy_from_device(layers, b)
 
     def test_inc_lock_ref_rejects_unallocated(self):
         with self.assertRaises(RuntimeError):
@@ -162,9 +165,16 @@ class TestLRUHostKVPoolBoundaryInvariants(unittest.TestCase):
             self.pool.inc_lock_ref(99)
 
     def test_stage_backup_rejects_out_of_range_device_page(self):
+        # kv_buffer carries a sentinel page, so size=16/page_size=1 has 17 rows:
+        # valid device pages are [0, 17). 17 is the first out-of-range id; 16 (the
+        # top real page the allocator can hand out) must NOT be rejected.
         page = int(self.pool.alloc(1)[0])
+        n_dev = int(self.pool._device_pool.kv_buffer[0].shape[0])
+        self.assertEqual(n_dev, 17)
         with self.assertRaises(ValueError):
-            self.pool.stage_backup([16], [page])  # device has 16 pages: [0, 16)
+            self.pool.stage_backup([n_dev], [page])  # 17 is out of range
+        # Highest valid page is accepted (would raise before the off-by-one fix).
+        self.pool.stage_backup([n_dev - 1], [page])
 
     def test_flush_load_rejects_negative_device_page(self):
         page = int(self.pool.alloc(1)[0])
