@@ -18,30 +18,6 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 
-def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
-    assert embed_dim % 2 == 0
-    omega = np.arange(embed_dim // 2, dtype=np.float32)
-    omega /= embed_dim / 2.0
-    omega = 1.0 / 10000**omega
-
-    pos = pos.reshape(-1)
-    out = np.einsum("m,d->md", pos, omega)
-
-    emb_sin = np.sin(out)
-    emb_cos = np.cos(out)
-
-    emb = np.concatenate([emb_sin, emb_cos], axis=1)
-    return emb
-
-
-def get_1d_sincos_pos_embed(embed_dim, t_size, cls_token=False):
-    grid_t = np.arange(t_size, dtype=np.float32)
-    pos_embed = get_1d_sincos_pos_embed_from_grid(embed_dim, grid_t)
-    if cls_token:
-        pos_embed = np.concatenate([np.zeros([1, embed_dim]), pos_embed], axis=0)
-    return pos_embed
-
-
 class Learnable2DInterPosEmbDivided_fixed(nnx.Module):
 
     def __init__(
@@ -234,20 +210,18 @@ class KimiK25VisionAttention(nnx.Module):
         pad_k = k
         pad_v = v
 
-        segment_ids = None
-
         if sum_seq_len != align_seq_len:
             pad_q = jnp.pad(q, ((0, align_seq_len - sum_seq_len), (0, 0), (0, 0)))
             pad_k = jnp.pad(k, ((0, align_seq_len - sum_seq_len), (0, 0), (0, 0)))
             pad_v = jnp.pad(v, ((0, align_seq_len - sum_seq_len), (0, 0), (0, 0)))
 
-            indices = jnp.arange(sum_seq_len)
-            item_ids = jnp.sum(indices[:, None] >= cu_seqlens[1:][None, :], axis=-1) + 1
+        indices = jnp.arange(sum_seq_len)
+        item_ids = jnp.sum(indices[:, None] >= cu_seqlens[1:][None, :], axis=-1) + 1
 
-            seg_q = jnp.pad(item_ids, (0, align_seq_len - sum_seq_len))
-            seg_kv = jnp.pad(item_ids, (0, align_seq_len - sum_seq_len))
+        seg_q = jnp.pad(item_ids, (0, align_seq_len - sum_seq_len))
+        seg_kv = jnp.pad(item_ids, (0, align_seq_len - sum_seq_len))
 
-            segment_ids = SegmentIds(q=seg_q[None, :], kv=seg_kv[None, :])
+        segment_ids = SegmentIds(q=seg_q[None, :], kv=seg_kv[None, :])
 
         pad_q = jnp.transpose(pad_q, (1, 0, 2))[None, ...]
         pad_k = jnp.transpose(pad_k, (1, 0, 2))[None, ...]
@@ -293,15 +267,12 @@ class KimiK25VisionMLP(nnx.Module):
         self,
         config: KimiK25ModelVitConfig,
         dtype: jnp.dtype,
-        mesh: Mesh | None = None,
         rngs: nnx.Rngs | None = None,
     ):
         in_features = config.vt_hidden_size
         intermediate_size = config.vt_intermediate_size
 
         _rngs = rngs or nnx.Rngs(0)
-
-        self.mesh = mesh
 
         self.up_proj = nnx.Linear(
             in_features,
@@ -337,7 +308,7 @@ class KimiK25VisionBlock(nnx.Module):
         assert mesh is not None, "KimiK25VisionBlock requires a sharding Mesh"
 
         self.attn = KimiK25VisionAttention(config, dtype, mesh, rngs)
-        self.mlp = KimiK25VisionMLP(config, dtype, mesh, rngs)
+        self.mlp = KimiK25VisionMLP(config, dtype, rngs)
 
         _rngs = rngs or nnx.Rngs(0)
 
@@ -384,7 +355,6 @@ class VisionTowerEncoder(nnx.Module):
         config: KimiK25ModelVitConfig,
         dtype: jnp.dtype,
         mesh: Mesh | None = None,
-        norm_eps: float = 1e-6,
         rngs: nnx.Rngs | None = None,
         video_attn_type: str = "spatial_temporal",
     ):
@@ -434,7 +404,6 @@ class VisionTower(nnx.Module):
         dtype: jnp.dtype,
         rngs: nnx.Rngs | None = None,
         mesh: Mesh | None = None,
-        norm_eps: float = 1e-6,
     ):
         self.config = config
         self.dtype = dtype
@@ -459,7 +428,7 @@ class VisionTower(nnx.Module):
             dtype,
         )
 
-        self.encoder = VisionTowerEncoder(config, dtype, mesh, norm_eps, rngs)
+        self.encoder = VisionTowerEncoder(config, dtype, mesh, rngs)
 
     def compute_aux_arrays(
         self,
@@ -540,7 +509,12 @@ class Kimi_K25_MultiModalProjector(nnx.Module):
         self.hidden_size = config.vt_hidden_size * merge_h * merge_w
 
         _rngs = rngs or nnx.Rngs(0)
-        self.pre_norm = nnx.LayerNorm(config.vt_hidden_size, param_dtype=dtype, rngs=_rngs)
+        self.pre_norm = nnx.LayerNorm(
+            config.vt_hidden_size,
+            config.projector_ln_eps,
+            param_dtype=dtype,
+            rngs=_rngs
+        )
 
         self.proj_0 = nnx.Linear(
             self.hidden_size,
@@ -585,7 +559,7 @@ class Kimi_K25_VisionModel(nnx.Module):
         self.dtype = dtype
         self.mesh = mesh
 
-        self.vision_tower = VisionTower(config, dtype, rngs, mesh, config.projector_ln_eps)
+        self.vision_tower = VisionTower(config, dtype, rngs, mesh)
         self.mm_projector = Kimi_K25_MultiModalProjector(config, dtype, rngs)
 
         logger.info("Kimi K2.5 Vision Model initialized with dtype %s", dtype)
