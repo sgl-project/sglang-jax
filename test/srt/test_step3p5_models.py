@@ -39,12 +39,16 @@ from sgl_jax.test.test_utils import (
 _MODEL = os.environ.get("STEP35_MODEL_PATH")
 _BASE_URL = os.environ.get("STEP35_BASE_URL", DEFAULT_URL_FOR_TEST)
 
-# Floors calibrated from measured v7x runs (two consistent runs):
-#   gsm8k = 0.905 (200 examples) -> floor 0.88 (~2.5pt margin)
-#   mmlu  = 0.727 (128 examples) -> floor 0.70 (~2.7pt margin; fewer examples => more variance)
-# Margin covers cross-launch bf16 reduction-order flips on borderline examples.
+# Floors from measured v7x runs (max_tokens=8192 — see _eval; Step-3.5 is a
+# reasoning model, so a small generation budget truncates the long CoT before the
+# final answer and tanks MMLU: 2048 gave a false 0.727, 8192 gives 0.859 ≈ the
+# official 85.8). The MMLU subset is seeded (fixed 128), so run-to-run variance is
+# only concurrency bf16 flips, not example sampling; floors are measured-minus a
+# (heuristic, not variance-swept) margin:
+#   gsm8k = 0.905 (200 ex) -> floor 0.88
+#   mmlu  = 0.859 (128 ex) -> floor 0.80 (wider margin: single 8192 measurement)
 _GSM8K_FLOOR = 0.88
-_MMLU_FLOOR = 0.70
+_MMLU_FLOOR = 0.80
 
 
 @unittest.skipUnless(
@@ -62,6 +66,10 @@ class TestStep3p5FlashAccuracy(CustomTestCase):
             eval_name=eval_name,
             num_examples=num_examples,
             num_threads=32,
+            # Step-3.5 is a reasoning model: a tight budget truncates the CoT before
+            # the final answer (MMLU dropped to 0.727 at 2048; 0.859 at 8192). The
+            # server must be launched with --context-length >= prompt + 8192.
+            max_tokens=8192,
         )
         score = run_eval(args)["score"]
         # Print to stdout so the score survives in the pytest log (run with -s) even
