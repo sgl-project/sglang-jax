@@ -1,0 +1,87 @@
+from typing import Any
+
+import jax.numpy as jnp
+
+STR_DTYPE_TO_JAX_DTYPE = {
+    "half": jnp.float16,
+    "float16": jnp.float16,
+    "float": jnp.float32,
+    "float32": jnp.float32,
+    "bfloat16": jnp.bfloat16,
+    "int8": jnp.int8,
+}
+
+
+class DtypeConfig:
+    def __init__(
+        self, config_dict: dict[str, Any] | None = None, default_dtype: jnp.dtype | None = None
+    ):
+        # Validate at least one of config_dict and default_dtype is provided
+        if config_dict is None and default_dtype is None:
+            raise ValueError("At least one of config_dict and default_dtype must be provided.")
+
+        self.config_dict = self._parse_dict(config_dict or {})
+
+        # Resolve the default dtype for this level
+        if "default" in self.config_dict:
+            self.default_dtype = self.config_dict["default"]
+        else:
+            self.default_dtype = jnp.dtype(default_dtype) if default_dtype is not None else None
+
+    def __repr__(self) -> str:
+        """Return a concise representation including config_dict and default_dtype."""
+        return (
+            f"DtypeConfig(config_dict={self.config_dict!r}, "
+            f"default_dtype={self.default_dtype!r})"
+        )
+
+    def _parse_dict(self, d: dict[str, Any]) -> dict[str, Any]:
+        """Recursively parses a dictionary, converting string dtypes to jnp.dtype."""
+        parsed = {}
+        for k, v in d.items():
+            if isinstance(v, dict):
+                parsed[k] = self._parse_dict(v)
+            elif isinstance(v, str) and v.lower() in STR_DTYPE_TO_JAX_DTYPE:
+                parsed[k] = STR_DTYPE_TO_JAX_DTYPE[v.lower()]
+            else:
+                try:
+                    # Handles both dtype instances and dtype type objects (e.g., jnp.bfloat16)
+                    parsed[k] = jnp.dtype(v)
+                except (TypeError, ValueError) as err:
+                    raise ValueError(f"Unknown dtype: {v}, provided value type: {type(v)}") from err
+        return parsed
+
+    def get_config(self, key: str) -> "DtypeConfig":
+        """Returns a child config covering the sub-dictionary, preserving the default."""
+        return DtypeConfig(
+            config_dict=self.config_dict.get(key, {}), default_dtype=self.default_dtype
+        )
+
+    def get_dtype(self, key: str) -> jnp.dtype | None:
+        """Returns the specific dtype, or falls back to the default.
+
+        This is ideal for weights like q_proj, gate_proj, etc. that should always
+        have a dtype (defaulting to the model's default dtype if not explicitly set).
+        """
+        val = self.config_dict.get(key, self.default_dtype)
+        if isinstance(val, dict):
+            return self.default_dtype
+        if val is None:
+            return None
+        return jnp.dtype(val)
+
+    def get_optional_dtype(self, key: str) -> jnp.dtype | None:
+        """Returns the specific dtype, or None if the key is not explicitly set.
+
+        This is ideal for optional parameters like softmax_dtype that should only
+        be used if explicitly configured. Returns None if the key is not present
+        in the config_dict.
+        """
+        if key not in self.config_dict:
+            return None
+        val = self.config_dict[key]
+        if isinstance(val, dict):
+            return None
+        if val is None:
+            return None
+        return jnp.dtype(val)

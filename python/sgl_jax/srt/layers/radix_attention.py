@@ -3,6 +3,7 @@
 from enum import Enum
 
 import jax
+import jax.numpy as jnp
 from flax import nnx
 
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
@@ -36,6 +37,7 @@ class RadixAttention(nnx.Module):
         sliding_window_size: int = 0,
         logit_cap: float = 0,
         attn_type: AttentionType = AttentionType.DECODER,
+        softmax_dtype: jnp.dtype | None = None,
     ):
         super().__init__()
         self.q_head_num = num_heads
@@ -49,6 +51,13 @@ class RadixAttention(nnx.Module):
         self.logit_cap = logit_cap or None
         self.attn_type = attn_type
         self.xai_temperature_len = -1
+        if softmax_dtype is not None:
+            softmax_dtype = jnp.dtype(softmax_dtype)
+            if not jnp.issubdtype(softmax_dtype, jnp.floating):
+                raise ValueError(
+                    f"softmax_dtype must be a floating-point type, but got {softmax_dtype}."
+                )
+        self.softmax_dtype = softmax_dtype
 
     def __call__(
         self,

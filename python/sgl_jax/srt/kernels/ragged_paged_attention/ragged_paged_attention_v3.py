@@ -109,6 +109,7 @@ def ref_ragged_paged_attention(
     v_scale: float | None = None,
     xai_temperature_len: float | None = None,
     attention_sink: jax.Array | float | None = None,
+    softmax_dtype: jnp.dtype | None = None,
 ):
     """Reference implementation for ragged paged attention."""
     if not causal:
@@ -177,8 +178,14 @@ def ref_ragged_paged_attention(
             attn = attn * xai_temperature_reg[None, :, None]
 
         attn += jnp.where(mask, mask_value, 0.0)
+
+        # Cast to softmax_dtype if specified
+        if softmax_dtype is not None:
+            attn = attn.astype(softmax_dtype)
+
         if attention_sink is not None:
-            sink = jnp.asarray(attention_sink, dtype=jnp.float32)
+            sink_dtype = softmax_dtype if softmax_dtype is not None else jnp.float32
+            sink = jnp.asarray(attention_sink, dtype=sink_dtype)
             if sink.ndim == 0:
                 sink = jnp.full((num_q_heads,), sink)
             sink_logits = jnp.broadcast_to(
@@ -186,10 +193,10 @@ def ref_ragged_paged_attention(
                 (num_q_heads, q_len, 1),
             )
             attn = jnp.concatenate([sink_logits, attn], axis=-1)
-            attn = jax.nn.softmax(attn, axis=-1).astype(v.dtype)
+            attn = jax.nn.softmax(attn, axis=-1)
             attn = attn[..., 1:]
         else:
-            attn = jax.nn.softmax(attn, axis=-1).astype(v.dtype)
+            attn = jax.nn.softmax(attn, axis=-1)
         out = jnp.einsum("hqk,khd->qhd", attn, v).astype(queries.dtype)
         outputs.append(out)
 
@@ -360,6 +367,7 @@ def _ragged_paged_attention_kernel_loop(
     k_scale: float | None = None,
     v_scale: float | None = None,
     xai_temperature_len: float | None = None,
+    softmax_dtype: jnp.dtype | None = None,
     static_q_len: int | None = None,
     bq_sz,  # bq fetch size
     bkv_sz,  # bkv prefetch size
@@ -511,6 +519,9 @@ def _ragged_paged_attention_kernel_loop(
 
         if mask is not None:
             s = jnp.where(mask, s, mask_value)
+
+        if softmax_dtype is not None:
+            s = s.astype(softmax_dtype)
 
         s_rowmax = jnp.max(s, axis=1, keepdims=True)
         m_prev = m_ref[...].astype(jnp.float32)
@@ -1637,6 +1648,7 @@ def get_vmem_limit():
         "k_scale",
         "v_scale",
         "xai_temperature_len",
+        "softmax_dtype",
         "chunk_prefill_size",
         "d_block_sizes",
         "p_block_sizes",
@@ -1672,6 +1684,7 @@ def ragged_paged_attention(
     k_scale: float | None = None,
     v_scale: float | None = None,
     xai_temperature_len: float | None = None,
+    softmax_dtype: jnp.dtype | None = None,
     chunk_prefill_size: int | None = None,
     d_block_sizes: tuple[int, int, int, int] | None = None,
     p_block_sizes: tuple[int, int, int, int] | None = None,
@@ -1919,6 +1932,7 @@ def ragged_paged_attention(
                 k_scale=k_scale,
                 v_scale=v_scale,
                 xai_temperature_len=xai_temperature_len,
+                softmax_dtype=softmax_dtype,
                 static_q_len=static_q_len,
                 bq_sz=bq_sz,
                 bkv_sz=bkv_sz,
