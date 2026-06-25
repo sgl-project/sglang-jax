@@ -36,7 +36,7 @@ GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
 BACKENDS=(
   "v1|fused|tpu-v7-4-c|-|-"
   "v2|fused_v2|tpu-v7-4-b|einops fla-core triton|8"
-  "v4|fused_v4|tpu-v7-4-b|-|-"
+  "v4|fused_v4|tpu-v7-4-a|-|-"
 )
 
 # ── 公共配置 ──────────────────────────────────────────────────────
@@ -172,6 +172,7 @@ deploy_one() {
   local job_name="ling-v3-flash-longctx-bench-${label}"
 
   echo -e "${GREEN}=== Deploy ${label} (moe_backend=${moe_backend}) ===${NC}"
+  echo "  commit: 20260625-033020-2e437ae8"
 
   # 清理旧 job
   kubectl delete job "$job_name" --ignore-not-found >/dev/null 2>&1

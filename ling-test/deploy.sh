@@ -26,7 +26,7 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 # ── Phase 0: 本地代码检查 ────────────────────────────────────────
 phase_0_local_check() {
-    echo "=== Phase 0: Local code check ==="
+    echo "=== Phase 0: Local code check (commit: 20260625-033020-2e437ae8) ==="
 
     cd "$REPO_ROOT/python"
 
