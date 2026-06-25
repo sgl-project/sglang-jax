@@ -780,9 +780,13 @@ class Step3p5ForCausalLM(nnx.Module):
         # Checkpoint stores pre-stacked [E, out, in]; the loader detects 3D + shape[0]==E
         # (single-source branch) and calls _create_prestacked_moe_lazy_tensor, which applies
         # transpose(0,2,1): [E, out, in] → [E, in, out] matching EPMoE wi_0/wi_1/wo layout.
-        # Sharding is (None, None, None) so the prestacked loader uses the standard mesh
-        # (avoids the expert/tensor mesh context mismatch during transpose); the assignment
-        # to EPMoE params auto-reshards to the expert/tensor sharding they were initialized on.
+        # Sharding ("expert", None, None) shards axis 0 on the moe mesh's expert axis so each
+        # device loads ONLY its experts (num_experts/ep_size), never the full stacked tensor —
+        # mirrors minimax_m2 / deepseek_v3 / qwen3_moe. The non-expert dims stay unsharded, so
+        # transpose(0,2,1) keeps ("expert", None, None) (no mesh-context conflict); the
+        # assignment to EPMoE params reshards to their ("expert", None, "tensor") layout.
+        # REQUIRES --ep-size > 1 at runtime, else the expert axis has size 1 and the full
+        # stacked tensor is replicated on every device (HBM blow-up on the real 288-expert model).
         for src_proj, tgt_name in [
             ("gate_proj", "wi_0"),
             ("up_proj", "wi_1"),
@@ -792,7 +796,7 @@ class Step3p5ForCausalLM(nnx.Module):
             src_key = f"{prefix}.moe.{src_proj}.weight"
             mappings[f"__MOE_EXPERTS__{tgt_base}"] = WeightMapping(
                 target_path=[tgt_base, src_key],
-                sharding=(None, None, None),
+                sharding=("expert", None, None),
                 transpose=True,
             )
 

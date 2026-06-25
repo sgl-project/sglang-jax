@@ -1874,10 +1874,17 @@ class WeightLoader:
             host = host[np.asarray(physical_to_logical_map)]
             result = jax.device_put(_reinterpret_dtype_if_needed(host, target_dtype), sharding)
 
-        if result.dtype != target_dtype:
-            result = result.astype(target_dtype)
-        if do_transpose:
-            result = jnp.transpose(result, (0, 2, 1))
+        # dtype cast + transpose must run under the array's OWN mesh (target_sharding's
+        # mesh — e.g. the moe expert/tensor mesh). JAX explicit-sharding requires the
+        # context mesh to match the operand's aval mesh, else transpose raises
+        # "context mesh ... should match the aval mesh". This is what lets the stacked
+        # experts load sharded on the expert axis (no full-tensor replication) yet still
+        # transpose correctly.
+        with jax.set_mesh(sharding.mesh):  # type: ignore[arg-type]
+            if result.dtype != target_dtype:
+                result = result.astype(target_dtype)
+            if do_transpose:
+                result = jnp.transpose(result, (0, 2, 1))
         return result
 
     def load_weights_from_safetensors(
@@ -2227,7 +2234,13 @@ class WeightLoader:
                         if stacked_weight.dtype in [jnp.float8_e4m3fn, jnp.float8_e5m2]:
                             model_param.value = stacked_weight
                         else:
-                            model_param.value = stacked_weight.astype(model_param.value.dtype)
+                            # The dtype cast must run under the loaded array's OWN mesh
+                            # (e.g. the moe expert/tensor mesh) — JAX explicit-sharding
+                            # requires the context mesh to match the operand's aval mesh.
+                            # No-op for global-mesh arrays (context already matches), but
+                            # required when experts loaded sharded on the moe mesh.
+                            with jax.set_mesh(stacked_weight.sharding.mesh):  # type: ignore[arg-type]
+                                model_param.value = stacked_weight.astype(model_param.value.dtype)
                         if assert_all_assigned:
                             _assigned_paths.add(target_path)
                         _t_assign = time.monotonic() - _t_assign_start
