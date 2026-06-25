@@ -39,15 +39,17 @@ from sgl_jax.test.test_utils import (
 _MODEL = os.environ.get("STEP35_MODEL_PATH")
 _BASE_URL = os.environ.get("STEP35_BASE_URL", DEFAULT_URL_FOR_TEST)
 
-# Floors from measured v7x runs (max_tokens=8192 — see _eval; Step-3.5 is a
-# reasoning model, so a small generation budget truncates the long CoT before the
-# final answer and tanks MMLU: 2048 gave a false 0.727, 8192 gives 0.859 ≈ the
-# official 85.8). The MMLU subset is seeded (fixed 128), so run-to-run variance is
-# only concurrency bf16 flips, not example sampling; floors are measured-minus a
-# (heuristic, not variance-swept) margin:
-#   gsm8k = 0.905 (200 ex) -> floor 0.88
-#   mmlu  = 0.859 (128 ex) -> floor 0.80 (wider margin: single 8192 measurement)
-_GSM8K_FLOOR = 0.88
+# Accuracy gating follows upstream sglang's convention
+# (sglang test/registered/eval/test_text_models_gsm8k_eval.py): SAME run_eval
+# harness, floor = measured_score - 5 percentage points. sglang gates only gsm8k
+# (it has no registered MMLU test); we additionally check MMLU via the same
+# run_eval harness. NOTE: the official Step-3.5 standard MMLU/GSM8K (85.8 / 88.2)
+# are BASE (pre-training) numbers, NOT comparable to this post-trained checkpoint,
+# so we anchor to our own measured value minus sglang's 5pt margin:
+#   gsm8k = 0.905 -> floor 0.85  (sglang runs the full set: num_examples=None)
+#   mmlu  = 0.859 -> floor 0.80  (128-ex subset for cost; sglang has no mmlu gate)
+# Both require max_tokens=8192 (reasoning CoT truncates at 2048; see _eval).
+_GSM8K_FLOOR = 0.85
 _MMLU_FLOOR = 0.80
 
 
@@ -78,7 +80,8 @@ class TestStep3p5FlashAccuracy(CustomTestCase):
         return score
 
     def test_gsm8k(self):
-        score = self._eval("gsm8k", 200)
+        # num_examples=None -> full GSM8K set, matching sglang's registered eval.
+        score = self._eval("gsm8k", None)
         if is_in_ci():
             write_github_step_summary(f"### step3p5 test_gsm8k\n{score=:.4f}\n")
         self.assertGreater(score, _GSM8K_FLOOR, f"gsm8k {score:.4f} below floor {_GSM8K_FLOOR}")
