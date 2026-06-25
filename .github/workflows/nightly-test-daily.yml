@@ -149,16 +149,10 @@ jobs:
       # an unset suite would run both under one job.
       suite: mimo-flash-accuracy-nightly-test
 
-  multi-host-test-recurrent-daily:
-    # Temporarily skipped until CI has 4-node v6e capacity (same posture as mimo).
-    if: false
-    uses: ./.github/workflows/multi-host-test.yml
-    permissions:
-      contents: read
-      id-token: write
-    secrets: inherit
-    with:
-      suite: recurrent-cache-aware-nightly-v6e-4x4
+  # Recurrent multi-host cache_aware is on-demand only (run via multi-host-test.yml
+  # workflow_dispatch with suite=recurrent-cache-aware-nightly-v6e-4x4) — nightly CI
+  # has no 4x4 capacity, and the gate is covered nightly single-host by
+  # nightly-recurrent-cache-aware-4-tpu-daily (tp4/dp2/ep4).
 
   nightly-infra-smoke-1-tpu-daily:
     if: github.repository == 'sgl-project/sglang-jax' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-infra-smoke-1-tpu-daily')
@@ -430,6 +424,37 @@ jobs:
           cd test/srt
           python3 nightly/single_host/suite_runner.py --suite recurrent-ab-perf-v6e-4 ${CASES:+--cases "$CASES"}
 
+  nightly-recurrent-cache-aware-4-tpu-daily:
+    if: github.repository == 'sgl-project/sglang-jax' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-recurrent-cache-aware-4-tpu-daily')
+    runs-on: arc-runner-v6e-4
+    # Runs PR-HEAD code under /run-nightly → read-only, no write token.
+    permissions:
+      contents: read
+    env:
+      TZ: Asia/Shanghai
+      JAX_COMPILATION_CACHE_DIR: /xla-cache
+      SGLANG_JAX_MODEL_CACHE: /models/model_scope
+      RESULTS_DIR: ${{ github.workspace }}/test/nightly_test_output/recurrent_cache_aware
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          persist-credentials: false
+      - name: Setup Python environment
+        uses: ./.github/actions/setup-venv
+      - name: Run recurrent cache_aware reuse gate (v6e-4, tp4/dp2/ep4)
+        # Single-host dp>1 cache_aware reuse-knee gate + min_running contrast
+        # (Phase 3 re-homed off multi-host, which CI has no capacity for). Two
+        # sequential 35B launches (cold gcsfuse ~14-40min each) -> keep margin.
+        timeout-minutes: 180
+        env:
+          # /run-nightly passes a single case name here; empty runs the whole suite.
+          CASES: ${{ inputs.cases }}
+        run: |
+          cd test/srt
+          python3 nightly/single_host/suite_runner.py --suite recurrent-cache-aware-v6e-4 ${CASES:+--cases "$CASES"}
+
   nightly-recurrent-accuracy-4-tpu-daily:
     if: github.repository == 'sgl-project/sglang-jax' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-recurrent-accuracy-4-tpu-daily')
     runs-on: arc-runner-v6e-4
@@ -534,12 +559,12 @@ jobs:
       nightly-test-perf-text-models-1-tpu-daily,
       nightly-test-openai-api-surface-1-tpu-daily,
       multi-host-test-mimo-flash-daily,
-      multi-host-test-recurrent-daily,
       nightly-infra-smoke-1-tpu-daily,
       nightly-test-accuracy-text-models-4-tpu-daily,
       nightly-test-perf-text-models-4-tpu-daily,
       nightly-recurrent-e2e-4-tpu-daily,
       nightly-recurrent-ab-perf-4-tpu-daily,
+      nightly-recurrent-cache-aware-4-tpu-daily,
       nightly-recurrent-accuracy-4-tpu-daily,
       nightly-trend-monitor,
       nightly-trend-alert,
@@ -554,12 +579,12 @@ jobs:
           echo "perf-text-1-tpu-daily: ${{ needs.nightly-test-perf-text-models-1-tpu-daily.result }}"
           echo "openai-api-surface-1-tpu-daily: ${{ needs.nightly-test-openai-api-surface-1-tpu-daily.result }}"
           echo "multi-host-mimo-flash-daily: ${{ needs.multi-host-test-mimo-flash-daily.result }}"
-          echo "multi-host-recurrent-daily: ${{ needs.multi-host-test-recurrent-daily.result }}"
           echo "infra-smoke-1-tpu-daily: ${{ needs.nightly-infra-smoke-1-tpu-daily.result }}"
           echo "accuracy-4-tpu-daily: ${{ needs.nightly-test-accuracy-text-models-4-tpu-daily.result }}"
           echo "perf-4-tpu-daily: ${{ needs.nightly-test-perf-text-models-4-tpu-daily.result }}"
           echo "recurrent-e2e-4-tpu-daily: ${{ needs.nightly-recurrent-e2e-4-tpu-daily.result }}"
           echo "recurrent-ab-perf-4-tpu-daily: ${{ needs.nightly-recurrent-ab-perf-4-tpu-daily.result }}"
+          echo "recurrent-cache-aware-4-tpu-daily: ${{ needs.nightly-recurrent-cache-aware-4-tpu-daily.result }}"
           echo "recurrent-accuracy-4-tpu-daily: ${{ needs.nightly-recurrent-accuracy-4-tpu-daily.result }}"
           # Visibility only, NOT gated: by design (continue-on-error) monitoring
           # never changes the nightly conclusion; a 'failure' just flags it broke.
@@ -573,20 +598,16 @@ jobs:
             "perf-text-1-tpu-daily=${{ needs.nightly-test-perf-text-models-1-tpu-daily.result }}" \
             "openai-api-surface-1-tpu-daily=${{ needs.nightly-test-openai-api-surface-1-tpu-daily.result }}" \
             "multi-host-mimo-flash-daily=${{ needs.multi-host-test-mimo-flash-daily.result }}" \
-            "multi-host-recurrent-daily=${{ needs.multi-host-test-recurrent-daily.result }}" \
             "infra-smoke-1-tpu-daily=${{ needs.nightly-infra-smoke-1-tpu-daily.result }}" \
             "accuracy-4-tpu-daily=${{ needs.nightly-test-accuracy-text-models-4-tpu-daily.result }}" \
             "perf-4-tpu-daily=${{ needs.nightly-test-perf-text-models-4-tpu-daily.result }}" \
             "recurrent-e2e-4-tpu-daily=${{ needs.nightly-recurrent-e2e-4-tpu-daily.result }}" \
             "recurrent-ab-perf-4-tpu-daily=${{ needs.nightly-recurrent-ab-perf-4-tpu-daily.result }}" \
+            "recurrent-cache-aware-4-tpu-daily=${{ needs.nightly-recurrent-cache-aware-4-tpu-daily.result }}" \
             "recurrent-accuracy-4-tpu-daily=${{ needs.nightly-recurrent-accuracy-4-tpu-daily.result }}"; do
             job_name="${job_result%%=*}"
             result="${job_result#*=}"
             if [ "$job_name" = "multi-host-mimo-flash-daily" ] && [ "$result" = "skipped" ]; then
-              echo "${job_name} temporarily skipped: multi-host CI capacity unavailable"
-              continue
-            fi
-            if [ "$job_name" = "multi-host-recurrent-daily" ] && [ "$result" = "skipped" ]; then
               echo "${job_name} temporarily skipped: multi-host CI capacity unavailable"
               continue
             fi

@@ -1,0 +1,45 @@
+name: qwen3_5_a3b-recurrent-cache_aware-tp4-dp2-ep4
+target: v6e-4
+# Single-host dp>1 cache_aware: dp2 enables cross-rank routing on ONE v6e-4, and
+# ep4 shards experts across all 4 chips so the 35B fits at dp>1 (dp halves the tp
+# weight-sharding; without ep it OOMs). Validated on a v6e-4 node: kv_budget +6.2GB,
+# reuse plateau 0.66, knee in predict range. tp4 keeps the fused-MoE t_packing
+# trivial (bs-padding 8 -> 2 tokens/device), unlike the tp16 multi-host path.
+model_path: Qwen/Qwen3.5-35B-A3B
+tp_size: 4
+dp_size: 2
+ep_size: 4
+port: 30050
+check_cache_miss: false  # dynamic-shape reuse-sweep
+server_args:
+  - --trust-remote-code
+  - --skip-server-warmup
+  - --dtype
+  - bfloat16
+  - --attention-backend
+  - fa
+  - --page-size
+  - "128"
+  - --context-length
+  - "8192"
+  - --chunked-prefill-size
+  - "512"
+  - --mem-fraction-static
+  - "0.8"
+  - --max-running-requests
+  - "16"
+  - --random-seed
+  - "42"
+  - --disable-overlap-schedule
+  - --enable-unified-radix-tree
+  - --enable-recurrent-extra-buffer
+  - --max-recurrent-state-size
+  - "96"
+  - --dp-schedule-policy
+  - cache_aware
+  - --precompile-bs-paddings
+  - "8"
+  - "16"
+  - --precompile-token-paddings
+  - "512"
+  - "1024"

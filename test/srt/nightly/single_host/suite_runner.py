@@ -268,6 +268,64 @@ SUITES: dict[str, SingleHostSuite] = {
             ),
         ],
     ),
+    # Recurrent dp>1 cache_aware reuse gate, SINGLE-host (Next Work item 4, Phase 3
+    # re-homed to single-host — nightly CI has no multi-host v6e capacity). One
+    # v6e-4 runs tp4/dp2/ep4: dp2 gives cache_aware something to route across, ep4
+    # shards experts so the 35B fits at dp>1, tp4 keeps the fused-MoE t_packing
+    # trivial. Two SingleHostRuns (gate + contrast) launch sequentially on one host
+    # — single-host has no multi-host 2nd-launch sync hang, so they share a suite.
+    # Validated on a v6e-4 node: cache_aware reuse plateau 0.66, knee 64 in
+    # K*=72 range [43.2, 100.8] -> PASS; min_running is the lower-reuse baseline.
+    "recurrent-cache-aware-v6e-4": SingleHostSuite(
+        name="recurrent-cache-aware-v6e-4",
+        runs=[
+            # Gate: assert the empirical reuse knee lands within predict_knee's range.
+            SingleHostRun(
+                launch_profile="recurrent-qwen35-cache-aware-v6e-4.yaml",
+                cases=[
+                    BenchCase(
+                        name="reuse-sweep-cache-aware",
+                        script="benchmark/hicache/bench_recurrent_reuse_sweep.py",
+                        server="runner",
+                        output_json="reuse_cache_aware.json",
+                        argv=(
+                            "--parallel",
+                            "8",
+                            "--k-list",
+                            "8",
+                            "32",
+                            "64",
+                            "96",
+                            "128",
+                        ),
+                    ),
+                ],
+            ),
+            # Contrast (--no-assert): min_running reuse is ~1/dp-bounded, reported only.
+            SingleHostRun(
+                launch_profile="recurrent-qwen35-min-running-v6e-4.yaml",
+                cases=[
+                    BenchCase(
+                        name="reuse-sweep-min-running",
+                        script="benchmark/hicache/bench_recurrent_reuse_sweep.py",
+                        server="runner",
+                        output_json="reuse_min_running.json",
+                        argv=(
+                            "--parallel",
+                            "8",
+                            "--k-list",
+                            "8",
+                            "32",
+                            "64",
+                            "96",
+                            "128",
+                            "--no-assert",
+                        ),
+                    ),
+                ],
+            ),
+        ],
+    ),
 }
 
 
