@@ -1208,6 +1208,12 @@ class ServerArgs:
             action="store_true",
             help="Enable multimodal HTTP server.",
         )
+        parser.add_argument(
+            "--limit-mm-data-per-request",
+            type=json.loads,
+            default=ServerArgs.limit_mm_data_per_request,
+            help="JSON object that limits the number of multimodal items per request, e.g. '{\"image\": 16}'.",
+        )
 
         # LoRA
         parser.add_argument(
