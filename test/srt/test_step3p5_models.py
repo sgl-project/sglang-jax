@@ -39,9 +39,12 @@ from sgl_jax.test.test_utils import (
 _MODEL = os.environ.get("STEP35_MODEL_PATH")
 _BASE_URL = os.environ.get("STEP35_BASE_URL", DEFAULT_URL_FOR_TEST)
 
-# Conservative floors — replace with the measured numbers after the first run.
-_GSM8K_FLOOR = 0.70
-_MMLU_FLOOR = 0.60
+# Floors calibrated from measured v7x runs (two consistent runs):
+#   gsm8k = 0.905 (200 examples) -> floor 0.88 (~2.5pt margin)
+#   mmlu  = 0.727 (128 examples) -> floor 0.70 (~2.7pt margin; fewer examples => more variance)
+# Margin covers cross-launch bf16 reduction-order flips on borderline examples.
+_GSM8K_FLOOR = 0.88
+_MMLU_FLOOR = 0.70
 
 
 @unittest.skipUnless(
