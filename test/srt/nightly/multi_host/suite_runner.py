@@ -23,7 +23,6 @@ for _p in (_TEST_SRT, _NIGHTLY_DIR, _SELF_DIR):
 
 from multi_host_suite import (
     AccuracyCase,
-    BenchCase,
     ModelRun,
     MultiHostSuite,
     PerfCase,
@@ -140,19 +139,11 @@ def build_runtime_config(node_rank: int | None = None) -> RuntimeConfig:
     )
 
 
-def run_case(case: PerfCase | AccuracyCase | BenchCase, profile: LaunchProfile) -> None:
+def run_case(case: PerfCase | AccuracyCase, profile: LaunchProfile) -> None:
     # Lazy: pull jax in only to actually run a case (module import stays jax-free).
     from accuracy_case_runner import run_accuracy_case
     from perf_case_runner import run_perf_case
 
-    if isinstance(case, BenchCase):
-        from drivers import run_bench_for_case
-
-        base_url = f"http://127.0.0.1:{profile.port}" if case.server == "runner" else None
-        _result, fail = run_bench_for_case(case, base_url)
-        if fail:
-            raise SuiteError(kind=fail[0], message=fail[1])
-        return
     if isinstance(case, PerfCase):
         run_perf_case(case, profile)
         return
@@ -167,13 +158,10 @@ def run_model_run(model_run: ModelRun, runtime_cfg: RuntimeConfig) -> int:
     from profile_loader import build_other_server_args, load_profile
 
     from sgl_jax.srt.utils import kill_process_tree
-    from sgl_jax.test.test_utils import _local_or_hf, popen_launch_server
+    from sgl_jax.test.test_utils import popen_launch_server
 
     profile = load_profile(model_run.launch_profile)
     runtime_cfg = dataclasses.replace(runtime_cfg, port=profile.port)
-    # Resolve against the model cache like the single-host runner: a bare HF id in
-    # the profile picks up a local CI checkpoint; absolute paths pass through.
-    model_path = _local_or_hf(profile.model_path)
     _log(
         f"Launching model run={profile.name}, target={profile.target}, "
         f"rank={runtime_cfg.node_rank}, port={runtime_cfg.port}"
@@ -187,11 +175,10 @@ def run_model_run(model_run: ModelRun, runtime_cfg: RuntimeConfig) -> int:
     try:
         base_url = f"http://{runtime_cfg.host}:{runtime_cfg.port}"
         server_process = popen_launch_server(
-            model=model_path,
+            model=profile.model_path,
             base_url=base_url,
             timeout=1800,
             other_args=build_other_server_args(profile, runtime_cfg),
-            check_cache_miss=profile.check_cache_miss,
         )
 
         if is_rank0:
@@ -248,7 +235,7 @@ def run_model_run(model_run: ModelRun, runtime_cfg: RuntimeConfig) -> int:
                 server_process.wait()
         if control_server is not None:
             control_server.shutdown()
-            # Release the control port so the next ModelRun's control server can
+            # Release the control port so a later ModelRun's control server can
             # re-bind it (a multi-ModelRun suite reuses CONTROL_PORT); shutdown()
             # stops serving but leaves the socket open.
             control_server.server_close()
@@ -305,79 +292,6 @@ SUITES: dict[str, MultiHostSuite] = {
                             "chat_template_kwargs": {"enable_thinking": True},
                         },
                         score_threshold=0.85,
-                    ),
-                ],
-            ),
-        ],
-    ),
-    # Recurrent dp>1 cache_aware coverage (Next Work item 4, Phase 3), v6e-4x4
-    # tp16/dp4. The headline: cache_aware routing lifts recurrent reuse above the
-    # ~1/dp_size floor that min_running is bounded by. rank 0 launches one 16-chip
-    # server and drives the reuse K-sweep client-only against it.
-    #
-    # Each suite is ONE ModelRun by design: launching a second multi-host server on
-    # the same TPUs after killing the first hangs at the Publisher/Subscriber sync,
-    # so the gate (cache_aware) and the contrast (min_running) are separate suites /
-    # daily jobs rather than two ModelRuns in one job.
-    #
-    # parallel=32 (= max_running): tp16 fused EP-MoE decode needs >= 2 tokens/device,
-    # so the decode batch must reach the 32 bucket; a small parallel runs at 1
-    # token/device and trips the t_packing=2 alignment check. K* = size - 3*parallel
-    # = 192 - 96 = 96 (range [57.6, 134.4]).
-    "recurrent-cache-aware-nightly-v6e-4x4": MultiHostSuite(
-        name="recurrent-cache-aware-nightly-v6e-4x4",
-        runs=[
-            # Gate: assert the empirical reuse knee lands within predict_knee's range.
-            ModelRun(
-                launch_profile="recurrent-qwen35-cache-aware-v6e-4x4.yaml",
-                cases=[
-                    BenchCase(
-                        name="reuse-sweep-cache-aware",
-                        script="benchmark/hicache/bench_recurrent_reuse_sweep.py",
-                        server="runner",
-                        output_json="reuse_cache_aware.json",
-                        argv=(
-                            "--parallel",
-                            "32",
-                            "--k-list",
-                            "8",
-                            "32",
-                            "64",
-                            "96",
-                            "128",
-                            "192",
-                        ),
-                    ),
-                ],
-            ),
-        ],
-    ),
-    # Contrast curve (--no-assert): min_running reuse is bounded by ~1/dp_size, so
-    # its knee falls below predict_knee; reported, not gated. Separate suite/job
-    # (see the one-ModelRun note above).
-    "recurrent-min-running-nightly-v6e-4x4": MultiHostSuite(
-        name="recurrent-min-running-nightly-v6e-4x4",
-        runs=[
-            ModelRun(
-                launch_profile="recurrent-qwen35-min-running-v6e-4x4.yaml",
-                cases=[
-                    BenchCase(
-                        name="reuse-sweep-min-running",
-                        script="benchmark/hicache/bench_recurrent_reuse_sweep.py",
-                        server="runner",
-                        output_json="reuse_min_running.json",
-                        argv=(
-                            "--parallel",
-                            "32",
-                            "--k-list",
-                            "8",
-                            "32",
-                            "64",
-                            "96",
-                            "128",
-                            "192",
-                            "--no-assert",
-                        ),
                     ),
                 ],
             ),

@@ -144,15 +144,10 @@ jobs:
       contents: read
       id-token: write
     secrets: inherit
-    with:
-      # Scope to the mimo suite — a second v6e-4x4 suite (recurrent) now exists, so
-      # an unset suite would run both under one job.
-      suite: mimo-flash-accuracy-nightly-test
 
-  # Recurrent multi-host cache_aware is on-demand only (run via multi-host-test.yml
-  # workflow_dispatch with suite=recurrent-cache-aware-nightly-v6e-4x4) — nightly CI
-  # has no 4x4 capacity, and the gate is covered nightly single-host by
-  # nightly-recurrent-cache-aware-4-tpu-daily (tp4/dp2/ep4).
+  # Recurrent multi-host cache_aware has no nightly job (no 4x4 CI capacity); the
+  # gate is covered single-host by nightly-recurrent-cache-aware-4-tpu-daily
+  # (tp4/dp2/ep4), and the 16-chip run is a manual procedure (validation runbook).
 
   nightly-infra-smoke-1-tpu-daily:
     if: github.repository == 'sgl-project/sglang-jax' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-infra-smoke-1-tpu-daily')
