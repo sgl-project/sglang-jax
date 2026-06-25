@@ -42,21 +42,19 @@ logger = logging.getLogger(__name__)
 TUNED_BLOCK_CONFIGS: dict[str, dict[tuple, tuple[int, ...]]] = {
     # Populate per-device kind, e.g. "TPU v6e", "TPU v7".
     "TPU v7": {
-        # ling_v3_flash: E=512, H=2560, I=768, top_k=8, ep=4, grouped_topk=True
-        # bf=256 = I/3 (no waste); bd=1280 = H/2 (2 tiles for H=2560, smem-safe).
-        # bd=2048 from the E=128/H=2048 series doesn't fit here because H=2560
-        # creates a 3rd partial tile and overflows smem (>1MB).
-        # Value tuple: (bt, bf, bd1, bd2, bts, btc, bfc, bd1c, bd2c, bse)
-        ('bfloat16', 'bfloat16', 8, 512, 8, 2560, 768, 4, False, True): (2, 256, 1280, 1280, 2, 2, 256, 1280, 1280, 256),
-        ('bfloat16', 'bfloat16', 16, 512, 8, 2560, 768, 4, False, True): (4, 256, 1280, 1280, 4, 4, 256, 1280, 1280, 256),
-        ('bfloat16', 'bfloat16', 32, 512, 8, 2560, 768, 4, False, True): (8, 256, 1280, 1280, 8, 8, 256, 1280, 1280, 256),
-        ('bfloat16', 'bfloat16', 64, 512, 8, 2560, 768, 4, False, True): (16, 256, 1280, 1280, 16, 16, 256, 1280, 1280, 256),
-        ('bfloat16', 'bfloat16', 128, 512, 8, 2560, 768, 4, False, True): (32, 256, 1280, 1280, 32, 32, 256, 1280, 1280, 256),
-        ('bfloat16', 'bfloat16', 256, 512, 8, 2560, 768, 4, False, True): (64, 256, 1280, 1280, 64, 64, 256, 1280, 1280, 256),
-        ('bfloat16', 'bfloat16', 512, 512, 8, 2560, 768, 4, False, True): (128, 256, 1280, 1280, 128, 128, 256, 1280, 1280, 256),
-        ('bfloat16', 'bfloat16', 1024, 512, 8, 2560, 768, 4, False, True): (256, 256, 1280, 1280, 256, 256, 256, 1280, 1280, 256),
-        ('bfloat16', 'bfloat16', 2048, 512, 8, 2560, 768, 4, False, True): (512, 256, 1280, 1280, 512, 512, 256, 1280, 1280, 256),
-        ('bfloat16', 'bfloat16', 4096, 512, 8, 2560, 768, 4, False, True): (1024, 256, 1280, 1280, 1024, 1024, 256, 1280, 1280, 256),
+        # ling_v3_flash: 512 experts, top_k=8, H=2560, moe_I=768, ep=4 (tp=4),
+        # grouped_topk(8,4). Ported verbatim from AInfer (offline v7x sweep
+        # 2026-06-08). KEY INSIGHT: full-tile (bf=768=full I, bd=2560=full H)
+        # beats any tiling — I/H small enough to fit one VMEM tile, so tiling
+        # only adds DMA round-trips. AInfer measured vs the shrink-fallback
+        # (bd≤512, bf=384): decode(8) 1134→595us (+90%), prefill 512 +357%.
+        # Value = (bt, bf, bd1, bd2, bts, btc, bfc, bd1c, bd2c, bse).
+        ('bfloat16', 'bfloat16', 8, 512, 8, 2560, 768, 4, False, True): (2, 768, 2560, 2560, 8, 8, 768, 2560, 2560, 768),
+        ('bfloat16', 'bfloat16', 16, 512, 8, 2560, 768, 4, False, True): (4, 768, 2560, 2560, 8, 4, 768, 2560, 2560, 768),
+        ('bfloat16', 'bfloat16', 32, 512, 8, 2560, 768, 4, False, True): (8, 768, 2560, 2560, 8, 8, 768, 2560, 2560, 768),
+        ('bfloat16', 'bfloat16', 128, 512, 8, 2560, 768, 4, False, True): (32, 768, 2560, 2560, 32, 32, 768, 2560, 2560, 768),
+        ('bfloat16', 'bfloat16', 512, 512, 8, 2560, 768, 4, False, True): (32, 768, 2560, 2560, 32, 32, 768, 2560, 2560, 768),
+        ('bfloat16', 'bfloat16', 2048, 512, 8, 2560, 768, 4, False, True): (32, 768, 2560, 2560, 64, 32, 768, 2560, 2560, 768),
 
         ('bfloat16', 'bfloat16', 16, 128, 8, 2048, 768, 8, False, False): (2, 256, 2048, 2048, 2, 2, 256, 2048, 2048, 256),
         ('bfloat16', 'bfloat16', 32, 128, 8, 2048, 768, 8, False, False): (4, 256, 2048, 2048, 4, 4, 256, 2048, 2048, 256),
