@@ -45,7 +45,7 @@ Multi-chip note:
     at tp_size // dp_size). At --tp-size > 1, --precompile-bs-paddings values must be
     divisible by --tp-size (validated at startup): a decode batch not divisible by the
     device count hits a pre-existing tp>1 sampler lax.cond sharding bug. Widen the set
-    to cover higher --max-concurrency.
+    to cover higher --parallel.
 
 GSP disk-cache warning:
     The generated-shared-prefix dataset is pickled under ``~/.cache/sglang``
@@ -94,15 +94,18 @@ def parse_args():
     p.add_argument(
         "--workloads",
         nargs="+",
-        choices=["random", "gsp"],
+        choices=["random", "gsp", "mooncake"],
         default=["random", "gsp"],
     )
     p.add_argument(
-        "--max-concurrency",
+        "--parallel",
+        nargs="+",
         type=int,
-        default=64,
-        help="Client-side in-flight request load (NOT a server capacity knob; the "
-        "server cap is --max-running-requests). With cache_aware DP routing, keep "
+        default=[64],
+        help="Client-side in-flight request load(s) — the same knob as the reuse "
+        "sweep's --parallel (an asyncio.Semaphore), NOT a server capacity knob (the "
+        "server cap is --max-running-requests). Pass several values to sweep "
+        "concurrency on one launched server. With cache_aware DP routing, keep each "
         ">= dp_size so all ranks receive load.",
     )
     p.add_argument("--num-prompts", type=int, default=256)
@@ -113,6 +116,34 @@ def parse_args():
     p.add_argument("--gsp-system-prompt-len", type=int, default=2048)
     p.add_argument("--gsp-question-len", type=int, default=128)
     p.add_argument("--gsp-output-len", type=int, default=128)
+    p.add_argument(
+        "--mooncake-workload",
+        default="conversation",
+        help="Mooncake trace to replay for the 'mooncake' workload (conversation "
+        "has the highest prefix reuse).",
+    )
+    p.add_argument(
+        "--mooncake-trace-path",
+        default=None,
+        help="Local path to the mooncake trace .jsonl. When unset, bench_serving "
+        "downloads it to /tmp; pre-stage it (e.g. on a model bucket) for offline / "
+        "deterministic runs.",
+    )
+    p.add_argument(
+        "--mooncake-slowdown-factor",
+        type=float,
+        default=1.0,
+        help="Scales trace inter-arrival times (<1 compresses the replay to a "
+        "shorter wall-clock; 1.0 = real time).",
+    )
+    p.add_argument(
+        "--mooncake-num-rounds",
+        type=int,
+        default=1,
+        help="Conversation rounds replayed per trace session. >1 re-sends the "
+        "growing history each round, so round N shares a prefix with round N-1 — "
+        "this is what exercises recurrent prefix reuse (rounds=1 has no reuse).",
+    )
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--mem-fraction-static", type=float, default=0.8)
     p.add_argument("--attention-backend", default="fa")
@@ -233,7 +264,7 @@ def parse_args():
     return args
 
 
-def _per_run_args(args, base_url, workload):
+def _per_run_args(args, base_url, workload, parallel):
     """Build a per-run bench_serving SimpleNamespace via get_benchmark_args."""
     from sgl_jax.test.test_utils import get_benchmark_args
 
@@ -247,7 +278,7 @@ def _per_run_args(args, base_url, workload):
             random_input_len=args.random_input_len,
             random_output_len=args.random_output_len,
             random_range_ratio=1.0,
-            max_concurrency=args.max_concurrency,
+            max_concurrency=parallel,
             seed=args.seed,
             warmup_requests=1,
         )
@@ -259,7 +290,7 @@ def _per_run_args(args, base_url, workload):
             device="tpu",
             tokenizer=args.model,
             num_prompts=num_prompts,
-            max_concurrency=args.max_concurrency,
+            max_concurrency=parallel,
             seed=args.seed,
             warmup_requests=1,
             gsp_num_groups=args.gsp_num_groups,
@@ -268,6 +299,28 @@ def _per_run_args(args, base_url, workload):
             gsp_question_len=args.gsp_question_len,
             gsp_output_len=args.gsp_output_len,
             gsp_range_ratio=1.0,
+        )
+    elif workload == "mooncake":
+        # Trace replay: bench_serving owns the rows via its timed generator, so
+        # backend="sglang" selects that path (the same /generate request func as
+        # sgl-jax). num_rounds>1 re-sends the growing history per session, which is
+        # what exercises recurrent prefix reuse; the per-rep completeness check
+        # below scales the expected count by num_rounds.
+        run_args = get_benchmark_args(
+            base_url=base_url,
+            dataset_name="mooncake",
+            device="tpu",
+            tokenizer=args.model,
+            num_prompts=args.num_prompts,
+            max_concurrency=parallel,
+            seed=args.seed,
+            warmup_requests=1,
+            backend="sglang",
+            dataset_path=args.mooncake_trace_path or "",
+            mooncake_workload=args.mooncake_workload,
+            use_trace_timestamps=True,
+            mooncake_slowdown_factor=args.mooncake_slowdown_factor,
+            mooncake_num_rounds=args.mooncake_num_rounds,
         )
     else:
         raise ValueError(f"unknown workload {workload!r}")
@@ -294,41 +347,46 @@ def run_config(args, config):
     external = args.server_url is not None
     base_url = args.server_url if external else f"http://127.0.0.1:{args.port}"
 
-    # config -> {workload -> [res dict per rep]}
-    results = {w: [] for w in args.workloads}
+    # config -> {workload -> {parallel -> [res dict per rep]}}
+    results = {w: {p: [] for p in args.parallel} for w in args.workloads}
 
     def run_reps():
         for workload in args.workloads:
-            for rep in range(args.repeats):
-                print(
-                    f"\n=== config={config} workload={workload} "
-                    f"rep={rep + 1}/{args.repeats} ===",
-                    flush=True,
-                )
-                run_args = _per_run_args(args, base_url, workload)
-                try:
-                    res = run_benchmark(run_args)
-                except Exception as e:  # noqa: BLE001
-                    # Don't let one failed rep (OOM, transient hiccup, or
-                    # run_benchmark's NameError on zero completions) abort the sweep.
+            for parallel in args.parallel:
+                for rep in range(args.repeats):
                     print(
-                        f"!!! rep failed (config={config} workload={workload} "
-                        f"rep={rep + 1}): {e!r}; skipping this rep",
+                        f"\n=== config={config} workload={workload} "
+                        f"parallel={parallel} rep={rep + 1}/{args.repeats} ===",
                         flush=True,
                     )
-                    continue
-                # A partially-failed rep would skew stats (failed requests carry
-                # ttft=0.0 and missing tokens); count it as failed instead.
-                completed = res.get("completed", 0)
-                if completed != run_args.num_prompts:
-                    print(
-                        f"!!! rep incomplete (config={config} workload={workload} "
-                        f"rep={rep + 1}): completed={completed}/{run_args.num_prompts}; "
-                        "skipping this rep",
-                        flush=True,
-                    )
-                    continue
-                results[workload].append(res)
+                    run_args = _per_run_args(args, base_url, workload, parallel)
+                    try:
+                        res = run_benchmark(run_args)
+                    except Exception as e:  # noqa: BLE001
+                        # Don't let one failed rep (OOM, transient hiccup, or
+                        # run_benchmark's NameError on zero completions) abort the sweep.
+                        print(
+                            f"!!! rep failed (config={config} workload={workload} "
+                            f"parallel={parallel} rep={rep + 1}): {e!r}; skipping this rep",
+                            flush=True,
+                        )
+                        continue
+                    # A partially-failed rep would skew stats (failed requests carry
+                    # ttft=0.0 and missing tokens); count it as failed instead.
+                    # Mooncake replays num_rounds requests per session, so the
+                    # expected completion is num_prompts * num_rounds (1 for the
+                    # other workloads).
+                    completed = res.get("completed", 0)
+                    expected = run_args.num_prompts * run_args.mooncake_num_rounds
+                    if completed != expected:
+                        print(
+                            f"!!! rep incomplete (config={config} workload={workload} "
+                            f"parallel={parallel} rep={rep + 1}): "
+                            f"completed={completed}/{expected}; skipping this rep",
+                            flush=True,
+                        )
+                        continue
+                    results[workload][parallel].append(res)
 
     if external:
         # Operator already launched the matching server (e.g. multi-host KDA);
@@ -406,65 +464,68 @@ def _sample_std(x):
 
 
 def aggregate(args, raw):
-    """Aggregate raw[config][workload] = [res, ...] into per-cell stats."""
+    """Aggregate raw[config][workload][parallel] = [res, ...] into per-cell stats."""
     agg = {}
     for config, by_workload in raw.items():
         agg[config] = {}
-        for workload, reps in by_workload.items():
-            kept = reps[args.drop_first :]
-            if not kept:
-                continue
-            pooled_ttft = []
-            for res in kept:
-                # bench_serving's per-request ttfts are unfiltered: failed
-                # requests carry the 0.0 default, which would fake-improve
-                # percentiles. Reps are already completeness-checked; this
-                # guards the per-request layer.
-                pooled_ttft.extend(t for t in (res.get("ttfts") or []) if t > 0)
-            if pooled_ttft:
-                p50, p95, p99 = np.percentile(pooled_ttft, [50, 95, 99]) * 1000.0
-            else:
-                p50 = p95 = p99 = float("nan")
+        for workload, by_parallel in by_workload.items():
+            agg[config][workload] = {}
+            for parallel, reps in by_parallel.items():
+                kept = reps[args.drop_first :]
+                if not kept:
+                    continue
+                pooled_ttft = []
+                for res in kept:
+                    # bench_serving's per-request ttfts are unfiltered: failed
+                    # requests carry the 0.0 default, which would fake-improve
+                    # percentiles. Reps are already completeness-checked; this
+                    # guards the per-request layer.
+                    pooled_ttft.extend(t for t in (res.get("ttfts") or []) if t > 0)
+                if pooled_ttft:
+                    p50, p95, p99 = np.percentile(pooled_ttft, [50, 95, 99]) * 1000.0
+                else:
+                    p50 = p95 = p99 = float("nan")
 
-            out_tps = np.array([res["output_throughput"] for res in kept], dtype=float)
-            total_tps = np.array([res["total_throughput"] for res in kept], dtype=float)
-            hit_rate = np.array([res.get("cache_hit_rate", 0.0) for res in kept], dtype=float)
+                out_tps = np.array([res["output_throughput"] for res in kept], dtype=float)
+                total_tps = np.array([res["total_throughput"] for res in kept], dtype=float)
+                hit_rate = np.array([res.get("cache_hit_rate", 0.0) for res in kept], dtype=float)
 
-            agg[config][workload] = {
-                "p50_ttft_ms": float(p50),
-                "p95_ttft_ms": float(p95),
-                "p99_ttft_ms": float(p99),
-                "out_tok_s_mean": float(out_tps.mean()),
-                "out_tok_s_std": _sample_std(out_tps),
-                "total_tok_s_mean": float(total_tps.mean()),
-                "total_tok_s_std": _sample_std(total_tps),
-                "hit_rate_mean": float(hit_rate.mean()),
-                "kept_reps": len(kept),
-            }
+                agg[config][workload][parallel] = {
+                    "p50_ttft_ms": float(p50),
+                    "p95_ttft_ms": float(p95),
+                    "p99_ttft_ms": float(p99),
+                    "out_tok_s_mean": float(out_tps.mean()),
+                    "out_tok_s_std": _sample_std(out_tps),
+                    "total_tok_s_mean": float(total_tps.mean()),
+                    "total_tok_s_std": _sample_std(total_tps),
+                    "hit_rate_mean": float(hit_rate.mean()),
+                    "kept_reps": len(kept),
+                }
     return agg
 
 
 def print_table(args, agg):
     header = (
-        f"{'workload':<10} {'config':<10} {'p50_ttft':>10} {'p95_ttft':>10} "
-        f"{'p99_ttft':>10} {'out_tok/s':>20} {'total_tok/s':>20} {'hit_rate':>9}"
+        f"{'workload':<10} {'parallel':>8} {'config':<18} {'p50_ttft':>10} "
+        f"{'p95_ttft':>10} {'p99_ttft':>10} {'out_tok/s':>20} {'total_tok/s':>20} {'hit_rate':>9}"
     )
     print("\n" + "=" * len(header))
     print(header)
     print("-" * len(header))
     for workload in args.workloads:
-        for config in args.configs:
-            cell = agg.get(config, {}).get(workload)
-            if cell is None:
-                continue
-            out_str = f"{cell['out_tok_s_mean']:.1f}+/-{cell['out_tok_s_std']:.1f}"
-            total_str = f"{cell['total_tok_s_mean']:.1f}+/-{cell['total_tok_s_std']:.1f}"
-            print(
-                f"{workload:<10} {config:<10} "
-                f"{cell['p50_ttft_ms']:>10.2f} {cell['p95_ttft_ms']:>10.2f} "
-                f"{cell['p99_ttft_ms']:>10.2f} {out_str:>20} "
-                f"{total_str:>20} {cell['hit_rate_mean']:>9.4f}"
-            )
+        for parallel in args.parallel:
+            for config in args.configs:
+                cell = agg.get(config, {}).get(workload, {}).get(parallel)
+                if cell is None:
+                    continue
+                out_str = f"{cell['out_tok_s_mean']:.1f}+/-{cell['out_tok_s_std']:.1f}"
+                total_str = f"{cell['total_tok_s_mean']:.1f}+/-{cell['total_tok_s_std']:.1f}"
+                print(
+                    f"{workload:<10} {parallel!s:>8} {config:<18} "
+                    f"{cell['p50_ttft_ms']:>10.2f} {cell['p95_ttft_ms']:>10.2f} "
+                    f"{cell['p99_ttft_ms']:>10.2f} {out_str:>20} "
+                    f"{total_str:>20} {cell['hit_rate_mean']:>9.4f}"
+                )
     print("=" * len(header))
 
 
@@ -481,17 +542,19 @@ def check_sweep_complete(args, raw):
     complete = True
     for config in args.configs:
         for workload in args.workloads:
-            n = len(raw.get(config, {}).get(workload, []))
-            if n < min_required:
-                complete = False
-                tag = "FAIL"
-            elif n < args.repeats:
-                tag = "WARN"
-            else:
-                tag = "PASS"
-            print(
-                f"[{tag}] {config}/{workload}: {n}/{args.repeats} reps ok (need >= {min_required})"
-            )
+            for parallel in args.parallel:
+                n = len(raw.get(config, {}).get(workload, {}).get(parallel, []))
+                if n < min_required:
+                    complete = False
+                    tag = "FAIL"
+                elif n < args.repeats:
+                    tag = "WARN"
+                else:
+                    tag = "PASS"
+                print(
+                    f"[{tag}] {config}/{workload}/p{parallel}: {n}/{args.repeats} reps ok "
+                    f"(need >= {min_required})"
+                )
     return complete
 
 
@@ -499,85 +562,119 @@ def soft_targets(args, agg):
     """Print PASS/WARN per check. Returns ``(all_pass, n_gates_fired)``.
 
     ``n_gates_fired`` counts the A/B comparison checks that actually ran (both
-    sides present). A run where no gate fired (e.g. only one config supplied)
-    must not be mistaken for a pass; callers using ``--strict`` should fail when
-    it is zero.
+    sides present) across every ``--parallel`` point. A run where no gate fired
+    (e.g. only one config supplied) must not be mistaken for a pass; callers
+    using ``--strict`` should fail when it is zero.
     """
     print("\n--- soft-target report ---")
     all_pass = True
     fired = 0
 
-    def have(config, workload):
-        return agg.get(config, {}).get(workload) is not None
+    def have(config, workload, parallel):
+        return agg.get(config, {}).get(workload, {}).get(parallel) is not None
 
-    # 1. random: unified degradation < 5% vs radix total throughput.
-    if "random" in args.workloads and have("unified", "random") and have("radix", "random"):
-        u = agg["unified"]["random"]["total_tok_s_mean"]
-        r = agg["radix"]["random"]["total_tok_s_mean"]
-        ok = u >= 0.95 * r
-        all_pass = all_pass and ok
-        fired += 1
-        print(
-            f"[{'PASS' if ok else 'WARN'}] random: unified.total_tok/s ({u:.1f}) "
-            f">= 0.95 * radix.total_tok/s ({0.95 * r:.1f})"
-        )
-
-    # 2. gsp: unified hit-rate >= radix hit-rate.
-    if "gsp" in args.workloads and have("unified", "gsp") and have("radix", "gsp"):
-        u = agg["unified"]["gsp"]["hit_rate_mean"]
-        r = agg["radix"]["gsp"]["hit_rate_mean"]
-        ok = u >= r
-        all_pass = all_pass and ok
-        fired += 1
-        print(
-            f"[{'PASS' if ok else 'WARN'}] gsp: unified.hit_rate ({u:.4f}) "
-            f">= radix.hit_rate ({r:.4f})"
-        )
-
-    # 3. gsp: unified p50 TTFT < no-cache p50 TTFT (warn if ratio >= 0.9).
-    if "gsp" in args.workloads and have("unified", "gsp") and have("no-cache", "gsp"):
-        u = agg["unified"]["gsp"]["p50_ttft_ms"]
-        nc = agg["no-cache"]["gsp"]["p50_ttft_ms"]
-        ratio = u / nc if nc else float("nan")
-        ok = ratio < 0.9
-        all_pass = all_pass and ok
-        fired += 1
-        print(
-            f"[{'PASS' if ok else 'WARN'}] gsp: unified.p50_ttft ({u:.2f}) "
-            f"vs no-cache.p50_ttft ({nc:.2f}), ratio={ratio:.3f} (want < 0.9)"
-        )
-
-    # Recurrent A/B {no-cache, unified-recurrent} (no radix baseline). The
-    # hit-rate band is calibrated by the controller after the first run, so
-    # gsp hit-rate is reported, not gated.
     rc = "unified-recurrent"
-    if "gsp" in args.workloads and have(rc, "gsp"):
-        hr = agg[rc]["gsp"]["hit_rate_mean"]
-        print(f"[REPORT] gsp: {rc}.hit_rate = {hr:.4f}")
-        if have("no-cache", "gsp"):
-            u = agg[rc]["gsp"]["p50_ttft_ms"]
-            nc = agg["no-cache"]["gsp"]["p50_ttft_ms"]
+    for parallel in args.parallel:
+        t = f"@p{parallel}"
+
+        # 1. random: unified degradation < 5% vs radix total throughput.
+        if (
+            "random" in args.workloads
+            and have("unified", "random", parallel)
+            and have("radix", "random", parallel)
+        ):
+            u = agg["unified"]["random"][parallel]["total_tok_s_mean"]
+            r = agg["radix"]["random"][parallel]["total_tok_s_mean"]
+            ok = u >= 0.95 * r
+            all_pass = all_pass and ok
+            fired += 1
+            print(
+                f"[{'PASS' if ok else 'WARN'}] random{t}: unified.total_tok/s ({u:.1f}) "
+                f">= 0.95 * radix.total_tok/s ({0.95 * r:.1f})"
+            )
+
+        # 2. gsp: unified hit-rate >= radix hit-rate.
+        if (
+            "gsp" in args.workloads
+            and have("unified", "gsp", parallel)
+            and have("radix", "gsp", parallel)
+        ):
+            u = agg["unified"]["gsp"][parallel]["hit_rate_mean"]
+            r = agg["radix"]["gsp"][parallel]["hit_rate_mean"]
+            ok = u >= r
+            all_pass = all_pass and ok
+            fired += 1
+            print(
+                f"[{'PASS' if ok else 'WARN'}] gsp{t}: unified.hit_rate ({u:.4f}) "
+                f">= radix.hit_rate ({r:.4f})"
+            )
+
+        # 3. gsp: unified p50 TTFT < no-cache p50 TTFT (warn if ratio >= 0.9).
+        if (
+            "gsp" in args.workloads
+            and have("unified", "gsp", parallel)
+            and have("no-cache", "gsp", parallel)
+        ):
+            u = agg["unified"]["gsp"][parallel]["p50_ttft_ms"]
+            nc = agg["no-cache"]["gsp"][parallel]["p50_ttft_ms"]
             ratio = u / nc if nc else float("nan")
             ok = ratio < 0.9
             all_pass = all_pass and ok
             fired += 1
             print(
-                f"[{'PASS' if ok else 'WARN'}] gsp: {rc}.p50_ttft ({u:.2f}) "
+                f"[{'PASS' if ok else 'WARN'}] gsp{t}: unified.p50_ttft ({u:.2f}) "
                 f"vs no-cache.p50_ttft ({nc:.2f}), ratio={ratio:.3f} (want < 0.9)"
             )
 
-    # random (a.k.a. low-concurrency): recurrent throughput overhead <= 5% vs
-    # no-cache.
-    if "random" in args.workloads and have(rc, "random") and have("no-cache", "random"):
-        u = agg[rc]["random"]["total_tok_s_mean"]
-        nc = agg["no-cache"]["random"]["total_tok_s_mean"]
-        ok = u >= 0.95 * nc
-        all_pass = all_pass and ok
-        fired += 1
-        print(
-            f"[{'PASS' if ok else 'WARN'}] random: {rc}.total_tok/s ({u:.1f}) "
-            f">= 0.95 * no-cache.total_tok/s ({0.95 * nc:.1f})"
-        )
+        # Recurrent A/B {no-cache, unified-recurrent} (no radix baseline). The
+        # hit-rate band is calibrated by the controller after the first run, so
+        # gsp hit-rate is reported, not gated.
+        if "gsp" in args.workloads and have(rc, "gsp", parallel):
+            hr = agg[rc]["gsp"][parallel]["hit_rate_mean"]
+            print(f"[REPORT] gsp{t}: {rc}.hit_rate = {hr:.4f}")
+            if have("no-cache", "gsp", parallel):
+                u = agg[rc]["gsp"][parallel]["p50_ttft_ms"]
+                nc = agg["no-cache"]["gsp"][parallel]["p50_ttft_ms"]
+                ratio = u / nc if nc else float("nan")
+                ok = ratio < 0.9
+                all_pass = all_pass and ok
+                fired += 1
+                print(
+                    f"[{'PASS' if ok else 'WARN'}] gsp{t}: {rc}.p50_ttft ({u:.2f}) "
+                    f"vs no-cache.p50_ttft ({nc:.2f}), ratio={ratio:.3f} (want < 0.9)"
+                )
+
+        # random (a.k.a. low-concurrency): recurrent throughput overhead <= 5% vs
+        # no-cache.
+        if (
+            "random" in args.workloads
+            and have(rc, "random", parallel)
+            and have("no-cache", "random", parallel)
+        ):
+            u = agg[rc]["random"][parallel]["total_tok_s_mean"]
+            nc = agg["no-cache"]["random"][parallel]["total_tok_s_mean"]
+            ok = u >= 0.95 * nc
+            all_pass = all_pass and ok
+            fired += 1
+            print(
+                f"[{'PASS' if ok else 'WARN'}] random{t}: {rc}.total_tok/s ({u:.1f}) "
+                f">= 0.95 * no-cache.total_tok/s ({0.95 * nc:.1f})"
+            )
+
+        # mooncake: REPORT-only. The trace's throughput is output-only (the rows
+        # are owned by the timed generator), and a stable TTFT threshold isn't
+        # calibrated yet, so report recurrent-vs-no-cache, don't gate.
+        if "mooncake" in args.workloads and have(rc, "mooncake", parallel):
+            hr = agg[rc]["mooncake"][parallel]["hit_rate_mean"]
+            print(f"[REPORT] mooncake{t}: {rc}.hit_rate = {hr:.4f}")
+            if have("no-cache", "mooncake", parallel):
+                u = agg[rc]["mooncake"][parallel]["p50_ttft_ms"]
+                nc = agg["no-cache"]["mooncake"][parallel]["p50_ttft_ms"]
+                ratio = u / nc if nc else float("nan")
+                print(
+                    f"[REPORT] mooncake{t}: {rc}.p50_ttft ({u:.2f}) "
+                    f"vs no-cache.p50_ttft ({nc:.2f}), ratio={ratio:.3f}"
+                )
 
     return all_pass, fired
 
@@ -592,23 +689,29 @@ def compare_mode(args) -> tuple[bool, int]:
     """
     merged: dict = {}
     workloads: list[str] = []
+    parallels: list = []
     for path in args.compare:
         with open(path) as f:
             payload = json.load(f)
         for config, by_workload in (payload.get("aggregates") or {}).items():
             dst = merged.setdefault(config, {})
-            for workload, cell in by_workload.items():
-                dst[workload] = cell
+            for workload, by_parallel in by_workload.items():
+                wdst = dst.setdefault(workload, {})
                 if workload not in workloads:
                     workloads.append(workload)
+                for parallel, cell in by_parallel.items():
+                    wdst[parallel] = cell
+                    if parallel not in parallels:
+                        parallels.append(parallel)
     if not merged:
         raise SystemExit(f"--compare: no 'aggregates' found in {args.compare}")
     # print_table / soft_targets iterate these; drive them off the merged keys.
     args.configs = list(merged.keys())
     args.workloads = workloads
+    args.parallel = parallels
     print(
         f"compare: merged {len(args.compare)} file(s) -> "
-        f"configs={args.configs} workloads={workloads}\n"
+        f"configs={args.configs} workloads={workloads} parallel={parallels}\n"
     )
     print_table(args, merged)
     return soft_targets(args, merged)

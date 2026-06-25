@@ -88,6 +88,71 @@ def _gsm8k_case(name: str, model_id: str, threshold: float, eval_batch_size: int
     )
 
 
+def _ablation_case(label: str, dp: int, ep: int) -> BenchCase:
+    """A self-launching recurrent A/B BenchCase for one dp/ep mesh point.
+
+    tp4 is fixed (4 chips); ep shards experts so dp>1 fits the 35B. The bench
+    sweeps the --parallel list on one launched server per config (no relaunch per
+    concurrency point), so each mesh point is two cold 35B loads. Report-only (no
+    --strict). Mooncake uses bench_serving's /tmp trace fallback — pre-stage
+    /tmp/conversation_trace.jsonl on the pod (see the validation runbook).
+    """
+    return BenchCase(
+        name=f"ablation-{label}",
+        script="benchmark/hicache/bench_unified_radix_ab.py",
+        server="self",
+        output_json=f"ablation_{label}.json",
+        argv=(
+            "--model",
+            "Qwen/Qwen3.5-35B-A3B",
+            "--tp-size",
+            "4",
+            "--dp-size",
+            str(dp),
+            "--ep-size",
+            str(ep),
+            "--page-size",
+            "128",
+            "--context-length",
+            "8192",
+            "--max-running-requests",
+            "16",
+            "--chunked-prefill-size",
+            "512",
+            "--max-recurrent-state-size",
+            "96",
+            "--mem-fraction-static",
+            "0.8",
+            "--configs",
+            "no-cache",
+            "unified-recurrent",
+            "--workloads",
+            "gsp",
+            "random",
+            "mooncake",
+            "--parallel",
+            "8",
+            "16",
+            "--num-prompts",
+            "64",
+            "--repeats",
+            "2",
+            "--drop-first",
+            "1",
+            "--disable-overlap-schedule",
+            "--precompile-bs-paddings",
+            "8",
+            "16",
+            "--mooncake-workload",
+            "conversation",
+            "--mooncake-slowdown-factor",
+            "0.1",
+            "--mooncake-num-rounds",
+            "2",
+        ),
+    )
+
+
 SUITES: dict[str, SingleHostSuite] = {
     "accuracy-text-models-v6e-4": SingleHostSuite(
         name="accuracy-text-models-v6e-4",
@@ -249,7 +314,7 @@ SUITES: dict[str, SingleHostSuite] = {
                             "--workloads",
                             "gsp",
                             "random",
-                            "--max-concurrency",
+                            "--parallel",
                             "16",
                             "--num-prompts",
                             "64",
@@ -322,6 +387,23 @@ SUITES: dict[str, SingleHostSuite] = {
                             "--no-assert",
                         ),
                     ),
+                ],
+            ),
+        ],
+    ),
+    # Offline ablation harness (manual; NOT wired into the nightly workflow). Sweeps
+    # the dp/ep mesh and a --parallel concurrency list for the recurrent A/B on one
+    # v6e-4. tp4 is fixed; ep shards experts so dp>1 fits. Report-only (no --strict)
+    # — heavy (several cold 35B loads), run on demand. See the validation runbook.
+    "recurrent-ablation-v6e-4": SingleHostSuite(
+        name="recurrent-ablation-v6e-4",
+        runs=[
+            SingleHostRun(
+                launch_profile=None,
+                cases=[
+                    _ablation_case("dp1-ep1", dp=1, ep=1),
+                    _ablation_case("dp1-ep4", dp=1, ep=4),
+                    _ablation_case("dp2-ep4", dp=2, ep=4),
                 ],
             ),
         ],

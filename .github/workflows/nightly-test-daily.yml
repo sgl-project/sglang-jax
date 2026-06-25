@@ -414,9 +414,11 @@ jobs:
         uses: ./.github/actions/setup-venv
       - name: Run recurrent A/B perf gate (v6e-4)
         # Self-launching A/B: bench starts no-cache + unified-recurrent servers
-        # sequentially (2x Qwen3.5-35B-A3B cold load dominates, bimodal warm ~29s
-        # vs cold gcsfuse ~14-40min each), then runs the gsp/random sweep + --strict.
-        timeout-minutes: 180
+        # sequentially, then runs the gsp/random sweep + --strict. Measured ~23min
+        # wall-clock on a v6e-4 (compute: 2x 35B load + gsp/random x3 reps); the
+        # cold-gcsfuse bimodal 35B load (warm ~29s vs cold ~14-40min each, x2) sets
+        # the ceiling, so 120min covers two worst-case cold loads + the bench.
+        timeout-minutes: 120
         env:
           # /run-nightly passes a single case name here; empty runs the whole suite.
           CASES: ${{ inputs.cases }}

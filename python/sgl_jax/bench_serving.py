@@ -2176,7 +2176,10 @@ async def benchmark(
     else:
         raise ValueError(f"Unknown backend: {backend}")
 
-    is_multi_turn = isinstance(input_requests[0].prompt, list)
+    # Mooncake records are raw trace dicts replayed by the timed generator below
+    # (which yields flat DatasetRows), so they are neither indexable as DatasetRow
+    # here nor wrapped as multi-turn.
+    is_multi_turn = args.dataset_name != "mooncake" and isinstance(input_requests[0].prompt, list)
     if is_multi_turn:
         request_func = wrap_multi_turn_request_func(request_func, backend=backend)
 
@@ -2285,9 +2288,9 @@ async def benchmark(
     benchmark_start_time = time.perf_counter()
     tasks: list[asyncio.Task] = []
     pbar_total = len(input_requests)
-    if (
-        backend == "sglang" and args.dataset_name == "mooncake"
-    ):  # Assuming mooncake is mainly for sglang or similar backends
+    if args.dataset_name == "mooncake":
+        # The timed generator converts the raw trace dicts into DatasetRows; it is
+        # the only valid mooncake path, so it runs for any sglang-style backend.
         print("Using time-based Mooncake request scheduler, ignoring --request-rate.")
         request_generator = get_mooncake_request_over_time(
             input_requests, tokenizer, mooncake_slowdown_factor, mooncake_num_rounds
@@ -2383,7 +2386,11 @@ async def benchmark(
     # Compute metrics and print results
     benchmark_duration = time.perf_counter() - benchmark_start_time
     metrics, output_lens = calculate_metrics(
-        input_requests=None if is_multi_turn else input_requests,
+        # Mooncake's rows are owned by the timed generator (the param here is raw
+        # trace dicts), so pass None like the multi-turn path.
+        input_requests=(
+            None if (is_multi_turn or args.dataset_name == "mooncake") else input_requests
+        ),
         outputs=outputs,
         dur_s=benchmark_duration,
         tokenizer=tokenizer,
@@ -2587,9 +2594,6 @@ def run_benchmark(args_: argparse.Namespace):
 
     if not hasattr(args, "use_trace_timestamps"):
         args.use_trace_timestamps = False
-    if not hasattr(args, "mooncake_slowdown_factor"):
-        args.mooncake_slowdown_factor = 1.0
-
     if not hasattr(args, "mooncake_slowdown_factor"):
         args.mooncake_slowdown_factor = 1.0
 
