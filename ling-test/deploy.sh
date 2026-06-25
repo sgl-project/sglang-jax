@@ -59,6 +59,38 @@ phase_0_local_check() {
     done
     pass "core modules accessible"
 
+    # 0.3 API 兼容性：检查关键类的构造函数签名是否匹配
+    echo -n "  API compat check ... "
+    python3 -c "
+import ast, sys
+
+errors = []
+
+# Check: DeepseekV3Attention.__init__ accepts 'use_gate' kwarg (lost in rebase once)
+with open('sgl_jax/srt/models/deepseek_v3.py') as f:
+    tree = ast.parse(f.read())
+for node in ast.walk(tree):
+    if isinstance(node, ast.ClassDef) and node.name == 'DeepseekV3Attention':
+        for item in node.body:
+            if isinstance(item, ast.FunctionDef) and item.name == '__init__':
+                params = {a.arg for a in item.args.args}
+                if 'use_gate' not in params:
+                    errors.append('DeepseekV3Attention.__init__ missing use_gate param')
+                break
+
+# Check: engine.shutdown uses getattr (not bare self.server_args)
+with open('sgl_jax/srt/entrypoints/engine.py') as f:
+    src = f.read()
+if 'self.server_args' in src and 'getattr(self, \"server_args\"' not in src:
+    errors.append('Engine.shutdown may crash if init incomplete')
+
+if errors:
+    for e in errors:
+        print(f'FAIL: {e}')
+    sys.exit(1)
+print('OK')
+" 2>/dev/null || fail "API compatibility issue found"
+
     echo
 }
 
