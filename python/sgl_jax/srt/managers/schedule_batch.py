@@ -1001,17 +1001,17 @@ class ScheduleBatch:
         return self.batch_size() == 0
 
     def alloc_req_slots(self, reqs: list[Req]):
-        # Recurrent radix: each new req needs one running slot (plus two ping-pong
-        # track slots under extra-buffer = 3 total). Evict exactly the shortfall
-        # from the tree (frees FULL KV + recurrent atomically at page=1) so the
-        # pool alloc below never runs out of recurrent slots.
+        # Recurrent radix: each new req needs request_owned_slots recurrent slots
+        # (1 running + ping-pong track slots under extra-buffer). Evict exactly
+        # the shortfall from the tree (frees FULL KV + recurrent atomically at
+        # page=1) so the pool alloc below never runs out of recurrent slots.
         if (
             self.is_hybrid_recurrent
             and self.tree_cache is not None
             and self.tree_cache.supports_recurrent()
         ):
             dp_rank = reqs[0].dp_rank if reqs and reqs[0].dp_rank is not None else 0
-            per_req = 3 if self.tree_cache.enable_recurrent_extra_buffer else 1
+            per_req = self.req_to_token_pool.request_owned_slots
             demand = per_req * sum(1 for r in reqs if r.recurrent_pool_idx is None)
             available = self.req_to_token_pool.recurrent_available_size(dp_rank)
             if available < demand:
@@ -1020,11 +1020,24 @@ class ScheduleBatch:
                 )
         req_pool_indices = self.req_to_token_pool.alloc(reqs)
         if req_pool_indices is None:
+            detail = f"{self.req_to_token_pool.available_size()=}, {len(reqs)=}"
+            if (
+                self.is_hybrid_recurrent
+                and self.tree_cache is not None
+                and self.tree_cache.supports_recurrent()
+            ):
+                # Recurrent over-subscription is throttled upstream by the scheduler
+                # admission backpressure, so this branch should be unreachable for
+                # recurrent. Report the recurrent pool (the actual constrained
+                # resource) rather than the misleading base req-pool available_size.
+                dp_rank = reqs[0].dp_rank if reqs and reqs[0].dp_rank is not None else 0
+                detail += (
+                    f", recurrent_available={self.req_to_token_pool.recurrent_available_size(dp_rank)}"
+                    f", request_owned_slots={self.req_to_token_pool.request_owned_slots}"
+                )
             raise RuntimeError(
                 "alloc_req_slots runs out of memory. "
-                "Please set a smaller number for `--max-running-requests`. "
-                f"{self.req_to_token_pool.available_size()=}, "
-                f"{len(reqs)=}, "
+                f"Please set a smaller number for `--max-running-requests`. {detail}"
             )
         return req_pool_indices
 

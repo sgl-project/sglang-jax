@@ -1,20 +1,25 @@
 """Recurrent state sizing config + validation (#1380).
 
-Covers the pure ``_recurrent_slot_factor`` helper (slots per concurrent request)
-and the ``ServerArgs`` static validation / normalization for the new
-``--recurrent-track-interval`` knob gated by ``--enable-recurrent-extra-buffer``. No
-server launch: direct ``ServerArgs(...)`` construction and a plain namespace for
-the helper.
+Covers the two pure per-req helpers -- ``reservation_slots_per_request`` (the
+sizing back-cap factor) and ``request_owned_slots`` (what a running req actually
+consumes, overlap-aware) -- and the ``ServerArgs`` static validation /
+normalization for the ``--recurrent-track-interval`` knob gated by
+``--enable-recurrent-extra-buffer``. No server launch: direct ``ServerArgs(...)``
+construction and a plain namespace for the helpers.
 """
 
 import unittest
 from types import SimpleNamespace
 
 from sgl_jax.srt.model_executor.model_runner_kv_cache_mixin import (
+    ModelRunnerKVCacheMixin,
     _enforce_recurrent_state_server_constraints,
-    _recurrent_slot_factor,
+    request_owned_slots,
+    reservation_slots_per_request,
 )
 from sgl_jax.srt.server_args import ServerArgs
+
+_MIXIN_LOGGER = "sgl_jax.srt.model_executor.model_runner_kv_cache_mixin"
 
 
 def _factor_args(
@@ -22,32 +27,51 @@ def _factor_args(
     disable_radix_cache=False,
     enable_unified_radix_tree=False,
     enable_recurrent_extra_buffer=False,
+    disable_overlap_schedule=False,
 ):
     return SimpleNamespace(
         disable_radix_cache=disable_radix_cache,
         enable_unified_radix_tree=enable_unified_radix_tree,
         enable_recurrent_extra_buffer=enable_recurrent_extra_buffer,
+        disable_overlap_schedule=disable_overlap_schedule,
     )
 
 
-class TestRecurrentSlotFactor(unittest.TestCase):
-    """One running slot plus headroom: 1 legacy, 2 radix, 3 extra-buffer."""
+class TestReservationSlotsPerRequest(unittest.TestCase):
+    """Back-cap reservation: 1 legacy, 2 radix, 3 extra-buffer. The surplus over
+    request_owned_slots is the implicit per-req snapshot headroom."""
 
     def test_legacy_disabled_radix_is_one(self):
-        self.assertEqual(_recurrent_slot_factor(_factor_args(disable_radix_cache=True)), 1)
+        self.assertEqual(reservation_slots_per_request(_factor_args(disable_radix_cache=True)), 1)
 
     def test_plain_no_radix_is_one(self):
-        self.assertEqual(_recurrent_slot_factor(_factor_args()), 1)
+        self.assertEqual(reservation_slots_per_request(_factor_args()), 1)
 
     def test_unified_radix_without_extra_buffer_is_two(self):
-        self.assertEqual(_recurrent_slot_factor(_factor_args(enable_unified_radix_tree=True)), 2)
+        self.assertEqual(
+            reservation_slots_per_request(_factor_args(enable_unified_radix_tree=True)), 2
+        )
 
     def test_extra_buffer_is_three(self):
         self.assertEqual(
-            _recurrent_slot_factor(
+            reservation_slots_per_request(
                 _factor_args(
                     enable_unified_radix_tree=True,
                     enable_recurrent_extra_buffer=True,
+                )
+            ),
+            3,
+        )
+
+    def test_extra_buffer_reservation_unaffected_by_overlap(self):
+        # The reservation factor stays 3 regardless of overlap; only consumption
+        # (request_owned_slots) drops to 2 overlap-off, leaving 1 headroom slot/req.
+        self.assertEqual(
+            reservation_slots_per_request(
+                _factor_args(
+                    enable_unified_radix_tree=True,
+                    enable_recurrent_extra_buffer=True,
+                    disable_overlap_schedule=True,
                 )
             ),
             3,
@@ -57,10 +81,49 @@ class TestRecurrentSlotFactor(unittest.TestCase):
         # disable_radix_cache wins (legacy 1:1 path); extra-buffer is invalid
         # there and rejected by server_args / constraints elsewhere.
         self.assertEqual(
-            _recurrent_slot_factor(
+            reservation_slots_per_request(
                 _factor_args(disable_radix_cache=True, enable_recurrent_extra_buffer=True)
             ),
             1,
+        )
+
+
+class TestRequestOwnedSlots(unittest.TestCase):
+    """Actual per-req consumption: 1 running + ping-pong track slots."""
+
+    def test_legacy_disabled_radix_is_one(self):
+        self.assertEqual(request_owned_slots(_factor_args(disable_radix_cache=True)), 1)
+
+    def test_plain_no_radix_is_one(self):
+        self.assertEqual(request_owned_slots(_factor_args()), 1)
+
+    def test_unified_radix_without_extra_buffer_consumes_one(self):
+        # page=1 base path consumes a single running slot (reservation is 2 -> the
+        # surplus is headroom). Consumption != reservation here.
+        self.assertEqual(request_owned_slots(_factor_args(enable_unified_radix_tree=True)), 1)
+
+    def test_extra_buffer_overlap_on_is_three(self):
+        self.assertEqual(
+            request_owned_slots(
+                _factor_args(
+                    enable_unified_radix_tree=True,
+                    enable_recurrent_extra_buffer=True,
+                )
+            ),
+            3,
+        )
+
+    def test_extra_buffer_overlap_off_is_two(self):
+        # --disable-overlap-schedule needs only 1 ping-pong track slot.
+        self.assertEqual(
+            request_owned_slots(
+                _factor_args(
+                    enable_unified_radix_tree=True,
+                    enable_recurrent_extra_buffer=True,
+                    disable_overlap_schedule=True,
+                )
+            ),
+            2,
         )
 
 
@@ -195,6 +258,74 @@ class TestRecurrentStateConstraints(unittest.TestCase):
     def test_legacy_disable_radix_passes(self):
         sa = ServerArgs(model_path="dummy", disable_radix_cache=True)
         _enforce_recurrent_state_server_constraints(sa)  # early return, no raise
+
+
+class TestResolveMaxNumReqsHeadroom(unittest.TestCase):
+    """``_resolve_max_num_reqs`` back-cap: the auto/ratio path enforces snapshot
+    headroom; the explicit path keeps the operator's max_running and only warns."""
+
+    def _runner(self, *, max_recurrent_state_size, dp_size, user_supplied, **sa_over):
+        sa = SimpleNamespace(
+            disable_radix_cache=False,
+            enable_unified_radix_tree=True,
+            enable_recurrent_extra_buffer=True,
+            disable_overlap_schedule=True,
+            max_recurrent_state_size=max_recurrent_state_size,
+            max_num_reqs=None,
+        )
+        sa.__dict__.update(sa_over)
+        return SimpleNamespace(
+            is_draft_worker=False,
+            spec_algorithm=None,
+            server_args=sa,
+            linear_recurrent_config=object(),
+            dp_size=dp_size,
+            recurrent_size_user_supplied=user_supplied,
+        )
+
+    def _resolve(self, runner, requested):
+        return ModelRunnerKVCacheMixin._resolve_max_num_reqs(runner, requested)
+
+    def test_auto_path_reserves_headroom(self):
+        # size 192 / dp 4 -> 48 slots/rank; overlap-off consumes 2/req.
+        # headroom = ceil(0.25*48)=12; running/rank = (48-12)//2 = 18 -> 72 global.
+        runner = self._runner(max_recurrent_state_size=192, dp_size=4, user_supplied=False)
+        result = self._resolve(runner, 1000)
+        self.assertEqual(result, 72)
+        slots_per_rank = 192 // 4
+        owned = request_owned_slots(runner.server_args)
+        headroom = slots_per_rank - (result // 4) * owned
+        self.assertGreaterEqual(headroom, 12)
+
+    def test_auto_path_running_floor_is_at_least_dp(self):
+        # Tiny pool still yields >=1 running slot/rank (no zero/negative cap).
+        runner = self._runner(max_recurrent_state_size=8, dp_size=4, user_supplied=False)
+        result = self._resolve(runner, 1000)
+        self.assertGreaterEqual(result, 4)
+
+    def test_explicit_path_keeps_reservation_cap_no_warn(self):
+        # Explicit 192/dp4, overlap-off: cap = 192//3 = 64; owned 2 < reservation 3
+        # leaves real headroom 192 - 64*2 = 64 -> no warning.
+        runner = self._runner(max_recurrent_state_size=192, dp_size=4, user_supplied=True)
+        import logging
+
+        logger = logging.getLogger(_MIXIN_LOGGER)
+        with self.assertNoLogs(logger, level="WARNING"):
+            result = self._resolve(runner, 1000)
+        self.assertEqual(result, 64)
+
+    def test_explicit_path_overlap_on_zero_headroom_warns(self):
+        # Overlap-ON: owned == reservation == 3, so 192//3 = 64 running consumes the
+        # whole pool -> zero headroom -> warn (but max_running is NOT reduced).
+        runner = self._runner(
+            max_recurrent_state_size=192,
+            dp_size=4,
+            user_supplied=True,
+            disable_overlap_schedule=False,
+        )
+        with self.assertLogs(_MIXIN_LOGGER, level="WARNING"):
+            result = self._resolve(runner, 1000)
+        self.assertEqual(result, 64)
 
 
 if __name__ == "__main__":

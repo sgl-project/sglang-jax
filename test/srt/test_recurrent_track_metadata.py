@@ -107,11 +107,15 @@ class TestForwardBatchTrackPytree(unittest.TestCase):
 
 
 class _PingPongPool:
-    """Minimal pool exposing the ping-pong flip helper the track builder uses."""
+    """Minimal pool exposing the ping-pong flip helper the track builder uses.
+    ``ping_pong_slots`` mirrors HybridReqToTokenPool: 2 with overlap (toggle),
+    1 without (the flip is a no-op, keep == next == 0)."""
 
-    @staticmethod
-    def get_recurrent_ping_pong_other_idx(next_idx: int) -> int:
-        return 1 - next_idx
+    def __init__(self, ping_pong_slots: int = 2):
+        self.ping_pong_slots = ping_pong_slots
+
+    def get_recurrent_ping_pong_other_idx(self, next_idx: int) -> int:
+        return (next_idx + 1) % self.ping_pong_slots
 
 
 class _FakeReq:
@@ -186,6 +190,22 @@ class TestRecurrentTrackEntryBuilder(unittest.TestCase):
         # Only the hitting req flipped.
         self.assertEqual(reqs[0].recurrent_next_track_idx, 1)
         self.assertEqual(reqs[1].recurrent_next_track_idx, 0)
+
+    def test_single_slot_boundary_reads_then_stays(self):
+        # Overlap-off: one track slot. The read returns the sole slot and the
+        # "flip" keeps next_idx at 0 (no other slot to swap to).
+        pool = _PingPongPool(ping_pong_slots=1)
+        req = _FakeReq(extend_input_len=128, buffer=[40], next_idx=0)
+        entry = _recurrent_track_entry(req, 256, interval=128, pool=pool, is_extend=True)
+        self.assertTrue(entry.track_mask)
+        self.assertEqual(entry.track_index, 40)
+        self.assertEqual(req.recurrent_last_track_seqlen, 256)
+        self.assertEqual(req.recurrent_next_track_idx, 0)  # stays 0
+        # A second boundary reuses the same slot.
+        entry2 = _recurrent_track_entry(req, 384, interval=128, pool=pool, is_extend=True)
+        self.assertTrue(entry2.track_mask)
+        self.assertEqual(entry2.track_index, 40)
+        self.assertEqual(req.recurrent_next_track_idx, 0)
 
 
 class _CapturingTreeCache:

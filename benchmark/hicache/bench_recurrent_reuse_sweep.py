@@ -7,8 +7,9 @@ the hybrid-recurrent cache.
 
 Recurrent state capacity is slot-count based (unlike token-scaled FULL KV), so
 a controlled one-snapshot-per-prefix workload shows a visible capacity knee at
-K* = dp_size * (S_rank - factor * C_rank), where S_rank = max_recurrent_state_size
-/ dp_size, factor = 3 (1 running + 2 ping-pong track slots), and C_rank is the
+K* = dp_size * (S_rank - owned * C_rank), where S_rank = max_recurrent_state_size
+/ dp_size, owned = request_owned_slots a running req consumes (1 running + ping-pong
+track slots: 3 with overlap, 2 with --disable-overlap-schedule), and C_rank is the
 per-rank in-flight reservation derived from the ACTUAL run (--parallel spread
 over DP ranks), not a fixed constant.
 
@@ -63,18 +64,19 @@ def predict_knee(
     max_recurrent_state_size: int,
     dp_size: int,
     C_rank: float,
-    factor: int = 3,
+    request_owned_slots: int = 3,
     snapshots_per_prefix: int = 1,
 ) -> float:
-    """Analytic collapse knee K* = dp_size * (S_rank - factor*C_rank) / snapshots.
+    """Analytic collapse knee K* = dp_size * (S_rank - owned*C_rank) / snapshots.
 
-    S_rank = max_recurrent_state_size / dp_size (slots per rank); factor = 3
-    reserves 1 running + 2 ping-pong track slots per concurrent request; C_rank
-    is the per-rank in-flight reservation. Example: size=192, dp=4, C_rank=4 ->
-    S_rank=48, K* = 4 * (48 - 3*4) = 144.
+    S_rank = max_recurrent_state_size / dp_size (slots per rank); request_owned_slots
+    is the slots a running req actually consumes (1 running + ping-pong track slots:
+    3 with overlap, 2 with --disable-overlap-schedule); C_rank is the per-rank
+    in-flight reservation. Example: size=192, dp=4, C_rank=4, owned=2 -> S_rank=48,
+    K* = 4 * (48 - 2*4) = 160.
     """
     s_rank = max_recurrent_state_size / dp_size
-    cap_rank = s_rank - factor * C_rank
+    cap_rank = s_rank - request_owned_slots * C_rank
     return dp_size * cap_rank / snapshots_per_prefix
 
 
@@ -128,6 +130,13 @@ def parse_args():
     p.add_argument("--dp-size", type=int, default=None)
     p.add_argument("--recurrent-track-interval", type=int, default=None)
     p.add_argument(
+        "--request-owned-slots",
+        type=int,
+        default=None,
+        help="Per-req recurrent slots consumed (overrides server-info derivation: "
+        "3 overlap-on / 2 overlap-off extra-buffer, 1 otherwise).",
+    )
+    p.add_argument(
         "--plateau-frac",
         type=float,
         default=0.9,
@@ -165,7 +174,15 @@ def get_server_sizing(args):
         "--dp-size, --recurrent-track-interval explicitly "
         f"(got size={size}, dp_size={dp_size}, interval={interval})"
     )
-    return int(size), int(dp_size), int(interval), tokenizer
+    # Actual per-req consumption: 1 running + ping-pong track slots (2 with overlap,
+    # 1 with --disable-overlap-schedule); 1 without extra-buffer.
+    if args.request_owned_slots is not None:
+        owned = args.request_owned_slots
+    elif info.get("enable_recurrent_extra_buffer"):
+        owned = 2 if info.get("disable_overlap_schedule") else 3
+    else:
+        owned = 1
+    return int(size), int(dp_size), int(interval), tokenizer, int(owned)
 
 
 def make_prefix_ids(tokenizer, index: int, target_tokens: int):
@@ -263,7 +280,7 @@ def main():
 
     from sgl_jax.bench_serving import get_tokenizer
 
-    size, dp_size, interval, tokenizer_path = get_server_sizing(args)
+    size, dp_size, interval, tokenizer_path, owned = get_server_sizing(args)
 
     if args.parallel < dp_size and not args.no_assert:
         raise SystemExit(
@@ -290,7 +307,9 @@ def main():
 
     knee = detect_knee(curve, args.plateau_frac)
     C_rank = derive_actual_C_rank(args.parallel, dp_size)
-    Kstar = predict_knee(size, dp_size, C_rank=C_rank, factor=3, snapshots_per_prefix=1)
+    Kstar = predict_knee(
+        size, dp_size, C_rank=C_rank, request_owned_slots=owned, snapshots_per_prefix=1
+    )
     Kstar_lo = Kstar * (1 - args.knee_range_frac)
     Kstar_hi = Kstar * (1 + args.knee_range_frac)
     no_reuse = knee is None
@@ -319,6 +338,7 @@ def main():
                 "max_recurrent_state_size": size,
                 "dp_size": dp_size,
                 "recurrent_track_interval": interval,
+                "request_owned_slots": owned,
                 "C_rank": C_rank,
             },
             "curve": curve,

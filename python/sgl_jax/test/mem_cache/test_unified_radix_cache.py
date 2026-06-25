@@ -1664,7 +1664,7 @@ class TestUnifiedRadixCacheRecurrentExtraBuffer(CustomTestCase):
         self.conv_kernel_size = 4
         self.track_interval = 128
 
-    def _create_setup(self, dp_size=1, recurrent_size=None):
+    def _create_setup(self, dp_size=1, recurrent_size=None, ping_pong_slots=2):
         recurrent_size = recurrent_size or self.recurrent_size
         state_pool = RecurrentStatePool(
             linear_recurrent_layer_ids=[0, 1],
@@ -1682,6 +1682,7 @@ class TestUnifiedRadixCacheRecurrentExtraBuffer(CustomTestCase):
             recurrent_state_pool=state_pool,
             dp_size=dp_size,
             enable_recurrent_extra_buffer=True,
+            ping_pong_slots=ping_pong_slots,
         )
         kv_cache = MHATokenToKVPool(
             size=self.pool_size,
@@ -2022,6 +2023,137 @@ class TestUnifiedRadixCacheRecurrentExtraBuffer(CustomTestCase):
         # No eviction: enough free slots already.
         self.assertEqual(cache.component_evictable_size_[ComponentType.RECURRENT][0], leaves_before)
         self.assertEqual(cache.assert_recurrent_slot_ledger(0, live_reqs=reqs), 9)
+
+    def test_alloc_req_slots_recurrent_oom_reports_recurrent_pool(self):
+        # Pool too small with nothing evictable: the recurrent pre-check fails and
+        # the raise must name the recurrent pool (not the base req-pool size).
+        _, pool, allocator, cache = self._create_setup(recurrent_size=4)  # 4 slots, per_req 3
+        batch = self._make_batch(cache, pool, allocator, None)
+        reqs = [_AllocReq(dp_rank=0) for _ in range(2)]  # demand 6 > 4, nothing to evict
+        with self.assertRaises(RuntimeError) as cm:
+            batch.alloc_req_slots(reqs)
+        self.assertIn("recurrent_available", str(cm.exception))
+        self.assertIn("request_owned_slots", str(cm.exception))
+
+    # --- Single-slot ping-pong (overlap-off): donate/cleanup orchestration when
+    #     the keep slot IS the only track slot (keep == next == 0) ---
+
+    def test_single_slot_admit_owns_running_plus_one_track(self):
+        _, pool, _, cache = self._create_setup(ping_pong_slots=1)
+        req = self._admit(pool)
+        self.assertEqual(len(req.recurrent_ping_pong_track_buffer), 1)
+        self.assertEqual(cache.assert_recurrent_slot_ledger(0, live_reqs=[req]), 2)
+
+    def test_single_slot_finished_committed_tree_owns_sole_slot(self):
+        _, pool, _, cache = self._create_setup(ping_pong_slots=1)
+        comp = self._component(cache)
+        slots = pool.slots_per_rank
+        req = self._admit(pool)
+        keep_slot = self._simulate_boundary_scatter(pool, req, final_seq_len=128)
+        params = InsertParams(
+            key=RadixKey([1, 2, 3, 4], None, 0), value=np.arange(10, 14, dtype=np.int32)
+        )
+        cap = comp.prepare_for_caching_req(req, params, token_ids_len=4, is_finished=True)
+        self.assertEqual(cap, 128)
+        self.assertEqual(int(params.recurrent_value[0]), keep_slot)
+        result = cache.insert(params)
+        self.assertTrue(result.recurrent_committed)
+        comp.cleanup_after_caching_req(
+            req, is_finished=True, insert_result=result, insert_params=params
+        )
+        # Net of the 2 owned slots: 1 tree-owned + 1 freed.
+        self.assertEqual(cache.component_evictable_size_[ComponentType.RECURRENT][0], 1)
+        self.assertEqual(cache.assert_recurrent_slot_ledger(0, live_reqs=[req]), 0)
+        self.assertEqual(pool.recurrent_available_size(0), slots - 1)
+
+    def test_single_slot_unfinished_committed_secures_replacement(self):
+        _, pool, _, cache = self._create_setup(ping_pong_slots=1)
+        comp = self._component(cache)
+        req = self._admit(pool)
+        running = req.recurrent_pool_idx
+        keep_slot = self._simulate_boundary_scatter(pool, req, final_seq_len=128)
+        free_before = pool.recurrent_available_size(0)
+        params = InsertParams(
+            key=RadixKey([5, 6, 7, 8], None, 0), value=np.arange(20, 24, dtype=np.int32)
+        )
+        cap = comp.prepare_for_caching_req(req, params, token_ids_len=4, is_finished=False)
+        self.assertEqual(cap, 128)
+        self.assertEqual(int(params.recurrent_value[0]), keep_slot)
+        # The donated slot left the buffer; a fresh replacement is the sole slot.
+        self.assertEqual(len(req.recurrent_ping_pong_track_buffer), 1)
+        self.assertNotIn(keep_slot, req.recurrent_ping_pong_track_buffer)
+        self.assertEqual(pool.recurrent_available_size(0), free_before - 1)
+        self.assertEqual(req.recurrent_pool_idx, running)
+        result = cache.insert(params)
+        self.assertTrue(result.recurrent_committed)
+        comp.cleanup_after_caching_req(
+            req, is_finished=False, insert_result=result, insert_params=params
+        )
+        self.assertIsNone(req.recurrent_last_track_seqlen)
+        self.assertEqual(req.recurrent_pool_idx, running)
+        # active = running + 1 track = 2; tree_owned = 1.
+        self.assertEqual(cache.assert_recurrent_slot_ledger(0, live_reqs=[req]), 2)
+
+    def test_single_slot_unfinished_not_committed_frees_orphan(self):
+        _, pool, _, cache = self._create_setup(ping_pong_slots=1)
+        comp = self._component(cache)
+        # Seed a leaf so the same key is a duplicate (not re-committed).
+        seed = self._admit(pool)
+        self._simulate_boundary_scatter(pool, seed, final_seq_len=128)
+        seed_params = InsertParams(
+            key=RadixKey([5, 6, 7, 8], None, 0), value=np.arange(20, 24, dtype=np.int32)
+        )
+        comp.prepare_for_caching_req(seed, seed_params, token_ids_len=4, is_finished=True)
+        seed_res = cache.insert(seed_params)
+        comp.cleanup_after_caching_req(
+            seed, is_finished=True, insert_result=seed_res, insert_params=seed_params
+        )
+
+        req = self._admit(pool)
+        running = req.recurrent_pool_idx
+        keep_slot = self._simulate_boundary_scatter(pool, req, final_seq_len=128)
+        params = InsertParams(
+            key=RadixKey([5, 6, 7, 8], None, 0), value=np.arange(20, 24, dtype=np.int32)
+        )
+        comp.prepare_for_caching_req(req, params, token_ids_len=4, is_finished=False)
+        donated = int(params.recurrent_value[0])
+        self.assertEqual(donated, keep_slot)
+        result = cache.insert(params)
+        self.assertFalse(result.recurrent_committed)  # duplicate of the seed leaf
+        free_before = pool.recurrent_available_size(0)
+        comp.cleanup_after_caching_req(
+            req, is_finished=False, insert_result=result, insert_params=params
+        )
+        # Orphaned donated slot freed; watermark cleared; req keeps running + 1 track.
+        self.assertEqual(pool.recurrent_available_size(0), free_before + 1)
+        self.assertIn(donated, pool.recurrent_free_slots[0])
+        self.assertIsNone(req.recurrent_last_track_seqlen)
+        self.assertEqual(req.recurrent_pool_idx, running)
+        self.assertEqual(cache.assert_recurrent_slot_ledger(0, live_reqs=[req]), 2)
+
+    def test_single_slot_replacement_alloc_fails_skips_donation(self):
+        # Size 2: exactly one req's worth (running + 1 track), so no free slot and
+        # no evictable leaf for a replacement.
+        _, pool, _, cache = self._create_setup(recurrent_size=2, ping_pong_slots=1)
+        comp = self._component(cache)
+        req = self._admit(pool)
+        keep_slot = self._simulate_boundary_scatter(pool, req, final_seq_len=128)
+        self.assertEqual(pool.recurrent_available_size(0), 0)
+        buffer_before = list(req.recurrent_ping_pong_track_buffer)
+        params = InsertParams(
+            key=RadixKey([9, 10, 11, 12], None, 0), value=np.arange(30, 34, dtype=np.int32)
+        )
+        cap = comp.prepare_for_caching_req(req, params, token_ids_len=4, is_finished=False)
+        # Replacement unavailable → donation skipped: buffer + watermark intact.
+        self.assertEqual(cap, 0)
+        self.assertIsNone(params.recurrent_value)
+        self.assertEqual(req.recurrent_ping_pong_track_buffer, buffer_before)
+        self.assertIn(keep_slot, req.recurrent_ping_pong_track_buffer)
+        self.assertEqual(req.recurrent_last_track_seqlen, 128)
+        comp.cleanup_after_caching_req(
+            req, is_finished=False, insert_result=None, insert_params=params
+        )
+        self.assertEqual(req.recurrent_ping_pong_track_buffer, buffer_before)
 
 
 if __name__ == "__main__":

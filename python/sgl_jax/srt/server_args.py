@@ -1083,9 +1083,10 @@ class ServerArgs:
             default=ServerArgs.dp_schedule_policy,
             help=(
                 "DP scheduling policy for assigning dp_rank to new requests. "
-                "'cache_aware' routes a request to the dp rank holding the longest "
-                "cached prefix (bounded by per-rank load), improving prefix reuse "
-                "under DP; it falls back to least-loaded when no rank has a match."
+                "'cache_aware' routes by cache affinity with soft load balancing: "
+                "it balances on large load skew, else picks the least-loaded rank "
+                "among those holding a substantial cached prefix, so a hot prefix "
+                "spreads across its holders. Improves prefix reuse under DP."
             ),
         )
 

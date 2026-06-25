@@ -184,11 +184,17 @@ class HybridReqToTokenPool(ReqToTokenPool):
         recurrent_state_pool,
         dp_size: int = 1,
         enable_recurrent_extra_buffer: bool = False,
+        ping_pong_slots: int = 2,
     ):
         super().__init__(size=size, max_context_len=max_context_len, dtype=dtype)
         self.recurrent_state_pool = recurrent_state_pool
         self.dp_size = dp_size
         self.enable_recurrent_extra_buffer = enable_recurrent_extra_buffer
+        # Ping-pong track slots a req holds under extra-buffer: 2 with overlap
+        # scheduling (double-buffer across the overlap boundary), 1 without
+        # (--disable-overlap-schedule) -- the boundary state is committed before
+        # the next forward, so a single track slot suffices.
+        self.ping_pong_slots = ping_pong_slots
         # recurrent_state_pool.size is global (mirrors MHATokenToKVPool).
         # Divisibility is asserted inside RecurrentStatePool.__init__.
         self.slots_per_rank = recurrent_state_pool.size // dp_size
@@ -196,19 +202,27 @@ class HybridReqToTokenPool(ReqToTokenPool):
             list(range(1, self.slots_per_rank + 1)) for _ in range(dp_size)
         ]
         self.req_index_to_recurrent_index_mapping = np.zeros(size, dtype=np.int32)
-        # Extra-buffer ping-pong track slots: (req_pool_idx, 2) running parallel to
-        # req_index_to_recurrent_index_mapping. Untouched when extra-buffer is off.
+        # Extra-buffer ping-pong track slots: (req_pool_idx, ping_pong_slots)
+        # running parallel to req_index_to_recurrent_index_mapping. Untouched
+        # when extra-buffer is off.
         self.req_index_to_recurrent_ping_pong_track_buffer_mapping = np.zeros(
-            (size, 2), dtype=np.int32
+            (size, ping_pong_slots), dtype=np.int32
         )
+
+    @property
+    def request_owned_slots(self) -> int:
+        """Recurrent slots a running req actually consumes: 1 running plus the
+        ping-pong track slots under extra-buffer (1 otherwise). Distinct from the
+        sizing back-cap's reservation factor, whose surplus is snapshot headroom."""
+        return 1 + self.ping_pong_slots if self.enable_recurrent_extra_buffer else 1
 
     def alloc(self, reqs: list[Req]) -> list[int] | None:
         # dp_rank from reqs[0]: callers (prepare_for_extend/decode) iterate per-DP,
         # so all reqs in a single alloc() call share the same dp_rank.
         dp_rank = reqs[0].dp_rank if reqs and reqs[0].dp_rank is not None else 0
-        # Each new req needs 1 running slot, plus 2 ping-pong track slots under
-        # extra-buffer (1 running + 2 track = 3 total).
-        per_req = 3 if self.enable_recurrent_extra_buffer else 1
+        # Each new req needs 1 running slot, plus ping_pong_slots track slots
+        # under extra-buffer (1 running + ping_pong_slots track).
+        per_req = self.request_owned_slots
         needed = per_req * sum(1 for r in reqs if r.recurrent_pool_idx is None)
         if needed > len(self.recurrent_free_slots[dp_rank]):
             return None
@@ -245,13 +259,15 @@ class HybridReqToTokenPool(ReqToTokenPool):
         return np.array([int(slot)], dtype=np.int32)
 
     def _alloc_ping_pong_buffer(self, req: Req, dp_rank: int) -> list[int] | None:
-        """Pop two free slots for a request's ping-pong track buffer; store them
-        in the req + mapping. Returns None (without partial mutation) if fewer
-        than two free slots remain (caller handles the shortfall)."""
+        """Pop ``ping_pong_slots`` free slots for a request's ping-pong track
+        buffer; store them in the req + mapping. Returns None (without partial
+        mutation) if fewer than ``ping_pong_slots`` free slots remain (caller
+        handles the shortfall)."""
         slots = self.recurrent_free_slots[dp_rank]
-        if len(slots) < 2:
+        n = self.ping_pong_slots
+        if len(slots) < n:
             return None
-        buffer = [slots.pop(0), slots.pop(0)]
+        buffer = [slots.pop(0) for _ in range(n)]
         req.recurrent_ping_pong_track_buffer = buffer
         req.recurrent_next_track_idx = 0
         req.recurrent_last_track_seqlen = None
@@ -260,10 +276,11 @@ class HybridReqToTokenPool(ReqToTokenPool):
         )
         return buffer
 
-    @staticmethod
-    def get_recurrent_ping_pong_other_idx(next_idx: int) -> int:
-        """The buffer index that is NOT the next-scatter target."""
-        return 1 - next_idx
+    def get_recurrent_ping_pong_other_idx(self, next_idx: int) -> int:
+        """The buffer index that is NOT the next-scatter target. With a single
+        track slot (overlap disabled) there is no other slot, so this returns 0
+        (keep == next == the sole slot)."""
+        return (next_idx + 1) % self.ping_pong_slots
 
     def get_recurrent_ping_pong_keep_idx(self, req: Req) -> int:
         """Buffer index holding the most-recently materialized boundary: the

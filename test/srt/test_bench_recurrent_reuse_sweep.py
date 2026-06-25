@@ -31,12 +31,13 @@ class TestPredictKnee(unittest.TestCase):
         self.bench = _load_bench_module()
 
     def test_spec_example(self):
-        """Doc example: size=192, dp=4, C_rank=4 -> S_rank=48, K* = 4*(48-12) = 144."""
+        """Doc example: size=192, dp=4, C_rank=4, owned=3 -> S_rank=48, 4*(48-12)=144."""
         self.assertEqual(self.bench.predict_knee(192, dp_size=4, C_rank=4), 144.0)
 
-    def test_factor_scales_reservation(self):
-        """factor multiplies the per-rank reservation: 4*(48 - 2*4) = 160."""
-        self.assertEqual(self.bench.predict_knee(192, 4, C_rank=4, factor=2), 160.0)
+    def test_owned_slots_scale_reservation(self):
+        """request_owned_slots multiplies the per-rank consumption: overlap-off
+        (owned=2) raises the knee: 4*(48 - 2*4) = 160."""
+        self.assertEqual(self.bench.predict_knee(192, 4, C_rank=4, request_owned_slots=2), 160.0)
 
     def test_snapshots_per_prefix_divides_knee(self):
         """More snapshots per prefix -> fewer distinct prefixes fit -> lower K*."""

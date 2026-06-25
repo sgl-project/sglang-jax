@@ -844,10 +844,12 @@ class Scheduler(
         extra_counts: list[int],
         extra_token_counts: list[int],
     ) -> int | None:
-        """Route to the rank holding the longest cached prefix for ``req``.
+        """Route ``req`` by cache affinity with soft load balancing.
 
-        Falls back to least-loaded when no eligible rank has a cached match.
-        Returns None if all DP ranks are full.
+        Probes each eligible rank's cached prefix length, then defers to
+        ``pick_cache_aware_dp``: balance on large load skew, else least-loaded
+        among the ranks holding a substantial cached prefix. Returns None if all
+        DP ranks are full.
         """
         if self.dp_size == 1:
             return 0
@@ -860,11 +862,12 @@ class Scheduler(
 
         token_ids, extra_key = req_prefix_match_key(req)
         matches: dict[int, int] = {}
+        prompt_len = len(token_ids) if token_ids else 0
         if token_ids:
             for dp_rank in eligible:
                 matches[dp_rank] = self._cached_prefix_len(token_ids, extra_key, dp_rank)
 
-        return pick_cache_aware_dp(eligible, counts, token_counts, matches)
+        return pick_cache_aware_dp(eligible, counts, token_counts, matches, prompt_len)
 
     def select_dp_for_request(self, recv_reqs: list[Req]) -> list[Req]:
         """Assign dp_rank to incoming requests using the configured DP policy.
@@ -1775,14 +1778,15 @@ class Scheduler(
             ):
                 continue
 
-            # Recurrent backpressure: a new req needs per_req recurrent slots
-            # (1 running, +2 ping-pong under extra-buffer) that the running
-            # reservation can't evict. If this rank's free + evictable recurrent
-            # slots can't cover the reqs already queued plus this one, defer it
-            # rather than let alloc_req_slots raise (the pool is non-evictable
-            # while in flight, so over-subscription must throttle, not crash).
+            # Recurrent backpressure: a new req needs request_owned_slots
+            # recurrent slots (1 running + ping-pong track slots under
+            # extra-buffer) that the running reservation can't evict. If this
+            # rank's free + evictable recurrent slots can't cover the reqs
+            # already queued plus this one, defer it rather than let
+            # alloc_req_slots raise (the pool is non-evictable while in flight,
+            # so over-subscription must throttle, not crash).
             if self.tree_cache is not None and self.tree_cache.supports_recurrent():
-                per_req = 3 if self.tree_cache.enable_recurrent_extra_buffer else 1
+                per_req = self.req_to_token_pool.request_owned_slots
                 demand = per_req * (len(adder.can_run_list[dp_rank]) + 1)
                 free = self.req_to_token_pool.recurrent_available_size(dp_rank)
                 evictable = self.tree_cache.recurrent_evictable_size(dp_rank)

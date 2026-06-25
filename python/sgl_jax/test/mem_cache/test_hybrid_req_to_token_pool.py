@@ -431,7 +431,7 @@ class TestHybridPoolExtraBufferAPI(CustomTestCase):
     behave byte-identically to the base page=1 path (running slot only).
     """
 
-    def _make_pool(self, enable_recurrent_extra_buffer, dp_size=1, size=16):
+    def _make_pool(self, enable_recurrent_extra_buffer, dp_size=1, size=16, ping_pong_slots=2):
         state_pool = FakeRecurrentStatePool(size=size)
         return HybridReqToTokenPool(
             size=size,
@@ -440,6 +440,7 @@ class TestHybridPoolExtraBufferAPI(CustomTestCase):
             recurrent_state_pool=state_pool,
             dp_size=dp_size,
             enable_recurrent_extra_buffer=enable_recurrent_extra_buffer,
+            ping_pong_slots=ping_pong_slots,
         )
 
     # --- Case: extra-buffer OFF is a strict no-op (base page=1 path unchanged) ---
@@ -658,6 +659,129 @@ class TestHybridPoolExtraBufferAPI(CustomTestCase):
         owned = pool.count_request_owned_recurrent_slots(live_reqs, 0)
         self.assertEqual(len(leaked), 2)
         self.assertNotEqual(owned + free, slots)
+
+
+class TestPingPongSingleSlot(unittest.TestCase):
+    """Overlap-off (--disable-overlap-schedule) uses 1 ping-pong track slot, so a
+    req consumes 2 (1 running + 1 track) instead of 3. The toggle collapses to a
+    no-op and donate/cleanup must stay ledger-consistent."""
+
+    def _make_pool(self, dp_size=1, size=16):
+        state_pool = FakeRecurrentStatePool(size=size)
+        return HybridReqToTokenPool(
+            size=size,
+            max_context_len=32,
+            dtype=np.int32,
+            recurrent_state_pool=state_pool,
+            dp_size=dp_size,
+            enable_recurrent_extra_buffer=True,
+            ping_pong_slots=1,
+        )
+
+    def test_request_owned_slots_is_two(self):
+        pool = self._make_pool()
+        self.assertEqual(pool.request_owned_slots, 2)
+
+    def test_alloc_allocates_running_plus_one_track(self):
+        pool = self._make_pool()
+        free_before = pool.recurrent_available_size(0)
+        req = FakeReq(dp_rank=0)
+
+        pool.alloc([req])
+
+        self.assertEqual(len(req.recurrent_ping_pong_track_buffer), 1)
+        # Free list dropped by 2 (1 running + 1 track).
+        self.assertEqual(pool.recurrent_available_size(0), free_before - 2)
+        used = {req.recurrent_pool_idx, *req.recurrent_ping_pong_track_buffer}
+        self.assertEqual(len(used), 2)
+        self.assertNotIn(0, used)
+        # Mapping row is width 1 and reflects the single track slot.
+        np.testing.assert_array_equal(
+            pool.req_index_to_recurrent_ping_pong_track_buffer_mapping[req.req_pool_idx],
+            np.array(req.recurrent_ping_pong_track_buffer, dtype=np.int32),
+        )
+
+    def test_toggle_is_noop_and_keep_equals_next(self):
+        pool = self._make_pool()
+        req = FakeReq(dp_rank=0)
+        pool.alloc([req])
+        # With one slot the next-scatter target never moves; keep == next == 0.
+        self.assertEqual(pool.get_recurrent_ping_pong_other_idx(0), 0)
+        self.assertEqual(req.recurrent_next_track_idx, 0)
+        self.assertEqual(pool.get_recurrent_ping_pong_keep_idx(req), 0)
+
+    def test_donate_replaces_the_sole_slot(self):
+        pool = self._make_pool()
+        req = FakeReq(dp_rank=0)
+        pool.alloc([req])
+        keep_slot = req.recurrent_ping_pong_track_buffer[0]
+        new_slot = pool.alloc_recurrent_slot(0)
+
+        value = pool.donate_recurrent_ping_pong_slot(req, new_slot)
+
+        self.assertEqual(int(value[0]), keep_slot)
+        self.assertEqual(req.recurrent_ping_pong_track_buffer[0], new_slot)
+        self.assertEqual(
+            pool.req_index_to_recurrent_ping_pong_track_buffer_mapping[req.req_pool_idx, 0],
+            new_slot,
+        )
+
+    def test_free_recurrent_cache_frees_running_and_single_track(self):
+        pool = self._make_pool()
+        free_full = pool.recurrent_available_size(0)
+        req = FakeReq(dp_rank=0)
+        pool.alloc([req])
+        running = req.recurrent_pool_idx
+        track = list(req.recurrent_ping_pong_track_buffer)
+
+        pool.free_recurrent_cache(req)
+
+        self.assertEqual(pool.recurrent_available_size(0), free_full)
+        self.assertIn(running, pool.recurrent_free_slots[0])
+        self.assertIn(track[0], pool.recurrent_free_slots[0])
+        np.testing.assert_array_equal(
+            pool.req_index_to_recurrent_ping_pong_track_buffer_mapping[req.req_pool_idx],
+            np.zeros(1, dtype=np.int32),
+        )
+        self.assertIsNone(req.recurrent_ping_pong_track_buffer)
+
+    def test_finished_committed_net_one_tree_one_free(self):
+        """Finished + committed: zero the keep slot (tree owns it), free running.
+        Net of the 2 owned slots: 1 tree-owned + 1 freed."""
+        pool = self._make_pool()
+        req = FakeReq(dp_rank=0)
+        pool.alloc([req])
+        free_after_alloc = pool.recurrent_available_size(0)
+        keep_idx = pool.get_recurrent_ping_pong_keep_idx(req)  # 0
+
+        # Tree takes the keep slot: zero it so free_recurrent_cache skips it.
+        pool.set_recurrent_ping_pong_slot(req, keep_idx, 0)
+        pool.free_recurrent_cache(req)
+
+        # Only the running slot returned (+1); the donated track slot stays
+        # tree-owned (off-pool).
+        self.assertEqual(pool.recurrent_available_size(0), free_after_alloc + 1)
+
+    def test_ledger_invariant_with_donation(self):
+        pool = self._make_pool(dp_size=1, size=16)
+        reqs = [FakeReq(dp_rank=0), FakeReq(dp_rank=0)]
+        pool.alloc(reqs)
+        slots = pool.slots_per_rank
+
+        def owned():
+            return pool.count_request_owned_recurrent_slots(reqs, 0)
+
+        self.assertEqual(owned() + pool.recurrent_available_size(0), slots)
+
+        # Unfinished donation: alloc replacement, donate the sole slot. Owned is
+        # unchanged (replacement swaps in); +1 tree-owned.
+        new_slot = pool.alloc_recurrent_slot(0)
+        donated = pool.donate_recurrent_ping_pong_slot(reqs[0], new_slot)
+        self.assertEqual(owned() + 1 + pool.recurrent_available_size(0), slots)
+
+        # Tree eviction returns the donated slot.
+        pool.free_recurrent_slot(int(donated[0]), 0)
+        self.assertEqual(owned() + pool.recurrent_available_size(0), slots)
 
 
 if __name__ == "__main__":
