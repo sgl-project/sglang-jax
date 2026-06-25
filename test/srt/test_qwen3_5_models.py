@@ -147,5 +147,105 @@ class TestQwen35DenseModel(CustomTestCase):
         _run_mmlu_smoke(self, self.base_url, self.model)
 
 
+class TestQwen35MoeRecurrentRadixAccuracy(CustomTestCase):
+    """Qwen3.5-35B-A3B accuracy with the recurrent radix cache ON, single-host
+    v6e-4 at tp4/**dp2** (the 4-chip DP point: 2 dp groups x attention_tp2).
+
+    Counterpart to ``TestQwen35MoeModel`` (which serves cache-off): this one turns
+    the GDN-hybrid unified-radix + recurrent extra-buffer cache ON and runs at
+    dp>1, validating that recurrent serving keeps accuracy intact when requests are
+    DP-routed across recurrent-state pools. gsm8k greedy is deterministic (the
+    cache-on hit path is byte-identical to cache-off, the KL==0 guarantee), so the
+    score is a tight regression gate.
+
+    Config notes (validated on sky-yh-v6e4): the recurrent extra-buffer needs
+    ``--page-size >= 128``; dp2 replicates the model per dp group (attention_tp2),
+    doubling per-chip weight, so the context is bounded to 8192 to keep a positive
+    KV budget; ``--max-recurrent-state-size 96`` caps the slot-based recurrent pool
+    (the default ratio sizing reserves ~0.9 of HBM -> negative KV budget). gsm8k is
+    non-thinking + max_tokens 1024 so it fits the bounded context (the cache-off
+    smoke above uses thinking-mode mmlu, which needs ~32k context not available at
+    dp2 with the cache on).
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = QWEN3_5_35B_A3B
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            device="tpu",
+            other_args=[
+                "--trust-remote-code",
+                "--skip-server-warmup",
+                "--random-seed",
+                "3",
+                "--dtype",
+                "bfloat16",
+                "--tp-size",
+                "4",
+                "--dp-size",
+                "2",
+                "--nnodes",
+                "1",
+                "--dist-init-addr",
+                "0.0.0.0:10011",
+                "--mem-fraction-static",
+                "0.8",
+                "--chunked-prefill-size",
+                "512",
+                "--page-size",
+                "128",
+                "--max-running-requests",
+                "16",
+                "--context-length",
+                "8192",
+                "--enable-unified-radix-tree",
+                "--enable-recurrent-extra-buffer",
+                "--max-recurrent-state-size",
+                "96",
+                "--disable-overlap-schedule",
+                "--precompile-bs-paddings",
+                "8",
+                "16",
+                "--precompile-token-paddings",
+                "512",
+                "1024",
+            ],
+            env={"JAX_COMPILATION_CACHE_DIR": "/tmp/jax_compilation_cache"},
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_gsm8k(self):
+        # Greedy (temperature 0) + non-thinking so answers fit the bounded context.
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            host=None,
+            port=None,
+            model=self.model,
+            eval_name="gsm8k",
+            num_examples=200,
+            num_threads=16,
+            max_tokens=1024,
+            temperature=0.0,
+            top_p=None,
+            top_k=None,
+            min_p=None,
+            presence_penalty=None,
+            repetition_penalty=None,
+            frequency_penalty=None,
+            seed=None,
+            chat_template_kwargs={"enable_thinking": False},
+        )
+        metrics = run_eval(args)
+        # Measured ~0.96 on sky-yh-v6e4 (tp4/dp2, cache on); 0.90 leaves margin.
+        self.assertGreater(metrics["score"], 0.90)
+
+
 if __name__ == "__main__":
     unittest.main()

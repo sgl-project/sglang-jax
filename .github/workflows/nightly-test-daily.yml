@@ -430,6 +430,32 @@ jobs:
           cd test/srt
           python3 nightly/single_host/suite_runner.py --suite recurrent-ab-perf-v6e-4 ${CASES:+--cases "$CASES"}
 
+  nightly-recurrent-accuracy-4-tpu-daily:
+    if: github.repository == 'sgl-project/sglang-jax' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-recurrent-accuracy-4-tpu-daily')
+    runs-on: arc-runner-v6e-4
+    # Runs PR-HEAD code under /run-nightly → read-only, no write token.
+    permissions:
+      contents: read
+    env:
+      TZ: Asia/Shanghai
+      JAX_COMPILATION_CACHE_DIR: /xla-cache
+      SGLANG_JAX_MODEL_CACHE: /models/model_scope
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          persist-credentials: false
+      - name: Setup Python environment
+        uses: ./.github/actions/setup-venv
+      - name: Run recurrent accuracy gate (v6e-4, tp4/dp2, cache on)
+        # Run from repo root (like the e2e job) so the suite's test/srt-prefixed
+        # path also resolves under rerun-test.yml (/rerun-group). 35B load (bimodal
+        # warm ~29s vs cold gcsfuse ~14-40min) + 200-ex gsm8k -> keep timeout margin.
+        timeout-minutes: 90
+        run: |
+          python3 test/srt/run_suite.py --suite nightly-recurrent-accuracy-tpu-v6e-4
+
 
   # Trend drift: detect on v6e-4 (only it can read the /observability-storage
   # mount), alert from ubuntu (has gh), connected by a drift.json artifact.
@@ -514,6 +540,7 @@ jobs:
       nightly-test-perf-text-models-4-tpu-daily,
       nightly-recurrent-e2e-4-tpu-daily,
       nightly-recurrent-ab-perf-4-tpu-daily,
+      nightly-recurrent-accuracy-4-tpu-daily,
       nightly-trend-monitor,
       nightly-trend-alert,
     ]
@@ -533,6 +560,7 @@ jobs:
           echo "perf-4-tpu-daily: ${{ needs.nightly-test-perf-text-models-4-tpu-daily.result }}"
           echo "recurrent-e2e-4-tpu-daily: ${{ needs.nightly-recurrent-e2e-4-tpu-daily.result }}"
           echo "recurrent-ab-perf-4-tpu-daily: ${{ needs.nightly-recurrent-ab-perf-4-tpu-daily.result }}"
+          echo "recurrent-accuracy-4-tpu-daily: ${{ needs.nightly-recurrent-accuracy-4-tpu-daily.result }}"
           # Visibility only, NOT gated: by design (continue-on-error) monitoring
           # never changes the nightly conclusion; a 'failure' just flags it broke.
           echo "trend-monitor (not gated): ${{ needs.nightly-trend-monitor.result }}"
@@ -550,7 +578,8 @@ jobs:
             "accuracy-4-tpu-daily=${{ needs.nightly-test-accuracy-text-models-4-tpu-daily.result }}" \
             "perf-4-tpu-daily=${{ needs.nightly-test-perf-text-models-4-tpu-daily.result }}" \
             "recurrent-e2e-4-tpu-daily=${{ needs.nightly-recurrent-e2e-4-tpu-daily.result }}" \
-            "recurrent-ab-perf-4-tpu-daily=${{ needs.nightly-recurrent-ab-perf-4-tpu-daily.result }}"; do
+            "recurrent-ab-perf-4-tpu-daily=${{ needs.nightly-recurrent-ab-perf-4-tpu-daily.result }}" \
+            "recurrent-accuracy-4-tpu-daily=${{ needs.nightly-recurrent-accuracy-4-tpu-daily.result }}"; do
             job_name="${job_result%%=*}"
             result="${job_result#*=}"
             if [ "$job_name" = "multi-host-mimo-flash-daily" ] && [ "$result" = "skipped" ]; then
