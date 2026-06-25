@@ -60,7 +60,11 @@ class TestStep3p5FlashAccuracy(CustomTestCase):
             num_examples=num_examples,
             num_threads=32,
         )
-        return run_eval(args)["score"]
+        score = run_eval(args)["score"]
+        # Print to stdout so the score survives in the pytest log (run with -s) even
+        # when the per-rank /tmp/*.json is destroyed on container exit.
+        print(f"\n[step3p5-accuracy] {eval_name} score = {score:.4f}\n", flush=True)
+        return score
 
     def test_gsm8k(self):
         score = self._eval("gsm8k", 200)
