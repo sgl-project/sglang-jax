@@ -43,11 +43,17 @@ class QwenVLProcessor(BaseMultimodalProcessor):
         pixel_values = self._to_numpy(processor_output.get("pixel_values"))
         image_grid_thw = self._to_grid_list(processor_output.get("image_grid_thw"))
 
-        mm_items = self._build_items(pixel_values, image_grid_thw)
+        vision_config = self.hf_config.vision_config
+        image_offsets = self._compute_image_offsets(
+            input_ids=input_ids,
+            grids=image_grid_thw,
+            image_token_id=self.hf_config.image_token_id,
+            spatial_merge_size=vision_config.spatial_merge_size,
+        )
+        mm_items = self._build_items(pixel_values, image_grid_thw, image_offsets)
         for item in mm_items:
             item.set_pad_value()
 
-        vision_config = self.hf_config.vision_config
         mrope_positions, mrope_position_delta = compute_mrope_positions(
             input_ids=input_ids,
             image_grid_thw=image_grid_thw,
@@ -71,11 +77,16 @@ class QwenVLProcessor(BaseMultimodalProcessor):
         )
 
     @staticmethod
-    def _build_items(features, grids):
+    def _build_items(features, grids, image_offsets):
         if features is None:
             return []
         if not grids:
             raise ValueError("Missing image_grid_thw metadata for IMAGE inputs.")
+        if len(image_offsets) != len(grids):
+            raise ValueError(
+                f"IMAGE offset count does not match grid metadata: "
+                f"{len(image_offsets)} != {len(grids)}."
+            )
 
         feature_counts = [int(np.prod(grid)) for grid in grids]
         if sum(feature_counts) != len(features):
@@ -92,9 +103,39 @@ class QwenVLProcessor(BaseMultimodalProcessor):
                 feature=features[offset : offset + count],
             )
             item.set("image_grid_thw", np.asarray([grid], dtype=np.int32))
+            item.offsets = [image_offsets[len(items)]]
             items.append(item)
             offset += count
         return items
+
+    @staticmethod
+    def _compute_image_offsets(input_ids, grids, image_token_id, spatial_merge_size):
+        if not grids:
+            return []
+
+        offsets = []
+        search_start = 0
+        for grid in grids:
+            token_count = int(np.prod(grid) // (spatial_merge_size**2))
+            start = None
+            for idx in range(search_start, len(input_ids)):
+                if input_ids[idx] == image_token_id:
+                    start = idx
+                    break
+            if start is None:
+                raise ValueError("Missing IMAGE placeholder tokens in processor input_ids.")
+
+            end = start + token_count - 1
+            if end >= len(input_ids) or any(
+                token_id != image_token_id for token_id in input_ids[start : end + 1]
+            ):
+                raise ValueError(
+                    "IMAGE placeholder token span does not match image_grid_thw metadata."
+                )
+            offsets.append((start, end))
+            search_start = end + 1
+
+        return offsets
 
     @staticmethod
     def _to_numpy(value):
