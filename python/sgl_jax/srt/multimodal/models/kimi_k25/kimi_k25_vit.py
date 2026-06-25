@@ -510,10 +510,7 @@ class Kimi_K25_MultiModalProjector(nnx.Module):
 
         _rngs = rngs or nnx.Rngs(0)
         self.pre_norm = nnx.LayerNorm(
-            config.vt_hidden_size,
-            config.projector_ln_eps,
-            param_dtype=dtype,
-            rngs=_rngs
+            config.vt_hidden_size, config.projector_ln_eps, param_dtype=dtype, rngs=_rngs
         )
 
         self.proj_0 = nnx.Linear(
