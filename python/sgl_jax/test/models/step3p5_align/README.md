@@ -4,6 +4,24 @@ NOT part of CI. Manual real-weight correctness verification against the official
 HuggingFace reference (`modeling_step3p5.py`). Complements the microscale
 `naive==HF` alignment (function-level) with a **real-weight** check.
 
+## gsm8k vs upstream sglang (apples-to-apples, run this first)
+
+`run_sglang_gsm8k_against_jax.py` runs **upstream sglang's OWN gsm8k eval** (no
+port, no divergence) with the EXACT setup sglang uses for Step-3.5-Flash
+(`GSM8KMixin` in `test_step3p5_flash_chain_mtp.py`: api=completion, num_shots=5,
+max_tokens=512, num_examples=200, threshold 0.83), pointed at the sglang-jax
+server's OpenAI `/v1/completions`:
+
+```bash
+pip install sglang          # upstream sglang, for its eval code
+python run_sglang_gsm8k_against_jax.py --base-url http://<node0>:30000/v1 --model <served-model>
+```
+score ≥ 0.83 (identical harness) ⇒ functionally equivalent to sglang for gsm8k.
+(This replaces the old self-referenced 0-shot gsm8k/mmlu in test_step3p5_models.py,
+which had no external reference and could not prove correctness.)
+
+## HF reference comparison
+
 Two comparisons, both off the same fixed `inputs.json` (raw token ids — no
 tokenizer skew):
 
