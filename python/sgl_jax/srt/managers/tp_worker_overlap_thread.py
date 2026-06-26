@@ -4,6 +4,7 @@ import dataclasses
 import logging
 import signal
 import threading
+import time
 from queue import Queue
 
 import jax
@@ -39,7 +40,9 @@ class ModelWorkerClient:
         self.worker.need_prepare_lora_batch = False
 
         self.max_running_requests = self.worker.max_running_requests
+        self.max_total_num_tokens = self.worker.max_total_num_tokens
         self.device = self.worker.device
+        self.cur_sampling_info = None
 
         # Init future mappings
         self.future_token_ids_ct = 0
@@ -60,17 +63,22 @@ class ModelWorkerClient:
         self.parent_process = psutil.Process().parent()
         replicated_sharding = NamedSharding(mesh, PartitionSpec())
         self.async_gather_fn = jax.jit(lambda x: x, out_shardings=replicated_sharding)
+        logger.info(
+            "[pd-debug] overlap mesh=%s replicated_devices=%s",
+            mesh.shape,
+            sorted(d.id for d in replicated_sharding.device_set),
+        )
 
-    def get_model_runner(self):
-        return self.worker.get_model_runner()
+    @property
+    def model_runner(self):
+        return self.worker.model_runner
 
     @property
     def model_config(self):
         return self.worker.model_config
 
-    @property
-    def model_runner(self):
-        return self.worker.model_runner
+    def get_model_runner(self):
+        return self.worker.get_model_runner()
 
     def get_worker_info(self):
         return self.worker.get_worker_info()
@@ -148,7 +156,9 @@ class ModelWorkerClient:
         overlap on PCIe rather than serializing the per-array sync that
         jax.device_get does.
         """
+        _r0 = time.perf_counter()
         _, logits_output, next_token_ids, cache_miss_count = self.output_queue.get()
+        _r1 = time.perf_counter()
         # Step 1: kick off async D2H copies for everything we need
         async_next_logprobs = (
             jax.copy_to_host_async(logits_output.next_token_logprobs)
@@ -175,9 +185,29 @@ class ModelWorkerClient:
             logits_output.input_token_logprobs = np.asarray(async_input_logprobs).tolist()
         if async_hidden_states is not None:
             logits_output.hidden_states = np.asarray(async_hidden_states)
+        _r2 = _r2a = _r3 = time.perf_counter()
 
         if launch_done is not None:
             launch_done.wait()
+        _r4 = time.perf_counter()
+        if _r4 - _r0 > 0.5:
+            import gc as _gc
+
+            import jax as _jax
+
+            logger.info(
+                "[pd-resolve] total=%.0fms qget=%.0f logprobs=%.0f ntok_d2h=%.0f "
+                "(bur=%.0f d2h=%.0f) launch_wait=%.0f n_live=%d gc=%s",
+                (_r4 - _r0) * 1e3,
+                (_r1 - _r0) * 1e3,
+                (_r2 - _r1) * 1e3,
+                (_r3 - _r2) * 1e3,
+                (_r2a - _r2) * 1e3,
+                (_r3 - _r2a) * 1e3,
+                (_r4 - _r3) * 1e3,
+                len(_jax.live_arrays()),
+                _gc.get_count(),
+            )
 
         return logits_output, next_token_ids, cache_miss_count
 

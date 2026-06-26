@@ -1,5 +1,6 @@
 """ModelRunner runs the forward passes of the models."""
 
+import contextlib
 import logging
 from functools import partial
 
@@ -501,18 +502,27 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         cache_miss_count = 0
         import jax._src.test_util as jtu
 
-        with jtu.count_pjit_cpp_cache_miss() as count:
+        # _donate_lock (set by PD scheduler init) serializes the donate-dispatch
+        # → replace_all window against the main-thread scatter_from_dmesh which
+        # also donates the same kv_buffer list. ifrt_proxy/client/array.cc:382
+        # marks the input deleted the instant kDonateInput dispatches, so a GIL
+        # switch in this window lets scatter read a deleted array.
+        _kv_lock = getattr(self.token_to_kv_pool, "_donate_lock", None)
+        with (
+            jtu.count_pjit_cpp_cache_miss() as count,
+            _kv_lock if _kv_lock is not None else contextlib.nullcontext(),
+        ):
             output, pool_updates, _, layers_topk_ids = self.jitted_run_model(
                 forward_batch, logits_metadata
             )
             cache_miss_count = count()
 
-        # tp_size==1: sharding constraint is lost after JIT; re-place explicitly.
-        # See https://github.com/sgl-project/sglang-jax/issues/233
-        if self.tp_size == 1 and isinstance(pool_updates, list):
-            target_sharding = self.token_to_kv_pool.kv_sharding
-            pool_updates = [jax.device_put(kv, target_sharding) for kv in pool_updates]
-        self.memory_pools.replace_all(pool_updates)
+            # tp_size==1: sharding constraint is lost after JIT; re-place explicitly.
+            # See https://github.com/sgl-project/sglang-jax/issues/233
+            if self.tp_size == 1 and isinstance(pool_updates, list):
+                target_sharding = self.token_to_kv_pool.kv_sharding
+                pool_updates = [jax.device_put(kv, target_sharding) for kv in pool_updates]
+            self.memory_pools.replace_all(pool_updates)
 
         # layers_topk_ids required real_bs and original_input_len which could not be stored in ForwardBatch
         return output, cache_miss_count, layers_topk_ids

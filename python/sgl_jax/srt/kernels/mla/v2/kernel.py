@@ -1276,6 +1276,11 @@ def prepare_q_inputs(
         q_packing,
         head_dim,
     )
+    # When actual_num_q_heads % q_packing == 0 (e.g. 2 heads on bf16), the
+    # head-axis pad is (0,0) and XLA may fuse pad+reshape into a lazy view
+    # whose physical layout != [mnt, h//p, p, D]. pallas_call then gets a
+    # non-contiguous HBM ref and the DMA BoundsCheck trips. Force a copy.
+    q = jax.lax.optimization_barrier(q)
     return q
 
 

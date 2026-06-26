@@ -41,7 +41,7 @@ dependencies = [
     "aiohttp",
     "pybase64",
     "partial_json_parser",
-    "pathwaysutils",
+    "pathwaysutils>=0.1.7,<0.1.9",
     "omegaconf",
     "imageio[ffmpeg]",
     "librosa>=0.10",

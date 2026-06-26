@@ -99,6 +99,12 @@ class ServerArgs:
     # Runtime options
     device: str | None = None
     device_indexes: list[int] | None = None
+    pd_disaggregation: str = ""
+    pd_prefill_mem_fraction: float = 0.85
+    pd_decode_mem_fraction: float = 0.85
+    pd_prefill_max_tokens: int = 20480
+    pd_decode_max_tokens: int = 25600
+    pd_num_prefill: int = 1
     tp_size: int = 1
     ep_size: int = 1
     ep_num_redundant_experts: int = 0
@@ -771,6 +777,47 @@ class ServerArgs:
             type=int,
             nargs="+",
             help="The device indexes to use build mesh. Defaults is all if not specified.",
+        )
+        parser.add_argument(
+            "--pd-disaggregation",
+            dest="pd_disaggregation",
+            nargs="?",
+            const="ici",
+            default="",
+            choices=["", "ici", "pathways"],
+            help="In-process P/D split: 'ici' = single-slice sub-mesh ppermute; "
+            "'pathways' = cross-slice IFRT device_put (requires Pathways proxy + >=2 slices).",
+        )
+        parser.add_argument(
+            "--pd-prefill-mem-fraction",
+            dest="pd_prefill_mem_fraction",
+            type=float,
+            default=ServerArgs.pd_prefill_mem_fraction,
+        )
+        parser.add_argument(
+            "--pd-decode-mem-fraction",
+            dest="pd_decode_mem_fraction",
+            type=float,
+            default=ServerArgs.pd_decode_mem_fraction,
+        )
+        parser.add_argument(
+            "--pd-prefill-max-tokens",
+            dest="pd_prefill_max_tokens",
+            type=int,
+            default=ServerArgs.pd_prefill_max_tokens,
+        )
+        parser.add_argument(
+            "--pd-decode-max-tokens",
+            dest="pd_decode_max_tokens",
+            type=int,
+            default=ServerArgs.pd_decode_max_tokens,
+        )
+        parser.add_argument(
+            "--pd-num-prefill",
+            dest="pd_num_prefill",
+            type=int,
+            default=ServerArgs.pd_num_prefill,
+            help="Number of prefill slices for pathways PD (Stage 6 multi-P).",
         )
 
         parser.add_argument(
