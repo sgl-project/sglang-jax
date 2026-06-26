@@ -75,7 +75,7 @@ class QwenVLProcessor(BaseMultimodalProcessor):
             mm_items=mm_items,
             input_ids=input_ids,
             im_start_id=self.hf_config.vision_start_token_id,
-            im_end_id=getattr(self.hf_config, "vision_end_token_id", None),
+            im_end_id=self.hf_config.vision_end_token_id,
             im_token_id=self.hf_config.image_token_id,
             mrope_positions=mrope_positions,
             mrope_position_delta=mrope_position_delta,

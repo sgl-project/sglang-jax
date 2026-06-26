@@ -32,7 +32,7 @@ _REJECTED_PD_HOST_ALIASES = frozenset({"localhost"})
 
 
 def apply_multimodal_model_defaults(server_args, model_config) -> None:
-    if not getattr(model_config, "is_multimodal", False):
+    if not model_config.is_multimodal:
         return
 
     if not server_args.disable_radix_cache:
