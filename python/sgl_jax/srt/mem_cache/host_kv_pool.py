@@ -620,22 +620,48 @@ class LRUHostKVPool(HostKVPool):
             staged_pages.append(packed)
 
         n = len(host_buffer_ids)
-        # Bucket the page count so write_kv_layer compiles once per bucket, not
-        # per distinct n. Pad pages by duplicating page 0; the padding tokens get
-        # loc=-1, which the kernel skips, so the duplicate data is never written.
-        n_b = self._pad_to_page_bucket(n)
-        sel = list(range(n)) + [0] * (n_b - n)
+        dp = self._device_pool
+        dp_size = int(dp.dp_size)
+        num_dev_pages = int(dp.kv_buffer[0].shape[0])
+        pages_per_shard = num_dev_pages // dp_size
+
+        # The KV buffer's page axis is sharded contiguously across the data axis:
+        # shard d owns global pages [d*pages_per_shard, (d+1)*pages_per_shard).
+        # write_kv_layer's shard_map splits loc/data into dp_size equal contiguous
+        # chunks and indexes each shard's LOCAL slice -- so a global page must land
+        # in its owning shard's chunk, addressed as a shard-local offset (passing
+        # global ids writes to the wrong shard under dp>1). Give every shard a
+        # fixed per_shard bucket (pad_to_page_bucket(n) == the worst case where all
+        # n pages fall on one shard) so the compiled shape depends only on
+        # (n bucket, dp_size). For dp_size==1 this collapses to one global==local
+        # chunk -- identical to the single-shard layout.
+        per_shard = self._pad_to_page_bucket(n)
+        n_b = per_shard * dp_size
+        # Bucket each transfer page into its owning shard's slot list; padding
+        # slots keep staged index 0 (data ignored) and loc -1 (kernel skips it).
+        shard_sel = [[0] * per_shard for _ in range(dp_size)]
+        shard_loc = [[-1] * per_shard for _ in range(dp_size)]
+        fill_pos = [0] * dp_size
+        for k, gp in enumerate(int(p) for p in device_indices):
+            d = gp // pages_per_shard
+            pos = fill_pos[d]
+            shard_sel[d][pos] = k
+            shard_loc[d][pos] = gp - d * pages_per_shard
+            fill_pos[d] = pos + 1
+        sel = [k for chunk in shard_sel for k in chunk]
         stack = jnp.stack(
             [staged_pages[i] for i in sel], axis=0
         )  # (n_b, layer_num, *per_layer_shape)
 
-        # Expand global page ids -> absolute device token slots (page*PS + offset),
-        # then pad to n_b pages with -1 (skipped by the kernel).
-        dev_pages = np.asarray(device_indices, dtype=np.int64)
-        loc_np = (dev_pages[:, None] * PS + np.arange(PS, dtype=np.int64)).reshape(-1)
-        if n_b > n:
-            loc_np = np.concatenate([loc_np, -np.ones((n_b - n) * PS, dtype=loc_np.dtype)])
-        dp = self._device_pool
+        # Expand shard-local page ids -> shard-local token slots (page*PS + offset),
+        # -1 for padding. The per-shard chunk order matches the loc/data data-axis
+        # split so each shard receives exactly the pages it owns.
+        loc_pages = np.asarray([lp for chunk in shard_loc for lp in chunk], dtype=np.int64)
+        loc_np = np.where(
+            loc_pages[:, None] < 0,
+            -1,
+            loc_pages[:, None] * PS + np.arange(PS, dtype=np.int64),
+        ).reshape(-1)
         loc = jax.device_put(
             jnp.asarray(loc_np, dtype=jnp.int32),
             NamedSharding(dp.mesh, PartitionSpec(dp.attention_data_partition_axis)),

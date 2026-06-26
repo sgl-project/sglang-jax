@@ -9,17 +9,12 @@ most likely to break a donating in-place KV write unexercised:
   2. true ``pinned_host`` placement for the host slots.
 
 This module runs the bit-exact D2H->H2D round-trip on a 4-chip TPU at
-``tp=4/dp=1``, covering both. Registered in the ``unit-test-tpu-v6e-4`` suite;
-skipped off TPU / with <4 devices.
-
-dp>1 is intentionally NOT covered here: the H2D scatter
-(``flush_load`` -> ``write_kv_layer`` -> ``update_fused_kv_cache_vectorized``)
-passes GLOBAL device page ids, but the kernel's ``shard_map`` splits ``loc`` on
-the data axis and indexes each shard's local KV slice with those ids -- correct
-for the forward path (loc is already dp-local there) but wrong for HiCache's
-global ids, so a page lands on the wrong dp shard. Routing global pages to their
-owning shard is a separate piece of work; LRUHostKVPool is not yet wired into
-the unified cache, so no production path runs it under dp>1 today.
+``tp=4/dp=1``, covering both. The dp>1 page-axis gather/scatter layout is covered
+by the companion ``test_host_kv_pool_tpu_dp.py``: a single process cannot switch
+device mesh topology (``[1, 4]`` vs ``[2, 2]``) without the second mesh producing
+garbage, so the two layouts live in separate files (each TestFile in
+``run_suite.py`` is its own subprocess). Both are registered in
+``unit-test-tpu-v6e-4``; skipped off TPU / with <4 devices.
 """
 
 from __future__ import annotations
