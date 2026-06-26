@@ -55,14 +55,12 @@ class SingleHostRun:
     Mirrors the multi-host ``ModelRun``: ``launch_profile`` is a profile filename
     under ``launch_profiles/`` carrying the full server config (one profile per
     config — no per-run overrides), and ``cases`` are evaluated in order against
-    the single launched server.
-
-    ``launch_profile`` may be ``None`` for a run of self-launching / offline
-    ``BenchCase``s (the single-host A/B bench launches its own servers): the runner
-    then launches nothing and just drives the cases.
+    the single launched server. A ``BenchCase`` here runs client-only against that
+    server (``server="runner"``); self-launching / offline benches go in a
+    ``SelfLaunchRun`` instead, so this type always means exactly one server.
     """
 
-    launch_profile: str | None
+    launch_profile: str
     cases: tuple[AccuracyCase | PerfCase | BenchCase, ...]
 
     def __post_init__(self):
@@ -72,9 +70,30 @@ class SingleHostRun:
 
 
 @dataclass(frozen=True)
+class SelfLaunchRun:
+    """A run with no runner-launched server: its ``BenchCase``s either launch their
+    own servers (``server="self"``, e.g. the A/B bench starts a server per config)
+    or are offline (``server="none"``, e.g. an ``--compare`` gate). A separate type
+    keeps SingleHostRun's "one run == one launched server" invariant intact.
+    """
+
+    cases: tuple[BenchCase, ...]
+
+    def __post_init__(self):
+        if not isinstance(self.cases, tuple):
+            object.__setattr__(self, "cases", tuple(self.cases))
+        bad = [c for c in self.cases if not isinstance(c, BenchCase) or c.server == "runner"]
+        if bad:
+            raise ValueError(
+                "SelfLaunchRun holds only self-launching/offline BenchCases "
+                f"(server in {{self, none}}); got {[getattr(c, 'name', c) for c in bad]}"
+            )
+
+
+@dataclass(frozen=True)
 class SingleHostSuite:
     name: str
-    runs: list[SingleHostRun]
+    runs: list[SingleHostRun | SelfLaunchRun]
 
 
 def _gsm8k_case(name: str, model_id: str, threshold: float, eval_batch_size: int) -> AccuracyCase:
@@ -283,8 +302,7 @@ SUITES: dict[str, SingleHostSuite] = {
     "recurrent-ab-perf-v6e-4": SingleHostSuite(
         name="recurrent-ab-perf-v6e-4",
         runs=[
-            SingleHostRun(
-                launch_profile=None,
+            SelfLaunchRun(
                 cases=[
                     BenchCase(
                         name="recurrent-ab",
@@ -398,8 +416,7 @@ SUITES: dict[str, SingleHostSuite] = {
     "recurrent-ablation-v6e-4": SingleHostSuite(
         name="recurrent-ablation-v6e-4",
         runs=[
-            SingleHostRun(
-                launch_profile=None,
+            SelfLaunchRun(
                 cases=[
                     _ablation_case("dp1-ep1", dp=1, ep=1),
                     _ablation_case("dp1-ep4", dp=1, ep=4),
@@ -429,82 +446,46 @@ def _gate_accuracy(case: AccuracyCase, result: dict) -> tuple[str, str] | None:
     return None
 
 
-def run_one(run: SingleHostRun) -> None:
-    """Launch one server for ``run`` and evaluate its cases.
+def _eval_cases(cases, spec, profile) -> None:
+    """Evaluate ``cases`` against an already-launched server (``spec``/``profile``)
+    or, when both are ``None``, drive self-launching / offline ``BenchCase``s.
 
-    Collects per-case failures across all of ``run.cases`` — both gating misses
-    and unexpected crashes from the case runner — and raises a single SuiteError
-    tagged with the dominant kind (a crash maps to ``case`` so it surfaces as
-    EXIT_CASE_CRASH, not retryable infra). Only genuine infra errors (profile
-    load, server launch) propagate as-is. ``AccuracyCase`` / ``PerfCase`` are
-    dispatched by type to their case runner; ``BenchCase`` shells out to a
-    standalone bench (``run.launch_profile`` is ``None`` for a self-launching /
-    offline BenchCase run, so no server is launched here).
+    Collects per-case failures — both gating misses and unexpected crashes from the
+    case runner — and raises a single SuiteError tagged with the dominant kind (a
+    crash maps to ``case`` so it surfaces as EXIT_CASE_CRASH, not retryable infra).
     """
     from drivers import run_bench_for_case
 
-    from sgl_jax.srt.utils import kill_process_tree
-
-    process = None
-    spec = None
-    profile = None
-    if run.launch_profile is not None:
-        # Lazy: pull jax in only when a server-backed case actually runs (keeps
-        # --caselist and BenchCase-only runs jax-free in the parent).
-        from accuracy_case_runner import load_profile_file, profile_server_spec
-
-        from sgl_jax.test.test_utils import (
-            DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            popen_launch_server,
-        )
-
-        profile = load_profile_file(run.launch_profile)
-        spec = profile_server_spec(profile)
-        _log(f"launching {profile.name} (model={spec['model']}, base_url={spec['base_url']})")
-        process = popen_launch_server(
-            spec["model"],
-            spec["base_url"],
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=spec["other_args"],
-            check_cache_miss=spec["check_cache_miss"],
-        )
-    else:
-        _log(f"no launch profile — self-launching/offline cases ({len(run.cases)})")
-
     failures: list[tuple[str, str]] = []
-    try:
-        for case in run.cases:
-            try:
-                if isinstance(case, BenchCase):
-                    base_url = spec["base_url"] if (spec and case.server == "runner") else None
-                    _result, fail = run_bench_for_case(case, base_url)
-                elif isinstance(case, PerfCase):
-                    if spec is None:
-                        raise ValueError(f"{case.name}: PerfCase requires a launch_profile")
-                    from perf_case_runner import run_perf_case
+    for case in cases:
+        try:
+            if isinstance(case, BenchCase):
+                base_url = spec["base_url"] if (spec and case.server == "runner") else None
+                _result, fail = run_bench_for_case(case, base_url)
+            elif isinstance(case, PerfCase):
+                if spec is None:
+                    raise ValueError(f"{case.name}: PerfCase requires a launch_profile")
+                from perf_case_runner import run_perf_case
 
-                    _result, fail = run_perf_case(
-                        case, spec["base_url"], spec["model"], profile.name, profile.target
-                    )
-                else:
-                    if spec is None:
-                        raise ValueError(f"{case.name}: AccuracyCase requires a launch_profile")
-                    from accuracy_case_runner import run_accuracy_case
-
-                    result = run_accuracy_case(case, spec["base_url"], profile.name, profile.target)
-                    fail = _gate_accuracy(case, result)
-            except Exception as exc:  # noqa: BLE001 — a case crash is a bug, not infra
-                _log(f"{case.name}: CRASH — {exc!r}")
-                failures.append(("case", f"{case.name}: {exc!r}"))
-                continue
-            if fail:
-                _log(f"{case.name}: FAIL ({fail[0]}) — {fail[1]}")
-                failures.append(fail)
+                _result, fail = run_perf_case(
+                    case, spec["base_url"], spec["model"], profile.name, profile.target
+                )
             else:
-                _log(f"{case.name}: PASS")
-    finally:
-        if process is not None:
-            kill_process_tree(process.pid)
+                if spec is None:
+                    raise ValueError(f"{case.name}: AccuracyCase requires a launch_profile")
+                from accuracy_case_runner import run_accuracy_case
+
+                result = run_accuracy_case(case, spec["base_url"], profile.name, profile.target)
+                fail = _gate_accuracy(case, result)
+        except Exception as exc:  # noqa: BLE001 — a case crash is a bug, not infra
+            _log(f"{case.name}: CRASH — {exc!r}")
+            failures.append(("case", f"{case.name}: {exc!r}"))
+            continue
+        if fail:
+            _log(f"{case.name}: FAIL ({fail[0]}) — {fail[1]}")
+            failures.append(fail)
+        else:
+            _log(f"{case.name}: PASS")
 
     if failures:
         kinds = {kind for kind, _ in failures}
@@ -513,22 +494,62 @@ def run_one(run: SingleHostRun) -> None:
         raise SuiteError(kind=kind, message="; ".join(msg for _, msg in failures))
 
 
+def run_one(run: SingleHostRun) -> None:
+    """Launch the run's profile server, evaluate its cases, then tear it down.
+
+    Only genuine infra errors (profile load, server launch) propagate as-is;
+    per-case outcomes are funneled through ``_eval_cases`` into a SuiteError.
+    """
+    from accuracy_case_runner import load_profile_file, profile_server_spec
+
+    from sgl_jax.srt.utils import kill_process_tree
+    from sgl_jax.test.test_utils import (
+        DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+        popen_launch_server,
+    )
+
+    profile = load_profile_file(run.launch_profile)
+    spec = profile_server_spec(profile)
+    _log(f"launching {profile.name} (model={spec['model']}, base_url={spec['base_url']})")
+    process = popen_launch_server(
+        spec["model"],
+        spec["base_url"],
+        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+        other_args=spec["other_args"],
+        check_cache_miss=spec["check_cache_miss"],
+    )
+    try:
+        _eval_cases(run.cases, spec=spec, profile=profile)
+    finally:
+        kill_process_tree(process.pid)
+
+
+def run_self_launch(run: SelfLaunchRun) -> None:
+    """Drive self-launching / offline BenchCases — the runner launches no server."""
+    _log(f"self-launching/offline cases ({len(run.cases)}) — no runner server")
+    _eval_cases(run.cases, spec=None, profile=None)
+
+
 def run_suite(suite: SingleHostSuite) -> int:
-    """Run every SingleHostRun (independent servers); report all failures."""
+    """Run every run (independent servers / self-launching benches); report all failures."""
     total_cases = sum(len(r.cases) for r in suite.runs)
     _log(f"running suite={suite.name} ({len(suite.runs)} runs, {total_cases} cases)")
     had_infra = had_crash = had_threshold = False
     for run in suite.runs:
+        label = run.launch_profile if isinstance(run, SingleHostRun) else "self-launch"
         try:
-            run_one(run)
+            if isinstance(run, SingleHostRun):
+                run_one(run)
+            else:
+                run_self_launch(run)
         except SuiteError as exc:
-            _log(f"{run.launch_profile}: FAIL ({exc.kind}) — {exc}")
+            _log(f"{label}: FAIL ({exc.kind}) — {exc}")
             if exc.kind == "threshold":
                 had_threshold = True
             else:
                 had_crash = True
         except Exception as exc:  # noqa: BLE001 — surface as infra failure
-            _log(f"{run.launch_profile}: infra error — {exc!r}")
+            _log(f"{label}: infra error — {exc!r}")
             had_infra = True
 
     if had_infra:
@@ -546,7 +567,7 @@ def _dry_run(suite: SingleHostSuite) -> dict:
         "suite": suite.name,
         "runs": [
             {
-                "launch_profile": run.launch_profile,
+                "launch_profile": getattr(run, "launch_profile", None),
                 "cases": [
                     {
                         "case": case.name,
@@ -600,11 +621,14 @@ def _select_cases(suite: SingleHostSuite, cases: str | None) -> SingleHostSuite:
     if not cases:
         return suite
     want = {c.strip() for c in cases.split(",") if c.strip()}
-    selected: list[SingleHostRun] = []
+    selected: list[SingleHostRun | SelfLaunchRun] = []
     for run in suite.runs:
         keep = tuple(c for c in run.cases if c.name in want)
         if keep:
-            selected.append(SingleHostRun(launch_profile=run.launch_profile, cases=keep))
+            if isinstance(run, SingleHostRun):
+                selected.append(SingleHostRun(launch_profile=run.launch_profile, cases=keep))
+            else:
+                selected.append(SelfLaunchRun(cases=keep))
     found = {c.name for run in selected for c in run.cases}
     missing = want - found
     if missing:
