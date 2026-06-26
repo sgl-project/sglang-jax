@@ -99,6 +99,12 @@ class Step3p5Config(PretrainedConfig):
         self.moe_layers_enum = moe_layers_enum
         self.moe_num_experts = moe_num_experts
         self.moe_top_k = moe_top_k
+        # Canonical aliases for shared infra that reads the standard names:
+        # EPLB expert_location reads ``num_experts``; the routed-experts capturer
+        # (tp_worker) reads ``num_experts_per_tok``. (Same pattern as
+        # num_key_value_heads = num_attention_groups above.)
+        self.num_experts = moe_num_experts
+        self.num_experts_per_tok = moe_top_k
         self.moe_intermediate_size = moe_intermediate_size
         self.share_expert_dim = share_expert_dim
         self.moe_router_activation = moe_router_activation
