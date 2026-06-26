@@ -1135,9 +1135,11 @@ class GlmMoeDsaForCausalLM(Glm5ForCausalLM):
         # runs, so the fused weights bypass quantization and regress decode
         # TPOT on HBM-bound hardware (#1378). Keep the unfused path there so
         # the LinearBase modules get quantized as before.
-        mc.hf_config._sgl_use_fused_mlp = (
-            mc.quantization_config is None or mc.quantization_config.is_static_checkpoint
-        )
+        # Static fp8 checkpoint also breaks fused: gate_proj/up_proj/down_proj
+        # become QuantizedLinear (no .weight), so post_load_weights cannot
+        # populate w_gu/w_d and the abstract ShapeDtypeStruct placeholders
+        # leak into jit inputs. Keep fused for bf16-only.
+        mc.hf_config._sgl_use_fused_mlp = mc.quantization_config is None
 
 
 EntryClass = [Glm5ForCausalLM, GlmMoeDsaForCausalLM]
