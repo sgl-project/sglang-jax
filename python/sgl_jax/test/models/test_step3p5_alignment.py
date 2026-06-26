@@ -384,6 +384,9 @@ def _jax_instrumented_forward(model, forward_batch, jax_caps: dict) -> dict[tupl
         residual = hidden
         post_ln = layer.post_attention_layernorm(hidden)
         ffn_out = layer.mlp(post_ln)
+        # MoE layers return (output, topk_ids); dense layers return just the tensor.
+        if isinstance(ffn_out, tuple):
+            ffn_out = ffn_out[0]
 
         # HF layer output = ffn_out + residual (full residual connection).
         # JAX Step3p5DecoderLayer returns (ffn_out, residual, ...) — next layer adds them.
