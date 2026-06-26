@@ -34,7 +34,11 @@ def compare_A(hf_dir, jax_dir):
     if not common:
         print("A: no common prompts")
         return
+    # jax dump may be argmax-only (1 token/prompt) — the generation path avoids the
+    # multi-host logprob bug; argmax agreement is still the main criterion.
+    argmax_only = all(len(jx[p]) == 1 for p in common)
     argmax_agree = 0
+    jx_in_hf_topk = 0
     overlaps = []
     logprob_absdiffs = []
     for p in common:
@@ -43,20 +47,23 @@ def compare_A(hf_dir, jax_dir):
         jx_top1 = max(jx_tk, key=lambda x: x[1])[0]
         argmax_agree += int(hf_top1 == jx_top1)
         hf_set = {t for t, _ in hf_tk}
-        jx_set = {t for t, _ in jx_tk}
-        overlaps.append(len(hf_set & jx_set) / max(len(hf_set), 1))
-        hf_lp = dict(hf_tk)
-        jx_lp = dict(jx_tk)
-        for t in hf_set & jx_set:
-            logprob_absdiffs.append(abs(hf_lp[t] - jx_lp[t]))
+        jx_in_hf_topk += int(jx_top1 in hf_set)
+        if not argmax_only:
+            jx_set = {t for t, _ in jx_tk}
+            overlaps.append(len(hf_set & jx_set) / max(len(hf_set), 1))
+            hf_lp, jx_lp = dict(hf_tk), dict(jx_tk)
+            for t in hf_set & jx_set:
+                logprob_absdiffs.append(abs(hf_lp[t] - jx_lp[t]))
     n = len(common)
     print("=== A: end-to-end next-token (HF vs jax, real weights) ===")
-    print(f" prompts compared      : {n}")
+    print(f" prompts compared      : {n}" + ("   [jax: argmax-only]" if argmax_only else ""))
     print(f" argmax agreement      : {argmax_agree}/{n} = {argmax_agree / n:.4f}")
-    print(f" mean top-k overlap    : {np.mean(overlaps):.4f}")
-    if logprob_absdiffs:
-        a = np.array(logprob_absdiffs)
-        print(f" logprob |diff| on shared tokens: mean={a.mean():.4e} max={a.max():.4e}")
+    print(f" jax argmax in HF top-k: {jx_in_hf_topk}/{n} = {jx_in_hf_topk / n:.4f}")
+    if not argmax_only:
+        print(f" mean top-k overlap    : {np.mean(overlaps):.4f}")
+        if logprob_absdiffs:
+            a = np.array(logprob_absdiffs)
+            print(f" logprob |diff| on shared tokens: mean={a.mean():.4e} max={a.max():.4e}")
     print(
         " criterion: argmax agreement ~1.0 (a few borderline flips OK = bf16 noise);"
         " low agreement => real implementation divergence."
