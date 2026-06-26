@@ -75,7 +75,11 @@ from sgl_jax.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.multimodal.tokenizer_utils import resolve_tokenizer_subdir
 from sgl_jax.srt.precision_tracer import precision_tracer
-from sgl_jax.srt.server_args import PortArgs, ServerArgs
+from sgl_jax.srt.server_args import (
+    PortArgs,
+    ServerArgs,
+    apply_multimodal_model_defaults,
+)
 from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 from sgl_jax.srt.utils.common_utils import (
@@ -579,6 +583,7 @@ class Scheduler(
     def init_tokenizer(self):
         server_args = self.server_args
         self.model_config = ModelConfig.from_server_args(server_args)
+        apply_multimodal_model_defaults(server_args, self.model_config)
         self.is_generation = self.model_config.is_generation
         if server_args.skip_tokenizer_init:
             self.tokenizer = self.processor = None

@@ -72,7 +72,11 @@ from sgl_jax.srt.multimodal.manager.multimodal_processor import (
 )
 from sgl_jax.srt.multimodal.tokenizer_utils import resolve_tokenizer_subdir
 from sgl_jax.srt.sampling.sampling_params import SamplingParams
-from sgl_jax.srt.server_args import PortArgs, ServerArgs
+from sgl_jax.srt.server_args import (
+    PortArgs,
+    ServerArgs,
+    apply_multimodal_model_defaults,
+)
 from sgl_jax.srt.utils import (
     dataclass_to_string_truncated,
     get_bool_env_var,
@@ -158,6 +162,7 @@ class TokenizerManager:
         self.served_model_name = server_args.served_model_name
         if not server_args.multimodal:
             self.model_config = ModelConfig.from_server_args(server_args)
+            apply_multimodal_model_defaults(server_args, self.model_config)
             self.is_generation = self.model_config.is_generation
             self.context_len = self.model_config.context_len
             self.image_token_id = self.model_config.image_token_id

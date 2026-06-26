@@ -31,6 +31,17 @@ GRAMMAR_BACKEND_CHOICES = ["llguidance", "none"]
 _REJECTED_PD_HOST_ALIASES = frozenset({"localhost"})
 
 
+def apply_multimodal_model_defaults(server_args, model_config) -> None:
+    if not getattr(model_config, "is_multimodal", False):
+        return
+
+    if not server_args.disable_radix_cache:
+        logger.info("Multimodal model detected, disabling radix cache")
+        server_args.disable_radix_cache = True
+    if server_args.limit_mm_data_per_request is None:
+        server_args.limit_mm_data_per_request = {"image": 16}
+
+
 def _validate_disaggregation_host_ip(host_ip: str) -> str:
     if host_ip in _REJECTED_PD_HOST_ALIASES:
         raise ValueError(
