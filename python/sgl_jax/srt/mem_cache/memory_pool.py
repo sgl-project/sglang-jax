@@ -184,10 +184,18 @@ class HybridReqToTokenPool(ReqToTokenPool):
         dtype: np.dtype,
         recurrent_state_pool,
         dp_size: int = 1,
+        enable_recurrent_extra_buffer: bool = False,
+        ping_pong_slots: int = 2,
     ):
         super().__init__(size=size, max_context_len=max_context_len, dtype=dtype)
         self.recurrent_state_pool = recurrent_state_pool
         self.dp_size = dp_size
+        self.enable_recurrent_extra_buffer = enable_recurrent_extra_buffer
+        # Ping-pong track slots a req holds under extra-buffer: 2 with overlap
+        # scheduling (double-buffer across the overlap boundary), 1 without
+        # (--disable-overlap-schedule) -- the boundary state is committed before
+        # the next forward, so a single track slot suffices.
+        self.ping_pong_slots = ping_pong_slots
         # recurrent_state_pool.size is global (mirrors MHATokenToKVPool).
         # Divisibility is asserted inside RecurrentStatePool.__init__.
         self.slots_per_rank = recurrent_state_pool.size // dp_size
@@ -195,12 +203,28 @@ class HybridReqToTokenPool(ReqToTokenPool):
             list(range(1, self.slots_per_rank + 1)) for _ in range(dp_size)
         ]
         self.req_index_to_recurrent_index_mapping = np.zeros(size, dtype=np.int32)
+        # Extra-buffer ping-pong track slots: (req_pool_idx, ping_pong_slots)
+        # running parallel to req_index_to_recurrent_index_mapping. Untouched
+        # when extra-buffer is off.
+        self.req_index_to_recurrent_ping_pong_track_buffer_mapping = np.zeros(
+            (size, ping_pong_slots), dtype=np.int32
+        )
+
+    @property
+    def request_owned_slots(self) -> int:
+        """Recurrent slots a running req actually consumes: 1 running plus the
+        ping-pong track slots under extra-buffer (1 otherwise). Distinct from the
+        sizing back-cap's reservation factor, whose surplus is snapshot headroom."""
+        return 1 + self.ping_pong_slots if self.enable_recurrent_extra_buffer else 1
 
     def alloc(self, reqs: list[Req]) -> list[int] | None:
         # dp_rank from reqs[0]: callers (prepare_for_extend/decode) iterate per-DP,
         # so all reqs in a single alloc() call share the same dp_rank.
         dp_rank = reqs[0].dp_rank if reqs and reqs[0].dp_rank is not None else 0
-        needed = sum(1 for r in reqs if r.recurrent_pool_idx is None)
+        # Each new req needs 1 running slot, plus ping_pong_slots track slots
+        # under extra-buffer (1 running + ping_pong_slots track).
+        per_req = self.request_owned_slots
+        needed = per_req * sum(1 for r in reqs if r.recurrent_pool_idx is None)
         if needed > len(self.recurrent_free_slots[dp_rank]):
             return None
 
@@ -213,6 +237,8 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 slot = self.alloc_recurrent_slot(dp_rank)
                 r.recurrent_pool_idx = slot
                 self.req_index_to_recurrent_index_mapping[r.req_pool_idx] = slot
+                if self.enable_recurrent_extra_buffer:
+                    self._alloc_ping_pong_buffer(r, dp_rank)
 
         return result
 
@@ -229,6 +255,67 @@ class HybridReqToTokenPool(ReqToTokenPool):
     def recurrent_value_from_slot(slot: int) -> np.ndarray:
         return np.array([int(slot)], dtype=np.int32)
 
+    def _alloc_ping_pong_buffer(self, req: Req, dp_rank: int) -> list[int] | None:
+        """Pop ``ping_pong_slots`` free slots for a request's ping-pong track
+        buffer; store them in the req + mapping. Returns None (without partial
+        mutation) if fewer than ``ping_pong_slots`` free slots remain (caller
+        handles the shortfall)."""
+        slots = self.recurrent_free_slots[dp_rank]
+        n = self.ping_pong_slots
+        if len(slots) < n:
+            return None
+        buffer = [slots.pop(0) for _ in range(n)]
+        req.recurrent_ping_pong_track_buffer = buffer
+        req.recurrent_next_track_idx = 0
+        req.recurrent_last_track_seqlen = None
+        self.req_index_to_recurrent_ping_pong_track_buffer_mapping[req.req_pool_idx] = np.array(
+            buffer, dtype=np.int32
+        )
+        return buffer
+
+    def get_recurrent_ping_pong_other_idx(self, next_idx: int) -> int:
+        """The buffer index that is NOT the next-scatter target. With a single
+        track slot (overlap disabled) there is no other slot, so this returns 0
+        (keep == next == the sole slot)."""
+        return (next_idx + 1) % self.ping_pong_slots
+
+    def get_recurrent_ping_pong_keep_idx(self, req: Req) -> int:
+        """Buffer index holding the most-recently materialized boundary: the
+        slot the next scatter does NOT overwrite."""
+        return self.get_recurrent_ping_pong_other_idx(req.recurrent_next_track_idx)
+
+    def set_recurrent_ping_pong_slot(self, req: Req, idx: int, slot: int) -> None:
+        """Point buffer slot ``idx`` at ``slot`` in both the req and the mapping."""
+        req.recurrent_ping_pong_track_buffer[idx] = int(slot)
+        self.req_index_to_recurrent_ping_pong_track_buffer_mapping[req.req_pool_idx, idx] = int(
+            slot
+        )
+
+    def donate_recurrent_ping_pong_slot(self, req: Req, new_slot: int) -> np.ndarray:
+        """Donate the current KEEP slot to the tree: return its length-1 int32
+        tree value, then replace it in the buffer + mapping with ``new_slot``."""
+        keep_idx = self.get_recurrent_ping_pong_keep_idx(req)
+        keep_slot = req.recurrent_ping_pong_track_buffer[keep_idx]
+        value = self.recurrent_value_from_slot(keep_slot)
+        self.set_recurrent_ping_pong_slot(req, keep_idx, new_slot)
+        return value
+
+    def count_request_owned_recurrent_slots(self, live_reqs: list[Req], dp_rank: int = 0) -> int:
+        """Count request-owned recurrent slots (running + ping-pong track) held by
+        the live requests on ``dp_rank``. Lets the ledger check
+        ``owned + tree_owned + free == slots_per_rank`` catch a leaked slot."""
+        count = 0
+        for req in live_reqs:
+            req_rank = req.dp_rank if req.dp_rank is not None else 0
+            if req_rank != dp_rank:
+                continue
+            if req.recurrent_pool_idx is not None:
+                count += 1
+            track = getattr(req, "recurrent_ping_pong_track_buffer", None)
+            if track is not None:
+                count += sum(1 for s in track if s)
+        return count
+
     def commit_to_tree(self, req: Req) -> None:
         """Transfer running-slot ownership to the tree; the slot is not freed."""
         if req.recurrent_pool_idx is None:
@@ -244,12 +331,22 @@ class HybridReqToTokenPool(ReqToTokenPool):
 
     def free_recurrent_cache(self, req: Req):
         recurrent_idx = req.recurrent_pool_idx
-        if recurrent_idx is None:
-            return
         dp_rank = req.dp_rank if req.dp_rank is not None else 0
-        self.free_recurrent_slot(recurrent_idx, dp_rank)
-        self.req_index_to_recurrent_index_mapping[req.req_pool_idx] = 0
-        req.recurrent_pool_idx = None
+        if recurrent_idx is not None:
+            self.free_recurrent_slot(recurrent_idx, dp_rank)
+            self.req_index_to_recurrent_index_mapping[req.req_pool_idx] = 0
+            req.recurrent_pool_idx = None
+        # Extra-buffer: return every request-owned track slot (never slot 0/None),
+        # zero the mapping row, and clear the ping-pong fields.
+        track = getattr(req, "recurrent_ping_pong_track_buffer", None)
+        if track is not None:
+            for slot in track:
+                if slot:
+                    self.free_recurrent_slot(slot, dp_rank)
+            self.req_index_to_recurrent_ping_pong_track_buffer_mapping[req.req_pool_idx] = 0
+            req.recurrent_ping_pong_track_buffer = None
+            req.recurrent_next_track_idx = None
+            req.recurrent_last_track_seqlen = None
 
     def get_linear_recurrent_indices(self, req_pool_indices) -> np.ndarray:
         return self.req_index_to_recurrent_index_mapping[req_pool_indices]
@@ -263,6 +360,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         for rank in range(self.dp_size):
             self.recurrent_free_slots[rank] = list(range(1, self.slots_per_rank + 1))
         self.req_index_to_recurrent_index_mapping.fill(0)
+        self.req_index_to_recurrent_ping_pong_track_buffer_mapping.fill(0)
 
 
 @register_pytree_node_class

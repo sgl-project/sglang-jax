@@ -356,8 +356,8 @@ class TreeComponent(ABC):
         return int >= 0 for effective cache length.
         - Full: no-op, returns None.
         - SWA: sets insert_params.swa_evicted_seqlen on finished; returns None.
-        - Recurrent: on a finished request, donates the running slot as
-          recurrent_value; returns None (no truncation)."""
+        - Recurrent: prepares recurrent_value (finished from ping-pong buffer,
+          unfinished fork from req); returns recurrent_last_track_seqlen."""
         return None
 
     def cleanup_after_caching_req(

@@ -178,6 +178,8 @@ def _run_backend_extend(lens, H, K, dtype, h0, rng_seed, layer_id=_LAYER_ID):
             input_ids=np.zeros(total_tokens, dtype=np.int32),
             recurrent_indices=rec_indices,
             has_initial_state=np.ones(B, dtype=np.bool_),
+            recurrent_track_indices=None,
+            recurrent_track_mask=None,
             dp_size=1,
             per_dp_bs_size=B,
         )
@@ -227,6 +229,8 @@ def _run_backend_extend_bucket_padded(lens, H, K, dtype, h0, rng_seed, layer_id=
             input_ids=input_ids,
             recurrent_indices=rec_indices,
             has_initial_state=np.ones(B_padded, dtype=np.bool_),
+            recurrent_track_indices=None,
+            recurrent_track_mask=None,
             dp_size=1,
             per_dp_bs_size=B_padded,
         )
@@ -285,6 +289,8 @@ def _run_backend_decode(B, H, K, dtype, h0, rng_seed, layer_id=_LAYER_ID):
             seq_lens=np.ones(B, dtype=np.int32),
             recurrent_indices=rec_indices,
             has_initial_state=np.ones(B, dtype=np.bool_),
+            recurrent_track_indices=None,
+            recurrent_track_mask=None,
             dp_size=1,
             per_dp_bs_size=B,
         )

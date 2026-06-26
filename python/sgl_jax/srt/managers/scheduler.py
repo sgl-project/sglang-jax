@@ -79,6 +79,9 @@ from sgl_jax.srt.mem_cache.kv_cache_builder import build_kv_cache
 from sgl_jax.srt.mem_cache.radix_cache import RadixKey
 from sgl_jax.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
+from sgl_jax.srt.model_executor.model_runner_kv_cache_mixin import (
+    recurrent_admission_blocked,
+)
 from sgl_jax.srt.multimodal.tokenizer_utils import resolve_tokenizer_subdir
 from sgl_jax.srt.precision_tracer import precision_tracer
 from sgl_jax.srt.server_args import PortArgs, ServerArgs
@@ -1752,6 +1755,24 @@ class Scheduler(
             ):
                 continue
 
+            # Recurrent backpressure: a new req needs request_owned_slots
+            # recurrent slots (1 running + ping-pong track slots under
+            # extra-buffer) that the running reservation can't evict. If this
+            # rank's free + evictable recurrent slots can't cover the reqs
+            # already queued plus this one, defer it rather than let
+            # alloc_req_slots raise (the pool is non-evictable while in flight,
+            # so over-subscription must throttle, not crash).
+            if self.tree_cache is not None and self.tree_cache.supports_recurrent():
+                per_req = self.req_to_token_pool.request_owned_slots
+                demand = per_req * (len(adder.can_run_list[dp_rank]) + 1)
+                free = self.req_to_token_pool.recurrent_available_size(dp_rank)
+                evictable = self.tree_cache.recurrent_evictable_size(dp_rank)
+                if recurrent_admission_blocked(free, evictable, demand):
+                    self.running_batch.reqs_info[dp_rank].batch_is_full = True
+                    if self.running_batch.batch_is_full:
+                        break
+                    continue
+
             # Skip DP ranks with an ongoing chunked request to avoid
             # creating a second chunked req on the same rank.
             if self.chunked_reqs[dp_rank] is not None:
@@ -1779,6 +1800,31 @@ class Scheduler(
                 continue  # host pool full: leave req in waiting_queue, retry next round
 
             req.init_next_round_input(self.tree_cache)
+
+            # Recurrent backpressure refinement (post-match): a cross-request
+            # prefix hit keeps its matched recurrent snapshot protected for the
+            # req's lifetime (add_one_req -> inc_lock_ref below), so that slot
+            # leaves the evictable pool while the req still needs
+            # request_owned_slots fresh slots. The pre-match check above counts
+            # the snapshot as evictable; discount it here so admission at exact
+            # recurrent capacity defers instead of letting alloc_req_slots raise.
+            if (
+                self.tree_cache is not None
+                and self.tree_cache.supports_recurrent()
+                and req.recurrent_cow_src_index is not None
+            ):
+                per_req = self.req_to_token_pool.request_owned_slots
+                demand = per_req * (len(adder.can_run_list[dp_rank]) + 1)
+                free = self.req_to_token_pool.recurrent_available_size(dp_rank)
+                evictable = self.tree_cache.recurrent_evictable_size(dp_rank)
+                if recurrent_admission_blocked(free, evictable, demand, keeps_locked=1):
+                    if _reserved_bid is not None and _host_pool is not None:
+                        _host_pool.release(_reserved_bid)
+                    self.running_batch.reqs_info[dp_rank].batch_is_full = True
+                    if self.running_batch.batch_is_full:
+                        break
+                    continue
+
             res = adder.add_one_req(req)
 
             if res != AddReqResult.CONTINUE:

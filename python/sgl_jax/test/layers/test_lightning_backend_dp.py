@@ -201,6 +201,8 @@ class TestDPMetadata:
                 seq_lens=np.array([10, 20, 15, 25], dtype=np.int32),
                 recurrent_indices=np.array([1, 2, 1, 2], dtype=np.int32),  # LOCAL indices per rank
                 has_initial_state=np.ones(4, dtype=np.bool_),
+                recurrent_track_indices=None,
+                recurrent_track_mask=None,
                 dp_size=2,
                 per_dp_bs_size=2,
             )
@@ -271,6 +273,8 @@ class TestDPDecode:
                 seq_lens=np.ones(B, dtype=np.int32),
                 recurrent_indices=rec_indices,
                 has_initial_state=np.ones(B, dtype=np.bool_),
+                recurrent_track_indices=None,
+                recurrent_track_mask=None,
                 dp_size=1,
                 per_dp_bs_size=B,
             )
@@ -311,6 +315,8 @@ class TestDPDecode:
                 seq_lens=np.ones(B, dtype=np.int32),
                 recurrent_indices=batch_rec_indices,
                 has_initial_state=np.ones(B, dtype=np.bool_),
+                recurrent_track_indices=None,
+                recurrent_track_mask=None,
                 dp_size=2,
                 per_dp_bs_size=B // 2,
             )
@@ -386,6 +392,8 @@ class TestDPDecode:
                 seq_lens=np.ones(B, dtype=np.int32),
                 recurrent_indices=batch_rec_indices,
                 has_initial_state=np.ones(B, dtype=np.bool_),
+                recurrent_track_indices=None,
+                recurrent_track_mask=None,
                 dp_size=2,
                 per_dp_bs_size=B // 2,
             )
@@ -459,6 +467,8 @@ class TestDPExtend:
                 input_ids=np.zeros(total_tokens, dtype=np.int32),
                 recurrent_indices=rec_indices,
                 has_initial_state=np.ones(B, dtype=np.bool_),
+                recurrent_track_indices=None,
+                recurrent_track_mask=None,
                 dp_size=1,
                 per_dp_bs_size=B,
             )
@@ -502,6 +512,8 @@ class TestDPExtend:
                 input_ids=np.zeros(total_tokens, dtype=np.int32),
                 recurrent_indices=batch_rec_indices,
                 has_initial_state=np.ones(B, dtype=np.bool_),
+                recurrent_track_indices=None,
+                recurrent_track_mask=None,
                 dp_size=2,
                 per_dp_bs_size=B // 2,
             )
@@ -631,6 +643,8 @@ class TestDPExtend:
                 input_ids=np.zeros(total_tokens, dtype=np.int32),
                 recurrent_indices=rec_indices,
                 has_initial_state=np.ones(B, dtype=np.bool_),
+                recurrent_track_indices=None,
+                recurrent_track_mask=None,
                 dp_size=2,
                 per_dp_bs_size=B // 2,
             )
@@ -721,6 +735,8 @@ class TestDPEndToEnd:
                 input_ids=np.zeros(total_tokens, dtype=np.int32),
                 recurrent_indices=batch_rec_indices,
                 has_initial_state=np.ones(B, dtype=np.bool_),
+                recurrent_track_indices=None,
+                recurrent_track_mask=None,
                 dp_size=2,
                 per_dp_bs_size=B // 2,
             )

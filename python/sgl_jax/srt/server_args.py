@@ -94,6 +94,7 @@ class ServerArgs:
     swa_full_tokens_ratio: float = 0.8
     recurrent_state_memory_ratio: float = 0.9
     max_recurrent_state_size: int | None = None
+    recurrent_track_interval: int | None = None
     disable_hybrid_swa_memory: bool = False
 
     # Runtime options
@@ -153,6 +154,7 @@ class ServerArgs:
     # Optimization/debug options
     disable_radix_cache: bool = False
     enable_unified_radix_tree: bool = False
+    enable_recurrent_extra_buffer: bool = False
     allow_auto_truncate: bool = False
     enable_tokenizer_batch_encode: bool = False
     disable_overlap_schedule: bool = False
@@ -353,6 +355,90 @@ class ServerArgs:
         # Normalize speculative_algorithm: treat empty string as None
         if isinstance(self.speculative_algorithm, str) and self.speculative_algorithm.strip() == "":
             self.speculative_algorithm = None
+
+        # Recurrent extra-buffer static validation + track-interval
+        # normalization. Gated on the flag so non-recurrent / base-path launches
+        # are untouched. Model-dependent checks (radix routing) live in
+        # _enforce_recurrent_state_server_constraints.
+        if self.enable_recurrent_extra_buffer:
+            if self.page_size <= 1:
+                raise ValueError(
+                    "--enable-recurrent-extra-buffer requires --page-size > 1 "
+                    f"(recurrent radix caching uses page-boundary track slots); "
+                    f"got page_size={self.page_size}."
+                )
+            # Default the snapshot interval to the prefill chunk size: a smaller
+            # interval force-splits prefill into sub-chunks, and chunked prefill is
+            # chunk-size-sensitive (bf16 reduction order) -> ~3.5pp lower GPQA at
+            # 128 vs 512. Snapshotting at the existing chunk boundaries adds no split.
+            if self.recurrent_track_interval is None:
+                if self.chunked_prefill_size and self.chunked_prefill_size > 0:
+                    # The interval defaults to chunked_prefill_size, so it must be
+                    # page-aligned too. check_server_args() asserts this for chunked
+                    # prefill in general, but that runs later -- without this guard a
+                    # non-page-aligned chunk would trip the interval check below with
+                    # a message blaming the auto-derived interval, not the chunk.
+                    if self.chunked_prefill_size % self.page_size != 0:
+                        raise ValueError(
+                            f"--chunked-prefill-size ({self.chunked_prefill_size}) must be a "
+                            f"multiple of --page-size ({self.page_size}) when "
+                            "--enable-recurrent-extra-buffer is set (the recurrent track "
+                            "interval defaults to it)."
+                        )
+                    self.recurrent_track_interval = self.chunked_prefill_size
+                else:
+                    self.recurrent_track_interval = self.page_size
+            if self.recurrent_track_interval <= 0:
+                raise ValueError(
+                    "--recurrent-track-interval must be > 0 when "
+                    f"--enable-recurrent-extra-buffer is set; got {self.recurrent_track_interval}."
+                )
+            if self.recurrent_track_interval % self.page_size != 0:
+                raise ValueError(
+                    f"--recurrent-track-interval ({self.recurrent_track_interval}) must be a "
+                    f"multiple of --page-size ({self.page_size})."
+                )
+            if self.chunked_prefill_size and self.chunked_prefill_size > 0:
+                if self.recurrent_track_interval > self.chunked_prefill_size:
+                    # Coarser than the chunk: a prompt shorter than the interval
+                    # caches nothing, but does not stall (the zero-cache-len chunk
+                    # skip keeps progress; verified at interval=4096, chunk=512).
+                    # Warn, don't reject -- a valid memory-for-hit-rate trade.
+                    logger.warning(
+                        "--recurrent-track-interval (%d) > --chunked-prefill-size (%d): recurrent "
+                        "snapshots are published only at interval boundaries, so any prompt shorter "
+                        "than the interval caches nothing and cross-request reuse is limited to "
+                        "prompts that cross a boundary. The request still progresses (no stall); "
+                        "this only lowers the recurrent-cache hit rate. Prefer the default "
+                        "(= chunked_prefill_size) unless you are deliberately trading hit rate for "
+                        "coarser, cheaper snapshots.",
+                        self.recurrent_track_interval,
+                        self.chunked_prefill_size,
+                    )
+                elif self.recurrent_track_interval < self.chunked_prefill_size:
+                    logger.warning(
+                        "--recurrent-track-interval (%d) < --chunked-prefill-size (%d): this "
+                        "force-splits prefill into %d-token sub-chunks so each forward ends on a "
+                        "snapshot boundary. Chunked prefill is chunk-size-sensitive in the "
+                        "full-attention/MoE path, so finer snapshots trade accuracy (~3.5pp on "
+                        "GPQA at interval=128 vs chunk=512) for recurrent-cache granularity. "
+                        "Prefer the default (= chunked_prefill_size).",
+                        self.recurrent_track_interval,
+                        self.chunked_prefill_size,
+                        self.recurrent_track_interval,
+                    )
+            if self.speculative_algorithm is not None:
+                raise ValueError(
+                    "--enable-recurrent-extra-buffer does not support speculative "
+                    f"decoding yet; got --speculative-algorithm={self.speculative_algorithm}. "
+                    "Disable one of them."
+                )
+            if self.enable_mixed_chunk:
+                raise ValueError(
+                    "--enable-recurrent-extra-buffer does not support mixed chunked "
+                    "prefill yet (the track snapshot is scoped to pure extend / "
+                    "pure decode forwards). Disable --enable-mixed-chunk."
+                )
 
         os.environ["SGLANG_ENABLE_DETERMINISTIC_SAMPLING"] = (
             "1" if self.enable_deterministic_sampling else "0"
@@ -753,6 +839,16 @@ class ServerArgs:
             "Must be divisible by dp_size when set explicitly.",
         )
         parser.add_argument(
+            "--recurrent-track-interval",
+            type=int,
+            default=ServerArgs.recurrent_track_interval,
+            help="Recurrent radix cache: page-boundary interval at which a "
+            "recurrent track state is committed. Requires --enable-recurrent-extra-buffer "
+            "and must be a positive multiple of --page-size. Defaults to "
+            "--chunked-prefill-size when extra-buffer is enabled (falls back to "
+            "--page-size if chunked prefill is off).",
+        )
+        parser.add_argument(
             "--disable-hybrid-swa-memory",
             action="store_true",
             help="Disable the hybrid SWA memory.",
@@ -1046,6 +1142,13 @@ class ServerArgs:
             help="Route non-hybrid (full-attention) models to UnifiedRadixCache "
             "(component-agnostic prefix cache). Default off. Also required to route "
             "hybrid recurrent models (e.g. Kimi-Linear) into UnifiedRadixCache.",
+        )
+        parser.add_argument(
+            "--enable-recurrent-extra-buffer",
+            action="store_true",
+            help="Recurrent radix cache: use the page-aligned ping-pong track "
+            "buffer for page_size>=128. Off by default; the base path supports "
+            "page_size=1 only.",
         )
         parser.add_argument(
             "--allow-auto-truncate",
