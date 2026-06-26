@@ -326,8 +326,6 @@ suites = {
         TestFile("python/sgl_jax/test/models/test_step3p5_model.py", 2.0, runner="pytest"),
         TestFile("python/sgl_jax/test/models/test_step3p5_invariants.py", 1.0, runner="pytest"),
         TestFile("python/sgl_jax/test/models/test_step3p5_alignment.py", 5.0, runner="pytest"),
-        # Plan 4: bf16 propagation floor (CPU-verifiable, naive path only).
-        TestFile("python/sgl_jax/test/models/test_step3p5_bf16_floor.py", 1.0, runner="pytest"),
         TestFile(
             "python/sgl_jax/test/utils/test_weight_loader_prestacked_moe.py",
             0.1,

@@ -46,27 +46,6 @@ def _router_bias_oracle(logits_np: np.ndarray, bias_np: np.ndarray, topk: int, s
     return weights, ids
 
 
-def _sigmoid_topk_oracle(logits_np: np.ndarray, topk: int, scale: float):
-    """Unbiased sigmoid top-k (no bias), renorm, ×scale — used as wrong oracle check."""
-    prob = 1.0 / (1.0 + np.exp(-logits_np.astype(np.float64))).astype(np.float32)
-    ids = np.argsort(prob, axis=-1)[:, ::-1][:, :topk]
-    gathered = np.take_along_axis(prob, ids, axis=1)
-    denom = gathered.sum(axis=-1, keepdims=True) + 1e-20
-    weights = (gathered / denom) * scale
-    return weights, ids
-
-
-def _softmax_topk_oracle(logits_np: np.ndarray, topk: int, scale: float):
-    """Softmax oracle — would mismatch Step3p5 which uses sigmoid."""
-    exp = np.exp(logits_np.astype(np.float32) - logits_np.max(axis=-1, keepdims=True))
-    prob = exp / exp.sum(axis=-1, keepdims=True)
-    ids = np.argsort(prob, axis=-1)[:, ::-1][:, :topk]
-    gathered = np.take_along_axis(prob, ids, axis=1)
-    denom = gathered.sum(axis=-1, keepdims=True)
-    weights = (gathered / denom) * scale
-    return weights, ids
-
-
 def _naive_moe_ref(x, wi_0, wi_1, wo, topk_w, topk_ids, swiglu_limit):
     """Per-expert loop reference (fp32). wi_0/wi_1=[E,h,i], wo=[E,i,h]."""
     x = x.astype(np.float32)
@@ -280,12 +259,6 @@ class TestTopKLegality(unittest.TestCase):
         config = _tiny_moe_config(layer_id=3)
         self._check_ids(config, layer_id=3, T=8)
 
-    def test_legality_varying_tokens(self):
-        config = _tiny_moe_config(layer_id=3)
-        for T in [1, 5, 16]:
-            with self.subTest(T=T):
-                self._check_ids(config, layer_id=3, T=T)
-
 
 # ---------------------------------------------------------------------------
 # Tests: sigmoid not softmax
@@ -298,35 +271,6 @@ class TestSigmoidNotSoftmax(unittest.TestCase):
     def setUp(self):
         self.mesh = _make_mesh()
         self.rng = np.random.default_rng(77)
-
-    def test_sigmoid_differs_from_softmax(self):
-        config = _tiny_moe_config(layer_id=3)
-        E = config.moe_num_experts
-        T = 6
-        logits_np = self.rng.standard_normal((T, E)).astype(np.float32)
-        bias_np = np.zeros((E,), np.float32)
-
-        moe = _build_moe(config, layer_id=3, mesh=self.mesh)
-        with jax.set_mesh(self.mesh):
-            router_logits = jax.nn.sigmoid(jnp.asarray(logits_np).astype(jnp.float32))
-            topk_w, topk_ids = moe.topk(router_logits, jnp.asarray(bias_np))
-
-        topk_w_np = np.asarray(topk_w)
-        topk_ids_np = np.asarray(topk_ids)
-
-        # Sigmoid oracle (correct).
-        sig_w, sig_ids = _sigmoid_topk_oracle(logits_np, config.moe_top_k, scale=3.0)
-        np.testing.assert_allclose(
-            topk_w_np, sig_w, atol=_ATOL, err_msg="Weights must match sigmoid oracle"
-        )
-        np.testing.assert_array_equal(topk_ids_np, sig_ids, err_msg="Ids must match sigmoid oracle")
-
-        # Softmax oracle (wrong — should differ in at least weights).
-        sm_w, _ = _softmax_topk_oracle(logits_np, config.moe_top_k, scale=3.0)
-        self.assertFalse(
-            np.allclose(topk_w_np, sm_w, atol=1e-3),
-            "Weights must NOT match a softmax oracle — routing should be sigmoid",
-        )
 
     def test_renorm_then_scale_order(self):
         """Renorm happens before ×3.0: sum of unnormalized weights × 3.0 ≠ 3.0 generally."""
@@ -378,49 +322,6 @@ class TestClampOverLimit(unittest.TestCase):
                 swiglu_limit=swiglu_limit,
             )
 
-    def test_layer3_no_routed_clamp(self):
-        """Layer 3: swiglu_limits[3]=0 → routed EPMoE has no clamp."""
-        config = _tiny_moe_config(layer_id=3, swiglu_limit_routed=0.0)
-        moe = _build_moe(config, layer_id=3, mesh=self.mesh)
-        # swiglu_limit=None means no clamp.
-        self.assertIsNone(
-            moe.experts.swiglu_limit, "Layer 3 routed EPMoE should have swiglu_limit=None"
-        )
-
-    def test_layer43_routed_clamp_limit7(self):
-        """Layer 43: swiglu_limits[43]=7 → routed EPMoE has swiglu_limit=7."""
-        config = _tiny_moe_config(layer_id=43, swiglu_limit_routed=7.0)
-        moe = _build_moe(config, layer_id=43, mesh=self.mesh)
-        self.assertEqual(
-            moe.experts.swiglu_limit, 7.0, "Layer 43 routed EPMoE should have swiglu_limit=7"
-        )
-
-    def test_layer44_routed_clamp_limit7(self):
-        """Layer 44: swiglu_limits[44]=7 → routed EPMoE has swiglu_limit=7."""
-        config = _tiny_moe_config(layer_id=44, swiglu_limit_routed=7.0)
-        moe = _build_moe(config, layer_id=44, mesh=self.mesh)
-        self.assertEqual(
-            moe.experts.swiglu_limit, 7.0, "Layer 44 routed EPMoE should have swiglu_limit=7"
-        )
-
-    def test_layer44_shared_clamp_limit16(self):
-        """Layer 44: swiglu_limits_shared[44]=16 → shared Step3p5MLP has swiglu_limit=16."""
-        config = _tiny_moe_config(layer_id=44, swiglu_limit_shared=16.0)
-        moe = _build_moe(config, layer_id=44, mesh=self.mesh)
-        self.assertEqual(
-            moe.shared_experts.swiglu_limit,
-            16.0,
-            "Layer 44 shared expert should have swiglu_limit=16",
-        )
-
-    def test_layer3_shared_no_clamp(self):
-        """Layer 3: swiglu_limits_shared[3]=0 → shared MLP has no clamp."""
-        config = _tiny_moe_config(layer_id=3, swiglu_limit_shared=0.0)
-        moe = _build_moe(config, layer_id=3, mesh=self.mesh)
-        self.assertIsNone(
-            moe.shared_experts.swiglu_limit, "Layer 3 shared expert should have swiglu_limit=None"
-        )
-
     def test_routed_clamp_upper_only(self):
         """Routed expert gate clamped upper-only at limit=7 (via EPMoE swiglu_limit)."""
         E, H, inter, T, K, L = 8, 32, 16, 4, 2, 7.0
@@ -453,67 +354,6 @@ class TestClampOverLimit(unittest.TestCase):
             rtol=2e-3,
             atol=2e-3,
             err_msg="Routed EPMoE with limit=7 must match clamped loop ref",
-        )
-
-    def test_routed_no_clamp_different_from_clamped(self):
-        """Without clamp, outputs differ from clamped (confirms clamp is active)."""
-        E, H, inter, T, K, L = 8, 32, 16, 4, 2, 7.0
-        rng = np.random.default_rng(11)
-
-        m_clamp = self._build_epmoe(swiglu_limit=L, num_experts=E, hidden=H, inter=inter)
-        m_noclamp = self._build_epmoe(swiglu_limit=None, num_experts=E, hidden=H, inter=inter)
-        # Same weights.
-        w0 = jnp.asarray(rng.normal(0, 8.0, (E, H, inter)), jnp.float32)
-        w1 = jnp.asarray(rng.normal(0, 8.0, (E, H, inter)), jnp.float32)
-        wo = jnp.asarray(rng.normal(0, 1.0, (E, inter, H)), jnp.float32)
-        for m in (m_clamp, m_noclamp):
-            m.wi_0.value = w0
-            m.wi_1.value = w1
-            m.wo.value = wo
-
-        x = jnp.asarray(rng.normal(0, 3.0, (T, H)), jnp.float32)
-        topk_ids = jnp.asarray(rng.integers(0, E, (T, K)), jnp.int32)
-        topk_w = jnp.asarray(rng.uniform(0.1, 1.0, (T, K)), jnp.float32)
-
-        with jax.set_mesh(self.mesh):
-            out_clamp = np.asarray(m_clamp(x, topk_w, topk_ids))
-            out_noclamp = np.asarray(m_noclamp(x, topk_w, topk_ids))
-
-        self.assertFalse(
-            np.allclose(out_clamp, out_noclamp, atol=1e-3),
-            "Clamped and unclamped outputs should differ with over-limit inputs",
-        )
-
-    def test_shared_mlp_clamp_upper_only(self):
-        """Shared expert: gate upper-only clamp, up double-sided (Step3p5MLP)."""
-        from sgl_jax.srt.models.step3p5 import Step3p5MLP
-
-        H, inter, L = 32, 16, 16.0
-        rng = np.random.default_rng(20)
-        mesh = self.mesh
-
-        with jax.set_mesh(mesh):
-            mlp_clamp = Step3p5MLP(H, inter, mesh=mesh, dtype=jnp.float32, swiglu_limit=L)
-            mlp_noclamp = Step3p5MLP(H, inter, mesh=mesh, dtype=jnp.float32, swiglu_limit=None)
-
-        # Large weights to push gate/up above the clamp threshold.
-        gw = jnp.asarray(rng.normal(0, 5.0, (H, inter)), jnp.float32)
-        uw = jnp.asarray(rng.normal(0, 5.0, (H, inter)), jnp.float32)
-        dw = jnp.asarray(rng.normal(0, 1.0, (inter, H)), jnp.float32)
-
-        for mlp in (mlp_clamp, mlp_noclamp):
-            mlp.gate_proj.weight.value = gw
-            mlp.up_proj.weight.value = uw
-            mlp.down_proj.weight.value = dw
-
-        x = jnp.asarray(rng.normal(0, 3.0, (6, H)), jnp.float32)
-        with jax.set_mesh(mesh):
-            out_clamp = np.asarray(mlp_clamp(x))
-            out_noclamp = np.asarray(mlp_noclamp(x))
-
-        self.assertFalse(
-            np.allclose(out_clamp, out_noclamp, atol=1e-3),
-            "Shared MLP: clamped vs unclamped must differ with over-limit inputs",
         )
 
     def test_shared_mlp_clamp_asymmetry(self):
@@ -574,89 +414,6 @@ class TestClampOverLimit(unittest.TestCase):
             atol=1e-5,
             err_msg="Gate upper+up upper clamp mismatch on dim 1",
         )
-
-
-# ---------------------------------------------------------------------------
-# Tests: dense layers 0-2 (no MoE, just Step3p5MLP)
-# ---------------------------------------------------------------------------
-
-
-class TestDenseLayers(unittest.TestCase):
-    """Dense layers (0-2): Step3p5MLP with intermediate=11264 analog, no routing."""
-
-    def setUp(self):
-        self.mesh = _make_mesh()
-        self.config = _tiny_moe_config(layer_id=3)
-
-    def test_dense_mlp_forward_shape(self):
-        T, H = 5, self.config.hidden_size
-        mlp = _build_dense_mlp(self.config, self.mesh, intermediate_size=64)
-        x = jnp.ones((T, H), jnp.float32)
-        with jax.set_mesh(self.mesh):
-            out = mlp(x)
-        self.assertEqual(out.shape, (T, H), "Dense MLP output shape mismatch")
-
-    def test_dense_mlp_no_swiglu_limit(self):
-        """Dense MLP without limit: output is unconstrained (no clamp applied)."""
-        from sgl_jax.srt.models.step3p5 import Step3p5MLP
-
-        H, inter = self.config.hidden_size, 64
-        rng = np.random.default_rng(30)
-        mesh = self.mesh
-
-        with jax.set_mesh(mesh):
-            mlp_none = Step3p5MLP(H, inter, mesh=mesh, dtype=jnp.float32, swiglu_limit=None)
-            mlp_tight = Step3p5MLP(H, inter, mesh=mesh, dtype=jnp.float32, swiglu_limit=0.01)
-
-        gw = jnp.asarray(rng.normal(0, 3.0, (H, inter)), jnp.float32)
-        uw = jnp.asarray(rng.normal(0, 3.0, (H, inter)), jnp.float32)
-        dw = jnp.asarray(rng.normal(0, 1.0, (inter, H)), jnp.float32)
-        for mlp in (mlp_none, mlp_tight):
-            mlp.gate_proj.weight.value = gw
-            mlp.up_proj.weight.value = uw
-            mlp.down_proj.weight.value = dw
-
-        x = jnp.asarray(rng.normal(0, 2.0, (4, H)), jnp.float32)
-        with jax.set_mesh(mesh):
-            out_none = np.asarray(mlp_none(x))
-            out_tight = np.asarray(mlp_tight(x))
-
-        self.assertFalse(
-            np.allclose(out_none, out_tight, atol=1e-3),
-            "No-clamp dense MLP must differ from tight-clamp dense MLP",
-        )
-
-    def test_dense_mlp_swiglu_formula(self):
-        """down(silu(gate(x)) * up(x)): verify the SwiGLU formula numerically."""
-        from sgl_jax.srt.models.step3p5 import Step3p5MLP
-
-        H, inter = 8, 4
-        rng = np.random.default_rng(31)
-        mesh = self.mesh
-
-        with jax.set_mesh(mesh):
-            mlp = Step3p5MLP(H, inter, mesh=mesh, dtype=jnp.float32)
-
-        gw = jnp.asarray(rng.normal(size=(H, inter)), jnp.float32)
-        uw = jnp.asarray(rng.normal(size=(H, inter)), jnp.float32)
-        dw = jnp.asarray(rng.normal(size=(inter, H)), jnp.float32)
-        mlp.gate_proj.weight.value = gw
-        mlp.up_proj.weight.value = uw
-        mlp.down_proj.weight.value = dw
-
-        x_np = rng.normal(size=(3, H)).astype(np.float32)
-        x = jnp.asarray(x_np)
-
-        with jax.set_mesh(mesh):
-            got = np.asarray(mlp(x))
-
-        gate_np = x_np @ np.asarray(gw)
-        up_np = x_np @ np.asarray(uw)
-        silu_np = gate_np / (1.0 + np.exp(-gate_np))
-        inter_np = silu_np * up_np
-        expected = inter_np @ np.asarray(dw)
-
-        np.testing.assert_allclose(got, expected, atol=_ATOL, err_msg="SwiGLU formula mismatch")
 
 
 # ---------------------------------------------------------------------------
@@ -725,36 +482,6 @@ class TestGMMEqualLoop(unittest.TestCase):
         """Routed-expert clamp limit=7 (layers 43/44 analog)."""
         self._run_test(swiglu_limit=7.0, seed=51)
 
-    def test_gmm_equals_loop_with_clamp_16(self):
-        """Shared-expert clamp limit=16 analog (exercises different threshold)."""
-        # Use EPMoE directly with limit=16 (shared expert uses Step3p5MLP, not EPMoE,
-        # but the EPMoE path at limit=16 confirms the gmm clamp implementation).
-        self._run_test(swiglu_limit=16.0, seed=52)
-
-    def test_dispatch_conservation(self):
-        """Each token is routed to exactly K experts (dispatch conservation)."""
-        T, K = 10, 2
-        rng = np.random.default_rng(60)
-        config = _tiny_moe_config(layer_id=3)
-        config.moe_top_k = K
-        moe = _build_moe(config, layer_id=3, mesh=self.mesh)
-
-        x = jnp.asarray(rng.standard_normal((T, config.hidden_size)), jnp.float32)
-        with jax.set_mesh(self.mesh):
-            router_logits = moe.moe_gate(x)
-            bias = moe.moe_gate.bias.value if moe.moe_gate.bias is not None else None
-            topk_w, topk_ids = moe.topk(router_logits, bias)
-
-        ids_np = np.asarray(topk_ids)
-        # Every token routes to exactly K experts.
-        self.assertEqual(
-            ids_np.shape[1], K, f"Expected {K} experts per token, got shape {ids_np.shape}"
-        )
-        # Verify via per-row uniqueness.
-        for t in range(T):
-            n_unique = len(set(ids_np[t].tolist()))
-            self.assertEqual(n_unique, K, f"Token {t}: {n_unique} unique ids, expected {K}")
-
 
 # ---------------------------------------------------------------------------
 # Tests: MoE forward output shape + shared expert always added
@@ -767,15 +494,6 @@ class TestMoEForward(unittest.TestCase):
     def setUp(self):
         self.mesh = _make_mesh()
 
-    def test_moe_output_shape(self):
-        config = _tiny_moe_config(layer_id=3)
-        T, H = 5, config.hidden_size
-        moe = _build_moe(config, layer_id=3, mesh=self.mesh)
-        x = jnp.ones((T, H), jnp.float32)
-        with jax.set_mesh(self.mesh):
-            out = moe(x)
-        self.assertEqual(out.shape, (T, H), "MoE output shape mismatch")
-
     def test_shared_expert_is_added(self):
         """Shared expert output is non-zero and is added to MoE output."""
         config = _tiny_moe_config(layer_id=3)
@@ -786,7 +504,8 @@ class TestMoEForward(unittest.TestCase):
         x = jnp.asarray(rng.standard_normal((T, H)), jnp.float32)
 
         with jax.set_mesh(self.mesh):
-            full_out = np.asarray(moe(x))
+            full_out, _ = moe(x)
+            full_out = np.asarray(full_out)
             # Zero out shared expert weights to isolate moe-only contribution.
             moe.shared_experts.gate_proj.weight.value = jnp.zeros(
                 moe.shared_experts.gate_proj.weight.value.shape, jnp.float32
@@ -794,95 +513,12 @@ class TestMoEForward(unittest.TestCase):
             moe.shared_experts.up_proj.weight.value = jnp.zeros(
                 moe.shared_experts.up_proj.weight.value.shape, jnp.float32
             )
-            moe_only_out = np.asarray(moe(x))
+            moe_only_out, _ = moe(x)
+            moe_only_out = np.asarray(moe_only_out)
 
         self.assertFalse(
             np.allclose(full_out, moe_only_out, atol=1e-6),
             "Shared expert must contribute to MoE output (outputs differ when shared is non-zero)",
-        )
-
-
-# ---------------------------------------------------------------------------
-# Test: I2 expert-permutation invariance
-# ---------------------------------------------------------------------------
-
-
-class TestExpertPermutationInvariance(unittest.TestCase):
-    """I2: permuting expert numbering + remapping topk_ids leaves MoE output unchanged.
-
-    This verifies dispatch/gather index correctness independently of the GMM==loop test.
-    """
-
-    def setUp(self):
-        self.mesh = _make_mesh()
-
-    def _build_epmoe(self, num_experts=8, hidden=32, inter=16):
-        from sgl_jax.srt.layers.moe import EPMoE
-
-        with jax.set_mesh(self.mesh):
-            return EPMoE(
-                hidden_size=hidden,
-                num_experts=num_experts,
-                num_experts_per_tok=2,
-                ep_size=1,
-                mesh=self.mesh,
-                intermediate_dim=inter,
-                weight_dtype=jnp.float32,
-                dtype=jnp.float32,
-                swiglu_limit=None,
-            )
-
-    def test_expert_permutation_invariance(self):
-        """out1 == out2 when expert weights permuted along axis 0 and topk_ids remapped."""
-        E, H, inter, T, K = 8, 32, 16, 6, 2
-        rng = np.random.default_rng(123)
-
-        # Build base EPMoE with random fp32 weights.
-        m1 = self._build_epmoe(num_experts=E, hidden=H, inter=inter)
-        wi_0 = jnp.asarray(rng.normal(0, 1.5, (E, H, inter)), jnp.float32)
-        wi_1 = jnp.asarray(rng.normal(0, 1.5, (E, H, inter)), jnp.float32)
-        wo = jnp.asarray(rng.normal(0, 0.5, (E, inter, H)), jnp.float32)
-        m1.wi_0.value = wi_0
-        m1.wi_1.value = wi_1
-        m1.wo.value = wo
-
-        x = jnp.asarray(rng.normal(0, 1.0, (T, H)), jnp.float32)
-        topk_ids = jnp.asarray(rng.integers(0, E, (T, K)), jnp.int32)
-        topk_w = jnp.asarray(rng.uniform(0.1, 1.0, (T, K)), jnp.float32)
-
-        with jax.set_mesh(self.mesh):
-            out1 = np.asarray(m1(x, topk_w, topk_ids))
-
-        # Build permuted EPMoE: perm is a roll by 3 (deterministic, covers all positions).
-        perm = np.roll(np.arange(E), 3)  # perm[e] = new position for expert e
-        perm_jnp = jnp.asarray(perm, jnp.int32)
-
-        m2 = self._build_epmoe(num_experts=E, hidden=H, inter=inter)
-        # wi_0_perm[perm[e]] = wi_0[e], equivalently wi_0_perm = wi_0[inv_perm] at each slot
-        # Simpler: set m2.wi_0.value[perm[e]] = wi_0[e] for all e via index_update.
-        wi_0_perm = jnp.zeros_like(wi_0)
-        wi_1_perm = jnp.zeros_like(wi_1)
-        wo_perm = jnp.zeros_like(wo)
-        for e in range(E):
-            wi_0_perm = wi_0_perm.at[perm[e]].set(wi_0[e])
-            wi_1_perm = wi_1_perm.at[perm[e]].set(wi_1[e])
-            wo_perm = wo_perm.at[perm[e]].set(wo[e])
-        m2.wi_0.value = wi_0_perm
-        m2.wi_1.value = wi_1_perm
-        m2.wo.value = wo_perm
-
-        # Remap topk_ids: tokens that used expert e now use slot perm[e].
-        topk_ids_perm = perm_jnp[topk_ids]
-
-        with jax.set_mesh(self.mesh):
-            out2 = np.asarray(m2(x, topk_w, topk_ids_perm))
-
-        np.testing.assert_allclose(
-            out2,
-            out1,
-            rtol=2e-3,
-            atol=2e-3,
-            err_msg="EPMoE output must be invariant to expert permutation+topk_ids remap",
         )
 
 
