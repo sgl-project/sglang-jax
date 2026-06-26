@@ -383,8 +383,8 @@ jobs:
         # Run from repo root (unlike the sibling daily jobs' `cd test/srt`) so the
         # suite's test/srt-prefixed path also resolves under rerun-test.yml (/rerun-group).
         # ~8-min test + 2x Qwen3.5-35B-A3B load & compile; load dominates and is bimodal
-        # (warm ~29s vs cold gcsfuse ~14-40min each), so keep timeout margin.
-        timeout-minutes: 90
+        # (warm ~29s vs cold gcsfuse ~14-40min each) → ~88min worst, so 120 for margin.
+        timeout-minutes: 120
         run: |
           python3 test/srt/run_suite.py --suite nightly-recurrent-e2e-tpu-v6e-4
 
@@ -472,10 +472,11 @@ jobs:
       - name: Setup Python environment
         uses: ./.github/actions/setup-venv
       - name: Run recurrent accuracy gate (v6e-4, tp4/dp2, cache on)
-        # AccuracyCase framework (profile + run_accuracy_case), like the other
-        # accuracy gates. 35B load (bimodal warm ~29s vs cold gcsfuse ~14-40min) +
-        # 200-ex gsm8k (~5min) -> 90min keeps margin for a cold load.
-        timeout-minutes: 90
+        # AccuracyCase framework: gsm8k gate (dp2/8192) + mmlu-thinking REPORT
+        # (dp2/ep4/32768) = TWO sequential 35B servers. Each cold gcsfuse load is
+        # bimodal (~29s warm vs ~14-40min cold), so 2 loads + the evals (~10min)
+        # -> 150min covers two worst-case cold loads.
+        timeout-minutes: 150
         env:
           # /run-nightly passes a single case name here; empty runs the whole suite.
           CASES: ${{ inputs.cases }}

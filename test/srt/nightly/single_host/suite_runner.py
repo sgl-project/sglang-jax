@@ -426,8 +426,8 @@ SUITES: dict[str, SingleHostSuite] = {
         ],
     ),
     # Recurrent-cache accuracy gate (Next Work item 4): Qwen3.5-35B-A3B tp4/dp2 with
-    # the recurrent radix cache ON, gsm8k greedy non-thinking → score >= 0.90
-    # (~0.965 measured). Goes through the AccuracyCase framework (profile +
+    # the recurrent radix cache ON, gsm8k greedy non-thinking → score >= 0.95
+    # (0.97 measured, 3-repeat spread 0.000 → min-0.02). Goes through the AccuracyCase framework (profile +
     # run_accuracy_case) like accuracy-text-models-v6e-4; the e2e determinism test
     # stays a unittest in run_suite.py (it's a 2-run byte-identical comparison).
     "recurrent-accuracy-v6e-4": SingleHostSuite(
@@ -441,15 +441,49 @@ SUITES: dict[str, SingleHostSuite] = {
                         dataset="gsm8k",
                         model_id="Qwen/Qwen3.5-35B-A3B",
                         eval_batch_size=16,
-                        # Non-thinking + max_tokens 1024 so answers fit the bounded
-                        # (8192) context at dp2; greedy → deterministic gate.
+                        # Non-thinking + max_tokens 2048 (repo GSM8K convention) so
+                        # answers fit the bounded (8192) context at dp2; greedy →
+                        # deterministic gate.
                         generation_config={
                             "temperature": 0.0,
-                            "max_tokens": 1024,
+                            "max_tokens": 2048,
                             "chat_template_kwargs": {"enable_thinking": False},
                         },
                         limit=200,
-                        score_threshold=0.90,
+                        score_threshold=0.95,
+                    ),
+                ],
+            ),
+            # MMLU (thinking) gate: cache-on serving accuracy on a harder benchmark
+            # at dp2/ep4/context-32768 (ep4 fits the 32k thinking CoT that dp2/8192
+            # can't). Official Qwen3.5 Thinking/general sampling (temp 1.0). Calibrated
+            # over 6 seeds @ limit 200: 0.90-0.93, mean 0.914, sigma 0.011 →
+            # threshold 0.88 = min(min-0.02, mean-3sigma). seed pinned to a calibrated
+            # point for reproducibility (threshold has margin over all 6).
+            SingleHostRun(
+                launch_profile="recurrent-qwen35-mmlu-v6e-4.yaml",
+                cases=[
+                    AccuracyCase(
+                        name="recurrent-mmlu-thinking",
+                        dataset="mmlu",
+                        model_id="Qwen/Qwen3.5-35B-A3B",
+                        eval_batch_size=16,
+                        generation_config={
+                            "temperature": 1.0,
+                            "top_p": 0.95,
+                            "top_k": 20,
+                            "min_p": 0.0,
+                            "presence_penalty": 1.5,
+                            "repetition_penalty": 1.0,
+                            "seed": 11,
+                            # < context (32768): max_tokens is the completion cap and
+                            # input+completion must fit the context, so it can't equal
+                            # it. 16384 is ample for mmlu thinking CoT.
+                            "max_tokens": 16384,
+                            "chat_template_kwargs": {"enable_thinking": True},
+                        },
+                        limit=200,
+                        score_threshold=0.88,
                     ),
                 ],
             ),
