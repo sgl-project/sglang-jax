@@ -514,6 +514,12 @@ class Glm5MLP(nnx.Module):
     def post_load_weights(self):
         if not self.use_fused:
             return
+        if not hasattr(self.gate_proj, "weight"):
+            # static fp8 checkpoint: gate_proj is already QuantizedLinear
+            # (weight_q/weight_scale), fused-merge path from #1344 only
+            # handles bf16 LinearBase. Fall back to unfused (forward checks
+            # hasattr(self, "w_gu")).
+            return
 
         wg = self.gate_proj.weight.value
         wu = self.up_proj.weight.value
