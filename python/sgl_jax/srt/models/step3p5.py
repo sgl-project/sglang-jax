@@ -604,8 +604,11 @@ class Step3p5Model(nnx.Module):
             )
             layers_kv_fused.append(kv_fused)
             layers_callback_flags.extend(cb_flags)
-            if topk_ids is not None:
-                layers_topk_ids.append(topk_ids)
+            # Append every layer (None for dense) so the list index == real layer
+            # index: the routed-experts capturer enumerates this list and writes
+            # host_buffer[layer_idx], allocated for all num_hidden_layers. Dropping
+            # dense layers here would shift every MoE layer's index (mirror qwen3_moe).
+            layers_topk_ids.append(topk_ids)
 
         if residual is not None:
             hidden_states = hidden_states + residual
