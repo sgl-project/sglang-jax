@@ -343,7 +343,7 @@ def _run_prefill_all_positions(model, mesh, kv_pool, token_ids):
 
     with jax.set_mesh(mesh):
         # Run backbone only to get all T hidden states.
-        hidden, layers_kv_fused, _ = model.model(fb, kv_pool)
+        hidden, layers_kv_fused, _, _ = model.model(fb, kv_pool)
         # Apply final norm then lm_head at every position.
         logits = model.logits_processor._get_logits(hidden, model.lm_head)
     # KV writes are functional in JAX (the kernel returns the updated fused buffer

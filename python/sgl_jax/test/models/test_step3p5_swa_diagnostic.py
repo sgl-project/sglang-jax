@@ -203,13 +203,13 @@ class TestSWADiagnostic(unittest.TestCase):
         hidden = jnp.asarray(rng.standard_normal((_NUM_TOKENS, self._cfg.hidden_size)), jnp.float32)
         pos = jnp.arange(_NUM_TOKENS, dtype=jnp.int32)
         with jax.set_mesh(self._mesh):
-            nh, _, _, _ = nm.model.layers[1](
+            nh, _, _, _, _ = nm.model.layers[1](
                 pos, hidden, _make_forward_batch(_NUM_TOKENS), None, None
             )
             kv = _make_kv_pool(self._cfg, self._mesh, jnp.float32, _NUM_TOKENS)
             fb = _make_forward_batch(_NUM_TOKENS)
             _attach_flash_backend(fb, self._cfg, self._mesh, kv.page_size)
-            fh, _, _, _ = fm.model.layers[1](pos, hidden, fb, kv, None)
+            fh, _, _, _, _ = fm.model.layers[1](pos, hidden, fb, kv, None)
         n_bad, _ = _per_position_report(
             "layer1 full DecoderLayer (dense)", np.asarray(fh), np.asarray(nh)
         )
@@ -234,12 +234,12 @@ class TestSWADiagnostic(unittest.TestCase):
             recs = []  # (topk_ids, gate_probs) per MoE layer, in forward order
             orig = m.Step3p5MoE.__call__
 
-            def patched(moe_self, hidden):
+            def patched(moe_self, hidden, dispatch_info=None):
                 rl = moe_self.moe_gate(hidden)
                 cb = moe_self.moe_gate.bias.value if moe_self.moe_gate.bias is not None else None
                 tw, tid = moe_self.topk(rl, cb)
                 recs.append((np.asarray(tid), np.asarray(rl)))
-                return orig(moe_self, hidden)
+                return orig(moe_self, hidden, dispatch_info)
 
             m.Step3p5MoE.__call__ = patched
             try:

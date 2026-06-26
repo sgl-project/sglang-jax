@@ -426,13 +426,15 @@ class Step3p5MoE(nnx.Module):
             swiglu_limit=swiglu_limit_shared,
         )
 
-    def __call__(self, hidden_states: jax.Array) -> jax.Array:
+    def __call__(self, hidden_states: jax.Array, dispatch_info=None):
         router_logits = self.moe_gate(hidden_states)
         correction_bias = self.moe_gate.bias.value if self.moe_gate.bias is not None else None
-        topk_weights, topk_ids = self.topk(router_logits, correction_bias)
+        topk_weights, topk_ids = self.topk(
+            router_logits, correction_bias, dispatch_info=dispatch_info
+        )
         moe_out = self.experts(hidden_states, topk_weights, topk_ids)
         shared_out = self.shared_experts(hidden_states)
-        return moe_out + shared_out
+        return moe_out + shared_out, topk_ids
 
 
 class Step3p5DecoderLayer(nnx.Module):
@@ -498,7 +500,7 @@ class Step3p5DecoderLayer(nnx.Module):
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
         residual: jax.Array | None = None,
-    ) -> tuple[jax.Array, jax.Array, jax.Array, list]:
+    ) -> tuple[jax.Array, jax.Array, jax.Array, list, jax.Array | None]:
         # Pre-norm fused residual (deepseek/M2 pattern).
         if residual is None:
             residual = hidden_states
@@ -524,13 +526,24 @@ class Step3p5DecoderLayer(nnx.Module):
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
 
-        hidden_states = self.mlp(hidden_states)
+        # Dense layers (0-2) return only the hidden state; MoE layers also return
+        # the per-token routed expert ids so the engine can capture them
+        # (return_routed_experts) and apply EPLB logical->physical remap.
+        if isinstance(self.mlp, Step3p5MoE):
+            hidden_states, topk_ids = self.mlp(
+                hidden_states, dispatch_info=forward_batch.expert_location_metadata
+            )
+            # Replicate so the capturer can host-read across multi-host shardings.
+            topk_ids = jax.sharding.reshard(topk_ids, P(None))
+        else:
+            hidden_states = self.mlp(hidden_states)
+            topk_ids = None
 
         mlp_flag = precision_tracer.jit_pure_callback_record(
             hidden_states, "mlp_output", "MLP", self.layer_id
         )
 
-        return hidden_states, residual, kv_fused, [ln_flag, attn_flag, mlp_flag]
+        return hidden_states, residual, kv_fused, [ln_flag, attn_flag, mlp_flag], topk_ids
 
 
 class Step3p5Model(nnx.Module):
@@ -574,14 +587,15 @@ class Step3p5Model(nnx.Module):
         self,
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
-    ) -> tuple[jax.Array, list, list]:
+    ) -> tuple[jax.Array, list, list, list]:
         hidden_states = self.embed_tokens(forward_batch.input_ids)
         residual = None
         layers_kv_fused: list = []
         layers_callback_flags: list = []
+        layers_topk_ids: list = []
 
         for layer in self.layers:
-            hidden_states, residual, kv_fused, cb_flags = layer(
+            hidden_states, residual, kv_fused, cb_flags, topk_ids = layer(
                 forward_batch.positions,
                 hidden_states,
                 forward_batch,
@@ -590,6 +604,8 @@ class Step3p5Model(nnx.Module):
             )
             layers_kv_fused.append(kv_fused)
             layers_callback_flags.extend(cb_flags)
+            if topk_ids is not None:
+                layers_topk_ids.append(topk_ids)
 
         if residual is not None:
             hidden_states = hidden_states + residual
@@ -601,7 +617,7 @@ class Step3p5Model(nnx.Module):
         )
         layers_callback_flags.append(xfmr_flag)
 
-        return hidden_states, layers_kv_fused, layers_callback_flags
+        return hidden_states, layers_kv_fused, layers_callback_flags, layers_topk_ids
 
 
 class Step3p5ForCausalLM(nnx.Module):
@@ -644,9 +660,11 @@ class Step3p5ForCausalLM(nnx.Module):
         logits_metadata: LogitsMetadata,
     ):
         kv_pool = memory_pools.token_to_kv_pool
-        hidden_states, layers_kv_fused, layers_callback_flags = self.model(forward_batch, kv_pool)
+        hidden_states, layers_kv_fused, layers_callback_flags, layers_topk_ids = self.model(
+            forward_batch, kv_pool
+        )
         output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
-        return output, {"token_to_kv_pool": layers_kv_fused}, True, None
+        return output, {"token_to_kv_pool": layers_kv_fused}, True, layers_topk_ids
 
     def load_weights(self, model_config: ModelConfig) -> None:
         loader = WeightLoader(
