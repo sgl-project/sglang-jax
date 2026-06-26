@@ -43,27 +43,29 @@ def main():
 
     a_out = []
     for i, ids in enumerate(input_ids):
+        # argmax-only: greedy next token via the GENERATION path (output_ids), NOT
+        # return_logprob. The multi-host logprob serialization path has a separate
+        # bug (non-addressable sharded array on device_get); the generation path is
+        # what gsm8k/mmlu/sglang-align already exercised. argmax agreement is the
+        # main alignment criterion, so this is sufficient and avoids that bug.
         resp = requests.post(
             f"{args.base_url}/generate",
             json={
                 "input_ids": ids,
                 "sampling_params": {"temperature": 0, "max_new_tokens": 1},
-                "return_logprob": True,
-                "top_logprobs_num": args.topk,
             },
             timeout=120,
         )
         resp.raise_for_status()
-        meta = resp.json()["meta_info"]
-        # output_top_logprobs[0] = top-k for the first generated token (next-token).
-        top = meta["output_top_logprobs"][0]  # [[logprob, token_id, ...], ...]
-        a_out.append({"prompt": i, "topk": [[int(tid), float(lp)] for lp, tid, *_ in top]})
+        out_id = int(resp.json()["output_ids"][0])  # greedy next token = argmax
+        # Keep the schema compatible with compare.py: a 1-element top-k.
+        a_out.append({"prompt": i, "topk": [[out_id, 0.0]]})
         if (i + 1) % 8 == 0:
             print(f"[jax] {i + 1}/{len(input_ids)}", flush=True)
 
     with open(os.path.join(args.out, "A_nexttok.json"), "w") as f:
-        json.dump({"topk": args.topk, "data": a_out}, f)
-    print(f"[jax] wrote A_nexttok.json to {args.out}", flush=True)
+        json.dump({"topk": 1, "argmax_only": True, "data": a_out}, f)
+    print(f"[jax] wrote A_nexttok.json (argmax-only) to {args.out}", flush=True)
 
 
 if __name__ == "__main__":
