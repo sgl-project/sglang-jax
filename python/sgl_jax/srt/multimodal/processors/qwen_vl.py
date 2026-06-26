@@ -22,12 +22,16 @@ class QwenVLProcessor(BaseMultimodalProcessor):
         request_obj,
         **kwargs,
     ):
+        if isinstance(input_text, list):
+            # TODO: support multimodal input_ids without decode + retokenize drift.
+            raise ValueError(
+                "Multimodal input_ids are not supported for Qwen-VL. "
+                "Please provide text input instead."
+            )
+
         images = [self.load_image(item) for item in self.normalize_data(image_data)]
         if not images:
             return None
-
-        if isinstance(input_text, list):
-            input_text = self.processor.tokenizer.decode(input_text)
 
         processor_output = self.processor(
             text=[input_text],
