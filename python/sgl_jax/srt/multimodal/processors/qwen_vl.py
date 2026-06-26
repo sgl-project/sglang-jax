@@ -1,3 +1,5 @@
+import asyncio
+
 import numpy as np
 
 from sgl_jax.srt.multimodal.common.modality_enum import (
@@ -29,9 +31,7 @@ class QwenVLProcessor(BaseMultimodalProcessor):
                 "Please provide text input instead."
             )
 
-        images = [self.load_image(item) for item in self.normalize_data(image_data)]
-        if not images:
-            return None
+        images = await self._load_images_async(image_data)
 
         processor_output = self.processor(
             text=[input_text],
@@ -112,6 +112,11 @@ class QwenVLProcessor(BaseMultimodalProcessor):
             items.append(item)
             offset += count
         return items
+
+    async def _load_images_async(self, image_data):
+        return await asyncio.gather(
+            *(self.load_image_async(item) for item in self.normalize_data(image_data))
+        )
 
     @staticmethod
     def _compute_image_offsets(input_ids, grids, image_token_id, spatial_merge_size):

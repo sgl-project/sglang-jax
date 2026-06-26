@@ -1,4 +1,6 @@
+import asyncio
 import base64
+import concurrent.futures
 import io
 import os
 from abc import ABC, abstractmethod
@@ -10,11 +12,15 @@ from PIL import Image
 
 from sgl_jax.srt.multimodal.common.modality_enum import MultimodalInputs
 
-# Stage 1 safety limits for fetching remote multimodal payloads. These are
-# intentionally conservative; future stages should make them configurable via
-# ServerArgs and add proper async fetching.
+# Safety limits for fetching remote multimodal payloads. These are intentionally
+# conservative and should become configurable via ServerArgs.
 DEFAULT_HTTP_TIMEOUT_SECS = 30
 MAX_REMOTE_BYTES = 64 * 1024 * 1024  # 64 MiB hard cap per asset
+
+IMAGE_IO_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=8,
+    thread_name_prefix="image-data-executor",
+)
 
 
 def _fetch_url(url: str) -> bytes:
@@ -105,3 +111,8 @@ class BaseMultimodalProcessor(ABC):
         if isinstance(payload, bytes):
             return Image.open(io.BytesIO(payload)).convert("RGB")
         return Image.open(payload).convert("RGB")
+
+    @classmethod
+    async def load_image_async(cls, source) -> Image.Image:
+        future = IMAGE_IO_EXECUTOR.submit(cls.load_image, source)
+        return await asyncio.wrap_future(future)
