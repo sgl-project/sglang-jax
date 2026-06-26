@@ -9,6 +9,7 @@ Aligns with upstream sglang model_runner_kv_cache_mixin.py:
 from __future__ import annotations
 
 import logging
+import math
 import os
 from typing import TYPE_CHECKING
 
@@ -110,23 +111,105 @@ def _per_req_state_bytes_from_config(cfg, tp_size: int) -> int:
     )
 
 
-def _enforce_recurrent_state_server_constraints(server_args) -> None:
+def _enforce_recurrent_state_server_constraints(server_args, is_lightning: bool = False) -> None:
     """Assert server constraints for hybrid recurrent state models."""
+    if server_args.enable_recurrent_extra_buffer:
+        # GLA/Lightning decode is a fused Pallas kernel that cannot add a masked
+        # recurrent track scatter, so the extra-buffer path is unsupported. Reject
+        # at init (the LightningAttnBackend assert is a mid-serving backstop).
+        assert not is_lightning, (
+            "--enable-recurrent-extra-buffer is not supported with the GLA/Lightning "
+            "(bailing_hybrid) architecture."
+        )
+        # The extra-buffer path needs the recurrent radix path; the legacy 1:1
+        # disable_radix_cache branch has no track slots. Check before the
+        # early return below so the combo fails loudly.
+        assert not server_args.disable_radix_cache, (
+            "--enable-recurrent-extra-buffer is incompatible with --disable-radix-cache "
+            "(the legacy 1:1 path has no recurrent track slots)."
+        )
+        assert server_args.enable_unified_radix_tree, (
+            "--enable-recurrent-extra-buffer requires --enable-unified-radix-tree "
+            "(recurrent radix caching)."
+        )
     if server_args.disable_radix_cache:
         return
     assert server_args.enable_unified_radix_tree, (
         "Hybrid recurrent state models require --disable-radix-cache (legacy) "
         "or --enable-unified-radix-tree (recurrent radix caching)."
     )
-    assert server_args.page_size == 1, "Recurrent radix caching requires --page-size 1."
+    # HiCache host offload is unsupported here: recurrent state is device-only
+    # (never backed up), the match validator stops at every tombstone, so the
+    # host tier can never serve a hit.
+    assert getattr(server_args, "hicache_storage", "disable") == "disable", (
+        "Recurrent radix caching does not support HiCache host offload "
+        "(--hicache-storage must be 'disable' for linear-recurrent models)."
+    )
+    if not server_args.enable_recurrent_extra_buffer:
+        assert server_args.page_size == 1, (
+            "Recurrent radix caching requires --page-size 1 unless "
+            "--enable-recurrent-extra-buffer."
+        )
 
 
-def _recurrent_slot_factor(server_args) -> int:
-    """Slots per concurrent request: 2 under radix caching (running slot +
-    tree-owned/clone headroom), 1 on the legacy 1:1 path."""
-    if server_args.enable_unified_radix_tree and not server_args.disable_radix_cache:
-        return 2
+# Fraction of a rank's recurrent slots reserved for cross-request snapshots when
+# the pool size is derived from --recurrent-state-memory-ratio (the auto path).
+# On the explicit --max-recurrent-state-size path this is not enforced (warn only).
+_RECURRENT_SNAPSHOT_HEADROOM_FRACTION = 0.25
+
+
+def _recurrent_ping_pong_slots(server_args) -> int:
+    """Ping-pong track slots per req under extra-buffer: 2 with overlap
+    scheduling (double-buffer across the overlap boundary), 1 without
+    (--disable-overlap-schedule)."""
+    return 1 if server_args.disable_overlap_schedule else 2
+
+
+def request_owned_slots(server_args) -> int:
+    """Recurrent slots a running req actually CONSUMES.
+
+    - extra-buffer: 1 running + ping-pong track slots (3 overlap-on / 2 overlap-off).
+    - 1 otherwise (unified-radix page=1, or legacy 1:1 path).
+
+    Used by alloc, admission backpressure, eviction demand, and the reuse K-sweep.
+    Distinct from ``reservation_slots_per_request`` (the back-cap factor)."""
+    if server_args.disable_radix_cache or not server_args.enable_unified_radix_tree:
+        return 1
+    if server_args.enable_recurrent_extra_buffer:
+        return 1 + _recurrent_ping_pong_slots(server_args)
     return 1
+
+
+def reservation_slots_per_request(server_args) -> int:
+    """Slots the sizing back-cap RESERVES per concurrent request. The surplus
+    over ``request_owned_slots`` is the implicit per-req snapshot headroom.
+
+    - 3 with extra-buffer (overlap-off consumes 2 -> 1 headroom slot/req).
+    - 2 for unified-radix recurrent without extra-buffer (consumes 1 -> 1 headroom).
+    - 1 otherwise (legacy 1:1 path; radix disabled).
+    """
+    if server_args.disable_radix_cache or not server_args.enable_unified_radix_tree:
+        return 1
+    if server_args.enable_recurrent_extra_buffer:
+        return 3
+    return 2
+
+
+def recurrent_admission_blocked(
+    free: int, evictable: int, demand: int, keeps_locked: int = 0
+) -> bool:
+    """Whether a rank's recurrent slots cannot cover ``demand`` fresh slots.
+
+    ``free`` = unused recurrent slots, ``evictable`` = unlocked tree-owned
+    snapshots reclaimable by eviction. ``keeps_locked`` discounts snapshots this
+    admission will keep protected: a cross-request prefix hit locks its matched
+    snapshot for the req's lifetime, so that slot leaves the evictable pool while
+    the req still needs ``request_owned_slots`` fresh slots. Pre-match callers
+    pass 0; a post-match caller that sees a recurrent prefix hit passes 1 so
+    admission at exact capacity defers instead of letting ``alloc_req_slots``
+    evict too few and raise.
+    """
+    return free + evictable - keeps_locked < demand
 
 
 def _build_hybrid_pools(
@@ -138,6 +221,8 @@ def _build_hybrid_pools(
     mesh,
     dp_size: int = 1,
     state_size: int | None = None,
+    enable_recurrent_extra_buffer: bool = False,
+    ping_pong_slots: int = 2,
 ) -> tuple:
     """Build RecurrentStatePool + HybridReqToTokenPool + MemoryPools.
 
@@ -175,6 +260,8 @@ def _build_hybrid_pools(
         dtype=np.int32,
         recurrent_state_pool=rsp,
         dp_size=dp_size,
+        enable_recurrent_extra_buffer=enable_recurrent_extra_buffer,
+        ping_pong_slots=ping_pong_slots,
     )
     mp = MemoryPools(
         token_to_kv_pool=token_to_kv_pool,
@@ -287,6 +374,9 @@ class ModelRunnerKVCacheMixin:
         sa = self.server_args
         dp_size = self.dp_size
         per_req_state = _per_req_state_bytes_from_config(cfg, self.attention_tp_size)
+        factor = reservation_slots_per_request(sa)
+        # Operator-set (priority 1/2) vs ratio-derived (priority 3) pool size.
+        self.recurrent_size_user_supplied = sa.max_recurrent_state_size is not None
 
         if sa.max_recurrent_state_size is not None:
             assert sa.max_recurrent_state_size % dp_size == 0, (
@@ -309,23 +399,25 @@ class ModelRunnerKVCacheMixin:
                     f"hybrid recurrent model; set --recurrent-state-memory-ratio > 0 "
                     f"(default 0.9)."
                 )
-            # _split_state_kv_budget runs against per-device memory, so its
-            # output is per-rank — multiply back to global.
-            state_max_reqs_per_rank, _ = _split_state_kv_budget(
+            # _split_state_kv_budget returns the per-rank SLOT count the state
+            # share affords (not a request count); the pool is exactly those slots.
+            state_slots_per_rank, _ = _split_state_kv_budget(
                 total_rest_memory, ratio, per_req_state
             )
-            sa.max_recurrent_state_size = state_max_reqs_per_rank * dp_size
+            sa.max_recurrent_state_size = state_slots_per_rank * dp_size
 
         state_memory_per_rank = (sa.max_recurrent_state_size // dp_size) * per_req_state
         kv_budget = total_rest_memory - state_memory_per_rank
 
         logger.info(
-            "Hybrid recurrent budget: per_req_state=%d bytes, "
+            "Hybrid recurrent budget: per_req_state=%d bytes, reservation_factor=%d, "
             "max_recurrent_state_size=%d (global) / %d per dp rank, "
-            "kv_budget=%.1f GB",
+            "reservation_cap=%d (global), kv_budget=%.1f GB",
             per_req_state,
+            factor,
             sa.max_recurrent_state_size,
             sa.max_recurrent_state_size // dp_size,
+            sa.max_recurrent_state_size // factor,
             kv_budget / (1024**3),
         )
 
@@ -411,17 +503,82 @@ class ModelRunnerKVCacheMixin:
         ):
             max_num_reqs = self.server_args.max_num_reqs
 
-        # Cap by recurrent state budget (global).
+        # Cap max_running by the recurrent state pool. max_recurrent_state_size is
+        # global (set by handle_recurrent_cache). Explicit sizing caps by the
+        # reservation factor (warn-only headroom); the auto path reserves explicit
+        # snapshot headroom and caps by actual per-req consumption.
         if (
             self.linear_recurrent_config is not None
             and self.server_args.max_recurrent_state_size is not None
         ):
-            factor = _recurrent_slot_factor(self.server_args)
-            budget_cap = self.server_args.max_recurrent_state_size // factor
-            # _build_hybrid_pools asserts max_num_reqs % dp_size == 0; round the
-            # budget cap down to stay dp-aligned.
-            budget_cap -= budget_cap % self.dp_size
-            max_num_reqs = min(max_num_reqs, budget_cap)
+            reservation = reservation_slots_per_request(self.server_args)
+            owned = request_owned_slots(self.server_args)
+            dp_size = self.dp_size
+            slots_per_rank = self.server_args.max_recurrent_state_size // dp_size
+            user_supplied = getattr(self, "recurrent_size_user_supplied", True)
+
+            # A pool with fewer slots/rank than one request consumes can never
+            # allocate; backpressure would mark every rank full forever. Fail
+            # fast with an actionable message instead of a stuck server.
+            if slots_per_rank < owned:
+                raise ValueError(
+                    f"Recurrent state pool too small: {slots_per_rank} slot(s) per dp rank "
+                    f"(max_recurrent_state_size={self.server_args.max_recurrent_state_size}, "
+                    f"dp_size={dp_size}) < request_owned_slots={owned} -- cannot fit even one "
+                    f"running request. Raise --max-recurrent-state-size to >= {reservation * dp_size} "
+                    f"(or raise --recurrent-state-memory-ratio for the auto-derived pool)."
+                )
+
+            if user_supplied:
+                # Warn using the REAL headroom (slots left after actual
+                # consumption), not the reservation factor.
+                budget_cap = slots_per_rank * dp_size // reservation
+                budget_cap -= budget_cap % dp_size
+                # The reservation divide + dp floor can land at 0 even past the
+                # per-slot guard above (owned < reservation): fail fast, a server
+                # with max_running=0 admits nothing and hangs silently.
+                if budget_cap < dp_size:
+                    raise ValueError(
+                        f"Recurrent state pool too small for one running request per dp rank: "
+                        f"max_recurrent_state_size={self.server_args.max_recurrent_state_size} "
+                        f"/ reservation_slots_per_request={reservation} / dp_size={dp_size} "
+                        f"caps max_running at {budget_cap}. Raise --max-recurrent-state-size "
+                        f"to >= {reservation * dp_size}."
+                    )
+                max_num_reqs = min(max_num_reqs, budget_cap)
+                snapshot_headroom = self.server_args.max_recurrent_state_size - max_num_reqs * owned
+                if snapshot_headroom < dp_size:
+                    logger.warning(
+                        "Recurrent pool has near-zero snapshot headroom "
+                        "(max_recurrent_state_size=%d, max_running=%d, "
+                        "request_owned_slots=%d -> %d slot(s) for cached "
+                        "snapshots). Cross-request reuse will be ~0 at saturation; "
+                        "raise --max-recurrent-state-size (e.g. > max_running*%d) "
+                        "to enable reuse.",
+                        self.server_args.max_recurrent_state_size,
+                        max_num_reqs,
+                        owned,
+                        snapshot_headroom,
+                        owned,
+                    )
+            else:
+                # Auto path: reserve snapshot headroom when capacity allows and
+                # back-cap running by actual consumption. The max(1, ...) floors
+                # keep one running req/rank on a tiny pool (liveness over headroom).
+                headroom_per_rank = max(
+                    1, math.ceil(_RECURRENT_SNAPSHOT_HEADROOM_FRACTION * slots_per_rank)
+                )
+                running_per_rank = max(1, (slots_per_rank - headroom_per_rank) // owned)
+                budget_cap = running_per_rank * dp_size
+                max_num_reqs = min(max_num_reqs, budget_cap)
+                logger.info(
+                    "Recurrent pool headroom: %d slot(s)/rank reserved for snapshots "
+                    "(slots/rank=%d, request_owned_slots=%d, max_running=%d global).",
+                    headroom_per_rank,
+                    slots_per_rank,
+                    owned,
+                    max_num_reqs,
+                )
 
         return max_num_reqs
 
@@ -556,6 +713,8 @@ class ModelRunnerKVCacheMixin:
                 mesh=self.mesh,
                 dp_size=dp_size,
                 state_size=state_size,
+                enable_recurrent_extra_buffer=self.server_args.enable_recurrent_extra_buffer,
+                ping_pong_slots=_recurrent_ping_pong_slots(self.server_args),
             )
         else:
             self.memory_pools = _build_non_hybrid_memory_pools(self.token_to_kv_pool)
@@ -598,7 +757,9 @@ class ModelRunnerKVCacheMixin:
 
         # 2. Enforce constraints for hybrid recurrent
         if self.linear_recurrent_config is not None:
-            _enforce_recurrent_state_server_constraints(self.server_args)
+            _enforce_recurrent_state_server_constraints(
+                self.server_args, is_lightning=self.lightning_config is not None
+            )
 
         # 3. Profile max tokens
         self.max_total_num_tokens = self.profile_max_num_token(total_device_memory)

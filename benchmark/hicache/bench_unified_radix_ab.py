@@ -1,31 +1,44 @@
-"""Standalone A/B serving benchmark for HiCache Stage 1 (S1c).
+"""Standalone A/B serving benchmark for the unified radix cache.
 
-Compares three cache configurations on a single TPU pod:
+Compares cache configurations on a single TPU pod:
   - ``no-cache``  (``--disable-radix-cache``): no prefix reuse, the floor.
   - ``radix``     (default RadixCache): the current production baseline.
-  - ``unified``   (``--enable-unified-radix-tree``): the S1c UnifiedRadixCache.
+  - ``unified``   (``--enable-unified-radix-tree``): the UnifiedRadixCache.
+  - ``unified-recurrent`` (``--enable-unified-radix-tree
+    --enable-recurrent-extra-buffer``): the hybrid-recurrent cache.
 
 For each (config x workload) it launches one server, runs ``bench_serving``
 ``--repeats`` times (cold each rep via ``/flush_cache``), drops the first
 ``--drop-first`` warmup reps, then reports pooled TTFT percentiles, mean+/-std
 throughput, and mean cache-hit-rate, plus a few soft acceptance checks.
 
-This is M1 throughput/TTFT evidence for S1c. It is run MANUALLY on a v6e-4
-host (e.g. sky-yh-v6e4); it is NOT registered in CI. Servers are launched
-sequentially -- one TPU pod, never two servers at once.
+This is throughput/TTFT evidence for the unified radix cache. It is run
+MANUALLY on a v6e-4 host (e.g. sky-yh-v6e4); it is NOT registered in CI.
+Servers are launched sequentially -- one TPU pod, never two servers at once.
 
 Usage (on the TPU host, from the repo root)::
 
     python benchmark/hicache/bench_unified_radix_ab.py \
         --model Qwen/Qwen3-8B --tp-size 4 --page-size 128 --port 20000 \
         --configs no-cache radix unified --workloads random gsp \
-        --output-json /tmp/s1c_ab.json
+        --output-json /tmp/radix_ab.json
 
 MoE usage (Qwen3-MoE under tp/ep/dp)::
 
     python benchmark/hicache/bench_unified_radix_ab.py \
         --model /models/Qwen3-30B-A3B --tp-size 4 --ep-size 4 --moe-backend epmoe \
         --page-size 256 --configs radix unified --output-json /tmp/moe_ab.json
+
+External-server / multi-host usage:
+    ``popen_launch_server`` is single-host and cannot start an ``nnodes>1``
+    server. For multi-host KDA the operator launches the 4-pod server manually,
+    then runs this harness client-only against rank0 with ``--server-url`` and a
+    single ``--configs`` entry (a result label). A/B = run twice (e.g. no-cache
+    and unified-recurrent) and merge the two ``--output-json`` files offline::
+
+        python benchmark/hicache/bench_unified_radix_ab.py \
+            --server-url http://<rank0>:30000 --configs unified-recurrent \
+            --disable-overlap-schedule --workloads gsp --output-json /tmp/rec.json
 
 Multi-chip note:
     --tp-size is the TOTAL chip count; --dp-size sub-partitions it (attention runs
@@ -51,12 +64,16 @@ CONFIG_ARGS = {
     "no-cache": ["--disable-radix-cache"],
     "radix": [],
     "unified": ["--enable-unified-radix-tree"],
+    "unified-recurrent": [
+        "--enable-unified-radix-tree",
+        "--enable-recurrent-extra-buffer",
+    ],
 }
 
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="A/B serving benchmark: no-cache / RadixCache / UnifiedRadixCache (S1c).",
+        description="A/B serving benchmark: no-cache / RadixCache / UnifiedRadixCache.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--model", default="Qwen/Qwen3-8B")
@@ -71,7 +88,7 @@ def parse_args():
     p.add_argument(
         "--configs",
         nargs="+",
-        choices=["no-cache", "radix", "unified"],
+        choices=["no-cache", "radix", "unified", "unified-recurrent"],
         default=["no-cache", "radix", "unified"],
     )
     p.add_argument(
@@ -99,6 +116,34 @@ def parse_args():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--mem-fraction-static", type=float, default=0.8)
     p.add_argument("--attention-backend", default="fa")
+    p.add_argument(
+        "--chunked-prefill-size",
+        type=int,
+        default=512,
+        help=(
+            "Prefill chunk size. Emitted to the server command ONLY for the "
+            "unified-recurrent config (it also sets the recurrent track interval); "
+            "the dense configs use the server default to stay byte-identical."
+        ),
+    )
+    p.add_argument(
+        "--disable-overlap-schedule",
+        action="store_true",
+        help=(
+            "Pass --disable-overlap-schedule to the server (correctness-critical "
+            "for KDA/Kimi-Linear recurrent decode)."
+        ),
+    )
+    p.add_argument(
+        "--server-url",
+        default=None,
+        help=(
+            "Run client-only against an already-launched server at this URL "
+            "(e.g. a multi-host nnodes>1 server). When set, the harness does NOT "
+            "launch or kill a server; exactly one --configs entry is required "
+            "(it is only a result label)."
+        ),
+    )
     p.add_argument(
         "--precompile-bs-paddings",
         nargs="+",
@@ -157,6 +202,12 @@ def parse_args():
             f"--precompile-bs-paddings {bad} not divisible by --tp-size "
             f"{args.tp_size} (hits the tp>1 sampler sharding bug)"
         )
+    if args.server_url is not None:
+        assert len(args.configs) == 1, (
+            "--server-url runs client-only against one already-launched server, so "
+            f"exactly one --configs entry is required (got {args.configs}). The config "
+            "name is only a result label; run twice and merge the two JSON outputs for A/B."
+        )
     return args
 
 
@@ -207,59 +258,24 @@ def _per_run_args(args, base_url, workload):
 
 
 def run_config(args, config):
-    """Launch one server for ``config`` and run all workloads x repeats."""
+    """Run all workloads x repeats for ``config``.
+
+    Launches one server for ``config`` unless ``--server-url`` is set, in which
+    case it runs client-only against that already-launched server (no launch, no
+    kill) -- the path for multi-host nnodes>1 servers ``popen_launch_server``
+    cannot start.
+    """
     from sgl_jax.bench_serving import run_benchmark
     from sgl_jax.srt.utils import kill_process_tree
     from sgl_jax.test.test_utils import popen_launch_server
 
-    base_url = f"http://127.0.0.1:{args.port}"
-    common = [
-        "--trust-remote-code",
-        "--skip-server-warmup",
-        "--dtype",
-        "bfloat16",
-        "--random-seed",
-        "3",
-        "--mem-fraction-static",
-        str(args.mem_fraction_static),
-        "--max-running-requests",
-        "256",
-        "--page-size",
-        str(args.page_size),
-        "--tp-size",
-        str(args.tp_size),
-        "--attention-backend",
-        args.attention_backend,
-        "--download-dir",
-        "/dev/shm/",
-    ]
-    common += ["--precompile-bs-paddings", *[str(b) for b in args.precompile_bs_paddings]]
-    common += ["--precompile-token-paddings", *[str(t) for t in args.precompile_token_paddings]]
-    # Emit parallelism/MoE flags only when set, so the default dense command stays
-    # byte-identical and main-compatible. --tp-size is the TOTAL chip count;
-    # --dp-size sub-partitions it (attention runs at tp_size // dp_size).
-    if args.dp_size > 1:
-        common += ["--dp-size", str(args.dp_size)]
-    if args.ep_size > 1:
-        common += ["--ep-size", str(args.ep_size)]
-    if args.moe_backend:
-        common += ["--moe-backend", args.moe_backend]
+    external = args.server_url is not None
+    base_url = args.server_url if external else f"http://127.0.0.1:{args.port}"
 
     # config -> {workload -> [res dict per rep]}
     results = {w: [] for w in args.workloads}
 
-    process = popen_launch_server(
-        args.model,
-        base_url=base_url,
-        timeout=1800,
-        other_args=common + CONFIG_ARGS[config],
-        check_cache_miss=False,
-        # A stray SGLANG_JAX_ENABLE_UNIFIED_RADIX_TREE=1 in the caller's env
-        # would silently turn the baselines into unified (env can only force
-        # the flag ON); pin it off -- "unified" gets the flag via CLI.
-        env={"SGLANG_JAX_ENABLE_UNIFIED_RADIX_TREE": "0"},
-    )
-    try:
+    def run_reps():
         for workload in args.workloads:
             for rep in range(args.repeats):
                 print(
@@ -291,6 +307,65 @@ def run_config(args, config):
                     )
                     continue
                 results[workload].append(res)
+
+    if external:
+        # Operator already launched the matching server (e.g. multi-host KDA);
+        # just drive the client loop against it.
+        run_reps()
+        return results
+
+    common = [
+        "--trust-remote-code",
+        "--skip-server-warmup",
+        "--dtype",
+        "bfloat16",
+        "--random-seed",
+        "3",
+        "--mem-fraction-static",
+        str(args.mem_fraction_static),
+        "--max-running-requests",
+        "256",
+        "--page-size",
+        str(args.page_size),
+        "--tp-size",
+        str(args.tp_size),
+        "--attention-backend",
+        args.attention_backend,
+        "--download-dir",
+        "/dev/shm/",
+    ]
+    common += ["--precompile-bs-paddings", *[str(b) for b in args.precompile_bs_paddings]]
+    common += ["--precompile-token-paddings", *[str(t) for t in args.precompile_token_paddings]]
+    # Emit parallelism/MoE flags only when set, so the default dense command stays
+    # byte-identical and main-compatible. --tp-size is the TOTAL chip count;
+    # --dp-size sub-partitions it (attention runs at tp_size // dp_size).
+    if args.dp_size > 1:
+        common += ["--dp-size", str(args.dp_size)]
+    if args.ep_size > 1:
+        common += ["--ep-size", str(args.ep_size)]
+    if args.moe_backend:
+        common += ["--moe-backend", args.moe_backend]
+    # Recurrent flags. Emit --chunked-prefill-size only for the recurrent config
+    # (it also sets the recurrent track interval); the dense configs keep the
+    # server default (4096) so their launch command stays byte-identical.
+    if config == "unified-recurrent":
+        common += ["--chunked-prefill-size", str(args.chunked_prefill_size)]
+    if args.disable_overlap_schedule:
+        common += ["--disable-overlap-schedule"]
+
+    process = popen_launch_server(
+        args.model,
+        base_url=base_url,
+        timeout=1800,
+        other_args=common + CONFIG_ARGS[config],
+        check_cache_miss=False,
+        # A stray SGLANG_JAX_ENABLE_UNIFIED_RADIX_TREE=1 in the caller's env
+        # would silently turn the baselines into unified (env can only force
+        # the flag ON); pin it off -- "unified" gets the flag via CLI.
+        env={"SGLANG_JAX_ENABLE_UNIFIED_RADIX_TREE": "0"},
+    )
+    try:
+        run_reps()
     finally:
         kill_process_tree(process.pid)
         process.wait()
@@ -446,6 +521,38 @@ def soft_targets(args, agg):
             f"vs no-cache.p50_ttft ({nc:.2f}), ratio={ratio:.3f} (want < 0.9)"
         )
 
+    # Recurrent A/B {no-cache, unified-recurrent} (no radix baseline). The
+    # hit-rate band is calibrated by the controller after the first run, so
+    # gsp hit-rate is reported, not gated.
+    rc = "unified-recurrent"
+    if "gsp" in args.workloads and have(rc, "gsp"):
+        hr = agg[rc]["gsp"]["hit_rate_mean"]
+        print(f"[REPORT] gsp: {rc}.hit_rate = {hr:.4f}")
+        if have("no-cache", "gsp"):
+            u = agg[rc]["gsp"]["p50_ttft_ms"]
+            nc = agg["no-cache"]["gsp"]["p50_ttft_ms"]
+            ratio = u / nc if nc else float("nan")
+            ok = ratio < 0.9
+            all_pass = all_pass and ok
+            fired += 1
+            print(
+                f"[{'PASS' if ok else 'WARN'}] gsp: {rc}.p50_ttft ({u:.2f}) "
+                f"vs no-cache.p50_ttft ({nc:.2f}), ratio={ratio:.3f} (want < 0.9)"
+            )
+
+    # random (a.k.a. low-concurrency): recurrent throughput overhead <= 5% vs
+    # no-cache.
+    if "random" in args.workloads and have(rc, "random") and have("no-cache", "random"):
+        u = agg[rc]["random"]["total_tok_s_mean"]
+        nc = agg["no-cache"]["random"]["total_tok_s_mean"]
+        ok = u >= 0.95 * nc
+        all_pass = all_pass and ok
+        fired += 1
+        print(
+            f"[{'PASS' if ok else 'WARN'}] random: {rc}.total_tok/s ({u:.1f}) "
+            f">= 0.95 * no-cache.total_tok/s ({0.95 * nc:.1f})"
+        )
+
     return all_pass, fired
 
 
@@ -488,8 +595,8 @@ def main():
         if fired == 0:
             print(
                 "\nNOTE: no A/B gate fired — compare needs both sides of a pair "
-                "for the same workload (e.g. no-cache/gsp + unified/gsp, or "
-                "radix/* + unified/*). Supply both result JSONs."
+                "for the same workload (e.g. no-cache/gsp + unified-recurrent/gsp, "
+                "or radix/* + unified/*). Supply both result JSONs."
             )
         if args.strict and (not ok or fired == 0):
             raise SystemExit(1)
@@ -506,6 +613,15 @@ def main():
     complete = check_sweep_complete(args, raw)
     targets_pass, _fired = soft_targets(args, agg)
     all_pass = complete and targets_pass
+
+    if args.server_url is not None and args.strict:
+        # Single-config external run: the A/B targets compare two configs, so none
+        # of them fire here. Say so, so --strict is not mistaken for a passed gate.
+        print(
+            "\nNOTE: single-config external run — the A/B targets need two configs "
+            "and did not run. Run each config separately, then gate with "
+            "`--compare run_a.json run_b.json --strict`."
+        )
 
     if args.output_json:
         payload = {
