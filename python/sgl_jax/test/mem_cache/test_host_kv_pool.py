@@ -460,6 +460,89 @@ class TestLRUHostKVPoolStageDrainErrors(unittest.TestCase):
             self.pool.flush_load([b], [0])
 
 
+class TestLRUHostKVPoolABA(unittest.TestCase):
+    """A free()+realloc() that reuses a slot id WHILE a transfer is mid-flight
+    must not let the stale, in-flight data land in the reused slot. A bare
+    ``_allocated`` re-check at publish can't tell the reused slot from the
+    original allocation (both show allocated); the per-slot epoch can."""
+
+    def setUp(self):
+        if not jax.devices():
+            self.skipTest("JAX not available")
+        # pool_size=1 so a free()+alloc() deterministically hands back the same id.
+        self.device_pool = _make_device_pool(size=16, page_size=1, layer_num=2)
+        self.pool = _make_pool(self.device_pool, pool_size=1, page_size=1)
+
+    def _fill(self, device_idx, seed):
+        orig = []
+        for layer in range(self.device_pool.layer_num):
+            buf = self.device_pool.kv_buffer[layer]
+            vals = jax.random.normal(
+                jax.random.PRNGKey(seed * 100 + layer), buf[device_idx].shape, buf.dtype
+            )
+            self.device_pool.kv_buffer[layer] = buf.at[device_idx].set(
+                vals, out_sharding=buf.sharding
+            )
+            orig.append(np.asarray(self.device_pool.kv_buffer[layer][device_idx]))
+        return orig
+
+    def test_stage_backup_drops_gather_when_slot_reused_midflight(self):
+        # Force the ABA: free()+realloc() the slot DURING stage_backup's gather
+        # (after the entry epoch capture, before the publish). The stale gather
+        # must be dropped, leaving the reused slot empty rather than poisoned.
+        pool = self.pool
+        [pid] = [int(p) for p in pool.alloc(1)]
+        orig_gather = pool._jit_gather_one_layer
+        state = {"fired": False}
+
+        def hook(buf, idx, sharding):
+            if not state["fired"]:
+                state["fired"] = True
+                pool.free([pid])
+                [again] = [int(p) for p in pool.alloc(1)]
+                self.assertEqual(again, pid)  # same id, new epoch
+            return orig_gather(buf, idx, sharding)
+
+        pool._jit_gather_one_layer = hook
+        pool.stage_backup([2], [pid])
+        self.assertTrue(state["fired"])
+        with pool._pending_lock:
+            self.assertNotIn(pid, pool._pending_gather)  # stale publish dropped
+        # The reused slot must be empty: a stale gather would have populated it.
+        with self.assertRaises(RuntimeError):
+            pool.stage_load([pid])
+
+    def test_flush_backup_rejects_stale_epoch(self):
+        # Simulate a free()+realloc() landing between flush_backup's pop and its
+        # _slots write by tagging the pending gather with an older epoch.
+        pool = self.pool
+        [pid] = [int(p) for p in pool.alloc(1)]
+        pool.stage_backup([2], [pid])
+        with pool._pending_lock:
+            gen, data = pool._pending_gather[pid]
+            pool._pending_gather[pid] = (gen - 1, data)
+        pool.flush_backup([pid])
+        self.assertIsNone(pool._slots[pid])  # stale rejected, slot not populated
+
+    def test_flush_load_skips_stale_epoch(self):
+        # A page whose slot was reused since stage_load must not be scattered into
+        # the caller's device pages; the dst page stays untouched.
+        pool = self.pool
+        dp = self.device_pool
+        [pid] = [int(p) for p in pool.alloc(1)]
+        self._fill(2, seed=1)
+        guard = self._fill(9, seed=99)  # dst page, must stay untouched
+        pool.copy_into([2], [pid])
+        pool.stage_load([pid])
+        with pool._pending_load_lock:
+            gen, data = pool._pending_load[pid]
+            pool._pending_load[pid] = (gen - 1, data)
+        pool.flush_load([pid], [9])
+        for layer in range(dp.layer_num):
+            got = np.asarray(dp.kv_buffer[layer][9])
+            np.testing.assert_array_equal(got, guard[layer])
+
+
 class TestLRUHostKVPoolPrecompile(unittest.TestCase):
     """precompile_transfers warms one shape per page count serving can hit and
     must always restore the pool (free its scratch slots), never raise, and warm

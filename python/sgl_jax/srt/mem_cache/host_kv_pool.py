@@ -273,12 +273,15 @@ class LRUHostKVPool(HostKVPool):
     ``int`` crossing the boundary is a page id, and ``available_size`` /
     ``total_size`` count pages.
 
-    ``self._lock`` guards the free-list and ``_lock_ref``. Per-slot reads rely on
-    the caller holding an exclusive reservation, but the transfer write/publish
-    points (``_slots`` in flush_backup, ``_pending_*`` in stage_backup/stage_load)
-    re-check ``_allocated`` under ``_lock`` before publishing, so a concurrent
-    release()/free() can never resurrect data into a freed slot — it surfaces
-    loudly instead. Lock order is ``_lock -> _pending_lock``/``_pending_load_lock``.
+    ``self._lock`` guards the free-list, ``_lock_ref`` and ``_generation``. Per-slot
+    reads rely on the caller holding an exclusive reservation, but the transfer
+    write/publish points (``_slots`` in flush_backup, ``_pending_*`` in
+    stage_backup/stage_load, the scatter in flush_load) capture the slot's epoch
+    (``_generation``) at entry and re-check it under ``_lock`` before publishing.
+    A free()+realloc() that reused the slot mid-transfer leaves ``_allocated`` True
+    but bumps the epoch, so the stale publish is dropped (the ABA a bare
+    ``_allocated`` re-check missed). Lock order is
+    ``_lock -> _pending_lock``/``_pending_load_lock``.
     """
 
     def __init__(
@@ -335,18 +338,28 @@ class LRUHostKVPool(HostKVPool):
         # Allocated-state mirror of the free-list (O(1) membership for the
         # page-id boundary checks below; a bare ``in self._free_ids`` is O(n)).
         self._allocated: list[bool] = [False] * pool_size
+        # Per-slot allocation epoch, bumped on every alloc (reserve/alloc). A
+        # transfer captures the epoch at entry and re-checks it at publish: a
+        # free()+realloc() that reused the slot mid-transfer leaves _allocated
+        # True again but bumps the epoch, so the stale publish is dropped instead
+        # of resurrecting the old allocation's data into the new owner's slot
+        # (the ABA a bare _allocated re-check can't catch).
+        self._generation: list[int] = [0] * pool_size
         self._peak_used = 0
         self._exhaust_count = 0
         self._last_exhaust_log = 0.0
         # D2H: pages gathered by stage_backup (buffer-owning thread, sync) await
-        # their async host transfer in flush_backup (D2H worker), keyed by buffer_id.
+        # their async host transfer in flush_backup (D2H worker), keyed by
+        # buffer_id; each value is ``(epoch, array)`` so flush can reject a stale
+        # publish from a slot reused since staging.
         self._pending_lock = threading.Lock()
-        self._pending_gather: dict[int, jax.Array] = {}
+        self._pending_gather: dict[int, tuple[int, jax.Array]] = {}
         # H2D (mirror): pages staged by stage_load (worker, slow device_put, never
         # touches kv_buffer) await their cheap in-place scatter in flush_load
-        # (buffer-owning thread, donation-safe window), keyed by buffer_id.
+        # (buffer-owning thread, donation-safe window), keyed by buffer_id; value
+        # is ``(epoch, array)`` for the same staleness guard.
         self._pending_load_lock = threading.Lock()
-        self._pending_load: dict[int, jax.Array] = {}
+        self._pending_load: dict[int, tuple[int, jax.Array]] = {}
 
     # ------------------------------------------------------------------
     # HostKVPool ABC
@@ -373,6 +386,7 @@ class LRUHostKVPool(HostKVPool):
                 return None
             buffer_id = self._free_ids.pop(0)
             self._allocated[buffer_id] = True
+            self._generation[buffer_id] += 1
             used = self._pool_size - len(self._free_ids)
             if used > self._peak_used:
                 self._peak_used = used
@@ -426,6 +440,7 @@ class LRUHostKVPool(HostKVPool):
             pages = [self._free_ids.pop(0) for _ in range(need_pages)]
             for pid in pages:
                 self._allocated[pid] = True
+                self._generation[pid] += 1
             used = self._pool_size - len(self._free_ids)
             if used > self._peak_used:
                 self._peak_used = used
@@ -471,8 +486,13 @@ class LRUHostKVPool(HostKVPool):
             )
         if not host_buffer_ids:
             return
-        for buffer_id in host_buffer_ids:
-            self._require_allocated(buffer_id)
+        # Capture each slot's epoch under _lock alongside the allocated check, so
+        # the publish below can tell whether a free()+realloc() reused the slot
+        # while this (slow) gather was in flight.
+        with self._lock:
+            for buffer_id in host_buffer_ids:
+                self._require_allocated(buffer_id)
+            gens = {bid: self._generation[bid] for bid in host_buffer_ids}
         self._require_device_pages(device_indices)
         buffers = self._device_pool.kv_buffer
         n = len(device_indices)
@@ -495,17 +515,18 @@ class LRUHostKVPool(HostKVPool):
         # Slice the real pages back per buffer_id (cheap views on the now-
         # materialized array); padding rows [n:] are dropped.
         gathered = {bid: packed[:, i] for i, bid in enumerate(host_buffer_ids)}
-        # Publish under _lock with an allocation re-check: a free()/release()
-        # may have run since the entry check above (its _drop_pending also takes
-        # _lock, so this serializes against it). Without the re-check a gather
-        # could land in _pending_gather for a slot already returned to the
-        # free-list, to be popped later into a reused slot. Lock order is
-        # _lock -> _pending_lock, matching free()/release().
-        with self._lock:
+        # Publish under _lock, tagging each entry with the epoch captured at
+        # entry. A free()+realloc() since then leaves _allocated True but bumps
+        # the epoch, so the stale gather is dropped rather than landing in the
+        # reused slot (a bare _allocated re-check can't tell the new owner apart).
+        # Lock order is _lock -> _pending_lock, matching free()/release().
+        with self._lock, self._pending_lock:
             for buffer_id in host_buffer_ids:
-                self._require_allocated(buffer_id)
-            with self._pending_lock:
-                self._pending_gather.update(gathered)
+                if self._allocated[buffer_id] and self._generation[buffer_id] == gens[buffer_id]:
+                    self._pending_gather[buffer_id] = (
+                        gens[buffer_id],
+                        gathered[buffer_id],
+                    )
 
     def flush_backup(self, host_buffer_ids: list[int]) -> None:
         """D2H phase 2: ``device_put`` the staged pages into their host slots.
@@ -521,20 +542,21 @@ class LRUHostKVPool(HostKVPool):
         staged: list[jax.Array] = []
         for buffer_id in host_buffer_ids:
             with self._pending_lock:
-                packed = self._pending_gather.pop(buffer_id, None)
-            if packed is None:
+                entry = self._pending_gather.pop(buffer_id, None)
+            if entry is None:
                 raise RuntimeError(
                     f"flush_backup with no staged gather for buffer_id={buffer_id}; "
                     f"stage_backup() must run (synchronously) first"
                 )
+            gen, packed = entry
             host_packed = jax.device_put(packed, self._host_sharding)
-            # Re-check allocation under _lock before publishing into _slots: a
-            # release()/free() may have run after the pop above; writing here
-            # without the guard would resurrect data into a slot already on the
-            # free-list (claimable by the next alloc()).
+            # Publish into _slots only if the slot is still the same allocation
+            # that staged this gather (epoch unchanged): a release()/free()
+            # (+realloc) after the pop above would otherwise resurrect stale data
+            # into the reused slot.
             with self._lock:
-                self._require_allocated(buffer_id)
-                self._slots[buffer_id] = host_packed
+                if self._allocated[buffer_id] and self._generation[buffer_id] == gen:
+                    self._slots[buffer_id] = host_packed
             staged.append(host_packed)
         jax.block_until_ready(staged)
 
@@ -568,24 +590,32 @@ class LRUHostKVPool(HostKVPool):
         # Batching would need to stack pinned-host arrays (no CPU implementation).
         staged: list[jax.Array] = []
         loaded: dict[int, jax.Array] = {}
+        # Read the slot refs + capture epochs under _lock, so the publish can
+        # reject a slot reused since this (slow) device_put started.
+        with self._lock:
+            for buffer_id in host_buffer_ids:
+                self._require_allocated(buffer_id)
+            gens = {bid: self._generation[bid] for bid in host_buffer_ids}
+            slots = {bid: self._slots[bid] for bid in host_buffer_ids}
         for buffer_id in host_buffer_ids:
-            self._require_allocated(buffer_id)
-            slot = self._slots[buffer_id]
+            slot = slots[buffer_id]
             if slot is None:
                 raise RuntimeError(f"stage_load from empty buffer_id={buffer_id}")
             packed_dev = jax.device_put(slot, self._device_packed_sharding)
             loaded[buffer_id] = packed_dev
             staged.append(packed_dev)
         jax.block_until_ready(staged)
-        # Publish under _lock with an allocation re-check (same race as
-        # stage_backup): release()'s _drop_pending also takes _lock, so this
-        # serializes against a slot being freed mid-stage. Lock order
+        # Publish tagged with the entry epoch (same ABA guard as stage_backup): a
+        # free()+realloc() mid-stage bumps the epoch, so the stale device copy is
+        # dropped instead of landing in the reused slot's pending load. Lock order
         # _lock -> _pending_load_lock.
-        with self._lock:
+        with self._lock, self._pending_load_lock:
             for buffer_id in host_buffer_ids:
-                self._require_allocated(buffer_id)
-            with self._pending_load_lock:
-                self._pending_load.update(loaded)
+                if self._allocated[buffer_id] and self._generation[buffer_id] == gens[buffer_id]:
+                    self._pending_load[buffer_id] = (
+                        gens[buffer_id],
+                        loaded[buffer_id],
+                    )
 
     def flush_load(self, host_buffer_ids: list[int], device_indices: list[int]) -> None:
         """H2D phase 2: scatter the staged pages into the KV buffer via the
@@ -607,17 +637,32 @@ class LRUHostKVPool(HostKVPool):
         from sgl_jax.srt.mem_cache.memory_pool import write_kv_layer
 
         PS = self._page_size
+        # Capture each slot's current epoch under _lock; a page whose epoch moved
+        # since stage_load (free()+realloc()) is stale and must not be scattered
+        # into the caller's device pages.
+        with self._lock:
+            cur_gen: dict[int, int | None] = {}
+            for buffer_id in host_buffer_ids:
+                if not (0 <= buffer_id < self._pool_size):
+                    raise ValueError(
+                        f"buffer_id={buffer_id} outside pool range [0, {self._pool_size})"
+                    )
+                cur_gen[buffer_id] = (
+                    self._generation[buffer_id] if self._allocated[buffer_id] else None
+                )
         staged_pages: list[jax.Array] = []
+        fresh: list[bool] = []
         for buffer_id in host_buffer_ids:
-            self._require_allocated(buffer_id)
             with self._pending_load_lock:
-                packed = self._pending_load.pop(buffer_id, None)
-            if packed is None:
+                entry = self._pending_load.pop(buffer_id, None)
+            if entry is None:
                 raise RuntimeError(
                     f"flush_load with no staged page for buffer_id={buffer_id}; "
                     f"stage_load() must run first"
                 )
+            gen, packed = entry
             staged_pages.append(packed)
+            fresh.append(cur_gen[buffer_id] == gen)
 
         n = len(host_buffer_ids)
         dp = self._device_pool
@@ -643,6 +688,8 @@ class LRUHostKVPool(HostKVPool):
         shard_loc = [[-1] * per_shard for _ in range(dp_size)]
         fill_pos = [0] * dp_size
         for k, gp in enumerate(int(p) for p in device_indices):
+            if not fresh[k]:
+                continue  # slot freed/realloc'd since stage_load: drop stale page
             d = gp // pages_per_shard
             pos = fill_pos[d]
             shard_sel[d][pos] = k
