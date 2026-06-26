@@ -208,17 +208,41 @@ class HybridReqToTokenPool(ReqToTokenPool):
         if result is None:
             return None
 
-        new_indices = []
         for r in reqs:
             if r.recurrent_pool_idx is None:
-                slot = self.recurrent_free_slots[dp_rank].pop(0)
+                slot = self.alloc_recurrent_slot(dp_rank)
                 r.recurrent_pool_idx = slot
                 self.req_index_to_recurrent_index_mapping[r.req_pool_idx] = slot
-                new_indices.append(slot)
 
         return result
 
+    def alloc_recurrent_slot(self, dp_rank: int = 0) -> int | None:
+        """Pop one free recurrent slot (scalar), or None if exhausted."""
+        slots = self.recurrent_free_slots[dp_rank]
+        if not slots:
+            return None
+        return slots.pop(0)
+
+    def free_recurrent_slot(self, slot: int, dp_rank: int = 0) -> None:
+        self.recurrent_free_slots[dp_rank].append(int(slot))
+
+    @staticmethod
+    def recurrent_value_from_slot(slot: int) -> np.ndarray:
+        """Wrap a scalar slot index into the length-1 array stored as a tree
+        node's recurrent ``.value``."""
+        return np.array([int(slot)], dtype=np.int32)
+
+    def commit_to_tree(self, req: Req) -> None:
+        """Transfer the request's running slot to the tree without freeing: clear
+        the request handle + mapping; the tree node's ``.value`` now owns it."""
+        if req.recurrent_pool_idx is None:
+            return
+        self.req_index_to_recurrent_index_mapping[req.req_pool_idx] = 0
+        req.recurrent_pool_idx = None
+
     def free(self, req: Req):
+        # Ownership-based: free_recurrent_cache no-ops on a slot donated to the
+        # tree (commit_to_tree cleared the handle), so it is never double-freed.
         self.free_recurrent_cache(req)
         super().free(req)
 
@@ -227,7 +251,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         if recurrent_idx is None:
             return
         dp_rank = req.dp_rank if req.dp_rank is not None else 0
-        self.recurrent_free_slots[dp_rank].append(recurrent_idx)
+        self.free_recurrent_slot(recurrent_idx, dp_rank)
         self.req_index_to_recurrent_index_mapping[req.req_pool_idx] = 0
         req.recurrent_pool_idx = None
 

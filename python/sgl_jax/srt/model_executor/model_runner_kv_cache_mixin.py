@@ -112,11 +112,21 @@ def _per_req_state_bytes_from_config(cfg, tp_size: int) -> int:
 
 def _enforce_recurrent_state_server_constraints(server_args) -> None:
     """Assert server constraints for hybrid recurrent state models."""
-    assert server_args.disable_radix_cache, (
-        "Hybrid recurrent state models require --disable-radix-cache "
-        "(prefix sharing is unsafe with recurrent state). Please pass "
-        "--disable-radix-cache explicitly."
+    if server_args.disable_radix_cache:
+        return  # legacy 1:1 path (no prefix sharing)
+    assert server_args.enable_unified_radix_tree, (
+        "Hybrid recurrent state models require --disable-radix-cache (legacy) "
+        "or --enable-unified-radix-tree (recurrent radix caching)."
     )
+    assert server_args.page_size == 1, "Recurrent radix caching requires --page-size 1."
+
+
+def _recurrent_slot_factor(server_args) -> int:
+    """Recurrent slots per concurrent request. Radix caching needs 2 (1 running
+    + 1 for the tree-owned / transient clone headroom); legacy 1:1 needs 1."""
+    if server_args.enable_unified_radix_tree and not server_args.disable_radix_cache:
+        return 2
+    return 1
 
 
 def _build_hybrid_pools(
@@ -401,13 +411,19 @@ class ModelRunnerKVCacheMixin:
         ):
             max_num_reqs = self.server_args.max_num_reqs
 
-        # Cap by recurrent state budget. server_args.max_recurrent_state_size
-        # is global (set by handle_recurrent_cache).
+        # Cap by recurrent state budget (global). Radix caching holds `factor`
+        # slots per concurrent request, so admission is capped at budget // factor.
         if (
             self.linear_recurrent_config is not None
             and self.server_args.max_recurrent_state_size is not None
         ):
-            max_num_reqs = min(max_num_reqs, self.server_args.max_recurrent_state_size)
+            factor = _recurrent_slot_factor(self.server_args)
+            budget_cap = self.server_args.max_recurrent_state_size // factor
+            # Admission shards evenly across dp ranks (_build_hybrid_pools asserts
+            # max_num_reqs % dp_size == 0), but budget // factor can land off the dp
+            # grid (e.g. 12 // 2 = 6 with dp_size=4). Round down to stay dp-aligned.
+            budget_cap -= budget_cap % self.dp_size
+            max_num_reqs = min(max_num_reqs, budget_cap)
 
         return max_num_reqs
 

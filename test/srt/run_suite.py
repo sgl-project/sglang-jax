@@ -335,6 +335,9 @@ suites = {
         TestFile("test/srt/test_reasoning_parser.py", 0.1),
         TestFile("test/srt/eval/test_simple_eval_common.py", 0.1, runner="pytest"),
         TestFile("test/srt/test_server_info.py", 0.1),
+        TestFile("test/srt/test_recurrent_cow_metadata.py", 0.2),
+        TestFile("test/srt/test_prepare_for_extend_protected_len.py", 0.2),
+        TestFile("test/srt/test_extend_bs_guard.py", 0.2),
     ],
     "unit-test-tpu-v6e-4": [
         TestFile("python/sgl_jax/test/test_mesh.py", 0.4),

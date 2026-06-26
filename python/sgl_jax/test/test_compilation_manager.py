@@ -3,7 +3,13 @@ from unittest.mock import MagicMock
 
 from sgl_jax.srt.model_executor.compilation_manager import CompilationManager
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
-from sgl_jax.srt.utils.common_utils import align_bs_for_fused_ep, pad_to_bucket
+from sgl_jax.srt.utils.common_utils import (
+    SAFE_EXTEND_PER_DP_BS,
+    align_bs_for_fused_ep,
+    pad_to_bucket,
+    projected_per_dp_bucket,
+    selected_extend_per_dp_bs,
+)
 
 
 class TestAlignBsForFusedEp(unittest.TestCase):
@@ -39,6 +45,8 @@ def _make_server_args(**overrides):
     args.moe_backend = "none"
     args.enable_static_lora = False
     args.multimodal = False
+    args.nnodes = 1
+    args.speculative_algorithm = None
     for k, v in overrides.items():
         setattr(args, k, v)
     return args
@@ -266,6 +274,103 @@ class TestDummyBatch(unittest.TestCase):
     def test_invalid_cache_loc_raises(self):
         with self.assertRaises(ValueError):
             self.cm._make_dummy_batch(64, 128, ForwardMode.EXTEND, 32)
+
+
+def _make_recurrent_cm(**overrides):
+    """CompilationManager on the validated affected config (tp16/dp4/fused/page1
+    recurrent multi-host) unless overridden."""
+    kwargs = dict(
+        max_padded_batch_size=64,
+        max_padded_num_tokens=2048,
+        dp_size=4,
+        tp_size=16,
+        page_size=1,
+        max_req_len=4096,
+        vocab_size=32000,
+        has_recurrent_state=True,
+    )
+    sa_overrides = {}
+    for k in ("nnodes", "speculative_algorithm", "moe_backend", "precompile_bs_paddings"):
+        if k in overrides:
+            sa_overrides[k] = overrides.pop(k)
+    kwargs.update(overrides)
+    sa_overrides.setdefault("nnodes", 4)
+    sa_overrides.setdefault("moe_backend", "fused")
+    return CompilationManager(server_args=_make_server_args(**sa_overrides), **kwargs)
+
+
+class TestRecurrentExtendSafeBucket(unittest.TestCase):
+    """Affected recurrent multi-host EXTEND must always have a runtime-reachable
+    bucket with per_dp_bs <= SAFE_EXTEND_PER_DP_BS."""
+
+    def test_safe_bucket_inserted_when_user_paddings_only_large(self):
+        cm = _make_recurrent_cm(precompile_bs_paddings=[64])
+        safe_total = SAFE_EXTEND_PER_DP_BS * 4
+        self.assertIn(safe_total, cm.bs_buckets)
+        self.assertTrue(any(b // 4 <= SAFE_EXTEND_PER_DP_BS for b in cm.bs_buckets))
+
+    def test_no_insert_when_max_already_safe(self):
+        # max_padded_batch_size == SAFE*dp_size -> largest bucket already safe.
+        cm = _make_recurrent_cm(max_padded_batch_size=SAFE_EXTEND_PER_DP_BS * 4)
+        self.assertTrue(all(b // 4 <= SAFE_EXTEND_PER_DP_BS for b in cm.bs_buckets))
+
+    def test_infeasible_safe_bucket_raises(self):
+        # fused-moe tp_size*2 = 64 > SAFE*dp_size = 32 -> no feasible safe bucket.
+        with self.assertRaises(ValueError):
+            _make_recurrent_cm(tp_size=32, max_padded_batch_size=128, precompile_bs_paddings=[128])
+
+    def test_single_host_not_affected_no_safe_bucket(self):
+        cm = _make_recurrent_cm(nnodes=1, precompile_bs_paddings=[64])
+        self.assertNotIn(SAFE_EXTEND_PER_DP_BS * 4, cm.bs_buckets)
+
+
+class TestExtendPrecompileBsPairs(unittest.TestCase):
+    def test_affected_filters_unsafe_buckets(self):
+        cm = _make_recurrent_cm(precompile_bs_paddings=[32, 64])
+        pairs = cm._extend_precompile_bs_pairs()
+        self.assertTrue(all(bs // 4 <= SAFE_EXTEND_PER_DP_BS for _, bs in pairs))
+        self.assertNotIn(64, [bs for _, bs in pairs])
+        # the matching cache_loc bucket index is preserved
+        for i, bs in pairs:
+            self.assertEqual(cm.bs_buckets[i], bs)
+
+    def test_not_affected_uses_largest_only(self):
+        cm = _make_recurrent_cm(nnodes=1, precompile_bs_paddings=[32, 64])
+        pairs = cm._extend_precompile_bs_pairs()
+        self.assertEqual(pairs, [(len(cm.bs_buckets) - 1, cm.max_padded_batch_size)])
+
+
+class TestProjectedPerDpBucket(unittest.TestCase):
+    def test_small_active_maps_to_smallest_bucket(self):
+        # smallest bucket 32 -> per_dp 8 even for a single active req
+        self.assertEqual(projected_per_dp_bucket(1, 4, [32, 64]), 8)
+        self.assertEqual(projected_per_dp_bucket(8, 4, [32, 64]), 8)
+
+    def test_over_safe_maps_to_next_bucket(self):
+        self.assertEqual(projected_per_dp_bucket(9, 4, [32, 64]), 16)
+
+    def test_beyond_largest_bucket_does_not_raise(self):
+        self.assertEqual(projected_per_dp_bucket(20, 4, [32, 64]), 20)
+
+    def test_fine_grained_buckets(self):
+        self.assertEqual(projected_per_dp_bucket(1, 1, [4, 8, 16]), 4)
+        self.assertEqual(projected_per_dp_bucket(5, 1, [4, 8, 16]), 8)
+
+
+class TestSelectedExtendPerDpBs(unittest.TestCase):
+    """Global selected bucket is keyed to the max active count across dp ranks."""
+
+    def test_keyed_to_global_max_not_single_rank(self):
+        # dp1 has 16 (e.g. running decode that would mix in), dp0 has 1: the
+        # selected bucket must reflect the global max (16), not dp0's 1.
+        self.assertEqual(selected_extend_per_dp_bs([1, 16, 3, 2], 4, [32, 64, 128]), 16)
+
+    def test_all_within_safe(self):
+        self.assertEqual(selected_extend_per_dp_bs([8, 8, 8, 8], 4, [32, 64]), 8)
+        self.assertEqual(selected_extend_per_dp_bs([1, 0, 0, 0], 4, [32, 64]), 8)
+
+    def test_empty(self):
+        self.assertEqual(selected_extend_per_dp_bs([], 4, [32, 64]), 8)
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-"""RecurrentStatePool -- buffer pool for linear recurrent layers (KDA/Mamba/GDN)."""
+"""RecurrentStatePool -- buffer pool for linear recurrent layers (KDA/GDN)."""
 
 from __future__ import annotations
 
@@ -36,7 +36,7 @@ class LinearRecurrentStateParams:
     head_dim: int
     conv_kernel_size: int
     dtype: RecurrentStateDType
-    # GDN/Mamba have asymmetric K vs V projection widths (e.g.
+    # GDN has asymmetric K vs V projection widths (e.g.
     # Qwen3.5 GDN: num_k_heads=16/head_k_dim=128 vs num_v_heads=32/head_v_dim=128).
     # When None (KDA / Lightning / Bailing), RecurrentStatePool falls back to
     # treating K dim = V dim.
@@ -208,6 +208,63 @@ class RecurrentStatePool:
             self.recurrent_buffers[layer] = jnp.zeros_like(self.recurrent_buffers[layer])
             for inner in range(len(self.conv_buffers[layer])):
                 self.conv_buffers[layer][inner] = jnp.zeros_like(self.conv_buffers[layer][inner])
+
+    def copy_slots(self, src_indices, dst_indices):
+        """Copy-on-write clone of recurrent + conv state from ``src_indices`` to
+        ``dst_indices`` across all layers. Rows with ``src==0`` are no-ops (dst
+        keeps its content), covering padding and non-cloned requests.
+
+        Returns new ``(recurrent_buffers, conv_buffers)`` for the caller to fold
+        into the donated pool. ``src``/``dst`` are per-request LOCAL slot indices
+        within one DP rank.
+        """
+        mesh = self.mesh
+        data_axis = self.data_partition_axis
+
+        def _temporal(buf, src, dst):
+            # Donated-pool aliasing barrier: buf is donated, so without it the
+            # scatter races the gather under multi-host SPMD -> NaN. Both barriers
+            # are value-preserving; do not remove.
+            buf = jax.lax.optimization_barrier(buf)
+            val = jnp.where((src == 0).reshape(-1, 1, 1, 1), buf[dst], buf[src])
+            return jax.lax.optimization_barrier(buf.at[dst].set(val))
+
+        def _conv(buf, src, dst):
+            buf = jax.lax.optimization_barrier(buf)  # see _temporal
+            val = jnp.where((src == 0).reshape(-1, 1, 1), buf[dst], buf[src])
+            return jax.lax.optimization_barrier(buf.at[dst].set(val))
+
+        copy_temporal = jax.shard_map(
+            _temporal,
+            mesh=mesh,
+            in_specs=(
+                P(data_axis, self.recurrent_partition_axis, None, None),
+                P(data_axis),
+                P(data_axis),
+            ),
+            out_specs=P(data_axis, self.recurrent_partition_axis, None, None),
+            check_vma=False,
+        )
+        copy_conv = jax.shard_map(
+            _conv,
+            mesh=mesh,
+            in_specs=(
+                P(data_axis, self.conv_partition_axis, None),
+                P(data_axis),
+                P(data_axis),
+            ),
+            out_specs=P(data_axis, self.conv_partition_axis, None),
+            check_vma=False,
+        )
+
+        new_recurrent = [
+            copy_temporal(buf, src_indices, dst_indices) for buf in self.recurrent_buffers
+        ]
+        new_conv = [
+            [copy_conv(cbuf, src_indices, dst_indices) for cbuf in inner]
+            for inner in self.conv_buffers
+        ]
+        return new_recurrent, new_conv
 
     # --- pytree ---
     def tree_flatten(self):
