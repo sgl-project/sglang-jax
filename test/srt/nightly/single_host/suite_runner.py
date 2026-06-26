@@ -466,6 +466,7 @@ def run_one(run: SingleHostRun) -> None:
             spec["base_url"],
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=spec["other_args"],
+            check_cache_miss=spec["check_cache_miss"],
         )
     else:
         _log(f"no launch profile — self-launching/offline cases ({len(run.cases)})")
