@@ -147,7 +147,7 @@ jobs:
 
   # Recurrent multi-host cache_aware has no nightly job (no 4x4 CI capacity); the
   # gate is covered single-host by nightly-recurrent-cache-aware-4-tpu-daily
-  # (tp4/dp2/ep4), and the 16-chip run is a manual procedure (validation runbook).
+  # (tp4/dp2/ep4), and the 16-chip run is a manual, on-demand procedure.
 
   nightly-infra-smoke-1-tpu-daily:
     if: github.repository == 'sgl-project/sglang-jax' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-infra-smoke-1-tpu-daily')
@@ -442,7 +442,7 @@ jobs:
         uses: ./.github/actions/setup-venv
       - name: Run recurrent cache_aware reuse gate (v6e-4, tp4/dp2/ep4)
         # Single-host dp>1 cache_aware reuse-knee gate + min_running contrast
-        # (Phase 3 re-homed off multi-host, which CI has no capacity for). Two
+        # (re-homed off multi-host, which CI has no capacity for). Two
         # sequential 35B launches (cold gcsfuse ~14-40min each) -> keep margin.
         timeout-minutes: 180
         env:

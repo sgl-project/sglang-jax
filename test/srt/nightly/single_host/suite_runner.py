@@ -114,7 +114,7 @@ def _ablation_case(label: str, dp: int, ep: int) -> BenchCase:
     sweeps the --parallel list on one launched server per config (no relaunch per
     concurrency point), so each mesh point is two cold 35B loads. Report-only (no
     --strict). Mooncake uses bench_serving's /tmp trace fallback — pre-stage
-    /tmp/conversation_trace.jsonl on the pod (see the validation runbook).
+    /tmp/conversation_trace.jsonl on the pod before running.
     """
     return BenchCase(
         name=f"ablation-{label}",
@@ -292,7 +292,7 @@ SUITES: dict[str, SingleHostSuite] = {
             ),
         ],
     ),
-    # Recurrent A/B perf gate (Next Work item 4, Phase 2): no-cache vs
+    # Recurrent A/B perf gate: no-cache vs
     # unified-recurrent on the GDN-hybrid Qwen3.5-35B-A3B, single-host dp=1 tp=4.
     # The A/B bench self-launches both servers sequentially (one pod), so the run
     # carries no launch_profile; its own --strict gate fires the soft targets
@@ -351,8 +351,8 @@ SUITES: dict[str, SingleHostSuite] = {
             ),
         ],
     ),
-    # Recurrent dp>1 cache_aware reuse gate, SINGLE-host (Next Work item 4, Phase 3
-    # re-homed to single-host — nightly CI has no multi-host v6e capacity). One
+    # Recurrent dp>1 cache_aware reuse gate, SINGLE-host (re-homed from multi-host —
+    # nightly CI has no multi-host v6e capacity). One
     # v6e-4 runs tp4/dp2/ep4: dp2 gives cache_aware something to route across, ep4
     # shards experts so the 35B fits at dp>1, tp4 keeps the fused-MoE t_packing
     # trivial. Two SingleHostRuns (gate + contrast) launch sequentially on one host
@@ -412,7 +412,7 @@ SUITES: dict[str, SingleHostSuite] = {
     # Offline ablation harness (manual; NOT wired into the nightly workflow). Sweeps
     # the dp/ep mesh and a --parallel concurrency list for the recurrent A/B on one
     # v6e-4. tp4 is fixed; ep shards experts so dp>1 fits. Report-only (no --strict)
-    # — heavy (several cold 35B loads), run on demand. See the validation runbook.
+    # — heavy (several cold 35B loads), run on demand.
     "recurrent-ablation-v6e-4": SingleHostSuite(
         name="recurrent-ablation-v6e-4",
         runs=[
@@ -425,7 +425,7 @@ SUITES: dict[str, SingleHostSuite] = {
             ),
         ],
     ),
-    # Recurrent-cache accuracy gate (Next Work item 4): Qwen3.5-35B-A3B tp4/dp2 with
+    # Recurrent-cache accuracy gate: Qwen3.5-35B-A3B tp4/dp2 with
     # the recurrent radix cache ON, gsm8k greedy non-thinking → score >= 0.95
     # (0.97 measured, 3-repeat spread 0.000 → min-0.02). Goes through the AccuracyCase framework (profile +
     # run_accuracy_case) like accuracy-text-models-v6e-4; the e2e determinism test
