@@ -425,6 +425,36 @@ SUITES: dict[str, SingleHostSuite] = {
             ),
         ],
     ),
+    # Recurrent-cache accuracy gate (Next Work item 4): Qwen3.5-35B-A3B tp4/dp2 with
+    # the recurrent radix cache ON, gsm8k greedy non-thinking → score >= 0.90
+    # (~0.965 measured). Goes through the AccuracyCase framework (profile +
+    # run_accuracy_case) like accuracy-text-models-v6e-4; the e2e determinism test
+    # stays a unittest in run_suite.py (it's a 2-run byte-identical comparison).
+    "recurrent-accuracy-v6e-4": SingleHostSuite(
+        name="recurrent-accuracy-v6e-4",
+        runs=[
+            SingleHostRun(
+                launch_profile="recurrent-qwen35-accuracy-v6e-4.yaml",
+                cases=[
+                    AccuracyCase(
+                        name="recurrent-gsm8k",
+                        dataset="gsm8k",
+                        model_id="Qwen/Qwen3.5-35B-A3B",
+                        eval_batch_size=16,
+                        # Non-thinking + max_tokens 1024 so answers fit the bounded
+                        # (8192) context at dp2; greedy → deterministic gate.
+                        generation_config={
+                            "temperature": 0.0,
+                            "max_tokens": 1024,
+                            "chat_template_kwargs": {"enable_thinking": False},
+                        },
+                        limit=200,
+                        score_threshold=0.90,
+                    ),
+                ],
+            ),
+        ],
+    ),
 }
 
 

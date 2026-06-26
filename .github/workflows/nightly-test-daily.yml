@@ -462,6 +462,7 @@ jobs:
       TZ: Asia/Shanghai
       JAX_COMPILATION_CACHE_DIR: /xla-cache
       SGLANG_JAX_MODEL_CACHE: /models/model_scope
+      RESULTS_DIR: ${{ github.workspace }}/test/nightly_test_output/recurrent_accuracy
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
@@ -471,12 +472,16 @@ jobs:
       - name: Setup Python environment
         uses: ./.github/actions/setup-venv
       - name: Run recurrent accuracy gate (v6e-4, tp4/dp2, cache on)
-        # Run from repo root (like the e2e job) so the suite's test/srt-prefixed
-        # path also resolves under rerun-test.yml (/rerun-group). 35B load (bimodal
-        # warm ~29s vs cold gcsfuse ~14-40min) + 200-ex gsm8k -> keep timeout margin.
+        # AccuracyCase framework (profile + run_accuracy_case), like the other
+        # accuracy gates. 35B load (bimodal warm ~29s vs cold gcsfuse ~14-40min) +
+        # 200-ex gsm8k (~5min) -> 90min keeps margin for a cold load.
         timeout-minutes: 90
+        env:
+          # /run-nightly passes a single case name here; empty runs the whole suite.
+          CASES: ${{ inputs.cases }}
         run: |
-          python3 test/srt/run_suite.py --suite nightly-recurrent-accuracy-tpu-v6e-4
+          cd test/srt
+          python3 nightly/single_host/suite_runner.py --suite recurrent-accuracy-v6e-4 ${CASES:+--cases "$CASES"}
 
 
   # Trend drift: detect on v6e-4 (only it can read the /observability-storage

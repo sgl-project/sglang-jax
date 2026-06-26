@@ -260,16 +260,6 @@ suites = {
             ["TestUnifiedRadixCacheServingRecurrent.test_recurrent_hit_flush_determinism"],
         ),
     ],
-    # Recurrent-cache accuracy: Qwen3.5-35B-A3B at tp4/dp2 with the recurrent radix
-    # cache ON, gsm8k greedy -> validates dp>1 recurrent serving keeps accuracy
-    # (~0.96 measured on sky-yh-v6e4). 35B load + 200-ex gsm8k -> nightly on v6e-4.
-    "nightly-recurrent-accuracy-tpu-v6e-4": [
-        TestFile(
-            "test/srt/test_qwen3_5_models.py",
-            25,
-            ["TestQwen35MoeRecurrentRadixAccuracy.test_gsm8k"],
-        ),
-    ],
     "sglang_dependency_test": [],
     "unit-test-tpu-v6e-1": [
         TestFile("python/sgl_jax/test/kernels/quantized_linear_test.py", 0.3, runner="pytest"),

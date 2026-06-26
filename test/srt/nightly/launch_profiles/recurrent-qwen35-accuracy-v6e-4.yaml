@@ -1,0 +1,42 @@
+name: qwen3_5_a3b-recurrent-accuracy-tp4-dp2
+target: v6e-4
+# Recurrent-cache accuracy gate: Qwen3.5-35B-A3B, tp4/dp2 (the 4-chip DP point),
+# unified-radix + recurrent extra-buffer ON. dp2 routes requests across recurrent
+# state pools; gsm8k greedy is deterministic (cache-on == cache-off, the KL==0
+# guarantee), so the score is a tight regression gate. Mirrors the server config the
+# bespoke test validated (gsm8k ~0.965 on a v6e-4). No ep here (it fit at dp2 without
+# expert sharding at these budgets); context bounded 8192 + max-recurrent-state-size
+# 96 keep a positive KV budget at dp2. check_cache_miss stays default (true): the
+# gsm8k shapes are covered by the precompile paddings below (unlike the reuse-sweep).
+model_path: Qwen/Qwen3.5-35B-A3B
+tp_size: 4
+dp_size: 2
+port: 30052
+server_args:
+  - --trust-remote-code
+  - --skip-server-warmup
+  - --random-seed
+  - "3"
+  - --dtype
+  - bfloat16
+  - --mem-fraction-static
+  - "0.8"
+  - --chunked-prefill-size
+  - "512"
+  - --page-size
+  - "128"
+  - --max-running-requests
+  - "16"
+  - --context-length
+  - "8192"
+  - --enable-unified-radix-tree
+  - --enable-recurrent-extra-buffer
+  - --max-recurrent-state-size
+  - "96"
+  - --disable-overlap-schedule
+  - --precompile-bs-paddings
+  - "8"
+  - "16"
+  - --precompile-token-paddings
+  - "512"
+  - "1024"
