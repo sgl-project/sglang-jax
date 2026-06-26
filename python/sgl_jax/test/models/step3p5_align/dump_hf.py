@@ -59,16 +59,37 @@ def main():
         input_ids = input_ids[: args.num_prompts]
     print(f"[hf] {len(input_ids)} prompts, ckpt={args.ckpt}", flush=True)
 
-    from transformers import AutoModelForCausalLM
+    from accelerate import infer_auto_device_map, init_empty_weights
+    from transformers import AutoConfig, AutoModelForCausalLM
 
+    # from_pretrained(device_map="auto") routes through get_balanced_memory, which
+    # auto-injects a CPU budget and offloads MoE layers to CPU even though 393.9GB
+    # fits on the 16 GPUs (uneven layer sizes: dense 0.43GB vs MoE ~9GB confuse the
+    # balanced heuristic). Precompute an explicit GPU-only device_map on a meta
+    # skeleton (no cpu entry) and pass the dict directly -> all weights on GPU.
+    # `dtype` (not deprecated `torch_dtype`) so bf16 actually applies.
+    n_gpu = torch.cuda.device_count()
+    cfg = AutoConfig.from_pretrained(args.ckpt, trust_remote_code=True)
+    with init_empty_weights():
+        skel = AutoModelForCausalLM.from_config(cfg, trust_remote_code=True, dtype=torch.bfloat16)
+    device_map = infer_auto_device_map(
+        skel,
+        max_memory={i: "38GiB" for i in range(n_gpu)},
+        no_split_module_classes=["Step3p5DecoderLayer"],
+        dtype=torch.bfloat16,
+    )
+    del skel
     model = AutoModelForCausalLM.from_pretrained(
         args.ckpt,
-        torch_dtype=torch.bfloat16,
-        device_map=args.device_map,
+        dtype=torch.bfloat16,
+        device_map=device_map,
         trust_remote_code=True,
     )
     model.eval()
-    emb_dev = model.get_input_embeddings().weight.device
+    # checkpoint's Step3p5Model.get_input_embeddings(input_ids) is non-standard
+    # (returns embeddings, not the module), so the no-arg ForCausalLM wrapper
+    # raises TypeError. Take the embedding device directly from embed_tokens.
+    emb_dev = model.model.embed_tokens.weight.device
 
     # A: next-token top-k per prompt. B: per-layer hidden states (mean over layers req'd).
     a_out = []  # [{"prompt": i, "topk": [[tid, logprob], ...]}]
@@ -86,16 +107,21 @@ def main():
         a_out.append({"prompt": i, "topk": [[int(j), float(v)] for j, v in zip(idx, vals)]})
         # hidden_states: tuple len num_layers+1; [l] is the OUTPUT of layer l-1
         # (index 0 = embeddings). We save the output of layer k = hidden_states[k+1].
-        for k in args.layers:
-            h = out.hidden_states[k + 1][0, -1].float().cpu().numpy()  # [hidden]
-            b_hidden[k].append(h)
+        # The checkpoint's modeling_step3p5.py does not populate hidden_states
+        # even with output_hidden_states=True, so B (per-layer localizer) is
+        # skipped. A (next-token argmax) is the primary criterion and works.
+        if out.hidden_states is not None:
+            for k in args.layers:
+                h = out.hidden_states[k + 1][0, -1].float().cpu().numpy()  # [hidden]
+                b_hidden[k].append(h)
         if (i + 1) % 8 == 0:
             print(f"[hf] {i + 1}/{len(input_ids)}", flush=True)
 
     with open(os.path.join(args.out, "A_nexttok.json"), "w") as f:
         json.dump({"topk": args.topk, "data": a_out}, f)
     for k, lst in b_hidden.items():
-        np.save(os.path.join(args.out, f"B_layer{k}.npy"), np.stack(lst))
+        if lst:
+            np.save(os.path.join(args.out, f"B_layer{k}.npy"), np.stack(lst))
     print(f"[hf] wrote A_nexttok.json + B_layer*.npy to {args.out}", flush=True)
 
 
