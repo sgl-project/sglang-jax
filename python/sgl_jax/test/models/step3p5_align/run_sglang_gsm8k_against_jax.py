@@ -22,6 +22,7 @@ sglang-jax server (the real-weight server must be running, OpenAI API enabled):
 """
 
 import argparse
+import os
 from types import SimpleNamespace
 
 from sglang.test.run_eval import run_eval  # upstream sglang's eval
@@ -43,15 +44,24 @@ def main():
     ap.add_argument(
         "--base-url",
         required=True,
-        help="sglang-jax server OpenAI base, e.g. http://host:30000/v1",
+        help="sglang-jax server ROOT, NO /v1 (e.g. http://host:30000). "
+        "sglang's run_eval appends /v1 itself — passing /v1 yields /v1/v1 -> 404.",
     )
     ap.add_argument("--model", required=True, help="served model name (see /v1/models)")
     ap.add_argument("--threshold", type=float, default=SGLANG_STEP35_GSM8K_THRESHOLD)
     args = ap.parse_args()
 
-    eval_args = SimpleNamespace(base_url=args.base_url, model=args.model, **SGLANG_STEP35_GSM8K)
+    # The OpenAI client (used by sglang's sampler) requires an api_key; the server
+    # ignores it. Set a dummy so client init doesn't fail.
+    os.environ.setdefault("OPENAI_API_KEY", "dummy")
+    # Guard against the /v1/v1 404: run_eval will append /v1, so base_url must not.
+    base = args.base_url.rstrip("/")
+    if base.endswith("/v1"):
+        base = base[: -len("/v1")]
+
+    eval_args = SimpleNamespace(base_url=base, model=args.model, **SGLANG_STEP35_GSM8K)
     print(
-        f"[align] running sglang's gsm8k (5-shot/completion/512/200) vs {args.base_url}",
+        f"[align] running sglang's gsm8k (5-shot/completion/512/200) vs {base}/v1",
         flush=True,
     )
     metrics = run_eval(eval_args)
