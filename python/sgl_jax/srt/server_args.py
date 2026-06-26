@@ -997,9 +997,15 @@ class ServerArgs:
         parser.add_argument(
             "--dp-schedule-policy",
             type=str,
-            choices=["round_robin", "min_running_queue"],
+            choices=["round_robin", "min_running_queue", "cache_aware"],
             default=ServerArgs.dp_schedule_policy,
-            help="DP scheduling policy for assigning dp_rank to new requests.",
+            help=(
+                "DP scheduling policy for assigning dp_rank to new requests. "
+                "'cache_aware' routes by cache affinity with soft load balancing: "
+                "it balances on large load skew, else picks the least-loaded rank "
+                "among those holding a substantial cached prefix, so a hot prefix "
+                "spreads across its holders. Improves prefix reuse under DP."
+            ),
         )
 
         # Multi-node distributed serving
