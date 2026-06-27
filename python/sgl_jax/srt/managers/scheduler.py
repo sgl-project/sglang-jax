@@ -63,6 +63,7 @@ from sgl_jax.srt.managers.scheduler_output_processor_mixin import (
     SchedulerOutputProcessorMixin,
 )
 from sgl_jax.srt.managers.scheduler_profiler_mixing import SchedulerProfilerMixin
+from sgl_jax.srt.managers.resource_estimator import ResourceEstimator
 from sgl_jax.srt.managers.tp_worker import ModelWorker
 from sgl_jax.srt.managers.tp_worker_overlap_thread import ModelWorkerClient
 from sgl_jax.srt.managers.utils import validate_input_length
@@ -440,6 +441,13 @@ class Scheduler(
         self.chunked_reqs = [None] * self.dp_size  # Per-DP chunked requests
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and server_args.enable_mixed_chunk
+        )
+
+        # Init resource estimator for best-fit DP scheduling
+        self.resource_estimator = ResourceEstimator.from_server_args(
+            model_config=self.model_config,
+            server_args=server_args,
+            dp_size=self.dp_size,
         )
 
         # Init pause/continue state
@@ -826,28 +834,11 @@ class Scheduler(
     ) -> int | None:
         """Select a DP rank using FLOPs (prefill) and HBM (decode) dimensions.
 
-        Uses a stranding-based approach to minimize wasted resources:
-            * input tokens:   (proxy for FLOPs/prefill load)
-            * output tokens:  (proxy for HBM/decode load)
-
-        1. Compute utilization for each dimension:
-            flops_util = after_input / flops_cap
-            hbm_util = after_output / hbm_cap
-
-        2. Compute inflation factor (driven by bottleneck dimension - the one with higher utilization):
-            inflation = min(flops_cap / after_input, hbm_cap / after_output)
-
-        3. Compute stranding (wasted capacity) per dimension:
-            flops_stranding = 1 - inflation * flops_util
-            hbm_stranding = 1 - inflation * hbm_util
-
-        4. Compute total weighted stranding cost:
-            total_stranding = flops_weight * flops_stranding + hbm_weight * hbm_stranding
-
-        Select the DP rank with the lowest total stranding.
+        Uses the ResourceEstimator's stranding-based approach to minimize wasted
+        resources. See ResourceEstimator.compute_stranding() for the algorithm.
 
         Returns:
-            None if all DP ranks are full.
+            Best DP rank index, or None if all DP ranks are full.
         """
         if self.dp_size == 1:
             return 0
@@ -865,16 +856,6 @@ class Scheduler(
             running_output[i] + extra_output_counts[i] for i in range(self.dp_size)
         ]
 
-        # FLOPs capacity: max prefill tokens per DP
-        flops_cap = max(
-            self.chunked_prefill_size
-            if self.chunked_prefill_size and self.chunked_prefill_size > 0
-            else self.max_prefill_tokens,
-            1,
-        )
-        # HBM capacity: max KV tokens per DP
-        hbm_cap = max(self.max_total_num_tokens // self.dp_size, 1)
-
         # Cost weights for each resource dimension (from server args)
         flops_weight = self.server_args.dp_best_fit_flops_weight
         hbm_weight = self.server_args.dp_best_fit_hbm_weight
@@ -886,25 +867,18 @@ class Scheduler(
             if self.running_batch.reqs_info[dp_rank].batch_is_full:
                 continue
 
+            # Compute load after adding this request (in tokens)
             after_input = input_counts[dp_rank] + item_input_tokens
             after_output = output_counts[dp_rank] + item_output_tokens
 
-            # Utilization ratios
-            flops_util = after_input / flops_cap
-            hbm_util = after_output / hbm_cap
-
-            # Inflation factor (driven by bottleneck dimension - the one with higher utilization)
-            inflation = min(
-                flops_cap / max(after_input, 1),
-                hbm_cap / max(after_output, 1),
+            # Use ResourceEstimator to compute stranding
+            # (internally converts tokens to actual FLOPs and bytes)
+            total_stranding = self.resource_estimator.compute_stranding(
+                input_tokens=after_input,
+                output_tokens=after_output,
+                flops_weight=flops_weight,
+                hbm_weight=hbm_weight,
             )
-
-            # Stranding per dimension
-            flops_stranding = 1 - inflation * flops_util
-            hbm_stranding = 1 - inflation * hbm_util
-
-            # Total weighted stranding cost
-            total_stranding = flops_weight * flops_stranding + hbm_weight * hbm_stranding
 
             if total_stranding < best_stranding:
                 best_stranding = total_stranding

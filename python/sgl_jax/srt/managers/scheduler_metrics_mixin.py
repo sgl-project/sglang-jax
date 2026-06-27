@@ -127,6 +127,24 @@ class SchedulerMetricsMixin:
         if batch.dp_size > 1:
             per_dp_running = [len(info.reqs) if info.reqs else 0 for info in batch.reqs_info]
             msg += f"#running-req per DP: {per_dp_running}, "
+            # Per-DP resource load + stranding (best-fit observability).
+            # Uses the same capacities as the scheduler, so the reported
+            # stranding reflects actual (committed) scheduling behavior.
+            dp_in, dp_out = self._get_dp_compute_memory_snapshot()
+            per_dp_load = [(dp_in[i], dp_out[i]) for i in range(batch.dp_size)]
+            per_dp_stranding = [
+                round(
+                    self.resource_estimator.compute_stranding(
+                        input_tokens=dp_in[i],
+                        output_tokens=dp_out[i],
+                        flops_weight=self.server_args.dp_best_fit_flops_weight,
+                        hbm_weight=self.server_args.dp_best_fit_hbm_weight,
+                    ),
+                    4,
+                )
+                for i in range(batch.dp_size)
+            ]
+            msg += f"load per DP: {per_dp_load}, stranding per DP: {per_dp_stranding}, "
 
         if running_batch.spec_algorithm is not None and not running_batch.spec_algorithm.is_none():
             accept_ratio = self.accept_token / self.draft_token

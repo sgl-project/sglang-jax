@@ -1,5 +1,7 @@
 """Tests for best-fit DP scheduling with stranding-based scoring."""
 
+from __future__ import annotations
+
 import random
 import unittest
 from dataclasses import dataclass
