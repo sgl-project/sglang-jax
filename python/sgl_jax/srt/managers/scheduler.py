@@ -876,6 +876,16 @@ class Scheduler(
             if batch:
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
+            elif any(r is not None for r in self.chunked_reqs):
+                # Spec non-overlap blocks prefill while running_batch is non-empty
+                # (get_new_batch_prefill early-return). When the last running req
+                # finishes, the same call still sees the finished req in
+                # running_batch, returns None, and update_running_batch then
+                # filters it to empty -> batch=None for one iteration. Chunked
+                # reqs on other DP ranks still hold KV at that moment, so
+                # check_memory() would raise a false-positive leak. Skip the
+                # idle bookkeeping; next iteration prefill will resume chunk2.
+                pass
             else:
                 # When the server is idle, do self-check and re-init some states
                 self.check_memory()
