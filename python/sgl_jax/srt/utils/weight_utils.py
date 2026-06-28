@@ -1813,6 +1813,14 @@ class WeightLoader:
                 len(file_groups),
                 n_local,
             )
+            if os.environ.get("SGLANG_MOE_BULK_BLOCK") == "1":
+                # Pathways single-controller: device_put to remote workers is
+                # async via IFRT proxy; without blocking the host shard buffers
+                # accumulate across all groups (~963G for V2.5-Pro) and evict
+                # the c4-192 head node. Block per group to bound host RSS.
+                jax.block_until_ready(result)
+                expert_data_map.clear()
+                del per_device_arrays
         else:
             # Pre-warm safetensors file handles to avoid cold-start latency
             # during serial callbacks. This is especially important for small

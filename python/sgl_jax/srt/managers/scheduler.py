@@ -306,7 +306,12 @@ class Scheduler(
             from sgl_jax.srt.disaggregation.pathways_pd import make_slice_meshes
 
             server_args.disable_radix_cache = True
-            os.environ["SGLANG_PD_WEIGHT_CACHE"] = "1"
+            if not server_args.quantization_config_path:
+                # Dynamic quant: cache holds BF16; after quant the fp8 model
+                # plus BF16 cache exceeds device HBM (139G>103G on v7x).
+                # setdefault so SGLANG_PD_WEIGHT_CACHE=0 can disable for >768G
+                # checkpoints that overflow the c4-192 head-node host RAM.
+                os.environ.setdefault("SGLANG_PD_WEIGHT_CACHE", "1")
             os.environ.setdefault("SGLANG_MOE_BULK_READ", "1")
             self._pd_n_prefill = max(1, server_args.pd_num_prefill)
             self.p_meshes, self.mesh = make_slice_meshes(
@@ -361,7 +366,11 @@ class Scheduler(
             d_args = _copy.deepcopy(server_args)
             d_args.mem_fraction_static = server_args.pd_decode_mem_fraction
             d_args.disable_radix_cache = True
+            from sgl_jax.srt.mem_cache.allocator import (
+                SWATokenToKVPoolAllocator as _SWAAlloc,
+            )
             from sgl_jax.srt.mem_cache.chunk_cache import ChunkCache as _CC
+            from sgl_jax.srt.mem_cache.chunk_cache import SWAChunkCache as _SWACC
 
             n_p = getattr(self, "_pd_n_prefill", 1)
             p_meshes = getattr(self, "p_meshes", [self.p_mesh])
@@ -382,7 +391,17 @@ class Scheduler(
                 r2t, alloc = w.get_memory_pool()
                 self.p_r2ts.append(r2t)
                 self.p_allocs.append(alloc)
-                self.p_trees.append(_CC(r2t, alloc, page_size=server_args.page_size))
+                if isinstance(alloc, _SWAAlloc):
+                    self.p_trees.append(
+                        _SWACC(
+                            r2t,
+                            alloc,
+                            page_size=server_args.page_size,
+                            sliding_window_size=w.sliding_window_size,
+                        )
+                    )
+                else:
+                    self.p_trees.append(_CC(r2t, alloc, page_size=server_args.page_size))
             self.tp_worker_p = self.tp_workers_p[0]
             self.p_r2t, self.p_alloc, self.p_tree = (
                 self.p_r2ts[0],
@@ -406,9 +425,18 @@ class Scheduler(
 
                 from sgl_jax.srt.disaggregation.pathways_pd import PathwaysPDKVTransfer
 
+                d_alloc = self.tp_worker.model_runner.token_to_kv_pool_allocator
                 self.kv_transfers = [
-                    PathwaysPDKVTransfer(pm, d_mesh, w.model_runner.token_to_kv_pool, d_kv)
-                    for pm, w in zip(p_meshes, self.tp_workers_p)
+                    PathwaysPDKVTransfer(
+                        pm,
+                        d_mesh,
+                        w.model_runner.token_to_kv_pool,
+                        d_kv,
+                        p_alloc=self.p_allocs[i],
+                        d_alloc=d_alloc,
+                        page_size=server_args.page_size,
+                    )
+                    for i, (pm, w) in enumerate(zip(p_meshes, self.tp_workers_p))
                 ]
                 self.kv_transfer = self.kv_transfers[0]
                 self._pd_prefill_qs = [_Queue(maxsize=2) for _ in range(n_p)]

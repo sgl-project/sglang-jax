@@ -93,77 +93,106 @@ def make_slice_meshes(
     return p_meshes, d_mesh
 
 
+def _make_pool_jits(p_mesh: Mesh, d_mesh: Mesh, p_sub, d_sub):
+    """Build (gather_jit, scatter_jit, d_stack_shard) for one MHA-style sub-pool."""
+    kv_spec = d_sub.kv_sharding.spec
+    page_spec = P(None, *kv_spec[1:])
+    stack_spec = P(None, *kv_spec)
+    gather_jit = jax.jit(
+        lambda bufs, idx: jnp.stack([b.at[idx].get(out_sharding=page_spec) for b in bufs])
+    )
+    scatter_jit = jax.jit(
+        lambda bufs, idx, stacked: tuple(
+            b.at[idx].set(stacked[i], out_sharding=kv_spec) for i, b in enumerate(bufs)
+        ),
+        donate_argnums=(0,),
+    )
+    return gather_jit, scatter_jit, NamedSharding(d_mesh, stack_spec)
+
+
 class PathwaysPDKVTransfer:
     """Paged KV pool P-mesh -> D-mesh via cross-slice device_put.
 
     gather(P pages) -> stack L layers -> device_put to d_mesh sharding
     -> scatter into D pool (donate). Single transfer per batch maximizes
     payload (P0 measured 28.9 GB/s aggregate at 2048 MiB on 2x v7x-8).
+
+    SWAKVPool: full + swa sub-pools transferred independently. Input/output
+    pages are in the *full* index space; swa pages are derived per side via
+    each allocator's full_to_swa_index_mapping (page-aligned 1:1 because PD
+    forces disable_radix + no chunked prefill, so every alloc is page-head).
     """
 
-    def __init__(self, p_mesh: Mesh, d_mesh: Mesh, p_pool, d_pool) -> None:
+    def __init__(self, p_mesh: Mesh, d_mesh: Mesh, p_pool, d_pool, **kw) -> None:
         self.p_mesh = p_mesh
         self.d_mesh = d_mesh
-        self.p_pool = p_pool
         self.d_pool = d_pool
-        self.L = p_pool.layer_num
-        self.page_shape = p_pool.kv_buffer[0].shape[1:]
-        # kv_buffer real spec is P("data", None, "tensor", None, None) (5-dim fused
-        # KV); the previous hardcoded 4-dim P("data",None,None,None) made XLA
-        # all-gather dim2 (tensor=16) across 36 layers -> ~170ms/scatter on D
-        # device (xprof confirmed: scatter_custom_fusion 0.005ms vs module 170ms).
-        kv_spec = d_pool.kv_sharding.spec
-        page_spec = P(None, *kv_spec[1:])  # gathered pages: dim0=npg unsharded
-        stack_spec = P(None, *kv_spec)  # stacked: [L, num_pages_dim, ...]
-        self._d_stack_shard = NamedSharding(d_mesh, stack_spec)
-
-        self._gather_stack = jax.jit(
-            lambda bufs, idx: jnp.stack([b.at[idx].get(out_sharding=page_spec) for b in bufs])
-        )
-        self._scatter_jit = jax.jit(
-            lambda bufs, idx, stacked: tuple(
-                b.at[idx].set(stacked[i], out_sharding=kv_spec) for i, b in enumerate(bufs)
-            ),
-            donate_argnums=(0,),
-        )
+        self.is_swa = hasattr(p_pool, "swa_kv_pool")
+        if self.is_swa:
+            self.page_size = kw["page_size"]
+            self.p_mapping = kw["p_alloc"].full_to_swa_index_mapping
+            self.d_mapping = kw["d_alloc"].full_to_swa_index_mapping
+            sub_pools = [
+                (p_pool.full_kv_pool, d_pool.full_kv_pool),
+                (p_pool.swa_kv_pool, d_pool.swa_kv_pool),
+            ]
+        else:
+            sub_pools = [(p_pool, d_pool)]
+        # _jits[k] = (gather, scatter, d_stack_shard, p_sub_pool, d_sub_pool)
+        self._jits = [
+            (*_make_pool_jits(p_mesh, d_mesh, p_sub, d_sub), p_sub, d_sub)
+            for p_sub, d_sub in sub_pools
+        ]
         self._p_idx_shard = NamedSharding(p_mesh, P(None))
         self._d_idx_shard = NamedSharding(d_mesh, P(None))
+        logger.info(
+            "[pathways_pd] kv_transfer is_swa=%s sub_pools=%d layers=%s",
+            self.is_swa,
+            len(sub_pools),
+            [p.layer_num for p, _ in sub_pools],
+        )
 
-    def gather_to_dmesh(self, p_pages: np.ndarray) -> tuple[jax.Array, int]:
-        """gather P pool pages -> stack -> device_put to D mesh -> block.
+    def _swa_pages(self, full_pages: np.ndarray, mapping) -> np.ndarray:
+        # PD currently runs dp=1 only; mapping is a single np.array.
+        m = mapping[0] if isinstance(mapping, list) else mapping
+        return (m[full_pages.astype(np.int64) * self.page_size] // self.page_size).astype(np.int32)
 
-        Runs in the prefill thread; blocks here so the main (decode) thread
-        never waits on cross-slice transfer. Returns (d_stacked, bucket_len).
+    def gather_to_dmesh(self, p_pages: np.ndarray) -> tuple[jax.Array | tuple, int]:
+        """gather P pool pages -> stack -> device_put to D mesh.
+
+        Runs in the prefill thread; the returned d_stacked is a future on the
+        D mesh — main-thread scatter consumes it via data-dep so the cross-slice
+        RecvRefs interleaves with decode instead of stalling here for ~250ms.
         """
         p_pages = np.asarray(p_pages, np.int32)
         npg = len(p_pages)
         bucket = _bucket_npg(npg)
         if bucket > npg:
             p_pages = np.concatenate([p_pages, np.full(bucket - npg, p_pages[-1], np.int32)])
-        p_idx = jax.device_put(p_pages, self._p_idx_shard)
-        with jax.set_mesh(self.p_mesh):
-            p_stacked = self._gather_stack(tuple(self.p_pool.kv_buffer), p_idx)
-        # Do NOT block on d_stacked: kRecvRefs on the dst slice is hard-coded
-        # kSerializedOnDeviceThread (worker_op_dispatcher.cc GetOpSyncMode) and
-        # queues behind concurrent decode kExecute (~15*17ms backpressure).
-        # Return the future; main-thread scatter consumes it via data-dep so
-        # the RecvRefs lands in the D Processor queue early and interleaves
-        # with decode instead of stalling this thread for ~250ms.
-        d_stacked = jax.device_put(p_stacked, self._d_stack_shard)
-        return d_stacked, bucket
+        out = []
+        for k, (gather_jit, _, d_stack_shard, p_sub, _) in enumerate(self._jits):
+            pp = p_pages if k == 0 else self._swa_pages(p_pages, self.p_mapping)
+            p_idx = jax.device_put(pp, self._p_idx_shard)
+            with jax.set_mesh(self.p_mesh):
+                p_stacked = gather_jit(tuple(p_sub.kv_buffer), p_idx)
+            out.append(jax.device_put(p_stacked, d_stack_shard))
+        return (out[0] if len(out) == 1 else tuple(out), bucket)
 
-    def scatter_from_dmesh(self, d_pages: np.ndarray, d_stacked: jax.Array, bucket: int) -> None:
+    def scatter_from_dmesh(self, d_pages: np.ndarray, d_stacked, bucket: int) -> None:
         """scatter d_stacked into D pool. Called on the main thread so the
-        donated d_pool.kv_buffer reassignment is ordered before the next decode
+        donated kv_buffer reassignment is ordered before the next decode
         forward dispatch (data-dependency guarantees device-side ordering)."""
         d_pages = np.asarray(d_pages, np.int32)
         npg = len(d_pages)
         if bucket > npg:
             d_pages = np.concatenate([d_pages, np.full(bucket - npg, d_pages[-1], np.int32)])
-        d_idx = jax.device_put(d_pages, self._d_idx_shard)
+        stacked = d_stacked if isinstance(d_stacked, tuple) else (d_stacked,)
         with self.d_pool._donate_lock, jax.set_mesh(self.d_mesh):
-            new_bufs = self._scatter_jit(tuple(self.d_pool.kv_buffer), d_idx, d_stacked)
-            self.d_pool.kv_buffer = list(new_bufs)
+            for k, (_, scatter_jit, _, _, d_sub) in enumerate(self._jits):
+                dp = d_pages if k == 0 else self._swa_pages(d_pages, self.d_mapping)
+                d_idx = jax.device_put(dp, self._d_idx_shard)
+                new_bufs = scatter_jit(tuple(d_sub.kv_buffer), d_idx, stacked[k])
+                d_sub.kv_buffer = list(new_bufs)
 
     def transfer(self, p_page_indices: np.ndarray, d_page_indices: np.ndarray) -> None:
         p_page_indices = np.asarray(p_page_indices, np.int32)
