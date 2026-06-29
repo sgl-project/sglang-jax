@@ -424,13 +424,25 @@ class Qwen3_5DecoderLayer(nnx.Module):
     ):
         text_cfg = config.text_config
         self.is_full_attn = layer_id in text_cfg.full_attention_layer_ids
+        self.is_moe = text_cfg.is_moe
 
         if self.is_full_attn:
             self.self_attn = Qwen3_5Attention(config, mesh, layer_id, dtype=dtype)
         else:
             self.self_attn = Qwen3_5GatedDeltaNet(config, mesh, layer_id, dtype=dtype)
 
-        self.mlp = Qwen3_5MoeBlock(config, mesh, layer_id, dtype=dtype)
+        if self.is_moe:
+            self.mlp = Qwen3_5MoeBlock(config, mesh, layer_id, dtype=dtype)
+        else:
+            # Dense: plain SwiGLU (Qwen2MoeMLP doubles as the column/row-parallel MLP).
+            self.mlp = Qwen2MoeMLP(
+                hidden_size=text_cfg.hidden_size,
+                intermediate_size=text_cfg.intermediate_size,
+                mesh=mesh,
+                layer_id=layer_id,
+                dtype=dtype,
+                gate_up_down_bias=False,
+            )
         self.input_layernorm = GemmaRMSNorm(text_cfg.hidden_size, epsilon=text_cfg.rms_norm_eps)
         self.post_attention_layernorm = GemmaRMSNorm(
             text_cfg.hidden_size, epsilon=text_cfg.rms_norm_eps
@@ -464,7 +476,12 @@ class Qwen3_5DecoderLayer(nnx.Module):
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
 
-        hidden_states, topk_ids = self.mlp(hidden_states, forward_batch, dispatch_info)
+        # MoE MLP consumes routing info and returns topk_ids; dense takes only hidden.
+        if self.is_moe:
+            hidden_states, topk_ids = self.mlp(hidden_states, forward_batch, dispatch_info)
+        else:
+            hidden_states = self.mlp(hidden_states)
+            topk_ids = None
         return hidden_states, residual, attn_state, topk_ids
 
 
@@ -518,7 +535,9 @@ class Qwen3_5MoeModel(nnx.Module):
                 rec_buf, conv_buf_list = attn_state
                 layers_rec_buffers.append(rec_buf)
                 layers_conv_buffers.append(conv_buf_list)
-            layers_topk_ids.append(topk_ids)
+            # Dense yields topk_ids=None; keep the list MoE-only (no-op EPLB for dense).
+            if topk_ids is not None:
+                layers_topk_ids.append(topk_ids)
 
         if residual is not None:
             hidden_states = hidden_states + residual
@@ -679,6 +698,7 @@ class Qwen3_5MoeForConditionalGeneration(nnx.Module):
         tc = hf_config.text_config
         num_layers = int(tc.num_hidden_layers)
         gdn_layers = list(tc.linear_layer_ids)
+        is_moe = tc.is_moe
 
         mappings, visual_skip, mtp_skip = _create_qwen3_5_weight_mappings(hf_config)
 
@@ -696,8 +716,11 @@ class Qwen3_5MoeForConditionalGeneration(nnx.Module):
                     f"{s}.conv1d.weight",
                 }
             )
-        for i in range(num_layers):
-            special.add(f"model.language_model.layers.{i}.mlp.experts.gate_up_proj")
+        # Pre-fused experts exist only in MoE variants; dense FFN weights are
+        # simple column/row-parallel and go through the shared loader.
+        if is_moe:
+            for i in range(num_layers):
+                special.add(f"model.language_model.layers.{i}.mlp.experts.gate_up_proj")
 
         simple = {k: v for k, v in mappings.items() if k not in special}
 
@@ -709,8 +732,9 @@ class Qwen3_5MoeForConditionalGeneration(nnx.Module):
         with SequentialSafetensorManager() as fm:
             for i in gdn_layers:
                 self._load_gdn_layer(fm, weight_info, i, tp)
-            for i in range(num_layers):
-                self._load_moe_gate_up(fm, weight_info, i)
+            if is_moe:
+                for i in range(num_layers):
+                    self._load_moe_gate_up(fm, weight_info, i)
 
         self._log_load_summary(mappings, weight_info, visual_skip, mtp_skip)
 
@@ -759,6 +783,8 @@ def _create_qwen3_5_weight_mappings(hf_config):
     tc = hf_config.text_config
     num_layers = int(tc.num_hidden_layers)
     full_attn_ids = set(tc.full_attention_layer_ids)
+    is_moe = tc.is_moe
+    tie_word_embeddings = bool(getattr(hf_config, "tie_word_embeddings", False))
     key_dim = tc.linear_num_key_heads * tc.linear_key_head_dim
     value_dim = tc.linear_num_value_heads * tc.linear_value_head_dim
     conv_dim = 2 * key_dim + value_dim
@@ -777,11 +803,14 @@ def _create_qwen3_5_weight_mappings(hf_config):
         sharding=(None,),
         transpose=False,
     )
-    mappings["lm_head.weight"] = WeightMapping(
-        target_path="lm_head.embedding",
-        sharding=("tensor", None),
-        transpose=False,
-    )
+    # Tied variants (0.8B / 2B / 4B) ship no ``lm_head.weight`` and reuse the
+    # embedding; the wrapper omits the lm_head module, so omit its mapping too.
+    if not tie_word_embeddings:
+        mappings["lm_head.weight"] = WeightMapping(
+            target_path="lm_head.embedding",
+            sharding=("tensor", None),
+            transpose=False,
+        )
 
     for i in range(num_layers):
         is_full = i in full_attn_ids
@@ -861,7 +890,27 @@ def _create_qwen3_5_weight_mappings(hf_config):
                 transpose=True,
             )
 
-        # MoE (all 40 layers). Experts are pre-fused on disk.
+        # FFN. Dense layers carry a plain SwiGLU (mlp.{gate,up,down}_proj); MoE
+        # layers carry the pre-fused routed experts + sigmoid-gated shared expert.
+        if not is_moe:
+            mappings[f"{src}.mlp.gate_proj.weight"] = WeightMapping(
+                target_path=f"{dst}.mlp.gate_proj.weight",
+                sharding=(None, "tensor"),
+                transpose=True,
+            )
+            mappings[f"{src}.mlp.up_proj.weight"] = WeightMapping(
+                target_path=f"{dst}.mlp.up_proj.weight",
+                sharding=(None, "tensor"),
+                transpose=True,
+            )
+            mappings[f"{src}.mlp.down_proj.weight"] = WeightMapping(
+                target_path=f"{dst}.mlp.down_proj.weight",
+                sharding=("tensor", None),
+                transpose=True,
+            )
+            continue
+
+        # MoE (all layers when is_moe). Experts are pre-fused on disk.
         mappings[f"{src}.mlp.gate.weight"] = WeightMapping(
             target_path=f"{dst}.mlp.moe_gate.kernel", sharding=(None, None), transpose=True
         )
@@ -901,4 +950,12 @@ def _create_qwen3_5_weight_mappings(hf_config):
     return mappings, _VISUAL_SKIP_PATTERNS, _MTP_SKIP_PATTERNS
 
 
-EntryClass = Qwen3_5MoeForConditionalGeneration
+class Qwen3_5ForConditionalGeneration(Qwen3_5MoeForConditionalGeneration):
+    """Dense Qwen3.5 (0.8B–27B). Behavior is fully config-driven in the base
+    class (MLP + weight loader branch on ``text_config.is_moe``); this subclass
+    exists only so the dense ``architectures`` name resolves via the
+    ``__name__``-keyed model registry.
+    """
+
+
+EntryClass = [Qwen3_5MoeForConditionalGeneration, Qwen3_5ForConditionalGeneration]

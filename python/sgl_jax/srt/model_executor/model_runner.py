@@ -18,6 +18,7 @@ from sgl_jax.srt.eplb.expert_location import (
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
 from sgl_jax.srt.layers.routed_experts_capturer import (
     RoutedExpertsCapturer,
+    get_routed_expert_count,
     set_global_experts_capturer,
 )
 from sgl_jax.srt.layers.sampler import Sampler, compute_logprobs
@@ -179,7 +180,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 dist_recorder_buffer_size=self.server_args.expert_distribution_recorder_buffer_size,
                 dist_recorder_output_file=self.server_args.expert_distribution_recorder_output_file,
                 physical_expert_counts=self.server_args.ep_num_redundant_experts
-                + getattr(self.model_config.hf_config, "num_experts", 0),
+                + (get_routed_expert_count(self.model_config) or 0),
             )
         )
 
