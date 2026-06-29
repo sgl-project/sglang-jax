@@ -322,6 +322,34 @@ class TestClampOverLimit(unittest.TestCase):
                 swiglu_limit=swiglu_limit,
             )
 
+    def test_clamp_layer_index_mapping(self):
+        """config swiglu_limits[i] -> layer i (routed reads swiglu_limits, shared reads
+        swiglu_limits_shared). Mirrors the REAL Step-3.5 distribution: layer 43 =
+        routed-only (7), layer 44 = routed (7) + shared (16), layer 3 = none.
+
+        Alignment cannot cover this: its single clamp layer is routed+shared only, and
+        its small random weights keep activations below the limit so the clamp is a
+        no-op (it would pass with the clamp wired to the wrong layer). This test pins
+        the config->layer index mapping directly, with the real routed-only case.
+        """
+        NL = 45
+        routed = [0.0] * NL
+        shared = [0.0] * NL
+        routed[43] = routed[44] = 7.0  # routed clamp on 43 and 44
+        shared[44] = 16.0  # shared clamp only on 44
+        cfg = _tiny_moe_config(layer_id=43, num_layers=NL)
+        cfg.swiglu_limits = routed
+        cfg.swiglu_limits_shared = shared
+        cases = {3: (None, None), 43: (7.0, None), 44: (7.0, 16.0)}
+        for lid, (exp_routed, exp_shared) in cases.items():
+            moe = _build_moe(cfg, layer_id=lid, mesh=self.mesh)
+            self.assertEqual(
+                moe.experts.swiglu_limit, exp_routed, f"layer {lid}: routed swiglu_limit"
+            )
+            self.assertEqual(
+                moe.shared_experts.swiglu_limit, exp_shared, f"layer {lid}: shared swiglu_limit"
+            )
+
     def test_routed_clamp_upper_only(self):
         """Routed expert gate clamped upper-only at limit=7 (via EPMoE swiglu_limit)."""
         E, H, inter, T, K, L = 8, 32, 16, 4, 2, 7.0
