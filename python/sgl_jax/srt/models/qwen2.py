@@ -7,7 +7,7 @@ from flax import nnx
 from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig
-from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, RotaryEmbedding
+from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, get_rope
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
@@ -127,12 +127,13 @@ class Qwen2Attention(nnx.Module):
             params_dtype=dtype,
             mesh=mesh,
         )
-        self.rotary_emb = RotaryEmbedding(
+        self.rotary_emb = get_rope(
             head_size=self.head_dim,
             rotary_dim=self.head_dim,
-            max_position_embeddings=max_position_embeddings,
+            max_position=max_position_embeddings,
             base=rope_theta,
             is_neox_style=True,
+            rope_scaling=rope_scaling,
             dtype=dtype,
         )
 
@@ -293,9 +294,18 @@ class Qwen2Model(nnx.Module):
         )
         layers_kv_fused = []
         layers_callback_flag = []
+        # MRoPE-aware: use 3-D forward_batch.mrope_positions when present (set by
+        # the multimodal path for Qwen2.5-VL); text-only batches leave it None and
+        # fall back to the 1-D positions. The per-layer rotary_emb (plain or
+        # MRotaryEmbedding from get_rope) consumes whichever transparently.
+        rope_positions = (
+            forward_batch.mrope_positions
+            if forward_batch.mrope_positions is not None
+            else forward_batch.positions
+        )
         for layer in self.layers:
             hidden_states, residual, kv_fused, callback_flag = layer(
-                forward_batch.positions,
+                rope_positions,
                 hidden_states,
                 forward_batch,
                 token_to_kv_pool,

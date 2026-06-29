@@ -14,10 +14,10 @@ from transformers import modeling_flax_utils
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.hf_transformers_utils import get_hf_text_config
-from sgl_jax.srt.layers.embeddings import MRotaryEmbedding, ParallelLMHead
+from sgl_jax.srt.layers.embeddings import ParallelLMHead
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.managers.mm_utils import mm_encode
-from sgl_jax.srt.mem_cache.memory_pool import KVCache, MemoryPools
+from sgl_jax.srt.mem_cache.memory_pool import MemoryPools
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.models.qwen2 import Qwen2Model
 from sgl_jax.srt.multimodal.configs.qwen_vl.qwen_2_5_vl_config import (
@@ -664,85 +664,11 @@ def _get_visual_config(config: Any) -> QwenVLModelVitConfig:
     return vision_config
 
 
-class Qwen2_5_VL_Model(Qwen2Model):
-    """Qwen2Model with MRoPE support for Qwen2.5-VL.
-
-    Kept as a subclass (B): the base ``Qwen2Model`` rope is not MRoPE-aware
-    (hardcoded ``RotaryEmbedding`` that flattens positions), so MRoPE is isolated
-    here -- ``__init__`` swaps each layer's ``rotary_emb`` to ``MRotaryEmbedding``
-    and ``__call__`` feeds 3-D ``forward_batch.mrope_positions``. Base ``qwen2.py``
-    is untouched.
-    """
-
-    def __init__(
-        self,
-        config,
-        mesh,
-        dtype=jnp.bfloat16,
-    ):
-        super().__init__(config=config, mesh=mesh, dtype=dtype)
-        rope_scaling = getattr(config, "rope_scaling", None) or {}
-        self._mrope_section = rope_scaling.get("mrope_section")
-        self._mrope_interleaved = rope_scaling.get("mrope_interleaved", False)
-        if self._mrope_section:
-            rope_theta = getattr(config, "rope_theta", 1000000)
-            max_position_embeddings = getattr(config, "max_position_embeddings", 32768)
-            for layer in self.layers:
-                head_dim = layer.self_attn.head_dim
-                layer.self_attn.rotary_emb = MRotaryEmbedding(
-                    head_size=head_dim,
-                    rotary_dim=head_dim,
-                    max_position_embeddings=max_position_embeddings,
-                    base=rope_theta,
-                    is_neox_style=True,
-                    dtype=dtype,
-                    mrope_section=self._mrope_section,
-                    mrope_interleaved=self._mrope_interleaved,
-                )
-
-    def __call__(
-        self,
-        forward_batch: ForwardBatch,
-        token_to_kv_pool: KVCache,
-    ):
-        residual = None
-        input_embeds = (
-            forward_batch.input_embedding
-            if forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
-            else None
-        )
-        hidden_states = (
-            self.embed_tokens(forward_batch.input_ids) if input_embeds is None else input_embeds
-        )
-        rope_positions = (
-            forward_batch.mrope_positions
-            if self._mrope_section and forward_batch.mrope_positions is not None
-            else forward_batch.positions
-        )
-        layers_kv_fused = []
-        layers_callback_flag = []
-        for layer in self.layers:
-            hidden_states, residual, kv_fused, callback_flag = layer(
-                rope_positions,
-                hidden_states,
-                forward_batch,
-                token_to_kv_pool,
-                residual,
-            )
-            layers_kv_fused.append(kv_fused)
-            layers_callback_flag.extend(callback_flag)
-
-        if residual is not None:
-            hidden_states += residual
-        hidden_states = self.norm(hidden_states)
-
-        return hidden_states, layers_kv_fused, layers_callback_flag
-
-
 class Qwen2_5_VLForConditionalGeneration(nnx.Module):
     """In-model Qwen2.5-VL (single-file): vision tower + Qwen2 backbone (+ MRoPE)
     + lm_head. The visual encode/merge surfaces stay outside the backbone JIT;
-    MRoPE lives in ``Qwen2_5_VL_Model``.
+    MRoPE is handled transparently by the plain ``Qwen2Model`` (mrope-aware
+    ``get_rope`` + 3-D ``forward_batch.mrope_positions``), so no backbone subclass.
     """
 
     def __init__(self, config=None, dtype=None, mesh=None, rngs=None):
@@ -753,7 +679,7 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
         self.dtype = dtype or jnp.bfloat16
 
         # Language backbone (Qwen2 + MRoPE) + lm_head + logits.
-        self.model = Qwen2_5_VL_Model(self.text_config, mesh=mesh, dtype=self.dtype)
+        self.model = Qwen2Model(self.text_config, mesh=mesh, dtype=self.dtype)
         if not getattr(self.text_config, "tie_word_embeddings", False):
             self.lm_head = ParallelLMHead(
                 self.text_config.vocab_size,
