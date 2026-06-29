@@ -57,6 +57,7 @@ class Step3p5Config(PretrainedConfig):
         moe_top_k: int = 8,
         moe_intermediate_size: int = 1280,
         share_expert_dim: int = 1280,
+        share_expert_dims: int | None = None,
         moe_router_activation: str = "sigmoid",
         moe_router_scaling_factor: float = 3.0,
         norm_expert_weight: bool = True,
@@ -106,7 +107,13 @@ class Step3p5Config(PretrainedConfig):
         self.num_experts = moe_num_experts
         self.num_experts_per_tok = moe_top_k
         self.moe_intermediate_size = moe_intermediate_size
-        self.share_expert_dim = share_expert_dim
+        # `share_expert_dims` (plural) is the canonical name in the HF checkpoint
+        # config.json and upstream sglang's Step3p5Config; it wins when present.
+        # `share_expert_dim` (singular) is kept for internal/test callers. Both map
+        # to self.share_expert_dim (mirrors upstream's self.share_expert_dim = share_expert_dims).
+        self.share_expert_dim = (
+            share_expert_dims if share_expert_dims is not None else share_expert_dim
+        )
         self.moe_router_activation = moe_router_activation
         self.moe_router_scaling_factor = moe_router_scaling_factor
         self.norm_expert_weight = norm_expert_weight
