@@ -49,7 +49,6 @@ class EmbedRound:
     encode_inputs: Any  # VisionEncodeInputs (opaque)
     src_idx: Any  # [total_token] int   token -> features row
     mask: Any  # [total_token] bool
-    out_rows: int
 
 
 @dataclass

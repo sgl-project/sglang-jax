@@ -3164,7 +3164,6 @@ def build_mm_embed_plan(
                 encode_inputs=encode_inputs,
                 src_idx=src_idx_k,
                 mask=mask_k,
-                out_rows=out_rows_k,
             )
         )
 
