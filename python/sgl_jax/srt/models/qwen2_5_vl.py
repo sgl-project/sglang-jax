@@ -718,11 +718,17 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
 
         aux 落点 = Design X: compute the ViT aux arrays HERE (host, per rank from
         `enc.grid`), reshard to `P("data")`, then run the JIT(1) encode shard_map.
-        `enc` is a `VisionEncodeInputs` for one DP round. Returns
+        The ViT weights are passed into `mm_encode` as an explicit JIT operand via
+        `nnx.split` (graphdef static + state dynamic), NOT closure-captured, so a
+        weight reload needs no compile-cache clear (aligns the backbone's nnx.split
+        convention). `enc` is a `VisionEncodeInputs` for one DP round. Returns
         `[dp*out_rows, H]` as `P("data", None)`.
         """
         aux = self._compute_round_aux(enc.grid)
-        return mm_encode(self.mesh, self._vision_encode_body, enc.pixels, aux, enc.valid)
+        graphdef, state = nnx.split(self.visual)
+        return mm_encode(
+            self.mesh, graphdef, self._vision_encode_body, state, enc.pixels, aux, enc.valid
+        )
 
     def _compute_round_aux(self, grid):
         """Per-round host aux (Design X; computed here from ``grid`` instead of
@@ -774,13 +780,16 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
             stacked_leaves.append(self._device_put_data_axis(stacked, spec))
         return tuple(stacked_leaves)
 
-    def _vision_encode_body(self, pixels, aux, valid):
+    @staticmethod
+    def _vision_encode_body(visual, pixels, aux, valid):
         """Single-image ViT body for one DP rank (runs INSIDE the JIT(1) encode
-        shard_map). `aux` is the 4-tuple `(window_index, rotary_pos_emb,
+        shard_map). ``visual`` is the ViT tower merged inside ``mm_encode`` from the
+        nnx graphdef/state passed in -- weights are an explicit JIT operand, not
+        closure-captured. `aux` is the 4-tuple `(window_index, rotary_pos_emb,
         cu_seqlens, cu_window_seqlens)` computed host-side by `get_image_feature`
         (`_compute_round_aux`). Returns `[out_rows, H]` for this rank's image.
         """
-        return self.visual.compute_hidden_states(pixels, *aux, valid_patch_rows=valid)
+        return visual.compute_hidden_states(pixels, *aux, valid_patch_rows=valid)
 
     def load_weights(self, model_config: ModelConfig):
         # Backbone (text) weights -- folded in from former Qwen2_5_VL_Generation.

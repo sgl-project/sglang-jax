@@ -22,6 +22,7 @@ import functools
 
 import jax
 import jax.numpy as jnp
+from flax import nnx
 from jax.sharding import PartitionSpec
 
 _MERGE_IN_SPECS = (
@@ -60,21 +61,28 @@ def mm_merge(mesh, running, features, src_idx, mask):
     )(running, features, src_idx, mask)
 
 
-@functools.partial(jax.jit, static_argnames=("mesh", "body"))
-def mm_encode(mesh, body, pixels, aux, valid):
+@functools.partial(jax.jit, static_argnames=("mesh", "graphdef", "body"))
+def mm_encode(mesh, graphdef, body, state, pixels, aux, valid):
     """JIT(1): single-image ViT ``body`` wrapped in a shard_map.
 
+    The ViT weights flow in as an EXPLICIT JIT operand via ``nnx.split`` --
+    ``graphdef`` (static structure) + ``state`` (dynamic leaves) -- rather than
+    being closure-captured by ``body``. This matches the backbone's
+    ``jitted_run_model`` (nnx.split) convention and keeps the weights OUT of the
+    compiled constants: a weight reload just passes a fresh ``state`` and the
+    cached executable picks it up, no compile-cache clear needed.
+
     ``aux`` is the 4-tuple already computed host-side by the model's
-    ``get_image_feature`` (Design X: aux 在 embedder 内算). The shard_map is
-    inlined and ``@jax.jit`` (``mesh``/``body`` static) caches it -- matching the
-    repo's jit-wrapped kernel-entry convention; no separate cached builder.
+    ``get_image_feature`` (Design X: aux 在 embedder 内算).
 
     Flat leaf order: ``pixels``, ``*aux``, ``valid`` (``grid`` is host-only, NOT a
     shard_map operand). The leading ``dp`` axis is fully sharded on ``data`` and
     shard_map strips it, so each shard's body sees one rank's single image and
-    returns ``[out_rows, H]``; ``out_specs`` assembles them into
-    ``[dp*out_rows, H]``. Returns ``P("data", None)``.
+    returns ``[out_rows, H]``; ``out_specs`` assembles them into ``[dp*out_rows,
+    H]``. The ViT weights are replicated (no TP), so the merged ``visual`` is
+    closed over inside shard_map as a replicated value. Returns ``P("data", None)``.
     """
+    visual = nnx.merge(graphdef, state)
     aux = tuple(aux) if aux is not None else ()
     leaves = (pixels, *aux, valid)
     n_aux = len(aux)
@@ -85,7 +93,7 @@ def mm_encode(mesh, body, pixels, aux, valid):
 
     def encode(enc_leaves):
         a = tuple(enc_leaves[1 : 1 + n_aux]) if n_aux else None
-        return body(enc_leaves[0], a, enc_leaves[-1])
+        return body(visual, enc_leaves[0], a, enc_leaves[-1])
 
     return jax.shard_map(
         encode,
