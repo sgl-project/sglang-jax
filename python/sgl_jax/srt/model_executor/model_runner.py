@@ -2,6 +2,7 @@
 
 import logging
 from functools import partial
+from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
@@ -22,6 +23,7 @@ from sgl_jax.srt.layers.routed_experts_capturer import (
 )
 from sgl_jax.srt.layers.sampler import Sampler, compute_logprobs
 from sgl_jax.srt.lora.context_manager import LoraBatchContext
+from sgl_jax.srt.managers.mm_utils import general_mm_embed_routine
 from sgl_jax.srt.managers.schedule_batch import (
     GLOBAL_SERVER_ARGS_KEYS,
     global_server_args_dict,
@@ -41,6 +43,9 @@ from sgl_jax.srt.server_args import ServerArgs
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 from sgl_jax.srt.utils.common_utils import get_bool_env_var
 from sgl_jax.srt.utils.jax_utils import get_available_device_memory
+
+if TYPE_CHECKING:
+    pass
 
 logger = logging.getLogger(__name__)
 
@@ -514,6 +519,24 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         self.forward_pass_id += 1
         precision_tracer.start_batch_trace(forward_batch.bid)
         precision_tracer.set_current_forward_pass_id(self.forward_pass_id)
+        # In-model VLM path (active): run the host embed routine (per-round JIT
+        # vision-encode -> JIT merge; aux computed INSIDE `get_image_feature`,
+        # Design X), landing the merged embedding on forward_batch.input_embedding
+        # before the backbone JIT. `self.model` is the VL wrapper -- it provides
+        # both `get_input_embeddings` (language_model) and `get_image_feature`
+        # (multimodal_model).
+        if (
+            getattr(self.model_config, "is_multimodal", False)
+            and forward_batch.mm_embed_plan is not None
+            and forward_batch.forward_mode.is_extend()
+        ):
+            general_mm_embed_routine(
+                input_ids=forward_batch.input_ids,
+                forward_batch=forward_batch,
+                language_model=self.model,
+                multimodal_model=self.model,
+                mm_embed_plan=forward_batch.mm_embed_plan,
+            )
         with jax.profiler.TraceAnnotation("_forward_raw"):
             ret = self._forward_raw(forward_batch, logits_metadata)
         return ret

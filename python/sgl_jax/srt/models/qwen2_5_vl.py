@@ -2,21 +2,32 @@ import logging
 import math
 from collections.abc import Callable
 from functools import partial
-from typing import Literal, TypedDict
+from types import SimpleNamespace
+from typing import Any
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import nnx
-from jax.sharding import Mesh
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from transformers import modeling_flax_utils
 
-from sgl_jax.srt.layers.embeddings import Embed
+from sgl_jax.srt.configs.model_config import ModelConfig
+from sgl_jax.srt.hf_transformers_utils import get_hf_text_config
+from sgl_jax.srt.layers.embeddings import MRotaryEmbedding, ParallelLMHead
+from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
+from sgl_jax.srt.managers.mm_utils import mm_encode
+from sgl_jax.srt.mem_cache.memory_pool import KVCache, MemoryPools
+from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+from sgl_jax.srt.models.qwen2 import Qwen2Model
 from sgl_jax.srt.multimodal.configs.qwen_vl.qwen_2_5_vl_config import (
     QwenVLModelVitConfig,
 )
 from sgl_jax.srt.utils.jax_utils import is_tpu_runtime
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 _FLASH_MHA = None
 
@@ -29,23 +40,6 @@ def _get_flash_mha():
 
 
 init_fn = nnx.initializers.uniform()
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
-
-
-class Qwen2_5_VLImagePixelInputs(TypedDict):
-    type: Literal["pixel_values"]
-    pixel_values: jax.Array
-    image_grid_thw: tuple[tuple[int, int, int], ...]
-
-
-class Qwen2_5_VLImageEmbeddingInputs(TypedDict):
-    type: Literal["image_embeds"]
-    image_embeds: jax.Array
-    image_grid_thw: jax.Array
-
-
-Qwen2_5_VLImageInputs = Qwen2_5_VLImagePixelInputs | Qwen2_5_VLImageEmbeddingInputs
 
 
 def apply_rotary_pos_emb_vision(x: jax.Array, rotary_pos_emb: jax.Array) -> jax.Array:
@@ -73,6 +67,7 @@ def vision_attention(
     v: jax.Array,
     scale: float,
     window_size: int = -1,
+    valid_token_count: jax.Array | None = None,
 ) -> jax.Array:
     """
     Compute vision attention using flash attention on GPU or native attention on TPU.
@@ -87,7 +82,7 @@ def vision_attention(
     Returns:
         Output tensor of shape [B, T, N, H]
     """
-    if not is_tpu_runtime():
+    if not is_tpu_runtime() and valid_token_count is None:
         # GPU: use flash_mha
         flash_mha = _get_flash_mha()
         original_dtype = q.dtype
@@ -127,6 +122,23 @@ def vision_attention(
             window_mask = distance > window_size
             attn_weights = jnp.where(
                 window_mask[None, None, :, :], jnp.finfo(attn_weights.dtype).min, attn_weights
+            )
+
+        if valid_token_count is not None:
+            valid_token_count = jnp.reshape(valid_token_count, ())[()]
+            positions = jnp.arange(T)
+            valid_queries = positions < valid_token_count
+            valid_keys = positions < valid_token_count
+            safe_key0 = positions == 0
+            padding_mask = jnp.where(
+                valid_queries[:, None],
+                valid_keys[None, :],
+                safe_key0[None, :],
+            )
+            attn_weights = jnp.where(
+                padding_mask[None, None, :, :],
+                attn_weights,
+                jnp.finfo(attn_weights.dtype).min,
             )
 
         attn_weights = jax.nn.softmax(attn_weights, axis=-1)
@@ -187,7 +199,7 @@ class Qwen2_5_VisionRotaryEmbedding(nnx.Module):
         return freqs.astype(jnp.bfloat16)
 
 
-class Qwen2_5_VisionMLP(nnx.Module):
+class Qwen2_5_VLMLP(nnx.Module):
     def __init__(self, config: QwenVLModelVitConfig, dtype: jnp.dtype, rngs: nnx.Rngs = None):
         in_features = config.hidden_size
         hidden_features = config.intermediate_size
@@ -267,6 +279,7 @@ class Qwen2_5_VisionAttention(nnx.Module):
         rotary_pos_emb: jax.Array,
         cu_window_seqlens: jax.Array | None = None,
         use_fullattn: bool = True,
+        valid_token_count: jax.Array | None = None,
     ) -> jax.Array:
         T, B, D = x.shape
         assert B == 1, "Vision attention currently only supports batch size 1"
@@ -290,7 +303,14 @@ class Qwen2_5_VisionAttention(nnx.Module):
             window_size = self._window_token_size
 
         # Compute attention using the backend function
-        output = vision_attention(q, k, v, self.scale, window_size)
+        output = vision_attention(
+            q,
+            k,
+            v,
+            self.scale,
+            window_size,
+            valid_token_count=valid_token_count,
+        )
 
         # Reshape back: [B, T, N, H] -> [T, B, D]
         output = output.transpose(1, 0, 2, 3).reshape(T, B, D)
@@ -319,7 +339,7 @@ class Qwen2_5_VisionBlock(nnx.Module):
         self.norm1 = norm_layer(dim, dtype=dtype, rngs=_rngs)
         self.norm2 = norm_layer(dim, dtype=dtype, rngs=_rngs)
         self.attn = Qwen2_5_VisionAttention(config=config, dtype=dtype, rngs=rngs, mesh=mesh)
-        self.mlp = Qwen2_5_VisionMLP(config=config, dtype=dtype, rngs=rngs)
+        self.mlp = Qwen2_5_VLMLP(config=config, dtype=dtype, rngs=rngs)
 
     def __call__(
         self,
@@ -327,8 +347,15 @@ class Qwen2_5_VisionBlock(nnx.Module):
         rotary_pos_emb: jax.Array,
         cu_window_seqlens: jax.Array | None = None,
         use_fullattn: bool = True,
+        valid_token_count: jax.Array | None = None,
     ) -> jax.Array:
-        x = x + self.attn(self.norm1(x), rotary_pos_emb, cu_window_seqlens, use_fullattn)
+        x = x + self.attn(
+            self.norm1(x),
+            rotary_pos_emb,
+            cu_window_seqlens,
+            use_fullattn,
+            valid_token_count=valid_token_count,
+        )
         x = x + self.mlp(self.norm2(x))
         return x
 
@@ -376,7 +403,7 @@ class Qwen2_5_VisionPatchMerger(nnx.Module):
         return x
 
 
-class Qwen2_5_VL_VisionTransformer(nnx.Module):
+class Qwen2_5_VisionTransformer(nnx.Module):
 
     def __init__(
         self,
@@ -561,6 +588,7 @@ class Qwen2_5_VL_VisionTransformer(nnx.Module):
         rotary_pos_emb: jax.Array,
         cu_seqlens: jax.Array,
         cu_window_seqlens: jax.Array,
+        valid_patch_rows: jax.Array | None = None,
     ) -> jax.Array:
         hidden_states = self.patch_embed(x)
 
@@ -582,6 +610,7 @@ class Qwen2_5_VL_VisionTransformer(nnx.Module):
                     rotary_pos_emb=rotary_pos_emb,
                     cu_window_seqlens=cu_seqlens,
                     use_fullattn=True,
+                    valid_token_count=valid_patch_rows,
                 )
             else:
                 hidden_states = blk(
@@ -589,6 +618,7 @@ class Qwen2_5_VL_VisionTransformer(nnx.Module):
                     rotary_pos_emb=rotary_pos_emb,
                     cu_window_seqlens=cu_window_seqlens,
                     use_fullattn=False,
+                    valid_token_count=valid_patch_rows,
                 )
 
         # adapter
@@ -618,43 +648,239 @@ class Qwen2_5_VL_VisionTransformer(nnx.Module):
         )
 
 
-class Qwen2_5_VL_VisionModel(nnx.Module):
-    """Placeholder model class for the ViT stage.
-    - Call encode_vision() to get vision embeddings
+def _get_visual_config(config: Any) -> QwenVLModelVitConfig:
+    vision_config = getattr(config, "vision_config", None)
+    if vision_config is None:
+        vision_config = getattr(config, "vision_config_dict", None)
+    if vision_config is None:
+        return QwenVLModelVitConfig()
+    if isinstance(vision_config, QwenVLModelVitConfig):
+        return vision_config
+    if isinstance(vision_config, dict):
+        config_obj = QwenVLModelVitConfig()
+        for key, value in vision_config.items():
+            setattr(config_obj, key, value)
+        return config_obj
+    return vision_config
+
+
+class Qwen2_5_VL_Model(Qwen2Model):
+    """Qwen2Model with MRoPE support for Qwen2.5-VL.
+
+    Kept as a subclass (B): the base ``Qwen2Model`` rope is not MRoPE-aware
+    (hardcoded ``RotaryEmbedding`` that flattens positions), so MRoPE is isolated
+    here -- ``__init__`` swaps each layer's ``rotary_emb`` to ``MRotaryEmbedding``
+    and ``__call__`` feeds 3-D ``forward_batch.mrope_positions``. Base ``qwen2.py``
+    is untouched.
     """
 
     def __init__(
         self,
-        config: QwenVLModelVitConfig,
-        dtype: jnp.dtype = jnp.bfloat16,
-        rngs: nnx.Rngs = None,
-        mesh: Mesh = None,
-    ) -> None:
-        self.config = config
-        self.dtype = dtype
-        self.mesh = mesh
-        self.visual = Qwen2_5_VL_VisionTransformer(
-            config=config,
-            dtype=dtype,
-            rngs=rngs,
-            mesh=mesh,
-            norm_eps=getattr(config, "rms_norm_eps", 1e-6),
-        )
-        logger.info("Qwen2_5_VL_VisionModel initialized with dtype %s", dtype)
+        config,
+        mesh,
+        dtype=jnp.bfloat16,
+    ):
+        super().__init__(config=config, mesh=mesh, dtype=dtype)
+        rope_scaling = getattr(config, "rope_scaling", None) or {}
+        self._mrope_section = rope_scaling.get("mrope_section")
+        self._mrope_interleaved = rope_scaling.get("mrope_interleaved", False)
+        if self._mrope_section:
+            rope_theta = getattr(config, "rope_theta", 1000000)
+            max_position_embeddings = getattr(config, "max_position_embeddings", 32768)
+            for layer in self.layers:
+                head_dim = layer.self_attn.head_dim
+                layer.self_attn.rotary_emb = MRotaryEmbedding(
+                    head_size=head_dim,
+                    rotary_dim=head_dim,
+                    max_position_embeddings=max_position_embeddings,
+                    base=rope_theta,
+                    is_neox_style=True,
+                    dtype=dtype,
+                    mrope_section=self._mrope_section,
+                    mrope_interleaved=self._mrope_interleaved,
+                )
 
-    def load_weights(self, model_config: QwenVLModelVitConfig) -> None:
-        """Load model weights with JAX distributed loading support"""
-        if not hasattr(self, "text_embed"):
-            self.text_embed = Embed(
-                num_embeddings=model_config.vocab_size,
-                features=model_config.text_hidden_size,
+    def __call__(
+        self,
+        forward_batch: ForwardBatch,
+        token_to_kv_pool: KVCache,
+    ):
+        residual = None
+        input_embeds = (
+            forward_batch.input_embedding
+            if forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
+            else None
+        )
+        hidden_states = (
+            self.embed_tokens(forward_batch.input_ids) if input_embeds is None else input_embeds
+        )
+        rope_positions = (
+            forward_batch.mrope_positions
+            if self._mrope_section and forward_batch.mrope_positions is not None
+            else forward_batch.positions
+        )
+        layers_kv_fused = []
+        layers_callback_flag = []
+        for layer in self.layers:
+            hidden_states, residual, kv_fused, callback_flag = layer(
+                rope_positions,
+                hidden_states,
+                forward_batch,
+                token_to_kv_pool,
+                residual,
+            )
+            layers_kv_fused.append(kv_fused)
+            layers_callback_flag.extend(callback_flag)
+
+        if residual is not None:
+            hidden_states += residual
+        hidden_states = self.norm(hidden_states)
+
+        return hidden_states, layers_kv_fused, layers_callback_flag
+
+
+class Qwen2_5_VLForConditionalGeneration(nnx.Module):
+    """In-model Qwen2.5-VL (single-file): vision tower + Qwen2 backbone (+ MRoPE)
+    + lm_head. The visual encode/merge surfaces stay outside the backbone JIT;
+    MRoPE lives in ``Qwen2_5_VL_Model``.
+    """
+
+    def __init__(self, config=None, dtype=None, mesh=None, rngs=None):
+        super().__init__()
+        self.mesh = mesh
+        self.config = config
+        self.text_config = get_hf_text_config(config) or config
+        self.dtype = dtype or jnp.bfloat16
+
+        # Language backbone (Qwen2 + MRoPE) + lm_head + logits.
+        self.model = Qwen2_5_VL_Model(self.text_config, mesh=mesh, dtype=self.dtype)
+        if not getattr(self.text_config, "tie_word_embeddings", False):
+            self.lm_head = ParallelLMHead(
+                self.text_config.vocab_size,
+                self.text_config.hidden_size,
                 dtype=self.dtype,
                 param_dtype=self.dtype,
-                kernel_axes=(None, None),
-                mesh=self.mesh,
+                kernel_axes=("tensor", None),
             )
+        self.logits_processor = LogitsProcessor(self.text_config.vocab_size, mesh=self.mesh)
+        self.image_token_id = getattr(self.config, "image_token_id", None)
+        self.video_token_id = getattr(self.config, "video_token_id", None)
 
-        # Decide loading strategy based on mesh configuration
+        # Vision tower. `self.visual` IS the ViT; the in-model embedder is
+        # `get_image_feature` (resolved by `embed_mm_inputs` via
+        # `getattr(model, "get_image_feature")`, no `mm_embedders` dict).
+        self.visual_config = _get_visual_config(config)
+        self.visual = Qwen2_5_VisionTransformer(
+            config=self.visual_config,
+            dtype=self.dtype,
+            rngs=rngs,
+            mesh=mesh,
+            norm_eps=getattr(self.visual_config, "rms_norm_eps", 1e-6),
+        )
+
+    def get_input_embeddings(self):
+        """Return the token-embedding module (callable on input_ids).
+
+        Used by `general_mm_embed_routine`/`embed_mm_inputs` to seed `running`
+        once, outside the round loop, before merging vision features.
+        """
+        return self.model.embed_tokens
+
+    def get_image_feature(self, enc):
+        """Image embedder (= upstream `get_image_feature`, models/qwen2_5_vl.py:643;
+        resolved by `embed_mm_inputs` via `getattr(model, "get_image_feature")`).
+
+        aux 落点 = Design X: compute the ViT aux arrays HERE (host, per rank from
+        `enc.grid`), reshard to `P("data")`, then run the JIT(1) encode shard_map.
+        `enc` is a `VisionEncodeInputs` for one DP round. Returns
+        `[dp*out_rows, H]` as `P("data", None)`.
+        """
+        aux = self._compute_round_aux(enc.grid)
+        return mm_encode(self.mesh, self._vision_encode_body, enc.pixels, aux, enc.valid)
+
+    def _compute_round_aux(self, grid):
+        """Per-round host aux (Design X; computed here from ``grid`` instead of
+        being stored in the plan).
+
+        `grid` is `[dp, 3]`; per rank call `compute_aux_arrays(grid[r])` with a
+        static python-int single-image grid, pad/stack the 4 aux leaves across
+        ranks to the cross-rank max, then reshard each to `P("data")`. aux arrays
+        are `jnp` (already on device) -> this is a `P("data")` reshard, NOT an H2D
+        transfer. Dummy ranks (`grid == 0`) get a zero lane. Returns the 4-tuple
+        of stacked+sharded aux leaves, or `None` if all ranks are dummy.
+        """
+        visual = self.visual  # ViT tower (compute_aux_arrays lives here)
+        # grid is host (static; init_new does NOT device_put it). np.asarray is a
+        # no-op on host numpy and syncs if a device array ever slips through.
+        grid_host = np.asarray(grid)
+        dp_size = int(grid_host.shape[0])
+
+        per_rank_aux: list = []  # over ranks: 4-tuple of jnp aux, or None (dummy)
+        for r in range(dp_size):
+            g = tuple(int(v) for v in grid_host[r])
+            if g == (0, 0, 0):
+                per_rank_aux.append(None)
+                continue
+            per_rank_aux.append(tuple(visual.compute_aux_arrays((g,))))
+
+        present = [a for a in per_rank_aux if a is not None]
+        if not present:
+            return None
+
+        num_leaves = len(present[0])
+        max_rows = [max(int(a[i].shape[0]) for a in present) for i in range(num_leaves)]
+        stacked_leaves = []
+        for i in range(num_leaves):
+            ref = present[0][i]
+            tail_shape = ref.shape[1:]
+            # aux[0] is window_index (a permutation of [0, F_r)); pad it by
+            # EXTENDING the permutation so compute_hidden_states' argsort stays a
+            # valid inverse. Other leaves zero-pad (rotary padded rows are
+            # attention-masked by valid_patch_rows; cu_seqlens values are unused
+            # by the distance-band attention).
+            pad = self._pad_window_index if i == 0 else self._pad_rows_to
+            rank_arrs = []
+            for a in per_rank_aux:
+                leaf = a[i] if a is not None else jnp.zeros((0, *tail_shape), dtype=ref.dtype)
+                rank_arrs.append(pad(leaf, max_rows[i]))
+            stacked = jnp.stack(rank_arrs, axis=0)  # [dp, max_rows_i, ...]
+            spec = PartitionSpec("data", *([None] * (stacked.ndim - 1)))
+            stacked_leaves.append(self._device_put_data_axis(stacked, spec))
+        return tuple(stacked_leaves)
+
+    def _vision_encode_body(self, pixels, aux, valid):
+        """Single-image ViT body for one DP rank (runs INSIDE the JIT(1) encode
+        shard_map). `aux` is the 4-tuple `(window_index, rotary_pos_emb,
+        cu_seqlens, cu_window_seqlens)` computed host-side by `get_image_feature`
+        (`_compute_round_aux`). Returns `[out_rows, H]` for this rank's image.
+        """
+        return self.visual.compute_hidden_states(pixels, *aux, valid_patch_rows=valid)
+
+    def load_weights(self, model_config: ModelConfig):
+        # Backbone (text) weights -- folded in from former Qwen2_5_VL_Generation.
+        loader = WeightLoader(
+            model=self,
+            model_config=model_config,
+            mesh=self.mesh,
+            dtype=self.dtype,
+        )
+        loader.load_weights_from_safetensors(self._create_qwen2_weight_mappings())
+        logger.info("Qwen2.5-VL (LLM) weights loaded successfully!")
+        # Vision (ViT) weights -- second WeightLoader pass mapping only visual.*.
+        # The vision loader reads ONLY `model_path` (WeightLoader's safetensors
+        # glob); the head/kv block in weight_utils is skipped for the
+        # string-target vision mappings, so no other config field is needed.
+        visual_loader_config = SimpleNamespace(model_path=model_config.model_path)
+        self._load_vision_weights(visual_loader_config)
+
+    def _load_vision_weights(self, model_config) -> None:
+        """Load the ViT (``self.visual``) weights from safetensors.
+
+        Folded in from the former ``Qwen2_5_VL_VisionModel.load_weights``. The
+        backbone (text) weights are loaded by ``super().load_weights`` above; this
+        is a second WeightLoader pass over the same safetensors that maps only the
+        ``visual.*`` keys. No ``text_embed`` -- the LM owns token embedding.
+        """
         loader = WeightLoader(
             model=self,
             model_config=model_config,
@@ -662,82 +888,59 @@ class Qwen2_5_VL_VisionModel(nnx.Module):
             dtype=self.dtype,
         )
         weight_mappings = self._create_qwen2_5_vl_vision_weight_mappings()
-
         if self.mesh is not None:
             with self.mesh:
                 loader.load_weights_from_safetensors(weight_mappings)
         else:
             loader.load_weights_from_safetensors(weight_mappings)
-
-        logger.info("Qwen2.5 VL - ViT Stage weights loaded successfully!")
+        logger.info("Qwen2.5-VL ViT weights loaded successfully!")
 
     def _create_qwen2_5_vl_vision_weight_mappings(self) -> dict:
-        mappings = {}
-
-        mappings["model.embed_tokens.weight"] = WeightMapping(
-            target_path="text_embed.embedding",
-            sharding=(None, None),
-            transpose=False,
-        )
-
-        # Vision mappings (check if visual model exists)
-        if hasattr(self, "visual"):
-            mappings.update(
-                {
-                    # Patch embedding (Conv layer)
-                    # PyTorch: [out_ch, in_ch, kd, kh, kw] -> JAX: [kd, kh, kw, in_ch, out_ch]
-                    # Vision layers use replicated weights (no tensor parallelism)
-                    "visual.patch_embed.proj.weight": WeightMapping(
-                        target_path="visual.patch_embed.proj.kernel",
-                        sharding=(None, None, None, None, None),
-                        transpose_axes=(2, 3, 4, 1, 0),
-                        # transpose=(2, 3, 4, 1, 0),  # Permute axes for Conv3D
-                    ),
-                    # Merger layers
-                    "visual.merger.ln_q.weight": WeightMapping(
-                        target_path="visual.merger.ln_q.scale",
-                        sharding=(None,),
-                        transpose=False,
-                    ),
-                    "visual.merger.mlp.0.weight": WeightMapping(
-                        target_path="visual.merger.mlp_fc1.kernel",
-                        sharding=(None, None),
-                        transpose=True,
-                    ),
-                    "visual.merger.mlp.0.bias": WeightMapping(
-                        target_path="visual.merger.mlp_fc1.bias",
-                        sharding=(None,),
-                        transpose=False,
-                    ),
-                    "visual.merger.mlp.2.weight": WeightMapping(
-                        target_path="visual.merger.mlp_fc2.kernel",
-                        sharding=(None, None),
-                        transpose=True,
-                    ),
-                    "visual.merger.mlp.2.bias": WeightMapping(
-                        target_path="visual.merger.mlp_fc2.bias",
-                        sharding=(None,),
-                        transpose=False,
-                    ),
-                }
-            )
-
-        # Vision layers mappings
-        num_vision_layers = getattr(self.config, "depth", 0)
+        # Vision layers use replicated weights (no tensor parallelism). Targets are
+        # relative to `self` (the wrapper), whose `self.visual` IS the ViT tower.
+        mappings = {
+            # Patch embed Conv3D: PyTorch [out,in,kd,kh,kw] -> JAX [kd,kh,kw,in,out]
+            "visual.patch_embed.proj.weight": WeightMapping(
+                target_path="visual.patch_embed.proj.kernel",
+                sharding=(None, None, None, None, None),
+                transpose_axes=(2, 3, 4, 1, 0),
+            ),
+            "visual.merger.ln_q.weight": WeightMapping(
+                target_path="visual.merger.ln_q.scale",
+                sharding=(None,),
+                transpose=False,
+            ),
+            "visual.merger.mlp.0.weight": WeightMapping(
+                target_path="visual.merger.mlp_fc1.kernel",
+                sharding=(None, None),
+                transpose=True,
+            ),
+            "visual.merger.mlp.0.bias": WeightMapping(
+                target_path="visual.merger.mlp_fc1.bias",
+                sharding=(None,),
+                transpose=False,
+            ),
+            "visual.merger.mlp.2.weight": WeightMapping(
+                target_path="visual.merger.mlp_fc2.kernel",
+                sharding=(None, None),
+                transpose=True,
+            ),
+            "visual.merger.mlp.2.bias": WeightMapping(
+                target_path="visual.merger.mlp_fc2.bias",
+                sharding=(None,),
+                transpose=False,
+            ),
+        }
+        num_vision_layers = getattr(self.visual_config, "depth", 0)
         for layer_idx in range(num_vision_layers):
-            vision_layer_mappings = self._create_vision_layer_mappings(layer_idx)
-            mappings.update(vision_layer_mappings)
-
+            mappings.update(self._create_vision_layer_mappings(layer_idx))
         return mappings
 
     def _create_vision_layer_mappings(self, layer_idx: int) -> dict:
-        # Qwen2.5-VL uses visual.blocks.{i}.* for vision layers
-        # Vision layers use replicated weights (no tensor parallelism)
+        # Qwen2.5-VL uses visual.blocks.{i}.* for vision layers (replicated).
         prefix = f"visual.blocks.{layer_idx}"
         target_prefix = f"visual.blocks.{layer_idx}"
-
-        mappings = {
-            # Layer norms
+        return {
             f"{prefix}.norm1.weight": WeightMapping(
                 target_path=f"{target_prefix}.norm1.scale",
                 sharding=(None,),
@@ -748,7 +951,6 @@ class Qwen2_5_VL_VisionModel(nnx.Module):
                 sharding=(None,),
                 transpose=False,
             ),
-            # QKV projection (single layer) - replicated, no sharding
             f"{prefix}.attn.qkv.weight": WeightMapping(
                 target_path=f"{target_prefix}.attn.qkv_proj.kernel",
                 sharding=(None, None),
@@ -759,7 +961,6 @@ class Qwen2_5_VL_VisionModel(nnx.Module):
                 sharding=(None,),
                 transpose=False,
             ),
-            # Output projection - replicated, no sharding
             f"{prefix}.attn.proj.weight": WeightMapping(
                 target_path=f"{target_prefix}.attn.proj.kernel",
                 sharding=(None, None),
@@ -770,7 +971,6 @@ class Qwen2_5_VL_VisionModel(nnx.Module):
                 sharding=(None,),
                 transpose=False,
             ),
-            # MLP layers - replicated, no sharding
             f"{prefix}.mlp.gate_proj.weight": WeightMapping(
                 target_path=f"{target_prefix}.mlp.gate_proj.kernel",
                 sharding=(None, None),
@@ -803,138 +1003,187 @@ class Qwen2_5_VL_VisionModel(nnx.Module):
             ),
         }
 
-        return mappings
+    def _device_put_data_axis(self, value, spec):
+        if getattr(self, "mesh", None) is None:
+            return value
+        return jax.device_put(value, NamedSharding(self.mesh, spec))
 
-    def _validate_and_reshape_mm_tensor(self, mm_input: object, name: str) -> jax.Array:
-        if isinstance(mm_input, list):
-            arrays_to_concat = [jnp.asarray(item) for item in mm_input]
-            return jnp.concatenate(arrays_to_concat, axis=0)
+    @staticmethod
+    def _pad_rows_to(value, target_rows: int):
+        """Zero-pad `value` (a `[rows, ...]` array) up to `target_rows` rows.
 
-        if hasattr(mm_input, "ndim"):
-            array_input = jnp.asarray(mm_input)
-            if array_input.ndim == 2:
-                return array_input
-            if array_input.ndim == 3:
-                return array_input.reshape(-1, array_input.shape[-1])
+        Used by `_compute_round_aux` to pad each rank's aux leaf to the cross-rank
+        max before stacking; shapes are static under trace.
+        """
+        rows = int(value.shape[0])
+        if rows == target_rows:
+            return value
+        pad_shape = (target_rows - rows, *value.shape[1:])
+        padding = jnp.zeros(pad_shape, dtype=value.dtype)
+        return jnp.concatenate([value, padding], axis=0)
 
-        raise ValueError(f"Incorrect type of {name}. " f"Got type: {type(mm_input)}")
+    @staticmethod
+    def _pad_window_index(window_index, target_rows: int):
+        """Pad ``window_index`` (a permutation of ``[0, rows)``) up to
+        ``target_rows`` by EXTENDING the permutation with
+        ``arange(rows, target_rows)``.
 
-    def _parse_and_validate_image_input(
-        self, image_grid_thw: tuple[tuple[int, int, int], ...], **kwargs: object
-    ) -> Qwen2_5_VLImageInputs | None:
-        pixel_values = kwargs.pop("pixel_values", None)
-        image_embeds = kwargs.pop("image_embeds", None)
+        Unlike zero-padding, this keeps it a valid permutation of
+        ``[0, target_rows)`` so ``compute_hidden_states``'s
+        ``argsort(window_index)`` stays a correct inverse for padded ranks --
+        zero-padding would collide the value-0 entries and scramble the padded
+        rank's feature rows. Dummy ranks (``rows == 0``) get the full identity
+        permutation.
+        """
+        rows = int(window_index.shape[0])
+        if rows >= target_rows:
+            return window_index
+        ext = jnp.arange(rows, target_rows, dtype=window_index.dtype)
+        return jnp.concatenate([window_index, ext], axis=0)
 
-        if pixel_values is None and image_embeds is None:
-            return None
+    def _create_qwen2_weight_mappings(self) -> dict:
+        mappings = {
+            "model.embed_tokens.weight": WeightMapping(
+                target_path="model.embed_tokens.embedding",
+                sharding=("tensor", None),
+                transpose=False,
+            ),
+            "model.norm.weight": WeightMapping(
+                target_path="model.norm.scale", sharding=(None,), transpose=False
+            ),
+        }
 
-        if pixel_values is not None:
-            pixel_values = self._validate_and_reshape_mm_tensor(pixel_values, "image pixel values")
-            return Qwen2_5_VLImagePixelInputs(
-                type="pixel_values", pixel_values=pixel_values, image_grid_thw=image_grid_thw
+        if not getattr(self.text_config, "tie_word_embeddings", False):
+            mappings["lm_head.weight"] = WeightMapping(
+                target_path="lm_head.embedding", sharding=("tensor", None), transpose=False
             )
 
-        return None
+        num_layers = self.text_config.num_hidden_layers
+        for layer_idx in range(num_layers):
+            mappings.update(self._create_layer_mappings(layer_idx))
 
-    def _parse_and_validate_multimodal_inputs(
-        self, image_grid_thw: tuple[tuple[int, int, int], ...], **kwargs: object
-    ) -> dict:
-        mm_input_by_modality = {}
+        return mappings
 
-        for input_key in kwargs:
-            if (
-                input_key in ("pixel_values", "image_embeds")
-                and "image" not in mm_input_by_modality
-            ):
-                mm_input_by_modality["image"] = self._parse_and_validate_image_input(
-                    image_grid_thw, **kwargs
-                )
-        return mm_input_by_modality
+    def _create_layer_mappings(self, layer_idx: int) -> dict:
+        prefix = f"model.layers.{layer_idx}"
+        target_prefix = f"model.layers.{layer_idx}"
 
-    def get_single_image_embedding(self, image_pixel_values, image_grid_thw):
-        return self.visual(image_pixel_values, (image_grid_thw,))
+        mappings = {
+            f"{prefix}.input_layernorm.weight": WeightMapping(
+                target_path=f"{target_prefix}.input_layernorm.scale",
+                sharding=(None,),
+                transpose=False,
+            ),
+            f"{prefix}.post_attention_layernorm.weight": WeightMapping(
+                target_path=f"{target_prefix}.post_attention_layernorm.scale",
+                sharding=(None,),
+                transpose=False,
+            ),
+            f"{prefix}.self_attn.q_proj.weight": WeightMapping(
+                target_path=f"{target_prefix}.self_attn.q_proj.weight",
+                sharding=(None, "tensor"),
+                transpose=True,
+                head_dim_padding=True,
+                kv_head_padding=False,
+            ),
+            f"{prefix}.self_attn.k_proj.weight": WeightMapping(
+                target_path=f"{target_prefix}.self_attn.k_proj.weight",
+                sharding=(None, "tensor"),
+                transpose=True,
+                head_dim_padding=True,
+                kv_head_padding=True,
+            ),
+            f"{prefix}.self_attn.v_proj.weight": WeightMapping(
+                target_path=f"{target_prefix}.self_attn.v_proj.weight",
+                sharding=(None, "tensor"),
+                transpose=True,
+                head_dim_padding=True,
+                kv_head_padding=True,
+            ),
+            f"{prefix}.self_attn.o_proj.weight": WeightMapping(
+                target_path=f"{target_prefix}.self_attn.o_proj.weight",
+                sharding=("tensor", None),
+                transpose=True,
+                head_dim_padding=True,
+                kv_head_padding=False,
+            ),
+            f"{prefix}.mlp.gate_proj.weight": WeightMapping(
+                target_path=f"{target_prefix}.mlp.gate_proj.weight",
+                sharding=(None, "tensor"),
+                transpose=True,
+            ),
+            f"{prefix}.mlp.up_proj.weight": WeightMapping(
+                target_path=f"{target_prefix}.mlp.up_proj.weight",
+                sharding=(None, "tensor"),
+                transpose=True,
+            ),
+            f"{prefix}.mlp.down_proj.weight": WeightMapping(
+                target_path=f"{target_prefix}.mlp.down_proj.weight",
+                sharding=("tensor", None),
+                transpose=True,
+            ),
+        }
 
-    def _process_image_input(self, image_input: Qwen2_5_VLImageInputs) -> tuple[jax.Array, ...]:
+        if getattr(self.text_config, "attention_bias", True):
+            mappings.update(
+                {
+                    f"{prefix}.self_attn.q_proj.bias": WeightMapping(
+                        target_path=f"{target_prefix}.self_attn.q_proj.bias",
+                        sharding=(None,),
+                        transpose=False,
+                        head_dim_padding=True,
+                        kv_head_padding=False,
+                    ),
+                    f"{prefix}.self_attn.k_proj.bias": WeightMapping(
+                        target_path=f"{target_prefix}.self_attn.k_proj.bias",
+                        sharding=(None,),
+                        transpose=False,
+                        head_dim_padding=True,
+                        kv_head_padding=True,
+                    ),
+                    f"{prefix}.self_attn.v_proj.bias": WeightMapping(
+                        target_path=f"{target_prefix}.self_attn.v_proj.bias",
+                        sharding=(None,),
+                        transpose=False,
+                        head_dim_padding=True,
+                        kv_head_padding=True,
+                    ),
+                }
+            )
 
-        grid_thw = image_input["image_grid_thw"]
+        return mappings
 
-        if image_input["type"] == "image_embeds":
-            image_embeds = image_input["image_embeds"].astype(self.visual.dtype)
-        else:
-            pixel_values = image_input["pixel_values"]
-            image_embeds = []
-            current_idx = 0
-            for image_thw in grid_thw:
-                t, h, w = image_thw
-                image_size = t * h * w
-                end_idx = current_idx + image_size
-                image_pixel_values = pixel_values[current_idx:end_idx, :]
-                image_embeds.append(self.get_single_image_embedding(image_pixel_values, image_thw))
-                current_idx = end_idx
-            image_embeds = jnp.concatenate(image_embeds, axis=0)
+    def get_embed_and_head(self):
+        if getattr(self.text_config, "tie_word_embeddings", False):
+            weight = self.model.embed_tokens.embedding.value
+            return (weight, weight)
+        return (self.model.embed_tokens.embedding.value, self.lm_head.embedding.value)
 
-        merge_size = self.visual.config.spatial_merge_size
-        sizes = np.prod(np.array(grid_thw, dtype=np.int64), axis=-1) // merge_size // merge_size
-
-        if sizes.size == 0:
-            return ()
-        if sizes.size == 1:
-            return (image_embeds,)
-
-        split_indices = np.cumsum(sizes)[:-1]
-        return tuple(jnp.split(image_embeds, split_indices))
-
-    def get_multimodal_embeddings(
-        self, image_grid_thw: tuple[tuple[int, int, int], ...], **kwargs: object
-    ) -> list[jax.Array]:
-        mm_input_by_modality = self._parse_and_validate_multimodal_inputs(image_grid_thw, **kwargs)
-        if not mm_input_by_modality:
-            return []
-
-        multimodal_embeddings: tuple[jax.Array, ...] = ()
-
-        for modality in mm_input_by_modality:
-            multimodal_input = mm_input_by_modality[modality]
-            if modality == "image":
-                vision_embeddings = self._process_image_input(multimodal_input)
-                multimodal_embeddings += vision_embeddings
-
-        return list(multimodal_embeddings)
+    def set_embed_and_head(
+        self,
+        embed_weight: jax.Array | None = None,
+        head_weight: jax.Array | None = None,
+    ) -> None:
+        if embed_weight is not None:
+            self.model.embed_tokens.embedding.value = embed_weight
+        if head_weight is not None:
+            self.lm_head.embedding.value = head_weight
 
     def __call__(
         self,
-        pixel_values: jax.Array,
-        image_grid_thw: tuple[tuple[int, int, int], ...] = None,
-        video_grid_thw: tuple[tuple[int, int, int], ...] = None,
-    ) -> jax.Array:
-        """
-        Encode vision inputs (images and/or videos) to embeddings.
-
-        This should be called once during prefill to compute vision embeddings.
-
-        Args:
-            pixel_values: Pixel values [num_patches, channels * patch_size^2]
-            image_grid_thw: Grid dimensions for each image (t=1 for images)
-            video_grid_thw: Grid dimensions for each video (t>1 for videos)
-
-        Returns:
-            Vision embeddings concatenated [total_patches, hidden_dim]
-        """
-        # Combine image and video grid_thw - both use the same visual encoder
-        # The grid_thw just describes the temporal/spatial dimensions
-        combined_grid_thw = []
-        if image_grid_thw:
-            combined_grid_thw.extend(image_grid_thw)
-        if video_grid_thw:
-            combined_grid_thw.extend(video_grid_thw)
-
-        if not combined_grid_thw:
-            return jnp.zeros((0, self.config.hidden_size), dtype=pixel_values.dtype)
-
-        combined_grid_thw = tuple(combined_grid_thw)
-        vision_embeds_list = self.get_multimodal_embeddings(
-            image_grid_thw=combined_grid_thw,
-            pixel_values=pixel_values,
+        forward_batch: ForwardBatch,
+        memory_pools: MemoryPools,
+        logits_metadata: LogitsMetadata,
+    ):
+        token_to_kv_pool = memory_pools.token_to_kv_pool
+        hidden_states, layers_kv_fused, layers_callback_flag = self.model(
+            forward_batch, token_to_kv_pool
         )
-        # Concatenate all vision embeddings into a single array
-        return jnp.concatenate(vision_embeds_list, axis=0)
+        if not getattr(self.text_config, "tie_word_embeddings", False):
+            output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
+        else:
+            output = self.logits_processor(hidden_states, self.model.embed_tokens, logits_metadata)
+        return output, layers_kv_fused, layers_callback_flag, None
+
+
+EntryClass = Qwen2_5_VLForConditionalGeneration

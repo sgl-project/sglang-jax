@@ -51,6 +51,12 @@ from sgl_jax.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPo
 from sgl_jax.srt.mem_cache.radix_cache import RadixKey
 from sgl_jax.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
+from sgl_jax.srt.multimodal.common.mm_plan import (
+    EmbedRound,
+    MultimodalEmbedPlan,
+    VisionEncodeInputs,
+)
+from sgl_jax.srt.multimodal.common.modality_enum import Modality
 from sgl_jax.srt.precision_tracer import (
     PrecisionTracerRequestMetadata,
     precision_tracer,
@@ -2652,6 +2658,17 @@ class ScheduleBatch:
         mrope_positions = _mm["mrope_positions"]
         apply_for_deepstack = _mm["apply_for_deepstack"]
         deepstack_visual_embedding = _mm["deepstack_visual_embedding"]
+        # In-model VLM path: owning-rank DP embed plan (host-side numpy). Stays a
+        # host-only ModelWorkerBatch field; its array leaves are device_put in
+        # ForwardBatch.init_new and consumed by mm_embed_routine (outside the
+        # backbone JIT). None for non-multimodal / text-only batches.
+        mm_embed_plan = build_mm_embed_plan(
+            self.reqs_info,
+            self.dp_size,
+            self.model_config,
+            per_dp_token_padding,
+            total_token_size,
+        )
 
         # Merge per-DP top_logprobs_nums / token_ids_logprobs with the same
         # offset_bs += per_dp_bs_padding padding scheme used in _merge_batch_metadata.
@@ -2756,6 +2773,7 @@ class ScheduleBatch:
             per_dp_bs_size=per_dp_bs_padding,
             launch_done=self.launch_done,
             input_embedding=input_embedding,
+            mm_embed_plan=mm_embed_plan,
             apply_for_deepstack=apply_for_deepstack,
             deepstack_visual_embedding=deepstack_visual_embedding,
             recurrent_indices=recurrent_indices_cpu,
@@ -2954,6 +2972,203 @@ def _extract_mm_value(mm_inputs: Any, key: str):
     if isinstance(mm_inputs, dict):
         return mm_inputs.get(key)
     return getattr(mm_inputs, key, None)
+
+
+def _is_image_mm_item(item: Any) -> bool:
+    modality = getattr(item, "modality", None)
+    if modality is None and isinstance(item, dict):
+        modality = item.get("modality")
+    # Compare against the Modality enum (IMAGE/MULTI_IMAGES), not the string
+    # "image": MultimodalDataItem.modality is the enum, whose `.value` is an int
+    # (auto()), so the old `== "image"` check never matched.
+    if isinstance(modality, str):
+        try:
+            modality = Modality.from_str(modality)
+        except ValueError:
+            return False
+    return modality in (Modality.IMAGE, Modality.MULTI_IMAGES)
+
+
+def _mm_item_offsets(item: Any) -> list:
+    offsets = getattr(item, "offsets", None)
+    if offsets is None and isinstance(item, dict):
+        offsets = item.get("offsets")
+    return offsets or []
+
+
+def _grid_feature_rows(grid: tuple, sms2: int) -> int:
+    """Feature rows for one image grid: prod(grid) // spatial_merge_size**2."""
+    t, h, w = int(grid[0]), int(grid[1]), int(grid[2])
+    return (t * h * w) // sms2
+
+
+def _item_grid_thw(item: Any) -> tuple:
+    """First (t, h, w) of this item's ``image_grid_thw`` as a python-int tuple.
+
+    # TODO(stage1): one round handles ONE image per rank, so we read row 0 only;
+    #   multi-image-per-item packing needs the full grid list.
+    """
+    grid = _extract_mm_value(getattr(item, "model_specific_data", None), "image_grid_thw")
+    if grid is None:
+        grid = getattr(item, "image_grid_thw", None)
+    if grid is None:
+        return (0, 0, 0)
+    arr = np.asarray(grid)
+    row = arr if arr.ndim == 1 else arr[0]
+    return (int(row[0]), int(row[1]), int(row[2]))
+
+
+def _build_merge_idx(
+    rank_items_round_k: list,
+    dp_size: int,
+    per_dp_token: int,
+    out_rows_k: int,
+    sms2: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Minimal ``src_idx``/``mask`` for the simple per-rank-aligned case.
+
+    Token layout mirrors ``_merge_input_and_positions``: rank ``r`` owns the
+    contiguous slot ``[r * per_dp_token : (r + 1) * per_dp_token]``. Round-k
+    features (flat ``[dp * out_rows_k, H]``) place rank ``r``'s single image at
+    rows ``[r * out_rows_k : (r + 1) * out_rows_k]``; the local feature row
+    counts ``0 .. out_rows_k - 1`` within that block.
+
+    For each rank's round-k image we use ``item.offsets`` (inclusive ``(start,
+    end)`` spans, rank-local token positions) to mark which tokens this image
+    fills, in order, and point them at consecutive feature rows.
+
+    # TODO(stage1): full T_r bookkeeping for multi-req packing + bucket
+    #   alignment. This version assumes a single image per rank per round whose
+    #   placeholder offsets are already rank-local and contiguous-enough that
+    #   sequential feature-row numbering is correct; it does not reconcile
+    #   multiple reqs packed on one rank or token-axis bucket padding shifts.
+    """
+    total_token = dp_size * per_dp_token
+    src_idx = np.zeros(total_token, dtype=np.int32)
+    mask = np.zeros(total_token, dtype=np.bool_)
+
+    for dp_rank in range(dp_size):
+        item = rank_items_round_k[dp_rank] if dp_rank < len(rank_items_round_k) else None
+        if item is None:
+            continue  # dummy lane: contributes nothing (mask stays False)
+        base_token = dp_rank * per_dp_token
+        base_feat = dp_rank * out_rows_k
+        feat_row = 0
+        for start, end in _mm_item_offsets(item):
+            for local_pos in range(int(start), int(end) + 1):
+                tok = base_token + local_pos
+                if tok >= base_token + per_dp_token or feat_row >= out_rows_k:
+                    # Out of this rank's token slot or feature block: skip
+                    # (stage1 guard; full bookkeeping is a TODO above).
+                    break
+                src_idx[tok] = base_feat + feat_row
+                mask[tok] = True
+                feat_row += 1
+    return src_idx, mask
+
+
+def build_mm_embed_plan(
+    reqs_info: list[ScheduleReqsInfo] | None,
+    dp_size: int,
+    model_config: Any,
+    per_dp_token: int,
+    total_token: int,
+) -> MultimodalEmbedPlan | None:
+    """Build the owning-rank DP multimodal embed plan (host-side, numpy).
+
+    Round-loop: process images one-per-rank-per-round. ``n_rounds`` = max over
+    ranks of (#images that rank owns). Ranks with fewer images use a dummy lane
+    that contributes nothing (grid/pixels zero, mask all False). Each round runs
+    ONE single-image ViT per rank.
+
+    Returns ``None`` for non-multimodal models or batches with no image items.
+
+    # TODO(stage1): bucket the vision (patch / out_rows) axes; this uses the
+    #   per-forward cross-rank max for stable shapes within one call.
+    """
+    if not getattr(model_config, "is_multimodal", False):
+        return None
+
+    # spatial_merge_size**2; read from config, never touch the model.
+    # TODO(stage1): the top-level ModelConfig may surface spatial_merge_size on a
+    #   nested vision_config (see multimodal/configs/.../qwen_2_5_vl_config.py);
+    #   resolve the right attribute path once the VLM config wiring is finalized.
+    spatial_merge_size = int(getattr(model_config, "spatial_merge_size", 1) or 1)
+    sms2 = spatial_merge_size * spatial_merge_size
+
+    # Collect image items per rank (each item follows its req's dp_rank).
+    items_by_rank: list[list[Any]] = [[] for _ in range(dp_size)]
+    for dp_rank in range(dp_size):
+        if not reqs_info or dp_rank >= len(reqs_info):
+            continue
+        info = reqs_info[dp_rank]
+        if not info.reqs:
+            continue
+        for req in info.reqs:
+            mm_items = _extract_mm_value(getattr(req, "mm_inputs", None), "mm_items") or []
+            mm_items = [item for item in mm_items if _is_image_mm_item(item)]
+            items_by_rank[dp_rank].extend(mm_items)
+
+    n_rounds = max((len(items) for items in items_by_rank), default=0)
+    if n_rounds == 0:
+        return None
+
+    rounds: list[EmbedRound] = []
+    for k in range(n_rounds):
+        # The round-k item per rank (None => dummy lane for ranks with < k+1 imgs).
+        rank_items_k = [
+            items_by_rank[r][k] if k < len(items_by_rank[r]) else None for r in range(dp_size)
+        ]
+
+        # Per-rank grid (passthrough; dummy ranks zeros) + per-rank feature rows.
+        grids_k = np.zeros((dp_size, 3), dtype=np.int32)
+        feature_rows = [0] * dp_size
+        patch_rows = [0] * dp_size
+        features = [None] * dp_size
+        for r, item in enumerate(rank_items_k):
+            if item is None:
+                continue
+            grid = _item_grid_thw(item)
+            grids_k[r] = np.asarray(grid, dtype=np.int32)
+            feature_rows[r] = _grid_feature_rows(grid, sms2)
+            feat = _extract_mm_value(item, "feature")
+            feat = np.asarray(feat)
+            features[r] = feat
+            patch_rows[r] = int(feat.shape[0])
+
+        patch_k = max(patch_rows) if any(patch_rows) else 0
+        out_rows_k = max(feature_rows) if any(feature_rows) else 0
+        # Patch feature dim from the first present feature; 0 if none (defensive).
+        present = next((f for f in features if f is not None), None)
+        patch_dim = int(present.shape[1]) if present is not None and present.ndim == 2 else 0
+
+        # pixels_k [dp, patch_k, dim]: pad+stack each rank's feature (pure numpy).
+        pixels_k = np.zeros((dp_size, patch_k, patch_dim), dtype=np.float32)
+        valid_k = np.zeros((dp_size,), dtype=np.int32)
+        for r, feat in enumerate(features):
+            if feat is None:
+                continue
+            rows = int(feat.shape[0])
+            pixels_k[r, :rows, :] = feat
+            valid_k[r] = rows
+
+        src_idx_k, mask_k = _build_merge_idx(rank_items_k, dp_size, per_dp_token, out_rows_k, sms2)
+
+        encode_inputs = VisionEncodeInputs(
+            pixels=pixels_k,
+            grid=grids_k,
+            valid=valid_k,
+        )
+        rounds.append(
+            EmbedRound(
+                encode_inputs=encode_inputs,
+                src_idx=src_idx_k,
+                mask=mask_k,
+                out_rows=out_rows_k,
+            )
+        )
+
+    return MultimodalEmbedPlan(rounds_by_modality={Modality.IMAGE: rounds})
 
 
 def _as_int_scalar(value: Any, default: int = 0) -> int:
@@ -3198,6 +3413,9 @@ class ModelWorkerBatch:
     tree_cache: BasePrefixCache = None
 
     input_embedding: np.ndarray | None = None
+    # In-model VLM owning-rank DP embed plan (host-side). Array leaves get
+    # device_put in ForwardBatch.init_new; never a backbone-JIT pytree child.
+    mm_embed_plan: MultimodalEmbedPlan | None = None
     apply_for_deepstack: bool = False
     deepstack_visual_embedding: np.ndarray | None = None
 
