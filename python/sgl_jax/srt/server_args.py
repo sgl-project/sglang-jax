@@ -117,6 +117,8 @@ class ServerArgs:
     # Data parallel
     dp_size: int = 1
     dp_schedule_policy: str = "min_running_queue"
+    dp_best_fit_flops_weight: float = 1.0
+    dp_best_fit_hbm_weight: float = 1.0
 
     # Logging
     log_level: str = "info"
@@ -997,9 +999,23 @@ class ServerArgs:
         parser.add_argument(
             "--dp-schedule-policy",
             type=str,
-            choices=["round_robin", "min_running_queue"],
+            choices=["round_robin", "min_running_queue", "best_fit"],
             default=ServerArgs.dp_schedule_policy,
             help="DP scheduling policy for assigning dp_rank to new requests.",
+        )
+        parser.add_argument(
+            "--dp-best-fit-flops-weight",
+            type=float,
+            default=ServerArgs.dp_best_fit_flops_weight,
+            help="Cost weight for FLOPs/compute stranding in best_fit DP scheduling. "
+            "Higher weight penalizes wasted compute capacity more.",
+        )
+        parser.add_argument(
+            "--dp-best-fit-hbm-weight",
+            type=float,
+            default=ServerArgs.dp_best_fit_hbm_weight,
+            help="Cost weight for HBM/memory stranding in best_fit DP scheduling. "
+            "Higher weight penalizes wasted memory capacity more.",
         )
 
         # Multi-node distributed serving

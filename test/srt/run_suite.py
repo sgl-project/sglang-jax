@@ -307,6 +307,7 @@ suites = {
         TestFile("test/srt/test_dtype_config_consistency.py", 10),
         TestFile("python/sgl_jax/test/test_compilation_manager.py", 1),
         TestFile("python/sgl_jax/test/test_kernel_utils.py", 1),
+        TestFile("python/sgl_jax/test/test_resource_estimator.py", 0.1, runner="pytest"),
         TestFile("python/sgl_jax/test/speculative/test_spec_info.py", 0.2, runner="pytest"),
         TestFile("python/sgl_jax/test/models/test_mimo_v2_nextn.py", 0.2, runner="pytest"),
         TestFile(
