@@ -3,6 +3,7 @@ from __future__ import annotations
 import abc
 import logging
 import time
+from functools import partial
 from typing import TYPE_CHECKING
 
 import jax
@@ -842,6 +843,63 @@ def _set_fused_kv_buffer(
         page_size=page_size,
         kv_partition_axis=kv_partition_axis,
         data_partition_axis=attention_data_partition_axis,
+        mesh=mesh,
+    )
+
+
+@partial(
+    jax.jit,
+    static_argnames=(
+        "page_size",
+        "kv_partition_axis",
+        "attention_data_partition_axis",
+        "mesh",
+    ),
+    donate_argnames=("kv_cache",),
+)
+def write_kv_layer(
+    layer_kv,
+    loc,
+    kv_cache,
+    page_size,
+    kv_partition_axis,
+    attention_data_partition_axis,
+    mesh,
+):
+    """One-layer in-place KV write, wrapped in a module-level ``jax.jit``.
+
+    Shared by PD decode write-back and HiCache H2D load-back. ``layer_kv`` is
+    ``[total_tokens, *per_token_shape]``; ``loc`` is per-token absolute pool
+    slots (-1 marks padding, skipped). The write goes through the in-place
+    Pallas kernel (``_set_fused_kv_buffer`` -> ``update_fused_kv_cache_vectorized``
+    with ``input_output_aliases``), so the footprint scales with the tokens
+    written, not the whole pool. The stable module-level ``jax.jit`` makes the
+    trace cache hit on shape + static args so the kernel compiles once per write
+    shape and is reused thereafter.
+    """
+    total_tokens = loc.shape[0]
+    fused_sharding = NamedSharding(
+        mesh,
+        P(
+            attention_data_partition_axis,
+            None,
+            kv_partition_axis,
+            None,
+            None,
+        ),
+    )
+    fused = jax.lax.reshape(
+        layer_kv,
+        (total_tokens, 1) + tuple(layer_kv.shape[2:]),
+        out_sharding=fused_sharding,
+    )
+    return _set_fused_kv_buffer(
+        fused_kv=fused,
+        loc=loc,
+        kv_cache=kv_cache,
+        page_size=page_size,
+        kv_partition_axis=kv_partition_axis,
+        attention_data_partition_axis=attention_data_partition_axis,
         mesh=mesh,
     )
 
