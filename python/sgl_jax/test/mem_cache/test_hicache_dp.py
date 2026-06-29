@@ -85,9 +85,7 @@ class HiCacheDPTest(unittest.TestCase):
             dp_size=_DP,
         )
         self.allocator = (
-            TokenToKVPoolAllocator(
-                size=self.DEVICE_SIZE, kvcache=self.kv_cache, dp_size=_DP
-            )
+            TokenToKVPoolAllocator(size=self.DEVICE_SIZE, kvcache=self.kv_cache, dp_size=_DP)
             if self.PAGE_SIZE == 1
             else PagedTokenToKVPoolAllocator(
                 size=self.DEVICE_SIZE,
@@ -153,9 +151,7 @@ class HiCacheDPTest(unittest.TestCase):
         # multi-device mesh; the explicit form is required (same as the pool).
         gp = self._global_page(local_token, dp_rank)
         off = int(local_token) % self.PAGE_SIZE
-        page = self.kv_cache.kv_buffer[layer].at[gp].get(
-            out_sharding=self._gather_sharding
-        )
+        page = self.kv_cache.kv_buffer[layer].at[gp].get(out_sharding=self._gather_sharding)
         return np.asarray(page)[off]
 
     def _fill(self, dp_rank: int, n: int, seed: int) -> tuple[np.ndarray, list]:
@@ -206,9 +202,7 @@ class HiCacheDPTest(unittest.TestCase):
         # Sanity: rank0/rank1 chose overlapping LOCAL indices but they live in
         # different GLOBAL shards, so the fixtures must not collide.
         self.assertEqual(list(local0), list(local1))
-        self.assertNotEqual(
-            self._global_page(local0[0], 0), self._global_page(local1[0], 1)
-        )
+        self.assertNotEqual(self._global_page(local0[0], 0), self._global_page(local1[0], 1))
 
         for dp_rank, local in ((0, local0), (1, local1)):
             key = _key(tokens, dp_rank)

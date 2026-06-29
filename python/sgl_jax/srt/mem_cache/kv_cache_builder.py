@@ -73,9 +73,7 @@ def init_hicache(cache, server_args, mesh, token_to_kv_pool_allocator) -> None:
     from sgl_jax.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
     if not isinstance(cache, UnifiedRadixCache):
-        raise TypeError(
-            f"HiCache requires UnifiedRadixCache, got {type(cache).__name__}"
-        )
+        raise TypeError(f"HiCache requires UnifiedRadixCache, got {type(cache).__name__}")
     if mesh is None:
         raise ValueError("HiCache needs a mesh to build the host pool sharding")
 

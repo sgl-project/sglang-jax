@@ -63,9 +63,9 @@ class FullComponent(TreeComponent):
         # and hand the whole host buffer to one side (the partial-match split bug).
         if child_cd.host_value is not None:
             PS = self.cache.page_size
-            assert split_len % PS == 0, (
-                f"node split at non-page-aligned len {split_len} (page_size={PS})"
-            )
+            assert (
+                split_len % PS == 0
+            ), f"node split at non-page-aligned len {split_len} (page_size={PS})"
             split_pages = split_len // PS
             new_parent.component_data[ct].host_value = child_cd.host_value[:split_pages].copy()
             child_cd.host_value = child_cd.host_value[split_pages:].copy()
@@ -170,12 +170,11 @@ class FullComponent(TreeComponent):
             # Mirror acquire: device-token accounting only for live nodes; a
             # tombstone on the path just gets its lock_ref decremented. State
             # cannot have flipped while locked, so this stays symmetric.
-            if cd.value is not None:
-                if cd.lock_ref == 1:
-                    key_len = len(cd.value)
-                    cur_dp_rank = cur.key.dp_rank if cur.key and cur.key.dp_rank is not None else 0
-                    self.cache.component_evictable_size_[ct][cur_dp_rank] += key_len
-                    self.cache.component_protected_size_[ct][cur_dp_rank] -= key_len
+            if cd.value is not None and cd.lock_ref == 1:
+                key_len = len(cd.value)
+                cur_dp_rank = cur.key.dp_rank if cur.key and cur.key.dp_rank is not None else 0
+                self.cache.component_evictable_size_[ct][cur_dp_rank] += key_len
+                self.cache.component_protected_size_[ct][cur_dp_rank] -= key_len
             cd.lock_ref -= 1
             if cd.lock_ref == 0:
                 self.cache._update_evictable_leaf_sets(cur)

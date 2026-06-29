@@ -26,7 +26,9 @@ _MESH = create_device_mesh(ici_parallelism=[1, -1], dcn_parallelism=[1, 1])
 # head_dim must be 128-aligned: the H2D load path now writes via the in-place
 # Pallas kernel (write_kv_layer -> update_fused_kv_cache_vectorized), which
 # requires it -- and production KV pools are always 128-aligned.
-def _make_device_pool(*, size=16, page_size=1, head_num=4, head_dim=128, layer_num=3, dtype=jnp.float32):
+def _make_device_pool(
+    *, size=16, page_size=1, head_num=4, head_dim=128, layer_num=3, dtype=jnp.float32
+):
     return MHATokenToKVPool(
         size=size,
         page_size=page_size,
@@ -116,7 +118,6 @@ class _FakeLoadPool:
 
     def free(self, host_buffer_ids):
         pass
-
 
 
 class TestHiCacheControllerAsync(unittest.TestCase):
