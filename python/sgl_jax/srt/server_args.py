@@ -399,7 +399,6 @@ class ServerArgs:
                     f"write_through_selective/write_back, got {self.hicache_write_policy}"
                 )
 
-
         if self.nnodes > 1 and self.device_indexes is not None:
             logger.warning("In a multi-machine scenario, device_indexes will be set to None.")
             self.device_indexes = None

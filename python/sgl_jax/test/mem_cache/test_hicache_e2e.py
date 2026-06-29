@@ -67,9 +67,7 @@ class HiCacheE2EBase(unittest.TestCase):
             dp_size=1,
         )
         self.allocator = (
-            TokenToKVPoolAllocator(
-                size=self.DEVICE_SIZE, kvcache=self.kv_cache, dp_size=1
-            )
+            TokenToKVPoolAllocator(size=self.DEVICE_SIZE, kvcache=self.kv_cache, dp_size=1)
             if self.PAGE_SIZE == 1
             else PagedTokenToKVPoolAllocator(
                 size=self.DEVICE_SIZE,
@@ -125,9 +123,7 @@ class HiCacheE2EBase(unittest.TestCase):
         """Set one token's KV at [page, offset] (kv_buffer leading axis=page)."""
         page, off = int(token_idx) // self.PAGE_SIZE, int(token_idx) % self.PAGE_SIZE
         buf = self.kv_cache.kv_buffer[layer]
-        self.kv_cache.kv_buffer[layer] = buf.at[page, off].set(
-            vals, out_sharding=buf.sharding
-        )
+        self.kv_cache.kv_buffer[layer] = buf.at[page, off].set(vals, out_sharding=buf.sharding)
 
     def _read_token(self, layer: int, token_idx: int):
         page, off = int(token_idx) // self.PAGE_SIZE, int(token_idx) % self.PAGE_SIZE
@@ -261,10 +257,14 @@ class TestEvictAndLoadBack(HiCacheE2EBase):
         idx_a, _ = self._alloc_and_fill(len(seg_a), seed=11)
         idx_b, _ = self._alloc_and_fill(len(seg_b), seed=12)
         self.cache.insert(InsertParams(key=_key(seg_a), value=idx_a))
-        self.cache.insert(InsertParams(key=_key(seg_a + seg_b), value=np.concatenate([idx_a, idx_b])))
+        self.cache.insert(
+            InsertParams(key=_key(seg_a + seg_b), value=np.concatenate([idx_a, idx_b]))
+        )
         # Reuse to back both nodes up.
         self.cache.insert(InsertParams(key=_key(seg_a), value=idx_a))
-        self.cache.insert(InsertParams(key=_key(seg_a + seg_b), value=np.concatenate([idx_a, idx_b])))
+        self.cache.insert(
+            InsertParams(key=_key(seg_a + seg_b), value=np.concatenate([idx_a, idx_b]))
+        )
         self._settle_writes()
         self.cache.evict(EvictParams(num_tokens=len(seg_a) + len(seg_b), dp_rank=0))
 
@@ -431,9 +431,7 @@ class TestTombstoneRevival(HiCacheE2EBase):
         head_idx, _ = self._alloc_and_fill(len(head), seed=42)
         tail_idx, _ = self._alloc_and_fill(len(tail), seed=43)
         self.cache.insert(
-            InsertParams(
-                key=_key(head + tail), value=np.concatenate([head_idx, tail_idx])
-            )
+            InsertParams(key=_key(head + tail), value=np.concatenate([head_idx, tail_idx]))
         )
         self.assertFalse(node.evicted, "ancestor must be revived, not tombstoned")
         child = [c for c in node.children.values()][0]
@@ -447,7 +445,6 @@ class TestTombstoneRevival(HiCacheE2EBase):
         tokens = [70, 71, 72, 73]
         idx, _ = self._alloc_and_fill(len(tokens), seed=51)
         self.cache.insert(InsertParams(key=_key(tokens), value=idx))
-        node = self._child_of_root()
         self.cache.insert(InsertParams(key=_key(tokens), value=idx))
         self._settle_writes()
         self.cache.evict(EvictParams(num_tokens=len(tokens), dp_rank=0))
@@ -585,9 +582,7 @@ class TestHostCopyReuse(HiCacheE2EBase):
             self.assertTrue(node.evicted and node.backuped)
             # Demotion of an already-backed node issues no new transfer.
             self.assertFalse(self.cache.ongoing_write)
-            self.assertEqual(
-                [int(b) for b in node.component_data[0].host_value], host_first
-            )
+            self.assertEqual([int(b) for b in node.component_data[0].host_value], host_first)
 
             mr = self.cache.match_prefix(MatchPrefixParams(key=_key(tokens)))
             self.assertEqual(len(mr.device_indices), 0)
@@ -648,9 +643,7 @@ class TestPartialHit(HiCacheE2EBase):
         # Shallow KV already on device is correct.
         for i, dev_idx in enumerate(mr.device_indices):
             for layer in range(self.LAYER_NUM):
-                np.testing.assert_allclose(
-                    self._read_token(layer, int(dev_idx)), orig_a[i][layer]
-                )
+                np.testing.assert_allclose(self._read_token(layer, int(dev_idx)), orig_a[i][layer])
 
         new_indices, _ = self._load_back(
             mr.last_host_node, mr.host_hit_length, mem_quota=self.DEVICE_SIZE
@@ -658,9 +651,7 @@ class TestPartialHit(HiCacheE2EBase):
         self.assertEqual(len(new_indices), len(seg_b))
         for i, dev_idx in enumerate(new_indices):
             for layer in range(self.LAYER_NUM):
-                np.testing.assert_allclose(
-                    self._read_token(layer, int(dev_idx)), orig_b[i][layer]
-                )
+                np.testing.assert_allclose(self._read_token(layer, int(dev_idx)), orig_b[i][layer])
 
     def test_partial(self):
         self._run()
@@ -706,9 +697,7 @@ class TestLoadBackPreEvicts(HiCacheE2EBase):
         self.assertEqual(len(new_indices), len(target))
         for i, dev_idx in enumerate(new_indices):
             for layer in range(self.LAYER_NUM):
-                np.testing.assert_allclose(
-                    self._read_token(layer, int(dev_idx)), orig[i][layer]
-                )
+                np.testing.assert_allclose(self._read_token(layer, int(dev_idx)), orig[i][layer])
 
 
 # ---- B5: randomized round-trip property test ------------------------------

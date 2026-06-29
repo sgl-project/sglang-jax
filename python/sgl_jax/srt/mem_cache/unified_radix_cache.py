@@ -653,9 +653,7 @@ class UnifiedRadixCache(BasePrefixCache):
                     f"(page_size={self.page_size})"
                 )
                 cd.value = value[:prefix_len].copy()
-                node_dp_rank = (
-                    node.key.dp_rank if node.key and node.key.dp_rank is not None else 0
-                )
+                node_dp_rank = node.key.dp_rank if node.key and node.key.dp_rank is not None else 0
                 self.component_evictable_size_[BASE_COMPONENT_TYPE][node_dp_rank] += prefix_len
                 self._update_evictable_leaf_sets(node)
                 self._update_evictable_leaf_sets(node.parent)
@@ -807,9 +805,9 @@ class UnifiedRadixCache(BasePrefixCache):
 
         PS = self.page_size
         device_tokens = np.asarray(device_indices)
-        assert len(device_tokens) % PS == 0, (
-            f"node.value len {len(device_tokens)} not page-aligned (page_size={PS})"
-        )
+        assert (
+            len(device_tokens) % PS == 0
+        ), f"node.value len {len(device_tokens)} not page-aligned (page_size={PS})"
         device_pages = device_tokens[::PS] // PS  # local device page ids
         num_pages = len(device_pages)
         host_pages = self._reserve_host_slots(num_pages)
@@ -908,11 +906,7 @@ class UnifiedRadixCache(BasePrefixCache):
         # synchronous, so cd.value is still valid here and materializes off-device
         # before the free below. A failed backup (host pool full -> returns 0)
         # falls through to the delete path, exactly like write_through.
-        if (
-            self.hicache_enabled
-            and self.write_policy == "write_back"
-            and not node.backuped
-        ):
+        if self.hicache_enabled and self.write_policy == "write_back" and not node.backuped:
             if self._donation_barrier is not None:
                 self._donation_barrier()
             self.write_backup(node, write_back=True)
@@ -1059,15 +1053,17 @@ class UnifiedRadixCache(BasePrefixCache):
         # node's token count is pages * PS.
         PS = self.page_size
         selected = list(chain)
-        total = sum(
-            len(n.component_data[BASE_COMPONENT_TYPE].host_value) * PS for n in selected
-        )
+        total = sum(len(n.component_data[BASE_COMPONENT_TYPE].host_value) * PS for n in selected)
         # Skip the reload (recompute instead) if the full chain cannot fit even
         # after eviction; the caller falls back to prefilling this prefix.
         if mem_quota is not None and total > mem_quota:
             return np.empty((0,), dtype=np.int32), last_host_node, []
 
-        dp_rank = last_host_node.key.dp_rank if last_host_node.key and last_host_node.key.dp_rank is not None else 0
+        dp_rank = (
+            last_host_node.key.dp_rank
+            if last_host_node.key and last_host_node.key.dp_rank is not None
+            else 0
+        )
 
         # Make device room (the matched path was just touched, so LRU eviction
         # targets colder leaves first), then allocate. Abort if still short.
@@ -1118,9 +1114,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
         return device_indices_all, selected[-1], flush_plan
 
-    def finish_load_back(
-        self, flush_plan: list[tuple[list[int], list[int]]]
-    ) -> None:
+    def finish_load_back(self, flush_plan: list[tuple[list[int], list[int]]]) -> None:
         """Donation-safe second half of :meth:`init_load_back`.
 
         Drains the async ``stage_load``s submitted by ``init_load_back`` and

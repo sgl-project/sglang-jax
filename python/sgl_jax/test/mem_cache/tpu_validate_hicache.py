@@ -90,12 +90,8 @@ def _fill_page(device_pool, device_page: int, seed: int):
     orig = []
     for layer in range(device_pool.layer_num):
         buf = device_pool.kv_buffer[layer]
-        vals = jax.random.normal(
-            jax.random.PRNGKey(seed * 100 + layer), buf.shape[1:], buf.dtype
-        )
-        device_pool.kv_buffer[layer] = buf.at[device_page].set(
-            vals, out_sharding=buf.sharding
-        )
+        vals = jax.random.normal(jax.random.PRNGKey(seed * 100 + layer), buf.shape[1:], buf.dtype)
+        device_pool.kv_buffer[layer] = buf.at[device_page].set(vals, out_sharding=buf.sharding)
         orig.append(np.asarray(device_pool.kv_buffer[layer])[device_page])
     return orig
 
@@ -120,9 +116,7 @@ def check_pinned_host(host_pool, device_pool, page_size: int) -> bool:
 
 
 def check_roundtrip(host_pool, device_pool, page_size: int) -> bool:
-    _section(
-        f"2. multi-chip sharded D2H/H2D page round-trip bit-exact (page_size={page_size})"
-    )
+    _section(f"2. multi-chip sharded D2H/H2D page round-trip bit-exact (page_size={page_size})")
     pairs = [(2, 10), (5, 11), (9, 12)]  # (src_page, dst_page)
     origs = {src: _fill_page(device_pool, src, seed=src) for src, _ in pairs}
     pages = [int(p) for p in host_pool.alloc(len(pairs))]
@@ -132,7 +126,7 @@ def check_roundtrip(host_pool, device_pool, page_size: int) -> bool:
     host_pool.flush_backup(pages)
     host_pool.copy_to_device(pages, dsts)
     ok = True
-    for (src, dst) in pairs:
+    for src, dst in pairs:
         for layer in range(device_pool.layer_num):
             got = np.asarray(device_pool.kv_buffer[layer])[dst]
             if not np.array_equal(got, origs[src][layer]):
@@ -148,9 +142,7 @@ def check_roundtrip(host_pool, device_pool, page_size: int) -> bool:
 
 
 def check_controller(host_pool, device_pool, page_size: int) -> bool:
-    _section(
-        f"3. HiCacheController async-write / sync-load round-trip (page_size={page_size})"
-    )
+    _section(f"3. HiCacheController async-write / sync-load round-trip (page_size={page_size})")
     ctrl = HiCacheController(host_pool, device_pool)
     ok = True
     try:
@@ -182,10 +174,7 @@ def check_dp_page_isolation(page_size: int = 2, dp_size: int = 2) -> bool:
     each must load back its own physical page (global-page math under real
     data+tensor sharding). Mirrors ``UnifiedRadixCache._to_global_device_pages``.
     """
-    _section(
-        f"5. DP={dp_size} + page_size={page_size} rank isolation "
-        "(global device page math)"
-    )
+    _section(f"5. DP={dp_size} + page_size={page_size} rank isolation " "(global device page math)")
     if len(jax.devices()) < dp_size * 2:
         print(f"  SKIP: need >= {dp_size * 2} chips for a data={dp_size},tensor>=2 mesh")
         return True
@@ -283,9 +272,7 @@ def check_dp_full_chain(page_size: int = 128, dp_size: int = 2) -> bool:
     tokens_per_rank = page_size * 2  # two pages per rank
     device_size = page_size * 16  # room to insert both ranks + reload after evict
 
-    mesh = create_device_mesh(
-        ici_parallelism=[dp_size, tensor], dcn_parallelism=[1, 1]
-    )
+    mesh = create_device_mesh(ici_parallelism=[dp_size, tensor], dcn_parallelism=[1, 1])
     jax.sharding.set_mesh(mesh)
     kv_cache = MHATokenToKVPool(
         size=device_size,
@@ -360,9 +347,7 @@ def check_dp_full_chain(page_size: int = 128, dp_size: int = 2) -> bool:
                     token_shape,
                     buf.dtype,
                 )
-                kv_cache.kv_buffer[layer] = buf.at[gp, off].set(
-                    vals, out_sharding=buf.sharding
-                )
+                kv_cache.kv_buffer[layer] = buf.at[gp, off].set(vals, out_sharding=buf.sharding)
                 per_layer.append(_read_token(layer, lidx, dp_rank))
             orig.append(per_layer)
         return local, orig
@@ -472,9 +457,7 @@ def measure_bandwidth(host_pool, device_pool) -> bool:
 
     n_tok = 32768  # 32768 * 16 * 2 * 128 * 2B = 256 MB
     arr = jax.device_put(
-        jax.random.normal(
-            jax.random.PRNGKey(0), (n_tok, _HEAD_NUM, 2, _HEAD_DIM), _DTYPE
-        ),
+        jax.random.normal(jax.random.PRNGKey(0), (n_tok, _HEAD_NUM, 2, _HEAD_DIM), _DTYPE),
         dev_sharding,
     )
     jax.block_until_ready(arr)
@@ -509,23 +492,15 @@ def measure_bandwidth(host_pool, device_pool) -> bool:
 
 
 def run_suite(page_size: int) -> dict[str, bool]:
-    mesh, device_pool, host_pool = _build(
-        page_size=page_size, dp_size=1, ici_parallelism=[1, -1]
-    )
+    mesh, device_pool, host_pool = _build(page_size=page_size, dp_size=1, ici_parallelism=[1, -1])
     print(f"\n##### page_size={page_size} #####")
     print(f"mesh: {mesh}")
     print(f"device kv_buffer[0].shape: {device_pool.kv_buffer[0].shape}")
     print(f"device kv_buffer[0].sharding: {device_pool.kv_buffer[0].sharding}")
     results = {
-        f"pinned_host[ps={page_size}]": check_pinned_host(
-            host_pool, device_pool, page_size
-        ),
-        f"roundtrip[ps={page_size}]": check_roundtrip(
-            host_pool, device_pool, page_size
-        ),
-        f"controller[ps={page_size}]": check_controller(
-            host_pool, device_pool, page_size
-        ),
+        f"pinned_host[ps={page_size}]": check_pinned_host(host_pool, device_pool, page_size),
+        f"roundtrip[ps={page_size}]": check_roundtrip(host_pool, device_pool, page_size),
+        f"controller[ps={page_size}]": check_controller(host_pool, device_pool, page_size),
     }
     if page_size == 1:
         results["bandwidth"] = measure_bandwidth(host_pool, device_pool)
