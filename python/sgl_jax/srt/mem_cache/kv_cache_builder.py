@@ -25,6 +25,7 @@ def build_kv_cache(
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
     page_size: int,
     is_hybrid: bool,
+    is_hybrid_recurrent: bool = False,
     sliding_window_size: int | None,
     tp_size: int,
     spec_algorithm: SpeculativeAlgorithm | None,
@@ -35,6 +36,8 @@ def build_kv_cache(
         page_size=page_size,
         is_eagle=spec_algorithm is not None and spec_algorithm.is_eagle(),
         sliding_window_size=sliding_window_size,
+        enable_recurrent_extra_buffer=server_args.enable_recurrent_extra_buffer,
+        recurrent_track_interval=server_args.recurrent_track_interval,
     )
 
     return create_tree_cache(
@@ -42,6 +45,7 @@ def build_kv_cache(
             server_args=server_args,
             params=params,
             is_hybrid_swa=is_hybrid,
+            is_hybrid_recurrent=is_hybrid_recurrent,
             disable_radix_cache=server_args.disable_radix_cache,
             effective_chunked_prefill_size=server_args.chunked_prefill_size,
             model_config=model_config,

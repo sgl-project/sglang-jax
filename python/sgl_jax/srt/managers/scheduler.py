@@ -34,6 +34,10 @@ from sgl_jax.srt.disaggregation.runtime import install_disaggregation_wiring
 from sgl_jax.srt.hf_transformers_utils import get_tokenizer
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
 from sgl_jax.srt.managers.communication import CommunicationBackend
+from sgl_jax.srt.managers.dp_schedule_policy import (
+    pick_cache_aware_dp,
+    req_prefix_match_key,
+)
 from sgl_jax.srt.managers.io_struct import (
     AbortReq,
     ContinueGenerationReqInput,
@@ -69,8 +73,10 @@ from sgl_jax.srt.managers.scheduler_profiler_mixing import SchedulerProfilerMixi
 from sgl_jax.srt.managers.tp_worker import ModelWorker
 from sgl_jax.srt.managers.tp_worker_overlap_thread import ModelWorkerClient
 from sgl_jax.srt.managers.utils import validate_input_length
+from sgl_jax.srt.mem_cache.base_prefix_cache import MatchPrefixParams
 from sgl_jax.srt.mem_cache.chunk_cache import ChunkCache
 from sgl_jax.srt.mem_cache.kv_cache_builder import build_kv_cache
+from sgl_jax.srt.mem_cache.radix_cache import RadixKey
 from sgl_jax.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.multimodal.tokenizer_utils import resolve_tokenizer_subdir
@@ -85,11 +91,13 @@ from sgl_jax.srt.speculative.overlap_utils import (
 )
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 from sgl_jax.srt.utils.common_utils import (
+    SAFE_EXTEND_PER_DP_BS,
     configure_logger,
     get_bool_env_var,
     get_zmq_socket,
     kill_itself_when_parent_died,
     pyspy_dump_schedulers,
+    selected_extend_per_dp_bs,
     set_random_seed,
 )
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
@@ -615,6 +623,8 @@ class Scheduler(
             )
 
     def init_memory_pool_and_cache(self):
+        from sgl_jax.srt.mem_cache.memory_pool import HybridReqToTokenPool
+
         self.req_to_token_pool, self.token_to_kv_pool_allocator = self.tp_worker.get_memory_pool()
         self.tree_cache = build_kv_cache(
             server_args=self.server_args,
@@ -623,10 +633,23 @@ class Scheduler(
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             page_size=self.page_size,
             is_hybrid=self.is_hybrid,
+            is_hybrid_recurrent=isinstance(self.req_to_token_pool, HybridReqToTokenPool),
             sliding_window_size=self.sliding_window_size,
             tp_size=self.tp_size,
             spec_algorithm=self.spec_algorithm,
         )
+
+        # Multi-host recurrent page_size=1 EXTEND miscompiles RPA above a safe
+        # per_dp_bs (finite inputs -> NaN). Gate the admission guard + Step 1b
+        # backstop to exactly that path; everything else is unaffected.
+        self._extend_bs_guard_active = (
+            self.server_args.nnodes > 1
+            and self.page_size == 1
+            and isinstance(self.req_to_token_pool, HybridReqToTokenPool)
+            and (self.spec_algorithm is None or self.spec_algorithm.is_none())
+        )
+        # bs bucket list runtime selects from (== compilation_manager.bs_buckets).
+        self._precompile_bs_paddings = self.tp_worker.get_precompile_paddings()[1]
 
     def _select_round_robin_dp(self) -> int:
         dp_rank = self.dp_round_robin_counter % self.dp_size
@@ -755,6 +778,27 @@ class Scheduler(
 
         return req_counts, token_counts
 
+    def _dp_load_and_eligible(
+        self, extra_counts: list[int], extra_token_counts: list[int]
+    ) -> tuple[list[int], list[int], list[int]]:
+        """Per-DP (running + pending) load and the ranks that can accept a request.
+
+        A rank is eligible when its batch is not full and it is under the
+        per-rank running cap. Returns ``(eligible_ranks, counts, token_counts)``.
+        """
+        running_counts, running_token_counts = self._get_dp_load_snapshot()
+        counts = [running_counts[i] + extra_counts[i] for i in range(self.dp_size)]
+        token_counts = [
+            running_token_counts[i] + extra_token_counts[i] for i in range(self.dp_size)
+        ]
+        eligible = [
+            dp_rank
+            for dp_rank in range(self.dp_size)
+            if not self.running_batch.reqs_info[dp_rank].batch_is_full
+            and counts[dp_rank] < self.per_dp_max_running_requests
+        ]
+        return eligible, counts, token_counts
+
     def _select_min_running_dp(
         self,
         extra_counts: list[int] | None = None,
@@ -772,24 +816,58 @@ class Scheduler(
         if extra_token_counts is None:
             extra_token_counts = [0] * self.dp_size
 
-        running_counts, running_token_counts = self._get_dp_load_snapshot()
-        counts = [running_counts[i] + extra_counts[i] for i in range(self.dp_size)]
-        token_counts = [
-            running_token_counts[i] + extra_token_counts[i] for i in range(self.dp_size)
-        ]
-
-        eligible = []
-        for dp_rank in range(self.dp_size):
-            if self.running_batch.reqs_info[dp_rank].batch_is_full:
-                continue
-            if counts[dp_rank] >= self.per_dp_max_running_requests:
-                continue
-            eligible.append(dp_rank)
-
+        eligible, counts, token_counts = self._dp_load_and_eligible(
+            extra_counts, extra_token_counts
+        )
         if not eligible:
             return None
 
         return min(eligible, key=lambda dp_rank: (counts[dp_rank], token_counts[dp_rank], dp_rank))
+
+    def _cached_prefix_len(self, token_ids: list[int], extra_key: str | None, dp_rank: int) -> int:
+        """Length of the longest cached prefix for ``token_ids`` on ``dp_rank``.
+
+        Probes the dp-keyed tree (no alloc, no CoW), but incurs the normal
+        ``match_prefix`` side effects (LRU refresh, possible node split). Returns
+        0 for non-radix caches (ChunkCache returns an empty match).
+        """
+        if self.tree_cache is None:
+            return 0
+        result = self.tree_cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(token_ids, extra_key, dp_rank))
+        )
+        return len(result.device_indices)
+
+    def _select_cache_aware_dp(
+        self,
+        req: TokenizedGenerateReqInput,
+        extra_counts: list[int],
+        extra_token_counts: list[int],
+    ) -> int | None:
+        """Route ``req`` by cache affinity with soft load balancing.
+
+        Probes each eligible rank's cached prefix length, then defers to
+        ``pick_cache_aware_dp``: balance on large load skew, else least-loaded
+        among the ranks holding a substantial cached prefix. Returns None if all
+        DP ranks are full.
+        """
+        if self.dp_size == 1:
+            return 0
+
+        eligible, counts, token_counts = self._dp_load_and_eligible(
+            extra_counts, extra_token_counts
+        )
+        if not eligible:
+            return None
+
+        token_ids, extra_key = req_prefix_match_key(req)
+        matches: dict[int, int] = {}
+        prompt_len = len(token_ids) if token_ids else 0
+        if token_ids:
+            for dp_rank in eligible:
+                matches[dp_rank] = self._cached_prefix_len(token_ids, extra_key, dp_rank)
+
+        return pick_cache_aware_dp(eligible, counts, token_counts, matches, prompt_len)
 
     def select_dp_for_request(self, recv_reqs: list[Req]) -> list[Req]:
         """Assign dp_rank to incoming requests using the configured DP policy.
@@ -838,10 +916,17 @@ class Scheduler(
                 ready_reqs.append(req)
                 continue
 
-            dp_rank = self._select_min_running_dp(
-                extra_counts=pending_counts,
-                extra_token_counts=pending_token_counts,
-            )
+            if self.dp_schedule_policy == "cache_aware":
+                dp_rank = self._select_cache_aware_dp(
+                    req,
+                    extra_counts=pending_counts,
+                    extra_token_counts=pending_token_counts,
+                )
+            else:
+                dp_rank = self._select_min_running_dp(
+                    extra_counts=pending_counts,
+                    extra_token_counts=pending_token_counts,
+                )
             if dp_rank is None:
                 # All DP ranks are full; keep the request pending.
                 self.pending_dp_reqs.append(req)
@@ -1607,6 +1692,18 @@ class Scheduler(
 
         return ret
 
+    def _project_extend_per_dp_bs(self, adder, candidate_dp_rank):
+        """Per_dp_bs bucket runtime would select if one more req joined
+        candidate_dp_rank's EXTEND batch. Mirrors `_compute_global_padding_sizes`
+        exactly: keyed to the GLOBAL max active count across dp ranks. Running
+        reqs are not counted -- `mix_with_running` is disabled on the guarded
+        path, so EXTEND stays pure prefill + chunked."""
+        active_per_dp = [
+            len(adder.can_run_list[r]) + (1 if r == candidate_dp_rank else 0)
+            for r in range(self.dp_size)
+        ]
+        return selected_extend_per_dp_bs(active_per_dp, self.dp_size, self._precompile_bs_paddings)
+
     def get_new_batch_prefill(self) -> ScheduleBatch | None:
         if self.grammar_queue:
             self.move_ready_grammar_requests()
@@ -1678,6 +1775,32 @@ class Scheduler(
             if self.running_batch.reqs_info[dp_rank].batch_is_full or (
                 len(self.running_batch.reqs_info[dp_rank].reqs) + len(adder.can_run_list[dp_rank])
                 >= self.per_dp_max_running_requests
+            ):
+                continue
+
+            # Recurrent backpressure: a new req needs request_owned_slots
+            # recurrent slots (1 running + ping-pong track slots under
+            # extra-buffer) that the running reservation can't evict. If this
+            # rank's free + evictable recurrent slots can't cover the reqs
+            # already queued plus this one, defer it rather than let
+            # alloc_req_slots raise (the pool is non-evictable while in flight,
+            # so over-subscription must throttle, not crash).
+            if self.tree_cache is not None and self.tree_cache.supports_recurrent():
+                per_req = self.req_to_token_pool.request_owned_slots
+                demand = per_req * (len(adder.can_run_list[dp_rank]) + 1)
+                free = self.req_to_token_pool.recurrent_available_size(dp_rank)
+                evictable = self.tree_cache.recurrent_evictable_size(dp_rank)
+                if free + evictable < demand:
+                    self.running_batch.reqs_info[dp_rank].batch_is_full = True
+                    if self.running_batch.batch_is_full:
+                        break
+                    continue
+
+            # Affected recurrent multi-host path: defer reqs that would push the
+            # GLOBAL selected EXTEND bucket past the safe per_dp_bs. Overflow stays
+            # in the waiting queue and runs next iteration (clean split via deferral).
+            if self._extend_bs_guard_active and (
+                self._project_extend_per_dp_bs(adder, dp_rank) > SAFE_EXTEND_PER_DP_BS
             ):
                 continue
 
@@ -1775,9 +1898,14 @@ class Scheduler(
 
         new_batch.prepare_for_extend()
 
-        # Mixed-style chunked prefill
+        # Mixed-style chunked prefill. Disabled on the affected recurrent
+        # multi-host path: mixing folds all ranks' running decode into the EXTEND
+        # batch, which could push the selected per_dp_bs past the safe bound that
+        # the admission guard enforces on prefill alone. There decode runs as its
+        # own forward instead.
         if (
             self.is_mixed_chunk
+            and not self._extend_bs_guard_active
             and not self._is_spec_decode_enabled()
             and not self.running_batch.is_empty()
             and not (new_batch.return_logprob or self.running_batch.return_logprob)
@@ -1924,6 +2052,9 @@ class Scheduler(
                 precompile_cache_loc_paddings,
                 self.page_size,
                 self.server_args.enable_static_lora,
+                extend_guard_per_dp_bs=(
+                    SAFE_EXTEND_PER_DP_BS if self._extend_bs_guard_active else 0
+                ),
             )
 
             if self.enable_overlap:

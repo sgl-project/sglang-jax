@@ -615,6 +615,112 @@ class TestKDAAttention(unittest.TestCase):
             )
             pool.replace_buffer(([recurrent_buffer], [conv_buffer_list]))
 
+    def test_recurrent_cow_copy_equivalence(self):
+        """Recurrent CoW: copy_slots clones a prefilled recurrent+conv state
+        into another slot bitwise-identically, so a decode from the clone matches
+        a decode from the source (KL==0 at page_size=1)."""
+        layer, pool, rec_idx, rec_buf, conv_buf_list = self.run_test("prefill", [128])
+        pool.replace_buffer(([rec_buf], [conv_buf_list]))
+
+        src = int(np.asarray(rec_idx).reshape(-1)[0])
+        dst = src + 1 if src + 1 < pool.total_slots else 1
+        data_sh = NamedSharding(mesh, P("data"))
+        src_arr = jax.device_put(np.array([src], dtype=np.int32), data_sh)
+        dst_arr = jax.device_put(np.array([dst], dtype=np.int32), data_sh)
+        new_rec, new_conv = jax.jit(pool.copy_slots)(src_arr, dst_arr)
+        pool.replace_buffer((new_rec, new_conv))
+
+        src_idx = np.array([src], dtype=np.int32)
+        dst_idx = np.array([dst], dtype=np.int32)
+        for layer_idx in range(pool.num_linear_recurrent_layers):
+            np.testing.assert_array_equal(
+                np.asarray(gather_ssm(pool, pool.recurrent_buffers[layer_idx], dst_idx)),
+                np.asarray(gather_ssm(pool, pool.recurrent_buffers[layer_idx], src_idx)),
+            )
+            np.testing.assert_array_equal(
+                np.asarray(gather_conv(pool, pool.conv_buffers[layer_idx][0], dst_idx)),
+                np.asarray(gather_conv(pool, pool.conv_buffers[layer_idx][0], src_idx)),
+            )
+
+    def test_track_scatter_equivalence(self):
+        """Recurrent track writeback: a prefill that lands on a track boundary
+        scatters the SAME final state into the request's track slot AND its
+        running slot. Assert the track slot equals the running slot bitwise
+        (synthetic weights, no checkpoint). Controller-validated on TPU.
+
+        Uses a pool sized larger than the batch so distinct free track slots
+        exist (``create_test_data`` ties pool size to batch size, leaving no
+        spare slot)."""
+        # Pin the 4-device mesh for the whole test via jax.set_mesh (the
+        # codebase-standard context, see moe.py / weight_utils). This keeps the
+        # test correct even when another test module's import-time set_mesh has
+        # left a different global mesh active (e.g. test_gdn_attention sets a
+        # single-device mesh); CI already isolates files in separate subprocesses.
+        with jax.set_mesh(mesh):
+            seq_lens = [64, 32]
+            batch_size = len(seq_lens)
+            (
+                forward_batch,
+                _pool,
+                layer,
+                q,
+                k,
+                v,
+                a,
+                b,
+                _initial_ssm_ref,
+                _initial_conv_ref,
+                recurrent_indices,
+            ) = create_test_data(
+                "prefill",
+                seq_lens,
+                self.NUM_HEADS,
+                self.HEAD_DIM,
+                self.CONV_KERNEL_SIZE,
+                self.DTYPE,
+                self.rng,
+            )
+            # Fresh, larger pool so track slots are distinct free slots. Fresh
+            # prefill (has_initial_state=False) needs no initial-state write.
+            pool = RecurrentStatePool(
+                linear_recurrent_layer_ids=[layer.layer_id],
+                size=8,
+                num_heads=self.NUM_HEADS,
+                head_dim=self.HEAD_DIM,
+                conv_kernel_size=self.CONV_KERNEL_SIZE,
+                mesh=mesh,
+                dp_size=1,
+                recurrent_partition_axis="tensor",
+                conv_partition_axis="tensor",
+                data_partition_axis="data",
+                temporal_dtype=jnp.float32,
+                conv_dtype=self.DTYPE,
+            )
+            running = np.asarray(recurrent_indices)  # [1, 2]
+            track = running + batch_size  # [3, 4] (free slots)
+            data_sh = NamedSharding(mesh, P("data"))
+            md = forward_batch.attn_backend.forward_metadata
+            md.recurrent_track_indices = jax.device_put(track.astype(np.int32), data_sh)
+            md.recurrent_track_mask = jax.device_put(np.ones(batch_size, dtype=np.int32), data_sh)
+
+            hidden_sharding = NamedSharding(mesh, P("data", "tensor"))
+            head_sharding = NamedSharding(mesh, P("data", "tensor"))
+            _, (recurrent_buffer, conv_buffer_list) = layer(
+                forward_batch,
+                jax.device_put(q, hidden_sharding),
+                jax.device_put(k, hidden_sharding),
+                jax.device_put(v, hidden_sharding),
+                jax.device_put(a, hidden_sharding),
+                jax.device_put(b, head_sharding),
+                pool,
+            )
+            run_ssm = np.asarray(gather_ssm(pool, recurrent_buffer, running))
+            trk_ssm = np.asarray(gather_ssm(pool, recurrent_buffer, track))
+            run_conv = np.asarray(gather_conv(pool, conv_buffer_list[0], running))
+            trk_conv = np.asarray(gather_conv(pool, conv_buffer_list[0], track))
+        np.testing.assert_array_equal(trk_ssm, run_ssm)
+        np.testing.assert_array_equal(trk_conv, run_conv)
+
 
 if __name__ == "__main__":
     unittest.main()

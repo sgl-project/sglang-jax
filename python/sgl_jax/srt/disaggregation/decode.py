@@ -654,6 +654,8 @@ class SchedulerDisaggregationDecodeMixin:
         if req.req_pool_idx is None:
             return
         try:
+            # pool.free releases the request slot and any request-owned recurrent
+            # slot (PD decode abort never enters caching, so it stays owned).
             self.req_to_token_pool.free(req)
         except Exception:
             logger.exception(

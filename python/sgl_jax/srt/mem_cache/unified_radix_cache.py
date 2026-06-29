@@ -1,9 +1,10 @@
 """Unified radix cache: a component-based radix tree over the device KV cache.
 
-Stage 1 ports the FULL-attention subset of upstream sglang's UnifiedRadixCache.
-All per-component behavior (matching, locking, eviction, split redistribution)
-is delegated to TreeComponent implementations so that later stages (SWA, Mamba,
-HiCache) plug in without touching the core walk.
+Ports upstream sglang's UnifiedRadixCache. Per-component behavior (matching,
+locking, eviction, split redistribution) is delegated to TreeComponent
+implementations: a FULL-attention component plus a leaf-only recurrent
+component (KDA / GDN). SWA / HiCache components plug into the same contract
+without touching the core walk.
 """
 
 from __future__ import annotations
@@ -43,6 +44,7 @@ from sgl_jax.srt.mem_cache.unified_cache_components import (
     EvictLayer,
     FullComponent,
     InsertResult,
+    RecurrentComponent,
     TreeComponent,
     get_and_increase_time_counter,
 )
@@ -83,6 +85,7 @@ class UnifiedTreeNode:
 
 COMPONENT_REGISTRY: dict[ComponentType, type[TreeComponent]] = {
     ComponentType.FULL: FullComponent,
+    ComponentType.RECURRENT: RecurrentComponent,
 }
 
 
@@ -101,6 +104,8 @@ class UnifiedRadixCache(BasePrefixCache):
         enable_kv_cache_events: bool = False,
         is_eagle: bool = False,
         tree_components: tuple[ComponentType, ...] = (ComponentType.FULL,),
+        enable_recurrent_extra_buffer: bool = False,
+        recurrent_track_interval: int | None = None,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -112,6 +117,8 @@ class UnifiedRadixCache(BasePrefixCache):
         self.max_seq_len = max_seq_len
         self.dtype = dtype
         self.enable_kv_cache_events = enable_kv_cache_events
+        self.enable_recurrent_extra_buffer = enable_recurrent_extra_buffer
+        self.recurrent_track_interval = recurrent_track_interval
         self.kv_event_queue: list = []
 
         self.process_id = jax.process_index()
@@ -165,12 +172,14 @@ class UnifiedRadixCache(BasePrefixCache):
         if len(converted_key) == 0:
             return self._empty_match_result()
 
-        value, best_match_node, best_value_len = self._match_prefix_helper(converted_key)
+        value, best_match_node, best_value_len = self._match_prefix_helper(
+            converted_key, full_only=params.full_only
+        )
         return self._match_post_processor(params, value, best_match_node, best_value_len)
 
-    def insert(self, params: InsertParams) -> int:
+    def insert(self, params: InsertParams) -> InsertResult:
         if self.disable:
-            return 0
+            return InsertResult(prefix_len=0)
 
         key = params.key
         value = params.value
@@ -210,7 +219,54 @@ class UnifiedRadixCache(BasePrefixCache):
         return EvictResult(
             num_tokens_evicted=tracker[BASE_COMPONENT_TYPE],
             swa_num_tokens_evicted=tracker.get(ComponentType.SWA, 0),
+            recurrent_num_evicted=tracker.get(ComponentType.RECURRENT, 0),
         )
+
+    def supports_recurrent(self) -> bool:
+        return ComponentType.RECURRENT in self.components
+
+    def recurrent_extra_buffer_active(self) -> bool:
+        return (
+            self.supports_recurrent()
+            and self.enable_recurrent_extra_buffer
+            and self.recurrent_track_interval is not None
+        )
+
+    def recurrent_evictable_size(self, dp_rank: int = 0) -> int:
+        """Unlocked tree-owned recurrent slots on ``dp_rank`` — what ``evict``
+        can reclaim (protected/locked snapshots excluded)."""
+        return self.component_evictable_size_[ComponentType.RECURRENT][dp_rank]
+
+    def assert_recurrent_slot_ledger(self, dp_rank: int = 0, live_reqs: list | None = None) -> int:
+        """Per-rank invariant ``active + tree_owned + free == slots_per_rank``;
+        returns the derived ``active`` (request-owned) count. Tree-owned =
+        recurrent evictable + protected; free = recurrent free-list length.
+
+        When ``live_reqs`` is given, the structurally-derived ``active`` is
+        cross-checked against the slots those requests actually hold (running +
+        ping-pong track), so a leaked track slot is caught rather than silently
+        absorbed into the tautological subtraction."""
+        ct = ComponentType.RECURRENT
+        rtp = self.req_to_token_pool
+        free = len(rtp.recurrent_free_slots[dp_rank])
+        tree_owned = (
+            self.component_evictable_size_[ct][dp_rank]
+            + self.component_protected_size_[ct][dp_rank]
+        )
+        slots = rtp.slots_per_rank
+        active = slots - tree_owned - free
+        assert active >= 0, (
+            f"recurrent slot ledger broken (dp={dp_rank}): free={free} "
+            f"tree_owned={tree_owned} > slots_per_rank={slots}"
+        )
+        if live_reqs is not None:
+            owned = rtp.count_request_owned_recurrent_slots(live_reqs, dp_rank)
+            assert owned == active, (
+                f"recurrent slot leak (dp={dp_rank}): request-owned={owned} != "
+                f"active={active} (free={free} tree_owned={tree_owned} "
+                f"slots_per_rank={slots})"
+            )
+        return active
 
     def inc_lock_ref(self, node: UnifiedTreeNode) -> IncLockRefResult:
         if self.disable:
@@ -255,15 +311,6 @@ class UnifiedRadixCache(BasePrefixCache):
         kv_indices = self.req_to_token_pool.read(req.req_pool_idx, committed_kv_len)
         kv_indices = kv_indices[kv_indices != 0]
 
-        if self.page_size != 1:
-            page_aligned_len = actual_kv_len // self.page_size * self.page_size
-            page_aligned_kv_indices = kv_indices[:page_aligned_len].copy()
-            self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:], dp_rank=dp_rank)
-        else:
-            page_aligned_len = actual_kv_len
-            page_aligned_kv_indices = kv_indices[:page_aligned_len].copy()
-
-        page_aligned_token_len = page_aligned_len + 1 if self.is_eagle else page_aligned_len
         # cache_protected_len, not len(prefix_indices): the latter may include
         # an unaligned tail owned by the req but not by the tree.
         old_prefix_len = req.cache_protected_len
@@ -272,24 +319,58 @@ class UnifiedRadixCache(BasePrefixCache):
             # unmatched token; -1 so its kv can be freed without leaking.
             old_prefix_len -= 1
 
-        insert_params = None
-        insert_result = None
+        # Let each component fill its insert fields and return an effective
+        # cache length; the inserted key is capped to the min across components.
+        # FULL returns None (full length); the recurrent component returns its
+        # effective cache len, capping the key to the recurrent boundary.
+        insert_params = InsertParams() if is_insert else None
+        effective_cache_len = len(token_ids)
         if is_insert:
-            insert_params = InsertParams(
-                key=RadixKey(token_ids[:page_aligned_token_len], req.extra_key, req.dp_rank),
-                value=page_aligned_kv_indices,
-            )
             for component in self._components_tuple:
-                component.prepare_for_caching_req(
+                cl = component.prepare_for_caching_req(
                     req, insert_params, len(token_ids), is_finished=True
                 )
+                if cl is not None:
+                    effective_cache_len = min(effective_cache_len, cl)
+
+        capped_kv_len = min(actual_kv_len, effective_cache_len)
+        if self.page_size != 1:
+            page_aligned_len = capped_kv_len // self.page_size * self.page_size
+        else:
+            page_aligned_len = capped_kv_len
+        page_aligned_kv_indices = kv_indices[:page_aligned_len].copy()
+        page_aligned_token_len = page_aligned_len + 1 if self.is_eagle else page_aligned_len
+
+        # Free the uncached tail: the page-alignment remainder plus any KV
+        # dropped by capping. Clamp the lower bound to old_prefix_len so the
+        # tree-protected prefix is never freed (matters only when capping below
+        # the prefix; otherwise page_aligned_len >= old_prefix_len). The upper
+        # bound preserves the original page=1 behavior of keeping the EAGLE +1
+        # token (kv_indices[actual_kv_len:] stays request-owned).
+        tail_start = max(page_aligned_len, old_prefix_len)
+        if self.page_size != 1:
+            self.token_to_kv_pool_allocator.free(kv_indices[tail_start:], dp_rank=dp_rank)
+        else:
+            self.token_to_kv_pool_allocator.free(
+                kv_indices[tail_start:actual_kv_len], dp_rank=dp_rank
+            )
+
+        insert_result = None
+        if is_insert and effective_cache_len > 0:
+            insert_params.key = RadixKey(
+                token_ids[:page_aligned_token_len], req.extra_key, req.dp_rank
+            )
+            insert_params.value = page_aligned_kv_indices
             # Radix cache takes over one reference from the memory pool.
-            new_prefix_len = self.insert(insert_params)
-            insert_result = InsertResult(prefix_len=new_prefix_len)
+            insert_result = self.insert(insert_params)
+            new_prefix_len = insert_result.prefix_len
             self.token_to_kv_pool_allocator.free(
                 kv_indices[old_prefix_len:new_prefix_len], dp_rank=dp_rank
             )
-        else:
+        elif not is_insert:
+            # Retract path: no insert at all. Free the request-owned range above
+            # the protected prefix (the tail above page_aligned_len is already
+            # freed; this covers [old_prefix_len:page_aligned_len]).
             self.token_to_kv_pool_allocator.free(
                 kv_indices[old_prefix_len:page_aligned_len], dp_rank=dp_rank
             )
@@ -316,35 +397,64 @@ class UnifiedRadixCache(BasePrefixCache):
         actual_kv_len = all_token_len - 1 if self.is_eagle else all_token_len
         kv_indices = self.req_to_token_pool.read(req.req_pool_idx, all_token_len)
 
-        if self.page_size != 1:
-            page_aligned_len = actual_kv_len // self.page_size * self.page_size
-            page_aligned_kv_indices = kv_indices[:page_aligned_len].copy()
-        else:
-            page_aligned_len = actual_kv_len
-            page_aligned_kv_indices = kv_indices
-
-        # For EAGLE, page_aligned_len is for the bigram key; the token len is +1.
-        page_aligned_token_len = page_aligned_len + 1 if self.is_eagle else page_aligned_len
-        page_aligned_token_ids = token_ids[:page_aligned_token_len]
-
         # cache_protected_len, not len(prefix_indices): see cache_finished_req.
         old_prefix_len = req.cache_protected_len
         if self.is_eagle and old_prefix_len > req.last_matched_prefix_len:
             old_prefix_len -= 1
 
-        radix_key = RadixKey(page_aligned_token_ids, req.extra_key, req.dp_rank)
-        insert_params = InsertParams(key=radix_key, value=page_aligned_kv_indices)
+        # Let each component fill its insert fields and return an effective
+        # cache length; the inserted key is capped to the min across components.
+        # FULL returns None (full length); the recurrent component returns its
+        # effective cache len, capping the key to the recurrent boundary.
+        insert_params = InsertParams()
+        effective_cache_len = all_token_len
         for component in self._components_tuple:
-            component.prepare_for_caching_req(req, insert_params, all_token_len, is_finished=False)
+            cl = component.prepare_for_caching_req(
+                req, insert_params, all_token_len, is_finished=False
+            )
+            if cl is not None:
+                effective_cache_len = min(effective_cache_len, cl)
+
+        if effective_cache_len <= 0:
+            # Nothing entered the tree this round, but the chunk's KV is committed.
+            # Advance prefix_indices to the committed range (like ChunkCache) so the
+            # next chunked round extends from here; leaving it stale re-allocates over
+            # this chunk's KV and orphans its pages (token_to_kv_pool leak).
+            # cache_protected_len / last_matched_prefix_len stay unchanged so the
+            # committed tail is freed from old_prefix_len on finish/retract.
+            req.prefix_indices = kv_indices.copy()
+            for component in self._components_tuple:
+                component.cleanup_after_caching_req(
+                    req, is_finished=False, insert_result=None, insert_params=insert_params
+                )
+            return
+
+        capped_kv_len = min(actual_kv_len, effective_cache_len)
+        if self.page_size != 1:
+            page_aligned_len = capped_kv_len // self.page_size * self.page_size
+            page_aligned_kv_indices = kv_indices[:page_aligned_len].copy()
+        else:
+            page_aligned_len = capped_kv_len
+            page_aligned_kv_indices = kv_indices[:page_aligned_len]
+
+        # For EAGLE, page_aligned_len is for the bigram key; the token len is +1.
+        page_aligned_token_len = page_aligned_len + 1 if self.is_eagle else page_aligned_len
+        page_aligned_token_ids = token_ids[:page_aligned_token_len]
+
+        radix_key = RadixKey(page_aligned_token_ids, req.extra_key, req.dp_rank)
+        insert_params.key = radix_key
+        insert_params.value = page_aligned_kv_indices
         # Radix cache takes over one reference from the memory pool.
-        new_prefix_len = self.insert(insert_params)
-        insert_result = InsertResult(prefix_len=new_prefix_len)
+        insert_result = self.insert(insert_params)
+        new_prefix_len = insert_result.prefix_len
         self.token_to_kv_pool_allocator.free(
             kv_indices[old_prefix_len:new_prefix_len], dp_rank=dp_rank
         )
 
-        # Prefix indices may have been updated, reuse them.
-        new_match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
+        # Prefix indices may have been updated, reuse them. FULL-only: this
+        # request's own prefix bookkeeping must not be gated on recurrent state
+        # (it lives in the running slot, not the tree).
+        new_match_result = self.match_prefix(MatchPrefixParams(key=radix_key, full_only=True))
         new_indices = new_match_result.device_indices
         new_last_node = new_match_result.last_device_node
 
@@ -358,11 +468,16 @@ class UnifiedRadixCache(BasePrefixCache):
         self.inc_lock_ref(new_last_node)
 
         # `req.prefix_indices` is used later in `PrefillAdder::add_chunked_req`.
+        # The still-running request retains its KV tail beyond the cached prefix
+        # (kv_indices[len(new_indices):]); this is empty when no component caps,
+        # so the page=1 non-EAGLE case stays byte-identical to plain new_indices.
         if self.page_size != 1:
             req.prefix_indices = np.concatenate([new_indices, kv_indices[len(new_indices) :]])
         elif self.is_eagle:
             # Attach the kv index of the last token for EAGLE chunked prefill.
             req.prefix_indices = np.concatenate([new_indices, kv_indices[actual_kv_len:]])
+        elif len(new_indices) < all_token_len:
+            req.prefix_indices = np.concatenate([new_indices, kv_indices[len(new_indices) :]])
         else:
             req.prefix_indices = new_indices
         req.last_node = new_last_node
@@ -431,7 +546,9 @@ class UnifiedRadixCache(BasePrefixCache):
             host_hit_length=0,
         )
 
-    def _match_prefix_helper(self, key: RadixKey) -> tuple[list[np.ndarray], UnifiedTreeNode, int]:
+    def _match_prefix_helper(
+        self, key: RadixKey, full_only: bool = False
+    ) -> tuple[list[np.ndarray], UnifiedTreeNode, int]:
         node = self.root_node
         node.last_access_time = get_and_increase_time_counter()
         child_key = self.get_child_key_fn(key)
@@ -441,11 +558,20 @@ class UnifiedRadixCache(BasePrefixCache):
         # Number of value CHUNKS accepted at the best match, not a token
         # count (upstream seam name kept for port parity).
         best_value_len = 0
-        # Stage 1 has no host tier: device-only matching is the only mode, so
-        # the best match and the best device match coincide.
-        validators = tuple(
-            comp.create_match_validator(match_device_only=True) for comp in self._components_tuple
-        )
+        # No host tier (HiCache unimplemented): device-only matching is the
+        # only mode, so the best match and the best device match coincide.
+        # full_only: a request's own FULL-prefix bookkeeping (cache_unfinished_req
+        # re-match) must not be gated on aux components (e.g. recurrent state,
+        # which lives in the running slot, not the tree).
+        if full_only:
+            validators = (
+                self.components[BASE_COMPONENT_TYPE].create_match_validator(match_device_only=True),
+            )
+        else:
+            validators = tuple(
+                comp.create_match_validator(match_device_only=True)
+                for comp in self._components_tuple
+            )
 
         def _update_best_if_valid(candidate: UnifiedTreeNode):
             nonlocal best_match_node, best_value_len
@@ -544,6 +670,11 @@ class UnifiedRadixCache(BasePrefixCache):
         node_dp_rank = key.dp_rank if key.dp_rank is not None else 0
         self.component_evictable_size_[BASE_COMPONENT_TYPE][node_dp_rank] += len(value)
 
+        # parent just gained a child: leaf-only components must drop their data
+        # so it is not stranded on an unevictable internal node.
+        for component in self._components_tuple:
+            component.on_parent_gains_child(parent)
+
         self._update_evictable_leaf_sets(new_node)
         self._update_evictable_leaf_sets(parent)
         return new_node
@@ -554,10 +685,10 @@ class UnifiedRadixCache(BasePrefixCache):
         key: RadixKey,
         value: np.ndarray,
         params: InsertParams,
-    ) -> int:
+    ) -> InsertResult:
         node.last_access_time = get_and_increase_time_counter()
         if len(key) == 0:
-            return 0
+            return InsertResult(prefix_len=0)
 
         child_key = self.get_child_key_fn(key)
         total_prefix_length = 0
@@ -569,8 +700,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 node = self._split_node(node.key, node, prefix_len)
 
             # Let each component claim ownership of overlapping KV slots.
-            # FULL never consumes; duplicate frees stay in cache_*_req (this
-            # repo's convention), so the returned index is unused in stage 1.
+            # FULL never consumes and recurrent does not override this overlap
+            # hook; duplicate frees stay in cache_*_req (this repo's
+            # convention), so the returned index is currently unused.
             value_slice = value[:prefix_len]
             for component in self._components_tuple:
                 component.update_component_on_insert_overlap(
@@ -600,7 +732,7 @@ class UnifiedRadixCache(BasePrefixCache):
             ):
                 node_dp_rank = key.dp_rank if key.dp_rank is not None else 0
                 self.token_to_kv_pool_allocator.free(value, dp_rank=node_dp_rank)
-                return total_prefix_length
+                return InsertResult(prefix_len=total_prefix_length)
             target_node = self._add_new_node(node, key, value)
             is_new_leaf = True
 
@@ -614,16 +746,17 @@ class UnifiedRadixCache(BasePrefixCache):
                 result=result,
             )
 
-        return total_prefix_length
+        return result
 
     ##### Evict Helpers #####
 
     def _cascade_evict(self, node: UnifiedTreeNode) -> None:
         """Tombstone the base value after all components have been driven.
 
-        Stage 1 collapses the upstream priority cascade: FULL is both the
-        trigger and the only component. The deferral contract puts
-        value = None here, not in FullComponent.evict_component."""
+        FULL is the eviction trigger (device-leaf status keys off its value);
+        the base-value tombstone is deferred to here -- after every component's
+        evict_component has run -- rather than inside FullComponent, so an aux
+        component (e.g. recurrent) can still read FULL.value while evicting."""
         node.component_data[BASE_COMPONENT_TYPE].value = None
         self._update_evictable_leaf_sets(node)
 

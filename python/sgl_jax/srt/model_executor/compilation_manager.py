@@ -12,6 +12,7 @@ from tqdm import tqdm
 from sgl_jax.srt.utils.common_utils import (
     PRECOMPILE_DEFAULT_BS_PADDINGS,
     PRECOMPILE_DEFAULT_TOKEN_PADDINGS,
+    SAFE_EXTEND_PER_DP_BS,
 )
 
 if TYPE_CHECKING:
@@ -48,6 +49,11 @@ class CompilationManager:
         self.has_recurrent_state = has_recurrent_state
         self.moe_backend = server_args.moe_backend
         self.enable_static_lora = server_args.enable_static_lora
+        # Needed by _compute_bs_buckets / _precompile_extend to scope the
+        # recurrent multi-host EXTEND safe-bucket handling. Set before the
+        # _compute_bs_buckets call below.
+        self.nnodes = server_args.nnodes
+        self.speculative_algorithm = server_args.speculative_algorithm
 
         self.token_buckets = self._compute_token_buckets(server_args.precompile_token_paddings)
         self.bs_buckets = self._compute_bs_buckets(server_args.precompile_bs_paddings)
@@ -77,19 +83,47 @@ class CompilationManager:
 
         return buckets
 
+    @property
+    def _extend_affected(self) -> bool:
+        """The recurrent, multi-host, page_size=1, non-spec EXTEND path whose
+        large per_dp_bs shape miscompiles RPA under multi-host SPMD."""
+        return (
+            self.nnodes > 1
+            and self.has_recurrent_state
+            and self.page_size == 1
+            and self.speculative_algorithm is None
+        )
+
+    def _bs_bucket_feasible(self, bs: int) -> bool:
+        return (
+            bs <= self.max_padded_batch_size
+            and (self.moe_backend not in ("fused", "fused_v2") or bs >= self.tp_size * 2)
+            and bs >= self.dp_size
+        )
+
     def _compute_bs_buckets(self, user_paddings: list[int] | None) -> list[int]:
         bs_list = user_paddings if user_paddings is not None else PRECOMPILE_DEFAULT_BS_PADDINGS
-        buckets = []
-        for bs in bs_list:
-            if (
-                bs <= self.max_padded_batch_size
-                and (self.moe_backend not in ("fused", "fused_v2") or bs >= self.tp_size * 2)
-                and bs >= self.dp_size
-            ):
-                buckets.append(bs)
+        buckets = [bs for bs in bs_list if self._bs_bucket_feasible(bs)]
         buckets.sort()
         if len(buckets) == 0 or buckets[-1] < self.max_padded_batch_size:
             buckets.append(self.max_padded_batch_size)
+
+        # Affected recurrent multi-host path: EXTEND must be able to select a bucket
+        # with per_dp_bs <= SAFE_EXTEND_PER_DP_BS, otherwise the admission guard
+        # would defer every request (no progress). Guarantee that bucket exists.
+        if self._extend_affected:
+            safe_total = SAFE_EXTEND_PER_DP_BS * self.dp_size
+            if self.max_padded_batch_size > safe_total and safe_total not in buckets:
+                if self._bs_bucket_feasible(safe_total):
+                    buckets.append(safe_total)
+                    buckets.sort()
+                else:
+                    raise ValueError(
+                        "recurrent multi-host EXTEND needs a bs bucket with per_dp_bs <= "
+                        f"{SAFE_EXTEND_PER_DP_BS} (total {safe_total}), but none is feasible "
+                        f"under moe_backend={self.moe_backend} tp_size={self.tp_size} "
+                        f"dp_size={self.dp_size} max_padded_batch_size={self.max_padded_batch_size}."
+                    )
         return buckets
 
     def _compute_cache_loc_buckets(self) -> list[int]:
@@ -113,6 +147,18 @@ class CompilationManager:
             forward_fn, model_runner, mesh, prepare_lora_fn, future_token_ids_map
         )
 
+    def _extend_precompile_bs_pairs(self) -> list[tuple[int, int]]:
+        """(bucket_index, bs) pairs to precompile EXTEND for. On the affected
+        recurrent multi-host path, every runtime-reachable bs bucket capped at the
+        safe per_dp_bs; everywhere else, just the largest bucket (legacy)."""
+        if self._extend_affected:
+            return [
+                (i, bs)
+                for i, bs in enumerate(self.bs_buckets)
+                if bs // self.dp_size <= SAFE_EXTEND_PER_DP_BS
+            ]
+        return [(len(self.bs_buckets) - 1, self.max_padded_batch_size)]
+
     def _precompile_extend(
         self,
         forward_fn: Callable,
@@ -126,17 +172,19 @@ class CompilationManager:
         from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 
         start_time = time.perf_counter()
-        bs = self.max_padded_batch_size
+        # cache_loc_buckets[bs_index] keeps cache_loc consistent with each bs
+        # bucket runtime may select (see _extend_precompile_bs_pairs).
+        bs_pairs = self._extend_precompile_bs_pairs()
         logger.info(
             "[EXTEND] Begin to precompile bs_paddings=%s token_paddings=%s",
-            [bs],
+            [bs for _, bs in bs_pairs],
             self.token_buckets,
         )
 
-        pairs = list(itertools.product([bs], self.token_buckets))
+        pairs = list(itertools.product(bs_pairs, self.token_buckets))
         with tqdm(pairs, desc="[EXTEND] PRECOMPILE", leave=False) as pbar:
             for pair in pbar:
-                bs_val, num_tokens = pair
+                (bs_index, bs_val), num_tokens = pair
                 pbar.set_postfix(bs=bs_val, tokens=num_tokens)
                 if bs_val > num_tokens:
                     logger.warning("bs=%s > num_tokens=%s, skip this pair", bs_val, num_tokens)
@@ -145,7 +193,7 @@ class CompilationManager:
                     bs_val,
                     num_tokens,
                     ForwardMode.EXTEND,
-                    self.cache_loc_buckets[-1],
+                    self.cache_loc_buckets[bs_index],
                     dp_size=self.dp_size,
                     per_dp_bs_size=bs_val // self.dp_size,
                 )

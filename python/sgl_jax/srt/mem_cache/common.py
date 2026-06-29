@@ -152,4 +152,7 @@ def release_kv_cache(
         indices_to_free = indices_to_free[indices_to_free != 0]
         tree_cache.token_to_kv_pool_allocator.free(indices_to_free, dp_rank=dp_rank)
 
+    # pool.free() releases the request slot and (for hybrid recurrent pools) any
+    # still-request-owned recurrent slot; a donated slot was cleared by
+    # commit_to_tree, so it is correctly skipped here.
     tree_cache.req_to_token_pool.free(req)
