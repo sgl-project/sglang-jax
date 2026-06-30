@@ -558,13 +558,11 @@ class TestDecodeFlashVsNaive(unittest.TestCase):
         jax.sharding.set_mesh(cls._mesh)
         cls._weights = _build_checkpoint(cls._cfg)
 
-    def _build_model(self, attn_impl: str):
+    def _build_model(self, attn_impl: str, dtype=jnp.float32):
         from sgl_jax.srt.models.step3p5 import Step3p5ForCausalLM
 
         with jax.set_mesh(self._mesh):
-            model = Step3p5ForCausalLM(
-                self._cfg, mesh=self._mesh, dtype=jnp.float32, attn_impl=attn_impl
-            )
+            model = Step3p5ForCausalLM(self._cfg, mesh=self._mesh, dtype=dtype, attn_impl=attn_impl)
         _load_weights(model, self._weights, self._cfg, self._mesh)
         return model
 
@@ -574,7 +572,12 @@ class TestDecodeFlashVsNaive(unittest.TestCase):
         return jnp.asarray(out, dtype=jnp.float32)
 
     def _check_layer(
-        self, layer_idx: int, label: str, prefix_len: int = _PREFIX_LEN, page_size=None
+        self,
+        layer_idx: int,
+        label: str,
+        prefix_len: int = _PREFIX_LEN,
+        page_size=None,
+        dtype=jnp.float32,
     ):
         """Compare decode-mode flash output to naive on layer `layer_idx`.
 
@@ -584,6 +587,8 @@ class TestDecodeFlashVsNaive(unittest.TestCase):
         page_size: KV pool page size. Set < prefix_len+1 so the decode reads KV across
             MULTIPLE pages (the prefix fills earlier pages, the decode token lands in a
             new page), exercising cross-page block indexing in decode mode.
+        dtype: fp32 (logic correctness, strict argmax) or bf16 (production regime; argmax
+            flips within the band are near-tie, doc §3.1/P6 — numeric band is the gate).
         """
         T = prefix_len  # tokens in the prefix (prefill sequence length)
         rng = np.random.default_rng(99 + layer_idx + prefix_len)
@@ -597,8 +602,8 @@ class TestDecodeFlashVsNaive(unittest.TestCase):
         pos_decode = jnp.array([T], dtype=jnp.int32)
 
         # Build flash model and kv_pool.
-        flash_model = self._build_model("flash")
-        kv_pool = _make_kv_pool(self._cfg, self._mesh, jnp.float32, T + 1, page_size=page_size)
+        flash_model = self._build_model("flash", dtype)
+        kv_pool = _make_kv_pool(self._cfg, self._mesh, dtype, T + 1, page_size=page_size)
         flash_attn = flash_model.model.layers[layer_idx].self_attn
 
         # Step 1: prefill the T-token prefix to populate KV pool.
@@ -619,7 +624,7 @@ class TestDecodeFlashVsNaive(unittest.TestCase):
         flash_out = self._run_attn_layer(flash_attn, pos_decode, hidden_decode, fb_decode, kv_pool)
 
         # Naive oracle: full [T+1] sequence, causal.
-        naive_model = self._build_model("naive")
+        naive_model = self._build_model("naive", dtype)
         naive_attn = naive_model.model.layers[layer_idx].self_attn
         fb_naive = _make_prefill_fb(T + 1, jnp.zeros(T + 1, dtype=jnp.int32))
         with jax.set_mesh(self._mesh):
@@ -630,12 +635,15 @@ class TestDecodeFlashVsNaive(unittest.TestCase):
         f = np.asarray(flash_out, dtype=np.float64).ravel()
         n = np.asarray(naive_out, dtype=np.float64).ravel()
 
-        # Hard gate: argmax of attention output (head-dim concatenated) must agree.
-        self.assertEqual(
-            int(f.argmax()),
-            int(n.argmax()),
-            f"decode flash vs naive argmax differ at layer {layer_idx} ({label})",
-        )
+        # argmax gate: hard for fp32 (logic); soft for bf16 (near-tie flips expected, P6).
+        if dtype == jnp.float32:
+            self.assertEqual(
+                int(f.argmax()),
+                int(n.argmax()),
+                f"decode flash vs naive argmax differ at layer {layer_idx} ({label})",
+            )
+        elif int(f.argmax()) != int(n.argmax()):
+            print(f"  [bf16] argmax flip at layer {layer_idx} ({label}) — near-tie expected")
         scale = float(np.max(np.abs(n)))
         np.testing.assert_allclose(
             f,
@@ -643,8 +651,8 @@ class TestDecodeFlashVsNaive(unittest.TestCase):
             rtol=_RTOL_ATTN,
             atol=_RTOL_ATTN * max(scale, 1e-6),
             err_msg=(
-                f"decode flash vs naive attn output ({label}) beyond theory band "
-                f"rtol={_RTOL_ATTN} (single-stage √2·ε_bf16·safety)"
+                f"[{('fp32' if dtype == jnp.float32 else 'bf16')}] decode flash vs naive attn "
+                f"output ({label}) beyond theory band rtol={_RTOL_ATTN} (single-stage √2·ε_bf16·safety)"
             ),
         )
 
@@ -680,6 +688,21 @@ class TestDecodeFlashVsNaive(unittest.TestCase):
         was untested. Layer 0 (full attention) isolates the paging from the window logic.
         """
         self._check_layer(0, "full multipage page_size=4", page_size=4)
+
+    # bf16 (production dtype) variants — same invariants in the regime production runs in.
+    # fp32 (above) proves the logic; these guard the bf16 decode kernel. argmax flips within
+    # the single-stage band are near-tie (doc §3.1/P6); the numeric band _RTOL_ATTN is the gate.
+    def test_decode_flash_equals_naive_full_attention_bf16(self):
+        self._check_layer(0, "full_attention", dtype=jnp.bfloat16)
+
+    def test_decode_flash_equals_naive_sliding_attention_bf16(self):
+        self._check_layer(1, "sliding_attention W=16", dtype=jnp.bfloat16)
+
+    def test_decode_flash_equals_naive_sliding_window_edge_bf16(self):
+        self._check_layer(1, "sliding W-edge prefix=20", prefix_len=20, dtype=jnp.bfloat16)
+
+    def test_decode_flash_equals_naive_multipage_bf16(self):
+        self._check_layer(0, "full multipage page_size=4", page_size=4, dtype=jnp.bfloat16)
 
 
 # ---------------------------------------------------------------------------
