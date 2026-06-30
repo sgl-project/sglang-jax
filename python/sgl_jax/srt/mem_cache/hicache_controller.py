@@ -31,7 +31,9 @@ class HiCacheController:
         self._host_pool = host_pool
         self._device_pool = device_pool
         self._device_allocator = device_allocator
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="hicache-d2h")
+        self._executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="hicache-d2h"
+        )
         self._pending: list[Future] = []
         # Guards against freeing a host page while the worker is still writing it.
         self._inflight_lock = threading.Lock()
@@ -183,6 +185,8 @@ class HiCacheController:
             self.drain_pending()
             self.drain_loads()
         except Exception:  # noqa: BLE001 - cleanup path must not mask shutdown
-            logger.warning("HiCacheController shutdown: pending transfer raised", exc_info=True)
+            logger.warning(
+                "HiCacheController shutdown: pending transfer raised", exc_info=True
+            )
         finally:
             self._executor.shutdown(wait=True)

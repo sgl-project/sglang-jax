@@ -73,7 +73,10 @@ class UnifiedTreeNode:
     @property
     def evicted(self) -> bool:
         """Tree-level: FULL KV not on device (non-root with value=None)."""
-        return self.parent is not None and self.component_data[BASE_COMPONENT_TYPE].value is None
+        return (
+            self.parent is not None
+            and self.component_data[BASE_COMPONENT_TYPE].value is None
+        )
 
     @property
     def backuped(self) -> bool:
@@ -136,7 +139,9 @@ class UnifiedRadixCache(BasePrefixCache):
         self.components: dict[ComponentType, TreeComponent] = {
             ct: COMPONENT_REGISTRY[ct](self, None) for ct in tree_components
         }
-        self._components_tuple: tuple[TreeComponent, ...] = tuple(self.components.values())
+        self._components_tuple: tuple[TreeComponent, ...] = tuple(
+            self.components.values()
+        )
 
         # HiCache (L1<->L2) wiring — populated by init_hicache() when enabled.
         self.hicache_enabled: bool = False
@@ -175,7 +180,9 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.disable or len(key) == 0:
             return self._empty_match_result()
 
-        converted_key = RadixKey(self.key_convert_fn(key.token_ids), key.extra_key, key.dp_rank)
+        converted_key = RadixKey(
+            self.key_convert_fn(key.token_ids), key.extra_key, key.dp_rank
+        )
         if self.page_size != 1:
             page_aligned_len = len(converted_key) // self.page_size * self.page_size
             converted_key = converted_key[:page_aligned_len]
@@ -186,7 +193,12 @@ class UnifiedRadixCache(BasePrefixCache):
             self._match_prefix_helper(converted_key)
         )
         return self._match_post_processor(
-            params, value, best_device_node, best_value_len, best_host_node, host_hit_length
+            params,
+            value,
+            best_device_node,
+            best_value_len,
+            best_host_node,
+            host_hit_length,
         )
 
     def insert(self, params: InsertParams) -> int:
@@ -200,7 +212,9 @@ class UnifiedRadixCache(BasePrefixCache):
         if not isinstance(key, RadixKey):
             key = RadixKey(key, None, None)
 
-        converted_key = RadixKey(self.key_convert_fn(key.token_ids), key.extra_key, key.dp_rank)
+        converted_key = RadixKey(
+            self.key_convert_fn(key.token_ids), key.extra_key, key.dp_rank
+        )
 
         if value is None:
             value = np.array(converted_key.token_ids, dtype=np.int32)
@@ -244,7 +258,9 @@ class UnifiedRadixCache(BasePrefixCache):
         self._update_evictable_leaf_sets(node)
         return result
 
-    def dec_lock_ref(self, node: UnifiedTreeNode, params: DecLockRefParams | None = None):
+    def dec_lock_ref(
+        self, node: UnifiedTreeNode, params: DecLockRefParams | None = None
+    ):
         if self.disable:
             return 0
 
@@ -279,12 +295,16 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.page_size != 1:
             page_aligned_len = actual_kv_len // self.page_size * self.page_size
             page_aligned_kv_indices = kv_indices[:page_aligned_len].copy()
-            self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:], dp_rank=dp_rank)
+            self.token_to_kv_pool_allocator.free(
+                kv_indices[page_aligned_len:], dp_rank=dp_rank
+            )
         else:
             page_aligned_len = actual_kv_len
             page_aligned_kv_indices = kv_indices[:page_aligned_len].copy()
 
-        page_aligned_token_len = page_aligned_len + 1 if self.is_eagle else page_aligned_len
+        page_aligned_token_len = (
+            page_aligned_len + 1 if self.is_eagle else page_aligned_len
+        )
         # cache_protected_len, not len(prefix_indices): the latter may include
         # an unaligned tail owned by the req but not by the tree.
         old_prefix_len = req.cache_protected_len
@@ -297,7 +317,9 @@ class UnifiedRadixCache(BasePrefixCache):
         insert_result = None
         if is_insert:
             insert_params = InsertParams(
-                key=RadixKey(token_ids[:page_aligned_token_len], req.extra_key, req.dp_rank),
+                key=RadixKey(
+                    token_ids[:page_aligned_token_len], req.extra_key, req.dp_rank
+                ),
                 value=page_aligned_kv_indices,
             )
             for component in self._components_tuple:
@@ -317,7 +339,10 @@ class UnifiedRadixCache(BasePrefixCache):
 
         for component in self._components_tuple:
             component.cleanup_after_caching_req(
-                req, is_finished=True, insert_result=insert_result, insert_params=insert_params
+                req,
+                is_finished=True,
+                insert_result=insert_result,
+                insert_params=insert_params,
             )
 
         self.dec_lock_ref(req.last_node)
@@ -345,7 +370,9 @@ class UnifiedRadixCache(BasePrefixCache):
             page_aligned_kv_indices = kv_indices
 
         # For EAGLE, page_aligned_len is for the bigram key; the token len is +1.
-        page_aligned_token_len = page_aligned_len + 1 if self.is_eagle else page_aligned_len
+        page_aligned_token_len = (
+            page_aligned_len + 1 if self.is_eagle else page_aligned_len
+        )
         page_aligned_token_ids = token_ids[:page_aligned_token_len]
 
         # cache_protected_len, not len(prefix_indices): see cache_finished_req.
@@ -356,7 +383,9 @@ class UnifiedRadixCache(BasePrefixCache):
         radix_key = RadixKey(page_aligned_token_ids, req.extra_key, req.dp_rank)
         insert_params = InsertParams(key=radix_key, value=page_aligned_kv_indices)
         for component in self._components_tuple:
-            component.prepare_for_caching_req(req, insert_params, all_token_len, is_finished=False)
+            component.prepare_for_caching_req(
+                req, insert_params, all_token_len, is_finished=False
+            )
         # Radix cache takes over one reference from the memory pool.
         new_prefix_len = self.insert(insert_params)
         insert_result = InsertResult(prefix_len=new_prefix_len)
@@ -380,17 +409,24 @@ class UnifiedRadixCache(BasePrefixCache):
 
         # `req.prefix_indices` is used later in `PrefillAdder::add_chunked_req`.
         if self.page_size != 1:
-            req.prefix_indices = np.concatenate([new_indices, kv_indices[len(new_indices) :]])
+            req.prefix_indices = np.concatenate(
+                [new_indices, kv_indices[len(new_indices) :]]
+            )
         elif self.is_eagle:
             # Attach the kv index of the last token for EAGLE chunked prefill.
-            req.prefix_indices = np.concatenate([new_indices, kv_indices[actual_kv_len:]])
+            req.prefix_indices = np.concatenate(
+                [new_indices, kv_indices[actual_kv_len:]]
+            )
         else:
             req.prefix_indices = new_indices
         req.last_node = new_last_node
 
         for component in self._components_tuple:
             component.cleanup_after_caching_req(
-                req, is_finished=False, insert_result=insert_result, insert_params=insert_params
+                req,
+                is_finished=False,
+                insert_result=insert_result,
+                insert_params=insert_params,
             )
 
     ##### Size Accessors #####
@@ -472,10 +508,12 @@ class UnifiedRadixCache(BasePrefixCache):
         device_broken = False
 
         device_validators = tuple(
-            comp.create_match_validator(match_device_only=True) for comp in self._components_tuple
+            comp.create_match_validator(match_device_only=True)
+            for comp in self._components_tuple
         )
         host_validators = tuple(
-            comp.create_match_validator(match_device_only=False) for comp in self._components_tuple
+            comp.create_match_validator(match_device_only=False)
+            for comp in self._components_tuple
         )
 
         def _update_best_if_valid(candidate: UnifiedTreeNode):
@@ -548,7 +586,9 @@ class UnifiedRadixCache(BasePrefixCache):
             device_indices=device_indices,
             last_device_node=best_device_node,
             last_host_node=best_host_node if self.hicache_enabled else best_device_node,
-            best_match_node=best_host_node if self.hicache_enabled else best_device_node,
+            best_match_node=(
+                best_host_node if self.hicache_enabled else best_device_node
+            ),
             host_hit_length=host_hit_length if self.hicache_enabled else 0,
         )
         for component in self._components_tuple:
@@ -560,7 +600,9 @@ class UnifiedRadixCache(BasePrefixCache):
             )
         return result
 
-    def _split_node(self, key: RadixKey, child: UnifiedTreeNode, split_len: int) -> UnifiedTreeNode:
+    def _split_node(
+        self, key: RadixKey, child: UnifiedTreeNode, split_len: int
+    ) -> UnifiedTreeNode:
         new_node = UnifiedTreeNode(self.tree_components)
         new_node.children = {self.get_child_key_fn(key[split_len:]): child}
         new_node.parent = child.parent
@@ -623,8 +665,12 @@ class UnifiedRadixCache(BasePrefixCache):
                     f"(page_size={self.page_size})"
                 )
                 cd.value = value[:prefix_len].copy()
-                node_dp_rank = node.key.dp_rank if node.key and node.key.dp_rank is not None else 0
-                self.component_evictable_size_[BASE_COMPONENT_TYPE][node_dp_rank] += prefix_len
+                node_dp_rank = (
+                    node.key.dp_rank if node.key and node.key.dp_rank is not None else 0
+                )
+                self.component_evictable_size_[BASE_COMPONENT_TYPE][
+                    node_dp_rank
+                ] += prefix_len
                 self._update_evictable_leaf_sets(node)
                 self._update_evictable_leaf_sets(node.parent)
             else:
@@ -727,7 +773,11 @@ class UnifiedRadixCache(BasePrefixCache):
         if node is self.root_node or node.backuped:
             return 0
 
-        if not write_back and node.parent is not self.root_node and not node.parent.backuped:
+        if (
+            not write_back
+            and node.parent is not self.root_node
+            and not node.parent.backuped
+        ):
             self.write_backup(node.parent)
             if not node.parent.backuped:
                 return 0
@@ -749,7 +799,9 @@ class UnifiedRadixCache(BasePrefixCache):
             return 0
 
         self.inc_lock_ref(node)
-        node_dp_rank = node.key.dp_rank if node.key and node.key.dp_rank is not None else 0
+        node_dp_rank = (
+            node.key.dp_rank if node.key and node.key.dp_rank is not None else 0
+        )
         global_pages = self._to_global_device_pages(device_pages, node_dp_rank)
         future = self.hicache_controller.write(global_pages, host_pages)
         cd.host_value = np.array(host_pages, dtype=np.int64)
@@ -802,7 +854,9 @@ class UnifiedRadixCache(BasePrefixCache):
         v = node.parent.children.pop(child_key, None)
         assert v is node
 
-    def _evict_device_leaf(self, node: UnifiedTreeNode, tracker: dict[ComponentType, int]) -> None:
+    def _evict_device_leaf(
+        self, node: UnifiedTreeNode, tracker: dict[ComponentType, int]
+    ) -> None:
         """Evict a device leaf. Backed-up nodes are demoted to tombstones
         instead of deleted, so later matches can reload them from host."""
         assert self._is_device_leaf(node), f"node {node.id} is not a D-leaf"
@@ -811,7 +865,11 @@ class UnifiedRadixCache(BasePrefixCache):
         # the gather would read reclaimed pages. _donation_barrier is only set
         # by the overlap scheduler; in non-overlap mode it's None, which is safe
         # because no forward is in flight during get_next_batch_to_run.
-        if self.hicache_enabled and self.write_policy == "write_back" and not node.backuped:
+        if (
+            self.hicache_enabled
+            and self.write_policy == "write_back"
+            and not node.backuped
+        ):
             if self._donation_barrier is not None:
                 self._donation_barrier()
             self.write_backup(node, write_back=True)
@@ -843,7 +901,8 @@ class UnifiedRadixCache(BasePrefixCache):
         if any(cd.lock_ref > 0 for cd in node.component_data):
             return False
         return not any(
-            child.component_data[ct].value is not None for child in node.children.values()
+            child.component_data[ct].value is not None
+            for child in node.children.values()
         )
 
     def _is_host_leaf(self, node: UnifiedTreeNode) -> bool:
@@ -931,7 +990,9 @@ class UnifiedRadixCache(BasePrefixCache):
         # a tombstone), which inc_lock_ref and evictable accounting rely on.
         PS = self.page_size
         selected = list(chain)
-        total = sum(len(n.component_data[BASE_COMPONENT_TYPE].host_value) * PS for n in selected)
+        total = sum(
+            len(n.component_data[BASE_COMPONENT_TYPE].host_value) * PS for n in selected
+        )
         if mem_quota is not None and total > mem_quota:
             return np.empty((0,), dtype=np.int32), last_host_node, []
 
@@ -948,7 +1009,9 @@ class UnifiedRadixCache(BasePrefixCache):
             avail = self.token_to_kv_pool_allocator.available_size(dp_rank)
             if avail < total:
                 self.evict(EvictParams(num_tokens=total - avail, dp_rank=dp_rank))
-            device_indices_all = self.token_to_kv_pool_allocator.alloc(total, dp_rank=dp_rank)
+            device_indices_all = self.token_to_kv_pool_allocator.alloc(
+                total, dp_rank=dp_rank
+            )
         finally:
             self.dec_lock_ref(attach_boundary, lock_res.to_dec_params())
         if device_indices_all is None:
@@ -968,7 +1031,9 @@ class UnifiedRadixCache(BasePrefixCache):
             # Un-tombstone: restore device value, retain host copy (write-through).
             cd.value = np.array(dev_tokens, dtype=np.int32)
             node_dp_rank = n.key.dp_rank if n.key and n.key.dp_rank is not None else 0
-            self.component_evictable_size_[BASE_COMPONENT_TYPE][node_dp_rank] += n_tokens
+            self.component_evictable_size_[BASE_COMPONENT_TYPE][
+                node_dp_rank
+            ] += n_tokens
             offset += n_tokens
 
         for n in selected:

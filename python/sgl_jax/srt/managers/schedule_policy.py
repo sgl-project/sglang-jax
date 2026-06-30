@@ -96,9 +96,13 @@ class SchedulePolicy:
         prefix_computed = False
         if isinstance(policy, CacheAwarePolicy):
             prefix_computed = True
-            temporary_deprioritized = self._compute_prefix_matches(waiting_queue, policy)
+            temporary_deprioritized = self._compute_prefix_matches(
+                waiting_queue, policy
+            )
             if policy == CacheAwarePolicy.LPM:
-                SchedulePolicy._sort_by_longest_prefix(waiting_queue, temporary_deprioritized)
+                SchedulePolicy._sort_by_longest_prefix(
+                    waiting_queue, temporary_deprioritized
+                )
             elif policy == CacheAwarePolicy.DFS_WEIGHT:
                 SchedulePolicy._sort_by_dfs_weight(waiting_queue, self.tree_cache)
             else:
@@ -121,7 +125,9 @@ class SchedulePolicy:
             return CacheAgnosticPolicy.FCFS
         return self.policy
 
-    def _validate_and_adjust_policy(self, policy: str, tree_cache: BasePrefixCache) -> Policy:
+    def _validate_and_adjust_policy(
+        self, policy: str, tree_cache: BasePrefixCache
+    ) -> Policy:
         """
         Validates the policy and adjusts it if necessary based on tree cache settings.
         """
@@ -153,7 +159,9 @@ class SchedulePolicy:
             # NOTE: the prefix_indices must always be aligned with last_node
             match_result = self.tree_cache.match_prefix(
                 MatchPrefixParams(
-                    key=RadixKey(token_ids=prefix_ids, extra_key=extra_key, dp_rank=r.dp_rank)
+                    key=RadixKey(
+                        token_ids=prefix_ids, extra_key=extra_key, dp_rank=r.dp_rank
+                    )
                 )
             )
             r.prefix_indices = match_result.device_indices
@@ -171,7 +179,9 @@ class SchedulePolicy:
             if len(r.prefix_indices) <= IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD:
                 in_batch_match = self.waiting_queue_radix_tree.match_prefix(
                     MatchPrefixParams(
-                        key=RadixKey(token_ids=prefix_ids, extra_key=extra_key, dp_rank=r.dp_rank)
+                        key=RadixKey(
+                            token_ids=prefix_ids, extra_key=extra_key, dp_rank=r.dp_rank
+                        )
                     )
                 )
                 in_batch_matching_prefixes = in_batch_match.device_indices
@@ -185,7 +195,9 @@ class SchedulePolicy:
                     self.waiting_queue_radix_tree.insert(
                         InsertParams(
                             key=RadixKey(
-                                token_ids=prefix_ids, extra_key=extra_key, dp_rank=r.dp_rank
+                                token_ids=prefix_ids,
+                                extra_key=extra_key,
+                                dp_rank=r.dp_rank,
                             ),
                             value=np.empty(len(prefix_ids), dtype=np.bool_),
                         )
@@ -199,12 +211,16 @@ class SchedulePolicy:
         """Sorts the waiting queue based on the longest prefix match."""
         waiting_queue.sort(
             key=lambda r: (
-                -len(r.prefix_indices) if r.rid not in temporary_deprioritized else float("inf")
+                -len(r.prefix_indices)
+                if r.rid not in temporary_deprioritized
+                else float("inf")
             )
         )
 
     @staticmethod
-    def _sort_by_dfs_weight(waiting_queue: list[Req], tree_cache: BasePrefixCache) -> None:
+    def _sort_by_dfs_weight(
+        waiting_queue: list[Req], tree_cache: BasePrefixCache
+    ) -> None:
         """Sorts the waiting queue based on a depth-first search weighting."""
         last_node_to_reqs = defaultdict(list)
         for req in waiting_queue:
@@ -249,7 +265,9 @@ class SchedulePolicy:
         childs = [child for child in cur_node.children.values()]
         childs.sort(key=lambda x: -node_to_priority[x])
         for child in childs:
-            SchedulePolicy._get_dfs_priority(child, node_to_priority, last_node_to_reqs, q)
+            SchedulePolicy._get_dfs_priority(
+                child, node_to_priority, last_node_to_reqs, q
+            )
         q.extend(last_node_to_reqs[cur_node])
 
 
@@ -293,7 +311,8 @@ class PrefillAdder:
         self.rem_chunk_tokens = rem_chunk_tokens
         if self.rem_chunk_tokens is not None:
             self.rem_chunk_tokens_list = [
-                self.rem_chunk_tokens - mixed_tokens_per_dp[dp_rank] for dp_rank in range(dp_size)
+                self.rem_chunk_tokens - mixed_tokens_per_dp[dp_rank]
+                for dp_rank in range(dp_size)
             ]
         else:
             self.rem_chunk_tokens_list = None
@@ -326,7 +345,9 @@ class PrefillAdder:
                         ]
                     )
 
-        self.is_hybrid = isinstance(self.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator)
+        self.is_hybrid = isinstance(
+            self.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator
+        )
         self.rem_swa_token_offset = [0] * dp_size
 
     def rem_total_tokens_for_dp(self, dp_rank: int) -> int:
@@ -342,9 +363,10 @@ class PrefillAdder:
             # For hybrid models, use only the full pool's capacity for budget.
             # SWA layers only need sliding-window tokens per request,
             # so the SWA pool should not limit admission (eviction ensures SWA won't overflow).
-            available_and_evictable = self.token_to_kv_pool_allocator.full_available_size(
-                dp_rank=dp_rank
-            ) + self.tree_cache.full_evictable_size(dp_rank=dp_rank)
+            available_and_evictable = (
+                self.token_to_kv_pool_allocator.full_available_size(dp_rank=dp_rank)
+                + self.tree_cache.full_evictable_size(dp_rank=dp_rank)
+            )
         else:
             available_and_evictable = self.token_to_kv_pool_allocator.available_size(
                 dp_rank=dp_rank
@@ -354,9 +376,10 @@ class PrefillAdder:
 
     def cur_rem_tokens_for_dp(self, dp_rank: int) -> int:
         if self.is_hybrid:
-            available_and_evictable = self.token_to_kv_pool_allocator.full_available_size(
-                dp_rank=dp_rank
-            ) + self.tree_cache.full_evictable_size(dp_rank=dp_rank)
+            available_and_evictable = (
+                self.token_to_kv_pool_allocator.full_available_size(dp_rank=dp_rank)
+                + self.tree_cache.full_evictable_size(dp_rank=dp_rank)
+            )
         else:
             available_and_evictable = self.token_to_kv_pool_allocator.available_size(
                 dp_rank=dp_rank
@@ -379,11 +402,18 @@ class PrefillAdder:
         to reserve room for decode phase.
         """
         rem_chunk = (
-            self.rem_chunk_tokens_list[dp_rank] if self.rem_chunk_tokens_list is not None else None
+            self.rem_chunk_tokens_list[dp_rank]
+            if self.rem_chunk_tokens_list is not None
+            else None
         )
-        alloc = min(extend_input_len, rem_chunk) if rem_chunk is not None else extend_input_len
+        alloc = (
+            min(extend_input_len, rem_chunk)
+            if rem_chunk is not None
+            else extend_input_len
+        )
         return (
-            self.ceil_paged_tokens(max(alloc, self.tree_cache.sliding_window_size)) + self.page_size
+            self.ceil_paged_tokens(max(alloc, self.tree_cache.sliding_window_size))
+            + self.page_size
         )
 
     @property
@@ -392,7 +422,9 @@ class PrefillAdder:
 
         For backward compatibility and global checks.
         """
-        return min(self.rem_total_tokens_for_dp(dp_rank) for dp_rank in range(self.dp_size))
+        return min(
+            self.rem_total_tokens_for_dp(dp_rank) for dp_rank in range(self.dp_size)
+        )
 
     @property
     def cur_rem_tokens(self):
@@ -400,7 +432,9 @@ class PrefillAdder:
 
         For backward compatibility and global checks.
         """
-        return min(self.cur_rem_tokens_for_dp(dp_rank) for dp_rank in range(self.dp_size))
+        return min(
+            self.cur_rem_tokens_for_dp(dp_rank) for dp_rank in range(self.dp_size)
+        )
 
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
@@ -411,7 +445,9 @@ class PrefillAdder:
     def budget_state(self):
         no_token = self.rem_total_tokens <= 0 or self.cur_rem_tokens <= 0
         if not no_token and self.is_hybrid:
-            no_token = all(self.rem_swa_tokens_for_dp(dp) <= 0 for dp in range(self.dp_size))
+            no_token = all(
+                self.rem_swa_tokens_for_dp(dp) <= 0 for dp in range(self.dp_size)
+            )
         if no_token:
             return AddReqResult.NO_TOKEN
 
@@ -436,7 +472,8 @@ class PrefillAdder:
     def add_chunked_req(self, req: Req):
         dp_rank = req.dp_rank if req.dp_rank is not None else 0
         _rem_tokens = min(
-            self.rem_chunk_tokens_list[dp_rank], int(self.rem_total_tokens_for_dp(dp_rank))
+            self.rem_chunk_tokens_list[dp_rank],
+            int(self.rem_total_tokens_for_dp(dp_rank)),
         )
         if self.is_hybrid:
             _rem_tokens = min(
@@ -513,7 +550,9 @@ class PrefillAdder:
             return AddReqResult.NO_TOKEN
 
         def add_req_state(r, insert_sort=False):
-            new_token_ratio = 1.0 if r.sampling_params.ignore_eos else self.new_token_ratio
+            new_token_ratio = (
+                1.0 if r.sampling_params.ignore_eos else self.new_token_ratio
+            )
             tokens_left = self.align_page_size(
                 r.sampling_params.max_new_tokens * new_token_ratio
             ) - len(r.output_ids)
@@ -547,11 +586,13 @@ class PrefillAdder:
             add_req_state(req, insert_sort=True)
 
         if not self.is_hybrid:
-            cur_rem_tokens = self.cur_rem_tokens_for_dp(dp_rank) - self.ceil_paged_tokens(
-                req.extend_input_len
-            )
+            cur_rem_tokens = self.cur_rem_tokens_for_dp(
+                dp_rank
+            ) - self.ceil_paged_tokens(req.extend_input_len)
             tokens_freed = 0
-            for i, (tokens_left, tokens_occupied) in enumerate(self.req_states[dp_rank]):
+            for i, (tokens_left, tokens_occupied) in enumerate(
+                self.req_states[dp_rank]
+            ):
                 # tokens_left gives a reservative calculation as the last token is not stored
                 bs = len(self.req_states[dp_rank]) - i
                 min_free_tokens = cur_rem_tokens + tokens_freed - tokens_left * bs
@@ -562,7 +603,8 @@ class PrefillAdder:
 
         if (
             self.rem_chunk_tokens_list is None  # chunked prefill is disabled
-            or req.extend_input_len <= self.rem_chunk_tokens_list[dp_rank]  # it is the last chunk
+            or req.extend_input_len
+            <= self.rem_chunk_tokens_list[dp_rank]  # it is the last chunk
         ):
             # Non-chunked prefill
             self.can_run_list[dp_rank].append(req)
@@ -633,14 +675,19 @@ class PrefillAdder:
 
             # HiCache: after budget gate, pull host-only prefix back to device.
             # Must happen after NO_TOKEN check so rejected reqs never trigger H2D.
-            if getattr(self.tree_cache, "hicache_enabled", False) and req.host_hit_length > 0:
+            if (
+                getattr(self.tree_cache, "hicache_enabled", False)
+                and req.host_hit_length > 0
+            ):
                 mem_quota = self.token_to_kv_pool_allocator.available_size(dp_rank)
                 new_indices, last_node, flush_plan = self.tree_cache.init_load_back(
                     req.last_host_node, req.host_hit_length, mem_quota=mem_quota
                 )
                 if len(new_indices) > 0:
                     self.pending_h2d.extend(flush_plan)
-                    req.prefix_indices = np.concatenate([req.prefix_indices, new_indices])
+                    req.prefix_indices = np.concatenate(
+                        [req.prefix_indices, new_indices]
+                    )
                     req.last_node = last_node
                     req.last_host_node = last_node
                     req.host_hit_length = max(0, req.host_hit_length - len(new_indices))
@@ -677,7 +724,11 @@ class PrefillAdder:
                 )
             else:
                 # Make sure at least one page is available
-                trunc_len = self.rem_chunk_tokens_list[dp_rank] // self.page_size * self.page_size
+                trunc_len = (
+                    self.rem_chunk_tokens_list[dp_rank]
+                    // self.page_size
+                    * self.page_size
+                )
                 if trunc_len <= 0:
                     return AddReqResult.OTHER
 

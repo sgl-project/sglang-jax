@@ -67,7 +67,9 @@ class HiCacheE2EBase(unittest.TestCase):
             dp_size=1,
         )
         self.allocator = (
-            TokenToKVPoolAllocator(size=self.DEVICE_SIZE, kvcache=self.kv_cache, dp_size=1)
+            TokenToKVPoolAllocator(
+                size=self.DEVICE_SIZE, kvcache=self.kv_cache, dp_size=1
+            )
             if self.PAGE_SIZE == 1
             else PagedTokenToKVPoolAllocator(
                 size=self.DEVICE_SIZE,
@@ -123,7 +125,9 @@ class HiCacheE2EBase(unittest.TestCase):
         """Set one token's KV at [page, offset] (kv_buffer leading axis=page)."""
         page, off = int(token_idx) // self.PAGE_SIZE, int(token_idx) % self.PAGE_SIZE
         buf = self.kv_cache.kv_buffer[layer]
-        self.kv_cache.kv_buffer[layer] = buf.at[page, off].set(vals, out_sharding=buf.sharding)
+        self.kv_cache.kv_buffer[layer] = buf.at[page, off].set(
+            vals, out_sharding=buf.sharding
+        )
 
     def _read_token(self, layer: int, token_idx: int):
         page, off = int(token_idx) // self.PAGE_SIZE, int(token_idx) % self.PAGE_SIZE
@@ -189,7 +193,9 @@ class TestWriteThrough(HiCacheE2EBase):
         # Second insert (prefix reuse): hit_count crosses threshold -> backup.
         self.cache.insert(InsertParams(key=_key(tokens), value=idx))
         self.assertTrue(node.backuped)
-        self.assertEqual(len(node.component_data[0].host_value), self._pages(len(tokens)))
+        self.assertEqual(
+            len(node.component_data[0].host_value), self._pages(len(tokens))
+        )
         # The device lock is taken only around the synchronous gather inside
         # write_backup and released before it returns, so it is already 0 here
         # even though the async host->host flush is still in flight (tracked in
@@ -431,7 +437,9 @@ class TestTombstoneRevival(HiCacheE2EBase):
         head_idx, _ = self._alloc_and_fill(len(head), seed=42)
         tail_idx, _ = self._alloc_and_fill(len(tail), seed=43)
         self.cache.insert(
-            InsertParams(key=_key(head + tail), value=np.concatenate([head_idx, tail_idx]))
+            InsertParams(
+                key=_key(head + tail), value=np.concatenate([head_idx, tail_idx])
+            )
         )
         self.assertFalse(node.evicted, "ancestor must be revived, not tombstoned")
         child = [c for c in node.children.values()][0]
@@ -582,7 +590,9 @@ class TestHostCopyReuse(HiCacheE2EBase):
             self.assertTrue(node.evicted and node.backuped)
             # Demotion of an already-backed node issues no new transfer.
             self.assertFalse(self.cache.ongoing_write)
-            self.assertEqual([int(b) for b in node.component_data[0].host_value], host_first)
+            self.assertEqual(
+                [int(b) for b in node.component_data[0].host_value], host_first
+            )
 
             mr = self.cache.match_prefix(MatchPrefixParams(key=_key(tokens)))
             self.assertEqual(len(mr.device_indices), 0)
@@ -643,7 +653,9 @@ class TestPartialHit(HiCacheE2EBase):
         # Shallow KV already on device is correct.
         for i, dev_idx in enumerate(mr.device_indices):
             for layer in range(self.LAYER_NUM):
-                np.testing.assert_allclose(self._read_token(layer, int(dev_idx)), orig_a[i][layer])
+                np.testing.assert_allclose(
+                    self._read_token(layer, int(dev_idx)), orig_a[i][layer]
+                )
 
         new_indices, _ = self._load_back(
             mr.last_host_node, mr.host_hit_length, mem_quota=self.DEVICE_SIZE
@@ -651,7 +663,9 @@ class TestPartialHit(HiCacheE2EBase):
         self.assertEqual(len(new_indices), len(seg_b))
         for i, dev_idx in enumerate(new_indices):
             for layer in range(self.LAYER_NUM):
-                np.testing.assert_allclose(self._read_token(layer, int(dev_idx)), orig_b[i][layer])
+                np.testing.assert_allclose(
+                    self._read_token(layer, int(dev_idx)), orig_b[i][layer]
+                )
 
     def test_partial(self):
         self._run()
@@ -685,7 +699,9 @@ class TestLoadBackPreEvicts(HiCacheE2EBase):
         filler_n = ((avail - 4) // 4) * 4  # leave only 4 free, page-aligned
         self.assertGreater(filler_n, len(target))
         fidx, _ = self._alloc_and_fill(filler_n, seed=72)
-        self.cache.insert(InsertParams(key=_key(list(range(200, 200 + filler_n))), value=fidx))
+        self.cache.insert(
+            InsertParams(key=_key(list(range(200, 200 + filler_n))), value=fidx)
+        )
         self.assertLess(self.allocator.available_size(0), len(target))
 
         # Reloading the target now requires pre-eviction of the filler.
@@ -697,7 +713,9 @@ class TestLoadBackPreEvicts(HiCacheE2EBase):
         self.assertEqual(len(new_indices), len(target))
         for i, dev_idx in enumerate(new_indices):
             for layer in range(self.LAYER_NUM):
-                np.testing.assert_allclose(self._read_token(layer, int(dev_idx)), orig[i][layer])
+                np.testing.assert_allclose(
+                    self._read_token(layer, int(dev_idx)), orig[i][layer]
+                )
 
 
 # ---- B5: randomized round-trip property test ------------------------------
@@ -741,7 +759,9 @@ class TestRoundTripProperty(HiCacheE2EBase):
                 mr = self.cache.match_prefix(MatchPrefixParams(key=_key(tokens)))
                 if mr.host_hit_length == length and len(mr.device_indices) == 0:
                     new_indices, _ = self._load_back(
-                        mr.last_host_node, mr.host_hit_length, mem_quota=self.DEVICE_SIZE
+                        mr.last_host_node,
+                        mr.host_hit_length,
+                        mem_quota=self.DEVICE_SIZE,
                     )
                     if len(new_indices) == length:
                         for i, dev_idx in enumerate(new_indices):
@@ -758,7 +778,8 @@ class TestRoundTripProperty(HiCacheE2EBase):
             )
             self.assertLessEqual(used, total_pages)
             self.assertEqual(
-                self.host_pool.available_size() + (total_pages - self.host_pool.available_size()),
+                self.host_pool.available_size()
+                + (total_pages - self.host_pool.available_size()),
                 total_pages,
             )
         self._settle_writes()
