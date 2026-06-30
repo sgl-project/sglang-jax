@@ -38,7 +38,7 @@ _NUM_HEADS_FULL = 4
 _NUM_HEADS_SLIDE = 4
 _NUM_KV_HEADS = 2
 _HEAD_DIM = 128
-_NUM_LAYERS = 5
+_NUM_LAYERS = 6
 _SLIDING_WIN = 16
 _PREFIX_LEN = 8  # prefix prefilled before decode steps
 _DECODE_STEPS = 3  # number of incremental decode positions to verify
@@ -75,25 +75,29 @@ def _make_config():
         vocab_size=_VOCAB,
         rms_norm_eps=1e-5,
         max_position_embeddings=64,
-        rope_theta=[5000000.0, 10000.0, 10000.0, 5000000.0, 5000000.0],
+        rope_theta=[5000000.0, 10000.0, 5000000.0, 10000.0, 10000.0, 5000000.0],
         rope_scaling=None,
+        # 6 layers covering every real-model combo: dense/MoE × full/sliding ×
+        # no-clamp/routed-only/routed+shared. layer 4 = sliding+routed-only (= real 43),
+        # layer 5 = full+routed+shared (= real 44).
         layer_types=[
             "full_attention",
             "sliding_attention",
+            "full_attention",
+            "sliding_attention",
             "sliding_attention",
             "full_attention",
-            "full_attention",
         ],
-        partial_rotary_factors=[0.5, 1.0, 1.0, 0.5, 0.5],
+        partial_rotary_factors=[0.5, 1.0, 0.5, 1.0, 1.0, 0.5],
         attention_other_setting={
             "attention_type": "sliding_attention",
             "num_attention_heads": _NUM_HEADS_SLIDE,
             "num_attention_groups": _NUM_KV_HEADS,
             "head_dim": _HEAD_DIM,
         },
-        swiglu_limits=[0.0, 0.0, 0.0, 0.0, 7.0],
-        swiglu_limits_shared=[0.0, 0.0, 0.0, 0.0, 16.0],
-        moe_layers_enum="2,3,4",
+        swiglu_limits=[0.0, 0.0, 0.0, 0.0, 7.0, 7.0],
+        swiglu_limits_shared=[0.0, 0.0, 0.0, 0.0, 0.0, 16.0],
+        moe_layers_enum="2,3,4,5",
         moe_num_experts=_NUM_EXPERTS,
         moe_top_k=_TOPK,
         moe_intermediate_size=_MOE_INTER,
