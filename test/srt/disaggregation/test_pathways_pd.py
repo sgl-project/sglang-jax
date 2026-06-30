@@ -20,6 +20,7 @@ from sgl_jax.srt.disaggregation.pathways_pd import (
     PathwaysPDKVTransfer,
     group_by_slice,
     make_slice_meshes,
+    migrate_reqs_p_to_d,
     slots_to_ordered_pages,
 )
 
@@ -211,3 +212,90 @@ def test_swa_page_mapping(meshes):
     full_pages = np.array([0, 1, 5], np.int32)
     np.testing.assert_array_equal(xfer._swa_pages(full_pages, xfer.p_mapping), [2, 3, 7])
     np.testing.assert_array_equal(xfer._swa_pages(full_pages, xfer.d_mapping), full_pages)
+
+
+# ---- e2e: full migrate_reqs_p_to_d path on CPU mock pools ----
+
+
+class _MockR2T:
+    def __init__(self, max_reqs: int, max_len: int):
+        self.req_to_token = np.full((max_reqs, max_len), -1, np.int32)
+        self.free_slots = list(range(max_reqs))
+
+    def alloc(self, reqs):
+        for r in reqs:
+            r.req_pool_idx = self.free_slots.pop(0)
+
+
+class _MockAlloc:
+    def __init__(self, n_tokens: int):
+        self._free = list(range(n_tokens))
+
+    def alloc(self, n, dp_rank=0):
+        if len(self._free) < n:
+            return None
+        out, self._free = np.asarray(self._free[:n], np.int32), self._free[n:]
+        return out
+
+    def free(self, slots, dp_rank=0):
+        self._free.extend(int(s) for s in slots)
+
+    def available_size(self):
+        return len(self._free)
+
+
+def _mk_req(rid, fill_ids, p_r2t, p_alloc):
+    r = SimpleNamespace(
+        rid=rid,
+        fill_ids=list(fill_ids),
+        dp_rank=0,
+        req_pool_idx=None,
+        prefix_indices=None,
+        last_node=object(),
+        cache_protected_len=99,
+        kv_committed_len=0,
+        kv_allocated_len=0,
+    )
+    p_r2t.alloc([r])
+    slots = p_alloc.alloc(len(fill_ids))
+    p_r2t.req_to_token[r.req_pool_idx, : len(fill_ids)] = slots
+    return r, slots
+
+
+@pytest.mark.unit
+def test_migrate_reqs_e2e(meshes):
+    """End-to-end migrate on CPU mock: P pool -> transfer -> D pool, plus
+    req bookkeeping (req_pool_idx swap, prefix_indices remap, P slots freed)."""
+    p_mesh, d_mesh = meshes
+    p_pool = _make_pool(p_mesh, "seq")
+    d_pool = _make_pool(d_mesh, "zero")
+    xfer = PathwaysPDKVTransfer(p_mesh, d_mesh, p_pool, d_pool)
+
+    p_r2t, d_r2t = _MockR2T(8, 32), _MockR2T(8, 32)
+    p_alloc = _MockAlloc(NUM_PAGES * PAGE_SIZE)
+    d_alloc = _MockAlloc(NUM_PAGES * PAGE_SIZE)
+
+    r0, p_slots0 = _mk_req("r0", range(6), p_r2t, p_alloc)  # 6 tok -> 2 pages
+    r1, p_slots1 = _mk_req("r1", range(9), p_r2t, p_alloc)  # 9 tok -> 3 pages
+    p_avail_before = p_alloc.available_size()
+    assert (r0.req_pool_idx, r1.req_pool_idx) == (0, 1)
+
+    migrate_reqs_p_to_d([r0, r1], PAGE_SIZE, p_r2t, p_alloc, d_r2t, d_alloc, xfer)
+
+    # --- req bookkeeping ---
+    assert r0.req_pool_idx == 0 and r1.req_pool_idx == 1  # reassigned on D side
+    assert sorted(p_r2t.free_slots) == list(range(8))  # P r2t fully freed
+    assert p_alloc.available_size() == p_avail_before + 6 + 9  # P slots freed
+    assert d_alloc.available_size() == NUM_PAGES * PAGE_SIZE - (2 + 3) * PAGE_SIZE
+    for r, n in ((r0, 6), (r1, 9)):
+        assert r.kv_committed_len == n and r.kv_allocated_len == n
+        assert r.last_node is None and r.cache_protected_len == 0
+        np.testing.assert_array_equal(d_r2t.req_to_token[r.req_pool_idx, :n], r.prefix_indices)
+
+    # --- KV bytes: D[d_slot] == P[p_slot] for every migrated token, all layers ---
+    for r, p_slots in ((r0, p_slots0), (r1, p_slots1)):
+        d_slots = r.prefix_indices
+        for layer in range(N_LAYERS):
+            p_host = np.asarray(p_pool.kv_buffer[layer]).reshape(-1, HEAD_DIM)
+            d_host = np.asarray(d_pool.kv_buffer[layer]).reshape(-1, HEAD_DIM)
+            np.testing.assert_array_equal(d_host[d_slots], p_host[p_slots])
