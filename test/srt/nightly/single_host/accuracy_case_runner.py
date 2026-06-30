@@ -17,16 +17,18 @@ for _p in (_TEST_SRT, _NIGHTLY_DIR, _SELF_DIR):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+# isort: off
 from cases import AccuracyCase  # noqa: E402
 from drivers import run_eval_for_case  # noqa: E402
-from results import build_accuracy_result, write_result  # noqa: E402
-
 from profiles import (  # noqa: E402
     LaunchProfile,
     RuntimeConfig,
     build_other_server_args,
     load_profile,
 )
+from results import build_accuracy_result, write_result  # noqa: E402
+
+# isort: on
 from sgl_jax.test.test_utils import (  # noqa: E402
     _local_or_hf,
     is_in_ci,
