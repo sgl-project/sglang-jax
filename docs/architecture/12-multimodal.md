@@ -6,7 +6,7 @@ sglang-jax's multimodal subsystem is an independent parallel architecture suppor
 
 Multimodal mode automatically disables the radix cache because the prefix-sharing rate of multimodal requests is extremely low — each image/video's visual token sequence is highly unlikely to overlap with another request's, so the maintenance overhead of the radix tree (LRU tracking, refcounts, eviction logic) yields no payoff in prefix reuse.
 
-**`Modality` enum** (`multimodal/common/modality_enum.py`): `IMAGE`, `MULTI_IMAGES`, `VIDEO`, `AUDIO`
+**`Modality` enum** (`multimodal/common/modality_enum.py`): `IMAGE`, `VIDEO`, `AUDIO` (multi-image requests are represented as multiple `IMAGE` items)
 
 ![Multimodal request processing flow](images/12-multimodal-request-flow.svg)
 
@@ -346,7 +346,7 @@ Auto-behaviors when `multimodal` is enabled:
 | `Stage` | `multimodal/manager/stage.py` | Pipeline stage definition |
 | `DeviceManager` | `multimodal/manager/device_manager.py` | Device mesh allocation (greedy in-order) |
 | `StageConfigRegistry` | `multimodal/models/static_configs/` | Mapping from model name → stage config YAML |
-| `Modality` | `multimodal/common/modality_enum.py` | Modality enum (IMAGE/MULTI_IMAGES/VIDEO/AUDIO) |
+| `Modality` | `multimodal/common/modality_enum.py` | Modality enum (IMAGE/VIDEO/AUDIO) |
 | `DataType` | `multimodal/manager/io_struct.py` | Request data-type enum (IMAGE/VIDEO/AUDIO) |
 | `GenerateMMReqInput` | `multimodal/manager/io_struct.py` | Image/video generation request |
 | `TokenizedGenerateMMReqInput` | `multimodal/manager/io_struct.py` | Tokenized image/video generation request (ZMQ transport) |
