@@ -879,7 +879,9 @@ class UnifiedRadixCache(BasePrefixCache):
         assert self._is_device_leaf(node), f"node {node.id} is not a D-leaf"
 
         # write_back: do the D2H backup BEFORE freeing device pages, otherwise
-        # the gather would read reclaimed pages.
+        # the gather would read reclaimed pages. _donation_barrier is only set
+        # by the overlap scheduler; in non-overlap mode it's None, which is safe
+        # because no forward is in flight during get_next_batch_to_run.
         if self.hicache_enabled and self.write_policy == "write_back" and not node.backuped:
             if self._donation_barrier is not None:
                 self._donation_barrier()

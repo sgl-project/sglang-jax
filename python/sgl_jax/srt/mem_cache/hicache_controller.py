@@ -155,13 +155,20 @@ class HiCacheController:
             raise first_exc
 
     def evict_callback(self, host_buffer_ids: list[int]) -> None:
-        """Free host page slots. Rejects pages with in-flight D2H writes."""
+        """Free host page slots. Rejects pages with in-flight D2H writes or H2D loads."""
         with self._inflight_lock:
-            busy = [b for b in host_buffer_ids if b in self._inflight]
-        if busy:
+            busy_d2h = [b for b in host_buffer_ids if b in self._inflight]
+        if busy_d2h:
             raise RuntimeError(
-                f"evict of page id(s) {busy} with in-flight D2H write; "
+                f"evict of page id(s) {busy_d2h} with in-flight D2H write; "
                 f"call drain_pending() (or wait for the write) before releasing"
+            )
+        with self._inflight_load_lock:
+            busy_h2d = [b for b in host_buffer_ids if b in self._inflight_load]
+        if busy_h2d:
+            raise RuntimeError(
+                f"evict of page id(s) {busy_h2d} with in-flight H2D load; "
+                f"call drain_loads() before releasing"
             )
         self._host_pool.free(host_buffer_ids)
 
