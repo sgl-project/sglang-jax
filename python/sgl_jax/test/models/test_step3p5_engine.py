@@ -425,90 +425,102 @@ class TestPrefillDecodeConsistency(unittest.TestCase):
         jax.sharding.set_mesh(cls._mesh)
         cls._weights = _build_checkpoint(cls._cfg)
 
-    def _build_and_load(self):
+    def _build_and_load(self, dtype=jnp.float32):
         from sgl_jax.srt.models.step3p5 import Step3p5ForCausalLM
 
         with jax.set_mesh(self._mesh):
-            model = Step3p5ForCausalLM(
-                self._cfg, mesh=self._mesh, dtype=jnp.float32, attn_impl="flash"
-            )
+            model = Step3p5ForCausalLM(self._cfg, mesh=self._mesh, dtype=dtype, attn_impl="flash")
         _load_weights(model, self._weights, self._cfg, self._mesh)
         return model
 
-    def test_prefill_equals_decode(self):
-        """Full-prefill logit[k] == autoregressive-decode logit[k] for the last DECODE_STEPS.
+    def _prefill_decode_rows(self, dtype):
+        """Run full-prefill vs autoregressive-decode chain at ``dtype``.
 
-        Protocol:
-          1. Reference: one full EXTEND prefill of T = PREFIX_LEN + DECODE_STEPS tokens
-             on its own pool → logits_prefill[k] at every position k.
-          2. Decode side (SEPARATE pool): prefill ONLY the prefix [0..PREFIX_LEN-1], then
-             run a TRUE autoregressive chain — decode k reads 0..k, writes its KV at slot
-             k, and persists it (replace_buffer) so decode k+1 reads what decode k wrote.
-             This exercises the decode KV-WRITE accumulation, not merely reading
-             pre-written KV; and because the decode pool never holds future-token KV
-             there is no same-page future-token contamination to confound the result.
-          3. Assert per-position argmax AGREES (decision hard gate) and numeric within
-             _RTOL_LOGITS (EXTEND vs DECODE are two flash reduction orders accumulating
-             over L layers + lm_head — the flash-vs-naive logits regime, √(L+1) growth).
+        Protocol (per position k):
+          1. Reference: one full EXTEND prefill of T = PREFIX_LEN + DECODE_STEPS tokens on
+             its own pool -> logits_prefill[k].
+          2. Decode side (SEPARATE pool): prefill ONLY the prefix, then a TRUE autoregressive
+             chain — decode k reads 0..k, writes its KV at slot k and persists it so decode
+             k+1 reads what decode k wrote (exercises decode KV-WRITE accumulation; the pool
+             never holds future-token KV, so no same-page future contamination).
+        Returns rows (k, argmax_p, argmax_d, max_abs, scale, rel); logits cast to fp64.
         """
         T = _PREFIX_LEN + _DECODE_STEPS
         token_ids = jnp.array(np.random.default_rng(42).integers(0, _VOCAB, T), dtype=jnp.int32)
-        model = self._build_and_load()
+        model = self._build_and_load(dtype)
 
-        # Reference side: full EXTEND prefill of all T tokens → per-position logits.
-        pool_ref = _make_kv_pool(self._cfg, self._mesh, jnp.float32, T)
+        pool_ref = _make_kv_pool(self._cfg, self._mesh, dtype, T)
         prefill_logits = _run_prefill_all_positions(model, self._mesh, pool_ref, token_ids)
         jax.block_until_ready(prefill_logits)
 
-        # Decode side: a SEPARATE pool holding only the prefix, then an autoregressive
-        # chain. _run_decode_step persists each step's KV so the next step reads it.
-        pool_dec = _make_kv_pool(self._cfg, self._mesh, jnp.float32, T)
+        pool_dec = _make_kv_pool(self._cfg, self._mesh, dtype, T)
         _run_prefill_all_positions(model, self._mesh, pool_dec, token_ids[:_PREFIX_LEN])
 
-        # Collect all positions, then print, then assert — so the per-position growth is
-        # visible even under pytest -x. With the autoregressive chain the only expected
-        # gap is cross-forward-mode reduction-order noise (smooth, _RTOL_LOGITS regime).
-        rows = []  # (k, argmax_p, argmax_d, max_abs, scale, rel)
+        rows = []
         for step in range(_DECODE_STEPS):
             k = _PREFIX_LEN + step
             decode_token = int(np.asarray(token_ids)[k])
             decode_logits = _run_decode_step(model, self._mesh, pool_dec, k, decode_token)
             jax.block_until_ready(decode_logits)
-
             p = np.asarray(prefill_logits[k], dtype=np.float64)
             d = np.asarray(decode_logits[0], dtype=np.float64)
             max_abs = float(np.max(np.abs(d - p)))
             scale = float(np.max(np.abs(p)))
-            rel = max_abs / (scale + 1e-9)
-            rows.append((k, int(p.argmax()), int(d.argmax()), max_abs, scale, rel))
+            rows.append(
+                (k, int(p.argmax()), int(d.argmax()), max_abs, scale, max_abs / (scale + 1e-9))
+            )
+        return rows
 
-        print(
-            "\n=== prefill==decode per-position (flash EXTEND vs autoregressive DECODE chain) ==="
-        )
+    @staticmethod
+    def _print_pd_rows(tag, rows):
+        print(f"\n=== prefill==decode per-position [{tag}] (EXTEND vs autoregressive DECODE) ===")
         print(" pos | argmax p | argmax d | max_abs_diff |  scale  |  rel_err")
         for k, ap, ad, mx, sc, rl in rows:
             print(f" {k:>3} | {ap:>8} | {ad:>8} | {mx:>11.4e} | {sc:>7.3f} | {rl:>7.4f}")
-        print(
-            f" bands: _RTOL_ATTN={_RTOL_ATTN} (single-stage)  _RTOL_LOGITS={_RTOL_LOGITS} (depth √(L+1))"
-        )
+        print(f" band: _RTOL_LOGITS={_RTOL_LOGITS} (depth √(L+1))")
 
-        # Hard gate: every position's argmax must agree (decision correctness).
+    def test_prefill_equals_decode(self):
+        """fp32: EXTEND-prefill logit[k] == autoregressive-decode logit[k] (logic correctness).
+
+        fp32 removes bf16 noise -> tight check that the EXTEND vs DECODE KV-cache logic is
+        correct: argmax must AGREE and logits within _RTOL_LOGITS (√(L+1) depth band).
+        """
+        rows = self._prefill_decode_rows(jnp.float32)
+        self._print_pd_rows("fp32", rows)
         for k, ap, ad, *_ in rows:
-            self.assertEqual(ap, ad, f"prefill vs decode argmax differ at position {k}")
-
-        # Numeric tripwire. prefill (EXTEND, full-segment) and decode (DECODE, single
-        # token) are TWO different flash forward-mode tilings → two reduction orders
-        # over the keys, accumulating across all L layers + lm_head — the same regime
-        # as flash-vs-naive logits, NOT a single attention stage. The correct band is
-        # therefore _RTOL_LOGITS (√(L+1) depth growth), not _RTOL_ATTN.
+            self.assertEqual(ap, ad, f"[fp32] prefill vs decode argmax differ at position {k}")
         for k, ap, ad, mx, sc, rl in rows:
             np.testing.assert_allclose(
                 mx,
                 0.0,
                 atol=_RTOL_LOGITS * max(sc, 1e-6),
                 err_msg=(
-                    f"prefill vs decode logits at pos {k} exceed theory band "
-                    f"rtol={_RTOL_LOGITS} (cross-forward-mode reduction order over L layers); "
+                    f"[fp32] prefill vs decode logits at pos {k} exceed _RTOL_LOGITS; "
+                    f"max_abs={mx:.4f} scale={sc:.3f} rel={rl:.4f}"
+                ),
+            )
+
+    def test_prefill_equals_decode_bf16(self):
+        """bf16 (production dtype): same invariant in the production regime.
+
+        EXTEND and DECODE are two reduction orders accumulating bf16 error over L layers, so
+        the criterion is logit agreement within the √(L+1) cross-depth band _RTOL_LOGITS, NOT
+        strict argmax — near-tie argmax flips within the band are expected (doc §3.1/P6), and
+        the numeric band subsumes them (a flip needs top1≈top2 inside the band). If bf16
+        exceeds the band, the printed max_abs/rel is the measured floor to recalibrate against
+        (doc §2.5). fp32 (above) already proved the logic; this guards the bf16 regime.
+        """
+        rows = self._prefill_decode_rows(jnp.bfloat16)
+        self._print_pd_rows("bf16", rows)
+        n_flip = sum(ap != ad for _, ap, ad, *_ in rows)
+        print(f" argmax flips (bf16, near-tie expected): {n_flip}/{len(rows)}")
+        for k, ap, ad, mx, sc, rl in rows:
+            np.testing.assert_allclose(
+                mx,
+                0.0,
+                atol=_RTOL_LOGITS * max(sc, 1e-6),
+                err_msg=(
+                    f"[bf16] prefill vs decode logits at pos {k} exceed _RTOL_LOGITS; "
                     f"max_abs={mx:.4f} scale={sc:.3f} rel={rl:.4f}"
                 ),
             )
