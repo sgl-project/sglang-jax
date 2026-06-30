@@ -155,11 +155,11 @@ class ServerArgs:
     enable_unified_radix_tree: bool = False
 
     # HiCache (L1<->L2 KV cache offloading). hicache_storage: "disable" off,
-    # "none" enables L1+L2 (host pinned pool), "file" reserved for Stage 4 (L3).
+    # "none" enables L1+L2 (host pinned pool), "file" still not supported.
     hicache_storage: str = "disable"
     hicache_ratio: float = 2.0
     hicache_write_through_threshold: int = 1
-    # Write policy (aligned with sglang):
+    # Write policy:
     #   write_through            backup on hit_count >= threshold (default)
     #   write_through_selective  same path, just a higher threshold
     #   write_back               no backup on hit; back up only at device eviction
@@ -378,15 +378,10 @@ class ServerArgs:
                     f"hicache_storage must be one of disable/none/file, got {self.hicache_storage}"
                 )
             if self.hicache_storage == "file":
-                raise ValueError("hicache_storage='file' (L3) is not supported yet (Stage 4)")
+                raise ValueError("hicache_storage='file' (L3) is not supported yet")
             # HiCache rides on the component-based UnifiedRadixCache prefix tree.
             self.enable_unified_radix_tree = True
             self.disable_radix_cache = False
-            # DP>1 is supported at any page_size: device KV indices are per-rank
-            # local views, so the tree cache globalizes them at the controller
-            # boundary (UnifiedRadixCache._to_global_device_pages). That
-            # conversion is page-granular and dp-rank aware, so dp_size>1 +
-            # page_size>1 is correct.
             if self.hicache_ratio <= 0:
                 raise ValueError(f"hicache_ratio must be positive, got {self.hicache_ratio}")
             if self.hicache_write_policy not in (
@@ -1091,7 +1086,7 @@ class ServerArgs:
             choices=["disable", "none", "file"],
             default=ServerArgs.hicache_storage,
             help="HiCache KV offloading: 'disable' off, 'none' enables L1+L2 "
-            "(host pinned pool), 'file' reserved for Stage 4 (L3).",
+            "(host pinned pool), 'file' reserved for L3(not suppport yet).",
         )
         parser.add_argument(
             "--hicache-ratio",
@@ -1113,8 +1108,7 @@ class ServerArgs:
             help="HiCache D2H backup policy: 'write_through' backs up on hit "
             "(>= threshold); 'write_through_selective' is the same path with a "
             "higher threshold; 'write_back' skips hit-time backup and only backs "
-            "up a node when its device KV is evicted (fewest D2H, best for slow "
-            "D2H links such as TPU).",
+            "up a node when its device KV is evicted (fewest D2H)",
         )
         parser.add_argument(
             "--allow-auto-truncate",
