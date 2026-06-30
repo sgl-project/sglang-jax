@@ -482,7 +482,7 @@ def get_processor(
     tokenizer_mode: str = "auto",
     trust_remote_code: bool = False,
     tokenizer_revision: str | None = None,
-    use_fast: bool | None = True,
+    use_fast: bool | None = False,
     **kwargs,
 ):
     # pop 'revision' from kwargs if present.
