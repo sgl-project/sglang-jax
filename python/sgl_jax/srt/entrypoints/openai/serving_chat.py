@@ -257,8 +257,14 @@ Assistant: {% endif %}"""
                 **chat_template_kwargs,
             )
 
-        if isinstance(prompt_ids, dict) and "input_ids" in prompt_ids:
+        if (
+            not isinstance(prompt_ids, (str, list))
+            and hasattr(prompt_ids, "__contains__")
+            and "input_ids" in prompt_ids
+        ):
             prompt_ids = prompt_ids["input_ids"]
+        if isinstance(prompt_ids, list) and prompt_ids and isinstance(prompt_ids[0], list):
+            prompt_ids = prompt_ids[0]
 
         if assistant_prefix:
             encoded = self.tokenizer_manager.tokenizer.encode(assistant_prefix)

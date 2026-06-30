@@ -36,6 +36,8 @@ class EPMoE(nnx.Module):
         weight_dtype: jnp.dtype = jnp.bfloat16,
         dtype: jnp.dtype = jnp.bfloat16,
         activation: str = "silu",
+        swiglu_alpha: float = 1.702,
+        swiglu_limit: float = 7.0,
         layer_id: int = 0,
         quantization_config=None,
         physical_to_logical_map: "jax.Array | None" = None,
@@ -59,6 +61,8 @@ class EPMoE(nnx.Module):
         self.original_mesh = mesh
         self.mesh = mesh
         self.activation = activation
+        self.swiglu_alpha = swiglu_alpha
+        self.swiglu_limit = swiglu_limit
         self.hidden_size = hidden_size
 
         # Get quantization settings from config
@@ -640,12 +644,15 @@ class EPMoE(nnx.Module):
 
         # === Activation ===
         if self.activation == "silu":
-            layer_act = jax.nn.silu(layer_w0)
+            intermediate_layer = jax.nn.silu(layer_w0) * layer_w1
         elif self.activation == "gelu":
-            layer_act = jax.nn.gelu(layer_w0)
+            intermediate_layer = jax.nn.gelu(layer_w0) * layer_w1
+        elif self.activation == "swigluoai":
+            gate = jnp.clip(layer_w0, max=self.swiglu_limit)
+            up = jnp.clip(layer_w1, -self.swiglu_limit, self.swiglu_limit)
+            intermediate_layer = (up + 1.0) * gate * jax.nn.sigmoid(gate * self.swiglu_alpha)
         else:
             raise ValueError(f"Unsupported activation function {self.activation}")
-        intermediate_layer = jnp.multiply(layer_act, layer_w1)
 
         # === GEMM2: intermediate @ wo ===
         return gmm(

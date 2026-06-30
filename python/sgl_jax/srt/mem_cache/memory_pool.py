@@ -553,6 +553,9 @@ class MHATokenToKVPool(KVCache):
     def replace_buffer(self, fused_kv_buffer: list[jax.Array]) -> None:
         self.kv_buffer[self.start_layer : self.start_layer + len(fused_kv_buffer)] = fused_kv_buffer
 
+    def get_index_k_buffer(self, layer_id: int) -> jax.Array:  # noqa: ARG002
+        raise NotImplementedError("index_k requires MSATokenToKVPool")
+
     def get_cpu_copy(self, indices):
         """Get CPU copy of fused KV cache for specified indices"""
         kv_cache_host = []
@@ -627,6 +630,130 @@ class MHATokenToKVPool(KVCache):
                 self.attention_data_partition_axis, None, self.kv_partition_axis, None, None
             ),
         )
+
+
+@register_pytree_node_class
+class MSATokenToKVPool(MHATokenToKVPool):
+    """MHATokenToKVPool plus a single-head index_k cache for MiniMax Sparse
+    Attention. index_k shares the same page addressing as the main KV buffer
+    so the scheduler's cache_loc/page_indices apply to both."""
+
+    def __init__(
+        self,
+        *,
+        sparse_layer_ids: list[int],
+        index_head_dim: int,
+        **kwargs,
+    ):
+        self.sparse_layer_ids = list(sparse_layer_ids)
+        self.index_head_dim = index_head_dim
+        self._sparse_map = {g: i for i, g in enumerate(self.sparse_layer_ids)}
+        super().__init__(**kwargs)
+
+    def _create_buffers(self):
+        super()._create_buffers()
+        num_pages = (self.size + self.page_size * self.dp_size) // self.page_size
+        ik_shape = (num_pages, self.page_size, 1, self.index_head_dim)
+        ikp_shape = (num_pages, 1, self.index_head_dim)
+        data = self.attention_data_partition_axis
+        ik_sharding = NamedSharding(self.mesh, P(data, None, None, None))
+        ikp_sharding = NamedSharding(self.mesh, P(data, None, None))
+        with self.mesh:
+            self.index_k_buffer = [
+                jax.jit(lambda: jnp.zeros(ik_shape, dtype=self.dtype), out_shardings=ik_sharding)()
+                for _ in range(len(self.sparse_layer_ids))
+            ]
+            # Per-block element-wise-max pooled ik. Reset to -inf so first token's
+            # ik becomes the pool value (scatter-max). Approximates max_t(iq·ik_t)
+            # by iq·max_t(ik_t); exact when iq>=0, approximate post-RoPE.
+            self.index_k_pooled = [
+                jax.jit(
+                    lambda: jnp.full(ikp_shape, -jnp.inf, dtype=self.dtype),
+                    out_shardings=ikp_sharding,
+                )()
+                for _ in range(len(self.sparse_layer_ids))
+            ]
+        ik_gb = num_pages * self.page_size * self.index_head_dim * jnp.dtype(self.dtype).itemsize
+        ik_gb = ik_gb * len(self.sparse_layer_ids) / GB
+        self.mem_usage += ik_gb
+        logger.info(
+            "MSA index_k cache: %d sparse layers, %.2f GB", len(self.sparse_layer_ids), ik_gb
+        )
+
+    def get_kv_size_bytes(self):
+        k, v = super().get_kv_size_bytes()
+        ik_per_token = (
+            self.index_head_dim * jnp.dtype(self.dtype).itemsize * len(self.sparse_layer_ids)
+        )
+        ik = (self.size + self.page_size * self.dp_size) * ik_per_token
+        return k + ik, v
+
+    def _ik_idx(self, layer_id: int) -> int:
+        return self._sparse_map[layer_id]
+
+    def get_index_k_buffer(self, layer_id: int) -> jax.Array:
+        return self.index_k_buffer[self._ik_idx(layer_id)]
+
+    def get_index_k_pooled(self, layer_id: int) -> jax.Array:
+        return self.index_k_pooled[self._ik_idx(layer_id)]
+
+    def set_index_k_buffer(self, layer_id: int, loc: jax.Array, index_k: jax.Array) -> None:
+        """index_k: [n_tokens, 1, index_head_dim]. loc: token slot indices."""
+        idx = self._ik_idx(layer_id)
+        page_idx = loc // self.page_size
+        slot = loc % self.page_size
+        self.index_k_buffer[idx] = (
+            self.index_k_buffer[idx].at[page_idx, slot].set(index_k.astype(self.dtype))
+        )
+
+    def replace_index_k_buffer(self, ik_updates: list) -> None:
+        for i, upd in enumerate(ik_updates):
+            if isinstance(upd, tuple):
+                self.index_k_buffer[i], self.index_k_pooled[i] = upd
+            else:
+                self.index_k_buffer[i] = upd
+
+    def tree_flatten(self):
+        children, aux = super().tree_flatten()
+        children = (self.index_k_buffer, self.index_k_pooled) + children
+        aux = {
+            **aux,
+            "sparse_layer_ids": self.sparse_layer_ids,
+            "index_head_dim": self.index_head_dim,
+        }
+        return (children, aux)
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        index_k_buffer, index_k_pooled = children[0], children[1]
+        obj = super().tree_unflatten(aux_data, children[2:])
+        obj.__class__ = cls
+        obj.index_k_buffer = index_k_buffer
+        obj.index_k_pooled = index_k_pooled
+        obj.sparse_layer_ids = aux_data["sparse_layer_ids"]
+        obj.index_head_dim = aux_data["index_head_dim"]
+        obj._sparse_map = {g: i for i, g in enumerate(obj.sparse_layer_ids)}
+        return obj
+
+
+@register_pytree_node_class
+class MSAIndexKProxy:
+    """Routes MemoryPools.replace_all("msa_index_k") to the underlying
+    MSATokenToKVPool.replace_index_k_buffer. Pytree-empty (no leaves) so JIT
+    sees no duplicate of index_k_buffer (already a leaf of MSATokenToKVPool)."""
+
+    def __init__(self, pool: MSATokenToKVPool | None = None):
+        self._pool = pool
+
+    def replace_buffer(self, ik_buffer: list[jax.Array]) -> None:
+        self._pool.replace_index_k_buffer(ik_buffer)
+
+    def tree_flatten(self):
+        return (), None
+
+    @classmethod
+    def tree_unflatten(cls, aux, children):
+        return cls()
 
 
 @register_pytree_node_class
