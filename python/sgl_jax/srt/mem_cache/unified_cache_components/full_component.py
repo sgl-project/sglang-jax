@@ -35,10 +35,8 @@ class FullComponent(TreeComponent):
     def create_match_validator(
         self, match_device_only: bool = False
     ) -> Callable[[UnifiedTreeNode], bool]:
-        # HiCache: the default (host-aware) validator also accepts a node whose
-        # FULL KV lives only on host (value is None, host_value set), so the
-        # match can walk into the L2 tier. ``match_device_only`` keeps the strict
-        # device check for callers that need a device-resident boundary.
+        # HiCache: host-aware validator also accepts nodes with KV only on host
+        # (value=None, host_value set), so the match can walk into the L2 tier.
         ct = self.component_type
         if self.cache.hicache_enabled and not match_device_only:
             return lambda node: (
@@ -55,12 +53,7 @@ class FullComponent(TreeComponent):
         if child_cd.value is not None:
             new_parent.component_data[ct].value = child_cd.value[:split_len].copy()
             child_cd.value = child_cd.value[split_len:].copy()
-        # HiCache: a backed-up node carries one host buffer_id per PAGE, so the
-        # host_value array splits at the PAGE boundary -- not at split_len, which
-        # is a TOKEN count. split_len is page-aligned (radix invariant), so
-        # split_pages = split_len // page_size folds it to the page unit. Using
-        # the token split_len here would slice past the (much shorter) page array
-        # and hand the whole host buffer to one side (the partial-match split bug).
+        # HiCache: host_value is PAGE-level, so split at page (not token) boundary.
         if child_cd.host_value is not None:
             PS = self.cache.page_size
             assert (
@@ -123,15 +116,7 @@ class FullComponent(TreeComponent):
         root = self.cache.root_node
         cur = node
 
-        # A lock path may cross tombstones (evicted-but-backuped nodes): with
-        # HiCache, partial load_back / re-insert can leave a live node below a
-        # still-demoted ancestor, and write_backup locks node->root through it.
-        # That mirrors sglang (inc_lock_ref tolerates evicted nodes on the path).
-        # Device-token accounting only applies to LIVE nodes: a tombstone was
-        # already removed from component_evictable_size_ at eviction and holds no
-        # device slots, so we just bump its lock_ref to protect it (eviction
-        # skips locked nodes, so a node's live/tombstone state cannot flip while
-        # locked -- acquire and release stay symmetric).
+        # Lock path may cross tombstones — only live nodes affect token accounting.
         delta = 0
         while cur is not root:
             cd = cur.component_data[ct]
@@ -167,9 +152,7 @@ class FullComponent(TreeComponent):
             cd = cur.component_data[ct]
             assert cd.lock_ref > 0
 
-            # Mirror acquire: device-token accounting only for live nodes; a
-            # tombstone on the path just gets its lock_ref decremented. State
-            # cannot have flipped while locked, so this stays symmetric.
+            # Mirror acquire: token accounting only for live nodes.
             if cd.value is not None and cd.lock_ref == 1:
                 key_len = len(cd.value)
                 cur_dp_rank = cur.key.dp_rank if cur.key and cur.key.dp_rank is not None else 0

@@ -307,10 +307,7 @@ class PrefillAdder:
         self.new_chunked_reqs = [None] * dp_size
         self.log_hit_tokens = 0
         self.log_input_tokens = 0
-        # HiCache: flush plans produced by init_load_back for admitted reqs only.
-        # The scheduler drains this into its _pending_h2d after the prefill loop
-        # and completes the kernel scatter in a donation-safe window. Collected
-        # here (post budget-gate) so a rejected req never triggers an H2D load.
+        # HiCache: H2D flush plans from init_load_back (post-budget-gate only).
         self.pending_h2d: list = []
 
         if running_batch is not None:
@@ -634,13 +631,8 @@ class PrefillAdder:
                 if swa_needed >= self.rem_swa_tokens_for_dp(dp_rank):
                     return AddReqResult.NO_TOKEN
 
-            # HiCache: now that the req has passed the budget gate, pull its
-            # host-only prefix back onto the device (async H2D). Doing this AFTER
-            # the NO_TOKEN check (and before inc_lock_ref below, which locks the
-            # post-loadback deeper node) mirrors sglang: a rejected req must never
-            # allocate device slots / submit a stage_load / queue an H2D flush,
-            # otherwise the scheduler blocks in finish_load_back for a req that
-            # won't run, starving the running batch (the 16k livelock).
+            # HiCache: after budget gate, pull host-only prefix back to device.
+            # Must happen after NO_TOKEN check so rejected reqs never trigger H2D.
             if getattr(self.tree_cache, "hicache_enabled", False) and req.host_hit_length > 0:
                 mem_quota = self.token_to_kv_pool_allocator.available_size(dp_rank)
                 new_indices, last_node, flush_plan = self.tree_cache.init_load_back(

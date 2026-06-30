@@ -68,8 +68,7 @@ class UnifiedTreeNode:
         self.last_access_time = get_and_increase_time_counter()
         self.id = UnifiedTreeNode.counter
         UnifiedTreeNode.counter += 1
-        # HiCache: prefix-reuse counter; once it reaches write_through_threshold
-        # the node's FULL KV is backed up to host (D2H). 0 until first reuse.
+        # HiCache: prefix-reuse counter; backs up to host when >= write_through_threshold.
         self.hit_count = 0
 
     @property
@@ -141,22 +140,14 @@ class UnifiedRadixCache(BasePrefixCache):
         }
         self._components_tuple: tuple[TreeComponent, ...] = tuple(self.components.values())
 
-        # HiCache (L1<->L2) wiring. Populated by init_hicache() after construction
-        # when --hicache-storage != disable. Until then the cache is L1-only and
-        # every hicache_enabled branch is skipped.
+        # HiCache (L1<->L2) wiring — populated by init_hicache() when enabled.
         self.hicache_enabled: bool = False
         self.hicache_controller = None
         self.host_pool = None
         self.write_through_threshold: int = 1
-        # HiCache write policy (set from server_args in init_hicache):
-        #   "write_through" / "write_through_selective" back up on hit;
-        #   "write_back" backs up only at device eviction (see _evict_device_leaf).
         self.write_policy: str = "write_through"
-        # Optional callable injected by the scheduler. write_back's eviction-time
-        # D2H gather reads kv_buffer during get_next_batch_to_run, BEFORE the event
-        # loop's own launch_done.wait, so the prior forward may still hold the
-        # donated buffer. This barrier blocks until that forward's replace_all is
-        # done (kv_buffer rebound to a live handle) -> gather is donation-safe.
+        # Injected by the overlap scheduler so write_back's eviction-time D2H
+        # gather waits for the prior forward's replace_all (donation-safe).
         self._donation_barrier = None
 
         self.reset()
@@ -175,8 +166,8 @@ class UnifiedRadixCache(BasePrefixCache):
             ct: defaultdict(int) for ct in self.tree_components
         }
         self.evictable_device_leaves: set[UnifiedTreeNode] = set()
-        # HiCache: host-tier leaf set (evicted-but-backuped nodes still in tree)
-        # and in-flight async D2H writes (future -> (node, buffer_ids)).
+        # HiCache: host-tier leaves (evicted-but-backuped tombstones) and
+        # in-flight async D2H writes (future -> (node, buffer_ids)).
         self.evictable_host_leaves: set[UnifiedTreeNode] = set()
         self.ongoing_write: dict = {}
 
@@ -531,16 +522,15 @@ class UnifiedRadixCache(BasePrefixCache):
         child_key = self.get_child_key_fn(key)
 
         value: list[np.ndarray] = []
-        # Device-best: deepest node whose FULL KV is on device. ``best_value_len``
-        # is the count of value CHUNKS accepted (upstream seam name kept), not a
-        # token count; ``best_device_tokens`` is the token count at that node.
         best_device_node = node
         best_value_len = 0
         best_device_tokens = 0
-        # Host-best: deepest node reachable through the L2 (backuped) tier.
         best_host_node = node
         best_host_tokens = 0
         cur_tokens = 0
+        # Device coverage must stay a contiguous prefix from root. Once a
+        # tombstone breaks the chain, device-best freezes — otherwise a deeper
+        # still-resident node under an evicted ancestor breaks inc_lock_ref.
         device_broken = False
 
         if full_only:
@@ -608,9 +598,7 @@ class UnifiedRadixCache(BasePrefixCache):
         best_host_node: UnifiedTreeNode,
         host_hit_length: int,
     ) -> MatchResult:
-        # Refresh the matched path so deeper nodes look more recently used. With
-        # HiCache the deepest reached node is the host-best one (it may sit below
-        # the device-best on the L2 tier).
+        # Refresh the matched path so deeper nodes look more recently used.
         refresh_from = best_host_node if self.hicache_enabled else best_device_node
         cur_time = get_and_increase_time_counter()
         node_update: UnifiedTreeNode | None = refresh_from
@@ -698,17 +686,9 @@ class UnifiedRadixCache(BasePrefixCache):
 
             cd = node.component_data[BASE_COMPONENT_TYPE]
             if self.hicache_enabled and cd.value is None:
-                # Revive a tombstone (mirrors sglang ``insert``): the request
-                # recomputed this prefix, so adopt its freshly computed KV as the
-                # node's device value and keep the host copy (write-through). This
-                # is what preserves the "no live node below a tombstone"
-                # invariant. Without it a live leaf would be added under a dead
-                # ancestor; ``write_backup`` would then lock node->root *through*
-                # that tombstone, and a later ``init_load_back`` could un-tombstone
-                # the still-locked node into the evictable counter -- the
-                # deterministic evictable/protected drift. The revived range is
-                # NOT added to ``total_prefix_length`` so cache_*_req does not free
-                # it: the tree now owns these slots (same as a new leaf).
+                # Revive a tombstone: adopt the recomputed KV as device value
+                # while keeping the host copy. Must NOT add to total_prefix_length
+                # so cache_*_req does not free slots the tree now owns.
                 assert prefix_len % self.page_size == 0, (
                     f"tombstone revive at non-page-aligned len {prefix_len} "
                     f"(page_size={self.page_size})"
@@ -719,9 +699,6 @@ class UnifiedRadixCache(BasePrefixCache):
                 self._update_evictable_leaf_sets(node)
                 self._update_evictable_leaf_sets(node.parent)
             else:
-                # Let each component claim ownership of overlapping KV slots.
-                # FULL never consumes; duplicate frees stay in cache_*_req (this
-                # repo's convention), so the returned index is unused in stage 1.
                 value_slice = value[:prefix_len]
                 for component in self._components_tuple:
                     component.update_component_on_insert_overlap(
@@ -733,10 +710,6 @@ class UnifiedRadixCache(BasePrefixCache):
                     )
 
                 total_prefix_length += prefix_len
-
-                # HiCache write-through: reusing an existing prefix node counts as
-                # a hit; once a node crosses the threshold its FULL KV is backed up
-                # to host. New leaves (created below) never trigger backup here.
                 if self.hicache_enabled:
                     self._inc_hit_count(node)
 
@@ -777,12 +750,7 @@ class UnifiedRadixCache(BasePrefixCache):
     ##### HiCache (L1<->L2) Write Path #####
 
     def _inc_hit_count(self, node: UnifiedTreeNode) -> None:
-        """Bump a reused node's hit counter; back it up to host on threshold.
-
-        Only nodes that are already on device and not yet backed up are
-        candidates — root and already-backuped nodes are skipped."""
-        # write_back defers all backup to device eviction (_evict_device_leaf),
-        # so hits never trigger D2H here (aligned with sglang HiRadixCache).
+        """Bump hit counter; back up to host on threshold (write_through only)."""
         if self.write_policy == "write_back":
             return
         if node is self.root_node or node.backuped:
@@ -792,12 +760,7 @@ class UnifiedRadixCache(BasePrefixCache):
             self.write_backup(node)
 
     def _reserve_host_slots(self, num_pages: int) -> list[int] | None:
-        """Reserve ``num_pages`` host PAGE ids, evicting host leaves on demand.
-
-        Returns the list of page ids, or None when the host pool stays short of
-        ``num_pages`` even after evicting enough host-tier LRU leaves. The host
-        pool's :meth:`alloc` is all-or-nothing, so we evict the shortfall first
-        and retry once."""
+        """Alloc host pages, evicting host LRU leaves if short. None if still short."""
         pages = self.host_pool.alloc(num_pages)
         if pages is None:
             shortfall = num_pages - self.host_pool.available_size()
@@ -809,16 +772,11 @@ class UnifiedRadixCache(BasePrefixCache):
         return [int(p) for p in pages]
 
     def _to_global_device_pages(self, local_pages, dp_rank: int) -> list[int]:
-        """Map per-rank LOCAL device page ids to GLOBAL page ids.
+        """Map per-rank local device page ids to global page ids.
 
-        The device KV buffer is DP-sharded along its leading (page) axis, but the
-        allocator hands out per-rank local views ``[1, pages_per_shard]`` (forward
-        writes index them inside a ``shard_map`` local view, so they are never
-        globalized there). HiCache's gather/scatter, however, run OUTSIDE any
-        shard_map on the GLOBAL buffer, so a local page id for ``dp_rank>0`` would
-        hit the wrong physical page. Convert with
-        ``global = dp_rank * pages_per_shard + local`` (a no-op at ``dp_size==1``,
-        which keeps the single-rank path bit-identical)."""
+        The allocator hands out per-rank local views; HiCache gather/scatter runs
+        outside shard_map on the global buffer, so convert via
+        ``global = dp_rank * pages_per_shard + local``."""
         dp_size = getattr(self.token_to_kv_pool_allocator, "dp_size", 1)
         if dp_size <= 1 or dp_rank == 0:
             return [int(x) for x in local_pages]
@@ -827,33 +785,19 @@ class UnifiedRadixCache(BasePrefixCache):
         return [int(x) + dp_rank * pages_per_shard for x in local_pages]
 
     def write_backup(self, node: UnifiedTreeNode, write_back: bool = False) -> int:
-        """Async D2H backup of a node's FULL device KV to host.
+        """Async D2H backup of a node's device KV to host.
 
-        Maintains the contiguous-prefix invariant (a backed-up node's parent is
-        backed up first), reserves one host PAGE slot per device page, locks the
-        device node for the duration of the in-flight copy, and records the future
-        in ``ongoing_write`` for :meth:`writing_check` to settle. Returns the
-        number of pages backed up (0 if skipped/aborted; retried on a later hit).
+        write_back=True is the eviction-time path: leaf-up eviction guarantees
+        ancestors are already backed up, so parent recursion is skipped. The device
+        lock is held only around the synchronous gather (stage_backup); the slow
+        host transfer (flush_backup) is async and never touches the device buffer,
+        so releasing the lock early lets the node be demoted under memory pressure.
 
-        ``write_back=True`` is the eviction-time path (see _evict_device_leaf):
-        eviction is leaf-up, so the parent may still be live (unevicted, not yet
-        backed up). Skipping the parent recursion is safe because a tombstone's
-        tombstone-ancestors are always backed up — an ancestor only becomes a
-        tombstone by being evicted, which backs it up (aligned with sglang's
-        ``write_backup(node, write_back=True)``).
-
-        Unit boundary [token -> page]: ``cd.value`` is TOKEN-level (radix core
-        invariant); the control plane is PAGE-level. We fold here once: the value
-        is page-aligned and page-internally-contiguous, so taking every PS-th
-        token and dividing by PS yields the (local) device page ids."""
+        Token->page folding: cd.value is token-level; take every page_size-th
+        element and divide by page_size to get local device page ids."""
         if node is self.root_node or node.backuped:
             return 0
 
-        # Contiguous-prefix invariant: parent must be backed up first. Since
-        # host_value is set synchronously below, the parent becomes backuped even
-        # while its own D2H is still in flight. Skipped on the write_back path
-        # (leaf-up eviction guarantees the invariant without forcing the parent's
-        # D2H early — forcing it would defeat write_back's "backup only on evict").
         if not write_back and node.parent is not self.root_node and not node.parent.backuped:
             self.write_backup(node.parent)
             if not node.parent.backuped:
@@ -869,22 +813,12 @@ class UnifiedRadixCache(BasePrefixCache):
         assert (
             len(device_tokens) % PS == 0
         ), f"node.value len {len(device_tokens)} not page-aligned (page_size={PS})"
-        device_pages = device_tokens[::PS] // PS  # local device page ids
+        device_pages = device_tokens[::PS] // PS
         num_pages = len(device_pages)
         host_pages = self._reserve_host_slots(num_pages)
         if host_pages is None:
             return 0
 
-        # Lock the device node only around the *synchronous* device gather. The
-        # gather (stage_backup, inside controller.write) is the sole step that
-        # reads the device KV pages; it runs on this buffer-owning thread and
-        # materializes the pages into an independent array before write()
-        # returns. The async half (flush_backup) moves those already-materialized
-        # pages host->host and never touches the device buffer, so the node need
-        # not stay locked across it. Releasing the lock here lets a backed-up
-        # node be demoted to host under memory pressure -- otherwise a single
-        # in-flight backup of a deep node would chain-lock the whole root->node
-        # prefix and starve admission (cross-prefix requests wedge the scheduler).
         self.inc_lock_ref(node)
         node_dp_rank = node.key.dp_rank if node.key and node.key.dp_rank is not None else 0
         global_pages = self._to_global_device_pages(device_pages, node_dp_rank)
@@ -895,25 +829,13 @@ class UnifiedRadixCache(BasePrefixCache):
         return num_pages
 
     def precompile_hicache_transfers(self) -> None:
-        """Warm up the four host<->device transfer kernels at server startup.
-
-        No-op unless HiCache is enabled. Drives the host pool's bucketed
-        precompile so the XLA/Pallas compile of stage_backup / flush_backup /
-        stage_load / flush_load happens here (off the serving critical path)
-        rather than inline on the scheduler thread at the first backup/load-back.
-        """
+        """Precompile host<->device transfer kernels at startup (no-op if disabled)."""
         if not self.hicache_enabled or self.host_pool is None:
             return
         self.host_pool.precompile_transfers()
 
     def writing_check(self) -> None:
-        """Settle completed async D2H writes (non-blocking).
-
-        The device lock is released in :meth:`write_backup` as soon as the
-        synchronous gather finishes, so here we only drain finished futures from
-        ``ongoing_write``. ``hicache_controller.check_write_status`` clears the
-        controller's own pending mirror and re-raises the first worker error,
-        if any."""
+        """Settle completed async D2H writes (non-blocking)."""
         if not self.ongoing_write:
             return
         done = [f for f in self.ongoing_write if f.done()]
@@ -922,7 +844,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self.hicache_controller.check_write_status()
 
     def check_hicache_events(self) -> None:
-        """Scheduler entry hook: non-blocking poll of in-flight D2H writes."""
+        """Non-blocking poll of in-flight D2H writes (scheduler hook)."""
         if self.hicache_enabled:
             self.writing_check()
 
@@ -932,7 +854,7 @@ class UnifiedRadixCache(BasePrefixCache):
             self.writing_check()
 
     def ready_to_load_host_cache(self) -> int:
-        """No-op: H2D load is synchronous in this version, nothing to pre-arm."""
+        """No-op: H2D load is synchronous, nothing to pre-arm."""
         return 0
 
     ##### Evict Helpers #####
@@ -952,21 +874,12 @@ class UnifiedRadixCache(BasePrefixCache):
         assert v is node
 
     def _evict_device_leaf(self, node: UnifiedTreeNode, tracker: dict[ComponentType, int]) -> None:
-        """Evict a device leaf.
-
-        Without HiCache (or for a node with no host backup) the node is freed
-        and deleted from the tree. With HiCache, a backed-up node is *demoted*
-        instead: its device KV is freed but the node stays in the tree as an
-        evicted-but-backuped tombstone, so a later match can reload it from L2."""
+        """Evict a device leaf. Backed-up nodes are demoted to tombstones
+        instead of deleted, so later matches can reload them from host."""
         assert self._is_device_leaf(node), f"node {node.id} is not a D-leaf"
 
-        # write_back policy: a node is backed up only when it is about to be
-        # evicted. Do it BEFORE evict_component frees the device pages (it calls
-        # _free_full, returning them to the allocator), otherwise the D2H gather
-        # would read reclaimed pages. The gather inside write_backup is
-        # synchronous, so cd.value is still valid here and materializes off-device
-        # before the free below. A failed backup (host pool full -> returns 0)
-        # falls through to the delete path, exactly like write_through.
+        # write_back: do the D2H backup BEFORE freeing device pages, otherwise
+        # the gather would read reclaimed pages.
         if self.hicache_enabled and self.write_policy == "write_back" and not node.backuped:
             if self._donation_barrier is not None:
                 self._donation_barrier()
@@ -981,8 +894,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self.evictable_device_leaves.discard(node)
 
         if self.hicache_enabled and node.backuped:
-            # Demote to host tier: keep the tombstone, refresh leaf sets so the
-            # node joins the host-leaf set and its parent can become a D-leaf.
+            # Demote to host tier: keep the tombstone in-tree.
             self._update_evictable_leaf_sets(node)
             self._update_evictable_leaf_sets(node.parent)
             return
@@ -1004,12 +916,7 @@ class UnifiedRadixCache(BasePrefixCache):
         )
 
     def _is_host_leaf(self, node: UnifiedTreeNode) -> bool:
-        """H-leaf: an evicted-but-backuped tombstone (device gone, host present)
-        with no backed-up child — the deepest host-resident node on its path.
-
-        Device coverage is always a contiguous prefix, so an evicted node's
-        surviving children are all backuped; "no backuped child" thus means the
-        node is a genuine leaf of the host tier."""
+        """H-leaf: evicted-but-backuped tombstone with no backed-up child."""
         if node is self.root_node:
             return False
         if not (node.evicted and node.backuped):
@@ -1030,8 +937,7 @@ class UnifiedRadixCache(BasePrefixCache):
     ##### HiCache (L1<->L2) Host Eviction #####
 
     def evict_host(self, num_pages: int) -> int:
-        """Free at least ``num_pages`` host slots by evicting host-tier LRU
-        leaves. Returns the number of pages actually freed."""
+        """Free at least num_pages host slots by evicting host-tier LRU leaves."""
         if not self.hicache_enabled:
             return 0
         num_freed = 0
@@ -1048,9 +954,7 @@ class UnifiedRadixCache(BasePrefixCache):
         return num_freed
 
     def _evict_host_leaf(self, node: UnifiedTreeNode) -> int:
-        """Release a host leaf's page ids (TOCTOU-safe via the controller),
-        clear its host_value, and delete the now-dead node from the tree.
-        Returns the number of PAGES freed."""
+        """Release a host leaf's page ids and delete it from the tree."""
         cd = node.component_data[BASE_COMPONENT_TYPE]
         buffer_ids = cd.host_value
         num = len(buffer_ids)
@@ -1070,27 +974,17 @@ class UnifiedRadixCache(BasePrefixCache):
         host_hit_length: int,
         mem_quota: int | None = None,
     ) -> tuple[np.ndarray, UnifiedTreeNode, list[tuple[list[int], list[int]]]]:
-        """Start an async reload of a host-only prefix onto the device (H2D).
+        """Start async reload of a host-only prefix onto device (H2D).
 
-        Walks the tombstone chain (evicted & backuped nodes) from
-        ``last_host_node`` up to the device boundary, allocates device slots for
-        as many tokens as ``mem_quota`` allows (shallow-first), and for each node
-        submits an **async** ``stage_load`` (slow host->device device_put into an
-        independent staging array, never touches ``kv_buffer``) so it can overlap
-        the in-flight forward. The nodes are un-tombstoned here (control plane:
-        ``cd.value`` restored, host copy retained under write-through), but the KV
-        bytes are NOT yet in ``kv_buffer``.
-
-        Returns ``(device_indices, deepest_reloaded_node, flush_plan)`` where
-        ``flush_plan`` is a list of ``(host_pages, global_device_pages)`` pairs
-        the caller MUST hand to :meth:`finish_load_back` in a donation-safe window
-        (no forward in flight) to complete the cheap kernel scatter into
-        ``kv_buffer`` before the forward that consumes these slots is dispatched.
+        Walks the tombstone chain from last_host_node up to the device boundary,
+        allocates device slots, and submits async stage_load for each node.
+        Returns (device_indices, deepest_reloaded_node, flush_plan) — the caller
+        must hand flush_plan to finish_load_back in a donation-safe window to
+        complete the kernel scatter into kv_buffer.
         """
         if not self.hicache_enabled or host_hit_length <= 0:
             return np.empty((0,), dtype=np.int32), last_host_node, []
 
-        # Tombstone chain, parent-first (shallow = closest to device boundary).
         chain: list[UnifiedTreeNode] = []
         node = last_host_node
         while node is not self.root_node and node.evicted and node.backuped:
@@ -1099,24 +993,14 @@ class UnifiedRadixCache(BasePrefixCache):
         chain.reverse()
         if not chain:
             return np.empty((0,), dtype=np.int32), last_host_node, []
-        # Deepest device node the tombstone chain hangs from (its only child is
-        # the shallowest tombstone, so it is itself an evictable device leaf).
         attach_boundary = node
 
-        # All-or-nothing load-back (mirrors sglang ``load_back``): reload the
-        # ENTIRE tombstone chain or none of it. A partial reload would leave a
-        # still-tombstoned ancestor above a freshly-reloaded device node
-        # (live-below-tombstone), which breaks two invariants sglang relies on:
-        # (1) device coverage is a contiguous prefix from root, and (2) a node's
-        # device-resident state never flips while a lock is held on it (a locked
-        # tombstone could otherwise be un-tombstoned mid-flight, desyncing the
-        # evictable/protected token accounting). host_value is PAGE-level, so a
-        # node's token count is pages * PS.
+        # All-or-nothing: reload the entire tombstone chain or none of it.
+        # Partial reload breaks the contiguous-prefix invariant (live node below
+        # a tombstone), which inc_lock_ref and evictable accounting rely on.
         PS = self.page_size
         selected = list(chain)
         total = sum(len(n.component_data[BASE_COMPONENT_TYPE].host_value) * PS for n in selected)
-        # Skip the reload (recompute instead) if the full chain cannot fit even
-        # after eviction; the caller falls back to prefilling this prefix.
         if mem_quota is not None and total > mem_quota:
             return np.empty((0,), dtype=np.int32), last_host_node, []
 
@@ -1126,16 +1010,8 @@ class UnifiedRadixCache(BasePrefixCache):
             else 0
         )
 
-        # Make device room (the matched path was just touched, so LRU eviction
-        # targets colder leaves first), then allocate. Abort if still short.
-        # The matched device prefix is not locked yet (the scheduler only locks
-        # in add_one_req, after this call), so eviction here could otherwise
-        # demote ``attach_boundary`` itself -- it is a device leaf whose sole
-        # child is the tombstone we are reloading. Demoting it would leave a
-        # tombstone sandwiched above a freshly-reloaded device node, breaking the
-        # "device coverage is contiguous from root" invariant and tripping the
-        # FULL lock-path assertion later. Lock the attachment path across the
-        # eviction to keep it on device.
+        # Lock attach_boundary across eviction so it isn't demoted (it's the
+        # device leaf whose sole child is the tombstone we're reloading).
         lock_res = self.inc_lock_ref(attach_boundary)
         try:
             avail = self.token_to_kv_pool_allocator.available_size(dp_rank)
@@ -1151,19 +1027,14 @@ class UnifiedRadixCache(BasePrefixCache):
         flush_plan: list[tuple[list[int], list[int]]] = []
         for n in selected:
             cd = n.component_data[BASE_COMPONENT_TYPE]
-            host_pages = [int(b) for b in cd.host_value]  # page ids
+            host_pages = [int(b) for b in cd.host_value]
             n_tokens = len(host_pages) * PS
-            # Unit boundary [page -> token]: device slice is TOKEN-level (radix
-            # invariant for cd.value); fold to local page ids for the controller.
             dev_tokens = device_indices_all[offset : offset + n_tokens]
             dev_pages = np.asarray(dev_tokens)[::PS] // PS
             global_pages = self._to_global_device_pages(dev_pages, dp_rank)
-            # Async H2D: start the slow host->device device_put now so it overlaps
-            # the in-flight forward; the cheap kernel scatter into kv_buffer is
-            # deferred to finish_load_back() in a donation-safe window.
             self.hicache_controller.stage_load(host_pages)
             flush_plan.append((host_pages, [int(p) for p in global_pages]))
-            # Un-tombstone: device value restored, host copy retained (write-through).
+            # Un-tombstone: restore device value, retain host copy (write-through).
             cd.value = np.array(dev_tokens, dtype=np.int32)
             node_dp_rank = n.key.dp_rank if n.key and n.key.dp_rank is not None else 0
             self.component_evictable_size_[BASE_COMPONENT_TYPE][node_dp_rank] += n_tokens
@@ -1176,17 +1047,9 @@ class UnifiedRadixCache(BasePrefixCache):
         return device_indices_all, selected[-1], flush_plan
 
     def finish_load_back(self, flush_plan: list[tuple[list[int], list[int]]]) -> None:
-        """Donation-safe second half of :meth:`init_load_back`.
-
-        Drains the async ``stage_load``s submitted by ``init_load_back`` and
-        scatters the staged pages into the device KV buffer via the cheap aliased
-        kernel write (``controller.flush_load``). MUST run on the forward thread
-        with NO forward in flight: it reads + reassigns ``kv_buffer[layer]``,
-        which the forward donates every step. Idempotent on an empty plan."""
+        """Complete the H2D scatter into kv_buffer. Must run donation-safe."""
         if not self.hicache_enabled or not flush_plan:
             return
-        # Block until every staged device_put has landed, then the per-node
-        # flush_load won't trip its in-flight guard.
         self.hicache_controller.drain_loads()
         for host_pages, global_pages in flush_plan:
             self.hicache_controller.flush_load(host_pages, list(global_pages))
