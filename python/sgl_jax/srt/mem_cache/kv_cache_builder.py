@@ -61,10 +61,8 @@ def build_kv_cache(
 def init_hicache(cache, server_args, mesh, token_to_kv_pool_allocator) -> None:
     """Assemble the HiCache L2 stack and attach it to a UnifiedRadixCache.
 
-    This is the single raiden swap point: replacing LRUHostKVPool with a
-    RaidenHostKVPool here is the only change needed to switch storage backends
-    (decision D4) — the controller and tree-cache control plane only ever cross
-    the boundary with int buffer_id, never a host jax.Array.
+    This is the single swap point for storage backends — the controller and
+    tree cache only pass int buffer_ids across the boundary.
     """
     from sgl_jax.srt.mem_cache.hicache_controller import HiCacheController
     from sgl_jax.srt.mem_cache.host_kv_pool import LRUHostKVPool
@@ -78,9 +76,7 @@ def init_hicache(cache, server_args, mesh, token_to_kv_pool_allocator) -> None:
     device_pool = token_to_kv_pool_allocator.get_kvcache()
     per_layer_shape = tuple(int(d) for d in device_pool.kv_buffer[0].shape[1:])
     page_size = device_pool.page_size
-    # hicache_ratio scales the device *token* capacity; LRUHostKVPool is
-    # page-addressed (one host slot == one whole device page), so fold the
-    # token budget down to a page-slot count before handing it over.
+    # hicache_ratio is token-based; fold to page count for the page-addressed pool.
     host_token_budget = int(server_args.hicache_ratio * device_pool.size)
     num_pages = host_token_budget // page_size
 

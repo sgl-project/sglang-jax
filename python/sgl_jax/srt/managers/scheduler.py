@@ -413,10 +413,7 @@ class Scheduler(
         # The last forward batch
         self.last_batch: ScheduleBatch | None = None
         self.forward_ct = 0
-        # HiCache async H2D load-back: per-round flush plan accumulated by
-        # PrefillAdder.add_one_req (control plane + async stage_load, only for
-        # admitted reqs), handed off here after the prefill loop, and drained by
-        # the event loop in a donation-safe window before dispatching forward.
+        # HiCache: per-round H2D flush plans from PrefillAdder, drained donation-safe.
         self._pending_h2d: list[tuple[list[int], list[int]]] = []
         self.forward_ct_decode = 0
         self.num_generated_tokens = 0
@@ -496,9 +493,7 @@ class Scheduler(
                 self.draft_worker.run_spec_decode_precompile()
                 logger.info("[Scheduler] Completes spec_decode worker precompile.")
 
-            # Warm up the HiCache host<->device transfer kernels (no-op unless
-            # HiCache is enabled) so their XLA/Pallas compile does not land on the
-            # scheduler hot path at the first backup/load-back.
+            # Precompile HiCache transfer kernels off the critical path.
             if getattr(self.tree_cache, "hicache_enabled", False):
                 logger.info("[Scheduler] Begins to precompile HiCache transfers.")
                 self.tree_cache.precompile_hicache_transfers()
@@ -647,10 +642,9 @@ class Scheduler(
             spec_algorithm=self.spec_algorithm,
             mesh=self.mesh,
         )
-        # write_back eviction backs up KV during get_next_batch_to_run, before the
-        # event loop's launch_done.wait. Hand the cache a barrier that blocks on the
-        # prior forward's launch_done so its D2H gather reads a live (not donated)
-        # kv_buffer. Only needed under overlap; the normal loop is synchronous.
+        # write_back eviction runs inside get_next_batch_to_run, before the event
+        # loop's launch_done.wait. Hand the cache a barrier so the D2H gather
+        # blocks until kv_buffer is rebound (donation-safe).
         if self.enable_overlap and getattr(self.tree_cache, "hicache_enabled", False):
             self.tree_cache._donation_barrier = self._wait_donation_safe
 
@@ -960,9 +954,6 @@ class Scheduler(
 
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
-            # HiCache: complete this round's async H2D load-backs. The sync loop
-            # has no forward in flight here, so the kv_buffer scatter is always
-            # donation-safe. No-op when nothing was loaded.
             self._flush_pending_h2d()
 
             if batch:
@@ -1001,12 +992,8 @@ class Scheduler(
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
 
-            # HiCache async H2D: stage_load (device_put) was already issued inside
-            # get_next_batch_to_run, overlapping the previous batch's forward. The
-            # cheap kernel scatter (flush) must wait until that forward's replace_all
-            # is done (launch_done is set after replace_all) so it doesn't race the
-            # donated kv_buffer. Gated on _pending_h2d: pure-forward batches are
-            # untouched.
+            # HiCache: stage_load was issued during last round; flush must wait
+            # for that forward's replace_all to avoid racing the donated kv_buffer.
             if self._pending_h2d:
                 if (
                     self.last_batch is not None
@@ -1717,7 +1704,7 @@ class Scheduler(
         if self.grammar_queue:
             self.move_ready_grammar_requests()
 
-        # HiCache: settle any completed async D2H backups before scheduling.
+        # Settle completed async D2H backups before scheduling.
         if getattr(self.tree_cache, "hicache_enabled", False):
             self.tree_cache.check_hicache_events()
 
@@ -1818,9 +1805,7 @@ class Scheduler(
                 continue  # host pool full: leave req in waiting_queue, retry next round
 
             req.init_next_round_input(self.tree_cache)
-            # HiCache: the host-only prefix load-back (async H2D) now happens
-            # INSIDE adder.add_one_req, after its NO_TOKEN budget gate, so a
-            # rejected req never allocates device slots or queues an H2D flush.
+            # H2D load-back happens inside add_one_req (after NO_TOKEN gate).
             res = adder.add_one_req(req)
 
             if res != AddReqResult.CONTINUE:
@@ -1843,11 +1828,7 @@ class Scheduler(
                 req.disagg_host_buffer_id = _reserved_bid
 
         # Update waiting queue
-        # HiCache: collect the H2D flush plans produced for admitted reqs. The
-        # event loop scatters them into kv_buffer in a donation-safe window
-        # (_flush_pending_h2d) before dispatching the forward that consumes them.
-        # Drain unconditionally: any plan here has an in-flight stage_load that
-        # finish_load_back MUST complete, even if no req ends up runnable.
+        # Collect H2D flush plans from admitted reqs; drained donation-safe later.
         if adder.pending_h2d:
             self._pending_h2d.extend(adder.pending_h2d)
 
@@ -1930,24 +1911,13 @@ class Scheduler(
         return new_batch
 
     def _flush_pending_h2d(self) -> None:
-        """Donation-safe completion of this round's HiCache H2D load-backs.
-
-        Drains the async ``stage_load``s and scatters the staged pages into the
-        device KV buffer. MUST be called with NO forward in flight (the flush
-        reads + reassigns ``kv_buffer``, which the forward donates). Clears the
-        plan so a failed flush does not re-run on the next round."""
+        """Complete this round's HiCache H2D load-backs. Must be donation-safe."""
         plan, self._pending_h2d = self._pending_h2d, []
         if plan:
             self.tree_cache.finish_load_back(plan)
 
     def _wait_donation_safe(self) -> None:
-        """Block until the last dispatched forward has finished replace_all.
-
-        Injected into the radix cache as its donation barrier. write_back's
-        eviction-time D2H gather runs inside get_next_batch_to_run, before the
-        event loop's own launch_done.wait, so the prior forward may still hold
-        the donated kv_buffer. Waiting on its launch_done (set after replace_all
-        rebinds kv_buffer) makes the gather read a live handle."""
+        """Block until the last forward's replace_all is done (donation barrier)."""
         last = self.last_batch
         if last is not None and getattr(last, "launch_done", None) is not None:
             last.launch_done.wait()
@@ -1956,7 +1926,7 @@ class Scheduler(
         """Update the current running decoding batch."""
         initial_bs = batch.batch_size()
 
-        # HiCache: free device locks held by finished D2H backups early.
+        # Free device locks held by finished D2H backups.
         if getattr(self.tree_cache, "hicache_enabled", False):
             self.tree_cache.flush_write_through_acks()
 
