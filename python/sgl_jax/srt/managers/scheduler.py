@@ -34,6 +34,10 @@ from sgl_jax.srt.disaggregation.runtime import install_disaggregation_wiring
 from sgl_jax.srt.hf_transformers_utils import get_tokenizer
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
 from sgl_jax.srt.managers.communication import CommunicationBackend
+from sgl_jax.srt.managers.dp_schedule_policy import (
+    pick_cache_aware_dp,
+    req_prefix_match_key,
+)
 from sgl_jax.srt.managers.io_struct import (
     AbortReq,
     ContinueGenerationReqInput,
@@ -69,8 +73,10 @@ from sgl_jax.srt.managers.scheduler_profiler_mixing import SchedulerProfilerMixi
 from sgl_jax.srt.managers.tp_worker import ModelWorker
 from sgl_jax.srt.managers.tp_worker_overlap_thread import ModelWorkerClient
 from sgl_jax.srt.managers.utils import validate_input_length
+from sgl_jax.srt.mem_cache.base_prefix_cache import MatchPrefixParams
 from sgl_jax.srt.mem_cache.chunk_cache import ChunkCache
 from sgl_jax.srt.mem_cache.kv_cache_builder import build_kv_cache
+from sgl_jax.srt.mem_cache.radix_cache import RadixKey
 from sgl_jax.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.multimodal.tokenizer_utils import resolve_tokenizer_subdir
@@ -755,6 +761,27 @@ class Scheduler(
 
         return req_counts, token_counts
 
+    def _dp_load_and_eligible(
+        self, extra_counts: list[int], extra_token_counts: list[int]
+    ) -> tuple[list[int], list[int], list[int]]:
+        """Per-DP (running + pending) load and the ranks that can accept a request.
+
+        A rank is eligible when its batch is not full and it is under the
+        per-rank running cap. Returns ``(eligible_ranks, counts, token_counts)``.
+        """
+        running_counts, running_token_counts = self._get_dp_load_snapshot()
+        counts = [running_counts[i] + extra_counts[i] for i in range(self.dp_size)]
+        token_counts = [
+            running_token_counts[i] + extra_token_counts[i] for i in range(self.dp_size)
+        ]
+        eligible = [
+            dp_rank
+            for dp_rank in range(self.dp_size)
+            if not self.running_batch.reqs_info[dp_rank].batch_is_full
+            and counts[dp_rank] < self.per_dp_max_running_requests
+        ]
+        return eligible, counts, token_counts
+
     def _select_min_running_dp(
         self,
         extra_counts: list[int] | None = None,
@@ -772,24 +799,58 @@ class Scheduler(
         if extra_token_counts is None:
             extra_token_counts = [0] * self.dp_size
 
-        running_counts, running_token_counts = self._get_dp_load_snapshot()
-        counts = [running_counts[i] + extra_counts[i] for i in range(self.dp_size)]
-        token_counts = [
-            running_token_counts[i] + extra_token_counts[i] for i in range(self.dp_size)
-        ]
-
-        eligible = []
-        for dp_rank in range(self.dp_size):
-            if self.running_batch.reqs_info[dp_rank].batch_is_full:
-                continue
-            if counts[dp_rank] >= self.per_dp_max_running_requests:
-                continue
-            eligible.append(dp_rank)
-
+        eligible, counts, token_counts = self._dp_load_and_eligible(
+            extra_counts, extra_token_counts
+        )
         if not eligible:
             return None
 
         return min(eligible, key=lambda dp_rank: (counts[dp_rank], token_counts[dp_rank], dp_rank))
+
+    def _cached_prefix_len(self, token_ids: list[int], extra_key: str | None, dp_rank: int) -> int:
+        """Length of the longest cached prefix for ``token_ids`` on ``dp_rank``.
+
+        Probes the dp-keyed tree (no alloc, no CoW), but incurs the normal
+        ``match_prefix`` side effects (LRU refresh, possible node split). Returns
+        0 for non-radix caches (ChunkCache returns an empty match).
+        """
+        if self.tree_cache is None:
+            return 0
+        result = self.tree_cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(token_ids, extra_key, dp_rank))
+        )
+        return len(result.device_indices)
+
+    def _select_cache_aware_dp(
+        self,
+        req: TokenizedGenerateReqInput,
+        extra_counts: list[int],
+        extra_token_counts: list[int],
+    ) -> int | None:
+        """Route ``req`` by cache affinity with soft load balancing.
+
+        Probes each eligible rank's cached prefix length, then defers to
+        ``pick_cache_aware_dp``: balance on large load skew, else least-loaded
+        among the ranks holding a substantial cached prefix. Returns None if all
+        DP ranks are full.
+        """
+        if self.dp_size == 1:
+            return 0
+
+        eligible, counts, token_counts = self._dp_load_and_eligible(
+            extra_counts, extra_token_counts
+        )
+        if not eligible:
+            return None
+
+        token_ids, extra_key = req_prefix_match_key(req)
+        matches: dict[int, int] = {}
+        prompt_len = len(token_ids) if token_ids else 0
+        if token_ids:
+            for dp_rank in eligible:
+                matches[dp_rank] = self._cached_prefix_len(token_ids, extra_key, dp_rank)
+
+        return pick_cache_aware_dp(eligible, counts, token_counts, matches, prompt_len)
 
     def select_dp_for_request(self, recv_reqs: list[Req]) -> list[Req]:
         """Assign dp_rank to incoming requests using the configured DP policy.
@@ -838,10 +899,17 @@ class Scheduler(
                 ready_reqs.append(req)
                 continue
 
-            dp_rank = self._select_min_running_dp(
-                extra_counts=pending_counts,
-                extra_token_counts=pending_token_counts,
-            )
+            if self.dp_schedule_policy == "cache_aware":
+                dp_rank = self._select_cache_aware_dp(
+                    req,
+                    extra_counts=pending_counts,
+                    extra_token_counts=pending_token_counts,
+                )
+            else:
+                dp_rank = self._select_min_running_dp(
+                    extra_counts=pending_counts,
+                    extra_token_counts=pending_token_counts,
+                )
             if dp_rank is None:
                 # All DP ranks are full; keep the request pending.
                 self.pending_dp_reqs.append(req)

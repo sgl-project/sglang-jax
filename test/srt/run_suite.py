@@ -323,6 +323,7 @@ suites = {
         TestFile("python/sgl_jax/test/mem_cache/test_paged_allocator_multi_dp.py", 1),
         TestFile("python/sgl_jax/test/mem_cache/test_host_kv_pool.py", 1, runner="pytest"),
         TestFile("python/sgl_jax/test/test_kv_cache_builder.py", 0.1, runner="pytest"),
+        TestFile("test/srt/test_dp_schedule_policy.py", 0.2, runner="pytest"),
         TestFile("test/srt/function_call/test_qwen3_coder_detector.py", 0.1),
         TestFile("test/srt/function_call/test_glm4_moe_detector.py", 0.1),
         TestFile("test/srt/function_call/test_qwen25_detector.py", 0.1),
