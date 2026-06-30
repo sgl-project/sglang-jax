@@ -782,11 +782,11 @@ class ServerArgs:
             "--pd-disaggregation",
             dest="pd_disaggregation",
             nargs="?",
-            const="ici",
+            const="pathways",
             default="",
-            choices=["", "ici", "pathways"],
-            help="In-process P/D split: 'ici' = single-slice sub-mesh ppermute; "
-            "'pathways' = cross-slice IFRT device_put (requires Pathways proxy + >=2 slices).",
+            choices=["", "pathways"],
+            help="In-process P/D split: 'pathways' = single-controller cross-slice "
+            "IFRT device_put (requires Pathways proxy backend + >=2 slices).",
         )
         parser.add_argument(
             "--pd-prefill-mem-fraction",

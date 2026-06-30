@@ -318,17 +318,6 @@ class Scheduler(
                 self.dp_size, self.tp_size, self._pd_n_prefill
             )
             self.p_mesh = self.p_meshes[0]
-            self.full_mesh = None
-        elif self.pd:
-            from sgl_jax.srt.disaggregation.ici_pd import (
-                install_submesh_patches,
-                make_pd_meshes,
-            )
-
-            self.enable_overlap = False
-            server_args.disable_radix_cache = True
-            install_submesh_patches()
-            self.full_mesh, self.p_mesh, self.mesh = make_pd_meshes(self.dp_size, self.tp_size)
         else:
             self.mesh = create_device_mesh(
                 ici_parallelism=[self.dp_size, self.tp_size // self.dp_size],
@@ -355,8 +344,6 @@ class Scheduler(
         if self.pd:
             import copy as _copy
 
-            from sgl_jax.srt.disaggregation.ici_pd import ICIPDKVTransfer
-
             assert self.spec_algorithm is None or self.spec_algorithm.is_none()
             assert not getattr(server_args, "enable_mixed_chunk", False)
             d_mesh = self.mesh
@@ -378,7 +365,7 @@ class Scheduler(
             self.tp_workers_p = []
             self.p_r2ts, self.p_allocs, self.p_trees = [], [], []
             for i, pm in enumerate(p_meshes):
-                logger.info("[ici_pd] loading P worker %d/%d on %s", i, n_p, pm.shape)
+                logger.info("[pathways_pd] loading P worker %d/%d on %s", i, n_p, pm.shape)
                 # P worker stays sync (ModelWorker): prefill must finish writing
                 # KV into the P pool before gather_to_dmesh reads it.
                 w = ModelWorker(
@@ -408,7 +395,7 @@ class Scheduler(
                 self.p_allocs[0],
                 self.p_trees[0],
             )
-            logger.info("[ici_pd] loading D worker on %s", d_mesh.shape)
+            logger.info("[pathways_pd] loading D worker on %s", d_mesh.shape)
             os.environ["SGLANG_CI_SMALL_KV_SIZE"] = str(server_args.pd_decode_max_tokens)
             self.tp_worker = TpWorkerClass(
                 server_args=d_args,
@@ -473,12 +460,9 @@ class Scheduler(
                 ]
                 for t in self._pd_prefill_threads:
                     t.start()
-            else:
-                p_kv = self.tp_worker_p.model_runner.token_to_kv_pool
-                self.kv_transfer = ICIPDKVTransfer(self.full_mesh, self.p_mesh, d_mesh, p_kv, d_kv)
             self._pd_pending_migrate: ScheduleBatch | None = None
             logger.info(
-                "[ici_pd] n_prefill=%d P pool=%d tok, D pool=%d tok",
+                "[pathways_pd] n_prefill=%d P pool=%d tok, D pool=%d tok",
                 n_p,
                 self.tp_worker_p.max_total_num_tokens,
                 self.tp_worker.max_total_num_tokens,
@@ -2331,14 +2315,14 @@ class Scheduler(
             ret.accept_lens = batch_output.accept_lens
         return ret
 
-    # ---- ici_pd helpers ----
+    # ---- pathways_pd helpers ----
     def _pd_prefill_loop(self, p_idx: int = 0):
         """Pathways-PD async prefill thread: P-slice forward + cross-slice KV
         gather/device_put run here so the main loop never blocks on P mesh.
         scatter into D pool stays on the main thread (see _pd_drain_ready).
         Multi-P: one thread per P slice, each bound to its own
         worker/pool/transfer; main thread round-robins batches across queues."""
-        from sgl_jax.srt.disaggregation.ici_pd import slots_to_ordered_pages
+        from sgl_jax.srt.disaggregation.pathways_pd import slots_to_ordered_pages
 
         worker = self.tp_workers_p[p_idx]
         p_r2t = self.p_r2ts[p_idx]
@@ -2397,7 +2381,7 @@ class Scheduler(
         """Main-thread side of async PD: pop ONE ready item per call (avoid
         burst stalling decode), rewrite req state to D side, scatter, then
         process_prefill under D context so finished reqs release D pool."""
-        from sgl_jax.srt.disaggregation.ici_pd import slots_to_ordered_pages
+        from sgl_jax.srt.disaggregation.pathways_pd import slots_to_ordered_pages
 
         try:
             item = self._pd_ready_q.get_nowait()
@@ -2577,7 +2561,7 @@ class Scheduler(
         """把 batch（prefill 完成、已 filter 掉 chunked/finished）中的 reqs 从 P pool
         迁移到 D pool（KV ppermute + r2t/alloc/req 状态重写），使其可 merge 进 D
         running_batch。D pool 不够时返回 False（caller 应暂存等 D free）。"""
-        from sgl_jax.srt.disaggregation.ici_pd import migrate_reqs_p_to_d
+        from sgl_jax.srt.disaggregation.pathways_pd import migrate_reqs_p_to_d
 
         all_reqs = []
         for info in batch.reqs_info:
@@ -2612,7 +2596,7 @@ class Scheduler(
                 )
         if self.forward_ct % 50 == 0:
             logger.info(
-                "[ici_pd] migrate %d reqs in %.1fms (D avail=%d)",
+                "[pathways_pd] migrate %d reqs in %.1fms (D avail=%d)",
                 len(all_reqs),
                 (time.perf_counter() - t0) * 1e3,
                 self.token_to_kv_pool_allocator.available_size(),

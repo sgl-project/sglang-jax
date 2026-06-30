@@ -5,9 +5,6 @@ N slices via IFRT proxy. Build prefill_mesh on slice 0, decode_mesh on
 slice 1, run two ModelRunners. KV transfer = jax.device_put across meshes
 (IFRT runtime handles per-host DCN fan-out, ~14 GB/s/host on v7x vs ~4.5
 for jax.experimental.transfer on the same hardware).
-
-Reuses ici_pd's gather/scatter jit kernels; replaces the
-embed->ppermute->extract path with a single device_put.
 """
 
 from __future__ import annotations
@@ -21,13 +18,6 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from sgl_jax.srt.disaggregation.ici_pd import (
-    _NPG_BATCH_MAX,
-    _bucket_npg,
-    migrate_reqs_p_to_d,
-    slots_to_ordered_pages,
-)
-
 __all__ = [
     "group_by_slice",
     "make_slice_meshes",
@@ -37,6 +27,89 @@ __all__ = [
 ]
 
 logger = logging.getLogger(__name__)
+
+_NPG_BUCKETS = (8, 16, 32, 64)
+# Upper bound on pages per stacked transfer. 64pg x 78L x 80KB ~= 0.39 GB
+# transient HBM (x2 with the recv-side donate buffer) — fits the smallest
+# headroom we measured (v6e fp8: ~1.3 GB free after weights + KV + jit exec).
+_NPG_BATCH_MAX = 64
+
+
+def _bucket_npg(n: int) -> int:
+    for b in _NPG_BUCKETS:
+        if n <= b:
+            return b
+    return _NPG_BATCH_MAX
+
+
+def slots_to_ordered_pages(slots: np.ndarray, page_size: int) -> np.ndarray:
+    """Token slots -> page indices, deduped, preserving first-seen order.
+
+    PD forces disable_radix so a single req's slots are page-block contiguous
+    (== slots[::page_size]//page_size), but a chunked req can resume mid-page.
+    The generic dedup handles both.
+    """
+    pages = np.asarray(slots, np.int64) // page_size
+    _, first_idx = np.unique(pages, return_index=True)
+    return pages[np.sort(first_idx)].astype(np.int32)
+
+
+def migrate_reqs_p_to_d(
+    reqs: list,
+    page_size: int,
+    p_r2t,
+    p_alloc,
+    d_r2t,
+    d_alloc,
+    kv_transfer,
+) -> None:
+    """Migrate reqs whose prefill finished from P pool into D pool.
+
+    Per req: read P slots -> alloc page-aligned D slots + req_pool_idx ->
+    rewrite req.{req_pool_idx, prefix_indices, kv_committed_len} -> free P.
+    Page pairs are accumulated then transferred in one batched kv_transfer.
+    """
+    if not reqs:
+        return
+    p_pages_all, d_pages_all = [], []
+    for r in reqs:
+        seq_len = len(r.fill_ids)
+        p_idx_old = r.req_pool_idx
+        p_slots = p_r2t.req_to_token[p_idx_old, :seq_len].copy()
+        p_pages = slots_to_ordered_pages(p_slots, page_size)
+        n_pages = len(p_pages)
+
+        d_slots = d_alloc.alloc(n_pages * page_size, dp_rank=r.dp_rank or 0)
+        if d_slots is None:
+            raise RuntimeError(
+                f"[pathways_pd] D pool OOM during migrate: need {n_pages} pages, "
+                f"avail {d_alloc.available_size()}"
+            )
+        d_pages = slots_to_ordered_pages(d_slots, page_size)
+        # Remap by in-page offset: token at P-page k offset o -> D-page k offset o.
+        p_slots64 = np.asarray(p_slots, np.int64)
+        offsets = p_slots64 % page_size
+        page_pos = {int(pg): k for k, pg in enumerate(p_pages)}
+        tok_page_k = np.array([page_pos[int(s)] for s in p_slots64 // page_size], np.int64)
+        d_slot_per_tok = (d_pages[tok_page_k].astype(np.int64) * page_size + offsets).astype(
+            np.int32
+        )
+
+        p_alloc.free(p_slots, dp_rank=r.dp_rank or 0)
+        p_r2t.free_slots.append(p_idx_old)
+        r.req_pool_idx = None
+        d_r2t.alloc([r])
+        d_r2t.req_to_token[r.req_pool_idx, :seq_len] = d_slot_per_tok
+        r.prefix_indices = d_slot_per_tok
+        r.last_node = None
+        r.cache_protected_len = 0
+        r.kv_committed_len = seq_len
+        r.kv_allocated_len = seq_len
+
+        p_pages_all.append(p_pages)
+        d_pages_all.append(d_pages)
+
+    kv_transfer.transfer(np.concatenate(p_pages_all), np.concatenate(d_pages_all))
 
 
 def group_by_slice(devs: list) -> dict[int, list]:
