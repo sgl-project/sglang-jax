@@ -55,9 +55,7 @@ def cleanup_model_cache():
                 model_path = os.path.join(shm_dir, item)
                 if os.path.isdir(model_path):
                     try:
-                        print(
-                            f"\nCleaning up model cache at {model_path}...", flush=True
-                        )
+                        print(f"\nCleaning up model cache at {model_path}...", flush=True)
                         shutil.rmtree(model_path)
                         print("Model cache cleaned successfully.\n", flush=True)
                     except Exception as e:
@@ -192,9 +190,7 @@ def run_unittest_files(
             return process.returncode
 
         try:
-            ret_code = run_with_timeout(
-                run_one_file, args=(filename,), timeout=timeout_per_file
-            )
+            ret_code = run_with_timeout(run_one_file, args=(filename,), timeout=timeout_per_file)
             if ret_code != 0 and reruns > 0:
                 # pytest exit 1 = test case failures already retried by pytest-rerunfailures;
                 # only file-level retry on infrastructure errors (exit 2/3/5)
@@ -216,9 +212,7 @@ def run_unittest_files(
                                 flush=True,
                             )
                             break
-            assert (
-                ret_code == 0
-            ), f"expected return code 0, but {filename} returned {ret_code}"
+            assert ret_code == 0, f"expected return code 0, but {filename} returned {ret_code}"
         except TimeoutError:
             kill_process_tree(process.pid)
             time.sleep(5)
@@ -265,12 +259,8 @@ suites = {
     ],
     "sglang_dependency_test": [],
     "unit-test-tpu-v6e-1": [
-        TestFile(
-            "python/sgl_jax/test/kernels/quantized_linear_test.py", 0.3, runner="pytest"
-        ),
-        TestFile(
-            "python/sgl_jax/test/kernels/moe_block_quant_test.py", 0.2, runner="pytest"
-        ),
+        TestFile("python/sgl_jax/test/kernels/quantized_linear_test.py", 0.3, runner="pytest"),
+        TestFile("python/sgl_jax/test/kernels/moe_block_quant_test.py", 0.2, runner="pytest"),
         TestFile("python/sgl_jax/test/test_flashattention_mha.py", 11),
         TestFile("python/sgl_jax/test/test_flashattention_gqa.py", 11),
         TestFile("python/sgl_jax/test/test_flashattention_misc.py", 7),
@@ -282,25 +272,17 @@ suites = {
         TestFile("python/sgl_jax/test/test_sampler_deterministic_cond.py", 0.3),
         TestFile("python/sgl_jax/test/test_utils.py", 0.1),
         TestFile("python/sgl_jax/test/mem_cache/test_kv_cache.py", 0.7),
-        TestFile(
-            "python/sgl_jax/test/mem_cache/test_hicache_e2e_tpu.py", 1, runner="pytest"
-        ),
+        TestFile("python/sgl_jax/test/mem_cache/test_hicache_e2e_tpu.py", 1, runner="pytest"),
         TestFile("python/sgl_jax/test/speculative/test_eagle_tree_build.py", 0.2),
         TestFile("python/sgl_jax/test/speculative/test_eagle_utils.py", 0.2),
         TestFile("python/sgl_jax/test/multimodal/test_wan_vae_precision.py", 0.5),
         TestFile("python/sgl_jax/test/multimodal/test_vae_scheduler.py", 0.2),
         TestFile("python/sgl_jax/test/multimodal/test_flash_attention_kernel.py", 0.1),
-        TestFile(
-            "python/sgl_jax/test/layers/test_group_rmsnorm.py", 0.1, runner="pytest"
-        ),
+        TestFile("python/sgl_jax/test/layers/test_group_rmsnorm.py", 0.1, runner="pytest"),
         TestFile("test/srt/lora/test_bgmv_backend.py", 7),
         TestFile("test/srt/lora/test_align_lora_accuracy.py", 5.5),
-        TestFile(
-            "python/sgl_jax/test/kernels/simple_gla_fused_test.py", 1, runner="pytest"
-        ),
-        TestFile(
-            "python/sgl_jax/test/layers/test_merged_column_parallel_linear.py", 0.1
-        ),
+        TestFile("python/sgl_jax/test/kernels/simple_gla_fused_test.py", 1, runner="pytest"),
+        TestFile("python/sgl_jax/test/layers/test_merged_column_parallel_linear.py", 0.1),
     ],
     # CPU-only unit tests — moved off arc-runner-v6e-1 to a dedicated
     # CPU runner so they don't consume TPU capacity. Either pure
@@ -333,12 +315,8 @@ suites = {
         TestFile("test/srt/test_dtype_config_consistency.py", 10),
         TestFile("python/sgl_jax/test/test_compilation_manager.py", 1),
         TestFile("python/sgl_jax/test/test_kernel_utils.py", 1),
-        TestFile(
-            "python/sgl_jax/test/speculative/test_spec_info.py", 0.2, runner="pytest"
-        ),
-        TestFile(
-            "python/sgl_jax/test/models/test_mimo_v2_nextn.py", 0.2, runner="pytest"
-        ),
+        TestFile("python/sgl_jax/test/speculative/test_spec_info.py", 0.2, runner="pytest"),
+        TestFile("python/sgl_jax/test/models/test_mimo_v2_nextn.py", 0.2, runner="pytest"),
         TestFile(
             "python/sgl_jax/test/multimodal/test_kimi_k25_weight_mapping.py",
             0.2,
@@ -353,17 +331,13 @@ suites = {
         TestFile("python/sgl_jax/test/mem_cache/test_unified_radix_cache.py", 1),
         TestFile("python/sgl_jax/test/mem_cache/test_unified_radix_tree_flag.py", 1),
         TestFile("python/sgl_jax/test/mem_cache/test_paged_allocator_multi_dp.py", 1),
-        TestFile(
-            "python/sgl_jax/test/mem_cache/test_host_kv_pool.py", 1, runner="pytest"
-        ),
+        TestFile("python/sgl_jax/test/mem_cache/test_host_kv_pool.py", 1, runner="pytest"),
         TestFile(
             "python/sgl_jax/test/mem_cache/test_hicache_controller.py",
             0.5,
             runner="pytest",
         ),
-        TestFile(
-            "python/sgl_jax/test/mem_cache/test_hicache_e2e.py", 5, runner="pytest"
-        ),
+        TestFile("python/sgl_jax/test/mem_cache/test_hicache_e2e.py", 5, runner="pytest"),
         TestFile("python/sgl_jax/test/test_kv_cache_builder.py", 0.1, runner="pytest"),
         TestFile("test/srt/test_dp_schedule_policy.py", 0.2, runner="pytest"),
         TestFile("test/srt/function_call/test_qwen3_coder_detector.py", 0.1),
@@ -390,13 +364,9 @@ suites = {
         TestFile("python/sgl_jax/test/test_kda_attention_dp.py", 6),
         TestFile("python/sgl_jax/test/test_gdn_attention.py", 6.5),
         TestFile("python/sgl_jax/test/test_gdn_attention_dp.py", 6),
-        TestFile(
-            "python/sgl_jax/test/layers/test_lightning_backend.py", 8, runner="pytest"
-        ),
+        TestFile("python/sgl_jax/test/layers/test_lightning_backend.py", 8, runner="pytest"),
         TestFile("test/srt/test_moe_block_quant_e2e.py", 1.5, runner="pytest"),
-        TestFile(
-            "python/sgl_jax/test/mem_cache/test_host_kv_pool_tpu.py", 1, runner="pytest"
-        ),
+        TestFile("python/sgl_jax/test/mem_cache/test_host_kv_pool_tpu.py", 1, runner="pytest"),
         TestFile(
             "python/sgl_jax/test/mem_cache/test_host_kv_pool_tpu_dp.py",
             1,
@@ -463,9 +433,7 @@ suites = {
             2,
             runner="pytest",
         ),
-        TestFile(
-            "test/srt/quantization/test_w8_moe_block_linear_channel_quantization.py", 3
-        ),
+        TestFile("test/srt/quantization/test_w8_moe_block_linear_channel_quantization.py", 3),
         # TestFile("test/srt/test_engine_determine_generation.py", 5),
         # ^ Disabled in DP merge: asserts bit-exact equivalence between baseline,
         #   retract, and abort+regenerate generation paths under temperature=0.
@@ -591,11 +559,7 @@ if __name__ == "__main__":
     args = arg_parser.parse_args()
     print(f"{args=}")
 
-    files = (
-        glob.glob("**/test_*.py", recursive=True)
-        if args.suite == "all"
-        else suites[args.suite]
-    )
+    files = glob.glob("**/test_*.py", recursive=True) if args.suite == "all" else suites[args.suite]
 
     if args.auto_partition_size:
         files = auto_partition(files, args.auto_partition_id, args.auto_partition_size)

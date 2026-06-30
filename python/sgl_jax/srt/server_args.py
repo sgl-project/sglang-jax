@@ -289,9 +289,7 @@ class ServerArgs:
 
         from sgl_jax.srt.disaggregation.pd_auth import resolve_secret
 
-        self.disaggregation_shared_secret = resolve_secret(
-            self.disaggregation_shared_secret
-        )
+        self.disaggregation_shared_secret = resolve_secret(self.disaggregation_shared_secret)
         if self.disaggregation_host_ip is not None:
             self.disaggregation_host_ip = _validate_disaggregation_host_ip(
                 self.disaggregation_host_ip
@@ -328,9 +326,9 @@ class ServerArgs:
             self.chunked_prefill_size = 4096
 
         # GGUF
-        if (
-            self.load_format == "auto" or self.load_format == "gguf"
-        ) and check_gguf_file(self.model_path):
+        if (self.load_format == "auto" or self.load_format == "gguf") and check_gguf_file(
+            self.model_path
+        ):
             self.quantization = self.load_format = "gguf"
 
         if is_remote_url(self.model_path):
@@ -364,10 +362,7 @@ class ServerArgs:
                     self.dtype_config = json.load(f)
 
         # Normalize speculative_algorithm: treat empty string as None
-        if (
-            isinstance(self.speculative_algorithm, str)
-            and self.speculative_algorithm.strip() == ""
-        ):
+        if isinstance(self.speculative_algorithm, str) and self.speculative_algorithm.strip() == "":
             self.speculative_algorithm = None
 
         os.environ["SGLANG_ENABLE_DETERMINISTIC_SAMPLING"] = (
@@ -388,9 +383,7 @@ class ServerArgs:
             self.enable_unified_radix_tree = True
             self.disable_radix_cache = False
             if self.hicache_ratio <= 0:
-                raise ValueError(
-                    f"hicache_ratio must be positive, got {self.hicache_ratio}"
-                )
+                raise ValueError(f"hicache_ratio must be positive, got {self.hicache_ratio}")
             if self.hicache_write_policy not in (
                 "write_through",
                 "write_through_selective",
@@ -402,9 +395,7 @@ class ServerArgs:
                 )
 
         if self.nnodes > 1 and self.device_indexes is not None:
-            logger.warning(
-                "In a multi-machine scenario, device_indexes will be set to None."
-            )
+            logger.warning("In a multi-machine scenario, device_indexes will be set to None.")
             self.device_indexes = None
         if self.multimodal:
             self.model_path = download_from_hf(self.model_path, allow_patterns=None)
@@ -412,10 +403,7 @@ class ServerArgs:
         if self.ep_num_redundant_experts < 0:
             raise ValueError("ep_num_redundant_experts must be non-negative")
 
-        if (
-            self.enable_expert_balance_debug
-            and self.expert_balance_segment_counter <= 0
-        ):
+        if self.enable_expert_balance_debug and self.expert_balance_segment_counter <= 0:
             raise ValueError("expert_balance_segment_counter must be positive")
 
         if self.enable_expert_balance_debug and not self.expert_balance_output_file:
@@ -482,9 +470,7 @@ class ServerArgs:
                     ServerArgs.disaggregation_enable_d2h,
                 ),
             ]
-            non_default = [
-                name for name, value, default in pd_overrides if value != default
-            ]
+            non_default = [name for name, value, default in pd_overrides if value != default]
             if non_default:
                 logger.warning(
                     "--disaggregation-mode=null ignores PD options: %s",
@@ -1498,8 +1484,7 @@ class ServerArgs:
             "--disaggregation-orphan-reaper-interval-seconds",
             type=float,
             default=ServerArgs.disaggregation_orphan_reaper_interval_seconds,
-            help="How often the background reaper scans for orphan "
-            "senders/receivers.",
+            help="How often the background reaper scans for orphan " "senders/receivers.",
         )
         parser.add_argument(
             "--disaggregation-decode-watchdog-seconds",
@@ -1600,9 +1585,7 @@ class ServerArgs:
         return hf_config
 
     def check_server_args(self):
-        assert (
-            self.tp_size
-        ) % self.nnodes == 0, "tp_size must be divisible by number of nodes"
+        assert (self.tp_size) % self.nnodes == 0, "tp_size must be divisible by number of nodes"
 
         # Check chunked prefill
         # Skip validation if chunked prefill is disabled (i.e., size <= 0).
@@ -1715,9 +1698,7 @@ class ServerArgs:
 
                                     name = os.path.basename(item.rstrip("/"))
                                     normalized_lora_refs.append(
-                                        LoRARef(
-                                            lora_name=name, lora_path=item, pinned=True
-                                        )
+                                        LoRARef(lora_name=name, lora_path=item, pinned=True)
                                     )
                             elif isinstance(item, dict):
                                 # Dict format in list: {"name": "adapter1", "path": "/path/to/adapter"}
@@ -1725,17 +1706,13 @@ class ServerArgs:
                                 path = item.get("path") or item.get("lora_path")
                                 pinned = item.get("pinned", True)
                                 normalized_lora_refs.append(
-                                    LoRARef(
-                                        lora_name=name, lora_path=path, pinned=pinned
-                                    )
+                                    LoRARef(lora_name=name, lora_path=path, pinned=pinned)
                                 )
                             elif hasattr(item, "lora_name"):
                                 # Already a LoRARef object
                                 normalized_lora_refs.append(item)
                             else:
-                                raise ValueError(
-                                    f"Unsupported lora_paths item format: {item}"
-                                )
+                                raise ValueError(f"Unsupported lora_paths item format: {item}")
 
                     self.lora_paths = normalized_lora_refs
 
@@ -1794,13 +1771,9 @@ class PortArgs:
             rpc_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
             metrics_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
             pub_sub_addr=(
-                f"tcp://{dist_init_host}:{port_base + 4}"
-                if server_args.nnodes > 1
-                else None
+                f"tcp://{dist_init_host}:{port_base + 4}" if server_args.nnodes > 1 else None
             ),
             pub_sub_sync_addr=(
-                f"tcp://{dist_init_host}:{port_base + 5}"
-                if server_args.nnodes > 1
-                else None
+                f"tcp://{dist_init_host}:{port_base + 5}" if server_args.nnodes > 1 else None
             ),
         )

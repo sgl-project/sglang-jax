@@ -45,9 +45,7 @@ class FullComponent(TreeComponent):
             )
         return lambda node: node.component_data[ct].value is not None
 
-    def redistribute_on_node_split(
-        self, new_parent: UnifiedTreeNode, child: UnifiedTreeNode
-    ):
+    def redistribute_on_node_split(self, new_parent: UnifiedTreeNode, child: UnifiedTreeNode):
         ct = self.component_type
         new_parent.component_data[ct].lock_ref = child.component_data[ct].lock_ref
         child_cd = child.component_data[ct]
@@ -62,9 +60,7 @@ class FullComponent(TreeComponent):
                 split_len % PS == 0
             ), f"node split at non-page-aligned len {split_len} (page_size={PS})"
             split_pages = split_len // PS
-            new_parent.component_data[ct].host_value = child_cd.host_value[
-                :split_pages
-            ].copy()
+            new_parent.component_data[ct].host_value = child_cd.host_value[:split_pages].copy()
             child_cd.host_value = child_cd.host_value[split_pages:].copy()
 
     def evict_component(
@@ -76,14 +72,10 @@ class FullComponent(TreeComponent):
         freed = 0
 
         if EvictLayer.DEVICE in target and cd.value is not None:
-            node_dp_rank = (
-                node.key.dp_rank if node.key and node.key.dp_rank is not None else 0
-            )
+            node_dp_rank = node.key.dp_rank if node.key and node.key.dp_rank is not None else 0
             freed = len(cd.value)
             self._free_full(cd.value, dp_rank=node_dp_rank)
-            self.cache.component_evictable_size_[self.component_type][
-                node_dp_rank
-            ] -= freed
+            self.cache.component_evictable_size_[self.component_type][node_dp_rank] -= freed
             # NOTE: cd.value = None is deferred to _cascade_evict (Full as trigger)
             # because SWA's free_swa still needs to read Full.value.
         return freed, 0
@@ -91,9 +83,7 @@ class FullComponent(TreeComponent):
     def eviction_priority(self, is_leaf: bool) -> int:
         return 0 if is_leaf else 2
 
-    def drive_eviction(
-        self, params: EvictParams, tracker: dict[ComponentType, int]
-    ) -> None:
+    def drive_eviction(self, params: EvictParams, tracker: dict[ComponentType, int]) -> None:
         request = params.num_tokens
         dp_rank = params.dp_rank
         # UnifiedTreeNode.__lt__ compares last_access_time, so heapifying the
@@ -133,11 +123,7 @@ class FullComponent(TreeComponent):
             if cd.value is not None:
                 if cd.lock_ref == 0:
                     key_len = len(cd.value)
-                    cur_dp_rank = (
-                        cur.key.dp_rank
-                        if cur.key and cur.key.dp_rank is not None
-                        else 0
-                    )
+                    cur_dp_rank = cur.key.dp_rank if cur.key and cur.key.dp_rank is not None else 0
                     self.cache.component_evictable_size_[ct][cur_dp_rank] -= key_len
                     self.cache.component_protected_size_[ct][cur_dp_rank] += key_len
                     # This repo's convention (RadixCache.inc_lock_ref): delta is the
@@ -169,9 +155,7 @@ class FullComponent(TreeComponent):
             # Mirror acquire: token accounting only for live nodes.
             if cd.value is not None and cd.lock_ref == 1:
                 key_len = len(cd.value)
-                cur_dp_rank = (
-                    cur.key.dp_rank if cur.key and cur.key.dp_rank is not None else 0
-                )
+                cur_dp_rank = cur.key.dp_rank if cur.key and cur.key.dp_rank is not None else 0
                 self.cache.component_evictable_size_[ct][cur_dp_rank] += key_len
                 self.cache.component_protected_size_[ct][cur_dp_rank] -= key_len
             cd.lock_ref -= 1

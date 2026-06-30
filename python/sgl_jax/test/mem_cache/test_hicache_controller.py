@@ -61,9 +61,7 @@ class _FakePool:
     (host transfer, worker thread), so the blocking/raising behaviour that
     models the slow worker lives in flush_backup."""
 
-    def __init__(
-        self, *, block_event: threading.Event | None = None, raise_on_copy=False
-    ):
+    def __init__(self, *, block_event: threading.Event | None = None, raise_on_copy=False):
         self.block_event = block_event
         self.raise_on_copy = raise_on_copy
         self.copy_into_calls = []
@@ -102,9 +100,7 @@ class _FakeLoadPool:
     controller's in-flight guard (flush before the stage finishes) is observable,
     or raise to exercise error propagation through drain_loads/check_load_status."""
 
-    def __init__(
-        self, *, stage_gate: threading.Event | None = None, raise_on_stage=False
-    ):
+    def __init__(self, *, stage_gate: threading.Event | None = None, raise_on_stage=False):
         self.stage_gate = stage_gate
         self.raise_on_stage = raise_on_stage
         self.staged = []

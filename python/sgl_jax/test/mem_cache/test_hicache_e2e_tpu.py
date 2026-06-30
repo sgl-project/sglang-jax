@@ -72,9 +72,7 @@ class TestHiCacheE2ETPU(unittest.TestCase):
                 dp_size=1,
             )
             if self.PAGE_SIZE > 1
-            else TokenToKVPoolAllocator(
-                size=self.DEVICE_SIZE, kvcache=self.kv_cache, dp_size=1
-            )
+            else TokenToKVPoolAllocator(size=self.DEVICE_SIZE, kvcache=self.kv_cache, dp_size=1)
         )
         self.req_pool = ReqToTokenPool(size=64, max_context_len=512, dtype=np.int32)
         self.cache = UnifiedRadixCache(
@@ -154,9 +152,7 @@ class TestHiCacheE2ETPU(unittest.TestCase):
         return avail, evict, prot
 
     def _load_back(self, host_node, hit_len, mem_quota):
-        new_idx, last, plan = self.cache.init_load_back(
-            host_node, hit_len, mem_quota=mem_quota
-        )
+        new_idx, last, plan = self.cache.init_load_back(host_node, hit_len, mem_quota=mem_quota)
         self.cache.finish_load_back(plan)
         return new_idx, last
 
@@ -167,9 +163,7 @@ class TestHiCacheE2ETPU(unittest.TestCase):
         tokens = [10, 11, 12, 13]
         idx, orig = self._fill(len(tokens), seed=1)
         self.cache.insert(InsertParams(key=self._key(tokens), value=idx))
-        self.cache.insert(
-            InsertParams(key=self._key(tokens), value=idx)
-        )  # trigger backup
+        self.cache.insert(InsertParams(key=self._key(tokens), value=idx))  # trigger backup
         self._settle()
 
         # Verify host_value is set and memory_kind is pinned_host.
@@ -189,16 +183,12 @@ class TestHiCacheE2ETPU(unittest.TestCase):
         self.assertEqual(mr.host_hit_length, len(tokens))
 
         # Load-back restores bit-exact.
-        new_idx, _ = self._load_back(
-            mr.last_host_node, mr.host_hit_length, self.DEVICE_SIZE
-        )
+        new_idx, _ = self._load_back(mr.last_host_node, mr.host_hit_length, self.DEVICE_SIZE)
         self.assertEqual(len(new_idx), len(tokens))
         self.assertFalse(node.evicted)
         for i, dev_idx in enumerate(new_idx):
             for layer in range(self.LAYER_NUM):
-                np.testing.assert_allclose(
-                    self._read_token(layer, dev_idx), orig[i][layer]
-                )
+                np.testing.assert_allclose(self._read_token(layer, dev_idx), orig[i][layer])
 
     def test_tombstone_revival_and_token_conservation(self):
         """Re-insert revives tombstone in place; token accounting stays balanced."""
@@ -267,14 +257,10 @@ class TestHiCacheE2ETPU(unittest.TestCase):
         # Load-back restores bit-exact.
         mr = self.cache.match_prefix(MatchPrefixParams(key=self._key(tokens)))
         self.assertEqual(mr.host_hit_length, len(tokens))
-        new_idx, _ = self._load_back(
-            mr.last_host_node, mr.host_hit_length, self.DEVICE_SIZE
-        )
+        new_idx, _ = self._load_back(mr.last_host_node, mr.host_hit_length, self.DEVICE_SIZE)
         for i, dev_idx in enumerate(new_idx):
             for layer in range(self.LAYER_NUM):
-                np.testing.assert_allclose(
-                    self._read_token(layer, dev_idx), orig[i][layer]
-                )
+                np.testing.assert_allclose(self._read_token(layer, dev_idx), orig[i][layer])
 
 
 class TestHiCacheE2ETPUPage4(TestHiCacheE2ETPU):
