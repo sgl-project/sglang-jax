@@ -433,8 +433,13 @@ class TestPrefillDecodeConsistency(unittest.TestCase):
         _load_weights(model, self._weights, self._cfg, self._mesh)
         return model
 
-    def _prefill_decode_rows(self, dtype):
+    def _prefill_decode_rows(self, dtype, page_size=None):
         """Run full-prefill vs autoregressive-decode chain at ``dtype``.
+
+        page_size: KV pool page size. bf16 needs an EVEN-derived bkv_sz (RPA v3 packs 2
+        bf16 values into 32-bit: kernel asserts bkv_sz % kv_packing == 0). The default odd
+        page_size (=T) yields bkv_sz=max_kv//2 odd and the bf16 kernel asserts; pass an even
+        page_size (e.g. 4) for bf16. fp32 (kv_packing=1) is unaffected.
 
         Protocol (per position k):
           1. Reference: one full EXTEND prefill of T = PREFIX_LEN + DECODE_STEPS tokens on
@@ -449,11 +454,11 @@ class TestPrefillDecodeConsistency(unittest.TestCase):
         token_ids = jnp.array(np.random.default_rng(42).integers(0, _VOCAB, T), dtype=jnp.int32)
         model = self._build_and_load(dtype)
 
-        pool_ref = _make_kv_pool(self._cfg, self._mesh, dtype, T)
+        pool_ref = _make_kv_pool(self._cfg, self._mesh, dtype, T, page_size=page_size)
         prefill_logits = _run_prefill_all_positions(model, self._mesh, pool_ref, token_ids)
         jax.block_until_ready(prefill_logits)
 
-        pool_dec = _make_kv_pool(self._cfg, self._mesh, dtype, T)
+        pool_dec = _make_kv_pool(self._cfg, self._mesh, dtype, T, page_size=page_size)
         _run_prefill_all_positions(model, self._mesh, pool_dec, token_ids[:_PREFIX_LEN])
 
         rows = []
@@ -510,7 +515,7 @@ class TestPrefillDecodeConsistency(unittest.TestCase):
         exceeds the band, the printed max_abs/rel is the measured floor to recalibrate against
         (doc §2.5). fp32 (above) already proved the logic; this guards the bf16 regime.
         """
-        rows = self._prefill_decode_rows(jnp.bfloat16)
+        rows = self._prefill_decode_rows(jnp.bfloat16, page_size=4)
         self._print_pd_rows("bf16", rows)
         n_flip = sum(ap != ad for _, ap, ad, *_ in rows)
         print(f" argmax flips (bf16, near-tie expected): {n_flip}/{len(rows)}")
@@ -693,13 +698,15 @@ class TestDecodeFlashVsNaive(unittest.TestCase):
     # fp32 (above) proves the logic; these guard the bf16 decode kernel. argmax flips within
     # the single-stage band are near-tie (doc §3.1/P6); the numeric band _RTOL_ATTN is the gate.
     def test_decode_flash_equals_naive_full_attention_bf16(self):
-        self._check_layer(0, "full_attention", dtype=jnp.bfloat16)
+        self._check_layer(0, "full_attention", page_size=4, dtype=jnp.bfloat16)
 
     def test_decode_flash_equals_naive_sliding_attention_bf16(self):
-        self._check_layer(1, "sliding_attention W=16", dtype=jnp.bfloat16)
+        self._check_layer(1, "sliding_attention W=16", page_size=4, dtype=jnp.bfloat16)
 
     def test_decode_flash_equals_naive_sliding_window_edge_bf16(self):
-        self._check_layer(1, "sliding W-edge prefix=20", prefix_len=20, dtype=jnp.bfloat16)
+        self._check_layer(
+            1, "sliding W-edge prefix=20", prefix_len=20, page_size=4, dtype=jnp.bfloat16
+        )
 
     def test_decode_flash_equals_naive_multipage_bf16(self):
         self._check_layer(0, "full multipage page_size=4", page_size=4, dtype=jnp.bfloat16)
