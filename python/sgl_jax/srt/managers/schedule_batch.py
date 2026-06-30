@@ -872,6 +872,21 @@ class ScheduleBatch:
     def batch_is_full(self) -> bool:
         return all(info.batch_is_full for info in self.reqs_info)
 
+    def contains_mm_inputs(self) -> bool:
+        """Whether any request in this batch carries multimodal inputs.
+
+        Mirrors the per-req mm detection used by ``_merge_multimodal`` /
+        ``build_mm_embed_plan``: a req is multimodal iff it has ``mm_inputs``.
+        Reused by the scheduler-side gates (mrope: extend|decode; vision:
+        extend-only) so pure-text batches short-circuit all mm work (spec §2.1).
+        """
+        return any(
+            getattr(req, "mm_inputs", None) is not None
+            for info in self.reqs_info
+            if info.reqs
+            for req in info.reqs
+        )
+
     def batch_size(self) -> int:
         """Get total number of requests across all DP ranks."""
         return sum(len(info.reqs) if info.reqs else 0 for info in self.reqs_info)
@@ -2662,13 +2677,20 @@ class ScheduleBatch:
         # host-only ModelWorkerBatch field; its array leaves are device_put in
         # ForwardBatch.init_new and consumed by mm_embed_routine (outside the
         # backbone JIT). None for non-multimodal / text-only batches.
-        mm_embed_plan = build_mm_embed_plan(
-            self.reqs_info,
-            self.dp_size,
-            self.model_config,
-            per_dp_token_padding,
-            total_token_size,
-        )
+        #
+        # Two-layer gate (spec §2.1): vision encode is prefill-only, so the plan
+        # is only built on multimodal EXTEND batches. (mrope above is gated
+        # separately inside _merge_multimodal over extend|decode.)
+        if self.contains_mm_inputs() and self.forward_mode.is_extend():
+            mm_embed_plan = build_mm_embed_plan(
+                self.reqs_info,
+                self.dp_size,
+                self.model_config,
+                per_dp_token_padding,
+                total_token_size,
+            )
+        else:
+            mm_embed_plan = None
 
         # Merge per-DP top_logprobs_nums / token_ids_logprobs with the same
         # offset_bs += per_dp_bs_padding padding scheme used in _merge_batch_metadata.
@@ -3025,43 +3047,61 @@ def _build_merge_idx(
     out_rows_k: int,
     sms2: int,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Minimal ``src_idx``/``mask`` for the simple per-rank-aligned case.
+    """Build ``src_idx``/``mask`` for round-k images, translating REQ-LOCAL
+    placeholder offsets into GLOBAL token positions.
 
     Token layout mirrors ``_merge_input_and_positions``: rank ``r`` owns the
-    contiguous slot ``[r * per_dp_token : (r + 1) * per_dp_token]``. Round-k
-    features (flat ``[dp * out_rows_k, H]``) place rank ``r``'s single image at
-    rows ``[r * out_rows_k : (r + 1) * out_rows_k]``; the local feature row
-    counts ``0 .. out_rows_k - 1`` within that block.
+    contiguous slot ``[r * per_dp_token : (r + 1) * per_dp_token]``, and within
+    that slot the rank's reqs are concatenated in order. The merge JIT
+    (``jitted_mm_merge``) runs inside a ``P("data")`` shard and gathers
+    ``features[src_idx]`` where each shard only sees its OWN rank's
+    ``[out_rows_k, H]`` features. Therefore ``src_idx`` carries **rank-local**
+    feature row numbers (``0 .. out_rows_k - 1``), NOT a global block offset
+    (spec invariant ①). ``mask`` stays a global ``[total_token]`` positional
+    bool; ``src_idx`` is also global ``[total_token]`` in SHAPE, but its VALUES
+    are rank-local rows (non-placeholder tokens carry 0, paired with mask=False).
 
-    For each rank's round-k image we use ``item.offsets`` (inclusive ``(start,
-    end)`` spans, rank-local token positions) to mark which tokens this image
-    fills, in order, and point them at consecutive feature rows.
+    Each ``rank_items_round_k[r]`` is a ``(item, req_base, prefix_len)`` tuple
+    (or ``None`` for a dummy lane). ``item.offsets`` are inclusive ``(start,
+    end)`` spans in **req-local** token positions (relative to that req's
+    ``input_ids`` start). They are translated to the global token axis as::
 
-    # TODO(stage1): full T_r bookkeeping for multi-req packing + bucket
-    #   alignment. This version assumes a single image per rank per round whose
-    #   placeholder offsets are already rank-local and contiguous-enough that
-    #   sequential feature-row numbering is correct; it does not reconcile
-    #   multiple reqs packed on one rank or token-axis bucket padding shifts.
+        extend_pos = offset - prefix_len      # drop into the extend window
+        tok = rank_base + req_base + extend_pos
+
+    where ``rank_base = r * per_dp_token`` and ``req_base`` is the running
+    prefix-sum of ``extend_input_len`` over the reqs packed before this one on
+    rank ``r`` (computed in ``build_mm_embed_plan``). Placeholders that fall
+    inside the already-cached prefix (``extend_pos < 0``) are skipped — those
+    tokens are not part of the extend window and must not be re-merged. This
+    supports multiple reqs packed on one rank AND prefix-cache windows; it
+    replaces the earlier assumption that offsets were already rank-local.
     """
     total_token = dp_size * per_dp_token
     src_idx = np.zeros(total_token, dtype=np.int32)
     mask = np.zeros(total_token, dtype=np.bool_)
 
     for dp_rank in range(dp_size):
-        item = rank_items_round_k[dp_rank] if dp_rank < len(rank_items_round_k) else None
-        if item is None:
+        entry = rank_items_round_k[dp_rank] if dp_rank < len(rank_items_round_k) else None
+        if entry is None:
             continue  # dummy lane: contributes nothing (mask stays False)
-        base_token = dp_rank * per_dp_token
-        base_feat = dp_rank * out_rows_k
+        item, req_base, prefix_len = entry
+        rank_base = dp_rank * per_dp_token
         feat_row = 0
         for start, end in _mm_item_offsets(item):
-            for local_pos in range(int(start), int(end) + 1):
-                tok = base_token + local_pos
-                if tok >= base_token + per_dp_token or feat_row >= out_rows_k:
-                    # Out of this rank's token slot or feature block: skip
-                    # (stage1 guard; full bookkeeping is a TODO above).
+            for o in range(int(start), int(end) + 1):
+                extend_pos = o - prefix_len
+                if extend_pos < 0:
+                    # Placeholder lives in the already-cached prefix: not in the
+                    # extend window, so it carries no fresh feature row.
+                    continue
+                tok = rank_base + req_base + extend_pos
+                if tok >= rank_base + per_dp_token or feat_row >= out_rows_k:
+                    # Out of this rank's token slot or feature block: guard.
                     break
-                src_idx[tok] = base_feat + feat_row
+                # rank-local feature row (merge gathers within this shard's own
+                # [out_rows_k, H]); NOT base_feat + feat_row.
+                src_idx[tok] = feat_row
                 mask[tok] = True
                 feat_row += 1
     return src_idx, mask
@@ -3089,6 +3129,10 @@ def build_mm_embed_plan(
     if not getattr(model_config, "is_multimodal", False):
         return None
 
+    # Lazy (in-function) import to avoid a module-level circular import between
+    # managers/schedule_batch.py and models/qwen2_5_vl.py.
+    from sgl_jax.srt.models.qwen2_5_vl import resolve_vision_metadata_builder
+
     # spatial_merge_size**2; read from config, never touch the model.
     # TODO(stage1): the top-level ModelConfig may surface spatial_merge_size on a
     #   nested vision_config (see multimodal/configs/.../qwen_2_5_vl_config.py);
@@ -3096,18 +3140,37 @@ def build_mm_embed_plan(
     spatial_merge_size = int(getattr(model_config, "spatial_merge_size", 1) or 1)
     sms2 = spatial_merge_size * spatial_merge_size
 
-    # Collect image items per rank (each item follows its req's dp_rank).
-    items_by_rank: list[list[Any]] = [[] for _ in range(dp_size)]
+    # Per-arch, config-only metadata builder
+    # (window_index/cu_window_seqlens/rotary_pos_emb).
+    # Resolved/instantiated once per plan; produces SINGLE-image native-size
+    # aux per call, which the round-loop pads-by-role + stacks across ranks.
+    builder = resolve_vision_metadata_builder(model_config.arch)(model_config.vision_config)
+
+    # Collect image items per rank, keeping each item bound to ITS OWN req's
+    # slot offset (``req_base`` = running prefix-sum of ``extend_input_len`` over
+    # the reqs packed before it on this rank) and prefix-cache length
+    # (``prefix_len``). ``item.offsets`` are REQ-LOCAL inclusive spans; the merge
+    # builder translates them to global tokens via
+    # ``rank_base + req_base + (offset - prefix_len)`` (see ``_build_merge_idx``),
+    # which is why we must NOT flatten away req boundaries here. Each element is a
+    # ``(item, req_base, prefix_len)`` tuple.
+    items_by_rank: list[list[tuple[Any, int, int]]] = [[] for _ in range(dp_size)]
     for dp_rank in range(dp_size):
         if not reqs_info or dp_rank >= len(reqs_info):
             continue
         info = reqs_info[dp_rank]
         if not info.reqs:
             continue
+        req_base = 0  # running slot offset of the current req within this rank
         for req in info.reqs:
+            prefix_len = int(getattr(req, "last_matched_prefix_len", 0) or 0)
             mm_items = _extract_mm_value(getattr(req, "mm_inputs", None), "mm_items") or []
-            mm_items = [item for item in mm_items if _is_image_mm_item(item)]
-            items_by_rank[dp_rank].extend(mm_items)
+            for item in mm_items:
+                if _is_image_mm_item(item):
+                    items_by_rank[dp_rank].append((item, req_base, prefix_len))
+            # Advance by how many tokens this req contributes to the slot (the
+            # extend window, == len(fill_ids) - len(prefix_indices)).
+            req_base += int(getattr(req, "extend_input_len", 0) or 0)
 
     n_rounds = max((len(items) for items in items_by_rank), default=0)
     if n_rounds == 0:
@@ -3115,26 +3178,34 @@ def build_mm_embed_plan(
 
     rounds: list[EmbedRound] = []
     for k in range(n_rounds):
-        # The round-k item per rank (None => dummy lane for ranks with < k+1 imgs).
-        rank_items_k = [
+        # The round-k entry per rank: a ``(item, req_base, prefix_len)`` tuple, or
+        # None => dummy lane for ranks with < k+1 imgs.
+        rank_entries_k = [
             items_by_rank[r][k] if k < len(items_by_rank[r]) else None for r in range(dp_size)
         ]
+        # Bare items (without req_base/prefix_len) for grid/feature/meta sizing,
+        # which is per-image and does not need the slot translation.
+        rank_items_k = [None if e is None else e[0] for e in rank_entries_k]
 
-        # Per-rank grid (passthrough; dummy ranks zeros) + per-rank feature rows.
-        grids_k = np.zeros((dp_size, 3), dtype=np.int32)
+        # Per-rank grid (drives bucket sizing only) + per-rank feature rows +
+        # per-rank native-size ViT aux (from the config-only builder).
         feature_rows = [0] * dp_size
         patch_rows = [0] * dp_size
         features = [None] * dp_size
+        metas = [None] * dp_size  # per-rank native VisionMetadata (None => dummy)
         for r, item in enumerate(rank_items_k):
             if item is None:
                 continue
             grid = _item_grid_thw(item)
-            grids_k[r] = np.asarray(grid, dtype=np.int32)
             feature_rows[r] = _grid_feature_rows(grid, sms2)
             feat = _extract_mm_value(item, "feature")
             feat = np.asarray(feat)
             features[r] = feat
             patch_rows[r] = int(feat.shape[0])
+            # Single-image native-size aux: window_index [units],
+            # cu_window_seqlens [windows], rotary_pos_emb [patches, rot_dim]. Cross-rank
+            # pad-by-role below.
+            metas[r] = builder.get_metadata(grid)
 
         patch_k = max(patch_rows) if any(patch_rows) else 0
         out_rows_k = max(feature_rows) if any(feature_rows) else 0
@@ -3152,12 +3223,21 @@ def build_mm_embed_plan(
             pixels_k[r, :rows, :] = feat
             valid_k[r] = rows
 
-        src_idx_k, mask_k = _build_merge_idx(rank_items_k, dp_size, per_dp_token, out_rows_k, sms2)
+        # Cross-rank pad-by-role + stack of the per-rank native-size aux is the
+        # builder's job (opaque to the scheduler): it owns the role semantics
+        # (window_index permutation / cu sentinel / rope zero-pad). The scheduler
+        # only collects per-rank metas (None => dummy lane) and the round's
+        # patch_k bucket.
+        meta_k = builder.stack_metadata(metas, patch_k)
+
+        src_idx_k, mask_k = _build_merge_idx(
+            rank_entries_k, dp_size, per_dp_token, out_rows_k, sms2
+        )
 
         encode_inputs = VisionEncodeInputs(
             pixels=pixels_k,
-            grid=grids_k,
             valid=valid_k,
+            meta=meta_k,
         )
         rounds.append(
             EmbedRound(

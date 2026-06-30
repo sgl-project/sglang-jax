@@ -520,15 +520,18 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         precision_tracer.start_batch_trace(forward_batch.bid)
         precision_tracer.set_current_forward_pass_id(self.forward_pass_id)
         # In-model VLM path (active): run the host embed routine (per-round JIT
-        # vision-encode -> JIT merge; aux computed INSIDE `get_image_feature`,
-        # Design X), landing the merged embedding on forward_batch.input_embedding
-        # before the backbone JIT. `self.model` is the VL wrapper -- it provides
-        # both `get_input_embeddings` (language_model) and `get_image_feature`
-        # (multimodal_model).
+        # vision-encode -> JIT merge; aux precomputed host-side by the scheduler
+        # and carried in the plan, Design B), landing the merged embedding on
+        # forward_batch.input_embedding before the backbone JIT. `self.model` is
+        # the VL wrapper -- it provides both `get_input_embeddings`
+        # (language_model) and `get_image_feature` (multimodal_model). Gate
+        # excludes decode and target_verify (both is_extend but not vision
+        # encode); the plan is non-None only for extend mm batches.
         if (
             getattr(self.model_config, "is_multimodal", False)
+            and not forward_batch.forward_mode.is_decode()
+            and not forward_batch.forward_mode.is_target_verify()
             and forward_batch.mm_embed_plan is not None
-            and forward_batch.forward_mode.is_extend()
         ):
             general_mm_embed_routine(
                 input_ids=forward_batch.input_ids,

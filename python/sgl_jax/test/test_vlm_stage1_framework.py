@@ -2,7 +2,6 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh, PartitionSpec
 
@@ -13,7 +12,6 @@ from sgl_jax.srt.managers.schedule_batch import (
     ScheduleReqsInfo,
 )
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sgl_jax.srt.models import qwen2_5_vl
 
 
 def test_generate_req_getitem_preserves_media_fields():
@@ -88,34 +86,6 @@ def test_forward_batch_input_embedding_uses_data_axis_sharding():
         ForwardBatch.init_new(batch, runner)
 
     assert PartitionSpec("data", None) in captured_specs
-
-
-def test_qwen2_5_vl_vision_attention_masks_padded_keys():
-    q = jnp.ones((1, 2, 1, 1), dtype=jnp.float32)
-    k = jnp.ones((1, 2, 1, 1), dtype=jnp.float32)
-    v_with_large_pad = jnp.array([[[[2.0]], [[1000.0]]]], dtype=jnp.float32)
-    v_without_large_pad = jnp.array([[[[2.0]], [[3.0]]]], dtype=jnp.float32)
-
-    masked_large = qwen2_5_vl.vision_attention(
-        q,
-        k,
-        v_with_large_pad,
-        scale=1.0,
-        valid_token_count=jnp.array(1, dtype=jnp.int32),
-    )
-    masked_small = qwen2_5_vl.vision_attention(
-        q,
-        k,
-        v_without_large_pad,
-        scale=1.0,
-        valid_token_count=jnp.array(1, dtype=jnp.int32),
-    )
-
-    np.testing.assert_allclose(
-        np.asarray(masked_large[:, :1]),
-        np.asarray(masked_small[:, :1]),
-        rtol=1e-6,
-    )
 
 
 def test_mrope_positions_propagate_through_model_worker_batch():

@@ -182,9 +182,7 @@ class ModelConfig:
                 self.quantization_config.ignored_layers = ignored
         # Check model type
         self.is_generation = is_generation_model(self.hf_config.architectures, is_embedding)
-        self.is_multimodal = any(
-            architecture in multimodal_model_archs for architecture in self.hf_config.architectures
-        )
+        self.is_multimodal = is_multimodal_model(self.hf_config.architectures)
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
 
         # Derive context length
@@ -258,6 +256,20 @@ class ModelConfig:
         self.image_token_id = getattr(config, "image_token_id", None) or getattr(
             config, "image_token_index", None
         )
+
+        # Surface the nested vision sub-config and a few derived fields at the
+        # top level so the host-side embed planner (build_mm_embed_plan) and the
+        # vision-metadata builder can read them WITHOUT reaching into hf_config.
+        # The vision config is the HF-native nested object (e.g.
+        # Qwen2_5_VLVisionConfig), matching how multimodal_tokenizer reads
+        # `hf_config.vision_config.spatial_merge_size`.
+        self.vision_config = getattr(config, "vision_config", None)
+        # architecture name for resolve_vision_metadata_builder(arch); falls back
+        # to None when architectures is empty.
+        archs = getattr(config, "architectures", None)
+        self.arch = archs[0] if archs else None
+        # spatial_merge_size lives on the vision config; default 1 (no merge).
+        self.spatial_merge_size = int(getattr(self.vision_config, "spatial_merge_size", 1) or 1)
 
     def _get_hf_quant_config(self):
         hf_quant_config = getattr(self.hf_config, "quantization_config", None)
@@ -927,6 +939,18 @@ multimodal_model_archs = [
     "VILAForConditionalGeneration",
     "KimiK25ForConditionalGeneration",
 ]
+
+
+def is_multimodal_model(model_architectures: list[str] | None) -> bool:
+    """Return True when any architecture is a known multimodal model.
+
+    Mirrors upstream sglang: a model is multimodal iff its architecture class
+    name appears in ``multimodal_model_archs``. To enable a new VLM, add its
+    architecture to that list (no per-model branch here).
+    """
+    if not model_architectures:
+        return False
+    return any(arch in multimodal_model_archs for arch in model_architectures)
 
 
 # Models that require attention_mask for padding token handling

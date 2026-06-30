@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec
 from jax.tree_util import register_pytree_node_class
 
@@ -146,11 +147,14 @@ class CaptureHiddenMode(IntEnum):
 def _device_put_embed_plan(plan, mesh):
     """Place each EmbedRound's array leaves onto the shard_map in_specs sharding.
 
-    Mirrors the in-model VLM shard_map contract: vision payload (``pixels``,
-    ``valid``) and ``src_idx``/``mask`` flow as ``P("data")``. ``grid`` stays
-    HOST (static) -- the model's ``get_image_feature`` consumes it to compute aux
-    (Design X), so it is NOT a shard_map operand. ``aux`` is not stored in the
-    plan (computed at encode time). Pure placement, no compute.
+    Mirrors the in-model VLM shard_map contract (Design B): vision payload
+    (``pixels``, ``valid``), the opaque ``meta`` pytree's leaves, and
+    ``src_idx``/``mask`` all flow as ``P("data", ...)``. ``meta`` is the per-arch
+    registered pytree the scheduler already computed host-side; common code
+    treats it as OPAQUE -- its leaves are device_put generically via
+    ``jax.tree.map`` (each leaf gets ``P("data", *[None]*(ndim-1))``) and the
+    pytree structure is rebuilt automatically, so the encode JIT receives the
+    same pytree type with device-array leaves. Pure placement, no compute.
     """
 
     def _put(arr, spec):
@@ -162,10 +166,18 @@ def _device_put_embed_plan(plan, mesh):
     for rounds in plan.rounds_by_modality.values():
         for rnd in rounds:
             enc = rnd.encode_inputs
-            # pixels [dp, patch, dim]; valid [dp] -> device. grid [dp, 3] stays
-            # HOST (consumed by get_image_feature's compute_aux_arrays, Design X).
+            # pixels [dp, patch_k, dim]; valid [dp] -> device.
             enc.pixels = _put(enc.pixels, PartitionSpec("data", None, None))
             enc.valid = _put(enc.valid, PartitionSpec("data"))
+            # Opaque meta pytree: device_put each (numpy) leaf onto P("data", ...)
+            # sharding derived from its rank; structure rebuilt by tree.map.
+            enc.meta = jax.tree.map(
+                lambda leaf: _put(
+                    leaf,
+                    PartitionSpec("data", *([None] * (np.asarray(leaf).ndim - 1))),
+                ),
+                enc.meta,
+            )
             # src_idx / mask are flat [total_token], P("data").
             rnd.src_idx = _put(rnd.src_idx, PartitionSpec("data"))
             rnd.mask = _put(rnd.mask, PartitionSpec("data"))
@@ -447,8 +459,9 @@ class ForwardBatch:
             )
 
         # In-model VLM embed plan: device_put each EmbedRound's array leaves onto
-        # the shard_map in_specs sharding (grid stays HOST). Zero computation --
-        # just placement. aux is computed at encode time in `get_image_feature`.
+        # the shard_map in_specs sharding (pixels/valid + VisionMetadata leaves +
+        # src_idx/mask). Zero computation -- just placement. aux is precomputed
+        # host-side by the scheduler and carried in the plan (Design B).
         mm_embed_plan = None
         if getattr(batch, "mm_embed_plan", None) is not None:
             mm_embed_plan = _device_put_embed_plan(batch.mm_embed_plan, model_runner.mesh)

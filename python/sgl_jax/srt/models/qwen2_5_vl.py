@@ -1,6 +1,7 @@
 import logging
 import math
 from collections.abc import Callable
+from dataclasses import dataclass
 from functools import partial
 from types import SimpleNamespace
 from typing import Any
@@ -9,35 +10,26 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import nnx
-from jax.sharding import Mesh, NamedSharding, PartitionSpec
+from jax.sharding import Mesh
+from jax.tree_util import register_pytree_node_class
 from transformers import modeling_flax_utils
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.hf_transformers_utils import get_hf_text_config
 from sgl_jax.srt.layers.embeddings import ParallelLMHead
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
-from sgl_jax.srt.managers.mm_utils import mm_encode
+from sgl_jax.srt.managers.mm_utils import jitted_mm_encode
 from sgl_jax.srt.mem_cache.memory_pool import MemoryPools
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.models.qwen2 import Qwen2Model
 from sgl_jax.srt.multimodal.configs.qwen_vl.qwen_2_5_vl_config import (
     QwenVLModelVitConfig,
 )
-from sgl_jax.srt.utils.jax_utils import is_tpu_runtime
+from sgl_jax.srt.multimodal.kernels.flash_attention import SegmentIds, flash_attention
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
-
-_FLASH_MHA = None
-
-
-def _get_flash_mha():
-    global _FLASH_MHA
-    if _FLASH_MHA is None:
-        from flash_attn_jax import flash_mha as _FLASH_MHA
-    return _FLASH_MHA
-
 
 init_fn = nnx.initializers.uniform()
 
@@ -66,84 +58,67 @@ def vision_attention(
     k: jax.Array,
     v: jax.Array,
     scale: float,
-    window_size: int = -1,
-    valid_token_count: jax.Array | None = None,
+    seg: jax.Array,
 ) -> jax.Array:
+    """In-model ViT attention via the segment_ids flash kernel (block-diagonal).
+
+    The in-model (round-loop, DP-only) encode path's single ViT attention
+    primitive. Runs INSIDE ``jitted_mm_encode``'s shard_map (per-rank single
+    image), so it calls the pallas kernel directly -- NO shard_map /
+    FlashAttentionBackend wrapping (those carry head-TP ``P("data","tensor")``
+    which violates this stage's DP-only regime; vision-TP is future work,
+    spec §4). The legacy distance-band / ``valid_token_count`` attention is gone
+    (spec §3.9): windowing is now exact block-diagonal via ``seg``.
+
+    Layout: inputs are ``[B, T, N, H]`` (ViT convention); the kernel wants
+    ``[B, N, T, H]`` so we ``transpose(0,2,1,3)`` (the legacy TPU branch did the
+    same -> ~zero cost). The kernel requires the T (seq) dim aligned to 128; we
+    pad T up to a multiple of 128, give padding patches a sentinel segment
+    (``-1``, distinct from every real segment so they are masked both as queries
+    and as keys), run the kernel, then slice ``[:, :, :T, :]`` back.
+
+    ``seg`` is the per-patch segment id ``[T]`` (windowed =
+    ``searchsorted(cu_window_seqlens)``; full-att = a single segment id over
+    valid patches, padding sentinel elsewhere). Same-segment patches attend
+    (block diagonal); ``causal=False``.
     """
-    Compute vision attention using flash attention on GPU or native attention on TPU.
+    B, T, N, H = q.shape
+    assert B == 1, "Vision attention currently only supports batch size 1"
 
-    This is a simple attention function for vision models (no KV cache, no causal masking).
+    # [B, T, N, H] -> [B, N, T, H] (kernel layout).
+    q = jnp.transpose(q, (0, 2, 1, 3))
+    k = jnp.transpose(k, (0, 2, 1, 3))
+    v = jnp.transpose(v, (0, 2, 1, 3))
 
-    Args:
-        q, k, v: Input tensors of shape [B, T, N, H] (batch, seq_len, num_heads, head_dim)
-        scale: Attention scale factor (1/sqrt(head_dim))
-        window_size: Window size for local attention. -1 means full attention.
+    # Pad seq (T) up to a multiple of 128 (kernel block requirement). Padding
+    # rows get a sentinel segment so they never share a segment with real
+    # patches (masked as both query and key); their query outputs are sliced off.
+    T_aligned = ((T + 127) // 128) * 128
+    pad = T_aligned - T
+    if pad > 0:
+        q = jnp.pad(q, ((0, 0), (0, 0), (0, pad), (0, 0)))
+        k = jnp.pad(k, ((0, 0), (0, 0), (0, pad), (0, 0)))
+        v = jnp.pad(v, ((0, 0), (0, 0), (0, pad), (0, 0)))
+        seg = jnp.concatenate(
+            [seg, jnp.full((pad,), -1, dtype=seg.dtype)],
+            axis=0,
+        )
 
-    Returns:
-        Output tensor of shape [B, T, N, H]
-    """
-    if not is_tpu_runtime() and valid_token_count is None:
-        # GPU: use flash_mha
-        flash_mha = _get_flash_mha()
-        original_dtype = q.dtype
-        if q.dtype not in [jnp.bfloat16, jnp.float16]:
-            q = q.astype(jnp.bfloat16)
-            k = k.astype(jnp.bfloat16)
-            v = v.astype(jnp.bfloat16)
+    seg_b = seg[None, :]  # [B=1, T_aligned]
+    segment_ids = SegmentIds(q=seg_b, kv=seg_b)
 
-        if window_size > 0:
-            output = flash_mha(
-                q,
-                k,
-                v,
-                softmax_scale=scale,
-                is_causal=False,
-                window_size=(window_size, window_size),
-            )
-        else:
-            output = flash_mha(q, k, v, softmax_scale=scale, is_causal=False)
+    output = flash_attention(
+        q,
+        k,
+        v,
+        segment_ids=segment_ids,
+        causal=False,
+        sm_scale=scale,
+    )  # [B, N, T_aligned, H]
 
-        if output.dtype != original_dtype:
-            output = output.astype(original_dtype)
-        return output
-    else:
-        # TPU: native attention
-        B, T, N, H = q.shape
-        q = jnp.transpose(q, (0, 2, 1, 3))  # [B, N, T, H]
-        k = jnp.transpose(k, (0, 2, 1, 3))
-        v = jnp.transpose(v, (0, 2, 1, 3))
-
-        attn_weights = jnp.einsum("bnth,bnsh->bnts", q, k) * scale
-
-        if window_size > 0:
-            # Create window mask for local attention
-            positions = jnp.arange(T)
-            distance = jnp.abs(positions[:, None] - positions[None, :])
-            window_mask = distance > window_size
-            attn_weights = jnp.where(
-                window_mask[None, None, :, :], jnp.finfo(attn_weights.dtype).min, attn_weights
-            )
-
-        if valid_token_count is not None:
-            valid_token_count = jnp.reshape(valid_token_count, ())[()]
-            positions = jnp.arange(T)
-            valid_queries = positions < valid_token_count
-            valid_keys = positions < valid_token_count
-            safe_key0 = positions == 0
-            padding_mask = jnp.where(
-                valid_queries[:, None],
-                valid_keys[None, :],
-                safe_key0[None, :],
-            )
-            attn_weights = jnp.where(
-                padding_mask[None, None, :, :],
-                attn_weights,
-                jnp.finfo(attn_weights.dtype).min,
-            )
-
-        attn_weights = jax.nn.softmax(attn_weights, axis=-1)
-        output = jnp.einsum("bnts,bnsh->bnth", attn_weights, v)
-        return jnp.transpose(output, (0, 2, 1, 3))  # [B, T, N, H]
+    output = output[:, :, :T, :]  # slice back to real seq
+    # [B, N, T, H] -> [B, T, N, H]
+    return jnp.transpose(output, (0, 2, 1, 3))
 
 
 class Qwen2_5_VisionPatchEmbed(nnx.Module):
@@ -250,9 +225,6 @@ class Qwen2_5_VisionAttention(nnx.Module):
         self.num_heads = config.num_heads
         self.head_dim = self.hidden_size // self.num_heads
         self.scale = 1.0 / math.sqrt(self.head_dim)
-        self._window_token_size = (
-            (config.window_size // config.spatial_merge_size // config.patch_size) ** 2
-        ) * (config.spatial_merge_size**2)
 
         # Use dummy rngs if None (for eval_shape)
         _rngs = rngs or nnx.Rngs(0)
@@ -277,12 +249,31 @@ class Qwen2_5_VisionAttention(nnx.Module):
         self,
         x: jax.Array,
         rotary_pos_emb: jax.Array,
-        cu_window_seqlens: jax.Array | None = None,
-        use_fullattn: bool = True,
-        valid_token_count: jax.Array | None = None,
+        cu: jax.Array,
+        valid: jax.Array | None = None,
     ) -> jax.Array:
+        """ViT attention via block-diagonal segment flash (spec §3.9).
+
+        ``cu`` is this block's cumulative segment boundaries (window order):
+        full-att blocks pass the degenerate single-segment ``cu_full = [valid]``,
+        windowed blocks pass ``cu_window_seqlens`` -- SAME function, only the
+        ``cu`` differs ("swap the cu, not the function", per tpu-inference). The
+        per-patch segment ids are derived HERE via
+        ``searchsorted(cu, arange(T), side="right")``; round-loop cross-rank
+        padding patches (``p >= valid``) are overwritten with a sentinel segment
+        (``-1``) so they never attend to / from real patches.
+        """
         T, B, D = x.shape
         assert B == 1, "Vision attention currently only supports batch size 1"
+
+        # cu -> per-patch segment ids (window order), then mask padding patches
+        # with a sentinel segment (-1) distinct from every real segment.
+        positions = jnp.arange(T)
+        seg = jnp.searchsorted(cu, positions, side="right").astype(jnp.int32)
+        if valid is not None:
+            valid_scalar = jnp.reshape(valid, ())[()]
+            is_real = positions < valid_scalar
+            seg = jnp.where(is_real, seg, jnp.full_like(seg, -1))
 
         # Project to Q, K, V
         qkv = self.qkv_proj(x)
@@ -297,20 +288,8 @@ class Qwen2_5_VisionAttention(nnx.Module):
         q = apply_rotary_pos_emb_vision(q, rotary_pos_emb)
         k = apply_rotary_pos_emb_vision(k, rotary_pos_emb)
 
-        # Use static window size derived from config for JIT compatibility.
-        window_size = -1
-        if not use_fullattn and cu_window_seqlens is not None:
-            window_size = self._window_token_size
-
-        # Compute attention using the backend function
-        output = vision_attention(
-            q,
-            k,
-            v,
-            self.scale,
-            window_size,
-            valid_token_count=valid_token_count,
-        )
+        # Block-diagonal segment flash attention.
+        output = vision_attention(q, k, v, self.scale, seg)
 
         # Reshape back: [B, T, N, H] -> [T, B, D]
         output = output.transpose(1, 0, 2, 3).reshape(T, B, D)
@@ -345,17 +324,10 @@ class Qwen2_5_VisionBlock(nnx.Module):
         self,
         x: jax.Array,
         rotary_pos_emb: jax.Array,
-        cu_window_seqlens: jax.Array | None = None,
-        use_fullattn: bool = True,
-        valid_token_count: jax.Array | None = None,
+        cu: jax.Array,
+        valid: jax.Array | None = None,
     ) -> jax.Array:
-        x = x + self.attn(
-            self.norm1(x),
-            rotary_pos_emb,
-            cu_window_seqlens,
-            use_fullattn,
-            valid_token_count=valid_token_count,
-        )
+        x = x + self.attn(self.norm1(x), rotary_pos_emb, cu, valid)
         x = x + self.mlp(self.norm2(x))
         return x
 
@@ -585,14 +557,29 @@ class Qwen2_5_VisionTransformer(nnx.Module):
         self,
         x: jax.Array,
         window_index: jax.Array,
-        rotary_pos_emb: jax.Array,
-        cu_seqlens: jax.Array,
         cu_window_seqlens: jax.Array,
-        valid_patch_rows: jax.Array | None = None,
+        rotary_pos_emb: jax.Array,
+        valid: jax.Array | None = None,
     ) -> jax.Array:
-        hidden_states = self.patch_embed(x)
+        """In-model single-image ViT forward (segment-flash, spec §3.9).
 
-        # num of patches
+        Consumes the scheduler-built ``VisionMetadata`` (``window_index`` /
+        ``cu_window_seqlens`` / ``rotary_pos_emb``). Order: patch_embed ->
+        unit-granularity ``hidden[window_index]`` (window order) -> blocks
+        (unified cu path) -> merger (window order spatial-merge) ->
+        ``argsort(window_index)`` inverse (raster order).
+
+        Unified cu path ("swap the cu, not the function", §3.9): full-att blocks
+        pass the degenerate single-segment ``cu_full = [valid]`` (image-internal
+        full attention), windowed blocks pass ``cu_window_seqlens``; the block
+        derives per-patch segment ids (``searchsorted``) + padding sentinel from
+        ``(cu, valid)`` internally.
+
+        ``rotary_pos_emb`` arrives ALREADY gathered into window order by the
+        builder -> do NOT re-gather. ``valid`` (real patch count) masks
+        round-loop cross-rank padding patches.
+        """
+        hidden_states = self.patch_embed(x)
         seq_len = x.shape[0]
 
         hidden_states = hidden_states.reshape(
@@ -600,26 +587,18 @@ class Qwen2_5_VisionTransformer(nnx.Module):
         )
         hidden_states = hidden_states[window_index, :, :]
         hidden_states = hidden_states.reshape(seq_len, -1)
+        hidden_states = jnp.expand_dims(hidden_states, axis=1)  # [T, B=1, D]
 
-        hidden_states = jnp.expand_dims(hidden_states, axis=1)
+        # full-att blocks: degenerate single segment cu_full = [valid]; windowed
+        # blocks: cu_window_seqlens. Block derives seg + padding sentinel itself.
+        if valid is None:
+            cu_full = jnp.asarray([seq_len], dtype=cu_window_seqlens.dtype)
+        else:
+            cu_full = jnp.reshape(valid, (1,)).astype(cu_window_seqlens.dtype)
 
         for layer_num, blk in enumerate(self.blocks):
-            if layer_num in self.fullatt_block_indexes:
-                hidden_states = blk(
-                    hidden_states,
-                    rotary_pos_emb=rotary_pos_emb,
-                    cu_window_seqlens=cu_seqlens,
-                    use_fullattn=True,
-                    valid_token_count=valid_patch_rows,
-                )
-            else:
-                hidden_states = blk(
-                    hidden_states,
-                    rotary_pos_emb=rotary_pos_emb,
-                    cu_window_seqlens=cu_window_seqlens,
-                    use_fullattn=False,
-                    valid_token_count=valid_patch_rows,
-                )
+            cu = cu_full if layer_num in self.fullatt_block_indexes else cu_window_seqlens
+            hidden_states = blk(hidden_states, rotary_pos_emb, cu, valid)
 
         # adapter
         hidden_states = self.merger(hidden_states)
@@ -662,6 +641,258 @@ def _get_visual_config(config: Any) -> QwenVLModelVitConfig:
             setattr(config_obj, key, value)
         return config_obj
     return vision_config
+
+
+@register_pytree_node_class
+@dataclass
+class VisionMetadata:
+    """Per-round vision aux, scheduler-computed, threaded into the encode JIT.
+
+    Per-arch registered pytree (Qwen2.5-VL): defined HERE in the model file (not
+    in the modality-general ``mm_plan``), since common code treats the encode
+    ``meta`` as an OPAQUE pytree and never names these fields. ``get_metadata`` /
+    ``stack_metadata`` (below) construct it; only the ViT encode body interprets
+    it.
+
+    aux 落点 = Design B -- the per-arch ``get_metadata`` builder computes these
+    ViT aux arrays host-side in the scheduler (config-only, from ``grid``), so
+    the plan carries the derived aux directly and the encode body never recomputes
+    it. Because this payload crosses the encode JIT boundary, it is a registered
+    pytree (children flatten order is fixed: ``window_index``,
+    ``cu_window_seqlens``, ``rotary_pos_emb``).
+
+    Fields hold one round's pad-stacked-across-ranks ViT aux:
+
+    - ``window_index``:      ``[dp, merge_units]`` int -- unit-granularity
+      window-order permutation (identity-padded across ranks so ``argsort``
+      un-permute holds).
+    - ``cu_window_seqlens``: ``[dp, max_windows]`` int -- cumulative window
+      boundaries on the window-reordered layout (no leading 0; last real value =
+      true patch count; sentinel-padded to ``max_windows``). The per-patch
+      segment ids are computed inside the ViT forward via
+      ``searchsorted(cu_window_seqlens, arange(seq))`` (host no longer
+      pre-derives them).
+    - ``rotary_pos_emb``:    ``[dp, patch_k, rot_dim]`` -- per-patch 2D rope
+      (zero-padded).
+    """
+
+    window_index: Any
+    cu_window_seqlens: Any
+    rotary_pos_emb: Any
+
+    def tree_flatten(self):
+        children = (self.window_index, self.cu_window_seqlens, self.rotary_pos_emb)
+        aux_data = {}  # static sizes/roles may live here; runtime does not depend on it
+        return (children, aux_data)
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        return cls(*children)
+
+
+class VisionMetadataBuilder:
+    """Per-arch, config-only ViT aux builder (spec §3.2 / decision 2.1).
+
+    Pure numpy, NO weights, NO model instance: the scheduler instantiates this
+    from ``model_config.vision_config`` and calls :meth:`get_metadata` once per
+    image to produce a :class:`VisionMetadata` (``window_index`` /
+    ``cu_window_seqlens`` / ``rotary_pos_emb``). Reuses the same window/rope algorithm the
+    ViT used host-side (ported off ``jnp`` to ``np``); ``cu_window_seqlens`` is
+    carried as-is (cumulative window boundaries) and converted to per-patch
+    segment ids INSIDE the ViT forward (``searchsorted``), not here.
+
+    Cross-rank pad/stack of the produced arrays into the round-loop bucket is the
+    scheduler's job; this builder only ever produces SINGLE-image metadata.
+    """
+
+    def __init__(self, vision_cfg):
+        self.vision_cfg = vision_cfg
+        self.patch_size = int(getattr(vision_cfg, "patch_size", 14))
+        self.window_size = int(getattr(vision_cfg, "window_size", 112))
+        self.spatial_merge_size = int(getattr(vision_cfg, "spatial_merge_size", 2))
+        self.fullatt_block_indexes = list(
+            getattr(vision_cfg, "fullatt_block_indexes", [7, 15, 23, 31])
+        )
+        num_heads = int(getattr(vision_cfg, "num_heads", 16))
+        hidden_size = int(getattr(vision_cfg, "hidden_size", 1280))
+        head_dim = hidden_size // num_heads
+        # rotary dim = head_dim // 2 (matches Qwen2_5_VisionRotaryEmbedding(head_dim//2))
+        self.rotary_dim = head_dim // 2
+        self.theta = float(getattr(vision_cfg, "rope_theta", 10000.0))
+        self.spatial_merge_unit = self.spatial_merge_size**2
+
+    # ---- ported host-only algorithms (numpy) ----------------------------------
+    def _rotary_pos_emb_full(self, seq_len: int) -> np.ndarray:
+        # mirrors Qwen2_5_VisionRotaryEmbedding.__call__ (dim = self.rotary_dim)
+        inv_freq = 1.0 / (
+            self.theta ** (np.arange(0, self.rotary_dim, 2, dtype=np.float32) / self.rotary_dim)
+        )
+        seq = np.arange(seq_len, dtype=np.float32)
+        return np.outer(seq, inv_freq)  # [seq_len, rotary_dim//2]
+
+    def _rotary_pos_emb_thw(self, t, h, w) -> np.ndarray:
+        sms = self.spatial_merge_size
+        hpos_ids, wpos_ids = np.indices((h, w))
+        hpos_ids = hpos_ids.reshape(h // sms, sms, w // sms, sms).transpose(0, 2, 1, 3).flatten()
+        wpos_ids = wpos_ids.reshape(h // sms, sms, w // sms, sms).transpose(0, 2, 1, 3).flatten()
+        pos_ids = np.stack([hpos_ids, wpos_ids], axis=-1)
+        pos_ids = np.tile(pos_ids, (t, 1))
+
+        max_size = max(h, w)
+        rotary_pos_emb_full = self._rotary_pos_emb_full(max_size)
+
+        rotary_pos_emb = rotary_pos_emb_full[pos_ids].reshape(pos_ids.shape[0], -1)
+        rotary_pos_emb = rotary_pos_emb.reshape(
+            rotary_pos_emb.shape[0] // self.spatial_merge_unit,
+            self.spatial_merge_unit,
+            -1,
+        )
+        return rotary_pos_emb  # [merge_units, sms^2, rot_dim]
+
+    def _window_index_thw(self, grid_t, grid_h, grid_w):
+        sms = self.spatial_merge_size
+        vit_merger_window_size = self.window_size // sms // self.patch_size
+
+        llm_grid_h = grid_h // sms
+        llm_grid_w = grid_w // sms
+
+        index = np.arange(grid_t * llm_grid_h * llm_grid_w).reshape(grid_t, llm_grid_h, llm_grid_w)
+
+        pad_h = (
+            vit_merger_window_size - llm_grid_h % vit_merger_window_size
+        ) % vit_merger_window_size
+        pad_w = (
+            vit_merger_window_size - llm_grid_w % vit_merger_window_size
+        ) % vit_merger_window_size
+        num_windows_h = (llm_grid_h + pad_h) // vit_merger_window_size
+        num_windows_w = (llm_grid_w + pad_w) // vit_merger_window_size
+
+        index_padded = np.pad(index, ((0, 0), (0, pad_h), (0, pad_w)), constant_values=-100)
+        index_padded = index_padded.reshape(
+            grid_t,
+            num_windows_h,
+            vit_merger_window_size,
+            num_windows_w,
+            vit_merger_window_size,
+        )
+        index_padded = np.transpose(index_padded, (0, 1, 3, 2, 4)).reshape(
+            grid_t,
+            num_windows_h * num_windows_w,
+            vit_merger_window_size,
+            vit_merger_window_size,
+        )
+        seqlens = (index_padded != -100).sum(axis=(2, 3)).reshape(-1)
+        index_padded = index_padded.reshape(-1)
+        index_new = index_padded[index_padded != -100]
+        cu_seqlens_window = np.cumsum(seqlens) * self.spatial_merge_unit
+        cu_seqlens_window = cu_seqlens_window.astype(np.int32)
+        return index_new.astype(np.int32), cu_seqlens_window
+
+    def get_metadata(self, image_grid) -> VisionMetadata:
+        """Single-image ``(t, h, w)`` -> :class:`VisionMetadata`.
+
+        - ``window_index``: unit-granularity window-order permutation (length
+          ``t * (h//sms) * (w//sms)`` = merge_units).
+        - ``rotary_pos_emb``: per-patch 2D rope, ALREADY gathered into window order
+          (``rope[window_index]`` flattened), length ``t*h*w`` patches.
+        - ``cu_window_seqlens``: cumulative window boundaries on the
+          window-reordered layout (``cumsum(seqlens) * spatial_merge_unit``; no
+          leading 0; last value = true patch count). The per-patch segment ids
+          (``searchsorted(cu_window_seqlens, patch, side="right")``) are NOT
+          pre-derived here -- they are computed inside
+          ``compute_hidden_states`` (in the encode JIT), right before the
+          flash kernel.
+
+        ``cu_seqlens`` (whole-image boundary) is NOT produced: round-loop single
+        image -> full-att = full attention + ``valid`` padding mask (spec §2.3).
+        """
+        t, h, w = (int(image_grid[0]), int(image_grid[1]), int(image_grid[2]))
+
+        window_index, cu_window_seqlens = self._window_index_thw(t, h, w)
+
+        # rope: gather into window order (mirrors get_rope_by_thw).
+        rope_units = self._rotary_pos_emb_thw(t, h, w)  # [merge_units, sms^2, rot_dim]
+        rope = rope_units[window_index, :, :]
+        rope = rope.reshape(-1, rope.shape[-1]).astype(np.float32)  # [patches, rot_dim]
+
+        return VisionMetadata(
+            window_index=window_index.astype(np.int32),
+            cu_window_seqlens=cu_window_seqlens.astype(np.int32),
+            rotary_pos_emb=rope,
+        )
+
+    def stack_metadata(self, metas, patch_k):
+        """Cross-rank pad-by-role + stack of single-image metas -> VisionMetadata[dp, ...].
+
+        ``metas[r]`` is this rank's round-k native-size :class:`VisionMetadata`,
+        or ``None`` for a dummy lane (rank owns < k+1 images). ``patch_k`` is the
+        round's cross-rank max patch-row bucket (drives the cu sentinel and rope
+        pad length). Bucket sizes are the cross-rank max of each role's native
+        length:
+
+        - ``window_index`` is a PERMUTATION over ``units_k`` (= merge_units):
+          identity-fill pad slots with ``arange(native_units, units_k)`` so the
+          full row stays a valid permutation (the ViT ``argsort``-un-permutes; a
+          non-permutation would corrupt that reverse-scatter). Dummy lanes get a
+          full ``arange(units_k)`` identity row.
+        - ``cu_window_seqlens`` (cumulative boundaries): sentinel = ``patch_k``
+          for pad slots. cu's last real value = true patch count <= ``patch_k``,
+          so a ``patch_k`` sentinel keeps the row non-decreasing AND > every real
+          patch index, hence the forward's ``searchsorted(side="right")`` never
+          counts a sentinel window for any real patch. Dummy lanes get an
+          all-``patch_k`` row (irrelevant -- masked by ``valid`` in the forward).
+        - ``rotary_pos_emb`` (per-patch values): 0 for pad patches; rope is
+          padded to ``patch_k`` rows.
+        """
+        present = [m for m in metas if m is not None]
+        units_k = max(int(m.window_index.shape[0]) for m in present)
+        win_k = max(int(m.cu_window_seqlens.shape[0]) for m in present)
+        rot_dim = int(present[0].rotary_pos_emb.shape[-1])
+        wi, cu, rope = [], [], []
+        for m in metas:
+            if m is None:  # dummy lane
+                wi.append(np.arange(units_k, dtype=np.int32))  # identity perm (un-permute safe)
+                cu.append(np.full(win_k, patch_k, dtype=np.int32))  # all sentinel
+                rope.append(np.zeros((patch_k, rot_dim), dtype=np.float32))
+            else:
+                # window_index: true values + arange continuation for the pad tail.
+                w = np.arange(units_k, dtype=np.int32)
+                n_units = int(m.window_index.shape[0])
+                w[:n_units] = np.asarray(m.window_index, dtype=np.int32)
+                # cu_window_seqlens: true values + patch_k sentinel tail.
+                c = np.full(win_k, patch_k, dtype=np.int32)
+                n_win = int(m.cu_window_seqlens.shape[0])
+                c[:n_win] = np.asarray(m.cu_window_seqlens, dtype=np.int32)
+                # rotary_pos_emb: true rows + zero pad to patch_k.
+                r = np.zeros((patch_k, rot_dim), dtype=np.float32)
+                rp = np.asarray(m.rotary_pos_emb, dtype=np.float32)
+                r[: int(rp.shape[0])] = rp
+                wi.append(w)
+                cu.append(c)
+                rope.append(r)
+        return VisionMetadata(np.stack(wi), np.stack(cu), np.stack(rope))
+
+
+def resolve_vision_metadata_builder(arch_or_config):
+    """Resolve the per-arch :class:`VisionMetadataBuilder` class (spec §3.2).
+
+    Accepts an arch name string or an object carrying ``.arch``. The scheduler
+    then instantiates the returned class with ``model_config.vision_config`` and
+    calls ``get_metadata`` per image -- NO model instance required.
+
+    Resolution mirrors the repo's ``ModelRegistry``/``EntryClass`` mechanism: the
+    arch must map (via ``EntryClass``) to this module's embedder. Currently the
+    only vision-metadata arch is ``Qwen2_5_VLForConditionalGeneration``.
+    """
+    arch = (
+        arch_or_config if isinstance(arch_or_config, str) else getattr(arch_or_config, "arch", None)
+    )
+    if arch == "Qwen2_5_VLForConditionalGeneration":
+        return VisionMetadataBuilder
+    raise ValueError(
+        f"No VisionMetadataBuilder registered for arch={arch!r}; "
+        "expected 'Qwen2_5_VLForConditionalGeneration'."
+    )
 
 
 class Qwen2_5_VLForConditionalGeneration(nnx.Module):
@@ -713,83 +944,36 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
         return self.model.embed_tokens
 
     def get_image_feature(self, enc):
-        """Image embedder (= upstream `get_image_feature`, models/qwen2_5_vl.py:643;
-        resolved by `embed_mm_inputs` via `getattr(model, "get_image_feature")`).
+        """Image embedder (= upstream ``get_image_feature``; resolved by
+        ``embed_mm_inputs`` via ``getattr(model, "get_image_feature")``).
 
-        aux 落点 = Design X: compute the ViT aux arrays HERE (host, per rank from
-        `enc.grid`), reshard to `P("data")`, then run the JIT(1) encode shard_map.
-        The ViT weights are passed into `mm_encode` as an explicit JIT operand via
-        `nnx.split` (graphdef static + state dynamic), NOT closure-captured, so a
-        weight reload needs no compile-cache clear (aligns the backbone's nnx.split
-        convention). `enc` is a `VisionEncodeInputs` for one DP round. Returns
-        `[dp*out_rows, H]` as `P("data", None)`.
+        aux 落点 = Design B: the ViT aux (``window_index`` /
+        ``cu_window_seqlens`` / ``rotary_pos_emb``) is computed host-side in the scheduler
+        (``VisionMetadataBuilder``) and carried on ``enc.meta``; this embedder no
+        longer recomputes it. It
+        ``nnx.split``s the ViT (graphdef static + state dynamic, an explicit JIT
+        operand -- reload-safe, no compile-cache clear) and runs the JIT(1) encode
+        shard_map. ``enc`` is a ``VisionEncodeInputs`` for one DP round. Returns
+        ``[dp*out_rows, H]`` as ``P("data", None)``.
         """
-        aux = self._compute_round_aux(enc.grid)
         graphdef, state = nnx.split(self.visual)
-        return mm_encode(
-            self.mesh, graphdef, self._vision_encode_body, state, enc.pixels, aux, enc.valid
+        return jitted_mm_encode(
+            self.mesh, self._vision_encode_body, graphdef, state, enc.pixels, enc.meta, enc.valid
         )
 
-    def _compute_round_aux(self, grid):
-        """Per-round host aux (Design X; computed here from ``grid`` instead of
-        being stored in the plan).
-
-        `grid` is `[dp, 3]`; per rank call `compute_aux_arrays(grid[r])` with a
-        static python-int single-image grid, pad/stack the 4 aux leaves across
-        ranks to the cross-rank max, then reshard each to `P("data")`. aux arrays
-        are `jnp` (already on device) -> this is a `P("data")` reshard, NOT an H2D
-        transfer. Dummy ranks (`grid == 0`) get a zero lane. Returns the 4-tuple
-        of stacked+sharded aux leaves, or `None` if all ranks are dummy.
-        """
-        visual = self.visual  # ViT tower (compute_aux_arrays lives here)
-        # grid is host (static; init_new does NOT device_put it). np.asarray is a
-        # no-op on host numpy and syncs if a device array ever slips through.
-        grid_host = np.asarray(grid)
-        dp_size = int(grid_host.shape[0])
-
-        per_rank_aux: list = []  # over ranks: 4-tuple of jnp aux, or None (dummy)
-        for r in range(dp_size):
-            g = tuple(int(v) for v in grid_host[r])
-            if g == (0, 0, 0):
-                per_rank_aux.append(None)
-                continue
-            per_rank_aux.append(tuple(visual.compute_aux_arrays((g,))))
-
-        present = [a for a in per_rank_aux if a is not None]
-        if not present:
-            return None
-
-        num_leaves = len(present[0])
-        max_rows = [max(int(a[i].shape[0]) for a in present) for i in range(num_leaves)]
-        stacked_leaves = []
-        for i in range(num_leaves):
-            ref = present[0][i]
-            tail_shape = ref.shape[1:]
-            # aux[0] is window_index (a permutation of [0, F_r)); pad it by
-            # EXTENDING the permutation so compute_hidden_states' argsort stays a
-            # valid inverse. Other leaves zero-pad (rotary padded rows are
-            # attention-masked by valid_patch_rows; cu_seqlens values are unused
-            # by the distance-band attention).
-            pad = self._pad_window_index if i == 0 else self._pad_rows_to
-            rank_arrs = []
-            for a in per_rank_aux:
-                leaf = a[i] if a is not None else jnp.zeros((0, *tail_shape), dtype=ref.dtype)
-                rank_arrs.append(pad(leaf, max_rows[i]))
-            stacked = jnp.stack(rank_arrs, axis=0)  # [dp, max_rows_i, ...]
-            spec = PartitionSpec("data", *([None] * (stacked.ndim - 1)))
-            stacked_leaves.append(self._device_put_data_axis(stacked, spec))
-        return tuple(stacked_leaves)
-
     @staticmethod
-    def _vision_encode_body(visual, pixels, aux, valid):
+    def _vision_encode_body(visual, pixels, meta, valid):
         """Single-image ViT body for one DP rank (runs INSIDE the JIT(1) encode
-        shard_map). ``visual`` is the ViT tower merged inside ``mm_encode`` from the
-        nnx graphdef/state passed in -- weights are an explicit JIT operand, not
-        closure-captured. `aux` is the 4-tuple `(window_index, rotary_pos_emb,
-        cu_seqlens, cu_window_seqlens)` computed host-side by `get_image_feature`
-        (`_compute_round_aux`). Returns `[out_rows, H]` for this rank's image.
+        shard_map). ``visual`` is the ViT tower merged inside ``jitted_mm_encode``
+        from the nnx graphdef/state passed in -- weights are an explicit JIT
+        operand, not closure-captured. ``meta`` is the ``VisionMetadata`` pytree
+        (``window_index`` / ``cu_window_seqlens`` / ``rotary_pos_emb``) from ``enc.meta``
+        (Design B; scheduler-built). Returns ``[out_rows, H]`` for this rank's
+        image.
         """
-        return visual.compute_hidden_states(pixels, *aux, valid_patch_rows=valid)
+        return visual.compute_hidden_states(
+            pixels, meta.window_index, meta.cu_window_seqlens, meta.rotary_pos_emb, valid
+        )
 
     def load_weights(self, model_config: ModelConfig):
         # Backbone (text) weights -- folded in from former Qwen2_5_VL_Generation.
@@ -937,44 +1121,6 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
                 transpose=False,
             ),
         }
-
-    def _device_put_data_axis(self, value, spec):
-        if getattr(self, "mesh", None) is None:
-            return value
-        return jax.device_put(value, NamedSharding(self.mesh, spec))
-
-    @staticmethod
-    def _pad_rows_to(value, target_rows: int):
-        """Zero-pad `value` (a `[rows, ...]` array) up to `target_rows` rows.
-
-        Used by `_compute_round_aux` to pad each rank's aux leaf to the cross-rank
-        max before stacking; shapes are static under trace.
-        """
-        rows = int(value.shape[0])
-        if rows == target_rows:
-            return value
-        pad_shape = (target_rows - rows, *value.shape[1:])
-        padding = jnp.zeros(pad_shape, dtype=value.dtype)
-        return jnp.concatenate([value, padding], axis=0)
-
-    @staticmethod
-    def _pad_window_index(window_index, target_rows: int):
-        """Pad ``window_index`` (a permutation of ``[0, rows)``) up to
-        ``target_rows`` by EXTENDING the permutation with
-        ``arange(rows, target_rows)``.
-
-        Unlike zero-padding, this keeps it a valid permutation of
-        ``[0, target_rows)`` so ``compute_hidden_states``'s
-        ``argsort(window_index)`` stays a correct inverse for padded ranks --
-        zero-padding would collide the value-0 entries and scramble the padded
-        rank's feature rows. Dummy ranks (``rows == 0``) get the full identity
-        permutation.
-        """
-        rows = int(window_index.shape[0])
-        if rows >= target_rows:
-            return window_index
-        ext = jnp.arange(rows, target_rows, dtype=window_index.dtype)
-        return jnp.concatenate([window_index, ext], axis=0)
 
     def _create_qwen2_weight_mappings(self) -> dict:
         mappings = {

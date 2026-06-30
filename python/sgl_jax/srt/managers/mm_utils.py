@@ -12,10 +12,11 @@ merges into its own tokens with ZERO cross-rank collective. The ``data`` mesh
 axis == dp size; everything vision flows as ``P("data")``.
 
 This module owns JIT(1) and JIT(2) plus the host loop that drives them
-(``general_mm_embed_routine`` -> ``embed_mm_inputs``). ``mm_encode``/``mm_merge``
-are jit-wrapped kernel entries (``mesh`` as a static arg) with the shard_map
-inlined -- the ``@jax.jit`` handles caching, matching the repo convention
-(``kernels/fused_moe``, ``layers/attention/.../paged_attention``).
+(``general_mm_embed_routine`` -> ``embed_mm_inputs``).
+``jitted_mm_encode``/``jitted_mm_merge`` are forward JIT segments (the same
+layer as ``jitted_run_model``): jit-wrapped kernel entries (``mesh`` as a static
+arg) with the shard_map inlined -- the ``@jax.jit`` handles caching, matching the
+repo convention (``kernels/fused_moe``, ``layers/attention/.../paged_attention``).
 """
 
 import functools
@@ -43,11 +44,12 @@ def _merge_local(running, features, src_idx, mask):
 
 
 @functools.partial(jax.jit, static_argnames=("mesh",))
-def mm_merge(mesh, running, features, src_idx, mask):
-    """JIT(2): src_idx merge, ``P("data")`` flat layout.
+def jitted_mm_merge(mesh, running, features, src_idx, mask):
+    """Forward JIT(2): src_idx merge, ``P("data")`` flat layout.
 
-    The shard_map is inlined and ``@jax.jit`` (``mesh`` static) caches it --
-    matching the repo's jit-wrapped kernel-entry convention (``kernels/fused_moe``,
+    A forward JIT segment (same layer as ``jitted_run_model``). The shard_map is
+    inlined and ``@jax.jit`` (``mesh`` static) caches it -- matching the repo's
+    jit-wrapped kernel-entry convention (``kernels/fused_moe``,
     ``layers/attention/.../paged_attention``); no separate cached builder.
     ``running``/``features`` are ``P("data", None)``; ``src_idx``/``mask`` are
     ``P("data")``. Returns ``P("data", None)``.
@@ -62,46 +64,57 @@ def mm_merge(mesh, running, features, src_idx, mask):
 
 
 @functools.partial(jax.jit, static_argnames=("mesh", "graphdef", "body"))
-def mm_encode(mesh, graphdef, body, state, pixels, aux, valid):
-    """JIT(1): single-image ViT ``body`` wrapped in a shard_map.
+def jitted_mm_encode(mesh, body, graphdef, state, pixels, meta, valid):
+    """Forward JIT(1): single-image ViT ``body`` wrapped in a shard_map.
 
-    The ViT weights flow in as an EXPLICIT JIT operand via ``nnx.split`` --
-    ``graphdef`` (static structure) + ``state`` (dynamic leaves) -- rather than
-    being closure-captured by ``body``. This matches the backbone's
-    ``jitted_run_model`` (nnx.split) convention and keeps the weights OUT of the
-    compiled constants: a weight reload just passes a fresh ``state`` and the
-    cached executable picks it up, no compile-cache clear needed.
+    A forward JIT segment (same layer as ``jitted_run_model``). The ViT weights
+    flow in as an EXPLICIT JIT operand via ``nnx.split`` -- ``graphdef`` (static
+    structure) + ``state`` (dynamic leaves) -- rather than being closure-captured
+    by ``body``. This matches the backbone's ``jitted_run_model`` (nnx.split)
+    convention and keeps the weights OUT of the compiled constants: a weight
+    reload just passes a fresh ``state`` and the cached executable picks it up,
+    no compile-cache clear needed.
 
-    ``aux`` is the 4-tuple already computed host-side by the model's
-    ``get_image_feature`` (Design X: aux 在 embedder 内算).
+    ``meta`` is a per-arch registered pytree (e.g. ``VisionMetadata``) already
+    computed host-side by the scheduler (Design B: aux in the plan, NOT
+    recomputed at encode time). Common code treats it as OPAQUE -- it never names
+    the fields.
 
-    Flat leaf order: ``pixels``, ``*aux``, ``valid`` (``grid`` is host-only, NOT a
-    shard_map operand). The leading ``dp`` axis is fully sharded on ``data`` and
-    shard_map strips it, so each shard's body sees one rank's single image and
-    returns ``[out_rows, H]``; ``out_specs`` assembles them into ``[dp*out_rows,
-    H]``. The ViT weights are replicated (no TP), so the merged ``visual`` is
-    closed over inside shard_map as a replicated value. Returns ``P("data", None)``.
+    DP-only: every tensor axis is replicated (``None``); only the leading ``dp``
+    axis is sharded on ``data``. ``in_specs`` is a pytree-of-PartitionSpec that
+    mirrors the ``(pixels, meta, valid)`` argument structure -- ``meta``'s specs
+    are derived generically from its leaves via ``jax.tree.map`` (each leaf gets
+    ``P("data", *[None]*(ndim-1))``), so this layer stays modality-agnostic
+    (shard_map supports pytree ``in_specs``). shard_map strips the ``dp`` axis, so
+    each shard's body sees one rank's single image: ``pixels[patch_k, dim]``,
+    ``meta`` leaves with the dp axis dropped, and scalar ``valid``. The body is
+    called as ``body(visual, pixels, meta, valid)`` and returns ``[out_rows, H]``;
+    ``out_specs`` assembles them into ``[dp*out_rows, H]``. The ViT weights are
+    replicated (no TP), so the merged ``visual`` is closed over inside shard_map
+    as a replicated value. Returns ``P("data", None)``.
     """
     visual = nnx.merge(graphdef, state)
-    aux = tuple(aux) if aux is not None else ()
-    leaves = (pixels, *aux, valid)
-    n_aux = len(aux)
-    # Every leaf: P("data", *[None]*(ndim-1)) -- dp axis sharded, rest replicated.
-    in_specs = tuple(
-        PartitionSpec("data", *([None] * (getattr(leaf, "ndim", 1) - 1))) for leaf in leaves
+    # ``meta`` is an opaque per-arch registered pytree; common code never names
+    # its fields. Mirror its structure with a pytree-of-PartitionSpec: each leaf
+    # is a jax.Array sharded on the leading ``dp`` axis only (``P("data", None,
+    # ...)``). shard_map supports pytree ``in_specs``.
+    meta_specs = jax.tree.map(lambda leaf: PartitionSpec("data", *([None] * (leaf.ndim - 1))), meta)
+    in_specs = (
+        PartitionSpec("data", None, None),  # pixels  [dp, patch_k, dim]
+        meta_specs,  # opaque meta pytree (leaves carry their own specs)
+        PartitionSpec("data"),  # valid   [dp]
     )
 
-    def encode(enc_leaves):
-        a = tuple(enc_leaves[1 : 1 + n_aux]) if n_aux else None
-        return body(visual, enc_leaves[0], a, enc_leaves[-1])
+    def encode(pixels_s, meta_s, valid_s):
+        return body(visual, pixels_s, meta_s, valid_s)
 
     return jax.shard_map(
         encode,
         mesh=mesh,
-        in_specs=(in_specs,),
+        in_specs=in_specs,
         out_specs=PartitionSpec("data", None),
         check_vma=False,
-    )(leaves)
+    )(pixels, meta, valid)
 
 
 def embed_mm_inputs(
@@ -130,7 +143,7 @@ def embed_mm_inputs(
         assert embedder is not None, f"no embedding method for {modality}"
         for rnd in rounds:
             features = embedder(rnd.encode_inputs)  # JIT(1) via get_image_feature
-            running = mm_merge(mesh, running, features, rnd.src_idx, rnd.mask)  # JIT(2)
+            running = jitted_mm_merge(mesh, running, features, rnd.src_idx, rnd.mask)  # JIT(2)
     return running
 
 
