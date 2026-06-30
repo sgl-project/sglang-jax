@@ -35,15 +35,16 @@ jax.sharding.set_mesh(_mesh)
 # Tiny 5-layer config covering all archetypes:
 #   0: full_attention + dense
 #   1: sliding_attention + dense
-#   2: sliding_attention + MoE
-#   3: full_attention + MoE
-#   4: full_attention + MoE + swiglu_limits (clamp)
+#   2: full_attention + MoE
+#   3: sliding_attention + MoE
+#   4: sliding_attention + MoE + routed-only clamp  (= real layer 43)
+#   5: full_attention + MoE + routed+shared clamp   (= real layer 44)
 # ---------------------------------------------------------------------------
 
 _VOCAB, _HIDDEN, _INTER = 64, 256, 256
 _MOE_INTER, _SHARE_DIM, _NUM_EXPERTS, _TOPK = 64, 64, 8, 2
 _NUM_HEADS_FULL, _NUM_HEADS_SLIDE, _NUM_KV = 4, 6, 2
-_HEAD_DIM, _NUM_LAYERS = 128, 5
+_HEAD_DIM, _NUM_LAYERS = 128, 6
 
 _TINY_CFG_DICT: dict = {
     "architectures": ["Step3p5ForCausalLM"],
@@ -61,25 +62,26 @@ _TINY_CFG_DICT: dict = {
     "vocab_size": _VOCAB,
     "rms_norm_eps": 1e-5,
     "max_position_embeddings": 64,
-    "rope_theta": [5000000.0, 10000.0, 10000.0, 5000000.0, 5000000.0],
+    "rope_theta": [5000000.0, 10000.0, 5000000.0, 10000.0, 10000.0, 5000000.0],
     "rope_scaling": None,
     "layer_types": [
         "full_attention",
         "sliding_attention",
+        "full_attention",
+        "sliding_attention",
         "sliding_attention",
         "full_attention",
-        "full_attention",
     ],
-    "partial_rotary_factors": [0.5, 1.0, 1.0, 0.5, 0.5],
+    "partial_rotary_factors": [0.5, 1.0, 0.5, 1.0, 1.0, 0.5],
     "attention_other_setting": {
         "attention_type": "sliding_attention",
         "num_attention_heads": _NUM_HEADS_SLIDE,
         "num_attention_groups": _NUM_KV,
         "head_dim": _HEAD_DIM,
     },
-    "swiglu_limits": [0.0, 0.0, 0.0, 0.0, 7.0],
-    "swiglu_limits_shared": [0.0, 0.0, 0.0, 0.0, 16.0],
-    "moe_layers_enum": "2,3,4",
+    "swiglu_limits": [0.0, 0.0, 0.0, 0.0, 7.0, 7.0],
+    "swiglu_limits_shared": [0.0, 0.0, 0.0, 0.0, 0.0, 16.0],
+    "moe_layers_enum": "2,3,4,5",
     "moe_num_experts": _NUM_EXPERTS,
     "moe_top_k": _TOPK,
     "moe_intermediate_size": _MOE_INTER,
@@ -257,25 +259,26 @@ def _make_jax_config():
         vocab_size=_VOCAB,
         rms_norm_eps=1e-5,
         max_position_embeddings=64,
-        rope_theta=[5000000.0, 10000.0, 10000.0, 5000000.0, 5000000.0],
+        rope_theta=[5000000.0, 10000.0, 5000000.0, 10000.0, 10000.0, 5000000.0],
         rope_scaling=None,
         layer_types=[
             "full_attention",
             "sliding_attention",
+            "full_attention",
+            "sliding_attention",
             "sliding_attention",
             "full_attention",
-            "full_attention",
         ],
-        partial_rotary_factors=[0.5, 1.0, 1.0, 0.5, 0.5],
+        partial_rotary_factors=[0.5, 1.0, 0.5, 1.0, 1.0, 0.5],
         attention_other_setting={
             "attention_type": "sliding_attention",
             "num_attention_heads": _NUM_HEADS_SLIDE,
             "num_attention_groups": _NUM_KV,
             "head_dim": _HEAD_DIM,
         },
-        swiglu_limits=[0.0, 0.0, 0.0, 0.0, 7.0],
-        swiglu_limits_shared=[0.0, 0.0, 0.0, 0.0, 16.0],
-        moe_layers_enum="2,3,4",
+        swiglu_limits=[0.0, 0.0, 0.0, 0.0, 7.0, 7.0],
+        swiglu_limits_shared=[0.0, 0.0, 0.0, 0.0, 0.0, 16.0],
+        moe_layers_enum="2,3,4,5",
         moe_num_experts=_NUM_EXPERTS,
         moe_top_k=_TOPK,
         moe_intermediate_size=_MOE_INTER,
