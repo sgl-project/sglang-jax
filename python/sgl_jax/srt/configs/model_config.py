@@ -223,7 +223,9 @@ class ModelConfig:
                 self.quantization_config.ignored_layers = ignored
         # Check model type
         self.is_generation = is_generation_model(self.hf_config.architectures, is_embedding)
-        self.is_multimodal = False
+        self.is_multimodal = any(
+            architecture in multimodal_model_archs for architecture in self.hf_config.architectures
+        )
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
 
         if not isinstance(dtype_config, DtypeConfig):

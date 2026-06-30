@@ -87,7 +87,11 @@ from sgl_jax.srt.model_executor.model_runner_kv_cache_mixin import (
 )
 from sgl_jax.srt.multimodal.tokenizer_utils import resolve_tokenizer_subdir
 from sgl_jax.srt.precision_tracer import precision_tracer
-from sgl_jax.srt.server_args import PortArgs, ServerArgs
+from sgl_jax.srt.server_args import (
+    PortArgs,
+    ServerArgs,
+    apply_multimodal_model_defaults,
+)
 from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
 from sgl_jax.srt.speculative.overlap_utils import (
     can_use_spec_decode_overlap,
@@ -627,6 +631,7 @@ class Scheduler(
     def init_tokenizer(self):
         server_args = self.server_args
         self.model_config = ModelConfig.from_server_args(server_args)
+        apply_multimodal_model_defaults(server_args, self.model_config)
         self.is_generation = self.model_config.is_generation
         if server_args.skip_tokenizer_init:
             self.tokenizer = self.processor = None
@@ -1242,17 +1247,20 @@ class Scheduler(
         req.disagg_transfer_id = recv_req.disagg_transfer_id or req.rid
         if hasattr(recv_req, "mm_inputs") and recv_req.mm_inputs:
             req.mm_inputs = recv_req.mm_inputs
-            multimodal_embedding = recv_req.mm_inputs.get("multimodal_embedding")
+            get_mm_value = (
+                recv_req.mm_inputs.get
+                if isinstance(recv_req.mm_inputs, dict)
+                else lambda key: getattr(recv_req.mm_inputs, key, None)
+            )
+            multimodal_embedding = get_mm_value("multimodal_embedding")
             req.multimodal_embedding = multimodal_embedding
             if (
-                recv_req.mm_inputs.get("deepstack_visual_pos_mask") is not None
-                and recv_req.mm_inputs.get("deepstack_visual_embedding") is not None
+                get_mm_value("deepstack_visual_pos_mask") is not None
+                and get_mm_value("deepstack_visual_embedding") is not None
             ):
                 req.apply_for_deepstack = True
-                req.deepstack_visual_pos_mask = recv_req.mm_inputs.get("deepstack_visual_pos_mask")
-                req.deepstack_visual_embedding = recv_req.mm_inputs.get(
-                    "deepstack_visual_embedding"
-                )
+                req.deepstack_visual_pos_mask = get_mm_value("deepstack_visual_pos_mask")
+                req.deepstack_visual_embedding = get_mm_value("deepstack_visual_embedding")
         # Validate prompt length
         error_msg = validate_input_length(
             req,
