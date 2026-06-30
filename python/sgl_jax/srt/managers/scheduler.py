@@ -2333,10 +2333,10 @@ class Scheduler(
 
     # ---- ici_pd helpers ----
     def _pd_prefill_loop(self, p_idx: int = 0):
-        """Route-D async prefill thread: P-slice forward + cross-slice KV
+        """Pathways-PD async prefill thread: P-slice forward + cross-slice KV
         gather/device_put run here so the main loop never blocks on P mesh.
         scatter into D pool stays on the main thread (see _pd_drain_ready).
-        Multi-P (Stage 6): one thread per P slice, each bound to its own
+        Multi-P: one thread per P slice, each bound to its own
         worker/pool/transfer; main thread round-robins batches across queues."""
         from sgl_jax.srt.disaggregation.ici_pd import slots_to_ordered_pages
 
@@ -2478,7 +2478,7 @@ class Scheduler(
             )
 
     def _pd_get_next_batch_async(self):
-        """Route-D pathways async scheduling: main loop only ever returns decode
+        """Pathways-PD async scheduling: main loop only ever returns decode
         batches; prefill batches are pushed to _pd_prefill_qs[i] (round-robin
         across P slices) and run on prefill threads concurrently with D decode."""
         self._pd_drain_ready()

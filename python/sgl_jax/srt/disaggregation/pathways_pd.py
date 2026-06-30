@@ -1,4 +1,4 @@
-"""Route D: Pathways single-controller cross-slice P/D split.
+"""Pathways single-controller cross-slice P/D disaggregation.
 
 Architecture: one Python process (Pathways head) sees all devices across
 N slices via IFRT proxy. Build prefill_mesh on slice 0, decode_mesh on
@@ -57,7 +57,7 @@ def make_slice_meshes(
     dp_size: int, tp_per_side: int, n_prefill: int = 1
 ) -> tuple[list[Mesh], Mesh]:
     """Build ([prefill_mesh_0..n_prefill-1], decode_mesh) from the first
-    n_prefill+1 slices. Stage 6 multi-P: n_prefill>1 fans prefill across
+    n_prefill+1 slices. Multi-P: n_prefill>1 fans prefill across
     slices to lift R_prefill (the bottleneck on device-bound models)."""
     devs = jax.devices()
     groups = group_by_slice(devs)
