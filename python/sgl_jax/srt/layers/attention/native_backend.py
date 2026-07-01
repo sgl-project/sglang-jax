@@ -70,8 +70,14 @@ class NativeAttention(AttentionBackend):
             Tuple of (output tensor of shape [total_tokens, hidden_size], kv_fused 5D)
         """
         # TODO(pc) support tree based native attention backend
+        save_kv_cache = kwargs.get("save_kv_cache", True)
         k_buffer, v_buffer, kv_fused = self._get_and_update_kv_cache(
-            k, v, forward_batch, token_to_kv_pool, layer.layer_id
+            k,
+            v,
+            forward_batch,
+            token_to_kv_pool,
+            layer.layer_id,
+            save_kv_cache=save_kv_cache,
         )
 
         scale = 1.0 / jnp.sqrt(layer.head_dim) if layer.scaling is None else layer.scaling
@@ -122,6 +128,7 @@ class NativeAttention(AttentionBackend):
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
         layer_id: int,
+        save_kv_cache: bool = True,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         """
         Update KV cache and return (k_3d, v_3d, fused_5d).
@@ -129,7 +136,9 @@ class NativeAttention(AttentionBackend):
         The 5D fused buffer is persisted outside JIT. The 3D k/v views are
         used by forward_attention for the actual attention computation.
         """
-        if is_tpu_runtime():
+        if not save_kv_cache:
+            fused_5d = token_to_kv_pool.get_fused_kv_buffer(layer_id)
+        elif is_tpu_runtime():
             if forward_batch.forward_mode.is_extend():
                 token_to_kv_pool.set_kv_buffer(
                     layer_id, forward_batch.out_cache_loc, k, v, is_decode=False
