@@ -62,7 +62,7 @@ _PERSTAGE = math.sqrt(2.0) * _EPS_BF16  # ≈ 1.1e-2  single matmul, flash vs na
 _RTOL_ATTN = round(_PERSTAGE * 2.0, 4)  # ≈ 0.022  single attention stage × safety
 _RTOL_LOGITS = round(
     _PERSTAGE * math.sqrt(_NUM_LAYERS + 1) * 2.0, 4
-)  # ≈ 0.054  (5 layers + lm_head)
+)  # ≈ 0.0585 = √2·ε_bf16·√(L+1=7)·2  (6 layers + lm_head)
 
 _RNG = np.random.default_rng(7)
 
