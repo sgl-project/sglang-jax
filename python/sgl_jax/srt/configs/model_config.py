@@ -140,8 +140,8 @@ class ModelConfig:
         # Models whose MoE block hard-codes FusedEPMoE (fused_ep_moe v1 kernel)
         # instead of dispatching on --moe-backend. Resolve the effective backend
         # to FUSED so downstream guards keyed on the backend string
-        # (CompilationManager bs-bucket filter, tp_worker align_bs, scheduler
-        # ep-size warning) see the actual kernel constraints.
+        # (CompilationManager bs-bucket filter, tp_worker align_bs) see the
+        # actual kernel constraints.
         if self.hf_config.architectures[
             0
         ] in _FORCED_FUSED_EP_MOE_ARCHS and self.moe_backend not in (

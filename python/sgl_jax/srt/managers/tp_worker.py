@@ -193,13 +193,13 @@ class ModelWorker:
                 dp_size,
             )
 
-        # fused_ep_moe derives its EP group from the mesh (get_ep_size = dp*tp),
-        # not from --ep-size, so align against the mesh size. Use the *resolved*
-        # backend from ModelConfig so architectures that hard-code FusedEPMoE
-        # (e.g. Qwen3.5 MoE) are covered even when the raw server_args string
-        # stays at the "epmoe" default.
+        # fused_ep_moe derives its EP group from the mesh (get_ep_size(mesh) =
+        # mesh['data'] * mesh['tensor']), not from --ep-size, so align against
+        # the actual mesh shape. Use the *resolved* backend from ModelConfig so
+        # architectures that hard-code FusedEPMoE (e.g. Qwen3.5 MoE) are
+        # covered even when the raw server_args string stays at "epmoe".
         effective_moe_backend = self.model_runner.model_config.moe_backend.value
-        mesh_ep_size = self.tp_size * self.dp_size
+        mesh_ep_size = self.mesh.shape.get("data", 1) * self.mesh.shape.get("tensor", 1)
         if effective_moe_backend == "fused" and mesh_ep_size > 1:
             from sgl_jax.srt.utils.common_utils import align_bs_for_fused_ep
 
