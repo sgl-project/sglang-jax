@@ -48,7 +48,9 @@ _EPS_BF16 = 2.0**-7
 _PERSTAGE = math.sqrt(2.0) * _EPS_BF16
 # prefill and decode use the same flash kernel — tighter single-attn band:
 _RTOL_ATTN = round(_PERSTAGE * 2.0, 4)  # ~0.022
-_RTOL_LOGITS = round(_PERSTAGE * math.sqrt(_NUM_LAYERS + 1) * 2.0, 4)  # ~0.054
+_RTOL_LOGITS = round(
+    _PERSTAGE * math.sqrt(_NUM_LAYERS + 1) * 2.0, 4
+)  # ~0.0585 = √2·ε_bf16·√(L+1=7)·2
 # TRUE fp32 logic gate (see test_prefill_equals_decode): the flash/RPA kernel HONORS
 # jax.default_matmul_precision("highest") (6-pass fp32 on the MXU). Under it the fp32
 # prefill==decode residual drops to ~1e-6 (measured 1.33e-6 @ 6 layers) vs the DEFAULT
