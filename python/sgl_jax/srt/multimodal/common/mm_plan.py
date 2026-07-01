@@ -14,35 +14,26 @@ caller knows which state it holds by context (scheduler = numpy, post-``init_new
 = device).
 
 The embedded ``meta`` payload *is* a registered pytree, but a PER-ARCH one
-(e.g. ``VisionMetadata`` in ``models/qwen2_5_vl.py``). Common code must not name
-its fields nor import the concrete class (keeps common decoupled from models), so
-it is typed by the local :class:`VisionMetadataPytree` structural marker. ``meta``
-is the only payload that crosses the encode JIT boundary.
+(e.g. ``Qwen25VLVisionMetadata`` in ``models/vision_metadata/qwen2_5_vl.py``).
+Common code must not name its fields nor import the concrete class (keeps common
+decoupled from models), so it is typed by the ``VisionMetadataPytree`` structural
+marker defined in ``common/vision_metadata.py``. ``meta`` is the only opaque
+per-arch pytree payload; ``pixels`` and ``valid`` are common tensor inputs to the
+encode JIT.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING
+
+from sgl_jax.srt.multimodal.common.vision_metadata import VisionMetadataPytree
 
 if TYPE_CHECKING:
     import jax
     import numpy as np
 
     from sgl_jax.srt.multimodal.common.modality_enum import Modality
-
-
-class VisionMetadataPytree(Protocol):
-    """Structural marker for a per-arch ViT-aux **registered pytree**.
-
-    The concrete type is defined per model (e.g. ``models/qwen2_5_vl.py``'s
-    ``VisionMetadata`` with children ``window_index`` / ``cu_window_seqlens`` /
-    ``rotary_pos_emb``). Common code treats ``meta`` only through this marker --
-    a registered pytree whose leaves are ``np.ndarray`` (host, scheduler-built)
-    or ``jax.Array`` (device, after ``init_new`` device_put). No member contract
-    is declared here on purpose: it names the opaque payload without coupling
-    common -> models. Only the model's encode body reads the concrete fields.
-    """
 
 
 @dataclass

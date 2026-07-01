@@ -73,14 +73,14 @@ def jitted_mm_encode(mesh, body, graphdef, state, pixels, meta, valid):
     ``[dp, ...]`` and GSPMD partitions the matmuls/norms along ``data`` (weights
     replicated -> per-image independent -> zero cross-rank collective). The two
     ops GSPMD can't auto-partition keep their OWN local shard_map: attention
-    (inside the body, via ``FlashAttentionBackend(dp_only=True)``) and merge
+    (inside the body, via ``VisionFlashAttentionBackend``) and merge
     (``jitted_mm_merge``, JIT(2)).
 
     ViT weights flow in as an EXPLICIT operand via ``nnx.split`` (``graphdef``
     static + ``state`` traced), replicated (no TP); ``nnx.merge`` rebuilds inside.
 
-    ``meta`` is an opaque per-arch registered pytree (scheduler-computed, Design
-    B); common code never names its fields -- the body interprets them.
+    ``meta`` is an opaque scheduler-computed per-arch registered pytree; common
+    code never names its fields -- the body interprets them.
 
     The body returns batched ``[dp, out_rows, H]``; we flatten to
     ``[dp*out_rows, H]`` and ANCHOR the sharding with
@@ -110,10 +110,10 @@ def embed_mm_inputs(
 
     ``running`` starts as the plain text embedding (``embed_tokens`` once); each
     round encodes one image per rank via the model's ``get_{modality}_feature``
-    embedder (Design X: aux computed inside it) and merges its features in. No
-    ``clamp`` -- sglang-jax placeholders are in-vocab ``im_token_id``, not
-    upstream's out-of-range hash ``pad_value``. Returns the merged embedding
-    ``[total_token, H]`` (``P("data", None)``).
+    embedder, which consumes scheduler-built ``enc.meta``, and merges its
+    features in. No ``clamp`` -- sglang-jax placeholders are in-vocab
+    ``im_token_id``, not upstream's out-of-range hash ``pad_value``. Returns the
+    merged embedding ``[total_token, H]`` (``P("data", None)``).
     """
     mesh = multimodal_model.mesh
     running = input_embedding(input_ids)

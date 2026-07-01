@@ -145,16 +145,17 @@ class CaptureHiddenMode(IntEnum):
 
 
 def _device_put_embed_plan(plan, mesh):
-    """Place each EmbedRound's array leaves onto the shard_map in_specs sharding.
+    """Place each EmbedRound's array leaves onto the ``P("data", ...)`` forward-segment sharding.
 
-    Mirrors the in-model VLM shard_map contract (Design B): vision payload
-    (``pixels``, ``valid``), the opaque ``meta`` pytree's leaves, and
-    ``src_idx``/``mask`` all flow as ``P("data", ...)``. ``meta`` is the per-arch
-    registered pytree the scheduler already computed host-side; common code
-    treats it as OPAQUE -- its leaves are device_put generically via
-    ``jax.tree.map`` (each leaf gets ``P("data", *[None]*(ndim-1))``) and the
-    pytree structure is rebuilt automatically, so the encode JIT receives the
-    same pytree type with device-array leaves. Pure placement, no compute.
+    Mirrors the in-model VLM forward-segment contract: common encode inputs
+    (``pixels``, ``valid``) + the opaque ``meta`` pytree's leaves feed the GSPMD
+    encode (pure jit), while ``src_idx``/``mask`` feed the merge shard_map. All
+    flow as ``P("data", ...)``. ``meta`` is the per-arch registered pytree the
+    scheduler already computed host-side; common code treats it as OPAQUE -- its
+    leaves are device_put generically via ``jax.tree.map`` (each leaf gets
+    ``P("data", *[None]*(ndim-1))``) and the pytree structure is rebuilt
+    automatically, so the encode JIT receives the same pytree type with
+    device-array leaves. Pure placement, no compute.
     """
 
     def _put(arr, spec):
@@ -245,8 +246,9 @@ class ForwardBatch:
     # Recurrent state indices [batch_size]
     recurrent_indices: jax.Array | None = None
 
-    # In-model VLM owning-rank DP embed plan (host-side reference holding device
-    # arrays + host grid). Consumed by general_mm_embed_routine OUTSIDE the
+    # In-model VLM owning-rank DP embed plan. After init_new, the same host-side
+    # plan object holds device arrays for encode common inputs, per-arch meta,
+    # and merge indices. Consumed by general_mm_embed_routine OUTSIDE the
     # backbone JIT, so it is a PLAIN attribute and NOT a pytree child below.
     mm_embed_plan: object | None = None
 
@@ -459,9 +461,10 @@ class ForwardBatch:
             )
 
         # In-model VLM embed plan: device_put each EmbedRound's array leaves onto
-        # the shard_map in_specs sharding (pixels/valid + VisionMetadata leaves +
-        # src_idx/mask). Zero computation -- just placement. aux is precomputed
-        # host-side by the scheduler and carried in the plan (Design B).
+        # the encode input sharding (pixels/valid + VisionMetadata leaves) and
+        # merge shard_map input sharding (src_idx/mask). Zero computation -- just
+        # placement. aux is precomputed host-side by the scheduler and carried in
+        # the plan.
         mm_embed_plan = None
         if getattr(batch, "mm_embed_plan", None) is not None:
             mm_embed_plan = _device_put_embed_plan(batch.mm_embed_plan, model_runner.mesh)

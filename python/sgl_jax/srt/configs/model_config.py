@@ -257,9 +257,9 @@ class ModelConfig:
             config, "image_token_index", None
         )
 
-        # Surface the nested vision sub-config and a few derived fields at the
-        # top level so the host-side embed planner (build_mm_embed_plan) and the
-        # vision-metadata builder can read them WITHOUT reaching into hf_config.
+        # Surface the nested vision sub-config and architecture name for the
+        # host-side embed planner and vision-metadata builder without reaching
+        # into hf_config.
         # The vision config is the HF-native nested object (e.g.
         # Qwen2_5_VLVisionConfig), matching how multimodal_tokenizer reads
         # `hf_config.vision_config.spatial_merge_size`.
@@ -268,7 +268,9 @@ class ModelConfig:
         # to None when architectures is empty.
         archs = getattr(config, "architectures", None)
         self.arch = archs[0] if archs else None
-        # spatial_merge_size lives on the vision config; default 1 (no merge).
+        # Mirror of the vision-config value at the top level (default 1 = no
+        # merge); the authoritative value lives on the vision config. The in-model
+        # VLM scheduler path no longer reads this top-level field.
         self.spatial_merge_size = int(getattr(self.vision_config, "spatial_merge_size", 1) or 1)
 
     def _get_hf_quant_config(self):
