@@ -20,8 +20,8 @@ from sgl_jax.srt.mem_cache.memory_pool import MemoryPools
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.models.qwen2 import Qwen2Model
 
-# Import the Qwen2.5-VL vision-metadata module so its builder self-registers
-# (spec §3.2/§3.3); the encode body consumes only the opaque ``meta`` pytree.
+# Import the Qwen2.5-VL vision-metadata module so model import triggers builder
+# registration; the encode body consumes only the opaque ``meta`` pytree.
 from sgl_jax.srt.models.vision_metadata import (  # noqa: F401
     qwen2_5_vl as _qwen25vl_vision_metadata,
 )
@@ -67,7 +67,7 @@ def vision_attention(
 ) -> jax.Array:
     """In-model ViT attention via ``VisionFlashAttentionBackend`` (block-diagonal).
 
-    Batched, dp-leading (spec §2.4 / §3.10): ``q/k/v`` are ``[dp, T, N, H]`` and
+    Batched, dp-leading: ``q/k/v`` are ``[dp, T, N, H]`` and
     ``seg`` is ``[dp, T]``. Uses ``VisionFlashAttentionBackend`` (DP-only) -- it
     wraps the segment-flash pallas kernel in a DP-only shard_map
     (qkv ``P("data",None,None,None)`` / seg ``P("data",None)``), NO head-TP. Since
@@ -131,7 +131,7 @@ class Qwen2_5_VisionPatchEmbed(nnx.Module):
         )
 
     def __call__(self, x: jax.Array) -> jax.Array:
-        # x is (dp, seq_len, C * T * H * W) -- dp-leading batched (spec §3.10);
+        # x is (dp, seq_len, C * T * H * W) -- dp-leading batched;
         # seq_len == the per-image patch count (== patch_k in the plan).
         dp, seq_len, dim = x.shape
         C = dim // (self.temporal_patch_size * self.patch_size * self.patch_size)
@@ -218,7 +218,7 @@ class Qwen2_5_VisionAttention(nnx.Module):
             rngs=_rngs,
         )
 
-        # DP-only vision attention backend (spec §2.4 / §3.10): reused across all
+        # DP-only vision attention backend reused across all
         # in-model VLMs. Lazy import avoids a module-level import cycle
         # (flash_attention_backend -> schedule_batch -> models). ``mesh`` is None
         # only during eval_shape (which never calls __call__), so guard it.
@@ -238,7 +238,7 @@ class Qwen2_5_VisionAttention(nnx.Module):
         cu: jax.Array,
         valid: jax.Array | None = None,
     ) -> jax.Array:
-        """ViT attention via block-diagonal segment flash (dp-leading, spec §3.10).
+        """ViT attention via block-diagonal segment flash (dp-leading).
 
         ``x`` is ``[dp, T, D]``. ``cu`` is this block's cumulative segment
         boundaries PER IMAGE: full-att blocks pass ``cu_full = [dp, 1]`` (= valid),
@@ -351,12 +351,12 @@ class Qwen2_5_VisionPatchMerger(nnx.Module):
         )
 
     def __call__(self, x: jax.Array) -> jax.Array:
-        # x: [dp, T, ctx] (dp-leading, spec §3.10 #11).
+        # x: [dp, T, ctx] (dp-leading).
         x = self.ln_q(x)
         dp = x.shape[0]
         # Keep dp on axis 0: the sms² spatial-merge stays WITHIN each image.
         # ``reshape(-1, ...)`` here would interleave T and dp and silently mix
-        # across images (the one silent-corruption point, spec §3.10 manual-verify②).
+        # across images.
         x = x.reshape(dp, -1, self.hidden_size)  # [dp, T/sms², ctx*sms²]
         x = self.mlp_fc1(x)
         x = self.mlp_act(x)
@@ -419,7 +419,7 @@ class Qwen2_5_VisionTransformer(nnx.Module):
         rotary_pos_emb: jax.Array,
         valid: jax.Array | None = None,
     ) -> jax.Array:
-        """In-model single-image ViT forward (segment-flash, spec §3.9).
+        """In-model single-image ViT forward (segment-flash).
 
         Consumes the scheduler-built ``VisionMetadata`` (``window_index`` /
         ``cu_window_seqlens`` / ``rotary_pos_emb``). Order: patch_embed ->
@@ -427,7 +427,7 @@ class Qwen2_5_VisionTransformer(nnx.Module):
         (unified cu path) -> merger (window order spatial-merge) ->
         ``argsort(window_index)`` inverse (raster order).
 
-        Unified cu path ("swap the cu, not the function", §3.9): full-att blocks
+        Unified cu path ("swap the cu, not the function"): full-att blocks
         pass the degenerate single-segment ``cu_full = [valid]`` (image-internal
         full attention), windowed blocks pass ``cu_window_seqlens``; the block
         derives per-patch segment ids (``searchsorted``) + padding sentinel from
@@ -437,7 +437,7 @@ class Qwen2_5_VisionTransformer(nnx.Module):
         builder -> do NOT re-gather. ``valid`` (real patch count) masks
         round-loop cross-rank padding patches.
         """
-        # x: [dp, seq, dim_in] (dp-leading batched, spec §3.10).
+        # x: [dp, seq, dim_in] (dp-leading batched).
         hidden_states = self.patch_embed(x)  # [dp, seq, D]
         dp = x.shape[0]
         seq_len = x.shape[1]

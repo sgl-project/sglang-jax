@@ -65,7 +65,7 @@ def jitted_mm_merge(mesh, running, features, src_idx, mask):
 
 @functools.partial(jax.jit, static_argnames=("mesh", "graphdef", "body"))
 def jitted_mm_encode(mesh, body, graphdef, state, pixels, meta, valid):
-    """Forward JIT(1): GSPMD batched ViT (pure jit, dp-leading; spec §2.4 / §3.10).
+    """Forward JIT(1): GSPMD batched ViT (pure jit, dp-leading).
 
     Pure ``@jax.jit`` (NO outer shard_map): the ViT runs as a GSPMD batched
     computation with the leading ``dp`` axis as the batch. Inputs are already
@@ -84,10 +84,10 @@ def jitted_mm_encode(mesh, body, graphdef, state, pixels, meta, valid):
 
     The body returns batched ``[dp, out_rows, H]``; we flatten to
     ``[dp*out_rows, H]`` and ANCHOR the sharding with
-    ``with_sharding_constraint(P("data", None))`` so the encode->merge seam lines
+    ``with_sharding_constraint(P("data", None))`` so the encode->merge layout lines
     up with ``jitted_mm_merge``'s ``_MERGE_IN_SPECS`` (the dp-leading flatten is
     naturally aligned -- sharded-major ``dp`` + replicated ``out_rows`` -- and the
-    anchor pins "inferred" to "contractual", spec §3.10 #13). Returns
+    anchor pins the inferred layout to the merge contract). Returns
     ``P("data", None)``.
     """
     visual = nnx.merge(graphdef, state)
@@ -140,7 +140,7 @@ def general_mm_embed_routine(
     """HOST segment (= upstream ``general_mm_embed_routine``, mm_utils.py:1023 --
     minus the LM call, since our backbone is a separate JIT).
 
-    Strings ``embed_tokens`` -> per-round encode->merge, landing the merged
+    Strings ``embed_tokens`` -> per-round encode->merge, storing the merged
     embedding on ``forward_batch.input_embedding`` for the backbone JIT to
     consume (= upstream's ``forward_batch.mm_input_embeds`` field set).
     """

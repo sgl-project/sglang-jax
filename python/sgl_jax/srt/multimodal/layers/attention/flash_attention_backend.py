@@ -58,7 +58,7 @@ class VisionFlashAttentionBackend(AttentionBackend):
 
     Kept SEPARATE from ``FlashAttentionBackend`` (which is head-TP, used by
     ``USPAttention`` for Flux / Wan / Qwen3-Omni audio) so that class stays
-    untouched. Here the ViT is DP-only with replicated weights (spec §2.4):
+    untouched. Here the ViT is DP-only with replicated weights:
     batch on ``data``; heads / T / head_dim are NOT sharded on ``tensor``; and
     ``segment_ids`` is per-image, riding the batch (``data``) axis rather than
     being replicated. Wraps the SAME pallas segment-flash kernel as

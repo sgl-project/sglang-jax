@@ -521,7 +521,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         precision_tracer.set_current_forward_pass_id(self.forward_pass_id)
         # In-model VLM path (active): run the host embed routine (per-round JIT
         # vision-encode -> JIT merge; aux precomputed host-side by the scheduler
-        # and carried in the plan), landing the merged embedding on
+        # and carried in the plan), storing the merged embedding on
         # forward_batch.input_embedding before the backbone JIT. `language_model`
         # is the Qwen2Model backbone (`self.model.model`) -- it provides
         # `get_input_embeddings` (embed module) to seed `running`;

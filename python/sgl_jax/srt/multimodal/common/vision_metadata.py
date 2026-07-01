@@ -1,4 +1,4 @@
-"""Common (arch-general) vision-metadata interface + registry (spec §3.2).
+"""Common arch-general vision-metadata interface and registry.
 
 The vision-metadata *interface* (Protocols) and *registry* live here; the
 concrete per-arch metadata pytree and builder live in
@@ -10,8 +10,8 @@ Registration is **import-triggered, NOT auto-scanned**: each VLM's main model
 file (``models/<arch>.py``) imports its metadata module at top level; when
 ``ModelRegistry`` loads that model, the import chain runs the metadata module's
 top-level ``register_vision_metadata_builder(...)``. ``resolve`` only looks up
-the dict (does no import). Adding a new VLM = new model file + new metadata file
-+ one import line in the model file, with no change to any central table.
+the dict (does no import). Adding a new VLM means adding its model file,
+metadata file, and model-level import; the common registry lookup stays generic.
 """
 
 from __future__ import annotations
@@ -34,7 +34,7 @@ class VisionMetadataPytree(Protocol):
 
 
 class VisionMetadataBuilderProtocol(Protocol):
-    """Per-arch, config-only ViT-aux builder interface (spec §3.2).
+    """Per-arch, config-only ViT-aux builder interface.
 
     Concrete builders live in ``models/vision_metadata/<arch>.py``. All methods
     are host-side numpy: no weights, no model instance. The scheduler

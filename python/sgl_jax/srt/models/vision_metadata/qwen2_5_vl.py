@@ -1,4 +1,4 @@
-"""Qwen2.5-VL concrete vision metadata + builder (spec §3.3).
+"""Qwen2.5-VL concrete vision metadata and builder.
 
 Split out of the main model file ``models/qwen2_5_vl.py`` but still Qwen2.5-VL
 arch code. This module registers its builder at import time; the main model
@@ -81,7 +81,7 @@ def _item_grid_thw(item: Any) -> tuple:
 
 
 class Qwen25VLVisionMetadataBuilder:
-    """Per-arch, config-only ViT aux builder (spec §3.2 / §3.3).
+    """Per-arch, config-only ViT aux builder.
 
     Pure numpy, NO weights, NO model instance: the scheduler instantiates this
     from ``model_config.vision_config`` and calls :meth:`get_metadata` once per
@@ -197,7 +197,7 @@ class Qwen25VLVisionMetadataBuilder:
           encode JIT), right before the flash kernel.
 
         ``cu_seqlens`` (whole-image boundary) is NOT produced: round-loop single
-        image -> full-att = full attention + ``valid`` padding mask (spec §2.3).
+        image -> full-att = full attention + ``valid`` padding mask.
         """
         t, h, w = _item_grid_thw(item)
 

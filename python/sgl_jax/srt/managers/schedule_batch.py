@@ -3040,9 +3040,9 @@ def _build_merge_idx(
     (``jitted_mm_merge``) runs inside a ``P("data")`` shard and gathers
     ``features[src_idx]`` where each shard only sees its OWN rank's features.
     Therefore ``src_idx`` carries **rank-local** feature row numbers (a running
-    ``0, 1, 2, ...`` per placeholder), NOT a global block offset (spec invariant
-    ①). ``mask`` stays a global ``[total_token]`` positional bool; ``src_idx``
-    is also global ``[total_token]`` in SHAPE, but its VALUES are rank-local rows
+    ``0, 1, 2, ...`` per placeholder), NOT a global block offset. ``mask`` stays
+    a global ``[total_token]`` positional bool; ``src_idx`` is also global
+    ``[total_token]`` in SHAPE, but its VALUES are rank-local rows
     (non-placeholder tokens carry 0, paired with mask=False).
 
     Each ``rank_entries[r]`` is an ``(item, req_base)`` tuple (or ``None`` for a
@@ -3062,10 +3062,10 @@ def _build_merge_idx(
     (``prefix_len == 0`` -- the extend window IS the whole ``input_ids``), so
     ``offset`` maps directly to the extend-window position. prefix-cache x vision
     (cross-prefill ``feat_row`` <-> whole-image feature alignment, mm-aware radix
-    key) is a later stage, out of this landing's scope. The only guard kept is
-    the packing-slot bound ``tok >= rank_base + per_dp_token`` (guards against a
-    mis-computed packing offset writing into another rank's slot); there is no
-    vision-geometry ``feat_row`` bound.
+    key) is not handled by this helper. The only guard kept is the packing-slot
+    bound ``tok >= rank_base + per_dp_token`` (guards against a mis-computed
+    packing offset writing into another rank's slot); there is no vision-geometry
+    ``feat_row`` bound.
     """
     total_token = dp_size * per_dp_token
     src_idx = np.zeros(total_token, dtype=np.int32)
@@ -3114,7 +3114,7 @@ def build_mm_embed_plan(
     if not getattr(model_config, "is_multimodal", False):
         return None
 
-    # Resolve the per-arch metadata builder from the COMMON registry (spec §3.2):
+    # Resolve the per-arch metadata builder from the common registry:
     # scheduler only imports common; the concrete builder was registered when its
     # model file was imported (see common/vision_metadata.py). Kept in-function so
     # the text-only path pays no import cost.
