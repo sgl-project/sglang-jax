@@ -29,7 +29,6 @@ class TestWan2_1Model(CustomTestCase):
                 "--random-seed",
                 "3",
                 "--multimodal",
-                "--disable-precompile",
             ],
             multimodal=True,
         )
@@ -47,6 +46,10 @@ class TestWan2_1Model(CustomTestCase):
         )
         response.raise_for_status()
         result = response.json()
+        # Guard against a semantically-failed generation that still returns
+        # HTTP 200: the encoder pipeline must report success and emit meta_info.
+        self.assertTrue(result.get("success"), msg=f"generation not successful: {result}")
+        self.assertIn("meta_info", result)
         print("success！")
         print(json.dumps(result, indent=4, ensure_ascii=False))
         process.kill()
@@ -63,7 +66,6 @@ class TestWan2_1Model(CustomTestCase):
                 "--random-seed",
                 "3",
                 "--multimodal",
-                "--disable-precompile",
             ],
             multimodal=True,
         )
@@ -76,6 +78,10 @@ class TestWan2_1Model(CustomTestCase):
         )
         response.raise_for_status()
         result = response.json()
+        # Guard against a semantically-failed generation that still returns
+        # HTTP 200: the encoder pipeline must report success and emit meta_info.
+        self.assertTrue(result.get("success"), msg=f"generation not successful: {result}")
+        self.assertIn("meta_info", result)
         print("success！")
         print(json.dumps(result, indent=4, ensure_ascii=False))
         process.kill()

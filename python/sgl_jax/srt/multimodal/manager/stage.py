@@ -10,7 +10,6 @@ import psutil
 from sgl_jax.srt.managers.communication import QueueBackend
 from sgl_jax.srt.managers.scheduler import Scheduler as AutoRegressiveScheduler
 from sgl_jax.srt.models.qwen2 import Qwen2ForCausalLM
-from sgl_jax.srt.models.umt5 import UMT5EncoderModel
 from sgl_jax.srt.multimodal.manager.device_manager import DeviceManager
 from sgl_jax.srt.multimodal.manager.scheduler.audio_backbone_scheduler import (
     AudioBackboneScheduler,
@@ -25,7 +24,7 @@ from sgl_jax.srt.multimodal.manager.scheduler.vae_scheduler import VaeScheduler
 from sgl_jax.srt.multimodal.manager.scheduler.vit_scheduler import VitScheduler
 from sgl_jax.srt.multimodal.models.dits.flux import FluxTransformer2DModel
 from sgl_jax.srt.multimodal.models.encoders.clip import CLIPTextModel
-from sgl_jax.srt.multimodal.models.encoders.t5 import T5EncoderModel
+from sgl_jax.srt.multimodal.models.encoders.t5 import T5EncoderModel, UMT5EncoderModel
 from sgl_jax.srt.multimodal.models.mimo_audio.mimo_audio_backbone import (
     MiMoAudioForCausalLM,
 )
