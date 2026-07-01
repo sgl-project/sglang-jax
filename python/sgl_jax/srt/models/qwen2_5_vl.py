@@ -935,14 +935,6 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
             norm_eps=getattr(self.visual_config, "rms_norm_eps", 1e-6),
         )
 
-    def get_input_embeddings(self):
-        """Return the token-embedding module (callable on input_ids).
-
-        Used by `general_mm_embed_routine`/`embed_mm_inputs` to seed `running`
-        once, outside the round loop, before merging vision features.
-        """
-        return self.model.embed_tokens
-
     def get_image_feature(self, enc):
         """Image embedder (= upstream ``get_image_feature``; resolved by
         ``embed_mm_inputs`` via ``getattr(model, "get_image_feature")``).

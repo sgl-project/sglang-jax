@@ -522,11 +522,13 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         # In-model VLM path (active): run the host embed routine (per-round JIT
         # vision-encode -> JIT merge; aux precomputed host-side by the scheduler
         # and carried in the plan, Design B), landing the merged embedding on
-        # forward_batch.input_embedding before the backbone JIT. `self.model` is
-        # the VL wrapper -- it provides both `get_input_embeddings`
-        # (language_model) and `get_image_feature` (multimodal_model). Gate
-        # excludes decode and target_verify (both is_extend but not vision
-        # encode); the plan is non-None only for extend mm batches.
+        # forward_batch.input_embedding before the backbone JIT. `language_model`
+        # is the Qwen2Model backbone (`self.model.model`) -- it provides
+        # `get_input_embeddings` (embed module) to seed `running`;
+        # `multimodal_model` is the VL wrapper (`self.model`) -- it provides
+        # `get_image_feature`. Gate excludes decode and target_verify (both
+        # is_extend but not vision encode); the plan is non-None only for extend
+        # mm batches.
         if (
             getattr(self.model_config, "is_multimodal", False)
             and not forward_batch.forward_mode.is_decode()
@@ -536,7 +538,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             general_mm_embed_routine(
                 input_ids=forward_batch.input_ids,
                 forward_batch=forward_batch,
-                language_model=self.model,
+                language_model=self.model.model,
                 multimodal_model=self.model,
                 mm_embed_plan=forward_batch.mm_embed_plan,
             )
