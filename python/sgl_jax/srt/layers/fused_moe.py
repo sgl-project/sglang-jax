@@ -282,30 +282,31 @@ class FusedEPMoE(nnx.Module):
                 )
 
                 if self.num_shared_experts > 0:
-                    # fused kernel expects per-channel shared scale (1, 1, se_inter)
-                    # — see _validate_fused_ep_moe_args / kernel.py:455-470
-                    shared_scale_sharding = P(None, None, None)
+                    # Static block-wise checkpoints: store the raw HF 2D block
+                    # scale [out_blocks, in_blocks]; __call__ dequants the fp8
+                    # shared weight to bf16 before the kernel call so the
+                    # Pallas kernel keeps its per-channel-only shared path.
+                    bn = self.quant_block_n or wsz
                     se_inter = self.moe_shared_expert_intermediate_size * self.num_shared_experts
+                    se13_shape = (-(-se_inter // bn), -(-self.hidden_size // wsz))
+                    se2_shape = (-(-self.hidden_size // bn), -(-se_inter // wsz))
 
                     if hasattr(self, "w1_shared_scale"):
                         del self.w1_shared_scale
                     self.w1_shared_scale = nnx.Param(
-                        jnp.zeros((1, 1, se_inter), dtype=jnp.float32),
-                        out_sharding=shared_scale_sharding,
+                        jnp.zeros(se13_shape, dtype=jnp.float32), out_sharding=P(None, None)
                     )
 
                     if hasattr(self, "w3_shared_scale"):
                         del self.w3_shared_scale
                     self.w3_shared_scale = nnx.Param(
-                        jnp.zeros((1, 1, se_inter), dtype=jnp.float32),
-                        out_sharding=shared_scale_sharding,
+                        jnp.zeros(se13_shape, dtype=jnp.float32), out_sharding=P(None, None)
                     )
 
                     if hasattr(self, "w2_shared_scale"):
                         del self.w2_shared_scale
                     self.w2_shared_scale = nnx.Param(
-                        jnp.zeros((1, 1, self.hidden_size), dtype=jnp.float32),
-                        out_sharding=shared_scale_sharding,
+                        jnp.zeros(se2_shape, dtype=jnp.float32), out_sharding=P(None, None)
                     )
 
                 return
@@ -480,6 +481,29 @@ class FusedEPMoE(nnx.Module):
         w3_shared_scale = self.w3_shared_scale.value if self.w3_shared_scale is not None else None
         w2_shared_scale = self.w2_shared_scale.value if self.w2_shared_scale is not None else None
 
+        # Static block-wise shared scale (HF 2D [out_blocks, in_blocks]): the
+        # Pallas kernel's shared-expert VMEM buffers are hard-typed to the
+        # routed weight dtype (fp8) and only accept per-channel (1,1,N) scale,
+        # so compute the shared-expert contribution here in jnp (dequant fp8
+        # weight to bf16) and disable the kernel's shared path.
+        def _dequant(w, s):
+            in_dim, out_dim = w.shape
+            ob, ib = s.shape
+            bk, bn = -(-in_dim // ib), -(-out_dim // ob)
+            full = jnp.repeat(jnp.repeat(s, bn, axis=0)[:out_dim], bk, axis=1)[:, :in_dim].T
+            return (w.astype(jnp.float32) * full).astype(self.dtype)
+
+        external_shared_out = None
+        if w1_shared_val is not None and w1_shared_scale is not None and w1_shared_scale.ndim == 2:
+            w1d = _dequant(w1_shared_val, w1_shared_scale)
+            w3d = _dequant(w3_shared_val, w3_shared_scale)
+            w2d = _dequant(w2_shared_val, w2_shared_scale)
+            x = hidden_states.astype(self.dtype)
+            gate = jax.nn.silu(x @ w1d)
+            external_shared_out = ((gate * (x @ w3d)) @ w2d).astype(hidden_states.dtype)
+            w1_shared_val = w3_shared_val = w2_shared_val = None
+            w1_shared_scale = w3_shared_scale = w2_shared_scale = None
+
         quant_block_k = self.quant_block_k if self.quant_block_k is not None else None
 
         output = fused_ep_moe(
@@ -528,6 +552,9 @@ class FusedEPMoE(nnx.Module):
 
         if out_sharding is None:
             out_sharding = jax.sharding.NamedSharding(self.mesh, P(*([None] * output.ndim)))
+        if external_shared_out is not None:
+            ep_spec = jax.sharding.NamedSharding(self.mesh, P(("data", "tensor"), None))
+            output = output + jax.sharding.reshard(external_shared_out, ep_spec)
         output = jax.sharding.reshard(output, out_sharding)
         return output
 

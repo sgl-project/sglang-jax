@@ -939,18 +939,17 @@ class DeepseekV3ForCausalLM(nnx.Module):
         )
         mappings.update(moe_mappings)
 
-        # Routed expert weight-scale sidecars (static FP8, non-fused only).
-        # Fused MoE static-FP8 placeholder shapes are (1,) today — loading
-        # block scales would need a dedicated fix in fused_moe.py. Skip.
-        #
-        # For each expert weight group (emitted by create_moe_weights_mapping
-        # as `__MOE_EXPERTS__<target_base>`) register a parallel scale group
-        # whose HF keys are the per-expert `*.weight_scale_inv` tensors and
-        # whose target is `<target_base>_scale` (e.g. `wi_0_scale`). After
-        # stacking, WeightLoader's _maybe_convert_epmoe_scale_for_kernel
-        # converts the `[E, out_blocks, in_blocks]` layout into the
-        # kernel-ready `[E, k_blocks, 1, n_out]` expected by GMM.
-        if is_static_quant and not use_fused:
+        # Routed expert weight-scale sidecars (static FP8). For each expert
+        # weight group register a parallel `*_scale` group. WeightLoader's
+        # _maybe_convert_epmoe_scale_for_kernel converts `[E, out_blocks,
+        # in_blocks]` → kernel-ready `[E, k_blocks, 1, n_out]` (works for both
+        # epmoe targets `wi_*_scale` and fused targets `w[123]_scale`).
+        if is_static_quant:
+            # Match the weight mapping's mesh: epmoe uses moe_mesh ("expert"
+            # axis), fused uses the original mesh ("data","tensor" product).
+            scale_load_sharding = (
+                ("expert", None, None) if not use_fused else (("data", "tensor"), None, None)
+            )
             for moe_key, wm in moe_mappings.items():
                 if not moe_key.startswith("__MOE_EXPERTS__"):
                     continue
@@ -959,14 +958,9 @@ class DeepseekV3ForCausalLM(nnx.Module):
                     k.replace(".weight", ".weight_scale_inv") for k in wm.target_path[1:]
                 ]
                 scale_target = f"{target_base}_scale"
-                # Stacked checkpoint scale is `[E, out_blocks, in_blocks]`. Load
-                # replicated on the block dims; _maybe_convert_epmoe_scale_for_kernel
-                # expands via jnp.take, which fails if the gathered axis is
-                # tensor-sharded (ambiguous output sharding). The converter reshards
-                # to model_param.value.sharding at the end.
                 mappings[f"__MOE_EXPERTS__{scale_target}"] = WeightMapping(
                     target_path=[scale_target] + expert_scale_keys,
-                    sharding=("expert", None, None),
+                    sharding=scale_load_sharding,
                     transpose=False,
                     physical_to_logical_map=wm.physical_to_logical_map,
                 )
@@ -975,10 +969,10 @@ class DeepseekV3ForCausalLM(nnx.Module):
         n_shared_experts = getattr(self.config, "n_shared_experts", None)
         if n_shared_experts and n_shared_experts > 0:
             if use_fused:
-                # Fused backend stores shared-expert weights as bare nnx.Param
-                # (no QuantizedLinear swap). Static-FP8 scale mappings for the
-                # fused path are TODO (requires fixed placeholder shapes in
-                # FusedEPMoE.quantize_weights(is_static=True)).
+                # Fused backend stores shared-expert weights as bare nnx.Param.
+                # For static FP8 also load the 2D HF block scale_inv directly
+                # into the matching placeholder; FusedEPMoE.__call__ dequants
+                # the weight to bf16 before the kernel call.
                 for hf_name, target_name in [
                     ("gate_proj", "w1_shared"),
                     ("up_proj", "w3_shared"),
@@ -989,6 +983,14 @@ class DeepseekV3ForCausalLM(nnx.Module):
                         sharding=(None, None),
                         transpose=True,
                     )
+                    if is_static_quant:
+                        mappings[f"{prefix}.mlp.shared_experts.{hf_name}.weight_scale_inv"] = (
+                            WeightMapping(
+                                target_path=f"{target}.mlp.{target_name}_scale",
+                                sharding=(None, None),
+                                transpose=False,
+                            )
+                        )
             else:
                 for proj, sharding in [
                     ("gate_proj", (None, "tensor")),
