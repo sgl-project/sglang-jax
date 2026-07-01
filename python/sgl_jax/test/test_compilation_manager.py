@@ -89,6 +89,39 @@ class TestBucketComputation(unittest.TestCase):
         for b in cm.bs_buckets:
             assert b >= 8, f"bucket {b} < tp_size*2=8 for fused moe"
 
+    def test_bs_buckets_raw_epmoe_unfiltered(self):
+        """Raw server_args.moe_backend='epmoe' (GMM path, e.g. DeepSeek-V3)
+        pads internally and must NOT be forced to bs>=tp*2."""
+        cm = CompilationManager(
+            server_args=_make_server_args(moe_backend="epmoe"),
+            max_padded_batch_size=128,
+            max_padded_num_tokens=2048,
+            dp_size=1,
+            tp_size=16,
+            page_size=128,
+            max_req_len=4096,
+            vocab_size=32000,
+        )
+        assert 1 in cm.bs_buckets, cm.bs_buckets
+
+    def test_bs_buckets_effective_fused_via_param(self):
+        """Architectures that hard-code FusedEPMoE (Qwen3.5) get moe_backend
+        resolved to 'fused' by ModelConfig and pass it explicitly, so the
+        fused_ep_moe alignment filter applies even when the raw server_args
+        string stays at the 'epmoe' default."""
+        cm = CompilationManager(
+            server_args=_make_server_args(moe_backend="epmoe"),
+            max_padded_batch_size=64,
+            max_padded_num_tokens=2048,
+            dp_size=1,
+            tp_size=16,
+            page_size=128,
+            max_req_len=4096,
+            vocab_size=32000,
+            moe_backend="fused",
+        )
+        assert cm.bs_buckets == [32, 64], cm.bs_buckets
+
     def test_bs_buckets_max_included(self):
         cm = CompilationManager(
             server_args=_make_server_args(),

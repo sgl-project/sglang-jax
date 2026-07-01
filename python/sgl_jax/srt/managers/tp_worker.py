@@ -250,6 +250,7 @@ class ModelWorker:
             vocab_size=self.model_config.vocab_size,
             multimodal=server_args.multimodal,
             has_recurrent_state=self.model_runner.linear_recurrent_config is not None,
+            moe_backend=self.model_runner.model_config.moe_backend.value,
         )
 
         # Allocate the persistent cache_loc host buffer once (reused every step
