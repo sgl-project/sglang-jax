@@ -28,6 +28,15 @@ class TestReasoningParserQwen3(CustomTestCase):
         self.assertEqual(reasoning, "step1 step2 step3")
         self.assertEqual(normal, "")
 
+    def test_mimo_shares_qwen3_detector(self):
+        """mimo maps to Qwen3Detector so also gets force_reasoning=True.
+        serving_chat gates mimo on `enable_thinking is True`, so the detector
+        is only invoked when reasoning is active — same safety as qwen3."""
+        parser = ReasoningParser(model_type="mimo")
+        reasoning, normal = parser.parse_non_stream("thinking\n</think>\n\nans")
+        self.assertEqual(reasoning, "thinking\n")
+        self.assertEqual(normal, "ans")
+
     def test_qwen3_streaming_no_open_tag(self):
         parser = ReasoningParser(model_type="qwen3")
         r1, n1 = parser.parse_stream_chunk("step1 ")
