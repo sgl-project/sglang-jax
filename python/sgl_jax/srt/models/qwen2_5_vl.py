@@ -25,7 +25,7 @@ from sgl_jax.srt.models.qwen2 import Qwen2Model
 from sgl_jax.srt.multimodal.configs.qwen_vl.qwen_2_5_vl_config import (
     QwenVLModelVitConfig,
 )
-from sgl_jax.srt.multimodal.kernels.flash_attention import SegmentIds, flash_attention
+from sgl_jax.srt.multimodal.kernels.flash_attention import SegmentIds
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
@@ -35,6 +35,7 @@ init_fn = nnx.initializers.uniform()
 
 
 def apply_rotary_pos_emb_vision(x: jax.Array, rotary_pos_emb: jax.Array) -> jax.Array:
+    # x: [dp, T, N, H]; rotary_pos_emb: [dp, T, rot] (per-image, dp-leading).
     _, _, _, H = x.shape
     half_dim = H // 2
 
@@ -44,8 +45,9 @@ def apply_rotary_pos_emb_vision(x: jax.Array, rotary_pos_emb: jax.Array) -> jax.
     cos_emb = jnp.cos(rotary_pos_emb)
     sin_emb = jnp.sin(rotary_pos_emb)
 
-    cos_emb = cos_emb[None, :, None, :]
-    sin_emb = sin_emb[None, :, None, :]
+    # rope already carries the dp (batch) axis -> only insert the heads (N) axis.
+    cos_emb = cos_emb[:, :, None, :]  # [dp, T, 1, rot]
+    sin_emb = sin_emb[:, :, None, :]
 
     x_rotated_real = x_real * cos_emb - x_imag * sin_emb
     x_rotated_imag = x_real * sin_emb + x_imag * cos_emb
@@ -54,70 +56,49 @@ def apply_rotary_pos_emb_vision(x: jax.Array, rotary_pos_emb: jax.Array) -> jax.
 
 
 def vision_attention(
+    backend,
     q: jax.Array,
     k: jax.Array,
     v: jax.Array,
-    scale: float,
     seg: jax.Array,
 ) -> jax.Array:
-    """In-model ViT attention via the segment_ids flash kernel (block-diagonal).
+    """In-model ViT attention via ``VisionFlashAttentionBackend`` (block-diagonal).
 
-    The in-model (round-loop, DP-only) encode path's single ViT attention
-    primitive. Runs INSIDE ``jitted_mm_encode``'s shard_map (per-rank single
-    image), so it calls the pallas kernel directly -- NO shard_map /
-    FlashAttentionBackend wrapping (those carry head-TP ``P("data","tensor")``
-    which violates this stage's DP-only regime; vision-TP is future work,
-    spec §4). The legacy distance-band / ``valid_token_count`` attention is gone
-    (spec §3.9): windowing is now exact block-diagonal via ``seg``.
+    Batched, dp-leading (spec §2.4 / §3.10): ``q/k/v`` are ``[dp, T, N, H]`` and
+    ``seg`` is ``[dp, T]``. Uses ``VisionFlashAttentionBackend`` (DP-only) -- it
+    wraps the segment-flash pallas kernel in a DP-only shard_map
+    (qkv ``P("data",None,None,None)`` / seg ``P("data",None)``), NO head-TP. Since
+    ``jitted_mm_encode`` is now a pure jit, calling the backend's
+    ``jax.jit(shard_map(...))`` is jit-in-jit (inlined; NOT shard_map nesting).
 
-    Layout: inputs are ``[B, T, N, H]`` (ViT convention); the kernel wants
-    ``[B, N, T, H]`` so we ``transpose(0,2,1,3)`` (the legacy TPU branch did the
-    same -> ~zero cost). The kernel requires the T (seq) dim aligned to 128; we
-    pad T up to a multiple of 128, give padding patches a sentinel segment
-    (``-1``, distinct from every real segment so they are masked both as queries
-    and as keys), run the kernel, then slice ``[:, :, :T, :]`` back.
-
-    ``seg`` is the per-patch segment id ``[T]`` (windowed =
-    ``searchsorted(cu_window_seqlens)``; full-att = a single segment id over
-    valid patches, padding sentinel elsewhere). Same-segment patches attend
-    (block diagonal); ``causal=False``.
+    Layout: the kernel wants ``[dp, N, T, H]`` so we ``transpose(0,2,1,3)``. T is
+    padded to a multiple of 128 (pallas block req); padding rows get a sentinel
+    segment (``-1``, distinct from every real segment -> masked as q and kv), then
+    sliced ``[:, :, :T, :]`` back. ``causal=False`` (carried by the backend).
     """
-    B, T, N, H = q.shape
-    assert B == 1, "Vision attention currently only supports batch size 1"
+    dp, T, N, H = q.shape
 
-    # [B, T, N, H] -> [B, N, T, H] (kernel layout).
+    # [dp, T, N, H] -> [dp, N, T, H] (kernel layout).
     q = jnp.transpose(q, (0, 2, 1, 3))
     k = jnp.transpose(k, (0, 2, 1, 3))
     v = jnp.transpose(v, (0, 2, 1, 3))
 
     # Pad seq (T) up to a multiple of 128 (kernel block requirement). Padding
-    # rows get a sentinel segment so they never share a segment with real
-    # patches (masked as both query and key); their query outputs are sliced off.
+    # rows get a sentinel segment so they never share a segment with real patches.
     T_aligned = ((T + 127) // 128) * 128
     pad = T_aligned - T
     if pad > 0:
         q = jnp.pad(q, ((0, 0), (0, 0), (0, pad), (0, 0)))
         k = jnp.pad(k, ((0, 0), (0, 0), (0, pad), (0, 0)))
         v = jnp.pad(v, ((0, 0), (0, 0), (0, pad), (0, 0)))
-        seg = jnp.concatenate(
-            [seg, jnp.full((pad,), -1, dtype=seg.dtype)],
-            axis=0,
-        )
+        seg = jnp.pad(seg, ((0, 0), (0, pad)), constant_values=-1)  # [dp, T_aligned]
 
-    seg_b = seg[None, :]  # [B=1, T_aligned]
-    segment_ids = SegmentIds(q=seg_b, kv=seg_b)
+    segment_ids = SegmentIds(q=seg, kv=seg)
 
-    output = flash_attention(
-        q,
-        k,
-        v,
-        segment_ids=segment_ids,
-        causal=False,
-        sm_scale=scale,
-    )  # [B, N, T_aligned, H]
+    output = backend(q, k, v, segment_ids)  # [dp, N, T_aligned, H]
 
     output = output[:, :, :T, :]  # slice back to real seq
-    # [B, N, T, H] -> [B, T, N, H]
+    # [dp, N, T, H] -> [dp, T, N, H]
     return jnp.transpose(output, (0, 2, 1, 3))
 
 
@@ -147,18 +128,19 @@ class Qwen2_5_VisionPatchEmbed(nnx.Module):
         )
 
     def __call__(self, x: jax.Array) -> jax.Array:
-        # x is (L, C * T * H * W)
-        L, dim = x.shape
+        # x is (dp, seq_len, C * T * H * W) -- dp-leading batched (spec §3.10);
+        # seq_len == the per-image patch count (== patch_k in the plan).
+        dp, seq_len, dim = x.shape
         C = dim // (self.temporal_patch_size * self.patch_size * self.patch_size)
-        # Reshape to (L, T, H, W, C) for Conv3D with channels_last
-        x = x.reshape(L, C, self.temporal_patch_size, self.patch_size, self.patch_size)
-        # L,T,H,W,C
+        # Fold [dp, seq_len] into ONE conv batch axis: conv is per-element over
+        # the batch, so dp*seq_len patches together == per-image (no cross-image
+        # mixing).
+        x = x.reshape(dp * seq_len, C, self.temporal_patch_size, self.patch_size, self.patch_size)
+        # (dp*seq_len), T, H, W, C
         x = jnp.transpose(x, (0, 2, 3, 4, 1))
         x = self.proj(x)
-        # After conv, shape is (L, T_out, H_out, W_out, C_out)
-        # With stride=kernel_size, T_out=H_out=W_out=1.
-        # So shape is (L, 1, 1, 1, hidden_size)
-        x = x.reshape(L, self.hidden_size)
+        # After conv (stride=kernel_size): (dp*seq_len, 1, 1, 1, hidden_size)
+        x = x.reshape(dp, seq_len, self.hidden_size)  # unfold dp
         return x
 
 
@@ -245,6 +227,19 @@ class Qwen2_5_VisionAttention(nnx.Module):
             rngs=_rngs,
         )
 
+        # DP-only vision attention backend (spec §2.4 / §3.10): reused across all
+        # in-model VLMs. Lazy import avoids a module-level import cycle
+        # (flash_attention_backend -> schedule_batch -> models). ``mesh`` is None
+        # only during eval_shape (which never calls __call__), so guard it.
+        if mesh is not None:
+            from sgl_jax.srt.multimodal.layers.attention.flash_attention_backend import (
+                VisionFlashAttentionBackend,
+            )
+
+            self.attn_backend = VisionFlashAttentionBackend(mesh, sm_scale=self.scale, causal=False)
+        else:
+            self.attn_backend = None
+
     def __call__(
         self,
         x: jax.Array,
@@ -252,47 +247,44 @@ class Qwen2_5_VisionAttention(nnx.Module):
         cu: jax.Array,
         valid: jax.Array | None = None,
     ) -> jax.Array:
-        """ViT attention via block-diagonal segment flash (spec §3.9).
+        """ViT attention via block-diagonal segment flash (dp-leading, spec §3.10).
 
-        ``cu`` is this block's cumulative segment boundaries (window order):
-        full-att blocks pass the degenerate single-segment ``cu_full = [valid]``,
-        windowed blocks pass ``cu_window_seqlens`` -- SAME function, only the
-        ``cu`` differs ("swap the cu, not the function", per tpu-inference). The
-        per-patch segment ids are derived HERE via
-        ``searchsorted(cu, arange(T), side="right")``; round-loop cross-rank
-        padding patches (``p >= valid``) are overwritten with a sentinel segment
-        (``-1``) so they never attend to / from real patches.
+        ``x`` is ``[dp, T, D]``. ``cu`` is this block's cumulative segment
+        boundaries PER IMAGE: full-att blocks pass ``cu_full = [dp, 1]`` (= valid),
+        windowed blocks pass ``cu_window_seqlens`` ``[dp, max_windows]`` -- SAME
+        function, only the ``cu`` differs ("swap the cu, not the function"). The
+        per-patch segment ids are derived here via a batched ``searchsorted``-
+        equivalent broadcast; round-loop cross-rank padding patches
+        (``pos >= valid``) get a sentinel segment (``-1``).
         """
-        T, B, D = x.shape
-        assert B == 1, "Vision attention currently only supports batch size 1"
+        dp, T, D = x.shape
 
-        # cu -> per-patch segment ids (window order), then mask padding patches
-        # with a sentinel segment (-1) distinct from every real segment.
+        # cu -> per-patch segment ids (window order), batched over dp. This is the
+        # broadcast form of searchsorted(side="right"): count of cu <= pos.
         positions = jnp.arange(T)
-        seg = jnp.searchsorted(cu, positions, side="right").astype(jnp.int32)
+        seg = (cu[:, None, :] <= positions[None, :, None]).sum(-1).astype(jnp.int32)  # [dp, T]
         if valid is not None:
-            valid_scalar = jnp.reshape(valid, ())[()]
-            is_real = positions < valid_scalar
+            is_real = positions[None, :] < jnp.reshape(valid, (dp, 1))  # [dp, T]
             seg = jnp.where(is_real, seg, jnp.full_like(seg, -1))
 
         # Project to Q, K, V
-        qkv = self.qkv_proj(x)
-        q, k, v = jnp.split(qkv, 3, axis=-1)
+        qkv = self.qkv_proj(x)  # [dp, T, 3D]
+        q, k, v = jnp.split(qkv, 3, axis=-1)  # [dp, T, D] each
 
-        # Reshape: [T, B, D] -> [B, T, N, H]
-        q = q.reshape(T, B, self.num_heads, self.head_dim).transpose(1, 0, 2, 3)
-        k = k.reshape(T, B, self.num_heads, self.head_dim).transpose(1, 0, 2, 3)
-        v = v.reshape(T, B, self.num_heads, self.head_dim).transpose(1, 0, 2, 3)
+        # [dp, T, D] -> [dp, T, N, H] (dp-leading: NO transpose, already kernel-ready)
+        q = q.reshape(dp, T, self.num_heads, self.head_dim)
+        k = k.reshape(dp, T, self.num_heads, self.head_dim)
+        v = v.reshape(dp, T, self.num_heads, self.head_dim)
 
-        # Apply rotary embeddings
+        # Apply rotary embeddings (rope is per-image [dp, T, rot])
         q = apply_rotary_pos_emb_vision(q, rotary_pos_emb)
         k = apply_rotary_pos_emb_vision(k, rotary_pos_emb)
 
-        # Block-diagonal segment flash attention.
-        output = vision_attention(q, k, v, self.scale, seg)
+        # Block-diagonal segment flash attention via the DP-only backend.
+        output = vision_attention(self.attn_backend, q, k, v, seg)  # [dp, T, N, H]
 
-        # Reshape back: [B, T, N, H] -> [T, B, D]
-        output = output.transpose(1, 0, 2, 3).reshape(T, B, D)
+        # [dp, T, N, H] -> [dp, T, D]
+        output = output.reshape(dp, T, D)
 
         return self.proj(output)
 
@@ -367,12 +359,17 @@ class Qwen2_5_VisionPatchMerger(nnx.Module):
         )
 
     def __call__(self, x: jax.Array) -> jax.Array:
+        # x: [dp, T, ctx] (dp-leading, spec §3.10 #11).
         x = self.ln_q(x)
-        x = x.reshape(-1, self.hidden_size)
+        dp = x.shape[0]
+        # Keep dp on axis 0: the sms² spatial-merge stays WITHIN each image.
+        # ``reshape(-1, ...)`` here would interleave T and dp and silently mix
+        # across images (the one silent-corruption point, spec §3.10 manual-verify②).
+        x = x.reshape(dp, -1, self.hidden_size)  # [dp, T/sms², ctx*sms²]
         x = self.mlp_fc1(x)
         x = self.mlp_act(x)
         x = self.mlp_fc2(x)
-        return x
+        return x  # [dp, T/sms², d_model]
 
 
 class Qwen2_5_VisionTransformer(nnx.Module):
@@ -579,33 +576,36 @@ class Qwen2_5_VisionTransformer(nnx.Module):
         builder -> do NOT re-gather. ``valid`` (real patch count) masks
         round-loop cross-rank padding patches.
         """
-        hidden_states = self.patch_embed(x)
-        seq_len = x.shape[0]
+        # x: [dp, seq, dim_in] (dp-leading batched, spec §3.10).
+        hidden_states = self.patch_embed(x)  # [dp, seq, D]
+        dp = x.shape[0]
+        seq_len = x.shape[1]
+        u = self.spatial_merge_unit
 
-        hidden_states = hidden_states.reshape(
-            seq_len // self.spatial_merge_unit, self.spatial_merge_unit, -1
-        )
-        hidden_states = hidden_states[window_index, :, :]
-        hidden_states = hidden_states.reshape(seq_len, -1)
-        hidden_states = jnp.expand_dims(hidden_states, axis=1)  # [T, B=1, D]
+        hidden_states = hidden_states.reshape(dp, seq_len // u, u, -1)  # [dp, seq//u, u, D]
+        # window 正排 (per-image gather on the unit axis): take_along_axis(axis=1).
+        gather_idx = jnp.broadcast_to(window_index[:, :, None, None], hidden_states.shape)
+        hidden_states = jnp.take_along_axis(hidden_states, gather_idx, axis=1)
+        hidden_states = hidden_states.reshape(dp, seq_len, -1)  # [dp, T, D]
 
-        # full-att blocks: degenerate single segment cu_full = [valid]; windowed
-        # blocks: cu_window_seqlens. Block derives seg + padding sentinel itself.
+        # full-att blocks: degenerate single segment cu_full = [dp, 1] (= valid);
+        # windowed blocks: cu_window_seqlens. Block derives seg + sentinel itself.
         if valid is None:
-            cu_full = jnp.asarray([seq_len], dtype=cu_window_seqlens.dtype)
+            cu_full = jnp.full((dp, 1), seq_len, dtype=cu_window_seqlens.dtype)
         else:
-            cu_full = jnp.reshape(valid, (1,)).astype(cu_window_seqlens.dtype)
+            cu_full = jnp.reshape(valid, (dp, 1)).astype(cu_window_seqlens.dtype)
 
         for layer_num, blk in enumerate(self.blocks):
             cu = cu_full if layer_num in self.fullatt_block_indexes else cu_window_seqlens
             hidden_states = blk(hidden_states, rotary_pos_emb, cu, valid)
 
-        # adapter
+        # adapter (merger): [dp, T, D] -> [dp, T/sms², d_model]
         hidden_states = self.merger(hidden_states)
-        # JIT-safe argsort (numpy would break under JIT).
-        reverse_indices = jnp.argsort(window_index)
-        hidden_states = hidden_states[reverse_indices, :]
-        return hidden_states
+        # 反排 (per-image): argsort along axis=1, then take_along_axis(axis=1).
+        reverse_indices = jnp.argsort(window_index, axis=1)  # [dp, seq//u]
+        rev_idx = jnp.broadcast_to(reverse_indices[:, :, None], hidden_states.shape)
+        hidden_states = jnp.take_along_axis(hidden_states, rev_idx, axis=1)
+        return hidden_states  # [dp, out_rows, H]
 
     def __call__(self, x: jax.Array, grid_thw: tuple[tuple[int, int, int]]) -> jax.Array:
         # x: pixel_values: jax.Array

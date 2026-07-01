@@ -3,7 +3,7 @@ three independently-compiled JIT segments per forward.
 
 Target forward (extend only) for the in-model VLM path::
 
-    JIT(1) vision encode (shard_map)
+    JIT(1) vision encode (pure jit, GSPMD batched)
     JIT(2) multimodal merge (shard_map)
     JIT(3) language backbone  (existing, unchanged)
 
@@ -13,10 +13,10 @@ axis == dp size; everything vision flows as ``P("data")``.
 
 This module owns JIT(1) and JIT(2) plus the host loop that drives them
 (``general_mm_embed_routine`` -> ``embed_mm_inputs``).
-``jitted_mm_encode``/``jitted_mm_merge`` are forward JIT segments (the same
-layer as ``jitted_run_model``): jit-wrapped kernel entries (``mesh`` as a static
-arg) with the shard_map inlined -- the ``@jax.jit`` handles caching, matching the
-repo convention (``kernels/fused_moe``, ``layers/attention/.../paged_attention``).
+``jitted_mm_encode`` is a pure ``@jax.jit`` (GSPMD batched ViT, dp-leading);
+``jitted_mm_merge`` is ``@jax.jit`` wrapping a ``shard_map`` (rank-local gather).
+Both are forward JIT segments (the same layer as ``jitted_run_model``), with
+``mesh`` as a static arg for caching.
 """
 
 import functools
@@ -24,7 +24,7 @@ import functools
 import jax
 import jax.numpy as jnp
 from flax import nnx
-from jax.sharding import PartitionSpec
+from jax.sharding import NamedSharding, PartitionSpec
 
 _MERGE_IN_SPECS = (
     PartitionSpec("data", None),  # running   [total_tok, H]
@@ -65,56 +65,38 @@ def jitted_mm_merge(mesh, running, features, src_idx, mask):
 
 @functools.partial(jax.jit, static_argnames=("mesh", "graphdef", "body"))
 def jitted_mm_encode(mesh, body, graphdef, state, pixels, meta, valid):
-    """Forward JIT(1): single-image ViT ``body`` wrapped in a shard_map.
+    """Forward JIT(1): GSPMD batched ViT (pure jit, dp-leading; spec §2.4 / §3.10).
 
-    A forward JIT segment (same layer as ``jitted_run_model``). The ViT weights
-    flow in as an EXPLICIT JIT operand via ``nnx.split`` -- ``graphdef`` (static
-    structure) + ``state`` (dynamic leaves) -- rather than being closure-captured
-    by ``body``. This matches the backbone's ``jitted_run_model`` (nnx.split)
-    convention and keeps the weights OUT of the compiled constants: a weight
-    reload just passes a fresh ``state`` and the cached executable picks it up,
-    no compile-cache clear needed.
+    Pure ``@jax.jit`` (NO outer shard_map): the ViT runs as a GSPMD batched
+    computation with the leading ``dp`` axis as the batch. Inputs are already
+    device_put on ``P("data", ...)`` by ``init_new``; the ViT body operates on
+    ``[dp, ...]`` and GSPMD partitions the matmuls/norms along ``data`` (weights
+    replicated -> per-image independent -> zero cross-rank collective). The two
+    ops GSPMD can't auto-partition keep their OWN local shard_map: attention
+    (inside the body, via ``FlashAttentionBackend(dp_only=True)``) and merge
+    (``jitted_mm_merge``, JIT(2)).
 
-    ``meta`` is a per-arch registered pytree (e.g. ``VisionMetadata``) already
-    computed host-side by the scheduler (Design B: aux in the plan, NOT
-    recomputed at encode time). Common code treats it as OPAQUE -- it never names
-    the fields.
+    ViT weights flow in as an EXPLICIT operand via ``nnx.split`` (``graphdef``
+    static + ``state`` traced), replicated (no TP); ``nnx.merge`` rebuilds inside.
 
-    DP-only: every tensor axis is replicated (``None``); only the leading ``dp``
-    axis is sharded on ``data``. ``in_specs`` is a pytree-of-PartitionSpec that
-    mirrors the ``(pixels, meta, valid)`` argument structure -- ``meta``'s specs
-    are derived generically from its leaves via ``jax.tree.map`` (each leaf gets
-    ``P("data", *[None]*(ndim-1))``), so this layer stays modality-agnostic
-    (shard_map supports pytree ``in_specs``). shard_map strips the ``dp`` axis, so
-    each shard's body sees one rank's single image: ``pixels[patch_k, dim]``,
-    ``meta`` leaves with the dp axis dropped, and scalar ``valid``. The body is
-    called as ``body(visual, pixels, meta, valid)`` and returns ``[out_rows, H]``;
-    ``out_specs`` assembles them into ``[dp*out_rows, H]``. The ViT weights are
-    replicated (no TP), so the merged ``visual`` is closed over inside shard_map
-    as a replicated value. Returns ``P("data", None)``.
+    ``meta`` is an opaque per-arch registered pytree (scheduler-computed, Design
+    B); common code never names its fields -- the body interprets them.
+
+    The body returns batched ``[dp, out_rows, H]``; we flatten to
+    ``[dp*out_rows, H]`` and ANCHOR the sharding with
+    ``with_sharding_constraint(P("data", None))`` so the encode->merge seam lines
+    up with ``jitted_mm_merge``'s ``_MERGE_IN_SPECS`` (the dp-leading flatten is
+    naturally aligned -- sharded-major ``dp`` + replicated ``out_rows`` -- and the
+    anchor pins "inferred" to "contractual", spec §3.10 #13). Returns
+    ``P("data", None)``.
     """
     visual = nnx.merge(graphdef, state)
-    # ``meta`` is an opaque per-arch registered pytree; common code never names
-    # its fields. Mirror its structure with a pytree-of-PartitionSpec: each leaf
-    # is a jax.Array sharded on the leading ``dp`` axis only (``P("data", None,
-    # ...)``). shard_map supports pytree ``in_specs``.
-    meta_specs = jax.tree.map(lambda leaf: PartitionSpec("data", *([None] * (leaf.ndim - 1))), meta)
-    in_specs = (
-        PartitionSpec("data", None, None),  # pixels  [dp, patch_k, dim]
-        meta_specs,  # opaque meta pytree (leaves carry their own specs)
-        PartitionSpec("data"),  # valid   [dp]
+    features = body(visual, pixels, meta, valid)  # [dp, out_rows, H]
+    dp, out_rows, h = features.shape
+    features = features.reshape(dp * out_rows, h)  # [dp*out_rows, H]
+    return jax.lax.with_sharding_constraint(
+        features, NamedSharding(mesh, PartitionSpec("data", None))
     )
-
-    def encode(pixels_s, meta_s, valid_s):
-        return body(visual, pixels_s, meta_s, valid_s)
-
-    return jax.shard_map(
-        encode,
-        mesh=mesh,
-        in_specs=in_specs,
-        out_specs=PartitionSpec("data", None),
-        check_vma=False,
-    )(pixels, meta, valid)
 
 
 def embed_mm_inputs(

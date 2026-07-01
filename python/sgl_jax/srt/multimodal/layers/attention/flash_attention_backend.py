@@ -51,3 +51,47 @@ class FlashAttentionBackend(AttentionBackend):
     def get_forward_metadata(self, batch: ModelWorkerBatch):
         """Init the metadata for a forward pass and return it"""
         return None
+
+
+class VisionFlashAttentionBackend(AttentionBackend):
+    """DP-only segment-flash attention for the in-model VLM ViT (encode path).
+
+    Kept SEPARATE from ``FlashAttentionBackend`` (which is head-TP, used by
+    ``USPAttention`` for Flux / Wan / Qwen3-Omni audio) so that class stays
+    untouched. Here the ViT is DP-only with replicated weights (spec §2.4):
+    batch on ``data``; heads / T / head_dim are NOT sharded on ``tensor``; and
+    ``segment_ids`` is per-image, riding the batch (``data``) axis rather than
+    being replicated. Wraps the SAME pallas segment-flash kernel as
+    ``FlashAttentionBackend`` -- only the shard specs differ. Reusable across
+    in-model VLM ViTs (Qwen2.5-VL, future Qwen3-Omni, ...).
+    """
+
+    def __init__(self, mesh, sm_scale=1.0, causal=False, vmem_limit_bytes=128 * 1024 * 1024):
+        qkv_spec = P("data", None, None, None)  # dp on data; no head-TP
+        seg_spec = P("data", None)  # per-image segment ids ride the batch axis
+        in_specs = (qkv_spec, qkv_spec, qkv_spec, seg_spec)
+        out_specs = qkv_spec
+
+        def _flash_attention(q, k, v, segment_ids):
+            return flash_attention(
+                q,
+                k,
+                v,
+                segment_ids=segment_ids,
+                sm_scale=sm_scale,
+                causal=causal,
+                vmem_limit_bytes=vmem_limit_bytes,
+            )
+
+        self.jit_flash_attention = jax.jit(
+            jax.shard_map(
+                _flash_attention, mesh=mesh, in_specs=in_specs, out_specs=out_specs, check_vma=False
+            )
+        )
+
+    def __call__(self, q, k, v, segment_ids):
+        return self.jit_flash_attention(q, k, v, segment_ids)
+
+    def get_forward_metadata(self, batch: ModelWorkerBatch):
+        """Init the metadata for a forward pass and return it"""
+        return None
