@@ -49,6 +49,13 @@ _PERSTAGE = math.sqrt(2.0) * _EPS_BF16
 # prefill and decode use the same flash kernel — tighter single-attn band:
 _RTOL_ATTN = round(_PERSTAGE * 2.0, 4)  # ~0.022
 _RTOL_LOGITS = round(_PERSTAGE * math.sqrt(_NUM_LAYERS + 1) * 2.0, 4)  # ~0.054
+# TRUE fp32 logic gate (see test_prefill_equals_decode): the flash/RPA kernel HONORS
+# jax.default_matmul_precision("highest") (6-pass fp32 on the MXU). Under it the fp32
+# prefill==decode residual drops to ~1e-6 (measured 1.33e-6 @ 6 layers) vs the DEFAULT
+# bf16-input-truncation (~0.035, and it even NaNs on some configs at depth). That isolates
+# LOGIC: a structural KV/position/mask/cache bug gives O(0.01-1) — far above this band —
+# so any breach is a real bug, not floating-point noise.
+_RTOL_FP32_LOGIC = 1e-4
 
 _RNG = np.random.default_rng(13)
 
@@ -489,12 +496,18 @@ class TestPrefillDecodeConsistency(unittest.TestCase):
         print(f" band: _RTOL_LOGITS={_RTOL_LOGITS} (depth √(L+1))")
 
     def test_prefill_equals_decode(self):
-        """fp32: EXTEND-prefill logit[k] == autoregressive-decode logit[k] (logic correctness).
+        """fp32 LOGIC gate: EXTEND-prefill logit[k] == autoregressive-decode logit[k].
 
-        fp32 removes bf16 noise -> tight check that the EXTEND vs DECODE KV-cache logic is
-        correct: argmax must AGREE and logits within _RTOL_LOGITS (√(L+1) depth band).
+        Runs under jax.default_matmul_precision("highest") so the MXU does 6-pass fp32
+        (the DEFAULT truncates matmul inputs to bf16 — that is NOT true fp32 and leaves a
+        bf16-magnitude residual, defeating the point of a logic gate). At true fp32 the
+        reduction-order noise between the two paths collapses to ~1e-6, so this is a TIGHT
+        check that the EXTEND-vs-DECODE KV-cache logic (positions/mask/cache indexing) is
+        structurally correct: argmax must AGREE and logits within _RTOL_FP32_LOGIC. The
+        bf16 production regime is guarded separately by test_prefill_equals_decode_bf16.
         """
-        rows = self._prefill_decode_rows(jnp.float32)
+        with jax.default_matmul_precision("highest"):
+            rows = self._prefill_decode_rows(jnp.float32)
         self._print_pd_rows("fp32", rows)
         for k, ap, ad, *_ in rows:
             self.assertEqual(ap, ad, f"[fp32] prefill vs decode argmax differ at position {k}")
@@ -502,22 +515,29 @@ class TestPrefillDecodeConsistency(unittest.TestCase):
             np.testing.assert_allclose(
                 mx,
                 0.0,
-                atol=_RTOL_LOGITS * max(sc, 1e-6),
+                atol=_RTOL_FP32_LOGIC * max(sc, 1e-6),
                 err_msg=(
-                    f"[fp32] prefill vs decode logits at pos {k} exceed _RTOL_LOGITS; "
-                    f"max_abs={mx:.4f} scale={sc:.3f} rel={rl:.4f}"
+                    f"[fp32] prefill vs decode logits at pos {k} exceed _RTOL_FP32_LOGIC; "
+                    f"max_abs={mx:.6f} scale={sc:.3f} rel={rl:.6f} — a breach at true fp32 "
+                    f"means a structural KV/position/mask/cache bug, not fp noise"
                 ),
             )
 
     def test_prefill_equals_decode_bf16(self):
-        """bf16 (production dtype): same invariant in the production regime.
+        """bf16 (production regime): same invariant at the production dtype AND precision.
 
-        EXTEND and DECODE are two reduction orders accumulating bf16 error over L layers, so
-        the criterion is logit agreement within the √(L+1) cross-depth band _RTOL_LOGITS, NOT
-        strict argmax — near-tie argmax flips within the band are expected (doc §3.1/P6), and
-        the numeric band subsumes them (a flip needs top1≈top2 inside the band). If bf16
-        exceeds the band, the printed max_abs/rel is the measured floor to recalibrate against
-        (doc §2.5). fp32 (above) already proved the logic; this guards the bf16 regime.
+        bf16 is MXU-native, so DEFAULT matmul precision here IS how production serves — the
+        measured residual (~0.041) is the genuine bf16 floor, not an artifact. EXTEND and
+        DECODE are two reduction orders accumulating bf16 error over L layers, so the
+        criterion is logit agreement within the √(L+1) cross-depth band _RTOL_LOGITS, NOT
+        strict argmax — near-tie argmax flips within the band are expected (doc §3.1/P6) and
+        the numeric band subsumes them (a flip needs top1≈top2 inside the band).
+
+        A per-LAYER jump-detector (assert no single layer's increment >> median) was the
+        original design but is infeasible here: microscale is only 6 layers (too few for a
+        curve) and the synthetic depth harness NaNs at true depth under DEFAULT precision.
+        The √(L+1) band + near-tie tolerance is the right microscale guard; the fp32 test
+        above (true-fp32 logic gate) already proves the structure is correct.
         """
         rows = self._prefill_decode_rows(jnp.bfloat16, page_size=4)
         self._print_pd_rows("bf16", rows)
