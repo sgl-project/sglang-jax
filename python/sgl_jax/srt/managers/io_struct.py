@@ -279,6 +279,10 @@ class GenerateReqInput:
     input_ids: list[list[int]] | list[int] | None = None
     # The embeddings for input_ids; one can specify either text or input_ids or input_embeds.
     input_embeds: list[list[list[float]]] | list[list[float]] | None = None
+    # Pre-computed multimodal inputs, e.g. {"multimodal_embedding": [[...]]} for
+    # vision embeddings produced offline. Forwarded to the scheduler, which wires
+    # them onto Req.multimodal_embedding -> ForwardBatch.input_embedding.
+    mm_inputs: dict | None = None
     # The image input. It can be an image instance, file name, URL, or base64 encoded string.
     # Can be formatted as:
     # - Single image for a single request

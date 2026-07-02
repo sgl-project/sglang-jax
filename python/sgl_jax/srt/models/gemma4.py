@@ -930,7 +930,114 @@ class Gemma4ForCausalLM(nnx.Module):
 
 
 class Gemma4ForConditionalGeneration(Gemma4ForCausalLM):
-    pass
+    """Gemma4 multimodal: text decoder + vision tower.
+
+    The text decode/prefill path is inherited unchanged — it reads
+    ``forward_batch.input_embedding`` for multimodal prefill (already wired in
+    ``Gemma4Model``). Image embeddings are produced by ``get_image_feature``
+    (vision encoder → ``embed_vision`` projection) and merged into the input
+    embedding stream via the ``mm_inputs.multimodal_embedding`` scheduler path.
+    """
+
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        mesh: jax.sharding.Mesh,
+        dtype: jnp.dtype = jnp.bfloat16,
+    ):
+        super().__init__(config, mesh=mesh, dtype=dtype)
+        from sgl_jax.srt.multimodal.models.gemma4.vision_encoder import (
+            Gemma4MultimodalEmbedder,
+            Gemma4VisionEncoder,
+        )
+
+        vision_config = getattr(config, "vision_config", None)
+        if vision_config is None:
+            raise ValueError("Gemma4ForConditionalGeneration requires config.vision_config")
+        self.vision_config = vision_config
+        self.vision_tower = Gemma4VisionEncoder(vision_config, dtype=dtype)
+        self.embed_vision = Gemma4MultimodalEmbedder(
+            vision_config.hidden_size,
+            self.config.hidden_size,
+            getattr(vision_config, "rms_norm_eps", 1e-6),
+            dtype=dtype,
+        )
+
+    def get_image_feature(
+        self, pixel_values: jax.Array, pixel_position_ids: jax.Array
+    ) -> jax.Array:
+        """Encode pre-patchified images into text-space embeddings.
+
+        Args:
+          pixel_values: ``[B, num_patches, 768]`` (HF Gemma4ImageProcessor output).
+          pixel_position_ids: ``[B, num_patches, 2]`` (x, y), -1 for padding.
+        Returns:
+          ``[B, out_len, text_hidden]`` soft-token embeddings (caller drops
+          padded rows using the encoder's valid mask if needed).
+        """
+        soft_tokens, valid_mask = self.vision_tower(pixel_values, pixel_position_ids)
+        return self.embed_vision(soft_tokens), valid_mask
+
+    def load_weights(self, model_config: ModelConfig):
+        super().load_weights(model_config)
+        self._load_vision_weights(model_config)
+
+    def _load_vision_weights(self, model_config: ModelConfig):
+        """Load ``model.vision_tower.*`` + ``model.embed_vision.*`` directly from
+        safetensors into the nnx tree (separate from the text WeightLoader, whose
+        QKV/transpose semantics don't apply to the standalone vision encoder)."""
+        import json
+        import os
+
+        from sgl_jax.srt.multimodal.models.gemma4.vision_encoder import (
+            vision_weight_mappings,
+        )
+
+        model_path = model_config.model_path
+        index_path = os.path.join(model_path, "model.safetensors.index.json")
+        if not os.path.exists(index_path):
+            logger.warning("vision: no safetensors index at %s, skipping", index_path)
+            return
+        with open(index_path) as f:
+            weight_map = json.load(f)["weight_map"]
+
+        enc_mappings = vision_weight_mappings(self.vision_config.num_hidden_layers)
+        proj_key = "model.embed_vision.embedding_projection.weight"
+
+        wanted = {k: v for k, v in enc_mappings.items() if k in weight_map}
+        by_file: dict[str, list[str]] = {}
+        for hf_key in list(wanted) + ([proj_key] if proj_key in weight_map else []):
+            by_file.setdefault(weight_map[hf_key], []).append(hf_key)
+
+        enc_state = nnx.state(self.vision_tower)
+        for fname, keys in by_file.items():
+            with safetensors.safe_open(
+                os.path.join(model_path, fname), framework="np", device="cpu"
+            ) as f:
+                for hf_key in keys:
+                    w = f.get_tensor(hf_key)
+                    if hf_key == proj_key:
+                        self.embed_vision.embedding_projection.kernel.value = jnp.asarray(
+                            w.T, dtype=self.dtype
+                        )
+                        continue
+                    dst = enc_mappings[hf_key]
+                    if dst.endswith(".kernel"):
+                        w = w.T
+                    _set_nnx_path(enc_state, dst, jnp.asarray(w))
+        nnx.update(self.vision_tower, enc_state)
+        logger.info("Gemma4 vision tower + embed_vision weights loaded.")
+
+
+def _set_nnx_path(state, path: str, value):
+    """Set a leaf in an nnx State tree by dotted path (ints index lists)."""
+    parts = path.split(".")
+    node = state
+    for p in parts[:-1]:
+        node = node[int(p)] if p.isdigit() else node[p]
+    leaf = parts[-1]
+    cur = node[int(leaf)] if leaf.isdigit() else node[leaf]
+    cur.value = value.astype(cur.value.dtype)
 
 
 EntryClass = [Gemma4ForCausalLM, Gemma4ForConditionalGeneration]
