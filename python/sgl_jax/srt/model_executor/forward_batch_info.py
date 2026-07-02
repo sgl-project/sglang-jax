@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec
 from jax.tree_util import register_pytree_node_class
 
@@ -143,6 +144,32 @@ class CaptureHiddenMode(IntEnum):
             raise ValueError(f"Unknown CaptureHiddenMode: {mode}")
 
 
+def _device_put_embed_plan(plan, mesh):
+    """Place every array leaf in the embed plan on data-leading sharding."""
+
+    def _data_leading_spec(arr):
+        ndim = np.asarray(arr).ndim
+        if ndim == 0:
+            return PartitionSpec()
+        return PartitionSpec("data", *([None] * (ndim - 1)))
+
+    def _put(arr):
+        if arr is None:
+            return None
+        (placed,) = device_array((arr,), sharding=NamedSharding(mesh, _data_leading_spec(arr)))
+        return placed
+
+    for rounds in plan.rounds_by_modality.values():
+        for rnd in rounds:
+            enc = rnd.encode_inputs
+            enc.pixels = _put(enc.pixels)
+            enc.valid = _put(enc.valid)
+            enc.meta = jax.tree.map(_put, enc.meta)
+            rnd.src_idx = _put(rnd.src_idx)
+            rnd.mask = _put(rnd.mask)
+    return plan
+
+
 @register_pytree_node_class
 @dataclass
 class ForwardBatch:
@@ -203,6 +230,12 @@ class ForwardBatch:
 
     # Recurrent state indices [batch_size]
     recurrent_indices: jax.Array | None = None
+
+    # In-model VLM owning-rank DP embed plan. After init_new, the same host-side
+    # plan object holds device arrays for encode common inputs, per-arch meta,
+    # and merge indices. Consumed by general_mm_embed_routine OUTSIDE the
+    # backbone JIT, so it is a PLAIN attribute and NOT a pytree child below.
+    mm_embed_plan: object | None = None
 
     def tree_flatten(self):
         children = (
@@ -270,6 +303,10 @@ class ForwardBatch:
         obj.apply_for_deepstack = children[17]
         obj.deepstack_visual_embedding = children[18]
         obj.recurrent_indices = children[19]
+        # Host-only attribute, never a pytree child; reset so attribute access on
+        # an unflattened ForwardBatch never raises (the routine that consumes it
+        # runs on the original, pre-jit ForwardBatch).
+        obj.mm_embed_plan = None
         return obj
 
     def __repr__(self) -> str:
@@ -365,7 +402,7 @@ class ForwardBatch:
         if batch.input_embedding is not None:
             (input_embedding,) = device_array(
                 (batch.input_embedding,),
-                sharding=(NamedSharding(model_runner.mesh, PartitionSpec(None, None))),
+                sharding=(NamedSharding(model_runner.mesh, PartitionSpec("data", None))),
             )
         if input_embedding is not None:
             input_embedding = input_embedding.astype(jnp.bfloat16)
@@ -384,7 +421,7 @@ class ForwardBatch:
                 sharding=(NamedSharding(model_runner.mesh, PartitionSpec("data"))),
             )
         else:
-            (lora_scalings, lora_token_indices, lora_ranks) = (
+            lora_scalings, lora_token_indices, lora_ranks = (
                 batch.lora_scalings,
                 batch.lora_token_indices,
                 batch.lora_ranks,
@@ -407,6 +444,15 @@ class ForwardBatch:
                 (batch.recurrent_indices,),
                 sharding=(NamedSharding(model_runner.mesh, PartitionSpec("data"))),
             )
+
+        # In-model VLM embed plan: device_put each EmbedRound's array leaves onto
+        # the encode input sharding (pixels/valid + VisionMetadata leaves) and
+        # merge shard_map input sharding (src_idx/mask). Zero computation -- just
+        # placement. aux is precomputed host-side by the scheduler and carried in
+        # the plan.
+        mm_embed_plan = None
+        if getattr(batch, "mm_embed_plan", None) is not None:
+            mm_embed_plan = _device_put_embed_plan(batch.mm_embed_plan, model_runner.mesh)
 
         obj = cls(
             bid=batch.bid,
@@ -435,6 +481,7 @@ class ForwardBatch:
             expert_location_metadata=expert_location_metadata,
             recurrent_indices=recurrent_indices,
         )
+        obj.mm_embed_plan = mm_embed_plan
 
         # Auto-generate attention mask for Encoder-only models (e.g. UMT5Encoder, BERT)
         is_embedding = getattr(model_runner.model_config, "is_embedding", False)

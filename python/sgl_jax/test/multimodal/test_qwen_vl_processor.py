@@ -43,6 +43,14 @@ class TestQwenVLProcessor(unittest.TestCase):
         self.assertEqual(items[1].offsets, [(5, 8)])
         self.assertEqual(items[0].feature.shape, (8, 1))
         self.assertEqual(items[1].feature.shape, (16, 1))
+        np.testing.assert_array_equal(
+            items[0].model_specific_data["image_grid_thw"],
+            np.array([[1, 2, 4]], dtype=np.int32),
+        )
+        np.testing.assert_array_equal(
+            items[1].model_specific_data["image_grid_thw"],
+            np.array([[1, 4, 4]], dtype=np.int32),
+        )
 
 
 if __name__ == "__main__":
