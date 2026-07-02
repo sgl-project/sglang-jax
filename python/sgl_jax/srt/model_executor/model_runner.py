@@ -508,14 +508,12 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         # marks the input deleted the instant kDonateInput dispatches, so a GIL
         # switch in this window lets scatter read a deleted array.
         _kv_lock = getattr(self.token_to_kv_pool, "_donate_lock", None)
-        with (
-            jtu.count_pjit_cpp_cache_miss() as count,
-            _kv_lock if _kv_lock is not None else contextlib.nullcontext(),
-        ):
-            output, pool_updates, _, layers_topk_ids = self.jitted_run_model(
-                forward_batch, logits_metadata
-            )
-            cache_miss_count = count()
+        with _kv_lock if _kv_lock is not None else contextlib.nullcontext():
+            with jtu.count_pjit_cpp_cache_miss() as count:
+                output, pool_updates, _, layers_topk_ids = self.jitted_run_model(
+                    forward_batch, logits_metadata
+                )
+                cache_miss_count = count()
 
             # tp_size==1: sharding constraint is lost after JIT; re-place explicitly.
             # See https://github.com/sgl-project/sglang-jax/issues/233

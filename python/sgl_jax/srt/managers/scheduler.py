@@ -310,7 +310,7 @@ class Scheduler(
             # capacity so PrefillAdder never truncates a req mid-batch when
             # packing many short reqs (e.g. 32-way GSM8K -> 6x~700 > 4096).
             server_args.chunked_prefill_size = max(
-                server_args.chunked_prefill_size, server_args.pd_prefill_max_tokens
+                server_args.chunked_prefill_size or 0, server_args.pd_prefill_max_tokens
             )
             if not server_args.quantization_config_path:
                 # Dynamic quant: cache holds BF16; after quant the fp8 model
@@ -1115,16 +1115,17 @@ class Scheduler(
         self.result_queue = deque()
         _pd_iter_trace = self.pd == "pathways"
 
-        import gc as _gc
+        if self.pd == "pathways":
+            import gc as _gc
 
-        _gc.collect()
-        _gc.freeze()
-        _gc.set_threshold(700, 10, 10000)
-        logger.info(
-            "[pd-gc] gc.freeze() frozen=%d thresholds=%s",
-            _gc.get_freeze_count(),
-            _gc.get_threshold(),
-        )
+            _gc.collect()
+            _gc.freeze()
+            _gc.set_threshold(700, 10, 10000)
+            logger.info(
+                "[pd-gc] gc.freeze() frozen=%d thresholds=%s",
+                _gc.get_freeze_count(),
+                _gc.get_threshold(),
+            )
 
         while True:
             _it0 = time.perf_counter() if _pd_iter_trace else 0.0
@@ -1780,7 +1781,8 @@ class Scheduler(
     def get_next_batch_to_run(self) -> ScheduleBatch | None:
         if self.pd == "pathways":
             return self._pd_get_next_batch_async()
-        # PD: 先尝试迁移之前 D 满时暂存的 batch（D running req 完成后 free 出空间）
+        # PD: retry migrating the batch parked when D pool was full (D running
+        # reqs finishing frees space).
         if self.pd and self._pd_pending_migrate is not None:  # noqa: SIM102
             if self._pd_migrate(self._pd_pending_migrate):
                 if self.running_batch.is_empty():
@@ -1835,7 +1837,7 @@ class Scheduler(
             # Merge the new batch into the running batch
             if not self.last_batch.is_empty() and not self.last_batch.is_prefill_only:
                 if self.pd and not self._pd_migrate(self.last_batch):
-                    # D 满，暂存等 D running req 完成 free 后再 migrate
+                    # D pool full: park and retry migrate after D reqs finish.
                     assert self._pd_pending_migrate is None
                     self._pd_pending_migrate = self.last_batch
                 elif self.running_batch.is_empty():
@@ -2495,6 +2497,9 @@ class Scheduler(
             assert all(
                 r is None for r in self.chunked_reqs
             ), "[pd_async] chunked prefill not supported (single-req IL exceeds pd_prefill_max_tokens)"
+            assert not any(
+                r.return_logprob for info in new_batch.reqs_info if info.reqs for r in info.reqs
+            ), "[pd_async] return_logprob / hidden_states not yet supported (async prefill drops logits_output)"
             self._pd_inflight += sum(len(info.reqs) for info in new_batch.reqs_info if info.reqs)
             self._pd_prefill_qs[i].put_nowait(new_batch)
             break
@@ -2504,7 +2509,7 @@ class Scheduler(
         return None
 
     def _pd_gather_output(self, arr, is_prefill: bool) -> np.ndarray:
-        """sub-mesh forward output（仅半边 process addressable）→ 全 process numpy。"""
+        """Sub-mesh forward output (addressable on one side only) -> full numpy."""
         if self.pd == "pathways":
             return np.asarray(jax.device_get(arr))
         from jax.experimental.multihost_utils import broadcast_one_to_all
@@ -2518,8 +2523,9 @@ class Scheduler(
         return np.asarray(broadcast_one_to_all(local, is_source=(jax.process_index() == src_pid)))
 
     def _pd_swap_p_pool(self, p_idx: int = 0):
-        """get_new_batch_prefill / process_batch_result_prefill 期间临时把
-        self.{tree_cache,req_to_token_pool,token_to_kv_pool_allocator,mesh} 指向 P[p_idx] 侧。
+        """Temporarily point self.{tree_cache, req_to_token_pool,
+        token_to_kv_pool_allocator, mesh} at the P[p_idx] side while
+        get_new_batch_prefill / process_batch_result_prefill run.
         """
         from contextlib import contextmanager
 
@@ -2564,9 +2570,10 @@ class Scheduler(
         return _ctx()
 
     def _pd_migrate(self, batch: ScheduleBatch) -> bool:
-        """把 batch（prefill 完成、已 filter 掉 chunked/finished）中的 reqs 从 P pool
-        迁移到 D pool（KV ppermute + r2t/alloc/req 状态重写），使其可 merge 进 D
-        running_batch。D pool 不够时返回 False（caller 应暂存等 D free）。"""
+        """Migrate reqs (prefill done, chunked/finished already filtered) from
+        the P pool into the D pool (KV transfer + r2t/alloc/req rewrite) so
+        they can merge into the D running_batch. Returns False if D pool lacks
+        space (caller should park and retry after D frees)."""
         from sgl_jax.srt.disaggregation.pathways_pd import migrate_reqs_p_to_d
 
         all_reqs = []
@@ -2591,7 +2598,8 @@ class Scheduler(
             self.token_to_kv_pool_allocator,
             self.kv_transfer,
         )
-        # batch 元信息改绑 D pool（merge_batch 不检查，但后续 prepare_for_decode 用）
+        # Rebind batch metadata to D pool (merge_batch doesn't check, but
+        # prepare_for_decode reads these).
         batch.req_to_token_pool = self.req_to_token_pool
         batch.token_to_kv_pool_allocator = self.token_to_kv_pool_allocator
         batch.tree_cache = self.tree_cache

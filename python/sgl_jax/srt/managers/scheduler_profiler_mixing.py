@@ -220,7 +220,9 @@ class SchedulerProfilerMixin:
 
         print(f"profiler_options: {profiler_options}")
 
-        if self.profiler_output_dir.startswith("gs://"):
+        if os.getenv("JAX_PLATFORMS") != "proxy":
+            jax.profiler.start_trace(self.profiler_output_dir, profiler_options=profiler_options)
+        elif self.profiler_output_dir.startswith("gs://"):
             # Pathways: worker device trace only. Client-side python tracer
             # OOMs head pod on stop (millions of events); patch it out.
             from pathwaysutils import profiling as _pwp
@@ -233,7 +235,7 @@ class SchedulerProfilerMixin:
                 max_num_hosts=int(os.getenv("SGLANG_PROFILE_MAX_HOSTS", "8")),
             )
         else:
-            # local: client-side host trace only (bypass pathwaysutils worker RPC)
+            # Pathways local: client-side host trace only (bypass worker RPC)
             from pathwaysutils.profiling import _original_start_trace
 
             _original_start_trace(self.profiler_output_dir, profiler_options=profiler_options)
@@ -298,7 +300,7 @@ class SchedulerProfilerMixin:
             )
 
         logger.info("Stop profiling...")
-        if self.profiler_output_dir.startswith("gs://"):
+        if os.getenv("JAX_PLATFORMS") != "proxy" or self.profiler_output_dir.startswith("gs://"):
             jax.profiler.stop_trace()
         else:
             if not Path(self.profiler_output_dir).exists():

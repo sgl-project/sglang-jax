@@ -394,6 +394,11 @@ class ServerArgs:
                 f"--disaggregation-mode must be one of {valid_modes}, "
                 f"got {self.disaggregation_mode!r}"
             )
+        if self.pd_disaggregation and self.disaggregation_mode != "null":
+            raise ValueError(
+                "--pd-disaggregation (single-controller) and --disaggregation-mode "
+                "(multi-process) are mutually exclusive"
+            )
         if self.disaggregation_mode != "null":
             if self.disaggregation_bootstrap_url is None:
                 raise ValueError(
