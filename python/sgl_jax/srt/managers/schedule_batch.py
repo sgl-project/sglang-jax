@@ -56,7 +56,11 @@ from sgl_jax.srt.multimodal.common.mm_plan import (
     MultimodalEmbedPlan,
     VisionEncodeInputs,
 )
-from sgl_jax.srt.multimodal.common.modality_enum import Modality, MultimodalInputs
+from sgl_jax.srt.multimodal.common.modality_enum import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputs,
+)
 from sgl_jax.srt.precision_tracer import (
     PrecisionTracerRequestMetadata,
     precision_tracer,
@@ -2981,26 +2985,12 @@ def _extract_mm_value(mm_inputs: Any, key: str):
     return getattr(mm_inputs, key, None)
 
 
-def _is_image_mm_item(item: Any) -> bool:
-    modality = getattr(item, "modality", None)
-    if modality is None and isinstance(item, dict):
-        modality = item.get("modality")
-    # Compare against the Modality enum (IMAGE/MULTI_IMAGES), not the string
-    # "image": MultimodalDataItem.modality is the enum, whose `.value` is an int
-    # (auto()), so the old `== "image"` check never matched.
-    if isinstance(modality, str):
-        try:
-            modality = Modality.from_str(modality)
-        except ValueError:
-            return False
-    return modality in (Modality.IMAGE, Modality.MULTI_IMAGES)
-
-
-def _mm_item_offsets(item: Any) -> list:
-    offsets = getattr(item, "offsets", None)
-    if offsets is None and isinstance(item, dict):
-        offsets = item.get("offsets")
-    return offsets or []
+def _as_mm_item(item: Any) -> MultimodalDataItem:
+    if isinstance(item, MultimodalDataItem):
+        return item
+    if isinstance(item, dict):
+        return MultimodalDataItem.from_dict(item)
+    raise TypeError(f"mm_items must contain MultimodalDataItem, got {type(item).__name__}.")
 
 
 def _build_merge_idx(
@@ -3031,10 +3021,10 @@ def _build_merge_idx(
         item, req_base = entry
         rank_base = dp_rank * per_dp_token
         feat_row = 0
-        for start, end in _mm_item_offsets(item):
+        for start, end in item.offsets or []:
             for o in range(int(start), int(end) + 1):
                 tok = rank_base + req_base + o
-                if tok < rank_base or tok >= rank_base + per_dp_token:
+                if tok >= rank_base + per_dp_token:
                     raise ValueError(
                         "IMAGE placeholder offset is outside its packed rank slot: "
                         f"dp_rank={dp_rank}, req_base={req_base}, offset={o}, "
@@ -3082,8 +3072,9 @@ def build_mm_embed_plan(
         req_base = 0  # running slot offset of the current req within this rank
         for req in info.reqs:
             mm_items = _extract_mm_value(req.mm_inputs, "mm_items") or []
-            for item in mm_items:
-                if _is_image_mm_item(item):
+            for raw_item in mm_items:
+                item = _as_mm_item(raw_item)
+                if item.is_image():
                     items_by_rank[dp_rank].append((item, req_base))
             # Advance by how many tokens this req contributes to the slot (the
             # extend window, == len(fill_ids) - len(prefix_indices)).
@@ -3120,7 +3111,7 @@ def build_mm_embed_plan(
         for r, item in enumerate(rank_items_k):
             if item is None:
                 continue
-            feat = _extract_mm_value(item, "feature")
+            feat = item.feature
             if feat is None:
                 raise ValueError(f"IMAGE item in round {k}, dp_rank {r} is missing feature.")
             feat = np.asarray(feat)

@@ -144,15 +144,14 @@ class CaptureHiddenMode(IntEnum):
             raise ValueError(f"Unknown CaptureHiddenMode: {mode}")
 
 
-def _data_leading_spec(arr):
-    ndim = np.asarray(arr).ndim
-    if ndim == 0:
-        return PartitionSpec()
-    return PartitionSpec("data", *([None] * (ndim - 1)))
-
-
 def _device_put_embed_plan(plan, mesh):
     """Place every array leaf in the embed plan on data-leading sharding."""
+
+    def _data_leading_spec(arr):
+        ndim = np.asarray(arr).ndim
+        if ndim == 0:
+            return PartitionSpec()
+        return PartitionSpec("data", *([None] * (ndim - 1)))
 
     def _put(arr):
         if arr is None:

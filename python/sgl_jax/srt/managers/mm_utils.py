@@ -21,15 +21,6 @@ _MERGE_IN_SPECS = (
 )
 
 
-def _merge_local(running, features, src_idx, mask):
-    """Per shard (one DP rank's slice): ``where(mask, features[src_idx], running)``.
-
-    No cumsum, no clip, no host sync -- ``src_idx``/``mask`` are precomputed by
-    the scheduler.
-    """
-    return jnp.where(mask[:, None], features[src_idx], running)
-
-
 @functools.partial(jax.jit, static_argnames=("mesh",))
 def jitted_mm_merge(mesh, running, features, src_idx, mask):
     """Merge encoded multimodal rows into the token embedding stream.
@@ -37,8 +28,12 @@ def jitted_mm_merge(mesh, running, features, src_idx, mask):
     ``running``/``features`` are ``P("data", None)``; ``src_idx``/``mask`` are
     ``P("data")``. Returns ``P("data", None)``.
     """
+
+    def merge_local(running, features, src_idx, mask):
+        return jnp.where(mask[:, None], features[src_idx], running)
+
     return jax.shard_map(
-        _merge_local,
+        merge_local,
         mesh=mesh,
         in_specs=_MERGE_IN_SPECS,
         out_specs=PartitionSpec("data", None),

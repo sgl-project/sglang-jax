@@ -13,6 +13,7 @@ from typing import Any
 import numpy as np
 from jax.tree_util import register_pytree_node_class
 
+from sgl_jax.srt.multimodal.common.modality_enum import MultimodalDataItem
 from sgl_jax.srt.multimodal.common.vision_metadata import (
     register_vision_metadata_builder,
 )
@@ -58,18 +59,13 @@ class Qwen25VLVisionMetadata:
         return cls(*children)
 
 
-def _item_grid_thw(item: Any) -> tuple:
+def _item_grid_thw(item: MultimodalDataItem) -> tuple:
     """First ``(t, h, w)`` of this item's ``image_grid_thw`` as a python-int tuple.
 
     Qwen-specific: the builder pulls its geometry FROM the item here, so the
     common ``get_metadata(item)`` interface stays arch-agnostic.
     """
-    md = getattr(item, "model_specific_data", None)
-    grid = md.get("image_grid_thw") if isinstance(md, dict) else getattr(md, "image_grid_thw", None)
-    if grid is None:
-        grid = getattr(item, "image_grid_thw", None)
-        if grid is None and isinstance(item, dict):
-            grid = item.get("image_grid_thw")
+    grid = item.get("image_grid_thw")
     if grid is None:
         raise ValueError("Qwen2.5-VL image item is missing image_grid_thw metadata.")
     arr = np.asarray(grid)
@@ -217,7 +213,7 @@ class Qwen25VLVisionMetadataBuilder:
         ``metas[r]`` is this rank's round-k native-size
         :class:`Qwen25VLVisionMetadata`, or ``None`` for a dummy lane (rank owns
         < k+1 images). ``patch_k`` is the round's cross-rank max patch-row bucket
-        (drives the cu sentinel and rope pad length). Bucket sizes are the
+        (drives the cumulative-boundary sentinel and rope pad length). Bucket sizes are the
         cross-rank max of each role's native length:
 
         - ``window_index`` is a PERMUTATION over ``units_k`` (= merge_units):
@@ -226,7 +222,7 @@ class Qwen25VLVisionMetadataBuilder:
           non-permutation would corrupt that reverse-scatter). Dummy lanes get a
           full ``arange(units_k)`` identity row.
         - ``cu_window_seqlens`` (cumulative boundaries): sentinel = ``patch_k``
-          for pad slots. cu's last real value = true patch count <= ``patch_k``,
+          for pad slots. Last real boundary = true patch count <= ``patch_k``,
           so a ``patch_k`` sentinel keeps the row non-decreasing AND > every real
           patch index, hence the forward's ``searchsorted(side="right")`` never
           counts a sentinel window for any real patch. Dummy lanes get an
@@ -238,12 +234,12 @@ class Qwen25VLVisionMetadataBuilder:
         units_k = max(int(m.window_index.shape[0]) for m in present)
         win_k = max(int(m.cu_window_seqlens.shape[0]) for m in present)
         rot_dim = int(present[0].rotary_pos_emb.shape[-1])
-        wi, cu, rope = [], [], []
+        window_indices, cu_window_seqlens_rows, rotary_rows = [], [], []
         for m in metas:
             if m is None:  # dummy lane
-                wi.append(np.arange(units_k, dtype=np.int32))  # identity perm (un-permute safe)
-                cu.append(np.full(win_k, patch_k, dtype=np.int32))  # all sentinel
-                rope.append(np.zeros((patch_k, rot_dim), dtype=np.float32))
+                window_indices.append(np.arange(units_k, dtype=np.int32))  # identity perm
+                cu_window_seqlens_rows.append(np.full(win_k, patch_k, dtype=np.int32))
+                rotary_rows.append(np.zeros((patch_k, rot_dim), dtype=np.float32))
             else:
                 # window_index: true values + arange continuation for the pad tail.
                 w = np.arange(units_k, dtype=np.int32)
@@ -257,10 +253,14 @@ class Qwen25VLVisionMetadataBuilder:
                 r = np.zeros((patch_k, rot_dim), dtype=np.float32)
                 rp = np.asarray(m.rotary_pos_emb, dtype=np.float32)
                 r[: int(rp.shape[0])] = rp
-                wi.append(w)
-                cu.append(c)
-                rope.append(r)
-        return Qwen25VLVisionMetadata(np.stack(wi), np.stack(cu), np.stack(rope))
+                window_indices.append(w)
+                cu_window_seqlens_rows.append(c)
+                rotary_rows.append(r)
+        return Qwen25VLVisionMetadata(
+            np.stack(window_indices),
+            np.stack(cu_window_seqlens_rows),
+            np.stack(rotary_rows),
+        )
 
 
 register_vision_metadata_builder(

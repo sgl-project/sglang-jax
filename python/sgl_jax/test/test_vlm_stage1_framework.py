@@ -202,6 +202,26 @@ def test_mrope_positions_propagate_through_model_worker_batch():
     np.testing.assert_array_equal(mwb.mrope_positions[:, :3], mrope_positions)
 
 
+def test_multimodal_data_item_get_reads_common_and_model_specific_fields():
+    item = MultimodalDataItem.from_dict(
+        {
+            "modality": "image",
+            "feature": np.ones((2, 1), dtype=np.float32),
+            "offsets": [(1, 2)],
+            "image_grid_thw": np.array([[1, 2, 4]], dtype=np.int32),
+        }
+    )
+
+    assert item.is_image()
+    np.testing.assert_array_equal(item.get("feature"), np.ones((2, 1), dtype=np.float32))
+    assert item.get("offsets") == [(1, 2)]
+    np.testing.assert_array_equal(
+        item.get("image_grid_thw"),
+        np.array([[1, 2, 4]], dtype=np.int32),
+    )
+    assert item.get("missing", "fallback") == "fallback"
+
+
 def test_mm_embed_plan_keeps_placeholder_count_separate_from_encode_rows():
     features = np.arange(24, dtype=np.float32).reshape(24, 1)
     grids = [(1, 2, 4), (1, 4, 4)]
@@ -246,6 +266,51 @@ def test_mm_embed_plan_keeps_placeholder_count_separate_from_encode_rows():
 
     np.testing.assert_array_equal(np.flatnonzero(rounds[1].mask), np.array([5, 6, 7, 8]))
     np.testing.assert_array_equal(rounds[1].src_idx[5:9], np.array([0, 1, 2, 3], dtype=np.int32))
+
+
+def test_mm_embed_plan_normalizes_dict_mm_items():
+    feature = np.arange(8, dtype=np.float32).reshape(8, 1)
+    req = SimpleNamespace(
+        mm_inputs={
+            "mm_items": [
+                {
+                    "modality": "image",
+                    "feature": feature,
+                    "offsets": [(0, 1)],
+                    "image_grid_thw": np.array([[1, 2, 4]], dtype=np.int32),
+                }
+            ]
+        },
+        extend_input_len=2,
+    )
+    vision_config = SimpleNamespace(
+        patch_size=14,
+        window_size=112,
+        spatial_merge_size=2,
+        fullatt_block_indexes=[],
+        num_heads=16,
+        hidden_size=1280,
+        rope_theta=10000.0,
+    )
+    model_config = SimpleNamespace(
+        is_multimodal=True,
+        hf_config=SimpleNamespace(
+            architectures=["Qwen2_5_VLForConditionalGeneration"],
+            vision_config=vision_config,
+        ),
+    )
+
+    plan = build_mm_embed_plan(
+        reqs_info=[ScheduleReqsInfo(reqs=[req])],
+        dp_size=1,
+        model_config=model_config,
+        per_dp_token=2,
+    )
+
+    rounds = plan.rounds_by_modality[Modality.IMAGE]
+    assert len(rounds) == 1
+    np.testing.assert_array_equal(rounds[0].encode_inputs.valid, np.array([8], dtype=np.int32))
+    np.testing.assert_array_equal(np.flatnonzero(rounds[0].mask), np.array([0, 1]))
 
 
 def test_mm_embed_plan_returns_none_before_resolving_builder_without_images():

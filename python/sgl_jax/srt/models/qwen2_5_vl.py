@@ -220,17 +220,18 @@ class Qwen2_5_VisionAttention(nnx.Module):
         self,
         x: jax.Array,
         rotary_pos_emb: jax.Array,
-        cu: jax.Array,
+        cu_window_seqlens: jax.Array,
         valid: jax.Array | None = None,
     ) -> jax.Array:
         """Run one dp-leading ViT attention block."""
         dp, T, D = x.shape
 
-        # cu -> per-patch segment ids; padding patches get sentinel -1.
         positions = jnp.arange(T)
-        seg = (cu[:, None, :] <= positions[None, :, None]).sum(-1).astype(jnp.int32)  # [dp, T]
+        seg = jax.vmap(lambda row: jnp.searchsorted(row, positions, side="right"))(
+            cu_window_seqlens
+        ).astype(jnp.int32)
         if valid is not None:
-            is_real = positions[None, :] < jnp.reshape(valid, (dp, 1))  # [dp, T]
+            is_real = positions[None, :] < jnp.reshape(valid, (dp, 1))
             seg = jnp.where(is_real, seg, jnp.full_like(seg, -1))
 
         # Project to Q, K, V
@@ -283,10 +284,10 @@ class Qwen2_5_VisionBlock(nnx.Module):
         self,
         x: jax.Array,
         rotary_pos_emb: jax.Array,
-        cu: jax.Array,
+        cu_window_seqlens: jax.Array,
         valid: jax.Array | None = None,
     ) -> jax.Array:
-        x = x + self.attn(self.norm1(x), rotary_pos_emb, cu, valid)
+        x = x + self.attn(self.norm1(x), rotary_pos_emb, cu_window_seqlens, valid)
         x = x + self.mlp(self.norm2(x))
         return x
 
@@ -421,15 +422,23 @@ class Qwen2_5_VisionTransformer(nnx.Module):
         hidden_states = jnp.take_along_axis(hidden_states, gather_idx, axis=1)
         hidden_states = hidden_states.reshape(dp, seq_len, -1)  # [dp, T, D]
 
-        # Full-att blocks use one segment per image; windowed blocks use window cu.
+        # Full-att blocks use one segment per image; windowed blocks use window boundaries.
         if valid is None:
-            cu_full = jnp.full((dp, 1), seq_len, dtype=cu_window_seqlens.dtype)
+            full_cu_window_seqlens = jnp.full((dp, 1), seq_len, dtype=cu_window_seqlens.dtype)
         else:
-            cu_full = jnp.reshape(valid, (dp, 1)).astype(cu_window_seqlens.dtype)
+            full_cu_window_seqlens = jnp.reshape(valid, (dp, 1)).astype(cu_window_seqlens.dtype)
 
         for layer_num, blk in enumerate(self.blocks):
-            cu = cu_full if layer_num in self.fullatt_block_indexes else cu_window_seqlens
-            hidden_states = blk(hidden_states, rotary_pos_emb, cu, valid)
+            hidden_states = blk(
+                hidden_states,
+                rotary_pos_emb,
+                (
+                    full_cu_window_seqlens
+                    if layer_num in self.fullatt_block_indexes
+                    else cu_window_seqlens
+                ),
+                valid,
+            )
 
         # adapter (merger): [dp, T, D] -> [dp, T/sms², d_model]
         hidden_states = self.merger(hidden_states)
