@@ -3122,9 +3122,8 @@ def build_mm_embed_plan(
                 )
             features[r] = feat
             patch_rows[r] = int(feat.shape[0])
-            # Single-image native-size aux: window_index [units],
-            # cu_window_seqlens [windows], rotary_pos_emb [patches, rot_dim]. Cross-rank
-            # pad-by-role below. The builder pulls its geometry (grid) from the item.
+            # The builder constructs native-size per-image metadata and keeps its
+            # concrete fields opaque to the scheduler.
             metas[r] = builder.get_metadata(item)
 
         patch_k = max(patch_rows) if any(patch_rows) else 0
@@ -3141,11 +3140,8 @@ def build_mm_embed_plan(
             pixels_k[r, :rows, :] = feat
             valid_k[r] = rows
 
-        # Cross-rank pad-by-role + stack of the per-rank native-size aux is the
-        # builder's job (opaque to the scheduler): it owns the role semantics
-        # (window_index permutation / cu sentinel / rope zero-pad). The scheduler
-        # only collects per-rank metas (None => dummy lane) and the round's
-        # patch_k bucket.
+        # The builder owns role-specific cross-rank metadata padding; the
+        # scheduler only supplies native metas and the round's patch bucket.
         meta_k = builder.stack_metadata(metas, patch_k)
 
         src_idx_k, mask_k = _build_merge_idx(rank_entries_k, dp_size, per_dp_token)

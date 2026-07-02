@@ -2,7 +2,6 @@
 
 import logging
 from functools import partial
-from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
@@ -43,9 +42,6 @@ from sgl_jax.srt.server_args import ServerArgs
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 from sgl_jax.srt.utils.common_utils import get_bool_env_var
 from sgl_jax.srt.utils.jax_utils import get_available_device_memory
-
-if TYPE_CHECKING:
-    pass
 
 logger = logging.getLogger(__name__)
 

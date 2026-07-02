@@ -22,27 +22,11 @@ from sgl_jax.srt.multimodal.common.vision_metadata import (
 @register_pytree_node_class
 @dataclass
 class Qwen25VLVisionMetadata:
-    """Per-round Qwen2.5-VL vision aux, scheduler-computed, threaded into encode JIT.
+    """Qwen2.5-VL ViT aux for one DP encode round.
 
-    Per-arch registered pytree: common code treats the encode ``meta`` as an
-    OPAQUE pytree and never names these fields;
-    ``Qwen25VLVisionMetadataBuilder`` (below) constructs it and only the ViT
-    encode body interprets it. Children flatten order is fixed:
-    ``window_index``, ``cu_window_seqlens``, ``rotary_pos_emb``.
-
-    Fields hold one round's pad-stacked-across-ranks ViT aux:
-
-    - ``window_index``:      ``[dp, merge_units]`` int -- unit-granularity
-      window-order permutation (identity-padded across ranks so ``argsort``
-      un-permute holds).
-    - ``cu_window_seqlens``: ``[dp, max_windows]`` int -- cumulative window
-      boundaries on the window-reordered layout (no leading 0; last real value =
-      true patch count; sentinel-padded to ``max_windows``). Per-patch segment
-      ids are computed inside the ViT forward via
-      ``searchsorted(cu_window_seqlens, arange(seq))`` (host no longer
-      pre-derives them).
-    - ``rotary_pos_emb``:    ``[dp, patch_k, rot_dim]`` -- per-patch 2D rope
-      (zero-padded).
+    Common code treats this as an opaque pytree. The Qwen ViT encode body reads
+    the concrete fields, in flatten order:
+    ``window_index`` / ``cu_window_seqlens`` / ``rotary_pos_emb``.
     """
 
     window_index: Any
@@ -84,7 +68,18 @@ def _item_grid_thw(item: MultimodalDataItem) -> tuple:
 
 
 class Qwen25VLVisionMetadataBuilder:
-    """Qwen2.5-VL host-side ViT aux builder."""
+    """Host-side builder for Qwen2.5-VL ViT aux.
+
+    Contract:
+    - ``get_metadata(item)`` consumes one image item carrying ``image_grid_thw``
+      and returns native-size metadata for that image.
+    - ``stack_metadata(metas, patch_k)`` consumes one native metadata object per
+      DP rank (or ``None`` for a dummy lane) and returns a pad-stacked metadata
+      pytree for one encode round.
+
+    The scheduler owns pixels/valid/merge indices; this builder owns the Qwen
+    metadata roles and their padding semantics.
+    """
 
     def __init__(self, model_config):
         hf_config = getattr(model_config, "hf_config", None)
@@ -173,24 +168,14 @@ class Qwen25VLVisionMetadataBuilder:
         return index_new.astype(np.int32), cu_seqlens_window
 
     def get_metadata(self, item) -> Qwen25VLVisionMetadata:
-        """One ``MultimodalDataItem`` -> :class:`Qwen25VLVisionMetadata`.
+        """Build native-size Qwen metadata for one image item.
 
-        Pulls the Qwen ``image_grid_thw`` ``(t, h, w)`` from ``item`` (arch-
-        specific), then:
-
-        - ``window_index``: unit-granularity window-order permutation (length
-          ``t * (h//sms) * (w//sms)`` = merge_units).
-        - ``rotary_pos_emb``: per-patch 2D rope, ALREADY gathered into window
-          order (``rope[window_index]`` flattened), length ``t*h*w`` patches.
-        - ``cu_window_seqlens``: cumulative window boundaries on the
-          window-reordered layout (``cumsum(seqlens) * spatial_merge_unit``; no
-          leading 0; last value = true patch count). Per-patch segment ids
-          (``searchsorted(cu_window_seqlens, patch, side="right")``) are NOT
-          pre-derived here -- computed inside the ViT encode body, right before
-          the flash kernel.
-
-        ``cu_seqlens`` (whole-image boundary) is NOT produced: round-loop single
-        image -> full-att = full attention + ``valid`` padding mask.
+        Input contract: ``item`` must provide exactly one ``image_grid_thw`` row.
+        Output contract: all fields are native-size numpy arrays for this image:
+        ``window_index`` is a spatial-merge-unit permutation,
+        ``cu_window_seqlens`` is cumulative window boundaries, and
+        ``rotary_pos_emb`` is per-patch 2D rope already gathered into window
+        order. Full-attention boundaries are derived later from ``valid``.
         """
         t, h, w = _item_grid_thw(item)
 
@@ -208,27 +193,17 @@ class Qwen25VLVisionMetadataBuilder:
         )
 
     def stack_metadata(self, metas, patch_k):
-        """Cross-rank pad-by-role + stack of single-image metas -> ``[dp, ...]``.
+        """Pad and stack native per-rank metadata for one encode round.
 
         ``metas[r]`` is this rank's round-k native-size
         :class:`Qwen25VLVisionMetadata`, or ``None`` for a dummy lane (rank owns
-        < k+1 images). ``patch_k`` is the round's cross-rank max patch-row bucket
-        (drives the cumulative-boundary sentinel and rope pad length). Bucket sizes are the
-        cross-rank max of each role's native length:
+        no image in this round). ``patch_k`` is the round's cross-rank patch-row
+        bucket and is used as the sentinel for cumulative boundaries.
 
-        - ``window_index`` is a PERMUTATION over ``units_k`` (= merge_units):
-          identity-fill pad slots with ``arange(native_units, units_k)`` so the
-          full row stays a valid permutation (the ViT ``argsort``-un-permutes; a
-          non-permutation would corrupt that reverse-scatter). Dummy lanes get a
-          full ``arange(units_k)`` identity row.
-        - ``cu_window_seqlens`` (cumulative boundaries): sentinel = ``patch_k``
-          for pad slots. Last real boundary = true patch count <= ``patch_k``,
-          so a ``patch_k`` sentinel keeps the row non-decreasing AND > every real
-          patch index, hence the forward's ``searchsorted(side="right")`` never
-          counts a sentinel window for any real patch. Dummy lanes get an
-          all-``patch_k`` row (irrelevant -- masked by ``valid`` in the forward).
-        - ``rotary_pos_emb`` (per-patch values): 0 for pad patches; rope is
-          padded to ``patch_k`` rows.
+        Padding contract:
+        - ``window_index`` stays a valid permutation via identity tail padding.
+        - ``cu_window_seqlens`` uses ``patch_k`` sentinel tail padding.
+        - ``rotary_pos_emb`` uses zero row padding to ``patch_k``.
         """
         present = [m for m in metas if m is not None]
         units_k = max(int(m.window_index.shape[0]) for m in present)

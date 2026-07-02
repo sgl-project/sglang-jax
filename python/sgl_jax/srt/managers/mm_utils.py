@@ -63,7 +63,6 @@ def embed_mm_inputs(
     input_ids,
     input_embedding,
     multimodal_model,
-    data_embedding_func_mapping=None,
 ):
     """Encode each multimodal round and merge it into token embeddings.
 
@@ -74,11 +73,8 @@ def embed_mm_inputs(
     """
     mesh = multimodal_model.mesh
     running = input_embedding(input_ids)
-    mapping = data_embedding_func_mapping or {}
     for modality, rounds in mm_embed_plan.rounds_by_modality.items():
-        embedder = mapping.get(modality) or getattr(
-            multimodal_model, f"get_{modality.name.lower()}_feature", None
-        )
+        embedder = getattr(multimodal_model, f"get_{modality.name.lower()}_feature", None)
         assert embedder is not None, f"no embedding method for {modality}"
         for rnd in rounds:
             features = embedder(rnd.encode_inputs)
@@ -92,7 +88,6 @@ def general_mm_embed_routine(
     language_model,
     multimodal_model,
     mm_embed_plan,
-    data_embedding_funcs=None,
 ):
     """Populate ``forward_batch.input_embedding`` for multimodal prefill.
 
@@ -105,6 +100,5 @@ def general_mm_embed_routine(
         input_ids,
         embed_tokens,
         multimodal_model,
-        data_embedding_funcs,
     )
     forward_batch.input_embedding = input_embeds

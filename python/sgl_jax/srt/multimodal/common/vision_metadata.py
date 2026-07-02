@@ -6,39 +6,24 @@ from typing import Protocol
 
 
 class VisionMetadataPytree(Protocol):
-    """Structural marker for a per-arch ViT-aux **registered pytree**.
+    """Structural marker for a per-arch ViT aux registered pytree.
 
-    The concrete type is defined per model (e.g.
-    ``models/vision_metadata/qwen2_5_vl.py``'s ``Qwen25VLVisionMetadata`` with
-    children ``window_index`` / ``cu_window_seqlens`` / ``rotary_pos_emb``).
-    Common code treats ``meta`` only through this marker -- a registered pytree
-    whose leaves are ``np.ndarray`` (host, scheduler-built) or ``jax.Array``
-    (device, after ``init_new`` device_put). No member contract is declared here
-    on purpose: it names the opaque payload without coupling common -> models.
-    Only the model's encode body reads the concrete fields.
+    Common code only carries this opaque payload. Concrete metadata types define
+    their own fields and are consumed by their matching model encode body.
     """
 
 
 class VisionMetadataBuilderProtocol(Protocol):
-    """Per-arch, config-only ViT-aux builder interface.
-
-    Concrete builders live in ``models/vision_metadata/<arch>.py`` and are
-    resolved from ``model_config``.
-    """
+    """Per-arch host-side ViT aux builder interface."""
 
     def __init__(self, model_config) -> None: ...
 
     def get_metadata(self, item) -> VisionMetadataPytree:
-        """One ``MultimodalDataItem`` -> native-size per-arch meta (numpy).
-
-        The builder pulls whatever geometry it needs FROM ``item`` (e.g. Qwen's
-        ``image_grid_thw``); the interface does not assume a grid, so models
-        that derive geometry differently (or need no host aux) still fit.
-        """
+        """Build native-size metadata for one multimodal item."""
         ...
 
     def stack_metadata(self, metas, patch_k) -> VisionMetadataPytree:
-        """Cross-rank pad-by-role + stack single-image metas -> ``[dp, ...]``."""
+        """Pad and stack per-rank native metadata for one DP round."""
         ...
 
 
