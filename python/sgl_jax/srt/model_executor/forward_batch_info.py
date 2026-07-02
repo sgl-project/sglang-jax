@@ -144,44 +144,30 @@ class CaptureHiddenMode(IntEnum):
             raise ValueError(f"Unknown CaptureHiddenMode: {mode}")
 
 
+def _data_leading_spec(arr):
+    ndim = np.asarray(arr).ndim
+    if ndim == 0:
+        return PartitionSpec()
+    return PartitionSpec("data", *([None] * (ndim - 1)))
+
+
 def _device_put_embed_plan(plan, mesh):
-    """Place each EmbedRound's array leaves onto the ``P("data", ...)`` forward-segment sharding.
+    """Place every array leaf in the embed plan on data-leading sharding."""
 
-    Mirrors the in-model VLM forward-segment contract: common encode inputs
-    (``pixels``, ``valid``) + the opaque ``meta`` pytree's leaves feed the GSPMD
-    encode (pure jit), while ``src_idx``/``mask`` feed the merge shard_map. All
-    flow as ``P("data", ...)``. ``meta`` is the per-arch registered pytree the
-    scheduler already computed host-side; common code treats it as OPAQUE -- its
-    leaves are device_put generically via ``jax.tree.map`` (each leaf gets
-    ``P("data", *[None]*(ndim-1))``) and the pytree structure is rebuilt
-    automatically, so the encode JIT receives the same pytree type with
-    device-array leaves. Pure placement, no compute.
-    """
-
-    def _put(arr, spec):
+    def _put(arr):
         if arr is None:
             return None
-        (placed,) = device_array((arr,), sharding=NamedSharding(mesh, spec))
+        (placed,) = device_array((arr,), sharding=NamedSharding(mesh, _data_leading_spec(arr)))
         return placed
 
     for rounds in plan.rounds_by_modality.values():
         for rnd in rounds:
             enc = rnd.encode_inputs
-            # pixels [dp, patch_k, dim]; valid [dp] -> device.
-            enc.pixels = _put(enc.pixels, PartitionSpec("data", None, None))
-            enc.valid = _put(enc.valid, PartitionSpec("data"))
-            # Opaque meta pytree: device_put each (numpy) leaf onto P("data", ...)
-            # sharding derived from its rank; structure rebuilt by tree.map.
-            enc.meta = jax.tree.map(
-                lambda leaf: _put(
-                    leaf,
-                    PartitionSpec("data", *([None] * (np.asarray(leaf).ndim - 1))),
-                ),
-                enc.meta,
-            )
-            # src_idx / mask are flat [total_token], P("data").
-            rnd.src_idx = _put(rnd.src_idx, PartitionSpec("data"))
-            rnd.mask = _put(rnd.mask, PartitionSpec("data"))
+            enc.pixels = _put(enc.pixels)
+            enc.valid = _put(enc.valid)
+            enc.meta = jax.tree.map(_put, enc.meta)
+            rnd.src_idx = _put(rnd.src_idx)
+            rnd.mask = _put(rnd.mask)
     return plan
 
 

@@ -1955,9 +1955,8 @@ class ScheduleBatch:
         is_decode = self.forward_mode.is_decode()
 
         has_mrope = any(
-            _extract_mm_value(getattr(req, "mm_inputs", None), "mrope_positions") is not None
-            or _extract_mm_value(getattr(req, "mm_inputs", None), "mrope_position_delta")
-            is not None
+            _extract_mm_value(req.mm_inputs, "mrope_positions") is not None
+            or _extract_mm_value(req.mm_inputs, "mrope_position_delta") is not None
             for info in self.reqs_info
             if info.reqs
             for req in info.reqs
@@ -1990,9 +1989,7 @@ class ScheduleBatch:
                 if mrope is not None:
                     for req, seq_len in zip(info.reqs, info.seq_lens):
                         base_pos = int(seq_len) - 1
-                        delta = _extract_mm_value(
-                            getattr(req, "mm_inputs", None), "mrope_position_delta"
-                        )
+                        delta = _extract_mm_value(req.mm_inputs, "mrope_position_delta")
                         if delta is not None:
                             base_pos += _as_int_scalar(delta)
                         mrope[:, offset + local] = base_pos
@@ -2019,9 +2016,7 @@ class ScheduleBatch:
 
                 # mrope_positions: 3-D positions, slice with fallback.
                 if mrope is not None:
-                    mm_positions = _extract_mm_value(
-                        getattr(req, "mm_inputs", None), "mrope_positions"
-                    )
+                    mm_positions = _extract_mm_value(req.mm_inputs, "mrope_positions")
                     if mm_positions is None:
                         # Text-only req in a mixed mrope batch: 1-D positions
                         # broadcast to 3 rows (T==H==W), matching the model's
@@ -2031,9 +2026,7 @@ class ScheduleBatch:
                     else:
                         mchunk = np.asarray(mm_positions)[:, start : start + ext_len]
                         if mchunk.size == 0:
-                            delta = _extract_mm_value(
-                                getattr(req, "mm_inputs", None), "mrope_position_delta"
-                            )
+                            delta = _extract_mm_value(req.mm_inputs, "mrope_position_delta")
                             base = np.arange(start, start + ext_len, dtype=np.int32)
                             if delta is not None:
                                 base = base + _as_int_scalar(delta)
@@ -3088,7 +3081,7 @@ def build_mm_embed_plan(
             continue
         req_base = 0  # running slot offset of the current req within this rank
         for req in info.reqs:
-            mm_items = _extract_mm_value(getattr(req, "mm_inputs", None), "mm_items") or []
+            mm_items = _extract_mm_value(req.mm_inputs, "mm_items") or []
             for item in mm_items:
                 if _is_image_mm_item(item):
                     items_by_rank[dp_rank].append((item, req_base))
@@ -3106,7 +3099,7 @@ def build_mm_embed_plan(
         resolve_vision_metadata_builder,
     )
 
-    builder = resolve_vision_metadata_builder(model_config.arch)(model_config.vision_config)
+    builder = resolve_vision_metadata_builder(model_config)
 
     rounds: list[EmbedRound] = []
     for k in range(n_rounds):

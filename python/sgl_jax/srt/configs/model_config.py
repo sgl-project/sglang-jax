@@ -1,7 +1,7 @@
 import json
 import logging
 import os
-from enum import Enum, IntEnum, auto
+from enum import IntEnum, StrEnum, auto
 
 import jax.numpy as jnp
 from transformers import PretrainedConfig
@@ -25,13 +25,13 @@ class AttentionArch(IntEnum):
     MHA = auto()
 
 
-class ModelImpl(str, Enum):
+class ModelImpl(StrEnum):
     AUTO = "auto"
     SGLANG = "sglang"
     TRANSFORMERS = "transformers"
 
 
-class MoEBackend(str, Enum):
+class MoEBackend(StrEnum):
     """Backend for Mixture of Experts computation."""
 
     EPMOE = "epmoe"  # Native Expert Parallel MoE (default)
@@ -256,22 +256,6 @@ class ModelConfig:
         self.image_token_id = getattr(config, "image_token_id", None) or getattr(
             config, "image_token_index", None
         )
-
-        # Surface the nested vision sub-config and architecture name for the
-        # host-side embed planner and vision-metadata builder without reaching
-        # into hf_config.
-        # The vision config is the HF-native nested object (e.g.
-        # Qwen2_5_VLVisionConfig), matching how multimodal_tokenizer reads
-        # `hf_config.vision_config.spatial_merge_size`.
-        self.vision_config = getattr(config, "vision_config", None)
-        # architecture name for resolve_vision_metadata_builder(arch); falls back
-        # to None when architectures is empty.
-        archs = getattr(config, "architectures", None)
-        self.arch = archs[0] if archs else None
-        # Mirror of the vision-config value at the top level (default 1 = no
-        # merge); the authoritative value lives on the vision config. The in-model
-        # VLM scheduler path no longer reads this top-level field.
-        self.spatial_merge_size = int(getattr(self.vision_config, "spatial_merge_size", 1) or 1)
 
     def _get_hf_quant_config(self):
         hf_quant_config = getattr(self.hf_config, "quantization_config", None)
@@ -850,7 +834,7 @@ def _get_and_verify_dtype(
     if isinstance(config_dtype, str):
         config_dtype = _STR_DTYPE_TO_JAX_DTYPE.get(config_dtype)
     elif config_dtype is not None:
-        config_dtype = _STR_DTYPE_TO_JAX_DTYPE.get(str(config_dtype).replace("torch.", ""), None)
+        config_dtype = _STR_DTYPE_TO_JAX_DTYPE.get(str(config_dtype).replace("torch.", ""))
 
     if config_dtype is None:
         config_dtype = jnp.float32

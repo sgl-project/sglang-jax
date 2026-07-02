@@ -3,6 +3,7 @@ from unittest.mock import patch
 
 import jax
 import numpy as np
+import pytest
 from jax.sharding import Mesh, PartitionSpec
 
 from sgl_jax.srt.managers.io_struct import GenerateReqInput
@@ -12,9 +13,19 @@ from sgl_jax.srt.managers.schedule_batch import (
     ScheduleReqsInfo,
     build_mm_embed_plan,
 )
-from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sgl_jax.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    ForwardMode,
+    _device_put_embed_plan,
+)
 from sgl_jax.srt.models.vision_metadata import (  # noqa: F401
     qwen2_5_vl as _qwen25vl_vision_metadata,
+)
+from sgl_jax.srt.models.vision_metadata.qwen2_5_vl import Qwen25VLVisionMetadata
+from sgl_jax.srt.multimodal.common.mm_plan import (
+    EmbedRound,
+    MultimodalEmbedPlan,
+    VisionEncodeInputs,
 )
 from sgl_jax.srt.multimodal.common.modality_enum import (
     Modality,
@@ -98,6 +109,51 @@ def test_forward_batch_input_embedding_uses_data_axis_sharding():
     assert PartitionSpec("data", None) in captured_specs
 
 
+def test_mm_embed_plan_device_put_uses_data_leading_sharding():
+    devices = np.array(jax.devices()[:1])
+    mesh = Mesh(devices, ("data",))
+    plan = MultimodalEmbedPlan(
+        rounds_by_modality={
+            Modality.IMAGE: [
+                EmbedRound(
+                    encode_inputs=VisionEncodeInputs(
+                        pixels=np.ones((1, 4, 3), dtype=np.float32),
+                        valid=np.array([4], dtype=np.int32),
+                        meta=Qwen25VLVisionMetadata(
+                            window_index=np.zeros((1, 1), dtype=np.int32),
+                            cu_window_seqlens=np.ones((1, 1), dtype=np.int32),
+                            rotary_pos_emb=np.ones((1, 4, 2), dtype=np.float32),
+                        ),
+                    ),
+                    src_idx=np.zeros((4,), dtype=np.int32),
+                    mask=np.zeros((4,), dtype=np.bool_),
+                )
+            ]
+        }
+    )
+    captured_specs = []
+
+    def fake_device_array(values, sharding):
+        captured_specs.append(sharding.spec)
+        return values
+
+    with patch(
+        "sgl_jax.srt.model_executor.forward_batch_info.device_array",
+        side_effect=fake_device_array,
+    ):
+        _device_put_embed_plan(plan, mesh)
+
+    assert captured_specs == [
+        PartitionSpec("data", None, None),
+        PartitionSpec("data"),
+        PartitionSpec("data", None),
+        PartitionSpec("data", None),
+        PartitionSpec("data", None, None),
+        PartitionSpec("data"),
+        PartitionSpec("data"),
+    ]
+
+
 def test_mrope_positions_propagate_through_model_worker_batch():
     item = SimpleNamespace(modality="image", offsets=[(1, 1)])
     mrope_positions = np.array(
@@ -166,8 +222,10 @@ def test_mm_embed_plan_keeps_placeholder_count_separate_from_encode_rows():
     )
     model_config = SimpleNamespace(
         is_multimodal=True,
-        arch="Qwen2_5_VLForConditionalGeneration",
-        vision_config=vision_config,
+        hf_config=SimpleNamespace(
+            architectures=["Qwen2_5_VLForConditionalGeneration"],
+            vision_config=vision_config,
+        ),
     )
 
     plan = build_mm_embed_plan(
@@ -204,8 +262,10 @@ def test_mm_embed_plan_returns_none_before_resolving_builder_without_images():
     )
     model_config = SimpleNamespace(
         is_multimodal=True,
-        arch="NoVisionBuilderForAudioOnly",
-        vision_config=SimpleNamespace(),
+        hf_config=SimpleNamespace(
+            architectures=["NoVisionBuilderForAudioOnly"],
+            vision_config=SimpleNamespace(),
+        ),
     )
 
     plan = build_mm_embed_plan(
@@ -216,3 +276,26 @@ def test_mm_embed_plan_returns_none_before_resolving_builder_without_images():
     )
 
     assert plan is None
+
+
+def test_mm_embed_plan_fails_fast_when_qwen_vision_config_missing():
+    features = np.arange(8, dtype=np.float32).reshape(8, 1)
+    items = QwenVLProcessor._build_items(features, [(1, 2, 4)], [(0, 1)])
+    req = SimpleNamespace(
+        mm_inputs=MultimodalInputs(mm_items=items),
+        extend_input_len=2,
+    )
+    model_config = SimpleNamespace(
+        is_multimodal=True,
+        hf_config=SimpleNamespace(
+            architectures=["Qwen2_5_VLForConditionalGeneration"],
+        ),
+    )
+
+    with pytest.raises(ValueError, match="vision_config"):
+        build_mm_embed_plan(
+            reqs_info=[ScheduleReqsInfo(reqs=[req])],
+            dp_size=1,
+            model_config=model_config,
+            per_dp_token=2,
+        )

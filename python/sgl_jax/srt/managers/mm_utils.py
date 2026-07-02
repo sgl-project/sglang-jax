@@ -46,16 +46,16 @@ def jitted_mm_merge(mesh, running, features, src_idx, mask):
     )(running, features, src_idx, mask)
 
 
-@functools.partial(jax.jit, static_argnames=("mesh", "graphdef", "body"))
-def jitted_mm_encode(mesh, body, graphdef, state, pixels, meta, valid):
+@functools.partial(jax.jit, static_argnames=("mesh", "graphdef"))
+def jitted_mm_encode(mesh, graphdef, state, pixels, meta, valid):
     """Run the dp-leading vision encode.
 
-    ``pixels`` and ``meta`` are already placed on ``P("data", ...)``. The model
-    body returns ``[dp, out_rows, H]``; this function flattens it to
+    ``pixels`` and ``meta`` are already placed on ``P("data", ...)``. The visual
+    module returns ``[dp, out_rows, H]``; this function flattens it to
     ``[dp * out_rows, H]`` and pins the result to the merge sharding.
     """
     visual = nnx.merge(graphdef, state)
-    features = body(visual, pixels, meta, valid)  # [dp, out_rows, H]
+    features = visual(pixels, meta, valid)  # [dp, out_rows, H]
     dp, out_rows, h = features.shape
     features = features.reshape(dp * out_rows, h)  # [dp*out_rows, H]
     return jax.lax.with_sharding_constraint(

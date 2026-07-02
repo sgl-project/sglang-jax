@@ -88,23 +88,16 @@ def _item_grid_thw(item: Any) -> tuple:
 
 
 class Qwen25VLVisionMetadataBuilder:
-    """Per-arch, config-only ViT aux builder.
+    """Qwen2.5-VL host-side ViT aux builder."""
 
-    Pure numpy, NO weights, NO model instance: the scheduler instantiates this
-    from ``model_config.vision_config`` and calls :meth:`get_metadata` once per
-    image to produce a :class:`Qwen25VLVisionMetadata` (``window_index`` /
-    ``cu_window_seqlens`` / ``rotary_pos_emb``). Reuses the same window/rope
-    algorithm the ViT used host-side (ported off ``jnp`` to ``np``);
-    ``cu_window_seqlens`` is carried as-is (cumulative window boundaries) and
-    converted to per-patch segment ids INSIDE the ViT forward (``searchsorted``),
-    not here.
-
-    :meth:`get_metadata` produces single-image native metadata (pulling the
-    grid from the item). :meth:`stack_metadata` owns the per-arch cross-rank
-    pad-by-role and stack into the round-loop bucket.
-    """
-
-    def __init__(self, vision_cfg):
+    def __init__(self, model_config):
+        hf_config = getattr(model_config, "hf_config", None)
+        vision_cfg = getattr(hf_config, "vision_config", None)
+        if vision_cfg is None:
+            raise ValueError(
+                "Qwen2.5-VL vision metadata builder requires "
+                "model_config.hf_config.vision_config."
+            )
         self.vision_cfg = vision_cfg
         self.patch_size = int(getattr(vision_cfg, "patch_size", 14))
         self.window_size = int(getattr(vision_cfg, "window_size", 112))
@@ -197,8 +190,8 @@ class Qwen25VLVisionMetadataBuilder:
           window-reordered layout (``cumsum(seqlens) * spatial_merge_unit``; no
           leading 0; last value = true patch count). Per-patch segment ids
           (``searchsorted(cu_window_seqlens, patch, side="right")``) are NOT
-          pre-derived here -- computed inside ``compute_hidden_states`` (in the
-          encode JIT), right before the flash kernel.
+          pre-derived here -- computed inside the ViT encode body, right before
+          the flash kernel.
 
         ``cu_seqlens`` (whole-image boundary) is NOT produced: round-loop single
         image -> full-att = full attention + ``valid`` padding mask.

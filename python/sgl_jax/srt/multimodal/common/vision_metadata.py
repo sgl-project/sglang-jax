@@ -1,18 +1,4 @@
-"""Common arch-general vision-metadata interface and registry.
-
-The vision-metadata *interface* (Protocols) and *registry* live here; the
-concrete per-arch metadata pytree and builder live in
-``models/vision_metadata/<arch>.py`` and register themselves at import time.
-Common code (mm_plan / scheduler / encode-JIT plumbing) depends only on this
-module, never on a concrete model/metadata file.
-
-Registration is **import-triggered, NOT auto-scanned**: each VLM's main model
-file (``models/<arch>.py``) imports its metadata module at top level; when
-``ModelRegistry`` loads that model, the import chain runs the metadata module's
-top-level ``register_vision_metadata_builder(...)``. ``resolve`` only looks up
-the dict (does no import). Adding a new VLM means adding its model file,
-metadata file, and model-level import; the common registry lookup stays generic.
-"""
+"""Common vision-metadata protocol and registry."""
 
 from __future__ import annotations
 
@@ -36,13 +22,11 @@ class VisionMetadataPytree(Protocol):
 class VisionMetadataBuilderProtocol(Protocol):
     """Per-arch, config-only ViT-aux builder interface.
 
-    Concrete builders live in ``models/vision_metadata/<arch>.py``. All methods
-    are host-side numpy: no weights, no model instance. The scheduler
-    instantiates the builder from ``model_config.vision_config`` and calls
-    ``get_metadata`` per image, then ``stack_metadata`` per round.
+    Concrete builders live in ``models/vision_metadata/<arch>.py`` and are
+    resolved from ``model_config``.
     """
 
-    def __init__(self, vision_cfg) -> None: ...
+    def __init__(self, model_config) -> None: ...
 
     def get_metadata(self, item) -> VisionMetadataPytree:
         """One ``MultimodalDataItem`` -> native-size per-arch meta (numpy).
@@ -70,24 +54,20 @@ def register_vision_metadata_builder(arch: str, builder_cls: type) -> None:
     _BUILDERS[arch] = builder_cls
 
 
-def resolve_vision_metadata_builder(arch_or_config):
-    """Resolve the registered builder class for an arch name or ``.arch`` carrier.
+def resolve_vision_metadata_builder(model_config):
+    """Resolve and instantiate the registered builder for ``model_config``.
 
-    Pure dict lookup, no import. The concrete builder must already be registered
-    -- that happens when the main model file was imported (it top-level imports
-    its ``models/vision_metadata/<arch>.py``, whose top-level ``register(...)``
-    fills the dict). ``ModelRegistry`` loads models well before the scheduler
-    runs, so by ``build_mm_embed_plan`` time the entry is present.
+    The concrete metadata module must already be imported by the model module.
     """
-    arch = (
-        arch_or_config if isinstance(arch_or_config, str) else getattr(arch_or_config, "arch", None)
-    )
-    builder = _BUILDERS.get(arch)
-    if builder is None:
+    hf_config = getattr(model_config, "hf_config", None)
+    archs = getattr(hf_config, "architectures", None) or []
+    arch = archs[0] if archs else None
+    builder_cls = _BUILDERS.get(arch)
+    if builder_cls is None:
         raise ValueError(
             f"No VisionMetadataBuilder registered for arch={arch!r}. "
             "Ensure the model file top-level imports its "
             "models/vision_metadata/<arch>.py module (which registers the "
             "builder at import time)."
         )
-    return builder
+    return builder_cls(model_config)
