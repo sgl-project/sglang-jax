@@ -306,6 +306,12 @@ class Scheduler(
             from sgl_jax.srt.disaggregation.pathways_pd import make_slice_meshes
 
             server_args.disable_radix_cache = True
+            # PD does not support chunked prefill; raise cps to the P-pool
+            # capacity so PrefillAdder never truncates a req mid-batch when
+            # packing many short reqs (e.g. 32-way GSM8K -> 6x~700 > 4096).
+            server_args.chunked_prefill_size = max(
+                server_args.chunked_prefill_size, server_args.pd_prefill_max_tokens
+            )
             if not server_args.quantization_config_path:
                 # Dynamic quant: cache holds BF16; after quant the fp8 model
                 # plus BF16 cache exceeds device HBM (139G>103G on v7x).
@@ -2488,7 +2494,7 @@ class Scheduler(
                 break
             assert all(
                 r is None for r in self.chunked_reqs
-            ), "[pd_async] chunked prefill not yet supported (IL must be < chunked_prefill_size)"
+            ), "[pd_async] chunked prefill not supported (single-req IL exceeds pd_prefill_max_tokens)"
             self._pd_inflight += sum(len(info.reqs) for info in new_batch.reqs_info if info.reqs)
             self._pd_prefill_qs[i].put_nowait(new_batch)
             break
