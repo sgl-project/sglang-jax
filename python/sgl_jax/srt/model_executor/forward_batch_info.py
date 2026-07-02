@@ -32,6 +32,7 @@ from sgl_jax.srt.eplb.expert_location import (
     ExpertLocationMetadata,
     get_global_expert_location_metadata,
 )
+from sgl_jax.srt.multimodal.embed_plan import MultimodalEmbedPlan, device_put_plan
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 from sgl_jax.srt.utils.jax_utils import device_array
 
@@ -201,8 +202,14 @@ class ForwardBatch:
     apply_for_deepstack: bool = False
     deepstack_visual_embedding: jax.Array | None = None
 
+    # Host-built image forward plan with device-placed arrays.
+    mm_embed_plan: MultimodalEmbedPlan | None = None
+
     # Recurrent state indices [batch_size]
     recurrent_indices: jax.Array | None = None
+
+    def contains_mm_inputs(self) -> bool:
+        return self.mm_embed_plan is not None
 
     def tree_flatten(self):
         children = (
@@ -270,6 +277,7 @@ class ForwardBatch:
         obj.apply_for_deepstack = children[17]
         obj.deepstack_visual_embedding = children[18]
         obj.recurrent_indices = children[19]
+        obj.mm_embed_plan = None
         return obj
 
     def __repr__(self) -> str:
@@ -408,6 +416,8 @@ class ForwardBatch:
                 sharding=(NamedSharding(model_runner.mesh, PartitionSpec("data"))),
             )
 
+        mm_embed_plan = device_put_plan(batch.mm_embed_plan, model_runner.mesh)
+
         obj = cls(
             bid=batch.bid,
             forward_mode=batch.forward_mode,
@@ -434,6 +444,7 @@ class ForwardBatch:
             deepstack_visual_embedding=deepstack_visual_embedding,
             expert_location_metadata=expert_location_metadata,
             recurrent_indices=recurrent_indices,
+            mm_embed_plan=mm_embed_plan,
         )
 
         # Auto-generate attention mask for Encoder-only models (e.g. UMT5Encoder, BERT)

@@ -23,6 +23,7 @@ import logging
 import os
 import threading
 from http import HTTPStatus
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, ClassVar
 
 import jax
@@ -51,6 +52,11 @@ from sgl_jax.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPo
 from sgl_jax.srt.mem_cache.radix_cache import RadixKey
 from sgl_jax.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
+from sgl_jax.srt.multimodal.common.modality_enum import MultimodalInputs
+from sgl_jax.srt.multimodal.common.vision_metadata import (
+    resolve_vision_metadata_builder,
+)
+from sgl_jax.srt.multimodal.embed_plan import MultimodalEmbedPlan, build_mm_embed_plan
 from sgl_jax.srt.precision_tracer import (
     PrecisionTracerRequestMetadata,
     precision_tracer,
@@ -2058,6 +2064,98 @@ class ScheduleBatch:
             "deepstack_visual_embedding": dense,
         }
 
+    def _build_mm_embed_plan(
+        self,
+        per_dp_token_size: int,
+        total_token_size: int,
+    ) -> MultimodalEmbedPlan | None:
+        """Build host-side per-round image forward plan.
+
+        Translates each image item's absolute prompt-frame ``offsets`` into
+        rank-local extend-window coordinates matching
+        ``_merge_input_and_positions`` layout, then delegates to
+        ``build_mm_embed_plan``.
+        """
+        if self.forward_mode != ForwardMode.EXTEND:
+            if self.forward_mode in (ForwardMode.MIXED, ForwardMode.DRAFT_EXTEND):
+                for info in self.reqs_info:
+                    for req in info.reqs or []:
+                        mm_inputs = getattr(req, "mm_inputs", None)
+                        if mm_inputs is not None and any(
+                            item.is_image() for item in mm_inputs.mm_items or []
+                        ):
+                            raise ValueError(
+                                "Image multimodal embed plan is only supported for "
+                                f"regular EXTEND mode, got {self.forward_mode.name}"
+                            )
+            return None
+
+        vision_config = getattr(self.model_config.hf_config, "vision_config", None)
+        if vision_config is None:
+            return None
+        builder_cls = resolve_vision_metadata_builder(self.model_config.hf_config)
+        builder = builder_cls(vision_config)
+
+        translated_reqs_info = []
+        any_image = False
+        for dp_rank in range(self.dp_size):
+            info = self.reqs_info[dp_rank]
+            translated_reqs = []
+            if info.reqs and info.seq_lens is not None and len(info.seq_lens) > 0:
+                prior = 0
+                for req, seq_len, prefix_len in zip(info.reqs, info.seq_lens, info.prefix_lens):
+                    ext_len = int(seq_len) - int(prefix_len)
+                    if ext_len <= 0:
+                        continue
+                    mm_inputs = getattr(req, "mm_inputs", None)
+                    if mm_inputs is None or not mm_inputs.mm_items:
+                        prior += ext_len
+                        continue
+
+                    translated_items = []
+                    for item in mm_inputs.mm_items:
+                        if not item.is_image():
+                            continue
+                        if not item.offsets:
+                            continue
+                        start_abs, end_abs = item.offsets[0]
+                        prefix_i = int(prefix_len)
+                        seq_i = int(seq_len)
+                        if end_abs < prefix_i or start_abs >= seq_i:
+                            continue
+                        if start_abs < prefix_i or end_abs >= seq_i:
+                            raise ValueError(
+                                "Image placeholder span crosses the current "
+                                "extend window; chunked prefill for image "
+                                "spans is not supported. "
+                                f"rank={dp_rank}, span=({start_abs},{end_abs}), "
+                                f"window=[{prefix_i},{seq_i})"
+                            )
+                        local_start = prior + (int(start_abs) - prefix_i)
+                        local_end = prior + (int(end_abs) - prefix_i)
+                        translated_items.append(
+                            dataclasses.replace(item, offsets=[(local_start, local_end)])
+                        )
+
+                    if translated_items:
+                        any_image = True
+                        translated_reqs.append(
+                            SimpleNamespace(mm_inputs=MultimodalInputs(mm_items=translated_items))
+                        )
+                    prior += ext_len
+            translated_reqs_info.append(SimpleNamespace(reqs=translated_reqs))
+
+        if not any_image:
+            return None
+
+        return build_mm_embed_plan(
+            reqs_info=translated_reqs_info,
+            dp_size=self.dp_size,
+            builder=builder,
+            per_dp_token=per_dp_token_size,
+            total_token=total_token_size,
+        )
+
     def _merge_batch_metadata(
         self,
         per_dp_bs_size: int,
@@ -2653,6 +2751,9 @@ class ScheduleBatch:
         apply_for_deepstack = _mm["apply_for_deepstack"]
         deepstack_visual_embedding = _mm["deepstack_visual_embedding"]
 
+        # Host-side image forward plan (extend + image only); None otherwise.
+        mm_embed_plan = self._build_mm_embed_plan(per_dp_token_padding, total_token_size)
+
         # Merge per-DP top_logprobs_nums / token_ids_logprobs with the same
         # offset_bs += per_dp_bs_padding padding scheme used in _merge_batch_metadata.
         if self.return_logprob:
@@ -2758,6 +2859,7 @@ class ScheduleBatch:
             input_embedding=input_embedding,
             apply_for_deepstack=apply_for_deepstack,
             deepstack_visual_embedding=deepstack_visual_embedding,
+            mm_embed_plan=mm_embed_plan,
             recurrent_indices=recurrent_indices_cpu,
             has_initial_state=has_initial_state_cpu,
             spec_algorithm=self.spec_algorithm,
@@ -3203,6 +3305,9 @@ class ModelWorkerBatch:
 
     # MRoPE position information [3, total_tokens]
     mrope_positions: np.ndarray | None = None
+
+    # Host-side multimodal image forward plan; None for text-only or decode.
+    mm_embed_plan: MultimodalEmbedPlan | None = None
 
     # Recurrent state indices for hybrid recurrent models
     recurrent_indices: np.ndarray | None = None
