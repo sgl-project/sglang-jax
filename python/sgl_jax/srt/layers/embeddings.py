@@ -197,19 +197,27 @@ class RotaryEmbedding:
         head_size: int,
         rotary_dim: int,
         max_position_embeddings: int,
-        base: int,
+        base: int | float,
         is_neox_style: bool,
         dtype: jnp.dtype,
+        linear_scaling_factor: float = 1.0,
         mesh: jax.sharding.Mesh | None = None,
     ):
+        del mesh
+        if linear_scaling_factor <= 0:
+            raise ValueError(
+                f"linear_scaling_factor must be positive, got {linear_scaling_factor}."
+            )
         self.head_size = head_size
         self.rotary_dim = rotary_dim
         self.max_position_embeddings = max_position_embeddings
         self.base = base
         self.is_neox_style = is_neox_style
         self.dtype = dtype
+        self.linear_scaling_factor = linear_scaling_factor
 
         inv_freq_np = 1.0 / (base ** (np.arange(0, rotary_dim, 2, dtype=np.float32) / rotary_dim))
+        inv_freq_np = inv_freq_np / linear_scaling_factor
         self._inv_freq_np = inv_freq_np  # shape: (rotary_dim // 2,)
 
     @named_scope
@@ -257,6 +265,7 @@ class RotaryEmbedding:
         inv_freq = 1.0 / (
             base ** (jnp.arange(0, self.rotary_dim, 2, dtype=jnp.float32) / self.rotary_dim)
         )
+        inv_freq = inv_freq / self.linear_scaling_factor
         return inv_freq
 
     def _compute_cos_sin_cache(self) -> jax.Array:
@@ -746,7 +755,7 @@ def _yarn_find_correction_range(
     low_rot: int,
     high_rot: int,
     dim: int,
-    base: int,
+    base: int | float,
     max_position_embeddings: int,
 ) -> tuple[float, float]:
     low = math.floor(_yarn_find_correction_dim(low_rot, dim, base, max_position_embeddings))
