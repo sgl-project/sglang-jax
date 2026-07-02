@@ -100,6 +100,14 @@ class MultiLayerDraftWorker(EagleDraftWorker):
             )
         self._worker = self._workers[0]
 
+        # Chain-style MTP (e.g. Step-3.5-Flash): each layer consumes the previous
+        # layer's pre-norm hidden instead of the target hidden. Signalled by a
+        # model class attribute (same convention as ``load_lm_head_from_target``);
+        # non-chain MTP (DeepSeek/MiMo) leaves this False and keeps target hidden.
+        self.chain_mtp_hidden_states = getattr(
+            self._workers[0].model_runner.model, "chain_mtp_hidden_states", False
+        )
+
         EagleDraftInput.ALLOC_LEN_PER_DECODE = max(
             self.speculative_num_steps * self.topk, self.speculative_num_draft_tokens
         )
@@ -253,9 +261,12 @@ class MultiLayerDraftWorker(EagleDraftWorker):
         all_topk_p, all_topk_index = [], []
         ext = model_worker_batch.extend_seq_lens
         sel_pos = np.clip(ext - 1, 0, None).astype(np.int64)
+        # Chain-style MTP feeds layer i-1's pre-norm hidden into layer i; non-chain
+        # keeps the target hidden for every layer (see class docstring).
+        chained_hidden = hidden_states
         for i, w in enumerate(self._workers):
             mr = w.model_runner
-            model_worker_batch.spec_info_padded.hidden_states = hidden_states
+            model_worker_batch.spec_info_padded.hidden_states = chained_hidden
             forward_batch = ForwardBatch.init_new(model_worker_batch, mr)
             forward_batch.return_logprob = False
             mr.attn_backend.forward_metadata = mr.attn_backend.get_eagle_forward_metadata(
@@ -270,6 +281,10 @@ class MultiLayerDraftWorker(EagleDraftWorker):
             )
             if i == 0:
                 layer0_out = logits_output
+            if self.chain_mtp_hidden_states and logits_output.hidden_states is not None:
+                # logits_output.hidden_states is the layer's pre-norm hidden
+                # (captured via aux_hidden_states); use it as the next layer input.
+                chained_hidden = logits_output.hidden_states
             tp, ti = topk_probs_from_logits(
                 replicate_to_mesh(self.mesh, logits_output.next_token_logits), self.topk
             )

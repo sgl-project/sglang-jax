@@ -136,7 +136,7 @@ class Step3p5ModelNextN(nnx.Module):
 
     def __call__(
         self, forward_batch: ForwardBatch, token_to_kv_pool: KVCache
-    ) -> tuple[jax.Array, list[jax.Array]]:
+    ) -> tuple[jax.Array, list[jax.Array], list[jax.Array]]:
         embed = self.embed_tokens(forward_batch.input_ids)
         hidden_in = forward_batch.spec_info.hidden_states
         emb_sh = jax.typeof(embed).sharding
@@ -148,8 +148,14 @@ class Step3p5ModelNextN(nnx.Module):
         hidden_states, residual, kv_fused, _cb_flags, _topk_ids = self.mtp_block(
             forward_batch.positions, hidden_states, forward_batch, token_to_kv_pool, None
         )
-        hidden_states = self.shared_head_norm(hidden_states + residual)
-        return hidden_states, [kv_fused]
+        # Chain: the pre-norm hidden (hidden + residual, before shared_head.norm)
+        # is what the multi-layer draft worker feeds into the next MTP layer.
+        # Mirror llama_eagle3: return it as an aux hidden state so the logits
+        # processor captures it as ``logits_output.hidden_states``, while the LM
+        # head logits use the post-norm hidden.
+        pre_norm = hidden_states + residual
+        hidden_to_logits = self.shared_head_norm(pre_norm)
+        return hidden_to_logits, [pre_norm], [kv_fused]
 
 
 class Step3p5MTPForCausalLM(nnx.Module):
@@ -158,6 +164,15 @@ class Step3p5MTPForCausalLM(nnx.Module):
     # MTP carries its own `shared_head.output` LM head — only the token
     # embedding is injected from the target (set_embed).
     load_lm_head_from_target = False
+
+    # Step-3.5-Flash MTP is chain-style (upstream sglang enables chain only for
+    # Step3p5MTP): each MTP layer consumes the previous layer's pre-norm hidden,
+    # not the target hidden. `capture_aux_hidden_states` makes the logits
+    # processor store that pre-norm hidden as `logits_output.hidden_states`
+    # (sglang-jax's EAGLE3 mechanism); `chain_mtp_hidden_states` tells the
+    # multi-layer draft worker to feed it forward between layers.
+    capture_aux_hidden_states = True
+    chain_mtp_hidden_states = True
 
     @classmethod
     def patch_model_config(cls, mc: ModelConfig) -> None:
@@ -198,8 +213,17 @@ class Step3p5MTPForCausalLM(nnx.Module):
         memory_pools: MemoryPools,
         logits_metadata: LogitsMetadata,
     ):
-        hidden_states, layers_kv_fused = self.model(forward_batch, memory_pools.token_to_kv_pool)
-        output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
+        hidden_to_logits, aux_hidden_states, layers_kv_fused = self.model(
+            forward_batch, memory_pools.token_to_kv_pool
+        )
+        # Logits use the post-norm hidden; the pre-norm aux hidden is captured as
+        # logits_output.hidden_states for chain propagation (see class docstring).
+        output = self.logits_processor(
+            hidden_to_logits,
+            self.lm_head,
+            logits_metadata,
+            aux_hidden_states=aux_hidden_states if self.capture_aux_hidden_states else None,
+        )
         return output, layers_kv_fused, True, None
 
     def load_weights(self, model_config: ModelConfig) -> None:
