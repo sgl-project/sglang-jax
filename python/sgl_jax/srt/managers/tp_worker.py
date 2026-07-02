@@ -11,7 +11,7 @@ import jax.numpy as jnp
 import numpy as np
 import psutil
 from flax import nnx
-from jax.experimental.multihost_utils import broadcast_one_to_all
+from jax.experimental.multihost_utils import broadcast_one_to_all, process_allgather
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.constrained.bitmask_ops import allocate_token_bitmask
@@ -54,6 +54,12 @@ def _iter_padded_input_logprob_reqs(model_worker_batch, padded_rows: int):
             plen = max(int(eseq[slot]) - int(estart[slot]), 0)
             yield slot, base + cum, plen
             cum += plen
+
+
+def _host_logprob_array(arr, *, allgather: bool = False):
+    if allgather:
+        arr = process_allgather(arr, tiled=True)
+    return jax.device_get(arr)
 
 
 class ModelWorker:
@@ -489,7 +495,9 @@ class ModelWorker:
             selector = model_worker_batch.logits_indices_selector
             if model_worker_batch.return_output_logprob_only:
                 logprobs = self.model_runner.compute_logprobs(token_logprobs, next_token_ids_device)
-                logits_output.next_token_logprobs = jax.device_get(logprobs)[selector]
+                # compute_logprobs returns replicated per-request scalars; only
+                # data-sharded top-k/token-id tables below need allgather.
+                logits_output.next_token_logprobs = _host_logprob_array(logprobs)[selector]
         if new_logits_output is not None:
             logits_output = new_logits_output
             self._materialize_logprobs_to_host(logits_output, model_worker_batch, selector)
@@ -518,22 +526,27 @@ class ModelWorker:
         consumer contract in `scheduler_output_processor_mixin`.
         """
 
-        def gather(arr, *, as_float=False):
+        def gather(arr, *, as_float=False, allgather=False):
             if as_float:
                 arr = arr.astype(jnp.float32)
-            return jax.device_get(arr)[selector]
+            return _host_logprob_array(arr, allgather=allgather)[selector]
 
         if logits_output.next_token_logprobs is not None:
-            logits_output.next_token_logprobs = jax.device_get(logits_output.next_token_logprobs)[
-                selector
-            ]
+            logits_output.next_token_logprobs = _host_logprob_array(
+                logits_output.next_token_logprobs
+            )[selector]
 
         top_nums = model_worker_batch.top_logprobs_nums
         tok_ids = model_worker_batch.token_ids_logprobs
+        needs_allgather = model_worker_batch.dp_size > 1
 
         if logits_output.next_token_top_logprobs_val is not None:
-            vals = gather(logits_output.next_token_top_logprobs_val, as_float=True)
-            idxs = gather(logits_output.next_token_top_logprobs_idx)
+            vals = gather(
+                logits_output.next_token_top_logprobs_val,
+                as_float=True,
+                allgather=needs_allgather,
+            )
+            idxs = gather(logits_output.next_token_top_logprobs_idx, allgather=needs_allgather)
             logits_output.next_token_top_logprobs_val = [
                 vals[i, : top_nums[orig]].tolist() for i, orig in enumerate(selector)
             ]
@@ -542,7 +555,11 @@ class ModelWorker:
             ]
 
         if logits_output.next_token_token_ids_logprobs_val is not None:
-            full = gather(logits_output.next_token_token_ids_logprobs_val, as_float=True)
+            full = gather(
+                logits_output.next_token_token_ids_logprobs_val,
+                as_float=True,
+                allgather=needs_allgather,
+            )
             per_req_vals, per_req_idxs = [], []
             for i, orig in enumerate(selector):
                 ids = tok_ids[orig] if tok_ids else None
@@ -556,11 +573,17 @@ class ModelWorker:
             logits_output.next_token_token_ids_logprobs_idx = per_req_idxs
 
         # input_* per-token logprobs use the padded layout; split per req via the
-        # helper. (A dp>1 tight fallback never reaches here — it crashes earlier
-        # at the sharded slice; dp=1 is a single section, base 0.)
+        # helper. dp=1 is a single section with base 0; dp>1 gathers the padded
+        # sections above before splitting.
         if logits_output.input_top_logprobs_val is not None:
-            vals = jax.device_get(logits_output.input_top_logprobs_val.astype(jnp.float32))
-            idxs = jax.device_get(logits_output.input_top_logprobs_idx)
+            vals = _host_logprob_array(
+                logits_output.input_top_logprobs_val.astype(jnp.float32),
+                allgather=needs_allgather,
+            )
+            idxs = _host_logprob_array(
+                logits_output.input_top_logprobs_idx,
+                allgather=needs_allgather,
+            )
             per_req_vals, per_req_idxs = [], []
             for slot, off, plen in _iter_padded_input_logprob_reqs(
                 model_worker_batch, vals.shape[0]
@@ -576,7 +599,10 @@ class ModelWorker:
             logits_output.input_top_logprobs_idx = per_req_idxs
 
         if logits_output.input_token_ids_logprobs_val is not None:
-            full = jax.device_get(logits_output.input_token_ids_logprobs_val.astype(jnp.float32))
+            full = _host_logprob_array(
+                logits_output.input_token_ids_logprobs_val.astype(jnp.float32),
+                allgather=needs_allgather,
+            )
             per_req_vals, per_req_idxs = [], []
             for slot, off, plen in _iter_padded_input_logprob_reqs(
                 model_worker_batch, full.shape[0]
