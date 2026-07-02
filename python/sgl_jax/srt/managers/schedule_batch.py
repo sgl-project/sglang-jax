@@ -3051,14 +3051,11 @@ def build_mm_embed_plan(
     that contributes nothing (grid/pixels zero, mask all False). Each round runs
     ONE single-image ViT per rank.
 
-    Returns ``None`` for non-multimodal models or batches with no image items.
+    Returns ``None`` for batches with no image items.
 
     # TODO: bucket the vision patch and per-arch metadata axes; this
     #   uses the per-forward cross-rank max for stable shapes within one call.
     """
-    if not getattr(model_config, "is_multimodal", False):
-        return None
-
     # Keep each image item bound to its request's packed-slot offset. The merge
     # builder translates item-local offsets with that req_base, so request
     # boundaries must be preserved here.

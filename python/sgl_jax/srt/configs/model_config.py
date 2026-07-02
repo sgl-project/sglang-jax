@@ -1,7 +1,7 @@
 import json
 import logging
 import os
-from enum import IntEnum, StrEnum, auto
+from enum import Enum, IntEnum, auto
 
 import jax.numpy as jnp
 from transformers import PretrainedConfig
@@ -25,13 +25,13 @@ class AttentionArch(IntEnum):
     MHA = auto()
 
 
-class ModelImpl(StrEnum):
+class ModelImpl(str, Enum):
     AUTO = "auto"
     SGLANG = "sglang"
     TRANSFORMERS = "transformers"
 
 
-class MoEBackend(StrEnum):
+class MoEBackend(str, Enum):
     """Backend for Mixture of Experts computation."""
 
     EPMOE = "epmoe"  # Native Expert Parallel MoE (default)
@@ -182,7 +182,9 @@ class ModelConfig:
                 self.quantization_config.ignored_layers = ignored
         # Check model type
         self.is_generation = is_generation_model(self.hf_config.architectures, is_embedding)
-        self.is_multimodal = is_multimodal_model(self.hf_config.architectures)
+        self.is_multimodal = any(
+            architecture in multimodal_model_archs for architecture in self.hf_config.architectures
+        )
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
 
         # Derive context length
@@ -834,7 +836,7 @@ def _get_and_verify_dtype(
     if isinstance(config_dtype, str):
         config_dtype = _STR_DTYPE_TO_JAX_DTYPE.get(config_dtype)
     elif config_dtype is not None:
-        config_dtype = _STR_DTYPE_TO_JAX_DTYPE.get(str(config_dtype).replace("torch.", ""))
+        config_dtype = _STR_DTYPE_TO_JAX_DTYPE.get(str(config_dtype).replace("torch.", ""), None)
 
     if config_dtype is None:
         config_dtype = jnp.float32
@@ -925,18 +927,6 @@ multimodal_model_archs = [
     "VILAForConditionalGeneration",
     "KimiK25ForConditionalGeneration",
 ]
-
-
-def is_multimodal_model(model_architectures: list[str] | None) -> bool:
-    """Return True when any architecture is a known multimodal model.
-
-    Mirrors upstream sglang: a model is multimodal iff its architecture class
-    name appears in ``multimodal_model_archs``. To enable a new VLM, add its
-    architecture to that list (no per-model branch here).
-    """
-    if not model_architectures:
-        return False
-    return any(arch in multimodal_model_archs for arch in model_architectures)
 
 
 # Models that require attention_mask for padding token handling

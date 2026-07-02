@@ -526,10 +526,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         # (plan built iff forward_mode == EXTEND), so a non-None plan already means
         # "this batch runs vision" -- here we just test `mm_embed_plan is not None`
         # (decode / target_verify / mixed / draft_extend all carry a None plan).
-        if (
-            getattr(self.model_config, "is_multimodal", False)
-            and forward_batch.mm_embed_plan is not None
-        ):
+        if forward_batch.mm_embed_plan is not None:
             general_mm_embed_routine(
                 input_ids=forward_batch.input_ids,
                 forward_batch=forward_batch,

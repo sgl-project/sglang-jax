@@ -155,7 +155,6 @@ def test_mm_embed_plan_device_put_uses_data_leading_sharding():
 
 
 def test_mrope_positions_propagate_through_model_worker_batch():
-    item = SimpleNamespace(modality="image", offsets=[(1, 1)])
     mrope_positions = np.array(
         [
             [0, 10, 2],
@@ -170,7 +169,6 @@ def test_mrope_positions_propagate_through_model_worker_batch():
                 reqs=[
                     SimpleNamespace(
                         mm_inputs={
-                            "mm_items": [item],
                             "mrope_positions": mrope_positions,
                         },
                         lora_id="0",
