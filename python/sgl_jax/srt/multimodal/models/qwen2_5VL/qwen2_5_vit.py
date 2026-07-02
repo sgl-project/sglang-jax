@@ -72,7 +72,7 @@ def vision_attention(
     k: jax.Array,
     v: jax.Array,
     scale: float,
-    window_size: int = -1,
+    attn_mask: jax.Array | None = None,
 ) -> jax.Array:
     """
     Compute vision attention using flash attention on GPU or native attention on TPU.
@@ -82,13 +82,16 @@ def vision_attention(
     Args:
         q, k, v: Input tensors of shape [B, T, N, H] (batch, seq_len, num_heads, head_dim)
         scale: Attention scale factor (1/sqrt(head_dim))
-        window_size: Window size for local attention. -1 means full attention.
+        attn_mask: Optional [T, T] boolean mask where True marks an allowed
+            (query, key) pair. Used to implement Qwen2.5-VL's block-diagonal
+            attention (within a single image for full-attention layers, within a
+            single window for windowed layers). None means unmasked full attention.
 
     Returns:
         Output tensor of shape [B, T, N, H]
     """
-    if not is_tpu_runtime():
-        # GPU: use flash_mha
+    if not is_tpu_runtime() and attn_mask is None:
+        # GPU fast path: unmasked full attention via flash_mha.
         flash_mha = _get_flash_mha()
         original_dtype = q.dtype
         if q.dtype not in [jnp.bfloat16, jnp.float16]:
@@ -96,23 +99,15 @@ def vision_attention(
             k = k.astype(jnp.bfloat16)
             v = v.astype(jnp.bfloat16)
 
-        if window_size > 0:
-            output = flash_mha(
-                q,
-                k,
-                v,
-                softmax_scale=scale,
-                is_causal=False,
-                window_size=(window_size, window_size),
-            )
-        else:
-            output = flash_mha(q, k, v, softmax_scale=scale, is_causal=False)
+        output = flash_mha(q, k, v, softmax_scale=scale, is_causal=False)
 
         if output.dtype != original_dtype:
             output = output.astype(original_dtype)
         return output
     else:
-        # TPU: native attention
+        # Native attention (TPU, or GPU when a block-diagonal mask is required).
+        # flash_mha cannot express the per-image / per-window block-diagonal
+        # mask, so masked attention always runs natively here.
         B, T, N, H = q.shape
         q = jnp.transpose(q, (0, 2, 1, 3))  # [B, N, T, H]
         k = jnp.transpose(k, (0, 2, 1, 3))
@@ -120,13 +115,10 @@ def vision_attention(
 
         attn_weights = jnp.einsum("bnth,bnsh->bnts", q, k) * scale
 
-        if window_size > 0:
-            # Create window mask for local attention
-            positions = jnp.arange(T)
-            distance = jnp.abs(positions[:, None] - positions[None, :])
-            window_mask = distance > window_size
+        if attn_mask is not None:
+            # attn_mask[i, j] == True  -> keep; False -> mask out.
             attn_weights = jnp.where(
-                window_mask[None, None, :, :], jnp.finfo(attn_weights.dtype).min, attn_weights
+                attn_mask[None, None, :, :], attn_weights, jnp.finfo(attn_weights.dtype).min
             )
 
         attn_weights = jax.nn.softmax(attn_weights, axis=-1)
@@ -265,8 +257,7 @@ class Qwen2_5_VisionAttention(nnx.Module):
         self,
         x: jax.Array,
         rotary_pos_emb: jax.Array,
-        cu_window_seqlens: jax.Array | None = None,
-        use_fullattn: bool = True,
+        cu_seqlens: jax.Array | None = None,
     ) -> jax.Array:
         T, B, D = x.shape
         assert B == 1, "Vision attention currently only supports batch size 1"
@@ -284,13 +275,22 @@ class Qwen2_5_VisionAttention(nnx.Module):
         q = apply_rotary_pos_emb_vision(q, rotary_pos_emb)
         k = apply_rotary_pos_emb_vision(k, rotary_pos_emb)
 
-        # Use static window size derived from config for JIT compatibility.
-        window_size = -1
-        if not use_fullattn and cu_window_seqlens is not None:
-            window_size = self._window_token_size
+        # Build a block-diagonal attention mask from the cumulative sequence
+        # lengths. `cu_seqlens` is [0, b1, b2, ..., T]; for full-attention layers
+        # the blocks are per-image frames, for windowed layers they are per
+        # window. Token p belongs to segment seg[p] = number of boundaries in
+        # cu_seqlens[1:] that p has reached; two tokens may attend iff they share
+        # a segment. This replaces the previous (incorrect) 1-D sliding-distance
+        # window mask and the unmasked full attention. Robust to zero-width
+        # segments (duplicate boundaries) produced by window padding.
+        attn_mask = None
+        if cu_seqlens is not None:
+            pos = jnp.arange(T)
+            seg = jnp.sum(pos[:, None] >= cu_seqlens[None, 1:], axis=1)
+            attn_mask = seg[:, None] == seg[None, :]
 
         # Compute attention using the backend function
-        output = vision_attention(q, k, v, self.scale, window_size)
+        output = vision_attention(q, k, v, self.scale, attn_mask)
 
         # Reshape back: [B, T, N, H] -> [T, B, D]
         output = output.transpose(1, 0, 2, 3).reshape(T, B, D)
@@ -325,10 +325,9 @@ class Qwen2_5_VisionBlock(nnx.Module):
         self,
         x: jax.Array,
         rotary_pos_emb: jax.Array,
-        cu_window_seqlens: jax.Array | None = None,
-        use_fullattn: bool = True,
+        cu_seqlens: jax.Array | None = None,
     ) -> jax.Array:
-        x = x + self.attn(self.norm1(x), rotary_pos_emb, cu_window_seqlens, use_fullattn)
+        x = x + self.attn(self.norm1(x), rotary_pos_emb, cu_seqlens)
         x = x + self.mlp(self.norm2(x))
         return x
 
@@ -580,15 +579,13 @@ class Qwen2_5_VL_VisionTransformer(nnx.Module):
                 hidden_states = blk(
                     hidden_states,
                     rotary_pos_emb=rotary_pos_emb,
-                    cu_window_seqlens=cu_seqlens,
-                    use_fullattn=True,
+                    cu_seqlens=cu_seqlens,
                 )
             else:
                 hidden_states = blk(
                     hidden_states,
                     rotary_pos_emb=rotary_pos_emb,
-                    cu_window_seqlens=cu_window_seqlens,
-                    use_fullattn=False,
+                    cu_seqlens=cu_window_seqlens,
                 )
 
         # adapter
