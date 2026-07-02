@@ -8,7 +8,12 @@ from sgl_jax.srt.multimodal.common.modality_enum import (
     MultimodalInputs,
 )
 from sgl_jax.srt.multimodal.manager.mrope_utils import compute_mrope_positions
+from sgl_jax.srt.multimodal.models.vision_metadata import (
+    qwen2_5_vl as _qwen2_5_vl_metadata,
+)
 from sgl_jax.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
+
+_ = _qwen2_5_vl_metadata
 
 
 class QwenVLProcessor(BaseMultimodalProcessor):
