@@ -23,6 +23,7 @@ import logging
 import os
 import threading
 from http import HTTPStatus
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, ClassVar
 
 import jax
@@ -2074,6 +2075,106 @@ class ScheduleBatch:
             "deepstack_visual_embedding": dense,
         }
 
+    def _build_extend_mm_embed_plan(
+        self,
+        per_dp_token_size: int,
+    ) -> MultimodalEmbedPlan | None:
+        """Build the image plan for the current EXTEND token window.
+
+        Processor offsets are prompt-absolute; this method translates them to
+        the current ``[prefix_len, seq_len)`` window before the DP round builder
+        consumes them.
+        """
+        if not self.contains_mm_inputs():
+            return None
+        if self.forward_mode != ForwardMode.EXTEND:
+            if self.forward_mode in (ForwardMode.MIXED, ForwardMode.DRAFT_EXTEND):
+                for info in self.reqs_info:
+                    for req in info.reqs or []:
+                        mm_items = (
+                            _extract_mm_value(getattr(req, "mm_inputs", None), "mm_items") or []
+                        )
+                        if any(_as_mm_item(item).is_image() for item in mm_items):
+                            raise ValueError(
+                                "Image multimodal embed plan is only supported for "
+                                f"regular EXTEND mode, got {self.forward_mode.name}"
+                            )
+            return None
+
+        translated_reqs_info = []
+        any_image = False
+        for dp_rank in range(self.dp_size):
+            info = self.reqs_info[dp_rank]
+            translated_reqs = []
+            if info.reqs:
+                rank_has_image = any(_req_has_image_mm(req) for req in info.reqs)
+                if info.seq_lens is None or info.prefix_lens is None:
+                    if rank_has_image:
+                        raise ValueError(
+                            "Image multimodal embed plan requires seq_lens and "
+                            f"prefix_lens in EXTEND mode, rank={dp_rank}"
+                        )
+                    translated_reqs_info.append(SimpleNamespace(reqs=translated_reqs))
+                    continue
+                if rank_has_image and (
+                    len(info.seq_lens) != len(info.reqs) or len(info.prefix_lens) != len(info.reqs)
+                ):
+                    raise ValueError(
+                        "Image multimodal embed plan requires one seq_len and "
+                        f"prefix_len per request, rank={dp_rank}, reqs={len(info.reqs)}, "
+                        f"seq_lens={len(info.seq_lens)}, prefix_lens={len(info.prefix_lens)}"
+                    )
+                for req, seq_len, prefix_len in zip(info.reqs, info.seq_lens, info.prefix_lens):
+                    prefix_i = int(prefix_len)
+                    seq_i = int(seq_len)
+                    ext_len = seq_i - prefix_i
+                    if ext_len <= 0:
+                        continue
+
+                    mm_items = _extract_mm_value(getattr(req, "mm_inputs", None), "mm_items") or []
+                    translated_items = []
+                    for raw_item in mm_items:
+                        item = _as_mm_item(raw_item)
+                        if not item.is_image():
+                            continue
+                        offsets = item.offsets or []
+                        local_offsets = []
+                        for start_abs, end_abs in offsets:
+                            start_abs = int(start_abs)
+                            end_abs = int(end_abs)
+                            if start_abs < prefix_i or end_abs >= seq_i:
+                                raise ValueError(
+                                    "Image placeholder span crosses the current extend window; "
+                                    "chunked prefill for image spans is not supported. "
+                                    f"rank={dp_rank}, span=({start_abs},{end_abs}), "
+                                    f"window=[{prefix_i},{seq_i})"
+                                )
+                            local_offsets.append((start_abs - prefix_i, end_abs - prefix_i))
+                        if local_offsets:
+                            translated_items.append(
+                                dataclasses.replace(item, offsets=local_offsets)
+                            )
+
+                    if translated_items:
+                        any_image = True
+                        translated_reqs.append(
+                            SimpleNamespace(
+                                mm_inputs=MultimodalInputs(mm_items=translated_items),
+                                extend_input_len=ext_len,
+                            )
+                        )
+            translated_reqs_info.append(SimpleNamespace(reqs=translated_reqs))
+
+        if not any_image:
+            return None
+
+        return build_mm_embed_plan(
+            reqs_info=translated_reqs_info,
+            dp_size=self.dp_size,
+            model_config=self.model_config,
+            per_dp_token=per_dp_token_size,
+        )
+
     def _merge_batch_metadata(
         self,
         per_dp_bs_size: int,
@@ -2671,15 +2772,7 @@ class ScheduleBatch:
         # Build the vision encode/merge plan only for ordinary prefill. Other
         # forward modes leave the plan unset, and the runner treats a non-None
         # plan as the sole vision-forward signal.
-        if self.contains_mm_inputs() and self.forward_mode == ForwardMode.EXTEND:
-            mm_embed_plan = build_mm_embed_plan(
-                self.reqs_info,
-                self.dp_size,
-                self.model_config,
-                per_dp_token_padding,
-            )
-        else:
-            mm_embed_plan = None
+        mm_embed_plan = self._build_extend_mm_embed_plan(per_dp_token_padding)
 
         # Merge per-DP top_logprobs_nums / token_ids_logprobs with the same
         # offset_bs += per_dp_bs_padding padding scheme used in _merge_batch_metadata.
@@ -2991,6 +3084,11 @@ def _as_mm_item(item: Any) -> MultimodalDataItem:
     if isinstance(item, dict):
         return MultimodalDataItem.from_dict(item)
     raise TypeError(f"mm_items must contain MultimodalDataItem, got {type(item).__name__}.")
+
+
+def _req_has_image_mm(req: Any) -> bool:
+    mm_items = _extract_mm_value(getattr(req, "mm_inputs", None), "mm_items") or []
+    return any(_as_mm_item(item).is_image() for item in mm_items)
 
 
 def _build_merge_idx(

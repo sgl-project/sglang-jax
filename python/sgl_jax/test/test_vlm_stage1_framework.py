@@ -664,6 +664,132 @@ def test_mm_embed_plan_keeps_placeholder_count_separate_from_encode_rows():
     np.testing.assert_array_equal(rounds[1].src_idx[5:9], np.array([0, 1, 2, 3], dtype=np.int32))
 
 
+def test_schedule_batch_translates_image_offsets_to_extend_window():
+    features = np.arange(16, dtype=np.float32).reshape(16, 1)
+    items = QwenVLProcessor._build_items(features, [(1, 4, 4)], [(5, 8)])
+    req = SimpleNamespace(mm_inputs=MultimodalInputs(mm_items=items))
+    batch = SimpleNamespace(
+        dp_size=1,
+        forward_mode=ForwardMode.EXTEND,
+        reqs_info=[
+            ScheduleReqsInfo(
+                reqs=[req],
+                seq_lens=np.array([10], dtype=np.int32),
+                prefix_lens=np.array([3], dtype=np.int32),
+            )
+        ],
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(
+                architectures=["Qwen2_5_VLForConditionalGeneration"],
+                vision_config=SimpleNamespace(
+                    patch_size=14,
+                    window_size=112,
+                    spatial_merge_size=2,
+                    fullatt_block_indexes=[],
+                    num_heads=16,
+                    hidden_size=1280,
+                    rope_theta=10000.0,
+                ),
+            )
+        ),
+    )
+    batch.contains_mm_inputs = lambda: True
+
+    plan = ScheduleBatch._build_extend_mm_embed_plan(batch, per_dp_token_size=8)
+
+    rnd = plan.rounds_by_modality[Modality.IMAGE][0]
+    np.testing.assert_array_equal(np.flatnonzero(rnd.mask), np.array([2, 3, 4, 5]))
+    np.testing.assert_array_equal(rnd.src_idx[2:6], np.array([0, 1, 2, 3], dtype=np.int32))
+
+
+def test_schedule_batch_rejects_image_span_crossing_extend_window():
+    features = np.arange(16, dtype=np.float32).reshape(16, 1)
+    items = QwenVLProcessor._build_items(features, [(1, 4, 4)], [(5, 8)])
+    req = SimpleNamespace(mm_inputs=MultimodalInputs(mm_items=items))
+    batch = SimpleNamespace(
+        dp_size=1,
+        forward_mode=ForwardMode.EXTEND,
+        reqs_info=[
+            ScheduleReqsInfo(
+                reqs=[req],
+                seq_lens=np.array([10], dtype=np.int32),
+                prefix_lens=np.array([6], dtype=np.int32),
+            )
+        ],
+        model_config=SimpleNamespace(hf_config=SimpleNamespace()),
+    )
+    batch.contains_mm_inputs = lambda: True
+
+    with pytest.raises(ValueError, match="chunked prefill for image spans is not supported"):
+        ScheduleBatch._build_extend_mm_embed_plan(batch, per_dp_token_size=8)
+
+
+def test_schedule_batch_rejects_image_plan_for_mixed_mode():
+    features = np.arange(16, dtype=np.float32).reshape(16, 1)
+    items = QwenVLProcessor._build_items(features, [(1, 4, 4)], [(0, 3)])
+    req = SimpleNamespace(mm_inputs=MultimodalInputs(mm_items=items))
+    batch = SimpleNamespace(
+        dp_size=1,
+        forward_mode=ForwardMode.MIXED,
+        reqs_info=[ScheduleReqsInfo(reqs=[req])],
+    )
+    batch.contains_mm_inputs = lambda: True
+
+    with pytest.raises(ValueError, match="regular EXTEND mode"):
+        ScheduleBatch._build_extend_mm_embed_plan(batch, per_dp_token_size=8)
+
+
+def test_schedule_batch_skips_image_plan_for_decode_mode():
+    features = np.arange(16, dtype=np.float32).reshape(16, 1)
+    items = QwenVLProcessor._build_items(features, [(1, 4, 4)], [(0, 3)])
+    req = SimpleNamespace(mm_inputs=MultimodalInputs(mm_items=items))
+    batch = SimpleNamespace(
+        dp_size=1,
+        forward_mode=ForwardMode.DECODE,
+        reqs_info=[ScheduleReqsInfo(reqs=[req])],
+    )
+    batch.contains_mm_inputs = lambda: True
+
+    assert ScheduleBatch._build_extend_mm_embed_plan(batch, per_dp_token_size=8) is None
+
+
+def test_schedule_batch_rejects_image_plan_without_extend_window_metadata():
+    features = np.arange(16, dtype=np.float32).reshape(16, 1)
+    items = QwenVLProcessor._build_items(features, [(1, 4, 4)], [(0, 3)])
+    req = SimpleNamespace(mm_inputs=MultimodalInputs(mm_items=items))
+    batch = SimpleNamespace(
+        dp_size=1,
+        forward_mode=ForwardMode.EXTEND,
+        reqs_info=[ScheduleReqsInfo(reqs=[req], seq_lens=None, prefix_lens=None)],
+    )
+    batch.contains_mm_inputs = lambda: True
+
+    with pytest.raises(ValueError, match="requires seq_lens and prefix_lens"):
+        ScheduleBatch._build_extend_mm_embed_plan(batch, per_dp_token_size=8)
+
+
+def test_schedule_batch_rejects_image_plan_with_mismatched_window_metadata():
+    features = np.arange(16, dtype=np.float32).reshape(16, 1)
+    items = QwenVLProcessor._build_items(features, [(1, 4, 4)], [(0, 3)])
+    req0 = SimpleNamespace(mm_inputs=MultimodalInputs(mm_items=items))
+    req1 = SimpleNamespace(mm_inputs=MultimodalInputs(mm_items=[]))
+    batch = SimpleNamespace(
+        dp_size=1,
+        forward_mode=ForwardMode.EXTEND,
+        reqs_info=[
+            ScheduleReqsInfo(
+                reqs=[req0, req1],
+                seq_lens=np.array([4], dtype=np.int32),
+                prefix_lens=np.array([0, 0], dtype=np.int32),
+            )
+        ],
+    )
+    batch.contains_mm_inputs = lambda: True
+
+    with pytest.raises(ValueError, match="one seq_len and prefix_len per request"):
+        ScheduleBatch._build_extend_mm_embed_plan(batch, per_dp_token_size=8)
+
+
 def test_mm_embed_plan_normalizes_dict_mm_items():
     feature = np.arange(8, dtype=np.float32).reshape(8, 1)
     req = SimpleNamespace(
