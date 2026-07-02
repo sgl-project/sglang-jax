@@ -310,6 +310,7 @@ suites = {
             "python/sgl_jax/test/test_multihost_logprob_host_transfer.py",
             0.1,
         ),
+        TestFile("python/sgl_jax/test/speculative/test_multihost_eagle_host_transfer.py", 0.1),
         TestFile("test/srt/test_dtype_config_llama.py", 1),
         TestFile("test/srt/test_dtype_config_consistency.py", 10),
         TestFile("python/sgl_jax/test/test_compilation_manager.py", 1),
