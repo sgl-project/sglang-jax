@@ -455,8 +455,14 @@ def _topk1_index_from_logits(logits):
     return topk_idx
 
 
-def _build_draft_extend(num_layers: int, topk: int):
-    """Build the fused JIT. Called once, result cached on draft_worker."""
+def _build_draft_extend(num_layers: int, topk: int, chain_mtp: bool = False):
+    """Build the fused JIT. Called once, result cached on draft_worker.
+
+    ``chain_mtp`` (chain-style MTP, e.g. Step-3.5-Flash): feed each layer's
+    pre-norm hidden (captured as ``output.hidden_states``) into the next layer
+    instead of the constant target hidden. Baked in at build time as a
+    compile-time branch; non-chain models keep the target hidden every layer.
+    """
     assert topk == 1, "Fused draft extend only supports topk=1"
 
     @partial(
@@ -506,11 +512,12 @@ def _build_draft_extend(num_layers: int, topk: int):
                 dp_size=dp_size,
             )
 
+        chained_hidden = target_hidden
         for i in range(num_layers):
             state = jax.tree_util.tree_unflatten(model_state_def, all_leaves[i])
             model = nnx.merge(model_def, state)
 
-            forward_batch.spec_info.hidden_states = target_hidden
+            forward_batch.spec_info.hidden_states = chained_hidden
             forward_batch.input_ids = input_ids
 
             output, pool_updates, _, _ = model(forward_batch, all_memory_pools[i], logits_metadata)
@@ -521,6 +528,11 @@ def _build_draft_extend(num_layers: int, topk: int):
 
             if i == 0:
                 layer0_hidden = output.hidden_states
+
+            # Chain-style MTP: layer i+1 consumes layer i's pre-norm hidden
+            # (captured as output.hidden_states via aux_hidden_states).
+            if chain_mtp and output.hidden_states is not None:
+                chained_hidden = output.hidden_states
 
             topk_idx = _topk1_index_from_logits(output.next_token_logits)
             all_topk_index.append(topk_idx)
@@ -1486,6 +1498,7 @@ def launch_fused_draft_extend_for_decode(
         draft_worker._fused_jit_fn = _build_draft_extend(
             num_layers=draft_worker.speculative_num_steps,
             topk=draft_worker.topk,
+            chain_mtp=getattr(draft_worker, "chain_mtp_hidden_states", False),
         )
 
     with jax.set_mesh(draft_worker.mesh):
