@@ -144,7 +144,31 @@ class Qwen2_5_VisionPatchEmbed(nnx.Module):
             )
         # [dp, seq, C, T, H, W] -> [dp, seq, T, H, W, C]
         x = jnp.transpose(x, (0, 1, 3, 4, 5, 2))
-        x = self.proj(x)
+        flat_sharding = out_sharding = None
+        if self.mesh is not None and "data" in self.mesh.abstract_mesh.explicit_axes:
+            flat_sharding = NamedSharding(self.mesh, PartitionSpec("data", None, None, None, None))
+            out_sharding = NamedSharding(
+                self.mesh,
+                PartitionSpec("data", None, None, None, None, None),
+            )
+        x = x.reshape(
+            dp * seq_len,
+            self.temporal_patch_size,
+            self.patch_size,
+            self.patch_size,
+            C,
+            out_sharding=flat_sharding,
+        )
+        x = self.proj(x, out_sharding=flat_sharding)
+        x = x.reshape(
+            dp,
+            seq_len,
+            1,
+            1,
+            1,
+            self.hidden_size,
+            out_sharding=out_sharding,
+        )
         # After conv: [dp, seq, 1, 1, 1, hidden_size].
         x = jnp.squeeze(x, axis=(2, 3, 4))
         if self.mesh is not None:
