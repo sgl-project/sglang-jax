@@ -160,7 +160,7 @@ def _build_checkpoint(cfg) -> dict[str, np.ndarray]:
             weights[f"{p}.mlp.up_proj.weight"] = _rand(_INTER, H)
             weights[f"{p}.mlp.down_proj.weight"] = _rand(H, _INTER)
         else:
-            E, M, S = _NUM_EXPERTS, _MOE_INTER, _SHARE_DIM
+            E, M, S = _NUM_EXPERTS, cfg.moe_intermediate_size, _SHARE_DIM
             weights[f"{p}.moe.gate.weight"] = _rand(E, H)
             weights[f"{p}.moe.router_bias"] = _rand(E)
             weights[f"{p}.moe.gate_proj.weight"] = _rand(E, M, H)
