@@ -25,7 +25,10 @@ from sgl_jax.srt.models.qwen2_5_vl import Qwen2_5_VisionTransformer
 from sgl_jax.srt.models.vision_metadata import (  # noqa: F401
     qwen2_5_vl as _qwen25vl_vision_metadata,
 )
-from sgl_jax.srt.models.vision_metadata.qwen2_5_vl import Qwen25VLVisionMetadata
+from sgl_jax.srt.models.vision_metadata.qwen2_5_vl import (
+    Qwen25VLVisionMetadata,
+    Qwen25VLVisionMetadataBuilder,
+)
 from sgl_jax.srt.multimodal.common.mm_plan import (
     EmbedRound,
     MultimodalEmbedPlan,
@@ -662,6 +665,52 @@ def test_mm_embed_plan_keeps_placeholder_count_separate_from_encode_rows():
 
     np.testing.assert_array_equal(np.flatnonzero(rounds[1].mask), np.array([5, 6, 7, 8]))
     np.testing.assert_array_equal(rounds[1].src_idx[5:9], np.array([0, 1, 2, 3], dtype=np.int32))
+
+
+def test_qwen_metadata_builder_checks_feature_rows_match_grid():
+    vision_config = SimpleNamespace(
+        patch_size=14,
+        window_size=112,
+        spatial_merge_size=2,
+        num_heads=16,
+        hidden_size=1280,
+        rope_theta=10000.0,
+    )
+    builder = Qwen25VLVisionMetadataBuilder(
+        SimpleNamespace(hf_config=SimpleNamespace(vision_config=vision_config))
+    )
+    item = MultimodalDataItem(
+        modality=Modality.IMAGE,
+        feature=np.ones((7, 1), dtype=np.float32),
+        offsets=[(0, 1)],
+        model_specific_data={"image_grid_thw": np.array([[1, 2, 4]], dtype=np.int32)},
+    )
+
+    with pytest.raises(ValueError, match="feature rows"):
+        builder.get_metadata(item)
+
+
+def test_qwen_metadata_builder_checks_placeholder_rows_match_grid():
+    vision_config = SimpleNamespace(
+        patch_size=14,
+        window_size=112,
+        spatial_merge_size=2,
+        num_heads=16,
+        hidden_size=1280,
+        rope_theta=10000.0,
+    )
+    builder = Qwen25VLVisionMetadataBuilder(
+        SimpleNamespace(hf_config=SimpleNamespace(vision_config=vision_config))
+    )
+    item = MultimodalDataItem(
+        modality=Modality.IMAGE,
+        feature=np.ones((8, 1), dtype=np.float32),
+        offsets=[(0, 0)],
+        model_specific_data={"image_grid_thw": np.array([[1, 2, 4]], dtype=np.int32)},
+    )
+
+    with pytest.raises(ValueError, match="placeholder rows"):
+        builder.get_metadata(item)
 
 
 def test_mm_embed_plan_normalizes_dict_mm_items():

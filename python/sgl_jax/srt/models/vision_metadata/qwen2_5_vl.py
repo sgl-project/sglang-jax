@@ -67,6 +67,10 @@ def _item_grid_thw(item: MultimodalDataItem) -> tuple:
     return (int(row[0]), int(row[1]), int(row[2]))
 
 
+def _placeholder_rows(item) -> int:
+    return sum(int(end) - int(start) + 1 for start, end in item.offsets or [])
+
+
 class Qwen25VLVisionMetadataBuilder:
     """Host-side builder for Qwen2.5-VL ViT aux.
 
@@ -178,6 +182,32 @@ class Qwen25VLVisionMetadataBuilder:
         order. Full-attention boundaries are derived later from ``valid``.
         """
         t, h, w = _item_grid_thw(item)
+        sms = self.spatial_merge_size
+        if h % sms != 0 or w % sms != 0:
+            raise ValueError(
+                "Qwen2.5-VL image_grid_thw height/width must be divisible by "
+                f"spatial_merge_size={sms}, got grid={(t, h, w)}."
+            )
+
+        expected_patch_rows = t * h * w
+        feature = item.get("feature")
+        if feature is None or int(np.asarray(feature).shape[0]) != expected_patch_rows:
+            actual = None if feature is None else int(np.asarray(feature).shape[0])
+            raise ValueError(
+                "Qwen2.5-VL image feature rows must match image_grid_thw: "
+                f"actual feature rows={actual}, expected={expected_patch_rows}, "
+                f"grid={(t, h, w)}."
+            )
+
+        expected_feature_rows = t * (h // sms) * (w // sms)
+        actual_placeholder_rows = _placeholder_rows(item)
+        if actual_placeholder_rows != expected_feature_rows:
+            raise ValueError(
+                "Qwen2.5-VL placeholder rows must match spatial-merged grid rows: "
+                f"actual placeholder rows={actual_placeholder_rows}, "
+                f"expected={expected_feature_rows}, grid={(t, h, w)}, "
+                f"spatial_merge_size={sms}."
+            )
 
         window_index, cu_window_seqlens = self._window_index_thw(t, h, w)
 
