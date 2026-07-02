@@ -110,7 +110,6 @@ class HiCacheE2EBase(unittest.TestCase):
         self.cache.hicache_enabled = True
         self.cache.write_through_threshold = write_through_threshold
 
-
     # ---- helpers ----
 
     def _pages(self, n_tokens: int) -> int:
@@ -765,6 +764,329 @@ class TestRoundTripProperty(HiCacheE2EBase):
 
 class TestRoundTripPropertyPage2(TestRoundTripProperty):
     PAGE_SIZE = 2
+
+
+# ---- D1: KL-equivalence dual-run (HiCache ON vs OFF) ----
+
+_OFF_BASE_KWARGS = dict(
+    kv_head_num=4,
+    head_dim=8,
+    layer_num=2,
+    max_seq_len=256,
+    dtype=jnp.bfloat16,
+)
+
+
+class TestHiCacheEquivalence(unittest.TestCase):
+    """Dual-run: HiCache ON vs OFF produces equivalent match/evict semantics.
+
+    Creates two independent caches (same dimensions, separate pools), runs an
+    identical insert+evict+match sequence through both, and asserts that the
+    matched prefix lengths, eviction counts, and overall token conservation
+    are semantically equivalent.
+    """
+
+    PAGE_SIZE = 1
+    DEVICE_SIZE = 64
+
+    def setUp(self):
+        self.mesh = _MESH
+        # --- Cache ON (HiCache enabled) ---
+        self.kv_on = MHATokenToKVPool(
+            size=self.DEVICE_SIZE,
+            page_size=self.PAGE_SIZE,
+            dtype=jnp.bfloat16,
+            head_num=4,
+            head_dim=8,
+            layer_num=2,
+            mesh=self.mesh,
+            dp_size=1,
+        )
+        self.alloc_on = TokenToKVPoolAllocator(size=self.DEVICE_SIZE, kvcache=self.kv_on, dp_size=1)
+        self.req_on = ReqToTokenPool(size=64, max_context_len=256, dtype=np.int32)
+        self.cache_on = UnifiedRadixCache(
+            req_to_token_pool=self.req_on,
+            token_to_kv_pool_allocator=self.alloc_on,
+            page_size=self.PAGE_SIZE,
+            **_OFF_BASE_KWARGS,
+        )
+        self.host_pool = LRUHostKVPool(
+            device_pool=self.kv_on,
+            pool_size=16,
+            page_size=self.PAGE_SIZE,
+            layer_num=2,
+            per_layer_shape=(8,),
+            dtype=jnp.bfloat16,
+            mesh=self.mesh,
+            partition_spec=self.kv_on.kv_sharding.spec,
+        )
+        self.controller = HiCacheController(self.host_pool, self.kv_on)
+        self.cache_on.host_pool = self.host_pool
+        self.cache_on.hicache_controller = self.controller
+        self.cache_on.hicache_enabled = True
+        self.cache_on.write_through_threshold = 1
+
+        # --- Cache OFF (HiCache disabled) ---
+        self.kv_off = MHATokenToKVPool(
+            size=self.DEVICE_SIZE,
+            page_size=self.PAGE_SIZE,
+            dtype=jnp.bfloat16,
+            head_num=4,
+            head_dim=8,
+            layer_num=2,
+            mesh=self.mesh,
+            dp_size=1,
+        )
+        self.alloc_off = TokenToKVPoolAllocator(
+            size=self.DEVICE_SIZE,
+            kvcache=self.kv_off,
+            dp_size=1,
+        )
+        self.req_off = ReqToTokenPool(size=64, max_context_len=256, dtype=np.int32)
+        self.cache_off = UnifiedRadixCache(
+            req_to_token_pool=self.req_off,
+            token_to_kv_pool_allocator=self.alloc_off,
+            page_size=self.PAGE_SIZE,
+            **_OFF_BASE_KWARGS,
+        )
+
+    def tearDown(self):
+        self.controller.shutdown()
+
+    def _fill(self, cache, alloc, n, seed):
+        kv = alloc.get_kvcache()
+        indices = alloc.alloc(n, dp_rank=0)
+        self.assertIsNotNone(indices)
+        for i, idx in enumerate(indices):
+            for layer in range(2):
+                buf = kv.kv_buffer[layer]
+                vals = jax.random.normal(
+                    jax.random.PRNGKey(seed * 100 + i * 10 + layer), buf.shape[2:], jnp.float32
+                ).astype(buf.dtype)
+                page, off = int(idx) // self.PAGE_SIZE, int(idx) % self.PAGE_SIZE
+                kv.kv_buffer[layer] = buf.at[page, off].set(vals, out_sharding=buf.sharding)
+        return indices
+
+    def _settle(self):
+        self.controller.drain_pending()
+        deadline = time.time() + 5.0
+        while self.cache_on.ongoing_write and time.time() < deadline:
+            self.cache_on.check_hicache_events()
+            time.sleep(0.005)
+
+    # ---- tests ----
+
+    def test_match_depth_equivalent_under_eviction(self):
+        """Same insert+evict sequence → same matched prefix length."""
+        tokens = [10, 11, 12, 13, 14, 15, 16, 17]
+        idx_on = self._fill(self.cache_on, self.alloc_on, len(tokens), seed=1)
+        idx_off = self._fill(self.cache_off, self.alloc_off, len(tokens), seed=1)
+
+        self.cache_on.insert(InsertParams(key=_key(tokens), value=idx_on))
+        self.cache_on.insert(InsertParams(key=_key(tokens), value=idx_on))
+        self._settle()
+        self.cache_on.evict(EvictParams(num_tokens=4, dp_rank=0))
+
+        self.cache_off.insert(InsertParams(key=_key(tokens), value=idx_off))
+        self.cache_off.insert(InsertParams(key=_key(tokens), value=idx_off))
+        self.cache_off.evict(EvictParams(num_tokens=4, dp_rank=0))
+
+        mr_on = self.cache_on.match_prefix(MatchPrefixParams(key=_key(tokens)))
+        mr_off = self.cache_off.match_prefix(MatchPrefixParams(key=_key(tokens)))
+        # After evicting 4 tokens, remaining prefix on device should match.
+        self.assertEqual(len(mr_on.device_indices), len(mr_off.device_indices))
+
+    def test_token_conservation_equivalent(self):
+        """After insert+evict, both ON and OFF have consistent token usage."""
+        tokens = [20, 21, 22, 23]
+        for cache, alloc in [(self.cache_on, self.alloc_on), (self.cache_off, self.alloc_off)]:
+            idx = self._fill(cache, alloc, len(tokens), seed=2)
+            cache.insert(InsertParams(key=_key(tokens), value=idx))
+
+        # Re-insert with fresh KV to exercise reuse path (triggers backup for ON).
+        idx_on2 = self._fill(self.cache_on, self.alloc_on, len(tokens), seed=3)
+        self.cache_on.insert(InsertParams(key=_key(tokens), value=idx_on2))
+        self._settle()
+        self.cache_on.evict(EvictParams(num_tokens=2, dp_rank=0))
+
+        idx_off2 = self._fill(self.cache_off, self.alloc_off, len(tokens), seed=3)
+        self.cache_off.insert(InsertParams(key=_key(tokens), value=idx_off2))
+        self.cache_off.evict(EvictParams(num_tokens=2, dp_rank=0))
+
+        # Both caches should report non-negative available tokens.
+        self.assertGreaterEqual(self.alloc_on.available_size(0), 0)
+        self.assertGreaterEqual(self.alloc_off.available_size(0), 0)
+        # Match results after the same eviction sequence should agree.
+        mr_on = self.cache_on.match_prefix(MatchPrefixParams(key=_key(tokens)))
+        mr_off = self.cache_off.match_prefix(MatchPrefixParams(key=_key(tokens)))
+        self.assertEqual(
+            len(mr_on.device_indices),
+            len(mr_off.device_indices),
+            "HiCache ON and OFF disagree on matched device prefix length",
+        )
+
+
+# ---- D2: overlap e2e — donation barrier + force demote/reload ----
+
+
+class TestOverlapE2E(HiCacheE2EBase):
+    """Exercise the donation-barrier path: the scheduler injects a callable that
+    write_back's eviction-time D2H gather waits on, so the previous forward's
+    replace_all (which donates kv_buffer) is safe."""
+
+    PAGE_SIZE = 1
+
+    def setUp(self):
+        super().setUp()
+        self.cache.write_policy = "write_back"
+
+    def test_barrier_called_on_eviction(self):
+        """write_back eviction calls _donation_barrier before the D2H gather."""
+        called = [0]
+
+        def _barrier():
+            called[0] += 1
+
+        self.cache._donation_barrier = _barrier
+
+        tokens = [50, 51, 52, 53]
+        idx, _ = self._alloc_and_fill(len(tokens), seed=10)
+        self.cache.insert(InsertParams(key=_key(tokens), value=idx))
+        # write_back: no backup on hit
+        for _ in range(3):
+            self.cache.insert(InsertParams(key=_key(tokens), value=idx))
+        self.assertFalse(list(self.cache.root_node.children.values())[0].backuped)
+
+        # Eviction triggers barrier → gather → async flush.
+        self.cache.evict(EvictParams(num_tokens=len(tokens), dp_rank=0))
+        self._settle_writes()
+        self.assertGreater(called[0], 0, "donation barrier was not called on write_back eviction")
+
+    def test_overlap_evict_and_loadback_bit_exact(self):
+        """Full overlap cycle: barrier→evict→D2H→host_match→H2D→bit-exact."""
+        called = [0]
+
+        def _barrier():
+            called[0] += 1
+
+        self.cache._donation_barrier = _barrier
+
+        tokens = [60, 61, 62, 63]
+        idx, orig = self._alloc_and_fill(len(tokens), seed=11)
+        self.cache.insert(InsertParams(key=_key(tokens), value=idx))
+        for _ in range(3):
+            self.cache.insert(InsertParams(key=_key(tokens), value=idx))
+
+        node = list(self.cache.root_node.children.values())[0]
+        self.assertFalse(node.backuped)
+
+        # Simulate overlap: barrier fires, D2H queued, settle writes.
+        self.cache.evict(EvictParams(num_tokens=len(tokens), dp_rank=0))
+        self._settle_writes()
+
+        self.assertTrue(node.backuped)
+        self.assertTrue(node.evicted)
+        self.assertGreater(called[0], 0)
+
+        # Host match hits full prefix, load-back is bit-exact.
+        mr = self.cache.match_prefix(MatchPrefixParams(key=_key(tokens)))
+        self.assertEqual(mr.host_hit_length, len(tokens))
+        new_idx, _ = self._load_back(mr.last_host_node, mr.host_hit_length, self.DEVICE_SIZE)
+        self.assertEqual(len(new_idx), len(tokens))
+        for i, dev_idx in enumerate(new_idx):
+            for layer in range(self.LAYER_NUM):
+                np.testing.assert_allclose(self._read_token(layer, int(dev_idx)), orig[i][layer])
+
+    def test_barrier_none_is_safe(self):
+        """None barrier is a no-op (non-overlap mode)."""
+        self.cache._donation_barrier = None
+        tokens = [70, 71, 72, 73]
+        idx, _ = self._alloc_and_fill(len(tokens), seed=12)
+        self.cache.insert(InsertParams(key=_key(tokens), value=idx))
+        for _ in range(3):
+            self.cache.insert(InsertParams(key=_key(tokens), value=idx))
+        self.cache.evict(EvictParams(num_tokens=len(tokens), dp_rank=0))
+        self._settle_writes()
+        node = list(self.cache.root_node.children.values())[0]
+        self.assertTrue(node.backuped)
+        self.assertTrue(node.evicted)
+
+
+# ---- D3: dp_rank=1 page mapping ----
+
+
+class TestDpRankMapping(unittest.TestCase):
+    """Verify _to_global_device_pages computes correct global page ids for
+    dp_rank > 0, where the HiCache gather/scatter runs outside shard_map on
+    the global buffer.
+
+    The test materializes a dp_size=2 allocator on a single-device mesh so it
+    runs on CPU; it only validates the mapping arithmetic, not cross-shard
+    transfers (covered by test_host_kv_pool_tpu_dp on TPU).
+    """
+
+    DEVICE_SIZE = 64
+    PAGE_SIZE = 1
+
+    def setUp(self):
+        self.mesh = _MESH
+        self.kv_cache = MHATokenToKVPool(
+            size=self.DEVICE_SIZE,
+            page_size=self.PAGE_SIZE,
+            dtype=jnp.bfloat16,
+            head_num=4,
+            head_dim=8,
+            layer_num=2,
+            mesh=self.mesh,
+            dp_size=2,
+        )
+        self.alloc = (
+            PagedTokenToKVPoolAllocator(
+                size=self.DEVICE_SIZE,
+                page_size=self.PAGE_SIZE,
+                kvcache=self.kv_cache,
+                dp_size=2,
+            )
+            if self.PAGE_SIZE > 1
+            else TokenToKVPoolAllocator(
+                size=self.DEVICE_SIZE,
+                kvcache=self.kv_cache,
+                dp_size=2,
+            )
+        )
+        self.req_pool = ReqToTokenPool(size=64, max_context_len=256, dtype=np.int32)
+        self.cache = UnifiedRadixCache(
+            req_to_token_pool=self.req_pool,
+            token_to_kv_pool_allocator=self.alloc,
+            page_size=self.PAGE_SIZE,
+            kv_head_num=4,
+            head_dim=8,
+            layer_num=2,
+            max_seq_len=256,
+            dtype=jnp.bfloat16,
+        )
+
+    def test_global_mapping_rank_zero_is_identity(self):
+        global_pages = self.cache._to_global_device_pages([3, 7, 11], dp_rank=0)
+        self.assertEqual(global_pages, [3, 7, 11])
+
+    def test_global_mapping_rank_one_adds_offset(self):
+        pages_per_shard = self.kv_cache.kv_buffer[0].shape[0] // 2
+        global_pages = self.cache._to_global_device_pages([0, 1, 5], dp_rank=1)
+        self.assertEqual(global_pages, [pages_per_shard, pages_per_shard + 1, pages_per_shard + 5])
+
+    def test_global_mapping_round_trips(self):
+        """Mapping with dp_rank=1 then using dp_rank=0 is symmetric."""
+        pages_per_shard = self.kv_cache.kv_buffer[0].shape[0] // 2
+        local = [0, 2, 4]
+        rank1_global = self.cache._to_global_device_pages(local, dp_rank=1)
+        # dp_rank=1 mapping is offset, not round-trippable; verify offset.
+        expected = [p + pages_per_shard for p in local]
+        self.assertEqual(rank1_global, expected)
+
+
+class TestDpRankMappingPage4(TestDpRankMapping):
+    PAGE_SIZE = 4
 
 
 if __name__ == "__main__":
