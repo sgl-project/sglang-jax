@@ -185,7 +185,9 @@ class SchedulePolicy:
                     self.waiting_queue_radix_tree.insert(
                         InsertParams(
                             key=RadixKey(
-                                token_ids=prefix_ids, extra_key=extra_key, dp_rank=r.dp_rank
+                                token_ids=prefix_ids,
+                                extra_key=extra_key,
+                                dp_rank=r.dp_rank,
                             ),
                             value=np.empty(len(prefix_ids), dtype=np.bool_),
                         )
@@ -307,6 +309,8 @@ class PrefillAdder:
         self.new_chunked_reqs = [None] * dp_size
         self.log_hit_tokens = 0
         self.log_input_tokens = 0
+        # HiCache: H2D flush plans from init_load_back (post-budget-gate only).
+        self.pending_h2d: list = []
 
         if running_batch is not None:
             # Calculate token offset per DP rank
@@ -434,7 +438,8 @@ class PrefillAdder:
     def add_chunked_req(self, req: Req):
         dp_rank = req.dp_rank if req.dp_rank is not None else 0
         _rem_tokens = min(
-            self.rem_chunk_tokens_list[dp_rank], int(self.rem_total_tokens_for_dp(dp_rank))
+            self.rem_chunk_tokens_list[dp_rank],
+            int(self.rem_total_tokens_for_dp(dp_rank)),
         )
         if self.is_hybrid:
             _rem_tokens = min(
@@ -628,6 +633,37 @@ class PrefillAdder:
                 swa_needed = self._swa_budget_for_req(req.extend_input_len, dp_rank)
                 if swa_needed >= self.rem_swa_tokens_for_dp(dp_rank):
                     return AddReqResult.NO_TOKEN
+
+            # HiCache: if chunked prefill would reject (trunc_len <= 0), bail
+            # before init_load_back — it allocates device pages, un-tombstones
+            # nodes, and queues H2D work, none of which the chunked rejection
+            # path rolls back. Using the original extend_input_len is a
+            # conservative over-estimate; after load-back it can only shrink.
+            if self.rem_chunk_tokens_list is not None:
+                input_tokens_est = self.ceil_paged_tokens(req.extend_input_len)
+                if input_tokens_est > self.rem_chunk_tokens_list[dp_rank]:
+                    trunc_est = (
+                        self.rem_chunk_tokens_list[dp_rank] // self.page_size * self.page_size
+                    )
+                    if trunc_est <= 0:
+                        return AddReqResult.OTHER
+
+            # HiCache: after budget gate, pull host-only prefix back to device.
+            # Must happen after NO_TOKEN check so rejected reqs never trigger H2D.
+            if getattr(self.tree_cache, "hicache_enabled", False) and req.host_hit_length > 0:
+                mem_quota = self.token_to_kv_pool_allocator.available_size(dp_rank)
+                new_indices, last_node, flush_plan = self.tree_cache.init_load_back(
+                    req.last_host_node, req.host_hit_length, mem_quota=mem_quota
+                )
+                if len(new_indices) > 0:
+                    self.pending_h2d.extend(flush_plan)
+                    req.prefix_indices = np.concatenate([req.prefix_indices, new_indices])
+                    req.last_node = last_node
+                    req.last_host_node = last_node
+                    req.host_hit_length = max(0, req.host_hit_length - len(new_indices))
+                    prefix_len = len(req.prefix_indices)
+                    req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
+
             req.last_matched_prefix_len = prefix_len
             input_tokens = self.ceil_paged_tokens(req.extend_input_len)
 

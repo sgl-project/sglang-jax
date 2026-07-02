@@ -29,14 +29,19 @@ class FullComponent(TreeComponent):
     def __init__(self, cache: UnifiedRadixCache, params: CacheInitParams | None = None):
         super().__init__(cache, params)
         self._free_full = cache.token_to_kv_pool_allocator.free
-        # HiCache state: set to host KV pool when HiCache enabled (not in stage 1)
-        self._full_kv_pool_host = None
 
     def create_match_validator(
         self, match_device_only: bool = False
     ) -> Callable[[UnifiedTreeNode], bool]:
-        # Stage 1 has no host tier, so device-only and default matching coincide.
-        return lambda node: node.component_data[self.component_type].value is not None
+        # HiCache: host-aware validator also accepts nodes with KV only on host
+        # (value=None, host_value set), so the match can walk into the L2 tier.
+        ct = self.component_type
+        if self.cache.hicache_enabled and not match_device_only:
+            return lambda node: (
+                node.component_data[ct].value is not None
+                or node.component_data[ct].host_value is not None
+            )
+        return lambda node: node.component_data[ct].value is not None
 
     def redistribute_on_node_split(self, new_parent: UnifiedTreeNode, child: UnifiedTreeNode):
         ct = self.component_type
@@ -46,6 +51,15 @@ class FullComponent(TreeComponent):
         if child_cd.value is not None:
             new_parent.component_data[ct].value = child_cd.value[:split_len].copy()
             child_cd.value = child_cd.value[split_len:].copy()
+        # HiCache: host_value is PAGE-level, so split at page (not token) boundary.
+        if child_cd.host_value is not None:
+            PS = self.cache.page_size
+            assert (
+                split_len % PS == 0
+            ), f"node split at non-page-aligned len {split_len} (page_size={PS})"
+            split_pages = split_len // PS
+            new_parent.component_data[ct].host_value = child_cd.host_value[:split_pages].copy()
+            child_cd.host_value = child_cd.host_value[split_pages:].copy()
 
     def evict_component(
         self,
@@ -100,24 +114,21 @@ class FullComponent(TreeComponent):
         root = self.cache.root_node
         cur = node
 
-        # Stage 1 has no tombstones (device eviction deletes leaves), so a
-        # live node's FULL value is never None on a lock path.
+        # Lock path may cross tombstones — only live nodes affect token accounting.
         delta = 0
         while cur is not root:
             cd = cur.component_data[ct]
-            assert (
-                cd.value is not None
-            ), f"FULL invariant broken: evicted node {cur.id} on lock path"
-            if cd.lock_ref == 0:
-                key_len = len(cd.value)
-                cur_dp_rank = cur.key.dp_rank if cur.key and cur.key.dp_rank is not None else 0
-                self.cache.component_evictable_size_[ct][cur_dp_rank] -= key_len
-                self.cache.component_protected_size_[ct][cur_dp_rank] += key_len
-                # This repo's convention (RadixCache.inc_lock_ref): delta is the
-                # evictable-size change, negative on acquire.
-                delta -= key_len
+            if cd.value is not None:
+                if cd.lock_ref == 0:
+                    key_len = len(cd.value)
+                    cur_dp_rank = cur.key.dp_rank if cur.key and cur.key.dp_rank is not None else 0
+                    self.cache.component_evictable_size_[ct][cur_dp_rank] -= key_len
+                    self.cache.component_protected_size_[ct][cur_dp_rank] += key_len
+                    # This repo's convention (RadixCache.inc_lock_ref): delta is the
+                    # evictable-size change, negative on acquire.
+                    delta -= key_len
+                self.cache.evictable_device_leaves.discard(cur)
             cd.lock_ref += 1
-            self.cache.evictable_device_leaves.discard(cur)
             cur = cur.parent
         result.delta = delta
         return result
@@ -137,10 +148,10 @@ class FullComponent(TreeComponent):
         cur = node
         while cur is not root:
             cd = cur.component_data[ct]
-            assert cd.value is not None
             assert cd.lock_ref > 0
 
-            if cd.lock_ref == 1:
+            # Mirror acquire: token accounting only for live nodes.
+            if cd.value is not None and cd.lock_ref == 1:
                 key_len = len(cd.value)
                 cur_dp_rank = cur.key.dp_rank if cur.key and cur.key.dp_rank is not None else 0
                 self.cache.component_evictable_size_[ct][cur_dp_rank] += key_len
