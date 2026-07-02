@@ -141,6 +141,23 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         new_conv_full_list = self.set_conv_state(
             recurrent_state_pool, layer.layer_id, recurrent_indices, new_conv_packed
         )
+
+        # Recurrent extra-buffer track snapshot: when a track boundary lands in
+        # this batch, also scatter the SAME final state into each request's track
+        # slot. Track boundaries are forced to forward ends, so the
+        # running-scatter value IS the boundary snapshot. None (extra-buffer off
+        # OR no boundary this batch) -> byte-identical to the no-track path: no
+        # extra shard_map runs.
+        track_indices = self.forward_metadata.recurrent_track_indices
+        if track_indices is not None:
+            track_mask = self.forward_metadata.recurrent_track_mask
+            new_ssm_full = self.set_ssm_track_state(
+                new_ssm_full, track_indices, track_mask, new_recurrent
+            )
+            new_conv_full_list = self.set_conv_track_state(
+                new_conv_full_list, track_indices, track_mask, new_conv_packed
+            )
+
         return output.reshape(output.shape[0], -1), (new_ssm_full, new_conv_full_list)
 
     def get_state(self, recurrent_state_pool, layer_id, recurrent_indices):
@@ -226,6 +243,61 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
             check_vma=False,
         )(full_conv, recurrent_indices, new_conv_packed)
         return [new_conv_full]
+
+    def set_ssm_track_state(self, full_recurrent, track_indices, track_mask, new_recurrent):
+        """Scatter ``new_recurrent`` into the request track slots.
+
+        Operates on the buffer RETURNED by ``set_ssm_state`` so both the
+        running slot and the track slot persist. Keep-mask preserves slots at
+        ``track_idx == 0`` (padding/dummy) and ``track_mask == 0`` (non-boundary
+        rows). Wrapped in ``optimization_barrier`` because the buffer is donated
+        (donated-buffer multi-host aliasing guard).
+        """
+
+        def _scatter(buf, tidx, tmask, val):
+            keep = ((tidx == 0) | (tmask == 0)).reshape(-1, 1, 1, 1)
+            safe_val = jnp.where(keep, buf[tidx], val)
+            return buf.at[tidx].set(safe_val)
+
+        new_full = jax.shard_map(
+            _scatter,
+            mesh=self.mesh,
+            in_specs=(
+                P("data", "tensor", None, None),
+                P("data"),
+                P("data"),
+                P("data", "tensor", None, None),
+            ),
+            out_specs=P("data", "tensor", None, None),
+            check_vma=False,
+        )(full_recurrent, track_indices, track_mask, new_recurrent)
+        return jax.lax.optimization_barrier(new_full)
+
+    def set_conv_track_state(self, new_conv_full_list, track_indices, track_mask, new_conv_packed):
+        """Scatter ``new_conv_packed`` into the request track slots.
+
+        Conv variant of :meth:`set_ssm_track_state` (3D keep-mask reshape).
+        """
+        full_conv = new_conv_full_list[0]
+
+        def _scatter(buf, tidx, tmask, val):
+            keep = ((tidx == 0) | (tmask == 0)).reshape(-1, 1, 1)
+            safe_val = jnp.where(keep, buf[tidx], val)
+            return buf.at[tidx].set(safe_val)
+
+        new_full = jax.shard_map(
+            _scatter,
+            mesh=self.mesh,
+            in_specs=(
+                P("data", "tensor", None),
+                P("data"),
+                P("data"),
+                P("data", "tensor", None),
+            ),
+            out_specs=P("data", "tensor", None),
+            check_vma=False,
+        )(full_conv, track_indices, track_mask, new_conv_packed)
+        return [jax.lax.optimization_barrier(new_full)]
 
     # ------------------------------------------------------------------
     # Forward mode implementations
