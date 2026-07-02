@@ -107,3 +107,66 @@ def test_registry_resolves_draft_arch():
     assert model_cls.__name__ == "Step3p5MTPForCausalLM"
     # MTP owns its LM head; only the token embedding is injected from the target.
     assert model_cls.load_lm_head_from_target is False
+
+
+def test_chain_mtp_contract():
+    """Step-3.5-Flash MTP is chain-style: it must expose the pre-norm hidden as an
+    aux hidden state (captured as logits_output.hidden_states) and flag the
+    multi-layer worker to chain it. Mirrors upstream sglang's Step3p5MTP, using
+    sglang-jax's EAGLE3 aux-capture mechanism."""
+    from sgl_jax.srt.models.step3p5_nextn import Step3p5MTPForCausalLM
+
+    assert Step3p5MTPForCausalLM.chain_mtp_hidden_states is True
+    assert Step3p5MTPForCausalLM.capture_aux_hidden_states is True
+
+
+def test_worker_and_fused_import():
+    """The chain edits to the shared spec engine must import cleanly."""
+    import sgl_jax.srt.speculative.draft_extend_fused as dxf
+    import sgl_jax.srt.speculative.multi_layer_draft_worker as mldw
+
+    assert hasattr(mldw, "MultiLayerDraftWorker")
+    assert hasattr(dxf, "_build_draft_extend")
+
+
+def test_aux_hidden_is_captured_as_chain_hidden():
+    """Behavioral proof of the mechanism the chain relies on: when a model passes
+    a distinct pre-norm hidden as ``aux_hidden_states`` with FULL capture, the
+    logits processor stores IT (not the post-norm logits hidden) as
+    ``output.hidden_states`` — which the multi-layer worker then chains forward.
+    Micro sizes (vocab=8, hidden=4) to stay well within RAM."""
+    import jax
+    import jax.numpy as jnp
+
+    from sgl_jax.srt.layers.embeddings import ParallelLMHead
+    from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
+    from sgl_jax.srt.model_executor.forward_batch_info import (
+        CaptureHiddenMode,
+        ForwardMode,
+    )
+    from sgl_jax.srt.utils.mesh_utils import create_device_mesh
+
+    vocab, hidden, ntok = 8, 4, 3
+    mesh = create_device_mesh(
+        ici_parallelism=[1, 1], dcn_parallelism=[1, 1], devices=[jax.devices()[0]]
+    )
+    with jax.set_mesh(mesh):
+        lp = LogitsProcessor(vocab, mesh=mesh)
+        lm_head = ParallelLMHead(vocab, hidden, dtype=jnp.float32, param_dtype=jnp.float32)
+        post = jnp.ones((ntok, hidden), dtype=jnp.float32)  # post-norm → logits
+        pre = 2.0 * jnp.ones((ntok, hidden), dtype=jnp.float32)  # pre-norm → chain
+        lm = LogitsMetadata(
+            forward_mode=ForwardMode.DECODE,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+            logits_indices=None,
+            extend_seq_lens=None,
+            extend_seq_lens_cpu=None,
+        )
+        out = lp(post, lm_head, lm, aux_hidden_states=[pre])
+
+    import numpy as np
+
+    captured = np.asarray(out.hidden_states)
+    # Captured hidden must be the aux (pre-norm), NOT the post-norm logits hidden.
+    np.testing.assert_allclose(captured, np.asarray(pre))
+    assert not np.allclose(captured, np.asarray(post))
