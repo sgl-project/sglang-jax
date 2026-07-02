@@ -33,6 +33,26 @@ from sgl_jax.srt.multimodal.common.modality_enum import (
     MultimodalInputs,
 )
 from sgl_jax.srt.multimodal.processors.qwen_vl import QwenVLProcessor
+from sgl_jax.srt.server_args import apply_multimodal_model_defaults
+
+
+def test_multimodal_model_defaults_disable_unsupported_scheduler_features():
+    server_args = SimpleNamespace(
+        disable_radix_cache=False,
+        disable_overlap_schedule=False,
+        chunked_prefill_size=4096,
+        enable_mixed_chunk=True,
+        limit_mm_data_per_request=None,
+    )
+    model_config = SimpleNamespace(is_multimodal=True)
+
+    apply_multimodal_model_defaults(server_args, model_config)
+
+    assert server_args.disable_radix_cache is True
+    assert server_args.disable_overlap_schedule is True
+    assert server_args.chunked_prefill_size == -1
+    assert server_args.enable_mixed_chunk is False
+    assert server_args.limit_mm_data_per_request == {"image": 16}
 
 
 def test_generate_req_getitem_preserves_media_fields():

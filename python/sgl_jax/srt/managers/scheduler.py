@@ -174,13 +174,6 @@ class Scheduler(
         self.stream_interval = server_args.stream_interval
         self.max_seq_len = server_args.max_seq_len
         self.page_size = server_args.page_size
-        self.enable_overlap = not server_args.disable_overlap_schedule
-        if server_args.multimodal:
-            logger.info("Multimodal mode enabled, disabling overlap schedule")
-            self.enable_overlap = False
-        if server_args.disaggregation_mode != "null":
-            logger.info("PD disaggregation mode enabled, disabling overlap schedule")
-            self.enable_overlap = False
         self.spec_algorithm = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
 
         # PD disaggregation runtime attributes. They are populated by
@@ -254,6 +247,14 @@ class Scheduler(
 
         # Init tokenizer
         self.init_tokenizer()
+
+        self.enable_overlap = not server_args.disable_overlap_schedule
+        if server_args.multimodal:
+            logger.info("Multimodal mode enabled, disabling overlap schedule")
+            self.enable_overlap = False
+        if server_args.disaggregation_mode != "null":
+            logger.info("PD disaggregation mode enabled, disabling overlap schedule")
+            self.enable_overlap = False
 
         # Init grammar backend for structured output
         self.grammar_backend = None
