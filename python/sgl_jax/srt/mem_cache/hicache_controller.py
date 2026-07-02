@@ -52,9 +52,11 @@ class HiCacheController:
         """
         host_buffer_ids = list(host_buffer_ids)
         self._host_pool.stage_backup(list(device_indices), host_buffer_ids)
-        future = self._executor.submit(self._do_d2h, host_buffer_ids)
+        # Register in-flight ids before submit: if the worker finishes before
+        # registration, its cleanup has nothing to remove and the ids leak.
         with self._inflight_lock:
             self._inflight.update(host_buffer_ids)
+        future = self._executor.submit(self._do_d2h, host_buffer_ids)
         self._pending.append(future)
         return future
 
@@ -76,9 +78,10 @@ class HiCacheController:
         The cheap scatter is deferred to flush_load.
         """
         host_buffer_ids = list(host_buffer_ids)
-        future = self._executor.submit(self._do_stage_load, host_buffer_ids)
+        # Register in-flight ids before submit (same race-window fix as write).
         with self._inflight_load_lock:
             self._inflight_load.update(host_buffer_ids)
+        future = self._executor.submit(self._do_stage_load, host_buffer_ids)
         self._pending_load.append(future)
         return future
 
@@ -171,6 +174,16 @@ class HiCacheController:
                 f"call drain_loads() before releasing"
             )
         self._host_pool.free(host_buffer_ids)
+
+    def has_inflight(self, host_buffer_ids: list[int]) -> bool:
+        """Check whether any of the given host pages have in-flight transfers."""
+        with self._inflight_lock:
+            if any(b in self._inflight for b in host_buffer_ids):
+                return True
+        with self._inflight_load_lock:
+            if any(b in self._inflight_load for b in host_buffer_ids):
+                return True
+        return False
 
     def pending_count(self) -> int:
         return len(self._pending)

@@ -9,6 +9,7 @@ HiCache) plug in without touching the core walk.
 from __future__ import annotations
 
 import heapq
+import logging
 from collections import defaultdict
 from functools import partial
 from typing import TYPE_CHECKING
@@ -51,6 +52,8 @@ from sgl_jax.srt.mem_cache.unified_cache_components import (
 
 if TYPE_CHECKING:
     from sgl_jax.srt.managers.schedule_batch import Req
+
+logger = logging.getLogger(__name__)
 
 
 class UnifiedTreeNode:
@@ -153,6 +156,11 @@ class UnifiedRadixCache(BasePrefixCache):
         self.reset()
 
     def reset(self):
+        # Drain in-flight HiCache transfers before clearing state, otherwise
+        # the controller holds page refs that the reset forgets.
+        if self.hicache_controller is not None:
+            self.hicache_controller.drain_pending()
+            self.hicache_controller.drain_loads()
         self.root_node = UnifiedTreeNode(self.tree_components)
         self.root_node.key = RadixKey(token_ids=[], extra_key=None, dp_rank=None)
         self.root_node.component_data[BASE_COMPONENT_TYPE].value = []
@@ -835,12 +843,27 @@ class UnifiedRadixCache(BasePrefixCache):
         self.host_pool.precompile_transfers()
 
     def writing_check(self) -> None:
-        """Settle completed async D2H writes (non-blocking)."""
+        """Settle completed async D2H writes (non-blocking).
+
+        Rolls back host_value on failed futures so the node does not point at a
+        stale or empty host slot if the exception is handled non-fatally.
+        """
         if not self.ongoing_write:
             return
         done = [f for f in self.ongoing_write if f.done()]
         for f in done:
-            self.ongoing_write.pop(f)
+            node, host_pages = self.ongoing_write.pop(f)
+            exc = f.exception()
+            if exc is not None:
+                node.component_data[BASE_COMPONENT_TYPE].host_value = None
+                self.host_pool.free(list(host_pages))
+                logger.warning(
+                    "HiCache write for node %r failed: %s; host_value cleared, "
+                    "%d host page(s) freed.",
+                    node.key.token_ids[:8] if node.key else [],
+                    exc,
+                    len(host_pages),
+                )
         self.hicache_controller.check_write_status()
 
     def check_hicache_events(self) -> None:
@@ -901,6 +924,15 @@ class UnifiedRadixCache(BasePrefixCache):
             self._update_evictable_leaf_sets(node.parent)
             return
 
+        # If eviction-time backup failed but there are backed-up descendants
+        # below this node, keep it as a structural tombstone so the subtree
+        # remains reachable for H2D reload. Without this, cascade-deleting
+        # the parent detaches the children and leaks their host pages.
+        if self.hicache_enabled and any(child.backuped for child in node.children.values()):
+            self._update_evictable_leaf_sets(node)
+            self._update_evictable_leaf_sets(node.parent)
+            return
+
         parent = node.parent
         self._remove_leaf_from_parent(node)
         self._update_evictable_leaf_sets(parent)
@@ -956,17 +988,24 @@ class UnifiedRadixCache(BasePrefixCache):
         return num_freed
 
     def _evict_host_leaf(self, node: UnifiedTreeNode) -> int:
-        """Release a host leaf's page ids and delete it from the tree."""
+        """Release a host leaf's page ids and delete it from the tree.
+
+        Skips (returns 0) when any page has an in-flight D2H/H2D transfer rather
+        than raising — evict_callback's RuntimeError was the pressure signal, but
+        write_backup publishes host_value before the worker finishes, so normal
+        host-pool pressure can select in-flight pages as LRU victims.
+        """
         cd = node.component_data[BASE_COMPONENT_TYPE]
-        buffer_ids = cd.host_value
-        num = len(buffer_ids)
-        self.hicache_controller.evict_callback([int(b) for b in buffer_ids])
+        buffer_ids = [int(b) for b in cd.host_value]
+        if self.hicache_controller.has_inflight(buffer_ids):
+            return 0
+        self.hicache_controller.evict_callback(buffer_ids)
         cd.host_value = None
         self.evictable_host_leaves.discard(node)
         parent = node.parent
         self._remove_leaf_from_parent(node)
         self._update_evictable_leaf_sets(parent)
-        return num
+        return len(buffer_ids)
 
     ##### HiCache (L1<->L2) Load Path #####
 

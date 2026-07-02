@@ -29,8 +29,6 @@ class FullComponent(TreeComponent):
     def __init__(self, cache: UnifiedRadixCache, params: CacheInitParams | None = None):
         super().__init__(cache, params)
         self._free_full = cache.token_to_kv_pool_allocator.free
-        # HiCache state: set to host KV pool when HiCache enabled (not in stage 1)
-        self._full_kv_pool_host = None
 
     def create_match_validator(
         self, match_device_only: bool = False

@@ -631,6 +631,20 @@ class PrefillAdder:
                 if swa_needed >= self.rem_swa_tokens_for_dp(dp_rank):
                     return AddReqResult.NO_TOKEN
 
+            # HiCache: if chunked prefill would reject (trunc_len <= 0), bail
+            # before init_load_back — it allocates device pages, un-tombstones
+            # nodes, and queues H2D work, none of which the chunked rejection
+            # path rolls back. Using the original extend_input_len is a
+            # conservative over-estimate; after load-back it can only shrink.
+            if self.rem_chunk_tokens_list is not None:
+                input_tokens_est = self.ceil_paged_tokens(req.extend_input_len)
+                if input_tokens_est > self.rem_chunk_tokens_list[dp_rank]:
+                    trunc_est = (
+                        self.rem_chunk_tokens_list[dp_rank] // self.page_size * self.page_size
+                    )
+                    if trunc_est <= 0:
+                        return AddReqResult.OTHER
+
             # HiCache: after budget gate, pull host-only prefix back to device.
             # Must happen after NO_TOKEN check so rejected reqs never trigger H2D.
             if getattr(self.tree_cache, "hicache_enabled", False) and req.host_hit_length > 0:
