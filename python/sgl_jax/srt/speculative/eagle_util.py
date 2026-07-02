@@ -12,6 +12,7 @@ import jax.numpy as jnp
 import numpy
 import numpy as np
 from flax import nnx
+from jax.experimental.multihost_utils import process_allgather
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 from jax.tree_util import register_pytree_node_class
@@ -74,6 +75,27 @@ def _as_int32_array(value: Any, *, fallback: int = -1) -> Any:
         raise TypeError(
             f"Unable to convert value of type {type(value)} into int32 metadata array."
         ) from exc
+
+
+def _host_spec_array(value: Any) -> np.ndarray:
+    if getattr(value, "is_fully_addressable", True):
+        copy = getattr(value, "copy_to_host_async", None)
+        if copy is not None:
+            copy()
+        return np.asarray(value)
+
+    if getattr(value, "is_fully_replicated", False):
+        local = value.addressable_data(0)
+        copy = getattr(local, "copy_to_host_async", None)
+        if copy is not None:
+            copy()
+        return np.asarray(local)
+
+    gathered = process_allgather(value, tiled=True)
+    copy = getattr(gathered, "copy_to_host_async", None)
+    if copy is not None:
+        copy()
+    return np.asarray(gathered)
 
 
 def get_last_loc_jax_array(
@@ -806,14 +828,10 @@ class EagleDraftInput:
         _scatter_spec_info_to_dp_slots eliminates those persistent cache misses.
         """
         device_fields = ("topk_p", "topk_index", "hidden_states", "verified_id", "accept_length")
-        to_copy = []
         for f in device_fields:
             v = getattr(self, f, None)
             if v is not None and hasattr(v, "copy_to_host_async"):
-                jax.copy_to_host_async(v)
-                to_copy.append(f)
-        for f in to_copy:
-            setattr(self, f, np.asarray(getattr(self, f)))
+                setattr(self, f, _host_spec_array(v))
 
     def filter_batch(self, new_indices: np.ndarray, has_been_filtered: bool = True):
         new_indices = np.asarray(new_indices)
