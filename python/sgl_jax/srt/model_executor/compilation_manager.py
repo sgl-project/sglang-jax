@@ -36,6 +36,7 @@ class CompilationManager:
         vocab_size: int,
         multimodal: bool = False,
         has_recurrent_state: bool = False,
+        moe_backend: str | None = None,
     ):
         self.dp_size = dp_size
         self.tp_size = tp_size
@@ -46,7 +47,11 @@ class CompilationManager:
         self.vocab_size = vocab_size
         self.multimodal = multimodal
         self.has_recurrent_state = has_recurrent_state
-        self.moe_backend = server_args.moe_backend
+        # Callers pass the *effective* backend (ModelConfig.moe_backend), which
+        # resolves architectures that hard-code FusedEPMoE (e.g. Qwen3.5) to
+        # "fused" so the bs-bucket filter below applies. Fall back to the raw
+        # server_args string for callers that don't have a ModelConfig yet.
+        self.moe_backend = moe_backend if moe_backend is not None else server_args.moe_backend
         self.enable_static_lora = server_args.enable_static_lora
 
         self.token_buckets = self._compute_token_buckets(server_args.precompile_token_paddings)

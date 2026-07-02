@@ -193,21 +193,28 @@ class ModelWorker:
                 dp_size,
             )
 
-        if server_args.moe_backend == "fused" and server_args.ep_size > 1:
+        # fused_ep_moe derives its EP group from the mesh (get_ep_size(mesh) =
+        # mesh['data'] * mesh['tensor']), not from --ep-size, so align against
+        # the actual mesh shape. Use the *resolved* backend from ModelConfig so
+        # architectures that hard-code FusedEPMoE (e.g. Qwen3.5 MoE) are
+        # covered even when the raw server_args string stays at "epmoe".
+        effective_moe_backend = self.model_runner.model_config.moe_backend.value
+        mesh_ep_size = self.mesh.shape.get("data", 1) * self.mesh.shape.get("tensor", 1)
+        if effective_moe_backend == "fused" and mesh_ep_size > 1:
             from sgl_jax.srt.utils.common_utils import align_bs_for_fused_ep
 
-            assert server_args.ep_size % dp_size == 0, (
-                f"fused MoE requires ep_size ({server_args.ep_size}) to be a multiple "
+            assert mesh_ep_size % dp_size == 0, (
+                f"fused MoE requires mesh_ep_size ({mesh_ep_size}) to be a multiple "
                 f"of dp_size ({dp_size}) so the ep-aligned cap stays dp-aligned"
             )
-            aligned = align_bs_for_fused_ep(self.max_running_requests, server_args.ep_size)
+            aligned = align_bs_for_fused_ep(self.max_running_requests, mesh_ep_size)
             if aligned != self.max_running_requests:
                 logger.warning(
                     "Adjusted max_running_requests from %s to %s for fused MoE "
-                    "(ep_size=%s, bt must be in {2,4,8k})",
+                    "(mesh_ep_size=%s, bt must be in {2,4,8k})",
                     self.max_running_requests,
                     aligned,
-                    server_args.ep_size,
+                    mesh_ep_size,
                 )
                 self.max_running_requests = aligned
 
@@ -250,6 +257,7 @@ class ModelWorker:
             vocab_size=self.model_config.vocab_size,
             multimodal=server_args.multimodal,
             has_recurrent_state=self.model_runner.linear_recurrent_config is not None,
+            moe_backend=effective_moe_backend,
         )
 
         # Allocate the persistent cache_loc host buffer once (reused every step

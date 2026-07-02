@@ -53,6 +53,9 @@ _FUSED_MOE_V2_SUPPORTED_ARCHITECTURES = frozenset(
 )
 
 
+_FORCED_FUSED_EP_MOE_ARCHS = frozenset({"Qwen3_5MoeForConditionalGeneration"})
+
+
 def _assert_fused_moe_v2_supported(moe_backend: MoEBackend, architectures: list[str]) -> None:
     if moe_backend != MoEBackend.FUSED_V2:
         return
@@ -133,6 +136,24 @@ class ModelConfig:
                 "Check that the model path points to a valid Hugging Face model directory."
             )
         _assert_fused_moe_v2_supported(self.moe_backend, self.hf_config.architectures)
+
+        # Models whose MoE block hard-codes FusedEPMoE (fused_ep_moe v1 kernel)
+        # instead of dispatching on --moe-backend. Resolve the effective backend
+        # to FUSED so downstream guards keyed on the backend string
+        # (CompilationManager bs-bucket filter, tp_worker align_bs) see the
+        # actual kernel constraints.
+        if self.hf_config.architectures[
+            0
+        ] in _FORCED_FUSED_EP_MOE_ARCHS and self.moe_backend not in (
+            MoEBackend.FUSED,
+            MoEBackend.FUSED_V2,
+        ):
+            logger.info(
+                "%s hard-codes FusedEPMoE; resolving effective moe_backend %s -> fused",
+                self.hf_config.architectures[0],
+                self.moe_backend.value,
+            )
+            self.moe_backend = MoEBackend.FUSED
 
         # Unify quantization config handling:
         # 1. User provided config path -> use it

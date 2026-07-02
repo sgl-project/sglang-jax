@@ -161,11 +161,15 @@ class Qwen3Detector(BaseReasoningFormatDetector):
     """
 
     def __init__(self, stream_reasoning: bool = True):
-        # Qwen3 won't be in reasoning mode when user passes `enable_thinking=False`
+        # Qwen3 chat_template emits the `<think>\n` opener as part of the prompt,
+        # so the completion starts mid-reasoning without the start tag. The
+        # `enable_thinking=False` case is gated upstream in serving_chat
+        # (`_get_reasoning_from_request`), so this detector is only invoked when
+        # reasoning is active.
         super().__init__(
             "<think>",
             "</think>",
-            force_reasoning=False,
+            force_reasoning=True,
             stream_reasoning=stream_reasoning,
         )
 
