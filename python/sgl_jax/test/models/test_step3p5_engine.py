@@ -795,5 +795,55 @@ class TestChunkedVsFullPrefill(unittest.TestCase):
         )
 
 
+@unittest.skipUnless(_IS_TPU, "fused MoE kernel requires TPU — skip on CPU")
+class TestFusedVsEPMoE(unittest.TestCase):
+    """FusedEPMoEV2 == EPMoE (#1391): same weights + input, both MoE backends agree within
+    the bf16 cross-kernel band, incl. the clamped layers. EPMoE is HF-aligned, so agreement
+    carries correctness to the fused production path.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls._mesh = create_device_mesh(
+            ici_parallelism=[1, 1], dcn_parallelism=[1, 1], devices=[jax.devices()[0]]
+        )
+        cls._weights = _build_checkpoint(_make_config())
+
+    def _moe_outputs(self, backend):
+        from sgl_jax.srt.models.step3p5 import Step3p5ForCausalLM, Step3p5MoE
+
+        cfg = _make_config()
+        cfg.moe_backend = backend
+        with jax.set_mesh(self._mesh):
+            model = Step3p5ForCausalLM(cfg, mesh=self._mesh, dtype=jnp.bfloat16, attn_impl="flash")
+        _load_weights(model, self._weights, cfg, self._mesh)
+        T = _PREFIX_LEN + _DECODE_STEPS
+        hs = jnp.asarray(
+            np.random.default_rng(7).standard_normal((T, cfg.hidden_size)), dtype=jnp.bfloat16
+        )
+        outs = {}
+        with jax.set_mesh(self._mesh):
+            for i, layer in enumerate(model.model.layers):
+                if isinstance(layer.mlp, Step3p5MoE):
+                    out, _ = layer.mlp(hs, forward_batch=None, dispatch_info=None)
+                    jax.block_until_ready(out)
+                    outs[i] = np.asarray(out, np.float64)
+        return outs
+
+    def test_fused_equals_epmoe(self):
+        ep = self._moe_outputs("epmoe")
+        fused = self._moe_outputs("fused_v2")
+        self.assertEqual(set(ep), set(fused))
+        for i in sorted(ep):
+            mx = float(np.max(np.abs(ep[i] - fused[i])))
+            sc = float(np.max(np.abs(ep[i])))
+            print(f" layer {i}: max_abs_diff={mx:.4e} scale={sc:.3f} rel={mx / (sc + 1e-9):.4f}")
+            self.assertLess(
+                mx,
+                _RTOL_LOGITS * max(sc, 1e-6),
+                f"layer {i} fused vs epmoe exceeds band: max_abs={mx:.4f} scale={sc:.3f}",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
