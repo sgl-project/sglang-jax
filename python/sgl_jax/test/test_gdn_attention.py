@@ -733,6 +733,31 @@ class TestGDNAttention(unittest.TestCase):
             )
             pool.replace_buffer(([recurrent_buffer], [conv_buffer_list]))
 
+    def test_recurrent_cow_copy_equivalence(self):
+        """copy_slots clones a prefilled recurrent+conv state bitwise into another slot."""
+        layer, pool, rec_idx, rec_buf, conv_buf_list = self.run_test("prefill", [128])
+        pool.replace_buffer(([rec_buf], [conv_buf_list]))
+
+        src = int(np.asarray(rec_idx).reshape(-1)[0])
+        dst = src + 1 if src + 1 < pool.total_slots else 1
+        data_sh = NamedSharding(mesh, P("data"))
+        src_arr = jax.device_put(np.array([src], dtype=np.int32), data_sh)
+        dst_arr = jax.device_put(np.array([dst], dtype=np.int32), data_sh)
+        new_rec, new_conv = jax.jit(pool.copy_slots)(src_arr, dst_arr)
+        pool.replace_buffer((new_rec, new_conv))
+
+        src_idx = np.array([src], dtype=np.int32)
+        dst_idx = np.array([dst], dtype=np.int32)
+        for layer_idx in range(pool.num_linear_recurrent_layers):
+            np.testing.assert_array_equal(
+                np.asarray(gather_ssm(pool, pool.recurrent_buffers[layer_idx], dst_idx)),
+                np.asarray(gather_ssm(pool, pool.recurrent_buffers[layer_idx], src_idx)),
+            )
+            np.testing.assert_array_equal(
+                np.asarray(gather_conv(pool, pool.conv_buffers[layer_idx][0], dst_idx)),
+                np.asarray(gather_conv(pool, pool.conv_buffers[layer_idx][0], src_idx)),
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

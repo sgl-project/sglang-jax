@@ -1044,8 +1044,8 @@ class ServerArgs:
             "--enable-unified-radix-tree",
             action="store_true",
             help="Route non-hybrid (full-attention) models to UnifiedRadixCache "
-            "(component-agnostic prefix cache). Default off; hybrid models are "
-            "unaffected.",
+            "(component-agnostic prefix cache). Default off. Also required to route "
+            "hybrid recurrent models (e.g. Kimi-Linear) into UnifiedRadixCache.",
         )
         parser.add_argument(
             "--allow-auto-truncate",

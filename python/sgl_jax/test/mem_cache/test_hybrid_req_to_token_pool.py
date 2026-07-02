@@ -331,5 +331,82 @@ class TestHybridPoolAllocMultiDP(CustomTestCase):
         self.assertIsNotNone(new_peer.recurrent_pool_idx)
 
 
+class TestHybridPoolRecurrentSlotAPI(CustomTestCase):
+    """Typed scalar slot API + 3-state (active/tree-owned/free) lifecycle."""
+
+    def setUp(self):
+        self.state_pool = FakeRecurrentStatePool(size=8)
+        self.pool = HybridReqToTokenPool(
+            size=8,
+            max_context_len=32,
+            dtype=np.int32,
+            recurrent_state_pool=self.state_pool,
+            dp_size=1,
+        )
+
+    def test_alloc_free_recurrent_slot_scalars(self):
+        slot = self.pool.alloc_recurrent_slot(0)
+        self.assertIsInstance(slot, int)
+        self.assertNotIn(slot, self.pool.recurrent_free_slots[0])
+        self.pool.free_recurrent_slot(slot, 0)
+        self.assertIn(slot, self.pool.recurrent_free_slots[0])
+
+    def test_alloc_recurrent_slot_returns_none_when_exhausted(self):
+        for _ in range(self.pool.slots_per_rank):
+            self.assertIsNotNone(self.pool.alloc_recurrent_slot(0))
+        self.assertIsNone(self.pool.alloc_recurrent_slot(0))
+
+    def test_recurrent_value_from_slot_is_length1_array(self):
+        v = self.pool.recurrent_value_from_slot(5)
+        self.assertIsInstance(v, np.ndarray)
+        self.assertEqual(v.dtype, np.int32)
+        self.assertEqual(v.shape, (1,))
+        self.assertEqual(int(v[0]), 5)
+
+    def test_commit_to_tree_transfers_ownership_without_freeing(self):
+        req = FakeReq(dp_rank=0)
+        self.pool.alloc([req])
+        slot = req.recurrent_pool_idx
+        free_before = self.pool.recurrent_available_size(0)
+
+        self.pool.commit_to_tree(req)
+
+        self.assertIsNone(req.recurrent_pool_idx)
+        self.assertEqual(self.pool.req_index_to_recurrent_index_mapping[req.req_pool_idx], 0)
+        self.assertEqual(self.pool.recurrent_available_size(0), free_before)
+        self.assertNotIn(slot, self.pool.recurrent_free_slots[0])
+
+    def test_free_skips_donated_slot(self):
+        """After commit_to_tree, pool.free must not return the donated slot."""
+        req = FakeReq(dp_rank=0)
+        self.pool.alloc([req])
+        slot = req.recurrent_pool_idx
+        self.pool.commit_to_tree(req)
+        free_before = self.pool.recurrent_available_size(0)
+
+        self.pool.free(req)
+
+        self.assertEqual(self.pool.recurrent_available_size(0), free_before)
+        self.assertNotIn(slot, self.pool.recurrent_free_slots[0])
+
+    def test_ledger_alloc_commit_evict_free(self):
+        """Free count tracks the active/tree-owned/free lifecycle."""
+        slots = self.pool.slots_per_rank
+        reqs = [FakeReq(dp_rank=0) for _ in range(3)]
+        self.pool.alloc(reqs)
+        self.assertEqual(self.pool.recurrent_available_size(0), slots - 3)
+
+        committed_slot = reqs[0].recurrent_pool_idx
+        self.pool.commit_to_tree(reqs[0])
+        self.assertEqual(self.pool.recurrent_available_size(0), slots - 3)
+
+        self.pool.free_recurrent_slot(committed_slot, 0)
+        self.assertEqual(self.pool.recurrent_available_size(0), slots - 2)
+
+        self.pool.free(reqs[1])
+        self.pool.free(reqs[2])
+        self.assertEqual(self.pool.recurrent_available_size(0), slots)
+
+
 if __name__ == "__main__":
     unittest.main()

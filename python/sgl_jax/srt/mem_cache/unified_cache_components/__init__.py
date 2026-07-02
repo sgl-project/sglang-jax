@@ -1,4 +1,7 @@
 from sgl_jax.srt.mem_cache.unified_cache_components.full_component import FullComponent
+from sgl_jax.srt.mem_cache.unified_cache_components.recurrent_component import (
+    RecurrentComponent,
+)
 from sgl_jax.srt.mem_cache.unified_cache_components.tree_component import (
     _NUM_COMPONENT_TYPES,
     BASE_COMPONENT_TYPE,
@@ -22,6 +25,7 @@ __all__ = [
     "FullComponent",
     "InsertResult",
     "LRURefreshPhase",
+    "RecurrentComponent",
     "TreeComponent",
     "_NUM_COMPONENT_TYPES",
     "get_and_increase_time_counter",

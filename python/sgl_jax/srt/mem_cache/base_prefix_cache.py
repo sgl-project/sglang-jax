@@ -17,6 +17,13 @@ class MatchPrefixParams:
     """Unified parameters for match_prefix across cache types."""
 
     key: RadixKey
+    # Record the deepest recurrent-bearing match on ``req`` as the CoW clone source.
+    cow_recurrent: bool = False
+    req: Any = None
+    # Match with the base FULL validator only: a request's own prefix re-match
+    # must not be gated on aux components (its recurrent state lives in the
+    # running slot, not the tree).
+    full_only: bool = False
 
 
 @dataclasses.dataclass
@@ -28,6 +35,9 @@ class InsertParams:
     # SWA-specific: consumed by SWARadixCache, ignored by RadixCache.
     prev_prefix_len: int = 0
     swa_evicted_seqlen: int = 0
+    # Length-1 int32 array (a RecurrentStatePool slot index); ownership passes
+    # to the tree at commit.
+    recurrent_value: Any = None
 
 
 @dataclasses.dataclass
@@ -37,6 +47,7 @@ class EvictParams:
     num_tokens: int = 0
     swa_num_tokens: int = 0
     dp_rank: int | None = None
+    recurrent_num: int = 0
 
 
 @dataclasses.dataclass
@@ -45,6 +56,7 @@ class EvictResult:
 
     num_tokens_evicted: int = 0
     swa_num_tokens_evicted: int = 0
+    recurrent_num_evicted: int = 0
 
 
 @dataclasses.dataclass
@@ -52,6 +64,8 @@ class DecLockRefParams:
     """Parameters for dec_lock_ref."""
 
     swa_uuid_for_lock: int | None = None
+    # Node ids where inc_lock_ref acquired nothing (no value); release skips them.
+    skip_lock_node_ids: dict = dataclasses.field(default_factory=dict)
 
 
 @dataclasses.dataclass
@@ -60,9 +74,13 @@ class IncLockRefResult:
 
     delta: int | None = None
     swa_uuid_for_lock: int | None = None
+    skip_lock_node_ids: dict = dataclasses.field(default_factory=dict)
 
     def to_dec_params(self) -> DecLockRefParams:
-        return DecLockRefParams(swa_uuid_for_lock=self.swa_uuid_for_lock)
+        return DecLockRefParams(
+            swa_uuid_for_lock=self.swa_uuid_for_lock,
+            skip_lock_node_ids=self.skip_lock_node_ids,
+        )
 
 
 class MatchResult(NamedTuple):
@@ -85,6 +103,9 @@ class MatchResult(NamedTuple):
     last_host_node: TreeNode | None
     best_match_node: TreeNode | None
     host_hit_length: int = 0
+    # Always None in the base path (clones the full match); branch truncation is
+    # a follow-up.
+    recurrent_branching_seqlen: int | None = None
 
 
 class BasePrefixCache(abc.ABC):
@@ -120,6 +141,9 @@ class BasePrefixCache(abc.ABC):
 
     def evictable_size(self, dp_rank: int = 0):
         return 0
+
+    def supports_recurrent(self) -> bool:
+        return False
 
     def full_evictable_size(self, dp_rank: int = 0):
         return 0
