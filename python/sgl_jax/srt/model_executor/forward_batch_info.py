@@ -203,8 +203,7 @@ class ForwardBatch:
 
     # Recurrent state indices [batch_size]
     recurrent_indices: jax.Array | None = None
-    # Recurrent CoW src slots [batch_size] (0 = no clone); clone dst =
-    # recurrent_indices. Set on extend batches with a prefix hit; None otherwise.
+    # Recurrent CoW src slots [batch_size] (0 = no clone)
     recurrent_cow_src_indices: jax.Array | None = None
 
     def tree_flatten(self):

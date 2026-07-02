@@ -210,21 +210,14 @@ class RecurrentStatePool:
                 self.conv_buffers[layer][inner] = jnp.zeros_like(self.conv_buffers[layer][inner])
 
     def copy_slots(self, src_indices, dst_indices):
-        """Copy-on-write clone of recurrent + conv state from ``src_indices`` to
-        ``dst_indices`` across all layers. Rows with ``src==0`` are no-ops (dst
-        keeps its content), covering padding and non-cloned requests.
-
-        Returns new ``(recurrent_buffers, conv_buffers)`` for the caller to fold
-        into the donated pool. ``src``/``dst`` are per-request LOCAL slot indices
-        within one DP rank.
-        """
+        """Clone src->dst slots across all layers; rows with src==0 keep dst.
+        Indices are per-DP-rank local; returns new buffers for the donated pool."""
         mesh = self.mesh
         data_axis = self.data_partition_axis
 
         def _temporal(buf, src, dst):
-            # Donated-pool aliasing barrier: buf is donated, so without it the
-            # scatter races the gather under multi-host SPMD -> NaN. Both barriers
-            # are value-preserving; do not remove.
+            # Donated-buffer aliasing barriers: without them the scatter races the
+            # gather under multi-host SPMD -> NaN. Value-preserving; do not remove.
             buf = jax.lax.optimization_barrier(buf)
             val = jnp.where((src == 0).reshape(-1, 1, 1, 1), buf[dst], buf[src])
             return jax.lax.optimization_barrier(buf.at[dst].set(val))

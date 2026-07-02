@@ -757,10 +757,7 @@ class TestUnifiedRadixCacheWithRequests(CustomTestCase):
 
 
 class TestUnifiedRadixCacheEffectiveCacheLen(CustomTestCase):
-    """Effective-cache-length consumption in cache_finished_req /
-    cache_unfinished_req: a component caps the inserted key via
-    prepare_for_caching_req; the cache truncates (freeing the dropped tail) or
-    skips the insert when 0. A monkeypatch stubs the cap (no component caps today)."""
+    """A prepare_for_caching_req cap truncates the inserted key, or skips the insert when 0."""
 
     def setUp(self):
         self.kv_head_num = 8
@@ -801,16 +798,13 @@ class TestUnifiedRadixCacheEffectiveCacheLen(CustomTestCase):
 
     @staticmethod
     def _cap_to(cache, cl):
-        """Monkeypatch the FULL component's prepare_for_caching_req to return a
-        fixed effective length, standing in for a future recurrent cap."""
+        """Cap the effective cache length at ``cl``, standing in for a recurrent cap."""
         full = cache.components[ComponentType.FULL]
         full.prepare_for_caching_req = lambda req, insert_params, token_ids_len, is_finished: cl
 
     def test_no_op_equivalence_unfinished_inserts_full_length(self):
-        # No component caps (all return None): the inserted key is the full
-        # page-aligned length, identical to today's behavior.
         pool, allocator, cache = self._create_stack()
-        token_ids = list(range(1, 13))  # 12 tokens
+        token_ids = list(range(1, 13))
         kv_indices = allocator.alloc(len(token_ids), dp_rank=0)
         pool.write((0, slice(0, len(token_ids))), kv_indices)
         req = MockRequest(
@@ -843,7 +837,6 @@ class TestUnifiedRadixCacheEffectiveCacheLen(CustomTestCase):
             last_node=cache.root_node,
         )
         req.last_matched_prefix_len = 0
-        # committed_kv_len == len(token_ids): finished caches the full sequence.
         req.kv_committed_len = len(token_ids)
         req.kv_allocated_len = len(token_ids)
 
@@ -854,11 +847,8 @@ class TestUnifiedRadixCacheEffectiveCacheLen(CustomTestCase):
         self.assertEqual(cache.total_size(), 12)
 
     def test_truncation_caps_inserted_key_unfinished_keeps_tail(self):
-        # A running request whose tree key is capped keeps its full KV (it is
-        # still generating); only the tree key is shortened, the dropped tail is
-        # retained in prefix_indices, not freed.
         pool, allocator, cache = self._create_stack()
-        token_ids = list(range(1, 13))  # 12 tokens
+        token_ids = list(range(1, 13))
         kv_indices = allocator.alloc(len(token_ids), dp_rank=0)
         pool.write((0, slice(0, len(token_ids))), kv_indices)
         req = MockRequest(
@@ -872,20 +862,15 @@ class TestUnifiedRadixCacheEffectiveCacheLen(CustomTestCase):
         req.last_matched_prefix_len = 0
 
         avail_before = allocator.available_size(0)
-        self._cap_to(cache, 8)  # cap 12 -> 8
+        self._cap_to(cache, 8)
         cache.cache_unfinished_req(req)
 
-        # Only the first 8 tokens were materialized into the tree.
         self.assertEqual(cache.total_size(), 8)
         match = cache.match_prefix(MatchPrefixParams(key=RadixKey(token_ids[:8])))
         self.assertEqual(len(match.device_indices), 8)
-        # The full key no longer fully matches; only the capped prefix does.
         full_match = cache.match_prefix(MatchPrefixParams(key=RadixKey(token_ids)))
         self.assertEqual(len(full_match.device_indices), 8)
-        # The protected prefix tracks the capped length.
         self.assertEqual(req.cache_protected_len, 8)
-        # The running request keeps its full KV (tail retained in prefix_indices,
-        # nothing freed beyond the duplicate overlap, which is 0 here).
         self.assertEqual(allocator.available_size(0), avail_before)
         self.assertEqual(len(req.prefix_indices), 12)
 
@@ -913,13 +898,9 @@ class TestUnifiedRadixCacheEffectiveCacheLen(CustomTestCase):
         self.assertEqual(cache.total_size(), 8)
         match = cache.match_prefix(MatchPrefixParams(key=RadixKey(token_ids[:8])))
         self.assertEqual(len(match.device_indices), 8)
-        # 4 dropped tail slots freed.
         self.assertEqual(allocator.available_size(0), avail_before + 4)
 
     def test_skip_insert_on_zero_unfinished(self):
-        # Unfinished skip (cap 0): nothing enters the tree, but prefix_indices is
-        # advanced to the committed KV (leak fix) and cache_protected_len stays 0,
-        # so finishing later frees the full committed range.
         pool, allocator, cache = self._create_stack()
         token_ids = list(range(1, 13))
         kv_indices = allocator.alloc(len(token_ids), dp_rank=0)
@@ -946,17 +927,13 @@ class TestUnifiedRadixCacheEffectiveCacheLen(CustomTestCase):
         self._cap_to(cache, 0)
         cache.cache_unfinished_req(req)
 
-        # No node was materialized; the request still points at root.
         self.assertEqual(cache.total_size(), 0)
         self.assertIs(req.last_node, cache.root_node)
-        # cleanup still ran.
         self.assertTrue(cleanup_calls)
-        # Nothing freed; protected length unchanged (nothing entered the tree).
         self.assertEqual(allocator.available_size(0), avail_before)
         self.assertEqual(req.cache_protected_len, 0)
-        # Leak fix: prefix_indices advanced to the committed KV (not left stale).
+        # Leak fix: prefix_indices advanced to the committed KV, not left stale.
         np.testing.assert_array_equal(req.prefix_indices, kv_indices)
-        # Finishing now frees the entire committed range -> no orphaned pages.
         req.kv_committed_len = len(token_ids)
         req.kv_allocated_len = len(token_ids)
         self._cap_to(cache, 0)
@@ -964,10 +941,6 @@ class TestUnifiedRadixCacheEffectiveCacheLen(CustomTestCase):
         self.assertEqual(allocator.available_size(0), avail_before + len(token_ids))
 
     def test_skip_insert_on_zero_unfinished_preserves_protected_prefix(self):
-        # With a protected [0:4] prefix, the unfinished skip frees nothing and
-        # leaves cache_protected_len at 4 (nothing new entered the tree), but
-        # advances prefix_indices to the committed KV (leak fix). Finishing then
-        # frees only the request-owned tail [4:12]; the protected prefix persists.
         pool, allocator, cache = self._create_stack()
         token_ids = list(range(1, 13))
         kv_indices = allocator.alloc(len(token_ids), dp_rank=0)
@@ -981,19 +954,16 @@ class TestUnifiedRadixCacheEffectiveCacheLen(CustomTestCase):
             last_node=cache.root_node,
         )
         req.last_matched_prefix_len = 4
-        req.cache_protected_len = 4  # first 4 KV slots are tree-protected
+        req.cache_protected_len = 4
 
         avail_before = allocator.available_size(0)
         self._cap_to(cache, 0)
         cache.cache_unfinished_req(req)
 
         self.assertEqual(cache.total_size(), 0)
-        # Nothing freed; the protected [0:4] prefix bookkeeping persists.
         self.assertEqual(allocator.available_size(0), avail_before)
         self.assertEqual(req.cache_protected_len, 4)
-        # Leak fix: prefix_indices advanced to the committed KV.
         np.testing.assert_array_equal(req.prefix_indices, kv_indices)
-        # Finishing frees the request-owned tail above the protected prefix.
         req.kv_committed_len = len(token_ids)
         req.kv_allocated_len = len(token_ids)
         self._cap_to(cache, 0)
@@ -1023,51 +993,45 @@ class TestUnifiedRadixCacheEffectiveCacheLen(CustomTestCase):
         cache.cache_finished_req(req)
 
         self.assertEqual(cache.total_size(), 0)
-        # Entire committed range freed (old_prefix_len=0 upward).
         self.assertEqual(allocator.available_size(0), avail_before + 12)
 
     def test_zero_cache_len_skip_then_continuation_extends_without_overlap(self):
-        # End-to-end leak guard: a chunked round ends off a boundary
-        # (effective_cache_len <= 0), then round 2 continues WITHOUT re-matching,
-        # allocating the suffix from len(prefix_indices). A stale prefix ([]
-        # instead of the committed chunk) would re-extend the whole prompt over
-        # round 1's pages and orphan them.
+        # A stale prefix after an off-boundary skip would re-extend over round 1's
+        # pages and orphan them (round 2 continues without re-matching).
         pool, allocator, cache = self._create_stack()
         token_ids = list(range(1, 13))  # 12-token prompt, chunked 6 + 6
         avail_start = allocator.available_size(0)
 
-        # --- Round 1: commit the first 6-token chunk, ending off a boundary. ---
+        # --- round 1: off-boundary skip ---
         chunk1 = allocator.alloc(6, dp_rank=0)
         pool.write((0, slice(0, 6)), chunk1)
         req = MockRequest(
             req_pool_idx=0,
             origin_input_ids=list(token_ids),
             output_ids=[],
-            fill_ids=list(token_ids[:6]),  # only the committed chunk this round
+            fill_ids=list(token_ids[:6]),
             prefix_indices=np.empty((0,), dtype=np.int32),
             last_node=cache.root_node,
         )
         req.last_matched_prefix_len = 0
         req.cache_protected_len = 0
 
-        self._cap_to(cache, 0)  # recurrent reports nothing cacheable (off boundary)
+        self._cap_to(cache, 0)
         cache.cache_unfinished_req(req)
 
-        # prefix_indices advanced to the committed chunk (NOT left stale at []).
         np.testing.assert_array_equal(req.prefix_indices, chunk1)
 
-        # --- Round 2: continue from the advanced prefix (mirror prepare_for_extend). ---
+        # --- round 2: continuation (mirrors prepare_for_extend) ---
         offset = len(req.prefix_indices)
         extend_len = len(token_ids) - offset
-        self.assertEqual(offset, 6)  # extend starts AFTER the committed chunk
-        self.assertEqual(extend_len, 6)  # suffix only, not the whole prompt
+        self.assertEqual(offset, 6)
+        self.assertEqual(extend_len, 6)
         chunk2 = allocator.alloc(extend_len, dp_rank=0)
-        # The continuation must not re-allocate over the committed chunk's pages.
         self.assertEqual(set(chunk1.tolist()) & set(chunk2.tolist()), set())
         pool.write((0, slice(offset, offset + extend_len)), chunk2)
         req.fill_ids = list(token_ids)
 
-        # --- Finish: the whole committed range frees -> no orphaned pages. ---
+        # --- finish ---
         req.kv_committed_len = len(token_ids)
         req.kv_allocated_len = len(token_ids)
         self._cap_to(cache, 0)
@@ -1084,9 +1048,7 @@ class _CowReq:
 
 
 class _ReleaseReq:
-    """Req surrogate carrying a request-owned recurrent slot, enough to drive
-    the production release entry point ``release_kv_cache`` (the scheduler's
-    abort and retract paths both funnel through it)."""
+    """Req surrogate with a request-owned recurrent slot for release_kv_cache."""
 
     def __init__(self, req_pool_idx, recurrent_pool_idx, origin_input_ids, dp_rank=0):
         self.req_pool_idx = req_pool_idx
@@ -1100,7 +1062,6 @@ class _ReleaseReq:
         self.rid = "release-req"
         self.kv_committed_len = len(origin_input_ids)
         self.kv_allocated_len = self.kv_committed_len
-        # No matched prefix: the whole committed range is request-owned.
         self.cache_protected_len = 0
         self.last_matched_prefix_len = 0
         self.kv_committed_freed = False
@@ -1118,9 +1079,7 @@ class _ReleaseReq:
 
 
 class _RunningRecurrentReq:
-    """Req surrogate for a running recurrent request mid chunked-prefill: it owns
-    a running recurrent slot (``recurrent_pool_idx`` set) and carries the cache
-    bookkeeping ``cache_unfinished_req`` reads/writes."""
+    """Req surrogate for a running recurrent request mid chunked-prefill."""
 
     def __init__(self, req_pool_idx, recurrent_pool_idx, fill_ids, dp_rank=0):
         self.req_pool_idx = req_pool_idx
@@ -1141,8 +1100,7 @@ class _RunningRecurrentReq:
 
 
 class TestUnifiedRadixCacheRecurrent(CustomTestCase):
-    """Cache-level recurrent component: commit / match-CoW / evict / lock /
-    slot ledger, all at page_size=1."""
+    """Cache-level recurrent component behavior at page_size=1."""
 
     def setUp(self):
         self.kv_head_num = 8
@@ -1151,7 +1109,7 @@ class TestUnifiedRadixCacheRecurrent(CustomTestCase):
         self.max_seq_len = 2048
         self.dtype = jnp.bfloat16
         self.pool_size = 8192
-        self.recurrent_size = 8  # global recurrent slots
+        self.recurrent_size = 8
         self.rec_num_heads = 8
         self.rec_head_dim = 16
         self.conv_kernel_size = 4
@@ -1199,8 +1157,7 @@ class TestUnifiedRadixCacheRecurrent(CustomTestCase):
         return state_pool, hybrid_pool, allocator, cache
 
     def _commit(self, cache, pool, key, value):
-        """Simulate a finished-request recurrent commit: pop a running slot and
-        donate it to the tree via insert (mirrors cache_finished_req)."""
+        """Donate a running slot to the tree via insert (mirrors cache_finished_req)."""
         slot = pool.alloc_recurrent_slot(0)
         params = InsertParams(
             key=RadixKey(key, None, 0),
@@ -1211,9 +1168,7 @@ class TestUnifiedRadixCacheRecurrent(CustomTestCase):
         return slot, result
 
     def _admit(self, cache, allocator, pool, key, dp_rank=0):
-        """Admit a running recurrent request: grab a req slot + a request-owned
-        recurrent running slot + KV indices, and wire them into the pools the way
-        prefill does, so the production release path can free them."""
+        """Admit a running request the way prefill does, so release can free it."""
         req = _ReleaseReq(
             req_pool_idx=None, recurrent_pool_idx=None, origin_input_ids=key, dp_rank=dp_rank
         )
@@ -1221,7 +1176,6 @@ class TestUnifiedRadixCacheRecurrent(CustomTestCase):
         kv_indices = allocator.alloc(len(key), dp_rank=dp_rank)
         self.assertIsNotNone(kv_indices)
         pool.write((req.req_pool_idx, slice(0, len(key))), kv_indices)
-        # No prefix was matched/locked: the lock release walks from root (no-op).
         req.last_node = cache.root_node
         return req
 
@@ -1237,14 +1191,11 @@ class TestUnifiedRadixCacheRecurrent(CustomTestCase):
         value = np.arange(100, 104, dtype=np.int32)
         slot, result = self._commit(cache, pool, key, value)
 
-        # The tree took ownership: committed leaf holds the slot.
         self.assertTrue(result.recurrent_committed)
         self.assertEqual(cache.component_evictable_size_[ComponentType.RECURRENT][0], 1)
-        # active=0 (no live request), tree_owned=1, free=slots-1.
         self.assertEqual(cache.assert_recurrent_slot_ledger(0), 0)
         self.assertEqual(pool.recurrent_available_size(0), slots - 1)
 
-        # A prefix hit records the src slot for CoW (no allocation at match).
         req = _CowReq(dp_rank=0)
         match = cache.match_prefix(
             MatchPrefixParams(key=RadixKey(key, None, 0), cow_recurrent=True, req=req)
@@ -1252,7 +1203,6 @@ class TestUnifiedRadixCacheRecurrent(CustomTestCase):
         self.assertTrue(np.array_equal(match.device_indices, value))
         self.assertEqual(req.recurrent_cow_src_index, slot)
 
-        # Eviction frees the recurrent slot and reports it.
         evict_result = cache.evict(EvictParams(recurrent_num=1, dp_rank=0))
         self.assertEqual(evict_result.recurrent_num_evicted, 1)
         self.assertEqual(cache.component_evictable_size_[ComponentType.RECURRENT][0], 0)
@@ -1260,58 +1210,43 @@ class TestUnifiedRadixCacheRecurrent(CustomTestCase):
         self.assertEqual(cache.assert_recurrent_slot_ledger(0), 0)
 
     def test_abort_and_retract_release_recurrent_slots(self):
-        """Abort and retract must return request-owned recurrent slots to the free
-        list (ledger back to active == 0). Both funnel through ``release_kv_cache``:
-        abort with is_insert=True (duplicate leaf not re-committed -> slot freed),
-        retract with is_insert=False (no insert).
-        """
+        """Abort and retract must return request-owned recurrent slots to the free list."""
         state_pool, pool, allocator, cache = self._create_recurrent_setup()
         slots = pool.slots_per_rank
 
-        # A committed tree leaf so the aborted request's sequence is a duplicate
-        # (recurrent_exist -> not re-committed -> request slot is freed).
+        # A committed leaf makes the aborted request's sequence a duplicate, so
+        # its running slot is freed rather than donated.
         committed_key = [1, 2, 3, 4]
         committed_val = np.arange(100, 104, dtype=np.int32)
         _, commit_res = self._commit(cache, pool, committed_key, committed_val)
         self.assertTrue(commit_res.recurrent_committed)
-        self.assertEqual(pool.recurrent_available_size(0), slots - 1)  # tree owns 1
+        self.assertEqual(pool.recurrent_available_size(0), slots - 1)
 
-        # Admit two running requests; each takes a request-owned recurrent slot.
         abort_req = self._admit(cache, allocator, pool, committed_key)  # duplicate seq
         retract_req = self._admit(cache, allocator, pool, [9, 10, 11])  # distinct seq
         self.assertIsNotNone(abort_req.recurrent_pool_idx)
         self.assertIsNotNone(retract_req.recurrent_pool_idx)
-        # tree_owned=1, active=2 -> free = slots - 3.
         self.assertEqual(pool.recurrent_available_size(0), slots - 3)
         self.assertEqual(cache.assert_recurrent_slot_ledger(0), 2)
 
-        # Abort: finished release with insert; the duplicate leaf is not
-        # re-committed, so the running slot is freed (not donated).
         release_kv_cache(abort_req, cache, is_insert=True)
         self.assertIsNone(abort_req.recurrent_pool_idx)
         self.assertEqual(cache.assert_recurrent_slot_ledger(0), 1)
 
-        # Retract: release without insert; the running slot is freed directly.
         release_kv_cache(retract_req, cache, is_insert=False)
         self.assertIsNone(retract_req.recurrent_pool_idx)
 
-        # No request-owned slots remain; only the tree leaf is still held.
         self.assertEqual(cache.assert_recurrent_slot_ledger(0), 0)
         self.assertEqual(cache.component_evictable_size_[ComponentType.RECURRENT][0], 1)
         self.assertEqual(pool.recurrent_available_size(0), slots - 1)
 
-        # Evicting the tree leaf returns the ledger to fully free.
         evict_result = cache.evict(EvictParams(recurrent_num=1, dp_rank=0))
         self.assertEqual(evict_result.recurrent_num_evicted, 1)
         self.assertEqual(pool.recurrent_available_size(0), slots)
         self.assertEqual(cache.assert_recurrent_slot_ledger(0), 0)
 
     def test_continuation_match_hits_committed_leaf(self):
-        """Serving reuse path: a follow-up whose prompt extends a committed
-        sequence (multi-turn / P -> P+suffix) walks past and stops on the
-        committed leaf, so recurrent hits the full committed length and records
-        the CoW src. This is the case cross-request recurrent reuse is built for.
-        """
+        """A prompt extending a committed sequence stops on the leaf and records the CoW src."""
         state_pool, pool, _, cache = self._create_recurrent_setup()
         key = [1, 2, 3, 4, 5, 6, 7, 8]
         value = np.arange(200, 208, dtype=np.int32)
@@ -1326,35 +1261,25 @@ class TestUnifiedRadixCacheRecurrent(CustomTestCase):
         self.assertEqual(req.recurrent_cow_src_index, slot)
 
     def test_page1_running_recurrent_chunked_continuation_full_only_preserves_prefix(self):
-        """page=1 regression floor for the full_only rematch
-        (schedule_batch.init_next_round_input). A RUNNING recurrent request owns
-        its state in its running slot, so its own unfinished FULL prefix lives in
-        the tree as recurrent-LESS interior nodes. The next-round re-match must use
-        full_only=True / cow_recurrent=False, else the leaf-only recurrent validator
-        rejects those nodes and the whole FULL prefix collapses to root. Asserts the
-        fixed params preserve the prefix, the wrong params truncate it to 0, and a
-        second continuation grows it with the ledger balanced.
-        """
+        """A running request's re-match must use full_only=True, else the leaf-only
+        recurrent validator collapses its cached FULL prefix to root."""
         state_pool, pool, allocator, cache = self._create_recurrent_setup()
 
-        # --- Admit a running recurrent request (req slot + a running slot). ---
-        chunk1 = list(range(1, 9))  # 8-token first chunk
+        chunk1 = list(range(1, 9))
         req = _RunningRecurrentReq(req_pool_idx=None, recurrent_pool_idx=None, fill_ids=chunk1)
         pool.alloc([req])  # assigns req_pool_idx + a running recurrent slot
         self.assertIsNotNone(req.recurrent_pool_idx)
         running_slot = req.recurrent_pool_idx
-        # active=1 (this running req), tree_owned=0, free=slots-1.
         self.assertEqual(cache.assert_recurrent_slot_ledger(0), 1)
 
-        # --- Chunk 1: write KV, cache the unfinished prefix into the tree. ---
         kv1 = allocator.alloc(len(chunk1), dp_rank=0)
         self.assertIsNotNone(kv1)
         pool.write((req.req_pool_idx, slice(0, len(chunk1))), kv1)
         req.last_node = cache.root_node
         cache.cache_unfinished_req(req)
 
-        # Unfinished page=1 donates no recurrent value: the running slot stays
-        # request-owned, the cached FULL nodes hold NO recurrent value.
+        # Unfinished caching donates nothing: the cached FULL nodes hold no
+        # recurrent value.
         self.assertEqual(req.recurrent_pool_idx, running_slot)
         self.assertEqual(req.cache_protected_len, len(chunk1))
         self.assertEqual(len(req.prefix_indices), len(chunk1))
@@ -1363,21 +1288,16 @@ class TestUnifiedRadixCacheRecurrent(CustomTestCase):
 
         prefix_key = RadixKey(chunk1, None, 0)
 
-        # --- (a) The fix's params: full_only=True / cow_recurrent=False. ---
+        # (a) fixed params preserve the FULL prefix
         cow_probe = _CowReq(dp_rank=0)
         fixed = cache.match_prefix(
             MatchPrefixParams(key=prefix_key, full_only=True, cow_recurrent=False, req=cow_probe)
         )
-        # The whole FULL prefix survives -- it is NOT gated on recurrent state.
         self.assertEqual(len(fixed.device_indices), len(chunk1))
         self.assertTrue(np.array_equal(fixed.device_indices, np.asarray(req.prefix_indices)))
-        # No re-clone: a running req owns its slot, so no CoW src is recorded.
         self.assertIsNone(cow_probe.recurrent_cow_src_index)
 
-        # --- (b) The WRONG params a new-prefill would use on this same key. ---
-        # full_only=False + cow_recurrent=True makes the leaf-only recurrent
-        # validator reject the recurrent-less FULL nodes, collapsing the match
-        # to root -- this is the regression the fix prevents.
+        # (b) a fresh prefill's params collapse the match to root
         wrong_probe = _CowReq(dp_rank=0)
         wrong = cache.match_prefix(
             MatchPrefixParams(key=prefix_key, full_only=False, cow_recurrent=True, req=wrong_probe)
@@ -1385,8 +1305,8 @@ class TestUnifiedRadixCacheRecurrent(CustomTestCase):
         self.assertEqual(len(wrong.device_indices), 0)
         self.assertIsNone(wrong_probe.recurrent_cow_src_index)
 
-        # --- (c) Second chunked-continuation: prefix preserved + ledger sound. ---
-        chunk2 = list(range(9, 13))  # 4 more tokens
+        # (c) second continuation
+        chunk2 = list(range(9, 13))
         req.fill_ids = chunk1 + chunk2
         kv2 = allocator.alloc(len(chunk2), dp_rank=0)
         self.assertIsNotNone(kv2)
@@ -1394,8 +1314,6 @@ class TestUnifiedRadixCacheRecurrent(CustomTestCase):
         protected_before = req.cache_protected_len
         cache.cache_unfinished_req(req)
 
-        # The continuation extends the protected prefix (never truncates it) and
-        # still does not clone or donate a recurrent slot.
         self.assertEqual(req.cache_protected_len, len(chunk1) + len(chunk2))
         self.assertGreater(req.cache_protected_len, protected_before)
         self.assertEqual(len(req.prefix_indices), len(chunk1) + len(chunk2))
@@ -1403,19 +1321,13 @@ class TestUnifiedRadixCacheRecurrent(CustomTestCase):
         self.assertEqual(cache.component_evictable_size_[ComponentType.RECURRENT][0], 0)
         self.assertEqual(cache.assert_recurrent_slot_ledger(0), 1)
 
-        # The extended FULL prefix is still fully matchable full_only.
         full_key = RadixKey(chunk1 + chunk2, None, 0)
         again = cache.match_prefix(MatchPrefixParams(key=full_key, full_only=True))
         self.assertEqual(len(again.device_indices), len(chunk1) + len(chunk2))
 
     def test_shorter_match_misses_recurrent_leaf(self):
-        """A match stopping one token short of the committed leaf (the universal
-        adjust_max_prefix_ids = input_len - 1, an identical-prompt resubmit) lands
-        on a recurrent-less split parent. Match requires every component's validator
-        to accept the node, so the whole match -- FULL KV included -- falls back to
-        root. Hence repeated-identical prompts report cached-token 0; matchable
-        intermediate snapshots are out of scope for the page=1 base.
-        """
+        """A match stopping one token short of the leaf (identical-prompt resubmit)
+        lands on a recurrent-less split parent and falls back to root."""
         state_pool, pool, _, cache = self._create_recurrent_setup()
         key = [1, 2, 3, 4, 5, 6, 7, 8]
         value = np.arange(200, 208, dtype=np.int32)
@@ -1430,9 +1342,7 @@ class TestUnifiedRadixCacheRecurrent(CustomTestCase):
         self.assertIsNone(req.recurrent_cow_src_index)
 
     def test_shorter_prefix_after_longer_skips_internal(self):
-        """Caching AB after ABCD lands on internal node B: recurrent is leaf-only,
-        so it is not committed there (no orphan); the running slot is freed by
-        the caller (recurrent_committed=False)."""
+        """Committing on an internal node is skipped (leaf-only); the caller frees the slot."""
         state_pool, pool, _, cache = self._create_recurrent_setup()
 
         long_key = [1, 2, 3, 4]
@@ -1444,10 +1354,8 @@ class TestUnifiedRadixCacheRecurrent(CustomTestCase):
         short_val = np.arange(20, 22, dtype=np.int32)
         short_slot, short_res = self._commit(cache, pool, short_key, short_val)
 
-        # Internal target → not committed; the longer leaf keeps its recurrent.
         self.assertFalse(short_res.recurrent_committed)
         self.assertEqual(cache.component_evictable_size_[ComponentType.RECURRENT][0], 1)
-        # The short slot is still request-owned (caller frees it).
         pool.free_recurrent_slot(short_slot, 0)
         self.assertEqual(cache.assert_recurrent_slot_ledger(0), 0)
 
@@ -1461,15 +1369,12 @@ class TestUnifiedRadixCacheRecurrent(CustomTestCase):
         leaf = match.last_device_node
         lock_result = cache.inc_lock_ref(leaf)
 
-        # Recurrent value moved evictable → protected.
         self.assertEqual(cache.component_evictable_size_[ComponentType.RECURRENT][0], 0)
         self.assertEqual(cache.component_protected_size_[ComponentType.RECURRENT][0], 1)
 
-        # Locked leaf survives eviction.
         evict_result = cache.evict(EvictParams(recurrent_num=1, dp_rank=0))
         self.assertEqual(evict_result.recurrent_num_evicted, 0)
 
-        # Unlock restores, then eviction frees.
         cache.dec_lock_ref(leaf, lock_result.to_dec_params())
         self.assertEqual(cache.component_evictable_size_[ComponentType.RECURRENT][0], 1)
         self.assertEqual(cache.component_protected_size_[ComponentType.RECURRENT][0], 0)
@@ -1478,9 +1383,7 @@ class TestUnifiedRadixCacheRecurrent(CustomTestCase):
         self.assertEqual(pool.recurrent_available_size(0), pool.slots_per_rank)
 
     def test_longer_prefix_after_shorter_frees_parent(self):
-        """Caching AB (leaf) then ABCD makes AB internal via _add_new_node; its
-        recurrent value must be dropped (not stranded on the unevictable internal
-        node), so eviction can reclaim every slot."""
+        """A leaf turning internal drops its recurrent slot instead of stranding it."""
         state_pool, pool, _, cache = self._create_recurrent_setup()
         slots = pool.slots_per_rank
 
@@ -1489,7 +1392,6 @@ class TestUnifiedRadixCacheRecurrent(CustomTestCase):
         _, abcd_res = self._commit(cache, pool, [1, 2, 3, 4], np.arange(20, 24, dtype=np.int32))
         self.assertTrue(abcd_res.recurrent_committed)
 
-        # AB became internal → its slot was freed; only ABCD's leaf is tree-owned.
         self.assertEqual(cache.component_evictable_size_[ComponentType.RECURRENT][0], 1)
         self.assertEqual(pool.recurrent_available_size(0), slots - 1)
         self.assertEqual(cache.assert_recurrent_slot_ledger(0), 0)
@@ -1499,34 +1401,29 @@ class TestUnifiedRadixCacheRecurrent(CustomTestCase):
         self.assertEqual(pool.recurrent_available_size(0), slots)
 
     def test_internal_transition_while_locked_frees_on_unlock(self):
-        """If a node becomes internal while its recurrent value is locked (a CoW
-        src this round), the free is deferred to the final unlock."""
+        """A locked node turning internal defers the recurrent free to the final unlock."""
         state_pool, pool, _, cache = self._create_recurrent_setup()
         self._commit(cache, pool, [1, 2], np.arange(10, 12, dtype=np.int32))
         ab = cache.match_prefix(MatchPrefixParams(key=RadixKey([1, 2], None, 0))).last_device_node
 
-        lock = cache.inc_lock_ref(ab)  # AB recurrent: evictable → protected
+        lock = cache.inc_lock_ref(ab)
         self.assertEqual(cache.component_protected_size_[ComponentType.RECURRENT][0], 1)
 
-        # Cache ABCD → AB gains a child while locked; recurrent free is deferred.
         self._commit(cache, pool, [1, 2, 3, 4], np.arange(20, 24, dtype=np.int32))
         self.assertIsNotNone(ab.component_data[ComponentType.RECURRENT].value)
         free_before = pool.recurrent_available_size(0)
 
-        cache.dec_lock_ref(ab, lock.to_dec_params())  # final unlock frees it
+        cache.dec_lock_ref(ab, lock.to_dec_params())
         self.assertIsNone(ab.component_data[ComponentType.RECURRENT].value)
         self.assertEqual(pool.recurrent_available_size(0), free_before + 1)
         self.assertEqual(cache.component_protected_size_[ComponentType.RECURRENT][0], 0)
         self.assertEqual(cache.assert_recurrent_slot_ledger(0), 0)
 
     def test_copy_slots_bitwise_clone_all_layers(self):
-        """copy_slots clones src→dst bitwise across all recurrent + conv layers;
-        src==0 rows are no-ops. This is the page=1 building block of CoW
-        equivalence (full KL==0 model parity is the TPU test)."""
+        """copy_slots clones src->dst bitwise across all layers; src==0 rows are no-ops."""
         state_pool, _, _, _ = self._create_recurrent_setup()
         src, dst = 2, 5
 
-        # Seed distinct per-layer data into the src slot; leave dst zeroed.
         # out_sharding is required because the test runs under an explicit mesh.
         rec_spec = state_pool.recurrent_sharding.spec
         conv_spec = state_pool.conv_sharding.spec
@@ -1542,9 +1439,7 @@ class TestUnifiedRadixCacheRecurrent(CustomTestCase):
                 .set(float(layer + 7), out_sharding=conv_spec)
             )
 
-        # Indices arrive P("data")-sharded in production; mirror that so
-        # copy_slots' shard_map in_specs match, and run it under jit as production
-        # does (jitted_run_model).
+        # Mirror production: P("data")-sharded indices + jit, so shard_map in_specs match.
         data_sh = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("data"))
         src_idx = jax.device_put(np.array([src], dtype=np.int32), data_sh)
         dst_idx = jax.device_put(np.array([dst], dtype=np.int32), data_sh)
@@ -1558,10 +1453,8 @@ class TestUnifiedRadixCacheRecurrent(CustomTestCase):
             src_conv = np.asarray(state_pool.conv_buffers[layer][0])[src]
             np.testing.assert_array_equal(rec[dst], src_rec)
             np.testing.assert_array_equal(conv[dst], src_conv)
-            # src is untouched (the tree's value is preserved).
             np.testing.assert_array_equal(rec[src], src_rec)
 
-        # src==0 → no clone: dst keeps its (zero) content.
         zero_idx = jax.device_put(np.array([0], dtype=np.int32), data_sh)
         noop_rec, _ = copy(zero_idx, dst_idx)
         for layer in range(state_pool.num_linear_recurrent_layers):
@@ -1569,8 +1462,7 @@ class TestUnifiedRadixCacheRecurrent(CustomTestCase):
             np.testing.assert_array_equal(np.asarray(noop_rec[layer])[dst], dst_before)
 
     def test_copy_slots_multi_dp_locality(self):
-        """copy_slots under dp_size=2: src/dst are per-rank-LOCAL slot indices, so
-        the clone must stay within each DP shard (no cross-rank corruption)."""
+        """src/dst are per-rank-LOCAL indices; clones must not cross DP shards."""
         dp_mesh = create_device_mesh(ici_parallelism=[2, -1], dcn_parallelism=[1, 1])
         with jax.sharding.set_mesh(dp_mesh):
             state_pool = RecurrentStatePool(
@@ -1583,7 +1475,7 @@ class TestUnifiedRadixCacheRecurrent(CustomTestCase):
                 dp_size=2,
             )
             buf = state_pool.recurrent_buffers[0]
-            # Seed global row i = i, so each rank's local slot has distinct data.
+            # Seed global row i = i so each rank's local slot has distinct data.
             seed = np.broadcast_to(
                 np.arange(buf.shape[0], dtype=np.float32).reshape(-1, 1, 1, 1), buf.shape
             )
@@ -1592,16 +1484,13 @@ class TestUnifiedRadixCacheRecurrent(CustomTestCase):
             )
 
             data_sh = jax.sharding.NamedSharding(dp_mesh, jax.sharding.PartitionSpec("data"))
-            # Both ranks clone LOCAL slot 2 → LOCAL slot 3 (global 2→3 on rank0,
-            # global 7→8 on rank1).
+            # Both ranks clone local 2 -> local 3 (global 2->3 on rank0, 7->8 on rank1).
             src = jax.device_put(np.array([2, 2], dtype=np.int32), data_sh)
             dst = jax.device_put(np.array([3, 3], dtype=np.int32), data_sh)
             new_rec, _ = jax.jit(state_pool.copy_slots)(src, dst)
             rec = np.asarray(new_rec[0])
 
-        # rank0 local-3 (global 3) == its local-2 (global 2) == 2.0;
-        # rank1 local-3 (global 8) == its local-2 (global 7) == 7.0.
-        # Cross-rank leakage would make global 3 == 7.0 (or vice versa).
+        # Cross-rank leakage would make global row 3 read 7.0 (or vice versa).
         self.assertEqual(float(rec[3].reshape(-1)[0]), 2.0)
         self.assertEqual(float(rec[8].reshape(-1)[0]), 7.0)
 

@@ -1,9 +1,5 @@
-"""`_build_recurrent_cow_src_indices` must return None (not an all-zero array)
-when no clone is pending, so `_maybe_apply_recurrent_cow` skips the donated-buffer
-scatter on cold/no-hit extends (which would corrupt state under multi-host SPMD).
-
-One-shot *consumption* is covered end-to-end by the recurrent serving probe.
-"""
+"""_build_recurrent_cow_src_indices must return None (not an all-zero array)
+when no clone is pending, so cold extends skip the donated-buffer CoW scatter."""
 
 import unittest
 from unittest.mock import MagicMock

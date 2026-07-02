@@ -229,9 +229,8 @@ class Req:
         # Memory pool info
         self.req_pool_idx: int | None = None
         self.recurrent_pool_idx: int | None = None
-        # Recurrent CoW: src tree slot to clone into the running slot this round.
-        # Set during match (finalize_match_result), consumed at prepare_for_extend,
-        # reset at the top of every init_next_round_input and on retract.
+        # One-shot recurrent CoW src slot: set on a fresh match, consumed at the
+        # next extend forward, cleared everywhere else (re-match, merge, retract).
         self.recurrent_cow_src_index: int | None = None
 
         # Check finish
@@ -418,8 +417,7 @@ class Req:
         self,
         tree_cache: BasePrefixCache | None = None,
     ):
-        # Reset the recurrent CoW src before matching: set only on a fresh hit,
-        # so a non-admitted re-match never clones from a stale/evicted slot.
+        # Reset so a non-admitted re-match never clones from a stale/evicted slot.
         self.recurrent_cow_src_index = None
         self.fill_ids = (
             self.origin_input_ids + self.output_ids if self.output_ids else self.origin_input_ids
@@ -722,16 +720,13 @@ class ScheduleReqsInfo:
     # Recurrent state indices for hybrid recurrent models (per DP)
     recurrent_indices: np.ndarray | None = None
 
-    # Recurrent CoW src slot per req (0 = no clone), per DP; aligned with
-    # recurrent_indices (the clone destination = the running slot).
+    # Recurrent CoW src slot per req (0 = no clone), per DP
     recurrent_cow_src_indices: np.ndarray | None = None
 
 
 def _build_recurrent_cow_src_indices(reqs: list[Req]) -> np.ndarray | None:
-    """Recurrent CoW src slots for a per-DP req list, or None when no request
-    has a pending clone. Returning None for the all-zero case keeps the CoW
-    prepass one-shot: cold/no-hit extends skip the donated-buffer scatter
-    entirely (see _maybe_apply_recurrent_cow)."""
+    """None when no clone is pending, so cold extends skip the donated-buffer
+    CoW scatter in _maybe_apply_recurrent_cow."""
     vals = [r.recurrent_cow_src_index or 0 for r in reqs]
     if not any(vals):
         return None
@@ -922,9 +917,6 @@ class ScheduleBatch:
         return self.batch_size() == 0
 
     def alloc_req_slots(self, reqs: list[Req]):
-        # Recurrent radix: each new req needs one running slot. Evict exactly the
-        # shortfall from the tree (frees FULL KV + recurrent atomically at page=1)
-        # so the pool alloc below never runs out of recurrent slots.
         if (
             self.is_hybrid_recurrent
             and self.tree_cache is not None
@@ -1065,8 +1057,6 @@ class ScheduleBatch:
                 info.recurrent_indices = self.req_to_token_pool.get_linear_recurrent_indices(
                     info.req_pool_indices
                 )
-                # Prefill reqs keep their match-time CoW src; appended running
-                # (decode) reqs have none (cleared after their own prefill).
                 if self.tree_cache is not None and self.tree_cache.supports_recurrent():
                     info.recurrent_cow_src_indices = _build_recurrent_cow_src_indices(info.reqs)
 
@@ -1125,12 +1115,10 @@ class ScheduleBatch:
 
                 req.kv_committed_len = seq_len
                 req.kv_allocated_len = seq_len
-                # cache_protected_len = the TREE-OWNED prefix (the free-from floor
-                # on finish/retract) = last_matched_prefix_len, NOT len(prefix_indices):
-                # a recurrent off-boundary chunk skip advances prefix_indices past
-                # the last published boundary, and using pre_len there would mark
-                # that request-owned tail tree-protected and leak it. No-op for
-                # non-recurrent reqs; net-identical for EAGLE.
+                # Tree-owned floor is last_matched_prefix_len, NOT pre_len: a
+                # recurrent off-boundary chunk skip advances prefix_indices past the
+                # published boundary, and pre_len would mark that request-owned tail
+                # tree-protected and leak it on finish.
                 req.cache_protected_len = req.last_matched_prefix_len
 
                 prefix_indices = req.prefix_indices
@@ -1241,8 +1229,6 @@ class ScheduleBatch:
                 info.recurrent_indices = self.req_to_token_pool.get_linear_recurrent_indices(
                     req_pool_indices_cpu
                 )
-                # Recurrent CoW src per req (0 = no clone); merged + cleared in
-                # get_model_worker_batch. Only when the tree does CoW.
                 if self.tree_cache is not None and self.tree_cache.supports_recurrent():
                     info.recurrent_cow_src_indices = _build_recurrent_cow_src_indices(reqs)
 
@@ -1664,8 +1650,6 @@ class ScheduleBatch:
                 info.recurrent_indices = self.req_to_token_pool.get_linear_recurrent_indices(
                     info.req_pool_indices
                 )
-                # Decode never initiates a prefix-hit clone (the running slot
-                # already holds the advanced state).
                 info.recurrent_cow_src_indices = None
 
             # Allocate memory for this DP rank
@@ -2833,8 +2817,8 @@ class ScheduleBatch:
                         )
                 offset_bs += per_dp_bs_padding
 
-        # Step 5.5b: Merge recurrent CoW src indices (extend only; 0 = no clone)
-        # and consume the per-req src so later decode/mixed forwards don't re-clone.
+        # Step 5.5b: Merge recurrent CoW src indices (extend only) and consume
+        # the per-req src so later decode/mixed forwards don't re-clone.
         recurrent_cow_src_indices_cpu = None
         if any(info.recurrent_cow_src_indices is not None for info in self.reqs_info):
             recurrent_cow_src_indices_cpu = np.zeros(total_bs, dtype=np.int32)
@@ -2848,13 +2832,10 @@ class ScheduleBatch:
                             info.recurrent_cow_src_indices
                         )
                 offset_bs += per_dp_bs_padding
-            # One-shot consumption (see header): clear per-DP array + per-req scalar.
             for info in self.reqs_info:
                 info.recurrent_cow_src_indices = None
                 for r in info.reqs or []:
                     r.recurrent_cow_src_index = None
-            # An all-zero merged array still triggers the donated-buffer scatter in
-            # _maybe_apply_recurrent_cow; drop it to None.
             if (
                 recurrent_cow_src_indices_cpu is not None
                 and not recurrent_cow_src_indices_cpu.any()

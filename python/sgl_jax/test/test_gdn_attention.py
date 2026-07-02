@@ -734,8 +734,7 @@ class TestGDNAttention(unittest.TestCase):
             pool.replace_buffer(([recurrent_buffer], [conv_buffer_list]))
 
     def test_recurrent_cow_copy_equivalence(self):
-        """Recurrent CoW: copy_slots clones a prefilled recurrent+conv state
-        into another slot bitwise-identically (KL==0 at page_size=1)."""
+        """copy_slots clones a prefilled recurrent+conv state bitwise into another slot."""
         layer, pool, rec_idx, rec_buf, conv_buf_list = self.run_test("prefill", [128])
         pool.replace_buffer(([rec_buf], [conv_buf_list]))
 

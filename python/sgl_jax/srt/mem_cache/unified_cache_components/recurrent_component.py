@@ -1,13 +1,7 @@
-"""Recurrent (linear-recurrent state) component for UnifiedRadixCache.
+"""Recurrent-state (KDA/GDN/GLA) component for UnifiedRadixCache, page_size=1.
 
-Brings KDA / GDN / GLA recurrent state into the radix tree so it is reused
-across requests like full KV. Recurrent state is per-leaf (a single
-RecurrentStatePool slot index), so this component is leaf-only: it rides the
-core's ``evictable_device_leaves`` rather than an LRU list.
-
-Scope (page_size=1): finished-request commit + prefix-hit copy-on-write clone.
-Unfinished/fork donation and page_size>=128 support are deferred.
-"""
+State is one RecurrentStatePool slot per leaf, so the component is leaf-only:
+it rides the core's ``evictable_device_leaves`` rather than an LRU list."""
 
 from __future__ import annotations
 
@@ -75,8 +69,6 @@ class RecurrentComponent(TreeComponent):
         value_chunks: list,
         best_value_len: int,
     ) -> MatchResult:
-        # Record the src slot only; the copy into the request's running slot runs
-        # in the next forward's one-shot pre-pass, not here.
         if not params.cow_recurrent:
             return result
         req = params.req
@@ -91,15 +83,13 @@ class RecurrentComponent(TreeComponent):
     # ---- insert / commit ----------------------------------------------------
 
     def redistribute_on_node_split(self, new_parent: UnifiedTreeNode, child: UnifiedTreeNode):
-        # Recurrent data is leaf-only; the new prefix (internal) parent gets none.
         ct = self.component_type
         new_parent.component_data[ct].value = None
         new_parent.component_data[ct].lock_ref = 0
 
     def on_parent_gains_child(self, node: UnifiedTreeNode) -> None:
-        # Recurrent is leaf-only: a node gaining a child becomes internal and must
-        # drop its recurrent value, else the slot strands on an unevictable node.
-        # If still locked (a CoW src this round), defer the free to final unlock.
+        # Leaf-only invariant: a node turning internal must drop its slot or it
+        # strands unevictable; if locked (a CoW src), defer the free to final unlock.
         cd = node.component_data[self.component_type]
         if cd.value is None or cd.lock_ref > 0:
             return
@@ -119,14 +109,10 @@ class RecurrentComponent(TreeComponent):
             return
         cd = node.component_data[ct]
         if cd.value is not None:
-            # Prefix already in the tree: keep the existing value; caller frees
-            # the request slot.
             result.recurrent_exist = True
             result.recurrent_committed = False
             return
         if node.children:
-            # Internal node: recurrent is leaf-only, so attaching here would
-            # orphan the slot. Skip.
             result.recurrent_committed = False
             return
         cd.value = params.recurrent_value
@@ -141,9 +127,8 @@ class RecurrentComponent(TreeComponent):
         token_ids_len: int,
         is_finished: bool,
     ) -> int | None:
-        # Only finished requests donate: the running slot is already the final
-        # state, so the tree value is the slot itself (no copy). Unfinished/fork
-        # donation is deferred to avoid a publish-before-materialize race.
+        # Finished-only donation: the running slot already holds the final state
+        # (no copy); donating unfinished would publish state not yet materialized.
         if not is_finished or req.recurrent_pool_idx is None:
             return None
         insert_params.recurrent_value = self.req_to_token_pool.recurrent_value_from_slot(
@@ -159,14 +144,12 @@ class RecurrentComponent(TreeComponent):
         insert_params: InsertParams | None = None,
     ) -> None:
         committed = insert_result.recurrent_committed if insert_result is not None else False
-        # Sole owner of the finished donate-vs-free decision. Unfinished requests
-        # donate nothing and keep their running slot.
         if not is_finished:
             return
         if committed:
-            # Tree owns the running slot now (its content is the final state).
+            # Donate-vs-free: on commit the tree takes ownership of the running
+            # slot; otherwise req keeps recurrent_pool_idx and release frees it.
             self.req_to_token_pool.commit_to_tree(req)
-        # else: leave req.recurrent_pool_idx set so ownership-based release frees it.
 
     # ---- eviction -----------------------------------------------------------
 
@@ -194,9 +177,8 @@ class RecurrentComponent(TreeComponent):
             return
         ct = self.component_type
         dp_rank = params.dp_rank
-        # Leaf-only: walk recurrent-bearing device leaves LRU-first. Evicting a
-        # leaf frees its FULL KV too (atomic at page=1); parents are internal
-        # (no recurrent value), so none are re-pushed.
+        # Evicting a leaf frees its FULL KV too (atomic at page=1); parents are
+        # internal (no recurrent value), so nothing is re-pushed after a pop.
         heap = [
             x
             for x in self.cache.evictable_device_leaves
@@ -213,7 +195,7 @@ class RecurrentComponent(TreeComponent):
                 continue
             self.cache._evict_device_leaf(x, tracker)
 
-    # ---- locking (single-node; recurrent state is per-leaf, not per-path) ----
+    # ---- locking ------------------------------------------------------------
 
     def acquire_component_lock(
         self,
@@ -226,7 +208,6 @@ class RecurrentComponent(TreeComponent):
             return result
         cd = node.component_data[ct]
         if cd.value is None:
-            # Tombstone when locked → release must skip it (no lock acquired).
             result.skip_lock_node_ids.setdefault(ct, set()).add(node.id)
             return result
         if cd.lock_ref == 0:
@@ -253,9 +234,8 @@ class RecurrentComponent(TreeComponent):
             if cd.lock_ref == 1:
                 node_dp_rank = _node_dp_rank(node)
                 if cd.value is not None and node.children:
-                    # Became internal while locked (a child was inserted during
-                    # this request's caching): free instead of re-exposing, since
-                    # recurrent is leaf-only. Mirrors on_parent_gains_child.
+                    # Node went internal while locked: deferred free from
+                    # on_parent_gains_child.
                     self.req_to_token_pool.free_recurrent_slot(int(cd.value[0]), node_dp_rank)
                     self.cache.component_protected_size_[ct][node_dp_rank] -= 1
                     cd.value = None

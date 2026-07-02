@@ -371,8 +371,6 @@ class TestHybridPoolRecurrentSlotAPI(CustomTestCase):
 
         self.pool.commit_to_tree(req)
 
-        # Ownership moved to the tree: req handle + mapping cleared, slot NOT
-        # returned to the free list.
         self.assertIsNone(req.recurrent_pool_idx)
         self.assertEqual(self.pool.req_index_to_recurrent_index_mapping[req.req_pool_idx], 0)
         self.assertEqual(self.pool.recurrent_available_size(0), free_before)
@@ -386,7 +384,7 @@ class TestHybridPoolRecurrentSlotAPI(CustomTestCase):
         self.pool.commit_to_tree(req)
         free_before = self.pool.recurrent_available_size(0)
 
-        self.pool.free(req)  # ownership-based: recurrent_pool_idx is None → no-op
+        self.pool.free(req)
 
         self.assertEqual(self.pool.recurrent_available_size(0), free_before)
         self.assertNotIn(slot, self.pool.recurrent_free_slots[0])
@@ -400,14 +398,11 @@ class TestHybridPoolRecurrentSlotAPI(CustomTestCase):
 
         committed_slot = reqs[0].recurrent_pool_idx
         self.pool.commit_to_tree(reqs[0])
-        # commit transfers ownership to the tree: free count unchanged.
         self.assertEqual(self.pool.recurrent_available_size(0), slots - 3)
 
-        # tree eviction returns the committed slot.
         self.pool.free_recurrent_slot(committed_slot, 0)
         self.assertEqual(self.pool.recurrent_available_size(0), slots - 2)
 
-        # request-owned slots freed normally.
         self.pool.free(reqs[1])
         self.pool.free(reqs[2])
         self.assertEqual(self.pool.recurrent_available_size(0), slots)

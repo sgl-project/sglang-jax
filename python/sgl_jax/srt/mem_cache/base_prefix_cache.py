@@ -17,13 +17,12 @@ class MatchPrefixParams:
     """Unified parameters for match_prefix across cache types."""
 
     key: RadixKey
-    # When True and the deepest match holds a recurrent value, record its slot
-    # on ``req`` as the copy-on-write source for the next forward.
+    # Record the deepest recurrent-bearing match on ``req`` as the CoW clone source.
     cow_recurrent: bool = False
     req: Any = None
-    # Match only the base (FULL) validator, ignoring aux components. Used by
-    # cache_unfinished_req's re-match: a request's own FULL-prefix bookkeeping
-    # must not be gated on recurrent state (which lives in the running slot).
+    # Match with the base FULL validator only: a request's own prefix re-match
+    # must not be gated on aux components (its recurrent state lives in the
+    # running slot, not the tree).
     full_only: bool = False
 
 
@@ -36,8 +35,8 @@ class InsertParams:
     # SWA-specific: consumed by SWARadixCache, ignored by RadixCache.
     prev_prefix_len: int = 0
     swa_evicted_seqlen: int = 0
-    # Recurrent: length-1 np.int32 array (a RecurrentStatePool slot index)
-    # donated to the tree node at commit; set by RecurrentComponent.
+    # Length-1 int32 array (a RecurrentStatePool slot index); ownership passes
+    # to the tree at commit.
     recurrent_value: Any = None
 
 
@@ -48,7 +47,6 @@ class EvictParams:
     num_tokens: int = 0
     swa_num_tokens: int = 0
     dp_rank: int | None = None
-    # Recurrent: number of recurrent slots to free from the tree.
     recurrent_num: int = 0
 
 
@@ -66,8 +64,7 @@ class DecLockRefParams:
     """Parameters for dec_lock_ref."""
 
     swa_uuid_for_lock: int | None = None
-    # Per-component node ids that were tombstones when inc_lock_ref ran, so
-    # release_component_lock must skip them (no lock was acquired there).
+    # Node ids where inc_lock_ref acquired nothing (no value); release skips them.
     skip_lock_node_ids: dict = dataclasses.field(default_factory=dict)
 
 
@@ -106,8 +103,8 @@ class MatchResult(NamedTuple):
     last_host_node: TreeNode | None
     best_match_node: TreeNode | None
     host_hit_length: int = 0
-    # Recurrent: aligned branching length for partial-prefix CoW. The base path
-    # always clones the full match (None); branch truncation is a follow-up.
+    # Always None in the base path (clones the full match); branch truncation is
+    # a follow-up.
     recurrent_branching_seqlen: int | None = None
 
 
@@ -146,7 +143,6 @@ class BasePrefixCache(abc.ABC):
         return 0
 
     def supports_recurrent(self) -> bool:
-        """True for caches that manage recurrent (linear-recurrent) state."""
         return False
 
     def full_evictable_size(self, dp_rank: int = 0):

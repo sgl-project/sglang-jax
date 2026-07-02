@@ -151,9 +151,8 @@ def jax_causal_conv1d_prefill(
         assert state_indices.shape == (
             B,
         ), f"state_indices {state_indices.shape} != expected ({B},)"
-        # Donated-pool aliasing barrier: conv_state is donated, so under multi-host
-        # SPMD the scatter below can race this gather and corrupt reused slots.
-        # Value-preserving -- do not remove.
+        # Donated-buffer aliasing barrier: under multi-host SPMD the scatter below
+        # can race this gather and corrupt reused slots. Do not remove.
         conv_state = jax.lax.optimization_barrier(conv_state)
         # Gather per-seq prior state once up front; later lookups index by
         # local seq id rather than walking the full table per token.
@@ -423,8 +422,7 @@ def ragged_gated_delta_rule_ref(
 
     # Gather per-seq initial state once, then mask brand-new prefills to
     # zero. Mirrors GPU's `initial_state[~has_initial_state, ...] = 0`.
-    # Donated-pool aliasing barrier (see jax_causal_conv1d_prefill): guards the
-    # donated recurrent_state gather from the later scatter. Do not remove.
+    # Donated-buffer aliasing barrier (see jax_causal_conv1d_prefill). Do not remove.
     recurrent_state = jax.lax.optimization_barrier(recurrent_state)
     init_state = recurrent_state[state_indices].astype(jnp.float32)
     init_state = jnp.where(

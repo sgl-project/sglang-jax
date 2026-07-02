@@ -82,9 +82,8 @@ class InsertResult:
     used only in component seam annotations."""
 
     prefix_len: int = 0
-    # recurrent_exist: target node already held a recurrent value (duplicate).
-    # recurrent_committed: this insert attached the request's slot to a fresh leaf
-    # (tree took ownership); cleanup_after_caching_req keys donate-vs-free on it.
+    # recurrent_committed: the tree took ownership of the request's slot;
+    # cleanup_after_caching_req keys donate-vs-free on it.
     recurrent_exist: bool = False
     recurrent_committed: bool = False
 
@@ -215,10 +214,8 @@ class TreeComponent(ABC):
         return None
 
     def on_parent_gains_child(self, node: UnifiedTreeNode) -> None:
-        """Hook: ``node`` just gained its first child (leaf→internal transition
-        in _add_new_node). Leaf-only components (Recurrent) drop their per-leaf
-        data here so it is not stranded on an unevictable internal node. Default
-        no-op (Full keeps internal-node data)."""
+        """``node`` just gained its first child (leaf->internal); leaf-only
+        components drop their per-leaf data here. Default no-op."""
         return None
 
     def commit_insert_component_data(

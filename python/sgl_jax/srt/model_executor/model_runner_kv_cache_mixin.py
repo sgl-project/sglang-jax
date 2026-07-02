@@ -113,7 +113,7 @@ def _per_req_state_bytes_from_config(cfg, tp_size: int) -> int:
 def _enforce_recurrent_state_server_constraints(server_args) -> None:
     """Assert server constraints for hybrid recurrent state models."""
     if server_args.disable_radix_cache:
-        return  # legacy 1:1 path (no prefix sharing)
+        return
     assert server_args.enable_unified_radix_tree, (
         "Hybrid recurrent state models require --disable-radix-cache (legacy) "
         "or --enable-unified-radix-tree (recurrent radix caching)."
@@ -122,8 +122,8 @@ def _enforce_recurrent_state_server_constraints(server_args) -> None:
 
 
 def _recurrent_slot_factor(server_args) -> int:
-    """Recurrent slots per concurrent request. Radix caching needs 2 (1 running
-    + 1 for the tree-owned / transient clone headroom); legacy 1:1 needs 1."""
+    """Slots per concurrent request: 2 under radix caching (running slot +
+    tree-owned/clone headroom), 1 on the legacy 1:1 path."""
     if server_args.enable_unified_radix_tree and not server_args.disable_radix_cache:
         return 2
     return 1
@@ -411,17 +411,15 @@ class ModelRunnerKVCacheMixin:
         ):
             max_num_reqs = self.server_args.max_num_reqs
 
-        # Cap by recurrent state budget (global). Radix caching holds `factor`
-        # slots per concurrent request, so admission is capped at budget // factor.
+        # Cap by recurrent state budget (global).
         if (
             self.linear_recurrent_config is not None
             and self.server_args.max_recurrent_state_size is not None
         ):
             factor = _recurrent_slot_factor(self.server_args)
             budget_cap = self.server_args.max_recurrent_state_size // factor
-            # Admission shards evenly across dp ranks (_build_hybrid_pools asserts
-            # max_num_reqs % dp_size == 0), but budget // factor can land off the dp
-            # grid (e.g. 12 // 2 = 6 with dp_size=4). Round down to stay dp-aligned.
+            # _build_hybrid_pools asserts max_num_reqs % dp_size == 0; round the
+            # budget cap down to stay dp-aligned.
             budget_cap -= budget_cap % self.dp_size
             max_num_reqs = min(max_num_reqs, budget_cap)
 

@@ -1,10 +1,6 @@
-"""prepare_for_extend must set cache_protected_len to the TREE-OWNED prefix
-(last_matched_prefix_len), NOT len(prefix_indices).
-
-They diverge after a recurrent off-boundary chunk skip (prefix_indices advances
-to committed-but-unpublished KV). Using len(prefix_indices) would mark that
-request-owned tail tree-protected and orphan it on finish -> token_to_kv leak.
-"""
+"""prepare_for_extend must set cache_protected_len to the tree-owned prefix
+(last_matched_prefix_len), not len(prefix_indices): after an off-boundary chunk
+skip the latter includes request-owned KV that would leak on finish."""
 
 import unittest
 from unittest.mock import MagicMock
@@ -19,8 +15,7 @@ from sgl_jax.srt.managers.schedule_batch import (
 
 
 def _make_req(*, prefix_len, last_matched, total_len):
-    """A req mid chunked-prefill continuation: prefix_indices spans the committed
-    range (prefix_len), last_matched_prefix_len is the published tree prefix."""
+    """A req mid chunked continuation: prefix_indices spans the committed range."""
     req = MagicMock()
     req.prefix_indices = np.arange(prefix_len, dtype=np.int32)
     req.last_matched_prefix_len = last_matched
@@ -37,7 +32,7 @@ def _make_req(*, prefix_len, last_matched, total_len):
 class TestPrepareForExtendProtectedLen(unittest.TestCase):
     def _protected_len_after_prepare(self, req):
         pool = MagicMock()
-        pool.alloc.return_value = [0]  # one req slot
+        pool.alloc.return_value = [0]
         batch = ScheduleBatch(
             reqs_info=[ScheduleReqsInfo(reqs=[req])],
             dp_size=1,
@@ -48,12 +43,9 @@ class TestPrepareForExtendProtectedLen(unittest.TestCase):
             forward_mode=ForwardMode.EXTEND,
         )
         batch.is_hybrid_recurrent = False
-        # Sentinel: -1 survives if prepare_for_extend raises before the
-        # cache_protected_len assignment, so the assertion below catches it.
         req.cache_protected_len = -1
-        # cache_protected_len is set early; the only tolerated failure is the later
-        # token-slot allocation dereferencing the (None) tree_cache. Narrow to
-        # AttributeError so unrelated later failures aren't swallowed.
+        # Only the later token-slot allocation may fail (None tree_cache); narrow
+        # to AttributeError so unrelated failures surface.
         try:
             batch.prepare_for_extend()
         except AttributeError:
@@ -66,10 +58,8 @@ class TestPrepareForExtendProtectedLen(unittest.TestCase):
         return req.cache_protected_len
 
     def test_protected_len_is_last_matched_not_prefix_len(self):
-        # Off-boundary skip: committed 512, published 0 (never crossed a boundary).
+        # Off-boundary skip: committed 512, published 0.
         req = _make_req(prefix_len=512, last_matched=0, total_len=640)
-        # The fix: protected = tree-owned (0), so finish frees the full committed
-        # range. The bug set this to len(prefix_indices)=512 -> orphan [0:512].
         self.assertEqual(self._protected_len_after_prepare(req), 0)
 
     def test_protected_len_after_partial_publish(self):
