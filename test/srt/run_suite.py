@@ -363,6 +363,11 @@ suites = {
     ],
     "accuracy-test-tpu-v6e-4": [
         TestFile(
+            "test/srt/test_eval_accuracy_large.py",
+            40,
+            ["TestMMMUProAccuracyLarge.test_mmmu_pro"],
+        ),
+        TestFile(
             "test/srt/test_moe_eval_accuracy_large.py",
             40,
             ["TestMoEEvalAccuracyLarge.test_mmlu"],
