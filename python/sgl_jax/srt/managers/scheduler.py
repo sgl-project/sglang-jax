@@ -34,6 +34,7 @@ from sgl_jax.srt.disaggregation.runtime import install_disaggregation_wiring
 from sgl_jax.srt.hf_transformers_utils import get_tokenizer
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
 from sgl_jax.srt.managers.communication import CommunicationBackend
+from sgl_jax.srt.managers.dp_rank_assignment import assign_dp_ranks
 from sgl_jax.srt.managers.dp_schedule_policy import (
     pick_cache_aware_dp,
     req_prefix_match_key,
@@ -858,69 +859,18 @@ class Scheduler(
         Requests without a dp assignment (min-running + all full) are queued and
         retried in the next loop to keep ordering deterministic across nodes.
         """
-        if recv_reqs is None:
-            recv_reqs = []
-
-        # Preserve FIFO order: older pending requests first, then new arrivals.
-        combined_reqs = []
-        if self.pending_dp_reqs:
-            combined_reqs.extend(self.pending_dp_reqs)
-            self.pending_dp_reqs = []
-        if recv_reqs:
-            combined_reqs.extend(recv_reqs)
-
-        if self.dp_size == 1:
-            for req in combined_reqs:
-                # Only assign dp_rank to TokenizedGenerateReqInput
-                if isinstance(req, TokenizedGenerateReqInput):
-                    req.dp_rank = 0
-            return combined_reqs
-
-        pending_counts = [0] * self.dp_size
-        pending_token_counts = [0] * self.dp_size
-        ready_reqs: list[Req] = []
-
-        for req in combined_reqs:
-            # Only assign dp_rank to TokenizedGenerateReqInput
-            if not isinstance(req, TokenizedGenerateReqInput):
-                ready_reqs.append(req)
-                continue
-
-            # Skip if dp_rank already set (e.g., sticky sessions)
-            if req.dp_rank is not None:
-                if 0 <= req.dp_rank < self.dp_size:
-                    pending_counts[req.dp_rank] += 1
-                    pending_token_counts[req.dp_rank] += self._estimate_req_tokens(req)
-                ready_reqs.append(req)
-                continue
-
-            if self.dp_schedule_policy == "round_robin":
-                req.dp_rank = self._select_round_robin_dp()
-                ready_reqs.append(req)
-                continue
-
-            if self.dp_schedule_policy == "cache_aware":
-                dp_rank = self._select_cache_aware_dp(
-                    req,
-                    extra_counts=pending_counts,
-                    extra_token_counts=pending_token_counts,
-                )
-            else:
-                dp_rank = self._select_min_running_dp(
-                    extra_counts=pending_counts,
-                    extra_token_counts=pending_token_counts,
-                )
-            if dp_rank is None:
-                # All DP ranks are full; keep the request pending.
-                self.pending_dp_reqs.append(req)
-                continue
-
-            req.dp_rank = dp_rank
-            pending_counts[dp_rank] += 1
-            pending_token_counts[dp_rank] += self._estimate_req_tokens(req)
-            ready_reqs.append(req)
-
-        return ready_reqs
+        result = assign_dp_ranks(
+            recv_reqs=recv_reqs,
+            pending_dp_reqs=self.pending_dp_reqs,
+            dp_size=self.dp_size,
+            dp_schedule_policy=self.dp_schedule_policy,
+            select_round_robin_dp=self._select_round_robin_dp,
+            select_cache_aware_dp=self._select_cache_aware_dp,
+            select_min_running_dp=self._select_min_running_dp,
+            estimate_req_tokens=self._estimate_req_tokens,
+        )
+        self.pending_dp_reqs = result.pending_reqs
+        return result.ready_reqs
 
     def event_loop_normal(self):
         """A normal scheduler loop."""
