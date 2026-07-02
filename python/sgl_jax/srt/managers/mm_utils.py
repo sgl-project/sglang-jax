@@ -1,22 +1,9 @@
-"""In-model multimodal embed routine: the host orchestration that strings the
-three independently-compiled JIT segments per forward.
-
-Target forward (extend only) for the in-model VLM path::
-
-    JIT(1) vision encode (pure jit, GSPMD batched)
-    JIT(2) multimodal merge (shard_map)
-    JIT(3) language backbone  (existing, unchanged)
+"""Host orchestration for in-model multimodal embedding.
 
 Vision uses owning-rank data-parallel: each DP rank encodes its own images and
-merges into its own tokens with ZERO cross-rank collective. The ``data`` mesh
-axis == dp size; everything vision flows as ``P("data")``.
-
-This module owns JIT(1) and JIT(2) plus the host loop that drives them
-(``general_mm_embed_routine`` -> ``embed_mm_inputs``).
-``jitted_mm_encode`` is a pure ``@jax.jit`` (GSPMD batched ViT, dp-leading);
-``jitted_mm_merge`` is ``@jax.jit`` wrapping a ``shard_map`` (rank-local gather).
-Both are forward JIT segments (the same layer as ``jitted_run_model``), with
-``mesh`` as a static arg for caching.
+merges into its own token slice on the ``data`` mesh axis. This module provides
+the vision encode, token merge, and host loop used before the language backbone
+forward.
 """
 
 import functools
@@ -45,12 +32,8 @@ def _merge_local(running, features, src_idx, mask):
 
 @functools.partial(jax.jit, static_argnames=("mesh",))
 def jitted_mm_merge(mesh, running, features, src_idx, mask):
-    """Forward JIT(2): src_idx merge, ``P("data")`` flat layout.
+    """Merge encoded multimodal rows into the token embedding stream.
 
-    A forward JIT segment (same layer as ``jitted_run_model``). The shard_map is
-    inlined and ``@jax.jit`` (``mesh`` static) caches it -- matching the repo's
-    jit-wrapped kernel-entry convention (``kernels/fused_moe``,
-    ``layers/attention/.../paged_attention``); no separate cached builder.
     ``running``/``features`` are ``P("data", None)``; ``src_idx``/``mask`` are
     ``P("data")``. Returns ``P("data", None)``.
     """
@@ -65,30 +48,11 @@ def jitted_mm_merge(mesh, running, features, src_idx, mask):
 
 @functools.partial(jax.jit, static_argnames=("mesh", "graphdef", "body"))
 def jitted_mm_encode(mesh, body, graphdef, state, pixels, meta, valid):
-    """Forward JIT(1): GSPMD batched ViT (pure jit, dp-leading).
+    """Run the dp-leading vision encode.
 
-    Pure ``@jax.jit`` (NO outer shard_map): the ViT runs as a GSPMD batched
-    computation with the leading ``dp`` axis as the batch. Inputs are already
-    device_put on ``P("data", ...)`` by ``init_new``; the ViT body operates on
-    ``[dp, ...]`` and GSPMD partitions the matmuls/norms along ``data`` (weights
-    replicated -> per-image independent -> zero cross-rank collective). The two
-    ops GSPMD can't auto-partition keep their OWN local shard_map: attention
-    (inside the body, via ``VisionFlashAttentionBackend``) and merge
-    (``jitted_mm_merge``, JIT(2)).
-
-    ViT weights flow in as an EXPLICIT operand via ``nnx.split`` (``graphdef``
-    static + ``state`` traced), replicated (no TP); ``nnx.merge`` rebuilds inside.
-
-    ``meta`` is an opaque scheduler-computed per-arch registered pytree; common
-    code never names its fields -- the body interprets them.
-
-    The body returns batched ``[dp, out_rows, H]``; we flatten to
-    ``[dp*out_rows, H]`` and ANCHOR the sharding with
-    ``with_sharding_constraint(P("data", None))`` so the encode->merge layout lines
-    up with ``jitted_mm_merge``'s ``_MERGE_IN_SPECS`` (the dp-leading flatten is
-    naturally aligned -- sharded-major ``dp`` + replicated ``out_rows`` -- and the
-    anchor pins the inferred layout to the merge contract). Returns
-    ``P("data", None)``.
+    ``pixels`` and ``meta`` are already placed on ``P("data", ...)``. The model
+    body returns ``[dp, out_rows, H]``; this function flattens it to
+    ``[dp * out_rows, H]`` and pins the result to the merge sharding.
     """
     visual = nnx.merge(graphdef, state)
     features = body(visual, pixels, meta, valid)  # [dp, out_rows, H]
@@ -106,14 +70,12 @@ def embed_mm_inputs(
     multimodal_model,
     data_embedding_func_mapping=None,
 ):
-    """Per-modality embed + merge (= upstream ``embed_mm_inputs``, mm_utils.py:782).
+    """Encode each multimodal round and merge it into token embeddings.
 
     ``running`` starts as the plain text embedding (``embed_tokens`` once); each
     round encodes one image per rank via the model's ``get_{modality}_feature``
-    embedder, which consumes scheduler-built ``enc.meta``, and merges its
-    features in. No ``clamp`` -- sglang-jax placeholders are in-vocab
-    ``im_token_id``, not upstream's out-of-range hash ``pad_value``. Returns the
-    merged embedding ``[total_token, H]`` (``P("data", None)``).
+    embedder, which consumes scheduler-built ``enc.meta``. Returns the merged
+    embedding ``[total_token, H]``.
     """
     mesh = multimodal_model.mesh
     running = input_embedding(input_ids)
@@ -124,8 +86,8 @@ def embed_mm_inputs(
         )
         assert embedder is not None, f"no embedding method for {modality}"
         for rnd in rounds:
-            features = embedder(rnd.encode_inputs)  # JIT(1) via get_image_feature
-            running = jitted_mm_merge(mesh, running, features, rnd.src_idx, rnd.mask)  # JIT(2)
+            features = embedder(rnd.encode_inputs)
+            running = jitted_mm_merge(mesh, running, features, rnd.src_idx, rnd.mask)
     return running
 
 
@@ -137,12 +99,10 @@ def general_mm_embed_routine(
     mm_embed_plan,
     data_embedding_funcs=None,
 ):
-    """HOST segment (= upstream ``general_mm_embed_routine``, mm_utils.py:1023 --
-    minus the LM call, since our backbone is a separate JIT).
+    """Populate ``forward_batch.input_embedding`` for multimodal prefill.
 
-    Strings ``embed_tokens`` -> per-round encode->merge, storing the merged
-    embedding on ``forward_batch.input_embedding`` for the backbone JIT to
-    consume (= upstream's ``forward_batch.mm_input_embeds`` field set).
+    The language backbone consumes this fused embedding instead of re-embedding
+    ``input_ids``.
     """
     embed_tokens = language_model.get_input_embeddings()
     input_embeds = embed_mm_inputs(

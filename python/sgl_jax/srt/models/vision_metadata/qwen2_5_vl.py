@@ -63,9 +63,6 @@ def _item_grid_thw(item: Any) -> tuple:
 
     Qwen-specific: the builder pulls its geometry FROM the item here, so the
     common ``get_metadata(item)`` interface stays arch-agnostic.
-
-    # TODO(stage1): one round handles ONE image per rank, so we read row 0 only;
-    #   multi-image-per-item packing needs the full grid list.
     """
     md = getattr(item, "model_specific_data", None)
     grid = md.get("image_grid_thw") if isinstance(md, dict) else getattr(md, "image_grid_thw", None)
@@ -74,9 +71,19 @@ def _item_grid_thw(item: Any) -> tuple:
         if grid is None and isinstance(item, dict):
             grid = item.get("image_grid_thw")
     if grid is None:
-        return (0, 0, 0)
+        raise ValueError("Qwen2.5-VL image item is missing image_grid_thw metadata.")
     arr = np.asarray(grid)
+    if arr.size == 0:
+        raise ValueError("Qwen2.5-VL image_grid_thw metadata is empty.")
+    if arr.ndim > 1 and arr.shape[0] != 1:
+        raise ValueError(
+            "Qwen2.5-VL image item must carry exactly one image_grid_thw row, "
+            f"got shape={arr.shape}."
+        )
     row = arr if arr.ndim == 1 else arr[0]
+    row = np.asarray(row).reshape(-1)
+    if row.shape[0] != 3:
+        raise ValueError(f"Qwen2.5-VL image_grid_thw must contain (t, h, w), got {row}.")
     return (int(row[0]), int(row[1]), int(row[2]))
 
 
@@ -102,9 +109,6 @@ class Qwen25VLVisionMetadataBuilder:
         self.patch_size = int(getattr(vision_cfg, "patch_size", 14))
         self.window_size = int(getattr(vision_cfg, "window_size", 112))
         self.spatial_merge_size = int(getattr(vision_cfg, "spatial_merge_size", 2))
-        self.fullatt_block_indexes = list(
-            getattr(vision_cfg, "fullatt_block_indexes", [7, 15, 23, 31])
-        )
         num_heads = int(getattr(vision_cfg, "num_heads", 16))
         hidden_size = int(getattr(vision_cfg, "hidden_size", 1280))
         head_dim = hidden_size // num_heads

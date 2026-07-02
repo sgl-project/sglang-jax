@@ -526,17 +526,11 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
         )
 
     def get_image_feature(self, enc):
-        """Image embedder (= upstream ``get_image_feature``; resolved by
-        ``embed_mm_inputs`` via ``getattr(model, "get_image_feature")``).
+        """Encode one DP round of images.
 
-        The ViT aux (``window_index`` / ``cu_window_seqlens`` /
-        ``rotary_pos_emb``) comes from scheduler-built per-arch metadata carried
-        on ``enc.meta``; this embedder no longer recomputes it. It ``nnx.split``s
-        the ViT (graphdef static + state dynamic, an explicit JIT
-        operand -- reload-safe, no compile-cache clear) and runs the JIT(1)
-        GSPMD-batched encode (pure jit; see ``jitted_mm_encode``). ``enc`` is a
-        ``VisionEncodeInputs`` for one DP round. Returns ``[dp*out_rows, H]`` as
-        ``P("data", None)``.
+        ``enc.meta`` carries scheduler-built ViT aux
+        (``window_index`` / ``cu_window_seqlens`` / ``rotary_pos_emb``).
+        Returns flattened image features with shape ``[dp * out_rows, H]``.
         """
         graphdef, state = nnx.split(self.visual)
         return jitted_mm_encode(
@@ -545,21 +539,17 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
 
     @staticmethod
     def _vision_encode_body(visual, pixels, meta, valid):
-        """Batched dp-leading ViT body (runs INSIDE the JIT(1) GSPMD encode, pure
-        jit -- NOT a shard_map). ``visual`` is the ViT tower merged inside
-        ``jitted_mm_encode`` from the nnx graphdef/state passed in -- weights are
-        an explicit JIT operand, not closure-captured. ``meta`` is the
-        ``VisionMetadata`` pytree (``window_index`` / ``cu_window_seqlens`` /
-        ``rotary_pos_emb``) from scheduler-built ``enc.meta``. Returns
-        ``[dp, out_rows, H]`` (``jitted_mm_encode`` then flattens to
-        ``[dp*out_rows, H]``).
+        """Run the dp-leading ViT body for one encoded round.
+
+        Returns ``[dp, out_rows, H]``; ``jitted_mm_encode`` flattens the leading
+        two axes for the merge step.
         """
         return visual.compute_hidden_states(
             pixels, meta.window_index, meta.cu_window_seqlens, meta.rotary_pos_emb, valid
         )
 
     def load_weights(self, model_config: ModelConfig):
-        # Backbone (text) weights -- folded in from former Qwen2_5_VL_Generation.
+        # Load text backbone and lm_head weights.
         loader = WeightLoader(
             model=self,
             model_config=model_config,
@@ -578,10 +568,8 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
     def _load_vision_weights(self, model_config) -> None:
         """Load the ViT (``self.visual``) weights from safetensors.
 
-        Folded in from the former ``Qwen2_5_VL_VisionModel.load_weights``. The
-        backbone (text) weights are loaded by ``super().load_weights`` above; this
-        is a second WeightLoader pass over the same safetensors that maps only the
-        ``visual.*`` keys. No ``text_embed`` -- the LM owns token embedding.
+        This pass maps only ``visual.*`` keys; text embeddings are owned by the
+        language backbone.
         """
         loader = WeightLoader(
             model=self,

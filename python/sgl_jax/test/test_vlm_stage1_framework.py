@@ -10,8 +10,18 @@ from sgl_jax.srt.managers.schedule_batch import (
     ModelWorkerBatch,
     ScheduleBatch,
     ScheduleReqsInfo,
+    build_mm_embed_plan,
 )
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sgl_jax.srt.models.vision_metadata import (  # noqa: F401
+    qwen2_5_vl as _qwen25vl_vision_metadata,
+)
+from sgl_jax.srt.multimodal.common.modality_enum import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputs,
+)
+from sgl_jax.srt.multimodal.processors.qwen_vl import QwenVLProcessor
 
 
 def test_generate_req_getitem_preserves_media_fields():
@@ -134,3 +144,75 @@ def test_mrope_positions_propagate_through_model_worker_batch():
     )
 
     np.testing.assert_array_equal(mwb.mrope_positions[:, :3], mrope_positions)
+
+
+def test_mm_embed_plan_keeps_placeholder_count_separate_from_encode_rows():
+    features = np.arange(24, dtype=np.float32).reshape(24, 1)
+    grids = [(1, 2, 4), (1, 4, 4)]
+    offsets = [(2, 3), (5, 8)]
+    items = QwenVLProcessor._build_items(features, grids, offsets)
+    req = SimpleNamespace(
+        mm_inputs=MultimodalInputs(mm_items=items),
+        extend_input_len=10,
+    )
+    vision_config = SimpleNamespace(
+        patch_size=14,
+        window_size=112,
+        spatial_merge_size=2,
+        fullatt_block_indexes=[],
+        num_heads=16,
+        hidden_size=1280,
+        rope_theta=10000.0,
+    )
+    model_config = SimpleNamespace(
+        is_multimodal=True,
+        arch="Qwen2_5_VLForConditionalGeneration",
+        vision_config=vision_config,
+    )
+
+    plan = build_mm_embed_plan(
+        reqs_info=[ScheduleReqsInfo(reqs=[req])],
+        dp_size=1,
+        model_config=model_config,
+        per_dp_token=10,
+    )
+
+    rounds = plan.rounds_by_modality[items[0].modality]
+    assert len(rounds) == 2
+
+    np.testing.assert_array_equal(rounds[0].encode_inputs.valid, np.array([8], dtype=np.int32))
+    np.testing.assert_array_equal(rounds[1].encode_inputs.valid, np.array([16], dtype=np.int32))
+
+    np.testing.assert_array_equal(np.flatnonzero(rounds[0].mask), np.array([2, 3]))
+    np.testing.assert_array_equal(rounds[0].src_idx[2:4], np.array([0, 1], dtype=np.int32))
+
+    np.testing.assert_array_equal(np.flatnonzero(rounds[1].mask), np.array([5, 6, 7, 8]))
+    np.testing.assert_array_equal(rounds[1].src_idx[5:9], np.array([0, 1, 2, 3], dtype=np.int32))
+
+
+def test_mm_embed_plan_returns_none_before_resolving_builder_without_images():
+    req = SimpleNamespace(
+        mm_inputs=MultimodalInputs(
+            mm_items=[
+                MultimodalDataItem(
+                    modality=Modality.AUDIO,
+                    feature=np.ones((4, 2), dtype=np.float32),
+                )
+            ]
+        ),
+        extend_input_len=4,
+    )
+    model_config = SimpleNamespace(
+        is_multimodal=True,
+        arch="NoVisionBuilderForAudioOnly",
+        vision_config=SimpleNamespace(),
+    )
+
+    plan = build_mm_embed_plan(
+        reqs_info=[ScheduleReqsInfo(reqs=[req])],
+        dp_size=1,
+        model_config=model_config,
+        per_dp_token=4,
+    )
+
+    assert plan is None

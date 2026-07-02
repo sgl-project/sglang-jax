@@ -56,7 +56,7 @@ from sgl_jax.srt.multimodal.common.mm_plan import (
     MultimodalEmbedPlan,
     VisionEncodeInputs,
 )
-from sgl_jax.srt.multimodal.common.modality_enum import Modality
+from sgl_jax.srt.multimodal.common.modality_enum import Modality, MultimodalInputs
 from sgl_jax.srt.precision_tracer import (
     PrecisionTracerRequestMetadata,
     precision_tracer,
@@ -203,8 +203,8 @@ class Req:
         # Used for radix cache matching to differentiate different images/videos
         # If None, origin_input_ids is used for cache matching
         self.cache_input_ids: list[int] | None = None
-        # Multimodal inputs (e.g., mrope positions) from tokenizer
-        self.mm_inputs: dict | None = None
+        # Multimodal inputs (e.g., image items and mrope positions) from tokenizer.
+        self.mm_inputs: MultimodalInputs | dict | None = None
 
         # Each decode stage's output ids
         self.output_ids = []
@@ -876,11 +876,7 @@ class ScheduleBatch:
         """Whether any request in this batch carries multimodal inputs.
 
         Mirrors the per-req mm detection used by ``_merge_multimodal`` /
-        ``build_mm_embed_plan``: a req is multimodal iff it has ``mm_inputs``.
-        Reused by scheduler-side gates so pure-text batches short-circuit all mm
-        work. The in-model VLM embed plan is only valid for ordinary prefill; its
-        concrete mode gate is expressed at the callsite as
-        ``forward_mode == ForwardMode.EXTEND`` (no chunked / speculative).
+        ``build_mm_embed_plan`` so pure-text batches skip all multimodal work.
         """
         return any(
             getattr(req, "mm_inputs", None) is not None
@@ -2675,27 +2671,15 @@ class ScheduleBatch:
         mrope_positions = _mm["mrope_positions"]
         apply_for_deepstack = _mm["apply_for_deepstack"]
         deepstack_visual_embedding = _mm["deepstack_visual_embedding"]
-        # In-model VLM path: owning-rank DP embed plan (host-side numpy). Stays a
-        # host-only ModelWorkerBatch field; its array leaves are device_put in
-        # ForwardBatch.init_new and consumed by mm_embed_routine (outside the
-        # backbone JIT). None for non-multimodal / text-only batches.
-        #
-        # Vision-encode plan is built ONLY for ordinary prefill multimodal
-        # batches: the gate below is exactly `forward_mode == ForwardMode.EXTEND`,
-        # NOT the generic is_extend() (which also covers MIXED / DRAFT_EXTEND /
-        # TARGET_VERIFY). The plan assumes token offsets and req_base are relative
-        # to a pure prefill window; chunked or speculative layouts need a
-        # different contract. This is the ONLY forward_mode check for the vision
-        # path -- a non-None plan already encodes "this batch runs vision", so the
-        # runner just tests `mm_embed_plan is not None`.
-        # (mrope above is gated separately inside _merge_multimodal over extend|decode.)
+        # Build the vision encode/merge plan only for ordinary prefill. Other
+        # forward modes leave the plan unset, and the runner treats a non-None
+        # plan as the sole vision-forward signal.
         if self.contains_mm_inputs() and self.forward_mode == ForwardMode.EXTEND:
             mm_embed_plan = build_mm_embed_plan(
                 self.reqs_info,
                 self.dp_size,
                 self.model_config,
                 per_dp_token_padding,
-                total_token_size,
             )
         else:
             mm_embed_plan = None
@@ -3031,41 +3015,17 @@ def _build_merge_idx(
     dp_size: int,
     per_dp_token: int,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Build ``src_idx``/``mask`` for round-k images, translating REQ-LOCAL
-    placeholder offsets into GLOBAL token positions.
+    """Build ``src_idx``/``mask`` for one image round.
 
     Token layout mirrors ``_merge_input_and_positions``: rank ``r`` owns the
-    contiguous slot ``[r * per_dp_token : (r + 1) * per_dp_token]``, and within
-    that slot the rank's reqs are concatenated in order. The merge JIT
-    (``jitted_mm_merge``) runs inside a ``P("data")`` shard and gathers
-    ``features[src_idx]`` where each shard only sees its OWN rank's features.
-    Therefore ``src_idx`` carries **rank-local** feature row numbers (a running
-    ``0, 1, 2, ...`` per placeholder), NOT a global block offset. ``mask`` stays
-    a global ``[total_token]`` positional bool; ``src_idx`` is also global
-    ``[total_token]`` in SHAPE, but its VALUES are rank-local rows
-    (non-placeholder tokens carry 0, paired with mask=False).
+    contiguous slot ``[r * per_dp_token : (r + 1) * per_dp_token]``; within that
+    slot, requests are concatenated in prefill order. ``item.offsets`` are
+    request-local inclusive placeholder spans, and ``req_base`` translates them
+    into the rank-local packed slot.
 
-    Each ``rank_entries[r]`` is an ``(item, req_base)`` tuple (or ``None`` for a
-    dummy lane). ``item.offsets`` are inclusive ``(start, end)`` spans in
-    **req-local** token positions (relative to that req's ``input_ids`` start).
-    They are translated to the global token axis as::
-
-        tok = rank_base + req_base + offset
-
-    where ``rank_base = r * per_dp_token`` and ``req_base`` is the running
-    prefix-sum of ``extend_input_len`` over the reqs packed before this one on
-    rank ``r`` (computed in ``build_mm_embed_plan``). This supports multiple reqs
-    packed on one rank.
-
-    SCOPE: no ``prefix_len`` handling. Stage1 assumes the server/processor side
-    guarantees the VLM runs with NO radix cache / chunked prefill
-    (``prefix_len == 0`` -- the extend window IS the whole ``input_ids``), so
-    ``offset`` maps directly to the extend-window position. prefix-cache x vision
-    (cross-prefill ``feat_row`` <-> whole-image feature alignment, mm-aware radix
-    key) is not handled by this helper. The only guard kept is the packing-slot
-    bound ``tok >= rank_base + per_dp_token`` (guards against a mis-computed
-    packing offset writing into another rank's slot); there is no vision-geometry
-    ``feat_row`` bound.
+    ``src_idx`` values are rank-local feature rows because the merge shard only
+    sees its own rank's encoded features. ``mask`` marks the global token
+    positions that should be replaced by vision rows.
     """
     total_token = dp_size * per_dp_token
     src_idx = np.zeros(total_token, dtype=np.int32)
@@ -3081,9 +3041,12 @@ def _build_merge_idx(
         for start, end in _mm_item_offsets(item):
             for o in range(int(start), int(end) + 1):
                 tok = rank_base + req_base + o
-                if tok >= rank_base + per_dp_token:
-                    # Out of this rank's token slot: packing-offset guard.
-                    break
+                if tok < rank_base or tok >= rank_base + per_dp_token:
+                    raise ValueError(
+                        "IMAGE placeholder offset is outside its packed rank slot: "
+                        f"dp_rank={dp_rank}, req_base={req_base}, offset={o}, "
+                        f"per_dp_token={per_dp_token}."
+                    )
                 # rank-local feature row (merge gathers within this shard's own
                 # features); a plain running counter, NOT base_feat + feat_row.
                 src_idx[tok] = feat_row
@@ -3097,7 +3060,6 @@ def build_mm_embed_plan(
     dp_size: int,
     model_config: Any,
     per_dp_token: int,
-    total_token: int,
 ) -> MultimodalEmbedPlan | None:
     """Build the owning-rank DP multimodal embed plan (host-side, numpy).
 
@@ -3108,35 +3070,15 @@ def build_mm_embed_plan(
 
     Returns ``None`` for non-multimodal models or batches with no image items.
 
-    # TODO(stage1): bucket the vision patch and per-arch metadata axes; this
+    # TODO: bucket the vision patch and per-arch metadata axes; this
     #   uses the per-forward cross-rank max for stable shapes within one call.
     """
     if not getattr(model_config, "is_multimodal", False):
         return None
 
-    # Resolve the per-arch metadata builder from the common registry:
-    # scheduler only imports common; the concrete builder was registered when its
-    # model file was imported (see common/vision_metadata.py). Kept in-function so
-    # the text-only path pays no import cost.
-    from sgl_jax.srt.multimodal.common.vision_metadata import (
-        resolve_vision_metadata_builder,
-    )
-
-    # Per-arch, config-only metadata builder
-    # (window_index/cu_window_seqlens/rotary_pos_emb).
-    # Resolved/instantiated once per plan; produces SINGLE-image native-size
-    # aux per call, which the round-loop pads-by-role + stacks across ranks.
-    builder = resolve_vision_metadata_builder(model_config.arch)(model_config.vision_config)
-
-    # Collect image items per rank, keeping each item bound to ITS OWN req's
-    # slot offset (``req_base`` = running prefix-sum of ``extend_input_len`` over
-    # the reqs packed before it on this rank). ``item.offsets`` are REQ-LOCAL
-    # inclusive spans; the merge builder translates them to global tokens via
-    # ``rank_base + req_base + offset`` (see ``_build_merge_idx``), which is why
-    # we must NOT flatten away req boundaries here. Each element is an
-    # ``(item, req_base)`` tuple. SCOPE: no prefix_len -- Stage1 assumes the VLM
-    # runs with no radix cache / chunked prefill (prefix_len == 0); see
-    # ``_build_merge_idx`` docstring.
+    # Keep each image item bound to its request's packed-slot offset. The merge
+    # builder translates item-local offsets with that req_base, so request
+    # boundaries must be preserved here.
     items_by_rank: list[list[tuple[Any, int]]] = [[] for _ in range(dp_size)]
     for dp_rank in range(dp_size):
         if not reqs_info or dp_rank >= len(reqs_info):
@@ -3158,6 +3100,14 @@ def build_mm_embed_plan(
     if n_rounds == 0:
         return None
 
+    # Resolve the per-arch metadata builder only after confirming this batch has
+    # image items, so non-image multimodal batches do not require a vision builder.
+    from sgl_jax.srt.multimodal.common.vision_metadata import (
+        resolve_vision_metadata_builder,
+    )
+
+    builder = resolve_vision_metadata_builder(model_config.arch)(model_config.vision_config)
+
     rounds: list[EmbedRound] = []
     for k in range(n_rounds):
         # The round-k entry per rank: an ``(item, req_base)`` tuple, or
@@ -3178,7 +3128,14 @@ def build_mm_embed_plan(
             if item is None:
                 continue
             feat = _extract_mm_value(item, "feature")
+            if feat is None:
+                raise ValueError(f"IMAGE item in round {k}, dp_rank {r} is missing feature.")
             feat = np.asarray(feat)
+            if feat.ndim != 2 or feat.shape[0] <= 0:
+                raise ValueError(
+                    "IMAGE item feature must be a non-empty 2D patch array, "
+                    f"got shape={feat.shape} in round {k}, dp_rank {r}."
+                )
             features[r] = feat
             patch_rows[r] = int(feat.shape[0])
             # Single-image native-size aux: window_index [units],
@@ -3187,9 +3144,8 @@ def build_mm_embed_plan(
             metas[r] = builder.get_metadata(item)
 
         patch_k = max(patch_rows) if any(patch_rows) else 0
-        # Patch feature dim from the first present feature; 0 if none (defensive).
-        present = next((f for f in features if f is not None), None)
-        patch_dim = int(present.shape[1]) if present is not None and present.ndim == 2 else 0
+        present = next(f for f in features if f is not None)
+        patch_dim = int(present.shape[1])
 
         # pixels_k [dp, patch_k, dim]: pad+stack each rank's feature (pure numpy).
         pixels_k = np.zeros((dp_size, patch_k, patch_dim), dtype=np.float32)
