@@ -877,10 +877,7 @@ class Scheduler(
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
             else:
-                # When the server is idle, do self-check and re-init some states
-                self.check_memory()
-                self.check_tree_cache()
-                self.new_token_ratio = self.init_new_token_ratio
+                self.on_idle()
 
                 # Elegant wait if idle
                 if self._comm_backend is not None:
@@ -947,10 +944,7 @@ class Scheduler(
                     tmp_batch, tmp_result, batch.launch_done if batch else None
                 )
             elif batch is None:
-                # When the server is idle, do self-check and re-init some states
-                self.check_memory()
-                self.check_tree_cache()
-                self.new_token_ratio = self.init_new_token_ratio
+                self.on_idle()
 
             self.last_batch = batch
 
@@ -1336,6 +1330,7 @@ class Scheduler(
             return 0 if batch.is_empty() else batch.batch_size()
 
         waiting_reqs = len(self.waiting_queue)
+        grammar_reqs = len(self.grammar_queue)
         pending_dp_reqs = len(self.pending_dp_reqs)
         running_reqs = _batch_size(self.running_batch)
         current_batch_reqs = _batch_size(self.cur_batch)
@@ -1345,6 +1340,7 @@ class Scheduler(
 
         has_pending = (
             waiting_reqs > 0
+            or grammar_reqs > 0
             or pending_dp_reqs > 0
             or running_reqs > 0
             or current_batch_reqs > 0
@@ -1361,7 +1357,8 @@ class Scheduler(
         if has_pending:
             msg = (
                 "Cache not flushed because there are pending requests. "
-                f"waiting={waiting_reqs}, pending_dp={pending_dp_reqs}, running={running_reqs}, "
+                f"waiting={waiting_reqs}, grammar={grammar_reqs}, "
+                f"pending_dp={pending_dp_reqs}, running={running_reqs}, "
                 f"cur_batch={current_batch_reqs}, last_batch={last_batch_reqs}, "
                 f"chunked={chunked_pending}, pending_results={pending_results}, "
                 f"pd_prefill={pd_prefill}, pd_prealloc={pd_prealloc}, pd_transfer={pd_transfer}"
@@ -1369,6 +1366,17 @@ class Scheduler(
             return False, msg
 
         return True, ""
+
+    def is_fully_idle(self) -> bool:
+        can_flush, _ = self._can_flush_cache()
+        return can_flush
+
+    def on_idle(self):
+        if not self.is_fully_idle():
+            return
+        self.check_memory()
+        self.check_tree_cache()
+        self.new_token_ratio = self.init_new_token_ratio
 
     def flush_cache(self) -> tuple[bool, str, int]:
         can_flush, message = self._can_flush_cache()
