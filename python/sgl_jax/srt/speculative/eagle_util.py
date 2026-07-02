@@ -12,6 +12,7 @@ import jax.numpy as jnp
 import numpy
 import numpy as np
 from flax import nnx
+from jax.experimental.multihost_utils import process_allgather
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 from jax.tree_util import register_pytree_node_class
@@ -74,6 +75,37 @@ def _as_int32_array(value: Any, *, fallback: int = -1) -> Any:
         raise TypeError(
             f"Unable to convert value of type {type(value)} into int32 metadata array."
         ) from exc
+
+
+def _prefetch_spec_array(value: Any) -> Any:
+    # Spec state mixes P("data") arrays with P() replicated arrays and does not
+    # carry a dp_size flag at this boundary, so use per-array sharding metadata.
+    if getattr(value, "is_fully_addressable", True):
+        copy = getattr(value, "copy_to_host_async", None)
+        if copy is not None:
+            copy()
+        return value
+
+    if getattr(value, "is_fully_replicated", False):
+        local = value.addressable_data(0)
+        copy = getattr(local, "copy_to_host_async", None)
+        if copy is not None:
+            copy()
+        return local
+
+    return None
+
+
+def _host_spec_array(value: Any, prefetched: Any = None) -> np.ndarray:
+    if prefetched is not None:
+        return np.asarray(prefetched)
+
+    if not getattr(value, "is_fully_addressable", True) and not getattr(
+        value, "is_fully_replicated", False
+    ):
+        return np.asarray(process_allgather(value, tiled=True))
+
+    return np.asarray(_prefetch_spec_array(value))
 
 
 def get_last_loc_jax_array(
@@ -810,10 +842,9 @@ class EagleDraftInput:
         for f in device_fields:
             v = getattr(self, f, None)
             if v is not None and hasattr(v, "copy_to_host_async"):
-                jax.copy_to_host_async(v)
-                to_copy.append(f)
-        for f in to_copy:
-            setattr(self, f, np.asarray(getattr(self, f)))
+                to_copy.append((f, v, _prefetch_spec_array(v)))
+        for f, v, prefetched in to_copy:
+            setattr(self, f, _host_spec_array(v, prefetched))
 
     def filter_batch(self, new_indices: np.ndarray, has_been_filtered: bool = True):
         new_indices = np.asarray(new_indices)

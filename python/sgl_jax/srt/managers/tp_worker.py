@@ -487,6 +487,8 @@ class ModelWorker:
             selector = model_worker_batch.logits_indices_selector
             if model_worker_batch.return_output_logprob_only:
                 logprobs = self.model_runner.compute_logprobs(token_logprobs, next_token_ids_device)
+                # compute_logprobs returns replicated per-request scalars; only
+                # data-sharded top-k/token-id tables below need allgather.
                 logits_output.next_token_logprobs = _host_logprob_array(logprobs)[selector]
         if new_logits_output is not None:
             logits_output = new_logits_output
