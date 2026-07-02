@@ -214,9 +214,9 @@ class FlashAttention(AttentionBackend):
         if batch.forward_mode == ForwardMode.TARGET_VERIFY:
             metadata.custom_mask = batch.spec_info_padded.custom_mask
             if metadata.custom_mask is not None:
-                assert (
-                    metadata.custom_mask.dtype != jnp.bool_
-                ), "custom_mask bool dtype is not supported; use int32 instead."
+                assert metadata.custom_mask.dtype != jnp.bool_, (
+                    "custom_mask bool dtype is not supported; use int32 instead."
+                )
         else:
             metadata.custom_mask = None
 
@@ -502,6 +502,7 @@ class FlashAttention(AttentionBackend):
         token_to_kv_pool: KVCache,
         causal: int = 1,
         attention_sink: jax.Array = None,
+        save_kv_cache: bool = True,
     ):
         """
         Args:
@@ -512,6 +513,12 @@ class FlashAttention(AttentionBackend):
         Returns:
             Output tensor of shape [total_tokens, hidden_size]
         """
+        if not save_kv_cache:
+            raise NotImplementedError(
+                "FlashAttention does not support Gemma 3n shared-KV read-only layers yet. "
+                "Use --attention-backend native for shared-KV Gemma 3n configs."
+            )
+
         if forward_batch is not None and token_to_kv_pool is not None:
             kv_cache_fused = self._get_fused_kv_cache(
                 forward_batch, token_to_kv_pool, layer.layer_id
@@ -631,7 +638,7 @@ class FlashAttention(AttentionBackend):
     def get_max_running_reqests(max_context_len: int, page_size: int) -> int:
         num_page_per_req = cdiv(max_context_len, page_size)
         res = 1024 * 1024 // 2 // num_page_per_req // 4
-        assert (
-            res > 0
-        ), f"max running requests: {res} must larger than 0, please increase page size or decrease max context length"
+        assert res > 0, (
+            f"max running requests: {res} must larger than 0, please increase page size or decrease max context length"
+        )
         return res
