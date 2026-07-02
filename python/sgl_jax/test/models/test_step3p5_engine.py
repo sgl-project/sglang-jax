@@ -807,17 +807,25 @@ class TestFusedVsEPMoE(unittest.TestCase):
         cls._mesh = create_device_mesh(
             ici_parallelism=[1, 1], dcn_parallelism=[1, 1], devices=[jax.devices()[0]]
         )
-        cls._weights = _build_checkpoint(_make_config())
+        cls._weights = _build_checkpoint(cls._cfg())
+
+    @staticmethod
+    def _cfg(backend="epmoe"):
+        # fused v2 kernel tiling: moe_intermediate_size % 512 == 0 and hidden_size % 128 == 0.
+        cfg = _make_config()
+        cfg.hidden_size = 128
+        cfg.moe_intermediate_size = 512
+        cfg.moe_backend = backend
+        return cfg
 
     def _moe_outputs(self, backend):
         from sgl_jax.srt.models.step3p5 import Step3p5ForCausalLM, Step3p5MoE
 
-        cfg = _make_config()
-        cfg.moe_backend = backend
+        cfg = self._cfg(backend)
         with jax.set_mesh(self._mesh):
             model = Step3p5ForCausalLM(cfg, mesh=self._mesh, dtype=jnp.bfloat16, attn_impl="flash")
         _load_weights(model, self._weights, cfg, self._mesh)
-        T = _PREFIX_LEN + _DECODE_STEPS
+        T = 16
         hs = jnp.asarray(
             np.random.default_rng(7).standard_normal((T, cfg.hidden_size)), dtype=jnp.bfloat16
         )
