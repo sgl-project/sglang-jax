@@ -17,7 +17,6 @@ from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, get_rope
-from sgl_jax.srt.layers.fused_moe import FusedEPMoEV2
 from sgl_jax.srt.layers.layernorm import GemmaRMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
@@ -403,37 +402,18 @@ class Step3p5MoE(nnx.Module):
         )
 
         swiglu_limit_routed = _swiglu_limit_for(getattr(config, "swiglu_limits", None), layer_id)
-        # #1391: fused_v2 is the production perf path (configurable in-kernel clamp == EPMoE,
-        # guarded by TestFusedVsEPMoE); renorm/scaling done in self.topk. Default epmoe.
-        self.moe_backend = getattr(config, "moe_backend", "epmoe")
-        self.swiglu_limit_routed = swiglu_limit_routed
-        if self.moe_backend == "fused_v2":
-            self.experts = FusedEPMoEV2(
-                hidden_size=hidden_size,
-                num_experts=num_experts,
-                num_experts_per_tok=topk,
-                intermediate_dim=moe_intermediate_size,
-                ep_size=ep_size,
-                mesh=mesh,
-                activation="silu",
-                weight_dtype=dtype,
-                dtype=dtype,
-                layer_id=layer_id,
-                quantization_config=getattr(config, "quantization_config", None),
-            )
-        else:
-            self.experts = EPMoE(
-                hidden_size=hidden_size,
-                num_experts=num_experts,
-                num_experts_per_tok=topk,
-                intermediate_dim=moe_intermediate_size,
-                ep_size=ep_size,
-                mesh=mesh,
-                weight_dtype=dtype,
-                dtype=dtype,
-                layer_id=layer_id,
-                swiglu_limit=swiglu_limit_routed,
-            )
+        self.experts = EPMoE(
+            hidden_size=hidden_size,
+            num_experts=num_experts,
+            num_experts_per_tok=topk,
+            intermediate_dim=moe_intermediate_size,
+            ep_size=ep_size,
+            mesh=mesh,
+            weight_dtype=dtype,
+            dtype=dtype,
+            layer_id=layer_id,
+            swiglu_limit=swiglu_limit_routed,
+        )
 
         swiglu_limit_shared = _swiglu_limit_for(
             getattr(config, "swiglu_limits_shared", None), layer_id
@@ -446,23 +426,13 @@ class Step3p5MoE(nnx.Module):
             swiglu_limit=swiglu_limit_shared,
         )
 
-    def __call__(self, hidden_states: jax.Array, forward_batch=None, dispatch_info=None):
+    def __call__(self, hidden_states: jax.Array, dispatch_info=None):
         router_logits = self.moe_gate(hidden_states)
         correction_bias = self.moe_gate.bias.value if self.moe_gate.bias is not None else None
         topk_weights, topk_ids = self.topk(
             router_logits, correction_bias, dispatch_info=dispatch_info
         )
-        if self.moe_backend == "fused_v2":
-            # Fused kernel skips padded rows via topk_ids == -1 (EPMoE/GMM does not need it).
-            if forward_batch is not None:
-                mask = forward_batch.get_token_valid_mask(hidden_states.shape[0])
-                if mask is not None:
-                    topk_ids = jnp.where(mask[:, None], topk_ids, -1)
-            moe_out = self.experts(
-                hidden_states, topk_weights, topk_ids, swiglu_limit=self.swiglu_limit_routed
-            )
-        else:
-            moe_out = self.experts(hidden_states, topk_weights, topk_ids)
+        moe_out = self.experts(hidden_states, topk_weights, topk_ids)
         shared_out = self.shared_experts(hidden_states)
         return moe_out + shared_out, topk_ids
 
@@ -561,9 +531,7 @@ class Step3p5DecoderLayer(nnx.Module):
         # (return_routed_experts) and apply EPLB logical->physical remap.
         if isinstance(self.mlp, Step3p5MoE):
             hidden_states, topk_ids = self.mlp(
-                hidden_states,
-                forward_batch=forward_batch,
-                dispatch_info=forward_batch.expert_location_metadata,
+                hidden_states, dispatch_info=forward_batch.expert_location_metadata
             )
             # Replicate so the capturer can host-read across multi-host shardings.
             topk_ids = jax.sharding.reshard(topk_ids, P(None))
@@ -840,21 +808,16 @@ class Step3p5ForCausalLM(nnx.Module):
         # assignment to EPMoE params reshards to their ("expert", None, "tensor") layout.
         # REQUIRES --ep-size > 1 at runtime, else the expert axis has size 1 and the full
         # stacked tensor is replicated on every device (HBM blow-up on the real 288-expert model).
-        # EPMoE wi_0/wi_1/wo on the moe "expert" axis; FusedEPMoEV2 w1/w3/w2 on the main
-        # mesh (expert dim over data×tensor). Same pre-stacked [E,out,in] + transpose(0,2,1).
-        _fused = getattr(self.config, "moe_backend", "epmoe") == "fused_v2"
-        _expert_names = (
-            [("gate_proj", "w1"), ("up_proj", "w3"), ("down_proj", "w2")]
-            if _fused
-            else [("gate_proj", "wi_0"), ("up_proj", "wi_1"), ("down_proj", "wo")]
-        )
-        _expert_sharding = (("data", "tensor"), None, None) if _fused else ("expert", None, None)
-        for src_proj, tgt_name in _expert_names:
+        for src_proj, tgt_name in [
+            ("gate_proj", "wi_0"),
+            ("up_proj", "wi_1"),
+            ("down_proj", "wo"),
+        ]:
             tgt_base = f"{target}.mlp.experts.{tgt_name}"
             src_key = f"{prefix}.moe.{src_proj}.weight"
             mappings[f"__MOE_EXPERTS__{tgt_base}"] = WeightMapping(
                 target_path=[tgt_base, src_key],
-                sharding=_expert_sharding,
+                sharding=("expert", None, None),
                 transpose=True,
             )
 
