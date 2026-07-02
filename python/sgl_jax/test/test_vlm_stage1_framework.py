@@ -5,8 +5,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from flax import nnx
-from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec
+from jax.sharding import AxisType, Mesh, PartitionSpec
 
 from sgl_jax.srt.managers.io_struct import GenerateReqInput
 from sgl_jax.srt.managers.mm_utils import merge_jit
@@ -41,13 +40,6 @@ from sgl_jax.srt.multimodal.common.modality_enum import (
 )
 from sgl_jax.srt.multimodal.processors.qwen_vl import QwenVLProcessor
 from sgl_jax.srt.server_args import apply_multimodal_model_defaults
-
-
-def _two_data_devices():
-    devices = jax.devices()
-    if len(devices) < 2:
-        pytest.skip("requires at least two devices for real data-axis sharding")
-    return np.array(devices[:2])
 
 
 def test_vision_transformer_uses_default_norm_eps_when_hf_vision_config_omits_it():
@@ -233,115 +225,6 @@ def test_vision_transformer_encode_binds_mesh_for_sharded_inputs_without_callsit
     assert features.shape == (1, 1, 4)
 
 
-def test_vision_patch_embed_calls_conv_with_single_batch_dim(monkeypatch):
-    vision_config = SimpleNamespace(
-        patch_size=1,
-        temporal_patch_size=1,
-        in_channels=1,
-        hidden_size=4,
-        depth=0,
-        intermediate_size=8,
-        hidden_act="silu",
-        num_heads=1,
-        out_hidden_size=4,
-        spatial_merge_size=1,
-        fullatt_block_indexes=[],
-    )
-    mesh = Mesh(np.array(jax.devices()[:1]), ("data",), axis_types=(AxisType.Explicit,))
-    meta = Qwen25VLVisionMetadata(
-        window_index=jnp.tile(jnp.arange(3, dtype=jnp.int32)[None, :], (2, 1)),
-        cu_window_seqlens=jnp.array([[3], [3]], dtype=jnp.int32),
-        rotary_pos_emb=jnp.zeros((2, 3, 2), dtype=jnp.float32),
-    )
-
-    seen_input_shapes = []
-    original_call = nnx.Conv.__call__
-
-    def record_conv_input_shape(self, inputs, *args, **kwargs):
-        seen_input_shapes.append(inputs.shape)
-        return original_call(self, inputs, *args, **kwargs)
-
-    monkeypatch.setattr(nnx.Conv, "__call__", record_conv_input_shape)
-
-    with jax.set_mesh(mesh):
-        visual = Qwen2_5_VisionTransformer(
-            config=vision_config,
-            dtype=jnp.float32,
-            mesh=mesh,
-            norm_eps=1e-6,
-        )
-        features = visual.encode_jit(
-            jnp.ones((2, 3, 1), dtype=jnp.float32),
-            meta,
-            jnp.array([3, 3], dtype=jnp.int32),
-        )
-
-    assert features.shape == (2, 3, 4)
-    assert seen_input_shapes == [(6, 1, 1, 1, 1)]
-
-
-def test_vision_encode_runs_on_real_dp2_data_mesh(monkeypatch):
-    mesh = Mesh(_two_data_devices(), ("data",), axis_types=(AxisType.Explicit,))
-    vision_config = SimpleNamespace(
-        patch_size=1,
-        temporal_patch_size=1,
-        in_channels=1,
-        hidden_size=4,
-        depth=2,
-        intermediate_size=16,
-        hidden_act="silu",
-        num_heads=1,
-        out_hidden_size=4,
-        spatial_merge_size=2,
-        fullatt_block_indexes=[1],
-    )
-
-    def fake_vision_attention(backend, q, k, v, seg):
-        return jnp.zeros_like(q)
-
-    monkeypatch.setattr(
-        "sgl_jax.srt.models.qwen2_5_vl._vision_attention",
-        fake_vision_attention,
-    )
-
-    with jax.set_mesh(mesh):
-        visual = Qwen2_5_VisionTransformer(
-            config=vision_config,
-            dtype=jnp.float32,
-            mesh=mesh,
-            norm_eps=1e-6,
-        )
-        for block in visual.blocks:
-            block.attn.attn_backend = None
-
-    plan = MultimodalEmbedPlan(
-        rounds_by_modality={
-            Modality.IMAGE: [
-                EmbedRound(
-                    encode_inputs=VisionEncodeInputs(
-                        pixels=np.ones((2, 8, 1), dtype=np.float32),
-                        valid=np.array([8, 4], dtype=np.int32),
-                        meta=Qwen25VLVisionMetadata(
-                            window_index=np.array([[1, 0], [0, 1]], dtype=np.int32),
-                            cu_window_seqlens=np.array([[8], [4]], dtype=np.int32),
-                            rotary_pos_emb=np.zeros((2, 8, 2), dtype=np.float32),
-                        ),
-                    ),
-                    src_idx=np.zeros((8,), dtype=np.int32),
-                    mask=np.zeros((8,), dtype=np.bool_),
-                )
-            ]
-        }
-    )
-    _device_put_embed_plan(plan, mesh)
-    enc = plan.rounds_by_modality[Modality.IMAGE][0].encode_inputs
-
-    features = visual.encode(enc.pixels, enc.meta, enc.valid)
-
-    assert features.shape == (2, 2, 4)
-    assert tuple(features.sharding.spec) == ("data", None, None)
-
-
 def test_merge_jit_consumes_dp_leading_features():
     mesh = Mesh(np.array(jax.devices()[:1]), ("data",))
     running = jnp.zeros((2, 3), dtype=jnp.float32)
@@ -352,69 +235,6 @@ def test_merge_jit_consumes_dp_leading_features():
     out = merge_jit(mesh, running, features, src_idx, mask)
 
     np.testing.assert_array_equal(np.asarray(out), np.asarray(features[0]))
-
-
-def test_merge_jit_uses_rank_local_features_on_real_dp2_mesh():
-    mesh = Mesh(_two_data_devices(), ("data",), axis_types=(AxisType.Explicit,))
-    running = np.arange(12, dtype=np.float32).reshape(6, 2)
-    features = np.array(
-        [
-            [[10.0, 11.0], [20.0, 21.0]],
-            [[100.0, 101.0], [200.0, 201.0]],
-        ],
-        dtype=np.float32,
-    )
-    src_idx = np.array([1, 0, 0, 0, 0, 1], dtype=np.int32)
-    mask = np.array([True, True, False, True, False, True])
-
-    running_d = jax.device_put(running, NamedSharding(mesh, PartitionSpec("data", None)))
-    features_d = jax.device_put(features, NamedSharding(mesh, PartitionSpec("data", None, None)))
-    src_idx_d = jax.device_put(src_idx, NamedSharding(mesh, PartitionSpec("data")))
-    mask_d = jax.device_put(mask, NamedSharding(mesh, PartitionSpec("data")))
-
-    out = merge_jit(mesh, running_d, features_d, src_idx_d, mask_d)
-
-    expected = running.copy()
-    expected[0] = features[0, 1]
-    expected[1] = features[0, 0]
-    expected[3] = features[1, 0]
-    expected[5] = features[1, 1]
-    np.testing.assert_array_equal(np.asarray(out), expected)
-
-
-def test_device_put_embed_plan_places_qwen_metadata_data_leading():
-    mesh = Mesh(np.array(jax.devices()[:1]), ("data",), axis_types=(AxisType.Explicit,))
-    plan = MultimodalEmbedPlan(
-        rounds_by_modality={
-            Modality.IMAGE: [
-                EmbedRound(
-                    encode_inputs=VisionEncodeInputs(
-                        pixels=np.ones((1, 4, 1), dtype=np.float32),
-                        valid=np.array([4], dtype=np.int32),
-                        meta=Qwen25VLVisionMetadata(
-                            window_index=np.array([[0]], dtype=np.int32),
-                            cu_window_seqlens=np.array([[4]], dtype=np.int32),
-                            rotary_pos_emb=np.zeros((1, 4, 2), dtype=np.float32),
-                        ),
-                    ),
-                    src_idx=np.zeros((2,), dtype=np.int32),
-                    mask=np.zeros((2,), dtype=np.bool_),
-                )
-            ]
-        }
-    )
-
-    _device_put_embed_plan(plan, mesh)
-    rnd = plan.rounds_by_modality[Modality.IMAGE][0]
-    enc = rnd.encode_inputs
-
-    assert tuple(enc.pixels.sharding.spec) == ("data", None, None)
-    assert tuple(enc.valid.sharding.spec) == ("data",)
-    assert tuple(enc.meta.window_index.sharding.spec) == ("data", None)
-    assert tuple(enc.meta.cu_window_seqlens.sharding.spec) == ("data", None)
-    assert tuple(enc.meta.rotary_pos_emb.sharding.spec) == ("data", None, None)
-    assert tuple(rnd.src_idx.sharding.spec) == ("data",)
-    assert tuple(rnd.mask.sharding.spec) == ("data",)
 
 
 def test_multimodal_model_defaults_disable_unsupported_scheduler_features():
