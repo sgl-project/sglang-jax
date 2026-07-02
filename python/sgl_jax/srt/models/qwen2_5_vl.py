@@ -7,14 +7,13 @@ from types import SimpleNamespace
 import jax
 import jax.numpy as jnp
 from flax import nnx
-from jax.sharding import Mesh
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from transformers import modeling_flax_utils
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.hf_transformers_utils import get_hf_text_config
 from sgl_jax.srt.layers.embeddings import ParallelLMHead
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
-from sgl_jax.srt.managers.mm_utils import jitted_mm_encode
 from sgl_jax.srt.mem_cache.memory_pool import MemoryPools
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.models.qwen2 import Qwen2Model, create_qwen2_weight_mappings
@@ -34,6 +33,13 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 init_fn = nnx.initializers.uniform()
+
+
+def _apply_data_sharding(x: jax.Array, mesh: Mesh, spec: PartitionSpec) -> jax.Array:
+    sharding = NamedSharding(mesh, spec)
+    if "data" in mesh.abstract_mesh.explicit_axes:
+        return jax.sharding.reshard(x, sharding)
+    return jax.lax.with_sharding_constraint(x, sharding)
 
 
 def _apply_rotary_pos_emb_vision(x: jax.Array, rotary_pos_emb: jax.Array) -> jax.Array:
@@ -99,10 +105,12 @@ class Qwen2_5_VisionPatchEmbed(nnx.Module):
         in_channels: int = 3,
         hidden_size: int = 1152,
         dtype: jnp.dtype = jnp.bfloat16,
+        mesh: Mesh = None,
     ) -> None:
         self.patch_size = patch_size
         self.temporal_patch_size = temporal_patch_size
         self.hidden_size = hidden_size
+        self.mesh = mesh
         kernel_size = (temporal_patch_size, patch_size, patch_size)
 
         self.proj = nnx.Conv(
@@ -120,15 +128,31 @@ class Qwen2_5_VisionPatchEmbed(nnx.Module):
         # seq_len == the per-image patch count (== patch_k in the plan).
         dp, seq_len, dim = x.shape
         C = dim // (self.temporal_patch_size * self.patch_size * self.patch_size)
-        # Fold [dp, seq_len] into one conv batch axis: conv is per-element over
-        # the batch, so dp*seq_len patches together == per-image (no cross-image
-        # mixing).
-        x = x.reshape(dp * seq_len, C, self.temporal_patch_size, self.patch_size, self.patch_size)
-        # (dp*seq_len), T, H, W, C
-        x = jnp.transpose(x, (0, 2, 3, 4, 1))
+        x = x.reshape(
+            dp,
+            seq_len,
+            C,
+            self.temporal_patch_size,
+            self.patch_size,
+            self.patch_size,
+        )
+        if self.mesh is not None:
+            x = _apply_data_sharding(
+                x,
+                self.mesh,
+                PartitionSpec("data", None, None, None, None, None),
+            )
+        # [dp, seq, C, T, H, W] -> [dp, seq, T, H, W, C]
+        x = jnp.transpose(x, (0, 1, 3, 4, 5, 2))
         x = self.proj(x)
-        # After conv (stride=kernel_size): (dp*seq_len, 1, 1, 1, hidden_size)
-        x = x.reshape(dp, seq_len, self.hidden_size)  # unfold dp
+        # After conv: [dp, seq, 1, 1, 1, hidden_size].
+        x = jnp.squeeze(x, axis=(2, 3, 4))
+        if self.mesh is not None:
+            x = _apply_data_sharding(
+                x,
+                self.mesh,
+                PartitionSpec("data", None, None),
+            )
         return x
 
 
@@ -183,6 +207,7 @@ class Qwen2_5_VisionAttention(nnx.Module):
         self.num_heads = config.num_heads
         self.head_dim = self.hidden_size // self.num_heads
         self.scale = 1.0 / math.sqrt(self.head_dim)
+        self.mesh = mesh
 
         # Use dummy rngs if None (for eval_shape)
         _rngs = rngs or nnx.Rngs(0)
@@ -226,12 +251,17 @@ class Qwen2_5_VisionAttention(nnx.Module):
         """Run one dp-leading ViT attention block."""
         dp, T, D = x.shape
 
-        positions = jnp.arange(T)
-        seg = jax.vmap(lambda row: jnp.searchsorted(row, positions, side="right"))(
-            cu_window_seqlens
+        positions = jnp.arange(T, dtype=cu_window_seqlens.dtype)
+        seg = jnp.sum(
+            cu_window_seqlens[:, :, None] <= positions[None, None, :],
+            axis=1,
         ).astype(jnp.int32)
+        if self.mesh is not None:
+            seg = _apply_data_sharding(seg, self.mesh, PartitionSpec("data", None))
         if valid is not None:
             is_real = positions[None, :] < jnp.reshape(valid, (dp, 1))
+            if self.mesh is not None:
+                is_real = _apply_data_sharding(is_real, self.mesh, PartitionSpec("data", None))
             seg = jnp.where(is_real, seg, jnp.full_like(seg, -1))
 
         # Project to Q, K, V
@@ -264,11 +294,12 @@ class Qwen2_5_VisionBlock(nnx.Module):
         dtype: jnp.dtype,
         rngs: nnx.Rngs = None,
         mesh: Mesh = None,
+        norm_eps: float = 1e-6,
     ):
         dim = config.hidden_size
         norm_layer = partial(
             nnx.RMSNorm,
-            epsilon=config.rms_norm_eps,
+            epsilon=norm_eps,
             scale_init=nnx.with_partitioning(init_fn, (None,)),
         )
 
@@ -301,8 +332,10 @@ class Qwen2_5_VisionPatchMerger(nnx.Module):
         spatial_merge_size: int,
         dtype: jnp.dtype,
         rngs: nnx.Rngs = None,
+        mesh: Mesh = None,
     ):
         self.hidden_size = context_dim * (spatial_merge_size**2)
+        self.mesh = mesh
 
         # Use dummy rngs if None (for eval_shape)
         _rngs = rngs or nnx.Rngs(0)
@@ -333,7 +366,17 @@ class Qwen2_5_VisionPatchMerger(nnx.Module):
         # Keep dp on axis 0: the sms² spatial-merge stays WITHIN each image.
         # ``reshape(-1, ...)`` here would interleave T and dp and silently mix
         # across images.
-        x = x.reshape(dp, -1, self.hidden_size)  # [dp, T/sms², ctx*sms²]
+        out_sharding = None
+        if self.mesh is not None and "data" in self.mesh.abstract_mesh.explicit_axes:
+            out_sharding = NamedSharding(self.mesh, PartitionSpec("data", None, None))
+        x = x.reshape(
+            dp,
+            -1,
+            self.hidden_size,
+            out_sharding=out_sharding,
+        )  # [dp, T/sms², ctx*sms²]
+        if self.mesh is not None and out_sharding is None:
+            x = _apply_data_sharding(x, self.mesh, PartitionSpec("data", None, None))
         x = self.mlp_fc1(x)
         x = self.mlp_act(x)
         x = self.mlp_fc2(x)
@@ -352,6 +395,7 @@ class Qwen2_5_VisionTransformer(nnx.Module):
     ):
         self.config = config
         self.dtype = dtype
+        self.mesh = mesh
 
         self.patch_embed = Qwen2_5_VisionPatchEmbed(
             patch_size=config.patch_size,
@@ -360,6 +404,7 @@ class Qwen2_5_VisionTransformer(nnx.Module):
             hidden_size=config.hidden_size,
             dtype=dtype,
             rngs=rngs,
+            mesh=mesh,
         )
 
         self.blocks = nnx.List(
@@ -369,6 +414,7 @@ class Qwen2_5_VisionTransformer(nnx.Module):
                     dtype=dtype,
                     rngs=rngs,
                     mesh=mesh,
+                    norm_eps=norm_eps,
                 )
                 for _ in range(config.depth)
             ]
@@ -381,6 +427,7 @@ class Qwen2_5_VisionTransformer(nnx.Module):
             spatial_merge_size=config.spatial_merge_size,
             dtype=dtype,
             rngs=rngs,
+            mesh=mesh,
         )
 
         self.spatial_merge_size = config.spatial_merge_size
@@ -448,6 +495,30 @@ class Qwen2_5_VisionTransformer(nnx.Module):
         hidden_states = jnp.take_along_axis(hidden_states, rev_idx, axis=1)
         return hidden_states  # [dp, out_rows, H]
 
+    def encode(self, pixels: jax.Array, meta, valid: jax.Array | None = None) -> jax.Array:
+        if self.mesh is None:
+            return self.encode_jit(pixels, meta, valid)
+        try:
+            ctx = jax.sharding.use_mesh(self.mesh)
+        except AttributeError:
+            try:
+                ctx = jax.set_mesh(self.mesh)
+            except AttributeError:
+                ctx = self.mesh
+        with ctx:
+            return self.encode_jit(pixels, meta, valid)
+
+    @jax.jit
+    def encode_jit(self, pixels: jax.Array, meta, valid: jax.Array | None = None) -> jax.Array:
+        features = self(pixels, meta, valid)  # [dp, out_rows, H]
+        if self.mesh is None:
+            return features
+        return _apply_data_sharding(
+            features,
+            self.mesh,
+            PartitionSpec("data", None, None),
+        )
+
 
 class Qwen2_5_VLForConditionalGeneration(nnx.Module):
     """In-model Qwen2.5-VL (single-file): vision tower + Qwen2 backbone (+ MRoPE)
@@ -496,10 +567,9 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
 
         ``enc.meta`` carries scheduler-built ViT aux
         (``window_index`` / ``cu_window_seqlens`` / ``rotary_pos_emb``).
-        Returns flattened image features with shape ``[dp * out_rows, H]``.
+        Returns dp-leading image features with shape ``[dp, out_rows, H]``.
         """
-        graphdef, state = nnx.split(self.visual)
-        return jitted_mm_encode(self.mesh, graphdef, state, enc.pixels, enc.meta, enc.valid)
+        return self.visual.encode(enc.pixels, enc.meta, enc.valid)
 
     def load_weights(self, model_config: ModelConfig):
         # Load text backbone and lm_head weights.
