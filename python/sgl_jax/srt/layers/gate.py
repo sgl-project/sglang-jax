@@ -103,7 +103,8 @@ class TopK(nnx.Module):
             topk_ids = topk_ids_logical_to_physical(topk_ids, dispatch_info, self.layer_id)
 
         if self.renormalize:
-            topk_weights = topk_weights / (jnp.sum(topk_weights, axis=-1, keepdims=True))
+            # 1e-20 matches HF router_bias_func to avoid division-by-zero on near-zero probs.
+            topk_weights = topk_weights / (jnp.sum(topk_weights, axis=-1, keepdims=True) + 1e-20)
         if self.routed_scaling_factor is not None:
             topk_weights *= self.routed_scaling_factor
 

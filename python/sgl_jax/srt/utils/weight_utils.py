@@ -8,7 +8,7 @@ import pickle
 import re
 import struct
 import time
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
@@ -1836,14 +1836,74 @@ class WeightLoader:
             )
         return result
 
+    def _create_prestacked_moe_lazy_tensor(
+        self,
+        hf_key: str,
+        weight_info: dict,
+        file_manager: "SequentialSafetensorManager",
+        do_transpose: bool = False,
+        target_sharding: jax.sharding.NamedSharding | None = None,
+        physical_to_logical_map: np.ndarray | None = None,
+    ) -> jax.Array:
+        """Load experts pre-stacked as one [E, out, in] tensor (Step 3.5), reusing the
+        transpose(0,2,1) -> [E, in, out] + EPLB reorder convention of the per-expert loader."""
+        info = weight_info[hf_key][0]
+        st_dtype = info["dtype"]
+        target_dtype = _SAFETENSORS_DTYPE_TO_JAX.get(st_dtype, jnp.float32)
+        sharding = target_sharding or jax.sharding.NamedSharding(self.mesh, P())
+        full_shape = tuple(info["shape"])  # [E, out, in]
+        # Built at full_shape then transposed; correct only because EPMoE stacked
+        # specs shard axis 0 ("expert") and leave weight dims unsharded.
+
+        if physical_to_logical_map is None:
+
+            def _load_slice(index):
+                f = file_manager.get_handle(info["file"])
+                arr = f.get_slice(hf_key)[index]
+                return _reinterpret_dtype_if_needed(arr, target_dtype)
+
+            result: jax.Array = jax.make_array_from_callback(full_shape, sharding, _load_slice)
+        else:
+            physical_to_logical_map = self._normalize_physical_to_logical_map(
+                physical_to_logical_map=physical_to_logical_map,
+                num_logical_experts=full_shape[0],
+                context="prestacked_moe_loader",
+            )
+            f = file_manager.get_handle(info["file"])
+            host = np.asarray(f.get_slice(hf_key)[:, :, :])
+            host = host[np.asarray(physical_to_logical_map)]
+            result = jax.device_put(_reinterpret_dtype_if_needed(host, target_dtype), sharding)
+
+        # dtype cast + transpose must run under the array's OWN mesh (target_sharding's
+        # mesh — e.g. the moe expert/tensor mesh). JAX explicit-sharding requires the
+        # context mesh to match the operand's aval mesh, else transpose raises
+        # "context mesh ... should match the aval mesh". This is what lets the stacked
+        # experts load sharded on the expert axis (no full-tensor replication) yet still
+        # transpose correctly.
+        with jax.set_mesh(sharding.mesh):  # type: ignore[arg-type]
+            if result.dtype != target_dtype:
+                result = result.astype(target_dtype)
+            if do_transpose:
+                result = jnp.transpose(result, (0, 2, 1))
+        return result
+
     def load_weights_from_safetensors(
         self,
         weight_mappings: Mapping[str, WeightMappingSpec],
         safetensors_partition=1,
         dummy=False,
+        assert_all_assigned: bool = False,
+        unassigned_whitelist: Iterable[str] = (),
     ):
-        """Load weights using JAX lazy evaluation and parallel I/O."""
+        """Load weights using JAX lazy evaluation and parallel I/O.
+
+        assert_all_assigned: if True, raises after loading if any nnx.Param in
+        the model was not assigned from the checkpoint. Pass unassigned_whitelist
+        to exclude legitimately-derived params (e.g. MLA absorbed weights).
+        Default False so existing models are unaffected.
+        """
         params = nnx.state(self.model)
+        _assigned_paths: set[str] = set()  # populated only when assert_all_assigned=True
 
         if dummy or self.dummy_mode:
             self._load_dummy_weights(params, weight_mappings)
@@ -2001,6 +2061,8 @@ class WeightLoader:
                         else:
                             model_param.value = lazy_weight.astype(model_param.value.dtype)
 
+                        if assert_all_assigned:
+                            _assigned_paths.add(target_path)
                         mode_str = "Split-Stitch" if is_split_weight else "Direct"
                         logger.debug(
                             "Fast Loading %s -> %s (%s), shape: %s",
@@ -2036,7 +2098,13 @@ class WeightLoader:
                     hot_tokens_ids.value = hot_ids
                     continue
 
-                self._process_and_assign_weight(params, hf_key, lazy_weight, mapping)
+                self._process_and_assign_weight(
+                    params,
+                    hf_key,
+                    lazy_weight,
+                    mapping,
+                    _assigned_paths if assert_all_assigned else None,
+                )
 
             # 3. Process MoE Weights (Lazy Pull)
             for moe_key, mapping in tqdm(moe_mappings.items(), desc="Loading MoE Weights"):
@@ -2103,14 +2171,31 @@ class WeightLoader:
 
                     # 2. Call creator
                     _t_load_start = time.monotonic()
-                    stacked_weight = self._create_stacked_moe_lazy_tensor(
-                        expected_hf_keys,
-                        weight_info,
-                        file_manager,
-                        do_transpose=mapping.transpose,  # CPU transpose
-                        target_sharding=final_sharding,  # Global loading
-                        physical_to_logical_map=mapping.physical_to_logical_map,
-                    )
+                    _is_prestacked = False
+                    if len(expected_hf_keys) == 1:
+                        _info0 = weight_info[expected_hf_keys[0]][0]
+                        _shape0 = tuple(_info0["shape"])
+                        _tgt_param = self._get_param(params, mapping.target_path[0])
+                        if len(_shape0) == 3 and _shape0[0] == _tgt_param.value.shape[0]:
+                            _is_prestacked = True
+                    if _is_prestacked:
+                        stacked_weight = self._create_prestacked_moe_lazy_tensor(
+                            expected_hf_keys[0],
+                            weight_info,
+                            file_manager,
+                            do_transpose=mapping.transpose,
+                            target_sharding=final_sharding,
+                            physical_to_logical_map=mapping.physical_to_logical_map,
+                        )
+                    else:
+                        stacked_weight = self._create_stacked_moe_lazy_tensor(
+                            expected_hf_keys,
+                            weight_info,
+                            file_manager,
+                            do_transpose=mapping.transpose,  # CPU transpose
+                            target_sharding=final_sharding,  # Global loading
+                            physical_to_logical_map=mapping.physical_to_logical_map,
+                        )
                     _t_load = time.monotonic() - _t_load_start
                     loaded_shape = stacked_weight.shape
 
@@ -2149,7 +2234,15 @@ class WeightLoader:
                         if stacked_weight.dtype in [jnp.float8_e4m3fn, jnp.float8_e5m2]:
                             model_param.value = stacked_weight
                         else:
-                            model_param.value = stacked_weight.astype(model_param.value.dtype)
+                            # The dtype cast must run under the loaded array's OWN mesh
+                            # (e.g. the moe expert/tensor mesh) — JAX explicit-sharding
+                            # requires the context mesh to match the operand's aval mesh.
+                            # No-op for global-mesh arrays (context already matches), but
+                            # required when experts loaded sharded on the moe mesh.
+                            with jax.set_mesh(stacked_weight.sharding.mesh):  # type: ignore[arg-type]
+                                model_param.value = stacked_weight.astype(model_param.value.dtype)
+                        if assert_all_assigned:
+                            _assigned_paths.add(target_path)
                         _t_assign = time.monotonic() - _t_assign_start
                         logger.debug(
                             "MoE group %s: load=%.2fs assign=%.2fs total=%.2fs "
@@ -2259,6 +2352,8 @@ class WeightLoader:
                             model_param.value = expert_weights
                         else:
                             model_param.value = expert_weights.astype(model_param.value.dtype)
+                        if assert_all_assigned:
+                            _assigned_paths.add(target_path)
                     except Exception as e:
                         logger.error(
                             "Failed Split-MoE assign group=%s target=%s loaded_shape=%s final_shape=%s "
@@ -2283,6 +2378,40 @@ class WeightLoader:
 
         nnx.update(self.model, params)
         logger.info("All weights loaded successfully.")
+
+        if assert_all_assigned:
+            self._check_all_params_assigned(_assigned_paths, unassigned_whitelist)
+
+    def _check_all_params_assigned(
+        self,
+        assigned_paths: set[str],
+        whitelist: Iterable[str],
+    ) -> None:
+        """Raise ValueError if any nnx.Param in the model was not assigned.
+
+        Enumerate all nnx.Param leaves, subtract assigned_paths and whitelist;
+        any remainder means a mapping key was missing or mis-keyed.
+        """
+        state = nnx.state(self.model)
+        flat = nnx.to_flat_state(state)
+        all_param_paths = {
+            ".".join(str(p) for p in path)
+            for path, leaf in zip(flat.paths, flat.leaves)
+            if isinstance(leaf, nnx.Param)
+        }
+        whitelist_set = set(whitelist)
+        unassigned = all_param_paths - assigned_paths - whitelist_set
+        if unassigned:
+            sorted_missing = sorted(unassigned)
+            raise ValueError(
+                f"assert_all_assigned: {len(sorted_missing)} model param(s) were not loaded "
+                f"from the checkpoint (possible mis-keyed mapping):\n"
+                + "\n".join(f"  {p}" for p in sorted_missing)
+            )
+        logger.info(
+            "assert_all_assigned: all %d params confirmed loaded from checkpoint.",
+            len(all_param_paths),
+        )
 
     def _load_dummy_weights(
         self,
@@ -2461,6 +2590,7 @@ class WeightLoader:
         hf_key: str,
         hf_weight: jax.Array,
         mapping: WeightMapping,
+        _assigned_paths: set[str] | None = None,
     ):
         processed_weight = hf_weight
 
@@ -2471,12 +2601,17 @@ class WeightLoader:
             processed_weight = jnp.transpose(processed_weight, (1, 0))
 
         if isinstance(mapping.target_path, list):
-            self._handle_split_weight(params, hf_key, processed_weight, mapping)
+            self._handle_split_weight(params, hf_key, processed_weight, mapping, _assigned_paths)
         else:
-            self._handle_single_weight(params, hf_key, processed_weight, mapping)
+            self._handle_single_weight(params, hf_key, processed_weight, mapping, _assigned_paths)
 
     def _handle_single_weight(
-        self, params: nnx.State, hf_key: str, weight: jax.Array, mapping: WeightMapping
+        self,
+        params: nnx.State,
+        hf_key: str,
+        weight: jax.Array,
+        mapping: WeightMapping,
+        _assigned_paths: set[str] | None = None,
     ):
         assert isinstance(mapping.target_path, str)
         jax_path: str = mapping.target_path
@@ -2563,17 +2698,29 @@ class WeightLoader:
                 model_param.value = sharded_weight
             else:
                 model_param.value = sharded_weight.astype(model_param.value.dtype)
+            if _assigned_paths is not None:
+                _assigned_paths.add(jax_path)
         except Exception as e:
             logger.error("Failed to load %s -> %s: %s", hf_key, jax_path, str(e))
             raise
 
     def _handle_split_weight(
-        self, params: nnx.State, hf_key: str, weight: jax.Array, mapping: WeightMapping
+        self,
+        params: nnx.State,
+        hf_key: str,
+        weight: jax.Array,
+        mapping: WeightMapping,
+        _assigned_paths: set[str] | None = None,
     ):
-        self._split_qkv_weight(params, hf_key, weight, mapping)
+        self._split_qkv_weight(params, hf_key, weight, mapping, _assigned_paths)
 
     def _split_qkv_weight(
-        self, params: nnx.State, hf_key: str, weight: jax.Array, mapping: WeightMapping
+        self,
+        params: nnx.State,
+        hf_key: str,
+        weight: jax.Array,
+        mapping: WeightMapping,
+        _assigned_paths: set[str] | None = None,
     ):
         jax_paths = mapping.target_path
 
@@ -2806,6 +2953,8 @@ class WeightLoader:
             else:
                 model_param.value = sharded_weight.astype(model_param.value.dtype)
 
+            if _assigned_paths is not None:
+                _assigned_paths.add(jax_path)
             logger.debug("Split %s -> %s, shape: %s", hf_key, jax_path, processed_weight.shape)
 
     def _shard_weight(
