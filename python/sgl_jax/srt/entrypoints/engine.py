@@ -296,9 +296,10 @@ class Engine(EngineBase):
         return ret
 
     def shutdown(self):
-        """Shutdown the engine"""
+        """Shutdown the engine (safe even if __init__ did not complete)."""
         kill_process_tree(os.getpid(), include_parent=False)
-        if self.server_args.enable_single_process:
+        server_args = getattr(self, "server_args", None)
+        if server_args is not None and server_args.enable_single_process:
             self.send_to_rpc.close()
 
     def __enter__(self):

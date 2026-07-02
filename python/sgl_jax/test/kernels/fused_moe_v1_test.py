@@ -1065,6 +1065,89 @@ class MoEKernelTest(jtu.JaxTestCase):
         self.assertEqual(eff.bf, 384)
         self.assertEqual(eff.bse, 384)
 
+    def test_effective_for_bd_reduction_for_hidden_1536(self):
+        """bd1/bd2 auto-reduce from 1024 to 768 for hidden_size=1536 (e.g. ring_v3_tiny).
+
+        1536 % 1024 != 0 would otherwise trip the kernel's bd-alignment validation.
+        768 is the largest multiple of tile_align(=256 for bf16) that divides 1536.
+        """
+        cfg = FusedMoEBlockConfig(
+            bt=32,
+            bf=512,
+            bd1=1024,
+            bd2=1024,
+            btc=32,
+            bfc=512,
+            bd1c=1024,
+            bd2c=1024,
+            bse=512,
+        )
+        eff = cfg.effective_for(
+            num_tokens=256,
+            ep_size=1,
+            dtype=jnp.bfloat16,
+            intermediate_size=512,
+            hidden_size=1536,
+        )
+        self.assertEqual(eff.bd1, 768)
+        self.assertEqual(eff.bd2, 768)
+        self.assertEqual(1536 % eff.bd1, 0)
+        self.assertEqual(1536 % eff.bd2, 0)
+        # bd1c/bd2c capped to the reduced bd (768) and kept divisible.
+        self.assertEqual(eff.bd1, eff.bd1c)
+        self.assertEqual(eff.bd2, eff.bd2c)
+        self.assertEqual(eff.bd1 % eff.bd1c, 0)
+        self.assertEqual(eff.bd2 % eff.bd2c, 0)
+        self.assertEqual(eff.bd1c % 256, 0)
+        self.assertEqual(eff.bd2c % 256, 0)
+
+    def test_effective_for_bd_no_reduction_when_aligned(self):
+        """bd1/bd2 stay unchanged when hidden_size is already a multiple of bd."""
+        cfg = FusedMoEBlockConfig(
+            bt=32,
+            bf=512,
+            bd1=1024,
+            bd2=1024,
+            btc=32,
+            bfc=512,
+            bd1c=1024,
+            bd2c=1024,
+            bse=512,
+        )
+        eff = cfg.effective_for(
+            num_tokens=256,
+            ep_size=1,
+            dtype=jnp.bfloat16,
+            intermediate_size=2048,
+            hidden_size=2048,
+        )
+        self.assertEqual(eff.bd1, 1024)
+        self.assertEqual(eff.bd2, 1024)
+        self.assertEqual(eff.bd1c, 1024)
+        self.assertEqual(eff.bd2c, 1024)
+
+    def test_effective_for_bd_reduction_skipped_when_hidden_size_none(self):
+        """Without hidden_size, bd1/bd2 are passed through unchanged (back-compat)."""
+        cfg = FusedMoEBlockConfig(
+            bt=32,
+            bf=512,
+            bd1=1024,
+            bd2=1024,
+            btc=32,
+            bfc=512,
+            bd1c=1024,
+            bd2c=1024,
+            bse=512,
+        )
+        eff = cfg.effective_for(
+            num_tokens=256,
+            ep_size=1,
+            dtype=jnp.bfloat16,
+            intermediate_size=512,
+        )
+        self.assertEqual(eff.bd1, 1024)
+        self.assertEqual(eff.bd2, 1024)
+
 
 if __name__ == "__main__":
     absltest.main(testLoader=jtu.JaxTestLoader())

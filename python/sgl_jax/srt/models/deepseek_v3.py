@@ -125,6 +125,7 @@ class DeepseekV3Attention(nnx.Module):
         dtype: jnp.dtype = jnp.bfloat16,
         use_absorbed: bool = True,
         skip_rope: bool = False,
+        use_gate: bool = False,
     ):
         super().__init__()
         self.mesh = mesh
@@ -135,6 +136,7 @@ class DeepseekV3Attention(nnx.Module):
         self.v_head_dim = v_head_dim
         self.kv_lora_rank = kv_lora_rank
         self.q_lora_rank = q_lora_rank
+        self.use_gate = use_gate
 
         if q_lora_rank is None:
             self.q_proj = LinearBase(
@@ -196,6 +198,23 @@ class DeepseekV3Attention(nnx.Module):
             kernel_axes=("tensor", None),
             scope_name="o_proj",
         )
+
+        # Optional head-wise output gating (BailingMoeV3 / Ling-V3): one scalar
+        # per head, g = sigmoid(hidden @ Wg), applied as attn_output *= g[...,None]
+        # before o_proj. Column-parallel over the head (tensor) axis. Off by
+        # default so DeepSeek/Kimi are unaffected.
+        if use_gate:
+            self.g_proj = LinearBase(
+                hidden_size,
+                num_heads,
+                mesh,
+                use_bias=False,
+                params_dtype=dtype,
+                kernel_axes=(None, "tensor"),
+                scope_name="g_proj",
+            )
+        else:
+            self.g_proj = None
 
         if not skip_rope:
             self.rotary_emb = get_rope(
@@ -295,6 +314,15 @@ class DeepseekV3Attention(nnx.Module):
             attn_output, kv_fused = self._forward_mha(
                 q_nope, q_rope, compressed, k_rope, forward_batch, token_to_kv_pool
             )
+
+        # Head-wise output gate (BailingMoeV3 / Ling-V3): attn_output is flat
+        # [T, num_heads * v_head_dim]; gate has one scalar per head.
+        if self.g_proj is not None:
+            gate, _ = self.g_proj(hidden_states)
+            gate = jax.nn.sigmoid(gate.astype(jnp.float32))
+            attn_output = attn_output.reshape(-1, self.num_heads, self.v_head_dim)
+            attn_output = attn_output * gate[:, :, None].astype(attn_output.dtype)
+            attn_output = attn_output.reshape(-1, self.num_heads * self.v_head_dim)
 
         output, _ = self.o_proj(attn_output)
         return output, kv_fused
