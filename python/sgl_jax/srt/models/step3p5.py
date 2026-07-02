@@ -669,6 +669,16 @@ class Step3p5ForCausalLM(nnx.Module):
         output = self.logits_processor(hidden_states, self.lm_head, logits_metadata)
         return output, {"token_to_kv_pool": layers_kv_fused}, True, layers_topk_ids
 
+    def get_embed_and_head(self):
+        # Consumed by the spec-decode draft worker to share the target token
+        # embedding (and LM head) with the MTP draft model. See
+        # ``MultiLayerDraftWorker._share_embed_head_one``.
+        return self.model.embed_tokens.embedding.value, self.lm_head.embedding.value
+
+    def set_embed_and_head(self, embed, head) -> None:  # noqa: D401 - interface hook
+        self.model.embed_tokens.embedding.value = embed
+        self.lm_head.embedding.value = head
+
     def load_weights(self, model_config: ModelConfig) -> None:
         loader = WeightLoader(
             model=self,
