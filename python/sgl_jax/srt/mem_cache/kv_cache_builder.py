@@ -97,8 +97,9 @@ def init_hicache(cache, server_args, mesh, token_to_kv_pool_allocator) -> None:
     cache.hicache_enabled = True
     cache.write_through_threshold = server_args.hicache_write_through_threshold
     cache.write_policy = server_args.hicache_write_policy
-    for component in cache._components_tuple:
-        component._full_kv_pool_host = host_pool
+    # Per-component host-pool hooks deferred to Stage 5 (multi-component reuse).
+    # The current Stage 2/3 HiCache control plane is centralized in
+    # UnifiedRadixCache, so _full_kv_pool_host has no production readers yet.
 
     logger.info(
         "HiCache enabled: host pool=%d pages (page_size=%d, ~%d tokens, "

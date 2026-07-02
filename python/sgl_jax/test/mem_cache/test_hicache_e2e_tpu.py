@@ -53,7 +53,9 @@ class TestHiCacheE2ETPU(unittest.TestCase):
     HOST_PAGES = 32
 
     def setUp(self):
-        self.mesh = create_device_mesh(ici_parallelism=[1, 1], dcn_parallelism=[1, 1])
+        self.mesh = create_device_mesh(
+            ici_parallelism=[1, jax.device_count()], dcn_parallelism=[1, 1]
+        )
         self.kv_cache = MHATokenToKVPool(
             size=self.DEVICE_SIZE,
             page_size=self.PAGE_SIZE,
@@ -102,8 +104,6 @@ class TestHiCacheE2ETPU(unittest.TestCase):
         self.cache.hicache_enabled = True
         self.cache.write_through_threshold = 1
         self.cache.write_policy = "write_through"
-        for c in self.cache._components_tuple:
-            c._full_kv_pool_host = self.host_pool
 
     def tearDown(self):
         self.controller.shutdown()

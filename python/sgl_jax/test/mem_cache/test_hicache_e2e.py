@@ -109,8 +109,7 @@ class HiCacheE2EBase(unittest.TestCase):
         self.cache.hicache_controller = self.controller
         self.cache.hicache_enabled = True
         self.cache.write_through_threshold = write_through_threshold
-        for component in self.cache._components_tuple:
-            component._full_kv_pool_host = self.host_pool
+
 
     # ---- helpers ----
 
