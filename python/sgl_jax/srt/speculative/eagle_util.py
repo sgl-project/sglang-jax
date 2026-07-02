@@ -810,6 +810,18 @@ class EagleDraftInput:
         for f in device_fields:
             v = getattr(self, f, None)
             if v is not None and hasattr(v, "copy_to_host_async"):
+                sh = getattr(v, "sharding", None)
+                if sh is not None and not getattr(sh, "is_fully_replicated", True):
+                    # Non-overlap multi-host path: spec_decode_verify leaves
+                    # accept_length (and potentially others) as P("data")
+                    # device arrays. np.asarray on a cross-host array raises
+                    # "spans non-addressable devices". Gather to replicated
+                    # first; this path is SPMD across hosts so the collective
+                    # is safe.
+                    from jax.experimental.multihost_utils import process_allgather
+
+                    v = process_allgather(v, tiled=True)
+                    setattr(self, f, v)
                 jax.copy_to_host_async(v)
                 to_copy.append(f)
         for f in to_copy:
