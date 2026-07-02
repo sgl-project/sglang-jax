@@ -51,6 +51,16 @@ from sgl_jax.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPo
 from sgl_jax.srt.mem_cache.radix_cache import RadixKey
 from sgl_jax.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
+from sgl_jax.srt.multimodal.common.mm_plan import (
+    EmbedRound,
+    MultimodalEmbedPlan,
+    VisionEncodeInputs,
+)
+from sgl_jax.srt.multimodal.common.modality_enum import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputs,
+)
 from sgl_jax.srt.precision_tracer import (
     PrecisionTracerRequestMetadata,
     precision_tracer,
@@ -199,8 +209,8 @@ class Req:
         # Used for radix cache matching to differentiate different images/videos
         # If None, origin_input_ids is used for cache matching
         self.cache_input_ids: list[int] | None = None
-        # Multimodal inputs (e.g., mrope positions) from tokenizer
-        self.mm_inputs: dict | None = None
+        # Multimodal inputs (e.g., image items and mrope positions) from tokenizer.
+        self.mm_inputs: MultimodalInputs | dict | None = None
 
         # Each decode stage's output ids
         self.output_ids = []
@@ -974,6 +984,19 @@ class ScheduleBatch:
     @property
     def batch_is_full(self) -> bool:
         return all(info.batch_is_full for info in self.reqs_info)
+
+    def contains_mm_inputs(self) -> bool:
+        """Whether any request in this batch carries multimodal inputs.
+
+        Mirrors the per-req mm detection used by ``_merge_multimodal`` /
+        ``build_mm_embed_plan`` so pure-text batches skip all multimodal work.
+        """
+        return any(
+            getattr(req, "mm_inputs", None) is not None
+            for info in self.reqs_info
+            if info.reqs
+            for req in info.reqs
+        )
 
     def batch_size(self) -> int:
         """Get total number of requests across all DP ranks."""
@@ -2129,9 +2152,8 @@ class ScheduleBatch:
         is_decode = self.forward_mode.is_decode()
 
         has_mrope = any(
-            _extract_mm_value(getattr(req, "mm_inputs", None), "mrope_positions") is not None
-            or _extract_mm_value(getattr(req, "mm_inputs", None), "mrope_position_delta")
-            is not None
+            _extract_mm_value(req.mm_inputs, "mrope_positions") is not None
+            or _extract_mm_value(req.mm_inputs, "mrope_position_delta") is not None
             for info in self.reqs_info
             if info.reqs
             for req in info.reqs
@@ -2164,9 +2186,7 @@ class ScheduleBatch:
                 if mrope is not None:
                     for req, seq_len in zip(info.reqs, info.seq_lens):
                         base_pos = int(seq_len) - 1
-                        delta = _extract_mm_value(
-                            getattr(req, "mm_inputs", None), "mrope_position_delta"
-                        )
+                        delta = _extract_mm_value(req.mm_inputs, "mrope_position_delta")
                         if delta is not None:
                             base_pos += _as_int_scalar(delta)
                         mrope[:, offset + local] = base_pos
@@ -2193,9 +2213,7 @@ class ScheduleBatch:
 
                 # mrope_positions: 3-D positions, slice with fallback.
                 if mrope is not None:
-                    mm_positions = _extract_mm_value(
-                        getattr(req, "mm_inputs", None), "mrope_positions"
-                    )
+                    mm_positions = _extract_mm_value(req.mm_inputs, "mrope_positions")
                     if mm_positions is None:
                         # Text-only req in a mixed mrope batch: 1-D positions
                         # broadcast to 3 rows (T==H==W), matching the model's
@@ -2205,9 +2223,7 @@ class ScheduleBatch:
                     else:
                         mchunk = np.asarray(mm_positions)[:, start : start + ext_len]
                         if mchunk.size == 0:
-                            delta = _extract_mm_value(
-                                getattr(req, "mm_inputs", None), "mrope_position_delta"
-                            )
+                            delta = _extract_mm_value(req.mm_inputs, "mrope_position_delta")
                             base = np.arange(start, start + ext_len, dtype=np.int32)
                             if delta is not None:
                                 base = base + _as_int_scalar(delta)
@@ -3023,6 +3039,18 @@ class ScheduleBatch:
         mrope_positions = _mm["mrope_positions"]
         apply_for_deepstack = _mm["apply_for_deepstack"]
         deepstack_visual_embedding = _mm["deepstack_visual_embedding"]
+        # Build the vision encode/merge plan only for ordinary prefill. Other
+        # forward modes leave the plan unset, and the runner treats a non-None
+        # plan as the sole vision-forward signal.
+        if self.contains_mm_inputs() and self.forward_mode == ForwardMode.EXTEND:
+            mm_embed_plan = build_mm_embed_plan(
+                self.reqs_info,
+                self.dp_size,
+                self.model_config,
+                per_dp_token_padding,
+            )
+        else:
+            mm_embed_plan = None
 
         # Merge per-DP top_logprobs_nums / token_ids_logprobs with the same
         # offset_bs += per_dp_bs_padding padding scheme used in _merge_batch_metadata.
@@ -3127,6 +3155,7 @@ class ScheduleBatch:
             per_dp_bs_size=per_dp_bs_padding,
             launch_done=self.launch_done,
             input_embedding=input_embedding,
+            mm_embed_plan=mm_embed_plan,
             apply_for_deepstack=apply_for_deepstack,
             deepstack_visual_embedding=deepstack_visual_embedding,
             recurrent_indices=recurrent_indices_cpu,
@@ -3329,6 +3358,180 @@ def _extract_mm_value(mm_inputs: Any, key: str):
     if isinstance(mm_inputs, dict):
         return mm_inputs.get(key)
     return getattr(mm_inputs, key, None)
+
+
+def _as_mm_item(item: Any) -> MultimodalDataItem:
+    if isinstance(item, MultimodalDataItem):
+        return item
+    if isinstance(item, dict):
+        return MultimodalDataItem.from_dict(item)
+    raise TypeError(f"mm_items must contain MultimodalDataItem, got {type(item).__name__}.")
+
+
+def _build_merge_idx(
+    rank_entries: list,
+    dp_size: int,
+    per_dp_token: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build ``src_idx``/``mask`` for one image round.
+
+    Token layout mirrors ``_merge_input_and_positions``: rank ``r`` owns the
+    contiguous slot ``[r * per_dp_token : (r + 1) * per_dp_token]``; within that
+    slot, requests are concatenated in prefill order. ``item.offsets`` are
+    request-local inclusive placeholder spans, and ``req_base`` translates them
+    into the rank-local packed slot.
+
+    ``src_idx`` values are rank-local feature rows because the merge shard only
+    sees its own rank's encoded features. ``mask`` marks the global token
+    positions that should be replaced by vision rows.
+    """
+    total_token = dp_size * per_dp_token
+    src_idx = np.zeros(total_token, dtype=np.int32)
+    mask = np.zeros(total_token, dtype=np.bool_)
+
+    for dp_rank in range(dp_size):
+        entry = rank_entries[dp_rank] if dp_rank < len(rank_entries) else None
+        if entry is None:
+            continue  # dummy lane: contributes nothing (mask stays False)
+        item, req_base = entry
+        rank_base = dp_rank * per_dp_token
+        feat_row = 0
+        for start, end in item.offsets or []:
+            for o in range(int(start), int(end) + 1):
+                tok = rank_base + req_base + o
+                if tok >= rank_base + per_dp_token:
+                    raise ValueError(
+                        "IMAGE placeholder offset is outside its packed rank slot: "
+                        f"dp_rank={dp_rank}, req_base={req_base}, offset={o}, "
+                        f"per_dp_token={per_dp_token}."
+                    )
+                # rank-local feature row (merge gathers within this shard's own
+                # features); a plain running counter, NOT base_feat + feat_row.
+                src_idx[tok] = feat_row
+                mask[tok] = True
+                feat_row += 1
+    return src_idx, mask
+
+
+def build_mm_embed_plan(
+    reqs_info: list[ScheduleReqsInfo] | None,
+    dp_size: int,
+    model_config: Any,
+    per_dp_token: int,
+) -> MultimodalEmbedPlan | None:
+    """Build the owning-rank DP multimodal embed plan (host-side, numpy).
+
+    Round-loop: process images one-per-rank-per-round. ``n_rounds`` = max over
+    ranks of (#images that rank owns). Ranks with fewer images use a dummy lane
+    that contributes nothing (grid/pixels zero, mask all False). Each round runs
+    ONE single-image ViT per rank.
+
+    Returns ``None`` for batches with no image items.
+
+    # TODO: bucket the vision patch and per-arch metadata axes; this
+    #   uses the per-forward cross-rank max for stable shapes within one call.
+    """
+    # Keep each image item bound to its request's packed-slot offset. The merge
+    # builder translates item-local offsets with that req_base, so request
+    # boundaries must be preserved here.
+    items_by_rank: list[list[tuple[Any, int]]] = [[] for _ in range(dp_size)]
+    for dp_rank in range(dp_size):
+        if not reqs_info or dp_rank >= len(reqs_info):
+            continue
+        info = reqs_info[dp_rank]
+        if not info.reqs:
+            continue
+        req_base = 0  # running slot offset of the current req within this rank
+        for req in info.reqs:
+            mm_items = _extract_mm_value(req.mm_inputs, "mm_items") or []
+            for raw_item in mm_items:
+                item = _as_mm_item(raw_item)
+                if item.is_image():
+                    items_by_rank[dp_rank].append((item, req_base))
+            # Advance by how many tokens this req contributes to the slot (the
+            # extend window, == len(fill_ids) - len(prefix_indices)).
+            req_base += int(getattr(req, "extend_input_len", 0) or 0)
+
+    n_rounds = max((len(items) for items in items_by_rank), default=0)
+    if n_rounds == 0:
+        return None
+
+    # Resolve the per-arch metadata builder only after confirming this batch has
+    # image items, so non-image multimodal batches do not require a vision builder.
+    from sgl_jax.srt.multimodal.common.vision_metadata import (
+        resolve_vision_metadata_builder,
+    )
+
+    builder = resolve_vision_metadata_builder(model_config)
+
+    rounds: list[EmbedRound] = []
+    for k in range(n_rounds):
+        # The round-k entry per rank: an ``(item, req_base)`` tuple, or
+        # None => dummy lane for ranks with < k+1 imgs.
+        rank_entries_k = [
+            items_by_rank[r][k] if k < len(items_by_rank[r]) else None for r in range(dp_size)
+        ]
+        # Bare items (without req_base) for grid/feature/meta sizing, which is
+        # per-image and does not need the slot translation.
+        rank_items_k = [None if e is None else e[0] for e in rank_entries_k]
+
+        # Per-rank grid for the per-arch metadata builder only; patch bucket
+        # sizing comes from feature rows.
+        patch_rows = [0] * dp_size
+        features = [None] * dp_size
+        metas = [None] * dp_size  # per-rank native VisionMetadata (None => dummy)
+        for r, item in enumerate(rank_items_k):
+            if item is None:
+                continue
+            feat = item.feature
+            if feat is None:
+                raise ValueError(f"IMAGE item in round {k}, dp_rank {r} is missing feature.")
+            feat = np.asarray(feat)
+            if feat.ndim != 2 or feat.shape[0] <= 0:
+                raise ValueError(
+                    "IMAGE item feature must be a non-empty 2D patch array, "
+                    f"got shape={feat.shape} in round {k}, dp_rank {r}."
+                )
+            features[r] = feat
+            patch_rows[r] = int(feat.shape[0])
+            # The builder constructs native-size per-image metadata and keeps its
+            # concrete fields opaque to the scheduler.
+            metas[r] = builder.get_metadata(item)
+
+        patch_k = max(patch_rows) if any(patch_rows) else 0
+        present = next(f for f in features if f is not None)
+        patch_dim = int(present.shape[1])
+
+        # pixels_k [dp, patch_k, dim]: pad+stack each rank's feature (pure numpy).
+        pixels_k = np.zeros((dp_size, patch_k, patch_dim), dtype=np.float32)
+        valid_k = np.zeros((dp_size,), dtype=np.int32)
+        for r, feat in enumerate(features):
+            if feat is None:
+                continue
+            rows = int(feat.shape[0])
+            pixels_k[r, :rows, :] = feat
+            valid_k[r] = rows
+
+        # The builder owns role-specific cross-rank metadata padding; the
+        # scheduler only supplies native metas and the round's patch bucket.
+        meta_k = builder.stack_metadata(metas, patch_k)
+
+        src_idx_k, mask_k = _build_merge_idx(rank_entries_k, dp_size, per_dp_token)
+
+        encode_inputs = VisionEncodeInputs(
+            pixels=pixels_k,
+            valid=valid_k,
+            meta=meta_k,
+        )
+        rounds.append(
+            EmbedRound(
+                encode_inputs=encode_inputs,
+                src_idx=src_idx_k,
+                mask=mask_k,
+            )
+        )
+
+    return MultimodalEmbedPlan(rounds_by_modality={Modality.IMAGE: rounds})
 
 
 def _as_int_scalar(value: Any, default: int = 0) -> int:
@@ -3573,6 +3776,9 @@ class ModelWorkerBatch:
     tree_cache: BasePrefixCache = None
 
     input_embedding: np.ndarray | None = None
+    # In-model VLM owning-rank DP embed plan (host-side). Array leaves get
+    # device_put in ForwardBatch.init_new; never a backbone-JIT pytree child.
+    mm_embed_plan: MultimodalEmbedPlan | None = None
     apply_for_deepstack: bool = False
     deepstack_visual_embedding: np.ndarray | None = None
 

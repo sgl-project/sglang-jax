@@ -24,6 +24,7 @@ from sgl_jax.srt.layers.routed_experts_capturer import (
 )
 from sgl_jax.srt.layers.sampler import Sampler, compute_logprobs
 from sgl_jax.srt.lora.context_manager import LoraBatchContext
+from sgl_jax.srt.managers.mm_utils import general_mm_embed_routine
 from sgl_jax.srt.managers.schedule_batch import (
     GLOBAL_SERVER_ARGS_KEYS,
     global_server_args_dict,
@@ -556,6 +557,25 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         self.forward_pass_id += 1
         precision_tracer.start_batch_trace(forward_batch.bid)
         precision_tracer.set_current_forward_pass_id(self.forward_pass_id)
+        # In-model VLM path (active): run the host embed routine (per-round JIT
+        # vision-encode -> JIT merge; aux precomputed host-side by the scheduler
+        # and carried in the plan), storing the merged embedding on
+        # forward_batch.input_embedding before the backbone JIT. `language_model`
+        # is the Qwen2Model backbone (`self.model.model`) -- it provides
+        # `get_input_embeddings` (embed module) to seed `running`;
+        # `multimodal_model` is the VL wrapper (`self.model`) -- it provides
+        # `get_image_feature`. The forward_mode gate lives ONLY in the scheduler
+        # (plan built iff forward_mode == EXTEND), so a non-None plan already means
+        # "this batch runs vision" -- here we just test `mm_embed_plan is not None`
+        # (decode / target_verify / mixed / draft_extend all carry a None plan).
+        if forward_batch.mm_embed_plan is not None:
+            general_mm_embed_routine(
+                input_ids=forward_batch.input_ids,
+                forward_batch=forward_batch,
+                language_model=self.model.model,
+                multimodal_model=self.model,
+                mm_embed_plan=forward_batch.mm_embed_plan,
+            )
         with jax.profiler.TraceAnnotation("_forward_raw"):
             ret = self._forward_raw(forward_batch, logits_metadata)
         return ret

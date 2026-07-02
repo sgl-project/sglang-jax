@@ -38,6 +38,15 @@ def apply_multimodal_model_defaults(server_args, model_config) -> None:
     if not server_args.disable_radix_cache:
         logger.info("Multimodal model detected, disabling radix cache")
         server_args.disable_radix_cache = True
+    if not server_args.disable_overlap_schedule:
+        logger.info("Multimodal model detected, disabling overlap schedule")
+        server_args.disable_overlap_schedule = True
+    if server_args.chunked_prefill_size is None or server_args.chunked_prefill_size > 0:
+        logger.info("Multimodal model detected, disabling chunked prefill")
+        server_args.chunked_prefill_size = -1
+    if server_args.enable_mixed_chunk:
+        logger.info("Multimodal model detected, disabling mixed chunk")
+        server_args.enable_mixed_chunk = False
     if server_args.limit_mm_data_per_request is None:
         server_args.limit_mm_data_per_request = {"image": 16}
 

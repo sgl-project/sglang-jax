@@ -660,11 +660,27 @@ def get_rope(
             raise ValueError("Unknown RoPE scaling type")
 
         if scaling_type == "default":
-            # HF transformers uses rope_type="default" to mean "no scaling",
-            # equivalent to rope_scaling=None.  Fall back to plain RotaryEmbedding.
-            rotary_emb = RotaryEmbedding(
-                head_size, rotary_dim, max_position, base, is_neox_style, dtype
-            )
+            if "mrope_section" in rope_scaling:
+                # Qwen2.5-VL / Omni: HF config is rope_type="default" plus an
+                # mrope_section -> multimodal sectioned RoPE. Aligns upstream
+                # get_rope (the model/attention stay mrope-agnostic; the 3D
+                # positions come from forward_batch.mrope_positions).
+                rotary_emb = MRotaryEmbedding(
+                    head_size,
+                    rotary_dim,
+                    max_position,
+                    base,
+                    is_neox_style,
+                    dtype,
+                    mrope_section=rope_scaling["mrope_section"],
+                    mrope_interleaved=rope_scaling.get("mrope_interleaved", False),
+                )
+            else:
+                # HF transformers uses rope_type="default" to mean "no scaling",
+                # equivalent to rope_scaling=None.  Fall back to plain RotaryEmbedding.
+                rotary_emb = RotaryEmbedding(
+                    head_size, rotary_dim, max_position, base, is_neox_style, dtype
+                )
         elif scaling_type == "proportional":
             rotary_emb = ProportionalRotaryEmbedding(
                 head_size,
