@@ -694,59 +694,54 @@ class EagleDraftInput:
         from sgl_jax.srt.layers.logits_processor import LogitsMetadata
         from sgl_jax.srt.utils.jax_utils import device_array
 
-        if legacy_non_overlap or model_worker_batch.return_logprob:
-            logits_metadata = LogitsMetadata.from_model_worker_batch(
-                model_worker_batch, draft_model_runner.mesh
-            )
-        else:
-            sharding = NamedSharding(draft_model_runner.mesh, P("data"))
+        sharding = NamedSharding(draft_model_runner.mesh, P("data"))
 
-            def _to_device(name, value):
-                if value is None:
-                    return None
-                if isinstance(value, jax.Array):
-                    current_sharding = value.sharding
-                    if current_sharding == sharding:
-                        return value
-                    return jax.device_put(value, sharding)
-                return device_array(value, sharding=sharding)
+        def _to_device(name, value):
+            if value is None:
+                return None
+            if isinstance(value, jax.Array):
+                current_sharding = value.sharding
+                if current_sharding == sharding:
+                    return value
+                return jax.device_put(value, sharding)
+            return device_array(value, sharding=sharding)
 
-            extend_seq_lens_for_logits = getattr(
-                model_worker_batch.spec_info_padded,
-                "extend_seq_lens_for_draft_extend",
-                None,
-            )
-            if extend_seq_lens_for_logits is None:
-                extend_seq_lens_for_logits = model_worker_batch.extend_seq_lens
-            logits_indices_for_logits = getattr(
-                model_worker_batch.spec_info_padded,
-                "logits_indices_for_draft_extend",
-                None,
-            )
-            if logits_indices_for_logits is None:
-                logits_indices_for_logits = model_worker_batch.logits_indices
+        extend_seq_lens_for_logits = getattr(
+            model_worker_batch.spec_info_padded,
+            "extend_seq_lens_for_draft_extend",
+            None,
+        )
+        if extend_seq_lens_for_logits is None:
+            extend_seq_lens_for_logits = model_worker_batch.extend_seq_lens
+        logits_indices_for_logits = getattr(
+            model_worker_batch.spec_info_padded,
+            "logits_indices_for_draft_extend",
+            None,
+        )
+        if logits_indices_for_logits is None:
+            logits_indices_for_logits = model_worker_batch.logits_indices
 
-            logits_metadata = LogitsMetadata(
-                forward_mode=model_worker_batch.forward_mode,
-                capture_hidden_mode=model_worker_batch.capture_hidden_mode,
-                extend_return_logprob=False,
-                extend_return_top_logprob=False,
-                extend_token_ids_logprob=False,
-                extend_seq_lens=_to_device("extend_seq_lens", extend_seq_lens_for_logits),
-                logits_indices=_to_device("logits_indices", logits_indices_for_logits),
-                accept_lens=_to_device(
-                    "accept_lens", model_worker_batch.spec_info_padded.accept_length
-                ),
-                extend_seq_lens_cpu=None,
-                extend_logprob_start_lens_cpu=None,
-                extend_logprob_pruned_lens_cpu=None,
-                top_logprobs_nums=model_worker_batch.top_logprobs_nums,
-                token_ids_logprobs=model_worker_batch.token_ids_logprobs,
-                extend_input_logprob_token_ids_device=_to_device(
-                    "extend_input_logprob_token_ids",
-                    model_worker_batch.extend_input_logprob_token_ids,
-                ),
-            )
+        logits_metadata = LogitsMetadata(
+            forward_mode=model_worker_batch.forward_mode,
+            capture_hidden_mode=model_worker_batch.capture_hidden_mode,
+            extend_return_logprob=False,
+            extend_return_top_logprob=False,
+            extend_token_ids_logprob=False,
+            extend_seq_lens=_to_device("extend_seq_lens", extend_seq_lens_for_logits),
+            logits_indices=_to_device("logits_indices", logits_indices_for_logits),
+            accept_lens=_to_device(
+                "accept_lens", model_worker_batch.spec_info_padded.accept_length
+            ),
+            extend_seq_lens_cpu=None,
+            extend_logprob_start_lens_cpu=None,
+            extend_logprob_pruned_lens_cpu=None,
+            top_logprobs_nums=model_worker_batch.top_logprobs_nums,
+            token_ids_logprobs=model_worker_batch.token_ids_logprobs,
+            extend_input_logprob_token_ids_device=_to_device(
+                "extend_input_logprob_token_ids",
+                model_worker_batch.extend_input_logprob_token_ids,
+            ),
+        )
         return model_worker_batch, logits_metadata
 
     def prepare_for_decode(self, schedule_batch: ScheduleBatch):
