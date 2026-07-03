@@ -364,13 +364,22 @@ class RaidenTransferWrapper:
         self,
         kv_caches: list[Any],
         *,
-        host_blocks_to_allocate: int,
+        max_blocks: int,
+        num_slots: int,
+        timeout_s: float = 120.0,
     ) -> Any:
         """Idempotent. Construct the KVCacheManager over ``kv_caches``.
 
         ``kv_caches`` is the device KV pool's per-layer tensor list; raiden
-        references them for both send (P) and receive (D). ``host_blocks_to_
-        allocate`` sizes raiden's internal host staging pool.
+        references them for both send (P) and receive (D).
+
+        ``max_blocks`` is the max device pages a single request can pull (one
+        staging slot must fit it) and ``num_slots`` is the number of concurrent
+        transfer slots. These MUST be passed (not ``host_blocks_to_allocate``):
+        the legacy ``host_blocks_to_allocate`` ctor overload leaves
+        ``local_control_port`` at -1 so raiden skips slot-pool setup entirely
+        (``max_blocks_=0``), and every ``start_read`` then fails the
+        ``local_block_ids.size() > max_blocks_`` guard immediately.
         """
 
         if self._started:
@@ -385,7 +394,9 @@ class RaidenTransferWrapper:
             self._engine = KVCacheManager(
                 kv_caches=list(kv_caches),
                 local_control_port=self._control_port,
-                host_blocks_to_allocate=int(host_blocks_to_allocate),
+                max_blocks=int(max_blocks),
+                num_slots=int(num_slots),
+                timeout_s=float(timeout_s),
                 parallelism=self._parallelism,
                 unsafe_skip_buffer_lock=True,
             )

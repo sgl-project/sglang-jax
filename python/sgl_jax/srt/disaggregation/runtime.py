@@ -152,20 +152,31 @@ def install_disaggregation_wiring(scheduler: Scheduler, server_args: ServerArgs)
             server_args.disaggregation_raiden_control_port,
             parallelism=server_args.disaggregation_channel_number,
         )
-        # ``host_blocks_to_allocate`` sizes raiden's internal host staging pool.
-        # One block == one device page; bound it by the device KV budget so a
-        # single request's pages always fit. NEEDS-TPU-VERIFICATION: confirm the
-        # sizing heuristic against raiden's staging semantics on real hardware.
-        num_device_pages = int(kv_pool.kv_buffer[0].shape[0])
+        # raiden staging-slot sizing. ``max_blocks`` must fit the largest
+        # per-request page count (a single slot holds one request's pages);
+        # ``num_slots`` bounds concurrent in-flight receives on decode. Passing
+        # ``host_blocks_to_allocate`` instead routes to raiden's legacy ctor
+        # overload that leaves the slot pool unconfigured (max_blocks_=0) so
+        # every start_read fails the size guard immediately.
+        page_size = max(1, int(server_args.page_size))
+        max_blocks = (int(server_args.max_seq_len) + page_size - 1) // page_size
+        num_slots = max(
+            16,
+            int(server_args.disaggregation_d2h_pool_size),
+            int(server_args.disaggregation_max_inflight_transfers),
+        )
         raiden_wrapper.start(
             kv_caches=list(kv_pool.kv_buffer),
-            host_blocks_to_allocate=num_device_pages,
+            max_blocks=max_blocks,
+            num_slots=num_slots,
+            timeout_s=float(server_args.disaggregation_pull_timeout_seconds),
         )
         logger.info(
-            "raiden data plane enabled: control_port=%s host_blocks=%d "
-            "layer_num=%d",
+            "raiden data plane enabled: control_port=%s max_blocks=%d "
+            "num_slots=%d layer_num=%d",
             server_args.disaggregation_raiden_control_port,
-            num_device_pages,
+            max_blocks,
+            num_slots,
             kv_pool.layer_num,
         )
 
