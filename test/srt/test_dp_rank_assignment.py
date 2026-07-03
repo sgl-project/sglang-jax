@@ -71,10 +71,27 @@ class _DpAssignmentHarness:
         self.cache_aware_calls.append((req.rid, list(extra_counts), list(extra_token_counts)))
         return self.select_min_running_dp(extra_counts, extra_token_counts)
 
+    def select_shape_aware_dp(
+        self,
+        item_input: int,
+        item_output: int,
+        extra_counts: list[int],
+        extra_token_counts: list[int],
+        extra_input_counts: list[int],
+        extra_output_counts: list[int],
+    ) -> int | None:
+        # These characterization tests exercise the dispatcher, not the shape-aware
+        # math (covered by test_dp_schedule_shape_aware.py); reuse min-running here.
+        return self.select_min_running_dp(extra_counts, extra_token_counts)
+
     @staticmethod
     def estimate_req_tokens(req: TokenizedGenerateReqInput) -> int:
         max_new_tokens = req.sampling_params.get("max_new_tokens", 0)
         return len(req.input_ids or []) + max_new_tokens
+
+    @staticmethod
+    def estimate_req_io_tokens(req: TokenizedGenerateReqInput) -> tuple[int, int]:
+        return len(req.input_ids or []), req.sampling_params.get("max_new_tokens", 0)
 
     def _eligible(self, extra_counts: list[int]) -> list[int]:
         return [
@@ -103,7 +120,9 @@ def _assign(
         select_round_robin_dp=harness.select_round_robin_dp,
         select_cache_aware_dp=harness.select_cache_aware_dp,
         select_min_running_dp=harness.select_min_running_dp,
+        select_shape_aware_dp=harness.select_shape_aware_dp,
         estimate_req_tokens=harness.estimate_req_tokens,
+        estimate_req_io_tokens=harness.estimate_req_io_tokens,
     )
 
 
