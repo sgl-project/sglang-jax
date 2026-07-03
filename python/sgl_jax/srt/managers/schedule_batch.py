@@ -2638,6 +2638,23 @@ class ScheduleBatch:
             if target_per_rank_ocl > 0
             else np.empty(0, dtype=np.int32)
         )
+        if self.return_logprob:
+            top_logprobs_nums = [0] * total_bs
+            token_ids_logprobs: list[list[int] | None] = [None] * total_bs
+            offset_bs = 0
+            for dp_rank in range(self.dp_size):
+                info = self.reqs_info[dp_rank]
+                if info.seq_lens is not None and len(info.seq_lens) > 0:
+                    dp_bs = len(info.seq_lens)
+                    if info.top_logprobs_nums is not None:
+                        top_logprobs_nums[offset_bs : offset_bs + dp_bs] = info.top_logprobs_nums
+                    if info.token_ids_logprobs is not None:
+                        token_ids_logprobs[offset_bs : offset_bs + dp_bs] = info.token_ids_logprobs
+                offset_bs += per_dp_bs
+        else:
+            top_logprobs_nums = None
+            token_ids_logprobs = None
+
         model_worker_batch = ModelWorkerBatch(
             bid=acc_global_bid(),
             forward_mode=self.forward_mode,
@@ -2648,8 +2665,8 @@ class ScheduleBatch:
             out_cache_loc=out_cache_loc,
             return_logprob=self.return_logprob,
             return_output_logprob_only=self.return_output_logprob_only,
-            top_logprobs_nums=None,
-            token_ids_logprobs=None,
+            top_logprobs_nums=top_logprobs_nums,
+            token_ids_logprobs=token_ids_logprobs,
             sampling_info=sampling_info,
             positions=np.empty(0, dtype=np.int32),
             cache_loc=np.empty(0, dtype=np.int32),
