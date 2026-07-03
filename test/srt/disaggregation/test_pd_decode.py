@@ -587,6 +587,7 @@ class _Req:
         self.bootstrap_room = room
         self.disagg_transfer_id = None
         self.origin_input_ids = [1, 2, 3, 4]
+        self.dp_rank = 0
 
 
 class _ServerArgs:
@@ -612,7 +613,7 @@ class _FakeCache:
         self._results = list(results)
         self.calls = 0
 
-    def pick_for_room(self, room):
+    def pick_for_room(self, room, dp_rank=None):
         self.calls += 1
         return self._results.pop(0) if self._results else None
 

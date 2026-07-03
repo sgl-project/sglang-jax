@@ -199,6 +199,7 @@ class Scheduler(
         self.disagg_bootstrap_server = None
         self.disagg_heartbeat = None
         self.disagg_bootstrap_key = None
+        self.disagg_bootstrap_keys = None
         self.disagg_shutdown = None
         self.disagg_use_d2h_staging = False
         self.disagg_prefill_queue = None

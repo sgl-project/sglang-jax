@@ -202,14 +202,23 @@ class _Registry:
             self._evict_stale_locked()
             return list(self.prefills.values())
 
-    def pick_for_room(self, bootstrap_room: int) -> PrefillInfo | None:
+    def pick_for_room(
+        self, bootstrap_room: int, dp_rank: int | None = None
+    ) -> PrefillInfo | None:
         with self.lock:
             self._evict_stale_locked()
             if not self.prefills:
                 return None
-            keys = sorted(self.prefills.keys())
+            candidates = {
+                k: v
+                for k, v in self.prefills.items()
+                if dp_rank is None or v.system_dp_rank == dp_rank
+            }
+            if not candidates:
+                return None
+            keys = sorted(candidates.keys())
             chosen = keys[bootstrap_room % len(keys)]
-            return self.prefills[chosen]
+            return candidates[chosen]
 
 
 def build_app(
@@ -278,8 +287,10 @@ def build_app(
         return {"prefills": [p.to_dict() for p in registry.list_all()]}
 
     @app.get("/get_prefill_info")
-    def get_prefill_info(bootstrap_room: int) -> dict[str, object]:
-        info = registry.pick_for_room(bootstrap_room)
+    def get_prefill_info(
+        bootstrap_room: int, dp_rank: int | None = None
+    ) -> dict[str, object]:
+        info = registry.pick_for_room(bootstrap_room, dp_rank=dp_rank)
         if info is None:
             raise HTTPException(
                 status_code=503,
@@ -517,10 +528,15 @@ class BootstrapClient:
         r.raise_for_status()
         return r.json()["prefills"]
 
-    def get_prefill_info(self, bootstrap_room: int) -> dict[str, object]:
+    def get_prefill_info(
+        self, bootstrap_room: int, dp_rank: int | None = None
+    ) -> dict[str, object]:
+        params: dict[str, object] = {"bootstrap_room": bootstrap_room}
+        if dp_rank is not None:
+            params["dp_rank"] = dp_rank
         r = self._client.get(
             f"{self._base_url}/get_prefill_info",
-            params={"bootstrap_room": bootstrap_room},
+            params=params,
             timeout=self._timeout_s,
             headers=self._headers(),
         )
@@ -568,13 +584,27 @@ class PrefillInfoCache:
         self._sorted_keys = sorted(by_key)
         self._last_refresh = self._clock()
 
-    def _pick_locked(self, bootstrap_room: int) -> dict[str, object] | None:
+    def _pick_locked(
+        self, bootstrap_room: int, dp_rank: int | None = None
+    ) -> dict[str, object] | None:
         if not self._sorted_keys:
             return None
-        chosen = self._sorted_keys[bootstrap_room % len(self._sorted_keys)]
+        if dp_rank is not None:
+            candidates = [
+                k
+                for k in self._sorted_keys
+                if int(self._by_key[k].get("system_dp_rank", 0)) == dp_rank
+            ]
+            if not candidates:
+                return None
+            chosen = candidates[bootstrap_room % len(candidates)]
+        else:
+            chosen = self._sorted_keys[bootstrap_room % len(self._sorted_keys)]
         return self._by_key[chosen]
 
-    def pick_for_room(self, bootstrap_room: int) -> dict[str, object] | None:
+    def pick_for_room(
+        self, bootstrap_room: int, dp_rank: int | None = None
+    ) -> dict[str, object] | None:
         """Return prefill info for ``bootstrap_room``, or ``None`` if no
         prefill is registered yet (caller should defer + retry).
 
@@ -610,7 +640,7 @@ class PrefillInfoCache:
                             len(self._sorted_keys),
                             exc,
                         )
-            info = self._pick_locked(bootstrap_room)
+            info = self._pick_locked(bootstrap_room, dp_rank=dp_rank)
         if info is None:
             return None
         _reject_if_below_protocol_floor(info)
@@ -626,11 +656,11 @@ class HeartbeatDaemon:
     def __init__(
         self,
         client: BootstrapClient,
-        bootstrap_key: str,
+        bootstrap_keys: list[str],
         interval_s: float = HEARTBEAT_INTERVAL_SECONDS,
     ) -> None:
         self._client = client
-        self._bootstrap_key = bootstrap_key
+        self._bootstrap_keys = bootstrap_keys
         self._interval_s = interval_s
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -642,7 +672,7 @@ class HeartbeatDaemon:
         self._stop_event.clear()
         self._thread = threading.Thread(
             target=self._loop,
-            name=f"BootstrapHeartbeat-{self._bootstrap_key}",
+            name=f"BootstrapHeartbeat-{self._bootstrap_keys[0]}-...",
             daemon=True,
         )
         self._thread.start()
@@ -659,12 +689,15 @@ class HeartbeatDaemon:
 
     def _loop(self) -> None:
         while not self._stop_event.is_set():
-            try:
-                self._client.heartbeat(self._bootstrap_key)
-            except Exception:
-                logger.warning(
-                    "bootstrap heartbeat for %s failed; will retry",
-                    self._bootstrap_key,
-                    exc_info=True,
-                )
+            for key in self._bootstrap_keys:
+                if self._stop_event.is_set():
+                    break
+                try:
+                    self._client.heartbeat(key)
+                except Exception:
+                    logger.warning(
+                        "bootstrap heartbeat for %s failed; will retry",
+                        key,
+                        exc_info=True,
+                    )
             self._stop_event.wait(self._interval_s)

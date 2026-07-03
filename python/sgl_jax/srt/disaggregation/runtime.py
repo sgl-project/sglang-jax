@@ -21,11 +21,6 @@ def install_disaggregation_wiring(scheduler: Scheduler, server_args: ServerArgs)
     mode = server_args.disaggregation_mode
     if mode == "null":
         return
-    if server_args.dp_size > 1:
-        raise RuntimeError(
-            f"PD disaggregation does not yet support dp_size>1 "
-            f"(got dp_size={server_args.dp_size})."
-        )
     if server_args.disaggregation_bootstrap_url is None:
         raise RuntimeError("disaggregation_mode != null requires bootstrap_url")
 
@@ -153,26 +148,33 @@ def install_disaggregation_wiring(scheduler: Scheduler, server_args: ServerArgs)
         import jax
 
         scheduler.disagg_prefill_queue = PrefillBootstrapQueue()
-        bootstrap_key = f"{local_host}:{transfer_port}"
         prefill_kv_pool = scheduler.token_to_kv_pool_allocator.get_kvcache()
-        scheduler.disagg_bootstrap_client.register_prefill(
-            bootstrap_key=bootstrap_key,
-            host=local_host,
-            transfer_port=transfer_port,
-            side_channel_port=side_channel_port,
-            tp_rank=server_args.node_rank,
-            tp_size=server_args.tp_size,
-            system_dp_rank=0,
-            jax_process_index=jax.process_index(),
-            jax_process_count=jax.process_count(),
-            page_size=server_args.page_size,
-            kv_dtype=resolve_kv_dtype_name(prefill_kv_pool.dtype),
-        )
+        kv_dtype_name = resolve_kv_dtype_name(prefill_kv_pool.dtype)
+
+        bootstrap_keys = []
+        for system_dp_rank in range(server_args.dp_size):
+            bootstrap_key = f"{local_host}:{transfer_port}:dp_{system_dp_rank}"
+            bootstrap_keys.append(bootstrap_key)
+            scheduler.disagg_bootstrap_client.register_prefill(
+                bootstrap_key=bootstrap_key,
+                host=local_host,
+                transfer_port=transfer_port,
+                side_channel_port=side_channel_port,
+                tp_rank=server_args.node_rank,
+                tp_size=server_args.tp_size,
+                system_dp_rank=system_dp_rank,
+                jax_process_index=jax.process_index(),
+                jax_process_count=jax.process_count(),
+                page_size=server_args.page_size,
+                kv_dtype=kv_dtype_name,
+            )
+
         scheduler.disagg_heartbeat = HeartbeatDaemon(
-            scheduler.disagg_bootstrap_client, bootstrap_key
+            scheduler.disagg_bootstrap_client, bootstrap_keys
         )
         scheduler.disagg_heartbeat.start()
-        scheduler.disagg_bootstrap_key = bootstrap_key
+        scheduler.disagg_bootstrap_keys = bootstrap_keys
+        scheduler.disagg_bootstrap_key = bootstrap_keys[0]
     else:
         scheduler.disagg_prefill_info_cache = PrefillInfoCache(scheduler.disagg_bootstrap_client)
         scheduler.disagg_prealloc_queue = DecodePreallocQueue()
@@ -214,14 +216,18 @@ def _make_disagg_shutdown(scheduler: Scheduler, mode: str):
             return
         state["done"] = True
         if mode == "prefill":
-            try:
-                key = scheduler.disagg_bootstrap_key
-                scheduler.disagg_bootstrap_client.unregister_prefill(key)
-            except Exception:
-                logger.warning(
-                    "PD shutdown: unregister_prefill failed",
-                    exc_info=True,
-                )
+            for key in (
+                getattr(scheduler, "disagg_bootstrap_keys", None)
+                or [scheduler.disagg_bootstrap_key]
+            ):
+                try:
+                    scheduler.disagg_bootstrap_client.unregister_prefill(key)
+                except Exception:
+                    logger.warning(
+                        "PD shutdown: unregister_prefill failed for %s",
+                        key,
+                        exc_info=True,
+                    )
             with suppress(Exception):
                 scheduler.disagg_heartbeat.stop()
         try:

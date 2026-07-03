@@ -246,7 +246,7 @@ def test_heartbeat_daemon_keeps_registration_alive(server_and_client):
     )
     # 50ms interval — far shorter than the 30s TTL but enough to
     # demonstrate continuous beating without slowing the test.
-    daemon = HeartbeatDaemon(client, "hb-key", interval_s=0.05)
+    daemon = HeartbeatDaemon(client, ["hb-key"], interval_s=0.05)
     daemon.start()
     try:
         time.sleep(0.25)  # ~5 beats
@@ -272,7 +272,7 @@ def test_heartbeat_daemon_survives_transient_server_errors():
             raise RuntimeError("transient")
 
     failing_client.heartbeat.side_effect = _raise_then_succeed
-    daemon = HeartbeatDaemon(failing_client, "k", interval_s=0.01)
+    daemon = HeartbeatDaemon(failing_client, ["k"], interval_s=0.01)
     daemon.start()
     try:
         time.sleep(0.1)
@@ -743,3 +743,211 @@ def test_decode_mode_explicit_values_win_over_auto_derive():
     assert tokenized.bootstrap_host == "10.0.0.99"
     assert tokenized.bootstrap_port == 9999
     assert tokenized.bootstrap_room == 42
+
+
+# ==================================================================
+# DP-rank-aware peer selection (bootstrap.py dp_rank parameter)
+# ==================================================================
+
+
+def test_registry_pick_for_room_dp_rank_filters():
+    """pick_for_room with dp_rank returns only matching entries."""
+    clock = _ManualClock()
+    registry = _Registry(ttl_seconds=30.0, clock=clock)
+    for i in range(3):
+        registry.register(
+            PrefillInfo(
+                bootstrap_key=f"p{i}",
+                host="10.0.0.1",
+                transfer_port=30001 + i,
+                side_channel_port=9600 + i,
+                system_dp_rank=0,
+            )
+        )
+    for i in range(2):
+        registry.register(
+            PrefillInfo(
+                bootstrap_key=f"p_dp1_{i}",
+                host="10.0.0.1",
+                transfer_port=30101 + i,
+                side_channel_port=9700 + i,
+                system_dp_rank=1,
+            )
+        )
+    # dp_rank=None: all 5 entries are visible
+    info = registry.pick_for_room(42)
+    assert info is not None
+    # dp_rank=0: only the first 3
+    info0 = registry.pick_for_room(42, dp_rank=0)
+    assert info0 is not None
+    assert info0.system_dp_rank == 0
+    assert info0.bootstrap_key in {"p0", "p1", "p2"}
+    # dp_rank=1: only the last 2
+    info1 = registry.pick_for_room(42, dp_rank=1)
+    assert info1 is not None
+    assert info1.system_dp_rank == 1
+    assert info1.bootstrap_key in {"p_dp1_0", "p_dp1_1"}
+    # dp_rank=9: no match
+    assert registry.pick_for_room(0, dp_rank=9) is None
+
+
+def test_registry_pick_for_room_dp_rank_modulo():
+    """Modulo selection distributes over matching dp_rank subset."""
+    clock = _ManualClock()
+    registry = _Registry(ttl_seconds=30.0, clock=clock)
+    for i in range(2):
+        registry.register(
+            PrefillInfo(
+                bootstrap_key=f"a{i}",
+                host="10.0.0.1",
+                transfer_port=30001 + i,
+                side_channel_port=9600 + i,
+                system_dp_rank=0,
+            )
+        )
+    registry.register(
+        PrefillInfo(
+            bootstrap_key="b0",
+            host="10.0.0.1",
+            transfer_port=30101,
+            side_channel_port=9700,
+            system_dp_rank=1,
+        )
+    )
+    # With 2 entries at dp_rank=0, odd rooms -> a1, even rooms -> a0
+    seen: set[str] = set()
+    for room in range(20):
+        info = registry.pick_for_room(room, dp_rank=0)
+        assert info is not None and info.system_dp_rank == 0
+        seen.add(info.bootstrap_key)
+    assert seen == {"a0", "a1"}
+
+
+def test_client_get_prefill_info_dp_rank_param(server_and_client):
+    """Client sends dp_rank query param to server."""
+    _, client = server_and_client
+    client.register_prefill(
+        bootstrap_key="p0",
+        host="10.0.0.1",
+        transfer_port=30001,
+        side_channel_port=9600,
+        system_dp_rank=0,
+    )
+    client.register_prefill(
+        bootstrap_key="p1",
+        host="10.0.0.2",
+        transfer_port=30002,
+        side_channel_port=9601,
+        system_dp_rank=1,
+    )
+    # Without dp_rank: returns some prefill
+    info_any = client.get_prefill_info(bootstrap_room=42)
+    assert info_any["bootstrap_key"] in {"p0", "p1"}
+    # With dp_rank=0: returns only p0
+    info0 = client.get_prefill_info(bootstrap_room=42, dp_rank=0)
+    assert info0["bootstrap_key"] == "p0"
+    # With dp_rank=1: returns only p1
+    info1 = client.get_prefill_info(bootstrap_room=42, dp_rank=1)
+    assert info1["bootstrap_key"] == "p1"
+
+
+def test_prefill_info_cache_dp_rank_filtering():
+    """PrefillInfoCache._pick_locked filters by system_dp_rank."""
+    from sgl_jax.srt.disaggregation.bootstrap import PrefillInfoCache
+
+    fake_client = mock.MagicMock()
+    fake_client.list_prefills.return_value = [
+        {
+            "bootstrap_key": "a0",
+            "host": "10.0.0.1",
+            "transfer_port": 30001,
+            "side_channel_port": 9600,
+            "system_dp_rank": 0,
+            "jax_process_index": 0,
+            "jax_process_count": 1,
+            "tp_rank": 0,
+            "tp_size": 1,
+            "page_size": 128,
+            "kv_dtype": "bfloat16",
+            "protocol_version": PROTOCOL_VERSION,
+        },
+        {
+            "bootstrap_key": "b0",
+            "host": "10.0.0.2",
+            "transfer_port": 30002,
+            "side_channel_port": 9601,
+            "system_dp_rank": 1,
+            "jax_process_index": 0,
+            "jax_process_count": 1,
+            "tp_rank": 0,
+            "tp_size": 1,
+            "page_size": 128,
+            "kv_dtype": "bfloat16",
+            "protocol_version": PROTOCOL_VERSION,
+        },
+    ]
+
+    clock = _ManualClock()
+    cache = PrefillInfoCache(fake_client, refresh_interval_s=1.0, clock=clock)
+    # Trigger refresh
+    info_any = cache.pick_for_room(42)
+    assert info_any["bootstrap_key"] in {"a0", "b0"}
+    # dp_rank=0: only a0
+    info0 = cache.pick_for_room(42, dp_rank=0)
+    assert info0["bootstrap_key"] == "a0"
+    # dp_rank=1: only b0
+    info1 = cache.pick_for_room(42, dp_rank=1)
+    assert info1["bootstrap_key"] == "b0"
+    # dp_rank=9: no match
+    assert cache.pick_for_room(0, dp_rank=9) is None
+
+
+def test_heartbeat_daemon_beats_for_all_keys(server_and_client):
+    """HeartbeatDaemon beats for each key in the list."""
+    from sgl_jax.srt.disaggregation.bootstrap import HeartbeatDaemon
+
+    _, client = server_and_client
+    for i in range(3):
+        client.register_prefill(
+            bootstrap_key=f"dp_{i}",
+            host="10.0.0.1",
+            transfer_port=30001 + i,
+            side_channel_port=9600 + i,
+            system_dp_rank=i,
+        )
+
+    daemon = HeartbeatDaemon(client, ["dp_0", "dp_1", "dp_2"], interval_s=0.05)
+    daemon.start()
+    try:
+        time.sleep(0.25)  # ~5 beats per key
+        plist = client.list_prefills()
+        keys = {p["bootstrap_key"] for p in plist}
+        assert keys >= {"dp_0", "dp_1", "dp_2"}
+    finally:
+        daemon.stop()
+
+
+def test_heartbeat_daemon_continues_after_single_key_failure():
+    """One failing key doesn't stop beats for other keys."""
+    from sgl_jax.srt.disaggregation.bootstrap import HeartbeatDaemon
+
+    call_log: list[str] = []
+    fail_key = "fail_key"
+
+    class _PartialFailingClient:
+        def heartbeat(self, key):
+            call_log.append(key)
+            if key == fail_key:
+                raise RuntimeError("transient")
+
+    client = _PartialFailingClient()
+    daemon = HeartbeatDaemon(client, [fail_key, "good_key"], interval_s=0.01)
+    daemon.start()
+    try:
+        time.sleep(0.1)
+    finally:
+        daemon.stop()
+    assert "good_key" in call_log, (
+        f"Heartbeat should have beaten good_key despite fail_key errors; " f"got {call_log}"
+    )
+    assert fail_key in call_log, f"fail_key should have been attempted: {call_log}"

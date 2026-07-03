@@ -237,12 +237,16 @@ class SchedulerDisaggregationDecodeMixin:
                     if jax.process_count() > 1:
                         # Multi-host caches the matched peer after the first
                         # lookup, so this does no per-request network I/O.
-                        p_info = self._pick_prefill_peer_for_this_host()
+                        p_info = self._pick_prefill_peer_for_this_host(
+                            dp_rank=getattr(req, "dp_rank", 0)
+                        )
                     else:
                         # Local cache resolution (sglang-style): a warm cache
                         # does zero network I/O, so this no longer blocks the
                         # event loop.
-                        p_info = self.disagg_prefill_info_cache.pick_for_room(req.bootstrap_room)
+                        p_info = self.disagg_prefill_info_cache.pick_for_room(
+                            req.bootstrap_room, dp_rank=getattr(req, "dp_rank", 0)
+                        )
                 self._pd_mark_time(req, "bootstrap_done")
             except Exception:
                 logger.exception(
@@ -367,28 +371,40 @@ class SchedulerDisaggregationDecodeMixin:
                     self._release_decode_kv_indices(entry.kv_indices)
                 self._abort_decode_request(entry.req, "receiver_terminal_failed")
 
-    def _pick_prefill_peer_for_this_host(self: Scheduler) -> dict[str, object]:
+    def _pick_prefill_peer_for_this_host(
+        self: Scheduler, dp_rank: int | None = None
+    ) -> dict[str, object]:
         """Multi-host: find the P host whose jax_process_index matches ours.
         That host's local KV shard is exactly the slice this D host needs.
         Requires P/D to have the same nproc (same-TP constraint).
         """
-        if getattr(self, "_disagg_prefill_peer", None) is not None:
+        cache = getattr(self, "_disagg_prefill_peers", {})
+        if dp_rank is not None and dp_rank in cache:
+            return cache[dp_rank]
+        if dp_rank is None and getattr(self, "_disagg_prefill_peer", None) is not None:
             return self._disagg_prefill_peer
         my_pidx = jax.process_index()
         my_nproc = jax.process_count()
         all_p = self.disagg_bootstrap_client.list_prefills()
         for p in all_p:
             if int(p.get("jax_process_index", -1)) == my_pidx:
+                if dp_rank is not None and int(p.get("system_dp_rank", 0)) != dp_rank:
+                    continue
                 if int(p.get("jax_process_count", 0)) != my_nproc:
                     raise RuntimeError(
                         f"P/D process_count mismatch: P={p.get('jax_process_count')} "
                         f"D={my_nproc}. Per-host shard transfer requires same nproc."
                     )
-                self._disagg_prefill_peer = p
+                if dp_rank is not None:
+                    cache[dp_rank] = p
+                    self._disagg_prefill_peers = cache
+                else:
+                    self._disagg_prefill_peer = p
                 return p
         raise RuntimeError(
-            f"no prefill host with jax_process_index={my_pidx} registered "
-            f"(got {[(p.get('host'), p.get('jax_process_index')) for p in all_p]})"
+            f"no prefill host with jax_process_index={my_pidx} "
+            f"{'and dp_rank=' + str(dp_rank) if dp_rank is not None else ''} registered "
+            f"(got {[(p.get('host'), p.get('jax_process_index'), p.get('system_dp_rank')) for p in all_p]})"
         )
 
     def _drain_transfer_queue_synced(self: Scheduler) -> list[DecodeBookkeeping]:
