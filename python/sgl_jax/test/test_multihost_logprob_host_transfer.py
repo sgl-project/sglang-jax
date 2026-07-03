@@ -4,11 +4,15 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+import jax
+import jax.numpy as jnp
 import numpy as np
+from jax.sharding import Mesh
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
+from sgl_jax.srt.layers.sampler import Sampler
 from sgl_jax.srt.managers import tp_worker
 from sgl_jax.srt.managers.scheduler_output_processor_mixin import (
     SchedulerOutputProcessorMixin,
@@ -221,6 +225,44 @@ class TestSpecPrefillLogprobPaths(unittest.TestCase):
 
         batch.return_output_logprob_only = False
         self.assertFalse(worker._can_skip_greedy_prefill_sample(batch, True))
+
+
+class TestSamplerLogprobOutput(unittest.TestCase):
+    def test_process_logprob_results_preserves_hidden_states(self):
+        sampler = type("SamplerLike", (), {"mesh": Mesh(np.array(jax.devices()), ("data",))})()
+        hidden_states = jnp.arange(6, dtype=jnp.float32).reshape(2, 3)
+        logits_output = LogitsProcessorOutput(
+            next_token_logits=jnp.zeros((2, 4), dtype=jnp.float32),
+            hidden_states=hidden_states,
+            input_token_logprobs=jnp.array([0.5, 0.25], dtype=jnp.float32),
+        )
+        sampling_metadata = type(
+            "SamplingMetadata",
+            (),
+            {
+                "top_logprobs_nums": None,
+                "token_ids_logprobs": None,
+            },
+        )()
+
+        output = Sampler._process_logprob_results(
+            sampler,
+            (
+                logits_output,
+                sampling_metadata,
+                jnp.array([1, 2], dtype=jnp.int32),
+                jnp.array(
+                    [[0.0, -0.1, -0.2, -0.3], [-1.0, -1.1, -1.2, -1.3]],
+                    dtype=jnp.float32,
+                ),
+            ),
+        )
+
+        np.testing.assert_array_equal(np.asarray(output.hidden_states), np.asarray(hidden_states))
+        np.testing.assert_allclose(np.asarray(output.next_token_logprobs), [-0.1, -1.2])
+        np.testing.assert_array_equal(
+            np.asarray(output.input_token_logprobs), np.asarray(logits_output.input_token_logprobs)
+        )
 
 
 if __name__ == "__main__":

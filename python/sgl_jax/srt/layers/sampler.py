@@ -108,6 +108,7 @@ class Sampler(nnx.Module):
 
         return LogitsProcessorOutput(
             next_token_logits=logits_output.next_token_logits,
+            hidden_states=logits_output.hidden_states,
             next_token_logprobs=next_token_logprobs,
             next_token_top_logprobs_val=next_token_top_logprobs_val,
             next_token_top_logprobs_idx=next_token_top_logprobs_idx,
