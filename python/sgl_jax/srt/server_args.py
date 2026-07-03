@@ -1086,7 +1086,7 @@ class ServerArgs:
             choices=["disable", "none", "file"],
             default=ServerArgs.hicache_storage,
             help="HiCache KV offloading: 'disable' off, 'none' enables L1+L2 "
-            "(host pinned pool), 'file' reserved for L3(not suppport yet).",
+            "(host pinned pool), 'file' reserved for L3(not support yet).",
         )
         parser.add_argument(
             "--hicache-ratio",

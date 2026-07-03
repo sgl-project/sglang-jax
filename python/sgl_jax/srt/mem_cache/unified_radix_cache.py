@@ -548,10 +548,12 @@ class UnifiedRadixCache(BasePrefixCache):
             host_validators = ()
         else:
             device_validators = tuple(
-                comp.create_match_validator(match_device_only=True) for comp in self._components_tuple
+                comp.create_match_validator(match_device_only=True)
+                for comp in self._components_tuple
             )
             host_validators = tuple(
-                comp.create_match_validator(match_device_only=False) for comp in self._components_tuple
+                comp.create_match_validator(match_device_only=False)
+                for comp in self._components_tuple
             )
 
         def _update_best_if_valid(candidate: UnifiedTreeNode):
