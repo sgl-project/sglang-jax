@@ -68,6 +68,8 @@ spec:
           value: "512"
         - name: SGLANG_JAX_USE_RAIDEN
           value: "1"
+        - name: TF_CPP_MIN_LOG_LEVEL
+          value: "0"
         command:
         - bash
         - -c

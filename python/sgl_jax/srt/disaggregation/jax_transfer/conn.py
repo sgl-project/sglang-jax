@@ -347,6 +347,16 @@ class JaxTransferKVManager(CommonKVManager):
         if self._raiden_wrapper is None:
             raise RuntimeError("producer_register_read requires a raiden_wrapper on the manager")
         needed = self._raiden_wrapper.register_read(req_id, _uuid_to_int(uuid), block_ids)
+        logger.warning(
+            "RAIDEN-P register_read req_id=%s uuid=%s uuid_int=%s room=%s nblocks=%d blocks=%s needed=%s",
+            req_id,
+            uuid,
+            _uuid_to_int(uuid),
+            bootstrap_room,
+            len(block_ids),
+            list(block_ids)[:8],
+            needed,
+        )
         # Publish the block layout + control endpoint for D. Even when
         # ``needed`` is False we register (empty transfers still resolve on the
         # decode side); an empty block list means D's start_read is a no-op.
@@ -837,6 +847,18 @@ class JaxTransferKVReceiver(KVReceiver, StateHolder):
                 if not self._started_read:
                     self._started_read = True
                     md = self._metadata
+                    logger.warning(
+                        "RAIDEN-D start_read req_id=%s uuid=%s uuid_int=%s remote_ep=%r "
+                        "n_remote=%d remote=%s n_local=%d local=%s",
+                        self._req_id,
+                        md.uuid,
+                        _uuid_to_int(md.uuid),
+                        md.remote_endpoint,
+                        len(md.remote_block_ids or ()),
+                        list(md.remote_block_ids or ())[:8],
+                        len(md.local_block_ids or ()),
+                        list(md.local_block_ids or ())[:8],
+                    )
                     try:
                         self._mgr.raiden_wrapper.start_read(
                             self._req_id,
