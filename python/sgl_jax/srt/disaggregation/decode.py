@@ -694,6 +694,11 @@ class SchedulerDisaggregationDecodeMixin:
         else:
             req.prefix_indices = valid_slots
         req.last_matched_prefix_len = len(req.prefix_indices)
+        # Reuse the transferred KV as prefix (extend_input_len=1) instead of
+        # re-prefilling the whole prompt on decode. Mirrors path-A's
+        # _write_kv_to_pool; without this the raiden path re-runs a full prefill
+        # (cached-token=0), wasting the transfer and leaking the prealloc pages.
+        req._pd_skip_prefix_match = True
         req._pd_prealloc_kv_indices = kv_indices_np
         req.fill_ids = list(req.origin_input_ids) + list(req.output_ids)
 
