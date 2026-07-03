@@ -6,6 +6,7 @@ import threading
 from typing import TYPE_CHECKING
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
@@ -411,20 +412,36 @@ class SchedulerOutputProcessorMixin:
             and (batch.return_logprob or batch.return_output_logprob_only)
             and logits_output.next_token_logprobs is not None
         ):
-            logits_output.next_token_logprobs = jax.device_get(
+
+            def spec_host_array(arr, *, allgather=False, as_float=False):
+                if as_float:
+                    arr = arr.astype(jnp.float32)
+                if allgather:
+                    from jax.experimental.multihost_utils import process_allgather
+
+                    arr = process_allgather(arr, tiled=True)
+                return jax.device_get(arr)
+
+            needs_allgather = batch.dp_size > 1
+            logits_output.next_token_logprobs = spec_host_array(
                 logits_output.next_token_logprobs
             ).astype(float)
             if logits_output.next_token_top_logprobs_val is not None:
-                logits_output.next_token_top_logprobs_val = jax.device_get(
-                    logits_output.next_token_top_logprobs_val
-                ).astype(float)
-                logits_output.next_token_top_logprobs_idx = jax.device_get(
-                    logits_output.next_token_top_logprobs_idx
+                logits_output.next_token_top_logprobs_val = spec_host_array(
+                    logits_output.next_token_top_logprobs_val,
+                    allgather=needs_allgather,
+                    as_float=True,
+                )
+                logits_output.next_token_top_logprobs_idx = spec_host_array(
+                    logits_output.next_token_top_logprobs_idx,
+                    allgather=needs_allgather,
                 )
             if logits_output.next_token_token_ids_logprobs_val is not None:
-                logits_output.next_token_token_ids_logprobs_val = jax.device_get(
-                    logits_output.next_token_token_ids_logprobs_val
-                ).astype(float)
+                logits_output.next_token_token_ids_logprobs_val = spec_host_array(
+                    logits_output.next_token_token_ids_logprobs_val,
+                    allgather=needs_allgather,
+                    as_float=True,
+                )
 
         self.token_to_kv_pool_allocator.free_group_begin()
 
