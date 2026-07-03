@@ -109,15 +109,33 @@ class TestStep3p5MTPGsm8k(unittest.TestCase):
     def test_accept_length(self):
         """Mean accept-length >= threshold — proves the MTP draft is genuinely
         accepted (chain working), not just lossless. sgl-jax does not expose
-        accept-length over the API, so this reads the server log if provided."""
+        accept-length over the API, so this drives a few decode-heavy requests
+        itself, then reads the server log (self-contained: does not depend on
+        another test having generated first / on pytest ordering)."""
         if not _SERVER_LOG:
             self.skipTest(
                 "Set SGLANG_SPEC_SERVER_LOG=<server log path> to assert accept-length; "
                 "otherwise grep 'accept-len' in the server log manually (want >= "
                 f"{_ACCEPT_LEN_THRES})."
             )
+        # Warm up: generate enough decode steps so the scheduler logs 'accept-len'
+        # (spec accept-length is only emitted during decode, not prefill).
+        for _ in range(4):
+            requests.post(
+                f"{_URL}/generate",
+                json={
+                    "text": "Count slowly: one, two, three, four, five, six, seven,",
+                    "sampling_params": {"temperature": 0, "max_new_tokens": 64},
+                },
+                timeout=600,
+            ).raise_for_status()
+
         mean_al = _mean_accept_length_from_log(_SERVER_LOG)
-        self.assertIsNotNone(mean_al, "no 'accept-len' lines found in server log")
+        self.assertIsNotNone(
+            mean_al,
+            "no 'accept-len' lines in server log even after warm-up decode — is this "
+            "a spec-decode server, and is SGLANG_SPEC_SERVER_LOG the right log path?",
+        )
         print(f"[accept-len] mean={mean_al:.3f} (threshold {_ACCEPT_LEN_THRES})")
         self.assertGreaterEqual(mean_al, _ACCEPT_LEN_THRES)
 
