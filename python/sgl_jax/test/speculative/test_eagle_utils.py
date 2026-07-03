@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
@@ -9,11 +10,62 @@ from sgl_jax.srt.kernels.speculative.tree_speculative_sampling_target_only_kerne
     tree_speculative_sampling_target_only_pallas_call,
 )
 from sgl_jax.srt.kernels.speculative.verify_tree_greedy_kernel import verify_tree_greedy
-from sgl_jax.srt.speculative.eagle_util import build_tree_mask_for_draft_decode
+from sgl_jax.srt.speculative.eagle_util import (
+    EagleDraftInput,
+    build_tree_mask_for_draft_decode,
+)
+from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 from sgl_jax.test.test_utils import CustomTestCase
 
 
 class TestVerifyTree(CustomTestCase):
+    def test_draft_extend_metadata_ignores_request_logprob(self):
+        mesh = jax.sharding.Mesh(np.array(jax.devices()), ("data",))
+        for spec_algorithm in (SpeculativeAlgorithm.NEXTN, SpeculativeAlgorithm.EAGLE3):
+            draft_input = EagleDraftInput(
+                hidden_states=jnp.zeros((1, 4), dtype=jnp.float32),
+                allocate_lens=np.array([8], dtype=np.int32),
+            )
+            model_worker_batch = SimpleNamespace(
+                spec_algorithm=spec_algorithm,
+                spec_info_padded=None,
+                logits_indices_selector=np.array([0], dtype=np.int64),
+                seq_lens=np.array([8], dtype=np.int32),
+                input_ids=np.array([10, 11], dtype=np.int32),
+                positions=np.array([8, 9], dtype=np.int32),
+                dp_size=1,
+                per_dp_bs_size=1,
+                return_logprob=True,
+                top_logprobs_nums=None,
+                token_ids_logprobs=None,
+                extend_input_logprob_token_ids=None,
+            )
+            batch_output = SimpleNamespace(
+                accept_lens=np.array([1], dtype=np.int32),
+                next_draft_input=SimpleNamespace(
+                    hidden_states=jnp.zeros((1, 4), dtype=jnp.float32),
+                    verified_id=np.array([12, 13], dtype=np.int32),
+                ),
+            )
+            draft_model_runner = SimpleNamespace(
+                mesh=mesh,
+                attn_backend=SimpleNamespace(
+                    get_eagle_forward_metadata=lambda _batch: object(),
+                    forward_metadata=None,
+                ),
+            )
+
+            _, logits_metadata = draft_input.prepare_for_extend_after_verify(
+                model_worker_batch,
+                draft_model_runner,
+                batch_output,
+                speculative_num_draft_tokens=4,
+            )
+
+            self.assertFalse(logits_metadata.extend_return_logprob)
+            self.assertFalse(logits_metadata.extend_return_top_logprob)
+            self.assertFalse(logits_metadata.extend_token_ids_logprob)
+
     def test_as_int32_array_keeps_host_metadata_on_host(self):
         from sgl_jax.srt.speculative import eagle_util
 
