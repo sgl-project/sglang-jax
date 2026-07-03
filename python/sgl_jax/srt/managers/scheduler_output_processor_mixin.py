@@ -399,10 +399,32 @@ class SchedulerOutputProcessorMixin:
                 next_token_logprobs = logits_output.next_token_logprobs
         else:
             # spec decoding handles output logprobs inside verify process.
-            if batch.return_logprob or batch.return_output_logprob_only:
+            if is_spec_decode:
+                next_token_logprobs = None
+            elif batch.return_logprob or batch.return_output_logprob_only:
                 next_token_logprobs = jax.device_get(logits_output.next_token_logprobs).astype(
                     float
                 )
+
+        if (
+            is_spec_decode
+            and (batch.return_logprob or batch.return_output_logprob_only)
+            and logits_output.next_token_logprobs is not None
+        ):
+            logits_output.next_token_logprobs = jax.device_get(
+                logits_output.next_token_logprobs
+            ).astype(float)
+            if logits_output.next_token_top_logprobs_val is not None:
+                logits_output.next_token_top_logprobs_val = jax.device_get(
+                    logits_output.next_token_top_logprobs_val
+                ).astype(float)
+                logits_output.next_token_top_logprobs_idx = jax.device_get(
+                    logits_output.next_token_top_logprobs_idx
+                )
+            if logits_output.next_token_token_ids_logprobs_val is not None:
+                logits_output.next_token_token_ids_logprobs_val = jax.device_get(
+                    logits_output.next_token_token_ids_logprobs_val
+                ).astype(float)
 
         self.token_to_kv_pool_allocator.free_group_begin()
 
@@ -489,12 +511,52 @@ class SchedulerOutputProcessorMixin:
                 ):
                     req.kv_committed_len += new_accepted_len - 1
 
-                if req.return_output_logprob_only:
+                if req.return_output_logprob_only and not is_spec_decode:
                     req.output_token_logprobs_val.append(next_token_logprobs[req_idx])
                     req.output_token_logprobs_idx.append(next_token_id)
 
+                if (
+                    (req.return_logprob or req.return_output_logprob_only)
+                    and is_spec_decode
+                    and logits_output.next_token_logprobs is not None
+                ):
+                    draft_n = self.draft_worker.speculative_num_draft_tokens
+                    slot = per_dp_bs_size * dp_rank + i
+                    base = slot * draft_n
+                    for j, token_id in enumerate(next_token_id):
+                        flat_idx = base + j
+                        req.output_token_logprobs_val.append(
+                            logits_output.next_token_logprobs[flat_idx]
+                        )
+                        req.output_token_logprobs_idx.append(token_id)
+                        if (
+                            req.return_logprob
+                            and req.top_logprobs_num > 0
+                            and logits_output.next_token_top_logprobs_val is not None
+                        ):
+                            req.output_top_logprobs_val.append(
+                                logits_output.next_token_top_logprobs_val[flat_idx][
+                                    : req.top_logprobs_num
+                                ].tolist()
+                            )
+                            req.output_top_logprobs_idx.append(
+                                logits_output.next_token_top_logprobs_idx[flat_idx][
+                                    : req.top_logprobs_num
+                                ].tolist()
+                            )
+                        if (
+                            req.return_logprob
+                            and req.token_ids_logprob is not None
+                            and logits_output.next_token_token_ids_logprobs_val is not None
+                        ):
+                            req.output_token_ids_logprobs_val.append(
+                                logits_output.next_token_token_ids_logprobs_val[flat_idx][
+                                    req.token_ids_logprob
+                                ].tolist()
+                            )
+                            req.output_token_ids_logprobs_idx.append(req.token_ids_logprob)
+
                 if req.return_logprob and not is_spec_decode:
-                    # speculative worker handles logprob in speculative decoding
                     req.output_token_logprobs_val.append(next_token_logprobs[req_idx])
                     req.output_token_logprobs_idx.append(next_token_id)
                     if req.top_logprobs_num > 0:
