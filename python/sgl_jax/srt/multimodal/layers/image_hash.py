@@ -3,6 +3,7 @@
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
+from jax.experimental.pallas import triton as plgpu
 
 FMIX32_C1 = 0x85EBCA6B
 FMIX32_C2 = 0xC2B2AE35
@@ -57,9 +58,9 @@ def hash_tiles32_kernel(
 
         # Load data with appropriate cache modifier
         if use_cg:
-            v = pl.load(in_ptr + idx, mask=mask, other=0, cache="global")
+            v = plgpu.load(in_ptr + idx, mask=mask, other=0, cache="global")
         else:
-            v = pl.load(in_ptr + idx, mask=mask, other=0)
+            v = plgpu.load(in_ptr + idx, mask=mask, other=0)
         v = v.astype(jnp.uint32)
 
         iu = idx.astype(jnp.uint32)
@@ -82,7 +83,7 @@ def hash_tiles32_kernel(
     h2 = _fmix32(h2, fm_c1, fm_c2)
 
     out = (h1.astype(jnp.uint64) << 32) | h2.astype(jnp.uint64)
-    pl.store(out_ptr + pid, out)
+    plgpu.store(out_ptr + pid, out)
 
 
 def add_tree_reduce_u64_kernel(
@@ -99,10 +100,10 @@ def add_tree_reduce_u64_kernel(
     for i in range(chunk):
         idx = start + i
         mask = idx < n_elems
-        v = pl.load(in_ptr + idx, mask=mask, other=0).astype(jnp.uint64)
+        v = plgpu.load(in_ptr + idx, mask=mask, other=0).astype(jnp.uint64)
         h += v
 
-    pl.store(out_ptr + pid, h)
+    plgpu.store(out_ptr + pid, h)
 
 
 def _as_uint32_words(t: jax.Array) -> jax.Array:

@@ -344,14 +344,14 @@ def build_eagle_tree_structure_pallas_call(
 
     in_specs = [
         # all zero array
-        pl.BlockSpec(memory_space=pltpu.ANY),
+        pl.BlockSpec(memory_space=pl.ANY),
         # all one array
-        pl.BlockSpec(memory_space=pltpu.ANY),
+        pl.BlockSpec(memory_space=pl.ANY),
     ]
 
     out_specs = [
         # tree mask, shape: (draft_token_num, tree_mask_capacity, 128)
-        pl.BlockSpec(memory_space=pltpu.ANY),
+        pl.BlockSpec(memory_space=pl.ANY),
         # positions, shape: (bs*draft_token_num,)
         pl.BlockSpec(memory_space=pltpu.SMEM),
         # retrive_index, shape: (bs, draft_token_num)

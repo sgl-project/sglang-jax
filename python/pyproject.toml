@@ -55,16 +55,18 @@ fastokens = [
     "fastokens>=0.1.1,<0.2.0",
 ]
 tpu = [
-    "jax[tpu]==0.8.1",
+    "jax[tpu]==0.10.2",
+    "libtpu==0.0.42.1",
 ]
 gpu = [
-    "jax[cuda12]==0.8.1",
+    "jax[cuda12]==0.10.2",
 ]
 cpu = [
-    "jax[cpu]==0.8.1",
+    "jax[cpu]==0.10.2",
 ]
 all = [
-    "jax[tpu]==0.8.1",
+    "jax[tpu]==0.10.2",
+    "libtpu==0.0.42.1",
     "fastokens>=0.1.1,<0.2.0",
 ]
 multimodal = [
