@@ -180,6 +180,9 @@ class RegisterTransferRequest(BaseModel):
     chunk_index: int = 0
     num_chunks: int = 0
     chunk_page_offset: int = 0
+    # SWA hybrid-attention fields (empty for non-SWA models).
+    swa_block_ids: list[int] = []
+    swa_raiden_endpoints_json: str = ""
 
 
 class HeartbeatRequest(BaseModel):
@@ -669,11 +672,16 @@ class BootstrapClient:
         chunk_index: int = 0,
         num_chunks: int = 0,
         chunk_page_offset: int = 0,
+        swa_block_ids: list[int] | None = None,
+        swa_raiden_endpoints_json: str = "",
     ) -> None:
         """P: publish per-chunk block metadata for raiden pull (keyed by room +
         chunk_index). Best-effort with the shared client timeout; the caller
         treats a failure as a transfer failure for that request. ``num_chunks``
-        is set to N only on the final chunk (0 means more chunks coming)."""
+        is set to N only on the final chunk (0 means more chunks coming).
+
+        For hybrid SWA models, ``swa_block_ids`` and ``swa_raiden_endpoints_json``
+        carry the SWA-pool counterpart metadata."""
 
         payload = {
             "bootstrap_room": bootstrap_room,
@@ -684,6 +692,8 @@ class BootstrapClient:
             "chunk_index": chunk_index,
             "num_chunks": num_chunks,
             "chunk_page_offset": chunk_page_offset,
+            "swa_block_ids": list(swa_block_ids or []),
+            "swa_raiden_endpoints_json": swa_raiden_endpoints_json,
         }
         r = self._client.post(
             f"{self._base_url}/register_transfer",

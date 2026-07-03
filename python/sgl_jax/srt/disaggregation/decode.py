@@ -633,6 +633,46 @@ class SchedulerDisaggregationDecodeMixin:
             )
             local_pages = tuple(int(p) for p in (kv_indices_np[::page_size] // page_size))
 
+            # SWA hybrid-attention: build SWA-pool local pages (tail only) and
+            # remote endpoint from the SWA engine's endpoint descriptors.
+            swa_local_pages: tuple[int, ...] | None = None
+            swa_remote_endpoint: object | None = None
+            allocator = self.token_to_kv_pool_allocator
+            swa_mapping = getattr(allocator, "full_to_swa_index_mapping", None)
+            if swa_mapping is not None and hasattr(self, "sliding_window_size"):
+                seqlen = len(req.origin_input_ids)
+                sliding = self.sliding_window_size or 0
+                if isinstance(swa_mapping, list):
+                    swa_mapping = swa_mapping[0]
+                window_start = max(0, seqlen - sliding)
+                tail_kv = kv_indices_np[window_start:seqlen]
+                swa_pages = sorted(
+                    set(int(swa_mapping[int(idx)]) // page_size for idx in tail_kv)
+                )
+                swa_pages = [p for p in swa_pages if p >= 0]
+                swa_local_pages = tuple(swa_pages) if swa_pages else None
+
+                # SWA remote endpoint from P's SWA engine descriptors.
+                swa_eps_json = first_info.get("swa_raiden_endpoints_json", "") or ""
+                if swa_eps_json:
+                    swa_p_endpoints = _json.loads(swa_eps_json)
+                    swa_base_port = int(
+                        str(swa_p_endpoints[0]["endpoint"]).rsplit(":", 1)[1]
+                    )
+                    swa_local_eps = (
+                        self.disagg_kv_manager.raiden_wrapper.endpoints_swa or []
+                    )
+                    if len(swa_local_eps) <= 1:
+                        swa_remote_endpoint = f"{p_host}:{swa_base_port}"
+                    else:
+                        swa_remote_endpoint = [
+                            {
+                                "endpoint": f"{p_host}:{swa_base_port + i}",
+                                "shards": list(ep["shards"]),
+                            }
+                            for i, ep in enumerate(swa_local_eps)
+                        ]
+
             receiver = self.disagg_kv_manager.create_receiver(req.rid)
             receiver.init(
                 PMetadata(
@@ -644,6 +684,8 @@ class SchedulerDisaggregationDecodeMixin:
                     remote_endpoint=remote_endpoint,
                     bootstrap_room=req.bootstrap_room,
                     local_pages=local_pages,
+                    swa_remote_endpoint=swa_remote_endpoint,
+                    swa_local_pages=swa_local_pages,
                 )
             )
         except Exception:

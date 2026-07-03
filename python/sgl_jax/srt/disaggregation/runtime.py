@@ -164,19 +164,34 @@ def install_disaggregation_wiring(scheduler: Scheduler, server_args: ServerArgs)
         page_size = max(1, int(server_args.page_size))
         max_blocks = (int(server_args.max_seq_len) + page_size - 1) // page_size + 8
         num_slots = max(16, int(server_args.disaggregation_max_inflight_transfers) * 2)
+        # For hybrid SWA models the pool is a SWAKVPool with separate full and SWA
+        # sub-pools. Pass both so raiden creates two KVCacheManagers (one per pool);
+        # raiden broadcasts block_ids to all layers within an engine, so per-pool
+        # engines are needed when full and SWA layers have different page numbering.
+        kv_caches_swa = None
+        if hasattr(kv_pool, "full_kv_pool"):
+            # SWAKVPool: expose sub-pool buffers directly (kv_pool.kv_buffer is not
+            # defined — get_kv_buffer dispatches per-layer).
+            kv_caches_full = list(kv_pool.full_kv_pool.kv_buffer)
+            kv_caches_swa = list(kv_pool.swa_kv_pool.kv_buffer)
+        else:
+            kv_caches_full = list(kv_pool.kv_buffer)
         raiden_wrapper.start(
-            kv_caches=list(kv_pool.kv_buffer),
+            kv_caches=kv_caches_full,
             max_blocks=max_blocks,
             num_slots=num_slots,
             timeout_s=float(server_args.disaggregation_pull_timeout_seconds),
+            kv_caches_swa=kv_caches_swa,
         )
         logger.info(
             "raiden data plane enabled: control_port=%s max_blocks=%d "
-            "num_slots=%d layer_num=%d",
+            "num_slots=%d layer_num=%d is_hybrid_swa=%s swa_layer_num=%d",
             server_args.disaggregation_raiden_control_port,
             max_blocks,
             num_slots,
-            kv_pool.layer_num,
+            len(kv_caches_full),
+            kv_caches_swa is not None,
+            len(kv_caches_swa) if kv_caches_swa else 0,
         )
 
     scheduler.disagg_kv_manager = JaxTransferKVManager(

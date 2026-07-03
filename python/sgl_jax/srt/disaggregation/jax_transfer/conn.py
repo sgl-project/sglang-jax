@@ -92,6 +92,9 @@ class PMetadata:
     local_block_ids: tuple[int, ...] | None = None
     bootstrap_room: int | None = None
     local_pages: tuple[int, ...] | None = None
+    # SWA hybrid-attention fields (non-None only for hybrid SWA models).
+    swa_remote_endpoint: object | None = None
+    swa_local_pages: tuple[int, ...] | None = None
 
 
 @dataclass
@@ -346,26 +349,29 @@ class JaxTransferKVManager(CommonKVManager):
         chunk_index: int = 0,
         num_chunks: int = 0,
         chunk_page_offset: int = 0,
+        swa_block_ids: list[int] | None = None,
     ) -> bool:
         """raiden producer handoff: mark ``block_ids`` readable and publish the
         per-request block metadata to bootstrap so D can pull.
 
-        Returns raiden's ``register_read`` result (False = nothing to transfer).
-        Unlike path-A there is no D2H staging and no HBM buffer to keep alive:
-        raiden references the device pool blocks directly and pulls them on
-        demand, so the sender holds no payload reference.
+        For hybrid SWA models, ``swa_block_ids`` (SWA-pool page indices, tail
+        only) are registered on the SWA engine and published to bootstrap under
+        ``swa_*`` keys alongside the full-attention blocks.
 
-        For chunked transfer each chunk is registered as its own raiden uuid
-        (register_read is overwrite-per-uuid, not cumulative); ``chunk_index`` /
-        ``num_chunks`` / ``chunk_page_offset`` are forwarded to bootstrap so D
-        can discover and place each chunk.
+        Returns raiden's ``register_read`` result (False = nothing to transfer).
         """
 
         if self._raiden_wrapper is None:
             raise RuntimeError("producer_register_read requires a raiden_wrapper on the manager")
-        needed = self._raiden_wrapper.register_read(req_id, _uuid_to_int(uuid), block_ids)
+        needed = self._raiden_wrapper.register_read(
+            req_id,
+            _uuid_to_int(uuid),
+            block_ids,
+            swa_block_ids=swa_block_ids,
+        )
         logger.warning(
-            "RAIDEN-P register_read req_id=%s uuid=%s uuid_int=%s room=%s chunk=%d/%s off=%d nblocks=%d blocks=%s needed=%s",
+            "RAIDEN-P register_read req_id=%s uuid=%s uuid_int=%s room=%s chunk=%d/%s off=%d "
+            "nblocks=%d blocks=%s n_swa=%d needed=%s",
             req_id,
             uuid,
             _uuid_to_int(uuid),
@@ -375,15 +381,15 @@ class JaxTransferKVManager(CommonKVManager):
             chunk_page_offset,
             len(block_ids),
             list(block_ids)[:8],
+            len(swa_block_ids) if swa_block_ids else 0,
             needed,
         )
-        # Publish the block layout + control endpoint for D. Even when
-        # ``needed`` is False we register (empty transfers still resolve on the
-        # decode side); an empty block list means D's start_read is a no-op.
+        # Publish the block layout + control endpoint for D.
         if self._bootstrap_client is not None and bootstrap_room is not None:
             import json as _json
 
             endpoints = self._raiden_wrapper.endpoints
+            endpoints_swa = self._raiden_wrapper.endpoints_swa
             self._bootstrap_client.register_transfer(
                 bootstrap_room,
                 transfer_id or uuid,
@@ -392,6 +398,12 @@ class JaxTransferKVManager(CommonKVManager):
                 chunk_index=chunk_index,
                 num_chunks=num_chunks,
                 chunk_page_offset=chunk_page_offset,
+                swa_block_ids=swa_block_ids or [],
+                swa_raiden_endpoints_json=(
+                    _json.dumps(endpoints_swa)
+                    if endpoints_swa is not None
+                    else ""
+                ),
             )
         return needed
 
@@ -480,6 +492,7 @@ class JaxTransferKVSender(KVSender, StateHolder):
         bootstrap_room: int | None,
         is_final: bool,
         chunk_page_offset: int = 0,
+        swa_block_ids: list[int] | None = None,
     ) -> None:
         """raiden chunked send: register THIS chunk's device blocks as readable
         and publish their layout to D under a per-chunk uuid ``f"{uuid}#c{k}"``.
@@ -487,7 +500,10 @@ class JaxTransferKVSender(KVSender, StateHolder):
         Called once per chunk right after that chunk's forward, so the transfer
         overlaps the next chunk's compute. No zmq callback — SUCCESS is driven by
         ``poll()`` once every chunk's ``done_sending`` is observed. ``is_final``
-        marks the last chunk (fixes ``_num_chunks = chunk_index + 1``)."""
+        marks the last chunk (fixes ``_num_chunks = chunk_index + 1``).
+
+        For hybrid SWA models, ``swa_block_ids`` carries the SWA-pool tail page
+        indices published alongside the full-attention blocks."""
 
         with self._state_lock:
             self._bootstrap_room = bootstrap_room
@@ -502,6 +518,7 @@ class JaxTransferKVSender(KVSender, StateHolder):
                 chunk_index=chunk_index,
                 num_chunks=num_chunks,
                 chunk_page_offset=chunk_page_offset,
+                swa_block_ids=swa_block_ids,
             )
             self._started_chunks.add(chunk_index)
             if is_final:
@@ -995,6 +1012,24 @@ class JaxTransferKVReceiver(KVReceiver, StateHolder):
                 remote_block_ids[:8],
                 local_block_ids[:8],
             )
+            # SWA hybrid-attention: start a parallel read on the SWA engine if
+            # the P advertised SWA block metadata for this chunk.
+            swa_kwargs: dict = {}
+            if md.swa_remote_endpoint is not None and md.swa_local_pages:
+                swa_local_pages = md.swa_local_pages
+                swa_remote_ids_raw = chunk_info.get("swa_remote_block_ids", ())
+                swa_remote_ids = [int(b) for b in swa_remote_ids_raw] if swa_remote_ids_raw else []
+                if swa_remote_ids:
+                    # SWA tail chunk uses a fixed-size window: local offset is
+                    # just position 0..len-1 within the SWA pool (the offset is
+                    # per-chunk, not whole-prompt, because SWA only transfers
+                    # the tail).
+                    swa_local_ids = [int(p) for p in swa_local_pages[: len(swa_remote_ids)]]
+                    swa_kwargs = {
+                        "swa_remote_endpoint": md.swa_remote_endpoint,
+                        "swa_remote_block_ids": swa_remote_ids,
+                        "swa_local_block_ids": swa_local_ids,
+                    }
             try:
                 self._mgr.raiden_wrapper.start_read(
                     cu,
@@ -1002,6 +1037,7 @@ class JaxTransferKVReceiver(KVReceiver, StateHolder):
                     md.remote_endpoint,
                     remote_block_ids,
                     local_block_ids,
+                    **swa_kwargs,
                 )
             except Exception:  # noqa: BLE001
                 logger.exception("raiden start_read raised for cu=%s", cu)

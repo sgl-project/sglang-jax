@@ -380,6 +380,9 @@ class SchedulerDisaggregationPrefillMixin:
         ``start // page_size`` is this chunk's sequence-relative page offset. The
         final chunk's ``end`` need not be aligned; the last (partial) page is
         rounded up so its block is included exactly once.
+
+        Returns full-pool block ids. Use ``_extract_swa_block_ids_for_chunk``
+        for the SWA-pool counterpart on hybrid-SWA models.
         """
 
         import numpy as _np
@@ -395,6 +398,49 @@ class SchedulerDisaggregationPrefillMixin:
         ]
         page_ids = _np.asarray(page_id_source) // page_size
         return [int(p) for p in page_ids]
+
+    def _extract_swa_block_ids_for_chunk(
+        self: Scheduler,
+        req: Req,
+        start: int,
+        end: int,
+        page_size: int,
+        sliding_window_size: int,
+    ) -> list[int]:
+        """Extract SWA-pool block ids for the token range ``[start, end)``.
+
+        Translates full-pool token indices to SWA-pool indices via
+        ``full_to_swa_index_mapping``, then filters to only the sliding-window
+        tail (``window_start..seqlen``).  Returns an empty list when the chunk
+        lies entirely before the tail window or the allocator has no SWA pool.
+        """
+
+        import numpy as _np
+
+        allocator = self.token_to_kv_pool_allocator
+        mapping = getattr(allocator, "full_to_swa_index_mapping", None)
+        if mapping is None:
+            return []
+        if isinstance(mapping, list):
+            mapping = mapping[0]
+
+        seqlen = len(req.origin_input_ids)
+        window_start = max(0, seqlen - sliding_window_size)
+        tail_start = max(start, window_start)
+        if tail_start >= end or tail_start >= seqlen:
+            return []
+
+        first_page = tail_start // page_size
+        last_page = (min(end, seqlen) + page_size - 1) // page_size
+
+        req_to_token = self.req_to_token_pool.req_to_token
+        swa_page_ids = []
+        for p in range(first_page, last_page):
+            full_token_idx = int(req_to_token[req.req_pool_idx, p * page_size])
+            swa_token_idx = int(mapping[full_token_idx])
+            swa_page_ids.append(swa_token_idx // page_size)
+
+        return sorted(set(swa_page_ids))
 
     def _raiden_handoff_chunk(self: Scheduler, req: Req, req_id: str, *, is_final: bool) -> None:
         """raiden per-chunk handoff: publish THIS chunk's device page subset to D
@@ -415,6 +461,16 @@ class SchedulerDisaggregationPrefillMixin:
             end = start + req.extend_input_len
             page_offset = start // page_size
             block_ids = self._extract_req_block_ids_range(req, start, end)
+            # SWA (hybrid attention) tail blocks — only the sliding-window
+            # tail pages, translated to the SWA pool's index space. Empty for
+            # non-SWA models (no full_to_swa_index_mapping).
+            swa_block_ids = self._extract_swa_block_ids_for_chunk(
+                req,
+                start,
+                end,
+                page_size,
+                getattr(self, "sliding_window_size", None) or 0,
+            )
             if sender is None:
                 sender = self.disagg_kv_manager.create_sender(req_id)
                 sender.init(
@@ -430,6 +486,7 @@ class SchedulerDisaggregationPrefillMixin:
                 bootstrap_room=req.bootstrap_room,
                 is_final=is_final,
                 chunk_page_offset=page_offset,
+                swa_block_ids=swa_block_ids or None,
             )
         except Exception as exc:
             logger.exception(
