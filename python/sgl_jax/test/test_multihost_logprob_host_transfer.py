@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
 from sgl_jax.srt.managers import tp_worker
 from sgl_jax.srt.managers.tp_worker import ModelWorker
+from sgl_jax.srt.speculative.base_worker import BaseSpecWorker
 
 
 class FakeArray:
@@ -113,6 +114,86 @@ class TestMultihostLogprobHostTransfer(unittest.TestCase):
         ):
             np.testing.assert_allclose(actual, expected)
         self.assertEqual(output.next_token_top_logprobs_idx, [[11], [31], [21, 22]])
+
+    def test_materialize_input_top_logprobs_without_next_token_outputs(self):
+        output = LogitsProcessorOutput(
+            next_token_logits=np.empty((2, 0)),
+            input_token_logprobs=np.array([0.1, 0.2, 0.3, 0.4], dtype=np.float32),
+            input_top_logprobs_val=np.array(
+                [[1.0, 1.1], [2.0, 2.1], [3.0, 3.1], [4.0, 4.1]], dtype=np.float32
+            ),
+            input_top_logprobs_idx=np.array(
+                [[11, 12], [21, 22], [31, 32], [41, 42]], dtype=np.int32
+            ),
+        )
+        batch = type(
+            "Batch",
+            (),
+            {
+                "dp_size": 2,
+                "per_dp_bs_size": 1,
+                "real_bs_per_dp": [1, 1],
+                "extend_seq_lens": np.array([2, 1], dtype=np.int32),
+                "extend_logprob_start_lens": np.array([0, 0], dtype=np.int32),
+                "top_logprobs_nums": [2, 1],
+                "token_ids_logprobs": None,
+            },
+        )()
+
+        gathered = []
+
+        def fake_process_allgather(value, *, tiled):
+            gathered.append(value)
+            return value
+
+        with (
+            mock.patch.object(tp_worker.jax, "device_get", lambda value: value),
+            mock.patch.object(tp_worker, "process_allgather", fake_process_allgather),
+        ):
+            ModelWorker._materialize_logprobs_to_host(
+                None,
+                output,
+                batch,
+                np.array([0, 1], dtype=np.int64),
+            )
+
+        self.assertEqual(len(gathered), 2)
+        np.testing.assert_allclose(output.input_token_logprobs, [0.1, 0.2, 0.3, 0.4])
+        for actual, expected in zip(
+            output.input_top_logprobs_val,
+            [[[1.0, 1.1], [2.0, 2.1]], [[3.0]]],
+            strict=True,
+        ):
+            np.testing.assert_allclose(actual, expected)
+        self.assertEqual(output.input_top_logprobs_idx, [[[11, 12], [21, 22]], [[31]]])
+
+
+class TestSpecPrefillLogprobPaths(unittest.TestCase):
+    def test_logprob_requests_do_not_skip_greedy_prefill_sample(self):
+        worker = object.__new__(BaseSpecWorker)
+        sampling_info = type("SamplingInfo", (), {"is_all_greedy": True})()
+
+        batch = type(
+            "Batch",
+            (),
+            {
+                "sampling_info": sampling_info,
+                "return_logprob": False,
+                "return_output_logprob_only": False,
+            },
+        )()
+
+        self.assertTrue(worker._can_skip_greedy_prefill_sample(batch, False))
+
+        batch.return_logprob = True
+        self.assertFalse(worker._can_skip_greedy_prefill_sample(batch, False))
+
+        batch.return_logprob = False
+        batch.return_output_logprob_only = True
+        self.assertFalse(worker._can_skip_greedy_prefill_sample(batch, False))
+
+        batch.return_output_logprob_only = False
+        self.assertFalse(worker._can_skip_greedy_prefill_sample(batch, True))
 
 
 if __name__ == "__main__":
