@@ -587,14 +587,34 @@ class SchedulerDisaggregationDecodeMixin:
 
             remote_block_ids = tuple(int(b) for b in info.get("remote_block_ids", ()))
             endpoints_json = info.get("raiden_endpoints_json", "") or ""
-            remote_endpoint: object
-            if endpoints_json:
-                remote_endpoint = _json.loads(endpoints_json)
+            p_info = entry.p_info
+            p_host = p_info["host"]
+            # Producer's advertised base control port: prefer the port carried in
+            # its endpoint descriptors, else the explicit control port field.
+            p_endpoints = _json.loads(endpoints_json) if endpoints_json else None
+            if p_endpoints:
+                base_port = int(str(p_endpoints[0]["endpoint"]).rsplit(":", 1)[1])
             else:
-                # Fall back to a "host:control_port" string when endpoints were
-                # not advertised (raiden accepts either form).
-                p_info = entry.p_info
-                remote_endpoint = f"{p_info['host']}:{int(info.get('local_control_port', 0))}"
+                base_port = int(info.get("local_control_port", 0))
+
+            # Shape remote_endpoint by the CONSUMER's local sub-manager count,
+            # mirroring tpu-inference's _remote_endpoint. A single sub-manager
+            # (TP=1 / single-chip) must get a plain "host:port" string; passing a
+            # list-of-dict here hits start_read's broadcast overload and raiden
+            # returns failed_recving immediately. Only >1 sub-managers use the
+            # shard-matched list form (base_port + i per local endpoint).
+            local_eps = self.disagg_kv_manager.raiden_wrapper.endpoints or []
+            remote_endpoint: object
+            if len(local_eps) <= 1:
+                remote_endpoint = f"{p_host}:{base_port}"
+            else:
+                remote_endpoint = [
+                    {
+                        "endpoint": f"{p_host}:{base_port + i}",
+                        "shards": list(ep["shards"]),
+                    }
+                    for i, ep in enumerate(local_eps)
+                ]
 
             # Local device block ids for D's freshly allocated slots. Mirror
             # _write_kv_to_pool's page derivation; take exactly as many blocks as
@@ -614,7 +634,6 @@ class SchedulerDisaggregationDecodeMixin:
                 )
 
             receiver = self.disagg_kv_manager.create_receiver(req.rid)
-            p_info = entry.p_info
             receiver.init(
                 PMetadata(
                     remote_addr=(f"{p_info['host']}:{p_info['transfer_port']}"),
