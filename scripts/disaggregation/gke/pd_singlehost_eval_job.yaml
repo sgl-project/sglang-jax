@@ -1,7 +1,9 @@
 # Single-host PD eval/benchmark job on GKE.
 # DeepSeek-R1-Distill-Qwen-1.5B, TP=1 per role on pd-v6e-1 (single chip/host).
 # Pod 0 runs bootstrap + prefill; pod 1 runs decode + router + a driver that
-# runs GSM8K (correctness) then a bench_serving smoke (in4k/out1k conc64).
+# runs GSM8K (correctness) then a conc=1 serial TTFT sweep (out=1, inputs
+# 512/1024/2048/4096) aligned to pd_ttft_profiling_report.md, to A/B raiden
+# latency against the path-A baseline table in pd_ttft_results.md.
 # Rendered by deploy.sh, which injects <JOB_NAME>/<SSH_KEY_B64>/<GH_ORG>/<BRANCH>.
 ---
 apiVersion: v1
@@ -66,6 +68,8 @@ spec:
           value: "16"
         - name: GSM_MAXTOK
           value: "512"
+        - name: TTFT_INPUTS
+          value: "512 1024 2048 4096"
         - name: SGLANG_JAX_USE_RAIDEN
           value: "1"
         - name: TF_CPP_MIN_LOG_LEVEL
@@ -247,25 +251,30 @@ spec:
             cat /tmp/gsm8k_result.jsonl 2>/dev/null || echo "(no gsm8k result, rc=${GSM_RC})"
 
             echo "=========================================="
-            echo "SMOKE conc=${CONCURRENCY} n=${NUM_PROMPTS} in=${INPUT_LEN} out=${OUTPUT_LEN} CAP=${CAP}"
+            echo "TTFT sweep conc=1 serial (out=1) inputs=${TTFT_INPUTS}"
+            echo "aligned to pd_ttft_profiling_report.md methodology"
             echo "=========================================="
             set +e
-            timeout 1800 python -m sgl_jax.bench_serving \
-              --backend sgl-jax \
-              --base-url http://localhost:30000 \
-              --model "$MODEL_PATH" \
-              --dataset-name random \
-              --random-input-len ${INPUT_LEN} \
-              --random-output-len ${OUTPUT_LEN} \
-              --random-range-ratio 1.0 \
-              --num-prompts ${NUM_PROMPTS} \
-              --max-concurrency ${CONCURRENCY} \
-              --warmup-requests 4 \
-              --output-file /tmp/bench_smoke.jsonl
-            SMOKE_RC=$?
+            for L in ${TTFT_INPUTS}; do
+              echo "--- TTFT input_len=${L} (warmup=3 measure=10, conc=1) ---"
+              timeout 900 python -m sgl_jax.bench_serving \
+                --backend sgl-jax \
+                --base-url http://localhost:30000 \
+                --model "$MODEL_PATH" \
+                --dataset-name random \
+                --random-input-len ${L} \
+                --random-output-len 1 \
+                --random-range-ratio 1.0 \
+                --num-prompts 13 \
+                --max-concurrency 1 \
+                --warmup-requests 3 \
+                --output-file /tmp/ttft_${L}.jsonl
+              echo "--- ttft result input_len=${L} (BRANCH=${BRANCH}) ---"
+              cat /tmp/ttft_${L}.jsonl 2>/dev/null || echo "(no ttft result for ${L})"
+            done
             set -e
-            echo "--- smoke result (BRANCH=${BRANCH}) ---"
-            cat /tmp/bench_smoke.jsonl 2>/dev/null || echo "(no smoke result, rc=${SMOKE_RC})"
+            echo "--- raiden decode PD-TIME-STATS kv_wait sample ---"
+            grep -E "PD-TIME-STATS" /tmp/decode_server.log 2>/dev/null | tail -60 || echo "(no PD-TIME-STATS)"
 
             echo "=========================================="
             echo "OOM/abort markers (decode): "
