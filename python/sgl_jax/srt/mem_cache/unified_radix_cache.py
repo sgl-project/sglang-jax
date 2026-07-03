@@ -156,11 +156,14 @@ class UnifiedRadixCache(BasePrefixCache):
         self.reset()
 
     def reset(self):
-        # Drain in-flight HiCache transfers before clearing state, otherwise
-        # the controller holds page refs that the reset forgets.
+        # Drain in-flight transfers and free old-tree host pages before
+        # dropping the tree, otherwise the host pool leaks allocated pages
+        # that have no tree owner left to free them.
         if self.hicache_controller is not None:
             self.hicache_controller.drain_pending()
             self.hicache_controller.drain_loads()
+        if self.hicache_enabled and self.host_pool is not None:
+            self._free_host_pages(self.root_node)
         self.root_node = UnifiedTreeNode(self.tree_components)
         self.root_node.key = RadixKey(token_ids=[], extra_key=None, dp_rank=None)
         self.root_node.component_data[BASE_COMPONENT_TYPE].value = []
@@ -837,6 +840,14 @@ class UnifiedRadixCache(BasePrefixCache):
         self.dec_lock_ref(node)
         self.ongoing_write[future] = (node, host_pages)
         return num_pages
+
+    def _free_host_pages(self, node: UnifiedTreeNode) -> None:
+        """Recursively free every node's host_value pages back to host_pool."""
+        cd = node.component_data[BASE_COMPONENT_TYPE]
+        if cd.host_value is not None:
+            self.host_pool.free([int(b) for b in cd.host_value])
+        for child in node.children.values():
+            self._free_host_pages(child)
 
     def precompile_hicache_transfers(self) -> None:
         """Precompile host<->device transfer kernels at startup (no-op if disabled)."""

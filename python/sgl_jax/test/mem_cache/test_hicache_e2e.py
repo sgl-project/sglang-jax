@@ -1012,6 +1012,43 @@ class TestOverlapE2E(HiCacheE2EBase):
         self.assertTrue(node.evicted)
 
 
+# ---- Reset / flush_cache host-pool integrity ----
+
+
+class TestResetHostCapacity(HiCacheE2EBase):
+    """reset() and flush_cache() must return all host pages to the pool."""
+
+    PAGE_SIZE = 1
+
+    def test_reset_restores_full_host_capacity(self):
+        total = self.host_pool.available_size()
+        tokens = [10, 11, 12, 13]
+        idx, _ = self._alloc_and_fill(len(tokens), seed=1)
+        self.cache.insert(InsertParams(key=_key(tokens), value=idx))
+        self.cache.insert(InsertParams(key=_key(tokens), value=idx))
+        self._settle_writes()
+        # Host pool consumed pages for the write-through backup.
+        self.assertLess(self.host_pool.available_size(), total)
+        self.cache.reset()
+        self.assertEqual(
+            self.host_pool.available_size(), total, "reset() must restore full host capacity"
+        )
+
+    def test_reset_clears_ongoing_writes(self):
+        tokens = [20, 21, 22, 23]
+        idx, _ = self._alloc_and_fill(len(tokens), seed=2)
+        self.cache.insert(InsertParams(key=_key(tokens), value=idx))
+        self.cache.insert(InsertParams(key=_key(tokens), value=idx))
+        self._settle_writes()
+        self.cache.reset()
+        self.assertEqual(len(self.cache.ongoing_write), 0)
+        self.assertEqual(len(self.cache.evictable_host_leaves), 0)
+
+
+class TestResetHostCapacityPage4(TestResetHostCapacity):
+    PAGE_SIZE = 4
+
+
 # ---- D3: dp_rank=1 page mapping ----
 
 
