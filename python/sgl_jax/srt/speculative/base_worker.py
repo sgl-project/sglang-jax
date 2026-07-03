@@ -139,6 +139,16 @@ class BaseSpecWorker:
             and not getattr(model_worker_batch, "return_output_logprob_only", False)
         )
 
+    def _can_skip_greedy_prefill_sample(
+        self, model_worker_batch: ModelWorkerBatch, legacy_non_overlap: bool
+    ) -> bool:
+        return (
+            model_worker_batch.sampling_info.is_all_greedy
+            and not legacy_non_overlap
+            and not getattr(model_worker_batch, "return_logprob", False)
+            and not getattr(model_worker_batch, "return_output_logprob_only", False)
+        )
+
     # -- Main entry point --
 
     def _prepare_overlap_sampling_info(self, model_worker_batch: ModelWorkerBatch):
@@ -228,7 +238,7 @@ class BaseSpecWorker:
                 self.mesh,
                 vocab_size=self.target_worker.model_config.vocab_size,
             )
-            if model_worker_batch.sampling_info.is_all_greedy and not legacy_non_overlap:
+            if self._can_skip_greedy_prefill_sample(model_worker_batch, legacy_non_overlap):
                 logits_output, _, cache_miss_count, bid, _seq_lens = self.forward_target_extend(
                     model_worker_batch,
                     sampling_metadata,

@@ -534,9 +534,14 @@ class ModelWorker:
                 forward_batch.forward_mode,
             )
 
+        # `selector` reorders DP-interleaved per-req tensors back to
+        # original request order. For DP=1 it's just np.arange(real_bs).
+        selector = model_worker_batch.logits_indices_selector
         if skip_sample:
             next_token_ids_device = None
             new_logits_output = None
+            if model_worker_batch.return_logprob:
+                self._materialize_logprobs_to_host(logits_output, model_worker_batch, selector)
         else:
             import jax._src.test_util as jtu
 
@@ -550,9 +555,6 @@ class ModelWorker:
                     sampling_metadata,
                 )
                 cache_miss_count += count()
-            # `selector` reorders DP-interleaved per-req tensors back to
-            # original request order. For DP=1 it's just np.arange(real_bs).
-            selector = model_worker_batch.logits_indices_selector
             if model_worker_batch.return_output_logprob_only:
                 logprobs = self.model_runner.compute_logprobs(token_logprobs, next_token_ids_device)
                 # compute_logprobs returns replicated per-request scalars; only
