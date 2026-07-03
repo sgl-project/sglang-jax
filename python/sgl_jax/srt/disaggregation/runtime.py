@@ -157,14 +157,13 @@ def install_disaggregation_wiring(scheduler: Scheduler, server_args: ServerArgs)
         # ``num_slots`` bounds concurrent in-flight receives on decode. Passing
         # ``host_blocks_to_allocate`` instead routes to raiden's legacy ctor
         # overload that leaves the slot pool unconfigured (max_blocks_=0) so
-        # every start_read fails the size guard immediately.
+        # every start_read fails the size guard immediately. Add headroom over
+        # max_seq_len/page_size: a max-length prompt spills into one extra page
+        # once BOS / chat-template tokens push it past the page boundary
+        # (observed 33 pages for a 4096-token input at page_size 128).
         page_size = max(1, int(server_args.page_size))
-        max_blocks = (int(server_args.max_seq_len) + page_size - 1) // page_size
-        num_slots = max(
-            16,
-            int(server_args.disaggregation_d2h_pool_size),
-            int(server_args.disaggregation_max_inflight_transfers),
-        )
+        max_blocks = (int(server_args.max_seq_len) + page_size - 1) // page_size + 8
+        num_slots = max(16, int(server_args.disaggregation_max_inflight_transfers) * 2)
         raiden_wrapper.start(
             kv_caches=list(kv_pool.kv_buffer),
             max_blocks=max_blocks,
