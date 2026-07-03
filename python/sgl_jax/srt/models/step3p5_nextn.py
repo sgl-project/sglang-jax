@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import os
 
 import jax
 import jax.numpy as jnp
@@ -172,7 +173,9 @@ class Step3p5MTPForCausalLM(nnx.Module):
     # (sglang-jax's EAGLE3 mechanism); `chain_mtp_hidden_states` tells the
     # multi-layer draft worker to feed it forward between layers.
     capture_aux_hidden_states = True
-    chain_mtp_hidden_states = True
+    # Default on; SGLANG_STEP3P5_CHAIN_MTP=0 disables chaining (falls back to
+    # feeding the target hidden to every MTP layer) for A/B correctness testing.
+    chain_mtp_hidden_states = os.getenv("SGLANG_STEP3P5_CHAIN_MTP", "1") != "0"
 
     @classmethod
     def patch_model_config(cls, mc: ModelConfig) -> None:
