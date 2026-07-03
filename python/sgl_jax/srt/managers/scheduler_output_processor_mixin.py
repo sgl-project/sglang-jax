@@ -704,18 +704,23 @@ class SchedulerOutputProcessorMixin:
         position; both must be passed.
         """
         nt_idx = i if local_idx is None else local_idx
-        req.output_token_logprobs_val.append(output.next_token_logprobs[i])
-        req.output_token_logprobs_idx.append(next_token_ids[nt_idx])
+        if output.next_token_logprobs is not None:
+            req.output_token_logprobs_val.append(output.next_token_logprobs[i])
+            req.output_token_logprobs_idx.append(next_token_ids[nt_idx])
 
-        self.add_input_logprob_return_values(
-            i, req, output, pt, num_input_logprobs, last_prefill_chunk=True
-        )
+        if num_input_logprobs > 0:
+            self.add_input_logprob_return_values(
+                i, req, output, pt, num_input_logprobs, last_prefill_chunk=True
+            )
 
-        if req.top_logprobs_num > 0:
+        if req.top_logprobs_num > 0 and output.next_token_top_logprobs_val is not None:
             req.output_top_logprobs_val.append(output.next_token_top_logprobs_val[i])
             req.output_top_logprobs_idx.append(output.next_token_top_logprobs_idx[i])
 
-        if req.token_ids_logprob is not None:
+        if (
+            req.token_ids_logprob is not None
+            and output.next_token_token_ids_logprobs_val is not None
+        ):
             req.output_token_ids_logprobs_val.append(output.next_token_token_ids_logprobs_val[i])
             req.output_token_ids_logprobs_idx.append(output.next_token_token_ids_logprobs_idx[i])
 

@@ -1771,7 +1771,10 @@ class Scheduler(
                 # Move the chunked request out of the batch so that we can merge
                 # only finished requests to running_batch.
                 chunked_req_to_exclude[dp_rank] = self.chunked_reqs[dp_rank]
-                _chunk_tree.cache_unfinished_req(self.chunked_reqs[dp_rank])
+                if len(self.chunked_reqs[dp_rank].fill_ids) > len(
+                    self.chunked_reqs[dp_rank].prefix_indices
+                ):
+                    _chunk_tree.cache_unfinished_req(self.chunked_reqs[dp_rank])
 
         # Merge the prefill batch into the running batch
         if self.last_batch and self.last_batch.forward_mode.is_extend():
