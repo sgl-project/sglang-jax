@@ -1,5 +1,6 @@
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 
@@ -196,9 +197,9 @@ class TestSchedulerIdleCheck(unittest.TestCase):
             token_ids_logprob=[7, 8],
         )
         batch = SimpleNamespace(
-            dp_size=1,
+            dp_size=2,
             per_dp_bs_size=1,
-            reqs_info=[SimpleNamespace(reqs=[req])],
+            reqs_info=[SimpleNamespace(reqs=[req]), SimpleNamespace(reqs=[])],
             return_logprob=True,
             return_output_logprob_only=False,
         )
@@ -225,9 +226,20 @@ class TestSchedulerIdleCheck(unittest.TestCase):
             num_accepted_tokens=None,
         )
 
-        SchedulerOutputProcessorMixin.process_batch_result_decode(scheduler, batch, result)
+        gathered = []
+
+        def fake_process_allgather(value, *, tiled):
+            gathered.append(value)
+            return value
+
+        with mock.patch(
+            "jax.experimental.multihost_utils.process_allgather",
+            fake_process_allgather,
+        ):
+            SchedulerOutputProcessorMixin.process_batch_result_decode(scheduler, batch, result)
 
         self.assertEqual(req.output_ids, [101, 102])
+        self.assertEqual(len(gathered), 3)
         self.assertEqual(req.output_token_logprobs_idx, [101, 102])
         np.testing.assert_allclose(req.output_token_logprobs_val, [-0.1, -0.2])
         self.assertEqual(req.output_top_logprobs_idx, [[10, 11], [20, 21]])
