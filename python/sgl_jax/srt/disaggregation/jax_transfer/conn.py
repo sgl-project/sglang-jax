@@ -73,6 +73,13 @@ class PMetadata:
     ``"host:control_port"`` string); ``remote_block_ids`` are P's device block
     (page) ids for this request; ``local_block_ids`` are D's pre-allocated
     device block ids. All None/empty on the path-A code path.
+
+    Chunked raiden transfer: ``bootstrap_room`` lets the receiver re-poll
+    bootstrap for per-chunk metadata as P produces it, and ``local_pages`` is
+    D's whole-prompt device page id list (in sequence order) that the receiver
+    slices per chunk via each chunk's ``chunk_page_offset``. For chunked
+    transfer ``remote_block_ids`` / ``local_block_ids`` are None (per-chunk
+    block lists come from bootstrap instead).
     """
 
     remote_addr: str
@@ -83,6 +90,8 @@ class PMetadata:
     remote_endpoint: object | None = None
     remote_block_ids: tuple[int, ...] | None = None
     local_block_ids: tuple[int, ...] | None = None
+    bootstrap_room: int | None = None
+    local_pages: tuple[int, ...] | None = None
 
 
 @dataclass
@@ -334,6 +343,9 @@ class JaxTransferKVManager(CommonKVManager):
         *,
         bootstrap_room: int | None = None,
         transfer_id: str | None = None,
+        chunk_index: int = 0,
+        num_chunks: int = 0,
+        chunk_page_offset: int = 0,
     ) -> bool:
         """raiden producer handoff: mark ``block_ids`` readable and publish the
         per-request block metadata to bootstrap so D can pull.
@@ -342,17 +354,25 @@ class JaxTransferKVManager(CommonKVManager):
         Unlike path-A there is no D2H staging and no HBM buffer to keep alive:
         raiden references the device pool blocks directly and pulls them on
         demand, so the sender holds no payload reference.
+
+        For chunked transfer each chunk is registered as its own raiden uuid
+        (register_read is overwrite-per-uuid, not cumulative); ``chunk_index`` /
+        ``num_chunks`` / ``chunk_page_offset`` are forwarded to bootstrap so D
+        can discover and place each chunk.
         """
 
         if self._raiden_wrapper is None:
             raise RuntimeError("producer_register_read requires a raiden_wrapper on the manager")
         needed = self._raiden_wrapper.register_read(req_id, _uuid_to_int(uuid), block_ids)
         logger.warning(
-            "RAIDEN-P register_read req_id=%s uuid=%s uuid_int=%s room=%s nblocks=%d blocks=%s needed=%s",
+            "RAIDEN-P register_read req_id=%s uuid=%s uuid_int=%s room=%s chunk=%d/%s off=%d nblocks=%d blocks=%s needed=%s",
             req_id,
             uuid,
             _uuid_to_int(uuid),
             bootstrap_room,
+            chunk_index,
+            num_chunks or "?",
+            chunk_page_offset,
             len(block_ids),
             list(block_ids)[:8],
             needed,
@@ -369,6 +389,9 @@ class JaxTransferKVManager(CommonKVManager):
                 transfer_id or uuid,
                 block_ids,
                 raiden_endpoints_json=_json.dumps(endpoints) if endpoints is not None else "",
+                chunk_index=chunk_index,
+                num_chunks=num_chunks,
+                chunk_page_offset=chunk_page_offset,
             )
         return needed
 
@@ -411,8 +434,11 @@ class JaxTransferKVSender(KVSender, StateHolder):
         self._status: TransferStatus | None = None
         # raiden path: device block ids to register + bootstrap room for the
         # P->D block-metadata publish. ``_use_raiden`` mirrors the manager.
+        # Chunked transfer registers one raiden uuid per chunk (register_read is
+        # overwrite-per-uuid, not cumulative), so we track them per chunk_index.
         self._use_raiden: bool = mgr.use_raiden
-        self._block_ids: list[int] | None = None
+        self._started_chunks: set[int] = set()
+        self._num_chunks: int | None = None
         self._bootstrap_room: int | None = None
         self._state_lock = threading.Lock()
         self._ack_timer: object | None = None
@@ -446,20 +472,53 @@ class JaxTransferKVSender(KVSender, StateHolder):
         self._use_d2h_staging = use_d2h_staging
         self._buffer_id = buffer_id
 
-    def attach_block_ids(self, block_ids: list[int], *, bootstrap_room: int | None) -> None:
-        """raiden path: attach the device block (page) ids of this request +
-        the bootstrap room used to publish them to D. No payload is captured —
-        raiden reads the device pool blocks directly on pull."""
+    def send_chunk(
+        self,
+        chunk_index: int,
+        block_ids: list[int],
+        *,
+        bootstrap_room: int | None,
+        is_final: bool,
+        chunk_page_offset: int = 0,
+    ) -> None:
+        """raiden chunked send: register THIS chunk's device blocks as readable
+        and publish their layout to D under a per-chunk uuid ``f"{uuid}#c{k}"``.
 
-        if self._block_ids is not None:
-            raise RuntimeError(f"sender {self._req_id!r} block_ids already attached")
-        self._block_ids = list(block_ids)
-        self._bootstrap_room = bootstrap_room
+        Called once per chunk right after that chunk's forward, so the transfer
+        overlaps the next chunk's compute. No zmq callback — SUCCESS is driven by
+        ``poll()`` once every chunk's ``done_sending`` is observed. ``is_final``
+        marks the last chunk (fixes ``_num_chunks = chunk_index + 1``)."""
+
+        with self._state_lock:
+            self._bootstrap_room = bootstrap_room
+            cu = f"{self.uuid}#c{chunk_index}"
+            num_chunks = (chunk_index + 1) if is_final else 0
+            self._mgr.producer_register_read(
+                cu,
+                cu,
+                block_ids,
+                bootstrap_room=bootstrap_room,
+                transfer_id=cu,
+                chunk_index=chunk_index,
+                num_chunks=num_chunks,
+                chunk_page_offset=chunk_page_offset,
+            )
+            self._started_chunks.add(chunk_index)
+            if is_final:
+                self._num_chunks = chunk_index + 1
+            if self.state == KVPoll.WAITING_FOR_INPUT:
+                self._transition_to(KVPoll.TRANSFERRING)
+                self._ack_timer = time_phase("ack", "prefill")
+                self._ack_timer.__enter__()
+                import time as _time
+
+                self._transfer_started_at = _time.monotonic()
 
     def send(self) -> None:
         if self._use_raiden:
-            self._send_raiden()
-            return
+            raise RuntimeError(
+                f"sender {self._req_id!r} uses raiden; call send_chunk() per chunk, not send()"
+            )
         if self._payload is None:
             raise RuntimeError(
                 f"sender {self._req_id!r} has no payload attached; "
@@ -495,31 +554,6 @@ class JaxTransferKVSender(KVSender, StateHolder):
 
             self._transfer_started_at = _time.monotonic()
 
-    def _send_raiden(self) -> None:
-        """raiden send: register the request's device blocks as readable and
-        publish their layout to D. No zmq callback — SUCCESS is driven by
-        ``poll()`` reading ``poll_stats().done_sending``."""
-
-        if self._block_ids is None:
-            raise RuntimeError(
-                f"sender {self._req_id!r} has no block_ids attached; "
-                "call attach_block_ids() before send()"
-            )
-        with self._state_lock:
-            self._mgr.producer_register_read(
-                self._req_id,
-                self.uuid,
-                self._block_ids,
-                bootstrap_room=self._bootstrap_room,
-                transfer_id=self.uuid,
-            )
-            self._transition_to(KVPoll.TRANSFERRING)
-            self._ack_timer = time_phase("ack", "prefill")
-            self._ack_timer.__enter__()
-            import time as _time
-
-            self._transfer_started_at = _time.monotonic()
-
     def poll(self) -> KVPoll:
         if self._use_raiden:
             return self._poll_raiden()
@@ -530,9 +564,15 @@ class JaxTransferKVSender(KVSender, StateHolder):
         with self._state_lock:
             if self.state != KVPoll.TRANSFERRING:
                 return self.state
+            num_chunks = self._num_chunks
         # Refresh the manager's cached raiden done set, then check membership.
         self._mgr.poll_raiden()
-        if not self._mgr.raiden_sender_done(self._req_id):
+        # Not done until P has published the FINAL chunk AND every chunk's
+        # done_sending has been observed. Each chunk is its own raiden req_id.
+        if num_chunks is None:
+            return KVPoll.TRANSFERRING
+        chunk_req_ids = [f"{self.uuid}#c{k}" for k in range(num_chunks)]
+        if not all(self._mgr.raiden_sender_done(cu) for cu in chunk_req_ids):
             return KVPoll.TRANSFERRING
         with self._state_lock:
             if self.state != KVPoll.TRANSFERRING:
@@ -547,7 +587,8 @@ class JaxTransferKVSender(KVSender, StateHolder):
                 state=KVPoll.SUCCESS,
                 reason="raiden_done_sending",
             )
-        self._mgr.raiden_forget(self._req_id)
+        for cu in chunk_req_ids:
+            self._mgr.raiden_forget(cu)
         self._mgr._prune_sender(self._req_id)
         return KVPoll.SUCCESS
 
@@ -677,10 +718,12 @@ class JaxTransferKVReceiver(KVReceiver, StateHolder):
         self._results: dict[str, jax.Array] | None = None
         self._pull_timer: object | None = None
         self._transfer_started_at: float | None = None
-        # raiden path: mirrors the manager. ``_started_read`` guards the
-        # one-shot ``start_read`` so a repeated poll never re-issues the pull.
+        # raiden path: mirrors the manager. Chunked transfer issues one
+        # ``start_read`` per chunk (each its own uuid), so track which chunks
+        # have been started and the total once P publishes its final chunk.
         self._use_raiden: bool = mgr.use_raiden
-        self._started_read: bool = False
+        self._started_chunks: set[int] = set()
+        self._num_chunks: int | None = None
         self._state_lock = threading.Lock()
 
     @property
@@ -821,20 +864,18 @@ class JaxTransferKVReceiver(KVReceiver, StateHolder):
         return self.state
 
     def _poll_raiden(self) -> KVPoll:
-        """raiden receiver drive: on the first WAITING_FOR_INPUT poll, issue
-        ``start_read`` (P's blocks -> D's pre-allocated blocks) and move to
-        TRANSFERRING. Subsequent polls read ``poll_stats().done_recving`` /
-        ``failed_recving`` via the manager's cached sets. No ZMQ ack and no
-        Pallas write-back: raiden lands the blocks straight into D's device KV
-        pool, so SUCCESS is purely a completion signal.
+        """raiden receiver drive (chunked): discover per-chunk metadata from
+        bootstrap and issue one ``start_read`` per chunk as P produces them, so
+        each chunk's pull overlaps the next chunk's prefill compute. SUCCESS once
+        P has published its final chunk AND every chunk's ``done_recving`` is
+        observed; FAILED if any chunk fails. No ZMQ ack, no Pallas write-back:
+        raiden lands blocks straight into D's device KV pool.
         """
 
         state = self.state
         if state == KVPoll.WAITING_FOR_INPUT:
             if self._metadata is None:
-                raise RuntimeError(
-                    "JaxTransferKVReceiver.init() must be called before poll()"
-                )
+                raise RuntimeError("JaxTransferKVReceiver.init() must be called before poll()")
             import time as _time
 
             with self._state_lock:
@@ -844,74 +885,39 @@ class JaxTransferKVReceiver(KVReceiver, StateHolder):
                 self._pull_timer = time_phase("pull", "decode")
                 self._pull_timer.__enter__()
                 self._transfer_started_at = _time.monotonic()
-                if not self._started_read:
-                    self._started_read = True
-                    md = self._metadata
-                    logger.warning(
-                        "RAIDEN-D start_read req_id=%s uuid=%s uuid_int=%s remote_ep=%r "
-                        "n_remote=%d remote=%s n_local=%d local=%s",
-                        self._req_id,
-                        md.uuid,
-                        _uuid_to_int(md.uuid),
-                        md.remote_endpoint,
-                        len(md.remote_block_ids or ()),
-                        list(md.remote_block_ids or ())[:8],
-                        len(md.local_block_ids or ()),
-                        list(md.local_block_ids or ())[:8],
-                    )
-                    try:
-                        self._mgr.raiden_wrapper.start_read(
-                            self._req_id,
-                            _uuid_to_int(md.uuid),
-                            md.remote_endpoint,
-                            list(md.remote_block_ids or ()),
-                            list(md.local_block_ids or ()),
-                        )
-                    except Exception:
-                        self._transition_to(KVPoll.FAILED)
-                        self._close_pull_timer()
-                        self._transfer_started_at = None
-                        self._mgr.record_terminal(
-                            self._req_id,
-                            role="decode",
-                            transfer_id=md.uuid,
-                            state=KVPoll.FAILED,
-                            reason="raiden_start_read",
-                        )
-                        with suppress(Exception):
-                            PD_TRANSFER_FAILURES_TOTAL.labels(
-                                reason="raiden_start_read", role="decode"
-                            ).inc()
-                        self._mgr._prune_receiver(self._req_id)
-                        return self.state
+            # Kick off chunk 0 (and any already-published chunks) right away.
+            self._discover_and_start_chunks()
             return self.state
 
         if state == KVPoll.TRANSFERRING:
+            # (a) Discover + start newly-published chunks. Bounded: does nothing
+            # once all chunks are known and started (no bootstrap GET on the hot
+            # completion-poll path — avoids the conc128 sync-GET freeze).
+            self._discover_and_start_chunks()
+            if self.state != KVPoll.TRANSFERRING:
+                # Discovery hit a fatal error (start_read / block mismatch) and
+                # already moved us to FAILED; nothing more to poll.
+                return self.state
+            # (b) Completion accounting over the cached raiden done/failed sets.
             self._mgr.poll_raiden()
-            rstate = self._mgr.raiden_receiver_state(self._req_id)
-            if rstate is None:
-                return state
             assert self._metadata is not None
+            base = self._metadata.uuid
+            with self._state_lock:
+                num_chunks = self._num_chunks
+                started = list(self._started_chunks)
+            for k in started:
+                if self._mgr.raiden_receiver_state(f"{base}#c{k}") == "failed":
+                    self._fail_raiden(reason="raiden_failed_recving")
+                    return self.state
+            if num_chunks is None:
+                return self.state
+            chunk_req_ids = [f"{base}#c{k}" for k in range(num_chunks)]
+            if not all(
+                self._mgr.raiden_receiver_state(cu) == "done" for cu in chunk_req_ids
+            ):
+                return self.state
             with self._state_lock:
                 if self.state != KVPoll.TRANSFERRING:
-                    return self.state
-                if rstate == "failed":
-                    self._transition_to(KVPoll.FAILED)
-                    self._close_pull_timer()
-                    self._transfer_started_at = None
-                    self._mgr.record_terminal(
-                        self._req_id,
-                        role="decode",
-                        transfer_id=self._metadata.uuid,
-                        state=KVPoll.FAILED,
-                        reason="raiden_failed_recving",
-                    )
-                    with suppress(Exception):
-                        PD_TRANSFER_FAILURES_TOTAL.labels(
-                            reason="raiden_failed_recving", role="decode"
-                        ).inc()
-                    self._mgr.raiden_forget(self._req_id)
-                    self._mgr._prune_receiver(self._req_id)
                     return self.state
                 self._transition_to(KVPoll.SUCCESS)
                 self._close_pull_timer()
@@ -919,13 +925,137 @@ class JaxTransferKVReceiver(KVReceiver, StateHolder):
                 self._mgr.record_terminal(
                     self._req_id,
                     role="decode",
-                    transfer_id=self._metadata.uuid,
+                    transfer_id=base,
                     state=KVPoll.SUCCESS,
                     reason="raiden_done_recving",
                 )
-            self._mgr.raiden_forget(self._req_id)
+            for cu in chunk_req_ids:
+                self._mgr.raiden_forget(cu)
+            self._pop_bootstrap_room()
             self._mgr._prune_receiver(self._req_id)
         return self.state
+
+    def _discover_and_start_chunks(self) -> None:
+        """Poll bootstrap once for this room's published chunks and issue
+        ``start_read`` for any not yet started. No-op once every chunk is known
+        and started, so the steady-state completion poll never hits the network.
+        """
+
+        with self._state_lock:
+            if self.state != KVPoll.TRANSFERRING:
+                return
+            if self._num_chunks is not None and len(self._started_chunks) >= self._num_chunks:
+                return
+            md = self._metadata
+        assert md is not None
+        bc = self._mgr.bootstrap_client
+        if bc is None or md.bootstrap_room is None:
+            return
+        try:
+            info = bc.get_transfer_info(md.bootstrap_room)
+        except Exception:  # noqa: BLE001
+            logger.exception("raiden get_transfer_info raised for room=%s", md.bootstrap_room)
+            return
+        if info is None:
+            return
+        chunks = info.get("chunks", {}) or {}
+        num_chunks = int(info.get("num_chunks", 0) or 0)
+        local_pages = md.local_pages or ()
+        for chunk_index in sorted(chunks):
+            with self._state_lock:
+                if chunk_index in self._started_chunks:
+                    continue
+            chunk_info = chunks[chunk_index]
+            remote_block_ids = [int(b) for b in chunk_info.get("remote_block_ids", ())]
+            page_offset = int(chunk_info.get("chunk_page_offset", 0) or 0)
+            n = len(remote_block_ids)
+            local_block_ids = [int(p) for p in local_pages[page_offset : page_offset + n]]
+            if len(local_block_ids) != n:
+                logger.error(
+                    "raiden chunk local/remote mismatch req_id=%s chunk=%d "
+                    "remote=%d local=%d off=%d total_local=%d",
+                    self._req_id,
+                    chunk_index,
+                    n,
+                    len(local_block_ids),
+                    page_offset,
+                    len(local_pages),
+                )
+                self._fail_raiden(reason="raiden_chunk_local_mismatch")
+                return
+            cu = f"{md.uuid}#c{chunk_index}"
+            logger.warning(
+                "RAIDEN-D start_read cu=%s uuid_int=%s remote_ep=%r off=%d "
+                "n=%d remote=%s local=%s",
+                cu,
+                _uuid_to_int(cu),
+                md.remote_endpoint,
+                page_offset,
+                n,
+                remote_block_ids[:8],
+                local_block_ids[:8],
+            )
+            try:
+                self._mgr.raiden_wrapper.start_read(
+                    cu,
+                    _uuid_to_int(cu),
+                    md.remote_endpoint,
+                    remote_block_ids,
+                    local_block_ids,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("raiden start_read raised for cu=%s", cu)
+                self._fail_raiden(reason="raiden_start_read")
+                return
+            with self._state_lock:
+                self._started_chunks.add(chunk_index)
+        if num_chunks > 0:
+            with self._state_lock:
+                self._num_chunks = num_chunks
+
+    def _fail_raiden(self, *, reason: str) -> None:
+        """Transition a raiden receiver to FAILED and drop its per-chunk raiden
+        + bootstrap state. Idempotent vs. a concurrent reaper ``fail()``."""
+
+        with self._state_lock:
+            if self.state in (KVPoll.SUCCESS, KVPoll.FAILED):
+                return
+            try:
+                self._transition_to(KVPoll.FAILED)
+            except ValueError:
+                return
+            self._close_pull_timer()
+            self._transfer_started_at = None
+            md = self._metadata
+            transfer_id = md.uuid if md is not None else self._req_id
+            started = list(self._started_chunks)
+            self._mgr.record_terminal(
+                self._req_id,
+                role="decode",
+                transfer_id=transfer_id,
+                state=KVPoll.FAILED,
+                reason=reason,
+            )
+        with suppress(Exception):
+            PD_TRANSFER_FAILURES_TOTAL.labels(reason=reason, role="decode").inc()
+        if md is not None:
+            for k in started:
+                self._mgr.raiden_forget(f"{md.uuid}#c{k}")
+        self._pop_bootstrap_room()
+        self._mgr._prune_receiver(self._req_id)
+
+    def _pop_bootstrap_room(self) -> None:
+        """Best-effort: tell bootstrap to drop this room's chunk table so it
+        stays bounded once the transfer is terminal."""
+
+        md = self._metadata
+        if md is None or md.bootstrap_room is None:
+            return
+        bc = self._mgr.bootstrap_client
+        if bc is None:
+            return
+        with suppress(Exception):
+            bc.pop_transfer(md.bootstrap_room)
 
     def _run_pull(self) -> None:
         """Run the pull on a background worker thread, off the decode

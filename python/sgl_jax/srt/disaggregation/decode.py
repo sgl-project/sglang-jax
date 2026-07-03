@@ -585,8 +585,15 @@ class SchedulerDisaggregationDecodeMixin:
         try:
             import json as _json
 
-            remote_block_ids = tuple(int(b) for b in info.get("remote_block_ids", ()))
-            endpoints_json = info.get("raiden_endpoints_json", "") or ""
+            # Chunked transfer: P publishes one entry per chunk. Admit as soon as
+            # chunk 0 exists; the receiver discovers + starts the rest as P
+            # produces them (transfer/compute overlap). The endpoint descriptor
+            # is chunk-independent, so read it from the first available chunk.
+            chunks = info.get("chunks", {}) or {}
+            if not chunks:
+                return None
+            first_info = chunks[min(chunks)]
+            endpoints_json = first_info.get("raiden_endpoints_json", "") or ""
             p_info = entry.p_info
             p_host = p_info["host"]
             # Producer's advertised base control port: prefer the port carried in
@@ -595,7 +602,7 @@ class SchedulerDisaggregationDecodeMixin:
             if p_endpoints:
                 base_port = int(str(p_endpoints[0]["endpoint"]).rsplit(":", 1)[1])
             else:
-                base_port = int(info.get("local_control_port", 0))
+                base_port = int(first_info.get("local_control_port", 0))
 
             # Shape remote_endpoint by the CONSUMER's local sub-manager count,
             # mirroring tpu-inference's _remote_endpoint. A single sub-manager
@@ -616,22 +623,15 @@ class SchedulerDisaggregationDecodeMixin:
                     for i, ep in enumerate(local_eps)
                 ]
 
-            # Local device block ids for D's freshly allocated slots. Mirror
-            # _write_kv_to_pool's page derivation; take exactly as many blocks as
-            # P advertised so remote/local line up one-to-one.
+            # Whole-prompt local device page ids (sequence order). The receiver
+            # slices these per chunk via each chunk's chunk_page_offset, so the
+            # local blocks line up one-to-one with P's per-chunk remote blocks.
             kv_indices_np = (
                 np.asarray(kv_indices)
                 if not isinstance(kv_indices, np.ndarray)
                 else kv_indices
             )
-            local_pages = kv_indices_np[::page_size] // page_size
-            n = len(remote_block_ids)
-            local_block_ids = tuple(int(b) for b in local_pages[:n])
-            if len(local_block_ids) != n:
-                raise RuntimeError(
-                    f"raiden block count mismatch for req_id={req.rid!r}: "
-                    f"remote={n} local={len(local_block_ids)}"
-                )
+            local_pages = tuple(int(p) for p in (kv_indices_np[::page_size] // page_size))
 
             receiver = self.disagg_kv_manager.create_receiver(req.rid)
             receiver.init(
@@ -642,8 +642,8 @@ class SchedulerDisaggregationDecodeMixin:
                     p_side_channel_host=str(p_info["host"]),
                     p_side_channel_port=int(p_info["side_channel_port"]),
                     remote_endpoint=remote_endpoint,
-                    remote_block_ids=remote_block_ids,
-                    local_block_ids=local_block_ids,
+                    bootstrap_room=req.bootstrap_room,
+                    local_pages=local_pages,
                 )
             )
         except Exception:

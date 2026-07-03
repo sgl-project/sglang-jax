@@ -170,6 +170,16 @@ class RegisterTransferRequest(BaseModel):
     # resolved its peer can skip the second lookup by reading them here.
     local_control_port: int = 0
     raiden_endpoints_json: str = ""
+    # Chunked KV transfer: P publishes one entry per chunk (each an independent
+    # raiden uuid, since register_read is overwrite-per-uuid not cumulative).
+    # ``chunk_index`` is 0..N-1; ``num_chunks`` is set to N on the FINAL chunk
+    # (0 means "more chunks coming"), so D learns the total once P is done.
+    # ``chunk_page_offset`` is the sequence-relative page index where this chunk
+    # starts, so D can slice the matching pages of its whole-prompt kv_indices
+    # without having to reproduce P's chunk boundaries.
+    chunk_index: int = 0
+    num_chunks: int = 0
+    chunk_page_offset: int = 0
 
 
 class HeartbeatRequest(BaseModel):
@@ -190,9 +200,15 @@ class _Registry:
     ttl_seconds: float = HEARTBEAT_TTL_SECONDS
     clock: Callable[[], float] = time.monotonic
     # raiden per-request block metadata, keyed by bootstrap_room. Written by P
-    # (register_read side) and read once by D at admission. Consumed on read so
-    # the table stays bounded; a room re-lookup after consumption returns None.
-    transfers: dict[int, dict[str, object]] = field(default_factory=dict)
+    # (register_read side) and read by D at admission + on every poll tick.
+    # Chunked transfer publishes one entry per chunk, so the value is an inner
+    # dict keyed by chunk_index. Accumulated (not overwritten) so D can learn
+    # about new chunks as P produces them; a room is popped explicitly by D once
+    # the whole transfer is done (or by TTL) to keep the table bounded.
+    transfers: dict[int, dict[int, dict[str, object]]] = field(default_factory=dict)
+    # Per room: N once P has published its FINAL chunk (num_chunks>0); absent
+    # until then so D keeps polling instead of assuming the transfer is complete.
+    transfer_num_chunks: dict[int, int] = field(default_factory=dict)
 
     def now(self) -> float:
         return self.clock()  # type: ignore[no-any-return]
@@ -255,16 +271,40 @@ class _Registry:
 
     def register_transfer(self, info: dict[str, object]) -> None:
         with self.lock:
-            self.transfers[int(info["bootstrap_room"])] = info
+            room = int(info["bootstrap_room"])
+            chunk_index = int(info.get("chunk_index", 0) or 0)
+            self.transfers.setdefault(room, {})[chunk_index] = info
+            num_chunks = int(info.get("num_chunks", 0) or 0)
+            if num_chunks > 0:
+                self.transfer_num_chunks[room] = num_chunks
 
-    def take_transfer(self, bootstrap_room: int) -> dict[str, object] | None:
-        """Pop the per-request block metadata for ``bootstrap_room``.
+    def get_transfer_chunks(self, bootstrap_room: int) -> dict[str, object] | None:
+        """Read (without consuming) all chunk metadata P has published for
+        ``bootstrap_room``.
 
-        Consumed on read: the single-shot pull needs it exactly once. Returns
-        None if P has not registered it yet (D defers + retries next tick).
+        Returns ``{"chunks": {chunk_index: info, ...}, "num_chunks": N}`` where
+        ``num_chunks`` is 0 until P publishes its final chunk. D polls this every
+        tick to discover newly-published chunks; it pops the room via
+        :meth:`pop_room` once the whole transfer is done. Returns None if P has
+        not registered any chunk yet (D defers + retries).
         """
         with self.lock:
-            return self.transfers.pop(int(bootstrap_room), None)
+            room = int(bootstrap_room)
+            chunks = self.transfers.get(room)
+            if not chunks:
+                return None
+            return {
+                "chunks": dict(chunks),
+                "num_chunks": self.transfer_num_chunks.get(room, 0),
+            }
+
+    def pop_room(self, bootstrap_room: int) -> None:
+        """Drop all chunk metadata for ``bootstrap_room`` (D calls this on
+        SUCCESS/failure so the table stays bounded)."""
+        with self.lock:
+            room = int(bootstrap_room)
+            self.transfers.pop(room, None)
+            self.transfer_num_chunks.pop(room, None)
 
 
 def build_app(
@@ -351,7 +391,7 @@ def build_app(
 
     @app.get("/get_transfer_info")
     def get_transfer_info(bootstrap_room: int) -> dict[str, object]:
-        info = registry.take_transfer(bootstrap_room)
+        info = registry.get_transfer_chunks(bootstrap_room)
         if info is None:
             # Not registered yet: 404 lets the decode side treat it as
             # "defer + retry" (never abort) rather than a hard error.
@@ -360,6 +400,11 @@ def build_app(
                 detail=f"no transfer info for bootstrap_room={bootstrap_room}",
             )
         return info
+
+    @app.post("/pop_transfer")
+    def pop_transfer(bootstrap_room: int) -> dict[str, str]:
+        registry.pop_room(bootstrap_room)
+        return {"status": "popped"}
 
     # Bootstrap runs as a standalone single process and does NOT inherit
     # PROMETHEUS_MULTIPROC_DIR, so it exposes its own default-registry
@@ -621,10 +666,14 @@ class BootstrapClient:
         *,
         local_control_port: int = 0,
         raiden_endpoints_json: str = "",
+        chunk_index: int = 0,
+        num_chunks: int = 0,
+        chunk_page_offset: int = 0,
     ) -> None:
-        """P: publish per-request block metadata for raiden pull (keyed by
-        room). Best-effort with the shared client timeout; the caller treats a
-        failure as a transfer failure for that request."""
+        """P: publish per-chunk block metadata for raiden pull (keyed by room +
+        chunk_index). Best-effort with the shared client timeout; the caller
+        treats a failure as a transfer failure for that request. ``num_chunks``
+        is set to N only on the final chunk (0 means more chunks coming)."""
 
         payload = {
             "bootstrap_room": bootstrap_room,
@@ -632,6 +681,9 @@ class BootstrapClient:
             "remote_block_ids": list(remote_block_ids),
             "local_control_port": local_control_port,
             "raiden_endpoints_json": raiden_endpoints_json,
+            "chunk_index": chunk_index,
+            "num_chunks": num_chunks,
+            "chunk_page_offset": chunk_page_offset,
         }
         r = self._client.post(
             f"{self._base_url}/register_transfer",
@@ -642,9 +694,10 @@ class BootstrapClient:
         r.raise_for_status()
 
     def get_transfer_info(self, bootstrap_room: int) -> dict[str, object] | None:
-        """D: fetch (and consume) the per-request block metadata P registered
-        for ``bootstrap_room``. Returns None if not registered yet (404) so the
-        caller defers + retries rather than aborting."""
+        """D: fetch (without consuming) all chunk metadata P published for
+        ``bootstrap_room``. Returns ``{"chunks": {int: info}, "num_chunks": N}``
+        with int chunk-index keys, or None if nothing registered yet (404) so
+        the caller defers + retries rather than aborting."""
 
         r = self._client.get(
             f"{self._base_url}/get_transfer_info",
@@ -655,7 +708,23 @@ class BootstrapClient:
         if r.status_code == 404:
             return None
         r.raise_for_status()
-        return r.json()
+        body = r.json()
+        # JSON turns the inner dict's int keys into strings; normalize back.
+        raw_chunks = body.get("chunks", {}) or {}
+        chunks = {int(k): v for k, v in raw_chunks.items()}
+        return {"chunks": chunks, "num_chunks": int(body.get("num_chunks", 0) or 0)}
+
+    def pop_transfer(self, bootstrap_room: int) -> None:
+        """D: drop the room's chunk metadata once the whole transfer is done
+        (or failed), keeping the bootstrap table bounded. Best-effort."""
+
+        r = self._client.post(
+            f"{self._base_url}/pop_transfer",
+            params={"bootstrap_room": bootstrap_room},
+            timeout=self._timeout_s,
+            headers=self._headers(),
+        )
+        r.raise_for_status()
 
 
 class PrefillInfoCache:

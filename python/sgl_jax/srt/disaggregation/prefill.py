@@ -224,65 +224,26 @@ class SchedulerDisaggregationPrefillMixin:
         self.set_next_batch_sampling_info_done(batch)
 
         chunked_now = tuple(r for r in getattr(self, "chunked_reqs", ()) if r is not None)
+        use_raiden = self.disagg_kv_manager.use_raiden
         for req in batch.reqs:
             if req.bootstrap_room is None:
                 continue
-            if any(req is cr for cr in chunked_now):
+            req_id = req.rid
+            is_mid_chunk = any(req is cr for cr in chunked_now)
+            if use_raiden:
+                # raiden path: hand off THIS chunk's device page subset now (no
+                # gather / no D2H). Each chunk is published as its own uuid so
+                # its pull overlaps the next chunk's compute. Mid-chunk reqs are
+                # NOT skipped — that is the whole point of chunked transfer.
+                self._raiden_handoff_chunk(req, req_id, is_final=not is_mid_chunk)
+                continue
+            # path A (D2H / HBM): single-shot, extract on the FINAL chunk only.
+            if is_mid_chunk:
                 # Still mid-chunk: KV is incomplete, and releasing the
                 # req_pool_idx here would leak the slot the next chunk
                 # round re-allocates. Extract on the final chunk.
                 continue
-            req_id = req.rid
             if req_id in self.disagg_prefill_queue._entries:
-                continue
-            use_raiden = self.disagg_kv_manager.use_raiden
-            if use_raiden:
-                # raiden path: no gather / no D2H staging. Publish this req's
-                # device block (page) ids; raiden reads the device pool blocks
-                # directly on the decode-side pull.
-                sender = None
-                try:
-                    block_ids = self._extract_req_block_ids(req)
-                    sender = self.disagg_kv_manager.create_sender(req_id)
-                    sender.init(
-                        kv_indices=None,
-                        transfer_id=req.disagg_transfer_id or req_id,
-                    )
-                    sender.attach_block_ids(
-                        block_ids,
-                        bootstrap_room=req.bootstrap_room,
-                    )
-                    self._pd_mark_time(req, "transfer_start")
-                    sender.send()
-                except Exception as exc:
-                    logger.exception(
-                        "raiden sender init/send failed for req_id=%s; aborting",
-                        req_id,
-                    )
-                    if sender is not None:
-                        with suppress(Exception):
-                            sender.abort()
-                        with suppress(Exception):
-                            sender.clear()
-                    self._abort_prefill_req(
-                        req,
-                        f"Prefill raiden sender failed for req_id={req_id!r}: {exc}",
-                        metric_reason="sender_init",
-                    )
-                    continue
-                # raiden references the device KV pool blocks directly, so they
-                # MUST stay alive until poll_stats() reports done_sending. Do
-                # NOT release the KV pool early here; the terminal callback frees
-                # it once the transfer completes. NEEDS-TPU-VERIFICATION: confirm
-                # raiden holds no residual reference after done_sending so the
-                # terminal release is safe.
-
-                def _on_terminal(req_obj=req, sender_obj=sender):
-                    self._on_prefill_transfer_terminal(
-                        req_obj, sender_obj, already_released=False
-                    )
-
-                self.disagg_prefill_queue.add(req_id, sender, on_terminal=_on_terminal)
                 continue
             try:
                 device_kv = self._extract_req_kv(req)
@@ -408,13 +369,17 @@ class SchedulerDisaggregationPrefillMixin:
             req.pd_time_stats = ts
         ts.mark(name)
 
-    def _extract_req_block_ids(self: Scheduler, req: Req) -> list[int]:
-        """raiden path: the device page (block) ids this req occupies.
+    def _extract_req_block_ids_range(
+        self: Scheduler, req: Req, start: int, end: int
+    ) -> list[int]:
+        """raiden chunked path: the device page (block) ids covering token range
+        ``[start, end)`` of ``req``.
 
-        Unlike :meth:`_extract_req_kv`, no gather / D2H staging happens: raiden
-        reads these device pool blocks directly on pull. Returns the *exact*
-        pages (no bucket padding, no zero fill) so remote/local block lists
-        line up one-to-one with D's pre-allocated blocks.
+        Chunk boundaries are page-aligned (the scheduler truncates chunks to
+        page multiples), so ``start`` is a multiple of ``page_size`` and
+        ``start // page_size`` is this chunk's sequence-relative page offset. The
+        final chunk's ``end`` need not be aligned; the last (partial) page is
+        rounded up so its block is included exactly once.
         """
 
         import numpy as _np
@@ -422,16 +387,81 @@ class SchedulerDisaggregationPrefillMixin:
         req_to_token = self.req_to_token_pool.req_to_token
         kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
         page_size = kv_pool.page_size
-        seqlen = len(req.origin_input_ids)
-        num_pages = (seqlen + page_size - 1) // page_size
+        first_page = start // page_size
+        last_page = (end + page_size - 1) // page_size  # exclusive
         page_id_source = req_to_token[
             req.req_pool_idx,
-            : num_pages * page_size : page_size,
+            first_page * page_size : last_page * page_size : page_size,
         ]
         page_ids = _np.asarray(page_id_source) // page_size
         return [int(p) for p in page_ids]
 
-    def _extract_req_kv(self: Scheduler, req: Req):
+    def _raiden_handoff_chunk(self: Scheduler, req: Req, req_id: str, *, is_final: bool) -> None:
+        """raiden per-chunk handoff: publish THIS chunk's device page subset to D
+        right after its forward, so D's pull overlaps the next chunk's compute.
+
+        Each chunk is registered under its own raiden uuid (register_read is
+        overwrite-per-uuid, not cumulative). The sender is created on chunk 0 and
+        reused for later chunks; the request is enqueued on the prefill transfer
+        queue exactly once (chunk 0). ``is_final`` fixes the total chunk count.
+        """
+
+        kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
+        page_size = kv_pool.page_size
+        chunk_index = getattr(req, "_pd_chunk_index", 0)
+        sender = getattr(req, "_pd_sender", None)
+        try:
+            start = len(req.prefix_indices)
+            end = start + req.extend_input_len
+            page_offset = start // page_size
+            block_ids = self._extract_req_block_ids_range(req, start, end)
+            if sender is None:
+                sender = self.disagg_kv_manager.create_sender(req_id)
+                sender.init(
+                    kv_indices=None,
+                    transfer_id=req.disagg_transfer_id or req_id,
+                )
+                req._pd_sender = sender
+            if chunk_index == 0:
+                self._pd_mark_time(req, "transfer_start")
+            sender.send_chunk(
+                chunk_index,
+                block_ids,
+                bootstrap_room=req.bootstrap_room,
+                is_final=is_final,
+                chunk_page_offset=page_offset,
+            )
+        except Exception as exc:
+            logger.exception(
+                "raiden per-chunk handoff failed for req_id=%s chunk=%s; aborting",
+                req_id,
+                chunk_index,
+            )
+            if sender is not None:
+                with suppress(Exception):
+                    sender.abort()
+                with suppress(Exception):
+                    sender.clear()
+            self._abort_prefill_req(
+                req,
+                f"Prefill raiden handoff failed for req_id={req_id!r}: {exc}",
+                metric_reason="sender_init",
+            )
+            return
+
+        req._pd_chunk_index = chunk_index + 1
+        if chunk_index == 0:
+            # Enqueue exactly once. raiden references the device KV pool blocks
+            # directly, so they MUST stay alive until poll_stats() reports
+            # done_sending for EVERY chunk; the terminal callback frees them once
+            # the whole transfer completes (already_released=False). ChunkCache
+            # keeps earlier chunks' pages resident until then, so registering
+            # chunk 0 early is safe. NEEDS-TPU-VERIFICATION: raiden holds no
+            # residual device reference after done_sending.
+            def _on_terminal(req_obj=req, sender_obj=sender):
+                self._on_prefill_transfer_terminal(req_obj, sender_obj, already_released=False)
+
+            self.disagg_prefill_queue.add(req_id, sender, on_terminal=_on_terminal)
         """Gather prefilled KV from the paged pool for ``req``.
 
         Returns a per-layer list of ``(padded_pages, page_size, ...)`` arrays.
