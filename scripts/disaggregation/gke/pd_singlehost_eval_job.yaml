@@ -66,6 +66,8 @@ spec:
           value: "16"
         - name: GSM_MAXTOK
           value: "512"
+        - name: SGLANG_JAX_USE_RAIDEN
+          value: "1"
         command:
         - bash
         - -c
@@ -81,7 +83,7 @@ spec:
           chmod 600 ~/.ssh/id_ed25519
           ssh-keyscan github.com >> ~/.ssh/known_hosts
 
-          apt-get update && apt-get install -y iproute2 tmux vim
+          apt-get update && apt-get install -y iproute2 tmux vim build-essential
 
           export UV_CACHE_DIR="/tmp/tpu_logs/uv_cache"
           export UV_PYTHON_INSTALL_DIR="/tmp/tpu_logs/python"
@@ -91,6 +93,59 @@ spec:
           uv pip install pip py-spy
           git clone git@github.com:<GH_ORG>/sglang-jax.git --branch "${BRANCH}"
           cd sglang-jax && uv pip install -e python[all] && uv pip install datasets
+
+          echo "=== Installing tpu-raiden (JAX data plane) ==="
+          RAIDEN_OK=0
+          # Cache built artifact (source tree + compiled .so) on the /models
+          # gcsfuse bucket so repeat runs skip the ~30min Bazel build. Keyed by
+          # the pinned jax version so a toolchain bump invalidates it.
+          RAIDEN_CACHE="/models/raiden/tpu-raiden-jax-0.10.2.tgz"
+          # Option A: /models cache hit (fast path, ~1-2min).
+          if [ -f "$RAIDEN_CACHE" ]; then
+            echo "raiden cache found at $RAIDEN_CACHE; extracting"
+            mkdir -p /tmp/tpu-raiden
+            if tar xzf "$RAIDEN_CACHE" -C /tmp && \
+               uv pip install -r /tmp/tpu-raiden/requirements.txt >/dev/null 2>&1; then
+              export PYTHONPATH="/tmp/tpu-raiden:${PYTHONPATH:-}"
+              python -c "import tpu_raiden.frameworks.jax._tpu_raiden_jax" 2>/dev/null && \
+                RAIDEN_OK=1 && echo "tpu-raiden loaded from /models cache"
+            fi
+            [ "$RAIDEN_OK" = "1" ] || echo "cache present but unusable; falling back to build"
+          fi
+          # Option B: prebuilt GAR wheel (only if this pod's SA can read the AR).
+          if [ "$RAIDEN_OK" != "1" ]; then
+            if pip install keyrings.google-artifactregistry-auth >/dev/null 2>&1 && \
+               uv pip install tpu-raiden-jax \
+                 --extra-index-url https://us-python.pkg.dev/cloud-tpu-inference-test/tpu-raiden/simple/ >/dev/null 2>&1 && \
+               python -c "import tpu_raiden.frameworks.jax._tpu_raiden_jax" 2>/dev/null; then
+              RAIDEN_OK=1
+              echo "tpu-raiden installed from GAR wheel"
+            fi
+          fi
+          # Option C: build from source with Bazel (self-contained fallback);
+          # on success, populate the /models cache for the next run.
+          if [ "$RAIDEN_OK" != "1" ]; then
+            echo "cache/wheel unavailable; building tpu-raiden from source"
+            git clone --depth 1 https://github.com/google/tpu-raiden.git /tmp/tpu-raiden
+            ( cd /tmp/tpu-raiden && \
+              BAZEL_OUTPUT_BASE=/tmp/tpu_logs/raiden_bazel_out \
+              BAZEL_CACHE_DIR=/tmp/tpu_logs/raiden_bazel_cache \
+              HERMETIC_PYTHON_VERSION=3.12 ./build.sh jax )
+            export PYTHONPATH="/tmp/tpu-raiden:${PYTHONPATH:-}"
+            if python -c "import tpu_raiden.frameworks.jax._tpu_raiden_jax"; then
+              RAIDEN_OK=1
+              echo "saving raiden build to $RAIDEN_CACHE (best-effort)"
+              mkdir -p /models/raiden
+              TMP_TGZ="/models/raiden/.build-${JOB_COMPLETION_INDEX:-0}.tgz"
+              tar czf "$TMP_TGZ" -C /tmp \
+                --exclude='tpu-raiden/bazel-*' --exclude='tpu-raiden/.git' tpu-raiden \
+                && mv -f "$TMP_TGZ" "$RAIDEN_CACHE" \
+                && echo "raiden build cached to /models" \
+                || echo "WARN: failed to write raiden cache (non-fatal)"
+            fi
+          fi
+          [ "$RAIDEN_OK" = "1" ] || { echo "FATAL: tpu-raiden not importable"; exit 1; }
+          echo "tpu-raiden ready (PYTHONPATH=${PYTHONPATH:-<site-packages>})"
 
           INDEX=${JOB_COMPLETION_INDEX}
           echo "=== Pod index: $INDEX BRANCH=${BRANCH} (single-host PD, DeepSeek-1.5B TP=1) ==="
@@ -111,6 +166,7 @@ spec:
               --disaggregation-bootstrap-url "http://${P_HOST}:8998" \
               --chunked-prefill-size 16384 \
               --disaggregation-enable-d2h \
+              --disaggregation-use-raiden \
               --enable-metrics \
               2>&1 | tee /tmp/prefill_server.log &
 
@@ -146,6 +202,7 @@ spec:
               --disaggregation-bootstrap-url "http://${P_HOST}:8998" \
               --chunked-prefill-size 16384 \
               --disaggregation-enable-d2h \
+              --disaggregation-use-raiden \
               --disaggregation-max-inflight-transfers ${CAP} \
               --mem-fraction-static 0.80 \
               --enable-metrics \

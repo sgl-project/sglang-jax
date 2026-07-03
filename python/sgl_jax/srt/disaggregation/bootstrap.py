@@ -58,6 +58,13 @@ class PrefillInfo:
     # peer predating these fields skips the check.
     page_size: int = 0
     kv_dtype: str = ""
+    # raiden control-plane endpoint (Phase 0 raiden data plane). Empty means
+    # "not a raiden peer" (path-A). ``local_control_port`` is the resolved TCP
+    # port raiden's KVCacheManager listens on; ``raiden_endpoints_json`` is the
+    # JSON-encoded ``get_local_endpoints()`` descriptor list that decode passes
+    # verbatim to ``start_read(remote_endpoint=...)``.
+    local_control_port: int = 0
+    raiden_endpoints_json: str = ""
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -141,6 +148,28 @@ class RegisterPrefillRequest(BaseModel):
     protocol_version: int = PROTOCOL_VERSION
     page_size: int = 0
     kv_dtype: str = ""
+    local_control_port: int = 0
+    raiden_endpoints_json: str = ""
+
+
+class RegisterTransferRequest(BaseModel):
+    """Per-request block metadata P publishes so D can pull with raiden.
+
+    raiden's ``start_read`` needs the producer's device block ids
+    (``remote_block_ids``). Those are per-request and only P knows them (the
+    paged allocator picks non-contiguous blocks), so they cannot be derived by
+    D deterministically — P registers them here keyed by ``bootstrap_room`` and
+    D fetches them at admission. This is the raiden analogue of path-A's
+    crc32(uuid) pairing (which only needed a shared int, not the block layout).
+    """
+
+    bootstrap_room: int
+    transfer_id: str
+    remote_block_ids: list[int]
+    # Endpoint + control port are also on PrefillInfo, but a decode that already
+    # resolved its peer can skip the second lookup by reading them here.
+    local_control_port: int = 0
+    raiden_endpoints_json: str = ""
 
 
 class HeartbeatRequest(BaseModel):
@@ -160,6 +189,10 @@ class _Registry:
     lock: threading.Lock = field(default_factory=threading.Lock)
     ttl_seconds: float = HEARTBEAT_TTL_SECONDS
     clock: Callable[[], float] = time.monotonic
+    # raiden per-request block metadata, keyed by bootstrap_room. Written by P
+    # (register_read side) and read once by D at admission. Consumed on read so
+    # the table stays bounded; a room re-lookup after consumption returns None.
+    transfers: dict[int, dict[str, object]] = field(default_factory=dict)
 
     def now(self) -> float:
         return self.clock()  # type: ignore[no-any-return]
@@ -202,14 +235,36 @@ class _Registry:
             self._evict_stale_locked()
             return list(self.prefills.values())
 
-    def pick_for_room(self, bootstrap_room: int) -> PrefillInfo | None:
+    def pick_for_room(
+        self, bootstrap_room: int, dp_rank: int | None = None
+    ) -> PrefillInfo | None:
         with self.lock:
             self._evict_stale_locked()
             if not self.prefills:
                 return None
-            keys = sorted(self.prefills.keys())
+            candidates = {
+                k: v
+                for k, v in self.prefills.items()
+                if dp_rank is None or v.system_dp_rank == dp_rank
+            }
+            if not candidates:
+                return None
+            keys = sorted(candidates.keys())
             chosen = keys[bootstrap_room % len(keys)]
-            return self.prefills[chosen]
+            return candidates[chosen]
+
+    def register_transfer(self, info: dict[str, object]) -> None:
+        with self.lock:
+            self.transfers[int(info["bootstrap_room"])] = info
+
+    def take_transfer(self, bootstrap_room: int) -> dict[str, object] | None:
+        """Pop the per-request block metadata for ``bootstrap_room``.
+
+        Consumed on read: the single-shot pull needs it exactly once. Returns
+        None if P has not registered it yet (D defers + retries next tick).
+        """
+        with self.lock:
+            return self.transfers.pop(int(bootstrap_room), None)
 
 
 def build_app(
@@ -278,14 +333,33 @@ def build_app(
         return {"prefills": [p.to_dict() for p in registry.list_all()]}
 
     @app.get("/get_prefill_info")
-    def get_prefill_info(bootstrap_room: int) -> dict[str, object]:
-        info = registry.pick_for_room(bootstrap_room)
+    def get_prefill_info(
+        bootstrap_room: int, dp_rank: int | None = None
+    ) -> dict[str, object]:
+        info = registry.pick_for_room(bootstrap_room, dp_rank=dp_rank)
         if info is None:
             raise HTTPException(
                 status_code=503,
                 detail="no prefill workers registered",
             )
         return info.to_dict()
+
+    @app.post("/register_transfer")
+    def register_transfer(req: RegisterTransferRequest) -> dict[str, str]:
+        registry.register_transfer(req.model_dump())
+        return {"status": "registered"}
+
+    @app.get("/get_transfer_info")
+    def get_transfer_info(bootstrap_room: int) -> dict[str, object]:
+        info = registry.take_transfer(bootstrap_room)
+        if info is None:
+            # Not registered yet: 404 lets the decode side treat it as
+            # "defer + retry" (never abort) rather than a hard error.
+            raise HTTPException(
+                status_code=404,
+                detail=f"no transfer info for bootstrap_room={bootstrap_room}",
+            )
+        return info
 
     # Bootstrap runs as a standalone single process and does NOT inherit
     # PROMETHEUS_MULTIPROC_DIR, so it exposes its own default-registry
@@ -447,6 +521,8 @@ class BootstrapClient:
         protocol_version: int = PROTOCOL_VERSION,
         page_size: int = 0,
         kv_dtype: str = "",
+        local_control_port: int = 0,
+        raiden_endpoints_json: str = "",
     ) -> None:
         payload = {
             "bootstrap_key": bootstrap_key,
@@ -461,6 +537,8 @@ class BootstrapClient:
             "protocol_version": protocol_version,
             "page_size": page_size,
             "kv_dtype": kv_dtype,
+            "local_control_port": local_control_port,
+            "raiden_endpoints_json": raiden_endpoints_json,
         }
         last_err: Exception | None = None
         for attempt in range(self._register_retries):
@@ -517,10 +595,15 @@ class BootstrapClient:
         r.raise_for_status()
         return r.json()["prefills"]
 
-    def get_prefill_info(self, bootstrap_room: int) -> dict[str, object]:
+    def get_prefill_info(
+        self, bootstrap_room: int, dp_rank: int | None = None
+    ) -> dict[str, object]:
+        params: dict[str, object] = {"bootstrap_room": bootstrap_room}
+        if dp_rank is not None:
+            params["dp_rank"] = dp_rank
         r = self._client.get(
             f"{self._base_url}/get_prefill_info",
-            params={"bootstrap_room": bootstrap_room},
+            params=params,
             timeout=self._timeout_s,
             headers=self._headers(),
         )
@@ -529,6 +612,50 @@ class BootstrapClient:
         # Reject peers below the supported protocol floor.
         _reject_if_below_protocol_floor(info)
         return info
+
+    def register_transfer(
+        self,
+        bootstrap_room: int,
+        transfer_id: str,
+        remote_block_ids: list[int],
+        *,
+        local_control_port: int = 0,
+        raiden_endpoints_json: str = "",
+    ) -> None:
+        """P: publish per-request block metadata for raiden pull (keyed by
+        room). Best-effort with the shared client timeout; the caller treats a
+        failure as a transfer failure for that request."""
+
+        payload = {
+            "bootstrap_room": bootstrap_room,
+            "transfer_id": transfer_id,
+            "remote_block_ids": list(remote_block_ids),
+            "local_control_port": local_control_port,
+            "raiden_endpoints_json": raiden_endpoints_json,
+        }
+        r = self._client.post(
+            f"{self._base_url}/register_transfer",
+            json=payload,
+            timeout=self._timeout_s,
+            headers=self._headers(),
+        )
+        r.raise_for_status()
+
+    def get_transfer_info(self, bootstrap_room: int) -> dict[str, object] | None:
+        """D: fetch (and consume) the per-request block metadata P registered
+        for ``bootstrap_room``. Returns None if not registered yet (404) so the
+        caller defers + retries rather than aborting."""
+
+        r = self._client.get(
+            f"{self._base_url}/get_transfer_info",
+            params={"bootstrap_room": bootstrap_room},
+            timeout=self._timeout_s,
+            headers=self._headers(),
+        )
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+        return r.json()
 
 
 class PrefillInfoCache:
@@ -568,13 +695,27 @@ class PrefillInfoCache:
         self._sorted_keys = sorted(by_key)
         self._last_refresh = self._clock()
 
-    def _pick_locked(self, bootstrap_room: int) -> dict[str, object] | None:
+    def _pick_locked(
+        self, bootstrap_room: int, dp_rank: int | None = None
+    ) -> dict[str, object] | None:
         if not self._sorted_keys:
             return None
-        chosen = self._sorted_keys[bootstrap_room % len(self._sorted_keys)]
+        if dp_rank is not None:
+            candidates = [
+                k
+                for k in self._sorted_keys
+                if int(self._by_key[k].get("system_dp_rank", 0)) == dp_rank
+            ]
+            if not candidates:
+                return None
+            chosen = candidates[bootstrap_room % len(candidates)]
+        else:
+            chosen = self._sorted_keys[bootstrap_room % len(self._sorted_keys)]
         return self._by_key[chosen]
 
-    def pick_for_room(self, bootstrap_room: int) -> dict[str, object] | None:
+    def pick_for_room(
+        self, bootstrap_room: int, dp_rank: int | None = None
+    ) -> dict[str, object] | None:
         """Return prefill info for ``bootstrap_room``, or ``None`` if no
         prefill is registered yet (caller should defer + retry).
 
@@ -610,7 +751,7 @@ class PrefillInfoCache:
                             len(self._sorted_keys),
                             exc,
                         )
-            info = self._pick_locked(bootstrap_room)
+            info = self._pick_locked(bootstrap_room, dp_rank=dp_rank)
         if info is None:
             return None
         _reject_if_below_protocol_floor(info)
@@ -626,11 +767,11 @@ class HeartbeatDaemon:
     def __init__(
         self,
         client: BootstrapClient,
-        bootstrap_key: str,
+        bootstrap_keys: list[str],
         interval_s: float = HEARTBEAT_INTERVAL_SECONDS,
     ) -> None:
         self._client = client
-        self._bootstrap_key = bootstrap_key
+        self._bootstrap_keys = bootstrap_keys
         self._interval_s = interval_s
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -642,7 +783,7 @@ class HeartbeatDaemon:
         self._stop_event.clear()
         self._thread = threading.Thread(
             target=self._loop,
-            name=f"BootstrapHeartbeat-{self._bootstrap_key}",
+            name=f"BootstrapHeartbeat-{self._bootstrap_keys[0]}-...",
             daemon=True,
         )
         self._thread.start()
@@ -659,12 +800,15 @@ class HeartbeatDaemon:
 
     def _loop(self) -> None:
         while not self._stop_event.is_set():
-            try:
-                self._client.heartbeat(self._bootstrap_key)
-            except Exception:
-                logger.warning(
-                    "bootstrap heartbeat for %s failed; will retry",
-                    self._bootstrap_key,
-                    exc_info=True,
-                )
+            for key in self._bootstrap_keys:
+                if self._stop_event.is_set():
+                    break
+                try:
+                    self._client.heartbeat(key)
+                except Exception:
+                    logger.warning(
+                        "bootstrap heartbeat for %s failed; will retry",
+                        key,
+                        exc_info=True,
+                    )
             self._stop_event.wait(self._interval_s)

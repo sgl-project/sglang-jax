@@ -21,11 +21,6 @@ def install_disaggregation_wiring(scheduler: Scheduler, server_args: ServerArgs)
     mode = server_args.disaggregation_mode
     if mode == "null":
         return
-    if server_args.dp_size > 1:
-        raise RuntimeError(
-            f"PD disaggregation does not yet support dp_size>1 "
-            f"(got dp_size={server_args.dp_size})."
-        )
     if server_args.disaggregation_bootstrap_url is None:
         raise RuntimeError("disaggregation_mode != null requires bootstrap_url")
 
@@ -55,7 +50,10 @@ def install_disaggregation_wiring(scheduler: Scheduler, server_args: ServerArgs)
     from sgl_jax.srt.disaggregation.decode_watchdog import EventLoopWatchdog
     from sgl_jax.srt.disaggregation.host_ip import resolve_host_ip
     from sgl_jax.srt.disaggregation.jax_transfer.conn import JaxTransferKVManager
-    from sgl_jax.srt.disaggregation.jax_transfer.wrapper import get_or_create_wrapper
+    from sgl_jax.srt.disaggregation.jax_transfer.wrapper import (
+        get_or_create_raiden_wrapper,
+        get_or_create_wrapper,
+    )
     from sgl_jax.srt.disaggregation.pd_auth import resolve_secret
     from sgl_jax.srt.disaggregation.prefill import PrefillBootstrapQueue
 
@@ -92,7 +90,11 @@ def install_disaggregation_wiring(scheduler: Scheduler, server_args: ServerArgs)
     )
     notifier.start()
     host_pool = None
-    if server_args.disaggregation_enable_d2h and mode == "prefill":
+    if (
+        server_args.disaggregation_enable_d2h
+        and mode == "prefill"
+        and not server_args.disaggregation_use_raiden
+    ):
         from sgl_jax.srt.disaggregation.prefill import (
             _KV_GATHER_PAGE_BUCKETS,
             _pad_to_page_bucket,
@@ -131,10 +133,48 @@ def install_disaggregation_wiring(scheduler: Scheduler, server_args: ServerArgs)
             per_layer_shape,
         )
 
+    scheduler.disagg_bootstrap_client = BootstrapClient(
+        server_args.disaggregation_bootstrap_url,
+        timeout_s=server_args.disaggregation_bootstrap_timeout_seconds,
+        shared_secret=shared_secret,
+    )
+
+    # raiden data plane (Phase 0). When enabled, construct the process-level
+    # RaidenTransferWrapper over the device KV pool's per-layer tensors and hand
+    # it (plus the bootstrap client, used for the P->D per-request block-metadata
+    # channel) to the manager. path-A stays fully wired so it can be selected by
+    # leaving --disaggregation-use-raiden off for A/B baselining.
+    raiden_wrapper = None
+    if server_args.disaggregation_use_raiden:
+        kv_pool = scheduler.token_to_kv_pool_allocator.get_kvcache()
+        raiden_wrapper = get_or_create_raiden_wrapper(
+            local_host,
+            server_args.disaggregation_raiden_control_port,
+            parallelism=server_args.disaggregation_channel_number,
+        )
+        # ``host_blocks_to_allocate`` sizes raiden's internal host staging pool.
+        # One block == one device page; bound it by the device KV budget so a
+        # single request's pages always fit. NEEDS-TPU-VERIFICATION: confirm the
+        # sizing heuristic against raiden's staging semantics on real hardware.
+        num_device_pages = int(kv_pool.kv_buffer[0].shape[0])
+        raiden_wrapper.start(
+            kv_caches=list(kv_pool.kv_buffer),
+            host_blocks_to_allocate=num_device_pages,
+        )
+        logger.info(
+            "raiden data plane enabled: control_port=%s host_blocks=%d "
+            "layer_num=%d",
+            server_args.disaggregation_raiden_control_port,
+            num_device_pages,
+            kv_pool.layer_num,
+        )
+
     scheduler.disagg_kv_manager = JaxTransferKVManager(
         wrapper,
         notifier,
         host_pool=host_pool,
+        raiden_wrapper=raiden_wrapper,
+        bootstrap_client=scheduler.disagg_bootstrap_client,
         ack_timeout_seconds=server_args.disaggregation_ack_timeout_seconds,
         pull_timeout_seconds=server_args.disaggregation_pull_timeout_seconds,
         reaper_interval_seconds=(server_args.disaggregation_orphan_reaper_interval_seconds),
@@ -143,36 +183,51 @@ def install_disaggregation_wiring(scheduler: Scheduler, server_args: ServerArgs)
     scheduler.disagg_kv_manager.start_reaper()
     scheduler.disagg_use_d2h_staging = server_args.disaggregation_enable_d2h
 
-    scheduler.disagg_bootstrap_client = BootstrapClient(
-        server_args.disaggregation_bootstrap_url,
-        timeout_s=server_args.disaggregation_bootstrap_timeout_seconds,
-        shared_secret=shared_secret,
-    )
-
     if mode == "prefill":
         import jax
 
         scheduler.disagg_prefill_queue = PrefillBootstrapQueue()
-        bootstrap_key = f"{local_host}:{transfer_port}"
         prefill_kv_pool = scheduler.token_to_kv_pool_allocator.get_kvcache()
-        scheduler.disagg_bootstrap_client.register_prefill(
-            bootstrap_key=bootstrap_key,
-            host=local_host,
-            transfer_port=transfer_port,
-            side_channel_port=side_channel_port,
-            tp_rank=server_args.node_rank,
-            tp_size=server_args.tp_size,
-            system_dp_rank=0,
-            jax_process_index=jax.process_index(),
-            jax_process_count=jax.process_count(),
-            page_size=server_args.page_size,
-            kv_dtype=resolve_kv_dtype_name(prefill_kv_pool.dtype),
-        )
+        kv_dtype_name = resolve_kv_dtype_name(prefill_kv_pool.dtype)
+
+        # raiden: advertise the control endpoint so D can reach P's TransferEngine.
+        raiden_control_port = 0
+        raiden_endpoints_json = ""
+        if raiden_wrapper is not None:
+            import json as _json
+
+            raiden_control_port = server_args.disaggregation_raiden_control_port
+            endpoints = raiden_wrapper.endpoints
+            raiden_endpoints_json = (
+                _json.dumps(endpoints) if endpoints is not None else ""
+            )
+
+        bootstrap_keys = []
+        for system_dp_rank in range(server_args.dp_size):
+            bootstrap_key = f"{local_host}:{transfer_port}:dp_{system_dp_rank}"
+            bootstrap_keys.append(bootstrap_key)
+            scheduler.disagg_bootstrap_client.register_prefill(
+                bootstrap_key=bootstrap_key,
+                host=local_host,
+                transfer_port=transfer_port,
+                side_channel_port=side_channel_port,
+                tp_rank=server_args.node_rank,
+                tp_size=server_args.tp_size,
+                system_dp_rank=system_dp_rank,
+                jax_process_index=jax.process_index(),
+                jax_process_count=jax.process_count(),
+                page_size=server_args.page_size,
+                kv_dtype=kv_dtype_name,
+                local_control_port=raiden_control_port,
+                raiden_endpoints_json=raiden_endpoints_json,
+            )
+
         scheduler.disagg_heartbeat = HeartbeatDaemon(
-            scheduler.disagg_bootstrap_client, bootstrap_key
+            scheduler.disagg_bootstrap_client, bootstrap_keys
         )
         scheduler.disagg_heartbeat.start()
-        scheduler.disagg_bootstrap_key = bootstrap_key
+        scheduler.disagg_bootstrap_keys = bootstrap_keys
+        scheduler.disagg_bootstrap_key = bootstrap_keys[0]
     else:
         scheduler.disagg_prefill_info_cache = PrefillInfoCache(scheduler.disagg_bootstrap_client)
         scheduler.disagg_prealloc_queue = DecodePreallocQueue()
@@ -214,14 +269,18 @@ def _make_disagg_shutdown(scheduler: Scheduler, mode: str):
             return
         state["done"] = True
         if mode == "prefill":
-            try:
-                key = scheduler.disagg_bootstrap_key
-                scheduler.disagg_bootstrap_client.unregister_prefill(key)
-            except Exception:
-                logger.warning(
-                    "PD shutdown: unregister_prefill failed",
-                    exc_info=True,
-                )
+            for key in (
+                getattr(scheduler, "disagg_bootstrap_keys", None)
+                or [scheduler.disagg_bootstrap_key]
+            ):
+                try:
+                    scheduler.disagg_bootstrap_client.unregister_prefill(key)
+                except Exception:
+                    logger.warning(
+                        "PD shutdown: unregister_prefill failed for %s",
+                        key,
+                        exc_info=True,
+                    )
             with suppress(Exception):
                 scheduler.disagg_heartbeat.stop()
         try:

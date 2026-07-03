@@ -235,6 +235,55 @@ class SchedulerDisaggregationPrefillMixin:
             req_id = req.rid
             if req_id in self.disagg_prefill_queue._entries:
                 continue
+            use_raiden = self.disagg_kv_manager.use_raiden
+            if use_raiden:
+                # raiden path: no gather / no D2H staging. Publish this req's
+                # device block (page) ids; raiden reads the device pool blocks
+                # directly on the decode-side pull.
+                sender = None
+                try:
+                    block_ids = self._extract_req_block_ids(req)
+                    sender = self.disagg_kv_manager.create_sender(req_id)
+                    sender.init(
+                        kv_indices=None,
+                        transfer_id=req.disagg_transfer_id or req_id,
+                    )
+                    sender.attach_block_ids(
+                        block_ids,
+                        bootstrap_room=req.bootstrap_room,
+                    )
+                    self._pd_mark_time(req, "transfer_start")
+                    sender.send()
+                except Exception as exc:
+                    logger.exception(
+                        "raiden sender init/send failed for req_id=%s; aborting",
+                        req_id,
+                    )
+                    if sender is not None:
+                        with suppress(Exception):
+                            sender.abort()
+                        with suppress(Exception):
+                            sender.clear()
+                    self._abort_prefill_req(
+                        req,
+                        f"Prefill raiden sender failed for req_id={req_id!r}: {exc}",
+                        metric_reason="sender_init",
+                    )
+                    continue
+                # raiden references the device KV pool blocks directly, so they
+                # MUST stay alive until poll_stats() reports done_sending. Do
+                # NOT release the KV pool early here; the terminal callback frees
+                # it once the transfer completes. NEEDS-TPU-VERIFICATION: confirm
+                # raiden holds no residual reference after done_sending so the
+                # terminal release is safe.
+
+                def _on_terminal(req_obj=req, sender_obj=sender):
+                    self._on_prefill_transfer_terminal(
+                        req_obj, sender_obj, already_released=False
+                    )
+
+                self.disagg_prefill_queue.add(req_id, sender, on_terminal=_on_terminal)
+                continue
             try:
                 device_kv = self._extract_req_kv(req)
             except Exception as exc:
@@ -358,6 +407,29 @@ class SchedulerDisaggregationPrefillMixin:
             ts = TimeStats(role)
             req.pd_time_stats = ts
         ts.mark(name)
+
+    def _extract_req_block_ids(self: Scheduler, req: Req) -> list[int]:
+        """raiden path: the device page (block) ids this req occupies.
+
+        Unlike :meth:`_extract_req_kv`, no gather / D2H staging happens: raiden
+        reads these device pool blocks directly on pull. Returns the *exact*
+        pages (no bucket padding, no zero fill) so remote/local block lists
+        line up one-to-one with D's pre-allocated blocks.
+        """
+
+        import numpy as _np
+
+        req_to_token = self.req_to_token_pool.req_to_token
+        kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
+        page_size = kv_pool.page_size
+        seqlen = len(req.origin_input_ids)
+        num_pages = (seqlen + page_size - 1) // page_size
+        page_id_source = req_to_token[
+            req.req_pool_idx,
+            : num_pages * page_size : page_size,
+        ]
+        page_ids = _np.asarray(page_id_source) // page_size
+        return [int(p) for p in page_ids]
 
     def _extract_req_kv(self: Scheduler, req: Req):
         """Gather prefilled KV from the paged pool for ``req``.

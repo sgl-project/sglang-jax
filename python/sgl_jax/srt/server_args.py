@@ -226,6 +226,18 @@ class ServerArgs:
     # a host pool would fail every prefill request with
     # ``RuntimeError("use_d2h_staging=True requires a host_pool")``.
     disaggregation_enable_d2h: bool = False
+    # Data-plane backend selector. When True the KV data plane is served by
+    # tpu-raiden's TransferEngine (KVCacheManager): block-addressed device pool
+    # transfer with raiden's own control-plane TCP + host staging, replacing
+    # path-A's D2H staging + jax.experimental.transfer single-shot. Path-A stays
+    # runnable for A/B baselining by leaving this False (the default). raiden
+    # keeps the SAME semantics as path-A: last chunk gathers the full KV block
+    # set and pulls it in a single transfer (no chunked/overlap in Phase 0).
+    disaggregation_use_raiden: bool = False
+    # raiden control-plane TCP port. 0 = kernel picks a free port; the real port
+    # is read back from KVCacheManager.get_local_endpoints() and advertised via
+    # bootstrap so decode can reach it.
+    disaggregation_raiden_control_port: int = 0
     disaggregation_side_channel_port: int = 9600
     disaggregation_d2h_pool_size: int = 64
     disaggregation_d2h_max_tokens: int | None = None
@@ -1325,6 +1337,22 @@ class ServerArgs:
             help="Enable D2H staging on the prefill side: KV is copied into "
             "an unpinned host-memory buffer before remote pull, bounding "
             "prefill HBM pressure via the host pool. Default OFF.",
+        )
+        parser.add_argument(
+            "--disaggregation-use-raiden",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.disaggregation_use_raiden,
+            help="Serve the PD KV data plane with tpu-raiden's TransferEngine "
+            "(block-addressed device-pool transfer) instead of path-A's D2H "
+            "staging + jax.experimental.transfer. Same single-shot semantics; "
+            "path-A stays the default for A/B baselining. Default OFF.",
+        )
+        parser.add_argument(
+            "--disaggregation-raiden-control-port",
+            type=int,
+            default=ServerArgs.disaggregation_raiden_control_port,
+            help="raiden control-plane TCP port. 0 lets the kernel pick a free "
+            "port (read back and advertised via bootstrap). Default 0.",
         )
         parser.add_argument(
             "--disaggregation-side-channel-port",

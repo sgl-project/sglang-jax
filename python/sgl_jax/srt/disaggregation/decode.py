@@ -237,12 +237,16 @@ class SchedulerDisaggregationDecodeMixin:
                     if jax.process_count() > 1:
                         # Multi-host caches the matched peer after the first
                         # lookup, so this does no per-request network I/O.
-                        p_info = self._pick_prefill_peer_for_this_host()
+                        p_info = self._pick_prefill_peer_for_this_host(
+                            dp_rank=getattr(req, "dp_rank", 0)
+                        )
                     else:
                         # Local cache resolution (sglang-style): a warm cache
                         # does zero network I/O, so this no longer blocks the
                         # event loop.
-                        p_info = self.disagg_prefill_info_cache.pick_for_room(req.bootstrap_room)
+                        p_info = self.disagg_prefill_info_cache.pick_for_room(
+                            req.bootstrap_room, dp_rank=getattr(req, "dp_rank", 0)
+                        )
                 self._pd_mark_time(req, "bootstrap_done")
             except Exception:
                 logger.exception(
@@ -326,6 +330,28 @@ class SchedulerDisaggregationDecodeMixin:
                     state = KVPoll.FAILED
             if state == KVPoll.SUCCESS:
                 try:
+                    if self.disagg_kv_manager.use_raiden:
+                        # raiden landed the KV directly into D's device pool
+                        # blocks and the decode bookkeeping was set at admission,
+                        # so skip the path-A pull-result scatter (_write_kv_to_pool).
+                        # NEEDS-TPU-VERIFICATION: confirm the blocks are correct
+                        # and no write-back is required.
+                        self._enqueue_for_decode(entry.req)
+                        self._pd_mark_time(entry.req, "first_token")
+                        from sgl_jax.srt.disaggregation.req_time_stats import (
+                            maybe_log_time_stats,
+                        )
+
+                        maybe_log_time_stats(
+                            entry.req.pd_time_stats,
+                            req_id=entry.req_id,
+                            enabled=getattr(
+                                self.server_args,
+                                "enable_request_time_stats_logging",
+                                False,
+                            ),
+                        )
+                        continue
                     kv_result = entry.receiver.result
                     kv = kv_result["kv"] if kv_result else None
                     self._maybe_log_decode_pull_debug(entry.req, kv)
@@ -367,28 +393,40 @@ class SchedulerDisaggregationDecodeMixin:
                     self._release_decode_kv_indices(entry.kv_indices)
                 self._abort_decode_request(entry.req, "receiver_terminal_failed")
 
-    def _pick_prefill_peer_for_this_host(self: Scheduler) -> dict[str, object]:
+    def _pick_prefill_peer_for_this_host(
+        self: Scheduler, dp_rank: int | None = None
+    ) -> dict[str, object]:
         """Multi-host: find the P host whose jax_process_index matches ours.
         That host's local KV shard is exactly the slice this D host needs.
         Requires P/D to have the same nproc (same-TP constraint).
         """
-        if getattr(self, "_disagg_prefill_peer", None) is not None:
+        cache = getattr(self, "_disagg_prefill_peers", {})
+        if dp_rank is not None and dp_rank in cache:
+            return cache[dp_rank]
+        if dp_rank is None and getattr(self, "_disagg_prefill_peer", None) is not None:
             return self._disagg_prefill_peer
         my_pidx = jax.process_index()
         my_nproc = jax.process_count()
         all_p = self.disagg_bootstrap_client.list_prefills()
         for p in all_p:
             if int(p.get("jax_process_index", -1)) == my_pidx:
+                if dp_rank is not None and int(p.get("system_dp_rank", 0)) != dp_rank:
+                    continue
                 if int(p.get("jax_process_count", 0)) != my_nproc:
                     raise RuntimeError(
                         f"P/D process_count mismatch: P={p.get('jax_process_count')} "
                         f"D={my_nproc}. Per-host shard transfer requires same nproc."
                     )
-                self._disagg_prefill_peer = p
+                if dp_rank is not None:
+                    cache[dp_rank] = p
+                    self._disagg_prefill_peers = cache
+                else:
+                    self._disagg_prefill_peer = p
                 return p
         raise RuntimeError(
-            f"no prefill host with jax_process_index={my_pidx} registered "
-            f"(got {[(p.get('host'), p.get('jax_process_index')) for p in all_p]})"
+            f"no prefill host with jax_process_index={my_pidx} "
+            f"{'and dp_rank=' + str(dp_rank) if dp_rank is not None else ''} registered "
+            f"(got {[(p.get('host'), p.get('jax_process_index'), p.get('system_dp_rank')) for p in all_p]})"
         )
 
     def _drain_transfer_queue_synced(self: Scheduler) -> list[DecodeBookkeeping]:
@@ -472,6 +510,21 @@ class SchedulerDisaggregationDecodeMixin:
                 # as transient and retry next tick rather than abort.
                 break
 
+            if self.disagg_kv_manager.use_raiden:
+                admitted_raiden = self._admit_one_raiden(entry, kv_indices, page_size)
+                if admitted_raiden is None:
+                    # P hasn't published this req's block metadata yet (bootstrap
+                    # 404). Free the slot we just allocated and leave the entry in
+                    # the prealloc queue to retry next tick (deferral, not abort).
+                    self._release_decode_kv_indices(kv_indices)
+                    continue
+                if admitted_raiden is False:
+                    # Setup failed and the request was already aborted inside the
+                    # helper; move on.
+                    continue
+                admitted += 1
+                continue
+
             try:
                 receiver = self.disagg_kv_manager.create_receiver(entry.req.rid)
                 spec = self._build_kv_spec_for_req(entry.req)
@@ -503,6 +556,127 @@ class SchedulerDisaggregationDecodeMixin:
             self.disagg_prealloc_queue.remove(entry.req_id)
             self.disagg_transfer_queue.add(entry)
             admitted += 1
+
+    def _admit_one_raiden(self: Scheduler, entry, kv_indices, page_size: int):
+        """raiden admission for a single prealloc entry.
+
+        Returns:
+          * ``True``  -- admitted to the transfer queue.
+          * ``None``  -- P's per-request block metadata not yet published
+            (bootstrap 404); caller should defer (free kv_indices, retry).
+          * ``False`` -- setup failed and the request was aborted here.
+        """
+
+        import numpy as np
+
+        req = entry.req
+        try:
+            info = self.disagg_bootstrap_client.get_transfer_info(req.bootstrap_room)
+        except Exception:
+            logger.exception(
+                "raiden get_transfer_info raised for room=%s",
+                req.bootstrap_room,
+            )
+            return None
+        if info is None:
+            # Not published yet -> defer.
+            return None
+
+        try:
+            import json as _json
+
+            remote_block_ids = tuple(int(b) for b in info.get("remote_block_ids", ()))
+            endpoints_json = info.get("raiden_endpoints_json", "") or ""
+            remote_endpoint: object
+            if endpoints_json:
+                remote_endpoint = _json.loads(endpoints_json)
+            else:
+                # Fall back to a "host:control_port" string when endpoints were
+                # not advertised (raiden accepts either form).
+                p_info = entry.p_info
+                remote_endpoint = f"{p_info['host']}:{int(info.get('local_control_port', 0))}"
+
+            # Local device block ids for D's freshly allocated slots. Mirror
+            # _write_kv_to_pool's page derivation; take exactly as many blocks as
+            # P advertised so remote/local line up one-to-one.
+            kv_indices_np = (
+                np.asarray(kv_indices)
+                if not isinstance(kv_indices, np.ndarray)
+                else kv_indices
+            )
+            local_pages = kv_indices_np[::page_size] // page_size
+            n = len(remote_block_ids)
+            local_block_ids = tuple(int(b) for b in local_pages[:n])
+            if len(local_block_ids) != n:
+                raise RuntimeError(
+                    f"raiden block count mismatch for req_id={req.rid!r}: "
+                    f"remote={n} local={len(local_block_ids)}"
+                )
+
+            receiver = self.disagg_kv_manager.create_receiver(req.rid)
+            p_info = entry.p_info
+            receiver.init(
+                PMetadata(
+                    remote_addr=(f"{p_info['host']}:{p_info['transfer_port']}"),
+                    uuid=req.disagg_transfer_id or req.rid,
+                    specs={},
+                    p_side_channel_host=str(p_info["host"]),
+                    p_side_channel_port=int(p_info["side_channel_port"]),
+                    remote_endpoint=remote_endpoint,
+                    remote_block_ids=remote_block_ids,
+                    local_block_ids=local_block_ids,
+                )
+            )
+        except Exception:
+            logger.exception(
+                "failed to set up raiden KVReceiver for req_id=%s",
+                req.rid,
+            )
+            self._record_decode_transfer_failure("receiver_init")
+            self._release_decode_kv_indices(kv_indices)
+            self.disagg_prealloc_queue.remove(entry.req_id)
+            self._abort_decode_request(req, "receiver_init")
+            return False
+
+        entry.kv_indices = kv_indices
+        entry.receiver = receiver
+        entry.started = True
+        # raiden lands the KV straight into D's device pool blocks, so the
+        # post-transfer Pallas write-back is skipped (see process_decode_queue).
+        # Set the decode bookkeeping (prefix_indices / fill_ids) now so the req
+        # is ready to enqueue on SUCCESS.
+        self._raiden_set_decode_bookkeeping(req, kv_indices)
+        self._pd_mark_time(req, "transfer_entry")
+        self.disagg_prealloc_queue.remove(entry.req_id)
+        self.disagg_transfer_queue.add(entry)
+        return True
+
+    def _raiden_set_decode_bookkeeping(self: Scheduler, req, kv_indices) -> None:
+        """Set prefix_indices / fill_ids for a raiden-transferred req.
+
+        raiden writes KV directly into the device pool, so unlike path-A there is
+        no ``_write_kv_to_pool`` scatter. This mirrors the bookkeeping tail of
+        ``_write_kv_to_pool`` without touching the pool tensors.
+        NEEDS-TPU-VERIFICATION: confirm raiden's landed layout matches the
+        allocator slot order so prefix_indices point at the correct pages.
+        """
+
+        import numpy as np
+
+        kv_indices_np = (
+            np.asarray(kv_indices)
+            if not isinstance(kv_indices, np.ndarray)
+            else kv_indices
+        )
+        seqlen = len(req.origin_input_ids)
+        valid_slots = kv_indices_np[:seqlen]
+        if len(valid_slots) > 0:
+            req.prefix_indices = valid_slots[:-1]
+        else:
+            req.prefix_indices = valid_slots
+        req.last_matched_prefix_len = len(req.prefix_indices)
+        req._pd_prealloc_kv_indices = kv_indices_np
+        req.fill_ids = list(req.origin_input_ids) + list(req.output_ids)
 
     # ------------------------------------------------------------------
     # Overridable / test-friendly hooks
