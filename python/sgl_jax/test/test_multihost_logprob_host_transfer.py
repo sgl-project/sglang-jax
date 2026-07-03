@@ -278,9 +278,9 @@ class TestSpecDecodeOutputLogprobs(unittest.TestCase):
             token_vals = np.tile(np.arange(-10.0, 0.0, dtype=np.float32), (4, 1))
 
         batch = SimpleNamespace(
-            dp_size=1,
+            dp_size=2,
             per_dp_bs_size=1,
-            reqs_info=[SimpleNamespace(reqs=[req])],
+            reqs_info=[SimpleNamespace(reqs=[req]), SimpleNamespace(reqs=[])],
             return_logprob=not output_only,
             return_output_logprob_only=output_only,
         )
@@ -299,13 +299,24 @@ class TestSpecDecodeOutputLogprobs(unittest.TestCase):
             num_accepted_tokens=None,
         )
 
-        SchedulerOutputProcessorMixin.process_batch_result_decode(scheduler, batch, result)
-        return req
+        gathered = []
+
+        def fake_process_allgather(value, *, tiled):
+            gathered.append((value, tiled))
+            return value
+
+        with mock.patch(
+            "jax.experimental.multihost_utils.process_allgather",
+            fake_process_allgather,
+        ):
+            SchedulerOutputProcessorMixin.process_batch_result_decode(scheduler, batch, result)
+        return req, gathered
 
     def test_spec_decode_appends_flat_output_logprobs(self):
-        req = self._run_decode(output_only=False)
+        req, gathered = self._run_decode(output_only=False)
 
         self.assertEqual(req.output_ids, [101, 102])
+        self.assertEqual(len(gathered), 3)
         self.assertEqual(req.output_token_logprobs_idx, [101, 102])
         np.testing.assert_allclose(req.output_token_logprobs_val, [-0.1, -0.2])
         self.assertEqual(req.output_top_logprobs_idx, [[10, 11], [20, 21]])
@@ -313,8 +324,9 @@ class TestSpecDecodeOutputLogprobs(unittest.TestCase):
         np.testing.assert_allclose(req.output_token_ids_logprobs_val, [[-3.0, -2.0]] * 2)
 
     def test_spec_decode_appends_output_logprob_only(self):
-        req = self._run_decode(output_only=True)
+        req, gathered = self._run_decode(output_only=True)
 
+        self.assertEqual(gathered, [])
         self.assertEqual(req.output_token_logprobs_idx, [101, 102])
         np.testing.assert_allclose(req.output_token_logprobs_val, [-0.1, -0.2])
         self.assertIsNone(req.output_top_logprobs_val)
