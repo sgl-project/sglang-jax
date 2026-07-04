@@ -1017,7 +1017,9 @@ class JaxTransferKVReceiver(KVReceiver, StateHolder):
             # the P advertised SWA block metadata for this chunk.
             swa_kwargs: dict = {}
             if md.swa_remote_endpoint is not None and md.swa_local_pages:
-                swa_remote_ids_raw = chunk_info.get("swa_remote_block_ids", ())
+                swa_remote_ids_raw = chunk_info.get("swa_remote_block_ids")
+                if swa_remote_ids_raw is None:
+                    swa_remote_ids_raw = chunk_info.get("swa_block_ids", ())
                 swa_remote_ids = [int(b) for b in swa_remote_ids_raw] if swa_remote_ids_raw else []
                 if swa_remote_ids:
                     if md.swa_local_page_by_full_page:
@@ -1047,6 +1049,15 @@ class JaxTransferKVReceiver(KVReceiver, StateHolder):
                         "swa_remote_block_ids": swa_remote_ids,
                         "swa_local_block_ids": swa_local_ids,
                     }
+                    logger.warning(
+                        "RAIDEN-D start_read_swa cu=%s swa_ep=%r n_swa=%d "
+                        "remote_swa=%s local_swa=%s",
+                        cu,
+                        md.swa_remote_endpoint,
+                        len(swa_remote_ids),
+                        swa_remote_ids[:8],
+                        swa_local_ids[:8],
+                    )
             try:
                 self._mgr.raiden_wrapper.start_read(
                     cu,

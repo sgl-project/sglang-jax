@@ -209,7 +209,7 @@ class TestBackwardCompatible:
                         1: {
                             "remote_block_ids": [31],
                             "chunk_page_offset": 3,
-                            "swa_remote_block_ids": [41],
+                            "swa_block_ids": [41],
                         }
                     },
                 }
@@ -265,6 +265,7 @@ class TestBackwardCompatible:
 
         assert mgr.raiden_wrapper.calls
         _, kwargs = mgr.raiden_wrapper.calls[0]
+        assert kwargs["swa_remote_block_ids"] == [41]
         assert kwargs["swa_local_block_ids"] == [103]
 
     def test_resolve_kv_pool_dtype_accepts_swa_pool(self):
