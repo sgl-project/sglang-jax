@@ -29,6 +29,15 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _batch_req_count(batch) -> int:
+    if batch is None:
+        return 0
+    reqs_info = getattr(batch, "reqs_info", None)
+    if reqs_info is None:
+        return len(getattr(batch, "reqs", ()) or ())
+    return sum(len(info.reqs) if info.reqs else 0 for info in reqs_info)
+
+
 @dataclass
 class DecodeBookkeeping:
     """Per-request decode-side state."""
@@ -198,7 +207,7 @@ class SchedulerDisaggregationDecodeMixin:
             kv_avail = self.token_to_kv_pool_allocator.available_size()
         except Exception:
             kv_avail = -1
-        running = len(self.running_batch.reqs) if self.running_batch is not None else 0
+        running = _batch_req_count(self.running_batch)
         return (
             f"prealloc_q={prealloc} transfer_q={transfer} "
             f"inflight_send={ns} inflight_recv={nr} "
@@ -249,9 +258,14 @@ class SchedulerDisaggregationDecodeMixin:
                         # Local cache resolution (sglang-style): a warm cache
                         # does zero network I/O, so this no longer blocks the
                         # event loop.
-                        p_info = self.disagg_prefill_info_cache.pick_for_room(
-                            req.bootstrap_room, dp_rank=prefill_dp_rank
-                        )
+                        try:
+                            p_info = self.disagg_prefill_info_cache.pick_for_room(
+                                req.bootstrap_room, dp_rank=prefill_dp_rank
+                            )
+                        except TypeError:
+                            p_info = self.disagg_prefill_info_cache.pick_for_room(
+                                req.bootstrap_room
+                            )
                 self._pd_mark_time(req, "bootstrap_done")
             except Exception:
                 logger.exception(
@@ -492,7 +506,7 @@ class SchedulerDisaggregationDecodeMixin:
         page_size = allocator.page_size
         reserved_per = self.server_args.disaggregation_num_reserved_decode_tokens
         max_inflight = self.server_args.disaggregation_max_inflight_transfers
-        n_running = len(self.running_batch.reqs) if self.running_batch is not None else 0
+        n_running = _batch_req_count(self.running_batch)
         n_transfer = len(self.disagg_transfer_queue)
         admitted = 0
 
@@ -518,7 +532,7 @@ class SchedulerDisaggregationDecodeMixin:
                 # as transient and retry next tick rather than abort.
                 break
 
-            if self.disagg_kv_manager.use_raiden:
+            if getattr(self.disagg_kv_manager, "use_raiden", False):
                 admitted_raiden = self._admit_one_raiden(entry, kv_indices, page_size)
                 if admitted_raiden is None:
                     # P hasn't published this req's block metadata yet (bootstrap

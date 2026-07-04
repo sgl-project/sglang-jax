@@ -26,6 +26,15 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _batch_reqs(batch) -> tuple[Req, ...]:
+    if batch is None:
+        return ()
+    reqs_info = getattr(batch, "reqs_info", None)
+    if reqs_info is None:
+        return tuple(getattr(batch, "reqs", ()) or ())
+    return tuple(req for info in reqs_info for req in (info.reqs or ()))
+
+
 # Bucket page counts to bound XLA's per-shape compile pool.
 # Largest bucket (512 pages × 128 tokens/page) covers 64k-token prompts.
 _KV_GATHER_PAGE_BUCKETS = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512)
@@ -192,7 +201,8 @@ class SchedulerDisaggregationPrefillMixin:
             self.cur_batch = batch
 
             if batch:
-                for req in batch.reqs:
+                batch_reqs = _batch_reqs(batch)
+                for req in batch_reqs:
                     if req.bootstrap_room is not None:
                         self._pd_mark_time(req, "forward_start")
                 result = self.run_batch(batch)
@@ -206,14 +216,18 @@ class SchedulerDisaggregationPrefillMixin:
             self.send_kv_chunk()
             # PD reqs are finished and released inside process_prefill_chunk;
             # do not merge them into running_batch.
+            batch_reqs = _batch_reqs(batch)
             self.last_batch = (
-                None if batch and any(r.bootstrap_room is not None for r in batch.reqs) else batch
+                None
+                if batch and any(r.bootstrap_room is not None for r in batch_reqs)
+                else batch
             )
 
     def process_prefill_chunk(self: Scheduler, batch, result) -> None:
         """Extract KV for PD reqs and hand off to sender."""
 
-        pd_reqs = [req for req in batch.reqs if req.bootstrap_room is not None]
+        batch_reqs = _batch_reqs(batch)
+        pd_reqs = [req for req in batch_reqs if req.bootstrap_room is not None]
         if not pd_reqs:
             self.process_batch_result(batch, result)
             return
@@ -225,7 +239,7 @@ class SchedulerDisaggregationPrefillMixin:
 
         chunked_now = tuple(r for r in getattr(self, "chunked_reqs", ()) if r is not None)
         use_raiden = self.disagg_kv_manager.use_raiden
-        for req in batch.reqs:
+        for req in batch_reqs:
             if req.bootstrap_room is None:
                 continue
             req_id = req.rid

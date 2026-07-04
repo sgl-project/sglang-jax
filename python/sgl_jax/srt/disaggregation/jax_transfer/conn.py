@@ -449,7 +449,7 @@ class JaxTransferKVSender(KVSender, StateHolder):
         # P->D block-metadata publish. ``_use_raiden`` mirrors the manager.
         # Chunked transfer registers one raiden uuid per chunk (register_read is
         # overwrite-per-uuid, not cumulative), so we track them per chunk_index.
-        self._use_raiden: bool = mgr.use_raiden
+        self._use_raiden: bool = bool(getattr(mgr, "use_raiden", False))
         self._started_chunks: set[int] = set()
         self._num_chunks: int | None = None
         self._bootstrap_room: int | None = None
@@ -739,7 +739,7 @@ class JaxTransferKVReceiver(KVReceiver, StateHolder):
         # raiden path: mirrors the manager. Chunked transfer issues one
         # ``start_read`` per chunk (each its own uuid), so track which chunks
         # have been started and the total once P publishes its final chunk.
-        self._use_raiden: bool = mgr.use_raiden
+        self._use_raiden: bool = bool(getattr(mgr, "use_raiden", False))
         self._started_chunks: set[int] = set()
         self._num_chunks: int | None = None
         self._state_lock = threading.Lock()
