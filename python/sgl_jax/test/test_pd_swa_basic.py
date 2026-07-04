@@ -104,11 +104,17 @@ class TestSWABlockExtraction:
         class MockAllocator:
             full_to_swa_index_mapping = mapping
 
+            def get_kvcache(self):
+                return type("KVPool", (), {"page_size": page_size})()
+
         class MockScheduler:
             req_to_token_pool = MockReqToTokenPool()
             token_to_kv_pool_allocator = MockAllocator()
 
         # Monkey-patch the real method onto the mock
+        MockScheduler._extract_req_block_ids_range = (
+            SchedulerDisaggregationPrefillMixin._extract_req_block_ids_range
+        )
         MockScheduler._extract_swa_block_ids_for_chunk = (
             SchedulerDisaggregationPrefillMixin._extract_swa_block_ids_for_chunk
         )
@@ -201,8 +207,8 @@ class TestSWABlockExtraction:
 
         assert result == [8, 9]
 
-    def test_dp_rank_swa_blocks_are_globalized_for_raiden(self, mock_scheduler):
-        """Rank-local SWA page ids must be offset before raiden sees them."""
+    def test_dp_rank_swa_blocks_remain_local_for_raiden(self, mock_scheduler):
+        """DP rank selects the SWA mapping; raiden block ids stay local."""
         scheduler, page_size, seqlen = mock_scheduler
         rank0 = np.zeros_like(
             scheduler.token_to_kv_pool_allocator.full_to_swa_index_mapping
@@ -222,7 +228,21 @@ class TestSWABlockExtraction:
             sliding_window_size=8,
         )
 
-        assert result == [19, 20]
+        assert result == [8, 9]
+
+    def test_dp_rank_full_blocks_remain_local_for_raiden(self, mock_scheduler):
+        """Full-pool page ids must stay within the local raiden manager shape."""
+        scheduler, page_size, _ = mock_scheduler
+        scheduler.token_to_kv_pool_allocator.pages_per_rank = 10
+        req = self._make_req(list(range(40)), dp_rank=1)
+
+        result = scheduler._extract_req_block_ids_range(
+            req,
+            start=4,
+            end=12,
+        )
+
+        assert result == [1, 2]
 
 
 class TestRaidenDPPageNamespace:
