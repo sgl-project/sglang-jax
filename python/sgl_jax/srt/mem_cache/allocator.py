@@ -117,8 +117,14 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def free(self, free_index: np.ndarray, dp_rank: int = 0):
         if free_index.size == 0:
             return
+        free_index = np.unique(np.asarray(free_index, dtype=np.int32))
+        free_index = free_index[free_index > 0]
+        if free_index.size == 0:
+            return
         if self.is_not_in_free_group:
-            self.free_slots[dp_rank] = np.concatenate([self.free_slots[dp_rank], free_index])
+            free_index = np.setdiff1d(free_index, self.free_slots[dp_rank])
+            if free_index.size > 0:
+                self.free_slots[dp_rank] = np.concatenate([self.free_slots[dp_rank], free_index])
         else:
             self.free_group[dp_rank].append(free_index)
 
@@ -139,9 +145,8 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.is_not_in_free_group = True
         for rank in range(self.dp_size):
             if self.free_group[rank]:
-                self.free_slots[rank] = np.concatenate(
-                    [self.free_slots[rank]] + self.free_group[rank]
-                )
+                all_free_indices = np.concatenate(self.free_group[rank])
+                self.free(all_free_indices, dp_rank=rank)
                 self.free_group[rank] = []
 
     def get_cpu_copy(self, indices):
@@ -358,6 +363,10 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def free(self, free_index: np.ndarray, dp_rank: int = 0):
         if free_index.size == 0:
             return
+        free_index = np.unique(np.asarray(free_index, dtype=np.int32))
+        free_index = free_index[free_index > 0]
+        if free_index.size == 0:
+            return
 
         if self.is_not_in_free_group:
             free_pages = np.unique(free_index // self.page_size)
@@ -567,6 +576,10 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def free(self, free_index: np.array, dp_rank: int = 0):
         if len(free_index) == 0:
             return
+        free_index = np.unique(np.asarray(free_index, dtype=np.int32))
+        free_index = free_index[free_index > 0]
+        if free_index.size == 0:
+            return
         if self.is_not_in_free_group:
             self.full_attn_allocator.free(free_index, dp_rank=dp_rank)
             self.free_swa(free_index, dp_rank=dp_rank)
@@ -586,14 +599,21 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert self.swa_attn_allocator.available_size(dp_rank=dp_rank) <= swa_expected
 
     def free_swa(self, free_index: np.array, dp_rank: int = 0):
+        if len(free_index) == 0:
+            return
+        free_index = np.unique(np.asarray(free_index, dtype=np.int32))
+        free_index = free_index[free_index > 0]
+        if free_index.size == 0:
+            return
         mapping = (
             self.full_to_swa_index_mapping
             if self.dp_size == 1
             else self.full_to_swa_index_mapping[dp_rank]
         )
         map_vals = mapping[free_index]
-        swa_indices = map_vals[map_vals > 0]
-        self.swa_attn_allocator.free(swa_indices, dp_rank=dp_rank)
+        swa_indices = np.unique(map_vals[map_vals > 0])
+        if swa_indices.size > 0:
+            self.swa_attn_allocator.free(swa_indices, dp_rank=dp_rank)
         mapping[free_index] = 0
 
     def count_swa_mapped(self, indices: np.array, dp_rank: int = 0) -> int:
@@ -637,6 +657,6 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.is_not_in_free_group = True
         for rank in range(self.dp_size):
             if self.free_group[rank]:
-                all_free_indices = np.concatenate(self.free_group[rank])
+                all_free_indices = np.unique(np.concatenate(self.free_group[rank]))
                 self.free(all_free_indices, dp_rank=rank)
                 self.free_group[rank] = []

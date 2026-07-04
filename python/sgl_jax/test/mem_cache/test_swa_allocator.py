@@ -30,7 +30,7 @@ def _make_mesh():
     return Mesh(devices, axis_names=("data", "tensor"))
 
 
-def _make_swa_pool(size, size_swa, page_size, mesh):
+def _make_swa_pool(size, size_swa, page_size, mesh, dp_size=1):
     """Create a minimal SWAKVPool for testing."""
     return SWAKVPool(
         size=size,
@@ -43,6 +43,7 @@ def _make_swa_pool(size, size_swa, page_size, mesh):
         head_num=1,
         head_dim=1,
         mesh=mesh,
+        dp_size=dp_size,
     )
 
 
@@ -136,6 +137,53 @@ class TestSWAAllocatorTokenLevel(CustomTestCase):
         # Second call should be a no-op (mapping is already 0)
         self.alloc.free_swa(indices)
         self.assertEqual(self.alloc.swa_available_size(), swa_after_first)
+
+    def test_free_swa_deduplicates_repeated_indices(self):
+        """free_swa() should not over-free repeated indices in one call."""
+        indices = self.alloc.alloc(5)
+        swa_before = self.alloc.swa_available_size()
+
+        repeated = np.concatenate(
+            [np.array([0, 0], dtype=np.int32), indices, indices[:3], indices]
+        )
+        self.alloc.free_swa(repeated)
+
+        self.assertEqual(self.alloc.swa_available_size(), swa_before + len(indices))
+        self.assertEqual(self.alloc.swa_available_size(), 32)
+
+    def test_free_group_deduplicates_repeated_indices_multi_rank(self):
+        """free_group_end() should be safe with repeated frees under DP."""
+        dp_size = 2
+        kv = _make_swa_pool(
+            size=64,
+            size_swa=32,
+            page_size=1,
+            mesh=self.mesh,
+            dp_size=dp_size,
+        )
+        alloc = SWATokenToKVPoolAllocator(
+            size=64,
+            size_swa=32,
+            kvcache=kv,
+            page_size=1,
+            dp_size=dp_size,
+        )
+
+        rank0_indices = alloc.alloc(6, dp_rank=0)
+        rank1_indices = alloc.alloc(4, dp_rank=1)
+        self.assertIsNotNone(rank0_indices)
+        self.assertIsNotNone(rank1_indices)
+
+        alloc.free_group_begin()
+        alloc.free(np.concatenate([rank0_indices[:3], rank0_indices]), dp_rank=0)
+        alloc.free(np.concatenate([rank0_indices, rank0_indices[2:]]), dp_rank=0)
+        alloc.free(np.concatenate([rank1_indices, rank1_indices]), dp_rank=1)
+        alloc.free_group_end()
+
+        self.assertEqual(alloc.full_available_size(dp_rank=0), 32)
+        self.assertEqual(alloc.swa_available_size(dp_rank=0), 16)
+        self.assertEqual(alloc.full_available_size(dp_rank=1), 32)
+        self.assertEqual(alloc.swa_available_size(dp_rank=1), 16)
 
 
 # ---------------------------------------------------------------------------
@@ -268,6 +316,17 @@ class TestSWAAllocatorPaged(CustomTestCase):
         indices = self.alloc.alloc(8)
         self.assertIsNotNone(indices)
         self.alloc.free(indices)
+        self.assertEqual(self.alloc.full_available_size(), self.size)
+        self.assertEqual(self.alloc.swa_available_size(), self.size_swa)
+
+    def test_free_ignores_zero_padding_paged(self):
+        """free() should ignore padded zero slots instead of releasing page 0."""
+        indices = self.alloc.alloc(8)
+        self.assertIsNotNone(indices)
+
+        padded = np.concatenate([np.zeros(8, dtype=np.int32), indices, indices[:4]])
+        self.alloc.free(padded)
+
         self.assertEqual(self.alloc.full_available_size(), self.size)
         self.assertEqual(self.alloc.swa_available_size(), self.size_swa)
 
