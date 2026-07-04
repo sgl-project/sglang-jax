@@ -38,6 +38,10 @@ def _batch_req_count(batch) -> int:
     return sum(len(info.reqs) if info.reqs else 0 for info in reqs_info)
 
 
+def _req_dp_rank(req) -> int:
+    return int(getattr(req, "dp_rank", 0) or 0)
+
+
 def _raiden_endpoint_for_dp(
     *,
     p_host: str,
@@ -450,7 +454,9 @@ class SchedulerDisaggregationDecodeMixin:
                         entry.req_id,
                     )
                     if entry.kv_indices is not None:
-                        self._release_decode_kv_indices(entry.kv_indices)
+                        self._release_decode_kv_indices(
+                            entry.kv_indices, dp_rank=_req_dp_rank(entry.req)
+                        )
                     self._abort_decode_request(entry.req, "kv_writeback")
             else:
                 logger.warning(
@@ -461,7 +467,9 @@ class SchedulerDisaggregationDecodeMixin:
                 )
                 self._record_decode_transfer_failure("receiver_terminal_failed")
                 if entry.kv_indices is not None:
-                    self._release_decode_kv_indices(entry.kv_indices)
+                    self._release_decode_kv_indices(
+                        entry.kv_indices, dp_rank=_req_dp_rank(entry.req)
+                    )
                 self._abort_decode_request(entry.req, "receiver_terminal_failed")
 
     def _pick_prefill_peer_for_this_host(
@@ -560,6 +568,7 @@ class SchedulerDisaggregationDecodeMixin:
         admitted = 0
 
         for entry in self.disagg_prealloc_queue.items_fifo():
+            dp_rank = _req_dp_rank(entry.req)
             # In-flight transfer cap: each admitted transfer holds a pulled KV
             # destination buffer on decode HBM (untracked by the paged-pool
             # budget below) until it is scattered. Stop admitting once the cap
@@ -571,11 +580,11 @@ class SchedulerDisaggregationDecodeMixin:
             seqlen = len(entry.req.origin_input_ids)
             page_aligned = ((seqlen + page_size - 1) // page_size) * page_size
             reserved = reserved_per * (n_running + n_transfer + admitted)
-            if page_aligned + reserved > allocator.available_size():
+            if page_aligned + reserved > allocator.available_size(dp_rank=dp_rank):
                 # Insufficient capacity: defer this and all later (FIFO) reqs.
                 break
 
-            kv_indices = allocator.alloc(page_aligned)
+            kv_indices = allocator.alloc(page_aligned, dp_rank=dp_rank)
             if kv_indices is None:
                 # Budget check should prevent this; treat a surprise shortfall
                 # as transient and retry next tick rather than abort.
@@ -587,7 +596,7 @@ class SchedulerDisaggregationDecodeMixin:
                     # P hasn't published this req's block metadata yet (bootstrap
                     # 404). Free the slot we just allocated and leave the entry in
                     # the prealloc queue to retry next tick (deferral, not abort).
-                    self._release_decode_kv_indices(kv_indices)
+                    self._release_decode_kv_indices(kv_indices, dp_rank=dp_rank)
                     continue
                 if admitted_raiden is False:
                     # Setup failed and the request was already aborted inside the
@@ -615,7 +624,7 @@ class SchedulerDisaggregationDecodeMixin:
                     entry.req.rid,
                 )
                 self._record_decode_transfer_failure("receiver_init")
-                self._release_decode_kv_indices(kv_indices)
+                self._release_decode_kv_indices(kv_indices, dp_rank=dp_rank)
                 self.disagg_prealloc_queue.remove(entry.req_id)
                 self._abort_decode_request(entry.req, "receiver_init")
                 continue
@@ -770,7 +779,7 @@ class SchedulerDisaggregationDecodeMixin:
                 req.rid,
             )
             self._record_decode_transfer_failure("receiver_init")
-            self._release_decode_kv_indices(kv_indices)
+            self._release_decode_kv_indices(kv_indices, dp_rank=_req_dp_rank(req))
             self.disagg_prealloc_queue.remove(entry.req_id)
             self._abort_decode_request(req, "receiver_init")
             return False
@@ -838,7 +847,7 @@ class SchedulerDisaggregationDecodeMixin:
             req.pd_time_stats = ts
         ts.mark(name)
 
-    def _release_decode_kv_indices(self: Scheduler, kv_indices) -> None:
+    def _release_decode_kv_indices(self: Scheduler, kv_indices, dp_rank: int = 0) -> None:
         """Release KV indices back to the allocator."""
 
         if kv_indices is None:
@@ -846,7 +855,7 @@ class SchedulerDisaggregationDecodeMixin:
         allocator = self.token_to_kv_pool_allocator
         if allocator is not None:
             try:
-                allocator.free(kv_indices)
+                allocator.free(kv_indices, dp_rank=dp_rank)
             except Exception:
                 logger.exception("failed to free kv_indices=%r", kv_indices)
 

@@ -304,6 +304,168 @@ class TestRaidenEndpointDPShards:
         assert endpoint == "10.0.0.1:33463"
 
 
+class TestDecodeDPAllocation:
+    def test_admit_decode_prealloc_allocates_request_dp_rank(self):
+        from types import SimpleNamespace
+
+        from sgl_jax.srt.disaggregation.decode import (
+            DecodeBookkeeping,
+            SchedulerDisaggregationDecodeMixin,
+        )
+
+        class FakeAllocator:
+            page_size = 4
+
+            def __init__(self):
+                self.available_calls = []
+                self.alloc_calls = []
+
+            def available_size(self, dp_rank=0):
+                self.available_calls.append(dp_rank)
+                return 10_000
+
+            def alloc(self, need_size, dp_rank=0):
+                self.alloc_calls.append((need_size, dp_rank))
+                return np.arange(4, 20, dtype=np.int32)
+
+        class FakePreallocQueue:
+            def __init__(self, entry):
+                self.entry = entry
+
+            def items_fifo(self):
+                return [self.entry]
+
+        class FakeTransferQueue:
+            def __len__(self):
+                return 0
+
+        req = SimpleNamespace(
+            rid="req",
+            dp_rank=1,
+            origin_input_ids=list(range(13)),
+        )
+        entry = DecodeBookkeeping(req_id=req.rid, req=req, p_info={})
+        scheduler = SimpleNamespace(
+            token_to_kv_pool_allocator=FakeAllocator(),
+            server_args=SimpleNamespace(
+                disaggregation_num_reserved_decode_tokens=512,
+                disaggregation_max_inflight_transfers=8,
+            ),
+            running_batch=None,
+            disagg_transfer_queue=FakeTransferQueue(),
+            disagg_prealloc_queue=FakePreallocQueue(entry),
+            disagg_kv_manager=SimpleNamespace(use_raiden=True),
+        )
+
+        admitted = []
+
+        def fake_admit(entry_arg, kv_indices, page_size):
+            admitted.append((entry_arg.req.dp_rank, kv_indices.copy(), page_size))
+            return True
+
+        scheduler._admit_one_raiden = fake_admit
+
+        SchedulerDisaggregationDecodeMixin._admit_decode_prealloc(scheduler)
+
+        assert scheduler.token_to_kv_pool_allocator.available_calls == [1]
+        assert scheduler.token_to_kv_pool_allocator.alloc_calls == [(16, 1)]
+        assert admitted and admitted[0][0] == 1
+
+    def test_admit_one_raiden_builds_dp_rank_swa_local_pages(self):
+        import json
+        from types import SimpleNamespace
+
+        from sgl_jax.srt.disaggregation.decode import (
+            DecodeBookkeeping,
+            SchedulerDisaggregationDecodeMixin,
+        )
+
+        class FakeBootstrap:
+            def get_transfer_info(self, room):
+                assert room == 7
+                return {
+                    "chunks": {
+                        0: {
+                            "raiden_endpoints_json": json.dumps([
+                                {"endpoint": "10.0.0.1:37121", "shards": list(range(8))}
+                            ]),
+                            "swa_raiden_endpoints_json": json.dumps([
+                                {"endpoint": "10.0.0.1:33031", "shards": list(range(8))}
+                            ]),
+                        }
+                    }
+                }
+
+        class FakeReceiver:
+            def init(self, metadata):
+                self.metadata = metadata
+
+        class FakeManager:
+            use_raiden = True
+
+            def __init__(self):
+                self.receiver = FakeReceiver()
+                self.raiden_wrapper = SimpleNamespace(
+                    endpoints=[{"endpoint": "10.0.0.2:1", "shards": list(range(8))}],
+                    endpoints_swa=[{"endpoint": "10.0.0.2:2", "shards": list(range(8))}],
+                )
+
+            def create_receiver(self, req_id):
+                assert req_id == "req"
+                return self.receiver
+
+        rank0 = np.zeros(128, dtype=np.int32)
+        rank1 = np.zeros(128, dtype=np.int32)
+        rank1[12] = 20
+        rank1[16] = 24
+        allocator = SimpleNamespace(full_to_swa_index_mapping=[rank0, rank1])
+        manager = FakeManager()
+        removed = []
+        req = SimpleNamespace(
+            rid="req",
+            dp_rank=1,
+            bootstrap_room=7,
+            disagg_transfer_id=None,
+            origin_input_ids=list(range(16)),
+        )
+        entry = DecodeBookkeeping(
+            req_id=req.rid,
+            req=req,
+            p_info={
+                "host": "10.0.0.1",
+                "transfer_port": 31000,
+                "side_channel_port": 9600,
+            },
+        )
+        scheduler = SimpleNamespace(
+            disagg_bootstrap_client=FakeBootstrap(),
+            disagg_kv_manager=manager,
+            token_to_kv_pool_allocator=allocator,
+            sliding_window_size=8,
+            dp_size=2,
+            disagg_prealloc_queue=SimpleNamespace(remove=removed.append),
+            disagg_transfer_queue=SimpleNamespace(add=lambda entry: None),
+            _record_decode_transfer_failure=lambda reason: None,
+            _release_decode_kv_indices=lambda kv_indices, dp_rank=0: None,
+            _abort_decode_request=lambda req, reason: None,
+            _raiden_set_decode_bookkeeping=lambda req, kv_indices: None,
+            _pd_mark_time=lambda req, name: None,
+        )
+        kv_indices = np.arange(4, 20, dtype=np.int32)
+
+        ok = SchedulerDisaggregationDecodeMixin._admit_one_raiden(
+            scheduler, entry, kv_indices, page_size=4
+        )
+
+        assert ok is True
+        metadata = manager.receiver.metadata
+        assert metadata.swa_local_pages == (5, 6)
+        assert metadata.swa_local_page_by_full_page == {2: 5, 3: 6}
+        assert metadata.swa_remote_endpoint == [
+            {"endpoint": "10.0.0.1:33031", "shards": [4, 5, 6, 7]}
+        ]
+
+
 class TestBackwardCompatible:
     """Non-SWA paths remain unchanged."""
 
