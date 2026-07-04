@@ -1,0 +1,374 @@
+# MiMo-V2-Flash SWA PD E2E on two v7x-4 TPU nodes.
+#
+# Render and submit with:
+#   scripts/disaggregation/gke/deploy_mimo_swa_pd_e2e.sh
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: <JOB_NAME>-headless-svc
+spec:
+  clusterIP: None
+  selector:
+    job-name: <JOB_NAME>
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: <JOB_NAME>
+spec:
+  completionMode: Indexed
+  parallelism: 2
+  completions: 2
+  backoffLimit: 0
+  template:
+    metadata:
+      annotations:
+        gke-gcsfuse/volumes: "true"
+    spec:
+      subdomain: <JOB_NAME>-headless-svc
+      restartPolicy: Never
+      terminationGracePeriodSeconds: 30
+      nodeSelector:
+        cloud.google.com/gke-tpu-accelerator: <TPU_ACCELERATOR>
+        cloud.google.com/gke-tpu-topology: "<TPU_TOPOLOGY>"
+      tolerations:
+      - key: google.com/tpu
+        operator: Exists
+        effect: NoSchedule
+      - key: falcon.com/dedicated
+        operator: Exists
+        effect: NoSchedule
+      serviceAccountName: <SERVICE_ACCOUNT>
+      containers:
+      - name: jax-tpu
+        image: <IMAGE>
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          privileged: true
+        env:
+        - name: JOB_BASENAME
+          value: "<JOB_NAME>"
+        - name: P_HOST
+          value: "<JOB_NAME>-0.<JOB_NAME>-headless-svc"
+        - name: GH_REPO
+          value: "<GH_REPO>"
+        - name: BRANCH
+          value: "<BRANCH>"
+        - name: MODEL_PATH
+          value: "<MODEL_PATH>"
+        - name: RAIDEN_CACHE
+          value: "<RAIDEN_CACHE>"
+        - name: CAP
+          value: "<CAP>"
+        - name: MAX_RUNNING_REQUESTS
+          value: "<MAX_RUNNING_REQUESTS>"
+        - name: ROUTER_MAX_CONCURRENT_REQUESTS
+          value: "<ROUTER_MAX_CONCURRENT_REQUESTS>"
+        - name: CONTEXT_LENGTH
+          value: "<CONTEXT_LENGTH>"
+        - name: CHUNKED_PREFILL_SIZE
+          value: "<CHUNKED_PREFILL_SIZE>"
+        - name: MAX_PREFILL_TOKENS
+          value: "<MAX_PREFILL_TOKENS>"
+        - name: MEM_FRACTION_STATIC
+          value: "<MEM_FRACTION_STATIC>"
+        - name: SWA_FULL_TOKENS_RATIO
+          value: "<SWA_FULL_TOKENS_RATIO>"
+        - name: PRECOMPILE_BS_PADDINGS
+          value: "<PRECOMPILE_BS_PADDINGS>"
+        - name: PRECOMPILE_TOKEN_PADDINGS
+          value: "<PRECOMPILE_TOKEN_PADDINGS>"
+        - name: RUN_GSM8K
+          value: "<RUN_GSM8K>"
+        - name: GSM_Q
+          value: "<GSM_Q>"
+        - name: GSM_PAR
+          value: "<GSM_PAR>"
+        - name: GSM_MAXTOK
+          value: "<GSM_MAXTOK>"
+        - name: GSM_MIN_ACC
+          value: "<GSM_MIN_ACC>"
+        - name: GSM_TIMEOUT_SECONDS
+          value: "<GSM_TIMEOUT_SECONDS>"
+        - name: RUN_LONG_BENCH
+          value: "<RUN_LONG_BENCH>"
+        - name: BENCH_INPUT_LEN
+          value: "<BENCH_INPUT_LEN>"
+        - name: BENCH_OUTPUT_LEN
+          value: "<BENCH_OUTPUT_LEN>"
+        - name: BENCH_NUM_PROMPTS
+          value: "<BENCH_NUM_PROMPTS>"
+        - name: BENCH_CONCURRENCY
+          value: "<BENCH_CONCURRENCY>"
+        - name: BENCH_WARMUP_REQUESTS
+          value: "<BENCH_WARMUP_REQUESTS>"
+        - name: BENCH_TIMEOUT_SECONDS
+          value: "<BENCH_TIMEOUT_SECONDS>"
+        - name: KEEPALIVE_SECONDS
+          value: "<KEEPALIVE_SECONDS>"
+        command:
+        - bash
+        - -c
+        - |
+          set -euxo pipefail
+
+          export TMPDIR="/tmp/tpu_logs/tmp"
+          export PIP_CACHE_DIR="/tmp/tpu_logs/pip-cache"
+          export OUT="/tmp/e2e_logs"
+          mkdir -p "$TMPDIR" "$PIP_CACHE_DIR" "$OUT"
+          ulimit -c 0
+
+          apt-get update
+          apt-get install -y curl git iproute2 tmux vim build-essential
+
+          echo "=== Upgrading JAX to 0.10.2 ==="
+          pip install -U 'jax[tpu]==0.10.2' \
+            -i https://us-python.pkg.dev/ml-oss-artifacts-published/jax/simple/ \
+            -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+
+          echo "=== Cloning ${GH_REPO} branch ${BRANCH} ==="
+          cd /tmp
+          rm -rf /tmp/sglang-jax
+          git clone --depth 1 "${GH_REPO}" -b "${BRANCH}" /tmp/sglang-jax
+          cd /tmp/sglang-jax
+          git rev-parse HEAD | tee "$OUT/git_head.txt"
+
+          pip install -q -e python
+          export PYTHONPATH="/tmp/sglang-jax:${PYTHONPATH:-}"
+
+          INDEX=${JOB_COMPLETION_INDEX}
+          export TPU_PROCESS_ADDRESSES="${JOB_BASENAME}-${INDEX}.${JOB_BASENAME}-headless-svc:8471"
+          export TPU_WORKER_HOSTNAMES="${JOB_BASENAME}-${INDEX}.${JOB_BASENAME}-headless-svc"
+          export TPU_PROCESS_PORT="8471"
+          export TPU_WORKER_ID="0"
+          export TPU_LOG_DIR="/tmp/tpu_logs/jax-tpu-${INDEX}"
+
+          echo "=== Installing tpu-raiden from GCS cache ==="
+          test -f "$RAIDEN_CACHE"
+          mkdir -p /tmp/tpu-raiden-cached
+          tar xzf "$RAIDEN_CACHE" -C /tmp/tpu-raiden-cached
+          export PYTHONPATH="/tmp/tpu-raiden-cached/tpu-raiden:${PYTHONPATH:-}"
+          python -c "import tpu_raiden.frameworks.jax._tpu_raiden_jax"
+          export SGLANG_JAX_USE_RAIDEN=1
+
+          echo "=== Verifying model files ==="
+          ls "$MODEL_PATH/config.json"
+          ls "$MODEL_PATH/model.safetensors.index.json"
+
+          wait_health() {
+            local url="$1"
+            local name="$2"
+            local max_iters="$3"
+            local pid="${4:-}"
+            for i in $(seq 1 "$max_iters"); do
+              if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
+                echo "FATAL: ${name} died before ready"
+                return 1
+              fi
+              if curl -sf "$url" >/dev/null 2>&1; then
+                echo "${name} ready after ${i}0s"
+                return 0
+              fi
+              sleep 10
+              echo "waiting ${name} ${i}/${max_iters}"
+            done
+            echo "FATAL: ${name} not ready after $((max_iters * 10))s"
+            return 1
+          }
+
+          read -ra PRECOMPILE_BS_PADDING_ARGS <<< "$PRECOMPILE_BS_PADDINGS"
+          read -ra PRECOMPILE_TOKEN_PADDING_ARGS <<< "$PRECOMPILE_TOKEN_PADDINGS"
+
+          COMMON_ARGS=(
+            --model-path "$MODEL_PATH"
+            --trust-remote-code
+            --enable-sequence-parallel
+            --tp-size 8
+            --ep-size 8
+            --moe-backend fused_v2
+            --nnodes 1 --node-rank 0
+            --page-size 256
+            --context-length "$CONTEXT_LENGTH"
+            --disable-radix-cache
+            --chunked-prefill-size "$CHUNKED_PREFILL_SIZE"
+            --max-prefill-tokens "$MAX_PREFILL_TOKENS"
+            --dtype bfloat16
+            --mem-fraction-static "$MEM_FRACTION_STATIC"
+            --swa-full-tokens-ratio "$SWA_FULL_TOKENS_RATIO"
+            --skip-server-warmup
+            --log-level info
+            --max-running-requests "$MAX_RUNNING_REQUESTS"
+            --dp-schedule-policy round_robin
+            --precompile-bs-paddings "${PRECOMPILE_BS_PADDING_ARGS[@]}"
+            --precompile-token-paddings "${PRECOMPILE_TOKEN_PADDING_ARGS[@]}"
+            --disaggregation-enable-d2h
+            --disaggregation-use-raiden
+            --enable-metrics
+          )
+
+          if [ "$INDEX" = "0" ]; then
+            echo "=== Starting bootstrap ==="
+            python -m sgl_jax.srt.disaggregation.run_bootstrap --host 0.0.0.0 --port 8998 \
+              2>&1 | tee "$OUT/bootstrap.log" &
+            BOOT_PID=$!
+            wait_health http://localhost:8998/health bootstrap 60 "$BOOT_PID"
+
+            echo "=== Starting prefill server ==="
+            python -m sgl_jax.launch_server \
+              "${COMMON_ARGS[@]}" \
+              --host 0.0.0.0 --port 10000 \
+              --disaggregation-mode prefill \
+              --disaggregation-bootstrap-url "http://${P_HOST}:8998" \
+              2>&1 | tee "$OUT/prefill_server.log" &
+            PF_PID=$!
+
+            wait_health http://localhost:10000/health prefill 300 "$PF_PID" || {
+              tail -120 "$OUT/prefill_server.log" || true
+              exit 1
+            }
+
+            echo "=== Prefill key logs after ready ==="
+            grep -E "Sliding window|SWAChunkCache|is_hybrid_swa|swa_layer_num|RaidenTransferWrapper started|raiden data plane enabled" "$OUT/prefill_server.log" || true
+            echo "Prefill stays up for decode driver."
+            sleep "$KEEPALIVE_SECONDS"
+            echo "pod0 bounded sleep done."
+          else
+            echo "=== Waiting for bootstrap and prefill ==="
+            wait_health "http://${P_HOST}:8998/health" remote-bootstrap 300
+            wait_health "http://${P_HOST}:10000/health" remote-prefill 360
+
+            echo "=== Starting decode server ==="
+            python -m sgl_jax.launch_server \
+              "${COMMON_ARGS[@]}" \
+              --host 0.0.0.0 --port 10001 \
+              --disaggregation-mode decode \
+              --disaggregation-bootstrap-url "http://${P_HOST}:8998" \
+              --disaggregation-max-inflight-transfers "$CAP" \
+              2>&1 | tee "$OUT/decode_server.log" &
+            DECODE_PID=$!
+
+            wait_health http://localhost:10001/health decode 300 "$DECODE_PID" || {
+              tail -120 "$OUT/decode_server.log" || true
+              exit 1
+            }
+
+            echo "=== Starting router ==="
+            python -m sgl_jax.srt.disaggregation.launch_router \
+              --pd-disaggregation --mini-lb \
+              --prefill "http://${P_HOST}:10000" 8998 \
+              --decode http://localhost:10001 \
+              --prefill-bootstrap-host "${P_HOST}" \
+              --max-concurrent-requests "$ROUTER_MAX_CONCURRENT_REQUESTS" \
+              --host 0.0.0.0 --port 30000 \
+              2>&1 | tee "$OUT/router.log" &
+            ROUTER_PID=$!
+            wait_health http://localhost:30000/health router 60 "$ROUTER_PID"
+
+            echo "=== Bootstrap metrics ==="
+            curl -sf "http://${P_HOST}:8998/metrics" | grep -E "pd_bootstrap_registry_size" || true
+
+            FAIL=0
+
+            if [ "$RUN_GSM8K" = "1" ]; then
+              echo "=========================================="
+              echo "GSM8K high-concurrency eval q=${GSM_Q} par=${GSM_PAR} maxtok=${GSM_MAXTOK} min_acc=${GSM_MIN_ACC}"
+              echo "=========================================="
+              BEFORE=$(wc -l < "$OUT/decode_server.log")
+              set +e
+              timeout "$GSM_TIMEOUT_SECONDS" python benchmark/gsm8k/bench_sglang_jax.py \
+                --base-url http://localhost:30000 \
+                --num-questions "$GSM_Q" \
+                --num-shots 5 \
+                --max-new-tokens "$GSM_MAXTOK" \
+                --parallel "$GSM_PAR" \
+                --result-file "$OUT/gsm8k_result.jsonl" \
+                --output-file "$OUT/gsm8k_outputs.txt" \
+                2>&1 | tee "$OUT/gsm8k_stdout.log"
+              GSM_RC=${PIPESTATUS[0]}
+              set -e
+              echo "gsm8k_rc=${GSM_RC}"
+              cat "$OUT/gsm8k_result.jsonl" 2>/dev/null || true
+              if [ "$GSM_RC" != "0" ]; then
+                FAIL=1
+              fi
+              if [ -s "$OUT/gsm8k_result.jsonl" ]; then
+                GSM_ACC=$(python -c 'import json; from pathlib import Path; rows = [json.loads(line) for line in Path("/tmp/e2e_logs/gsm8k_result.jsonl").read_text().splitlines() if line.strip()]; print(rows[-1]["accuracy"])')
+                echo "gsm8k_accuracy=${GSM_ACC}"
+                python -c 'import sys; acc = float(sys.argv[1]); minimum = float(sys.argv[2]); sys.exit(0 if acc >= minimum else f"GSM8K accuracy {acc:.3f} is below threshold {minimum:.3f}")' "$GSM_ACC" "$GSM_MIN_ACC" || FAIL=1
+              else
+                FAIL=1
+              fi
+              echo "--- decode logs from GSM8K pass ---"
+              tail -n +$((BEFORE + 1)) "$OUT/decode_server.log" | grep -E "role=decode|RAIDEN-D|start_read|failed_recving|Traceback|RESOURCE_EXHAUSTED" | tail -120 || true
+            fi
+
+            if [ "$RUN_LONG_BENCH" = "1" ]; then
+              echo "=========================================="
+              echo "bench_serving random in=${BENCH_INPUT_LEN} out=${BENCH_OUTPUT_LEN} n=${BENCH_NUM_PROMPTS} conc=${BENCH_CONCURRENCY}"
+              echo "=========================================="
+              BEFORE=$(wc -l < "$OUT/decode_server.log")
+              set +e
+              timeout "$BENCH_TIMEOUT_SECONDS" python -m sgl_jax.bench_serving \
+                --backend sgl-jax \
+                --base-url http://localhost:30000 \
+                --model "$MODEL_PATH" \
+                --dataset-name random \
+                --random-input-len "$BENCH_INPUT_LEN" \
+                --random-output-len "$BENCH_OUTPUT_LEN" \
+                --random-range-ratio 1.0 \
+                --num-prompts "$BENCH_NUM_PROMPTS" \
+                --max-concurrency "$BENCH_CONCURRENCY" \
+                --warmup-requests "$BENCH_WARMUP_REQUESTS" \
+                --output-file "$OUT/bench_${BENCH_INPUT_LEN}_${BENCH_OUTPUT_LEN}.jsonl" \
+                2>&1 | tee "$OUT/bench_${BENCH_INPUT_LEN}_${BENCH_OUTPUT_LEN}.log"
+              BENCH_RC=${PIPESTATUS[0]}
+              set -e
+              echo "bench_rc=${BENCH_RC}"
+              cat "$OUT/bench_${BENCH_INPUT_LEN}_${BENCH_OUTPUT_LEN}.jsonl" 2>/dev/null || true
+              if [ "$BENCH_RC" != "0" ]; then
+                FAIL=1
+              fi
+              echo "--- decode logs from long benchmark pass ---"
+              tail -n +$((BEFORE + 1)) "$OUT/decode_server.log" | grep -E "role=decode|RAIDEN-D|start_read|failed_recving|Traceback|RESOURCE_EXHAUSTED" | tail -120 || true
+            fi
+
+            echo "=== Decode key logs ==="
+            grep -E "is_hybrid_swa|swa_layer_num|RaidenTransferWrapper started|raiden data plane enabled|RAIDEN-D|start_read|swa_remote|local_pages" "$OUT/decode_server.log" | tail -160 || true
+            echo "=== Prefill registered reads ==="
+            curl -sf "http://${P_HOST}:8998/metrics" | grep -E "pd_bootstrap_registry_size" || true
+            echo "=== Router errors ==="
+            grep -E " 4[0-9][0-9] | 5[0-9][0-9] |Traceback|ERROR" "$OUT/router.log" || true
+            echo "=== OOM/traceback markers ==="
+            grep -cE "RESOURCE_EXHAUSTED|out of memory|Traceback|SIGABRT|failed_recving" "$OUT/decode_server.log" || true
+            echo "=== Final status ==="
+            echo "driver_fail=${FAIL}"
+            echo "Driver done. Sleeping for log inspection."
+            sleep "$KEEPALIVE_SECONDS"
+            exit "$FAIL"
+          fi
+        resources:
+          requests:
+            ephemeral-storage: <EPHEMERAL_STORAGE>
+            google.com/tpu: <TPU_CHIPS>
+          limits:
+            ephemeral-storage: <EPHEMERAL_STORAGE>
+            google.com/tpu: <TPU_CHIPS>
+        volumeMounts:
+        - name: dshm
+          mountPath: /dev/shm
+        - name: model-storage
+          mountPath: /models
+          readOnly: true
+      volumes:
+      - name: model-storage
+        csi:
+          driver: gcsfuse.csi.storage.gke.io
+          readOnly: true
+          volumeAttributes:
+            bucketName: <MODEL_BUCKET>
+            mountOptions: "implicit-dirs,metadata-cache:ttl-secs:-1,metadata-cache:stat-cache-max-size-mb:512,metadata-cache:type-cache-max-size-mb:64,file-cache:max-size-mb:5120,file-cache:cache-file-for-range-read:true,file-system:kernel-list-cache-ttl-secs:-1,file-cache:enable-parallel-downloads:true,file-cache:parallel-downloads-per-file:32"
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 32Gi
