@@ -17,6 +17,8 @@ from sgl_jax.srt.disaggregation.base.kv_manager import KVPoll
 from sgl_jax.srt.disaggregation.jax_transfer.conn import (
     JaxTransferKVManager,
     JaxTransferKVSender,
+    _raiden_global_page_ids,
+    _raiden_pages_per_rank,
 )
 
 if TYPE_CHECKING:
@@ -411,7 +413,11 @@ class SchedulerDisaggregationPrefillMixin:
             first_page * page_size : last_page * page_size : page_size,
         ]
         page_ids = _np.asarray(page_id_source) // page_size
-        return [int(p) for p in page_ids]
+        return _raiden_global_page_ids(
+            page_ids,
+            dp_rank=int(getattr(req, "dp_rank", 0) or 0),
+            pages_per_rank=_raiden_pages_per_rank(self.token_to_kv_pool_allocator),
+        )
 
     def _extract_swa_block_ids_for_chunk(
         self: Scheduler,
@@ -456,7 +462,11 @@ class SchedulerDisaggregationPrefillMixin:
                 swa_page_ids.append(swa_token_idx // page_size)
 
         local_swa_page_ids = sorted(set(swa_page_ids))
-        return local_swa_page_ids
+        return _raiden_global_page_ids(
+            local_swa_page_ids,
+            dp_rank=int(getattr(req, "dp_rank", 0) or 0),
+            pages_per_rank=_raiden_pages_per_rank(allocator, swa=True),
+        )
 
     def _raiden_handoff_chunk(self: Scheduler, req: Req, req_id: str, *, is_final: bool) -> None:
         """raiden per-chunk handoff: publish THIS chunk's device page subset to D

@@ -19,6 +19,8 @@ from sgl_jax.srt.disaggregation.jax_transfer.conn import (
     JaxTransferKVManager,
     JaxTransferKVReceiver,
     PMetadata,
+    _raiden_global_page_ids,
+    _raiden_pages_per_rank,
 )
 from sgl_jax.srt.mem_cache.memory_pool import write_kv_layer
 
@@ -655,7 +657,13 @@ class SchedulerDisaggregationDecodeMixin:
             )
             allocator = self.token_to_kv_pool_allocator
             local_page_ids = [int(p) for p in (kv_indices_np[::page_size] // page_size)]
-            local_pages = tuple(local_page_ids)
+            local_pages = tuple(
+                _raiden_global_page_ids(
+                    local_page_ids,
+                    dp_rank=int(getattr(req, "dp_rank", 0) or 0),
+                    pages_per_rank=_raiden_pages_per_rank(allocator),
+                )
+            )
 
             # SWA hybrid-attention: build SWA-pool local pages (tail only) and
             # remote endpoint from the SWA engine's endpoint descriptors.
@@ -678,7 +686,11 @@ class SchedulerDisaggregationDecodeMixin:
                         break
                     swa_token_idx = int(swa_mapping[int(kv_indices_np[token_pos])])
                     if swa_token_idx >= page_size:
-                        page_map[full_page] = swa_token_idx // page_size
+                        page_map[full_page] = _raiden_global_page_ids(
+                            [swa_token_idx // page_size],
+                            dp_rank=int(getattr(req, "dp_rank", 0) or 0),
+                            pages_per_rank=_raiden_pages_per_rank(allocator, swa=True),
+                        )[0]
                 if page_map:
                     swa_local_page_by_full_page = page_map
                     swa_local_pages = tuple(page_map[p] for p in sorted(page_map))
