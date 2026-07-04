@@ -97,6 +97,8 @@ spec:
           value: "<DP_SIZE>"
         - name: ENABLE_SEQUENCE_PARALLEL
           value: "<ENABLE_SEQUENCE_PARALLEL>"
+        - name: ENABLE_REQUEST_TIME_STATS_LOGGING
+          value: "<ENABLE_REQUEST_TIME_STATS_LOGGING>"
         - name: LIBTPU_INIT_ARGS_VALUE
           value: "<LIBTPU_INIT_ARGS_VALUE>"
         - name: JAX_CACHE_DIR
@@ -248,6 +250,9 @@ spec:
           fi
           if [ "$ENABLE_SEQUENCE_PARALLEL" = "1" ]; then
             COMMON_ARGS+=(--enable-sequence-parallel)
+          fi
+          if [ "$ENABLE_REQUEST_TIME_STATS_LOGGING" = "1" ]; then
+            COMMON_ARGS+=(--enable-request-time-stats-logging)
           fi
 
           if [ "$INDEX" = "0" ]; then
