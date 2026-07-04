@@ -95,6 +95,7 @@ class PMetadata:
     # SWA hybrid-attention fields (non-None only for hybrid SWA models).
     swa_remote_endpoint: object | None = None
     swa_local_pages: tuple[int, ...] | None = None
+    swa_local_page_by_full_page: dict[int, int] | None = None
 
 
 @dataclass
@@ -1016,15 +1017,31 @@ class JaxTransferKVReceiver(KVReceiver, StateHolder):
             # the P advertised SWA block metadata for this chunk.
             swa_kwargs: dict = {}
             if md.swa_remote_endpoint is not None and md.swa_local_pages:
-                swa_local_pages = md.swa_local_pages
                 swa_remote_ids_raw = chunk_info.get("swa_remote_block_ids", ())
                 swa_remote_ids = [int(b) for b in swa_remote_ids_raw] if swa_remote_ids_raw else []
                 if swa_remote_ids:
-                    # SWA tail chunk uses a fixed-size window: local offset is
-                    # just position 0..len-1 within the SWA pool (the offset is
-                    # per-chunk, not whole-prompt, because SWA only transfers
-                    # the tail).
-                    swa_local_ids = [int(p) for p in swa_local_pages[: len(swa_remote_ids)]]
+                    if md.swa_local_page_by_full_page:
+                        swa_local_ids = [
+                            int(md.swa_local_page_by_full_page[p])
+                            for p in range(page_offset, page_offset + n)
+                            if p in md.swa_local_page_by_full_page
+                        ]
+                    else:
+                        swa_local_ids = [
+                            int(p) for p in md.swa_local_pages[: len(swa_remote_ids)]
+                        ]
+                    if len(swa_local_ids) != len(swa_remote_ids):
+                        logger.error(
+                            "raiden SWA chunk local/remote mismatch req_id=%s "
+                            "chunk=%d remote=%d local=%d off=%d",
+                            self._req_id,
+                            chunk_index,
+                            len(swa_remote_ids),
+                            len(swa_local_ids),
+                            page_offset,
+                        )
+                        self._fail_raiden(reason="raiden_swa_chunk_local_mismatch")
+                        return
                     swa_kwargs = {
                         "swa_remote_endpoint": md.swa_remote_endpoint,
                         "swa_remote_block_ids": swa_remote_ids,

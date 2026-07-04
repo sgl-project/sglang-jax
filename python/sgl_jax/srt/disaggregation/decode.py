@@ -639,6 +639,7 @@ class SchedulerDisaggregationDecodeMixin:
             # SWA hybrid-attention: build SWA-pool local pages (tail only) and
             # remote endpoint from the SWA engine's endpoint descriptors.
             swa_local_pages: tuple[int, ...] | None = None
+            swa_local_page_by_full_page: dict[int, int] | None = None
             swa_remote_endpoint: object | None = None
             allocator = self.token_to_kv_pool_allocator
             swa_mapping = getattr(allocator, "full_to_swa_index_mapping", None)
@@ -648,12 +649,19 @@ class SchedulerDisaggregationDecodeMixin:
                 if isinstance(swa_mapping, list):
                     swa_mapping = swa_mapping[0]
                 window_start = max(0, seqlen - sliding)
-                tail_kv = kv_indices_np[window_start:seqlen]
-                swa_pages = sorted(
-                    set(int(swa_mapping[int(idx)]) // page_size for idx in tail_kv)
-                )
-                swa_pages = [p for p in swa_pages if p >= 0]
-                swa_local_pages = tuple(swa_pages) if swa_pages else None
+                first_tail_page = window_start // page_size
+                last_tail_page = (seqlen + page_size - 1) // page_size
+                page_map: dict[int, int] = {}
+                for full_page in range(first_tail_page, last_tail_page):
+                    token_pos = full_page * page_size
+                    if token_pos >= len(kv_indices_np):
+                        break
+                    swa_token_idx = int(swa_mapping[int(kv_indices_np[token_pos])])
+                    if swa_token_idx >= 0:
+                        page_map[full_page] = swa_token_idx // page_size
+                if page_map:
+                    swa_local_page_by_full_page = page_map
+                    swa_local_pages = tuple(page_map[p] for p in sorted(page_map))
 
                 # SWA remote endpoint from P's SWA engine descriptors.
                 swa_eps_json = first_info.get("swa_raiden_endpoints_json", "") or ""
@@ -689,6 +697,7 @@ class SchedulerDisaggregationDecodeMixin:
                     local_pages=local_pages,
                     swa_remote_endpoint=swa_remote_endpoint,
                     swa_local_pages=swa_local_pages,
+                    swa_local_page_by_full_page=swa_local_page_by_full_page,
                 )
             )
         except Exception:

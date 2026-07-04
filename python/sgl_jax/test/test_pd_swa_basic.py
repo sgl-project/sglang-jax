@@ -31,6 +31,57 @@ class TestRaidenWrapperSWA:
         assert not w.is_started
         assert w.is_hybrid_swa is False
 
+    def test_hybrid_poll_waits_for_swa_engine(self):
+        """Hybrid SWA completion requires both full and SWA engines."""
+        from sgl_jax.srt.disaggregation.jax_transfer.wrapper import (
+            RaidenTransferWrapper,
+        )
+
+        class FakeEngine:
+            def __init__(self, polls):
+                self.polls = list(polls)
+
+            def poll_stats(self):
+                return self.polls.pop(0) if self.polls else ([], [], [])
+
+        w = RaidenTransferWrapper("127.0.0.1")
+        w._started = True
+        w._is_hybrid_swa = True
+        w._engine_full = FakeEngine([
+            (["req#c0"], ["req#c0"], []),
+            ([], [], []),
+        ])
+        w._engine_swa = FakeEngine([
+            ([], [], []),
+            (["req#c0"], ["req#c0"], []),
+        ])
+        w._swa_send_req_ids.add("req#c0")
+        w._swa_recv_req_ids.add("req#c0")
+
+        assert w.poll_stats() == ([], [], [])
+        assert w.poll_stats() == (["req#c0"], ["req#c0"], [])
+
+    def test_hybrid_poll_allows_full_only_chunk(self):
+        """Hybrid wrapper still completes chunks that have no SWA blocks."""
+        from sgl_jax.srt.disaggregation.jax_transfer.wrapper import (
+            RaidenTransferWrapper,
+        )
+
+        class FakeEngine:
+            def __init__(self, polls):
+                self.polls = list(polls)
+
+            def poll_stats(self):
+                return self.polls.pop(0) if self.polls else ([], [], [])
+
+        w = RaidenTransferWrapper("127.0.0.1")
+        w._started = True
+        w._is_hybrid_swa = True
+        w._engine_full = FakeEngine([(["req#c0"], ["req#c0"], [])])
+        w._engine_swa = FakeEngine([([], [], [])])
+
+        assert w.poll_stats() == (["req#c0"], ["req#c0"], [])
+
 
 class TestSWABlockExtraction:
     """Verify _extract_swa_block_ids_for_chunk logic."""
@@ -140,6 +191,81 @@ class TestBackwardCompatible:
         )
         assert m.swa_remote_endpoint is None
         assert m.swa_local_pages is None
+        assert m.swa_local_page_by_full_page is None
+
+    def test_receiver_uses_swa_full_page_mapping(self):
+        """SWA local ids follow the chunk's full-page offset."""
+        from sgl_jax.srt.disaggregation.jax_transfer.conn import (
+            JaxTransferKVReceiver,
+            PMetadata,
+        )
+
+        class FakeBootstrap:
+            def get_transfer_info(self, room):
+                assert room == 7
+                return {
+                    "num_chunks": 2,
+                    "chunks": {
+                        1: {
+                            "remote_block_ids": [31],
+                            "chunk_page_offset": 3,
+                            "swa_remote_block_ids": [41],
+                        }
+                    },
+                }
+
+        class FakeRaidenWrapper:
+            def __init__(self):
+                self.calls = []
+
+            def start_read(self, *args, **kwargs):
+                self.calls.append((args, kwargs))
+
+        class FakeManager:
+            use_raiden = True
+
+            def __init__(self):
+                self.bootstrap_client = FakeBootstrap()
+                self.raiden_wrapper = FakeRaidenWrapper()
+
+            def poll_raiden(self):
+                pass
+
+            def raiden_receiver_state(self, req_id):
+                return None
+
+            def record_terminal(self, *args, **kwargs):
+                pass
+
+            def _prune_receiver(self, req_id):
+                pass
+
+            def raiden_forget(self, req_id):
+                pass
+
+        mgr = FakeManager()
+        receiver = JaxTransferKVReceiver(mgr, "req")
+        receiver.init(
+            PMetadata(
+                remote_addr="p:1",
+                uuid="req",
+                specs={},
+                p_side_channel_host="p",
+                p_side_channel_port=2,
+                remote_endpoint="full-ep",
+                bootstrap_room=7,
+                local_pages=(10, 11, 12, 13),
+                swa_remote_endpoint="swa-ep",
+                swa_local_pages=(101, 102, 103),
+                swa_local_page_by_full_page={3: 103},
+            )
+        )
+
+        receiver.poll()
+
+        assert mgr.raiden_wrapper.calls
+        _, kwargs = mgr.raiden_wrapper.calls[0]
+        assert kwargs["swa_local_block_ids"] == [103]
 
     def test_resolve_kv_pool_dtype_accepts_swa_pool(self):
         """SWA wrapper pools advertise dtype via their full sub-pool."""

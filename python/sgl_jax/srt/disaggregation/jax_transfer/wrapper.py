@@ -341,6 +341,15 @@ class RaidenTransferWrapper:
         self._is_hybrid_swa = False
         self._endpoints: list[Any] | None = None
         self._endpoints_swa: list[Any] | None = None
+        self._stats_lock = threading.Lock()
+        self._swa_send_req_ids: set[str] = set()
+        self._swa_recv_req_ids: set[str] = set()
+        self._done_sending_full: set[str] = set()
+        self._done_recving_full: set[str] = set()
+        self._done_sending_swa: set[str] = set()
+        self._done_recving_swa: set[str] = set()
+        self._failed_recving_full: set[str] = set()
+        self._failed_recving_swa: set[str] = set()
 
     @property
     def host_ip(self) -> str:
@@ -474,6 +483,8 @@ class RaidenTransferWrapper:
         result = bool(self._engine_full.register_read(req_id, uuid, list(block_ids)))
         if self._is_hybrid_swa and swa_block_ids:
             self._engine_swa.register_read(req_id, uuid, list(swa_block_ids))
+            with self._stats_lock:
+                self._swa_send_req_ids.add(req_id)
         return result
 
     def start_read(
@@ -514,6 +525,9 @@ class RaidenTransferWrapper:
                 list(swa_local_block_ids or []),
                 parallelism,
             )
+            if swa_remote_block_ids and swa_local_block_ids:
+                with self._stats_lock:
+                    self._swa_recv_req_ids.add(req_id)
 
     def poll_stats(self) -> tuple[list[str], list[str], list[str]]:
         """Non-blocking poll: ``(done_sending, done_recving, failed_recving)``
@@ -523,12 +537,33 @@ class RaidenTransferWrapper:
         if not self._started:
             raise RuntimeError("RaidenTransferWrapper.start() must be called before poll_stats()")
         done_s, done_r, failed_r = self._engine_full.poll_stats()
-        if self._is_hybrid_swa:
-            ds, dr, fr = self._engine_swa.poll_stats()
-            done_s = list(set(done_s) | set(ds))
-            done_r = list(set(done_r) | set(dr))
-            failed_r = list(set(failed_r) | set(fr))
-        return done_s, done_r, failed_r
+        if not self._is_hybrid_swa:
+            return done_s, done_r, failed_r
+
+        ds, dr, fr = self._engine_swa.poll_stats()
+        with self._stats_lock:
+            # raiden reports a req_id once when it transitions to done. Keep a
+            # cumulative view here so a full-engine completion observed before
+            # the SWA-engine completion is not lost while waiting for SWA.
+            self._done_sending_full.update(done_s)
+            self._done_recving_full.update(done_r)
+            self._failed_recving_full.update(failed_r)
+            self._done_sending_swa.update(ds)
+            self._done_recving_swa.update(dr)
+            self._failed_recving_swa.update(fr)
+
+            done_s_both = sorted(
+                rid
+                for rid in self._done_sending_full
+                if rid not in self._swa_send_req_ids or rid in self._done_sending_swa
+            )
+            done_r_both = sorted(
+                rid
+                for rid in self._done_recving_full
+                if rid not in self._swa_recv_req_ids or rid in self._done_recving_swa
+            )
+            failed_r_any = sorted(self._failed_recving_full | self._failed_recving_swa)
+        return done_s_both, done_r_both, failed_r_any
 
 
 def get_or_create_raiden_wrapper(
