@@ -19,8 +19,6 @@ from sgl_jax.srt.disaggregation.jax_transfer.conn import (
     JaxTransferKVManager,
     JaxTransferKVReceiver,
     PMetadata,
-    _raiden_global_page_ids,
-    _raiden_pages_per_rank,
 )
 from sgl_jax.srt.mem_cache.memory_pool import write_kv_layer
 
@@ -38,6 +36,55 @@ def _batch_req_count(batch) -> int:
     if reqs_info is None:
         return len(getattr(batch, "reqs", ()) or ())
     return sum(len(info.reqs) if info.reqs else 0 for info in reqs_info)
+
+
+def _raiden_endpoint_for_dp(
+    *,
+    p_host: str,
+    p_endpoints: list[dict] | None,
+    local_eps: list[dict] | None,
+    fallback_base_port: int,
+    dp_rank: int,
+    dp_size: int,
+) -> object:
+    """Build a raiden remote endpoint, narrowing endpoint shards for DP."""
+
+    def _host_port(endpoint: object, default_port: int) -> str:
+        try:
+            port = int(str(endpoint).rsplit(":", 1)[1])
+        except Exception:  # noqa: BLE001
+            port = int(default_port)
+        return f"{p_host}:{port}"
+
+    def _filter_dp_shards(ep: dict) -> dict | None:
+        shards = list(ep.get("shards") or [])
+        if dp_size <= 1 or not shards:
+            return {"endpoint": _host_port(ep.get("endpoint"), fallback_base_port), "shards": shards}
+        if len(shards) % dp_size != 0:
+            return {"endpoint": _host_port(ep.get("endpoint"), fallback_base_port), "shards": shards}
+        per_dp = len(shards) // dp_size
+        start = int(dp_rank or 0) * per_dp
+        selected = shards[start : start + per_dp]
+        if not selected:
+            return None
+        return {"endpoint": _host_port(ep.get("endpoint"), fallback_base_port), "shards": selected}
+
+    if p_endpoints and dp_size > 1:
+        filtered = [_filter_dp_shards(dict(ep)) for ep in p_endpoints]
+        filtered = [ep for ep in filtered if ep is not None]
+        if filtered:
+            return filtered
+
+    local_eps = local_eps or []
+    if len(local_eps) <= 1:
+        return f"{p_host}:{int(fallback_base_port)}"
+    return [
+        {
+            "endpoint": f"{p_host}:{int(fallback_base_port) + i}",
+            "shards": list(ep.get("shards") or []),
+        }
+        for i, ep in enumerate(local_eps)
+    ]
 
 
 @dataclass
@@ -635,17 +682,14 @@ class SchedulerDisaggregationDecodeMixin:
             # returns failed_recving immediately. Only >1 sub-managers use the
             # shard-matched list form (base_port + i per local endpoint).
             local_eps = self.disagg_kv_manager.raiden_wrapper.endpoints or []
-            remote_endpoint: object
-            if len(local_eps) <= 1:
-                remote_endpoint = f"{p_host}:{base_port}"
-            else:
-                remote_endpoint = [
-                    {
-                        "endpoint": f"{p_host}:{base_port + i}",
-                        "shards": list(ep["shards"]),
-                    }
-                    for i, ep in enumerate(local_eps)
-                ]
+            remote_endpoint = _raiden_endpoint_for_dp(
+                p_host=str(p_host),
+                p_endpoints=p_endpoints,
+                local_eps=local_eps,
+                fallback_base_port=base_port,
+                dp_rank=int(getattr(req, "dp_rank", 0) or 0),
+                dp_size=int(getattr(self, "dp_size", 1) or 1),
+            )
 
             # Whole-prompt local device page ids (sequence order). The receiver
             # slices these per chunk via each chunk's chunk_page_offset, so the
@@ -657,13 +701,7 @@ class SchedulerDisaggregationDecodeMixin:
             )
             allocator = self.token_to_kv_pool_allocator
             local_page_ids = [int(p) for p in (kv_indices_np[::page_size] // page_size)]
-            local_pages = tuple(
-                _raiden_global_page_ids(
-                    local_page_ids,
-                    dp_rank=int(getattr(req, "dp_rank", 0) or 0),
-                    pages_per_rank=_raiden_pages_per_rank(allocator),
-                )
-            )
+            local_pages = tuple(local_page_ids)
 
             # SWA hybrid-attention: build SWA-pool local pages (tail only) and
             # remote endpoint from the SWA engine's endpoint descriptors.
@@ -686,11 +724,7 @@ class SchedulerDisaggregationDecodeMixin:
                         break
                     swa_token_idx = int(swa_mapping[int(kv_indices_np[token_pos])])
                     if swa_token_idx >= page_size:
-                        page_map[full_page] = _raiden_global_page_ids(
-                            [swa_token_idx // page_size],
-                            dp_rank=int(getattr(req, "dp_rank", 0) or 0),
-                            pages_per_rank=_raiden_pages_per_rank(allocator, swa=True),
-                        )[0]
+                        page_map[full_page] = swa_token_idx // page_size
                 if page_map:
                     swa_local_page_by_full_page = page_map
                     swa_local_pages = tuple(page_map[p] for p in sorted(page_map))
@@ -705,16 +739,14 @@ class SchedulerDisaggregationDecodeMixin:
                     swa_local_eps = (
                         self.disagg_kv_manager.raiden_wrapper.endpoints_swa or []
                     )
-                    if len(swa_local_eps) <= 1:
-                        swa_remote_endpoint = f"{p_host}:{swa_base_port}"
-                    else:
-                        swa_remote_endpoint = [
-                            {
-                                "endpoint": f"{p_host}:{swa_base_port + i}",
-                                "shards": list(ep["shards"]),
-                            }
-                            for i, ep in enumerate(swa_local_eps)
-                        ]
+                    swa_remote_endpoint = _raiden_endpoint_for_dp(
+                        p_host=str(p_host),
+                        p_endpoints=swa_p_endpoints,
+                        local_eps=swa_local_eps,
+                        fallback_base_port=swa_base_port,
+                        dp_rank=int(getattr(req, "dp_rank", 0) or 0),
+                        dp_size=int(getattr(self, "dp_size", 1) or 1),
+                    )
 
             receiver = self.disagg_kv_manager.create_receiver(req.rid)
             receiver.init(
