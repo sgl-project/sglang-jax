@@ -32,6 +32,16 @@ spec:
       nodeSelector:
         cloud.google.com/gke-tpu-accelerator: <TPU_ACCELERATOR>
         cloud.google.com/gke-tpu-topology: "<TPU_TOPOLOGY>"
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: cloud.google.com/gke-nodepool
+                operator: In
+                values:
+                - bench-4-reserve
+                - codex-kkx-scan
       tolerations:
       - key: google.com/tpu
         operator: Exists
