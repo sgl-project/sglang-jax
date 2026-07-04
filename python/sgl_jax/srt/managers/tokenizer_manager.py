@@ -1033,6 +1033,12 @@ class TokenizerManager:
                 "finish_reason": recv_obj.finished_reasons[i],
                 "prompt_tokens": recv_obj.prompt_tokens[i],
             }
+            dp_rank = getattr(state.obj, "dp_rank", None)
+            if dp_rank is not None:
+                meta_info["dp_rank"] = dp_rank
+            disagg_prefill_dp_rank = getattr(state.obj, "disagg_prefill_dp_rank", None)
+            if disagg_prefill_dp_rank is not None:
+                meta_info["disagg_prefill_dp_rank"] = disagg_prefill_dp_rank
 
             if getattr(state.obj, "return_logprob", False) or getattr(
                 state.obj, "return_output_logprob_only", False

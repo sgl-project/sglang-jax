@@ -11,6 +11,13 @@ logger = logging.getLogger(__name__)
 AIOHTTP_STREAM_READ_CHUNK_SIZE = 1024 * 64
 
 
+def _get_dp_size(server_info: dict) -> int:
+    dp_size = server_info.get("dp_size")
+    if dp_size is not None:
+        return int(dp_size)
+    return max(1, len(server_info.get("internal_states") or []))
+
+
 class MiniLoadBalancer:
     def __init__(self, router_args):
         self._validate_router_args(router_args)
@@ -63,8 +70,8 @@ class MiniLoadBalancer:
                 self.decode_urls[0],
                 ("get_server_info", "server_info"),
             )
-        self.prefill_dp_size = len(prefill_info.get("internal_states", [1]))
-        self.decode_dp_size = len(decode_info.get("internal_states", [1]))
+        self.prefill_dp_size = _get_dp_size(prefill_info)
+        self.decode_dp_size = _get_dp_size(decode_info)
         logger.info(
             "[MiniLB] DP sizes: prefill=%s, decode=%s",
             self.prefill_dp_size,
