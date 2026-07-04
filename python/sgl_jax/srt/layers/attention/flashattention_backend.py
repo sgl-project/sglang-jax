@@ -534,9 +534,10 @@ class FlashAttention(AttentionBackend):
         elif hasattr(token_to_kv_pool, "remap_cache_loc") and self.page_size == 1:
             page_indices_arg = token_to_kv_pool.remap_cache_loc(page_indices_arg, layer.layer_id)
 
-        q_arg = q.reshape(q.shape[0], -1, self.head_dim)
-        k_arg = k.reshape(k.shape[0], -1, self.head_dim)
-        v_arg = v.reshape(v.shape[0], -1, self.head_dim)
+        head_dim = getattr(layer, "head_dim", self.head_dim)
+        q_arg = q.reshape(q.shape[0], -1, head_dim)
+        k_arg = k.reshape(k.shape[0], -1, head_dim)
+        v_arg = v.reshape(v.shape[0], -1, head_dim)
 
         # JAX 0.9.1+ enforces shard_map in_specs match actual input sharding.
         # Derive effective axes from the actual array sharding rather than
