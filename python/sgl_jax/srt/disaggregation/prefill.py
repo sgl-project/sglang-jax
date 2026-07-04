@@ -519,6 +519,8 @@ class SchedulerDisaggregationPrefillMixin:
                 self._on_prefill_transfer_terminal(req_obj, sender_obj, already_released=False)
 
             self.disagg_prefill_queue.add(req_id, sender, on_terminal=_on_terminal)
+
+    def _extract_req_kv(self: Scheduler, req: Req):
         """Gather prefilled KV from the paged pool for ``req``.
 
         Returns a per-layer list of ``(padded_pages, page_size, ...)`` arrays.

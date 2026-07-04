@@ -125,6 +125,7 @@ class TestBackwardCompatible:
         )
 
         assert hasattr(SchedulerDisaggregationPrefillMixin, "_extract_swa_block_ids_for_chunk")
+        assert hasattr(SchedulerDisaggregationPrefillMixin, "_extract_req_kv")
 
     def test_conn_pmetadata_defaults(self):
         """PMetadata swa fields default to None."""

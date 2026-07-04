@@ -81,7 +81,8 @@ def install_disaggregation_wiring(scheduler: Scheduler, server_args: ServerArgs)
         transfer_port,
         channel_number=server_args.disaggregation_channel_number,
     )
-    wrapper.start()
+    if not server_args.disaggregation_use_raiden:
+        wrapper.start()
     notifier = ZmqPullNotifier(
         role,
         local_host,
