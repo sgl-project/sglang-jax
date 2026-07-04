@@ -347,7 +347,7 @@ spec:
                   --num-prompts "$N" \
                   --max-concurrency "$C" \
                   --warmup-requests "$BENCH_WARMUP_REQUESTS" \
-                  --extra-request-body '{"sampling_params":{"temperature":0.1,"top_p":0.95,"max_new_tokens":4096,"ignore_eos":true}}' \
+                  --extra-request-body "{\"sampling_params\":{\"temperature\":0.1,\"top_p\":0.95,\"max_new_tokens\":${BENCH_OUTPUT_LEN},\"ignore_eos\":true}}" \
                   --output-file "$OUT/bench_${BENCH_INPUT_LEN}_${BENCH_OUTPUT_LEN}_c${C}.jsonl" \
                   2>&1 | tee "$OUT/bench_${BENCH_INPUT_LEN}_${BENCH_OUTPUT_LEN}_c${C}.log"
                 BENCH_RC=${PIPESTATUS[0]}

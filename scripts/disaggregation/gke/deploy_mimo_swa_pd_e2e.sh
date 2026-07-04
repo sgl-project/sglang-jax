@@ -13,7 +13,7 @@
 #
 # Common overrides:
 #   BRANCH=epic/mimo-pd-disggragation \
-#   GSM_Q=128 GSM_PAR=64 \
+#   GSM_Q=128 GSM_PAR=128 \
 #   BENCH_CONCURRENCIES="32 64 128" \
 #   scripts/disaggregation/gke/deploy_mimo_swa_pd_e2e.sh
 set -euo pipefail
@@ -59,7 +59,7 @@ JAX_CACHE_DIR="${JAX_CACHE_DIR:-/tmp/tpu_logs/jit_cache}"
 
 RUN_GSM8K="${RUN_GSM8K:-1}"
 GSM_Q="${GSM_Q:-128}"
-GSM_PAR="${GSM_PAR:-64}"
+GSM_PAR="${GSM_PAR:-128}"
 GSM_MAXTOK="${GSM_MAXTOK:-8192}"
 GSM_MIN_ACC="${GSM_MIN_ACC:-0.80}"
 GSM_ENABLE_THINKING="${GSM_ENABLE_THINKING:-1}"
