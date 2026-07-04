@@ -176,6 +176,8 @@ def lb_instance(router_args):
     import sgl_jax.srt.disaggregation.mini_lb as mini_lb_module
 
     instance = MiniLoadBalancer(router_args)
+    instance.prefill_dp_size = 1
+    instance.decode_dp_size = 1
     mini_lb_module.lb = instance
     yield instance
     mini_lb_module.lb = None
@@ -282,6 +284,128 @@ class TestGenerateEndpoint:
         data = response.json()
         assert data == {"text": "hello world"}
 
+    @patch("aiohttp.ClientSession")
+    def test_normal_dp_aligns_prefill_and_decode_rank(
+        self, mock_session_cls, client, lb_instance
+    ):
+        lb_instance.prefill_dp_size = 2
+        lb_instance.decode_dp_size = 2
+        captured_requests = []
+
+        async def capture_post(url, json=None):
+            captured_requests.append({"url": url, "json": json})
+            mock_resp = AsyncMock()
+            mock_resp.status = 200
+            mock_resp.json = AsyncMock(return_value={"text": "ok", "meta_info": {}})
+            return mock_resp
+
+        mock_session = AsyncMock()
+        mock_session.post = capture_post
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+        mock_session_cls.return_value = mock_session
+
+        with patch(
+            "sgl_jax.srt.disaggregation.mini_lb_helpers.generate_bootstrap_room",
+            return_value=5,
+        ):
+            response = client.post("/generate", json={"text": "hello"})
+
+        assert response.status_code == 200
+        assert len(captured_requests) == 2
+        prefill_req = captured_requests[0]["json"]
+        decode_req = captured_requests[1]["json"]
+        assert prefill_req["bootstrap_room"] == 5
+        assert prefill_req["dp_rank"] == 1
+        assert decode_req["dp_rank"] == 1
+        assert decode_req["disagg_prefill_dp_rank"] == 1
+
+    @patch("aiohttp.ClientSession")
+    def test_normal_dp_can_force_rank(
+        self, mock_session_cls, client, lb_instance, monkeypatch
+    ):
+        lb_instance.prefill_dp_size = 2
+        lb_instance.decode_dp_size = 2
+        monkeypatch.setenv("SGLANG_JAX_PD_FORCE_DP_RANK", "0")
+        captured_requests = []
+
+        async def capture_post(url, json=None):
+            captured_requests.append({"url": url, "json": json})
+            mock_resp = AsyncMock()
+            mock_resp.status = 200
+            mock_resp.json = AsyncMock(return_value={"text": "ok", "meta_info": {}})
+            return mock_resp
+
+        mock_session = AsyncMock()
+        mock_session.post = capture_post
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+        mock_session_cls.return_value = mock_session
+
+        with patch(
+            "sgl_jax.srt.disaggregation.mini_lb_helpers.generate_bootstrap_room",
+            return_value=5,
+        ):
+            response = client.post("/generate", json={"text": "hello"})
+
+        assert response.status_code == 200
+        prefill_req = captured_requests[0]["json"]
+        decode_req = captured_requests[1]["json"]
+        assert prefill_req["bootstrap_room"] == 5
+        assert prefill_req["dp_rank"] == 0
+        assert decode_req["dp_rank"] == 0
+        assert decode_req["disagg_prefill_dp_rank"] == 0
+
+    @patch("aiohttp.ClientSession")
+    def test_external_dp_missing_meta_rank_is_filled(self, mock_session_cls, client, lb_instance):
+        lb_instance.test_external_dp_routing = True
+        lb_instance.prefill_dp_size = 2
+        lb_instance.decode_dp_size = 2
+
+        prefill_response = AsyncMock()
+        prefill_response.status = 200
+        prefill_response.json = AsyncMock(return_value={"text": ""})
+        decode_response = AsyncMock()
+        decode_response.status = 200
+        decode_response.json = AsyncMock(return_value={"text": "hello", "meta_info": {}})
+
+        mock_session = AsyncMock()
+        mock_session.post = AsyncMock(side_effect=[prefill_response, decode_response])
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+        mock_session_cls.return_value = mock_session
+
+        with patch("random.randint", side_effect=[0, 0, 0, 0, 1]):
+            response = client.post("/generate", json={"text": "hello"})
+
+        assert response.status_code == 200
+        assert response.json()["meta_info"]["dp_rank"] == 1
+
+    @patch("aiohttp.ClientSession")
+    def test_external_dp_preserves_decode_error(self, mock_session_cls, client, lb_instance):
+        lb_instance.test_external_dp_routing = True
+        lb_instance.prefill_dp_size = 2
+        lb_instance.decode_dp_size = 2
+
+        prefill_response = AsyncMock()
+        prefill_response.status = 200
+        prefill_response.json = AsyncMock(return_value={"text": ""})
+        decode_response = AsyncMock()
+        decode_response.status = 500
+        decode_response.json = AsyncMock(return_value={"error": "backend failed"})
+
+        mock_session = AsyncMock()
+        mock_session.post = AsyncMock(side_effect=[prefill_response, decode_response])
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+        mock_session_cls.return_value = mock_session
+
+        with patch("random.randint", side_effect=[0, 0, 0, 0, 1]):
+            response = client.post("/generate", json={"text": "hello"})
+
+        assert response.status_code == 500
+        assert response.json() == {"error": "backend failed"}
+
 
 class TestV1CompletionsEndpoint:
     @patch("aiohttp.ClientSession")
@@ -358,6 +482,8 @@ class TestBootstrapInjection:
             prefill_bootstrap_host="10.31.0.1",
         )
         instance = MiniLoadBalancer(args)
+        instance.prefill_dp_size = 1
+        instance.decode_dp_size = 1
         mini_lb_module.lb = instance
 
         captured_requests = []

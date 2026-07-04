@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import random
 from http import HTTPStatus
 from itertools import chain
@@ -90,6 +91,31 @@ class MiniLoadBalancer:
 
         return prefill_req, decode_req, d_rank
 
+    @staticmethod
+    def _room_rank(bootstrap_room, dp_size: int):
+        if isinstance(bootstrap_room, list):
+            return [int(room) % dp_size for room in bootstrap_room]
+        return int(bootstrap_room) % dp_size
+
+    async def _align_dp_requests(self, request: dict):
+        await self._ensure_dp_sizes()
+        dp_size = min(int(self.prefill_dp_size or 1), int(self.decode_dp_size or 1))
+        if dp_size <= 1:
+            return request, request
+
+        forced_rank = os.getenv("SGLANG_JAX_PD_FORCE_DP_RANK")
+        dp_rank = (
+            int(forced_rank) % dp_size
+            if forced_rank is not None
+            else self._room_rank(request["bootstrap_room"], dp_size)
+        )
+        prefill_req = request.copy()
+        decode_req = request.copy()
+        prefill_req["dp_rank"] = dp_rank
+        decode_req["dp_rank"] = dp_rank
+        decode_req["disagg_prefill_dp_rank"] = dp_rank
+        return prefill_req, decode_req
+
     def select_pair(self) -> tuple[str, int | None, str]:
         pidx = random.randint(0, len(self.prefill_urls) - 1)
         didx = random.randint(0, len(self.decode_urls) - 1)
@@ -120,8 +146,7 @@ class MiniLoadBalancer:
                 expected_decode_dp_rank,
             ) = self._fork_dp_requests(modified_request)
         else:
-            prefill_req = modified_request
-            decode_req = modified_request
+            prefill_req, decode_req = await self._align_dp_requests(modified_request)
 
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=self.timeout)
@@ -143,9 +168,30 @@ class MiniLoadBalancer:
             else:
                 ret_json = await decode_response.json()
 
-            if expected_decode_dp_rank is not None:
-                actual = ret_json.get("meta_info", {}).get("dp_rank")
-                if actual != expected_decode_dp_rank:
+            if expected_decode_dp_rank is not None and decode_response.status < 400:
+                if not isinstance(ret_json, dict):
+                    return ORJSONResponse(
+                        content={
+                            "error": (
+                                "Decode response must be a JSON object when "
+                                "--test-external-dp-routing is enabled"
+                            )
+                        },
+                        status_code=500,
+                    )
+                meta_info = ret_json.setdefault("meta_info", {})
+                if not isinstance(meta_info, dict):
+                    meta_info = {}
+                    ret_json["meta_info"] = meta_info
+                actual = meta_info.get("dp_rank")
+                if actual is None:
+                    logger.warning(
+                        "[MiniLB] decode response missing meta_info.dp_rank; "
+                        "assuming externally routed dp_rank=%s",
+                        expected_decode_dp_rank,
+                    )
+                    meta_info["dp_rank"] = expected_decode_dp_rank
+                elif actual != expected_decode_dp_rank:
                     return ORJSONResponse(
                         content={
                             "error": (

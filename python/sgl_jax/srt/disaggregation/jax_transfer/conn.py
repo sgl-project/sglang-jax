@@ -58,6 +58,46 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 
+def _raiden_pages_per_rank(allocator, *, swa: bool = False) -> int:
+    """Return the page-id namespace span for one DP rank.
+
+    Allocators hand out rank-local page ids starting at 1. The KV buffer's page
+    axis has one reserved page per DP rank, so raiden's global row id needs a
+    ``rank * (pages_per_rank + 1)`` offset.
+    """
+
+    sub_allocator = allocator
+    if hasattr(allocator, "full_attn_allocator"):
+        sub_allocator = allocator.swa_attn_allocator if swa else allocator.full_attn_allocator
+    pages_per_rank = getattr(sub_allocator, "pages_per_rank", None)
+    if pages_per_rank is not None:
+        return int(pages_per_rank)
+    size_per_rank = getattr(sub_allocator, "size_per_rank", None)
+    if size_per_rank is None:
+        return 0
+    page_size = max(1, int(getattr(sub_allocator, "page_size", 1)))
+    return int(size_per_rank) // page_size
+
+
+def _raiden_global_page_id(page_id: int, *, dp_rank: int, pages_per_rank: int) -> int:
+    page_id = int(page_id)
+    if page_id <= 0:
+        return page_id
+    pages_per_rank = int(pages_per_rank)
+    if pages_per_rank <= 0:
+        return page_id
+    return int(dp_rank or 0) * (pages_per_rank + 1) + page_id
+
+
+def _raiden_global_page_ids(
+    page_ids, *, dp_rank: int, pages_per_rank: int
+) -> list[int]:
+    return [
+        _raiden_global_page_id(p, dp_rank=dp_rank, pages_per_rank=pages_per_rank)
+        for p in page_ids
+    ]
+
+
 @dataclass(frozen=True)
 class PMetadata:
     """Out-of-band metadata D needs to pull from P.
@@ -1020,7 +1060,11 @@ class JaxTransferKVReceiver(KVReceiver, StateHolder):
                 swa_remote_ids_raw = chunk_info.get("swa_remote_block_ids")
                 if swa_remote_ids_raw is None:
                     swa_remote_ids_raw = chunk_info.get("swa_block_ids", ())
-                swa_remote_ids = [int(b) for b in swa_remote_ids_raw] if swa_remote_ids_raw else []
+                swa_remote_ids = (
+                    [int(b) for b in swa_remote_ids_raw if int(b) > 0]
+                    if swa_remote_ids_raw
+                    else []
+                )
                 if swa_remote_ids:
                     if md.swa_local_page_by_full_page:
                         swa_local_ids = [
@@ -1032,6 +1076,9 @@ class JaxTransferKVReceiver(KVReceiver, StateHolder):
                         swa_local_ids = [
                             int(p) for p in md.swa_local_pages[: len(swa_remote_ids)]
                         ]
+                    swa_local_ids = [p for p in swa_local_ids if p > 0]
+                    if len(swa_local_ids) > len(swa_remote_ids):
+                        swa_local_ids = swa_local_ids[-len(swa_remote_ids) :]
                     if len(swa_local_ids) != len(swa_remote_ids):
                         logger.error(
                             "raiden SWA chunk local/remote mismatch req_id=%s "

@@ -330,6 +330,23 @@ class TestSWAAllocatorPaged(CustomTestCase):
         self.assertEqual(self.alloc.full_available_size(), self.size)
         self.assertEqual(self.alloc.swa_available_size(), self.size_swa)
 
+    def test_free_swa_ignores_reserved_page_zero_indices_paged(self):
+        """free_swa() should not release the reserved page-0 id range."""
+        indices = self.alloc.alloc(8)
+        self.assertIsNotNone(indices)
+
+        self.alloc.free_swa(indices)
+        swa_after_valid_free = self.alloc.swa_available_size()
+
+        # Simulate a stale/invalid mapping produced after the SWA side of a
+        # paged sequence has already been evicted. Token ids below page_size
+        # belong to reserved page 0 and must not be returned to the allocator.
+        self.alloc.full_to_swa_index_mapping[int(indices[0])] = self.page_size - 1
+        self.alloc.free_swa(np.array([indices[0]], dtype=np.int32))
+
+        self.assertEqual(self.alloc.swa_available_size(), swa_after_valid_free)
+        self.assertEqual(self.alloc.swa_available_size(), self.size_swa)
+
     # 15 — Regression test for the OOB bug (GH-231)
     def test_mapping_covers_last_page_indices(self):
         """full_to_swa_index_mapping must be large enough for max paged token index.

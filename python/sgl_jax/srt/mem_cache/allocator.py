@@ -370,6 +370,11 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         if self.is_not_in_free_group:
             free_pages = np.unique(free_index // self.page_size)
+            free_pages = free_pages[
+                (free_pages > 0) & (free_pages <= self.pages_per_rank)
+            ]
+            if free_pages.size == 0:
+                return
             rel_pages = self.release_pages[dp_rank]
             f_pages = self.free_pages[dp_rank]
             free_pages = np.setdiff1d(free_pages, rel_pages)

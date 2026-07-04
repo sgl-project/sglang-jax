@@ -115,10 +115,11 @@ class TestSWABlockExtraction:
         return MockScheduler(), page_size, seqlen
 
     @staticmethod
-    def _make_req(origin_input_ids):
+    def _make_req(origin_input_ids, dp_rank=0):
         return type("Req", (), {
             "origin_input_ids": origin_input_ids,
             "req_pool_idx": 0,
+            "dp_rank": dp_rank,
         })()
 
     def test_returns_empty_when_no_mapping(self, mock_scheduler):
@@ -164,6 +165,93 @@ class TestSWABlockExtraction:
             start=24, end=36, page_size=page_size, sliding_window_size=12,
         )
         assert result == [7, 8]
+
+    def test_skips_reserved_page_zero(self, mock_scheduler):
+        """Reserved SWA page 0 must not be advertised to decode."""
+        scheduler, page_size, seqlen = mock_scheduler
+        mapping = scheduler.token_to_kv_pool_allocator.full_to_swa_index_mapping
+        mapping[28] = 0
+
+        result = scheduler._extract_swa_block_ids_for_chunk(
+            self._make_req(list(range(seqlen))),
+            start=24, end=36, page_size=page_size, sliding_window_size=12,
+        )
+
+        assert result == [8]
+
+    def test_uses_request_dp_rank_mapping(self, mock_scheduler):
+        """DP requests must read the matching rank's SWA mapping."""
+        scheduler, page_size, seqlen = mock_scheduler
+        rank0 = np.zeros_like(
+            scheduler.token_to_kv_pool_allocator.full_to_swa_index_mapping
+        )
+        rank1 = np.arange(0, 200, dtype=np.int32)
+        scheduler.token_to_kv_pool_allocator.full_to_swa_index_mapping = [
+            rank0,
+            rank1,
+        ]
+
+        result = scheduler._extract_swa_block_ids_for_chunk(
+            self._make_req(list(range(seqlen)), dp_rank=1),
+            start=0,
+            end=seqlen,
+            page_size=page_size,
+            sliding_window_size=8,
+        )
+
+        assert result == [8, 9]
+
+    def test_dp_rank_swa_blocks_are_globalized_for_raiden(self, mock_scheduler):
+        """Rank-local SWA page ids must be offset before raiden sees them."""
+        scheduler, page_size, seqlen = mock_scheduler
+        rank0 = np.zeros_like(
+            scheduler.token_to_kv_pool_allocator.full_to_swa_index_mapping
+        )
+        rank1 = np.arange(0, 200, dtype=np.int32)
+        scheduler.token_to_kv_pool_allocator.full_to_swa_index_mapping = [
+            rank0,
+            rank1,
+        ]
+        scheduler.token_to_kv_pool_allocator.pages_per_rank = 10
+
+        result = scheduler._extract_swa_block_ids_for_chunk(
+            self._make_req(list(range(seqlen)), dp_rank=1),
+            start=0,
+            end=seqlen,
+            page_size=page_size,
+            sliding_window_size=8,
+        )
+
+        assert result == [19, 20]
+
+
+class TestRaidenDPPageNamespace:
+    def test_global_page_ids_include_reserved_page_per_rank(self):
+        from sgl_jax.srt.disaggregation.jax_transfer.conn import (
+            _raiden_global_page_ids,
+        )
+
+        assert _raiden_global_page_ids(
+            [0, 1, 2, 10], dp_rank=1, pages_per_rank=10
+        ) == [0, 12, 13, 21]
+
+    def test_pages_per_rank_uses_swa_sub_allocator(self):
+        from sgl_jax.srt.disaggregation.jax_transfer.conn import (
+            _raiden_pages_per_rank,
+        )
+
+        class FullAllocator:
+            pages_per_rank = 100
+
+        class SWAAllocator:
+            pages_per_rank = 25
+
+        class HybridAllocator:
+            full_attn_allocator = FullAllocator()
+            swa_attn_allocator = SWAAllocator()
+
+        assert _raiden_pages_per_rank(HybridAllocator()) == 100
+        assert _raiden_pages_per_rank(HybridAllocator(), swa=True) == 25
 
 
 class TestBackwardCompatible:
@@ -267,6 +355,81 @@ class TestBackwardCompatible:
         _, kwargs = mgr.raiden_wrapper.calls[0]
         assert kwargs["swa_remote_block_ids"] == [41]
         assert kwargs["swa_local_block_ids"] == [103]
+
+    def test_receiver_filters_swa_page_zero_and_tail_aligns(self):
+        """Old prefill metadata may include page 0; receiver should tail-align."""
+        from sgl_jax.srt.disaggregation.jax_transfer.conn import (
+            JaxTransferKVReceiver,
+            PMetadata,
+        )
+
+        class FakeBootstrap:
+            def get_transfer_info(self, room):
+                assert room == 7
+                return {
+                    "num_chunks": 1,
+                    "chunks": {
+                        0: {
+                            "remote_block_ids": [31, 32],
+                            "chunk_page_offset": 3,
+                            "swa_block_ids": [0, 41],
+                        }
+                    },
+                }
+
+        class FakeRaidenWrapper:
+            def __init__(self):
+                self.calls = []
+
+            def start_read(self, *args, **kwargs):
+                self.calls.append((args, kwargs))
+
+        class FakeManager:
+            use_raiden = True
+
+            def __init__(self):
+                self.bootstrap_client = FakeBootstrap()
+                self.raiden_wrapper = FakeRaidenWrapper()
+
+            def poll_raiden(self):
+                pass
+
+            def raiden_receiver_state(self, req_id):
+                return None
+
+            def record_terminal(self, *args, **kwargs):
+                pass
+
+            def _prune_receiver(self, req_id):
+                pass
+
+            def raiden_forget(self, req_id):
+                pass
+
+        mgr = FakeManager()
+        receiver = JaxTransferKVReceiver(mgr, "req")
+        receiver.init(
+            PMetadata(
+                remote_addr="p:1",
+                uuid="req",
+                specs={},
+                p_side_channel_host="p",
+                p_side_channel_port=2,
+                remote_endpoint="full-ep",
+                bootstrap_room=7,
+                local_pages=(0, 1, 2, 10, 11),
+                swa_remote_endpoint="swa-ep",
+                swa_local_pages=(101, 102),
+                swa_local_page_by_full_page={3: 101, 4: 102},
+            )
+        )
+
+        receiver.poll()
+
+        assert mgr.raiden_wrapper.calls
+        _, kwargs = mgr.raiden_wrapper.calls[0]
+        assert kwargs["swa_remote_block_ids"] == [41]
+        assert kwargs["swa_local_block_ids"] == [102]
 
     def test_resolve_kv_pool_dtype_accepts_swa_pool(self):
         """SWA wrapper pools advertise dtype via their full sub-pool."""

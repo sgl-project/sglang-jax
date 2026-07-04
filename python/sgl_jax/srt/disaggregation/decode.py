@@ -19,6 +19,9 @@ from sgl_jax.srt.disaggregation.jax_transfer.conn import (
     JaxTransferKVManager,
     JaxTransferKVReceiver,
     PMetadata,
+    _raiden_global_page_id,
+    _raiden_global_page_ids,
+    _raiden_pages_per_rank,
 )
 from sgl_jax.srt.mem_cache.memory_pool import write_kv_layer
 
@@ -653,20 +656,28 @@ class SchedulerDisaggregationDecodeMixin:
                 if not isinstance(kv_indices, np.ndarray)
                 else kv_indices
             )
-            local_pages = tuple(int(p) for p in (kv_indices_np[::page_size] // page_size))
+            allocator = self.token_to_kv_pool_allocator
+            dp_rank = int(getattr(req, "dp_rank", 0) or 0)
+            local_page_ids = [int(p) for p in (kv_indices_np[::page_size] // page_size)]
+            local_pages = tuple(
+                _raiden_global_page_ids(
+                    local_page_ids,
+                    dp_rank=dp_rank,
+                    pages_per_rank=_raiden_pages_per_rank(allocator),
+                )
+            )
 
             # SWA hybrid-attention: build SWA-pool local pages (tail only) and
             # remote endpoint from the SWA engine's endpoint descriptors.
             swa_local_pages: tuple[int, ...] | None = None
             swa_local_page_by_full_page: dict[int, int] | None = None
             swa_remote_endpoint: object | None = None
-            allocator = self.token_to_kv_pool_allocator
             swa_mapping = getattr(allocator, "full_to_swa_index_mapping", None)
             if swa_mapping is not None and hasattr(self, "sliding_window_size"):
                 seqlen = len(req.origin_input_ids)
                 sliding = self.sliding_window_size or 0
                 if isinstance(swa_mapping, list):
-                    swa_mapping = swa_mapping[0]
+                    swa_mapping = swa_mapping[int(getattr(req, "dp_rank", 0) or 0)]
                 window_start = max(0, seqlen - sliding)
                 first_tail_page = window_start // page_size
                 last_tail_page = (seqlen + page_size - 1) // page_size
@@ -676,8 +687,12 @@ class SchedulerDisaggregationDecodeMixin:
                     if token_pos >= len(kv_indices_np):
                         break
                     swa_token_idx = int(swa_mapping[int(kv_indices_np[token_pos])])
-                    if swa_token_idx >= 0:
-                        page_map[full_page] = swa_token_idx // page_size
+                    if swa_token_idx >= page_size:
+                        page_map[full_page] = _raiden_global_page_id(
+                            swa_token_idx // page_size,
+                            dp_rank=dp_rank,
+                            pages_per_rank=_raiden_pages_per_rank(allocator, swa=True),
+                        )
                 if page_map:
                     swa_local_page_by_full_page = page_map
                     swa_local_pages = tuple(page_map[p] for p in sorted(page_map))
