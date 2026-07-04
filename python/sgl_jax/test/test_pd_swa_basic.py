@@ -140,3 +140,15 @@ class TestBackwardCompatible:
         )
         assert m.swa_remote_endpoint is None
         assert m.swa_local_pages is None
+
+    def test_resolve_kv_pool_dtype_accepts_swa_pool(self):
+        """SWA wrapper pools advertise dtype via their full sub-pool."""
+        from sgl_jax.srt.disaggregation.bootstrap import resolve_kv_pool_dtype
+
+        class FullPool:
+            dtype = np.float16
+
+        class SWAPool:
+            full_kv_pool = FullPool()
+
+        assert resolve_kv_pool_dtype(SWAPool()) is np.float16

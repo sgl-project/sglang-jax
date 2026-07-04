@@ -15,13 +15,6 @@ from collections import deque
 from dataclasses import dataclass
 from types import SimpleNamespace
 
-# tpu-raiden ships a native JAX extension. Load it before jax initializes so the
-# native allocator registry is populated in a stable order.
-try:
-    import tpu_raiden.frameworks.jax._tpu_raiden_jax  # noqa: F401
-except Exception:  # noqa: BLE001
-    pass
-
 import jax
 import numpy as np
 import pathwaysutils

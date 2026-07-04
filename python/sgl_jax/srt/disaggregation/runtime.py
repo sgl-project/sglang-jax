@@ -41,6 +41,7 @@ def install_disaggregation_wiring(scheduler: Scheduler, server_args: ServerArgs)
         HeartbeatDaemon,
         PrefillInfoCache,
         resolve_kv_dtype_name,
+        resolve_kv_pool_dtype,
     )
     from sgl_jax.srt.disaggregation.common.zmq_notifier import ZmqPullNotifier
     from sgl_jax.srt.disaggregation.decode import (
@@ -81,8 +82,7 @@ def install_disaggregation_wiring(scheduler: Scheduler, server_args: ServerArgs)
         transfer_port,
         channel_number=server_args.disaggregation_channel_number,
     )
-    if not server_args.disaggregation_use_raiden:
-        wrapper.start()
+    wrapper.start()
     notifier = ZmqPullNotifier(
         role,
         local_host,
@@ -214,7 +214,9 @@ def install_disaggregation_wiring(scheduler: Scheduler, server_args: ServerArgs)
 
         scheduler.disagg_prefill_queue = PrefillBootstrapQueue()
         prefill_kv_pool = scheduler.token_to_kv_pool_allocator.get_kvcache()
-        kv_dtype_name = resolve_kv_dtype_name(prefill_kv_pool.dtype)
+        kv_dtype_name = resolve_kv_dtype_name(
+            resolve_kv_pool_dtype(prefill_kv_pool)
+        )
 
         # raiden: advertise the control endpoint so D can reach P's TransferEngine.
         raiden_control_port = 0

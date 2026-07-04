@@ -106,6 +106,20 @@ def resolve_kv_dtype_name(dtype: object) -> str:
         return str(dtype)
 
 
+def resolve_kv_pool_dtype(kv_pool: object) -> object:
+    """Return the canonical KV dtype for regular and hybrid SWA pools."""
+
+    dtype = getattr(kv_pool, "dtype", None)
+    if dtype is not None:
+        return dtype
+    full_kv_pool = getattr(kv_pool, "full_kv_pool", None)
+    dtype = getattr(full_kv_pool, "dtype", None)
+    if dtype is not None:
+        return dtype
+    swa_kv_pool = getattr(kv_pool, "swa_kv_pool", None)
+    return getattr(swa_kv_pool, "dtype", None)
+
+
 def check_prefill_compat(
     info: dict[str, object],
     *,
