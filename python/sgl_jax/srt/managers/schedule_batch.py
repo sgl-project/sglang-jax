@@ -223,6 +223,7 @@ class Req:
         self.bootstrap_host: str | None = None
         self.bootstrap_port: int | None = None
         self.bootstrap_room: int | None = None
+        self.disagg_prefill_dp_rank: int | None = None
         self.disagg_transfer_id: str | None = None
         self.disagg_host_buffer_id: int | None = None
 

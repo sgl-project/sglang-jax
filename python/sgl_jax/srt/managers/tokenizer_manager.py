@@ -416,6 +416,8 @@ class TokenizerManager:
         tokenized_obj.bootstrap_host = getattr(obj, "bootstrap_host", None)
         tokenized_obj.bootstrap_port = getattr(obj, "bootstrap_port", None)
         tokenized_obj.bootstrap_room = getattr(obj, "bootstrap_room", None)
+        tokenized_obj.dp_rank = getattr(obj, "dp_rank", None)
+        tokenized_obj.disagg_prefill_dp_rank = getattr(obj, "disagg_prefill_dp_rank", None)
         tokenized_obj.disagg_transfer_id = getattr(obj, "disagg_transfer_id", None)
         # note: When only `return_logprob` is specified, we assume that only the output probability is required.
         if (

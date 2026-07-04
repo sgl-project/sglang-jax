@@ -232,20 +232,25 @@ class SchedulerDisaggregationDecodeMixin:
             try:
                 from sgl_jax.srt.disaggregation.common.metrics import time_phase
 
+                prefill_dp_rank = getattr(
+                    req,
+                    "disagg_prefill_dp_rank",
+                    getattr(req, "dp_rank", 0),
+                )
                 self._pd_mark_time(req, "bootstrap_start")
                 with time_phase("bootstrap", "decode"):
                     if jax.process_count() > 1:
                         # Multi-host caches the matched peer after the first
                         # lookup, so this does no per-request network I/O.
                         p_info = self._pick_prefill_peer_for_this_host(
-                            dp_rank=getattr(req, "dp_rank", 0)
+                            dp_rank=prefill_dp_rank
                         )
                     else:
                         # Local cache resolution (sglang-style): a warm cache
                         # does zero network I/O, so this no longer blocks the
                         # event loop.
                         p_info = self.disagg_prefill_info_cache.pick_for_room(
-                            req.bootstrap_room, dp_rank=getattr(req, "dp_rank", 0)
+                            req.bootstrap_room, dp_rank=prefill_dp_rank
                         )
                 self._pd_mark_time(req, "bootstrap_done")
             except Exception:

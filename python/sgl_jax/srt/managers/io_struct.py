@@ -171,6 +171,7 @@ class TokenizedGenerateReqInput:
     bootstrap_host: str | None = None
     bootstrap_port: int | None = None
     bootstrap_room: int | None = None
+    disagg_prefill_dp_rank: int | None = None
     # Optional wire-level transfer identity. When omitted we fall back
     # to ``rid``; callers that may reuse ``rid`` across retries should
     # provide a per-attempt value to isolate late acks.
@@ -315,10 +316,14 @@ class GenerateReqInput:
 
     return_routed_experts: list[bool] | bool | None = None
 
+    # The data parallel rank for this request.
+    dp_rank: list[int] | int | None = None
+
     # PD disaggregation routing keys.
     bootstrap_host: list[str] | str | None = None
     bootstrap_port: list[int] | int | None = None
     bootstrap_room: list[int] | int | None = None
+    disagg_prefill_dp_rank: list[int] | int | None = None
     disagg_transfer_id: list[str] | str | None = None
 
     def contains_mm_input(self) -> bool:
@@ -556,6 +561,7 @@ class GenerateReqInput:
             lora_path=self.lora_path[i] if self.lora_path is not None else None,
             lora_id=self.lora_id[i] if self.lora_id is not None else None,
             return_routed_experts=self.return_routed_experts[i],
+            dp_rank=self.dp_rank[i] if isinstance(self.dp_rank, list) else self.dp_rank,
             # PD disaggregation passthrough.
             # Supports both scalar and list shapes.
             bootstrap_host=(
@@ -572,6 +578,11 @@ class GenerateReqInput:
                 self.bootstrap_room[i]
                 if isinstance(self.bootstrap_room, list)
                 else self.bootstrap_room
+            ),
+            disagg_prefill_dp_rank=(
+                self.disagg_prefill_dp_rank[i]
+                if isinstance(self.disagg_prefill_dp_rank, list)
+                else self.disagg_prefill_dp_rank
             ),
             disagg_transfer_id=(
                 self.disagg_transfer_id[i]

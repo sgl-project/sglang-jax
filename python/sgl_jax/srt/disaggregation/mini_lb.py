@@ -77,8 +77,8 @@ class MiniLoadBalancer:
 
         prefill_req = request.copy()
         decode_req = request.copy()
-        prefill_req["routed_dp_rank"] = p_rank
-        decode_req["routed_dp_rank"] = d_rank
+        prefill_req["dp_rank"] = p_rank
+        decode_req["dp_rank"] = d_rank
         decode_req["disagg_prefill_dp_rank"] = p_rank
 
         return prefill_req, decode_req, d_rank

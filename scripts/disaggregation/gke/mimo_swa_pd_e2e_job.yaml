@@ -75,6 +75,8 @@ spec:
           value: "<MAX_RUNNING_REQUESTS>"
         - name: ROUTER_MAX_CONCURRENT_REQUESTS
           value: "<ROUTER_MAX_CONCURRENT_REQUESTS>"
+        - name: ROUTER_TEST_EXTERNAL_DP_ROUTING
+          value: "<ROUTER_TEST_EXTERNAL_DP_ROUTING>"
         - name: CONTEXT_LENGTH
           value: "<CONTEXT_LENGTH>"
         - name: CHUNKED_PREFILL_SIZE
@@ -295,13 +297,19 @@ spec:
             }
 
             echo "=== Starting router ==="
+            ROUTER_ARGS=(
+              --pd-disaggregation --mini-lb
+              --prefill "http://${P_HOST}:10000" 8998
+              --decode http://localhost:10001
+              --prefill-bootstrap-host "${P_HOST}"
+              --max-concurrent-requests "$ROUTER_MAX_CONCURRENT_REQUESTS"
+              --host 0.0.0.0 --port 30000
+            )
+            if [ "$ROUTER_TEST_EXTERNAL_DP_ROUTING" = "1" ]; then
+              ROUTER_ARGS+=(--test-external-dp-routing)
+            fi
             python -m sgl_jax.srt.disaggregation.launch_router \
-              --pd-disaggregation --mini-lb \
-              --prefill "http://${P_HOST}:10000" 8998 \
-              --decode http://localhost:10001 \
-              --prefill-bootstrap-host "${P_HOST}" \
-              --max-concurrent-requests "$ROUTER_MAX_CONCURRENT_REQUESTS" \
-              --host 0.0.0.0 --port 30000 \
+              "${ROUTER_ARGS[@]}" \
               2>&1 | tee "$OUT/router.log" &
             ROUTER_PID=$!
             wait_health http://localhost:30000/health router 60 "$ROUTER_PID"
