@@ -56,6 +56,7 @@ DP_SIZE="${DP_SIZE:-}"
 ENABLE_SEQUENCE_PARALLEL="${ENABLE_SEQUENCE_PARALLEL:-0}"
 LIBTPU_INIT_ARGS_VALUE="${LIBTPU_INIT_ARGS_VALUE:---xla_tpu_dvfs_p_state=7}"
 JAX_CACHE_DIR="${JAX_CACHE_DIR:-/tmp/tpu_logs/jit_cache}"
+SKIP_GCSFUSE_WARMUP="${SKIP_GCSFUSE_WARMUP:-1}"
 
 RUN_GSM8K="${RUN_GSM8K:-1}"
 GSM_Q="${GSM_Q:-128}"
@@ -115,6 +116,7 @@ render() {
     -e "s|<ENABLE_SEQUENCE_PARALLEL>|$(escape_sed "$ENABLE_SEQUENCE_PARALLEL")|g" \
     -e "s|<LIBTPU_INIT_ARGS_VALUE>|$(escape_sed "$LIBTPU_INIT_ARGS_VALUE")|g" \
     -e "s|<JAX_CACHE_DIR>|$(escape_sed "$JAX_CACHE_DIR")|g" \
+    -e "s|<SKIP_GCSFUSE_WARMUP>|$(escape_sed "$SKIP_GCSFUSE_WARMUP")|g" \
     -e "s|<RUN_GSM8K>|$(escape_sed "$RUN_GSM8K")|g" \
     -e "s|<GSM_Q>|$(escape_sed "$GSM_Q")|g" \
     -e "s|<GSM_PAR>|$(escape_sed "$GSM_PAR")|g" \

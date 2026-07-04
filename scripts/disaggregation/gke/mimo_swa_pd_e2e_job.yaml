@@ -89,6 +89,8 @@ spec:
           value: "<LIBTPU_INIT_ARGS_VALUE>"
         - name: JAX_CACHE_DIR
           value: "<JAX_CACHE_DIR>"
+        - name: SGLANG_JAX_SKIP_GCSFUSE_WARMUP
+          value: "<SKIP_GCSFUSE_WARMUP>"
         - name: RUN_GSM8K
           value: "<RUN_GSM8K>"
         - name: GSM_Q

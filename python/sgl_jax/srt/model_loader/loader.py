@@ -192,6 +192,13 @@ class JAXModelLoader(DefaultModelLoader):
     @staticmethod
     def _warmup_safetensors_cache(model_config: ModelConfig):
         """Pre-read safetensors files to warm GCSFuse cache."""
+        if get_bool_env_var("SGLANG_JAX_SKIP_GCSFUSE_WARMUP"):
+            logger.info(
+                "Skipping GCSFuse safetensors warm-up because "
+                "SGLANG_JAX_SKIP_GCSFUSE_WARMUP is set"
+            )
+            return
+
         model_path = model_config.model_path
         try:
             with open("/proc/mounts") as fp:

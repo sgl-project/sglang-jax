@@ -20,6 +20,7 @@ from sgl_jax.srt.layers.moe import EPMoE, GateLogit, TopK, create_moe_weights_ma
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache, MemoryPools
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+from sgl_jax.srt.utils.common_utils import get_bool_env_var
 from sgl_jax.srt.utils.parallel_utils import make_reduce_sharding
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
@@ -626,6 +627,13 @@ class MiMoV2FlashForCausalLM(nnx.Module):
         GCSFuse random reads are ~400ms per tensor (cold) vs ~1ms (warm).
         Sequential bulk read fills the cache so MoE loading uses warm reads.
         """
+        if get_bool_env_var("SGLANG_JAX_SKIP_GCSFUSE_WARMUP"):
+            logger.info(
+                "Skipping GCSFuse safetensors warm-up because "
+                "SGLANG_JAX_SKIP_GCSFUSE_WARMUP is set"
+            )
+            return
+
         import glob
         import os
         from concurrent.futures import ThreadPoolExecutor
