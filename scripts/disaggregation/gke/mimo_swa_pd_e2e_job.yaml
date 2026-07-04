@@ -117,6 +117,18 @@ spec:
           value: "<BENCH_WARMUP_REQUESTS>"
         - name: BENCH_TIMEOUT_SECONDS
           value: "<BENCH_TIMEOUT_SECONDS>"
+        - name: RUN_MMLU_PRO
+          value: "<RUN_MMLU_PRO>"
+        - name: MMLU_PRO_Q
+          value: "<MMLU_PRO_Q>"
+        - name: MMLU_PRO_PAR
+          value: "<MMLU_PRO_PAR>"
+        - name: MMLU_PRO_MAXTOK
+          value: "<MMLU_PRO_MAXTOK>"
+        - name: MMLU_PRO_ENABLE_THINKING
+          value: "<MMLU_PRO_ENABLE_THINKING>"
+        - name: MMLU_PRO_TIMEOUT_SECONDS
+          value: "<MMLU_PRO_TIMEOUT_SECONDS>"
         - name: KEEPALIVE_SECONDS
           value: "<KEEPALIVE_SECONDS>"
         command:
@@ -363,6 +375,39 @@ spec:
                 echo "--- decode logs from long benchmark pass conc=${C} ---"
                 tail -n +$((BEFORE + 1)) "$OUT/decode_server.log" | grep -E "role=decode|RAIDEN-D|start_read|failed_recving|Traceback|RESOURCE_EXHAUSTED" | tail -120 || true
               done
+            fi
+
+            if [ "$RUN_MMLU_PRO" = "1" ] && [ "$FAIL" = "0" ]; then
+              echo "=========================================="
+              echo "MMLU-Pro eval q=${MMLU_PRO_Q} par=${MMLU_PRO_PAR} maxtok=${MMLU_PRO_MAXTOK} thinking=${MMLU_PRO_ENABLE_THINKING}"
+              echo "=========================================="
+              BEFORE=$(wc -l < "$OUT/decode_server.log")
+              MMLU_PRO_ARGS=(
+                --base-url http://localhost:30000
+                --num-questions "$MMLU_PRO_Q"
+                --max-new-tokens "$MMLU_PRO_MAXTOK"
+                --parallel "$MMLU_PRO_PAR"
+                --result-file "$OUT/mmlu_pro_result.jsonl"
+                --sample-file "$OUT/mmlu_pro_samples.jsonl"
+                --output-file "$OUT/mmlu_pro_outputs.txt"
+                --tokenizer-path "$MODEL_PATH"
+              )
+              if [ "$MMLU_PRO_ENABLE_THINKING" = "1" ]; then
+                MMLU_PRO_ARGS+=(--enable-thinking)
+              fi
+              set +e
+              timeout "$MMLU_PRO_TIMEOUT_SECONDS" python benchmark/mmlu_pro/bench_sglang_jax.py \
+                "${MMLU_PRO_ARGS[@]}" \
+                2>&1 | tee "$OUT/mmlu_pro_stdout.log"
+              MMLU_PRO_RC=${PIPESTATUS[0]}
+              set -e
+              echo "mmlu_pro_rc=${MMLU_PRO_RC}"
+              cat "$OUT/mmlu_pro_result.jsonl" 2>/dev/null || true
+              if [ "$MMLU_PRO_RC" != "0" ]; then
+                FAIL=1
+              fi
+              echo "--- decode logs from MMLU-Pro pass ---"
+              tail -n +$((BEFORE + 1)) "$OUT/decode_server.log" | grep -E "role=decode|RAIDEN-D|start_read|failed_recving|Traceback|RESOURCE_EXHAUSTED" | tail -120 || true
             fi
 
             echo "=== Decode key logs ==="
