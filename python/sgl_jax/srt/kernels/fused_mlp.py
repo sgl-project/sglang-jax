@@ -23,9 +23,7 @@ def inner_mlp_kernel(
     y_tile,
     y_scratch,
     *,
-    b_seq: int,
     b_inter: int,
-    hidden_size: int,
     num_inter: int,
 ):
     i_i = pl.program_id(0)
@@ -108,9 +106,7 @@ def mlp_kernel_main(x_hbm, w_gu_hbm, wd_hbm, y_hbm, y_scratch, *, b_seq, b_inter
     pipeline_fn = pltpu.emit_pipeline(
         functools.partial(
             inner_mlp_kernel,
-            b_seq=b_seq,
             b_inter=b_inter,
-            hidden_size=hidden_size,
             num_inter=num_inter,
         ),
         grid=(num_inter,),
@@ -191,7 +187,7 @@ def apply_fused_mlp_with_padding(
     b_inter: int = 128,
 ) -> jax.Array:
     """Pads the input sequence length to be a multiple of b_seq if necessary."""
-    seq_len, hidden_size = x.shape
+    seq_len = x.shape[0]
     rem = seq_len % b_seq
     if rem == 0:
         return apply_fused_mlp_sharded(x, w_gu, wd, mesh, b_seq, b_inter)
