@@ -111,6 +111,17 @@ RECORD_STEP_TIME = get_bool_env_var("SGLANG_RECORD_STEP_TIME")
 GRAMMAR_TIMEOUT = float(os.environ.get("SGLANG_GRAMMAR_TIMEOUT", 300))
 
 
+def _count_batch_reqs_for_pd_state(batch) -> int:
+    if batch is None:
+        return 0
+    if hasattr(batch, "is_empty") and batch.is_empty():
+        return 0
+    reqs_info = getattr(batch, "reqs_info", None)
+    if reqs_info is None:
+        return 0
+    return sum(len(info.reqs) for info in reqs_info if getattr(info, "reqs", None))
+
+
 class SyncError(Exception):
     pass
 
@@ -1328,8 +1339,47 @@ class Scheduler(
         ret["disagg_prefill_queue_size"] = len(self.disagg_prefill_queue or ())
         ret["disagg_prealloc_queue_size"] = len(self.disagg_prealloc_queue or ())
         ret["disagg_transfer_queue_size"] = len(self.disagg_transfer_queue or ())
+        ret["pd_decode_admission"] = self._get_pd_decode_admission_state()
 
         return GetInternalStateReqOutput(internal_state=ret)
+
+    def _get_pd_decode_admission_state(self) -> dict:
+        prealloc_q = getattr(self, "disagg_prealloc_queue", None)
+        if prealloc_q is None:
+            return {}
+
+        transfer_q = getattr(self, "disagg_transfer_queue", None)
+        allocator = getattr(self, "token_to_kv_pool_allocator", None)
+        entries = list(prealloc_q.items_fifo()) if hasattr(prealloc_q, "items_fifo") else []
+
+        oldest_wait_ms = None
+        if entries:
+            req = getattr(entries[0], "req", None)
+            time_stats = getattr(req, "pd_time_stats", None)
+            marks = getattr(time_stats, "marks", None) if time_stats is not None else None
+            start = marks.get("prealloc_entry") if marks is not None else None
+            if start is not None:
+                oldest_wait_ms = (time.perf_counter() - start) * 1000.0
+
+        kv_available_by_dp = []
+        if allocator is not None:
+            for dp_rank in range(int(getattr(self, "dp_size", 1) or 1)):
+                kv_available_by_dp.append(int(allocator.available_size(dp_rank=dp_rank)))
+
+        return {
+            "prealloc_queue_size": len(prealloc_q),
+            "transfer_queue_size": len(transfer_q) if transfer_q is not None else 0,
+            "running_reqs": _count_batch_reqs_for_pd_state(
+                getattr(self, "running_batch", None)
+            ),
+            "max_inflight_transfers": self.server_args.disaggregation_max_inflight_transfers,
+            "reserved_decode_tokens": self.server_args.disaggregation_num_reserved_decode_tokens,
+            "kv_available_by_dp": kv_available_by_dp,
+            "oldest_prealloc_wait_ms": oldest_wait_ms,
+            "pending_prealloc_prompt_tokens": sum(
+                len(getattr(entry.req, "origin_input_ids", ()) or ()) for entry in entries
+            ),
+        }
 
     def set_internal_state(self, recv_req: SetInternalStateReq):
         """Handle internal state updates, including precision tracer configuration"""
