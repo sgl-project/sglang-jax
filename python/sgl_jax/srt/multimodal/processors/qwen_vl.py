@@ -1,6 +1,12 @@
 import asyncio
+import base64
+import math
+import os
+import tempfile
 
 import numpy as np
+import requests
+from PIL import Image
 
 from sgl_jax.srt.multimodal.common.modality_enum import (
     Modality,
@@ -9,6 +15,207 @@ from sgl_jax.srt.multimodal.common.modality_enum import (
 )
 from sgl_jax.srt.multimodal.manager.mrope_utils import compute_mrope_positions
 from sgl_jax.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
+
+IMAGE_FACTOR = 28
+MIN_PIXELS = 4 * 28 * 28
+MAX_PIXELS = 16384 * 28 * 28
+MAX_RATIO = 200
+VIDEO_TOTAL_PIXELS = int(float(os.environ.get("VIDEO_MAX_PIXELS", 128000 * 28 * 28 * 0.9)))
+VIDEO_MIN_PIXELS = 128 * 28 * 28
+VIDEO_MAX_PIXELS = 768 * 28 * 28
+FRAME_FACTOR = 2
+FPS = 2.0
+FPS_MIN_FRAMES = 4
+FPS_MAX_FRAMES = 768
+VIDEO_CONFIG_KEYS = (
+    "min_pixels",
+    "max_pixels",
+    "total_pixels",
+    "resized_height",
+    "resized_width",
+    "min_frames",
+    "max_frames",
+)
+
+
+def smart_resize(
+    height: int,
+    width: int,
+    factor: int = IMAGE_FACTOR,
+    min_pixels: int = MIN_PIXELS,
+    max_pixels: int = MAX_PIXELS,
+) -> tuple[int, int]:
+    """Ported from SGLang Qwen-VL video preprocessing."""
+    if max(height, width) / min(height, width) > MAX_RATIO:
+        ratio = max(height, width) / min(height, width)
+        raise ValueError(f"absolute aspect ratio must be smaller than {MAX_RATIO}, got {ratio}")
+    h_bar = max(factor, round_by_factor(height, factor))
+    w_bar = max(factor, round_by_factor(width, factor))
+    if h_bar * w_bar > max_pixels:
+        beta = math.sqrt((height * width) / max_pixels)
+        h_bar = floor_by_factor(height / beta, factor)
+        w_bar = floor_by_factor(width / beta, factor)
+    elif h_bar * w_bar < min_pixels:
+        beta = math.sqrt(min_pixels / (height * width))
+        h_bar = ceil_by_factor(height * beta, factor)
+        w_bar = ceil_by_factor(width * beta, factor)
+    return h_bar, w_bar
+
+
+def round_by_factor(number: int, factor: int) -> int:
+    return round(number / factor) * factor
+
+
+def ceil_by_factor(number: int, factor: int) -> int:
+    return math.ceil(number / factor) * factor
+
+
+def floor_by_factor(number: int, factor: int) -> int:
+    return math.floor(number / factor) * factor
+
+
+def smart_nframes(video_config: dict, total_frames: int, video_fps: int | float) -> int:
+    assert not (
+        "fps" in video_config and "nframes" in video_config
+    ), "Only accept either `fps` or `nframes`"
+    if "nframes" in video_config:
+        nframes = round_by_factor(video_config["nframes"], FRAME_FACTOR)
+    else:
+        fps = video_config.get("fps", FPS)
+        min_frames = ceil_by_factor(video_config.get("min_frames", FPS_MIN_FRAMES), FRAME_FACTOR)
+        max_frames = floor_by_factor(
+            video_config.get("max_frames", min(FPS_MAX_FRAMES, total_frames)),
+            FRAME_FACTOR,
+        )
+        nframes = total_frames / video_fps * fps
+        nframes = min(min(max(nframes, min_frames), max_frames), total_frames)
+        nframes = floor_by_factor(nframes, FRAME_FACTOR)
+    if not (FRAME_FACTOR <= nframes <= total_frames):
+        raise ValueError(
+            f"nframes should in interval [{FRAME_FACTOR}, {total_frames}], but got {nframes}."
+        )
+    return int(nframes)
+
+
+def _resize_video_frames(video: np.ndarray, video_config: dict) -> np.ndarray:
+    if video.ndim != 4:
+        raise ValueError(f"Expected video array with 4 dims (T,H,W,C), got {video.shape}")
+
+    nframes, height, width = video.shape[0], video.shape[1], video.shape[2]
+    min_pixels = video_config.get("min_pixels", VIDEO_MIN_PIXELS)
+    total_pixels = video_config.get("total_pixels", VIDEO_TOTAL_PIXELS)
+    max_pixels = max(
+        min(
+            video_config.get("max_pixels", VIDEO_MAX_PIXELS),
+            total_pixels / nframes * FRAME_FACTOR,
+        ),
+        int(min_pixels * 1.05),
+    )
+
+    max_pixels_supposed = video_config.get("max_pixels", max_pixels)
+    max_pixels = min(max_pixels_supposed, max_pixels)
+    if "resized_height" in video_config and "resized_width" in video_config:
+        resized_height, resized_width = smart_resize(
+            video_config["resized_height"],
+            video_config["resized_width"],
+            factor=IMAGE_FACTOR,
+        )
+    else:
+        resized_height, resized_width = smart_resize(
+            height,
+            width,
+            factor=IMAGE_FACTOR,
+            min_pixels=min_pixels,
+            max_pixels=max_pixels,
+        )
+
+    if resized_height == height and resized_width == width:
+        return video
+
+    resized_frames = []
+    for frame in video:
+        img = Image.fromarray(frame)
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        img = img.resize((resized_width, resized_height), resample=Image.BILINEAR)
+        resized_frames.append(np.asarray(img))
+    return np.stack(resized_frames, axis=0)
+
+
+def _write_temp_video(payload: bytes) -> str:
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+        tmp.write(payload)
+        return tmp.name
+
+
+def _unwrap_source(source):
+    if isinstance(source, dict) and "url" in source:
+        return source["url"]
+    if hasattr(source, "url"):
+        return source.url
+    return source
+
+
+def preprocess_video(source, video_config: dict) -> np.ndarray:
+    if isinstance(source, np.ndarray):
+        return _resize_video_frames(source, video_config)
+
+    source = _unwrap_source(source)
+
+    from decord import VideoReader, cpu
+
+    tmp_path = None
+    try:
+        ctx = cpu(0)
+        if isinstance(source, bytes):
+            tmp_path = _write_temp_video(source)
+            vr = VideoReader(tmp_path, ctx=ctx)
+        elif isinstance(source, str):
+            if os.path.exists(source):
+                vr = VideoReader(source, ctx=ctx)
+            elif source.startswith(("http://", "https://")):
+                response = requests.get(source, timeout=10)
+                response.raise_for_status()
+                tmp_path = _write_temp_video(response.content)
+                vr = VideoReader(tmp_path, ctx=ctx)
+            elif source.startswith("data:") and "base64," in source:
+                payload = source.split("base64,", 1)[1]
+                tmp_path = _write_temp_video(base64.b64decode(payload))
+                vr = VideoReader(tmp_path, ctx=ctx)
+            else:
+                tmp_path = _write_temp_video(base64.b64decode(source, validate=True))
+                vr = VideoReader(tmp_path, ctx=ctx)
+        else:
+            raise ValueError(f"Unsupported video input type: {type(source)}")
+
+        total_frames = len(vr)
+        if total_frames <= 0:
+            raise ValueError("Video must have at least one frame.")
+        video_fps = float(vr.get_avg_fps() or 1.0)
+        nframes = smart_nframes(video_config, total_frames=total_frames, video_fps=video_fps)
+        frame_indices = np.linspace(0, total_frames - 1, num=nframes, dtype=np.int64)
+        frame_indices = np.unique(frame_indices)
+        video = vr.get_batch(frame_indices).asnumpy()
+        return _resize_video_frames(video, video_config)
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+
+def _update_video_config_from_mapping(video_config: dict, source):
+    if not isinstance(source, dict):
+        return
+    for key in VIDEO_CONFIG_KEYS:
+        value = source.get(key)
+        if value is not None:
+            video_config[key] = value
+
+    fps = source.get("fps")
+    if fps is not None:
+        video_config["fps"] = fps
+    nframes = source.get("nframes", source.get("num_frames"))
+    if nframes is not None and "fps" not in video_config:
+        video_config["nframes"] = nframes
 
 
 class QwenVLProcessor(BaseMultimodalProcessor):
@@ -32,12 +239,23 @@ class QwenVLProcessor(BaseMultimodalProcessor):
             )
 
         images = await self._load_images_async(image_data)
+        video_data = self.normalize_data(getattr(request_obj, "video_data", None))
+        video_config = self._build_video_config(request_obj)
+        videos = await self._load_videos_async(video_data, video_config)
+        processor_kwargs = {}
+        if videos:
+            processor_kwargs["videos_kwargs"] = {
+                "do_sample_frames": False,
+                "fps": video_config.get("fps", FPS),
+            }
 
         processor_output = self.processor(
             text=[input_text],
-            images=images,
+            images=images or None,
+            videos=videos or None,
             padding=True,
             return_tensors="pt",
+            **processor_kwargs,
         )
 
         input_ids_array = self._to_numpy(processor_output.get("input_ids"))
@@ -45,7 +263,13 @@ class QwenVLProcessor(BaseMultimodalProcessor):
             raise ValueError("HF multimodal processor did not return input_ids.")
         input_ids = input_ids_array.reshape(-1).tolist()
         pixel_values = self._to_numpy(processor_output.get("pixel_values"))
+        pixel_values_videos = self._to_numpy(processor_output.get("pixel_values_videos"))
         image_grid_thw = self._to_grid_list(processor_output.get("image_grid_thw"))
+        video_grid_thw = self._to_grid_list(processor_output.get("video_grid_thw"))
+        second_per_grid_ts_value = processor_output.get("second_per_grid_ts")
+        if second_per_grid_ts_value is None:
+            second_per_grid_ts_value = processor_output.get("video_second_per_grid")
+        second_per_grid_ts = self._to_list(second_per_grid_ts_value)
 
         vision_config = self.hf_config.vision_config
         image_offsets = self._compute_image_offsets(
@@ -54,20 +278,46 @@ class QwenVLProcessor(BaseMultimodalProcessor):
             image_token_id=self.hf_config.image_token_id,
             spatial_merge_size=vision_config.spatial_merge_size,
         )
-        mm_items = self._build_items(pixel_values, image_grid_thw, image_offsets)
+        video_token_id = getattr(self.hf_config, "video_token_id", None)
+        video_offsets = self._compute_offsets(
+            input_ids=input_ids,
+            grids=video_grid_thw,
+            token_id=video_token_id,
+            spatial_merge_size=vision_config.spatial_merge_size,
+            modality_name="VIDEO",
+        )
+        mm_items = []
+        mm_items.extend(
+            self._build_items(
+                pixel_values,
+                image_grid_thw,
+                image_offsets,
+                Modality.IMAGE,
+                "image_grid_thw",
+            )
+        )
+        mm_items.extend(
+            self._build_items(
+                pixel_values_videos,
+                video_grid_thw,
+                video_offsets,
+                Modality.VIDEO,
+                "video_grid_thw",
+            )
+        )
         for item in mm_items:
             item.set_pad_value()
 
         mrope_positions, mrope_position_delta = compute_mrope_positions(
             input_ids=input_ids,
             image_grid_thw=image_grid_thw,
-            video_grid_thw=None,
-            second_per_grid_ts=None,
+            video_grid_thw=video_grid_thw,
+            second_per_grid_ts=second_per_grid_ts,
             vision_start_token_id=self.hf_config.vision_start_token_id,
             image_token_id=self.hf_config.image_token_id,
-            video_token_id=None,
+            video_token_id=video_token_id,
             spatial_merge_size=vision_config.spatial_merge_size,
-            tokens_per_second=None,
+            tokens_per_second=getattr(vision_config, "tokens_per_second", None),
         )
         mrope_position_delta = np.asarray([[mrope_position_delta]], dtype=np.int32)
 
@@ -77,26 +327,27 @@ class QwenVLProcessor(BaseMultimodalProcessor):
             im_start_id=self.hf_config.vision_start_token_id,
             im_end_id=self.hf_config.vision_end_token_id,
             im_token_id=self.hf_config.image_token_id,
+            video_token_id=video_token_id,
             mrope_positions=mrope_positions,
             mrope_position_delta=mrope_position_delta,
         )
 
     @staticmethod
-    def _build_items(features, grids, image_offsets):
+    def _build_items(features, grids, offsets, modality, grid_key):
         if features is None:
             return []
         if not grids:
-            raise ValueError("Missing image_grid_thw metadata for IMAGE inputs.")
-        if len(image_offsets) != len(grids):
+            raise ValueError(f"Missing {grid_key} metadata for {modality.name} inputs.")
+        if len(offsets) != len(grids):
             raise ValueError(
-                f"IMAGE offset count does not match grid metadata: "
-                f"{len(image_offsets)} != {len(grids)}."
+                f"{modality.name} offset count does not match grid metadata: "
+                f"{len(offsets)} != {len(grids)}."
             )
 
         feature_counts = [int(np.prod(grid)) for grid in grids]
         if sum(feature_counts) != len(features):
             raise ValueError(
-                f"IMAGE feature count does not match grid metadata: "
+                f"{modality.name} feature count does not match grid metadata: "
                 f"{len(features)} != {sum(feature_counts)}."
             )
 
@@ -104,11 +355,11 @@ class QwenVLProcessor(BaseMultimodalProcessor):
         offset = 0
         for count, grid in zip(feature_counts, grids):
             item = MultimodalDataItem(
-                modality=Modality.IMAGE,
+                modality=modality,
                 feature=features[offset : offset + count],
             )
-            item.set("image_grid_thw", np.asarray([grid], dtype=np.int32))
-            item.offsets = [image_offsets[len(items)]]
+            item.set(grid_key, np.asarray([grid], dtype=np.int32))
+            item.offsets = [offsets[len(items)]]
             items.append(item)
             offset += count
         return items
@@ -120,8 +371,20 @@ class QwenVLProcessor(BaseMultimodalProcessor):
 
     @staticmethod
     def _compute_image_offsets(input_ids, grids, image_token_id, spatial_merge_size):
+        return QwenVLProcessor._compute_offsets(
+            input_ids=input_ids,
+            grids=grids,
+            token_id=image_token_id,
+            spatial_merge_size=spatial_merge_size,
+            modality_name="IMAGE",
+        )
+
+    @staticmethod
+    def _compute_offsets(input_ids, grids, token_id, spatial_merge_size, modality_name):
         if not grids:
             return []
+        if token_id is None:
+            raise ValueError(f"{modality_name} token id is not configured.")
 
         offsets = []
         search_start = 0
@@ -129,23 +392,44 @@ class QwenVLProcessor(BaseMultimodalProcessor):
             token_count = int(np.prod(grid) // (spatial_merge_size**2))
             start = None
             for idx in range(search_start, len(input_ids)):
-                if input_ids[idx] == image_token_id:
+                if input_ids[idx] == token_id:
                     start = idx
                     break
             if start is None:
-                raise ValueError("Missing IMAGE placeholder tokens in processor input_ids.")
+                raise ValueError(
+                    f"Missing {modality_name} placeholder tokens in processor input_ids."
+                )
 
             end = start + token_count - 1
             if end >= len(input_ids) or any(
-                token_id != image_token_id for token_id in input_ids[start : end + 1]
+                input_token_id != token_id for input_token_id in input_ids[start : end + 1]
             ):
                 raise ValueError(
-                    "IMAGE placeholder token span does not match image_grid_thw metadata."
+                    f"{modality_name} placeholder token span does not match grid metadata."
                 )
             offsets.append((start, end))
             search_start = end + 1
 
         return offsets
+
+    async def _load_videos_async(self, video_data, video_config):
+        return await asyncio.gather(
+            *(
+                asyncio.to_thread(preprocess_video, item, video_config)
+                for item in self.normalize_data(video_data)
+            )
+        )
+
+    @staticmethod
+    def _build_video_config(request_obj):
+        video_config = {}
+        fps = getattr(request_obj, "fps", None)
+        if fps is not None:
+            video_config["fps"] = fps
+        nframes = getattr(request_obj, "num_frames", None)
+        if nframes is not None and "fps" not in video_config:
+            video_config["nframes"] = nframes
+        return video_config
 
     @staticmethod
     def _to_numpy(value):
@@ -160,3 +444,9 @@ class QwenVLProcessor(BaseMultimodalProcessor):
         if value is None:
             return None
         return [tuple(int(item) for item in row) for row in cls._to_numpy(value).tolist()]
+
+    @classmethod
+    def _to_list(cls, value):
+        if value is None:
+            return None
+        return cls._to_numpy(value).reshape(-1).tolist()

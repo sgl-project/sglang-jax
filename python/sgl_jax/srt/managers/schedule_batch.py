@@ -2998,7 +2998,7 @@ def _build_merge_idx(
     dp_size: int,
     per_dp_token: int,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Build ``src_idx``/``mask`` for one image round.
+    """Build ``src_idx``/``mask`` for one vision round.
 
     Token layout mirrors ``_merge_input_and_positions``: rank ``r`` owns the
     contiguous slot ``[r * per_dp_token : (r + 1) * per_dp_token]``; within that
@@ -3026,7 +3026,7 @@ def _build_merge_idx(
                 tok = rank_base + req_base + o
                 if tok >= rank_base + per_dp_token:
                     raise ValueError(
-                        "IMAGE placeholder offset is outside its packed rank slot: "
+                        "Vision placeholder offset is outside its packed rank slot: "
                         f"dp_rank={dp_rank}, req_base={req_base}, offset={o}, "
                         f"per_dp_token={per_dp_token}."
                     )
@@ -3046,17 +3046,17 @@ def build_mm_embed_plan(
 ) -> MultimodalEmbedPlan | None:
     """Build the owning-rank DP multimodal embed plan (host-side, numpy).
 
-    Round-loop: process images one-per-rank-per-round. ``n_rounds`` = max over
-    ranks of (#images that rank owns). Ranks with fewer images use a dummy lane
+    Round-loop: process vision items one-per-rank-per-round. ``n_rounds`` = max over
+    ranks of (#vision items that rank owns). Ranks with fewer items use a dummy lane
     that contributes nothing (grid/pixels zero, mask all False). Each round runs
-    ONE single-image ViT per rank.
+    ONE single-item ViT per rank.
 
-    Returns ``None`` for batches with no image items.
+    Returns ``None`` for batches with no vision items.
 
     # TODO: bucket the vision patch and per-arch metadata axes; this
     #   uses the per-forward cross-rank max for stable shapes within one call.
     """
-    # Keep each image item bound to its request's packed-slot offset. The merge
+    # Keep each vision item bound to its request's packed-slot offset. The merge
     # builder translates item-local offsets with that req_base, so request
     # boundaries must be preserved here.
     items_by_rank: list[list[tuple[Any, int]]] = [[] for _ in range(dp_size)]
@@ -3071,7 +3071,7 @@ def build_mm_embed_plan(
             mm_items = _extract_mm_value(req.mm_inputs, "mm_items") or []
             for raw_item in mm_items:
                 item = _as_mm_item(raw_item)
-                if item.is_image():
+                if item.is_image() or item.is_video():
                     items_by_rank[dp_rank].append((item, req_base))
             # Advance by how many tokens this req contributes to the slot (the
             # extend window, == len(fill_ids) - len(prefix_indices)).
@@ -3082,7 +3082,7 @@ def build_mm_embed_plan(
         return None
 
     # Resolve the per-arch metadata builder only after confirming this batch has
-    # image items, so non-image multimodal batches do not require a vision builder.
+    # vision items, so non-vision multimodal batches do not require a vision builder.
     from sgl_jax.srt.multimodal.common.vision_metadata import (
         resolve_vision_metadata_builder,
     )
@@ -3110,11 +3110,11 @@ def build_mm_embed_plan(
                 continue
             feat = item.feature
             if feat is None:
-                raise ValueError(f"IMAGE item in round {k}, dp_rank {r} is missing feature.")
+                raise ValueError(f"Vision item in round {k}, dp_rank {r} is missing feature.")
             feat = np.asarray(feat)
             if feat.ndim != 2 or feat.shape[0] <= 0:
                 raise ValueError(
-                    "IMAGE item feature must be a non-empty 2D patch array, "
+                    "Vision item feature must be a non-empty 2D patch array, "
                     f"got shape={feat.shape} in round {k}, dp_rank {r}."
                 )
             features[r] = feat

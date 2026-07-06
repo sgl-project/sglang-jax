@@ -44,26 +44,32 @@ class Qwen25VLVisionMetadata:
 
 
 def _item_grid_thw(item: MultimodalDataItem) -> tuple:
-    """First ``(t, h, w)`` of this item's ``image_grid_thw`` as a python-int tuple.
+    """First ``(t, h, w)`` of this vision item's grid metadata as a python-int tuple.
 
     Qwen-specific: the builder pulls its geometry FROM the item here, so the
     common ``get_metadata(item)`` interface stays arch-agnostic.
     """
     grid = item.get("image_grid_thw")
+    grid_key = "image_grid_thw"
     if grid is None:
-        raise ValueError("Qwen2.5-VL image item is missing image_grid_thw metadata.")
+        grid = item.get("video_grid_thw")
+        grid_key = "video_grid_thw"
+    if grid is None:
+        raise ValueError(
+            "Qwen2.5-VL vision item is missing image_grid_thw/video_grid_thw metadata."
+        )
     arr = np.asarray(grid)
     if arr.size == 0:
-        raise ValueError("Qwen2.5-VL image_grid_thw metadata is empty.")
+        raise ValueError(f"Qwen2.5-VL {grid_key} metadata is empty.")
     if arr.ndim > 1 and arr.shape[0] != 1:
         raise ValueError(
-            "Qwen2.5-VL image item must carry exactly one image_grid_thw row, "
+            f"Qwen2.5-VL vision item must carry exactly one {grid_key} row, "
             f"got shape={arr.shape}."
         )
     row = arr if arr.ndim == 1 else arr[0]
     row = np.asarray(row).reshape(-1)
     if row.shape[0] != 3:
-        raise ValueError(f"Qwen2.5-VL image_grid_thw must contain (t, h, w), got {row}.")
+        raise ValueError(f"Qwen2.5-VL {grid_key} must contain (t, h, w), got {row}.")
     return (int(row[0]), int(row[1]), int(row[2]))
 
 

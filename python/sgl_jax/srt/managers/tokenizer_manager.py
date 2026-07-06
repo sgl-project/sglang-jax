@@ -347,9 +347,9 @@ class TokenizerManager:
                 raise ValueError(
                     "Multimodal input was provided, but the model has no multimodal processor."
                 )
-            if obj.video_data is not None or obj.audio_data is not None:
+            if obj.audio_data is not None:
                 raise ValueError(
-                    "Only image input is supported by the current multimodal processor."
+                    "Audio input is not supported by the current multimodal processor."
                 )
             self._validate_mm_limits(obj)
             mm_inputs = await self.mm_processor.process_mm_data_async(
