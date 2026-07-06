@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import os
 from contextlib import contextmanager
 from functools import partial
 from typing import NamedTuple
@@ -20,6 +22,8 @@ from sgl_jax.srt.speculative.relay_buffer import (
     make_dp_valid_mask,
     update_spec_relay_buffers,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class GreedyDraftInputs(NamedTuple):
@@ -1795,6 +1799,8 @@ def spec_decode_verify(spec_worker, model_worker_batch, cur_allocate_lens):
         getattr(model_worker_batch, "return_logprob", False)
         or getattr(model_worker_batch, "return_output_logprob_only", False)
     )
+    dump_verify = os.environ.get("SGL_JAX_VERIFYDUMP") == "1"
+    return_target_logits = return_target_logits or dump_verify
 
     spec_info.allocate_lens = cur_allocate_lens
     spec_info.prepare_for_verify(model_worker_batch, spec_worker.page_size, target_worker)
@@ -1908,6 +1914,12 @@ def spec_decode_verify(spec_worker, model_worker_batch, cur_allocate_lens):
         cache_miss_count = count()
 
     target_mr.memory_pools.replace_all(target_pool_updates)
+
+    if dump_verify and target_logits is not None:
+        target_argmax = np.asarray(jax.device_get(jnp.argmax(target_logits, axis=-1)))
+        logger.info(
+            "[VERIFYDUMP] fused verify_forward argmax per draft pos = %s", target_argmax[:8]
+        )
 
     next_draft_input = EagleDraftInput(
         verified_id=prepared_verified_id,

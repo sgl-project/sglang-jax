@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import logging
 import os
 import threading
 from abc import ABC, abstractmethod
@@ -13,6 +14,8 @@ from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.speculative.overlap_utils import use_legacy_eagle3_non_overlap
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
@@ -318,6 +321,14 @@ class BaseSpecWorker:
         logits_output, _, cache_miss_count = self.target_worker.forward_batch_generation(
             model_worker_batch, skip_sample=True, forward_metadata=forward_metadata
         )
+        if os.environ.get("SGL_JAX_VERIFYDUMP") == "1":
+            target_argmax = np.asarray(
+                jax.device_get(jnp.argmax(logits_output.next_token_logits, axis=-1))
+            )
+            logger.info(
+                "[VERIFYDUMP] verify_forward argmax per draft pos = %s",
+                target_argmax[:8],
+            )
         logits_output.next_token_logits, logits_output.hidden_states = replicate_to_mesh(
             self.mesh, logits_output.next_token_logits, logits_output.hidden_states
         )

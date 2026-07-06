@@ -1,4 +1,5 @@
 import logging
+import os
 from dataclasses import dataclass
 
 import jax
@@ -23,6 +24,17 @@ from sgl_jax.srt.utils.jax_utils import device_array
 from sgl_jax.srt.utils.profiling_utils import named_scope
 
 logger = logging.getLogger(__name__)
+
+_VERIFY_DUMP_SEEN = False
+
+
+def _debug_host_array(value, limit: int = 8):
+    if value is None:
+        return None
+    try:
+        return np.asarray(jax.device_get(value))[:limit]
+    except Exception as exc:  # pragma: no cover - debug-only path
+        return f"<unavailable: {type(exc).__name__}: {exc}>"
 
 
 def _per_dp_cumsum(lens, dp_size: int, per_dp_bs: int) -> np.ndarray:
@@ -533,6 +545,31 @@ class FlashAttention(AttentionBackend):
             page_indices_arg = self.forward_metadata.swa_page_indices
         elif hasattr(token_to_kv_pool, "remap_cache_loc") and self.page_size == 1:
             page_indices_arg = token_to_kv_pool.remap_cache_loc(page_indices_arg, layer.layer_id)
+
+        global _VERIFY_DUMP_SEEN
+        if (
+            os.environ.get("SGL_JAX_VERIFYDUMP") == "1"
+            and not _VERIFY_DUMP_SEEN
+            and forward_batch is not None
+            and forward_batch.forward_mode.is_target_verify()
+            and is_swa_layer
+            and layer.layer_id in (0, 1)
+        ):
+            _VERIFY_DUMP_SEEN = True
+            logger.info(
+                "[VERIFYDUMP] layer=%s swa_win=%s used_swa_pages=%s "
+                "custom_mask_is_none=%s cu_q_lens[:8]=%s cu_kv_lens[:8]=%s "
+                "seq_lens[:8]=%s positions[:8]=%s page_idx[:8]=%s",
+                layer.layer_id,
+                layer.sliding_window_size,
+                self.forward_metadata.swa_page_indices is not None,
+                self.forward_metadata.custom_mask is None,
+                _debug_host_array(self.forward_metadata.cu_q_lens),
+                _debug_host_array(self.forward_metadata.cu_kv_lens),
+                _debug_host_array(self.forward_metadata.seq_lens),
+                _debug_host_array(forward_batch.positions),
+                _debug_host_array(page_indices_arg),
+            )
 
         in_specs = (
             P(self.attention_data_partition_axis, self.kv_partition_axis),  # queries
