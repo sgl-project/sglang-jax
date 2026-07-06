@@ -619,9 +619,18 @@ class Qwen3_5MoeForConditionalGeneration(nnx.Module):
     # Weight loading
     # ------------------------------------------------------------------
     def _put(self, arr, spec):
-        """Host array -> sharded bf16 device array under the model mesh."""
-        return jax.device_put(
-            jnp.asarray(arr, dtype=self.dtype), NamedSharding(self.mesh, P(*spec))
+        """Host array -> sharded device array under the model mesh.
+
+        Uses make_array_from_callback so each host uploads only its local
+        shard; jax.device_put on a host-replicated array triggers a
+        multihost assert_equal -> process_allgather (16 hosts * 1.5G MoE
+        gate_up = 24G per device -> OOM on 122B/v6e-64). Matches the
+        pattern in weight_utils.py (see comment at :678).
+        """
+        sharding = NamedSharding(self.mesh, P(*spec))
+        arr = np.asarray(arr)
+        return jax.make_array_from_callback(arr.shape, sharding, lambda idx: arr[idx]).astype(
+            self.dtype
         )
 
     @staticmethod
