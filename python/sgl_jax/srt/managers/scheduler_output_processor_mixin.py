@@ -117,7 +117,7 @@ class SchedulerOutputProcessorMixin:
             result.extend_logprob_start_len_per_req,
             result.cache_miss_count,
         )
-        if self.enable_overlap:
+        if self.enable_overlap and not self.pd:
             if self.spec_algorithm is not None and not self.spec_algorithm.is_none():
                 next_token_ids = resolve_spec_prefill_token_ids(result)
                 if launch_done is not None:

@@ -99,6 +99,12 @@ class ServerArgs:
     # Runtime options
     device: str | None = None
     device_indexes: list[int] | None = None
+    pd_disaggregation: str = ""
+    pd_prefill_mem_fraction: float = 0.85
+    pd_decode_mem_fraction: float = 0.85
+    pd_prefill_max_tokens: int = 20480
+    pd_decode_max_tokens: int = 25600
+    pd_num_prefill: int = 1
     tp_size: int = 1
     ep_size: int = 1
     ep_num_redundant_experts: int = 0
@@ -387,6 +393,11 @@ class ServerArgs:
             raise ValueError(
                 f"--disaggregation-mode must be one of {valid_modes}, "
                 f"got {self.disaggregation_mode!r}"
+            )
+        if self.pd_disaggregation and self.disaggregation_mode != "null":
+            raise ValueError(
+                "--pd-disaggregation (single-controller) and --disaggregation-mode "
+                "(multi-process) are mutually exclusive"
             )
         if self.disaggregation_mode != "null":
             if self.disaggregation_bootstrap_url is None:
@@ -771,6 +782,47 @@ class ServerArgs:
             type=int,
             nargs="+",
             help="The device indexes to use build mesh. Defaults is all if not specified.",
+        )
+        parser.add_argument(
+            "--pd-disaggregation",
+            dest="pd_disaggregation",
+            nargs="?",
+            const="pathways",
+            default="",
+            choices=["", "pathways"],
+            help="In-process P/D split: 'pathways' = single-controller cross-slice "
+            "IFRT device_put (requires Pathways proxy backend + >=2 slices).",
+        )
+        parser.add_argument(
+            "--pd-prefill-mem-fraction",
+            dest="pd_prefill_mem_fraction",
+            type=float,
+            default=ServerArgs.pd_prefill_mem_fraction,
+        )
+        parser.add_argument(
+            "--pd-decode-mem-fraction",
+            dest="pd_decode_mem_fraction",
+            type=float,
+            default=ServerArgs.pd_decode_mem_fraction,
+        )
+        parser.add_argument(
+            "--pd-prefill-max-tokens",
+            dest="pd_prefill_max_tokens",
+            type=int,
+            default=ServerArgs.pd_prefill_max_tokens,
+        )
+        parser.add_argument(
+            "--pd-decode-max-tokens",
+            dest="pd_decode_max_tokens",
+            type=int,
+            default=ServerArgs.pd_decode_max_tokens,
+        )
+        parser.add_argument(
+            "--pd-num-prefill",
+            dest="pd_num_prefill",
+            type=int,
+            default=ServerArgs.pd_num_prefill,
+            help="Number of prefill slices for pathways PD (Stage 6 multi-P).",
         )
 
         parser.add_argument(

@@ -33,6 +33,12 @@ from sgl_jax.srt.configs.model_config import ModelConfig
 
 logger = logging.getLogger(__name__)
 
+# Pathways PD: cache loaded MoE weights so the second ModelRunner (D worker)
+# can cross-slice device_put from the first (P worker) instead of re-reading
+# ~700GB from PVC. Keyed by target_path; value is the on-device jax.Array
+# (post-convert, post-astype). Enabled via SGLANG_PD_WEIGHT_CACHE=1.
+_PD_WEIGHT_CACHE: dict[str, "jax.Array"] = {}
+
 if not hasattr(np, "float8_e4m3fn"):
     np.float8_e4m3fn = ml_dtypes.float8_e4m3fn
 if not hasattr(np, "float8_e5m2"):
@@ -1384,6 +1390,29 @@ class WeightLoader:
             result = jnp.transpose(result, (0, 2, 1))
         return result
 
+    def _pd_remap_sharding(self, src_shd):
+        """Rebuild a NamedSharding whose mesh devices are positionally remapped
+        from the cached (P-slice) mesh to self.mesh's slice. Keeps mesh shape,
+        axis_names, axis_types and spec — only swaps devices."""
+        if not isinstance(src_shd, jax.sharding.NamedSharding):
+            return jax.sharding.NamedSharding(self.mesh, P())
+        cache: dict[int, jax.sharding.Mesh] | None = getattr(self, "_pd_mesh_cache", None)
+        if cache is None:
+            cache = self._pd_mesh_cache = {}
+            src_devs = sorted({d for d in src_shd.mesh.devices.flatten()}, key=lambda d: d.id)
+            dst_devs = sorted(self.mesh.devices.flatten(), key=lambda d: d.id)
+            self._pd_dev_map = {p.id: d for p, d in zip(src_devs, dst_devs)}
+        pm = src_shd.mesh
+        key = id(pm)
+        if key not in cache:
+            new_devs = np.empty(pm.devices.shape, dtype=object)
+            for idx in np.ndindex(pm.devices.shape):
+                new_devs[idx] = self._pd_dev_map[pm.devices[idx].id]  # type: ignore[union-attr]
+            cache[key] = jax.sharding.Mesh(
+                new_devs, axis_names=pm.axis_names, axis_types=pm.axis_types
+            )
+        return jax.sharding.NamedSharding(cache[key], src_shd.spec)
+
     def _create_stacked_moe_lazy_tensor(
         self,
         expected_hf_keys: list[str],
@@ -1417,17 +1446,18 @@ class WeightLoader:
         # meaning each callback loads the full tensor. Deferring avoids the
         # costly strided memcpy from np.transpose on non-contiguous views.
         defer_transpose = False
-        if do_transpose and len(single_expert_shape) >= 2 and target_sharding is not None:
+        weight_dims_unsharded = False
+        if target_sharding is not None:
             spec = target_sharding.spec
-            # spec[0] is expert dim sharding, spec[1:] are weight dims
-            weight_dims_unsharded = all(s is None for s in spec[1:])
-            if weight_dims_unsharded:
-                defer_transpose = True
-                logger.info(
-                    "MoE defer_transpose=True: will load in HF layout and "
-                    "transpose on TPU (shape=%s)",
-                    single_expert_shape,
-                )
+            mesh_shape = target_sharding.mesh.shape
+            weight_dims_unsharded = all(s is None or mesh_shape.get(s, 1) == 1 for s in spec[1:])
+        if do_transpose and len(single_expert_shape) >= 2 and weight_dims_unsharded:
+            defer_transpose = True
+            logger.info(
+                "MoE defer_transpose=True: will load in HF layout and "
+                "transpose on TPU (shape=%s)",
+                single_expert_shape,
+            )
 
         # Check if bulk raw byte reading is possible (byte offsets available
         # from scan phase). This eliminates per-expert safetensors API calls
@@ -1439,8 +1469,9 @@ class WeightLoader:
             _expert_elems *= d
         _expert_bytes_est = _expert_elems * (1 if st_dtype.startswith("F8_") else 4)
         _BULK_READ_MIN_BYTES = 1024 * 1024  # 1 MB per expert
+        _bulk_nontranspose = os.environ.get("SGLANG_MOE_BULK_READ", "0") == "1"
         bulk_read = (
-            defer_transpose
+            (defer_transpose or (_bulk_nontranspose and not do_transpose and weight_dims_unsharded))
             and _expert_bytes_est >= _BULK_READ_MIN_BYTES
             and all(
                 "byte_offset" in weight_info[expected_hf_keys[i]][0]
@@ -1624,7 +1655,7 @@ class WeightLoader:
             if len(_callback_times) == 1 and _thread_stats["get_slice"]:
                 n = len(_thread_stats["get_slice"])
                 unique_files = len(set(_thread_files))
-                logger.debug(
+                logger.info(
                     "MoE callback[0] threads: n=%d unique_files=%d "
                     "get_handle=%.4fs get_slice(sum=%.2fs avg=%.4fs max=%.4fs) "
                     "fp8=%.4fs transpose(sum=%.2fs avg=%.4fs) copy=%.4fs",
@@ -1766,7 +1797,7 @@ class WeightLoader:
             )
             t_callback = time.monotonic() - t0
 
-            logger.debug(
+            logger.info(
                 "MoE host-bulk load: shape=%s dtype=%s "
                 "io=%.2fs (%.1f MB, %.1f MB/s) "
                 "assemble+put=%.2fs total=%.2fs "
@@ -1782,6 +1813,14 @@ class WeightLoader:
                 len(file_groups),
                 n_local,
             )
+            if os.environ.get("SGLANG_MOE_BULK_BLOCK") == "1":
+                # Pathways single-controller: device_put to remote workers is
+                # async via IFRT proxy; without blocking the host shard buffers
+                # accumulate across all groups (~963G for V2.5-Pro) and evict
+                # the c4-192 head node. Block per group to bound host RSS.
+                jax.block_until_ready(result)
+                expert_data_map.clear()
+                del per_device_arrays
         else:
             # Pre-warm safetensors file handles to avoid cold-start latency
             # during serial callbacks. This is especially important for small
@@ -1819,7 +1858,7 @@ class WeightLoader:
         t_defer = time.monotonic() - t2
         if _callback_times:
             defer_msg = f" defer_transpose={t_defer:.3f}s" if defer_transpose else ""
-            logger.debug(
+            logger.info(
                 "MoE tensor load: shape=%s dtype=%s callbacks=%d "
                 "callback_total=%.2fs (min=%.3fs max=%.3fs) "
                 "make_array=%.2fs astype=%.2fs workers=%d%s",
@@ -2101,6 +2140,23 @@ class WeightLoader:
                         # Standard Sharding
                         final_sharding = jax.sharding.NamedSharding(self.mesh, P(*mapping.sharding))
 
+                    target_path = mapping.target_path[0]
+                    _pd_cache = os.environ.get("SGLANG_PD_WEIGHT_CACHE") == "1"
+                    if _pd_cache and target_path in _PD_WEIGHT_CACHE:
+                        _t0 = time.monotonic()
+                        cached = _PD_WEIGHT_CACHE[target_path]
+                        model_param = self._get_param(params, target_path)
+                        model_param.value = jax.device_put(
+                            cached, self._pd_remap_sharding(cached.sharding)
+                        )
+                        logger.info(
+                            "MoE group %s: PD cache hit, cross-slice put %.2fs shape=%s",
+                            moe_key,
+                            time.monotonic() - _t0,
+                            cached.shape,
+                        )
+                        continue
+
                     # 2. Call creator
                     _t_load_start = time.monotonic()
                     stacked_weight = self._create_stacked_moe_lazy_tensor(
@@ -2122,13 +2178,14 @@ class WeightLoader:
                         stacked_weight = jnp.repeat(stacked_weight, times, axis=axis)
 
                     # 3. Direct assignment
-                    target_path = mapping.target_path[0]
                     model_param = self._get_param(params, target_path)
+                    _t_conv_start = time.monotonic()
                     stacked_weight = self._maybe_convert_epmoe_scale_for_kernel(
                         stacked_weight,
                         model_param,
                         target_path,
                     )
+                    _t_conv = time.monotonic() - _t_conv_start
 
                     if is_static_quant and moe_key.endswith("_scale"):
                         logger.debug(
@@ -2151,13 +2208,16 @@ class WeightLoader:
                         else:
                             model_param.value = stacked_weight.astype(model_param.value.dtype)
                         _t_assign = time.monotonic() - _t_assign_start
-                        logger.debug(
-                            "MoE group %s: load=%.2fs assign=%.2fs total=%.2fs "
+                        if _pd_cache:
+                            _PD_WEIGHT_CACHE[target_path] = model_param.value
+                        logger.info(
+                            "MoE group %s: load=%.2fs conv=%.2fs assign=%.2fs total=%.2fs "
                             "shape=%s sharding=%s",
                             moe_key,
                             _t_load,
+                            _t_conv,
                             _t_assign,
-                            _t_load + _t_assign,
+                            _t_load + _t_conv + _t_assign,
                             loaded_shape,
                             mapping.sharding,
                         )
@@ -2324,38 +2384,13 @@ class WeightLoader:
 
             sharding_spec = P(*mapping.sharding) if mapping.sharding else P()
             sharding = jax.sharding.NamedSharding(self.mesh, sharding_spec)
-
-            def make_shard(indices, shape=shape, dtype=dtype):
-                shard_shape = []
-                for dim_size, idx in zip(shape, indices):
-                    if isinstance(idx, slice):
-                        start, stop, step = idx.indices(dim_size)
-                        assert step == 1, f"Non-unit step not supported: {idx}"
-                        shard_shape.append(stop - start)
-                    else:
-                        shard_shape.append(1)
-                shard_shape = tuple(shard_shape)
-
-                rng = np.random.default_rng(seed)
-                if jnp.issubdtype(dtype, jnp.floating):
-                    gen_dtype: np.dtype[Any]
-                    if dtype == jnp.bfloat16:
-                        gen_dtype = np.dtype(np.float32)
-                    else:
-                        gen_dtype = np.dtype(
-                            {
-                                jnp.float16: np.float16,
-                                jnp.float32: np.float32,
-                                jnp.float64: np.float64,
-                            }.get(dtype, np.float32)
-                        )
-                    arr_np = rng.uniform(-1e-3, 1e-3, size=shard_shape).astype(gen_dtype)
-                    return jnp.asarray(arr_np, dtype=dtype)
-                else:
-                    return jnp.zeros(shard_shape, dtype=dtype)
-
-            dummy_weight = jax.make_array_from_callback(shape, sharding, make_shard)
-            model_param.value = dummy_weight
+            # jit(zeros) compiles to a device-side XLA constant -> 0 H2D. The
+            # original make_array_from_callback path serializes ndev host
+            # callbacks per param under Pathways IFRT (ocean_remote_python.py
+            # iterates devices synchronously) -> ~27K RPCs for a 78L MoE.
+            model_param.value = jax.jit(
+                lambda s=shape, d=dtype: jnp.zeros(s, dtype=d), out_shardings=sharding
+            )()
             logger.debug(
                 "Generated dummy weight for %s, shape=%s, sharding=%s",
                 target_path,
@@ -2379,53 +2414,12 @@ class WeightLoader:
 
             full_shape = model_param.value.shape
             num_experts = full_shape[0]
-            expert_weight_shape = full_shape[1:]
             dtype = model_param.value.dtype
-
-            collected_weights = []
-            for expert_idx in range(num_experts):
-                expert_sharding_tuple: tuple[Any, ...] | None
-                if mapping.sharding and "expert" in mapping.sharding:
-                    expert_sharding_tuple = tuple(s for s in mapping.sharding if s != "expert")
-                else:
-                    expert_sharding_tuple = mapping.sharding
-
-                expert_sharding_spec = P(*expert_sharding_tuple) if expert_sharding_tuple else P()
-                expert_sharding = jax.sharding.NamedSharding(self.mesh, expert_sharding_spec)
-
-                def make_expert_shard(
-                    indices, weight_shape=expert_weight_shape, weight_dtype=dtype, idx=expert_idx
-                ):
-                    shard_shape = []
-                    for dim_size, idx_val in zip(weight_shape, indices):
-                        if isinstance(idx_val, slice):
-                            start, stop, step = idx_val.indices(dim_size)
-                            assert step == 1, f"Non-unit step not supported: {idx_val}"
-                            shard_shape.append(stop - start)
-                        else:
-                            shard_shape.append(1)
-                    shard_shape = tuple(shard_shape)
-
-                    rng = np.random.default_rng(seed + idx)
-                    if jnp.issubdtype(weight_dtype, jnp.floating):
-                        gen_dtype = np.float32 if weight_dtype == jnp.bfloat16 else weight_dtype
-                        arr_np = rng.uniform(-1e-3, 1e-3, size=shard_shape).astype(gen_dtype)
-                        return jnp.asarray(arr_np, dtype=weight_dtype)
-                    else:
-                        return jnp.zeros(shard_shape, dtype=weight_dtype)
-
-                expert_weight = jax.make_array_from_callback(
-                    expert_weight_shape, expert_sharding, make_expert_shard
-                )
-                collected_weights.append(expert_weight)
-
-            stacked_weight = jnp.stack(collected_weights, axis=0)
 
             if mapping.sharding and "expert" in mapping.sharding:
                 ep_size = getattr(self.model_config.hf_config, "ep_size", 1)
                 world_size = self.mesh.shape.get("data", 1) * self.mesh.shape.get("tensor", 1)
                 tp_size = world_size // ep_size
-
                 devices = self.mesh.devices.flatten()
                 moe_mesh = jax.sharding.Mesh(
                     devices.reshape(ep_size, tp_size),
@@ -2435,14 +2429,15 @@ class WeightLoader:
                         jax.sharding.AxisType.Explicit,
                     ),
                 )
-                final_sharding_spec = P(*mapping.sharding)
-                final_sharding = jax.sharding.NamedSharding(moe_mesh, final_sharding_spec)
+                final_sharding = jax.sharding.NamedSharding(moe_mesh, P(*mapping.sharding))
             else:
-                final_sharding_spec = P(*mapping.sharding) if mapping.sharding else P()
-                final_sharding = jax.sharding.NamedSharding(self.mesh, final_sharding_spec)
+                spec = P(*mapping.sharding) if mapping.sharding else P()
+                final_sharding = jax.sharding.NamedSharding(self.mesh, spec)
 
-            sharded_weight = jax.device_put(stacked_weight, final_sharding)
-            model_param.value = sharded_weight.astype(dtype)
+            model_param.value = jax.jit(
+                lambda s=full_shape, d=dtype: jnp.zeros(s, dtype=d),
+                out_shardings=final_sharding,
+            )()
 
             logger.debug(
                 "Generated dummy MOE weight for %s, shape=%s, num_experts=%s, sharding=%s",
@@ -2451,6 +2446,40 @@ class WeightLoader:
                 num_experts,
                 mapping.sharding,
             )
+
+        # Fallback: fill any param the mappings missed (e.g. quant target_path
+        # points at .weight_q but the eval_shape model built a LinearBase with
+        # .weight, so the mapping lookup KeyError'd and skipped).
+        n_fallback = 0
+        flat, _ = jax.tree_util.tree_flatten_with_path(
+            params, is_leaf=lambda x: isinstance(x, nnx.VariableState)
+        )
+        for path, leaf in flat:
+            if not isinstance(leaf, nnx.VariableState):
+                continue
+            v = leaf.value
+            if not isinstance(v, jax.ShapeDtypeStruct):
+                continue
+            # eval_shape leaves AbstractMesh shardings that jit can't lower.
+            # Keep the spec (so large projs stay sharded) but rebind to the
+            # concrete self.mesh; drop spec only if it names axes self.mesh
+            # doesn't have (e.g. "expert").
+            spec = getattr(getattr(v, "sharding", None), "spec", None) or P()
+            mesh_axes = set(self.mesh.axis_names)
+            for a in spec:
+                if a is None:
+                    continue
+                names = (a,) if isinstance(a, str) else a
+                if any(x not in mesh_axes for x in names):
+                    spec = P()
+                    break
+            leaf.value = jax.jit(
+                lambda s=v.shape, d=v.dtype: jnp.zeros(s, d),
+                out_shardings=jax.sharding.NamedSharding(self.mesh, spec),
+            )()
+            n_fallback += 1
+        if n_fallback:
+            logger.info("Dummy fallback filled %d params missed by mappings", n_fallback)
 
         nnx.update(self.model, params)
         logger.info("Dummy weights generated successfully!")

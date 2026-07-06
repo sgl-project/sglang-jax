@@ -29,6 +29,7 @@ from sgl_jax.srt.constrained.base_grammar_backend import (
     create_grammar_backend,
 )
 from sgl_jax.srt.disaggregation.decode import SchedulerDisaggregationDecodeMixin
+from sgl_jax.srt.disaggregation.pathways_scheduler import PathwaysPDSchedulerMixin
 from sgl_jax.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
 from sgl_jax.srt.disaggregation.runtime import install_disaggregation_wiring
 from sgl_jax.srt.hf_transformers_utils import get_tokenizer
@@ -147,6 +148,7 @@ class Scheduler(
     SchedulerMetricsMixin,
     SchedulerDisaggregationPrefillMixin,
     SchedulerDisaggregationDecodeMixin,
+    PathwaysPDSchedulerMixin,
 ):
     """
     A scheduler that manages a tensor parallel TPU worker, which managaes fixed multi TPU devices.
@@ -296,9 +298,15 @@ class Scheduler(
         platform = os.getenv("JAX_PLATFORMS", None)
         if platform == "proxy":
             pathwaysutils.initialize()
+            from sgl_jax.srt.kernels._pathways_compat import install
 
+            install()
+
+        self.pd = server_args.pd_disaggregation
         if mesh is not None:
             self.mesh = mesh
+        elif self.pd == "pathways":
+            self._pd_make_meshes(server_args)
         else:
             self.mesh = create_device_mesh(
                 ici_parallelism=[self.dp_size, self.tp_size // self.dp_size],
@@ -321,12 +329,16 @@ class Scheduler(
 
         TpWorkerClass = ModelWorkerClient if self.enable_overlap else ModelWorker
 
-        self.tp_worker = TpWorkerClass(
-            server_args=server_args,
-            mesh=self.mesh,
-            model_class=model_class,
-            precompile_params=precompile_params,
-        )
+        self.tp_worker_p = None
+        if self.pd:
+            self._pd_init_workers(server_args, model_class, precompile_params, TpWorkerClass)
+        else:
+            self.tp_worker = TpWorkerClass(
+                server_args=server_args,
+                mesh=self.mesh,
+                model_class=model_class,
+                precompile_params=precompile_params,
+            )
 
         # launch draft worker
         self._spec_multi_layer = False
@@ -482,7 +494,7 @@ class Scheduler(
             ]
         )
 
-        if not server_args.disable_precompile:
+        if not server_args.disable_precompile and not self.pd:
             if self.spec_algorithm is None or self.spec_algorithm.is_none():
                 logger.info("[Scheduler] Begins to run worker precompile.")
                 self.tp_worker.run_precompile()
@@ -912,8 +924,22 @@ class Scheduler(
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and Accelerator computation."""
         self.result_queue = deque()
+        _pd_iter_trace = self.pd == "pathways"
+
+        if self.pd == "pathways":
+            import gc as _gc
+
+            _gc.collect()
+            _gc.freeze()
+            _gc.set_threshold(700, 10, 10000)
+            logger.info(
+                "[pd-gc] gc.freeze() frozen=%d thresholds=%s",
+                _gc.get_freeze_count(),
+                _gc.get_threshold(),
+            )
 
         while True:
+            _it0 = time.perf_counter() if _pd_iter_trace else 0.0
             recv_reqs = (
                 self._comm_backend.recv_requests()
                 if self._comm_backend is not None
@@ -922,6 +948,7 @@ class Scheduler(
             # Assign DP rank to incoming requests
             recv_reqs = self.select_dp_for_request(recv_reqs)
             self.process_input_requests(recv_reqs)
+            _it1 = time.perf_counter() if _pd_iter_trace else 0.0
 
             # Skip batch processing when engine is paused
             if self._engine_paused:
@@ -929,6 +956,7 @@ class Scheduler(
 
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
+            _it2 = time.perf_counter() if _pd_iter_trace else 0.0
 
             if batch:
                 batch.launch_done = threading.Event()
@@ -974,6 +1002,19 @@ class Scheduler(
                 self.new_token_ratio = self.init_new_token_ratio
 
             self.last_batch = batch
+            if _pd_iter_trace:
+                _it3 = time.perf_counter()
+                if _it3 - _it0 > 0.5:
+                    logger.info(
+                        "[pd-iter] total=%.0fms recv=%.0f get_batch=%.0f run+proc=%.0f "
+                        "running=%d inflight=%d",
+                        (_it3 - _it0) * 1e3,
+                        (_it1 - _it0) * 1e3,
+                        (_it2 - _it1) * 1e3,
+                        (_it3 - _it2) * 1e3,
+                        sum(len(i.reqs) for i in self.running_batch.reqs_info),
+                        getattr(self, "_pd_inflight", 0),
+                    )
 
     def run_publisher(self, recv_reqs):
         retry_count = 0
@@ -1549,14 +1590,27 @@ class Scheduler(
         )
 
     def get_next_batch_to_run(self) -> ScheduleBatch | None:
+        if self.pd == "pathways":
+            return self._pd_get_next_batch_async()
+        # PD: retry migrating the batch parked when D pool was full (D running
+        # reqs finishing frees space).
+        if self.pd and self._pd_pending_migrate is not None:  # noqa: SIM102
+            if self._pd_migrate(self._pd_pending_migrate):
+                if self.running_batch.is_empty():
+                    self.running_batch = self._pd_pending_migrate
+                else:
+                    self.running_batch.merge_batch(self._pd_pending_migrate)
+                self._pd_pending_migrate = None
+
         # Process chunked requests for each DP rank
         chunked_req_to_exclude = {}
+        _chunk_tree = self.p_tree if self.pd else self.tree_cache
         for dp_rank in range(self.dp_size):
             if self.chunked_reqs[dp_rank] is not None:
                 # Move the chunked request out of the batch so that we can merge
                 # only finished requests to running_batch.
                 chunked_req_to_exclude[dp_rank] = self.chunked_reqs[dp_rank]
-                self.tree_cache.cache_unfinished_req(self.chunked_reqs[dp_rank])
+                _chunk_tree.cache_unfinished_req(self.chunked_reqs[dp_rank])
 
         # Merge the prefill batch into the running batch
         if self.last_batch and self.last_batch.forward_mode.is_extend():
@@ -1593,7 +1647,11 @@ class Scheduler(
 
             # Merge the new batch into the running batch
             if not self.last_batch.is_empty() and not self.last_batch.is_prefill_only:
-                if self.running_batch.is_empty():
+                if self.pd and not self._pd_migrate(self.last_batch):
+                    # D pool full: park and retry migrate after D reqs finish.
+                    assert self._pd_pending_migrate is None
+                    self._pd_pending_migrate = self.last_batch
+                elif self.running_batch.is_empty():
                     self.running_batch = self.last_batch
                 elif (
                     not self._is_spec_decode_enabled()
@@ -1613,18 +1671,42 @@ class Scheduler(
                 for info in self.running_batch.reqs_info:
                     info.batch_is_full = False
 
-        new_batch = self.get_new_batch_prefill()
+        # decode-first interleave: when enabled, force 1:N decode:prefill ratio
+        # to bound Max ITL by ~prefill_chunk_time instead of letting a burst of
+        # waiting prefills starve running decodes (observed 110s spike at c64).
+        df = getattr(self, "_decode_first_n", None)
+        if df is None:
+            df = int(os.environ.get("SGL_DECODE_FIRST_INTERLEAVE", "0"))
+            self._decode_first_n = df
+            self._consec_decode = 0
+        skip_prefill = (
+            df > 0
+            and not self.running_batch.is_empty()
+            and not self.running_batch.is_prefill_only
+            and self._consec_decode < df
+        )
+        if skip_prefill or (self.pd and self._pd_pending_migrate is not None):
+            new_batch = None
+        elif self.pd:
+            with self._pd_swap_p_pool():
+                new_batch = self.get_new_batch_prefill()
+        else:
+            new_batch = self.get_new_batch_prefill()
 
         if new_batch:
             # Run prefill first if possible
+            self._consec_decode = 0
             ret = new_batch
         else:
             # Run decode (skip for prefill-only batches)
             if not self.running_batch.is_empty() and not self.running_batch.is_prefill_only:
                 self.running_batch = self.update_running_batch(self.running_batch)
                 ret = self.running_batch if not self.running_batch.is_empty() else None
+                if ret is not None:
+                    self._consec_decode += 1
             else:
                 ret = None
+                self._consec_decode = 0
 
         return ret
 
@@ -1933,11 +2015,12 @@ class Scheduler(
 
         # Run forward
         assert self.is_generation
+        _worker = self.tp_worker_p if self.pd and batch.forward_mode.is_extend() else self.tp_worker
         (
             precompile_token_paddings,
             precompile_bs_paddings,
             precompile_cache_loc_paddings,
-        ) = self.tp_worker.get_precompile_paddings()
+        ) = _worker.get_precompile_paddings()
         if self.spec_algorithm is None or self.spec_algorithm.is_none():
             model_worker_batch = batch.get_model_worker_batch(
                 precompile_token_paddings,
@@ -1947,7 +2030,7 @@ class Scheduler(
                 self.server_args.enable_static_lora,
             )
 
-            if self.enable_overlap:
+            if self.enable_overlap and not (self.pd and batch.forward_mode.is_extend()):
                 with jax.profiler.TraceAnnotation(
                     f"forward_batch_generation_overlap {self.forward_ct}"
                 ):
@@ -1960,17 +2043,21 @@ class Scheduler(
                 self._extract_dp_output_ids(next_token_ids, model_worker_batch, batch)
             else:
                 logits_output, next_token_ids_device, cache_miss_count = (
-                    self.tp_worker.forward_batch_generation(
-                        model_worker_batch, sampling_metadata=None
-                    )
+                    _worker.forward_batch_generation(model_worker_batch, sampling_metadata=None)
                 )
-                # In multi-host DP, next_token_ids may span non-addressable
-                # devices.  Replicate first so device_get can proceed.
-                if self.dp_size > 1:
+                if self.pd:
+                    next_token_ids = self._pd_gather_output(
+                        next_token_ids_device, batch.forward_mode.is_extend()
+                    )
+                elif self.dp_size > 1:
+                    # In multi-host DP, next_token_ids may span non-addressable
+                    # devices.  Replicate first so device_get can proceed.
                     from jax.experimental.multihost_utils import process_allgather
 
                     next_token_ids_device = process_allgather(next_token_ids_device, tiled=True)
-                next_token_ids = np.array(jax.device_get(next_token_ids_device))
+                    next_token_ids = np.array(jax.device_get(next_token_ids_device))
+                else:
+                    next_token_ids = np.array(jax.device_get(next_token_ids_device))
                 self._extract_dp_output_ids(next_token_ids, model_worker_batch, batch)
         else:
             (
@@ -2056,6 +2143,10 @@ class Scheduler(
         if batch.forward_mode.is_decode():
             self.process_batch_result_decode(batch, result, launch_done)
         elif batch.forward_mode.is_extend():
+            if self.pd:
+                with self._pd_swap_p_pool():
+                    self.process_batch_result_prefill(batch, result, launch_done)
+                return
             self.process_batch_result_prefill(batch, result, launch_done)
         elif batch.forward_mode.is_idle():
             if self.enable_overlap:

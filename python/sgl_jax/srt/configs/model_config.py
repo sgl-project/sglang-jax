@@ -1,3 +1,4 @@
+import copy
 import json
 import logging
 import os
@@ -122,12 +123,17 @@ class ModelConfig:
 
         config_path = self.model_path
 
-        self.hf_config = get_config(
-            config_path,
-            trust_remote_code=trust_remote_code,
-            revision=revision,
-            model_override_args=self.model_override_args,
-            **kwargs,
+        # get_config is lru_cached; configure_for_tensor_parallel mutates
+        # hf_text_config in-place, so deepcopy to avoid cross-ModelConfig
+        # pollution (e.g. PD disaggregation creates two ModelConfigs).
+        self.hf_config = copy.deepcopy(
+            get_config(
+                config_path,
+                trust_remote_code=trust_remote_code,
+                revision=revision,
+                model_override_args=self.model_override_args,
+                **kwargs,
+            )
         )
 
         if not getattr(self.hf_config, "architectures", None):

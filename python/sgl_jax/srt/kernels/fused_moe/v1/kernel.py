@@ -26,7 +26,12 @@ _A2A_HBM_FRACTION = 0.03
 @functools.lru_cache(maxsize=1)
 def _device_hbm_bytes() -> int:
     """Total HBM bytes on the local device (cached, queried once)."""
-    return jax.local_devices()[0].memory_stats()["bytes_limit"]
+    try:
+        return jax.local_devices()[0].memory_stats()["bytes_limit"]
+    except Exception:
+        # Pathways IFRT-proxy devices reject memory_stats(); fall back to the
+        # v7x per-device limit so a2a_scratch_budget stays sane.
+        return 96 * 1024**3
 
 
 @jax.tree_util.register_pytree_node_class

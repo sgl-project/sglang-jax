@@ -65,9 +65,30 @@ def get_device_hbm_limit() -> int:
 def pathways_hbm_usage_gb(live_arrays, devices: Any) -> list[tuple[float, float]]:
     hbm_used: defaultdict[str, int] = defaultdict(int)
     hbm_limit = get_device_hbm_limit()
+    # Do NOT touch array.addressable_shards: under IFRT proxy that property
+    # materializes one fresh single-device Array per shard which registers in
+    # jax.live_arrays() and is never reclaimed by gc (client holds a strong
+    # ref), so repeated calls leak ~n_params*n_dev wrappers per call and the
+    # next call double-counts every buffer. Compute per-device bytes purely
+    # from sharding metadata (device_set + shard_shape) instead.
     for array in live_arrays:
-        for buffer in array.addressable_shards:
-            hbm_used[buffer.data.device] += buffer.data.nbytes
+        try:
+            shd = array.sharding
+            per_bytes = int(np.prod(shd.shard_shape(array.shape))) * array.dtype.itemsize
+            devs = shd.device_set
+        except Exception:
+            continue
+        for d in devs:
+            hbm_used[d] += per_bytes
+    import logging
+
+    mx = max(hbm_used.values(), default=0)
+    logging.getLogger(__name__).info(
+        "[hbm-proxy] n_live=%d max_used=%.2fGB limit=%.2fGB",
+        len(live_arrays),
+        mx / 1e9,
+        hbm_limit / 1e9,
+    )
     return [(hbm_used[device], hbm_limit) for device in devices]
 
 
@@ -146,6 +167,8 @@ def get_available_device_memory(
     elif "proxy" in device:
         raw_devices = jax.devices()
         devices = filter_devices(raw_devices, device_indexes)
+        if empty_cache:
+            gc.collect()
         live_arrays = jax.live_arrays()
         pathways_hbm_used_mem = pathways_hbm_usage_gb(live_arrays, devices)
         avail_mem = jnp.array(
