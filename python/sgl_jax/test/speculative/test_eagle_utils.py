@@ -14,6 +14,30 @@ from sgl_jax.test.test_utils import CustomTestCase
 
 
 class TestVerifyTree(CustomTestCase):
+    def test_build_chain_verify_mask_matches_prefix_and_chain(self):
+        from sgl_jax.srt.speculative.eagle_util import build_chain_verify_mask
+
+        mask = build_chain_verify_mask(
+            seq_lens=np.array([3, 0, -1], dtype=np.int32),
+            num_verify_tokens=4,
+        )
+
+        expected_req0 = np.array(
+            [
+                [1, 1, 1, 1, 0, 0, 0],
+                [1, 1, 1, 1, 1, 0, 0],
+                [1, 1, 1, 1, 1, 1, 0],
+                [1, 1, 1, 1, 1, 1, 1],
+            ],
+            dtype=np.int32,
+        ).reshape(-1)
+        expected_req1 = np.tril(np.ones((4, 4), dtype=np.int32)).reshape(-1)
+        expected_req2 = np.zeros((4, 3), dtype=np.int32).reshape(-1)
+        np.testing.assert_array_equal(
+            np.asarray(mask),
+            np.concatenate([expected_req0, expected_req1, expected_req2]),
+        )
+
     def test_as_int32_array_keeps_host_metadata_on_host(self):
         from sgl_jax.srt.speculative import eagle_util
 

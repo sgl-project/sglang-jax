@@ -360,6 +360,23 @@ def build_chain_verify_inputs(
     return out
 
 
+def build_chain_verify_mask(seq_lens: np.ndarray, num_verify_tokens: int) -> np.ndarray:
+    seq_lens = np.asarray(seq_lens, dtype=np.int32)
+    q = int(num_verify_tokens)
+    lower = np.tril(np.ones((q, q), dtype=np.int32))
+    masks = []
+    for seq_len in seq_lens:
+        kv_len = int(seq_len) + q
+        if int(seq_len) < 0:
+            masks.append(np.zeros((q, max(kv_len, 0)), dtype=np.int32).reshape(-1))
+            continue
+        prefix = np.ones((q, int(seq_len)), dtype=np.int32)
+        masks.append(np.concatenate([prefix, lower], axis=1).reshape(-1))
+    if not masks:
+        return np.zeros((0,), dtype=np.int32)
+    return np.concatenate(masks).astype(np.int32)
+
+
 @functools.partial(jax.jit, static_argnames=["num_verify_tokens", "batch_size"])
 def build_chain_verify_inputs_device(
     verified_id: jax.Array,

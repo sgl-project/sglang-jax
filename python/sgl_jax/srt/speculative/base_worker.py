@@ -93,6 +93,8 @@ class BaseSpecWorker:
             and self.speculative_num_steps > 1
             and self.speculative_num_draft_tokens == self.speculative_num_steps + 1
         )
+        # Decode relay rebuilds verify metadata inside JIT and cannot repack custom masks yet.
+        self._can_use_fused_spec_decode_overlap = False
 
         self.req_to_token_pool, self.token_to_kv_pool_allocator = target_worker.get_memory_pool()
 
@@ -159,8 +161,8 @@ class BaseSpecWorker:
                 "Spec decode-overlap entry only supports decode batches; "
                 "prefill overlap uses forward_batch_speculative_generation()."
             )
-        if not self._can_use_fused_spec_decode:
-            raise NotImplementedError("Spec overlap entry only supports fused NEXTN topk=1 decode.")
+        if not self._can_use_fused_spec_decode_overlap:
+            raise NotImplementedError("Spec decode-overlap does not support verify custom masks.")
 
         self.init_spec_relay_buffers()
         self._prepare_overlap_sampling_info(model_worker_batch)

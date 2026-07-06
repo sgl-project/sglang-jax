@@ -2151,8 +2151,9 @@ class Scheduler(
                 draft_token_num=self.draft_worker.speculative_num_draft_tokens,
             )
 
-        use_spec_decode_overlap = can_use_spec_decode_overlap(
-            self.enable_overlap, self.spec_algorithm, batch
+        use_spec_decode_overlap = (
+            can_use_spec_decode_overlap(self.enable_overlap, self.spec_algorithm, batch)
+            and self.draft_worker._can_use_fused_spec_decode_overlap
         )
         use_spec_prefill_overlap = can_use_spec_prefill_overlap(
             self.enable_overlap, self.spec_algorithm, batch
