@@ -180,7 +180,7 @@ print()
 | Recurrent State Memory Ratio | 0.9 |
 | Tested build | sglang-jax 0.1.0 |
 
-**Deployment Command** — see [§2.3](#multi-host-gke-indexed-job--tpu-v6e-16) (v6e-16) or [§2.3](#multi-host-gke-indexed-job--tpu-v6e-32-recommended-production) (v6e-32).
+**Deployment Command** — see [§2.3](#multi-host--tpu-v6e-16) (v6e-16) or [§2.3](#multi-host--tpu-v6e-32) (v6e-32).
 
 **Benchmark Command** — example for GSM8K:
 

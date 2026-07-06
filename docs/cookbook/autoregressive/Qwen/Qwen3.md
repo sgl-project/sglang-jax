@@ -320,7 +320,7 @@ To see the full set of `--tool-call-parser` keys available in your build, run `p
 | Tensor Parallelism | 4 |
 | Tested build | sglang-jax 0.1.0 |
 
-**Deployment Command** — same as [§2.3 Single-host](#single-host-docker--tpu-v6e-4).
+**Deployment Command** — same as [§2.3 Single-host](#single-host--tpu-v6e-4).
 
 **Benchmark Command**
 
@@ -360,7 +360,7 @@ evalscope eval \
 
 Methodology: TTFT measured at `output_len=1` to isolate first-token latency; ITL / throughput measured at `output_len=1024`. Workload sweeps input lengths 1024 / 4096 / 8192 tokens × output lengths 1 / 1024 tokens × concurrency 8 / 16 / 32 / 64 / 128 / 256.
 
-**Deployment Command** — same as [§2.3 Single-host](#single-host-docker--tpu-v6e-4) for the SGL-JAX side, with `--disable-radix-cache` added to keep apples-to-apples comparison with vLLM (which doesn't use prefix caching in this run). For the vLLM baseline:
+**Deployment Command** — same as [§2.3 Single-host](#single-host--tpu-v6e-4) for the SGL-JAX side, with `--disable-radix-cache` added to keep apples-to-apples comparison with vLLM (which doesn't use prefix caching in this run). For the vLLM baseline:
 
 ```bash
 MODEL_NAME="Qwen/Qwen3-8B"  # or "Qwen/Qwen3-32B"

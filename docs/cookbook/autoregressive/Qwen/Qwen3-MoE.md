@@ -302,7 +302,7 @@ To see the full set of `--reasoning-parser` / `--tool-call-parser` keys availabl
 | Expert Parallelism | 16 |
 | Tested build | sglang-jax 0.1.0 |
 
-**Deployment Command** — same as [§2.3](#multi-host-gke-indexed-job--tpu-v6e-16-qwen3-30b-a3b).
+**Deployment Command** — same as [§2.3](#multi-host--tpu-v6e-16).
 
 **Benchmark Command** — example for GSM8K (with thinking-on for reasoning):
 

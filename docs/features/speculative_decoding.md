@@ -100,15 +100,10 @@ you have your own EAGLE/EAGLE3 distilled checkpoint, point
 `--speculative-draft-model-path` to that repo and ensure the tokenizer exactly
 matches the target model.
 
-## TODO
+## Known Gaps
 
-- **Performance Tuning:**
-
-the performance optimization is needed, some jnp array operations need move to JIT functions
-
-- **Non-greedy sample Kernel:**
-
-some kernels need to be implemented when verify candidate draft tokens
+- **Performance tuning:** Some array operations in the speculative path still need to move into JIT-compiled functions before treating the path as fully optimized.
+- **Non-greedy sampling:** Kernel coverage for verifying branched candidate tokens is still incomplete. The validated TPU command above uses `--speculative-eagle-topk 1`.
 
 ## Operational tips
 

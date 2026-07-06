@@ -285,7 +285,7 @@ To see the full set of `--reasoning-parser` / `--tool-call-parser` keys availabl
 | Reasoning Parser | `mimo` (thinking-on per-request via `chat_template_kwargs.enable_thinking=true`) |
 | Tested build | sglang-jax 0.1.0 |
 
-**Deployment Command** — same as [§2.3](#single-host-docker--tpu-v6e-4) plus `--reasoning-parser mimo --tool-call-parser mimo`.
+**Deployment Command** — same as [§2.3](#single-host--tpu-v6e-4) plus `--reasoning-parser mimo --tool-call-parser mimo`.
 
 **Benchmark Command**
 
@@ -322,7 +322,7 @@ Recommended additional datasets for reasoning variants: AIME 2025, MATH.
 | Tensor Parallelism | 4 |
 | Tested build | sglang-jax 0.1.0 |
 
-**Deployment Command** — same as [§2.3](#single-host-docker--tpu-v6e-4).
+**Deployment Command** — same as [§2.3](#single-host--tpu-v6e-4).
 
 **Benchmark Command**
 

@@ -112,7 +112,7 @@ print(resp.choices[0].message.content)
 
 > **Use the `-Chat` checkpoint for accuracy eval.** The base `DeepSeek-V2-Lite` ships without a chat template; evalscope's few-shot GSM8K prompt loops indefinitely against `/v1/chat/completions` (observed 0.014 score, `finish_reason: length`). The instruct-tuned `DeepSeek-V2-Lite-Chat` has the chat template and parses `\nThe answer is X` reliably.
 
-**Deployment Command** — same as [§2.3](#single-host-docker--tpu-v6e-4-deepseek-v2-lite) but swap `--model-path` to `deepseek-ai/DeepSeek-V2-Lite-Chat`.
+**Deployment Command** — same as [§2.3](#single-host--tpu-v6e-4-deepseek-v2-lite) but swap `--model-path` to `deepseek-ai/DeepSeek-V2-Lite-Chat`.
 
 **Benchmark Command** — example for GSM8K:
 

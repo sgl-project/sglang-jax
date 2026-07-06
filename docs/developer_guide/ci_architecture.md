@@ -145,41 +145,8 @@ and posts analysis results on the associated PR.
 | e2e-test-4-tpu | 4x TPU | - | Accuracy |
 
 ### Nightly Testing
-Coming soon
-<!--
-#### Comprehensive Weekly Tests (`weekly-test.yml`)
-*Schedule:* Weekly, Sunday 00:00 UTC+8
 
-*Trigger Conditions:*
-- Cron schedule: `0 16 * * 0`
-- Push to `main` when `version.py` changes
-- Manual dispatch
-
-*Test Scenario:*
-- models: Qwen3-8B(enable TP), Qwen3Qwen3-30B-A3B (enable TP, EP), bailing, gemma2
-- MMLU, MMUL-PRO, AIME-24/25, Math-500
-- ISL/OSL: 1k/1k, 4k/1k, 8k/1k, 1k/1, 4k/1, 8k/1
-
-*Jobs:*
-
-| unit-test-1-tpu | 1x TPU | - | All unit test pass|
-| unit-test-4-tpu | 4x TPU | - | All unit test pass|
-| performance-test-1-tpu (including cache miss check) | 1x TPU | - | Latency, Throughput|
-| performance-test-4-tpu (including cache miss check) | 4x TPU | - | Latency, Throughput|
-| accuracy-test-1-tpu | 1x TPU | - | Model Evaluation  |
-| accuracy-test-4-tpu | 4x TPU | - | Model Evaluation  |
-| pallas-kernel-benchmark | 1x TPU | - | Speed |
-| e2e-test-1-tpu | 1x TPU | - | Accuracy |
-| e2e-test-4-tpu | 4x TPU | - | Accuracy |
-
-**[TODO]** *Performance Monitoring:*
-- Traces published to `sgl-jax-ci-data` repository
-- Perfetto UI visualization
-- Historical performance tracking
-
-*Repository Restriction:*
-- Only runs on official ```sgl-project/sglang-jax``` repository
--->
+Nightly workflows are not part of the documented CI surface yet. Add this section when a scheduled workflow exists in `.github/workflows/`, including its schedule, trigger conditions, model set, and artifact locations.
 ### Release Automation
 #### Package Releases (`release-pypi.yml`)
 ##### Main Package Release

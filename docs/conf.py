@@ -41,6 +41,11 @@ suppress_warnings = [
     "misc.highlighting_failure",
 ]
 
+linkcheck_ignore = [
+    r"https://cloud\.google\.com/kubernetes-engine/docs/how-to/cluster-access-for-kubectl.*",
+    r"https://docs\.cloud\.google\.com/kubernetes-engine/docs/how-to/cluster-access-for-kubectl.*",
+]
+
 myst_enable_extensions = [
     "colon_fence",
     "deflist",

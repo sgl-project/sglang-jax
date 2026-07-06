@@ -99,7 +99,7 @@ grep -n 'add_argument' python/sgl_jax/srt/server_args.py
 | `qwen3` (reasoning), `qwen25` / `qwen3_coder` (tool) | _no Qwen recipe currently sets these — pick by model card on a per-checkpoint basis_ |
 | `kimi` (reasoning) | _no Kimi recipe currently sets this_ |
 
-For complete request/response examples see [`mimo-v2.5-pro.md` §5.2](../autoregressive/Xiaomi/MiMo-V2.5-Pro.md#52-reasoning-thinking-enabled) (reasoning streaming) and [§5.3](../autoregressive/Xiaomi/MiMo-V2.5-Pro.md#53-tool-calling) (tool calling).
+For complete request/response examples see [`mimo-v2.5-pro.md` §3.2](../autoregressive/Xiaomi/MiMo-V2.5-Pro.md#32-reasoning-thinking-on-default-thinking-off-optional) (reasoning streaming) and [§3.3](../autoregressive/Xiaomi/MiMo-V2.5-Pro.md#33-tool-calling) (tool calling).
 
 ## 9. Compilation cache (environment, not a flag)
 

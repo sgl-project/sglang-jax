@@ -118,7 +118,7 @@ print(resp.choices[0].message.content)
 | Tensor Parallelism | 4 |
 | Tested build | sglang-jax 0.1.0 |
 
-**Deployment Command** — same as [§2.3 27B-it](#single-host-docker--tpu-v6e-4-gemma-2-27b-it).
+**Deployment Command** — same as [§2.3 27B-it](#single-host--tpu-v6e-4-gemma-2-27b-it).
 
 **Benchmark Command** — example for GSM8K:
 

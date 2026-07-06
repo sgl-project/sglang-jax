@@ -390,7 +390,7 @@ To see the full set of `--tool-call-parser` keys available in your build, run `p
 | Reasoning Parser | `mimo` |
 | Tested build | sglang-jax 0.1.0 |
 
-**Deployment Command** — same as [§2.3 Multi-host](#multi-host-gke-indexed-job--tpu-v6e-16-4-nodes), plus `--reasoning-parser mimo`.
+**Deployment Command** — same as [§2.3 Multi-host](#multi-host--tpu-v6e-16-4-nodes), plus `--reasoning-parser mimo`.
 
 **Benchmark Command**
 
@@ -431,7 +431,7 @@ This recipe uses a **single-workload configuration sweep**: one fixed ISL/OSL/co
 
 **Workload**: 256 prompts, ISL=16384, OSL=1024, concurrency=64 (single fixed cell).
 
-**Deployment Command** — same shape as [§2.3 Single-host](#single-host-docker--tpu-v7x-8), with `--dp-size 1` and the sweep dimensions (`--moe-backend` / `--chunked-prefill-size` / `--swa-full-tokens-ratio` / `--mem-fraction-static`) varied per row.
+**Deployment Command** — same shape as [§2.3 Single-host](#single-host--tpu-v7x-8), with `--dp-size 1` and the sweep dimensions (`--moe-backend` / `--chunked-prefill-size` / `--swa-full-tokens-ratio` / `--mem-fraction-static`) varied per row.
 
 **Benchmark Command**
 

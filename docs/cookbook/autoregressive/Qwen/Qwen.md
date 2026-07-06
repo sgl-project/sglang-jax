@@ -117,7 +117,7 @@ print(resp.choices[0].message.content)
 | Tensor Parallelism | 4 |
 | Tested build | sglang-jax 0.1.0 |
 
-**Deployment Command** — same as [§2.3 Single-host](#single-host-docker--tpu-v6e-4).
+**Deployment Command** — same as [§2.3 Single-host](#single-host--tpu-v6e-4).
 
 **Benchmark Command**
 
@@ -144,7 +144,7 @@ evalscope eval \
 
 **Test Environment** — same as §4.1.
 
-**Deployment Command** — same as [§2.3 Single-host](#single-host-docker--tpu-v6e-4).
+**Deployment Command** — same as [§2.3 Single-host](#single-host--tpu-v6e-4).
 
 **Benchmark Command**
 

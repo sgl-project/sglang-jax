@@ -120,7 +120,7 @@ print(resp.choices[0].message.content)
 | Tensor Parallelism | 16 |
 | Tested build | sglang-jax 0.1.0 |
 
-**Deployment Command** — same as [§2.3 v6e-16](#multi-host-gke-indexed-job--tpu-v6e-16-minimum).
+**Deployment Command** — same as [§2.3 v6e-16](#multi-host--tpu-v6e-16).
 
 **Benchmark Command** — example for GSM8K:
 

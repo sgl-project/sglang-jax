@@ -191,7 +191,7 @@ For non-streaming requests, the field appears on `response.choices[0].message.re
 | Reasoning Parser | deepseek-r1 |
 | Tested build | sglang-jax 0.1.0 |
 
-**Deployment Command** — same as [§2.3](#multi-host-gke-indexed-job--tpu-v6e-64).
+**Deployment Command** — same as [§2.3](#multi-host--tpu-v6e-64).
 
 **Benchmark Command**
 
