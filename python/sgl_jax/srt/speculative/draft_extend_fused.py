@@ -1168,10 +1168,7 @@ def _build_prefill(num_layers: int, topk: int):
 def _prepare_verify(draft_worker, model_worker_batch):
     """Prepare fixed-shape verify placeholders while keeping chain build inside JIT."""
     from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode
-    from sgl_jax.srt.speculative.eagle_util import (
-        EagleVerifyInput,
-        build_chain_verify_mask,
-    )
+    from sgl_jax.srt.speculative.eagle_util import EagleVerifyInput
 
     draft_input = model_worker_batch.spec_info_padded
     use_relay_state = (
@@ -1218,10 +1215,9 @@ def _prepare_verify(draft_worker, model_worker_batch):
     bs = model_worker_batch.seq_lens.shape[0]
     n = draft_worker.speculative_num_draft_tokens
     flat = bs * n
-    verified_seq_lens = np.asarray(model_worker_batch.seq_lens, dtype=np.int32) - 1
     model_worker_batch.spec_info_padded = EagleVerifyInput(
         draft_token=np.zeros((flat,), dtype=np.int32),
-        custom_mask=build_chain_verify_mask(verified_seq_lens, n),
+        custom_mask=None,
         positions=np.zeros((flat,), dtype=np.int32),
         retrive_index=np.zeros((bs, n), dtype=np.int32),
         retrive_next_token=np.zeros((bs, n), dtype=np.int32),

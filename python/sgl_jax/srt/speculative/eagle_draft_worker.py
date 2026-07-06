@@ -22,7 +22,6 @@ from sgl_jax.srt.speculative.eagle_util import (
     EagleVerifyInput,
     build_chain_verify_inputs,
     build_chain_verify_inputs_device,
-    build_chain_verify_mask,
     build_tree_kernel_efficient,
     build_tree_mask_for_draft_decode,
 )
@@ -175,10 +174,7 @@ class EagleDraftWorker(BaseDraftWorker):
             retrive_index = packed[2].reshape(bs, n)
             retrive_next_token = packed[3].reshape(bs, n)
             retrive_next_sibling = packed[4].reshape(bs, n)
-            tree_mask = build_chain_verify_mask(
-                np.asarray(jax.device_get(verified_seq_lens), dtype=np.int32),
-                n,
-            )
+            tree_mask = None
         else:
             max_seq_len = int(np.max(verified_seq_lens)) if verified_seq_lens.size > 0 else 1
             max_context_len = self._pick_context_len(max_seq_len)
