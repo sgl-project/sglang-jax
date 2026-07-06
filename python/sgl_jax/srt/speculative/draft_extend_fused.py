@@ -1943,7 +1943,8 @@ def spec_decode_verify(spec_worker, model_worker_batch, cur_allocate_lens):
         n = draft_worker.speculative_num_draft_tokens
         draft0 = None
         predict0 = None
-        positions0 = None
+        verify_positions0 = None
+        selected_positions0 = None
         emitted0 = None
         if (
             all(
@@ -1958,18 +1959,23 @@ def spec_decode_verify(spec_worker, model_worker_batch, cur_allocate_lens):
                 [pvid_host.reshape(-1)[:1], np.asarray(token_row0, dtype=np.int32)[: n - 1]]
             )
             predict0 = pred_host[:n]
-            positions0 = pos_host[:n]
+            verify_positions0 = (
+                seq_host.reshape(-1)[:1].astype(np.int32) + np.arange(n, dtype=np.int32)
+            ).reshape(-1)
+            selected_positions0 = pos_host[:n]
             emitted0 = pred_host[: int(acc_host[0])] if acc_host.size else None
         logger.info(
             "[VERIFYDUMP] fused verify_forward argmax per draft pos = %s", target_argmax[:8]
         )
         logger.info(
             "[VERIFYDUMP] fused verify trace "
-            "seq_lens[:4]=%s draft0=%s positions0=%s target_predict0=%s "
+            "seq_lens[:4]=%s draft0=%s verify_positions0=%s selected_positions0=%s "
+            "target_predict0=%s "
             "accept_lens[:4]=%s emitted0=%s",
             seq_host[:4] if isinstance(seq_host, np.ndarray) else seq_host,
             draft0,
-            positions0,
+            verify_positions0,
+            selected_positions0,
             predict0,
             acc_host[:4] if isinstance(acc_host, np.ndarray) else acc_host,
             emitted0,
