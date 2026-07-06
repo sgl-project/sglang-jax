@@ -43,7 +43,7 @@ See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU g
 
 ### 2.2 Environment
 
-Install per [Install guide](../../../get_started/install.md) and use [Single-host Docker template](../../deployment/single-host-docker.md) for the container setup.
+Install per [Install guide](../../../get_started/install.md) and use [Single-host Docker template](../../../deployment/single-host-docker.md) for the container setup.
 
 No extra pip package is needed for video generation. The response returns a video path or URL, and any post-processing such as MP4 transcoding happens client-side.
 
@@ -223,4 +223,4 @@ This is a single-shot smoke datapoint, not a throughput sweep. Throughput sweeps
 - [Wan-AI model collection](https://huggingface.co/Wan-AI)
 - [Wan2.2-T2V-A14B-Diffusers model card](https://huggingface.co/Wan-AI/Wan2.2-T2V-A14B-Diffusers)
 - [Launch flags reference](../../base/launch-flags-reference.md)
-- [Cross-recipe troubleshooting](../../troubleshooting.md) — cross-recipe generic issues.
+- [Cross-recipe troubleshooting](../../../deployment/troubleshooting.md) — cross-recipe generic issues.

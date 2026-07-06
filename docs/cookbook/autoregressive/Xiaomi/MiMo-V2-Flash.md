@@ -39,7 +39,7 @@ See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU g
 
 ### 2.2 Environment
 
-Install per [Install guide](../../../get_started/install.md) and use one of the launcher templates from [Deployment templates](../../deployment/).
+Install per [Install guide](../../../get_started/install.md) and use one of the launcher templates from [Deployment templates](../../../deployment/).
 
 Extra pip for accuracy benchmarking only:
 
@@ -56,7 +56,7 @@ Two slices we measured on, each as a separate launch path:
 
 #### Single-host — TPU v7x-8
 
-Boot a TPU container per [Single-host Docker template](../../deployment/single-host-docker.md), then:
+Boot a TPU container per [Single-host Docker template](../../../deployment/single-host-docker.md), then:
 
 ```bash
 JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -u -m sgl_jax.launch_server \
@@ -98,9 +98,9 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -u -m sgl_jax.launch_server \
 
 **Launcher** — wrap the above into GKE:
 
-- **GKE Indexed Job + headless Service** — adapt [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md). Differences from the template: `<JOB>=mimo-v2-flash`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=4x4`, `<N>=4`, `<MODEL_PATH>=XiaomiMiMo/MiMo-V2-Flash`, `<HTTP_PORT>=30000`, plus the launch flags above. `${NODE_RANK}` comes from `${JOB_COMPLETION_INDEX}`.
+- **GKE Indexed Job + headless Service** — adapt [GKE Indexed Job launcher](../../../deployment/gke-indexed-job.md). Differences from the template: `<JOB>=mimo-v2-flash`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=4x4`, `<N>=4`, `<MODEL_PATH>=XiaomiMiMo/MiMo-V2-Flash`, `<HTTP_PORT>=30000`, plus the launch flags above. `${NODE_RANK}` comes from `${JOB_COMPLETION_INDEX}`.
 
-For temporary v6e experiments, advanced users can adapt [SkyPilot launcher](../../deployment/skypilot.md) with the same launch flags.
+For temporary v6e experiments, advanced users can adapt [SkyPilot launcher](../../../deployment/skypilot.md) with the same launch flags.
 
 ### 2.4 Configuration Tips
 
@@ -472,4 +472,4 @@ The fused MoE tuned-config table covers the EP=8 shapes (server logs report `Usi
 - [MiMo-V2-Flash Model Card](https://huggingface.co/XiaomiMiMo/MiMo-V2-Flash)
 - [TPU topology reference](../../base/tpu-topology-reference.md)
 - [Launch flags reference](../../base/launch-flags-reference.md)
-- [Cross-recipe troubleshooting](../../troubleshooting.md) — cross-recipe generic issues.
+- [Cross-recipe troubleshooting](../../../deployment/troubleshooting.md) — cross-recipe generic issues.

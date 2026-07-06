@@ -44,7 +44,7 @@ See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU g
 
 ### 2.2 Environment
 
-Install per [Install guide](../../../get_started/install.md). For the current single-host VL paths use [Single-host Docker template](../../deployment/single-host-docker.md). Qwen2.5-VL 72B multi-host should stay pending until the built-in staging and scheduler path are fixed.
+Install per [Install guide](../../../get_started/install.md). For the current single-host VL paths use [Single-host Docker template](../../../deployment/single-host-docker.md). Qwen2.5-VL 72B multi-host should stay pending until the built-in staging and scheduler path are fixed.
 
 Extra pip for accuracy benchmarking only:
 
@@ -241,4 +241,4 @@ print(response.choices[0].message.content)
 - [Qwen2.5-VL model collection](https://huggingface.co/Qwen)
 - [Qwen3 recipe](Qwen3.md) — text-only Qwen3 dense recipe (Qwen3 series is the reasoning generation).
 - [Launch flags reference](../../base/launch-flags-reference.md)
-- [Cross-recipe troubleshooting](../../troubleshooting.md) — cross-recipe generic issues.
+- [Cross-recipe troubleshooting](../../../deployment/troubleshooting.md) — cross-recipe generic issues.

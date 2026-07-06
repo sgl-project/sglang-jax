@@ -118,25 +118,7 @@
                   "base/tpu-topology-reference",
                   "base/launch-flags-reference"
                 ]
-              },
-              {
-                "group": "Benchmark Reports",
-                "pages": [
-                  "base/benchmarks/index",
-                  "base/benchmarks/qwen3_benchmark",
-                  "base/benchmarks/deepseek-r1-distill-qwen-math500"
-                ]
-              },
-              {
-                "group": "Deployment Templates",
-                "pages": [
-                  "deployment/index",
-                  "deployment/single-host-docker",
-                  "deployment/gke-indexed-job",
-                  "deployment/skypilot"
-                ]
-              },
-              "troubleshooting"
+              }
             ]
           }
         ]

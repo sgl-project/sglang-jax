@@ -2,15 +2,13 @@
 
 The cookbook is the model-oriented documentation surface. It keeps a Mintlify-style structure under `docs/cookbook/` so contributors can add or validate one model recipe without changing the main Sphinx navigation.
 
-Start here:
+The Sphinx build excludes `docs/cookbook/**` intentionally. Keep cookbook navigation inside `docs/cookbook/docs.json`; that file is the source of truth for the cookbook surface.
 
-| Page | Purpose |
-|---|---|
-| [Cookbook index](https://github.com/sgl-project/sglang-jax/blob/main/docs/cookbook/index.md) | Model and hardware coverage overview. |
-| [Add a cookbook recipe](https://github.com/sgl-project/sglang-jax/blob/main/docs/cookbook/CONTRIBUTING.md) | Checklist for adding or validating a model recipe. |
-| [Autoregressive models](https://github.com/sgl-project/sglang-jax/blob/main/docs/cookbook/autoregressive/index.md) | Text and vision-language decoder recipes. |
-| [Diffusion models](https://github.com/sgl-project/sglang-jax/blob/main/docs/cookbook/diffusion/index.md) | Text-to-image/video recipes. |
-| [Benchmark references](https://github.com/sgl-project/sglang-jax/blob/main/docs/cookbook/base/benchmarks/index.md) | Detailed benchmark and evaluation reports. |
-| [Troubleshooting](https://github.com/sgl-project/sglang-jax/blob/main/docs/cookbook/troubleshooting.md) | Cross-recipe failure modes. |
+## Scope
 
-The Sphinx build excludes the cookbook source tree intentionally. Keep cookbook navigation in `docs/cookbook/docs.json`.
+- Model recipes live under `docs/cookbook/autoregressive/` and `docs/cookbook/diffusion/`.
+- Shared recipe references live under `docs/cookbook/base/`.
+- Cookbook contribution rules live in `docs/cookbook/CONTRIBUTING.md`.
+- Cross-cutting launcher templates and troubleshooting live in [Deployment](deployment/index.md), not in the cookbook.
+
+Use the cookbook for model-specific launch commands, validation status, benchmark summaries, and hardware matrices. Use the main Sphinx docs for installation, deployment templates, runtime features, architecture, and developer workflow.

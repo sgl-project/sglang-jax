@@ -4,7 +4,7 @@ title: "Deployment Templates"
 
 # Deployment Templates
 
-Launcher / orchestrator templates referenced by cookbook recipes. Model cookbooks use GKE as the primary path for multi-host serving; SkyPilot remains an advanced v6e experiment path for users who already operate SkyPilot.
+Launcher and orchestrator templates for SGL-JAX serving. Model cookbook recipes link here instead of duplicating full Docker, GKE, or SkyPilot templates.
 
 | Template | When to use |
 |---|---|
@@ -22,4 +22,4 @@ Launcher / orchestrator templates referenced by cookbook recipes. Model cookbook
 
 ## Picking flags
 
-For TP/EP/page-size/SWA-ratio choices, see the per-recipe Key Flags table. For the full flag inventory: [Launch flags reference](../base/launch-flags-reference.md). For TPU generation specs: [TPU topology reference](../base/tpu-topology-reference.md).
+For TP/EP/page-size/SWA-ratio choices, see the per-recipe Key Flags table. For launch flag categories, see [Server Arguments](../features/server_arguments.md). Cookbook-specific TPU generation specs live in `docs/cookbook/base/tpu-topology-reference.md`.

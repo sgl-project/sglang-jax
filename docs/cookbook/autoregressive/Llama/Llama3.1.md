@@ -28,7 +28,7 @@ See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU g
 
 ### 2.2 Environment
 
-Install per [Install guide](../../../get_started/install.md) and use [Single-host Docker template](../../deployment/single-host-docker.md) for the container setup.
+Install per [Install guide](../../../get_started/install.md) and use [Single-host Docker template](../../../deployment/single-host-docker.md) for the container setup.
 
 ### 2.3 Launch
 
@@ -178,4 +178,4 @@ Mean ITL (ms):                           9.87
 
 - [Llama 3.1 8B-Instruct model card](https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct)
 - [Launch flags reference](../../base/launch-flags-reference.md)
-- [Cross-recipe troubleshooting](../../troubleshooting.md) — cross-recipe generic issues.
+- [Cross-recipe troubleshooting](../../../deployment/troubleshooting.md) — cross-recipe generic issues.

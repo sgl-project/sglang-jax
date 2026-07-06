@@ -53,7 +53,7 @@ docker run --rm -it \
 |---|---|
 | `<TAG>` | Pick the image tag matching the recipe's `Tested build`. |
 | `<HF_REPO_OR_LOCAL_PATH>` | HuggingFace repo id (e.g. `Qwen/Qwen-7B-Chat`) or absolute path inside the container. |
-| `<DEVICE_COUNT>` | Total JAX devices on this host. v6e: number of chips. v7x: number of chips × 2 (see [TPU topology reference](../base/tpu-topology-reference.md)). |
+| `<DEVICE_COUNT>` | Total JAX devices on this host. v6e: number of chips. v7x: number of chips x 2. |
 | `<0.88-0.95>` | `--mem-fraction-static`. 0.88 is the TPU default; raise to 0.9–0.95 for dedicated serving with no other processes on the host. |
 
 If you have pre-downloaded weights on the host, add `-v /path/to/models:/models` and point `--model-path` at the in-container mount.
@@ -136,4 +136,4 @@ For multi-host launches (TPU slices spanning more than one node), use [GKE Index
 
 - [GKE Indexed Job launcher](gke-indexed-job.md) — multi-host on Kubernetes.
 - [SkyPilot launcher](skypilot.md) — multi-host via SkyPilot.
-- [Launch flags reference](../base/launch-flags-reference.md) — full launch flag inventory.
+- [Server Arguments](../features/server_arguments.md) — launch flag categories and tuning notes.

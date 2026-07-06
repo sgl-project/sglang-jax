@@ -46,5 +46,5 @@ When adding a page:
 1. Add it to `docs/cookbook/docs.json`.
 2. Add it to the relevant model index, such as `autoregressive/index.md` or `diffusion/index.md`.
 3. Add or update the hardware coverage table in `docs/cookbook/index.md`.
-4. Link long benchmark reports from `docs/cookbook/base/benchmarks/` instead of embedding large matrices in the recipe.
+4. Keep benchmark matrices in the recipe benchmark section or summarize them there; do not create a standalone benchmark-report section.
 5. If the recipe introduces a non-obvious runtime flag, link to `base/launch-flags-reference.md`.

@@ -40,7 +40,7 @@ See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU g
 
 ### 2.2 Environment
 
-Install per [Install guide](../../../get_started/install.md) and use one of the launcher templates from [Deployment templates](../../deployment/).
+Install per [Install guide](../../../get_started/install.md) and use one of the launcher templates from [Deployment templates](../../../deployment/).
 
 The `jax0.8.1-rev1` image is what SGL-JAX's GKE launcher and advanced SkyPilot path use; pinning it keeps the JAX runtime in lockstep with the SGL-JAX `[tpu]` extras.
 
@@ -98,7 +98,7 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -m sgl_jax.launch_server \
 
 `${NODE_RANK}` ranges from `0` to `15`.
 
-For the GKE Indexed Job + headless Service manifest pattern that wraps the launch command, see [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md). For v7x-16 fill in `<JOB>=mimo-v25-pro`, `<ACCELERATOR>=tpu7x`, `<TOPOLOGY>=2x2x4`, `<N>=4`; for v6e-64 fill in `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=4x4x4`, `<N>=16`. Paste the matching launch flags above into `<LAUNCH_FLAGS>`. For temporary v6e experiments, advanced users can adapt [SkyPilot launcher](../../deployment/skypilot.md) with the same launch flags.
+For the GKE Indexed Job + headless Service manifest pattern that wraps the launch command, see [GKE Indexed Job launcher](../../../deployment/gke-indexed-job.md). For v7x-16 fill in `<JOB>=mimo-v25-pro`, `<ACCELERATOR>=tpu7x`, `<TOPOLOGY>=2x2x4`, `<N>=4`; for v6e-64 fill in `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=4x4x4`, `<N>=16`. Paste the matching launch flags above into `<LAUNCH_FLAGS>`. For temporary v6e experiments, advanced users can adapt [SkyPilot launcher](../../../deployment/skypilot.md) with the same launch flags.
 
 ### 2.4 Configuration Tips
 
@@ -532,6 +532,6 @@ Max ITL (ms):                            1290.76
 - [MiMo-V2.5-Pro Model Card](https://huggingface.co/XiaomiMiMo/MiMo-V2.5-Pro)
 - [TPU topology reference](../../base/tpu-topology-reference.md)
 - [Launch flags reference](../../base/launch-flags-reference.md)
-- [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) — primary multi-host launcher.
-- [SkyPilot launcher](../../deployment/skypilot.md) — advanced v6e experiment alternative.
-- [Cross-recipe troubleshooting](../../troubleshooting.md) — cross-recipe generic issues.
+- [GKE Indexed Job launcher](../../../deployment/gke-indexed-job.md) — primary multi-host launcher.
+- [SkyPilot launcher](../../../deployment/skypilot.md) — advanced v6e experiment alternative.
+- [Cross-recipe troubleshooting](../../../deployment/troubleshooting.md) — cross-recipe generic issues.

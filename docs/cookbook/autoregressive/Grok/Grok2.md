@@ -39,7 +39,7 @@ For other slices (larger v6e, v7x variants, scaled-down configs), see [Adapting 
 
 ### 2.2 Environment
 
-Install per [Install guide](../../../get_started/install.md). **Build pin**: use sglang-jax 0.1.0 or later. For multi-host serving, use [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) as the primary user-facing path. Advanced users running temporary v6e experiments can adapt [SkyPilot launcher](../../deployment/skypilot.md).
+Install per [Install guide](../../../get_started/install.md). **Build pin**: use sglang-jax 0.1.0 or later. For multi-host serving, use [GKE Indexed Job launcher](../../../deployment/gke-indexed-job.md) as the primary user-facing path. Advanced users running temporary v6e experiments can adapt [SkyPilot launcher](../../../deployment/skypilot.md).
 
 The community tokenizer is downloaded on first launch — no extra pip needed beyond standard install. For evaluation, additionally install `evalscope`:
 
@@ -51,7 +51,7 @@ pip install evalscope==0.17.1
 
 #### Multi-host — TPU v6e-64
 
-Use [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) with `<JOB>=grok-2`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=8x8`, `parallelism: 16`, `completions: 16`, and `backoffLimit: 16`. Put these model-specific flags into `<LAUNCH_FLAGS>`:
+Use [GKE Indexed Job launcher](../../../deployment/gke-indexed-job.md) with `<JOB>=grok-2`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=8x8`, `parallelism: 16`, `completions: 16`, and `backoffLimit: 16`. Put these model-specific flags into `<LAUNCH_FLAGS>`:
 
 ```bash
   --model-path /models/grok-2 \
@@ -71,7 +71,7 @@ Use [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) with `<JOB>=
 
 Mount a shared `JAX_COMPILATION_CACHE_DIR` on the same PVC as the model weights — first cold compile is ~5-10 min, much faster than 1T-class models since the MoE kernel shape sweep is smaller.
 
-For temporary v6e experiments, advanced users can adapt [SkyPilot launcher](../../deployment/skypilot.md) with the same launch flags. The model recipe does not require users to run repository-local SkyPilot helper scripts.
+For temporary v6e experiments, advanced users can adapt [SkyPilot launcher](../../../deployment/skypilot.md) with the same launch flags. The model recipe does not require users to run repository-local SkyPilot helper scripts.
 
 ### 2.4 Configuration Tips
 
@@ -222,7 +222,7 @@ Max ITL (ms):                            1270.39
 
 - [Grok-2 Model Card](https://huggingface.co/xai-org/grok-2)
 - [Community tokenizer](https://huggingface.co/alvarobartt/grok-2-tokenizer)
-- [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) — primary multi-host launcher template.
-- [SkyPilot launcher](../../deployment/skypilot.md) — advanced v6e experiment alternative.
+- [GKE Indexed Job launcher](../../../deployment/gke-indexed-job.md) — primary multi-host launcher template.
+- [SkyPilot launcher](../../../deployment/skypilot.md) — advanced v6e experiment alternative.
 - [Launch flags reference](../../base/launch-flags-reference.md)
-- [Cross-recipe troubleshooting](../../troubleshooting.md) — cross-recipe generic issues.
+- [Cross-recipe troubleshooting](../../../deployment/troubleshooting.md) — cross-recipe generic issues.

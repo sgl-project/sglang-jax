@@ -102,7 +102,7 @@ Diffusion image/video generation models live in [Diffusion recipes](../diffusion
 | Single-host MoE with backend choice | [`Xiaomi/MiMo-V2-Flash.md`](Xiaomi/MiMo-V2-Flash.md) ✅ |
 | Vision-language chat | [`Qwen/Qwen2.5-VL.md`](Qwen/Qwen2.5-VL.md) ✅ |
 | Large multi-node MoE with GKE manifest | [`Xiaomi/MiMo-V2.5-Pro.md`](Xiaomi/MiMo-V2.5-Pro.md) ✅ |
-| Multi-node dense | [`Llama/Llama3.3-70B.md`](Llama/Llama3.3-70B.md) ✅ (+ [GKE Indexed Job launcher](../deployment/gke-indexed-job.md)) |
+| Multi-node dense | [`Llama/Llama3.3-70B.md`](Llama/Llama3.3-70B.md) ✅ (+ [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md)) |
 | Base model (no chat template, `/v1/completions` flow) | [`Grok/Grok2.md`](Grok/Grok2.md) ✅ |
 | Linear-attention model with recurrent state | [`Moonshotai/Kimi-Linear.md`](Moonshotai/Kimi-Linear.md) ✅ or [`InclusionAI/Ling-2.6.md`](InclusionAI/Ling-2.6.md) ✅ |
 | Reasoning model (RL-tuned, `<think>` blocks) | [`DeepSeek/DeepSeek-R1.md`](DeepSeek/DeepSeek-R1.md) ✅ |

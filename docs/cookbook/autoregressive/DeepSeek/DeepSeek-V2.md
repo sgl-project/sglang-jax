@@ -31,7 +31,7 @@ See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU g
 
 ### 2.2 Environment
 
-Install per [Install guide](../../../get_started/install.md). For V2-Lite single-host use [Single-host Docker template](../../deployment/single-host-docker.md).
+Install per [Install guide](../../../get_started/install.md). For V2-Lite single-host use [Single-host Docker template](../../../deployment/single-host-docker.md).
 
 ### 2.3 Launch
 
@@ -163,4 +163,4 @@ Mean TPOT (ms):                          7.41
 
 - [DeepSeek-V2-Lite model card](https://huggingface.co/deepseek-ai/DeepSeek-V2-Lite)
 - [Launch flags reference](../../base/launch-flags-reference.md)
-- [Cross-recipe troubleshooting](../../troubleshooting.md) — cross-recipe generic issues.
+- [Cross-recipe troubleshooting](../../../deployment/troubleshooting.md) — cross-recipe generic issues.

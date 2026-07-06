@@ -139,7 +139,7 @@ Before you hit "go", verify against `python/sgl_jax/srt/configs/model_config.py`
 | 5 | Hybrid recurrent models (Ling-2.6, Kimi-Linear) require `--disable-radix-cache` | Server asserts on startup | Recipe §2.4 |
 | 6 | MLA models (DeepSeek family) require `--page-size >= 2` | MLA backend asserts on startup | Recipe §2.4 |
 
-The recipe's §2.4 Configuration Tips covers these constraints; see the [central Troubleshooting page](../troubleshooting.md) if launch still fails.
+The recipe's §2.4 Configuration Tips covers these constraints; see the [central Troubleshooting page](../../deployment/troubleshooting.md) if launch still fails.
 
 ### Step 4 — If launch hits OOM
 
@@ -174,7 +174,7 @@ If you size a slice this section's math suggests, run the recipe end-to-end, and
 | GKE accelerator label (v7x) | `cloud.google.com/gke-tpu-accelerator: tpu7x` | [MiMo-V2.5-Pro GKE manifest](../autoregressive/Xiaomi/MiMo-V2.5-Pro.md) |
 | GKE topology label | `cloud.google.com/gke-tpu-topology: 2x2x4` | same |
 | Docker image | `us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1` | same |
-| SkyPilot resource (v6e) | `tpu-v6e-N` (N ∈ {1, 4, 8, 16, 32, 64}) | [SkyPilot launcher](../deployment/skypilot.md), `scripts/launch_tpu.sh` |
+| SkyPilot resource (v6e) | `tpu-v6e-N` (N ∈ {1, 4, 8, 16, 32, 64}) | [SkyPilot launcher](../../deployment/skypilot.md), `scripts/launch_tpu.sh` |
 | SkyPilot runtime (v6e) | `runtime_version: v2-alpha-tpuv6e` | `scripts/tpu_resource.sky.yaml`, [`developer_guide/tpu_resources_guide.md`](../../developer_guide/tpu_resources_guide.md) |
 
 ## What this page intentionally does NOT cover

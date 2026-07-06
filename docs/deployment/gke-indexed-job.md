@@ -156,6 +156,6 @@ The TL;DR: **Indexed Job is the cookbook default because JAX multi-host requires
 
 ## Related
 
-- [MiMo-V2.5-Pro §4.4](../autoregressive/Xiaomi/MiMo-V2.5-Pro.md#44-gke-indexed-job--headless-service) — a fully filled-in instance of this template.
+- `docs/cookbook/autoregressive/Xiaomi/MiMo-V2.5-Pro.md` §4.4 — a fully filled-in instance of this template.
 - [`single-host-docker.md`](single-host-docker.md) — when you only need one node.
 - [`skypilot.md`](skypilot.md) — SkyPilot alternative (v6e-only today).

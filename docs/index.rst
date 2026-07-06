@@ -18,10 +18,16 @@ the model cookbook is maintained as a Mintlify-style recipe collection.
    :maxdepth: 1
 
    basic_usage/index
-   basic_usage/qwen
-   basic_usage/mimo_v2_flash
-   basic_usage/mimo_v2.5_pro
-   basic_usage/grok2-skypilot-serving
+
+.. toctree::
+   :caption: Deployment
+   :maxdepth: 1
+
+   deployment/index
+   deployment/single-host-docker
+   deployment/gke-indexed-job
+   deployment/skypilot
+   deployment/troubleshooting
 
 .. toctree::
    :caption: Cookbook
@@ -36,14 +42,11 @@ the model cookbook is maintained as a Mintlify-style recipe collection.
    features/index
    features/attention_backend
    features/chunked_prefill
-   features/dtype_config
-   features/dynamic_continuous_batching
    features/global_jit_compile
-   features/partial_rollout
    features/quantization
    features/radix_cache
-   features/return_routed_experts
    features/run_in_pathways
+   features/server_arguments
    features/speculative_decoding
    features/structured_output
 
@@ -86,9 +89,3 @@ the model cookbook is maintained as a Mintlify-style recipe collection.
    developer_guide/release_process
    developer_guide/tpu_resources_guide
    developer_guide/how_to_join_community
-
-.. toctree::
-   :caption: References
-   :maxdepth: 1
-
-   references/index

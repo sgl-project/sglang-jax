@@ -38,7 +38,7 @@ Both fit on a single v6e-4 host with `bfloat16`. See [TPU topology reference](..
 
 ### 2.2 Environment
 
-Install per [Install guide](../../../get_started/install.md) and use [Single-host Docker template](../../deployment/single-host-docker.md) for the container setup.
+Install per [Install guide](../../../get_started/install.md) and use [Single-host Docker template](../../../deployment/single-host-docker.md) for the container setup.
 
 ### 2.3 Launch
 
@@ -412,7 +412,7 @@ chmod +x benchmark.sh
 ./benchmark.sh vllm Qwen/Qwen3-8B
 ```
 
-**Test Results** (selected representative cells — see [Qwen3 benchmark report](../../base/benchmarks/qwen3_benchmark.md) for the full ISL × OSL × batch matrix)
+**Test Results** (selected representative cells — see full validation matrix for the full ISL × OSL × batch matrix)
 
 Qwen3-8B:
 
@@ -450,4 +450,4 @@ Lower than the 1977 tok/s c=64 table cell because c=16 leaves the batch under-fi
 
 - [Qwen Model Cards](https://huggingface.co/Qwen)
 - [Launch flags reference](../../base/launch-flags-reference.md)
-- [Cross-recipe troubleshooting](../../troubleshooting.md) — cross-recipe generic issues.
+- [Cross-recipe troubleshooting](../../../deployment/troubleshooting.md) — cross-recipe generic issues.

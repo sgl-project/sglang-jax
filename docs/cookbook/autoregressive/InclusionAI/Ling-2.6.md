@@ -32,7 +32,7 @@ See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU g
 
 ### 2.2 Environment
 
-Install per [Install guide](../../../get_started/install.md). **Build pin**: use sglang-jax 0.1.0 or later — earlier builds crash at weight load on Ling-2.6's compressed-tensors FP8 QKV split. Multi-host required — use [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md). Advanced users running temporary v6e experiments can adapt [SkyPilot launcher](../../deployment/skypilot.md).
+Install per [Install guide](../../../get_started/install.md). **Build pin**: use sglang-jax 0.1.0 or later — earlier builds crash at weight load on Ling-2.6's compressed-tensors FP8 QKV split. Multi-host required — use [GKE Indexed Job launcher](../../../deployment/gke-indexed-job.md). Advanced users running temporary v6e experiments can adapt [SkyPilot launcher](../../../deployment/skypilot.md).
 
 For evaluation, additionally install `evalscope` in the client environment:
 
@@ -68,7 +68,7 @@ python3 -u -m sgl_jax.launch_server \
 
 > `--moe-backend` is tunable — `epmoe` (megablox GMM), `fused` (Pallas fused MoE V1), or `fused_v2` (Pallas fused MoE V2, double-buffered); the fused kernels require full EP (`--ep-size` = `--tp-size`). See §2.4.
 
-On GKE, use the [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) with `<JOB>=ling-2-6`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=8x8`, `parallelism: 16`, `completions: 16`, and `backoffLimit: 16`; the launcher injects `--nnodes`, `--node-rank`, `--dist-init-addr`, `--host`, and `--port`, so drop those and put the remaining model flags into `<LAUNCH_FLAGS>`. For temporary v6e experiments, advanced users can adapt the [SkyPilot launcher](../../deployment/skypilot.md) with the same flags.
+On GKE, use the [GKE Indexed Job launcher](../../../deployment/gke-indexed-job.md) with `<JOB>=ling-2-6`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=8x8`, `parallelism: 16`, `completions: 16`, and `backoffLimit: 16`; the launcher injects `--nnodes`, `--node-rank`, `--dist-init-addr`, `--host`, and `--port`, so drop those and put the remaining model flags into `<LAUNCH_FLAGS>`. For temporary v6e experiments, advanced users can adapt the [SkyPilot launcher](../../../deployment/skypilot.md) with the same flags.
 
 #### Multi-host — TPU v7x-16 (fused MoE V2)
 
@@ -334,4 +334,4 @@ Max ITL (ms):                            1293.91
 
 - [Ling-2.6-1T model card](https://huggingface.co/inclusionAI/Ling-2.6-1T)
 - [Launch flags reference](../../base/launch-flags-reference.md)
-- [Cross-recipe troubleshooting](../../troubleshooting.md) — cross-recipe generic issues.
+- [Cross-recipe troubleshooting](../../../deployment/troubleshooting.md) — cross-recipe generic issues.

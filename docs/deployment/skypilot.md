@@ -12,7 +12,7 @@ Advanced SkyPilot recipe for provisioning a multi-node v6e TPU cluster and launc
 - GCP TPU quota in the region you target.
 - A working SGL-JAX checkout on the local machine — the launcher script lives at `scripts/launch_tpu.sh`.
 
-For the broader SkyPilot development workflow (clone, sync, destroy) see [TPU resources guide](../../developer_guide/tpu_resources_guide.md).
+For the broader SkyPilot development workflow (clone, sync, destroy) see [TPU resources guide](../developer_guide/tpu_resources_guide.md).
 
 ## The launcher script
 
@@ -40,7 +40,7 @@ The resolved cluster name is written to `.cluster_name` at the repo root, which 
 
 ### Generation support
 
-`scripts/tpu_resource.sky.yaml` pins `runtime_version: v2-alpha-tpuv6e`, which is **v6e-only**. To use v5e / v5p / v7x you have to fork the template (or pass an alternative resource block via `sky launch` directly) and pick the matching TPU runtime version. The v7x recipes in the cookbook use the GKE path instead — see [MiMo-V2.5-Pro §2.3](../autoregressive/Xiaomi/MiMo-V2.5-Pro.md#23-launch).
+`scripts/tpu_resource.sky.yaml` pins `runtime_version: v2-alpha-tpuv6e`, which is **v6e-only**. To use v5e / v5p / v7x you have to fork the template (or pass an alternative resource block via `sky launch` directly) and pick the matching TPU runtime version. The v7x recipes in the cookbook use the GKE path instead.
 
 ## The cluster template
 
@@ -98,7 +98,7 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache uv run python -u -m sgl_jax.launch_serv
 | Placeholder | What to fill in |
 |---|---|
 | `<MODEL>` | HuggingFace repo id or absolute path on the node (e.g. `/models/xai-grok-2`). |
-| `<N>` | `--tp-size` = total JAX devices across all nodes. See [TPU topology reference](../base/tpu-topology-reference.md). |
+| `<N>` | `--tp-size` = total JAX devices across all nodes. |
 | `<NODE_0_IP_ADDRESS>:<PORT>` | Rank-0 node's internal IP and an unused TCP port. SkyPilot does not auto-expose this — `sky status -a <cluster>` shows per-node IPs. |
 | `<NODES>` | Node count. Matches the SkyPilot accelerator name's chip count divided by chips-per-node (4 for v6e). E.g. `tpu-v6e-32` → 8 nodes. |
 | `${SKYPILOT_NODE_RANK}` | Provided automatically by SkyPilot in the remote shell. Escape the `$` (`\$`) so the local shell does not expand it. |
@@ -122,12 +122,11 @@ The launcher passes `-i 10 --down`, so an idle cluster auto-destroys after 10 mi
 
 | Recipe | Accelerator | Nodes | `--tp-size` |
 |---|---|---|---|
-| [Grok-2](../autoregressive/Grok/Grok2.md) | `tpu-v6e-32` | 8 | 32 |
+| Grok-2 | `tpu-v6e-32` | 8 | 32 |
 
-Single-host recipes ([Qwen-7B-Chat](../autoregressive/Qwen/Qwen.md), [Qwen3](../autoregressive/Qwen/Qwen3.md)) can also run via SkyPilot by passing `tpu-v6e-4`, but Docker on a single host is usually simpler — see the recipes themselves for the direct launch form.
+Single-host recipes such as Qwen-7B-Chat and Qwen3 can also run via SkyPilot by passing `tpu-v6e-4`, but Docker on a single host is usually simpler.
 
 ## Related docs
 
-- [TPU resources guide](../../developer_guide/tpu_resources_guide.md) — broader SkyPilot dev workflow (sync code, destroy clusters).
-- [TPU topology reference](../base/tpu-topology-reference.md) — TPU/device/chip table for picking `--tp-size`.
-- [Launch flags reference](../base/launch-flags-reference.md) — full launch flag reference.
+- [TPU resources guide](../developer_guide/tpu_resources_guide.md) — broader SkyPilot dev workflow (sync code, destroy clusters).
+- [Server Arguments](../features/server_arguments.md) — launch flag categories and tuning notes.

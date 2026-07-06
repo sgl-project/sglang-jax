@@ -50,8 +50,8 @@ Current cookbook-facing configuration summary:
 
 - [TPU topology reference](../base/tpu-topology-reference.md) — TPU generation / HBM / topology.
 - [Launch flags reference](../base/launch-flags-reference.md) — launch flag full table; diffusion-specific flags appear when you run `python -m sgl_jax.launch_server --multimodal --help`.
-- [Deployment templates](../deployment/) — launcher templates (single-host Docker, GKE Indexed Job, and advanced SkyPilot v6e experiments).
-- [Cross-recipe troubleshooting](../troubleshooting.md) — cross-recipe generic issues.
+- [Deployment templates](../../deployment/) — launcher templates (single-host Docker, GKE Indexed Job, and advanced SkyPilot v6e experiments).
+- [Cross-recipe troubleshooting](../../deployment/troubleshooting.md) — cross-recipe generic issues.
 
 ## Picking a starting recipe to clone
 

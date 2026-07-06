@@ -6,7 +6,7 @@ title: "SGL-JAX Cookbook"
 
 End-to-end recipes for serving specific models on specific TPU (or GPU) topologies with SGL-JAX.
 
-> Where the rest of the docs (`get_started/`, `basic_usage/features/`, `architecture/`) explain *how SGL-JAX works*, the cookbook answers a single question per page: **"How do I run model X on hardware Y?"**
+> Where the rest of the docs (`get_started/`, `basic_usage/`, `features/`, `architecture/`) explain *how SGL-JAX works*, the cookbook answers a single question per page: **"How do I run model X on hardware Y?"**
 
 ## Layout
 
@@ -14,10 +14,12 @@ End-to-end recipes for serving specific models on specific TPU (or GPU) topologi
 |---|---|
 | [`autoregressive/`](autoregressive/index.md) | Token-generating recipes organized by vendor subdir: text-only LLMs plus vision-language decoders such as Qwen2.5-VL. |
 | [`diffusion/`](diffusion/index.md) | Diffusion-style media generation recipes such as Wan 2.1/2.2 T2V. |
-| [`base/`](base/) | Cross-cutting references shared by every recipe: TPU topology table, launch flag reference, and benchmark reports. |
-| [`deployment/`](deployment/) | Launcher templates referenced by recipes: single-host Docker, primary multi-host GKE Indexed Job, and advanced SkyPilot v6e experiments. |
-| [`troubleshooting.md`](troubleshooting.md) | Common startup / multi-node / runtime failure modes across all recipes. |
+| [`base/basic-api-usage.md`](base/basic-api-usage.md) | Shared request examples for running OpenAI-compatible and native API calls. |
+| [`base/tpu-topology-reference.md`](base/tpu-topology-reference.md) | TPU generation, topology, device-count, and HBM reference. |
+| [`base/launch-flags-reference.md`](base/launch-flags-reference.md) | Cookbook-focused launch flag notes used by model recipes. |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | Checklist for adding a new recipe or upgrading a recipe from Starter to Validated. |
+
+Cross-cutting launcher templates and troubleshooting live in the main Sphinx docs: [Deployment](../deployment/index.md) and [Troubleshooting](../deployment/troubleshooting.md).
 
 ## Conventions
 
@@ -28,7 +30,7 @@ Every recipe follows the **same four-section template** so you can scan any page
 3. **Invocation** — basic `curl` / OpenAI-compatible request examples; reasoning / tool-call patterns where applicable.
 4. **Benchmark** — accuracy (`evalscope`) and throughput (`bench_serving`) commands with reference numbers.
 
-Model-specific constraints are documented inline in each recipe's §2.4 Configuration Tips; cross-cutting startup / multi-node / runtime failures live in [`troubleshooting.md`](troubleshooting.md).
+Model-specific constraints are documented inline in each recipe's §2.4 Configuration Tips; cross-cutting startup / multi-node / runtime failures live in [Troubleshooting](../deployment/troubleshooting.md).
 
 Recipes carry one of five status banners at the top:
 
@@ -87,4 +89,4 @@ Vision-language and diffusion rows are constrained by SGL-JAX's built-in staged 
 5. Fill in real `evalscope` and `bench_serving` outputs — do not leave `_Pending_` cells in a Validated recipe's claimed primary path.
 6. Add an entry to this index's *Hardware coverage* table and to [`autoregressive/index.md`](autoregressive/index.md) or [`diffusion/index.md`](diffusion/index.md).
 7. Cross-link tunable flags in §2.4 to [`base/launch-flags-reference.md`](base/launch-flags-reference.md) for non-obvious flags.
-8. Put large benchmark matrices under [`base/benchmarks/`](base/benchmarks/index.md) and link them from the recipe.
+8. Keep benchmark evidence in the recipe's own Benchmark section so validation numbers stay next to the launch command they validate.
