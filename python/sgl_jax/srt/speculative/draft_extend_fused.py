@@ -26,6 +26,23 @@ from sgl_jax.srt.speculative.relay_buffer import (
 logger = logging.getLogger(__name__)
 
 
+def _debug_host_array(value, limit: int | None = 8):
+    if value is None:
+        return None
+    try:
+        if isinstance(value, jax.Array) and not getattr(value, "is_fully_addressable", True):
+            if getattr(value, "is_fully_replicated", False):
+                value = value.addressable_data(0)
+            else:
+                from jax.experimental.multihost_utils import process_allgather
+
+                value = process_allgather(value, tiled=True)
+        arr = np.asarray(jax.device_get(value))
+        return arr if limit is None else arr[:limit]
+    except Exception as exc:  # pragma: no cover - debug-only path
+        return f"<unavailable: {type(exc).__name__}: {exc}>"
+
+
 class GreedyDraftInputs(NamedTuple):
     hidden_states: jax.Array
     positions: jax.Array
@@ -1917,8 +1934,45 @@ def spec_decode_verify(spec_worker, model_worker_batch, cur_allocate_lens):
 
     if dump_verify and target_logits is not None:
         target_argmax = np.asarray(jax.device_get(jnp.argmax(target_logits, axis=-1)))
+        pred_host = _debug_host_array(prepared_predict, limit=None)
+        acc_host = _debug_host_array(prepared_accept_lens_host, limit=None)
+        seq_host = _debug_host_array(prepared_verify_seq_lens, limit=None)
+        pos_host = _debug_host_array(prepared_positions, limit=None)
+        pvid_host = _debug_host_array(previous_verified_id, limit=None)
+        ptok_host = _debug_host_array(previous_token_list, limit=None)
+        n = draft_worker.speculative_num_draft_tokens
+        draft0 = None
+        predict0 = None
+        positions0 = None
+        emitted0 = None
+        if (
+            all(
+                isinstance(x, np.ndarray)
+                for x in (pred_host, acc_host, pos_host, pvid_host, ptok_host)
+            )
+            and pvid_host.size > 0
+            and pred_host.size >= n
+        ):
+            token_row0 = ptok_host.reshape(-1, ptok_host.shape[-1])[0] if ptok_host.size else []
+            draft0 = np.concatenate(
+                [pvid_host.reshape(-1)[:1], np.asarray(token_row0, dtype=np.int32)[: n - 1]]
+            )
+            predict0 = pred_host[:n]
+            positions0 = pos_host[:n]
+            emitted0 = pred_host[: int(acc_host[0])] if acc_host.size else None
         logger.info(
             "[VERIFYDUMP] fused verify_forward argmax per draft pos = %s", target_argmax[:8]
+        )
+        logger.info(
+            "[VERIFYDUMP] fused verify trace "
+            "seq_lens[:4]=%s draft0=%s positions0=%s target_predict0=%s "
+            "accept_lens[:4]=%s emitted0=%s",
+            seq_host[:4] if isinstance(seq_host, np.ndarray) else seq_host,
+            draft0,
+            positions0,
+            predict0,
+            acc_host[:4] if isinstance(acc_host, np.ndarray) else acc_host,
+            emitted0,
         )
 
     next_draft_input = EagleDraftInput(
