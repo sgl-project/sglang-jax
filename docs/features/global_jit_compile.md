@@ -1,64 +1,52 @@
 # Global JIT Compile
 
-## Goals
+SGL-JAX runs model forward and sampling through JAX JIT by default. The goal is to keep the hot path compiled while controlling shape variation with precompile buckets and runtime padding.
 
-1. To improve the performance, wrap forward, logits and sample with JIT.
-2. To avoid cache miss, we support precompile and padding.
+For the broader executor data flow, see [Model Executor](../architecture/04-model-executor.md).
 
-## Design
+## Runtime Flow
 
-### JIT Forward
+`ModelRunner.init_model_fns()` builds the compiled callables:
 
-The wrapped forward function is `jitted_run_model` and `jitted_sampler`, which are used in prefill and decode. The input parameter `forward_batch`, `logits_metadata`, `logits_output` and `sampling_metadata` have to be registered as PyTrees. At the same time, the subclasses in it are required to register too. Besides, we use `nnx.split` and `nnx.merge` on model to keep satisfy the `jit` requirements.
+| Callable | Purpose |
+|---|---|
+| `jitted_run_model` | Runs the model forward pass with donated `memory_pools` and static model state structure. |
+| `jitted_sampler` | Runs sampling with the sampler state structure and top-p/top-k/min-p sort behavior as static inputs. |
+| `jitted_compute_logprobs` | Computes selected log probabilities under JIT. |
 
-Note: `return_logprob` is supported in `jitted_run_model` and `jitted_sampler` with performance degradation, It will be optimized later. However, if you only specify `return_logprob` and only need the log probabilities of the output tokens, it is optimized.
+The model and sampler are reconstructed inside the JIT boundary with `nnx.merge`. The mutable runtime arrays are carried through `memory_pools`, and model outputs return pool updates that `ModelRunner` writes back after the compiled call.
 
-### Precompile and padding
+## Precompile and Padding
 
-Cache miss is unacceptable because it results in a few seconds to a several tens of seconds compile time. In order to improve the performance, precompile and padding are necessary. Precompile is executed before Scheduler's loop. The precompile includes prefill and decode phase. Both phases need to pad tokens(like input_ids, positions, etc.) and batch_size.
+Shape misses can trigger expensive XLA compilation during serving. SGL-JAX reduces those misses by precompiling common prefill and decode shapes before the scheduler loop starts, then padding runtime batches into the same bucket scheme.
 
-#### token padding
+There are two bucket families:
 
-`--precompile-token-paddings` is used to configure the token padding list. Token padding uses a fixed batch_size to make a tradeoff between performance and precompile time. So the padding pair will be {bs = fixed_bs, num_tokens = token1}, {bs = fixed_bs, num_tokens = token2} and so on. The fixed batch_size is calculated through `get_max_padded_size()` which takes the `max_prefill_tokens`, `chunked_prefill_size` and `max_running_requests` into the consideration.
+| Bucket family | Flag | Used for |
+|---|---|---|
+| Token buckets | `--precompile-token-paddings` | Prefill/extend shapes such as `input_ids`, `positions`, and output cache locations. |
+| Batch-size buckets | `--precompile-bs-paddings` | Decode shapes such as request indices and sequence lengths. |
 
-#### batch size padding
+Prefill padding uses a fixed batch size derived from the configured serving limits and pads token-like fields to the selected token bucket. Decode padding normally pads both batch size and token count to the selected batch-size bucket.
 
-`--precompile-bs-paddings` is used to configure the batch size padding list. Decode padding pair likes {bs = bs1, num_tokens = bs1}, {bs = bs2, num_tokens = bs2} and so on.
+## User Knobs
 
+| Flag | Effect |
+|---|---|
+| `--precompile-token-paddings` | Override the prefill token bucket list. |
+| `--precompile-bs-paddings` | Override the decode batch-size bucket list. |
+| `--disable-precompile` | Skip startup precompilation. Runtime JIT compilation can still happen when new shapes appear. |
+| `--max-running-requests` | Changes the maximum active batch size and therefore the useful bucket range. |
+| `--chunked-prefill-size` | Changes the preferred prefill chunk size and therefore the token bucket pressure. |
 
+Choose bucket lists with the workload shape distribution in mind. Too few buckets can cause excessive padding or runtime compilation. Too many buckets increase startup time and compiled executable footprint.
 
+## Logprob Path
 
-## Implementation
+`return_logprob` is supported on the JIT path, but it can select a heavier compiled variant because logprob metadata changes the work returned by the model and sampler. For latency-sensitive serving, benchmark the exact logprob configuration rather than assuming it has the same profile as plain generation.
 
-Note: Padding strategy used in precompile and real forward is the same. The former padding is implemented in `generate_model_worker_batch` and the latter is implemented in `get_model_worker_batch`.
+## Implementation Entry Points
 
-### Precompile
-
-Run precompile before scheduler's loop. Generate the `ModelWorkerBatch` and call `forward_batch_generation` to reuse the current codes as much as possible.
-
-### Padding
-
-As mentioned above, padding use {bs = *bs*, num_tokens = *token*}:
-- extend: *bs* = fixed_bs, *token* is the first item in the token paddings list which is not less than len(field), like len(input_ids)
-- decode: *bs* (= *token*) is the the first item in the batch size paddings list which is not less than len(field), like len(seq_lens)
-
-The following fields are required to padding:
-- input_ids/out_cache_loc/positions: pad its length to num_tokens
-- cache_loc: pad its length to the product of batch_size * max_req_len
-- req_pool_indices/seq_lens/req_pool_indices: pad its length to batch size
-- extend_prefix_lens/extend_seq_lens: pad its length to batch size only for prefill
-
-
-## Usage
-
-### JIT Forward
-
-JIT Forward is default to use.
-
-### Precompile and padding
-
-- `--precompile-token-paddings`: default values is recommended, but you still can set like 8192 16384
-- `--precompile-bs-paddings`: default values is recommended, but you still can set like 1 10 32
-- `--disable-precompile`: default to False
-- `--max-running-requests`
-- `--chunked-prefill-size`
+- `python/sgl_jax/srt/model_executor/model_runner.py`: compiled model, sampler, and logprob callables.
+- `python/sgl_jax/srt/server_args.py`: precompile bucket flags and `--disable-precompile`.
+- `docs/architecture/04-model-executor.md`: executor-level architecture and precompile flow.

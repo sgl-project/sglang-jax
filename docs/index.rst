@@ -73,7 +73,6 @@ the model cookbook is maintained as a Mintlify-style recipe collection.
 
    multimodal/index
    multimodal/multimodal_usage
-   multimodal/design/multimodal_architecture_rfc
 
 .. toctree::
    :caption: Developer Guide
@@ -93,4 +92,3 @@ the model cookbook is maintained as a Mintlify-style recipe collection.
    :maxdepth: 1
 
    references/index
-   references/docs_gap_analysis

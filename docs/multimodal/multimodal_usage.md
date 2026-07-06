@@ -6,7 +6,7 @@ This guide covers how to use SGL-JAX for multimodal inference with models like W
 
 SGL-JAX provides a unified, high-performance inference framework for multimodal models. The framework supports heterogeneous compute patterns—integrating Auto-Regressive (AR) decoding with Diffusion denoising—within a single pipeline.
 
-For architecture details, see the [RFC: Multimodal Architecture Design](design/multimodal_architecture_rfc.md).
+For architecture details, see [Multimodal Architecture](../architecture/12-multimodal.md).
 
 ## Supported Models
 
@@ -22,7 +22,7 @@ For architecture details, see the [RFC: Multimodal Architecture Design](design/m
 
 ### Offline Inference
 
-> Still Under Development
+Offline multimodal inference is not documented in this page yet. Use the online API path below, or follow the model-specific cookbook recipe when one is available.
 
 ### Online Inference (OpenAI-Compatible API)
 
@@ -82,5 +82,5 @@ stage_args:
 
 ## Related Documentation
 
-- [RFC: Multimodal Architecture Design](design/multimodal_architecture_rfc.md)
+- [Multimodal Architecture](../architecture/12-multimodal.md)
 - [SGL-JAX Architecture](../architecture/01-architecture-overview.md)
