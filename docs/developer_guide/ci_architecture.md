@@ -146,7 +146,15 @@ and posts analysis results on the associated PR.
 
 ### Nightly Testing
 
-Nightly workflows are not part of the documented CI surface yet. Add this section when a scheduled workflow exists in `.github/workflows/`, including its schedule, trigger conditions, model set, and artifact locations.
+Scheduled nightly coverage is split across daily and weekly workflows. Keep the
+suite-level case list in the workflow and `test/srt` runners; this section should
+only document the CI surface that maintainers need to operate.
+
+| Workflow | Schedule | Entry Points | Scope and Outputs |
+|----------|----------|--------------|-------------------|
+| `nightly-test-daily.yml` | Daily at 18:00 UTC (`0 18 * * *`) | Schedule, push to `main` when `version.py` changes, manual dispatch, and `/run-nightly` via `workflow_call` | Runs the daily 1-TPU and 4-TPU nightly suites on the official repository. PR-triggered `/run-nightly` jobs post PASS/FAIL comments back to the PR. Main-branch runs publish selected accuracy/perf JSON, perf CSV/traces, and drift artifacts where configured. |
+| `weekly-test.yml` | Weekly on Sunday at 16:00 UTC / Monday 00:00 UTC+8 (`0 16 * * 0`) | Schedule, push to `main` when `version.py` changes, and manual dispatch | Runs the fuller weekly regression on v6e-1 and v6e-4 accuracy/performance suites. Configured jobs publish benchmark/perf outputs and nightly report CSV entries to the CI data storage repository. |
+
 ### Release Automation
 #### Package Releases (`release-pypi.yml`)
 ##### Main Package Release
