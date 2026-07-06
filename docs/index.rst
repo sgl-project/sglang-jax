@@ -39,7 +39,6 @@ the model cookbook is maintained as a Mintlify-style recipe collection.
    features/dtype_config
    features/dynamic_continuous_batching
    features/global_jit_compile
-   features/integrate_with_tunix
    features/partial_rollout
    features/quantization
    features/radix_cache
@@ -47,12 +46,6 @@ the model cookbook is maintained as a Mintlify-style recipe collection.
    features/run_in_pathways
    features/speculative_decoding
    features/structured_output
-   features/design/data_parallelism
-   features/design/lora
-   features/design/mla
-   features/design/pd_disaggregation
-   features/design/swa_eviction_and_lru_strategy
-   features/design/bailing_moe_linear_attention
 
 .. toctree::
    :caption: Architecture
@@ -72,7 +65,7 @@ the model cookbook is maintained as a Mintlify-style recipe collection.
    architecture/11-quantization
    architecture/12-multimodal
    architecture/13-configuration-reference
-   architecture/project-core-structure
+   architecture/14-pd-disaggregation
 
 .. toctree::
    :caption: Multimodal

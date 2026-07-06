@@ -1,5 +1,7 @@
 # SGLang-Jax Interruptible Sampling
 
+Status: implemented but lightly covered. The HTTP endpoints and `Engine` methods exist, but `pause_generation` / `continue_generation` and daemon-loop modes do not have the same CI coverage as the core `generate` / `async_generate` paths. Validate the exact mode before relying on it in production.
+
 ## 1. Motivation
 The motivation for supporting pause generation and continue generation is to support interruptible sampling in RL framework, especially for google/Tunix.
 Design

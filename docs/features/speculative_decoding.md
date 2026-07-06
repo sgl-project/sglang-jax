@@ -18,12 +18,15 @@ validate.
 | Draft decode | The draft runner (EAGLE or EAGLE3) grows every request by proposing `speculative_num_steps × speculative_eagle_topk` tokens. | `--speculative-num-steps`, `--speculative-eagle-topk`, `--speculative-num-draft-tokens` |
 | Verify | Verified tokens are replayed on the target model with custom attention masks. Tokens that pass are committed, failures fall back to regular decode. | `--speculative-accept-threshold-single`, `--speculative-accept-threshold-acc` |
 
-Two draft flavors are available:
+Two draft families are available:
 
 - **EAGLE** – classic draft model that shares the target embedding/head. Use it
   with ordinary causal checkpoints when a distilled EAGLE draft is available.
 - **EAGLE3** – draft model with auxiliary hidden state inputs. The repository
   includes inference-only modules for Qwen3 and LLaMA style EAGLE3 checkpoints.
+- **NEXTN** – fused MTP / NextN speculative path. The CLI and enum support it,
+  but the overlap path is restricted to the fused `topk=1` shape described in
+  `ServerArgs` validation.
 
 ## Enabling speculative decoding
 

@@ -131,7 +131,7 @@ The table below summarizes the most commonly used launch parameters, recommended
 | `device_indexes` | `list[int] \| None` | `None` | Device indices used by the mesh |
 | `tp_size` | `int` | `1` | Tensor parallelism degree |
 | `dp_size` | `int` | `1` | Data parallelism degree; the Scheduler partitions requests and batches by DP rank inside the same process |
-| `dp_schedule_policy` | `str` | `"min_running_queue"` | DP rank assignment policy (`min_running_queue` / `round_robin`) |
+| `dp_schedule_policy` | `str` | `"min_running_queue"` | DP rank assignment policy (`min_running_queue` / `round_robin` / `cache_aware`) |
 | `ep_size` | `int` | `1` | Expert parallelism degree |
 | `ep_num_redundant_experts` | `int` | `0` | Number of redundant experts for EP load balancing |
 | `ep_dispatch_algorithm` | `str \| None` | `None` | EP dispatch mode (`static` / `dynamic` / `fake`) |
@@ -148,7 +148,7 @@ The table below summarizes the most commonly used launch parameters, recommended
 
 **`tp_size` / `dp_size`**: `tp_size` denotes the model tensor-parallel configuration of the total parallel device count, and `dp_size` denotes the number of Data Parallel ranks partitioned within the same Scheduler. The execution-side mesh shape is `(dp_size, tp_size // dp_size)`, with axis names `(data, tensor)`. Therefore the actual TP width on the attention side is `tp_size // dp_size`.
 
-**`dp_schedule_policy`**: Controls which DP rank a new request is assigned to. `min_running_queue` selects the rank with the fewest currently running requests; `round_robin` cycles through ranks.
+**`dp_schedule_policy`**: Controls which DP rank a new request is assigned to. `min_running_queue` selects the rank with the fewest currently running requests; `round_robin` cycles through ranks; `cache_aware` routes by prefix-cache affinity when the load is balanced enough, and falls back toward the least-loaded rank under large skew.
 
 **`enable_sequence_parallel`**: Defaults to `False`. When set to `True`, `srt/utils/parallel_utils.py::should_scatter()` decides whether a specific row-parallel Linear actually performs reduce-scatter — only when the layer explicitly declares `output_scatter_dimension`, the per-device slice is ≥ `global_config.tpu_scatter_min_local_size`, and divisibility holds, does it take effect; otherwise it falls back to the original partition spec automatically. Currently wired up in `models/grok.py`; other models will only be affected after explicitly setting `output_scatter_dimension` on their Linear layers.
 
@@ -199,7 +199,7 @@ The table below summarizes the most commonly used launch parameters, recommended
 
 | Parameter | Type | Default | Description |
 |------|------|--------|------|
-| `speculative_algorithm` | `str \| None` | `None` | CLI choices: `"EAGLE"` / `"EAGLE3"` / `"NEXTN"` / `"STANDALONE"`; the current `SpeculativeAlgorithm.from_string` only recognizes `EAGLE` / `EAGLE3` / `STANDALONE` (and `None`), so passing `NEXTN` raises `KeyError` in `from_string` — it is a reserved value not yet wired into the runtime |
+| `speculative_algorithm` | `str \| None` | `None` | CLI choices: `"EAGLE"` / `"EAGLE3"` / `"NEXTN"` / `"STANDALONE"`; overlap scheduling is only accepted for the fused `NEXTN` shape with `topk=1` and `num_draft_tokens == num_steps + 1` |
 | `speculative_draft_model_path` | `str \| None` | `None` | Path to draft model weights |
 | `speculative_draft_model_revision` | `str \| None` | `None` | Draft model revision |
 | `speculative_num_steps` | `int` | `4` | Draft model generation steps |

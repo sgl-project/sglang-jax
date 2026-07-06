@@ -1,4 +1,16 @@
-# Prefill-Decode Disaggregation Design Document for SGLang-JAX
+# PD Disaggregation
+
+Prefill/decode (PD) disaggregation is implemented in `python/sgl_jax/srt/disaggregation/` and wired into the Scheduler when `--disaggregation-mode` is set to `prefill` or `decode`. This page describes the current multi-process PD path. The separate single-controller Pathways P/D path is selected by `--pd-disaggregation pathways` and is implemented by `disaggregation/pathways_pd.py` plus `disaggregation/pathways_scheduler.py`.
+
+Core files involved:
+
+- `disaggregation/bootstrap.py` and `run_bootstrap.py` — prefill registry, heartbeat, and lookup.
+- `disaggregation/prefill.py` — prefill-side Scheduler mixin and KV registration.
+- `disaggregation/decode.py` — decode-side Scheduler mixin, remote KV pull, and admission.
+- `disaggregation/jax_transfer/` — wrappers over `jax.experimental.transfer`.
+- `disaggregation/common/zmq_notifier.py` — side-channel acknowledgement from decode to prefill.
+- `disaggregation/mini_lb.py` and `launch_router.py` — single-entry router for pairing prefill and decode endpoints.
+- `server_args.py` — `--disaggregation-*` CLI flags and validation.
 
 ## 1. Motivation
 
@@ -15,7 +27,7 @@ a decode engine, and the decode engine generates the output tokens. Each side
 can then be sized and scheduled independently, matching the multi-host TP layout
 used in production.
 
-## 2. Architecture
+## 2. Runtime Architecture
 
 The data flow for a single request:
 
@@ -25,7 +37,7 @@ client → router (mini_lb) → prefill engine → KV transfer → decode engine
 
 Components:
 
-- **Bootstrap server** (`bootstrap.py`): an HTTP registry. Prefill processes
+- **Bootstrap server** (`disaggregation/bootstrap.py`): an HTTP registry. Prefill processes
   register their `host:transfer_port`; the decode side resolves a prefill peer
   per room from a locally cached layout. A heartbeat daemon keeps the registry
   live and evicts dead prefills on a bounded refresh interval.
@@ -38,9 +50,9 @@ Components:
   pinned-host staging pool (`QueueHostKVPool`) used by transfer path A.
 - **ZMQ side channel** (`common/zmq_notifier.py`): an out-of-band pull-done
   signal from decode back to prefill, so prefill can release its buffers.
-- **Scheduler mixins** (`prefill.py`, `decode.py`): wire the produce/consume
+- **Scheduler mixins** (`disaggregation/prefill.py`, `disaggregation/decode.py`): wire the produce/consume
   steps into the single-controller scheduler.
-- **Router** (`mini_lb.py`): a single-entry load balancer that fans a request
+- **Router** (`disaggregation/mini_lb.py`): a single-entry load balancer that fans a request
   out to a prefill and a decode endpoint and assigns the shared transfer id.
 
 ### Transfer paths
@@ -67,10 +79,15 @@ decode process pulls its `1/nproc` head shard. Multi-host + path A is rejected a
 startup because the host pool is built on the global KV mesh while multi-host
 prefill extracts a local-mesh shard.
 
-## 3. Testing
+### Runtime modes
 
-Verified on GKE (cluster `ainfer-tpu-bench`, node pool `pd-v6e-1`),
-DeepSeek-R1-Distill-Qwen-1.5B, TP=1, single-host:
+`--disaggregation-mode=prefill` and `--disaggregation-mode=decode` enable the multi-process PD event loop and require `--disaggregation-bootstrap-url`. The bootstrap server can be launched with `python -m sgl_jax.srt.disaggregation.run_bootstrap`.
+
+The legacy `--pd-disaggregation pathways` flag is a different mode: it keeps a single controller and splits prefill/decode across Pathways slices inside one runtime. Do not combine it with `--disaggregation-mode`; `ServerArgs` rejects that combination.
+
+## 3. Validation Scope
+
+Validated on GKE TPU with DeepSeek-R1-Distill-Qwen-1.5B, TP=1, single-host:
 
 - **GSM8K** (200 questions, 5-shot, parallel 16): path A **0.655**, path B
   **0.675**.
@@ -79,7 +96,7 @@ DeepSeek-R1-Distill-Qwen-1.5B, TP=1, single-host:
 - **Baseline** (admission cap 8, concurrency 48, input 4096 / output 32, 192
   prompts): **192/192**, **0 OOM**.
 
-Multi-host + path B was validated separately (#1366).
+Multi-host + path B was validated separately in the implementation history.
 
 The single-host eval/benchmark job is reproducible via
 `scripts/disaggregation/gke/deploy.sh`.

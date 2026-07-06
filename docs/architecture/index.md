@@ -2,13 +2,13 @@
 
 The architecture section explains the current SGL-JAX runtime from the top-level serving flow down to scheduler, executor, model, attention, KV cache, and multimodal internals.
 
-Status: this section is structurally complete enough to publish in the Sphinx tree, but it still needs a technical review against the latest runtime before being treated as authoritative.
+Status: this section is the authoritative home for current implementation architecture. Historical design notes that duplicated these pages have been removed to avoid drift.
 
 ## Reading order
 
 1. Start with [System Overview](01-architecture-overview.md).
 2. Follow the numbered subsystem docs from entrypoints through configuration.
-3. Use [Project Core Structure](project-core-structure.md) as the codebase map while reading implementation.
+3. Use the "Core files involved" sections inside each page as the codebase map for that subsystem.
 
 ## Pages
 
@@ -27,4 +27,4 @@ Status: this section is structurally complete enough to publish in the Sphinx tr
 | [11 Quantization](11-quantization.md) | Quantization architecture. |
 | [12 Multimodal](12-multimodal.md) | Multimodal extension model. |
 | [13 Configuration Reference](13-configuration-reference.md) | Runtime configuration reference. |
-| [Project Core Structure](project-core-structure.md) | Repository and module map. |
+| [14 PD Disaggregation](14-pd-disaggregation.md) | Prefill/decode disaggregation architecture. |

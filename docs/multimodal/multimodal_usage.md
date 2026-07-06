@@ -83,4 +83,4 @@ stage_args:
 ## Related Documentation
 
 - [RFC: Multimodal Architecture Design](design/multimodal_architecture_rfc.md)
-- [SGL-JAX Architecture](../architecture/project-core-structure.md)
+- [SGL-JAX Architecture](../architecture/01-architecture-overview.md)
