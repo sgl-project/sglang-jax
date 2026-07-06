@@ -426,6 +426,8 @@ class Scheduler(
         # The last forward batch
         self.last_batch: ScheduleBatch | None = None
         self.forward_ct = 0
+        # HiCache: per-round H2D flush plans from PrefillAdder, drained donation-safe.
+        self._pending_h2d: list[tuple[list[int], list[int]]] = []
         self.forward_ct_decode = 0
         self.num_generated_tokens = 0
         self.last_prefill_tokens = 0
@@ -503,6 +505,12 @@ class Scheduler(
                 logger.info("[Scheduler] Begins to run spec_decode worker precompile.")
                 self.draft_worker.run_spec_decode_precompile()
                 logger.info("[Scheduler] Completes spec_decode worker precompile.")
+
+            # Precompile HiCache transfer kernels off the critical path.
+            if getattr(self.tree_cache, "hicache_enabled", False):
+                logger.info("[Scheduler] Begins to precompile HiCache transfers.")
+                self.tree_cache.precompile_hicache_transfers()
+                logger.info("[Scheduler] Completes HiCache transfer precompile.")
 
     def _setup_jit_cache(self, server_args: ServerArgs) -> None:
         jit_cache_dir = os.getenv("JAX_COMPILATION_CACHE_DIR", None)
@@ -648,7 +656,13 @@ class Scheduler(
             sliding_window_size=self.sliding_window_size,
             tp_size=self.tp_size,
             spec_algorithm=self.spec_algorithm,
+            mesh=self.mesh,
         )
+        # write_back eviction runs inside get_next_batch_to_run, before the event
+        # loop's launch_done.wait. Hand the cache a barrier so the D2H gather
+        # blocks until kv_buffer is rebound (donation-safe).
+        if self.enable_overlap and getattr(self.tree_cache, "hicache_enabled", False):
+            self.tree_cache._donation_barrier = self._wait_donation_safe
 
     def _select_round_robin_dp(self) -> int:
         dp_rank = self.dp_round_robin_counter % self.dp_size
@@ -905,6 +919,7 @@ class Scheduler(
 
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
+            self._flush_pending_h2d()
 
             if batch:
                 result = self.run_batch(batch)
@@ -957,6 +972,16 @@ class Scheduler(
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
             _it2 = time.perf_counter() if _pd_iter_trace else 0.0
+
+            # HiCache: stage_load was issued during last round; flush must wait
+            # for that forward's replace_all to avoid racing the donated kv_buffer.
+            if self._pending_h2d:
+                if (
+                    self.last_batch is not None
+                    and getattr(self.last_batch, "launch_done", None) is not None
+                ):
+                    self.last_batch.launch_done.wait()
+                self._flush_pending_h2d()
 
             if batch:
                 batch.launch_done = threading.Event()
@@ -1714,6 +1739,10 @@ class Scheduler(
         if self.grammar_queue:
             self.move_ready_grammar_requests()
 
+        # Settle completed async D2H backups before scheduling.
+        if getattr(self.tree_cache, "hicache_enabled", False):
+            self.tree_cache.check_hicache_events()
+
         # Handle the cases where prefill is not allowed
         has_chunked_reqs = any(req is not None for req in self.chunked_reqs)
         if self.is_hybrid:
@@ -1811,6 +1840,7 @@ class Scheduler(
                 continue  # host pool full: leave req in waiting_queue, retry next round
 
             req.init_next_round_input(self.tree_cache)
+            # H2D load-back happens inside add_one_req (after NO_TOKEN gate).
             res = adder.add_one_req(req)
 
             if res != AddReqResult.CONTINUE:
@@ -1833,6 +1863,10 @@ class Scheduler(
                 req.disagg_host_buffer_id = _reserved_bid
 
         # Update waiting queue
+        # Collect H2D flush plans from admitted reqs; drained donation-safe later.
+        if adder.pending_h2d:
+            self._pending_h2d.extend(adder.pending_h2d)
+
         # Flatten can_run_list for operations that need all requests
         all_can_run_reqs = [req for reqs in adder.can_run_list.values() for req in reqs]
         if len(all_can_run_reqs) == 0:
@@ -1911,9 +1945,25 @@ class Scheduler(
 
         return new_batch
 
+    def _flush_pending_h2d(self) -> None:
+        """Complete this round's HiCache H2D load-backs. Must be donation-safe."""
+        plan, self._pending_h2d = self._pending_h2d, []
+        if plan:
+            self.tree_cache.finish_load_back(plan)
+
+    def _wait_donation_safe(self) -> None:
+        """Block until the last forward's replace_all is done (donation barrier)."""
+        last = self.last_batch
+        if last is not None and getattr(last, "launch_done", None) is not None:
+            last.launch_done.wait()
+
     def update_running_batch(self, batch: ScheduleBatch) -> ScheduleBatch | None:
         """Update the current running decoding batch."""
         initial_bs = batch.batch_size()
+
+        # Free device locks held by finished D2H backups.
+        if getattr(self.tree_cache, "hicache_enabled", False):
+            self.tree_cache.flush_write_through_acks()
 
         batch.filter_batch()
         if batch.is_empty():

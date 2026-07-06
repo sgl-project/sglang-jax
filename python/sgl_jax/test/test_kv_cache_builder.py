@@ -10,6 +10,7 @@ def _make_server_args(**overrides):
     args.chunked_prefill_size = None
     args.max_seq_len = 4096
     args.enable_unified_radix_tree = False
+    args.hicache_storage = "disable"
     for k, v in overrides.items():
         setattr(args, k, v)
     return args
