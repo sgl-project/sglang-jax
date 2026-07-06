@@ -2284,6 +2284,46 @@ class WeightLoader:
         nnx.update(self.model, params)
         logger.info("All weights loaded successfully.")
 
+    @staticmethod
+    def _make_dummy_shard(indices, shape, dtype, seed):
+        """Build one shard of a dummy weight for the slice described by
+        ``indices`` (as passed by ``jax.make_array_from_callback``)."""
+        shard_shape = []
+        for dim_size, idx in zip(shape, indices):
+            if isinstance(idx, slice):
+                start, stop, step = idx.indices(dim_size)
+                assert step == 1, f"Non-unit step not supported: {idx}"
+                shard_shape.append(stop - start)
+            else:
+                shard_shape.append(1)
+        shard_shape = tuple(shard_shape)
+
+        rng = np.random.default_rng(seed)
+        if jnp.issubdtype(dtype, jnp.floating):
+            gen_dtype: np.dtype[Any] = (
+                np.dtype(np.float32) if dtype == jnp.bfloat16 else np.dtype(dtype)
+            )
+            arr_np = rng.uniform(-1e-3, 1e-3, size=shard_shape).astype(gen_dtype)
+            return jnp.asarray(arr_np, dtype=dtype)
+        return jnp.zeros(shard_shape, dtype=dtype)
+
+    def _assign_dummy_param(self, params, target_path, sharding_tuple, seed):
+        """Materialize a single dummy parameter at ``target_path`` in-place."""
+        try:
+            model_param = self._get_param(params, target_path)
+        except (KeyError, AttributeError, ValueError):
+            logger.debug("Skip dummy weight for %s (parameter not found)", target_path)
+            return
+        shape = model_param.value.shape
+        dtype = model_param.value.dtype
+        sharding = jax.sharding.NamedSharding(
+            self.mesh, P(*sharding_tuple) if sharding_tuple else P()
+        )
+        model_param.value = jax.make_array_from_callback(
+            shape, sharding, lambda idx: self._make_dummy_shard(idx, shape, dtype, seed)
+        )
+        logger.debug("Generated dummy weight for %s, shape=%s", target_path, shape)
+
     def _load_dummy_weights(
         self,
         params: nnx.State,
@@ -2307,61 +2347,13 @@ class WeightLoader:
             elif not isinstance(mapping, WeightMapping):
                 raise TypeError("Unsupported mapping type:", type(mapping))
 
-            target_path = (
-                mapping.target_path
-                if isinstance(mapping.target_path, str)
-                else mapping.target_path[0]
-            )
-
-            try:
-                model_param = self._get_param(params, target_path)
-            except (KeyError, AttributeError, ValueError):
-                logger.debug("Skip dummy weight for %s (parameter not found)", target_path)
-                continue
-
-            shape = model_param.value.shape
-            dtype = model_param.value.dtype
-
-            sharding_spec = P(*mapping.sharding) if mapping.sharding else P()
-            sharding = jax.sharding.NamedSharding(self.mesh, sharding_spec)
-
-            def make_shard(indices, shape=shape, dtype=dtype):
-                shard_shape = []
-                for dim_size, idx in zip(shape, indices):
-                    if isinstance(idx, slice):
-                        start, stop, step = idx.indices(dim_size)
-                        assert step == 1, f"Non-unit step not supported: {idx}"
-                        shard_shape.append(stop - start)
-                    else:
-                        shard_shape.append(1)
-                shard_shape = tuple(shard_shape)
-
-                rng = np.random.default_rng(seed)
-                if jnp.issubdtype(dtype, jnp.floating):
-                    gen_dtype: np.dtype[Any]
-                    if dtype == jnp.bfloat16:
-                        gen_dtype = np.dtype(np.float32)
-                    else:
-                        gen_dtype = np.dtype(
-                            {
-                                jnp.float16: np.float16,
-                                jnp.float32: np.float32,
-                                jnp.float64: np.float64,
-                            }.get(dtype, np.float32)
-                        )
-                    arr_np = rng.uniform(-1e-3, 1e-3, size=shard_shape).astype(gen_dtype)
-                    return jnp.asarray(arr_np, dtype=dtype)
-                else:
-                    return jnp.zeros(shard_shape, dtype=dtype)
-
-            dummy_weight = jax.make_array_from_callback(shape, sharding, make_shard)
-            model_param.value = dummy_weight
-            logger.debug(
-                "Generated dummy weight for %s, shape=%s, sharding=%s",
-                target_path,
-                shape,
-                sharding_spec,
-            )
+            # A fused HF weight may map to several model params (e.g. a fused
+            # query_key_value -> q/k/v_proj). Materialize EVERY target, not just
+            # the first one, otherwise the un-filled params stay abstract
+            # (ShapeDtypeStruct from eval_shape) and crash at forward time.
+            tp = mapping.target_path
+            for target_path in tp if isinstance(tp, list) else [tp]:
+                self._assign_dummy_param(params, target_path, mapping.sharding, seed)
 
         for moe_key, mapping in moe_mappings.items():
             if isinstance(mapping, str | list):
@@ -2394,25 +2386,9 @@ class WeightLoader:
                 expert_sharding = jax.sharding.NamedSharding(self.mesh, expert_sharding_spec)
 
                 def make_expert_shard(
-                    indices, weight_shape=expert_weight_shape, weight_dtype=dtype, idx=expert_idx
+                    indices, shape=expert_weight_shape, dtype=dtype, idx=expert_idx
                 ):
-                    shard_shape = []
-                    for dim_size, idx_val in zip(weight_shape, indices):
-                        if isinstance(idx_val, slice):
-                            start, stop, step = idx_val.indices(dim_size)
-                            assert step == 1, f"Non-unit step not supported: {idx_val}"
-                            shard_shape.append(stop - start)
-                        else:
-                            shard_shape.append(1)
-                    shard_shape = tuple(shard_shape)
-
-                    rng = np.random.default_rng(seed + idx)
-                    if jnp.issubdtype(weight_dtype, jnp.floating):
-                        gen_dtype = np.float32 if weight_dtype == jnp.bfloat16 else weight_dtype
-                        arr_np = rng.uniform(-1e-3, 1e-3, size=shard_shape).astype(gen_dtype)
-                        return jnp.asarray(arr_np, dtype=weight_dtype)
-                    else:
-                        return jnp.zeros(shard_shape, dtype=weight_dtype)
+                    return self._make_dummy_shard(indices, shape, dtype, seed + idx)
 
                 expert_weight = jax.make_array_from_callback(
                     expert_weight_shape, expert_sharding, make_expert_shard
