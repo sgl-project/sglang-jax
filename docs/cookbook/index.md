@@ -14,9 +14,10 @@ End-to-end recipes for serving specific models on specific TPU (or GPU) topologi
 |---|---|
 | [`autoregressive/`](autoregressive/index.md) | Token-generating recipes organized by vendor subdir: text-only LLMs plus vision-language decoders such as Qwen2.5-VL. |
 | [`diffusion/`](diffusion/index.md) | Diffusion-style media generation recipes such as Wan 2.1/2.2 T2V. |
-| [`base/`](base/) | Cross-cutting references shared by every recipe: TPU topology table, launch flag reference. |
+| [`base/`](base/) | Cross-cutting references shared by every recipe: TPU topology table, launch flag reference, and benchmark reports. |
 | [`deployment/`](deployment/) | Launcher templates referenced by recipes: single-host Docker, primary multi-host GKE Indexed Job, and advanced SkyPilot v6e experiments. |
 | [`troubleshooting.md`](troubleshooting.md) | Common startup / multi-node / runtime failure modes across all recipes. |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | Checklist for adding a new recipe or upgrading a recipe from Starter to Validated. |
 
 ## Conventions
 
@@ -86,3 +87,4 @@ Vision-language and diffusion rows are constrained by SGL-JAX's built-in staged 
 5. Fill in real `evalscope` and `bench_serving` outputs — do not leave `_Pending_` cells in a Validated recipe's claimed primary path.
 6. Add an entry to this index's *Hardware coverage* table and to [`autoregressive/index.md`](autoregressive/index.md) or [`diffusion/index.md`](diffusion/index.md).
 7. Cross-link tunable flags in §2.4 to [`base/launch-flags-reference.md`](base/launch-flags-reference.md) for non-obvious flags.
+8. Put large benchmark matrices under [`base/benchmarks/`](base/benchmarks/index.md) and link them from the recipe.

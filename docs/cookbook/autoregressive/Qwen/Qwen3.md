@@ -412,7 +412,7 @@ chmod +x benchmark.sh
 ./benchmark.sh vllm Qwen/Qwen3-8B
 ```
 
-**Test Results** (selected representative cells — see [Qwen3 benchmark report](../../../performance/qwen3_benchmark.md) for the full ISL × OSL × batch matrix)
+**Test Results** (selected representative cells — see [Qwen3 benchmark report](../../base/benchmarks/qwen3_benchmark.md) for the full ISL × OSL × batch matrix)
 
 Qwen3-8B:
 

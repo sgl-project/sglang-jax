@@ -1,3 +1,7 @@
+---
+title: "Qwen3 Benchmark Report"
+---
+
 # Performance Benchmark Results
 
 This document presents comprehensive performance benchmark results comparing different inference frameworks with various model configurations.
@@ -63,11 +67,11 @@ vllm serve "${MODEL_NAME}" \
 
 ### Performance Overview
 
-![Qwen3-8B Performance: Input 1024/Output 1024](../_static/image/benchmark/qwen3-8B_input1024_output1024.png)
+![Qwen3-8B Performance: Input 1024/Output 1024](../../../_static/image/benchmark/qwen3-8B_input1024_output1024.png)
 
-![Qwen3-8B Performance: Input 4096/Output 1024](../_static/image/benchmark/qwen3-8B_input4096_output1024.png)
+![Qwen3-8B Performance: Input 4096/Output 1024](../../../_static/image/benchmark/qwen3-8B_input4096_output1024.png)
 
-![Qwen3-8B Performance: Input 8192/Output 1024](../_static/image/benchmark/qwen3-8B_input8192_output1024.png)
+![Qwen3-8B Performance: Input 8192/Output 1024](../../../_static/image/benchmark/qwen3-8B_input8192_output1024.png)
 
 ### Detailed Performance Data
 
@@ -96,11 +100,11 @@ vllm serve "${MODEL_NAME}" \
 
 ### Performance Overview
 
-![Qwen3-32B Performance: Input 1024/Output 1024](../_static/image/benchmark/qwen3-32B_input1024_output1024.png)
+![Qwen3-32B Performance: Input 1024/Output 1024](../../../_static/image/benchmark/qwen3-32B_input1024_output1024.png)
 
-![Qwen3-32B Performance: Input 4096/Output 1024](../_static/image/benchmark/qwen3-32B_input4096_output1024.png)
+![Qwen3-32B Performance: Input 4096/Output 1024](../../../_static/image/benchmark/qwen3-32B_input4096_output1024.png)
 
-![Qwen3-32B Performance: Input 8192/Output 1024](../_static/image/benchmark/qwen3-32B_input8192_output1024.png)
+![Qwen3-32B Performance: Input 8192/Output 1024](../../../_static/image/benchmark/qwen3-32B_input8192_output1024.png)
 
 ### Detailed Performance Data
 

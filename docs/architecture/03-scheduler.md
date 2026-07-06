@@ -662,5 +662,3 @@ The broadcast mechanism is ZMQ's `PUB`/`SUB`: Node 0's Scheduler simultaneously 
 | `FunctionCallParser.parse_stream_chunk()` | `function_call/function_call_parser.py` | Streaming tool-call incremental parsing |
 | `CommunicationBackend` (ABC) | `managers/communication.py` | Communication backend abstraction |
 | `stream_output_generation()` | `managers/scheduler_output_processor_mixin.py` | Build `BatchTokenIDOut` streaming output |
-
----

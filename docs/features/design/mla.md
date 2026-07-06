@@ -2,7 +2,7 @@
 
 ## 1. Background
 
-`sglang-jax` needs MLA absorbed-path support to run DeepSeek-V2/V3 and other MLA-based models. The current runtime only has an MHA attention backend ([flashattention_backend.py](../../python/sgl_jax/srt/layers/attention/flashattention_backend.py)) and `MHATokenToKVPool` ([memory_pool.py](../../python/sgl_jax/srt/mem_cache/memory_pool.py));
+`sglang-jax` needs MLA absorbed-path support to run DeepSeek-V2/V3 and other MLA-based models. The current runtime only has an MHA attention backend ([flashattention_backend.py](../../../python/sgl_jax/srt/layers/attention/flashattention_backend.py)) and `MHATokenToKVPool` ([memory_pool.py](../../../python/sgl_jax/srt/mem_cache/memory_pool.py));
 
 ## 2. Goals & non-goals
 
@@ -226,7 +226,7 @@ Backend-level implication: the MLA dispatch path in `model_runner.py` (§3.10) r
 
 ### 3.7 `MLATokenToKVPool`
 
-Location: new class in [memory_pool.py](../../python/sgl_jax/srt/mem_cache/memory_pool.py), alongside `MHATokenToKVPool`, sharing the `KVCache` base.
+Location: new class in [memory_pool.py](../../../python/sgl_jax/srt/mem_cache/memory_pool.py), alongside `MHATokenToKVPool`, sharing the `KVCache` base.
 
 Buffer shape per layer:
 
@@ -319,14 +319,14 @@ Where we diverge from each reference and why:
 
 ## 4. Work breakdown
 
-- [ ] `MLATokenToKVPool` in [memory_pool.py](../../python/sgl_jax/srt/mem_cache/memory_pool.py).
+- [ ] `MLATokenToKVPool` in [memory_pool.py](../../../python/sgl_jax/srt/mem_cache/memory_pool.py).
 - [ ] `MLAAttentionBackend` + `MLAAttentionMetadata` in `sglang-jax/python/sgl_jax/srt/layers/attention/mla_backend.py`.
 - [ ] Expose `W_UQ_nope`, `W_UQ_rope`, `W_UK`, `W_UV`, `W_O` as separate per-head params on `MLAAttention` (no fusion at load time).
 - [ ] Rewrite `MLAAttention.__call__` to the two-step factored absorb path (§3.9): `W_UQ_nope → W_UK` on Q, `W_UV → W_O` on output.
 - [ ] Wire dispatch in `model_runner.py` (§3.10).
 - [ ] Pad `r_dim=64` → 128 inside `MLAAttentionBackend`.
 - [ ] Unit tests for pool (shape, set/get, pytree round-trip, `get_kv_size_bytes`) and backend (kernel call, shard_map specs, decode + extend parity vs. a naive reference).
-- [ ] Unit test for the MLA backend (mirror of [test_flashattention.py](../../python/sgl_jax/test/test_flashattention.py)) verifying `ForwardBatch` compatibility and numerical accuracy.
+- [ ] Unit test for the MLA backend (mirror of [test_flashattention_mha.py](../../../python/sgl_jax/test/test_flashattention_mha.py)) verifying `ForwardBatch` compatibility and numerical accuracy.
 
 ## 5. Additional notes
 

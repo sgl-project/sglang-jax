@@ -6,7 +6,7 @@ This guide covers how to use SGL-JAX for multimodal inference with models like W
 
 SGL-JAX provides a unified, high-performance inference framework for multimodal models. The framework supports heterogeneous compute patterns—integrating Auto-Regressive (AR) decoding with Diffusion denoising—within a single pipeline.
 
-For architecture details, see the [RFC: Multimodal Architecture Design](design/[RFC]multimodal_architechure.md).
+For architecture details, see the [RFC: Multimodal Architecture Design](design/multimodal_architecture_rfc.md).
 
 ## Supported Models
 
@@ -42,7 +42,7 @@ uv run python3 -u -m sgl_jax.launch_server \
 ```bash
 curl http://localhost:30000/api/v1/images/generation \
     -H "Content-Type: application/json" \
-    -d '{"prompt": "A curious raccoon", "size": "480*832"}'
+    -d '{"prompt": "A neon city at sunrise", "size": "480*832"}'
 ```
 
 #### Video Generation
@@ -50,7 +50,7 @@ curl http://localhost:30000/api/v1/images/generation \
 ```bash
 curl http://localhost:30000/api/v1/videos/generation \
     -H "Content-Type: application/json" \
-    -d '{"prompt": "A curious raccoon", "size": "480*832", "num_frames": 41}'
+    -d '{"prompt": "A neon city at sunrise", "size": "480*832", "num_frames": 41}'
 ```
 
 ## Configuration
@@ -82,5 +82,5 @@ stage_args:
 
 ## Related Documentation
 
-- [RFC: Multimodal Architecture Design](design/[RFC]multimodal_architechure.md)
+- [RFC: Multimodal Architecture Design](design/multimodal_architecture_rfc.md)
 - [SGL-JAX Architecture](../architecture/project-core-structure.md)

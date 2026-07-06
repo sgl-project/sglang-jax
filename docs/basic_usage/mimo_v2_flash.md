@@ -163,4 +163,4 @@ The fused MoE tuned config table covers the EP=8 shapes (server logs show `Using
 ## Additional Resources
 
 - [MiMo-V2-Flash Model Card](https://huggingface.co/XiaomiMiMo/MiMo-V2-Flash)
-- [SGL-JAX SWA Documentation](../basic_usage/features/)
+- [SGL-JAX SWA Documentation](../features/design/swa_eviction_and_lru_strategy.md)

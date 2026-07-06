@@ -1,11 +1,11 @@
-## Grok-2 Model Server Launch on SkyPilot
-### Hardware Requirements
-#### Minimum TPU Setup (v6e-32) topology:
+# Grok-2 Model Server Launch on SkyPilot
+## Hardware Requirements
+### Minimum TPU Setup (v6e-32) topology:
 - Total nodes: 8
 - TPU chips per node: 4 (v6e)
 - Total TPU chips: 32
 
-### Launch a TPU v6e-32 Cluster with SkyPilot
+## Launch a TPU v6e-32 Cluster with SkyPilot
 From the root of the sglang-jax workspace:
 ```bash
 cd ${WORKSPACE_DIR}/sglang-jax
@@ -13,7 +13,7 @@ bash scripts/launch_tpu.sh tpu-v6e-32 main
 ```
 This provisions an 8-node TPU v6e-32 cluster using your SkyPilot configuration.
 
-### Start the sglang-jax Server with Grok-2
+## Start the sglang-jax Server with Grok-2
 After the cluster is running, launch the Grok-2 model server:
 ```bash
 sky exec <CLUSTER_NAME> -- "cd sglang-jax && source .venv/bin/activate && \
@@ -27,7 +27,7 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache uv run python -u -m sgl_jax.launch_serv
 ```
 - `-d`: with `-d` flag, as soon as a job is submitted, return from this call and do not stream execution logs.
 
-### Example of sending a request to the Grok-2 Server
+## Example of sending a request to the Grok-2 Server
 ```bash
 curl -X POST http://0.0.0.0:30000/v1/completions \
 -H "Content-Type: application/json" \
@@ -39,7 +39,7 @@ curl -X POST http://0.0.0.0:30000/v1/completions \
 "top_k": 1}
 ```
 
-### Example command using evalscope to evaluate grok-2
+## Example command using evalscope to evaluate grok-2
 ```bash
 evalscope eval  \
 --model /models/xai-grok-2 \
@@ -61,7 +61,7 @@ evalscope eval \
 --generation-config '{"temperature": 0.5,"top_p":0.8,"top_k":40, "max_tokens": 4096}'
 ```
 
-### Useful SkyPilot Commands
+## Useful SkyPilot Commands
 ```bash
 sky -h # show help
 sky status # show all clusters status

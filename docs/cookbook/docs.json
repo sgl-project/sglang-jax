@@ -29,6 +29,7 @@
             "icon": "book",
             "pages": [
               "index",
+              "CONTRIBUTING",
               {
                 "group": "Autoregressive Models",
                 "pages": [
@@ -116,6 +117,14 @@
                   "base/basic-api-usage",
                   "base/tpu-topology-reference",
                   "base/launch-flags-reference"
+                ]
+              },
+              {
+                "group": "Benchmark Reports",
+                "pages": [
+                  "base/benchmarks/index",
+                  "base/benchmarks/qwen3_benchmark",
+                  "base/benchmarks/deepseek-r1-distill-qwen-math500"
                 ]
               },
               {

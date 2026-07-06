@@ -3,11 +3,11 @@
 ## Table of Contents
 - [Overview](#overview)
 - [Architecture Principles](#architecture-principles)
-- [CI/CD Pipeline Categories](#cicd-pipeline-categories)
+- [CI/CD Pipeline Workflows](#cicd-pipeline-workflows)
   - [Slash Command Handler](#slash-command-handler-slash-commandyml)
   - [PR Review](#pr-review-pr-reviewyml)
   - [CI Auto Bisect](#ci-auto-bisect-ci-auto-bisectyml)
-  - [Pull Request Testing](#pull-request-testing)
+  - [Pull Request Testing](#pull-request-testing-pr-testyml)
   - [Nightly Testing](#nightly-testing)
   - [Release Automation](#release-automation)
 

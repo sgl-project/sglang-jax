@@ -1,8 +1,8 @@
-### Developer Guide: Why We Chose JAX and How to Learn It
+# Developer Guide: Why We Chose JAX and How to Learn It
 
 Welcome to the `sglang-jax` project! This document is designed to help new developers, especially those unfamiliar with JAX, understand the core reasons behind our technical choices and provide a clear learning path.
 
-#### Why We Chose JAX
+## Why We Chose JAX
 
 Among the many deep learning frameworks available (like PyTorch and TensorFlow), we choose JAX as our core backend for three key advantages that are crucial for building a high-performance inference system for large language models.
 
@@ -29,7 +29,7 @@ Among the many deep learning frameworks available (like PyTorch and TensorFlow),
 
 ---
 
-#### How to Learn JAX and Pallas
+## How to Learn JAX and Pallas
 
 We recommend following this path to systematically master JAX and Pallas.
 

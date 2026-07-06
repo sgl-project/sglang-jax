@@ -407,5 +407,3 @@ Note:
 ## 5. Performance Test
 
 Ensure the current moe performance tests to pass, like `test_bailing_moe_performance_tp_2_ep_2`. Besides, ensure the performance with `enable_return_routed_experts` is similar to disable.
-
----

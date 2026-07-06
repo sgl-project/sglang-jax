@@ -1,3 +1,7 @@
+---
+title: "DeepSeek-R1-Distill-Qwen Math-500"
+---
+
 # deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
 
 ## Math-500
@@ -66,7 +70,7 @@ evalscope eval  --model deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B \
 
 ### Evaluation Results
 
-- bloat16: average is **0.808**
+- bfloat16: average is **0.808**
   - 0.82,0.804,0.822,0.814,0.796,0.798,0.802,0.796,0.798,0.816,0.812,0.83,0.792,0.796,0.82
   - 15 turns
 - float32: average is **0.804**

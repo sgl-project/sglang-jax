@@ -57,7 +57,7 @@ Research foundations:
 
 ### 2.1 System Architecture
 
-![LoRA Architecture](../_static/image/lora_architecture.jpg)
+![LoRA Architecture](../../_static/image/lora_architecture.jpg)
 
 
 ### 2.2 Module Organization
@@ -373,7 +373,7 @@ POST /generate
 
 ### 4.2 Component Dependency Graph
 
-![Component Dependency Graph](../_static/image/lora_dependency_graph.svg)
+![Component Dependency Graph](../../_static/image/lora_dependency_graph.svg)
 
 
 **Critical Dependencies:**
