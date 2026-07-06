@@ -23,7 +23,7 @@ docs/
 | Area | Current state | Follow-up |
 |---|---|---|
 | `architecture/` | Strong numbered walkthrough exists. | Needs technical review against the current runtime and diagrams. |
-| `basic_usage/` | Contains useful legacy model launch notes. | Deduplicate with cookbook or convert to redirects once cookbook coverage is confirmed. |
+| `basic_usage/` | Model-specific pages now point to cookbook recipes instead of duplicating launch commands. | Keep this section limited to stable entry points and general usage notes. |
 | `features/` | Good feature-level material, now merged with tracked design docs. | Normalize page structure and add owner/status metadata. |
 | `developer_guide/` | Contribution, CI, TPU, benchmarking, release, and community docs exist. | Add a focused "add a new model" engineering guide that complements cookbook recipes. |
 | `evaluations/` | Former single evaluation note moved to cookbook benchmark references. | Define a repeatable accuracy evaluation methodology and accepted datasets. |

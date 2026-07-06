@@ -54,9 +54,9 @@ Status prefix: ✅ validated · 🧪 partially validated · 🚧 starter (not ye
 | TPU | Topology | Nodes | Recipes |
 |---|---|---|---|
 | v6e-16 | 4x4 | 4 | ✅ [MiMo-V2-Flash](autoregressive/Xiaomi/MiMo-V2-Flash.md) · ✅ [Qwen3-30B-A3B MoE](autoregressive/Qwen/Qwen3-MoE.md) · ✅ [Kimi-Linear](autoregressive/Moonshotai/Kimi-Linear.md) |
-| v6e-32 | 4x8 | 8 | ✅ [Grok-2](autoregressive/Grok/Grok2.md) · ✅ [Llama 3.3 70B](autoregressive/Llama/Llama3.3-70B.md) · ✅ [GLM-4.5-Air](autoregressive/GLM/GLM-4.5.md) |
-| v6e-64 | 4x4x4 | 16 | ✅ [MiMo-V2.5-Pro](autoregressive/Xiaomi/MiMo-V2.5-Pro.md) · ✅ [DeepSeek-V3](autoregressive/DeepSeek/DeepSeek-V3.md) · ✅ [DeepSeek-R1](autoregressive/DeepSeek/DeepSeek-R1.md) · ✅ [Ling-2.6](autoregressive/InclusionAI/Ling-2.6.md) |
-| v7x-16 | 2x2x4 | 4 | ✅ [MiMo-V2.5-Pro](autoregressive/Xiaomi/MiMo-V2.5-Pro.md) · ✅ [Ling-2.6](autoregressive/InclusionAI/Ling-2.6.md) · ✅ [DeepSeek-V3](autoregressive/DeepSeek/DeepSeek-V3.md) · ✅ [DeepSeek-R1](autoregressive/DeepSeek/DeepSeek-R1.md) |
+| v6e-32 | 4x8 | 8 | ✅ [Llama 3.3 70B](autoregressive/Llama/Llama3.3-70B.md) · ✅ [GLM-4.5-Air](autoregressive/GLM/GLM-4.5.md) |
+| v6e-64 | 4x4x4 | 16 | ✅ [MiMo-V2.5-Pro](autoregressive/Xiaomi/MiMo-V2.5-Pro.md) · ✅ [Grok-2](autoregressive/Grok/Grok2.md) · ✅ [DeepSeek-V3](autoregressive/DeepSeek/DeepSeek-V3.md) · ✅ [DeepSeek-R1](autoregressive/DeepSeek/DeepSeek-R1.md) · ✅ [Ling-2.6](autoregressive/InclusionAI/Ling-2.6.md) |
+| v7x-16 | 2x2x4 | 4 | 🧪 [MiMo-V2.5-Pro](autoregressive/Xiaomi/MiMo-V2.5-Pro.md) · ✅ [Ling-2.6](autoregressive/InclusionAI/Ling-2.6.md) · ✅ [DeepSeek-V3](autoregressive/DeepSeek/DeepSeek-V3.md) · ✅ [DeepSeek-R1](autoregressive/DeepSeek/DeepSeek-R1.md) |
 
 ### Diffusion (`--multimodal` server)
 

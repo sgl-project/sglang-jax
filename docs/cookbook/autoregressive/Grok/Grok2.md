@@ -12,7 +12,7 @@ title: "Grok-2"
 
 **Key Features**:
 
-- **~269B MoE / ~70B active** — 8 experts, 2 active per token (25% active fraction); served via SGL-JAX `Grok1ForCausalLM` runtime with `--moe-backend fused` (or `epmoe` for small EP).
+- **~269B MoE / ~70B active** — 8 experts, 2 active per token (25% active fraction); served via SGL-JAX `Grok1ForCausalLM` runtime. The validated v6e-64 path uses `--moe-backend epmoe`.
 - **Base model, not chat-tuned** — has no chat template; use the raw `/v1/completions` endpoint (see [§3.1](#31-basic-text-completion-base-model)), not `/v1/chat/completions`. xAI did not release a chat / instruct variant.
 - **Pre-sharded TP=8 safetensors checkpoint** — files named `pytorch_model-NNNNN-TP-{000..007}.safetensors`. The 8 per-expert/per-shard files imply the checkpoint expects **TP to be a multiple of 8** when serving (matches `--ep-size 8` for the MoE experts).
 - **GQA attention** — `num_attention_heads=64`, `num_key_value_heads=8` → 8 KV heads (sharding constraint: tensor axis must divide 8).
@@ -31,7 +31,7 @@ title: "Grok-2"
 
 | TPU | Topology | Nodes | Chips | `--tp-size` | `--ep-size` | `--moe-backend` | Notes |
 |---|---|---|---|---|---|---|---|
-| **v6e-64** | 8x8 | 16 | 64 | 64 | 8 | `fused` | This is the slice we measured on. 64-chip slice; ~8.4 GB weights per chip, plenty of room for KV / activations. `--ep-size 8` matches the 8 experts (and the pre-sharded TP-{000..007} file layout). |
+| **v6e-64** | 8x8 | 16 | 64 | 64 | 8 | `epmoe` | This is the slice we measured on. 64-chip slice; ~8.4 GB weights per chip, plenty of room for KV / activations. `--ep-size 8` matches the 8 experts (and the pre-sharded TP-{000..007} file layout). |
 
 **Pre-sharded TP=8 constraint**: the checkpoint files are named `pytorch_model-NNNNN-TP-{000..007}.safetensors` — `--tp-size` must be a multiple of 8 so the loader can map each pre-shard onto a contiguous device slice. v6e-64 (`tp=64=8×8`) satisfies this.
 
@@ -77,12 +77,12 @@ For temporary v6e experiments, advanced users can adapt [SkyPilot launcher](../.
 
 **MoE Backend and EP Sizing:**
 - Grok-2 is MoE with 8 experts (2 active per token). Use `--ep-size 8` to align with the pre-sharded TP=8 checkpoint layout.
-- `--moe-backend fused` is correct for EP=8: `intermediate_size=32768`, and `32768 % 512 == 0` satisfies the fused kernel alignment constraint. `--moe-backend epmoe` is the safe fallback at this EP size if the fused path regresses.
+- `--moe-backend epmoe` is the validated backend on the v6e-64 path. The fused backend currently fails to initialize on this small-EP large-mesh layout; revisit if fused MoE support changes.
 - `--ep-size` must divide `num_local_experts (=8)` evenly. EP 1 / 2 / 4 / 8 are valid; 16+ would mis-shard the expert dim.
 
 **Mesh / TP Constraints:**
 - Pre-sharded TP=8 checkpoint files force `--tp-size` to be a multiple of 8. v6e-64 → tp=64, v6e-32 → tp=32, v7x-16 → tp=32.
-- With `--moe-backend fused`, the fused kernel maps mesh `data * tensor` to the EP group. On v6e-64 with default `--dp-size 1`, mesh is `(data=1, tensor=64)` and `tensor / ep_size = 8` becomes the within-EP TP shard count.
+- On v6e-64 with default `--dp-size 1`, mesh is `(data=1, tensor=64)` and `tensor / ep_size = 8` becomes the within-EP TP shard count.
 - GQA `num_kv_heads=8` means the attention KV head dim is sharded over 8 — combined with `--ep-size 8`, all the dimensional constraints converge on 8.
 
 **Memory Management:**
