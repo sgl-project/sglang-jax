@@ -1956,6 +1956,15 @@ def spec_decode_verify(spec_worker, model_worker_batch, cur_allocate_lens):
 
     if dump_verify and target_logits is not None:
         target_argmax = np.asarray(jax.device_get(jnp.argmax(target_logits, axis=-1)))
+        target_top_k = min(
+            int(os.environ.get("SGL_JAX_VERIFYDUMP_TOPK", "8")),
+            target_logits.shape[-1],
+        )
+        target_top_vals, target_top_idx = jax.lax.top_k(
+            target_logits.astype(jnp.float32), target_top_k
+        )
+        target_top_vals_host = _debug_host_array(target_top_vals, limit=None)
+        target_top_idx_host = _debug_host_array(target_top_idx, limit=None)
         pred_host = _debug_host_array(prepared_predict, limit=None)
         acc_host = _debug_host_array(prepared_accept_lens_host, limit=None)
         seq_host = _debug_host_array(prepared_verify_seq_lens, limit=None)
@@ -1988,6 +1997,19 @@ def spec_decode_verify(spec_worker, model_worker_batch, cur_allocate_lens):
             emitted0 = pred_host[: int(acc_host[0])] if acc_host.size else None
         logger.info(
             "[VERIFYDUMP] fused verify_forward argmax per draft pos = %s", target_argmax[:8]
+        )
+        logger.info(
+            "[VERIFYDUMP] fused verify top logits " "top_ids0=%s top_vals0=%s",
+            (
+                target_top_idx_host[:n].tolist()
+                if isinstance(target_top_idx_host, np.ndarray)
+                else target_top_idx_host
+            ),
+            (
+                target_top_vals_host[:n].tolist()
+                if isinstance(target_top_vals_host, np.ndarray)
+                else target_top_vals_host
+            ),
         )
         logger.info(
             "[VERIFYDUMP] fused verify trace "

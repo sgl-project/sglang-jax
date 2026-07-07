@@ -465,6 +465,7 @@ class ModelWorker:
                 save_logits_file_info,
                 forward_batch.forward_mode,
             )
+        self._dump_decode_logits_for_debug(logits_output, model_worker_batch)
 
         if skip_sample:
             next_token_ids_device = None
@@ -648,6 +649,49 @@ class ModelWorker:
 
         # os.makedirs(os.path.dirname(file_name), exist_ok=True)
         np.savetxt(file_name, np.asarray(seq_layer_topk_cpu).flatten(), fmt="%d")
+
+    def _dump_decode_logits_for_debug(
+        self,
+        logits_output: LogitsProcessorOutput,
+        model_worker_batch: ModelWorkerBatch,
+    ):
+        if os.environ.get("SGL_JAX_DECODEDUMP") != "1":
+            return
+        if not model_worker_batch.forward_mode.is_decode():
+            return
+        if logits_output.next_token_logits is None:
+            return
+
+        top_k = min(
+            int(os.environ.get("SGL_JAX_DECODEDUMP_TOPK", "8")),
+            logits_output.next_token_logits.shape[-1],
+        )
+        top_vals_dev, top_idx_dev = jax.lax.top_k(
+            logits_output.next_token_logits.astype(jnp.float32), top_k
+        )
+        needs_allgather = model_worker_batch.dp_size > 1
+        top_vals = np.asarray(_host_logprob_array(top_vals_dev, allgather=needs_allgather))
+        top_idx = np.asarray(_host_logprob_array(top_idx_dev, allgather=needs_allgather))
+
+        selector = model_worker_batch.logits_indices_selector
+        if selector is not None and len(selector) > 0:
+            selector = np.asarray(selector)
+            if int(selector.max()) < top_idx.shape[0]:
+                top_vals = top_vals[selector]
+                top_idx = top_idx[selector]
+
+        logger.info(
+            "[DECODEDUMP] decode logits "
+            "bid=%s seq_lens[:4]=%s input_ids[:8]=%s positions[:8]=%s "
+            "argmax[:8]=%s top_ids0=%s top_vals0=%s",
+            model_worker_batch.bid,
+            np.asarray(model_worker_batch.seq_lens)[:4],
+            np.asarray(model_worker_batch.input_ids)[:8],
+            np.asarray(model_worker_batch.positions)[:8],
+            top_idx[:8, 0] if top_idx.ndim == 2 else top_idx[:8],
+            top_idx[0].tolist() if top_idx.ndim == 2 and top_idx.shape[0] else top_idx.tolist(),
+            top_vals[0].tolist() if top_vals.ndim == 2 and top_vals.shape[0] else top_vals.tolist(),
+        )
 
 
 class MockModelWorker:
