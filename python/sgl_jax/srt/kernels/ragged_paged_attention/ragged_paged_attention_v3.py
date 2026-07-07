@@ -51,6 +51,7 @@ logger = logging.getLogger(__name__)
 _COMPILER_PARAMS_SUPPORTS_SEMAPHORE = (
     "disable_semaphore_checks" in _inspect.signature(pltpu.CompilerParams).parameters
 )
+_VERIFY_RPA_LOGGED_KEYS = set()
 
 
 def _semaphore_kwargs(disable_semaphore_checks: bool) -> dict:
@@ -2013,12 +2014,17 @@ def ragged_paged_attention(
 
     def _prepare_block_sizes(block_sizes, case):
         if block_sizes is None:
-            if (
+            decode_like_verify = (
                 os.environ.get("SGL_JAX_VERIFY_DECODE_LIKE_RPA") == "1"
                 and mask_aligned_to_cu_kv
                 and case == RpaCase.MIXED
-            ):
-                return get_default_block_sizes(
+            )
+            should_log_verify_rpa = case == RpaCase.MIXED and (
+                os.environ.get("SGL_JAX_VERIFYDUMP") == "1"
+                or os.environ.get("SGL_JAX_VERIFY_DECODE_LIKE_RPA") == "1"
+            )
+            if decode_like_verify:
+                sizes = get_default_block_sizes(
                     q.dtype,
                     kv_cache_fused_processed.dtype,
                     actual_num_q_heads,
@@ -2033,6 +2039,29 @@ def ragged_paged_attention(
                     use_custom_mask=not use_causal_mask,
                     sliding_window=sliding_window,
                 )
+                if should_log_verify_rpa:
+                    key = (
+                        "decode_like",
+                        q.shape,
+                        kv_cache_fused_processed.shape,
+                        sliding_window,
+                        tuple(sizes.values()),
+                    )
+                    if key not in _VERIFY_RPA_LOGGED_KEYS:
+                        _VERIFY_RPA_LOGGED_KEYS.add(key)
+                        logger.info(
+                            "[VERIFY_RPA] mixed block sizes active decode_like=True "
+                            "mask_aligned_to_cu_kv=%s custom_mask=%s causal=%s "
+                            "q_shape=%s kv_cache_shape=%s sliding_window=%s sizes=%s",
+                            mask_aligned_to_cu_kv,
+                            custom_mask is not None,
+                            use_causal_mask,
+                            q.shape,
+                            kv_cache_fused_processed.shape,
+                            sliding_window,
+                            sizes,
+                        )
+                return sizes
             # The tuned table is measured on v7 (full VMEM). Restrict lookups to
             # v7 so v6e/v5 keep main's heuristic path unchanged (the v7-tuned
             # entries are not valid for the v6e //2 budget and regress its
@@ -2055,7 +2084,7 @@ def ragged_paged_attention(
             if tuned is not None:
                 block_sizes = tuned
             else:
-                return get_default_block_sizes(
+                sizes = get_default_block_sizes(
                     q.dtype,
                     kv_cache_fused_processed.dtype,
                     actual_num_q_heads,
@@ -2070,6 +2099,32 @@ def ragged_paged_attention(
                     use_custom_mask=not use_causal_mask,
                     sliding_window=sliding_window,
                 )
+                if should_log_verify_rpa:
+                    key = (
+                        "default",
+                        q.shape,
+                        kv_cache_fused_processed.shape,
+                        sliding_window,
+                        tuple(sizes.values()),
+                        os.environ.get("SGL_JAX_VERIFY_DECODE_LIKE_RPA") == "1",
+                        mask_aligned_to_cu_kv,
+                    )
+                    if key not in _VERIFY_RPA_LOGGED_KEYS:
+                        _VERIFY_RPA_LOGGED_KEYS.add(key)
+                        logger.info(
+                            "[VERIFY_RPA] mixed block sizes active decode_like=False "
+                            "flag=%s mask_aligned_to_cu_kv=%s custom_mask=%s causal=%s "
+                            "q_shape=%s kv_cache_shape=%s sliding_window=%s sizes=%s",
+                            os.environ.get("SGL_JAX_VERIFY_DECODE_LIKE_RPA") == "1",
+                            mask_aligned_to_cu_kv,
+                            custom_mask is not None,
+                            use_causal_mask,
+                            q.shape,
+                            kv_cache_fused_processed.shape,
+                            sliding_window,
+                            sizes,
+                        )
+                return sizes
 
         return {
             "bq_sz": block_sizes[0],

@@ -26,6 +26,7 @@ from sgl_jax.srt.utils.profiling_utils import named_scope
 logger = logging.getLogger(__name__)
 
 _VERIFY_DUMP_SEEN = False
+_VERIFY_RPA_DUMP_SEEN = False
 
 
 def _debug_host_array(value, limit: int = 8):
@@ -571,6 +572,7 @@ class FlashAttention(AttentionBackend):
                 _debug_host_array(page_indices_arg),
             )
 
+        global _VERIFY_RPA_DUMP_SEEN
         in_specs = (
             P(self.attention_data_partition_axis, self.kv_partition_axis),  # queries
             P(self.attention_data_partition_axis, self.kv_partition_axis),  # keys (new tokens)
@@ -604,6 +606,35 @@ class FlashAttention(AttentionBackend):
             self.forward_metadata.custom_mask is not None
             and forward_batch.forward_mode.is_target_verify()
         )
+        if (
+            (
+                os.environ.get("SGL_JAX_VERIFYDUMP") == "1"
+                or os.environ.get("SGL_JAX_VERIFY_DECODE_LIKE_RPA") == "1"
+            )
+            and not _VERIFY_RPA_DUMP_SEEN
+            and forward_batch is not None
+            and forward_batch.forward_mode.is_target_verify()
+        ):
+            _VERIFY_RPA_DUMP_SEEN = True
+            logger.info(
+                "[VERIFY_RPA] flash attention path layer=%s swa_win=%s "
+                "custom_mask_is_none=%s mask_aligned_to_cu_kv=%s "
+                "q_shape=%s k_shape=%s kv_cache_shape=%s "
+                "cu_q_lens[:8]=%s cu_kv_lens[:8]=%s distribution[:8]=%s "
+                "seq_lens[:8]=%s page_idx[:8]=%s",
+                layer.layer_id,
+                layer.sliding_window_size,
+                self.forward_metadata.custom_mask is None,
+                mask_aligned_to_cu_kv,
+                q.shape,
+                k.shape,
+                kv_cache_fused.shape,
+                _debug_host_array(self.forward_metadata.cu_q_lens),
+                _debug_host_array(self.forward_metadata.cu_kv_lens),
+                _debug_host_array(self.forward_metadata.distribution),
+                _debug_host_array(self.forward_metadata.seq_lens),
+                _debug_host_array(page_indices_arg),
+            )
 
         def _ragged_paged_attention_with_fused_kv(*args):
             queries, keys, values, kv_cache_fused = args[:4]
