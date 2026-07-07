@@ -38,6 +38,7 @@ from sgl_jax.srt.managers.communication import CommunicationBackend
 from sgl_jax.srt.managers.dp_rank_assignment import assign_dp_ranks
 from sgl_jax.srt.managers.dp_schedule_policy import (
     pick_cache_aware_dp,
+    pick_shape_aware_dp,
     req_prefix_match_key,
 )
 from sgl_jax.srt.managers.io_struct import (
@@ -727,8 +728,15 @@ class Scheduler(
             return bool(sampling_params.get("ignore_eos", False))
         return bool(getattr(sampling_params, "ignore_eos", False))
 
-    def _estimate_req_tokens(self, req: Req | TokenizedGenerateReqInput) -> int:
-        """Estimate per-request token load as input + expected output."""
+    def _estimate_req_input_output_tokens(
+        self, req: Req | TokenizedGenerateReqInput
+    ) -> tuple[int, int]:
+        """Estimate per-request (input_tokens, estimated_output_tokens).
+
+        The prefill (input) and decode (output) loads are kept separate here so
+        the ``shape_aware`` policy can balance them independently;
+        ``_estimate_req_tokens`` sums them for the load-total policies.
+        """
         input_token_len = self._get_input_token_len(req)
         sampling_params = getattr(req, "sampling_params", None)
         est_max_new_tokens = self._extract_max_new_tokens(sampling_params)
@@ -750,10 +758,11 @@ class Scheduler(
             ) * self.page_size
             est_output_tokens += IGNORE_EOS_RESERVE_TOKENS
 
-        if isinstance(req, Req):
-            # For running requests, scheduler load should reflect total reserved footprint.
-            return input_token_len + est_output_tokens
+        return input_token_len, est_output_tokens
 
+    def _estimate_req_tokens(self, req: Req | TokenizedGenerateReqInput) -> int:
+        """Estimate per-request token load as input + expected output."""
+        input_token_len, est_output_tokens = self._estimate_req_input_output_tokens(req)
         return input_token_len + est_output_tokens
 
     def _get_dp_load_snapshot(self) -> tuple[list[int], list[int]]:
@@ -882,6 +891,84 @@ class Scheduler(
 
         return pick_cache_aware_dp(eligible, counts, token_counts, matches, prompt_len)
 
+    def _get_dp_io_snapshot(self) -> tuple[list[int], list[int]]:
+        """Return per-DP (input_tokens, output_tokens) for in-flight scheduled work.
+
+        Mirrors ``_get_dp_load_snapshot`` but keeps prefill (input) and decode
+        (output) token loads separate, for the ``shape_aware`` policy.
+        """
+        input_counts = [0] * self.dp_size
+        output_counts = [0] * self.dp_size
+
+        def add(req, dp_rank):
+            in_tok, out_tok = self._estimate_req_input_output_tokens(req)
+            input_counts[dp_rank] += in_tok
+            output_counts[dp_rank] += out_tok
+
+        for dp_rank, info in enumerate(self.running_batch.reqs_info):
+            if not info.reqs:
+                continue
+            for req in info.reqs:
+                add(req, dp_rank)
+
+        # In overlap mode, last_batch can still be in-flight (extend) but not yet
+        # merged into running_batch. Include it, mirroring _get_dp_load_snapshot.
+        if self.last_batch and self.last_batch.forward_mode.is_extend():
+            for dp_rank, info in enumerate(self.last_batch.reqs_info):
+                if not info.reqs and info.chunked_req is None:
+                    continue
+                running_ids = set()
+                running_info = self.running_batch.reqs_info[dp_rank]
+                if running_info.reqs:
+                    running_ids = {req.rid for req in running_info.reqs}
+                for req in info.reqs or []:
+                    if req.rid in running_ids:
+                        continue
+                    add(req, dp_rank)
+                if info.chunked_req is not None and info.chunked_req.rid not in running_ids:
+                    add(info.chunked_req, dp_rank)
+
+        return input_counts, output_counts
+
+    def _select_shape_aware_dp(
+        self,
+        item_input_tokens: int,
+        item_output_tokens: int,
+        extra_counts: list[int],
+        extra_token_counts: list[int],
+        extra_input_counts: list[int],
+        extra_output_counts: list[int],
+    ) -> int | None:
+        """Route a request by balancing prefill (input) and decode (output) load jointly.
+
+        Defers to ``pick_shape_aware_dp``: among eligible ranks, pick the one
+        whose bottleneck dimension stays smallest after admitting this request,
+        ``max(input + input_r, output + output_r)``. This draws a prefill-heavy
+        request toward a decode-heavy rank and vice versa, co-locating
+        complementary shapes.
+
+        Per-rank load = live running snapshot + ``extra_*`` (requests assigned
+        earlier in this intake tick). Folding in the per-tick pending input/output
+        split is load-bearing at low concurrency: without it a burst routes
+        against a stale snapshot and mis-balances. Eligibility (admission cap)
+        matches min_running. Returns None if all DP ranks are full.
+        """
+        if self.dp_size == 1:
+            return 0
+
+        eligible, _counts, _token_counts = self._dp_load_and_eligible(
+            extra_counts, extra_token_counts
+        )
+        if not eligible:
+            return None
+
+        running_input, running_output = self._get_dp_io_snapshot()
+        input_counts = [running_input[i] + extra_input_counts[i] for i in range(self.dp_size)]
+        output_counts = [running_output[i] + extra_output_counts[i] for i in range(self.dp_size)]
+        return pick_shape_aware_dp(
+            eligible, input_counts, output_counts, item_input_tokens, item_output_tokens
+        )
+
     def select_dp_for_request(self, recv_reqs: list[Req]) -> list[Req]:
         """Assign dp_rank to incoming requests using the configured DP policy.
 
@@ -896,7 +983,9 @@ class Scheduler(
             select_round_robin_dp=self._select_round_robin_dp,
             select_cache_aware_dp=self._select_cache_aware_dp,
             select_min_running_dp=self._select_min_running_dp,
+            select_shape_aware_dp=self._select_shape_aware_dp,
             estimate_req_tokens=self._estimate_req_tokens,
+            estimate_req_io_tokens=self._estimate_req_input_output_tokens,
         )
         self.pending_dp_reqs = result.pending_reqs
         return result.ready_reqs

@@ -98,3 +98,36 @@ def pick_cache_aware_dp(
             return least_loaded(holders)
 
     return least_loaded(eligible)
+
+
+def pick_shape_aware_dp(
+    eligible: list[int],
+    input_counts: list[int],
+    output_counts: list[int],
+    item_input: int = 0,
+    item_output: int = 0,
+) -> int | None:
+    """Shape-aware DP policy: joint prefill/decode load balancing.
+
+    Balance prefill (input) and decode (output) token load jointly: route to the
+    eligible rank whose *bottleneck* dimension stays smallest after admitting the
+    request::
+
+        score(r) = max(input_counts[r] + item_input, output_counts[r] + item_output)
+
+    The ``max`` keeps whichever resource is the bottleneck on each rank (prefill
+    FLOPs vs. decode/KV HBM) lowest, so a prefill-heavy request is drawn toward a
+    decode-heavy rank and vice versa, co-locating complementary shapes rather than
+    piling like-shaped work onto one rank. Ties are broken by total load then rank
+    index. ``input_counts`` / ``output_counts`` are the per-rank running+pending
+    token sums; eligibility (the admission cap) is decided by the caller.
+    """
+    if not eligible:
+        return None
+
+    def score(r: int) -> tuple[int, int, int]:
+        after_in = input_counts[r] + item_input
+        after_out = output_counts[r] + item_output
+        return (max(after_in, after_out), after_in + after_out, r)
+
+    return min(eligible, key=score)
