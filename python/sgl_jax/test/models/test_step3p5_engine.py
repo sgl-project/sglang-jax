@@ -435,6 +435,90 @@ def _run_extend_all_positions(model, mesh, kv_pool, prefix_len, token_ids):
     return jnp.asarray(logits, dtype=jnp.float32)
 
 
+def _run_target_verify_all_positions(model, mesh, kv_pool, prefix_len, token_ids):
+    from sgl_jax.srt.layers.attention.flashattention_backend import FlashAttention
+    from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
+    from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+    from sgl_jax.srt.speculative.eagle_util import EagleVerifyInput
+
+    num_tokens = int(token_ids.shape[0])
+    total = prefix_len + num_tokens
+    positions = jnp.arange(prefix_len, total, dtype=jnp.int32)
+    spec_info = EagleVerifyInput(
+        draft_token=token_ids,
+        custom_mask=None,
+        positions=positions,
+        retrive_index=jnp.arange(num_tokens, dtype=jnp.int32).reshape(1, num_tokens),
+        retrive_next_token=jnp.concatenate(
+            [jnp.arange(1, num_tokens, dtype=jnp.int32), jnp.array([-1], dtype=jnp.int32)]
+        ).reshape(1, num_tokens),
+        retrive_next_sibling=jnp.full((1, num_tokens), -1, dtype=jnp.int32),
+        retrive_cum_len=None,
+        seq_lens_cpu=np.array([prefix_len], dtype=np.int32),
+        spec_steps=num_tokens - 1,
+        topk=1,
+        draft_token_num=num_tokens,
+        seq_lens_sum=prefix_len,
+        capture_hidden_mode=None,
+    )
+    backend = FlashAttention(
+        model.config.num_attention_heads,
+        model.config.num_attention_groups,
+        _HEAD_DIM,
+        page_size=kv_pool.page_size,
+        mesh=mesh,
+    )
+    mwb = ModelWorkerBatch(
+        bid=0,
+        forward_mode=ForwardMode.TARGET_VERIFY,
+        input_ids=np.asarray(token_ids),
+        real_input_ids_len=num_tokens,
+        seq_lens=np.array([prefix_len], dtype=np.int32),
+        out_cache_loc=np.arange(prefix_len, total, dtype=np.int32),
+        req_pool_indices=np.zeros(1, dtype=np.int32),
+        sampling_info=None,
+        positions=np.asarray(positions),
+        cache_loc=np.arange(total, dtype=np.int32),
+        extend_seq_lens=None,
+        extend_prefix_lens=None,
+        return_logprob=False,
+        return_output_logprob_only=False,
+        top_logprobs_nums=None,
+        token_ids_logprobs=None,
+        extend_logprob_start_lens=None,
+        extend_input_logprob_token_ids=None,
+        logits_indices=None,
+        real_bs=1,
+        real_bs_per_dp=[1],
+        logits_indices_selector=np.array([0], dtype=np.int32),
+        spec_info_padded=spec_info,
+        dp_size=1,
+        per_dp_bs_size=1,
+    )
+    backend.forward_metadata = backend.get_eagle_forward_metadata(mwb)
+    fb = ForwardBatch(
+        bid=0,
+        forward_mode=ForwardMode.TARGET_VERIFY,
+        batch_size=1,
+        input_ids=token_ids,
+        req_pool_indices=jnp.zeros(1, dtype=jnp.int32),
+        seq_lens=jnp.array([prefix_len], dtype=jnp.int32),
+        out_cache_loc=jnp.arange(prefix_len, total, dtype=jnp.int32),
+        cache_loc=jnp.arange(total, dtype=jnp.int32),
+        positions=positions,
+        extend_prefix_lens=None,
+        extend_seq_lens=None,
+        attn_backend=backend,
+        spec_info=spec_info,
+    )
+
+    with jax.set_mesh(mesh):
+        hidden, layers_kv_fused, _, _ = model.model(fb, kv_pool)
+        logits = model.logits_processor._get_logits(hidden, model.lm_head)
+    kv_pool.replace_buffer(layers_kv_fused)
+    return jnp.asarray(logits, dtype=jnp.float32)
+
+
 # ---------------------------------------------------------------------------
 # Test C-⓪: multi-token EXTEND causality
 # ---------------------------------------------------------------------------
@@ -577,6 +661,53 @@ class TestMultiTokenExtendCausality(unittest.TestCase):
                 "produce the same first-position logits as a clean cache"
             ),
         )
+
+    def test_target_verify_logits_match_plain_extend_logits(self):
+        model = self._build_and_load()
+        prefix_ids = jnp.array(np.arange(_PREFIX_LEN, dtype=np.int32) % _VOCAB)
+        verify_window = jnp.array([17, 19, 23, 29], dtype=jnp.int32)
+        total_tokens = _PREFIX_LEN + int(verify_window.shape[0])
+
+        with jax.default_matmul_precision("highest"):
+            extend_pool = self._prefill_pool(model, prefix_ids, total_tokens)
+            extend_logits = _run_extend_all_positions(
+                model, self._mesh, extend_pool, _PREFIX_LEN, verify_window
+            )
+            jax.block_until_ready(extend_logits)
+
+            verify_pool = self._prefill_pool(model, prefix_ids, total_tokens)
+            verify_logits = _run_target_verify_all_positions(
+                model, self._mesh, verify_pool, _PREFIX_LEN, verify_window
+            )
+            jax.block_until_ready(verify_logits)
+
+        extend_host = np.asarray(extend_logits, dtype=np.float64)
+        verify_host = np.asarray(verify_logits, dtype=np.float64)
+        print("\n=== TARGET_VERIFY vs plain EXTEND logits ===")
+        for pos in range(int(verify_window.shape[0])):
+            diff = np.abs(verify_host[pos] - extend_host[pos])
+            max_abs = float(np.max(diff))
+            scale = float(max(np.max(np.abs(extend_host[pos])), 1e-6))
+            print(
+                f" pos={pos} argmax_verify={int(verify_host[pos].argmax())} "
+                f"argmax_extend={int(extend_host[pos].argmax())} "
+                f"max_abs_diff={max_abs:.6e} scale={scale:.6e}"
+            )
+            self.assertEqual(
+                int(verify_host[pos].argmax()),
+                int(extend_host[pos].argmax()),
+                f"TARGET_VERIFY argmax differs from plain EXTEND at verify position {pos}",
+            )
+            np.testing.assert_allclose(
+                verify_host[pos],
+                extend_host[pos],
+                rtol=0.0,
+                atol=_RTOL_FP32_LOGIC * scale,
+                err_msg=(
+                    "TARGET_VERIFY logits must match plain EXTEND logits for the same "
+                    f"prefix/window at verify position {pos}"
+                ),
+            )
 
 
 # ---------------------------------------------------------------------------
