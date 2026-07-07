@@ -709,6 +709,68 @@ class TestMultiTokenExtendCausality(unittest.TestCase):
                 ),
             )
 
+    def test_partial_accept_after_target_verify_matches_clean_context(self):
+        model = self._build_and_load()
+        prefix_ids = jnp.array(np.arange(_PREFIX_LEN, dtype=np.int32) % _VOCAB)
+        accepted_tokens = jnp.array([17, 19], dtype=jnp.int32)
+        verify_window = jnp.array([17, 19, 3, 5], dtype=jnp.int32)
+        next_window = jnp.array([23, 29, 31, 37], dtype=jnp.int32)
+        total_tokens = _PREFIX_LEN + int(verify_window.shape[0])
+
+        with jax.default_matmul_precision("highest"):
+            dirty_pool = self._prefill_pool(model, prefix_ids, total_tokens)
+            first_verify_logits = _run_target_verify_all_positions(
+                model, self._mesh, dirty_pool, _PREFIX_LEN, verify_window
+            )
+            jax.block_until_ready(first_verify_logits)
+            dirty_next_logits = _run_target_verify_all_positions(
+                model,
+                self._mesh,
+                dirty_pool,
+                _PREFIX_LEN + int(accepted_tokens.shape[0]),
+                next_window,
+            )
+            jax.block_until_ready(dirty_next_logits)
+
+            clean_prefix = jnp.concatenate([prefix_ids, accepted_tokens])
+            clean_pool = self._prefill_pool(model, clean_prefix, total_tokens)
+            clean_next_logits = _run_target_verify_all_positions(
+                model,
+                self._mesh,
+                clean_pool,
+                _PREFIX_LEN + int(accepted_tokens.shape[0]),
+                next_window,
+            )
+            jax.block_until_ready(clean_next_logits)
+
+        dirty_host = np.asarray(dirty_next_logits, dtype=np.float64)
+        clean_host = np.asarray(clean_next_logits, dtype=np.float64)
+        print("\n=== partial accept TARGET_VERIFY KV commit ===")
+        for pos in range(int(next_window.shape[0])):
+            diff = np.abs(dirty_host[pos] - clean_host[pos])
+            max_abs = float(np.max(diff))
+            scale = float(max(np.max(np.abs(clean_host[pos])), 1e-6))
+            print(
+                f" pos={pos} argmax_dirty={int(dirty_host[pos].argmax())} "
+                f"argmax_clean={int(clean_host[pos].argmax())} "
+                f"max_abs_diff={max_abs:.6e} scale={scale:.6e}"
+            )
+            self.assertEqual(
+                int(dirty_host[pos].argmax()),
+                int(clean_host[pos].argmax()),
+                f"Partial-accept TARGET_VERIFY context differs at next verify position {pos}",
+            )
+            np.testing.assert_allclose(
+                dirty_host[pos],
+                clean_host[pos],
+                rtol=0.0,
+                atol=_RTOL_FP32_LOGIC * scale,
+                err_msg=(
+                    "After accepting only the prefix of a TARGET_VERIFY window, the "
+                    f"next verify position {pos} must match a clean committed context"
+                ),
+            )
+
 
 # ---------------------------------------------------------------------------
 # Test C-①: prefill == decode (flash self-consistency, I3)
