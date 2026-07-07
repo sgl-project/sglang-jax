@@ -7,6 +7,7 @@ Reference: HF modeling_step3p5.py / configuration_step3p5.py.
 from __future__ import annotations
 
 import logging
+import os
 
 import jax
 import jax.numpy as jnp
@@ -30,6 +31,65 @@ from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 logger = logging.getLogger(__name__)
 
 _HEAD_DIM = 128
+
+
+def _verify_layerdump_enabled() -> bool:
+    return os.environ.get("SGL_JAX_VERIFY_LAYERDUMP") == "1"
+
+
+def _verify_layerdump_row(num_rows: int) -> int:
+    row = int(os.environ.get("SGL_JAX_VERIFY_LAYERDUMP_ROW", "2"))
+    return max(0, min(row, num_rows - 1))
+
+
+def _verify_layerdump_tensor(
+    tensor: jax.Array,
+    *,
+    positions: jax.Array,
+    forward_batch: ForwardBatch,
+    layer_id: int,
+    stage: str,
+) -> None:
+    if not _verify_layerdump_enabled() or tensor.shape[0] == 0:
+        return
+    row_idx = _verify_layerdump_row(tensor.shape[0])
+    row = tensor[row_idx].astype(jnp.float32)
+    pos = positions[row_idx] if positions.shape[0] > row_idx else jnp.asarray(-1, jnp.int32)
+    jax.debug.print(
+        f"[VERIFY_LAYERDUMP] mode={int(forward_batch.forward_mode)} layer={layer_id} "
+        f"stage={stage} row={row_idx} shape={tensor.shape} dtype={tensor.dtype} "
+        "pos={pos} sum={sum} mean={mean} norm={norm} maxabs={maxabs} "
+        "h0={h0} h1={h1} h2={h2} h3={h3}",
+        pos=pos,
+        sum=jnp.sum(row),
+        mean=jnp.mean(row),
+        norm=jnp.linalg.norm(row),
+        maxabs=jnp.max(jnp.abs(row)),
+        h0=row[0],
+        h1=row[1],
+        h2=row[2],
+        h3=row[3],
+    )
+
+
+def _verify_layerdump_topk(
+    topk_ids: jax.Array | None,
+    *,
+    positions: jax.Array,
+    forward_batch: ForwardBatch,
+    layer_id: int,
+) -> None:
+    if not _verify_layerdump_enabled() or topk_ids is None or topk_ids.shape[0] == 0:
+        return
+    row_idx = _verify_layerdump_row(topk_ids.shape[0])
+    pos = positions[row_idx] if positions.shape[0] > row_idx else jnp.asarray(-1, jnp.int32)
+    width = min(8, topk_ids.shape[1])
+    jax.debug.print(
+        f"[VERIFY_LAYERDUMP] mode={int(forward_batch.forward_mode)} layer={layer_id} "
+        f"stage=moe_topk row={row_idx} shape={topk_ids.shape} pos={{pos}} ids={{ids}}",
+        pos=pos,
+        ids=topk_ids[row_idx, :width],
+    )
 
 
 class Step3p5Attention(nnx.Module):
@@ -513,6 +573,13 @@ class Step3p5DecoderLayer(nnx.Module):
         ln_flag = precision_tracer.jit_pure_callback_record(
             hidden_states, "input_layernorm_output", "INPUT_LAYERNORM", self.layer_id
         )
+        _verify_layerdump_tensor(
+            hidden_states,
+            positions=positions,
+            forward_batch=forward_batch,
+            layer_id=self.layer_id,
+            stage="input_layernorm",
+        )
 
         hidden_states, kv_fused = self.self_attn(
             positions, hidden_states, forward_batch, token_to_kv_pool
@@ -520,6 +587,13 @@ class Step3p5DecoderLayer(nnx.Module):
 
         attn_flag = precision_tracer.jit_pure_callback_record(
             hidden_states, "self_attn_output", "SELF_ATTN", self.layer_id
+        )
+        _verify_layerdump_tensor(
+            hidden_states,
+            positions=positions,
+            forward_batch=forward_batch,
+            layer_id=self.layer_id,
+            stage="self_attn",
         )
 
         hidden_states = hidden_states + residual
@@ -535,12 +609,25 @@ class Step3p5DecoderLayer(nnx.Module):
             )
             # Replicate so the capturer can host-read across multi-host shardings.
             topk_ids = jax.sharding.reshard(topk_ids, P(None))
+            _verify_layerdump_topk(
+                topk_ids,
+                positions=positions,
+                forward_batch=forward_batch,
+                layer_id=self.layer_id,
+            )
         else:
             hidden_states = self.mlp(hidden_states)
             topk_ids = None
 
         mlp_flag = precision_tracer.jit_pure_callback_record(
             hidden_states, "mlp_output", "MLP", self.layer_id
+        )
+        _verify_layerdump_tensor(
+            hidden_states,
+            positions=positions,
+            forward_batch=forward_batch,
+            layer_id=self.layer_id,
+            stage="mlp",
         )
 
         return hidden_states, residual, kv_fused, [ln_flag, attn_flag, mlp_flag], topk_ids
@@ -614,6 +701,13 @@ class Step3p5Model(nnx.Module):
             hidden_states = hidden_states + residual
 
         hidden_states = self.norm(hidden_states)
+        _verify_layerdump_tensor(
+            hidden_states,
+            positions=forward_batch.positions,
+            forward_batch=forward_batch,
+            layer_id=-1,
+            stage="transformer",
+        )
 
         xfmr_flag = precision_tracer.jit_pure_callback_record(
             hidden_states, "transformer_output", "TRANSFORMER"
