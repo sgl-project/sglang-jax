@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import logging
 import math
 import os
 import tempfile
@@ -15,6 +16,8 @@ from sgl_jax.srt.multimodal.common.modality_enum import (
 )
 from sgl_jax.srt.multimodal.manager.mrope_utils import compute_mrope_positions
 from sgl_jax.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
+
+logger = logging.getLogger(__name__)
 
 IMAGE_FACTOR = 28
 MIN_PIXELS = 4 * 28 * 28
@@ -130,7 +133,26 @@ def _resize_video_frames(video: np.ndarray, video_config: dict) -> np.ndarray:
         )
 
     if resized_height == height and resized_width == width:
+        logger.info(
+            "Qwen-VL video resize skipped: frames=%s, size=%sx%s, max_pixels=%s",
+            nframes,
+            height,
+            width,
+            max_pixels,
+        )
         return video
+
+    logger.info(
+        "Qwen-VL video resized: frames=%s, original=%sx%s, resized=%sx%s, "
+        "min_pixels=%s, max_pixels=%s",
+        nframes,
+        height,
+        width,
+        resized_height,
+        resized_width,
+        min_pixels,
+        max_pixels,
+    )
 
     resized_frames = []
     for frame in video:
@@ -195,6 +217,12 @@ def preprocess_video(source, video_config: dict) -> np.ndarray:
         nframes = smart_nframes(video_config, total_frames=total_frames, video_fps=video_fps)
         frame_indices = np.linspace(0, total_frames - 1, num=nframes, dtype=np.int64)
         frame_indices = np.unique(frame_indices)
+        logger.info(
+            "Qwen-VL video frames sampled: total_frames=%s, fps=%.3f, sampled_frames=%s",
+            total_frames,
+            video_fps,
+            len(frame_indices),
+        )
         video = vr.get_batch(frame_indices).asnumpy()
         return _resize_video_frames(video, video_config)
     finally:
@@ -266,6 +294,17 @@ class QwenVLProcessor(BaseMultimodalProcessor):
         pixel_values_videos = self._to_numpy(processor_output.get("pixel_values_videos"))
         image_grid_thw = self._to_grid_list(processor_output.get("image_grid_thw"))
         video_grid_thw = self._to_grid_list(processor_output.get("video_grid_thw"))
+        if images or videos:
+            logger.info(
+                "Qwen-VL processor output: images=%s, videos=%s, image_grid_thw=%s, "
+                "video_grid_thw=%s, pixel_values_shape=%s, pixel_values_videos_shape=%s",
+                len(images),
+                len(videos),
+                image_grid_thw,
+                video_grid_thw,
+                None if pixel_values is None else pixel_values.shape,
+                None if pixel_values_videos is None else pixel_values_videos.shape,
+            )
         second_per_grid_ts_value = processor_output.get("second_per_grid_ts")
         if second_per_grid_ts_value is None:
             second_per_grid_ts_value = processor_output.get("video_second_per_grid")
