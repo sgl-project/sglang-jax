@@ -606,6 +606,10 @@ class FlashAttention(AttentionBackend):
             self.forward_metadata.custom_mask is not None
             and forward_batch.forward_mode.is_target_verify()
         )
+        decode_like_verify_rpa = (
+            os.environ.get("SGL_JAX_VERIFY_DECODE_LIKE_RPA") == "1"
+            and forward_batch.forward_mode.is_target_verify()
+        )
         if (
             (
                 os.environ.get("SGL_JAX_VERIFYDUMP") == "1"
@@ -619,6 +623,7 @@ class FlashAttention(AttentionBackend):
             logger.info(
                 "[VERIFY_RPA] flash attention path layer=%s swa_win=%s "
                 "custom_mask_is_none=%s mask_aligned_to_cu_kv=%s "
+                "decode_like_verify_rpa=%s "
                 "q_shape=%s k_shape=%s kv_cache_shape=%s "
                 "cu_q_lens[:8]=%s cu_kv_lens[:8]=%s distribution[:8]=%s "
                 "seq_lens[:8]=%s page_idx[:8]=%s",
@@ -626,6 +631,7 @@ class FlashAttention(AttentionBackend):
                 layer.sliding_window_size,
                 self.forward_metadata.custom_mask is None,
                 mask_aligned_to_cu_kv,
+                decode_like_verify_rpa,
                 q.shape,
                 k.shape,
                 kv_cache_fused.shape,
@@ -656,6 +662,7 @@ class FlashAttention(AttentionBackend):
                 ),
                 softmax_dtype=layer.softmax_dtype,
                 mask_aligned_to_cu_kv=mask_aligned_to_cu_kv,
+                decode_like_verify_rpa=decode_like_verify_rpa,
             )
 
             return result, updated_kv_cache_fused

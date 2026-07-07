@@ -1661,6 +1661,7 @@ def get_vmem_limit():
         "disable_semaphore_checks",
         "debug_mode",
         "mask_aligned_to_cu_kv",
+        "decode_like_verify_rpa",
     ),
     donate_argnames=("queries", "keys", "values", "kv_cache_fused"),
 )
@@ -1697,6 +1698,7 @@ def ragged_paged_attention(
     disable_semaphore_checks: bool = True,
     debug_mode: bool = False,
     mask_aligned_to_cu_kv: bool = False,
+    decode_like_verify_rpa: bool = False,
 ):
     """Ragged paged attention with fused KV cache.
 
@@ -2014,11 +2016,7 @@ def ragged_paged_attention(
 
     def _prepare_block_sizes(block_sizes, case):
         if block_sizes is None:
-            decode_like_verify = (
-                os.environ.get("SGL_JAX_VERIFY_DECODE_LIKE_RPA") == "1"
-                and mask_aligned_to_cu_kv
-                and case == RpaCase.MIXED
-            )
+            decode_like_verify = decode_like_verify_rpa and case == RpaCase.MIXED
             should_log_verify_rpa = case == RpaCase.MIXED and (
                 os.environ.get("SGL_JAX_VERIFYDUMP") == "1"
                 or os.environ.get("SGL_JAX_VERIFY_DECODE_LIKE_RPA") == "1"
@@ -2051,8 +2049,9 @@ def ragged_paged_attention(
                         _VERIFY_RPA_LOGGED_KEYS.add(key)
                         logger.info(
                             "[VERIFY_RPA] mixed block sizes active decode_like=True "
-                            "mask_aligned_to_cu_kv=%s custom_mask=%s causal=%s "
+                            "force_decode_like=%s mask_aligned_to_cu_kv=%s custom_mask=%s causal=%s "
                             "q_shape=%s kv_cache_shape=%s sliding_window=%s sizes=%s",
+                            decode_like_verify_rpa,
                             mask_aligned_to_cu_kv,
                             custom_mask is not None,
                             use_causal_mask,
@@ -2113,9 +2112,11 @@ def ragged_paged_attention(
                         _VERIFY_RPA_LOGGED_KEYS.add(key)
                         logger.info(
                             "[VERIFY_RPA] mixed block sizes active decode_like=False "
-                            "flag=%s mask_aligned_to_cu_kv=%s custom_mask=%s causal=%s "
+                            "flag=%s force_decode_like=%s mask_aligned_to_cu_kv=%s "
+                            "custom_mask=%s causal=%s "
                             "q_shape=%s kv_cache_shape=%s sliding_window=%s sizes=%s",
                             os.environ.get("SGL_JAX_VERIFY_DECODE_LIKE_RPA") == "1",
+                            decode_like_verify_rpa,
                             mask_aligned_to_cu_kv,
                             custom_mask is not None,
                             use_causal_mask,
