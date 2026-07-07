@@ -281,6 +281,26 @@ def _make_decode_fb(prefix_len: int, token_id: int):
     )
 
 
+def _make_extend_fb(prefix_len: int, token_ids: jax.Array):
+    from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+
+    num_tokens = int(token_ids.shape[0])
+    total = prefix_len + num_tokens
+    return ForwardBatch(
+        bid=0,
+        forward_mode=ForwardMode.EXTEND,
+        batch_size=1,
+        input_ids=token_ids,
+        req_pool_indices=jnp.zeros(1, dtype=jnp.int32),
+        seq_lens=jnp.array([total], dtype=jnp.int32),
+        out_cache_loc=jnp.arange(prefix_len, total, dtype=jnp.int32),
+        cache_loc=jnp.arange(total, dtype=jnp.int32),
+        positions=jnp.arange(prefix_len, total, dtype=jnp.int32),
+        extend_prefix_lens=jnp.array([prefix_len], dtype=jnp.int32),
+        extend_seq_lens=jnp.array([num_tokens], dtype=jnp.int32),
+    )
+
+
 def _attach_backend(fb, cfg, mesh, page_size, *, mode):
     """Wire FlashAttention backend + forward_metadata onto fb.
 
@@ -402,6 +422,102 @@ def _run_decode_step(model, mesh, kv_pool, prefix_len, token_id):
     # Persist this step's KV write so the next decode step reads it.
     kv_pool.replace_buffer(extras["token_to_kv_pool"])
     return jnp.asarray(output.next_token_logits, dtype=jnp.float32)  # [1, vocab]
+
+
+def _run_extend_all_positions(model, mesh, kv_pool, prefix_len, token_ids):
+    fb = _make_extend_fb(prefix_len, token_ids)
+    _attach_backend(fb, model.config, mesh, kv_pool.page_size, mode="prefill")
+
+    with jax.set_mesh(mesh):
+        hidden, layers_kv_fused, _, _ = model.model(fb, kv_pool)
+        logits = model.logits_processor._get_logits(hidden, model.lm_head)
+    kv_pool.replace_buffer(layers_kv_fused)
+    return jnp.asarray(logits, dtype=jnp.float32)
+
+
+# ---------------------------------------------------------------------------
+# Test C-⓪: multi-token EXTEND causality
+# ---------------------------------------------------------------------------
+
+
+@unittest.skipUnless(_IS_TPU, "multi-token EXTEND causality requires TPU flash kernel")
+class TestMultiTokenExtendCausality(unittest.TestCase):
+    _mesh = None
+    _cfg = None
+    _weights = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls._cfg = _make_config()
+        cls._mesh = create_device_mesh(
+            ici_parallelism=[1, 1],
+            dcn_parallelism=[1, 1],
+            devices=[jax.devices()[0]],
+        )
+        jax.sharding.set_mesh(cls._mesh)
+        cls._weights = _build_checkpoint(cls._cfg)
+
+    def _build_and_load(self):
+        from sgl_jax.srt.models.step3p5 import Step3p5ForCausalLM
+
+        with jax.set_mesh(self._mesh):
+            model = Step3p5ForCausalLM(
+                self._cfg,
+                mesh=self._mesh,
+                dtype=jnp.float32,
+                attn_impl="flash",
+            )
+        _load_weights(model, self._weights, self._cfg, self._mesh)
+        return model
+
+    def _prefill_pool(self, model, prefix_ids, total_tokens):
+        pool = _make_kv_pool(self._cfg, self._mesh, jnp.float32, total_tokens, page_size=4)
+        _run_prefill_all_positions(model, self._mesh, pool, prefix_ids)
+        return pool
+
+    def test_first_extend_position_does_not_depend_on_future_tokens(self):
+        model = self._build_and_load()
+        prefix_ids = jnp.array(np.arange(_PREFIX_LEN, dtype=np.int32) % _VOCAB)
+        root_token = jnp.array([17], dtype=jnp.int32)
+        future_a = jnp.array([3, 5, 7], dtype=jnp.int32)
+        future_b = jnp.array([41, 43, 47], dtype=jnp.int32)
+        tokens_a = jnp.concatenate([root_token, future_a])
+        tokens_b = jnp.concatenate([root_token, future_b])
+
+        total_tokens = _PREFIX_LEN + int(tokens_a.shape[0])
+        with jax.default_matmul_precision("highest"):
+            pool_a = self._prefill_pool(model, prefix_ids, total_tokens)
+            logits_a = _run_extend_all_positions(model, self._mesh, pool_a, _PREFIX_LEN, tokens_a)
+            jax.block_until_ready(logits_a)
+
+            pool_b = self._prefill_pool(model, prefix_ids, total_tokens)
+            logits_b = _run_extend_all_positions(model, self._mesh, pool_b, _PREFIX_LEN, tokens_b)
+            jax.block_until_ready(logits_b)
+
+        first_a = np.asarray(logits_a[0], dtype=np.float64)
+        first_b = np.asarray(logits_b[0], dtype=np.float64)
+        max_abs = float(np.max(np.abs(first_a - first_b)))
+        scale = float(max(np.max(np.abs(first_a)), 1e-6))
+        print(
+            "\n=== multi-token EXTEND causality ===\n"
+            f" first argmax A={int(first_a.argmax())} B={int(first_b.argmax())}\n"
+            f" first max_abs_diff={max_abs:.6e} scale={scale:.6e}"
+        )
+        self.assertEqual(
+            int(first_a.argmax()),
+            int(first_b.argmax()),
+            "The first EXTEND query changed argmax when only future tokens changed",
+        )
+        np.testing.assert_allclose(
+            first_a,
+            first_b,
+            rtol=0.0,
+            atol=_RTOL_FP32_LOGIC * scale,
+            err_msg=(
+                "The first EXTEND query must be causally independent of later EXTEND "
+                "tokens when the prefix and first token are identical"
+            ),
+        )
 
 
 # ---------------------------------------------------------------------------
