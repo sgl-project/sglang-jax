@@ -43,6 +43,11 @@ def _verify_layerdump_row(num_rows: int) -> int:
     return max(0, min(row, num_rows - 1))
 
 
+def _verify_layerdump_position() -> int | None:
+    pos = os.environ.get("SGL_JAX_VERIFY_LAYERDUMP_POS")
+    return int(pos) if pos is not None else None
+
+
 def _verify_layerdump_tensor(
     tensor: jax.Array,
     *,
@@ -53,21 +58,29 @@ def _verify_layerdump_tensor(
 ) -> None:
     if not _verify_layerdump_enabled() or tensor.shape[0] == 0:
         return
-    row_idx = _verify_layerdump_row(tensor.shape[0])
-    row_mask = (jnp.arange(tensor.shape[0], dtype=jnp.int32) == row_idx).astype(jnp.float32)
+    target_pos = _verify_layerdump_position()
+    if target_pos is None:
+        row_idx = _verify_layerdump_row(tensor.shape[0])
+        select_mask = jnp.arange(tensor.shape[0], dtype=jnp.int32) == row_idx
+    else:
+        row_idx = -1
+        select_mask = positions == target_pos
+    match_count = jnp.sum(select_mask.astype(jnp.int32))
+    row_mask = select_mask.astype(jnp.float32)
     row_mask = row_mask.reshape((tensor.shape[0],) + (1,) * (tensor.ndim - 1))
     tensor_f32 = tensor.astype(jnp.float32)
     selected = tensor_f32 * row_mask
-    pos_mask = jnp.arange(positions.shape[0], dtype=jnp.int32) == row_idx
-    pos = jnp.sum(jnp.where(pos_mask, positions, 0))
+    pos = target_pos if target_pos is not None else jnp.sum(jnp.where(select_mask, positions, 0))
     row_numel = max(1, math.prod(tensor.shape[1:]))
     jax.debug.print(
         f"[VERIFY_LAYERDUMP] mode={int(forward_batch.forward_mode)} layer={layer_id} "
         f"stage={stage} row={row_idx} shape={tensor.shape} dtype={tensor.dtype} "
-        "pos={pos} sum={sum} mean={mean} norm={norm} maxabs={maxabs}",
+        "pos={pos} match_count={match_count} sum={sum} mean={mean} norm={norm} "
+        "maxabs={maxabs}",
         pos=pos,
+        match_count=match_count,
         sum=jnp.sum(selected),
-        mean=jnp.sum(selected) / row_numel,
+        mean=jnp.sum(selected) / jnp.maximum(match_count, 1) / row_numel,
         norm=jnp.sqrt(jnp.sum(selected * selected)),
         maxabs=jnp.max(jnp.abs(selected)),
     )
@@ -82,18 +95,24 @@ def _verify_layerdump_topk(
 ) -> None:
     if not _verify_layerdump_enabled() or topk_ids is None or topk_ids.shape[0] == 0:
         return
-    row_idx = _verify_layerdump_row(topk_ids.shape[0])
-    pos_mask = jnp.arange(positions.shape[0], dtype=jnp.int32) == row_idx
-    pos = jnp.sum(jnp.where(pos_mask, positions, 0))
+    target_pos = _verify_layerdump_position()
+    if target_pos is None:
+        row_idx = _verify_layerdump_row(topk_ids.shape[0])
+        select_mask = jnp.arange(topk_ids.shape[0], dtype=jnp.int32) == row_idx
+    else:
+        row_idx = -1
+        select_mask = positions == target_pos
+    match_count = jnp.sum(select_mask.astype(jnp.int32))
+    pos = target_pos if target_pos is not None else jnp.sum(jnp.where(select_mask, positions, 0))
     width = min(8, topk_ids.shape[1])
-    topk_mask = (jnp.arange(topk_ids.shape[0], dtype=jnp.int32) == row_idx).reshape(
-        (topk_ids.shape[0], 1)
-    )
+    topk_mask = select_mask.reshape((topk_ids.shape[0], 1))
     ids = jnp.sum(jnp.where(topk_mask, topk_ids[:, :width], 0), axis=0)
     jax.debug.print(
         f"[VERIFY_LAYERDUMP] mode={int(forward_batch.forward_mode)} layer={layer_id} "
-        f"stage=moe_topk row={row_idx} shape={topk_ids.shape} pos={{pos}} ids={{ids}}",
+        f"stage=moe_topk row={row_idx} shape={topk_ids.shape} pos={{pos}} "
+        "match_count={match_count} ids={ids}",
         pos=pos,
+        match_count=match_count,
         ids=ids,
     )
 
