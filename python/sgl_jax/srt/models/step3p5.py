@@ -7,6 +7,7 @@ Reference: HF modeling_step3p5.py / configuration_step3p5.py.
 from __future__ import annotations
 
 import logging
+import math
 import os
 
 import jax
@@ -53,22 +54,22 @@ def _verify_layerdump_tensor(
     if not _verify_layerdump_enabled() or tensor.shape[0] == 0:
         return
     row_idx = _verify_layerdump_row(tensor.shape[0])
-    row = tensor[row_idx].astype(jnp.float32)
-    pos = positions[row_idx] if positions.shape[0] > row_idx else jnp.asarray(-1, jnp.int32)
+    row_mask = (jnp.arange(tensor.shape[0], dtype=jnp.int32) == row_idx).astype(jnp.float32)
+    row_mask = row_mask.reshape((tensor.shape[0],) + (1,) * (tensor.ndim - 1))
+    tensor_f32 = tensor.astype(jnp.float32)
+    selected = tensor_f32 * row_mask
+    pos_mask = jnp.arange(positions.shape[0], dtype=jnp.int32) == row_idx
+    pos = jnp.sum(jnp.where(pos_mask, positions, 0))
+    row_numel = max(1, math.prod(tensor.shape[1:]))
     jax.debug.print(
         f"[VERIFY_LAYERDUMP] mode={int(forward_batch.forward_mode)} layer={layer_id} "
         f"stage={stage} row={row_idx} shape={tensor.shape} dtype={tensor.dtype} "
-        "pos={pos} sum={sum} mean={mean} norm={norm} maxabs={maxabs} "
-        "h0={h0} h1={h1} h2={h2} h3={h3}",
+        "pos={pos} sum={sum} mean={mean} norm={norm} maxabs={maxabs}",
         pos=pos,
-        sum=jnp.sum(row),
-        mean=jnp.mean(row),
-        norm=jnp.linalg.norm(row),
-        maxabs=jnp.max(jnp.abs(row)),
-        h0=row[0],
-        h1=row[1],
-        h2=row[2],
-        h3=row[3],
+        sum=jnp.sum(selected),
+        mean=jnp.sum(selected) / row_numel,
+        norm=jnp.sqrt(jnp.sum(selected * selected)),
+        maxabs=jnp.max(jnp.abs(selected)),
     )
 
 
@@ -82,13 +83,18 @@ def _verify_layerdump_topk(
     if not _verify_layerdump_enabled() or topk_ids is None or topk_ids.shape[0] == 0:
         return
     row_idx = _verify_layerdump_row(topk_ids.shape[0])
-    pos = positions[row_idx] if positions.shape[0] > row_idx else jnp.asarray(-1, jnp.int32)
+    pos_mask = jnp.arange(positions.shape[0], dtype=jnp.int32) == row_idx
+    pos = jnp.sum(jnp.where(pos_mask, positions, 0))
     width = min(8, topk_ids.shape[1])
+    topk_mask = (jnp.arange(topk_ids.shape[0], dtype=jnp.int32) == row_idx).reshape(
+        (topk_ids.shape[0], 1)
+    )
+    ids = jnp.sum(jnp.where(topk_mask, topk_ids[:, :width], 0), axis=0)
     jax.debug.print(
         f"[VERIFY_LAYERDUMP] mode={int(forward_batch.forward_mode)} layer={layer_id} "
         f"stage=moe_topk row={row_idx} shape={topk_ids.shape} pos={{pos}} ids={{ids}}",
         pos=pos,
-        ids=topk_ids[row_idx, :width],
+        ids=ids,
     )
 
 
