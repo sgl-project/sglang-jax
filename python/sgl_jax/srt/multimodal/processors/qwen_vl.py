@@ -30,15 +30,6 @@ FRAME_FACTOR = 2
 FPS = 2.0
 FPS_MIN_FRAMES = 4
 FPS_MAX_FRAMES = 768
-VIDEO_CONFIG_KEYS = (
-    "min_pixels",
-    "max_pixels",
-    "total_pixels",
-    "resized_height",
-    "resized_width",
-    "min_frames",
-    "max_frames",
-)
 
 
 def smart_resize(
@@ -228,22 +219,6 @@ def preprocess_video(source, video_config: dict) -> np.ndarray:
     finally:
         if tmp_path and os.path.exists(tmp_path):
             os.unlink(tmp_path)
-
-
-def _update_video_config_from_mapping(video_config: dict, source):
-    if not isinstance(source, dict):
-        return
-    for key in VIDEO_CONFIG_KEYS:
-        value = source.get(key)
-        if value is not None:
-            video_config[key] = value
-
-    fps = source.get("fps")
-    if fps is not None:
-        video_config["fps"] = fps
-    nframes = source.get("nframes", source.get("num_frames"))
-    if nframes is not None and "fps" not in video_config:
-        video_config["nframes"] = nframes
 
 
 class QwenVLProcessor(BaseMultimodalProcessor):
