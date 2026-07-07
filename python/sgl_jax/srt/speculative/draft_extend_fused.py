@@ -1058,7 +1058,7 @@ def _build_verify(topk: int):
     return fused_verify
 
 
-def _build_prefill(num_layers: int, topk: int):
+def _build_prefill(num_layers: int, topk: int, chain_mtp: bool = False):
     """Build prefill JIT: target extend + all MTP draft-extend layers."""
     assert topk == 1, "Fused greedy prefill only supports topk=1"
 
@@ -1121,13 +1121,13 @@ def _build_prefill(num_layers: int, topk: int):
         layer0_hidden = None
         mesh = None
 
-        draft_forward_batch.spec_info.hidden_states = target_hidden
+        chained_hidden = target_hidden
         for i in range(num_layers):
             state = jax.tree_util.tree_unflatten(draft_model_state_def, draft_all_leaves[i])
             model = nnx.merge(draft_model_def, state)
 
             draft_forward_batch.input_ids = input_ids
-            draft_forward_batch.spec_info.hidden_states = target_hidden
+            draft_forward_batch.spec_info.hidden_states = chained_hidden
             output, pool_updates, _, _ = model(
                 draft_forward_batch, all_memory_pools[i], draft_logits_metadata
             )
@@ -1139,6 +1139,8 @@ def _build_prefill(num_layers: int, topk: int):
             all_topk_index.append(topk_idx)
             if i == 0:
                 layer0_hidden = output.hidden_states
+            if chain_mtp and output.hidden_states is not None:
+                chained_hidden = output.hidden_states
             if i < num_layers - 1:
                 input_ids = _rotate_prefill_input_ids(
                     input_ids,
@@ -1684,6 +1686,7 @@ def spec_prefill(spec_worker, model_worker_batch, launch_done=None, *, update_re
         draft_worker._fused_greedy_prefill_jit_fn = _build_prefill(
             num_layers=draft_worker.speculative_num_steps,
             topk=draft_worker.topk,
+            chain_mtp=getattr(draft_worker, "chain_mtp_hidden_states", False),
         )
 
     data_sharding = NamedSharding(draft_worker.mesh, P("data"))
