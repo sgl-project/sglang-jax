@@ -2,35 +2,36 @@
 
 Vision uses owning-rank data-parallel: each DP rank encodes its own images and
 merges into its own token slice on the ``data`` mesh axis. This module provides
-the vision encode, token merge, and host loop used before the language backbone
-forward.
+the token merge and host loop that call model-specific encoders before the
+language backbone forward.
 """
 
 import functools
 
 import jax
 import jax.numpy as jnp
-from flax import nnx
-from jax.sharding import NamedSharding, PartitionSpec
+from jax.sharding import PartitionSpec
 
 _MERGE_IN_SPECS = (
     PartitionSpec("data", None),  # running   [total_tok, H]
-    PartitionSpec("data", None),  # features  [dp*out_rows, H]
+    PartitionSpec("data", None, None),  # features  [dp, out_rows, H]
     PartitionSpec("data"),  # src_idx   [total_tok]
     PartitionSpec("data"),  # mask      [total_tok]
 )
 
 
 @functools.partial(jax.jit, static_argnames=("mesh",))
-def jitted_mm_merge(mesh, running, features, src_idx, mask):
+def merge_jit(mesh, running, features, src_idx, mask):
     """Merge encoded multimodal rows into the token embedding stream.
 
-    ``running``/``features`` are ``P("data", None)``; ``src_idx``/``mask`` are
-    ``P("data")``. Returns ``P("data", None)``.
+    ``running`` is ``P("data", None)``; ``features`` is
+    ``P("data", None, None)``. ``src_idx``/``mask`` are ``P("data")``. Returns
+    ``P("data", None)``.
     """
 
     def merge_local(running, features, src_idx, mask):
-        return jnp.where(mask[:, None], features[src_idx], running)
+        rank_features = features[0]
+        return jnp.where(mask[:, None], rank_features[src_idx], running)
 
     return jax.shard_map(
         merge_local,
@@ -39,23 +40,6 @@ def jitted_mm_merge(mesh, running, features, src_idx, mask):
         out_specs=PartitionSpec("data", None),
         check_vma=False,
     )(running, features, src_idx, mask)
-
-
-@functools.partial(jax.jit, static_argnames=("mesh", "graphdef"))
-def jitted_mm_encode(mesh, graphdef, state, pixels, meta, valid):
-    """Run the dp-leading vision encode.
-
-    ``pixels`` and ``meta`` are already placed on ``P("data", ...)``. The visual
-    module returns ``[dp, out_rows, H]``; this function flattens it to
-    ``[dp * out_rows, H]`` and pins the result to the merge sharding.
-    """
-    visual = nnx.merge(graphdef, state)
-    features = visual(pixels, meta, valid)  # [dp, out_rows, H]
-    dp, out_rows, h = features.shape
-    features = features.reshape(dp * out_rows, h)  # [dp*out_rows, H]
-    return jax.lax.with_sharding_constraint(
-        features, NamedSharding(mesh, PartitionSpec("data", None))
-    )
 
 
 def embed_mm_inputs(
@@ -78,7 +62,7 @@ def embed_mm_inputs(
         assert embedder is not None, f"no embedding method for {modality}"
         for rnd in rounds:
             features = embedder(rnd.encode_inputs)
-            running = jitted_mm_merge(mesh, running, features, rnd.src_idx, rnd.mask)
+            running = merge_jit(mesh, running, features, rnd.src_idx, rnd.mask)
     return running
 
 
