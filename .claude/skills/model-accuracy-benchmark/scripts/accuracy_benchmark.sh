@@ -3,6 +3,7 @@ set -euo pipefail
 
 # Thin wrapper around the sglang-jax repo's test/srt/run_eval.py accuracy runner.
 # Runs against an OpenAI-compatible endpoint and prints the eval score.
+# Use only as a fallback when evalscope cannot be installed/invoked on the target host.
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 REPO_DIR="${REPO_DIR:-.}"
