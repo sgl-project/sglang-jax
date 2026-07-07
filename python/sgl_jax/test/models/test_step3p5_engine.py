@@ -709,6 +709,49 @@ class TestMultiTokenExtendCausality(unittest.TestCase):
                 ),
             )
 
+    def test_first_target_verify_logit_matches_single_token_decode(self):
+        model = self._build_and_load()
+        prefix_ids = jnp.array(np.arange(_PREFIX_LEN, dtype=np.int32) % _VOCAB)
+        verify_window = jnp.array([17, 19, 23, 29], dtype=jnp.int32)
+        root_token = int(np.asarray(verify_window)[0])
+        total_tokens = _PREFIX_LEN + int(verify_window.shape[0])
+
+        with jax.default_matmul_precision("highest"):
+            verify_pool = self._prefill_pool(model, prefix_ids, total_tokens)
+            verify_logits = _run_target_verify_all_positions(
+                model, self._mesh, verify_pool, _PREFIX_LEN, verify_window
+            )
+            jax.block_until_ready(verify_logits)
+
+            decode_pool = self._prefill_pool(model, prefix_ids, total_tokens)
+            decode_logits = _run_decode_step(
+                model, self._mesh, decode_pool, _PREFIX_LEN, root_token
+            )
+            jax.block_until_ready(decode_logits)
+
+        verify_first = np.asarray(verify_logits[0], dtype=np.float64)
+        decode_first = np.asarray(decode_logits[0], dtype=np.float64)
+        max_abs = float(np.max(np.abs(verify_first - decode_first)))
+        scale = float(max(np.max(np.abs(decode_first)), 1e-6))
+        print(
+            "\n=== TARGET_VERIFY q0 vs single-token DECODE ===\n"
+            f" argmax_verify={int(verify_first.argmax())} "
+            f"argmax_decode={int(decode_first.argmax())}\n"
+            f" max_abs_diff={max_abs:.6e} scale={scale:.6e}"
+        )
+        self.assertEqual(
+            int(verify_first.argmax()),
+            int(decode_first.argmax()),
+            "TARGET_VERIFY q0 argmax differs from single-token DECODE",
+        )
+        np.testing.assert_allclose(
+            verify_first,
+            decode_first,
+            rtol=0.0,
+            atol=_RTOL_FP32_LOGIC * scale,
+            err_msg="TARGET_VERIFY q0 logits must match single-token DECODE logits",
+        )
+
     def test_partial_accept_after_target_verify_matches_clean_context(self):
         model = self._build_and_load()
         prefix_ids = jnp.array(np.arange(_PREFIX_LEN, dtype=np.int32) % _VOCAB)
