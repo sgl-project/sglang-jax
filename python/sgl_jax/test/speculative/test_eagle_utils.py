@@ -156,6 +156,17 @@ class TestVerifyTree(CustomTestCase):
             np.asarray(chain.verified_id)[select_index],
             np.array([99, 99, 99, 44], dtype=np.int32),
         )
+        np.testing.assert_array_equal(np.asarray(chain.draft_extend_verified_id), target_predict)
+        np.testing.assert_array_equal(
+            np.asarray(chain.draft_extend_positions),
+            np.arange(bs * num_draft_tokens, dtype=np.int32),
+        )
+        np.testing.assert_array_equal(
+            np.asarray(chain.draft_extend_hidden_states),
+            np.arange(bs * num_draft_tokens * 2, dtype=np.float32).reshape(
+                bs * num_draft_tokens, 2
+            ),
+        )
 
     def test_fused_chain_verify_zeroes_padding_accept_length(self):
         from sgl_jax.srt.speculative.draft_extend_fused import _verify_greedy

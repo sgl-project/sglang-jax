@@ -56,6 +56,9 @@ class GreedyDraftInputs(NamedTuple):
 class GreedySampleAndPrepareOutput(NamedTuple):
     hidden_states: jax.Array
     positions: jax.Array
+    draft_extend_hidden_states: jax.Array
+    draft_extend_positions: jax.Array
+    draft_extend_verified_id: jax.Array
     new_seq_lens: jax.Array
     select_index: jax.Array
     safe_index: jax.Array
@@ -246,6 +249,9 @@ def _verify_greedy(
     return GreedySampleAndPrepareOutput(
         hidden_states=prepared.hidden_states,
         positions=prepared.positions,
+        draft_extend_hidden_states=target_hidden,
+        draft_extend_positions=positions,
+        draft_extend_verified_id=predict,
         new_seq_lens=prepared.new_seq_lens,
         select_index=prepared.select_index,
         safe_index=safe_index,
@@ -378,6 +384,9 @@ def _verify_rejection_sampling(
     return GreedySampleAndPrepareOutput(
         hidden_states=prepared.hidden_states,
         positions=prepared.positions,
+        draft_extend_hidden_states=target_hidden,
+        draft_extend_positions=positions,
+        draft_extend_verified_id=predict,
         new_seq_lens=prepared.new_seq_lens,
         select_index=prepared.select_index,
         safe_index=safe_index,
@@ -950,7 +959,8 @@ def _build_verify(topk: int):
         )
         prepared_hidden = prepared.hidden_states
         prepared_verified_id = prepared.verified_id
-        prepared_verified_id_data = prepared.verified_id
+        prepared_hidden_for_draft_extend = prepared.draft_extend_hidden_states
+        prepared_verified_id_data = prepared.draft_extend_verified_id
         prepared_next_verified_id = _take_with_index_sharding(
             prepared.verified_id, prepared.select_index
         )
@@ -972,8 +982,8 @@ def _build_verify(topk: int):
         prepared_sel_pos = prepared.sel_pos
         prepared_sel_pos_data = prepared.sel_pos
         prepared_predict = prepared.predict
-        prepared_positions = prepared.positions
-        prepared_positions_data = prepared.positions
+        prepared_positions = prepared.draft_extend_positions
+        prepared_positions_data = prepared.draft_extend_positions
         prepared_verify_seq_lens = target_forward_batch.seq_lens
         prepared_allocate_lens_data = verify_allocate_lens
 
@@ -1007,6 +1017,7 @@ def _build_verify(topk: int):
                 prepared_sel_pos_data,
                 prepared_positions_data,
                 prepared_allocate_lens_data,
+                prepared_hidden_for_draft_extend,
             ) = _reshard_values(
                 data,
                 prepared_verified_id_data,
@@ -1017,6 +1028,7 @@ def _build_verify(topk: int):
                 prepared_sel_pos_data,
                 prepared_positions_data,
                 prepared_allocate_lens_data,
+                prepared_hidden_for_draft_extend,
             )
             if return_target_logits:
                 target_logits_for_host = jax.sharding.reshard(target_logits_for_host, rep)
@@ -1024,6 +1036,7 @@ def _build_verify(topk: int):
         return (
             target_pool_updates,
             prepared_hidden,
+            prepared_hidden_for_draft_extend,
             prepared_verified_id,
             prepared_verified_id_data,
             prepared_next_verified_id,
@@ -1421,7 +1434,11 @@ def launch_fused_draft_extend_for_decode(
 
     if batch_output.next_draft_input.verified_id.shape[0] <= 0:
         return None
-    target_hidden = batch_output.logits_output.hidden_states
+    target_hidden = getattr(
+        batch_output.next_draft_input,
+        "hidden_states_for_draft_extend",
+        batch_output.logits_output.hidden_states,
+    )
     update_relay = relay_buffers is not None
 
     draft_input = EagleDraftInput(
@@ -1588,6 +1605,7 @@ def restore_draft_extend_result(draft_worker, model_worker_batch, pending_result
     batch_output.next_draft_input.topk_p = np.ones(topk_index.shape, dtype=np.float32)
     batch_output.next_draft_input.topk_index = topk_index
     batch_output.next_draft_input.verified_id = np.asarray(next_verified_id)[sel]
+    batch_output.next_draft_input.hidden_states_for_draft_extend = None
     batch_output.next_draft_input.allocate_lens = batch_output.next_draft_input.allocate_lens[
         : model_worker_batch.real_bs
     ]
@@ -1884,6 +1902,7 @@ def spec_decode_verify(spec_worker, model_worker_batch, cur_allocate_lens):
         (
             target_pool_updates,
             prepared_hidden,
+            prepared_hidden_for_draft_extend,
             prepared_verified_id,
             prepared_verified_id_data,
             prepared_next_verified_id,
@@ -1944,7 +1963,7 @@ def spec_decode_verify(spec_worker, model_worker_batch, cur_allocate_lens):
         draft0 = None
         predict0 = None
         verify_positions0 = None
-        selected_positions0 = None
+        draft_extend_positions0 = None
         emitted0 = None
         if (
             all(
@@ -1962,20 +1981,20 @@ def spec_decode_verify(spec_worker, model_worker_batch, cur_allocate_lens):
             verify_positions0 = (
                 seq_host.reshape(-1)[:1].astype(np.int32) + np.arange(n, dtype=np.int32)
             ).reshape(-1)
-            selected_positions0 = pos_host[:n]
+            draft_extend_positions0 = pos_host[:n]
             emitted0 = pred_host[: int(acc_host[0])] if acc_host.size else None
         logger.info(
             "[VERIFYDUMP] fused verify_forward argmax per draft pos = %s", target_argmax[:8]
         )
         logger.info(
             "[VERIFYDUMP] fused verify trace "
-            "seq_lens[:4]=%s draft0=%s verify_positions0=%s selected_positions0=%s "
+            "seq_lens[:4]=%s draft0=%s verify_positions0=%s draft_extend_positions0=%s "
             "target_predict0=%s "
             "accept_lens[:4]=%s emitted0=%s",
             seq_host[:4] if isinstance(seq_host, np.ndarray) else seq_host,
             draft0,
             verify_positions0,
-            selected_positions0,
+            draft_extend_positions0,
             predict0,
             acc_host[:4] if isinstance(acc_host, np.ndarray) else acc_host,
             emitted0,
@@ -1988,6 +2007,7 @@ def spec_decode_verify(spec_worker, model_worker_batch, cur_allocate_lens):
         hidden_states=prepared_hidden,
         accept_length=prepared_accept_lens_data,
     )
+    next_draft_input.hidden_states_for_draft_extend = prepared_hidden_for_draft_extend
     next_draft_input.verified_id_for_draft_extend = prepared_verified_id_data
     next_draft_input.extend_seq_lens_for_draft_extend = prepared_extend_seq_lens
     next_draft_input.logits_indices_for_draft_extend = prepared_logits_indices
