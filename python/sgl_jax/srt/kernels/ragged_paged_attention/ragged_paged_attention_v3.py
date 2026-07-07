@@ -23,6 +23,7 @@ sglang-jax specific features:
 import functools
 import inspect as _inspect
 import logging
+import os
 from enum import Enum
 
 import jax
@@ -2012,6 +2013,26 @@ def ragged_paged_attention(
 
     def _prepare_block_sizes(block_sizes, case):
         if block_sizes is None:
+            if (
+                os.environ.get("SGL_JAX_VERIFY_DECODE_LIKE_RPA") == "1"
+                and mask_aligned_to_cu_kv
+                and case == RpaCase.MIXED
+            ):
+                return get_default_block_sizes(
+                    q.dtype,
+                    kv_cache_fused_processed.dtype,
+                    actual_num_q_heads,
+                    actual_num_kv_heads,
+                    head_dim,
+                    page_size,
+                    max_num_tokens,
+                    max_num_seqs,
+                    pages_per_seq,
+                    case=RpaCase.DECODE,
+                    vmem_limit_bytes=vmem_limit_bytes,
+                    use_custom_mask=not use_causal_mask,
+                    sliding_window=sliding_window,
+                )
             # The tuned table is measured on v7 (full VMEM). Restrict lookups to
             # v7 so v6e/v5 keep main's heuristic path unchanged (the v7-tuned
             # entries are not valid for the v6e //2 budget and regress its
