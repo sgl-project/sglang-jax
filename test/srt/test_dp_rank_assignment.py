@@ -38,6 +38,9 @@ class _DpAssignmentHarness:
         self.per_dp_max_running_requests = per_dp_max_running_requests
         self.round_robin_counter = 0
         self.cache_aware_calls: list[tuple[str | list[str] | None, list[int], list[int]]] = []
+        # Records (item_input, item_output, extra_input_counts, extra_output_counts)
+        # per shape_aware dispatch, so tests can assert the same-tick pending-IO split.
+        self.shape_aware_calls: list[tuple[int, int, list[int], list[int]]] = []
 
     def select_round_robin_dp(self) -> int:
         dp_rank = self.round_robin_counter % self.dp_size
@@ -80,8 +83,12 @@ class _DpAssignmentHarness:
         extra_input_counts: list[int],
         extra_output_counts: list[int],
     ) -> int | None:
-        # These characterization tests exercise the dispatcher, not the shape-aware
-        # math (covered by test_dp_schedule_shape_aware.py); reuse min-running here.
+        # Record the IO-specific args so the dispatcher's same-tick pending-IO
+        # tracking is under test; the routing decision itself (shape-aware math)
+        # is covered by test_dp_schedule_shape_aware.py, so reuse min-running here.
+        self.shape_aware_calls.append(
+            (item_input, item_output, list(extra_input_counts), list(extra_output_counts))
+        )
         return self.select_min_running_dp(extra_counts, extra_token_counts)
 
     @staticmethod
@@ -201,6 +208,25 @@ def test_cache_aware_receives_pending_load_from_prior_requests():
     assert result.pending_reqs == []
     assert new.dp_rank == 1
     assert harness.cache_aware_calls == [("new", [1, 0], [8, 0])]
+
+
+def test_shape_aware_receives_pending_io_split_from_prior_requests():
+    # Guards the load-bearing same-tick pending-IO tracking: a request assigned
+    # earlier in this intake tick (the sticky request on rank 0) must be reflected
+    # in the input/output split passed to select_shape_aware_dp for the next
+    # request -- distinct input/output values here catch a swapped or dropped axis.
+    harness = _DpAssignmentHarness()
+    sticky = _req("sticky", dp_rank=0, input_len=10, max_new_tokens=3)  # io = (10, 3)
+    new = _req("new", input_len=5, max_new_tokens=7)  # item io = (5, 7)
+
+    result = _assign(recv_reqs=[sticky, new], policy="shape_aware", harness=harness)
+
+    assert result.ready_reqs == [sticky, new]
+    assert result.pending_reqs == []
+    # select_shape_aware_dp was called once (for `new`), seeing the incoming item's
+    # (input, output) = (5, 7) and the sticky request's IO accumulated on rank 0:
+    # per-rank pending input = [10, 0], pending output = [3, 0].
+    assert harness.shape_aware_calls == [(5, 7, [10, 0], [3, 0])]
 
 
 def test_dp_size_one_assigns_generate_reqs_and_preserves_control_reqs():
