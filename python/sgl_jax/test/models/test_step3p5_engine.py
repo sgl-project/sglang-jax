@@ -519,6 +519,65 @@ class TestMultiTokenExtendCausality(unittest.TestCase):
             ),
         )
 
+    def test_first_extend_position_overwrites_stale_future_cache_slot(self):
+        model = self._build_and_load()
+        prefix_ids = jnp.array(np.arange(_PREFIX_LEN, dtype=np.int32) % _VOCAB)
+        accepted_tokens = jnp.array([17, 19], dtype=jnp.int32)
+        stale_window = jnp.array([17, 19, 3, 5], dtype=jnp.int32)
+        next_window = jnp.array([23, 29, 31, 37], dtype=jnp.int32)
+        total_tokens = _PREFIX_LEN + int(stale_window.shape[0])
+
+        with jax.default_matmul_precision("highest"):
+            dirty_pool = self._prefill_pool(model, prefix_ids, total_tokens)
+            stale_logits = _run_extend_all_positions(
+                model, self._mesh, dirty_pool, _PREFIX_LEN, stale_window
+            )
+            jax.block_until_ready(stale_logits)
+            dirty_logits = _run_extend_all_positions(
+                model,
+                self._mesh,
+                dirty_pool,
+                _PREFIX_LEN + int(accepted_tokens.shape[0]),
+                next_window,
+            )
+            jax.block_until_ready(dirty_logits)
+
+            clean_prefix = jnp.concatenate([prefix_ids, accepted_tokens])
+            clean_pool = self._prefill_pool(model, clean_prefix, total_tokens)
+            clean_logits = _run_extend_all_positions(
+                model,
+                self._mesh,
+                clean_pool,
+                _PREFIX_LEN + int(accepted_tokens.shape[0]),
+                next_window,
+            )
+            jax.block_until_ready(clean_logits)
+
+        dirty_first = np.asarray(dirty_logits[0], dtype=np.float64)
+        clean_first = np.asarray(clean_logits[0], dtype=np.float64)
+        max_abs = float(np.max(np.abs(dirty_first - clean_first)))
+        scale = float(max(np.max(np.abs(clean_first)), 1e-6))
+        print(
+            "\n=== stale future KV overwrite ===\n"
+            f" first argmax dirty={int(dirty_first.argmax())} clean={int(clean_first.argmax())}\n"
+            f" first max_abs_diff={max_abs:.6e} scale={scale:.6e}"
+        )
+        self.assertEqual(
+            int(dirty_first.argmax()),
+            int(clean_first.argmax()),
+            "The first EXTEND query changed argmax when its cache slot contained stale KV",
+        )
+        np.testing.assert_allclose(
+            dirty_first,
+            clean_first,
+            rtol=0.0,
+            atol=_RTOL_FP32_LOGIC * scale,
+            err_msg=(
+                "Writing a new token at an already-populated future cache slot must "
+                "produce the same first-position logits as a clean cache"
+            ),
+        )
+
 
 # ---------------------------------------------------------------------------
 # Test C-①: prefill == decode (flash self-consistency, I3)
