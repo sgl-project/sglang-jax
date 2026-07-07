@@ -81,13 +81,32 @@ def main() -> None:
     parser.add_argument("--sample-count", type=int, required=True, help="Accuracy sample count.")
     parser.add_argument("--server-id", default="", help="Server PID or Falcon exp_id.")
     parser.add_argument("--accuracy-json", default="", help="Accuracy metrics json path.")
-    parser.add_argument("--accuracy-artifact", action="append", default=[], help="Accuracy artifact path. Repeatable.")
-    parser.add_argument("--accuracy-note", action="append", default=[], help="Extra accuracy result note. Repeatable.")
+    parser.add_argument(
+        "--accuracy-artifact",
+        action="append",
+        default=[],
+        help="Accuracy artifact path. Repeatable.",
+    )
+    parser.add_argument(
+        "--accuracy-note",
+        action="append",
+        default=[],
+        help="Extra accuracy result note. Repeatable.",
+    )
     parser.add_argument("--speed-output-dir", default="", help="Speed benchmark output directory.")
     parser.add_argument("--speed-summary-csv", default="", help="Speed summary csv path.")
-    parser.add_argument("--speed-artifact", action="append", default=[], help="Speed artifact path. Repeatable.")
-    parser.add_argument("--speed-note", action="append", default=[], help="Extra speed result note. Repeatable.")
-    parser.add_argument("--speed-kv", action="append", default=[], help="Extra speed metadata as KEY=VALUE. Repeatable.")
+    parser.add_argument(
+        "--speed-artifact", action="append", default=[], help="Speed artifact path. Repeatable."
+    )
+    parser.add_argument(
+        "--speed-note", action="append", default=[], help="Extra speed result note. Repeatable."
+    )
+    parser.add_argument(
+        "--speed-kv",
+        action="append",
+        default=[],
+        help="Extra speed metadata as KEY=VALUE. Repeatable.",
+    )
     args = parser.parse_args()
 
     accuracy_metrics = _read_json(args.accuracy_json)
