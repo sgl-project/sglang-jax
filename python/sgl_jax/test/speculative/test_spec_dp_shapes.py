@@ -23,6 +23,10 @@ from sgl_jax.srt.managers.scheduler_output_processor_mixin import (
     SchedulerOutputProcessorMixin,
 )
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
+from sgl_jax.srt.speculative.draft_extend_fused import (
+    _build_decode_loop_cache_loc,
+    _build_decode_loop_out_cache_loc,
+)
 from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 
@@ -386,6 +390,50 @@ def test_draft_page_indices_dp_segmented(dp, bs_per_rank):
         want = np.concatenate([np.full(int(spec_pg[k]), k) for k in ks] or [np.array([], int)])
         assert list(seg[: len(want)]) == list(want), (r, seg[: len(want) + 2], want)
         assert np.all(seg[len(want) :] == -1), f"rank {r} pad region nonempty"
+
+
+def test_decode_loop_cache_loc_is_dp_segmented():
+    req_to_token = np.zeros((8, 16), dtype=np.int32)
+    req_to_token[2] = 200 + np.arange(16, dtype=np.int32)
+    req_to_token[5] = 500 + np.arange(16, dtype=np.int32)
+    req_to_token[6] = 600 + np.arange(16, dtype=np.int32)
+    pool = SimpleNamespace(req_to_token=req_to_token)
+
+    req_pool_indices = np.asarray([2, -1, 5, 6], dtype=np.int32)
+    seq_lens = np.asarray([3, 0, 5, 2], dtype=np.int32)
+    cache_loc = _build_decode_loop_cache_loc(
+        pool,
+        req_pool_indices,
+        seq_lens,
+        dp_size=2,
+        per_dp_bs=2,
+        page_size=4,
+    )
+
+    assert cache_loc.shape == (24,)
+    np.testing.assert_array_equal(cache_loc[:3], [200, 201, 202])
+    assert np.all(cache_loc[3:12] == 0)
+    np.testing.assert_array_equal(cache_loc[12:17], [500, 501, 502, 503, 504])
+    assert np.all(cache_loc[17:20] == 0)
+    np.testing.assert_array_equal(cache_loc[20:22], [600, 601])
+    assert np.all(cache_loc[22:24] == 0)
+
+
+def test_decode_loop_out_cache_loc_uses_current_positions():
+    req_to_token = np.zeros((8, 16), dtype=np.int32)
+    req_to_token[2] = 200 + np.arange(16, dtype=np.int32)
+    req_to_token[5] = 500 + np.arange(16, dtype=np.int32)
+    req_to_token[6] = 600 + np.arange(16, dtype=np.int32)
+    pool = SimpleNamespace(req_to_token=req_to_token)
+
+    out_cache_loc = _build_decode_loop_out_cache_loc(
+        pool,
+        np.asarray([2, -1, 5, 6], dtype=np.int32),
+        np.asarray([3, 0, 5, 2], dtype=np.int32),
+        np.asarray([True, False, True, True]),
+    )
+
+    np.testing.assert_array_equal(out_cache_loc, [203, -1, 505, 602])
 
 
 @pytest.mark.parametrize(
