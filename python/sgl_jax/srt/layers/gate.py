@@ -105,7 +105,9 @@ class TopK(nnx.Module):
 
         if self.num_expert_group > 0 or self.topk_group > 0:
             if correction_bias is not None:
-                topk_weights, topk_ids = self._biased_grouped_topk(router_logits, correction_bias)
+                topk_weights, topk_ids = self._biased_grouped_topk(
+                    router_logits, correction_bias, packed=router_logits.dtype == jnp.bfloat16
+                )
             else:
                 topk_weights, topk_ids = self._grouped_topk(router_logits)
         else:
@@ -175,6 +177,7 @@ class TopK(nnx.Module):
         self,
         router_logits: jax.Array,
         correction_bias: jax.Array = None,
+        packed: bool = False,
     ):
         if not _grouped_topk_kernel_enabled():
             return self._biased_grouped_topk_jax(router_logits, correction_bias)
@@ -183,6 +186,7 @@ class TopK(nnx.Module):
             num_expert_group=self.num_expert_group,
             topk_group=self.topk_group,
             topk=self.topk,
+            packed=packed,
         )
         # Mosaic/Pallas kernels cannot be auto-partitioned by JAX's SPMD compiler;
         # wrap in shard_map so each device runs the kernel on its local token slice.

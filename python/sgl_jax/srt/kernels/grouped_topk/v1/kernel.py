@@ -35,15 +35,11 @@ import jax.numpy as jnp
 logger = logging.getLogger(__name__)
 
 NEG_INF = -jnp.inf
+_I32_MIN = jnp.iinfo(jnp.int32).min
 
 # Largest token block (grid>1) known to fit v7x VMEM with double-buffered [E,BT] inputs. The "auto"
 # path never tiles above this without warning.
 SAFE_AUTO_BT = 2048
-
-
-def _align_to(x: int, a: int) -> int:
-    return ((x + a - 1) // a) * a
-
 
 def _largest_safe_divisor(bs: int, cap: int = SAFE_AUTO_BT, align: int = 128) -> int | None:
     """Largest d dividing bs with d <= cap and d % align == 0, else None.
@@ -72,6 +68,7 @@ def _grouped_topk_kernel(
     topk_group: int,
     topk: int,
     num_experts: int,
+    packed: bool = False,
 ):
     S = num_experts // n_group
     E = num_experts
@@ -115,29 +112,57 @@ def _grouped_topk_kernel(
     #    fori_loop carries the [E,BT] working array and writes each pick into ROW k of the [topk,BT]
     #    outputs, so per-block VMEM stays O(E*BT), independent of topk. Fully unrolled (topk is
     #    small and static) so the picks overlap.
+    #
+    #    Two selection modes (compile-time `packed`):
+    #      packed=False — the f32 contract: `max` + masked-`min` finds the smallest expert id at the
+    #        max score, bit-exact to `lax.top_k` on the f32 scores.
+    #      packed=True  — the bf16 contract: bf16-round each score into an int32 order-preserving key
+    #        (plain int order == (score DESC, index ASC)), so each pick is ONE reduction + a low-bit
+    #        decode instead of the max+masked-min pair. Lossless for bf16 inputs (the low 16 mantissa
+    #        bits are zero, so packing the id into those 16 bits discards nothing). See gate.py:
+    #        the caller selects packed only when router_logits is bf16.
     with jax.named_scope("final_select"):
         e_iota = jax.lax.broadcasted_iota(jnp.int32, (E, bt), 0)
         row_iota = jax.lax.broadcasted_iota(jnp.int32, (topk, bt), 0)
         ids_init = jnp.full((topk, bt), -1, dtype=jnp.int32)
         w_init = jnp.zeros((topk, bt), dtype=jnp.float32)
 
+        if packed:
+            # Index goes in the low 16 bits (bf16-rounded mantissa, all zero; score lives in bits
+            # 16-31). op count is identical to a tighter b (masks are compile-time constants).
+            # E-1 (<=511) fits in 16 bits.
+            low_mask = jnp.int32(0xFFFF)
+            clear_mask = jnp.int32(-(1 << 16))  # 0xFFFF0000: clears the low 16 index bits
+            with jax.named_scope("build_key"):
+                sb = masked.astype(jnp.bfloat16).astype(jnp.float32)  # bf16-round: low 16 bits zero
+                si = jax.lax.bitcast_convert_type(sb, jnp.int32)
+                # flip low 31 bits for negatives so signed int32 compares in float order (incl -inf)
+                key_score = si ^ ((si >> 31) & jnp.int32(0x7FFFFFFF))
+                work0 = (key_score & clear_mask) | (E - 1 - e_iota)  # [E, BT] packed key
+        else:
+            work0 = masked  # [E, BT] f32 working scores
+
         def _pick(k, carry):
             cur, ids_buf, w_buf = carry
-            cmax = jnp.max(cur, axis=0, keepdims=True)
-            idx = jnp.min(
-                jnp.where(cur == cmax, e_iota, E), axis=0, keepdims=True
-            )  # [1, BT] lowest expert id achieving the max
+            if packed:
+                kmax = jnp.max(cur, axis=0, keepdims=True)  # [1, BT] single reduction
+                idx = (E - 1) - (kmax & low_mask)  # [1, BT] lowest-index winner from the low bits
+            else:
+                cmax = jnp.max(cur, axis=0, keepdims=True)
+                idx = jnp.min(
+                    jnp.where(cur == cmax, e_iota, E), axis=0, keepdims=True
+                )  # [1, BT] lowest expert id achieving the max
             sel = e_iota == idx  # [E, BT]
             # weight from PRE-bias logits via masked sum (gather is unsupported in Pallas/Mosaic).
             wval = jnp.sum(jnp.where(sel, logits, 0.0), axis=0, keepdims=True)  # [1, BT]
             write = row_iota == k  # [topk, BT] one-hot on row k (loop index)
             ids_buf = jnp.where(write, idx.astype(jnp.int32), ids_buf)
             w_buf = jnp.where(write, wval.astype(jnp.float32), w_buf)
-            cur = jnp.where(sel, NEG_INF, cur)  # drop the winner before the next pick
+            cur = jnp.where(sel, _I32_MIN if packed else NEG_INF, cur)  # drop the winner
             return cur, ids_buf, w_buf
 
         _, ids_out, w_out = jax.lax.fori_loop(
-            0, topk, _pick, (masked, ids_init, w_init), unroll=True
+            0, topk, _pick, (work0, ids_init, w_init), unroll=True
         )
 
     ids_ref[...] = ids_out  # [topk, BT]
@@ -153,6 +178,7 @@ def grouped_topk_pallas(
     topk: int,
     block_tokens: int | str = "auto",
     interpret: bool | None = None,
+    packed: bool = False,
 ):
     """Biased grouped top-k via argmax-selection. Returns (topk_weights[BS,k], topk_ids[BS,k]).
 
@@ -160,6 +186,10 @@ def grouped_topk_pallas(
     the caller). `block_tokens="auto"` picks the largest 128-aligned divisor of BS (tokens are in the
     lane dim), falling back to a single whole-batch block. The final-select `fori_loop` is fully
     unrolled (topk is small and static).
+
+    `packed=True` uses the bf16 packed-key final select (single reduction per pick, bit-exact to
+    `lax.top_k` at bf16 precision). It is lossless only for bf16 inputs, so the caller enables it
+    exactly when router_logits is bf16; the default f32 path is unchanged.
     """
     bs, e = router_logits.shape
     router_logits = router_logits.astype(jnp.float32)
@@ -190,6 +220,7 @@ def grouped_topk_pallas(
         topk_group=topk_group,
         topk=topk,
         num_experts=e,
+        packed=packed,
     )
     # Kernel emits [topk, BS] (BS in lanes, dense); the `.T` to the [BS, topk] contract lowers to a
     # free bitcast ([topk,BS]{1,0} == [BS,topk]{0,1}), avoiding an output relayout copy.
@@ -209,6 +240,6 @@ def grouped_topk_pallas(
             jax.ShapeDtypeStruct((topk, bs), jnp.int32),
         ],
         interpret=interpret,
-        name="grouped-topk",
+        name="grouped-topk-packed" if packed else "grouped-topk",
     )(router_logits, bias)
     return weights_t.T, ids_t.T
