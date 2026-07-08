@@ -393,10 +393,20 @@ class TestStep3p5ForwardSmoke(unittest.TestCase):
                 os.environ["SGL_JAX_STEP35_FP32_LINEAR_ACC"] = old
 
         self.assertEqual(model.model.layers[0].self_attn.q_proj.preferred_element_type, jnp.float32)
+        self.assertEqual(model.model.layers[0].self_attn.q_proj.output_dtype, jnp.bfloat16)
         self.assertEqual(
             model.model.layers[2].mlp.shared_experts.gate_proj.preferred_element_type,
             jnp.float32,
         )
+        self.assertEqual(
+            model.model.layers[2].mlp.shared_experts.gate_proj.output_dtype,
+            jnp.bfloat16,
+        )
+        with jax.set_mesh(_mesh):
+            q_out, _ = model.model.layers[0].self_attn.q_proj(
+                jnp.zeros((2, cfg.hidden_size), dtype=jnp.bfloat16)
+            )
+        self.assertEqual(q_out.dtype, jnp.bfloat16)
 
     def test_naive_forward_logits_shape_and_finite(self):
         """ForCausalLM(attn_impl="naive") produces finite logits of correct shape."""

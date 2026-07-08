@@ -183,6 +183,7 @@ class Step3p5Attention(nnx.Module):
             kernel_axes=(None, "tensor"),
             params_dtype=dtype,
             preferred_element_type=linear_acc_dtype,
+            output_dtype=dtype,
             mesh=mesh,
             scope_name="q_proj",
         )
@@ -193,6 +194,7 @@ class Step3p5Attention(nnx.Module):
             kernel_axes=(None, "tensor"),
             params_dtype=dtype,
             preferred_element_type=linear_acc_dtype,
+            output_dtype=dtype,
             mesh=mesh,
             scope_name="k_proj",
         )
@@ -203,6 +205,7 @@ class Step3p5Attention(nnx.Module):
             kernel_axes=(None, "tensor"),
             params_dtype=dtype,
             preferred_element_type=linear_acc_dtype,
+            output_dtype=dtype,
             mesh=mesh,
             scope_name="v_proj",
         )
@@ -213,6 +216,7 @@ class Step3p5Attention(nnx.Module):
             kernel_axes=("tensor", None),
             params_dtype=dtype,
             preferred_element_type=linear_acc_dtype,
+            output_dtype=dtype,
             mesh=mesh,
             scope_name="o_proj",
         )
@@ -256,6 +260,7 @@ class Step3p5Attention(nnx.Module):
                 kernel_axes=(None, "tensor"),
                 params_dtype=dtype,
                 preferred_element_type=linear_acc_dtype,
+                output_dtype=dtype,
                 mesh=mesh,
                 scope_name="g_proj",
             )
@@ -409,6 +414,7 @@ class Step3p5MLP(nnx.Module):
             use_bias=False,
             params_dtype=dtype,
             preferred_element_type=linear_acc_dtype,
+            output_dtype=dtype,
             mesh=mesh,
             scope_name="gate_proj",
         )
@@ -419,6 +425,7 @@ class Step3p5MLP(nnx.Module):
             use_bias=False,
             params_dtype=dtype,
             preferred_element_type=linear_acc_dtype,
+            output_dtype=dtype,
             mesh=mesh,
             scope_name="up_proj",
         )
@@ -429,6 +436,7 @@ class Step3p5MLP(nnx.Module):
             use_bias=False,
             params_dtype=dtype,
             preferred_element_type=linear_acc_dtype,
+            output_dtype=dtype,
             mesh=mesh,
             scope_name="down_proj",
         )
