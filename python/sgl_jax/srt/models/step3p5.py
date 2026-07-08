@@ -468,15 +468,14 @@ class Step3p5MoE(nnx.Module):
         share_expert_dim: int = config.share_expert_dim
         routed_scaling_factor: float = config.moe_router_scaling_factor
         renormalize: bool = config.norm_expert_weight
+        self.need_fp32_gate: bool = config.need_fp32_gate
 
-        # Gate: fp32 kernel, HIGHEST precision dot (need_fp32_gate).
-        # GateLogit already uses fp32 kernel + HIGHEST precision.
         self.moe_gate = GateLogit(
             input_size=hidden_size,
             num_experts=num_experts,
             score_func="sigmoid",
             enable_expert_bias=config.use_moe_router_bias,
-            weight_dtype=dtype,
+            weight_dtype=jnp.float32,
         )
 
         self.topk = TopK(
@@ -512,7 +511,8 @@ class Step3p5MoE(nnx.Module):
         )
 
     def __call__(self, hidden_states: jax.Array, dispatch_info=None):
-        router_logits = self.moe_gate(hidden_states)
+        router_input = hidden_states.astype(jnp.float32) if self.need_fp32_gate else hidden_states
+        router_logits = self.moe_gate(router_input)
         correction_bias = self.moe_gate.bias.value if self.moe_gate.bias is not None else None
         topk_weights, topk_ids = self.topk(
             router_logits, correction_bias, dispatch_info=dispatch_info

@@ -337,15 +337,14 @@ class TestStep3p5WeightLoading(unittest.TestCase):
         model, src = self._build_model_and_load(cfg)
 
         src_bias = src["model.layers.2.moe.router_bias"]
-        # GateLogit.bias is stored as nnx.Param; value dtype may be cast to model dtype.
         loaded_bias = np.asarray(model.model.layers[2].mlp.moe_gate.bias.value)
         self.assertEqual(loaded_bias.shape, (cfg.moe_num_experts,))
-        # Check values match (with bf16 tolerance — bias is loaded in model dtype).
+        self.assertEqual(loaded_bias.dtype, np.float32)
         np.testing.assert_allclose(
-            loaded_bias.astype(np.float32),
-            src_bias.astype(np.float32),
-            rtol=1e-2,
-            atol=1e-2,
+            loaded_bias,
+            src_bias,
+            rtol=1e-6,
+            atol=1e-6,
             err_msg="moe_gate.bias values must be close to checkpoint router_bias",
         )
 
