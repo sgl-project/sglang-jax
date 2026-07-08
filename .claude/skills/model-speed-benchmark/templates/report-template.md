@@ -29,7 +29,7 @@
 {actual command — expand the raw bench_serving loop with the concrete bs values}
 ```
 
-- Status: {completed | failed}
+- Status: {completed | partial | failed}
 - Output dir: {output directory}
 - Summary CSV: {summary.csv path}
 - Backend: {--backend value, e.g. sgl-jax / sglang / vllm}

@@ -194,6 +194,29 @@ values = [
     pick("mean_itl_ms"),
     pick("p99_itl_ms"),
 ]
+if not rows:
+    raise SystemExit(f"No valid JSON rows found in {result_file}")
+if any(value == "" for value in values):
+    missing = [
+        name
+        for name, value in zip(
+            [
+                "max_concurrency",
+                "input_throughput",
+                "output_throughput",
+                "max_output_tokens_per_s",
+                "total_throughput",
+                "mean_e2e_latency_ms",
+                "mean_ttft_ms",
+                "mean_tpot_ms",
+                "mean_itl_ms",
+                "p99_itl_ms",
+            ],
+            values,
+        )
+        if value == ""
+    ]
+    raise SystemExit(f"Missing required metrics in {result_file}: {', '.join(missing)}")
 with open(summary, "a", encoding="utf-8") as f:
     f.write(",".join(map(str, values)) + "\n")
 PY

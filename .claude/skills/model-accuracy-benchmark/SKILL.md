@@ -102,6 +102,10 @@ model id should be explicit in the report or when auto-discovery is unreliable.
 **Fallback path**: use `scripts/accuracy_benchmark.sh` only if `evalscope` cannot be
 installed or invoked on the target host. This wrapper calls `test/srt/run_eval.py` (not
 `evalscope eval`) and supports only the benchmark names exposed by that repo-local runner.
+Its artifact layout differs from `evalscope`: `run_eval.py` writes
+`/tmp/<eval_name>_<model>.json` and `/tmp/<eval_name>_<model>.html`. When using the fallback,
+validate and report those `/tmp` files instead of the `evalscope`
+`reports/<model_id>/<dataset>.json` path.
 
 Fallback command:
 
@@ -122,7 +126,9 @@ validation, or comparison, but they do not replace the current run.
 Before reporting success, validate the outputs that were actually produced:
 
 - The work directory exists.
-- `reports/<model_id>/<dataset>.json` exists and is readable.
+- For `evalscope`, `reports/<model_id>/<dataset>.json` exists and is readable.
+- For the fallback wrapper, `/tmp/<eval_name>_<model>.json` and its matching `.html` report
+  exist and are readable.
 - The reported sample count matches the requested `--limit` when a limit was specified.
 - The score can be read from the report artifact.
 
