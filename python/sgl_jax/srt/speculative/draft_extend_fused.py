@@ -493,6 +493,10 @@ def _reshard_values(sharding, *values):
     return tuple(jax.sharding.reshard(value, sharding) for value in values)
 
 
+def _device_put_values(sharding, *values):
+    return tuple(jax.device_put(value, sharding) for value in values)
+
+
 def _topk1_index_from_logits(logits):
     topk_idx = jnp.argmax(logits, axis=-1).astype(jnp.int32)[:, None]
     return topk_idx
@@ -2033,7 +2037,7 @@ def _decode_loop_target_verify(
             prepared_sel_pos,
             prepared_predict,
             prepared_positions,
-        ) = _reshard_values(
+        ) = _device_put_values(
             rep,
             prepared_hidden,
             prepared_verified_id,
@@ -2053,7 +2057,7 @@ def _decode_loop_target_verify(
             prepared_positions_data,
             prepared_allocate_lens_data,
             prepared_hidden_for_draft_extend,
-        ) = _reshard_values(
+        ) = _device_put_values(
             data,
             prepared_verified_id_data,
             prepared_next_verified_id,
@@ -2066,7 +2070,7 @@ def _decode_loop_target_verify(
             prepared_hidden_for_draft_extend,
         )
         if return_target_logits:
-            target_logits_for_host = jax.sharding.reshard(target_logits_for_host, rep)
+            target_logits_for_host = jax.device_put(target_logits_for_host, rep)
 
     return (
         prepared_hidden,

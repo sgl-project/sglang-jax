@@ -311,6 +311,27 @@ class TestVerifyTree(CustomTestCase):
         )
         self.assertTrue(out.is_fully_replicated)
 
+    def test_decode_loop_output_values_are_device_put_to_target_sharding(self):
+        from sgl_jax.srt.speculative import draft_extend_fused
+
+        mesh = Mesh(np.asarray(jax.devices()), ("data",))
+        data = NamedSharding(mesh, P("data"))
+        calls = []
+        original_device_put = draft_extend_fused.jax.device_put
+
+        def record_device_put(value, sharding):
+            calls.append((value, sharding))
+            return ("placed", value, sharding)
+
+        try:
+            draft_extend_fused.jax.device_put = record_device_put
+            placed = draft_extend_fused._device_put_values(data, "a", "b")
+        finally:
+            draft_extend_fused.jax.device_put = original_device_put
+
+        self.assertEqual(placed, (("placed", "a", data), ("placed", "b", data)))
+        self.assertEqual(calls, [("a", data), ("b", data)])
+
     def test_verify_tree_greedy(self):
         candidates = jnp.array(
             [
