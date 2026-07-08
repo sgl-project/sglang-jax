@@ -1806,25 +1806,29 @@ class ServerArgs:
 
         # DFLASH (minimal): non-causal one-shot diffusion draft + linear-chain
         # greedy verify. It does not support overlap / tree / multi-step draft.
-        # block_size (== speculative_num_draft_tokens - 1) is validated against
+        # block_size (== speculative_num_draft_tokens) is validated against
         # the draft model's dflash_config at worker init.
         if self.speculative_algorithm == "DFLASH":
             if not self.disable_overlap_schedule:
-                raise ValueError(
-                    "DFLASH speculative decoding requires --disable-overlap-schedule."
-                )
+                raise ValueError("DFLASH speculative decoding requires --disable-overlap-schedule.")
+            if self.dp_size != 1:
+                raise ValueError("DFLASH stage2 requires --dp-size=1.")
+            if self.tp_size != 1:
+                raise ValueError("DFLASH stage2 requires --tp-size=1.")
             if self.speculative_eagle_topk != 1:
                 raise ValueError(
                     "DFLASH requires --speculative-eagle-topk=1 (linear chain, no tree)."
                 )
             if self.speculative_num_steps != 1:
-                raise ValueError(
-                    "DFLASH (minimal) requires --speculative-num-steps=1."
-                )
+                raise ValueError("DFLASH (minimal) requires --speculative-num-steps=1.")
             if self.speculative_draft_model_path is None:
                 raise ValueError(
                     "DFLASH requires --speculative-draft-model-path (the diffusion draft)."
                 )
+            if self.enable_lora or self.enable_static_lora or self.lora_paths:
+                raise ValueError("DFLASH stage2 does not support LoRA.")
+            if self.grammar_backend not in (None, "none"):
+                raise ValueError("DFLASH stage2 does not support constrained decoding.")
 
     def check_lora_server_args(self):
         """Validate and normalize LoRA-related server arguments."""

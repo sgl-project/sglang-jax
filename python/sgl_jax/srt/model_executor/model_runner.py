@@ -496,10 +496,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 # if there is no aux layer, set to None
                 eagle_aux_hidden_state_layer_ids = None
             self.model.set_eagle3_layers_to_capture(eagle_aux_hidden_state_layer_ids)
-        elif (
-            self.server_args.speculative_algorithm == "DFLASH"
-            and not self.is_draft_worker
-        ):
+        elif self.server_args.speculative_algorithm == "DFLASH" and not self.is_draft_worker:
             # DFLASH captures target intermediate-layer hidden states (K layers)
             # to inject into the draft KV cache. The layer ids come from the draft
             # model's dflash_config; must match the draft checkpoint's fc in-dim.
@@ -512,11 +509,12 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 )
                 dflash_layer_ids = dflash_cfg.target_layer_ids
             except Exception as e:
-                logger.warning(
-                    "DFLASH: failed to parse draft config for aux layer capture: %s", e
-                )
+                logger.warning("DFLASH: failed to parse draft config for aux layer capture: %s", e)
                 dflash_layer_ids = None
-            self.model.set_eagle3_layers_to_capture(dflash_layer_ids)
+            if hasattr(self.model, "set_dflash_layers_to_capture"):
+                self.model.set_dflash_layers_to_capture(dflash_layer_ids)
+            else:
+                self.model.set_eagle3_layers_to_capture(dflash_layer_ids)
 
     def adjust_layer_num(self):
         """For hybrid models, compute effective layer count accounting for
