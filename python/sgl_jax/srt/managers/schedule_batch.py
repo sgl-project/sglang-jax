@@ -2748,6 +2748,14 @@ class ScheduleBatch:
         if flat is None:
             return [None] * len(real_bs_per_dp)
 
+        from sgl_jax.srt.speculative.dflash_info import DFlashDraftInput
+
+        if isinstance(flat, DFlashDraftInput):
+            # DFLASH stage C is dp_size=1: a single rank owns every request, so
+            # the flat spec info passes straight through. DP scatter/split is out
+            # of scope (guarded by ServerArgs.check_server_args).
+            return [flat if n > 0 else None for n in real_bs_per_dp]
+
         has_future_indices = getattr(flat, "future_indices", None) is not None
         if getattr(flat, "pending_draft_extend_result", None) is not None:
             flat.resolve_pending_draft_extend_result()

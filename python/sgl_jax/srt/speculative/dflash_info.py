@@ -38,6 +38,92 @@ def compute_dflash_accept_len_and_bonus(
     return accept_len.astype(jnp.int32), bonus.astype(jnp.int32)
 
 
+def build_dflash_draft_block(
+    verified_id: np.ndarray | jax.Array,
+    mask_token_id: int,
+    target_prefix_lens: np.ndarray | jax.Array,
+    block_size: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build the fixed-size DFlash draft block inputs for one decode step.
+
+    Token 0 of each row is the already-verified seed token; tokens ``1..block_size-1``
+    are the draft mask token. Positions are absolute target positions
+    ``seq_len + arange(block_size)`` so RoPE matches the target KV cache.
+
+    Returns ``(block_ids, positions)``, both host ``np.ndarray`` of shape
+    ``(bs, block_size)`` and int32.
+    """
+    verified_id = np.asarray(verified_id, dtype=np.int32)
+    target_prefix_lens = np.asarray(target_prefix_lens, dtype=np.int32)
+    if verified_id.ndim != 1:
+        raise ValueError(f"verified_id must be 1D, got shape={verified_id.shape}.")
+    if target_prefix_lens.shape != verified_id.shape:
+        raise ValueError(
+            "target_prefix_lens must match verified_id, got "
+            f"{target_prefix_lens.shape} vs {verified_id.shape}."
+        )
+    bs = int(verified_id.shape[0])
+    block_size = int(block_size)
+
+    block_ids = np.full((bs, block_size), int(mask_token_id), dtype=np.int32)
+    block_ids[:, 0] = verified_id
+    positions = target_prefix_lens[:, None] + np.arange(block_size, dtype=np.int32)[None, :]
+    return block_ids, positions.astype(np.int32)
+
+
+def dflash_committed_slices(
+    ctx_lens: np.ndarray,
+    draft_seq_lens: np.ndarray,
+    is_prefill: bool,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Per-request ``(start, length)`` of committed tokens in the KV cache.
+
+    - Prefill: the new-prompt span occupies ``[prefix_len : prefix_len + extend_len]``,
+      where ``draft_seq_lens`` is the cached prefix length and ``ctx_lens`` the new
+      prompt token count.
+    - Decode: the committed tokens occupy the tail ``[new_len - accept_len : new_len]``,
+      where ``draft_seq_lens`` is the new total length and ``ctx_lens`` the number
+      committed this step.
+    """
+    ctx_lens = np.asarray(ctx_lens, dtype=np.int32)
+    draft_seq_lens = np.asarray(draft_seq_lens, dtype=np.int32)
+    if is_prefill:
+        starts = draft_seq_lens.copy()
+    else:
+        starts = draft_seq_lens - ctx_lens
+    return starts.astype(np.int32), ctx_lens.copy()
+
+
+def dflash_greedy_verify_outputs(
+    draft_token: jax.Array,
+    target_predict: jax.Array,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Greedy DFlash verify → scheduler-facing decode outputs.
+
+    ``draft_token[:, 0]`` is the seed (already-emitted verified id). The tokens
+    committed this step are the accepted draft proposals plus one bonus token,
+    which are exactly ``target_predict[i, 0 : accept_len_draft[i] + 1]``.
+
+    Returns:
+    - ``accept_lens_out``: ``(bs,)`` emitted token count per request
+      (= accepted drafts + 1 bonus). This is what the scheduler advances output
+      length by and what ``resolve_spec_decode_token_ids`` slices with.
+    - ``next_token_ids_flat``: ``(bs * block_size,)`` — ``target_predict``
+      flattened; the scheduler keeps the first ``accept_lens_out[i]`` per row.
+    - ``new_verified_id``: ``(bs,)`` next-step seed (= bonus token).
+    - ``accept_len_draft``: ``(bs,)`` number of accepted draft proposals.
+    """
+    if draft_token.ndim != 2:
+        raise ValueError(f"draft_token must be 2D, got shape={draft_token.shape}.")
+    accept_len_draft, bonus = compute_dflash_accept_len_and_bonus(
+        draft_token, target_predict
+    )
+    accept_lens_out = (accept_len_draft + 1).astype(jnp.int32)
+    next_token_ids_flat = target_predict.reshape(-1).astype(jnp.int32)
+    new_verified_id = bonus.astype(jnp.int32)
+    return accept_lens_out, next_token_ids_flat, new_verified_id, accept_len_draft
+
+
 @dataclass
 class DFlashDraftInput:
     """Host-side DFlash state carried between decode iterations."""
@@ -154,3 +240,34 @@ class DFlashVerifyInput:
         candidates = self.draft_token.reshape((-1, int(self.draft_token_num)))
         target_predict = target_predict.reshape(candidates.shape)
         return compute_dflash_accept_len_and_bonus(candidates, target_predict)
+
+    def prepare_for_verify(self, model_worker_batch, page_size: int) -> None:
+        """Wire the drafted block into ``model_worker_batch`` for target verify.
+
+        The scheduler has already allocated ``out_cache_loc`` for ``bs * block``
+        verify tokens via ``get_spec_model_worker_batch``. Here we install the
+        drafted token ids / positions and request full aux-hidden capture so the
+        verify forward yields the target features DFlash needs for the next block.
+        """
+        model_worker_batch.input_ids = np.asarray(
+            jax.device_get(self.draft_token), dtype=np.int32
+        ).reshape(-1)
+        model_worker_batch.positions = np.asarray(
+            jax.device_get(self.positions), dtype=np.int32
+        ).reshape(-1)
+        model_worker_batch.spec_info_padded = self
+        model_worker_batch.capture_hidden_mode = self.capture_hidden_mode
+
+    def verify(
+        self, target_logits: jax.Array
+    ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+        """Greedy-verify a target forward output.
+
+        ``target_logits`` has shape ``[bs * block_size, vocab]``. Returns the
+        scheduler-facing decode outputs from :func:`dflash_greedy_verify_outputs`:
+        ``(accept_lens_out, next_token_ids_flat, new_verified_id, accept_len_draft)``.
+        """
+        target_predict = jnp.argmax(target_logits, axis=-1).astype(jnp.int32)
+        candidates = self.draft_token.reshape((-1, int(self.draft_token_num)))
+        target_predict = target_predict.reshape(candidates.shape)
+        return dflash_greedy_verify_outputs(candidates, target_predict)
