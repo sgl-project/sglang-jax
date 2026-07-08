@@ -1,8 +1,9 @@
-"""Autotune `block_tokens` (BT) for `grouped_topk_pallas` on TPU.
+"""Autotune `block_tokens` for `grouped_topk_pallas` on TPU.
 
 Given a *local* token count T (under sequence-parallelism the topk runs on the per-device token
-shard, so T is small) and a grouped-topk config (E, G, Gtop, k), this sweeps BT candidates, skips
-any that overflow VMEM, times the survivors via a profiler trace, and reports the fastest BT.
+shard, so T is small) and a grouped-topk config (E, G, Gtop, k), this sweeps `block_tokens` (the
+grid-step lever) -- skips any that overflow VMEM, times the survivors via a profiler trace, and
+reports the fastest BT. The final-select `fori_loop` is always fully unrolled by the kernel.
 
 Mirrors the sweep/skip/emit shape of `benchmark/kernels/mla/get_block_spec_config_mla.py`.
 
@@ -36,9 +37,12 @@ except Exception:  # noqa: BLE001
     # is already defined at module scope; nothing to import.
     pass
 
+
 TRACE_ROOT = os.environ.get("TOPK_TRACE_ROOT", "/tmp/tpu_logs/topk_tune")
 VMEM_DEFAULT = 64 * 2**20  # v7x VMEM if get_tpu_info() is unavailable
-N_LIVE = 6  # ~live [BT,E] f32 buffers at the ③ peak (see analysis-zh.md §VMEM)
+# Peak live [BT,E] f32 buffers with the fully-unrolled final-select carry. Pre-filter only (errs
+# lenient so it never over-skips a fittable config); compile is the real gate.
+N_LIVE = 6
 
 
 # ---- profiler-trace device-time (XLA Modules median), mirrors sort_study.py:trace_run ----
@@ -103,6 +107,7 @@ def _logits(T, E, seed=2):
 
 
 def tune_one(T, E, G, Gtop, k, *, tries, vmem_frac, interpret, cap_bytes):
+    kernel_fn = grouped_topk_pallas
     logits = jax.device_put(_logits(T, E))
     bias = jax.device_put(jax.random.normal(jax.random.PRNGKey(1), (E,), dtype=jnp.float32) * 0.1)
     budget = vmem_frac * cap_bytes
@@ -110,7 +115,7 @@ def tune_one(T, E, G, Gtop, k, *, tries, vmem_frac, interpret, cap_bytes):
         f"\n## T={T} E={E} G={G} Gtop={Gtop} k={k}  (VMEM cap {cap_bytes/2**20:.0f}MiB, budget {budget/2**20:.0f}MiB)"
     )
     print(f"{'BT':>6} {'estVMEM':>9} {'status':>9} {'ms':>10}")
-    rows = []
+    rows = []  # (bt, ms)
     for bt in _candidates(T):
         est = N_LIVE * bt * E * 4
         if est > budget:
@@ -118,7 +123,7 @@ def tune_one(T, E, G, Gtop, k, *, tries, vmem_frac, interpret, cap_bytes):
             continue
         fn = jax.jit(
             functools.partial(
-                grouped_topk_pallas,
+                kernel_fn,
                 num_expert_group=G,
                 topk_group=Gtop,
                 topk=k,
@@ -133,14 +138,17 @@ def tune_one(T, E, G, Gtop, k, *, tries, vmem_frac, interpret, cap_bytes):
             oom = ("RESOURCE_EXHAUSTED" in msg) or ("vmem" in msg.lower())
             print(f"{bt:>6} {est/2**20:8.1f}M {('OOM-skip' if oom else 'FAIL'):>9} {'-':>10}")
             continue
-        ms = min(_trace_ms(lambda: fn(logits, bias), tag=f"t{T}_e{E}_bt{bt}") for _ in range(tries))
+        ms = min(
+            _trace_ms(lambda: fn(logits, bias), tag=f"t{T}_e{E}_bt{bt}") for _ in range(tries)
+        )
         print(f"{bt:>6} {est/2**20:8.1f}M {'ok':>9} {ms*1e3:9.2f}u")
         rows.append((bt, ms))
     if not rows:
         print("  (no BT fit VMEM)")
         return None
     best_bt, best_ms = min(rows, key=lambda r: r[1])
-    base = dict(rows).get(min(512, T))
+    # Baseline: BT=min(512,T) -- the pre-tuning default config.
+    base = next((ms for (bt, ms) in rows if bt == min(512, T)), None)
     win = (base / best_ms - 1) * 100 if base else float("nan")
     print(
         f"  best BT={best_bt}  {best_ms*1e3:.2f}us"
@@ -183,8 +191,8 @@ def main():
                 cap_bytes=cap,
             )
             if r:
-                best[(T, E, G, Gtop, k)] = r[0]
-    # paste-ready block for tuned_block_sizes.py: (device, pow2(T), E, G, Gtop, k) -> BT
+                best[(T, E, G, Gtop, k)] = r[0]  # best_bt
+    # paste-ready block for tuned_block_sizes.py: (pow2(T), E, G, Gtop, k) -> BT
     print(f"\n# --- paste-ready for TUNED_BT[{dev!r}] ---")
     for (T, E, G, Gtop, k), bt in sorted(best.items()):
         p2 = 1 << (T - 1).bit_length()

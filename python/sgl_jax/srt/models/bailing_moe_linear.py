@@ -435,6 +435,7 @@ class BailingMoELinearDecoderLayer(nnx.Module):
             topk_group=getattr(config, "topk_group", 0),
             routed_scaling_factor=getattr(config, "routed_scaling_factor", 1.0),
             layer_id=layer_id,
+            mesh=mesh,
         )
 
         self.moe_backend = getattr(config, "moe_backend", MoEBackend.EPMOE)

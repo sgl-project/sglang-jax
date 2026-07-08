@@ -325,6 +325,7 @@ class BailingMoEDecoderLayer(nnx.Module):
                 topk_group=config.topk_group,
                 routed_scaling_factor=config.routed_scaling_factor,
                 layer_id=layer_id,
+                mesh=mesh,
             )
 
             if self.moe_backend == MoEBackend.FUSED_V2:
