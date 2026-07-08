@@ -164,6 +164,7 @@ def _prepare_draft_inputs(
     speculative_num_steps,
     speculative_num_draft_tokens,
     preserve_gather_sharding=True,
+    gather_out_sharding=None,
 ):
     accept_width = speculative_num_steps + 1
     req_ids = (
@@ -178,11 +179,15 @@ def _prepare_draft_inputs(
     )
     hidden_sharding = jax.typeof(hidden_states).sharding
     positions_sharding = jax.typeof(positions).sharding
-    if preserve_gather_sharding and isinstance(hidden_sharding, NamedSharding):
+    if gather_out_sharding is not None:
+        gathered_hidden = hidden_states.at[safe_index, :].get(out_sharding=gather_out_sharding)
+    elif preserve_gather_sharding and isinstance(hidden_sharding, NamedSharding):
         gathered_hidden = hidden_states.at[safe_index, :].get(out_sharding=hidden_sharding)
     else:
         gathered_hidden = hidden_states[safe_index, :]
-    if preserve_gather_sharding and isinstance(positions_sharding, NamedSharding):
+    if gather_out_sharding is not None:
+        gathered_positions = positions.at[safe_index].get(out_sharding=gather_out_sharding)
+    elif preserve_gather_sharding and isinstance(positions_sharding, NamedSharding):
         gathered_positions = positions.at[safe_index].get(out_sharding=positions_sharding)
     else:
         gathered_positions = positions[safe_index]
@@ -207,6 +212,7 @@ def _verify_greedy(
     speculative_num_steps,
     speculative_num_draft_tokens,
     preserve_gather_sharding=True,
+    gather_out_sharding=None,
 ):
     bs = seq_lens.shape[0]
     n = speculative_num_draft_tokens
@@ -249,6 +255,7 @@ def _verify_greedy(
         speculative_num_steps=speculative_num_steps,
         speculative_num_draft_tokens=speculative_num_draft_tokens,
         preserve_gather_sharding=preserve_gather_sharding,
+        gather_out_sharding=gather_out_sharding,
     )
     return GreedySampleAndPrepareOutput(
         hidden_states=prepared.hidden_states,
@@ -1954,6 +1961,7 @@ def _decode_loop_target_verify(
         hidden_per_step.append(logits_output.hidden_states)
 
     with jax.set_mesh(spec_worker.mesh):
+        rep_sharding = NamedSharding(spec_worker.mesh, P())
         target_logits = jnp.stack(logits_per_step, axis=1).reshape(bs * n, -1)
         target_hidden = jnp.stack(hidden_per_step, axis=1).reshape(bs * n, -1)
         draft_tokens = jnp.asarray(draft_tokens_2d.reshape(bs * n), dtype=jnp.int32)
@@ -1968,6 +1976,7 @@ def _decode_loop_target_verify(
             speculative_num_steps=spec_worker.draft_worker.speculative_num_steps,
             speculative_num_draft_tokens=n,
             preserve_gather_sharding=False,
+            gather_out_sharding=rep_sharding,
         )
 
         target_logits_for_host = (
