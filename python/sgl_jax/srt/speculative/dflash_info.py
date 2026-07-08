@@ -36,9 +36,13 @@ def compute_dflash_accept_len_and_bonus(
     row_ids = jnp.arange(candidates.shape[0], dtype=jnp.int32)
     flat_idx = row_ids * candidates.shape[1] + accept_len
     tp_flat = target_predict.reshape(-1)
-    from jax.sharding import NamedSharding, PartitionSpec as P
-    mesh = tp_flat.sharding.mesh
-    bonus = tp_flat.at[flat_idx].get(out_sharding=NamedSharding(mesh, P(None)))
+    mesh = getattr(tp_flat.sharding, "mesh", None)
+    if mesh is None:
+        bonus = jnp.take(tp_flat, flat_idx)
+    else:
+        from jax.sharding import NamedSharding, PartitionSpec as P
+
+        bonus = tp_flat.at[flat_idx].get(out_sharding=NamedSharding(mesh, P(None)))
     return accept_len.astype(jnp.int32), bonus.astype(jnp.int32)
 
 
@@ -265,6 +269,9 @@ class DFlashVerifyInput:
     positions: jax.Array
     draft_token_num: int
     custom_mask: jax.Array | None = None
+    prefix_cache_loc: jax.Array | None = None
+    prefix_lens: jax.Array | None = None
+    dense_draft: bool = False
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL
 
     def is_draft_input(self) -> bool:
@@ -295,10 +302,17 @@ class DFlashVerifyInput:
         pass
 
     def tree_flatten(self):
-        children = (self.draft_token, self.positions, self.custom_mask)
+        children = (
+            self.draft_token,
+            self.positions,
+            self.custom_mask,
+            self.prefix_cache_loc,
+            self.prefix_lens,
+        )
         aux_data = {
             "draft_token_num": int(self.draft_token_num),
             "capture_hidden_mode": self.capture_hidden_mode,
+            "dense_draft": bool(self.dense_draft),
         }
         return children, aux_data
 
@@ -308,7 +322,10 @@ class DFlashVerifyInput:
             draft_token=children[0],
             positions=children[1],
             custom_mask=children[2],
+            prefix_cache_loc=children[3],
+            prefix_lens=children[4],
             draft_token_num=aux_data["draft_token_num"],
+            dense_draft=aux_data.get("dense_draft", False),
             capture_hidden_mode=aux_data["capture_hidden_mode"],
         )
 

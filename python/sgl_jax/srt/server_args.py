@@ -1756,7 +1756,10 @@ class ServerArgs:
         from sgl_jax.srt.multimodal.common.ServerArgs import MultimodalServerArgs
 
         MultimodalServerArgs.add_cli_args(parser)
-        return cls.from_cli_args(parser.parse_args(argv or sys.argv[1:]))
+        raw_argv = argv or sys.argv[1:]
+        server_args = cls.from_cli_args(parser.parse_args(raw_argv))
+        server_args._explicit_cli_args = set(raw_argv)
+        return server_args
 
     def url(self):
         if is_valid_ipv6_address(self.host):
@@ -1806,8 +1809,6 @@ class ServerArgs:
 
         # DFLASH (minimal): non-causal one-shot diffusion draft + linear-chain
         # greedy verify. It does not support overlap / tree / multi-step draft.
-        # block_size (== speculative_num_draft_tokens) is validated against
-        # the draft model's dflash_config at worker init.
         if self.speculative_algorithm == "DFLASH":
             if not self.disable_overlap_schedule:
                 raise ValueError("DFLASH speculative decoding requires --disable-overlap-schedule.")
@@ -1825,6 +1826,31 @@ class ServerArgs:
                 raise ValueError(
                     "DFLASH requires --speculative-draft-model-path (the diffusion draft)."
                 )
+            explicit_cli_args = getattr(self, "_explicit_cli_args", set())
+            explicit_draft_tokens = any(
+                str(arg) == "--speculative-num-draft-tokens"
+                or str(arg).startswith("--speculative-num-draft-tokens=")
+                for arg in explicit_cli_args
+            )
+            if (
+                not explicit_draft_tokens
+                and self.speculative_num_draft_tokens == ServerArgs.speculative_num_draft_tokens
+            ):
+                from sgl_jax.srt.speculative.dflash_util import parse_dflash_draft_config
+
+                draft_config = parse_dflash_draft_config(
+                    self.speculative_draft_model_path,
+                    revision=self.speculative_draft_model_revision,
+                    trust_remote_code=self.trust_remote_code,
+                )
+                if draft_config.block_size != self.speculative_num_draft_tokens:
+                    logger.info(
+                        "DFLASH: using draft config block_size=%d for "
+                        "--speculative-num-draft-tokens (default was %d).",
+                        draft_config.block_size,
+                        self.speculative_num_draft_tokens,
+                    )
+                    self.speculative_num_draft_tokens = draft_config.block_size
             if self.enable_lora or self.enable_static_lora or self.lora_paths:
                 raise ValueError("DFLASH stage2 does not support LoRA.")
             if self.grammar_backend not in (None, "none"):

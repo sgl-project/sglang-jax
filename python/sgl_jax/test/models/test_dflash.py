@@ -55,10 +55,10 @@ def test_dflash_weight_mapping_covers_tiny_config():
     expected = {
         "fc.weight",
         "hidden_norm.weight",
-        "model.norm.weight",
+        "norm.weight",
     }
     for layer_idx in range(2):
-        prefix = f"model.layers.{layer_idx}"
+        prefix = f"layers.{layer_idx}"
         expected.update(
             {
                 f"{prefix}.input_layernorm.weight",

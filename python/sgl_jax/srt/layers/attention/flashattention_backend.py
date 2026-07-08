@@ -537,6 +537,9 @@ class FlashAttention(AttentionBackend):
             else layer.scaling
         )
 
+        attn_type = getattr(layer, "attn_type", None)
+        if getattr(attn_type, "value", attn_type) == "encoder_only":
+            causal = 0
         if self.forward_metadata.custom_mask is not None:
             causal = 0
         # Select page indices and remap to SWA pool if KV cache supports it

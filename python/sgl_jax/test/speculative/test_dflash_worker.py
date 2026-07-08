@@ -95,3 +95,17 @@ def test_committed_cache_loc_reads_req_to_token():
     # req1: positions [2,3] -> req_to_token[1, 2:4] = [22, 23]
     # req3: position  [1]   -> req_to_token[3, 1:2] = [61]
     np.testing.assert_array_equal(locs, np.array([22, 23, 61], dtype=np.int32))
+
+
+def test_pack_cache_loc_rows_uses_bucket_stable_row_width():
+    w = _bare_worker(page_size=1)
+    rows = [
+        np.array([1, 2, 3], dtype=np.int32),
+        np.array([4, 5, 6, 7, 8], dtype=np.int32),
+    ]
+
+    packed = w._pack_cache_loc_rows(rows, [len(r) for r in rows])
+
+    assert packed.shape == (32,)
+    np.testing.assert_array_equal(packed[:5], np.array([1, 2, 3, 0, 0], dtype=np.int32))
+    np.testing.assert_array_equal(packed[16:21], np.array([4, 5, 6, 7, 8], dtype=np.int32))
