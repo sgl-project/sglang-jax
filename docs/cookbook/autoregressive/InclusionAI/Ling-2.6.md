@@ -28,11 +28,11 @@ title: "Ling 2.6"
 | Ling-2.6-1T | **v6e-64** | 8x8 | 16 | 64 | 64 | 8 | 64 | This is the slice we measured on. Trillion-scale; multi-host mandatory. `dp=8` required (GLA `num_groups=8` ≤ tensor axis); `--disable-radix-cache` required (hybrid recurrent state). |
 | Ling-2.6-1T | **v7x-16** | 2×2×4 | 4 | 16 | 32 | 8 | 32 | v7x exposes 2 JAX devices/chip, so `--tp-size` = 16 chips × 2 = 32. Runs the V2 fused MoE kernel (`--moe-backend fused_v2`), which cuts MoE-layer prefill latency ~53% vs V1. Same `dp=8` and `--disable-radix-cache` constraints as v6e-64. |
 
-See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation reference. For other slices (larger v6e, v7x variants, scaled-down configs), see [Adapting to other topologies](../../base/tpu-topology-reference.md#adapting-to-other-topologies).
+See [TPU topology reference](/base/tpu-topology-reference) for the TPU generation reference. For other slices (larger v6e, v7x variants, scaled-down configs), see [Adapting to other topologies](/base/tpu-topology-reference#adapting-to-other-topologies).
 
 ### 2.2 Environment
 
-Install per [Install guide](../../../get_started/install.md). **Build pin**: use sglang-jax 0.1.0 or later — earlier builds crash at weight load on Ling-2.6's compressed-tensors FP8 QKV split. Multi-host required — use [GKE Indexed Job launcher](../../../deployment/gke-indexed-job.md). Advanced users running temporary v6e experiments can adapt [SkyPilot launcher](../../../deployment/skypilot.md).
+Install per [Install guide](/get_started/install). **Build pin**: use sglang-jax 0.1.0 or later — earlier builds crash at weight load on Ling-2.6's compressed-tensors FP8 QKV split. Multi-host required — use [GKE Indexed Job launcher](/deployment/gke-indexed-job). Advanced users running temporary v6e experiments can adapt [SkyPilot launcher](/deployment/skypilot).
 
 For evaluation, additionally install `evalscope` in the client environment:
 
@@ -68,7 +68,7 @@ python3 -u -m sgl_jax.launch_server \
 
 > `--moe-backend` is tunable — `epmoe` (megablox GMM), `fused` (Pallas fused MoE V1), or `fused_v2` (Pallas fused MoE V2, double-buffered); the fused kernels require full EP (`--ep-size` = `--tp-size`). See §2.4.
 
-On GKE, use the [GKE Indexed Job launcher](../../../deployment/gke-indexed-job.md) with `<JOB>=ling-2-6`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=8x8`, `parallelism: 16`, `completions: 16`, and `backoffLimit: 16`; the launcher injects `--nnodes`, `--node-rank`, `--dist-init-addr`, `--host`, and `--port`, so drop those and put the remaining model flags into `<LAUNCH_FLAGS>`. For temporary v6e experiments, advanced users can adapt the [SkyPilot launcher](../../../deployment/skypilot.md) with the same flags.
+On GKE, use the [GKE Indexed Job launcher](/deployment/gke-indexed-job) with `<JOB>=ling-2-6`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=8x8`, `parallelism: 16`, `completions: 16`, and `backoffLimit: 16`; the launcher injects `--nnodes`, `--node-rank`, `--dist-init-addr`, `--host`, and `--port`, so drop those and put the remaining model flags into `<LAUNCH_FLAGS>`. For temporary v6e experiments, advanced users can adapt the [SkyPilot launcher](/deployment/skypilot) with the same flags.
 
 #### Multi-host — TPU v7x-16 (fused MoE V2)
 
@@ -134,13 +134,13 @@ All nodes must sit in the same TPU slice and reach each other on the `--dist-ini
 **Compilation Cache Hygiene:**
 - Set `JAX_COMPILATION_CACHE_DIR` to a shared path (same PVC across all nodes) to persist the JIT cache across restarts.
 
-For full flag definitions see [Launch flags reference](../../base/launch-flags-reference.md).
+For full flag definitions see [Launch flags reference](/base/launch-flags-reference).
 
 ## 3. Invocation
 
 ### 3.1 Basic Chat Completion
 
-For full cURL + native `/generate` patterns see [Basic API usage](../../base/basic-api-usage.md). For thinking + content streaming see §3.2.
+For full cURL + native `/generate` patterns see [Basic API usage](/base/basic-api-usage). For thinking + content streaming see §3.2.
 
 Short Python OpenAI client example (replace `<rank0-ip>` with your rank-0 internal IP):
 
@@ -204,7 +204,7 @@ For non-streaming requests, the field appears on `response.choices[0].message.re
 
 ### 4.1 Accuracy — GSM8K
 
-**Deployment Command** — launch a server per [§2.3 Launch](#23-launch).
+**Deployment Command** — launch a server per [§2.3 Launch](/autoregressive/InclusionAI/Ling-2.6#2-3-launch).
 
 **Benchmark Command**
 
@@ -232,7 +232,7 @@ evalscope eval \
 
 Sanity-checks the quantized fused-MoE serving path on competition math: AIME 2026 (`MathArena/aime_2026`, 30 problems, pass@1; extracted answers exact-matched against the reference). Point `test/srt/run_eval.py` at the served Ling-2.6-1T endpoint.
 
-**Deployment Command** — launch a server per [§2.3 Launch](#23-launch).
+**Deployment Command** — launch a server per [§2.3 Launch](/autoregressive/InclusionAI/Ling-2.6#2-3-launch).
 
 **Benchmark Command**
 
@@ -272,7 +272,7 @@ python test/srt/run_eval.py \
 | Expert Parallelism | 64 |
 | Tested build | sglang-jax 0.1.0 |
 
-**Deployment Command** — same as [§2.3 Multi-host — TPU v6e-64](#multi-host--tpu-v6e-64).
+**Deployment Command** — same as [§2.3 Multi-host — TPU v6e-64](/autoregressive/InclusionAI/Ling-2.6#2-3-launch).
 
 **Benchmark Command**
 
@@ -333,5 +333,5 @@ Max ITL (ms):                            1293.91
 ## Additional Resources
 
 - [Ling-2.6-1T model card](https://huggingface.co/inclusionAI/Ling-2.6-1T)
-- [Launch flags reference](../../base/launch-flags-reference.md)
-- [Cross-recipe troubleshooting](../../../deployment/troubleshooting.md) — cross-recipe generic issues.
+- [Launch flags reference](/base/launch-flags-reference)
+- [Cross-recipe troubleshooting](/deployment/troubleshooting) — cross-recipe generic issues.

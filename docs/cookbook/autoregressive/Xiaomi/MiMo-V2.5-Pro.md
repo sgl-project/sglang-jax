@@ -36,11 +36,11 @@ title: "MiMo-V2.5-Pro"
 
 MiMo-V2.5-Pro is multi-host only — all nodes must be in the same TPU slice and reach each other on the JAX init port (`5000` by default) and the TPU process port (`8471`).
 
-See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation / HBM / device-per-chip reference. For other slices (larger v6e, v7x variants, scaled-down configs), see [Adapting to other topologies](../../base/tpu-topology-reference.md#adapting-to-other-topologies).
+See [TPU topology reference](/base/tpu-topology-reference) for the TPU generation / HBM / device-per-chip reference. For other slices (larger v6e, v7x variants, scaled-down configs), see [Adapting to other topologies](/base/tpu-topology-reference#adapting-to-other-topologies).
 
 ### 2.2 Environment
 
-Install per [Install guide](../../../get_started/install.md) and use one of the launcher templates from [Deployment templates](../../../deployment/).
+Install per [Install guide](/get_started/install) and use one of the launcher templates from [Deployment templates](/deployment).
 
 The `jax0.8.1-rev1` image is what SGL-JAX's GKE launcher and advanced SkyPilot path use; pinning it keeps the JAX runtime in lockstep with the SGL-JAX `[tpu]` extras.
 
@@ -98,7 +98,7 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -m sgl_jax.launch_server \
 
 `${NODE_RANK}` ranges from `0` to `15`.
 
-For the GKE Indexed Job + headless Service manifest pattern that wraps the launch command, see [GKE Indexed Job launcher](../../../deployment/gke-indexed-job.md). For v7x-16 fill in `<JOB>=mimo-v25-pro`, `<ACCELERATOR>=tpu7x`, `<TOPOLOGY>=2x2x4`, `<N>=4`; for v6e-64 fill in `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=4x4x4`, `<N>=16`. Paste the matching launch flags above into `<LAUNCH_FLAGS>`. For temporary v6e experiments, advanced users can adapt [SkyPilot launcher](../../../deployment/skypilot.md) with the same launch flags.
+For the GKE Indexed Job + headless Service manifest pattern that wraps the launch command, see [GKE Indexed Job launcher](/deployment/gke-indexed-job). For v7x-16 fill in `<JOB>=mimo-v25-pro`, `<ACCELERATOR>=tpu7x`, `<TOPOLOGY>=2x2x4`, `<N>=4`; for v6e-64 fill in `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=4x4x4`, `<N>=16`. Paste the matching launch flags above into `<LAUNCH_FLAGS>`. For temporary v6e experiments, advanced users can adapt [SkyPilot launcher](/deployment/skypilot) with the same launch flags.
 
 ### 2.4 Configuration Tips
 
@@ -136,13 +136,13 @@ For the GKE Indexed Job + headless Service manifest pattern that wraps the launc
 - `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache` is mandatory — without it, first request blocks ~4 min while XLA/Pallas re-compiles every kernel.
 - The cache keys on full kernel shape: changing `--page-size`, `--tp-size`, `--chunked-prefill-size`, or `--context-length` invalidates cached entries. Give each tuning experiment its own cache dir to avoid stale-cache misses across runs.
 
-For full flag definitions and defaults see [Launch flags reference](../../base/launch-flags-reference.md).
+For full flag definitions and defaults see [Launch flags reference](/base/launch-flags-reference).
 
 ## 3. Invocation
 
 ### 3.1 Basic Chat Completion
 
-For full cURL + native `/generate` patterns see [Basic API usage](../../base/basic-api-usage.md). For thinking + content streaming see §3.2, for tool calling see §3.3.
+For full cURL + native `/generate` patterns see [Basic API usage](/base/basic-api-usage). For thinking + content streaming see §3.2, for tool calling see §3.3.
 
 Short Python OpenAI client example (replace `<rank0-ip>` with your rank-0 internal IP; tool-calling sampling baseline — for long thinking-on chains raise `max_tokens`):
 
@@ -395,7 +395,7 @@ To see the full set of `--tool-call-parser` keys available in your build, run `p
 | Reasoning Parser | `mimo` |
 | Tested build | sglang-jax 0.1.0 |
 
-**Deployment Command** — same as [§2.3 Multi-host (v6e-64)](#multi-host--tpu-v6e-64-16-nodes-4x4x4), plus `--reasoning-parser mimo`.
+**Deployment Command** — same as [§2.3 Multi-host (v6e-64)](/autoregressive/Xiaomi/MiMo-V2.5-Pro#2-3-launch), plus `--reasoning-parser mimo`.
 
 **Benchmark Command**
 
@@ -430,7 +430,7 @@ evalscope eval \
 | Data Parallelism | 4 |
 | Expert Parallelism | 32 |
 
-**Deployment Command** — same as [§2.3 Multi-host (v7x-16)](#multi-host--tpu-v7x-16-4-nodes-2x2x4).
+**Deployment Command** — same as [§2.3 Multi-host (v7x-16)](/autoregressive/Xiaomi/MiMo-V2.5-Pro#2-3-launch).
 
 **Benchmark Command**
 
@@ -471,7 +471,7 @@ evalscope eval \
 | Expert Parallelism | 64 |
 | Tested build | sglang-jax 0.1.0 |
 
-**Deployment Command** — same as [§2.3 Multi-host (v6e-64)](#multi-host--tpu-v6e-64-16-nodes-4x4x4), without `--reasoning-parser`.
+**Deployment Command** — same as [§2.3 Multi-host (v6e-64)](/autoregressive/Xiaomi/MiMo-V2.5-Pro#2-3-launch), without `--reasoning-parser`.
 
 **Benchmark Command**
 
@@ -530,8 +530,8 @@ Max ITL (ms):                            1290.76
 ## Additional Resources
 
 - [MiMo-V2.5-Pro Model Card](https://huggingface.co/XiaomiMiMo/MiMo-V2.5-Pro)
-- [TPU topology reference](../../base/tpu-topology-reference.md)
-- [Launch flags reference](../../base/launch-flags-reference.md)
-- [GKE Indexed Job launcher](../../../deployment/gke-indexed-job.md) — primary multi-host launcher.
-- [SkyPilot launcher](../../../deployment/skypilot.md) — advanced v6e experiment alternative.
-- [Cross-recipe troubleshooting](../../../deployment/troubleshooting.md) — cross-recipe generic issues.
+- [TPU topology reference](/base/tpu-topology-reference)
+- [Launch flags reference](/base/launch-flags-reference)
+- [GKE Indexed Job launcher](/deployment/gke-indexed-job) — primary multi-host launcher.
+- [SkyPilot launcher](/deployment/skypilot) — advanced v6e experiment alternative.
+- [Cross-recipe troubleshooting](/deployment/troubleshooting) — cross-recipe generic issues.

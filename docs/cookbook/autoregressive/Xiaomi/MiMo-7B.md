@@ -29,11 +29,11 @@ title: "MiMo-7B"
 |---|---|---|---|---|---|
 | MiMo-7B-RL | **v6e-4** | 2x2 | 4 | 4 | This is the slice we measured on. BF16 weights ~14 GB — fits with headroom; single-host serving. |
 
-See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation reference. For other slices (larger v6e, v7x variants), see [Adapting to other topologies](../../base/tpu-topology-reference.md#adapting-to-other-topologies).
+See [TPU topology reference](/base/tpu-topology-reference) for the TPU generation reference. For other slices (larger v6e, v7x variants), see [Adapting to other topologies](/base/tpu-topology-reference#adapting-to-other-topologies).
 
 ### 2.2 Environment
 
-Install per [Install guide](../../../get_started/install.md) and use [Single-host Docker template](../../../deployment/single-host-docker.md) for the container setup.
+Install per [Install guide](/get_started/install) and use [Single-host Docker template](/deployment/single-host-docker) for the container setup.
 
 ### 2.3 Launch
 
@@ -57,7 +57,7 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -m sgl_jax.launch_server \
 - `--mem-fraction-static 0.88` is the TPU default. Raise to `0.9` for dedicated serving / higher concurrency.
 
 **Tool Calling:**
-- MiMo-7B-RL uses the `mimo` tool-call parser format. Add `--tool-call-parser mimo` when using the OpenAI tools API. See [§3.3](#33-tool-calling) for the request/response pattern.
+- MiMo-7B-RL uses the `mimo` tool-call parser format. Add `--tool-call-parser mimo` when using the OpenAI tools API. See [§3.3](/autoregressive/Xiaomi/MiMo-7B#3-3-tool-calling) for the request/response pattern.
 
 **Reasoning Parser:**
 - MiMo-7B-RL uses `--reasoning-parser mimo` (alias of the `qwen3` reasoning parser — same `<think>...</think>` format + `enable_thinking` switch). Append to the §2.3 launch command to expose `reasoning_content` separated from `content`.
@@ -67,13 +67,13 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -m sgl_jax.launch_server \
 **Compilation Cache Hygiene:**
 - `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache` is mandatory — without it, first request blocks ~4 min while XLA/Pallas re-compiles.
 
-For full flag definitions see [Launch flags reference](../../base/launch-flags-reference.md).
+For full flag definitions see [Launch flags reference](/base/launch-flags-reference).
 
 ## 3. Invocation
 
 ### 3.1 Basic Chat Completion
 
-For full cURL + native `/generate` patterns see [Basic API usage](../../base/basic-api-usage.md). For thinking + content streaming see §3.2, for tool calling see §3.3.
+For full cURL + native `/generate` patterns see [Basic API usage](/base/basic-api-usage). For thinking + content streaming see §3.2, for tool calling see §3.3.
 
 Short Python OpenAI client example:
 
@@ -285,7 +285,7 @@ To see the full set of `--reasoning-parser` / `--tool-call-parser` keys availabl
 | Reasoning Parser | `mimo` (thinking-on per-request via `chat_template_kwargs.enable_thinking=true`) |
 | Tested build | sglang-jax 0.1.0 |
 
-**Deployment Command** — same as [§2.3](#single-host--tpu-v6e-4) plus `--reasoning-parser mimo --tool-call-parser mimo`.
+**Deployment Command** — same as [§2.3](/autoregressive/Xiaomi/MiMo-7B#2-3-launch) plus `--reasoning-parser mimo --tool-call-parser mimo`.
 
 **Benchmark Command**
 
@@ -322,7 +322,7 @@ Recommended additional datasets for reasoning variants: AIME 2025, MATH.
 | Tensor Parallelism | 4 |
 | Tested build | sglang-jax 0.1.0 |
 
-**Deployment Command** — same as [§2.3](#single-host--tpu-v6e-4).
+**Deployment Command** — same as [§2.3](/autoregressive/Xiaomi/MiMo-7B#2-3-launch).
 
 **Benchmark Command**
 
@@ -384,5 +384,5 @@ Max ITL (ms):                            38.99
 ## Additional Resources
 
 - [MiMo-7B-RL model card](https://huggingface.co/XiaomiMiMo/MiMo-7B-RL)
-- [Launch flags reference](../../base/launch-flags-reference.md)
-- [Cross-recipe troubleshooting](../../../deployment/troubleshooting.md) — cross-recipe generic issues.
+- [Launch flags reference](/base/launch-flags-reference)
+- [Cross-recipe troubleshooting](/deployment/troubleshooting) — cross-recipe generic issues.

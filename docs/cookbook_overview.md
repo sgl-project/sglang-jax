@@ -8,7 +8,7 @@ The Sphinx build excludes `docs/cookbook/**` intentionally. Keep cookbook naviga
 
 - Model recipes live under `docs/cookbook/autoregressive/` and `docs/cookbook/diffusion/`.
 - Shared recipe references live under `docs/cookbook/base/`.
-- Cookbook contribution rules live in `docs/cookbook/CONTRIBUTING.md`.
+- Cookbook contribution rules live in `docs/cookbook/add-recipe.md`.
 - Cross-cutting launcher templates and troubleshooting live in [Deployment](deployment/index.md), not in the cookbook.
 
 Use the cookbook for model-specific launch commands, validation status, benchmark summaries, and hardware matrices. Use the main Sphinx docs for installation, deployment templates, runtime features, architecture, and developer workflow.

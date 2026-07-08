@@ -22,8 +22,8 @@ End-to-end serving recipes for diffusion-style image and video generation models
 
 | Status | Model | Recipe | Min TPU | Modality | Endpoint |
 |---|---|---|---|---|---|
-| ✅ | Wan 2.1 T2V-14B | [`Wan/Wan2.1.md`](Wan/Wan2.1.md) | v6e-4 | Text-to-video diffusion | `/api/v1/videos/generation`, `/api/v1/images/generation` |
-| ✅ | Wan 2.2 T2V A14B | [`Wan/Wan2.2.md`](Wan/Wan2.2.md) | v6e-4 | Text-to-video diffusion | `/api/v1/videos/generation`, `/api/v1/images/generation` |
+| ✅ | Wan 2.1 T2V-14B | [`Wan/Wan2.1.md`](/diffusion/Wan/Wan2.1) | v6e-4 | Text-to-video diffusion | `/api/v1/videos/generation`, `/api/v1/images/generation` |
+| ✅ | Wan 2.2 T2V A14B | [`Wan/Wan2.2.md`](/diffusion/Wan/Wan2.2) | v6e-4 | Text-to-video diffusion | `/api/v1/videos/generation`, `/api/v1/images/generation` |
 
 > Upgrade path: 🚧 → 🧪 requires measured launch / quality / wall-clock output for at least one variant and hardware path. 🧪 → ✅ requires complete evidence for the recipe's claimed primary path.
 
@@ -31,7 +31,7 @@ End-to-end serving recipes for diffusion-style image and video generation models
 
 A diffusion recipe covers models where the expensive generation loop is denoising, not autoregressive token decoding. For Wan, SGL-JAX stages a text encoder, a DiT denoiser, and a VAE decoder; the endpoint returns an image or video artifact rather than chat tokens.
 
-Autoregressive text and vision-language decoders, including Qwen2.5-VL, live in [Autoregressive recipes](../autoregressive/index.md).
+Autoregressive text and vision-language decoders, including Qwen2.5-VL, live in [Autoregressive recipes](/autoregressive).
 
 ## Built-in Staging Constraint
 
@@ -48,15 +48,15 @@ Current cookbook-facing configuration summary:
 
 ## Shared references
 
-- [TPU topology reference](../base/tpu-topology-reference.md) — TPU generation / HBM / topology.
-- [Launch flags reference](../base/launch-flags-reference.md) — launch flag full table; diffusion-specific flags appear when you run `python -m sgl_jax.launch_server --multimodal --help`.
-- [Deployment templates](../../deployment/) — launcher templates (single-host Docker, GKE Indexed Job, and advanced SkyPilot v6e experiments).
-- [Cross-recipe troubleshooting](../../deployment/troubleshooting.md) — cross-recipe generic issues.
+- [TPU topology reference](/base/tpu-topology-reference) — TPU generation / HBM / topology.
+- [Launch flags reference](/base/launch-flags-reference) — launch flag full table; diffusion-specific flags appear when you run `python -m sgl_jax.launch_server --multimodal --help`.
+- [Deployment templates](/deployment) — launcher templates (single-host Docker, GKE Indexed Job, and advanced SkyPilot v6e experiments).
+- [Cross-recipe troubleshooting](/deployment/troubleshooting) — cross-recipe generic issues.
 
 ## Picking a starting recipe to clone
 
 | Goal | Clone from |
 |---|---|
-| Text-to-video diffusion with Wan 2.1 | [`Wan/Wan2.1.md`](Wan/Wan2.1.md) ✅ |
-| Text-to-video diffusion with Wan 2.2 | [`Wan/Wan2.2.md`](Wan/Wan2.2.md) ✅ |
-| Text-to-image diffusion (prompt → image) | Use [`Wan/Wan2.1.md`](Wan/Wan2.1.md) or [`Wan/Wan2.2.md`](Wan/Wan2.2.md) as the current staged runtime pattern, then replace the model path and endpoint examples as needed |
+| Text-to-video diffusion with Wan 2.1 | [`Wan/Wan2.1.md`](/diffusion/Wan/Wan2.1) ✅ |
+| Text-to-video diffusion with Wan 2.2 | [`Wan/Wan2.2.md`](/diffusion/Wan/Wan2.2) ✅ |
+| Text-to-image diffusion (prompt → image) | Use [`Wan/Wan2.1.md`](/diffusion/Wan/Wan2.1) or [`Wan/Wan2.2.md`](/diffusion/Wan/Wan2.2) as the current staged runtime pattern, then replace the model path and endpoint examples as needed |
