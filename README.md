@@ -29,7 +29,7 @@ SGL-JAX operates on a distributed architecture designed for scalability and perf
 5.  **Model Runner(Included in TP Worker)**: Manages the actual JAX-based model execution, including the forward pass, attention computation, and KV cache operations.
 6. **DetokenizerManager**: Runs in a subprocess, handles output token decoding
 
-More details in [architecture](https://github.com/sgl-project/sglang-jax/blob/main/docs/architecture/project-core-structure.md).
+More details in [architecture](docs/architecture/index.md).
 
 ---
 
@@ -68,7 +68,7 @@ SGL-JAX also supports multimodal models with the same usage interface as LLMs. T
 -   **Wan 2.2 T2V**: Text-to-Video generation model. Uses different DiT models at different noise stages for denoising.
 -   **Qwen2.5-VL**: Vision-language model series based on Qwen2.5.
 
-For multimodal model usage, see the [Usage Guide](docs/multimodal/multimodal_usage.md) and [Architecture Design](docs/multimodal/design/multimodal_architecture_rfc.md).
+For multimodal model usage, see the [Usage Guide](docs/multimodal/multimodal_usage.md) and [Architecture Design](docs/architecture/12-multimodal.md).
 
 
 ## Performance and Benchmarking
