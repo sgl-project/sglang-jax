@@ -104,11 +104,14 @@ class DFlashWorker:
         # because is_draft_worker=True).
         self.draft_model_runner.initialize_jit()
 
+        self.draft_layers = len(self.draft_model.model.layers)
+        self._init_jit_kv_materialize()
+
         logger.info(
             "Initialized DFLASH worker: block_size=%d, mask_token_id=%d, draft_layers=%d",
             self.block_size,
             self._mask_token_id,
-            len(self.draft_model.model.layers),
+            self.draft_layers,
         )
         self._debug_tokens_remaining = (
             4 if os.getenv("SGL_JAX_DFLASH_DEBUG_TOKENS") == "1" else 0
@@ -230,7 +233,6 @@ class DFlashWorker:
         verify_input.prepare_for_verify(model_worker_batch, self.page_size)
         model_worker_batch.forward_mode = ForwardMode.TARGET_VERIFY
         model_worker_batch.seq_lens = target_prefix_lens
-        # Rebuild cache_loc for the target verify: prefix + verify block slots.
         self._rebuild_cache_loc(model_worker_batch, target_prefix_lens, bs)
         forward_metadata = self.target_worker.model_runner.attn_backend.get_eagle_forward_metadata(
             model_worker_batch
@@ -267,8 +269,7 @@ class DFlashWorker:
         new_seq_lens = seq_lens + accept_lens_np
         new_draft_kv_lens = target_prefix_lens + accept_lens_np
 
-        # 4) Update draft state for the next step: new seed + committed target
-        #    hidden appended into the draft KV pool.
+        # 4) Update draft state for the next step.
         next_target_hidden = self._slice_committed_target_hidden(
             logits_output.hidden_states, accept_lens_np, bs
         )
@@ -516,15 +517,72 @@ class DFlashWorker:
     # ------------------------------------------------------------------ #
     # KV materialization + greedy head sampling
     # ------------------------------------------------------------------ #
+    def _init_jit_kv_materialize(self):
+        """Build a single JIT function for materialize_kv + merge + KV write.
+
+        Without this, each decode step dispatches ~60 individual JAX ops
+        (FC, 5×k/v proj, 5×merge, 5×scatter) with ~25 ms tracing overhead
+        each, totalling ~1.5 s.  One JIT call replaces them all.
+        """
+        from functools import partial as _partial
+
+        from flax import nnx
+
+        from sgl_jax.srt.mem_cache.memory_pool import _set_fused_kv_buffer, merge_kv
+
+        runner = self.draft_model_runner
+        pool = runner.token_to_kv_pool
+        page_size = pool.page_size
+        kv_part = pool.kv_partition_axis
+        data_part = pool.attention_data_partition_axis
+        mesh = pool.mesh
+        n_layers = self.draft_layers
+
+        model_def = runner._model_def
+        model_state_def = runner._model_state_def
+
+        @_partial(
+            jax.jit,
+            static_argnames=["model_state_def"],
+            donate_argnames=["kv_buffers"],
+        )
+        def _jit_fn(
+            model_def,
+            model_state_def,
+            model_state_leaves,
+            target_hidden,
+            positions,
+            cache_loc,
+            kv_buffers,
+        ):
+            state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
+            model = nnx.merge(model_def, state)
+            kv_list = model.materialize_kv(target_hidden, positions)
+            new_bufs = []
+            for i in range(n_layers):
+                k, v = kv_list[i]
+                fused = merge_kv(k, v)
+                new_bufs.append(
+                    _set_fused_kv_buffer(
+                        fused,
+                        cache_loc,
+                        kv_buffers[i],
+                        page_size,
+                        kv_part,
+                        data_part,
+                        mesh,
+                    )
+                )
+            return new_bufs
+
+        self._jit_materialize_write = _partial(
+            _jit_fn, model_def, model_state_def
+        )
+
     def _append_target_hidden_to_draft_kv(
         self, model_worker_batch: ModelWorkerBatch, draft_input: DFlashDraftInput, is_prefill: bool
     ) -> None:
-        """Project committed target hidden and write draft K/V at their cache_loc.
-
-        For prefill this is every prompt token; for decode it is the committed
-        verify tokens. The draft cache_loc mirrors the target's committed slots
-        (shared req_to_token_pool), so draft attention over the prefix is valid.
-        """
+        """Project committed target hidden and write draft K/V at their cache_loc."""
         target_hidden = draft_input.target_hidden
         if target_hidden is None or int(np.asarray(draft_input.ctx_lens).sum()) == 0:
             return
@@ -532,11 +590,18 @@ class DFlashWorker:
         cache_loc = self._committed_cache_loc(model_worker_batch, draft_input, is_prefill)
         positions = self._committed_positions(draft_input, is_prefill)
 
-        kv_list = self.draft_model.materialize_kv(target_hidden, jnp.asarray(positions))
-        token_to_kv_pool = self.draft_model_runner.token_to_kv_pool
-        cache_loc_dev = jnp.asarray(cache_loc)
-        for layer_id, (k, v) in enumerate(kv_list):
-            token_to_kv_pool.set_kv_buffer(layer_id, cache_loc_dev, k, v)
+        pool = self.draft_model_runner.token_to_kv_pool
+        kv_buffers = list(pool.kv_buffer[: self.draft_layers])
+
+        new_buffers = self._jit_materialize_write(
+            self.draft_model_runner.model_state_leaves,
+            jnp.asarray(target_hidden),
+            jnp.asarray(positions),
+            jnp.asarray(cache_loc),
+            kv_buffers,
+        )
+        for i, buf in enumerate(new_buffers):
+            pool.kv_buffer[i] = buf
 
         starts, lengths = dflash_committed_slices(
             draft_input.ctx_lens, draft_input.draft_seq_lens, is_prefill

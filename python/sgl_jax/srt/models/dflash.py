@@ -262,7 +262,6 @@ class DFlashAttention(nnx.Module):
         dummy_q = jnp.zeros((num_tokens, 1, self.head_dim), dtype=k.dtype)
         _, k = self.rotary_emb(positions, dummy_q, k)
         return k, v
-        return k, v
 
 
 class DFlashMLP(nnx.Module):
