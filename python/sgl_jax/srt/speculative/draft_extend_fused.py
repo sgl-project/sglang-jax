@@ -480,7 +480,9 @@ def _rotate_prefill_input_ids(input_ids, extend_seq_lens, verified_id, dp_size, 
     return jax.vmap(rotate_rank)(ids, ext, verified).reshape(input_ids.shape)
 
 
-def _gather_rows_preserve_sharding(values, index):
+def _gather_rows_preserve_sharding(values, index, *, out_sharding=None):
+    if out_sharding is not None:
+        return values.at[index, :].get(out_sharding=out_sharding)
     sharding = jax.typeof(values).sharding
     if isinstance(sharding, NamedSharding):
         return values.at[index, :].get(out_sharding=sharding)
@@ -1980,7 +1982,11 @@ def _decode_loop_target_verify(
         )
 
         target_logits_for_host = (
-            _gather_rows_preserve_sharding(target_logits, prepared.safe_index)
+            _gather_rows_preserve_sharding(
+                target_logits,
+                prepared.safe_index,
+                out_sharding=rep_sharding,
+            )
             if return_target_logits
             else None
         )

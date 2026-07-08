@@ -3,6 +3,8 @@ import unittest
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.sharding import Mesh, NamedSharding
+from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.kernels.speculative.kernel import create_extend_after_decode_spec_info
 from sgl_jax.srt.kernels.speculative.tree_speculative_sampling_target_only_kernel import (
@@ -203,6 +205,111 @@ class TestVerifyTree(CustomTestCase):
             np.asarray(out.new_seq_lens),
             np.array([105, 308], dtype=np.int32),
         )
+
+    def test_greedy_verify_can_replicate_gather_outputs(self):
+        from sgl_jax.srt.speculative.draft_extend_fused import _verify_greedy
+
+        mesh = Mesh(np.asarray(jax.devices()), ("data",))
+        data_hidden = NamedSharding(mesh, P("data", None))
+        data_1d = NamedSharding(mesh, P("data"))
+        replicated = NamedSharding(mesh, P())
+        bs = 4
+        num_draft_tokens = 4
+        out = _verify_greedy(
+            target_hidden=jax.device_put(
+                jnp.arange(bs * num_draft_tokens * 2, dtype=jnp.float32).reshape(
+                    bs * num_draft_tokens, 2
+                ),
+                data_hidden,
+            ),
+            positions=jax.device_put(
+                jnp.arange(bs * num_draft_tokens, dtype=jnp.int32),
+                data_1d,
+            ),
+            seq_lens=jax.device_put(
+                jnp.array([10, 20, 30, 40], dtype=jnp.int32),
+                data_1d,
+            ),
+            draft_tokens=jax.device_put(
+                jnp.array(
+                    [
+                        10,
+                        11,
+                        12,
+                        13,
+                        20,
+                        21,
+                        22,
+                        23,
+                        30,
+                        31,
+                        32,
+                        33,
+                        40,
+                        41,
+                        42,
+                        43,
+                    ],
+                    dtype=jnp.int32,
+                ),
+                data_1d,
+            ),
+            target_predict=jax.device_put(
+                jnp.array(
+                    [
+                        11,
+                        12,
+                        99,
+                        14,
+                        21,
+                        99,
+                        23,
+                        24,
+                        31,
+                        32,
+                        33,
+                        34,
+                        41,
+                        42,
+                        43,
+                        44,
+                    ],
+                    dtype=jnp.int32,
+                ),
+                data_1d,
+            ),
+            speculative_num_steps=3,
+            speculative_num_draft_tokens=num_draft_tokens,
+            preserve_gather_sharding=False,
+            gather_out_sharding=replicated,
+        )
+
+        np.testing.assert_array_equal(np.asarray(out.accept_lens), np.array([3, 2, 4, 4]))
+        self.assertTrue(out.hidden_states.is_fully_replicated)
+        self.assertTrue(out.positions.is_fully_replicated)
+
+    def test_gather_rows_can_use_explicit_replicated_out_sharding(self):
+        from sgl_jax.srt.speculative.draft_extend_fused import (
+            _gather_rows_preserve_sharding,
+        )
+
+        mesh = Mesh(np.asarray(jax.devices()), ("data",))
+        values = jax.device_put(
+            jnp.arange(5 * 3, dtype=jnp.float32).reshape(5, 3),
+            NamedSharding(mesh, P("data", None)),
+        )
+        index = jax.device_put(jnp.array([3, 0, 4], dtype=jnp.int32), NamedSharding(mesh, P()))
+        out = _gather_rows_preserve_sharding(
+            values,
+            index,
+            out_sharding=NamedSharding(mesh, P()),
+        )
+
+        np.testing.assert_array_equal(
+            np.asarray(out),
+            np.array([[9, 10, 11], [0, 1, 2], [12, 13, 14]], dtype=np.float32),
+        )
+        self.assertTrue(out.is_fully_replicated)
 
     def test_verify_tree_greedy(self):
         candidates = jnp.array(
