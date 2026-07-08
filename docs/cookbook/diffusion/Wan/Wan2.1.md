@@ -17,7 +17,7 @@ title: "Wan 2.1 T2V"
 
 **Recommended Generation Parameters** (request body, not launch flags):
 
-- `size` - `720*1280` (default), `480*832` (lower-cost), or another precompiled bucket. **Format is `WIDTH*HEIGHT` (asterisk-separated), the same syntax as `--precompile-width-heights`.** Sending `WIDTHxHEIGHT` (lowercase `x`) raises `ValueError: invalid literal for int() with base 10: ...` and crashes the GlobalScheduler. Must match a precompiled bucket; see [§2.4 Configuration Tips](#24-configuration-tips).
+- `size` - `720*1280` (default), `480*832` (lower-cost), or another precompiled bucket. **Format is `WIDTH*HEIGHT` (asterisk-separated), the same syntax as `--precompile-width-heights`.** Sending `WIDTHxHEIGHT` (lowercase `x`) raises `ValueError: invalid literal for int() with base 10: ...` and crashes the GlobalScheduler. Must match a precompiled bucket; see [§2.4 Configuration Tips](/diffusion/Wan/Wan2.1#2-4-configuration-tips).
 - `num_frames` - defaults to the model-card recommended count, commonly 41 for Wan 2.1.
 - `num_inference_steps` - defaults to the model-card recommended count.
 - `seconds` / `fps` - alternative way to specify frame count; the server resolves to `num_frames`.
@@ -34,11 +34,11 @@ title: "Wan 2.1 T2V"
 
 > Wan 2.1 runs through SGL-JAX's built-in staged multimodal runtime. Use the `--tp-size` shown for this model; moving to a larger TPU host or slice does not automatically make every stage use more devices.
 
-See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation reference. For other slices (larger v6e, v7x variants), see [Adapting to other topologies](../../base/tpu-topology-reference.md#adapting-to-other-topologies).
+See [TPU topology reference](/base/tpu-topology-reference) for the TPU generation reference. For other slices (larger v6e, v7x variants), see [Adapting to other topologies](/base/tpu-topology-reference#adapting-to-other-topologies).
 
 ### 2.2 Environment
 
-Install per [Install guide](../../../get_started/install.md) and use [Single-host Docker template](../../deployment/single-host-docker.md) for the container setup.
+Install per [Install guide](/get_started/install) and use [Single-host Docker template](/deployment/single-host-docker) for the container setup.
 
 No extra pip package is needed for video generation. The response returns a video path or URL, and any post-processing such as MP4 transcoding happens client-side.
 
@@ -107,7 +107,7 @@ VAE tiling is enabled by default in the multimodal server and there is no `--no-
 - `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache` avoids recompiling the same `(resolution x frame-count)` buckets across server restarts.
 - The cache keys on full kernel shape. Changing `--precompile-width-heights`, `--precompile-frame-paddings`, `--tp-size`, or `--dit-precision` invalidates cached entries.
 
-For full flag definitions see [Launch flags reference](../../base/launch-flags-reference.md) and the multimodal-specific options (`python -m sgl_jax.launch_server --multimodal --help`).
+For full flag definitions see [Launch flags reference](/base/launch-flags-reference) and the multimodal-specific options (`python -m sgl_jax.launch_server --multimodal --help`).
 
 ## 3. Invocation
 
@@ -217,5 +217,5 @@ This is a single-shot smoke datapoint, not a throughput sweep. Throughput sweeps
 
 - [Wan-AI model collection](https://huggingface.co/Wan-AI)
 - [Wan2.1-T2V-14B-Diffusers model card](https://huggingface.co/Wan-AI/Wan2.1-T2V-14B-Diffusers)
-- [Launch flags reference](../../base/launch-flags-reference.md)
-- [Cross-recipe troubleshooting](../../troubleshooting.md) — cross-recipe generic issues.
+- [Launch flags reference](/base/launch-flags-reference)
+- [Cross-recipe troubleshooting](/deployment/troubleshooting) — cross-recipe generic issues.

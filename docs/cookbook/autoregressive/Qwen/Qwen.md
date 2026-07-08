@@ -6,7 +6,7 @@ title: "Qwen-7B-Chat"
 
 > **Validated recipe** — empirically validated on TPU v6e-4 with sglang-jax 0.1.0.
 >
-> First-generation Qwen recipe. For Qwen3-8B / Qwen3-32B see [Qwen3 recipe](Qwen3.md).
+> First-generation Qwen recipe. For Qwen3-8B / Qwen3-32B see [Qwen3 recipe](/autoregressive/Qwen/Qwen3).
 
 ## 1. Model Introduction
 
@@ -30,11 +30,11 @@ title: "Qwen-7B-Chat"
 |---|---|---|---|---|
 | **v6e-4** | 2x2 | 4 | 4 | This is the slice we measured on. Single host; v6e is 1:1 chip↔device. |
 
-See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation reference. For other slices (larger v6e, v7x variants), see [Adapting to other topologies](../../base/tpu-topology-reference.md#adapting-to-other-topologies). For larger Qwen sizes (8B / 32B) see [Qwen3 recipe](Qwen3.md).
+See [TPU topology reference](/base/tpu-topology-reference) for the TPU generation reference. For other slices (larger v6e, v7x variants), see [Adapting to other topologies](/base/tpu-topology-reference#adapting-to-other-topologies). For larger Qwen sizes (8B / 32B) see [Qwen3 recipe](/autoregressive/Qwen/Qwen3).
 
 ### 2.2 Environment
 
-Install per [Install guide](../../../get_started/install.md) and use [Single-host Docker template](../../deployment/single-host-docker.md) for the container setup.
+Install per [Install guide](/get_started/install) and use [Single-host Docker template](/deployment/single-host-docker) for the container setup.
 
 Extra pip for accuracy benchmarking only:
 
@@ -75,13 +75,13 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -u -m sgl_jax.launch_server \
 - `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache` is mandatory — without it, first request blocks ~4 min while XLA/Pallas re-compiles.
 - The cache keys on full kernel shape: changing `--page-size`, `--tp-size`, or context length invalidates cached entries.
 
-For full flag definitions and defaults see [Launch flags reference](../../base/launch-flags-reference.md).
+For full flag definitions and defaults see [Launch flags reference](/base/launch-flags-reference).
 
 ## 3. Invocation
 
 ### 3.1 Basic Chat Completion
 
-For full cURL + native `/generate` patterns see [Basic API usage](../../base/basic-api-usage.md).
+For full cURL + native `/generate` patterns see [Basic API usage](/base/basic-api-usage).
 
 Short Python OpenAI client example:
 
@@ -100,7 +100,7 @@ resp = client.chat.completions.create(
 print(resp.choices[0].message.content)
 ```
 
-> Qwen-7B-Chat is a first-generation chat model without hybrid reasoning or native tool-calling formats. For reasoning / tool-call workloads use [Qwen3](Qwen3.md) or a later Qwen series.
+> Qwen-7B-Chat is a first-generation chat model without hybrid reasoning or native tool-calling formats. For reasoning / tool-call workloads use [Qwen3](/autoregressive/Qwen/Qwen3) or a later Qwen series.
 
 ## 4. Benchmark
 
@@ -117,7 +117,7 @@ print(resp.choices[0].message.content)
 | Tensor Parallelism | 4 |
 | Tested build | sglang-jax 0.1.0 |
 
-**Deployment Command** — same as [§2.3 Single-host](#single-host-docker--tpu-v6e-4).
+**Deployment Command** — same as [§2.3 Single-host](/autoregressive/Qwen/Qwen#2-3-launch).
 
 **Benchmark Command**
 
@@ -144,7 +144,7 @@ evalscope eval \
 
 **Test Environment** — same as §4.1.
 
-**Deployment Command** — same as [§2.3 Single-host](#single-host-docker--tpu-v6e-4).
+**Deployment Command** — same as [§2.3 Single-host](/autoregressive/Qwen/Qwen#2-3-launch).
 
 **Benchmark Command**
 
@@ -206,7 +206,7 @@ Max ITL (ms):                            154.39
 ## Additional Resources
 
 - [Qwen Model Cards](https://huggingface.co/Qwen)
-- [Qwen3 recipe](Qwen3.md) — newer Qwen3 8B/32B recipe with framework comparison numbers.
+- [Qwen3 recipe](/autoregressive/Qwen/Qwen3) — newer Qwen3 8B/32B recipe with framework comparison numbers.
 - [JAX Scaling Book](https://jax-ml.github.io/scaling-book/)
-- [Launch flags reference](../../base/launch-flags-reference.md)
-- [Cross-recipe troubleshooting](../../troubleshooting.md) — cross-recipe generic issues.
+- [Launch flags reference](/base/launch-flags-reference)
+- [Cross-recipe troubleshooting](/deployment/troubleshooting) — cross-recipe generic issues.

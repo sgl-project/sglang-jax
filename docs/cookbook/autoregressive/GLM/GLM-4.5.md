@@ -25,17 +25,17 @@ title: "GLM-4.5"
 |---|---|---|---|---|---|---|---|
 | GLM-4.5-Air (106B) | **v6e-32** | 4x8 | 8  | 32 | 32 | 32 | This is the slice we measured on. BF16 ~210 GB. |
 
-See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation reference. For other slices (larger v6e, v7x variants, scaled-down configs), see [Adapting to other topologies](../../base/tpu-topology-reference.md#adapting-to-other-topologies).
+See [TPU topology reference](/base/tpu-topology-reference) for the TPU generation reference. For other slices (larger v6e, v7x variants, scaled-down configs), see [Adapting to other topologies](/base/tpu-topology-reference#adapting-to-other-topologies).
 
 ### 2.2 Environment
 
-Install per [Install guide](../../../get_started/install.md). Multi-host required — use [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) as the primary user-facing path. Advanced users running temporary v6e experiments can adapt [SkyPilot launcher](../../deployment/skypilot.md).
+Install per [Install guide](/get_started/install). Multi-host required — use [GKE Indexed Job launcher](/deployment/gke-indexed-job) as the primary user-facing path. Advanced users running temporary v6e experiments can adapt [SkyPilot launcher](/deployment/skypilot).
 
 ### 2.3 Launch
 
 #### Multi-host — TPU v6e-32
 
-Use [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) with `<JOB>=glm-4-5-air`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=4x8`, `parallelism: 8`, and `completions: 8`. Put these model-specific flags into `<LAUNCH_FLAGS>`:
+Use [GKE Indexed Job launcher](/deployment/gke-indexed-job) with `<JOB>=glm-4-5-air`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=4x8`, `parallelism: 8`, and `completions: 8`. Put these model-specific flags into `<LAUNCH_FLAGS>`:
 
 ```bash
   --model-path zai-org/GLM-4.5-Air \
@@ -53,7 +53,7 @@ Use [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) with `<JOB>=
 
 > `--moe-backend epmoe` is mandatory for GLM-4.5-Air. The fused Pallas backend requires `moe_intermediate_size % 512 == 0`; GLM-4.5-Air's `moe_intermediate_size=1408` fails that alignment and crashes at startup (`tile_n` divisibility assert).
 
-For temporary v6e experiments, advanced users can adapt [SkyPilot launcher](../../deployment/skypilot.md) with the same launch flags. The model recipe does not require users to run repository-local SkyPilot helper scripts.
+For temporary v6e experiments, advanced users can adapt [SkyPilot launcher](/deployment/skypilot) with the same launch flags. The model recipe does not require users to run repository-local SkyPilot helper scripts.
 
 ### 2.4 Configuration Tips
 
@@ -76,13 +76,13 @@ For temporary v6e experiments, advanced users can adapt [SkyPilot launcher](../.
 - `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache` is mandatory — without it, first request blocks ~4 min per node.
 - Mount a shared PVC across the cluster's nodes to amortize compilation.
 
-For full flag definitions see [Launch flags reference](../../base/launch-flags-reference.md).
+For full flag definitions see [Launch flags reference](/base/launch-flags-reference).
 
 ## 3. Invocation
 
 ### 3.1 Basic Chat Completion
 
-For full cURL + native `/generate` patterns see [Basic API usage](../../base/basic-api-usage.md).
+For full cURL + native `/generate` patterns see [Basic API usage](/base/basic-api-usage).
 
 Short Python OpenAI client example (replace `<rank0-ip>` with your rank-0 internal IP):
 
@@ -237,7 +237,7 @@ To see the full set of `--reasoning-parser` / `--tool-call-parser` keys availabl
 | Expert Parallelism | 32 |
 | Tested build | sglang-jax 0.1.0 |
 
-**Deployment Command** — same as [§2.3](#multi-host-gke-indexed-job--tpu-v6e-32-glm-45-air).
+**Deployment Command** — same as [§2.3](/autoregressive/GLM/GLM-4.5#2-3-launch).
 
 **Benchmark Command** — example for GSM8K:
 
@@ -266,7 +266,7 @@ Recommended additional datasets: MMLU, GPQA Diamond, AIME 2025.
 
 > **Layout B — methodology + command template.** No measured numbers yet; PR back full `============ Serving Benchmark Result ============` blocks from `bench_serving` to upgrade to Validated.
 
-**Benchmark Command** — adapt the driver from [`Qwen3.md` §4.2](../Qwen/Qwen3.md#42-speed--sgl-jax-vs-vllm) (swap `MODEL_NAME` to the GLM-4.5 checkpoint, remove the vLLM half).
+**Benchmark Command** — adapt the driver from [`Qwen3.md` §4.2](/autoregressive/Qwen/Qwen3#4-benchmark) (swap `MODEL_NAME` to the GLM-4.5 checkpoint, remove the vLLM half).
 
 **Test Results** — GLM-4.5-Air, Layout B (`bench_serving` random 1024→1024, N=100, max-concurrency 16), v6e-32 + `--moe-backend epmoe`, sglang-jax 0.1.0:
 
@@ -288,5 +288,5 @@ Mean TPOT (ms):           13.35
 ## Additional Resources
 
 - [GLM-4.5-Air model card](https://huggingface.co/zai-org/GLM-4.5-Air)
-- [Launch flags reference](../../base/launch-flags-reference.md)
-- [Cross-recipe troubleshooting](../../troubleshooting.md) — cross-recipe generic issues.
+- [Launch flags reference](/base/launch-flags-reference)
+- [Cross-recipe troubleshooting](/deployment/troubleshooting) — cross-recipe generic issues.

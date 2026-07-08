@@ -34,11 +34,11 @@ title: "Qwen3"
 | Qwen3-8B | **v6e-4** | 2x2 | 4 | 4 | This is the slice we measured on. Single host; ~16 GB BF16 weights. |
 | Qwen3-32B | **v6e-4** | 2x2 | 4 | 4 | This is the slice we measured on. Single host; ~64 GB BF16 weights — fits with `--mem-fraction-static 0.8`. |
 
-Both fit on a single v6e-4 host with `bfloat16`. See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation reference. For other slices (larger v6e, v7x variants), see [Adapting to other topologies](../../base/tpu-topology-reference.md#adapting-to-other-topologies).
+Both fit on a single v6e-4 host with `bfloat16`. See [TPU topology reference](/base/tpu-topology-reference) for the TPU generation reference. For other slices (larger v6e, v7x variants), see [Adapting to other topologies](/base/tpu-topology-reference#adapting-to-other-topologies).
 
 ### 2.2 Environment
 
-Install per [Install guide](../../../get_started/install.md) and use [Single-host Docker template](../../deployment/single-host-docker.md) for the container setup.
+Install per [Install guide](/get_started/install) and use [Single-host Docker template](/deployment/single-host-docker) for the container setup.
 
 ### 2.3 Launch
 
@@ -83,13 +83,13 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python3 -u -m sgl_jax.launch_server \
 - `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache` is mandatory — without it, first request blocks ~4 min while XLA/Pallas re-compiles.
 - The cache keys on full kernel shape: changing `--page-size`, `--tp-size`, `--chunked-prefill-size`, or `--context-length` invalidates cached entries.
 
-For full flag definitions and defaults see [Launch flags reference](../../base/launch-flags-reference.md).
+For full flag definitions and defaults see [Launch flags reference](/base/launch-flags-reference).
 
 ## 3. Invocation
 
 ### 3.1 Basic Chat Completion
 
-For full cURL + native `/generate` patterns see [Basic API usage](../../base/basic-api-usage.md). For thinking + content streaming see §3.2, for tool calling see §3.3.
+For full cURL + native `/generate` patterns see [Basic API usage](/base/basic-api-usage). For thinking + content streaming see §3.2, for tool calling see §3.3.
 
 Short Python OpenAI client example (thinking-off baseline):
 
@@ -320,7 +320,7 @@ To see the full set of `--tool-call-parser` keys available in your build, run `p
 | Tensor Parallelism | 4 |
 | Tested build | sglang-jax 0.1.0 |
 
-**Deployment Command** — same as [§2.3 Single-host](#single-host-docker--tpu-v6e-4).
+**Deployment Command** — same as [§2.3 Single-host](/autoregressive/Qwen/Qwen3#2-3-launch).
 
 **Benchmark Command**
 
@@ -347,7 +347,7 @@ evalscope eval \
 
 ### 4.2 Speed — SGL-JAX vs vLLM
 
-> **Layout E — variant × workload sweep on single hardware.** Qwen3-8B and Qwen3-32B on TPU v6e-4 (TP=4), sgl-jax vs vLLM across ISL ∈ {1024, 4096, 8192} × OSL ∈ {1, 1024} × concurrency ∈ {8, 16, 32, 64, 128, 256}.
+> **Layout E — variant × workload sweep on single hardware.** Qwen3-8B and Qwen3-32B on TPU v6e-4 (TP=4), sgl-jax vs vLLM across ISL values 1024, 4096, and 8192; OSL values 1 and 1024; and concurrency values 8, 16, 32, 64, 128, and 256.
 
 **Test Environment**
 
@@ -360,7 +360,7 @@ evalscope eval \
 
 Methodology: TTFT measured at `output_len=1` to isolate first-token latency; ITL / throughput measured at `output_len=1024`. Workload sweeps input lengths 1024 / 4096 / 8192 tokens × output lengths 1 / 1024 tokens × concurrency 8 / 16 / 32 / 64 / 128 / 256.
 
-**Deployment Command** — same as [§2.3 Single-host](#single-host-docker--tpu-v6e-4) for the SGL-JAX side, with `--disable-radix-cache` added to keep apples-to-apples comparison with vLLM (which doesn't use prefix caching in this run). For the vLLM baseline:
+**Deployment Command** — same as [§2.3 Single-host](/autoregressive/Qwen/Qwen3#2-3-launch) for the SGL-JAX side, with `--disable-radix-cache` added to keep apples-to-apples comparison with vLLM (which doesn't use prefix caching in this run). For the vLLM baseline:
 
 ```bash
 MODEL_NAME="Qwen/Qwen3-8B"  # or "Qwen/Qwen3-32B"
@@ -412,7 +412,7 @@ chmod +x benchmark.sh
 ./benchmark.sh vllm Qwen/Qwen3-8B
 ```
 
-**Test Results** (selected representative cells — see [Qwen3 benchmark report](../../../performance/qwen3_benchmark.md) for the full ISL × OSL × batch matrix)
+**Test Results** (selected representative cells — see full validation matrix for the full ISL × OSL × batch matrix)
 
 Qwen3-8B:
 
@@ -449,5 +449,5 @@ Lower than the 1977 tok/s c=64 table cell because c=16 leaves the batch under-fi
 ## Additional Resources
 
 - [Qwen Model Cards](https://huggingface.co/Qwen)
-- [Launch flags reference](../../base/launch-flags-reference.md)
-- [Cross-recipe troubleshooting](../../troubleshooting.md) — cross-recipe generic issues.
+- [Launch flags reference](/base/launch-flags-reference)
+- [Cross-recipe troubleshooting](/deployment/troubleshooting) — cross-recipe generic issues.

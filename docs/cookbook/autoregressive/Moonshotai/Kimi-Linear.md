@@ -31,11 +31,11 @@ title: "Kimi-Linear"
 | Kimi-Linear-48B-A3B | **v6e-16** | 4x4 | 4 | 16 | 16 | One of two slices we measured on. BF16 ~96 GB — multi-host required to fit weights + recurrent state pool. |
 | Kimi-Linear-48B-A3B | **v6e-32** | 4x8 | 8 | 32 | 32 | The other slice we measured on. More HBM per active expert and larger recurrent state budget for long-prompt linear-attention workloads. |
 
-See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation reference. For other slices (larger v6e, v7x variants, scaled-down configs), see [Adapting to other topologies](../../base/tpu-topology-reference.md#adapting-to-other-topologies).
+See [TPU topology reference](/base/tpu-topology-reference) for the TPU generation reference. For other slices (larger v6e, v7x variants, scaled-down configs), see [Adapting to other topologies](/base/tpu-topology-reference#adapting-to-other-topologies).
 
 ### 2.2 Environment
 
-Install per [Install guide](../../../get_started/install.md). Multi-host recommended at this size — use [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) as the primary user-facing path. Advanced users running temporary v6e experiments can adapt [SkyPilot launcher](../../deployment/skypilot.md).
+Install per [Install guide](/get_started/install). Multi-host recommended at this size — use [GKE Indexed Job launcher](/deployment/gke-indexed-job) as the primary user-facing path. Advanced users running temporary v6e experiments can adapt [SkyPilot launcher](/deployment/skypilot).
 
 ### 2.3 Launch
 
@@ -46,7 +46,7 @@ Two slices we measured on, each as a separate launch path:
 
 #### Multi-host — TPU v6e-16
 
-Use [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) with `<JOB>=kimi-linear`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=4x4`, `parallelism: 4`, and `completions: 4`. Put these model-specific flags into `<LAUNCH_FLAGS>`:
+Use [GKE Indexed Job launcher](/deployment/gke-indexed-job) with `<JOB>=kimi-linear`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=4x4`, `parallelism: 4`, and `completions: 4`. Put these model-specific flags into `<LAUNCH_FLAGS>`:
 
 ```bash
   --model-path moonshotai/Kimi-Linear-48B-A3B-Instruct \
@@ -82,7 +82,7 @@ Same template with `<TOPOLOGY>=4x8`, `parallelism: 8`, `completions: 8`, and `--
   --skip-server-warmup
 ```
 
-For temporary v6e experiments, advanced users can adapt [SkyPilot launcher](../../deployment/skypilot.md) with the same launch flags. The model recipe does not require users to run repository-local SkyPilot helper scripts.
+For temporary v6e experiments, advanced users can adapt [SkyPilot launcher](/deployment/skypilot) with the same launch flags. The model recipe does not require users to run repository-local SkyPilot helper scripts.
 
 ### 2.4 Configuration Tips
 
@@ -108,13 +108,13 @@ For temporary v6e experiments, advanced users can adapt [SkyPilot launcher](../.
 - `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache` is mandatory — without it, first request blocks ~4 min per node.
 - Mount a shared PVC across the cluster's 4 nodes to amortize compilation.
 
-For full flag definitions see [Launch flags reference](../../base/launch-flags-reference.md).
+For full flag definitions see [Launch flags reference](/base/launch-flags-reference).
 
 ## 3. Invocation
 
 ### 3.1 Basic Chat Completion
 
-For full cURL + native `/generate` patterns see [Basic API usage](../../base/basic-api-usage.md). For long-context streaming see §3.2.
+For full cURL + native `/generate` patterns see [Basic API usage](/base/basic-api-usage). For long-context streaming see §3.2.
 
 Short Python OpenAI client example (replace `<rank0-ip>` with your rank-0 internal IP):
 
@@ -162,7 +162,7 @@ for chunk in stream:
 print()
 ```
 
-> Kimi-Linear-Instruct ships with a chat template but no native reasoning or tool-call format. For reasoning / tool-call workloads, pick a model with `--reasoning-parser` / `--tool-call-parser` support — see the **Parser key reference** table in [Parser key reference](../index.md#parser-key-reference) for the list of cookbook recipes with reasoning / tool-call parsers registered.
+> Kimi-Linear-Instruct ships with a chat template but no native reasoning or tool-call format. For reasoning / tool-call workloads, pick a model with `--reasoning-parser` / `--tool-call-parser` support — see the **Parser key reference** table in [Parser key reference](/autoregressive#parser-key-reference) for the list of cookbook recipes with reasoning / tool-call parsers registered.
 
 ## 4. Benchmark
 
@@ -180,7 +180,7 @@ print()
 | Recurrent State Memory Ratio | 0.9 |
 | Tested build | sglang-jax 0.1.0 |
 
-**Deployment Command** — see [§2.3](#multi-host-gke-indexed-job--tpu-v6e-16) (v6e-16) or [§2.3](#multi-host-gke-indexed-job--tpu-v6e-32-recommended-production) (v6e-32).
+**Deployment Command** — see [§2.3](/autoregressive/Moonshotai/Kimi-Linear#2-3-launch) (v6e-16) or [§2.3](/autoregressive/Moonshotai/Kimi-Linear#2-3-launch) (v6e-32).
 
 **Benchmark Command** — example for GSM8K:
 
@@ -224,5 +224,5 @@ v6e-32 delivers ~5% throughput / 13% TTFT improvement over v6e-16. Scaling is su
 ## Additional Resources
 
 - [Kimi-Linear model card](https://huggingface.co/moonshotai/Kimi-Linear-48B-A3B-Instruct)
-- [Launch flags reference](../../base/launch-flags-reference.md)
-- [Cross-recipe troubleshooting](../../troubleshooting.md) — cross-recipe generic issues.
+- [Launch flags reference](/base/launch-flags-reference)
+- [Cross-recipe troubleshooting](/deployment/troubleshooting) — cross-recipe generic issues.

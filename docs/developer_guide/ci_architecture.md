@@ -3,11 +3,11 @@
 ## Table of Contents
 - [Overview](#overview)
 - [Architecture Principles](#architecture-principles)
-- [CI/CD Pipeline Categories](#cicd-pipeline-categories)
+- [CI/CD Pipeline Workflows](#cicd-pipeline-workflows)
   - [Slash Command Handler](#slash-command-handler-slash-commandyml)
   - [PR Review](#pr-review-pr-reviewyml)
   - [CI Auto Bisect](#ci-auto-bisect-ci-auto-bisectyml)
-  - [Pull Request Testing](#pull-request-testing)
+  - [Pull Request Testing](#pull-request-testing-pr-testyml)
   - [Nightly Testing](#nightly-testing)
   - [Release Automation](#release-automation)
 
@@ -145,41 +145,16 @@ and posts analysis results on the associated PR.
 | e2e-test-4-tpu | 4x TPU | - | Accuracy |
 
 ### Nightly Testing
-Coming soon
-<!--
-#### Comprehensive Weekly Tests (`weekly-test.yml`)
-*Schedule:* Weekly, Sunday 00:00 UTC+8
 
-*Trigger Conditions:*
-- Cron schedule: `0 16 * * 0`
-- Push to `main` when `version.py` changes
-- Manual dispatch
+Scheduled nightly coverage is split across daily and weekly workflows. Keep the
+suite-level case list in the workflow and `test/srt` runners; this section should
+only document the CI surface that maintainers need to operate.
 
-*Test Scenario:*
-- models: Qwen3-8B(enable TP), Qwen3Qwen3-30B-A3B (enable TP, EP), bailing, gemma2
-- MMLU, MMUL-PRO, AIME-24/25, Math-500
-- ISL/OSL: 1k/1k, 4k/1k, 8k/1k, 1k/1, 4k/1, 8k/1
+| Workflow | Schedule | Entry Points | Scope and Outputs |
+|----------|----------|--------------|-------------------|
+| `nightly-test-daily.yml` | Daily at 18:00 UTC (`0 18 * * *`) | Schedule, push to `main` when `version.py` changes, manual dispatch, and `/run-nightly` via `workflow_call` | Runs the daily 1-TPU and 4-TPU nightly suites on the official repository. PR-triggered `/run-nightly` jobs post PASS/FAIL comments back to the PR. Main-branch runs publish selected accuracy/perf JSON, perf CSV/traces, and drift artifacts where configured. |
+| `weekly-test.yml` | Weekly on Sunday at 16:00 UTC / Monday 00:00 UTC+8 (`0 16 * * 0`) | Schedule, push to `main` when `version.py` changes, and manual dispatch | Runs the fuller weekly regression on v6e-1 and v6e-4 accuracy/performance suites. Configured jobs publish benchmark/perf outputs and nightly report CSV entries to the CI data storage repository. |
 
-*Jobs:*
-
-| unit-test-1-tpu | 1x TPU | - | All unit test pass|
-| unit-test-4-tpu | 4x TPU | - | All unit test pass|
-| performance-test-1-tpu (including cache miss check) | 1x TPU | - | Latency, Throughput|
-| performance-test-4-tpu (including cache miss check) | 4x TPU | - | Latency, Throughput|
-| accuracy-test-1-tpu | 1x TPU | - | Model Evaluation  |
-| accuracy-test-4-tpu | 4x TPU | - | Model Evaluation  |
-| pallas-kernel-benchmark | 1x TPU | - | Speed |
-| e2e-test-1-tpu | 1x TPU | - | Accuracy |
-| e2e-test-4-tpu | 4x TPU | - | Accuracy |
-
-**[TODO]** *Performance Monitoring:*
-- Traces published to `sgl-jax-ci-data` repository
-- Perfetto UI visualization
-- Historical performance tracking
-
-*Repository Restriction:*
-- Only runs on official ```sgl-project/sglang-jax``` repository
--->
 ### Release Automation
 #### Package Releases (`release-pypi.yml`)
 ##### Main Package Release

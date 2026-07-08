@@ -17,7 +17,7 @@ title: "Qwen2.5-VL"
 - [**Qwen/Qwen2.5-VL-32B-Instruct**](https://huggingface.co/Qwen/Qwen2.5-VL-32B-Instruct) — 32B; starter single-host path on v6e-4 with `--tp-size 4`.
 - [**Qwen/Qwen2.5-VL-72B-Instruct**](https://huggingface.co/Qwen/Qwen2.5-VL-72B-Instruct) — 72B; multi-host serving is pending.
 
-For the text-only Qwen3 dense recipes see [Qwen3 recipe](Qwen3.md).
+For the text-only Qwen3 dense recipes see [Qwen3 recipe](/autoregressive/Qwen/Qwen3).
 
 **Key Features**:
 
@@ -40,11 +40,11 @@ For the text-only Qwen3 dense recipes see [Qwen3 recipe](Qwen3.md).
 
 > Multimodal recipes are constrained by SGL-JAX's built-in staged runtime. Use the `--tp-size` shown for the model; a larger TPU slice is not automatically used by changing only `--tp-size`.
 
-See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation reference. For other slices (larger v6e, v7x variants), see [Adapting to other topologies](../../base/tpu-topology-reference.md#adapting-to-other-topologies).
+See [TPU topology reference](/base/tpu-topology-reference) for the TPU generation reference. For other slices (larger v6e, v7x variants), see [Adapting to other topologies](/base/tpu-topology-reference#adapting-to-other-topologies).
 
 ### 2.2 Environment
 
-Install per [Install guide](../../../get_started/install.md). For the current single-host VL paths use [Single-host Docker template](../../deployment/single-host-docker.md). Qwen2.5-VL 72B multi-host should stay pending until the built-in staging and scheduler path are fixed.
+Install per [Install guide](/get_started/install). For the current single-host VL paths use [Single-host Docker template](/deployment/single-host-docker). Qwen2.5-VL 72B multi-host should stay pending until the built-in staging and scheduler path are fixed.
 
 Extra pip for accuracy benchmarking only:
 
@@ -100,7 +100,7 @@ For Qwen2.5-VL-3B or Qwen2.5-VL-7B, use the same command shape but set `--model-
 - `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache` is mandatory — without it, first request blocks ~4 min per stage while XLA/Pallas re-compiles every kernel (ViT and AR each compile independently).
 - The cache keys on full kernel shape: changing `--page-size`, `--tp-size`, image resolution buckets, or `--context-length` invalidates cached entries.
 
-For full flag definitions see [Launch flags reference](../../base/launch-flags-reference.md); run `python -m sgl_jax.launch_server --multimodal --help` to see multimodal-specific flags.
+For full flag definitions see [Launch flags reference](/base/launch-flags-reference); run `python -m sgl_jax.launch_server --multimodal --help` to see multimodal-specific flags.
 
 ## 3. Invocation
 
@@ -228,17 +228,17 @@ print(response.choices[0].message.content)
 
 > **Long video / large image set:** Make sure `--context-length` is large enough to fit the vision token count plus the text prompt and response. Each high-resolution image and each sampled video frame contributes a non-trivial number of vision tokens to the prefill.
 
-> Qwen2.5-VL is non-reasoning (no `<think>` blocks) and does not ship a native tool-call format. For reasoning workloads use [Qwen3](Qwen3.md); for tool-calling workloads use a model with `--tool-call-parser` support (see [`Qwen3.md` §3.3](Qwen3.md#33-tool-calling)).
+> Qwen2.5-VL is non-reasoning (no `<think>` blocks) and does not ship a native tool-call format. For reasoning workloads use [Qwen3](/autoregressive/Qwen/Qwen3); for tool-calling workloads use a model with `--tool-call-parser` support (see [`Qwen3.md` §3.3](/autoregressive/Qwen/Qwen3#3-3-tool-calling)).
 
 ## 4. Benchmark
 
-> Benchmark section is intentionally omitted — Qwen2.5-VL is a Starter recipe (banner). All §4.1 Accuracy / §4.2 Speed cells are pending real PR-back measurements. When you run a numbered MMMU / MMMU Pro Vision / DocVQA / ChartQA eval against the model on TPU, file a PR adding the §4 block back with the actual numbers and upgrade the banner to Partially validated or Validated. For the canonical four-part §4 form (Test Environment / Deployment Command / Benchmark Command / Test Results) see any Validated recipe in [Autoregressive index](../index.md).
+> Benchmark section is intentionally omitted — Qwen2.5-VL is a Starter recipe (banner). All §4.1 Accuracy / §4.2 Speed cells are pending real PR-back measurements. When you run a numbered MMMU / MMMU Pro Vision / DocVQA / ChartQA eval against the model on TPU, file a PR adding the §4 block back with the actual numbers and upgrade the banner to Partially validated or Validated. For the canonical four-part §4 form (Test Environment / Deployment Command / Benchmark Command / Test Results) see any Validated recipe in [Autoregressive index](/autoregressive).
 >
 > Note: `bench_serving` does not have native multimodal input support today, so §4.2 Speed needs a custom OpenAI-client load test driving the §3.2 multi-image / video patterns; PR back full TTFT / ITL / output tok/s along with the image resolution and prompt template used.
 
 ## Additional Resources
 
 - [Qwen2.5-VL model collection](https://huggingface.co/Qwen)
-- [Qwen3 recipe](Qwen3.md) — text-only Qwen3 dense recipe (Qwen3 series is the reasoning generation).
-- [Launch flags reference](../../base/launch-flags-reference.md)
-- [Cross-recipe troubleshooting](../../troubleshooting.md) — cross-recipe generic issues.
+- [Qwen3 recipe](/autoregressive/Qwen/Qwen3) — text-only Qwen3 dense recipe (Qwen3 series is the reasoning generation).
+- [Launch flags reference](/base/launch-flags-reference)
+- [Cross-recipe troubleshooting](/deployment/troubleshooting) — cross-recipe generic issues.

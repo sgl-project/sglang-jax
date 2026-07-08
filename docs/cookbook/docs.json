@@ -7,7 +7,6 @@
     "light": "#d55816",
     "dark": "#d55816"
   },
-  "favicon": "/favicon.png",
   "background": {
     "decoration": "grid",
     "color": {
@@ -29,6 +28,7 @@
             "icon": "book",
             "pages": [
               "index",
+              "add-recipe",
               {
                 "group": "Autoregressive Models",
                 "pages": [
@@ -119,15 +119,22 @@
                 ]
               },
               {
-                "group": "Deployment Templates",
+                "group": "Operational References",
                 "pages": [
-                  "deployment/index",
-                  "deployment/single-host-docker",
-                  "deployment/gke-indexed-job",
-                  "deployment/skypilot"
+                  "get_started/install",
+                  {
+                    "group": "Deployment",
+                    "pages": [
+                      "deployment/index",
+                      "deployment/single-host-docker",
+                      "deployment/gke-indexed-job",
+                      "deployment/skypilot",
+                      "deployment/troubleshooting"
+                    ]
+                  },
+                  "developer_guide/tpu_resources_guide"
                 ]
-              },
-              "troubleshooting"
+              }
             ]
           }
         ]

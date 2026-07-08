@@ -30,11 +30,11 @@ title: "Gemma 2"
 |---|---|---|---|---|---|
 | Gemma 2 27B-it | **v6e-4** | 2x2 | 4 | 4 | This is the slice we measured on. BF16 ~54 GB — fits with `--mem-fraction-static 0.85` (~13.5 GB weights/chip + dual KV pools). |
 
-See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation reference. For other slices (larger v6e, v7x variants), see [Adapting to other topologies](../../base/tpu-topology-reference.md#adapting-to-other-topologies).
+See [TPU topology reference](/base/tpu-topology-reference) for the TPU generation reference. For other slices (larger v6e, v7x variants), see [Adapting to other topologies](/base/tpu-topology-reference#adapting-to-other-topologies).
 
 ### 2.2 Environment
 
-Install per [Install guide](../../../get_started/install.md) and use [Single-host Docker template](../../deployment/single-host-docker.md) for the container setup.
+Install per [Install guide](/get_started/install) and use [Single-host Docker template](/deployment/single-host-docker) for the container setup.
 
 ### 2.3 Launch
 
@@ -69,19 +69,19 @@ The 27B-it `--mem-fraction-static 0.85` leaves room for the dual (global + slidi
 
 **Hybrid Attention (Gemma-specific):**
 - Gemma 2 alternates global (8K context) and sliding-window (4K) attention layers. SGL-JAX manages two KV pools — global and sliding — which is more memory-sensitive than uniform-attention models at the same parameter count.
-- `--swa-full-tokens-ratio` (default 0.8) controls the per-layer ratio of sliding-window vs full-attention layers and gates pool sizing. If you see sliding-window pool exhaustion at high concurrency, lower this ratio to give the sliding pool more capacity. See [troubleshooting §SWA pool exhaustion](../../troubleshooting.md#swa-pool-exhaustion-mimo-hybrid-attention-models).
+- `--swa-full-tokens-ratio` (default 0.8) controls the per-layer ratio of sliding-window vs full-attention layers and gates pool sizing. If you see sliding-window pool exhaustion at high concurrency, lower this ratio to give the sliding pool more capacity. See [troubleshooting §SWA pool exhaustion](/deployment/troubleshooting#swa-pool-exhaustion-mimo-hybrid-attention-models).
 
 **Compilation Cache Hygiene:**
 - `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache` is mandatory — without it, first request blocks ~4 min while XLA/Pallas re-compiles.
 - The cache keys on full kernel shape: changing `--page-size`, `--tp-size`, or `--swa-full-tokens-ratio` invalidates cached entries.
 
-For full flag definitions see [Launch flags reference](../../base/launch-flags-reference.md).
+For full flag definitions see [Launch flags reference](/base/launch-flags-reference).
 
 ## 3. Invocation
 
 ### 3.1 Basic Chat Completion
 
-For full cURL + native `/generate` patterns see [Basic API usage](../../base/basic-api-usage.md). Pass `top_k` via `extra_body={"top_k": 64}` since the OpenAI schema does not include it.
+For full cURL + native `/generate` patterns see [Basic API usage](/base/basic-api-usage). Pass `top_k` via `extra_body={"top_k": 64}` since the OpenAI schema does not include it.
 
 Short Python OpenAI client example:
 
@@ -101,7 +101,7 @@ resp = client.chat.completions.create(
 print(resp.choices[0].message.content)
 ```
 
-> Gemma 2 is non-reasoning and has no native tool-call format. For those workloads, see the **Parser key reference** in [Parser key reference](../index.md#parser-key-reference) for the list of cookbook recipes with reasoning / tool-call parsers registered.
+> Gemma 2 is non-reasoning and has no native tool-call format. For those workloads, see the **Parser key reference** in [Parser key reference](/autoregressive#parser-key-reference) for the list of cookbook recipes with reasoning / tool-call parsers registered.
 
 ## 4. Benchmark
 
@@ -118,7 +118,7 @@ print(resp.choices[0].message.content)
 | Tensor Parallelism | 4 |
 | Tested build | sglang-jax 0.1.0 |
 
-**Deployment Command** — same as [§2.3 27B-it](#single-host-docker--tpu-v6e-4-gemma-2-27b-it).
+**Deployment Command** — same as [§2.3 27B-it](/autoregressive/Google/Gemma2#2-3-launch).
 
 **Benchmark Command** — example for GSM8K:
 
@@ -190,5 +190,5 @@ Mean ITL (ms):                           14.48
 ## Additional Resources
 
 - [Gemma 2 27B-it model card](https://huggingface.co/google/gemma-2-27b-it)
-- [Launch flags reference](../../base/launch-flags-reference.md)
-- [Cross-recipe troubleshooting](../../troubleshooting.md) — cross-recipe generic issues including the SWA pool exhaustion note.
+- [Launch flags reference](/base/launch-flags-reference)
+- [Cross-recipe troubleshooting](/deployment/troubleshooting) — cross-recipe generic issues including the SWA pool exhaustion note.

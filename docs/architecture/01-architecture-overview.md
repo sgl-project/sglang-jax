@@ -36,7 +36,7 @@ Each Multimodal stage internally reuses the core concepts of the text engine (Sc
 |------|------|------|
 | **Google TPU** | Primary target platform | Supports v5/v6/v7 and other TPU generations; Pallas kernels are fully validated on TPU |
 | **CPU** | Supported | Pure JAX kernels run directly on CPU; mainly used for debugging and small-scale testing |
-| **GPU (CUDA)** | TODO | The end-to-end GPU pipeline has not been validated yet; some Pallas kernels are not yet available |
+| **GPU (CUDA)** | Not validated | The end-to-end GPU pipeline has not been validated yet; some Pallas kernels are not yet available |
 
 ### Supported Models
 

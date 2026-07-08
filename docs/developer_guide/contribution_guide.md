@@ -70,7 +70,7 @@ git clone https://github.com/<your_user_name>/sglang-jax.git
 ### Install Development Dependencies
 
 
-We recommend using [`uv`](https://github.com/astral-sh/uv) to manage Python dependencies for the `SGL-JAX` project, as it provides fast, reliable, and reproducible environments. You can install `uv` by following the instructions on [its GitHub page](https://github.com/astral-sh/uv?tab=readme-ov-file#installation).
+We recommend using [`uv`](https://github.com/astral-sh/uv) to manage Python dependencies for the `SGL-JAX` project, as it provides fast, reliable, and reproducible environments. You can install `uv` by following the [official installation guide](https://docs.astral.sh/uv/getting-started/installation/).
 
 ```bash
 cd sglang-jax

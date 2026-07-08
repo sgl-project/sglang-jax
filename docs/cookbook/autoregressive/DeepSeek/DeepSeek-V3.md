@@ -29,11 +29,11 @@ title: "DeepSeek V3"
 |---|---|---|---|---|---|---|---|---|
 | **v6e-64** | 8x8 | 16 | 64 | 64 | 8 | 8 | 64 | This is the slice we measured on. `dp=8` is required for FP8 shared-expert block-quant compatibility (`2048/8=256 > 128 = block_size`); `dp=4` silently collapses. HBM is tight at `dp=8`; see §2.4 Memory Management. |
 
-See [TPU topology reference](../../base/tpu-topology-reference.md) for the TPU generation reference. For other slices (larger v6e, v7x variants, scaled-down configs), see [Adapting to other topologies](../../base/tpu-topology-reference.md#adapting-to-other-topologies).
+See [TPU topology reference](/base/tpu-topology-reference) for the TPU generation reference. For other slices (larger v6e, v7x variants, scaled-down configs), see [Adapting to other topologies](/base/tpu-topology-reference#adapting-to-other-topologies).
 
 ### 2.2 Environment
 
-Install per [Install guide](../../../get_started/install.md). Multi-host required — use [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) as the primary user-facing path. Advanced users running temporary v6e experiments can adapt [SkyPilot launcher](../../deployment/skypilot.md).
+Install per [Install guide](/get_started/install). Multi-host required — use [GKE Indexed Job launcher](/deployment/gke-indexed-job) as the primary user-facing path. Advanced users running temporary v6e experiments can adapt [SkyPilot launcher](/deployment/skypilot).
 
 For evaluation, additionally install `evalscope` in the client environment (any host that can reach the served `:30000` port — typically a port-forwarded client laptop):
 
@@ -45,7 +45,7 @@ pip install evalscope==0.17.1
 
 #### Multi-host — TPU v6e-64
 
-Use [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) with `<JOB>=deepseek-v3`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=8x8`, `parallelism: 16`, `completions: 16`, and `backoffLimit: 16` (transient GKE control-plane blips happen; a non-zero backoff lets the job survive). Put these model-specific flags into `<LAUNCH_FLAGS>`:
+Use [GKE Indexed Job launcher](/deployment/gke-indexed-job) with `<JOB>=deepseek-v3`, `<ACCELERATOR>=tpu-v6e-slice`, `<TOPOLOGY>=8x8`, `parallelism: 16`, `completions: 16`, and `backoffLimit: 16` (transient GKE control-plane blips happen; a non-zero backoff lets the job survive). Put these model-specific flags into `<LAUNCH_FLAGS>`:
 
 ```bash
   --model-path deepseek-ai/DeepSeek-V3 \
@@ -63,7 +63,7 @@ Use [GKE Indexed Job launcher](../../deployment/gke-indexed-job.md) with `<JOB>=
 
 Mount a shared `JAX_COMPILATION_CACHE_DIR` on the same PVC as the model weights — first-time compile is ~4 minutes total (EXTEND ~70 s + DECODE ~3 min); subsequent restarts with the same mesh shape skip almost all of that.
 
-For temporary v6e experiments, advanced users can adapt [SkyPilot launcher](../../deployment/skypilot.md) with the same launch flags.
+For temporary v6e experiments, advanced users can adapt [SkyPilot launcher](/deployment/skypilot) with the same launch flags.
 
 ### 2.4 Configuration Tips
 
@@ -88,13 +88,13 @@ For temporary v6e experiments, advanced users can adapt [SkyPilot launcher](../.
 - `JAX_COMPILATION_CACHE_DIR` is mandatory — without it, first request blocks ~4 min per node and is repeated on every restart.
 - Mount a shared PVC at the cache directory to amortize compilation across all 16 nodes and across pod restarts. Mesh shape (`data × tensor`) is part of the cache key; changing `--dp-size` invalidates the cache.
 
-For full flag definitions see [Launch flags reference](../../base/launch-flags-reference.md).
+For full flag definitions see [Launch flags reference](/base/launch-flags-reference).
 
 ## 3. Invocation
 
 ### 3.1 Basic Chat Completion
 
-For full cURL + native `/generate` patterns see [Basic API usage](../../base/basic-api-usage.md).
+For full cURL + native `/generate` patterns see [Basic API usage](/base/basic-api-usage).
 
 Short Python OpenAI client example (replace `<rank0-ip>` with your rank-0 internal IP):
 
@@ -113,7 +113,7 @@ resp = client.chat.completions.create(
 print(resp.choices[0].message.content)
 ```
 
-> DeepSeek V3 is non-reasoning and has no native tool-call format. For those workloads, see the **Parser key reference** in [Parser key reference](../index.md#parser-key-reference) for the list of cookbook recipes with reasoning / tool-call parsers registered.
+> DeepSeek V3 is non-reasoning and has no native tool-call format. For those workloads, see the **Parser key reference** in [Parser key reference](/autoregressive#parser-key-reference) for the list of cookbook recipes with reasoning / tool-call parsers registered.
 
 ## 4. Benchmark
 
@@ -132,7 +132,7 @@ print(resp.choices[0].message.content)
 | Expert Parallelism | 64 |
 | Tested build | sglang-jax 0.1.0 |
 
-**Deployment Command** — same as [§2.3](#multi-host-gke-indexed-job--tpu-v6e-64).
+**Deployment Command** — same as [§2.3](/autoregressive/DeepSeek/DeepSeek-V3#2-3-launch).
 
 **Benchmark Command**
 
@@ -222,5 +222,5 @@ Max ITL (ms):                            2517.66
 
 - [DeepSeek-V3 model card](https://huggingface.co/deepseek-ai/DeepSeek-V3)
 - [SGLang DeepSeek V3 guide](https://docs.sglang.io/docs/basic_usage/deepseek_v3)
-- [Launch flags reference](../../base/launch-flags-reference.md)
-- [Cross-recipe troubleshooting](../../troubleshooting.md) — cross-recipe generic issues.
+- [Launch flags reference](/base/launch-flags-reference)
+- [Cross-recipe troubleshooting](/deployment/troubleshooting) — cross-recipe generic issues.

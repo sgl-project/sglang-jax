@@ -6,7 +6,7 @@ title: "Basic API Usage"
 
 This page is the shared reference for sending requests to a running sglang-jax server. Every recipe's §3.1 Basic Usage links here for the cURL / Python / streaming patterns; the recipe pages then add only the model-specific bits (recommended sampling parameters, parser keys, multi-turn examples).
 
-For installing the server see [Install guide](../../get_started/install.md). For the full launch-flag reference see [Launch flags reference](launch-flags-reference.md).
+For installing the server see [Install guide](/get_started/install). For the full launch-flag reference see [Launch flags reference](/base/launch-flags-reference).
 
 ## 1. Launch a Server
 
@@ -155,4 +155,4 @@ print()
 
 ## 6. What's Next
 
-For model-specific behavior (recommended sampling parameters, reasoning parser, tool-call parser, multi-host launch flags) see the recipe in [Autoregressive recipes](../autoregressive/). The recipe's §3.1 will name the model path and recommended parameters; everything else on this page applies unchanged.
+For model-specific behavior (recommended sampling parameters, reasoning parser, tool-call parser, multi-host launch flags) see the recipe in [Autoregressive recipes](/autoregressive). The recipe's §3.1 will name the model path and recommended parameters; everything else on this page applies unchanged.
