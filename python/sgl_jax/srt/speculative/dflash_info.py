@@ -34,7 +34,11 @@ def compute_dflash_accept_len_and_bonus(
     matches = candidates[:, 1:] == target_predict[:, :-1]
     accept_len = jnp.sum(jnp.cumprod(matches.astype(jnp.int32), axis=1), axis=1)
     row_ids = jnp.arange(candidates.shape[0], dtype=jnp.int32)
-    bonus = target_predict[row_ids, accept_len]
+    flat_idx = row_ids * candidates.shape[1] + accept_len
+    tp_flat = target_predict.reshape(-1)
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    mesh = tp_flat.sharding.mesh
+    bonus = tp_flat.at[flat_idx].get(out_sharding=NamedSharding(mesh, P(None)))
     return accept_len.astype(jnp.int32), bonus.astype(jnp.int32)
 
 
@@ -128,11 +132,21 @@ def dflash_greedy_verify_outputs(
 class DFlashDraftInput:
     """Host-side DFlash state carried between decode iterations."""
 
-    verified_id: jax.Array | np.ndarray
-    target_hidden: jax.Array | None
-    ctx_lens: np.ndarray
-    draft_seq_lens: np.ndarray
+    verified_id: jax.Array | np.ndarray = None
+    target_hidden: jax.Array | None = None
+    ctx_lens: np.ndarray = None
+    draft_seq_lens: np.ndarray = None
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL
+
+    def __init__(self, *, verified_id=None, target_hidden=None, ctx_lens=None,
+                 draft_seq_lens=None, capture_hidden_mode=CaptureHiddenMode.FULL,
+                 block_size=4, **_kwargs):
+        self.verified_id = verified_id
+        self.target_hidden = target_hidden
+        self.ctx_lens = ctx_lens
+        self.draft_seq_lens = draft_seq_lens
+        self.capture_hidden_mode = capture_hidden_mode
+        self.block_size = int(block_size)
 
     def is_draft_input(self) -> bool:
         return True
@@ -168,6 +182,65 @@ class DFlashDraftInput:
             "DFlashDraftInput.filter_batch with non-empty target_hidden is not "
             "implemented in stage2; DFLASH is restricted to dp_size=1/no retraction."
         )
+
+    def resolve_pending_draft_extend_result(self):
+        pass
+
+    def prepare_for_decode(self, schedule_batch) -> None:
+        from sgl_jax.srt.mem_cache.common import alloc_token_slots
+        from sgl_jax.srt.speculative.eagle_util import assign_req_to_token_pool
+
+        block_size = self.block_size
+
+        for dp_rank, info in enumerate(schedule_batch.reqs_info):
+            if info.seq_lens is None or len(info.seq_lens) == 0:
+                continue
+
+            reqs = info.reqs
+
+            old_r = np.asarray(
+                [req.kv_allocated_len for req in reqs], dtype=np.int32
+            )
+            committed_r = np.asarray(
+                [req.kv_committed_len for req in reqs], dtype=np.int32
+            )
+            new_r = np.maximum(old_r, committed_r + block_size)
+            ext_r = int((new_r - old_r).sum())
+
+            if ext_r > 0:
+                ocl_r = alloc_token_slots(
+                    schedule_batch.tree_cache, ext_r, dp_rank=dp_rank
+                )
+                assign_req_to_token_pool(
+                    info.req_pool_indices,
+                    schedule_batch.req_to_token_pool,
+                    old_r,
+                    new_r,
+                    ocl_r,
+                )
+
+            req_to_token = schedule_batch.req_to_token_pool.req_to_token
+            verify_locs = []
+            for i, req in enumerate(reqs):
+                rp = int(info.req_pool_indices[i])
+                c = int(committed_r[i])
+                verify_locs.append(
+                    np.asarray(
+                        req_to_token[rp, c : c + block_size], dtype=np.int32
+                    )
+                )
+            info.out_cache_loc = (
+                np.concatenate(verify_locs)
+                if verify_locs
+                else np.empty(0, dtype=np.int32)
+            )
+
+            for req, allocated_len in zip(reqs, new_r):
+                req.decode_batch_idx += 1
+                req.kv_allocated_len = int(allocated_len)
+                req.kv_committed_len += 1
+
+            info.seq_lens_sum = np.sum(info.seq_lens).item()
 
     def merge_batch(self, other: "DFlashDraftInput") -> None:
         self.verified_id = np.concatenate(
@@ -217,6 +290,9 @@ class DFlashVerifyInput:
 
     def merge_batch(self, other: "DFlashVerifyInput") -> None:
         raise NotImplementedError("DFlashVerifyInput is built per verify step and is not merged.")
+
+    def resolve_pending_draft_extend_result(self):
+        pass
 
     def tree_flatten(self):
         children = (self.draft_token, self.positions, self.custom_mask)

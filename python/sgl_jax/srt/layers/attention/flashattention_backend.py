@@ -323,6 +323,19 @@ class FlashAttention(AttentionBackend):
         local_n = np.sum(seq_2d > 0, axis=1, dtype=np.int32)
         distribution = np.column_stack([np.zeros_like(local_n), local_n, local_n]).ravel()
         page_indices = np.array(page_indices)
+
+        # Pad page_indices so pages_per_seq is bucket-stable, avoiding
+        # recompilation of the Pallas attention kernel on every decode step.
+        max_num_seqs = dp_size * per_dp_bs
+        if max_num_seqs > 0 and len(page_indices) > 0:
+            current_pps = len(page_indices) // max_num_seqs
+            bucketed_pps = max(16, 1 << max(0, (current_pps - 1)).bit_length())
+            target_len = max_num_seqs * bucketed_pps
+            if len(page_indices) < target_len:
+                page_indices = np.pad(
+                    page_indices, (0, target_len - len(page_indices)), constant_values=0
+                )
+
         seq_lens = np.array(seq_lens)
         (
             metadata.cu_q_lens,

@@ -1516,6 +1516,7 @@ def get_default_block_sizes(
 
     max_q = next_power_of_2(max_num_tokens)
     max_kv = pages_per_seq * page_size
+    max_kv = max(max_kv, page_size)
 
     min_bkv_sz_to_peak = 16 * 1024 * 1024 * kv_packing // 4 // head_dim // num_kv_heads_x2
 

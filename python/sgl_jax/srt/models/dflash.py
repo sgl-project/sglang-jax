@@ -145,6 +145,8 @@ class DFlashAttention(nnx.Module):
         return output, kv_fused
 
     def kv_proj_only(self, positions: jax.Array, hidden_states: jax.Array) -> tuple[jax.Array, jax.Array]:
+        num_tokens = positions.shape[0]
+        hidden_states = hidden_states[:num_tokens]
         k, _ = self.k_proj(hidden_states)
         v, _ = self.v_proj(hidden_states)
         k = k.reshape(
@@ -160,8 +162,9 @@ class DFlashAttention(nnx.Module):
             out_sharding=NamedSharding(self.mesh, P("data", "tensor", None)),
         )
         k = self.k_norm(k)
-        dummy_q = jnp.zeros((k.shape[0], 1, self.head_dim), dtype=k.dtype)
+        dummy_q = jnp.zeros((num_tokens, 1, self.head_dim), dtype=k.dtype)
         _, k = self.rotary_emb(positions, dummy_q, k)
+        return k, v
         return k, v
 
 
@@ -366,8 +369,10 @@ class DFlashDraftModel(nnx.Module):
         embed_weight: jax.Array | None = None,
         head_weight: jax.Array | None = None,
     ) -> None:
-        self.embed_weight = embed_weight
-        self.lm_head_weight = head_weight
+        from flax import nnx
+
+        self.embed_weight = nnx.data(embed_weight) if embed_weight is not None else None
+        self.lm_head_weight = nnx.data(head_weight) if head_weight is not None else None
 
     def project_target_hidden(self, target_hidden: jax.Array) -> jax.Array:
         expected = self.num_context_features * self.target_hidden_size
@@ -422,7 +427,7 @@ class DFlashDraftModel(nnx.Module):
                 sharding=(None,),
                 transpose=False,
             ),
-            "model.norm.weight": WeightMapping(
+            "norm.weight": WeightMapping(
                 target_path="model.norm.scale",
                 sharding=(None,),
                 transpose=False,
@@ -430,7 +435,7 @@ class DFlashDraftModel(nnx.Module):
         }
 
         for layer_idx in range(int(self.config.num_hidden_layers)):
-            prefix = f"model.layers.{layer_idx}"
+            prefix = f"layers.{layer_idx}"
             target = f"model.layers.{layer_idx}"
             mappings.update(
                 {

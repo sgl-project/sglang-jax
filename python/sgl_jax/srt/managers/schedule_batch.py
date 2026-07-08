@@ -2694,6 +2694,10 @@ class ScheduleBatch:
         (== ``logits_indices_selector``). Returns a new ``EagleDraftInput``;
         the cross-round flat state on ``reqs_info[r].spec_info`` is unchanged.
         """
+        from sgl_jax.srt.speculative.dflash_info import DFlashDraftInput
+
+        if isinstance(flat, DFlashDraftInput):
+            return flat
 
         def _scatter1(arr, *, require_selector_len: bool = True, data_sharded: bool = False):
             if arr is None:
@@ -2803,6 +2807,9 @@ class ScheduleBatch:
             "accept_length_cpu",
             "new_seq_lens",
             "future_indices",
+            "ctx_lens",
+            "draft_seq_lens",
+            "target_hidden",
         )
 
         out = []
@@ -2862,11 +2869,16 @@ class ScheduleBatch:
             "accept_length_cpu",
             "new_seq_lens",
             "future_indices",
+            "ctx_lens",
+            "draft_seq_lens",
+            "target_hidden",
         )
 
         kwargs = {
             "capture_hidden_mode": nonempty[0].capture_hidden_mode,
         }
+        if hasattr(nonempty[0], "block_size"):
+            kwargs["block_size"] = nonempty[0].block_size
         for f in per_req_fields:
             vals = [getattr(s, f, None) for s in nonempty]
             nonnull = [v for v in vals if v is not None]

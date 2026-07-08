@@ -97,6 +97,11 @@ class DFlashWorker:
             getattr(target_worker, "tokenizer", None),
             vocab_size=int(target_worker.model_runner.model_config.vocab_size),
         )
+
+        # Initialize JIT for the draft model runner (skipped during __init__
+        # because is_draft_worker=True).
+        self.draft_model_runner.initialize_jit()
+
         logger.info(
             "Initialized DFLASH worker: block_size=%d, mask_token_id=%d, draft_layers=%d",
             self.block_size,
@@ -153,6 +158,7 @@ class DFlashWorker:
             target_hidden=target_hidden,
             ctx_lens=extend_seq_lens,
             draft_seq_lens=np.asarray(model_worker_batch.extend_prefix_lens, dtype=np.int32),
+            block_size=self.block_size,
         )
 
         # Materialize prompt hidden into the draft KV pool at the committed slots.
@@ -188,6 +194,9 @@ class DFlashWorker:
 
         # 2) Target verify over the block.
         verify_input.prepare_for_verify(model_worker_batch, self.page_size)
+        model_worker_batch.forward_mode = ForwardMode.TARGET_VERIFY
+        # Rebuild cache_loc for the target verify: prefix + verify block slots.
+        self._rebuild_cache_loc(model_worker_batch, seq_lens, bs)
         forward_metadata = self.target_worker.model_runner.attn_backend.get_eagle_forward_metadata(
             model_worker_batch
         )
@@ -212,6 +221,7 @@ class DFlashWorker:
             target_hidden=next_target_hidden,
             ctx_lens=accept_lens_np,
             draft_seq_lens=new_seq_lens.astype(np.int32),
+            block_size=self.block_size,
         )
         next_draft_input.new_seq_lens = new_seq_lens.astype(np.int32)
         self._append_target_hidden_to_draft_kv(
@@ -250,7 +260,14 @@ class DFlashWorker:
         positions_flat = positions.reshape(-1)
 
         # Draft input embedding comes from the borrowed target embedding table.
-        input_embedding = jnp.take(self._target_embed, jnp.asarray(block_ids_flat), axis=0)
+        from jax.sharding import NamedSharding, PartitionSpec as P
+
+        embed = self._target_embed
+        ids = jnp.asarray(block_ids_flat)
+        out_sharding = NamedSharding(
+            self.draft_model_runner.mesh, P(None, None)
+        )
+        input_embedding = embed.at[ids].get(out_sharding=out_sharding)
 
         # Temporary draft-block KV slots (dropped after the draft forward).
         allocator = self.draft_model_runner.token_to_kv_pool_allocator
@@ -274,7 +291,7 @@ class DFlashWorker:
             forward_batch.input_embedding = input_embedding
             metadata = self.draft_model_runner.attn_backend.get_eagle_forward_metadata(draft_mwb)
             self.draft_model_runner.attn_backend.forward_metadata = metadata
-            draft_logits_output, _, _ = self.draft_model_runner.forward(forward_batch)
+            draft_logits_output, _, _ = self.draft_model_runner.forward(forward_batch, None)
         finally:
             allocator.restore_state(state)
 
@@ -317,6 +334,25 @@ class DFlashWorker:
             draft_token_num=self.block_size,
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
+        # The base MWB from speculative decode has an empty cache_loc placeholder.
+        # Rebuild it from req_to_token_pool so the attention kernel knows which
+        # pages hold the existing prefix KV (shared between target and draft).
+        # In TARGET_VERIFY mode the kernel adds extend_seq_lens to seq_lens,
+        # so cache_loc must cover prefix + block slots.
+        req_to_token = self.draft_model_runner.req_to_token_pool.req_to_token
+        req_pool_indices = np.asarray(base_mwb.req_pool_indices, dtype=np.int64)
+        block_loc = np.asarray(block_cache_loc, dtype=np.int32)
+        locs = []
+        blk_offset = 0
+        for i in range(bs):
+            sl = int(seq_lens[i])
+            if sl > 0:
+                rp = int(req_pool_indices[i])
+                prefix_locs = np.asarray(req_to_token[rp, :sl], dtype=np.int32)
+                blk_locs = block_loc[blk_offset : blk_offset + self.block_size]
+                locs.append(np.concatenate([prefix_locs, blk_locs]))
+            blk_offset += self.block_size
+        mwb.cache_loc = np.concatenate(locs) if locs else np.empty(0, dtype=np.int32)
         return mwb
 
     # ------------------------------------------------------------------ #
@@ -377,6 +413,24 @@ class DFlashWorker:
         """argmax over the target LM head. tp_size=1 bring-up path (full vocab)."""
         logits = hidden_states @ self._target_lm_head.T
         return jnp.argmax(logits, axis=-1).astype(jnp.int32)
+
+    def _rebuild_cache_loc(self, mwb: ModelWorkerBatch, seq_lens: np.ndarray, bs: int):
+        """Rebuild cache_loc from req_to_token_pool + out_cache_loc for verify."""
+        req_to_token = self.target_worker.model_runner.req_to_token_pool.req_to_token
+        req_pool_indices = np.asarray(mwb.req_pool_indices, dtype=np.int64)
+        out_cache_loc = np.asarray(mwb.out_cache_loc, dtype=np.int32)
+        locs = []
+        ocl_offset = 0
+        for i in range(bs):
+            sl = int(seq_lens[i])
+            rp = int(req_pool_indices[i])
+            if sl > 0:
+                prefix_locs = np.asarray(req_to_token[rp, :sl], dtype=np.int32)
+                n_verify = self.block_size
+                verify_locs = out_cache_loc[ocl_offset : ocl_offset + n_verify]
+                locs.append(np.concatenate([prefix_locs, verify_locs]))
+                ocl_offset += n_verify
+        mwb.cache_loc = np.concatenate(locs) if locs else np.empty(0, dtype=np.int32)
 
     def _slice_committed_target_hidden(self, hidden_states, accept_lens_np, bs):
         """Gather aux hidden for the committed verify tokens (front of each block)."""
