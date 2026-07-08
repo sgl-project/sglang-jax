@@ -1666,7 +1666,9 @@ class ScheduleBatch:
         # prepare_for_decode requires cross-rank-flat allocate_lens
         # (asserts shape[0] == batch_size); rebuild via _concat, run it, then
         # split allocate_lens back to per-rank.
-        if self.spec_algorithm is not None and self.spec_algorithm.is_eagle():
+        if self.spec_algorithm is not None and (
+            self.spec_algorithm.is_eagle() or self.spec_algorithm.is_dflash()
+        ):
             for info in self.reqs_info:
                 if not info.reqs:
                     info.input_ids = None

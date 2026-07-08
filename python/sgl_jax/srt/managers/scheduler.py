@@ -372,6 +372,15 @@ class Scheduler(
             )
             if self.enable_overlap and hasattr(self.draft_worker, "init_spec_relay_buffers"):
                 self.draft_worker.init_spec_relay_buffers()
+        elif self.spec_algorithm is not None and self.spec_algorithm.is_dflash():
+            from sgl_jax.srt.speculative.dflash_worker import (
+                DFlashWorker as _SpecWorkerCls,
+            )
+
+            self.draft_worker = _SpecWorkerCls(
+                server_args=server_args,
+                target_worker=self.tp_worker,
+            )
 
         # Get token and memory info from the model worker
         (

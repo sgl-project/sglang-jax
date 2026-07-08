@@ -1430,7 +1430,7 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE"],
+            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "DFLASH"],
             help="Speculative algorithm.",
             default=ServerArgs.speculative_algorithm,
         )
@@ -1802,6 +1802,28 @@ class ServerArgs:
                     "--speculative-eagle-topk=1 and "
                     "--speculative-num-draft-tokens == --speculative-num-steps + 1. "
                     "Please pass --disable-overlap-schedule for other speculative configs."
+                )
+
+        # DFLASH (minimal): non-causal one-shot diffusion draft + linear-chain
+        # greedy verify. It does not support overlap / tree / multi-step draft.
+        # block_size (== speculative_num_draft_tokens - 1) is validated against
+        # the draft model's dflash_config at worker init.
+        if self.speculative_algorithm == "DFLASH":
+            if not self.disable_overlap_schedule:
+                raise ValueError(
+                    "DFLASH speculative decoding requires --disable-overlap-schedule."
+                )
+            if self.speculative_eagle_topk != 1:
+                raise ValueError(
+                    "DFLASH requires --speculative-eagle-topk=1 (linear chain, no tree)."
+                )
+            if self.speculative_num_steps != 1:
+                raise ValueError(
+                    "DFLASH (minimal) requires --speculative-num-steps=1."
+                )
+            if self.speculative_draft_model_path is None:
+                raise ValueError(
+                    "DFLASH requires --speculative-draft-model-path (the diffusion draft)."
                 )
 
     def check_lora_server_args(self):
