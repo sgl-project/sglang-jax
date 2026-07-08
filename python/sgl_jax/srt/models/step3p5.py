@@ -38,6 +38,12 @@ def _verify_layerdump_enabled() -> bool:
     return os.environ.get("SGL_JAX_VERIFY_LAYERDUMP") == "1"
 
 
+def _step3p5_linear_preferred_element_type(dtype: jnp.dtype) -> jnp.dtype:
+    if os.environ.get("SGL_JAX_STEP35_FP32_LINEAR_ACC") == "1":
+        return jnp.float32
+    return dtype
+
+
 def _verify_layerdump_row(num_rows: int) -> int:
     row = int(os.environ.get("SGL_JAX_VERIFY_LAYERDUMP_ROW", "2"))
     return max(0, min(row, num_rows - 1))
@@ -134,6 +140,7 @@ class Step3p5Attention(nnx.Module):
     ) -> None:
         # "flash" → RadixAttention (TPU kernel, production default).
         # "naive" → pure-JAX fp32 oracle (CPU-runnable, Plan 4 reference).
+        linear_acc_dtype = _step3p5_linear_preferred_element_type(dtype)
         self.attn_impl = attn_impl
         self.layer_id = layer_id
         self.dtype = dtype
@@ -175,6 +182,7 @@ class Step3p5Attention(nnx.Module):
             use_bias=False,
             kernel_axes=(None, "tensor"),
             params_dtype=dtype,
+            preferred_element_type=linear_acc_dtype,
             mesh=mesh,
             scope_name="q_proj",
         )
@@ -184,6 +192,7 @@ class Step3p5Attention(nnx.Module):
             use_bias=False,
             kernel_axes=(None, "tensor"),
             params_dtype=dtype,
+            preferred_element_type=linear_acc_dtype,
             mesh=mesh,
             scope_name="k_proj",
         )
@@ -193,6 +202,7 @@ class Step3p5Attention(nnx.Module):
             use_bias=False,
             kernel_axes=(None, "tensor"),
             params_dtype=dtype,
+            preferred_element_type=linear_acc_dtype,
             mesh=mesh,
             scope_name="v_proj",
         )
@@ -202,6 +212,7 @@ class Step3p5Attention(nnx.Module):
             use_bias=False,
             kernel_axes=("tensor", None),
             params_dtype=dtype,
+            preferred_element_type=linear_acc_dtype,
             mesh=mesh,
             scope_name="o_proj",
         )
@@ -244,6 +255,7 @@ class Step3p5Attention(nnx.Module):
                 use_bias=False,
                 kernel_axes=(None, "tensor"),
                 params_dtype=dtype,
+                preferred_element_type=linear_acc_dtype,
                 mesh=mesh,
                 scope_name="g_proj",
             )
@@ -389,12 +401,14 @@ class Step3p5MLP(nnx.Module):
         swiglu_limit: float | None = None,
     ) -> None:
         self.swiglu_limit = swiglu_limit
+        linear_acc_dtype = _step3p5_linear_preferred_element_type(dtype)
         self.gate_proj = LinearBase(
             input_size=hidden_size,
             output_size=intermediate_size,
             kernel_axes=(None, "tensor"),
             use_bias=False,
             params_dtype=dtype,
+            preferred_element_type=linear_acc_dtype,
             mesh=mesh,
             scope_name="gate_proj",
         )
@@ -404,6 +418,7 @@ class Step3p5MLP(nnx.Module):
             kernel_axes=(None, "tensor"),
             use_bias=False,
             params_dtype=dtype,
+            preferred_element_type=linear_acc_dtype,
             mesh=mesh,
             scope_name="up_proj",
         )
@@ -413,6 +428,7 @@ class Step3p5MLP(nnx.Module):
             kernel_axes=("tensor", None),
             use_bias=False,
             params_dtype=dtype,
+            preferred_element_type=linear_acc_dtype,
             mesh=mesh,
             scope_name="down_proj",
         )

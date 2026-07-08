@@ -377,6 +377,27 @@ class TestStep3p5ForwardSmoke(unittest.TestCase):
             extend_seq_lens=jnp.array([num_tokens], dtype=jnp.int32),
         )
 
+    def test_fp32_linear_acc_env_is_scoped_to_step3p5_linears(self):
+        from sgl_jax.srt.models.step3p5 import Step3p5ForCausalLM
+
+        cfg = _make_config()
+        old = os.environ.get("SGL_JAX_STEP35_FP32_LINEAR_ACC")
+        os.environ["SGL_JAX_STEP35_FP32_LINEAR_ACC"] = "1"
+        try:
+            with jax.set_mesh(_mesh):
+                model = Step3p5ForCausalLM(cfg, mesh=_mesh, dtype=jnp.bfloat16, attn_impl="naive")
+        finally:
+            if old is None:
+                os.environ.pop("SGL_JAX_STEP35_FP32_LINEAR_ACC", None)
+            else:
+                os.environ["SGL_JAX_STEP35_FP32_LINEAR_ACC"] = old
+
+        self.assertEqual(model.model.layers[0].self_attn.q_proj.preferred_element_type, jnp.float32)
+        self.assertEqual(
+            model.model.layers[2].mlp.shared_experts.gate_proj.preferred_element_type,
+            jnp.float32,
+        )
+
     def test_naive_forward_logits_shape_and_finite(self):
         """ForCausalLM(attn_impl="naive") produces finite logits of correct shape."""
         from sgl_jax.srt.layers.logits_processor import LogitsMetadata

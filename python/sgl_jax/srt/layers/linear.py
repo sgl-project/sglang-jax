@@ -53,12 +53,14 @@ class LinearBase(nnx.Module):
         use_bias: bool = True,
         skip_bias_add: bool = False,
         params_dtype: jnp.dtype | None = jnp.bfloat16,
+        preferred_element_type: jnp.dtype | None = None,
         kernel_axes: Sequence[str | None] | None = None,
         scope_name: str = "linear_base",
     ):
         """Initialize parameters and quantization method."""
         self.skip_bias_add = skip_bias_add
         self.params_dtype = params_dtype
+        self.preferred_element_type = preferred_element_type or params_dtype
         self.kernel_axes = kernel_axes
         self.mesh = mesh
         self.name = scope_name
@@ -103,7 +105,7 @@ class LinearBase(nnx.Module):
             x,
             self.weight.value,
             (((x.ndim - 1,), (0,)), ((), ())),
-            preferred_element_type=self.params_dtype,
+            preferred_element_type=self.preferred_element_type,
             out_sharding=target,
         )
         if self.skip_bias_add:
