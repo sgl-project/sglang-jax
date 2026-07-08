@@ -497,6 +497,10 @@ def _device_put_values(sharding, *values):
     return tuple(jax.device_put(value, sharding) for value in values)
 
 
+def _decode_loop_output_shardings(mesh):
+    return NamedSharding(mesh, P()), NamedSharding(mesh, P("data"))
+
+
 def _topk1_index_from_logits(logits):
     topk_idx = jnp.argmax(logits, axis=-1).astype(jnp.int32)[:, None]
     return topk_idx
@@ -2024,11 +2028,9 @@ def _decode_loop_target_verify(
         prepared_verify_seq_lens = jnp.asarray(seq_lens_base, dtype=jnp.int32)
         prepared_allocate_lens_data = verify_allocate_lens
 
-    sh = jax.typeof(target_logits).sharding
-    mesh = sh.mesh if isinstance(sh, NamedSharding) else None
+    mesh = spec_worker.mesh
     if mesh is not None:
-        rep = NamedSharding(mesh, P())
-        data = NamedSharding(mesh, P("data"))
+        rep, data = _decode_loop_output_shardings(mesh)
         (
             prepared_hidden,
             prepared_verified_id,

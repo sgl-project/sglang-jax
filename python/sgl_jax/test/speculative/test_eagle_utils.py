@@ -332,6 +332,19 @@ class TestVerifyTree(CustomTestCase):
         self.assertEqual(placed, (("placed", "a", data), ("placed", "b", data)))
         self.assertEqual(calls, [("a", data), ("b", data)])
 
+    def test_decode_loop_output_shardings_use_worker_mesh(self):
+        from sgl_jax.srt.speculative.draft_extend_fused import (
+            _decode_loop_output_shardings,
+        )
+
+        mesh = Mesh(np.asarray(jax.devices()), ("data",))
+        rep, data = _decode_loop_output_shardings(mesh)
+
+        self.assertIs(rep.mesh, mesh)
+        self.assertIs(data.mesh, mesh)
+        self.assertEqual(rep.spec, P())
+        self.assertEqual(data.spec, P("data"))
+
     def test_verify_tree_greedy(self):
         candidates = jnp.array(
             [
