@@ -1849,7 +1849,7 @@ def _build_decode_loop_cache_loc(
         end = start + per_dp_bs
         aligned = ((seq_lens[start:end] + page_size - 1) // page_size) * page_size
         per_rank_sizes.append(int(np.sum(np.where(seq_lens[start:end] > 0, aligned, 0))))
-    per_dp_cache_loc_size = max(max(per_rank_sizes, default=0), page_size)
+    per_dp_cache_loc_size = max(max(per_rank_sizes, default=0), per_dp_bs * page_size)
     cache_loc = np.zeros(dp_size * per_dp_cache_loc_size, dtype=np.int32)
     req_to_token = req_to_token_pool.req_to_token
     for r in range(dp_size):
