@@ -1950,55 +1950,56 @@ def _decode_loop_target_verify(
         logits_per_step.append(logits_output.next_token_logits)
         hidden_per_step.append(logits_output.hidden_states)
 
-    target_logits = jnp.stack(logits_per_step, axis=1).reshape(bs * n, -1)
-    target_hidden = jnp.stack(hidden_per_step, axis=1).reshape(bs * n, -1)
-    draft_tokens = jnp.asarray(draft_tokens_2d.reshape(bs * n), dtype=jnp.int32)
-    positions = jnp.asarray(positions_2d.reshape(bs * n), dtype=jnp.int32)
-    target_predict = jnp.argmax(target_logits, axis=-1).astype(jnp.int32).reshape(-1)
-    prepared = _verify_greedy(
-        target_hidden=target_hidden,
-        positions=positions,
-        seq_lens=jnp.asarray(seq_lens_base, dtype=jnp.int32),
-        draft_tokens=draft_tokens,
-        target_predict=target_predict,
-        speculative_num_steps=spec_worker.draft_worker.speculative_num_steps,
-        speculative_num_draft_tokens=n,
-    )
+    with jax.set_mesh(spec_worker.mesh):
+        target_logits = jnp.stack(logits_per_step, axis=1).reshape(bs * n, -1)
+        target_hidden = jnp.stack(hidden_per_step, axis=1).reshape(bs * n, -1)
+        draft_tokens = jnp.asarray(draft_tokens_2d.reshape(bs * n), dtype=jnp.int32)
+        positions = jnp.asarray(positions_2d.reshape(bs * n), dtype=jnp.int32)
+        target_predict = jnp.argmax(target_logits, axis=-1).astype(jnp.int32).reshape(-1)
+        prepared = _verify_greedy(
+            target_hidden=target_hidden,
+            positions=positions,
+            seq_lens=jnp.asarray(seq_lens_base, dtype=jnp.int32),
+            draft_tokens=draft_tokens,
+            target_predict=target_predict,
+            speculative_num_steps=spec_worker.draft_worker.speculative_num_steps,
+            speculative_num_draft_tokens=n,
+        )
 
-    target_logits_for_host = (
-        _gather_rows_preserve_sharding(target_logits, prepared.safe_index)
-        if return_target_logits
-        else None
-    )
-    prepared_hidden = prepared.hidden_states
-    prepared_verified_id = prepared.verified_id
-    prepared_hidden_for_draft_extend = target_hidden
-    prepared_verified_id_data = target_predict
-    prepared_next_verified_id = _take_with_index_sharding(
-        prepared.verified_id, prepared.select_index
-    )
-    prepared_new_seq_lens = prepared.new_seq_lens
-    prepared_accept_lens_host = prepared.accept_lens
-    prepared_accept_lens_data = prepared.accept_lens
-    prepared_extend_seq_lens = jnp.where(
-        jnp.asarray(seq_lens_base, dtype=jnp.int32) > 0,
-        jnp.full((bs,), n, dtype=jnp.int32),
-        jnp.zeros((bs,), dtype=jnp.int32),
-    )
-    prepared_logits_indices = (
-        jnp.cumsum(
-            prepared_extend_seq_lens.reshape(dp_size, bs // dp_size),
-            axis=1,
-        ).reshape(-1)
-        - 1
-    ).astype(jnp.int32)
-    prepared_sel_pos = prepared.sel_pos
-    prepared_sel_pos_data = prepared.sel_pos
-    prepared_predict = prepared.predict
-    prepared_positions = prepared.draft_extend_positions
-    prepared_positions_data = prepared.draft_extend_positions
-    prepared_verify_seq_lens = jnp.asarray(seq_lens_base, dtype=jnp.int32)
-    prepared_allocate_lens_data = verify_allocate_lens
+        target_logits_for_host = (
+            _gather_rows_preserve_sharding(target_logits, prepared.safe_index)
+            if return_target_logits
+            else None
+        )
+        prepared_hidden = prepared.hidden_states
+        prepared_verified_id = prepared.verified_id
+        prepared_hidden_for_draft_extend = target_hidden
+        prepared_verified_id_data = target_predict
+        prepared_next_verified_id = _take_with_index_sharding(
+            prepared.verified_id, prepared.select_index
+        )
+        prepared_new_seq_lens = prepared.new_seq_lens
+        prepared_accept_lens_host = prepared.accept_lens
+        prepared_accept_lens_data = prepared.accept_lens
+        prepared_extend_seq_lens = jnp.where(
+            jnp.asarray(seq_lens_base, dtype=jnp.int32) > 0,
+            jnp.full((bs,), n, dtype=jnp.int32),
+            jnp.zeros((bs,), dtype=jnp.int32),
+        )
+        prepared_logits_indices = (
+            jnp.cumsum(
+                prepared_extend_seq_lens.reshape(dp_size, bs // dp_size),
+                axis=1,
+            ).reshape(-1)
+            - 1
+        ).astype(jnp.int32)
+        prepared_sel_pos = prepared.sel_pos
+        prepared_sel_pos_data = prepared.sel_pos
+        prepared_predict = prepared.predict
+        prepared_positions = prepared.draft_extend_positions
+        prepared_positions_data = prepared.draft_extend_positions
+        prepared_verify_seq_lens = jnp.asarray(seq_lens_base, dtype=jnp.int32)
+        prepared_allocate_lens_data = verify_allocate_lens
 
     sh = jax.typeof(target_logits).sharding
     mesh = sh.mesh if isinstance(sh, NamedSharding) else None
