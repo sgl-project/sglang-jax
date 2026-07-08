@@ -163,6 +163,7 @@ def _prepare_draft_inputs(
     *,
     speculative_num_steps,
     speculative_num_draft_tokens,
+    preserve_gather_sharding=True,
 ):
     accept_width = speculative_num_steps + 1
     req_ids = (
@@ -177,11 +178,11 @@ def _prepare_draft_inputs(
     )
     hidden_sharding = jax.typeof(hidden_states).sharding
     positions_sharding = jax.typeof(positions).sharding
-    if isinstance(hidden_sharding, NamedSharding):
+    if preserve_gather_sharding and isinstance(hidden_sharding, NamedSharding):
         gathered_hidden = hidden_states.at[safe_index, :].get(out_sharding=hidden_sharding)
     else:
         gathered_hidden = hidden_states[safe_index, :]
-    if isinstance(positions_sharding, NamedSharding):
+    if preserve_gather_sharding and isinstance(positions_sharding, NamedSharding):
         gathered_positions = positions.at[safe_index].get(out_sharding=positions_sharding)
     else:
         gathered_positions = positions[safe_index]
@@ -205,6 +206,7 @@ def _verify_greedy(
     target_predict,
     speculative_num_steps,
     speculative_num_draft_tokens,
+    preserve_gather_sharding=True,
 ):
     bs = seq_lens.shape[0]
     n = speculative_num_draft_tokens
@@ -246,6 +248,7 @@ def _verify_greedy(
         verified_id,
         speculative_num_steps=speculative_num_steps,
         speculative_num_draft_tokens=speculative_num_draft_tokens,
+        preserve_gather_sharding=preserve_gather_sharding,
     )
     return GreedySampleAndPrepareOutput(
         hidden_states=prepared.hidden_states,
@@ -1964,6 +1967,7 @@ def _decode_loop_target_verify(
             target_predict=target_predict,
             speculative_num_steps=spec_worker.draft_worker.speculative_num_steps,
             speculative_num_draft_tokens=n,
+            preserve_gather_sharding=False,
         )
 
         target_logits_for_host = (
