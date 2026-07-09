@@ -206,7 +206,7 @@ Max ITL (ms):                            154.39
 ## Additional Resources
 
 - [Qwen Model Cards](https://huggingface.co/Qwen)
-- [Qwen3 recipe](/autoregressive/Qwen/Qwen3) — newer Qwen3 8B/32B recipe with framework comparison numbers.
+- [Qwen3 recipe](/autoregressive/Qwen/Qwen3) — newer Qwen3 8B/32B recipe with TPU benchmark rows.
 - [JAX Scaling Book](https://jax-ml.github.io/scaling-book/)
 - [Launch flags reference](/base/launch-flags-reference)
 - [Cross-recipe troubleshooting](/deployment/troubleshooting) — cross-recipe generic issues.

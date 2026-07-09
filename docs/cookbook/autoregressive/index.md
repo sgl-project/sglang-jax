@@ -98,7 +98,7 @@ Diffusion image/video generation models live in [Diffusion recipes](/diffusion).
 | Goal | Clone from |
 |---|---|
 | Single-host dense model | [`Qwen/Qwen.md`](/autoregressive/Qwen/Qwen) ✅ or [`Llama/Llama3.1.md`](/autoregressive/Llama/Llama3.1) ✅ |
-| Dense model with benchmark comparison | [`Qwen/Qwen3.md`](/autoregressive/Qwen/Qwen3) ✅ |
+| Dense model with benchmark rows | [`Qwen/Qwen3.md`](/autoregressive/Qwen/Qwen3) ✅ |
 | Single-host MoE with backend choice | [`Xiaomi/MiMo-V2-Flash.md`](/autoregressive/Xiaomi/MiMo-V2-Flash) ✅ |
 | Vision-language chat | [`Qwen/Qwen2.5-VL.md`](/autoregressive/Qwen/Qwen2.5-VL) ✅ |
 | Large multi-node MoE with GKE manifest | [`Xiaomi/MiMo-V2.5-Pro.md`](/autoregressive/Xiaomi/MiMo-V2.5-Pro) ✅ |

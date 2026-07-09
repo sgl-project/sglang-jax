@@ -16,7 +16,7 @@ title: "Qwen3"
 - **Hybrid Reasoning**: Supports thinking-on (default) and thinking-off via `chat_template_kwargs.enable_thinking` per-request.
 - **Tool Calling**: OpenAI-compatible tool/function calling supported.
 - **Long Context**: 128K context window.
-- **Production-validated benchmarks**: §4.2 below has measured throughput vs vLLM on the same hardware.
+- **Production-validated benchmarks**: §4.2 below has measured throughput rows on TPU.
 
 **Recommended Generation Parameters**:
 
@@ -76,9 +76,6 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python3 -u -m sgl_jax.launch_server \
 - `--page-size 128` is benchmark-tuned (vs default `1`). Larger page reduces page-table overhead at high concurrency but uses more KV per request. Default `1` is more flexible for low-concurrency mixed traffic.
 - `--chunked-prefill-size 2048` splits long prefills into 2K-token chunks for predictable HBM. Raise to 4096 if you have HBM headroom; lower to 1024 if prefill OOM.
 - `--max-running-requests 256` is the concurrent decode cap. Throughput plateaus around this; raising further mainly increases queue depth.
-
-**Prefix Caching:**
-- RadixAttention prefix caching is enabled by default. Keep it on for regular serving so repeated prefixes can benefit from cache reuse.
 
 **Compilation Cache Hygiene:**
 - `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache` is mandatory — without it, first request blocks ~4 min while XLA/Pallas re-compiles.
@@ -402,9 +399,9 @@ PYTHONPATH=/tmp/sglang-jax/python python -m sgl_jax.bench_serving \
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | 1024 | 1024 | 128 | 384 | 8521.48 | 8521.48 | 10266.00 | 943.13 | 14.09 | 46.14 | 384 |
 
-#### v6e-4 SGL-JAX vs vLLM comparison
+#### Historical v6e-4 SGL-JAX sweep
 
-> **Layout E — variant × workload sweep on single hardware.** Qwen3-8B and Qwen3-32B on TPU v6e-4 (TP=4), sgl-jax vs vLLM across ISL values 1024, 4096, and 8192; OSL values 1 and 1024; and concurrency values 8, 16, 32, 64, 128, and 256.
+> **Layout E — variant × workload sweep on single hardware.** Qwen3-8B and Qwen3-32B on TPU v6e-4 (TP=4), across ISL values 1024, 4096, and 8192; OSL values 1 and 1024; and concurrency values 8, 16, 32, 64, 128, and 256.
 
 **Test Environment**
 
@@ -413,30 +410,18 @@ PYTHONPATH=/tmp/sglang-jax/python python -m sgl_jax.bench_serving \
 | Hardware | TPU v6e-4 (single host, 4 chips) |
 | Model | Qwen/Qwen3-8B and Qwen/Qwen3-32B (BF16) |
 | Tensor Parallelism | 4 |
-| Tested build | sglang-jax 0.1.0 (vs vLLM `main-5931b7e5d9acd4fd9eb42d56086c379fa2e2014e`) |
+| Tested build | sglang-jax 0.1.0 |
 
 Methodology: TTFT measured at `output_len=1` to isolate first-token latency; ITL / throughput measured at `output_len=1024`. Workload sweeps input lengths 1024 / 4096 / 8192 tokens × output lengths 1 / 1024 tokens × concurrency 8 / 16 / 32 / 64 / 128 / 256.
 
-**Deployment Command** — same as [§2.3 Single-host](/autoregressive/Qwen/Qwen3#2-3-launch) for the SGL-JAX side. For the vLLM baseline:
-
-```bash
-MODEL_NAME="Qwen/Qwen3-8B"  # or "Qwen/Qwen3-32B"
-vllm serve "${MODEL_NAME}" \
-  --download_dir /tmp --swap-space 16 --disable-log-requests \
-  --tensor_parallel_size 4 --trust-remote-code \
-  --max-model-len 9216 --no-enable-prefix-caching
-```
+**Deployment Command** — same as [§2.3 Single-host](/autoregressive/Qwen/Qwen3#2-3-launch).
 
 **Benchmark Command** — bash driver that sweeps (ISL × OSL × concurrency):
 
 ```bash
 #!/bin/bash
 set -e
-if [ -z "$1" ]; then
-  echo "Usage: $0 <engine> [model]"; echo "engine: sgl-jax or vllm"; exit 1
-fi
-backend=${1}
-MODEL_NAME=${2:-Qwen/Qwen3-8B}  # or pass Qwen/Qwen3-32B as 2nd arg
+MODEL_NAME=${1:-Qwen/Qwen3-8B}  # or pass Qwen/Qwen3-32B
 num_prompts_per_concurrency=3
 input_seq_lens=(1024 4096 8192)
 output_seq_lens=(1 1024)
@@ -447,7 +432,7 @@ for input_seq_len in "${input_seq_lens[@]}"; do
     for max_concurrency in "${max_concurrencies[@]}"; do
       num_prompts=$((num_prompts_per_concurrency * max_concurrency))
       python3 -m sgl_jax.bench_serving \
-        --backend ${backend} \
+        --backend sgl-jax \
         --dataset-name random \
         --num-prompts ${num_prompts} \
         --random-input-len ${input_seq_len} \
@@ -461,35 +446,32 @@ for input_seq_len in "${input_seq_lens[@]}"; do
 done
 ```
 
-Run against both engines:
+Run the sweep:
 
 ```bash
 chmod +x benchmark.sh
-./benchmark.sh sgl-jax Qwen/Qwen3-8B
-./benchmark.sh vllm Qwen/Qwen3-8B
+./benchmark.sh Qwen/Qwen3-8B
 ```
 
 **Test Results** (selected representative cells — see full validation matrix for the full ISL × OSL × batch matrix)
 
 Qwen3-8B:
 
-| ISL/OSL | Batch | TTFT (ms) SGL_JAX | TTFT (ms) vLLM | ITL (ms) SGL_JAX | ITL (ms) vLLM | Out tok/s SGL_JAX | Out tok/s vLLM |
-|---|---|---|---|---|---|---|---|
-| 1024/1024 | 64  | 940.87   | 1346.38  | 11.11 | 18.34 | 5296.60 | 3043.58 |
-| 1024/1024 | 256 | 3793.50  | 5496.67  | 30.00 | 56.81 | 7571.84 | 4051.08 |
-| 4096/1024 | 64  | 4108.43  | 6594.65  | 21.13 | 42.20 | 2528.79 | 1304.04 |
-| 8192/1024 | 64  | 9797.87  | 16565.67 | 31.98 | 58.86 | 1458.77 | 873.82  |
+| ISL/OSL | Batch | TTFT (ms) | ITL (ms) | Out tok/s |
+|---|---:|---:|---:|---:|
+| 1024/1024 | 64  | 940.87  | 11.11 | 5296.60 |
+| 1024/1024 | 256 | 3793.50 | 30.00 | 7571.84 |
+| 4096/1024 | 64  | 4108.43 | 21.13 | 2528.79 |
+| 8192/1024 | 64  | 9797.87 | 31.98 | 1458.77 |
 
 Qwen3-32B:
 
-| ISL/OSL | Batch | TTFT (ms) SGL_JAX | TTFT (ms) vLLM | ITL (ms) SGL_JAX | ITL (ms) vLLM | Out tok/s SGL_JAX | Out tok/s vLLM |
-|---|---|---|---|---|---|---|---|
-| 1024/1024 | 64  | 2864.06  | 3734.00  | 29.48 | 42.45  | 1977.45 | 1391.29 |
-| 1024/1024 | 256 | 11500.61 | 14985.60 | 34.27 | 68.14  | 2122.98 | 1652.79 |
-| 4096/1024 | 64  | 12329.34 | 16108.16 | 35.32 | 73.64  | 785.30  | 422.50  |
-| 8192/1024 | 64  | 28849.51 | 36082.81 | 33.43 | 142.77 | 435.25  | 199.05  |
-
-SGL-JAX wins consistently on this hardware across all measured cells: ~1.5–2.2× output throughput, ~1.4–2.0× faster TTFT, ~1.6–2.4× lower ITL.
+| ISL/OSL | Batch | TTFT (ms) | ITL (ms) | Out tok/s |
+|---|---:|---:|---:|---:|
+| 1024/1024 | 64  | 2864.06  | 29.48 | 1977.45 |
+| 1024/1024 | 256 | 11500.61 | 34.27 | 2122.98 |
+| 4096/1024 | 64  | 12329.34 | 35.32 | 785.30 |
+| 8192/1024 | 64  | 28849.51 | 33.43 | 435.25 |
 
 **Build verification (sglang-jax 0.1.0)** — single-cell confirmation that matches the sweep above. Qwen3-32B, ISL=1024 OSL=1024 c=16 (100 prompts):
 
@@ -501,7 +483,7 @@ Mean TPOT (ms):                          16.89
 Mean E2E Latency (ms):                   8948.78
 ```
 
-Lower than the 1977 tok/s c=64 table cell because c=16 leaves the batch under-filled — included only to confirm the recipe still launches and decodes cleanly on the current build. The Sept-2025 sweep above remains the canonical SGL-JAX-vs-vLLM comparison.
+Lower than the 1977 tok/s c=64 table cell because c=16 leaves the batch under-filled — included only to confirm the recipe still launches and decodes cleanly on the current build. The Sept-2025 sweep above remains the historical v6e-4 SGL-JAX reference sweep.
 
 ## Additional Resources
 

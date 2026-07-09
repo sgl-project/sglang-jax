@@ -143,7 +143,7 @@ Recommended additional datasets: MMLU, GPQA Diamond.
 
 ### 4.2 Speed
 
-> **Layout B — measured baseline.** TPU v6e-4 (single host, 4 chips, TP=4), sglang-jax 0.1.0. sgl-jax-only; no vLLM-on-TPU comparison.
+> **Layout B — measured baseline.** TPU v6e-4 (single host, 4 chips, TP=4), sglang-jax 0.1.0.
 
 **Test Environment**
 
