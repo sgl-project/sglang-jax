@@ -1,8 +1,10 @@
-"""MiniMax-M3 (text-only, dense-attention fallback).
+"""MiniMax-M3 (text-only) with MSA sparse-attention decode.
 
-MSA layers (3-59) use plain dense GQA here; mathematically identical to MSA
-when seq_len <= sparse_topk_blocks * sparse_block_size = 2048. Index-branch
-weights (`self_attn.index_*`) and vision/mtp weights are skipped at load time.
+Prefill: dense GQA (chunked); per-token index_k written to MSATokenToKVPool.
+Decode: index-branch top-k block selection over the paged KV cache
+(page_size == sparse_block_size), then RPA over the selected pages only.
+For seq_len <= topk*block_size the selection is the identity (== dense).
+Vision/MTP weights are skipped; VL checkpoints are aliased to text-only.
 Ground truth: transformers `modular_minimax_m3_vl.py` (refs/ground-truth.md).
 """
 
@@ -262,7 +264,7 @@ class MiniMaxM3Attention(nnx.Module):
         q, k = self.rotary_emb(positions, q, k)
 
         ik_upd = None
-        if self.is_sparse and hasattr(token_to_kv_pool, "set_index_k_buffer"):
+        if self.is_sparse and hasattr(token_to_kv_pool, "get_index_k_pooled"):
             iq, ik_new = self._compute_index_qk(hidden_states, positions)
             attn_output, kv_fused, ik_upd = self.attn(
                 q,
@@ -483,7 +485,7 @@ class MiniMaxM3SparseForCausalLM(nnx.Module):
                 setattr(self.config, k, getattr(config, k))
         self.mesh = mesh
         self.dtype = dtype
-        logger.info("MiniMaxM3SparseForCausalLM dtype=%s (dense-attn fallback)", dtype)
+        logger.info("MiniMaxM3SparseForCausalLM dtype=%s (MSA decode, dense prefill)", dtype)
         self.model = MiniMaxM3Model(self.config, mesh=mesh, dtype=dtype)
         self.lm_head = ParallelLMHead(
             self.config.vocab_size,

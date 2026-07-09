@@ -832,15 +832,6 @@ class MSATokenToKVPool(MHATokenToKVPool):
     def get_index_k_pooled(self, layer_id: int) -> jax.Array:
         return self.index_k_pooled[self._ik_idx(layer_id)]
 
-    def set_index_k_buffer(self, layer_id: int, loc: jax.Array, index_k: jax.Array) -> None:
-        """index_k: [n_tokens, 1, index_head_dim]. loc: token slot indices."""
-        idx = self._ik_idx(layer_id)
-        page_idx = loc // self.page_size
-        slot = loc % self.page_size
-        self.index_k_buffer[idx] = (
-            self.index_k_buffer[idx].at[page_idx, slot].set(index_k.astype(self.dtype))
-        )
-
     def replace_index_k_buffer(self, ik_updates: list) -> None:
         for i, upd in enumerate(ik_updates):
             if isinstance(upd, tuple):
