@@ -26,7 +26,7 @@ title: "Ling 2.6"
 | Model | TPU | Topology | Nodes | Chips | `--tp-size` | `--dp-size` | `--ep-size` | Notes |
 |---|---|---|---|---|---|---|---|---|
 | Ling-2.6-1T | **v6e-64** | 8x8 | 16 | 64 | 64 | 8 | 64 | This is the slice we measured on. Trillion-scale; multi-host mandatory. `dp=8` required (GLA `num_groups=8` ≤ tensor axis); `--disable-radix-cache` required (hybrid recurrent state). |
-| Ling-2.6-1T | **v7x-16** | 2×2×4 | 4 | 16 | 32 | 8 | 32 | v7x exposes 2 JAX devices/chip, so `--tp-size` = 16 chips × 2 = 32. Runs the V2 fused MoE kernel (`--moe-backend fused_v2`), which cuts MoE-layer prefill latency ~53% vs V1. Same `dp=8` and `--disable-radix-cache` constraints as v6e-64. |
+| Ling-2.6-1T | **v7x-16** | 2×2×4 | 4 | 16 | 32 | 8 | 32 | v7x exposes 2 JAX devices/chip, so `--tp-size` = 16 chips × 2 = 32. Runs the V2 fused MoE kernel (`--moe-backend fused_v2`). Same `dp=8` and `--disable-radix-cache` constraints as v6e-64. |
 
 See [TPU topology reference](/base/tpu-topology-reference) for the TPU generation reference. For other slices (larger v6e, v7x variants, scaled-down configs), see [Adapting to other topologies](/base/tpu-topology-reference#adapting-to-other-topologies).
 
@@ -72,7 +72,7 @@ On GKE, use the [GKE Indexed Job launcher](/deployment/gke-indexed-job) with `<J
 
 #### Multi-host — TPU v7x-16 (fused MoE V2)
 
-On a `v7x-16` slice (`2×2×4`, 4 nodes, 16 chips → 32 JAX devices) serve Ling-2.6-1T with the V2 fused MoE kernel (`--moe-backend fused_v2`), which packs scatter, expert FFN, and gather into one Pallas call with double buffering and activation quantization — cutting MoE-layer prefill latency ~53% vs V1. Launch the server on **every node**, varying `${NODE_RANK}` (`0..3`) and pointing all nodes at the rank-0 host via `--dist-init-addr`:
+On a `v7x-16` slice (`2×2×4`, 4 nodes, 16 chips → 32 JAX devices) serve Ling-2.6-1T with the V2 fused MoE kernel (`--moe-backend fused_v2`). Launch the server on **every node**, varying `${NODE_RANK}` (`0..3`) and pointing all nodes at the rank-0 host via `--dist-init-addr`:
 
 ```bash
 python3 -u -m sgl_jax.launch_server \
@@ -112,7 +112,7 @@ All nodes must sit in the same TPU slice and reach each other on the `--dist-ini
 - The GLA linear attention layer has a per-group RMSNorm with `num_groups=8`, sharded along the "tensor" mesh axis. **Effective tensor axis must be ≤ 8.** On v6e-64 that forces `--tp-size 64 --dp-size 8` (tensor axis = `tp/dp` = 8). Setting `--dp-size 1` builds tensor=64 and JIT trace crashes with `Sharding spec ('tensor',) implies that array axis 1 is partitioned 64 times, but does not evenly divide the dimension size 8`.
 
 **MoE Backend:**
-- `--moe-backend` selects the EP MoE implementation: `epmoe` (megablox GMM), `fused` (Pallas fused MoE V1), or `fused_v2` (Pallas fused MoE V2 — double-buffered with activation quantization, ~53% lower MoE-layer prefill latency vs V1). The v6e-64 recipe uses `fused`; the v7x-16 recipe uses `fused_v2`. The fused kernels (`fused` / `fused_v2`) require **full expert parallelism** — they treat the entire `data × tensor` mesh as the EP group, so set `--ep-size` equal to the total JAX device count (`--tp-size`): 64 on v6e-64, 32 on v7x-16.
+- `--moe-backend` selects the EP MoE implementation: `epmoe` (megablox GMM), `fused` (Pallas fused MoE V1), or `fused_v2` (Pallas fused MoE V2). The v6e-64 recipe uses `fused`; the v7x-16 recipe uses `fused_v2`. The fused kernels (`fused` / `fused_v2`) require **full expert parallelism** — they treat the entire `data × tensor` mesh as the EP group, so set `--ep-size` equal to the total JAX device count (`--tp-size`): 64 on v6e-64, 32 on v7x-16.
 
 **FP8 Quantization (compressed-tensors):**
 - Ling-2.6 ships compressed-tensors FP8 with `strategy="channel"` (per-output channel weight scales, dynamic per-token activation). The runtime auto-detects this — no `--quantization` flag needed. `--dtype bfloat16` controls runtime compute dtype, not weight residency.
