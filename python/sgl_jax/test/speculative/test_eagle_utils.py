@@ -28,6 +28,8 @@ class TestVerifyTree(CustomTestCase):
         topk=1,
         is_greedy=True,
         use_relay_state=False,
+        target_model_type="step3p5",
+        target_architectures=("Step3p5ForCausalLM",),
         env=None,
     ):
         from sgl_jax.srt.speculative.draft_extend_fused import (
@@ -41,6 +43,14 @@ class TestVerifyTree(CustomTestCase):
         spec_worker = SimpleNamespace(
             server_args=SimpleNamespace(speculative_target_verify_mode=mode),
             speculative_algorithm=algorithm,
+            target_worker=SimpleNamespace(
+                model_config=SimpleNamespace(
+                    hf_config=SimpleNamespace(
+                        model_type=target_model_type,
+                        architectures=list(target_architectures),
+                    )
+                )
+            ),
         )
         draft_worker = SimpleNamespace(topk=topk)
         model_worker_batch = SimpleNamespace(spec_algorithm=algorithm)
@@ -66,6 +76,14 @@ class TestVerifyTree(CustomTestCase):
         self.assertFalse(self._decode_loop_policy(topk=2))
         self.assertFalse(self._decode_loop_policy(use_relay_state=True))
         self.assertFalse(self._decode_loop_policy(algorithm=SpeculativeAlgorithm.EAGLE3))
+
+    def test_decode_loop_policy_auto_only_enables_step3p5_nextn(self):
+        self.assertFalse(
+            self._decode_loop_policy(
+                target_model_type="qwen3_5_moe",
+                target_architectures=("Qwen3_5MoeForCausalLM",),
+            )
+        )
 
     def test_decode_loop_policy_mode_and_env_override_auto(self):
         self.assertFalse(self._decode_loop_policy(mode="batched"))

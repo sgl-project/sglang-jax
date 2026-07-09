@@ -105,6 +105,25 @@ def _is_nextn_algorithm(value) -> bool:
     return bool(value.is_nextn())
 
 
+def _get_hf_config_from_worker(worker):
+    model_config = getattr(worker, "model_config", None)
+    if model_config is None:
+        model_runner = getattr(worker, "model_runner", None)
+        model_config = getattr(model_runner, "model_config", None)
+    return getattr(model_config, "hf_config", None)
+
+
+def _is_step3p5_target_model(spec_worker) -> bool:
+    hf_config = _get_hf_config_from_worker(spec_worker.target_worker)
+    if hf_config is None:
+        return False
+    model_type = getattr(hf_config, "model_type", None)
+    if isinstance(model_type, str) and model_type.lower() == "step3p5":
+        return True
+    architectures = getattr(hf_config, "architectures", []) or []
+    return "Step3p5ForCausalLM" in architectures
+
+
 def _should_use_decode_loop_target_verify(
     *,
     spec_worker,
@@ -127,7 +146,7 @@ def _should_use_decode_loop_target_verify(
     )
     if mode == "decode-loop":
         return supported
-    return supported
+    return supported and _is_step3p5_target_model(spec_worker)
 
 
 @contextmanager
