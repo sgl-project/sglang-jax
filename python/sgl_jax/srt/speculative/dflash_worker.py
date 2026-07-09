@@ -4,6 +4,12 @@ Scope: tp_size=1, dp_size=1, disable_overlap_schedule, greedy-only, page_size=1.
 Ports the algorithmic structure of SGLang PyTorch PR 22077 to the sglang-jax
 scheduler/worker contract. See ``docs/design/dflash_stage_c.md``.
 
+TODO(n=2 bug): batched decode with n>1 produces degraded/incorrect output for
+the second sequence. Suspected causes: (1) scheduler merge gate at scheduler.py
+~L1806 blocks DFlash batch merges, (2) _pack_cache_loc_rows zero-pads with
+page 0 causing cross-request KV contamination, (3) possible hidden-state or
+KV-cache alignment bug in the multi-request decode path.
+
 The worker exposes the surface the scheduler needs
 (``speculative_num_draft_tokens``, ``forward_batch_speculative_generation``,
 ``run_spec_decode_precompile``) and delegates everything else to the target
