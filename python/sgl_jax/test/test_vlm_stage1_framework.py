@@ -9,12 +9,16 @@ from flax import nnx
 from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec
 
 from sgl_jax.srt.managers.io_struct import GenerateReqInput
-from sgl_jax.srt.managers.mm_utils import merge_jit
+from sgl_jax.srt.managers.mm_utils import (
+    _build_embed_round,
+    _collect_image_requests,
+    build_mm_embed_plan,
+    merge_jit,
+)
 from sgl_jax.srt.managers.schedule_batch import (
     ModelWorkerBatch,
     ScheduleBatch,
     ScheduleReqsInfo,
-    build_mm_embed_plan,
 )
 from sgl_jax.srt.model_executor.forward_batch_info import (
     ForwardBatch,
@@ -41,6 +45,29 @@ from sgl_jax.srt.multimodal.common.modality_enum import (
 )
 from sgl_jax.srt.multimodal.processors.qwen_vl import QwenVLProcessor
 from sgl_jax.srt.server_args import apply_multimodal_model_defaults
+
+
+def _build_image_items(features, grids, offsets):
+    return QwenVLProcessor._build_items(
+        features,
+        grids,
+        offsets,
+        Modality.IMAGE,
+        "image_grid_thw",
+    )
+
+
+class _NaiveSegmentAttentionBackend:
+    def __call__(self, q, k, v, segment_ids):
+        q_seg = segment_ids.q
+        kv_seg = segment_ids.kv
+        scores = jnp.einsum("dnth,dnsh->dnts", q, k)
+        mask = (q_seg[:, None, :, None] == kv_seg[:, None, None, :]) & (
+            q_seg[:, None, :, None] >= 0
+        )
+        scores = jnp.where(mask, scores, jnp.asarray(-1e9, dtype=scores.dtype))
+        probs = jax.nn.softmax(scores, axis=-1)
+        return jnp.einsum("dnts,dnsh->dnth", probs, v)
 
 
 def _two_data_devices():
@@ -97,6 +124,7 @@ def test_vision_transformer_encode_jit_accepts_unhashable_vision_config():
         window_index=jnp.zeros((1, 2), dtype=jnp.int32),
         cu_window_seqlens=jnp.array([[2]], dtype=jnp.int32),
         rotary_pos_emb=jnp.zeros((1, 2, 2), dtype=jnp.float32),
+        cu_image_seqlens=jnp.array([[2]], dtype=jnp.int32),
     )
 
     with jax.set_mesh(mesh):
@@ -134,6 +162,7 @@ def test_vision_transformer_encode_jit_uses_reshard_for_explicit_mesh(monkeypatc
         window_index=jnp.zeros((1, 2), dtype=jnp.int32),
         cu_window_seqlens=jnp.array([[2]], dtype=jnp.int32),
         rotary_pos_emb=jnp.zeros((1, 2, 2), dtype=jnp.float32),
+        cu_image_seqlens=jnp.array([[2]], dtype=jnp.int32),
     )
 
     with jax.set_mesh(mesh):
@@ -217,6 +246,7 @@ def test_vision_transformer_encode_binds_mesh_for_sharded_inputs_without_callsit
                             window_index=np.array([[0]], dtype=np.int32),
                             cu_window_seqlens=np.array([[4]], dtype=np.int32),
                             rotary_pos_emb=np.zeros((1, 4, 2), dtype=np.float32),
+                            cu_image_seqlens=np.array([[4]], dtype=np.int32),
                         ),
                     ),
                     src_idx=np.zeros((1,), dtype=np.int32),
@@ -252,6 +282,7 @@ def test_vision_patch_embed_calls_conv_with_single_batch_dim(monkeypatch):
         window_index=jnp.tile(jnp.arange(3, dtype=jnp.int32)[None, :], (2, 1)),
         cu_window_seqlens=jnp.array([[3], [3]], dtype=jnp.int32),
         rotary_pos_emb=jnp.zeros((2, 3, 2), dtype=jnp.float32),
+        cu_image_seqlens=jnp.array([[3], [3]], dtype=jnp.int32),
     )
 
     seen_input_shapes = []
@@ -278,6 +309,142 @@ def test_vision_patch_embed_calls_conv_with_single_batch_dim(monkeypatch):
 
     assert features.shape == (2, 3, 4)
     assert seen_input_shapes == [(6, 1, 1, 1, 1)]
+
+
+def test_vision_full_attention_keeps_packed_images_block_diagonal_on_cpu():
+    vision_config = SimpleNamespace(
+        patch_size=1,
+        temporal_patch_size=1,
+        in_channels=1,
+        hidden_size=4,
+        depth=1,
+        intermediate_size=8,
+        hidden_act="silu",
+        num_heads=1,
+        out_hidden_size=4,
+        spatial_merge_size=1,
+        fullatt_block_indexes=[0],
+        window_size=1,
+        rope_theta=10000.0,
+    )
+    mesh = Mesh(np.array(jax.devices()[:1]), ("data",))
+    with jax.set_mesh(mesh):
+        visual = Qwen2_5_VisionTransformer(
+            config=vision_config,
+            dtype=jnp.float32,
+            mesh=None,
+            norm_eps=1e-6,
+        )
+    visual.blocks[0].attn.attn_backend = _NaiveSegmentAttentionBackend()
+    builder = Qwen25VLVisionMetadataBuilder(
+        SimpleNamespace(hf_config=SimpleNamespace(vision_config=vision_config))
+    )
+
+    packed_features = np.arange(1, 8, dtype=np.float32).reshape(7, 1)
+    packed_items = _build_image_items(
+        packed_features,
+        [(1, 2, 2), (1, 1, 3)],
+        [(0, 3), (4, 6)],
+    )
+    packed_meta = builder.stack_metadata(
+        [builder.get_metadata(packed_items)],
+        patch_k=7,
+    )
+
+    single_item = _build_image_items(
+        packed_features[:4],
+        [(1, 2, 2)],
+        [(0, 3)],
+    )[0]
+    single_meta = builder.stack_metadata(
+        [builder.get_metadata([single_item])],
+        patch_k=4,
+    )
+
+    packed_out = visual.compute_hidden_states(
+        jnp.asarray(packed_features[None, :, :]),
+        jnp.asarray(packed_meta.window_index),
+        jnp.asarray(packed_meta.cu_window_seqlens),
+        jnp.asarray(packed_meta.rotary_pos_emb),
+        jnp.asarray(packed_meta.cu_image_seqlens),
+        jnp.array([7], dtype=jnp.int32),
+    )
+    single_out = visual.compute_hidden_states(
+        jnp.asarray(packed_features[None, :4, :]),
+        jnp.asarray(single_meta.window_index),
+        jnp.asarray(single_meta.cu_window_seqlens),
+        jnp.asarray(single_meta.rotary_pos_emb),
+        jnp.asarray(single_meta.cu_image_seqlens),
+        jnp.array([4], dtype=jnp.int32),
+    )
+
+    np.testing.assert_allclose(
+        np.asarray(packed_out[:, :4, :]),
+        np.asarray(single_out),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+
+
+def test_vision_single_image_request_matches_single_image_encode_on_cpu():
+    vision_config = SimpleNamespace(
+        patch_size=1,
+        temporal_patch_size=1,
+        in_channels=1,
+        hidden_size=4,
+        depth=1,
+        intermediate_size=8,
+        hidden_act="silu",
+        num_heads=1,
+        out_hidden_size=4,
+        spatial_merge_size=1,
+        fullatt_block_indexes=[0],
+        window_size=1,
+        rope_theta=10000.0,
+    )
+    mesh = Mesh(np.array(jax.devices()[:1]), ("data",))
+    with jax.set_mesh(mesh):
+        visual = Qwen2_5_VisionTransformer(
+            config=vision_config,
+            dtype=jnp.float32,
+            mesh=None,
+            norm_eps=1e-6,
+        )
+    visual.blocks[0].attn.attn_backend = _NaiveSegmentAttentionBackend()
+    builder = Qwen25VLVisionMetadataBuilder(
+        SimpleNamespace(hf_config=SimpleNamespace(vision_config=vision_config))
+    )
+
+    patch_features = np.arange(1, 5, dtype=np.float32).reshape(4, 1)
+    item = _build_image_items(
+        patch_features,
+        [(1, 2, 2)],
+        [(0, 3)],
+    )[0]
+    native_meta = builder.stack_metadata([builder._get_image_metadata(item)], patch_k=4)
+    packed_meta = builder.stack_metadata(
+        [builder._pack_request_metadata([builder._get_image_metadata(item)])],
+        patch_k=4,
+    )
+
+    native_out = visual.compute_hidden_states(
+        jnp.asarray(patch_features[None, :, :]),
+        jnp.asarray(native_meta.window_index),
+        jnp.asarray(native_meta.cu_window_seqlens),
+        jnp.asarray(native_meta.rotary_pos_emb),
+        jnp.asarray(native_meta.cu_image_seqlens),
+        jnp.array([4], dtype=jnp.int32),
+    )
+    packed_out = visual.compute_hidden_states(
+        jnp.asarray(patch_features[None, :, :]),
+        jnp.asarray(packed_meta.window_index),
+        jnp.asarray(packed_meta.cu_window_seqlens),
+        jnp.asarray(packed_meta.rotary_pos_emb),
+        jnp.asarray(packed_meta.cu_image_seqlens),
+        jnp.array([4], dtype=jnp.int32),
+    )
+
+    np.testing.assert_allclose(np.asarray(packed_out), np.asarray(native_out), rtol=1e-5, atol=1e-5)
 
 
 def test_vision_encode_runs_on_real_dp2_data_mesh(monkeypatch):
@@ -325,6 +492,7 @@ def test_vision_encode_runs_on_real_dp2_data_mesh(monkeypatch):
                             window_index=np.array([[1, 0], [0, 1]], dtype=np.int32),
                             cu_window_seqlens=np.array([[8], [4]], dtype=np.int32),
                             rotary_pos_emb=np.zeros((2, 8, 2), dtype=np.float32),
+                            cu_image_seqlens=np.array([[8], [4]], dtype=np.int32),
                         ),
                     ),
                     src_idx=np.zeros((8,), dtype=np.int32),
@@ -395,6 +563,7 @@ def test_device_put_embed_plan_places_qwen_metadata_data_leading():
                             window_index=np.array([[0]], dtype=np.int32),
                             cu_window_seqlens=np.array([[4]], dtype=np.int32),
                             rotary_pos_emb=np.zeros((1, 4, 2), dtype=np.float32),
+                            cu_image_seqlens=np.array([[4]], dtype=np.int32),
                         ),
                     ),
                     src_idx=np.zeros((2,), dtype=np.int32),
@@ -413,6 +582,7 @@ def test_device_put_embed_plan_places_qwen_metadata_data_leading():
     assert tuple(enc.meta.window_index.sharding.spec) == ("data", None)
     assert tuple(enc.meta.cu_window_seqlens.sharding.spec) == ("data", None)
     assert tuple(enc.meta.rotary_pos_emb.sharding.spec) == ("data", None, None)
+    assert tuple(enc.meta.cu_image_seqlens.sharding.spec) == ("data", None)
     assert tuple(rnd.src_idx.sharding.spec) == ("data",)
     assert tuple(rnd.mask.sharding.spec) == ("data",)
 
@@ -524,6 +694,7 @@ def test_mm_embed_plan_device_put_uses_data_leading_sharding():
                             window_index=np.zeros((1, 1), dtype=np.int32),
                             cu_window_seqlens=np.ones((1, 1), dtype=np.int32),
                             rotary_pos_emb=np.ones((1, 4, 2), dtype=np.float32),
+                            cu_image_seqlens=np.array([[4]], dtype=np.int32),
                         ),
                     ),
                     src_idx=np.zeros((4,), dtype=np.int32),
@@ -550,6 +721,7 @@ def test_mm_embed_plan_device_put_uses_data_leading_sharding():
         PartitionSpec("data", None),
         PartitionSpec("data", None),
         PartitionSpec("data", None, None),
+        PartitionSpec("data", None),
         PartitionSpec("data"),
         PartitionSpec("data"),
     ]
@@ -621,11 +793,288 @@ def test_multimodal_data_item_get_reads_common_and_model_specific_fields():
     assert item.get("missing", "fallback") == "fallback"
 
 
+def test_qwen_metadata_builder_packs_request_metadata_with_image_boundaries():
+    vision_config = SimpleNamespace(
+        patch_size=14,
+        window_size=112,
+        spatial_merge_size=2,
+        num_heads=16,
+        hidden_size=1280,
+        rope_theta=10000.0,
+    )
+    builder = Qwen25VLVisionMetadataBuilder(
+        SimpleNamespace(hf_config=SimpleNamespace(vision_config=vision_config))
+    )
+    features = np.arange(272, dtype=np.float32).reshape(272, 1)
+    items = _build_image_items(
+        features,
+        [(1, 16, 16), (1, 4, 4)],
+        [(0, 63), (64, 67)],
+    )
+
+    packed = builder.get_metadata(items)
+
+    np.testing.assert_array_equal(
+        packed.cu_window_seqlens,
+        np.array([64, 128, 192, 256, 272], dtype=np.int32),
+    )
+    np.testing.assert_array_equal(
+        packed.cu_image_seqlens,
+        np.array([256, 272], dtype=np.int32),
+    )
+    np.testing.assert_array_equal(
+        np.sort(packed.window_index),
+        np.arange(68, dtype=np.int32),
+    )
+    assert packed.rotary_pos_emb.shape[0] == 272
+
+
+def test_qwen_metadata_builder_single_image_request_metadata_degenerates_to_native():
+    vision_config = SimpleNamespace(
+        patch_size=14,
+        window_size=112,
+        spatial_merge_size=2,
+        num_heads=16,
+        hidden_size=1280,
+        rope_theta=10000.0,
+    )
+    builder = Qwen25VLVisionMetadataBuilder(
+        SimpleNamespace(hf_config=SimpleNamespace(vision_config=vision_config))
+    )
+    item = _build_image_items(
+        np.arange(8, dtype=np.float32).reshape(8, 1),
+        [(1, 2, 4)],
+        [(0, 1)],
+    )[0]
+
+    native = builder._get_image_metadata(item)
+    packed = builder._pack_request_metadata([native])
+
+    np.testing.assert_array_equal(packed.window_index, native.window_index)
+    np.testing.assert_array_equal(packed.cu_window_seqlens, native.cu_window_seqlens)
+    np.testing.assert_array_equal(packed.rotary_pos_emb, native.rotary_pos_emb)
+    np.testing.assert_array_equal(packed.cu_image_seqlens, np.array([8], dtype=np.int32))
+
+
+def test_qwen_metadata_builder_stack_metadata_pads_multi_image_and_dummy_rank():
+    vision_config = SimpleNamespace(
+        patch_size=14,
+        window_size=112,
+        spatial_merge_size=2,
+        num_heads=16,
+        hidden_size=1280,
+        rope_theta=10000.0,
+    )
+    builder = Qwen25VLVisionMetadataBuilder(
+        SimpleNamespace(hf_config=SimpleNamespace(vision_config=vision_config))
+    )
+    items = _build_image_items(
+        np.arange(24, dtype=np.float32).reshape(24, 1),
+        [(1, 2, 4), (1, 4, 4)],
+        [(0, 1), (2, 5)],
+    )
+    meta = builder.get_metadata(items)
+
+    stacked = builder.stack_metadata([meta, None], patch_k=24)
+
+    assert stacked.window_index.shape == (2, 6)
+    assert stacked.cu_window_seqlens.shape == (2, 2)
+    assert stacked.rotary_pos_emb.shape == (2, 24, 40)
+    assert stacked.cu_image_seqlens.shape == (2, 2)
+    np.testing.assert_array_equal(stacked.cu_image_seqlens[0], np.array([8, 24], dtype=np.int32))
+    np.testing.assert_array_equal(stacked.cu_image_seqlens[1], np.array([24, 24], dtype=np.int32))
+    np.testing.assert_array_equal(stacked.window_index[1], np.arange(6, dtype=np.int32))
+
+
+def test_qwen_metadata_builder_stack_metadata_fails_fast_on_all_dummy_lanes():
+    vision_config = SimpleNamespace(
+        patch_size=14,
+        window_size=112,
+        spatial_merge_size=2,
+        num_heads=16,
+        hidden_size=1280,
+        rope_theta=10000.0,
+    )
+    builder = Qwen25VLVisionMetadataBuilder(
+        SimpleNamespace(hf_config=SimpleNamespace(vision_config=vision_config))
+    )
+
+    with pytest.raises(ValueError, match="at least one real"):
+        builder.stack_metadata([None, None], patch_k=0)
+
+
+def test_qwen_metadata_builder_stack_metadata_checks_patch_bucket_divisibility():
+    vision_config = SimpleNamespace(
+        patch_size=14,
+        window_size=112,
+        spatial_merge_size=2,
+        num_heads=16,
+        hidden_size=1280,
+        rope_theta=10000.0,
+    )
+    builder = Qwen25VLVisionMetadataBuilder(
+        SimpleNamespace(hf_config=SimpleNamespace(vision_config=vision_config))
+    )
+    item = _build_image_items(
+        np.arange(8, dtype=np.float32).reshape(8, 1),
+        [(1, 2, 4)],
+        [(0, 1)],
+    )[0]
+    meta = builder._get_image_metadata(item)
+
+    with pytest.raises(ValueError, match="divisible"):
+        builder.stack_metadata([meta], patch_k=10)
+
+
+def test_collect_image_requests_preserves_owner_rank_request_base():
+    feature = np.arange(8, dtype=np.float32).reshape(8, 1)
+    rank0_req0 = SimpleNamespace(
+        mm_inputs=MultimodalInputs(
+            mm_items=[
+                MultimodalDataItem(
+                    modality=Modality.AUDIO,
+                    feature=np.ones((1, 1), dtype=np.float32),
+                )
+            ]
+        ),
+        extend_input_len=3,
+    )
+    rank0_req1 = SimpleNamespace(
+        mm_inputs=MultimodalInputs(
+            mm_items=_build_image_items(
+                feature,
+                [(1, 2, 4)],
+                [(1, 2)],
+            )
+        ),
+        extend_input_len=4,
+    )
+    rank1_req0 = SimpleNamespace(
+        mm_inputs=MultimodalInputs(
+            mm_items=_build_image_items(
+                feature,
+                [(1, 2, 4)],
+                [(0, 1)],
+            )
+        ),
+        extend_input_len=2,
+    )
+
+    per_rank_units = _collect_image_requests(
+        [ScheduleReqsInfo(reqs=[rank0_req0, rank0_req1]), ScheduleReqsInfo(reqs=[rank1_req0])],
+        dp_size=2,
+    )
+
+    assert len(per_rank_units) == 2
+    assert len(per_rank_units[0]) == 1
+    assert per_rank_units[0][0].req_base == 3
+    assert len(per_rank_units[0][0].images) == 1
+    assert per_rank_units[0][0].images[0].is_image()
+    assert len(per_rank_units[1]) == 1
+    assert per_rank_units[1][0].req_base == 0
+
+
+def test_build_embed_round_derives_pixels_metadata_and_merge_idx_from_one_unit_order():
+    vision_config = SimpleNamespace(
+        patch_size=14,
+        window_size=112,
+        spatial_merge_size=2,
+        fullatt_block_indexes=[],
+        num_heads=16,
+        hidden_size=1280,
+        rope_theta=10000.0,
+    )
+    builder = Qwen25VLVisionMetadataBuilder(
+        SimpleNamespace(hf_config=SimpleNamespace(vision_config=vision_config))
+    )
+    items = _build_image_items(
+        np.arange(24, dtype=np.float32).reshape(24, 1),
+        [(1, 2, 4), (1, 4, 4)],
+        [(2, 3), (5, 8)],
+    )
+
+    rnd = _build_embed_round(
+        [SimpleNamespace(images=items, req_base=0)],
+        builder=builder,
+        dp_size=1,
+        per_dp_token=10,
+    )
+
+    np.testing.assert_array_equal(rnd.encode_inputs.valid, np.array([24], dtype=np.int32))
+    np.testing.assert_array_equal(rnd.encode_inputs.pixels[0, :, 0], np.arange(24))
+    np.testing.assert_array_equal(
+        rnd.encode_inputs.meta.cu_image_seqlens,
+        np.array([[8, 24]], dtype=np.int32),
+    )
+    np.testing.assert_array_equal(np.flatnonzero(rnd.mask), np.array([2, 3, 5, 6, 7, 8]))
+    np.testing.assert_array_equal(rnd.src_idx[[2, 3, 5, 6, 7, 8]], np.arange(6))
+
+
+def test_build_embed_round_keeps_merge_row_contiguous_across_multi_placeholder_images():
+    vision_config = SimpleNamespace(
+        patch_size=14,
+        window_size=112,
+        spatial_merge_size=2,
+        fullatt_block_indexes=[],
+        num_heads=16,
+        hidden_size=1280,
+        rope_theta=10000.0,
+    )
+    builder = Qwen25VLVisionMetadataBuilder(
+        SimpleNamespace(hf_config=SimpleNamespace(vision_config=vision_config))
+    )
+    items = _build_image_items(
+        np.arange(32, dtype=np.float32).reshape(32, 1),
+        [(1, 2, 4), (1, 4, 6)],
+        [(0, 1), (4, 9)],
+    )
+
+    rnd = _build_embed_round(
+        [SimpleNamespace(images=items, req_base=0)],
+        builder=builder,
+        dp_size=1,
+        per_dp_token=12,
+    )
+
+    np.testing.assert_array_equal(rnd.src_idx[[0, 1]], np.array([0, 1], dtype=np.int32))
+    assert rnd.src_idx[4] == 2
+    np.testing.assert_array_equal(rnd.src_idx[[4, 5, 6, 7, 8, 9]], np.arange(2, 8))
+
+
+def test_build_embed_round_fails_fast_on_placeholder_token_out_of_rank_slot():
+    vision_config = SimpleNamespace(
+        patch_size=14,
+        window_size=112,
+        spatial_merge_size=1,
+        fullatt_block_indexes=[],
+        num_heads=16,
+        hidden_size=1280,
+        rope_theta=10000.0,
+    )
+    builder = Qwen25VLVisionMetadataBuilder(
+        SimpleNamespace(hf_config=SimpleNamespace(vision_config=vision_config))
+    )
+    item = MultimodalDataItem(
+        modality=Modality.IMAGE,
+        feature=np.ones((3, 1), dtype=np.float32),
+        offsets=[(0, 2)],
+        model_specific_data={"image_grid_thw": np.array([[1, 1, 3]], dtype=np.int32)},
+    )
+
+    with pytest.raises(ValueError, match="outside its packed rank slot"):
+        _build_embed_round(
+            [SimpleNamespace(images=[item], req_base=2)],
+            builder=builder,
+            dp_size=1,
+            per_dp_token=4,
+        )
+
+
 def test_mm_embed_plan_keeps_placeholder_count_separate_from_encode_rows():
     features = np.arange(24, dtype=np.float32).reshape(24, 1)
     grids = [(1, 2, 4), (1, 4, 4)]
     offsets = [(2, 3), (5, 8)]
-    items = QwenVLProcessor._build_items(features, grids, offsets)
+    items = _build_image_items(features, grids, offsets)
     req = SimpleNamespace(
         mm_inputs=MultimodalInputs(mm_items=items),
         extend_input_len=10,
@@ -655,16 +1104,179 @@ def test_mm_embed_plan_keeps_placeholder_count_separate_from_encode_rows():
     )
 
     rounds = plan.rounds_by_modality[items[0].modality]
+    assert len(rounds) == 1
+
+    np.testing.assert_array_equal(rounds[0].encode_inputs.valid, np.array([24], dtype=np.int32))
+
+    np.testing.assert_array_equal(np.flatnonzero(rounds[0].mask), np.array([2, 3, 5, 6, 7, 8]))
+    np.testing.assert_array_equal(rounds[0].src_idx[[2, 3, 5, 6, 7, 8]], np.arange(6))
+
+
+def test_mm_embed_plan_fails_fast_on_overlapping_placeholder_offsets():
+    features = np.arange(3, dtype=np.float32).reshape(3, 1)
+    item = MultimodalDataItem(
+        modality=Modality.IMAGE,
+        feature=features,
+        offsets=[(0, 1), (1, 1)],
+        model_specific_data={"image_grid_thw": np.array([[1, 1, 3]], dtype=np.int32)},
+    )
+    req = SimpleNamespace(
+        mm_inputs=MultimodalInputs(mm_items=[item]),
+        extend_input_len=3,
+    )
+    vision_config = SimpleNamespace(
+        patch_size=14,
+        window_size=112,
+        spatial_merge_size=1,
+        fullatt_block_indexes=[],
+        num_heads=16,
+        hidden_size=1280,
+        rope_theta=10000.0,
+    )
+    model_config = SimpleNamespace(
+        is_multimodal=True,
+        hf_config=SimpleNamespace(
+            architectures=["Qwen2_5_VLForConditionalGeneration"],
+            vision_config=vision_config,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="assigned more than once"):
+        build_mm_embed_plan(
+            reqs_info=[ScheduleReqsInfo(reqs=[req])],
+            dp_size=1,
+            model_config=model_config,
+            per_dp_token=3,
+        )
+
+
+def test_mm_embed_plan_packs_per_request_with_dp_dummy_lane():
+    vision_config = SimpleNamespace(
+        patch_size=14,
+        window_size=112,
+        spatial_merge_size=2,
+        fullatt_block_indexes=[],
+        num_heads=16,
+        hidden_size=1280,
+        rope_theta=10000.0,
+    )
+    model_config = SimpleNamespace(
+        is_multimodal=True,
+        hf_config=SimpleNamespace(
+            architectures=["Qwen2_5_VLForConditionalGeneration"],
+            vision_config=vision_config,
+        ),
+    )
+    rank0_req0 = SimpleNamespace(
+        mm_inputs=MultimodalInputs(
+            mm_items=_build_image_items(
+                np.arange(8, dtype=np.float32).reshape(8, 1),
+                [(1, 2, 4)],
+                [(1, 2)],
+            )
+        ),
+        extend_input_len=4,
+    )
+    rank0_req1 = SimpleNamespace(
+        mm_inputs=MultimodalInputs(
+            mm_items=_build_image_items(
+                np.arange(16, dtype=np.float32).reshape(16, 1),
+                [(1, 4, 4)],
+                [(0, 3)],
+            )
+        ),
+        extend_input_len=5,
+    )
+    rank1_req0 = SimpleNamespace(
+        mm_inputs=MultimodalInputs(
+            mm_items=_build_image_items(
+                np.arange(8, dtype=np.float32).reshape(8, 1),
+                [(1, 2, 4)],
+                [(2, 3)],
+            )
+        ),
+        extend_input_len=4,
+    )
+
+    plan = build_mm_embed_plan(
+        reqs_info=[
+            ScheduleReqsInfo(reqs=[rank0_req0, rank0_req1]),
+            ScheduleReqsInfo(reqs=[rank1_req0]),
+        ],
+        dp_size=2,
+        model_config=model_config,
+        per_dp_token=10,
+    )
+
+    rounds = plan.rounds_by_modality[Modality.IMAGE]
     assert len(rounds) == 2
+    np.testing.assert_array_equal(rounds[0].encode_inputs.valid, np.array([8, 8], dtype=np.int32))
+    np.testing.assert_array_equal(rounds[1].encode_inputs.valid, np.array([16, 0], dtype=np.int32))
+    np.testing.assert_array_equal(np.flatnonzero(rounds[0].mask), np.array([1, 2, 12, 13]))
+    np.testing.assert_array_equal(np.flatnonzero(rounds[1].mask), np.array([4, 5, 6, 7]))
+    np.testing.assert_array_equal(
+        rounds[1].encode_inputs.meta.cu_image_seqlens,
+        np.array([[16], [16]], dtype=np.int32),
+    )
 
-    np.testing.assert_array_equal(rounds[0].encode_inputs.valid, np.array([8], dtype=np.int32))
-    np.testing.assert_array_equal(rounds[1].encode_inputs.valid, np.array([16], dtype=np.int32))
 
-    np.testing.assert_array_equal(np.flatnonzero(rounds[0].mask), np.array([2, 3]))
-    np.testing.assert_array_equal(rounds[0].src_idx[2:4], np.array([0, 1], dtype=np.int32))
+def test_mm_embed_plan_pads_dp_ranks_with_uneven_multi_image_requests():
+    vision_config = SimpleNamespace(
+        patch_size=14,
+        window_size=112,
+        spatial_merge_size=2,
+        fullatt_block_indexes=[],
+        num_heads=16,
+        hidden_size=1280,
+        rope_theta=10000.0,
+    )
+    model_config = SimpleNamespace(
+        is_multimodal=True,
+        hf_config=SimpleNamespace(
+            architectures=["Qwen2_5_VLForConditionalGeneration"],
+            vision_config=vision_config,
+        ),
+    )
+    rank0_items = _build_image_items(
+        np.arange(24, dtype=np.float32).reshape(24, 1),
+        [(1, 2, 4), (1, 4, 4)],
+        [(0, 1), (3, 6)],
+    )
+    rank1_items = _build_image_items(
+        np.arange(32, dtype=np.float32).reshape(32, 1),
+        [(1, 2, 4), (1, 2, 4), (1, 4, 4)],
+        [(1, 2), (4, 5), (7, 10)],
+    )
+    rank0_req = SimpleNamespace(
+        mm_inputs=MultimodalInputs(mm_items=rank0_items),
+        extend_input_len=8,
+    )
+    rank1_req = SimpleNamespace(
+        mm_inputs=MultimodalInputs(mm_items=rank1_items),
+        extend_input_len=12,
+    )
 
-    np.testing.assert_array_equal(np.flatnonzero(rounds[1].mask), np.array([5, 6, 7, 8]))
-    np.testing.assert_array_equal(rounds[1].src_idx[5:9], np.array([0, 1, 2, 3], dtype=np.int32))
+    plan = build_mm_embed_plan(
+        reqs_info=[ScheduleReqsInfo(reqs=[rank0_req]), ScheduleReqsInfo(reqs=[rank1_req])],
+        dp_size=2,
+        model_config=model_config,
+        per_dp_token=12,
+    )
+
+    rounds = plan.rounds_by_modality[Modality.IMAGE]
+    assert len(rounds) == 1
+    rnd = rounds[0]
+    np.testing.assert_array_equal(rnd.encode_inputs.valid, np.array([24, 32], dtype=np.int32))
+    assert rnd.encode_inputs.pixels.shape == (2, 32, 1)
+    np.testing.assert_array_equal(
+        rnd.encode_inputs.meta.cu_image_seqlens,
+        np.array([[8, 24, 32], [8, 16, 32]], dtype=np.int32),
+    )
+    np.testing.assert_array_equal(
+        np.flatnonzero(rnd.mask), np.array([0, 1, 3, 4, 5, 6, 13, 14, 16, 17, 19, 20, 21, 22])
+    )
+    np.testing.assert_array_equal(rnd.src_idx[[0, 1, 3, 4, 5, 6]], np.arange(6))
+    np.testing.assert_array_equal(rnd.src_idx[[13, 14, 16, 17, 19, 20, 21, 22]], np.arange(8))
 
 
 def test_qwen_metadata_builder_checks_feature_rows_match_grid():
@@ -687,7 +1299,7 @@ def test_qwen_metadata_builder_checks_feature_rows_match_grid():
     )
 
     with pytest.raises(ValueError, match="feature rows"):
-        builder.get_metadata(item)
+        builder._get_image_metadata(item)
 
 
 def test_qwen_metadata_builder_checks_placeholder_rows_match_grid():
@@ -710,10 +1322,10 @@ def test_qwen_metadata_builder_checks_placeholder_rows_match_grid():
     )
 
     with pytest.raises(ValueError, match="placeholder rows"):
-        builder.get_metadata(item)
+        builder._get_image_metadata(item)
 
 
-def test_mm_embed_plan_normalizes_dict_mm_items():
+def test_mm_embed_plan_rejects_dict_mm_inputs():
     feature = np.arange(8, dtype=np.float32).reshape(8, 1)
     req = SimpleNamespace(
         mm_inputs={
@@ -745,17 +1357,13 @@ def test_mm_embed_plan_normalizes_dict_mm_items():
         ),
     )
 
-    plan = build_mm_embed_plan(
-        reqs_info=[ScheduleReqsInfo(reqs=[req])],
-        dp_size=1,
-        model_config=model_config,
-        per_dp_token=2,
-    )
-
-    rounds = plan.rounds_by_modality[Modality.IMAGE]
-    assert len(rounds) == 1
-    np.testing.assert_array_equal(rounds[0].encode_inputs.valid, np.array([8], dtype=np.int32))
-    np.testing.assert_array_equal(np.flatnonzero(rounds[0].mask), np.array([0, 1]))
+    with pytest.raises(TypeError, match="MultimodalInputs"):
+        build_mm_embed_plan(
+            reqs_info=[ScheduleReqsInfo(reqs=[req])],
+            dp_size=1,
+            model_config=model_config,
+            per_dp_token=2,
+        )
 
 
 def test_mm_embed_plan_returns_none_before_resolving_builder_without_images():
@@ -790,7 +1398,7 @@ def test_mm_embed_plan_returns_none_before_resolving_builder_without_images():
 
 def test_mm_embed_plan_fails_fast_when_qwen_vision_config_missing():
     features = np.arange(8, dtype=np.float32).reshape(8, 1)
-    items = QwenVLProcessor._build_items(features, [(1, 2, 4)], [(0, 1)])
+    items = _build_image_items(features, [(1, 2, 4)], [(0, 1)])
     req = SimpleNamespace(
         mm_inputs=MultimodalInputs(mm_items=items),
         extend_input_len=2,

@@ -26,15 +26,22 @@ class Qwen25VLVisionMetadata:
 
     Common code treats this as an opaque pytree. The Qwen ViT encode body reads
     the concrete fields, in flatten order:
-    ``window_index`` / ``cu_window_seqlens`` / ``rotary_pos_emb``.
+    ``window_index`` / ``cu_window_seqlens`` / ``rotary_pos_emb`` /
+    ``cu_image_seqlens``.
     """
 
     window_index: Any
     cu_window_seqlens: Any
     rotary_pos_emb: Any
+    cu_image_seqlens: Any
 
     def tree_flatten(self):
-        children = (self.window_index, self.cu_window_seqlens, self.rotary_pos_emb)
+        children = (
+            self.window_index,
+            self.cu_window_seqlens,
+            self.rotary_pos_emb,
+            self.cu_image_seqlens,
+        )
         aux_data = {}  # static sizes/roles may live here; runtime does not depend on it
         return (children, aux_data)
 
@@ -46,8 +53,8 @@ class Qwen25VLVisionMetadata:
 def _item_grid_thw(item: MultimodalDataItem) -> tuple:
     """First ``(t, h, w)`` of this vision item's grid metadata as a python-int tuple.
 
-    The builder pulls its geometry from the item here, so the common
-    ``get_metadata(item)`` interface stays arch-agnostic.
+    Qwen-specific: the builder pulls its geometry from the item here, so the
+    common ``get_metadata(items)`` interface stays arch-agnostic.
     """
     grid = item.get("image_grid_thw")
     grid_key = "image_grid_thw"
@@ -78,8 +85,8 @@ class Qwen25VLVisionMetadataBuilder:
     """Host-side builder for Qwen2.5-VL ViT aux.
 
     Contract:
-    - ``get_metadata(item)`` consumes one image item carrying ``image_grid_thw``
-      and returns native-size metadata for that image.
+    - ``get_metadata(items)`` consumes one request's image items and
+      returns request-level metadata without a DP axis.
     - ``stack_metadata(metas, patch_k)`` consumes one native metadata object per
       DP rank (or ``None`` for a dummy lane) and returns a pad-stacked metadata
       pytree for one encode round.
@@ -174,15 +181,21 @@ class Qwen25VLVisionMetadataBuilder:
         cu_seqlens_window = cu_seqlens_window.astype(np.int32)
         return index_new.astype(np.int32), cu_seqlens_window
 
-    def get_metadata(self, item) -> Qwen25VLVisionMetadata:
+    def get_metadata(self, items) -> Qwen25VLVisionMetadata:
+        """Build request-level Qwen metadata for image items in concat order."""
+        per_img_metas = [self._get_image_metadata(item) for item in items]
+        return self._pack_request_metadata(per_img_metas)
+
+    def _get_image_metadata(self, item) -> Qwen25VLVisionMetadata:
         """Build native-size Qwen metadata for one image item.
 
         Input contract: ``item`` must provide exactly one ``image_grid_thw`` row.
         Output contract: all fields are native-size numpy arrays for this image:
         ``window_index`` is a spatial-merge-unit permutation,
-        ``cu_window_seqlens`` is cumulative window boundaries, and
+        ``cu_window_seqlens`` is cumulative window boundaries,
+        ``cu_image_seqlens`` is this image's cumulative patch-row boundary, and
         ``rotary_pos_emb`` is per-patch 2D rope already gathered into window
-        order. Full-attention boundaries are derived later from ``valid``.
+        order.
         """
         t, h, w = _item_grid_thw(item)
         sms = self.spatial_merge_size
@@ -223,6 +236,51 @@ class Qwen25VLVisionMetadataBuilder:
             window_index=window_index.astype(np.int32),
             cu_window_seqlens=cu_window_seqlens.astype(np.int32),
             rotary_pos_emb=rope,
+            cu_image_seqlens=np.asarray([expected_patch_rows], dtype=np.int32),
+        )
+
+    def _pack_request_metadata(self, per_img_metas) -> Qwen25VLVisionMetadata:
+        """Pack one request's per-image metadata into one encode sequence.
+
+        Args:
+            per_img_metas: Native per-image metadata from ``_get_image_metadata(item)``,
+                in the same order as the request's concatenated patch features.
+
+        Returns:
+            Request-level metadata without a DP axis. Shapes are
+            ``window_index=[sum_units]``, ``cu_window_seqlens=[sum_windows]``,
+            ``rotary_pos_emb=[sum_patches, rot_dim]``, and
+            ``cu_image_seqlens=[num_images]``.
+
+        Globalization rules:
+        - ``window_index`` is offset by prior images' spatial-merge units.
+        - ``cu_window_seqlens`` is offset by prior images' patch rows.
+        - ``cu_image_seqlens`` records image-end patch rows for full attention.
+        """
+        if not per_img_metas:
+            raise ValueError("Qwen2.5-VL request metadata requires at least one image.")
+
+        unit_off = 0
+        patch_off = 0
+        window_indices = []
+        cu_window_seqlens = []
+        rotary_rows = []
+        cu_image_seqlens = []
+        for meta in per_img_metas:
+            n_units = int(meta.window_index.shape[0])
+            n_patches = n_units * self.spatial_merge_unit
+            window_indices.append(np.asarray(meta.window_index, dtype=np.int32) + unit_off)
+            cu_window_seqlens.append(np.asarray(meta.cu_window_seqlens, dtype=np.int32) + patch_off)
+            rotary_rows.append(np.asarray(meta.rotary_pos_emb, dtype=np.float32))
+            patch_off += n_patches
+            unit_off += n_units
+            cu_image_seqlens.append(patch_off)
+
+        return Qwen25VLVisionMetadata(
+            window_index=np.concatenate(window_indices).astype(np.int32),
+            cu_window_seqlens=np.concatenate(cu_window_seqlens).astype(np.int32),
+            rotary_pos_emb=np.concatenate(rotary_rows, axis=0).astype(np.float32),
+            cu_image_seqlens=np.asarray(cu_image_seqlens, dtype=np.int32),
         )
 
     def stack_metadata(self, metas, patch_k):
@@ -237,21 +295,39 @@ class Qwen25VLVisionMetadataBuilder:
         - ``window_index`` stays a valid permutation via identity tail padding.
         - ``cu_window_seqlens`` uses ``patch_k`` sentinel tail padding.
         - ``rotary_pos_emb`` uses zero row padding to ``patch_k``.
+        - ``cu_image_seqlens`` uses ``patch_k`` sentinel tail padding.
         """
+        if patch_k % self.spatial_merge_unit != 0:
+            raise ValueError(
+                "Qwen2.5-VL metadata patch bucket must be divisible by "
+                f"spatial_merge_unit={self.spatial_merge_unit}, got patch_k={patch_k}."
+            )
+
         present = [m for m in metas if m is not None]
-        units_k = max(int(m.window_index.shape[0]) for m in present)
+        if not present:
+            raise ValueError("Qwen2.5-VL stack_metadata requires at least one real metadata lane.")
+        units_k = patch_k // self.spatial_merge_unit
         win_k = max(int(m.cu_window_seqlens.shape[0]) for m in present)
+        img_k = max(int(m.cu_image_seqlens.shape[0]) for m in present)
         rot_dim = int(present[0].rotary_pos_emb.shape[-1])
-        window_indices, cu_window_seqlens_rows, rotary_rows = [], [], []
+        window_indices, cu_window_seqlens_rows, rotary_rows, cu_image_rows = [], [], [], []
         for m in metas:
             if m is None:  # dummy lane
                 window_indices.append(np.arange(units_k, dtype=np.int32))  # identity perm
                 cu_window_seqlens_rows.append(np.full(win_k, patch_k, dtype=np.int32))
                 rotary_rows.append(np.zeros((patch_k, rot_dim), dtype=np.float32))
+                cu_image_rows.append(np.full(img_k, patch_k, dtype=np.int32))
             else:
                 # window_index: true values + arange continuation for the pad tail.
                 w = np.arange(units_k, dtype=np.int32)
                 n_units = int(m.window_index.shape[0])
+                # Defensive for direct calls with undersized patch_k; scheduler
+                # normally derives patch_k from the same round's patch features.
+                if n_units > units_k:
+                    raise ValueError(
+                        "Qwen2.5-VL window_index exceeds patch bucket: "
+                        f"n_units={n_units}, units_k={units_k}."
+                    )
                 w[:n_units] = np.asarray(m.window_index, dtype=np.int32)
                 # cu_window_seqlens: true values + patch_k sentinel tail.
                 c = np.full(win_k, patch_k, dtype=np.int32)
@@ -260,14 +336,27 @@ class Qwen25VLVisionMetadataBuilder:
                 # rotary_pos_emb: true rows + zero pad to patch_k.
                 r = np.zeros((patch_k, rot_dim), dtype=np.float32)
                 rp = np.asarray(m.rotary_pos_emb, dtype=np.float32)
+                # Defensive for direct calls with undersized patch_k; scheduler
+                # normally derives patch_k from the same round's patch features.
+                if int(rp.shape[0]) > patch_k:
+                    raise ValueError(
+                        "Qwen2.5-VL rotary rows exceed patch bucket: "
+                        f"rows={int(rp.shape[0])}, patch_k={patch_k}."
+                    )
                 r[: int(rp.shape[0])] = rp
+                # cu_image_seqlens: true per-image ends + patch_k sentinel tail.
+                ci = np.full(img_k, patch_k, dtype=np.int32)
+                n_img = int(m.cu_image_seqlens.shape[0])
+                ci[:n_img] = np.asarray(m.cu_image_seqlens, dtype=np.int32)
                 window_indices.append(w)
                 cu_window_seqlens_rows.append(c)
                 rotary_rows.append(r)
+                cu_image_rows.append(ci)
         return Qwen25VLVisionMetadata(
             np.stack(window_indices),
             np.stack(cu_window_seqlens_rows),
             np.stack(rotary_rows),
+            np.stack(cu_image_rows),
         )
 
 
