@@ -208,6 +208,8 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
         recurrence step across the batch, all inside a shard_map."""
         state_indices = self.forward_metadata.recurrent_indices
         has_initial_state = self.forward_metadata.has_initial_state
+        track_indices = self.forward_metadata.recurrent_track_indices
+        track_mask = self.forward_metadata.recurrent_track_mask
         tp = _mesh_tp_size(self.mesh)
         n_kq_tp = self.num_k_heads // tp
         n_v_tp = self.num_v_heads // tp
@@ -225,6 +227,8 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
             a_l,
             state_indices_l,
             has_initial_state_l,
+            track_indices_l=None,
+            track_mask_l=None,
         ):
             conv_out, new_conv = jax_causal_conv1d_update(
                 mixed_qkv_l,
@@ -234,6 +238,8 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
                 bias=None,
                 activation="silu",
                 has_initial_state=has_initial_state_l,
+                track_indices=track_indices_l,
+                track_mask=track_mask_l,
             )
             new_rec, out = decode_gated_delta_rule_ref(
                 conv_out,
@@ -248,31 +254,24 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
                 d_k=d_k,
                 d_v=d_v,
                 has_initial_state=has_initial_state_l,
+                track_indices=track_indices_l,
+                track_mask=track_mask_l,
             )
             return out, new_conv, new_rec
 
-        return jax.shard_map(
-            _decode_local,
-            mesh=self.mesh,
-            in_specs=(
-                P("data", "tensor"),  # mixed_qkv
-                P("data", "tensor", None),  # conv_state
-                P("data", "tensor", None, None),  # recurrent_state
-                P("tensor", None),  # conv1d weight
-                P("tensor"),  # A_log
-                P("tensor"),  # dt_bias
-                P("data", "tensor"),  # b
-                P("data", "tensor"),  # a
-                P("data"),  # state_indices (sharded by data — one slice per DP rank)
-                P("data"),  # has_initial_state (sharded by data)
-            ),
-            out_specs=(
-                P("data", "tensor", None),  # out [B, n_v, d_v]
-                P("data", "tensor", None),  # new_conv_state [num_blocks, conv_dim, K-1]
-                P("data", "tensor", None, None),  # new_rec_state [num_blocks, n_v, d_k, d_v]
-            ),
-            check_vma=False,
-        )(
+        in_specs = [
+            P("data", "tensor"),  # mixed_qkv
+            P("data", "tensor", None),  # conv_state
+            P("data", "tensor", None, None),  # recurrent_state
+            P("tensor", None),  # conv1d weight
+            P("tensor"),  # A_log
+            P("tensor"),  # dt_bias
+            P("data", "tensor"),  # b
+            P("data", "tensor"),  # a
+            P("data"),  # state_indices (sharded by data — one slice per DP rank)
+            P("data"),  # has_initial_state (sharded by data)
+        ]
+        args = [
             mixed_qkv,
             conv_state_in,
             recurrent_state_in,
@@ -283,7 +282,25 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
             a,
             state_indices,
             has_initial_state,
-        )
+        ]
+        # OFF/no-boundary: track_indices is None -> keep the original shard_map
+        # call (no track args), byte-identical to the no-track path. When a
+        # boundary lands in this batch, add two P("data") track slices.
+        if track_indices is not None:
+            in_specs += [P("data"), P("data")]  # track_indices, track_mask
+            args += [track_indices, track_mask]
+
+        return jax.shard_map(
+            _decode_local,
+            mesh=self.mesh,
+            in_specs=tuple(in_specs),
+            out_specs=(
+                P("data", "tensor", None),  # out [B, n_v, d_v]
+                P("data", "tensor", None),  # new_conv_state [num_blocks, conv_dim, K-1]
+                P("data", "tensor", None, None),  # new_rec_state [num_blocks, n_v, d_k, d_v]
+            ),
+            check_vma=False,
+        )(*args)
 
     # ------------------------------------------------------------------
     # Extend / chunked-prefill
@@ -305,6 +322,8 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
         cu_seqlens = meta.cu_q_lens
         state_indices = meta.recurrent_indices
         has_initial_state = meta.has_initial_state
+        track_indices = meta.recurrent_track_indices
+        track_mask = meta.recurrent_track_mask
         tp = _mesh_tp_size(self.mesh)
         n_kq_tp = self.num_k_heads // tp
         n_v_tp = self.num_v_heads // tp
@@ -323,6 +342,8 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
             cu_seqlens_l,
             state_indices_l,
             has_initial_state_l,
+            track_indices_l=None,
+            track_mask_l=None,
         ):
             # jax_causal_conv1d_prefill operates on [D, T] (channel-first).
             # Pass `has_initial_state` so brand-new prefills don't pick up
@@ -337,6 +358,8 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
                 state_indices=state_indices_l,
                 has_initial_state=has_initial_state_l,
                 activation="silu",
+                track_indices=track_indices_l,
+                track_mask=track_mask_l,
             )
             conv_out = conv_out_dt.T  # [T, D]
             new_rec, out = ragged_gated_delta_rule_ref(
@@ -353,32 +376,25 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
                 n_v=n_v_tp,
                 d_k=d_k,
                 d_v=d_v,
+                track_indices=track_indices_l,
+                track_mask=track_mask_l,
             )
             return out, new_conv, new_rec
 
-        return jax.shard_map(
-            _extend_local,
-            mesh=self.mesh,
-            in_specs=(
-                P("data", "tensor"),  # mixed_qkv
-                P("data", "tensor", None),  # conv_state
-                P("data", "tensor", None, None),  # recurrent_state
-                P("tensor", None),  # conv1d weight
-                P("tensor"),  # A_log
-                P("tensor"),  # dt_bias
-                P("data", "tensor"),  # b
-                P("data", "tensor"),  # a
-                P("data"),  # cu_seqlens (sharded by data — one slice per DP rank)
-                P("data"),  # state_indices (sharded by data)
-                P("data"),  # has_initial_state (sharded by data)
-            ),
-            out_specs=(
-                P("data", "tensor", None),  # out [T, n_v, d_v]
-                P("data", "tensor", None),  # new_conv_state [num_blocks, conv_dim, K-1]
-                P("data", "tensor", None, None),  # new_rec_state [num_blocks, n_v, d_k, d_v]
-            ),
-            check_vma=False,
-        )(
+        in_specs = [
+            P("data", "tensor"),  # mixed_qkv
+            P("data", "tensor", None),  # conv_state
+            P("data", "tensor", None, None),  # recurrent_state
+            P("tensor", None),  # conv1d weight
+            P("tensor"),  # A_log
+            P("tensor"),  # dt_bias
+            P("data", "tensor"),  # b
+            P("data", "tensor"),  # a
+            P("data"),  # cu_seqlens (sharded by data — one slice per DP rank)
+            P("data"),  # state_indices (sharded by data)
+            P("data"),  # has_initial_state (sharded by data)
+        ]
+        args = [
             mixed_qkv,
             conv_state_in,
             recurrent_state_in,
@@ -390,4 +406,19 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
             cu_seqlens,
             state_indices,
             has_initial_state,
-        )
+        ]
+        if track_indices is not None:
+            in_specs += [P("data"), P("data")]  # track_indices, track_mask
+            args += [track_indices, track_mask]
+
+        return jax.shard_map(
+            _extend_local,
+            mesh=self.mesh,
+            in_specs=tuple(in_specs),
+            out_specs=(
+                P("data", "tensor", None),  # out [T, n_v, d_v]
+                P("data", "tensor", None),  # new_conv_state [num_blocks, conv_dim, K-1]
+                P("data", "tensor", None, None),  # new_rec_state [num_blocks, n_v, d_k, d_v]
+            ),
+            check_vma=False,
+        )(*args)

@@ -107,7 +107,7 @@ class FullComponent(TreeComponent):
         lock_host: bool = False,
     ) -> IncLockRefResult:
         if lock_host:
-            # No host tier in stage 1.
+            # No host tier.
             return result
 
         ct = self.component_type
@@ -140,7 +140,7 @@ class FullComponent(TreeComponent):
         lock_host: bool = False,
     ) -> None:
         if lock_host:
-            # No host tier in stage 1.
+            # No host tier.
             return
 
         ct = self.component_type

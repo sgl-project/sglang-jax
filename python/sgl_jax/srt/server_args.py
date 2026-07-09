@@ -94,6 +94,7 @@ class ServerArgs:
     swa_full_tokens_ratio: float = 0.8
     recurrent_state_memory_ratio: float = 0.9
     max_recurrent_state_size: int | None = None
+    recurrent_track_interval: int | None = None
     disable_hybrid_swa_memory: bool = False
 
     # Runtime options
@@ -170,6 +171,7 @@ class ServerArgs:
     #   write_through_selective  same path, just a higher threshold
     #   write_back               no backup on hit; back up only at device eviction
     hicache_write_policy: str = "write_through"
+    enable_recurrent_extra_buffer: bool = False
     allow_auto_truncate: bool = False
     enable_tokenizer_batch_encode: bool = False
     disable_overlap_schedule: bool = False
@@ -370,6 +372,83 @@ class ServerArgs:
         # Normalize speculative_algorithm: treat empty string as None
         if isinstance(self.speculative_algorithm, str) and self.speculative_algorithm.strip() == "":
             self.speculative_algorithm = None
+
+        # Recurrent extra-buffer static validation + track-interval
+        # normalization. Gated on the flag so non-recurrent / base-path launches
+        # are untouched. Model-dependent checks (radix routing) live in
+        # _enforce_recurrent_state_server_constraints.
+        if self.enable_recurrent_extra_buffer:
+            if self.page_size <= 1:
+                raise ValueError(
+                    "--enable-recurrent-extra-buffer requires --page-size > 1 "
+                    f"(recurrent radix caching uses page-boundary track slots); "
+                    f"got page_size={self.page_size}."
+                )
+            # Default to chunked_prefill_size so snapshots land on existing
+            # chunk boundaries and add no extra prefill splits.
+            if self.recurrent_track_interval is None:
+                if self.chunked_prefill_size and self.chunked_prefill_size > 0:
+                    # check_server_args() asserts chunk page-alignment later; check
+                    # here so the error blames the chunk, not the derived interval.
+                    if self.chunked_prefill_size % self.page_size != 0:
+                        raise ValueError(
+                            f"--chunked-prefill-size ({self.chunked_prefill_size}) must be a "
+                            f"multiple of --page-size ({self.page_size}) when "
+                            "--enable-recurrent-extra-buffer is set (the recurrent track "
+                            "interval defaults to it)."
+                        )
+                    self.recurrent_track_interval = self.chunked_prefill_size
+                else:
+                    self.recurrent_track_interval = self.page_size
+            if self.recurrent_track_interval <= 0:
+                raise ValueError(
+                    "--recurrent-track-interval must be > 0 when "
+                    f"--enable-recurrent-extra-buffer is set; got {self.recurrent_track_interval}."
+                )
+            if self.recurrent_track_interval % self.page_size != 0:
+                raise ValueError(
+                    f"--recurrent-track-interval ({self.recurrent_track_interval}) must be a "
+                    f"multiple of --page-size ({self.page_size})."
+                )
+            if self.chunked_prefill_size and self.chunked_prefill_size > 0:
+                if self.recurrent_track_interval > self.chunked_prefill_size:
+                    # Coarser than the chunk: short prompts cache nothing but do
+                    # not stall. Warn, don't reject -- a memory-for-hit-rate trade.
+                    logger.warning(
+                        "--recurrent-track-interval (%d) > --chunked-prefill-size (%d): recurrent "
+                        "snapshots are published only at interval boundaries, so any prompt shorter "
+                        "than the interval caches nothing and cross-request reuse is limited to "
+                        "prompts that cross a boundary. The request still progresses (no stall); "
+                        "this only lowers the recurrent-cache hit rate. Prefer the default "
+                        "(= chunked_prefill_size) unless you are deliberately trading hit rate for "
+                        "coarser, cheaper snapshots.",
+                        self.recurrent_track_interval,
+                        self.chunked_prefill_size,
+                    )
+                elif self.recurrent_track_interval < self.chunked_prefill_size:
+                    logger.warning(
+                        "--recurrent-track-interval (%d) < --chunked-prefill-size (%d): this "
+                        "force-splits prefill into %d-token sub-chunks so each forward ends on a "
+                        "snapshot boundary. Chunked prefill is chunk-size-sensitive in the "
+                        "full-attention/MoE path, so finer snapshots trade accuracy (~3.5pp on "
+                        "GPQA at interval=128 vs chunk=512) for recurrent-cache granularity. "
+                        "Prefer the default (= chunked_prefill_size).",
+                        self.recurrent_track_interval,
+                        self.chunked_prefill_size,
+                        self.recurrent_track_interval,
+                    )
+            if self.speculative_algorithm is not None:
+                raise ValueError(
+                    "--enable-recurrent-extra-buffer does not support speculative "
+                    f"decoding yet; got --speculative-algorithm={self.speculative_algorithm}. "
+                    "Disable one of them."
+                )
+            if self.enable_mixed_chunk:
+                raise ValueError(
+                    "--enable-recurrent-extra-buffer does not support mixed chunked "
+                    "prefill yet (the track snapshot is scoped to pure extend / "
+                    "pure decode forwards). Disable --enable-mixed-chunk."
+                )
 
         os.environ["SGLANG_ENABLE_DETERMINISTIC_SAMPLING"] = (
             "1" if self.enable_deterministic_sampling else "0"
@@ -797,6 +876,16 @@ class ServerArgs:
             "Must be divisible by dp_size when set explicitly.",
         )
         parser.add_argument(
+            "--recurrent-track-interval",
+            type=int,
+            default=ServerArgs.recurrent_track_interval,
+            help="Recurrent radix cache: page-boundary interval at which a "
+            "recurrent track state is committed. Requires --enable-recurrent-extra-buffer "
+            "and must be a positive multiple of --page-size. Defaults to "
+            "--chunked-prefill-size when extra-buffer is enabled (falls back to "
+            "--page-size if chunked prefill is off).",
+        )
+        parser.add_argument(
             "--disable-hybrid-swa-memory",
             action="store_true",
             help="Disable the hybrid SWA memory.",
@@ -1141,7 +1230,9 @@ class ServerArgs:
             choices=["disable", "none", "file"],
             default=ServerArgs.hicache_storage,
             help="HiCache KV offloading: 'disable' off, 'none' enables L1+L2 "
-            "(host pinned pool), 'file' reserved for L3(not support yet).",
+            "(host pinned pool), 'file' reserved for L3(not support yet). "
+            "Unsupported for linear-recurrent models under the unified radix "
+            "tree (rejected at init).",
         )
         parser.add_argument(
             "--hicache-ratio",
@@ -1164,6 +1255,13 @@ class ServerArgs:
             "(>= threshold); 'write_through_selective' is the same path with a "
             "higher threshold; 'write_back' skips hit-time backup and only backs "
             "up a node when its device KV is evicted (fewest D2H)",
+        )
+        parser.add_argument(
+            "--enable-recurrent-extra-buffer",
+            action="store_true",
+            help="Recurrent radix cache: use the page-aligned ping-pong track "
+            "buffer for page_size>=128. Off by default; the base path supports "
+            "page_size=1 only.",
         )
         parser.add_argument(
             "--allow-auto-truncate",

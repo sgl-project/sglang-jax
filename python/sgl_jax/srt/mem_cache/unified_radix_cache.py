@@ -1,9 +1,10 @@
 """Unified radix cache: a component-based radix tree over the device KV cache.
 
-Stage 1 ports the FULL-attention subset of upstream sglang's UnifiedRadixCache.
-All per-component behavior (matching, locking, eviction, split redistribution)
-is delegated to TreeComponent implementations so that later stages (SWA, Mamba,
-HiCache) plug in without touching the core walk.
+Ports upstream sglang's UnifiedRadixCache. Per-component behavior (matching,
+locking, eviction, split redistribution) is delegated to TreeComponent
+implementations: a FULL-attention component plus a leaf-only recurrent
+component (KDA / GDN). SWA / HiCache components plug into the same contract
+without touching the core walk.
 """
 
 from __future__ import annotations
@@ -109,6 +110,8 @@ class UnifiedRadixCache(BasePrefixCache):
         enable_kv_cache_events: bool = False,
         is_eagle: bool = False,
         tree_components: tuple[ComponentType, ...] = (ComponentType.FULL,),
+        enable_recurrent_extra_buffer: bool = False,
+        recurrent_track_interval: int | None = None,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -120,6 +123,8 @@ class UnifiedRadixCache(BasePrefixCache):
         self.max_seq_len = max_seq_len
         self.dtype = dtype
         self.enable_kv_cache_events = enable_kv_cache_events
+        self.enable_recurrent_extra_buffer = enable_recurrent_extra_buffer
+        self.recurrent_track_interval = recurrent_track_interval
         self.kv_event_queue: list = []
 
         self.process_id = jax.process_index()
@@ -250,8 +255,27 @@ class UnifiedRadixCache(BasePrefixCache):
     def supports_recurrent(self) -> bool:
         return ComponentType.RECURRENT in self.components
 
-    def assert_recurrent_slot_ledger(self, dp_rank: int = 0) -> int:
-        """Assert active + tree_owned + free == slots_per_rank; return active."""
+    def recurrent_extra_buffer_active(self) -> bool:
+        return (
+            self.supports_recurrent()
+            and self.enable_recurrent_extra_buffer
+            and self.recurrent_track_interval is not None
+        )
+
+    def recurrent_evictable_size(self, dp_rank: int = 0) -> int:
+        """Unlocked tree-owned recurrent slots on ``dp_rank`` — what ``evict``
+        can reclaim (protected/locked snapshots excluded)."""
+        return self.component_evictable_size_[ComponentType.RECURRENT][dp_rank]
+
+    def assert_recurrent_slot_ledger(self, dp_rank: int = 0, live_reqs: list | None = None) -> int:
+        """Per-rank invariant ``active + tree_owned + free == slots_per_rank``;
+        returns the derived ``active`` (request-owned) count. Tree-owned =
+        recurrent evictable + protected; free = recurrent free-list length.
+
+        When ``live_reqs`` is given, the structurally-derived ``active`` is
+        cross-checked against the slots those requests actually hold (running +
+        ping-pong track), so a leaked track slot is caught rather than silently
+        absorbed into the tautological subtraction."""
         ct = ComponentType.RECURRENT
         rtp = self.req_to_token_pool
         free = len(rtp.recurrent_free_slots[dp_rank])
@@ -265,6 +289,13 @@ class UnifiedRadixCache(BasePrefixCache):
             f"recurrent slot ledger broken (dp={dp_rank}): free={free} "
             f"tree_owned={tree_owned} > slots_per_rank={slots}"
         )
+        if live_reqs is not None:
+            owned = rtp.count_request_owned_recurrent_slots(live_reqs, dp_rank)
+            assert owned == active, (
+                f"recurrent slot leak (dp={dp_rank}): request-owned={owned} != "
+                f"active={active} (free={free} tree_owned={tree_owned} "
+                f"slots_per_rank={slots})"
+            )
         return active
 
     def inc_lock_ref(self, node: UnifiedTreeNode) -> IncLockRefResult:
@@ -898,9 +929,10 @@ class UnifiedRadixCache(BasePrefixCache):
     def _cascade_evict(self, node: UnifiedTreeNode) -> None:
         """Tombstone the base value after all components have been driven.
 
-        Stage 1 collapses the upstream priority cascade: FULL is both the
-        trigger and the only component. The deferral contract puts
-        value = None here, not in FullComponent.evict_component."""
+        FULL is the eviction trigger (device-leaf status keys off its value);
+        the base-value tombstone is deferred to here -- after every component's
+        evict_component has run -- rather than inside FullComponent, so an aux
+        component (e.g. recurrent) can still read FULL.value while evicting."""
         node.component_data[BASE_COMPONENT_TYPE].value = None
         self._update_evictable_leaf_sets(node)
 

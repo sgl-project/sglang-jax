@@ -329,6 +329,8 @@ suites = {
         TestFile("test/srt/test_dp_schedule_policy.py", 0.2, runner="pytest"),
         TestFile("test/srt/test_dp_schedule_shape_aware.py", 0.2, runner="pytest"),
         TestFile("test/srt/test_dp_rank_assignment.py", 0.2, runner="pytest"),
+        TestFile("test/srt/test_bench_recurrent_reuse_sweep.py", 0.2, runner="pytest"),
+        TestFile("python/sgl_jax/test/test_mixed_chunk_dp.py", 0.2),
         TestFile("test/srt/function_call/test_qwen3_coder_detector.py", 0.1),
         TestFile("test/srt/function_call/test_glm4_moe_detector.py", 0.1),
         TestFile("test/srt/function_call/test_qwen25_detector.py", 0.1),
@@ -341,6 +343,11 @@ suites = {
         TestFile("test/srt/eval/test_simple_eval_common.py", 0.1, runner="pytest"),
         TestFile("test/srt/test_server_info.py", 0.1),
         TestFile("test/srt/test_recurrent_cow_metadata.py", 0.2),
+        TestFile("test/srt/test_recurrent_track_metadata.py", 0.2),
+        TestFile("test/srt/test_recurrent_boundary_split.py", 0.2),
+        TestFile("test/srt/test_recurrent_state_sizing.py", 0.2),
+        TestFile("test/srt/test_recurrent_track_scatter.py", 0.3),
+        TestFile("test/srt/test_recurrent_split_equivalence.py", 0.3),
         TestFile("test/srt/test_prepare_for_extend_protected_len.py", 0.2),
     ],
     "unit-test-tpu-v6e-4": [
@@ -400,7 +407,14 @@ suites = {
         TestFile("test/srt/lora/test_bgmv_backend.py", 6),
         TestFile("test/srt/lora/test_dynamic_lora.py", 10),
         TestFile("test/srt/lora/test_static_lora.py", 10),
-        TestFile("test/srt/test_unified_radix_cache_serving.py", 8),
+        # Dense (non-hybrid) class only. The recurrent (GDN-hybrid) class is a
+        # heavy 4-chip / 35B determinism run kept out of per-PR CI (nightly
+        # recurrent gate: #1425).
+        TestFile(
+            "test/srt/test_unified_radix_cache_serving.py",
+            8,
+            ["TestUnifiedRadixCacheServing"],
+        ),
     ],
     "e2e-test-tpu-v6e-4": [
         TestFile("test/srt/openai_server/basic/test_tool_calls.py", 2),
