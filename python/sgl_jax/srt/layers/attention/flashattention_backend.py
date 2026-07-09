@@ -703,13 +703,16 @@ class FlashAttention(AttentionBackend):
                     inserted_window_dims=(0,),
                     scatter_dims_to_operand_dims=(0,),
                 )
+                # NOT unique: out_cache_loc -1 padding is clamped to 0 above, so
+                # every prefill has duplicate 0s here. Sorted-only still gets
+                # the vectorized TPU lowering; unique=True would be UB.
                 ik_buf_upd = jax.lax.scatter(
                     ik_buf_l.reshape(-1, d_idx),
                     flat_idx[order][:, None],
                     ik_cast[order],
                     _dn,
                     indices_are_sorted=True,
-                    unique_indices=True,
+                    unique_indices=False,
                     mode="promise_in_bounds",
                 ).reshape(ik_buf_l.shape)
             # 1b. update per-block element-wise-max pool. slot==0 means this token
