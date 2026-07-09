@@ -216,6 +216,8 @@ class DFlashAttention(nnx.Module):
         q = q.reshape(bs, block, self.q_head_num, self.head_dim)
         k_noise = k_noise.reshape(bs, block, self.kv_head_num, self.head_dim)
         v_noise = v_noise.reshape(bs, block, self.kv_head_num, self.head_dim)
+        k_noise = jax.sharding.reshard(k_noise, kv_block_sharding)
+        v_noise = jax.sharding.reshard(v_noise, kv_block_sharding)
 
         k_all = jnp.concatenate([prefix_k, k_noise], axis=1)
         v_all = jnp.concatenate([prefix_v, v_noise], axis=1)

@@ -590,6 +590,23 @@ class DFlashWorker:
         cache_loc = self._committed_cache_loc(model_worker_batch, draft_input, is_prefill)
         positions = self._committed_positions(draft_input, is_prefill)
 
+        n = cache_loc.shape[0]
+        if not is_prefill and n > 0:
+            bs = int(np.asarray(draft_input.ctx_lens).shape[0])
+            max_tokens = bs * self.block_size
+            if n < max_tokens:
+                pad_n = max_tokens - n
+                cache_loc = np.concatenate(
+                    [cache_loc, np.full(pad_n, cache_loc[0], dtype=cache_loc.dtype)]
+                )
+                positions = np.concatenate(
+                    [positions, np.full(pad_n, positions[0], dtype=positions.dtype)]
+                )
+                target_hidden = np.asarray(target_hidden)
+                target_hidden = np.concatenate(
+                    [target_hidden, np.tile(target_hidden[0:1], (pad_n, 1))]
+                )
+
         pool = self.draft_model_runner.token_to_kv_pool
         kv_buffers = list(pool.kv_buffer[: self.draft_layers])
 
@@ -698,7 +715,7 @@ class DFlashWorker:
 
     def _slice_committed_target_hidden(self, hidden_states, accept_lens_np, bs):
         """Gather aux hidden for the committed verify tokens (front of each block)."""
-        hs = hidden_states.reshape(bs, self.block_size, -1)
+        hs = np.asarray(jax.device_get(hidden_states)).reshape(bs, self.block_size, -1)
         rows = []
         for i in range(bs):
             a = int(accept_lens_np[i])
@@ -706,8 +723,8 @@ class DFlashWorker:
                 continue
             rows.append(hs[i, :a, :])
         if not rows:
-            return hs[:0, 0, :]
-        return jnp.concatenate(rows, axis=0)
+            return np.zeros((0, hs.shape[-1]), dtype=hs.dtype)
+        return np.concatenate(rows, axis=0)
 
     # ------------------------------------------------------------------ #
     # Precompile hook (scheduler calls this at startup)

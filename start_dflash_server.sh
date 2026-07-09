@@ -10,6 +10,8 @@ HF_HUB_CACHE=/models HF_HOME=/models PYTHONPATH=python .venv/bin/python -m sgl_j
     --speculative-draft-model-path /models/z-lab/Qwen3-8B-DFlash-b16 \
     --speculative-num-steps 1 --speculative-eagle-topk 1 \
     --disable-overlap-schedule --tp-size 1 --dtype bfloat16 \
-    --attention-backend fa --mem-fraction-static 0.75 \
-    --trust-remote-code --grammar-backend none \
+    --attention-backend fa --mem-fraction-static 0.60 \
+    --trust-remote-code \
+    --disable-radix-cache \
+    --grammar-backend none \
     --host 0.0.0.0 --port 30000
