@@ -4,7 +4,7 @@ title: "DeepSeek R1"
 
 # DeepSeek R1 on SGL-JAX
 
-> **Validated recipe** — TPU v6e-64 path validated on sglang-jax 0.1.0: server starts, reasoning_content streams correctly, GSM8K accuracy 98.0% (50 examples, thinking-on). §4.2 includes a v7x-16 launch and `bench_serving` template; throughput numbers are intentionally omitted until the recipe has a release-quality performance datapoint.
+> **Validated recipe** — TPU v6e-64 path validated on sglang-jax 0.1.0: server starts, reasoning_content streams correctly, GSM8K accuracy 98.0% (50 examples, thinking-on). §4.2 includes a v7x-16 launch and `bench_serving` template.
 
 ## 1. Model Introduction
 
@@ -218,7 +218,7 @@ evalscope eval \
 
 ### 4.2 Speed
 
-> **v7x-16 benchmark template.** This recipe provides the launch and benchmark command shape, but does not publish a throughput result yet. That keeps the page useful as a working deployment recipe without turning a still-tunable datapoint into a release headline.
+> **v7x-16 benchmark template.** Fixed-length random requests (ISL=1024, OSL=1024), `max_concurrency=128`, 384 prompts, `random_range_ratio=1`, `seed=42`, and no warmup requests.
 
 **Test Environment**
 
@@ -247,7 +247,6 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -m sgl_jax.launch_server \
   --page-size 128 \
   --max-running-requests 128 \
   --attention-backend fa \
-  --disable-radix-cache \
   --dp-schedule-policy round_robin \
   --skip-server-warmup \
   --nnodes 4 --node-rank ${NODE_RANK} \
@@ -272,10 +271,6 @@ PYTHONPATH=/tmp/sglang-jax/python python -m sgl_jax.bench_serving \
   --seed 42 \
   --warmup-requests 0
 ```
-
-**Published Results**
-
-Throughput numbers are intentionally omitted from this recipe for now. Use the command above to validate local deployments; publish a result row only after the configuration is tuned enough to be representative of the release target.
 
 ## Additional Resources
 

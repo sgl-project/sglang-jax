@@ -78,7 +78,7 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python3 -u -m sgl_jax.launch_server \
 - `--max-running-requests 256` is the concurrent decode cap. Throughput plateaus around this; raising further mainly increases queue depth.
 
 **Prefix Caching:**
-- `--disable-radix-cache` disables RadixAttention prefix caching. Set this **only for benchmarks** that compare against engines without prefix caching (so measurements are apples-to-apples). For production, leave it off (default) — it gives a free latency win on repeated prefixes.
+- RadixAttention prefix caching is enabled by default. Keep it on for regular serving so repeated prefixes can benefit from cache reuse.
 
 **Compilation Cache Hygiene:**
 - `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache` is mandatory — without it, first request blocks ~4 min while XLA/Pallas re-compiles.
@@ -350,7 +350,7 @@ evalscope eval \
 
 #### High-throughput v7x-4 result (Qwen3-8B)
 
-> This cookbook row uses fixed-length random requests (ISL=1024, OSL=1024), `max_concurrency=128`, 384 prompts, `random_range_ratio=1`, `seed=42`, and no warmup requests. Radix cache is disabled and DP scheduling uses `round_robin`, so the result is throughput-oriented and not prefix-cache dependent.
+> This cookbook row uses fixed-length random requests (ISL=1024, OSL=1024), `max_concurrency=128`, 384 prompts, `random_range_ratio=1`, `seed=42`, and no warmup requests. DP scheduling uses `round_robin`.
 
 **Test Environment**
 
@@ -375,7 +375,6 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -m sgl_jax.launch_server \
   --mem-fraction-static 0.90 \
   --page-size 128 \
   --max-running-requests 256 \
-  --disable-radix-cache \
   --dp-schedule-policy round_robin \
   --skip-server-warmup \
   --host 0.0.0.0 --port 30000
@@ -418,7 +417,7 @@ PYTHONPATH=/tmp/sglang-jax/python python -m sgl_jax.bench_serving \
 
 Methodology: TTFT measured at `output_len=1` to isolate first-token latency; ITL / throughput measured at `output_len=1024`. Workload sweeps input lengths 1024 / 4096 / 8192 tokens × output lengths 1 / 1024 tokens × concurrency 8 / 16 / 32 / 64 / 128 / 256.
 
-**Deployment Command** — same as [§2.3 Single-host](/autoregressive/Qwen/Qwen3#2-3-launch) for the SGL-JAX side, with `--disable-radix-cache` added to keep apples-to-apples comparison with vLLM (which doesn't use prefix caching in this run). For the vLLM baseline:
+**Deployment Command** — same as [§2.3 Single-host](/autoregressive/Qwen/Qwen3#2-3-launch) for the SGL-JAX side. For the vLLM baseline:
 
 ```bash
 MODEL_NAME="Qwen/Qwen3-8B"  # or "Qwen/Qwen3-32B"

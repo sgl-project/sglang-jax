@@ -4,7 +4,7 @@ title: "Grok-2"
 
 # Grok-2 on SGL-JAX
 
-> **Validated recipe** — TPU v6e-64 path validated on sglang-jax 0.1.0: server starts and sanity output is correct. **Throughput numbers are intentionally omitted** until the Grok-2 TPU recipe has a release-quality performance datapoint. **Accuracy intentionally omitted** — Grok-2 is a base model (no chat template; see §1) and the cookbook follows design §6.F: base model recipes skip §4.1 Accuracy (chat-format datasets via `/v1/chat/completions` mis-extract on base models — see §3.1 for the underlying chat-template + evalscope-extractor interaction). **Cookbook used `--moe-backend epmoe`** because the fused MoE backend fails to init on this small-EP large-mesh layout (8 experts on 64 chips) (see §2.4). **Grok-2 architecture**: `config.json` declares `num_local_experts=8 num_experts_per_tok=2` under `Grok1ForCausalLM` — i.e. **MoE with 8 experts, 2 active per token** (not dense). Launch flags below assume MoE (`--ep-size 8 --moe-backend epmoe`).
+> **Validated recipe** — TPU v6e-64 path validated on sglang-jax 0.1.0: server starts and sanity output is correct. **Accuracy intentionally omitted** — Grok-2 is a base model (no chat template; see §1) and the cookbook follows design §6.F: base model recipes skip §4.1 Accuracy (chat-format datasets via `/v1/chat/completions` mis-extract on base models — see §3.1 for the underlying chat-template + evalscope-extractor interaction). **Cookbook used `--moe-backend epmoe`** because the fused MoE backend fails to init on this small-EP large-mesh layout (8 experts on 64 chips) (see §2.4). **Grok-2 architecture**: `config.json` declares `num_local_experts=8 num_experts_per_tok=2` under `Grok1ForCausalLM` — i.e. **MoE with 8 experts, 2 active per token** (not dense). Launch flags below assume MoE (`--ep-size 8 --moe-backend epmoe`).
 
 ## 1. Model Introduction
 
@@ -143,8 +143,6 @@ print(resp.choices[0].text)
 
 ## 4. Benchmark
 
-> Throughput results are not published in this recipe yet. Keep this page as a working launch recipe and benchmark template until the Grok-2 TPU path has a representative release-quality performance row.
->
 > Accuracy section is omitted by design — see the banner + §1 for why base models skip it (per design §6.F).
 
 ### 4.1 Speed Template
@@ -177,10 +175,6 @@ PYTHONPATH=/tmp/sglang-jax/python python -m sgl_jax.bench_serving \
   --seed 42 \
   --warmup-requests 0
 ```
-
-**Published Results**
-
-No throughput result is published for Grok-2 in this recipe yet. The current limitation is the small-EP MoE layout: with only 8 experts, the validated `--moe-backend epmoe` path underutilizes large TPU meshes, while the fused backend is not yet a validated replacement for this layout. Publish numbers only after a tuned v7x or smaller-mesh configuration produces a representative result.
 
 ## Additional Resources
 

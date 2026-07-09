@@ -458,7 +458,7 @@ evalscope eval \
 
 ### 4.3 Speed
 
-> **High-throughput v7x-16 row.** This cookbook row uses fixed-length random requests (ISL=1024, OSL=1024), `max_concurrency=128`, 384 prompts, `random_range_ratio=1`, `seed=42`, and no warmup requests. Radix cache is disabled and DP scheduling uses `round_robin`, so the result is throughput-oriented and not prefix-cache dependent. Do **not** set `--reasoning-parser mimo` for raw throughput benchmarks; the parser adds per-token CPU work that distorts token rates.
+> **High-throughput v7x-16 row.** This cookbook row uses fixed-length random requests (ISL=1024, OSL=1024), `max_concurrency=128`, 384 prompts, `random_range_ratio=1`, `seed=42`, and no warmup requests. DP scheduling uses `round_robin`. Do **not** set `--reasoning-parser mimo` for raw throughput benchmarks; the parser adds per-token CPU work that distorts token rates.
 
 **Test Environment**
 
@@ -487,7 +487,6 @@ JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -m sgl_jax.launch_server \
   --page-size 256 \
   --max-running-requests 256 \
   --attention-backend fa \
-  --disable-radix-cache \
   --dp-schedule-policy round_robin \
   --skip-server-warmup \
   --nnodes 4 --node-rank ${NODE_RANK} \
