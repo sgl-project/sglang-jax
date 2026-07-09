@@ -138,9 +138,7 @@ def tune_one(T, E, G, Gtop, k, *, tries, vmem_frac, interpret, cap_bytes):
             oom = ("RESOURCE_EXHAUSTED" in msg) or ("vmem" in msg.lower())
             print(f"{bt:>6} {est/2**20:8.1f}M {('OOM-skip' if oom else 'FAIL'):>9} {'-':>10}")
             continue
-        ms = min(
-            _trace_ms(lambda: fn(logits, bias), tag=f"t{T}_e{E}_bt{bt}") for _ in range(tries)
-        )
+        ms = min(_trace_ms(lambda: fn(logits, bias), tag=f"t{T}_e{E}_bt{bt}") for _ in range(tries))
         print(f"{bt:>6} {est/2**20:8.1f}M {'ok':>9} {ms*1e3:9.2f}u")
         rows.append((bt, ms))
     if not rows:

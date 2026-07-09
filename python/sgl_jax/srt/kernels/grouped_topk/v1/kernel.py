@@ -41,6 +41,7 @@ _I32_MIN = jnp.iinfo(jnp.int32).min
 # path never tiles above this without warning.
 SAFE_AUTO_BT = 2048
 
+
 def _largest_safe_divisor(bs: int, cap: int = SAFE_AUTO_BT, align: int = 128) -> int | None:
     """Largest d dividing bs with d <= cap and d % align == 0, else None.
 
