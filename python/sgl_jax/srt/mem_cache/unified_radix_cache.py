@@ -570,15 +570,19 @@ class UnifiedRadixCache(BasePrefixCache):
         best_host_node = node
         best_host_tokens = 0
         cur_tokens = 0
-        # Device coverage must stay a contiguous prefix from root. Once a
-        # tombstone breaks the chain, device-best freezes — otherwise a deeper
-        # still-resident node under an evicted ancestor breaks inc_lock_ref.
+        # Device coverage must stay a contiguous BASE prefix from root: past a
+        # tombstone (FULL KV evicted), a deeper still-resident node would break
+        # inc_lock_ref, so only a BASE miss freezes device-best. Auxiliary
+        # components hold no value on interior nodes by design (leaf-only
+        # recurrent snapshots), so their misses skip the node — a deeper
+        # fully-valid node can still win.
         device_broken = False
 
+        base_device_validator = self.components[BASE_COMPONENT_TYPE].create_match_validator(
+            match_device_only=True
+        )
         if full_only:
-            device_validators = (
-                self.components[BASE_COMPONENT_TYPE].create_match_validator(match_device_only=True),
-            )
+            device_validators = (base_device_validator,)
             host_validators = ()
         else:
             device_validators = tuple(
@@ -593,12 +597,12 @@ class UnifiedRadixCache(BasePrefixCache):
         def _update_best_if_valid(candidate: UnifiedTreeNode):
             nonlocal best_device_node, best_value_len, best_device_tokens
             nonlocal best_host_node, best_host_tokens, device_broken
+            if not base_device_validator(candidate):
+                device_broken = True
             if not device_broken and all(v(candidate) for v in device_validators):
                 best_device_node = candidate
                 best_value_len = len(value)
                 best_device_tokens = cur_tokens
-            else:
-                device_broken = True
             if all(v(candidate) for v in host_validators):
                 best_host_node = candidate
                 best_host_tokens = cur_tokens
