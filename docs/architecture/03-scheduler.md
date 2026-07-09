@@ -80,7 +80,7 @@ The `Scheduler` class inherits from three mixins:
 | `grammar_queue` | `list[Req]` | Asynchronous grammar compilation queue |
 | `aborted_reqs` | `dict[str, Req]` | Aborted requests (Request ID → Req mapping) |
 | `dp_size` | `int` | Number of Data Parallel ranks |
-| `dp_schedule_policy` | `str` | Policy for assigning new requests to DP ranks |
+| `dp_schedule_policy` | `str` | Policy for assigning new requests to DP ranks; auto-derived at startup when unset |
 
 ---
 
@@ -236,13 +236,14 @@ The `DFS_WEIGHT` policy traverses the Radix Tree, computing the number of waitin
 
 ### Data Parallel Request Assignment
 
-Data Parallel does not change the number of Scheduler processes. After receiving a new request, the Scheduler assigns `Req.dp_rank`, after which all batch construction, KV Cache allocation, and Attention Metadata are partitioned by DP rank. Three DP assignment policies are currently supported:
+Data Parallel does not change the number of Scheduler processes. After receiving a new request, the Scheduler assigns `Req.dp_rank`, after which all batch construction, KV Cache allocation, and Attention Metadata are partitioned by DP rank. If `--dp-schedule-policy` is unset, startup chooses `cache_aware` when radix cache is enabled and `min_running_queue` when `--disable-radix-cache` is set or Pathways PD is enabled. Explicit policy values remain available for tuning and debugging:
 
 | `dp_schedule_policy` | Description |
 |---|---|
-| `min_running_queue` | Picks the DP rank with the fewest currently running requests |
+| `cache_aware` | Prefers eligible DP ranks that hold a substantial reusable radix-cache prefix, preserves large-load-skew balancing, and uses shape-aware selection on cache misses |
+| `shape_aware` | Balances input/prefill and output/decode token load separately by minimizing the post-admission bottleneck dimension |
+| `min_running_queue` | Picks the DP rank with the fewest currently running requests, then scheduled tokens |
 | `round_robin` | Rotates new requests across ranks |
-| `cache_aware` | Prefer ranks with a substantial cached prefix while falling back to load balancing under skew |
 
 `waiting_queue` is still a Scheduler-level queue, but each `Req` already carries a target `dp_rank`. When constructing batches, `ScheduleBatch.reqs_info` keeps a `ScheduleReqsInfo` per rank, containing that rank's `reqs`, `chunked_req`, `input_ids`, `req_pool_indices`, `seq_lens`, and `out_cache_loc`; `per_dp_bs_size` records each rank's padded batch size, used by the execution side to construct DP-uniform inputs.
 

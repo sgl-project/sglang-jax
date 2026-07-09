@@ -67,8 +67,12 @@ def pick_cache_aware_dp(
     token_counts: list[int],
     matches: dict[int, int],
     prompt_len: int,
+    input_counts: list[int],
+    output_counts: list[int],
+    item_input: int = 0,
+    item_output: int = 0,
 ) -> int | None:
-    """Cache-affinity DP policy with soft load balancing.
+    """Cache-affinity DP policy with shape-aware miss fallback.
 
     1. If the load skew across eligible ranks is large
        (``max-min > BALANCE_ABS`` and ``max > min*BALANCE_REL``), ignore cache
@@ -76,10 +80,11 @@ def pick_cache_aware_dp(
     2. Otherwise route to the least-loaded rank among the *holders* -- ranks whose
        cached prefix covers more than ``CACHE_THRESHOLD`` of the prompt -- so a hot
        prefix spreads across all its holders by load.
-    3. No holders (or no usable ``prompt_len``) -> least-loaded rank.
+    3. No holders (or no usable ``prompt_len``) -> shape-aware fallback.
 
-    Load order is ``(running, tokens, rank)``. Eligibility (the per-rank admission
-    cap) is decided by the caller; this only chooses among eligible ranks.
+    Holder and large-skew load order is ``(running, tokens, rank)``. Eligibility
+    (the per-rank admission cap) is decided by the caller; this only chooses among
+    eligible ranks.
     """
     if not eligible:
         return None
@@ -97,7 +102,7 @@ def pick_cache_aware_dp(
         if holders:
             return least_loaded(holders)
 
-    return least_loaded(eligible)
+    return pick_shape_aware_dp(eligible, input_counts, output_counts, item_input, item_output)
 
 
 def pick_shape_aware_dp(

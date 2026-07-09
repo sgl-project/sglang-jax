@@ -48,9 +48,18 @@ For reusable Docker, GKE, and SkyPilot launchers, see [Deployment](../deployment
 |---|---|
 | `--model-path`, `--model` | Local path or Hugging Face repo id for the model weights. |
 | `--tokenizer-path` | Override the tokenizer location when it differs from the model path. |
+| `--tokenizer-mode` | Select `auto` fast-tokenizer usage or force `slow` tokenization. |
+| `--tokenizer-backend` | Select the tokenizer implementation, such as Hugging Face or `fastokens`. |
+| `--skip-tokenizer-init` | Skip tokenizer initialization; requests must provide `input_ids`. |
+| `--load-format` | Select checkpoint loading format, such as `auto`, `safetensors`, `dummy`, `gguf`, or `layered`. |
+| `--model-loader-extra-config` | Pass load-format-specific JSON config through to the selected model loader. |
 | `--trust-remote-code` | Allow model-specific code from the model repository. Common for Qwen-derived and MiMo recipes. |
 | `--context-length` | Override the model context length from config. |
+| `--max-seq-len` | Alias for setting the maximum model sequence length. |
+| `--is-embedding` | Serve a CausalLM as an embedding model. |
 | `--revision` | Pin a branch, tag, or commit for model loading. |
+| `--model-impl` | Select SGLang-native, Transformers, or automatic model implementation. |
+| `--model-layer-nums` | Load only the first N model layers, mainly for profiling or bring-up. |
 | `--json-model-override-args` | Patch selected model config fields, such as `architectures`, before loading. |
 | `--multimodal` | Use the multimodal server argument class and multimodal HTTP entrypoint. |
 
@@ -65,6 +74,16 @@ For reusable Docker, GKE, and SkyPilot launchers, see [Deployment](../deployment
 | `--stream-interval` | Control token interval for streaming responses. |
 | `--stream-output` | Return output as disjoint streamed segments. |
 | `--grammar-backend` | Select the backend for structured output constraints. |
+| `--constrained-json-whitespace-pattern` | Customize allowed JSON whitespace for llguidance constrained decoding. |
+| `--constrained-json-disable-any-whitespace` | Force compact JSON output for llguidance constrained decoding. |
+| `--api-key` | Require an API key for the OpenAI-compatible server. |
+| `--served-model-name` | Override the model name returned by `/v1/models`. |
+| `--file-storage-path` | Backend storage path for uploaded files. |
+| `--reasoning-parser` | Parse reasoning-model outputs with a supported detector. |
+| `--tool-call-parser` | Parse tool-call outputs for OpenAI-compatible function/tool calling. |
+| `--preferred-sampling-params` | JSON sampling defaults returned by `/get_model_info`. |
+| `--allow-auto-truncate` | Truncate over-length requests instead of returning an error. |
+| `--enable-tokenizer-batch-encode` | Batch tokenization for multi-text requests when inputs are not multimodal or pre-tokenized. |
 
 ## Precision, Quantization, and Dtype
 
@@ -85,7 +104,9 @@ For reusable Docker, GKE, and SkyPilot launchers, see [Deployment](../deployment
 |---|---|
 | `--tensor-parallel-size`, `--tp-size` | Total tensor-parallel JAX devices. |
 | `--data-parallel-size`, `--dp-size` | Data parallelism factor for supported execution paths. |
+| `--dp-schedule-policy` | DP rank assignment policy. If unset, radix-cache serving uses `cache_aware`; `--disable-radix-cache` and Pathways PD use `min_running_queue`. Explicit choices are `cache_aware`, `shape_aware`, `min_running_queue`, and `round_robin`; use non-default choices as workload-specific tuning overrides. |
 | `--ep-size` | Expert parallelism size for MoE models. |
+| `--ep-num-redundant-experts` | Add redundant physical experts for EP load balancing. |
 | `--ep-dispatch-algorithm` | Expert dispatch algorithm: `static`, `dynamic`, or `fake`. |
 | `--enable-sequence-parallel` | Enable sequence parallelism. |
 | `--nnodes` | Number of serving nodes. |
@@ -103,16 +124,45 @@ For TPU topology math, see the cookbook `base/tpu-topology-reference.md` page.
 | `--max-running-requests` | Maximum number of active decode requests. |
 | `--max-total-tokens` | Explicit token pool size; normally derived from memory limits. |
 | `--chunked-prefill-size` | Prefill chunk size. `-1` disables chunked prefill. |
+| `--enable-mixed-chunk` | Allow prefill and decode requests to share a batch when chunked prefill is enabled. |
 | `--max-prefill-tokens` | Maximum prefill tokens admitted into a batch. |
 | `--disable-overlap-schedule` | Disable scheduler/model-worker overlap. |
 | `--schedule-policy` | Request scheduling policy. |
 | `--schedule-conservativeness` | How conservatively the scheduler admits requests. |
 | `--page-size` | KV page size. |
 | `--swa-full-tokens-ratio` | Sliding-window/full-attention KV token ratio for hybrid attention models. |
-| `--disable-radix-cache` | Disable prefix cache reuse. |
+| `--recurrent-state-memory-ratio` | Recurrent-state memory budget ratio for hybrid recurrent models such as Kimi-Linear. |
+| `--max-recurrent-state-size` | Explicit total recurrent-state slot count across DP ranks. |
+| `--disable-hybrid-swa-memory` | Disable the hybrid sliding-window/full-attention memory optimization. |
+| `--disable-radix-cache` | Disable prefix cache reuse. This also makes the unset DP schedule policy resolve to `min_running_queue`; Pathways PD follows the same default because it uses chunk cache internally. |
 | `--enable-unified-radix-tree` | Use unified radix tree mode. |
+| `--hicache-storage` | Enable HiCache host KV offload with `none`, keep it off with `disable`, or reserve `file` for future file-backed storage. |
+| `--hicache-ratio` | Size the HiCache host pool relative to the device KV pool. |
+| `--hicache-write-through-threshold` | Minimum prefix hit count before backing a node up to host memory. |
+| `--hicache-write-policy` | Select HiCache write-through, selective write-through, or write-back behavior. |
 
 For deeper scheduler behavior, see [Scheduler](../architecture/03-scheduler.md) and [KV Cache](../architecture/07-kv-cache.md).
+
+## Runtime, Logging, and Metrics
+
+| Argument | Purpose |
+|---|---|
+| `--device` | Select the serving device, or leave unset for auto-detection. |
+| `--device-indexes` | Restrict mesh construction to specific local device indexes. |
+| `--random-seed` | Seed used by server-side sampling paths. |
+| `--download-dir` | Hugging Face model download/cache directory. |
+| `--sleep-on-idle` | Lower CPU usage while the server is idle. |
+| `--watchdog-timeout` | Crash the server if a forward batch hangs beyond the timeout. |
+| `--log-level`, `--log-level-http` | Control application and HTTP server logging verbosity. |
+| `--log-requests`, `--log-requests-level` | Log request metadata and optionally sampling parameters or payloads. |
+| `--crash-dump-folder` | Dump recent requests to a directory before crash handling. |
+| `--enable-metrics` | Enable Prometheus metrics. |
+| `--enable-metrics-for-all-schedulers` | Record scheduler metrics for all TP ranks instead of TP rank 0 only. |
+| `--bucket-time-to-first-token`, `--bucket-inter-token-latency`, `--bucket-e2e-request-latency` | Customize latency histogram buckets for metrics. |
+| `--decode-log-interval` | Control the decode-batch logging interval. |
+| `--enable-request-time-stats-logging` | Emit per-request timing statistics in logs. |
+| `--kv-events-config` | Enable NVIDIA Dynamo KV event publishing from a JSON config. |
+| `--enable-cache-report` | Include cached-token counts in OpenAI-compatible usage details. |
 
 ## JIT and Kernel Backends
 

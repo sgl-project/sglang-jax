@@ -868,13 +868,15 @@ class Scheduler(
         req: TokenizedGenerateReqInput,
         extra_counts: list[int],
         extra_token_counts: list[int],
+        extra_input_counts: list[int],
+        extra_output_counts: list[int],
     ) -> int | None:
-        """Route ``req`` by cache affinity with soft load balancing.
+        """Route ``req`` by cache affinity with shape-aware miss fallback.
 
         Probes each eligible rank's cached prefix length, then defers to
         ``pick_cache_aware_dp``: balance on large load skew, else least-loaded
-        among the ranks holding a substantial cached prefix. Returns None if all
-        DP ranks are full.
+        among the ranks holding a substantial cached prefix, else shape-aware
+        selection. Returns None if all DP ranks are full.
         """
         if self.dp_size == 1:
             return 0
@@ -892,7 +894,22 @@ class Scheduler(
             for dp_rank in eligible:
                 matches[dp_rank] = self._cached_prefix_len(token_ids, extra_key, dp_rank)
 
-        return pick_cache_aware_dp(eligible, counts, token_counts, matches, prompt_len)
+        running_input, running_output = self._get_dp_io_snapshot()
+        input_counts = [running_input[i] + extra_input_counts[i] for i in range(self.dp_size)]
+        output_counts = [running_output[i] + extra_output_counts[i] for i in range(self.dp_size)]
+        item_input, item_output = self._estimate_req_input_output_tokens(req)
+
+        return pick_cache_aware_dp(
+            eligible,
+            counts,
+            token_counts,
+            matches,
+            prompt_len,
+            input_counts,
+            output_counts,
+            item_input,
+            item_output,
+        )
 
     def _get_dp_io_snapshot(self) -> tuple[list[int], list[int]]:
         """Return per-DP (input_tokens, output_tokens) for in-flight scheduled work.
