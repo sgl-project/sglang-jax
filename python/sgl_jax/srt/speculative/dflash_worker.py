@@ -730,7 +730,154 @@ class DFlashWorker:
     # Precompile hook (scheduler calls this at startup)
     # ------------------------------------------------------------------ #
     def run_spec_decode_precompile(self):
-        # Minimal bring-up: rely on the first real batch to trigger compilation.
-        # A dedicated precompile sweep over bs paddings can be added once the
-        # single-batch path is validated on TPU.
-        logger.info("[DFLASH] run_spec_decode_precompile: deferred to first batch.")
+        import time
+
+        self.target_worker.run_precompile()
+
+        pps_buckets = self._compute_pps_buckets()
+        bs = self.target_worker.compilation_manager.max_padded_batch_size
+
+        start = time.perf_counter()
+        logger.info(
+            "[DFLASH] Precompiling TARGET_VERIFY: bs=%d, pps_buckets=%s",
+            bs,
+            pps_buckets,
+        )
+
+        for pps in pps_buckets:
+            t0 = time.perf_counter()
+            self._precompile_verify(bs, pps, target=True)
+            logger.info(
+                "[DFLASH] Target verify pps=%d compiled in %.1f secs",
+                pps,
+                time.perf_counter() - t0,
+            )
+            t0 = time.perf_counter()
+            self._precompile_verify(bs, pps, target=False)
+            logger.info(
+                "[DFLASH] Draft verify pps=%d compiled in %.1f secs",
+                pps,
+                time.perf_counter() - t0,
+            )
+
+        logger.info(
+            "[DFLASH] TARGET_VERIFY precompile finished in %.0f secs",
+            time.perf_counter() - start,
+        )
+
+    def _compute_pps_buckets(self) -> list[int]:
+        max_pps = (self.target_worker.max_req_len + self.page_size - 1) // self.page_size
+        buckets = []
+        pps = 16
+        while pps <= max_pps:
+            buckets.append(pps)
+            pps *= 2
+        if not buckets:
+            buckets.append(16)
+        final_bucket = max(16, 1 << max(0, (max_pps - 1)).bit_length())
+        if buckets[-1] < final_bucket:
+            buckets.append(final_bucket)
+        return buckets
+
+    def _precompile_verify(self, bs: int, pps: int, target: bool):
+        from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+
+        mwb = self._make_verify_dummy_batch(bs, pps, is_draft=not target)
+
+        if target:
+            forward_metadata = (
+                self.target_worker.model_runner.attn_backend.get_eagle_forward_metadata(mwb)
+            )
+            self.target_worker.forward_batch_generation(
+                mwb, skip_sample=True, forward_metadata=forward_metadata,
+            )
+        else:
+            from jax.sharding import NamedSharding, PartitionSpec as P
+
+            forward_batch = ForwardBatch.init_new(mwb, self.draft_model_runner)
+            forward_batch.forward_mode = ForwardMode.TARGET_VERIFY
+            num_tokens = bs * self.block_size
+            hidden_size = self.draft_model_runner.model_config.hidden_size
+            forward_batch.input_embedding = jnp.zeros(
+                (num_tokens, hidden_size),
+                dtype=jnp.bfloat16 if self.server_args.dtype == "bfloat16" else jnp.float32,
+            )
+            metadata = self.draft_model_runner.attn_backend.get_eagle_forward_metadata(mwb)
+            self.draft_model_runner.attn_backend.forward_metadata = metadata
+            self.draft_model_runner.forward(forward_batch, None)
+
+    def _make_verify_dummy_batch(
+        self, bs: int, pps: int, is_draft: bool = False
+    ) -> ModelWorkerBatch:
+        from sgl_jax.srt.managers.schedule_batch import ModelWorkerSamplingInfo
+
+        block_size = self.block_size
+        num_tokens = bs * block_size
+        prefix_len = max(0, pps - block_size)
+
+        input_ids = np.ones(num_tokens, dtype=np.int32)
+        positions = np.tile(
+            np.arange(prefix_len, prefix_len + block_size, dtype=np.int32), bs
+        )
+        out_cache_loc = np.arange(1, num_tokens + 1, dtype=np.int32)
+        cache_loc = np.zeros(bs * pps, dtype=np.int32)
+        seq_lens = np.full(bs, prefix_len, dtype=np.int32)
+
+        sampling_info = ModelWorkerSamplingInfo.generate_for_precompile_all_greedy(
+            bs, self.target_worker.model_runner.model_config.vocab_size,
+        )
+        sampling_info.vocab_mask = None
+
+        if is_draft:
+            prefix_cache_loc = jnp.zeros((bs, pps), dtype=jnp.int32)
+            prefix_lens_arr = jnp.full((bs,), prefix_len, dtype=jnp.int32)
+            verify_input = DFlashVerifyInput(
+                draft_token=jnp.ones(num_tokens, dtype=jnp.int32),
+                positions=jnp.asarray(positions),
+                draft_token_num=block_size,
+                capture_hidden_mode=CaptureHiddenMode.NULL,
+                prefix_cache_loc=prefix_cache_loc,
+                prefix_lens=prefix_lens_arr,
+                dense_draft=True,
+            )
+            capture_hidden = CaptureHiddenMode.NULL
+        else:
+            verify_input = DFlashVerifyInput(
+                draft_token=jnp.ones(num_tokens, dtype=jnp.int32),
+                positions=jnp.asarray(positions),
+                draft_token_num=block_size,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
+            )
+            capture_hidden = CaptureHiddenMode.FULL
+
+        return ModelWorkerBatch(
+            bid=1,
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            input_ids=input_ids,
+            real_input_ids_len=num_tokens,
+            real_bs=bs,
+            req_pool_indices=np.arange(bs, dtype=np.int32),
+            seq_lens=seq_lens,
+            out_cache_loc=out_cache_loc,
+            return_logprob=False,
+            return_output_logprob_only=False,
+            sampling_info=sampling_info,
+            extend_input_logprob_token_ids=None,
+            positions=positions,
+            cache_loc=cache_loc,
+            extend_prefix_lens=None,
+            extend_seq_lens=None,
+            top_logprobs_nums=None,
+            token_ids_logprobs=None,
+            extend_logprob_start_lens=None,
+            logits_indices=None,
+            input_logprob_indices=None,
+            capture_hidden_mode=capture_hidden,
+            spec_algorithm=SpeculativeAlgorithm.DFLASH,
+            lora_ids=["0"] * bs,
+            dp_size=1,
+            per_dp_bs_size=bs,
+            real_bs_per_dp=[bs],
+            logits_indices_selector=np.arange(bs, dtype=np.int32),
+            spec_info_padded=verify_input,
+        )
