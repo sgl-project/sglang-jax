@@ -690,7 +690,7 @@ class FlashAttention(AttentionBackend):
             ik_cast = ik_new_l[:, 0].astype(ik_buf_l.dtype)
             # 1. write new index_k into ik_buf (per-DP local page addressing).
             # Prefill: sort the flat index so XLA emits a sorted+unique scatter
-            # (v7x: 1065→367us/layer, ×57=37ms). Decode bs is small and idx is
+            # (v7x: 1070→259us/layer, ×57=14.8ms). Decode bs is small and idx is
             # already scattered across pages — plain .at[].set is faster there.
             if is_decode:
                 ik_buf_upd = ik_buf_l.at[q_page, slot_in_page, 0].set(ik_cast)
