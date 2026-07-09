@@ -91,6 +91,69 @@ class TestVerifyTree(CustomTestCase):
         self.assertFalse(self._decode_loop_policy(env="0"))
         self.assertTrue(self._decode_loop_policy(mode="batched", env="1"))
 
+    def test_decode_loop_policy_warns_once_for_step3p5_auto_fallback(self):
+        from sgl_jax.srt.speculative import draft_extend_fused
+        from sgl_jax.srt.speculative.draft_extend_fused import (
+            _should_use_decode_loop_target_verify,
+        )
+        from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        spec_worker = SimpleNamespace(
+            server_args=SimpleNamespace(speculative_target_verify_mode="auto"),
+            speculative_algorithm=SpeculativeAlgorithm.NEXTN,
+            target_worker=SimpleNamespace(
+                model_config=SimpleNamespace(
+                    hf_config=SimpleNamespace(
+                        model_type="step3p5",
+                        architectures=["Step3p5ForCausalLM"],
+                    )
+                )
+            ),
+        )
+        draft_worker = SimpleNamespace(topk=1)
+        batch = SimpleNamespace(spec_algorithm=SpeculativeAlgorithm.NEXTN)
+
+        with (
+            patch.dict("os.environ", {}, clear=False),
+            patch.object(draft_extend_fused.logger, "warning") as warning,
+        ):
+            os.environ.pop("SGL_JAX_STEP3P5_DECODE_LOOP_VERIFY_WARNED", None)
+            self.assertTrue(
+                _should_use_decode_loop_target_verify(
+                    spec_worker=spec_worker,
+                    draft_worker=draft_worker,
+                    model_worker_batch=batch,
+                    is_greedy=True,
+                    use_relay_state=False,
+                )
+            )
+            self.assertTrue(
+                _should_use_decode_loop_target_verify(
+                    spec_worker=spec_worker,
+                    draft_worker=draft_worker,
+                    model_worker_batch=batch,
+                    is_greedy=True,
+                    use_relay_state=False,
+                )
+            )
+
+        self.assertEqual(warning.call_count, 1)
+        self.assertIn("correctness-preserving decode-loop verify", warning.call_args.args[0])
+
+    def test_host_array_for_decode_loop_raises_transfer_errors(self):
+        from sgl_jax.srt.speculative.draft_extend_fused import (
+            _host_array_for_decode_loop,
+        )
+
+        class BadArray:
+            is_fully_addressable = True
+
+            def __array__(self, dtype=None):
+                raise RuntimeError("host transfer failed")
+
+        with self.assertRaisesRegex(RuntimeError, "host transfer failed"):
+            _host_array_for_decode_loop(BadArray())
+
     def test_server_args_exposes_speculative_target_verify_mode(self):
         from sgl_jax.srt.server_args import ServerArgs
 

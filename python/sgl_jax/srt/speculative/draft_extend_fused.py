@@ -28,20 +28,25 @@ logger = logging.getLogger(__name__)
 
 _TARGET_VERIFY_DECODE_LOOP_ENV = "SGL_JAX_TARGET_VERIFY_DECODE_LOOP"
 _TARGET_VERIFY_MODES = {"auto", "batched", "decode-loop"}
+_STEP3P5_DECODE_LOOP_WARNED_ENV = "SGL_JAX_STEP3P5_DECODE_LOOP_VERIFY_WARNED"
+
+
+def _host_array_for_decode_loop(value):
+    if value is None:
+        return None
+    if isinstance(value, jax.Array) and not getattr(value, "is_fully_addressable", True):
+        if getattr(value, "is_fully_replicated", False):
+            value = value.addressable_data(0)
+        else:
+            from jax.experimental.multihost_utils import process_allgather
+
+            value = process_allgather(value, tiled=True)
+    return np.asarray(jax.device_get(value))
 
 
 def _debug_host_array(value, limit: int | None = 8):
-    if value is None:
-        return None
     try:
-        if isinstance(value, jax.Array) and not getattr(value, "is_fully_addressable", True):
-            if getattr(value, "is_fully_replicated", False):
-                value = value.addressable_data(0)
-            else:
-                from jax.experimental.multihost_utils import process_allgather
-
-                value = process_allgather(value, tiled=True)
-        arr = np.asarray(jax.device_get(value))
+        arr = _host_array_for_decode_loop(value)
         return arr if limit is None else arr[:limit]
     except Exception as exc:  # pragma: no cover - debug-only path
         return f"<unavailable: {type(exc).__name__}: {exc}>"
@@ -124,6 +129,19 @@ def _is_step3p5_target_model(spec_worker) -> bool:
     return "Step3p5ForCausalLM" in architectures
 
 
+def _warn_step3p5_decode_loop_once():
+    if os.environ.get(_STEP3P5_DECODE_LOOP_WARNED_ENV) == "1":
+        return
+    os.environ[_STEP3P5_DECODE_LOOP_WARNED_ENV] = "1"
+    logger.warning(
+        "Step3p5 NEXTN greedy decoding is using correctness-preserving "
+        "decode-loop verify in auto mode. This path preserves greedy "
+        "equivalence but is slower than batched verify; use "
+        "--speculative-target-verify-mode=batched only for performance "
+        "experiments that can tolerate the known Step3p5 correctness risk."
+    )
+
+
 def _should_use_decode_loop_target_verify(
     *,
     spec_worker,
@@ -146,7 +164,10 @@ def _should_use_decode_loop_target_verify(
     )
     if mode == "decode-loop":
         return supported
-    return supported and _is_step3p5_target_model(spec_worker)
+    use_step3p5_fallback = supported and _is_step3p5_target_model(spec_worker)
+    if use_step3p5_fallback:
+        _warn_step3p5_decode_loop_once()
+    return use_step3p5_fallback
 
 
 @contextmanager
@@ -1978,8 +1999,8 @@ def _decode_loop_target_verify(
     dp_size = model_worker_batch.dp_size
     per_dp_bs = model_worker_batch.per_dp_bs_size if dp_size > 1 else bs
 
-    prev_verified_host = _debug_host_array(previous_verified_id, limit=None).astype(np.int32)
-    prev_tokens_host = _debug_host_array(previous_token_list, limit=None).astype(np.int32)
+    prev_verified_host = _host_array_for_decode_loop(previous_verified_id).astype(np.int32)
+    prev_tokens_host = _host_array_for_decode_loop(previous_token_list).astype(np.int32)
     seq_lens_base = np.asarray(model_worker_batch.seq_lens, dtype=np.int32)
     valid = seq_lens_base > 0
     draft_tokens_2d = np.concatenate(
