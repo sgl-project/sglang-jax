@@ -125,7 +125,7 @@ class Qwen2_5_VisionPatchEmbed(nnx.Module):
 
     def __call__(self, x: jax.Array) -> jax.Array:
         # x is (dp, seq_len, C * T * H * W) -- dp-leading batched;
-        # seq_len == the per-image patch count (== patch_k in the plan).
+        # seq_len == the per-request packed patch count (== patch_k in the plan).
         dp, seq_len, dim = x.shape
         C = dim // (self.temporal_patch_size * self.patch_size * self.patch_size)
         x = x.reshape(
@@ -469,6 +469,7 @@ class Qwen2_5_VisionTransformer(nnx.Module):
             meta.window_index,
             meta.cu_window_seqlens,
             meta.rotary_pos_emb,
+            meta.cu_image_seqlens,
             valid,
         )
 
@@ -478,6 +479,7 @@ class Qwen2_5_VisionTransformer(nnx.Module):
         window_index: jax.Array,
         cu_window_seqlens: jax.Array,
         rotary_pos_emb: jax.Array,
+        cu_image_seqlens: jax.Array,
         valid: jax.Array | None = None,
     ) -> jax.Array:
         """Run the dp-leading ViT encode body."""
@@ -493,21 +495,17 @@ class Qwen2_5_VisionTransformer(nnx.Module):
         hidden_states = jnp.take_along_axis(hidden_states, gather_idx, axis=1)
         hidden_states = hidden_states.reshape(dp, seq_len, -1)  # [dp, T, D]
 
-        # Full-att blocks use one segment per image; windowed blocks use window boundaries.
-        if valid is None:
-            full_cu_window_seqlens = jnp.full((dp, 1), seq_len, dtype=cu_window_seqlens.dtype)
-        else:
-            full_cu_window_seqlens = jnp.reshape(valid, (dp, 1)).astype(cu_window_seqlens.dtype)
-
         for layer_num, blk in enumerate(self.blocks):
+            # Full-attention blocks must segment by image, not by the packed
+            # request length, otherwise later images can leak into earlier image
+            # outputs. Windowed blocks keep the Qwen window boundaries.
+            cu_seqlens = (
+                cu_image_seqlens if layer_num in self.fullatt_block_indexes else cu_window_seqlens
+            )
             hidden_states = blk(
                 hidden_states,
                 rotary_pos_emb,
-                (
-                    full_cu_window_seqlens
-                    if layer_num in self.fullatt_block_indexes
-                    else cu_window_seqlens
-                ),
+                cu_seqlens,
                 valid,
             )
 
@@ -590,7 +588,8 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
         """Encode one DP round of images.
 
         ``enc.meta`` carries scheduler-built ViT aux
-        (``window_index`` / ``cu_window_seqlens`` / ``rotary_pos_emb``).
+        (``window_index`` / ``cu_window_seqlens`` / ``cu_image_seqlens`` /
+        ``rotary_pos_emb``).
         Returns dp-leading image features with shape ``[dp, out_rows, H]``.
         """
         return self.visual.encode(enc.pixels, enc.meta, enc.valid)

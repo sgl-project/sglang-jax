@@ -26,9 +26,9 @@ class VisionEncodeInputs:
 
     Two-state array fields (``np.ndarray`` host -> ``jax.Array`` device):
 
-    - ``pixels``: ``[dp, patch_k, dim]`` -- per-rank round-k image patches.
+    - ``pixels``: ``[dp, patch_k, dim]`` -- per-rank round-k request image patches.
     - ``valid``:  ``[dp]``               -- real patch-row count per rank's
-      round-k image.
+      round-k image-bearing request.
     - ``meta``:   per-arch ViT-aux registered pytree (opaque to common; see
       :class:`VisionMetadataPytree`). Crosses the encode JIT.
     """
@@ -40,7 +40,7 @@ class VisionEncodeInputs:
 
 @dataclass
 class EmbedRound:
-    """One owning-rank DP round: one single-image ViT per rank, then merge.
+    """One owning-rank DP round: one request's images per rank, then merge.
 
     ``src_idx``/``mask`` are integer/bool arrays produced by the scheduler that
     drive the ``where(mask, features[src_idx], running)`` merge -- no device
