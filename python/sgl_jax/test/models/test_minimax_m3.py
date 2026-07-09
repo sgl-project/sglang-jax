@@ -16,7 +16,7 @@ from sgl_jax.srt.models.minimax_m3 import (
 
 @pytest.fixture
 def mesh():
-    m = jax.make_mesh((1, 1), ("data", "tensor"))
+    m = jax.make_mesh((1, 1), ("data", "tensor"), axis_types=(jax.sharding.AxisType.Explicit,) * 2)
     with jax.sharding.set_mesh(m):
         yield m
 
