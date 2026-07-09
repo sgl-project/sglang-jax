@@ -30,7 +30,7 @@ IDX_DIM = 64
 POOL_SIZE = 512
 LAYER_NUM = 2
 SPARSE_LAYER = 1
-PAGES_PER_SEQ = 4
+PAGES_PER_SEQ = 8
 TOPK = 4
 SEQ_LENS = np.array([200, 300, 257, 384], dtype=np.int32)
 
@@ -44,14 +44,19 @@ def mesh():
 
 @pytest.fixture
 def rpa_stub(monkeypatch):
-    """Replace Pallas RPA with a shape-preserving jnp stub (CPU can't run TPU kernel)."""
+    """Replace Pallas RPA with a shape-preserving jnp stub (CPU can't run TPU kernel).
+    Captures the trace-time page_indices length so tests can assert the MSA
+    top-k branch (which rewrites page_indices to bs_l*TOPK) was taken."""
     from sgl_jax.srt.layers.attention import flashattention_backend as fab
 
-    def _stub(q, k, v, kv_cache, *_args, **_kwargs):
+    captured: dict = {}
+
+    def _stub(q, k, v, kv_cache, kv_lens, page_indices, *_args, **_kwargs):
+        captured["page_indices_len"] = page_indices.shape[0]
         return jnp.zeros_like(q), kv_cache
 
     monkeypatch.setattr(fab, "ragged_paged_attention_v3", _stub)
-    yield
+    yield captured
 
 
 def _shard(mesh, x, spec):
@@ -170,6 +175,14 @@ def test_msa_decode_shard_map_traces(mesh, rpa_stub):
     assert kv_upd.ndim == 5 and kv_upd.shape == pool.kv_buffer[SPARSE_LAYER].shape, kv_upd.shape
     assert ik_buf_upd.shape == pool.index_k_buffer[0].shape, ik_buf_upd.shape
     assert ikp_upd.shape == pool.index_k_pooled[0].shape, ikp_upd.shape
+    # sparse top-k branch rewrites page_indices to (bs_per_dp * TOPK); the
+    # dense/skip branch leaves it at (bs_per_dp * PAGES_PER_SEQ). Asserting the
+    # former proves the einsum→top_k→sort subgraph was actually traced.
+    per_dp_bs = BS // 2
+    assert rpa_stub["page_indices_len"] == per_dp_bs * TOPK, (
+        f"sparse branch not taken: page_indices_len={rpa_stub['page_indices_len']} "
+        f"(expected {per_dp_bs * TOPK}; PAGES_PER_SEQ={PAGES_PER_SEQ} must be > TOPK={TOPK})"
+    )
 
 
 @pytest.mark.unit
