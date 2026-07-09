@@ -28,6 +28,7 @@ from sgl_jax.srt.utils.common_utils import (
 logger = logging.getLogger(__name__)
 
 GRAMMAR_BACKEND_CHOICES = ["llguidance", "none"]
+SPECULATIVE_TARGET_VERIFY_MODE_CHOICES = ["auto", "batched", "decode-loop"]
 _REJECTED_PD_HOST_ALIASES = frozenset({"localhost"})
 
 
@@ -181,6 +182,7 @@ class ServerArgs:
     speculative_num_draft_tokens: int = 4
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
+    speculative_target_verify_mode: str = "auto"
 
     # For deterministic sampling
     enable_deterministic_sampling: bool = False
@@ -353,6 +355,12 @@ class ServerArgs:
         # Normalize speculative_algorithm: treat empty string as None
         if isinstance(self.speculative_algorithm, str) and self.speculative_algorithm.strip() == "":
             self.speculative_algorithm = None
+        if self.speculative_target_verify_mode not in SPECULATIVE_TARGET_VERIFY_MODE_CHOICES:
+            raise ValueError(
+                "--speculative-target-verify-mode must be one of "
+                f"{SPECULATIVE_TARGET_VERIFY_MODE_CHOICES}, "
+                f"got {self.speculative_target_verify_mode!r}"
+            )
 
         os.environ["SGLANG_ENABLE_DETERMINISTIC_SAMPLING"] = (
             "1" if self.enable_deterministic_sampling else "0"
@@ -1220,6 +1228,18 @@ class ServerArgs:
             type=float,
             help="The accept probability of a draft token is raised from its target probability p to min(1, p / threshold_acc).",
             default=ServerArgs.speculative_accept_threshold_acc,
+        )
+        parser.add_argument(
+            "--speculative-target-verify-mode",
+            type=str,
+            choices=SPECULATIVE_TARGET_VERIFY_MODE_CHOICES,
+            default=ServerArgs.speculative_target_verify_mode,
+            help=(
+                "Target verify mode for fused NEXTN topk=1 speculative decode. "
+                "'auto' uses decode-equivalent verify for greedy requests to keep "
+                "lossless outputs; 'batched' uses the faster batched verify path; "
+                "'decode-loop' explicitly requests the decode-equivalent path."
+            ),
         )
 
         # For deterministic sampling

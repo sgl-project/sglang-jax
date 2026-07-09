@@ -26,6 +26,9 @@ from sgl_jax.srt.speculative.relay_buffer import (
 
 logger = logging.getLogger(__name__)
 
+_TARGET_VERIFY_DECODE_LOOP_ENV = "SGL_JAX_TARGET_VERIFY_DECODE_LOOP"
+_TARGET_VERIFY_MODES = {"auto", "batched", "decode-loop"}
+
 
 def _debug_host_array(value, limit: int | None = 8):
     if value is None:
@@ -77,6 +80,54 @@ class FusedDraftExtendPendingResult(NamedTuple):
     accept_lens: object
     sel: np.ndarray
     updated_relay_buffers: object | None
+
+
+def _target_verify_mode_from_env_or_args(server_args) -> str:
+    override = os.environ.get(_TARGET_VERIFY_DECODE_LOOP_ENV)
+    if override is not None:
+        return "decode-loop" if override == "1" else "batched"
+    mode = getattr(server_args, "speculative_target_verify_mode", "auto")
+    if mode not in _TARGET_VERIFY_MODES:
+        raise ValueError(
+            "speculative_target_verify_mode must be one of "
+            f"{sorted(_TARGET_VERIFY_MODES)}, got {mode!r}"
+        )
+    return mode
+
+
+def _is_nextn_algorithm(value) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        value = SpeculativeAlgorithm.from_string(value)
+    return bool(value.is_nextn())
+
+
+def _should_use_decode_loop_target_verify(
+    *,
+    spec_worker,
+    draft_worker,
+    model_worker_batch,
+    is_greedy: bool,
+    use_relay_state: bool,
+) -> bool:
+    mode = _target_verify_mode_from_env_or_args(spec_worker.server_args)
+    if mode == "batched":
+        return False
+    algorithm = getattr(spec_worker, "speculative_algorithm", None)
+    if algorithm is None:
+        algorithm = getattr(model_worker_batch, "spec_algorithm", None)
+    supported = (
+        _is_nextn_algorithm(algorithm)
+        and is_greedy
+        and draft_worker.topk == 1
+        and not use_relay_state
+    )
+    if mode == "decode-loop":
+        return supported
+    return supported
 
 
 @contextmanager
@@ -2185,11 +2236,12 @@ def spec_decode_verify(spec_worker, model_worker_batch, cur_allocate_lens):
     # from (base_rng, step), so only this small int crosses the host->device boundary.
     target_mr._sampler_step += 1
 
-    use_decode_loop_verify = (
-        os.environ.get("SGL_JAX_TARGET_VERIFY_DECODE_LOOP") == "1"
-        and _sv_is_greedy
-        and draft_worker.topk == 1
-        and not use_relay_state
+    use_decode_loop_verify = _should_use_decode_loop_target_verify(
+        spec_worker=spec_worker,
+        draft_worker=draft_worker,
+        model_worker_batch=model_worker_batch,
+        is_greedy=_sv_is_greedy,
+        use_relay_state=use_relay_state,
     )
     target_pool_updates = None
     if use_decode_loop_verify:

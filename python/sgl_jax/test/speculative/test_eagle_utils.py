@@ -1,4 +1,8 @@
+import argparse
+import os
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import jax
 import jax.numpy as jnp
@@ -16,6 +20,79 @@ from sgl_jax.test.test_utils import CustomTestCase
 
 
 class TestVerifyTree(CustomTestCase):
+    def _decode_loop_policy(
+        self,
+        *,
+        mode="auto",
+        algorithm=None,
+        topk=1,
+        is_greedy=True,
+        use_relay_state=False,
+        env=None,
+    ):
+        from sgl_jax.srt.speculative.draft_extend_fused import (
+            _should_use_decode_loop_target_verify,
+        )
+        from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        if algorithm is None:
+            algorithm = SpeculativeAlgorithm.NEXTN
+
+        spec_worker = SimpleNamespace(
+            server_args=SimpleNamespace(speculative_target_verify_mode=mode),
+            speculative_algorithm=algorithm,
+        )
+        draft_worker = SimpleNamespace(topk=topk)
+        model_worker_batch = SimpleNamespace(spec_algorithm=algorithm)
+        with patch.dict("os.environ", {}, clear=False):
+            os.environ.pop("SGL_JAX_TARGET_VERIFY_DECODE_LOOP", None)
+            if env is not None:
+                os.environ["SGL_JAX_TARGET_VERIFY_DECODE_LOOP"] = env
+            return _should_use_decode_loop_target_verify(
+                spec_worker=spec_worker,
+                draft_worker=draft_worker,
+                model_worker_batch=model_worker_batch,
+                is_greedy=is_greedy,
+                use_relay_state=use_relay_state,
+            )
+
+    def test_decode_loop_policy_auto_enables_nextn_greedy_topk1(self):
+        self.assertTrue(self._decode_loop_policy())
+
+    def test_decode_loop_policy_auto_rejects_unsupported_verify_shapes(self):
+        from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        self.assertFalse(self._decode_loop_policy(is_greedy=False))
+        self.assertFalse(self._decode_loop_policy(topk=2))
+        self.assertFalse(self._decode_loop_policy(use_relay_state=True))
+        self.assertFalse(self._decode_loop_policy(algorithm=SpeculativeAlgorithm.EAGLE3))
+
+    def test_decode_loop_policy_mode_and_env_override_auto(self):
+        self.assertFalse(self._decode_loop_policy(mode="batched"))
+        self.assertTrue(self._decode_loop_policy(mode="decode-loop"))
+        self.assertFalse(self._decode_loop_policy(env="0"))
+        self.assertTrue(self._decode_loop_policy(mode="batched", env="1"))
+
+    def test_server_args_exposes_speculative_target_verify_mode(self):
+        from sgl_jax.srt.server_args import ServerArgs
+
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        args = parser.parse_args(
+            ["--model-path", "dummy-model", "--speculative-target-verify-mode", "batched"]
+        )
+        server_args = ServerArgs.from_cli_args(args)
+
+        self.assertEqual(
+            ServerArgs(model_path="dummy-model").speculative_target_verify_mode, "auto"
+        )
+        self.assertEqual(server_args.speculative_target_verify_mode, "batched")
+        with self.assertRaises(ValueError):
+            ServerArgs(
+                model_path="dummy-model",
+                speculative_target_verify_mode="unknown",
+            )
+
     def test_as_int32_array_keeps_host_metadata_on_host(self):
         from sgl_jax.srt.speculative import eagle_util
 
