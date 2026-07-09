@@ -8,7 +8,7 @@ from sgl_jax.srt.speculative.dflash_info import (
     DFlashVerifyInput,
     build_dflash_draft_block,
     compute_dflash_accept_len_and_bonus,
-    dflash_committed_slices,
+    compute_new_kv_slices,
     dflash_greedy_verify_outputs,
 )
 from sgl_jax.srt.speculative.spec_info import SpecInput
@@ -88,22 +88,12 @@ def test_dflash_verify_input_verify_from_logits():
         logits[i, row] = 10.0
     logits = jnp.asarray(logits)
 
-    accept_lens_out, next_token_ids_flat, new_verified_id, accept_len_draft = vi.verify(
-        logits
-    )
+    accept_lens_out, next_token_ids_flat, new_verified_id, accept_len_draft = vi.verify(logits)
 
-    np.testing.assert_array_equal(
-        np.asarray(accept_lens_out), np.array([4, 2], dtype=np.int32)
-    )
-    np.testing.assert_array_equal(
-        np.asarray(accept_len_draft), np.array([3, 1], dtype=np.int32)
-    )
-    np.testing.assert_array_equal(
-        np.asarray(new_verified_id), np.array([99, 77], dtype=np.int32)
-    )
-    np.testing.assert_array_equal(
-        np.asarray(next_token_ids_flat).reshape(2, 4), target_predict
-    )
+    np.testing.assert_array_equal(np.asarray(accept_lens_out), np.array([4, 2], dtype=np.int32))
+    np.testing.assert_array_equal(np.asarray(accept_len_draft), np.array([3, 1], dtype=np.int32))
+    np.testing.assert_array_equal(np.asarray(new_verified_id), np.array([99, 77], dtype=np.int32))
+    np.testing.assert_array_equal(np.asarray(next_token_ids_flat).reshape(2, 4), target_predict)
 
 
 def test_dflash_draft_input_is_spec_input():
@@ -165,12 +155,8 @@ def test_dflash_greedy_verify_outputs():
     )
 
     # emitted token count per req = accepted drafts + 1 bonus
-    np.testing.assert_array_equal(
-        np.asarray(accept_lens_out), np.array([4, 2, 1], dtype=np.int32)
-    )
-    np.testing.assert_array_equal(
-        np.asarray(accept_len_draft), np.array([3, 1, 0], dtype=np.int32)
-    )
+    np.testing.assert_array_equal(np.asarray(accept_lens_out), np.array([4, 2, 1], dtype=np.int32))
+    np.testing.assert_array_equal(np.asarray(accept_len_draft), np.array([3, 1, 0], dtype=np.int32))
     # next seed for the following block is the bonus token
     np.testing.assert_array_equal(
         np.asarray(new_verified_id), np.array([99, 77, 55], dtype=np.int32)
@@ -187,7 +173,7 @@ def test_dflash_committed_slices_prefill():
     # prefill: commit whole new-prompt span [prefix_len : prefix_len + extend_len]
     ctx_lens = np.array([3, 2], dtype=np.int32)  # new prompt tokens per req
     draft_seq_lens = np.array([5, 0], dtype=np.int32)  # cached prefix length per req
-    starts, lengths = dflash_committed_slices(ctx_lens, draft_seq_lens, is_prefill=True)
+    starts, lengths = compute_new_kv_slices(ctx_lens, draft_seq_lens, is_prefill=True)
     np.testing.assert_array_equal(starts, np.array([5, 0], dtype=np.int32))
     np.testing.assert_array_equal(lengths, np.array([3, 2], dtype=np.int32))
 
@@ -196,6 +182,6 @@ def test_dflash_committed_slices_decode():
     # decode: commit last accept_len tokens [new_seq_len - accept_len : new_seq_len]
     ctx_lens = np.array([2, 1], dtype=np.int32)  # committed this step per req
     draft_seq_lens = np.array([10, 7], dtype=np.int32)  # new total length per req
-    starts, lengths = dflash_committed_slices(ctx_lens, draft_seq_lens, is_prefill=False)
+    starts, lengths = compute_new_kv_slices(ctx_lens, draft_seq_lens, is_prefill=False)
     np.testing.assert_array_equal(starts, np.array([8, 6], dtype=np.int32))
     np.testing.assert_array_equal(lengths, np.array([2, 1], dtype=np.int32))

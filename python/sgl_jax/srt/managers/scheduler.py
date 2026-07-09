@@ -88,8 +88,8 @@ from sgl_jax.srt.model_executor.model_runner_kv_cache_mixin import (
 from sgl_jax.srt.multimodal.tokenizer_utils import resolve_tokenizer_subdir
 from sgl_jax.srt.precision_tracer import precision_tracer
 from sgl_jax.srt.server_args import PortArgs, ServerArgs
-from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
 from sgl_jax.srt.speculative.dflash_info import DFlashDraftInput
+from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
 from sgl_jax.srt.speculative.overlap_utils import (
     can_use_spec_decode_overlap,
     can_use_spec_prefill_overlap,
@@ -2381,9 +2381,7 @@ class Scheduler(
             and (self.spec_algorithm.is_eagle() or self.spec_algorithm.is_dflash())
             and batch_output.next_draft_input is not None
         ):
-            assert isinstance(
-                batch_output.next_draft_input, (EagleDraftInput, DFlashDraftInput)
-            )
+            assert isinstance(batch_output.next_draft_input, (EagleDraftInput, DFlashDraftInput))
             ret.next_draft_input = batch_output.next_draft_input
             ret.accept_lens = batch_output.accept_lens
         return ret

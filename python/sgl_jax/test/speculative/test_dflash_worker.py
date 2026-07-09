@@ -48,9 +48,7 @@ def test_slice_committed_target_hidden_gathers_front_of_block():
     accept_lens = np.array([2, 1], dtype=np.int32)
     out = np.asarray(w._slice_committed_target_hidden(hs, accept_lens, bs=2))
     # req0 rows 0,1 ; req1 row 3 (block start = 3)
-    expected = np.stack(
-        [np.asarray(hs)[0], np.asarray(hs)[1], np.asarray(hs)[3]], axis=0
-    )
+    expected = np.stack([np.asarray(hs)[0], np.asarray(hs)[1], np.asarray(hs)[3]], axis=0)
     np.testing.assert_array_equal(out, expected)
 
 
@@ -104,7 +102,7 @@ def test_pack_cache_loc_rows_uses_bucket_stable_row_width():
         np.array([4, 5, 6, 7, 8], dtype=np.int32),
     ]
 
-    packed = w._pack_cache_loc_rows(rows, [len(r) for r in rows])
+    packed = w._pack_kv_cache(rows, [len(r) for r in rows])
 
     assert packed.shape == (32,)
     np.testing.assert_array_equal(packed[:5], np.array([1, 2, 3, 0, 0], dtype=np.int32))

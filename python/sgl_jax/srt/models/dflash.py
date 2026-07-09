@@ -34,7 +34,9 @@ class DFlashAttention(nnx.Module):
     ):
         self.layer_id = layer_id
         self.hidden_size = int(config.hidden_size)
-        self.head_dim = int(getattr(config, "head_dim", self.hidden_size // config.num_attention_heads))
+        self.head_dim = int(
+            getattr(config, "head_dim", self.hidden_size // config.num_attention_heads)
+        )
         self.q_head_num = int(config.num_attention_heads)
         self.kv_head_num = int(getattr(config, "num_key_value_heads", self.q_head_num))
         self.q_size = self.q_head_num * self.head_dim
@@ -144,6 +146,7 @@ class DFlashAttention(nnx.Module):
         output, _ = self.o_proj(attn_output)
         return output, kv_fused
 
+    # @haifeng Need modify
     def dense_prefix_attention(
         self,
         positions: jax.Array,
@@ -243,7 +246,9 @@ class DFlashAttention(nnx.Module):
         output, _ = self.o_proj(attn_output)
         return output, token_to_kv_pool.get_fused_kv_buffer(self.layer_id)
 
-    def kv_proj_only(self, positions: jax.Array, hidden_states: jax.Array) -> tuple[jax.Array, jax.Array]:
+    def kv_proj(
+        self, positions: jax.Array, hidden_states: jax.Array
+    ) -> tuple[jax.Array, jax.Array]:
         num_tokens = positions.shape[0]
         hidden_states = hidden_states[:num_tokens]
         k, _ = self.k_proj(hidden_states)
@@ -501,14 +506,14 @@ class DFlashDraftModel(nnx.Module):
             )
         hidden_states, _ = self.fc(target_hidden)
         return self.hidden_norm(hidden_states)
-
+    # @haifeng kv injection here
     def materialize_kv(
         self,
         target_hidden: jax.Array,
         positions: jax.Array,
     ) -> list[tuple[jax.Array, jax.Array]]:
         ctx = self.project_target_hidden(target_hidden)
-        return [layer.self_attn.kv_proj_only(positions, ctx) for layer in self.model.layers]
+        return [layer.self_attn.kv_proj(positions, ctx) for layer in self.model.layers]
 
     def __call__(
         self,

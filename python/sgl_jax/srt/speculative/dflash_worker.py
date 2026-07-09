@@ -1,4 +1,4 @@
-"""DFlash speculative decoding worker (stage C, greedy runtime path).
+"""DFlash speculative decoding worker (greedy runtime path).
 
 Scope: tp_size=1, dp_size=1, disable_overlap_schedule, greedy-only, page_size=1.
 Ports the algorithmic structure of SGLang PyTorch PR 22077 to the sglang-jax
@@ -37,9 +37,12 @@ from sgl_jax.srt.speculative.dflash_info import (
     DFlashDraftInput,
     DFlashVerifyInput,
     build_dflash_draft_block,
-    dflash_committed_slices,
+    compute_new_kv_slices,
 )
-from sgl_jax.srt.speculative.dflash_util import parse_dflash_draft_config, resolve_mask_token_id
+from sgl_jax.srt.speculative.dflash_util import (
+    parse_dflash_draft_config,
+    resolve_mask_token_id,
+)
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 
 logger = logging.getLogger(__name__)
@@ -119,12 +122,8 @@ class DFlashWorker:
             self._mask_token_id,
             self.draft_layers,
         )
-        self._debug_tokens_remaining = (
-            4 if os.getenv("SGL_JAX_DFLASH_DEBUG_TOKENS") == "1" else 0
-        )
-        self._sample_from_seed_hidden = (
-            os.getenv("SGL_JAX_DFLASH_SAMPLE_FROM_SEED_HIDDEN") == "1"
-        )
+        self._debug_tokens_remaining = 4 if os.getenv("SGL_JAX_DFLASH_DEBUG_TOKENS") == "1" else 0
+        self._sample_from_seed_hidden = os.getenv("SGL_JAX_DFLASH_SAMPLE_FROM_SEED_HIDDEN") == "1"
         self._debug_prefix_ab = os.getenv("SGL_JAX_DFLASH_DEBUG_PREFIX_AB") == "1"
         if self._debug_tokens_remaining > 0:
             logger.warning(
@@ -176,12 +175,8 @@ class DFlashWorker:
 
         sel = np.asarray(model_worker_batch.logits_indices_selector)
         verified_id = np.asarray(jax.device_get(next_token_ids))[sel].astype(np.int32)
-        extend_seq_lens = np.asarray(model_worker_batch.extend_seq_lens, dtype=np.int32)[
-            sel
-        ]
-        extend_prefix_lens = np.asarray(
-            model_worker_batch.extend_prefix_lens, dtype=np.int32
-        )[sel]
+        extend_seq_lens = np.asarray(model_worker_batch.extend_seq_lens, dtype=np.int32)[sel]
+        extend_prefix_lens = np.asarray(model_worker_batch.extend_prefix_lens, dtype=np.int32)[sel]
 
         draft_input = DFlashDraftInput(
             verified_id=verified_id,
@@ -190,7 +185,7 @@ class DFlashWorker:
             draft_seq_lens=extend_prefix_lens,
             block_size=self.block_size,
         )
-
+        # @haifeng Need modify
         # Materialize prompt hidden into the draft KV pool at the committed slots.
         self._append_target_hidden_to_draft_kv(model_worker_batch, draft_input, is_prefill=True)
 
@@ -212,9 +207,9 @@ class DFlashWorker:
         from sgl_jax.srt.managers.scheduler import GenerationBatchResult
 
         draft_input: DFlashDraftInput = model_worker_batch.spec_info_padded
-        assert isinstance(draft_input, DFlashDraftInput), (
-            "DFLASH decode requires DFlashDraftInput carried over from prefill."
-        )
+        assert isinstance(
+            draft_input, DFlashDraftInput
+        ), "DFLASH decode requires DFlashDraftInput carried over from prefill."
 
         bs = int(model_worker_batch.seq_lens.shape[0])
         seq_lens = np.asarray(model_worker_batch.seq_lens, dtype=np.int32)
@@ -324,13 +319,12 @@ class DFlashWorker:
         positions_flat = positions.reshape(-1)
 
         # Draft input embedding comes from the borrowed target embedding table.
-        from jax.sharding import NamedSharding, PartitionSpec as P
+        from jax.sharding import NamedSharding
+        from jax.sharding import PartitionSpec as P
 
         embed = self._target_embed
         ids = jnp.asarray(block_ids_flat)
-        out_sharding = NamedSharding(
-            self.draft_model_runner.mesh, P(None, None)
-        )
+        out_sharding = NamedSharding(self.draft_model_runner.mesh, P(None, None))
         input_embedding = embed.at[ids].get(out_sharding=out_sharding)
 
         # Temporary draft-block KV slots (dropped after the draft forward).
@@ -367,29 +361,22 @@ class DFlashWorker:
                     zero_prefix_lens,
                     bs,
                 )
-                no_prefix_batch = ForwardBatch.init_new(
-                    no_prefix_mwb, self.draft_model_runner
-                )
+                no_prefix_batch = ForwardBatch.init_new(no_prefix_mwb, self.draft_model_runner)
                 no_prefix_batch.forward_mode = ForwardMode.TARGET_VERIFY
                 no_prefix_batch.input_embedding = input_embedding
                 no_prefix_metadata = (
-                    self.draft_model_runner.attn_backend.get_eagle_forward_metadata(
-                        no_prefix_mwb
-                    )
+                    self.draft_model_runner.attn_backend.get_eagle_forward_metadata(no_prefix_mwb)
                 )
                 self.draft_model_runner.attn_backend.forward_metadata = no_prefix_metadata
-                no_prefix_output, _, _ = self.draft_model_runner.forward(
-                    no_prefix_batch, None
-                )
+                no_prefix_output, _, _ = self.draft_model_runner.forward(no_prefix_batch, None)
         finally:
+            # release the temp kv
             allocator.restore_state(state)
 
         draft_hidden = draft_logits_output.hidden_states.reshape(bs, self.block_size, -1)
         # Greedy sample draft proposals d1..d15 from the target LM head.
         proposal_hidden = (
-            draft_hidden[:, :-1, :]
-            if self._sample_from_seed_hidden
-            else draft_hidden[:, 1:, :]
+            draft_hidden[:, :-1, :] if self._sample_from_seed_hidden else draft_hidden[:, 1:, :]
         )
         draft_next = self._greedy_sample_from_head(
             proposal_hidden.reshape(-1, draft_hidden.shape[-1])
@@ -409,8 +396,7 @@ class DFlashWorker:
                 axis=-1,
             )
             logger.warning(
-                "DFLASH draft stats: hidden_norm0=%s top1_0=%s margin0=%s "
-                "block_delta0=%s",
+                "DFLASH draft stats: hidden_norm0=%s top1_0=%s margin0=%s " "block_delta0=%s",
                 np.asarray(jax.device_get(hidden_norms), dtype=np.float32).round(3).tolist(),
                 np.asarray(jax.device_get(top_ids[:, 0]), dtype=np.int32)
                 .reshape(bs, self.block_size - 1)[0]
@@ -419,9 +405,7 @@ class DFlashWorker:
                 np.asarray(jax.device_get(block_delta), dtype=np.float32).round(5).tolist(),
             )
             if self._debug_prefix_ab:
-                no_prefix_hidden = no_prefix_output.hidden_states.reshape(
-                    bs, self.block_size, -1
-                )
+                no_prefix_hidden = no_prefix_output.hidden_states.reshape(bs, self.block_size, -1)
                 no_prefix_proposal = (
                     no_prefix_hidden[:, :-1, :]
                     if self._sample_from_seed_hidden
@@ -434,13 +418,11 @@ class DFlashWorker:
                 no_prefix_top = jnp.argmax(no_prefix_logits, axis=-1).astype(jnp.int32)
                 prefix_effect = jnp.max(
                     jnp.abs(
-                        proposal_hidden.astype(jnp.float32)
-                        - no_prefix_proposal.astype(jnp.float32)
+                        proposal_hidden.astype(jnp.float32) - no_prefix_proposal.astype(jnp.float32)
                     )
                 )
                 logger.warning(
-                    "DFLASH prefix A/B: prefix_lens=%s no_prefix_top1_0=%s "
-                    "max_hidden_diff=%.6f",
+                    "DFLASH prefix A/B: prefix_lens=%s no_prefix_top1_0=%s " "max_hidden_diff=%.6f",
                     draft_prefix_lens.tolist(),
                     np.asarray(jax.device_get(no_prefix_top), dtype=np.int32)
                     .reshape(bs, self.block_size - 1)[0]
@@ -493,21 +475,21 @@ class DFlashWorker:
         prefix_rows = []
         prefix_kv_lens = []
         kv_lens = []
-        blk_offset = 0
+        block_offset = 0
         for i in range(bs):
-            sl = int(prefix_lens[i])
-            if sl > 0:
-                rp = int(req_pool_indices[i])
-                prefix_locs = np.asarray(req_to_token[rp, :sl], dtype=np.int32)
+            prefix_len = int(prefix_lens[i])
+            if prefix_len > 0:
+                req_idx = int(req_pool_indices[i])
+                prefix_locs = np.asarray(req_to_token[req_idx, :prefix_len], dtype=np.int32)
             else:
                 prefix_locs = np.empty(0, dtype=np.int32)
-            blk_locs = block_loc[blk_offset : blk_offset + self.block_size]
+            block_locs = block_loc[block_offset : block_offset + self.block_size]
             prefix_rows.append(prefix_locs)
-            prefix_kv_lens.append(sl)
-            locs.append(np.concatenate([prefix_locs, blk_locs]))
-            kv_lens.append(sl + self.block_size)
-            blk_offset += self.block_size
-        prefix_cache_loc = self._pack_cache_loc_rows(prefix_rows, prefix_kv_lens).reshape(bs, -1)
+            prefix_kv_lens.append(prefix_len)
+            locs.append(np.concatenate([prefix_locs, block_locs]))
+            kv_lens.append(prefix_len + self.block_size)
+            block_offset += self.block_size
+        prefix_cache_loc = self._pack_kv_cache(prefix_rows, prefix_kv_lens).reshape(bs, -1)
         mwb.spec_info_padded = DFlashVerifyInput(
             draft_token=jnp.asarray(block_ids_flat),
             positions=jnp.asarray(positions_flat),
@@ -517,7 +499,7 @@ class DFlashWorker:
             prefix_lens=jnp.asarray(prefix_lens, dtype=jnp.int32),
             dense_draft=True,
         )
-        mwb.cache_loc = self._pack_cache_loc_rows(locs, kv_lens)
+        mwb.cache_loc = self._pack_kv_cache(locs, kv_lens)
         return mwb
 
     # ------------------------------------------------------------------ #
@@ -581,9 +563,7 @@ class DFlashWorker:
                 )
             return new_bufs
 
-        self._jit_materialize_write = _partial(
-            _jit_fn, model_def, model_state_def
-        )
+        self._jit_materialize_write = _partial(_jit_fn, model_def, model_state_def)
 
     def _append_target_hidden_to_draft_kv(
         self, model_worker_batch: ModelWorkerBatch, draft_input: DFlashDraftInput, is_prefill: bool
@@ -626,7 +606,7 @@ class DFlashWorker:
         for i, buf in enumerate(new_buffers):
             pool.kv_buffer[i] = buf
 
-        starts, lengths = dflash_committed_slices(
+        starts, lengths = compute_new_kv_slices(
             draft_input.ctx_lens, draft_input.draft_seq_lens, is_prefill
         )
         draft_input.draft_seq_lens = (starts + lengths).astype(np.int32)
@@ -637,7 +617,7 @@ class DFlashWorker:
         """Flat cache_loc for the committed tokens, read from req_to_token_pool."""
         req_to_token = self.draft_model_runner.req_to_token_pool.req_to_token
         req_pool_indices = np.asarray(model_worker_batch.req_pool_indices, dtype=np.int64)
-        starts, lengths = dflash_committed_slices(
+        starts, lengths = compute_new_kv_slices(
             draft_input.ctx_lens, draft_input.draft_seq_lens, is_prefill
         )
         locs = []
@@ -650,7 +630,7 @@ class DFlashWorker:
         return np.concatenate(locs).astype(np.int32)
 
     def _committed_positions(self, draft_input, is_prefill):
-        starts, lengths = dflash_committed_slices(
+        starts, lengths = compute_new_kv_slices(
             draft_input.ctx_lens, draft_input.draft_seq_lens, is_prefill
         )
         pos = []
@@ -662,6 +642,7 @@ class DFlashWorker:
             return np.zeros((0,), dtype=np.int32)
         return np.concatenate(pos).astype(np.int32)
 
+    # @haifeng: jit_transpose and jit_matmul
     def _greedy_sample_from_head(self, hidden_states: jax.Array) -> jax.Array:
         """argmax over the target LM head. tp_size=1 bring-up path (full vocab)."""
         vocab_size = self._lm_head_vocab_size()
@@ -692,11 +673,9 @@ class DFlashWorker:
             locs.append(np.concatenate([prefix_locs, verify_locs]))
             kv_lens.append(sl + n_verify)
             ocl_offset += n_verify
-        mwb.cache_loc = self._pack_cache_loc_rows(locs, kv_lens)
+        mwb.cache_loc = self._pack_kv_cache(locs, kv_lens)
 
-    def _pack_cache_loc_rows(
-        self, rows: list[np.ndarray], kv_lens: list[int]
-    ) -> np.ndarray:
+    def _pack_kv_cache(self, rows: list[np.ndarray], kv_lens: list[int]) -> np.ndarray:
         """Pack per-request cache_loc rows into a bucket-stable flat layout.
 
         ``ForwardBatch.cache_loc`` is a JIT-visible child. If its length grows

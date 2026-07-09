@@ -1836,7 +1836,9 @@ class ServerArgs:
                 not explicit_draft_tokens
                 and self.speculative_num_draft_tokens == ServerArgs.speculative_num_draft_tokens
             ):
-                from sgl_jax.srt.speculative.dflash_util import parse_dflash_draft_config
+                from sgl_jax.srt.speculative.dflash_util import (
+                    parse_dflash_draft_config,
+                )
 
                 draft_config = parse_dflash_draft_config(
                     self.speculative_draft_model_path,

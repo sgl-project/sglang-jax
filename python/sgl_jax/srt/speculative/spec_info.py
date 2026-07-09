@@ -83,9 +83,6 @@ class SpeculativeAlgorithm(IntEnum):
         return self == SpeculativeAlgorithm.STANDALONE
 
     def is_dflash(self):
-        # DFLASH is a diffusion-drafter algorithm with a non-causal one-shot
-        # draft + KV injection. It deliberately does NOT belong to is_eagle():
-        # its worker/driver and spec_info lifecycle differ from EAGLE.
         return self == SpeculativeAlgorithm.DFLASH
 
     @staticmethod

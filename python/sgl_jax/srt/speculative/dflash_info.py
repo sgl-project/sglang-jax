@@ -10,17 +10,14 @@ from jax.tree_util import register_pytree_node_class
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode
 
 
+# @haifeng Maybe common!
 def compute_dflash_accept_len_and_bonus(
     candidates: jax.Array,
     target_predict: jax.Array,
 ) -> tuple[jax.Array, jax.Array]:
     """Greedy DFlash chain verification.
 
-    ``candidates[:, 0]`` is the already verified seed token. Draft proposals are
-    accepted while ``candidates[:, 1:]`` matches the target predictions for the
-    previous positions. The bonus token is the target prediction at the first
-    unaccepted position, or the final target prediction when all draft proposals
-    are accepted.
+    match: candidates[:, 1:] == target_predict[:, :-1]
     """
 
     if candidates.ndim != 2:
@@ -40,7 +37,8 @@ def compute_dflash_accept_len_and_bonus(
     if mesh is None:
         bonus = jnp.take(tp_flat, flat_idx)
     else:
-        from jax.sharding import NamedSharding, PartitionSpec as P
+        from jax.sharding import NamedSharding
+        from jax.sharding import PartitionSpec as P
 
         bonus = tp_flat.at[flat_idx].get(out_sharding=NamedSharding(mesh, P(None)))
     return accept_len.astype(jnp.int32), bonus.astype(jnp.int32)
@@ -54,12 +52,8 @@ def build_dflash_draft_block(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Build the fixed-size DFlash draft block inputs for one decode step.
 
-    Token 0 of each row is the already-verified seed token; tokens ``1..block_size-1``
-    are the draft mask token. Positions are absolute target positions
-    ``seq_len + arange(block_size)`` so RoPE matches the target KV cache.
-
-    Returns ``(block_ids, positions)``, both host ``np.ndarray`` of shape
-    ``(bs, block_size)`` and int32.
+    - block: [verified_id, mask_token_id, mask_token_id, ...]
+    - position: [target_prefix_lens, target_prefix_lens + 1, ..., target_prefix_lens + block_size - 1]
     """
     verified_id = np.asarray(verified_id, dtype=np.int32)
     target_prefix_lens = np.asarray(target_prefix_lens, dtype=np.int32)
@@ -79,19 +73,15 @@ def build_dflash_draft_block(
     return block_ids, positions.astype(np.int32)
 
 
-def dflash_committed_slices(
+def compute_new_kv_slices(
     ctx_lens: np.ndarray,
     draft_seq_lens: np.ndarray,
     is_prefill: bool,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Per-request ``(start, length)`` of committed tokens in the KV cache.
 
-    - Prefill: the new-prompt span occupies ``[prefix_len : prefix_len + extend_len]``,
-      where ``draft_seq_lens`` is the cached prefix length and ``ctx_lens`` the new
-      prompt token count.
-    - Decode: the committed tokens occupy the tail ``[new_len - accept_len : new_len]``,
-      where ``draft_seq_lens`` is the new total length and ``ctx_lens`` the number
-      committed this step.
+    - Prefill: [prefix_len : prefix_len + extend_len]
+    - Decode: [new_len - accept_len : new_len]
     """
     ctx_lens = np.asarray(ctx_lens, dtype=np.int32)
     draft_seq_lens = np.asarray(draft_seq_lens, dtype=np.int32)
@@ -116,20 +106,18 @@ def dflash_greedy_verify_outputs(
     - ``accept_lens_out``: ``(bs,)`` emitted token count per request
       (= accepted drafts + 1 bonus). This is what the scheduler advances output
       length by and what ``resolve_spec_decode_token_ids`` slices with.
-    - ``next_token_ids_flat``: ``(bs * block_size,)`` — ``target_predict``
+    - ``next_token_ids``: ``(bs * block_size,)`` — ``target_predict``
       flattened; the scheduler keeps the first ``accept_lens_out[i]`` per row.
-    - ``new_verified_id``: ``(bs,)`` next-step seed (= bonus token).
+    - ``verified_id``: ``(bs,)`` next-step seed (= bonus token).
     - ``accept_len_draft``: ``(bs,)`` number of accepted draft proposals.
     """
     if draft_token.ndim != 2:
         raise ValueError(f"draft_token must be 2D, got shape={draft_token.shape}.")
-    accept_len_draft, bonus = compute_dflash_accept_len_and_bonus(
-        draft_token, target_predict
-    )
+    accept_len_draft, bonus = compute_dflash_accept_len_and_bonus(draft_token, target_predict)
     accept_lens_out = (accept_len_draft + 1).astype(jnp.int32)
-    next_token_ids_flat = target_predict.reshape(-1).astype(jnp.int32)
-    new_verified_id = bonus.astype(jnp.int32)
-    return accept_lens_out, next_token_ids_flat, new_verified_id, accept_len_draft
+    next_token_ids = target_predict.reshape(-1).astype(jnp.int32)
+    verified_id = bonus.astype(jnp.int32)
+    return accept_lens_out, next_token_ids, verified_id, accept_len_draft
 
 
 @dataclass
@@ -142,9 +130,17 @@ class DFlashDraftInput:
     draft_seq_lens: np.ndarray = None
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL
 
-    def __init__(self, *, verified_id=None, target_hidden=None, ctx_lens=None,
-                 draft_seq_lens=None, capture_hidden_mode=CaptureHiddenMode.FULL,
-                 block_size=4, **_kwargs):
+    def __init__(
+        self,
+        *,
+        verified_id=None,
+        target_hidden=None,
+        ctx_lens=None,
+        draft_seq_lens=None,
+        capture_hidden_mode=CaptureHiddenMode.FULL,
+        block_size=16,
+        **_kwargs,
+    ):
         self.verified_id = verified_id
         self.target_hidden = target_hidden
         self.ctx_lens = ctx_lens
@@ -184,12 +180,13 @@ class DFlashDraftInput:
             return
         raise NotImplementedError(
             "DFlashDraftInput.filter_batch with non-empty target_hidden is not "
-            "implemented in stage2; DFLASH is restricted to dp_size=1/no retraction."
+            "implemented; DFLASH is restricted to dp_size=1/no retraction."
         )
 
     def resolve_pending_draft_extend_result(self):
         pass
 
+    # alloc the kv cache for draft block
     def prepare_for_decode(self, schedule_batch) -> None:
         from sgl_jax.srt.mem_cache.common import alloc_token_slots
         from sgl_jax.srt.speculative.eagle_util import assign_req_to_token_pool
@@ -202,19 +199,13 @@ class DFlashDraftInput:
 
             reqs = info.reqs
 
-            old_r = np.asarray(
-                [req.kv_allocated_len for req in reqs], dtype=np.int32
-            )
-            committed_r = np.asarray(
-                [req.kv_committed_len for req in reqs], dtype=np.int32
-            )
+            old_r = np.asarray([req.kv_allocated_len for req in reqs], dtype=np.int32)
+            committed_r = np.asarray([req.kv_committed_len for req in reqs], dtype=np.int32)
             new_r = np.maximum(old_r, committed_r + block_size)
             ext_r = int((new_r - old_r).sum())
 
             if ext_r > 0:
-                ocl_r = alloc_token_slots(
-                    schedule_batch.tree_cache, ext_r, dp_rank=dp_rank
-                )
+                ocl_r = alloc_token_slots(schedule_batch.tree_cache, ext_r, dp_rank=dp_rank)
                 assign_req_to_token_pool(
                     info.req_pool_indices,
                     schedule_batch.req_to_token_pool,
@@ -228,15 +219,9 @@ class DFlashDraftInput:
             for i, req in enumerate(reqs):
                 rp = int(info.req_pool_indices[i])
                 c = int(committed_r[i])
-                verify_locs.append(
-                    np.asarray(
-                        req_to_token[rp, c : c + block_size], dtype=np.int32
-                    )
-                )
+                verify_locs.append(np.asarray(req_to_token[rp, c : c + block_size], dtype=np.int32))
             info.out_cache_loc = (
-                np.concatenate(verify_locs)
-                if verify_locs
-                else np.empty(0, dtype=np.int32)
+                np.concatenate(verify_locs) if verify_locs else np.empty(0, dtype=np.int32)
             )
 
             for req, allocated_len in zip(reqs, new_r):
@@ -246,14 +231,12 @@ class DFlashDraftInput:
 
             info.seq_lens_sum = np.sum(info.seq_lens).item()
 
-    def merge_batch(self, other: "DFlashDraftInput") -> None:
+    def merge_batch(self, other: DFlashDraftInput) -> None:
         self.verified_id = np.concatenate(
             [np.asarray(self.verified_id), np.asarray(other.verified_id)], axis=0
         )
         self.ctx_lens = np.concatenate([self.ctx_lens, other.ctx_lens], axis=0)
-        self.draft_seq_lens = np.concatenate(
-            [self.draft_seq_lens, other.draft_seq_lens], axis=0
-        )
+        self.draft_seq_lens = np.concatenate([self.draft_seq_lens, other.draft_seq_lens], axis=0)
         if self.target_hidden is None:
             self.target_hidden = other.target_hidden
         elif other.target_hidden is not None:
@@ -295,7 +278,7 @@ class DFlashVerifyInput:
     def filter_batch(self, new_indices: np.ndarray, has_been_filtered: bool = True) -> None:
         raise NotImplementedError("DFlashVerifyInput is built per verify step and is not filtered.")
 
-    def merge_batch(self, other: "DFlashVerifyInput") -> None:
+    def merge_batch(self, other: DFlashVerifyInput) -> None:
         raise NotImplementedError("DFlashVerifyInput is built per verify step and is not merged.")
 
     def resolve_pending_draft_extend_result(self):
@@ -351,14 +334,13 @@ class DFlashVerifyInput:
         model_worker_batch.spec_info_padded = self
         model_worker_batch.capture_hidden_mode = self.capture_hidden_mode
 
-    def verify(
-        self, target_logits: jax.Array
-    ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    # @haifeng Need modify
+    def verify(self, target_logits: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
         """Greedy-verify a target forward output.
 
         ``target_logits`` has shape ``[bs * block_size, vocab]``. Returns the
         scheduler-facing decode outputs from :func:`dflash_greedy_verify_outputs`:
-        ``(accept_lens_out, next_token_ids_flat, new_verified_id, accept_len_draft)``.
+        ``(accept_lens_out, next_token_ids, verified_id, accept_len_draft)``.
         """
         target_predict = jnp.argmax(target_logits, axis=-1).astype(jnp.int32)
         candidates = self.draft_token.reshape((-1, int(self.draft_token_num)))
