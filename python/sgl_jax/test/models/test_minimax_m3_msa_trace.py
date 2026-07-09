@@ -39,7 +39,12 @@ SEQ_LENS = np.array([200, 300, 257, 384], dtype=np.int32)
 def mesh():
     devs = jax.devices()
     assert len(devs) >= 4, f"need 4 CPU devices, got {len(devs)} (XLA_FLAGS not picked up?)"
-    return jax.make_mesh((2, 2), ("data", "tensor"), devices=devs[:4])
+    return jax.make_mesh(
+        (2, 2),
+        ("data", "tensor"),
+        devices=devs[:4],
+        axis_types=(jax.sharding.AxisType.Explicit,) * 2,
+    )
 
 
 @pytest.fixture
