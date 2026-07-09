@@ -557,17 +557,9 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         self.forward_pass_id += 1
         precision_tracer.start_batch_trace(forward_batch.bid)
         precision_tracer.set_current_forward_pass_id(self.forward_pass_id)
-        # In-model VLM path (active): run the host embed routine (per-round JIT
-        # vision-encode -> JIT merge; aux precomputed host-side by the scheduler
-        # and carried in the plan), storing the merged embedding on
-        # forward_batch.input_embedding before the backbone JIT. `language_model`
-        # is the Qwen2Model backbone (`self.model.model`) -- it provides
-        # `get_input_embeddings` (embed module) to seed `running`;
-        # `multimodal_model` is the VL wrapper (`self.model`) -- it provides
-        # `get_image_feature`. The forward_mode gate lives ONLY in the scheduler
-        # (plan built iff forward_mode == EXTEND), so a non-None plan already means
-        # "this batch runs vision" -- here we just test `mm_embed_plan is not None`
-        # (decode / target_verify / mixed / draft_extend all carry a None plan).
+        # In-model VLM path: a non-None mm_embed_plan means the scheduler chose
+        # the normal prefill vision path; here we just fuse embeddings before the
+        # backbone JIT.
         if forward_batch.mm_embed_plan is not None:
             general_mm_embed_routine(
                 input_ids=forward_batch.input_ids,

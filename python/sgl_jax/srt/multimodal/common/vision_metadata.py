@@ -18,8 +18,8 @@ class VisionMetadataBuilderProtocol(Protocol):
 
     def __init__(self, model_config) -> None: ...
 
-    def get_metadata(self, item) -> VisionMetadataPytree:
-        """Build native-size metadata for one multimodal item."""
+    def get_metadata(self, items) -> VisionMetadataPytree:
+        """Build request-level metadata for one rank's encode unit."""
         ...
 
     def stack_metadata(self, metas, patch_k) -> VisionMetadataPytree:
