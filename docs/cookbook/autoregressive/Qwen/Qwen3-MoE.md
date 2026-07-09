@@ -4,7 +4,7 @@ title: "Qwen3-MoE"
 
 # Qwen3-MoE on SGL-JAX
 
-> **Validated recipe** — Qwen3-30B-A3B validated on TPU v6e-16 with sglang-jax 0.1.0; see §4 for measured numbers.
+> **Validated recipe** — Qwen3-30B-A3B validated on TPU v6e-16 with sglang-jax 0.1.0; §4.2 now includes the recommended v7x-4 high-throughput `bench_serving` row, with the historical v6e-16 baseline kept as context.
 
 ## 1. Model Introduction
 
@@ -33,6 +33,7 @@ For the dense Qwen3 variants (8B / 32B) see [Qwen3 recipe](/autoregressive/Qwen/
 
 | Model | TPU | Topology | Nodes | Chips | `--tp-size` | `--ep-size` | Notes |
 |---|---|---|---|---|---|---|---|
+| Qwen3-30B-A3B | **v7x-4** | 2x2x1 | 1 | 4 chips / 8 devices | 8 | 8 | Recommended throughput recipe in §4.2. v7x exposes 2 JAX devices/chip. |
 | Qwen3-30B-A3B   | **v6e-16** | 4x4 | 4  | 16 | 16 | 16 | This is the slice we measured on. BF16 ~60 GB. |
 
 See [TPU topology reference](/base/tpu-topology-reference) for the TPU generation reference. For other slices (larger v6e, v7x variants), see [Adapting to other topologies](/base/tpu-topology-reference#adapting-to-other-topologies).
@@ -325,50 +326,59 @@ evalscope eval \
 
 ### 4.2 Speed
 
-> **Layout B — measured baseline.** TPU v6e-16 (4 nodes × 4 chips, TP=16, EP=16), sglang-jax 0.1.0. sgl-jax-only; no vLLM-on-TPU comparison.
+> **High-throughput v7x-4 row.** This cookbook row uses fixed-length random requests (ISL=1024, OSL=1024), `max_concurrency=128`, 384 prompts, `random_range_ratio=1`, `seed=42`, and no warmup requests. Radix cache is disabled and DP scheduling uses `round_robin`, so the result is throughput-oriented and not prefix-cache dependent.
 
 **Test Environment**
 
 | Field | Value |
 |---|---|
-| Hardware | TPU v6e-16 (4 nodes × 4 chips) |
-| Model | Qwen/Qwen3-30B-A3B (BF16, MoE A3B) |
-| Tensor Parallelism | 16 |
-| Expert Parallelism | 16 |
-| Tested build | sglang-jax 0.1.0 |
+| Hardware | TPU v7x-4 (1 node x 4 chips, 8 JAX devices) |
+| Model | Qwen/Qwen3-30B-A3B (real BF16 weights, MoE A3B) |
+| Tensor Parallelism | 8 |
+| Expert Parallelism | 8 |
+| Tested build | origin/main (`2d97c787f712f715784216f7c414a4f477ea8218`) |
+
+**Serving Flags Used**
+
+```bash
+JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -m sgl_jax.launch_server \
+  --model-path /models/Qwen3-30B-A3B \
+  --trust-remote-code \
+  --tp-size 8 --ep-size 8 \
+  --moe-backend epmoe \
+  --dtype bfloat16 \
+  --context-length 32768 \
+  --chunked-prefill-size 2048 \
+  --page-size 128 \
+  --max-running-requests 256 \
+  --disable-radix-cache \
+  --dp-schedule-policy round_robin \
+  --skip-server-warmup \
+  --host 0.0.0.0 --port 30000
+```
 
 **Benchmark Command**
 
 ```bash
-python3 -m sgl_jax.bench_serving \
-  --backend sglang \
-  --model Qwen/Qwen3-30B-A3B \
-  --tokenizer Qwen/Qwen3-30B-A3B \
+PYTHONPATH=/tmp/sglang-jax/python python -m sgl_jax.bench_serving \
+  --backend sgl-jax \
+  --model /models/Qwen3-30B-A3B \
+  --tokenizer /models/Qwen3-30B-A3B \
   --dataset-name random --random-input-len 1024 --random-output-len 1024 \
-  --num-prompts 100 --max-concurrency 16 \
+  --num-prompts 384 --max-concurrency 128 \
+  --random-range-ratio 1 \
+  --seed 42 \
+  --warmup-requests 0 \
   --host 127.0.0.1 --port 30000
 ```
 
 **Test Results**
 
-```
-============ Serving Benchmark Result ============
-Successful requests:                     100
-Benchmark duration (s):                  35.53
-Total input tokens:                      50561
-Total generated tokens:                  52444
-Request throughput (req/s):              2.81
-Input token throughput (tok/s):          1423.18
-Output token throughput (tok/s):         1476.18
-Peak output token throughput (tok/s):    1744.00
-Total token throughput (tok/s):          2899.37
-Mean E2E Latency (ms):                   5223.28
-Mean TTFT (ms):                          75.77
-Mean TPOT (ms):                          9.88
-Median TPOT (ms):                        9.97
-Mean ITL (ms):                           9.83
-==================================================
-```
+| ISL | OSL | Max concurrency | Prompts | Input tok/s | Output tok/s | Peak output tok/s | Mean TTFT (ms) | Mean TPOT (ms) | Duration (s) | OK |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1024 | 1024 | 128 | 384 | 6179.45 | 6179.45 | 7564.00 | 1833.34 | 18.91 | 63.63 | 384 |
+
+> Historical v6e-16 baseline: `1024/1024/c16`, 100 prompts, 1476.18 output tok/s, 1744.00 peak output tok/s. The v7x-4 row above uses fewer chips and is the recommended throughput-oriented recipe.
 
 ## Additional Resources
 

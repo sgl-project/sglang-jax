@@ -4,7 +4,7 @@ title: "Qwen3"
 
 # Qwen3-8B / Qwen3-32B on SGL-JAX
 
-> **Validated recipe** — Qwen3-8B and Qwen3-32B both empirically validated on TPU v6e-4 with sglang-jax 0.1.0; see §4 for measured numbers.
+> **Validated recipe** — Qwen3-8B and Qwen3-32B both empirically validated on TPU v6e-4 with sglang-jax 0.1.0; §4.2 also includes the recommended Qwen3-8B v7x-4 high-throughput `bench_serving` row.
 
 ## 1. Model Introduction
 
@@ -31,10 +31,11 @@ title: "Qwen3"
 
 | Model | TPU | Topology | Chips | `--tp-size` | Notes |
 |---|---|---|---|---|---|
+| Qwen3-8B | **v7x-4** | 2x2x1 | 4 chips / 8 devices | 8 | Current high-throughput row in §4.2. v7x exposes 2 JAX devices/chip. |
 | Qwen3-8B | **v6e-4** | 2x2 | 4 | 4 | This is the slice we measured on. Single host; ~16 GB BF16 weights. |
 | Qwen3-32B | **v6e-4** | 2x2 | 4 | 4 | This is the slice we measured on. Single host; ~64 GB BF16 weights — fits with `--mem-fraction-static 0.8`. |
 
-Both fit on a single v6e-4 host with `bfloat16`. See [TPU topology reference](/base/tpu-topology-reference) for the TPU generation reference. For other slices (larger v6e, v7x variants), see [Adapting to other topologies](/base/tpu-topology-reference#adapting-to-other-topologies).
+Both v6e rows fit on a single v6e-4 host with `bfloat16`; the v7x row uses one 4-chip v7x slice. See [TPU topology reference](/base/tpu-topology-reference) for the TPU generation reference. For other slices (larger v6e, v7x variants), see [Adapting to other topologies](/base/tpu-topology-reference#adapting-to-other-topologies).
 
 ### 2.2 Environment
 
@@ -345,7 +346,64 @@ evalscope eval \
 
 > Run **with thinking-on** for full reasoning capacity. Thinking-off would yield lower accuracy but ~10× faster wall-clock per question.
 
-### 4.2 Speed — SGL-JAX vs vLLM
+### 4.2 Speed
+
+#### High-throughput v7x-4 result (Qwen3-8B)
+
+> This cookbook row uses fixed-length random requests (ISL=1024, OSL=1024), `max_concurrency=128`, 384 prompts, `random_range_ratio=1`, `seed=42`, and no warmup requests. Radix cache is disabled and DP scheduling uses `round_robin`, so the result is throughput-oriented and not prefix-cache dependent.
+
+**Test Environment**
+
+| Field | Value |
+|---|---|
+| Hardware | TPU v7x-4 (1 node x 4 chips, 8 JAX devices) |
+| Model | Qwen/Qwen3-8B (real BF16 weights) |
+| Tensor Parallelism | 8 |
+| Tested build | origin/main (`2d97c787f712f715784216f7c414a4f477ea8218`) |
+
+**Serving Flags Used**
+
+```bash
+JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -m sgl_jax.launch_server \
+  --model-path /models/Qwen3-8B \
+  --trust-remote-code \
+  --reasoning-parser qwen3 \
+  --tp-size 8 \
+  --dtype bfloat16 \
+  --context-length 32768 \
+  --chunked-prefill-size 2048 \
+  --mem-fraction-static 0.90 \
+  --page-size 128 \
+  --max-running-requests 256 \
+  --disable-radix-cache \
+  --dp-schedule-policy round_robin \
+  --skip-server-warmup \
+  --host 0.0.0.0 --port 30000
+```
+
+**Benchmark Command**
+
+```bash
+PYTHONPATH=/tmp/sglang-jax/python python -m sgl_jax.bench_serving \
+  --backend sgl-jax \
+  --model /models/Qwen3-8B \
+  --tokenizer /models/Qwen3-8B \
+  --host 127.0.0.1 --port 30000 \
+  --dataset-name random \
+  --random-input-len 1024 --random-output-len 1024 \
+  --num-prompts 384 --max-concurrency 128 \
+  --random-range-ratio 1 \
+  --seed 42 \
+  --warmup-requests 0
+```
+
+**Test Results**
+
+| ISL | OSL | Max concurrency | Prompts | Input tok/s | Output tok/s | Peak output tok/s | Mean TTFT (ms) | Mean TPOT (ms) | Duration (s) | OK |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1024 | 1024 | 128 | 384 | 8521.48 | 8521.48 | 10266.00 | 943.13 | 14.09 | 46.14 | 384 |
+
+#### v6e-4 SGL-JAX vs vLLM comparison
 
 > **Layout E — variant × workload sweep on single hardware.** Qwen3-8B and Qwen3-32B on TPU v6e-4 (TP=4), sgl-jax vs vLLM across ISL values 1024, 4096, and 8192; OSL values 1 and 1024; and concurrency values 8, 16, 32, 64, 128, and 256.
 
@@ -393,8 +451,8 @@ for input_seq_len in "${input_seq_lens[@]}"; do
         --backend ${backend} \
         --dataset-name random \
         --num-prompts ${num_prompts} \
-        --random-input ${input_seq_len} \
-        --random-output ${output_seq_len} \
+        --random-input-len ${input_seq_len} \
+        --random-output-len ${output_seq_len} \
         --max-concurrency ${max_concurrency} \
         --random-range-ratio 1 \
         --warmup-requests 0 \

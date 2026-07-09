@@ -4,7 +4,7 @@ title: "Grok-2"
 
 # Grok-2 on SGL-JAX
 
-> **Validated recipe** — TPU v6e-64 path validated on sglang-jax 0.1.0: server starts, sanity output correct, `bench_serving` numbers in §4.1. **Accuracy intentionally omitted** — Grok-2 is a base model (no chat template; see §1) and the cookbook follows design §6.F: base model recipes skip §4.1 Accuracy (chat-format datasets via `/v1/chat/completions` mis-extract on base models — see §3.1 for the underlying chat-template + evalscope-extractor interaction). **Cookbook used `--moe-backend epmoe`** because the fused MoE backend fails to init on this small-EP large-mesh layout (8 experts on 64 chips) (see §2.4). **Grok-2 architecture**: `config.json` declares `num_local_experts=8 num_experts_per_tok=2` under `Grok1ForCausalLM` — i.e. **MoE with 8 experts, 2 active per token** (not dense). Launch flags below assume MoE (`--ep-size 8 --moe-backend epmoe`).
+> **Validated recipe** — TPU v6e-64 path validated on sglang-jax 0.1.0: server starts and sanity output is correct. **Throughput numbers are intentionally omitted** until the Grok-2 TPU recipe has a release-quality performance datapoint. **Accuracy intentionally omitted** — Grok-2 is a base model (no chat template; see §1) and the cookbook follows design §6.F: base model recipes skip §4.1 Accuracy (chat-format datasets via `/v1/chat/completions` mis-extract on base models — see §3.1 for the underlying chat-template + evalscope-extractor interaction). **Cookbook used `--moe-backend epmoe`** because the fused MoE backend fails to init on this small-EP large-mesh layout (8 experts on 64 chips) (see §2.4). **Grok-2 architecture**: `config.json` declares `num_local_experts=8 num_experts_per_tok=2` under `Grok1ForCausalLM` — i.e. **MoE with 8 experts, 2 active per token** (not dense). Launch flags below assume MoE (`--ep-size 8 --moe-backend epmoe`).
 
 ## 1. Model Introduction
 
@@ -143,13 +143,13 @@ print(resp.choices[0].text)
 
 ## 4. Benchmark
 
-> Benchmark data below is a snapshot pinned to the `Tested build` listed in each Test Environment; not refreshed on every release.
+> Throughput results are not published in this recipe yet. Keep this page as a working launch recipe and benchmark template until the Grok-2 TPU path has a representative release-quality performance row.
 >
 > Accuracy section is omitted by design — see the banner + §1 for why base models skip it (per design §6.F).
 
-### 4.1 Speed — single workload (low-concurrency latency baseline)
+### 4.1 Speed Template
 
-> **Layout F — single-workload sweep (one data point).** Standard chat (ISL=1000, OSL=1000), `max_concurrency=16`, 80 prompts, `seed=42`.
+> **Benchmark command template.** Fixed-length random workload (ISL=1024, OSL=1024), `max_concurrency=16`, 80 prompts, `random_range_ratio=1`, `seed=42`, and no warmup requests.
 
 **Test Environment**
 
@@ -171,52 +171,16 @@ PYTHONPATH=/tmp/sglang-jax/python python -m sgl_jax.bench_serving \
   --tokenizer alvarobartt/grok-2-tokenizer \
   --host 127.0.0.1 --port 30000 \
   --dataset-name random \
-  --random-input-len 1000 --random-output-len 1000 \
+  --random-input-len 1024 --random-output-len 1024 \
   --num-prompts 80 --max-concurrency 16 \
-  --seed 42
+  --random-range-ratio 1 \
+  --seed 42 \
+  --warmup-requests 0
 ```
 
-**Test Results**
+**Published Results**
 
-```text
-============ Serving Benchmark Result ============
-Backend:                                 sgl-jax
-Traffic request rate:                    inf
-Max request concurrency:                 16
-Successful requests:                     80
-Benchmark duration (s):                  540.78
-Total input tokens:                      37205
-Total generated tokens:                  38314
-Request throughput (req/s):              0.15
-Input token throughput (tok/s):          68.80
-Output token throughput (tok/s):         70.85
-Peak output token throughput (tok/s):    96.00
-Peak concurrent requests:                18
-Total token throughput (tok/s):          139.65
-Concurrency:                             12.89
-----------------End-to-End Latency----------------
-Mean E2E Latency (ms):                   87163.46
-Median E2E Latency (ms):                 85736.22
-P90 E2E Latency (ms):                    157043.93
-P99 E2E Latency (ms):                    176535.69
----------------Time to First Token----------------
-Mean TTFT (ms):                          756.62
-Median TTFT (ms):                        632.52
-P99 TTFT (ms):                           1765.84
------Time per Output Token (excl. 1st token)------
-Mean TPOT (ms):                          185.63
-Median TPOT (ms):                        181.85
-P99 TPOT (ms):                           266.39
----------------Inter-Token Latency----------------
-Mean ITL (ms):                           180.80
-Median ITL (ms):                         174.79
-P95 ITL (ms):                            175.14
-P99 ITL (ms):                            461.90
-Max ITL (ms):                            1270.39
-==================================================
-```
-
-> Grok-2 throughput on this v6e-64 mesh is bottlenecked by small-EP MoE underutilization: with only 8 experts on 64 chips, the `--moe-backend epmoe` fallback (forced because `fused` crashes on this mesh, see §2.4) leaves most chips idle per token. This is a known limitation of the current fused MoE backend assumes large-EP; Grok-2's 8-expert layout sits below that assumption.
+No throughput result is published for Grok-2 in this recipe yet. The current limitation is the small-EP MoE layout: with only 8 experts, the validated `--moe-backend epmoe` path underutilizes large TPU meshes, while the fused backend is not yet a validated replacement for this layout. Publish numbers only after a tuned v7x or smaller-mesh configuration produces a representative result.
 
 ## Additional Resources
 

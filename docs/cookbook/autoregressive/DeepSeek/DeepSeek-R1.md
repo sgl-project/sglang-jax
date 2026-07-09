@@ -4,7 +4,7 @@ title: "DeepSeek R1"
 
 # DeepSeek R1 on SGL-JAX
 
-> **Validated recipe** — TPU v6e-64 path validated on sglang-jax 0.1.0: server starts, reasoning_content streams correctly, GSM8K accuracy 98.0% (50 examples, thinking-on), `bench_serving` numbers in §4.2.
+> **Validated recipe** — TPU v6e-64 path validated on sglang-jax 0.1.0: server starts, reasoning_content streams correctly, GSM8K accuracy 98.0% (50 examples, thinking-on). §4.2 includes a v7x-16 launch and `bench_serving` template; throughput numbers are intentionally omitted until the recipe has a release-quality performance datapoint.
 
 ## 1. Model Introduction
 
@@ -27,6 +27,7 @@ title: "DeepSeek R1"
 
 | TPU | Topology | Nodes | Chips / JAX devices | `--tp-size` | `--dp-size` | Tensor axis | `--ep-size` | Notes |
 |---|---|---|---|---|---|---|---|---|
+| **v7x-16** | 2x2x4 | 4 | 16 chips / 32 devices | 32 | 4 | 8 | 32 | Launch and benchmark template in §4.2. v7x exposes 2 JAX devices/chip; keep tensor axis 8 for the FP8 block-quant and MLA layout. |
 | **v6e-64** | 8x8 | 16 | 64 | 64 | 8 | 8 | 64 | This is the slice we measured on. `dp=8` required for FP8 shared-expert block-quant compatibility (`2048/8=256 > 128 = block_size`); `dp=4` silently collapses. Dense MLP block-quant scale grid `(144, 56)` further requires `144 % tensor == 0`, so tensor=8 is the only working option. HBM is tight at `dp=8`; see §2.4 Memory Management. |
 
 See [TPU topology reference](/base/tpu-topology-reference) for the TPU generation reference. For other slices (larger v6e, v7x variants, scaled-down configs), see [Adapting to other topologies](/base/tpu-topology-reference#adapting-to-other-topologies).
@@ -217,11 +218,44 @@ evalscope eval \
 
 ### 4.2 Speed
 
-> **Layout F — single-workload sweep (one data point).** Standard chat (ISL=1000, OSL=1000, `max_concurrency=16`, 80 prompts, `seed=42`). Future PRs can add reasoning-typical workloads (e.g., OSL=4096) and concurrency sweeps.
+> **v7x-16 benchmark template.** This recipe provides the launch and benchmark command shape, but does not publish a throughput result yet. That keeps the page useful as a working deployment recipe without turning a still-tunable datapoint into a release headline.
 
-**Test Environment** — same hardware/build as §4.1.
+**Test Environment**
 
-**Workload** — `bench_serving` with `--dataset-name random --random-input-len 1000 --random-output-len 1000 --num-prompts 80 --max-concurrency 16 --seed 42`.
+| Field | Value |
+|---|---|
+| Hardware | TPU v7x-16 (4 nodes x 4 chips, 32 JAX devices) |
+| Model | deepseek-ai/DeepSeek-R1 (real FP8 weights; runtime dtype bfloat16) |
+| Tensor Parallelism | 32 (tensor axis 8 via `--dp-size 4`) |
+| Data Parallelism | 4 |
+| Expert Parallelism | 32 |
+| Tested build | origin/main (`2d97c787f712f715784216f7c414a4f477ea8218`) |
+
+**Serving Flags Used**
+
+```bash
+JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -m sgl_jax.launch_server \
+  --model-path /models/DeepSeek-R1 \
+  --trust-remote-code \
+  --reasoning-parser deepseek-r1 \
+  --tp-size 32 --dp-size 4 --ep-size 32 \
+  --moe-backend epmoe \
+  --dtype bfloat16 \
+  --context-length 32768 \
+  --chunked-prefill-size 1024 \
+  --mem-fraction-static 0.88 \
+  --page-size 128 \
+  --max-running-requests 128 \
+  --attention-backend fa \
+  --disable-radix-cache \
+  --dp-schedule-policy round_robin \
+  --skip-server-warmup \
+  --nnodes 4 --node-rank ${NODE_RANK} \
+  --dist-init-addr ${MASTER_ADDR} \
+  --host 0.0.0.0 --port 30000
+```
+
+**Workload** — `bench_serving` with `--dataset-name random --random-input-len 1024 --random-output-len 1024 --num-prompts 384 --max-concurrency 128 --random-range-ratio 1 --seed 42 --warmup-requests 0`.
 
 **Benchmark Command**
 
@@ -232,52 +266,16 @@ PYTHONPATH=/tmp/sglang-jax/python python -m sgl_jax.bench_serving \
   --tokenizer /models/DeepSeek-R1 \
   --host 127.0.0.1 --port 30000 \
   --dataset-name random \
-  --random-input-len 1000 --random-output-len 1000 \
-  --num-prompts 80 --max-concurrency 16 \
-  --seed 42
+  --random-input-len 1024 --random-output-len 1024 \
+  --num-prompts 384 --max-concurrency 128 \
+  --random-range-ratio 1 \
+  --seed 42 \
+  --warmup-requests 0
 ```
 
-**Test Results**
+**Published Results**
 
-```text
-============ Serving Benchmark Result ============
-Backend:                                 sgl-jax
-Traffic request rate:                    inf
-Max request concurrency:                 16
-Successful requests:                     80
-Benchmark duration (s):                  154.53
-Total input tokens:                      37205
-Total generated tokens:                  38314
-Request throughput (req/s):              0.52
-Input token throughput (tok/s):          240.76
-Output token throughput (tok/s):         247.94
-Peak output token throughput (tok/s):    464.00
-Peak concurrent requests:                18
-Total token throughput (tok/s):          488.70
-Concurrency:                             13.94
-----------------End-to-End Latency----------------
-Mean E2E Latency (ms):                   26926.31
-Median E2E Latency (ms):                 26597.51
-P90 E2E Latency (ms):                    49470.68
-P99 E2E Latency (ms):                    57541.02
----------------Time to First Token----------------
-Mean TTFT (ms):                          1145.82
-Median TTFT (ms):                        1292.52
-P99 TTFT (ms):                           2607.65
------Time per Output Token (excl. 1st token)------
-Mean TPOT (ms):                          56.05
-Median TPOT (ms):                        54.35
-P99 TPOT (ms):                           102.02
----------------Inter-Token Latency----------------
-Mean ITL (ms):                           53.94
-Median ITL (ms):                         34.51
-P95 ITL (ms):                            37.43
-P99 ITL (ms):                            1256.92
-Max ITL (ms):                            2518.61
-==================================================
-```
-
-> R1's throughput on this workload reflects MoE + MLA + FP8 block-quant on the validated `dp=8` mesh; future PRs can add reasoning-typical workloads (OSL=4096+) for trace-heavy scenarios.
+Throughput numbers are intentionally omitted from this recipe for now. Use the command above to validate local deployments; publish a result row only after the configuration is tuned enough to be representative of the release target.
 
 ## Additional Resources
 

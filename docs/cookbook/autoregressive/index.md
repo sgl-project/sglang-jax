@@ -10,8 +10,8 @@ End-to-end serving recipes for autoregressive models on SGL-JAX, organized by ve
 
 | Emoji | Meaning |
 |---|---|
-| ✅ | **Validated** — primary model / hardware path empirically tuned with reference benchmark numbers in §4 |
-| 🧪 | **Partially validated** — at least one variant / hardware path has real benchmark output; other variants, matrix cells, or current-build reruns are still pending |
+| ✅ | **Validated** — primary model / hardware path empirically validated for launch, invocation, and/or accuracy; throughput rows are included only when the datapoint is release-quality |
+| 🧪 | **Partially validated** — at least one variant / hardware path has real validation output; other variants, matrix cells, or current-build reruns are still pending |
 | 🚧 | **Starter** — launch command derived from HF model card; not yet measured. PR back tested numbers to upgrade to 🧪 or ✅ |
 | 📝 | **Planned** — architecture supported by the runtime but no recipe yet (or model release pending) |
 | 🚫 | **Blocked** — runnable path blocked by an upstream weight format / HBM / runtime constraint; banner cites the root cause and unblocking plan |
@@ -30,7 +30,7 @@ End-to-end serving recipes for autoregressive models on SGL-JAX, organized by ve
 
 | Status | Model | Recipe | Min TPU | Backend |
 |---|---|---|---|---|
-| ✅ | GLM-4.5-Air (106B) | [`GLM/GLM-4.5.md`](/autoregressive/GLM/GLM-4.5) | v6e-32 | MoE + reasoning/tool (`glm45`) |
+| ✅ | GLM-4.5-Air (106B) | [`GLM/GLM-4.5.md`](/autoregressive/GLM/GLM-4.5) | v6e-32 / v7x-4 | MoE + reasoning/tool (`glm45`) |
 
 ### Google — `Google/`
 
@@ -42,20 +42,20 @@ End-to-end serving recipes for autoregressive models on SGL-JAX, organized by ve
 
 | Status | Model | Recipe | Min TPU | Backend |
 |---|---|---|---|---|
-| ✅ | Grok-2 (base) | [`Grok/Grok2.md`](/autoregressive/Grok/Grok2) | v6e-32 | MoE (8 experts, 2 active) |
+| ✅ | Grok-2 (base) | [`Grok/Grok2.md`](/autoregressive/Grok/Grok2) | v6e-64 | MoE (8 experts, 2 active) |
 
 ### InclusionAI — `InclusionAI/`
 
 | Status | Model | Recipe | Min TPU | Backend |
 |---|---|---|---|---|
-| ✅ | Ling 2.6-1T | [`InclusionAI/Ling-2.6.md`](/autoregressive/InclusionAI/Ling-2.6) | v6e-64 | MoE + linear attn |
+| ✅ | Ling 2.6-1T | [`InclusionAI/Ling-2.6.md`](/autoregressive/InclusionAI/Ling-2.6) | v6e-64 / v7x-16 | MoE + linear attn |
 
 ### Llama — `Llama/`
 
 | Status | Model | Recipe | Min TPU | Backend |
 |---|---|---|---|---|
 | ✅ | Llama 3.1 8B-Instruct | [`Llama/Llama3.1.md`](/autoregressive/Llama/Llama3.1) | v6e-4 | dense |
-| ✅ | Llama 3.3 70B | [`Llama/Llama3.3-70B.md`](/autoregressive/Llama/Llama3.3-70B) | v6e-32 | dense |
+| ✅ | Llama 3.3 70B | [`Llama/Llama3.3-70B.md`](/autoregressive/Llama/Llama3.3-70B) | v6e-16 / v7x-4 | dense |
 
 ### Moonshotai — `Moonshotai/`
 
@@ -68,8 +68,8 @@ End-to-end serving recipes for autoregressive models on SGL-JAX, organized by ve
 | Status | Model | Recipe | Min TPU | Backend |
 |---|---|---|---|---|
 | ✅ | Qwen-7B-Chat | [`Qwen/Qwen.md`](/autoregressive/Qwen/Qwen) | v6e-4 | dense |
-| ✅ | Qwen3-8B / Qwen3-32B | [`Qwen/Qwen3.md`](/autoregressive/Qwen/Qwen3) | v6e-4 | dense + reasoning (`qwen3`) + tool (`qwen25`) |
-| ✅ | Qwen3-30B-A3B | [`Qwen/Qwen3-MoE.md`](/autoregressive/Qwen/Qwen3-MoE) | v6e-16 | MoE + reasoning (`qwen3`) + tool (`qwen25`) |
+| ✅ | Qwen3-8B / Qwen3-32B | [`Qwen/Qwen3.md`](/autoregressive/Qwen/Qwen3) | v6e-4; 8B v7x-4 | dense + reasoning (`qwen3`) + tool (`qwen25`) |
+| ✅ | Qwen3-30B-A3B | [`Qwen/Qwen3-MoE.md`](/autoregressive/Qwen/Qwen3-MoE) | v6e-16 / v7x-4 | MoE + reasoning (`qwen3`) + tool (`qwen25`) |
 | ✅ | Qwen2.5-VL (3B / 7B / 32B / 72B) | [`Qwen/Qwen2.5-VL.md`](/autoregressive/Qwen/Qwen2.5-VL) | v6e-4 for 3B/7B/32B; 72B pending | vision-language autoregressive decoder |
 | 📝 | Qwen2 / Qwen2-MoE | _no recipe — same family runtime path_ | — | dense / MoE |
 
@@ -81,7 +81,7 @@ End-to-end serving recipes for autoregressive models on SGL-JAX, organized by ve
 | ✅ | MiMo-V2.5-Pro | [`Xiaomi/MiMo-V2.5-Pro.md`](/autoregressive/Xiaomi/MiMo-V2.5-Pro) | v6e-64 (v7x-16 alternative) | MoE + reasoning/tool (`mimo`) |
 | ✅ | MiMo-7B-RL | [`Xiaomi/MiMo-7B.md`](/autoregressive/Xiaomi/MiMo-7B) | v6e-4 | dense + reasoning/tool (`mimo`) |
 
-> Upgrade path: 🚧 → 🧪 requires real `evalscope` (accuracy) or `bench_serving` (throughput) output for at least one variant / hardware path. 🧪 → ✅ requires the recipe's claimed primary path to have complete **Test Environment → Deployment Command → Benchmark Command → Test Results** evidence without unresolved required cells. See [`Xiaomi/MiMo-V2-Flash.md` §4](/autoregressive/Xiaomi/MiMo-V2-Flash#4-benchmark) for the canonical four-section form.
+> Upgrade path: 🚧 → 🧪 requires real `evalscope` (accuracy), launch validation, or `bench_serving` output for at least one variant / hardware path. 🧪 → ✅ requires the recipe's claimed primary path to have complete launch and invocation evidence without unresolved required cells. Publish throughput tables only for representative release-quality datapoints; otherwise keep a benchmark command template without a result row.
 
 ## What "autoregressive" means here
 

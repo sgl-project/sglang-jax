@@ -4,7 +4,7 @@ title: "GLM-4.5"
 
 # GLM-4.5 MoE on SGL-JAX
 
-> **Validated recipe** — GLM-4.5-Air (106B) validated on TPU v6e-32 with sglang-jax 0.1.0; sanity + GSM8K + bench all pass. Pin to sglang-jax 0.1.0+ — earlier builds have a stale `q_proj` weight-transpose mapping that fails at first prefill.
+> **Validated recipe** — GLM-4.5-Air (106B) validated on TPU v6e-32 with sglang-jax 0.1.0; sanity + GSM8K pass, and §4.2 now includes the recommended v7x-4 high-throughput `bench_serving` row with the historical v6e-32 baseline kept as context. Pin to sglang-jax 0.1.0+ — earlier builds have a stale `q_proj` weight-transpose mapping that fails at first prefill.
 
 ## 1. Model Introduction
 
@@ -23,6 +23,7 @@ title: "GLM-4.5"
 
 | Model | TPU | Topology | Nodes | Chips | `--tp-size` | `--ep-size` | Notes |
 |---|---|---|---|---|---|---|---|
+| GLM-4.5-Air (106B) | **v7x-4** | 2x2x1 | 1 | 4 chips / 8 devices | 8 | 8 | Recommended throughput recipe in §4.2. v7x exposes 2 JAX devices/chip. |
 | GLM-4.5-Air (106B) | **v6e-32** | 4x8 | 8  | 32 | 32 | 32 | This is the slice we measured on. BF16 ~210 GB. |
 
 See [TPU topology reference](/base/tpu-topology-reference) for the TPU generation reference. For other slices (larger v6e, v7x variants, scaled-down configs), see [Adapting to other topologies](/base/tpu-topology-reference#adapting-to-other-topologies).
@@ -264,26 +265,59 @@ Recommended additional datasets: MMLU, GPQA Diamond, AIME 2025.
 
 ### 4.2 Speed
 
-> **Layout B — methodology + command template.** No measured numbers yet; PR back full `============ Serving Benchmark Result ============` blocks from `bench_serving` to upgrade to Validated.
+> **High-throughput v7x-4 row.** This cookbook row uses fixed-length random requests (ISL=1024, OSL=1024), `max_concurrency=128`, 384 prompts, `random_range_ratio=1`, `seed=42`, and no warmup requests. Radix cache is disabled and DP scheduling uses `round_robin`, so the result is throughput-oriented and not prefix-cache dependent.
 
-**Benchmark Command** — adapt the driver from [`Qwen3.md` §4.2](/autoregressive/Qwen/Qwen3#4-benchmark) (swap `MODEL_NAME` to the GLM-4.5 checkpoint, remove the vLLM half).
+**Test Environment**
 
-**Test Results** — GLM-4.5-Air, Layout B (`bench_serving` random 1024→1024, N=100, max-concurrency 16), v6e-32 + `--moe-backend epmoe`, sglang-jax 0.1.0:
+| Field | Value |
+|---|---|
+| Hardware | TPU v7x-4 (1 node x 4 chips, 8 JAX devices) |
+| Model | zai-org/GLM-4.5-Air (real BF16 weights) |
+| Tensor Parallelism | 8 |
+| Expert Parallelism | 8 |
+| Tested build | origin/main (`2d97c787f712f715784216f7c414a4f477ea8218`) |
 
+**Serving Flags Used**
+
+```bash
+JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -m sgl_jax.launch_server \
+  --model-path /models/GLM-4.5-Air \
+  --trust-remote-code \
+  --tp-size 8 --ep-size 8 \
+  --moe-backend epmoe \
+  --dtype bfloat16 \
+  --context-length 32768 \
+  --chunked-prefill-size 2048 \
+  --page-size 128 \
+  --max-running-requests 256 \
+  --disable-radix-cache \
+  --dp-schedule-policy round_robin \
+  --skip-server-warmup \
+  --host 0.0.0.0 --port 30000
 ```
-============ Serving Benchmark Result ============
-Backend:                  sgl-jax
-Successful requests:      100
-Benchmark duration (s):   95.10
-Request throughput:       1.05 req/s
-Input throughput:         1076.76 tok/s
-Output throughput:        1076.76 tok/s
-Total throughput:         2153.51 tok/s
-Mean E2E Latency (ms):    14229.21
-Mean TTFT (ms):           576.77
-Mean TPOT (ms):           13.35
-==================================================
+
+**Benchmark Command**
+
+```bash
+PYTHONPATH=/tmp/sglang-jax/python python -m sgl_jax.bench_serving \
+  --backend sgl-jax \
+  --model /models/GLM-4.5-Air \
+  --tokenizer /models/GLM-4.5-Air \
+  --dataset-name random --random-input-len 1024 --random-output-len 1024 \
+  --num-prompts 384 --max-concurrency 128 \
+  --random-range-ratio 1 \
+  --seed 42 \
+  --warmup-requests 0 \
+  --host 127.0.0.1 --port 30000
 ```
+
+**Test Results**
+
+| ISL | OSL | Max concurrency | Prompts | Input tok/s | Output tok/s | Peak output tok/s | Mean TTFT (ms) | Mean TPOT (ms) | Duration (s) | OK |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1024 | 1024 | 128 | 384 | 4013.55 | 4013.55 | 4992.00 | 3126.11 | 28.84 | 97.97 | 384 |
+
+> Historical v6e-32 baseline: `1024/1024/c16`, 100 prompts, 1076.76 output tok/s. The v7x-4 row above uses fewer chips and is the recommended throughput-oriented recipe.
 
 ## Additional Resources
 
