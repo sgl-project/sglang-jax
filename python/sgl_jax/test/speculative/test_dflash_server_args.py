@@ -74,3 +74,15 @@ def test_dflash_server_args_preserves_explicit_default_block_size(monkeypatch):
     args.check_server_args()
 
     assert args.speculative_num_draft_tokens == 4
+
+
+def test_dflash_server_args_allows_tensor_parallel(monkeypatch):
+    def fail_parse(*args, **kwargs):
+        raise AssertionError("non-default DFlash draft token count should not be inferred")
+
+    monkeypatch.setattr(dflash_util, "parse_dflash_draft_config", fail_parse)
+
+    args = _dflash_args(speculative_num_draft_tokens=16, tp_size=4, dp_size=1)
+    args.check_server_args()
+
+    assert args.tp_size == 4

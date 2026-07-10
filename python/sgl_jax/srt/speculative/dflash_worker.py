@@ -1,6 +1,6 @@
 """DFlash speculative decoding worker (greedy runtime path).
 
-Scope: tp_size=1, dp_size=1, disable_overlap_schedule, greedy-only, page_size=1.
+Scope: dp_size=1, disable_overlap_schedule, greedy-only, page_size=1.
 Ports the algorithmic structure of SGLang PyTorch PR 22077 to the sglang-jax
 scheduler/worker contract. See ``docs/design/dflash_stage_c.md``.
 
@@ -63,7 +63,7 @@ def _dflash_greedy_sample_jit(
 
 
 class DFlashWorker:
-    """DFlash draft/verify runtime worker (greedy, single-chip)."""
+    """DFlash draft/verify runtime worker (greedy, dp_size=1)."""
 
     def __init__(self, server_args, target_worker: ModelWorker):
         self.server_args = server_args
@@ -323,6 +323,8 @@ class DFlashWorker:
         from functools import partial as _partial
 
         from flax import nnx
+        from jax.sharding import NamedSharding
+        from jax.sharding import PartitionSpec as P
 
         from sgl_jax.srt.lora.context_manager import LoraBatchContext
         from sgl_jax.srt.model_executor.model_runner import _maybe_apply_recurrent_cow
@@ -331,6 +333,7 @@ class DFlashWorker:
         model_def = runner._model_def
         model_state_def = runner._model_state_def
         draft_token_num = self.block_size
+        token_sharding = NamedSharding(runner.mesh, P(None))
 
         @_partial(
             jax.jit,
@@ -362,6 +365,10 @@ class DFlashWorker:
                     draft_token_num=draft_token_num,
                 )
             )
+            accept_lens_out = jax.sharding.reshard(accept_lens_out, token_sharding)
+            next_token_ids_flat = jax.sharding.reshard(next_token_ids_flat, token_sharding)
+            new_verified_id = jax.sharding.reshard(new_verified_id, token_sharding)
+            accept_draft = jax.sharding.reshard(accept_draft, token_sharding)
             return (
                 output,
                 pool_updates,
@@ -678,7 +685,9 @@ class DFlashWorker:
         block_size = self.block_size
         sample_from_seed_hidden = self._sample_from_seed_hidden
         vocab_size = self._lm_head_vocab_size()
-        embedding_sharding = NamedSharding(runner.mesh, P(None, None))
+        embedding_sharding = NamedSharding(runner.mesh, P("data", "tensor"))
+        logits_sharding = NamedSharding(runner.mesh, P("data", "tensor"))
+        token_sharding = NamedSharding(runner.mesh, P(None))
 
         @_partial(
             jax.jit,
@@ -721,11 +730,16 @@ class DFlashWorker:
                 draft_hidden[:, :-1, :] if sample_from_seed_hidden else draft_hidden[:, 1:, :]
             )
             proposal_flat = proposal_hidden.reshape((-1, proposal_hidden.shape[-1]))
-            logits = jnp.einsum("th,vh->tv", proposal_flat, lm_head)[:, :vocab_size]
+            logits = jnp.dot(
+                proposal_flat,
+                lm_head.T,
+                out_sharding=logits_sharding,
+            )[:, :vocab_size]
             draft_next = jnp.argmax(logits, axis=-1).astype(jnp.int32)
             draft_next = draft_next.reshape(proposal_hidden.shape[:-1])
             seed = forward_batch.input_ids.reshape((-1, block_size))[:, :1]
             draft_token = jnp.concatenate([seed, draft_next], axis=1).reshape(-1)
+            draft_token = jax.sharding.reshard(draft_token, token_sharding)
             return output, pool_updates, aux, layers_topk_ids, draft_token
 
         self._jit_draft_block = _partial(
@@ -784,8 +798,8 @@ class DFlashWorker:
         mesh = pool.mesh
         n_layers = self.draft_layers
         block_size = self.block_size
-        vector_sharding = NamedSharding(mesh, P(None))
-        hidden_sharding = NamedSharding(mesh, P(None, None))
+        vector_sharding = NamedSharding(mesh, P("data"))
+        hidden_sharding = NamedSharding(mesh, P("data", None))
 
         model_def = runner._model_def
         model_state_def = runner._model_state_def
@@ -808,6 +822,9 @@ class DFlashWorker:
             is_decode: bool,
             block_size: int,
         ):
+            positions = jax.sharding.reshard(positions.astype(jnp.int32), vector_sharding)
+            cache_loc = jax.sharding.reshard(cache_loc.astype(jnp.int32), vector_sharding)
+            accept_lens = jax.sharding.reshard(accept_lens.astype(jnp.int32), vector_sharding)
             if is_decode:
                 target_hidden = gather_dflash_accepted_hidden_padded(
                     target_hidden,
@@ -816,6 +833,8 @@ class DFlashWorker:
                     hidden_out_sharding=hidden_sharding,
                     index_out_sharding=vector_sharding,
                 )
+            else:
+                target_hidden = jax.sharding.reshard(target_hidden, hidden_sharding)
 
             state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
             model = nnx.merge(model_def, state)
@@ -922,7 +941,7 @@ class DFlashWorker:
         return np.concatenate(pos).astype(np.int32)
 
     def _greedy_sample(self, hidden_states: jax.Array) -> jax.Array:
-        """argmax over the target LM head. tp_size=1 bring-up path (full vocab)."""
+        """Argmax over the target LM head."""
         return _dflash_greedy_sample_jit(
             hidden_states,
             self._target_lm_head,
