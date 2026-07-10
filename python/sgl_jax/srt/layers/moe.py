@@ -726,7 +726,11 @@ class EPMoE(nnx.Module):
                 padding = jnp.zeros((padding_size, intermediate.shape[1]), dtype=intermediate.dtype)
                 intermediate = jnp.concatenate([intermediate, padding], axis=0)
 
-        argsort_indices = jnp.argsort(sorted_selected_experts, stable=True)
+        argsort_indices = (
+            jnp.zeros(expected_tokens, dtype=jnp.int32)
+            .at[sorted_selected_experts]
+            .set(jnp.arange(expected_tokens, dtype=jnp.int32))
+        )
         unsort_intermediate = jnp.take(intermediate, indices=argsort_indices, axis=0)
 
         total_tokens = weights.shape[0] * weights.shape[1] // self.num_experts_per_tok
