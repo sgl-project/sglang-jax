@@ -1595,15 +1595,31 @@ class Scheduler(
             swa_evictable_size,
         )
 
+    def _prepare_chunked_reqs_to_exclude(self) -> dict[int, Req]:
+        """Retain scheduler ownership before removing chunked requests from a batch."""
+        if self.last_batch and self.last_batch.forward_mode.is_extend():
+            for dp_rank, info in enumerate(self.last_batch.reqs_info):
+                if info.chunked_req is None:
+                    continue
+                active_req = self.chunked_reqs[dp_rank]
+                if active_req is None:
+                    self.chunked_reqs[dp_rank] = info.chunked_req
+                else:
+                    assert (
+                        active_req is info.chunked_req
+                    ), f"Chunked request mismatch for DP rank {dp_rank}"
+
+        chunked_req_to_exclude: dict[int, Req] = {}
+        for dp_rank, req in enumerate(self.chunked_reqs):
+            if req is None:
+                continue
+            chunked_req_to_exclude[dp_rank] = req
+            if len(req.fill_ids) > len(req.prefix_indices):
+                self.tree_cache.cache_unfinished_req(req)
+        return chunked_req_to_exclude
+
     def get_next_batch_to_run(self) -> ScheduleBatch | None:
-        # Process chunked requests for each DP rank
-        chunked_req_to_exclude = {}
-        for dp_rank in range(self.dp_size):
-            if self.chunked_reqs[dp_rank] is not None:
-                # Move the chunked request out of the batch so that we can merge
-                # only finished requests to running_batch.
-                chunked_req_to_exclude[dp_rank] = self.chunked_reqs[dp_rank]
-                self.tree_cache.cache_unfinished_req(self.chunked_reqs[dp_rank])
+        chunked_req_to_exclude = self._prepare_chunked_reqs_to_exclude()
 
         # Merge the prefill batch into the running batch
         if self.last_batch and self.last_batch.forward_mode.is_extend():
@@ -1612,14 +1628,9 @@ class Scheduler(
             for dp_rank in range(self.dp_size):
                 info = self.last_batch.reqs_info[dp_rank]
                 if info.chunked_req is not None:
-                    # Verify consistency: info.chunked_req should match self.chunked_reqs[dp_rank]
-                    if dp_rank in chunked_req_to_exclude:
-                        assert (
-                            chunked_req_to_exclude[dp_rank] is info.chunked_req
-                        ), f"Chunked request mismatch for DP rank {dp_rank}"
-                    else:
-                        # This shouldn't happen, but handle it gracefully
-                        chunked_req_to_exclude[dp_rank] = info.chunked_req
+                    assert (
+                        chunked_req_to_exclude.get(dp_rank) is info.chunked_req
+                    ), f"Chunked request owner missing for DP rank {dp_rank}"
 
             # Filter batch
             # Track per-DP batch sizes before filtering
