@@ -11,6 +11,9 @@ from types import SimpleNamespace
 import jax.numpy as jnp
 import numpy as np
 
+from sgl_jax.srt.layers.attention.flashattention_backend import (
+    _repack_row_padded_page_indices,
+)
 from sgl_jax.srt.speculative.dflash_info import DFlashDraftInput
 from sgl_jax.srt.speculative.dflash_worker import DFlashWorker
 
@@ -105,5 +108,25 @@ def test_pack_cache_loc_rows_uses_bucket_stable_row_width():
     packed = w._pack_kv_cache(rows, [len(r) for r in rows])
 
     assert packed.shape == (32,)
-    np.testing.assert_array_equal(packed[:5], np.array([1, 2, 3, 0, 0], dtype=np.int32))
-    np.testing.assert_array_equal(packed[16:21], np.array([4, 5, 6, 7, 8], dtype=np.int32))
+    np.testing.assert_array_equal(packed[:16], np.array([1, 2, 3] + [3] * 13, dtype=np.int32))
+    np.testing.assert_array_equal(
+        packed[16:32], np.array([4, 5, 6, 7, 8] + [8] * 11, dtype=np.int32)
+    )
+
+
+def test_repack_row_padded_page_indices_removes_dflash_row_padding():
+    row0 = np.array(list(range(100, 123)) + [122] * 9, dtype=np.int32)
+    row1 = np.array(list(range(200, 223)) + [222] * 9, dtype=np.int32)
+    cache_loc = np.concatenate([row0, row1])
+
+    page_indices = _repack_row_padded_page_indices(
+        cache_loc,
+        np.array([23, 23], dtype=np.int32),
+        page_size=1,
+        dp_size=1,
+        per_dp_bs=2,
+    )
+
+    assert page_indices.shape == (46,)
+    np.testing.assert_array_equal(page_indices[:23], np.arange(100, 123, dtype=np.int32))
+    np.testing.assert_array_equal(page_indices[23:], np.arange(200, 223, dtype=np.int32))

@@ -36,6 +36,61 @@ def _per_dp_cumsum(lens, dp_size: int, per_dp_bs: int) -> np.ndarray:
     return cu.ravel()
 
 
+def _repack_row_padded_page_indices(
+    cache_loc: np.ndarray,
+    aligned_seq_lens: np.ndarray,
+    *,
+    page_size: int,
+    dp_size: int,
+    per_dp_bs: int,
+) -> np.ndarray:
+    """Repack row-padded cache_loc into cu_kv_lens-aligned page_indices.
+
+    DFlash keeps ``cache_loc`` rows bucket-padded to stabilize JIT input shapes.
+    The attention kernel, however, uses ``cu_kv_lens`` to locate each request's
+    pages. Therefore row padding must be removed from the middle of
+    ``page_indices`` and moved to the final whole-buffer padding step.
+    """
+    cache_loc = np.asarray(cache_loc, dtype=np.int32)
+    aligned_seq_lens = np.asarray(aligned_seq_lens, dtype=np.int64)
+    max_num_seqs = int(dp_size) * int(per_dp_bs)
+    if max_num_seqs <= 0 or cache_loc.size == 0:
+        return np.empty(0, dtype=np.int32)
+
+    if cache_loc.size % max_num_seqs != 0:
+        raise ValueError(
+            "row-padded cache_loc must be divisible by total sequence slots: "
+            f"len(cache_loc)={cache_loc.size}, max_num_seqs={max_num_seqs}"
+        )
+    if aligned_seq_lens.shape[0] != max_num_seqs:
+        raise ValueError(
+            "aligned_seq_lens must match total sequence slots: "
+            f"{aligned_seq_lens.shape[0]} vs {max_num_seqs}"
+        )
+
+    row_width = cache_loc.size // max_num_seqs
+    if row_width % page_size != 0:
+        raise ValueError(f"row_width={row_width} must be divisible by page_size={page_size}")
+
+    parts: list[np.ndarray] = []
+    for r in range(dp_size):
+        for j in range(per_dp_bs):
+            slot = r * per_dp_bs + j
+            valid_len = int(aligned_seq_lens[slot])
+            if valid_len <= 0:
+                continue
+            if valid_len > row_width:
+                raise ValueError(
+                    "aligned sequence length exceeds row-padded cache_loc width: "
+                    f"slot={slot}, valid_len={valid_len}, row_width={row_width}"
+                )
+            row_start = slot * row_width
+            row_pages = cache_loc[row_start : row_start + valid_len : page_size]
+            parts.append((row_pages // page_size).astype(np.int32))
+
+    return np.concatenate(parts) if parts else np.empty(0, dtype=np.int32)
+
+
 @register_pytree_node_class
 @dataclass
 class FlashAttentionMetadata:
@@ -279,6 +334,15 @@ class FlashAttention(AttentionBackend):
                     packed,
                     sharding=NamedSharding(self.mesh, P("data")),
                 )
+
+            if getattr(batch.spec_algorithm, "is_dflash", lambda: False)():
+                page_indices = _repack_row_padded_page_indices(
+                    batch.cache_loc,
+                    aligned_seq_lens,
+                    page_size=self.page_size,
+                    dp_size=dp_size,
+                    per_dp_bs=per_dp_bs,
+                )
         else:
             aligned_seq_lens = (
                 (batch.seq_lens + self.page_size - 1) // self.page_size
@@ -328,7 +392,7 @@ class FlashAttention(AttentionBackend):
         # recompilation of the Pallas attention kernel on every decode step.
         max_num_seqs = dp_size * per_dp_bs
         if max_num_seqs > 0 and len(page_indices) > 0:
-            current_pps = len(page_indices) // max_num_seqs
+            current_pps = cdiv(len(page_indices), max_num_seqs)
             bucketed_pps = max(16, 1 << max(0, (current_pps - 1)).bit_length())
             target_len = max_num_seqs * bucketed_pps
             if len(page_indices) < target_len:

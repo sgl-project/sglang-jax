@@ -672,15 +672,19 @@ class DFlashWorker:
     def _pack_kv_cache(self, rows: list[np.ndarray], kv_lens: list[int]) -> np.ndarray:
         """Pack per-request cache_loc rows into a bucket-stable flat layout.
 
-        ``get_eagle_forward_metadata`` builds ``cu_kv_lens`` from the aligned
-        per-request KV length, so the flat cache_loc rows must use that same
-        stride. The metadata layer does the later whole-buffer bucket padding.
+        ``ForwardBatch.cache_loc`` is a JIT-visible child. Keep each request row
+        in a min-16/power-of-two page bucket so decode only recompiles when the
+        KV length crosses a bucket. FA metadata removes row padding from
+        ``page_indices`` before the kernel sees it, keeping request boundaries
+        aligned with ``cu_kv_lens``.
         """
         if not rows:
             return np.empty(0, dtype=np.int32)
 
         max_kv = max(int(x) for x in kv_lens)
-        row_width = ((max_kv + self.page_size - 1) // self.page_size) * self.page_size
+        pages_per_seq = (max_kv + self.page_size - 1) // self.page_size
+        bucketed_pages = max(16, 1 << max(0, (pages_per_seq - 1)).bit_length())
+        row_width = bucketed_pages * self.page_size
 
         packed = np.empty((len(rows), row_width), dtype=np.int32)
         for i, row in enumerate(rows):
