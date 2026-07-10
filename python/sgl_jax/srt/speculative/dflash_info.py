@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass
 
 import jax
@@ -118,6 +119,35 @@ def dflash_greedy_verify_outputs(
     next_token_ids = target_predict.reshape(-1).astype(jnp.int32)
     verified_id = bonus.astype(jnp.int32)
     return accept_lens_out, next_token_ids, verified_id, accept_len_draft
+
+
+@functools.partial(jax.jit, static_argnames=("draft_token_num",))
+def dflash_greedy_verify(
+    draft_token: jax.Array,
+    target_logits: jax.Array,
+    *,
+    draft_token_num: int,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Fused target-logits argmax and greedy DFlash verification."""
+    candidates = draft_token.reshape((-1, int(draft_token_num)))
+    target_predict = jnp.argmax(target_logits, axis=-1).astype(jnp.int32).reshape(candidates.shape)
+
+    matches = candidates[:, 1:] == target_predict[:, :-1]
+    accept_len_draft = jnp.sum(jnp.cumprod(matches.astype(jnp.int32), axis=1), axis=1)
+    row_ids = jnp.arange(candidates.shape[0], dtype=jnp.int32)
+    flat_idx = row_ids * candidates.shape[1] + accept_len_draft
+    target_predict_flat = target_predict.reshape(-1).astype(jnp.int32)
+    mesh = getattr(jax.typeof(target_predict_flat).sharding, "mesh", None)
+    if mesh is None:
+        bonus = jnp.take(target_predict_flat, flat_idx)
+    else:
+        from jax.sharding import NamedSharding
+        from jax.sharding import PartitionSpec as P
+
+        bonus = target_predict_flat.at[flat_idx].get(out_sharding=NamedSharding(mesh, P(None)))
+
+    accept_lens_out = (accept_len_draft + 1).astype(jnp.int32)
+    return accept_lens_out, target_predict_flat, bonus, accept_len_draft.astype(jnp.int32)
 
 
 @dataclass
@@ -342,7 +372,8 @@ class DFlashVerifyInput:
         scheduler-facing decode outputs from :func:`dflash_greedy_verify_outputs`:
         ``(accept_lens_out, next_token_ids, verified_id, accept_len_draft)``.
         """
-        target_predict = jnp.argmax(target_logits, axis=-1).astype(jnp.int32)
-        candidates = self.draft_token.reshape((-1, int(self.draft_token_num)))
-        target_predict = target_predict.reshape(candidates.shape)
-        return dflash_greedy_verify_outputs(candidates, target_predict)
+        return dflash_greedy_verify(
+            self.draft_token,
+            target_logits,
+            draft_token_num=int(self.draft_token_num),
+        )

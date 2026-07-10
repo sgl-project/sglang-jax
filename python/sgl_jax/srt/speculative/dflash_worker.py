@@ -13,6 +13,7 @@ worker via ``__getattr__``.
 from __future__ import annotations
 
 import copy
+import functools
 import logging
 import os
 
@@ -40,6 +41,21 @@ from sgl_jax.srt.speculative.dflash_util import (
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 
 logger = logging.getLogger(__name__)
+
+
+@functools.partial(jax.jit, static_argnames=("vocab_size",))
+def _dflash_greedy_sample_jit(
+    hidden_states: jax.Array,
+    lm_head: jax.Array,
+    *,
+    vocab_size: int,
+) -> jax.Array:
+    """Fused target-head greedy sampling for DFlash draft proposals."""
+    output_shape = hidden_states.shape[:-1]
+    flat_hidden = hidden_states.reshape((-1, hidden_states.shape[-1]))
+    logits = jnp.einsum("th,vh->tv", flat_hidden, lm_head)[:, :vocab_size]
+    token_ids = jnp.argmax(logits, axis=-1).astype(jnp.int32)
+    return token_ids.reshape(output_shape)
 
 
 class DFlashWorker:
@@ -107,8 +123,13 @@ class DFlashWorker:
         # because is_draft_worker=True).
         self.draft_model_runner.initialize_jit()
 
+        self._debug_tokens_remaining = 4 if os.getenv("SGL_JAX_DFLASH_DEBUG_TOKENS") == "1" else 0
+        self._sample_from_seed_hidden = os.getenv("SGL_JAX_DFLASH_SAMPLE_FROM_SEED_HIDDEN") == "1"
+        self._debug_prefix_ab = os.getenv("SGL_JAX_DFLASH_DEBUG_PREFIX_AB") == "1"
+
         self.draft_layers = len(self.draft_model.model.layers)
         self._init_jit_kv_materialize()
+        self._init_jit_draft_block()
 
         logger.info(
             "Initialized DFLASH worker: block_size=%d, mask_token_id=%d, draft_layers=%d",
@@ -116,9 +137,6 @@ class DFlashWorker:
             self._mask_token_id,
             self.draft_layers,
         )
-        self._debug_tokens_remaining = 4 if os.getenv("SGL_JAX_DFLASH_DEBUG_TOKENS") == "1" else 0
-        self._sample_from_seed_hidden = os.getenv("SGL_JAX_DFLASH_SAMPLE_FROM_SEED_HIDDEN") == "1"
-        self._debug_prefix_ab = os.getenv("SGL_JAX_DFLASH_DEBUG_PREFIX_AB") == "1"
         if self._debug_tokens_remaining > 0:
             logger.warning(
                 "DFLASH debug enabled: tokens=%d sample_from_seed_hidden=%s prefix_ab=%s",
@@ -343,7 +361,7 @@ class DFlashWorker:
             forward_batch.input_embedding = input_embedding
             metadata = self.draft_model_runner.attn_backend.get_eagle_forward_metadata(draft_mwb)
             self.draft_model_runner.attn_backend.forward_metadata = metadata
-            draft_logits_output, _, _ = self.draft_model_runner.forward(forward_batch, None)
+            draft_logits_output, draft_next = self._run_jit_draft_block(forward_batch, None)
 
             if self._debug_tokens_remaining > 0 and self._debug_prefix_ab:
                 zero_prefix_lens = np.zeros_like(draft_prefix_lens)
@@ -367,15 +385,11 @@ class DFlashWorker:
             # release the temp kv
             allocator.restore_state(state)
 
-        draft_hidden = draft_logits_output.hidden_states.reshape(bs, self.block_size, -1)
-        # Greedy sample draft proposals d1..d15 from the target LM head.
-        proposal_hidden = (
-            draft_hidden[:, :-1, :] if self._sample_from_seed_hidden else draft_hidden[:, 1:, :]
-        )
-        draft_next = self._greedy_sample_from_head(
-            proposal_hidden.reshape(-1, draft_hidden.shape[-1])
-        ).reshape(bs, self.block_size - 1)
         if self._debug_tokens_remaining > 0:
+            draft_hidden = draft_logits_output.hidden_states.reshape(bs, self.block_size, -1)
+            proposal_hidden = (
+                draft_hidden[:, :-1, :] if self._sample_from_seed_hidden else draft_hidden[:, 1:, :]
+            )
             proposal_flat = proposal_hidden.reshape(-1, draft_hidden.shape[-1])
             vocab_size = self._lm_head_vocab_size()
             proposal_logits = (proposal_flat @ self._target_lm_head.T)[:, :vocab_size]
@@ -499,6 +513,97 @@ class DFlashWorker:
     # ------------------------------------------------------------------ #
     # KV materialization + greedy head sampling
     # ------------------------------------------------------------------ #
+    def _init_jit_draft_block(self):
+        """Build a draft model forward JIT that also samples draft proposals."""
+        from functools import partial as _partial
+
+        from flax import nnx
+
+        from sgl_jax.srt.lora.context_manager import LoraBatchContext
+        from sgl_jax.srt.model_executor.model_runner import _maybe_apply_recurrent_cow
+
+        runner = self.draft_model_runner
+        model_def = runner._model_def
+        model_state_def = runner._model_state_def
+        block_size = self.block_size
+        sample_from_seed_hidden = self._sample_from_seed_hidden
+        vocab_size = self._lm_head_vocab_size()
+
+        @_partial(
+            jax.jit,
+            donate_argnames=["memory_pools"],
+            static_argnames=[
+                "model_state_def",
+                "block_size",
+                "sample_from_seed_hidden",
+                "vocab_size",
+            ],
+        )
+        def _jit_draft_block(
+            model_def,
+            model_state_def,
+            model_state_leaves,
+            forward_batch,
+            memory_pools,
+            logits_metadata,
+            lm_head,
+            *,
+            block_size: int,
+            sample_from_seed_hidden: bool,
+            vocab_size: int,
+        ):
+            model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
+            model = nnx.merge(model_def, model_state)
+            memory_pools = _maybe_apply_recurrent_cow(forward_batch, memory_pools)
+            with LoraBatchContext.set_batch(forward_batch):
+                output, pool_updates, aux, layers_topk_ids = model(
+                    forward_batch, memory_pools, logits_metadata
+                )
+
+            draft_hidden = output.hidden_states.reshape(
+                (-1, block_size, output.hidden_states.shape[-1])
+            )
+            proposal_hidden = (
+                draft_hidden[:, :-1, :] if sample_from_seed_hidden else draft_hidden[:, 1:, :]
+            )
+            proposal_flat = proposal_hidden.reshape((-1, proposal_hidden.shape[-1]))
+            logits = jnp.einsum("th,vh->tv", proposal_flat, lm_head)[:, :vocab_size]
+            draft_next = jnp.argmax(logits, axis=-1).astype(jnp.int32)
+            draft_next = draft_next.reshape(proposal_hidden.shape[:-1])
+            return output, pool_updates, aux, layers_topk_ids, draft_next
+
+        self._jit_draft_block = _partial(
+            _jit_draft_block,
+            model_def,
+            model_state_def,
+            block_size=block_size,
+            sample_from_seed_hidden=sample_from_seed_hidden,
+            vocab_size=vocab_size,
+        )
+
+    def _run_jit_draft_block(self, forward_batch, logits_metadata):
+        runner = self.draft_model_runner
+
+        def _call_and_replace():
+            output, pool_updates, _, _, draft_next = self._jit_draft_block(
+                runner.model_state_leaves,
+                forward_batch,
+                runner.memory_pools,
+                logits_metadata,
+                self._target_lm_head,
+            )
+            if runner.tp_size == 1 and isinstance(pool_updates, list):
+                target_sharding = runner.token_to_kv_pool.kv_sharding
+                pool_updates = [jax.device_put(kv, target_sharding) for kv in pool_updates]
+            runner.memory_pools.replace_all(pool_updates)
+            return output, draft_next
+
+        _kv_lock = getattr(runner.token_to_kv_pool, "_donate_lock", None)
+        if _kv_lock is None:
+            return _call_and_replace()
+        with _kv_lock:
+            return _call_and_replace()
+
     def _init_jit_kv_materialize(self):
         """Build a single JIT function for materialize_kv + merge + KV write.
 
@@ -636,12 +741,13 @@ class DFlashWorker:
             return np.zeros((0,), dtype=np.int32)
         return np.concatenate(pos).astype(np.int32)
 
-    # @haifeng: jit_transpose and jit_matmul
-    def _greedy_sample_from_head(self, hidden_states: jax.Array) -> jax.Array:
+    def _greedy_sample(self, hidden_states: jax.Array) -> jax.Array:
         """argmax over the target LM head. tp_size=1 bring-up path (full vocab)."""
-        vocab_size = self._lm_head_vocab_size()
-        logits = (hidden_states @ self._target_lm_head.T)[:, :vocab_size]
-        return jnp.argmax(logits, axis=-1).astype(jnp.int32)
+        return _dflash_greedy_sample_jit(
+            hidden_states,
+            self._target_lm_head,
+            vocab_size=self._lm_head_vocab_size(),
+        )
 
     def _lm_head_vocab_size(self) -> int:
         # Unit tests instantiate this class via __new__; avoid __getattr__ fallback there.

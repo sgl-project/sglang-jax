@@ -39,7 +39,7 @@ def test_greedy_sample_from_head_picks_argmax():
     )
     w = _bare_worker(_target_lm_head=lm_head)
     hidden = jnp.array([[5.0, 0.0, 0.0], [0.0, 5.0, 0.0]], dtype=jnp.float32)
-    out = np.asarray(w._greedy_sample_from_head(hidden))
+    out = np.asarray(w._greedy_sample(hidden))
     np.testing.assert_array_equal(out, np.array([0, 1], dtype=np.int32))
 
 
