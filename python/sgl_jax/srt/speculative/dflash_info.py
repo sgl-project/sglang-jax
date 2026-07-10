@@ -164,6 +164,41 @@ def dflash_greedy_verify(
     )
 
 
+def gather_dflash_accepted_hidden_padded(
+    target_hidden: jax.Array,
+    accept_lens: jax.Array,
+    *,
+    block_size: int,
+    hidden_out_sharding=None,
+    index_out_sharding=None,
+) -> jax.Array:
+    """Gather accepted target hidden states into DFlash draft-extend layout.
+
+    Decode target hidden is row-major ``[bs, block_size, hidden]``. Draft KV
+    materialization expects a fixed ``bs * block_size`` shape with valid tokens
+    concatenated by request and trailing dummy rows padded from row 0.
+    """
+    hidden_size = target_hidden.shape[-1]
+    flat_hidden = target_hidden.reshape((-1, hidden_size))
+    accept_lens = accept_lens.astype(jnp.int32)
+    max_tokens = accept_lens.shape[0] * int(block_size)
+    ends = jnp.cumsum(accept_lens)
+    starts = ends - accept_lens
+    slot_ids = jnp.arange(max_tokens, dtype=jnp.int32)
+    row_ids = jnp.sum(slot_ids[:, None] >= ends[None, :], axis=1).astype(jnp.int32)
+    row_ids = jnp.minimum(row_ids, accept_lens.shape[0] - 1)
+    if index_out_sharding is None:
+        row_starts = starts.at[row_ids].get()
+    else:
+        row_starts = starts.at[row_ids].get(out_sharding=index_out_sharding)
+    col_ids = slot_ids - row_starts
+    gather_ids = row_ids * int(block_size) + col_ids
+    gather_ids = jnp.where(slot_ids < ends[-1], gather_ids, 0)
+    if hidden_out_sharding is None:
+        return flat_hidden.at[gather_ids].get()
+    return flat_hidden.at[gather_ids].get(out_sharding=hidden_out_sharding)
+
+
 @dataclass
 class DFlashDraftInput:
     """Host-side DFlash state carried between decode iterations."""
@@ -295,6 +330,8 @@ class DFlashVerifyInput:
     draft_token: jax.Array
     positions: jax.Array
     draft_token_num: int
+    input_ids_host: np.ndarray | None = None
+    positions_host: np.ndarray | None = None
     custom_mask: jax.Array | None = None
     prefix_cache_loc: jax.Array | None = None
     prefix_lens: jax.Array | None = None
@@ -352,6 +389,8 @@ class DFlashVerifyInput:
             prefix_cache_loc=children[3],
             prefix_lens=children[4],
             draft_token_num=aux_data["draft_token_num"],
+            input_ids_host=None,
+            positions_host=None,
             dense_draft=aux_data.get("dense_draft", False),
             capture_hidden_mode=aux_data["capture_hidden_mode"],
         )
@@ -369,12 +408,22 @@ class DFlashVerifyInput:
         drafted token ids / positions and request full aux-hidden capture so the
         verify forward yields the target features DFlash needs for the next block.
         """
-        model_worker_batch.input_ids = np.asarray(
-            jax.device_get(self.draft_token), dtype=np.int32
-        ).reshape(-1)
-        model_worker_batch.positions = np.asarray(
-            jax.device_get(self.positions), dtype=np.int32
-        ).reshape(-1)
+        if self.input_ids_host is None:
+            model_worker_batch.input_ids = np.asarray(
+                jax.device_get(self.draft_token), dtype=np.int32
+            ).reshape(-1)
+        else:
+            model_worker_batch.input_ids = np.asarray(self.input_ids_host, dtype=np.int32).reshape(
+                -1
+            )
+        if self.positions_host is None:
+            model_worker_batch.positions = np.asarray(
+                jax.device_get(self.positions), dtype=np.int32
+            ).reshape(-1)
+        else:
+            model_worker_batch.positions = np.asarray(self.positions_host, dtype=np.int32).reshape(
+                -1
+            )
         model_worker_batch.spec_info_padded = self
         model_worker_batch.capture_hidden_mode = self.capture_hidden_mode
 

@@ -10,6 +10,7 @@ from sgl_jax.srt.speculative.dflash_info import (
     compute_dflash_accept_len_and_bonus,
     compute_new_kv_slices,
     dflash_greedy_verify_outputs,
+    gather_dflash_accepted_hidden_padded,
 )
 from sgl_jax.srt.speculative.spec_info import SpecInput
 
@@ -167,6 +168,36 @@ def test_dflash_greedy_verify_outputs():
         np.asarray(next_token_ids_flat),
         np.array([11, 12, 13, 99, 21, 77, 88, 99, 55, 31, 32, 33], dtype=np.int32),
     )
+
+
+def test_gather_dflash_accepted_hidden_padded_matches_valid_concat_layout():
+    block_size = 4
+    hidden = jnp.arange(3 * block_size * 2, dtype=jnp.float32).reshape(3 * block_size, 2)
+    accept_lens = jnp.array([4, 2, 1], dtype=jnp.int32)
+
+    out = gather_dflash_accepted_hidden_padded(
+        hidden,
+        accept_lens,
+        block_size=block_size,
+    )
+
+    hidden_np = np.asarray(hidden).reshape(3, block_size, 2)
+    expected_valid = np.concatenate(
+        [
+            hidden_np[0, :4],
+            hidden_np[1, :2],
+            hidden_np[2, :1],
+        ],
+        axis=0,
+    )
+    expected = np.concatenate(
+        [
+            expected_valid,
+            np.repeat(hidden_np[0, 0:1], 3 * block_size - len(expected_valid), axis=0),
+        ],
+        axis=0,
+    )
+    np.testing.assert_array_equal(np.asarray(out), expected)
 
 
 def test_dflash_committed_slices_prefill():
