@@ -506,6 +506,7 @@ class DFlashDraftModel(nnx.Module):
             )
         hidden_states, _ = self.fc(target_hidden)
         return self.hidden_norm(hidden_states)
+
     # @haifeng kv injection here
     def materialize_kv(
         self,

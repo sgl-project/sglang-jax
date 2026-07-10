@@ -4,12 +4,6 @@ Scope: tp_size=1, dp_size=1, disable_overlap_schedule, greedy-only, page_size=1.
 Ports the algorithmic structure of SGLang PyTorch PR 22077 to the sglang-jax
 scheduler/worker contract. See ``docs/design/dflash_stage_c.md``.
 
-TODO(n=2 bug): batched decode with n>1 produces degraded/incorrect output for
-the second sequence. Suspected causes: (1) scheduler merge gate at scheduler.py
-~L1806 blocks DFlash batch merges, (2) _pack_cache_loc_rows zero-pads with
-page 0 causing cross-request KV contamination, (3) possible hidden-state or
-KV-cache alignment bug in the multi-request decode path.
-
 The worker exposes the surface the scheduler needs
 (``speculative_num_draft_tokens``, ``forward_batch_speculative_generation``,
 ``run_spec_decode_precompile``) and delegates everything else to the target
@@ -678,24 +672,23 @@ class DFlashWorker:
     def _pack_kv_cache(self, rows: list[np.ndarray], kv_lens: list[int]) -> np.ndarray:
         """Pack per-request cache_loc rows into a bucket-stable flat layout.
 
-        ``ForwardBatch.cache_loc`` is a JIT-visible child. If its length grows
-        with sequence length, TPU decode retraces repeatedly. The FA metadata
-        already expects each request row to have a uniform page stride, so pad
-        the row width to the same min-16/power-of-two page bucket used by
-        ``get_eagle_forward_metadata``.
+        ``get_eagle_forward_metadata`` builds ``cu_kv_lens`` from the aligned
+        per-request KV length, so the flat cache_loc rows must use that same
+        stride. The metadata layer does the later whole-buffer bucket padding.
         """
         if not rows:
             return np.empty(0, dtype=np.int32)
 
         max_kv = max(int(x) for x in kv_lens)
-        pages_per_seq = (max_kv + self.page_size - 1) // self.page_size
-        bucketed_pages = max(16, 1 << max(0, (pages_per_seq - 1)).bit_length())
-        row_width = bucketed_pages * self.page_size
+        row_width = ((max_kv + self.page_size - 1) // self.page_size) * self.page_size
 
-        packed = np.zeros((len(rows), row_width), dtype=np.int32)
+        packed = np.empty((len(rows), row_width), dtype=np.int32)
         for i, row in enumerate(rows):
             n = min(len(row), row_width)
-            packed[i, :n] = np.asarray(row[:n], dtype=np.int32)
+            row_arr = np.asarray(row[:n], dtype=np.int32)
+            pad_value = row_arr[-1] if n > 0 else np.int32(0)
+            packed[i, :] = pad_value
+            packed[i, :n] = row_arr
         return packed.reshape(-1)
 
     def _slice_committed_target_hidden(self, hidden_states, accept_lens_np, bs):
@@ -774,10 +767,11 @@ class DFlashWorker:
                 self.target_worker.model_runner.attn_backend.get_eagle_forward_metadata(mwb)
             )
             self.target_worker.forward_batch_generation(
-                mwb, skip_sample=True, forward_metadata=forward_metadata,
+                mwb,
+                skip_sample=True,
+                forward_metadata=forward_metadata,
             )
         else:
-            from jax.sharding import NamedSharding, PartitionSpec as P
 
             forward_batch = ForwardBatch.init_new(mwb, self.draft_model_runner)
             forward_batch.forward_mode = ForwardMode.TARGET_VERIFY
@@ -801,15 +795,14 @@ class DFlashWorker:
         prefix_len = max(0, pps - block_size)
 
         input_ids = np.ones(num_tokens, dtype=np.int32)
-        positions = np.tile(
-            np.arange(prefix_len, prefix_len + block_size, dtype=np.int32), bs
-        )
+        positions = np.tile(np.arange(prefix_len, prefix_len + block_size, dtype=np.int32), bs)
         out_cache_loc = np.arange(1, num_tokens + 1, dtype=np.int32)
         cache_loc = np.zeros(bs * pps, dtype=np.int32)
         seq_lens = np.full(bs, prefix_len, dtype=np.int32)
 
         sampling_info = ModelWorkerSamplingInfo.generate_for_precompile_all_greedy(
-            bs, self.target_worker.model_runner.model_config.vocab_size,
+            bs,
+            self.target_worker.model_runner.model_config.vocab_size,
         )
         sampling_info.vocab_mask = None
 
