@@ -12,6 +12,7 @@ worker via ``__getattr__``.
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import functools
 import logging
@@ -21,6 +22,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from sgl_jax.srt.layers.logits_processor import LogitsMetadata
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 from sgl_jax.srt.managers.tp_worker import ModelWorker
 from sgl_jax.srt.model_executor.forward_batch_info import (
@@ -33,6 +35,7 @@ from sgl_jax.srt.speculative.dflash_info import (
     DFlashVerifyInput,
     build_dflash_draft_block,
     compute_new_kv_slices,
+    dflash_greedy_verify_impl,
 )
 from sgl_jax.srt.speculative.dflash_util import (
     parse_dflash_draft_config,
@@ -128,6 +131,7 @@ class DFlashWorker:
         self._debug_prefix_ab = os.getenv("SGL_JAX_DFLASH_DEBUG_PREFIX_AB") == "1"
 
         self.draft_layers = len(self.draft_model.model.layers)
+        self._init_jit_target_verify()
         self._init_jit_kv_materialize()
         self._init_jit_draft_block()
 
@@ -250,13 +254,17 @@ class DFlashWorker:
         forward_metadata = self.target_worker.model_runner.attn_backend.get_eagle_forward_metadata(
             model_worker_batch
         )
-        logits_output, _, cache_miss_count = self.target_worker.forward_batch_generation(
-            model_worker_batch, skip_sample=True, forward_metadata=forward_metadata
-        )
-
-        # 3) Greedy accept + bonus.
-        accept_lens_out, next_token_ids_flat, new_verified_id, _accept_draft = verify_input.verify(
-            logits_output.next_token_logits
+        (
+            logits_output,
+            cache_miss_count,
+            accept_lens_out,
+            next_token_ids_flat,
+            new_verified_id,
+            _accept_draft,
+        ) = self._run_jit_target_verify(
+            model_worker_batch,
+            verify_input,
+            forward_metadata,
         )
         if self._debug_tokens_remaining > 0:
             self._debug_tokens_remaining -= 1
@@ -310,6 +318,157 @@ class DFlashWorker:
             extend_logprob_start_len_per_req=None,
         )
 
+    def _init_jit_target_verify(self):
+        """Build target model forward + DFlash greedy verification as one JIT."""
+        from functools import partial as _partial
+
+        from flax import nnx
+
+        from sgl_jax.srt.lora.context_manager import LoraBatchContext
+        from sgl_jax.srt.model_executor.model_runner import _maybe_apply_recurrent_cow
+
+        runner = self.target_worker.model_runner
+        model_def = runner._model_def
+        model_state_def = runner._model_state_def
+        draft_token_num = self.block_size
+
+        @_partial(
+            jax.jit,
+            donate_argnames=["memory_pools"],
+            static_argnames=["model_state_def", "draft_token_num"],
+        )
+        def target_verify(
+            model_def,
+            model_state_def,
+            model_state_leaves,
+            forward_batch,
+            memory_pools,
+            logits_metadata,
+            draft_token,
+            *,
+            draft_token_num: int,
+        ):
+            model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
+            model = nnx.merge(model_def, model_state)
+            memory_pools = _maybe_apply_recurrent_cow(forward_batch, memory_pools)
+            with LoraBatchContext.set_batch(forward_batch):
+                output, pool_updates, aux, layers_topk_ids = model(
+                    forward_batch, memory_pools, logits_metadata
+                )
+            accept_lens_out, next_token_ids_flat, new_verified_id, accept_draft = (
+                dflash_greedy_verify_impl(
+                    draft_token,
+                    output.next_token_logits,
+                    draft_token_num=draft_token_num,
+                )
+            )
+            return (
+                output,
+                pool_updates,
+                aux,
+                layers_topk_ids,
+                accept_lens_out,
+                next_token_ids_flat,
+                new_verified_id,
+                accept_draft,
+            )
+
+        self._jit_target_verify = _partial(
+            target_verify,
+            model_def,
+            model_state_def,
+            draft_token_num=draft_token_num,
+        )
+
+    def _run_jit_target_verify(
+        self,
+        model_worker_batch: ModelWorkerBatch,
+        verify_input: DFlashVerifyInput,
+        forward_metadata,
+    ):
+        import jax._src.test_util as jtu
+
+        target_worker = self.target_worker
+        runner = target_worker.model_runner
+
+        if target_worker.worker.server_args.enable_lora and target_worker.need_prepare_lora_batch:
+            target_worker.prepare_lora_batch(model_worker_batch)
+
+        if model_worker_batch.forward_batch is not None:
+            forward_batch = model_worker_batch.forward_batch
+        else:
+            forward_batch = ForwardBatch.init_new(model_worker_batch, runner)
+
+        runner.attn_backend.forward_metadata = forward_metadata
+        logits_metadata = LogitsMetadata.from_model_worker_batch(model_worker_batch, self.mesh)
+
+        def _call_and_replace():
+            with jtu.count_pjit_cpp_cache_miss() as count:
+                (
+                    output,
+                    pool_updates,
+                    _,
+                    layers_topk_ids,
+                    accept_lens_out,
+                    next_token_ids_flat,
+                    new_verified_id,
+                    accept_draft,
+                ) = self._jit_target_verify(
+                    runner.model_state_leaves,
+                    forward_batch,
+                    runner.memory_pools,
+                    logits_metadata,
+                    verify_input.draft_token,
+                )
+                cache_miss_count = count()
+
+            if runner.tp_size == 1 and isinstance(pool_updates, list):
+                target_sharding = runner.token_to_kv_pool.kv_sharding
+                pool_updates = [jax.device_put(kv, target_sharding) for kv in pool_updates]
+            runner.memory_pools.replace_all(pool_updates)
+            return (
+                output,
+                cache_miss_count,
+                layers_topk_ids,
+                accept_lens_out,
+                next_token_ids_flat,
+                new_verified_id,
+                accept_draft,
+            )
+
+        _kv_lock = getattr(runner.token_to_kv_pool, "_donate_lock", None)
+        try:
+            mesh_ctx = jax.sharding.use_mesh(self.mesh)
+        except AttributeError:
+            try:
+                mesh_ctx = jax.set_mesh(self.mesh)
+            except AttributeError:
+                mesh_ctx = self.mesh
+
+        lock_ctx = _kv_lock if _kv_lock is not None else contextlib.nullcontext()
+        with mesh_ctx, lock_ctx:
+            (
+                output,
+                cache_miss_count,
+                layers_topk_ids,
+                accept_lens_out,
+                next_token_ids_flat,
+                new_verified_id,
+                accept_draft,
+            ) = _call_and_replace()
+
+        target_worker.dump_topk_ids(layers_topk_ids, model_worker_batch)
+        target_worker.sync_queue.put((layers_topk_ids, model_worker_batch))
+
+        return (
+            output,
+            cache_miss_count,
+            accept_lens_out,
+            next_token_ids_flat,
+            new_verified_id,
+            accept_draft,
+        )
+
     # ------------------------------------------------------------------ #
     # Draft block forward
     # ------------------------------------------------------------------ #
@@ -330,15 +489,6 @@ class DFlashWorker:
         block_ids_flat = block_ids.reshape(-1)
         positions_flat = positions.reshape(-1)
 
-        # Draft input embedding comes from the borrowed target embedding table.
-        from jax.sharding import NamedSharding
-        from jax.sharding import PartitionSpec as P
-
-        embed = self._target_embed
-        ids = jnp.asarray(block_ids_flat)
-        out_sharding = NamedSharding(self.draft_model_runner.mesh, P(None, None))
-        input_embedding = embed.at[ids].get(out_sharding=out_sharding)
-
         # Temporary draft-block KV slots (dropped after the draft forward).
         allocator = self.draft_model_runner.token_to_kv_pool_allocator
         state = allocator.backup_state()
@@ -358,7 +508,6 @@ class DFlashWorker:
             )
             forward_batch = ForwardBatch.init_new(draft_mwb, self.draft_model_runner)
             forward_batch.forward_mode = ForwardMode.TARGET_VERIFY
-            forward_batch.input_embedding = input_embedding
             metadata = self.draft_model_runner.attn_backend.get_eagle_forward_metadata(draft_mwb)
             self.draft_model_runner.attn_backend.forward_metadata = metadata
             draft_logits_output, draft_next = self._run_jit_draft_block(forward_batch, None)
@@ -375,12 +524,11 @@ class DFlashWorker:
                 )
                 no_prefix_batch = ForwardBatch.init_new(no_prefix_mwb, self.draft_model_runner)
                 no_prefix_batch.forward_mode = ForwardMode.TARGET_VERIFY
-                no_prefix_batch.input_embedding = input_embedding
                 no_prefix_metadata = (
                     self.draft_model_runner.attn_backend.get_eagle_forward_metadata(no_prefix_mwb)
                 )
                 self.draft_model_runner.attn_backend.forward_metadata = no_prefix_metadata
-                no_prefix_output, _, _ = self.draft_model_runner.forward(no_prefix_batch, None)
+                no_prefix_output, _ = self._run_jit_draft_block(no_prefix_batch, None)
         finally:
             # release the temp kv
             allocator.restore_state(state)
@@ -518,6 +666,8 @@ class DFlashWorker:
         from functools import partial as _partial
 
         from flax import nnx
+        from jax.sharding import NamedSharding
+        from jax.sharding import PartitionSpec as P
 
         from sgl_jax.srt.lora.context_manager import LoraBatchContext
         from sgl_jax.srt.model_executor.model_runner import _maybe_apply_recurrent_cow
@@ -528,6 +678,7 @@ class DFlashWorker:
         block_size = self.block_size
         sample_from_seed_hidden = self._sample_from_seed_hidden
         vocab_size = self._lm_head_vocab_size()
+        embedding_sharding = NamedSharding(runner.mesh, P(None, None))
 
         @_partial(
             jax.jit,
@@ -539,19 +690,22 @@ class DFlashWorker:
                 "vocab_size",
             ],
         )
-        def _jit_draft_block(
+        def draft(
             model_def,
             model_state_def,
             model_state_leaves,
             forward_batch,
             memory_pools,
             logits_metadata,
+            embed,
             lm_head,
             *,
             block_size: int,
             sample_from_seed_hidden: bool,
             vocab_size: int,
         ):
+            input_embedding = embed.at[forward_batch.input_ids].get(out_sharding=embedding_sharding)
+            forward_batch.input_embedding = input_embedding
             model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
             model = nnx.merge(model_def, model_state)
             memory_pools = _maybe_apply_recurrent_cow(forward_batch, memory_pools)
@@ -573,7 +727,7 @@ class DFlashWorker:
             return output, pool_updates, aux, layers_topk_ids, draft_next
 
         self._jit_draft_block = _partial(
-            _jit_draft_block,
+            draft,
             model_def,
             model_state_def,
             block_size=block_size,
@@ -590,6 +744,7 @@ class DFlashWorker:
                 forward_batch,
                 runner.memory_pools,
                 logits_metadata,
+                self._target_embed,
                 self._target_lm_head,
             )
             if runner.tp_size == 1 and isinstance(pool_updates, list):
@@ -633,7 +788,7 @@ class DFlashWorker:
             static_argnames=["model_state_def"],
             donate_argnames=["kv_buffers"],
         )
-        def _jit_fn(
+        def draft_extend(
             model_def,
             model_state_def,
             model_state_leaves,
@@ -662,7 +817,7 @@ class DFlashWorker:
                 )
             return new_bufs
 
-        self._jit_materialize_write = _partial(_jit_fn, model_def, model_state_def)
+        self._jit_materialize_write = _partial(draft_extend, model_def, model_state_def)
 
     def _append_target_hidden_to_draft_kv(
         self, model_worker_batch: ModelWorkerBatch, draft_input: DFlashDraftInput, is_prefill: bool

@@ -121,14 +121,13 @@ def dflash_greedy_verify_outputs(
     return accept_lens_out, next_token_ids, verified_id, accept_len_draft
 
 
-@functools.partial(jax.jit, static_argnames=("draft_token_num",))
-def dflash_greedy_verify(
+def dflash_greedy_verify_impl(
     draft_token: jax.Array,
     target_logits: jax.Array,
     *,
     draft_token_num: int,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    """Fused target-logits argmax and greedy DFlash verification."""
+    """Pure JAX target-logits argmax and greedy DFlash verification."""
     candidates = draft_token.reshape((-1, int(draft_token_num)))
     target_predict = jnp.argmax(target_logits, axis=-1).astype(jnp.int32).reshape(candidates.shape)
 
@@ -148,6 +147,21 @@ def dflash_greedy_verify(
 
     accept_lens_out = (accept_len_draft + 1).astype(jnp.int32)
     return accept_lens_out, target_predict_flat, bonus, accept_len_draft.astype(jnp.int32)
+
+
+@functools.partial(jax.jit, static_argnames=("draft_token_num",))
+def dflash_greedy_verify(
+    draft_token: jax.Array,
+    target_logits: jax.Array,
+    *,
+    draft_token_num: int,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Fused target-logits argmax and greedy DFlash verification."""
+    return dflash_greedy_verify_impl(
+        draft_token,
+        target_logits,
+        draft_token_num=draft_token_num,
+    )
 
 
 @dataclass
