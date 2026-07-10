@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import copy
+import logging
+import os
 from contextlib import contextmanager
 from functools import partial
 from typing import NamedTuple
@@ -21,6 +24,25 @@ from sgl_jax.srt.speculative.relay_buffer import (
     update_spec_relay_buffers,
 )
 
+logger = logging.getLogger(__name__)
+
+_TARGET_VERIFY_DECODE_LOOP_ENV = "SGL_JAX_TARGET_VERIFY_DECODE_LOOP"
+_TARGET_VERIFY_MODES = {"auto", "batched", "decode-loop"}
+_STEP3P5_DECODE_LOOP_WARNED_ENV = "SGL_JAX_STEP3P5_DECODE_LOOP_VERIFY_WARNED"
+
+
+def _host_array_for_decode_loop(value):
+    if value is None:
+        return None
+    if isinstance(value, jax.Array) and not value.is_fully_addressable:
+        if value.is_fully_replicated:
+            value = value.addressable_data(0)
+        else:
+            from jax.experimental.multihost_utils import process_allgather
+
+            value = process_allgather(value, tiled=True)
+    return np.asarray(jax.device_get(value))
+
 
 class GreedyDraftInputs(NamedTuple):
     hidden_states: jax.Array
@@ -35,6 +57,9 @@ class GreedyDraftInputs(NamedTuple):
 class GreedySampleAndPrepareOutput(NamedTuple):
     hidden_states: jax.Array
     positions: jax.Array
+    draft_extend_hidden_states: jax.Array
+    draft_extend_positions: jax.Array
+    draft_extend_verified_id: jax.Array
     new_seq_lens: jax.Array
     select_index: jax.Array
     safe_index: jax.Array
@@ -52,6 +77,89 @@ class FusedDraftExtendPendingResult(NamedTuple):
     accept_lens: object
     sel: np.ndarray
     updated_relay_buffers: object | None
+
+
+def _target_verify_mode_from_env_or_args(server_args) -> str:
+    override = os.environ.get(_TARGET_VERIFY_DECODE_LOOP_ENV)
+    if override is not None:
+        return "decode-loop" if override == "1" else "batched"
+    mode = getattr(server_args, "speculative_target_verify_mode", "auto")
+    if mode not in _TARGET_VERIFY_MODES:
+        raise ValueError(
+            "speculative_target_verify_mode must be one of "
+            f"{sorted(_TARGET_VERIFY_MODES)}, got {mode!r}"
+        )
+    return mode
+
+
+def _is_nextn_algorithm(value) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        value = SpeculativeAlgorithm.from_string(value)
+    return bool(value.is_nextn())
+
+
+def _get_hf_config_from_worker(worker):
+    model_config = getattr(worker, "model_config", None)
+    if model_config is None:
+        model_runner = getattr(worker, "model_runner", None)
+        model_config = getattr(model_runner, "model_config", None)
+    return getattr(model_config, "hf_config", None)
+
+
+def _is_step3p5_target_model(spec_worker) -> bool:
+    hf_config = _get_hf_config_from_worker(spec_worker.target_worker)
+    if hf_config is None:
+        return False
+    model_type = getattr(hf_config, "model_type", None)
+    if isinstance(model_type, str) and model_type.lower() == "step3p5":
+        return True
+    architectures = getattr(hf_config, "architectures", []) or []
+    return "Step3p5ForCausalLM" in architectures
+
+
+def _warn_step3p5_decode_loop_once():
+    if os.environ.get(_STEP3P5_DECODE_LOOP_WARNED_ENV) == "1":
+        return
+    os.environ[_STEP3P5_DECODE_LOOP_WARNED_ENV] = "1"
+    logger.warning(
+        "Step3p5 NEXTN greedy decoding is using correctness-preserving "
+        "decode-loop verify in auto mode. This path preserves greedy "
+        "equivalence but is slower than batched verify; use "
+        "--speculative-target-verify-mode=batched only for performance "
+        "experiments that can tolerate the known Step3p5 correctness risk."
+    )
+
+
+def _should_use_decode_loop_target_verify(
+    *,
+    spec_worker,
+    draft_worker,
+    model_worker_batch,
+    is_greedy: bool,
+    use_relay_state: bool,
+) -> bool:
+    mode = _target_verify_mode_from_env_or_args(spec_worker.server_args)
+    if mode == "batched":
+        return False
+    algorithm = getattr(spec_worker, "speculative_algorithm", None)
+    if algorithm is None:
+        algorithm = getattr(model_worker_batch, "spec_algorithm", None)
+    supported = (
+        _is_nextn_algorithm(algorithm)
+        and is_greedy
+        and draft_worker.topk == 1
+        and not use_relay_state
+    )
+    if mode == "decode-loop":
+        return supported
+    use_step3p5_fallback = supported and _is_step3p5_target_model(spec_worker)
+    if use_step3p5_fallback:
+        _warn_step3p5_decode_loop_once()
+    return use_step3p5_fallback
 
 
 @contextmanager
@@ -138,6 +246,8 @@ def _prepare_draft_inputs(
     *,
     speculative_num_steps,
     speculative_num_draft_tokens,
+    preserve_gather_sharding=True,
+    gather_out_sharding=None,
 ):
     accept_width = speculative_num_steps + 1
     req_ids = (
@@ -152,11 +262,15 @@ def _prepare_draft_inputs(
     )
     hidden_sharding = jax.typeof(hidden_states).sharding
     positions_sharding = jax.typeof(positions).sharding
-    if isinstance(hidden_sharding, NamedSharding):
+    if gather_out_sharding is not None:
+        gathered_hidden = hidden_states.at[safe_index, :].get(out_sharding=gather_out_sharding)
+    elif preserve_gather_sharding and isinstance(hidden_sharding, NamedSharding):
         gathered_hidden = hidden_states.at[safe_index, :].get(out_sharding=hidden_sharding)
     else:
         gathered_hidden = hidden_states[safe_index, :]
-    if isinstance(positions_sharding, NamedSharding):
+    if gather_out_sharding is not None:
+        gathered_positions = positions.at[safe_index].get(out_sharding=gather_out_sharding)
+    elif preserve_gather_sharding and isinstance(positions_sharding, NamedSharding):
         gathered_positions = positions.at[safe_index].get(out_sharding=positions_sharding)
     else:
         gathered_positions = positions[safe_index]
@@ -180,6 +294,8 @@ def _verify_greedy(
     target_predict,
     speculative_num_steps,
     speculative_num_draft_tokens,
+    preserve_gather_sharding=True,
+    gather_out_sharding=None,
 ):
     bs = seq_lens.shape[0]
     n = speculative_num_draft_tokens
@@ -221,10 +337,15 @@ def _verify_greedy(
         verified_id,
         speculative_num_steps=speculative_num_steps,
         speculative_num_draft_tokens=speculative_num_draft_tokens,
+        preserve_gather_sharding=preserve_gather_sharding,
+        gather_out_sharding=gather_out_sharding,
     )
     return GreedySampleAndPrepareOutput(
         hidden_states=prepared.hidden_states,
         positions=prepared.positions,
+        draft_extend_hidden_states=target_hidden,
+        draft_extend_positions=positions,
+        draft_extend_verified_id=predict,
         new_seq_lens=prepared.new_seq_lens,
         select_index=prepared.select_index,
         safe_index=safe_index,
@@ -357,6 +478,9 @@ def _verify_rejection_sampling(
     return GreedySampleAndPrepareOutput(
         hidden_states=prepared.hidden_states,
         positions=prepared.positions,
+        draft_extend_hidden_states=target_hidden,
+        draft_extend_positions=positions,
+        draft_extend_verified_id=predict,
         new_seq_lens=prepared.new_seq_lens,
         select_index=prepared.select_index,
         safe_index=safe_index,
@@ -439,7 +563,9 @@ def _rotate_prefill_input_ids(input_ids, extend_seq_lens, verified_id, dp_size, 
     return jax.vmap(rotate_rank)(ids, ext, verified).reshape(input_ids.shape)
 
 
-def _gather_rows_preserve_sharding(values, index):
+def _gather_rows_preserve_sharding(values, index, *, out_sharding=None):
+    if out_sharding is not None:
+        return values.at[index, :].get(out_sharding=out_sharding)
     sharding = jax.typeof(values).sharding
     if isinstance(sharding, NamedSharding):
         return values.at[index, :].get(out_sharding=sharding)
@@ -448,6 +574,14 @@ def _gather_rows_preserve_sharding(values, index):
 
 def _reshard_values(sharding, *values):
     return tuple(jax.sharding.reshard(value, sharding) for value in values)
+
+
+def _device_put_values(sharding, *values):
+    return tuple(jax.device_put(value, sharding) for value in values)
+
+
+def _decode_loop_output_shardings(mesh):
+    return NamedSharding(mesh, P()), NamedSharding(mesh, P("data"))
 
 
 def _topk1_index_from_logits(logits):
@@ -917,7 +1051,8 @@ def _build_verify(topk: int):
         )
         prepared_hidden = prepared.hidden_states
         prepared_verified_id = prepared.verified_id
-        prepared_verified_id_data = prepared.verified_id
+        prepared_hidden_for_draft_extend = prepared.draft_extend_hidden_states
+        prepared_verified_id_data = prepared.draft_extend_verified_id
         prepared_next_verified_id = _take_with_index_sharding(
             prepared.verified_id, prepared.select_index
         )
@@ -939,8 +1074,8 @@ def _build_verify(topk: int):
         prepared_sel_pos = prepared.sel_pos
         prepared_sel_pos_data = prepared.sel_pos
         prepared_predict = prepared.predict
-        prepared_positions = prepared.positions
-        prepared_positions_data = prepared.positions
+        prepared_positions = prepared.draft_extend_positions
+        prepared_positions_data = prepared.draft_extend_positions
         prepared_verify_seq_lens = target_forward_batch.seq_lens
         prepared_allocate_lens_data = verify_allocate_lens
 
@@ -974,6 +1109,7 @@ def _build_verify(topk: int):
                 prepared_sel_pos_data,
                 prepared_positions_data,
                 prepared_allocate_lens_data,
+                prepared_hidden_for_draft_extend,
             ) = _reshard_values(
                 data,
                 prepared_verified_id_data,
@@ -984,6 +1120,7 @@ def _build_verify(topk: int):
                 prepared_sel_pos_data,
                 prepared_positions_data,
                 prepared_allocate_lens_data,
+                prepared_hidden_for_draft_extend,
             )
             if return_target_logits:
                 target_logits_for_host = jax.sharding.reshard(target_logits_for_host, rep)
@@ -991,6 +1128,7 @@ def _build_verify(topk: int):
         return (
             target_pool_updates,
             prepared_hidden,
+            prepared_hidden_for_draft_extend,
             prepared_verified_id,
             prepared_verified_id_data,
             prepared_next_verified_id,
@@ -1012,7 +1150,7 @@ def _build_verify(topk: int):
     return fused_verify
 
 
-def _build_prefill(num_layers: int, topk: int):
+def _build_prefill(num_layers: int, topk: int, chain_mtp: bool = False):
     """Build prefill JIT: target extend + all MTP draft-extend layers."""
     assert topk == 1, "Fused greedy prefill only supports topk=1"
 
@@ -1075,13 +1213,13 @@ def _build_prefill(num_layers: int, topk: int):
         layer0_hidden = None
         mesh = None
 
-        draft_forward_batch.spec_info.hidden_states = target_hidden
+        chained_hidden = target_hidden
         for i in range(num_layers):
             state = jax.tree_util.tree_unflatten(draft_model_state_def, draft_all_leaves[i])
             model = nnx.merge(draft_model_def, state)
 
             draft_forward_batch.input_ids = input_ids
-            draft_forward_batch.spec_info.hidden_states = target_hidden
+            draft_forward_batch.spec_info.hidden_states = chained_hidden
             output, pool_updates, _, _ = model(
                 draft_forward_batch, all_memory_pools[i], draft_logits_metadata
             )
@@ -1093,6 +1231,8 @@ def _build_prefill(num_layers: int, topk: int):
             all_topk_index.append(topk_idx)
             if i == 0:
                 layer0_hidden = output.hidden_states
+            if chain_mtp and output.hidden_states is not None:
+                chained_hidden = output.hidden_states
             if i < num_layers - 1:
                 input_ids = _rotate_prefill_input_ids(
                     input_ids,
@@ -1388,7 +1528,11 @@ def launch_fused_draft_extend_for_decode(
 
     if batch_output.next_draft_input.verified_id.shape[0] <= 0:
         return None
-    target_hidden = batch_output.logits_output.hidden_states
+    target_hidden = getattr(
+        batch_output.next_draft_input,
+        "hidden_states_for_draft_extend",
+        batch_output.logits_output.hidden_states,
+    )
     update_relay = relay_buffers is not None
 
     draft_input = EagleDraftInput(
@@ -1554,6 +1698,7 @@ def restore_draft_extend_result(draft_worker, model_worker_batch, pending_result
     batch_output.next_draft_input.topk_p = np.ones(topk_index.shape, dtype=np.float32)
     batch_output.next_draft_input.topk_index = topk_index
     batch_output.next_draft_input.verified_id = np.asarray(next_verified_id)[sel]
+    batch_output.next_draft_input.hidden_states_for_draft_extend = None
     batch_output.next_draft_input.allocate_lens = batch_output.next_draft_input.allocate_lens[
         : model_worker_batch.real_bs
     ]
@@ -1632,6 +1777,7 @@ def spec_prefill(spec_worker, model_worker_batch, launch_done=None, *, update_re
         draft_worker._fused_greedy_prefill_jit_fn = _build_prefill(
             num_layers=draft_worker.speculative_num_steps,
             topk=draft_worker.topk,
+            chain_mtp=getattr(draft_worker, "chain_mtp_hidden_states", False),
         )
 
     data_sharding = NamedSharding(draft_worker.mesh, P("data"))
@@ -1758,6 +1904,269 @@ def spec_prefill_overlap(spec_worker, model_worker_batch):
     return spec_prefill(spec_worker, model_worker_batch, update_relay=True)
 
 
+def _build_decode_loop_cache_loc(
+    req_to_token_pool,
+    req_pool_indices: np.ndarray,
+    seq_lens: np.ndarray,
+    *,
+    dp_size: int,
+    per_dp_bs: int,
+    page_size: int,
+) -> np.ndarray:
+    per_rank_sizes = []
+    for r in range(dp_size):
+        start = r * per_dp_bs
+        end = start + per_dp_bs
+        aligned = ((seq_lens[start:end] + page_size - 1) // page_size) * page_size
+        per_rank_sizes.append(int(np.sum(np.where(seq_lens[start:end] > 0, aligned, 0))))
+    per_dp_cache_loc_size = max(max(per_rank_sizes, default=0), per_dp_bs * page_size)
+    cache_loc = np.zeros(dp_size * per_dp_cache_loc_size, dtype=np.int32)
+    req_to_token = req_to_token_pool.req_to_token
+    for r in range(dp_size):
+        dst = r * per_dp_cache_loc_size
+        for j in range(per_dp_bs):
+            slot = r * per_dp_bs + j
+            seq_len = int(seq_lens[slot])
+            req_idx = int(req_pool_indices[slot])
+            if seq_len <= 0 or req_idx < 0:
+                continue
+            aligned = ((seq_len + page_size - 1) // page_size) * page_size
+            cache_loc[dst : dst + seq_len] = req_to_token[req_idx, :seq_len]
+            dst += aligned
+    return cache_loc
+
+
+def _build_decode_loop_out_cache_loc(
+    req_to_token_pool,
+    req_pool_indices: np.ndarray,
+    positions: np.ndarray,
+    valid: np.ndarray,
+) -> np.ndarray:
+    out_cache_loc = np.full(positions.shape, -1, dtype=np.int32)
+    req_to_token = req_to_token_pool.req_to_token
+    for i, is_valid in enumerate(valid):
+        req_idx = int(req_pool_indices[i])
+        pos = int(positions[i])
+        if not is_valid or req_idx < 0 or pos < 0:
+            continue
+        out_cache_loc[i] = req_to_token[req_idx, pos]
+    return out_cache_loc
+
+
+def _decode_loop_target_verify(
+    *,
+    spec_worker,
+    model_worker_batch,
+    target_mr,
+    previous_verified_id,
+    previous_token_list,
+    verify_allocate_lens,
+    return_target_logits,
+) -> tuple:
+    from sgl_jax.srt.model_executor.forward_batch_info import (
+        CaptureHiddenMode,
+        ForwardMode,
+    )
+
+    if os.environ.get("SGL_JAX_TARGET_VERIFY_DECODE_LOOP_LOGGED") != "1":
+        os.environ["SGL_JAX_TARGET_VERIFY_DECODE_LOOP_LOGGED"] = "1"
+        logger.info("[VERIFY_DECODE_LOOP] target verify decode-loop path active")
+
+    req_to_token_pool, _ = spec_worker.target_worker.get_memory_pool()
+    bs = model_worker_batch.seq_lens.shape[0]
+    n = spec_worker.draft_worker.speculative_num_draft_tokens
+    dp_size = model_worker_batch.dp_size
+    per_dp_bs = model_worker_batch.per_dp_bs_size if dp_size > 1 else bs
+
+    prev_verified_host = _host_array_for_decode_loop(previous_verified_id).astype(np.int32)
+    prev_tokens_host = _host_array_for_decode_loop(previous_token_list).astype(np.int32)
+    seq_lens_base = np.asarray(model_worker_batch.seq_lens, dtype=np.int32)
+    valid = seq_lens_base > 0
+    draft_tokens_2d = np.concatenate(
+        [prev_verified_host.reshape(bs, 1), prev_tokens_host.reshape(bs, -1)[:, : n - 1]],
+        axis=1,
+    ).astype(np.int32)
+    positions_2d = (
+        seq_lens_base.reshape(bs, 1) + np.arange(n, dtype=np.int32).reshape(1, n)
+    ).astype(np.int32)
+
+    logits_per_step = []
+    hidden_per_step = []
+    cache_miss_count = 0
+    for step in range(n):
+        step_seq_lens = np.where(valid, seq_lens_base + step + 1, 0).astype(np.int32)
+        step_positions = np.where(valid, positions_2d[:, step], 0).astype(np.int32)
+        step_input_ids = np.where(valid, draft_tokens_2d[:, step], 0).astype(np.int32)
+        step_out_cache_loc = _build_decode_loop_out_cache_loc(
+            req_to_token_pool,
+            np.asarray(model_worker_batch.req_pool_indices, dtype=np.int32),
+            step_positions,
+            valid,
+        )
+        step_cache_loc = _build_decode_loop_cache_loc(
+            req_to_token_pool,
+            np.asarray(model_worker_batch.req_pool_indices, dtype=np.int32),
+            step_seq_lens,
+            dp_size=dp_size,
+            per_dp_bs=per_dp_bs,
+            page_size=spec_worker.page_size,
+        )
+
+        decode_batch = copy.copy(model_worker_batch)
+        decode_batch.forward_mode = ForwardMode.DECODE
+        decode_batch.input_ids = step_input_ids
+        decode_batch.positions = step_positions
+        decode_batch.seq_lens = step_seq_lens
+        decode_batch.out_cache_loc = step_out_cache_loc
+        decode_batch.cache_loc = step_cache_loc
+        decode_batch.extend_prefix_lens = None
+        decode_batch.extend_seq_lens = None
+        decode_batch.logits_indices = None
+        decode_batch.spec_info_padded = None
+        decode_batch.capture_hidden_mode = CaptureHiddenMode.FULL
+
+        target_mr.attn_backend.forward_metadata = target_mr.attn_backend.get_forward_metadata(
+            decode_batch
+        )
+        decode_forward_batch = _make_forward_batch(decode_batch, target_mr)
+        decode_forward_batch.bid = model_worker_batch.bid
+        decode_logits_metadata = _prepare_logits_metadata(
+            decode_batch, spec_worker.mesh, include_accept_lens=False
+        )
+        logits_output, step_cache_miss_count, _ = target_mr.forward(
+            decode_forward_batch, decode_logits_metadata
+        )
+        cache_miss_count += step_cache_miss_count
+        logits_per_step.append(logits_output.next_token_logits)
+        hidden_per_step.append(logits_output.hidden_states)
+
+    with jax.set_mesh(spec_worker.mesh):
+        rep_sharding = NamedSharding(spec_worker.mesh, P())
+        target_logits = jnp.stack(logits_per_step, axis=1).reshape(bs * n, -1)
+        target_hidden = jnp.stack(hidden_per_step, axis=1).reshape(bs * n, -1)
+        draft_tokens = jnp.asarray(draft_tokens_2d.reshape(bs * n), dtype=jnp.int32)
+        positions = jnp.asarray(positions_2d.reshape(bs * n), dtype=jnp.int32)
+        target_predict = jnp.argmax(target_logits, axis=-1).astype(jnp.int32).reshape(-1)
+        prepared = _verify_greedy(
+            target_hidden=target_hidden,
+            positions=positions,
+            seq_lens=jnp.asarray(seq_lens_base, dtype=jnp.int32),
+            draft_tokens=draft_tokens,
+            target_predict=target_predict,
+            speculative_num_steps=spec_worker.draft_worker.speculative_num_steps,
+            speculative_num_draft_tokens=n,
+            preserve_gather_sharding=False,
+            gather_out_sharding=rep_sharding,
+        )
+
+        target_logits_for_host = (
+            _gather_rows_preserve_sharding(
+                target_logits,
+                prepared.safe_index,
+                out_sharding=rep_sharding,
+            )
+            if return_target_logits
+            else None
+        )
+        prepared_hidden = prepared.hidden_states
+        prepared_verified_id = prepared.verified_id
+        prepared_hidden_for_draft_extend = target_hidden
+        prepared_verified_id_data = target_predict
+        prepared_next_verified_id = _take_with_index_sharding(
+            prepared.verified_id, prepared.select_index
+        )
+        prepared_new_seq_lens = prepared.new_seq_lens
+        prepared_accept_lens_host = prepared.accept_lens
+        prepared_accept_lens_data = prepared.accept_lens
+        prepared_extend_seq_lens = jnp.where(
+            jnp.asarray(seq_lens_base, dtype=jnp.int32) > 0,
+            jnp.full((bs,), n, dtype=jnp.int32),
+            jnp.zeros((bs,), dtype=jnp.int32),
+        )
+        prepared_logits_indices = (
+            jnp.cumsum(
+                prepared_extend_seq_lens.reshape(dp_size, bs // dp_size),
+                axis=1,
+            ).reshape(-1)
+            - 1
+        ).astype(jnp.int32)
+        prepared_sel_pos = prepared.sel_pos
+        prepared_sel_pos_data = prepared.sel_pos
+        prepared_predict = prepared.predict
+        prepared_positions = prepared.draft_extend_positions
+        prepared_positions_data = prepared.draft_extend_positions
+        prepared_verify_seq_lens = jnp.asarray(seq_lens_base, dtype=jnp.int32)
+        prepared_allocate_lens_data = verify_allocate_lens
+
+    mesh = spec_worker.mesh
+    if mesh is not None:
+        rep, data = _decode_loop_output_shardings(mesh)
+        (
+            prepared_hidden,
+            prepared_verified_id,
+            prepared_new_seq_lens,
+            prepared_accept_lens_host,
+            prepared_sel_pos,
+            prepared_predict,
+            prepared_positions,
+        ) = _device_put_values(
+            rep,
+            prepared_hidden,
+            prepared_verified_id,
+            prepared_new_seq_lens,
+            prepared_accept_lens_host,
+            prepared_sel_pos,
+            prepared_predict,
+            prepared_positions,
+        )
+        (
+            prepared_verified_id_data,
+            prepared_next_verified_id,
+            prepared_accept_lens_data,
+            prepared_extend_seq_lens,
+            prepared_logits_indices,
+            prepared_sel_pos_data,
+            prepared_positions_data,
+            prepared_allocate_lens_data,
+            prepared_hidden_for_draft_extend,
+        ) = _device_put_values(
+            data,
+            prepared_verified_id_data,
+            prepared_next_verified_id,
+            prepared_accept_lens_data,
+            prepared_extend_seq_lens,
+            prepared_logits_indices,
+            prepared_sel_pos_data,
+            prepared_positions_data,
+            prepared_allocate_lens_data,
+            prepared_hidden_for_draft_extend,
+        )
+        if return_target_logits:
+            target_logits_for_host = jax.device_put(target_logits_for_host, rep)
+
+    return (
+        prepared_hidden,
+        prepared_hidden_for_draft_extend,
+        prepared_verified_id,
+        prepared_verified_id_data,
+        prepared_next_verified_id,
+        prepared_new_seq_lens,
+        prepared_accept_lens_host,
+        prepared_accept_lens_data,
+        prepared_extend_seq_lens,
+        prepared_logits_indices,
+        prepared_sel_pos,
+        prepared_sel_pos_data,
+        prepared_predict,
+        prepared_positions,
+        prepared_positions_data,
+        prepared_verify_seq_lens,
+        prepared_allocate_lens_data,
+        target_logits_for_host,
+        cache_miss_count,
+    )
+
+
 def spec_decode_verify(spec_worker, model_worker_batch, cur_allocate_lens):
     """Run target verify as the first speculative decode JIT."""
     from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
@@ -1844,10 +2253,18 @@ def spec_decode_verify(spec_worker, model_worker_batch, cur_allocate_lens):
     # from (base_rng, step), so only this small int crosses the host->device boundary.
     target_mr._sampler_step += 1
 
-    with jax.set_mesh(draft_worker.mesh), _count_pjit_cpp_cache_miss() as count:
+    use_decode_loop_verify = _should_use_decode_loop_target_verify(
+        spec_worker=spec_worker,
+        draft_worker=draft_worker,
+        model_worker_batch=model_worker_batch,
+        is_greedy=_sv_is_greedy,
+        use_relay_state=use_relay_state,
+    )
+    target_pool_updates = None
+    if use_decode_loop_verify:
         (
-            target_pool_updates,
             prepared_hidden,
+            prepared_hidden_for_draft_extend,
             prepared_verified_id,
             prepared_verified_id_data,
             prepared_next_verified_id,
@@ -1864,37 +2281,70 @@ def spec_decode_verify(spec_worker, model_worker_batch, cur_allocate_lens):
             prepared_verify_seq_lens,
             prepared_allocate_lens_data,
             target_logits,
-        ) = draft_worker._fused_greedy_verify_jit_fn(
-            target_mr._model_def,
-            target_mr._model_state_def,
-            tuple(target_mr.model_state_leaves),
-            target_forward_batch,
-            target_mr.memory_pools,
-            target_logits_metadata,
-            previous_verified_id,
-            previous_token_list,
-            getattr(spec_worker, "spec_relay_buffers", None),
-            relay_future_indices,
-            verify_allocate_lens,
-            target_mr._sampler_base_rng,
-            target_mr._sampler_step,
-            _sv_temps,
-            _sv_topks,
-            _sv_topps,
-            speculative_num_steps=draft_worker.speculative_num_steps,
-            speculative_num_draft_tokens=draft_worker.speculative_num_draft_tokens,
+            cache_miss_count,
+        ) = _decode_loop_target_verify(
+            spec_worker=spec_worker,
+            model_worker_batch=model_worker_batch,
+            target_mr=target_mr,
+            previous_verified_id=previous_verified_id,
+            previous_token_list=previous_token_list,
+            verify_allocate_lens=verify_allocate_lens,
             return_target_logits=return_target_logits,
-            use_relay_state=use_relay_state,
-            dp_size=model_worker_batch.dp_size,
-            is_greedy=_sv_is_greedy,
-            threshold_single=_sv_thr_single,
-            threshold_acc=_sv_thr_acc,
-            enable_top_k=_sv_enable_top_k,
-            enable_top_p=_sv_enable_top_p,
         )
-        cache_miss_count = count()
+    else:
+        with jax.set_mesh(draft_worker.mesh), _count_pjit_cpp_cache_miss() as count:
+            (
+                target_pool_updates,
+                prepared_hidden,
+                prepared_hidden_for_draft_extend,
+                prepared_verified_id,
+                prepared_verified_id_data,
+                prepared_next_verified_id,
+                prepared_new_seq_lens,
+                prepared_accept_lens_host,
+                prepared_accept_lens_data,
+                prepared_extend_seq_lens,
+                prepared_logits_indices,
+                prepared_sel_pos,
+                prepared_sel_pos_data,
+                prepared_predict,
+                prepared_positions,
+                prepared_positions_data,
+                prepared_verify_seq_lens,
+                prepared_allocate_lens_data,
+                target_logits,
+            ) = draft_worker._fused_greedy_verify_jit_fn(
+                target_mr._model_def,
+                target_mr._model_state_def,
+                tuple(target_mr.model_state_leaves),
+                target_forward_batch,
+                target_mr.memory_pools,
+                target_logits_metadata,
+                previous_verified_id,
+                previous_token_list,
+                getattr(spec_worker, "spec_relay_buffers", None),
+                relay_future_indices,
+                verify_allocate_lens,
+                target_mr._sampler_base_rng,
+                target_mr._sampler_step,
+                _sv_temps,
+                _sv_topks,
+                _sv_topps,
+                speculative_num_steps=draft_worker.speculative_num_steps,
+                speculative_num_draft_tokens=draft_worker.speculative_num_draft_tokens,
+                return_target_logits=return_target_logits,
+                use_relay_state=use_relay_state,
+                dp_size=model_worker_batch.dp_size,
+                is_greedy=_sv_is_greedy,
+                threshold_single=_sv_thr_single,
+                threshold_acc=_sv_thr_acc,
+                enable_top_k=_sv_enable_top_k,
+                enable_top_p=_sv_enable_top_p,
+            )
+            cache_miss_count = count()
 
-    target_mr.memory_pools.replace_all(target_pool_updates)
+    if target_pool_updates is not None:
+        target_mr.memory_pools.replace_all(target_pool_updates)
 
     next_draft_input = EagleDraftInput(
         verified_id=prepared_verified_id,
@@ -1903,6 +2353,7 @@ def spec_decode_verify(spec_worker, model_worker_batch, cur_allocate_lens):
         hidden_states=prepared_hidden,
         accept_length=prepared_accept_lens_data,
     )
+    next_draft_input.hidden_states_for_draft_extend = prepared_hidden_for_draft_extend
     next_draft_input.verified_id_for_draft_extend = prepared_verified_id_data
     next_draft_input.extend_seq_lens_for_draft_extend = prepared_extend_seq_lens
     next_draft_input.logits_indices_for_draft_extend = prepared_logits_indices
