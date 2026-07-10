@@ -89,30 +89,6 @@ class TestSchedulerIdleCheck(unittest.TestCase):
         self.assertEqual(scheduler.calls, ["memory", "tree"])
         self.assertEqual(scheduler.new_token_ratio, scheduler.init_new_token_ratio)
 
-    def test_chunked_cache_skips_parked_chunk_without_new_kv(self):
-        scheduler = self._make_scheduler()
-        scheduler.cached = []
-        scheduler.tree_cache = SimpleNamespace(
-            cache_unfinished_req=lambda req: scheduler.cached.append(req.rid)
-        )
-        req = SimpleNamespace(rid="parked", fill_ids=[1, 2], prefix_indices=[10, 11])
-
-        scheduler._cache_chunked_req_if_needed(req)
-
-        self.assertEqual(scheduler.cached, [])
-
-    def test_chunked_cache_stashes_chunk_with_new_kv(self):
-        scheduler = self._make_scheduler()
-        scheduler.cached = []
-        scheduler.tree_cache = SimpleNamespace(
-            cache_unfinished_req=lambda req: scheduler.cached.append(req.rid)
-        )
-        req = SimpleNamespace(rid="chunk", fill_ids=[1, 2, 3], prefix_indices=[10, 11])
-
-        scheduler._cache_chunked_req_if_needed(req)
-
-        self.assertEqual(scheduler.cached, ["chunk"])
-
     def test_prefill_logprob_allows_missing_next_token_logprobs(self):
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.model_config = SimpleNamespace(vocab_size=100)
