@@ -1177,8 +1177,14 @@ class ScheduleBatch:
 
             # Init arrays
             seq_lens = [len(r.fill_ids) for r in reqs]
-            prefix_lens = [len(r.prefix_indices) for r in reqs]
             extend_lens = [r.extend_input_len for r in reqs]
+            # PD: P thread may concurrently reassign r.prefix_indices (stash
+            # eager path, pathways_scheduler:_pd_prefill_loop). fill_ids and
+            # extend_input_len are only set by this (main) thread in
+            # init_next_round_input/add_one_req, so derive prefix_lens from
+            # those instead of re-reading len(r.prefix_indices) which can race
+            # ahead -> fill_ids[pre_len:] empty -> np.fromiter count mismatch.
+            prefix_lens = [s - e for s, e in zip(seq_lens, extend_lens)]
             extend_num_tokens = sum(extend_lens)
 
             req_pool_indices_cpu = np.array(req_pool_indices, dtype=np.int32)
@@ -1206,11 +1212,12 @@ class ScheduleBatch:
                 # tree-protected and leak it on finish.
                 req.cache_protected_len = req.last_matched_prefix_len
 
-                prefix_indices = req.prefix_indices
                 if pre_len > 0:
-                    # note: prefix_indices has to locate on device, or will meet Received incompatible devices for jitted computation
+                    # req.prefix_indices may have been reassigned to a longer
+                    # array by the P thread (same race as prefix_lens above);
+                    # pre_len is the main-thread snapshot, so slice to match.
                     self.req_to_token_pool.write(
-                        (req.req_pool_idx, slice(0, pre_len)), prefix_indices
+                        (req.req_pool_idx, slice(0, pre_len)), req.prefix_indices[:pre_len]
                     )
 
                 req.cached_tokens += pre_len - req.already_computed
@@ -1241,10 +1248,7 @@ class ScheduleBatch:
                     # input_logprobs = [1, 2, 3, 4]
                     # fill_ids = [3, 4]
                     # extend_input_logprob_token_id = [4, 0]
-                    global_start_idx, global_end_idx = (
-                        len(req.prefix_indices),
-                        len(req.fill_ids),
-                    )
+                    global_start_idx, global_end_idx = (pre_len, seq_len)
                     # Apply logprob_start_len
                     if global_start_idx < req.logprob_start_len:
                         global_start_idx = req.logprob_start_len
@@ -2386,6 +2390,9 @@ class ScheduleBatch:
 
         offset_bs = 0
         req_to_token = self.req_to_token_pool.req_to_token
+        max_context_len = req_to_token.shape[1]
+        req_to_token_flat = req_to_token.reshape(-1)
+        page_ramp = np.arange(page_size, dtype=req_to_token.dtype) if page_size > 1 else None
 
         for dp_rank in range(self.dp_size):
             info = self.reqs_info[dp_rank]
@@ -2394,27 +2401,58 @@ class ScheduleBatch:
                 offset_bs += per_dp_cache_loc_size
                 continue
 
-            seq_lens = info.seq_lens
-            req_pool_indices = info.req_pool_indices
+            seq_lens = np.asarray(info.seq_lens)
+            req_pool_indices = np.asarray(info.req_pool_indices)
 
             n_reqs = len(seq_lens)
-            if n_reqs > 0:
-                # Page-aligned offsets per request
-                aligned_lens = ((seq_lens + page_size - 1) // page_size) * page_size
-                offsets = np.empty(n_reqs, dtype=np.int64)
-                offsets[0] = 0
-                np.cumsum(aligned_lens[:-1], out=offsets[1:])
+            # Page-aligned offsets per request
+            aligned_lens = ((seq_lens + page_size - 1) // page_size) * page_size
+            offsets = np.empty(n_reqs, dtype=np.int64)
+            offsets[0] = 0
+            np.cumsum(aligned_lens[:-1], out=offsets[1:])
 
-                # Per-req contiguous slice copy from req_to_token directly.
-                # Avoids:
-                #  - the 8MB-per-DP intermediate `req_to_token[req_pool_indices]`
-                #    full-row gather (only first seq_len of each row is used)
-                #  - the 1M-element fancy-index scatter, which numpy serialises
-                #    at Python level rather than as a contiguous memcpy.
-                # Measured ~40x speedup at BSZ=64 OSL=16K decode vs the
-                # vectorised fancy-index version (~12ms -> ~0.3ms).
-                # Byte-for-byte identical output (verified with 14 edge cases
-                # incl. BSZ in {1,8,32,64,512}, empty DPs, page boundaries).
+            if page_size > 1:
+                # PagedTokenToKVPoolAllocator (allocator.py alloc/_alloc_extend_impl/
+                # _alloc_decode_impl) always writes page-contiguous slot indices:
+                #   req_to_token[idx, p*page_size + j] == req_to_token[idx, p*page_size] + j
+                # so the full token-level cache_loc can be reconstructed from
+                # page-start values alone. This turns the O(bs) Python loop of
+                # ~seq_len memcpys into a single vectorised gather of
+                # sum(n_pages) ints (page_size x fewer reads from the large
+                # req_to_token array) plus one broadcast-add write. Under
+                # Pathways-head GIL contention the loop dominated run_batch
+                # (profiled 12.4ms@bs=64 -> 24.8ms@bs=128, MiMo 16K/4K page=256).
+                # Real-token positions are byte-identical to the loop; padding
+                # tail [seq_len:aligned] gets page_start+j (a valid in-bounds
+                # slot in the same allocated page) instead of stale buffer
+                # residue, which is still safe per the persistent-buffer note
+                # above.
+                n_pages = aligned_lens // page_size
+                total_pages = int(n_pages.sum())
+                if total_pages > 0:
+                    total_aligned = total_pages * page_size
+                    # Ragged flat indices of page-start slots in req_to_token:
+                    #   flat_src[g] = idx[r]*W + p*page_size
+                    # where g is the global page index and (r, p) its req/local-page.
+                    # Since dest is contiguous (offsets = cumsum(aligned)), g runs
+                    # 0..total_pages-1 and p = g - page_cum[r], so
+                    #   flat_src[g] = (idx[r]*W - page_cum[r]*page_size) + g*page_size.
+                    page_cum = offsets // page_size
+                    row_base = req_pool_indices.astype(np.int64) * max_context_len
+                    flat_src = np.repeat(row_base - page_cum * page_size, n_pages)
+                    flat_src += np.arange(total_pages, dtype=np.int64) * page_size
+                    page_starts = req_to_token_flat[flat_src]
+                    dest = cache_loc_cpu[offset_bs : offset_bs + total_aligned]
+                    np.add(
+                        page_starts.reshape(total_pages, 1),
+                        page_ramp.reshape(1, page_size),
+                        out=dest.reshape(total_pages, page_size),
+                    )
+            else:
+                # page_size == 1: non-paged TokenToKVPoolAllocator has no
+                # contiguity guarantee; keep the per-req contiguous slice copy
+                # (still avoids the full-row gather + fancy scatter, ~40x faster
+                # than that at BSZ=64 OSL=16K decode).
                 for r in range(n_reqs):
                     sl = int(seq_lens[r])
                     dest_start = int(offsets[r]) + offset_bs
@@ -2425,7 +2463,14 @@ class ScheduleBatch:
             # Move to next DP rank's section (fixed stride)
             offset_bs += per_dp_cache_loc_size
 
-        return cache_loc_cpu
+        # copy(): cache_loc_cpu is a VIEW into the per-r2t reusable
+        # cache_loc_host_buf. Pathways-PD eager-stash calls _disp(nxt)
+        # (which re-enters this path on the SAME r2t and overwrites host_buf)
+        # before batch N's make_array_from_callback H2D has necessarily
+        # consumed the view -> batch N forward reads nxt's cache_loc and
+        # writes KV to wrong slots. n_prefill>1 also races across P threads
+        # if they somehow shared a host_buf (they don't today, per-r2t).
+        return cache_loc_cpu.copy()
 
     def _merge_sampling_info(
         self,
@@ -3195,13 +3240,19 @@ class ScheduleBatch:
         for info in self.reqs_info:
             # Create a new ScheduleReqsInfo with shallow copies of necessary fields
             new_info = ScheduleReqsInfo()
-            new_info.reqs = info.reqs  # Shallow copy (list reference)
+            new_info.reqs = list(info.reqs) if info.reqs else info.reqs
             new_info.out_cache_loc = info.out_cache_loc
-            new_info.decoding_reqs = info.decoding_reqs
+            new_info.decoding_reqs = (
+                list(info.decoding_reqs) if info.decoding_reqs else info.decoding_reqs
+            )
             # process_batch_result compacts per-DP padded input logprobs via
             # _input_logprob_lens_per_dp, which reads these.
-            new_info.extend_lens = info.extend_lens
-            new_info.extend_logprob_start_lens = info.extend_logprob_start_lens
+            new_info.extend_lens = list(info.extend_lens) if info.extend_lens else info.extend_lens
+            new_info.extend_logprob_start_lens = (
+                list(info.extend_logprob_start_lens)
+                if info.extend_logprob_start_lens
+                else info.extend_logprob_start_lens
+            )
             new_info.spec_info = info.spec_info
             copied_reqs_info.append(new_info)
 

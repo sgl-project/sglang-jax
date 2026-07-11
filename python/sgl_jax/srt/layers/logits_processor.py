@@ -258,6 +258,10 @@ class LogitsProcessor(nnx.Module):
         def select_local_fn(local_states, local_indices):
             return local_states[local_indices]
 
+        hidden_states = jax.sharding.reshard(
+            hidden_states,
+            NamedSharding(self.mesh, P("data", None)),
+        )
         return jax.shard_map(
             select_local_fn,
             mesh=self.mesh,
