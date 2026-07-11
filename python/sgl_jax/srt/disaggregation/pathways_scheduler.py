@@ -182,11 +182,20 @@ class PathwaysPDSchedulerMixin:
             for i, (pm, w) in enumerate(zip(p_meshes, self.tp_workers_p))
         ]
         self.kv_transfer = self.kv_transfers[0][0]
-        # Warm up gather/[stack/reshard/unstack]/scatter so the first real
-        # request doesn't pay the trace/lower cost (78-layer models: minutes).
-        for row in self.kv_transfers:
-            for kt in row:
-                kt.precompile()
+        # Base Scheduler skips run_precompile under PD (`and not self.pd` in
+        # scheduler.py), so P/D workers would first-compile on the first real
+        # request (~minutes on 78L models). Precompile all of them here, plus
+        # the KV-transfer gather/[stack/reshard/unstack]/scatter per bucket.
+        if not server_args.disable_precompile:
+            for i, w in enumerate(self.tp_workers_p):
+                logger.info("[pathways_pd] precompiling P worker %d forward (extend only)", i)
+                w.run_precompile(only="extend")
+            for j, w in enumerate(self.tp_workers_d):
+                logger.info("[pathways_pd] precompiling D worker %d forward (decode only)", j)
+                w.run_precompile(only="decode")
+            for row in self.kv_transfers:
+                for kt in row:
+                    kt.precompile()
         # Per-dp RR counters: chunked prefill emits done batches of ~1 req in
         # strict dp0,dp1,dp0,.. order (select_dp_for_request round_robin), so a
         # single global RR counter phase-locks with dp -> dp0 all land on D0,

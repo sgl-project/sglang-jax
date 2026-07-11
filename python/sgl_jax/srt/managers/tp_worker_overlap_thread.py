@@ -155,14 +155,18 @@ class ModelWorkerClient:
                         forward_metadata=forward_metadata,
                     )
                 )
-            next_token_ids = self.async_gather_fn(next_token_ids)
-            # Update the future token ids map
+            # Update the future token ids map. next_token_ids here is the raw
+            # sampler output (stable P('data') sharding); feeding it directly
+            # avoids the tracing/cpp-fastpath cache miss that async_gather_fn's
+            # dp=1-no-op-optimized output type otherwise causes. async_gather
+            # runs afterwards purely to prep the replicated D2H copy.
             self.future_token_ids_map = set_future_token_ids(
                 self.future_token_ids_map,
                 future_token_ids_ct,
                 next_token_ids,
                 self.mesh,
             )
+            next_token_ids = self.async_gather_fn(next_token_ids)
             self.output_queue.put(
                 (None, logits_output, next_token_ids, cache_miss_count, time.perf_counter())
             )
@@ -313,8 +317,8 @@ class ModelWorkerClient:
         self.future_token_ids_ct = (self.future_token_ids_ct + bs) % self.future_token_ids_limit
         return None, future_next_token_ids, 0
 
-    def run_precompile(self):
-        self.worker.run_precompile(self.future_token_ids_map)
+    def run_precompile(self, only: str | None = None):
+        self.worker.run_precompile(self.future_token_ids_map, only=only)
 
     @property
     def page_size(self) -> int:

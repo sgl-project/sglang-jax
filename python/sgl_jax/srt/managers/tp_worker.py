@@ -302,15 +302,21 @@ class ModelWorker:
             layers_topk_ids, model_worker_batch = self.sync_queue.get()
             get_global_experts_capturer().on_forward_end(layers_topk_ids, model_worker_batch)
 
-    def run_precompile(self, future_token_ids_map=None):
+    def run_precompile(self, future_token_ids_map=None, only: str | None = None):
         prepare_lora = self.prepare_lora_batch if self.server_args.enable_lora else None
-        self.compilation_manager.precompile_all(
-            forward_fn=self.forward_batch_generation,
-            model_runner=self.model_runner,
-            mesh=self.mesh,
-            prepare_lora_fn=prepare_lora,
-            future_token_ids_map=future_token_ids_map,
+        args = (
+            self.forward_batch_generation,
+            self.model_runner,
+            self.mesh,
+            prepare_lora,
+            future_token_ids_map,
         )
+        if only == "extend":
+            self.compilation_manager._precompile_extend(*args)
+        elif only == "decode":
+            self.compilation_manager._precompile_decode(*args)
+        else:
+            self.compilation_manager.precompile_all(*args)
 
     def set_forward_metadata(self, model_worker_batch: ModelWorkerBatch):
         self.model_runner.attn_backend.forward_metadata = (
