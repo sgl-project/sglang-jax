@@ -29,12 +29,20 @@ def compute_dflash_accept_len_and_bonus(
             f"{target_predict.shape} vs {candidates.shape}."
         )
 
+    mesh = getattr(jax.typeof(target_predict).sharding, "mesh", None)
+    if mesh is not None:
+        from jax.sharding import NamedSharding
+        from jax.sharding import PartitionSpec as P
+
+        replicated_2d = NamedSharding(mesh, P(None, None))
+        candidates = jax.sharding.reshard(candidates, replicated_2d)
+        target_predict = jax.sharding.reshard(target_predict, replicated_2d)
+
     matches = candidates[:, 1:] == target_predict[:, :-1]
     accept_len = jnp.sum(jnp.cumprod(matches.astype(jnp.int32), axis=1), axis=1)
     row_ids = jnp.arange(candidates.shape[0], dtype=jnp.int32)
     flat_idx = row_ids * candidates.shape[1] + accept_len
     tp_flat = target_predict.reshape(-1)
-    mesh = getattr(tp_flat.sharding, "mesh", None)
     if mesh is None:
         bonus = jnp.take(tp_flat, flat_idx)
     else:
@@ -129,14 +137,22 @@ def dflash_greedy_verify_impl(
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """Pure JAX target-logits argmax and greedy DFlash verification."""
     candidates = draft_token.reshape((-1, int(draft_token_num)))
-    target_predict = jnp.argmax(target_logits, axis=-1).astype(jnp.int32).reshape(candidates.shape)
+    target_predict_flat = jnp.argmax(target_logits, axis=-1).astype(jnp.int32)
+    mesh = getattr(jax.typeof(target_predict_flat).sharding, "mesh", None)
+    target_predict = target_predict_flat.reshape(candidates.shape)
+    if mesh is not None:
+        from jax.sharding import NamedSharding
+        from jax.sharding import PartitionSpec as P
+
+        replicated_2d = NamedSharding(mesh, P(None, None))
+        candidates = jax.sharding.reshard(candidates, replicated_2d)
+        target_predict = jax.sharding.reshard(target_predict, replicated_2d)
 
     matches = candidates[:, 1:] == target_predict[:, :-1]
     accept_len_draft = jnp.sum(jnp.cumprod(matches.astype(jnp.int32), axis=1), axis=1)
     row_ids = jnp.arange(candidates.shape[0], dtype=jnp.int32)
     flat_idx = row_ids * candidates.shape[1] + accept_len_draft
     target_predict_flat = target_predict.reshape(-1).astype(jnp.int32)
-    mesh = getattr(jax.typeof(target_predict_flat).sharding, "mesh", None)
     if mesh is None:
         bonus = jnp.take(target_predict_flat, flat_idx)
     else:
@@ -181,6 +197,12 @@ def gather_dflash_accepted_hidden_padded(
     hidden_size = target_hidden.shape[-1]
     flat_hidden = target_hidden.reshape((-1, hidden_size))
     accept_lens = accept_lens.astype(jnp.int32)
+    mesh = getattr(jax.typeof(accept_lens).sharding, "mesh", None)
+    if mesh is not None:
+        from jax.sharding import NamedSharding
+        from jax.sharding import PartitionSpec as P
+
+        accept_lens = jax.sharding.reshard(accept_lens, NamedSharding(mesh, P(None)))
     max_tokens = accept_lens.shape[0] * int(block_size)
     ends = jnp.cumsum(accept_lens)
     starts = ends - accept_lens
@@ -245,11 +267,46 @@ class DFlashDraftInput:
     def get_verify_token_num(self, bs: int) -> int:
         return 0
 
+    def _ensure_host(self) -> None:
+        for f in ("verified_id", "ctx_lens", "draft_seq_lens"):
+            v = getattr(self, f, None)
+            if v is not None and hasattr(v, "copy_to_host_async"):
+                v.copy_to_host_async()
+        for f in ("verified_id", "ctx_lens", "draft_seq_lens"):
+            v = getattr(self, f, None)
+            if v is not None:
+                setattr(self, f, np.asarray(v, dtype=np.int32))
+
+    def trim_to_length(self, n: int) -> None:
+        self._ensure_host()
+        for f in ("verified_id", "ctx_lens", "draft_seq_lens"):
+            v = getattr(self, f, None)
+            if v is not None and len(v) != n:
+                setattr(self, f, np.asarray(v, dtype=np.int32)[:n])
+        if self.target_hidden is not None and self.target_hidden.shape[0] not in (0, n):
+            self.target_hidden = self.target_hidden[:n]
+
+    def new_tokens_required_next_decode(self, requests, page_size: int) -> int:
+        total = 0
+        block_size = int(self.block_size)
+        for req in requests:
+            cur = int(req.kv_allocated_len)
+            nxt = max(cur, int(req.kv_committed_len) + block_size)
+            total += ((nxt + page_size - 1) // page_size) * page_size - (
+                (cur + page_size - 1) // page_size
+            ) * page_size
+        return total
+
     def filter_batch(self, new_indices: np.ndarray, has_been_filtered: bool = True) -> None:
+        self._ensure_host()
         new_indices = np.asarray(new_indices, dtype=np.int32)
-        self.verified_id = np.asarray(self.verified_id)[new_indices]
-        self.ctx_lens = np.asarray(self.ctx_lens, dtype=np.int32)[new_indices]
-        self.draft_seq_lens = np.asarray(self.draft_seq_lens, dtype=np.int32)[new_indices]
+        if has_been_filtered and len(new_indices) == len(self.verified_id):
+            idx = slice(0, len(new_indices))
+        else:
+            idx = new_indices
+        self.verified_id = np.asarray(self.verified_id, dtype=np.int32)[idx]
+        self.ctx_lens = np.asarray(self.ctx_lens, dtype=np.int32)[idx]
+        self.draft_seq_lens = np.asarray(self.draft_seq_lens, dtype=np.int32)[idx]
 
         if self.target_hidden is None:
             return
@@ -267,10 +324,15 @@ class DFlashDraftInput:
 
     # alloc the kv cache for draft block
     def prepare_for_decode(self, schedule_batch) -> None:
-        from sgl_jax.srt.mem_cache.common import alloc_token_slots
+        from sgl_jax.srt.managers.schedule_batch import get_last_loc
+        from sgl_jax.srt.mem_cache.common import (
+            alloc_paged_token_slots_extend,
+            alloc_token_slots,
+        )
         from sgl_jax.srt.speculative.eagle_util import assign_req_to_token_pool
 
         block_size = self.block_size
+        page_size = schedule_batch.token_to_kv_pool_allocator.page_size
 
         for dp_rank, info in enumerate(schedule_batch.reqs_info):
             if info.seq_lens is None or len(info.seq_lens) == 0:
@@ -280,11 +342,33 @@ class DFlashDraftInput:
 
             old_r = np.asarray([req.kv_allocated_len for req in reqs], dtype=np.int32)
             committed_r = np.asarray([req.kv_committed_len for req in reqs], dtype=np.int32)
+            self._align_to_reqs(reqs, committed_r)
             new_r = np.maximum(old_r, committed_r + block_size)
             ext_r = int((new_r - old_r).sum())
 
-            if ext_r > 0:
+            if ext_r > 0 and page_size == 1:
                 ocl_r = alloc_token_slots(schedule_batch.tree_cache, ext_r, dp_rank=dp_rank)
+                assign_req_to_token_pool(
+                    info.req_pool_indices,
+                    schedule_batch.req_to_token_pool,
+                    old_r,
+                    new_r,
+                    ocl_r,
+                )
+            elif ext_r > 0:
+                last_loc_r = get_last_loc(
+                    schedule_batch.req_to_token_pool.req_to_token,
+                    info.req_pool_indices,
+                    old_r,
+                )
+                ocl_r = alloc_paged_token_slots_extend(
+                    schedule_batch.tree_cache,
+                    old_r,
+                    new_r,
+                    last_loc_r,
+                    int((new_r - old_r).sum()),
+                    dp_rank=dp_rank,
+                )
                 assign_req_to_token_pool(
                     info.req_pool_indices,
                     schedule_batch.req_to_token_pool,
@@ -310,7 +394,40 @@ class DFlashDraftInput:
 
             info.seq_lens_sum = np.sum(info.seq_lens).item()
 
+    def _align_to_reqs(self, reqs, committed_lens: np.ndarray) -> None:
+        state_bs = int(np.asarray(self.draft_seq_lens, dtype=np.int32).shape[0])
+        bs = len(reqs)
+        if state_bs == bs:
+            return
+
+        verified_id = np.asarray(self.verified_id, dtype=np.int32)
+        ctx_lens = np.asarray(self.ctx_lens, dtype=np.int32)
+        draft_seq_lens = np.asarray(self.draft_seq_lens, dtype=np.int32)
+        if state_bs > bs:
+            self.verified_id = verified_id[:bs]
+            self.ctx_lens = ctx_lens[:bs]
+            self.draft_seq_lens = draft_seq_lens[:bs]
+            return
+
+        missing_reqs = reqs[state_bs:bs]
+        missing_verified = np.asarray(
+            [
+                req.output_ids[-1] if len(req.output_ids) > 0 else req.origin_input_ids[-1]
+                for req in missing_reqs
+            ],
+            dtype=np.int32,
+        )
+        self.verified_id = np.concatenate([verified_id, missing_verified], axis=0)
+        self.ctx_lens = np.concatenate(
+            [ctx_lens, np.zeros((bs - state_bs,), dtype=np.int32)], axis=0
+        )
+        self.draft_seq_lens = np.concatenate(
+            [draft_seq_lens, committed_lens[state_bs:bs].astype(np.int32)], axis=0
+        )
+
     def merge_batch(self, other: DFlashDraftInput) -> None:
+        self._ensure_host()
+        other._ensure_host()
         self.verified_id = np.concatenate(
             [np.asarray(self.verified_id), np.asarray(other.verified_id)], axis=0
         )

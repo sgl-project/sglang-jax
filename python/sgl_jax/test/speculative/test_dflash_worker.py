@@ -98,6 +98,78 @@ def test_committed_cache_loc_reads_req_to_token():
     np.testing.assert_array_equal(locs, np.array([22, 23, 61], dtype=np.int32))
 
 
+def test_committed_decode_row_padded_cache_loc_positions():
+    req_to_token = np.arange(100, dtype=np.int32).reshape(5, 20)
+    draft_model_runner = SimpleNamespace(
+        req_to_token_pool=SimpleNamespace(req_to_token=req_to_token)
+    )
+    w = _bare_worker(draft_model_runner=draft_model_runner, block_size=4)
+
+    mwb = SimpleNamespace(req_pool_indices=np.array([1, 3], dtype=np.int32))
+    di = DFlashDraftInput(
+        verified_id=np.array([0, 0], dtype=np.int32),
+        target_hidden=None,
+        ctx_lens=np.array([2, 1], dtype=np.int32),
+        draft_seq_lens=np.array([10, 7], dtype=np.int32),  # decode starts: [8, 6]
+    )
+
+    locs, positions = w._committed_decode_row_padded_cache_loc_positions(mwb, di)
+
+    np.testing.assert_array_equal(
+        locs,
+        np.array([28, 29, -1, -1, 66, -1, -1, -1], dtype=np.int32),
+    )
+    np.testing.assert_array_equal(
+        positions,
+        np.array([8, 9, 9, 9, 6, 6, 6, 6], dtype=np.int32),
+    )
+
+
+def test_committed_decode_row_padded_cache_loc_ignores_padded_slots():
+    req_to_token = np.arange(100, dtype=np.int32).reshape(5, 20)
+    draft_model_runner = SimpleNamespace(
+        req_to_token_pool=SimpleNamespace(req_to_token=req_to_token)
+    )
+    w = _bare_worker(draft_model_runner=draft_model_runner, block_size=4)
+
+    mwb = SimpleNamespace(
+        req_pool_indices=np.array([1, 2, 3, 0], dtype=np.int32),
+        real_bs=3,
+        real_bs_per_dp=[3],
+        per_dp_bs_size=4,
+    )
+    di = DFlashDraftInput(
+        verified_id=np.array([0, 0, 0, 0], dtype=np.int32),
+        target_hidden=None,
+        ctx_lens=np.array([1, 1, 1, 1], dtype=np.int32),
+        draft_seq_lens=np.array([5, 6, 7, 0], dtype=np.int32),
+    )
+
+    locs, positions = w._committed_decode_row_padded_cache_loc_positions(mwb, di)
+
+    np.testing.assert_array_equal(
+        locs,
+        np.array([24, -1, -1, -1, 45, -1, -1, -1, 66, -1, -1, -1, -1, -1, -1, -1]),
+    )
+    np.testing.assert_array_equal(positions[-4:], np.zeros((4,), dtype=np.int32))
+
+
+def test_trim_dflash_draft_input_drops_stale_tail_state():
+    w = _bare_worker()
+    di = DFlashDraftInput(
+        verified_id=np.array([10, 20, 30, 40], dtype=np.int32),
+        target_hidden=None,
+        ctx_lens=np.array([0, 0, 0, 0], dtype=np.int32),
+        draft_seq_lens=np.array([5, 6, 7, 8], dtype=np.int32),
+    )
+
+    w._trim_dflash_draft_input_to_decode_batch(di, bs=3)
+
+    np.testing.assert_array_equal(di.verified_id, np.array([10, 20, 30], dtype=np.int32))
+    np.testing.assert_array_equal(di.ctx_lens, np.array([0, 0, 0], dtype=np.int32))
+    np.testing.assert_array_equal(di.draft_seq_lens, np.array([5, 6, 7], dtype=np.int32))
+
+
 def test_pack_cache_loc_rows_uses_bucket_stable_row_width():
     w = _bare_worker(page_size=1)
     rows = [

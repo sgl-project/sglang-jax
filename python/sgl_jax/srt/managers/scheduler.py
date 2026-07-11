@@ -91,6 +91,7 @@ from sgl_jax.srt.server_args import PortArgs, ServerArgs
 from sgl_jax.srt.speculative.dflash_info import DFlashDraftInput
 from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
 from sgl_jax.srt.speculative.overlap_utils import (
+    can_merge_spec_non_overlap_prefill,
     can_use_spec_decode_overlap,
     can_use_spec_prefill_overlap,
     publish_spec_decode_new_seq_lens,
@@ -1845,7 +1846,7 @@ class Scheduler(
                 elif (
                     not self._is_spec_decode_enabled()
                     or self.enable_overlap
-                    or use_legacy_eagle3_non_overlap(self.enable_overlap, self.spec_algorithm)
+                    or can_merge_spec_non_overlap_prefill(self.enable_overlap, self.spec_algorithm)
                 ):
                     # Spec overlap keeps prefill and decode as separate forwards, but
                     # once prefill has produced req-granular relay state it can join
@@ -1916,7 +1917,7 @@ class Scheduler(
         if (
             self._is_spec_decode_enabled()
             and not self.enable_overlap
-            and not use_legacy_eagle3_non_overlap(self.enable_overlap, self.spec_algorithm)
+            and not can_merge_spec_non_overlap_prefill(self.enable_overlap, self.spec_algorithm)
             and not self.running_batch.is_empty()
         ):
             return None

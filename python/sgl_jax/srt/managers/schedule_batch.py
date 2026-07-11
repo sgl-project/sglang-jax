@@ -2697,7 +2697,35 @@ class ScheduleBatch:
         from sgl_jax.srt.speculative.dflash_info import DFlashDraftInput
 
         if isinstance(flat, DFlashDraftInput):
-            return flat
+
+            def _scatter_dflash_1d(arr, *, fill_value: int = 0):
+                if arr is None:
+                    return None
+                a = np.asarray(arr)
+                if a.shape[0] != len(selector):
+                    return None
+                out = np.full((total_bs,), fill_value, dtype=a.dtype)
+                out[selector] = a
+                return out
+
+            def _scatter_dflash_hidden(arr):
+                if arr is None:
+                    return None
+                a = np.asarray(arr)
+                if a.shape[0] != len(selector):
+                    return None
+                out = np.zeros((total_bs,) + a.shape[1:], dtype=a.dtype)
+                out[selector] = a
+                return out
+
+            return DFlashDraftInput(
+                verified_id=_scatter_dflash_1d(flat.verified_id),
+                target_hidden=_scatter_dflash_hidden(flat.target_hidden),
+                ctx_lens=_scatter_dflash_1d(flat.ctx_lens),
+                draft_seq_lens=_scatter_dflash_1d(flat.draft_seq_lens),
+                capture_hidden_mode=flat.capture_hidden_mode,
+                block_size=flat.block_size,
+            )
 
         def _scatter1(arr, *, require_selector_len: bool = True, data_sharded: bool = False):
             if arr is None:
@@ -2755,10 +2783,28 @@ class ScheduleBatch:
         from sgl_jax.srt.speculative.dflash_info import DFlashDraftInput
 
         if isinstance(flat, DFlashDraftInput):
-            # DFLASH stage C is dp_size=1: a single rank owns every request, so
-            # the flat spec info passes straight through. DP scatter/split is out
-            # of scope (guarded by ServerArgs.check_server_args).
-            return [flat if n > 0 else None for n in real_bs_per_dp]
+            out = []
+            offset = 0
+            for n in real_bs_per_dp:
+                if n == 0:
+                    out.append(None)
+                    continue
+
+                def _slice(v):
+                    return None if v is None else v[offset : offset + n]
+
+                out.append(
+                    DFlashDraftInput(
+                        verified_id=_slice(flat.verified_id),
+                        target_hidden=_slice(flat.target_hidden),
+                        ctx_lens=_slice(flat.ctx_lens),
+                        draft_seq_lens=_slice(flat.draft_seq_lens),
+                        capture_hidden_mode=flat.capture_hidden_mode,
+                        block_size=flat.block_size,
+                    )
+                )
+                offset += n
+            return out
 
         has_future_indices = getattr(flat, "future_indices", None) is not None
         if getattr(flat, "pending_draft_extend_result", None) is not None:

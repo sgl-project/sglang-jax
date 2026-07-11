@@ -1,6 +1,6 @@
 """DFlash speculative decoding worker (greedy runtime path).
 
-Scope: dp_size=1, disable_overlap_schedule, greedy-only, page_size=1.
+Scope: dp_size=1, disable_overlap_schedule, greedy-only.
 Ports the algorithmic structure of SGLang PyTorch PR 22077 to the sglang-jax
 scheduler/worker contract. See ``docs/design/dflash_stage_c.md``.
 
@@ -36,7 +36,6 @@ from sgl_jax.srt.speculative.dflash_info import (
     build_dflash_draft_block,
     compute_new_kv_slices,
     dflash_greedy_verify_impl,
-    gather_dflash_accepted_hidden_padded,
 )
 from sgl_jax.srt.speculative.dflash_util import (
     parse_dflash_draft_config,
@@ -231,12 +230,8 @@ class DFlashWorker:
         bs = int(model_worker_batch.seq_lens.shape[0])
         seq_lens = np.asarray(model_worker_batch.seq_lens, dtype=np.int32)
         target_prefix_lens = seq_lens - 1
+        self._trim_dflash_draft_input_to_decode_batch(draft_input, bs)
         draft_prefix_lens = np.asarray(draft_input.draft_seq_lens, dtype=np.int32)
-        if draft_prefix_lens.shape[0] != bs:
-            draft_prefix_lens = draft_prefix_lens[:bs]
-            draft_input.draft_seq_lens = draft_prefix_lens
-            draft_input.verified_id = np.asarray(draft_input.verified_id, dtype=np.int32)[:bs]
-            draft_input.ctx_lens = np.asarray(draft_input.ctx_lens, dtype=np.int32)[:bs]
 
         # 1) Draft the fixed block and greedily sample draft proposals.
         verify_input = self._draft_block(
@@ -303,7 +298,6 @@ class DFlashWorker:
             model_worker_batch,
             next_draft_input,
             is_prefill=False,
-            accept_lens_device=accept_lens_out,
         )
         model_worker_batch.spec_info_padded = next_draft_input
 
@@ -316,6 +310,31 @@ class DFlashWorker:
             cache_miss_count=cache_miss_count,
             extend_input_len_per_req=None,
             extend_logprob_start_len_per_req=None,
+        )
+
+    def _trim_dflash_draft_input_to_decode_batch(
+        self,
+        draft_input: DFlashDraftInput,
+        bs: int,
+    ) -> None:
+        """Trim stale host-side DFlash state to the current decode batch size."""
+        draft_seq_lens = np.asarray(draft_input.draft_seq_lens, dtype=np.int32)
+        state_bs = int(draft_seq_lens.shape[0])
+        if state_bs == bs:
+            return
+
+        verified_id = np.asarray(draft_input.verified_id, dtype=np.int32)
+        ctx_lens = np.asarray(draft_input.ctx_lens, dtype=np.int32)
+        if state_bs > bs:
+            draft_input.draft_seq_lens = draft_seq_lens[:bs]
+            draft_input.verified_id = verified_id[:bs]
+            draft_input.ctx_lens = ctx_lens[:bs]
+            return
+
+        raise ValueError(
+            "DFLASH draft state is shorter than decode batch after prepare_for_decode: "
+            f"state_bs={state_bs}, bs={bs}. Merged decode requests must be aligned "
+            "from ScheduleBatch req state before entering DFlashWorker._forward_decode."
         )
 
     def _init_jit_target_verify(self):
@@ -501,11 +520,17 @@ class DFlashWorker:
         allocator = self.draft_model_runner.token_to_kv_pool_allocator
         state = allocator.backup_state()
         try:
-            block_cache_loc = allocator.alloc(bs * self.block_size)
+            num_block_tokens = bs * self.block_size
+            alloc_tokens = (
+                (num_block_tokens + self.page_size - 1) // self.page_size
+            ) * self.page_size
+            block_cache_loc = allocator.alloc(alloc_tokens)
             if block_cache_loc is None:
                 raise RuntimeError(
-                    f"DFLASH draft OOM allocating {bs * self.block_size} block tokens."
+                    f"DFLASH draft OOM allocating {alloc_tokens} block KV slots "
+                    f"for {num_block_tokens} block tokens."
                 )
+            block_cache_loc = np.asarray(block_cache_loc, dtype=np.int32)[:num_block_tokens]
             draft_mwb = self._make_draft_block_mwb(
                 model_worker_batch,
                 block_ids_flat,
@@ -816,7 +841,6 @@ class DFlashWorker:
             target_hidden,
             positions,
             cache_loc,
-            accept_lens,
             kv_buffers,
             *,
             is_decode: bool,
@@ -824,17 +848,7 @@ class DFlashWorker:
         ):
             positions = jax.sharding.reshard(positions.astype(jnp.int32), vector_sharding)
             cache_loc = jax.sharding.reshard(cache_loc.astype(jnp.int32), vector_sharding)
-            accept_lens = jax.sharding.reshard(accept_lens.astype(jnp.int32), vector_sharding)
-            if is_decode:
-                target_hidden = gather_dflash_accepted_hidden_padded(
-                    target_hidden,
-                    accept_lens,
-                    block_size=block_size,
-                    hidden_out_sharding=hidden_sharding,
-                    index_out_sharding=vector_sharding,
-                )
-            else:
-                target_hidden = jax.sharding.reshard(target_hidden, hidden_sharding)
+            target_hidden = jax.sharding.reshard(target_hidden, hidden_sharding)
 
             state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
             model = nnx.merge(model_def, state)
@@ -863,40 +877,28 @@ class DFlashWorker:
         model_worker_batch: ModelWorkerBatch,
         draft_input: DFlashDraftInput,
         is_prefill: bool,
-        accept_lens_device: jax.Array | None = None,
     ) -> None:
         """Project committed target hidden and write draft K/V at their cache_loc."""
         target_hidden = draft_input.target_hidden
         if target_hidden is None or int(np.asarray(draft_input.ctx_lens).sum()) == 0:
             return
 
-        cache_loc = self._committed_cache_loc(model_worker_batch, draft_input, is_prefill)
-        positions = self._committed_positions(draft_input, is_prefill)
-
-        n = cache_loc.shape[0]
-        if not is_prefill and n > 0:
-            bs = int(np.asarray(draft_input.ctx_lens).shape[0])
-            max_tokens = bs * self.block_size
-            if n < max_tokens:
-                pad_n = max_tokens - n
-                cache_loc = np.concatenate(
-                    [cache_loc, np.full(pad_n, cache_loc[0], dtype=cache_loc.dtype)]
-                )
-                positions = np.concatenate(
-                    [positions, np.full(pad_n, positions[0], dtype=positions.dtype)]
-                )
+        if is_prefill:
+            cache_loc = self._committed_cache_loc(model_worker_batch, draft_input, is_prefill)
+            positions = self._committed_positions(draft_input, is_prefill)
+        else:
+            cache_loc, positions = self._committed_decode_row_padded_cache_loc_positions(
+                model_worker_batch, draft_input
+            )
 
         pool = self.draft_model_runner.token_to_kv_pool
         kv_buffers = list(pool.kv_buffer[: self.draft_layers])
-        if accept_lens_device is None:
-            accept_lens_device = jnp.zeros((1,), dtype=jnp.int32)
 
         new_buffers = self._jit_materialize_write(
             self.draft_model_runner.model_state_leaves,
             jnp.asarray(target_hidden),
             jnp.asarray(positions),
             jnp.asarray(cache_loc),
-            accept_lens_device,
             kv_buffers,
             is_decode=not is_prefill,
             block_size=self.block_size,
@@ -926,6 +928,53 @@ class DFlashWorker:
         if not locs:
             return np.zeros((0,), dtype=np.int32)
         return np.concatenate(locs).astype(np.int32)
+
+    def _committed_decode_row_padded_cache_loc_positions(self, model_worker_batch, draft_input):
+        """Decode KV write layout aligned with target verify hidden rows.
+
+        Decode target hidden is row-major ``[bs, block_size, hidden]``. Keep the
+        same fixed row layout for KV materialization and mark unaccepted columns
+        with ``cache_loc=-1`` so the KV update kernel drops them. This avoids a
+        device-side accepted-hidden compaction based on ``accept_lens``.
+        """
+        req_to_token = self.draft_model_runner.req_to_token_pool.req_to_token
+        req_pool_indices = np.asarray(model_worker_batch.req_pool_indices, dtype=np.int64)
+        starts, lengths = compute_new_kv_slices(
+            draft_input.ctx_lens, draft_input.draft_seq_lens, is_prefill=False
+        )
+        bs = int(len(req_pool_indices))
+        cache_loc = np.full((bs, self.block_size), -1, dtype=np.int32)
+        positions = np.zeros((bs, self.block_size), dtype=np.int32)
+        active_mask = self._active_decode_slot_mask(model_worker_batch, bs)
+        for i, (rp, start, n) in enumerate(zip(req_pool_indices, starts, lengths)):
+            valid_n = min(int(n), self.block_size)
+            start = int(start)
+            positions[i, :] = max(start, 0)
+            if not active_mask[i] or valid_n <= 0 or start < 0:
+                continue
+            locs = np.asarray(req_to_token[int(rp), start : start + valid_n], dtype=np.int32)
+            valid_n = min(valid_n, int(locs.shape[0]))
+            if valid_n <= 0:
+                continue
+            cache_loc[i, :valid_n] = locs[:valid_n]
+            positions[i, :valid_n] = np.arange(start, start + valid_n, dtype=np.int32)
+            positions[i, valid_n:] = start + valid_n - 1
+        return cache_loc.reshape(-1), positions.reshape(-1)
+
+    @staticmethod
+    def _active_decode_slot_mask(model_worker_batch, total_bs: int) -> np.ndarray:
+        mask = np.zeros(total_bs, dtype=bool)
+        real_bs_per_dp = getattr(model_worker_batch, "real_bs_per_dp", None)
+        if real_bs_per_dp is None:
+            mask[: int(getattr(model_worker_batch, "real_bs", total_bs))] = True
+            return mask
+
+        per_dp_bs = int(getattr(model_worker_batch, "per_dp_bs_size", total_bs))
+        for dp_rank, real_bs in enumerate(real_bs_per_dp):
+            start = dp_rank * per_dp_bs
+            end = min(start + int(real_bs), total_bs)
+            mask[start:end] = True
+        return mask
 
     def _committed_positions(self, draft_input, is_prefill):
         starts, lengths = compute_new_kv_slices(
