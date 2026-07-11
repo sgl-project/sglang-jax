@@ -4,6 +4,7 @@ import logging
 import os
 import signal
 import threading
+import time
 from queue import Queue
 
 import jax
@@ -12,6 +13,8 @@ import numpy as np
 import psutil
 from flax import nnx
 from jax.experimental.multihost_utils import broadcast_one_to_all
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.constrained.bitmask_ops import allocate_token_bitmask
@@ -71,6 +74,7 @@ class ModelWorker:
         # Parse args
         self.tp_size = server_args.tp_size
         self.dp_size = server_args.dp_size
+        self._pd_fuse_sample = os.getenv("SGLANG_PD_FUSE_SAMPLE") == "1"
         from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
@@ -220,6 +224,16 @@ class ModelWorker:
 
         assert self.max_running_requests > 0, "max_running_request is zero"
 
+        # Fused resolve/set path needs a future_token_ids_map array of the same
+        # shape as ModelWorkerClient.future_token_ids_map for callers that don't
+        # supply one (precompile, non-overlap). Real ids are always >=0 there so
+        # resolve is a no-op and the returned map is discarded.
+        if self._pd_fuse_sample:
+            self._pd_dummy_future_map = jax.device_put(
+                jnp.zeros((self.max_running_requests * 5,), dtype=jnp.int32),
+                NamedSharding(self.mesh, P(None)),
+            )
+
         # A single request lives on one DP rank, so max_req_len is bounded
         # by per-rank pool size, not the global (dp-scaled) pool size.
         per_rank_tokens = (
@@ -255,6 +269,7 @@ class ModelWorker:
             page_size=self.page_size,
             max_req_len=self.max_req_len,
             vocab_size=self.model_config.vocab_size,
+            max_total_num_tokens=self.max_total_num_tokens,
             multimodal=server_args.multimodal,
             has_recurrent_state=self.model_runner.linear_recurrent_config is not None,
             moe_backend=effective_moe_backend,
@@ -416,21 +431,26 @@ class ModelWorker:
         skip_sample: bool = False,
         sampling_metadata: SamplingMetadata = None,
         forward_metadata=None,
+        future_map=None,
+        future_ct=None,
     ) -> tuple[LogitsProcessorOutput, jax.Array | None, int]:
         # Prepare LoRA batch if LoRA is enabled
         if self.worker.server_args.enable_lora and self.need_prepare_lora_batch:
             self.prepare_lora_batch(model_worker_batch)
 
+        _pd_t = getattr(model_worker_batch, "_pd_disp_t0", None)
         # Use pre-initialized ForwardBatch if available (for overlap scheduling optimization)
         if model_worker_batch.forward_batch is not None:
             forward_batch = model_worker_batch.forward_batch
         else:
             forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+        _pd_t1 = time.perf_counter()
 
         if forward_metadata is None:
             forward_metadata = self.model_runner.attn_backend.get_forward_metadata(
                 model_worker_batch
             )
+        _pd_t2 = time.perf_counter()
 
         if sampling_metadata is None:
             sampling_metadata = SamplingMetadata.from_model_worker_batch(
@@ -439,9 +459,54 @@ class ModelWorker:
                 self.mesh,
                 self.model_config.vocab_size,
             )
+        _pd_t3 = time.perf_counter()
 
         self.model_runner.attn_backend.forward_metadata = forward_metadata
         logits_metadata = LogitsMetadata.from_model_worker_batch(model_worker_batch, self.mesh)
+        if _pd_t is not None and os.environ.get("SGLANG_PD_DBG"):
+            _pd_t4 = time.perf_counter()
+            logger.info(
+                "[pd-disp] fb=%.1f attn=%.1f smp=%.1f lm=%.1f",
+                (_pd_t1 - _pd_t) * 1e3,
+                (_pd_t2 - _pd_t1) * 1e3,
+                (_pd_t3 - _pd_t2) * 1e3,
+                (_pd_t4 - _pd_t3) * 1e3,
+            )
+
+        # Pathways: fuse run_model+sampler into one jit to drop one Execute
+        # round-trip (~10ms/tick through the dispatch queue). Skips the debug-only
+        # DUMP_LAST_LAYER_LOGITS path and per-token logprob path (both add
+        # extra device_get anyway). Gated by env so CO/native path unchanged.
+        if (
+            self._pd_fuse_sample
+            and not skip_sample
+            and not model_worker_batch.return_output_logprob_only
+        ):
+            if model_worker_batch.sampling_info:
+                self._update_grammar_vocab_mask(model_worker_batch, sampling_metadata)
+            # Precompile / non-overlap callers don't have a future map; feed the
+            # same-shape dummy so the compiled variant matches the overlap
+            # thread's runtime shape (resolve/set are semantic no-ops there).
+            fmap = future_map if future_map is not None else self._pd_dummy_future_map
+            fct = future_ct if future_ct is not None else 0
+            (
+                next_token_ids_device,
+                logits_output,
+                _,
+                cache_miss_count,
+                layers_topk_ids,
+                new_future_map,
+            ) = self.model_runner.forward_and_sample(
+                forward_batch, logits_metadata, sampling_metadata, fmap, fct
+            )
+            self.dump_topk_ids(layers_topk_ids, model_worker_batch)
+            if launch_done is not None:
+                launch_done.set()
+            self.sync_queue.put((layers_topk_ids, model_worker_batch))
+            if future_map is not None:
+                return (logits_output, next_token_ids_device, cache_miss_count, new_future_map)
+            return (logits_output, next_token_ids_device, cache_miss_count)
+
         logits_output, cache_miss_count, layers_topk_ids = self.model_runner.forward(
             forward_batch,
             logits_metadata=logits_metadata,

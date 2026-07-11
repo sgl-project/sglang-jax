@@ -2,6 +2,7 @@
 
 import dataclasses
 import logging
+import os
 import signal
 import threading
 import time
@@ -63,11 +64,6 @@ class ModelWorkerClient:
         self.parent_process = psutil.Process().parent()
         replicated_sharding = NamedSharding(mesh, PartitionSpec())
         self.async_gather_fn = jax.jit(lambda x: x, out_shardings=replicated_sharding)
-        logger.info(
-            "[pd-debug] overlap mesh=%s replicated_devices=%s",
-            mesh.shape,
-            sorted(d.id for d in replicated_sharding.device_set),
-        )
 
     @property
     def model_runner(self):
@@ -120,6 +116,29 @@ class ModelWorkerClient:
             if not model_worker_batch:
                 break
 
+            if self.worker._pd_fuse_sample:
+                # Fused path: resolve/set_future are inlined into the single
+                # jitted_run_and_sample; feed raw (possibly negative) input_ids
+                # straight through and take the updated future map back out.
+                with jax.profiler.TraceAnnotation(
+                    f"forward_batch_generation {model_worker_batch.bid}"
+                ):
+                    logits_output, next_token_ids, cache_miss_count, new_future_map = (
+                        self.worker.forward_batch_generation(
+                            model_worker_batch,
+                            model_worker_batch.launch_done,
+                            sampling_metadata=sampling_metadata,
+                            forward_metadata=forward_metadata,
+                            future_map=self.future_token_ids_map,
+                            future_ct=future_token_ids_ct,
+                        )
+                    )
+                self.future_token_ids_map = new_future_map
+                self.output_queue.put(
+                    (None, logits_output, next_token_ids, cache_miss_count, time.perf_counter())
+                )
+                continue
+
             # Resolve future tokens in the input
             input_ids = model_worker_batch.forward_batch.input_ids
             model_worker_batch.forward_batch.input_ids = resolve_future_token_ids(
@@ -144,7 +163,9 @@ class ModelWorkerClient:
                 next_token_ids,
                 self.mesh,
             )
-            self.output_queue.put((None, logits_output, next_token_ids, cache_miss_count))
+            self.output_queue.put(
+                (None, logits_output, next_token_ids, cache_miss_count, time.perf_counter())
+            )
 
     def resolve_last_batch_result(self, launch_done: threading.Event | None = None):
         """
@@ -157,7 +178,7 @@ class ModelWorkerClient:
         jax.device_get does.
         """
         _r0 = time.perf_counter()
-        _, logits_output, next_token_ids, cache_miss_count = self.output_queue.get()
+        _, logits_output, next_token_ids, cache_miss_count, _fwd_done = self.output_queue.get()
         _r1 = time.perf_counter()
         # Step 1: kick off async D2H copies for everything we need
         async_next_logprobs = (
@@ -175,7 +196,32 @@ class ModelWorkerClient:
             if logits_output.hidden_states is not None
             else None
         )
+        if os.environ.get("SGLANG_PD_DBG_NTOK"):
+            try:
+                _all = next_token_ids.addressable_shards
+                _sh = [
+                    (s.device.id, np.asarray(s.data).flatten()[:4].tolist())
+                    for s in (_all[:2] + _all[len(_all) // 2 : len(_all) // 2 + 2])
+                ]
+                _sp = getattr(next_token_ids.sharding, "spec", "?")
+            except Exception as _e:
+                _sh, _sp = f"err:{_e}", "?"
+            _full = np.asarray(jax.device_get(next_token_ids)).flatten()
+            _n = len(_full)
+            logger.info(
+                "[D-ntok] shape=%s spec=%s dp0[:4]=%s dp1[:4]=%s shards=%s",
+                _full.shape,
+                _sp,
+                _full[: min(4, _n // 2)].tolist(),
+                _full[_n // 2 : _n // 2 + 4].tolist(),
+                _sh,
+            )
         next_token_ids = jax.device_get(next_token_ids).tolist()
+        _r2 = time.perf_counter()
+        if os.environ.get("SGLANG_PD_DBG") and _r2 - _r0 > 0.15:
+            logger.info(
+                "[pd-resolve] q_wait=%.0fms d2h=%.0fms", (_r1 - _r0) * 1e3, (_r2 - _r1) * 1e3
+            )
 
         # Step 2: materialize. The first np.asarray waits for that array's
         # copy; the others have been making progress in parallel.
@@ -190,7 +236,7 @@ class ModelWorkerClient:
         if launch_done is not None:
             launch_done.wait()
         _r4 = time.perf_counter()
-        if _r4 - _r0 > 0.5:
+        if os.environ.get("SGLANG_PD_DBG") and _r4 - _r0 > 0.5:
             import gc as _gc
 
             import jax as _jax

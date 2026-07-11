@@ -1,6 +1,7 @@
 """ModelRunner runs the forward passes of the models."""
 
 import contextlib
+import dataclasses
 import logging
 from functools import partial
 
@@ -9,6 +10,8 @@ import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 from jax._src import mesh as mesh_lib
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.configs.load_config import LoadConfig
 from sgl_jax.srt.configs.model_config import AttentionArch, MockModelConfig, ModelConfig
@@ -245,6 +248,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         # fold_in(constant, dynamic_step) is computed inside JIT, avoiding
         # the eager jax.random.split that would serialize the host-device pipeline.
         base_rng_key = self._sampler_base_rng
+        _fused_mesh = self.mesh
 
         @partial(jax.jit, static_argnames=["sampler_state_def", "use_sort_for_toppk_minp"])
         def jitted_sampler(
@@ -288,6 +292,109 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         )
 
         self.jitted_compute_logprobs = partial(jitted_compute_logprobs, self.mesh)
+
+        # Pathways: single-controller dispatch pays ~10ms per independent jit
+        # through the ordered dispatch queue. Fusing the
+        # full forward_thread tick body -- resolve_future_token_ids +
+        # run_model + sampler + async_gather + set_future_token_ids -- into
+        # one jit drops it from 3 Executes to 1 per decode tick. Only used
+        # when SGLANG_PD_FUSE_SAMPLE=1 and no grammar mask update is needed
+        # between forward and sample.
+        @partial(
+            jax.jit,
+            donate_argnames=["memory_pools"],
+            static_argnames=["model_state_def", "sampler_state_def", "use_sort_for_toppk_minp"],
+            compiler_options=jit_compiler_options,
+        )
+        def jitted_run_and_sample(
+            model_def,
+            model_state_def,
+            model_state_leaves,
+            forward_batch,
+            memory_pools,
+            logits_metadata,
+            sampler_def,
+            sampler_state_def,
+            sampler_state_leaves,
+            use_sort_for_toppk_minp,
+            rng_step,
+            sampling_metadata,
+            future_token_ids_map,
+            future_token_ids_ct,
+        ):
+            # resolve_future_token_ids inlined (utils.py:47-54): overlap thread
+            # feeds raw input_ids that may still hold negative future-id
+            # placeholders; look them up in the (replicated) future map here.
+            ids = forward_batch.input_ids
+            ids_g = jax.lax.with_sharding_constraint(ids, NamedSharding(_fused_mesh, P()))
+            resolved = jnp.where(
+                ids_g < 0,
+                future_token_ids_map.at[jnp.clip(-ids_g, min=0)].get(
+                    out_sharding=NamedSharding(_fused_mesh, P())
+                ),
+                ids_g,
+            )
+            resolved = jax.lax.with_sharding_constraint(
+                resolved, NamedSharding(_fused_mesh, P("data"))
+            )
+            forward_batch = dataclasses.replace(forward_batch, input_ids=resolved)
+
+            model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
+            model = nnx.merge(model_def, model_state)
+            with LoraBatchContext.set_batch(forward_batch):
+                output, pool_updates, aux, layers_topk_ids = model(
+                    forward_batch, memory_pools, logits_metadata
+                )
+            s_state = jax.tree_util.tree_unflatten(sampler_state_def, sampler_state_leaves)
+            sampler = nnx.merge(sampler_def, s_state)
+            rng_key = jax.random.fold_in(base_rng_key, rng_step)
+            next_ids, token_logprobs, _new_output = sampler(
+                output,
+                sampling_metadata,
+                use_sort_for_toppk_minp=use_sort_for_toppk_minp,
+                rng_override=rng_key,
+            )
+            # Fold async_gather_fn's replicated reshard into this jit so the
+            # overlap thread can skip that separate Execute.
+            next_ids = jax.lax.with_sharding_constraint(next_ids, NamedSharding(_fused_mesh, P()))
+            # set_future_token_ids inlined (utils.py:58-61): next_ids is already
+            # replicated above, so dynamic_update_slice on the replicated map
+            # needs no extra reshard.
+            new_future_map = jax.lax.dynamic_update_slice(
+                future_token_ids_map, next_ids, (future_token_ids_ct + 1,)
+            )
+            return (
+                next_ids,
+                output,
+                pool_updates,
+                aux,
+                layers_topk_ids,
+                token_logprobs,
+                new_future_map,
+            )
+
+        def run_and_sample_wrapper(
+            forward_batch, logits_metadata, sampling_metadata, future_map, future_ct
+        ):
+            self._sampler_step += 1
+            return jitted_run_and_sample(
+                model_def,
+                model_state_def,
+                self.model_state_leaves,
+                forward_batch,
+                self.memory_pools,
+                logits_metadata,
+                sampler_def,
+                sampler_state_def,
+                sampler_state_leaves,
+                self.use_sort_for_toppk_minp,
+                self._sampler_step,
+                sampling_metadata,
+                future_map,
+                jnp.asarray(future_ct, dtype=jnp.int32),
+            )
+
+        self.jitted_run_and_sample = run_and_sample_wrapper
 
     def get_available_device_memory(self):
         distributed = jax.process_count() != 1
@@ -520,9 +627,9 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
 
         # _donate_lock (set by PD scheduler init) serializes the donate-dispatch
         # → replace_all window against the main-thread scatter_from_dmesh which
-        # also donates the same kv_buffer list. ifrt_proxy/client/array.cc:382
-        # marks the input deleted the instant kDonateInput dispatches, so a GIL
-        # switch in this window lets scatter read a deleted array.
+        # also donates the same kv_buffer list. IFRT marks the input deleted the
+        # instant kDonateInput dispatches, so a GIL switch in this window lets
+        # scatter read a deleted array.
         _kv_lock = getattr(self.token_to_kv_pool, "_donate_lock", None)
         with _kv_lock if _kv_lock is not None else contextlib.nullcontext():
             with jtu.count_pjit_cpp_cache_miss() as count:
@@ -540,6 +647,36 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
 
         # layers_topk_ids required real_bs and original_input_len which could not be stored in ForwardBatch
         return output, cache_miss_count, layers_topk_ids
+
+    def forward_and_sample(
+        self, forward_batch, logits_metadata, sampling_metadata, future_map, future_ct
+    ):
+        import jax._src.test_util as jtu
+
+        self.forward_pass_id += 1
+        # NOTE: no use_mesh here (unlike _forward_raw): wrapping sampler in the
+        # Explicit mesh context makes binary_search.py:148 select fail on
+        # mismatched shardings. Model shard_maps carry mesh explicitly.
+        _kv_lock = getattr(self.token_to_kv_pool, "_donate_lock", None)
+        with _kv_lock if _kv_lock is not None else contextlib.nullcontext():
+            with jtu.count_pjit_cpp_cache_miss() as count:
+                (
+                    next_ids,
+                    output,
+                    pool_updates,
+                    _,
+                    layers_topk_ids,
+                    token_logprobs,
+                    new_future_map,
+                ) = self.jitted_run_and_sample(
+                    forward_batch, logits_metadata, sampling_metadata, future_map, future_ct
+                )
+                cache_miss_count = count()
+            if self.tp_size == 1 and isinstance(pool_updates, list):
+                target_sharding = self.token_to_kv_pool.kv_sharding
+                pool_updates = [jax.device_put(kv, target_sharding) for kv in pool_updates]
+            self.memory_pools.replace_all(pool_updates)
+        return next_ids, output, token_logprobs, cache_miss_count, layers_topk_ids, new_future_map
 
     def forward_idle(
         self,
