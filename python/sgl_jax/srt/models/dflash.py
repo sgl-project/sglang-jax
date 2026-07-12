@@ -204,19 +204,35 @@ class DFlashAttention(nnx.Module):
             ),
             out_sharding=NamedSharding(self.mesh, P("data", "tensor", None)),
         )
+        kv_head_sharding = NamedSharding(self.mesh, P(None, "tensor", None))
         prefix_fused = fused_flat.at[prefix_cache_loc.reshape(-1)].get(
-            out_sharding=NamedSharding(self.mesh, P(None, None, None))
+            out_sharding=kv_head_sharding
         )
         prefix_fused = prefix_fused.reshape(
-            bs, prefix_width, prefix_fused.shape[-2], prefix_fused.shape[-1]
+            bs,
+            prefix_width,
+            prefix_fused.shape[-2],
+            prefix_fused.shape[-1],
+            out_sharding=NamedSharding(self.mesh, P(None, None, "tensor", None)),
         )
-        prefix_k = prefix_fused[:, :, 0 : self.kv_head_num * 2 : 2, : self.head_dim]
-        prefix_v = prefix_fused[:, :, 1 : self.kv_head_num * 2 : 2, : self.head_dim]
-        kv_block_sharding = NamedSharding(self.mesh, P(None, "data", "tensor", None))
+        kv_block_sharding = NamedSharding(self.mesh, P(None, None, "tensor", None))
+        prefix_k = prefix_fused.at[:, :, 0 : self.kv_head_num * 2 : 2, : self.head_dim].get(
+            out_sharding=kv_block_sharding
+        )
+        prefix_v = prefix_fused.at[:, :, 1 : self.kv_head_num * 2 : 2, : self.head_dim].get(
+            out_sharding=kv_block_sharding
+        )
         prefix_k = jax.sharding.reshard(prefix_k, kv_block_sharding)
         prefix_v = jax.sharding.reshard(prefix_v, kv_block_sharding)
 
-        q = q.reshape(bs, block, self.q_head_num, self.head_dim)
+        q_head_sharding = NamedSharding(self.mesh, P(None, None, "tensor", None))
+        q = q.reshape(
+            bs,
+            block,
+            self.q_head_num,
+            self.head_dim,
+            out_sharding=q_head_sharding,
+        )
         k_noise = k_noise.reshape(bs, block, self.kv_head_num, self.head_dim)
         v_noise = v_noise.reshape(bs, block, self.kv_head_num, self.head_dim)
         k_noise = jax.sharding.reshard(k_noise, kv_block_sharding)
@@ -226,23 +242,29 @@ class DFlashAttention(nnx.Module):
         v_all = jnp.concatenate([prefix_v, v_noise], axis=1)
         if self.q_head_num != self.kv_head_num:
             repeat = self.q_head_num // self.kv_head_num
-            q_head_sharding = NamedSharding(self.mesh, P(None, "data", "tensor", None))
             k_all = jnp.repeat(k_all, repeat, axis=2, out_sharding=q_head_sharding)
             v_all = jnp.repeat(v_all, repeat, axis=2, out_sharding=q_head_sharding)
 
-        dense_sharding = NamedSharding(self.mesh, P(None, None, None, None))
-        q = jax.sharding.reshard(q, dense_sharding)
-        k_all = jax.sharding.reshard(k_all, dense_sharding)
-        v_all = jax.sharding.reshard(v_all, dense_sharding)
-
-        scores = jnp.einsum("bqhd,bkhd->bhqk", q, k_all) * self.scaling
         prefix_valid = jnp.arange(prefix_width, dtype=jnp.int32)[None, :] < prefix_lens[:, None]
         block_valid = jnp.ones((bs, block), dtype=bool)
         kv_valid = jnp.concatenate([prefix_valid, block_valid], axis=1)
+
+        q = jax.sharding.reshard(q, q_head_sharding)
+        k_all = jax.sharding.reshard(k_all, q_head_sharding)
+        v_all = jax.sharding.reshard(v_all, q_head_sharding)
+
+        scores = jnp.einsum("bqhd,bkhd->bhqk", q, k_all) * self.scaling
+        scores = jax.sharding.reshard(
+            scores, NamedSharding(self.mesh, P(None, "tensor", None, None))
+        )
         scores = jnp.where(kv_valid[:, None, None, :], scores, jnp.array(-1.0e30, scores.dtype))
         probs = jax.nn.softmax(scores.astype(jnp.float32), axis=-1).astype(q.dtype)
         attn_output = jnp.einsum("bhqk,bkhd->bqhd", probs, v_all)
-        attn_output = attn_output.reshape(bs * block, self.q_size)
+        attn_output = attn_output.reshape(
+            bs * block,
+            self.q_size,
+            out_sharding=NamedSharding(self.mesh, P("data", "tensor")),
+        )
         output, _ = self.o_proj(attn_output)
         return output, token_to_kv_pool.get_fused_kv_buffer(self.layer_id)
 

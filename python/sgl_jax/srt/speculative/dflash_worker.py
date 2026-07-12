@@ -129,6 +129,7 @@ class DFlashWorker:
         self._debug_tokens_remaining = 4 if os.getenv("SGL_JAX_DFLASH_DEBUG_TOKENS") == "1" else 0
         self._sample_from_seed_hidden = os.getenv("SGL_JAX_DFLASH_SAMPLE_FROM_SEED_HIDDEN") == "1"
         self._debug_prefix_ab = os.getenv("SGL_JAX_DFLASH_DEBUG_PREFIX_AB") == "1"
+        self._draft_prefix_window = int(os.getenv("SGL_JAX_DFLASH_DRAFT_PREFIX_WINDOW", "0"))
 
         self.draft_layers = len(self.draft_model.model.layers)
         self._init_jit_target_verify()
@@ -668,23 +669,32 @@ class DFlashWorker:
             prefix_len = int(prefix_lens[i])
             if prefix_len > 0:
                 req_idx = int(req_pool_indices[i])
-                prefix_locs = np.asarray(req_to_token[req_idx, :prefix_len], dtype=np.int32)
+                if self._draft_prefix_window > 0:
+                    prefix_start = max(0, prefix_len - self._draft_prefix_window)
+                else:
+                    prefix_start = 0
+                prefix_locs = np.asarray(
+                    req_to_token[req_idx, prefix_start:prefix_len], dtype=np.int32
+                )
             else:
                 prefix_locs = np.empty(0, dtype=np.int32)
+            draft_prefix_len = len(prefix_locs)
             block_locs = block_loc[block_offset : block_offset + self.block_size]
             prefix_rows.append(prefix_locs)
-            prefix_kv_lens.append(prefix_len)
+            prefix_kv_lens.append(draft_prefix_len)
             locs.append(np.concatenate([prefix_locs, block_locs]))
-            kv_lens.append(prefix_len + self.block_size)
+            kv_lens.append(draft_prefix_len + self.block_size)
             block_offset += self.block_size
         prefix_cache_loc = self._pack_kv_cache(prefix_rows, prefix_kv_lens).reshape(bs, -1)
+        draft_prefix_lens = np.asarray(prefix_kv_lens, dtype=np.int32)
+        mwb.seq_lens = draft_prefix_lens
         mwb.spec_info_padded = DFlashVerifyInput(
             draft_token=jnp.asarray(block_ids_flat),
             positions=jnp.asarray(positions_flat),
             draft_token_num=self.block_size,
             capture_hidden_mode=CaptureHiddenMode.NULL,
             prefix_cache_loc=jnp.asarray(prefix_cache_loc, dtype=jnp.int32),
-            prefix_lens=jnp.asarray(prefix_lens, dtype=jnp.int32),
+            prefix_lens=jnp.asarray(draft_prefix_lens, dtype=jnp.int32),
             dense_draft=True,
         )
         mwb.cache_loc = self._pack_kv_cache(locs, kv_lens)
