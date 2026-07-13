@@ -5,9 +5,10 @@ MTP (`test/registered/models_e2e/test_step3p5_flash_chain_mtp.py`) to sgl-jax:
 
   1. GSM8K accuracy with speculative decoding ON — because NEXTN spec-decode is
      lossless at temperature=0, the score must match the plain-Flash greedy score
-     (~0.9477); a spec/verify/chain bug shows up as a dropped score. Optionally
-     also gates mean accept-length >= 2.6 (upstream's threshold) from the server
-     log, since sgl-jax does not surface accept-length over the API yet.
+     when a baseline is supplied; otherwise it must meet upstream's five-shot
+     completion threshold. Optionally also gates mean accept-length >= 2.6
+     (upstream's threshold) from the server log, since sgl-jax does not surface
+     accept-length over the API yet.
 
   2. Logprob consistency — generate with chain-MTP spec, then re-score the same
      sequence via prefill-only (no speculation); the two logprob sets must match
@@ -42,10 +43,11 @@ _GSM8K_BASELINE = os.getenv("SGLANG_GSM8K_BASELINE")
 # GSM8K knobs (overridable via env for quick/full runs).
 _GSM8K_N = int(os.getenv("SGLANG_GSM8K_NUM_EXAMPLES", "200"))
 _GSM8K_THREADS = int(os.getenv("SGLANG_GSM8K_THREADS", "32"))
-_GSM8K_MAX_TOKENS = int(os.getenv("SGLANG_GSM8K_MAX_TOKENS", "512"))
-# Floor when no baseline is given. Base Flash is ~0.9477; lossless spec must stay
-# close, so a floor well above upstream's 0.83 still leaves TP/bf16 headroom.
-_GSM8K_FLOOR = float(os.getenv("SGLANG_GSM8K_FLOOR", "0.90"))
+_DEFAULT_GSM8K_MAX_TOKENS = 512
+_GSM8K_MAX_TOKENS = int(os.getenv("SGLANG_GSM8K_MAX_TOKENS", str(_DEFAULT_GSM8K_MAX_TOKENS)))
+# Upstream's five-shot completion threshold when no greedy baseline is given.
+_DEFAULT_GSM8K_FLOOR = 0.83
+_GSM8K_FLOOR = float(os.getenv("SGLANG_GSM8K_FLOOR", str(_DEFAULT_GSM8K_FLOOR)))
 # Tolerance vs baseline (lossless → near-zero; small slack for eval subset noise).
 _GSM8K_TOL = float(os.getenv("SGLANG_GSM8K_TOL", "0.01"))
 # Upstream's accept-length threshold for Step-3.5-Flash chain MTP.
@@ -64,6 +66,19 @@ def _mean_accept_length_from_log(path: str) -> float | None:
     return float(np.mean(vals)) if vals else None
 
 
+def _build_gsm8k_eval_args() -> SimpleNamespace:
+    return SimpleNamespace(
+        base_url=_URL,
+        model=_MODEL,
+        eval_name="gsm8k",
+        api="completion",
+        num_shots=5,
+        num_examples=_GSM8K_N,
+        num_threads=_GSM8K_THREADS,
+        max_tokens=_GSM8K_MAX_TOKENS,
+    )
+
+
 @unittest.skipUnless(
     _URL,
     "Set SGLANG_NEXTN_E2E_URL to a running multi-host Step-3.5-Flash NEXTN server "
@@ -77,15 +92,7 @@ class TestStep3p5MTPGsm8k(unittest.TestCase):
         requests.get(f"{_URL}/health", timeout=30).raise_for_status()
 
     def test_gsm8k_accuracy_lossless(self):
-        args = SimpleNamespace(
-            base_url=_URL,
-            model=_MODEL,
-            eval_name="gsm8k",
-            num_examples=_GSM8K_N,
-            num_threads=_GSM8K_THREADS,
-            max_tokens=_GSM8K_MAX_TOKENS,
-        )
-        metrics = run_eval(args)
+        metrics = run_eval(_build_gsm8k_eval_args())
         score = metrics["score"]
         print(f"[gsm8k] NEXTN spec-decode score={score:.4f} (n={_GSM8K_N})")
 
@@ -102,7 +109,7 @@ class TestStep3p5MTPGsm8k(unittest.TestCase):
             self.assertGreaterEqual(
                 score,
                 _GSM8K_FLOOR,
-                f"spec gsm8k {score:.4f} below floor {_GSM8K_FLOOR}; expected ~0.9477 "
+                f"spec gsm8k {score:.4f} below upstream five-shot floor {_GSM8K_FLOOR} "
                 f"(set SGLANG_GSM8K_BASELINE=<flash score> for the strict lossless check)",
             )
 
