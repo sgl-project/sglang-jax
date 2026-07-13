@@ -1081,35 +1081,52 @@ class DFlashWorker:
         self.target_worker.run_precompile()
 
         pps_buckets = self._compute_pps_buckets()
-        bs = self.target_worker.compilation_manager.max_padded_batch_size
+        bs_buckets = self._compute_verify_bs_buckets()
 
         start = time.perf_counter()
         logger.info(
-            "[DFLASH] Precompiling TARGET_VERIFY: bs=%d, pps_buckets=%s",
-            bs,
+            "[DFLASH] Precompiling TARGET_VERIFY: bs_buckets=%s, pps_buckets=%s",
+            bs_buckets,
             pps_buckets,
         )
 
-        for pps in pps_buckets:
-            t0 = time.perf_counter()
-            self._precompile_verify(bs, pps, target=True)
-            logger.info(
-                "[DFLASH] Target verify pps=%d compiled in %.1f secs",
-                pps,
-                time.perf_counter() - t0,
-            )
-            t0 = time.perf_counter()
-            self._precompile_verify(bs, pps, target=False)
-            logger.info(
-                "[DFLASH] Draft verify pps=%d compiled in %.1f secs",
-                pps,
-                time.perf_counter() - t0,
-            )
+        for bs in bs_buckets:
+            for pps in pps_buckets:
+                t0 = time.perf_counter()
+                self._precompile_verify(bs, pps, target=True)
+                logger.info(
+                    "[DFLASH] Target verify bs=%d pps=%d compiled in %.1f secs",
+                    bs,
+                    pps,
+                    time.perf_counter() - t0,
+                )
+                t0 = time.perf_counter()
+                self._precompile_verify(bs, pps, target=False)
+                logger.info(
+                    "[DFLASH] Draft verify bs=%d pps=%d compiled in %.1f secs",
+                    bs,
+                    pps,
+                    time.perf_counter() - t0,
+                )
 
         logger.info(
             "[DFLASH] TARGET_VERIFY precompile finished in %.0f secs",
             time.perf_counter() - start,
         )
+
+    def _compute_verify_bs_buckets(self) -> list[int]:
+        buckets = []
+        for bs in self.target_worker.compilation_manager.bs_buckets:
+            bs = int(bs)
+            # Skip the non-power-of-two max_padded_batch_size bucket that the
+            # generic compilation manager appends as a catch-all (e.g. 204).
+            # DFlash verify precompile is expensive, and normal serving sweeps
+            # use power-of-two batch buckets.
+            if bs > 0 and (bs & (bs - 1)) == 0:
+                buckets.append(bs)
+        if not buckets:
+            buckets.append(int(self.target_worker.compilation_manager.max_padded_batch_size))
+        return buckets
 
     def _compute_pps_buckets(self) -> list[int]:
         max_pps = (self.target_worker.max_req_len + self.page_size - 1) // self.page_size
@@ -1123,7 +1140,20 @@ class DFlashWorker:
         final_bucket = max(16, 1 << max(0, (max_pps - 1)).bit_length())
         if buckets[-1] < final_bucket:
             buckets.append(final_bucket)
-        return buckets
+        # _make_verify_dummy_batch uses these values as the row-padded token
+        # width of cache_loc. For paged attention the row width must be page
+        # aligned because get_eagle_forward_metadata repacks rows into page
+        # indices. Small buckets such as 16/32 are valid for page_size=1, but
+        # invalid for page_size=64/128.
+        min_width = max(self.block_size, self.page_size)
+        aligned_buckets = []
+        for bucket in buckets:
+            bucket = max(int(bucket), int(min_width))
+            if self.page_size > 1:
+                bucket = ((bucket + self.page_size - 1) // self.page_size) * self.page_size
+            if not aligned_buckets or aligned_buckets[-1] != bucket:
+                aligned_buckets.append(bucket)
+        return aligned_buckets
 
     def _precompile_verify(self, bs: int, pps: int, target: bool):
         from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
