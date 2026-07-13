@@ -181,6 +181,7 @@ class ServerArgs:
     attention_backend: str | None = "fa"
     moe_backend: str = "epmoe"
     disable_jax_allreduce_metadata: bool = False
+    enable_grouped_topk_kernel: bool = False
 
     grammar_backend: str | None = None
 
@@ -1375,6 +1376,15 @@ class ServerArgs:
                 "Disable the pure JAX allreduce metadata path for fused EP-MoE; "
                 "fall back to the Pallas DMA-based allgather. "
                 "Default uses JAX path (recommended)."
+            ),
+        )
+        parser.add_argument(
+            "--enable-grouped-topk-kernel",
+            action="store_true",
+            default=ServerArgs.enable_grouped_topk_kernel,
+            help=(
+                "Enable the Pallas grouped-topk kernel for biased grouped top-k "
+                "routing (TPU only). Default off, using the pure JAX implementation."
             ),
         )
 

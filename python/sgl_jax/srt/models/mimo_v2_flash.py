@@ -111,6 +111,7 @@ class MiMoV2Moe(nnx.Module):
         self.topk = TopK(
             topk=num_experts_per_tok,
             renormalize=getattr(config, "norm_topk_prob", True),
+            mesh=mesh,
         )
 
         if self.moe_backend == "fused_v2":

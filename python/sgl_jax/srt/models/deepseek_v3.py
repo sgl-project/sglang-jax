@@ -531,6 +531,7 @@ class DeepseekV3DecoderLayer(nnx.Module):
             topk_group=topk_group,
             routed_scaling_factor=routed_scaling_factor,
             layer_id=layer_id,
+            mesh=mesh,
         )
 
         # Expert computation

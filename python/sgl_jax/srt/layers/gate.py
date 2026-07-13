@@ -1,5 +1,7 @@
 """Gating and Top-K routing for MoE layers."""
 
+import functools
+
 import jax
 from flax import nnx
 from jax import numpy as jnp
@@ -7,9 +9,20 @@ from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.eplb.expert_location import (
     ExpertLocationMetadata,
+    get_global_server_args,
     topk_ids_logical_to_physical,
 )
+from sgl_jax.srt.kernels.grouped_topk.v1.kernel import grouped_topk_pallas
 from sgl_jax.srt.utils.profiling_utils import named_scope
+
+
+def _grouped_topk_kernel_enabled() -> bool:
+    server_args = get_global_server_args()
+    return (
+        server_args is not None
+        and server_args.enable_grouped_topk_kernel
+        and server_args.device == "tpu"
+    )
 
 
 class GateLogit(nnx.Module):
@@ -71,6 +84,7 @@ class TopK(nnx.Module):
         topk_group: int = 0,
         routed_scaling_factor: float | None = None,
         layer_id: int = 0,
+        mesh: jax.sharding.Mesh | None = None,
     ):
         self.topk = topk
         self.renormalize = renormalize
@@ -78,6 +92,7 @@ class TopK(nnx.Module):
         self.topk_group = topk_group
         self.routed_scaling_factor = routed_scaling_factor
         self.layer_id = layer_id
+        self.mesh = mesh
 
     @named_scope
     def __call__(
@@ -90,7 +105,9 @@ class TopK(nnx.Module):
 
         if self.num_expert_group > 0 or self.topk_group > 0:
             if correction_bias is not None:
-                topk_weights, topk_ids = self._biased_grouped_topk(router_logits, correction_bias)
+                topk_weights, topk_ids = self._biased_grouped_topk(
+                    router_logits, correction_bias, packed=router_logits.dtype == jnp.bfloat16
+                )
             else:
                 topk_weights, topk_ids = self._grouped_topk(router_logits)
         else:
@@ -157,6 +174,33 @@ class TopK(nnx.Module):
         return topk_weights, topk_ids
 
     def _biased_grouped_topk(
+        self,
+        router_logits: jax.Array,
+        correction_bias: jax.Array = None,
+        packed: bool = False,
+    ):
+        if not _grouped_topk_kernel_enabled():
+            return self._biased_grouped_topk_jax(router_logits, correction_bias)
+        fn = functools.partial(
+            grouped_topk_pallas,
+            num_expert_group=self.num_expert_group,
+            topk_group=self.topk_group,
+            topk=self.topk,
+            packed=packed,
+        )
+        # Mosaic/Pallas kernels cannot be auto-partitioned by JAX's SPMD compiler;
+        # wrap in shard_map so each device runs the kernel on its local token slice.
+        if self.mesh is not None:
+            fn = jax.shard_map(
+                fn,
+                mesh=self.mesh,
+                in_specs=(P("data", None), P(None)),
+                out_specs=(P("data", None), P("data", None)),
+                check_vma=False,
+            )
+        return fn(router_logits, correction_bias)
+
+    def _biased_grouped_topk_jax(
         self,
         router_logits: jax.Array,
         correction_bias: jax.Array = None,

@@ -206,6 +206,7 @@ class MiniMaxM2DecoderLayer(nnx.Module):
             topk=num_experts_per_tok,
             renormalize=True,
             layer_id=layer_id,
+            mesh=mesh,
         )
 
         moe_cls = FusedEPMoE if self.use_fused else EPMoE
