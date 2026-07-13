@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import contextlib
 import copy
-import functools
 import logging
 import os
 
@@ -44,21 +43,6 @@ from sgl_jax.srt.speculative.dflash_util import (
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 
 logger = logging.getLogger(__name__)
-
-
-@functools.partial(jax.jit, static_argnames=("vocab_size",))
-def _dflash_greedy_sample_jit(
-    hidden_states: jax.Array,
-    lm_head: jax.Array,
-    *,
-    vocab_size: int,
-) -> jax.Array:
-    """Fused target-head greedy sampling for DFlash draft proposals."""
-    output_shape = hidden_states.shape[:-1]
-    flat_hidden = hidden_states.reshape((-1, hidden_states.shape[-1]))
-    logits = jnp.einsum("th,vh->tv", flat_hidden, lm_head)[:, :vocab_size]
-    token_ids = jnp.argmax(logits, axis=-1).astype(jnp.int32)
-    return token_ids.reshape(output_shape)
 
 
 class DFlashWorker:
@@ -126,9 +110,6 @@ class DFlashWorker:
         # because is_draft_worker=True).
         self.draft_model_runner.initialize_jit()
 
-        self._debug_tokens_remaining = 4 if os.getenv("SGL_JAX_DFLASH_DEBUG_TOKENS") == "1" else 0
-        self._sample_from_seed_hidden = os.getenv("SGL_JAX_DFLASH_SAMPLE_FROM_SEED_HIDDEN") == "1"
-        self._debug_prefix_ab = os.getenv("SGL_JAX_DFLASH_DEBUG_PREFIX_AB") == "1"
         self._draft_prefix_window = int(os.getenv("SGL_JAX_DFLASH_DRAFT_PREFIX_WINDOW", "0"))
 
         self.draft_layers = len(self.draft_model.model.layers)
@@ -142,13 +123,6 @@ class DFlashWorker:
             self._mask_token_id,
             self.draft_layers,
         )
-        if self._debug_tokens_remaining > 0:
-            logger.warning(
-                "DFLASH debug enabled: tokens=%d sample_from_seed_hidden=%s prefix_ab=%s",
-                self._debug_tokens_remaining,
-                self._sample_from_seed_hidden,
-                self._debug_prefix_ab,
-            )
 
     # Delegate anything not implemented here to the target worker.
     def __getattr__(self, name):
@@ -224,9 +198,9 @@ class DFlashWorker:
         from sgl_jax.srt.managers.scheduler import GenerationBatchResult
 
         draft_input: DFlashDraftInput = model_worker_batch.spec_info_padded
-        assert isinstance(
-            draft_input, DFlashDraftInput
-        ), "DFLASH decode requires DFlashDraftInput carried over from prefill."
+        assert isinstance(draft_input, DFlashDraftInput), (
+            "DFLASH decode requires DFlashDraftInput carried over from prefill."
+        )
 
         bs = int(model_worker_batch.seq_lens.shape[0])
         seq_lens = np.asarray(model_worker_batch.seq_lens, dtype=np.int32)
@@ -263,26 +237,6 @@ class DFlashWorker:
             verify_input,
             forward_metadata,
         )
-        if self._debug_tokens_remaining > 0:
-            self._debug_tokens_remaining -= 1
-            candidates_np = np.asarray(jax.device_get(verify_input.draft_token)).reshape(
-                bs, self.block_size
-            )
-            target_predict_np = np.asarray(
-                jax.device_get(
-                    jnp.argmax(logits_output.next_token_logits, axis=-1).astype(jnp.int32)
-                )
-            ).reshape(bs, self.block_size)
-            logger.warning(
-                "DFLASH token debug: seq_lens=%s target_prefix=%s draft_prefix=%s "
-                "accept=%s candidates0=%s target0=%s",
-                seq_lens.tolist(),
-                target_prefix_lens.tolist(),
-                draft_prefix_lens.tolist(),
-                np.asarray(jax.device_get(accept_lens_out), dtype=np.int32).tolist(),
-                candidates_np[0].tolist() if len(candidates_np) else [],
-                target_predict_np[0].tolist() if len(target_predict_np) else [],
-            )
         accept_lens_np = np.asarray(jax.device_get(accept_lens_out), dtype=np.int32)
         new_seq_lens = seq_lens + accept_lens_np
         new_draft_kv_lens = target_prefix_lens + accept_lens_np
@@ -544,81 +498,10 @@ class DFlashWorker:
             forward_batch.forward_mode = ForwardMode.TARGET_VERIFY
             metadata = self.draft_model_runner.attn_backend.get_eagle_forward_metadata(draft_mwb)
             self.draft_model_runner.attn_backend.forward_metadata = metadata
-            draft_logits_output, draft_token_flat = self._run_jit_draft_block(forward_batch, None)
-
-            if self._debug_tokens_remaining > 0 and self._debug_prefix_ab:
-                zero_prefix_lens = np.zeros_like(draft_prefix_lens)
-                no_prefix_mwb = self._make_draft_block_mwb(
-                    model_worker_batch,
-                    block_ids_flat,
-                    positions_flat,
-                    block_cache_loc,
-                    zero_prefix_lens,
-                    bs,
-                )
-                no_prefix_batch = ForwardBatch.init_new(no_prefix_mwb, self.draft_model_runner)
-                no_prefix_batch.forward_mode = ForwardMode.TARGET_VERIFY
-                no_prefix_metadata = (
-                    self.draft_model_runner.attn_backend.get_eagle_forward_metadata(no_prefix_mwb)
-                )
-                self.draft_model_runner.attn_backend.forward_metadata = no_prefix_metadata
-                no_prefix_output, _ = self._run_jit_draft_block(no_prefix_batch, None)
+            draft_token_flat = self._run_jit_draft_block(forward_batch, None)
         finally:
             # release the temp kv
             allocator.restore_state(state)
-
-        if self._debug_tokens_remaining > 0:
-            draft_hidden = draft_logits_output.hidden_states.reshape(bs, self.block_size, -1)
-            proposal_hidden = (
-                draft_hidden[:, :-1, :] if self._sample_from_seed_hidden else draft_hidden[:, 1:, :]
-            )
-            proposal_flat = proposal_hidden.reshape(-1, draft_hidden.shape[-1])
-            vocab_size = self._lm_head_vocab_size()
-            proposal_logits = (proposal_flat @ self._target_lm_head.T)[:, :vocab_size]
-            top_vals, top_ids = jax.lax.top_k(proposal_logits, k=2)
-            hidden_norms = jnp.linalg.norm(draft_hidden[0].astype(jnp.float32), axis=-1)
-            margin = (top_vals[:, 0] - top_vals[:, 1]).reshape(bs, self.block_size - 1)
-            block_delta = jnp.max(
-                jnp.abs(
-                    draft_hidden[0, 1:].astype(jnp.float32)
-                    - draft_hidden[0, 1:2].astype(jnp.float32)
-                ),
-                axis=-1,
-            )
-            logger.warning(
-                "DFLASH draft stats: hidden_norm0=%s top1_0=%s margin0=%s " "block_delta0=%s",
-                np.asarray(jax.device_get(hidden_norms), dtype=np.float32).round(3).tolist(),
-                np.asarray(jax.device_get(top_ids[:, 0]), dtype=np.int32)
-                .reshape(bs, self.block_size - 1)[0]
-                .tolist(),
-                np.asarray(jax.device_get(margin), dtype=np.float32).round(3)[0].tolist(),
-                np.asarray(jax.device_get(block_delta), dtype=np.float32).round(5).tolist(),
-            )
-            if self._debug_prefix_ab:
-                no_prefix_hidden = no_prefix_output.hidden_states.reshape(bs, self.block_size, -1)
-                no_prefix_proposal = (
-                    no_prefix_hidden[:, :-1, :]
-                    if self._sample_from_seed_hidden
-                    else no_prefix_hidden[:, 1:, :]
-                )
-                no_prefix_logits = (
-                    no_prefix_proposal.reshape(-1, no_prefix_hidden.shape[-1])
-                    @ self._target_lm_head.T
-                )[:, :vocab_size]
-                no_prefix_top = jnp.argmax(no_prefix_logits, axis=-1).astype(jnp.int32)
-                prefix_effect = jnp.max(
-                    jnp.abs(
-                        proposal_hidden.astype(jnp.float32) - no_prefix_proposal.astype(jnp.float32)
-                    )
-                )
-                logger.warning(
-                    "DFLASH prefix A/B: prefix_lens=%s no_prefix_top1_0=%s " "max_hidden_diff=%.6f",
-                    draft_prefix_lens.tolist(),
-                    np.asarray(jax.device_get(no_prefix_top), dtype=np.int32)
-                    .reshape(bs, self.block_size - 1)[0]
-                    .tolist(),
-                    float(jax.device_get(prefix_effect)),
-                )
 
         return DFlashVerifyInput(
             draft_token=draft_token_flat,
@@ -718,7 +601,6 @@ class DFlashWorker:
         model_def = runner._model_def
         model_state_def = runner._model_state_def
         block_size = self.block_size
-        sample_from_seed_hidden = self._sample_from_seed_hidden
         vocab_size = self._lm_head_vocab_size()
         embedding_sharding = NamedSharding(runner.mesh, P("data", "tensor"))
         logits_sharding = NamedSharding(runner.mesh, P("data", "tensor"))
@@ -730,7 +612,6 @@ class DFlashWorker:
             static_argnames=[
                 "model_state_def",
                 "block_size",
-                "sample_from_seed_hidden",
                 "vocab_size",
             ],
         )
@@ -745,7 +626,6 @@ class DFlashWorker:
             lm_head,
             *,
             block_size: int,
-            sample_from_seed_hidden: bool,
             vocab_size: int,
         ):
             input_embedding = embed.at[forward_batch.input_ids].get(out_sharding=embedding_sharding)
@@ -754,16 +634,12 @@ class DFlashWorker:
             model = nnx.merge(model_def, model_state)
             memory_pools = _maybe_apply_recurrent_cow(forward_batch, memory_pools)
             with LoraBatchContext.set_batch(forward_batch):
-                output, pool_updates, aux, layers_topk_ids = model(
-                    forward_batch, memory_pools, logits_metadata
-                )
+                output, pool_updates, _, _ = model(forward_batch, memory_pools, logits_metadata)
 
             draft_hidden = output.hidden_states.reshape(
                 (-1, block_size, output.hidden_states.shape[-1])
             )
-            proposal_hidden = (
-                draft_hidden[:, :-1, :] if sample_from_seed_hidden else draft_hidden[:, 1:, :]
-            )
+            proposal_hidden = draft_hidden[:, 1:, :]
             proposal_flat = proposal_hidden.reshape((-1, proposal_hidden.shape[-1]))
             logits = jnp.dot(
                 proposal_flat,
@@ -775,14 +651,13 @@ class DFlashWorker:
             seed = forward_batch.input_ids.reshape((-1, block_size))[:, :1]
             draft_token = jnp.concatenate([seed, draft_next], axis=1).reshape(-1)
             draft_token = jax.sharding.reshard(draft_token, token_sharding)
-            return output, pool_updates, aux, layers_topk_ids, draft_token
+            return pool_updates, draft_token
 
         self._jit_draft_block = _partial(
             draft,
             model_def,
             model_state_def,
             block_size=block_size,
-            sample_from_seed_hidden=sample_from_seed_hidden,
             vocab_size=vocab_size,
         )
 
@@ -790,7 +665,7 @@ class DFlashWorker:
         runner = self.draft_model_runner
 
         def _call_and_replace():
-            output, pool_updates, _, _, draft_token = self._jit_draft_block(
+            pool_updates, draft_token = self._jit_draft_block(
                 runner.model_state_leaves,
                 forward_batch,
                 runner.memory_pools,
@@ -802,7 +677,7 @@ class DFlashWorker:
                 target_sharding = runner.token_to_kv_pool.kv_sharding
                 pool_updates = [jax.device_put(kv, target_sharding) for kv in pool_updates]
             runner.memory_pools.replace_all(pool_updates)
-            return output, draft_token
+            return draft_token
 
         _kv_lock = getattr(runner.token_to_kv_pool, "_donate_lock", None)
         if _kv_lock is None:
@@ -832,7 +707,6 @@ class DFlashWorker:
         data_part = pool.attention_data_partition_axis
         mesh = pool.mesh
         n_layers = self.draft_layers
-        block_size = self.block_size
         vector_sharding = NamedSharding(mesh, P("data"))
         hidden_sharding = NamedSharding(mesh, P("data", None))
 
@@ -841,7 +715,7 @@ class DFlashWorker:
 
         @_partial(
             jax.jit,
-            static_argnames=["model_state_def", "is_decode", "block_size"],
+            static_argnames=["model_state_def", "is_decode"],
             donate_argnames=["kv_buffers"],
         )
         def draft_extend(
@@ -854,7 +728,6 @@ class DFlashWorker:
             kv_buffers,
             *,
             is_decode: bool,
-            block_size: int,
         ):
             positions = jax.sharding.reshard(positions.astype(jnp.int32), vector_sharding)
             cache_loc = jax.sharding.reshard(cache_loc.astype(jnp.int32), vector_sharding)
@@ -911,7 +784,6 @@ class DFlashWorker:
             jnp.asarray(cache_loc),
             kv_buffers,
             is_decode=not is_prefill,
-            block_size=self.block_size,
         )
         for i, buf in enumerate(new_buffers):
             pool.kv_buffer[i] = buf
@@ -999,14 +871,6 @@ class DFlashWorker:
             return np.zeros((0,), dtype=np.int32)
         return np.concatenate(pos).astype(np.int32)
 
-    def _greedy_sample(self, hidden_states: jax.Array) -> jax.Array:
-        """Argmax over the target LM head."""
-        return _dflash_greedy_sample_jit(
-            hidden_states,
-            self._target_lm_head,
-            vocab_size=self._lm_head_vocab_size(),
-        )
-
     def _lm_head_vocab_size(self) -> int:
         # Unit tests instantiate this class via __new__; avoid __getattr__ fallback there.
         return int(self.__dict__.get("_target_vocab_size", self._target_lm_head.shape[0]))
@@ -1058,19 +922,6 @@ class DFlashWorker:
             packed[i, :] = pad_value
             packed[i, :n] = row_arr
         return packed.reshape(-1)
-
-    def _slice_committed_target_hidden(self, hidden_states, accept_lens_np, bs):
-        """Gather aux hidden for the committed verify tokens (front of each block)."""
-        hs = np.asarray(jax.device_get(hidden_states)).reshape(bs, self.block_size, -1)
-        rows = []
-        for i in range(bs):
-            a = int(accept_lens_np[i])
-            if a <= 0:
-                continue
-            rows.append(hs[i, :a, :])
-        if not rows:
-            return np.zeros((0, hs.shape[-1]), dtype=hs.dtype)
-        return np.concatenate(rows, axis=0)
 
     # ------------------------------------------------------------------ #
     # Precompile hook (scheduler calls this at startup)
@@ -1170,7 +1021,6 @@ class DFlashWorker:
                 forward_metadata=forward_metadata,
             )
         else:
-
             forward_batch = ForwardBatch.init_new(mwb, self.draft_model_runner)
             forward_batch.forward_mode = ForwardMode.TARGET_VERIFY
             num_tokens = bs * self.block_size

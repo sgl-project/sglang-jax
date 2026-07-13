@@ -1,14 +1,12 @@
 """CPU unit tests for DFlashWorker state-advance helpers.
 
 The full worker construction needs real target/draft ModelWorkers (TPU); these
-tests exercise the pure array helpers by instantiating the worker via ``__new__``
-and injecting the minimal attributes each helper reads. End-to-end draft/verify
-is validated by the TPU v6e smoke command in ``docs/design/dflash_stage_c.md``.
+tests exercise pure array helpers by instantiating the worker via ``__new__``
+and injecting the minimal attributes each helper reads.
 """
 
 from types import SimpleNamespace
 
-import jax.numpy as jnp
 import numpy as np
 
 from sgl_jax.srt.layers.attention.flashattention_backend import (
@@ -23,36 +21,6 @@ def _bare_worker(**attrs):
     for k, v in attrs.items():
         object.__setattr__(w, k, v)
     return w
-
-
-def test_greedy_sample_from_head_picks_argmax():
-    # lm_head: [vocab=4, hidden=3]. Row v is a one-hot at dim v%3 scaled by v+1,
-    # so hidden aligned to a given row maximizes that row's logit.
-    lm_head = jnp.array(
-        [
-            [3.0, 0.0, 0.0],
-            [0.0, 3.0, 0.0],
-            [0.0, 0.0, 3.0],
-            [1.0, 1.0, 1.0],
-        ],
-        dtype=jnp.float32,
-    )
-    w = _bare_worker(_target_lm_head=lm_head)
-    hidden = jnp.array([[5.0, 0.0, 0.0], [0.0, 5.0, 0.0]], dtype=jnp.float32)
-    out = np.asarray(w._greedy_sample(hidden))
-    np.testing.assert_array_equal(out, np.array([0, 1], dtype=np.int32))
-
-
-def test_slice_committed_target_hidden_gathers_front_of_block():
-    # bs=2, block_size=3, feat=2. Commit 2 tokens for req0, 1 for req1.
-    block_size = 3
-    w = _bare_worker(block_size=block_size)
-    hs = jnp.arange(2 * block_size * 2, dtype=jnp.float32).reshape(2 * block_size, 2)
-    accept_lens = np.array([2, 1], dtype=np.int32)
-    out = np.asarray(w._slice_committed_target_hidden(hs, accept_lens, bs=2))
-    # req0 rows 0,1 ; req1 row 3 (block start = 3)
-    expected = np.stack([np.asarray(hs)[0], np.asarray(hs)[1], np.asarray(hs)[3]], axis=0)
-    np.testing.assert_array_equal(out, expected)
 
 
 def test_committed_positions_prefill_and_decode():
