@@ -131,7 +131,7 @@ The table below summarizes the most commonly used launch parameters, recommended
 | `device_indexes` | `list[int] \| None` | `None` | Device indices used by the mesh |
 | `tp_size` | `int` | `1` | Tensor parallelism degree |
 | `dp_size` | `int` | `1` | Data parallelism degree; the Scheduler partitions requests and batches by DP rank inside the same process |
-| `dp_schedule_policy` | `str` | `"min_running_queue"` | DP rank assignment policy (`min_running_queue` / `round_robin` / `cache_aware`) |
+| `dp_schedule_policy` | `str \| None` | `None` (auto) | DP rank assignment policy (`cache_aware` / `shape_aware` / `min_running_queue` / `round_robin`) |
 | `ep_size` | `int` | `1` | Expert parallelism degree |
 | `ep_num_redundant_experts` | `int` | `0` | Number of redundant experts for EP load balancing |
 | `ep_dispatch_algorithm` | `str \| None` | `None` | EP dispatch mode (`static` / `dynamic` / `fake`) |
@@ -148,7 +148,7 @@ The table below summarizes the most commonly used launch parameters, recommended
 
 **`tp_size` / `dp_size`**: `tp_size` denotes the model tensor-parallel configuration of the total parallel device count, and `dp_size` denotes the number of Data Parallel ranks partitioned within the same Scheduler. The execution-side mesh shape is `(dp_size, tp_size // dp_size)`, with axis names `(data, tensor)`. Therefore the actual TP width on the attention side is `tp_size // dp_size`.
 
-**`dp_schedule_policy`**: Controls which DP rank a new request is assigned to. `min_running_queue` selects the rank with the fewest currently running requests; `round_robin` cycles through ranks; `cache_aware` routes by prefix-cache affinity when the load is balanced enough, and falls back toward the least-loaded rank under large skew.
+**`dp_schedule_policy`**: Controls which DP rank a new request is assigned to. If unset, startup chooses `cache_aware` when radix cache is enabled and `min_running_queue` when `--disable-radix-cache` is set or Pathways PD is enabled. `cache_aware` keeps prefix affinity as the first-order signal, falls back to shape-aware routing on cache misses, and still overrides cache affinity under large request-count skew. `shape_aware` balances input/prefill and output/decode token load separately by minimizing the post-admission bottleneck dimension, and is available as an explicit tuning option. `min_running_queue` selects the rank with the fewest currently running requests, then scheduled tokens; `round_robin` cycles through ranks.
 
 **`enable_sequence_parallel`**: Defaults to `False`. When set to `True`, `srt/utils/parallel_utils.py::should_scatter()` decides whether a specific row-parallel Linear actually performs reduce-scatter — only when the layer explicitly declares `output_scatter_dimension`, the per-device slice is ≥ `global_config.tpu_scatter_min_local_size`, and divisibility holds, does it take effect; otherwise it falls back to the original partition spec automatically. Currently wired up in `models/grok.py`; other models will only be affected after explicitly setting `output_scatter_dimension` on their Linear layers.
 

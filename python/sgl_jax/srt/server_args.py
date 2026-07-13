@@ -123,7 +123,7 @@ class ServerArgs:
 
     # Data parallel
     dp_size: int = 1
-    dp_schedule_policy: str = "min_running_queue"
+    dp_schedule_policy: str | None = None
 
     # Logging
     log_level: str = "info"
@@ -479,6 +479,10 @@ class ServerArgs:
                     "hicache_write_policy must be one of write_through/"
                     f"write_through_selective/write_back, got {self.hicache_write_policy}"
                 )
+
+        if self.dp_schedule_policy is None:
+            use_no_radix_default = self.disable_radix_cache or bool(self.pd_disaggregation)
+            self.dp_schedule_policy = "min_running_queue" if use_no_radix_default else "cache_aware"
 
         if self.nnodes > 1 and self.device_indexes is not None:
             logger.warning("In a multi-machine scenario, device_indexes will be set to None.")
@@ -1176,6 +1180,8 @@ class ServerArgs:
             default=ServerArgs.dp_schedule_policy,
             help=(
                 "DP scheduling policy for assigning dp_rank to new requests. "
+                "When unset, defaults to 'cache_aware' with radix cache enabled "
+                "and 'min_running_queue' with radix cache disabled or Pathways PD. "
                 "'cache_aware' routes by cache affinity with soft load balancing: "
                 "it balances on large load skew, else picks the least-loaded rank "
                 "among those holding a substantial cached prefix, so a hot prefix "

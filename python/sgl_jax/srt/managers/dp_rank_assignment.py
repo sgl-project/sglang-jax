@@ -29,7 +29,10 @@ def assign_dp_ranks(
     dp_size: int,
     dp_schedule_policy: str,
     select_round_robin_dp: Callable[[], int],
-    select_cache_aware_dp: Callable[[TokenizedGenerateReqInput, list[int], list[int]], int | None],
+    select_cache_aware_dp: Callable[
+        [TokenizedGenerateReqInput, list[int], list[int], list[int], list[int]],
+        int | None,
+    ],
     select_min_running_dp: Callable[[list[int], list[int]], int | None],
     select_shape_aware_dp: Callable[
         [int, int, list[int], list[int], list[int], list[int]], int | None
@@ -59,11 +62,11 @@ def assign_dp_ranks(
 
     pending_counts = [0] * dp_size
     pending_token_counts = [0] * dp_size
-    # shape_aware balances prefill (input) and decode (output) separately, so it
-    # also needs the input/output split of requests assigned earlier in this same
-    # intake tick -- otherwise a burst routes against a stale snapshot and
-    # mis-balances. Only tracked for that policy to avoid overhead elsewhere.
-    is_shape_aware = dp_schedule_policy == "shape_aware"
+    # shape_aware balances prefill (input) and decode (output) separately. cache_aware
+    # needs the same split for its no-holder/cache-miss shape-aware fallback. Include
+    # requests assigned earlier in this intake tick, otherwise bursts route against a
+    # stale snapshot and mis-balance.
+    tracks_pending_io = dp_schedule_policy in ("shape_aware", "cache_aware")
     pending_input_counts = [0] * dp_size
     pending_output_counts = [0] * dp_size
     ready_reqs: list[Any] = []
@@ -72,7 +75,7 @@ def assign_dp_ranks(
     def track(req, dp_rank):
         pending_counts[dp_rank] += 1
         pending_token_counts[dp_rank] += estimate_req_tokens(req)
-        if is_shape_aware:
+        if tracks_pending_io:
             in_tok, out_tok = estimate_req_io_tokens(req)
             pending_input_counts[dp_rank] += in_tok
             pending_output_counts[dp_rank] += out_tok
@@ -102,8 +105,14 @@ def assign_dp_ranks(
             continue
 
         if dp_schedule_policy == "cache_aware":
-            dp_rank = select_cache_aware_dp(req, pending_counts, pending_token_counts)
-        elif is_shape_aware:
+            dp_rank = select_cache_aware_dp(
+                req,
+                pending_counts,
+                pending_token_counts,
+                pending_input_counts,
+                pending_output_counts,
+            )
+        elif dp_schedule_policy == "shape_aware":
             item_in, item_out = estimate_req_io_tokens(req)
             dp_rank = select_shape_aware_dp(
                 item_in,

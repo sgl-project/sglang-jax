@@ -37,7 +37,19 @@ class _DpAssignmentHarness:
         self.full_ranks = full_ranks or set()
         self.per_dp_max_running_requests = per_dp_max_running_requests
         self.round_robin_counter = 0
-        self.cache_aware_calls: list[tuple[str | list[str] | None, list[int], list[int]]] = []
+        # Records (rid, extra_counts, extra_token_counts, item_input, item_output,
+        # extra_input_counts, extra_output_counts) per cache_aware dispatch.
+        self.cache_aware_calls: list[
+            tuple[
+                str | list[str] | None,
+                list[int],
+                list[int],
+                int,
+                int,
+                list[int],
+                list[int],
+            ]
+        ] = []
         # Records (item_input, item_output, extra_input_counts, extra_output_counts)
         # per shape_aware dispatch, so tests can assert the same-tick pending-IO split.
         self.shape_aware_calls: list[tuple[int, int, list[int], list[int]]] = []
@@ -70,8 +82,21 @@ class _DpAssignmentHarness:
         req: TokenizedGenerateReqInput,
         extra_counts: list[int],
         extra_token_counts: list[int],
+        extra_input_counts: list[int],
+        extra_output_counts: list[int],
     ) -> int | None:
-        self.cache_aware_calls.append((req.rid, list(extra_counts), list(extra_token_counts)))
+        item_input, item_output = self.estimate_req_io_tokens(req)
+        self.cache_aware_calls.append(
+            (
+                req.rid,
+                list(extra_counts),
+                list(extra_token_counts),
+                item_input,
+                item_output,
+                list(extra_input_counts),
+                list(extra_output_counts),
+            )
+        )
         return self.select_min_running_dp(extra_counts, extra_token_counts)
 
     def select_shape_aware_dp(
@@ -87,7 +112,12 @@ class _DpAssignmentHarness:
         # tracking is under test; the routing decision itself (shape-aware math)
         # is covered by test_dp_schedule_shape_aware.py, so reuse min-running here.
         self.shape_aware_calls.append(
-            (item_input, item_output, list(extra_input_counts), list(extra_output_counts))
+            (
+                item_input,
+                item_output,
+                list(extra_input_counts),
+                list(extra_output_counts),
+            )
         )
         return self.select_min_running_dp(extra_counts, extra_token_counts)
 
@@ -207,7 +237,26 @@ def test_cache_aware_receives_pending_load_from_prior_requests():
     assert result.ready_reqs == [sticky, new]
     assert result.pending_reqs == []
     assert new.dp_rank == 1
-    assert harness.cache_aware_calls == [("new", [1, 0], [8, 0])]
+    assert harness.cache_aware_calls == [("new", [1, 0], [8, 0], 4, 4, [4, 0], [4, 0])]
+
+
+def test_cache_aware_receives_pending_io_split_from_prior_same_tick_assignment():
+    # Guards cache_aware's shape-aware miss fallback: a request assigned earlier in
+    # the same intake tick must affect the input/output split seen by the next
+    # request, not only the aggregate pending token count.
+    harness = _DpAssignmentHarness()
+    first = _req("first", input_len=10, max_new_tokens=3)  # assigned to rank 0
+    second = _req("second", input_len=5, max_new_tokens=7)
+
+    result = _assign(recv_reqs=[first, second], policy="cache_aware", harness=harness)
+
+    assert result.ready_reqs == [first, second]
+    assert result.pending_reqs == []
+    assert [first.dp_rank, second.dp_rank] == [0, 1]
+    assert harness.cache_aware_calls == [
+        ("first", [0, 0], [0, 0], 10, 3, [0, 0], [0, 0]),
+        ("second", [1, 0], [13, 0], 5, 7, [10, 0], [3, 0]),
+    ]
 
 
 def test_shape_aware_receives_pending_io_split_from_prior_requests():
