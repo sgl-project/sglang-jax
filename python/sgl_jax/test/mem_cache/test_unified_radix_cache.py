@@ -1209,6 +1209,27 @@ class TestUnifiedRadixCacheRecurrent(CustomTestCase):
         self.assertEqual(pool.recurrent_available_size(0), slots)
         self.assertEqual(cache.assert_recurrent_slot_ledger(0), 0)
 
+    def test_match_reaches_snapshot_past_snapshotless_interior_node(self):
+        """The device walk must skip interior nodes without a recurrent snapshot
+        (leaf-only invariant frees them) and match the deeper snapshot leaf."""
+        _, pool, _, cache = self._create_recurrent_setup()
+
+        key = [1, 2, 3, 4, 5, 6, 7, 8]
+        full_value = np.arange(100, 108, dtype=np.int32)
+        self._commit(cache, pool, key[:4], full_value[:4])
+        slot2, second = self._commit(cache, pool, key, full_value)
+        self.assertTrue(second.recurrent_committed)
+        # The first boundary node turned interior; its snapshot was freed.
+        self.assertEqual(cache.component_evictable_size_[ComponentType.RECURRENT][0], 1)
+
+        # Cross-request share: same 8-token prefix, diverging tail.
+        req = _CowReq(dp_rank=0)
+        match = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(key + [99], None, 0), cow_recurrent=True, req=req)
+        )
+        self.assertTrue(np.array_equal(match.device_indices, full_value))
+        self.assertEqual(req.recurrent_cow_src_index, slot2)
+
     def test_abort_and_retract_release_recurrent_slots(self):
         """Abort and retract must return request-owned recurrent slots to the free list."""
         state_pool, pool, allocator, cache = self._create_recurrent_setup()
