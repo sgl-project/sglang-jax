@@ -48,10 +48,26 @@ export XLA_FLAGS="${XLA_FLAGS:+$XLA_FLAGS }\
 
 ## Capture skeleton
 
+Illustrative skeleton (placeholders — substitute your kernel). Name each phase with
+`jax.named_scope` so Trace Viewer shows business-stage names, then warm up and record:
+
 ```python
-import os  # flags BEFORE import jax (see above)
+# Run with the LIBTPU_INIT_ARGS / XLA_FLAGS from "Dump flags" already exported,
+# so they take effect before the first `import jax` below.
 import jax
-OUT = "/tmp/pallas-profile"                   # same dir as the flags block above
+
+@jax.jit
+def run_kernel():
+    # wrap each phase in its own named_scope context manager
+    with jax.named_scope("w1_load"):
+        w1 = load_weights()
+    with jax.named_scope("gemm"):
+        acc = matmul(x, w1)
+    with jax.named_scope("store_output"):
+        store(acc)
+    return acc
+
+opts = jax.profiler.ProfileOptions()          # add counter config only for counters mode
 for _ in range(3):                            # warm up so compile/autotune is outside the trace
     jax.block_until_ready(run_kernel())
 with jax.profiler.trace(f"{OUT}/xprof"):      # trace lands beside the LLO/HLO dumps under $OUT
@@ -60,15 +76,8 @@ with jax.profiler.trace(f"{OUT}/xprof"):      # trace lands beside the LLO/HLO d
     jax.block_until_ready(r)                  # block_until_ready MUST be inside the block
 ```
 
-Loop count: one call of a fast (single-digit-ns) kernel leaves too little in the window — a
-valid-but-empty trap. Loop until the region is milliseconds of device work (hundreds–thousands
-of iters for a tiny kernel); block **once at the end, still inside the block**.
-
-Name the phases with `jax.named_scope("w1_load" / "gemm" / "store_output")` so
-Trace Viewer maps LLO/MXU activity to your code. Those names are illustrative — use **your
-kernel's** real phases (a VPU/sort kernel has no `gemm`), business-stage names not `scope1`.
-
-Output: `<logdir>/plugins/profile/<ts>/<host>.xplane.pb` (+ `.trace.json.gz`).
+Output lands under the logdir passed to `jax.profiler.trace` — here
+`$OUT/xprof/plugins/profile/<ts>/<host>.xplane.pb` (+ `.trace.json.gz`).
 
 ## Verify the capture is valid
 

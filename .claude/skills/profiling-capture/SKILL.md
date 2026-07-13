@@ -66,8 +66,26 @@ Key flags:
 profile only that stage, omit for both.
 
 **Manual path:** `POST /start_profile` (body = `ProfileReqInput`, may include `output_dir`) →
-send requests → `POST /stop_profile` → `GET /profile_status` until `message == "idle"` (else
-`"in_progress"`).
+send requests → `POST /stop_profile` → `GET /profile_status` until `status == "idle"` (else
+`"in_progress"`):
+
+```bash
+# 1. arm the profiler (body = ProfileReqInput; all fields optional).
+#    Omit num_steps so the window runs until you call stop_profile below.
+curl -s -X POST http://127.0.0.1:30000/start_profile \
+  -H 'Content-Type: application/json' \
+  -d '{"output_dir": "/tmp/myprofile"}'
+
+# 2. send your requests here (bench_serving, curl /generate, real traffic, …)
+
+# 3. stop, then poll status until it flushes to idle
+curl -s -X POST http://127.0.0.1:30000/stop_profile
+until [ "$(curl -s http://127.0.0.1:30000/profile_status | jq -r .status)" = idle ]; do sleep 1; done
+```
+
+`start_profile` / `stop_profile` also accept `GET`; `start_profile` with no body uses server
+defaults. Key `ProfileReqInput` fields: `output_dir`, `num_steps`, `start_step`,
+`profile_by_stage`, `profile_stages` (e.g. `["prefill","decode"]`). 
 
 **Traces are written server-side**, into `SGLANG_JAX_PROFILER_DIR` (default `/tmp`), read from
 the server process's environment. To steer `bench_serving` output, export it **at server
@@ -79,10 +97,12 @@ launch** — a running process cannot be changed. The manual `/start_profile` pa
 `bench_one_batch` takes the **same server args as `launch_server`**, so fill the model and
 parallelism from your own deployment context, then add the batch shape and `--profile`:
 
+Replace `...` with your launch_server config; writes to `*.tb/`.
+
 ```bash
 python -m sgl_jax.bench_one_batch \
-  --model-path <model> --tp-size <n> --device tpu ... \  # your launch_server config
-  --batch-size 1 --input-len 4096 --output-len 128 --profile   # -> *.tb/
+  --model-path <model> --tp-size <n> --device tpu ... \
+  --batch-size 1 --input-len 4096 --output-len 128 --profile
 ```
 
 - **Match your server config.** Pass the same parallelism/model flags you launch with
@@ -137,8 +157,20 @@ $SGLANG_JAX_PROFILER_DIR/            # server-side; default /tmp
 
 ## Handoff
 
-Do not analyze — hand the trace to the analysis skill. The dir containing `plugins/profile` is
-what an analysis tool consumes. Always report:
+Do not analyze here — this skill is capture-only. Hand the trace to a companion
+analysis skill if one is installed in your environment, else open it manually:
+
+- Point TensorBoard's profile plugin at the dir that *contains* `plugins/profile` (not the
+  `.xplane.pb` file itself):
+
+  ```bash
+  pip install tensorboard tensorboard-plugin-profile
+  tensorboard --logdir /tmp/myprofile   # open http://localhost:6006 → PROFILE tab
+  ```
+
+- Or load the `*.xplane.pb` directly in the standalone [XProf](https://github.com/openxla/xprof) viewer.
+
+Either way, the dir containing `plugins/profile` is what the tool consumes. Always report:
 
 - **Trace dir(s)** and the stage(s) captured.
 - **Workload shape** — dataset, input/output len, warmup / `--profile-num-steps`.
