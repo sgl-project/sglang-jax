@@ -367,7 +367,6 @@ class PathwaysPDSchedulerMixin:
             _mwb = b.get_model_worker_batch(
                 *paddings, self.page_size, self.server_args.enable_static_lora
             )
-            _mwb._pd_disp_t0 = time.perf_counter()
             _, _ntok, _ = worker.forward_batch_generation(_mwb, sampling_metadata=None)
             return _mwb, _ntok, _t0, time.perf_counter()
 

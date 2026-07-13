@@ -4,7 +4,6 @@ import logging
 import os
 import signal
 import threading
-import time
 from queue import Queue
 
 import jax
@@ -451,19 +450,16 @@ class ModelWorker:
         if self.worker.server_args.enable_lora and self.need_prepare_lora_batch:
             self.prepare_lora_batch(model_worker_batch)
 
-        _pd_t = getattr(model_worker_batch, "_pd_disp_t0", None)
         # Use pre-initialized ForwardBatch if available (for overlap scheduling optimization)
         if model_worker_batch.forward_batch is not None:
             forward_batch = model_worker_batch.forward_batch
         else:
             forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
-        _pd_t1 = time.perf_counter()
 
         if forward_metadata is None:
             forward_metadata = self.model_runner.attn_backend.get_forward_metadata(
                 model_worker_batch
             )
-        _pd_t2 = time.perf_counter()
 
         if sampling_metadata is None:
             sampling_metadata = SamplingMetadata.from_model_worker_batch(
@@ -472,19 +468,9 @@ class ModelWorker:
                 self.mesh,
                 self.model_config.vocab_size,
             )
-        _pd_t3 = time.perf_counter()
 
         self.model_runner.attn_backend.forward_metadata = forward_metadata
         logits_metadata = LogitsMetadata.from_model_worker_batch(model_worker_batch, self.mesh)
-        if _pd_t is not None and os.environ.get("SGLANG_PD_DBG"):
-            _pd_t4 = time.perf_counter()
-            logger.info(
-                "[pd-disp] fb=%.1f attn=%.1f smp=%.1f lm=%.1f",
-                (_pd_t1 - _pd_t) * 1e3,
-                (_pd_t2 - _pd_t1) * 1e3,
-                (_pd_t3 - _pd_t2) * 1e3,
-                (_pd_t4 - _pd_t3) * 1e3,
-            )
 
         # Pathways: fuse run_model+sampler into one jit to drop one Execute
         # round-trip (~10ms/tick through the dispatch queue). Skips the debug-only

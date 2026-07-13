@@ -134,9 +134,7 @@ class ModelWorkerClient:
                         )
                     )
                 self.future_token_ids_map = new_future_map
-                self.output_queue.put(
-                    (None, logits_output, next_token_ids, cache_miss_count, time.perf_counter())
-                )
+                self.output_queue.put((None, logits_output, next_token_ids, cache_miss_count))
                 continue
 
             # Resolve future tokens in the input
@@ -167,9 +165,7 @@ class ModelWorkerClient:
                 self.mesh,
             )
             next_token_ids = self.async_gather_fn(next_token_ids)
-            self.output_queue.put(
-                (None, logits_output, next_token_ids, cache_miss_count, time.perf_counter())
-            )
+            self.output_queue.put((None, logits_output, next_token_ids, cache_miss_count))
 
     def resolve_last_batch_result(self, launch_done: threading.Event | None = None):
         """
@@ -182,7 +178,7 @@ class ModelWorkerClient:
         jax.device_get does.
         """
         _r0 = time.perf_counter()
-        _, logits_output, next_token_ids, cache_miss_count, _fwd_done = self.output_queue.get()
+        _, logits_output, next_token_ids, cache_miss_count = self.output_queue.get()
         _r1 = time.perf_counter()
         # Step 1: kick off async D2H copies for everything we need
         async_next_logprobs = (
@@ -221,11 +217,6 @@ class ModelWorkerClient:
                 _sh,
             )
         next_token_ids = jax.device_get(next_token_ids).tolist()
-        _r2 = time.perf_counter()
-        if os.environ.get("SGLANG_PD_DBG") and _r2 - _r0 > 0.15:
-            logger.info(
-                "[pd-resolve] q_wait=%.0fms d2h=%.0fms", (_r1 - _r0) * 1e3, (_r2 - _r1) * 1e3
-            )
 
         # Step 2: materialize. The first np.asarray waits for that array's
         # copy; the others have been making progress in parallel.
