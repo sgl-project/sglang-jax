@@ -10,7 +10,7 @@ python -m sgl_jax.launch_server --help
 
 The implementation source of truth is `python/sgl_jax/srt/server_args.py`.
 
-For an agent-friendly plan/launch/validate/benchmark workflow, see the cookbook [Serve Tuning Playbook](../cookbook/base/serve-tuning-playbook.md).
+For an agent-friendly plan/preflight/launch/smoke-test workflow, see the cookbook [Serve Launch Playbook](../cookbook/base/serve-launch-playbook.md).
 
 ## Common Launch Commands
 

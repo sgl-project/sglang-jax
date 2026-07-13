@@ -8,7 +8,7 @@ Cookbook-relevant flags for `python -m sgl_jax.launch_server`, grouped by what y
 
 > **For the full list**, run `python -m sgl_jax.launch_server --help` against the same checkout you're deploying. This page only covers the ~30 flags that appear in cookbook recipes.
 
-For a task-oriented workflow that turns model and topology inputs into a validated launch, benchmark, and artifact set, use the [Serve Tuning Playbook](/base/serve-tuning-playbook).
+For a task-oriented workflow that turns model and topology inputs into a validated launch and smoke-tested server, use the [Serve Launch Playbook](/base/serve-launch-playbook).
 
 ## 0. Where the entrypoint lives
 

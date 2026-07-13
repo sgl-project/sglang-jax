@@ -116,7 +116,7 @@
                   "base/basic-api-usage",
                   "base/tpu-topology-reference",
                   "base/launch-flags-reference",
-                  "base/serve-tuning-playbook"
+                  "base/serve-launch-playbook"
                 ]
               },
               {
