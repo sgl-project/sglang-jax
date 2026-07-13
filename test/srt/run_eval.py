@@ -8,7 +8,12 @@ import json
 import os
 import time
 
-from eval.simple_eval_common import ChatCompletionSampler, make_report, set_ulimit
+from eval.simple_eval_common import (
+    ChatCompletionSampler,
+    CompletionSampler,
+    make_report,
+    set_ulimit,
+)
 
 # Sampling params the SGLang server accepts but the OpenAI chat-completion API
 # does not expose as native kwargs. They ride in `extra_body`, which the OpenAI
@@ -41,6 +46,37 @@ def build_extra_body(args) -> dict | None:
         if value is not None:
             extra_body[name] = value
     return extra_body or None
+
+
+def build_sampler(args, base_url: str):
+    api = getattr(args, "api", "chat")
+    max_tokens = getattr(args, "max_tokens", None)
+    top_p = getattr(args, "top_p", None)
+    common_kwargs = dict(
+        model=getattr(args, "model", None),
+        max_tokens=2048 if max_tokens is None else max_tokens,
+        base_url=base_url,
+        temperature=getattr(args, "temperature", 0.0),
+    )
+    if api == "completion":
+        return CompletionSampler(
+            **common_kwargs,
+            top_p=1.0 if top_p is None else top_p,
+            stop=getattr(args, "stop", ["Question", "Assistant:", "<|separator|>"]),
+        )
+    if api == "chat":
+        return ChatCompletionSampler(
+            **common_kwargs,
+            top_p=top_p,
+            extra_body=build_extra_body(args),
+        )
+    raise ValueError(f"Unsupported eval API: {api!r}")
+
+
+def get_gsm8k_num_shots(args) -> int:
+    if getattr(args, "api", "chat") != "completion":
+        return 0
+    return getattr(args, "num_shots", 0)
 
 
 def run_eval(args):
@@ -88,7 +124,11 @@ def run_eval(args):
     elif args.eval_name == "gsm8k":
         from eval.simple_eval_gsm8k import GSM8KEval
 
-        eval_obj = GSM8KEval(args.num_examples, args.num_threads)
+        eval_obj = GSM8KEval(
+            args.num_examples,
+            args.num_threads,
+            num_shots=get_gsm8k_num_shots(args),
+        )
     elif args.eval_name == "aime25":
         from eval.simple_eval_aime25 import AIME25Eval
 
@@ -112,26 +152,11 @@ def run_eval(args):
     else:
         raise ValueError(f"Invalid eval name: {args.eval_name}")
 
-    if hasattr(args, "max_tokens") and args.max_tokens is not None:
-        max_tokens = args.max_tokens
-    else:
-        max_tokens = 2048
-
-    top_p = getattr(args, "top_p", None)
     chat_template_kwargs = dict(getattr(args, "chat_template_kwargs", {}) or {})
     if getattr(args, "enable_thinking", False):
         chat_template_kwargs["enable_thinking"] = True
     args.chat_template_kwargs = chat_template_kwargs or None
-    extra_body = build_extra_body(args)
-
-    sampler = ChatCompletionSampler(
-        model=args.model,
-        max_tokens=max_tokens,
-        base_url=base_url,
-        temperature=getattr(args, "temperature", 0.0),
-        top_p=top_p,
-        extra_body=extra_body,
-    )
+    sampler = build_sampler(args, base_url)
 
     # Run eval
     tic = time.perf_counter()
@@ -179,6 +204,8 @@ if __name__ == "__main__":
         help="Name or path of the model. If not set, the default model will request /v1/models for conf.",
     )
     parser.add_argument("--eval-name", type=str, default="mmlu")
+    parser.add_argument("--api", choices=("chat", "completion"), default="chat")
+    parser.add_argument("--num-shots", type=int, default=0)
     parser.add_argument("--num-examples", type=int)
     parser.add_argument("--num-threads", type=int, default=512)
     parser.add_argument("--temperature", type=float, default=0.0)
