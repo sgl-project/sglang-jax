@@ -82,6 +82,7 @@ PADDING_BUCKETS = [1 << i for i in range(6, 21)]
 
 # Put some global args for easy access
 global_server_args_dict = {k: getattr(ServerArgs, k) for k in GLOBAL_SERVER_ARGS_KEYS}
+_PD_PROXY = os.getenv("JAX_PLATFORMS") == "proxy"
 
 logger = logging.getLogger(__name__)
 
@@ -2463,14 +2464,14 @@ class ScheduleBatch:
             # Move to next DP rank's section (fixed stride)
             offset_bs += per_dp_cache_loc_size
 
-        # copy(): cache_loc_cpu is a VIEW into the per-r2t reusable
-        # cache_loc_host_buf. Pathways-PD eager-stash calls _disp(nxt)
+        # copy() only under Pathways-PD: cache_loc_cpu is a VIEW into the
+        # per-r2t reusable cache_loc_host_buf. PD eager-stash calls _disp(nxt)
         # (which re-enters this path on the SAME r2t and overwrites host_buf)
         # before batch N's make_array_from_callback H2D has necessarily
         # consumed the view -> batch N forward reads nxt's cache_loc and
-        # writes KV to wrong slots. n_prefill>1 also races across P threads
-        # if they somehow shared a host_buf (they don't today, per-r2t).
-        return cache_loc_cpu.copy()
+        # writes KV to wrong slots. Native/colocated has no concurrent stash
+        # so the view is consumed before any overwrite.
+        return cache_loc_cpu.copy() if _PD_PROXY else cache_loc_cpu
 
     def _merge_sampling_info(
         self,
