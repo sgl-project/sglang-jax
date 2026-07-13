@@ -450,9 +450,6 @@ class DFlashVerifyInput:
     input_ids_host: np.ndarray | None = None
     positions_host: np.ndarray | None = None
     custom_mask: jax.Array | None = None
-    prefix_cache_loc: jax.Array | None = None
-    prefix_lens: jax.Array | None = None
-    dense_draft: bool = False
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL
 
     def is_draft_input(self) -> bool:
@@ -487,13 +484,10 @@ class DFlashVerifyInput:
             self.draft_token,
             self.positions,
             self.custom_mask,
-            self.prefix_cache_loc,
-            self.prefix_lens,
         )
         aux_data = {
             "draft_token_num": int(self.draft_token_num),
             "capture_hidden_mode": self.capture_hidden_mode,
-            "dense_draft": bool(self.dense_draft),
         }
         return children, aux_data
 
@@ -503,12 +497,9 @@ class DFlashVerifyInput:
             draft_token=children[0],
             positions=children[1],
             custom_mask=children[2],
-            prefix_cache_loc=children[3],
-            prefix_lens=children[4],
             draft_token_num=aux_data["draft_token_num"],
             input_ids_host=None,
             positions_host=None,
-            dense_draft=aux_data.get("dense_draft", False),
             capture_hidden_mode=aux_data["capture_hidden_mode"],
         )
 

@@ -146,128 +146,6 @@ class DFlashAttention(nnx.Module):
         output, _ = self.o_proj(attn_output)
         return output, kv_fused
 
-    # @haifeng Need modify
-    def dense_prefix_attention(
-        self,
-        positions: jax.Array,
-        hidden_states: jax.Array,
-        prefix_cache_loc: jax.Array,
-        prefix_lens: jax.Array,
-        token_to_kv_pool: KVCache,
-    ) -> tuple[jax.Array, jax.Array]:
-        """Non-causal DFlash block attention using gathered prefix K/V.
-
-        The TPU RPA path currently collapses DFlash mask-query outputs when a
-        non-causal TARGET_VERIFY block has a prefix. DFlash only needs a small
-        fixed query block, so this dense path gathers the already-materialized
-        prefix K/V and performs qK attention directly.
-        """
-        q, _ = self.q_proj(hidden_states)
-        k_noise, _ = self.k_proj(hidden_states)
-        v_noise, _ = self.v_proj(hidden_states)
-
-        q = q.reshape(
-            -1,
-            self.q_head_num,
-            self.head_dim,
-            out_sharding=NamedSharding(self.mesh, P("data", "tensor", None)),
-        )
-        k_noise = k_noise.reshape(
-            -1,
-            self.kv_head_num,
-            self.head_dim,
-            out_sharding=NamedSharding(self.mesh, P("data", "tensor", None)),
-        )
-        v_noise = v_noise.reshape(
-            -1,
-            self.kv_head_num,
-            self.head_dim,
-            out_sharding=NamedSharding(self.mesh, P("data", "tensor", None)),
-        )
-
-        q = self.q_norm(q)
-        k_noise = self.k_norm(k_noise)
-        q, k_noise = self.rotary_emb(positions, q, k_noise)
-
-        bs = prefix_lens.shape[0]
-        block = hidden_states.shape[0] // bs
-        prefix_cache_loc = prefix_cache_loc.reshape(bs, -1)
-        prefix_width = prefix_cache_loc.shape[1]
-
-        fused = token_to_kv_pool.get_fused_kv_buffer(self.layer_id)
-        fused_flat = jax.lax.reshape(
-            fused,
-            (
-                fused.shape[0] * fused.shape[1],
-                fused.shape[2] * fused.shape[3],
-                fused.shape[4],
-            ),
-            out_sharding=NamedSharding(self.mesh, P("data", "tensor", None)),
-        )
-        kv_head_sharding = NamedSharding(self.mesh, P(None, "tensor", None))
-        prefix_fused = fused_flat.at[prefix_cache_loc.reshape(-1)].get(
-            out_sharding=kv_head_sharding
-        )
-        prefix_fused = prefix_fused.reshape(
-            bs,
-            prefix_width,
-            prefix_fused.shape[-2],
-            prefix_fused.shape[-1],
-            out_sharding=NamedSharding(self.mesh, P(None, None, "tensor", None)),
-        )
-        kv_block_sharding = NamedSharding(self.mesh, P(None, None, "tensor", None))
-        prefix_k = prefix_fused.at[:, :, 0 : self.kv_head_num * 2 : 2, : self.head_dim].get(
-            out_sharding=kv_block_sharding
-        )
-        prefix_v = prefix_fused.at[:, :, 1 : self.kv_head_num * 2 : 2, : self.head_dim].get(
-            out_sharding=kv_block_sharding
-        )
-        prefix_k = jax.sharding.reshard(prefix_k, kv_block_sharding)
-        prefix_v = jax.sharding.reshard(prefix_v, kv_block_sharding)
-
-        q_head_sharding = NamedSharding(self.mesh, P(None, None, "tensor", None))
-        q = q.reshape(
-            bs,
-            block,
-            self.q_head_num,
-            self.head_dim,
-            out_sharding=q_head_sharding,
-        )
-        k_noise = k_noise.reshape(bs, block, self.kv_head_num, self.head_dim)
-        v_noise = v_noise.reshape(bs, block, self.kv_head_num, self.head_dim)
-        k_noise = jax.sharding.reshard(k_noise, kv_block_sharding)
-        v_noise = jax.sharding.reshard(v_noise, kv_block_sharding)
-
-        k_all = jnp.concatenate([prefix_k, k_noise], axis=1)
-        v_all = jnp.concatenate([prefix_v, v_noise], axis=1)
-        if self.q_head_num != self.kv_head_num:
-            repeat = self.q_head_num // self.kv_head_num
-            k_all = jnp.repeat(k_all, repeat, axis=2, out_sharding=q_head_sharding)
-            v_all = jnp.repeat(v_all, repeat, axis=2, out_sharding=q_head_sharding)
-
-        prefix_valid = jnp.arange(prefix_width, dtype=jnp.int32)[None, :] < prefix_lens[:, None]
-        block_valid = jnp.ones((bs, block), dtype=bool)
-        kv_valid = jnp.concatenate([prefix_valid, block_valid], axis=1)
-
-        q = jax.sharding.reshard(q, q_head_sharding)
-        k_all = jax.sharding.reshard(k_all, q_head_sharding)
-        v_all = jax.sharding.reshard(v_all, q_head_sharding)
-
-        scores = jnp.einsum("bqhd,bkhd->bhqk", q, k_all) * self.scaling
-        scores = jax.sharding.reshard(
-            scores, NamedSharding(self.mesh, P(None, "tensor", None, None))
-        )
-        scores = jnp.where(kv_valid[:, None, None, :], scores, jnp.array(-1.0e30, scores.dtype))
-        probs = jax.nn.softmax(scores.astype(jnp.float32), axis=-1).astype(q.dtype)
-        attn_output = jnp.einsum("bhqk,bkhd->bqhd", probs, v_all)
-        attn_output = attn_output.reshape(
-            bs * block,
-            self.q_size,
-            out_sharding=NamedSharding(self.mesh, P("data", "tensor")),
-        )
-        output, _ = self.o_proj(attn_output)
-        return output, token_to_kv_pool.get_fused_kv_buffer(self.layer_id)
-
     def kv_proj(
         self, positions: jax.Array, hidden_states: jax.Array
     ) -> tuple[jax.Array, jax.Array]:
@@ -376,8 +254,6 @@ class DFlashDecoderLayer(nnx.Module):
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
         residual: jax.Array | None = None,
-        prefix_cache_loc: jax.Array | None = None,
-        prefix_lens: jax.Array | None = None,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         if residual is None:
             residual = hidden_states
@@ -387,21 +263,12 @@ class DFlashDecoderLayer(nnx.Module):
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
 
-        if prefix_cache_loc is not None and prefix_lens is not None:
-            hidden_states, kv_fused = self.self_attn.dense_prefix_attention(
-                positions=positions,
-                hidden_states=hidden_states,
-                prefix_cache_loc=prefix_cache_loc,
-                prefix_lens=prefix_lens,
-                token_to_kv_pool=token_to_kv_pool,
-            )
-        else:
-            hidden_states, kv_fused = self.self_attn(
-                positions=positions,
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
-                token_to_kv_pool=token_to_kv_pool,
-            )
+        hidden_states, kv_fused = self.self_attn(
+            positions=positions,
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
+            token_to_kv_pool=token_to_kv_pool,
+        )
         hidden_states = hidden_states + residual
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
@@ -438,13 +305,6 @@ class DFlashBackbone(nnx.Module):
         if hidden_states is None:
             raise ValueError("DFlashDraftModel requires forward_batch.input_embedding.")
 
-        spec_info = getattr(forward_batch, "spec_info", None)
-        prefix_cache_loc = None
-        prefix_lens = None
-        if bool(getattr(spec_info, "dense_draft", False)):
-            prefix_cache_loc = getattr(spec_info, "prefix_cache_loc", None)
-            prefix_lens = getattr(spec_info, "prefix_lens", None)
-
         residual = None
         layers_kv_fused = []
         for layer in self.layers:
@@ -454,8 +314,6 @@ class DFlashBackbone(nnx.Module):
                 forward_batch,
                 token_to_kv_pool,
                 residual,
-                prefix_cache_loc,
-                prefix_lens,
             )
             layers_kv_fused.append(kv_fused)
         if residual is not None:

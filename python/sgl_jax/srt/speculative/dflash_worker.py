@@ -106,11 +106,15 @@ class DFlashWorker:
             vocab_size=int(target_worker.model_runner.model_config.vocab_size),
         )
 
-        # Initialize JIT for the draft model runner (skipped during __init__
-        # because is_draft_worker=True).
-        self.draft_model_runner.initialize_jit()
-
         self._draft_prefix_window = int(os.getenv("SGL_JAX_DFLASH_DRAFT_PREFIX_WINDOW", "0"))
+        if self._draft_prefix_window > 0:
+            for layer in self.draft_model.model.layers:
+                layer.self_attn.attn.sliding_window_size = self._draft_prefix_window
+
+        # Initialize JIT for the draft model runner (skipped during __init__
+        # because is_draft_worker=True). The optional prefix window must be set
+        # before nnx.split captures the model graph.
+        self.draft_model_runner.initialize_jit()
 
         self.draft_layers = len(self.draft_model.model.layers)
         self._init_jit_target_verify()
@@ -471,37 +475,18 @@ class DFlashWorker:
         block_ids_flat = block_ids.reshape(-1)
         positions_flat = positions.reshape(-1)
 
-        # Temporary draft-block KV slots (dropped after the draft forward).
-        allocator = self.draft_model_runner.token_to_kv_pool_allocator
-        state = allocator.backup_state()
-        try:
-            num_block_tokens = bs * self.block_size
-            alloc_tokens = (
-                (num_block_tokens + self.page_size - 1) // self.page_size
-            ) * self.page_size
-            block_cache_loc = allocator.alloc(alloc_tokens)
-            if block_cache_loc is None:
-                raise RuntimeError(
-                    f"DFLASH draft OOM allocating {alloc_tokens} block KV slots "
-                    f"for {num_block_tokens} block tokens."
-                )
-            block_cache_loc = np.asarray(block_cache_loc, dtype=np.int32)[:num_block_tokens]
-            draft_mwb = self._make_draft_block_mwb(
-                model_worker_batch,
-                block_ids_flat,
-                positions_flat,
-                block_cache_loc,
-                draft_prefix_lens,
-                bs,
-            )
-            forward_batch = ForwardBatch.init_new(draft_mwb, self.draft_model_runner)
-            forward_batch.forward_mode = ForwardMode.TARGET_VERIFY
-            metadata = self.draft_model_runner.attn_backend.get_eagle_forward_metadata(draft_mwb)
-            self.draft_model_runner.attn_backend.forward_metadata = metadata
-            draft_token_flat = self._run_jit_draft_block(forward_batch, None)
-        finally:
-            # release the temp kv
-            allocator.restore_state(state)
+        draft_mwb = self._make_draft_block_mwb(
+            model_worker_batch,
+            block_ids_flat,
+            positions_flat,
+            draft_prefix_lens,
+            bs,
+        )
+        forward_batch = ForwardBatch.init_new(draft_mwb, self.draft_model_runner)
+        forward_batch.forward_mode = ForwardMode.TARGET_VERIFY
+        metadata = self.draft_model_runner.attn_backend.get_eagle_forward_metadata(draft_mwb)
+        self.draft_model_runner.attn_backend.forward_metadata = metadata
+        draft_token_flat = self._run_jit_draft_block(forward_batch, None)
 
         return DFlashVerifyInput(
             draft_token=draft_token_flat,
@@ -517,7 +502,6 @@ class DFlashWorker:
         base_mwb: ModelWorkerBatch,
         block_ids_flat: np.ndarray,
         positions_flat: np.ndarray,
-        block_cache_loc,
         prefix_lens: np.ndarray,
         bs: int,
     ) -> ModelWorkerBatch:
@@ -525,7 +509,6 @@ class DFlashWorker:
         mwb.forward_mode = ForwardMode.TARGET_VERIFY
         mwb.input_ids = np.asarray(block_ids_flat, dtype=np.int32)
         mwb.positions = np.asarray(positions_flat, dtype=np.int32)
-        mwb.out_cache_loc = np.asarray(block_cache_loc, dtype=np.int32)
         mwb.seq_lens = np.asarray(prefix_lens, dtype=np.int32)
         mwb.capture_hidden_mode = CaptureHiddenMode.NULL
         mwb.spec_algorithm = SpeculativeAlgorithm.DFLASH
@@ -535,51 +518,36 @@ class DFlashWorker:
             draft_token_num=self.block_size,
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
-        # The base MWB from speculative decode has an empty cache_loc placeholder.
-        # Rebuild it from req_to_token_pool so the attention kernel knows which
-        # pages hold the existing prefix KV (shared between target and draft).
-        # In TARGET_VERIFY mode the kernel adds extend_seq_lens to seq_lens,
-        # so cache_loc must cover prefix + block slots.
+        # Reuse the slots prepare_for_decode reserved for target verification.
+        # Target and draft own separate KV buffers but share physical cache_loc
+        # indices, so this yields a valid paged layout even when the block starts
+        # in a partially filled page.
         req_to_token = self.draft_model_runner.req_to_token_pool.req_to_token
         req_pool_indices = np.asarray(base_mwb.req_pool_indices, dtype=np.int64)
-        block_loc = np.asarray(block_cache_loc, dtype=np.int32)
         locs = []
-        prefix_rows = []
-        prefix_kv_lens = []
+        block_rows = []
         kv_lens = []
-        block_offset = 0
         for i in range(bs):
             prefix_len = int(prefix_lens[i])
             if prefix_len > 0:
                 req_idx = int(req_pool_indices[i])
-                if self._draft_prefix_window > 0:
-                    prefix_start = max(0, prefix_len - self._draft_prefix_window)
-                else:
-                    prefix_start = 0
-                prefix_locs = np.asarray(
-                    req_to_token[req_idx, prefix_start:prefix_len], dtype=np.int32
+                prefix_locs = np.asarray(req_to_token[req_idx, :prefix_len], dtype=np.int32)
+                block_locs = np.asarray(
+                    req_to_token[req_idx, prefix_len : prefix_len + self.block_size],
+                    dtype=np.int32,
                 )
+                if block_locs.shape[0] != self.block_size or np.any(block_locs < 0):
+                    raise RuntimeError(
+                        "DFLASH draft block slots were not reserved by prepare_for_decode: "
+                        f"slot={i}, prefix_len={prefix_len}, block_size={self.block_size}."
+                    )
             else:
                 prefix_locs = np.empty(0, dtype=np.int32)
-            draft_prefix_len = len(prefix_locs)
-            block_locs = block_loc[block_offset : block_offset + self.block_size]
-            prefix_rows.append(prefix_locs)
-            prefix_kv_lens.append(draft_prefix_len)
+                block_locs = np.zeros(self.block_size, dtype=np.int32)
+            block_rows.append(block_locs)
             locs.append(np.concatenate([prefix_locs, block_locs]))
-            kv_lens.append(draft_prefix_len + self.block_size)
-            block_offset += self.block_size
-        prefix_cache_loc = self._pack_kv_cache(prefix_rows, prefix_kv_lens).reshape(bs, -1)
-        draft_prefix_lens = np.asarray(prefix_kv_lens, dtype=np.int32)
-        mwb.seq_lens = draft_prefix_lens
-        mwb.spec_info_padded = DFlashVerifyInput(
-            draft_token=jnp.asarray(block_ids_flat),
-            positions=jnp.asarray(positions_flat),
-            draft_token_num=self.block_size,
-            capture_hidden_mode=CaptureHiddenMode.NULL,
-            prefix_cache_loc=jnp.asarray(prefix_cache_loc, dtype=jnp.int32),
-            prefix_lens=jnp.asarray(draft_prefix_lens, dtype=jnp.int32),
-            dense_draft=True,
-        )
+            kv_lens.append(prefix_len + self.block_size)
+        mwb.out_cache_loc = np.concatenate(block_rows)
         mwb.cache_loc = self._pack_kv_cache(locs, kv_lens)
         return mwb
 
@@ -680,9 +648,16 @@ class DFlashWorker:
             return draft_token
 
         _kv_lock = getattr(runner.token_to_kv_pool, "_donate_lock", None)
-        if _kv_lock is None:
-            return _call_and_replace()
-        with _kv_lock:
+        try:
+            mesh_ctx = jax.sharding.use_mesh(self.mesh)
+        except AttributeError:
+            try:
+                mesh_ctx = jax.set_mesh(self.mesh)
+            except AttributeError:
+                mesh_ctx = self.mesh
+
+        lock_ctx = _kv_lock if _kv_lock is not None else contextlib.nullcontext()
+        with mesh_ctx, lock_ctx:
             return _call_and_replace()
 
     def _init_jit_kv_materialize(self):
@@ -1055,16 +1030,11 @@ class DFlashWorker:
         sampling_info.vocab_mask = None
 
         if is_draft:
-            prefix_cache_loc = jnp.zeros((bs, pps), dtype=jnp.int32)
-            prefix_lens_arr = jnp.full((bs,), prefix_len, dtype=jnp.int32)
             verify_input = DFlashVerifyInput(
                 draft_token=jnp.ones(num_tokens, dtype=jnp.int32),
                 positions=jnp.asarray(positions),
                 draft_token_num=block_size,
                 capture_hidden_mode=CaptureHiddenMode.NULL,
-                prefix_cache_loc=prefix_cache_loc,
-                prefix_lens=prefix_lens_arr,
-                dense_draft=True,
             )
             capture_hidden = CaptureHiddenMode.NULL
         else:

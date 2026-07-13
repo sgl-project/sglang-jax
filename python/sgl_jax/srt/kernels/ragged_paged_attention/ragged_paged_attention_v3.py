@@ -20,6 +20,7 @@ sglang-jax specific features:
 - xai_temperature support for Grok-style models
 - cu_kv_lens-based page_indices offset computation
 """
+
 import functools
 import inspect as _inspect
 import logging
@@ -112,10 +113,6 @@ def ref_ragged_paged_attention(
     softmax_dtype: jnp.dtype | None = None,
 ):
     """Reference implementation for ragged paged attention."""
-    if not causal:
-        assert (
-            custom_mask is not None and custom_mask.size > jnp.cumsum(kv_lens)[-1]
-        ), f"use custom_mask, custom_mask length {custom_mask.size=} must larger than total kv length {jnp.cumsum(kv_lens)[-1]=}"
     if mask_value is None:
         mask_value = DEFAULT_MASK_VALUE
     _, _, num_kv_heads, head_dim = k_pages.shape
@@ -150,11 +147,11 @@ def ref_ragged_paged_attention(
         v = jnp.repeat(v, num_query_per_kv, axis=1)
         attn = jnp.einsum("qhd,khd->hqk", q, k, preferred_element_type=jnp.float32)
         attn *= sm_scale
+        q_span = (kv_len - q_len) + jax.lax.broadcasted_iota(jnp.int32, attn.shape, 1)
+        kv_span = jax.lax.broadcasted_iota(jnp.int32, attn.shape, 2)
         if causal:
-            q_span = (kv_len - q_len) + jax.lax.broadcasted_iota(jnp.int32, attn.shape, 1)
-            kv_span = jax.lax.broadcasted_iota(jnp.int32, attn.shape, 2)
             mask = q_span < kv_span
-        else:
+        elif custom_mask is not None:
             mask_start = cu_mask_lens[i]
             mask_end = cu_mask_lens[i + 1]
             mask = custom_mask[mask_start:mask_end]
@@ -164,6 +161,8 @@ def ref_ragged_paged_attention(
                 )
                 < 1
             )
+        else:
+            mask = jnp.zeros(attn.shape, dtype=jnp.bool_)
         if sliding_window is not None:
             mask = jnp.logical_or(mask, q_span - sliding_window >= kv_span)
         if soft_cap is not None:
@@ -1356,7 +1355,7 @@ def static_validate_inputs(
 
     if actual_num_q_heads % actual_num_kv_heads != 0:
         raise ValueError(
-            f"Expected {actual_num_q_heads=} to be divisible by" f" {actual_num_kv_heads=}."
+            f"Expected {actual_num_q_heads=} to be divisible by {actual_num_kv_heads=}."
         )
 
     if kv_cache_fused is not None:
@@ -1381,7 +1380,7 @@ def static_validate_inputs(
 
     if not (len(kv_lens.shape) == len(page_indices.shape) == len(cu_q_lens.shape) == 1):
         raise ValueError(
-            f"Expected 1D array for {kv_lens.shape=}, {page_indices.shape=}," f" {cu_q_lens.shape=}"
+            f"Expected 1D array for {kv_lens.shape=}, {page_indices.shape=}, {cu_q_lens.shape=}"
         )
 
     max_num_seqs = kv_lens.shape[0]
@@ -1484,8 +1483,7 @@ def dynamic_validate_inputs(
             page_idx = int(page_indices[seq_idx * pages_per_seq + p])
             if page_idx < 0 or page_idx >= total_num_pages:
                 raise ValueError(
-                    f"Sequence {seq_idx}, page {p}: index={page_idx} "
-                    f"out of [0, {total_num_pages})"
+                    f"Sequence {seq_idx}, page {p}: index={page_idx} out of [0, {total_num_pages})"
                 )
 
 
@@ -1868,7 +1866,7 @@ def ragged_paged_attention(
         else:
             bo_double_buf = bq_double_buf
 
-        if use_causal_mask:
+        if use_causal_mask or custom_mask is None:
             bkvmask_double_buf = None
         else:
             bkvmask_double_buf = pltpu.VMEM(
@@ -2047,7 +2045,7 @@ def ragged_paged_attention(
                     pages_per_seq,
                     case=case,
                     vmem_limit_bytes=vmem_limit_bytes,
-                    use_custom_mask=not use_causal_mask,
+                    use_custom_mask=custom_mask is not None,
                     sliding_window=sliding_window,
                 )
 
