@@ -169,6 +169,68 @@ class ChatCompletionSampler(SamplerBase):
             # unknown error shall throw exception
 
 
+class CompletionSampler(SamplerBase):
+    """Sample raw text prompts from OpenAI's completion API."""
+
+    def __init__(
+        self,
+        base_url: str = None,
+        model: str | None = None,
+        temperature: float = 0.0,
+        max_tokens: int = 2048,
+        top_p: float | None = None,
+        stop: list[str] | None = None,
+    ):
+        self.client = OpenAI(base_url=base_url, http_client=LargerHttpxClient())
+
+        if model is None:
+            model = self.client.models.list().data[0].id
+
+        self.model = model
+        self.temperature = temperature
+        self.max_tokens = max_tokens
+        self.top_p = top_p
+        self.stop = stop
+
+    def _pack_message(self, role: str, content: Any):
+        return {"role": str(role), "content": content}
+
+    def __call__(self, message_list: MessageList) -> str:
+        prompt = "\n".join(
+            message["content"]
+            for message in message_list
+            if isinstance(message.get("content"), str)
+        )
+        trial = 0
+        while trial < 6:
+            try:
+                kwargs = dict(
+                    model=self.model,
+                    prompt=prompt,
+                    temperature=self.temperature,
+                    max_tokens=self.max_tokens,
+                    stop=self.stop,
+                )
+                if self.top_p is not None:
+                    kwargs["top_p"] = self.top_p
+                response = self.client.completions.create(**kwargs)
+                return response.choices[0].text or ""
+            except openai.BadRequestError as e:
+                print("Bad Request Error", e)
+                return ""
+            except Exception as e:
+                trial += 1
+                if trial < 6:
+                    exception_backoff = 2 ** (trial - 1)
+                    print(
+                        f"Rate limit exception so wait and retry {trial} after {exception_backoff} sec",
+                        e,
+                    )
+                    time.sleep(exception_backoff)
+        print("All retry attempts exhausted for request. Returning empty response.")
+        return ""
+
+
 QUERY_TEMPLATE_MULTICHOICE = """
 Answer the following multiple choice question. The last line of your response should be of the following format: 'Answer: $LETTER' (without quotes) where LETTER is one of ABCD. Think step by step before answering.
 
