@@ -10,6 +10,8 @@ python -m sgl_jax.launch_server --help
 
 The implementation source of truth is `python/sgl_jax/srt/server_args.py`.
 
+For an agent-friendly plan/launch/validate/benchmark workflow, see the cookbook [Serve Tuning Playbook](../cookbook/base/serve-tuning-playbook.md).
+
 ## Common Launch Commands
 
 Single-host TPU serving:
@@ -91,7 +93,7 @@ For reusable Docker, GKE, and SkyPilot launchers, see [Deployment](../deployment
 | `--nnodes` | Number of serving nodes. |
 | `--node-rank` | Rank of the current node. |
 | `--dist-init-addr` | Rank-0 rendezvous address for distributed initialization. |
-| `--dist-timeout` | Distributed initialization timeout. |
+| `--dist-timeout` | Declared as a distributed initialization timeout; the standard Scheduler path does not currently pass it to `jax.distributed.initialize()`. |
 
 For TPU topology math, see the cookbook `base/tpu-topology-reference.md` page.
 

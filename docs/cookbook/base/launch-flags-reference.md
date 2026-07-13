@@ -8,6 +8,8 @@ Cookbook-relevant flags for `python -m sgl_jax.launch_server`, grouped by what y
 
 > **For the full list**, run `python -m sgl_jax.launch_server --help` against the same checkout you're deploying. This page only covers the ~30 flags that appear in cookbook recipes.
 
+For a task-oriented workflow that turns model and topology inputs into a validated launch, benchmark, and artifact set, use the [Serve Tuning Playbook](/base/serve-tuning-playbook).
+
 ## 0. Where the entrypoint lives
 
 `launch_server.py` is a thin wrapper; all CLI parsing happens in `ServerArgs.from_cli()` which calls `ServerArgs.add_cli_args(parser)`. To grep:
@@ -72,7 +74,7 @@ grep -n 'add_argument' python/sgl_jax/srt/server_args.py
 | `--nnodes` | `1` | Total node count. |
 | `--node-rank` | `0` | Per-node rank, `0..nnodes-1`. SkyPilot exposes this as `${SKYPILOT_NODE_RANK}`, GKE Indexed Job as `${JOB_COMPLETION_INDEX}`. |
 | `--dist-init-addr` | `None` | `host:port` of the rank-0 node for `jax.distributed` rendezvous. Conventional port: `5000` (MiMo) or any unused. |
-| `--dist-timeout` | `None` | `jax.distributed.initialize` timeout. |
+| `--dist-timeout` | `None` | Declared as a distributed initialization timeout, but the standard Scheduler path does not currently pass it to `jax.distributed.initialize()`. Verify the current source before relying on it. |
 
 ## 7. Lifecycle & observability
 
