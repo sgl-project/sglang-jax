@@ -1,106 +1,94 @@
-# Step-3.5 GSM8K Completion Evaluation Design
+# Step-3.5 GSM8K Completion 评测设计
 
-## Problem
+## 问题
 
-`test_step3p5_mtp_e2e.py` describes its GSM8K check as a port of upstream
-SGLang, but the two tests currently measure different tasks. Upstream runs a
-five-shot completion evaluation with a 0.83 score threshold. The local test
-uses the generic zero-shot chat-completion evaluator while expecting a score
-from the five-shot completion benchmark.
+`test_step3p5_mtp_e2e.py` 将其 GSM8K 检查描述为上游 SGLang 测试的移植，
+但两边当前测量的并不是同一个任务。上游使用 5-shot completion 评测，分数门槛为
+0.83；本地测试却使用通用的 zero-shot chat-completion evaluator，同时期待
+5-shot completion benchmark 的分数。
 
-The mismatch is observable independently of speculative decoding: the local
-chat evaluation scores about 0.55 for both speculative and non-speculative
-servers, while the existing five-shot `/generate` benchmark scores about 0.9.
-Consequently, the local accuracy failure does not identify a serving,
-speculative decoding, chunked prefill, or concurrency regression.
+该差异与 speculative decoding 无关：本地 chat 评测在 spec 和 no-spec server
+上都只有约 0.55，而现有 5-shot `/generate` benchmark 约为 0.9。因此，本地
+accuracy failure 并不能证明 serving、speculative decoding、chunked prefill 或
+并发路径存在回归。
 
-## Goals
+## 目标
 
-- Make the Step-3.5 MTP E2E GSM8K test measure the same five-shot completion
-  task as upstream SGLang.
-- Keep the generic zero-shot chat GSM8K evaluation unchanged for existing
-  callers.
-- Preserve the optional strict comparison against a non-speculative baseline.
-- Test prompt construction, request routing, and answer extraction on CPU.
+- 让 Step-3.5 MTP E2E GSM8K 测试与上游 SGLang 一样，测量 5-shot completion
+  任务。
+- 保持通用 zero-shot chat GSM8K 评测及其现有调用者的行为不变。
+- 保留与 no-spec baseline 严格对比的可选检查。
+- 用 CPU 测试覆盖 prompt 构造、请求路由和答案提取。
 
-## Non-Goals
+## 非目标
 
-- Changing model chat templates.
-- Changing speculative decoding or chunked prefill serving code.
-- Replacing the benchmark CLI or changing its output format.
-- Making all `run_eval` evaluations use completion requests.
+- 修改模型 chat template。
+- 修改 speculative decoding 或 chunked prefill serving 代码。
+- 替换 benchmark CLI 或修改其输出格式。
+- 将所有 `run_eval` 评测切换为 completion 请求。
 
-## Design
+## 设计
 
-Add an explicit completion mode to the local evaluation harness. `run_eval`
-will continue to use `ChatCompletionSampler` by default. When a caller passes
-`api="completion"`, it will construct a completion sampler and configure the
-GSM8K evaluator with the requested number of few-shot examples.
+为本地评测框架增加显式 completion 模式。`run_eval` 默认仍使用
+`ChatCompletionSampler`；只有调用者传入 `api="completion"` 时，才构造
+completion sampler，并使用调用者指定的 few-shot 数量配置 GSM8K evaluator。
 
-The completion GSM8K prompt will use the canonical structure already used by
-the repository benchmark:
+Completion GSM8K prompt 采用仓库现有 benchmark 已使用的标准结构：
 
 ```text
-Question: <example question>
-Answer: <example worked answer>
+Question: <示例问题>
+Answer: <示例完整解答>
 
 ...
 
-Question: <test question>
+Question: <待测问题>
 Answer:
 ```
 
-The sampler will send that prompt through the OpenAI-compatible completion
-endpoint. The evaluator will extract the last numeric answer from the model
-response, matching the established benchmark behavior. The existing chat
-mode will retain its current instruction, `Answer:` parser, and conversation
-reporting.
+Sampler 通过 OpenAI-compatible completion endpoint 发送该 prompt。Evaluator 从
+模型响应中提取最后一个数字，与现有 benchmark 行为一致。原有 chat 模式继续使用
+当前 instruction、`Answer:` parser 和 conversation report，不发生行为变化。
 
-`test_step3p5_mtp_e2e.py` will explicitly set `api="completion"` and
-`num_shots=5`, with `max_tokens=512`. Its fallback score floor will be 0.83,
-matching the upstream Step-3.5 test. When `SGLANG_GSM8K_BASELINE` is supplied,
-the stricter spec-versus-greedy comparison remains authoritative.
+`test_step3p5_mtp_e2e.py` 显式设置 `api="completion"`、`num_shots=5` 和
+`max_tokens=512`。没有 baseline 时，fallback 分数门槛改为 0.83，与上游
+Step-3.5 测试一致；设置了 `SGLANG_GSM8K_BASELINE` 时，仍以更严格的
+spec-versus-greedy 对比为准。
 
-## Data Flow
+## 数据流
 
-1. The Step-3.5 test builds `run_eval` arguments with completion mode and five
-   shots.
-2. `run_eval` selects the completion sampler and configures `GSM8KEval`.
-3. `GSM8KEval` builds one five-shot prompt per held-out test example.
-4. The completion sampler sends the prompt to the server's completion API.
-5. The evaluator extracts the final number, compares it with the GSM8K target,
-   and aggregates the same metrics/report shape returned today.
+1. Step-3.5 测试构造带有 completion 模式和 5-shot 参数的 `run_eval` 参数。
+2. `run_eval` 选择 completion sampler，并配置 `GSM8KEval`。
+3. `GSM8KEval` 为每个 held-out 测试样本构造一个 5-shot prompt。
+4. Completion sampler 将 prompt 发送至 server 的 completion API。
+5. Evaluator 提取最终数字，与 GSM8K target 比较，并返回与当前相同结构的聚合
+   metrics 和 report。
 
-## Error Handling
+## 错误处理
 
-Network retry behavior remains in the sampler layer. Evaluation exceptions
-continue to produce an empty prediction for that example, so transport
-failures reduce the score rather than being mistaken for correct answers.
-Unsupported `api` values fail immediately with a clear `ValueError`.
+网络重试仍由 sampler 层负责。单个样本评测异常时，继续产生空 prediction，使传输
+失败降低分数，而不会被误判为正确答案。不支持的 `api` 值立即抛出带有清晰信息的
+`ValueError`。
 
-## Tests
+## 测试
 
-CPU tests will prove:
+CPU 测试需要证明：
 
-- completion prompt construction contains exactly the requested demonstrations
-  followed by the held-out question;
-- completion mode selects the completion endpoint and forwards deterministic
-  generation parameters;
-- completion answer extraction uses the final numeric answer;
-- default GSM8K chat mode remains unchanged;
-- the Step-3.5 E2E test requests five-shot completion mode and uses the upstream
-  fallback threshold.
+- completion prompt 包含准确数量的 demonstrations，末尾紧跟 held-out 问题；
+- completion 模式选择 completion endpoint，并转发确定性 generation 参数；
+- completion 答案解析使用模型响应中的最后一个数字；
+- 默认 GSM8K chat 模式行为保持不变；
+- Step-3.5 E2E 测试使用 5-shot completion 模式及上游 fallback 门槛。
 
-After focused tests pass, run the registered CPU unit suite and pre-commit.
-The TPU acceptance is one bundled run: Step-3.5 speculative and greedy servers
-on the same commit, 200 GSM8K questions, five-shot completion, concurrency 32,
-plus the existing pool-idle and Weng checks for Problem 2.
+Focused tests 通过后，运行已注册的完整 CPU unit suite 和 pre-commit。TPU 只做
+一次组合验收：同一 commit 上启动 Step-3.5 spec 和 greedy server，以并发 32
+运行 200 道 5-shot completion GSM8K；同时复核 Problem 2 已有的 pool-idle 和
+Weng 检查。
 
-## Acceptance Criteria
+## 验收标准
 
-- Existing callers that do not set `api` continue using chat completion.
-- Step-3.5 E2E uses five-shot completion and no longer reports the known
-  zero-shot chat score as a serving regression.
-- The speculative score remains within the configured tolerance of a supplied
-  greedy baseline, or exceeds 0.83 when no baseline is supplied.
-- Problem 2's slot ownership behavior and tests remain unchanged.
+- 未设置 `api` 的现有调用者继续使用 chat completion。
+- Step-3.5 E2E 使用 5-shot completion，不再把已知的 zero-shot chat 低分误报为
+  serving 回归。
+- Spec 分数与传入的 greedy baseline 之差不超过配置 tolerance；未传入 baseline
+  时，分数不低于 0.83。
+- Problem 2 的 slot ownership 行为和测试不发生变化。
