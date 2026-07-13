@@ -51,14 +51,22 @@ export XLA_FLAGS="${XLA_FLAGS:+$XLA_FLAGS }\
 ```python
 import os  # flags BEFORE import jax (see above)
 import jax
+OUT = "/tmp/pallas-profile"                   # same dir as the flags block above
 for _ in range(3):                            # warm up so compile/autotune is outside the trace
     jax.block_until_ready(run_kernel())
-with jax.profiler.trace("/tmp/pallas-profile/xprof"):
-    jax.block_until_ready(run_kernel())       # block_until_ready MUST be inside the block
+with jax.profiler.trace(f"{OUT}/xprof"):      # trace lands beside the LLO/HLO dumps under $OUT
+    for _ in range(100):                      # a ns-scale kernel needs many iters or the window is ~empty
+        r = run_kernel()
+    jax.block_until_ready(r)                  # block_until_ready MUST be inside the block
 ```
 
+Loop count: one call of a fast (single-digit-ns) kernel leaves too little in the window — a
+valid-but-empty trap. Loop until the region is milliseconds of device work (hundreds–thousands
+of iters for a tiny kernel); block **once at the end, still inside the block**.
+
 Name the phases with `jax.named_scope("w1_load" / "gemm" / "store_output")` so
-Trace Viewer maps LLO/MXU activity to your code (business-stage names, not `scope1`).
+Trace Viewer maps LLO/MXU activity to your code. Those names are illustrative — use **your
+kernel's** real phases (a VPU/sort kernel has no `gemm`), business-stage names not `scope1`.
 
 Output: `<logdir>/plugins/profile/<ts>/<host>.xplane.pb` (+ `.trace.json.gz`).
 
@@ -86,6 +94,7 @@ same `compiler/llo/` or trace dir.
 | `NO_LLO` | wrong dump path → `compiler/llo/` or `rank-*/compiler/llo/` |
 | job SUCCEEDED, no trace | benchmark swallowed a compile/runtime error → check logs + `.xplane.pb` |
 | LLO/HLO but no xplane | kernel didn't run / `block_until_ready` outside trace block |
+| stale or empty `compiler/llo/` on a fresh `$OUT` | a persistent compile cache skipped recompile → no new Mosaic dump; unset/clear `JAX_COMPILATION_CACHE_DIR` (or use a fresh cache dir) so the kernel recompiles |
 | VMEM OOM | shrink tile / `pltpu.CompilerParams(vmem_limit_bytes=...)` |
 
 ## References
