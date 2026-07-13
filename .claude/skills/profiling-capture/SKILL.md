@@ -85,7 +85,7 @@ until [ "$(curl -s http://127.0.0.1:30000/profile_status | jq -r .status)" = idl
 
 `start_profile` / `stop_profile` also accept `GET`; `start_profile` with no body uses server
 defaults. Key `ProfileReqInput` fields: `output_dir`, `num_steps`, `start_step`,
-`profile_by_stage`, `profile_stages` (e.g. `["prefill","decode"]`). 
+`profile_by_stage`, `profile_stages` (e.g. `["prefill","decode"]`).
 
 **Traces are written server-side**, into `SGLANG_JAX_PROFILER_DIR` (default `/tmp`), read from
 the server process's environment. To steer `bench_serving` output, export it **at server
