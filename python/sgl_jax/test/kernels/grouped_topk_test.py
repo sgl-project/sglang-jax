@@ -4,7 +4,7 @@ Runs the Pallas kernel in CPU interpret mode (no TPU needed) and checks it is id
 to the reference sort-based routing (verbatim copy of `gate.py:TopK._biased_grouped_topk`,
 L159-193), with matching weights.
 
-Run:  PALLAS_INTERPRET=1 python -m pytest python/sgl_jax/test/kernels/grouped_topk_test.py -q
+Run:  python -m pytest python/sgl_jax/test/kernels/grouped_topk_test.py -q
 """
 
 import jax
