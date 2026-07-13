@@ -269,7 +269,14 @@ class ModelWorker:
             page_size=self.page_size,
             max_req_len=self.max_req_len,
             vocab_size=self.model_config.vocab_size,
-            max_total_num_tokens=self.max_total_num_tokens,
+            # cache_loc bucket cap only under Pathways proxy: it saves ~25ms/tick
+            # gRPC H2D there, but on native TPU the smaller/odd bucket shape
+            # (page_indices ~554 vs 81920) yields a slower Pallas ragged-attention
+            # kernel (-6% input_throughput on v6e-1 CI). Native H2D is fast enough
+            # that the uncapped bucket is not on the critical path.
+            max_total_num_tokens=(
+                self.max_total_num_tokens if os.getenv("JAX_PLATFORMS") == "proxy" else 0
+            ),
             multimodal=server_args.multimodal,
             has_recurrent_state=self.model_runner.linear_recurrent_config is not None,
             moe_backend=effective_moe_backend,
