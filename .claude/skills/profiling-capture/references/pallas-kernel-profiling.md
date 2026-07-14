@@ -56,6 +56,8 @@ Illustrative skeleton (placeholders — substitute your kernel). Name each phase
 # so they take effect before the first `import jax` below.
 import jax
 
+OUT = "tmp/pallas-profile"
+
 @jax.jit
 def run_kernel():
     # wrap each phase in its own named_scope context manager
@@ -70,7 +72,7 @@ def run_kernel():
 opts = jax.profiler.ProfileOptions()          # add counter config only for counters mode
 for _ in range(3):                            # warm up so compile/autotune is outside the trace
     jax.block_until_ready(run_kernel())
-with jax.profiler.trace(f"{OUT}/xprof"):      # trace lands beside the LLO/HLO dumps under $OUT
+with jax.profiler.trace(f"{OUT}/xprof", profiler_options=opts):
     for _ in range(100):                      # a ns-scale kernel needs many iters or the window is ~empty
         r = run_kernel()
     jax.block_until_ready(r)                  # block_until_ready MUST be inside the block
