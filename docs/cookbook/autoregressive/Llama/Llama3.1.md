@@ -130,7 +130,7 @@ Recommended additional datasets: MMLU, HumanEval, IFEval.
 
 ### 4.2 Speed
 
-> **Layout B — measured baseline.** Single-host TPU v6e-4, sglang-jax 0.1.0. Numbers are sgl-jax-only; vLLM-on-TPU comparison is not run.
+> **Layout B — measured baseline.** Single-host TPU v6e-4, sglang-jax 0.1.0.
 
 **Test Environment**
 
