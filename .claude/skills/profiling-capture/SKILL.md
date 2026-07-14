@@ -40,6 +40,9 @@ a real dataset workload, then stops — **one trace over the whole run**. A sing
 reliably captures device ops for **both** stages; separating prefill from decode is an
 analysis-time step (out of scope here).
 
+Keep startup precompilation enabled on the live server (the default): **do not pass
+`--disable-precompile`** when launching `sgl_jax.launch_server`.
+
 Default command:
 
 ```bash
@@ -117,10 +120,11 @@ python -m sgl_jax.bench_one_batch \
 
 ## C — kernel microbench
 
-`jax.profiler.trace(dir)` around a warmed-up `run_kernel()`. Produces Pallas/Mosaic LLO
-detail. For LLO / custom-call / perf-counter detail, set the dump flags **before `import jax`**
-and pin libtpu ≥ 0.0.39. Full recipe — region vs counter mode, flags, verification, delivery,
-existing harnesses — in [references/pallas-kernel-profiling.md](references/pallas-kernel-profiling.md).
+Use `jax.profiler.trace(dir)` around a warmed-up `run_kernel()` as the low-overhead default.
+Add LLO utilization, compiler dumps, or Ironwood/v7x periodic counters only when the profiling
+question needs that evidence. The modes are composable but add compilation, profile-size, or
+runtime overhead. Full selection guide, flags, verification, and delivery details are in
+[references/pallas-kernel-profiling.md](references/pallas-kernel-profiling.md).
 
 ## Capture quality
 
@@ -160,17 +164,23 @@ $SGLANG_JAX_PROFILER_DIR/            # server-side; default /tmp
 Do not analyze here — this skill is capture-only. Hand the trace to a companion
 analysis skill if one is installed in your environment, else open it manually:
 
-- Point TensorBoard's profile plugin at the dir that *contains* `plugins/profile` (not the
-  `.xplane.pb` file itself):
+- **Prefer standalone [XProf](https://openxla.org/xprof/jax_profiling).** Pass the complete
+  logdir that *contains* `plugins/profile` (not `plugins/profile` or the `.xplane.pb` file):
 
   ```bash
-  pip install tensorboard tensorboard-plugin-profile
-  tensorboard --logdir /tmp/myprofile   # open http://localhost:6006 → PROFILE tab
+  pip install -U xprof
+  xprof --logdir=/tmp/myprofile --port=8791   # open http://localhost:8791
   ```
 
-- Or load the `*.xplane.pb` directly in the standalone [XProf](https://github.com/openxla/xprof) viewer.
+- TensorBoard remains a fallback; install `xprof`, which now provides its Profile tab and
+  supersedes the formerly recommended `tensorboard-plugin-profile` package:
 
-Either way, the dir containing `plugins/profile` is what the tool consumes. Always report:
+  ```bash
+  pip install -U tensorboard xprof
+  tensorboard --logdir=/tmp/myprofile   # open http://localhost:6006 → Profile tab
+  ```
+
+Both commands consume the full logdir containing `plugins/profile`. Always report:
 
 - **Trace dir(s)** and the stage(s) captured.
 - **Workload shape** — dataset, input/output len, warmup / `--profile-num-steps`.
