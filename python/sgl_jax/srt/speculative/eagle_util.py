@@ -43,7 +43,6 @@ from sgl_jax.srt.mem_cache.common import (
 )
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sgl_jax.srt.speculative.overlap_utils import use_legacy_eagle3_non_overlap
-from sgl_jax.srt.speculative.spec_info import SpecDraftStateMixin
 
 SIMULATE_ACC_LEN = os.environ.get("SIMULATE_ACC_LEN")
 SIMULATE_ACC_METHOD = os.environ.get("SIMULATE_ACC_METHOD", "multinomial")
@@ -439,7 +438,7 @@ def build_tree_kernel_efficient(
 
 @register_pytree_node_class
 @dataclass
-class EagleDraftInput(SpecDraftStateMixin):
+class EagleDraftInput:
     """Next-round draft state — the only persistent cross-round spec state.
 
     Implements ``SpecInput``. MUST NOT hold worker/runner/pool/future handles.
@@ -447,28 +446,6 @@ class EagleDraftInput(SpecDraftStateMixin):
     """
 
     ALLOC_LEN_PER_DECODE: ClassVar[int] = None
-
-    _dp_fields = (
-        "topk_p",
-        "topk_index",
-        "hidden_states",
-        "verified_id",
-        "allocate_lens",
-        "accept_length",
-        "accept_length_cpu",
-        "new_seq_lens",
-        "future_indices",
-    )
-    _dp_required_split_fields = ("topk_p", "topk_index", "hidden_states", "verified_id")
-    _dp_data_sharded_fields = ("topk_p", "topk_index", "verified_id")
-    _dp_legacy_passthrough_fields = ("accept_length", "accept_length_cpu")
-    _dp_allow_partial_fields = ("accept_length", "accept_length_cpu")
-    _dp_future_retained_fields = (
-        "allocate_lens",
-        "new_seq_lens",
-        "accept_length_cpu",
-        "future_indices",
-    )
 
     # --- Cross-round draft state (device arrays, consumed by next draft) ---
     #: device ``(b, topk)`` — top-k probs from previous draft/draft_extend.

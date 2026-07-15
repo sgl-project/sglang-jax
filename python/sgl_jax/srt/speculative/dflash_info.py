@@ -8,7 +8,6 @@ import numpy as np
 from jax.tree_util import register_pytree_node_class
 
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode
-from sgl_jax.srt.speculative.spec_info import SpecDraftStateMixin
 
 
 def build_dflash_draft_block(
@@ -109,12 +108,8 @@ def dflash_greedy_verify(
 
 
 @dataclass
-class DFlashDraftInput(SpecDraftStateMixin):
+class DFlashDraftInput:
     """Host-side DFlash state carried between decode iterations."""
-
-    _dp_fields = ("verified_id", "target_hidden", "ctx_lens", "draft_seq_lens")
-    _dp_required_scatter_fields = ("verified_id", "ctx_lens", "draft_seq_lens")
-    _dp_empty_or_none_fields = ("target_hidden",)
 
     verified_id: jax.Array | np.ndarray = None
     target_hidden: jax.Array | None = None
