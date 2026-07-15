@@ -23,7 +23,8 @@ class EncoderScheduler(SchedulerProfilerMixin):
         communication_backend: CommunicationBackend,
         model_class: str | list[str] = None,
         stage_sub_dir: str | None = None,
-        **kwargs,
+        tokenizers: str = "tokenizer",
+        precompile_params: dict | None = None,
     ):
         """Initialize the EncoderScheduler.
 
@@ -33,7 +34,18 @@ class EncoderScheduler(SchedulerProfilerMixin):
             communication_backend: backend implementing
                 `recv_requests()` and `send_pyobj()`.
             model_class: encoder model class passed to the worker.
+            stage_sub_dir: optional stage sub-directory for the worker.
+            tokenizers: tokenizer path/name forwarded to the worker.
+            precompile_params: uniformly forwarded to every scheduler by
+                `stage.py` but unused here; ``None``/empty is accepted and a
+                non-empty value is rejected (issue #1326).
         """
+        if precompile_params:
+            raise ValueError(
+                f"EncoderScheduler does not support precompile_params "
+                f"({precompile_params!r}); precompilation is controlled by "
+                "server_args.disable_precompile."
+            )
 
         self.communication_backend = communication_backend
         self.mesh = mesh
@@ -42,7 +54,7 @@ class EncoderScheduler(SchedulerProfilerMixin):
             mesh=mesh,
             model_class=model_class,
             stage_sub_dir=stage_sub_dir,
-            tokenizer=kwargs.get("tokenizers", "tokenizer"),
+            tokenizer=tokenizers,
         )
         self.forward_ct = 0
         self.init_profier()
