@@ -8,40 +8,14 @@ from sgl_jax.srt.speculative.dflash_info import (
     DFlashDraftInput,
     DFlashVerifyInput,
     build_dflash_draft_block,
-    compute_dflash_accept_len_and_bonus,
     compute_new_kv_slices,
-    dflash_greedy_verify_outputs,
-    gather_dflash_accepted_hidden_padded,
+    dflash_greedy_verify,
 )
 from sgl_jax.srt.speculative.overlap_utils import (
     can_merge_spec_non_overlap_prefill,
     use_legacy_eagle3_non_overlap,
 )
 from sgl_jax.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
-
-
-def test_compute_dflash_accept_len_and_bonus():
-    candidates = jnp.array(
-        [
-            [10, 11, 12, 13],
-            [20, 21, 22, 23],
-            [30, 31, 32, 33],
-        ],
-        dtype=jnp.int32,
-    )
-    target_predict = jnp.array(
-        [
-            [11, 12, 13, 99],  # accept 3, bonus target_predict[3]
-            [21, 77, 88, 99],  # accept 1, bonus target_predict[1]
-            [55, 31, 32, 33],  # accept 0, bonus target_predict[0]
-        ],
-        dtype=jnp.int32,
-    )
-
-    accept_len, bonus = compute_dflash_accept_len_and_bonus(candidates, target_predict)
-
-    np.testing.assert_array_equal(np.asarray(accept_len), np.array([3, 1, 0], dtype=np.int32))
-    np.testing.assert_array_equal(np.asarray(bonus), np.array([99, 77, 55], dtype=np.int32))
 
 
 def test_dflash_verify_input_is_spec_input_and_pytree():
@@ -65,25 +39,11 @@ def test_dflash_verify_input_is_spec_input_and_pytree():
     assert restored.capture_hidden_mode == CaptureHiddenMode.FULL
 
 
-def test_dflash_verify_input_verify_greedy():
-    vi = DFlashVerifyInput(
-        draft_token=jnp.array([10, 11, 12, 13, 20, 21, 22, 23], dtype=jnp.int32),
-        positions=jnp.arange(8, dtype=jnp.int32),
-        draft_token_num=4,
-    )
-    target_predict = jnp.array([11, 12, 99, 0, 99, 0, 0, 0], dtype=jnp.int32)
-
-    accept_len, bonus = vi.verify_greedy(target_predict)
-    np.testing.assert_array_equal(np.asarray(accept_len), np.array([2, 0], dtype=np.int32))
-    np.testing.assert_array_equal(np.asarray(bonus), np.array([99, 99], dtype=np.int32))
-
-
-def test_dflash_verify_input_verify_from_logits():
+def test_dflash_greedy_verify_from_logits():
     # bs=2, block_size=4, vocab=100. draft_token[:,0] is the seed.
-    vi = DFlashVerifyInput(
-        draft_token=jnp.array([10, 11, 12, 13, 20, 21, 22, 23], dtype=jnp.int32),
-        positions=jnp.arange(8, dtype=jnp.int32),
-        draft_token_num=4,
+    draft_token = jnp.array(
+        [10, 11, 12, 13, 20, 21, 22, 23],
+        dtype=jnp.int32,
     )
     # Build target logits whose argmax reproduces a chosen target_predict.
     # req0 target_predict = [11, 12, 13, 99] -> accept all 3 drafts, bonus 99
@@ -94,7 +54,9 @@ def test_dflash_verify_input_verify_from_logits():
         logits[i, row] = 10.0
     logits = jnp.asarray(logits)
 
-    accept_lens_out, next_token_ids_flat, new_verified_id, accept_len_draft = vi.verify(logits)
+    accept_lens_out, next_token_ids_flat, new_verified_id, accept_len_draft = dflash_greedy_verify(
+        draft_token, logits, draft_token_num=4
+    )
 
     np.testing.assert_array_equal(np.asarray(accept_lens_out), np.array([4, 2], dtype=np.int32))
     np.testing.assert_array_equal(np.asarray(accept_len_draft), np.array([3, 1], dtype=np.int32))
@@ -212,74 +174,6 @@ def test_build_dflash_draft_block():
         np.asarray(positions),
         np.array([[5, 6, 7, 8], [3, 4, 5, 6]], dtype=np.int32),
     )
-
-
-def test_dflash_greedy_verify_outputs():
-    # draft_token[:, 0] is the seed (already-emitted verified id from last step).
-    draft_token = jnp.array(
-        [
-            [10, 11, 12, 13],  # accept 3 drafts + bonus -> emit 4
-            [20, 21, 22, 23],  # accept 1 draft + bonus  -> emit 2
-            [30, 31, 32, 33],  # accept 0 drafts + bonus -> emit 1
-        ],
-        dtype=jnp.int32,
-    )
-    target_predict = jnp.array(
-        [
-            [11, 12, 13, 99],
-            [21, 77, 88, 99],
-            [55, 31, 32, 33],
-        ],
-        dtype=jnp.int32,
-    )
-
-    accept_lens_out, next_token_ids_flat, new_verified_id, accept_len_draft = (
-        dflash_greedy_verify_outputs(draft_token, target_predict)
-    )
-
-    # emitted token count per req = accepted drafts + 1 bonus
-    np.testing.assert_array_equal(np.asarray(accept_lens_out), np.array([4, 2, 1], dtype=np.int32))
-    np.testing.assert_array_equal(np.asarray(accept_len_draft), np.array([3, 1, 0], dtype=np.int32))
-    # next seed for the following block is the bonus token
-    np.testing.assert_array_equal(
-        np.asarray(new_verified_id), np.array([99, 77, 55], dtype=np.int32)
-    )
-    # flat ids are target_predict flattened; scheduler slices the first
-    # accept_lens_out entries per req block.
-    np.testing.assert_array_equal(
-        np.asarray(next_token_ids_flat),
-        np.array([11, 12, 13, 99, 21, 77, 88, 99, 55, 31, 32, 33], dtype=np.int32),
-    )
-
-
-def test_gather_dflash_accepted_hidden_padded_matches_valid_concat_layout():
-    block_size = 4
-    hidden = jnp.arange(3 * block_size * 2, dtype=jnp.float32).reshape(3 * block_size, 2)
-    accept_lens = jnp.array([4, 2, 1], dtype=jnp.int32)
-
-    out = gather_dflash_accepted_hidden_padded(
-        hidden,
-        accept_lens,
-        block_size=block_size,
-    )
-
-    hidden_np = np.asarray(hidden).reshape(3, block_size, 2)
-    expected_valid = np.concatenate(
-        [
-            hidden_np[0, :4],
-            hidden_np[1, :2],
-            hidden_np[2, :1],
-        ],
-        axis=0,
-    )
-    expected = np.concatenate(
-        [
-            expected_valid,
-            np.repeat(hidden_np[0, 0:1], 3 * block_size - len(expected_valid), axis=0),
-        ],
-        axis=0,
-    )
-    np.testing.assert_array_equal(np.asarray(out), expected)
 
 
 def test_dflash_committed_slices_prefill():

@@ -1,21 +1,3 @@
-"""DFlash speculative decoding utilities.
-
-Minimal-runnable scope (Qwen3 target, greedy, no overlap/DP/tree).
-
-DFlash draft config field names follow the PyTorch sglang DFlash convention:
-``dflash_config.{block_size, target_layer_ids, mask_token, mask_token_id}``.
-The exact keys of a given draft checkpoint may differ — see
-:func:`parse_dflash_draft_config`, which is the single place to adjust once the
-real checkpoint's ``config.json`` is known.
-
-Terminology (kept identical to the PyTorch implementation):
-- ``block_size`` == number of tokens in one verify block == ``speculative_num_draft_tokens``.
-  candidates = [verified_id (seed), d_1, ..., d_{block_size-1}].
-- ``K`` == ``len(target_layer_ids)`` == number of captured target layers whose
-  hidden states are concatenated and projected by the draft's ``fc`` (fc in-dim
-  = ``K * target_hidden_size``).
-"""
-
 from __future__ import annotations
 
 import logging
@@ -29,19 +11,10 @@ DEFAULT_DFLASH_BLOCK_SIZE = 16
 
 @dataclass(frozen=True)
 class DFlashDraftConfig:
-    """Parsed DFlash draft-model configuration.
+    """DFlash settings consumed outside the draft model implementation."""
 
-    All fields are resolved from the draft model's HF config. ``target_hidden_size``
-    defaults to the draft ``hidden_size`` when the checkpoint does not record the
-    target's hidden size separately (common for same-family Qwen3 draft/target).
-    """
-
-    num_hidden_layers: int
-    hidden_size: int
-    target_hidden_size: int
     block_size: int
     target_layer_ids: list[int] | None
-    num_injection_layers: int
     mask_token: str
     mask_token_id: int | None
 
@@ -96,10 +69,6 @@ def parse_dflash_draft_config(
     hf_config = get_config(model_path, trust_remote_code=trust_remote_code, revision=revision)
     dflash = _get_dflash_subconfig(hf_config)
 
-    num_hidden_layers = int(getattr(hf_config, "num_hidden_layers", 1))
-    hidden_size = int(hf_config.hidden_size)
-    target_hidden_size = int(_cfg_get(dflash, hf_config, "target_hidden_size", hidden_size))
-
     block_size = _cfg_get(dflash, hf_config, "block_size", None)
     if block_size is None:
         logger.warning(
@@ -126,24 +95,14 @@ def parse_dflash_draft_config(
             "fall back to defaults, which may mismatch the draft fc in-dim."
         )
 
-    num_injection_layers = (
-        len(target_layer_ids)
-        if target_layer_ids is not None
-        else int(_cfg_get(dflash, hf_config, "num_target_layers", num_hidden_layers))
-    )
-
     mask_token = _cfg_get(dflash, hf_config, "mask_token", DEFAULT_DFLASH_MASK_TOKEN)
     mask_token_id = _cfg_get(dflash, hf_config, "mask_token_id", None)
     if mask_token_id is not None:
         mask_token_id = int(mask_token_id)
 
     return DFlashDraftConfig(
-        num_hidden_layers=num_hidden_layers,
-        hidden_size=hidden_size,
-        target_hidden_size=target_hidden_size,
         block_size=block_size,
         target_layer_ids=target_layer_ids,
-        num_injection_layers=int(num_injection_layers),
         mask_token=str(mask_token),
         mask_token_id=mask_token_id,
     )

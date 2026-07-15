@@ -1,14 +1,3 @@
-"""DFlash speculative decoding worker (greedy runtime path).
-
-Scope: dp_size=1, disable_overlap_schedule, greedy-only.
-Ports the algorithmic structure of SGLang PyTorch PR 22077 to the sglang-jax
-scheduler/worker contract. See ``docs/design/dflash_stage_c.md``.
-
-The generic prefill -> draft -> verify -> draft-extend orchestration is owned by
-``BaseSpecWorker``. This module keeps only the DFlash-specific phase hooks and
-the three fused JIT boundaries.
-"""
-
 from __future__ import annotations
 
 import contextlib
@@ -34,7 +23,7 @@ from sgl_jax.srt.speculative.dflash_info import (
     DFlashVerifyInput,
     build_dflash_draft_block,
     compute_new_kv_slices,
-    dflash_greedy_verify_impl,
+    dflash_greedy_verify,
 )
 from sgl_jax.srt.speculative.dflash_util import (
     parse_dflash_draft_config,
@@ -60,12 +49,6 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         self.device = server_args.device
         self.block_size = self.speculative_num_draft_tokens
 
-        # ---- Build the draft ModelWorker (shares the target req->token pool) ----
-        # sglang-jax's ModelWorker does not accept a KV allocator; EAGLE only
-        # shares req_to_token_pool. We additionally alias the target's KV
-        # allocator after construction so committed tokens land at the same
-        # cache_loc in both target and draft KV pools (design decision:
-        # "share allocator + independent KV buffer").
         req_to_token_pool = self.req_to_token_pool
         target_allocator = self.token_to_kv_pool_allocator
 
@@ -91,7 +74,6 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         # ---- Borrow the target embedding + LM head (draft owns neither) ----
         target_model = target_worker.model_runner.model
         embed_weight, head_weight = target_model.get_embed_and_head()
-        self.draft_model.set_embed_and_head(embed_weight, head_weight)
         self._target_lm_head = head_weight  # [vocab, hidden], for greedy head sampling
         self._target_embed = embed_weight  # [vocab, hidden]
         self._target_vocab_size = int(target_worker.model_runner.model_config.vocab_size)
@@ -194,12 +176,27 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         self._append_target_hidden_to_draft_kv(model_worker_batch, draft_input, is_prefill=True)
         model_worker_batch.spec_info_padded = draft_input
 
+    def draft_extend_for_decode(
+        self,
+        model_worker_batch: ModelWorkerBatch,
+        batch_output,
+    ) -> None:
+        """Commit accepted target hidden states into persistent draft KV."""
+        next_draft_input = batch_output.next_draft_input
+        assert isinstance(next_draft_input, DFlashDraftInput)
+        self._append_target_hidden_to_draft_kv(
+            model_worker_batch,
+            next_draft_input,
+            is_prefill=False,
+        )
+        model_worker_batch.spec_info_padded = next_draft_input
+
     def draft(self, model_worker_batch: ModelWorkerBatch) -> None:
         """Build one fixed-size DFlash proposal block."""
         draft_input: DFlashDraftInput = model_worker_batch.spec_info_padded
-        assert isinstance(draft_input, DFlashDraftInput), (
-            "DFLASH decode requires DFlashDraftInput carried over from prefill."
-        )
+        assert isinstance(
+            draft_input, DFlashDraftInput
+        ), "DFLASH decode requires DFlashDraftInput carried over from prefill."
 
         bs = int(model_worker_batch.seq_lens.shape[0])
         seq_lens = np.asarray(model_worker_batch.seq_lens, dtype=np.int32)
@@ -207,7 +204,6 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         self._trim_dflash_draft_input_to_decode_batch(draft_input, bs)
         draft_prefix_lens = np.asarray(draft_input.draft_seq_lens, dtype=np.int32)
 
-        # 1) Draft the fixed block and greedily sample draft proposals.
         verify_input = self._draft_block(
             model_worker_batch,
             draft_input,
@@ -222,9 +218,9 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         from sgl_jax.srt.managers.scheduler import GenerationBatchResult
 
         verify_input = model_worker_batch.spec_info_padded
-        assert isinstance(verify_input, DFlashVerifyInput), (
-            "DFLASH verify requires proposals produced by the draft phase."
-        )
+        assert isinstance(
+            verify_input, DFlashVerifyInput
+        ), "DFLASH verify requires proposals produced by the draft phase."
 
         bs = int(model_worker_batch.seq_lens.shape[0])
         seq_lens = np.asarray(model_worker_batch.seq_lens, dtype=np.int32)
@@ -243,7 +239,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             accept_lens_out,
             next_token_ids_flat,
             new_verified_id,
-            _accept_draft,
+            _,
         ) = self._run_jit_target_verify(
             model_worker_batch,
             verify_input,
@@ -273,21 +269,6 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             extend_input_len_per_req=None,
             extend_logprob_start_len_per_req=None,
         )
-
-    def draft_extend_for_decode(
-        self,
-        model_worker_batch: ModelWorkerBatch,
-        batch_output,
-    ) -> None:
-        """Commit accepted target hidden states into persistent draft KV."""
-        next_draft_input = batch_output.next_draft_input
-        assert isinstance(next_draft_input, DFlashDraftInput)
-        self._append_target_hidden_to_draft_kv(
-            model_worker_batch,
-            next_draft_input,
-            is_prefill=False,
-        )
-        model_worker_batch.spec_info_padded = next_draft_input
 
     def _trim_dflash_draft_input_to_decode_batch(
         self,
@@ -355,7 +336,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                     forward_batch, memory_pools, logits_metadata
                 )
             accept_lens_out, next_token_ids_flat, new_verified_id, accept_draft = (
-                dflash_greedy_verify_impl(
+                dflash_greedy_verify(
                     draft_token,
                     output.next_token_logits,
                     draft_token_num=draft_token_num,
@@ -716,7 +697,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
 
         @_partial(
             jax.jit,
-            static_argnames=["model_state_def", "is_decode"],
+            static_argnames=["model_state_def"],
             donate_argnames=["kv_buffers"],
         )
         def draft_extend(
@@ -727,8 +708,6 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             positions,
             cache_loc,
             kv_buffers,
-            *,
-            is_decode: bool,
         ):
             positions = jax.sharding.reshard(positions.astype(jnp.int32), vector_sharding)
             cache_loc = jax.sharding.reshard(cache_loc.astype(jnp.int32), vector_sharding)
@@ -775,12 +754,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 model_worker_batch, draft_input
             )
 
-        self._run_jit_draft_extend(
-            target_hidden,
-            positions,
-            cache_loc,
-            is_decode=not is_prefill,
-        )
+        self._run_jit_draft_extend(target_hidden, positions, cache_loc)
 
         starts, lengths = compute_new_kv_slices(
             draft_input.ctx_lens, draft_input.draft_seq_lens, is_prefill
@@ -789,7 +763,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         draft_input.ctx_lens = np.zeros_like(np.asarray(draft_input.ctx_lens, dtype=np.int32))
         draft_input.target_hidden = None if not is_prefill else target_hidden[:0]
 
-    def _run_jit_draft_extend(self, target_hidden, positions, cache_loc, *, is_decode: bool):
+    def _run_jit_draft_extend(self, target_hidden, positions, cache_loc):
         pool = self.draft_model_runner.token_to_kv_pool
         new_buffers = self._jit_materialize_write(
             self.draft_model_runner.model_state_leaves,
@@ -797,7 +771,6 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             jnp.asarray(positions),
             jnp.asarray(cache_loc),
             list(pool.kv_buffer[: self.draft_layers]),
-            is_decode=is_decode,
         )
         for i, buf in enumerate(new_buffers):
             pool.kv_buffer[i] = buf
@@ -995,14 +968,12 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 skip_sample=True,
             )
 
-            # Prefill materialization is a separate JIT variant from decode
-            # because is_decode is static. Consume the real target output so
-            # hidden-state sharding matches the serving dependency exactly.
+            # Consume the real target output so hidden-state sharding matches
+            # the serving dependency exactly.
             self._run_jit_draft_extend(
                 logits_output.hidden_states,
                 batch.positions,
                 batch.out_cache_loc,
-                is_decode=False,
             )
             logger.info(
                 "[DFLASH] Prefill bs=%d tokens=%d compiled in %.1f secs",
@@ -1045,7 +1016,6 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             logits_output.hidden_states,
             target_batch.positions,
             target_batch.out_cache_loc[: bs * self.block_size],
-            is_decode=True,
         )
 
     def _make_verify_dummy_batch(

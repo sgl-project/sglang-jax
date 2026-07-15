@@ -204,7 +204,6 @@ class DFlashDraftModel(nnx.Module):
         )
         self.num_context_features = int(num_context_features)
         self.target_hidden_size = target_hidden_size
-        self.block_size = int(getattr(config, "block_size", 16))
 
         self.fc = LinearBase(
             input_size=self.num_context_features * self.target_hidden_size,
@@ -221,18 +220,6 @@ class DFlashDraftModel(nnx.Module):
             param_dtype=dtype,
             scope_name="hidden_norm",
         )
-        self.embed_weight = None
-        self.lm_head_weight = None
-
-    def set_embed_and_head(
-        self,
-        embed_weight: jax.Array | None = None,
-        head_weight: jax.Array | None = None,
-    ) -> None:
-        from flax import nnx
-
-        self.embed_weight = nnx.data(embed_weight) if embed_weight is not None else None
-        self.lm_head_weight = nnx.data(head_weight) if head_weight is not None else None
 
     def project_target_hidden(self, target_hidden: jax.Array) -> jax.Array:
         expected = self.num_context_features * self.target_hidden_size

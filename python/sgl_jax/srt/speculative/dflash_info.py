@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import functools
 from dataclasses import dataclass
 
 import jax
@@ -9,48 +8,6 @@ import numpy as np
 from jax.tree_util import register_pytree_node_class
 
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode
-
-
-# @haifeng Maybe common!
-def compute_dflash_accept_len_and_bonus(
-    candidates: jax.Array,
-    target_predict: jax.Array,
-) -> tuple[jax.Array, jax.Array]:
-    """Greedy DFlash chain verification.
-
-    match: candidates[:, 1:] == target_predict[:, :-1]
-    """
-
-    if candidates.ndim != 2:
-        raise ValueError(f"candidates must be 2D, got shape={candidates.shape}.")
-    if target_predict.shape != candidates.shape:
-        raise ValueError(
-            "target_predict must have the same shape as candidates, got "
-            f"{target_predict.shape} vs {candidates.shape}."
-        )
-
-    mesh = getattr(jax.typeof(target_predict).sharding, "mesh", None)
-    if mesh is not None:
-        from jax.sharding import NamedSharding
-        from jax.sharding import PartitionSpec as P
-
-        replicated_2d = NamedSharding(mesh, P(None, None))
-        candidates = jax.sharding.reshard(candidates, replicated_2d)
-        target_predict = jax.sharding.reshard(target_predict, replicated_2d)
-
-    matches = candidates[:, 1:] == target_predict[:, :-1]
-    accept_len = jnp.sum(jnp.cumprod(matches.astype(jnp.int32), axis=1), axis=1)
-    row_ids = jnp.arange(candidates.shape[0], dtype=jnp.int32)
-    flat_idx = row_ids * candidates.shape[1] + accept_len
-    tp_flat = target_predict.reshape(-1)
-    if mesh is None:
-        bonus = jnp.take(tp_flat, flat_idx)
-    else:
-        from jax.sharding import NamedSharding
-        from jax.sharding import PartitionSpec as P
-
-        bonus = tp_flat.at[flat_idx].get(out_sharding=NamedSharding(mesh, P(None)))
-    return accept_len.astype(jnp.int32), bonus.astype(jnp.int32)
 
 
 def build_dflash_draft_block(
@@ -94,42 +51,12 @@ def compute_new_kv_slices(
     """
     ctx_lens = np.asarray(ctx_lens, dtype=np.int32)
     draft_seq_lens = np.asarray(draft_seq_lens, dtype=np.int32)
-    if is_prefill:
-        starts = draft_seq_lens.copy()
-    else:
-        starts = draft_seq_lens - ctx_lens
+    starts = draft_seq_lens.copy() if is_prefill else draft_seq_lens - ctx_lens
     return starts.astype(np.int32), ctx_lens.copy()
 
 
-def dflash_greedy_verify_outputs(
-    draft_token: jax.Array,
-    target_predict: jax.Array,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    """Greedy DFlash verify → scheduler-facing decode outputs.
-
-    ``draft_token[:, 0]`` is the seed (already-emitted verified id). The tokens
-    committed this step are the accepted draft proposals plus one bonus token,
-    which are exactly ``target_predict[i, 0 : accept_len_draft[i] + 1]``.
-
-    Returns:
-    - ``accept_lens_out``: ``(bs,)`` emitted token count per request
-      (= accepted drafts + 1 bonus). This is what the scheduler advances output
-      length by and what ``resolve_spec_decode_token_ids`` slices with.
-    - ``next_token_ids``: ``(bs * block_size,)`` — ``target_predict``
-      flattened; the scheduler keeps the first ``accept_lens_out[i]`` per row.
-    - ``verified_id``: ``(bs,)`` next-step seed (= bonus token).
-    - ``accept_len_draft``: ``(bs,)`` number of accepted draft proposals.
-    """
-    if draft_token.ndim != 2:
-        raise ValueError(f"draft_token must be 2D, got shape={draft_token.shape}.")
-    accept_len_draft, bonus = compute_dflash_accept_len_and_bonus(draft_token, target_predict)
-    accept_lens_out = (accept_len_draft + 1).astype(jnp.int32)
-    next_token_ids = target_predict.reshape(-1).astype(jnp.int32)
-    verified_id = bonus.astype(jnp.int32)
-    return accept_lens_out, next_token_ids, verified_id, accept_len_draft
-
-
-def dflash_greedy_verify_impl(
+# @haifeng Maybe common!
+def dflash_greedy_verify(
     draft_token: jax.Array,
     target_logits: jax.Array,
     *,
@@ -139,6 +66,8 @@ def dflash_greedy_verify_impl(
     candidates = draft_token.reshape((-1, int(draft_token_num)))
     target_predict_flat = jnp.argmax(target_logits, axis=-1).astype(jnp.int32)
     mesh = getattr(jax.typeof(target_predict_flat).sharding, "mesh", None)
+    if mesh is not None and getattr(mesh, "empty", False):
+        mesh = None
     target_predict = target_predict_flat.reshape(candidates.shape)
     if mesh is not None:
         from jax.sharding import NamedSharding
@@ -163,62 +92,6 @@ def dflash_greedy_verify_impl(
 
     accept_lens_out = (accept_len_draft + 1).astype(jnp.int32)
     return accept_lens_out, target_predict_flat, bonus, accept_len_draft.astype(jnp.int32)
-
-
-@functools.partial(jax.jit, static_argnames=("draft_token_num",))
-def dflash_greedy_verify(
-    draft_token: jax.Array,
-    target_logits: jax.Array,
-    *,
-    draft_token_num: int,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    """Fused target-logits argmax and greedy DFlash verification."""
-    return dflash_greedy_verify_impl(
-        draft_token,
-        target_logits,
-        draft_token_num=draft_token_num,
-    )
-
-
-def gather_dflash_accepted_hidden_padded(
-    target_hidden: jax.Array,
-    accept_lens: jax.Array,
-    *,
-    block_size: int,
-    hidden_out_sharding=None,
-    index_out_sharding=None,
-) -> jax.Array:
-    """Gather accepted target hidden states into DFlash draft-extend layout.
-
-    Decode target hidden is row-major ``[bs, block_size, hidden]``. Draft KV
-    materialization expects a fixed ``bs * block_size`` shape with valid tokens
-    concatenated by request and trailing dummy rows padded from row 0.
-    """
-    hidden_size = target_hidden.shape[-1]
-    flat_hidden = target_hidden.reshape((-1, hidden_size))
-    accept_lens = accept_lens.astype(jnp.int32)
-    mesh = getattr(jax.typeof(accept_lens).sharding, "mesh", None)
-    if mesh is not None:
-        from jax.sharding import NamedSharding
-        from jax.sharding import PartitionSpec as P
-
-        accept_lens = jax.sharding.reshard(accept_lens, NamedSharding(mesh, P(None)))
-    max_tokens = accept_lens.shape[0] * int(block_size)
-    ends = jnp.cumsum(accept_lens)
-    starts = ends - accept_lens
-    slot_ids = jnp.arange(max_tokens, dtype=jnp.int32)
-    row_ids = jnp.sum(slot_ids[:, None] >= ends[None, :], axis=1).astype(jnp.int32)
-    row_ids = jnp.minimum(row_ids, accept_lens.shape[0] - 1)
-    if index_out_sharding is None:
-        row_starts = starts.at[row_ids].get()
-    else:
-        row_starts = starts.at[row_ids].get(out_sharding=index_out_sharding)
-    col_ids = slot_ids - row_starts
-    gather_ids = row_ids * int(block_size) + col_ids
-    gather_ids = jnp.where(slot_ids < ends[-1], gather_ids, 0)
-    if hidden_out_sharding is None:
-        return flat_hidden.at[gather_ids].get()
-    return flat_hidden.at[gather_ids].get(out_sharding=hidden_out_sharding)
 
 
 @dataclass
@@ -503,11 +376,6 @@ class DFlashVerifyInput:
             capture_hidden_mode=aux_data["capture_hidden_mode"],
         )
 
-    def verify_greedy(self, target_predict: jax.Array) -> tuple[jax.Array, jax.Array]:
-        candidates = self.draft_token.reshape((-1, int(self.draft_token_num)))
-        target_predict = target_predict.reshape(candidates.shape)
-        return compute_dflash_accept_len_and_bonus(candidates, target_predict)
-
     def prepare_for_verify(self, model_worker_batch, page_size: int) -> None:
         """Wire the drafted block into ``model_worker_batch`` for target verify.
 
@@ -534,17 +402,3 @@ class DFlashVerifyInput:
             )
         model_worker_batch.spec_info_padded = self
         model_worker_batch.capture_hidden_mode = self.capture_hidden_mode
-
-    # @haifeng Need modify
-    def verify(self, target_logits: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-        """Greedy-verify a target forward output.
-
-        ``target_logits`` has shape ``[bs * block_size, vocab]``. Returns the
-        scheduler-facing decode outputs from :func:`dflash_greedy_verify_outputs`:
-        ``(accept_lens_out, next_token_ids, verified_id, accept_len_draft)``.
-        """
-        return dflash_greedy_verify(
-            self.draft_token,
-            target_logits,
-            draft_token_num=int(self.draft_token_num),
-        )
