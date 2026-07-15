@@ -343,12 +343,17 @@ class Glm5Attention(nnx.Module):
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
     ) -> tuple[jax.Array, jax.Array]:
-        # "thd,rhd->thr"
+        # "thd,rhd->thr" — fp32 accumulate: on v7x the default bf16
+        # accumulator drops enough precision on this small batched dot
+        # (per-device [T, H/tp, 128]) that decode drifts into repetition
+        # over 78 layers; v6e's default happens to be tighter. Cost is
+        # negligible vs q/o_proj.
         ql_nope = jax.lax.dot_general(
             q_nope,
             self.w_uk.value,
             (((2,), (2,)), ((1,), (1,))),
-        )
+            preferred_element_type=jnp.float32,
+        ).astype(q_nope.dtype)
         ql_nope = ql_nope.transpose(1, 0, 2)
 
         c_kv_3d = compressed[:, None, :]
@@ -361,12 +366,13 @@ class Glm5Attention(nnx.Module):
             q_rope=q_rope,
             k_rope=k_rope,
         )
-        # "thr,rhd->thd"
+        # "thr,rhd->thd" — fp32 accumulate; see ql_nope above.
         o_v = jax.lax.dot_general(
             attn_output,
             self.w_uv.value,
             (((2,), (0,)), ((1,), (1,))),
-        )
+            preferred_element_type=jnp.float32,
+        ).astype(attn_output.dtype)
         o_v = o_v.transpose(1, 0, 2)
         attn_output = o_v.reshape(-1, self.num_heads * self.v_head_dim)
         return attn_output, kv_fused
