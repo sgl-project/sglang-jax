@@ -91,6 +91,36 @@ def _repack_row_padded_page_indices(
     return np.concatenate(parts) if parts else np.empty(0, dtype=np.int32)
 
 
+def _pad_page_indices(
+    page_indices: np.ndarray,
+    max_num_seqs: int,
+    fixed_capacity: int | None = None,
+) -> np.ndarray:
+    """Pad page indices to either a fixed capacity or a per-sequence bucket."""
+    page_indices = np.asarray(page_indices, dtype=np.int32)
+    if fixed_capacity is not None:
+        target_len = int(fixed_capacity)
+        if target_len < len(page_indices):
+            raise ValueError(
+                "page_indices exceed fixed capacity: "
+                f"required={len(page_indices)}, capacity={target_len}"
+            )
+    elif max_num_seqs > 0 and len(page_indices) > 0:
+        current_pps = cdiv(len(page_indices), max_num_seqs)
+        bucketed_pps = max(16, 1 << max(0, (current_pps - 1)).bit_length())
+        target_len = max_num_seqs * bucketed_pps
+    else:
+        return page_indices
+
+    if len(page_indices) < target_len:
+        page_indices = np.pad(
+            page_indices,
+            (0, target_len - len(page_indices)),
+            constant_values=0,
+        )
+    return page_indices
+
+
 @register_pytree_node_class
 @dataclass
 class FlashAttentionMetadata:
@@ -258,7 +288,12 @@ class FlashAttention(AttentionBackend):
         )
         return metadata
 
-    def get_eagle_forward_metadata(self, batch: ModelWorkerBatch):
+    def get_eagle_forward_metadata(
+        self,
+        batch: ModelWorkerBatch,
+        *,
+        page_indices_capacity: int | None = None,
+    ):
         """Return the metadata for a forward pass."""
         # below code is for verify and draft extend phase
         metadata = FlashAttentionMetadata()
@@ -388,17 +423,15 @@ class FlashAttention(AttentionBackend):
         distribution = np.column_stack([np.zeros_like(local_n), local_n, local_n]).ravel()
         page_indices = np.array(page_indices)
 
-        # Pad page_indices so pages_per_seq is bucket-stable, avoiding
-        # recompilation of the Pallas attention kernel on every decode step.
+        # DFlash can provide one pool-sized capacity for every prefix length,
+        # removing pages-per-sequence from the JIT cache key. Other speculative
+        # paths retain the smaller per-sequence power-of-two buckets.
         max_num_seqs = dp_size * per_dp_bs
-        if max_num_seqs > 0 and len(page_indices) > 0:
-            current_pps = cdiv(len(page_indices), max_num_seqs)
-            bucketed_pps = max(16, 1 << max(0, (current_pps - 1)).bit_length())
-            target_len = max_num_seqs * bucketed_pps
-            if len(page_indices) < target_len:
-                page_indices = np.pad(
-                    page_indices, (0, target_len - len(page_indices)), constant_values=0
-                )
+        page_indices = _pad_page_indices(
+            page_indices,
+            max_num_seqs,
+            fixed_capacity=page_indices_capacity,
+        )
 
         seq_lens = np.array(seq_lens)
         (

@@ -96,6 +96,18 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         self._target_embed = embed_weight  # [vocab, hidden]
         self._target_vocab_size = int(target_worker.model_runner.model_config.vocab_size)
 
+        pool_pages = (
+            int(target_worker.max_total_num_tokens) + self.page_size - 1
+        ) // self.page_size
+        max_req_pages = (
+            int(target_worker.compilation_manager.max_req_len) + self.page_size - 1
+        ) // self.page_size
+        self._page_indices_pool_capacity = 1 << max(0, pool_pages - 1).bit_length()
+        self._page_indices_per_seq_capacity = max(
+            16,
+            1 << max(0, max_req_pages - 1).bit_length(),
+        )
+
         # ---- Resolve the draft mask token ----
         dflash_config = parse_dflash_draft_config(
             server_args.speculative_draft_model_path,
@@ -123,10 +135,21 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         self._init_jit_draft_block()
 
         logger.info(
-            "Initialized DFLASH worker: block_size=%d, mask_token_id=%d, draft_layers=%d",
+            "Initialized DFLASH worker: block_size=%d, mask_token_id=%d, "
+            "draft_layers=%d, page_indices_pool_capacity=%d, "
+            "page_indices_per_seq_capacity=%d",
             self.block_size,
             self._mask_token_id,
             self.draft_layers,
+            self._page_indices_pool_capacity,
+            self._page_indices_per_seq_capacity,
+        )
+
+    def _page_indices_capacity(self, bs: int) -> int:
+        """Return one stable page-index shape for a batch-size bucket."""
+        return min(
+            self._page_indices_pool_capacity,
+            max(int(bs), 1) * self._page_indices_per_seq_capacity,
         )
 
     @property
@@ -211,7 +234,8 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         model_worker_batch.seq_lens = target_prefix_lens
         self._rebuild_cache_loc(model_worker_batch, target_prefix_lens, bs)
         forward_metadata = self.target_worker.model_runner.attn_backend.get_eagle_forward_metadata(
-            model_worker_batch
+            model_worker_batch,
+            page_indices_capacity=self._page_indices_capacity(bs),
         )
         (
             logits_output,
@@ -378,6 +402,10 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         else:
             forward_batch = ForwardBatch.init_new(model_worker_batch, runner)
         forward_batch.input_ids = verify_input.draft_token
+        # FA consumes the already-built metadata. Keeping the host-only
+        # row-padded cache_loc in the JIT pytree would make prefix width part of
+        # the cache key even though model execution never reads it.
+        forward_batch.cache_loc = None
 
         runner.attn_backend.forward_metadata = forward_metadata
         logits_metadata = LogitsMetadata.from_model_worker_batch(model_worker_batch, self.mesh)
@@ -478,7 +506,10 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         )
         forward_batch = ForwardBatch.init_new(draft_mwb, self.draft_model_runner)
         forward_batch.forward_mode = ForwardMode.TARGET_VERIFY
-        metadata = self.draft_model_runner.attn_backend.get_eagle_forward_metadata(draft_mwb)
+        metadata = self.draft_model_runner.attn_backend.get_eagle_forward_metadata(
+            draft_mwb,
+            page_indices_capacity=self._page_indices_capacity(bs),
+        )
         self.draft_model_runner.attn_backend.forward_metadata = metadata
         draft_token_flat = self._run_jit_draft_block(forward_batch, None)
 
@@ -625,6 +656,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
 
     def _run_jit_draft_block(self, forward_batch, logits_metadata):
         runner = self.draft_model_runner
+        forward_batch.cache_loc = None
 
         def _call_and_replace():
             pool_updates, draft_token = self._jit_draft_block(
@@ -902,7 +934,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
     # Precompile hook (scheduler calls this at startup)
     # ------------------------------------------------------------------ #
     def run_spec_decode_precompile(self):
-        self.target_worker.run_precompile()
+        self._precompile_dflash_prefill()
         manager = self.target_worker.compilation_manager
         bs_buckets = [
             int(bs) for bs in manager.bs_buckets if int(bs) > 0 and int(bs) & (int(bs) - 1) == 0
@@ -910,50 +942,109 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         if not bs_buckets:
             bs_buckets = [int(manager.max_padded_batch_size)]
 
-        max_pages = max(
-            16,
-            (int(manager.max_req_len) + self.page_size - 1) // self.page_size,
-        )
-        max_bucket_pages = 1 << (max_pages - 1).bit_length()
-        page_buckets = []
-        pages = 16
-        while pages <= max_bucket_pages:
-            page_buckets.append(pages)
-            pages *= 2
-
-        row_widths = [pages * self.page_size for pages in page_buckets]
         logger.info(
-            "[DFLASH] Precompiling variants: bs=%s, row_width=%s",
+            "[DFLASH] Precompiling one fixed-page variant per bs: bs=%s, page_indices_capacity=%s",
             bs_buckets,
-            row_widths,
+            [self._page_indices_capacity(bs) for bs in bs_buckets],
         )
         for bs in bs_buckets:
-            for row_width in row_widths:
-                self._precompile_dflash_variant(bs, row_width)
+            self._precompile_dflash_variant(bs)
 
-    def _precompile_dflash_variant(self, bs: int, row_width: int) -> None:
+    @staticmethod
+    def _prefill_precompile_variants(manager) -> list[tuple[int, int]]:
+        """Return the EXTEND shapes emitted by ScheduleBatch's padded path."""
+        bs = int(manager.max_padded_batch_size)
+        return [(bs, int(tokens)) for tokens in manager.token_buckets if int(tokens) >= bs]
+
+    def _precompile_dflash_prefill(self) -> None:
+        """Compile the exact target-prefill -> draft-KV path used by DFlash."""
+        import time
+
+        from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
+
+        manager = self.target_worker.compilation_manager
+        variants = self._prefill_precompile_variants(manager)
+        logger.info("[DFLASH] Precompiling prefill variants: %s", variants)
+        start = time.perf_counter()
+
+        for bs, num_tokens in variants:
+            t0 = time.perf_counter()
+            batch = manager._make_dummy_batch(
+                bs,
+                num_tokens,
+                ForwardMode.EXTEND,
+                manager.cache_loc_buckets[-1],
+                speculative_algorithm=SpeculativeAlgorithm.DFLASH,
+                dp_size=manager.dp_size,
+                per_dp_bs_size=bs // manager.dp_size,
+            )
+            batch.capture_hidden_mode = CaptureHiddenMode.FULL
+            sampling_metadata = SamplingMetadata.from_model_worker_batch(
+                batch,
+                0,
+                self.mesh,
+                self._target_vocab_size,
+            )
+            batch.forward_batch = ForwardBatch.init_new(
+                batch,
+                self.target_worker.model_runner,
+            )
+            logits_output, *_ = self.forward_target_extend(
+                batch,
+                sampling_metadata,
+                skip_sample=True,
+            )
+
+            # Prefill materialization is a separate JIT variant from decode
+            # because is_decode is static. Consume the real target output so
+            # hidden-state sharding matches the serving dependency exactly.
+            self._run_jit_draft_extend(
+                logits_output.hidden_states,
+                batch.positions,
+                batch.out_cache_loc,
+                is_decode=False,
+            )
+            logger.info(
+                "[DFLASH] Prefill bs=%d tokens=%d compiled in %.1f secs",
+                bs,
+                num_tokens,
+                time.perf_counter() - t0,
+            )
+
+        logger.info(
+            "[DFLASH] Prefill precompile finished in %.0f secs",
+            time.perf_counter() - start,
+        )
+
+    def _precompile_dflash_variant(self, bs: int) -> None:
+        row_width = max(self.block_size, 16 * self.page_size)
+        draft_batch = self._make_verify_dummy_batch(bs, row_width, is_draft=True)
+        forward_batch = ForwardBatch.init_new(draft_batch, self.draft_model_runner)
+        forward_batch.forward_mode = ForwardMode.TARGET_VERIFY
+        draft_metadata = self.draft_model_runner.attn_backend.get_eagle_forward_metadata(
+            draft_batch,
+            page_indices_capacity=self._page_indices_capacity(bs),
+        )
+        self.draft_model_runner.attn_backend.forward_metadata = draft_metadata
+        draft_token = self._run_jit_draft_block(forward_batch, None)
+
+        # Match the serving dependency and sharding exactly: target verify
+        # consumes the P(None)-replicated proposal produced by jit_draft.
         target_batch = self._make_verify_dummy_batch(bs, row_width)
+        target_batch.spec_info_padded.draft_token = draft_token
         target_metadata = self.target_worker.model_runner.attn_backend.get_eagle_forward_metadata(
-            target_batch
+            target_batch,
+            page_indices_capacity=self._page_indices_capacity(bs),
         )
         logits_output, *_ = self._run_jit_target_verify(
             target_batch,
             target_batch.spec_info_padded,
             target_metadata,
         )
-
-        draft_batch = self._make_verify_dummy_batch(bs, row_width, is_draft=True)
-        forward_batch = ForwardBatch.init_new(draft_batch, self.draft_model_runner)
-        forward_batch.forward_mode = ForwardMode.TARGET_VERIFY
-        draft_metadata = self.draft_model_runner.attn_backend.get_eagle_forward_metadata(
-            draft_batch
-        )
-        self.draft_model_runner.attn_backend.forward_metadata = draft_metadata
-        self._run_jit_draft_block(forward_batch, None)
         self._run_jit_draft_extend(
             logits_output.hidden_states,
             target_batch.positions,
-            target_batch.out_cache_loc,
+            target_batch.out_cache_loc[: bs * self.block_size],
             is_decode=True,
         )
 
@@ -978,7 +1069,12 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         batch.input_ids = np.ones(num_tokens, dtype=np.int32)
         batch.real_input_ids_len = num_tokens
         batch.seq_lens = np.full(bs, prefix_len, dtype=np.int32)
-        batch.out_cache_loc = np.arange(1, num_tokens + 1, dtype=np.int32)
+        batch.out_cache_loc = np.concatenate(
+            [
+                np.arange(1, num_tokens + 1, dtype=np.int32),
+                np.full(num_tokens, -1, dtype=np.int32),
+            ]
+        )
         batch.positions = positions
         batch.capture_hidden_mode = capture_hidden
         batch.spec_info_padded = DFlashVerifyInput(

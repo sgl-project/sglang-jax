@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import numpy as np
 
 from sgl_jax.srt.layers.attention.flashattention_backend import (
+    _pad_page_indices,
     _repack_row_padded_page_indices,
 )
 from sgl_jax.srt.speculative.dflash_info import DFlashDraftInput
@@ -138,6 +139,31 @@ def test_trim_dflash_draft_input_drops_stale_tail_state():
     np.testing.assert_array_equal(di.draft_seq_lens, np.array([5, 6, 7], dtype=np.int32))
 
 
+def test_page_indices_capacity_is_bounded_by_request_and_pool():
+    w = _bare_worker(
+        _page_indices_pool_capacity=8192,
+        _page_indices_per_seq_capacity=1024,
+    )
+
+    assert w._page_indices_capacity(1) == 1024
+    assert w._page_indices_capacity(4) == 4096
+    assert w._page_indices_capacity(16) == 8192
+
+
+def test_prefill_precompile_variants_use_runtime_extend_buckets():
+    manager = SimpleNamespace(
+        max_padded_batch_size=128,
+        token_buckets=[64, 128, 256, 1024, 2048],
+    )
+
+    assert DFlashWorker._prefill_precompile_variants(manager) == [
+        (128, 128),
+        (128, 256),
+        (128, 1024),
+        (128, 2048),
+    ]
+
+
 def test_pack_cache_loc_rows_uses_bucket_stable_row_width():
     w = _bare_worker(page_size=1)
     rows = [
@@ -170,3 +196,23 @@ def test_repack_row_padded_page_indices_removes_dflash_row_padding():
     assert page_indices.shape == (46,)
     np.testing.assert_array_equal(page_indices[:23], np.arange(100, 123, dtype=np.int32))
     np.testing.assert_array_equal(page_indices[23:], np.arange(200, 223, dtype=np.int32))
+
+
+def test_pad_page_indices_uses_fixed_dflash_capacity():
+    page_indices = np.array([3, 5, 7], dtype=np.int32)
+
+    padded = _pad_page_indices(page_indices, max_num_seqs=2, fixed_capacity=8)
+
+    np.testing.assert_array_equal(
+        padded,
+        np.array([3, 5, 7, 0, 0, 0, 0, 0], dtype=np.int32),
+    )
+
+
+def test_pad_page_indices_rejects_fixed_capacity_overflow():
+    with np.testing.assert_raises_regex(ValueError, "exceed fixed capacity"):
+        _pad_page_indices(
+            np.arange(9, dtype=np.int32),
+            max_num_seqs=2,
+            fixed_capacity=8,
+        )
