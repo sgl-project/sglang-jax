@@ -2698,12 +2698,15 @@ class ScheduleBatch:
 
         if isinstance(flat, DFlashDraftInput):
 
-            def _scatter_dflash_1d(arr, *, fill_value: int = 0):
+            def _scatter_dflash_1d(arr, field: str, *, fill_value: int = 0):
                 if arr is None:
-                    return None
+                    raise ValueError(f"DFLASH state field {field!r} is missing before DP scatter.")
                 a = np.asarray(arr)
                 if a.shape[0] != len(selector):
-                    return None
+                    raise ValueError(
+                        "DFLASH state length does not match real request slots before DP scatter: "
+                        f"field={field}, state_bs={a.shape[0]}, real_bs={len(selector)}."
+                    )
                 out = np.full((total_bs,), fill_value, dtype=a.dtype)
                 out[selector] = a
                 return out
@@ -2719,10 +2722,10 @@ class ScheduleBatch:
                 return out
 
             return DFlashDraftInput(
-                verified_id=_scatter_dflash_1d(flat.verified_id),
+                verified_id=_scatter_dflash_1d(flat.verified_id, "verified_id"),
                 target_hidden=_scatter_dflash_hidden(flat.target_hidden),
-                ctx_lens=_scatter_dflash_1d(flat.ctx_lens),
-                draft_seq_lens=_scatter_dflash_1d(flat.draft_seq_lens),
+                ctx_lens=_scatter_dflash_1d(flat.ctx_lens, "ctx_lens"),
+                draft_seq_lens=_scatter_dflash_1d(flat.draft_seq_lens, "draft_seq_lens"),
                 capture_hidden_mode=flat.capture_hidden_mode,
                 block_size=flat.block_size,
             )
@@ -2783,6 +2786,10 @@ class ScheduleBatch:
         from sgl_jax.srt.speculative.dflash_info import DFlashDraftInput
 
         if isinstance(flat, DFlashDraftInput):
+
+            def _slice(v, start: int, end: int):
+                return None if v is None else v[start:end]
+
             out = []
             offset = 0
             for n in real_bs_per_dp:
@@ -2790,20 +2797,18 @@ class ScheduleBatch:
                     out.append(None)
                     continue
 
-                def _slice(v):
-                    return None if v is None else v[offset : offset + n]
-
+                end = offset + n
                 out.append(
                     DFlashDraftInput(
-                        verified_id=_slice(flat.verified_id),
-                        target_hidden=_slice(flat.target_hidden),
-                        ctx_lens=_slice(flat.ctx_lens),
-                        draft_seq_lens=_slice(flat.draft_seq_lens),
+                        verified_id=_slice(flat.verified_id, offset, end),
+                        target_hidden=_slice(flat.target_hidden, offset, end),
+                        ctx_lens=_slice(flat.ctx_lens, offset, end),
+                        draft_seq_lens=_slice(flat.draft_seq_lens, offset, end),
                         capture_hidden_mode=flat.capture_hidden_mode,
                         block_size=flat.block_size,
                     )
                 )
-                offset += n
+                offset = end
             return out
 
         has_future_indices = getattr(flat, "future_indices", None) is not None
@@ -2888,6 +2893,8 @@ class ScheduleBatch:
         Used at forward input boundary (``_get_spec_decode_mwb_dp``) to build the
         flat shape ``_scatter_spec_info_to_dp_slots`` expects.
         """
+        from sgl_jax.srt.speculative.dflash_info import DFlashDraftInput
+
         nonempty = [s for s in per_rank if s is not None]
         if not nonempty:
             return None
@@ -2927,6 +2934,11 @@ class ScheduleBatch:
             kwargs["block_size"] = nonempty[0].block_size
         for f in per_req_fields:
             vals = [getattr(s, f, None) for s in nonempty]
+            if isinstance(nonempty[0], DFlashDraftInput) and f == "target_hidden":
+                materialized = [v for v in vals if v is not None and v.shape[0] > 0]
+                if not materialized:
+                    kwargs[f] = None
+                    continue
             nonnull = [v for v in vals if v is not None]
             if not nonnull:
                 kwargs[f] = None

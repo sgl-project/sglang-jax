@@ -73,22 +73,35 @@ def dflash_greedy_verify(
         from jax.sharding import NamedSharding
         from jax.sharding import PartitionSpec as P
 
-        replicated_2d = NamedSharding(mesh, P(None, None))
-        candidates = jax.sharding.reshard(candidates, replicated_2d)
-        target_predict = jax.sharding.reshard(target_predict, replicated_2d)
+        data_2d = NamedSharding(mesh, P("data", None))
+        candidates = jax.sharding.reshard(candidates, data_2d)
+        target_predict = jax.sharding.reshard(target_predict, data_2d)
 
     matches = candidates[:, 1:] == target_predict[:, :-1]
     accept_len_draft = jnp.sum(jnp.cumprod(matches.astype(jnp.int32), axis=1), axis=1)
-    row_ids = jnp.arange(candidates.shape[0], dtype=jnp.int32)
-    flat_idx = row_ids * candidates.shape[1] + accept_len_draft
     target_predict_flat = target_predict.reshape(-1).astype(jnp.int32)
     if mesh is None:
-        bonus = jnp.take(target_predict_flat, flat_idx)
+        bonus = jnp.take_along_axis(
+            target_predict,
+            accept_len_draft[:, None],
+            axis=1,
+        ).reshape(-1)
     else:
-        from jax.sharding import NamedSharding
         from jax.sharding import PartitionSpec as P
 
-        bonus = target_predict_flat.at[flat_idx].get(out_sharding=NamedSharding(mesh, P(None)))
+        def _select_local_bonus(local_predict, local_accept_len):
+            return jnp.take_along_axis(
+                local_predict,
+                local_accept_len[:, None],
+                axis=1,
+            ).reshape(-1)
+
+        bonus = jax.shard_map(
+            _select_local_bonus,
+            mesh=mesh,
+            in_specs=(P("data", None), P("data")),
+            out_specs=P("data"),
+        )(target_predict, accept_len_draft)
 
     accept_lens_out = (accept_len_draft + 1).astype(jnp.int32)
     return accept_lens_out, target_predict_flat, bonus, accept_len_draft.astype(jnp.int32)
@@ -173,23 +186,51 @@ class DFlashDraftInput:
     def filter_batch(self, new_indices: np.ndarray, has_been_filtered: bool = True) -> None:
         self._ensure_host()
         new_indices = np.asarray(new_indices, dtype=np.int32)
-        if has_been_filtered and len(new_indices) == len(self.verified_id):
-            idx = slice(0, len(new_indices))
+        old_verified_id = np.asarray(self.verified_id, dtype=np.int32)
+        old_ctx_lens = np.asarray(self.ctx_lens, dtype=np.int32)
+        old_draft_seq_lens = np.asarray(self.draft_seq_lens, dtype=np.int32)
+        old_bs = len(old_verified_id)
+        if has_been_filtered and len(new_indices) == old_bs:
+            selected = np.arange(len(new_indices), dtype=np.int32)
         else:
-            idx = new_indices
-        self.verified_id = np.asarray(self.verified_id, dtype=np.int32)[idx]
-        self.ctx_lens = np.asarray(self.ctx_lens, dtype=np.int32)[idx]
-        self.draft_seq_lens = np.asarray(self.draft_seq_lens, dtype=np.int32)[idx]
+            selected = new_indices
+
+        self.verified_id = old_verified_id[selected]
+        self.ctx_lens = old_ctx_lens[selected]
+        self.draft_seq_lens = old_draft_seq_lens[selected]
 
         if self.target_hidden is None:
             return
-        old_lens = np.asarray(self.ctx_lens, dtype=np.int32)
-        if np.sum(old_lens) == 0:
+        hidden = np.asarray(jax.device_get(self.target_hidden))
+        hidden_rows = int(hidden.shape[0])
+        if hidden_rows == 0 or int(old_ctx_lens.sum()) == 0:
             self.target_hidden = self.target_hidden[:0]
             return
-        raise NotImplementedError(
-            "DFlashDraftInput.filter_batch with non-empty target_hidden is not "
-            "implemented; DFLASH is restricted to dp_size=1/no retraction."
+
+        if hidden_rows == old_bs:
+            self.target_hidden = hidden[selected]
+            return
+
+        block_rows = old_bs * int(self.block_size)
+        if hidden_rows == block_rows:
+            self.target_hidden = hidden.reshape((old_bs, int(self.block_size)) + hidden.shape[1:])[
+                selected
+            ].reshape((-1,) + hidden.shape[1:])
+            return
+
+        compact_rows = int(old_ctx_lens.sum())
+        if hidden_rows == compact_rows:
+            offsets = np.concatenate(
+                [np.zeros((1,), dtype=np.int64), np.cumsum(old_ctx_lens, dtype=np.int64)]
+            )
+            chunks = [hidden[offsets[i] : offsets[i + 1]] for i in selected]
+            self.target_hidden = np.concatenate(chunks, axis=0) if chunks else hidden[:0]
+            return
+
+        raise ValueError(
+            "Cannot filter DFlash target_hidden with an unknown row layout: "
+            f"hidden_rows={hidden_rows}, batch_size={old_bs}, "
+            f"block_size={self.block_size}, committed_rows={compact_rows}."
         )
 
     def resolve_pending_draft_extend_result(self):
@@ -207,6 +248,8 @@ class DFlashDraftInput:
         block_size = self.block_size
         page_size = schedule_batch.token_to_kv_pool_allocator.page_size
 
+        self._align_dp_state_to_reqs(schedule_batch)
+
         for dp_rank, info in enumerate(schedule_batch.reqs_info):
             if info.seq_lens is None or len(info.seq_lens) == 0:
                 continue
@@ -215,7 +258,6 @@ class DFlashDraftInput:
 
             old_r = np.asarray([req.kv_allocated_len for req in reqs], dtype=np.int32)
             committed_r = np.asarray([req.kv_committed_len for req in reqs], dtype=np.int32)
-            self._align_to_reqs(reqs, committed_r)
             new_r = np.maximum(old_r, committed_r + block_size)
             ext_r = int((new_r - old_r).sum())
 
@@ -266,6 +308,54 @@ class DFlashDraftInput:
                 req.kv_committed_len += 1
 
             info.seq_lens_sum = np.sum(info.seq_lens).item()
+
+    def _align_dp_state_to_reqs(self, schedule_batch) -> None:
+        """Align each rank's state independently, then rebuild rank-major state."""
+        rank_states = []
+        for info in schedule_batch.reqs_info:
+            reqs = info.reqs or []
+            if not reqs:
+                continue
+
+            rank_state = info.spec_info
+            if not isinstance(rank_state, DFlashDraftInput):
+                rank_state = DFlashDraftInput(
+                    verified_id=np.empty((0,), dtype=np.int32),
+                    target_hidden=None,
+                    ctx_lens=np.empty((0,), dtype=np.int32),
+                    draft_seq_lens=np.empty((0,), dtype=np.int32),
+                    block_size=self.block_size,
+                )
+            committed_lens = np.asarray([req.kv_committed_len for req in reqs], dtype=np.int32)
+            rank_state._align_to_reqs(reqs, committed_lens)
+            rank_states.append(rank_state)
+
+        if not rank_states:
+            self.verified_id = np.empty((0,), dtype=np.int32)
+            self.ctx_lens = np.empty((0,), dtype=np.int32)
+            self.draft_seq_lens = np.empty((0,), dtype=np.int32)
+            self.target_hidden = None
+            return
+
+        self.verified_id = np.concatenate(
+            [np.asarray(state.verified_id, dtype=np.int32) for state in rank_states]
+        )
+        self.ctx_lens = np.concatenate(
+            [np.asarray(state.ctx_lens, dtype=np.int32) for state in rank_states]
+        )
+        self.draft_seq_lens = np.concatenate(
+            [np.asarray(state.draft_seq_lens, dtype=np.int32) for state in rank_states]
+        )
+
+        hidden_parts = [state.target_hidden for state in rank_states]
+        if all(hidden is None for hidden in hidden_parts):
+            self.target_hidden = None
+        elif all(hidden is not None and hidden.shape[0] == 0 for hidden in hidden_parts):
+            self.target_hidden = hidden_parts[0][:0]
+        else:
+            raise ValueError(
+                "DFLASH target_hidden must be materialized before DP decode preparation."
+            )
 
     def _align_to_reqs(self, reqs, committed_lens: np.ndarray) -> None:
         state_bs = int(np.asarray(self.draft_seq_lens, dtype=np.int32).shape[0])

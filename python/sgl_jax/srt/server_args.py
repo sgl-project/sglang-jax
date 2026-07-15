@@ -1812,8 +1812,6 @@ class ServerArgs:
         if self.speculative_algorithm == "DFLASH":
             if not self.disable_overlap_schedule:
                 raise ValueError("DFLASH speculative decoding requires --disable-overlap-schedule.")
-            if self.dp_size != 1:
-                raise ValueError("DFLASH stage2 requires --dp-size=1.")
             if self.tp_size < 1:
                 raise ValueError("DFLASH requires --tp-size>=1.")
             if self.speculative_eagle_topk != 1:

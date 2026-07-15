@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 
 
 class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
-    """DFlash draft/verify runtime worker (greedy, dp_size=1)."""
+    """DFlash draft/verify runtime worker (greedy, DP/TP aware)."""
 
     _requires_allocate_lens = False
     _force_greedy_prefill = True
@@ -172,7 +172,6 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             draft_seq_lens=extend_prefix_lens,
             block_size=self.block_size,
         )
-        # @haifeng Need modify
         self._append_target_hidden_to_draft_kv(model_worker_batch, draft_input, is_prefill=True)
         model_worker_batch.spec_info_padded = draft_input
 
@@ -189,7 +188,36 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             next_draft_input,
             is_prefill=False,
         )
+        self._compact_dflash_state_to_real_slots(
+            next_draft_input,
+            model_worker_batch.logits_indices_selector,
+        )
         model_worker_batch.spec_info_padded = next_draft_input
+
+    @staticmethod
+    def _compact_dflash_state_to_real_slots(
+        draft_input: DFlashDraftInput,
+        selector: np.ndarray,
+    ) -> None:
+        """Remove per-DP padding before publishing cross-round host state.
+
+        ``ScheduleBatch._split_spec_info_per_rank`` consumes a compact
+        rank-major state, while target verify runs on DP-padded slots. Keep
+        ``new_seq_lens`` padded because the scheduler uses it immediately to
+        advance each rank's request lengths.
+        """
+        selector = np.asarray(selector, dtype=np.int32)
+        for field in ("verified_id", "ctx_lens", "draft_seq_lens"):
+            value = getattr(draft_input, field, None)
+            if value is None:
+                continue
+            value = np.asarray(value, dtype=np.int32)
+            if selector.size and int(selector.max()) >= value.shape[0]:
+                raise ValueError(
+                    "DFLASH state selector is out of bounds: "
+                    f"field={field}, shape={value.shape}, selector={selector}."
+                )
+            setattr(draft_input, field, value[selector])
 
     def draft(self, model_worker_batch: ModelWorkerBatch) -> None:
         """Build one fixed-size DFlash proposal block."""
@@ -310,7 +338,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         model_def = runner._model_def
         model_state_def = runner._model_state_def
         draft_token_num = self.block_size
-        token_sharding = NamedSharding(runner.mesh, P(None))
+        token_sharding = NamedSharding(runner.mesh, P("data"))
 
         @_partial(
             jax.jit,
@@ -578,7 +606,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         vocab_size = self._lm_head_vocab_size()
         embedding_sharding = NamedSharding(runner.mesh, P("data", "tensor"))
         logits_sharding = NamedSharding(runner.mesh, P("data", "tensor"))
-        token_sharding = NamedSharding(runner.mesh, P(None))
+        token_sharding = NamedSharding(runner.mesh, P("data"))
 
         @_partial(
             jax.jit,
@@ -747,12 +775,9 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             return
 
         if is_prefill:
-            cache_loc = self._committed_cache_loc(model_worker_batch, draft_input, is_prefill)
-            positions = self._committed_positions(draft_input, is_prefill)
-            positions, cache_loc = self._pad_prefill_draft_extend_inputs(
+            positions, cache_loc = self._prefill_draft_extend_metadata(
+                model_worker_batch,
                 target_hidden,
-                positions,
-                cache_loc,
             )
         else:
             cache_loc, positions = self._committed_decode_row_padded_cache_loc_positions(
@@ -766,7 +791,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         )
         draft_input.draft_seq_lens = (starts + lengths).astype(np.int32)
         draft_input.ctx_lens = np.zeros_like(np.asarray(draft_input.ctx_lens, dtype=np.int32))
-        draft_input.target_hidden = None if not is_prefill else target_hidden[:0]
+        draft_input.target_hidden = None
 
     def _run_jit_draft_extend(self, target_hidden, positions, cache_loc):
         import jax._src.test_util as jtu
@@ -792,10 +817,15 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             pool.kv_buffer[i] = buf
 
     @staticmethod
-    def _pad_prefill_draft_extend_inputs(target_hidden, positions, cache_loc):
-        """Pad host metadata to the target-prefill token bucket."""
-        positions = np.asarray(positions, dtype=np.int32).reshape(-1)
-        cache_loc = np.asarray(cache_loc, dtype=np.int32).reshape(-1)
+    def _prefill_draft_extend_metadata(model_worker_batch, target_hidden):
+        """Reuse target-prefill's DP-segmented token metadata.
+
+        Target hidden rows use ``[rank0 tokens + pad | rank1 tokens + pad | ...]``.
+        Reusing the matching positions/out-cache buffers preserves those rank
+        boundaries for the ``P("data")`` KV materialization JIT.
+        """
+        positions = np.asarray(model_worker_batch.positions, dtype=np.int32).reshape(-1)
+        cache_loc = np.asarray(model_worker_batch.out_cache_loc, dtype=np.int32).reshape(-1)
         if positions.shape != cache_loc.shape:
             raise ValueError(
                 "DFLASH prefill positions/cache_loc shape mismatch: "
@@ -803,36 +833,13 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             )
 
         bucket_tokens = int(target_hidden.shape[0])
-        real_tokens = int(positions.shape[0])
-        if real_tokens > bucket_tokens:
+        metadata_tokens = int(positions.shape[0])
+        if metadata_tokens != bucket_tokens:
             raise ValueError(
-                "DFLASH prefill metadata exceeds target hidden bucket: "
-                f"real_tokens={real_tokens}, bucket_tokens={bucket_tokens}."
+                "DFLASH prefill metadata must match the target hidden bucket: "
+                f"metadata_tokens={metadata_tokens}, bucket_tokens={bucket_tokens}."
             )
-        if real_tokens == bucket_tokens:
-            return positions, cache_loc
-
-        padded_positions = np.zeros(bucket_tokens, dtype=np.int32)
-        padded_cache_loc = np.full(bucket_tokens, -1, dtype=np.int32)
-        padded_positions[:real_tokens] = positions
-        padded_cache_loc[:real_tokens] = cache_loc
-        return padded_positions, padded_cache_loc
-
-    def _committed_cache_loc(self, model_worker_batch, draft_input, is_prefill):
-        """Flat cache_loc for the committed tokens, read from req_to_token_pool."""
-        req_to_token = self.draft_model_runner.req_to_token_pool.req_to_token
-        req_pool_indices = np.asarray(model_worker_batch.req_pool_indices, dtype=np.int64)
-        starts, lengths = compute_new_kv_slices(
-            draft_input.ctx_lens, draft_input.draft_seq_lens, is_prefill
-        )
-        locs = []
-        for rp, start, n in zip(req_pool_indices, starts, lengths):
-            if n <= 0:
-                continue
-            locs.append(np.asarray(req_to_token[rp, start : start + n]))
-        if not locs:
-            return np.zeros((0,), dtype=np.int32)
-        return np.concatenate(locs).astype(np.int32)
+        return positions, cache_loc
 
     def _committed_decode_row_padded_cache_loc_positions(self, model_worker_batch, draft_input):
         """Decode KV write layout aligned with target verify hidden rows.
@@ -881,19 +888,6 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             mask[start:end] = True
         return mask
 
-    def _committed_positions(self, draft_input, is_prefill):
-        starts, lengths = compute_new_kv_slices(
-            draft_input.ctx_lens, draft_input.draft_seq_lens, is_prefill
-        )
-        pos = []
-        for start, n in zip(starts, lengths):
-            if n <= 0:
-                continue
-            pos.append(np.arange(start, start + n, dtype=np.int32))
-        if not pos:
-            return np.zeros((0,), dtype=np.int32)
-        return np.concatenate(pos).astype(np.int32)
-
     def _lm_head_vocab_size(self) -> int:
         # Unit tests instantiate this class via __new__; avoid __getattr__ fallback there.
         return int(self.__dict__.get("_target_vocab_size", self._target_lm_head.shape[0]))
@@ -905,7 +899,25 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         out_cache_loc = np.asarray(mwb.out_cache_loc, dtype=np.int32)
         locs = []
         kv_lens = []
-        ocl_offset = 0
+        dp_size = int(getattr(mwb, "dp_size", 1))
+        per_dp_bs = int(getattr(mwb, "per_dp_bs_size", bs))
+        if dp_size * per_dp_bs != bs:
+            raise ValueError(
+                "DFLASH verify batch has inconsistent DP metadata: "
+                f"dp_size={dp_size}, per_dp_bs={per_dp_bs}, bs={bs}."
+            )
+        if out_cache_loc.shape[0] % dp_size != 0:
+            raise ValueError(
+                "DFLASH verify out_cache_loc is not DP-segmented: "
+                f"shape={out_cache_loc.shape}, dp_size={dp_size}."
+            )
+        per_dp_ocl = out_cache_loc.shape[0] // dp_size
+        required_per_dp = per_dp_bs * self.block_size
+        if per_dp_ocl < required_per_dp:
+            raise ValueError(
+                "DFLASH verify out_cache_loc rank section is too short: "
+                f"per_dp_ocl={per_dp_ocl}, required={required_per_dp}."
+            )
         for i in range(bs):
             sl = int(prefix_lens[i])
             rp = int(req_pool_indices[i])
@@ -914,10 +926,11 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             else:
                 prefix_locs = np.empty(0, dtype=np.int32)
             n_verify = self.block_size
+            dp_rank, local_slot = divmod(i, per_dp_bs)
+            ocl_offset = dp_rank * per_dp_ocl + local_slot * n_verify
             verify_locs = out_cache_loc[ocl_offset : ocl_offset + n_verify]
             locs.append(np.concatenate([prefix_locs, verify_locs]))
             kv_lens.append(sl + n_verify)
-            ocl_offset += n_verify
         mwb.cache_loc = self._pack_kv_cache(locs, kv_lens)
 
     def _pack_kv_cache(self, rows: list[np.ndarray], kv_lens: list[int]) -> np.ndarray:
@@ -952,11 +965,20 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
     def run_spec_decode_precompile(self):
         self._precompile_dflash_prefill()
         manager = self.target_worker.compilation_manager
+        dp_size = int(manager.dp_size)
         bs_buckets = [
-            int(bs) for bs in manager.bs_buckets if int(bs) > 0 and int(bs) & (int(bs) - 1) == 0
+            int(bs)
+            for bs in manager.bs_buckets
+            if int(bs) >= dp_size and int(bs) % dp_size == 0 and int(bs) & (int(bs) - 1) == 0
         ]
         if not bs_buckets:
-            bs_buckets = [int(manager.max_padded_batch_size)]
+            max_bs = int(manager.max_padded_batch_size)
+            if max_bs % dp_size != 0:
+                raise ValueError(
+                    "DFLASH precompile batch size must be divisible by dp_size: "
+                    f"max_padded_batch_size={max_bs}, dp_size={dp_size}."
+                )
+            bs_buckets = [max_bs]
 
         logger.info(
             "[DFLASH] Precompiling one fixed-page variant per bs: bs=%s, page_indices_capacity=%s",
@@ -1043,7 +1065,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         draft_token = self._run_jit_draft_block(forward_batch, None)
 
         # Match the serving dependency and sharding exactly: target verify
-        # consumes the P(None)-replicated proposal produced by jit_draft.
+        # consumes the P("data") proposal produced by jit_draft.
         target_batch = self._make_verify_dummy_batch(bs, row_width)
         target_batch.spec_info_padded.draft_token = draft_token
         target_metadata = self.target_worker.model_runner.attn_backend.get_eagle_forward_metadata(
@@ -1058,14 +1080,40 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         self._run_jit_draft_extend(
             logits_output.hidden_states,
             target_batch.positions,
-            target_batch.out_cache_loc[: bs * self.block_size],
+            self._verify_write_cache_loc(target_batch),
         )
+
+    def _verify_write_cache_loc(self, batch: ModelWorkerBatch) -> np.ndarray:
+        """Select the verify-token half from each DP rank's reserved slots."""
+        dp_size = int(batch.dp_size)
+        per_dp_tokens = int(batch.per_dp_bs_size) * self.block_size
+        out_cache_loc = np.asarray(batch.out_cache_loc, dtype=np.int32)
+        if out_cache_loc.shape[0] % dp_size != 0:
+            raise ValueError(
+                "DFLASH verify out_cache_loc is not divisible by dp_size: "
+                f"shape={out_cache_loc.shape}, dp_size={dp_size}."
+            )
+        per_dp_ocl = out_cache_loc.shape[0] // dp_size
+        if per_dp_ocl < per_dp_tokens:
+            raise ValueError(
+                "DFLASH verify out_cache_loc rank section is too short: "
+                f"per_dp_ocl={per_dp_ocl}, verify_tokens={per_dp_tokens}."
+            )
+        return out_cache_loc.reshape(dp_size, per_dp_ocl)[:, :per_dp_tokens].reshape(-1)
 
     def _make_verify_dummy_batch(
         self, bs: int, row_width: int, is_draft: bool = False
     ) -> ModelWorkerBatch:
         block_size = self.block_size
         num_tokens = bs * block_size
+        dp_size = int(self.target_worker.compilation_manager.dp_size)
+        if bs % dp_size != 0:
+            raise ValueError(
+                "DFLASH verify dummy batch must be divisible by dp_size: "
+                f"bs={bs}, dp_size={dp_size}."
+            )
+        per_dp_bs = bs // dp_size
+        per_dp_tokens = per_dp_bs * block_size
         kv_len = min(row_width, self.target_worker.compilation_manager.max_req_len)
         prefix_len = max(0, kv_len - block_size)
         positions = np.tile(np.arange(prefix_len, prefix_len + block_size, dtype=np.int32), bs)
@@ -1075,8 +1123,8 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             ForwardMode.TARGET_VERIFY,
             bs * row_width,
             speculative_algorithm=SpeculativeAlgorithm.DFLASH,
-            dp_size=1,
-            per_dp_bs_size=bs,
+            dp_size=dp_size,
+            per_dp_bs_size=per_dp_bs,
         )
         capture_hidden = CaptureHiddenMode.NULL if is_draft else CaptureHiddenMode.FULL
         batch.input_ids = np.ones(num_tokens, dtype=np.int32)
@@ -1084,8 +1132,17 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         batch.seq_lens = np.full(bs, prefix_len, dtype=np.int32)
         batch.out_cache_loc = np.concatenate(
             [
-                np.arange(1, num_tokens + 1, dtype=np.int32),
-                np.full(num_tokens, -1, dtype=np.int32),
+                np.concatenate(
+                    [
+                        np.arange(
+                            dp_rank * per_dp_tokens + 1,
+                            (dp_rank + 1) * per_dp_tokens + 1,
+                            dtype=np.int32,
+                        ),
+                        np.full(per_dp_tokens, -1, dtype=np.int32),
+                    ]
+                )
+                for dp_rank in range(dp_size)
             ]
         )
         batch.positions = positions

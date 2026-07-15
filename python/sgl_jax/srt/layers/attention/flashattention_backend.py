@@ -43,6 +43,7 @@ def _repack_row_padded_page_indices(
     page_size: int,
     dp_size: int,
     per_dp_bs: int,
+    fixed_capacity: int | None = None,
 ) -> np.ndarray:
     """Repack row-padded cache_loc into cu_kv_lens-aligned page_indices.
 
@@ -72,8 +73,9 @@ def _repack_row_padded_page_indices(
     if row_width % page_size != 0:
         raise ValueError(f"row_width={row_width} must be divisible by page_size={page_size}")
 
-    parts: list[np.ndarray] = []
+    rank_chunks: list[np.ndarray] = []
     for r in range(dp_size):
+        parts: list[np.ndarray] = []
         for j in range(per_dp_bs):
             slot = r * per_dp_bs + j
             valid_len = int(aligned_seq_lens[slot])
@@ -87,8 +89,34 @@ def _repack_row_padded_page_indices(
             row_start = slot * row_width
             row_pages = cache_loc[row_start : row_start + valid_len : page_size]
             parts.append((row_pages // page_size).astype(np.int32))
+        rank_chunks.append(np.concatenate(parts) if parts else np.empty((0,), dtype=np.int32))
 
-    return np.concatenate(parts) if parts else np.empty(0, dtype=np.int32)
+    if fixed_capacity is not None:
+        fixed_capacity = int(fixed_capacity)
+        if fixed_capacity % dp_size != 0:
+            raise ValueError(
+                "DFlash page_indices capacity must be divisible by dp_size: "
+                f"capacity={fixed_capacity}, dp_size={dp_size}."
+            )
+        per_rank_capacity = fixed_capacity // dp_size
+    else:
+        per_rank_capacity = max((len(chunk) for chunk in rank_chunks), default=0)
+
+    for r, chunk in enumerate(rank_chunks):
+        if len(chunk) > per_rank_capacity:
+            raise ValueError(
+                "DFlash page_indices exceed the per-rank capacity: "
+                f"rank={r}, required={len(chunk)}, capacity={per_rank_capacity}."
+            )
+
+    if per_rank_capacity == 0:
+        return np.empty((0,), dtype=np.int32)
+    return np.concatenate(
+        [
+            np.pad(chunk, (0, per_rank_capacity - len(chunk)), constant_values=0)
+            for chunk in rank_chunks
+        ]
+    ).astype(np.int32)
 
 
 def _pad_page_indices(
@@ -377,7 +405,13 @@ class FlashAttention(AttentionBackend):
                     page_size=self.page_size,
                     dp_size=dp_size,
                     per_dp_bs=per_dp_bs,
+                    fixed_capacity=page_indices_capacity,
                 )
+                # The helper has already padded every DP rank to an equal
+                # section. Avoid appending padding only at the global tail,
+                # which would move rank boundaries when sharded by data.
+                if page_indices_capacity is None:
+                    page_indices_capacity = len(page_indices)
         else:
             aligned_seq_lens = (
                 (batch.seq_lens + self.page_size - 1) // self.page_size
