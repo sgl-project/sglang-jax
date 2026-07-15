@@ -11,20 +11,19 @@ from jax.sharding import PartitionSpec as P
 from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig
-from sgl_jax.srt.layers.embeddings import RotaryEmbedding
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
-from sgl_jax.srt.layers.radix_attention import AttentionType, RadixAttention
+from sgl_jax.srt.layers.radix_attention import AttentionType
 from sgl_jax.srt.mem_cache.memory_pool import KVCache, MemoryPools
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
-from sgl_jax.srt.utils.profiling_utils import named_scope
+from sgl_jax.srt.models.qwen3 import QWen3Attention, Qwen3MLP
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
 
 
-class DFlashAttention(nnx.Module):
+class DFlashAttention(QWen3Attention):
     def __init__(
         self,
         config: PretrainedConfig,
@@ -32,119 +31,21 @@ class DFlashAttention(nnx.Module):
         layer_id: int = 0,
         dtype: jnp.dtype = jnp.bfloat16,
     ):
-        self.layer_id = layer_id
-        self.hidden_size = int(config.hidden_size)
-        self.head_dim = int(
-            getattr(config, "head_dim", self.hidden_size // config.num_attention_heads)
-        )
-        self.q_head_num = int(config.num_attention_heads)
-        self.kv_head_num = int(getattr(config, "num_key_value_heads", self.q_head_num))
-        self.q_size = self.q_head_num * self.head_dim
-        self.kv_size = self.kv_head_num * self.head_dim
-        self.scaling = self.head_dim**-0.5
-        self.mesh = mesh
-
-        attention_bias = bool(getattr(config, "attention_bias", False))
-        rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-6))
-
-        self.q_norm = RMSNorm(
-            self.head_dim, epsilon=rms_norm_eps, param_dtype=dtype, scope_name="q_norm"
-        )
-        self.k_norm = RMSNorm(
-            self.head_dim, epsilon=rms_norm_eps, param_dtype=dtype, scope_name="k_norm"
-        )
-
-        self.q_proj = LinearBase(
-            input_size=self.hidden_size,
-            output_size=self.q_size,
-            use_bias=attention_bias,
-            kernel_axes=(None, "tensor"),
-            params_dtype=dtype,
-            mesh=mesh,
-            scope_name="q_proj",
-        )
-        self.k_proj = LinearBase(
-            input_size=self.hidden_size,
-            output_size=self.kv_size,
-            use_bias=attention_bias,
-            kernel_axes=(None, "tensor"),
-            params_dtype=dtype,
-            mesh=mesh,
-            scope_name="k_proj",
-        )
-        self.v_proj = LinearBase(
-            input_size=self.hidden_size,
-            output_size=self.kv_size,
-            use_bias=attention_bias,
-            kernel_axes=(None, "tensor"),
-            params_dtype=dtype,
-            mesh=mesh,
-            scope_name="v_proj",
-        )
-        self.o_proj = LinearBase(
-            input_size=self.q_size,
-            output_size=self.hidden_size,
-            use_bias=attention_bias,
-            kernel_axes=("tensor", None),
-            params_dtype=dtype,
-            mesh=mesh,
-            scope_name="o_proj",
-        )
-
-        self.rotary_emb = RotaryEmbedding(
-            head_size=self.head_dim,
-            rotary_dim=self.head_dim,
+        super().__init__(
+            hidden_size=int(config.hidden_size),
+            num_heads=int(config.num_attention_heads),
+            num_kv_heads=int(getattr(config, "num_key_value_heads", config.num_attention_heads)),
             max_position_embeddings=int(getattr(config, "max_position_embeddings", 32768)),
-            base=float(getattr(config, "rope_theta", 1000000)),
-            is_neox_style=True,
-            dtype=dtype,
-        )
-        self.attn = RadixAttention(
-            num_heads=self.q_head_num,
-            head_dim=self.head_dim,
-            scaling=self.scaling,
-            num_kv_heads=self.kv_head_num,
+            rope_theta=float(getattr(config, "rope_theta", 1000000)),
+            rope_scaling=getattr(config, "rope_scaling", None),
+            head_dim=getattr(config, "head_dim", None),
+            rms_norm_eps=float(getattr(config, "rms_norm_eps", 1e-6)),
             layer_id=layer_id,
-            attn_type=AttentionType.ENCODER_ONLY,
+            attention_bias=bool(getattr(config, "attention_bias", False)),
+            dtype=dtype,
+            mesh=mesh,
         )
-
-    @named_scope
-    def __call__(
-        self,
-        positions: jax.Array,
-        hidden_states: jax.Array,
-        forward_batch: ForwardBatch,
-        token_to_kv_pool: KVCache,
-    ) -> tuple[jax.Array, jax.Array]:
-        q, _ = self.q_proj(hidden_states)
-        k, _ = self.k_proj(hidden_states)
-        v, _ = self.v_proj(hidden_states)
-
-        q = q.reshape(
-            -1,
-            self.q_head_num,
-            self.head_dim,
-            out_sharding=NamedSharding(self.mesh, P("data", "tensor", None)),
-        )
-        k = k.reshape(
-            -1,
-            self.kv_head_num,
-            self.head_dim,
-            out_sharding=NamedSharding(self.mesh, P("data", "tensor", None)),
-        )
-        v = v.reshape(
-            -1,
-            self.kv_head_num,
-            self.head_dim,
-            out_sharding=NamedSharding(self.mesh, P("data", "tensor", None)),
-        )
-
-        q = self.q_norm(q)
-        k = self.k_norm(k)
-        q, k = self.rotary_emb(positions, q, k)
-        attn_output, kv_fused = self.attn(q, k, v, forward_batch, token_to_kv_pool)
-        output, _ = self.o_proj(attn_output)
-        return output, kv_fused
+        self.attn.attn_type = AttentionType.ENCODER_ONLY
 
     def kv_proj(
         self, positions: jax.Array, hidden_states: jax.Array
@@ -171,56 +72,6 @@ class DFlashAttention(nnx.Module):
         return k, v
 
 
-class DFlashMLP(nnx.Module):
-    def __init__(
-        self,
-        config: PretrainedConfig,
-        mesh: jax.sharding.Mesh,
-        layer_id: int = 0,
-        dtype: jnp.dtype = jnp.bfloat16,
-    ) -> None:
-        self.layer_id = layer_id
-        hidden_size = int(config.hidden_size)
-        intermediate_size = int(config.intermediate_size)
-
-        self.gate_proj = LinearBase(
-            input_size=hidden_size,
-            output_size=intermediate_size,
-            kernel_axes=(None, "tensor"),
-            use_bias=False,
-            params_dtype=dtype,
-            mesh=mesh,
-            scope_name="gate_proj",
-        )
-        self.up_proj = LinearBase(
-            input_size=hidden_size,
-            output_size=intermediate_size,
-            kernel_axes=(None, "tensor"),
-            use_bias=False,
-            params_dtype=dtype,
-            mesh=mesh,
-            scope_name="up_proj",
-        )
-        self.down_proj = LinearBase(
-            input_size=intermediate_size,
-            output_size=hidden_size,
-            kernel_axes=("tensor", None),
-            use_bias=False,
-            params_dtype=dtype,
-            mesh=mesh,
-            scope_name="down_proj",
-        )
-        self.act_fn = jax.nn.silu
-
-    @named_scope
-    def __call__(self, hidden_states: jax.Array) -> jax.Array:
-        gate, _ = self.gate_proj(hidden_states)
-        up, _ = self.up_proj(hidden_states)
-        hidden_states = self.act_fn(gate) * up
-        hidden_states, _ = self.down_proj(hidden_states)
-        return hidden_states
-
-
 class DFlashDecoderLayer(nnx.Module):
     def __init__(
         self,
@@ -245,7 +96,13 @@ class DFlashDecoderLayer(nnx.Module):
             param_dtype=dtype,
             scope_name="post_attention_layernorm",
         )
-        self.mlp = DFlashMLP(config=config, mesh=mesh, layer_id=layer_id, dtype=dtype)
+        self.mlp = Qwen3MLP(
+            hidden_size=hidden_size,
+            intermediate_size=int(config.intermediate_size),
+            mesh=mesh,
+            layer_id=layer_id,
+            dtype=dtype,
+        )
 
     def __call__(
         self,
