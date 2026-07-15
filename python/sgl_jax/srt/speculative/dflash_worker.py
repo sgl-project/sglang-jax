@@ -749,6 +749,11 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         if is_prefill:
             cache_loc = self._committed_cache_loc(model_worker_batch, draft_input, is_prefill)
             positions = self._committed_positions(draft_input, is_prefill)
+            positions, cache_loc = self._pad_prefill_draft_extend_inputs(
+                target_hidden,
+                positions,
+                cache_loc,
+            )
         else:
             cache_loc, positions = self._committed_decode_row_padded_cache_loc_positions(
                 model_worker_batch, draft_input
@@ -764,16 +769,54 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         draft_input.target_hidden = None if not is_prefill else target_hidden[:0]
 
     def _run_jit_draft_extend(self, target_hidden, positions, cache_loc):
+        import jax._src.test_util as jtu
+
         pool = self.draft_model_runner.token_to_kv_pool
-        new_buffers = self._jit_materialize_write(
-            self.draft_model_runner.model_state_leaves,
-            jnp.asarray(target_hidden),
-            jnp.asarray(positions),
-            jnp.asarray(cache_loc),
-            list(pool.kv_buffer[: self.draft_layers]),
-        )
+        with jtu.count_pjit_cpp_cache_miss() as count:
+            new_buffers = self._jit_materialize_write(
+                self.draft_model_runner.model_state_leaves,
+                jnp.asarray(target_hidden),
+                jnp.asarray(positions),
+                jnp.asarray(cache_loc),
+                list(pool.kv_buffer[: self.draft_layers]),
+            )
+        cache_miss_count = count()
+        if cache_miss_count:
+            logger.info(
+                "[DFLASH] jit_draft_extend cache miss: hidden=%s positions=%s cache_loc=%s",
+                target_hidden.shape,
+                positions.shape,
+                cache_loc.shape,
+            )
         for i, buf in enumerate(new_buffers):
             pool.kv_buffer[i] = buf
+
+    @staticmethod
+    def _pad_prefill_draft_extend_inputs(target_hidden, positions, cache_loc):
+        """Pad host metadata to the target-prefill token bucket."""
+        positions = np.asarray(positions, dtype=np.int32).reshape(-1)
+        cache_loc = np.asarray(cache_loc, dtype=np.int32).reshape(-1)
+        if positions.shape != cache_loc.shape:
+            raise ValueError(
+                "DFLASH prefill positions/cache_loc shape mismatch: "
+                f"{positions.shape} vs {cache_loc.shape}."
+            )
+
+        bucket_tokens = int(target_hidden.shape[0])
+        real_tokens = int(positions.shape[0])
+        if real_tokens > bucket_tokens:
+            raise ValueError(
+                "DFLASH prefill metadata exceeds target hidden bucket: "
+                f"real_tokens={real_tokens}, bucket_tokens={bucket_tokens}."
+            )
+        if real_tokens == bucket_tokens:
+            return positions, cache_loc
+
+        padded_positions = np.zeros(bucket_tokens, dtype=np.int32)
+        padded_cache_loc = np.full(bucket_tokens, -1, dtype=np.int32)
+        padded_positions[:real_tokens] = positions
+        padded_cache_loc[:real_tokens] = cache_loc
+        return padded_positions, padded_cache_loc
 
     def _committed_cache_loc(self, model_worker_batch, draft_input, is_prefill):
         """Flat cache_loc for the committed tokens, read from req_to_token_pool."""

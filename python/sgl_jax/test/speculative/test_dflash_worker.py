@@ -67,6 +67,38 @@ def test_committed_cache_loc_reads_req_to_token():
     np.testing.assert_array_equal(locs, np.array([22, 23, 61], dtype=np.int32))
 
 
+def test_pad_prefill_draft_extend_inputs_uses_target_token_bucket():
+    target_hidden = np.zeros((8, 16), dtype=np.float32)
+    positions = np.array([5, 6, 7], dtype=np.int32)
+    cache_loc = np.array([20, 21, 22], dtype=np.int32)
+
+    padded_positions, padded_cache_loc = DFlashWorker._pad_prefill_draft_extend_inputs(
+        target_hidden,
+        positions,
+        cache_loc,
+    )
+
+    np.testing.assert_array_equal(
+        padded_positions,
+        np.array([5, 6, 7, 0, 0, 0, 0, 0], dtype=np.int32),
+    )
+    np.testing.assert_array_equal(
+        padded_cache_loc,
+        np.array([20, 21, 22, -1, -1, -1, -1, -1], dtype=np.int32),
+    )
+
+
+def test_pad_prefill_draft_extend_inputs_rejects_bucket_overflow():
+    target_hidden = np.zeros((2, 16), dtype=np.float32)
+
+    with np.testing.assert_raises_regex(ValueError, "exceeds target hidden bucket"):
+        DFlashWorker._pad_prefill_draft_extend_inputs(
+            target_hidden,
+            np.array([0, 1, 2], dtype=np.int32),
+            np.array([10, 11, 12], dtype=np.int32),
+        )
+
+
 def test_committed_decode_row_padded_cache_loc_positions():
     req_to_token = np.arange(100, dtype=np.int32).reshape(5, 20)
     draft_model_runner = SimpleNamespace(
