@@ -73,7 +73,10 @@ class ModelWorker:
         # Parse args
         self.tp_size = server_args.tp_size
         self.dp_size = server_args.dp_size
-        self._pd_fuse_sample = os.getenv("SGLANG_PD_FUSE_SAMPLE") == "1"
+        self._pd_fuse_sample = (
+            server_args.pd_disaggregation == "pathways"
+            and os.getenv("SGLANG_PD_FUSE_SAMPLE") == "1"
+        )
         from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
@@ -268,11 +271,11 @@ class ModelWorker:
             page_size=self.page_size,
             max_req_len=self.max_req_len,
             vocab_size=self.model_config.vocab_size,
-            # cache_loc bucket cap only under Pathways proxy: it saves ~25ms/tick
-            # gRPC H2D there, but on native TPU the smaller/odd bucket shape
-            # (page_indices ~554 vs 81920) yields a slower Pallas ragged-attention
-            # kernel (-6% input_throughput on v6e-1 CI). Native H2D is fast enough
-            # that the uncapped bucket is not on the critical path.
+            # cache_loc bucket cap under Pathways proxy backend (PD or colocated
+            # alike -- both do H2D over gRPC where the smaller bucket helps). On
+            # native TPU the smaller/odd bucket shape yields a slower Pallas
+            # ragged-attention kernel and native H2D is fast enough that the
+            # uncapped bucket is not on the critical path.
             max_total_num_tokens=(
                 self.max_total_num_tokens if os.getenv("JAX_PLATFORMS") == "proxy" else 0
             ),

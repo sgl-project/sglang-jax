@@ -89,9 +89,12 @@ class PathwaysPDSchedulerMixin:
             # both p_mesh world_size and num_experts; default = keep D's
             # ep/tp ratio (pure-EP stays pure-EP on the bigger P slice).
             p_args.tp_size = self._pd_tp_p
-            p_args.ep_size = server_args.pd_prefill_ep_size or (
-                server_args.ep_size * self._pd_tp_p // self.tp_size
+            p_args.ep_size = server_args.pd_prefill_ep_size or max(
+                1, server_args.ep_size * self._pd_tp_p // self.tp_size
             )
+            assert (
+                p_args.tp_size % p_args.ep_size == 0
+            ), f"derived P ep_size={p_args.ep_size} must divide P tp_size={p_args.tp_size}; set --pd-prefill-ep-size explicitly"
             logger.info(
                 "[pathways_pd] hetero-tp P: tp=%d ep=%d (D: tp=%d ep=%d)",
                 p_args.tp_size,

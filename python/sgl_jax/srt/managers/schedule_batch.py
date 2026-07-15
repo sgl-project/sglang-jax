@@ -76,13 +76,13 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "speculative_accept_threshold_single",
     "speculative_accept_threshold_acc",
     "enable_deterministic_sampling",
+    "pd_disaggregation",
 ]
 
 PADDING_BUCKETS = [1 << i for i in range(6, 21)]
 
 # Put some global args for easy access
 global_server_args_dict = {k: getattr(ServerArgs, k) for k in GLOBAL_SERVER_ARGS_KEYS}
-_PD_PROXY = os.getenv("JAX_PLATFORMS") == "proxy"
 
 logger = logging.getLogger(__name__)
 
@@ -2469,9 +2469,11 @@ class ScheduleBatch:
         # (which re-enters this path on the SAME r2t and overwrites host_buf)
         # before batch N's make_array_from_callback H2D has necessarily
         # consumed the view -> batch N forward reads nxt's cache_loc and
-        # writes KV to wrong slots. Native/colocated has no concurrent stash
-        # so the view is consumed before any overwrite.
-        return cache_loc_cpu.copy() if _PD_PROXY else cache_loc_cpu
+        # writes KV to wrong slots. Native/colocated (single scheduler thread,
+        # no concurrent stash) consume the view before any overwrite.
+        if global_server_args_dict.get("pd_disaggregation") == "pathways":
+            return cache_loc_cpu.copy()
+        return cache_loc_cpu
 
     def _merge_sampling_info(
         self,
