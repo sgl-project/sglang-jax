@@ -277,10 +277,8 @@ def _make_pool_jits(p_mesh: Mesh, d_mesh: Mesh, p_sub, d_sub):
     functional no-op here but was NOT compile/dispatch-free on real TPU --
     a live 78-layer model showed gather (all layers in one XLA program,
     unlike scatter's per-layer calls) climbing 18s->37s and NOT plateauing
-    across repeat calls, vs <1s before shard_map existed.
-    Since dp_size==1 is 100% of production traffic today (dp>1 scheduler-
-    side wiring isn't done yet), skip shard_map entirely for that case and
-    reuse the exact pre-shard_map plain-jit body -- callers still always
+    across repeat calls, vs <1s before shard_map existed. So skip shard_map
+    entirely when dp==1 and reuse the plain-jit body -- callers still always
     pass [dp_size, n]-shaped idx/page (this fn just unwraps dim 0).
     """
     kv_spec = d_sub.kv_sharding.spec
