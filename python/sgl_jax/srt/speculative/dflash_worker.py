@@ -4,10 +4,9 @@ Scope: dp_size=1, disable_overlap_schedule, greedy-only.
 Ports the algorithmic structure of SGLang PyTorch PR 22077 to the sglang-jax
 scheduler/worker contract. See ``docs/design/dflash_stage_c.md``.
 
-The worker exposes the surface the scheduler needs
-(``speculative_num_draft_tokens``, ``forward_batch_speculative_generation``,
-``run_spec_decode_precompile``) and delegates everything else to the target
-worker via ``__getattr__``.
+The generic prefill -> draft -> verify -> draft-extend orchestration is owned by
+``BaseSpecWorker``. This module keeps only the DFlash-specific phase hooks and
+the three fused JIT boundaries.
 """
 
 from __future__ import annotations
@@ -29,6 +28,7 @@ from sgl_jax.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
+from sgl_jax.srt.speculative.base_worker import BaseDraftWorker, BaseSpecWorker
 from sgl_jax.srt.speculative.dflash_info import (
     DFlashDraftInput,
     DFlashVerifyInput,
@@ -45,19 +45,20 @@ from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 logger = logging.getLogger(__name__)
 
 
-class DFlashWorker:
+class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
     """DFlash draft/verify runtime worker (greedy, dp_size=1)."""
 
-    def __init__(self, server_args, target_worker: ModelWorker):
-        self.server_args = server_args
-        self.target_worker = target_worker
-        self.mesh = target_worker.mesh
-        self.page_size = server_args.page_size
-        self.device = server_args.device
+    _requires_allocate_lens = False
+    _force_greedy_prefill = True
 
-        self.speculative_num_draft_tokens = int(server_args.speculative_num_draft_tokens)
+    def __init__(self, server_args, target_worker: ModelWorker):
+        super().__init__(
+            server_args,
+            target_worker,
+            self,
+        )
+        self.device = server_args.device
         self.block_size = self.speculative_num_draft_tokens
-        self.speculative_num_steps = int(server_args.speculative_num_steps)
 
         # ---- Build the draft ModelWorker (shares the target req->token pool) ----
         # sglang-jax's ModelWorker does not accept a KV allocator; EAGLE only
@@ -65,7 +66,8 @@ class DFlashWorker:
         # allocator after construction so committed tokens land at the same
         # cache_loc in both target and draft KV pools (design decision:
         # "share allocator + independent KV buffer").
-        req_to_token_pool, target_allocator = target_worker.get_memory_pool()
+        req_to_token_pool = self.req_to_token_pool
+        target_allocator = self.token_to_kv_pool_allocator
 
         draft_server_args = copy.deepcopy(server_args)
         draft_server_args.skip_tokenizer_init = True
@@ -79,13 +81,12 @@ class DFlashWorker:
             is_draft_worker=True,
             model_class=DFlashDraftModel,
         )
-        self.draft_model_runner = self._worker.model_runner
+        self._draft_model_runner = self._worker.model_runner
         self.draft_model = self.draft_model_runner.model
 
         # Alias the KV allocator so draft block allocation draws from the same
         # free list the target uses (no collision with committed slots).
         self.draft_model_runner.token_to_kv_pool_allocator = target_allocator
-        self.token_to_kv_pool_allocator = target_allocator
 
         # ---- Borrow the target embedding + LM head (draft owns neither) ----
         target_model = target_worker.model_runner.model
@@ -128,46 +129,32 @@ class DFlashWorker:
             self.draft_layers,
         )
 
+    @property
+    def draft_model_runner(self):
+        return self._draft_model_runner
+
+    @draft_model_runner.setter
+    def draft_model_runner(self, value):
+        self._draft_model_runner = value
+
     # Delegate anything not implemented here to the target worker.
     def __getattr__(self, name):
-        # __getattr__ only fires for missing attributes; forward to target.
-        return getattr(self.target_worker, name)
+        target_worker = self.__dict__.get("_target_worker")
+        if target_worker is None:
+            raise AttributeError(name)
+        return getattr(target_worker, name)
 
-    # ------------------------------------------------------------------ #
-    # Scheduler entry point
-    # ------------------------------------------------------------------ #
-    def forward_batch_speculative_generation(
-        self, model_worker_batch: ModelWorkerBatch, launch_done=None
-    ):
-        if model_worker_batch.forward_mode.is_extend():
-            return self._forward_prefill(model_worker_batch)
-        return self._forward_decode(model_worker_batch)
+    def _prepare_overlap_sampling_info(self, model_worker_batch: ModelWorkerBatch):
+        # Stage 1 is non-overlap and greedy-only; no relay sampling state is used.
+        return
 
-    # ------------------------------------------------------------------ #
-    # Prefill: target forward (capture FULL) -> materialize draft KV
-    # ------------------------------------------------------------------ #
-    def _forward_prefill(self, model_worker_batch: ModelWorkerBatch):
-        from sgl_jax.srt.managers.scheduler import GenerationBatchResult
-        from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
-
-        model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
-
-        sampling_metadata = SamplingMetadata.from_model_worker_batch(
-            model_worker_batch,
-            len(model_worker_batch.seq_lens) - model_worker_batch.real_bs,
-            self.mesh,
-            vocab_size=self.target_worker.model_runner.model_config.vocab_size,
-        )
-        logits_output, _, cache_miss_count = self.target_worker.forward_batch_generation(
-            model_worker_batch,
-            sampling_metadata=sampling_metadata,
-            skip_sample=True,
-        )
-        next_token_ids = jnp.argmax(logits_output.next_token_logits, axis=-1).astype(jnp.int32)
-
-        # Aux hidden features for every prompt token: [sum(extend_seq_lens), K*H].
-        target_hidden = logits_output.hidden_states
-
+    def draft_extend_for_prefill(
+        self,
+        model_worker_batch: ModelWorkerBatch,
+        target_hidden,
+        next_token_ids,
+    ) -> None:
+        """Seed persistent draft KV from target prefill hidden states."""
         sel = np.asarray(model_worker_batch.logits_indices_selector)
         verified_id = np.asarray(jax.device_get(next_token_ids))[sel].astype(np.int32)
         extend_seq_lens = np.asarray(model_worker_batch.extend_seq_lens, dtype=np.int32)[sel]
@@ -181,26 +168,11 @@ class DFlashWorker:
             block_size=self.block_size,
         )
         # @haifeng Need modify
-        # Materialize prompt hidden into the draft KV pool at the committed slots.
         self._append_target_hidden_to_draft_kv(model_worker_batch, draft_input, is_prefill=True)
-
         model_worker_batch.spec_info_padded = draft_input
-        return GenerationBatchResult(
-            logits_output=logits_output,
-            next_token_ids=next_token_ids,
-            next_draft_input=draft_input,
-            bid=model_worker_batch.bid,
-            cache_miss_count=cache_miss_count,
-            extend_input_len_per_req=None,
-            extend_logprob_start_len_per_req=None,
-        )
 
-    # ------------------------------------------------------------------ #
-    # Decode: draft block -> target verify -> accept/commit
-    # ------------------------------------------------------------------ #
-    def _forward_decode(self, model_worker_batch: ModelWorkerBatch):
-        from sgl_jax.srt.managers.scheduler import GenerationBatchResult
-
+    def draft(self, model_worker_batch: ModelWorkerBatch) -> None:
+        """Build one fixed-size DFlash proposal block."""
         draft_input: DFlashDraftInput = model_worker_batch.spec_info_padded
         assert isinstance(draft_input, DFlashDraftInput), (
             "DFLASH decode requires DFlashDraftInput carried over from prefill."
@@ -220,8 +192,20 @@ class DFlashWorker:
             draft_prefix_lens,
             bs,
         )
+        model_worker_batch.spec_info_padded = verify_input
 
-        # 2) Target verify over the block.
+    def verify(self, model_worker_batch: ModelWorkerBatch, cur_allocate_lens=None):
+        """Run target verification and publish the next DFlash round state."""
+        from sgl_jax.srt.managers.scheduler import GenerationBatchResult
+
+        verify_input = model_worker_batch.spec_info_padded
+        assert isinstance(verify_input, DFlashVerifyInput), (
+            "DFLASH verify requires proposals produced by the draft phase."
+        )
+
+        bs = int(model_worker_batch.seq_lens.shape[0])
+        seq_lens = np.asarray(model_worker_batch.seq_lens, dtype=np.int32)
+        target_prefix_lens = seq_lens - 1
         verify_input.prepare_for_verify(model_worker_batch, self.page_size)
         model_worker_batch.forward_mode = ForwardMode.TARGET_VERIFY
         model_worker_batch.seq_lens = target_prefix_lens
@@ -253,11 +237,6 @@ class DFlashWorker:
             block_size=self.block_size,
         )
         next_draft_input.new_seq_lens = new_seq_lens.astype(np.int32)
-        self._append_target_hidden_to_draft_kv(
-            model_worker_batch,
-            next_draft_input,
-            is_prefill=False,
-        )
         model_worker_batch.spec_info_padded = next_draft_input
 
         return GenerationBatchResult(
@@ -270,6 +249,21 @@ class DFlashWorker:
             extend_input_len_per_req=None,
             extend_logprob_start_len_per_req=None,
         )
+
+    def draft_extend_for_decode(
+        self,
+        model_worker_batch: ModelWorkerBatch,
+        batch_output,
+    ) -> None:
+        """Commit accepted target hidden states into persistent draft KV."""
+        next_draft_input = batch_output.next_draft_input
+        assert isinstance(next_draft_input, DFlashDraftInput)
+        self._append_target_hidden_to_draft_kv(
+            model_worker_batch,
+            next_draft_input,
+            is_prefill=False,
+        )
+        model_worker_batch.spec_info_padded = next_draft_input
 
     def _trim_dflash_draft_input_to_decode_batch(
         self,
@@ -293,7 +287,7 @@ class DFlashWorker:
         raise ValueError(
             "DFLASH draft state is shorter than decode batch after prepare_for_decode: "
             f"state_bs={state_bs}, bs={bs}. Merged decode requests must be aligned "
-            "from ScheduleBatch req state before entering DFlashWorker._forward_decode."
+            "from ScheduleBatch req state before entering the DFlash draft phase."
         )
 
     def _init_jit_target_verify(self):
@@ -749,19 +743,12 @@ class DFlashWorker:
                 model_worker_batch, draft_input
             )
 
-        pool = self.draft_model_runner.token_to_kv_pool
-        kv_buffers = list(pool.kv_buffer[: self.draft_layers])
-
-        new_buffers = self._jit_materialize_write(
-            self.draft_model_runner.model_state_leaves,
-            jnp.asarray(target_hidden),
-            jnp.asarray(positions),
-            jnp.asarray(cache_loc),
-            kv_buffers,
+        self._run_jit_draft_extend(
+            target_hidden,
+            positions,
+            cache_loc,
             is_decode=not is_prefill,
         )
-        for i, buf in enumerate(new_buffers):
-            pool.kv_buffer[i] = buf
 
         starts, lengths = compute_new_kv_slices(
             draft_input.ctx_lens, draft_input.draft_seq_lens, is_prefill
@@ -769,6 +756,19 @@ class DFlashWorker:
         draft_input.draft_seq_lens = (starts + lengths).astype(np.int32)
         draft_input.ctx_lens = np.zeros_like(np.asarray(draft_input.ctx_lens, dtype=np.int32))
         draft_input.target_hidden = None if not is_prefill else target_hidden[:0]
+
+    def _run_jit_draft_extend(self, target_hidden, positions, cache_loc, *, is_decode: bool):
+        pool = self.draft_model_runner.token_to_kv_pool
+        new_buffers = self._jit_materialize_write(
+            self.draft_model_runner.model_state_leaves,
+            jnp.asarray(target_hidden),
+            jnp.asarray(positions),
+            jnp.asarray(cache_loc),
+            list(pool.kv_buffer[: self.draft_layers]),
+            is_decode=is_decode,
+        )
+        for i, buf in enumerate(new_buffers):
+            pool.kv_buffer[i] = buf
 
     def _committed_cache_loc(self, model_worker_batch, draft_input, is_prefill):
         """Flat cache_loc for the committed tokens, read from req_to_token_pool."""
@@ -886,7 +886,7 @@ class DFlashWorker:
 
         max_kv = max(int(x) for x in kv_lens)
         pages_per_seq = (max_kv + self.page_size - 1) // self.page_size
-        bucketed_pages = max(16, 1 << max(0, (pages_per_seq - 1)).bit_length())
+        bucketed_pages = max(16, 1 << max(0, pages_per_seq - 1).bit_length())
         row_width = bucketed_pages * self.page_size
 
         packed = np.empty((len(rows), row_width), dtype=np.int32)
@@ -902,178 +902,89 @@ class DFlashWorker:
     # Precompile hook (scheduler calls this at startup)
     # ------------------------------------------------------------------ #
     def run_spec_decode_precompile(self):
-        import time
-
         self.target_worker.run_precompile()
+        manager = self.target_worker.compilation_manager
+        bs_buckets = [
+            int(bs) for bs in manager.bs_buckets if int(bs) > 0 and int(bs) & (int(bs) - 1) == 0
+        ]
+        if not bs_buckets:
+            bs_buckets = [int(manager.max_padded_batch_size)]
 
-        pps_buckets = self._compute_pps_buckets()
-        bs_buckets = self._compute_verify_bs_buckets()
+        max_pages = max(
+            16,
+            (int(manager.max_req_len) + self.page_size - 1) // self.page_size,
+        )
+        max_bucket_pages = 1 << (max_pages - 1).bit_length()
+        page_buckets = []
+        pages = 16
+        while pages <= max_bucket_pages:
+            page_buckets.append(pages)
+            pages *= 2
 
-        start = time.perf_counter()
+        row_widths = [pages * self.page_size for pages in page_buckets]
         logger.info(
-            "[DFLASH] Precompiling TARGET_VERIFY: bs_buckets=%s, pps_buckets=%s",
+            "[DFLASH] Precompiling variants: bs=%s, row_width=%s",
             bs_buckets,
-            pps_buckets,
+            row_widths,
         )
-
         for bs in bs_buckets:
-            for pps in pps_buckets:
-                t0 = time.perf_counter()
-                self._precompile_verify(bs, pps, target=True)
-                logger.info(
-                    "[DFLASH] Target verify bs=%d pps=%d compiled in %.1f secs",
-                    bs,
-                    pps,
-                    time.perf_counter() - t0,
-                )
-                t0 = time.perf_counter()
-                self._precompile_verify(bs, pps, target=False)
-                logger.info(
-                    "[DFLASH] Draft verify bs=%d pps=%d compiled in %.1f secs",
-                    bs,
-                    pps,
-                    time.perf_counter() - t0,
-                )
+            for row_width in row_widths:
+                self._precompile_dflash_variant(bs, row_width)
 
-        logger.info(
-            "[DFLASH] TARGET_VERIFY precompile finished in %.0f secs",
-            time.perf_counter() - start,
+    def _precompile_dflash_variant(self, bs: int, row_width: int) -> None:
+        target_batch = self._make_verify_dummy_batch(bs, row_width)
+        target_metadata = self.target_worker.model_runner.attn_backend.get_eagle_forward_metadata(
+            target_batch
+        )
+        logits_output, *_ = self._run_jit_target_verify(
+            target_batch,
+            target_batch.spec_info_padded,
+            target_metadata,
         )
 
-    def _compute_verify_bs_buckets(self) -> list[int]:
-        buckets = []
-        for bs in self.target_worker.compilation_manager.bs_buckets:
-            bs = int(bs)
-            # Skip the non-power-of-two max_padded_batch_size bucket that the
-            # generic compilation manager appends as a catch-all (e.g. 204).
-            # DFlash verify precompile is expensive, and normal serving sweeps
-            # use power-of-two batch buckets.
-            if bs > 0 and (bs & (bs - 1)) == 0:
-                buckets.append(bs)
-        if not buckets:
-            buckets.append(int(self.target_worker.compilation_manager.max_padded_batch_size))
-        return buckets
-
-    def _compute_pps_buckets(self) -> list[int]:
-        max_pps = (self.target_worker.max_req_len + self.page_size - 1) // self.page_size
-        buckets = []
-        pps = 16
-        while pps <= max_pps:
-            buckets.append(pps)
-            pps *= 2
-        if not buckets:
-            buckets.append(16)
-        final_bucket = max(16, 1 << max(0, (max_pps - 1)).bit_length())
-        if buckets[-1] < final_bucket:
-            buckets.append(final_bucket)
-        # _make_verify_dummy_batch uses these values as the row-padded token
-        # width of cache_loc. For paged attention the row width must be page
-        # aligned because get_eagle_forward_metadata repacks rows into page
-        # indices. Small buckets such as 16/32 are valid for page_size=1, but
-        # invalid for page_size=64/128.
-        min_width = max(self.block_size, self.page_size)
-        aligned_buckets = []
-        for bucket in buckets:
-            bucket = max(int(bucket), int(min_width))
-            if self.page_size > 1:
-                bucket = ((bucket + self.page_size - 1) // self.page_size) * self.page_size
-            if not aligned_buckets or aligned_buckets[-1] != bucket:
-                aligned_buckets.append(bucket)
-        return aligned_buckets
-
-    def _precompile_verify(self, bs: int, pps: int, target: bool):
-        from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
-
-        mwb = self._make_verify_dummy_batch(bs, pps, is_draft=not target)
-
-        if target:
-            forward_metadata = (
-                self.target_worker.model_runner.attn_backend.get_eagle_forward_metadata(mwb)
-            )
-            self.target_worker.forward_batch_generation(
-                mwb,
-                skip_sample=True,
-                forward_metadata=forward_metadata,
-            )
-        else:
-            forward_batch = ForwardBatch.init_new(mwb, self.draft_model_runner)
-            forward_batch.forward_mode = ForwardMode.TARGET_VERIFY
-            num_tokens = bs * self.block_size
-            hidden_size = self.draft_model_runner.model_config.hidden_size
-            forward_batch.input_embedding = jnp.zeros(
-                (num_tokens, hidden_size),
-                dtype=jnp.bfloat16 if self.server_args.dtype == "bfloat16" else jnp.float32,
-            )
-            metadata = self.draft_model_runner.attn_backend.get_eagle_forward_metadata(mwb)
-            self.draft_model_runner.attn_backend.forward_metadata = metadata
-            self.draft_model_runner.forward(forward_batch, None)
+        draft_batch = self._make_verify_dummy_batch(bs, row_width, is_draft=True)
+        forward_batch = ForwardBatch.init_new(draft_batch, self.draft_model_runner)
+        forward_batch.forward_mode = ForwardMode.TARGET_VERIFY
+        draft_metadata = self.draft_model_runner.attn_backend.get_eagle_forward_metadata(
+            draft_batch
+        )
+        self.draft_model_runner.attn_backend.forward_metadata = draft_metadata
+        self._run_jit_draft_block(forward_batch, None)
+        self._run_jit_draft_extend(
+            logits_output.hidden_states,
+            target_batch.positions,
+            target_batch.out_cache_loc,
+            is_decode=True,
+        )
 
     def _make_verify_dummy_batch(
-        self, bs: int, pps: int, is_draft: bool = False
+        self, bs: int, row_width: int, is_draft: bool = False
     ) -> ModelWorkerBatch:
-        from sgl_jax.srt.managers.schedule_batch import ModelWorkerSamplingInfo
-
         block_size = self.block_size
         num_tokens = bs * block_size
-        prefix_len = max(0, pps - block_size)
-
-        input_ids = np.ones(num_tokens, dtype=np.int32)
+        kv_len = min(row_width, self.target_worker.compilation_manager.max_req_len)
+        prefix_len = max(0, kv_len - block_size)
         positions = np.tile(np.arange(prefix_len, prefix_len + block_size, dtype=np.int32), bs)
-        out_cache_loc = np.arange(1, num_tokens + 1, dtype=np.int32)
-        cache_loc = np.zeros(bs * pps, dtype=np.int32)
-        seq_lens = np.full(bs, prefix_len, dtype=np.int32)
-
-        sampling_info = ModelWorkerSamplingInfo.generate_for_precompile_all_greedy(
+        batch = self.target_worker.compilation_manager._make_dummy_batch(
             bs,
-            self.target_worker.model_runner.model_config.vocab_size,
-        )
-        sampling_info.vocab_mask = None
-
-        if is_draft:
-            verify_input = DFlashVerifyInput(
-                draft_token=jnp.ones(num_tokens, dtype=jnp.int32),
-                positions=jnp.asarray(positions),
-                draft_token_num=block_size,
-                capture_hidden_mode=CaptureHiddenMode.NULL,
-            )
-            capture_hidden = CaptureHiddenMode.NULL
-        else:
-            verify_input = DFlashVerifyInput(
-                draft_token=jnp.ones(num_tokens, dtype=jnp.int32),
-                positions=jnp.asarray(positions),
-                draft_token_num=block_size,
-                capture_hidden_mode=CaptureHiddenMode.FULL,
-            )
-            capture_hidden = CaptureHiddenMode.FULL
-
-        return ModelWorkerBatch(
-            bid=1,
-            forward_mode=ForwardMode.TARGET_VERIFY,
-            input_ids=input_ids,
-            real_input_ids_len=num_tokens,
-            real_bs=bs,
-            req_pool_indices=np.arange(bs, dtype=np.int32),
-            seq_lens=seq_lens,
-            out_cache_loc=out_cache_loc,
-            return_logprob=False,
-            return_output_logprob_only=False,
-            sampling_info=sampling_info,
-            extend_input_logprob_token_ids=None,
-            positions=positions,
-            cache_loc=cache_loc,
-            extend_prefix_lens=None,
-            extend_seq_lens=None,
-            top_logprobs_nums=None,
-            token_ids_logprobs=None,
-            extend_logprob_start_lens=None,
-            logits_indices=None,
-            input_logprob_indices=None,
-            capture_hidden_mode=capture_hidden,
-            spec_algorithm=SpeculativeAlgorithm.DFLASH,
-            lora_ids=["0"] * bs,
+            num_tokens,
+            ForwardMode.TARGET_VERIFY,
+            bs * row_width,
+            speculative_algorithm=SpeculativeAlgorithm.DFLASH,
             dp_size=1,
             per_dp_bs_size=bs,
-            real_bs_per_dp=[bs],
-            logits_indices_selector=np.arange(bs, dtype=np.int32),
-            spec_info_padded=verify_input,
         )
+        capture_hidden = CaptureHiddenMode.NULL if is_draft else CaptureHiddenMode.FULL
+        batch.input_ids = np.ones(num_tokens, dtype=np.int32)
+        batch.real_input_ids_len = num_tokens
+        batch.seq_lens = np.full(bs, prefix_len, dtype=np.int32)
+        batch.out_cache_loc = np.arange(1, num_tokens + 1, dtype=np.int32)
+        batch.positions = positions
+        batch.capture_hidden_mode = capture_hidden
+        batch.spec_info_padded = DFlashVerifyInput(
+            draft_token=jnp.ones(num_tokens, dtype=jnp.int32),
+            positions=jnp.asarray(positions),
+            draft_token_num=block_size,
+            capture_hidden_mode=capture_hidden,
+        )
+        return batch
