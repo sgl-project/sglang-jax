@@ -246,8 +246,12 @@ def test_prefill_precompile_variants_use_runtime_extend_buckets():
         max_padded_batch_size=128,
         token_buckets=[64, 128, 256, 1024, 2048],
     )
+    worker = object.__new__(DFlashWorker)
 
-    assert DFlashWorker._prefill_precompile_variants(manager) == [
+    assert worker._get_spec_precompile_extend_variants(
+        manager.max_padded_batch_size,
+        token_buckets=manager.token_buckets,
+    ) == [
         (128, 128),
         (128, 256),
         (128, 1024),

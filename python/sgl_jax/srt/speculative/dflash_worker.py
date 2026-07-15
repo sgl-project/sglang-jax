@@ -37,9 +37,6 @@ logger = logging.getLogger(__name__)
 class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
     """DFlash draft/verify runtime worker (greedy, DP/TP aware)."""
 
-    _requires_allocate_lens = False
-    _force_greedy_prefill = True
-
     def __init__(self, server_args, target_worker: ModelWorker):
         super().__init__(
             server_args,
@@ -965,48 +962,32 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
     def run_spec_decode_precompile(self):
         self._precompile_dflash_prefill()
         manager = self.target_worker.compilation_manager
-        dp_size = int(manager.dp_size)
-        bs_buckets = [
-            int(bs)
-            for bs in manager.bs_buckets
-            if int(bs) >= dp_size and int(bs) % dp_size == 0 and int(bs) & (int(bs) - 1) == 0
-        ]
-        if not bs_buckets:
-            max_bs = int(manager.max_padded_batch_size)
-            if max_bs % dp_size != 0:
-                raise ValueError(
-                    "DFLASH precompile batch size must be divisible by dp_size: "
-                    f"max_padded_batch_size={max_bs}, dp_size={dp_size}."
-                )
-            bs_buckets = [max_bs]
-
-        logger.info(
-            "[DFLASH] Precompiling one fixed-page variant per bs: bs=%s, page_indices_capacity=%s",
-            bs_buckets,
-            [self._page_indices_capacity(bs) for bs in bs_buckets],
+        bs_buckets = self._get_spec_precompile_bs_buckets(
+            candidates=manager.bs_buckets,
+            power_of_two_only=True,
         )
-        for bs in bs_buckets:
-            self._precompile_dflash_variant(bs)
-
-    @staticmethod
-    def _prefill_precompile_variants(manager) -> list[tuple[int, int]]:
-        """Return the EXTEND shapes emitted by ScheduleBatch's padded path."""
-        bs = int(manager.max_padded_batch_size)
-        return [(bs, int(tokens)) for tokens in manager.token_buckets if int(tokens) >= bs]
+        self._run_spec_precompile_variants(
+            "DFLASH_DECODE",
+            bs_buckets,
+            self._precompile_dflash_variant,
+            lambda bs: {
+                "bs": bs,
+                "page_indices_capacity": self._page_indices_capacity(bs),
+            },
+        )
 
     def _precompile_dflash_prefill(self) -> None:
         """Compile the exact target-prefill -> draft-KV path used by DFlash."""
-        import time
-
         from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 
         manager = self.target_worker.compilation_manager
-        variants = self._prefill_precompile_variants(manager)
-        logger.info("[DFLASH] Precompiling prefill variants: %s", variants)
-        start = time.perf_counter()
+        variants = self._get_spec_precompile_extend_variants(
+            manager.max_padded_batch_size,
+            token_buckets=manager.token_buckets,
+        )
 
-        for bs, num_tokens in variants:
-            t0 = time.perf_counter()
+        def _compile(pair):
+            bs, num_tokens = pair
             batch = manager._make_dummy_batch(
                 bs,
                 num_tokens,
@@ -1040,16 +1021,12 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 batch.positions,
                 batch.out_cache_loc,
             )
-            logger.info(
-                "[DFLASH] Prefill bs=%d tokens=%d compiled in %.1f secs",
-                bs,
-                num_tokens,
-                time.perf_counter() - t0,
-            )
 
-        logger.info(
-            "[DFLASH] Prefill precompile finished in %.0f secs",
-            time.perf_counter() - start,
+        self._run_spec_precompile_variants(
+            "DFLASH_PREFILL",
+            variants,
+            _compile,
+            lambda pair: {"bs": pair[0], "tokens": pair[1]},
         )
 
     def _precompile_dflash_variant(self, bs: int) -> None:

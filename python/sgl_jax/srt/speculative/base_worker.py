@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import dataclasses
+import logging
 import os
 import threading
+import time
 from abc import ABC, abstractmethod
+from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING
 
 import jax
@@ -11,8 +14,11 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
+from tqdm import tqdm
 
 from sgl_jax.srt.speculative.overlap_utils import use_legacy_eagle3_non_overlap
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
@@ -68,9 +74,6 @@ class BaseSpecWorker:
     ``BaseDraftWorker`` they construct.
     """
 
-    _requires_allocate_lens = True
-    _force_greedy_prefill = False
-
     def __init__(self, server_args, target_worker: ModelWorker, draft_worker: BaseDraftWorker):
         self.server_args = server_args
         self._target_worker = target_worker
@@ -102,6 +105,70 @@ class BaseSpecWorker:
             self.precompile_cache_loc_paddings,
         ) = target_worker.get_precompile_paddings()
         self.spec_relay_buffers = None
+
+    def _get_spec_precompile_bs_buckets(
+        self,
+        *,
+        candidates: Iterable[int] | None = None,
+        power_of_two_only: bool = False,
+    ) -> list[int]:
+        """Return DP-compatible batch buckets for speculative precompile."""
+        dp_size = int(self.server_args.dp_size)
+        source = self.precompile_bs_paddings if candidates is None else candidates
+        buckets = [
+            int(bs)
+            for bs in source
+            if int(bs) >= dp_size
+            and int(bs) % dp_size == 0
+            and (not power_of_two_only or int(bs) & (int(bs) - 1) == 0)
+        ]
+        if buckets:
+            return buckets
+
+        max_bs = int(self.target_worker.compilation_manager.max_padded_batch_size)
+        if max_bs % dp_size != 0:
+            raise ValueError(
+                "Speculative precompile batch size must be divisible by dp_size: "
+                f"max_padded_batch_size={max_bs}, dp_size={dp_size}."
+            )
+        return [max_bs]
+
+    def _get_spec_precompile_extend_variants(
+        self,
+        batch_size: int,
+        *,
+        token_buckets: Iterable[int] | None = None,
+    ) -> list[tuple[int, int]]:
+        """Return EXTEND shapes compatible with scheduler bucket padding."""
+        bs = int(batch_size)
+        source = self.precompile_token_paddings if token_buckets is None else token_buckets
+        return [(bs, int(tokens)) for tokens in source if int(tokens) >= bs]
+
+    def _run_spec_precompile_variants(
+        self,
+        label: str,
+        variants: Iterable,
+        compile_variant: Callable,
+        describe_variant: Callable | None = None,
+    ) -> None:
+        """Run algorithm-owned compilation behind one common driver."""
+        variants = list(variants)
+        start = time.perf_counter()
+        logger.info("[%s] Begin precompile variants=%s", label, variants)
+        with tqdm(variants, desc=f"[{label}] PRECOMPILE", leave=False) as pbar:
+            for variant in pbar:
+                description = describe_variant(variant) if describe_variant is not None else {}
+                if description:
+                    pbar.set_postfix(**description)
+                t0 = time.perf_counter()
+                compile_variant(variant)
+                logger.info(
+                    "[%s] variant=%s compiled in %.1f secs",
+                    label,
+                    description or variant,
+                    time.perf_counter() - t0,
+                )
+        logger.info("[%s] Precompile finished in %.0f secs", label, time.perf_counter() - start)
 
     @property
     def target_worker(self) -> ModelWorker:
@@ -143,9 +210,9 @@ class BaseSpecWorker:
         )
 
     def _get_cur_allocate_lens(self, model_worker_batch: ModelWorkerBatch):
-        if not self._requires_allocate_lens:
+        allocate_lens = model_worker_batch.spec_info_padded.get_allocated_token_num()
+        if allocate_lens is None:
             return None
-        allocate_lens = model_worker_batch.spec_info_padded.allocate_lens
         return np.asarray(allocate_lens)[model_worker_batch.logits_indices_selector]
 
     # -- Main entry point --
@@ -236,9 +303,7 @@ class BaseSpecWorker:
                 self.mesh,
                 vocab_size=self.target_worker.model_config.vocab_size,
             )
-            if (
-                self._force_greedy_prefill or model_worker_batch.sampling_info.is_all_greedy
-            ) and not legacy_non_overlap:
+            if model_worker_batch.sampling_info.is_all_greedy and not legacy_non_overlap:
                 logits_output, _, cache_miss_count, bid, _seq_lens = self.forward_target_extend(
                     model_worker_batch,
                     sampling_metadata,
