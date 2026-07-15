@@ -117,9 +117,7 @@ class ModelWorkerClient:
                 break
 
             if self.worker._pd_fuse_sample:
-                # Fused path: resolve/set_future are inlined into the single
-                # jitted_run_and_sample; feed raw (possibly negative) input_ids
-                # straight through and take the updated future map back out.
+                # Fused path: resolve/set_future are inlined into the single jit.
                 with jax.profiler.TraceAnnotation(
                     f"forward_batch_generation {model_worker_batch.bid}"
                 ):
@@ -153,11 +151,8 @@ class ModelWorkerClient:
                         forward_metadata=forward_metadata,
                     )
                 )
-            # Update the future token ids map. next_token_ids here is the raw
-            # sampler output (stable P('data') sharding); feeding it directly
-            # avoids the tracing/cpp-fastpath cache miss that async_gather_fn's
-            # dp=1-no-op-optimized output type otherwise causes. async_gather
-            # runs afterwards purely to prep the replicated D2H copy.
+            # Feed the raw sampler output (stable P('data') sharding) so
+            # set_future's cpp-fastpath cache hits; async_gather afterwards.
             self.future_token_ids_map = set_future_token_ids(
                 self.future_token_ids_map,
                 future_token_ids_ct,

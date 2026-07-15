@@ -100,10 +100,9 @@ class CompilationManager:
         return buckets
 
     def _compute_cache_loc_buckets(self) -> list[int]:
-        # bs*max_req_len over-provisions: at bs=128 ctx=262K that's 134MB H2D
-        # per tick, but bs reqs together can never exceed max_total_num_tokens
-        # (the pool). Cap per-bs at the pool size -- shrinks 134MB->~15MB, a
-        # ~25ms/tick save on Pathways gRPC H2D (~5GB/s vs native PCIe 16GB/s).
+        # bs reqs together can never exceed max_total_num_tokens, so cap the
+        # per-bs bucket at the pool size (helps Pathways gRPC H2D; see tp_worker
+        # for why the cap is proxy-only).
         pages_per_req = (self.max_req_len + self.page_size - 1) // self.page_size * self.page_size
         pool_aligned = (
             (self.max_total_num_tokens + self.page_size - 1) // self.page_size * self.page_size

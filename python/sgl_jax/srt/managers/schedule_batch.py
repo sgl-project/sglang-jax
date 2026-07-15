@@ -1179,12 +1179,8 @@ class ScheduleBatch:
             # Init arrays
             seq_lens = [len(r.fill_ids) for r in reqs]
             extend_lens = [r.extend_input_len for r in reqs]
-            # PD: P thread may concurrently reassign r.prefix_indices (stash
-            # eager path, pathways_scheduler:_pd_prefill_loop). fill_ids and
-            # extend_input_len are only set by this (main) thread in
-            # init_next_round_input/add_one_req, so derive prefix_lens from
-            # those instead of re-reading len(r.prefix_indices) which can race
-            # ahead -> fill_ids[pre_len:] empty -> np.fromiter count mismatch.
+            # Derive from main-thread-owned fields: r.prefix_indices can be
+            # concurrently reassigned by the PD P-thread eager-stash path.
             prefix_lens = [s - e for s, e in zip(seq_lens, extend_lens)]
             extend_num_tokens = sum(extend_lens)
 
@@ -1214,9 +1210,7 @@ class ScheduleBatch:
                 req.cache_protected_len = req.last_matched_prefix_len
 
                 if pre_len > 0:
-                    # req.prefix_indices may have been reassigned to a longer
-                    # array by the P thread (same race as prefix_lens above);
-                    # pre_len is the main-thread snapshot, so slice to match.
+                    # Slice: same P-thread race on prefix_indices as above.
                     self.req_to_token_pool.write(
                         (req.req_pool_idx, slice(0, pre_len)), req.prefix_indices[:pre_len]
                     )
@@ -2413,31 +2407,16 @@ class ScheduleBatch:
             np.cumsum(aligned_lens[:-1], out=offsets[1:])
 
             if page_size > 1:
-                # PagedTokenToKVPoolAllocator (allocator.py alloc/_alloc_extend_impl/
-                # _alloc_decode_impl) always writes page-contiguous slot indices:
-                #   req_to_token[idx, p*page_size + j] == req_to_token[idx, p*page_size] + j
-                # so the full token-level cache_loc can be reconstructed from
-                # page-start values alone. This turns the O(bs) Python loop of
-                # ~seq_len memcpys into a single vectorised gather of
-                # sum(n_pages) ints (page_size x fewer reads from the large
-                # req_to_token array) plus one broadcast-add write. Under
-                # Pathways-head GIL contention the loop dominated run_batch
-                # (profiled 12.4ms@bs=64 -> 24.8ms@bs=128, MiMo 16K/4K page=256).
-                # Real-token positions are byte-identical to the loop; padding
-                # tail [seq_len:aligned] gets page_start+j (a valid in-bounds
-                # slot in the same allocated page) instead of stale buffer
-                # residue, which is still safe per the persistent-buffer note
-                # above.
+                # PagedTokenToKVPoolAllocator writes page-contiguous slot indices
+                # (req_to_token[i, p*ps+j] == req_to_token[i, p*ps] + j), so the
+                # per-req loop can be replaced by one gather of page-start values
+                # plus a broadcast-add. Padding tail [seq_len:aligned] lands in
+                # the same allocated page so remains safe.
                 n_pages = aligned_lens // page_size
                 total_pages = int(n_pages.sum())
                 if total_pages > 0:
                     total_aligned = total_pages * page_size
-                    # Ragged flat indices of page-start slots in req_to_token:
-                    #   flat_src[g] = idx[r]*W + p*page_size
-                    # where g is the global page index and (r, p) its req/local-page.
-                    # Since dest is contiguous (offsets = cumsum(aligned)), g runs
-                    # 0..total_pages-1 and p = g - page_cum[r], so
-                    #   flat_src[g] = (idx[r]*W - page_cum[r]*page_size) + g*page_size.
+                    # flat_src[g] = idx[r]*W + p*ps = (idx[r]*W - page_cum[r]*ps) + g*ps
                     page_cum = offsets // page_size
                     row_base = req_pool_indices.astype(np.int64) * max_context_len
                     flat_src = np.repeat(row_base - page_cum * page_size, n_pages)
@@ -2450,10 +2429,7 @@ class ScheduleBatch:
                         out=dest.reshape(total_pages, page_size),
                     )
             else:
-                # page_size == 1: non-paged TokenToKVPoolAllocator has no
-                # contiguity guarantee; keep the per-req contiguous slice copy
-                # (still avoids the full-row gather + fancy scatter, ~40x faster
-                # than that at BSZ=64 OSL=16K decode).
+                # Non-paged allocator has no page-contiguity guarantee.
                 for r in range(n_reqs):
                     sl = int(seq_lens[r])
                     dest_start = int(offsets[r]) + offset_bs
@@ -2464,13 +2440,9 @@ class ScheduleBatch:
             # Move to next DP rank's section (fixed stride)
             offset_bs += per_dp_cache_loc_size
 
-        # copy() only under Pathways-PD: cache_loc_cpu is a VIEW into the
-        # per-r2t reusable cache_loc_host_buf. PD eager-stash calls _disp(nxt)
-        # (which re-enters this path on the SAME r2t and overwrites host_buf)
-        # before batch N's make_array_from_callback H2D has necessarily
-        # consumed the view -> batch N forward reads nxt's cache_loc and
-        # writes KV to wrong slots. Native/colocated (single scheduler thread,
-        # no concurrent stash) consume the view before any overwrite.
+        # cache_loc_cpu is a view into the reusable host_buf; PD eager-stash
+        # can overwrite it via _disp(nxt) before this batch's H2D consumes the
+        # view. Single-threaded (native/colocated) callers don't need the copy.
         if global_server_args_dict.get("pd_disaggregation") == "pathways":
             return cache_loc_cpu.copy()
         return cache_loc_cpu

@@ -226,10 +226,8 @@ class ModelWorker:
 
         assert self.max_running_requests > 0, "max_running_request is zero"
 
-        # Fused resolve/set path needs a future_token_ids_map array of the same
-        # shape as ModelWorkerClient.future_token_ids_map for callers that don't
-        # supply one (precompile, non-overlap). Real ids are always >=0 there so
-        # resolve is a no-op and the returned map is discarded.
+        # Same-shape dummy for callers without a real future map (precompile,
+        # non-overlap) so the fused jit variant matches the overlap-thread shape.
         if self._pd_fuse_sample:
             self._pd_dummy_future_map = jax.device_put(
                 jnp.zeros((self.max_running_requests * 5,), dtype=jnp.int32),
@@ -475,10 +473,8 @@ class ModelWorker:
         self.model_runner.attn_backend.forward_metadata = forward_metadata
         logits_metadata = LogitsMetadata.from_model_worker_batch(model_worker_batch, self.mesh)
 
-        # Pathways: fuse run_model+sampler into one jit to drop one Execute
-        # round-trip (~10ms/tick through the dispatch queue). Skips the debug-only
-        # DUMP_LAST_LAYER_LOGITS path and per-token logprob path (both add
-        # extra device_get anyway). Gated by env so CO/native path unchanged.
+        # Pathways-PD: fuse run_model+sampler+resolve/set into one jit so a
+        # decode tick is a single Execute through the ordered dispatch queue.
         if (
             self._pd_fuse_sample
             and not skip_sample
@@ -486,9 +482,6 @@ class ModelWorker:
         ):
             if model_worker_batch.sampling_info:
                 self._update_grammar_vocab_mask(model_worker_batch, sampling_metadata)
-            # Precompile / non-overlap callers don't have a future map; feed the
-            # same-shape dummy so the compiled variant matches the overlap
-            # thread's runtime shape (resolve/set are semantic no-ops there).
             fmap = future_map if future_map is not None else self._pd_dummy_future_map
             fct = future_ct if future_ct is not None else 0
             (

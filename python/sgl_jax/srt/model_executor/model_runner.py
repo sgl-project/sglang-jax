@@ -293,13 +293,9 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
 
         self.jitted_compute_logprobs = partial(jitted_compute_logprobs, self.mesh)
 
-        # Pathways: single-controller dispatch pays ~10ms per independent jit
-        # through the ordered dispatch queue. Fusing the
-        # full forward_thread tick body -- resolve_future_token_ids +
-        # run_model + sampler + async_gather + set_future_token_ids -- into
-        # one jit drops it from 3 Executes to 1 per decode tick. Only used
-        # when SGLANG_PD_FUSE_SAMPLE=1 and no grammar mask update is needed
-        # between forward and sample.
+        # Pathways-PD: fuse resolve_future_token_ids + run_model + sampler +
+        # async_gather + set_future_token_ids into one jit so a decode tick is
+        # a single Execute through the ordered dispatch queue.
         @partial(
             jax.jit,
             donate_argnames=["memory_pools"],
@@ -322,9 +318,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             future_token_ids_map,
             future_token_ids_ct,
         ):
-            # resolve_future_token_ids inlined (utils.py:47-54): overlap thread
-            # feeds raw input_ids that may still hold negative future-id
-            # placeholders; look them up in the (replicated) future map here.
+            # resolve_future_token_ids inlined: negative ids are future placeholders.
             ids = forward_batch.input_ids
             ids_g = jax.lax.with_sharding_constraint(ids, NamedSharding(_fused_mesh, P()))
             resolved = jnp.where(
@@ -354,12 +348,8 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 use_sort_for_toppk_minp=use_sort_for_toppk_minp,
                 rng_override=rng_key,
             )
-            # Fold async_gather_fn's replicated reshard into this jit so the
-            # overlap thread can skip that separate Execute.
+            # async_gather + set_future_token_ids inlined.
             next_ids = jax.lax.with_sharding_constraint(next_ids, NamedSharding(_fused_mesh, P()))
-            # set_future_token_ids inlined (utils.py:58-61): next_ids is already
-            # replicated above, so dynamic_update_slice on the replicated map
-            # needs no extra reshard.
             new_future_map = jax.lax.dynamic_update_slice(
                 future_token_ids_map, next_ids, (future_token_ids_ct + 1,)
             )
