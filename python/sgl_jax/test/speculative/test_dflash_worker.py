@@ -7,11 +7,15 @@ and injecting the minimal attributes each helper reads.
 
 from types import SimpleNamespace
 
+import jax
 import numpy as np
 
 from sgl_jax.srt.layers.attention.flashattention_backend import _pad_page_indices
 from sgl_jax.srt.speculative.dflash_info import DFlashDraftInput
-from sgl_jax.srt.speculative.dflash_worker import DFlashWorker
+from sgl_jax.srt.speculative.dflash_worker import (
+    DFlashWorker,
+    _mask_dflash_draft_extend_cache_loc,
+)
 
 
 def _bare_worker(**attrs):
@@ -47,97 +51,44 @@ def test_prefill_draft_extend_metadata_rejects_bucket_mismatch():
         DFlashWorker._prefill_draft_extend_metadata(mwb, target_hidden)
 
 
-def test_committed_decode_row_padded_cache_loc_positions():
-    req_to_token = np.arange(100, dtype=np.int32).reshape(5, 20)
-    draft_model_runner = SimpleNamespace(
-        req_to_token_pool=SimpleNamespace(req_to_token=req_to_token)
+def test_draft_extend_masks_unaccepted_and_padded_rows():
+    cache_loc = np.arange(12, dtype=np.int32)
+    masked = _mask_dflash_draft_extend_cache_loc(
+        jax.numpy.asarray(cache_loc),
+        jax.numpy.asarray([2, 4, 3], dtype=jax.numpy.int32),
+        jax.numpy.asarray([True, False, True]),
     )
-    w = _bare_worker(draft_model_runner=draft_model_runner, block_size=4)
-
-    mwb = SimpleNamespace(req_pool_indices=np.array([1, 3], dtype=np.int32))
-    di = DFlashDraftInput(
-        verified_id=np.array([0, 0], dtype=np.int32),
-        target_hidden=None,
-        ctx_lens=np.array([2, 1], dtype=np.int32),
-        draft_seq_lens=np.array([10, 7], dtype=np.int32),  # decode starts: [8, 6]
-    )
-
-    locs, positions = w._committed_decode_row_padded_cache_loc_positions(mwb, di)
 
     np.testing.assert_array_equal(
-        locs,
-        np.array([28, 29, -1, -1, 66, -1, -1, -1], dtype=np.int32),
-    )
-    np.testing.assert_array_equal(
-        positions,
-        np.array([8, 9, 9, 9, 6, 6, 6, 6], dtype=np.int32),
+        np.asarray(masked),
+        np.array([0, 1, -1, -1, -1, -1, -1, -1, 8, 9, 10, -1], dtype=np.int32),
     )
 
 
-def test_committed_decode_row_padded_cache_loc_ignores_padded_slots():
-    req_to_token = np.arange(100, dtype=np.int32).reshape(5, 20)
-    draft_model_runner = SimpleNamespace(
-        req_to_token_pool=SimpleNamespace(req_to_token=req_to_token)
+def test_verify_bucket_template_is_cached_by_active_slots():
+    mesh = jax.sharding.Mesh(np.asarray(jax.devices()).reshape(1, 1), ("data", "tensor"))
+    worker = _bare_worker(
+        block_size=4,
+        mesh=mesh,
+        _verify_bucket_templates={},
     )
-    w = _bare_worker(draft_model_runner=draft_model_runner, block_size=4)
-
     mwb = SimpleNamespace(
-        req_pool_indices=np.array([1, 2, 3, 0], dtype=np.int32),
-        real_bs=3,
-        real_bs_per_dp=[3],
+        dp_size=1,
         per_dp_bs_size=4,
-    )
-    di = DFlashDraftInput(
-        verified_id=np.array([0, 0, 0, 0], dtype=np.int32),
-        target_hidden=None,
-        ctx_lens=np.array([1, 1, 1, 1], dtype=np.int32),
-        draft_seq_lens=np.array([5, 6, 7, 0], dtype=np.int32),
+        real_bs=2,
+        logits_indices_selector=np.array([0, 2], dtype=np.int32),
     )
 
-    locs, positions = w._committed_decode_row_padded_cache_loc_positions(mwb, di)
+    first = worker._get_verify_bucket_template(mwb, bs=4)
+    second = worker._get_verify_bucket_template(mwb, bs=4)
 
+    assert first is second
+    np.testing.assert_array_equal(first.extend_seq_lens, np.array([4, 0, 4, 0]))
+    np.testing.assert_array_equal(np.asarray(first.cu_q_lens), np.array([0, 4, 4, 8, 8]))
     np.testing.assert_array_equal(
-        locs,
-        np.array([24, -1, -1, -1, 45, -1, -1, -1, 66, -1, -1, -1, -1, -1, -1, -1]),
+        np.asarray(first.active_mask), np.array([True, False, True, False])
     )
-    np.testing.assert_array_equal(positions[-4:], np.zeros((4,), dtype=np.int32))
-
-
-def test_committed_decode_row_padded_cache_loc_handles_uneven_dp_ranks():
-    req_to_token = np.arange(160, dtype=np.int32).reshape(8, 20)
-    draft_model_runner = SimpleNamespace(
-        req_to_token_pool=SimpleNamespace(req_to_token=req_to_token)
-    )
-    w = _bare_worker(draft_model_runner=draft_model_runner, block_size=2)
-    mwb = SimpleNamespace(
-        req_pool_indices=np.array([1, 2, 0, 4, 0, 0], dtype=np.int32),
-        real_bs=3,
-        real_bs_per_dp=[2, 1],
-        per_dp_bs_size=3,
-    )
-    di = DFlashDraftInput(
-        verified_id=np.zeros(6, dtype=np.int32),
-        target_hidden=None,
-        ctx_lens=np.ones(6, dtype=np.int32),
-        draft_seq_lens=np.array([5, 6, 0, 8, 0, 0], dtype=np.int32),
-    )
-
-    locs, _ = w._committed_decode_row_padded_cache_loc_positions(mwb, di)
-
-    np.testing.assert_array_equal(
-        locs.reshape(6, 2),
-        np.array(
-            [
-                [24, -1],
-                [45, -1],
-                [-1, -1],
-                [87, -1],
-                [-1, -1],
-                [-1, -1],
-            ],
-            dtype=np.int32,
-        ),
-    )
+    np.testing.assert_array_equal(np.asarray(first.distribution), np.array([0, 2, 2]))
 
 
 def test_build_page_indices_preserves_dp_rank_sections():

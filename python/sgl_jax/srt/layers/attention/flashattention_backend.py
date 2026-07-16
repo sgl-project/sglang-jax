@@ -239,6 +239,9 @@ class FlashAttention(AttentionBackend):
         *,
         page_indices: np.ndarray | None = None,
         page_indices_capacity: int | None = None,
+        extend_seq_lens: np.ndarray | None = None,
+        cu_q_lens: jax.Array | None = None,
+        distribution: jax.Array | None = None,
     ):
         """Return the metadata for a forward pass."""
         # below code is for verify and draft extend phase
@@ -262,12 +265,20 @@ class FlashAttention(AttentionBackend):
         dp_size = batch.dp_size
         per_dp_bs = batch.per_dp_bs_size if dp_size > 1 else len(batch.seq_lens)
         if batch.forward_mode.is_target_verify():
-            padded_batch_size = len(batch.seq_lens)
-            extend_seq_lens = np.zeros(padded_batch_size, dtype=np.int32)
-            extend_seq_lens[batch.logits_indices_selector] = batch.spec_info_padded.draft_token_num
+            if extend_seq_lens is None:
+                padded_batch_size = len(batch.seq_lens)
+                extend_seq_lens = np.zeros(padded_batch_size, dtype=np.int32)
+                extend_seq_lens[batch.logits_indices_selector] = (
+                    batch.spec_info_padded.draft_token_num
+                )
         else:
             extend_seq_lens = batch.extend_seq_lens
-        cu_q_lens = _per_dp_cumsum(extend_seq_lens, dp_size, per_dp_bs)
+        if cu_q_lens is None:
+            cu_q_lens = _per_dp_cumsum(extend_seq_lens, dp_size, per_dp_bs)
+            cu_q_lens = device_array(
+                cu_q_lens,
+                sharding=NamedSharding(self.mesh, P("data")),
+            )
 
         seq_lens = np.copy(batch.seq_lens)
 
@@ -359,9 +370,10 @@ class FlashAttention(AttentionBackend):
                 dst_off[r] += n
             page_indices = new_pi
 
-        seq_2d = np.asarray(batch.seq_lens).reshape(dp_size, per_dp_bs)
-        local_n = np.sum(seq_2d > 0, axis=1, dtype=np.int32)
-        distribution = np.column_stack([np.zeros_like(local_n), local_n, local_n]).ravel()
+        if distribution is None:
+            seq_2d = np.asarray(batch.seq_lens).reshape(dp_size, per_dp_bs)
+            local_n = np.sum(seq_2d > 0, axis=1, dtype=np.int32)
+            distribution = np.column_stack([np.zeros_like(local_n), local_n, local_n]).ravel()
         page_indices = np.array(page_indices)
 
         # DFlash can provide one pool-sized capacity for every prefix length,
@@ -375,16 +387,27 @@ class FlashAttention(AttentionBackend):
         )
 
         seq_lens = np.array(seq_lens)
-        (
-            metadata.cu_q_lens,
-            metadata.cu_kv_lens,
-            metadata.page_indices,
-            metadata.seq_lens,
-            metadata.distribution,
-        ) = device_array(
-            (cu_q_lens, cu_kv_lens, page_indices, seq_lens, distribution),
-            sharding=(NamedSharding(self.mesh, P("data"))),
-        )
+        metadata.cu_q_lens = cu_q_lens
+        if isinstance(distribution, jax.Array):
+            metadata.distribution = distribution
+            (
+                metadata.cu_kv_lens,
+                metadata.page_indices,
+                metadata.seq_lens,
+            ) = device_array(
+                (cu_kv_lens, page_indices, seq_lens),
+                sharding=(NamedSharding(self.mesh, P("data"))),
+            )
+        else:
+            (
+                metadata.cu_kv_lens,
+                metadata.page_indices,
+                metadata.seq_lens,
+                metadata.distribution,
+            ) = device_array(
+                (cu_kv_lens, page_indices, seq_lens, distribution),
+                sharding=(NamedSharding(self.mesh, P("data"))),
+            )
         # Hybrid SWA targets need swa_page_indices for TARGET_VERIFY too,
         # otherwise SWA layers index the swa sub-pool with full-pool page ids.
         swa_mapping = getattr(self, "swa_index_mapping", None)
