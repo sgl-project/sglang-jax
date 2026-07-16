@@ -497,9 +497,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 eagle_aux_hidden_state_layer_ids = None
             self.model.set_eagle3_layers_to_capture(eagle_aux_hidden_state_layer_ids)
         elif self.server_args.speculative_algorithm == "DFLASH" and not self.is_draft_worker:
-            # DFLASH captures target intermediate-layer hidden states (K layers)
-            # to inject into the draft KV cache. The layer ids come from the draft
-            # model's dflash_config; must match the draft checkpoint's fc in-dim.
+            # The captured layers must match the draft checkpoint's projection input.
             from sgl_jax.srt.speculative.dflash_util import parse_dflash_draft_config
 
             try:

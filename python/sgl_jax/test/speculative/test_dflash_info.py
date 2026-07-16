@@ -3,12 +3,10 @@ import jax.numpy as jnp
 import numpy as np
 
 from sgl_jax.srt.managers.schedule_batch import ScheduleBatch
-from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sgl_jax.srt.speculative.dflash_info import (
     DFlashDraftInput,
     DFlashVerifyInput,
     build_dflash_draft_block,
-    compute_new_kv_slices,
     dflash_greedy_verify,
 )
 from sgl_jax.srt.speculative.overlap_utils import (
@@ -21,10 +19,8 @@ from sgl_jax.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 def test_dflash_verify_input_is_spec_input_and_pytree():
     vi = DFlashVerifyInput(
         draft_token=jnp.arange(8, dtype=jnp.int32),
-        positions=jnp.arange(8, dtype=jnp.int32),
         custom_mask=None,
         draft_token_num=4,
-        capture_hidden_mode=CaptureHiddenMode.FULL,
     )
 
     assert isinstance(vi, SpecInput)
@@ -36,7 +32,6 @@ def test_dflash_verify_input_is_spec_input_and_pytree():
     restored = jax.tree_util.tree_unflatten(treedef, leaves)
     assert isinstance(restored, DFlashVerifyInput)
     assert restored.draft_token_num == 4
-    assert restored.capture_hidden_mode == CaptureHiddenMode.FULL
 
 
 def test_dflash_greedy_verify_from_logits():
@@ -112,42 +107,19 @@ def test_dflash_draft_input_is_spec_input():
     assert di.get_verify_token_num(bs=2) == 0
 
 
-def test_dflash_draft_input_filter_batch_handles_block_hidden_rows():
-    hidden = jnp.arange(3 * 2 * 4, dtype=jnp.float32).reshape(6, 4)
+def test_dflash_draft_input_filter_batch():
     di = DFlashDraftInput(
         verified_id=np.array([10, 20, 30], dtype=np.int32),
-        target_hidden=hidden,
-        ctx_lens=np.array([1, 1, 1], dtype=np.int32),
+        target_hidden=None,
+        ctx_lens=np.array([1, 2, 3], dtype=np.int32),
         draft_seq_lens=np.array([5, 6, 7], dtype=np.int32),
-        block_size=2,
-    )
-
-    di.filter_batch(np.array([0, 2], dtype=np.int32), has_been_filtered=False)
-
-    np.testing.assert_array_equal(di.verified_id, np.array([10, 30], dtype=np.int32))
-    np.testing.assert_array_equal(
-        np.asarray(di.target_hidden),
-        np.asarray(hidden).reshape(3, 2, 4)[[0, 2]].reshape(4, 4),
-    )
-
-
-def test_dflash_draft_input_filter_batch_handles_compact_token_hidden():
-    hidden = jnp.arange(6 * 2, dtype=jnp.float32).reshape(6, 2)
-    di = DFlashDraftInput(
-        verified_id=np.array([10, 20, 30], dtype=np.int32),
-        target_hidden=hidden,
-        ctx_lens=np.array([2, 1, 3], dtype=np.int32),
-        draft_seq_lens=np.array([5, 6, 7], dtype=np.int32),
-        block_size=4,
     )
 
     di.filter_batch(np.array([2, 0], dtype=np.int32), has_been_filtered=False)
 
-    np.testing.assert_array_equal(di.ctx_lens, np.array([3, 2], dtype=np.int32))
-    np.testing.assert_array_equal(
-        np.asarray(di.target_hidden),
-        np.concatenate([np.asarray(hidden)[3:6], np.asarray(hidden)[0:2]], axis=0),
-    )
+    np.testing.assert_array_equal(di.verified_id, np.array([30, 10], dtype=np.int32))
+    np.testing.assert_array_equal(di.ctx_lens, np.array([3, 1], dtype=np.int32))
+    np.testing.assert_array_equal(di.draft_seq_lens, np.array([7, 5], dtype=np.int32))
 
 
 def test_dflash_draft_input_new_tokens_required_next_decode_page_aligned():
@@ -363,21 +335,3 @@ def test_build_dflash_draft_block():
         np.asarray(positions),
         np.array([[5, 6, 7, 8], [3, 4, 5, 6]], dtype=np.int32),
     )
-
-
-def test_dflash_committed_slices_prefill():
-    # prefill: commit whole new-prompt span [prefix_len : prefix_len + extend_len]
-    ctx_lens = np.array([3, 2], dtype=np.int32)  # new prompt tokens per req
-    draft_seq_lens = np.array([5, 0], dtype=np.int32)  # cached prefix length per req
-    starts, lengths = compute_new_kv_slices(ctx_lens, draft_seq_lens, is_prefill=True)
-    np.testing.assert_array_equal(starts, np.array([5, 0], dtype=np.int32))
-    np.testing.assert_array_equal(lengths, np.array([3, 2], dtype=np.int32))
-
-
-def test_dflash_committed_slices_decode():
-    # decode: commit last accept_len tokens [new_seq_len - accept_len : new_seq_len]
-    ctx_lens = np.array([2, 1], dtype=np.int32)  # committed this step per req
-    draft_seq_lens = np.array([10, 7], dtype=np.int32)  # new total length per req
-    starts, lengths = compute_new_kv_slices(ctx_lens, draft_seq_lens, is_prefill=False)
-    np.testing.assert_array_equal(starts, np.array([8, 6], dtype=np.int32))
-    np.testing.assert_array_equal(lengths, np.array([2, 1], dtype=np.int32))

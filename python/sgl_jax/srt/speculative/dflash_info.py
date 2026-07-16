@@ -39,22 +39,6 @@ def build_dflash_draft_block(
     return block_ids, positions.astype(np.int32)
 
 
-def compute_new_kv_slices(
-    ctx_lens: np.ndarray,
-    draft_seq_lens: np.ndarray,
-    is_prefill: bool,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Per-request ``(start, length)`` of committed tokens in the KV cache.
-
-    - Prefill: [prefix_len : prefix_len + extend_len]
-    - Decode: [new_len - accept_len : new_len]
-    """
-    ctx_lens = np.asarray(ctx_lens, dtype=np.int32)
-    draft_seq_lens = np.asarray(draft_seq_lens, dtype=np.int32)
-    starts = draft_seq_lens.copy() if is_prefill else draft_seq_lens - ctx_lens
-    return starts.astype(np.int32), ctx_lens.copy()
-
-
 # @haifeng Maybe common!
 def dflash_greedy_verify(
     draft_token: jax.Array,
@@ -199,44 +183,13 @@ class DFlashDraftInput:
         self.ctx_lens = old_ctx_lens[selected]
         self.draft_seq_lens = old_draft_seq_lens[selected]
 
-        if self.target_hidden is None:
-            return
-        hidden = np.asarray(jax.device_get(self.target_hidden))
-        hidden_rows = int(hidden.shape[0])
-        if hidden_rows == 0 or int(old_ctx_lens.sum()) == 0:
-            self.target_hidden = self.target_hidden[:0]
-            return
-
-        if hidden_rows == old_bs:
-            self.target_hidden = hidden[selected]
-            return
-
-        block_rows = old_bs * int(self.block_size)
-        if hidden_rows == block_rows:
-            self.target_hidden = hidden.reshape((old_bs, int(self.block_size)) + hidden.shape[1:])[
-                selected
-            ].reshape((-1,) + hidden.shape[1:])
-            return
-
-        compact_rows = int(old_ctx_lens.sum())
-        if hidden_rows == compact_rows:
-            offsets = np.concatenate(
-                [np.zeros((1,), dtype=np.int64), np.cumsum(old_ctx_lens, dtype=np.int64)]
-            )
-            chunks = [hidden[offsets[i] : offsets[i + 1]] for i in selected]
-            self.target_hidden = np.concatenate(chunks, axis=0) if chunks else hidden[:0]
-            return
-
-        raise ValueError(
-            "Cannot filter DFlash target_hidden with an unknown row layout: "
-            f"hidden_rows={hidden_rows}, batch_size={old_bs}, "
-            f"block_size={self.block_size}, committed_rows={compact_rows}."
-        )
+        if self.target_hidden is not None and self.target_hidden.shape[0] != 0:
+            raise ValueError("DFLASH target_hidden must be materialized before filtering.")
+        self.target_hidden = None
 
     def resolve_pending_draft_extend_result(self):
         pass
 
-    # alloc the kv cache for draft block
     def prepare_for_decode(self, schedule_batch) -> None:
         from sgl_jax.srt.managers.schedule_batch import get_last_loc
         from sgl_jax.srt.mem_cache.common import (
@@ -408,12 +361,8 @@ class DFlashVerifyInput:
     """JIT-visible target verify input for a fixed DFlash block."""
 
     draft_token: jax.Array
-    positions: jax.Array
     draft_token_num: int
-    input_ids_host: np.ndarray | None = None
-    positions_host: np.ndarray | None = None
     custom_mask: jax.Array | None = None
-    capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL
 
     def is_draft_input(self) -> bool:
         return False
@@ -445,50 +394,15 @@ class DFlashVerifyInput:
     def tree_flatten(self):
         children = (
             self.draft_token,
-            self.positions,
             self.custom_mask,
         )
-        aux_data = {
-            "draft_token_num": int(self.draft_token_num),
-            "capture_hidden_mode": self.capture_hidden_mode,
-        }
+        aux_data = {"draft_token_num": int(self.draft_token_num)}
         return children, aux_data
 
     @classmethod
     def tree_unflatten(cls, aux_data, children):
         return cls(
             draft_token=children[0],
-            positions=children[1],
-            custom_mask=children[2],
+            custom_mask=children[1],
             draft_token_num=aux_data["draft_token_num"],
-            input_ids_host=None,
-            positions_host=None,
-            capture_hidden_mode=aux_data["capture_hidden_mode"],
         )
-
-    def prepare_for_verify(self, model_worker_batch, page_size: int) -> None:
-        """Wire the drafted block into ``model_worker_batch`` for target verify.
-
-        The scheduler has already allocated ``out_cache_loc`` for ``bs * block``
-        verify tokens via ``get_spec_model_worker_batch``. Here we install the
-        drafted token ids / positions and request full aux-hidden capture so the
-        verify forward yields the target features DFlash needs for the next block.
-        """
-        if self.input_ids_host is None:
-            model_worker_batch.input_ids = np.asarray(
-                jax.device_get(self.draft_token), dtype=np.int32
-            ).reshape(-1)
-        else:
-            model_worker_batch.input_ids = np.asarray(self.input_ids_host, dtype=np.int32).reshape(
-                -1
-            )
-        if self.positions_host is None:
-            model_worker_batch.positions = np.asarray(
-                jax.device_get(self.positions), dtype=np.int32
-            ).reshape(-1)
-        else:
-            model_worker_batch.positions = np.asarray(self.positions_host, dtype=np.int32).reshape(
-                -1
-            )
-        model_worker_batch.spec_info_padded = self
-        model_worker_batch.capture_hidden_mode = self.capture_hidden_mode

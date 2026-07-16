@@ -136,7 +136,6 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         # free list the target uses (no collision with committed slots).
         self.draft_model_runner.token_to_kv_pool_allocator = target_allocator
 
-        # ---- Borrow the target embedding + LM head (draft owns neither) ----
         target_model = target_worker.model_runner.model
         embed_weight, head_weight = target_model.get_embed_and_head()
         self._target_lm_head = head_weight  # [vocab, hidden], for greedy head sampling
@@ -156,7 +155,6 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         )
         self._verify_bucket_templates: dict[tuple, DFlashVerifyBucketTemplate] = {}
 
-        # ---- Resolve the draft mask token ----
         dflash_config = parse_dflash_draft_config(
             server_args.speculative_draft_model_path,
             revision=server_args.speculative_draft_model_revision,
@@ -194,7 +192,6 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         )
 
     def _page_indices_capacity(self, bs: int) -> int:
-        """Return one stable page-index shape for a batch-size bucket."""
         return min(
             self._page_indices_pool_capacity,
             max(int(bs), 1) * self._page_indices_per_seq_capacity,
@@ -306,7 +303,6 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         model_worker_batch: ModelWorkerBatch,
         bs: int,
     ) -> DFlashVerifyBucketTemplate:
-        """Return device-resident metadata that only depends on the active batch slots."""
         from jax.sharding import NamedSharding
         from jax.sharding import PartitionSpec as P
 
@@ -351,7 +347,6 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
     def draft_model_runner(self, value):
         self._draft_model_runner = value
 
-    # Delegate anything not implemented here to the target worker.
     def __getattr__(self, name):
         target_worker = self.__dict__.get("_target_worker")
         if target_worker is None:
@@ -359,7 +354,6 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         return getattr(target_worker, name)
 
     def _prepare_overlap_sampling_info(self, model_worker_batch: ModelWorkerBatch):
-        # Stage 1 is non-overlap and greedy-only; no relay sampling state is used.
         return
 
     def draft_extend_for_prefill(
@@ -368,7 +362,6 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         target_hidden,
         next_token_ids,
     ) -> None:
-        """Seed persistent draft KV from target prefill hidden states."""
         sel = np.asarray(model_worker_batch.logits_indices_selector)
         extend_seq_lens = np.asarray(model_worker_batch.extend_seq_lens, dtype=np.int32)[sel]
         extend_prefix_lens = np.asarray(model_worker_batch.extend_prefix_lens, dtype=np.int32)[sel]
@@ -385,9 +378,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         # waiting for the sampled token so PJRT can run target prefill ->
         # jit_draft_extend without a host synchronization gap.
         self._append_target_hidden_to_draft_kv(model_worker_batch, draft_input)
-        draft_input.verified_id = np.asarray(jax.device_get(next_token_ids))[sel].astype(
-            np.int32
-        )
+        draft_input.verified_id = np.asarray(jax.device_get(next_token_ids))[sel].astype(np.int32)
         model_worker_batch.spec_info_padded = draft_input
 
     def draft_extend_for_decode(
@@ -395,7 +386,6 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         model_worker_batch: ModelWorkerBatch,
         batch_output,
     ) -> None:
-        """Restore host state after the already-dispatched draft KV update."""
         next_draft_input = batch_output.next_draft_input
         assert isinstance(next_draft_input, DFlashDraftInput)
         plan = getattr(next_draft_input, "_target_verify_plan", None)
@@ -447,7 +437,6 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             setattr(draft_input, field, value[selector])
 
     def draft(self, model_worker_batch: ModelWorkerBatch) -> None:
-        """Dispatch draft, then prepare target inputs while the draft executes."""
         draft_input: DFlashDraftInput = model_worker_batch.spec_info_padded
         assert isinstance(
             draft_input, DFlashDraftInput
@@ -480,7 +469,6 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         model_worker_batch._dflash_target_verify_plan = target_plan
 
     def verify(self, model_worker_batch: ModelWorkerBatch, cur_allocate_lens=None):
-        """Run target verification and publish the next DFlash round state."""
         from sgl_jax.srt.managers.scheduler import GenerationBatchResult
 
         plan = getattr(model_worker_batch, "_dflash_target_verify_plan", None)
@@ -538,7 +526,6 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         draft_input: DFlashDraftInput,
         bs: int,
     ) -> None:
-        """Trim stale host-side DFlash state to the current decode batch size."""
         draft_seq_lens = np.asarray(draft_input.draft_seq_lens, dtype=np.int32)
         state_bs = int(draft_seq_lens.shape[0])
         if state_bs == bs:
@@ -705,9 +692,6 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             layers_topk_ids,
         )
 
-    # ------------------------------------------------------------------ #
-    # Draft block forward
-    # ------------------------------------------------------------------ #
     def _build_draft_forward_plan(
         self,
         model_worker_batch: ModelWorkerBatch,
@@ -733,11 +717,8 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         )
         forward_batch = ForwardBatch.init_new(draft_mwb, self.draft_model_runner)
         forward_batch.forward_mode = ForwardMode.TARGET_VERIFY
-        # ForwardBatch.init_new already uploaded these arrays. Rebind spec_info
-        # to the same device buffers instead of retaining duplicate jnp.asarray
-        # copies created from the host block.
+        # Reuse ForwardBatch's device token buffer.
         draft_mwb.spec_info_padded.draft_token = forward_batch.input_ids
-        draft_mwb.spec_info_padded.positions = forward_batch.positions
         forward_batch.spec_info = draft_mwb.spec_info_padded
         active_mask = self._active_decode_slot_mask(model_worker_batch, bs)
         mismatched_prefix = active_mask & (draft_prefix_lens != target_prefix_lens)
@@ -780,7 +761,6 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         draft_plan: DraftForwardPlan,
         draft_token: jax.Array,
     ) -> TargetVerifyPlan:
-        """Prepare target-only host/device state without touching the scheduler batch."""
         bs = draft_plan.bs
         target_mwb = copy.copy(model_worker_batch)
         target_mwb.forward_mode = ForwardMode.TARGET_VERIFY
@@ -795,9 +775,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
 
         verify_input = DFlashVerifyInput(
             draft_token=draft_token,
-            positions=draft_plan.forward_batch.positions,
             draft_token_num=self.block_size,
-            capture_hidden_mode=CaptureHiddenMode.FULL,
         )
         target_mwb.spec_info_padded = verify_input
 
@@ -849,12 +827,8 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         mwb.capture_hidden_mode = CaptureHiddenMode.NULL
         mwb.spec_algorithm = SpeculativeAlgorithm.DFLASH
         mwb.spec_info_padded = DFlashVerifyInput(
-            # These host arrays are rebound to ForwardBatch's device buffers
-            # immediately after ForwardBatch.init_new.
             draft_token=block_ids_flat,
-            positions=positions_flat,
             draft_token_num=self.block_size,
-            capture_hidden_mode=CaptureHiddenMode.NULL,
         )
         # DFlashDraftInput.prepare_for_decode already reserved and packed one
         # block per active request into the first half of each DP rank section.
@@ -864,11 +838,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         mwb.cache_loc = None
         return mwb
 
-    # ------------------------------------------------------------------ #
-    # KV materialization + greedy head sampling
-    # ------------------------------------------------------------------ #
     def _init_jit_draft_block(self):
-        """Build a draft model forward JIT that also samples draft proposals."""
         from functools import partial as _partial
 
         from flax import nnx
@@ -882,7 +852,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         model_def = runner._model_def
         model_state_def = runner._model_state_def
         block_size = self.block_size
-        vocab_size = self._lm_head_vocab_size()
+        vocab_size = self._target_vocab_size
         embedding_sharding = NamedSharding(runner.mesh, P("data", "tensor"))
         logits_sharding = NamedSharding(runner.mesh, P("data", "tensor"))
         token_sharding = NamedSharding(runner.mesh, P("data"))
@@ -1057,7 +1027,6 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         model_worker_batch: ModelWorkerBatch,
         draft_input: DFlashDraftInput,
     ) -> None:
-        """Project target-prefill hidden and seed persistent draft K/V."""
         target_hidden = draft_input.target_hidden
         if target_hidden is None or int(np.asarray(draft_input.ctx_lens).sum()) == 0:
             return
@@ -1084,8 +1053,6 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         accept_lens=None,
         active_mask=None,
     ):
-        import jax._src.test_util as jtu
-
         pool = self.draft_model_runner.token_to_kv_pool
         if accept_lens is None:
             # Prefill metadata is already on the host. Build its fixed masks with
@@ -1103,24 +1070,15 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 "DFLASH draft extend cache rows do not match accept_lens: "
                 f"cache_loc={cache_loc.shape}, accept_lens={accept_lens.shape}."
             )
-        with jtu.count_pjit_cpp_cache_miss() as count:
-            new_buffers = self._jit_materialize_write(
-                self.draft_model_runner.model_state_leaves,
-                jnp.asarray(target_hidden),
-                jnp.asarray(positions),
-                cache_loc,
-                accept_lens,
-                active_mask,
-                list(pool.kv_buffer[: self.draft_layers]),
-            )
-        cache_miss_count = count()
-        if cache_miss_count:
-            logger.info(
-                "[DFLASH] jit_draft_extend cache miss: hidden=%s positions=%s cache_loc=%s",
-                target_hidden.shape,
-                positions.shape,
-                cache_loc.shape,
-            )
+        new_buffers = self._jit_materialize_write(
+            self.draft_model_runner.model_state_leaves,
+            jnp.asarray(target_hidden),
+            jnp.asarray(positions),
+            cache_loc,
+            accept_lens,
+            active_mask,
+            list(pool.kv_buffer[: self.draft_layers]),
+        )
         for i, buf in enumerate(new_buffers):
             pool.kv_buffer[i] = buf
 
@@ -1164,13 +1122,6 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             mask[start:end] = True
         return mask
 
-    def _lm_head_vocab_size(self) -> int:
-        # Unit tests instantiate this class via __new__; avoid __getattr__ fallback there.
-        return int(self.__dict__.get("_target_vocab_size", self._target_lm_head.shape[0]))
-
-    # ------------------------------------------------------------------ #
-    # Precompile hook (scheduler calls this at startup)
-    # ------------------------------------------------------------------ #
     def run_spec_decode_precompile(self):
         self._precompile_dflash_prefill()
         manager = self.target_worker.compilation_manager
@@ -1199,12 +1150,10 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
 
     @staticmethod
     def _prefill_precompile_variants(manager) -> list[tuple[int, int]]:
-        """Return the EXTEND shapes emitted by ScheduleBatch's padded path."""
         bs = int(manager.max_padded_batch_size)
         return [(bs, int(tokens)) for tokens in manager.token_buckets if int(tokens) >= bs]
 
     def _precompile_dflash_prefill(self) -> None:
-        """Compile the exact target-prefill -> draft-KV path used by DFlash."""
         import time
 
         from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
@@ -1285,9 +1234,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         target_batch = self._make_verify_dummy_batch(bs, row_width)
         verify_input = DFlashVerifyInput(
             draft_token=draft_token,
-            positions=forward_batch.positions,
             draft_token_num=self.block_size,
-            capture_hidden_mode=CaptureHiddenMode.FULL,
         )
         target_batch.spec_info_padded = verify_input
         target_metadata = draft_metadata
@@ -1324,7 +1271,6 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         )
 
     def _verify_write_cache_loc(self, batch: ModelWorkerBatch) -> np.ndarray:
-        """Select the verify-token half from each DP rank's reserved slots."""
         dp_size = int(batch.dp_size)
         per_dp_tokens = int(batch.per_dp_bs_size) * self.block_size
         out_cache_loc = np.asarray(batch.out_cache_loc, dtype=np.int32)
@@ -1390,8 +1336,6 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         batch.capture_hidden_mode = capture_hidden
         batch.spec_info_padded = DFlashVerifyInput(
             draft_token=jnp.ones(num_tokens, dtype=jnp.int32),
-            positions=jnp.asarray(positions),
             draft_token_num=block_size,
-            capture_hidden_mode=capture_hidden,
         )
         return batch

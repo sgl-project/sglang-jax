@@ -20,16 +20,12 @@ class DFlashDraftConfig:
 
 
 def _get_dflash_subconfig(hf_config) -> dict:
-    """Return the ``dflash_config`` sub-dict from an HF config, or {}.
-
-    Supports both an attribute (`hf_config.dflash_config`) and a nested dict.
-    """
+    """Return ``dflash_config`` as a dict."""
     cfg = getattr(hf_config, "dflash_config", None)
     if cfg is None:
         return {}
     if isinstance(cfg, dict):
         return cfg
-    # transformers PretrainedConfig-like nested object
     to_dict = getattr(cfg, "to_dict", None)
     if callable(to_dict):
         try:
@@ -54,16 +50,7 @@ def parse_dflash_draft_config(
     revision: str | None = None,
     trust_remote_code: bool = True,
 ) -> DFlashDraftConfig:
-    """Load and parse a DFlash draft model's HF config.
-
-    NOTE: field names follow the PyTorch DFlash convention. When wiring a real
-    checkpoint, verify the actual keys via::
-
-        from transformers import AutoConfig
-        print(AutoConfig.from_pretrained(<draft_path>))
-
-    and adjust the ``_cfg_get`` keys below if they differ.
-    """
+    """Load a DFlash draft model's HF config."""
     from sgl_jax.srt.hf_transformers_utils import get_config
 
     hf_config = get_config(model_path, trust_remote_code=trust_remote_code, revision=revision)
@@ -86,9 +73,6 @@ def parse_dflash_draft_config(
         if not target_layer_ids:
             raise ValueError("DFLASH target_layer_ids must be non-empty when set.")
     else:
-        # Fall back to num_target_layers if provided; otherwise leave None so the
-        # caller uses set_eagle3_layers_to_capture's default. K must ultimately
-        # match the draft fc in-dim, so a real checkpoint should always specify this.
         target_layer_ids = None
         logger.warning(
             "DFLASH: draft config has no target_layer_ids; capture layers will "
@@ -113,12 +97,7 @@ def resolve_mask_token_id(
     tokenizer,
     vocab_size: int,
 ) -> int:
-    """Resolve the mask token id used to fill draft block positions.
-
-    Priority: explicit dflash_config.mask_token_id -> tokenizer vocab lookup of
-    mask_token. The id must be within the target vocab (DFlash reuses the target
-    embedding; no vocab resizing is supported in minimal mode).
-    """
+    """Resolve and validate the draft mask token id."""
     resolved = dflash_config.mask_token_id
     if resolved is None:
         if tokenizer is None:
