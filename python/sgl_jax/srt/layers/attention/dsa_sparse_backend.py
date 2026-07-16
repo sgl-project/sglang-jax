@@ -294,6 +294,9 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                     dist_,
                     k_pages=min(_PAGE_TOPK_BUDGET, pages_per_seq),
                     pages_per_seq=pages_per_seq,
+                    # compute_topk is decode-only: T == num_seqs, token i
+                    # belongs to seq i — enables the O(S * max_kv) fast path.
+                    one_token_per_seq=True,
                 )
                 return cache3d.reshape(cache_.shape), topk, topk_pages
             if compute_topk:
@@ -308,6 +311,8 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                     dist_,
                     k=self.index_topk,
                     pages_per_seq=pages_per_seq,
+                    # compute_topk is decode-only: token i belongs to seq i.
+                    one_token_per_seq=True,
                 )
             else:
                 topk = jnp.full((q_.shape[0], 1), -1, jnp.int32)

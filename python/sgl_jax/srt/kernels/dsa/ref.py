@@ -48,7 +48,7 @@ def build_index_share_map(
     return full_slot, src_slot, len(full_slot)
 
 
-@functools.partial(jax.jit, static_argnames=("k", "pages_per_seq"))
+@functools.partial(jax.jit, static_argnames=("k", "pages_per_seq", "one_token_per_seq"))
 def streamindex_topk_ref(
     q: jax.Array,
     weights: jax.Array,
@@ -61,8 +61,13 @@ def streamindex_topk_ref(
     *,
     k: int,
     pages_per_seq: int,
+    one_token_per_seq: bool = False,
 ) -> jax.Array:
     """Reference lightning-indexer top-k.
+
+    ``one_token_per_seq=True`` (decode: T == num_seqs, token i belongs to
+    seq i) scores only each iteration's own query row — O(S * max_kv) total
+    instead of O(S * T * max_kv); see ``streamindex_page_topk_ref``.
 
     Scores are ``sum_h relu(q_h · k) * w_h`` per DSA semantics. Because ReLU
     sits before the head sum, the naive ``[T, H, max_kv]`` intermediate OOMs
@@ -92,6 +97,31 @@ def streamindex_topk_ref(
 
     w = weights.astype(jnp.float32)
     out = jnp.full((T, k), -1, dtype=jnp.int32)
+
+    if one_token_per_seq:
+
+        def body_decode(seq_id, out):
+            kv_len = seq_lens[seq_id]
+            seq_pages = jax.lax.dynamic_slice_in_dim(
+                page_indices, cu_kv_lens[seq_id] // page_size, pages_per_seq
+            )
+            keys = cache_kv[seq_pages].reshape(max_kv, D)
+            q_i = jax.lax.dynamic_slice_in_dim(q, seq_id, 1, axis=0)  # [1, H, D]
+            w_i = jax.lax.dynamic_slice_in_dim(w, seq_id, 1, axis=0)  # [1, H]
+            s = jnp.einsum("thd,kd->thk", q_i, keys, preferred_element_type=jnp.float32)
+            scores = jnp.einsum("th,thk->tk", w_i, jax.nn.relu(s))  # [1, max_kv]
+            mask = (jnp.arange(max_kv) < kv_len)[None, :]
+            scores = jnp.where(mask, scores, _NEG_INF)
+            cand_v, cand_i = jax.lax.approx_max_k(
+                scores, k, recall_target=0.70, aggregate_to_topk=False
+            )
+            vals, sel = jax.lax.top_k(cand_v, k)
+            idx = jnp.take_along_axis(cand_i, sel, axis=-1)
+            n_valid = mask.sum(-1, keepdims=True)
+            idx = jnp.where((jnp.arange(k)[None, :] < n_valid) & (vals > _NEG_INF), idx, -1)
+            return jax.lax.dynamic_update_slice_in_dim(out, idx, seq_id, axis=0)
+
+        return jax.lax.fori_loop(0, num_seqs, body_decode, out)
 
     def body(seq_id, out):
         q_start = cu_q_lens[seq_id]
@@ -140,7 +170,7 @@ def streamindex_topk_ref(
     return jax.lax.fori_loop(0, num_seqs, body, out)
 
 
-@functools.partial(jax.jit, static_argnames=("k_pages", "pages_per_seq"))
+@functools.partial(jax.jit, static_argnames=("k_pages", "pages_per_seq", "one_token_per_seq"))
 def streamindex_page_topk_ref(
     q: jax.Array,
     weights: jax.Array,
@@ -153,9 +183,16 @@ def streamindex_page_topk_ref(
     *,
     k_pages: int,
     pages_per_seq: int,
+    one_token_per_seq: bool = False,
 ) -> jax.Array:
     """Page-level lightning-indexer: max-pool token scores within each page,
     then top-k over pages_per_seq page scores.
+
+    ``one_token_per_seq=True`` (decode batches: T == num_seqs, token i belongs
+    to seq i) switches to a fast path where each loop iteration scores only
+    its own single query row — O(S * max_kv) total instead of the general
+    path's O(S * T * max_kv), which collapses under multi-request decode
+    (each iteration would score the full [T, max_kv] and mask all but one row).
 
     Vs the token-level path (``streamindex_topk_ref`` + page union, which
     saturates k_pages_max at long context): the page budget is exact, the
@@ -172,6 +209,29 @@ def streamindex_page_topk_ref(
 
     w = weights.astype(jnp.float32)
     out = jnp.full((T, k_pages), -1, dtype=jnp.int32)
+
+    if one_token_per_seq:
+
+        def body_decode(seq_id, out):
+            kv_len = seq_lens[seq_id]
+            seq_pages = jax.lax.dynamic_slice_in_dim(
+                page_indices, cu_kv_lens[seq_id] // page_size, pages_per_seq
+            )
+            keys = cache_kv[seq_pages].reshape(max_kv, D)
+            q_i = jax.lax.dynamic_slice_in_dim(q, seq_id, 1, axis=0)  # [1, H, D]
+            w_i = jax.lax.dynamic_slice_in_dim(w, seq_id, 1, axis=0)  # [1, H]
+            s = jnp.einsum("thd,kd->thk", q_i, keys, preferred_element_type=jnp.float32)
+            scores = jnp.einsum("th,thk->tk", w_i, jax.nn.relu(s))  # [1, max_kv]
+            # decode: query is the last token (abs pos kv_len-1), so the causal
+            # bound coincides with the kv_len bound
+            mask = (jnp.arange(max_kv) < kv_len)[None, :]
+            scores = jnp.where(mask, scores, _NEG_INF)
+            page_scores = scores.reshape(1, pages_per_seq, page_size).max(axis=-1)
+            vals, pidx = jax.lax.top_k(page_scores, k_pages)
+            pidx = jnp.where(vals > _NEG_INF, pidx, -1)
+            return jax.lax.dynamic_update_slice_in_dim(out, pidx, seq_id, axis=0)
+
+        return jax.lax.fori_loop(0, num_seqs, body_decode, out)
 
     def body(seq_id, out):
         q_start = cu_q_lens[seq_id]

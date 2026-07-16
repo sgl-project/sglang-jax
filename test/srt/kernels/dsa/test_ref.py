@@ -385,3 +385,49 @@ def test_page_topk_multi_seq_packed_layout():
         )
         got_t = [x for x in got[s].tolist() if x >= 0]
         assert set(got_t) == set(want), f"seq={s}: got {got_t} want {want}"
+
+
+def test_page_topk_decode_fast_path_matches_general():
+    """one_token_per_seq fast path == general path on decode-shaped batches
+    (T == num_seqs, cu_q_lens == arange), including a zero-length padding seq."""
+    rng = np.random.default_rng(7)
+    H, D, page_size, pages_per_seq = 2, 8, 8, 4
+    kv_lens = [24, 31, 0]  # last is a padding seq
+    S = len(kv_lens)
+    q = rng.normal(size=(S, H, D)).astype(np.float32)
+    weights = np.abs(rng.normal(size=(S, H))).astype(np.float32)
+    all_pages, all_idx = [], []
+    for kv in kv_lens:
+        keys = rng.normal(size=(max(kv, 1), D)).astype(np.float32)
+        pages, _ = _make_paged(keys, page_size)
+        pad = np.zeros((pages_per_seq - pages.shape[0], page_size, D), np.float32)
+        start = sum(pg.shape[0] for pg in all_pages)
+        all_pages.append(np.concatenate([pages, pad]) if pad.shape[0] else pages)
+        all_idx.append(np.arange(start, start + pages_per_seq, dtype=np.int32))
+    cache = np.concatenate(all_pages)
+    page_idx = np.concatenate(all_idx)
+
+    args = (
+        jnp.array(q),
+        jnp.array(weights),
+        jnp.array(cache),
+        jnp.array(kv_lens, np.int32),
+        jnp.array(page_idx),
+        jnp.array(np.arange(S + 1), np.int32),
+        jnp.array([i * pages_per_seq * page_size for i in range(S + 1)], np.int32),
+        jnp.array([0, S, S], np.int32),
+    )
+    for k_pages in (1, 2, 4):
+        general = np.asarray(
+            streamindex_page_topk_ref(*args, k_pages=k_pages, pages_per_seq=pages_per_seq)
+        )
+        fast = np.asarray(
+            streamindex_page_topk_ref(
+                *args,
+                k_pages=k_pages,
+                pages_per_seq=pages_per_seq,
+                one_token_per_seq=True,
+            )
+        )
+        np.testing.assert_array_equal(general, fast)
+        assert (fast[2] == -1).all()  # padding seq selects nothing
