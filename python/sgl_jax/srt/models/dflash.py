@@ -80,7 +80,6 @@ class DFlashDecoderLayer(nnx.Module):
         layer_id: int = 0,
         dtype: jnp.dtype = jnp.bfloat16,
     ):
-        self.layer_id = layer_id
         hidden_size = int(config.hidden_size)
         rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-6))
         self.input_layernorm = RMSNorm(

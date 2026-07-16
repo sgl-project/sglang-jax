@@ -2726,7 +2726,6 @@ class ScheduleBatch:
                 target_hidden=_scatter_dflash_hidden(flat.target_hidden),
                 ctx_lens=_scatter_dflash_1d(flat.ctx_lens, "ctx_lens"),
                 draft_seq_lens=_scatter_dflash_1d(flat.draft_seq_lens, "draft_seq_lens"),
-                capture_hidden_mode=flat.capture_hidden_mode,
                 block_size=flat.block_size,
             )
 
@@ -2804,7 +2803,6 @@ class ScheduleBatch:
                         target_hidden=_slice(flat.target_hidden, offset, end),
                         ctx_lens=_slice(flat.ctx_lens, offset, end),
                         draft_seq_lens=_slice(flat.draft_seq_lens, offset, end),
-                        capture_hidden_mode=flat.capture_hidden_mode,
                         block_size=flat.block_size,
                     )
                 )
@@ -2858,9 +2856,6 @@ class ScheduleBatch:
             "accept_length_cpu",
             "new_seq_lens",
             "future_indices",
-            "ctx_lens",
-            "draft_seq_lens",
-            "target_hidden",
         )
 
         out = []
@@ -2887,7 +2882,7 @@ class ScheduleBatch:
 
     @staticmethod
     def _concat_spec_info_per_rank(per_rank: list):
-        """Concat per-rank EagleDraftInputs into a single cross-rank-flat one.
+        """Concat per-rank draft inputs into a single cross-rank-flat one.
 
         ``None`` entries are skipped. Returns ``None`` if every entry is ``None``.
         Used at forward input boundary (``_get_spec_decode_mwb_dp``) to build the
@@ -2899,42 +2894,42 @@ class ScheduleBatch:
         if not nonempty:
             return None
 
-        has_future_indices = any(getattr(s, "future_indices", None) is not None for s in nonempty)
-        if has_future_indices:
-            assert all(getattr(s, "future_indices", None) is not None for s in nonempty), (
-                "_concat_spec_info_per_rank requires every nonempty rank to carry "
-                "future_indices on the relay-buffer path"
-            )
-        elif any(getattr(s, "pending_draft_extend_result", None) is not None for s in nonempty):
-            for spec_info in nonempty:
-                spec_info.resolve_pending_draft_extend_result()
+        is_dflash = isinstance(nonempty[0], DFlashDraftInput)
+        if is_dflash:
+            per_req_fields = ("verified_id", "ctx_lens", "draft_seq_lens", "target_hidden")
         else:
-            for spec_info in nonempty:
-                spec_info.resolve_pending_draft_extend_result()
+            has_future_indices = any(
+                getattr(s, "future_indices", None) is not None for s in nonempty
+            )
+            if has_future_indices:
+                assert all(
+                    getattr(s, "future_indices", None) is not None for s in nonempty
+                ), (
+                    "_concat_spec_info_per_rank requires every nonempty rank to carry "
+                    "future_indices on the relay-buffer path"
+                )
+            else:
+                for spec_info in nonempty:
+                    spec_info.resolve_pending_draft_extend_result()
 
-        per_req_fields = (
-            "topk_p",
-            "topk_index",
-            "hidden_states",
-            "verified_id",
-            "allocate_lens",
-            "accept_length",
-            "accept_length_cpu",
-            "new_seq_lens",
-            "future_indices",
-            "ctx_lens",
-            "draft_seq_lens",
-            "target_hidden",
-        )
+            per_req_fields = (
+                "topk_p",
+                "topk_index",
+                "hidden_states",
+                "verified_id",
+                "allocate_lens",
+                "accept_length",
+                "accept_length_cpu",
+                "new_seq_lens",
+                "future_indices",
+            )
 
-        kwargs = {
-            "capture_hidden_mode": nonempty[0].capture_hidden_mode,
-        }
-        if hasattr(nonempty[0], "block_size"):
+        kwargs = {} if is_dflash else {"capture_hidden_mode": nonempty[0].capture_hidden_mode}
+        if is_dflash:
             kwargs["block_size"] = nonempty[0].block_size
         for f in per_req_fields:
             vals = [getattr(s, f, None) for s in nonempty]
-            if isinstance(nonempty[0], DFlashDraftInput) and f == "target_hidden":
+            if is_dflash and f == "target_hidden":
                 materialized = [v for v in vals if v is not None and v.shape[0] > 0]
                 if not materialized:
                     kwargs[f] = None

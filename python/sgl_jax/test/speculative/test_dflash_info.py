@@ -19,7 +19,6 @@ from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 def test_dflash_verify_input_pytree_round_trip():
     vi = DFlashVerifyInput(
         draft_token=jnp.arange(8, dtype=jnp.int32),
-        custom_mask=None,
         draft_token_num=4,
     )
 

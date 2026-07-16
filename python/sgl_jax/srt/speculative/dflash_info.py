@@ -71,8 +71,6 @@ def dflash_greedy_verify(
             axis=1,
         ).reshape(-1)
     else:
-        from jax.sharding import PartitionSpec as P
-
         def _select_local_bonus(local_predict, local_accept_len):
             return jnp.take_along_axis(
                 local_predict,
@@ -99,25 +97,8 @@ class DFlashDraftInput:
     target_hidden: jax.Array | None = None
     ctx_lens: np.ndarray = None
     draft_seq_lens: np.ndarray = None
-    capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL
-
-    def __init__(
-        self,
-        *,
-        verified_id=None,
-        target_hidden=None,
-        ctx_lens=None,
-        draft_seq_lens=None,
-        capture_hidden_mode=CaptureHiddenMode.FULL,
-        block_size=16,
-        **_kwargs,
-    ):
-        self.verified_id = verified_id
-        self.target_hidden = target_hidden
-        self.ctx_lens = ctx_lens
-        self.draft_seq_lens = draft_seq_lens
-        self.capture_hidden_mode = capture_hidden_mode
-        self.block_size = int(block_size)
+    block_size: int = 16
+    capture_hidden_mode = CaptureHiddenMode.FULL
 
     def _ensure_host(self) -> None:
         for f in ("verified_id", "ctx_lens", "draft_seq_lens"):
@@ -128,15 +109,6 @@ class DFlashDraftInput:
             v = getattr(self, f, None)
             if v is not None:
                 setattr(self, f, np.asarray(v, dtype=np.int32))
-
-    def trim_to_length(self, n: int) -> None:
-        self._ensure_host()
-        for f in ("verified_id", "ctx_lens", "draft_seq_lens"):
-            v = getattr(self, f, None)
-            if v is not None and len(v) != n:
-                setattr(self, f, np.asarray(v, dtype=np.int32)[:n])
-        if self.target_hidden is not None and self.target_hidden.shape[0] not in (0, n):
-            self.target_hidden = self.target_hidden[:n]
 
     def new_tokens_required_next_decode(self, requests, page_size: int) -> int:
         total = 0
@@ -168,9 +140,6 @@ class DFlashDraftInput:
         if self.target_hidden is not None and self.target_hidden.shape[0] != 0:
             raise ValueError("DFLASH target_hidden must be materialized before filtering.")
         self.target_hidden = None
-
-    def resolve_pending_draft_extend_result(self):
-        pass
 
     def prepare_for_decode(self, schedule_batch) -> None:
         # TODO(haifeng): Share KV slot reservation and req_to_token_pool updates
@@ -346,29 +315,14 @@ class DFlashVerifyInput:
 
     draft_token: jax.Array
     draft_token_num: int
-    custom_mask: jax.Array | None = None
-
-    def filter_batch(self, new_indices: np.ndarray, has_been_filtered: bool = True) -> None:
-        raise NotImplementedError("DFlashVerifyInput is built per verify step and is not filtered.")
-
-    def merge_batch(self, other: DFlashVerifyInput) -> None:
-        raise NotImplementedError("DFlashVerifyInput is built per verify step and is not merged.")
-
-    def resolve_pending_draft_extend_result(self):
-        pass
+    custom_mask = None
 
     def tree_flatten(self):
-        children = (
-            self.draft_token,
-            self.custom_mask,
-        )
-        aux_data = {"draft_token_num": int(self.draft_token_num)}
-        return children, aux_data
+        return (self.draft_token,), {"draft_token_num": int(self.draft_token_num)}
 
     @classmethod
     def tree_unflatten(cls, aux_data, children):
         return cls(
             draft_token=children[0],
-            custom_mask=children[1],
             draft_token_num=aux_data["draft_token_num"],
         )

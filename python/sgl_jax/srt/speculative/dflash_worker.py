@@ -74,12 +74,10 @@ class DFlashVerifyBucketTemplate:
 
 @dataclass(frozen=True)
 class DraftForwardPlan:
-    model_worker_batch: ModelWorkerBatch
     forward_batch: ForwardBatch
     forward_metadata: object
     seq_lens: np.ndarray
     target_prefix_lens: np.ndarray
-    draft_prefix_lens: np.ndarray
     positions_host: np.ndarray
     bs: int
 
@@ -88,7 +86,6 @@ class DraftForwardPlan:
 class TargetVerifyPlan:
     model_worker_batch: ModelWorkerBatch
     forward_batch: ForwardBatch
-    verify_input: DFlashVerifyInput
     forward_metadata: object
     logits_metadata: LogitsMetadata
     seq_lens: np.ndarray
@@ -96,7 +93,6 @@ class TargetVerifyPlan:
     draft_extend_positions: jax.Array
     draft_extend_cache_loc: jax.Array
     active_mask: jax.Array
-    bs: int
 
 
 class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
@@ -108,7 +104,6 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             target_worker,
             self,
         )
-        self.device = server_args.device
         self.block_size = self.speculative_num_draft_tokens
 
         req_to_token_pool = self.req_to_token_pool
@@ -127,7 +122,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             model_class=DFlashDraftModel,
         )
         self._draft_model_runner = self._worker.model_runner
-        self.draft_model = self.draft_model_runner.model
+        draft_model = self.draft_model_runner.model
 
         # Alias the KV allocator so draft block allocation draws from the same
         # free list the target uses (no collision with committed slots).
@@ -164,7 +159,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
 
         self._draft_prefix_window = int(os.getenv("SGL_JAX_DFLASH_DRAFT_PREFIX_WINDOW", "0"))
         if self._draft_prefix_window > 0:
-            for layer in self.draft_model.model.layers:
+            for layer in draft_model.model.layers:
                 layer.self_attn.attn.sliding_window_size = self._draft_prefix_window
 
         # Initialize JIT for the draft model runner (skipped during __init__
@@ -172,7 +167,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         # before nnx.split captures the model graph.
         self.draft_model_runner.initialize_jit()
 
-        self.draft_layers = len(self.draft_model.model.layers)
+        self.draft_layers = len(draft_model.model.layers)
         self._init_jit_target_verify()
         self._init_jit_kv_materialize()
         self._init_jit_draft_block()
@@ -340,10 +335,6 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
     def draft_model_runner(self):
         return self._draft_model_runner
 
-    @draft_model_runner.setter
-    def draft_model_runner(self, value):
-        self._draft_model_runner = value
-
     def __getattr__(self, name):
         target_worker = self.__dict__.get("_target_worker")
         if target_worker is None:
@@ -453,7 +444,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             bs,
         )
         self.draft_model_runner.attn_backend.forward_metadata = draft_plan.forward_metadata
-        draft_token = self._run_jit_draft_block(draft_plan.forward_batch, None)
+        draft_token = self._run_jit_draft_block(draft_plan.forward_batch)
 
         # JAX dispatch is asynchronous. Bind the target model to the draft
         # proposal and shared device layout while jit_draft is executing.
@@ -640,7 +631,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                     plan.forward_batch,
                     runner.memory_pools,
                     plan.logits_metadata,
-                    plan.verify_input.draft_token,
+                    plan.forward_batch.input_ids,
                 )
                 cache_miss_count = count()
 
@@ -742,12 +733,10 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             distribution=template.distribution,
         )
         return DraftForwardPlan(
-            model_worker_batch=draft_mwb,
             forward_batch=forward_batch,
             forward_metadata=metadata,
             seq_lens=np.asarray(model_worker_batch.seq_lens, dtype=np.int32),
             target_prefix_lens=np.asarray(target_prefix_lens, dtype=np.int32),
-            draft_prefix_lens=np.asarray(draft_prefix_lens, dtype=np.int32),
             positions_host=positions_flat,
             bs=bs,
         )
@@ -798,7 +787,6 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         return TargetVerifyPlan(
             model_worker_batch=target_mwb,
             forward_batch=target_forward_batch,
-            verify_input=verify_input,
             forward_metadata=target_metadata,
             logits_metadata=LogitsMetadata.from_model_worker_batch(target_mwb, self.mesh),
             seq_lens=draft_plan.seq_lens,
@@ -806,7 +794,6 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             draft_extend_positions=draft_plan.forward_batch.positions,
             draft_extend_cache_loc=draft_extend_cache_loc,
             active_mask=template.active_mask,
-            bs=bs,
         )
 
     def _make_draft_block_mwb(
@@ -869,7 +856,6 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             model_state_leaves,
             forward_batch,
             memory_pools,
-            logits_metadata,
             embed,
             lm_head,
             *,
@@ -882,7 +868,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             model = nnx.merge(model_def, model_state)
             memory_pools = _maybe_apply_recurrent_cow(forward_batch, memory_pools)
             with LoraBatchContext.set_batch(forward_batch):
-                output, pool_updates, _, _ = model(forward_batch, memory_pools, logits_metadata)
+                output, pool_updates, _, _ = model(forward_batch, memory_pools, None)
 
             draft_hidden = output.hidden_states.reshape(
                 (-1, block_size, output.hidden_states.shape[-1])
@@ -909,7 +895,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             vocab_size=vocab_size,
         )
 
-    def _run_jit_draft_block(self, forward_batch, logits_metadata):
+    def _run_jit_draft_block(self, forward_batch):
         runner = self.draft_model_runner
         forward_batch.cache_loc = None
 
@@ -918,7 +904,6 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 runner.model_state_leaves,
                 forward_batch,
                 runner.memory_pools,
-                logits_metadata,
                 self._target_embed,
                 self._target_lm_head,
             )
@@ -942,12 +927,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             return _call_and_replace()
 
     def _init_jit_kv_materialize(self):
-        """Build a single JIT function for materialize_kv + merge + KV write.
-
-        Without this, each decode step dispatches ~60 individual JAX ops
-        (FC, 5×k/v proj, 5×merge, 5×scatter) with ~25 ms tracing overhead
-        each, totalling ~1.5 s.  One JIT call replaces them all.
-        """
+        """Fuse draft KV projection, merge, and cache writes into one JIT."""
         from functools import partial as _partial
 
         from flax import nnx
@@ -1224,7 +1204,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             distribution=template.distribution,
         )
         self.draft_model_runner.attn_backend.forward_metadata = draft_metadata
-        draft_token = self._run_jit_draft_block(forward_batch, None)
+        draft_token = self._run_jit_draft_block(forward_batch)
 
         # Match the serving dependency and sharding exactly: target verify
         # consumes the P("data") proposal produced by jit_draft.
@@ -1247,7 +1227,6 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         target_plan = TargetVerifyPlan(
             model_worker_batch=target_batch,
             forward_batch=target_forward_batch,
-            verify_input=verify_input,
             forward_metadata=target_metadata,
             logits_metadata=LogitsMetadata.from_model_worker_batch(target_batch, self.mesh),
             seq_lens=np.asarray(target_batch.seq_lens, dtype=np.int32) + 1,
@@ -1255,7 +1234,6 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             draft_extend_positions=forward_batch.positions,
             draft_extend_cache_loc=draft_extend_cache_loc,
             active_mask=template.active_mask,
-            bs=bs,
         )
         self.target_worker.model_runner.attn_backend.forward_metadata = target_metadata
         logits_output, _, accept_lens, *_ = self._run_jit_target_verify(target_plan)
