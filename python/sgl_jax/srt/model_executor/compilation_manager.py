@@ -34,6 +34,7 @@ class CompilationManager:
         page_size: int,
         max_req_len: int,
         vocab_size: int,
+        max_total_num_tokens: int = 0,
         multimodal: bool = False,
         has_recurrent_state: bool = False,
         moe_backend: str | None = None,
@@ -42,6 +43,7 @@ class CompilationManager:
         self.tp_size = tp_size
         self.page_size = page_size
         self.max_req_len = max_req_len
+        self.max_total_num_tokens = max_total_num_tokens
         self.max_padded_batch_size = max_padded_batch_size
         self.max_padded_num_tokens = max_padded_num_tokens
         self.vocab_size = vocab_size
@@ -98,8 +100,19 @@ class CompilationManager:
         return buckets
 
     def _compute_cache_loc_buckets(self) -> list[int]:
+        # bs reqs together can never exceed max_total_num_tokens, so cap the
+        # per-bs bucket at the pool size (helps Pathways gRPC H2D; see tp_worker
+        # for why the cap is proxy-only).
         pages_per_req = (self.max_req_len + self.page_size - 1) // self.page_size * self.page_size
-        return [bs * pages_per_req for bs in self.bs_buckets]
+        pool_aligned = (
+            (self.max_total_num_tokens + self.page_size - 1) // self.page_size * self.page_size
+            if self.max_total_num_tokens
+            else None
+        )
+        return [
+            min(bs * pages_per_req, pool_aligned) if pool_aligned else bs * pages_per_req
+            for bs in self.bs_buckets
+        ]
 
     # ---- Pre-compilation ----
 

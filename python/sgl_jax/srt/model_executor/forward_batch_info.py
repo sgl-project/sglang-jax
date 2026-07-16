@@ -251,6 +251,10 @@ class ForwardBatch:
     def tree_unflatten(cls, aux_data, children):
         obj = cls.__new__(cls)
 
+        # bid is intentionally not in aux_data (would break jit cache); only
+        # used by precision_tracer outside jit, so a sentinel is fine after a
+        # pytree round-trip (e.g. compilation_manager padding path).
+        obj.bid = 0
         obj.forward_mode = aux_data["forward_mode"]
         obj.batch_size = aux_data["batch_size"]
         obj.spec_algorithm = aux_data["spec_algorithm"]

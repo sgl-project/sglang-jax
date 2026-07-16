@@ -600,6 +600,10 @@ class FusedEPMoEV2(FusedEPMoE):
             )
 
         direct_scaled_dot = w1_scale is not None
+        kernel_sharding = jax.sharding.NamedSharding(self.mesh, P(("data", "tensor"), None))
+        hidden_states = jax.sharding.reshard(hidden_states, kernel_sharding)
+        topk_weights = jax.sharding.reshard(topk_weights, kernel_sharding)
+        topk_ids = jax.sharding.reshard(topk_ids, kernel_sharding)
 
         output = fused_ep_moe_v2(
             self.mesh,

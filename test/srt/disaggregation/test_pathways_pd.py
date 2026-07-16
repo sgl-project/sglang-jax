@@ -6,6 +6,7 @@ Run: XLA_FLAGS=--xla_force_host_platform_device_count=8 JAX_PLATFORMS=cpu \
 
 from __future__ import annotations
 
+import queue
 import threading
 from types import SimpleNamespace
 
@@ -19,10 +20,12 @@ from jax.sharding import PartitionSpec as P
 from sgl_jax.srt.disaggregation.pathways_pd import (
     PathwaysPDKVTransfer,
     group_by_slice,
+    group_pages_by_dp_rank,
     make_slice_meshes,
     migrate_reqs_p_to_d,
     slots_to_ordered_pages,
 )
+from sgl_jax.srt.disaggregation.pathways_scheduler import PathwaysPDSchedulerMixin
 
 NUM_PAGES = 16
 PAGE_SIZE = 4
@@ -35,9 +38,10 @@ def meshes():
     devs = jax.devices()
     if len(devs) < 8:
         pytest.skip(f"need >=8 devices, got {len(devs)}")
-    p_meshes, d_mesh = make_slice_meshes(dp_size=1, tp_per_side=len(devs) // 2)
+    p_meshes, d_meshes = make_slice_meshes(dp_size=1, tp_per_side=len(devs) // 2)
     assert isinstance(p_meshes, list) and len(p_meshes) == 1
-    return p_meshes[0], d_mesh
+    assert isinstance(d_meshes, list) and len(d_meshes) == 1
+    return p_meshes[0], d_meshes[0]
 
 
 def _make_pool(mesh, fill: str):
@@ -81,6 +85,71 @@ def test_make_slice_meshes(meshes):
 
 
 @pytest.mark.unit
+def test_make_slice_meshes_hetero_tp():
+    """tp_prefill != tp_per_side: P/D meshes have different tensor-axis size,
+    slices assigned by device count. group_by_slice fallback splits 8 CPU
+    devs into 2 groups of 4, so tp_p=tp_d=4 is the only combo we can test on
+    CPU without slice_index; the by-size assignment is unit-tested via a
+    monkeypatched group_by_slice returning unequal groups."""
+    devs = jax.devices()
+    if len(devs) < 6:
+        pytest.skip("need >=6 devices")
+    import sgl_jax.srt.disaggregation.pathways_pd as pd
+
+    orig = pd.group_by_slice
+    # fake: slice 0 = 4 dev (P tp4), slice 1 = 2 dev (D tp2)
+    pd.group_by_slice = lambda ds: {0: list(ds)[:4], 1: list(ds)[4:6]}
+    try:
+        p_meshes, d_meshes = make_slice_meshes(dp_size=1, tp_per_side=2, tp_prefill=4)
+        d_mesh = d_meshes[0]
+        assert p_meshes[0].devices.size == 4
+        assert d_mesh.devices.size == 2
+        assert p_meshes[0].shape["tensor"] == 4
+        assert d_mesh.shape["tensor"] == 2
+        p_ids = {d.id for d in p_meshes[0].devices.flatten()}
+        d_ids = {d.id for d in d_mesh.devices.flatten()}
+        assert p_ids.isdisjoint(d_ids)
+        # reversed roles: tp_p=2 (small P) tp_d=4 (big D) also assigns by size
+        p2, d2 = make_slice_meshes(dp_size=1, tp_per_side=4, tp_prefill=2)
+        assert p2[0].devices.size == 2 and d2[0].devices.size == 4
+        # mismatch: request tp_p=8 but no size-8 slice -> loud fail
+        with pytest.raises(RuntimeError, match="hetero-tp needs"):
+            make_slice_meshes(dp_size=1, tp_per_side=2, tp_prefill=8)
+    finally:
+        pd.group_by_slice = orig
+
+
+@pytest.mark.unit
+def test_transfer_byte_equal_hetero_tp():
+    """MLA-style pool (tensor-replicated P("data",None,None,None)) transfers
+    byte-equal across meshes of DIFFERENT tensor-axis size. This is the
+    GLM-5.2 hetero-TP path: device_put reshard is replicated->replicated
+    (change device set only), no shape change, no explicit reshape."""
+    devs = jax.devices()
+    if len(devs) < 6:
+        pytest.skip("need >=6 devices")
+    import sgl_jax.srt.disaggregation.pathways_pd as pd
+
+    orig = pd.group_by_slice
+    pd.group_by_slice = lambda ds: {0: list(ds)[:4], 1: list(ds)[4:6]}
+    try:
+        p_meshes, d_meshes = make_slice_meshes(dp_size=1, tp_per_side=2, tp_prefill=4)
+    finally:
+        pd.group_by_slice = orig
+    p_mesh, d_mesh = p_meshes[0], d_meshes[0]
+    p_pool = _make_pool(p_mesh, fill="seq")
+    d_pool = _make_pool(d_mesh, fill="zero")
+    xfer = PathwaysPDKVTransfer(p_mesh, d_mesh, p_pool, d_pool)
+    p_pages = np.array([1, 3, 5], np.int32)
+    d_pages = np.array([0, 2, 4], np.int32)
+    xfer.transfer(p_pages, d_pages)
+    for layer in range(N_LAYERS):
+        d_host = np.asarray(d_pool.kv_buffer[layer])
+        p_host = np.asarray(p_pool.kv_buffer[layer])
+        np.testing.assert_array_equal(d_host[d_pages], p_host[p_pages])
+
+
+@pytest.mark.unit
 def test_transfer_byte_equal(meshes):
     p_mesh, d_mesh = meshes
     p_pool = _make_pool(p_mesh, fill="seq")
@@ -97,6 +166,79 @@ def test_transfer_byte_equal(meshes):
         np.testing.assert_array_equal(d_host[d_pages], p_host[p_pages])
         untouched = np.array([1, 3, 5, 7, 8, 9], np.int32)
         np.testing.assert_array_equal(d_host[untouched], np.zeros_like(d_host[untouched]))
+
+
+@pytest.mark.unit
+def test_gather_scatter_jits_dp2_no_cross_rank_leakage():
+    """dp>1 kernel-level check (PathwaysPDKVTransfer's public API still
+    raises NotImplementedError for dp>1 pending scheduler-side per-req
+    dp_rank page grouping -- this test calls _make_pool_jits' gather_jit/
+    scatter_one_jit directly to prove the underlying shard_map kernel
+    itself is already dp>1-correct: each rank's local index only ever
+    touches that SAME rank's physical shard, never another rank's."""
+    from sgl_jax.srt.disaggregation.pathways_pd import _make_pool_jits
+
+    devs = jax.devices()
+    if len(devs) < 8:
+        pytest.skip(f"need >=8 devices, got {len(devs)}")
+    dp_size, tp_per_side = 2, 4
+    p_meshes, d_meshes = make_slice_meshes(dp_size=dp_size, tp_per_side=tp_per_side)
+    p_mesh, d_mesh = p_meshes[0], d_meshes[0]
+
+    p_pool = _make_pool(p_mesh, fill="seq")  # NUM_PAGES=16 total, 8 pages/rank
+    d_pool = _make_pool(d_mesh, fill="zero")
+    gather_jit, scatter_one_jit, d_stack_shard = _make_pool_jits(p_mesh, d_mesh, p_pool, d_pool)
+
+    pages_per_rank = NUM_PAGES // dp_size  # 8
+    # rank0 gathers its local pages [0,2]; rank1 gathers its local pages [1,3]
+    # (deliberately different per rank, so cross-rank leakage would be caught)
+    local_idx = np.array([[0, 2], [1, 3]], dtype=np.int32)
+    idx_dev = jax.device_put(local_idx, NamedSharding(p_mesh, P("data", None)))
+
+    stacked = gather_jit(tuple(p_pool.kv_buffer), idx_dev)
+    stacked_host = np.asarray(jax.device_put(stacked, d_stack_shard))
+
+    # gather output shape now [L, dp_size, n, page_size, 1, head_dim] (per-layer
+    # shard_map keeps the leading dp dim explicit instead of concatenating).
+    assert stacked_host.shape[:3] == (N_LAYERS, dp_size, 2)
+    p_host_full = [np.asarray(p_pool.kv_buffer[layer]) for layer in range(N_LAYERS)]
+    for layer in range(N_LAYERS):
+        # rank0's local page k lives at global page k; rank1's local page k
+        # lives at global page (pages_per_rank + k) -- per-rank contiguous shard.
+        expected_r0 = p_host_full[layer][[0, 2]]
+        expected_r1 = p_host_full[layer][[pages_per_rank + 1, pages_per_rank + 3]]
+        np.testing.assert_array_equal(stacked_host[layer, 0], expected_r0)
+        np.testing.assert_array_equal(stacked_host[layer, 1], expected_r1)
+
+    # scatter: write the gathered payload into DIFFERENT D-side local pages
+    # per rank, verify each rank's write lands only in its own shard.
+    scatter_idx = np.array([[5], [6]], dtype=np.int32)
+    scatter_idx_dev = jax.device_put(scatter_idx, NamedSharding(d_mesh, P("data", None)))
+    for layer in range(N_LAYERS):
+        # build payload on host (numpy) to avoid ad-hoc eager JAX indexing on
+        # an Explicit-sharded array, then device_put with the right sharding.
+        payload_host = np.stack(
+            [stacked_host[layer, 0, 0:1], stacked_host[layer, 1, 0:1]], axis=0
+        )  # [dp_size=2, n=1, page_size, 1, head_dim]
+        payload = jax.device_put(
+            payload_host, NamedSharding(d_mesh, P("data", None, None, None, None))
+        )
+        d_pool.kv_buffer[layer] = scatter_one_jit(d_pool.kv_buffer[layer], scatter_idx_dev, payload)
+
+    d_host_full = [np.asarray(d_pool.kv_buffer[layer]) for layer in range(N_LAYERS)]
+    for layer in range(N_LAYERS):
+        # rank0 wrote to its local page 5 (global page 5); rank1 wrote to its
+        # local page 6 (global page pages_per_rank+6).
+        np.testing.assert_array_equal(d_host_full[layer][5], p_host_full[layer][0])
+        np.testing.assert_array_equal(
+            d_host_full[layer][pages_per_rank + 6], p_host_full[layer][pages_per_rank + 1]
+        )
+        # everything else stays zero -- no cross-rank / off-target writes
+        untouched_mask = np.ones(NUM_PAGES, dtype=bool)
+        untouched_mask[[5, pages_per_rank + 6]] = False
+        np.testing.assert_array_equal(
+            d_host_full[layer][untouched_mask], np.zeros_like(d_host_full[layer][untouched_mask])
+        )
 
 
 @pytest.mark.unit
@@ -137,6 +279,49 @@ def test_slots_to_ordered_pages():
     np.testing.assert_array_equal(
         slots_to_ordered_pages(np.array([6, 7, 8, 9, 10], np.int32), 4), [1, 2]
     )
+
+
+def test_group_pages_by_dp_rank_balanced():
+    # rank0 req has 2 pages, rank1 req has 3 pages -> max_n=3, rank0 padded
+    # by repeating its own last page (7), never rank1's data.
+    pages_by_req = [(0, np.array([5, 7], np.int32)), (1, np.array([1, 2, 9], np.int32))]
+    pages, valid = group_pages_by_dp_rank(pages_by_req, dp_size=2)
+    np.testing.assert_array_equal(pages[0], [5, 7, 7])
+    np.testing.assert_array_equal(valid[0], [True, True, False])
+    np.testing.assert_array_equal(pages[1], [1, 2, 9])
+    np.testing.assert_array_equal(valid[1], [True, True, True])
+
+
+def test_group_pages_by_dp_rank_multi_req_same_rank():
+    # two reqs on the same rank get concatenated in order, not interleaved.
+    pages_by_req = [
+        (0, np.array([3], np.int32)),
+        (1, np.array([4, 5], np.int32)),
+        (0, np.array([6, 8], np.int32)),
+    ]
+    pages, valid = group_pages_by_dp_rank(pages_by_req, dp_size=2)
+    np.testing.assert_array_equal(pages[0], [3, 6, 8])
+    np.testing.assert_array_equal(valid[0], [True, True, True])
+    np.testing.assert_array_equal(pages[1], [4, 5, 5])
+    np.testing.assert_array_equal(valid[1], [True, True, False])
+
+
+def test_group_pages_by_dp_rank_empty_rank_marked_invalid():
+    # KNOWN LIMITATION case: rank1 has zero reqs this round. Its row must
+    # come back all-invalid (not silently defaulted to a "safe" real page --
+    # there isn't one), so a caller that forgets to check `valid` can't
+    # mistake page-index 0 for a real transfer.
+    pages_by_req = [(0, np.array([2, 4], np.int32))]
+    pages, valid = group_pages_by_dp_rank(pages_by_req, dp_size=2)
+    np.testing.assert_array_equal(pages[0], [2, 4])
+    np.testing.assert_array_equal(valid[0], [True, True])
+    np.testing.assert_array_equal(valid[1], [False, False])
+
+
+def test_group_pages_by_dp_rank_no_reqs():
+    pages, valid = group_pages_by_dp_rank([], dp_size=2)
+    assert pages.shape == (2, 0)
+    assert valid.shape == (2, 0)
 
 
 def _make_swa_pool(mesh, fill: str, n_swa_layers: int = 2):
@@ -212,6 +397,31 @@ def test_swa_page_mapping(meshes):
     full_pages = np.array([0, 1, 5], np.int32)
     np.testing.assert_array_equal(xfer._swa_pages(full_pages, xfer.p_mapping), [2, 3, 7])
     np.testing.assert_array_equal(xfer._swa_pages(full_pages, xfer.d_mapping), full_pages)
+
+
+def test_swa_pages_dp_rank_indexing():
+    """dp>1 building block: _swa_pages must select the CALLER-specified
+    dp_rank's mapping array, not always rank 0 -- each rank's mapping uses
+    that rank's own local index space (allocator.py: "Each rank has
+    independent [1, size_per_rank] indices"), so mixing ranks is wrong.
+    Default dp_rank=0 preserves today's dp=1-only behavior exactly."""
+    fake = SimpleNamespace(page_size=PAGE_SIZE, _swa_pages=PathwaysPDKVTransfer._swa_pages)
+    full_pages = np.array([0, 1, 2], np.int32)
+    # rank 0: full page k -> swa page k (identity)
+    map_r0 = np.arange(NUM_PAGES * PAGE_SIZE, dtype=np.int64)
+    # rank 1: full page k -> swa page (k+1) mod NUM_PAGES (shifted by one page)
+    map_r1 = ((map_r0 // PAGE_SIZE + 1) % NUM_PAGES) * PAGE_SIZE + map_r0 % PAGE_SIZE
+    mapping = [map_r0, map_r1]
+
+    # default dp_rank=0 (unchanged call signature still works)
+    np.testing.assert_array_equal(fake._swa_pages(fake, full_pages, mapping), full_pages)
+    np.testing.assert_array_equal(fake._swa_pages(fake, full_pages, mapping, dp_rank=0), full_pages)
+    # dp_rank=1 must use map_r1, NOT silently fall back to map_r0
+    np.testing.assert_array_equal(
+        fake._swa_pages(fake, full_pages, mapping, dp_rank=1), full_pages + 1
+    )
+    # non-list mapping (dp_size==1 real-world case): dp_rank is ignored, same array used
+    np.testing.assert_array_equal(fake._swa_pages(fake, full_pages, map_r0, dp_rank=1), full_pages)
 
 
 # ---- e2e: full migrate_reqs_p_to_d path on CPU mock pools ----
@@ -299,3 +509,80 @@ def test_migrate_reqs_e2e(meshes):
             p_host = np.asarray(p_pool.kv_buffer[layer]).reshape(-1, HEAD_DIM)
             d_host = np.asarray(d_pool.kv_buffer[layer]).reshape(-1, HEAD_DIM)
             np.testing.assert_array_equal(d_host[d_slots], p_host[p_slots])
+
+
+class _FakeDrainSelf:
+    """Minimal stand-in for `Scheduler` exposing only what
+    `_pd_drain_ready_multi` touches, so the multi-item drain loop can be
+    tested without booting a real scheduler/mesh/allocator stack."""
+
+    def __init__(self, ready_items=(), defer_items=(), drain_fn=None, ready_maxsize=8):
+        self._pd_ready_q = queue.Queue(maxsize=ready_maxsize)
+        for it in ready_items:
+            self._pd_ready_q.put_nowait(it)
+        self._pd_defer = list(defer_items)
+        self._drain_fn = drain_fn
+        self.drain_calls = 0
+
+    def _pd_drain_ready(self):
+        self.drain_calls += 1
+        self._drain_fn(self)
+
+
+def _drain_one_ready(fake: _FakeDrainSelf) -> None:
+    """Simulates a successful (non-deferred) drain: pop one ready_q item."""
+    try:
+        fake._pd_ready_q.get_nowait()
+    except queue.Empty:
+        pass
+
+
+def _drain_stuck_defer(fake: _FakeDrainSelf) -> None:
+    """Simulates a D-pool-full item that never fits: pop + re-append,
+    leaving both ready_q and defer-list lengths unchanged."""
+    item = fake._pd_defer.pop(0)
+    fake._pd_defer.append(item)
+
+
+def test_drain_multi_clears_backlog():
+    """A full ready_q backlog drains in a single tick, not one-per-tick."""
+    fake = _FakeDrainSelf(ready_items=list(range(5)), drain_fn=_drain_one_ready)
+    n_calls = PathwaysPDSchedulerMixin._pd_drain_ready_multi(fake)
+    assert fake._pd_ready_q.empty()
+    assert n_calls == 5
+    assert fake.drain_calls == 5
+
+
+def test_drain_multi_empty_makes_no_calls():
+    """Nothing to drain -> the loop must not call _pd_drain_ready at all."""
+    fake = _FakeDrainSelf(drain_fn=_drain_one_ready)
+    n_calls = PathwaysPDSchedulerMixin._pd_drain_ready_multi(fake)
+    assert n_calls == 0
+    assert fake.drain_calls == 0
+
+
+def test_drain_multi_stops_on_no_progress():
+    """A permanently-stuck deferred item (D pool never frees up) must not
+    burn the full maxsize+1 retry budget -- one no-op call, then exit."""
+    fake = _FakeDrainSelf(defer_items=["stuck-req"], drain_fn=_drain_stuck_defer)
+    n_calls = PathwaysPDSchedulerMixin._pd_drain_ready_multi(fake)
+    assert n_calls == 1
+    assert fake._pd_defer == ["stuck-req"]  # still stuck, untouched otherwise
+
+
+def test_drain_multi_mixed_backlog_then_stuck_defer():
+    """Ready_q items drain first (each shrinks the queue -> progress), then
+    a stuck defer item causes exit on the next no-progress call."""
+    fake = _FakeDrainSelf(ready_items=[1, 2, 3], defer_items=["stuck-req"])
+
+    def drain(f: _FakeDrainSelf) -> None:
+        if not f._pd_ready_q.empty():
+            _drain_one_ready(f)
+        else:
+            _drain_stuck_defer(f)
+
+    fake._drain_fn = drain
+    n_calls = PathwaysPDSchedulerMixin._pd_drain_ready_multi(fake)
+    assert fake._pd_ready_q.empty()
+    assert n_calls == 4  # 3 ready items + 1 no-progress defer call before exit
+    assert fake._pd_defer == ["stuck-req"]

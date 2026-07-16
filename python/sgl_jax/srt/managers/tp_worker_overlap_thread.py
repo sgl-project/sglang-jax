@@ -2,6 +2,7 @@
 
 import dataclasses
 import logging
+import os
 import signal
 import threading
 import time
@@ -63,11 +64,6 @@ class ModelWorkerClient:
         self.parent_process = psutil.Process().parent()
         replicated_sharding = NamedSharding(mesh, PartitionSpec())
         self.async_gather_fn = jax.jit(lambda x: x, out_shardings=replicated_sharding)
-        logger.info(
-            "[pd-debug] overlap mesh=%s replicated_devices=%s",
-            mesh.shape,
-            sorted(d.id for d in replicated_sharding.device_set),
-        )
 
     @property
     def model_runner(self):
@@ -120,6 +116,25 @@ class ModelWorkerClient:
             if not model_worker_batch:
                 break
 
+            if self.worker._pd_fuse_sample:
+                # Fused path: resolve/set_future are inlined into the single jit.
+                with jax.profiler.TraceAnnotation(
+                    f"forward_batch_generation {model_worker_batch.bid}"
+                ):
+                    logits_output, next_token_ids, cache_miss_count, new_future_map = (
+                        self.worker.forward_batch_generation(
+                            model_worker_batch,
+                            model_worker_batch.launch_done,
+                            sampling_metadata=sampling_metadata,
+                            forward_metadata=forward_metadata,
+                            future_map=self.future_token_ids_map,
+                            future_ct=future_token_ids_ct,
+                        )
+                    )
+                self.future_token_ids_map = new_future_map
+                self.output_queue.put((None, logits_output, next_token_ids, cache_miss_count))
+                continue
+
             # Resolve future tokens in the input
             input_ids = model_worker_batch.forward_batch.input_ids
             model_worker_batch.forward_batch.input_ids = resolve_future_token_ids(
@@ -136,14 +151,15 @@ class ModelWorkerClient:
                         forward_metadata=forward_metadata,
                     )
                 )
-            next_token_ids = self.async_gather_fn(next_token_ids)
-            # Update the future token ids map
+            # Feed the raw sampler output (stable P('data') sharding) so
+            # set_future's cpp-fastpath cache hits; async_gather afterwards.
             self.future_token_ids_map = set_future_token_ids(
                 self.future_token_ids_map,
                 future_token_ids_ct,
                 next_token_ids,
                 self.mesh,
             )
+            next_token_ids = self.async_gather_fn(next_token_ids)
             self.output_queue.put((None, logits_output, next_token_ids, cache_miss_count))
 
     def resolve_last_batch_result(self, launch_done: threading.Event | None = None):
@@ -175,6 +191,26 @@ class ModelWorkerClient:
             if logits_output.hidden_states is not None
             else None
         )
+        if os.environ.get("SGLANG_PD_DBG_NTOK"):
+            try:
+                _all = next_token_ids.addressable_shards
+                _sh = [
+                    (s.device.id, np.asarray(s.data).flatten()[:4].tolist())
+                    for s in (_all[:2] + _all[len(_all) // 2 : len(_all) // 2 + 2])
+                ]
+                _sp = getattr(next_token_ids.sharding, "spec", "?")
+            except Exception as _e:
+                _sh, _sp = f"err:{_e}", "?"
+            _full = np.asarray(jax.device_get(next_token_ids)).flatten()
+            _n = len(_full)
+            logger.info(
+                "[D-ntok] shape=%s spec=%s dp0[:4]=%s dp1[:4]=%s shards=%s",
+                _full.shape,
+                _sp,
+                _full[: min(4, _n // 2)].tolist(),
+                _full[_n // 2 : _n // 2 + 4].tolist(),
+                _sh,
+            )
         next_token_ids = jax.device_get(next_token_ids).tolist()
 
         # Step 2: materialize. The first np.asarray waits for that array's
@@ -190,7 +226,7 @@ class ModelWorkerClient:
         if launch_done is not None:
             launch_done.wait()
         _r4 = time.perf_counter()
-        if _r4 - _r0 > 0.5:
+        if os.environ.get("SGLANG_PD_DBG") and _r4 - _r0 > 0.5:
             import gc as _gc
 
             import jax as _jax
@@ -267,8 +303,8 @@ class ModelWorkerClient:
         self.future_token_ids_ct = (self.future_token_ids_ct + bs) % self.future_token_ids_limit
         return None, future_next_token_ids, 0
 
-    def run_precompile(self):
-        self.worker.run_precompile(self.future_token_ids_map)
+    def run_precompile(self, only: str | None = None):
+        self.worker.run_precompile(self.future_token_ids_map, only=only)
 
     @property
     def page_size(self) -> int:

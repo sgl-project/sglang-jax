@@ -106,6 +106,9 @@ class ServerArgs:
     pd_prefill_max_tokens: int = 20480
     pd_decode_max_tokens: int = 25600
     pd_num_prefill: int = 1
+    pd_num_decode: int = 1
+    pd_prefill_tp_size: int = 0
+    pd_prefill_ep_size: int = 0
     tp_size: int = 1
     ep_size: int = 1
     ep_num_redundant_experts: int = 0
@@ -950,6 +953,29 @@ class ServerArgs:
             type=int,
             default=ServerArgs.pd_num_prefill,
             help="Number of prefill slices for pathways PD (Stage 6 multi-P).",
+        )
+        parser.add_argument(
+            "--pd-num-decode",
+            dest="pd_num_decode",
+            type=int,
+            default=ServerArgs.pd_num_decode,
+            help="Number of decode slices for pathways PD (1P-ND fan-out).",
+        )
+        parser.add_argument(
+            "--pd-prefill-tp-size",
+            dest="pd_prefill_tp_size",
+            type=int,
+            default=ServerArgs.pd_prefill_tp_size,
+            help="Prefill-side tp_size for pathways PD hetero-TP (Stage 6 "
+            "P-D-different-tp). 0 = same as --tp-size (D side).",
+        )
+        parser.add_argument(
+            "--pd-prefill-ep-size",
+            dest="pd_prefill_ep_size",
+            type=int,
+            default=ServerArgs.pd_prefill_ep_size,
+            help="Prefill-side ep_size for pathways PD hetero-TP. "
+            "0 = scale ep_size by tp_p/tp_d.",
         )
 
         parser.add_argument(

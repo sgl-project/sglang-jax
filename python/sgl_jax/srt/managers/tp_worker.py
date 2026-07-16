@@ -12,6 +12,8 @@ import numpy as np
 import psutil
 from flax import nnx
 from jax.experimental.multihost_utils import broadcast_one_to_all
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.constrained.bitmask_ops import allocate_token_bitmask
@@ -71,6 +73,10 @@ class ModelWorker:
         # Parse args
         self.tp_size = server_args.tp_size
         self.dp_size = server_args.dp_size
+        self._pd_fuse_sample = (
+            server_args.pd_disaggregation == "pathways"
+            and os.getenv("SGLANG_PD_FUSE_SAMPLE") == "1"
+        )
         from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
@@ -220,6 +226,14 @@ class ModelWorker:
 
         assert self.max_running_requests > 0, "max_running_request is zero"
 
+        # Same-shape dummy for callers without a real future map (precompile,
+        # non-overlap) so the fused jit variant matches the overlap-thread shape.
+        if self._pd_fuse_sample:
+            self._pd_dummy_future_map = jax.device_put(
+                jnp.zeros((self.max_running_requests * 5,), dtype=jnp.int32),
+                NamedSharding(self.mesh, P(None)),
+            )
+
         # A single request lives on one DP rank, so max_req_len is bounded
         # by per-rank pool size, not the global (dp-scaled) pool size.
         per_rank_tokens = (
@@ -255,6 +269,14 @@ class ModelWorker:
             page_size=self.page_size,
             max_req_len=self.max_req_len,
             vocab_size=self.model_config.vocab_size,
+            # cache_loc bucket cap under Pathways proxy backend (PD or colocated
+            # alike -- both do H2D over gRPC where the smaller bucket helps). On
+            # native TPU the smaller/odd bucket shape yields a slower Pallas
+            # ragged-attention kernel and native H2D is fast enough that the
+            # uncapped bucket is not on the critical path.
+            max_total_num_tokens=(
+                self.max_total_num_tokens if os.getenv("JAX_PLATFORMS") == "proxy" else 0
+            ),
             multimodal=server_args.multimodal,
             has_recurrent_state=self.model_runner.linear_recurrent_config is not None,
             moe_backend=effective_moe_backend,
@@ -287,15 +309,21 @@ class ModelWorker:
             layers_topk_ids, model_worker_batch = self.sync_queue.get()
             get_global_experts_capturer().on_forward_end(layers_topk_ids, model_worker_batch)
 
-    def run_precompile(self, future_token_ids_map=None):
+    def run_precompile(self, future_token_ids_map=None, only: str | None = None):
         prepare_lora = self.prepare_lora_batch if self.server_args.enable_lora else None
-        self.compilation_manager.precompile_all(
-            forward_fn=self.forward_batch_generation,
-            model_runner=self.model_runner,
-            mesh=self.mesh,
-            prepare_lora_fn=prepare_lora,
-            future_token_ids_map=future_token_ids_map,
+        args = (
+            self.forward_batch_generation,
+            self.model_runner,
+            self.mesh,
+            prepare_lora,
+            future_token_ids_map,
         )
+        if only == "extend":
+            self.compilation_manager._precompile_extend(*args)
+        elif only == "decode":
+            self.compilation_manager._precompile_decode(*args)
+        else:
+            self.compilation_manager.precompile_all(*args)
 
     def set_forward_metadata(self, model_worker_batch: ModelWorkerBatch):
         self.model_runner.attn_backend.forward_metadata = (
@@ -416,6 +444,8 @@ class ModelWorker:
         skip_sample: bool = False,
         sampling_metadata: SamplingMetadata = None,
         forward_metadata=None,
+        future_map=None,
+        future_ct=None,
     ) -> tuple[LogitsProcessorOutput, jax.Array | None, int]:
         # Prepare LoRA batch if LoRA is enabled
         if self.worker.server_args.enable_lora and self.need_prepare_lora_batch:
@@ -442,6 +472,36 @@ class ModelWorker:
 
         self.model_runner.attn_backend.forward_metadata = forward_metadata
         logits_metadata = LogitsMetadata.from_model_worker_batch(model_worker_batch, self.mesh)
+
+        # Pathways-PD: fuse run_model+sampler+resolve/set into one jit so a
+        # decode tick is a single Execute through the ordered dispatch queue.
+        if (
+            self._pd_fuse_sample
+            and not skip_sample
+            and not model_worker_batch.return_output_logprob_only
+        ):
+            if model_worker_batch.sampling_info:
+                self._update_grammar_vocab_mask(model_worker_batch, sampling_metadata)
+            fmap = future_map if future_map is not None else self._pd_dummy_future_map
+            fct = future_ct if future_ct is not None else 0
+            (
+                next_token_ids_device,
+                logits_output,
+                _,
+                cache_miss_count,
+                layers_topk_ids,
+                new_future_map,
+            ) = self.model_runner.forward_and_sample(
+                forward_batch, logits_metadata, sampling_metadata, fmap, fct
+            )
+            self.dump_topk_ids(layers_topk_ids, model_worker_batch)
+            if launch_done is not None:
+                launch_done.set()
+            self.sync_queue.put((layers_topk_ids, model_worker_batch))
+            if future_map is not None:
+                return (logits_output, next_token_ids_device, cache_miss_count, new_future_map)
+            return (logits_output, next_token_ids_device, cache_miss_count)
+
         logits_output, cache_miss_count, layers_topk_ids = self.model_runner.forward(
             forward_batch,
             logits_metadata=logits_metadata,

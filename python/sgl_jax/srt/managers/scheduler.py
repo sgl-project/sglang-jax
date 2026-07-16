@@ -425,6 +425,8 @@ class Scheduler(
             spec_algorithm=self.spec_algorithm,
             mesh=self.mesh,
         )
+        if self.pd == "pathways":
+            self._pd_init_decode_extras()
         # The current forward batch
         self.cur_batch: ScheduleBatch | None = None
         # The last forward batch
@@ -1026,13 +1028,30 @@ class Scheduler(
             if self._engine_paused:
                 continue
 
+            _it1 = time.perf_counter() if self.pd == "pathways" else 0.0
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
             self._flush_pending_h2d()
+            _it2 = time.perf_counter() if self.pd == "pathways" else 0.0
 
             if batch:
                 result = self.run_batch(batch)
+                _it3 = time.perf_counter() if self.pd == "pathways" else 0.0
                 self.process_batch_result(batch, result)
+                if (
+                    self.pd == "pathways"
+                    and os.environ.get("SGLANG_PD_DBG")
+                    and self.forward_ct % 50 == 0
+                ):
+                    _it4 = time.perf_counter()
+                    logger.info(
+                        "[pd-iter-n] get_batch=%.1f run=%.1f proc=%.1f tot=%.1f running=%d",
+                        (_it2 - _it1) * 1e3,
+                        (_it3 - _it2) * 1e3,
+                        (_it4 - _it3) * 1e3,
+                        (_it4 - _it1) * 1e3,
+                        sum(len(i.reqs) for i in self.running_batch.reqs_info),
+                    )
             else:
                 # When the server is idle, do self-check and re-init some states
                 self.check_memory()
@@ -1048,7 +1067,7 @@ class Scheduler(
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and Accelerator computation."""
         self.result_queue = deque()
-        _pd_iter_trace = self.pd == "pathways"
+        _pd_iter_trace = self.pd == "pathways" and os.environ.get("SGLANG_PD_DBG")
 
         if self.pd == "pathways":
             import gc as _gc
@@ -1147,7 +1166,7 @@ class Scheduler(
                         (_it2 - _it1) * 1e3,
                         (_it3 - _it2) * 1e3,
                         sum(len(i.reqs) for i in self.running_batch.reqs_info),
-                        getattr(self, "_pd_inflight", 0),
+                        len(getattr(self, "_pd_inflight_rids", ())),
                     )
 
     def run_publisher(self, recv_reqs):
@@ -2652,6 +2671,8 @@ def dispatch_scheduler_event_loop(scheduler: Scheduler, server_args: ServerArgs)
         scheduler.event_loop_normal_disagg_prefill()
     elif mode == "decode":
         scheduler.event_loop_normal_disagg_decode()
+    elif scheduler.pd == "pathways" and getattr(scheduler, "_pd_n_decode", 1) > 1:
+        scheduler.event_loop_overlap_pd_nd()
     elif scheduler.enable_overlap:
         scheduler.event_loop_overlap()
     else:
