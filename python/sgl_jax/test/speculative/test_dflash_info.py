@@ -13,20 +13,15 @@ from sgl_jax.srt.speculative.overlap_utils import (
     can_merge_spec_non_overlap_prefill,
     use_legacy_eagle3_non_overlap,
 )
-from sgl_jax.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
+from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
-def test_dflash_verify_input_is_spec_input_and_pytree():
+def test_dflash_verify_input_pytree_round_trip():
     vi = DFlashVerifyInput(
         draft_token=jnp.arange(8, dtype=jnp.int32),
         custom_mask=None,
         draft_token_num=4,
     )
-
-    assert isinstance(vi, SpecInput)
-    assert vi.is_verify_input() and not vi.is_draft_input()
-    assert vi.get_spec_adjust_token_coefficient() == 4
-    assert vi.get_verify_token_num(bs=2) == 8
 
     leaves, treedef = jax.tree_util.tree_flatten(vi)
     restored = jax.tree_util.tree_unflatten(treedef, leaves)
@@ -91,20 +86,6 @@ def test_dflash_greedy_verify_keeps_outputs_data_sharded():
         assert output.sharding.spec == P("data")
     np.testing.assert_array_equal(np.asarray(accept_lens), np.full(bs, 4, dtype=np.int32))
     np.testing.assert_array_equal(np.asarray(verified_id), np.full(bs, 99, dtype=np.int32))
-
-
-def test_dflash_draft_input_is_spec_input():
-    di = DFlashDraftInput(
-        verified_id=np.array([1, 2], dtype=np.int32),
-        target_hidden=None,
-        ctx_lens=np.array([0, 0], dtype=np.int32),
-        draft_seq_lens=np.array([5, 7], dtype=np.int32),
-    )
-
-    assert isinstance(di, SpecInput)
-    assert di.is_draft_input() and not di.is_verify_input()
-    np.testing.assert_array_equal(di.get_logical_token_num(bs=2), np.ones(2, dtype=np.int32))
-    assert di.get_verify_token_num(bs=2) == 0
 
 
 def test_dflash_draft_input_filter_batch():

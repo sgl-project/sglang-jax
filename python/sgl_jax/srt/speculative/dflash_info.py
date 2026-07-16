@@ -39,7 +39,7 @@ def build_dflash_draft_block(
     return block_ids, positions.astype(np.int32)
 
 
-# @haifeng Maybe common!
+# TODO(haifeng): Share greedy chain verification through common speculative helpers.
 def dflash_greedy_verify(
     draft_token: jax.Array,
     target_logits: jax.Array,
@@ -119,24 +119,6 @@ class DFlashDraftInput:
         self.capture_hidden_mode = capture_hidden_mode
         self.block_size = int(block_size)
 
-    def is_draft_input(self) -> bool:
-        return True
-
-    def is_verify_input(self) -> bool:
-        return False
-
-    def get_spec_adjust_token_coefficient(self) -> int:
-        return 1
-
-    def get_logical_token_num(self, bs: int) -> np.ndarray:
-        return np.ones((bs,), dtype=np.int32)
-
-    def get_allocated_token_num(self) -> np.ndarray | None:
-        return None
-
-    def get_verify_token_num(self, bs: int) -> int:
-        return 0
-
     def _ensure_host(self) -> None:
         for f in ("verified_id", "ctx_lens", "draft_seq_lens"):
             v = getattr(self, f, None)
@@ -191,6 +173,8 @@ class DFlashDraftInput:
         pass
 
     def prepare_for_decode(self, schedule_batch) -> None:
+        # TODO(haifeng): Share KV slot reservation and req_to_token_pool updates
+        # with EAGLE through common speculative helpers in the next PR.
         from sgl_jax.srt.managers.schedule_batch import get_last_loc
         from sgl_jax.srt.mem_cache.common import (
             alloc_paged_token_slots_extend,
@@ -363,24 +347,6 @@ class DFlashVerifyInput:
     draft_token: jax.Array
     draft_token_num: int
     custom_mask: jax.Array | None = None
-
-    def is_draft_input(self) -> bool:
-        return False
-
-    def is_verify_input(self) -> bool:
-        return True
-
-    def get_spec_adjust_token_coefficient(self) -> int:
-        return int(self.draft_token_num)
-
-    def get_logical_token_num(self, bs: int) -> np.ndarray:
-        return np.full((bs,), int(self.draft_token_num), dtype=np.int32)
-
-    def get_allocated_token_num(self) -> np.ndarray | None:
-        return None
-
-    def get_verify_token_num(self, bs: int) -> int:
-        return int(bs) * int(self.draft_token_num)
 
     def filter_batch(self, new_indices: np.ndarray, has_been_filtered: bool = True) -> None:
         raise NotImplementedError("DFlashVerifyInput is built per verify step and is not filtered.")

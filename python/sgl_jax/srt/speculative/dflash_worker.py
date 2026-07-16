@@ -102,9 +102,6 @@ class TargetVerifyPlan:
 class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
     """DFlash draft/verify runtime worker (greedy, DP/TP aware)."""
 
-    _requires_allocate_lens = False
-    _force_greedy_prefill = True
-
     def __init__(self, server_args, target_worker: ModelWorker):
         super().__init__(
             server_args,

@@ -68,9 +68,6 @@ class BaseSpecWorker:
     ``BaseDraftWorker`` they construct.
     """
 
-    _requires_allocate_lens = True
-    _force_greedy_prefill = False
-
     def __init__(self, server_args, target_worker: ModelWorker, draft_worker: BaseDraftWorker):
         self.server_args = server_args
         self._target_worker = target_worker
@@ -143,9 +140,9 @@ class BaseSpecWorker:
         )
 
     def _get_cur_allocate_lens(self, model_worker_batch: ModelWorkerBatch):
-        if not self._requires_allocate_lens:
+        allocate_lens = getattr(model_worker_batch.spec_info_padded, "allocate_lens", None)
+        if allocate_lens is None:
             return None
-        allocate_lens = model_worker_batch.spec_info_padded.allocate_lens
         return np.asarray(allocate_lens)[model_worker_batch.logits_indices_selector]
 
     # -- Main entry point --
@@ -236,9 +233,7 @@ class BaseSpecWorker:
                 self.mesh,
                 vocab_size=self.target_worker.model_config.vocab_size,
             )
-            if (
-                self._force_greedy_prefill or model_worker_batch.sampling_info.is_all_greedy
-            ) and not legacy_non_overlap:
+            if model_worker_batch.sampling_info.is_all_greedy and not legacy_non_overlap:
                 logits_output, _, cache_miss_count, bid, _seq_lens = self.forward_target_extend(
                     model_worker_batch,
                     sampling_metadata,
