@@ -9,10 +9,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from sgl_jax.srt.layers.attention.flashattention_backend import (
-    _pad_page_indices,
-    _repack_row_padded_page_indices,
-)
+from sgl_jax.srt.layers.attention.flashattention_backend import _pad_page_indices
 from sgl_jax.srt.speculative.dflash_info import DFlashDraftInput
 from sgl_jax.srt.speculative.dflash_worker import DFlashWorker
 
@@ -143,34 +140,68 @@ def test_committed_decode_row_padded_cache_loc_handles_uneven_dp_ranks():
     )
 
 
-def test_rebuild_cache_loc_reads_each_dp_rank_section():
+def test_build_page_indices_preserves_dp_rank_sections():
     req_to_token = np.arange(200, dtype=np.int32).reshape(10, 20)
-    target_worker = SimpleNamespace(
-        model_runner=SimpleNamespace(req_to_token_pool=SimpleNamespace(req_to_token=req_to_token))
+    w = _bare_worker(
+        req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
+        block_size=2,
+        page_size=1,
+        _page_indices_pool_capacity=16,
+        _page_indices_per_seq_capacity=4,
     )
-    w = _bare_worker(_target_worker=target_worker, block_size=2, page_size=1)
-    # Each rank owns [two verify rows | conservative padding].
     mwb = SimpleNamespace(
         req_pool_indices=np.array([1, 2, 3, 4], dtype=np.int32),
-        out_cache_loc=np.array(
-            [100, 101, 110, 111, -1, -1, -1, -1, 120, 121, 130, 131, -1, -1, -1, -1],
-            dtype=np.int32,
-        ),
+        logits_indices_selector=np.arange(4, dtype=np.int32),
         dp_size=2,
         per_dp_bs_size=2,
     )
 
-    w._rebuild_cache_loc(mwb, np.array([1, 1, 1, 1], dtype=np.int32), bs=4)
+    page_indices = w._build_dflash_page_indices(
+        mwb,
+        np.array([1, 1, 1, 1], dtype=np.int32),
+        bs=4,
+    )
 
-    rows = mwb.cache_loc.reshape(4, -1)
     np.testing.assert_array_equal(
-        rows[:, :3],
+        page_indices.reshape(2, 8),
         np.array(
             [
-                [20, 100, 101],
-                [40, 110, 111],
-                [60, 120, 121],
-                [80, 130, 131],
+                [20, 21, 22, 40, 41, 42, 0, 0],
+                [60, 61, 62, 80, 81, 82, 0, 0],
+            ],
+            dtype=np.int32,
+        ),
+    )
+
+
+def test_build_page_indices_handles_uneven_dp_ranks():
+    req_to_token = np.arange(160, dtype=np.int32).reshape(8, 20)
+    w = _bare_worker(
+        req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
+        block_size=2,
+        page_size=1,
+        _page_indices_pool_capacity=16,
+        _page_indices_per_seq_capacity=4,
+    )
+    mwb = SimpleNamespace(
+        req_pool_indices=np.array([1, 2, 0, 4, 0, 0], dtype=np.int32),
+        logits_indices_selector=np.array([0, 1, 3], dtype=np.int32),
+        dp_size=2,
+        per_dp_bs_size=3,
+    )
+
+    page_indices = w._build_dflash_page_indices(
+        mwb,
+        np.array([2, 1, 0, 3, 0, 0], dtype=np.int32),
+        bs=6,
+    )
+
+    np.testing.assert_array_equal(
+        page_indices.reshape(2, 8),
+        np.array(
+            [
+                [20, 21, 22, 23, 40, 41, 42, 0],
+                [80, 81, 82, 83, 84, 0, 0, 0],
             ],
             dtype=np.int32,
         ),
@@ -255,75 +286,38 @@ def test_prefill_precompile_variants_use_runtime_extend_buckets():
     ]
 
 
-def test_pack_cache_loc_rows_uses_bucket_stable_row_width():
-    w = _bare_worker(page_size=1)
-    rows = [
-        np.array([1, 2, 3], dtype=np.int32),
-        np.array([4, 5, 6, 7, 8], dtype=np.int32),
-    ]
-
-    packed = w._pack_kv_cache(rows, [len(r) for r in rows])
-
-    assert packed.shape == (32,)
-    np.testing.assert_array_equal(packed[:16], np.array([1, 2, 3] + [3] * 13, dtype=np.int32))
-    np.testing.assert_array_equal(
-        packed[16:32], np.array([4, 5, 6, 7, 8] + [8] * 11, dtype=np.int32)
-    )
-
-
-def test_repack_row_padded_page_indices_removes_dflash_row_padding():
-    row0 = np.array(list(range(100, 123)) + [122] * 9, dtype=np.int32)
-    row1 = np.array(list(range(200, 223)) + [222] * 9, dtype=np.int32)
-    cache_loc = np.concatenate([row0, row1])
-
-    page_indices = _repack_row_padded_page_indices(
-        cache_loc,
-        np.array([23, 23], dtype=np.int32),
-        page_size=1,
-        dp_size=1,
-        per_dp_bs=2,
-    )
-
-    assert page_indices.shape == (46,)
-    np.testing.assert_array_equal(page_indices[:23], np.arange(100, 123, dtype=np.int32))
-    np.testing.assert_array_equal(page_indices[23:], np.arange(200, 223, dtype=np.int32))
-
-
-def test_repack_row_padded_page_indices_preserves_uneven_dp_rank_sections():
-    cache_loc = np.array(
+def test_build_page_indices_reads_noncontiguous_physical_pages():
+    req_to_token = np.array(
         [
-            10,
-            11,
-            12,
-            12,
-            20,
-            20,
-            20,
-            20,
-            30,
-            30,
-            30,
-            30,
-            0,
-            0,
-            0,
-            0,
+            np.arange(8),
+            [20, 21, 40, 41, 60, 61, 80, 81],
+            [100, 101, 120, 121, 140, 141, 160, 161],
         ],
         dtype=np.int32,
     )
+    w = _bare_worker(
+        req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
+        block_size=2,
+        page_size=2,
+        _page_indices_pool_capacity=8,
+        _page_indices_per_seq_capacity=4,
+    )
+    mwb = SimpleNamespace(
+        req_pool_indices=np.array([1, 2], dtype=np.int32),
+        logits_indices_selector=np.array([0, 1], dtype=np.int32),
+        dp_size=1,
+        per_dp_bs_size=2,
+    )
 
-    page_indices = _repack_row_padded_page_indices(
-        cache_loc,
-        np.array([3, 1, 1, 0], dtype=np.int32),
-        page_size=1,
-        dp_size=2,
-        per_dp_bs=2,
-        fixed_capacity=8,
+    page_indices = w._build_dflash_page_indices(
+        mwb,
+        np.array([3, 2], dtype=np.int32),
+        bs=2,
     )
 
     np.testing.assert_array_equal(
         page_indices,
-        np.array([10, 11, 12, 20, 30, 0, 0, 0], dtype=np.int32),
+        np.array([10, 20, 30, 50, 60, 0, 0, 0], dtype=np.int32),
     )
 
 

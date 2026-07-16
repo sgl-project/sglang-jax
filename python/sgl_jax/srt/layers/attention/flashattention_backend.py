@@ -36,89 +36,6 @@ def _per_dp_cumsum(lens, dp_size: int, per_dp_bs: int) -> np.ndarray:
     return cu.ravel()
 
 
-def _repack_row_padded_page_indices(
-    cache_loc: np.ndarray,
-    aligned_seq_lens: np.ndarray,
-    *,
-    page_size: int,
-    dp_size: int,
-    per_dp_bs: int,
-    fixed_capacity: int | None = None,
-) -> np.ndarray:
-    """Repack row-padded cache_loc into cu_kv_lens-aligned page_indices.
-
-    DFlash keeps ``cache_loc`` rows bucket-padded to stabilize JIT input shapes.
-    The attention kernel, however, uses ``cu_kv_lens`` to locate each request's
-    pages. Therefore row padding must be removed from the middle of
-    ``page_indices`` and moved to the final whole-buffer padding step.
-    """
-    cache_loc = np.asarray(cache_loc, dtype=np.int32)
-    aligned_seq_lens = np.asarray(aligned_seq_lens, dtype=np.int64)
-    max_num_seqs = int(dp_size) * int(per_dp_bs)
-    if max_num_seqs <= 0 or cache_loc.size == 0:
-        return np.empty(0, dtype=np.int32)
-
-    if cache_loc.size % max_num_seqs != 0:
-        raise ValueError(
-            "row-padded cache_loc must be divisible by total sequence slots: "
-            f"len(cache_loc)={cache_loc.size}, max_num_seqs={max_num_seqs}"
-        )
-    if aligned_seq_lens.shape[0] != max_num_seqs:
-        raise ValueError(
-            "aligned_seq_lens must match total sequence slots: "
-            f"{aligned_seq_lens.shape[0]} vs {max_num_seqs}"
-        )
-
-    row_width = cache_loc.size // max_num_seqs
-    if row_width % page_size != 0:
-        raise ValueError(f"row_width={row_width} must be divisible by page_size={page_size}")
-
-    rank_chunks: list[np.ndarray] = []
-    for r in range(dp_size):
-        parts: list[np.ndarray] = []
-        for j in range(per_dp_bs):
-            slot = r * per_dp_bs + j
-            valid_len = int(aligned_seq_lens[slot])
-            if valid_len <= 0:
-                continue
-            if valid_len > row_width:
-                raise ValueError(
-                    "aligned sequence length exceeds row-padded cache_loc width: "
-                    f"slot={slot}, valid_len={valid_len}, row_width={row_width}"
-                )
-            row_start = slot * row_width
-            row_pages = cache_loc[row_start : row_start + valid_len : page_size]
-            parts.append((row_pages // page_size).astype(np.int32))
-        rank_chunks.append(np.concatenate(parts) if parts else np.empty((0,), dtype=np.int32))
-
-    if fixed_capacity is not None:
-        fixed_capacity = int(fixed_capacity)
-        if fixed_capacity % dp_size != 0:
-            raise ValueError(
-                "DFlash page_indices capacity must be divisible by dp_size: "
-                f"capacity={fixed_capacity}, dp_size={dp_size}."
-            )
-        per_rank_capacity = fixed_capacity // dp_size
-    else:
-        per_rank_capacity = max((len(chunk) for chunk in rank_chunks), default=0)
-
-    for r, chunk in enumerate(rank_chunks):
-        if len(chunk) > per_rank_capacity:
-            raise ValueError(
-                "DFlash page_indices exceed the per-rank capacity: "
-                f"rank={r}, required={len(chunk)}, capacity={per_rank_capacity}."
-            )
-
-    if per_rank_capacity == 0:
-        return np.empty((0,), dtype=np.int32)
-    return np.concatenate(
-        [
-            np.pad(chunk, (0, per_rank_capacity - len(chunk)), constant_values=0)
-            for chunk in rank_chunks
-        ]
-    ).astype(np.int32)
-
-
 def _pad_page_indices(
     page_indices: np.ndarray,
     max_num_seqs: int,
@@ -320,14 +237,18 @@ class FlashAttention(AttentionBackend):
         self,
         batch: ModelWorkerBatch,
         *,
+        page_indices: np.ndarray | None = None,
         page_indices_capacity: int | None = None,
     ):
         """Return the metadata for a forward pass."""
         # below code is for verify and draft extend phase
         metadata = FlashAttentionMetadata()
-        indices = np.arange(0, len(batch.cache_loc), self.page_size)
-        selected_cache_locs = batch.cache_loc[indices]
-        page_indices = (selected_cache_locs // self.page_size).astype(np.int32)
+        if page_indices is None:
+            indices = np.arange(0, len(batch.cache_loc), self.page_size)
+            selected_cache_locs = batch.cache_loc[indices]
+            page_indices = (selected_cache_locs // self.page_size).astype(np.int32)
+        else:
+            page_indices = np.asarray(page_indices, dtype=np.int32)
 
         if batch.forward_mode == ForwardMode.TARGET_VERIFY:
             metadata.custom_mask = batch.spec_info_padded.custom_mask
@@ -398,20 +319,6 @@ class FlashAttention(AttentionBackend):
                     sharding=NamedSharding(self.mesh, P("data")),
                 )
 
-            if getattr(batch.spec_algorithm, "is_dflash", lambda: False)():
-                page_indices = _repack_row_padded_page_indices(
-                    batch.cache_loc,
-                    aligned_seq_lens,
-                    page_size=self.page_size,
-                    dp_size=dp_size,
-                    per_dp_bs=per_dp_bs,
-                    fixed_capacity=page_indices_capacity,
-                )
-                # The helper has already padded every DP rank to an equal
-                # section. Avoid appending padding only at the global tail,
-                # which would move rank boundaries when sharded by data.
-                if page_indices_capacity is None:
-                    page_indices_capacity = len(page_indices)
         else:
             aligned_seq_lens = (
                 (batch.seq_lens + self.page_size - 1) // self.page_size

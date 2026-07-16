@@ -134,6 +134,94 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             max(int(bs), 1) * self._page_indices_per_seq_capacity,
         )
 
+    def _build_dflash_page_indices(
+        self,
+        model_worker_batch: ModelWorkerBatch,
+        prefix_lens: np.ndarray,
+        bs: int,
+    ) -> np.ndarray:
+        """Build fixed-capacity, DP-segmented page indices from req_to_token."""
+        dp_size = int(getattr(model_worker_batch, "dp_size", 1))
+        per_dp_bs = int(getattr(model_worker_batch, "per_dp_bs_size", bs))
+        if dp_size * per_dp_bs != bs:
+            raise ValueError(
+                "DFLASH page layout has inconsistent DP metadata: "
+                f"dp_size={dp_size}, per_dp_bs={per_dp_bs}, bs={bs}."
+            )
+
+        capacity = self._page_indices_capacity(bs)
+        if capacity % dp_size != 0:
+            raise ValueError(
+                "DFLASH page_indices capacity must be divisible by dp_size: "
+                f"capacity={capacity}, dp_size={dp_size}."
+            )
+        per_rank_capacity = capacity // dp_size
+
+        prefix_lens = np.asarray(prefix_lens, dtype=np.int32)
+        if prefix_lens.shape != (bs,):
+            raise ValueError(
+                f"DFLASH prefix_lens must have shape ({bs},), got {prefix_lens.shape}."
+            )
+        req_pool_indices = np.asarray(model_worker_batch.req_pool_indices, dtype=np.int64)
+        if req_pool_indices.shape != (bs,):
+            raise ValueError(
+                "DFLASH req_pool_indices must match the padded batch: "
+                f"shape={req_pool_indices.shape}, bs={bs}."
+            )
+
+        selector = getattr(model_worker_batch, "logits_indices_selector", None)
+        if selector is None:
+            real_bs = int(getattr(model_worker_batch, "real_bs", bs))
+            selector = np.arange(real_bs, dtype=np.int32)
+        else:
+            selector = np.asarray(selector, dtype=np.int32)
+        if selector.size and (int(selector.min()) < 0 or int(selector.max()) >= bs):
+            raise ValueError(f"DFLASH active-slot selector is out of bounds: {selector}.")
+        active = np.zeros(bs, dtype=bool)
+        active[selector] = True
+
+        req_to_token = self.req_to_token_pool.req_to_token
+        rank_chunks = []
+        for dp_rank in range(dp_size):
+            pages = []
+            start = dp_rank * per_dp_bs
+            for slot in range(start, start + per_dp_bs):
+                if not active[slot]:
+                    continue
+                prefix_len = int(prefix_lens[slot])
+                if prefix_len < 0:
+                    raise ValueError(
+                        f"DFLASH active slot {slot} has invalid prefix_len={prefix_len}."
+                    )
+                kv_len = prefix_len + self.block_size
+                if kv_len <= 0:
+                    continue
+                if kv_len > req_to_token.shape[1]:
+                    raise ValueError(
+                        "DFLASH KV length exceeds req_to_token capacity: "
+                        f"slot={slot}, kv_len={kv_len}, capacity={req_to_token.shape[1]}."
+                    )
+                page_offsets = np.arange(0, kv_len, self.page_size, dtype=np.int64)
+                req_idx = int(req_pool_indices[slot])
+                page_locs = np.asarray(req_to_token[req_idx, page_offsets], dtype=np.int32)
+                if page_locs.shape[0] != page_offsets.shape[0] or np.any(page_locs < 0):
+                    raise RuntimeError(
+                        "DFLASH paged KV slots are incomplete: "
+                        f"slot={slot}, req_pool_index={req_idx}, kv_len={kv_len}."
+                    )
+                pages.append(page_locs // self.page_size)
+
+            chunk = np.concatenate(pages) if pages else np.empty((0,), dtype=np.int32)
+            if len(chunk) > per_rank_capacity:
+                raise ValueError(
+                    "DFLASH page_indices exceed the per-rank capacity: "
+                    f"rank={dp_rank}, required={len(chunk)}, capacity={per_rank_capacity}."
+                )
+            rank_chunks.append(
+                np.pad(chunk, (0, per_rank_capacity - len(chunk)), constant_values=0)
+            )
+        return np.concatenate(rank_chunks).astype(np.int32)
+
     @property
     def draft_model_runner(self):
         return self._draft_model_runner
@@ -256,9 +344,17 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         verify_input.prepare_for_verify(model_worker_batch, self.page_size)
         model_worker_batch.forward_mode = ForwardMode.TARGET_VERIFY
         model_worker_batch.seq_lens = target_prefix_lens
-        self._rebuild_cache_loc(model_worker_batch, target_prefix_lens, bs)
+        page_indices = self._build_dflash_page_indices(
+            model_worker_batch,
+            target_prefix_lens,
+            bs,
+        )
+        model_worker_batch.cache_loc = np.zeros(
+            int(getattr(model_worker_batch, "dp_size", 1)), dtype=np.int32
+        )
         forward_metadata = self.target_worker.model_runner.attn_backend.get_eagle_forward_metadata(
             model_worker_batch,
+            page_indices=page_indices,
             page_indices_capacity=self._page_indices_capacity(bs),
         )
         (
@@ -411,9 +507,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         else:
             forward_batch = ForwardBatch.init_new(model_worker_batch, runner)
         forward_batch.input_ids = verify_input.draft_token
-        # FA consumes the already-built metadata. Keeping the host-only
-        # row-padded cache_loc in the JIT pytree would make prefix width part of
-        # the cache key even though model execution never reads it.
+        # FA consumes precomputed page metadata; cache_loc is host-only here.
         forward_batch.cache_loc = None
 
         runner.attn_backend.forward_metadata = forward_metadata
@@ -515,8 +609,14 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         )
         forward_batch = ForwardBatch.init_new(draft_mwb, self.draft_model_runner)
         forward_batch.forward_mode = ForwardMode.TARGET_VERIFY
+        page_indices = self._build_dflash_page_indices(
+            draft_mwb,
+            draft_prefix_lens,
+            bs,
+        )
         metadata = self.draft_model_runner.attn_backend.get_eagle_forward_metadata(
             draft_mwb,
+            page_indices=page_indices,
             page_indices_capacity=self._page_indices_capacity(bs),
         )
         self.draft_model_runner.attn_backend.forward_metadata = metadata
@@ -552,20 +652,17 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             draft_token_num=self.block_size,
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
-        # Reuse the slots prepare_for_decode reserved for target verification.
-        # Target and draft own separate KV buffers but share physical cache_loc
-        # indices, so this yields a valid paged layout even when the block starts
-        # in a partially filled page.
+        # Target and draft own separate KV buffers but share the slot mapping.
         req_to_token = self.draft_model_runner.req_to_token_pool.req_to_token
         req_pool_indices = np.asarray(base_mwb.req_pool_indices, dtype=np.int64)
-        locs = []
         block_rows = []
-        kv_lens = []
+        active_mask = self._active_decode_slot_mask(base_mwb, bs)
         for i in range(bs):
             prefix_len = int(prefix_lens[i])
-            if prefix_len > 0:
+            if active_mask[i]:
+                if prefix_len < 0:
+                    raise ValueError(f"DFLASH active slot {i} has invalid prefix_len={prefix_len}.")
                 req_idx = int(req_pool_indices[i])
-                prefix_locs = np.asarray(req_to_token[req_idx, :prefix_len], dtype=np.int32)
                 block_locs = np.asarray(
                     req_to_token[req_idx, prefix_len : prefix_len + self.block_size],
                     dtype=np.int32,
@@ -576,13 +673,10 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                         f"slot={i}, prefix_len={prefix_len}, block_size={self.block_size}."
                     )
             else:
-                prefix_locs = np.empty(0, dtype=np.int32)
                 block_locs = np.zeros(self.block_size, dtype=np.int32)
             block_rows.append(block_locs)
-            locs.append(np.concatenate([prefix_locs, block_locs]))
-            kv_lens.append(prefix_len + self.block_size)
         mwb.out_cache_loc = np.concatenate(block_rows)
-        mwb.cache_loc = self._pack_kv_cache(locs, kv_lens)
+        mwb.cache_loc = np.zeros(int(getattr(mwb, "dp_size", 1)), dtype=np.int32)
         return mwb
 
     # ------------------------------------------------------------------ #
@@ -892,73 +986,6 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         # Unit tests instantiate this class via __new__; avoid __getattr__ fallback there.
         return int(self.__dict__.get("_target_vocab_size", self._target_lm_head.shape[0]))
 
-    def _rebuild_cache_loc(self, mwb: ModelWorkerBatch, prefix_lens: np.ndarray, bs: int):
-        """Rebuild cache_loc from req_to_token_pool + out_cache_loc for verify."""
-        req_to_token = self.target_worker.model_runner.req_to_token_pool.req_to_token
-        req_pool_indices = np.asarray(mwb.req_pool_indices, dtype=np.int64)
-        out_cache_loc = np.asarray(mwb.out_cache_loc, dtype=np.int32)
-        locs = []
-        kv_lens = []
-        dp_size = int(getattr(mwb, "dp_size", 1))
-        per_dp_bs = int(getattr(mwb, "per_dp_bs_size", bs))
-        if dp_size * per_dp_bs != bs:
-            raise ValueError(
-                "DFLASH verify batch has inconsistent DP metadata: "
-                f"dp_size={dp_size}, per_dp_bs={per_dp_bs}, bs={bs}."
-            )
-        if out_cache_loc.shape[0] % dp_size != 0:
-            raise ValueError(
-                "DFLASH verify out_cache_loc is not DP-segmented: "
-                f"shape={out_cache_loc.shape}, dp_size={dp_size}."
-            )
-        per_dp_ocl = out_cache_loc.shape[0] // dp_size
-        required_per_dp = per_dp_bs * self.block_size
-        if per_dp_ocl < required_per_dp:
-            raise ValueError(
-                "DFLASH verify out_cache_loc rank section is too short: "
-                f"per_dp_ocl={per_dp_ocl}, required={required_per_dp}."
-            )
-        for i in range(bs):
-            sl = int(prefix_lens[i])
-            rp = int(req_pool_indices[i])
-            if sl > 0:
-                prefix_locs = np.asarray(req_to_token[rp, :sl], dtype=np.int32)
-            else:
-                prefix_locs = np.empty(0, dtype=np.int32)
-            n_verify = self.block_size
-            dp_rank, local_slot = divmod(i, per_dp_bs)
-            ocl_offset = dp_rank * per_dp_ocl + local_slot * n_verify
-            verify_locs = out_cache_loc[ocl_offset : ocl_offset + n_verify]
-            locs.append(np.concatenate([prefix_locs, verify_locs]))
-            kv_lens.append(sl + n_verify)
-        mwb.cache_loc = self._pack_kv_cache(locs, kv_lens)
-
-    def _pack_kv_cache(self, rows: list[np.ndarray], kv_lens: list[int]) -> np.ndarray:
-        """Pack per-request cache_loc rows into a bucket-stable flat layout.
-
-        ``ForwardBatch.cache_loc`` is a JIT-visible child. Keep each request row
-        in a min-16/power-of-two page bucket so decode only recompiles when the
-        KV length crosses a bucket. FA metadata removes row padding from
-        ``page_indices`` before the kernel sees it, keeping request boundaries
-        aligned with ``cu_kv_lens``.
-        """
-        if not rows:
-            return np.empty(0, dtype=np.int32)
-
-        max_kv = max(int(x) for x in kv_lens)
-        pages_per_seq = (max_kv + self.page_size - 1) // self.page_size
-        bucketed_pages = max(16, 1 << max(0, pages_per_seq - 1).bit_length())
-        row_width = bucketed_pages * self.page_size
-
-        packed = np.empty((len(rows), row_width), dtype=np.int32)
-        for i, row in enumerate(rows):
-            n = min(len(row), row_width)
-            row_arr = np.asarray(row[:n], dtype=np.int32)
-            pad_value = row_arr[-1] if n > 0 else np.int32(0)
-            packed[i, :] = pad_value
-            packed[i, :n] = row_arr
-        return packed.reshape(-1)
-
     # ------------------------------------------------------------------ #
     # Precompile hook (scheduler calls this at startup)
     # ------------------------------------------------------------------ #
@@ -1054,11 +1081,13 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
 
     def _precompile_dflash_variant(self, bs: int) -> None:
         row_width = max(self.block_size, 16 * self.page_size)
+        page_indices = np.zeros(self._page_indices_capacity(bs), dtype=np.int32)
         draft_batch = self._make_verify_dummy_batch(bs, row_width, is_draft=True)
         forward_batch = ForwardBatch.init_new(draft_batch, self.draft_model_runner)
         forward_batch.forward_mode = ForwardMode.TARGET_VERIFY
         draft_metadata = self.draft_model_runner.attn_backend.get_eagle_forward_metadata(
             draft_batch,
+            page_indices=page_indices,
             page_indices_capacity=self._page_indices_capacity(bs),
         )
         self.draft_model_runner.attn_backend.forward_metadata = draft_metadata
@@ -1070,6 +1099,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         target_batch.spec_info_padded.draft_token = draft_token
         target_metadata = self.target_worker.model_runner.attn_backend.get_eagle_forward_metadata(
             target_batch,
+            page_indices=page_indices,
             page_indices_capacity=self._page_indices_capacity(bs),
         )
         logits_output, *_ = self._run_jit_target_verify(
@@ -1146,6 +1176,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             ]
         )
         batch.positions = positions
+        batch.cache_loc = np.zeros(dp_size, dtype=np.int32)
         batch.capture_hidden_mode = capture_hidden
         batch.spec_info_padded = DFlashVerifyInput(
             draft_token=jnp.ones(num_tokens, dtype=jnp.int32),
