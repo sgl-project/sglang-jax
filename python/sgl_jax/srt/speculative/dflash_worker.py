@@ -247,37 +247,50 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         active[selector] = True
 
         req_to_token = self.req_to_token_pool.req_to_token
+        kv_lens = np.where(active, prefix_lens + self.block_size, 0).astype(np.int32)
+        invalid_prefix = active & (prefix_lens < 0)
+        if np.any(invalid_prefix):
+            slot = int(np.flatnonzero(invalid_prefix)[0])
+            raise ValueError(
+                f"DFLASH active slot {slot} has invalid prefix_len={int(prefix_lens[slot])}."
+            )
+        overflow = kv_lens > req_to_token.shape[1]
+        if np.any(overflow):
+            slot = int(np.flatnonzero(overflow)[0])
+            raise ValueError(
+                "DFLASH KV length exceeds req_to_token capacity: "
+                f"slot={slot}, kv_len={int(kv_lens[slot])}, "
+                f"capacity={req_to_token.shape[1]}."
+            )
+
+        page_counts = (kv_lens + self.page_size - 1) // self.page_size
+        max_pages = int(page_counts.max(initial=0))
+        if max_pages:
+            page_offsets = np.arange(max_pages, dtype=np.int64) * self.page_size
+            valid_pages = page_offsets[None, :] < kv_lens[:, None]
+            safe_req_indices = np.where(active, req_pool_indices, 0)
+            page_locs = np.asarray(
+                req_to_token[safe_req_indices[:, None], page_offsets[None, :]],
+                dtype=np.int32,
+            )
+            incomplete = valid_pages & (page_locs < 0)
+            if np.any(incomplete):
+                slot = int(np.argwhere(incomplete)[0, 0])
+                raise RuntimeError(
+                    "DFLASH paged KV slots are incomplete: "
+                    f"slot={slot}, req_pool_index={int(req_pool_indices[slot])}, "
+                    f"kv_len={int(kv_lens[slot])}."
+                )
+            page_ids = page_locs // self.page_size
+        else:
+            valid_pages = np.zeros((bs, 0), dtype=bool)
+            page_ids = np.zeros((bs, 0), dtype=np.int32)
+
         rank_chunks = []
         for dp_rank in range(dp_size):
-            pages = []
             start = dp_rank * per_dp_bs
-            for slot in range(start, start + per_dp_bs):
-                if not active[slot]:
-                    continue
-                prefix_len = int(prefix_lens[slot])
-                if prefix_len < 0:
-                    raise ValueError(
-                        f"DFLASH active slot {slot} has invalid prefix_len={prefix_len}."
-                    )
-                kv_len = prefix_len + self.block_size
-                if kv_len <= 0:
-                    continue
-                if kv_len > req_to_token.shape[1]:
-                    raise ValueError(
-                        "DFLASH KV length exceeds req_to_token capacity: "
-                        f"slot={slot}, kv_len={kv_len}, capacity={req_to_token.shape[1]}."
-                    )
-                page_offsets = np.arange(0, kv_len, self.page_size, dtype=np.int64)
-                req_idx = int(req_pool_indices[slot])
-                page_locs = np.asarray(req_to_token[req_idx, page_offsets], dtype=np.int32)
-                if page_locs.shape[0] != page_offsets.shape[0] or np.any(page_locs < 0):
-                    raise RuntimeError(
-                        "DFLASH paged KV slots are incomplete: "
-                        f"slot={slot}, req_pool_index={req_idx}, kv_len={kv_len}."
-                    )
-                pages.append(page_locs // self.page_size)
-
-            chunk = np.concatenate(pages) if pages else np.empty((0,), dtype=np.int32)
+            end = start + per_dp_bs
+            chunk = page_ids[start:end][valid_pages[start:end]].astype(np.int32, copy=False)
             if len(chunk) > per_rank_capacity:
                 raise ValueError(
                     "DFLASH page_indices exceed the per-rank capacity: "
@@ -383,8 +396,11 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         if not isinstance(plan, TargetVerifyPlan):
             raise RuntimeError("DFLASH draft extend is missing its target verify plan.")
 
-        accept_lens = np.asarray(next_draft_input.ctx_lens, dtype=np.int32)
-        verified_id = np.asarray(next_draft_input.verified_id, dtype=np.int32)
+        accept_lens, verified_id = jax.device_get(
+            (next_draft_input.ctx_lens, next_draft_input.verified_id)
+        )
+        accept_lens = np.asarray(accept_lens, dtype=np.int32)
+        verified_id = np.asarray(verified_id, dtype=np.int32)
         next_draft_input.verified_id = verified_id
         next_draft_input.ctx_lens = np.zeros_like(accept_lens)
         next_draft_input.draft_seq_lens = plan.target_prefix_lens + accept_lens
@@ -486,7 +502,10 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         next_draft_input.new_seq_lens = None
         next_draft_input._target_verify_plan = plan
 
-        # Submit draft KV materialization before initiating any D2H copies.
+        # Start the small round-state copies as soon as target futures exist.
+        # They can overlap draft KV materialization and are consumed only after
+        # this method returns to draft_extend_for_decode.
+        jax.copy_to_host_async((accept_lens_out, new_verified_id))
         self._run_jit_draft_extend(
             logits_output.hidden_states,
             plan.draft_extend_positions,
@@ -496,10 +515,6 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         )
         self.target_worker.dump_topk_ids(layers_topk_ids, plan.model_worker_batch)
         self.target_worker.sync_queue.put((layers_topk_ids, plan.model_worker_batch))
-        if hasattr(accept_lens_out, "copy_to_host_async"):
-            accept_lens_out.copy_to_host_async()
-        if hasattr(new_verified_id, "copy_to_host_async"):
-            new_verified_id.copy_to_host_async()
 
         return GenerationBatchResult(
             logits_output=logits_output,
@@ -709,10 +724,15 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             block_ids_flat,
             positions_flat,
             draft_prefix_lens,
-            bs,
         )
         forward_batch = ForwardBatch.init_new(draft_mwb, self.draft_model_runner)
         forward_batch.forward_mode = ForwardMode.TARGET_VERIFY
+        # ForwardBatch.init_new already uploaded these arrays. Rebind spec_info
+        # to the same device buffers instead of retaining duplicate jnp.asarray
+        # copies created from the host block.
+        draft_mwb.spec_info_padded.draft_token = forward_batch.input_ids
+        draft_mwb.spec_info_padded.positions = forward_batch.positions
+        forward_batch.spec_info = draft_mwb.spec_info_padded
         active_mask = self._active_decode_slot_mask(model_worker_batch, bs)
         mismatched_prefix = active_mask & (draft_prefix_lens != target_prefix_lens)
         if np.any(mismatched_prefix):
@@ -814,7 +834,6 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         block_ids_flat: np.ndarray,
         positions_flat: np.ndarray,
         prefix_lens: np.ndarray,
-        bs: int,
     ) -> ModelWorkerBatch:
         mwb = copy.copy(base_mwb)
         mwb.forward_mode = ForwardMode.TARGET_VERIFY
@@ -824,36 +843,19 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         mwb.capture_hidden_mode = CaptureHiddenMode.NULL
         mwb.spec_algorithm = SpeculativeAlgorithm.DFLASH
         mwb.spec_info_padded = DFlashVerifyInput(
-            draft_token=jnp.asarray(block_ids_flat),
-            positions=jnp.asarray(positions_flat),
+            # These host arrays are rebound to ForwardBatch's device buffers
+            # immediately after ForwardBatch.init_new.
+            draft_token=block_ids_flat,
+            positions=positions_flat,
             draft_token_num=self.block_size,
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
-        # Target and draft own separate KV buffers but share the slot mapping.
-        req_to_token = self.draft_model_runner.req_to_token_pool.req_to_token
-        req_pool_indices = np.asarray(base_mwb.req_pool_indices, dtype=np.int64)
-        block_rows = []
-        active_mask = self._active_decode_slot_mask(base_mwb, bs)
-        for i in range(bs):
-            prefix_len = int(prefix_lens[i])
-            if active_mask[i]:
-                if prefix_len < 0:
-                    raise ValueError(f"DFLASH active slot {i} has invalid prefix_len={prefix_len}.")
-                req_idx = int(req_pool_indices[i])
-                block_locs = np.asarray(
-                    req_to_token[req_idx, prefix_len : prefix_len + self.block_size],
-                    dtype=np.int32,
-                )
-                if block_locs.shape[0] != self.block_size or np.any(block_locs < 0):
-                    raise RuntimeError(
-                        "DFLASH draft block slots were not reserved by prepare_for_decode: "
-                        f"slot={i}, prefix_len={prefix_len}, block_size={self.block_size}."
-                    )
-            else:
-                block_locs = np.zeros(self.block_size, dtype=np.int32)
-            block_rows.append(block_locs)
-        mwb.out_cache_loc = np.concatenate(block_rows)
-        mwb.cache_loc = np.zeros(int(getattr(mwb, "dp_size", 1)), dtype=np.int32)
+        # DFlashDraftInput.prepare_for_decode already reserved and packed one
+        # block per active request into the first half of each DP rank section.
+        # Reuse that scheduler output rather than gathering the same slots from
+        # req_to_token_pool again on every decode round.
+        mwb.out_cache_loc = self._verify_write_cache_loc(base_mwb)
+        mwb.cache_loc = None
         return mwb
 
     # ------------------------------------------------------------------ #
