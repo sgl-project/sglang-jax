@@ -140,6 +140,75 @@ def streamindex_topk_ref(
     return jax.lax.fori_loop(0, num_seqs, body, out)
 
 
+@functools.partial(jax.jit, static_argnames=("k_pages", "pages_per_seq"))
+def streamindex_page_topk_ref(
+    q: jax.Array,
+    weights: jax.Array,
+    cache_kv: jax.Array,
+    seq_lens: jax.Array,
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+    cu_kv_lens: jax.Array,
+    distribution: jax.Array,
+    *,
+    k_pages: int,
+    pages_per_seq: int,
+) -> jax.Array:
+    """Page-level lightning-indexer: max-pool token scores within each page,
+    then top-k over pages_per_seq page scores.
+
+    Vs the token-level path (``streamindex_topk_ref`` + page union, which
+    saturates k_pages_max at long context): the page budget is exact, the
+    top_k runs over [T, pages_per_seq] instead of [T, max_kv] (page_size×
+    smaller), and sparse-MLA cost becomes a true O(k_pages) flat.
+
+    Returns:
+      i32[T, k_pages]  seq-local page ids per query token; -1 for padding.
+    """
+    T, H, D = q.shape
+    page_size = cache_kv.shape[1]
+    max_kv = pages_per_seq * page_size
+    num_seqs = seq_lens.shape[0]
+
+    w = weights.astype(jnp.float32)
+    out = jnp.full((T, k_pages), -1, dtype=jnp.int32)
+
+    def body(seq_id, out):
+        q_start = cu_q_lens[seq_id]
+        q_end = cu_q_lens[seq_id + 1]
+        kv_len = seq_lens[seq_id]
+        seq_pages = jax.lax.dynamic_slice_in_dim(
+            page_indices, cu_kv_lens[seq_id] // page_size, pages_per_seq
+        )
+        keys = cache_kv[seq_pages].reshape(max_kv, D)
+
+        q_pos = jnp.arange(T)
+        kv_pos = jnp.arange(max_kv)
+        in_seq_q = (q_pos >= q_start) & (q_pos < q_end)
+        abs_q = kv_len - (q_end - q_start) + (q_pos - q_start)
+        mask = in_seq_q[:, None] & (kv_pos[None, :] < kv_len) & (kv_pos[None, :] <= abs_q[:, None])
+
+        if T * H * max_kv <= 1 << 26:
+            s = jnp.einsum("thd,kd->thk", q, keys, preferred_element_type=jnp.float32)
+            scores = jnp.einsum("th,thk->tk", w, jax.nn.relu(s))
+        else:
+
+            def h_step(h, acc):
+                q_h = jax.lax.dynamic_index_in_dim(q, h, axis=1, keepdims=False)
+                w_h = jax.lax.dynamic_index_in_dim(w, h, axis=1, keepdims=True)
+                s_h = jnp.einsum("td,kd->tk", q_h, keys, preferred_element_type=jnp.float32)
+                return acc + jax.nn.relu(s_h) * w_h
+
+            scores = jax.lax.fori_loop(0, H, h_step, jnp.zeros((T, max_kv), jnp.float32))
+        scores = jnp.where(mask, scores, _NEG_INF)
+        page_scores = scores.reshape(T, pages_per_seq, page_size).max(axis=-1)
+        vals, pidx = jax.lax.top_k(page_scores, k_pages)
+        pidx = jnp.where(vals > _NEG_INF, pidx, -1)
+        return jnp.where(in_seq_q[:, None], pidx, out)
+
+    return jax.lax.fori_loop(0, num_seqs, body, out)
+
+
 @functools.partial(jax.jit, static_argnames=("sm_scale", "pages_per_seq", "v_dim"))
 def sparse_mla_ref(
     q: jax.Array,

@@ -13,6 +13,7 @@ plain dense (the indexer still writes idx cache for later decode steps).
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -21,7 +22,7 @@ import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 from jax.tree_util import register_pytree_node_class
 
-from sgl_jax.srt.kernels.dsa.ref import streamindex_topk_ref
+from sgl_jax.srt.kernels.dsa.ref import streamindex_page_topk_ref, streamindex_topk_ref
 from sgl_jax.srt.kernels.dsa.sparse_mla import compute_topk_pages, sparse_mla_page_level
 from sgl_jax.srt.kernels.mla.v2.kernel import mla_ragged_paged_attention
 from sgl_jax.srt.layers.attention.mla_backend import MLAAttentionBackend
@@ -36,6 +37,11 @@ logger = logging.getLogger(__name__)
 
 _SPARSE_PALLAS_MAX_T = 1
 _DEBUG_N_HIT = False
+# Page-budget for the page-scoring indexer path: the indexer max-pools token
+# scores per page and selects this many pages directly (0 = off, use the
+# token-topk + page-union path with k_pages_max=512). Bounds sparse-MLA cost
+# to O(budget) flat vs the union path which saturates 512 pages at long ctx.
+_PAGE_TOPK_BUDGET = int(os.environ.get("DSA_PAGE_TOPK", "0"))
 
 
 @register_pytree_node_class
@@ -272,6 +278,24 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             pages_per_seq = pi_.shape[0] // seq_lens_.shape[0]
             cache3d = cache_.reshape(cache_.shape[0], page_size, idx_dim)
             cache3d = _scatter_paged(cache3d, k_, seq_lens_, pi_, cuq_, cukv_, pages_per_seq)
+            if compute_topk and _PAGE_TOPK_BUDGET > 0:
+                # Page-scoring path: budget pages picked directly by max-pooled
+                # page score; token-level topk is not materialized (sparse MLA
+                # attends whole pages via topk_pages, so it never reads it).
+                topk = jnp.full((q_.shape[0], 1), -1, jnp.int32)
+                topk_pages = streamindex_page_topk_ref(
+                    q_,
+                    w_,
+                    cache3d,
+                    seq_lens_,
+                    pi_,
+                    cuq_,
+                    cukv_,
+                    dist_,
+                    k_pages=min(_PAGE_TOPK_BUDGET, pages_per_seq),
+                    pages_per_seq=pages_per_seq,
+                )
+                return cache3d.reshape(cache_.shape), topk, topk_pages
             if compute_topk:
                 topk = streamindex_topk_ref(
                     q_,
@@ -360,7 +384,9 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                 page_size=page_size,
                 pages_per_seq=pages_per_seq,
                 kv_lora_rank=self.kv_lora_rank,
-                k_pages_max=512,
+                k_pages_max=(
+                    min(_PAGE_TOPK_BUDGET, pages_per_seq) + 1 if _PAGE_TOPK_BUDGET > 0 else 512
+                ),
                 vmem_limit_bytes=self.vmem_limit_bytes,
             )
 

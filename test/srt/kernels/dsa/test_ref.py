@@ -6,6 +6,7 @@ import pytest
 from sgl_jax.srt.kernels.dsa.ref import (
     build_index_share_map,
     sparse_mla_ref,
+    streamindex_page_topk_ref,
     streamindex_topk_ref,
 )
 
@@ -229,3 +230,158 @@ def test_sparse_mla_multi_seq_packed_layout():
         p = p / p.sum(-1, keepdims=True)
         want = np.einsum("hk,kd->hd", p, sel[:, :v_dim])
         np.testing.assert_allclose(o[t], want, rtol=1e-3, atol=1e-4)
+
+
+def _page_topk_oracle(q, weights, keys, kv_len, abs_t, page_size, pages_per_seq, k_pages):
+    """Numpy oracle: token scores -> causal mask -> page max-pool -> top-k pages."""
+    s = np.einsum(
+        "h,hk->k", weights.astype(np.float32), np.maximum(np.einsum("hd,kd->hk", q, keys), 0)
+    )
+    max_kv = pages_per_seq * page_size
+    padded = np.full(max_kv, -np.inf, np.float32)
+    n_valid = min(abs_t + 1, kv_len)
+    padded[:n_valid] = s[:n_valid]
+    page_scores = padded.reshape(pages_per_seq, page_size).max(-1)
+    order = np.argsort(-page_scores)
+    return [int(p) for p in order[:k_pages] if page_scores[p] > -np.inf]
+
+
+def test_page_topk_matches_numpy():
+    rng = np.random.default_rng(3)
+    T, H, D, KV, page_size, k_pages = 4, 2, 8, 60, 8, 3
+    q = rng.normal(size=(T, H, D)).astype(np.float32)
+    weights = rng.normal(size=(T, H)).astype(np.float32)
+    keys = rng.normal(size=(KV, D)).astype(np.float32)
+    cache, page_idx = _make_paged(keys, page_size)
+    pages_per_seq = cache.shape[0]
+
+    got = np.asarray(
+        streamindex_page_topk_ref(
+            jnp.array(q),
+            jnp.array(weights),
+            jnp.array(cache),
+            jnp.array([KV], np.int32),
+            jnp.array(page_idx),
+            jnp.array([0, T], np.int32),
+            jnp.array([0, pages_per_seq * page_size], np.int32),
+            jnp.array([0, 1, 1], np.int32),
+            k_pages=k_pages,
+            pages_per_seq=pages_per_seq,
+        )
+    )
+
+    keys_full = np.zeros((pages_per_seq * page_size, D), np.float32)
+    keys_full[:KV] = keys
+    for t in range(T):
+        abs_t = KV - T + t
+        want = _page_topk_oracle(
+            q[t], weights[t], keys_full, KV, abs_t, page_size, pages_per_seq, k_pages
+        )
+        got_t = [x for x in got[t].tolist() if x >= 0]
+        assert set(got_t) == set(want), f"t={t}: got {got_t} want {want}"
+        assert (got[t] == -1).sum() == k_pages - len(want)
+
+
+def test_page_topk_top1_page_contains_top1_token():
+    """max-pool property: the page holding the global top-1 token must be the top-1 page."""
+    rng = np.random.default_rng(4)
+    T, H, D, KV, page_size = 1, 2, 8, 64, 8
+    q = rng.normal(size=(T, H, D)).astype(np.float32)
+    weights = np.abs(rng.normal(size=(T, H))).astype(np.float32)
+    keys = rng.normal(size=(KV, D)).astype(np.float32)
+    cache, page_idx = _make_paged(keys, page_size)
+    pages_per_seq = cache.shape[0]
+
+    args = (
+        jnp.array(q),
+        jnp.array(weights),
+        jnp.array(cache),
+        jnp.array([KV], np.int32),
+        jnp.array(page_idx),
+        jnp.array([0, T], np.int32),
+        jnp.array([0, pages_per_seq * page_size], np.int32),
+        jnp.array([0, 1, 1], np.int32),
+    )
+    top1_token = np.asarray(streamindex_topk_ref(*args, k=1, pages_per_seq=pages_per_seq))[0, 0]
+    top1_page = np.asarray(
+        streamindex_page_topk_ref(*args, k_pages=1, pages_per_seq=pages_per_seq)
+    )[0, 0]
+    assert top1_token >= 0 and top1_page >= 0
+    assert top1_token // page_size == top1_page
+
+
+def test_page_topk_causal_mask():
+    """Selected pages never exceed each query token's causal page bound."""
+    rng = np.random.default_rng(5)
+    T, H, D, KV, page_size = 4, 2, 8, 32, 8
+    q = rng.normal(size=(T, H, D)).astype(np.float32)
+    weights = np.abs(rng.normal(size=(T, H))).astype(np.float32)
+    keys = rng.normal(size=(KV, D)).astype(np.float32)
+    cache, page_idx = _make_paged(keys, page_size)
+    pages_per_seq = cache.shape[0]
+
+    got = np.asarray(
+        streamindex_page_topk_ref(
+            jnp.array(q),
+            jnp.array(weights),
+            jnp.array(cache),
+            jnp.array([KV], np.int32),
+            jnp.array(page_idx),
+            jnp.array([0, T], np.int32),
+            jnp.array([0, pages_per_seq * page_size], np.int32),
+            jnp.array([0, 1, 1], np.int32),
+            k_pages=pages_per_seq,
+            pages_per_seq=pages_per_seq,
+        )
+    )
+    for t in range(T):
+        abs_t = KV - T + t
+        n_pages_valid = (abs_t + 1 + page_size - 1) // page_size
+        got_t = [x for x in got[t].tolist() if x >= 0]
+        assert len(got_t) == n_pages_valid
+        assert max(got_t) < n_pages_valid, f"t={t}: page beyond causal bound in {got_t}"
+        assert (got[t] == -1).sum() == pages_per_seq - n_pages_valid
+
+
+def test_page_topk_multi_seq_packed_layout():
+    """Two packed seqs: each query's pages come from its own seq (cu_kv_lens stride)."""
+    rng = np.random.default_rng(6)
+    H, D, page_size, pages_per_seq = 2, 8, 8, 4
+    kv_lens = [24, 32]
+    q = rng.normal(size=(2, H, D)).astype(np.float32)
+    weights = np.abs(rng.normal(size=(2, H))).astype(np.float32)
+    all_pages, all_idx = [], []
+    keys_by_seq = []
+    for kv in kv_lens:
+        keys = rng.normal(size=(kv, D)).astype(np.float32)
+        keys_by_seq.append(keys)
+        pages, _ = _make_paged(keys, page_size)
+        pad = np.zeros((pages_per_seq - pages.shape[0], page_size, D), np.float32)
+        start = sum(p.shape[0] for p in all_pages)
+        all_pages.append(np.concatenate([pages, pad]) if pad.shape[0] else pages)
+        all_idx.append(np.arange(start, start + pages_per_seq, dtype=np.int32))
+    cache = np.concatenate(all_pages)
+    page_idx = np.concatenate(all_idx)
+
+    got = np.asarray(
+        streamindex_page_topk_ref(
+            jnp.array(q),
+            jnp.array(weights),
+            jnp.array(cache),
+            jnp.array(kv_lens, np.int32),
+            jnp.array(page_idx),
+            jnp.array([0, 1, 2], np.int32),
+            jnp.array([0, pages_per_seq * page_size, 2 * pages_per_seq * page_size], np.int32),
+            jnp.array([0, 2, 2], np.int32),
+            k_pages=2,
+            pages_per_seq=pages_per_seq,
+        )
+    )
+    for s, kv in enumerate(kv_lens):
+        keys_full = np.zeros((pages_per_seq * page_size, D), np.float32)
+        keys_full[:kv] = keys_by_seq[s]
+        want = _page_topk_oracle(
+            q[s], weights[s], keys_full, kv, kv - 1, page_size, pages_per_seq, 2
+        )
+        got_t = [x for x in got[s].tolist() if x >= 0]
+        assert set(got_t) == set(want), f"seq={s}: got {got_t} want {want}"
