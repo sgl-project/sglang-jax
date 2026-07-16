@@ -40,6 +40,38 @@ def test_prefill_draft_extend_metadata_preserves_dp_rank_sections():
     np.testing.assert_array_equal(cache_loc, mwb.out_cache_loc)
 
 
+def test_prefill_dispatches_draft_extend_before_waiting_for_token(monkeypatch):
+    events = []
+    worker = _bare_worker(block_size=16)
+
+    def append_target_hidden(_batch, draft_input):
+        assert draft_input.verified_id is None
+        events.append("draft_extend")
+
+    worker._append_target_hidden_to_draft_kv = append_target_hidden
+    real_device_get = jax.device_get
+
+    def device_get(value):
+        events.append("device_get")
+        return real_device_get(value)
+
+    monkeypatch.setattr(jax, "device_get", device_get)
+    mwb = SimpleNamespace(
+        logits_indices_selector=np.array([0, 2], dtype=np.int32),
+        extend_seq_lens=np.array([3, 0, 5], dtype=np.int32),
+        extend_prefix_lens=np.array([7, 0, 11], dtype=np.int32),
+    )
+
+    worker.draft_extend_for_prefill(
+        mwb,
+        target_hidden=jax.numpy.zeros((3, 8)),
+        next_token_ids=jax.numpy.array([10, 20, 30], dtype=jax.numpy.int32),
+    )
+
+    assert events == ["draft_extend", "device_get"]
+    np.testing.assert_array_equal(mwb.spec_info_padded.verified_id, np.array([10, 30]))
+
+
 def test_prefill_draft_extend_metadata_rejects_bucket_mismatch():
     mwb = SimpleNamespace(
         positions=np.array([0, 1, 2], dtype=np.int32),

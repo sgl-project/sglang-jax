@@ -370,18 +370,24 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
     ) -> None:
         """Seed persistent draft KV from target prefill hidden states."""
         sel = np.asarray(model_worker_batch.logits_indices_selector)
-        verified_id = np.asarray(jax.device_get(next_token_ids))[sel].astype(np.int32)
         extend_seq_lens = np.asarray(model_worker_batch.extend_seq_lens, dtype=np.int32)[sel]
         extend_prefix_lens = np.asarray(model_worker_batch.extend_prefix_lens, dtype=np.int32)[sel]
 
         draft_input = DFlashDraftInput(
-            verified_id=verified_id,
+            verified_id=None,
             target_hidden=target_hidden,
             ctx_lens=extend_seq_lens,
             draft_seq_lens=extend_prefix_lens,
             block_size=self.block_size,
         )
+
+        # Materialization only depends on target hidden states. Dispatch it before
+        # waiting for the sampled token so PJRT can run target prefill ->
+        # jit_draft_extend without a host synchronization gap.
         self._append_target_hidden_to_draft_kv(model_worker_batch, draft_input)
+        draft_input.verified_id = np.asarray(jax.device_get(next_token_ids))[sel].astype(
+            np.int32
+        )
         model_worker_batch.spec_info_padded = draft_input
 
     def draft_extend_for_decode(
@@ -1081,12 +1087,17 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         import jax._src.test_util as jtu
 
         pool = self.draft_model_runner.token_to_kv_pool
-        cache_loc = jnp.asarray(cache_loc)
         if accept_lens is None:
-            accept_lens = jnp.ones((target_hidden.shape[0],), dtype=jnp.int32)
-        else:
-            accept_lens = jnp.asarray(accept_lens)
-        active_mask = cache_loc >= 0 if active_mask is None else jnp.asarray(active_mask)
+            # Prefill metadata is already on the host. Build its fixed masks with
+            # NumPy so they become inputs to jit_draft_extend instead of separate
+            # broadcast/compare JAX launches.
+            cache_loc = np.asarray(cache_loc, dtype=np.int32)
+            accept_lens = np.ones((target_hidden.shape[0],), dtype=np.int32)
+            if active_mask is None:
+                active_mask = cache_loc >= 0
+        cache_loc = jnp.asarray(cache_loc)
+        accept_lens = jnp.asarray(accept_lens)
+        active_mask = jnp.asarray(active_mask)
         if cache_loc.shape[0] % accept_lens.shape[0] != 0:
             raise ValueError(
                 "DFLASH draft extend cache rows do not match accept_lens: "
