@@ -178,7 +178,7 @@ class RecurrentStatePool:
             recurrent_shape, temporal_dtype, self.recurrent_sharding
         )
         alloc_conv = _get_recurrent_zero_allocator(conv_shape, conv_dtype, self.conv_sharding)
-        with self.mesh:
+        with jax.set_mesh(self.mesh):
             recurrent_buffers = []
             for _ in range(self.num_linear_recurrent_layers):
                 recurrent_buffers.append(alloc_recurrent())

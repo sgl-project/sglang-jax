@@ -281,11 +281,11 @@ def _launch_decode_simple_gla(
         pl.BlockSpec(memory_space=pltpu.SMEM),  # g_gamma
         pl.BlockSpec(memory_space=pltpu.SMEM),  # recurrent_indices
         pl.BlockSpec(memory_space=pltpu.SMEM),  # has_initial_state
-        pl.BlockSpec(memory_space=pltpu.ANY),  # recurrent_buffer (HBM)
+        pl.BlockSpec(memory_space=pl.ANY),  # recurrent_buffer (HBM)
     ]
     out_specs = [
         pl.BlockSpec((N, H, BV), o_index_map),
-        pl.BlockSpec(memory_space=pltpu.ANY),  # updated_recurrent_buffer
+        pl.BlockSpec(memory_space=pl.ANY),  # updated_recurrent_buffer
     ]
     out_shape = [
         jax.ShapeDtypeStruct((N, H, V), q.dtype),
