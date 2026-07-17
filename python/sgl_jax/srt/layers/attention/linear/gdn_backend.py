@@ -138,7 +138,10 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
                 )
             else:
                 platforms = {device.platform.lower() for device in mesh.devices.flat}
-                if platforms == {"tpu"} or os.environ.get("PALLAS_INTERPRET", "").lower() == "true":
+                all_tpu = platforms == {"tpu"}
+                all_non_tpu = "tpu" not in platforms
+                interpret_enabled = os.environ.get("PALLAS_INTERPRET", "").lower() == "true"
+                if all_tpu or (all_non_tpu and interpret_enabled):
                     self._prefill_callable = ragged_gated_delta_rule_chunkwise
                 else:
                     self.effective_impl = "reference"

@@ -142,6 +142,24 @@ class TestGDNPrefillImplementation(unittest.TestCase):
         self.assertIn("cpu", backend.fallback_reason.lower())
         self.assertIs(backend._prefill_callable, ragged_gated_delta_rule_ref)
 
+    def test_chunkwise_request_on_mixed_mesh_falls_back_despite_interpret(self):
+        fake_mixed_mesh = SimpleNamespace(
+            shape={"data": 1, "tensor": 1},
+            devices=np.asarray(
+                [SimpleNamespace(platform="tpu"), SimpleNamespace(platform="cpu")],
+                dtype=object,
+            ),
+        )
+        with _prefill_environment("chunkwise", "true"):
+            backend = self.make_backend(test_mesh=fake_mixed_mesh)
+
+        self.assertEqual(backend.effective_impl, "reference")
+        self.assertIs(backend._prefill_callable, ragged_gated_delta_rule_ref)
+        self.assertIsNotNone(backend.fallback_reason)
+        self.assertIn("platform", backend.fallback_reason.lower())
+        self.assertIn("cpu", backend.fallback_reason.lower())
+        self.assertIn("tpu", backend.fallback_reason.lower())
+
     def test_oversize_head_k_dimension_falls_back_with_shape_reason(self):
         with _prefill_environment("chunkwise", "true"):
             backend = self.make_backend(head_k_dim=257)
