@@ -51,11 +51,11 @@ def benchmark_backend(
         num_kv_heads = new_value.shape[1]
         head_dim = new_value.shape[2]
         in_specs = [
-            pl.BlockSpec(memory_space=pltpu.MemorySpace.ANY),
-            pl.BlockSpec(memory_space=pltpu.MemorySpace.ANY),
+            pl.BlockSpec(memory_space=pl.ANY),
+            pl.BlockSpec(memory_space=pl.ANY),
         ]
 
-        out_specs = [pl.BlockSpec(memory_space=pltpu.MemorySpace.ANY)]
+        out_specs = [pl.BlockSpec(memory_space=pl.ANY)]
         out_shape = [jax.ShapeDtypeStruct(cache.shape, dtype=cache.dtype)]
 
         scalar_prefetches = [slices]

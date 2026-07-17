@@ -77,7 +77,7 @@ class AudioBackboneScheduler:
         self.input_group_paddings = sorted(DEFAULT_AUDIO_INPUT_GROUP_PADDINGS)
         self.generation_group_paddings = sorted(DEFAULT_AUDIO_GENERATION_GROUP_PADDINGS)
 
-        with self.mesh:
+        with jax.set_mesh(self.mesh):
             self.backbone_worker = AudioBackboneModelWorker(
                 model_class=model_class, mesh=self.mesh, server_args=server_args
             )

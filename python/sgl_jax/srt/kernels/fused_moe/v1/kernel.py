@@ -224,8 +224,8 @@ def swigluoai(
     gate: jax.Array, up: jax.Array, *, alpha: float = 1.702, limit: float = 7.0
 ) -> jax.Array:
     """Activation used in some models such as GPT-OSS."""
-    gate = jnp.clip(gate, a_max=limit)
-    up = jnp.clip(up, a_min=-limit, a_max=limit)
+    gate = jnp.clip(gate, max=limit)
+    up = jnp.clip(up, min=-limit, max=limit)
     glu = gate * jax.nn.sigmoid(alpha * gate)
     return (up + 1.0) * glu
 
@@ -704,12 +704,12 @@ def _fused_ep_moe_kernel(
         # and can lead to rare deadlocks when subsequent comm assumes all peers
         # reached the same phase.
         for i in range(num_devices):
-            pltpu.semaphore_signal(
+            pl.semaphore_signal(
                 barrier_sem,
                 device_id=get_mesh_device_id(i),
-                device_id_type=pltpu.DeviceIdType.MESH,
+                device_id_type=pl.DeviceIdType.MESH,
             )
-        pltpu.semaphore_wait(barrier_sem, num_devices)
+        pl.semaphore_wait(barrier_sem, num_devices)
 
     def start_fetch_topk(*, bt_id, priority=0):
         bt_sem_id = bt_id & jnp.int32(1)
@@ -939,7 +939,7 @@ def _fused_ep_moe_kernel(
                         send_sem=send_sem,
                         recv_sem=recv_sem,
                         device_id=get_mesh_device_id(peer_id),
-                        device_id_type=pltpu.DeviceIdType.MESH,
+                        device_id_type=pl.DeviceIdType.MESH,
                     ).start()
 
                     recv_ref = d2e_count_vmem.at[
@@ -960,7 +960,7 @@ def _fused_ep_moe_kernel(
                         send_sem=send_sem,
                         recv_sem=recv_sem,
                         device_id=get_mesh_device_id(peer_id),
-                        device_id_type=pltpu.DeviceIdType.MESH,
+                        device_id_type=pl.DeviceIdType.MESH,
                     ).start()
 
                     src_peer = (my_id + num_devices - step) % num_devices
@@ -1065,7 +1065,7 @@ def _fused_ep_moe_kernel(
                         send_sem=send_x2_sems.at[e_sem_id],
                         recv_sem=recv_x2_sems.at[e_sem_id],
                         device_id=get_mesh_device_id(recv_id),
-                        device_id_type=pltpu.DeviceIdType.MESH,
+                        device_id_type=pl.DeviceIdType.MESH,
                     ).start()
 
             return send_sz
@@ -1127,7 +1127,7 @@ def _fused_ep_moe_kernel(
                         send_sem=send_x2_sems.at[e_sem_id_k],
                         recv_sem=recv_x2_sems.at[e_sem_id_k],
                         device_id=get_mesh_device_id(recv_id),
-                        device_id_type=pltpu.DeviceIdType.MESH,
+                        device_id_type=pl.DeviceIdType.MESH,
                     ).start()
 
             return None
@@ -1225,7 +1225,7 @@ def _fused_ep_moe_kernel(
                     send_sem=gather_send_x2_sems.at[e_sem_id],
                     recv_sem=a2a_gather_sem,
                     device_id=get_mesh_device_id(recv_id),
-                    device_id_type=pltpu.DeviceIdType.MESH,
+                    device_id_type=pl.DeviceIdType.MESH,
                 ).start()
 
             start += sz
