@@ -511,6 +511,11 @@ def ragged_gated_delta_rule_ref(
     return new_recurrent_state, output
 
 
+def ragged_gated_delta_rule_chunkwise(*args, **kwargs) -> tuple[jax.Array, jax.Array]:
+    """Temporary I3 dispatch target; I4 replaces this with the chunkwise kernel."""
+    return ragged_gated_delta_rule_ref(*args, **kwargs)
+
+
 def decode_gated_delta_rule_ref(
     mixed_qkv: jax.Array,
     b: jax.Array,
