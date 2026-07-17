@@ -17,6 +17,7 @@ from typing import Any, Callable
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.experimental import multihost_utils
 from jax.sharding import Mesh
 
 from sgl_jax.srt.kernels.gdn import (
@@ -147,16 +148,63 @@ def _runtime_hardware() -> dict[str, Any]:
     }
 
 
-def _validate_performance_runtime(runtime: dict[str, Any], rank: int) -> None:
+def _validate_rank_permutations(
+    requested_ids: list[int], pjrt_process_indices: list[int], process_count: int
+) -> dict[str, list[int]]:
+    expected = list(range(process_count))
+
+    def validate(field: str, values: list[int]) -> list[int]:
+        observed = [int(value) for value in values]
+        if len(observed) != process_count or sorted(observed) != expected:
+            raise RuntimeError(
+                f"{field} must be the complete unique permutation {expected}, got {observed}"
+            )
+        return sorted(observed)
+
+    return {
+        "requested_ids": validate("requested IDs", requested_ids),
+        "pjrt_process_indices": validate("PJRT process indices", pjrt_process_indices),
+    }
+
+
+def _gather_rank_identities(requested_id: int, pjrt_process_index: int) -> np.ndarray:
+    local_identity = jnp.asarray([requested_id, pjrt_process_index], dtype=jnp.int32)
+    gathered = np.asarray(multihost_utils.process_allgather(local_identity, tiled=False))
+    if gathered.size % 2:
+        raise RuntimeError(f"rank identity collective returned invalid shape {gathered.shape}")
+    return gathered.reshape(-1, 2)
+
+
+def _validate_performance_runtime(runtime: dict[str, Any], rank: int) -> dict[str, Any]:
     if (
         runtime["process_count"] != 4
         or runtime["device_count"] != 16
         or runtime["local_device_count"] != 4
-        or runtime["process_index"] != rank
         or runtime["device_platforms"] != ["tpu"]
         or "tpu v6" not in runtime["device_kind"].lower()
     ):
         raise RuntimeError(f"performance runtime does not match TPU v6e-16 contract: {runtime}")
+
+    gathered = _gather_rank_identities(rank, runtime["process_index"])
+    expected_shape = (runtime["process_count"], 2)
+    if gathered.shape != expected_shape:
+        raise RuntimeError(
+            f"rank identity collective must return shape {expected_shape}, got {gathered.shape}"
+        )
+    permutations = _validate_rank_permutations(
+        requested_ids=gathered[:, 0].tolist(),
+        pjrt_process_indices=gathered[:, 1].tolist(),
+        process_count=runtime["process_count"],
+    )
+    return {
+        "requested_id": int(rank),
+        "pjrt_process_index": int(runtime["process_index"]),
+        **permutations,
+        "identity_pairs": [
+            {"requested_id": int(requested), "pjrt_process_index": int(pjrt)}
+            for requested, pjrt in gathered
+        ],
+    }
 
 
 def _variant(impl: str) -> str:
@@ -299,8 +347,13 @@ def main() -> None:
     device_platform = runtime_hardware["device_platforms"][0]
     interpret = os.environ.get("PALLAS_INTERPRET", "").lower() == "true"
     performance = device_platform == "tpu" and not interpret
+    rank_identity = {
+        "requested_id": args.rank,
+        "pjrt_process_index": runtime_hardware["process_index"],
+        "validation": "not-run-correctness-only",
+    }
     if performance:
-        _validate_performance_runtime(runtime_hardware, args.rank)
+        rank_identity = _validate_performance_runtime(runtime_hardware, args.rank)
     code_revision, code_revision_source = _resolve_code_revision(
         args.code_revision, _revision(), performance=performance
     )
@@ -336,6 +389,9 @@ def main() -> None:
     payload = {
         "schema_version": SCHEMA_VERSION,
         "rank": args.rank,
+        "requested_id": args.rank,
+        "pjrt_process_index": runtime_hardware["process_index"],
+        "rank_identity": rank_identity,
         **selector,
         "device_platform": device_platform,
         "hardware": HARDWARE,
