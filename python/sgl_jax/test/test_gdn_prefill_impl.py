@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import unittest
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -243,9 +244,18 @@ class TestGDNPrefillImplementation(unittest.TestCase):
         ]
         self.assertEqual(len(status_logs), 1, "expected one selector status log per init")
         status_log = status_logs[0]
-        self.assertRegex(status_log, r"requested_impl\s*[:=]\s*['\"]?reference")
-        self.assertRegex(status_log, r"effective_impl\s*[:=]\s*['\"]?reference")
-        self.assertRegex(status_log, r"fallback_reason\s*[:=]\s*['\"]?None")
+
+        def assert_exact_field(field, expected):
+            pattern = (
+                rf"(?<!\w)['\"]?{re.escape(field)}['\"]?\s*[:=]\s*"
+                rf"(?P<quote>['\"]?){re.escape(expected)}(?P=quote)"
+                r"(?=$|[\s,;)}\]])"
+            )
+            self.assertRegex(status_log, pattern)
+
+        assert_exact_field("requested_impl", "reference")
+        assert_exact_field("effective_impl", "reference")
+        assert_exact_field("fallback_reason", "None")
 
     def make_numerical_fixture(
         self,
@@ -440,8 +450,11 @@ class TestGDNPrefillImplementation(unittest.TestCase):
                 err_msg=f"chunkwise/reference {name} mismatch",
             )
 
-    def test_saved_prefill_callable_results_govern_real_prefill_output(self):
-        for selector, sentinel in (("chunkwise", 11.0), ("reference", -13.0)):
+    def test_saved_prefill_callable_results_govern_real_prefill_output_and_state(self):
+        for selector, output_sentinel, recurrent_sentinel in (
+            ("chunkwise", 11.0, 7.0),
+            ("reference", -13.0, -9.0),
+        ):
             with self.subTest(selector=selector):
                 normal = self.make_numerical_fixture(
                     selector, [7], seed=47, all_have_initial_state=True
@@ -460,26 +473,58 @@ class TestGDNPrefillImplementation(unittest.TestCase):
                 selected_callable = backend._prefill_callable
                 calls = []
 
-                def return_sentinel_output(*args, **kwargs):
+                def return_sentinel_result(*args, **kwargs):
                     calls.append(True)
                     recurrent_state, output = selected_callable(*args, **kwargs)
-                    return recurrent_state, jnp.full_like(output, sentinel)
+                    return (
+                        jnp.full_like(recurrent_state, recurrent_sentinel),
+                        jnp.full_like(output, output_sentinel),
+                    )
 
-                backend._prefill_callable = return_sentinel_output
+                backend._prefill_callable = return_sentinel_result
                 normal_result = self.execute_fixture(normal)
                 wrapped_result = self.execute_fixture(wrapped)
-                expected = np.full_like(np.asarray(wrapped_result.output), sentinel)
+                expected_output = np.full_like(
+                    np.asarray(wrapped_result.output), output_sentinel
+                )
+                expected_recurrent = np.full_like(
+                    np.asarray(wrapped_result.recurrent_buffer), recurrent_sentinel
+                )
+                self.assertEqual(
+                    wrapped_result.recurrent_buffer.shape,
+                    normal_result.recurrent_buffer.shape,
+                    f"{selector} recurrent sentinel must preserve the pool shape",
+                )
+                self.assertEqual(
+                    wrapped_result.recurrent_buffer.dtype,
+                    normal_result.recurrent_buffer.dtype,
+                    f"{selector} recurrent sentinel must preserve the pool dtype",
+                )
 
                 self.assertFalse(
-                    np.array_equal(np.asarray(normal_result.output), expected),
-                    f"{selector} normal prefill unexpectedly equals the sentinel control",
+                    np.array_equal(np.asarray(normal_result.output), expected_output),
+                    f"{selector} normal prefill unexpectedly equals the output sentinel",
                 )
                 np.testing.assert_array_equal(
                     np.asarray(wrapped_result.output),
-                    expected,
+                    expected_output,
                     err_msg=(
                         f"{selector} forward_extend must consume the saved callable's "
                         "returned output"
+                    ),
+                )
+                self.assertFalse(
+                    np.array_equal(
+                        np.asarray(normal_result.recurrent_buffer), expected_recurrent
+                    ),
+                    f"{selector} normal prefill unexpectedly equals the recurrent sentinel",
+                )
+                np.testing.assert_array_equal(
+                    np.asarray(wrapped_result.recurrent_buffer),
+                    expected_recurrent,
+                    err_msg=(
+                        f"{selector} forward_extend must consume the saved callable's "
+                        "returned recurrent state"
                     ),
                 )
                 self.assertGreaterEqual(
@@ -487,22 +532,78 @@ class TestGDNPrefillImplementation(unittest.TestCase):
                     1,
                     f"{selector} forward_extend must invoke the saved callable",
                 )
-                self.assertIs(backend._prefill_callable, return_sentinel_output)
-                for name, normal_state, wrapped_state in (
-                    (
-                        "recurrent state",
-                        normal_result.recurrent_buffer,
-                        wrapped_result.recurrent_buffer,
-                    ),
-                    ("conv state", normal_result.conv_buffer, wrapped_result.conv_buffer),
+                self.assertIs(backend._prefill_callable, return_sentinel_result)
+                np.testing.assert_allclose(
+                    np.asarray(wrapped_result.conv_buffer),
+                    np.asarray(normal_result.conv_buffer),
+                    rtol=2e-2,
+                    atol=1e-2,
+                    err_msg=f"{selector} recurrent sentinel must not contaminate conv state",
+                )
+
+                normal.pool.replace_buffer(
+                    ([normal_result.recurrent_buffer], [normal_result.conv_buffer_list])
+                )
+                wrapped.pool.replace_buffer(
+                    ([wrapped_result.recurrent_buffer], [wrapped_result.conv_buffer_list])
+                )
+                stored_recurrent, stored_conv = self.pool_arrays(wrapped)
+                np.testing.assert_array_equal(
+                    stored_recurrent,
+                    expected_recurrent,
+                    err_msg=f"{selector} recurrent sentinel must be installable in the state pool",
+                )
+                np.testing.assert_allclose(
+                    stored_conv,
+                    self.pool_arrays(normal)[1],
+                    rtol=2e-2,
+                    atol=1e-2,
+                    err_msg=f"{selector} installed conv state must remain uncontaminated",
+                )
+
+                normal_decode = self.make_numerical_fixture(
+                    selector, [1], mode="decode", seed=53, all_have_initial_state=True
+                )
+                wrapped_decode = self.make_numerical_fixture(
+                    selector, [1], mode="decode", seed=53, all_have_initial_state=True
+                )
+                self.assert_effective_dispatch(normal_decode, selector)
+                self.assert_effective_dispatch(wrapped_decode, selector)
+                for decode_fixture, prefill_fixture in (
+                    (normal_decode, normal),
+                    (wrapped_decode, wrapped),
                 ):
-                    np.testing.assert_allclose(
-                        np.asarray(wrapped_state),
-                        np.asarray(normal_state),
+                    decode_fixture.layer = prefill_fixture.layer
+                    decode_fixture.pool = prefill_fixture.pool
+                self.assert_identical_inputs_parameters_metadata(normal_decode, wrapped_decode)
+
+                normal_decode_result = self.execute_fixture(normal_decode)
+                wrapped_decode_result = self.execute_fixture(wrapped_decode)
+                self.assertFalse(
+                    np.allclose(
+                        np.asarray(wrapped_decode_result.output),
+                        np.asarray(normal_decode_result.output),
                         rtol=2e-2,
                         atol=1e-2,
-                        err_msg=f"{selector} sentinel wrapper must preserve {name}",
-                    )
+                    ),
+                    f"{selector} decode must observe the installed recurrent sentinel",
+                )
+                self.assertFalse(
+                    np.allclose(
+                        np.asarray(wrapped_decode_result.recurrent_buffer),
+                        np.asarray(normal_decode_result.recurrent_buffer),
+                        rtol=2e-2,
+                        atol=1e-2,
+                    ),
+                    f"{selector} decode must continue from the installed recurrent sentinel",
+                )
+                np.testing.assert_allclose(
+                    np.asarray(wrapped_decode_result.conv_buffer),
+                    np.asarray(normal_decode_result.conv_buffer),
+                    rtol=2e-2,
+                    atol=1e-2,
+                    err_msg=f"{selector} decode conv state must remain uncontaminated",
+                )
 
     def expand_pool(self, fixture, *, size=8):
         old_recurrent, old_conv = self.pool_arrays(fixture)
