@@ -548,23 +548,154 @@ class TestGDNPrefillImplementation(unittest.TestCase):
                 )
 
     def test_numerical_zero_length_preserves_dummy_and_unused_slots(self):
-        def configure(fixture):
+        def configure_padded(fixture):
             self.expand_pool(fixture)
             self.set_metadata_indices(fixture, [1, 0, 3])
 
-        chunkwise, reference = self.make_prefill_ab(
-            [65, 0, 63],
-            seed=29,
-            all_have_initial_state=[True, True, False],
-            configure=configure,
+        def copy_real_request_states(padded, control):
+            padded_recurrent, padded_conv = self.pool_arrays(padded)
+            control_recurrent, control_conv = self.pool_arrays(control)
+            control_recurrent = control_recurrent.copy()
+            control_conv = control_conv.copy()
+            control_recurrent[[1, 2]] = padded_recurrent[[1, 3]]
+            control_conv[[1, 2]] = padded_conv[[1, 3]]
+            control.pool.replace_buffer(
+                (
+                    [
+                        jax.device_put(
+                            jnp.asarray(control_recurrent), control.pool.recurrent_sharding
+                        )
+                    ],
+                    [[jax.device_put(jnp.asarray(control_conv), control.pool.conv_sharding)]],
+                )
+            )
+
+        def effective_initial_states(fixture, request_rows, state_slots):
+            recurrent, conv = self.pool_arrays(fixture)
+            has_initial = np.asarray(
+                fixture.forward_batch.attn_backend.forward_metadata.has_initial_state
+            )[request_rows]
+            return (
+                np.where(
+                    has_initial[:, None, None, None],
+                    recurrent[state_slots],
+                    np.zeros_like(recurrent[state_slots]),
+                ),
+                np.where(
+                    has_initial[:, None, None],
+                    conv[state_slots],
+                    np.zeros_like(conv[state_slots]),
+                ),
+            )
+
+        def assert_equivalent_control_setup(padded, control):
+            for name in ("q", "k", "v", "a", "b"):
+                np.testing.assert_array_equal(
+                    np.asarray(getattr(padded, name)),
+                    np.asarray(getattr(control, name)),
+                    err_msg=f"padded/control {name} inputs must be identical",
+                )
+            for name, padded_value, control_value in (
+                (
+                    "conv1d weight",
+                    padded.layer.conv1d.weight.value,
+                    control.layer.conv1d.weight.value,
+                ),
+                ("A_log", padded.layer.A_log.value, control.layer.A_log.value),
+                ("dt_bias", padded.layer.dt_bias.value, control.layer.dt_bias.value),
+            ):
+                np.testing.assert_array_equal(
+                    np.asarray(padded_value),
+                    np.asarray(control_value),
+                    err_msg=f"padded/control {name} parameters must be identical",
+                )
+            padded_effective = effective_initial_states(padded, [0, 2], [1, 3])
+            control_effective = effective_initial_states(control, [0, 1], [1, 2])
+            for name, padded_value, control_value in zip(
+                ("recurrent", "conv"), padded_effective, control_effective
+            ):
+                np.testing.assert_array_equal(
+                    padded_value,
+                    control_value,
+                    err_msg=f"padded/control effective {name} initial states must be identical",
+                )
+
+        chunkwise = self.make_numerical_fixture(
+            "chunkwise", [65, 0, 63], seed=29, all_have_initial_state=[True, True, False]
         )
+        reference = self.make_numerical_fixture(
+            "reference", [65, 0, 63], seed=29, all_have_initial_state=[True, True, False]
+        )
+        chunkwise_control = self.make_numerical_fixture(
+            "chunkwise", [65, 63], seed=29, all_have_initial_state=[True, False]
+        )
+        reference_control = self.make_numerical_fixture(
+            "reference", [65, 63], seed=29, all_have_initial_state=[True, False]
+        )
+        for padded, control in (
+            (chunkwise, chunkwise_control),
+            (reference, reference_control),
+        ):
+            configure_padded(padded)
+            copy_real_request_states(padded, control)
+            np.testing.assert_array_equal(
+                np.asarray(padded.forward_batch.attn_backend.forward_metadata.cu_q_lens),
+                np.asarray([0, 65, 65, 128], dtype=np.int32),
+                err_msg="padded cu_q_lens must contain the duplicate zero-length boundary",
+            )
+            np.testing.assert_array_equal(
+                np.asarray(control.forward_batch.attn_backend.forward_metadata.cu_q_lens),
+                np.asarray([0, 65, 128], dtype=np.int32),
+                err_msg="no-zero control cu_q_lens must contain only the two real requests",
+            )
+            assert_equivalent_control_setup(padded, control)
+
+        # Build and validate both controls before this guard so fixture or RNG
+        # mismatches cannot be hidden by the expected selector-only RED.
+        self.assert_effective_dispatch(chunkwise, "chunkwise")
+        self.assert_effective_dispatch(reference, "reference")
+        self.assert_effective_dispatch(chunkwise_control, "chunkwise")
+        self.assert_effective_dispatch(reference_control, "reference")
+        self.assert_identical_fixtures(chunkwise, reference)
+        self.assert_identical_fixtures(chunkwise_control, reference_control)
         chunkwise_before = self.pool_arrays(chunkwise)
         reference_before = self.pool_arrays(reference)
         chunkwise_result = self.execute_fixture(chunkwise)
         reference_result = self.execute_fixture(reference)
+        chunkwise_control_result = self.execute_fixture(chunkwise_control)
+        reference_control_result = self.execute_fixture(reference_control)
         self.assertEqual(chunkwise_result.output.shape[0], 65 + 63)
         self.assertEqual(reference_result.output.shape[0], 65 + 63)
         self.assert_numerical_ab(chunkwise_result, reference_result)
+        self.assert_numerical_ab(chunkwise_control_result, reference_control_result)
+        for name, padded_result, control_result in (
+            ("chunkwise", chunkwise_result, chunkwise_control_result),
+            ("reference", reference_result, reference_control_result),
+        ):
+            for value_name, padded_value, control_value in (
+                ("real-token output", padded_result.output, control_result.output),
+                (
+                    "real-request recurrent state",
+                    np.asarray(padded_result.recurrent_buffer)[[1, 3]],
+                    np.asarray(control_result.recurrent_buffer)[[1, 2]],
+                ),
+                (
+                    "real-request conv state",
+                    np.asarray(padded_result.conv_buffer)[[1, 3]],
+                    np.asarray(control_result.conv_buffer)[[1, 2]],
+                ),
+            ):
+                padded_value = np.asarray(padded_value)
+                control_value = np.asarray(control_value)
+                self.assertTrue(np.isfinite(padded_value).all(), f"{name} padded {value_name}")
+                self.assertTrue(np.isfinite(control_value).all(), f"{name} control {value_name}")
+                np.testing.assert_allclose(
+                    padded_value,
+                    control_value,
+                    rtol=2e-2,
+                    atol=1e-2,
+                    err_msg=f"{name} zero-length row contaminated {value_name}",
+                )
         for name, result, before in (
             ("chunkwise", chunkwise_result, chunkwise_before),
             ("reference", reference_result, reference_before),
