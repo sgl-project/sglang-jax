@@ -375,8 +375,12 @@ class PathwaysPDSchedulerMixin:
             _mwb = b.get_model_worker_batch(
                 *paddings, self.page_size, self.server_args.enable_static_lora
             )
-            _, _ntok, _ = worker.forward_batch_generation(_mwb, sampling_metadata=None)
-            return _mwb, _ntok, _t0, time.perf_counter()
+            # logprob batches take the unfused path inside
+            # forward_batch_generation, which host-materializes all logprob
+            # fields of logits_output before returning -- so keeping it here
+            # (P thread) costs nothing on the main-thread drain.
+            _lo, _ntok, _ = worker.forward_batch_generation(_mwb, sampling_metadata=None)
+            return _mwb, _lo, _ntok, _t0, time.perf_counter()
 
         def _is_mid_only(b):
             return all(
@@ -385,16 +389,16 @@ class PathwaysPDSchedulerMixin:
                 if info.reqs
             )
 
-        _stash = None  # pre-dispatched (batch, mwb, ntok_dev, t0, t_disp)
+        _stash = None  # pre-dispatched (batch, mwb, lo, ntok_dev, t0, t_disp)
         while True:
             if _stash is not None:
-                batch, mwb, ntok_dev, t0, t_disp = _stash
+                batch, mwb, lo, ntok_dev, t0, t_disp = _stash
                 _stash = None
             else:
                 batch = q.get()
                 if batch is None:
                     return
-                mwb, ntok_dev, t0, t_disp = _disp(batch)
+                mwb, lo, ntok_dev, t0, t_disp = _disp(batch)
             t_enq_p = getattr(batch, "_pd_t_enqueue_prefill", None)
             try:
                 # depth-1 pipeline: mid-only chunk clears pending right after
@@ -475,11 +479,32 @@ class PathwaysPDSchedulerMixin:
                         ],
                     )
                 self._extract_dp_output_ids(ntok, mwb, batch)
+                if batch.return_logprob or batch.return_output_logprob_only:
+                    # Mirrors run_batch: snapshot per-req lens NOW -- chunked
+                    # bookkeeping mutates them before the main-thread drain
+                    # consumes this result. logits_output's logprob fields are
+                    # already host arrays (materialized on this P thread).
+                    extend_input_lens = [
+                        req.extend_input_len
+                        for info in batch.reqs_info
+                        if info.reqs
+                        for req in info.reqs
+                    ]
+                    extend_logprob_start_lens = [
+                        req.extend_logprob_start_len
+                        for info in batch.reqs_info
+                        if info.reqs
+                        for req in info.reqs
+                    ]
+                else:
+                    lo = None  # drop device logits promptly on non-logprob batches
+                    extend_input_lens = None
+                    extend_logprob_start_lens = None
                 result = GenerationBatchResult(
-                    logits_output=None,
+                    logits_output=lo,
                     next_token_ids=ntok.tolist(),
-                    extend_input_len_per_req=None,
-                    extend_logprob_start_len_per_req=None,
+                    extend_input_len_per_req=extend_input_lens,
+                    extend_logprob_start_len_per_req=extend_logprob_start_lens,
                     bid=mwb.bid,
                     cache_miss_count=0,
                 )
@@ -987,11 +1012,11 @@ class PathwaysPDSchedulerMixin:
                 break
             self._pd_chunk_stall = 0
             assert not any(
-                r.return_logprob or r.return_hidden_states
+                r.return_hidden_states
                 for info in new_batch.reqs_info
                 if info.reqs
                 for r in info.reqs
-            ), "[pd_async] return_logprob / hidden_states not yet supported (async prefill drops logits_output)"
+            ), "[pd_async] return_hidden_states not yet supported on the async prefill path"
             for info in new_batch.reqs_info:
                 for r in info.reqs or ():
                     self._pd_track_inflight(r)

@@ -475,9 +475,12 @@ class ModelWorker:
 
         # Pathways-PD: fuse run_model+sampler+resolve/set into one jit so a
         # decode tick is a single Execute through the ordered dispatch queue.
+        # Any logprob batch falls through to the unfused path below, which is
+        # the only one that computes/materializes logprob fields.
         if (
             self._pd_fuse_sample
             and not skip_sample
+            and not model_worker_batch.return_logprob
             and not model_worker_batch.return_output_logprob_only
         ):
             if model_worker_batch.sampling_info:
