@@ -17,6 +17,7 @@ from jax.sharding import PartitionSpec as P
 from sgl_jax.srt.kernels.gdn import ragged_gated_delta_rule_ref
 from sgl_jax.srt.layers.attention.linear import gdn_backend
 from sgl_jax.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
+from sgl_jax.srt.mem_cache.recurrent_state_pool import RecurrentStatePool
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
 from sgl_jax.test.test_gdn_attention import create_test_data, gather_conv, gather_ssm
 
@@ -260,6 +261,481 @@ class TestGDNPrefillImplementation(unittest.TestCase):
             if all(field in line for field in ("requested_impl", "effective_impl", "fallback_reason"))
         ]
         self.assertEqual(len(status_logs), 1, "expected one selector status log per init")
+
+    def make_numerical_fixture(
+        self,
+        selector,
+        seq_lens,
+        *,
+        mode="prefill",
+        seed=0,
+        all_have_initial_state=False,
+        test_mesh=mesh,
+        num_k_heads=2,
+        num_v_heads=4,
+        head_k_dim=16,
+        head_v_dim=16,
+        conv_kernel_size=3,
+    ):
+        """Create one selector-isolated fixture without executing its numerical body."""
+        with _prefill_environment(selector, "true"):
+            values = create_test_data(
+                mode,
+                seq_lens,
+                num_k_heads=num_k_heads,
+                num_v_heads=num_v_heads,
+                head_k_dim=head_k_dim,
+                head_v_dim=head_v_dim,
+                conv_kernel_size=conv_kernel_size,
+                dtype=jnp.bfloat16,
+                rng=np.random.default_rng(seed),
+                test_mesh=test_mesh,
+                all_have_initial_state=all_have_initial_state,
+            )
+        return SimpleNamespace(
+            selector=selector,
+            test_mesh=test_mesh,
+            forward_batch=values[0],
+            pool=values[1],
+            layer=values[2],
+            q=values[3],
+            k=values[4],
+            v=values[5],
+            a=values[6],
+            b=values[7],
+            initial_ssm=values[8],
+            initial_conv=values[9],
+            recurrent_indices=values[10],
+        )
+
+    def assert_effective_dispatch(self, fixture, expected_impl):
+        backend = fixture.forward_batch.attn_backend._backend
+        self.assertTrue(
+            hasattr(backend, "effective_impl"),
+            "optimized-vs-reference prefill requires GDNAttnBackend.effective_impl",
+        )
+        self.assertEqual(
+            backend.effective_impl,
+            expected_impl,
+            f"requested {fixture.selector!r} must be effective {expected_impl!r}",
+        )
+        self.assertEqual(
+            getattr(backend, "requested_impl", None),
+            fixture.selector,
+            f"backend must report the requested implementation {fixture.selector!r}",
+        )
+        self.assertTrue(
+            hasattr(backend, "_prefill_callable"),
+            "optimized-vs-reference prefill requires a saved _prefill_callable",
+        )
+        if expected_impl == "chunkwise":
+            self.assertIs(backend._prefill_callable, self.expected_chunkwise_callable())
+        else:
+            self.assertIs(
+                backend._prefill_callable,
+                ragged_gated_delta_rule_ref,
+                "reference selection must completely bypass optimized prefill",
+            )
+
+    @staticmethod
+    def pool_arrays(fixture):
+        recurrent, conv_list = fixture.pool.get_linear_recurrent_layer_cache(
+            fixture.layer.layer_id
+        )
+        return np.asarray(recurrent), np.asarray(conv_list[0])
+
+    def assert_identical_fixtures(self, chunkwise, reference):
+        for name in ("q", "k", "v", "a", "b"):
+            np.testing.assert_array_equal(
+                np.asarray(getattr(chunkwise, name)),
+                np.asarray(getattr(reference, name)),
+                err_msg=f"A/B {name} inputs must be identical",
+            )
+        for name, chunkwise_value, reference_value in (
+            (
+                "conv1d weight",
+                chunkwise.layer.conv1d.weight.value,
+                reference.layer.conv1d.weight.value,
+            ),
+            ("A_log", chunkwise.layer.A_log.value, reference.layer.A_log.value),
+            ("dt_bias", chunkwise.layer.dt_bias.value, reference.layer.dt_bias.value),
+        ):
+            np.testing.assert_array_equal(
+                np.asarray(chunkwise_value),
+                np.asarray(reference_value),
+                err_msg=f"A/B {name} parameters must be identical",
+            )
+        chunkwise_rec, chunkwise_conv = self.pool_arrays(chunkwise)
+        reference_rec, reference_conv = self.pool_arrays(reference)
+        np.testing.assert_array_equal(
+            chunkwise_rec,
+            reference_rec,
+            err_msg="A/B initial recurrent pools must be identical",
+        )
+        np.testing.assert_array_equal(
+            chunkwise_conv,
+            reference_conv,
+            err_msg="A/B initial conv pools must be identical",
+        )
+        chunkwise_meta = chunkwise.forward_batch.attn_backend.forward_metadata
+        reference_meta = reference.forward_batch.attn_backend.forward_metadata
+        for name in ("cu_q_lens", "recurrent_indices", "has_initial_state"):
+            np.testing.assert_array_equal(
+                np.asarray(getattr(chunkwise_meta, name)),
+                np.asarray(getattr(reference_meta, name)),
+                err_msg=f"A/B {name} metadata must be identical",
+            )
+        for name in ("recurrent_track_indices", "recurrent_track_mask"):
+            chunkwise_value = getattr(chunkwise_meta, name)
+            reference_value = getattr(reference_meta, name)
+            self.assertEqual(
+                chunkwise_value is None,
+                reference_value is None,
+                f"A/B {name} presence must be identical",
+            )
+            if chunkwise_value is not None:
+                np.testing.assert_array_equal(
+                    np.asarray(chunkwise_value),
+                    np.asarray(reference_value),
+                    err_msg=f"A/B {name} metadata must be identical",
+                )
+
+    def make_prefill_ab(self, seq_lens, *, configure=None, **kwargs):
+        chunkwise = self.make_numerical_fixture("chunkwise", seq_lens, **kwargs)
+        reference = self.make_numerical_fixture("reference", seq_lens, **kwargs)
+        if configure is not None:
+            configure(chunkwise)
+            configure(reference)
+        # This guard is deliberately before either layer call. Without it the
+        # current backend would execute reference twice and create a false pass.
+        self.assert_effective_dispatch(chunkwise, "chunkwise")
+        self.assert_effective_dispatch(reference, "reference")
+        self.assert_identical_fixtures(chunkwise, reference)
+        return chunkwise, reference
+
+    @staticmethod
+    def execute_fixture(fixture):
+        activation_sharding = NamedSharding(fixture.test_mesh, P("data", "tensor"))
+        with _prefill_environment(fixture.selector, "true"):
+            output, (recurrent_buffer, conv_buffer_list) = fixture.layer(
+                fixture.forward_batch,
+                jax.device_put(fixture.q, activation_sharding),
+                jax.device_put(fixture.k, activation_sharding),
+                jax.device_put(fixture.v, activation_sharding),
+                jax.device_put(fixture.a, activation_sharding),
+                jax.device_put(fixture.b, activation_sharding),
+                fixture.pool,
+            )
+        return SimpleNamespace(
+            output=output,
+            recurrent_buffer=recurrent_buffer,
+            conv_buffer=conv_buffer_list[0],
+            conv_buffer_list=conv_buffer_list,
+        )
+
+    def assert_numerical_ab(self, chunkwise, reference, *, rtol=2e-2, atol=1e-2):
+        for name, chunkwise_value, reference_value in (
+            ("output", chunkwise.output, reference.output),
+            ("full recurrent pool", chunkwise.recurrent_buffer, reference.recurrent_buffer),
+            ("full conv pool", chunkwise.conv_buffer, reference.conv_buffer),
+        ):
+            chunkwise_np = np.asarray(chunkwise_value)
+            reference_np = np.asarray(reference_value)
+            self.assertTrue(np.isfinite(chunkwise_np).all(), f"chunkwise {name} must be finite")
+            self.assertTrue(np.isfinite(reference_np).all(), f"reference {name} must be finite")
+            np.testing.assert_allclose(
+                chunkwise_np,
+                reference_np,
+                rtol=rtol,
+                atol=atol,
+                err_msg=f"chunkwise/reference {name} mismatch",
+            )
+
+    def expand_pool(self, fixture, *, size=8):
+        old_recurrent, old_conv = self.pool_arrays(fixture)
+        old_pool = fixture.pool
+        expanded = RecurrentStatePool(
+            linear_recurrent_layer_ids=[fixture.layer.layer_id],
+            size=size,
+            num_heads=old_pool.num_heads,
+            head_dim=old_pool.head_dim,
+            conv_kernel_size=old_pool.conv_kernel_size,
+            mesh=fixture.test_mesh,
+            dp_size=1,
+            recurrent_partition_axis="tensor",
+            conv_partition_axis="tensor",
+            data_partition_axis="data",
+            temporal_dtype=old_pool.temporal_dtype,
+            conv_dtype=old_pool.conv_dtype,
+            num_k_heads=old_pool.num_k_heads,
+            head_k_dim=old_pool.head_k_dim,
+        )
+        recurrent = np.full(
+            (expanded.total_slots,) + old_recurrent.shape[1:], 0.375, dtype=old_recurrent.dtype
+        )
+        conv = np.full(
+            (expanded.total_slots,) + old_conv.shape[1:], -0.5, dtype=old_conv.dtype
+        )
+        recurrent[: old_recurrent.shape[0]] = old_recurrent
+        conv[: old_conv.shape[0]] = old_conv
+        # Make dummy slot 0 nontrivial so an accidental zero/write is observable.
+        recurrent[0] = 0.625
+        conv[0] = -0.75
+        expanded.replace_buffer(
+            (
+                [jax.device_put(jnp.asarray(recurrent), expanded.recurrent_sharding)],
+                [[jax.device_put(jnp.asarray(conv), expanded.conv_sharding)]],
+            )
+        )
+        fixture.pool = expanded
+
+    @staticmethod
+    def set_metadata_indices(fixture, state_indices, track_indices=None, track_mask=None):
+        data_sharding = NamedSharding(fixture.test_mesh, P("data"))
+        metadata = fixture.forward_batch.attn_backend.forward_metadata
+        metadata.recurrent_indices = jax.device_put(
+            np.asarray(state_indices, dtype=np.int32), data_sharding
+        )
+        if track_indices is not None:
+            metadata.recurrent_track_indices = jax.device_put(
+                np.asarray(track_indices, dtype=np.int32), data_sharding
+            )
+            metadata.recurrent_track_mask = jax.device_put(
+                np.asarray(track_mask, dtype=np.int32), data_sharding
+            )
+
+    def test_numerical_fresh_and_mixed_continuing_prefill(self):
+        for case, has_initial_state in (
+            ("fresh", [False, False]),
+            ("mixed", [False, True]),
+        ):
+            with self.subTest(case=case):
+                chunkwise, reference = self.make_prefill_ab(
+                    [7, 5], seed=11, all_have_initial_state=has_initial_state
+                )
+                self.assert_numerical_ab(
+                    self.execute_fixture(chunkwise), self.execute_fixture(reference)
+                )
+
+    def test_numerical_raw_gate_activation_matches_reference(self):
+        def configure(fixture):
+            token = np.arange(fixture.a.shape[0], dtype=np.float32)[:, None]
+            head = np.asarray([-3.0, -0.75, 1.25, 3.5], dtype=np.float32)[None, :]
+            raw_a = head + 1.75 * np.sin(token * 0.37 + head * 0.19)
+            head_sharding = NamedSharding(fixture.test_mesh, P("data", "tensor"))
+            param_sharding = NamedSharding(fixture.test_mesh, P("tensor"))
+            fixture.a = jax.device_put(jnp.asarray(raw_a, dtype=jnp.bfloat16), head_sharding)
+            fixture.layer.dt_bias.value = jax.device_put(
+                jnp.asarray([-1.5, -0.2, 0.7, 1.4], dtype=jnp.bfloat16), param_sharding
+            )
+            fixture.layer.A_log.value = jax.device_put(
+                jnp.asarray([-1.2, -0.4, 0.3, 0.8], dtype=jnp.float32), param_sharding
+            )
+
+        chunkwise, reference = self.make_prefill_ab(
+            [65], seed=17, all_have_initial_state=True, configure=configure
+        )
+        self.assert_numerical_ab(self.execute_fixture(chunkwise), self.execute_fixture(reference))
+
+    def test_numerical_partial_chunk_lengths_match_reference(self):
+        for seq_len in (1, 63, 65, 127, 129):
+            with self.subTest(seq_len=seq_len):
+                chunkwise, reference = self.make_prefill_ab(
+                    [seq_len], seed=23, all_have_initial_state=True
+                )
+                self.assert_numerical_ab(
+                    self.execute_fixture(chunkwise), self.execute_fixture(reference)
+                )
+
+    def test_numerical_zero_length_preserves_dummy_and_unused_slots(self):
+        def configure(fixture):
+            self.expand_pool(fixture)
+            self.set_metadata_indices(fixture, [1, 0, 3])
+
+        chunkwise, reference = self.make_prefill_ab(
+            [65, 0, 63],
+            seed=29,
+            all_have_initial_state=[True, True, False],
+            configure=configure,
+        )
+        chunkwise_before = self.pool_arrays(chunkwise)
+        reference_before = self.pool_arrays(reference)
+        chunkwise_result = self.execute_fixture(chunkwise)
+        reference_result = self.execute_fixture(reference)
+        self.assertEqual(chunkwise_result.output.shape[0], 65 + 63)
+        self.assertEqual(reference_result.output.shape[0], 65 + 63)
+        self.assert_numerical_ab(chunkwise_result, reference_result)
+        for name, result, before in (
+            ("chunkwise", chunkwise_result, chunkwise_before),
+            ("reference", reference_result, reference_before),
+        ):
+            np.testing.assert_array_equal(
+                np.asarray(result.recurrent_buffer)[0],
+                before[0][0],
+                err_msg=f"{name} recurrent dummy slot 0 changed",
+            )
+            np.testing.assert_array_equal(
+                np.asarray(result.conv_buffer)[0],
+                before[1][0],
+                err_msg=f"{name} conv dummy slot 0 changed",
+            )
+            np.testing.assert_array_equal(
+                np.asarray(result.recurrent_buffer)[2],
+                before[0][2],
+                err_msg=f"{name} unrelated recurrent slot changed",
+            )
+            np.testing.assert_array_equal(
+                np.asarray(result.conv_buffer)[2],
+                before[1][2],
+                err_msg=f"{name} unrelated conv slot changed",
+            )
+
+    def test_numerical_track_snapshot_respects_boundary_and_zero_length(self):
+        def configure(fixture):
+            self.expand_pool(fixture)
+            # Row 0 is a valid boundary, row 1 is zero-length despite a true
+            # track mask, and row 2 is a real request away from a boundary.
+            self.set_metadata_indices(
+                fixture,
+                [1, 0, 3],
+                track_indices=[4, 5, 6],
+                track_mask=[1, 1, 0],
+            )
+
+        chunkwise, reference = self.make_prefill_ab(
+            [65, 0, 63],
+            seed=31,
+            all_have_initial_state=[True, True, True],
+            configure=configure,
+        )
+        chunkwise_before = self.pool_arrays(chunkwise)
+        reference_before = self.pool_arrays(reference)
+        chunkwise_result = self.execute_fixture(chunkwise)
+        reference_result = self.execute_fixture(reference)
+        self.assert_numerical_ab(chunkwise_result, reference_result)
+        for name, result, before in (
+            ("chunkwise", chunkwise_result, chunkwise_before),
+            ("reference", reference_result, reference_before),
+        ):
+            recurrent = np.asarray(result.recurrent_buffer)
+            conv = np.asarray(result.conv_buffer)
+            np.testing.assert_array_equal(
+                recurrent[4], recurrent[1], err_msg=f"{name} recurrent track snapshot mismatch"
+            )
+            np.testing.assert_array_equal(
+                conv[4], conv[1], err_msg=f"{name} conv track snapshot mismatch"
+            )
+            for track_slot in (5, 6):
+                np.testing.assert_array_equal(
+                    recurrent[track_slot],
+                    before[0][track_slot],
+                    err_msg=f"{name} recurrent track slot {track_slot} changed",
+                )
+                np.testing.assert_array_equal(
+                    conv[track_slot],
+                    before[1][track_slot],
+                    err_msg=f"{name} conv track slot {track_slot} changed",
+                )
+
+    def test_numerical_prefill_then_decode_continuation_matches_reference(self):
+        chunkwise, reference = self.make_prefill_ab(
+            [65], seed=37, all_have_initial_state=True
+        )
+        chunkwise_prefill = self.execute_fixture(chunkwise)
+        reference_prefill = self.execute_fixture(reference)
+        self.assert_numerical_ab(chunkwise_prefill, reference_prefill)
+
+        chunkwise.pool.replace_buffer(
+            ([chunkwise_prefill.recurrent_buffer], [chunkwise_prefill.conv_buffer_list])
+        )
+        reference.pool.replace_buffer(
+            ([reference_prefill.recurrent_buffer], [reference_prefill.conv_buffer_list])
+        )
+        chunkwise_decode = self.make_numerical_fixture(
+            "chunkwise", [1], mode="decode", seed=41, all_have_initial_state=True
+        )
+        reference_decode = self.make_numerical_fixture(
+            "reference", [1], mode="decode", seed=41, all_have_initial_state=True
+        )
+        self.assert_effective_dispatch(chunkwise_decode, "chunkwise")
+        self.assert_effective_dispatch(reference_decode, "reference")
+        for decode_fixture, prefill_fixture in (
+            (chunkwise_decode, chunkwise),
+            (reference_decode, reference),
+        ):
+            decode_fixture.layer = prefill_fixture.layer
+            decode_fixture.pool = prefill_fixture.pool
+        self.assert_identical_fixtures(chunkwise_decode, reference_decode)
+        self.assert_numerical_ab(
+            self.execute_fixture(chunkwise_decode), self.execute_fixture(reference_decode)
+        )
+
+    def test_numerical_sharded_dp2_tp2_matches_reference(self):
+        if jax.device_count() != 4:
+            self.skipTest("sharded DP2/TP2 numerical RED requires exactly four forced CPU devices")
+
+        from sgl_jax.test.test_gdn_attention_dp import (
+            create_test_data as create_dp_test_data,
+        )
+        from sgl_jax.test.test_gdn_attention_dp import set_mesh
+
+        sharded_mesh = set_mesh(tp_size=2, dp_size=2)
+        lens_per_rank = {0: [65], 1: [63]}
+
+        def make(selector):
+            with _prefill_environment(selector, "true"):
+                values = create_dp_test_data(
+                    "prefill",
+                    lens_per_rank,
+                    num_k_heads=4,
+                    num_v_heads=8,
+                    head_k_dim=16,
+                    head_v_dim=16,
+                    conv_kernel_size=3,
+                    dtype=jnp.bfloat16,
+                    mesh=sharded_mesh,
+                    dp_size=2,
+                    seed=43,
+                    has_initial_state_per_rank={0: [False], 1: [True]},
+                )
+            return SimpleNamespace(
+                selector=selector,
+                test_mesh=sharded_mesh,
+                forward_batch=values[0],
+                pool=values[1],
+                layer=values[2],
+                q=values[3],
+                k=values[4],
+                v=values[5],
+                a=values[6],
+                b=values[7],
+                per_dp_infos=values[8],
+                per_dp_token_padding=values[10],
+            )
+
+        chunkwise = make("chunkwise")
+        reference = make("reference")
+        self.assert_effective_dispatch(chunkwise, "chunkwise")
+        self.assert_effective_dispatch(reference, "reference")
+        self.assert_identical_fixtures(chunkwise, reference)
+        chunkwise_result = self.execute_fixture(chunkwise)
+        reference_result = self.execute_fixture(reference)
+
+        chunkwise_valid = []
+        reference_valid = []
+        for dp_rank in range(2):
+            valid = sum(chunkwise.per_dp_infos[dp_rank]["seq_lens"])
+            offset = dp_rank * chunkwise.per_dp_token_padding
+            chunkwise_valid.append(np.asarray(chunkwise_result.output)[offset : offset + valid])
+            reference_valid.append(np.asarray(reference_result.output)[offset : offset + valid])
+        chunkwise_result.output = np.concatenate(chunkwise_valid, axis=0)
+        reference_result.output = np.concatenate(reference_valid, axis=0)
+        self.assert_numerical_ab(
+            chunkwise_result,
+            reference_result,
+            rtol=2e-2,
+            atol=5e-2,
+        )
 
     def run_decode(self, selector):
         with _prefill_environment(selector):
