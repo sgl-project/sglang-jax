@@ -387,6 +387,9 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
             track_indices_l=None,
             track_mask_l=None,
         ):
+            if track_indices_l is not None:
+                nonempty = cu_seqlens_l[1:] > cu_seqlens_l[:-1]
+                track_mask_l = track_mask_l & nonempty & (state_indices_l != 0)
             # jax_causal_conv1d_prefill operates on [D, T] (channel-first).
             # Pass `has_initial_state` so brand-new prefills don't pick up
             # stale conv state from a freshly-allocated slot (same mask
