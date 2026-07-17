@@ -84,6 +84,11 @@ class TestGDNPrefillImplementation(unittest.TestCase):
             f"expected exported GDN chunkwise callable {_CHUNKWISE_CALLABLE_NAME!r}",
         )
         self.assertTrue(callable(callable_), "exported GDN chunkwise callable must be callable")
+        self.assertIsNot(
+            callable_,
+            ragged_gated_delta_rule_ref,
+            "optimized GDN chunkwise export must not alias the reference callable",
+        )
         return callable_
 
     def test_missing_selector_defaults_to_chunkwise_request(self):
@@ -91,6 +96,11 @@ class TestGDNPrefillImplementation(unittest.TestCase):
             backend = self.make_backend()
 
         self.assertEqual(backend.requested_impl, "chunkwise")
+        self.assertEqual(backend.effective_impl, "reference")
+        self.assertIsNotNone(backend.fallback_reason)
+        self.assertIn("platform", backend.fallback_reason.lower())
+        self.assertIn("cpu", backend.fallback_reason.lower())
+        self.assertIs(backend._prefill_callable, ragged_gated_delta_rule_ref)
 
     def test_reference_request_binds_reference_callable(self):
         with _prefill_environment("reference"):
@@ -112,12 +122,13 @@ class TestGDNPrefillImplementation(unittest.TestCase):
         self.assertIs(backend._prefill_callable, expected)
 
     def test_invalid_selector_is_rejected_during_initialization(self):
+        invalid = "not-a-gdn-prefill-implementation"
         with _prefill_environment("not-a-gdn-prefill-implementation"):
-            with self.assertRaisesRegex(
-                ValueError,
-                r"SGLANG_JAX_GDN_PREFILL_IMPL.*not-a-gdn-prefill-implementation.*(chunkwise|reference)",
-            ):
+            with self.assertRaises(ValueError) as raised:
                 self.make_backend()
+        message = str(raised.exception)
+        for required in (_SELECTOR_ENV, invalid, "chunkwise", "reference"):
+            self.assertIn(required, message)
 
     def test_chunkwise_request_on_cpu_falls_back_to_reference_with_platform_reason(self):
         with _prefill_environment("chunkwise"):
@@ -169,86 +180,56 @@ class TestGDNPrefillImplementation(unittest.TestCase):
         self.assertIs(backend._prefill_callable, self.expected_chunkwise_callable())
 
     def test_environment_changes_after_initialization_do_not_change_saved_dispatch(self):
-        with _prefill_environment("reference"):
-            (
-                forward_batch,
-                pool,
-                layer,
-                q,
-                k,
-                v,
-                a,
-                b,
-                initial_ssm,
-                initial_conv,
-                recurrent_indices,
-            ) = create_test_data(
-                "prefill",
-                [3],
-                num_k_heads=2,
-                num_v_heads=4,
-                head_k_dim=16,
-                head_v_dim=16,
-                conv_kernel_size=3,
-                dtype=jnp.bfloat16,
-                rng=np.random.default_rng(1),
-                test_mesh=mesh,
-                all_have_initial_state=True,
-            )
-            backend = forward_batch.attn_backend._backend
-
-        saved_status = tuple(
-            getattr(backend, field, None)
-            for field in ("requested_impl", "effective_impl", "fallback_reason")
+        normal = self.make_numerical_fixture(
+            "reference", [3], seed=1, all_have_initial_state=True
         )
-        saved_callable_was_bound = hasattr(backend, "_prefill_callable")
-        saved_callable = getattr(backend, "_prefill_callable", ragged_gated_delta_rule_ref)
-
-        dispatch_calls = []
-
-        def wrapped_reference(*args, **kwargs):
-            dispatch_calls.append(True)
-            return saved_callable(*args, **kwargs)
-
-        backend._prefill_callable = wrapped_reference
-
-        with _prefill_environment("invalid-after-initialization"):
-            activation_sharding = NamedSharding(mesh, P("data", "tensor"))
-            actual, (recurrent_buffer, conv_buffer_list) = layer(
-                forward_batch,
-                jax.device_put(q, activation_sharding),
-                jax.device_put(k, activation_sharding),
-                jax.device_put(v, activation_sharding),
-                jax.device_put(a, activation_sharding),
-                jax.device_put(b, activation_sharding),
-                pool,
-            )
-
-        actual_ssm = gather_ssm(pool, recurrent_buffer, recurrent_indices)
-        actual_conv = gather_conv(pool, conv_buffer_list[0], recurrent_indices)
-        self.assertGreaterEqual(
-            len(dispatch_calls),
-            1,
-            "forward_extend must invoke the saved _prefill_callable after initialization",
+        wrapped = self.make_numerical_fixture(
+            "reference", [3], seed=1, all_have_initial_state=True
         )
-        self.assertTrue(
-            saved_callable_was_bound,
-            "backend initialization must save the selected _prefill_callable",
+        self.assert_effective_dispatch(normal, "reference")
+        self.assert_effective_dispatch(wrapped, "reference")
+        self.assert_identical_fixtures(normal, wrapped)
+
+        backend = wrapped.forward_batch.attn_backend._backend
+        saved = (
+            backend.requested_impl,
+            backend.effective_impl,
+            backend.fallback_reason,
+            backend._prefill_callable,
         )
-        self.assertIs(saved_callable, ragged_gated_delta_rule_ref)
+        selected_callable = backend._prefill_callable
+
+        def return_sentinel_output(*args, **kwargs):
+            recurrent_state, output = selected_callable(*args, **kwargs)
+            return recurrent_state, jnp.full_like(output, 17.0)
+
+        backend._prefill_callable = return_sentinel_output
+        normal_result = self.execute_fixture(normal, runtime_selector="chunkwise")
+        wrapped_result = self.execute_fixture(wrapped, runtime_selector="chunkwise")
+        expected = np.full_like(np.asarray(wrapped_result.output), 17.0)
+
+        self.assertFalse(np.array_equal(np.asarray(normal_result.output), expected))
+        np.testing.assert_array_equal(
+            np.asarray(wrapped_result.output),
+            expected,
+            err_msg="runtime selector changes must not replace saved reference dispatch",
+        )
         self.assertEqual(
             (backend.requested_impl, backend.effective_impl, backend.fallback_reason),
-            saved_status,
+            saved[:3],
         )
-        self.assertIs(backend._prefill_callable, wrapped_reference)
-        for name, actual_value, expected_shape in (
-            ("output", actual, (q.shape[0], v.shape[1])),
-            ("recurrent state", actual_ssm, initial_ssm.shape),
-            ("conv state", actual_conv, initial_conv.shape),
+        self.assertIs(backend._prefill_callable, return_sentinel_output)
+        for name, normal_state, wrapped_state in (
+            ("recurrent state", normal_result.recurrent_buffer, wrapped_result.recurrent_buffer),
+            ("conv state", normal_result.conv_buffer, wrapped_result.conv_buffer),
         ):
-            actual_value = np.asarray(actual_value)
-            self.assertEqual(actual_value.shape, expected_shape)
-            self.assertTrue(np.isfinite(actual_value).all(), f"{name} must be finite")
+            np.testing.assert_allclose(
+                np.asarray(wrapped_state),
+                np.asarray(normal_state),
+                rtol=2e-2,
+                atol=1e-2,
+                err_msg=f"runtime selector control must preserve {name}",
+            )
 
     def test_initialization_logs_requested_effective_and_fallback_status_once(self):
         with _prefill_environment("reference"):
@@ -261,6 +242,10 @@ class TestGDNPrefillImplementation(unittest.TestCase):
             if all(field in line for field in ("requested_impl", "effective_impl", "fallback_reason"))
         ]
         self.assertEqual(len(status_logs), 1, "expected one selector status log per init")
+        status_log = status_logs[0]
+        self.assertRegex(status_log, r"requested_impl\s*[:=]\s*['\"]?reference")
+        self.assertRegex(status_log, r"effective_impl\s*[:=]\s*['\"]?reference")
+        self.assertRegex(status_log, r"fallback_reason\s*[:=]\s*['\"]?None")
 
     def make_numerical_fixture(
         self,
@@ -344,7 +329,7 @@ class TestGDNPrefillImplementation(unittest.TestCase):
         )
         return np.asarray(recurrent), np.asarray(conv_list[0])
 
-    def assert_identical_fixtures(self, chunkwise, reference):
+    def assert_identical_inputs_parameters_metadata(self, chunkwise, reference):
         for name in ("q", "k", "v", "a", "b"):
             np.testing.assert_array_equal(
                 np.asarray(getattr(chunkwise, name)),
@@ -365,18 +350,6 @@ class TestGDNPrefillImplementation(unittest.TestCase):
                 np.asarray(reference_value),
                 err_msg=f"A/B {name} parameters must be identical",
             )
-        chunkwise_rec, chunkwise_conv = self.pool_arrays(chunkwise)
-        reference_rec, reference_conv = self.pool_arrays(reference)
-        np.testing.assert_array_equal(
-            chunkwise_rec,
-            reference_rec,
-            err_msg="A/B initial recurrent pools must be identical",
-        )
-        np.testing.assert_array_equal(
-            chunkwise_conv,
-            reference_conv,
-            err_msg="A/B initial conv pools must be identical",
-        )
         chunkwise_meta = chunkwise.forward_batch.attn_backend.forward_metadata
         reference_meta = reference.forward_batch.attn_backend.forward_metadata
         for name in ("cu_q_lens", "recurrent_indices", "has_initial_state"):
@@ -400,6 +373,21 @@ class TestGDNPrefillImplementation(unittest.TestCase):
                     err_msg=f"A/B {name} metadata must be identical",
                 )
 
+    def assert_identical_fixtures(self, chunkwise, reference):
+        self.assert_identical_inputs_parameters_metadata(chunkwise, reference)
+        chunkwise_rec, chunkwise_conv = self.pool_arrays(chunkwise)
+        reference_rec, reference_conv = self.pool_arrays(reference)
+        np.testing.assert_array_equal(
+            chunkwise_rec,
+            reference_rec,
+            err_msg="A/B initial recurrent pools must be identical",
+        )
+        np.testing.assert_array_equal(
+            chunkwise_conv,
+            reference_conv,
+            err_msg="A/B initial conv pools must be identical",
+        )
+
     def make_prefill_ab(self, seq_lens, *, configure=None, **kwargs):
         chunkwise = self.make_numerical_fixture("chunkwise", seq_lens, **kwargs)
         reference = self.make_numerical_fixture("reference", seq_lens, **kwargs)
@@ -414,9 +402,10 @@ class TestGDNPrefillImplementation(unittest.TestCase):
         return chunkwise, reference
 
     @staticmethod
-    def execute_fixture(fixture):
+    def execute_fixture(fixture, *, runtime_selector=None):
         activation_sharding = NamedSharding(fixture.test_mesh, P("data", "tensor"))
-        with _prefill_environment(fixture.selector, "true"):
+        selector = fixture.selector if runtime_selector is None else runtime_selector
+        with _prefill_environment(selector, "true"):
             output, (recurrent_buffer, conv_buffer_list) = fixture.layer(
                 fixture.forward_batch,
                 jax.device_put(fixture.q, activation_sharding),
@@ -450,6 +439,70 @@ class TestGDNPrefillImplementation(unittest.TestCase):
                 atol=atol,
                 err_msg=f"chunkwise/reference {name} mismatch",
             )
+
+    def test_saved_prefill_callable_results_govern_real_prefill_output(self):
+        for selector, sentinel in (("chunkwise", 11.0), ("reference", -13.0)):
+            with self.subTest(selector=selector):
+                normal = self.make_numerical_fixture(
+                    selector, [7], seed=47, all_have_initial_state=True
+                )
+                wrapped = self.make_numerical_fixture(
+                    selector, [7], seed=47, all_have_initial_state=True
+                )
+
+                # Both guards precede execution so formal RED cannot reach an
+                # unavailable optimized/Pallas numerical body.
+                self.assert_effective_dispatch(normal, selector)
+                self.assert_effective_dispatch(wrapped, selector)
+                self.assert_identical_fixtures(normal, wrapped)
+
+                backend = wrapped.forward_batch.attn_backend._backend
+                selected_callable = backend._prefill_callable
+                calls = []
+
+                def return_sentinel_output(*args, **kwargs):
+                    calls.append(True)
+                    recurrent_state, output = selected_callable(*args, **kwargs)
+                    return recurrent_state, jnp.full_like(output, sentinel)
+
+                backend._prefill_callable = return_sentinel_output
+                normal_result = self.execute_fixture(normal)
+                wrapped_result = self.execute_fixture(wrapped)
+                expected = np.full_like(np.asarray(wrapped_result.output), sentinel)
+
+                self.assertFalse(
+                    np.array_equal(np.asarray(normal_result.output), expected),
+                    f"{selector} normal prefill unexpectedly equals the sentinel control",
+                )
+                np.testing.assert_array_equal(
+                    np.asarray(wrapped_result.output),
+                    expected,
+                    err_msg=(
+                        f"{selector} forward_extend must consume the saved callable's "
+                        "returned output"
+                    ),
+                )
+                self.assertGreaterEqual(
+                    len(calls),
+                    1,
+                    f"{selector} forward_extend must invoke the saved callable",
+                )
+                self.assertIs(backend._prefill_callable, return_sentinel_output)
+                for name, normal_state, wrapped_state in (
+                    (
+                        "recurrent state",
+                        normal_result.recurrent_buffer,
+                        wrapped_result.recurrent_buffer,
+                    ),
+                    ("conv state", normal_result.conv_buffer, wrapped_result.conv_buffer),
+                ):
+                    np.testing.assert_allclose(
+                        np.asarray(wrapped_state),
+                        np.asarray(normal_state),
+                        rtol=2e-2,
+                        atol=1e-2,
+                        err_msg=f"{selector} sentinel wrapper must preserve {name}",
+                    )
 
     def expand_pool(self, fixture, *, size=8):
         old_recurrent, old_conv = self.pool_arrays(fixture)
@@ -796,7 +849,21 @@ class TestGDNPrefillImplementation(unittest.TestCase):
         ):
             decode_fixture.layer = prefill_fixture.layer
             decode_fixture.pool = prefill_fixture.pool
-        self.assert_identical_fixtures(chunkwise_decode, reference_decode)
+        self.assert_identical_inputs_parameters_metadata(chunkwise_decode, reference_decode)
+        chunkwise_carried = self.pool_arrays(chunkwise_decode)
+        reference_carried = self.pool_arrays(reference_decode)
+        for name, chunkwise_state, reference_state in zip(
+            ("carried recurrent state", "carried conv state"),
+            chunkwise_carried,
+            reference_carried,
+        ):
+            np.testing.assert_allclose(
+                chunkwise_state,
+                reference_state,
+                rtol=2e-2,
+                atol=1e-2,
+                err_msg=f"chunkwise/reference {name} mismatch before decode",
+            )
         self.assert_numerical_ab(
             self.execute_fixture(chunkwise_decode), self.execute_fixture(reference_decode)
         )
