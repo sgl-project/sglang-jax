@@ -19,6 +19,11 @@ class SpecRelayBuffers(NamedTuple):
     new_seq_lens: jax.Array
 
 
+class DFlashRelayBuffers(NamedTuple):
+    verified_id: jax.Array
+    new_seq_lens: jax.Array
+
+
 def create_spec_relay_buffers(
     mesh,
     req_to_token_pool,
@@ -50,6 +55,22 @@ def create_spec_relay_buffers(
             jnp.zeros((dp_size, capacity), dtype=jnp.int32),
             id_sharding,
         ),
+    )
+
+
+def create_dflash_relay_buffers(
+    mesh,
+    req_to_token_pool,
+    *,
+    dp_size: int,
+) -> DFlashRelayBuffers:
+    """Create the minimal req-indexed state needed by DFlash overlap."""
+    capacity = int(req_to_token_pool.req_to_token.shape[0])
+    sharding = NamedSharding(mesh, RELAY_ID_SPEC)
+    shape = (dp_size, capacity)
+    return DFlashRelayBuffers(
+        verified_id=jax.device_put(jnp.zeros(shape, dtype=jnp.int32), sharding),
+        new_seq_lens=jax.device_put(jnp.zeros(shape, dtype=jnp.int32), sharding),
     )
 
 
@@ -104,6 +125,41 @@ def update_spec_relay_buffers(
     )
 
 
+def update_dflash_relay_buffers(
+    buffers: DFlashRelayBuffers,
+    future_indices,
+    valid_mask,
+    verified_id,
+    new_seq_lens,
+    *,
+    dp_size: int,
+) -> DFlashRelayBuffers:
+    """Publish one DP-padded DFlash round without writing padded slots."""
+    per_dp_bs = future_indices.shape[0] // dp_size
+    indices = future_indices.reshape((dp_size, per_dp_bs))
+    valid = valid_mask.reshape((dp_size, per_dp_bs))
+    dp_indices = jnp.arange(dp_size, dtype=jnp.int32)[:, None]
+    scatter_indices = jnp.where(
+        valid,
+        indices,
+        jnp.full_like(indices, buffers.verified_id.shape[1]),
+    )
+    verified_id = verified_id.reshape((dp_size, per_dp_bs))
+    new_seq_lens = new_seq_lens.reshape((dp_size, per_dp_bs))
+    return DFlashRelayBuffers(
+        verified_id=buffers.verified_id.at[dp_indices, scatter_indices].set(
+            verified_id,
+            mode="drop",
+            out_sharding=RELAY_ID_SPEC,
+        ),
+        new_seq_lens=buffers.new_seq_lens.at[dp_indices, scatter_indices].set(
+            new_seq_lens,
+            mode="drop",
+            out_sharding=RELAY_ID_SPEC,
+        ),
+    )
+
+
 def gather_spec_relay_buffers(
     buffers: SpecRelayBuffers,
     future_indices,
@@ -122,6 +178,26 @@ def gather_spec_relay_buffers(
         buffers.hidden_states.at[dp_indices, indices]
         .get(out_sharding=RELAY_STATE_SPEC)
         .reshape(future_indices.shape + buffers.hidden_states.shape[2:]),
+        buffers.verified_id.at[dp_indices, indices]
+        .get(out_sharding=RELAY_ID_SPEC)
+        .reshape(future_indices.shape),
+        buffers.new_seq_lens.at[dp_indices, indices]
+        .get(out_sharding=RELAY_ID_SPEC)
+        .reshape(future_indices.shape),
+    )
+
+
+def gather_dflash_relay_buffers(
+    buffers: DFlashRelayBuffers,
+    future_indices,
+    *,
+    dp_size: int,
+):
+    """Gather the DFlash seed token and logical length for the next round."""
+    per_dp_bs = future_indices.shape[0] // dp_size
+    indices = future_indices.reshape((dp_size, per_dp_bs))
+    dp_indices = jnp.arange(dp_size, dtype=jnp.int32)[:, None]
+    return (
         buffers.verified_id.at[dp_indices, indices]
         .get(out_sharding=RELAY_ID_SPEC)
         .reshape(future_indices.shape),

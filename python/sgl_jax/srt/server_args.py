@@ -1791,27 +1791,25 @@ class ServerArgs:
         # Check LoRA configuration
         self.check_lora_server_args()
 
-        # Speculative overlap is currently implemented for the fused NEXTN
-        # topk=1 path only.
+        # Speculative overlap uses the fused NEXTN path or DFlash's dedicated
+        # relay-backed draft/verify path.
         if self.speculative_algorithm is not None and not self.disable_overlap_schedule:
-            supports_spec_overlap = (
+            supports_nextn_overlap = (
                 self.speculative_algorithm == "NEXTN"
                 and self.speculative_eagle_topk == 1
                 and self.speculative_num_draft_tokens == self.speculative_num_steps + 1
             )
-            if not supports_spec_overlap:
+            supports_dflash_overlap = self.speculative_algorithm == "DFLASH"
+            if not (supports_nextn_overlap or supports_dflash_overlap):
                 raise ValueError(
-                    "Speculative overlap scheduler only supports NEXTN with "
+                    "Speculative overlap scheduler only supports DFLASH or NEXTN with "
                     "--speculative-eagle-topk=1 and "
                     "--speculative-num-draft-tokens == --speculative-num-steps + 1. "
                     "Please pass --disable-overlap-schedule for other speculative configs."
                 )
 
-        # DFLASH (minimal): non-causal one-shot diffusion draft + linear-chain
-        # greedy verify. It does not support overlap / tree / multi-step draft.
+        # DFLASH: non-causal one-shot diffusion draft + linear-chain greedy verify.
         if self.speculative_algorithm == "DFLASH":
-            if not self.disable_overlap_schedule:
-                raise ValueError("DFLASH speculative decoding requires --disable-overlap-schedule.")
             if self.tp_size < 1:
                 raise ValueError("DFLASH requires --tp-size>=1.")
             if self.speculative_eagle_topk != 1:

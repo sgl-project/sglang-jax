@@ -636,6 +636,9 @@ def _repack_page_indices(
         )
         .reshape((dp_size, pages_per_dp))
     )
+    gathered_sharding = jax.typeof(gathered).sharding
+    if isinstance(gathered_sharding, NamedSharding):
+        valid = jax.sharding.reshard(valid, gathered_sharding)
     return jnp.where(valid, gathered, jnp.zeros_like(gathered)).reshape(page_indices.shape)
 
 

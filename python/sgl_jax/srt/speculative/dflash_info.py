@@ -98,15 +98,26 @@ class DFlashDraftInput:
     target_hidden: jax.Array | None = None
     ctx_lens: np.ndarray = None
     draft_seq_lens: np.ndarray = None
+    allocate_lens: np.ndarray = None
+    reservation_base_lens: np.ndarray = None
+    future_indices: np.ndarray = None
     block_size: int = 16
     capture_hidden_mode = CaptureHiddenMode.FULL
 
     def _ensure_host(self) -> None:
-        for f in ("verified_id", "ctx_lens", "draft_seq_lens"):
+        fields = (
+            "verified_id",
+            "ctx_lens",
+            "draft_seq_lens",
+            "allocate_lens",
+            "reservation_base_lens",
+            "future_indices",
+        )
+        for f in fields:
             v = getattr(self, f, None)
             if v is not None and hasattr(v, "copy_to_host_async"):
                 v.copy_to_host_async()
-        for f in ("verified_id", "ctx_lens", "draft_seq_lens"):
+        for f in fields:
             v = getattr(self, f, None)
             if v is not None:
                 setattr(self, f, np.asarray(v, dtype=np.int32))
@@ -125,6 +136,19 @@ class DFlashDraftInput:
     def filter_batch(self, new_indices: np.ndarray, has_been_filtered: bool = True) -> None:
         self._ensure_host()
         new_indices = np.asarray(new_indices, dtype=np.int32)
+        if self.future_indices is not None:
+            old_bs = len(self.future_indices)
+            selected = (
+                np.arange(len(new_indices), dtype=np.int32)
+                if has_been_filtered and len(new_indices) == old_bs
+                else new_indices
+            )
+            for field in ("future_indices", "allocate_lens", "reservation_base_lens"):
+                value = getattr(self, field, None)
+                if value is not None:
+                    setattr(self, field, np.asarray(value, dtype=np.int32)[selected])
+            return
+
         old_verified_id = np.asarray(self.verified_id, dtype=np.int32)
         old_ctx_lens = np.asarray(self.ctx_lens, dtype=np.int32)
         old_draft_seq_lens = np.asarray(self.draft_seq_lens, dtype=np.int32)
@@ -137,6 +161,10 @@ class DFlashDraftInput:
         self.verified_id = old_verified_id[selected]
         self.ctx_lens = old_ctx_lens[selected]
         self.draft_seq_lens = old_draft_seq_lens[selected]
+        for field in ("allocate_lens", "reservation_base_lens"):
+            value = getattr(self, field, None)
+            if value is not None:
+                setattr(self, field, np.asarray(value, dtype=np.int32)[selected])
 
         if self.target_hidden is not None and self.target_hidden.shape[0] != 0:
             raise ValueError("DFLASH target_hidden must be materialized before filtering.")
@@ -154,8 +182,11 @@ class DFlashDraftInput:
 
         block_size = self.block_size
         page_size = schedule_batch.token_to_kv_pool_allocator.page_size
+        reserve_tokens = block_size * (2 if schedule_batch.enable_overlap else 1)
 
         self._align_dp_state_to_reqs(schedule_batch)
+        allocate_lens = []
+        reservation_base_lens = []
 
         for dp_rank, info in enumerate(schedule_batch.reqs_info):
             if info.seq_lens is None or len(info.seq_lens) == 0:
@@ -165,7 +196,7 @@ class DFlashDraftInput:
 
             old_r = np.asarray([req.kv_allocated_len for req in reqs], dtype=np.int32)
             committed_r = np.asarray([req.kv_committed_len for req in reqs], dtype=np.int32)
-            new_r = np.maximum(old_r, committed_r + block_size)
+            new_r = np.maximum(old_r, committed_r + reserve_tokens)
             ext_r = int((new_r - old_r).sum())
 
             if ext_r > 0 and page_size == 1:
@@ -204,10 +235,14 @@ class DFlashDraftInput:
             for i, req in enumerate(reqs):
                 rp = int(info.req_pool_indices[i])
                 c = int(committed_r[i])
-                verify_locs.append(np.asarray(req_to_token[rp, c : c + block_size], dtype=np.int32))
+                verify_locs.append(
+                    np.asarray(req_to_token[rp, c : c + reserve_tokens], dtype=np.int32)
+                )
             info.out_cache_loc = (
                 np.concatenate(verify_locs) if verify_locs else np.empty(0, dtype=np.int32)
             )
+            allocate_lens.append(new_r)
+            reservation_base_lens.append(committed_r)
 
             for req, allocated_len in zip(reqs, new_r):
                 req.decode_batch_idx += 1
@@ -216,8 +251,26 @@ class DFlashDraftInput:
 
             info.seq_lens_sum = np.sum(info.seq_lens).item()
 
+        self.allocate_lens = (
+            np.concatenate(allocate_lens) if allocate_lens else np.empty((0,), dtype=np.int32)
+        )
+        self.reservation_base_lens = (
+            np.concatenate(reservation_base_lens)
+            if reservation_base_lens
+            else np.empty((0,), dtype=np.int32)
+        )
+
     def _align_dp_state_to_reqs(self, schedule_batch) -> None:
         """Align each rank's state independently, then rebuild rank-major state."""
+        if self.future_indices is not None:
+            expected = sum(len(info.reqs or []) for info in schedule_batch.reqs_info)
+            if len(self.future_indices) != expected:
+                raise ValueError(
+                    "DFLASH relay state does not match the decode requests: "
+                    f"future_indices={len(self.future_indices)}, requests={expected}."
+                )
+            return
+
         rank_states = []
         for info in schedule_batch.reqs_info:
             reqs = info.reqs or []
@@ -298,11 +351,39 @@ class DFlashDraftInput:
     def merge_batch(self, other: DFlashDraftInput) -> None:
         self._ensure_host()
         other._ensure_host()
+        if self.future_indices is not None or other.future_indices is not None:
+            if self.future_indices is None or other.future_indices is None:
+                raise ValueError("DFLASH overlap merge requires future_indices on both batches.")
+            self.future_indices = np.concatenate(
+                [self.future_indices, other.future_indices], axis=0
+            )
+            for field in ("allocate_lens", "reservation_base_lens"):
+                lhs = getattr(self, field, None)
+                rhs = getattr(other, field, None)
+                setattr(
+                    self,
+                    field,
+                    None if lhs is None or rhs is None else np.concatenate([lhs, rhs], axis=0),
+                )
+            self.verified_id = None
+            self.ctx_lens = None
+            self.draft_seq_lens = None
+            self.target_hidden = None
+            return
+
         self.verified_id = np.concatenate(
             [np.asarray(self.verified_id), np.asarray(other.verified_id)], axis=0
         )
         self.ctx_lens = np.concatenate([self.ctx_lens, other.ctx_lens], axis=0)
         self.draft_seq_lens = np.concatenate([self.draft_seq_lens, other.draft_seq_lens], axis=0)
+        for field in ("allocate_lens", "reservation_base_lens"):
+            lhs = getattr(self, field, None)
+            rhs = getattr(other, field, None)
+            setattr(
+                self,
+                field,
+                None if lhs is None or rhs is None else np.concatenate([lhs, rhs], axis=0),
+            )
         if self.target_hidden is None:
             self.target_hidden = other.target_hidden
         elif other.target_hidden is not None:

@@ -2721,11 +2721,33 @@ class ScheduleBatch:
                 out[selector] = a
                 return out
 
+            relay_state = flat.future_indices is not None
             return DFlashDraftInput(
-                verified_id=_scatter_dflash_1d(flat.verified_id, "verified_id"),
+                verified_id=(
+                    None if relay_state else _scatter_dflash_1d(flat.verified_id, "verified_id")
+                ),
                 target_hidden=_scatter_dflash_hidden(flat.target_hidden),
-                ctx_lens=_scatter_dflash_1d(flat.ctx_lens, "ctx_lens"),
-                draft_seq_lens=_scatter_dflash_1d(flat.draft_seq_lens, "draft_seq_lens"),
+                ctx_lens=(None if relay_state else _scatter_dflash_1d(flat.ctx_lens, "ctx_lens")),
+                draft_seq_lens=(
+                    None
+                    if relay_state
+                    else _scatter_dflash_1d(flat.draft_seq_lens, "draft_seq_lens")
+                ),
+                allocate_lens=(
+                    None
+                    if flat.allocate_lens is None
+                    else _scatter_dflash_1d(flat.allocate_lens, "allocate_lens")
+                ),
+                reservation_base_lens=(
+                    None
+                    if flat.reservation_base_lens is None
+                    else _scatter_dflash_1d(flat.reservation_base_lens, "reservation_base_lens")
+                ),
+                future_indices=(
+                    None
+                    if flat.future_indices is None
+                    else _scatter_dflash_1d(flat.future_indices, "future_indices")
+                ),
                 block_size=flat.block_size,
             )
 
@@ -2789,6 +2811,7 @@ class ScheduleBatch:
             def _slice(v, start: int, end: int):
                 return None if v is None else v[start:end]
 
+            relay_state = flat.future_indices is not None
             out = []
             offset = 0
             for n in real_bs_per_dp:
@@ -2799,10 +2822,19 @@ class ScheduleBatch:
                 end = offset + n
                 out.append(
                     DFlashDraftInput(
-                        verified_id=_slice(flat.verified_id, offset, end),
-                        target_hidden=_slice(flat.target_hidden, offset, end),
-                        ctx_lens=_slice(flat.ctx_lens, offset, end),
-                        draft_seq_lens=_slice(flat.draft_seq_lens, offset, end),
+                        verified_id=(
+                            None if relay_state else _slice(flat.verified_id, offset, end)
+                        ),
+                        target_hidden=(
+                            None if relay_state else _slice(flat.target_hidden, offset, end)
+                        ),
+                        ctx_lens=None if relay_state else _slice(flat.ctx_lens, offset, end),
+                        draft_seq_lens=(
+                            None if relay_state else _slice(flat.draft_seq_lens, offset, end)
+                        ),
+                        allocate_lens=_slice(flat.allocate_lens, offset, end),
+                        reservation_base_lens=_slice(flat.reservation_base_lens, offset, end),
+                        future_indices=_slice(flat.future_indices, offset, end),
                         block_size=flat.block_size,
                     )
                 )
@@ -2896,7 +2928,20 @@ class ScheduleBatch:
 
         is_dflash = isinstance(nonempty[0], DFlashDraftInput)
         if is_dflash:
-            per_req_fields = ("verified_id", "ctx_lens", "draft_seq_lens", "target_hidden")
+            has_future_indices = any(s.future_indices is not None for s in nonempty)
+            if has_future_indices and not all(s.future_indices is not None for s in nonempty):
+                raise ValueError(
+                    "DFLASH overlap concat requires future_indices on every nonempty rank."
+                )
+            per_req_fields = (
+                "verified_id",
+                "ctx_lens",
+                "draft_seq_lens",
+                "target_hidden",
+                "allocate_lens",
+                "reservation_base_lens",
+                "future_indices",
+            )
         else:
             has_future_indices = any(
                 getattr(s, "future_indices", None) is not None for s in nonempty
@@ -2927,6 +2972,19 @@ class ScheduleBatch:
             kwargs["block_size"] = nonempty[0].block_size
         for f in per_req_fields:
             vals = [getattr(s, f, None) for s in nonempty]
+            if (
+                is_dflash
+                and has_future_indices
+                and f
+                in (
+                    "verified_id",
+                    "ctx_lens",
+                    "draft_seq_lens",
+                    "target_hidden",
+                )
+            ):
+                kwargs[f] = None
+                continue
             if is_dflash and f == "target_hidden":
                 materialized = [v for v in vals if v is not None and v.shape[0] > 0]
                 if not materialized:

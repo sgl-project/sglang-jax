@@ -2364,7 +2364,7 @@ class Scheduler(
                 batch_output.next_token_ids
                 if (
                     self.spec_algorithm is not None
-                    and self.spec_algorithm.is_eagle()
+                    and (self.spec_algorithm.is_eagle() or self.spec_algorithm.is_dflash())
                     and (batch.forward_mode.is_decode() or defer_spec_prefill_output)
                     and self.enable_overlap
                 )
