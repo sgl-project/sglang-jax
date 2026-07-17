@@ -233,6 +233,8 @@ class FlashAttention(AttentionBackend):
         )
         return metadata
 
+    # TODO(haifeng): Make this a common speculative metadata builder in the next PR;
+    # DFlash and EAGLE already share this path.
     def get_eagle_forward_metadata(
         self,
         batch: ModelWorkerBatch,

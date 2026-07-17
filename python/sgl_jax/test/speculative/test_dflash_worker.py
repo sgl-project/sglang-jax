@@ -5,10 +5,7 @@ import numpy as np
 
 from sgl_jax.srt.layers.attention.flashattention_backend import _pad_page_indices
 from sgl_jax.srt.speculative.dflash_info import DFlashDraftInput
-from sgl_jax.srt.speculative.dflash_worker import (
-    DFlashWorker,
-    _mask_dflash_draft_extend_cache_loc,
-)
+from sgl_jax.srt.speculative.dflash_worker import DFlashWorker, _mask_draft_kv_writes
 
 
 def _bare_worker(**attrs):
@@ -46,7 +43,7 @@ def test_prefill_draft_extend_metadata_rejects_bucket_mismatch():
 
 def test_draft_extend_masks_unaccepted_and_padded_rows():
     cache_loc = np.arange(12, dtype=np.int32)
-    masked = _mask_dflash_draft_extend_cache_loc(
+    masked = _mask_draft_kv_writes(
         jax.numpy.asarray(cache_loc),
         jax.numpy.asarray([2, 4, 3], dtype=jax.numpy.int32),
         jax.numpy.asarray([True, False, True]),
@@ -152,7 +149,7 @@ def test_build_page_indices_handles_uneven_dp_ranks():
     )
 
 
-def test_compact_dflash_state_removes_dp_padding_but_keeps_new_seq_lens():
+def test_unpad_draft_state_removes_dp_padding_but_keeps_new_seq_lens():
     di = DFlashDraftInput(
         verified_id=np.array([10, 20, 0, 30, 0, 0], dtype=np.int32),
         target_hidden=None,
@@ -161,7 +158,7 @@ def test_compact_dflash_state_removes_dp_padding_but_keeps_new_seq_lens():
     )
     di.new_seq_lens = np.array([6, 8, 0, 10, 0, 0], dtype=np.int32)
 
-    DFlashWorker._compact_dflash_state_to_real_slots(
+    DFlashWorker._unpad_draft_state(
         di,
         np.array([0, 1, 3], dtype=np.int32),
     )
@@ -189,7 +186,7 @@ def test_verify_write_cache_loc_selects_valid_half_per_dp_rank():
     )
 
 
-def test_trim_dflash_draft_input_drops_stale_tail_state():
+def test_trim_draft_state_drops_stale_tail():
     w = _bare_worker()
     di = DFlashDraftInput(
         verified_id=np.array([10, 20, 30, 40], dtype=np.int32),
@@ -198,7 +195,7 @@ def test_trim_dflash_draft_input_drops_stale_tail_state():
         draft_seq_lens=np.array([5, 6, 7, 8], dtype=np.int32),
     )
 
-    w._trim_dflash_draft_input_to_decode_batch(di, bs=3)
+    w._trim_draft_state_to_bs(di, bs=3)
 
     np.testing.assert_array_equal(di.verified_id, np.array([10, 20, 30], dtype=np.int32))
     np.testing.assert_array_equal(di.ctx_lens, np.array([0, 0, 0], dtype=np.int32))

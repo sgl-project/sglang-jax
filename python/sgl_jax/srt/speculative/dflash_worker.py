@@ -34,7 +34,7 @@ from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 logger = logging.getLogger(__name__)
 
 
-def _mask_dflash_draft_extend_cache_loc(
+def _mask_draft_kv_writes(
     cache_loc: jax.Array,
     accept_lens: jax.Array,
     active_mask: jax.Array,
@@ -106,9 +106,6 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         )
         self.block_size = self.speculative_num_draft_tokens
 
-        req_to_token_pool = self.req_to_token_pool
-        target_allocator = self.token_to_kv_pool_allocator
-
         draft_server_args = copy.deepcopy(server_args)
         draft_server_args.skip_tokenizer_init = True
 
@@ -117,16 +114,15 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         self._worker = ModelWorker(
             server_args=draft_server_args,
             mesh=self.mesh,
-            req_to_token_pool=req_to_token_pool,
+            req_to_token_pool=self.req_to_token_pool,
             is_draft_worker=True,
             model_class=DFlashDraftModel,
         )
-        self._draft_model_runner = self._worker.model_runner
         draft_model = self.draft_model_runner.model
 
         # Alias the KV allocator so draft block allocation draws from the same
         # free list the target uses (no collision with committed slots).
-        self.draft_model_runner.token_to_kv_pool_allocator = target_allocator
+        self.draft_model_runner.token_to_kv_pool_allocator = self.token_to_kv_pool_allocator
 
         target_model = target_worker.model_runner.model
         embed_weight, head_weight = target_model.get_embed_and_head()
@@ -333,7 +329,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
 
     @property
     def draft_model_runner(self):
-        return self._draft_model_runner
+        return self._worker.model_runner
 
     def __getattr__(self, name):
         target_worker = self.__dict__.get("_target_worker")
@@ -372,14 +368,14 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         next_token_ids,
     ) -> None:
         sel = np.asarray(model_worker_batch.logits_indices_selector)
-        extend_seq_lens = np.asarray(model_worker_batch.extend_seq_lens, dtype=np.int32)[sel]
-        extend_prefix_lens = np.asarray(model_worker_batch.extend_prefix_lens, dtype=np.int32)[sel]
+        seq_lens = np.asarray(model_worker_batch.extend_seq_lens, dtype=np.int32)[sel]
+        prefix_lens = np.asarray(model_worker_batch.extend_prefix_lens, dtype=np.int32)[sel]
 
         draft_input = DFlashDraftInput(
             verified_id=None,
             target_hidden=target_hidden,
-            ctx_lens=extend_seq_lens,
-            draft_seq_lens=extend_prefix_lens,
+            ctx_lens=seq_lens,
+            draft_seq_lens=prefix_lens,
             block_size=self.block_size,
         )
 
@@ -412,7 +408,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         next_draft_input.new_seq_lens = plan.seq_lens + accept_lens
         next_draft_input.target_hidden = None
         batch_output.accept_lens = accept_lens
-        self._compact_dflash_state_to_real_slots(
+        self._unpad_draft_state(
             next_draft_input,
             model_worker_batch.logits_indices_selector,
         )
@@ -421,17 +417,10 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         del model_worker_batch._dflash_target_verify_plan
 
     @staticmethod
-    def _compact_dflash_state_to_real_slots(
+    def _unpad_draft_state(
         draft_input: DFlashDraftInput,
         selector: np.ndarray,
     ) -> None:
-        """Remove per-DP padding before publishing cross-round host state.
-
-        ``ScheduleBatch._split_spec_info_per_rank`` consumes a compact
-        rank-major state, while target verify runs on DP-padded slots. Keep
-        ``new_seq_lens`` padded because the scheduler uses it immediately to
-        advance each rank's request lengths.
-        """
         selector = np.asarray(selector, dtype=np.int32)
         for field in ("verified_id", "ctx_lens", "draft_seq_lens"):
             value = getattr(draft_input, field, None)
@@ -454,7 +443,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         bs = int(model_worker_batch.seq_lens.shape[0])
         seq_lens = np.asarray(model_worker_batch.seq_lens, dtype=np.int32)
         target_prefix_lens = seq_lens - 1
-        self._trim_dflash_draft_input_to_decode_batch(draft_input, bs)
+        self._trim_draft_state_to_bs(draft_input, bs)
         draft_prefix_lens = np.asarray(draft_input.draft_seq_lens, dtype=np.int32)
 
         draft_plan = self._build_draft_forward_plan(
@@ -529,7 +518,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             extend_logprob_start_len_per_req=None,
         )
 
-    def _trim_dflash_draft_input_to_decode_batch(
+    def _trim_draft_state_to_bs(
         self,
         draft_input: DFlashDraftInput,
         bs: int,
@@ -593,12 +582,10 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 output, pool_updates, _, layers_topk_ids = model(
                     forward_batch, memory_pools, logits_metadata
                 )
-            accept_lens_out, next_token_ids_flat, new_verified_id, _ = (
-                dflash_greedy_verify(
-                    draft_token,
-                    output.next_token_logits,
-                    draft_token_num=draft_token_num,
-                )
+            accept_lens_out, next_token_ids_flat, new_verified_id, _ = dflash_greedy_verify(
+                draft_token,
+                output.next_token_logits,
+                draft_token_num=draft_token_num,
             )
             accept_lens_out = jax.sharding.reshard(accept_lens_out, token_sharding)
             next_token_ids_flat = jax.sharding.reshard(next_token_ids_flat, token_sharding)
@@ -952,7 +939,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             active_mask = jax.sharding.reshard(active_mask.astype(jnp.bool_), vector_sharding)
             target_hidden = jax.sharding.reshard(target_hidden, hidden_sharding)
 
-            cache_loc = _mask_dflash_draft_extend_cache_loc(
+            cache_loc = _mask_draft_kv_writes(
                 cache_loc,
                 accept_lens,
                 active_mask,

@@ -71,6 +71,7 @@ def dflash_greedy_verify(
             axis=1,
         ).reshape(-1)
     else:
+
         def _select_local_bonus(local_predict, local_accept_len):
             return jnp.take_along_axis(
                 local_predict,

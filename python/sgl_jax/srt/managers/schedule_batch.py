@@ -2902,9 +2902,7 @@ class ScheduleBatch:
                 getattr(s, "future_indices", None) is not None for s in nonempty
             )
             if has_future_indices:
-                assert all(
-                    getattr(s, "future_indices", None) is not None for s in nonempty
-                ), (
+                assert all(getattr(s, "future_indices", None) is not None for s in nonempty), (
                     "_concat_spec_info_per_rank requires every nonempty rank to carry "
                     "future_indices on the relay-buffer path"
                 )
