@@ -169,24 +169,85 @@ class TestGDNPrefillImplementation(unittest.TestCase):
 
     def test_environment_changes_after_initialization_do_not_change_saved_dispatch(self):
         with _prefill_environment("reference"):
-            backend = self.make_backend()
-
-        saved = (
-            backend.requested_impl,
-            backend.effective_impl,
-            backend.fallback_reason,
-            backend._prefill_callable,
-        )
-        with _prefill_environment("chunkwise", "true"):
-            self.assertEqual(
-                (
-                    backend.requested_impl,
-                    backend.effective_impl,
-                    backend.fallback_reason,
-                    backend._prefill_callable,
-                ),
-                saved,
+            (
+                forward_batch,
+                pool,
+                layer,
+                q,
+                k,
+                v,
+                a,
+                b,
+                initial_ssm,
+                initial_conv,
+                recurrent_indices,
+            ) = create_test_data(
+                "prefill",
+                [3],
+                num_k_heads=2,
+                num_v_heads=4,
+                head_k_dim=16,
+                head_v_dim=16,
+                conv_kernel_size=3,
+                dtype=jnp.bfloat16,
+                rng=np.random.default_rng(1),
+                test_mesh=mesh,
+                all_have_initial_state=True,
             )
+            backend = forward_batch.attn_backend._backend
+
+        saved_status = tuple(
+            getattr(backend, field, None)
+            for field in ("requested_impl", "effective_impl", "fallback_reason")
+        )
+        saved_callable_was_bound = hasattr(backend, "_prefill_callable")
+        saved_callable = getattr(backend, "_prefill_callable", ragged_gated_delta_rule_ref)
+
+        dispatch_calls = []
+
+        def wrapped_reference(*args, **kwargs):
+            dispatch_calls.append(True)
+            return saved_callable(*args, **kwargs)
+
+        backend._prefill_callable = wrapped_reference
+
+        with _prefill_environment("invalid-after-initialization"):
+            activation_sharding = NamedSharding(mesh, P("data", "tensor"))
+            actual, (recurrent_buffer, conv_buffer_list) = layer(
+                forward_batch,
+                jax.device_put(q, activation_sharding),
+                jax.device_put(k, activation_sharding),
+                jax.device_put(v, activation_sharding),
+                jax.device_put(a, activation_sharding),
+                jax.device_put(b, activation_sharding),
+                pool,
+            )
+
+        actual_ssm = gather_ssm(pool, recurrent_buffer, recurrent_indices)
+        actual_conv = gather_conv(pool, conv_buffer_list[0], recurrent_indices)
+        self.assertGreaterEqual(
+            len(dispatch_calls),
+            1,
+            "forward_extend must invoke the saved _prefill_callable after initialization",
+        )
+        self.assertTrue(
+            saved_callable_was_bound,
+            "backend initialization must save the selected _prefill_callable",
+        )
+        self.assertIs(saved_callable, ragged_gated_delta_rule_ref)
+        self.assertEqual(
+            (backend.requested_impl, backend.effective_impl, backend.fallback_reason),
+            saved_status,
+        )
+        self.assertIs(backend._prefill_callable, wrapped_reference)
+        for name, actual_value, expected_shape in (
+            ("output", actual, (q.shape[0], v.shape[1])),
+            ("recurrent state", actual_ssm, initial_ssm.shape),
+            ("conv state", actual_conv, initial_conv.shape),
+        ):
+            actual_value = np.asarray(actual_value)
+            self.assertEqual(actual_value.shape, expected_shape)
+            self.assertTrue(np.isfinite(actual_value).all(), f"{name} must be finite")
 
     def test_initialization_logs_requested_effective_and_fallback_status_once(self):
         with _prefill_environment("reference"):
