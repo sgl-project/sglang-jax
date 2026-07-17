@@ -75,7 +75,11 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
             input_size=2 * config.hidden_size,
             output_size=config.num_key_value_heads * self.self_attn.head_dim,
             use_bias=attention_bias,
-            kernel_axes=("tensor", None),
+            # Column-parallel like q_proj/k_proj: output (heads) sharded on "tensor",
+            # matching the (None, "tensor") WeightMapping and the attention kernel's
+            # k/v shape contract. ("tensor", None) left v replicated while k was
+            # sharded — the k.shape != v.shape failure seen on multi-chip GQA.
+            kernel_axes=(None, "tensor"),
             params_dtype=dtype,
             mesh=mesh,
         )
