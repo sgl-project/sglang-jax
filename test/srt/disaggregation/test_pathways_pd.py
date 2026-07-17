@@ -586,3 +586,122 @@ def test_drain_multi_mixed_backlog_then_stuck_defer():
     assert fake._pd_ready_q.empty()
     assert n_calls == 4  # 3 ready items + 1 no-progress defer call before exit
     assert fake._pd_defer == ["stuck-req"]
+
+
+# ---------------------------------------------------------------------------
+# D-side token-level admission reservation (#1427 follow-up: KV backpressure)
+# ---------------------------------------------------------------------------
+
+
+class _FakeReq:
+    def __init__(self, rid: str, n_tokens: int):
+        self.rid = rid
+        self.origin_input_ids = [0] * n_tokens
+
+
+class _FakeFullAlloc:
+    """SWA-style allocator: full_available_size differs from (min-based)
+    available_size, so the gate must read the full pool, not the min."""
+
+    def __init__(self, full_by_rank, min_by_rank=None):
+        self._full = full_by_rank
+        self._min = min_by_rank or full_by_rank
+
+    def full_available_size(self, dp_rank: int = 0) -> int:
+        return self._full[dp_rank]
+
+    def available_size(self, dp_rank: int = 0) -> int:
+        return self._min[dp_rank]
+
+
+class _FakeMinOnlyAlloc:
+    """Non-SWA allocator: only available_size exists (getattr fallback)."""
+
+    def __init__(self, by_rank):
+        self._by_rank = by_rank
+
+    def available_size(self, dp_rank: int = 0) -> int:
+        return self._by_rank[dp_rank]
+
+
+class _FakeGateSelf(PathwaysPDSchedulerMixin):
+    """Subclasses the mixin so the gate/ledger helpers under test can call
+    each other through self, with only the state they touch defined here."""
+
+    page_size = PAGE_SIZE
+
+    def __init__(self, d_allocs, dp_size=1, reserved_per=0, d_running=0):
+        self.d_allocs = d_allocs
+        self.dp_size = dp_size
+        self._pd_reserved_per = reserved_per
+        self._d_running = d_running
+        self._pd_inflight_rids = set()
+        self._pd_inflight_tokens = 0
+        self._pd_gate_ticks = 0
+
+    def _pd_total_d_running(self) -> int:
+        return self._d_running
+
+
+def test_pd_req_kv_tokens_page_padded():
+    fake = _FakeGateSelf(d_allocs=[])
+    f = PathwaysPDSchedulerMixin._pd_req_kv_tokens
+    assert f(fake, _FakeReq("a", 1)) == PAGE_SIZE
+    assert f(fake, _FakeReq("b", PAGE_SIZE)) == PAGE_SIZE
+    assert f(fake, _FakeReq("c", PAGE_SIZE + 1)) == 2 * PAGE_SIZE
+
+
+def test_track_untrack_inflight_idempotent():
+    fake = _FakeGateSelf(d_allocs=[])
+    r = _FakeReq("r1", 5)  # pads to 8
+    PathwaysPDSchedulerMixin._pd_track_inflight(fake, r)
+    assert fake._pd_inflight_tokens == 8
+    # chunked req: chunk-2..N re-track the same rid -> counted once
+    PathwaysPDSchedulerMixin._pd_track_inflight(fake, r)
+    assert fake._pd_inflight_tokens == 8
+    PathwaysPDSchedulerMixin._pd_untrack_inflight(fake, r)
+    assert fake._pd_inflight_tokens == 0
+    assert not fake._pd_inflight_rids
+    # double-untrack (failure path after success path) must not go negative
+    PathwaysPDSchedulerMixin._pd_untrack_inflight(fake, r)
+    assert fake._pd_inflight_tokens == 0
+
+
+def test_token_gate_open_under_capacity():
+    fake = _FakeGateSelf(d_allocs=[_FakeMinOnlyAlloc({0: 100})])
+    PathwaysPDSchedulerMixin._pd_track_inflight(fake, _FakeReq("r1", 40))
+    assert not PathwaysPDSchedulerMixin._pd_token_gate_closed(fake)
+
+
+def test_token_gate_closes_on_projected_exhaustion():
+    # inflight 40 + reserved 2*(running 20 + inflight 1) = 82 >= avail 80
+    fake = _FakeGateSelf(d_allocs=[_FakeMinOnlyAlloc({0: 80})], reserved_per=2, d_running=20)
+    PathwaysPDSchedulerMixin._pd_track_inflight(fake, _FakeReq("r1", 40))
+    assert PathwaysPDSchedulerMixin._pd_token_gate_closed(fake)
+
+
+def test_token_gate_sums_across_d_and_ranks():
+    # 2 D targets x 2 ranks x 30 = 120 total; inflight 100 < 120 -> open
+    allocs = [_FakeMinOnlyAlloc({0: 30, 1: 30}), _FakeMinOnlyAlloc({0: 30, 1: 30})]
+    fake = _FakeGateSelf(d_allocs=allocs, dp_size=2)
+    PathwaysPDSchedulerMixin._pd_track_inflight(fake, _FakeReq("r1", 100))
+    assert not PathwaysPDSchedulerMixin._pd_token_gate_closed(fake)
+    PathwaysPDSchedulerMixin._pd_track_inflight(fake, _FakeReq("r2", 100))
+    assert PathwaysPDSchedulerMixin._pd_token_gate_closed(fake)
+
+
+def test_token_gate_reads_full_pool_not_min_for_swa():
+    # swa side transiently tiny (min=4) but full pool has room (100): the
+    # IL projection must gate on the full pool -- the swa transient is
+    # handled exactly by the drain-time gate + defer. min() here would
+    # wedge admission for SWA models whose swa pool is window-sized.
+    fake = _FakeGateSelf(d_allocs=[_FakeFullAlloc({0: 100}, min_by_rank={0: 4})])
+    PathwaysPDSchedulerMixin._pd_track_inflight(fake, _FakeReq("r1", 40))
+    assert not PathwaysPDSchedulerMixin._pd_token_gate_closed(fake)
+
+
+def test_token_gate_env_escape(monkeypatch):
+    monkeypatch.setenv("SGLANG_PD_NO_TOKEN_GATE", "1")
+    fake = _FakeGateSelf(d_allocs=[_FakeMinOnlyAlloc({0: 0})])
+    PathwaysPDSchedulerMixin._pd_track_inflight(fake, _FakeReq("r1", 400))
+    assert not PathwaysPDSchedulerMixin._pd_token_gate_closed(fake)

@@ -227,6 +227,11 @@ class PathwaysPDSchedulerMixin:
         # reqs pushed to prefill_q but not yet drained into running_batch;
         # tracked by rid so a chunked req counts once, not once-per-chunk.
         self._pd_inflight_rids: set[str] = set()
+        # D-pool tokens the inflight rids will need at migrate time (page-
+        # padded full IL per req) -- the admission-side reservation ledger.
+        self._pd_inflight_tokens = 0
+        self._pd_gate_ticks = 0
+        self._pd_defer_ticks = 0
         self._pd_reserved_per = server_args.disaggregation_num_reserved_decode_tokens
         self._pd_sliding_window = self.tp_workers_p[0].sliding_window_size or 0
         self._pd_next_p = 0
@@ -647,7 +652,7 @@ class PathwaysPDSchedulerMixin:
                     if r.req_pool_idx is not None:
                         p_tree.cache_finished_req(r)
                         p_r2t.free_slots.append(r.req_pool_idx)
-                    self._pd_inflight_rids.discard(r.rid)
+                    self._pd_untrack_inflight(r)
                     all_reqs.append(r)
             self.stream_output(all_reqs, False, False)
             for dp in chunked_excl:
@@ -671,7 +676,22 @@ class PathwaysPDSchedulerMixin:
                 for rk, nd in need_by_rank.items()
             ):
                 self._pd_defer.append(item)
+                # Starvation diagnostic: defer is silent by design (retried
+                # every drain tick); if it stays wedged (e.g. a single item
+                # whose need can never fit next to the reserve) surface the
+                # numbers instead of hanging mutely. ~30s at a ~29ms tick.
+                self._pd_defer_ticks += 1
+                if self._pd_defer_ticks % 1024 == 0:
+                    logger.warning(
+                        "[pd-backpressure] ready item deferred x%d: need=%s "
+                        "reserved/rank=%d avail=%s",
+                        self._pd_defer_ticks,
+                        dict(need_by_rank),
+                        reserved_per_rank,
+                        {rk: allocator.available_size(dp_rank=rk) for rk in need_by_rank},
+                    )
                 return
+            self._pd_defer_ticks = 0
         d_pages_all = []
         for r, p_slots, p_pages in done_per_req:
             seq_len = len(r.fill_ids)
@@ -773,7 +793,7 @@ class PathwaysPDSchedulerMixin:
                 (time.perf_counter() - t_dequeue_ready) * 1e3,
             )
         for r, _, _ in done_per_req:
-            self._pd_inflight_rids.discard(r.rid)
+            self._pd_untrack_inflight(r)
         if _PD_DBG and done_per_req and hasattr(p_alloc, "swa_available_size"):
             logger.info(
                 "[pd-diag] after free %d done: P full_avail=%d swa_avail=%d",
@@ -827,6 +847,65 @@ class PathwaysPDSchedulerMixin:
                 break
         return n_calls
 
+    def _pd_req_kv_tokens(self, r) -> int:
+        """Page-padded D-pool token footprint a req needs at migrate time
+        (migrate allocs len(p_pages) * page_size for the full input)."""
+        n = len(r.origin_input_ids)
+        return -(-n // self.page_size) * self.page_size
+
+    def _pd_track_inflight(self, r) -> None:
+        """Reserve r's D-pool footprint at admission. Idempotent per rid so
+        a chunked req's chunk-2..N batches don't double-count."""
+        if r.rid not in self._pd_inflight_rids:
+            self._pd_inflight_rids.add(r.rid)
+            self._pd_inflight_tokens += self._pd_req_kv_tokens(r)
+
+    def _pd_untrack_inflight(self, r) -> None:
+        """Release r's reservation (migrated into D, or prefill failed)."""
+        if r.rid in self._pd_inflight_rids:
+            self._pd_inflight_rids.discard(r.rid)
+            self._pd_inflight_tokens = max(0, self._pd_inflight_tokens - self._pd_req_kv_tokens(r))
+
+    def _pd_token_gate_closed(self) -> bool:
+        """D-side token-level admission reservation (#1427 follow-up).
+
+        Closed when the inflight reqs' migrate-time footprint plus the
+        decode-growth reserve already covers the D pools' free space --
+        admitting more would just burn P compute on prefills that pile up
+        in _pd_defer holding P KV. Totals across D targets and dp ranks
+        (per-rank exact fit is enforced by the drain-time gate + defer);
+        check-then-build, so one build of overshoot is possible -- also
+        absorbed by the drain gate. On SWA allocators gate on the FULL
+        pool: the swa pool's transient full-seq occupancy during migrate
+        recovers via free_swa, and min()-gating on it would wedge
+        admission for models whose swa pool is window-sized.
+        """
+        if os.environ.get("SGLANG_PD_NO_TOKEN_GATE"):
+            return False
+        avail = 0
+        for alloc in self.d_allocs:
+            f = getattr(alloc, "full_available_size", alloc.available_size)
+            avail += sum(f(dp_rank=rk) for rk in range(self.dp_size))
+        reserved = self._pd_reserved_per * (
+            self._pd_total_d_running() + len(self._pd_inflight_rids)
+        )
+        closed = self._pd_inflight_tokens + reserved >= avail
+        if closed:
+            self._pd_gate_ticks += 1
+            if self._pd_gate_ticks % 512 == 1:
+                logger.info(
+                    "[pd-backpressure] admission paused x%d: inflight=%d reqs "
+                    "%d tok + reserved %d >= D avail %d",
+                    self._pd_gate_ticks,
+                    len(self._pd_inflight_rids),
+                    self._pd_inflight_tokens,
+                    reserved,
+                    avail,
+                )
+        else:
+            self._pd_gate_ticks = 0
+        return closed
+
     def _pd_maybe_push_prefill(self) -> None:
         """Build at most one P batch (round-robin across P slices) and push to
         its prefill_q. Extracted so both the n_decode==1 path
@@ -857,11 +936,19 @@ class PathwaysPDSchedulerMixin:
         # up in the same tick -> observed 2P1D-only correctness bug on the
         # first attempt. D tick ~29ms << P cycle ~330ms so 1 build/tick is
         # plenty to keep both P threads fed.
+        gate_closed = self._pd_token_gate_closed()
         for _off in range(n_p):
             i = (self._pd_next_p + _off) % n_p
             if self._pd_chunk_pending[i]:
                 continue
             if self._pd_prefill_qs[i].full():
+                continue
+            # Token gate blocks NEW admissions only; a P slice with a pending
+            # chunked req still builds so chunk-N+1 can complete and migrate
+            # (its footprint is already in the ledger from chunk-1). The
+            # builder may admit new reqs alongside a continuation -- bounded
+            # overshoot, see _pd_token_gate_closed docstring.
+            if gate_closed and not any(r is not None for r in self.p_chunked_reqs[i]):
                 continue
             self._pd_next_p = (i + 1) % n_p
             saved = self.per_dp_max_running_requests
@@ -907,7 +994,7 @@ class PathwaysPDSchedulerMixin:
             ), "[pd_async] return_logprob / hidden_states not yet supported (async prefill drops logits_output)"
             for info in new_batch.reqs_info:
                 for r in info.reqs or ():
-                    self._pd_inflight_rids.add(r.rid)
+                    self._pd_track_inflight(r)
             # Set pending only when this batch has a mid-chunk req (whose next
             # chunk depends on this one draining). Final-chunk / non-chunked
             # batches leave pending untouched so the main loop can immediately
