@@ -15,6 +15,8 @@ Run the exact acceptance nodes on TPU with::
     uv run --with pytest python -m pytest -q \
       python/sgl_jax/test/kernels/kda_test.py::test_chunk_kda_32k_varlen_output_and_final_state_match_naive_recurrent_kda -vv
     uv run --with pytest python -m pytest -q \
+      python/sgl_jax/test/kernels/kda_test.py::test_chunk_kda_32k_no_zero_length_output_and_final_state_match_naive_recurrent_kda -vv
+    uv run --with pytest python -m pytest -q \
       python/sgl_jax/test/kernels/kda_test.py::test_chunk_local_cumsum_preserves_custom_chunk_order_and_masks_invalid_chunks -vv
 """
 
@@ -207,10 +209,11 @@ def test_kda_gate_chunk_cumsum_32k_tpu_regression():
     )
 
 
-def _make_full_32k_case():
-    seq_lens = [0, 1023, 1025] + [1024] * 30
+def _make_full_32k_case(*, include_zero_length: bool = True):
+    base_seq_lens = [0, 1023, 1025] + [1024] * 30
+    seq_lens = base_seq_lens if include_zero_length else base_seq_lens[1:]
     logical_t = sum(seq_lens)
-    assert len(seq_lens) == 33
+    assert len(seq_lens) == (33 if include_zero_length else 32)
     assert logical_t == 32_768
     cu_seqlens = jnp.asarray(
         np.concatenate([[0], np.cumsum(seq_lens, dtype=np.int32)]), dtype=jnp.int32
@@ -227,9 +230,12 @@ def _make_full_32k_case():
     )
     A_log = -1.5 + 0.1 * jax.random.normal(keys[5], (_H,), dtype=jnp.float32)
     dt_bias = 0.1 + 0.2 * jax.random.normal(keys[6], (_H, _K), dtype=jnp.float32)
-    initial_state = 0.01 * jax.random.normal(
-        keys[7], (len(seq_lens), _H, _K, _V), dtype=jnp.float32
+    base_initial_state = 0.01 * jax.random.normal(
+        keys[7], (len(base_seq_lens), _H, _K, _V), dtype=jnp.float32
     )
+    # Generate the 33-row base first so removing the zero-length request keeps
+    # every remaining request's initial state bit-for-bit identical.
+    initial_state = base_initial_state if include_zero_length else base_initial_state[1:]
 
     assert q.dtype == k.dtype == v.dtype == raw_g.dtype == jnp.bfloat16
     assert q.shape == k.shape == v.shape == raw_g.shape == shape
@@ -303,13 +309,12 @@ def _full_naive_reference(
         outputs.append(output_i)
         final_states.append(final_state_i[0])
 
-    assert call_count == len(seq_lens) == 33
-    assert set(callable_by_length) == {0, 1023, 1024, 1025}
+    assert call_count == len(seq_lens)
+    assert set(callable_by_length) == set(seq_lens)
     return jnp.concatenate(outputs, axis=1), jnp.stack(final_states, axis=0)
 
 
-def test_chunk_kda_32k_varlen_output_and_final_state_match_naive_recurrent_kda():
-    """Full path covers duplicate, BT-1, BT+1, and 30 aligned requests."""
+def _run_full_32k_case(*, include_zero_length: bool):
     (
         seq_lens,
         cu_seqlens,
@@ -321,7 +326,7 @@ def test_chunk_kda_32k_varlen_output_and_final_state_match_naive_recurrent_kda()
         A_log,
         dt_bias,
         initial_state,
-    ) = _make_full_32k_case()
+    ) = _make_full_32k_case(include_zero_length=include_zero_length)
 
     scale = _K**-0.5
     optimized_output, optimized_final_state, *_ = chunk_kda(
@@ -359,30 +364,68 @@ def test_chunk_kda_32k_varlen_output_and_final_state_match_naive_recurrent_kda()
     )
 
     # _align_seqs allocates its static worst-case packed shape rather than only
-    # padded_cu_seqlens[-1]: logical/aligned/Stage-1 allocated = 32768/34880/34944.
+    # padded_cu_seqlens[-1]. Keep logical, aligned, and Stage-1 allocated T
+    # separate because the zero-length request changes only the latter two.
     aligned_t = align_up(len(seq_lens) * (_BT - 1) + q.shape[1], _BT)
+    expected_aligned_t = 34_880 if include_zero_length else 34_816
+    expected_allocated_t = expected_aligned_t + _BT
     assert q.shape[1] == 32_768
-    assert aligned_t == 34_880
-    assert aligned_t + _BT == 34_944
+    assert aligned_t == expected_aligned_t
+    assert aligned_t + _BT == expected_allocated_t
     assert optimized_output.shape == reference_output.shape == (1, 32_768, _H, _V)
     assert (
         optimized_final_state.shape
         == reference_final_state.shape
         == (
-            33,
+            len(seq_lens),
             _H,
             _K,
             _V,
         )
     )
     assert np.isfinite(np.asarray(optimized_output)).all()
+    assert np.isfinite(np.asarray(reference_output)).all()
     assert np.isfinite(np.asarray(optimized_final_state)).all()
+    assert np.isfinite(np.asarray(reference_final_state)).all()
     np.testing.assert_allclose(
         np.asarray(optimized_output),
         np.asarray(reference_output),
         rtol=2e-2,
         atol=1e-2,
     )
+    return seq_lens, optimized_final_state, reference_final_state
+
+
+def test_chunk_kda_32k_varlen_output_and_final_state_match_naive_recurrent_kda():
+    """Zero-length full path: logical/aligned/allocated T = 32768/34880/34944."""
+    seq_lens, optimized_final_state, reference_final_state = _run_full_32k_case(
+        include_zero_length=True
+    )
+
+    nonempty_mask = np.asarray(seq_lens, dtype=np.int32) > 0
+    assert nonempty_mask.shape == (33,)
+    assert np.count_nonzero(nonempty_mask) == 32
+    # Zero-length optimized final-state semantics are tracked by #326:
+    # https://github.com/primatrix/projects/issues/326
+    # All logical output remains checked above; only the explicitly nonempty
+    # requests participate in this final-state acceptance boundary.
+    np.testing.assert_allclose(
+        np.asarray(optimized_final_state)[nonempty_mask],
+        np.asarray(reference_final_state)[nonempty_mask],
+        rtol=2e-2,
+        atol=1e-2,
+    )
+
+
+def test_chunk_kda_32k_no_zero_length_output_and_final_state_match_naive_recurrent_kda():
+    """No-zero full path: logical/aligned/allocated T = 32768/34816/34880."""
+    seq_lens, optimized_final_state, reference_final_state = _run_full_32k_case(
+        include_zero_length=False
+    )
+
+    nonempty_mask = np.asarray(seq_lens, dtype=np.int32) > 0
+    assert nonempty_mask.shape == (32,)
+    assert nonempty_mask.all()
     np.testing.assert_allclose(
         np.asarray(optimized_final_state),
         np.asarray(reference_final_state),
@@ -395,7 +438,11 @@ def test_chunk_local_cumsum_preserves_custom_chunk_order_and_masks_invalid_chunk
     """Characterize caller mapping, both scan directions, dtype/layout, and masks."""
     chunk_size = 4
     total_t = 12
+    # The duplicate boundary at 3 is a zero-length request. Keep this fixed-seed
+    # fixture as the direct caller-mapping/mask characterization for #325.
     cu_seqlens = jnp.asarray([0, 3, 3, 8], dtype=jnp.int32)
+    # [2, 1] is partial, the middle rows are deliberately reordered, and
+    # [2, 2] is invalid; production must consume these caller-provided rows.
     chunk_indices = jnp.asarray([[2, 1], [0, 0], [2, 0], [2, 2]], dtype=jnp.int32)
     key = jax.random.PRNGKey(325)
     g = 0.25 + 0.2 * jax.random.normal(key, (1, total_t, _H, 7), dtype=jnp.float32)
@@ -451,6 +498,10 @@ def test_chunk_local_cumsum_preserves_custom_chunk_order_and_masks_invalid_chunk
 
         padding_slice = [slice(None)] * optimized.ndim
         padding_slice[time_axis] = slice(8, total_t)
+        np.testing.assert_array_equal(
+            np.asarray(reference[tuple(padding_slice)]),
+            np.zeros_like(np.asarray(reference[tuple(padding_slice)])),
+        )
         np.testing.assert_array_equal(
             np.asarray(optimized[tuple(padding_slice)]),
             np.zeros_like(np.asarray(optimized[tuple(padding_slice)])),
