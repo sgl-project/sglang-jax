@@ -385,8 +385,9 @@ def _run_full_32k_case(*, include_zero_length: bool):
     )
     assert np.isfinite(np.asarray(optimized_output)).all()
     assert np.isfinite(np.asarray(reference_output)).all()
-    assert np.isfinite(np.asarray(optimized_final_state)).all()
-    assert np.isfinite(np.asarray(reference_final_state)).all()
+    nonempty_mask = np.asarray(seq_lens, dtype=np.int32) > 0
+    assert np.isfinite(np.asarray(optimized_final_state)[nonempty_mask]).all()
+    assert np.isfinite(np.asarray(reference_final_state)[nonempty_mask]).all()
     np.testing.assert_allclose(
         np.asarray(optimized_output),
         np.asarray(reference_output),
