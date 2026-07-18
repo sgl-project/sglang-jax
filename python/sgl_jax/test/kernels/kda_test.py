@@ -141,16 +141,18 @@ def _make_direct_case(length: int):
 
 def _run_direct_case(length: int):
     raw_g, A_log, dt_bias, cu_seqlens, chunk_indices, aligned_t = _make_direct_case(length)
-    optimized = kda_gate_chunk_cumsum(
-        raw_g,
-        A_log,
-        chunk_size=_BT,
-        scale=_GATE_SCALE,
-        dt_bias=dt_bias,
-        cu_seqlens=cu_seqlens,
-        output_dtype=jnp.float32,
-        chunk_indices=chunk_indices,
-    )
+    optimized = jax.jit(
+        lambda dynamic_raw_g: kda_gate_chunk_cumsum(
+            dynamic_raw_g,
+            A_log,
+            chunk_size=_BT,
+            scale=_GATE_SCALE,
+            dt_bias=dt_bias,
+            cu_seqlens=cu_seqlens,
+            output_dtype=jnp.float32,
+            chunk_indices=chunk_indices,
+        )
+    )(raw_g)
     # The 32K RED must surface at the optimized Stage 1 compile before the
     # independent eager reference performs one update per logical chunk.
     jax.block_until_ready(optimized)
