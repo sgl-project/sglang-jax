@@ -137,48 +137,34 @@ _VMEM_HW_LIMIT_BYTES = 30 * 1024 * 1024
 
 
 def _chunk_cumsum_kernel(
-    cu_seqlens_ref,
-    chunk_indices_ref,
     s_ref,
     o_ref,
     *,
     BT: int,
-    NT: int,
     REVERSE: bool,
     HAS_SCALE: bool,
     scale: float,
 ):
     num_steps = int(math.log2(BT))
+    s = s_ref[:, 0, :, :].astype(jnp.float32)
 
-    def body(i_t, _):
-        i_n = chunk_indices_ref[i_t, 0]
-        local_i_t = chunk_indices_ref[i_t, 1]
-        bos = cu_seqlens_ref[i_n]
-        start_t = bos + local_i_t * BT
-        start_t = pl.multiple_of(start_t, BT)
+    if REVERSE:
+        for d in range(num_steps):
+            stride = 1 << d
+            top = s[:, : BT - stride, :] + s[:, stride:, :]
+            bot = s[:, BT - stride :, :]
+            s = jnp.concatenate([top, bot], axis=1)
+    else:
+        for d in range(num_steps):
+            stride = 1 << d
+            top = s[:, :stride, :]
+            bot = s[:, stride:, :] + s[:, :-stride, :]
+            s = jnp.concatenate([top, bot], axis=1)
 
-        s = s_ref[:, dslice(start_t, BT), :].astype(jnp.float32)
+    if HAS_SCALE:
+        s = s * scale
 
-        if REVERSE:
-            for d in range(num_steps):
-                stride = 1 << d
-                top = s[:, : BT - stride, :] + s[:, stride:, :]
-                bot = s[:, BT - stride :, :]
-                s = jnp.concatenate([top, bot], axis=1)
-        else:
-            for d in range(num_steps):
-                stride = 1 << d
-                top = s[:, :stride, :]
-                bot = s[:, stride:, :] + s[:, :-stride, :]
-                s = jnp.concatenate([top, bot], axis=1)
-
-        if HAS_SCALE:
-            s = s * scale
-
-        o_ref[:, dslice(start_t, BT), :] = s.astype(o_ref.dtype)
-        return 0
-
-    jax.lax.fori_loop(0, NT, body, 0)
+    o_ref[:, 0, dslice(0, BT), :] = s.astype(o_ref.dtype)
 
 
 def chunk_local_cumsum_vector(
@@ -226,41 +212,82 @@ def chunk_local_cumsum_vector(
 
     if chunk_indices is None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
-    NT = len(chunk_indices)
+    NC_max = len(chunk_indices)
 
     g_flat = jnp.pad(g_flat, ((0, 0), (0, BT), (0, 0)))
     T_alloc = T + BT
 
+    cu_i32 = cu_seqlens.astype(jnp.int32)
+    chunk_indices_i32 = chunk_indices.astype(jnp.int32)
+    N = cu_i32.shape[0] - 1
+    chunks_per_seq = (jnp.diff(cu_i32) + BT - 1) // BT
+
+    seq_id = chunk_indices_i32[:, 0]
+    local_ci = chunk_indices_i32[:, 1]
+    safe_seq_id = jnp.clip(seq_id, 0, N - 1)
+    chunk_valid = (
+        (seq_id == safe_seq_id)
+        & (local_ci >= 0)
+        & (local_ci < chunks_per_seq[safe_seq_id])
+    )
+
+    bos = cu_i32[safe_seq_id]
+    eos = cu_i32[safe_seq_id + 1]
+    chunk_starts = jnp.where(chunk_valid, bos + local_ci * BT, 0)
+    positions = chunk_starts[:, None] + jnp.arange(BT, dtype=jnp.int32)[None, :]
+    token_valid = chunk_valid[:, None] & (positions < eos[:, None]) & (positions < T)
+
+    def _gather_chunk(start):
+        return jax.lax.dynamic_slice(
+            g_flat,
+            (0, start, 0),
+            (BH_padded, BT, S_padded),
+        )
+
+    g_chunks = jax.vmap(_gather_chunk)(chunk_starts).transpose(1, 0, 2, 3)
+    g_chunks = jnp.where(token_valid[None, :, :, None], g_chunks, 0)
+
     elem_bytes = 4
-    while BB > 1 and 4 * BB * T_alloc * BS * elem_bytes > _VMEM_HW_LIMIT_BYTES:
+    while BB > 1 and 4 * BB * BT * BS * elem_bytes > _VMEM_HW_LIMIT_BYTES:
         BB //= 2
     NBH = BH_padded // BB
 
-    grid = (NS, NBH)
+    grid = (NS, NBH, NC_max)
     kernel = functools.partial(
         _chunk_cumsum_kernel,
         BT=BT,
-        NT=NT,
         REVERSE=reverse,
         HAS_SCALE=HAS_SCALE,
         scale=scale_val,
     )
 
-    def _index_map(i_s, i_bb, *_):
-        return (i_bb, 0, i_s)
+    def _index_map(i_s, i_bb, i_t):
+        return (i_bb, i_t, 0, i_s)
 
-    o_flat = pl.pallas_call(
+    block_shape = (BB, 1, BT, BS)
+
+    o_chunks = pl.pallas_call(
         kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=2,
+            num_scalar_prefetch=0,
             grid=grid,
-            in_specs=[pl.BlockSpec(block_shape=(BB, T_alloc, BS), index_map=_index_map)],
-            out_specs=pl.BlockSpec(block_shape=(BB, T_alloc, BS), index_map=_index_map),
+            in_specs=[pl.BlockSpec(block_shape=block_shape, index_map=_index_map)],
+            out_specs=pl.BlockSpec(block_shape=block_shape, index_map=_index_map),
         ),
-        out_shape=jax.ShapeDtypeStruct(g_flat.shape, out_dtype),
+        out_shape=jax.ShapeDtypeStruct(g_chunks.shape, out_dtype),
         interpret=interpret,
-        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel", "parallel")),
-    )(cu_seqlens, chunk_indices, g_flat)
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel", "parallel", "parallel")
+        ),
+    )(g_chunks)
+
+    o_chunks = jnp.where(token_valid[None, :, :, None], o_chunks, 0)
+    sentinel = jnp.minimum(cu_i32[-1], T)
+    scatter_positions = jnp.where(token_valid, positions, sentinel).reshape(-1)
+    scatter_values = o_chunks.reshape(BH_padded, NC_max * BT, S_padded)
+
+    o_flat = jnp.zeros((BH_padded, T_alloc, S_padded), dtype=o_chunks.dtype)
+    o_flat = o_flat.at[:, scatter_positions, :].add(scatter_values)
 
     o_flat = o_flat[:BH, :T, :S]
 
