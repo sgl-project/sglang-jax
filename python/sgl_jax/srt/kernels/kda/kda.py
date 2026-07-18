@@ -226,9 +226,7 @@ def chunk_local_cumsum_vector(
     local_ci = chunk_indices_i32[:, 1]
     safe_seq_id = jnp.clip(seq_id, 0, N - 1)
     chunk_valid = (
-        (seq_id == safe_seq_id)
-        & (local_ci >= 0)
-        & (local_ci < chunks_per_seq[safe_seq_id])
+        (seq_id == safe_seq_id) & (local_ci >= 0) & (local_ci < chunks_per_seq[safe_seq_id])
     )
 
     bos = cu_i32[safe_seq_id]
