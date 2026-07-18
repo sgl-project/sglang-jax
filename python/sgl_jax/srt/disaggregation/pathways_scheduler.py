@@ -480,22 +480,13 @@ class PathwaysPDSchedulerMixin:
                     )
                 self._extract_dp_output_ids(ntok, mwb, batch)
                 if batch.return_logprob or batch.return_output_logprob_only:
-                    # Mirrors run_batch: snapshot per-req lens NOW -- chunked
-                    # bookkeeping mutates them before the main-thread drain
-                    # consumes this result. logits_output's logprob fields are
-                    # already host arrays (materialized on this P thread).
-                    extend_input_lens = [
-                        req.extend_input_len
-                        for info in batch.reqs_info
-                        if info.reqs
-                        for req in info.reqs
-                    ]
-                    extend_logprob_start_lens = [
-                        req.extend_logprob_start_len
-                        for info in batch.reqs_info
-                        if info.reqs
-                        for req in info.reqs
-                    ]
+                    # Per-req lens were snapshotted on the main thread at
+                    # build time (_pd_maybe_push_prefill) -- the live req
+                    # fields may already belong to chunk N+1 by now.
+                    # logits_output's logprob fields are already host arrays
+                    # (materialized on this P thread).
+                    extend_input_lens = batch._pd_extend_input_lens
+                    extend_logprob_start_lens = batch._pd_extend_logprob_start_lens
                 else:
                     lo = None  # drop device logits promptly on non-logprob batches
                     extend_input_lens = None
@@ -1027,6 +1018,26 @@ class PathwaysPDSchedulerMixin:
             # (depth=2 overlap). Drain only clears pending on a mid-chunk item.
             if any(info.chunked_req is not None for info in new_batch.reqs_info):
                 self._pd_chunk_pending[i] = True
+            # Snapshot per-req logprob lens NOW, on the main thread: once this
+            # batch is queued, the depth-1 pipeline lets the main loop build
+            # chunk N+1 (init_next_round_input mutates extend_input_len /
+            # extend_logprob_start_len) while the P thread is still between
+            # forward and result construction -- reading the live fields there
+            # races and breaks chunked input-logprob accounting. Mirrors the
+            # copy run_batch does for the same reason.
+            if new_batch.return_logprob or new_batch.return_output_logprob_only:
+                new_batch._pd_extend_input_lens = [
+                    req.extend_input_len
+                    for info in new_batch.reqs_info
+                    if info.reqs
+                    for req in info.reqs
+                ]
+                new_batch._pd_extend_logprob_start_lens = [
+                    req.extend_logprob_start_len
+                    for info in new_batch.reqs_info
+                    if info.reqs
+                    for req in info.reqs
+                ]
             new_batch._pd_t_enqueue_prefill = time.perf_counter()
             self._pd_prefill_qs[i].put_nowait(new_batch)
             break
