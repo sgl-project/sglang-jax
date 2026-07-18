@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -82,6 +83,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--impl", choices=("reference", "chunkwise"), required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--publish-output", type=Path)
     parser.add_argument("--rank", type=int, required=True)
     parser.add_argument("--lengths", type=_parse_lengths, default=_parse_lengths("4096,32768"))
     parser.add_argument("--warmup", type=int, default=3)
@@ -98,8 +100,12 @@ def _parse_args() -> argparse.Namespace:
     if args.iterations <= 0:
         parser.error("--iterations must be positive")
     distributed = (args.coordinator_address, args.num_processes, args.process_id)
-    if any(value is not None for value in distributed) and not all(value is not None for value in distributed):
-        parser.error("--coordinator-address, --num-processes, and --process-id must be supplied together")
+    if any(value is not None for value in distributed) and not all(
+        value is not None for value in distributed
+    ):
+        parser.error(
+            "--coordinator-address, --num-processes, and --process-id must be supplied together"
+        )
     return args
 
 
@@ -118,7 +124,9 @@ def _resolve_code_revision(
     git_known = bool(re.fullmatch(r"[0-9a-f]{40}", git_revision))
     if supplied is None:
         if performance:
-            raise ValueError("performance mode requires --code-revision with exactly 40 hex characters")
+            raise ValueError(
+                "performance mode requires --code-revision with exactly 40 hex characters"
+            )
         return (git_revision, "git") if git_known else ("unknown", "unknown")
     if not re.fullmatch(r"[0-9a-f]{40}", supplied):
         raise ValueError("code revision must contain exactly 40 hex characters")
@@ -278,13 +286,24 @@ def _fixture(length: int) -> dict[str, jax.Array]:
     }
 
 
-def _kernel(function: Callable[..., tuple[jax.Array, jax.Array]]) -> Callable[[dict[str, jax.Array]], tuple[jax.Array, jax.Array]]:
+def _kernel(
+    function: Callable[..., tuple[jax.Array, jax.Array]]
+) -> Callable[[dict[str, jax.Array]], tuple[jax.Array, jax.Array]]:
     return jax.jit(
         lambda values: function(
-            values["mixed_qkv"], values["b"], values["a"], values["recurrent_state"],
-            values["A_log"], values["dt_bias"], values["cu_seqlens"],
-            values["state_indices"], values["has_initial_state"],
-            n_kq=FIXTURE["n_kq"], n_v=FIXTURE["n_v"], d_k=FIXTURE["d_k"], d_v=FIXTURE["d_v"],
+            values["mixed_qkv"],
+            values["b"],
+            values["a"],
+            values["recurrent_state"],
+            values["A_log"],
+            values["dt_bias"],
+            values["cu_seqlens"],
+            values["state_indices"],
+            values["has_initial_state"],
+            n_kq=FIXTURE["n_kq"],
+            n_v=FIXTURE["n_v"],
+            d_k=FIXTURE["d_k"],
+            d_v=FIXTURE["d_v"],
         )
     )
 
@@ -301,11 +320,17 @@ def _correctness(reference, chunkwise, values: dict[str, jax.Array]) -> dict[str
     chunkwise_state, chunkwise_output = (np.asarray(item) for item in chunkwise_result)
     correctness = {
         "identical_inputs": True,
-        "outputs_allclose": bool(np.allclose(reference_output, chunkwise_output, rtol=2e-2, atol=1e-2)),
-        "states_allclose": bool(np.allclose(reference_state, chunkwise_state, rtol=2e-2, atol=1e-2)),
+        "outputs_allclose": bool(
+            np.allclose(reference_output, chunkwise_output, rtol=2e-2, atol=1e-2)
+        ),
+        "states_allclose": bool(
+            np.allclose(reference_state, chunkwise_state, rtol=2e-2, atol=1e-2)
+        ),
         "finite": bool(
-            np.isfinite(reference_output).all() and np.isfinite(chunkwise_output).all()
-            and np.isfinite(reference_state).all() and np.isfinite(chunkwise_state).all()
+            np.isfinite(reference_output).all()
+            and np.isfinite(chunkwise_output).all()
+            and np.isfinite(reference_state).all()
+            and np.isfinite(chunkwise_state).all()
         ),
     }
     if not all(correctness.values()):
@@ -313,7 +338,9 @@ def _correctness(reference, chunkwise, values: dict[str, jax.Array]) -> dict[str
     return correctness
 
 
-def _time_kernel(function, values: dict[str, jax.Array], warmup: int, iterations: int) -> list[float]:
+def _time_kernel(
+    function, values: dict[str, jax.Array], warmup: int, iterations: int
+) -> list[float]:
     for _ in range(warmup):
         _ready(function(values))
     timings = []
@@ -326,7 +353,9 @@ def _time_kernel(function, values: dict[str, jax.Array], warmup: int, iterations
 
 def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as handle:
+    with tempfile.NamedTemporaryFile(
+        "w", encoding="utf-8", dir=path.parent, delete=False
+    ) as handle:
         temporary = Path(handle.name)
         json.dump(payload, handle, indent=2, allow_nan=False)
         handle.write("\n")
@@ -340,6 +369,96 @@ def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _sha256(raw: bytes) -> str:
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _validate_staged_artifact(raw: bytes, *, rank: int) -> dict[str, Any]:
+    try:
+        payload = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("staged artifact must contain valid UTF-8 JSON") from error
+    if not isinstance(payload, dict):
+        raise ValueError("staged artifact schema requires a JSON object")
+    required = {"schema_version", "rank", "evidence", "code_revision", "lengths"}
+    missing = sorted(required - payload.keys())
+    if missing:
+        raise ValueError(f"staged artifact schema is missing: {missing}")
+    if type(payload["schema_version"]) is not int or payload["schema_version"] != SCHEMA_VERSION:
+        raise ValueError(f"staged artifact schema_version must equal {SCHEMA_VERSION}")
+    if type(payload["rank"]) is not int or payload["rank"] != rank:
+        raise ValueError(f"staged artifact rank must equal {rank}")
+    if payload["evidence"] != {"classification": "performance"}:
+        raise ValueError("only performance artifacts may be published")
+    if not isinstance(payload["code_revision"], str) or not re.fullmatch(
+        r"[0-9a-f]{40}", payload["code_revision"]
+    ):
+        raise ValueError("staged artifact code_revision must contain 40 hex characters")
+    if not isinstance(payload["lengths"], list) or not payload["lengths"]:
+        raise ValueError("staged artifact lengths must be a non-empty list")
+
+    def require_finite(value: Any, path: str = "root") -> None:
+        if isinstance(value, float) and not math.isfinite(value):
+            raise ValueError(f"staged artifact contains non-finite value at {path}")
+        if isinstance(value, dict):
+            for key, nested in value.items():
+                require_finite(nested, f"{path}.{key}")
+        elif isinstance(value, list):
+            for index, nested in enumerate(value):
+                require_finite(nested, f"{path}[{index}]")
+
+    require_finite(payload)
+    return payload
+
+
+def _exclusive_bytes(path: Path, raw: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    except FileExistsError as error:
+        raise FileExistsError(f"refusing to overwrite existing output: {path}") from error
+    with os.fdopen(descriptor, "wb") as handle:
+        handle.write(raw)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _publish_rank_artifact(staging: Path, published: Path, *, rank: int) -> dict[str, Any]:
+    local_raw = staging.read_bytes()
+    local_payload = _validate_staged_artifact(local_raw, rank=rank)
+    local_sha256 = _sha256(local_raw)
+    local_size = len(local_raw)
+
+    _exclusive_bytes(published, local_raw)
+    published_raw = published.read_bytes()
+    if _sha256(published_raw) != local_sha256:
+        raise RuntimeError("published artifact SHA256 does not match local staging")
+    if len(published_raw) != local_size:
+        raise RuntimeError("published artifact size does not match local staging")
+    published_payload = _validate_staged_artifact(published_raw, rank=rank)
+    if published_payload != local_payload:
+        raise RuntimeError("published artifact JSON does not match local staging")
+
+    receipt = {
+        "schema_version": SCHEMA_VERSION,
+        "rank": rank,
+        "artifact_path": str(published),
+        "artifact_size": local_size,
+        "artifact_sha256": local_sha256,
+        "code_revision": local_payload["code_revision"],
+    }
+    marker = Path(f"{published}.complete")
+    marker_raw = (json.dumps(receipt, indent=2, allow_nan=False) + "\n").encode()
+    _exclusive_bytes(marker, marker_raw)
+    try:
+        marker_payload = json.loads(marker.read_bytes())
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RuntimeError("complete marker readback is not valid JSON") from error
+    if marker_payload != receipt:
+        raise RuntimeError("complete marker readback does not match the publish receipt")
+    return receipt
+
+
 def main() -> None:
     args = _parse_args()
     _initialize_distributed(args)
@@ -347,6 +466,17 @@ def main() -> None:
     device_platform = runtime_hardware["device_platforms"][0]
     interpret = os.environ.get("PALLAS_INTERPRET", "").lower() == "true"
     performance = device_platform == "tpu" and not interpret
+    if performance:
+        if args.publish_output is None:
+            raise RuntimeError("performance mode requires --publish-output")
+        try:
+            args.output.resolve().relative_to("/tmp")
+        except ValueError as error:
+            raise RuntimeError("performance staging --output must be under local /tmp") from error
+        if args.output.resolve() == args.publish_output.resolve():
+            raise RuntimeError("staging --output and --publish-output must differ")
+    elif args.publish_output is not None:
+        raise RuntimeError("--publish-output is reserved for real TPU performance evidence")
     rank_identity = {
         "requested_id": args.rank,
         "pjrt_process_index": runtime_hardware["process_index"],
@@ -381,10 +511,15 @@ def main() -> None:
         timings = _time_kernel(selected, values, args.warmup, args.iterations)
         if not all(math.isfinite(timing) and timing > 0 for timing in timings):
             raise RuntimeError("non-positive or non-finite timing observed")
-        per_length.append({
-            "length": length, "correctness": correctness, "raw_iteration_ms": timings,
-            "median_ms": statistics.median(timings), "finite": True,
-        })
+        per_length.append(
+            {
+                "length": length,
+                "correctness": correctness,
+                "raw_iteration_ms": timings,
+                "median_ms": statistics.median(timings),
+                "finite": True,
+            }
+        )
 
     payload = {
         "schema_version": SCHEMA_VERSION,
@@ -397,8 +532,11 @@ def main() -> None:
         "hardware": HARDWARE,
         "evidence": {"classification": "performance" if performance else "correctness-only"},
         "deterministic_fixture": {
-            **FIXTURE, "mixed_qkv_shape": [None, 512], "a_shape": [None, 2],
-            "b_shape": [None, 2], "state_slot_shape": [2, 128, 128],
+            **FIXTURE,
+            "mixed_qkv_shape": [None, 512],
+            "a_shape": [None, 2],
+            "b_shape": [None, 2],
+            "state_slot_shape": [2, 128, 128],
         },
         "code_revision": code_revision,
         "code_revision_source": code_revision_source,
@@ -412,6 +550,8 @@ def main() -> None:
         "command": ["python", *os.sys.argv],
     }
     _atomic_json(args.output, payload)
+    if args.publish_output is not None:
+        _publish_rank_artifact(args.output, args.publish_output, rank=args.rank)
 
 
 if __name__ == "__main__":
