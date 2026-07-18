@@ -197,14 +197,21 @@ def gather_dflash_relay_buffers(
     per_dp_bs = future_indices.shape[0] // dp_size
     indices = future_indices.reshape((dp_size, per_dp_bs))
     dp_indices = jnp.arange(dp_size, dtype=jnp.int32)[:, None]
-    return (
+    verified_id = (
         buffers.verified_id.at[dp_indices, indices]
         .get(out_sharding=RELAY_ID_SPEC)
-        .reshape(future_indices.shape),
+        .reshape(future_indices.shape)
+    )
+    new_seq_lens = (
         buffers.new_seq_lens.at[dp_indices, indices]
         .get(out_sharding=RELAY_ID_SPEC)
-        .reshape(future_indices.shape),
+        .reshape(future_indices.shape)
     )
+    flat_sharding = jax.typeof(future_indices).sharding
+    if isinstance(flat_sharding, NamedSharding) and not flat_sharding.mesh.empty:
+        verified_id = jax.sharding.reshard(verified_id, flat_sharding)
+        new_seq_lens = jax.sharding.reshard(new_seq_lens, flat_sharding)
+    return verified_id, new_seq_lens
 
 
 def make_dp_valid_mask(real_bs_per_dp, *, total_bs: int, per_dp_bs: int) -> np.ndarray:

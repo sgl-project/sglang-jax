@@ -579,13 +579,26 @@ def _build_draft_extend(num_layers: int, topk: int):
     return fused_draft_extend
 
 
+def _reshape_per_dp_rows(values, dp_size: int):
+    per_dp_size = values.shape[0] // dp_size
+    rows = values.reshape((dp_size, per_dp_size))
+    sharding = jax.typeof(values).sharding
+    if isinstance(sharding, NamedSharding) and not sharding.mesh.empty:
+        rows = jax.sharding.reshard(rows, NamedSharding(sharding.mesh, P("data", None)))
+    return rows
+
+
 def _per_dp_cumsum_device(lens, dp_size: int):
     per_dp_bs = lens.shape[0] // dp_size
-    lens_2d = lens.reshape((dp_size, per_dp_bs))
+    lens_2d = _reshape_per_dp_rows(lens, dp_size)
     zeros = jnp.zeros_like(lens_2d[:, :1], dtype=jnp.int32)
-    return jnp.concatenate([zeros, jnp.cumsum(lens_2d, axis=1, dtype=jnp.int32)], axis=1).reshape(
+    result = jnp.concatenate([zeros, jnp.cumsum(lens_2d, axis=1, dtype=jnp.int32)], axis=1).reshape(
         (dp_size * (per_dp_bs + 1),)
     )
+    sharding = jax.typeof(lens).sharding
+    if isinstance(sharding, NamedSharding) and not sharding.mesh.empty:
+        result = jax.sharding.reshard(result, sharding)
+    return result
 
 
 def _repack_page_indices(
@@ -596,14 +609,12 @@ def _repack_page_indices(
     page_size: int,
     dp_size: int,
 ):
-    total_bs = metadata_seq_lens.shape[0]
-    per_dp_bs = total_bs // dp_size
     pages_per_dp = page_indices.shape[0] // dp_size
 
     allocated_pages = ((allocated_lens + page_size - 1) // page_size).astype(jnp.int32)
     needed_pages = ((metadata_seq_lens + page_size - 1) // page_size).astype(jnp.int32)
-    allocated_pages = allocated_pages.reshape((dp_size, per_dp_bs))
-    needed_pages = needed_pages.reshape((dp_size, per_dp_bs))
+    allocated_pages = _reshape_per_dp_rows(allocated_pages, dp_size)
+    needed_pages = _reshape_per_dp_rows(needed_pages, dp_size)
 
     src_offsets = jnp.cumsum(allocated_pages, axis=1, dtype=jnp.int32) - allocated_pages
     dst_offsets = jnp.cumsum(needed_pages, axis=1, dtype=jnp.int32) - needed_pages
@@ -636,6 +647,10 @@ def _repack_page_indices(
         )
         .reshape((dp_size, pages_per_dp))
     )
+    if isinstance(page_sharding, NamedSharding) and not page_sharding.mesh.empty:
+        gathered = jax.sharding.reshard(
+            gathered, NamedSharding(page_sharding.mesh, P("data", None))
+        )
     gathered_sharding = jax.typeof(gathered).sharding
     if isinstance(gathered_sharding, NamedSharding):
         valid = jax.sharding.reshard(valid, gathered_sharding)
@@ -682,12 +697,22 @@ def _make_target_verify_metadata(
             dp_size=dp_size,
         )
 
-    per_dp_bs = verify_seq_lens.shape[0] // dp_size
-    local_num_seqs = jnp.sum(valid.reshape((dp_size, per_dp_bs)).astype(jnp.int32), axis=1)
+    valid_rows = _reshape_per_dp_rows(valid, dp_size)
+    local_num_seqs = jnp.sum(valid_rows.astype(jnp.int32), axis=1)
     distribution = jnp.stack(
         [jnp.zeros_like(local_num_seqs), local_num_seqs, local_num_seqs],
         axis=1,
     ).reshape((dp_size * 3,))
+
+    data_sharding = jax.typeof(old_metadata.seq_lens).sharding
+    if isinstance(data_sharding, NamedSharding) and not data_sharding.mesh.empty:
+        cu_q_lens = jax.sharding.reshard(cu_q_lens, data_sharding)
+        cu_kv_lens = jax.sharding.reshard(cu_kv_lens, data_sharding)
+        page_indices = jax.sharding.reshard(page_indices, data_sharding)
+        metadata_seq_lens = jax.sharding.reshard(metadata_seq_lens, data_sharding)
+        distribution = jax.sharding.reshard(distribution, data_sharding)
+        if swa_page_indices is not None:
+            swa_page_indices = jax.sharding.reshard(swa_page_indices, data_sharding)
 
     return FlashAttentionMetadata(
         cu_q_lens=cu_q_lens,
@@ -736,8 +761,8 @@ def _make_draft_extend_metadata(
             dp_size=dp_size,
         )
 
-    per_dp_bs = draft_seq_lens.shape[0] // dp_size
-    local_num_seqs = jnp.sum(valid.reshape((dp_size, per_dp_bs)).astype(jnp.int32), axis=1)
+    valid_rows = _reshape_per_dp_rows(valid, dp_size)
+    local_num_seqs = jnp.sum(valid_rows.astype(jnp.int32), axis=1)
     distribution = jnp.stack(
         [jnp.zeros_like(local_num_seqs), local_num_seqs, local_num_seqs],
         axis=1,

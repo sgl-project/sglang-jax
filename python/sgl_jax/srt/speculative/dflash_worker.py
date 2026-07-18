@@ -63,11 +63,15 @@ def _mask_draft_kv_writes(
         active_rows = jax.sharding.reshard(active_rows, row_sharding)
         token_offsets = jax.sharding.reshard(token_offsets, replicated_2d)
     write_mask = active_rows & (token_offsets < accept_rows)
-    return jnp.where(
+    masked_cache_loc = jnp.where(
         write_mask,
         cache_rows,
         jnp.int32(-1),
     ).reshape(-1)
+    cache_sharding = jax.typeof(cache_loc).sharding
+    if isinstance(cache_sharding, jax.sharding.NamedSharding) and not cache_sharding.mesh.empty:
+        masked_cache_loc = jax.sharding.reshard(masked_cache_loc, cache_sharding)
+    return masked_cache_loc
 
 
 @dataclass(frozen=True)
@@ -426,10 +430,19 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
     ):
         from functools import partial as _partial
 
+        from jax.sharding import NamedSharding
+        from jax.sharding import PartitionSpec as P
+
+        data_sharding = NamedSharding(self.mesh, P("data"))
+
         if not hasattr(self, "_jit_update_dflash_relay"):
 
             @_partial(jax.jit, donate_argnames=["buffers"], static_argnames=["dp_size"])
             def update(buffers, indices, mask, token_ids, seq_lens, *, dp_size: int):
+                indices = jax.sharding.reshard(indices, data_sharding)
+                mask = jax.sharding.reshard(mask, data_sharding)
+                token_ids = jax.sharding.reshard(token_ids, data_sharding)
+                seq_lens = jax.sharding.reshard(seq_lens, data_sharding)
                 return update_dflash_relay_buffers(
                     buffers,
                     indices,
@@ -853,6 +866,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             next_token_ids_flat = jax.sharding.reshard(next_token_ids_flat, token_sharding)
             new_verified_id = jax.sharding.reshard(new_verified_id, token_sharding)
             new_seq_lens = (target_prefix_lens + 1 + accept_lens_out).astype(jnp.int32)
+            new_seq_lens = jax.sharding.reshard(new_seq_lens, token_sharding)
             updated_relay_buffers = relay_buffers
             if update_relay:
                 updated_relay_buffers = update_dflash_relay_buffers(
@@ -1211,9 +1225,6 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                     relay_future_indices,
                     dp_size=dp_size,
                 )
-                verified_id = jax.sharding.reshard(verified_id, token_sharding)
-                relay_new_seq_lens = jax.sharding.reshard(relay_new_seq_lens, token_sharding)
-                relay_valid_mask = jax.sharding.reshard(relay_valid_mask, token_sharding)
                 target_prefix_lens = jnp.where(
                     relay_valid_mask,
                     relay_new_seq_lens - 1,
@@ -1223,12 +1234,17 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                     (target_prefix_lens.shape[0], block_size - 1),
                     jnp.int32(self._mask_token_id),
                 )
+                mask_rows = jax.sharding.reshard(mask_rows, cache_row_sharding)
                 block_rows = jnp.concatenate([verified_id[:, None], mask_rows], axis=1)
                 positions = (
                     target_prefix_lens[:, None] + jnp.arange(block_size, dtype=jnp.int32)[None, :]
                 )
-                forward_batch.input_ids = block_rows.reshape(-1)
-                forward_batch.positions = positions.reshape(-1)
+                forward_batch.input_ids = jax.sharding.reshard(
+                    block_rows.reshape(-1), token_sharding
+                )
+                forward_batch.positions = jax.sharding.reshard(
+                    positions.reshape(-1), token_sharding
+                )
                 forward_batch.seq_lens = target_prefix_lens
                 forward_batch.attn_backend.forward_metadata = _make_target_verify_metadata(
                     forward_batch.attn_backend.forward_metadata,
