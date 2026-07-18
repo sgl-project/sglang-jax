@@ -438,11 +438,17 @@ def test_chunk_local_cumsum_preserves_custom_chunk_order_and_masks_invalid_chunk
         assert optimized.shape == reference.shape == case_g.shape
         assert optimized.dtype == reference.dtype == output_dtype
         assert np.isfinite(np.asarray(optimized)).all()
-        np.testing.assert_allclose(
-            np.asarray(optimized), np.asarray(reference), rtol=rtol, atol=atol
-        )
 
         time_axis = 2 if head_first else 1
+        logical_slice = [slice(None)] * optimized.ndim
+        logical_slice[time_axis] = slice(0, 8)
+        np.testing.assert_allclose(
+            np.asarray(optimized[tuple(logical_slice)]),
+            np.asarray(reference[tuple(logical_slice)]),
+            rtol=rtol,
+            atol=atol,
+        )
+
         padding_slice = [slice(None)] * optimized.ndim
         padding_slice[time_axis] = slice(8, total_t)
         np.testing.assert_array_equal(
