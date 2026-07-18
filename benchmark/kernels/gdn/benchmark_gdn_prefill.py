@@ -27,7 +27,6 @@ from sgl_jax.srt.kernels.gdn import (
 )
 from sgl_jax.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
 
-
 SCHEMA_VERSION = 1
 SELECTOR_ENV = "SGLANG_JAX_GDN_PREFILL_IMPL"
 MODEL_REVISION = "59d61f3ce65a6d9863b86d2e96597125219dc754"

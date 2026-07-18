@@ -22,7 +22,6 @@ from sgl_jax.srt.mem_cache.recurrent_state_pool import RecurrentStatePool
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
 from sgl_jax.test.test_gdn_attention import create_test_data, gather_conv, gather_ssm
 
-
 _SELECTOR_ENV = "SGLANG_JAX_GDN_PREFILL_IMPL"
 _PALLAS_INTERPRET_ENV = "PALLAS_INTERPRET"
 _ENV_UNSET = object()
@@ -124,9 +123,11 @@ class TestGDNPrefillImplementation(unittest.TestCase):
 
     def test_invalid_selector_is_rejected_during_initialization(self):
         invalid = "not-a-gdn-prefill-implementation"
-        with _prefill_environment("not-a-gdn-prefill-implementation"):
-            with self.assertRaises(ValueError) as raised:
-                self.make_backend()
+        with (
+            _prefill_environment("not-a-gdn-prefill-implementation"),
+            self.assertRaises(ValueError) as raised,
+        ):
+            self.make_backend()
         message = str(raised.exception)
         for required in (_SELECTOR_ENV, invalid, "chunkwise", "reference"):
             self.assertIn(required, message)
@@ -176,22 +177,24 @@ class TestGDNPrefillImplementation(unittest.TestCase):
             shape={"data": 1, "tensor": 1},
             devices=np.asarray([SimpleNamespace(platform="tpu")], dtype=object),
         )
-        with _prefill_environment("chunkwise"):
-            with (
-                mock.patch.object(
-                    gdn_backend.jax,
-                    "devices",
-                    side_effect=AssertionError("selector must inspect the supplied mesh, not jax.devices"),
+        with (
+            _prefill_environment("chunkwise"),
+            mock.patch.object(
+                gdn_backend.jax,
+                "devices",
+                side_effect=AssertionError(
+                    "selector must inspect the supplied mesh, not jax.devices"
                 ),
-                mock.patch.object(
-                    gdn_backend.jax,
-                    "default_backend",
-                    side_effect=AssertionError(
-                        "selector must inspect the supplied mesh, not jax.default_backend"
-                    ),
+            ),
+            mock.patch.object(
+                gdn_backend.jax,
+                "default_backend",
+                side_effect=AssertionError(
+                    "selector must inspect the supplied mesh, not jax.default_backend"
                 ),
-            ):
-                backend = self.make_backend(test_mesh=fake_tpu_mesh)
+            ),
+        ):
+            backend = self.make_backend(test_mesh=fake_tpu_mesh)
 
         self.assertEqual(backend.requested_impl, "chunkwise")
         self.assertEqual(backend.effective_impl, "chunkwise")
@@ -202,27 +205,16 @@ class TestGDNPrefillImplementation(unittest.TestCase):
         import sgl_jax.srt.kernels.gdn.gated_delta as gated_delta
 
         n_kq, n_v, d_k, d_v = 1, 2, 2, 2
-        query = jnp.asarray(
-            [[[3.0, 4.0]], [[5.0, 12.0]], [[8.0, 15.0]]], dtype=jnp.bfloat16
-        )
-        key = jnp.asarray(
-            [[[4.0, 3.0]], [[12.0, 5.0]], [[15.0, 8.0]]], dtype=jnp.bfloat16
-        )
+        query = jnp.asarray([[[3.0, 4.0]], [[5.0, 12.0]], [[8.0, 15.0]]], dtype=jnp.bfloat16)
+        key = jnp.asarray([[[4.0, 3.0]], [[12.0, 5.0]], [[15.0, 8.0]]], dtype=jnp.bfloat16)
         value = jnp.arange(12, dtype=jnp.bfloat16).reshape(3, n_v, d_v)
         mixed_qkv = jnp.concatenate(
             (query.reshape(3, -1), key.reshape(3, -1), value.reshape(3, -1)), axis=-1
         )
-        raw_b = jnp.asarray(
-            [[-2.0, -1.0], [0.0, 1.0], [2.0, 3.0]], dtype=jnp.bfloat16
-        )
-        raw_a = jnp.asarray(
-            [[-3.0, -2.0], [-1.0, 0.0], [1.0, 2.0]], dtype=jnp.bfloat16
-        )
+        raw_b = jnp.asarray([[-2.0, -1.0], [0.0, 1.0], [2.0, 3.0]], dtype=jnp.bfloat16)
+        raw_a = jnp.asarray([[-3.0, -2.0], [-1.0, 0.0], [1.0, 2.0]], dtype=jnp.bfloat16)
         recurrent_state = (
-            jnp.arange(8 * n_v * d_k * d_v, dtype=jnp.float32).reshape(
-                8, n_v, d_k, d_v
-            )
-            / 8
+            jnp.arange(8 * n_v * d_k * d_v, dtype=jnp.float32).reshape(8, n_v, d_k, d_v) / 8
         ).astype(jnp.bfloat16)
         A_log = jnp.asarray([-0.75, 0.25], dtype=jnp.float32)
         dt_bias = jnp.asarray([-0.5, 1.5], dtype=jnp.bfloat16)
@@ -314,12 +306,8 @@ class TestGDNPrefillImplementation(unittest.TestCase):
         call = calls[0]
         query_f32 = np.asarray(query, dtype=np.float32)
         key_f32 = np.asarray(key, dtype=np.float32)
-        expected_q = query_f32 / np.sqrt(
-            np.square(query_f32).sum(axis=-1, keepdims=True) + 1e-6
-        )
-        expected_k = key_f32 / np.sqrt(
-            np.square(key_f32).sum(axis=-1, keepdims=True) + 1e-6
-        )
+        expected_q = query_f32 / np.sqrt(np.square(query_f32).sum(axis=-1, keepdims=True) + 1e-6)
+        expected_k = key_f32 / np.sqrt(np.square(key_f32).sum(axis=-1, keepdims=True) + 1e-6)
         expected_q = np.repeat(expected_q, n_v // n_kq, axis=1)[None]
         expected_k = np.repeat(expected_k, n_v // n_kq, axis=1)[None]
         np.testing.assert_allclose(np.asarray(call.q), expected_q, rtol=1e-6, atol=1e-6)
@@ -363,12 +351,8 @@ class TestGDNPrefillImplementation(unittest.TestCase):
         np.testing.assert_array_equal(np.asarray(new_recurrent_state), expected_pool)
 
     def test_environment_changes_after_initialization_do_not_change_saved_dispatch(self):
-        normal = self.make_numerical_fixture(
-            "reference", [3], seed=1, all_have_initial_state=True
-        )
-        wrapped = self.make_numerical_fixture(
-            "reference", [3], seed=1, all_have_initial_state=True
-        )
+        normal = self.make_numerical_fixture("reference", [3], seed=1, all_have_initial_state=True)
+        wrapped = self.make_numerical_fixture("reference", [3], seed=1, all_have_initial_state=True)
         self.assert_effective_dispatch(normal, "reference")
         self.assert_effective_dispatch(wrapped, "reference")
         self.assert_identical_fixtures(normal, wrapped)
@@ -415,14 +399,18 @@ class TestGDNPrefillImplementation(unittest.TestCase):
             )
 
     def test_initialization_logs_requested_effective_and_fallback_status_once(self):
-        with _prefill_environment("reference"):
-            with self.assertLogs(level="INFO") as captured:
-                self.make_backend()
+        with (
+            _prefill_environment("reference"),
+            self.assertLogs(level="INFO") as captured,
+        ):
+            self.make_backend()
 
         status_logs = [
             line
             for line in captured.output
-            if all(field in line for field in ("requested_impl", "effective_impl", "fallback_reason"))
+            if all(
+                field in line for field in ("requested_impl", "effective_impl", "fallback_reason")
+            )
         ]
         self.assertEqual(len(status_logs), 1, "expected one selector status log per init")
         status_log = status_logs[0]
@@ -516,9 +504,7 @@ class TestGDNPrefillImplementation(unittest.TestCase):
 
     @staticmethod
     def pool_arrays(fixture):
-        recurrent, conv_list = fixture.pool.get_linear_recurrent_layer_cache(
-            fixture.layer.layer_id
-        )
+        recurrent, conv_list = fixture.pool.get_linear_recurrent_layer_cache(fixture.layer.layer_id)
         return np.asarray(recurrent), np.asarray(conv_list[0])
 
     def assert_identical_inputs_parameters_metadata(self, chunkwise, reference):
@@ -655,20 +641,25 @@ class TestGDNPrefillImplementation(unittest.TestCase):
                 selected_callable = backend._prefill_callable
                 calls = []
 
-                def return_sentinel_result(*args, **kwargs):
-                    calls.append(True)
-                    recurrent_state, output = selected_callable(*args, **kwargs)
+                def return_sentinel_result(
+                    *args,
+                    _calls=calls,
+                    _selected_callable=selected_callable,
+                    _recurrent_sentinel=recurrent_sentinel,
+                    _output_sentinel=output_sentinel,
+                    **kwargs,
+                ):
+                    _calls.append(True)
+                    recurrent_state, output = _selected_callable(*args, **kwargs)
                     return (
-                        jnp.full_like(recurrent_state, recurrent_sentinel),
-                        jnp.full_like(output, output_sentinel),
+                        jnp.full_like(recurrent_state, _recurrent_sentinel),
+                        jnp.full_like(output, _output_sentinel),
                     )
 
                 backend._prefill_callable = return_sentinel_result
                 normal_result = self.execute_fixture(normal)
                 wrapped_result = self.execute_fixture(wrapped)
-                expected_output = np.full_like(
-                    np.asarray(wrapped_result.output), output_sentinel
-                )
+                expected_output = np.full_like(np.asarray(wrapped_result.output), output_sentinel)
                 expected_recurrent = np.full_like(
                     np.asarray(wrapped_result.recurrent_buffer), recurrent_sentinel
                 )
@@ -696,9 +687,7 @@ class TestGDNPrefillImplementation(unittest.TestCase):
                     ),
                 )
                 self.assertFalse(
-                    np.array_equal(
-                        np.asarray(normal_result.recurrent_buffer), expected_recurrent
-                    ),
+                    np.array_equal(np.asarray(normal_result.recurrent_buffer), expected_recurrent),
                     f"{selector} normal prefill unexpectedly equals the recurrent sentinel",
                 )
                 np.testing.assert_array_equal(
@@ -809,9 +798,7 @@ class TestGDNPrefillImplementation(unittest.TestCase):
         recurrent = np.full(
             (expanded.total_slots,) + old_recurrent.shape[1:], 0.375, dtype=old_recurrent.dtype
         )
-        conv = np.full(
-            (expanded.total_slots,) + old_conv.shape[1:], -0.5, dtype=old_conv.dtype
-        )
+        conv = np.full((expanded.total_slots,) + old_conv.shape[1:], -0.5, dtype=old_conv.dtype)
         recurrent[: old_recurrent.shape[0]] = old_recurrent
         conv[: old_conv.shape[0]] = old_conv
         # Make dummy slot 0 nontrivial so an accidental zero/write is observable.
@@ -1105,9 +1092,7 @@ class TestGDNPrefillImplementation(unittest.TestCase):
                 )
 
     def test_numerical_prefill_then_decode_continuation_matches_reference(self):
-        chunkwise, reference = self.make_prefill_ab(
-            [65], seed=37, all_have_initial_state=True
-        )
+        chunkwise, reference = self.make_prefill_ab([65], seed=37, all_have_initial_state=True)
         chunkwise_prefill = self.execute_fixture(chunkwise)
         reference_prefill = self.execute_fixture(reference)
         self.assert_numerical_ab(chunkwise_prefill, reference_prefill)

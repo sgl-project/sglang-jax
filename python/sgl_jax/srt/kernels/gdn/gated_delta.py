@@ -581,9 +581,7 @@ def ragged_gated_delta_rule_chunkwise(
         final_state,
         gathered_state,
     )
-    new_recurrent_state = _scatter_idx0_safe(
-        recurrent_state, state_indices, scatter_state
-    )
+    new_recurrent_state = _scatter_idx0_safe(recurrent_state, state_indices, scatter_state)
     if track_indices is not None:
         effective_track_mask = track_mask & nonempty & (state_indices != 0)
         new_recurrent_state = _scatter_track(
@@ -594,9 +592,7 @@ def ragged_gated_delta_rule_chunkwise(
         )
 
     output = output[0].astype(mixed_qkv.dtype)
-    new_recurrent_state, output = jax.lax.optimization_barrier(
-        (new_recurrent_state, output)
-    )
+    new_recurrent_state, output = jax.lax.optimization_barrier((new_recurrent_state, output))
     return new_recurrent_state, output
 
 

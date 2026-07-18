@@ -27,7 +27,8 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import TYPE_CHECKING, Callable
+from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
@@ -133,9 +134,7 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
         if self.requested_impl == "chunkwise":
             if self.head_k_dim > 256:
                 self.effective_impl = "reference"
-                self.fallback_reason = (
-                    f"head_k_dim={self.head_k_dim} exceeds chunkwise limit=256"
-                )
+                self.fallback_reason = f"head_k_dim={self.head_k_dim} exceeds chunkwise limit=256"
             else:
                 platforms = {device.platform.lower() for device in mesh.devices.flat}
                 all_tpu = platforms == {"tpu"}
@@ -145,8 +144,8 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
                     self._prefill_callable = ragged_gated_delta_rule_chunkwise
                 else:
                     self.effective_impl = "reference"
-                    self.fallback_reason = (
-                        "chunkwise prefill unsupported on platform=" + ",".join(sorted(platforms))
+                    self.fallback_reason = "chunkwise prefill unsupported on platform=" + ",".join(
+                        sorted(platforms)
                     )
 
         logger.info(
