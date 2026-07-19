@@ -10,6 +10,40 @@ from jax.tree_util import register_pytree_node_class
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode
 
 
+def _mask_draft_kv_writes(
+    cache_loc: jax.Array,
+    accept_lens: jax.Array,
+    active_mask: jax.Array,
+) -> jax.Array:
+    """Mask unaccepted and padded draft-KV writes inside jit_draft_extend."""
+    tokens_per_row = cache_loc.shape[0] // accept_lens.shape[0]
+    cache_rows = cache_loc.reshape((-1, tokens_per_row))
+    accept_rows = accept_lens[:, None]
+    active_rows = active_mask[:, None]
+    token_offsets = jnp.arange(tokens_per_row, dtype=jnp.int32)[None, :]
+    mesh = getattr(jax.typeof(cache_loc).sharding, "mesh", None)
+    if mesh is not None and not getattr(mesh, "empty", False):
+        from jax.sharding import NamedSharding
+        from jax.sharding import PartitionSpec as P
+
+        row_sharding = NamedSharding(mesh, P("data", None))
+        replicated_2d = NamedSharding(mesh, P(None, None))
+        cache_rows = jax.sharding.reshard(cache_rows, row_sharding)
+        accept_rows = jax.sharding.reshard(accept_rows, row_sharding)
+        active_rows = jax.sharding.reshard(active_rows, row_sharding)
+        token_offsets = jax.sharding.reshard(token_offsets, replicated_2d)
+    write_mask = active_rows & (token_offsets < accept_rows)
+    masked_cache_loc = jnp.where(
+        write_mask,
+        cache_rows,
+        jnp.int32(-1),
+    ).reshape(-1)
+    cache_sharding = jax.typeof(cache_loc).sharding
+    if isinstance(cache_sharding, jax.sharding.NamedSharding) and not cache_sharding.mesh.empty:
+        masked_cache_loc = jax.sharding.reshard(masked_cache_loc, cache_sharding)
+    return masked_cache_loc
+
+
 def build_dflash_draft_block(
     verified_id: np.ndarray | jax.Array,
     mask_token_id: int,

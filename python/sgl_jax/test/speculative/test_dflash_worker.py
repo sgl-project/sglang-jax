@@ -4,8 +4,8 @@ import jax
 import numpy as np
 
 from sgl_jax.srt.layers.attention.flashattention_backend import _pad_page_indices
-from sgl_jax.srt.speculative.dflash_info import DFlashDraftInput
-from sgl_jax.srt.speculative.dflash_worker import DFlashWorker, _mask_draft_kv_writes
+from sgl_jax.srt.speculative.dflash_info import DFlashDraftInput, _mask_draft_kv_writes
+from sgl_jax.srt.speculative.dflash_worker import DFlashWorker
 
 
 def _bare_worker(**attrs):
