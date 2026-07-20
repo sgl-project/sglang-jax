@@ -480,6 +480,7 @@ class SchedulerOutputProcessorMixin:
                 req.latest_bid = result.bid
 
                 new_accepted_len = 1
+                output_len_before = len(req.output_ids)
                 if not is_spec_decode:
                     req.output_ids.append(next_token_id)
                 elif self.spec_algorithm.is_eagle():
@@ -537,10 +538,16 @@ class SchedulerOutputProcessorMixin:
                     and is_spec_decode
                     and logits_output.next_token_logprobs is not None
                 ):
-                    draft_n = self.draft_worker.speculative_num_draft_tokens
+                    rows_per_req = self.draft_worker.speculative_num_steps + 1
                     slot = per_dp_bs_size * dp_rank + i
-                    base = slot * draft_n
-                    for j, token_id in enumerate(next_token_id):
+                    base = slot * rows_per_req
+                    visible_accepted_len = new_accepted_len
+                    if req.finished_len is not None:
+                        visible_accepted_len = max(
+                            0,
+                            min(new_accepted_len, req.finished_len - output_len_before),
+                        )
+                    for j, token_id in enumerate(next_token_id[:visible_accepted_len]):
                         flat_idx = base + j
                         req.output_token_logprobs_val.append(
                             logits_output.next_token_logprobs[flat_idx]
