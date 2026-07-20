@@ -14,6 +14,7 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
+from types import SimpleNamespace
 
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
@@ -28,6 +29,23 @@ _mesh = create_device_mesh(
     ici_parallelism=[1, 1], dcn_parallelism=[1, 1], devices=[jax.devices()[0]]
 )
 jax.sharding.set_mesh(_mesh)
+
+
+class TestStep3p5TensorParallelValidation(unittest.TestCase):
+    def test_rejects_tp_that_cannot_shard_sliding_attention_heads(self):
+        from sgl_jax.srt.configs.model_config import ModelConfig
+
+        model_config = SimpleNamespace(
+            num_attention_heads=64,
+            hf_config=SimpleNamespace(
+                attention_other_setting={"num_attention_heads": 96},
+            ),
+        )
+
+        with self.assertRaisesRegex(AssertionError, "Alternate attention head count"):
+            ModelConfig.validate_tensor_parallel_config(model_config, 64)
+
+        ModelConfig.validate_tensor_parallel_config(model_config, 32)
 
 
 def _get_fixtures():

@@ -26,6 +26,7 @@ present in the running server, otherwise the logprob path crashes on multi-host.
 
 import os
 import re
+import tempfile
 import unittest
 from types import SimpleNamespace
 
@@ -54,16 +55,49 @@ _GSM8K_TOL = float(os.getenv("SGLANG_GSM8K_TOL", "0.01"))
 _ACCEPT_LEN_THRES = float(os.getenv("SGLANG_ACCEPT_LEN_THRES", "2.6"))
 
 
-def _mean_accept_length_from_log(path: str) -> float | None:
+def _mean_accept_length_from_log(path: str, start_offset: int = 0) -> float | None:
     """Mean of `accept-len X.XX` values in the server decode log (None if absent)."""
     vals = []
     pat = re.compile(r"accept-len\s+([0-9.]+)")
     with open(path, encoding="utf-8", errors="ignore") as f:
+        f.seek(start_offset)
         for line in f:
             m = pat.search(line)
             if m:
                 vals.append(float(m.group(1)))
     return float(np.mean(vals)) if vals else None
+
+
+def _validate_step3p5_nextn_server(info: dict) -> None:
+    expected = {
+        "speculative_algorithm": "NEXTN",
+        "speculative_eagle_topk": 1,
+    }
+    for key, value in expected.items():
+        if info.get(key) != value:
+            raise AssertionError(f"expected {key}={value!r}, got {info.get(key)!r}")
+
+    mode = info.get("speculative_target_verify_mode")
+    if mode not in {"auto", "decode-loop"}:
+        raise AssertionError(f"expected decode-equivalent target verify, got mode={mode!r}")
+    steps = info.get("speculative_num_steps")
+    if info.get("speculative_num_draft_tokens") != steps + 1:
+        raise AssertionError("draft-token count must equal speculative steps plus one")
+    if info.get("nnodes", 1) <= 1:
+        raise AssertionError("Step3p5 MTP E2E requires a multi-host server")
+
+    states = info.get("internal_states") or []
+    if not states:
+        raise AssertionError("server did not return scheduler internal state")
+    for state in states:
+        if state.get("model_type") != "step3p5":
+            raise AssertionError(f"expected model_type='step3p5', got {state.get('model_type')!r}")
+        if "Step3p5ForCausalLM" not in state.get("model_architectures", []):
+            raise AssertionError("server is not running Step3p5ForCausalLM")
+        if not state.get("spec_multi_layer"):
+            raise AssertionError("server did not initialize multi-layer MTP")
+        if state.get("enable_overlap"):
+            raise AssertionError("decode-loop target verify must run with overlap disabled")
 
 
 def _build_gsm8k_eval_args() -> SimpleNamespace:
@@ -79,6 +113,41 @@ def _build_gsm8k_eval_args() -> SimpleNamespace:
     )
 
 
+class TestStep3p5MTPHarness(unittest.TestCase):
+    def test_accept_length_reader_uses_current_log_segment(self):
+        with tempfile.NamedTemporaryFile(mode="w+", encoding="utf-8") as log:
+            log.write("accept-len 9.0\n")
+            log.flush()
+            start_offset = log.tell()
+            log.write("accept-len 2.0\naccept-len 4.0\n")
+            log.flush()
+
+            self.assertEqual(_mean_accept_length_from_log(log.name, start_offset), 3.0)
+
+    def test_server_validation_requires_effective_decode_loop_configuration(self):
+        info = {
+            "speculative_algorithm": "NEXTN",
+            "speculative_eagle_topk": 1,
+            "speculative_target_verify_mode": "auto",
+            "speculative_num_steps": 3,
+            "speculative_num_draft_tokens": 4,
+            "nnodes": 4,
+            "internal_states": [
+                {
+                    "model_type": "step3p5",
+                    "model_architectures": ["Step3p5ForCausalLM"],
+                    "spec_multi_layer": True,
+                    "enable_overlap": False,
+                }
+            ],
+        }
+
+        _validate_step3p5_nextn_server(info)
+        info["internal_states"][0]["enable_overlap"] = True
+        with self.assertRaisesRegex(AssertionError, "overlap disabled"):
+            _validate_step3p5_nextn_server(info)
+
+
 @unittest.skipUnless(
     _URL,
     "Set SGLANG_NEXTN_E2E_URL to a running multi-host Step-3.5-Flash NEXTN server "
@@ -90,6 +159,9 @@ class TestStep3p5MTPGsm8k(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         requests.get(f"{_URL}/health", timeout=30).raise_for_status()
+        info = requests.get(f"{_URL}/get_server_info", timeout=30)
+        info.raise_for_status()
+        _validate_step3p5_nextn_server(info.json())
 
     def test_gsm8k_accuracy_lossless(self):
         metrics = run_eval(_build_gsm8k_eval_args())
@@ -125,6 +197,7 @@ class TestStep3p5MTPGsm8k(unittest.TestCase):
                 "otherwise grep 'accept-len' in the server log manually (want >= "
                 f"{_ACCEPT_LEN_THRES})."
             )
+        start_offset = os.path.getsize(_SERVER_LOG)
         # Warm up: generate enough decode steps so the scheduler logs 'accept-len'
         # (spec accept-length is only emitted during decode, not prefill).
         for _ in range(4):
@@ -137,7 +210,7 @@ class TestStep3p5MTPGsm8k(unittest.TestCase):
                 timeout=600,
             ).raise_for_status()
 
-        mean_al = _mean_accept_length_from_log(_SERVER_LOG)
+        mean_al = _mean_accept_length_from_log(_SERVER_LOG, start_offset)
         self.assertIsNotNone(
             mean_al,
             "no 'accept-len' lines in server log even after warm-up decode — is this "
@@ -168,6 +241,9 @@ class TestStep3p5MTPLogprobConsistency(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         requests.get(f"{_URL}/health", timeout=30).raise_for_status()
+        info = requests.get(f"{_URL}/get_server_info", timeout=30)
+        info.raise_for_status()
+        _validate_step3p5_nextn_server(info.json())
 
     def test_logprob_spec_matches_prefill(self):
         try:

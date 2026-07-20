@@ -121,11 +121,11 @@ def _tiny_moe_config(
     )
 
 
-def _build_moe(config, layer_id, mesh):
+def _build_moe(config, layer_id, mesh, dtype=jnp.float32):
     from sgl_jax.srt.models.step3p5 import Step3p5MoE
 
     with jax.set_mesh(mesh):
-        return Step3p5MoE(config, layer_id=layer_id, mesh=mesh, ep_size=1, dtype=jnp.float32)
+        return Step3p5MoE(config, layer_id=layer_id, mesh=mesh, ep_size=1, dtype=dtype)
 
 
 def _build_dense_mlp(config, mesh, intermediate_size=None):
@@ -161,6 +161,12 @@ class TestRoutingBias(unittest.TestCase):
             router_logits = jax.nn.sigmoid(logits_jax.astype(jnp.float32))
             topk_w, topk_ids = moe.topk(router_logits, bias_jax)
         return np.asarray(topk_w), np.asarray(topk_ids)
+
+    def test_bfloat16_model_keeps_router_bias_in_float32(self):
+        moe = _build_moe(self.config, layer_id=3, mesh=self.mesh, dtype=jnp.bfloat16)
+
+        self.assertEqual(np.asarray(moe.moe_gate.kernel).dtype, jnp.float32)
+        self.assertEqual(np.asarray(moe.moe_gate.bias).dtype, jnp.float32)
 
     def test_bias_select_only_matches_oracle(self):
         """Weights = gathered original sigmoid prob, renorm, ×3.0 (NOT prob+bias)."""

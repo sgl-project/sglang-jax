@@ -817,6 +817,16 @@ class ModelConfig:
             f"tensor parallel size ({tensor_parallel_size}). "
             f"Got remainder: {self.num_attention_heads % tensor_parallel_size}"
         )
+        attention_other_setting = getattr(self.hf_config, "attention_other_setting", None)
+        if attention_other_setting is not None:
+            alternate_num_heads = attention_other_setting.get("num_attention_heads")
+            if alternate_num_heads is not None:
+                assert alternate_num_heads % tensor_parallel_size == 0, (
+                    "Alternate attention head count "
+                    f"({alternate_num_heads}) must be divisible by tensor parallel size "
+                    f"({tensor_parallel_size}). Got remainder: "
+                    f"{alternate_num_heads % tensor_parallel_size}"
+                )
 
     # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
     def _parse_quant_hf_config(self):
