@@ -20,6 +20,8 @@ from sgl_jax.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
 
+ENCODER_TOKEN_BUCKETS = (16, 32, 64, 128, 256, 512, 1024)
+
 
 @dataclass
 class _EncoderSpec:
@@ -363,11 +365,21 @@ class EncoderModelRunner(BaseModelRunner):
         actual_length: int,
         encoder_max_length: int,
     ) -> int:
-        token_buckets = [16, 32, 64, 128, 256, 512, 1024]
-        for size in token_buckets:
+        for size in ENCODER_TOKEN_BUCKETS:
             if actual_length <= size <= encoder_max_length:
                 return size
         return encoder_max_length
+
+    def get_precompile_lengths(self, spec: _EncoderSpec, encoder_idx: int) -> list[int]:
+        if spec.max_length is None:
+            raise ValueError(f"Encoder max_length is not initialized for {spec.model_class}.")
+        if self.is_flux_t5(spec, encoder_idx):
+            return [spec.max_length]
+
+        lengths = [size for size in ENCODER_TOKEN_BUCKETS if size <= spec.max_length]
+        if not lengths or lengths[-1] != spec.max_length:
+            lengths.append(spec.max_length)
+        return lengths
 
     def _get_model_attention_mask(
         self,

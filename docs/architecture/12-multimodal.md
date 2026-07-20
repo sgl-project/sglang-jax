@@ -238,9 +238,9 @@ HTTP Request (text prompt + params)
   → GlobalScheduler
     → TypeBasedDispatcher → Wan Pipeline
 
-  → Stage 0 (Embed)
-    → EmbedScheduler → EmbedModelExecutor
-    → Text → CLIP/T5 embedding
+  → Stage 0 (Text Encoder)
+    → EncoderScheduler → EncoderModelWorker → EncoderModelRunner
+    → Text → UMT5 embeddings
 
   → Stage 1 (Diffusion)
     → DiffusionScheduler → DiffusionModelExecutor
