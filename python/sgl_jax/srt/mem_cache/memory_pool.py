@@ -24,6 +24,34 @@ from sgl_jax.srt.kernels.update_kv_cache.update_kv_cache import (
     kv_cache_update_impl,
 )
 
+# Module-level cache for jitted zero-allocators.
+# Keyed by (mesh_id, shape, dtype, sharding_spec, memory_kind).
+# Caches the FUNCTION (not the tensor) — each call returns fresh zeros.
+_KV_ZERO_ALLOCATOR_CACHE: dict = {}
+
+
+def _get_kv_zero_allocator(shape, dtype, sharding):
+    """Return a cached jax.jit(jnp.zeros) allocator for the given spec.
+
+    Avoids repeated JAX trace/compile overhead when _create_buffers()
+    allocates N identical layers. The allocator function is cached;
+    each call to the returned function still produces a fresh
+    zero-initialised tensor.
+    """
+    key = (
+        id(sharding.mesh),
+        tuple(shape),
+        str(jnp.dtype(dtype)),
+        repr(sharding.spec),
+        getattr(sharding, "memory_kind", None),
+    )
+    if key not in _KV_ZERO_ALLOCATOR_CACHE:
+        _KV_ZERO_ALLOCATOR_CACHE[key] = jax.jit(
+            partial(jnp.zeros, shape=tuple(shape), dtype=dtype),
+            out_shardings=sharding,
+        )
+    return _KV_ZERO_ALLOCATOR_CACHE[key]
+
 
 def merge_kv(k: jax.Array, v: jax.Array) -> jax.Array:
     """Merge 3D k/v into 5D fused format matching KV cache shape.
@@ -571,16 +599,9 @@ class MHATokenToKVPool(KVCache):
         )
         with self.mesh:
             self.kv_buffer = []
+            allocate = _get_kv_zero_allocator(fused_buffer_shape, self.dtype, self.kv_sharding)
             for _ in range(self.layer_num):
-                kv_buf = jax.jit(
-                    lambda: jnp.zeros(
-                        shape=fused_buffer_shape,
-                        dtype=self.dtype,
-                    ),
-                    out_shardings=self.kv_sharding,
-                )()
-
-                self.kv_buffer.append(kv_buf)
+                self.kv_buffer.append(allocate())
 
         end_time = time.time()
         logger.info(
@@ -1324,12 +1345,9 @@ class MLATokenToKVPool(KVCache):
 
         with self.mesh:
             self.kv_buffer = []
+            allocate = _get_kv_zero_allocator(buffer_shape, self.dtype, self.kv_sharding)
             for _ in range(self.layer_num):
-                kv_buf = jax.jit(
-                    lambda: jnp.zeros(shape=buffer_shape, dtype=self.dtype),
-                    out_shardings=self.kv_sharding,
-                )()
-                self.kv_buffer.append(kv_buf)
+                self.kv_buffer.append(allocate())
 
     def _calculate_memory_usage(self):
         """Calculate memory usage for the 4D paged MLA cache."""

@@ -4,12 +4,34 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from functools import partial
 
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 from jax.tree_util import register_pytree_node_class
+
+# Module-level cache for jitted zero-allocators (recurrent/conv buffers).
+_RECURRENT_ZERO_ALLOCATOR_CACHE: dict = {}
+
+
+def _get_recurrent_zero_allocator(shape, dtype, sharding):
+    """Return a cached jax.jit(jnp.zeros) allocator for recurrent/conv buffers."""
+    key = (
+        id(sharding.mesh),
+        tuple(shape),
+        str(jnp.dtype(dtype)),
+        repr(sharding.spec),
+        getattr(sharding, "memory_kind", None),
+    )
+    if key not in _RECURRENT_ZERO_ALLOCATOR_CACHE:
+        _RECURRENT_ZERO_ALLOCATOR_CACHE[key] = jax.jit(
+            partial(jnp.zeros, shape=tuple(shape), dtype=dtype),
+            out_shardings=sharding,
+        )
+    return _RECURRENT_ZERO_ALLOCATOR_CACHE[key]
+
 
 _DTYPE_MAP = {
     "float32": jnp.float32,
@@ -152,23 +174,19 @@ class RecurrentStatePool:
         temporal_dtype = self.temporal_dtype
         conv_dtype = self.conv_dtype
 
+        alloc_recurrent = _get_recurrent_zero_allocator(
+            recurrent_shape, temporal_dtype, self.recurrent_sharding
+        )
+        alloc_conv = _get_recurrent_zero_allocator(conv_shape, conv_dtype, self.conv_sharding)
         with self.mesh:
             recurrent_buffers = []
             for _ in range(self.num_linear_recurrent_layers):
-                buf = jax.jit(
-                    lambda: jnp.zeros(shape=recurrent_shape, dtype=temporal_dtype),
-                    out_shardings=self.recurrent_sharding,
-                )()
-                recurrent_buffers.append(buf)
+                recurrent_buffers.append(alloc_recurrent())
 
             conv_buffers = []
             for _ in range(self.num_linear_recurrent_layers):
                 inner = []
-                buf = jax.jit(
-                    lambda: jnp.zeros(shape=conv_shape, dtype=conv_dtype),
-                    out_shardings=self.conv_sharding,
-                )()
-                inner.append(buf)
+                inner.append(alloc_conv())
                 conv_buffers.append(inner)
 
         return recurrent_buffers, conv_buffers
