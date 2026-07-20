@@ -119,7 +119,8 @@ Each stage contains:
 | `DiffusionScheduler` | Text-to-image / video | Manages diffusion-step iteration |
 | `VaeScheduler` | VAE decoding | Latent → pixel decoding scheduling |
 | `VitScheduler` | Vision Transformer | Image patch encoding |
-| `EmbedScheduler` | Text embedding | Text encoder feature extraction |
+| `EncoderScheduler` | Text encoding | Runs dedicated text encoders such as CLIP, T5, and UMT5 |
+| `EmbedScheduler` | Text embedding | Produces embedding-model outputs |
 | `AudioScheduler` | Audio | Audio feature extraction/generation |
 | `AudioBackboneScheduler` | Audio backbone | Audio model backbone network |
 
@@ -141,7 +142,7 @@ The `auto_regressive` Scheduler type in the YAML config reuses the text engine's
 
 | Directory | Model | Pipeline stages |
 |------|------|--------------|
-| `wan/` | Wan 2.1/2.2 | Embed → Diffusion → VAE |
+| `wan/` | Wan 2.1/2.2 | Text Encoder → Diffusion → VAE |
 | `qwen2_5VL/` | Qwen2.5-VL | ViT → AutoRegressive |
 | `qwen3_omni_moe/` | Qwen3-Omni-MoE | ViT → AutoRegressive → Audio |
 | `mimo_audio/` | MiMo Audio | Audio → AutoRegressive |
@@ -154,8 +155,8 @@ Each model has a corresponding YAML config under `multimodal/models/static_confi
 **Wan 2.1 example** (3-stage pipeline, `wan2_1_stage_config.yaml`):
 
 ```text
-Stage 0: scheduler=auto_regressive, model_class=UMT5EncoderModel
-  → Text encoding (reuses the text engine's Scheduler)
+Stage 0: scheduler=text_encoder, model_class=UMT5EncoderModel
+  → UMT5 text encoding through the dedicated encoder scheduler
 
 Stage 1: scheduler=diffusion, model_class=WanTransformer3DModel
   → N-step diffusion denoising
@@ -212,7 +213,8 @@ Each stage's YAML definition contains:
 |------|------|--------|
 | `audio/` | Audio processing | Audio encoding/decoding execution |
 | `diffusion/` | Diffusion model execution | Manages denoising steps, invokes UNet/DiT |
-| `embed/` | Embedding extraction | Text encoder forward |
+| `embed/` | Embedding extraction | Produces embedding-model outputs |
+| `encoder/` | Text encoding | Tokenization and dedicated text encoder forward |
 | `vae/` | VAE encode/decode | Latent ↔ pixel conversion |
 | `vit/` | Vision Transformer | Image patch encoding |
 
@@ -236,9 +238,9 @@ HTTP Request (text prompt + params)
   → GlobalScheduler
     → TypeBasedDispatcher → Wan Pipeline
 
-  → Stage 0 (Embed)
-    → EmbedScheduler → EmbedModelExecutor
-    → Text → CLIP/T5 embedding
+  → Stage 0 (Text Encoder)
+    → EncoderScheduler → EncoderModelWorker → EncoderModelRunner
+    → Text → UMT5 embeddings
 
   → Stage 1 (Diffusion)
     → DiffusionScheduler → DiffusionModelExecutor

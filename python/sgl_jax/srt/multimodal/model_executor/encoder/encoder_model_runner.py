@@ -20,6 +20,8 @@ from sgl_jax.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
 
+ENCODER_TOKEN_BUCKETS = (16, 32, 64, 128, 256, 512, 1024)
+
 
 @dataclass
 class _EncoderSpec:
@@ -231,7 +233,7 @@ class EncoderModelRunner(BaseModelRunner):
             processed_output, output_kind = self._postprocess_encoder_outputs(
                 spec,
                 outputs,
-                tokenized,
+                model_attention_mask,
             )
             if processed_output is None:
                 continue
@@ -286,14 +288,14 @@ class EncoderModelRunner(BaseModelRunner):
         self,
         spec: _EncoderSpec,
         outputs: dict[str, jax.Array],
-        text_inputs: dict[str, jax.Array],
+        attention_mask: jax.Array,
     ) -> tuple[jax.Array | None, str]:
         model_class_name = getattr(spec.model_class, "__name__", str(spec.model_class))
 
         if "T5" in model_class_name:
-            return self.t5_postprocess_text(outputs, text_inputs), "hidden_states"
+            return self.t5_postprocess_text(outputs, attention_mask), "hidden_states"
         if "CLIP" in model_class_name:
-            return self.clip_postprocess_text(outputs, text_inputs), "pooler"
+            return self.clip_postprocess_text(outputs, attention_mask), "pooler"
 
         if outputs["last_hidden_state"] is not None:
             return outputs["last_hidden_state"], "hidden_states"
@@ -304,16 +306,17 @@ class EncoderModelRunner(BaseModelRunner):
     @staticmethod
     def t5_postprocess_text(
         outputs: dict[str, jax.Array],
-        _text_inputs: dict[str, jax.Array],
+        attention_mask: jax.Array,
     ) -> jax.Array:
         if outputs["last_hidden_state"] is None:
             raise ValueError("T5 encoder output does not contain last_hidden_state.")
-        return outputs["last_hidden_state"]
+        hidden_states = outputs["last_hidden_state"]
+        return hidden_states * attention_mask[..., None].astype(hidden_states.dtype)
 
     @staticmethod
     def clip_postprocess_text(
         outputs: dict[str, jax.Array],
-        _text_inputs: dict[str, jax.Array],
+        _attention_mask: jax.Array,
     ) -> jax.Array:
         if outputs["pooler_output"] is None:
             raise ValueError("CLIP encoder output does not contain pooler_output.")
@@ -362,11 +365,21 @@ class EncoderModelRunner(BaseModelRunner):
         actual_length: int,
         encoder_max_length: int,
     ) -> int:
-        token_buckets = [16, 32, 64, 128, 256, 512, 1024]
-        for size in token_buckets:
+        for size in ENCODER_TOKEN_BUCKETS:
             if actual_length <= size <= encoder_max_length:
                 return size
         return encoder_max_length
+
+    def get_precompile_lengths(self, spec: _EncoderSpec, encoder_idx: int) -> list[int]:
+        if spec.max_length is None:
+            raise ValueError(f"Encoder max_length is not initialized for {spec.model_class}.")
+        if self.is_flux_t5(spec, encoder_idx):
+            return [spec.max_length]
+
+        lengths = [size for size in ENCODER_TOKEN_BUCKETS if size <= spec.max_length]
+        if not lengths or lengths[-1] != spec.max_length:
+            lengths.append(spec.max_length)
+        return lengths
 
     def _get_model_attention_mask(
         self,
