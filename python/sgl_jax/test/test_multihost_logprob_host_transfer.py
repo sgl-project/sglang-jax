@@ -1,6 +1,7 @@
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
@@ -9,6 +10,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
 from sgl_jax.srt.managers import tp_worker
+from sgl_jax.srt.managers.scheduler_output_processor_mixin import (
+    SchedulerOutputProcessorMixin,
+)
 from sgl_jax.srt.managers.tp_worker import ModelWorker
 
 
@@ -113,6 +117,29 @@ class TestMultihostLogprobHostTransfer(unittest.TestCase):
         ):
             np.testing.assert_allclose(actual, expected)
         self.assertEqual(output.next_token_top_logprobs_idx, [[11], [31], [21, 22]])
+
+    def test_optional_prefill_output_logprobs_can_be_absent(self):
+        req = SimpleNamespace(
+            output_token_logprobs_val=[],
+            output_token_logprobs_idx=[],
+            output_top_logprobs_val=[],
+            output_top_logprobs_idx=[],
+            output_token_ids_logprobs_val=[],
+            output_token_ids_logprobs_idx=[],
+            top_logprobs_num=2,
+            token_ids_logprob=[5, 6],
+        )
+        output = SimpleNamespace(
+            next_token_logprobs=None,
+            next_token_top_logprobs_val=None,
+            next_token_token_ids_logprobs_val=None,
+        )
+
+        SchedulerOutputProcessorMixin.add_logprob_return_values(object(), 0, req, 0, [4], 0, output)
+
+        self.assertEqual(req.output_token_logprobs_val, [])
+        self.assertEqual(req.output_top_logprobs_val, [])
+        self.assertEqual(req.output_token_ids_logprobs_val, [])
 
 
 if __name__ == "__main__":
