@@ -120,6 +120,36 @@ def test_chain_mtp_contract():
     assert Step3p5MTPForCausalLM.capture_aux_hidden_states is True
 
 
+def test_mtp_loader_requires_every_checkpoint_parameter(monkeypatch):
+    from sgl_jax.srt.models import step3p5_nextn
+
+    captured = {}
+
+    class FakeLoader:
+        def __init__(self, **kwargs):
+            captured["init"] = kwargs
+
+        def load_weights_from_safetensors(self, mappings, **kwargs):
+            captured["mappings"] = mappings
+            captured["kwargs"] = kwargs
+
+    monkeypatch.setattr(step3p5_nextn, "WeightLoader", FakeLoader)
+    model = SimpleNamespace(
+        mesh=object(),
+        dtype=object(),
+        mtp_layer_idx=0,
+        model=SimpleNamespace(mtp_abs_layer=45),
+        _create_weight_mappings=lambda: {"source": "target"},
+    )
+
+    step3p5_nextn.Step3p5MTPForCausalLM.load_weights(model, SimpleNamespace())
+
+    assert captured["kwargs"] == {
+        "assert_all_assigned": True,
+        "unassigned_whitelist": ("model.embed_tokens.embedding",),
+    }
+
+
 def test_worker_and_fused_import():
     """The chain edits to the shared spec engine must import cleanly."""
     import sgl_jax.srt.speculative.draft_extend_fused as dxf

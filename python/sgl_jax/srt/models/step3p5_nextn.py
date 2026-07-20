@@ -234,7 +234,11 @@ class Step3p5MTPForCausalLM(nnx.Module):
             model=self, model_config=model_config, mesh=self.mesh, dtype=self.dtype
         )
         mappings = self._create_weight_mappings()
-        self.loader.load_weights_from_safetensors(mappings)
+        self.loader.load_weights_from_safetensors(
+            mappings,
+            assert_all_assigned=True,
+            unassigned_whitelist=("model.embed_tokens.embedding",),
+        )
         logger.info(
             "Step3p5 MTP layer %d weights loaded (abs layer %d)",
             self.mtp_layer_idx,

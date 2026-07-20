@@ -359,6 +359,7 @@ suites = {
         TestFile("python/sgl_jax/test/models/test_step3p5_alignment.py", 5.0, runner="pytest"),
         TestFile("python/sgl_jax/test/models/test_step3p5_nextn.py", 0.2, runner="pytest"),
         TestFile("python/sgl_jax/test/models/test_weight_loader_assert.py", 0.5, runner="pytest"),
+        TestFile("test/srt/test_step3p5_mtp_e2e.py", 0.2, runner="pytest"),
         TestFile(
             "python/sgl_jax/test/test_moe_weight_loader_sharding.py",
             0.2,

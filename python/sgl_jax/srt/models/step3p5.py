@@ -391,7 +391,7 @@ class Step3p5MoE(nnx.Module):
             num_experts=num_experts,
             score_func="sigmoid",
             enable_expert_bias=config.use_moe_router_bias,
-            weight_dtype=dtype,
+            weight_dtype=jnp.float32,
         )
 
         self.topk = TopK(
