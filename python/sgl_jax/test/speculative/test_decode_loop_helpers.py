@@ -22,6 +22,7 @@ def test_decode_loop_cache_loc_is_dp_segmented():
         dp_size=2,
         per_dp_bs=2,
         page_size=4,
+        total_cache_loc_size=24,
     )
 
     assert cache_loc.shape == (24,)
@@ -47,11 +48,56 @@ def test_decode_loop_cache_loc_has_page_for_each_padded_slot():
         dp_size=1,
         per_dp_bs=per_dp_bs,
         page_size=page_size,
+        total_cache_loc_size=per_dp_bs * page_size,
     )
 
     assert cache_loc.shape == (per_dp_bs * page_size,)
     assert cache_loc[0] == 200
     assert np.all(cache_loc[1:] == 0)
+
+
+def test_decode_loop_cache_loc_keeps_scheduler_bucket_shape():
+    req_to_token = np.zeros((4, 32), dtype=np.int32)
+    req_to_token[1] = 100 + np.arange(32, dtype=np.int32)
+    pool = SimpleNamespace(req_to_token=req_to_token)
+
+    short = _build_decode_loop_cache_loc(
+        pool,
+        np.asarray([1], dtype=np.int32),
+        np.asarray([3], dtype=np.int32),
+        dp_size=1,
+        per_dp_bs=1,
+        page_size=1,
+        total_cache_loc_size=16,
+    )
+    longer = _build_decode_loop_cache_loc(
+        pool,
+        np.asarray([1], dtype=np.int32),
+        np.asarray([9], dtype=np.int32),
+        dp_size=1,
+        per_dp_bs=1,
+        page_size=1,
+        total_cache_loc_size=16,
+    )
+
+    assert short.shape == longer.shape == (16,)
+    np.testing.assert_array_equal(short[:3], [100, 101, 102])
+    np.testing.assert_array_equal(longer[:9], np.arange(100, 109))
+
+
+def test_decode_loop_cache_loc_rejects_too_small_scheduler_bucket():
+    pool = SimpleNamespace(req_to_token=np.zeros((2, 16), dtype=np.int32))
+
+    with np.testing.assert_raises_regex(ValueError, "bucket is too small"):
+        _build_decode_loop_cache_loc(
+            pool,
+            np.asarray([1], dtype=np.int32),
+            np.asarray([5], dtype=np.int32),
+            dp_size=1,
+            per_dp_bs=1,
+            page_size=1,
+            total_cache_loc_size=4,
+        )
 
 
 def test_decode_loop_out_cache_loc_uses_current_positions():

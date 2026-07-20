@@ -564,12 +564,15 @@ def _make_fake_tokenizer_manager(disaggregation_mode: str):
 
     tm = TokenizerManager.__new__(TokenizerManager)
     tm.preferred_sampling_params = None
-    tm.model_config = SimpleNamespace(vocab_size=32000)
+    tm.model_config = SimpleNamespace(vocab_size=32000, hf_config=SimpleNamespace())
     tm.tokenizer = SimpleNamespace(
         normalize=lambda x: x,
     )
     tm.server_args = SimpleNamespace(
         disaggregation_mode=disaggregation_mode,
+        speculative_algorithm=None,
+        speculative_target_verify_mode="auto",
+        speculative_eagle_topk=1,
     )
     return tm
 

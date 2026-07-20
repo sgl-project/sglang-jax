@@ -114,6 +114,45 @@ class ReqState:
     output_token_ids_logprobs_idx: list = dataclasses.field(default_factory=list)
 
 
+def _validate_speculative_sampling_params(
+    server_args, model_config, sampling_params: SamplingParams
+) -> None:
+    from sgl_jax.srt.speculative.draft_extend_fused import (
+        _requires_non_overlap_target_verify,
+    )
+
+    if not _requires_non_overlap_target_verify(
+        server_args,
+        server_args.speculative_algorithm,
+        model_config.hf_config,
+    ):
+        return
+
+    unsupported = []
+    if (
+        sampling_params.frequency_penalty != 0.0
+        or sampling_params.presence_penalty != 0.0
+        or sampling_params.repetition_penalty != 1.0
+        or sampling_params.min_new_tokens != 0
+    ):
+        unsupported.append("token penalties")
+    if any(
+        value is not None
+        for value in (
+            sampling_params.json_schema,
+            sampling_params.regex,
+            sampling_params.ebnf,
+            sampling_params.structural_tag,
+        )
+    ):
+        unsupported.append("grammar constraints")
+    if sampling_params.logit_bias:
+        unsupported.append("logit_bias")
+
+    if unsupported:
+        raise ValueError("Speculative decoding does not support " + ", ".join(unsupported) + ".")
+
+
 class TokenizerManager:
     """TokenizerManager is a process that tokenizes the text."""
 
@@ -359,6 +398,7 @@ class TokenizerManager:
         sampling_params = SamplingParams(**sampling_kwargs)
         sampling_params.normalize(self.tokenizer)
         sampling_params.verify(self.model_config.vocab_size)
+        _validate_speculative_sampling_params(self.server_args, self.model_config, sampling_params)
 
         # Build return object
 
