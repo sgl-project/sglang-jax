@@ -144,6 +144,28 @@ class TestNextNV25Pro(CustomTestCase):
             self.assertGreaterEqual(d["meta_info"]["completion_tokens"], n)
         requests.get(f"{self.base_url}/health", timeout=10).raise_for_status()
 
+    def test_multihost_logprob_output_alignment(self):
+        response = requests.post(
+            f"{self.base_url}/generate",
+            json={
+                "text": "hello",
+                "sampling_params": {"temperature": 0, "max_new_tokens": 32},
+                "return_logprob": True,
+                "top_logprobs_num": 2,
+            },
+            timeout=600,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        output_ids = payload["output_ids"]
+        output_logprobs = payload["meta_info"]["output_token_logprobs"]
+        output_top_logprobs = payload["meta_info"]["output_top_logprobs"]
+        self.assertGreater(len(output_ids), 1)
+        self.assertEqual(len(output_logprobs), len(output_ids))
+        self.assertEqual(len(output_top_logprobs), len(output_ids))
+        self.assertTrue(all(item[0] is not None for item in output_logprobs))
+        self.assertGreater(len(payload["text"]), 0)
+
     def test_raw_completion_accuracy(self):
         # run_eval's mmlu uses /v1/chat/completions; V2.5-Pro then emits
         # <think>...</think> reasoning which the mmlu parser can't score.
