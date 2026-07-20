@@ -119,7 +119,8 @@ Each stage contains:
 | `DiffusionScheduler` | Text-to-image / video | Manages diffusion-step iteration |
 | `VaeScheduler` | VAE decoding | Latent → pixel decoding scheduling |
 | `VitScheduler` | Vision Transformer | Image patch encoding |
-| `EmbedScheduler` | Text embedding | Text encoder feature extraction |
+| `EncoderScheduler` | Text encoding | Runs dedicated text encoders such as CLIP, T5, and UMT5 |
+| `EmbedScheduler` | Text embedding | Produces embedding-model outputs |
 | `AudioScheduler` | Audio | Audio feature extraction/generation |
 | `AudioBackboneScheduler` | Audio backbone | Audio model backbone network |
 
@@ -212,7 +213,8 @@ Each stage's YAML definition contains:
 |------|------|--------|
 | `audio/` | Audio processing | Audio encoding/decoding execution |
 | `diffusion/` | Diffusion model execution | Manages denoising steps, invokes UNet/DiT |
-| `embed/` | Embedding extraction | Text encoder forward |
+| `embed/` | Embedding extraction | Produces embedding-model outputs |
+| `encoder/` | Text encoding | Tokenization and dedicated text encoder forward |
 | `vae/` | VAE encode/decode | Latent ↔ pixel conversion |
 | `vit/` | Vision Transformer | Image patch encoding |
 
