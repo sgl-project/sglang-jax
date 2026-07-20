@@ -18,6 +18,7 @@ from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.kernels.speculative.kernel import top_k_renorm_prob, top_p_renorm_prob
 from sgl_jax.srt.sampling.sampling_params import TOP_K_ALL
+from sgl_jax.srt.speculative.base_worker import populate_speculative_output_logprobs
 from sgl_jax.srt.speculative.relay_buffer import (
     gather_spec_relay_buffers,
     make_dp_valid_mask,
@@ -112,6 +113,10 @@ def _get_hf_config_from_worker(worker):
 
 def _is_step3p5_target_model(spec_worker) -> bool:
     hf_config = _get_hf_config_from_worker(spec_worker.target_worker)
+    return _is_step3p5_hf_config(hf_config)
+
+
+def _is_step3p5_hf_config(hf_config) -> bool:
     if hf_config is None:
         return False
     model_type = getattr(hf_config, "model_type", None)
@@ -119,6 +124,17 @@ def _is_step3p5_target_model(spec_worker) -> bool:
         return True
     architectures = getattr(hf_config, "architectures", []) or []
     return "Step3p5ForCausalLM" in architectures
+
+
+def _requires_non_overlap_target_verify(server_args, algorithm, hf_config) -> bool:
+    mode = _target_verify_mode_from_env_or_args(server_args)
+    if mode == "batched" or not _is_nextn_algorithm(algorithm):
+        return False
+    if getattr(server_args, "speculative_eagle_topk", 1) != 1:
+        return False
+    if mode == "decode-loop":
+        return True
+    return _is_step3p5_hf_config(hf_config)
 
 
 def _warn_step3p5_decode_loop_once():
@@ -148,15 +164,14 @@ def _should_use_decode_loop_target_verify(
     algorithm = getattr(spec_worker, "speculative_algorithm", None)
     if algorithm is None:
         algorithm = getattr(model_worker_batch, "spec_algorithm", None)
-    supported = (
-        _is_nextn_algorithm(algorithm)
-        and is_greedy
-        and draft_worker.topk == 1
-        and not use_relay_state
-    )
+    supported = _is_nextn_algorithm(algorithm) and is_greedy and draft_worker.topk == 1
     if mode == "decode-loop":
+        if supported and use_relay_state:
+            raise RuntimeError("decode-loop target verify cannot run with speculative relay state")
         return supported
     use_step3p5_fallback = supported and _is_step3p5_target_model(spec_worker)
+    if use_step3p5_fallback and use_relay_state:
+        raise RuntimeError("Step3p5 auto target verify cannot run with speculative relay state")
     if use_step3p5_fallback:
         _warn_step3p5_decode_loop_once()
     return use_step3p5_fallback
@@ -1912,6 +1927,7 @@ def _build_decode_loop_cache_loc(
     dp_size: int,
     per_dp_bs: int,
     page_size: int,
+    total_cache_loc_size: int,
 ) -> np.ndarray:
     per_rank_sizes = []
     for r in range(dp_size):
@@ -1919,8 +1935,18 @@ def _build_decode_loop_cache_loc(
         end = start + per_dp_bs
         aligned = ((seq_lens[start:end] + page_size - 1) // page_size) * page_size
         per_rank_sizes.append(int(np.sum(np.where(seq_lens[start:end] > 0, aligned, 0))))
-    per_dp_cache_loc_size = max(max(per_rank_sizes, default=0), per_dp_bs * page_size)
-    cache_loc = np.zeros(dp_size * per_dp_cache_loc_size, dtype=np.int32)
+    if total_cache_loc_size % dp_size != 0:
+        raise ValueError(
+            f"cache_loc size {total_cache_loc_size} is not divisible by dp_size {dp_size}"
+        )
+    per_dp_cache_loc_size = total_cache_loc_size // dp_size
+    required_size = max(max(per_rank_sizes, default=0), per_dp_bs * page_size)
+    if required_size > per_dp_cache_loc_size:
+        raise ValueError(
+            "decode-loop cache_loc bucket is too small: "
+            f"required_per_dp={required_size}, available_per_dp={per_dp_cache_loc_size}"
+        )
+    cache_loc = np.zeros(total_cache_loc_size, dtype=np.int32)
     req_to_token = req_to_token_pool.req_to_token
     for r in range(dp_size):
         dst = r * per_dp_cache_loc_size
@@ -2010,6 +2036,7 @@ def _decode_loop_target_verify(
             dp_size=dp_size,
             per_dp_bs=per_dp_bs,
             page_size=spec_worker.page_size,
+            total_cache_loc_size=model_worker_batch.cache_loc.shape[0],
         )
 
         decode_batch = copy.copy(model_worker_batch)

@@ -74,8 +74,13 @@ class TestVerifyTree(CustomTestCase):
 
         self.assertFalse(self._decode_loop_policy(is_greedy=False))
         self.assertFalse(self._decode_loop_policy(topk=2))
-        self.assertFalse(self._decode_loop_policy(use_relay_state=True))
         self.assertFalse(self._decode_loop_policy(algorithm=SpeculativeAlgorithm.EAGLE3))
+
+    def test_decode_loop_policy_rejects_relay_instead_of_silent_fallback(self):
+        with self.assertRaisesRegex(RuntimeError, "cannot run with speculative relay state"):
+            self._decode_loop_policy(use_relay_state=True)
+        with self.assertRaisesRegex(RuntimeError, "cannot run with speculative relay state"):
+            self._decode_loop_policy(mode="decode-loop", use_relay_state=True)
 
     def test_decode_loop_policy_auto_only_enables_step3p5_nextn(self):
         self.assertFalse(
@@ -90,6 +95,118 @@ class TestVerifyTree(CustomTestCase):
         self.assertTrue(self._decode_loop_policy(mode="decode-loop"))
         self.assertFalse(self._decode_loop_policy(env="0"))
         self.assertTrue(self._decode_loop_policy(mode="batched", env="1"))
+
+    def test_target_verify_overlap_policy_matches_decode_loop_gate(self):
+        from sgl_jax.srt.speculative.draft_extend_fused import (
+            _requires_non_overlap_target_verify,
+        )
+
+        step3p5 = SimpleNamespace(model_type="step3p5", architectures=["Step3p5ForCausalLM"])
+        other = SimpleNamespace(model_type="qwen3_5_moe", architectures=["Qwen3_5MoeForCausalLM"])
+
+        def args(mode="auto", topk=1):
+            return SimpleNamespace(
+                speculative_target_verify_mode=mode,
+                speculative_eagle_topk=topk,
+            )
+
+        self.assertTrue(
+            _requires_non_overlap_target_verify(args(), SpeculativeAlgorithm.NEXTN, step3p5)
+        )
+        self.assertFalse(
+            _requires_non_overlap_target_verify(args(), SpeculativeAlgorithm.NEXTN, other)
+        )
+        self.assertTrue(
+            _requires_non_overlap_target_verify(
+                args("decode-loop"), SpeculativeAlgorithm.NEXTN, other
+            )
+        )
+        self.assertFalse(
+            _requires_non_overlap_target_verify(
+                args("batched"), SpeculativeAlgorithm.NEXTN, step3p5
+            )
+        )
+        self.assertFalse(
+            _requires_non_overlap_target_verify(args(topk=2), SpeculativeAlgorithm.NEXTN, step3p5)
+        )
+
+    def test_speculative_sampling_params_reject_constraints(self):
+        from sgl_jax.srt.managers.tokenizer_manager import (
+            _validate_speculative_sampling_params,
+        )
+        from sgl_jax.srt.sampling.sampling_params import SamplingParams
+
+        step3p5 = SimpleNamespace(
+            vocab_size=32000,
+            hf_config=SimpleNamespace(model_type="step3p5", architectures=["Step3p5ForCausalLM"]),
+        )
+        other = SimpleNamespace(
+            vocab_size=32000,
+            hf_config=SimpleNamespace(
+                model_type="qwen3_5_moe", architectures=["Qwen3_5MoeForCausalLM"]
+            ),
+        )
+        speculative = SimpleNamespace(
+            speculative_algorithm="NEXTN",
+            speculative_target_verify_mode="auto",
+            speculative_eagle_topk=1,
+        )
+        plain = SimpleNamespace(
+            speculative_algorithm=None,
+            speculative_target_verify_mode="auto",
+            speculative_eagle_topk=1,
+        )
+
+        _validate_speculative_sampling_params(speculative, step3p5, SamplingParams(temperature=0))
+        _validate_speculative_sampling_params(
+            plain, step3p5, SamplingParams(temperature=0, frequency_penalty=0.5)
+        )
+        _validate_speculative_sampling_params(
+            speculative, other, SamplingParams(temperature=0, frequency_penalty=0.5)
+        )
+        with self.assertRaisesRegex(ValueError, "token penalties"):
+            _validate_speculative_sampling_params(
+                speculative,
+                step3p5,
+                SamplingParams(temperature=0, frequency_penalty=0.5),
+            )
+        with self.assertRaisesRegex(ValueError, "grammar constraints"):
+            _validate_speculative_sampling_params(
+                speculative, step3p5, SamplingParams(temperature=0, regex="[a-z]+")
+            )
+
+    def test_speculative_output_logprobs_populates_generic_verify_output(self):
+        from sgl_jax.srt.speculative.base_worker import (
+            populate_speculative_output_logprobs,
+        )
+
+        mesh = Mesh(
+            np.asarray(jax.devices()),
+            ("data",),
+            axis_types=(jax.sharding.AxisType.Explicit,),
+        )
+        output = SimpleNamespace(
+            next_token_logits=jnp.asarray([[1.0, 3.0, 2.0], [2.0, 0.0, 1.0]]),
+            next_token_logprobs=None,
+            next_token_top_logprobs_val=None,
+            next_token_top_logprobs_idx=None,
+            next_token_token_ids_logprobs_val=None,
+            next_token_token_ids_logprobs_idx=None,
+        )
+
+        populate_speculative_output_logprobs(
+            output,
+            jnp.asarray([1, 0], dtype=jnp.int32),
+            top_logprobs_nums=[2],
+            token_ids_logprobs=[[0, 2]],
+            speculative_num_draft_tokens=2,
+            mesh=mesh,
+        )
+
+        expected = jax.nn.log_softmax(output.next_token_logits, axis=-1)
+        np.testing.assert_allclose(np.asarray(output.next_token_logprobs), expected[[0, 1], [1, 0]])
+        assert output.next_token_top_logprobs_val.shape == (2, 2)
+        assert output.next_token_token_ids_logprobs_val.shape == (2, 3)
 
     def test_decode_loop_policy_warns_once_for_step3p5_auto_fallback(self):
         from sgl_jax.srt.speculative import draft_extend_fused

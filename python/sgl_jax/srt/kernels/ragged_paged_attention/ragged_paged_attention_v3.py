@@ -1555,9 +1555,9 @@ def get_default_block_sizes(
 
     bkv_alignment = max(page_size, kv_packing)
     bq_sz = max(1, bq_sz)
-    bkv_sz = align_to(bkv_sz, bkv_alignment)
+    bkv_sz = max(bkv_alignment, align_to(bkv_sz, bkv_alignment))
     bq_csz = max(1, bq_csz)
-    bkv_csz = align_to(bkv_csz, bkv_alignment)
+    bkv_csz = max(bkv_alignment, align_to(bkv_csz, bkv_alignment))
 
     # Reduce block sizes if VMEM estimate exceeds limit.
     # Use 30% of vmem_limit to account for compiler overhead (intermediates,
