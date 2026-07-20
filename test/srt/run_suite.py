@@ -336,6 +336,8 @@ suites = {
         TestFile("python/sgl_jax/test/models/test_step3p5_model.py", 2.0, runner="pytest"),
         TestFile("python/sgl_jax/test/models/test_step3p5_invariants.py", 1.0, runner="pytest"),
         TestFile("python/sgl_jax/test/models/test_step3p5_alignment.py", 5.0, runner="pytest"),
+        TestFile("python/sgl_jax/test/models/test_step3p5_nextn.py", 0.2, runner="pytest"),
+        TestFile("python/sgl_jax/test/models/test_weight_loader_assert.py", 0.5, runner="pytest"),
         TestFile(
             "python/sgl_jax/test/utils/test_weight_loader_prestacked_moe.py",
             0.1,
