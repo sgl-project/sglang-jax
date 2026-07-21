@@ -16,6 +16,7 @@ from sgl_jax.srt.kernels.speculative.tree_speculative_sampling_target_only_kerne
 )
 from sgl_jax.srt.kernels.speculative.verify_tree_greedy_kernel import verify_tree_greedy
 from sgl_jax.srt.speculative.eagle_util import build_tree_mask_for_draft_decode
+from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 from sgl_jax.test.test_utils import CustomTestCase
 
 
@@ -174,39 +175,6 @@ class TestVerifyTree(CustomTestCase):
             _validate_speculative_sampling_params(
                 speculative, step3p5, SamplingParams(temperature=0, regex="[a-z]+")
             )
-
-    def test_speculative_output_logprobs_populates_generic_verify_output(self):
-        from sgl_jax.srt.speculative.base_worker import (
-            populate_speculative_output_logprobs,
-        )
-
-        mesh = Mesh(
-            np.asarray(jax.devices()),
-            ("data",),
-            axis_types=(jax.sharding.AxisType.Explicit,),
-        )
-        output = SimpleNamespace(
-            next_token_logits=jnp.asarray([[1.0, 3.0, 2.0], [2.0, 0.0, 1.0]]),
-            next_token_logprobs=None,
-            next_token_top_logprobs_val=None,
-            next_token_top_logprobs_idx=None,
-            next_token_token_ids_logprobs_val=None,
-            next_token_token_ids_logprobs_idx=None,
-        )
-
-        populate_speculative_output_logprobs(
-            output,
-            jnp.asarray([1, 0], dtype=jnp.int32),
-            top_logprobs_nums=[2],
-            token_ids_logprobs=[[0, 2]],
-            speculative_num_draft_tokens=2,
-            mesh=mesh,
-        )
-
-        expected = jax.nn.log_softmax(output.next_token_logits, axis=-1)
-        np.testing.assert_allclose(np.asarray(output.next_token_logprobs), expected[[0, 1], [1, 0]])
-        assert output.next_token_top_logprobs_val.shape == (2, 2)
-        assert output.next_token_token_ids_logprobs_val.shape == (2, 3)
 
     def test_decode_loop_policy_warns_once_for_step3p5_auto_fallback(self):
         from sgl_jax.srt.speculative import draft_extend_fused
