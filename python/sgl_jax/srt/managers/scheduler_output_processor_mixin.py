@@ -431,11 +431,9 @@ class SchedulerOutputProcessorMixin:
 
         # Process each DP rank's requests (unified for all dp_size >= 1)
         per_dp_bs_size = batch.per_dp_bs_size  # Padded batch size per DP rank
-        # Flat index across all DP ranks. logprob arrays in `logits_output`
-        # / `next_token_logprobs` have already been reordered to original-req
-        # order in tp_worker via `logits_indices_selector`. Increment for
-        # every visited req (including retracted) so the counter stays
-        # aligned with the selector.
+        # Non-spec logprobs are reordered to request order by tp_worker;
+        # speculative logprobs remain DP-padded and use `slot` below.
+        # Count every visited request so non-spec outputs stay aligned.
         req_idx = 0
 
         for dp_rank in range(batch.dp_size):

@@ -5,7 +5,8 @@ from unittest import mock
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.sharding import Mesh
+from jax.sharding import Mesh, NamedSharding
+from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.kernels.speculative.kernel import create_extend_after_decode_spec_info
 from sgl_jax.srt.kernels.speculative.tree_speculative_sampling_target_only_kernel import (
@@ -33,13 +34,14 @@ def _explicit_mesh():
 class TestVerifyTree(CustomTestCase):
     def test_speculative_logprobs_use_accept_width_and_verified_ids(self):
         mesh = _explicit_mesh()
-        logits = jnp.arange(6 * 3, dtype=jnp.float32).reshape(6, 3) / 10
-        verified_id = np.array([1, 2, 0, 2, 1, 0], dtype=np.int32)
-        temperatures = jnp.asarray([[2.0], [2.0], [2.0], [4.0], [4.0], [4.0]])
+        logits = jnp.arange(12 * 3, dtype=jnp.float32).reshape(12, 3) / 10
+        logits = jax.device_put(logits, NamedSharding(mesh, P("data", None)))
+        verified_id = np.tile([1, 2, 0], 4).astype(np.int32)
+        temperatures = jnp.repeat(jnp.asarray([2.0, 4.0, 2.0, 4.0]), 3)[:, None]
         batch = SimpleNamespace(
-            sampling_info=SimpleNamespace(temperatures=jnp.asarray([[2.0], [4.0]])),
-            top_logprobs_nums=[1, 2],
-            token_ids_logprobs=[[0], [1, 2]],
+            sampling_info=SimpleNamespace(temperatures=jnp.asarray([[2.0], [4.0], [2.0], [4.0]])),
+            top_logprobs_nums=[1, 2, 1, 2],
+            token_ids_logprobs=[[0], [1, 2], [0], [1, 2]],
         )
         for return_original in (False, True):
             with self.subTest(return_original=return_original):
@@ -54,13 +56,17 @@ class TestVerifyTree(CustomTestCase):
                     )
 
                 expected_logits = logits if return_original else logits / temperatures
-                expected = jax.nn.log_softmax(expected_logits, axis=-1)
+                expected = np.asarray(jax.nn.log_softmax(expected_logits, axis=-1))
                 np.testing.assert_allclose(
                     np.asarray(output.next_token_logprobs),
-                    np.asarray(expected[jnp.arange(6), jnp.asarray(verified_id)]),
+                    expected[np.arange(12), verified_id],
                 )
-                self.assertEqual(output.next_token_top_logprobs_val.shape, (6, 2))
-                self.assertEqual(output.next_token_token_ids_logprobs_val.shape, (6, 3))
+                self.assertEqual(
+                    output.next_token_logprobs.sharding.spec,
+                    P(None),
+                )
+                self.assertEqual(output.next_token_top_logprobs_val.shape, (12, 2))
+                self.assertEqual(output.next_token_token_ids_logprobs_val.shape, (12, 3))
 
     def test_draft_extend_metadata_ignores_request_logprob(self):
         mesh = jax.sharding.Mesh(np.array(jax.devices()), ("data",))
