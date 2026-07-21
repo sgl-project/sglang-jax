@@ -584,6 +584,7 @@ def _reshape_per_dp_rows(values, dp_size: int):
     rows = values.reshape((dp_size, per_dp_size))
     sharding = jax.typeof(values).sharding
     if isinstance(sharding, NamedSharding) and not sharding.mesh.empty:
+        # Keep the DP axis sharded and the rank-local reduction axis unsharded after reshape.
         rows = jax.sharding.reshard(rows, NamedSharding(sharding.mesh, P("data", None)))
     return rows
 

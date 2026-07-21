@@ -73,7 +73,7 @@ def build_dflash_draft_block(
     return block_ids, positions.astype(np.int32)
 
 
-# TODO(haifeng): Share greedy chain verification through common speculative helpers.
+# TODO: Share greedy chain verification through common speculative helpers.
 def dflash_greedy_verify(
     draft_token: jax.Array,
     target_logits: jax.Array,
@@ -205,7 +205,7 @@ class DFlashDraftInput:
         self.target_hidden = None
 
     def prepare_for_decode(self, schedule_batch) -> None:
-        # TODO(haifeng): Share KV slot reservation and req_to_token_pool updates
+        # TODO: Share KV slot reservation and req_to_token_pool updates
         # with EAGLE through common speculative helpers in the next PR.
         from sgl_jax.srt.managers.schedule_batch import get_last_loc
         from sgl_jax.srt.mem_cache.common import (
