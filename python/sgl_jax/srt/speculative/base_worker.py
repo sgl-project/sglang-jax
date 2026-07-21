@@ -12,11 +12,8 @@ import numpy as np
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from sgl_jax.srt.layers.sampler import get_token_ids_logprobs, get_top_logprobs
+from sgl_jax.srt.layers.sampler import populate_speculative_output_logprobs
 from sgl_jax.srt.speculative.overlap_utils import use_legacy_eagle3_non_overlap
-from sgl_jax.srt.utils.common_utils import get_bool_env_var
-
-RETURN_ORIGINAL_LOGPROB = get_bool_env_var("RETURN_ORIGINAL_LOGPROB")
 
 if TYPE_CHECKING:
     from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
@@ -33,47 +30,6 @@ def replicate_to_mesh(
     """
     out = jax.device_put(arrs, NamedSharding(mesh, P()))
     return out[0] if len(out) == 1 else out
-
-
-def populate_speculative_output_logprobs(
-    logits_output,
-    next_token_ids,
-    *,
-    top_logprobs_nums,
-    token_ids_logprobs,
-    num_rows_per_req: int,
-    temperatures,
-    mesh,
-):
-    logprob_logits = logits_output.next_token_logits.astype(jnp.float32)
-    if temperatures is not None:
-        row_temperatures = jnp.repeat(
-            jnp.asarray(temperatures, dtype=jnp.float32).reshape(-1),
-            num_rows_per_req,
-        )[:, None]
-        logprob_logits = logprob_logits / row_temperatures
-    logprobs = jax.nn.log_softmax(logprob_logits, axis=-1)
-    next_token_ids = jnp.asarray(next_token_ids, dtype=jnp.int32).reshape(-1)
-    logits_output.next_token_logprobs = logprobs[
-        jnp.arange(next_token_ids.shape[0], dtype=jnp.int32),
-        next_token_ids,
-    ]
-
-    if top_logprobs_nums is not None and any(x > 0 for x in top_logprobs_nums):
-        flat_top_logprobs_nums = [num for num in top_logprobs_nums for _ in range(num_rows_per_req)]
-        (
-            logits_output.next_token_top_logprobs_val,
-            logits_output.next_token_top_logprobs_idx,
-        ) = get_top_logprobs(logprobs, flat_top_logprobs_nums, mesh)
-
-    if token_ids_logprobs is not None and any(x is not None for x in token_ids_logprobs):
-        flat_token_ids_logprobs = [
-            token_ids for token_ids in token_ids_logprobs for _ in range(num_rows_per_req)
-        ]
-        logits_output.next_token_token_ids_logprobs_val = get_token_ids_logprobs(
-            logprobs, flat_token_ids_logprobs, mesh
-        )
-        logits_output.next_token_token_ids_logprobs_idx = None
 
 
 class BaseDraftWorker(ABC):
@@ -427,18 +383,11 @@ class BaseSpecWorker:
         )
 
         if model_worker_batch.return_logprob or model_worker_batch.return_output_logprob_only:
-            accept_width = self.speculative_num_steps + 1
             populate_speculative_output_logprobs(
                 logits_output,
                 verified_id,
-                top_logprobs_nums=model_worker_batch.top_logprobs_nums,
-                token_ids_logprobs=model_worker_batch.token_ids_logprobs,
-                num_rows_per_req=accept_width,
-                temperatures=(
-                    None
-                    if RETURN_ORIGINAL_LOGPROB
-                    else model_worker_batch.sampling_info.temperatures
-                ),
+                model_worker_batch=model_worker_batch,
+                speculative_num_steps=self.speculative_num_steps,
                 mesh=self.mesh,
             )
 

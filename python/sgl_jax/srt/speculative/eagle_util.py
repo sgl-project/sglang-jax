@@ -12,7 +12,6 @@ import jax.numpy as jnp
 import numpy
 import numpy as np
 from flax import nnx
-from jax.experimental.multihost_utils import process_allgather
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 from jax.tree_util import register_pytree_node_class
@@ -44,6 +43,11 @@ from sgl_jax.srt.mem_cache.common import (
 )
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sgl_jax.srt.speculative.overlap_utils import use_legacy_eagle3_non_overlap
+from sgl_jax.srt.utils.jax_utils import (
+    device_array,
+    materialize_to_host,
+    prefetch_to_host,
+)
 
 SIMULATE_ACC_LEN = os.environ.get("SIMULATE_ACC_LEN")
 SIMULATE_ACC_METHOD = os.environ.get("SIMULATE_ACC_METHOD", "multinomial")
@@ -75,37 +79,6 @@ def _as_int32_array(value: Any, *, fallback: int = -1) -> Any:
         raise TypeError(
             f"Unable to convert value of type {type(value)} into int32 metadata array."
         ) from exc
-
-
-def _prefetch_spec_array(value: Any) -> Any:
-    # Spec state mixes P("data") arrays with P() replicated arrays and does not
-    # carry a dp_size flag at this boundary, so use per-array sharding metadata.
-    if getattr(value, "is_fully_addressable", True):
-        copy = getattr(value, "copy_to_host_async", None)
-        if copy is not None:
-            copy()
-        return value
-
-    if getattr(value, "is_fully_replicated", False):
-        local = value.addressable_data(0)
-        copy = getattr(local, "copy_to_host_async", None)
-        if copy is not None:
-            copy()
-        return local
-
-    return None
-
-
-def _host_spec_array(value: Any, prefetched: Any = None) -> np.ndarray:
-    if prefetched is not None:
-        return np.asarray(prefetched)
-
-    if not getattr(value, "is_fully_addressable", True) and not getattr(
-        value, "is_fully_replicated", False
-    ):
-        return np.asarray(process_allgather(value, tiled=True))
-
-    return np.asarray(_prefetch_spec_array(value))
 
 
 def get_last_loc_jax_array(
@@ -692,11 +665,10 @@ class EagleDraftInput:
 
         draft_model_runner.attn_backend.forward_metadata = forward_metadata
         from sgl_jax.srt.layers.logits_processor import LogitsMetadata
-        from sgl_jax.srt.utils.jax_utils import device_array
 
         sharding = NamedSharding(draft_model_runner.mesh, P("data"))
 
-        def _to_device(name, value):
+        def _to_device(value):
             if value is None:
                 return None
             if isinstance(value, jax.Array):
@@ -727,19 +699,16 @@ class EagleDraftInput:
             extend_return_logprob=False,
             extend_return_top_logprob=False,
             extend_token_ids_logprob=False,
-            extend_seq_lens=_to_device("extend_seq_lens", extend_seq_lens_for_logits),
-            logits_indices=_to_device("logits_indices", logits_indices_for_logits),
-            accept_lens=_to_device(
-                "accept_lens", model_worker_batch.spec_info_padded.accept_length
-            ),
+            extend_seq_lens=_to_device(extend_seq_lens_for_logits),
+            logits_indices=_to_device(logits_indices_for_logits),
+            accept_lens=_to_device(model_worker_batch.spec_info_padded.accept_length),
             extend_seq_lens_cpu=None,
             extend_logprob_start_lens_cpu=None,
             extend_logprob_pruned_lens_cpu=None,
             top_logprobs_nums=model_worker_batch.top_logprobs_nums,
             token_ids_logprobs=model_worker_batch.token_ids_logprobs,
             extend_input_logprob_token_ids_device=_to_device(
-                "extend_input_logprob_token_ids",
-                model_worker_batch.extend_input_logprob_token_ids,
+                model_worker_batch.extend_input_logprob_token_ids
             ),
         )
         return model_worker_batch, logits_metadata
@@ -837,9 +806,9 @@ class EagleDraftInput:
         for f in device_fields:
             v = getattr(self, f, None)
             if v is not None and hasattr(v, "copy_to_host_async"):
-                to_copy.append((f, v, _prefetch_spec_array(v)))
+                to_copy.append((f, v, prefetch_to_host(v)))
         for f, v, prefetched in to_copy:
-            setattr(self, f, _host_spec_array(v, prefetched))
+            setattr(self, f, materialize_to_host(v, prefetched))
 
     def filter_batch(self, new_indices: np.ndarray, has_been_filtered: bool = True):
         new_indices = np.asarray(new_indices)

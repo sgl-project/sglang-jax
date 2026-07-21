@@ -6,7 +6,6 @@ import threading
 from typing import TYPE_CHECKING
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
@@ -19,6 +18,7 @@ from sgl_jax.srt.speculative.overlap_utils import (
     resolve_spec_prefill_token_ids,
     use_legacy_eagle3_non_overlap,
 )
+from sgl_jax.srt.utils.jax_utils import materialize_to_host
 
 if TYPE_CHECKING:
     from sgl_jax.srt.managers.scheduler import (
@@ -412,35 +412,19 @@ class SchedulerOutputProcessorMixin:
             and (batch.return_logprob or batch.return_output_logprob_only)
             and logits_output.next_token_logprobs is not None
         ):
-
-            def spec_host_array(arr, *, allgather=False, as_float=False):
-                if as_float:
-                    arr = arr.astype(jnp.float32)
-                if allgather:
-                    from jax.experimental.multihost_utils import process_allgather
-
-                    arr = process_allgather(arr, tiled=True)
-                return jax.device_get(arr)
-
-            needs_allgather = batch.dp_size > 1
-            logits_output.next_token_logprobs = spec_host_array(
+            logits_output.next_token_logprobs = materialize_to_host(
                 logits_output.next_token_logprobs
             ).astype(float)
             if logits_output.next_token_top_logprobs_val is not None:
-                logits_output.next_token_top_logprobs_val = spec_host_array(
-                    logits_output.next_token_top_logprobs_val,
-                    allgather=needs_allgather,
-                    as_float=True,
+                logits_output.next_token_top_logprobs_val = materialize_to_host(
+                    logits_output.next_token_top_logprobs_val.astype(np.float32)
                 )
-                logits_output.next_token_top_logprobs_idx = spec_host_array(
-                    logits_output.next_token_top_logprobs_idx,
-                    allgather=needs_allgather,
+                logits_output.next_token_top_logprobs_idx = materialize_to_host(
+                    logits_output.next_token_top_logprobs_idx
                 )
             if logits_output.next_token_token_ids_logprobs_val is not None:
-                logits_output.next_token_token_ids_logprobs_val = spec_host_array(
-                    logits_output.next_token_token_ids_logprobs_val,
-                    allgather=needs_allgather,
-                    as_float=True,
+                logits_output.next_token_token_ids_logprobs_val = materialize_to_host(
+                    logits_output.next_token_token_ids_logprobs_val.astype(np.float32)
                 )
 
         self.token_to_kv_pool_allocator.free_group_begin()
@@ -540,45 +524,15 @@ class SchedulerOutputProcessorMixin:
                 ):
                     rows_per_req = self.draft_worker.speculative_num_steps + 1
                     slot = per_dp_bs_size * dp_rank + i
-                    base = slot * rows_per_req
-                    visible_accepted_len = new_accepted_len
-                    if req.finished_len is not None:
-                        visible_accepted_len = max(
-                            0,
-                            min(new_accepted_len, req.finished_len - output_len_before),
-                        )
-                    for j, token_id in enumerate(next_token_id[:visible_accepted_len]):
-                        flat_idx = base + j
-                        req.output_token_logprobs_val.append(
-                            logits_output.next_token_logprobs[flat_idx]
-                        )
-                        req.output_token_logprobs_idx.append(token_id)
-                        if (
-                            req.return_logprob
-                            and req.top_logprobs_num > 0
-                            and logits_output.next_token_top_logprobs_val is not None
-                        ):
-                            req.output_top_logprobs_val.append(
-                                logits_output.next_token_top_logprobs_val[flat_idx][
-                                    : req.top_logprobs_num
-                                ].tolist()
-                            )
-                            req.output_top_logprobs_idx.append(
-                                logits_output.next_token_top_logprobs_idx[flat_idx][
-                                    : req.top_logprobs_num
-                                ].tolist()
-                            )
-                        if (
-                            req.return_logprob
-                            and req.token_ids_logprob is not None
-                            and logits_output.next_token_token_ids_logprobs_val is not None
-                        ):
-                            req.output_token_ids_logprobs_val.append(
-                                logits_output.next_token_token_ids_logprobs_val[flat_idx][
-                                    req.token_ids_logprob
-                                ].tolist()
-                            )
-                            req.output_token_ids_logprobs_idx.append(req.token_ids_logprob)
+                    self.add_spec_decode_logprob_return_values(
+                        req,
+                        logits_output,
+                        next_token_id,
+                        slot,
+                        rows_per_req,
+                        output_len_before,
+                        new_accepted_len,
+                    )
 
                 if req.return_logprob and not is_spec_decode:
                     req.output_token_logprobs_val.append(next_token_logprobs[req_idx])
@@ -811,6 +765,48 @@ class SchedulerOutputProcessorMixin:
             req.output_token_ids_logprobs_idx.append(output.next_token_token_ids_logprobs_idx[i])
 
         return num_input_logprobs
+
+    @staticmethod
+    def add_spec_decode_logprob_return_values(
+        req: Req,
+        output: LogitsProcessorOutput,
+        next_token_ids,
+        slot: int,
+        rows_per_req: int,
+        output_len_before: int,
+        accepted_len: int,
+    ) -> None:
+        length = accepted_len
+        if req.finished_len is not None:
+            length = max(0, min(accepted_len, req.finished_len - output_len_before))
+        start = slot * rows_per_req
+        end = start + length
+        req.output_token_logprobs_val.extend(output.next_token_logprobs[start:end])
+        req.output_token_logprobs_idx.extend(next_token_ids[:length])
+
+        if (
+            req.return_logprob
+            and req.top_logprobs_num > 0
+            and output.next_token_top_logprobs_val is not None
+        ):
+            k = req.top_logprobs_num
+            req.output_top_logprobs_val.extend(
+                output.next_token_top_logprobs_val[start:end, :k].tolist()
+            )
+            req.output_top_logprobs_idx.extend(
+                output.next_token_top_logprobs_idx[start:end, :k].tolist()
+            )
+
+        if (
+            req.return_logprob
+            and req.token_ids_logprob is not None
+            and output.next_token_token_ids_logprobs_val is not None
+        ):
+            ids = req.token_ids_logprob
+            req.output_token_ids_logprobs_val.extend(
+                output.next_token_token_ids_logprobs_val[start:end, ids].tolist()
+            )
+            req.output_token_ids_logprobs_idx.extend([ids for _ in range(length)])
 
     def stream_output(
         self: Scheduler,

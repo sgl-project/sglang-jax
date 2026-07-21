@@ -14,7 +14,7 @@ from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.kernels.speculative.kernel import top_k_renorm_prob, top_p_renorm_prob
-from sgl_jax.srt.layers.sampler import get_token_ids_logprobs, get_top_logprobs
+from sgl_jax.srt.layers.sampler import populate_speculative_output_logprobs
 from sgl_jax.srt.sampling.sampling_params import TOP_K_ALL
 from sgl_jax.srt.speculative.relay_buffer import (
     gather_spec_relay_buffers,
@@ -1927,36 +1927,15 @@ def spec_decode_verify(spec_worker, model_worker_batch, cur_allocate_lens):
         extend_input_len_per_req=None,
         extend_logprob_start_len_per_req=None,
     )
-    if return_target_logits and (
-        model_worker_batch.return_logprob or model_worker_batch.return_output_logprob_only
-    ):
-        logprobs = jax.nn.log_softmax(target_logits.astype(jnp.float32), axis=-1)
-        next_token_ids = prepared_predict.astype(jnp.int32)
-        batch_output.logits_output.next_token_logprobs = logprobs[
-            jnp.arange(next_token_ids.shape[0], dtype=jnp.int32),
-            next_token_ids,
-        ]
-        top_logprobs_nums = model_worker_batch.top_logprobs_nums
-        if top_logprobs_nums is not None and any(x > 0 for x in top_logprobs_nums):
-            top_logprobs_nums_flat = []
-            for num in top_logprobs_nums:
-                top_logprobs_nums_flat.extend([num] * draft_worker.speculative_num_draft_tokens)
-            (
-                batch_output.logits_output.next_token_top_logprobs_val,
-                batch_output.logits_output.next_token_top_logprobs_idx,
-            ) = get_top_logprobs(logprobs, top_logprobs_nums_flat, spec_worker.mesh)
-
-        token_ids_logprobs = model_worker_batch.token_ids_logprobs
-        if token_ids_logprobs is not None and any(x is not None for x in token_ids_logprobs):
-            token_ids_logprobs_flat = []
-            for token_ids in token_ids_logprobs:
-                token_ids_logprobs_flat.extend(
-                    [token_ids] * draft_worker.speculative_num_draft_tokens
-                )
-            batch_output.logits_output.next_token_token_ids_logprobs_val = get_token_ids_logprobs(
-                logprobs, token_ids_logprobs_flat, spec_worker.mesh
-            )
-            batch_output.logits_output.next_token_token_ids_logprobs_idx = None
+    if return_target_logits:
+        populate_speculative_output_logprobs(
+            batch_output.logits_output,
+            prepared_verified_id,
+            model_worker_batch=model_worker_batch,
+            speculative_num_steps=draft_worker.speculative_num_steps,
+            mesh=spec_worker.mesh,
+            temperatures=_sv_temps,
+        )
     model_worker_batch.spec_info_padded = next_draft_input
     return batch_output
 
