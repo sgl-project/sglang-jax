@@ -263,9 +263,7 @@ def populate_speculative_output_logprobs(
 
     logprobs = jax.nn.log_softmax(logits, axis=-1)
     verified_ids = jnp.asarray(verified_ids, dtype=jnp.int32).reshape(-1)
-    logits_output.next_token_logprobs = logprobs[
-        jnp.arange(verified_ids.shape[0], dtype=jnp.int32), verified_ids
-    ]
+    logits_output.next_token_logprobs = compute_logprobs(mesh, logprobs, verified_ids)
 
     top_logprobs_nums = model_worker_batch.top_logprobs_nums
     if top_logprobs_nums is not None and any(num > 0 for num in top_logprobs_nums):
