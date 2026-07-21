@@ -277,8 +277,6 @@ def _build_eagle_tree_structure_kernel(
 
             def cond(state):
                 it, while_break, _, _ = state
-                # The tree-back-traversal reaches the root in at most draft_token_num steps; cap
-                # iterations so the loop can never spin forever if the break condition mis-evaluates.
                 return (while_break != 1) & (it < draft_token_num)
 
             _, _, position, _ = jax.lax.while_loop(cond, body, (0, 0, position, cur_position))

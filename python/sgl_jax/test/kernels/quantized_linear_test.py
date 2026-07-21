@@ -34,11 +34,7 @@ def _create_single_device_mesh():
 
 
 def _shard_activation(mesh, x):
-    """Place the activation as production does (tokens sharded on "data").
-
-    JAX 0.10.1 asserts shard_map inputs already match in_specs, including the
-    size-1 data axis on a single-device mesh; production activations arrive
-    P("data", ...) from the preceding layer's out_sharding."""
+    """Place an activation on the layout produced by the preceding layer."""
     return jax.device_put(x, NamedSharding(mesh, P("data", None)))
 
 

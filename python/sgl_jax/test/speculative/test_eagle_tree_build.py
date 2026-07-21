@@ -246,7 +246,6 @@ class TestDraftDecodeMask(CustomTestCase):
             speculative_num_steps=4,  # This was missing in the original provided content, inferring from number of score_list_raw elements
             mesh=mesh,
         )
-        # Await the kernel so no async executable is left pending at process teardown.
         jax.block_until_ready(
             (
                 tree_mask,

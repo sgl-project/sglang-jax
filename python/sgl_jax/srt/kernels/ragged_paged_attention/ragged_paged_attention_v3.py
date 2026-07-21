@@ -1554,10 +1554,7 @@ def get_default_block_sizes(
             raise NotImplementedError(f"Unsupported {tpu_version=}.")
 
     bkv_alignment = max(page_size, kv_packing)
-    # On v5/v6 the custom-mask int32 double buffer and compiler-generated
-    # softmax intermediates make a 32-row tile exceed the 64 MiB scoped VMEM
-    # budget for otherwise common GQA shapes. Keep the query tile small enough
-    # for the compiler before applying the general estimate below.
+    # Custom-mask intermediates exceed v5/v6 scoped VMEM with a 32-row query tile.
     if use_custom_mask and tpu_version in (5, 6):
         bq_sz = min(bq_sz, 16)
         bq_csz = min(bq_csz, bq_sz)

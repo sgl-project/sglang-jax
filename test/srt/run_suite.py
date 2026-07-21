@@ -255,9 +255,7 @@ suites = {
         TestFile("python/sgl_jax/test/kernels/quantized_linear_test.py", 0.3, runner="pytest"),
         TestFile("python/sgl_jax/test/kernels/moe_block_quant_test.py", 0.2, runner="pytest"),
         TestFile("python/sgl_jax/test/kernels/kda_test.py", 10, runner="pytest"),
-        # Run via pytest: these use a module-level global mesh (flashattention_common) whose
-        # unittest teardown deadlocks the TPU client on JAX 0.10.1 in script mode; pytest exits
-        # cleanly. Kernels/results are unaffected (all cases pass either way).
+        # Pytest tears down the shared FlashAttention mesh cleanly on JAX 0.10.1.
         TestFile("python/sgl_jax/test/test_flashattention_mha.py", 11, runner="pytest"),
         TestFile("python/sgl_jax/test/test_flashattention_gqa.py", 11, runner="pytest"),
         TestFile("python/sgl_jax/test/test_flashattention_misc.py", 7, runner="pytest"),

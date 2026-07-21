@@ -93,15 +93,7 @@ def _make_fake_layer(layer_id=_LAYER_ID, num_heads=_H, head_dim=_K):
 
 
 def _put(x, *axes):
-    """Place an array on the sharding production provides to the backend.
-
-    JAX 0.9.1+ asserts shard_map inputs already match in_specs (0.10.1 is
-    strict even on size-1 axes). Production q/k/v arrive from LinearBase with
-    P("data", ..., "tensor") and the state pool emits P("data", "tensor", ...)
-    buffers, so backend inputs must mirror that. Only apply this to the arrays
-    handed to the backend: the naive reference scans over the token axis and
-    requires its inputs replicated.
-    """
+    """Place an array on the layout produced for the backend."""
     return jax.device_put(x, jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(*axes)))
 
 
@@ -112,8 +104,7 @@ def _make_mock_pool(layer_id, recurrent_state, recurrent_indices=None):
         recurrent_indices = np.arange(1, B + 1, dtype=np.int32)
     N_plus_1 = int(max(recurrent_indices)) + 1
     buf = jnp.zeros((N_plus_1,) + recurrent_state.shape[1:], dtype=recurrent_state.dtype)
-    # recurrent_state may come back sharded from a prior backend call; JAX 0.10.1 refuses to
-    # scatter a sharded operand into the unsharded scaffolding buffer, so replicate it first.
+    # Build the reference buffer from a host copy before placing its backend layout.
     buf = buf.at[jnp.array(recurrent_indices)].set(np.asarray(recurrent_state))
     buf = _put(buf, "data", "tensor", None, None)
     return MockRecurrentStatePool(layer_caches={layer_id: (buf, [])}), recurrent_indices
@@ -293,8 +284,6 @@ def _run_backend_extend_bucket_padded(lens, H, K, dtype, h0, rng_seed, layer_id=
 def _run_backend_decode(B, H, K, dtype, h0, rng_seed, layer_id=_LAYER_ID):
     """Helper to run backend decode and return output + state."""
     rng = np.random.default_rng(rng_seed)
-    # Keep these replicated: they feed the naive reference (which scans over the
-    # batch axis). The backend gets sharded copies at the call site below.
     q = jnp.array(rng.standard_normal((B, 1, H, K)).astype(np.float32), dtype=dtype)
     k = jnp.array(rng.standard_normal((B, 1, H, K)).astype(np.float32), dtype=dtype)
     v = jnp.array(rng.standard_normal((B, 1, H, K)).astype(np.float32), dtype=dtype)

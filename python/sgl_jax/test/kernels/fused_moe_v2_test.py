@@ -183,8 +183,7 @@ class MoEV2KernelTest(jtu.JaxTestCase):
 
         block_config = FusedMoEBlockConfig(bt=bt, bf=bf, btc=btc, bse=bse)
 
-        # fused_ep_moe_v2 feeds these straight into its shard_map, which shards dim 0 across the
-        # EP mesh. ref_moe's scatter cannot take a sharded operand, so keep its originals.
+        # Shard kernel inputs while keeping replicated originals for ref_moe.
         ep = jax.sharding.NamedSharding(self.mesh, P(("data", "tensor")))
 
         def shard(x):
@@ -253,7 +252,6 @@ class MoEV2KernelTest(jtu.JaxTestCase):
             x = lax.all_gather(x, axis_name="data", axis=0, tiled=True)
             return x
 
-        # _replicate gathers from the EP layout, so the replicated ref output must match.
         expected = jax.reshard(expected, ep)
         actual_host = np.asarray(jax.device_get(_replicate(actual)))
         expected_host = np.asarray(jax.device_get(_replicate(expected)))

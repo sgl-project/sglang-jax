@@ -30,9 +30,7 @@ class TestChunkedPrefillSize(CustomTestCase):
                 "4",
                 "--random-seed",
                 "3",
-                # The MMLU client submits 64 requests concurrently. Keep token
-                # sampling independent of scheduler batch ordering so this
-                # accuracy gate is reproducible.
+                # Keep sampling independent of concurrent request scheduling.
                 "--enable-deterministic-sampling",
                 "--mem-fraction-static",
                 "0.8",

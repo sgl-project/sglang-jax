@@ -180,8 +180,7 @@ class TestLogprobsDense(unittest.TestCase):
 
     def check_output(self, actual, key, expected):
         for i, logprob in enumerate(actual[key]):
-            # Logprob values drift slightly across XLA/libtpu versions (bf16 fused-op rounding);
-            # compare with tolerance while keeping the token id / token string exact.
+            # Allow bf16 rounding drift while keeping token identity exact.
             self.assertAlmostEqual(
                 logprob[0], expected[i][0], delta=0.1, msg=f"{logprob[0]} logprob is invalid"
             )

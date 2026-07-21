@@ -400,8 +400,7 @@ class TestAttention(CustomTestCase):
         if xai_temperature_len is not None and xai_temperature_len > 0:
             attn.xai_temperature_len = xai_temperature_len
 
-        # Keep the reference input replicated, but mirror the model's
-        # tensor-sharded attention-sink parameter at the backend boundary.
+        # Place only the backend sink on the model parameter layout.
         attention_sink_backend = (
             None
             if attention_sink is None
