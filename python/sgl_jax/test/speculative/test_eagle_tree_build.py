@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import jax
 import jax.numpy as jnp
 
 from sgl_jax.srt.speculative.eagle_util import (
@@ -244,6 +245,17 @@ class TestDraftDecodeMask(CustomTestCase):
             batch_size=2,
             speculative_num_steps=4,  # This was missing in the original provided content, inferring from number of score_list_raw elements
             mesh=mesh,
+        )
+        # Await the kernel so no async executable is left pending at process teardown.
+        jax.block_until_ready(
+            (
+                tree_mask,
+                position,
+                retrive_index,
+                retrive_next_token,
+                retrive_next_sibling,
+                draft_tokens,
+            )
         )
 
         print("=========== build tree kernel efficient ==========")
@@ -797,6 +809,7 @@ class TestDraftDecodeMask(CustomTestCase):
             batch_size,
             speculative_steps,
         )
+        jax.block_until_ready((parent_list, top_scores_index, draft_tokens))
 
         print("========== Preprocessing Test Results ==========")
         print(f"parent_list shape: {parent_list.shape}")
@@ -850,6 +863,7 @@ class TestDraftDecodeMask(CustomTestCase):
             speculative_num_steps=1,  # This was missing in the original provided content, inferring from number of score_list_raw elements
             mesh=mesh,
         )
+        jax.block_until_ready(result)
 
         (
             tree_mask,
