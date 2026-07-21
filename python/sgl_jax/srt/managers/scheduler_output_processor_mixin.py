@@ -31,6 +31,33 @@ logger = logging.getLogger(__name__)
 DEFAULT_FORCE_STREAM_INTERVAL = 50
 
 
+def _complete_precision_trace(req: Req) -> None:
+    if not precision_tracer.get_trace_active():
+        return
+
+    precision_tracer.set_request_status_to_completed(req.rid)
+    precision_tracer.add_completed_requests_count()
+    precision_tracer.set_end_time_and_duration(req.rid)
+    logger.info(
+        "Request trace completed (%d/%d): %s",
+        precision_tracer.get_completed_requests_count(),
+        precision_tracer.get_max_requests(),
+        req.rid,
+    )
+    if precision_tracer.get_completed_requests_count() >= precision_tracer.get_max_requests():
+        precision_tracer.stop_trace()
+
+
+def _num_input_logprobs(
+    req_idx: int,
+    extend_input_len_per_req: list[int] | None,
+    extend_logprob_start_len_per_req: list[int] | None,
+) -> int:
+    assert extend_input_len_per_req is not None
+    assert extend_logprob_start_len_per_req is not None
+    return extend_input_len_per_req[req_idx] - extend_logprob_start_len_per_req[req_idx]
+
+
 def _input_logprob_lens_per_dp(batch: ScheduleBatch) -> list[int] | None:
     if not batch.forward_mode.is_extend():
         return None
@@ -77,6 +104,25 @@ class SchedulerOutputProcessorMixin:
     This class implements the output processing logic for Scheduler.
     We put them into a separate file to make the `scheduler.py` shorter.
     """
+
+    def _finalize_chunked_abort(self: Scheduler, req: Req, dp_rank: int) -> None:
+        assert self.chunked_reqs[dp_rank] is req
+        assert self._pending_chunked_abort_reqs[dp_rank] is req
+        assert req.is_chunked == 0
+        req.check_finished()
+        assert req.finished(), f"Chunked abort did not finish request {req.rid}"
+        _complete_precision_trace(req)
+        self._release_prefill_host_buffer(req)
+        release_kv_cache(
+            req,
+            self.tree_cache,
+            is_insert=False,
+            allow_overallocated=(
+                self.spec_algorithm is not None and not self.spec_algorithm.is_none()
+            ),
+        )
+        self.chunked_reqs[dp_rank] = None
+        self._pending_chunked_abort_reqs[dp_rank] = None
 
     def maybe_collect_routed_experts(self: Scheduler, req: Req):
         """Collect routed experts for a finished request."""
@@ -183,21 +229,7 @@ class SchedulerOutputProcessorMixin:
                     req.check_finished()
                     if req.finished():
                         self.maybe_collect_routed_experts(req)
-                        if precision_tracer.get_trace_active():
-                            precision_tracer.set_request_status_to_completed(req.rid)
-                            precision_tracer.add_completed_requests_count()
-                            precision_tracer.set_end_time_and_duration(req.rid)
-                            logger.info(
-                                "Request trace completed (%d/%d): %s",
-                                precision_tracer.get_completed_requests_count(),
-                                precision_tracer.get_max_requests(),
-                                req.rid,
-                            )
-                            if (
-                                precision_tracer.get_completed_requests_count()
-                                >= precision_tracer.get_max_requests()
-                            ):
-                                precision_tracer.stop_trace()
+                        _complete_precision_trace(req)
                         release_kv_cache(
                             req,
                             self.tree_cache,
@@ -217,11 +249,11 @@ class SchedulerOutputProcessorMixin:
                         req.output_token_logprobs_idx.append(next_token_id)
 
                     if req.return_logprob:
-                        assert extend_logprob_start_len_per_req is not None
-                        assert extend_input_len_per_req is not None
-                        extend_logprob_start_len = extend_logprob_start_len_per_req[req_idx]
-                        extend_input_len = extend_input_len_per_req[req_idx]
-                        num_input_logprobs = extend_input_len - extend_logprob_start_len
+                        num_input_logprobs = _num_input_logprobs(
+                            req_idx,
+                            extend_input_len_per_req,
+                            extend_logprob_start_len_per_req,
+                        )
                         self.add_logprob_return_values(
                             req_idx,
                             req,
@@ -264,26 +296,42 @@ class SchedulerOutputProcessorMixin:
                 else:
                     # being chunked reqs' prefill is not finished
                     req.is_chunked -= 1
-                    # On dp>1, multiple reqs (one per dp rank) can be chunked
-                    # in the same batch; collect all so stream_output skips them.
-                    skip_stream_reqs.add(id(req))
-
-                    # Incrementally update input logprobs.
-                    if req.return_logprob:
-                        extend_logprob_start_len = extend_logprob_start_len_per_req[req_idx]
-                        extend_input_len = extend_input_len_per_req[req_idx]
-                        if extend_logprob_start_len < extend_input_len:
-                            # Update input logprobs.
-                            num_input_logprobs = extend_input_len - extend_logprob_start_len
-                            self.add_input_logprob_return_values(
+                    if self._pending_chunked_abort_reqs[dp_rank] is req:
+                        assert req.to_finish is not None
+                        if req.return_logprob:
+                            # An aborted partial prefill has no complete prompt logprobs to emit.
+                            req.input_logprob_sent = True
+                            num_input_logprobs = _num_input_logprobs(
                                 req_idx,
-                                req,
-                                logits_output,
-                                logprob_pt,
-                                num_input_logprobs,
-                                last_prefill_chunk=False,
+                                extend_input_len_per_req,
+                                extend_logprob_start_len_per_req,
                             )
-                            logprob_pt += num_input_logprobs
+                            if num_input_logprobs > 0:
+                                logprob_pt += num_input_logprobs
+                        self._finalize_chunked_abort(req, dp_rank)
+                    else:
+                        # On dp>1, multiple reqs (one per dp rank) can be chunked
+                        # in the same batch; collect all so stream_output skips them.
+                        skip_stream_reqs.add(id(req))
+
+                        # Incrementally update input logprobs.
+                        if req.return_logprob:
+                            num_input_logprobs = _num_input_logprobs(
+                                req_idx,
+                                extend_input_len_per_req,
+                                extend_logprob_start_len_per_req,
+                            )
+                            if num_input_logprobs > 0:
+                                # Update input logprobs.
+                                self.add_input_logprob_return_values(
+                                    req_idx,
+                                    req,
+                                    logits_output,
+                                    logprob_pt,
+                                    num_input_logprobs,
+                                    last_prefill_chunk=False,
+                                )
+                                logprob_pt += num_input_logprobs
                 req_idx += 1
 
         batch.cache_miss_count = cache_miss_count
@@ -461,22 +509,7 @@ class SchedulerOutputProcessorMixin:
                         # kv_allocated_len as the allocation upper bound and let
                         # release_kv_cache free the overallocated tail.
                         req.kv_committed_len -= 1
-                    # End trace for finished request
-                    if precision_tracer.get_trace_active():
-                        precision_tracer.set_request_status_to_completed(req.rid)
-                        precision_tracer.add_completed_requests_count()
-                        precision_tracer.set_end_time_and_duration(req.rid)
-                        logger.info(
-                            "Request trace completed (%d/%d): %s",
-                            precision_tracer.get_completed_requests_count(),
-                            precision_tracer.get_max_requests(),
-                            req.rid,
-                        )
-                        if (
-                            precision_tracer.get_completed_requests_count()
-                            >= precision_tracer.get_max_requests()
-                        ):
-                            precision_tracer.stop_trace()
+                    _complete_precision_trace(req)
                     release_kv_cache(
                         req,
                         self.tree_cache,

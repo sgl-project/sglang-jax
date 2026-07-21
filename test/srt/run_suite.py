@@ -306,6 +306,8 @@ suites = {
             0.2,
             runner="pytest",
         ),
+        TestFile("python/sgl_jax/test/test_scheduler_idle_check.py", 0.1),
+        TestFile("python/sgl_jax/test/test_scheduler_chunked_ownership.py", 0.1),
         TestFile("test/srt/test_dtype_config_llama.py", 1),
         TestFile("test/srt/test_dtype_config_consistency.py", 10),
         TestFile("python/sgl_jax/test/test_compilation_manager.py", 1),
@@ -424,7 +426,7 @@ suites = {
     "e2e-test-tpu-v6e-4": [
         TestFile("test/srt/openai_server/basic/test_tool_calls.py", 2),
         TestFile("test/srt/test_features.py", 3),
-        TestFile("test/srt/test_chunked_prefill_size.py", 2),
+        TestFile("test/srt/test_chunked_prefill_size.py", 6),
         # TestFile("test/srt/test_sliding_window_attention.py", 30), # add after gpt-oss supported
         TestFile("test/srt/test_logprobs_dp.py", 3),
         TestFile("test/srt/test_model_loader.py", 1),
