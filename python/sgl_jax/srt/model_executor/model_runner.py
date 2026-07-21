@@ -27,6 +27,7 @@ from sgl_jax.srt.layers.routed_experts_capturer import (
 )
 from sgl_jax.srt.layers.sampler import Sampler, compute_logprobs
 from sgl_jax.srt.lora.context_manager import LoraBatchContext
+from sgl_jax.srt.managers.mm_utils import general_mm_embed_routine
 from sgl_jax.srt.managers.schedule_batch import (
     GLOBAL_SERVER_ARGS_KEYS,
     global_server_args_dict,
@@ -683,6 +684,17 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         self.forward_pass_id += 1
         precision_tracer.start_batch_trace(forward_batch.bid)
         precision_tracer.set_current_forward_pass_id(self.forward_pass_id)
+        # In-model VLM path: a non-None mm_embed_plan means the scheduler chose
+        # the normal prefill vision path; here we just fuse embeddings before the
+        # backbone JIT.
+        if forward_batch.mm_embed_plan is not None:
+            general_mm_embed_routine(
+                input_ids=forward_batch.input_ids,
+                forward_batch=forward_batch,
+                language_model=self.model.model,
+                multimodal_model=self.model,
+                mm_embed_plan=forward_batch.mm_embed_plan,
+            )
         with jax.profiler.TraceAnnotation("_forward_raw"):
             ret = self._forward_raw(forward_batch, logits_metadata)
         return ret

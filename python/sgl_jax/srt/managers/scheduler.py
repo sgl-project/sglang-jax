@@ -58,6 +58,7 @@ from sgl_jax.srt.managers.schedule_batch import (
     FINISH_ABORT,
     Req,
     ScheduleBatch,
+    _extract_mm_value,
     acc_global_bid,
     global_server_args_dict,
 )
@@ -87,7 +88,11 @@ from sgl_jax.srt.model_executor.model_runner_kv_cache_mixin import (
 )
 from sgl_jax.srt.multimodal.tokenizer_utils import resolve_tokenizer_subdir
 from sgl_jax.srt.precision_tracer import precision_tracer
-from sgl_jax.srt.server_args import PortArgs, ServerArgs
+from sgl_jax.srt.server_args import (
+    PortArgs,
+    ServerArgs,
+    apply_multimodal_model_defaults,
+)
 from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
 from sgl_jax.srt.speculative.overlap_utils import (
     can_use_spec_decode_overlap,
@@ -189,13 +194,6 @@ class Scheduler(
         self.stream_interval = server_args.stream_interval
         self.max_seq_len = server_args.max_seq_len
         self.page_size = server_args.page_size
-        self.enable_overlap = not server_args.disable_overlap_schedule
-        if server_args.multimodal:
-            logger.info("Multimodal mode enabled, disabling overlap schedule")
-            self.enable_overlap = False
-        if server_args.disaggregation_mode != "null":
-            logger.info("PD disaggregation mode enabled, disabling overlap schedule")
-            self.enable_overlap = False
         self.spec_algorithm = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
 
         # PD disaggregation runtime attributes. They are populated by
@@ -274,6 +272,14 @@ class Scheduler(
 
         # Init tokenizer
         self.init_tokenizer()
+
+        self.enable_overlap = not server_args.disable_overlap_schedule
+        if server_args.multimodal:
+            logger.info("Multimodal mode enabled, disabling overlap schedule")
+            self.enable_overlap = False
+        if server_args.disaggregation_mode != "null":
+            logger.info("PD disaggregation mode enabled, disabling overlap schedule")
+            self.enable_overlap = False
 
         # Init grammar backend for structured output
         self.grammar_backend = None
@@ -629,6 +635,7 @@ class Scheduler(
     def init_tokenizer(self):
         server_args = self.server_args
         self.model_config = ModelConfig.from_server_args(server_args)
+        apply_multimodal_model_defaults(server_args, self.model_config)
         self.is_generation = self.model_config.is_generation
         if server_args.skip_tokenizer_init:
             self.tokenizer = self.processor = None
@@ -1278,16 +1285,18 @@ class Scheduler(
         req.disagg_transfer_id = recv_req.disagg_transfer_id or req.rid
         if hasattr(recv_req, "mm_inputs") and recv_req.mm_inputs:
             req.mm_inputs = recv_req.mm_inputs
-            multimodal_embedding = recv_req.mm_inputs.get("multimodal_embedding")
+            multimodal_embedding = _extract_mm_value(recv_req.mm_inputs, "multimodal_embedding")
             req.multimodal_embedding = multimodal_embedding
             if (
-                recv_req.mm_inputs.get("deepstack_visual_pos_mask") is not None
-                and recv_req.mm_inputs.get("deepstack_visual_embedding") is not None
+                _extract_mm_value(recv_req.mm_inputs, "deepstack_visual_pos_mask") is not None
+                and _extract_mm_value(recv_req.mm_inputs, "deepstack_visual_embedding") is not None
             ):
                 req.apply_for_deepstack = True
-                req.deepstack_visual_pos_mask = recv_req.mm_inputs.get("deepstack_visual_pos_mask")
-                req.deepstack_visual_embedding = recv_req.mm_inputs.get(
-                    "deepstack_visual_embedding"
+                req.deepstack_visual_pos_mask = _extract_mm_value(
+                    recv_req.mm_inputs, "deepstack_visual_pos_mask"
+                )
+                req.deepstack_visual_embedding = _extract_mm_value(
+                    recv_req.mm_inputs, "deepstack_visual_embedding"
                 )
         # Validate prompt length
         error_msg = validate_input_length(

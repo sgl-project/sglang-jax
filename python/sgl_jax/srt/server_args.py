@@ -31,6 +31,26 @@ GRAMMAR_BACKEND_CHOICES = ["llguidance", "none"]
 _REJECTED_PD_HOST_ALIASES = frozenset({"localhost"})
 
 
+def apply_multimodal_model_defaults(server_args, model_config) -> None:
+    if not model_config.is_multimodal:
+        return
+
+    if not server_args.disable_radix_cache:
+        logger.info("Multimodal model detected, disabling radix cache")
+        server_args.disable_radix_cache = True
+    if not server_args.disable_overlap_schedule:
+        logger.info("Multimodal model detected, disabling overlap schedule")
+        server_args.disable_overlap_schedule = True
+    if server_args.chunked_prefill_size is None or server_args.chunked_prefill_size > 0:
+        logger.info("Multimodal model detected, disabling chunked prefill")
+        server_args.chunked_prefill_size = -1
+    if server_args.enable_mixed_chunk:
+        logger.info("Multimodal model detected, disabling mixed chunk")
+        server_args.enable_mixed_chunk = False
+    if server_args.limit_mm_data_per_request is None:
+        server_args.limit_mm_data_per_request = {"image": 16}
+
+
 def _validate_disaggregation_host_ip(host_ip: str) -> str:
     if host_ip in _REJECTED_PD_HOST_ALIASES:
         raise ValueError(
@@ -229,6 +249,7 @@ class ServerArgs:
 
     # Multimodal
     multimodal: bool = False
+    limit_mm_data_per_request: dict[str, int] | None = None
 
     enable_return_routed_experts: bool = False
     enable_expert_balance_debug: bool = False
@@ -492,6 +513,8 @@ class ServerArgs:
             self.device_indexes = None
         if self.multimodal:
             self.model_path = download_from_hf(self.model_path, allow_patterns=None)
+            if self.limit_mm_data_per_request is None:
+                self.limit_mm_data_per_request = {"image": 16}
 
         if self.ep_num_redundant_experts < 0:
             raise ValueError("ep_num_redundant_experts must be non-negative")
@@ -1504,6 +1527,12 @@ class ServerArgs:
             "--multimodal",
             action="store_true",
             help="Enable multimodal HTTP server.",
+        )
+        parser.add_argument(
+            "--limit-mm-data-per-request",
+            type=json.loads,
+            default=ServerArgs.limit_mm_data_per_request,
+            help="JSON object that limits the number of multimodal items per request, e.g. '{\"image\": 16}'.",
         )
 
         # LoRA

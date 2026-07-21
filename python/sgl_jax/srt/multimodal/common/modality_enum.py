@@ -205,6 +205,11 @@ class MultimodalDataItem:
     def set(self, key: str, value: Any):
         self.__setitem__(key, value)
 
+    def get(self, key: str, default: Any = None) -> Any:
+        if key in self.__dataclass_fields__ and key != "model_specific_data":
+            return getattr(self, key)
+        return self.model_specific_data.get(key, default)
+
     @staticmethod
     def is_empty_list(lst):
         if lst is None:
@@ -251,8 +256,22 @@ class MultimodalDataItem:
         kwargs = dict(obj)
         modality = kwargs.pop("modality")
         if isinstance(modality, str):
-            modality = Modality[modality]
-        ret = MultimodalDataItem(modality=modality, **kwargs)
+            modality = Modality.from_str(modality)
+
+        field_names = set(MultimodalDataItem.__dataclass_fields__)
+        model_specific_data = dict(kwargs.pop("model_specific_data", {}) or {})
+        item_kwargs = {}
+        for key, value in kwargs.items():
+            if key in field_names and key != "model_specific_data":
+                item_kwargs[key] = value
+            else:
+                model_specific_data[key] = value
+
+        ret = MultimodalDataItem(
+            modality=modality,
+            model_specific_data=model_specific_data,
+            **item_kwargs,
+        )
         ret.validate()
         return ret
 
@@ -284,6 +303,7 @@ class MultimodalInputs:
 
     # List of data items
     mm_items: list[MultimodalDataItem]
+    input_ids: list[int] | None = None
     image_pad_len: list | None = None
     num_image_tokens: int | None = None
 

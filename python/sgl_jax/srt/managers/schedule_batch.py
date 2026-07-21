@@ -31,6 +31,7 @@ from jax._src import mesh as mesh_lib
 
 from sgl_jax.global_config import global_config
 from sgl_jax.srt.configs.model_config import ModelConfig
+from sgl_jax.srt.managers.mm_utils import build_mm_embed_plan
 from sgl_jax.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
@@ -51,6 +52,8 @@ from sgl_jax.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPo
 from sgl_jax.srt.mem_cache.radix_cache import RadixKey
 from sgl_jax.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
+from sgl_jax.srt.multimodal.common.mm_plan import MultimodalEmbedPlan
+from sgl_jax.srt.multimodal.common.modality_enum import MultimodalInputs
 from sgl_jax.srt.precision_tracer import (
     PrecisionTracerRequestMetadata,
     precision_tracer,
@@ -200,8 +203,8 @@ class Req:
         # Used for radix cache matching to differentiate different images/videos
         # If None, origin_input_ids is used for cache matching
         self.cache_input_ids: list[int] | None = None
-        # Multimodal inputs (e.g., mrope positions) from tokenizer
-        self.mm_inputs: dict | None = None
+        # Multimodal inputs (e.g., image items and mrope positions) from tokenizer.
+        self.mm_inputs: MultimodalInputs | dict | None = None
 
         # Each decode stage's output ids
         self.output_ids = []
@@ -975,6 +978,19 @@ class ScheduleBatch:
     @property
     def batch_is_full(self) -> bool:
         return all(info.batch_is_full for info in self.reqs_info)
+
+    def contains_mm_inputs(self) -> bool:
+        """Whether any request in this batch carries multimodal inputs.
+
+        Mirrors the per-req mm detection used by ``_merge_multimodal`` /
+        ``build_mm_embed_plan`` so pure-text batches skip all multimodal work.
+        """
+        return any(
+            getattr(req, "mm_inputs", None) is not None
+            for info in self.reqs_info
+            if info.reqs
+            for req in info.reqs
+        )
 
     def batch_size(self) -> int:
         """Get total number of requests across all DP ranks."""
@@ -2128,9 +2144,8 @@ class ScheduleBatch:
         is_decode = self.forward_mode.is_decode()
 
         has_mrope = any(
-            _extract_mm_value(getattr(req, "mm_inputs", None), "mrope_positions") is not None
-            or _extract_mm_value(getattr(req, "mm_inputs", None), "mrope_position_delta")
-            is not None
+            _extract_mm_value(req.mm_inputs, "mrope_positions") is not None
+            or _extract_mm_value(req.mm_inputs, "mrope_position_delta") is not None
             for info in self.reqs_info
             if info.reqs
             for req in info.reqs
@@ -2163,9 +2178,7 @@ class ScheduleBatch:
                 if mrope is not None:
                     for req, seq_len in zip(info.reqs, info.seq_lens):
                         base_pos = int(seq_len) - 1
-                        delta = _extract_mm_value(
-                            getattr(req, "mm_inputs", None), "mrope_position_delta"
-                        )
+                        delta = _extract_mm_value(req.mm_inputs, "mrope_position_delta")
                         if delta is not None:
                             base_pos += _as_int_scalar(delta)
                         mrope[:, offset + local] = base_pos
@@ -2192,9 +2205,7 @@ class ScheduleBatch:
 
                 # mrope_positions: 3-D positions, slice with fallback.
                 if mrope is not None:
-                    mm_positions = _extract_mm_value(
-                        getattr(req, "mm_inputs", None), "mrope_positions"
-                    )
+                    mm_positions = _extract_mm_value(req.mm_inputs, "mrope_positions")
                     if mm_positions is None:
                         # Text-only req in a mixed mrope batch: 1-D positions
                         # broadcast to 3 rows (T==H==W), matching the model's
@@ -2204,9 +2215,7 @@ class ScheduleBatch:
                     else:
                         mchunk = np.asarray(mm_positions)[:, start : start + ext_len]
                         if mchunk.size == 0:
-                            delta = _extract_mm_value(
-                                getattr(req, "mm_inputs", None), "mrope_position_delta"
-                            )
+                            delta = _extract_mm_value(req.mm_inputs, "mrope_position_delta")
                             base = np.arange(start, start + ext_len, dtype=np.int32)
                             if delta is not None:
                                 base = base + _as_int_scalar(delta)
@@ -3043,6 +3052,18 @@ class ScheduleBatch:
         mrope_positions = _mm["mrope_positions"]
         apply_for_deepstack = _mm["apply_for_deepstack"]
         deepstack_visual_embedding = _mm["deepstack_visual_embedding"]
+        # Build the vision encode/merge plan only for ordinary prefill. Other
+        # forward modes leave the plan unset, and the runner treats a non-None
+        # plan as the sole vision-forward signal.
+        if self.contains_mm_inputs() and self.forward_mode == ForwardMode.EXTEND:
+            mm_embed_plan = build_mm_embed_plan(
+                self.reqs_info,
+                self.dp_size,
+                self.model_config,
+                per_dp_token_padding,
+            )
+        else:
+            mm_embed_plan = None
 
         # Merge per-DP top_logprobs_nums / token_ids_logprobs with the same
         # offset_bs += per_dp_bs_padding padding scheme used in _merge_batch_metadata.
@@ -3147,6 +3168,7 @@ class ScheduleBatch:
             per_dp_bs_size=per_dp_bs_padding,
             launch_done=self.launch_done,
             input_embedding=input_embedding,
+            mm_embed_plan=mm_embed_plan,
             apply_for_deepstack=apply_for_deepstack,
             deepstack_visual_embedding=deepstack_visual_embedding,
             recurrent_indices=recurrent_indices_cpu,
@@ -3599,6 +3621,9 @@ class ModelWorkerBatch:
     tree_cache: BasePrefixCache = None
 
     input_embedding: np.ndarray | None = None
+    # In-model VLM owning-rank DP embed plan (host-side). Array leaves get
+    # device_put in ForwardBatch.init_new; never a backbone-JIT pytree child.
+    mm_embed_plan: MultimodalEmbedPlan | None = None
     apply_for_deepstack: bool = False
     deepstack_visual_embedding: np.ndarray | None = None
 

@@ -8,7 +8,10 @@ from typing import TYPE_CHECKING, Any, Literal
 import numpy as np
 
 from sgl_jax.srt.managers.schedule_batch import BaseFinishReason
-from sgl_jax.srt.multimodal.common.modality_enum import flatten_nested_list
+from sgl_jax.srt.multimodal.common.modality_enum import (
+    MultimodalInputs,
+    flatten_nested_list,
+)
 
 # Handle serialization of Image for pydantic
 if TYPE_CHECKING:
@@ -164,7 +167,7 @@ class TokenizedGenerateReqInput:
     # whether to return hidden states
     return_hidden_states: bool = False
     # multimodal inputs (e.g., mrope positions, embeddings)
-    mm_inputs: dict | None = None
+    mm_inputs: MultimodalInputs | dict | None = None
     # The data parallel rank for this request
     dp_rank: int | None = None
     # PD disaggregation routing keys.
@@ -545,6 +548,10 @@ class GenerateReqInput:
         return GenerateReqInput(
             text=self.text[i] if self.text is not None else None,
             input_ids=self.input_ids[i] if self.input_ids is not None else None,
+            input_embeds=self.input_embeds[i] if self.input_embeds is not None else None,
+            image_data=self.image_data[i] if self.image_data is not None else None,
+            video_data=self.video_data[i] if self.video_data is not None else None,
+            audio_data=self.audio_data[i] if self.audio_data is not None else None,
             sampling_params=self.sampling_params[i],
             rid=self.rid[i],
             return_logprob=self.return_logprob[i],
