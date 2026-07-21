@@ -18,7 +18,6 @@ from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.kernels.speculative.kernel import top_k_renorm_prob, top_p_renorm_prob
 from sgl_jax.srt.sampling.sampling_params import TOP_K_ALL
-from sgl_jax.srt.speculative.base_worker import populate_speculative_output_logprobs
 from sgl_jax.srt.speculative.relay_buffer import (
     gather_spec_relay_buffers,
     make_dp_valid_mask,
