@@ -116,8 +116,11 @@ class ModelWorkerClient:
             if not model_worker_batch:
                 break
 
-            if self.worker._pd_fuse_sample:
+            if self.worker._pd_fuse_for_batch(model_worker_batch):
                 # Fused path: resolve/set_future are inlined into the single jit.
+                # Batch-level check (not the worker flag): logprob batches take
+                # the regular 3-tuple path inside forward_batch_generation, so
+                # selecting the fused 4-tuple unpack here would crash on them.
                 with jax.profiler.TraceAnnotation(
                     f"forward_batch_generation {model_worker_batch.bid}"
                 ):

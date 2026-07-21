@@ -961,9 +961,7 @@ class PathwaysPDSchedulerMixin:
                 continue
             # Token gate blocks NEW admissions only; a P slice with a pending
             # chunked req still builds so chunk-N+1 can complete and migrate
-            # (its footprint is already in the ledger from chunk-1). The
-            # builder may admit new reqs alongside a continuation -- bounded
-            # overshoot, see _pd_token_gate_closed docstring.
+            # (its footprint is already in the ledger from chunk-1).
             if gate_closed and not any(r is not None for r in self.p_chunked_reqs[i]):
                 continue
             self._pd_next_p = (i + 1) % n_p
@@ -986,7 +984,20 @@ class PathwaysPDSchedulerMixin:
             )
             try:
                 with self._pd_swap_p_pool(i):
-                    new_batch = self.get_new_batch_prefill()
+                    if gate_closed:
+                        # Chunk-continuation only: hide the waiting queue so
+                        # the builder cannot admit new reqs from ANY dp rank
+                        # while the gate is closed (with dp>1, ranks without a
+                        # chunk would otherwise fill their slots from the
+                        # queue, leaking admissions past the gate).
+                        _saved_q = self.waiting_queue
+                        self.waiting_queue = []
+                        try:
+                            new_batch = self.get_new_batch_prefill()
+                        finally:
+                            self.waiting_queue = _saved_q
+                    else:
+                        new_batch = self.get_new_batch_prefill()
             finally:
                 self.per_dp_max_running_requests = saved
             if new_batch is None:

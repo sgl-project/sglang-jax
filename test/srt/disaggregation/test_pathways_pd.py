@@ -705,3 +705,28 @@ def test_token_gate_env_escape(monkeypatch):
     fake = _FakeGateSelf(d_allocs=[_FakeMinOnlyAlloc({0: 0})])
     PathwaysPDSchedulerMixin._pd_track_inflight(fake, _FakeReq("r1", 400))
     assert not PathwaysPDSchedulerMixin._pd_token_gate_closed(fake)
+
+
+def test_fuse_for_batch_is_batch_level():
+    """Fused-sample eligibility must consider the batch's logprob flags, not
+    just the worker flag -- the overlap client picks its unpack arity from
+    this predicate (#1469 review)."""
+    from types import SimpleNamespace as _NS
+
+    from sgl_jax.srt.managers.tp_worker import ModelWorker
+
+    w = ModelWorker.__new__(ModelWorker)
+    w._pd_fuse_sample = True
+    dec = _NS(is_decode=lambda: True)
+    ext = _NS(is_decode=lambda: False)
+    plain = _NS(return_logprob=False, return_output_logprob_only=False, forward_mode=dec)
+    lp = _NS(return_logprob=True, return_output_logprob_only=False, forward_mode=dec)
+    olp = _NS(return_logprob=False, return_output_logprob_only=True, forward_mode=dec)
+    prefill = _NS(return_logprob=False, return_output_logprob_only=False, forward_mode=ext)
+    assert w._pd_fuse_for_batch(plain)
+    assert not w._pd_fuse_for_batch(lp)
+    assert not w._pd_fuse_for_batch(olp)
+    # the PD prefill thread's EXTEND batches must never take the fused path
+    assert not w._pd_fuse_for_batch(prefill)
+    w._pd_fuse_sample = False
+    assert not w._pd_fuse_for_batch(plain)
