@@ -21,6 +21,12 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(_NIGHTLY_DIR)))
 
 from cases import AccuracyCase, BenchCase, PerfCase  # noqa: E402
 
+_BENCH_EXIT_KINDS = {
+    10: "infra",
+    20: "threshold",
+    30: "case",
+}
+
 
 def run_eval_for_case(case: AccuracyCase, base_url: str):
     """Drive ``run_eval`` for one case against a live server at ``base_url``.
@@ -111,12 +117,13 @@ def run_bench_for_case(
 
     Builds ``python <repo>/<script> [--server-url ...] [--compare ...] <argv>
     [--output-json ...]`` and runs it from the repo root with inherited stdio (so
-    a long sweep streams live to the CI log). The bench owns its own gate
-    (``--strict`` / a knee assert); this maps ``returncode != 0`` to a tagged
-    ``threshold`` failure. A dashboard record is written to ``$RESULTS_DIR``.
+    a long sweep streams live to the CI log). The bench owns its own gate and
+    uses the suite's tagged exit codes (infra=10, threshold=20, case=30).
+    Unknown nonzero exits are treated as case crashes. A dashboard record is
+    written to ``$RESULTS_DIR``.
 
-    Returns ``(result, fail)`` where ``fail`` is ``None`` on pass or
-    ``("threshold", msg)`` on a nonzero exit, matching the other case drivers.
+    Returns ``(result, fail)`` where ``fail`` is ``None`` on pass or a tagged
+    ``(kind, message)`` tuple, matching the other case drivers.
     """
     from results import write_result
 
@@ -140,7 +147,12 @@ def run_bench_for_case(
         cmd += ["--output-json", os.path.join(results_dir, case.output_json)]
 
     print(f"[bench-runner] {case.name}: {' '.join(cmd)}", flush=True)
-    rc = subprocess.run(cmd, cwd=_REPO_ROOT).returncode
+    timed_out = False
+    try:
+        rc = subprocess.run(cmd, cwd=_REPO_ROOT, timeout=case.timeout).returncode
+    except subprocess.TimeoutExpired:
+        rc = None
+        timed_out = True
 
     result = {
         "type": "bench",
@@ -149,10 +161,19 @@ def run_bench_for_case(
         "server": case.server,
         "argv": list(case.argv),
         "returncode": rc,
-        "passed": rc == 0,
+        "timeout": case.timeout,
+        "timed_out": timed_out,
+        "passed": not timed_out and rc == 0,
     }
     write_result(result, case.name)
 
-    fail = None if rc == 0 else ("threshold", f"{case.name}: bench exited {rc} (see logs)")
-    print(f"[bench-runner] {case.name}: {'PASS' if rc == 0 else 'FAIL'} (exit {rc})", flush=True)
+    if timed_out:
+        fail = ("infra", f"{case.name}: bench timed out after {case.timeout}s")
+    elif rc == 0:
+        fail = None
+    else:
+        kind = _BENCH_EXIT_KINDS.get(rc, "case")
+        fail = (kind, f"{case.name}: bench exited {rc} (see logs)")
+    status = "PASS" if fail is None else f"FAIL ({fail[0]})"
+    print(f"[bench-runner] {case.name}: {status} (exit {rc})", flush=True)
     return result, fail

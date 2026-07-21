@@ -94,6 +94,7 @@ class SelfLaunchRun:
 class SingleHostSuite:
     name: str
     runs: list[SingleHostRun | SelfLaunchRun]
+    expose_in_caselist: bool = True
 
 
 def _gsm8k_case(name: str, model_id: str, threshold: float, eval_batch_size: int) -> AccuracyCase:
@@ -168,6 +169,35 @@ def _ablation_case(label: str, dp: int, ep: int) -> BenchCase:
             "0.1",
             "--mooncake-num-rounds",
             "2",
+        ),
+    )
+
+
+def _recurrent_ab_measurement(config: str, output_json: str) -> BenchCase:
+    """Run one side of the recurrent A/B against a profile-launched server."""
+    return BenchCase(
+        name=f"recurrent-ab-{config}",
+        case_key="recurrent-ab",
+        script="benchmark/hicache/bench_unified_radix_ab.py",
+        server="runner",
+        output_json=output_json,
+        timeout=30 * 60,
+        argv=(
+            "--model",
+            "Qwen/Qwen3.5-35B-A3B",
+            "--configs",
+            config,
+            "--workloads",
+            "gsp",
+            "random",
+            "--parallel",
+            "16",
+            "--num-prompts",
+            "64",
+            "--repeats",
+            "3",
+            "--drop-first",
+            "1",
         ),
     )
 
@@ -294,58 +324,35 @@ SUITES: dict[str, SingleHostSuite] = {
     ),
     # Recurrent A/B perf gate: no-cache vs
     # unified-recurrent on the GDN-hybrid Qwen3.5-35B-A3B, single-host dp=1 tp=4.
-    # The A/B bench self-launches both servers sequentially (one pod), so the run
-    # carries no launch_profile; its own --strict gate fires the soft targets
+    # Each side runs client-only against a profile-launched server; the final
+    # offline case merges their JSON and applies the --strict soft targets
     # (gsp p50-TTFT < 0.9x no-cache; random throughput >= 0.95x no-cache). Server
     # knobs mirror the page-128 extra-buffer determinism e2e (context bounded so
     # the 35B leaves a positive KV budget; bs-paddings divisible by tp*t_packing).
     "recurrent-ab-perf-v6e-4": SingleHostSuite(
         name="recurrent-ab-perf-v6e-4",
         runs=[
+            SingleHostRun(
+                launch_profile="recurrent-qwen35-ab-no-cache-v6e-4.yaml",
+                cases=[_recurrent_ab_measurement("no-cache", "recurrent_ab_no_cache.json")],
+            ),
+            SingleHostRun(
+                launch_profile="recurrent-qwen35-ab-unified-v6e-4.yaml",
+                cases=[_recurrent_ab_measurement("unified-recurrent", "recurrent_ab_unified.json")],
+            ),
             SelfLaunchRun(
                 cases=[
                     BenchCase(
-                        name="recurrent-ab",
+                        name="recurrent-ab-compare",
+                        case_key="recurrent-ab",
                         script="benchmark/hicache/bench_unified_radix_ab.py",
-                        server="self",
-                        output_json="recurrent_ab.json",
-                        argv=(
-                            "--model",
-                            "Qwen/Qwen3.5-35B-A3B",
-                            "--tp-size",
-                            "4",
-                            "--page-size",
-                            "128",
-                            "--context-length",
-                            "8192",
-                            "--max-running-requests",
-                            "16",
-                            "--chunked-prefill-size",
-                            "512",
-                            "--max-recurrent-state-size",
-                            "96",
-                            "--mem-fraction-static",
-                            "0.8",
-                            "--configs",
-                            "no-cache",
-                            "unified-recurrent",
-                            "--workloads",
-                            "gsp",
-                            "random",
-                            "--parallel",
-                            "16",
-                            "--num-prompts",
-                            "64",
-                            "--repeats",
-                            "3",
-                            "--drop-first",
-                            "1",
-                            "--disable-overlap-schedule",
-                            "--precompile-bs-paddings",
-                            "8",
-                            "16",
-                            "--strict",
+                        server="none",
+                        compare_inputs=(
+                            "recurrent_ab_no_cache.json",
+                            "recurrent_ab_unified.json",
                         ),
+                        timeout=60,
+                        argv=("--strict",),
                     ),
                 ],
             ),
@@ -371,6 +378,7 @@ SUITES: dict[str, SingleHostSuite] = {
                         script="benchmark/hicache/bench_recurrent_reuse_sweep.py",
                         server="runner",
                         output_json="reuse_cache_aware.json",
+                        timeout=60 * 60,
                         argv=(
                             "--parallel",
                             "8",
@@ -393,6 +401,7 @@ SUITES: dict[str, SingleHostSuite] = {
                         script="benchmark/hicache/bench_recurrent_reuse_sweep.py",
                         server="runner",
                         output_json="reuse_min_running.json",
+                        timeout=60 * 60,
                         argv=(
                             "--parallel",
                             "8",
@@ -415,6 +424,7 @@ SUITES: dict[str, SingleHostSuite] = {
     # — heavy (several cold 35B loads), run on demand.
     "recurrent-ablation-v6e-4": SingleHostSuite(
         name="recurrent-ablation-v6e-4",
+        expose_in_caselist=False,
         runs=[
             SelfLaunchRun(
                 cases=[
@@ -553,8 +563,14 @@ def _eval_cases(cases, spec, profile) -> None:
 
     if failures:
         kinds = {kind for kind, _ in failures}
-        # A case-crash dominates a threshold miss: surface the bug.
-        kind = "case" if "case" in kinds else "threshold"
+        # Infra dominates because it is retryable; otherwise a case crash dominates
+        # a threshold miss so the bug is not reported as a model regression.
+        if "infra" in kinds:
+            kind = "infra"
+        elif "case" in kinds:
+            kind = "case"
+        else:
+            kind = "threshold"
         raise SuiteError(kind=kind, message="; ".join(msg for _, msg in failures))
 
 
@@ -608,7 +624,9 @@ def run_suite(suite: SingleHostSuite) -> int:
                 run_self_launch(run)
         except SuiteError as exc:
             _log(f"{label}: FAIL ({exc.kind}) — {exc}")
-            if exc.kind == "threshold":
+            if exc.kind == "infra":
+                had_infra = True
+            elif exc.kind == "threshold":
                 had_threshold = True
             else:
                 had_crash = True
@@ -657,11 +675,18 @@ def _caselist() -> list[dict]:
     """
     out: list[dict] = []
     for suite_name, suite in SUITES.items():
+        if not suite.expose_in_caselist:
+            continue
+        seen: set[str] = set()
         for run in suite.runs:
             for case in run.cases:
                 if getattr(case, "capture_trace", True) is False:
                     continue
-                out.append({"suite": suite_name, "case": case.name})
+                case_key = getattr(case, "case_key", None) or case.name
+                if case_key in seen:
+                    continue
+                seen.add(case_key)
+                out.append({"suite": suite_name, "case": case_key})
     return out
 
 
@@ -687,13 +712,13 @@ def _select_cases(suite: SingleHostSuite, cases: str | None) -> SingleHostSuite:
     want = {c.strip() for c in cases.split(",") if c.strip()}
     selected: list[SingleHostRun | SelfLaunchRun] = []
     for run in suite.runs:
-        keep = tuple(c for c in run.cases if c.name in want)
+        keep = tuple(c for c in run.cases if (getattr(c, "case_key", None) or c.name) in want)
         if keep:
             if isinstance(run, SingleHostRun):
                 selected.append(SingleHostRun(launch_profile=run.launch_profile, cases=keep))
             else:
                 selected.append(SelfLaunchRun(cases=keep))
-    found = {c.name for run in selected for c in run.cases}
+    found = {getattr(c, "case_key", None) or c.name for run in selected for c in run.cases}
     missing = want - found
     if missing:
         raise SystemExit(f"unknown case_key(s): {sorted(missing)}")

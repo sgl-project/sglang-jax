@@ -7,7 +7,7 @@ model_path: Qwen/Qwen3.5-35B-A3B
 tp_size: 4
 dp_size: 2
 ep_size: 4
-port: 30051
+port: 30055
 check_cache_miss: false  # dynamic-shape reuse-sweep
 server_args:
   - --trust-remote-code

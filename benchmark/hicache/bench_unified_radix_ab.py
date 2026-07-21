@@ -70,6 +70,8 @@ CONFIG_ARGS = {
     ],
 }
 
+EXIT_THRESHOLD = 20
+
 
 def parse_args():
     p = argparse.ArgumentParser(
@@ -728,7 +730,7 @@ def main():
                 "or radix/* + unified/*). Supply both result JSONs."
             )
         if args.strict and (not ok or fired == 0):
-            raise SystemExit(1)
+            raise SystemExit(EXIT_THRESHOLD)
         return
 
     # Resolve the model against the test model cache (SGLANG_JAX_MODEL_CACHE) like
@@ -771,7 +773,7 @@ def main():
         print(f"\nWrote results to {args.output_json}")
 
     if args.strict and not all_pass:
-        raise SystemExit(1)
+        raise SystemExit(EXIT_THRESHOLD)
 
 
 if __name__ == "__main__":

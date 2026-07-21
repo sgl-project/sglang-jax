@@ -1,0 +1,38 @@
+name: qwen3_5_a3b-recurrent-ab-unified-tp4
+target: v6e-4
+model_path: Qwen/Qwen3.5-35B-A3B
+tp_size: 4
+dp_size: 1
+port: 30057
+check_cache_miss: false
+server_args:
+  - --trust-remote-code
+  - --skip-server-warmup
+  - --dtype
+  - bfloat16
+  - --random-seed
+  - "3"
+  - --mem-fraction-static
+  - "0.8"
+  - --max-running-requests
+  - "16"
+  - --page-size
+  - "128"
+  - --attention-backend
+  - fa
+  - --download-dir
+  - /dev/shm/
+  - --context-length
+  - "8192"
+  - --chunked-prefill-size
+  - "512"
+  - --max-recurrent-state-size
+  - "96"
+  - --disable-overlap-schedule
+  - --enable-unified-radix-tree
+  - --enable-recurrent-extra-buffer
+  - --precompile-bs-paddings
+  - "8"
+  - "16"
+  - --precompile-token-paddings
+  - "2048"

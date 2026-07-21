@@ -35,6 +35,9 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__f
 _SINGLE_HOST_SUITE_JOBS = {
     "accuracy-text-models-v6e-4": "nightly-test-accuracy-text-models-4-tpu-daily",
     "perf-text-models-v6e-4": "nightly-test-perf-text-models-4-tpu-daily",
+    "recurrent-ab-perf-v6e-4": "nightly-recurrent-ab-perf-4-tpu-daily",
+    "recurrent-cache-aware-v6e-4": "nightly-recurrent-cache-aware-4-tpu-daily",
+    "recurrent-accuracy-v6e-4": "nightly-recurrent-accuracy-4-tpu-daily",
 }
 # Multi-host (the mimo-flash suite) is intentionally NOT wired into /run-nightly: its
 # nightly job stays `if: false` until multi-host CI has 4-node v6e capacity. To enable

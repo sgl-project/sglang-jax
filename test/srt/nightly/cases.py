@@ -165,9 +165,9 @@ class BenchCase:
 
     Unlike ``PerfCase``/``AccuracyCase`` (driven in-process against a server the
     suite launched), a ``BenchCase`` shells out to a standalone bench that already
-    owns its own gate (``--strict`` / a knee ``assert``). The runner only injects
-    the runtime wiring and maps the exit code to the tagged suite exit codes:
-    ``returncode == 0`` -> pass, nonzero -> a ``threshold`` failure.
+    owns its own gate. The runner injects runtime wiring plus a case timeout and
+    preserves the tagged suite exit-code contract: 10=infra, 20=threshold,
+    30=case crash; unknown nonzero exits are case crashes.
 
     ``server`` selects how the bench gets its server:
       - ``"runner"`` — the runner already launched one (multi-host ``ModelRun``);
@@ -182,6 +182,10 @@ class BenchCase:
     ``compare_inputs`` (bare filenames) are resolved against ``$RESULTS_DIR`` and
     injected as ``--compare <paths...>`` — the cross-policy A/B gate references the
     same names the per-policy ``output_json`` runs wrote.
+
+    ``case_key`` groups multiple dependent cases behind one ``--cases`` selector.
+    For example, two profile-backed measurements plus their offline comparison can
+    all use ``case_key="recurrent-ab"`` while keeping distinct result names.
     """
 
     name: str
@@ -190,6 +194,8 @@ class BenchCase:
     server: str = "runner"  # runner | self | none
     output_json: str | None = None
     compare_inputs: tuple[str, ...] = ()
+    timeout: int | None = None
+    case_key: str | None = None
 
     def __post_init__(self):
         if self.server not in ("runner", "self", "none"):
@@ -198,6 +204,10 @@ class BenchCase:
             object.__setattr__(self, "argv", tuple(self.argv))
         if not isinstance(self.compare_inputs, tuple):
             object.__setattr__(self, "compare_inputs", tuple(self.compare_inputs))
+        if self.timeout is not None and self.timeout <= 0:
+            raise ValueError(f"BenchCase.timeout must be positive, got {self.timeout}")
+        if self.case_key == "":
+            raise ValueError("BenchCase.case_key must be non-empty when set")
 
 
 # Default gsm8k sampling (greedy). Lives here (host-neutral, stdlib-only) so the

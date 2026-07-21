@@ -59,6 +59,8 @@ from sgl_jax.test.kits.cache_hit_kit import (
     gen_payload,
 )
 
+EXIT_THRESHOLD = 20
+
 
 def predict_knee(
     max_recurrent_state_size: int,
@@ -217,6 +219,15 @@ async def _send_round(payloads, url, parallel):
     return await asyncio.gather(*[asyncio.create_task(one(p)) for p in payloads])
 
 
+def _require_complete_round(results, phase, K):
+    failed = [r for r in results if not r.success]
+    if not failed:
+        return
+    errors = [r.error for r in failed if getattr(r, "error", "")]
+    detail = f"; errors={errors[:3]}" if errors else ""
+    raise RuntimeError(f"K={K}: {len(failed)}/{len(results)} {phase} requests failed{detail}")
+
+
 def run_k_point(args, tokenizer, generate_url, K, interval):
     """Run one K point: flush -> WARM -> PROBE; return per-point metrics."""
     target_tokens = interval + interval // 2  # in [I, 2I) -> one track boundary
@@ -227,7 +238,8 @@ def run_k_point(args, tokenizer, generate_url, K, interval):
         gen_payload(prefixes[i] + make_suffix_ids(tokenizer, i, 7, args.suffix_tokens), 1)
         for i in range(K)
     ]
-    asyncio.run(_send_round(warm, generate_url, args.parallel))
+    warm_results = asyncio.run(_send_round(warm, generate_url, args.parallel))
+    _require_complete_round(warm_results, "warm", K)
 
     # Probe each prefix once, in a fixed-seed shuffled order (NOT the warm order).
     # Same-order replay makes every probe miss once K exceeds capacity (each
@@ -242,29 +254,19 @@ def run_k_point(args, tokenizer, generate_url, K, interval):
     t0 = time.perf_counter()
     results = asyncio.run(_send_round(probe, generate_url, args.parallel))
     wall = time.perf_counter() - t0
+    _require_complete_round(results, "probe", K)
 
-    ok = [r for r in results if r.success]
-    n_fail = len(results) - len(ok)
-    # Past capacity the pool over-subscribes and retracts requests (their HTTP
-    # response comes back incomplete -> success=False). That IS the reuse collapse
-    # the sweep measures, so count failed probes as zero-reuse (each contributes
-    # its expected prompt length to the denominator, nothing to the numerator) and
-    # keep going, rather than aborting the whole sweep. A genuine all-points
-    # wipeout still surfaces: every K reads ~0 reuse, so detect_knee() returns None
-    # (no_reuse) and the gate fails.
-    expected_prompt = target_tokens + args.suffix_tokens
-    total_cached = sum(r.cached_tokens for r in ok)
-    total_prompt = sum(r.prompt_len for r in ok) + n_fail * expected_prompt
-    ttfts = sorted(r.ttft for r in ok) or [0.0]
+    total_cached = sum(r.cached_tokens for r in results)
+    total_prompt = sum(r.prompt_len for r in results)
+    ttfts = sorted(r.ttft for r in results)
     return {
         "K": K,
         "reuse_frac": total_cached / total_prompt if total_prompt else 0.0,
         "cached_tokens": total_cached,
         "prompt_tokens": total_prompt,
-        "n_failed": n_fail,
         "ttft_p50_ms": statistics.median(ttfts) * 1000.0,
         "ttft_p90_ms": ttfts[min(len(ttfts) - 1, int(0.9 * len(ttfts)))] * 1000.0,
-        "throughput_req_s": len(ok) / wall if wall else 0.0,
+        "throughput_req_s": len(results) / wall if wall else 0.0,
     }
 
 
@@ -309,7 +311,6 @@ def main():
         print(
             f"K={K:>5}  reuse_frac={pt['reuse_frac']:.4f}  "
             f"cached={pt['cached_tokens']}/{pt['prompt_tokens']}  "
-            f"failed={pt['n_failed']}  "
             f"ttft_p50={pt['ttft_p50_ms']:.1f}ms  ttft_p90={pt['ttft_p90_ms']:.1f}ms  "
             f"tput={pt['throughput_req_s']:.1f}req/s",
             flush=True,
@@ -362,19 +363,8 @@ def main():
             json.dump(payload, f, indent=2, default=str)
         print(f"\nWrote results to {args.output_json}")
 
-    if no_reuse:
-        assert args.no_assert, (
-            "no reusable prefixes observed (peak reuse_frac ~ 0): caching is "
-            "disabled/unreachable or the recurrent snapshot is not cached/reused."
-        )
-    else:
-        assert in_range or args.no_assert, (
-            f"empirical knee {knee} outside predicted range "
-            f"[{Kstar_lo:.1f}, {Kstar_hi:.1f}] (K*={Kstar:.1f}): "
-            "knee << K* means parallel < dp_size (WARM under-fills ranks) or an "
-            "eviction/sizing/routing bug; knee >> K* means over-provisioning / "
-            "non-caching prefixes."
-        )
+    if not args.no_assert and (no_reuse or not in_range):
+        raise SystemExit(EXIT_THRESHOLD)
 
 
 if __name__ == "__main__":

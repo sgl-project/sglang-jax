@@ -1,4 +1,4 @@
-"""Unit tests for scripts/ci/coordinator_decide.py and scripts/ci/finish_check.py."""
+"""Unit tests for the lightweight CI control scripts."""
 
 import os
 import subprocess
@@ -10,6 +10,7 @@ from unittest.mock import patch
 sys.path.insert(0, "scripts/ci")
 from coordinator_decide import detect_draft, detect_labels, summarize, write_outputs
 from finish_check import check_jobs
+from slash_command_parse import _SINGLE_HOST_SUITE_JOBS, nightly_index
 
 
 class TestDetectDraft(unittest.TestCase):
@@ -282,6 +283,42 @@ class TestWriteOutputs(unittest.TestCase):
     def test_no_github_output_no_crash(self):
         with patch.dict("os.environ", {}, clear=True):
             write_outputs({"run_full": "true"})
+
+
+class TestNightlyIndex(unittest.TestCase):
+    @patch(
+        "slash_command_parse._run_caselist",
+        return_value=[
+            {"suite": "recurrent-ab-perf-v6e-4", "case": "recurrent-ab"},
+            {
+                "suite": "recurrent-cache-aware-v6e-4",
+                "case": "reuse-sweep-cache-aware",
+            },
+            {"suite": "recurrent-accuracy-v6e-4", "case": "recurrent-gsm8k"},
+        ],
+    )
+    def test_recurrent_cases_map_to_jobs(self, _caselist):
+        index = nightly_index()
+        self.assertEqual(
+            index["recurrent-ab"],
+            ("nightly-recurrent-ab-perf-4-tpu-daily", "recurrent-ab"),
+        )
+        self.assertEqual(
+            index["reuse-sweep-cache-aware"],
+            ("nightly-recurrent-cache-aware-4-tpu-daily", "reuse-sweep-cache-aware"),
+        )
+        self.assertEqual(
+            index["recurrent-gsm8k"],
+            ("nightly-recurrent-accuracy-4-tpu-daily", "recurrent-gsm8k"),
+        )
+
+    def test_mapped_jobs_exist_in_workflow(self):
+        import yaml
+
+        with open(".github/workflows/nightly-test-daily.yml") as f:
+            workflow = yaml.safe_load(f)
+        jobs = workflow["jobs"]
+        self.assertEqual(set(_SINGLE_HOST_SUITE_JOBS.values()) - set(jobs), set())
 
 
 class TestYAMLConsistency(unittest.TestCase):

@@ -6,6 +6,8 @@ import importlib.util
 import os
 import sys
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # Make sgl_jax importable when the package is not installed (CPU dev box).
@@ -74,6 +76,54 @@ class TestDetectKnee(unittest.TestCase):
         """Peak reuse ~0 (no-cache / broken / all-miss) has no knee, not max K."""
         curve = self._curve([(8, 0.0), (16, 0.0), (32, 0.0)])
         self.assertIsNone(self.bench.detect_knee(curve, plateau_frac=0.9))
+
+
+class TestRunKPoint(unittest.TestCase):
+    def setUp(self):
+        self.bench = _load_bench_module()
+        self.args = SimpleNamespace(server_url="http://server", suffix_tokens=8, parallel=2)
+
+    @staticmethod
+    def _result(success=True, error=""):
+        return SimpleNamespace(
+            success=success,
+            error=error,
+            cached_tokens=64,
+            prompt_len=96,
+            ttft=0.1,
+        )
+
+    def _run(self, rounds):
+        with (
+            mock.patch.object(self.bench, "flush_cache"),
+            mock.patch.object(self.bench, "make_prefix_ids", return_value=[1] * 80),
+            mock.patch.object(self.bench, "make_suffix_ids", return_value=[2] * 8),
+            mock.patch.object(self.bench, "_send_round", mock.AsyncMock(side_effect=rounds)),
+        ):
+            return self.bench.run_k_point(
+                self.args,
+                tokenizer=object(),
+                generate_url="http://server/generate",
+                K=2,
+                interval=64,
+            )
+
+    def test_failed_warm_request_aborts_measurement(self):
+        warm = [self._result(), self._result(False, "warm failed")]
+        with self.assertRaisesRegex(RuntimeError, "warm requests failed"):
+            self._run([warm])
+
+    def test_failed_probe_request_aborts_measurement(self):
+        warm = [self._result(), self._result()]
+        probe = [self._result(), self._result(False, "probe failed")]
+        with self.assertRaisesRegex(RuntimeError, "probe requests failed"):
+            self._run([warm, probe])
+
+    def test_complete_rounds_produce_reuse_metrics(self):
+        results = [self._result(), self._result()]
+        point = self._run([results, results])
+        self.assertEqual(point["cached_tokens"], 128)
+        self.assertEqual(point["prompt_tokens"], 192)
 
 
 if __name__ == "__main__":

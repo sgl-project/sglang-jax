@@ -408,8 +408,8 @@ jobs:
       - name: Setup Python environment
         uses: ./.github/actions/setup-venv
       - name: Run recurrent A/B perf gate (v6e-4)
-        # Self-launching A/B: bench starts no-cache + unified-recurrent servers
-        # sequentially, then runs the gsp/random sweep + --strict. Measured ~23min
+        # Profile-backed A/B: the runner starts no-cache + unified-recurrent servers
+        # sequentially, then an offline case applies the gsp/random --strict gate. Measured ~23min
         # wall-clock on a v6e-4 (compute: 2x 35B load + gsp/random x3 reps); the
         # cold-gcsfuse bimodal 35B load (warm ~29s vs cold ~14-40min each, x2) sets
         # the ceiling, so 120min covers two worst-case cold loads + the bench.
@@ -420,6 +420,14 @@ jobs:
         run: |
           cd test/srt
           python3 nightly/single_host/suite_runner.py --suite recurrent-ab-perf-v6e-4 ${CASES:+--cases "$CASES"}
+      - name: Upload recurrent A/B results
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: recurrent-ab-results-${{ github.run_id }}
+          path: ${{ env.RESULTS_DIR }}
+          if-no-files-found: warn
+          retention-days: 30
 
   nightly-recurrent-cache-aware-4-tpu-daily:
     if: github.repository == 'sgl-project/sglang-jax' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-recurrent-cache-aware-4-tpu-daily')
@@ -451,6 +459,14 @@ jobs:
         run: |
           cd test/srt
           python3 nightly/single_host/suite_runner.py --suite recurrent-cache-aware-v6e-4 ${CASES:+--cases "$CASES"}
+      - name: Upload recurrent cache-aware results
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: recurrent-cache-aware-results-${{ github.run_id }}
+          path: ${{ env.RESULTS_DIR }}
+          if-no-files-found: warn
+          retention-days: 30
 
   nightly-recurrent-accuracy-4-tpu-daily:
     if: github.repository == 'sgl-project/sglang-jax' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-recurrent-accuracy-4-tpu-daily')
@@ -483,6 +499,80 @@ jobs:
         run: |
           cd test/srt
           python3 nightly/single_host/suite_runner.py --suite recurrent-accuracy-v6e-4 ${CASES:+--cases "$CASES"}
+      - name: Upload recurrent accuracy results
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: recurrent-accuracy-results-${{ github.run_id }}
+          path: ${{ env.RESULTS_DIR }}
+          if-no-files-found: warn
+          retention-days: 30
+
+  nightly-recurrent-ab-perf-4-tpu-comment:
+    needs: nightly-recurrent-ab-perf-4-tpu-daily
+    if: >-
+      always() && inputs.pr_number != ''
+      && contains(fromJSON('["success", "failure"]'), needs.nightly-recurrent-ab-perf-4-tpu-daily.result)
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Comment result on PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          CASE_KEY: ${{ inputs.cases || 'recurrent-ab' }}
+          RESULT: ${{ needs.nightly-recurrent-ab-perf-4-tpu-daily.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ "$RESULT" = "success" ]; then status="PASS"; else status="FAIL"; fi
+          gh pr comment "$PR_NUMBER" --repo "$REPO" \
+            --body "> **Nightly (recurrent A/B)** [\`$CASE_KEY\`]($RUN_URL): **$status**."
+
+  nightly-recurrent-cache-aware-4-tpu-comment:
+    needs: nightly-recurrent-cache-aware-4-tpu-daily
+    if: >-
+      always() && inputs.pr_number != ''
+      && contains(fromJSON('["success", "failure"]'), needs.nightly-recurrent-cache-aware-4-tpu-daily.result)
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Comment result on PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          CASE_KEY: ${{ inputs.cases || 'recurrent-cache-aware-v6e-4' }}
+          RESULT: ${{ needs.nightly-recurrent-cache-aware-4-tpu-daily.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ "$RESULT" = "success" ]; then status="PASS"; else status="FAIL"; fi
+          gh pr comment "$PR_NUMBER" --repo "$REPO" \
+            --body "> **Nightly (recurrent cache-aware)** [\`$CASE_KEY\`]($RUN_URL): **$status**."
+
+  nightly-recurrent-accuracy-4-tpu-comment:
+    needs: nightly-recurrent-accuracy-4-tpu-daily
+    if: >-
+      always() && inputs.pr_number != ''
+      && contains(fromJSON('["success", "failure"]'), needs.nightly-recurrent-accuracy-4-tpu-daily.result)
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Comment result on PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          CASE_KEY: ${{ inputs.cases || 'recurrent-accuracy-v6e-4' }}
+          RESULT: ${{ needs.nightly-recurrent-accuracy-4-tpu-daily.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ "$RESULT" = "success" ]; then status="PASS"; else status="FAIL"; fi
+          gh pr comment "$PR_NUMBER" --repo "$REPO" \
+            --body "> **Nightly (recurrent accuracy)** [\`$CASE_KEY\`]($RUN_URL): **$status**."
 
 
   # Trend drift: detect on v6e-4 (only it can read the /observability-storage
