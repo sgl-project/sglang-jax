@@ -245,8 +245,7 @@ class MoEKernelTest(jtu.JaxTestCase):
 
         topk_weights, topk_ids = topk_module(gating_output)
 
-        # fused_ep_moe feeds these straight into its shard_map, which shards dim 0 across the
-        # EP mesh. ref_moe is a plain-JAX reference and must keep the replicated originals.
+        # Shard kernel inputs while keeping replicated originals for ref_moe.
         ep = jax.sharding.NamedSharding(self.mesh, P(("data", "tensor")))
 
         def shard(x):
@@ -323,7 +322,6 @@ class MoEKernelTest(jtu.JaxTestCase):
             x = lax.all_gather(x, axis_name="data", axis=0, tiled=True)
             return x
 
-        # _replicate_tokens gathers from the EP layout, so the replicated ref output must match.
         expected = jax.reshard(expected, ep)
         actual_host = np.asarray(jax.device_get(_replicate_tokens(actual)))
         expected_host = np.asarray(jax.device_get(_replicate_tokens(expected)))

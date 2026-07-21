@@ -351,8 +351,6 @@ def create_test_data(
 
         fb.attn_backend.forward_metadata.custom_mask = device_array(
             (fb.spec_info.custom_mask),
-            # The target-verify producer segments this array by DP rank.  The
-            # direct test fixture must provide the same layout to shard_map.
             sharding=(NamedSharding(attention_backend.mesh, P("data"))),
         )
     return fb, current_kv_cache, q, k, v
@@ -460,10 +458,7 @@ class AttentionTestBase(CustomTestCase):
             cache_loc_list.append(padded_page_indices)
         page_table = jnp.stack(cache_loc_list)
 
-        # The reference is a serial, unsharded calculation.  Production
-        # metadata is P("data") for the backend's shard_map, but indexing that
-        # array in the reference has no unambiguous gather out_sharding on
-        # multi-device JAX 0.10.1.  Materialize the small metadata on host.
+        # Keep the serial reference independent of production metadata sharding.
         ref_cu_q_lens = jnp.asarray(
             jax.device_get(forward_batch.attn_backend.forward_metadata.cu_q_lens)
         )
@@ -491,9 +486,7 @@ class AttentionTestBase(CustomTestCase):
         if xai_temperature_len is not None and xai_temperature_len > 0:
             attn.xai_temperature_len = xai_temperature_len
 
-        # Preserve the replicated array for the reference calculation above.
-        # The backend's in_specs requires the per-head sink to be tensor-sharded,
-        # exactly as the model parameter and its WeightMapping declare.
+        # Keep the reference replicated and place the backend input like the model parameter.
         attention_sink_backend = (
             None
             if attention_sink is None
@@ -573,12 +566,7 @@ class AttentionTestBase(CustomTestCase):
         )
 
     def run_test_on_single_device(self, *args, **kwargs):
-        """Run logical-head kernel cases that are not TP-divisible.
-
-        Production rejects non-divisible query heads and replicates/pads KV
-        heads before constructing the attention backend. Direct backend tests
-        keep the logical head counts, so they need a matching TP=1 mesh.
-        """
+        """Run logical-head cases that require a TP=1 mesh."""
         one_device_mesh = create_device_mesh(
             ici_parallelism=[1, 1],
             dcn_parallelism=[1, 1],

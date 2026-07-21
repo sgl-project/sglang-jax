@@ -253,10 +253,6 @@ class QuantizedLinear(nnx.Module):
             if n_out is not None:
                 weight_scale = expand_block_scale(weight_scale, n_out, int(weight_block_size[0]))
 
-        # Place the scale on its kernel-intended sharding at construction time. The
-        # dynamically-quantized scale is computed via reduction + expand and would otherwise
-        # arrive replicated at the quantized-matmul shard_map (the static/abstract path in
-        # from_linear already declares these exact shardings via ShapeDtypeStruct).
         if (
             mesh is not None
             and kernel_axes is not None
