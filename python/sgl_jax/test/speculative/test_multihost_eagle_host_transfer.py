@@ -16,11 +16,10 @@ class FakeDeviceArray:
     def __init__(
         self,
         data,
-        *,
-        fully_addressable: bool,
-        fully_replicated: bool = False,
+        fully_addressable,
+        fully_replicated=False,
         local_data=None,
-        name: str | None = None,
+        name=None,
     ):
         self.data = np.asarray(data)
         self.is_fully_addressable = fully_addressable
@@ -43,8 +42,8 @@ class FakeDeviceArray:
         assert index == 0
         return FakeDeviceArray(
             self.local_data,
-            fully_addressable=True,
-            fully_replicated=True,
+            True,
+            True,
             name=self.name,
         )
 
@@ -55,16 +54,11 @@ class TestMultihostEagleHostTransfer(unittest.TestCase):
 
         def fake_allgather(value, *, tiled):
             calls.append((value, tiled))
-            return FakeDeviceArray(value.data + 100, fully_addressable=True)
+            return FakeDeviceArray(value.data + 100, True)
 
-        local = FakeDeviceArray([1, 2], fully_addressable=True)
-        replicated = FakeDeviceArray(
-            [9, 9],
-            fully_addressable=False,
-            fully_replicated=True,
-            local_data=[3, 4],
-        )
-        sharded = FakeDeviceArray([5, 6], fully_addressable=False)
+        local = FakeDeviceArray([1, 2], True)
+        replicated = FakeDeviceArray([9, 9], False, True, [3, 4])
+        sharded = FakeDeviceArray([5, 6], False)
 
         with mock.patch.object(eagle_util, "process_allgather", fake_allgather):
             np.testing.assert_array_equal(eagle_util._host_spec_array(local), np.array([1, 2]))
@@ -95,24 +89,18 @@ class TestMultihostEagleHostTransfer(unittest.TestCase):
 
         def fake_allgather(value, *, tiled):
             calls.append((value.name, tiled))
-            return FakeDeviceArray(gathered[value.name], fully_addressable=True)
+            return FakeDeviceArray(gathered[value.name], True)
 
+        fields = ("topk_p", "topk_index", "hidden_states", "verified_id", "accept_length")
         flat = EagleDraftInput(
-            topk_p=FakeDeviceArray([], fully_addressable=False, name="topk_p"),
-            topk_index=FakeDeviceArray([], fully_addressable=False, name="topk_index"),
-            hidden_states=FakeDeviceArray([], fully_addressable=False, name="hidden_states"),
-            verified_id=FakeDeviceArray([], fully_addressable=False, name="verified_id"),
-            accept_length=FakeDeviceArray([], fully_addressable=False, name="accept_length"),
+            **{name: FakeDeviceArray([], False, name=name) for name in fields},
             allocate_lens=np.array([8, 9, 10], dtype=np.int32),
         )
 
         with mock.patch.object(eagle_util, "process_allgather", fake_allgather):
             parts = ScheduleBatch._split_spec_info_per_rank(flat, [2, 1])
 
-        self.assertEqual(
-            [name for name, tiled in calls if tiled],
-            ["topk_p", "topk_index", "hidden_states", "verified_id", "accept_length"],
-        )
+        self.assertEqual([name for name, tiled in calls if tiled], list(fields))
         self.assertIsNotNone(parts[0])
         self.assertIsNotNone(parts[1])
         np.testing.assert_array_equal(parts[0].verified_id, np.array([1, 2], dtype=np.int32))
