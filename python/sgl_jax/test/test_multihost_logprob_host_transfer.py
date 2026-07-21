@@ -14,45 +14,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
 from sgl_jax.srt.layers.sampler import Sampler
 from sgl_jax.srt.managers import tp_worker
-from sgl_jax.srt.managers.schedule_batch import Req
-from sgl_jax.srt.managers.scheduler import Scheduler
+from sgl_jax.srt.managers.schedule_batch import ScheduleBatch
 from sgl_jax.srt.managers.scheduler_output_processor_mixin import (
     SchedulerOutputProcessorMixin,
 )
 from sgl_jax.srt.managers.tp_worker import ModelWorker
-from sgl_jax.srt.sampling.sampling_params import SamplingParams
 from sgl_jax.srt.speculative.base_worker import BaseSpecWorker
-from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
 class TestMultihostLogprobHostTransfer(unittest.TestCase):
-    def test_host_logprob_array_gathers_only_when_requested(self):
-        local = np.array([3.0], dtype=np.float32)
-        sharded, gathered = object(), np.array([1.0, 2.0], dtype=np.float32)
-        allgather = mock.Mock(return_value=gathered)
-        device_get = mock.Mock(side_effect=lambda value: value)
-
-        with (
-            mock.patch.object(tp_worker, "process_allgather", allgather),
-            mock.patch.object(tp_worker.jax, "device_get", device_get),
-        ):
-            local_out = tp_worker._host_logprob_array(local)
-            gathered_out = tp_worker._host_logprob_array(sharded, allgather=True)
-
-        np.testing.assert_array_equal(local_out, local)
-        np.testing.assert_array_equal(gathered_out, gathered)
-        allgather.assert_called_once_with(sharded, tiled=True)
-        self.assertEqual(device_get.call_args_list, [mock.call(local), mock.call(gathered)])
-
     @staticmethod
     def _materialize(output, batch, selector):
-        allgather = mock.Mock(side_effect=lambda value, *, tiled: value)
-        with (
-            mock.patch.object(tp_worker.jax, "device_get", side_effect=lambda value: value),
-            mock.patch.object(tp_worker, "process_allgather", allgather),
-        ):
+        materialize = mock.Mock(side_effect=np.asarray)
+        with mock.patch.object(tp_worker, "materialize_to_host", materialize):
             ModelWorker._materialize_logprobs_to_host(None, output, batch, selector)
-        return allgather
+        return materialize
 
     def test_materialize_logprobs_to_host_preserves_selector_order(self):
         output = LogitsProcessorOutput(
@@ -68,10 +44,9 @@ class TestMultihostLogprobHostTransfer(unittest.TestCase):
             top_logprobs_nums=[1, 2, 1],
             token_ids_logprobs=None,
         )
-        allgather = self._materialize(output, batch, np.array([0, 2, 1]))
+        self._materialize(output, batch, np.array([0, 2, 1]))
 
         np.testing.assert_array_equal(output.next_token_logprobs, np.array([10.0, 30.0, 20.0]))
-        self.assertEqual(allgather.call_count, 2)
         for actual, expected in zip(
             output.next_token_top_logprobs_val,
             [[1.0], [3.0], [2.0, 2.1]],
@@ -79,6 +54,30 @@ class TestMultihostLogprobHostTransfer(unittest.TestCase):
         ):
             np.testing.assert_allclose(actual, expected)
         self.assertEqual(output.next_token_top_logprobs_idx, [[11], [31], [21, 22]])
+
+    def test_merge_logprob_metadata_preserves_dp_padding(self):
+        def info(seq_lens, top_nums, token_ids):
+            return SimpleNamespace(
+                seq_lens=seq_lens,
+                top_logprobs_nums=top_nums,
+                token_ids_logprobs=token_ids,
+            )
+
+        batch = SimpleNamespace(
+            return_logprob=True,
+            dp_size=2,
+            reqs_info=[
+                info([4, 5], [1, 2], [[10], [20]]),
+                info([6], [3], [[30]]),
+            ],
+        )
+
+        top_nums, token_ids = ScheduleBatch._merge_logprob_metadata(batch, 3, 6)
+        self.assertEqual(top_nums, [1, 2, 0, 3, 0, 0])
+        self.assertEqual(token_ids, [[10], [20], None, [30], None, None])
+
+        batch.return_logprob = False
+        self.assertEqual(ScheduleBatch._merge_logprob_metadata(batch, 3, 6), (None, None))
 
     def test_optional_prefill_output_logprobs_can_be_absent(self):
         req = SimpleNamespace(
@@ -123,9 +122,9 @@ class TestMultihostLogprobHostTransfer(unittest.TestCase):
             top_logprobs_nums=[2, 1],
             token_ids_logprobs=None,
         )
-        allgather = self._materialize(output, batch, np.array([0, 1]))
+        materialize = self._materialize(output, batch, np.array([0, 1]))
 
-        self.assertEqual(allgather.call_count, 2)
+        self.assertEqual(materialize.call_count, 2)
         np.testing.assert_allclose(output.input_token_logprobs, [0.1, 0.2, 0.3, 0.4])
         for actual, expected in zip(
             output.input_top_logprobs_val,
@@ -162,144 +161,85 @@ class TestSpecPrefillLogprobPaths(unittest.TestCase):
 
 
 class TestSpecDecodeOutputLogprobs(unittest.TestCase):
-    def _run_decode(
-        self,
-        *,
-        output_only: bool,
-        stop_token_ids=None,
-        draft_n: int = 4,
-        spec_steps: int = 3,
-    ):
-        scheduler = Scheduler.__new__(Scheduler)
-        scheduler.__dict__.update(
-            spec_algorithm=SpeculativeAlgorithm.NEXTN,
-            enable_overlap=output_only,
-            draft_worker=SimpleNamespace(
-                speculative_num_draft_tokens=draft_n,
-                speculative_num_steps=spec_steps,
-            ),
-            num_generated_tokens=0,
-            accept_token=0,
-            spec_num_forward_ct=0,
-            draft_token=0,
-            token_to_kv_pool_allocator=SimpleNamespace(
-                free_group_begin=lambda: None,
-                free_group_end=lambda: None,
-            ),
-            tree_cache=None,
-            set_next_batch_sampling_info_done=lambda _batch: None,
-            stream_output=lambda *args, **kwargs: None,
-            forward_ct_decode=0,
-            server_args=SimpleNamespace(decode_log_interval=1000),
-            log_decode_stats=lambda _batch: None,
+    @staticmethod
+    def _req(**kwargs):
+        values = dict(
+            return_logprob=True,
+            finished_len=None,
+            top_logprobs_num=2,
+            token_ids_logprob=[1, 3],
+            output_token_logprobs_val=[],
+            output_token_logprobs_idx=[],
+            output_top_logprobs_val=[],
+            output_top_logprobs_idx=[],
+            output_token_ids_logprobs_val=[],
+            output_token_ids_logprobs_idx=[],
+        )
+        values.update(kwargs)
+        return SimpleNamespace(**values)
+
+    @staticmethod
+    def _output():
+        return SimpleNamespace(
+            next_token_logprobs=np.arange(8, dtype=np.float32),
+            next_token_top_logprobs_val=np.arange(24, dtype=np.float32).reshape(8, 3),
+            next_token_top_logprobs_idx=np.arange(100, 124, dtype=np.int32).reshape(8, 3),
+            next_token_token_ids_logprobs_val=np.arange(40, dtype=np.float32).reshape(8, 5),
         )
 
-        def make_req(rid, *, stops=None):
-            req = Req(
-                rid=rid,
-                origin_input_text="",
-                origin_input_ids=[1, 2],
-                sampling_params=SamplingParams(max_new_tokens=10, stop_token_ids=stops),
-                return_logprob=not output_only,
-                top_logprobs_num=0 if output_only else 2,
-                token_ids_logprob=None if output_only else [7, 8],
-            )
-            if output_only:
-                req.return_output_logprob_only = True
-                req.output_token_logprobs_val = []
-                req.output_token_logprobs_idx = []
-            return req
-
-        req0 = make_req("rank-0", stops=stop_token_ids)
-        req1 = make_req("rank-1")
-
-        rows_per_req = spec_steps + 1
-        total_rows = 2 * rows_per_req
-        top_vals = top_idx = token_vals = None
-        if not output_only:
-            shape = (total_rows, 2)
-            top_vals = -np.arange(1, total_rows * 2 + 1, dtype=np.float32).reshape(shape)
-            top_idx = np.arange(10, 10 + total_rows * 2, dtype=np.int32).reshape(shape)
-            token_vals = np.tile(np.arange(-10.0, 0.0, dtype=np.float32), (total_rows, 1))
-
-        batch = SimpleNamespace(
-            dp_size=2,
-            per_dp_bs_size=1,
-            reqs_info=[SimpleNamespace(reqs=[req0]), SimpleNamespace(reqs=[req1])],
-            return_logprob=not output_only,
-            return_output_logprob_only=output_only,
-        )
-        result = SimpleNamespace(
-            logits_output=SimpleNamespace(
-                next_token_logprobs=-0.1 * np.arange(1, total_rows + 1, dtype=np.float32),
-                next_token_top_logprobs_val=top_vals,
-                next_token_top_logprobs_idx=top_idx,
-                next_token_token_ids_logprobs_val=token_vals,
-                hidden_states=None,
-            ),
-            next_token_ids=np.concatenate(
-                [
-                    np.arange(101, 101 + draft_n, dtype=np.int32),
-                    np.arange(201, 201 + draft_n, dtype=np.int32),
-                ]
-            ),
-            accept_lens=np.array([2, 3], dtype=np.int32),
-            cache_miss_count=0,
-            bid=1,
-            num_accepted_tokens=None,
+    def test_uses_accepted_width_and_dp_slot(self):
+        req = self._req()
+        SchedulerOutputProcessorMixin.add_spec_decode_logprob_return_values(
+            req,
+            self._output(),
+            [201, 202, 203],
+            slot=1,
+            rows_per_req=3,
+            output_len_before=0,
+            accepted_len=3,
         )
 
-        gathered = mock.Mock(side_effect=lambda value, *, tiled: value)
-        with mock.patch("jax.experimental.multihost_utils.process_allgather", gathered):
-            SchedulerOutputProcessorMixin.process_batch_result_decode(scheduler, batch, result)
-        return (req0, req1), gathered
+        self.assertEqual(req.output_token_logprobs_val, [3, 4, 5])
+        self.assertEqual(req.output_token_logprobs_idx, [201, 202, 203])
+        self.assertEqual(req.output_top_logprobs_idx, [[109, 110], [112, 113], [115, 116]])
+        self.assertEqual(req.output_token_ids_logprobs_val, [[16, 18], [21, 23], [26, 28]])
+        self.assertEqual(req.output_token_ids_logprobs_idx, [[1, 3]] * 3)
 
-    def test_spec_decode_appends_flat_output_logprobs(self):
-        (req, rank1_req), gathered = self._run_decode(output_only=False)
-
-        self.assertEqual(req.output_ids, [101, 102])
-        self.assertEqual(gathered.call_count, 3)
-        self.assertEqual(req.output_token_logprobs_idx, [101, 102])
-        np.testing.assert_allclose(req.output_token_logprobs_val, [-0.1, -0.2])
-        self.assertEqual(req.output_top_logprobs_idx, [[10, 11], [12, 13]])
-        self.assertEqual(req.output_token_ids_logprobs_idx, [[7, 8], [7, 8]])
-        np.testing.assert_allclose(req.output_token_ids_logprobs_val, [[-3.0, -2.0]] * 2)
-        self.assertEqual(rank1_req.output_ids, [201, 202, 203])
-        self.assertEqual(rank1_req.output_token_logprobs_idx, [201, 202, 203])
-        np.testing.assert_allclose(rank1_req.output_token_logprobs_val, [-0.5, -0.6, -0.7])
-        self.assertEqual(rank1_req.output_top_logprobs_idx, [[18, 19], [20, 21], [22, 23]])
-
-    def test_spec_decode_appends_output_logprob_only(self):
-        (req, rank1_req), gathered = self._run_decode(output_only=True)
-
-        gathered.assert_not_called()
-        self.assertEqual(req.output_token_logprobs_idx, [101, 102])
-        np.testing.assert_allclose(req.output_token_logprobs_val, [-0.1, -0.2])
-        self.assertIsNone(req.output_top_logprobs_val)
-        self.assertIsNone(req.output_token_ids_logprobs_val)
-        self.assertEqual(rank1_req.output_token_logprobs_idx, [201, 202, 203])
-
-    def test_non_fused_tree_uses_accept_width_for_logprob_rows(self):
-        (req, rank1_req), _ = self._run_decode(
-            output_only=False,
-            draft_n=6,
-            spec_steps=2,
+    def test_truncates_output_only_logprobs_at_stop(self):
+        req = self._req(
+            return_logprob=False,
+            finished_len=3,
+            top_logprobs_num=0,
+            token_ids_logprob=None,
+        )
+        SchedulerOutputProcessorMixin.add_spec_decode_logprob_return_values(
+            req,
+            self._output(),
+            [101, 102, 103],
+            slot=0,
+            rows_per_req=4,
+            output_len_before=2,
+            accepted_len=3,
         )
 
-        self.assertEqual(req.output_token_logprobs_idx, [101, 102])
-        np.testing.assert_allclose(req.output_token_logprobs_val, [-0.1, -0.2])
-        self.assertEqual(rank1_req.output_token_logprobs_idx, [201, 202, 203])
-        np.testing.assert_allclose(rank1_req.output_token_logprobs_val, [-0.4, -0.5, -0.6])
-        self.assertEqual(rank1_req.output_top_logprobs_idx, [[16, 17], [18, 19], [20, 21]])
-
-    def test_spec_decode_does_not_return_logprobs_after_stop(self):
-        (req, _), _ = self._run_decode(output_only=False, stop_token_ids=[101])
-
-        self.assertEqual(req.output_ids_through_stop, [101])
+        self.assertEqual(req.output_token_logprobs_val, [0])
         self.assertEqual(req.output_token_logprobs_idx, [101])
-        np.testing.assert_allclose(req.output_token_logprobs_val, [-0.1])
-        self.assertEqual(req.output_top_logprobs_idx, [[10, 11]])
-        self.assertEqual(req.output_token_ids_logprobs_idx, [[7, 8]])
+        self.assertEqual(req.output_top_logprobs_val, [])
+        self.assertEqual(req.output_token_ids_logprobs_val, [])
+
+    def test_allows_missing_optional_logprob_outputs(self):
+        req = self._req()
+        output = self._output()
+        output.next_token_top_logprobs_val = None
+        output.next_token_token_ids_logprobs_val = None
+
+        SchedulerOutputProcessorMixin.add_spec_decode_logprob_return_values(
+            req, output, [101], 0, 4, 0, 1
+        )
+
+        self.assertEqual(req.output_token_logprobs_val, [0])
+        self.assertEqual(req.output_top_logprobs_val, [])
+        self.assertEqual(req.output_token_ids_logprobs_val, [])
 
 
 class TestSamplerLogprobOutput(unittest.TestCase):

@@ -7,9 +7,8 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
-from sgl_jax.srt.managers.schedule_batch import ScheduleBatch
-from sgl_jax.srt.speculative import eagle_util
 from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
+from sgl_jax.srt.utils import jax_utils
 
 
 class FakeDeviceArray:
@@ -49,7 +48,7 @@ class FakeDeviceArray:
 
 
 class TestMultihostEagleHostTransfer(unittest.TestCase):
-    def test_host_spec_array_gathers_only_nonlocal_sharded_arrays(self):
+    def test_materialize_to_host_respects_array_sharding(self):
         calls = []
 
         def fake_allgather(value, *, tiled):
@@ -60,21 +59,24 @@ class TestMultihostEagleHostTransfer(unittest.TestCase):
         replicated = FakeDeviceArray([9, 9], False, True, [3, 4])
         sharded = FakeDeviceArray([5, 6], False)
 
-        with mock.patch.object(eagle_util, "process_allgather", fake_allgather):
-            np.testing.assert_array_equal(eagle_util._host_spec_array(local), np.array([1, 2]))
+        def materialize(value):
+            return jax_utils.materialize_to_host(value, jax_utils.prefetch_to_host(value))
+
+        with mock.patch.object(jax_utils, "process_allgather", fake_allgather):
+            np.testing.assert_array_equal(materialize(local), np.array([1, 2]))
             np.testing.assert_array_equal(
-                eagle_util._host_spec_array(replicated),
+                materialize(replicated),
                 np.array([3, 4]),
             )
             np.testing.assert_array_equal(
-                eagle_util._host_spec_array(sharded),
+                materialize(sharded),
                 np.array([105, 106]),
             )
 
         self.assertEqual(local.copy_count, 1)
         self.assertEqual(calls, [(sharded, True)])
 
-    def test_split_spec_info_ensure_host_gathers_cross_rank_flat_layout(self):
+    def test_eagle_ensure_host_gathers_cross_rank_fields(self):
         gathered = {
             "topk_p": np.array([[0.1], [0.2], [0.3]], dtype=np.float32),
             "topk_index": np.array([[10], [20], [30]], dtype=np.int32),
@@ -94,21 +96,14 @@ class TestMultihostEagleHostTransfer(unittest.TestCase):
         fields = ("topk_p", "topk_index", "hidden_states", "verified_id", "accept_length")
         flat = EagleDraftInput(
             **{name: FakeDeviceArray([], False, name=name) for name in fields},
-            allocate_lens=np.array([8, 9, 10], dtype=np.int32),
         )
 
-        with mock.patch.object(eagle_util, "process_allgather", fake_allgather):
-            parts = ScheduleBatch._split_spec_info_per_rank(flat, [2, 1])
+        with mock.patch.object(jax_utils, "process_allgather", fake_allgather):
+            flat._ensure_host()
 
         self.assertEqual([name for name, tiled in calls if tiled], list(fields))
-        self.assertIsNotNone(parts[0])
-        self.assertIsNotNone(parts[1])
-        np.testing.assert_array_equal(parts[0].verified_id, np.array([1, 2], dtype=np.int32))
-        np.testing.assert_array_equal(parts[1].verified_id, np.array([3], dtype=np.int32))
-        np.testing.assert_array_equal(parts[0].topk_index, np.array([[10], [20]], dtype=np.int32))
-        np.testing.assert_array_equal(
-            parts[1].hidden_states, np.array([[300, 301]], dtype=np.float32)
-        )
+        for name in fields:
+            np.testing.assert_array_equal(getattr(flat, name), gathered[name])
 
 
 if __name__ == "__main__":

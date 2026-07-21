@@ -6,11 +6,37 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.experimental.multihost_utils import process_allgather
 from jax.sharding import PartitionSpec
 
 GBYTES = 1024 * 1024 * 1024
 TPU_HEAD_SIZE_ALIGNMENT = 128
 TPU_SECOND_LAST_MINOR = 8
+
+
+def prefetch_to_host(value: Any) -> Any | None:
+    if getattr(value, "is_fully_addressable", True):
+        local_value = value
+    elif getattr(value, "is_fully_replicated", False):
+        local_value = value.addressable_data(0)
+    else:
+        return None
+
+    copy = getattr(local_value, "copy_to_host_async", None)
+    if copy is not None:
+        copy()
+    return local_value
+
+
+def materialize_to_host(value: Any, prefetched: Any | None = None) -> np.ndarray:
+    if prefetched is not None:
+        return np.asarray(prefetched)
+    if not getattr(value, "is_fully_addressable", True):
+        if getattr(value, "is_fully_replicated", False):
+            value = value.addressable_data(0)
+        else:
+            value = process_allgather(value, tiled=True)
+    return np.asarray(value)
 
 
 # Note: we suppose the allocated devices in Pathways are contiguous. This is waiting to check from GCP.
