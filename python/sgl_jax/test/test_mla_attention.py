@@ -419,10 +419,14 @@ class TestMLAAttention(CustomTestCase):
         new_kv_c_3d = new_kv_c.reshape(new_kv_c.shape[0], 1, new_kv_c.shape[1])
         new_k_pe_3d = new_k_pe.reshape(new_k_pe.shape[0], 1, new_k_pe.shape[1])
 
-        # Match the backend's shard_map in_specs: Q tensors are head-sharded on
-        # "tensor", latent K/V are replicated (single shared KV head).
-        heads_sharded = NamedSharding(mesh, P(None, "tensor", None))
-        replicated = NamedSharding(mesh, P(None, None, None))
+        # Match the backend's shard_map in_specs (P(dpa, ...) with dpa="data"):
+        # Q tensors are token-sharded on "data" and head-sharded on "tensor";
+        # latent K/V carry only the token/"data" axis (single shared KV head).
+        # JAX 0.10.1 asserts the inputs already match in_specs (incl. the
+        # size-1 data axis on a single chip), so the test must place them
+        # exactly as production does.
+        heads_sharded = NamedSharding(mesh, P("data", "tensor", None))
+        replicated = NamedSharding(mesh, P("data", None, None))
         ql_nope_s = jax.device_put(ql_nope, heads_sharded)
         q_pe_s = jax.device_put(q_pe, heads_sharded)
         new_kv_c_3d_s = jax.device_put(new_kv_c_3d, replicated)

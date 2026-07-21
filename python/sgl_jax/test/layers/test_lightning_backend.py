@@ -92,6 +92,19 @@ def _make_fake_layer(layer_id=_LAYER_ID, num_heads=_H, head_dim=_K):
     return SimpleNamespace(layer_id=layer_id, mesh=mesh, num_heads=num_heads, head_dim=head_dim)
 
 
+def _put(x, *axes):
+    """Place an array on the sharding production provides to the backend.
+
+    JAX 0.9.1+ asserts shard_map inputs already match in_specs (0.10.1 is
+    strict even on size-1 axes). Production q/k/v arrive from LinearBase with
+    P("data", ..., "tensor") and the state pool emits P("data", "tensor", ...)
+    buffers, so backend inputs must mirror that. Only apply this to the arrays
+    handed to the backend: the naive reference scans over the token axis and
+    requires its inputs replicated.
+    """
+    return jax.device_put(x, jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(*axes)))
+
+
 def _make_mock_pool(layer_id, recurrent_state, recurrent_indices=None):
     """Create a mock recurrent state pool."""
     B = recurrent_state.shape[0]
@@ -99,7 +112,10 @@ def _make_mock_pool(layer_id, recurrent_state, recurrent_indices=None):
         recurrent_indices = np.arange(1, B + 1, dtype=np.int32)
     N_plus_1 = int(max(recurrent_indices)) + 1
     buf = jnp.zeros((N_plus_1,) + recurrent_state.shape[1:], dtype=recurrent_state.dtype)
-    buf = buf.at[jnp.array(recurrent_indices)].set(recurrent_state)
+    # recurrent_state may come back sharded from a prior backend call; JAX 0.10.1 refuses to
+    # scatter a sharded operand into the unsharded scaffolding buffer, so replicate it first.
+    buf = buf.at[jnp.array(recurrent_indices)].set(np.asarray(recurrent_state))
+    buf = _put(buf, "data", "tensor", None, None)
     return MockRecurrentStatePool(layer_caches={layer_id: (buf, [])}), recurrent_indices
 
 
@@ -189,7 +205,10 @@ def _run_backend_extend(lens, H, K, dtype, h0, rng_seed, layer_id=_LAYER_ID):
         layer = _make_fake_layer(layer_id=layer_id, num_heads=H, head_dim=K)
         fb = SimpleNamespace(forward_mode=ForwardMode.EXTEND)
 
-        out_backend, pu = backend(q, k, v, layer=layer, forward_batch=fb, recurrent_state_pool=pool)
+        qs, ks, vs = (_put(t, "data", "tensor", None) for t in (q, k, v))
+        out_backend, pu = backend(
+            qs, ks, vs, layer=layer, forward_batch=fb, recurrent_state_pool=pool
+        )
         state_backend = _extract_state(pu, rec_indices)
 
     # Reference
@@ -240,7 +259,10 @@ def _run_backend_extend_bucket_padded(lens, H, K, dtype, h0, rng_seed, layer_id=
         layer = _make_fake_layer(layer_id=layer_id, num_heads=H, head_dim=K)
         fb = SimpleNamespace(forward_mode=ForwardMode.EXTEND)
 
-        out_backend, pu = backend(q, k, v, layer=layer, forward_batch=fb, recurrent_state_pool=pool)
+        qs, ks, vs = (_put(t, "data", "tensor", None) for t in (q, k, v))
+        out_backend, pu = backend(
+            qs, ks, vs, layer=layer, forward_batch=fb, recurrent_state_pool=pool
+        )
         state_backend = _extract_state(pu, rec_indices)
 
     cu_seqlens = np.concatenate([np.array([0], dtype=np.int32), np.cumsum(lens, dtype=np.int32)])
@@ -271,6 +293,8 @@ def _run_backend_extend_bucket_padded(lens, H, K, dtype, h0, rng_seed, layer_id=
 def _run_backend_decode(B, H, K, dtype, h0, rng_seed, layer_id=_LAYER_ID):
     """Helper to run backend decode and return output + state."""
     rng = np.random.default_rng(rng_seed)
+    # Keep these replicated: they feed the naive reference (which scans over the
+    # batch axis). The backend gets sharded copies at the call site below.
     q = jnp.array(rng.standard_normal((B, 1, H, K)).astype(np.float32), dtype=dtype)
     k = jnp.array(rng.standard_normal((B, 1, H, K)).astype(np.float32), dtype=dtype)
     v = jnp.array(rng.standard_normal((B, 1, H, K)).astype(np.float32), dtype=dtype)
@@ -300,9 +324,9 @@ def _run_backend_decode(B, H, K, dtype, h0, rng_seed, layer_id=_LAYER_ID):
         layer = _make_fake_layer(layer_id=layer_id, num_heads=H, head_dim=K)
         fb = SimpleNamespace(forward_mode=ForwardMode.DECODE)
 
-        q_in = q.reshape(B, H, K)
-        k_in = k.reshape(B, H, K)
-        v_in = v.reshape(B, H, K)
+        q_in = _put(q.reshape(B, H, K), "data", "tensor", None)
+        k_in = _put(k.reshape(B, H, K), "data", "tensor", None)
+        v_in = _put(v.reshape(B, H, K), "data", "tensor", None)
 
         out_backend, pu = backend(
             q_in, k_in, v_in, layer=layer, forward_batch=fb, recurrent_state_pool=pool

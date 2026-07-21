@@ -245,23 +245,30 @@ class MoEKernelTest(jtu.JaxTestCase):
 
         topk_weights, topk_ids = topk_module(gating_output)
 
+        # fused_ep_moe feeds these straight into its shard_map, which shards dim 0 across the
+        # EP mesh. ref_moe is a plain-JAX reference and must keep the replicated originals.
+        ep = jax.sharding.NamedSharding(self.mesh, P(("data", "tensor")))
+
+        def shard(x):
+            return None if x is None else jax.device_put(x, ep)
+
         actual = fused_ep_moe(
             mesh=self.mesh,
-            tokens=a,
-            w1=w1,
-            w2=w2,
-            w3=w3,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
+            tokens=shard(a),
+            w1=shard(w1),
+            w2=shard(w2),
+            w3=shard(w3),
+            topk_weights=shard(topk_weights),
+            topk_ids=shard(topk_ids),
             top_k=top_k,
             act_fn=act_fn,
             quant_block_k=quant_block_k,
-            w1_scale=w1_scale,
-            w2_scale=w2_scale,
-            w3_scale=w3_scale,
-            b1=b1,
-            b2=b2,
-            b3=b3,
+            w1_scale=shard(w1_scale),
+            w2_scale=shard(w2_scale),
+            w3_scale=shard(w3_scale),
+            b1=shard(b1),
+            b2=shard(b2),
+            b3=shard(b3),
             w1_shared=w1_shared,
             w2_shared=w2_shared,
             w3_shared=w3_shared,
@@ -316,6 +323,8 @@ class MoEKernelTest(jtu.JaxTestCase):
             x = lax.all_gather(x, axis_name="data", axis=0, tiled=True)
             return x
 
+        # _replicate_tokens gathers from the EP layout, so the replicated ref output must match.
+        expected = jax.reshard(expected, ep)
         actual_host = np.asarray(jax.device_get(_replicate_tokens(actual)))
         expected_host = np.asarray(jax.device_get(_replicate_tokens(expected)))
         self.assertAllClose(actual_host, expected_host, atol=atol, rtol=rtol)
