@@ -430,7 +430,13 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         # KV via kv_b_proj and run standard attention. Read by
         # DeepseekV3DecoderLayer to construct DeepseekV3Attention; harmless on
         # non-MLA models that ignore the attribute.
-        self.model_config.hf_config.use_absorbed_mla = self.server_args.attention_backend == "fa"
+        self.model_config.hf_config.use_absorbed_mla = self.server_args.attention_backend in (
+            "fa",
+            "dsa_sparse",
+        )
+        self.model_config.hf_config.use_dsa_sparse = (
+            self.server_args.attention_backend == "dsa_sparse"
+        )
         self.model_config.hf_config.enable_sequence_parallel = (
             self.server_args.enable_sequence_parallel
         )
@@ -566,6 +572,34 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 )
             cfg = self.model_config.hf_text_config
             full_attn_backend = MLAAttentionBackend(
+                num_attn_heads=self.num_attn_heads,
+                kv_lora_rank=cfg.kv_lora_rank,
+                qk_nope_head_dim=cfg.qk_nope_head_dim,
+                qk_rope_head_dim=cfg.qk_rope_head_dim,
+                v_head_dim=cfg.v_head_dim,
+                page_size=self.page_size,
+                mesh=self.mesh,
+                attention_data_partition_axis="data",
+            )
+
+        elif backend == "dsa_sparse" and self.use_mla_backend:
+            from sgl_jax.srt.kernels.dsa.ref import build_index_share_map
+            from sgl_jax.srt.layers.attention.dsa_sparse_backend import (
+                DSASparseAttentionBackend,
+            )
+
+            cfg = self.model_config.hf_text_config
+            full_slot, _, _ = build_index_share_map(
+                getattr(cfg, "indexer_types", None),
+                getattr(cfg, "index_skip_topk_offset", 0),
+                cfg.num_hidden_layers,
+            )
+            full_attn_backend = DSASparseAttentionBackend(
+                index_topk=cfg.index_topk,
+                index_head_dim=cfg.index_head_dim,
+                index_n_heads=cfg.index_n_heads,
+                skip_offset=getattr(cfg, "index_skip_topk_offset", 0),
+                full_slot=full_slot,
                 num_attn_heads=self.num_attn_heads,
                 kv_lora_rank=cfg.kv_lora_rank,
                 qk_nope_head_dim=cfg.qk_nope_head_dim,

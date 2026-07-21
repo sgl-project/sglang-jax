@@ -97,6 +97,34 @@ class GlmDsaIndexer(nnx.Module):
             scope_name="weights_proj",
         )
 
+    def project(
+        self, hidden_states: jax.Array, qr: jax.Array, positions: jax.Array, rotary_emb: Any
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        """Indexer projections only (query, key, per-head weights); no top-k.
+
+        Returns query [T, n_head, head_dim], key [T, head_dim], weights [T, n_head]
+        after RoPE + Hadamard, ready for the DSA backend's streamindex_topk.
+        """
+        query, _ = self.wq_b(qr)
+        query = query.reshape(-1, self.n_head, self.head_dim)
+
+        key, _ = self.wk(hidden_states)
+        key = self.k_norm(key)
+
+        rope_dim = 64
+        q_rope = query[:, :, :rope_dim]
+        k_rope = key[:, :rope_dim][:, None, :]
+        q_rope, k_rope = rotary_emb(positions, q_rope, k_rope)
+        query = query.at[:, :, :rope_dim].set(q_rope)
+        key = key.at[:, :rope_dim].set(k_rope.squeeze(1))
+
+        h_matrix = get_hadamard_matrix(128) * (128**-0.5)
+        query = jnp.einsum("thd,de->the", query, h_matrix)
+        key = jnp.einsum("td,de->te", key, h_matrix)
+
+        weights, _ = self.weights_proj(hidden_states)
+        return query, key, weights
+
     def __call__(
         self, hidden_states: jax.Array, qr: jax.Array, positions: jax.Array, rotary_emb: Any
     ) -> jax.Array:
@@ -165,12 +193,16 @@ class Glm5Attention(nnx.Module):
         dtype: jnp.dtype = jnp.bfloat16,
         use_absorbed: bool = True,
         has_indexer: bool = True,
+        indexer_type: str = "full",
+        use_dsa_sparse: bool = False,
     ):
         super().__init__()
         self.layer_id = layer_id
         self.mesh = mesh
         self.num_heads = num_heads
         self.kv_head_num = num_kv_heads
+        self.indexer_type = indexer_type
+        self.use_dsa_sparse = use_dsa_sparse
 
         self.qk_nope_head_dim = 192
         self.qk_rope_head_dim = 64
@@ -342,6 +374,7 @@ class Glm5Attention(nnx.Module):
         k_rope: jax.Array,
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
+        **dsa_kwargs,
     ) -> tuple[jax.Array, jax.Array]:
         # "thd,rhd->thr" — fp32 accumulate: on v7x the default bf16
         # accumulator drops enough precision on this small batched dot
@@ -365,6 +398,7 @@ class Glm5Attention(nnx.Module):
             token_to_kv_pool=token_to_kv_pool,
             q_rope=q_rope,
             k_rope=k_rope,
+            **dsa_kwargs,
         )
         # "thr,rhd->thd" — fp32 accumulate; see ql_nope above.
         o_v = jax.lax.dot_general(
@@ -411,13 +445,27 @@ class Glm5Attention(nnx.Module):
         hidden_states: jax.Array,
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
+        dsa_topk_in: jax.Array | None = None,
+        dsa_topk_pages_in: jax.Array | None = None,
     ) -> tuple[jax.Array, jax.Array]:
         q_compressed, _ = self.q_a_proj(hidden_states)
         q_compressed = self.q_a_layernorm(q_compressed)
         q, _ = self.q_b_proj(q_compressed)
         q = q.reshape(-1, self.num_heads, self.qk_head_dim)
 
-        if self.indexer is not None:
+        dsa_kwargs = {}
+        if self.use_dsa_sparse:
+            dsa_kwargs["indexer_type"] = self.indexer_type
+            dsa_kwargs["dsa_topk_in"] = dsa_topk_in
+            dsa_kwargs["dsa_topk_pages_in"] = dsa_topk_pages_in
+            if self.indexer is not None:
+                q_idx, k_idx, idx_w = self.indexer.project(
+                    hidden_states, q_compressed, positions, self.rotary_emb
+                )
+                dsa_kwargs["q_idx"] = q_idx
+                dsa_kwargs["k_idx"] = k_idx
+                dsa_kwargs["idx_weights"] = idx_w
+        elif self.indexer is not None:
             _ = self.indexer(hidden_states, q_compressed, positions, self.rotary_emb)
 
         q_nope = q[:, :, : self.qk_nope_head_dim]
@@ -432,7 +480,7 @@ class Glm5Attention(nnx.Module):
 
         if self.use_absorbed:
             attn_output, kv_fused = self._forward_mqa(
-                q_nope, q_rope, compressed, k_rope, forward_batch, token_to_kv_pool
+                q_nope, q_rope, compressed, k_rope, forward_batch, token_to_kv_pool, **dsa_kwargs
             )
         else:
             attn_output, kv_fused = self._forward_mha(
@@ -615,7 +663,9 @@ class Glm5DecoderLayer(nnx.Module):
         # layer's top-k and ship no indexer weights. Dense MLA discards indexer
         # output anyway, so just skip building the module on shared layers.
         indexer_types = getattr(config, "indexer_types", None)
-        has_indexer = indexer_types is None or indexer_types[layer_id] == "full"
+        indexer_type = "full" if indexer_types is None else indexer_types[layer_id]
+        has_indexer = indexer_type == "full"
+        use_dsa_sparse = getattr(config, "use_dsa_sparse", False)
 
         self.self_attn = Glm5Attention(
             hidden_size=config.hidden_size,
@@ -634,6 +684,8 @@ class Glm5DecoderLayer(nnx.Module):
             mesh=mesh,
             use_absorbed=True,
             has_indexer=has_indexer,
+            indexer_type=indexer_type,
+            use_dsa_sparse=use_dsa_sparse,
         )
 
         first_k_dense_replace = getattr(config, "first_k_dense_replace", 0)
@@ -742,6 +794,8 @@ class Glm5DecoderLayer(nnx.Module):
         token_to_kv_pool: KVCache,
         residual: jax.Array | None = None,
         dispatch_info: ExpertLocationMetadata | None = None,
+        dsa_topk_in: jax.Array | None = None,
+        dsa_topk_pages_in: jax.Array | None = None,
     ) -> tuple[jax.Array, jax.Array]:
         if residual is None:
             residual = hidden_states
@@ -756,6 +810,8 @@ class Glm5DecoderLayer(nnx.Module):
             hidden_states=hidden_states,
             forward_batch=forward_batch,
             token_to_kv_pool=token_to_kv_pool,
+            dsa_topk_in=dsa_topk_in,
+            dsa_topk_pages_in=dsa_topk_pages_in,
         )
         hidden_states += residual
         residual = hidden_states
@@ -827,10 +883,15 @@ class Glm5Model(nnx.Module):
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
     ) -> jax.Array:
+        from sgl_jax.srt.layers.attention.dsa_sparse_backend import DSAFusedCache
+
         hidden_states = self.embed_tokens(forward_batch.input_ids)
         residual = None
         layers_kv_fused = []
+        layers_idx_fused = []
         layers_topk_ids = []
+        dsa_topk = None
+        dsa_topk_pages = None
         for layer in self.layers:
             hidden_states, residual, kv_fused, topk_ids = layer(
                 forward_batch.positions,
@@ -839,15 +900,26 @@ class Glm5Model(nnx.Module):
                 token_to_kv_pool,
                 residual,
                 dispatch_info=forward_batch.expert_location_metadata,
+                dsa_topk_in=dsa_topk,
+                dsa_topk_pages_in=dsa_topk_pages,
             )
-            layers_kv_fused.append(kv_fused)
+            if isinstance(kv_fused, DSAFusedCache):
+                layers_kv_fused.append(kv_fused.kv)
+                if kv_fused.idx is not None:
+                    layers_idx_fused.append(kv_fused.idx)
+                if kv_fused.topk is not None:
+                    dsa_topk = kv_fused.topk
+                if kv_fused.topk_pages is not None:
+                    dsa_topk_pages = kv_fused.topk_pages
+            else:
+                layers_kv_fused.append(kv_fused)
             layers_topk_ids.append(topk_ids)
 
         if residual is not None:
             hidden_states += residual
 
         hidden_states = self.norm(hidden_states)
-        return hidden_states, layers_kv_fused, layers_topk_ids
+        return hidden_states, layers_kv_fused, layers_idx_fused, layers_topk_ids
 
 
 class Glm5ForCausalLM(nnx.Module):
@@ -882,7 +954,7 @@ class Glm5ForCausalLM(nnx.Module):
         logits_metadata: LogitsMetadata,
     ):
         kv_pool = memory_pools.token_to_kv_pool
-        hidden_states, layers_kv_fused, layers_topk_ids = self.model(
+        hidden_states, layers_kv_fused, layers_idx_fused, layers_topk_ids = self.model(
             forward_batch,
             kv_pool,
         )
@@ -892,7 +964,8 @@ class Glm5ForCausalLM(nnx.Module):
         else:
             output = self.logits_processor(hidden_states, self.model.embed_tokens, logits_metadata)
 
-        return output, {"token_to_kv_pool": layers_kv_fused}, True, layers_topk_ids
+        kv_update = (layers_kv_fused, layers_idx_fused) if layers_idx_fused else layers_kv_fused
+        return output, {"token_to_kv_pool": kv_update}, True, layers_topk_ids
 
     def load_weights(self, model_config: ModelConfig):
         loader = WeightLoader(
