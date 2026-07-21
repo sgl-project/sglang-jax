@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -21,6 +22,8 @@ if TYPE_CHECKING:
     from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
     from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
     from sgl_jax.srt.model_executor.model_runner import ModelRunner
+
+logger = logging.getLogger(__name__)
 
 
 # --- Linear (state-based) attention base classes ----------------------------
@@ -284,17 +287,31 @@ def attn_backend_wrapper(
             mesh=runner.mesh,
         )
     elif runner.lightning_config is not None:
-        from sgl_jax.srt.layers.attention.linear.lightning_backend import (
-            LightningAttnBackend,
-        )
-
         cfg_lightning = runner.lightning_config
-        linear_attn_backend = LightningAttnBackend(
-            mesh=runner.mesh,
-            linear_recurrent_layer_ids=cfg_lightning.linear_layer_ids,
-            num_hidden_layers=cfg_lightning.num_hidden_layers,
-            num_heads=cfg_lightning.num_attention_heads,
+        # Bailing hybrid spans two linear-attention families: V2.5 uses
+        # Lightning/GLA, while V3 (Ling-V3-Flash / ring_v3_lite) uses KDA.
+        # Route by ``linear_attn_type``.
+        resolved_type = getattr(cfg_lightning, "linear_attn_type", "gla")
+        logger.info(
+            "Bailing hybrid linear backend: linear_attn_type=%r -> %s",
+            resolved_type,
+            "KDA" if resolved_type == "kda" else "Lightning/GLA",
         )
+        if resolved_type == "kda":
+            from sgl_jax.srt.layers.attention.linear.kda_backend import KDAAttnBackend
+
+            linear_attn_backend = KDAAttnBackend(mesh=runner.mesh)
+        else:
+            from sgl_jax.srt.layers.attention.linear.lightning_backend import (
+                LightningAttnBackend,
+            )
+
+            linear_attn_backend = LightningAttnBackend(
+                mesh=runner.mesh,
+                linear_recurrent_layer_ids=cfg_lightning.linear_layer_ids,
+                num_hidden_layers=cfg_lightning.num_hidden_layers,
+                num_heads=cfg_lightning.num_attention_heads,
+            )
     else:
         raise NotImplementedError(f"No linear backend wired for hybrid config {type(cfg).__name__}")
 

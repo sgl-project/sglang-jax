@@ -14,7 +14,7 @@ from sgl_jax.srt.eplb.expert_location import get_global_expert_location_metadata
 from sgl_jax.srt.kernels.gmm.megablox_gmm_backend import gmm
 
 # Re-export for backward compatibility: external code imports from this module.
-from sgl_jax.srt.layers.fused_moe import FusedEPMoE, FusedEPMoEV2  # noqa: F401
+from sgl_jax.srt.layers.fused_moe import FusedEPMoE, FusedEPMoEV2, FusedTPMoEV4  # noqa: F401
 from sgl_jax.srt.layers.gate import GateLogit, TopK  # noqa: F401
 from sgl_jax.srt.utils.profiling_utils import named_scope
 from sgl_jax.srt.utils.quantization.quantization_utils import (
@@ -783,7 +783,7 @@ def create_moe_weights_mapping(
             expert_type_names[1]: "wi_1",
             expert_type_names[2]: "wo",
         }
-    elif moe_backend in ("fused", "fused_v2"):
+    elif moe_backend in ("fused", "fused_v2", "fused_v4"):
         expert_type_map = {
             expert_type_names[0]: "w1",
             expert_type_names[1]: "w3",
@@ -814,7 +814,7 @@ def create_moe_weights_mapping(
                 ("expert", "tensor", None) if target_name == "wo" else ("expert", None, "tensor")
             )
             transpose = True
-        elif moe_backend in ("fused", "fused_v2"):
+        elif moe_backend in ("fused", "fused_v2", "fused_v4"):
             # Fused MoE kernel shards experts across the full EP mesh, i.e. the
             # product of ("data", "tensor"). Shard expert dim (axis=0) across
             # both mesh axes so each device owns a disjoint expert slice.

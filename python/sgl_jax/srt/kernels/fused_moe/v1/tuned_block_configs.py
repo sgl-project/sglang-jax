@@ -42,6 +42,20 @@ logger = logging.getLogger(__name__)
 TUNED_BLOCK_CONFIGS: dict[str, dict[tuple, tuple[int, ...]]] = {
     # Populate per-device kind, e.g. "TPU v6e", "TPU v7".
     "TPU v7": {
+        # ling_v3_flash: 512 experts, top_k=8, H=2560, moe_I=768, ep=4 (tp=4),
+        # grouped_topk(8,4). Ported verbatim from AInfer (offline v7x sweep
+        # 2026-06-08). KEY INSIGHT: full-tile (bf=768=full I, bd=2560=full H)
+        # beats any tiling — I/H small enough to fit one VMEM tile, so tiling
+        # only adds DMA round-trips. AInfer measured vs the shrink-fallback
+        # (bd≤512, bf=384): decode(8) 1134→595us (+90%), prefill 512 +357%.
+        # Value = (bt, bf, bd1, bd2, bts, btc, bfc, bd1c, bd2c, bse).
+        ('bfloat16', 'bfloat16', 8, 512, 8, 2560, 768, 4, False, True): (2, 768, 2560, 2560, 8, 8, 768, 2560, 2560, 768),
+        ('bfloat16', 'bfloat16', 16, 512, 8, 2560, 768, 4, False, True): (4, 768, 2560, 2560, 8, 4, 768, 2560, 2560, 768),
+        ('bfloat16', 'bfloat16', 32, 512, 8, 2560, 768, 4, False, True): (8, 768, 2560, 2560, 8, 8, 768, 2560, 2560, 768),
+        ('bfloat16', 'bfloat16', 128, 512, 8, 2560, 768, 4, False, True): (32, 768, 2560, 2560, 32, 32, 768, 2560, 2560, 768),
+        ('bfloat16', 'bfloat16', 512, 512, 8, 2560, 768, 4, False, True): (32, 768, 2560, 2560, 32, 32, 768, 2560, 2560, 768),
+        ('bfloat16', 'bfloat16', 2048, 512, 8, 2560, 768, 4, False, True): (32, 768, 2560, 2560, 64, 32, 768, 2560, 2560, 768),
+
         ('bfloat16', 'bfloat16', 16, 128, 8, 2048, 768, 8, False, False): (2, 256, 2048, 2048, 2, 2, 256, 2048, 2048, 256),
         ('bfloat16', 'bfloat16', 32, 128, 8, 2048, 768, 8, False, False): (4, 256, 2048, 2048, 4, 4, 256, 2048, 2048, 256),
         ('bfloat16', 'bfloat16', 64, 128, 8, 2048, 768, 8, False, False): (8, 256, 2048, 2048, 8, 8, 256, 2048, 2048, 256),
@@ -285,6 +299,36 @@ def get_simplified_key(
     )
 
 
+def _shape_aware_fallback(
+    *, num_tokens: int, hidden_size: int, intermediate_size: int, ep_size: int,
+) -> FusedMoEBlockConfig:
+    """Compute a shape-aware default block config (ported from AInfer v1
+    tuned_block_sizes.py:DEFAULT_BLOCK_SIZES).
+
+    Far better than DEFAULT_FUSED_MOE_BLOCK_CONFIG when the actual shape is
+    not in TUNED_BLOCK_CONFIGS — bf=384 for I=768 (3 tiles, no waste) vs the
+    hardcoded bf=512 (1.5 tiles, 33% waste).
+    """
+    h = hidden_size if hidden_size % 256 == 0 else ((hidden_size + 255) // 256) * 256
+    i = intermediate_size if intermediate_size % 256 == 0 else ((intermediate_size + 255) // 256) * 256
+    local_num_tokens = max(num_tokens // ep_size, 1)
+    d = h // 256
+    f = i // 256
+    bt = min(local_num_tokens, 128)
+    bf = min(256 * f // 2, 1024)
+    bd1 = min(256 * d // 2, 1024)
+    bd2 = min(256 * d // 2, 2048)
+    btc = min(local_num_tokens // 2 or 1, 64)
+    bfc = min(256 * f // 2, 1024)
+    bd1c = min(256 * d // 2, 1024)
+    bd2c = min(256 * d // 2, 2048)
+    return FusedMoEBlockConfig(
+        bt=bt, bf=bf, bd1=bd1, bd2=bd2,
+        btc=btc, bfc=bfc, bd1c=bd1c, bd2c=bd2c,
+        bse=min(256 * f // 2, 512),
+    )
+
+
 def get_tuned_fused_moe_block_config(
     *,
     num_tokens: int,
@@ -326,7 +370,22 @@ def get_tuned_fused_moe_block_config(
         cfg_tuple = TUNED_BLOCK_CONFIGS.get("*", {}).get(table_key)
 
     if cfg_tuple is None:
-        return DEFAULT_FUSED_MOE_BLOCK_CONFIG
+        # No exact tuning match — use AInfer-style shape-aware fallback (much
+        # better than the legacy DEFAULT for non-tuned shapes like
+        # ling_v3_flash E=512 H=2560 I=768 where DEFAULT bf=512 wastes 33%).
+        cfg = _shape_aware_fallback(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            ep_size=ep_size,
+        )
+        logger.info(
+            "v1 tuned lookup miss for %s, using shape-aware fallback: bt=%d bf=%d "
+            "bd1=%d bd2=%d btc=%d bfc=%d bd1c=%d bd2c=%d",
+            table_key, cfg.bt, cfg.bf, cfg.bd1, cfg.bd2,
+            cfg.btc, cfg.bfc, cfg.bd1c, cfg.bd2c,
+        )
+        return cfg
 
     if len(cfg_tuple) != 10:
         raise ValueError(f"Unexpected tuned config tuple length: {len(cfg_tuple)}")

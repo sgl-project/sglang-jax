@@ -1,0 +1,120 @@
+# Tunix GRPO training with AInfer rollout on 4x4 TPU v6e
+#
+# 4 nodes × 4 chips = 16 chips total
+# Mesh: (4,4) — fsdp=4, tp=4
+# Rollout shares actor mesh (AInfer tp=16, can be optimized later)
+#
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: grpo-ainfer-4x4
+  annotations:
+    alpha.jobset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool
+spec:
+  failurePolicy:
+    maxRestarts: 0
+  replicatedJobs:
+    - name: worker
+      replicas: 1
+      template:
+        spec:
+          parallelism: 4
+          completions: 4
+          backoffLimit: 0
+          template:
+            spec:
+              restartPolicy: Never
+              nodeSelector:
+                cloud.google.com/gke-tpu-accelerator: tpu-v6e-slice
+                cloud.google.com/gke-tpu-topology: "4x4"
+              tolerations:
+                - key: google.com/tpu
+                  operator: Exists
+                  effect: NoSchedule
+              containers:
+                - name: grpo
+                  image: python:3.12-slim
+                  command: ["/bin/bash", "-c"]
+                  args:
+                    - |
+                      set -e
+                      apt-get update -qq && apt-get install -y -qq git build-essential curl cmake && rm -rf /var/lib/apt/lists/*
+                      pip install -q --upgrade pip setuptools
+                      pip install -q "numpy>=1.26"
+                      pip install -q torch --index-url https://download.pytorch.org/whl/cpu
+                      pip install -q transformers huggingface_hub safetensors tokenizers gcsfs
+                      pip install -q datasets
+                      pip install -q tensorflow-cpu
+                      pip install -q "jax[tpu]==0.10.1" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+                      pip install -q "flax==0.12.4" triton
+                      pip cache purge 2>/dev/null || true
+                      apt-get clean
+
+                      python3 -c "import jax; print(f'TPU local={jax.local_device_count()}')"
+
+                      # Tunix from GCS tarball (with skip_weight_load support)
+                      python3 -c "import gcsfs; fs=gcsfs.GCSFileSystem(); fs.get('gs://wenqiao-ainfer-test/tunix.tar.gz','/tmp/tunix.tar.gz')"
+                      mkdir -p /app/tunix-repo && cd /app/tunix-repo && tar xzf /tmp/tunix.tar.gz && rm /tmp/tunix.tar.gz
+                      pip install -q -e .
+                      pip cache purge 2>/dev/null || true
+
+                      # AInfer (with skip_weight_load support)
+                      python3 -c "import gcsfs; fs=gcsfs.GCSFileSystem(); fs.get('gs://wenqiao-ainfer-test/ainfer.tar.gz','/tmp/ainfer.tar.gz')"
+                      mkdir -p /app/ainfer && cd /app/ainfer && tar xzf /tmp/ainfer.tar.gz && rm /tmp/ainfer.tar.gz
+                      export PYTHONPATH=/app/ainfer:$PYTHONPATH
+
+                      # Model and config
+                      mkdir -p /tmp/models
+                      python3 -c "import gcsfs; fs=gcsfs.GCSFileSystem(); fs.get('gs://wenqiao-ainfer-test/models/inclusionAI/Ling-mini-2.0','/tmp/models/inclusionAI/Ling-mini-2.0',recursive=True); print('Model OK')"
+                      python3 -c "import gcsfs; fs=gcsfs.GCSFileSystem(); fs.get('gs://wenqiao-ainfer-test/wenqiao/grpo-ainfer-4x4-config.yaml','/app/grpo-config.yaml')"
+
+                      cd /app/tunix-repo
+                      python3 -m tunix.cli.grpo_main /app/grpo-config.yaml 2>&1 | tee /tmp/grpo_ainfer.log
+                      echo "DONE_GRPO_AINFER_4x4"
+                  env:
+                    - name: AINFER_SKIP_INIT_SYNC
+                      value: "0"
+                    - name: GRPO_DEBUG_LOSS
+                      value: "0"
+                    - name: GRPO_DEBUG_GRAD
+                      value: "0"
+                    - name: GRPO_DEBUG_ROLLOUT
+                      value: "0"
+                    - name: SKIP_XPROF
+                      value: "1"
+                    - name: TPU_COMPILE_CACHE_DIR
+                      value: "gs://wenqiao-ainfer-test/jax_cache/"
+                    - name: AINFER_OVERLAP
+                      value: "0"
+                    - name: AINFER_MULTI_STEP
+                      value: "8"
+                    - name: AINFER_ASYNC_DISPATCH
+                      value: "0"
+                    - name: AINFER_MOE_KERNEL_VERSION
+                      value: "1"
+                    - name: PALLAS_COMPILER_PARAMS
+                      value: "--disable_sparse_core_dma_merging=true"
+                    - name: PALLAS_ENABLE_STRICT_DONE_BIT_CHECKS
+                      value: "true"
+                    - name: TPU_MESH_CONTROLLER_TIMEOUT_MS
+                      value: "300000"
+                    - name: LIBTPU_INIT_ARGS
+                      value: "--xla_tpu_all_gather_collective_matmul_mode=post_spmd --xla_tpu_reduce_scatter_collective_matmul_mode=post_spmd"
+                    - name: TPU_MIN_LOG_LEVEL
+                      value: "1"
+                    - name: TF_CPP_MIN_LOG_LEVEL
+                      value: "1"
+                    - name: TPU_STDERR_LOG_LEVEL
+                      value: "0"
+                    - name: HF_TOKEN
+                      value: "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"
+                  ports:
+                    - containerPort: 8471
+                    - containerPort: 29500
+                  resources:
+                    requests:
+                      google.com/tpu: "4"
+                      ephemeral-storage: "40Gi"
+                    limits:
+                      google.com/tpu: "4"
+                      ephemeral-storage: "100Gi"

@@ -1,5 +1,7 @@
 """Fused Expert-Parallel MoE layer using Pallas kernel."""
 
+import logging
+
 import jax
 from flax import nnx
 from jax import numpy as jnp
@@ -7,7 +9,12 @@ from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.eplb.expert_location import get_global_expert_location_metadata
-from sgl_jax.srt.kernels.fused_moe.v1.kernel import FusedMoEBlockConfig, fused_ep_moe
+from sgl_jax.srt.kernels.fused_moe.v1.kernel import (
+    FusedMoEBlockConfig,
+    fused_ep_moe,
+    get_dtype_packing,
+    get_ep_size,
+)
 from sgl_jax.srt.utils.quantization.quantization_utils import quantize_tensor
 
 
@@ -470,6 +477,36 @@ class FusedEPMoE(nnx.Module):
         """Forward pass through the fused MoE layer."""
         assert hidden_states.ndim == 2
 
+        # The fused kernel requires num_tokens to be a multiple of
+        # ep_size * t_packing: it shards tokens across ep_size devices and the
+        # per-device token count (local_num_tokens) must align to t_packing
+        # (2 for bf16, 4 for fp8). Small decode batches (e.g. bs=8 with ep=8 ->
+        # local_num_tokens=1) violate this. Pad the token axis up to the next
+        # valid multiple with zero-weight rows (they select expert 0 but
+        # contribute nothing), then slice the real tokens back out.
+        #
+        # ep_size must match what the kernel derives from the mesh
+        # (get_ep_size = dp * tp), NOT self.ep_size — the latter comes from the
+        # model config (often defaulting to 1) and would under-pad.
+        num_tokens = hidden_states.shape[0]
+        t_packing = get_dtype_packing(self.dtype)
+        kernel_ep_size = get_ep_size(self.mesh, "data", "tensor")
+        token_multiple = kernel_ep_size * t_packing
+        pad = (-num_tokens) % token_multiple
+        if pad:
+            hidden_states = jnp.concatenate(
+                [hidden_states, jnp.zeros((pad, hidden_states.shape[1]), hidden_states.dtype)],
+                axis=0,
+            )
+            topk_weights = jnp.concatenate(
+                [topk_weights, jnp.zeros((pad, topk_weights.shape[1]), topk_weights.dtype)],
+                axis=0,
+            )
+            topk_ids = jnp.concatenate(
+                [topk_ids, jnp.zeros((pad, topk_ids.shape[1]), topk_ids.dtype)],
+                axis=0,
+            )
+
         w1_shared_val = self.w1_shared.value if self.w1_shared is not None else None
         w3_shared_val = self.w3_shared.value if self.w3_shared is not None else None
         w2_shared_val = self.w2_shared.value if self.w2_shared is not None else None
@@ -529,6 +566,8 @@ class FusedEPMoE(nnx.Module):
         if out_sharding is None:
             out_sharding = jax.sharding.NamedSharding(self.mesh, P(*([None] * output.ndim)))
         output = jax.sharding.reshard(output, out_sharding)
+        if pad:
+            output = output[:num_tokens]
         return output
 
 
@@ -556,6 +595,28 @@ class FusedEPMoEV2(FusedEPMoE):
         )
 
         assert hidden_states.ndim == 2
+
+        # Same ep_size*t_packing padding as FusedEPMoE.__call__: the v2 kernel
+        # asserts num_tokens % ep_size == 0 (kernel.py local_num_tokens > 0
+        # assertion). Without this, bs=1 with ep=4 crashes at compile.
+        num_tokens = hidden_states.shape[0]
+        t_packing = get_dtype_packing(self.dtype)
+        kernel_ep_size = get_ep_size(self.mesh, "data", "tensor")
+        token_multiple = kernel_ep_size * t_packing
+        pad = (-num_tokens) % token_multiple
+        if pad:
+            hidden_states = jnp.concatenate(
+                [hidden_states, jnp.zeros((pad, hidden_states.shape[1]), hidden_states.dtype)],
+                axis=0,
+            )
+            topk_weights = jnp.concatenate(
+                [topk_weights, jnp.zeros((pad, topk_weights.shape[1]), topk_weights.dtype)],
+                axis=0,
+            )
+            topk_ids = jnp.concatenate(
+                [topk_ids, jnp.zeros((pad, topk_ids.shape[1]), topk_ids.dtype)],
+                axis=0,
+            )
 
         w1_scale = self.w1_scale.value if self.w1_scale is not None else None
         w3_scale = self.w3_scale.value if self.w3_scale is not None else None
@@ -632,6 +693,16 @@ class FusedEPMoEV2(FusedEPMoE):
             direct_scaled_dot=direct_scaled_dot,
             dp_axis_name="data",
             tp_axis_name="tensor",
+            # sflag budget control: 512/4=128 local experts overflow 16KB sflag
+            cross_expert_prefetch_mode=(
+                "none" if self.num_experts // self.ep_size >= 64 else "full"
+            ),
+            enable_bt_scatter_overlap=(
+                False if self.num_experts // self.ep_size >= 64 else True
+            ),
+            interleave_bt=(
+                False if self.num_experts // self.ep_size >= 64 else True
+            ),
         )
 
         # Reshard the MoE output to the caller-requested layout. Under sequence
@@ -645,4 +716,108 @@ class FusedEPMoEV2(FusedEPMoE):
             output = jax.sharding.reshard(
                 output, jax.sharding.NamedSharding(self.mesh, P("data", None))
             )
+        if pad:
+            output = output[:num_tokens]
+        return output
+
+
+class FusedTPMoEV4(FusedEPMoE):
+    """Tensor-Parallel MoE layer (v4 kernel, ported from AInfer).
+
+    Holds ALL experts on every chip but with the intermediate dim TP-sharded
+    1/tp. Replaces the EP a2a / barrier with a single psum across the tp axis.
+    bf16-only; no quantization, no in-kernel shared expert, incompatible with
+    EPLB (TP replicates every expert).
+    """
+
+    def __init__(self, *args, **kwargs):
+        import logging
+
+        logger = logging.getLogger(__name__)
+
+        kwargs.setdefault("num_shared_experts", 0)
+        quantization_config = kwargs.get("quantization_config", None)
+
+        super().__init__(*args, **kwargs)
+
+        if get_global_expert_location_metadata() is not None:
+            raise NotImplementedError("FUSED_V4 incompatible with EPLB (TP replicates all experts).")
+        if self.num_shared_experts > 0:
+            raise NotImplementedError("FUSED_V4 expects external shared expert (num_shared_experts=0).")
+        if quantization_config is not None and (
+            quantization_config.get_moe_weight_dtype() is not None
+            or quantization_config.get_moe_activation_dtype() is not None
+        ):
+            raise NotImplementedError("FUSED_V4 is bf16-only; quantization unsupported.")
+        logger.info("FusedTPMoEV4 layer %d: initialized (bf16 TP-MoE)", self.layer_id)
+
+    def reshape_weights_for_tp(self):
+        """EP→TP weight reshard for FusedTPMoEV4."""
+        import jax
+
+        full_w1 = jax.device_put(self.w1.value, jax.sharding.NamedSharding(self.mesh, P()))
+        full_w1.block_until_ready()
+        self.w1_tp = nnx.Param(jax.device_put(full_w1, jax.sharding.NamedSharding(self.mesh, P(None, None, "tensor"))))
+        full_w1.delete()
+        delattr(self, "w1")
+
+        full_w3 = jax.device_put(self.w3.value, jax.sharding.NamedSharding(self.mesh, P()))
+        full_w3.block_until_ready()
+        self.w3_tp = nnx.Param(jax.device_put(full_w3, jax.sharding.NamedSharding(self.mesh, P(None, None, "tensor"))))
+        full_w3.delete()
+        delattr(self, "w3")
+
+        full_w2 = jax.device_put(self.w2.value, jax.sharding.NamedSharding(self.mesh, P()))
+        full_w2.block_until_ready()
+        self.w2_tp = nnx.Param(jax.device_put(full_w2, jax.sharding.NamedSharding(self.mesh, P(None, "tensor", None))))
+        full_w2.delete()
+        delattr(self, "w2")
+
+    def __call__(
+        self,
+        hidden_states: jax.Array,
+        topk_weights: jax.Array,
+        topk_ids: jax.Array,
+        *,
+        block_config=None,
+        out_sharding: jax.sharding.Sharding | None = None,
+    ) -> jax.Array:
+        from sgl_jax.srt.kernels.fused_moe.v4.kernel import tp_moe_per_device
+
+        assert hidden_states.ndim == 2
+        topk_ids = jnp.asarray(topk_ids, dtype=jnp.int32)
+
+        # shard_map doesn't accept extra kwargs when called — bind static args
+        # via functools.partial before wrapping.
+        import functools
+        bound_kernel = functools.partial(
+            tp_moe_per_device,
+            num_experts=self.num_experts,
+            tp_axis_name="tensor",
+        )
+
+        output = jax.shard_map(
+            bound_kernel,
+            mesh=self.mesh,
+            in_specs=(
+                P("data", None),
+                P(None, None, "tensor"),
+                P(None, "tensor", None),
+                P(None, None, "tensor"),
+                P("data", None),
+                P("data", None),
+            ),
+            out_specs=P("data", None),
+        )(
+            hidden_states,
+            self.w1_tp.value,
+            self.w2_tp.value,
+            self.w3_tp.value,
+            topk_ids,
+            topk_weights,
+        )
+
+        output = jax.sharding.reshard(
+            output, jax.sharding.NamedSharding(self.mesh, P("data", None))
+        )
         return output
