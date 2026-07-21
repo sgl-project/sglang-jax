@@ -164,6 +164,8 @@ def validate_dflash_request(req) -> str | None:
         or getattr(sp, "structural_tag", None) is not None
     ):
         return "DFLASH speculative decoding does not support grammar-constrained decoding yet."
+    if sp.top_k != 1:
+        return "DFLASH speculative decoding currently only supports greedy sampling."
     return None
 
 

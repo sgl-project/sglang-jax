@@ -159,9 +159,10 @@ class DFlashDraftInput:
     def new_tokens_required_next_decode(self, requests, page_size: int) -> int:
         total = 0
         block_size = int(self.block_size)
+        reserve_tokens = block_size * (2 if self.future_indices is not None else 1)
         for req in requests:
             cur = int(req.kv_allocated_len)
-            nxt = max(cur, int(req.kv_committed_len) + block_size)
+            nxt = max(cur, int(req.kv_committed_len) + reserve_tokens)
             total += ((nxt + page_size - 1) // page_size) * page_size - (
                 (cur + page_size - 1) // page_size
             ) * page_size
