@@ -25,60 +25,34 @@ from sgl_jax.srt.speculative.base_worker import BaseSpecWorker
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
-class FakeArray:
-    def astype(self, dtype):
-        return ("astype", self, dtype)
-
-
 class TestMultihostLogprobHostTransfer(unittest.TestCase):
-    def test_host_logprob_array_allgathers_when_requested(self):
-        fake = FakeArray()
-        gathered = object()
-        calls = []
-
-        def fake_process_allgather(value, *, tiled):
-            calls.append(("allgather", value, tiled))
-            return gathered
-
-        def fake_device_get(value):
-            calls.append(("device_get", value))
-            return np.array([1.0, 2.0], dtype=np.float32)
-
-        with (
-            mock.patch.object(tp_worker, "process_allgather", fake_process_allgather),
-            mock.patch.object(tp_worker.jax, "device_get", fake_device_get),
-        ):
-            out = tp_worker._host_logprob_array(fake, allgather=True)
-
-        np.testing.assert_array_equal(out, np.array([1.0, 2.0], dtype=np.float32))
-        self.assertEqual(
-            calls,
-            [
-                ("allgather", fake, True),
-                ("device_get", gathered),
-            ],
-        )
-
-    def test_host_logprob_array_skips_allgather_by_default(self):
+    def test_host_logprob_array_gathers_only_when_requested(self):
         local = np.array([3.0], dtype=np.float32)
-        calls = []
-
-        def fake_process_allgather(value, *, tiled):
-            calls.append(("allgather", value, tiled))
-            return value
-
-        def fake_device_get(value):
-            calls.append(("device_get", value))
-            return value
+        sharded, gathered = object(), np.array([1.0, 2.0], dtype=np.float32)
+        allgather = mock.Mock(return_value=gathered)
+        device_get = mock.Mock(side_effect=lambda value: value)
 
         with (
-            mock.patch.object(tp_worker, "process_allgather", fake_process_allgather),
-            mock.patch.object(tp_worker.jax, "device_get", fake_device_get),
+            mock.patch.object(tp_worker, "process_allgather", allgather),
+            mock.patch.object(tp_worker.jax, "device_get", device_get),
         ):
-            out = tp_worker._host_logprob_array(local)
+            local_out = tp_worker._host_logprob_array(local)
+            gathered_out = tp_worker._host_logprob_array(sharded, allgather=True)
 
-        np.testing.assert_array_equal(out, local)
-        self.assertEqual(calls, [("device_get", local)])
+        np.testing.assert_array_equal(local_out, local)
+        np.testing.assert_array_equal(gathered_out, gathered)
+        allgather.assert_called_once_with(sharded, tiled=True)
+        self.assertEqual(device_get.call_args_list, [mock.call(local), mock.call(gathered)])
+
+    @staticmethod
+    def _materialize(output, batch, selector):
+        allgather = mock.Mock(side_effect=lambda value, *, tiled: value)
+        with (
+            mock.patch.object(tp_worker.jax, "device_get", side_effect=lambda value: value),
+            mock.patch.object(tp_worker, "process_allgather", allgather),
+        ):
+            ModelWorker._materialize_logprobs_to_host(None, output, batch, selector)
+        return allgather
 
     def test_materialize_logprobs_to_host_preserves_selector_order(self):
         output = LogitsProcessorOutput(
@@ -89,36 +63,15 @@ class TestMultihostLogprobHostTransfer(unittest.TestCase):
             ),
             next_token_top_logprobs_idx=np.array([[11, 12], [21, 22], [31, 32]], dtype=np.int32),
         )
-        batch = type(
-            "Batch",
-            (),
-            {
-                "dp_size": 2,
-                "top_logprobs_nums": [1, 2, 1],
-                "token_ids_logprobs": None,
-            },
-        )()
-
-        gathered = []
-
-        def fake_process_allgather(value, *, tiled):
-            gathered.append(value)
-            return value
-
-        with (
-            mock.patch.object(tp_worker.jax, "device_get", lambda value: value),
-            mock.patch.object(tp_worker, "process_allgather", fake_process_allgather),
-        ):
-            ModelWorker._materialize_logprobs_to_host(
-                None,
-                output,
-                batch,
-                np.array([0, 2, 1], dtype=np.int64),
-            )
+        batch = SimpleNamespace(
+            dp_size=2,
+            top_logprobs_nums=[1, 2, 1],
+            token_ids_logprobs=None,
+        )
+        allgather = self._materialize(output, batch, np.array([0, 2, 1]))
 
         np.testing.assert_array_equal(output.next_token_logprobs, np.array([10.0, 30.0, 20.0]))
-        self.assertEqual(len(gathered), 2)
-        self.assertEqual(len(output.next_token_top_logprobs_val), 3)
+        self.assertEqual(allgather.call_count, 2)
         for actual, expected in zip(
             output.next_token_top_logprobs_val,
             [[1.0], [3.0], [2.0, 2.1]],
@@ -161,38 +114,18 @@ class TestMultihostLogprobHostTransfer(unittest.TestCase):
                 [[11, 12], [21, 22], [31, 32], [41, 42]], dtype=np.int32
             ),
         )
-        batch = type(
-            "Batch",
-            (),
-            {
-                "dp_size": 2,
-                "per_dp_bs_size": 1,
-                "real_bs_per_dp": [1, 1],
-                "extend_seq_lens": np.array([2, 1], dtype=np.int32),
-                "extend_logprob_start_lens": np.array([0, 0], dtype=np.int32),
-                "top_logprobs_nums": [2, 1],
-                "token_ids_logprobs": None,
-            },
-        )()
+        batch = SimpleNamespace(
+            dp_size=2,
+            per_dp_bs_size=1,
+            real_bs_per_dp=[1, 1],
+            extend_seq_lens=np.array([2, 1]),
+            extend_logprob_start_lens=np.array([0, 0]),
+            top_logprobs_nums=[2, 1],
+            token_ids_logprobs=None,
+        )
+        allgather = self._materialize(output, batch, np.array([0, 1]))
 
-        gathered = []
-
-        def fake_process_allgather(value, *, tiled):
-            gathered.append(value)
-            return value
-
-        with (
-            mock.patch.object(tp_worker.jax, "device_get", lambda value: value),
-            mock.patch.object(tp_worker, "process_allgather", fake_process_allgather),
-        ):
-            ModelWorker._materialize_logprobs_to_host(
-                None,
-                output,
-                batch,
-                np.array([0, 1], dtype=np.int64),
-            )
-
-        self.assertEqual(len(gathered), 2)
+        self.assertEqual(allgather.call_count, 2)
         np.testing.assert_allclose(output.input_token_logprobs, [0.1, 0.2, 0.3, 0.4])
         for actual, expected in zip(
             output.input_top_logprobs_val,
@@ -206,29 +139,26 @@ class TestMultihostLogprobHostTransfer(unittest.TestCase):
 class TestSpecPrefillLogprobPaths(unittest.TestCase):
     def test_logprob_requests_do_not_skip_greedy_prefill_sample(self):
         worker = object.__new__(BaseSpecWorker)
-        sampling_info = type("SamplingInfo", (), {"is_all_greedy": True})()
-
-        batch = type(
-            "Batch",
-            (),
-            {
-                "sampling_info": sampling_info,
-                "return_logprob": False,
-                "return_output_logprob_only": False,
-            },
-        )()
-
-        self.assertTrue(worker._can_skip_greedy_prefill_sample(batch, False))
-
-        batch.return_logprob = True
-        self.assertFalse(worker._can_skip_greedy_prefill_sample(batch, False))
-
-        batch.return_logprob = False
-        batch.return_output_logprob_only = True
-        self.assertFalse(worker._can_skip_greedy_prefill_sample(batch, False))
-
-        batch.return_output_logprob_only = False
-        self.assertFalse(worker._can_skip_greedy_prefill_sample(batch, True))
+        batch = SimpleNamespace(
+            sampling_info=SimpleNamespace(is_all_greedy=True),
+            return_logprob=False,
+            return_output_logprob_only=False,
+        )
+        cases = [
+            (False, False, False, True),
+            (True, False, False, False),
+            (False, True, False, False),
+            (False, False, True, False),
+        ]
+        for return_logprob, output_only, legacy, expected in cases:
+            with self.subTest(
+                return_logprob=return_logprob,
+                output_only=output_only,
+                legacy=legacy,
+            ):
+                batch.return_logprob = return_logprob
+                batch.return_output_logprob_only = output_only
+                self.assertEqual(worker._can_skip_greedy_prefill_sample(batch, legacy), expected)
 
 
 class TestSpecDecodeOutputLogprobs(unittest.TestCase):
@@ -241,26 +171,28 @@ class TestSpecDecodeOutputLogprobs(unittest.TestCase):
         spec_steps: int = 3,
     ):
         scheduler = Scheduler.__new__(Scheduler)
-        scheduler.spec_algorithm = SpeculativeAlgorithm.NEXTN
-        scheduler.enable_overlap = output_only
-        scheduler.draft_worker = SimpleNamespace(
-            speculative_num_draft_tokens=draft_n,
-            speculative_num_steps=spec_steps,
+        scheduler.__dict__.update(
+            spec_algorithm=SpeculativeAlgorithm.NEXTN,
+            enable_overlap=output_only,
+            draft_worker=SimpleNamespace(
+                speculative_num_draft_tokens=draft_n,
+                speculative_num_steps=spec_steps,
+            ),
+            num_generated_tokens=0,
+            accept_token=0,
+            spec_num_forward_ct=0,
+            draft_token=0,
+            token_to_kv_pool_allocator=SimpleNamespace(
+                free_group_begin=lambda: None,
+                free_group_end=lambda: None,
+            ),
+            tree_cache=None,
+            set_next_batch_sampling_info_done=lambda _batch: None,
+            stream_output=lambda *args, **kwargs: None,
+            forward_ct_decode=0,
+            server_args=SimpleNamespace(decode_log_interval=1000),
+            log_decode_stats=lambda _batch: None,
         )
-        scheduler.num_generated_tokens = 0
-        scheduler.accept_token = 0
-        scheduler.spec_num_forward_ct = 0
-        scheduler.draft_token = 0
-        scheduler.token_to_kv_pool_allocator = SimpleNamespace(
-            free_group_begin=lambda: None,
-            free_group_end=lambda: None,
-        )
-        scheduler.tree_cache = None
-        scheduler.set_next_batch_sampling_info_done = lambda _batch: None
-        scheduler.stream_output = lambda *args, **kwargs: None
-        scheduler.forward_ct_decode = 0
-        scheduler.server_args = SimpleNamespace(decode_log_interval=1000)
-        scheduler.log_decode_stats = lambda _batch: None
 
         def make_req(rid, *, stops=None):
             req = Req(
@@ -281,14 +213,13 @@ class TestSpecDecodeOutputLogprobs(unittest.TestCase):
         req0 = make_req("rank-0", stops=stop_token_ids)
         req1 = make_req("rank-1")
 
-        top_vals = None
-        top_idx = None
-        token_vals = None
         rows_per_req = spec_steps + 1
         total_rows = 2 * rows_per_req
+        top_vals = top_idx = token_vals = None
         if not output_only:
-            top_vals = -np.arange(1, total_rows * 2 + 1, dtype=np.float32).reshape(total_rows, 2)
-            top_idx = np.arange(10, 10 + total_rows * 2, dtype=np.int32).reshape(total_rows, 2)
+            shape = (total_rows, 2)
+            top_vals = -np.arange(1, total_rows * 2 + 1, dtype=np.float32).reshape(shape)
+            top_idx = np.arange(10, 10 + total_rows * 2, dtype=np.int32).reshape(shape)
             token_vals = np.tile(np.arange(-10.0, 0.0, dtype=np.float32), (total_rows, 1))
 
         batch = SimpleNamespace(
@@ -318,16 +249,8 @@ class TestSpecDecodeOutputLogprobs(unittest.TestCase):
             num_accepted_tokens=None,
         )
 
-        gathered = []
-
-        def fake_process_allgather(value, *, tiled):
-            gathered.append((value, tiled))
-            return value
-
-        with mock.patch(
-            "jax.experimental.multihost_utils.process_allgather",
-            fake_process_allgather,
-        ):
+        gathered = mock.Mock(side_effect=lambda value, *, tiled: value)
+        with mock.patch("jax.experimental.multihost_utils.process_allgather", gathered):
             SchedulerOutputProcessorMixin.process_batch_result_decode(scheduler, batch, result)
         return (req0, req1), gathered
 
@@ -335,7 +258,7 @@ class TestSpecDecodeOutputLogprobs(unittest.TestCase):
         (req, rank1_req), gathered = self._run_decode(output_only=False)
 
         self.assertEqual(req.output_ids, [101, 102])
-        self.assertEqual(len(gathered), 3)
+        self.assertEqual(gathered.call_count, 3)
         self.assertEqual(req.output_token_logprobs_idx, [101, 102])
         np.testing.assert_allclose(req.output_token_logprobs_val, [-0.1, -0.2])
         self.assertEqual(req.output_top_logprobs_idx, [[10, 11], [12, 13]])
@@ -349,7 +272,7 @@ class TestSpecDecodeOutputLogprobs(unittest.TestCase):
     def test_spec_decode_appends_output_logprob_only(self):
         (req, rank1_req), gathered = self._run_decode(output_only=True)
 
-        self.assertEqual(gathered, [])
+        gathered.assert_not_called()
         self.assertEqual(req.output_token_logprobs_idx, [101, 102])
         np.testing.assert_allclose(req.output_token_logprobs_val, [-0.1, -0.2])
         self.assertIsNone(req.output_top_logprobs_val)
@@ -381,21 +304,14 @@ class TestSpecDecodeOutputLogprobs(unittest.TestCase):
 
 class TestSamplerLogprobOutput(unittest.TestCase):
     def test_process_logprob_results_preserves_hidden_states(self):
-        sampler = type("SamplerLike", (), {"mesh": Mesh(np.array(jax.devices()), ("data",))})()
+        sampler = SimpleNamespace(mesh=Mesh(np.array(jax.devices()), ("data",)))
         hidden_states = jnp.arange(6, dtype=jnp.float32).reshape(2, 3)
         logits_output = LogitsProcessorOutput(
             next_token_logits=jnp.zeros((2, 4), dtype=jnp.float32),
             hidden_states=hidden_states,
             input_token_logprobs=jnp.array([0.5, 0.25], dtype=jnp.float32),
         )
-        sampling_metadata = type(
-            "SamplingMetadata",
-            (),
-            {
-                "top_logprobs_nums": None,
-                "token_ids_logprobs": None,
-            },
-        )()
+        sampling_metadata = SimpleNamespace(top_logprobs_nums=None, token_ids_logprobs=None)
 
         output = Sampler._process_logprob_results(
             sampler,
