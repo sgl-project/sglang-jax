@@ -145,6 +145,17 @@ class SchedulerOutputProcessorMixin:
         self.chunked_reqs[dp_rank] = None
         self._pending_chunked_abort_reqs[dp_rank] = None
 
+    def _resolve_normal_overlap_result(self, result, launch_done=None):
+        if result.worker_batch is not None:
+            return self.tp_worker.resolve_result(
+                result.logits_output,
+                result.next_token_ids,
+                result.worker_batch,
+                result.cache_miss_count,
+                launch_done,
+            )
+        return self.tp_worker.resolve_last_batch_result(launch_done)
+
     def maybe_collect_routed_experts(self: Scheduler, req: Req):
         """Collect routed experts for a finished request."""
         if not req.return_routed_experts:
@@ -191,7 +202,7 @@ class SchedulerOutputProcessorMixin:
                     launch_done.wait()
             else:
                 logits_output, next_token_ids, cache_miss_count = (
-                    self.tp_worker.resolve_last_batch_result(launch_done)
+                    self._resolve_normal_overlap_result(result, launch_done)
                 )
         else:
             # Move next_token_ids and logprobs to cpu
@@ -462,7 +473,7 @@ class SchedulerOutputProcessorMixin:
                 next_token_logprobs = None
             else:
                 logits_output, next_token_ids, cache_miss_count = (
-                    self.tp_worker.resolve_last_batch_result(launch_done)
+                    self._resolve_normal_overlap_result(result, launch_done)
                 )
                 next_token_logprobs = logits_output.next_token_logprobs
         else:
