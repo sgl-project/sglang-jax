@@ -78,7 +78,7 @@ from sgl_jax.srt.managers.scheduler_output_processor_mixin import (
 from sgl_jax.srt.managers.scheduler_profiler_mixing import SchedulerProfilerMixin
 from sgl_jax.srt.managers.tp_worker import ModelWorker
 from sgl_jax.srt.managers.tp_worker_overlap_thread import ModelWorkerClient
-from sgl_jax.srt.managers.tp_worker_overlap_v2 import OverlapModelWorker
+from sgl_jax.srt.managers.tp_worker_overlap_v2 import ModelWorkerOverlap
 from sgl_jax.srt.managers.utils import validate_input_length
 from sgl_jax.srt.mem_cache.base_prefix_cache import MatchPrefixParams
 from sgl_jax.srt.mem_cache.chunk_cache import ChunkCache
@@ -409,7 +409,7 @@ class Scheduler(
                 )
 
         if self.enable_overlap_v2:
-            TpWorkerClass = OverlapModelWorker
+            TpWorkerClass = ModelWorkerOverlap
         else:
             TpWorkerClass = ModelWorkerClient if self.enable_overlap else ModelWorker
 
@@ -1150,7 +1150,7 @@ class Scheduler(
             if batch:
                 batch.launch_done = threading.Event()
                 with jax.profiler.TraceAnnotation("run_batch_forward"):
-                    context = self._launch_batch_forward_v2(batch)
+                    context = self._launch_batch_forward(batch)
 
             if self.last_batch:
                 last_batch, last_result = self.result_queue.popleft()
@@ -1165,7 +1165,7 @@ class Scheduler(
 
             if context is not None:
                 with jax.profiler.TraceAnnotation("run_batch_sample"):
-                    result = self._launch_batch_sample_v2(batch, context)
+                    result = self._launch_batch_sample(batch, context)
                 self.result_queue.append((batch.copy(), result))
             elif self.last_batch is None:
                 self.check_memory()
@@ -2544,7 +2544,7 @@ class Scheduler(
                     dp_rank * per_dp_bs_size : dp_rank * per_dp_bs_size + num_real_reqs
                 ]
 
-    def _set_relay_input_metadata(self, batch, worker_batch):
+    def _prepare_relay_metadata(self, batch, worker_batch):
         total_tokens = len(worker_batch.input_ids)
         per_dp_tokens = total_tokens // self.dp_size
         indices = np.zeros(total_tokens, dtype=np.int32)
@@ -2578,7 +2578,7 @@ class Scheduler(
             worker_batch.relay_input_indices = indices
             worker_batch.relay_input_mask = mask
 
-    def _launch_batch_forward_v2(self, batch):
+    def _launch_batch_forward(self, batch):
         self.forward_ct += 1
         self._profile_batch_predicate(batch)
         paddings = self.tp_worker.get_precompile_paddings()
@@ -2587,10 +2587,10 @@ class Scheduler(
             self.page_size,
             self.server_args.enable_static_lora,
         )
-        self._set_relay_input_metadata(batch, worker_batch)
+        self._prepare_relay_metadata(batch, worker_batch)
         return self.tp_worker.launch_forward(worker_batch)
 
-    def _launch_batch_sample_v2(self, batch, context):
+    def _launch_batch_sample(self, batch, context):
         logits_output, next_token_ids, cache_miss_count = self.tp_worker.launch_sample(context)
         worker_batch = context.batch
         placeholders = np.zeros(len(worker_batch.seq_lens), dtype=np.int32)
@@ -2762,7 +2762,7 @@ class Scheduler(
             self.process_batch_result_prefill(batch, result, launch_done)
         elif batch.forward_mode.is_idle():
             if self.enable_overlap:
-                self._resolve_normal_overlap_result(result, launch_done)
+                self._resolve_overlap_v2_result(result, launch_done)
                 self.set_next_batch_sampling_info_done(batch)
         elif batch.forward_mode.is_dummy_first():
             self.set_next_batch_sampling_info_done(batch)
