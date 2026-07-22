@@ -36,6 +36,8 @@ def _make_server_args(**overrides):
     args = MagicMock()
     args.precompile_token_paddings = None
     args.precompile_bs_paddings = None
+    args.precompile_vision_patch_paddings = None
+    args.precompile_vision_merge_paddings = None
     args.moe_backend = "none"
     args.enable_static_lora = False
     args.multimodal = False
@@ -45,6 +47,30 @@ def _make_server_args(**overrides):
 
 
 class TestBucketComputation(unittest.TestCase):
+    def test_vision_buckets(self):
+        defaults = self._manager()
+        custom = self._manager(
+            precompile_vision_patch_paddings=[256, 64, 1024],
+            precompile_vision_merge_paddings=[128, 32],
+        )
+        self.assertTrue(defaults.vision_patch_buckets)
+        self.assertTrue(defaults.vision_merge_buckets)
+        self.assertEqual(custom.vision_patch_buckets, [64, 256, 1024])
+        self.assertEqual(custom.vision_merge_buckets, [32, 128])
+
+    @staticmethod
+    def _manager(**overrides):
+        return CompilationManager(
+            server_args=_make_server_args(**overrides),
+            max_padded_batch_size=8,
+            max_padded_num_tokens=2048,
+            dp_size=1,
+            tp_size=1,
+            page_size=64,
+            max_req_len=2048,
+            vocab_size=1000,
+        )
+
     def test_token_buckets_default(self):
         cm = CompilationManager(
             server_args=_make_server_args(),

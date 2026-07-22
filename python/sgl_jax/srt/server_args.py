@@ -61,8 +61,7 @@ def apply_multimodal_model_defaults(server_args, model_config) -> None:
 def _validate_disaggregation_host_ip(host_ip: str) -> str:
     if host_ip in _REJECTED_PD_HOST_ALIASES:
         raise ValueError(
-            "--disaggregation-host-ip must be a routable address; "
-            f"got loopback alias {host_ip!r}"
+            f"--disaggregation-host-ip must be a routable address; got loopback alias {host_ip!r}"
         )
     try:
         addr = ipaddress.ip_address(host_ip)
@@ -71,8 +70,7 @@ def _validate_disaggregation_host_ip(host_ip: str) -> str:
     if addr.is_loopback or addr.is_unspecified:
         kind = "loopback" if addr.is_loopback else "bind/unspecified"
         raise ValueError(
-            "--disaggregation-host-ip must be a routable address; "
-            f"got {kind} address {host_ip!r}"
+            f"--disaggregation-host-ip must be a routable address; got {kind} address {host_ip!r}"
         )
     return host_ip
 
@@ -215,6 +213,8 @@ class ServerArgs:
 
     precompile_token_paddings: list[int] | None = None
     precompile_bs_paddings: list[int] | None = None
+    precompile_vision_patch_paddings: list[int] | None = None
+    precompile_vision_merge_paddings: list[int] | None = None
 
     # Vision encoder parallelism: "dp" replicates the ViT and data-parallelizes
     # its batch across all devices; "tp" shards ViT weights over the tensor axis.
@@ -1371,6 +1371,20 @@ class ServerArgs:
             help="Set the list of batch sizes buckets for jax jit",
         )
         parser.add_argument(
+            "--precompile-vision-patch-paddings",
+            type=int,
+            nargs="+",
+            default=ServerArgs.precompile_vision_patch_paddings,
+            help="Padding buckets for the vision encoder patch dimension (VLM precompile).",
+        )
+        parser.add_argument(
+            "--precompile-vision-merge-paddings",
+            type=int,
+            nargs="+",
+            default=ServerArgs.precompile_vision_merge_paddings,
+            help="Padding capacities for VLM encoder-output merge staging.",
+        )
+        parser.add_argument(
             "--vision-encoder-parallel",
             type=str,
             choices=["dp", "tp"],
@@ -1659,7 +1673,7 @@ class ServerArgs:
             "--disaggregation-bootstrap-timeout-seconds",
             type=float,
             default=ServerArgs.disaggregation_bootstrap_timeout_seconds,
-            help="Bootstrap-server query timeout in seconds. <=0 to " "disable.",
+            help="Bootstrap-server query timeout in seconds. <=0 to disable.",
         )
         parser.add_argument(
             "--disaggregation-pull-timeout-seconds",
@@ -1682,7 +1696,7 @@ class ServerArgs:
             "--disaggregation-orphan-reaper-interval-seconds",
             type=float,
             default=ServerArgs.disaggregation_orphan_reaper_interval_seconds,
-            help="How often the background reaper scans for orphan " "senders/receivers.",
+            help="How often the background reaper scans for orphan senders/receivers.",
         )
         parser.add_argument(
             "--disaggregation-decode-watchdog-seconds",

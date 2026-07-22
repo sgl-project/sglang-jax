@@ -246,6 +246,7 @@ class ModelWorker:
         # precompile
         from sgl_jax.srt.model_executor.compilation_manager import CompilationManager
 
+        is_in_model_multimodal = self.model_config.is_multimodal and not server_args.multimodal
         self.compilation_manager = CompilationManager(
             server_args=server_args,
             max_padded_batch_size=self.max_padded_batch_size,
@@ -255,7 +256,10 @@ class ModelWorker:
             page_size=self.page_size,
             max_req_len=self.max_req_len,
             vocab_size=self.model_config.vocab_size,
-            multimodal=server_args.multimodal,
+            # This path precompiles multimodal encoding performed inside the
+            # regular model forward. server_args.multimodal instead selects the
+            # standalone multimodal stage pipeline.
+            multimodal=is_in_model_multimodal,
             has_recurrent_state=self.model_runner.linear_recurrent_config is not None,
             moe_backend=effective_moe_backend,
         )
