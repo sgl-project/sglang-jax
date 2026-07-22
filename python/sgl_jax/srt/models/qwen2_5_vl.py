@@ -17,17 +17,16 @@ from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.mem_cache.memory_pool import MemoryPools
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.models.qwen2 import Qwen2Model, create_qwen2_weight_mappings
-
-# Import the Qwen2.5-VL vision-metadata module so model import triggers builder
-# registration; the encode body consumes only the opaque ``meta`` pytree.
-from sgl_jax.srt.models.vision_metadata import (  # noqa: F401
-    qwen2_5_vl as _qwen25vl_vision_metadata,
+from sgl_jax.srt.models.vision_metadata.qwen2_5_vl import (
+    register_qwen25vl_vision_encoder,
 )
 from sgl_jax.srt.multimodal.configs.qwen_vl.qwen_2_5_vl_config import (
     QwenVLModelVitConfig,
 )
 from sgl_jax.srt.multimodal.kernels.flash_attention import SegmentIds
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
+
+register_qwen25vl_vision_encoder()
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -592,7 +591,7 @@ class Qwen2_5_VLForConditionalGeneration(nnx.Module):
         ``rotary_pos_emb``).
         Returns dp-leading image features with shape ``[dp, out_rows, H]``.
         """
-        return self.visual.encode(enc.pixels, enc.meta, enc.valid)
+        return self.visual.encode(enc.patches, enc.meta, enc.valid)
 
     def load_weights(self, model_config: ModelConfig):
         # Load text backbone and lm_head weights.

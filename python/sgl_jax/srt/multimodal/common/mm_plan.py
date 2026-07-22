@@ -1,9 +1,8 @@
-"""Containers for scheduler-built multimodal encode/merge plans.
+"""Containers for scheduler-built in-model multimodal encode/merge plans.
 
-The scheduler creates these dataclasses with numpy leaves. ``ForwardBatch``
-places those leaves on device before the model runner consumes the plan. The
-``meta`` field is the only model-specific payload and is kept opaque to common
-code via ``VisionMetadataPytree``.
+These are modality-agnostic: encode inputs are an opaque pytree and merge
+arrays are plain index tensors, so the host orchestration does not need to know
+what modality produced them.
 """
 
 from __future__ import annotations
@@ -11,31 +10,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from sgl_jax.srt.multimodal.common.vision_metadata import VisionMetadataPytree
+from sgl_jax.srt.multimodal.common.modality_enum import Modality
 
 if TYPE_CHECKING:
     import jax
     import numpy as np
-
-    from sgl_jax.srt.multimodal.common.modality_enum import Modality
-
-
-@dataclass
-class VisionEncodeInputs:
-    """Model/modality-specific encode payload for one owning-rank DP round.
-
-    Two-state array fields (``np.ndarray`` host -> ``jax.Array`` device):
-
-    - ``pixels``: ``[dp, patch_k, dim]`` -- per-rank round-k request image patches.
-    - ``valid``:  ``[dp]``               -- real patch-row count per rank's
-      round-k image-bearing request.
-    - ``meta``:   per-arch ViT-aux registered pytree (opaque to common; see
-      :class:`VisionMetadataPytree`). Crosses the encode JIT.
-    """
-
-    pixels: np.ndarray | jax.Array
-    valid: np.ndarray | jax.Array
-    meta: VisionMetadataPytree
 
 
 @dataclass
@@ -48,33 +27,15 @@ class DeviceMergePlan:
 
 @dataclass
 class ModalityEmbedBatch:
-    """One encoder invocation and its token merge routing.
+    """One encoder invocation and its token merge routing."""
 
-    This coexists temporarily with the round-based plan below so the generic
-    planning framework can land without changing the active Qwen runtime.
-    """
-
+    # A registered pytree whose array leaves share leading ``[dp, tp]`` axes,
+    # produced by a modality's plan builder. Kept modality-agnostic here: host
+    # orchestration only tree-maps over it, never reads its fields.
     encode_inputs: Any
     merge: DeviceMergePlan
     source_capacity: int | None = None
 
 
-@dataclass
-class EmbedRound:
-    """One owning-rank DP round: one request's images per rank, then merge.
-
-    ``src_idx``/``mask`` are integer/bool arrays produced by the scheduler that
-    drive the ``where(mask, features[src_idx], running)`` merge -- no device
-    cumsum. Two-state (``np.ndarray`` host -> ``jax.Array`` device).
-    """
-
-    encode_inputs: VisionEncodeInputs
-    src_idx: np.ndarray | jax.Array  # [total_token] int   token -> features row
-    mask: np.ndarray | jax.Array  # [total_token] bool
-
-
-@dataclass
-class MultimodalEmbedPlan:
-    """Per-modality rounds. Empty ``rounds_by_modality`` => text-only forward."""
-
-    rounds_by_modality: dict[Modality, list[EmbedRound]]
+# One encoder batch per modality for one language-model forward.
+MultimodalEmbedPlan = dict[Modality, ModalityEmbedBatch]
