@@ -478,7 +478,7 @@ class Req:
                 )
                 match_result = tree_cache.match_prefix(
                     MatchPrefixParams(
-                        key=RadixKey(self.adjust_max_prefix_ids(), self.extra_key, self.dp_rank),
+                        key=RadixKey(self.match_key_ids(), self.extra_key, self.dp_rank),
                         cow_recurrent=(
                             tree_cache.supports_recurrent() and not is_running_recurrent
                         ),
@@ -512,6 +512,48 @@ class Req:
 
         max_prefix_len = max(max_prefix_len, 0)
         return self.fill_ids[:max_prefix_len]
+
+    def compute_cache_input_ids(
+        self, im_token_id=None, video_token_id=None, audio_token_id=None
+    ) -> None:
+        """Set ``cache_input_ids`` to ``origin_input_ids`` with multimodal
+        placeholders replaced by per-item hash pad_values, so the radix key
+        distinguishes different images/videos that share placeholder tokens.
+
+        Never touches ``fill_ids`` / ``origin_input_ids`` -- those stay the real
+        model input; only the radix key is affected.
+        """
+        from sgl_jax.srt.multimodal.common.modality_enum import (
+            MultimodalInputs,
+            pad_input_tokens,
+        )
+
+        mm_inputs = self.mm_inputs
+        if not isinstance(mm_inputs, MultimodalInputs) or not mm_inputs.mm_items:
+            self.cache_input_ids = None
+            return
+        padded = pad_input_tokens(
+            self.origin_input_ids,
+            mm_inputs.mm_items,
+            im_token_id=im_token_id,
+            video_token_id=video_token_id,
+            audio_token_id=audio_token_id,
+        )
+        self.cache_input_ids = padded if padded != list(self.origin_input_ids) else None
+
+    def match_key_ids(self):
+        """Prefix ids for the radix key. Uses hash-substituted ``cache_input_ids``
+        when set (to distinguish multimodal content) but keeps ``fill_ids`` as the
+        real model input; length is identical to ``adjust_max_prefix_ids`` so
+        ``extend_input_len`` math is unchanged.
+        """
+        real_prefix = self.adjust_max_prefix_ids()
+        if self.cache_input_ids is None:
+            return real_prefix
+        key_fill = (
+            self.cache_input_ids + self.output_ids if self.output_ids else self.cache_input_ids
+        )
+        return key_fill[: len(real_prefix)]
 
     def pop_committed_kv_cache(self) -> int:
         # Idempotent: the PD prefill abort path can run release a second time
