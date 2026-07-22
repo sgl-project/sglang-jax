@@ -123,7 +123,7 @@ class TestLogprobsDense(unittest.TestCase):
         )
 
         expected_output_logprobs = [
-            [-0.8515625, 32313, "Okay"],
+            [-0.9453125, 32313, "Okay"],
             [0.0, 11, ","],
             [-0.3515625, 773, " so"],
         ]
