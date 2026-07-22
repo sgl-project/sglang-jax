@@ -985,17 +985,17 @@ class PathwaysPDSchedulerMixin:
             try:
                 with self._pd_swap_p_pool(i):
                     if gate_closed:
-                        # Chunk-continuation only: hide the waiting queue so
-                        # the builder cannot admit new reqs from ANY dp rank
-                        # while the gate is closed (with dp>1, ranks without a
-                        # chunk would otherwise fill their slots from the
-                        # queue, leaking admissions past the gate).
-                        _saved_q = self.waiting_queue
-                        self.waiting_queue = []
+                        # Chunk-continuation only: pause admissions explicitly
+                        # so the builder advances existing chunks without
+                        # scanning the waiting queue on ANY dp rank and without
+                        # the grammar-queue move (swapping the queue out
+                        # instead would strand grammar reqs moved into the
+                        # temporary list -- review on #1469).
+                        self._pd_admission_paused = True
                         try:
                             new_batch = self.get_new_batch_prefill()
                         finally:
-                            self.waiting_queue = _saved_q
+                            self._pd_admission_paused = False
                     else:
                         new_batch = self.get_new_batch_prefill()
             finally:

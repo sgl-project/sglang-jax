@@ -1864,7 +1864,13 @@ class Scheduler(
         return ret
 
     def get_new_batch_prefill(self) -> ScheduleBatch | None:
-        if self.grammar_queue:
+        # Pathways-PD sets _pd_admission_paused while its D-pool token gate is
+        # closed: existing chunked requests still advance, but nothing new is
+        # admitted -- neither from the waiting queue nor via the grammar-queue
+        # move (which would strand or leak requests past the gate). Absent /
+        # False everywhere else, so the native path is unchanged.
+        admissions_paused = getattr(self, "_pd_admission_paused", False)
+        if self.grammar_queue and not admissions_paused:
             self.move_ready_grammar_requests()
 
         # Settle completed async D2H backups before scheduling.
@@ -1927,7 +1933,7 @@ class Scheduler(
                         lora_set.update([req.lora_id for req in info.reqs])
 
         # Get requests from the waiting queue to a new prefill batch
-        for req in self.waiting_queue:
+        for req in () if admissions_paused else self.waiting_queue:
             # Get DP rank for this request
             dp_rank = req.dp_rank
             assert (
