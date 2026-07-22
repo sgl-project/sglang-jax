@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import functools
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Protocol
 
 import jax
 import jax.numpy as jnp
@@ -13,13 +13,30 @@ from sgl_jax.srt.multimodal.common.in_model_plan_builder import (
     resolve_in_model_plan_builder,
 )
 from sgl_jax.srt.multimodal.common.mm_plan import MultimodalEmbedPlan
-from sgl_jax.srt.multimodal.common.modality_enum import MultimodalInputs
+from sgl_jax.srt.multimodal.common.modality_enum import Modality, MultimodalInputs
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
+
+    from jax.sharding import Mesh
+    from jax.typing import ArrayLike
 
     from sgl_jax.srt.configs.model_config import ModelConfig
     from sgl_jax.srt.managers.schedule_batch import ScheduleReqsInfo
+
+
+class _LanguageModel(Protocol):
+    def get_input_embeddings(self) -> Callable[[jax.Array], jax.Array]: ...
+
+
+class _MultimodalModel(Protocol):
+    mesh: Mesh
+
+    def get_multimodal_encoder(self, modality: Modality) -> Callable[[Any], jax.Array]: ...
+
+
+class _ForwardBatch(Protocol):
+    input_embedding: jax.Array | None
 
 
 def _has_in_model_multimodal_inputs(reqs_info: list[ScheduleReqsInfo] | None) -> bool:
@@ -61,7 +78,7 @@ def build_mm_embed_plan(
     return builder.build(reqs_info, dp_size, per_dp_token, tp_size)
 
 
-def _merge_in_specs(encoder_tp: bool):
+def _merge_in_specs(encoder_tp: bool) -> tuple[PartitionSpec, ...]:
     """Merge in-specs. DP-Encoder shards lanes over ``"tensor"``; TP-Encoder
     replicates them (one collaborative lane per DP rank)."""
     tp = None if encoder_tp else "tensor"
@@ -74,7 +91,14 @@ def _merge_in_specs(encoder_tp: bool):
 
 
 @functools.partial(jax.jit, static_argnames=("mesh", "encoder_tp"))
-def merge_jit(mesh, running, features, src_idx, mask, encoder_tp=False):
+def merge_jit(
+    mesh: Mesh,
+    running: ArrayLike,
+    features: ArrayLike,
+    src_idx: ArrayLike,
+    mask: ArrayLike,
+    encoder_tp: bool = False,
+) -> jax.Array:
     """Gather per-lane encoder features directly into DP token embedding rows.
 
     Routing is destination-driven: its final axis is the local token axis, so
@@ -110,11 +134,13 @@ def merge_jit(mesh, running, features, src_idx, mask, encoder_tp=False):
     )(running, features, src_idx, mask)
 
 
-def _flatten_device_batch(value, *, dp_size: int, tp_size: int):
-    return value.reshape(dp_size * tp_size, *value.shape[2:])
+def _flatten_device_batch(value: jax.Array, *, out_sharding: NamedSharding) -> jax.Array:
+    return value.reshape(
+        value.shape[0] * value.shape[1], *value.shape[2:], out_sharding=out_sharding
+    )
 
 
-def _encode_inputs_lane_shape(encode_inputs) -> tuple[int, int]:
+def _encode_inputs_lane_shape(encode_inputs: Any) -> tuple[int, int]:
     leaves = jax.tree.leaves(encode_inputs)
     if not leaves:
         raise ValueError("Multimodal encode inputs must contain at least one array leaf.")
@@ -127,7 +153,7 @@ def _encode_inputs_lane_shape(encode_inputs) -> tuple[int, int]:
 
 
 @functools.partial(jax.jit, static_argnames=("capacity",))
-def _pad_features_jit(features, capacity: int):
+def _pad_features_jit(features: jax.Array, capacity: int) -> jax.Array:
     """Canonicalize encoder rows so downstream merge JITs do not depend on them."""
     rows = features.shape[2]
     if rows > capacity:
@@ -136,11 +162,11 @@ def _pad_features_jit(features, capacity: int):
 
 
 def embed_mm_inputs(
-    mm_embed_plan,
-    input_ids,
-    input_embedding,
-    multimodal_model,
-):
+    mm_embed_plan: MultimodalEmbedPlan,
+    input_ids: jax.Array,
+    input_embedding: Callable[[jax.Array], jax.Array],
+    multimodal_model: _MultimodalModel,
+) -> jax.Array:
     """Encode each fixed-shape modality batch and merge it into token embeddings.
 
     ``running`` starts as the plain text embedding. Each modality batch encodes
@@ -155,19 +181,20 @@ def embed_mm_inputs(
     tp_axis = None if encoder_tp else "tensor"
     running = input_embedding(input_ids)
     for modality, batch in mm_embed_plan.items():
-        embedder = getattr(multimodal_model, f"get_{modality.name.lower()}_feature", None)
-        assert embedder is not None, f"no embedding method for {modality}"
+        encoder = multimodal_model.get_multimodal_encoder(modality)
         device_inputs = batch.encode_inputs
         dp_size, tp_size = _encode_inputs_lane_shape(device_inputs)
         flatten_device_batch = functools.partial(
             _flatten_device_batch,
-            dp_size=dp_size,
-            tp_size=tp_size,
+            out_sharding=NamedSharding(
+                mesh,
+                PartitionSpec("data" if encoder_tp else ("data", "tensor")),
+            ),
         )
 
         # [dp,tp,...] lanes -> flat [dp*tp,...] batch for the ViT
         model_inputs = jax.tree.map(flatten_device_batch, device_inputs)
-        features = embedder(model_inputs)
+        features = encoder(model_inputs)
         feature_shape = (dp_size, tp_size, *features.shape[1:])
         features = jax.lax.reshape(
             features,
@@ -192,12 +219,12 @@ def embed_mm_inputs(
 
 
 def general_mm_embed_routine(
-    input_ids,
-    forward_batch,
-    language_model,
-    multimodal_model,
-    mm_embed_plan,
-):
+    input_ids: jax.Array,
+    forward_batch: _ForwardBatch,
+    language_model: _LanguageModel,
+    multimodal_model: _MultimodalModel,
+    mm_embed_plan: MultimodalEmbedPlan,
+) -> None:
     """Populate ``forward_batch.input_embedding`` for multimodal prefill.
 
     The language backbone consumes this fused embedding instead of re-embedding

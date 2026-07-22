@@ -260,7 +260,12 @@ def test_embed_mm_inputs_accepts_opaque_encoder_inputs(monkeypatch):
     class Model:
         mesh = _mesh()
 
-        def get_audio_feature(self, value):
+        def get_multimodal_encoder(self, modality):
+            assert modality is Modality.AUDIO
+            return self._encode_audio
+
+        @staticmethod
+        def _encode_audio(value):
             assert value.values.shape == (2, 4, 3)
             return value.values[..., :2]
 
@@ -277,6 +282,41 @@ def test_embed_mm_inputs_accepts_opaque_encoder_inputs(monkeypatch):
         Model(),
     )
     np.testing.assert_array_equal(result, running)
+
+
+@pytest.mark.parametrize(
+    ("logical_tp", "input_spec", "output_spec"),
+    [
+        (
+            2,
+            PartitionSpec("data", "tensor", None, None),
+            PartitionSpec(("data", "tensor"), None, None),
+        ),
+        (
+            1,
+            PartitionSpec("data", None, None, None),
+            PartitionSpec("data", None, None),
+        ),
+    ],
+)
+def test_flatten_device_batch_preserves_explicit_sharding(logical_tp, input_spec, output_spec):
+    mesh = _mesh(tp=2)
+    values = np.arange(logical_tp * 12, dtype=np.float32).reshape(1, logical_tp, 4, 3)
+    values = jax.device_put(
+        values,
+        NamedSharding(mesh, input_spec),
+    )
+    out_sharding = NamedSharding(mesh, output_spec)
+
+    with jax.set_mesh(mesh):
+        output = mm_utils._flatten_device_batch(
+            values,
+            out_sharding=out_sharding,
+        )
+        jax.block_until_ready(output)
+
+    assert output.shape == (logical_tp, 4, 3)
+    assert output.sharding.spec == output_spec
 
 
 def test_plan_balances_images_across_tp_lanes():
