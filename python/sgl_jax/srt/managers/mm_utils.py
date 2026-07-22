@@ -146,11 +146,12 @@ def embed_mm_inputs(
     ``running`` starts as the plain text embedding. Each modality batch encodes
     and merges directly. Returns ``[total_token, H]``.
 
-    This first migration keeps one replicated encoder lane per DP rank. Encoder
-    lane fan-out and weight tensor parallelism are added independently.
+    ``multimodal_model.encoder_tp`` selects the merge/write shardings: DP-Encoder
+    shards the ``tp`` lanes over ``"tensor"``; TP-Encoder keeps a single
+    tensor-replicated lane per DP rank.
     """
     mesh = multimodal_model.mesh
-    encoder_tp = True
+    encoder_tp = getattr(multimodal_model, "encoder_tp", False)
     tp_axis = None if encoder_tp else "tensor"
     running = input_embedding(input_ids)
     for modality, batch in mm_embed_plan.items():

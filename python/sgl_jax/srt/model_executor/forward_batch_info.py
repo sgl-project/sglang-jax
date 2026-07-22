@@ -425,7 +425,7 @@ class ForwardBatch:
         if batch.mrope_positions is not None:
             (mrope_positions,) = device_array(
                 (batch.mrope_positions,),
-                sharding=(NamedSharding(model_runner.mesh, PartitionSpec(None, None))),
+                sharding=(NamedSharding(model_runner.mesh, PartitionSpec(None, "data"))),
             )
         input_embedding = None
         if batch.input_embedding is not None:

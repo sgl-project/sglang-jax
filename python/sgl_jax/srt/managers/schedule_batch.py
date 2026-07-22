@@ -54,6 +54,10 @@ from sgl_jax.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sgl_jax.srt.multimodal.common.mm_plan import MultimodalEmbedPlan
 from sgl_jax.srt.multimodal.common.modality_enum import MultimodalInputs
+from sgl_jax.srt.multimodal.layers.vision_sharding import (
+    encode_lane_count,
+    resolve_encoder_tp,
+)
 from sgl_jax.srt.precision_tracer import (
     PrecisionTracerRequestMetadata,
     precision_tracer,
@@ -79,6 +83,7 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "speculative_accept_threshold_single",
     "speculative_accept_threshold_acc",
     "enable_deterministic_sampling",
+    "vision_encoder_parallel",
 ]
 
 PADDING_BUCKETS = [1 << i for i in range(6, 21)]
@@ -3078,11 +3083,17 @@ class ScheduleBatch:
         # chunked prefill, the builder clips full-prompt placeholder ranges to
         # [prefix_len, seq_len); chunks without visual rows return no plan.
         if self.contains_mm_inputs() and self.forward_mode == ForwardMode.EXTEND:
+            encoder_tp = resolve_encoder_tp(
+                self.mesh, global_server_args_dict.get("vision_encoder_parallel", "dp")
+            )
             mm_embed_plan = build_mm_embed_plan(
                 self.reqs_info,
                 self.dp_size,
                 self.model_config,
                 per_dp_token_padding,
+                # DP-Encoder fans a DP rank's requests across the tensor devices;
+                # TP-Encoder keeps a single collaborative lane per DP rank.
+                tp_size=encode_lane_count(self.mesh, encoder_tp),
             )
         else:
             mm_embed_plan = None

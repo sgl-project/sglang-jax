@@ -216,6 +216,10 @@ class ServerArgs:
     precompile_token_paddings: list[int] | None = None
     precompile_bs_paddings: list[int] | None = None
 
+    # Vision encoder parallelism: "dp" replicates the ViT and data-parallelizes
+    # its batch across all devices; "tp" shards ViT weights over the tensor axis.
+    vision_encoder_parallel: str = "dp"
+
     disable_precompile: bool = False
 
     # Speculative decoding
@@ -1365,6 +1369,15 @@ class ServerArgs:
             type=int,
             nargs="+",
             help="Set the list of batch sizes buckets for jax jit",
+        )
+        parser.add_argument(
+            "--vision-encoder-parallel",
+            type=str,
+            choices=["dp", "tp"],
+            default=ServerArgs.vision_encoder_parallel,
+            help="Vision encoder parallelism. 'dp' (default) replicates the ViT and "
+            "data-parallelizes its batch across all devices; 'tp' shards ViT weights "
+            "over the tensor axis (only takes effect when tp_size > 1).",
         )
         parser.add_argument(
             "--disable-precompile",
