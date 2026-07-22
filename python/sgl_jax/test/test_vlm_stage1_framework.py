@@ -690,10 +690,10 @@ def test_device_put_plan_shards_lane_axes():
 
 
 @pytest.mark.parametrize(
-    ("arch", "chunked", "radix"),
-    [(ARCH, 4096, False), ("UnsupportedVLM", -1, True)],
+    ("arch", "chunked", "radix", "mixed_chunk"),
+    [(ARCH, 4096, False, True), ("UnsupportedVLM", -1, True, False)],
 )
-def test_multimodal_defaults_follow_capabilities(arch, chunked, radix):
+def test_multimodal_defaults_follow_capabilities(arch, chunked, radix, mixed_chunk):
     args = SimpleNamespace(
         disable_radix_cache=False,
         disable_overlap_schedule=False,
@@ -704,7 +704,7 @@ def test_multimodal_defaults_follow_capabilities(arch, chunked, radix):
     apply_multimodal_model_defaults(args, _model_config(arch=arch))
     assert (args.chunked_prefill_size, args.disable_radix_cache) == (chunked, radix)
     assert args.disable_overlap_schedule is False
-    assert args.enable_mixed_chunk is False
+    assert args.enable_mixed_chunk is mixed_chunk
     assert args.limit_mm_data_per_request == {"image": 16}
 
 

@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 GRAMMAR_BACKEND_CHOICES = ["llguidance", "none"]
 _REJECTED_PD_HOST_ALIASES = frozenset({"localhost"})
 _MULTIMODAL_CHUNKED_PREFILL_ARCHITECTURES = frozenset({"Qwen2_5_VLForConditionalGeneration"})
+_MULTIMODAL_MIXED_CHUNK_ARCHITECTURES = frozenset({"Qwen2_5_VLForConditionalGeneration"})
 _MULTIMODAL_RADIX_CACHE_ARCHITECTURES = frozenset({"Qwen2_5_VLForConditionalGeneration"})
 
 
@@ -51,8 +52,9 @@ def apply_multimodal_model_defaults(server_args, model_config) -> None:
     ):
         logger.info("Multimodal model detected, disabling chunked prefill")
         server_args.chunked_prefill_size = -1
-    if server_args.enable_mixed_chunk:
-        logger.info("Multimodal model detected, disabling mixed chunk")
+    supports_mixed_chunk = bool(architectures & _MULTIMODAL_MIXED_CHUNK_ARCHITECTURES)
+    if server_args.enable_mixed_chunk and not supports_mixed_chunk:
+        logger.info("Multimodal model does not support mixed chunk; disabling it")
         server_args.enable_mixed_chunk = False
     if server_args.limit_mm_data_per_request is None:
         server_args.limit_mm_data_per_request = {"image": 16}
