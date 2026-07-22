@@ -10,7 +10,7 @@ from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
-from sgl_jax.srt.managers.overlap_utils import (
+from sgl_jax.srt.utils.overlap_utils import (
     create_relay_buffers,
     gather_relay_buffers,
     update_relay_buffers,
@@ -30,7 +30,7 @@ class ForwardContext:
     cache_miss_count: int
 
 
-class OverlapModelWorker(ModelWorker):
+class ModelWorkerOverlap(ModelWorker):
     def __init__(
         self,
         server_args: ServerArgs,
@@ -169,7 +169,7 @@ class OverlapModelWorker(ModelWorker):
 
         return logits_output, output_ids, cache_miss_count
 
-    def resolve_result(
+    def resolve_last_batch_result(
         self,
         logits_output: LogitsProcessorOutput,
         next_token_ids: jax.Array,
