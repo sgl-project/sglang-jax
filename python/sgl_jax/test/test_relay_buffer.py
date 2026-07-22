@@ -10,7 +10,7 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from sgl_jax.srt.managers.overlap_utils import (
+from sgl_jax.srt.utils.overlap_utils import (
     create_relay_buffers,
     gather_relay_buffers,
     update_relay_buffers,
