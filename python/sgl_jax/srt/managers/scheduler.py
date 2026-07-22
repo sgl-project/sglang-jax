@@ -2762,7 +2762,10 @@ class Scheduler(
             self.process_batch_result_prefill(batch, result, launch_done)
         elif batch.forward_mode.is_idle():
             if self.enable_overlap:
-                self._resolve_overlap_v2_result(result, launch_done)
+                if self.enable_overlap_v2:
+                    self._resolve_overlap_v2_result(result, launch_done)
+                else:
+                    self.tp_worker.resolve_last_batch_result(launch_done)
                 self.set_next_batch_sampling_info_done(batch)
         elif batch.forward_mode.is_dummy_first():
             self.set_next_batch_sampling_info_done(batch)
