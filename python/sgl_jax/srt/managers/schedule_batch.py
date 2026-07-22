@@ -3813,6 +3813,9 @@ class ModelWorkerBatch:
     # Whether each request has prior recurrent state (lazy zero-on-read)
     has_initial_state: np.ndarray | None = None
 
+    relay_input_indices: np.ndarray | None = None
+    relay_input_mask: np.ndarray | None = None
+
     def get_original_input_len(self):
         """
         return unpadded tokens number for prefill and real batch size for decode
