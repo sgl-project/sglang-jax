@@ -146,15 +146,15 @@ class SchedulerOutputProcessorMixin:
         self._pending_chunked_abort_reqs[dp_rank] = None
 
     def _resolve_overlap_v2_result(self, result, launch_done=None):
-        if result.worker_batch is not None:
-            return self.tp_worker.resolve_last_batch_result(
-                result.logits_output,
-                result.next_token_ids,
-                result.worker_batch,
-                result.cache_miss_count,
-                launch_done,
-            )
-        return self.tp_worker.resolve_last_batch_result(launch_done)
+        assert self.enable_overlap_v2
+        assert result.worker_batch is not None
+        return self.tp_worker.resolve_last_batch_result(
+            result.logits_output,
+            result.next_token_ids,
+            result.worker_batch,
+            result.cache_miss_count,
+            launch_done,
+        )
 
     def maybe_collect_routed_experts(self: Scheduler, req: Req):
         """Collect routed experts for a finished request."""
@@ -201,9 +201,11 @@ class SchedulerOutputProcessorMixin:
                 if launch_done is not None:
                     launch_done.wait()
             else:
-                logits_output, next_token_ids, cache_miss_count = (
-                    self._resolve_overlap_v2_result(result, launch_done)
-                )
+                if self.enable_overlap_v2:
+                    resolved_result = self._resolve_overlap_v2_result(result, launch_done)
+                else:
+                    resolved_result = self.tp_worker.resolve_last_batch_result(launch_done)
+                logits_output, next_token_ids, cache_miss_count = resolved_result
         else:
             # Move next_token_ids and logprobs to cpu
             if batch.return_output_logprob_only and logits_output.next_token_logprobs is not None:
@@ -472,9 +474,11 @@ class SchedulerOutputProcessorMixin:
             if is_spec_decode:
                 next_token_logprobs = None
             else:
-                logits_output, next_token_ids, cache_miss_count = (
-                    self._resolve_overlap_v2_result(result, launch_done)
-                )
+                if self.enable_overlap_v2:
+                    resolved_result = self._resolve_overlap_v2_result(result, launch_done)
+                else:
+                    resolved_result = self.tp_worker.resolve_last_batch_result(launch_done)
+                logits_output, next_token_ids, cache_miss_count = resolved_result
                 next_token_logprobs = logits_output.next_token_logprobs
         else:
             # spec decoding handles output logprobs inside verify process.
