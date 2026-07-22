@@ -9,7 +9,7 @@ code via ``VisionMetadataPytree``.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from sgl_jax.srt.multimodal.common.vision_metadata import VisionMetadataPytree
 
@@ -36,6 +36,27 @@ class VisionEncodeInputs:
     pixels: np.ndarray | jax.Array
     valid: np.ndarray | jax.Array
     meta: VisionMetadataPytree
+
+
+@dataclass
+class DeviceMergePlan:
+    """Token-shaped routing from encoder rows to backbone embedding rows."""
+
+    src_idx: np.ndarray | jax.Array  # [dp, tp, per_dp_token]
+    mask: np.ndarray | jax.Array  # [dp, tp, per_dp_token]
+
+
+@dataclass
+class ModalityEmbedBatch:
+    """One encoder invocation and its token merge routing.
+
+    This coexists temporarily with the round-based plan below so the generic
+    planning framework can land without changing the active Qwen runtime.
+    """
+
+    encode_inputs: Any
+    merge: DeviceMergePlan
+    source_capacity: int | None = None
 
 
 @dataclass
