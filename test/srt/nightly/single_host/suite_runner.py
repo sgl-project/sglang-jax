@@ -31,6 +31,7 @@ for _p in (_TEST_SRT, _NIGHTLY_DIR, _SELF_DIR):
 from cases import (  # noqa: E402
     GSM8K_GENERATION_CONFIG,
     AccuracyCase,
+    GeneratedSharedPrefixParams,
     PerfCase,
     PerfParams,
     SuiteError,
@@ -200,6 +201,44 @@ SUITES: dict[str, SingleHostSuite] = {
                         prefill_floors={"in_tps": 31954.6},
                     ),
                 ),
+            ),
+            SingleHostRun(
+                launch_profile="recurrent-qwen35-perf-v6e-4.yaml",
+                cases=[
+                    *perf_sweep_cases(
+                        "recurrent-qwen35",
+                        PerfParams(
+                            decode_concurrencies=(16, 32),
+                            profile_point=(32, 4096, 1024),
+                            floors={"out_tps": 268.2},
+                            prefill_floor_point=(32, 4096, 1),
+                            prefill_floors={"in_tps": 1954.4},
+                            flush_cache=True,
+                        ),
+                    ),
+                    PerfCase(
+                        name="recurrent-qwen35-gsp-c16-i8704-o1",
+                        workload="generated-shared-prefix",
+                        input_len=8704,
+                        output_len=1,
+                        num_prompts=128,
+                        max_concurrency=16,
+                        flush_cache=True,
+                        gsp_params=GeneratedSharedPrefixParams(
+                            num_groups=16,
+                            prompts_per_group=8,
+                            shared_prefix_len=8192,
+                            question_len=512,
+                        ),
+                        floors={
+                            "cache_hit_rate": 0.75,
+                            "in_tps": 5769.3,
+                            "ttft_ms": 6049.6,
+                        },
+                        capture_trace=True,
+                        profile_num_steps=10,
+                    ),
+                ],
             ),
         ],
     ),
