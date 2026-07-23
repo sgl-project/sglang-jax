@@ -148,6 +148,24 @@ SUITES: dict[str, SingleHostSuite] = {
                 launch_profile="qwen3-moe-fp8-fused-v6e-4.yaml",
                 cases=[_gsm8k_case("qwen3-moe-fp8-fused", "Qwen/Qwen3-30B-A3B-FP8", 0.93, 64)],
             ),
+            SingleHostRun(
+                launch_profile="recurrent-qwen35-gsm8k-v6e-4.yaml",
+                cases=[
+                    AccuracyCase(
+                        name="recurrent-gsm8k",
+                        dataset="gsm8k",
+                        model_id="Qwen/Qwen3.5-35B-A3B",
+                        eval_batch_size=16,
+                        generation_config={
+                            "temperature": 0.0,
+                            "max_tokens": 2048,
+                            "chat_template_kwargs": {"enable_thinking": False},
+                        },
+                        limit=None,
+                        score_threshold=0.96,
+                    ),
+                ],
+            ),
         ],
     ),
     # 4-TPU perf sweeps. One server per model/config; concurrency points filtered

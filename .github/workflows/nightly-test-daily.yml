@@ -195,6 +195,19 @@ jobs:
         run: |
           cd test/srt
           python3 nightly/single_host/suite_runner.py --suite accuracy-text-models-v6e-4 ${CASES:+--cases "$CASES"}
+      - name: Run recurrent determinism e2e
+        if: ${{ !cancelled() && (inputs.cases == '' || contains(format(',{0},', inputs.cases), ',recurrent-gsm8k,')) }}
+        timeout-minutes: 120
+        run: |
+          set +e
+          python3 test/srt/run_suite.py --suite nightly-recurrent-e2e-tpu-v6e-4
+          status=$?
+          if [ "$status" -eq 0 ]; then result=PASS; else result=FAIL; fi
+          {
+            echo "### recurrent-determinism"
+            echo "**${result}**"
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
       - name: Publish accuracy JSON to observability dashboard mount (main only)
         # !cancelled() so a below-gate run (non-zero exit) still publishes its real data for the trend monitor.
         if: ${{ !cancelled() && github.ref == 'refs/heads/main' && github.repository == 'sgl-project/sglang-jax' && inputs.pr_number == '' }}
@@ -236,7 +249,7 @@ jobs:
         run: |
           if [ "$RESULT" = "success" ]; then status="PASS"; else status="FAIL"; fi
           gh pr comment "$PR_NUMBER" --repo "$REPO" \
-            --body "> **Nightly** [\`$CASE_KEY\`]($RUN_URL): **$status** — see the run's step summary for the score."
+            --body "> **Nightly** [\`$CASE_KEY\`]($RUN_URL): **$status** — see the run's step summary for gate details."
 
   nightly-test-perf-text-models-4-tpu-daily:
     if: github.repository == 'sgl-project/sglang-jax' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-perf-text-models-4-tpu-daily')

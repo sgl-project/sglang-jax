@@ -250,6 +250,13 @@ suites = {
     "nightly-infra-smoke-tpu-v6e-1": [
         TestFile("test_nightly_infra_smoke.py", 15),
     ],
+    "nightly-recurrent-e2e-tpu-v6e-4": [
+        TestFile(
+            "test/srt/test_unified_radix_cache_serving.py",
+            8,
+            ["TestUnifiedRadixCacheServingRecurrent.test_recurrent_hit_flush_determinism"],
+        ),
+    ],
     "sglang_dependency_test": [],
     "unit-test-tpu-v6e-1": [
         TestFile("python/sgl_jax/test/kernels/quantized_linear_test.py", 0.3, runner="pytest"),

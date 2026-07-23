@@ -221,6 +221,9 @@ class TestUnifiedRadixCacheServingRecurrent(CustomTestCase):
         "16",
         "--random-seed",
         "42",
+        # Keep this cache-correctness gate independent of optional MoE
+        # routing-kernel changes; the JAX top-k path is the stable baseline.
+        "--disable-topk-kernel",
         "--disable-overlap-schedule",
         # bs paddings pinned to multiples of tp_size*t_packing (=8): keeps the
         # decode batch divisible by the device count (sampler lax.cond) and gives
