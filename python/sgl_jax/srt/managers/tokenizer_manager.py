@@ -1216,7 +1216,11 @@ class TokenizerManager:
             ]
         else:
             assert self.tokenizer is not None
-            token_texts = self.tokenizer.batch_decode(token_logprobs_idx)
+            # Wrap each id as its own sequence: transformers>=5 batch_decode
+            # treats a flat int list as ONE sequence, returning a single
+            # string -- zip would then truncate to one (logprob, id, text)
+            # triple. Nested lists decode per-token on both v4 and v5.
+            token_texts = self.tokenizer.batch_decode([[t] for t in token_logprobs_idx])
             return list(zip(token_logprobs_val, token_logprobs_idx, token_texts))
 
     def detokenize_top_logprobs_tokens(

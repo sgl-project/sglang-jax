@@ -437,6 +437,25 @@ class ModelWorker:
             sampling_metadata.apply_vocab_mask = True
             sampling_metadata.vocab_mask = batch.sampling_info.vocab_mask
 
+    def _pd_fuse_for_batch(self, model_worker_batch: ModelWorkerBatch) -> bool:
+        """Batch-level fused-sample eligibility. The single source of truth
+        for every fused-vs-regular branch choice (worker AND overlap client):
+        the two paths return different tuple arities, so a caller keying on
+        the worker-level flag alone would mis-unpack whenever an ineligible
+        batch falls through to the regular path.
+
+        Decode-only: the fused jit exists to collapse a decode tick into one
+        Execute; the Pathways-PD prefill thread's EXTEND batches crash inside
+        its future-token resolve (and prefill was never the fusion target).
+        Logprob batches take the regular path -- the only one that computes/
+        materializes logprob fields."""
+        return (
+            self._pd_fuse_sample
+            and model_worker_batch.forward_mode.is_decode()
+            and not model_worker_batch.return_logprob
+            and not model_worker_batch.return_output_logprob_only
+        )
+
     def forward_batch_generation(
         self,
         model_worker_batch: ModelWorkerBatch,
@@ -475,11 +494,9 @@ class ModelWorker:
 
         # Pathways-PD: fuse run_model+sampler+resolve/set into one jit so a
         # decode tick is a single Execute through the ordered dispatch queue.
-        if (
-            self._pd_fuse_sample
-            and not skip_sample
-            and not model_worker_batch.return_output_logprob_only
-        ):
+        # Any logprob batch falls through to the unfused path below, which is
+        # the only one that computes/materializes logprob fields.
+        if self._pd_fuse_for_batch(model_worker_batch) and not skip_sample:
             if model_worker_batch.sampling_info:
                 self._update_grammar_vocab_mask(model_worker_batch, sampling_metadata)
             fmap = future_map if future_map is not None else self._pd_dummy_future_map
