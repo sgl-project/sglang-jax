@@ -4,19 +4,18 @@ import dataclasses
 from functools import partial
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
-from sgl_jax.srt.utils.overlap_utils import (
-    create_relay_buffers,
-    gather_relay_buffers,
-    update_relay_buffers,
-)
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 from sgl_jax.srt.managers.tp_worker import ModelWorker
+from sgl_jax.srt.utils.overlap_utils import (
+    create_relay_buffers,
+    resolve_relay_inputs,
+    update_relay_buffers,
+)
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 from sgl_jax.srt.server_args import ServerArgs
@@ -52,12 +51,15 @@ class ModelWorkerOverlap(ModelWorker):
             dp_size=self.dp_size,
         )
         relay_sharding = NamedSharding(mesh, P("data", None))
-        self._gather_relay = jax.jit(
+        input_sharding = NamedSharding(mesh, P("data"))
+        self._resolve_relay = jax.jit(
             partial(
-                gather_relay_buffers,
+                resolve_relay_inputs,
                 dp_size=self.dp_size,
-                output_sharding=relay_sharding,
-            )
+                relay_sharding=relay_sharding,
+                output_sharding=input_sharding,
+            ),
+            out_shardings=input_sharding,
         )
         self._update_relay = jax.jit(
             partial(
@@ -88,13 +90,15 @@ class ModelWorkerOverlap(ModelWorker):
             self.prepare_lora_batch(batch)
         forward_batch = ForwardBatch.init_new(batch, self.model_runner)
         if batch.relay_input_indices is not None:
-            sharding = NamedSharding(self.mesh, P("data"))
-            indices = jax.device_put(batch.relay_input_indices, sharding)
-            relay_ids = self._gather_relay(self.relay_buffers, indices)
             input_sharding = forward_batch.input_ids.sharding
-            relay_ids = jax.sharding.reshard(relay_ids, input_sharding)
+            indices = jax.device_put(batch.relay_input_indices, input_sharding)
             mask = jax.device_put(batch.relay_input_mask, input_sharding)
-            forward_batch.input_ids = jnp.where(mask, relay_ids, forward_batch.input_ids)
+            forward_batch.input_ids = self._resolve_relay(
+                self.relay_buffers,
+                indices,
+                mask,
+                forward_batch.input_ids,
+            )
         batch.forward_batch = forward_batch
 
         logits_output, _, cache_miss_count = super().forward_batch_generation(
