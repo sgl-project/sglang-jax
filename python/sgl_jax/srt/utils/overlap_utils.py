@@ -72,3 +72,23 @@ def gather_relay_buffers(
         .reshape(indices.shape)
     )
     return values
+
+
+def resolve_relay_inputs(
+    buffers: RelayBuffers,
+    indices,
+    valid_mask,
+    input_ids,
+    *,
+    dp_size: int,
+    relay_sharding,
+    output_sharding,
+) -> jax.Array:
+    relay_ids = gather_relay_buffers(
+        buffers,
+        indices,
+        dp_size=dp_size,
+        output_sharding=relay_sharding,
+    )
+    relay_ids = jax.sharding.reshard(relay_ids, output_sharding)
+    return jnp.where(valid_mask, relay_ids, input_ids)
