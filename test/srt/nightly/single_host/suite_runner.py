@@ -148,6 +148,48 @@ SUITES: dict[str, SingleHostSuite] = {
                 launch_profile="qwen3-moe-fp8-fused-v6e-4.yaml",
                 cases=[_gsm8k_case("qwen3-moe-fp8-fused", "Qwen/Qwen3-30B-A3B-FP8", 0.93, 64)],
             ),
+            SingleHostRun(
+                launch_profile="recurrent-qwen35-gsm8k-v6e-4.yaml",
+                cases=[
+                    AccuracyCase(
+                        name="recurrent-gsm8k",
+                        dataset="gsm8k",
+                        model_id="Qwen/Qwen3.5-35B-A3B",
+                        eval_batch_size=16,
+                        generation_config={
+                            "temperature": 0.0,
+                            "max_tokens": 2048,
+                            "chat_template_kwargs": {"enable_thinking": False},
+                        },
+                        limit=200,
+                        score_threshold=0.95,
+                    ),
+                ],
+            ),
+            SingleHostRun(
+                launch_profile="recurrent-qwen35-mmlu-thinking-v6e-4.yaml",
+                cases=[
+                    AccuracyCase(
+                        name="recurrent-mmlu-thinking",
+                        dataset="mmlu",
+                        model_id="Qwen/Qwen3.5-35B-A3B",
+                        eval_batch_size=16,
+                        generation_config={
+                            "temperature": 1.0,
+                            "top_p": 0.95,
+                            "top_k": 20,
+                            "min_p": 0.0,
+                            "presence_penalty": 1.5,
+                            "repetition_penalty": 1.0,
+                            "seed": 11,
+                            "max_tokens": 16384,
+                            "chat_template_kwargs": {"enable_thinking": True},
+                        },
+                        limit=200,
+                        score_threshold=0.88,
+                    ),
+                ],
+            ),
         ],
     ),
     # 4-TPU perf sweeps. One server per model/config; concurrency points filtered
@@ -256,6 +298,7 @@ def run_one(run: SingleHostRun) -> None:
         spec["base_url"],
         timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
         other_args=spec["other_args"],
+        check_cache_miss=spec["check_cache_miss"],
     )
     failures: list[tuple[str, str]] = []
     try:

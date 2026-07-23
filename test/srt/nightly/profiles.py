@@ -63,6 +63,7 @@ class LaunchProfile(BaseModel):
     ep_size: int | None = Field(default=None, gt=0)
     port: int = 30000
     server_args: tuple[str, ...] = ()
+    check_cache_miss: bool = True
 
     @field_validator("server_args")
     @classmethod

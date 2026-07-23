@@ -250,6 +250,13 @@ suites = {
     "nightly-infra-smoke-tpu-v6e-1": [
         TestFile("test_nightly_infra_smoke.py", 15),
     ],
+    "nightly-recurrent-e2e-tpu-v6e-4": [
+        TestFile(
+            "test/srt/test_unified_radix_cache_serving.py",
+            8,
+            ["TestUnifiedRadixCacheServingRecurrent.test_recurrent_hit_flush_determinism"],
+        ),
+    ],
     "sglang_dependency_test": [],
     "unit-test-tpu-v6e-1": [
         TestFile("python/sgl_jax/test/kernels/quantized_linear_test.py", 0.3, runner="pytest"),
@@ -335,6 +342,7 @@ suites = {
         TestFile("test/srt/test_dp_schedule_shape_aware.py", 0.2, runner="pytest"),
         TestFile("test/srt/test_dp_rank_assignment.py", 0.2, runner="pytest"),
         TestFile("test/srt/test_bench_recurrent_reuse_sweep.py", 0.2, runner="pytest"),
+        TestFile("test/srt/test_nightly_recurrent_accuracy.py", 0.1, runner="pytest"),
         TestFile("python/sgl_jax/test/test_mixed_chunk_dp.py", 0.2),
         TestFile("test/srt/function_call/test_qwen3_coder_detector.py", 0.1),
         TestFile("test/srt/function_call/test_glm4_moe_detector.py", 0.1),

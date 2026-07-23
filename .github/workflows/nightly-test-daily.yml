@@ -166,6 +166,29 @@ jobs:
           cd test/srt
           python3 run_suite.py --suite nightly-infra-smoke-tpu-v6e-1
 
+  nightly-recurrent-e2e-4-tpu-daily:
+    if: github.repository == 'sgl-project/sglang-jax' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-recurrent-e2e-4-tpu-daily')
+    runs-on: arc-runner-v6e-4
+    permissions:
+      contents: read
+    env:
+      TZ: Asia/Shanghai
+      JAX_COMPILATION_CACHE_DIR: /xla-cache
+      SGLANG_JAX_MODEL_CACHE: /models/model_scope
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          # This suite has no /run-nightly case mapping; use the workflow ref
+          # instead of executing a PR ref from the issue_comment call chain.
+          persist-credentials: false
+      - name: Setup Python environment
+        uses: ./.github/actions/setup-venv
+      - name: Run recurrent determinism e2e
+        timeout-minutes: 120
+        run: |
+          python3 test/srt/run_suite.py --suite nightly-recurrent-e2e-tpu-v6e-4
+
   nightly-test-accuracy-text-models-4-tpu-daily:
     if: github.repository == 'sgl-project/sglang-jax' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-accuracy-text-models-4-tpu-daily')
     runs-on: arc-runner-v6e-4
@@ -435,6 +458,7 @@ jobs:
       nightly-test-openai-api-surface-1-tpu-daily,
       multi-host-test-mimo-flash-daily,
       nightly-infra-smoke-1-tpu-daily,
+      nightly-recurrent-e2e-4-tpu-daily,
       nightly-test-accuracy-text-models-4-tpu-daily,
       nightly-test-perf-text-models-4-tpu-daily,
       nightly-trend-monitor,
@@ -451,6 +475,7 @@ jobs:
           echo "openai-api-surface-1-tpu-daily: ${{ needs.nightly-test-openai-api-surface-1-tpu-daily.result }}"
           echo "multi-host-mimo-flash-daily: ${{ needs.multi-host-test-mimo-flash-daily.result }}"
           echo "infra-smoke-1-tpu-daily: ${{ needs.nightly-infra-smoke-1-tpu-daily.result }}"
+          echo "recurrent-e2e-4-tpu-daily: ${{ needs.nightly-recurrent-e2e-4-tpu-daily.result }}"
           echo "accuracy-4-tpu-daily: ${{ needs.nightly-test-accuracy-text-models-4-tpu-daily.result }}"
           echo "perf-4-tpu-daily: ${{ needs.nightly-test-perf-text-models-4-tpu-daily.result }}"
           # Visibility only, NOT gated: by design (continue-on-error) monitoring
@@ -466,6 +491,7 @@ jobs:
             "openai-api-surface-1-tpu-daily=${{ needs.nightly-test-openai-api-surface-1-tpu-daily.result }}" \
             "multi-host-mimo-flash-daily=${{ needs.multi-host-test-mimo-flash-daily.result }}" \
             "infra-smoke-1-tpu-daily=${{ needs.nightly-infra-smoke-1-tpu-daily.result }}" \
+            "recurrent-e2e-4-tpu-daily=${{ needs.nightly-recurrent-e2e-4-tpu-daily.result }}" \
             "accuracy-4-tpu-daily=${{ needs.nightly-test-accuracy-text-models-4-tpu-daily.result }}" \
             "perf-4-tpu-daily=${{ needs.nightly-test-perf-text-models-4-tpu-daily.result }}"; do
             job_name="${job_result%%=*}"

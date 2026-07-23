@@ -132,4 +132,5 @@ def profile_server_spec(profile: LaunchProfile) -> dict:
         "model": _local_or_hf(profile.model_path),
         "base_url": f"http://127.0.0.1:{profile.port}",
         "other_args": build_other_server_args(profile, runtime),
+        "check_cache_miss": profile.check_cache_miss,
     }
