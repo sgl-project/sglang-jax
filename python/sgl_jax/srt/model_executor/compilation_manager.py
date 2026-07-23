@@ -37,6 +37,8 @@ class CompilationManager:
         max_total_num_tokens: int = 0,
         multimodal: bool = False,
         has_recurrent_state: bool = False,
+        supports_recurrent_cow: bool = False,
+        supports_recurrent_track: bool = False,
         moe_backend: str | None = None,
     ):
         self.dp_size = dp_size
@@ -49,6 +51,8 @@ class CompilationManager:
         self.vocab_size = vocab_size
         self.multimodal = multimodal
         self.has_recurrent_state = has_recurrent_state
+        self.supports_recurrent_cow = supports_recurrent_cow
+        self.supports_recurrent_track = supports_recurrent_track
         # Callers pass the *effective* backend (ModelConfig.moe_backend), which
         # resolves architectures that hard-code FusedEPMoE (e.g. Qwen3.5) to
         # "fused" so the bs-bucket filter below applies. Fall back to the raw
@@ -349,6 +353,17 @@ class CompilationManager:
             # non-recurrent backends are unaffected.
             recurrent_indices=(np.zeros(bs, dtype=np.int32) if self.has_recurrent_state else None),
             has_initial_state=(np.zeros(bs, dtype=np.bool_) if self.has_recurrent_state else None),
+            recurrent_cow_src_indices=(
+                np.zeros(bs, dtype=np.int32)
+                if self.supports_recurrent_cow and mode == ForwardMode.EXTEND
+                else None
+            ),
+            recurrent_track_indices=(
+                np.zeros(bs, dtype=np.int32) if self.supports_recurrent_track else None
+            ),
+            recurrent_track_mask=(
+                np.zeros(bs, dtype=np.int32) if self.supports_recurrent_track else None
+            ),
         )
 
     # ---- Lazy compilation tracking ----
