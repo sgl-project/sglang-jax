@@ -12,7 +12,7 @@ from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.utils.overlap_utils import (
     create_relay_buffers,
-    gather_relay_buffers,
+    resolve_relay_inputs,
     update_relay_buffers,
 )
 
@@ -29,6 +29,7 @@ def test_relay_buffer_updates_valid_request_slots():
     indices = jax.device_put(jnp.array([2, 5, 0, 0]), sharding)
     valid = jax.device_put(jnp.array([True, True, False, False]), sharding)
     tokens = jax.device_put(jnp.array([11, 22, 99, 99]), sharding)
+    input_ids = jax.device_put(jnp.array([1, 2, 3, 4]), sharding)
 
     buffers = create_relay_buffers(mesh, pool, dp_size=1)
     buffers = jax.jit(
@@ -42,12 +43,16 @@ def test_relay_buffer_updates_valid_request_slots():
         )
     )(buffers, indices, valid, tokens)
     actual = jax.jit(
-        lambda b, i: gather_relay_buffers(
+        lambda b, i, m, x: resolve_relay_inputs(
             b,
             i,
+            m,
+            x,
             dp_size=1,
-            output_sharding=relay_sharding,
-        )
-    )(buffers, indices)
+            relay_sharding=relay_sharding,
+            output_sharding=sharding,
+        ),
+        out_shardings=sharding,
+    )(buffers, indices, valid, input_ids)
 
-    np.testing.assert_array_equal(np.asarray(actual), [11, 22, 0, 0])
+    np.testing.assert_array_equal(np.asarray(actual), [11, 22, 3, 4])
