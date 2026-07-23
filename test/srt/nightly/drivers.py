@@ -77,7 +77,7 @@ def run_benchmark_for_case(
 
     args = get_benchmark_args(
         base_url=base_url,
-        dataset_name="random",
+        dataset_name=case.workload,
         device="tpu",
         tokenizer=tokenizer,
         num_prompts=case.num_prompts,
@@ -87,7 +87,13 @@ def run_benchmark_for_case(
         random_range_ratio=1.0,
         request_rate=case.request_rate,
         seed=case.seed,
-        warmup_requests=0,
+        warmup_requests=case.warmup_requests,
+        gsp_num_groups=case.gsp_num_groups,
+        gsp_prompts_per_group=case.gsp_prompts_per_group,
+        gsp_system_prompt_len=case.gsp_system_prompt_len,
+        gsp_question_len=case.gsp_question_len,
+        gsp_output_len=case.output_len,
+        gsp_range_ratio=case.gsp_range_ratio,
     )
     args.output_file = "/dev/null"
     args.flush_cache = case.flush_cache

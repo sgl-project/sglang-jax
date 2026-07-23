@@ -334,6 +334,7 @@ suites = {
         TestFile("test/srt/test_dp_schedule_policy.py", 0.2, runner="pytest"),
         TestFile("test/srt/test_dp_schedule_shape_aware.py", 0.2, runner="pytest"),
         TestFile("test/srt/test_dp_rank_assignment.py", 0.2, runner="pytest"),
+        TestFile("test/srt/test_nightly_recurrent_perf.py", 0.2, runner="pytest"),
         TestFile("test/srt/test_bench_recurrent_reuse_sweep.py", 0.2, runner="pytest"),
         TestFile("python/sgl_jax/test/test_mixed_chunk_dp.py", 0.2),
         TestFile("test/srt/function_call/test_qwen3_coder_detector.py", 0.1),

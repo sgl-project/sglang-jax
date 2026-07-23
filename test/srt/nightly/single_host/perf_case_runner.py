@@ -41,6 +41,7 @@ def run_perf_case(
     xprof = case.capture_trace
     print(
         f"[perf-runner] Running case name={case.name}, base_url={base_url}, "
+        f"workload={case.workload}, "
         f"concurrency={case.max_concurrency}, input_len={case.input_len}, "
         f"output_len={case.output_len}, num_prompts={case.num_prompts}, profile={xprof}",
         flush=True,
@@ -71,13 +72,13 @@ def run_perf_case(
         out_path = write_perf_csv(result)
         if out_path is not None:
             print(f"[perf-runner] Wrote result to {out_path}", flush=True)
-        json_path = write_perf_json(case, profile_name, target, metrics)
+        json_path = write_perf_json(case, profile_name, target, metrics, result)
         if json_path is not None:
             print(f"[perf-runner] Wrote dashboard JSON to {json_path}", flush=True)
 
     print(
         f"[perf-runner] {case.name}: completed={result['completed']}/{case.num_prompts}, "
-        f"out_tps={result['out_tps']:.1f}, "
+        f"total_tps={result['total_tps']:.1f}, "
         f"ttft={result['ttft_ms']:.1f}ms, itl={result['itl_ms']:.1f}ms",
         flush=True,
     )

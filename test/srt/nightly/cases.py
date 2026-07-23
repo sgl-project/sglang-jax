@@ -13,7 +13,7 @@ launch-profile validators) stay in ``test/srt/nightly/multi_host/multi_host_suit
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 
 class SuiteError(Exception):
@@ -25,21 +25,52 @@ class SuiteError(Exception):
 
 
 @dataclass(frozen=True)
+class AbsolutePerfBaseline:
+    value: float
+    tolerance: float
+
+    def __post_init__(self):
+        if self.value <= 0:
+            raise ValueError(f"baseline value must be positive, got {self.value}")
+        if not 0 <= self.tolerance < 1:
+            raise ValueError(f"baseline tolerance must be in [0, 1), got {self.tolerance}")
+
+
+@dataclass(frozen=True)
 class PerfCase:
     name: str
     input_len: int
     output_len: int
     num_prompts: int
     max_concurrency: int
+    workload: Literal["random", "generated-shared-prefix"] = "random"
     request_rate: float = float("inf")
     seed: int = 42
+    warmup_requests: int = 0
     flush_cache: bool = False
+    gsp_num_groups: int = 64
+    gsp_prompts_per_group: int = 16
+    gsp_system_prompt_len: int = 2048
+    gsp_question_len: int = 128
+    gsp_range_ratio: float = 1.0
     # Absolute-floor gate: {csv_column: min_value}. Set only on the points that
     # have a floor (the representative point); the gate skips it when None.
     floors: dict[str, float] | None = None
+    absolute_baselines: dict[str, AbsolutePerfBaseline] | None = None
+    use_trailing_baseline: bool = True
+    expose_in_caselist: bool = False
     # Set on the one representative point that captures an xprof trace.
     capture_trace: bool = False
     profile_num_steps: int | None = None
+
+    def __post_init__(self):
+        if self.workload == "generated-shared-prefix":
+            expected = self.gsp_num_groups * self.gsp_prompts_per_group
+            if self.num_prompts != expected:
+                raise ValueError(
+                    f"{self.name}: num_prompts={self.num_prompts} must equal "
+                    f"gsp_num_groups*gsp_prompts_per_group={expected}"
+                )
 
 
 @dataclass(frozen=True)
