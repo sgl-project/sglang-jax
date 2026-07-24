@@ -1,0 +1,42 @@
+name: qwen3_5_a3b-recurrent-perf-tp4
+target: v6e-4
+model_path: Qwen/Qwen3.5-35B-A3B
+tp_size: 4
+dp_size: 1
+port: 30063
+server_args:
+  - --trust-remote-code
+  - --skip-server-warmup
+  - --random-seed
+  - "3"
+  - --dtype
+  - bfloat16
+  - --mem-fraction-static
+  - "0.8"
+  - --attention-backend
+  - fa
+  - --download-dir
+  - /dev/shm/
+  - --page-size
+  - "128"
+  - --context-length
+  - "8192"
+  - --max-running-requests
+  - "16"
+  - --max-prefill-tokens
+  - "4096"
+  - --chunked-prefill-size
+  - "512"
+  - --max-recurrent-state-size
+  - "96"
+  - --disable-overlap-schedule
+  - --enable-unified-radix-tree
+  - --enable-recurrent-extra-buffer
+  - --precompile-bs-paddings
+  - "8"
+  - "16"
+  - --precompile-token-paddings
+  - "512"
+  - "1024"
+  - "2048"
+  - "4096"

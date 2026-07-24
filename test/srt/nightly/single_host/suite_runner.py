@@ -30,6 +30,7 @@ for _p in (_TEST_SRT, _NIGHTLY_DIR, _SELF_DIR):
 
 from cases import (  # noqa: E402
     GSM8K_GENERATION_CONFIG,
+    AbsolutePerfBaseline,
     AccuracyCase,
     PerfCase,
     PerfParams,
@@ -201,6 +202,46 @@ SUITES: dict[str, SingleHostSuite] = {
                     ),
                 ),
             ),
+            SingleHostRun(
+                launch_profile="recurrent-qwen35-perf-v6e-4.yaml",
+                cases=[
+                    PerfCase(
+                        name="recurrent-qwen35-gsp",
+                        workload="generated-shared-prefix",
+                        input_len=2176,
+                        output_len=128,
+                        num_prompts=128,
+                        max_concurrency=16,
+                        warmup_requests=1,
+                        flush_cache=True,
+                        gsp_num_groups=16,
+                        gsp_prompts_per_group=8,
+                        gsp_system_prompt_len=2048,
+                        gsp_question_len=128,
+                        absolute_baselines={
+                            "ttft_ms": AbsolutePerfBaseline(value=1512.2, tolerance=0.02),
+                            "total_tps": AbsolutePerfBaseline(value=5795.3, tolerance=0.02),
+                        },
+                        use_trailing_baseline=False,
+                        expose_in_caselist=True,
+                    ),
+                    PerfCase(
+                        name="recurrent-qwen35-random",
+                        input_len=1024,
+                        output_len=128,
+                        num_prompts=64,
+                        max_concurrency=16,
+                        warmup_requests=1,
+                        flush_cache=True,
+                        absolute_baselines={
+                            "ttft_ms": AbsolutePerfBaseline(value=4400.3, tolerance=0.02),
+                            "total_tps": AbsolutePerfBaseline(value=1729.3, tolerance=0.02),
+                        },
+                        use_trailing_baseline=False,
+                        expose_in_caselist=True,
+                    ),
+                ],
+            ),
         ],
     ),
 }
@@ -339,16 +380,18 @@ def _dry_run(suite: SingleHostSuite) -> dict:
 def _caselist() -> list[dict]:
     """Runnable /run-nightly cases across all suites, as [{"suite", "case"}].
 
-    Perf exposes only its representative point (PerfCase.capture_trace) — the
-    sweep's other points only make sense as a set; accuracy cases have no such
-    attr so all are listed. Touches only the stdlib `cases` catalog (no jax), so
-    the slash handler can call this on a plain CPU runner.
+    Perf exposes its representative trace point or an explicitly selected case;
+    accuracy cases are all listed. Touches only the stdlib `cases` catalog (no
+    jax), so the slash handler can call this on a plain CPU runner.
     """
     out: list[dict] = []
     for suite_name, suite in SUITES.items():
         for run in suite.runs:
             for case in run.cases:
-                if getattr(case, "capture_trace", True) is False:
+                if not (
+                    getattr(case, "capture_trace", True)
+                    or getattr(case, "expose_in_caselist", False)
+                ):
                     continue
                 out.append({"suite": suite_name, "case": case.name})
     return out

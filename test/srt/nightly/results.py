@@ -152,6 +152,7 @@ def build_perf_result(
         # MoE servers (same HF checkpoint) get distinct files and plot legends.
         "model_name": profile_name,
         "tpu_size": _tpu_size(target),
+        "workload": case.workload,
         "concurrency": case.max_concurrency,
         "input": case.input_len,
         "output": case.output_len,
@@ -159,6 +160,7 @@ def build_perf_result(
         "itl_ms": _f("median_itl_ms"),
         "in_tps": _f("input_throughput"),
         "out_tps": _f("output_throughput"),
+        "total_tps": _f("total_throughput"),
         # Gate-helper fields (not written to CSV).
         "case": case.name,
         "completed": completed,
@@ -168,6 +170,7 @@ def build_perf_result(
         # returns. completion-only until then (None = gate not evaluated).
         "passed": completed == case.num_prompts,
         "absolute_floor_passed": None,
+        "absolute_baselines": None,
         "trailing_passed": None,
         "baseline_source": None,
     }
@@ -221,7 +224,13 @@ def write_perf_csv(result: dict) -> Path | None:
     return out_path
 
 
-def write_perf_json(case: PerfCase, profile_name: str, target: str, metrics: dict) -> Path | None:
+def write_perf_json(
+    case: PerfCase,
+    profile_name: str,
+    target: str,
+    metrics: dict,
+    result: dict | None = None,
+) -> Path | None:
     """Write one perf point as ``$RESULTS_DIR/<case>.json`` for the GCS dashboard.
 
     Shared by the single- and multi-host runners — emits ``{type, case, profile,
@@ -236,10 +245,19 @@ def write_perf_json(case: PerfCase, profile_name: str, target: str, metrics: dic
     summary = {
         "type": "perf",
         "case": case.name,
+        "workload": case.workload,
         "profile": profile_name,
         "target": target,
         **(metrics if isinstance(metrics, dict) else {}),
     }
+    if result is not None:
+        summary["gate"] = {
+            "passed": result.get("passed"),
+            "absolute_passed": result.get("absolute_floor_passed"),
+            "absolute_baselines": result.get("absolute_baselines"),
+            "trailing_passed": result.get("trailing_passed"),
+            "baseline_source": result.get("baseline_source"),
+        }
     # request_rate is inf for the concurrency sweep; json.dumps would write it as
     # the bare token `Infinity`, which JS JSON.parse rejects (the dashboard would
     # drop the whole case). Map non-finite top-level floats to None (valid JSON).
@@ -263,7 +281,8 @@ def gate_perf_result(case: PerfCase, result: dict) -> tuple[str, str] | None:
 
     1. **completion** — ``completed == num_prompts`` (OOM / dropped requests).
        Tagged ``"case"`` (a real bug, CI does not retry).
-    2. **absolute floor** — per-metric hard minimum from ``case.floors``.
+    2. **absolute gate** — hard bounds from ``case.floors`` and fixed
+       baseline/tolerance pairs from ``case.absolute_baselines``.
        Tagged ``"threshold"``.
     3. **trailing baseline** — each point's metrics (``gated_metrics``: a prefill
        point gates in_tps + ttft, a decode point adds out_tps + itl) within
@@ -290,8 +309,9 @@ def gate_perf_result(case: PerfCase, result: dict) -> tuple[str, str] | None:
         return ("case", f"{case.name}: completed={completed}/{case.num_prompts}")
 
     floors = case.floors or {}
+    baselines = case.absolute_baselines or {}
 
-    # 2. absolute floor — per-metric hard minimum/maximum, by metric direction
+    # 2. absolute gate — per-metric hard minimum/maximum, by metric direction
     # (higher-is-better → fail under floor; lower-is-better latency → fail over
     # floor). Today's registered floors are all out_tps (higher), so this is the
     # same `value < floor` as before; the direction split only matters if a
@@ -308,6 +328,36 @@ def gate_perf_result(case: PerfCase, result: dict) -> tuple[str, str] | None:
                 floor_failures.append(f"{metric}={value:.1f} > floor {floor:.1f}")
         elif value < floor:
             floor_failures.append(f"{metric}={value:.1f} < floor {floor:.1f}")
+
+    baseline_details: dict[str, dict] = {}
+    for metric, baseline in baselines.items():
+        direction = METRIC_DIRECTION.get(metric)
+        if direction is None:
+            result["passed"] = False
+            return ("case", f"{case.name}: unknown baseline metric {metric!r}")
+        value = result.get(metric)
+        if value is None or value <= 0:
+            result["passed"] = False
+            return ("case", f"{case.name}: missing or invalid metric {metric}={value!r}")
+        if direction == "lower":
+            bound = baseline.value * (1.0 + baseline.tolerance)
+            passed = value <= bound
+            comparison = f"{metric}={value:.1f} > {bound:.1f}"
+        else:
+            bound = baseline.value * (1.0 - baseline.tolerance)
+            passed = value >= bound
+            comparison = f"{metric}={value:.1f} < {bound:.1f}"
+        baseline_details[metric] = {
+            "value": baseline.value,
+            "tolerance": baseline.tolerance,
+            "bound": bound,
+            "direction": direction,
+            "measured": value,
+            "passed": passed,
+        }
+        if not passed:
+            floor_failures.append(comparison)
+    result["absolute_baselines"] = baseline_details
     result["absolute_floor_passed"] = not floor_failures
 
     # 3. trailing baseline (best-effort; skipped when history < min nights).
@@ -318,35 +368,43 @@ def gate_perf_result(case: PerfCase, result: dict) -> tuple[str, str] | None:
     csv_filename = perf_csv_filename(result["model_name"], result["tpu_size"])
     trailing_failures: list[str] = []
     trailing_evaluated = False
-    for metric, direction in gated_metrics(result["output"]).items():
-        value = result.get(metric)
-        if value is None:
-            continue
-        # A non-positive latency means the metric is missing/degenerate (build_perf_result
-        # defaults missing latencies to 0.0), not a record-low latency — skip it rather
-        # than letting `0.0 > bound` silently pass the lower-is-better gate.
-        if direction == "lower" and value <= 0:
-            continue
-        mean = fetch_trailing_baseline(
-            csv_filename,
-            result["concurrency"],
-            result["input"],
-            result["output"],
-            metric,
-            n,
-        )
-        if mean is None:
-            continue  # insufficient history -> skip this metric's trailing gate
-        trailing_evaluated = True
-        if direction == "higher":
-            bound = mean * (1.0 - tol)
-            if value < bound:
-                trailing_failures.append(f"{metric}={value:.1f} < {mean:.1f}*(1-{tol})={bound:.1f}")
-        else:  # lower-is-better (latency)
-            bound = mean * (1.0 + tol)
-            if value > bound:
-                trailing_failures.append(f"{metric}={value:.1f} > {mean:.1f}*(1+{tol})={bound:.1f}")
-    if trailing_evaluated:
+    if case.use_trailing_baseline:
+        for metric, direction in gated_metrics(result["output"]).items():
+            value = result.get(metric)
+            if value is None:
+                continue
+            # A non-positive latency means the metric is missing/degenerate (build_perf_result
+            # defaults missing latencies to 0.0), not a record-low latency — skip it rather
+            # than letting `0.0 > bound` silently pass the lower-is-better gate.
+            if direction == "lower" and value <= 0:
+                continue
+            mean = fetch_trailing_baseline(
+                csv_filename,
+                result["concurrency"],
+                result["input"],
+                result["output"],
+                metric,
+                n,
+            )
+            if mean is None:
+                continue  # insufficient history -> skip this metric's trailing gate
+            trailing_evaluated = True
+            if direction == "higher":
+                bound = mean * (1.0 - tol)
+                if value < bound:
+                    trailing_failures.append(
+                        f"{metric}={value:.1f} < {mean:.1f}*(1-{tol})={bound:.1f}"
+                    )
+            else:  # lower-is-better (latency)
+                bound = mean * (1.0 + tol)
+                if value > bound:
+                    trailing_failures.append(
+                        f"{metric}={value:.1f} > {mean:.1f}*(1+{tol})={bound:.1f}"
+                    )
+    if not case.use_trailing_baseline:
+        result["trailing_passed"] = None
+        result["baseline_source"] = "disabled"
+    elif trailing_evaluated:
         result["trailing_passed"] = not trailing_failures
         result["baseline_source"] = f"ci-data last-{n} mean"
     else:
@@ -356,7 +414,7 @@ def gate_perf_result(case: PerfCase, result: dict) -> tuple[str, str] | None:
     result["passed"] = result["absolute_floor_passed"] and result["trailing_passed"] is not False
 
     if floor_failures:
-        return ("threshold", f"{case.name} absolute-floor: {'; '.join(floor_failures)}")
+        return ("threshold", f"{case.name} absolute: {'; '.join(floor_failures)}")
     if trailing_failures:
         return ("threshold", f"{case.name} trailing: {'; '.join(trailing_failures)}")
     return None

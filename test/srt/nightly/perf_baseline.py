@@ -37,6 +37,7 @@ TRAILING_MIN_NIGHTS = 5
 METRIC_DIRECTION: dict[str, str] = {
     "in_tps": "higher",
     "out_tps": "higher",
+    "total_tps": "higher",
     "ttft_ms": "lower",
     "itl_ms": "lower",
 }
