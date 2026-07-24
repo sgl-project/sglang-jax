@@ -299,7 +299,7 @@ class ModelRunnerKVCacheMixin:
         dtype_size = jnp.dtype(self.kv_cache_dtype).itemsize
         num_layers = self._kv_pool_layer_count()
 
-        if self.use_mla_backend and self.server_args.attention_backend == "fa":
+        if self.use_mla_backend and self.server_args.attention_backend in ("fa", "dsa_sparse"):
             cfg = self.model_config.hf_text_config
             kv_dim = align128(cfg.kv_lora_rank) + align128(cfg.qk_rope_head_dim)
             # MLA v2 kernel packs page_size up to kv_packing boundary.
@@ -672,7 +672,7 @@ class ModelRunnerKVCacheMixin:
                 mesh=self.mesh,
                 dp_size=dp_size,
             )
-        elif self.use_mla_backend and self.server_args.attention_backend == "fa":
+        elif self.use_mla_backend and self.server_args.attention_backend in ("fa", "dsa_sparse"):
             from sgl_jax.srt.mem_cache.memory_pool import MLATokenToKVPool
 
             hf_text_config = self.model_config.hf_text_config
@@ -685,11 +685,24 @@ class ModelRunnerKVCacheMixin:
                     f"kv_lora_rank={kv_lora_rank}, qk_rope_head_dim={qk_rope_head_dim}."
                 )
 
+            dsa_kwargs = {}
+            if self.server_args.attention_backend == "dsa_sparse":
+                from sgl_jax.srt.kernels.dsa.ref import build_index_share_map
+
+                _, _, num_full = build_index_share_map(
+                    getattr(hf_text_config, "indexer_types", None),
+                    getattr(hf_text_config, "index_skip_topk_offset", 0),
+                    hf_text_config.num_hidden_layers,
+                )
+                dsa_kwargs["indexer_key_dim"] = hf_text_config.index_head_dim
+                dsa_kwargs["num_indexer_layers"] = num_full
+
             self.token_to_kv_pool = self._maybe_wrap_hybrid_kv_pool(
                 MLATokenToKVPool,
                 kv_lora_rank=kv_lora_rank,
                 qk_rope_head_dim=qk_rope_head_dim,
                 dp_size=dp_size,
+                **dsa_kwargs,
             )
         else:
             self.token_to_kv_pool = self._maybe_wrap_hybrid_kv_pool(

@@ -33,6 +33,10 @@ from sgl_jax.srt.managers.schedule_batch import (
 )
 from sgl_jax.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sgl_jax.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
+from sgl_jax.srt.model_executor.aot_dispatch import (
+    AotDispatcher,
+    aot_dispatch_requested,
+)
 from sgl_jax.srt.model_executor.base_model_runner import BaseModelRunner
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.model_executor.model_runner_kv_cache_mixin import (
@@ -271,25 +275,80 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         def jitted_compute_logprobs(mesh, logits, next_tokens):
             return compute_logprobs(mesh, logits, next_tokens)
 
-        def run_model_wrapper(forward_batch, logits_metadata):
-            return jitted_run_model(
-                model_def,
-                model_state_def,
-                self.model_state_leaves,
-                forward_batch,
-                self.memory_pools,
-                logits_metadata,
+        # Opt-in (SGLANG_JAX_AOT_DISPATCH=auto|1): weights enter jit as
+        # ~thousands of flat args; AotDispatcher skips pjit's per-arg Python
+        # dispatch (O(n_args) checks + shard_args) by caching an AOT
+        # executable per batch-shape and pre-sharding the weight buffers
+        # once. See aot_dispatch.py. run_precompile drives the same wrapper,
+        # so precompiled deployments start fully warm. Off by default; the
+        # stock pjit path below is untouched. Speculative decoding always
+        # uses the stock path (interaction not yet supported).
+        use_aot_dispatch = aot_dispatch_requested()
+        if use_aot_dispatch and self.server_args.speculative_algorithm:
+            logger.warning(
+                "SGLANG_JAX_AOT_DISPATCH is set but speculative decoding is "
+                "enabled; falling back to the stock pjit dispatch path."
+            )
+            use_aot_dispatch = False
+
+        if use_aot_dispatch:
+            self._run_model_dispatcher = AotDispatcher(
+                jitted_run_model,
+                stable_call_args=(model_def, model_state_def, self.model_state_leaves),
+                stable_flat_args=(model_def, self.model_state_leaves),
+                name="run_model",
             )
 
-        self.jitted_run_model = run_model_wrapper
+            def run_model_wrapper(forward_batch, logits_metadata):
+                # LoRA weight loading rebinds self.model_state_leaves to a new
+                # list (tp_worker.prepare_lora_batch); the dispatcher must not
+                # keep executing with the buffers captured at construction.
+                self._run_model_dispatcher.ensure_stable_args(
+                    (model_def, model_state_def, self.model_state_leaves),
+                    (model_def, self.model_state_leaves),
+                )
+                return self._run_model_dispatcher(
+                    forward_batch,
+                    self.memory_pools,
+                    logits_metadata,
+                )
 
-        self.jitted_sampler = partial(
-            jitted_sampler,
-            sampler_def,
-            sampler_state_def,
-            sampler_state_leaves,
-            self.use_sort_for_toppk_minp,
-        )
+            self.jitted_run_model = run_model_wrapper
+
+            self._sampler_dispatcher = AotDispatcher(
+                jitted_sampler,
+                stable_call_args=(
+                    sampler_def,
+                    sampler_state_def,
+                    sampler_state_leaves,
+                    self.use_sort_for_toppk_minp,
+                ),
+                stable_flat_args=(sampler_def, sampler_state_leaves),
+                name="sampler",
+            )
+
+            self.jitted_sampler = self._sampler_dispatcher
+        else:
+
+            def run_model_wrapper(forward_batch, logits_metadata):
+                return jitted_run_model(
+                    model_def,
+                    model_state_def,
+                    self.model_state_leaves,
+                    forward_batch,
+                    self.memory_pools,
+                    logits_metadata,
+                )
+
+            self.jitted_run_model = run_model_wrapper
+
+            self.jitted_sampler = partial(
+                jitted_sampler,
+                sampler_def,
+                sampler_state_def,
+                sampler_state_leaves,
+                self.use_sort_for_toppk_minp,
+            )
 
         self.jitted_compute_logprobs = partial(jitted_compute_logprobs, self.mesh)
 
@@ -430,7 +489,13 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         # KV via kv_b_proj and run standard attention. Read by
         # DeepseekV3DecoderLayer to construct DeepseekV3Attention; harmless on
         # non-MLA models that ignore the attribute.
-        self.model_config.hf_config.use_absorbed_mla = self.server_args.attention_backend == "fa"
+        self.model_config.hf_config.use_absorbed_mla = self.server_args.attention_backend in (
+            "fa",
+            "dsa_sparse",
+        )
+        self.model_config.hf_config.use_dsa_sparse = (
+            self.server_args.attention_backend == "dsa_sparse"
+        )
         self.model_config.hf_config.enable_sequence_parallel = (
             self.server_args.enable_sequence_parallel
         )
@@ -566,6 +631,34 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 )
             cfg = self.model_config.hf_text_config
             full_attn_backend = MLAAttentionBackend(
+                num_attn_heads=self.num_attn_heads,
+                kv_lora_rank=cfg.kv_lora_rank,
+                qk_nope_head_dim=cfg.qk_nope_head_dim,
+                qk_rope_head_dim=cfg.qk_rope_head_dim,
+                v_head_dim=cfg.v_head_dim,
+                page_size=self.page_size,
+                mesh=self.mesh,
+                attention_data_partition_axis="data",
+            )
+
+        elif backend == "dsa_sparse" and self.use_mla_backend:
+            from sgl_jax.srt.kernels.dsa.ref import build_index_share_map
+            from sgl_jax.srt.layers.attention.dsa_sparse_backend import (
+                DSASparseAttentionBackend,
+            )
+
+            cfg = self.model_config.hf_text_config
+            full_slot, _, _ = build_index_share_map(
+                getattr(cfg, "indexer_types", None),
+                getattr(cfg, "index_skip_topk_offset", 0),
+                cfg.num_hidden_layers,
+            )
+            full_attn_backend = DSASparseAttentionBackend(
+                index_topk=cfg.index_topk,
+                index_head_dim=cfg.index_head_dim,
+                index_n_heads=cfg.index_n_heads,
+                skip_offset=getattr(cfg, "index_skip_topk_offset", 0),
+                full_slot=full_slot,
                 num_attn_heads=self.num_attn_heads,
                 kv_lora_rank=cfg.kv_lora_rank,
                 qk_nope_head_dim=cfg.qk_nope_head_dim,

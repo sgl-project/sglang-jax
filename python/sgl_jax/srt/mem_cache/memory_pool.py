@@ -1231,6 +1231,8 @@ class MLATokenToKVPool(KVCache):
         dp_size: int = 1,
         start_layer: int | None = None,
         end_layer: int | None = None,
+        indexer_key_dim: int = 0,
+        num_indexer_layers: int = 0,
     ):
         super().__init__(size, page_size, dtype, layer_num, mesh, start_layer, end_layer)
         self.kv_lora_rank = kv_lora_rank
@@ -1243,6 +1245,8 @@ class MLATokenToKVPool(KVCache):
         self.nope_dim = align_to(kv_lora_rank, 128)
         self.rope_dim = align_to(qk_rope_head_dim, 128)
         self.kv_dim = self.nope_dim + self.rope_dim
+        self.indexer_key_dim = align_to(indexer_key_dim, 128) if indexer_key_dim else 0
+        self.num_indexer_layers = num_indexer_layers
 
         self._create_buffers()
         self._calculate_memory_usage()
@@ -1250,7 +1254,7 @@ class MLATokenToKVPool(KVCache):
     def tree_flatten(self):
         parent_children, parent_aux_data = super().tree_flatten()
 
-        children = (self.kv_buffer,) + parent_children
+        children = (self.kv_buffer, self.indexer_key_buffer) + parent_children
         aux_data = {
             **parent_aux_data,
             "kv_lora_rank": self.kv_lora_rank,
@@ -1261,13 +1265,16 @@ class MLATokenToKVPool(KVCache):
             "rope_dim": self.rope_dim,
             "kv_dim": self.kv_dim,
             "kv_sharding": self.kv_sharding,
+            "indexer_key_dim": self.indexer_key_dim,
+            "num_indexer_layers": self.num_indexer_layers,
         }
         return (children, aux_data)
 
     @classmethod
     def tree_unflatten(cls, aux_data, children):
         kv_buffer = children[0]
-        parent_children = children[1:] if len(children) > 1 else ()
+        indexer_key_buffer = children[1]
+        parent_children = children[2:] if len(children) > 2 else ()
 
         obj = object.__new__(cls)
 
@@ -1292,8 +1299,11 @@ class MLATokenToKVPool(KVCache):
         obj.rope_dim = aux_data["rope_dim"]
         obj.kv_dim = aux_data["kv_dim"]
         obj.kv_sharding = aux_data["kv_sharding"]
+        obj.indexer_key_dim = aux_data.get("indexer_key_dim", 0)
+        obj.num_indexer_layers = aux_data.get("num_indexer_layers", 0)
 
         obj.kv_buffer = kv_buffer
+        obj.indexer_key_buffer = indexer_key_buffer
 
         return obj
 
@@ -1348,6 +1358,37 @@ class MLATokenToKVPool(KVCache):
             allocate = _get_kv_zero_allocator(buffer_shape, self.dtype, self.kv_sharding)
             for _ in range(self.layer_num):
                 self.kv_buffer.append(allocate())
+
+            self.indexer_key_buffer = []
+            if self.indexer_key_dim > 0 and self.num_indexer_layers > 0:
+                idx_shape = get_kv_cache_shape(
+                    total_num_pages=total_num_pages,
+                    page_size=self.page_size,
+                    kv_dim=self.indexer_key_dim,
+                    kv_dtype=self.dtype,
+                )
+                logger.info(
+                    "DSA indexer-key cache: %d slots × %s (%.2f GB total)",
+                    self.num_indexer_layers,
+                    idx_shape,
+                    self.num_indexer_layers
+                    * idx_shape[0]
+                    * idx_shape[1]
+                    * idx_shape[2]
+                    * idx_shape[3]
+                    * jnp.dtype(self.dtype).itemsize
+                    / GB,
+                )
+                for _ in range(self.num_indexer_layers):
+                    self.indexer_key_buffer.append(
+                        jax.jit(
+                            lambda: jnp.zeros(shape=idx_shape, dtype=self.dtype),
+                            out_shardings=self.kv_sharding,
+                        )()
+                    )
+
+    def get_indexer_key_buffer(self, slot_id: int) -> jax.Array:
+        return self.indexer_key_buffer[slot_id]
 
     def _calculate_memory_usage(self):
         """Calculate memory usage for the 4D paged MLA cache."""
@@ -1404,7 +1445,11 @@ class MLATokenToKVPool(KVCache):
             "the MLA v2 kernel writes the cache in-place via input_output_aliases."
         )
 
-    def replace_buffer(self, kv_buffer: list[jax.Array]) -> None:
+    def replace_buffer(self, kv_buffer) -> None:
+        if isinstance(kv_buffer, tuple):
+            kv_buffer, idx_buffer = kv_buffer
+            if idx_buffer:
+                self.indexer_key_buffer[: len(idx_buffer)] = idx_buffer
         self.kv_buffer[self.start_layer : self.start_layer + len(kv_buffer)] = kv_buffer
 
     def get_cpu_copy(self, indices):

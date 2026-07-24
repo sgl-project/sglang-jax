@@ -182,6 +182,7 @@ class ServerArgs:
 
     # Kernel backend
     attention_backend: str | None = "fa"
+    dsa_use_pallas: bool = True  # deprecated no-op; jnp-ref e2e path removed
     moe_backend: str = "epmoe"
     disable_jax_allreduce_metadata: bool = False
     enable_grouped_topk_kernel: bool = False
@@ -1382,6 +1383,7 @@ class ServerArgs:
                 "native",
                 "fa",
                 "fa_mha",
+                "dsa_sparse",
             ],
             default=ServerArgs.attention_backend,
             help=(
@@ -1389,8 +1391,16 @@ class ServerArgs:
                 "'fa' = FlashAttention for MHA models, MLA Pallas kernel (absorbed) for MLA models. "
                 "'fa_mha' = force the MHA FlashAttention path for MLA models too "
                 "(decompress latent KV per-forward via kv_b_proj; ~70x more KV cache than 'fa', "
-                "intended for kernel A/B on short contexts)."
+                "intended for kernel A/B on short contexts). "
+                "'dsa_sparse' = DeepSeek Sparse Attention (lightning-indexer top-k + sparse MLA) "
+                "with IndexShare cross-layer reuse; MLA models with index_* config only."
             ),
+        )
+        parser.add_argument(
+            "--dsa-use-pallas",
+            action="store_true",
+            default=ServerArgs.dsa_use_pallas,
+            help="Use Pallas kernels for the dsa_sparse backend (default: jnp reference).",
         )
         parser.add_argument(
             "--moe-backend",
