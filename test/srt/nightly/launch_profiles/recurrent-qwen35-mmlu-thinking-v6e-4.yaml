@@ -1,0 +1,37 @@
+name: qwen3_5_a3b-recurrent-mmlu-thinking-tp4-dp2-ep4
+target: v6e-4
+model_path: Qwen/Qwen3.5-35B-A3B
+tp_size: 4
+dp_size: 2
+ep_size: 4
+port: 30053
+check_cache_miss: false
+server_args:
+  - --trust-remote-code
+  - --skip-server-warmup
+  - --random-seed
+  - "3"
+  - --dtype
+  - bfloat16
+  - --mem-fraction-static
+  - "0.8"
+  - --chunked-prefill-size
+  - "512"
+  - --page-size
+  - "128"
+  - --max-running-requests
+  - "16"
+  - --context-length
+  - "32768"
+  - --enable-unified-radix-tree
+  - --enable-recurrent-extra-buffer
+  - --max-recurrent-state-size
+  - "96"
+  - --disable-overlap-schedule
+  - --precompile-bs-paddings
+  - "8"
+  - "16"
+  - --precompile-token-paddings
+  - "512"
+  - "1024"
+  - "2048"

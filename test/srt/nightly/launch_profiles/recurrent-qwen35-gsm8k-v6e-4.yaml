@@ -1,0 +1,34 @@
+name: qwen3_5_a3b-recurrent-gsm8k-tp4-dp2
+target: v6e-4
+model_path: Qwen/Qwen3.5-35B-A3B
+tp_size: 4
+dp_size: 2
+port: 30052
+server_args:
+  - --trust-remote-code
+  - --skip-server-warmup
+  - --random-seed
+  - "3"
+  - --dtype
+  - bfloat16
+  - --mem-fraction-static
+  - "0.8"
+  - --chunked-prefill-size
+  - "512"
+  - --page-size
+  - "128"
+  - --max-running-requests
+  - "16"
+  - --context-length
+  - "8192"
+  - --enable-unified-radix-tree
+  - --enable-recurrent-extra-buffer
+  - --max-recurrent-state-size
+  - "96"
+  - --disable-overlap-schedule
+  - --precompile-bs-paddings
+  - "8"
+  - "16"
+  - --precompile-token-paddings
+  - "512"
+  - "1024"
