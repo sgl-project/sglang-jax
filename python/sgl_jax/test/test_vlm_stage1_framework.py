@@ -697,6 +697,7 @@ def test_device_put_plan_shards_lane_axes():
     ("arch", "chunked", "radix", "mixed_chunk"),
     [
         (ARCH, 4096, False, True),
+        ("Qwen3VLForConditionalGeneration", 4096, False, False),
         ("UnsupportedVLM", -1, True, False),
     ],
 )

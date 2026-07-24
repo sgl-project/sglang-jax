@@ -29,9 +29,12 @@ logger = logging.getLogger(__name__)
 
 GRAMMAR_BACKEND_CHOICES = ["llguidance", "none"]
 _REJECTED_PD_HOST_ALIASES = frozenset({"localhost"})
-_MULTIMODAL_CHUNKED_PREFILL_ARCHITECTURES = frozenset({"Qwen2_5_VLForConditionalGeneration"})
+_IN_MODEL_QWEN_VL_ARCHITECTURES = frozenset(
+    {"Qwen2_5_VLForConditionalGeneration", "Qwen3VLForConditionalGeneration"}
+)
+_MULTIMODAL_CHUNKED_PREFILL_ARCHITECTURES = _IN_MODEL_QWEN_VL_ARCHITECTURES
 _MULTIMODAL_MIXED_CHUNK_ARCHITECTURES = frozenset({"Qwen2_5_VLForConditionalGeneration"})
-_MULTIMODAL_RADIX_CACHE_ARCHITECTURES = frozenset({"Qwen2_5_VLForConditionalGeneration"})
+_MULTIMODAL_RADIX_CACHE_ARCHITECTURES = _IN_MODEL_QWEN_VL_ARCHITECTURES
 
 
 def apply_multimodal_model_defaults(server_args, model_config) -> None:
