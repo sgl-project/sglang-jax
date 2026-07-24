@@ -14,6 +14,7 @@ from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.kernels.speculative.kernel import top_k_renorm_prob, top_p_renorm_prob
+from sgl_jax.srt.layers.sampler import populate_speculative_output_logprobs
 from sgl_jax.srt.sampling.sampling_params import TOP_K_ALL
 from sgl_jax.srt.speculative.relay_buffer import (
     gather_spec_relay_buffers,
@@ -1926,6 +1927,15 @@ def spec_decode_verify(spec_worker, model_worker_batch, cur_allocate_lens):
         extend_input_len_per_req=None,
         extend_logprob_start_len_per_req=None,
     )
+    if return_target_logits:
+        populate_speculative_output_logprobs(
+            batch_output.logits_output,
+            prepared_verified_id,
+            model_worker_batch=model_worker_batch,
+            speculative_num_steps=draft_worker.speculative_num_steps,
+            mesh=spec_worker.mesh,
+            temperatures=_sv_temps,
+        )
     model_worker_batch.spec_info_padded = next_draft_input
     return batch_output
 

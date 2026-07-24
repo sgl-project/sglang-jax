@@ -12,6 +12,7 @@ import numpy as np
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
+from sgl_jax.srt.layers.sampler import populate_speculative_output_logprobs
 from sgl_jax.srt.speculative.overlap_utils import use_legacy_eagle3_non_overlap
 
 if TYPE_CHECKING:
@@ -139,6 +140,16 @@ class BaseSpecWorker:
             and not getattr(model_worker_batch, "return_output_logprob_only", False)
         )
 
+    def _can_skip_greedy_prefill_sample(
+        self, model_worker_batch: ModelWorkerBatch, legacy_non_overlap: bool
+    ) -> bool:
+        return (
+            model_worker_batch.sampling_info.is_all_greedy
+            and not legacy_non_overlap
+            and not getattr(model_worker_batch, "return_logprob", False)
+            and not getattr(model_worker_batch, "return_output_logprob_only", False)
+        )
+
     # -- Main entry point --
 
     def _prepare_overlap_sampling_info(self, model_worker_batch: ModelWorkerBatch):
@@ -228,7 +239,7 @@ class BaseSpecWorker:
                 self.mesh,
                 vocab_size=self.target_worker.model_config.vocab_size,
             )
-            if model_worker_batch.sampling_info.is_all_greedy and not legacy_non_overlap:
+            if self._can_skip_greedy_prefill_sample(model_worker_batch, legacy_non_overlap):
                 logits_output, _, cache_miss_count, bid, _seq_lens = self.forward_target_extend(
                     model_worker_batch,
                     sampling_metadata,
@@ -370,6 +381,15 @@ class BaseSpecWorker:
             allocate_lens=cur_allocate_lens,
             hidden_states=logits_output.hidden_states,
         )
+
+        if model_worker_batch.return_logprob or model_worker_batch.return_output_logprob_only:
+            populate_speculative_output_logprobs(
+                logits_output,
+                verified_id,
+                model_worker_batch=model_worker_batch,
+                speculative_num_steps=self.speculative_num_steps,
+                mesh=self.mesh,
+            )
 
         model_worker_batch.spec_info_padded = next_draft_input
         return GenerationBatchResult(

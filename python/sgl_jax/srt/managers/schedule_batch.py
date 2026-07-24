@@ -2333,6 +2333,26 @@ class ScheduleBatch:
             logits_indices_selector,
         )
 
+    def _merge_logprob_metadata(self, per_dp_bs_size: int, total_bs: int):
+        if not self.return_logprob:
+            return None, None
+
+        top_logprobs_nums = [0] * total_bs
+        token_ids_logprobs: list[list[int] | None] = [None] * total_bs
+        for dp_rank in range(self.dp_size):
+            info = self.reqs_info[dp_rank]
+            if info.seq_lens is None or len(info.seq_lens) == 0:
+                continue
+
+            start = dp_rank * per_dp_bs_size
+            end = start + len(info.seq_lens)
+            if info.top_logprobs_nums is not None:
+                top_logprobs_nums[start:end] = info.top_logprobs_nums
+            if info.token_ids_logprobs is not None:
+                token_ids_logprobs[start:end] = info.token_ids_logprobs
+
+        return top_logprobs_nums, token_ids_logprobs
+
     def _merge_cache_loc(
         self,
         bs_paddings: list,
@@ -2630,6 +2650,8 @@ class ScheduleBatch:
             if target_per_rank_ocl > 0
             else np.empty(0, dtype=np.int32)
         )
+        top_logprobs_nums, token_ids_logprobs = self._merge_logprob_metadata(per_dp_bs, total_bs)
+
         model_worker_batch = ModelWorkerBatch(
             bid=acc_global_bid(),
             forward_mode=self.forward_mode,
@@ -2640,8 +2662,8 @@ class ScheduleBatch:
             out_cache_loc=out_cache_loc,
             return_logprob=self.return_logprob,
             return_output_logprob_only=self.return_output_logprob_only,
-            top_logprobs_nums=None,
-            token_ids_logprobs=None,
+            top_logprobs_nums=top_logprobs_nums,
+            token_ids_logprobs=token_ids_logprobs,
             sampling_info=sampling_info,
             positions=np.empty(0, dtype=np.int32),
             cache_loc=np.empty(0, dtype=np.int32),
@@ -3025,24 +3047,9 @@ class ScheduleBatch:
         apply_for_deepstack = _mm["apply_for_deepstack"]
         deepstack_visual_embedding = _mm["deepstack_visual_embedding"]
 
-        # Merge per-DP top_logprobs_nums / token_ids_logprobs with the same
-        # offset_bs += per_dp_bs_padding padding scheme used in _merge_batch_metadata.
-        if self.return_logprob:
-            top_logprobs_nums = [0] * total_bs
-            token_ids_logprobs: list[list[int] | None] = [None] * total_bs
-            offset_bs = 0
-            for dp_rank in range(self.dp_size):
-                info = self.reqs_info[dp_rank]
-                if info.seq_lens is not None and len(info.seq_lens) > 0:
-                    dp_bs = len(info.seq_lens)
-                    if info.top_logprobs_nums is not None:
-                        top_logprobs_nums[offset_bs : offset_bs + dp_bs] = info.top_logprobs_nums
-                    if info.token_ids_logprobs is not None:
-                        token_ids_logprobs[offset_bs : offset_bs + dp_bs] = info.token_ids_logprobs
-                offset_bs += per_dp_bs_padding
-        else:
-            top_logprobs_nums = None
-            token_ids_logprobs = None
+        top_logprobs_nums, token_ids_logprobs = self._merge_logprob_metadata(
+            per_dp_bs_padding, total_bs
+        )
 
         # extend+logprob always uses the padded path: the legacy fallback slices
         # hidden_states per req under P("data","tensor") and crashes when the row
