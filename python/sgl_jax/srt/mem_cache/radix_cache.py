@@ -285,7 +285,8 @@ class RadixCache(BasePrefixCache):
         return self._insert_helper(self.root_node, converted_key, value)
 
     def _key_ids(self, req, length: int):
-        base = req.cache_input_ids if req.cache_input_ids is not None else req.origin_input_ids
+        cache_input_ids = getattr(req, "cache_input_ids", None)
+        base = cache_input_ids if cache_input_ids is not None else req.origin_input_ids
         ids = base + req.output_ids if req.output_ids else base
         return ids[:length]
 
