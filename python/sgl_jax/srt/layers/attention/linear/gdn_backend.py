@@ -25,6 +25,9 @@ inference. Returns ``(core_attn_out, new_conv, new_rec)`` shaped for
 
 from __future__ import annotations
 
+import logging
+import os
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import jax
@@ -35,6 +38,7 @@ from sgl_jax.srt.kernels.gdn import (
     decode_gated_delta_rule_ref,
     jax_causal_conv1d_prefill,
     jax_causal_conv1d_update,
+    ragged_gated_delta_rule_chunkwise,
     ragged_gated_delta_rule_ref,
 )
 from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
@@ -45,6 +49,9 @@ if TYPE_CHECKING:
     from sgl_jax.srt.layers.radix_linear_attention import RadixLinearAttention
     from sgl_jax.srt.mem_cache.recurrent_state_pool import RecurrentStatePool
     from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+
+
+logger = logging.getLogger(__name__)
 
 
 def _mesh_tp_size(mesh: jax.sharding.Mesh) -> int:
@@ -113,6 +120,40 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
                 f"GDNAttnBackend: num_v_heads={num_v_heads} must be a multiple "
                 f"of num_k_heads={num_k_heads} (GQA repeat factor)."
             )
+
+        self.requested_impl: str = os.environ.get("SGLANG_JAX_GDN_PREFILL_IMPL", "chunkwise")
+        if self.requested_impl not in {"chunkwise", "reference"}:
+            raise ValueError(
+                "SGLANG_JAX_GDN_PREFILL_IMPL must be one of 'chunkwise' or "
+                f"'reference', got {self.requested_impl!r}"
+            )
+
+        self.effective_impl: str = self.requested_impl
+        self.fallback_reason: str | None = None
+        self._prefill_callable: Callable = ragged_gated_delta_rule_ref
+        if self.requested_impl == "chunkwise":
+            if self.head_k_dim > 256:
+                self.effective_impl = "reference"
+                self.fallback_reason = f"head_k_dim={self.head_k_dim} exceeds chunkwise limit=256"
+            else:
+                platforms = {device.platform.lower() for device in mesh.devices.flat}
+                all_tpu = platforms == {"tpu"}
+                all_non_tpu = "tpu" not in platforms
+                interpret_enabled = os.environ.get("PALLAS_INTERPRET", "").lower() == "true"
+                if all_tpu or (all_non_tpu and interpret_enabled):
+                    self._prefill_callable = ragged_gated_delta_rule_chunkwise
+                else:
+                    self.effective_impl = "reference"
+                    self.fallback_reason = "chunkwise prefill unsupported on platform=" + ",".join(
+                        sorted(platforms)
+                    )
+
+        logger.info(
+            "GDN prefill implementation requested_impl=%s effective_impl=%s fallback_reason=%s",
+            self.requested_impl,
+            self.effective_impl,
+            self.fallback_reason,
+        )
 
     # ------------------------------------------------------------------
     # Dispatch
@@ -317,7 +358,7 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
         A_log: jax.Array,
         dt_bias: jax.Array,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
-        """Packed ragged batch through ``ragged_gated_delta_rule_ref``."""
+        """Packed ragged batch through the initialization-frozen prefill callable."""
         meta = self.forward_metadata
         cu_seqlens = meta.cu_q_lens
         state_indices = meta.recurrent_indices
@@ -345,6 +386,9 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
             track_indices_l=None,
             track_mask_l=None,
         ):
+            if track_indices_l is not None:
+                nonempty = cu_seqlens_l[1:] > cu_seqlens_l[:-1]
+                track_mask_l = track_mask_l & nonempty & (state_indices_l != 0)
             # jax_causal_conv1d_prefill operates on [D, T] (channel-first).
             # Pass `has_initial_state` so brand-new prefills don't pick up
             # stale conv state from a freshly-allocated slot (same mask
@@ -362,7 +406,7 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
                 track_mask=track_mask_l,
             )
             conv_out = conv_out_dt.T  # [T, D]
-            new_rec, out = ragged_gated_delta_rule_ref(
+            new_rec, out = self._prefill_callable(
                 conv_out,
                 b_l,
                 a_l,

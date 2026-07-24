@@ -43,6 +43,8 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 
+from sgl_jax.srt.kernels.kda import chunk_kda
+
 
 def _l2norm(x: jax.Array, eps: float = 1e-6) -> jax.Array:
     norm = jnp.sqrt((x.astype(jnp.float32) ** 2).sum(axis=-1, keepdims=True) + eps)
@@ -505,9 +507,92 @@ def ragged_gated_delta_rule_ref(
     # ``SGLANG_JAX_RECURRENT_STATE_DTYPE=bfloat16`` can override).
     new_recurrent_state = _scatter_idx0_safe(recurrent_state, state_indices, new_state_buf)
     if track_indices is not None:
+        nonempty = cu_seqlens[1:] > cu_seqlens[:-1]
+        effective_track_mask = track_mask & nonempty & (state_indices != 0)
         new_recurrent_state = _scatter_track(
-            new_recurrent_state, track_indices, track_mask, new_state_buf
+            new_recurrent_state, track_indices, effective_track_mask, new_state_buf
         )
+    return new_recurrent_state, output
+
+
+def ragged_gated_delta_rule_chunkwise(
+    mixed_qkv: jax.Array,
+    b: jax.Array,
+    a: jax.Array,
+    recurrent_state: jax.Array,
+    A_log: jax.Array,
+    dt_bias: jax.Array,
+    cu_seqlens: jax.Array,
+    state_indices: jax.Array,
+    has_initial_state: jax.Array,
+    *,
+    n_kq: int,
+    n_v: int,
+    d_k: int,
+    d_v: int,
+    track_indices: jax.Array | None = None,
+    track_mask: jax.Array | None = None,
+) -> tuple[jax.Array, jax.Array]:
+    """Ragged gated delta-rule forward through the existing KDA chunk kernel."""
+    num_tokens = mixed_qkv.shape[0]
+    key_dim = n_kq * d_k
+    query = mixed_qkv[:, :key_dim].reshape(num_tokens, n_kq, d_k)
+    key = mixed_qkv[:, key_dim : 2 * key_dim].reshape(num_tokens, n_kq, d_k)
+    value = mixed_qkv[:, 2 * key_dim :].reshape(num_tokens, n_v, d_v)
+
+    repeat_factor = n_v // n_kq
+    if repeat_factor > 1:
+        query = jnp.repeat(query, repeat_factor, axis=1)
+        key = jnp.repeat(key, repeat_factor, axis=1)
+
+    query = _l2norm(query.astype(jnp.float32))
+    key = _l2norm(key.astype(jnp.float32))
+    raw_gate = jnp.broadcast_to(a[None, :, :, None], (1, num_tokens, n_v, d_k))
+    beta = jax.nn.sigmoid(b.astype(jnp.float32))[None, ...]
+    broadcast_dt_bias = jnp.broadcast_to(dt_bias[:, None], (n_v, d_k))
+
+    # Keep the full pool intact while the kernel operates on one state per request.
+    recurrent_state = jax.lax.optimization_barrier(recurrent_state)
+    gathered_state = recurrent_state[state_indices].astype(jnp.float32)
+    initial_state = jnp.where(
+        has_initial_state[:, None, None, None],
+        gathered_state,
+        jnp.zeros_like(gathered_state),
+    )
+
+    output, final_state, *_ = chunk_kda(
+        query[None, ...],
+        key[None, ...],
+        value[None, ...],
+        raw_gate,
+        beta,
+        scale=d_k**-0.5,
+        initial_state=initial_state,
+        output_final_state=True,
+        cu_seqlens=cu_seqlens,
+        use_gate_in_kernel=True,
+        A_log=A_log,
+        dt_bias=broadcast_dt_bias,
+    )
+
+    nonempty = cu_seqlens[1:] > cu_seqlens[:-1]
+    scatter_state = jnp.where(
+        nonempty[:, None, None, None],
+        final_state,
+        gathered_state,
+    )
+    new_recurrent_state = _scatter_idx0_safe(recurrent_state, state_indices, scatter_state)
+    if track_indices is not None:
+        effective_track_mask = track_mask & nonempty & (state_indices != 0)
+        new_recurrent_state = _scatter_track(
+            new_recurrent_state,
+            track_indices,
+            effective_track_mask,
+            scatter_state,
+        )
+
+    output = output[0].astype(mixed_qkv.dtype)
+    new_recurrent_state, output = jax.lax.optimization_barrier((new_recurrent_state, output))
     return new_recurrent_state, output
 
 
