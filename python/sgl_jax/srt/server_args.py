@@ -1430,7 +1430,7 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE"],
+            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "DFLASH"],
             help="Speculative algorithm.",
             default=ServerArgs.speculative_algorithm,
         )
@@ -1756,7 +1756,10 @@ class ServerArgs:
         from sgl_jax.srt.multimodal.common.ServerArgs import MultimodalServerArgs
 
         MultimodalServerArgs.add_cli_args(parser)
-        return cls.from_cli_args(parser.parse_args(argv or sys.argv[1:]))
+        raw_argv = argv or sys.argv[1:]
+        server_args = cls.from_cli_args(parser.parse_args(raw_argv))
+        server_args._explicit_cli_args = set(raw_argv)
+        return server_args
 
     def url(self):
         if is_valid_ipv6_address(self.host):
@@ -1788,21 +1791,68 @@ class ServerArgs:
         # Check LoRA configuration
         self.check_lora_server_args()
 
-        # Speculative overlap is currently implemented for the fused NEXTN
-        # topk=1 path only.
+        # Speculative overlap uses the fused NEXTN path or DFlash's dedicated
+        # relay-backed draft/verify path.
         if self.speculative_algorithm is not None and not self.disable_overlap_schedule:
-            supports_spec_overlap = (
+            supports_nextn_overlap = (
                 self.speculative_algorithm == "NEXTN"
                 and self.speculative_eagle_topk == 1
                 and self.speculative_num_draft_tokens == self.speculative_num_steps + 1
             )
-            if not supports_spec_overlap:
+            supports_dflash_overlap = self.speculative_algorithm == "DFLASH"
+            if not (supports_nextn_overlap or supports_dflash_overlap):
                 raise ValueError(
-                    "Speculative overlap scheduler only supports NEXTN with "
+                    "Speculative overlap scheduler only supports DFLASH or NEXTN with "
                     "--speculative-eagle-topk=1 and "
                     "--speculative-num-draft-tokens == --speculative-num-steps + 1. "
                     "Please pass --disable-overlap-schedule for other speculative configs."
                 )
+
+        # DFLASH: non-causal one-shot diffusion draft + linear-chain greedy verify.
+        if self.speculative_algorithm == "DFLASH":
+            if self.tp_size < 1:
+                raise ValueError("DFLASH requires --tp-size>=1.")
+            if self.speculative_eagle_topk != 1:
+                raise ValueError(
+                    "DFLASH requires --speculative-eagle-topk=1 (linear chain, no tree)."
+                )
+            if self.speculative_num_steps != 1:
+                raise ValueError("DFLASH (minimal) requires --speculative-num-steps=1.")
+            if self.speculative_draft_model_path is None:
+                raise ValueError(
+                    "DFLASH requires --speculative-draft-model-path (the diffusion draft)."
+                )
+            explicit_cli_args = getattr(self, "_explicit_cli_args", set())
+            explicit_draft_tokens = any(
+                str(arg) == "--speculative-num-draft-tokens"
+                or str(arg).startswith("--speculative-num-draft-tokens=")
+                for arg in explicit_cli_args
+            )
+            if (
+                not explicit_draft_tokens
+                and self.speculative_num_draft_tokens == ServerArgs.speculative_num_draft_tokens
+            ):
+                from sgl_jax.srt.speculative.dflash_util import (
+                    parse_dflash_draft_config,
+                )
+
+                draft_config = parse_dflash_draft_config(
+                    self.speculative_draft_model_path,
+                    revision=self.speculative_draft_model_revision,
+                    trust_remote_code=self.trust_remote_code,
+                )
+                if draft_config.block_size != self.speculative_num_draft_tokens:
+                    logger.info(
+                        "DFLASH: using draft config block_size=%d for "
+                        "--speculative-num-draft-tokens (default was %d).",
+                        draft_config.block_size,
+                        self.speculative_num_draft_tokens,
+                    )
+                    self.speculative_num_draft_tokens = draft_config.block_size
+            if self.enable_lora or self.enable_static_lora or self.lora_paths:
+                raise ValueError("DFLASH stage2 does not support LoRA.")
+            if self.grammar_backend not in (None, "none"):
+                raise ValueError("DFLASH stage2 does not support constrained decoding.")
 
     def check_lora_server_args(self):
         """Validate and normalize LoRA-related server arguments."""

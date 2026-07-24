@@ -139,6 +139,12 @@ class BaseSpecWorker:
             and not getattr(model_worker_batch, "return_output_logprob_only", False)
         )
 
+    def _get_cur_allocate_lens(self, model_worker_batch: ModelWorkerBatch):
+        allocate_lens = getattr(model_worker_batch.spec_info_padded, "allocate_lens", None)
+        if allocate_lens is None:
+            return None
+        return np.asarray(allocate_lens)[model_worker_batch.logits_indices_selector]
+
     # -- Main entry point --
 
     def _prepare_overlap_sampling_info(self, model_worker_batch: ModelWorkerBatch):
@@ -161,8 +167,7 @@ class BaseSpecWorker:
 
         self.init_spec_relay_buffers()
         self._prepare_overlap_sampling_info(model_worker_batch)
-        sel = model_worker_batch.logits_indices_selector
-        cur_allocate_lens = np.asarray(model_worker_batch.spec_info_padded.allocate_lens)[sel]
+        cur_allocate_lens = self._get_cur_allocate_lens(model_worker_batch)
 
         from sgl_jax.srt.speculative.draft_extend_fused import spec_decode_overlap
 
@@ -258,10 +263,9 @@ class BaseSpecWorker:
                 extend_logprob_start_len_per_req=None,
             )
 
-        # spec_info.allocate_lens is DP-padded (total_bs,) at dp>1; gather back
-        # to global-flat (real_bs,) so reqs_info[0].spec_info stays flat-ordered.
-        sel = model_worker_batch.logits_indices_selector
-        cur_allocate_lens = np.asarray(model_worker_batch.spec_info_padded.allocate_lens)[sel]
+        # EAGLE carries DP-padded allocation lengths. Other algorithms can own
+        # committed KV lengths directly and return None from the hook.
+        cur_allocate_lens = self._get_cur_allocate_lens(model_worker_batch)
         if self._can_use_fused_spec_decode and model_worker_batch.sampling_info.is_all_greedy:
             # Current fused route covers greedy NEXTN decode; more speculative
             # decode paths can be folded into this entry point over time.

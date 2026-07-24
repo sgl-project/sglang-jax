@@ -88,8 +88,10 @@ from sgl_jax.srt.model_executor.model_runner_kv_cache_mixin import (
 from sgl_jax.srt.multimodal.tokenizer_utils import resolve_tokenizer_subdir
 from sgl_jax.srt.precision_tracer import precision_tracer
 from sgl_jax.srt.server_args import PortArgs, ServerArgs
+from sgl_jax.srt.speculative.dflash_info import DFlashDraftInput
 from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
 from sgl_jax.srt.speculative.overlap_utils import (
+    can_merge_spec_non_overlap_prefill,
     can_use_spec_decode_overlap,
     can_use_spec_prefill_overlap,
     publish_spec_decode_new_seq_lens,
@@ -138,12 +140,33 @@ class GenerationBatchResult:
     bid: int
     cache_miss_count: int
     # relay path: forward stream -> next step forward
-    next_draft_input: EagleDraftInput | None = None
+    next_draft_input: EagleDraftInput | DFlashDraftInput | None = None
     spec_relay_buffers: object | None = None
     prefill_relay_future_indices: object | None = None
 
     num_accepted_tokens: int | None = None
     accept_lens: np.ndarray | None = None
+
+
+def validate_dflash_request(req) -> str | None:
+    """Per-request DFLASH guard (mirrors SGLang PR 22077).
+
+    Returns an error message if the request uses a feature DFLASH stage C does
+    not support yet, otherwise None.
+    """
+    if req.return_logprob or req.return_output_logprob_only:
+        return "DFLASH speculative decoding does not support return_logprob yet."
+    sp = req.sampling_params
+    if (
+        getattr(sp, "json_schema", None) is not None
+        or getattr(sp, "regex", None) is not None
+        or getattr(sp, "ebnf", None) is not None
+        or getattr(sp, "structural_tag", None) is not None
+    ):
+        return "DFLASH speculative decoding does not support grammar-constrained decoding yet."
+    if sp.top_k != 1:
+        return "DFLASH speculative decoding currently only supports greedy sampling."
+    return None
 
 
 class Scheduler(
@@ -372,6 +395,15 @@ class Scheduler(
             )
             if self.enable_overlap and hasattr(self.draft_worker, "init_spec_relay_buffers"):
                 self.draft_worker.init_spec_relay_buffers()
+        elif self.spec_algorithm is not None and self.spec_algorithm.is_dflash():
+            from sgl_jax.srt.speculative.dflash_worker import (
+                DFlashWorker as _SpecWorkerCls,
+            )
+
+            self.draft_worker = _SpecWorkerCls(
+                server_args=server_args,
+                target_worker=self.tp_worker,
+            )
 
         # Get token and memory info from the model worker
         (
@@ -1300,6 +1332,13 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
+        if self.spec_algorithm is not None and self.spec_algorithm.is_dflash():
+            dflash_err = validate_dflash_request(req)
+            if dflash_err is not None:
+                req.set_finish_with_abort(dflash_err)
+                self._add_request_to_queue(req)
+                return
+
         if recv_req.logprob_start_len == -1 or not recv_req.return_logprob:
             # By default, only return the logprobs for output tokens
             req.logprob_start_len = len(req.origin_input_ids) - 1
@@ -1809,7 +1848,7 @@ class Scheduler(
                 elif (
                     not self._is_spec_decode_enabled()
                     or self.enable_overlap
-                    or use_legacy_eagle3_non_overlap(self.enable_overlap, self.spec_algorithm)
+                    or can_merge_spec_non_overlap_prefill(self.enable_overlap, self.spec_algorithm)
                 ):
                     # Spec overlap keeps prefill and decode as separate forwards, but
                     # once prefill has produced req-granular relay state it can join
@@ -1886,7 +1925,7 @@ class Scheduler(
         if (
             self._is_spec_decode_enabled()
             and not self.enable_overlap
-            and not use_legacy_eagle3_non_overlap(self.enable_overlap, self.spec_algorithm)
+            and not can_merge_spec_non_overlap_prefill(self.enable_overlap, self.spec_algorithm)
             and not self.running_batch.is_empty()
         ):
             return None
@@ -2333,7 +2372,7 @@ class Scheduler(
                 batch_output.next_token_ids
                 if (
                     self.spec_algorithm is not None
-                    and self.spec_algorithm.is_eagle()
+                    and (self.spec_algorithm.is_eagle() or self.spec_algorithm.is_dflash())
                     and (batch.forward_mode.is_decode() or defer_spec_prefill_output)
                     and self.enable_overlap
                 )
@@ -2348,10 +2387,10 @@ class Scheduler(
         )
         if (
             self.spec_algorithm is not None
-            and self.spec_algorithm.is_eagle()
+            and (self.spec_algorithm.is_eagle() or self.spec_algorithm.is_dflash())
             and batch_output.next_draft_input is not None
         ):
-            assert isinstance(batch_output.next_draft_input, EagleDraftInput)
+            assert isinstance(batch_output.next_draft_input, (EagleDraftInput, DFlashDraftInput))
             ret.next_draft_input = batch_output.next_draft_input
             ret.accept_lens = batch_output.accept_lens
         return ret

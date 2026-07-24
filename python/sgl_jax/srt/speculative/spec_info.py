@@ -61,6 +61,7 @@ class SpeculativeAlgorithm(IntEnum):
     EAGLE3 = auto()
     NEXTN = auto()
     STANDALONE = auto()
+    DFLASH = auto()
 
     def is_none(self):
         return self == SpeculativeAlgorithm.NONE
@@ -81,6 +82,9 @@ class SpeculativeAlgorithm(IntEnum):
     def is_standalone(self):
         return self == SpeculativeAlgorithm.STANDALONE
 
+    def is_dflash(self):
+        return self == SpeculativeAlgorithm.DFLASH
+
     @staticmethod
     def from_string(name: str):
         name_map = {
@@ -88,6 +92,7 @@ class SpeculativeAlgorithm(IntEnum):
             "EAGLE3": SpeculativeAlgorithm.EAGLE3,
             "NEXTN": SpeculativeAlgorithm.NEXTN,
             "STANDALONE": SpeculativeAlgorithm.STANDALONE,
+            "DFLASH": SpeculativeAlgorithm.DFLASH,
             None: SpeculativeAlgorithm.NONE,
         }
         if name is not None:
