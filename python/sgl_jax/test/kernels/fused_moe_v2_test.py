@@ -183,23 +183,29 @@ class MoEV2KernelTest(jtu.JaxTestCase):
 
         block_config = FusedMoEBlockConfig(bt=bt, bf=bf, btc=btc, bse=bse)
 
+        # Shard kernel inputs while keeping replicated originals for ref_moe.
+        ep = jax.sharding.NamedSharding(self.mesh, P(("data", "tensor")))
+
+        def shard(x):
+            return None if x is None else jax.device_put(x, ep)
+
         actual = fused_ep_moe_v2(
             self.mesh,
-            a,
-            w1,
-            w2,
-            w3,
-            topk_weights,
-            topk_ids,
+            shard(a),
+            shard(w1),
+            shard(w2),
+            shard(w3),
+            shard(topk_weights),
+            shard(topk_ids),
             top_k,
             act_fn=act_fn,
             swiglu_limit=swiglu_limit,
             shared_swiglu_limit=shared_swiglu_limit,
             block_config=block_config,
             quant_block_k=quant_block_k,
-            w1_scale=w1_scale,
-            w2_scale=w2_scale,
-            w3_scale=w3_scale,
+            w1_scale=shard(w1_scale),
+            w2_scale=shard(w2_scale),
+            w3_scale=shard(w3_scale),
             w1_shared=w1_sh,
             w2_shared=w2_sh,
             w3_shared=w3_sh,
@@ -246,6 +252,7 @@ class MoEV2KernelTest(jtu.JaxTestCase):
             x = lax.all_gather(x, axis_name="data", axis=0, tiled=True)
             return x
 
+        expected = jax.reshard(expected, ep)
         actual_host = np.asarray(jax.device_get(_replicate(actual)))
         expected_host = np.asarray(jax.device_get(_replicate(expected)))
         self.assertAllClose(actual_host, expected_host, atol=atol, rtol=rtol)

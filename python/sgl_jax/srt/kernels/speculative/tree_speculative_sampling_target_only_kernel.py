@@ -465,11 +465,11 @@ def tree_speculative_sampling_target_only_pallas_call(
 
     in_specs = [
         # target_probs
-        pl.BlockSpec(memory_space=pltpu.ANY),
+        pl.BlockSpec(memory_space=pl.ANY),
         # draft_probs
-        pl.BlockSpec(memory_space=pltpu.ANY),
+        pl.BlockSpec(memory_space=pl.ANY),
         # zero probs
-        pl.BlockSpec(memory_space=pltpu.ANY),
+        pl.BlockSpec(memory_space=pl.ANY),
     ]
 
     out_specs = [

@@ -317,7 +317,7 @@ class LoRAMemoryPool:
             sorted(self.target_modules),
         )
 
-        with self.mesh:
+        with jax.set_mesh(self.mesh):
             for module_name in self.target_modules:
                 a_shape = self._get_lora_a_shape(module_name)
                 b_shape = self._get_lora_b_shape(module_name)

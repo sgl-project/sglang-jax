@@ -419,10 +419,9 @@ class TestMLAAttention(CustomTestCase):
         new_kv_c_3d = new_kv_c.reshape(new_kv_c.shape[0], 1, new_kv_c.shape[1])
         new_k_pe_3d = new_k_pe.reshape(new_k_pe.shape[0], 1, new_k_pe.shape[1])
 
-        # Match the backend's shard_map in_specs: Q tensors are head-sharded on
-        # "tensor", latent K/V are replicated (single shared KV head).
-        heads_sharded = NamedSharding(mesh, P(None, "tensor", None))
-        replicated = NamedSharding(mesh, P(None, None, None))
+        # Mirror the Q and latent K/V layouts produced for the MLA backend.
+        heads_sharded = NamedSharding(mesh, P("data", "tensor", None))
+        replicated = NamedSharding(mesh, P("data", None, None))
         ql_nope_s = jax.device_put(ql_nope, heads_sharded)
         q_pe_s = jax.device_put(q_pe, heads_sharded)
         new_kv_c_3d_s = jax.device_put(new_kv_c_3d, replicated)

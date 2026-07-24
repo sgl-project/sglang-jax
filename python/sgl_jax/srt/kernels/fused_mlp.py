@@ -10,9 +10,9 @@ import functools
 
 import jax
 import jax.numpy as jnp
+from jax import shard_map
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
-from jax.experimental.shard_map import shard_map
 from jax.sharding import PartitionSpec as P
 
 

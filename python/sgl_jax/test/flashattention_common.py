@@ -174,9 +174,11 @@ def create_test_data(
     input_ids=None,
     model_config=None,
     max_total_token_size=200000,
+    test_mesh=None,
 ):
     """Create a real ForwardBatch for testing."""
     assert mode in ["prefill", "decode"]
+    test_mesh = test_mesh or mesh
     dtype = jnp.bfloat16 if model_config["bf16"] else jnp.float32
     batch_size = len(lens)
     # Create sequence lengths array
@@ -203,7 +205,7 @@ def create_test_data(
         head_num=model_config["num_kv_heads"],
         head_dim=model_config["head_dim"],
         layer_num=model_config["num_hidden_layers"],
-        mesh=mesh,
+        mesh=test_mesh,
     )
     # create q, k v
     q, k, v = create_qkv_cache(lens, num_heads, head_dim, num_kv_heads, page_size, dtype=dtype)
@@ -273,7 +275,7 @@ def create_test_data(
         num_kv_heads,
         head_dim,
         page_size=page_size,
-        mesh=mesh,
+        mesh=test_mesh,
     )
 
     if not causal:
@@ -349,7 +351,7 @@ def create_test_data(
 
         fb.attn_backend.forward_metadata.custom_mask = device_array(
             (fb.spec_info.custom_mask),
-            sharding=(NamedSharding(attention_backend.mesh, P())),
+            sharding=(NamedSharding(attention_backend.mesh, P("data"))),
         )
     return fb, current_kv_cache, q, k, v
 
@@ -375,7 +377,9 @@ class AttentionTestBase(CustomTestCase):
         logit_cap=None,
         xai_temperature_len=None,
         attention_sink=None,
+        test_mesh=None,
     ):
+        test_mesh = test_mesh or mesh
         # Create mock forward_batch
         if len(mode_args) == 5:
             num_heads, head_dim, num_kv_heads, page_size, dtype = mode_args
@@ -400,6 +404,7 @@ class AttentionTestBase(CustomTestCase):
                 "xai_temperature_len": xai_temperature_len,
             },
             max_total_token_size=max_total_token_size,
+            test_mesh=test_mesh,
         )
 
         # Debug cache mapping
@@ -416,7 +421,7 @@ class AttentionTestBase(CustomTestCase):
         extend_k, extend_v = write_prefix_tokens_for_kv(forward_batch, token_to_kv_pool, lens, k, v)
 
         # Shard q/extend_k/extend_v with P("data", "tensor") to match production in_specs
-        dp_sharding = NamedSharding(mesh, P("data", "tensor"))
+        dp_sharding = NamedSharding(test_mesh, P("data", "tensor"))
         q_shard = jax.device_put(q, dp_sharding)
         extend_k = jax.device_put(extend_k, dp_sharding)
         extend_v = jax.device_put(extend_v, dp_sharding)
@@ -453,13 +458,18 @@ class AttentionTestBase(CustomTestCase):
             cache_loc_list.append(padded_page_indices)
         page_table = jnp.stack(cache_loc_list)
 
+        # Keep the serial reference independent of production metadata sharding.
+        ref_cu_q_lens = jnp.asarray(
+            jax.device_get(forward_batch.attn_backend.forward_metadata.cu_q_lens)
+        )
+
         expected = ref_ragged_paged_attention(
             q.reshape(q.shape[0], num_heads, head_dim),
             k.reshape(k.shape[0] // page_size, page_size, num_kv_heads, head_dim),
             v.reshape(v.shape[0] // page_size, page_size, num_kv_heads, head_dim),
             forward_batch.seq_lens,
             page_table,
-            forward_batch.attn_backend.forward_metadata.cu_q_lens,
+            ref_cu_q_lens,
             jnp.array([forward_batch.batch_size], dtype=jnp.int32),
             custom_mask=(
                 forward_batch.spec_info.custom_mask if forward_batch.spec_info is not None else None
@@ -476,9 +486,23 @@ class AttentionTestBase(CustomTestCase):
         if xai_temperature_len is not None and xai_temperature_len > 0:
             attn.xai_temperature_len = xai_temperature_len
 
+        # Keep the reference replicated and place the backend input like the model parameter.
+        attention_sink_backend = (
+            None
+            if attention_sink is None
+            else jax.device_put(attention_sink, NamedSharding(test_mesh, P("tensor")))
+        )
+
         @jax.jit
         def jit_attn(q, k, v, forward_batch, token_to_kv_pool: KVCache):
-            out = attn(q, k, v, forward_batch, token_to_kv_pool, attention_sink=attention_sink)
+            out = attn(
+                q,
+                k,
+                v,
+                forward_batch,
+                token_to_kv_pool,
+                attention_sink=attention_sink_backend,
+            )
             return out
 
         # run
@@ -540,3 +564,19 @@ class AttentionTestBase(CustomTestCase):
             are_close,
             f"JAX output and expected output are not close, max diff: {max_diff}",
         )
+
+    def run_test_on_single_device(self, *args, **kwargs):
+        """Run logical-head cases that require a TP=1 mesh."""
+        one_device_mesh = create_device_mesh(
+            ici_parallelism=[1, 1],
+            dcn_parallelism=[1, 1],
+            devices=[jax.devices()[0]],
+        )
+        with jax.sharding.set_mesh(one_device_mesh):
+            attention_sink = kwargs.get("attention_sink")
+            if attention_sink is not None:
+                kwargs["attention_sink"] = jax.device_put(
+                    np.asarray(jax.device_get(attention_sink)),
+                    NamedSharding(one_device_mesh, P()),
+                )
+            return self.run_test(*args, test_mesh=one_device_mesh, **kwargs)

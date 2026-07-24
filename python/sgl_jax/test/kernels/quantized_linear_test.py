@@ -7,7 +7,8 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import nnx
-from jax.sharding import AxisType, Mesh
+from jax.sharding import AxisType, Mesh, NamedSharding
+from jax.sharding import PartitionSpec as P
 
 import sgl_jax.srt.kernels.quantized_matmul.blockwise_utils as blockwise_utils
 from sgl_jax.srt.configs.quantization_config import QuantizationConfig
@@ -30,6 +31,11 @@ def _create_single_device_mesh():
         axis_names=("data", "tensor"),
         axis_types=(AxisType.Explicit, AxisType.Explicit),
     )
+
+
+def _shard_activation(mesh, x):
+    """Place an activation on the layout produced by the preceding layer."""
+    return jax.device_put(x, NamedSharding(mesh, P("data", None)))
 
 
 def _make_linear_test_inputs():
@@ -115,7 +121,7 @@ def test_quantized_linear_offline_scale_formats(scale_format):
     )
 
     ref_out = jnp.dot(x, w_fp.T)
-    out, bias = quant_linear(x)
+    out, bias = quant_linear(_shard_activation(mesh, x))
     assert bias is None
 
     _assert_close(f"Offline QuantizedLinear ({scale_format})", out, ref_out)
@@ -279,7 +285,7 @@ def test_linear_return_contract_with_bias():
             activation_dtype=None,
             is_static_input=False,
         )
-        q_out, q_bias = quant_linear(x)
+        q_out, q_bias = quant_linear(_shard_activation(mesh, x))
 
     assert q_out.shape == (2, 32)
     assert q_bias is None
@@ -312,7 +318,7 @@ def test_linear_skip_bias_add_returns_param_bias():
             activation_dtype=None,
             is_static_input=False,
         )
-        q_out, q_bias = quant_linear(x)
+        q_out, q_bias = quant_linear(_shard_activation(mesh, x))
 
     assert q_out.shape == (2, 32)
     assert isinstance(q_bias, nnx.Param)
