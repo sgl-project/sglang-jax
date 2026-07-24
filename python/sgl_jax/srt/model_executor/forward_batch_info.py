@@ -145,28 +145,44 @@ class CaptureHiddenMode(IntEnum):
 
 
 def _device_put_embed_plan(plan, mesh):
-    """Place every array leaf in the embed plan on data-leading sharding."""
+    """Place multimodal lane arrays on their physical encoder lanes.
 
-    def _data_leading_spec(arr):
-        ndim = np.asarray(arr).ndim
-        if ndim == 0:
-            return PartitionSpec()
-        return PartitionSpec("data", *([None] * (ndim - 1)))
+    DP-Encoder has one logical lane per tensor device, while TP-Encoder has one
+    tensor-replicated logical lane per DP rank. Infer the two cases from the
+    second dimension so both encode inputs and token routing get matching
+    placement.
+    """
 
-    def _put(arr):
+    def _lane_spec(arr):
+        shape = np.asarray(arr).shape
+        ndim = len(shape)
+        if ndim < 2:
+            raise ValueError(
+                "Multimodal lane arrays must have leading [dp,tp] axes, " f"got shape={shape}."
+            )
+        mesh_tp = int(mesh.shape.get("tensor", 1))
+        logical_tp = int(shape[1])
+        if logical_tp not in (1, mesh_tp):
+            raise ValueError(
+                "Multimodal logical TP lanes must be one (TP-Encoder) or match "
+                f"the tensor mesh size (DP-Encoder), got lanes={logical_tp}, mesh_tp={mesh_tp}."
+            )
+        lane_axis = "tensor" if logical_tp == mesh_tp else None
+        return PartitionSpec("data", lane_axis, *([None] * (ndim - 2)))
+
+    def _put(arr, spec):
         if arr is None:
             return None
-        (placed,) = device_array((arr,), sharding=NamedSharding(mesh, _data_leading_spec(arr)))
+        (placed,) = device_array((arr,), sharding=NamedSharding(mesh, spec))
         return placed
 
-    for rounds in plan.rounds_by_modality.values():
-        for rnd in rounds:
-            enc = rnd.encode_inputs
-            enc.pixels = _put(enc.pixels)
-            enc.valid = _put(enc.valid)
-            enc.meta = jax.tree.map(_put, enc.meta)
-            rnd.src_idx = _put(rnd.src_idx)
-            rnd.mask = _put(rnd.mask)
+    for batch in plan.values():
+        batch.encode_inputs = jax.tree.map(
+            lambda value: _put(value, _lane_spec(value)),
+            batch.encode_inputs,
+        )
+        batch.merge.src_idx = _put(batch.merge.src_idx, _lane_spec(batch.merge.src_idx))
+        batch.merge.mask = _put(batch.merge.mask, _lane_spec(batch.merge.mask))
     return plan
 
 
@@ -219,7 +235,7 @@ class ForwardBatch:
     # Encoder-Decoder specific fields
     attention_mask: jax.Array | None = None
     deterministic: bool = True
-    # Multimodal cached vision embeddings (prefill only)
+    # Fused multimodal token embeddings (prefill only)
     input_embedding: jax.Array | None = None
     # MRoPE positions [3, total_tokens] for Qwen2.5-VL
     mrope_positions: jax.Array | None = None
@@ -409,7 +425,7 @@ class ForwardBatch:
         if batch.mrope_positions is not None:
             (mrope_positions,) = device_array(
                 (batch.mrope_positions,),
-                sharding=(NamedSharding(model_runner.mesh, PartitionSpec(None, None))),
+                sharding=(NamedSharding(model_runner.mesh, PartitionSpec(None, "data"))),
             )
         input_embedding = None
         if batch.input_embedding is not None:
@@ -479,11 +495,8 @@ class ForwardBatch:
                 sharding=(NamedSharding(model_runner.mesh, PartitionSpec("data"))),
             )
 
-        # In-model VLM embed plan: device_put each EmbedRound's array leaves onto
-        # the encode input sharding (pixels/valid + VisionMetadata leaves) and
-        # merge shard_map input sharding (src_idx/mask). Zero computation -- just
-        # placement. aux is precomputed host-side by the scheduler and carried in
-        # the plan.
+        # In-model VLM embed plan: place every [dp,tp]-leading encoder and merge
+        # leaf on its owning device lane. Metadata is precomputed host-side.
         mm_embed_plan = None
         if getattr(batch, "mm_embed_plan", None) is not None:
             mm_embed_plan = _device_put_embed_plan(batch.mm_embed_plan, model_runner.mesh)

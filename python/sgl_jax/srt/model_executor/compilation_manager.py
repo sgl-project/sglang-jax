@@ -12,6 +12,8 @@ from tqdm import tqdm
 from sgl_jax.srt.utils.common_utils import (
     PRECOMPILE_DEFAULT_BS_PADDINGS,
     PRECOMPILE_DEFAULT_TOKEN_PADDINGS,
+    resolve_vision_merge_buckets,
+    resolve_vision_patch_buckets,
 )
 
 if TYPE_CHECKING:
@@ -34,7 +36,8 @@ class CompilationManager:
         page_size: int,
         max_req_len: int,
         vocab_size: int,
-        multimodal: bool = False,
+        precompile_in_model_vision: bool = False,
+        capture_hidden_states: bool = False,
         has_recurrent_state: bool = False,
         moe_backend: str | None = None,
     ):
@@ -45,7 +48,8 @@ class CompilationManager:
         self.max_padded_batch_size = max_padded_batch_size
         self.max_padded_num_tokens = max_padded_num_tokens
         self.vocab_size = vocab_size
-        self.multimodal = multimodal
+        self.precompile_in_model_vision = precompile_in_model_vision
+        self.capture_hidden_states = capture_hidden_states
         self.has_recurrent_state = has_recurrent_state
         # Callers pass the *effective* backend (ModelConfig.moe_backend), which
         # resolves architectures that hard-code FusedEPMoE (e.g. Qwen3.5) to
@@ -57,6 +61,12 @@ class CompilationManager:
         self.token_buckets = self._compute_token_buckets(server_args.precompile_token_paddings)
         self.bs_buckets = self._compute_bs_buckets(server_args.precompile_bs_paddings)
         self.cache_loc_buckets = self._compute_cache_loc_buckets()
+        self.vision_patch_buckets = self._compute_vision_patch_buckets(
+            getattr(server_args, "precompile_vision_patch_paddings", None)
+        )
+        self.vision_merge_buckets = self._compute_vision_merge_buckets(
+            getattr(server_args, "precompile_vision_merge_paddings", None)
+        )
 
         self._compiled_variants: set[tuple] = set()
 
@@ -101,6 +111,12 @@ class CompilationManager:
         pages_per_req = (self.max_req_len + self.page_size - 1) // self.page_size * self.page_size
         return [bs * pages_per_req for bs in self.bs_buckets]
 
+    def _compute_vision_patch_buckets(self, user_paddings: list[int] | None) -> list[int]:
+        return resolve_vision_patch_buckets(user_paddings)
+
+    def _compute_vision_merge_buckets(self, user_paddings: list[int] | None) -> list[int]:
+        return resolve_vision_merge_buckets(user_paddings)
+
     # ---- Pre-compilation ----
 
     def precompile_all(
@@ -114,8 +130,113 @@ class CompilationManager:
         self._precompile_extend(
             forward_fn, model_runner, mesh, prepare_lora_fn, future_token_ids_map
         )
+        if self.precompile_in_model_vision:
+            self._precompile_vision(model_runner, mesh)
         self._precompile_decode(
             forward_fn, model_runner, mesh, prepare_lora_fn, future_token_ids_map
+        )
+
+    def _precompile_vision(self, model_runner: ModelRunner, mesh):
+        """Warm ViT encode and token-shaped merge executables across buckets.
+
+        Runs the exact runtime embed path (``general_mm_embed_routine`` ->
+        ``embed_mm_inputs`` -> encode + merge) with a zero-filled, all-masked
+        dummy plan (no token rows are touched).
+
+        Encoder output is canonicalized to a fixed source capacity and routing
+        is padded to the token bucket. Consequently encode depends only on the
+        patch bucket and merge only on the token bucket; sweeping both axes costs
+        ``P + T - 1`` warmup calls and covers the full configured shape space.
+        """
+        from types import SimpleNamespace
+
+        import jax
+        from jax.sharding import NamedSharding, PartitionSpec
+
+        from sgl_jax.srt.managers.mm_utils import general_mm_embed_routine
+        from sgl_jax.srt.model_executor.forward_batch_info import _device_put_embed_plan
+        from sgl_jax.srt.multimodal.common.in_model_plan_builder import (
+            resolve_in_model_plan_builder,
+        )
+
+        builder = resolve_in_model_plan_builder(
+            model_runner.model_config,
+            patch_buckets=self.vision_patch_buckets,
+            merge_buckets=self.vision_merge_buckets,
+        )
+        if builder is None or not hasattr(builder, "dummy_plan"):
+            logger.info("[VISION] No in-model plan builder; skipping vision precompile.")
+            return
+        if not self.vision_patch_buckets or not self.vision_merge_buckets:
+            logger.info("[VISION] No vision buckets configured; skipping vision precompile.")
+            return
+
+        multimodal_model = model_runner.model
+        language_backbone = multimodal_model.model
+        # Match the runtime encode lane count: DP-Encoder fans over the tensor
+        # devices, TP-Encoder uses a single collaborative lane per DP rank.
+        from sgl_jax.srt.multimodal.layers.vision_sharding import encode_lane_count
+
+        encode_lanes = encode_lane_count(mesh, getattr(multimodal_model, "encoder_tp", False))
+
+        min_patch = self.vision_patch_buckets[0]
+        # Token buckets the runtime merge will actually see (dp-aligned).
+        token_buckets = self.token_buckets or [max(self.dp_size, 1)]
+        min_token = token_buckets[0]
+
+        def warm(patch_bucket, num_tokens) -> bool:
+            input_ids = jax.device_put(
+                np.zeros((num_tokens,), dtype=np.int32),
+                NamedSharding(mesh, PartitionSpec("data")),
+            )
+            plan = builder.dummy_plan(
+                self.dp_size,
+                encode_lanes,
+                patch_bucket,
+                num_tokens // self.dp_size,
+            )
+            _device_put_embed_plan(plan, mesh)
+            forward_batch = SimpleNamespace(input_embedding=None)
+            try:
+                general_mm_embed_routine(
+                    input_ids=input_ids,
+                    forward_batch=forward_batch,
+                    language_model=language_backbone,
+                    multimodal_model=multimodal_model,
+                    mm_embed_plan=plan,
+                )
+                jax.block_until_ready(forward_batch.input_embedding)
+                return True
+            except Exception as exc:  # pragma: no cover - best-effort warmup
+                logger.warning(
+                    "[VISION] Skipping warmup (patch=%s, tokens=%s): %s",
+                    patch_bucket,
+                    num_tokens,
+                    exc,
+                )
+                return False
+
+        # Sweep the two independent JIT axes once.
+        combos: list[tuple[int, int]] = []
+        combos += [(p, min_token) for p in self.vision_patch_buckets]
+        combos += [(min_patch, t) for t in token_buckets]
+        # De-duplicate while preserving order.
+        combos = list(dict.fromkeys(combos))
+
+        start_time = time.perf_counter()
+        logger.info("[VISION] Begin to precompile %d model-shape combos", len(combos))
+        warmed = 0
+        with tqdm(combos, desc="[VISION] PRECOMPILE", leave=False) as pbar:
+            for patch_bucket, num_tokens in pbar:
+                pbar.set_postfix(patch=patch_bucket, tokens=num_tokens)
+                if warm(patch_bucket, num_tokens):
+                    self._compiled_variants.add(("VISION", patch_bucket, num_tokens))
+                    warmed += 1
+        logger.info(
+            "[VISION] Precompile finished: warmed %d/%d combos in %.0f secs",
+            warmed,
+            len(combos),
+            time.perf_counter() - start_time,
         )
 
     def _precompile_extend(
@@ -322,7 +443,7 @@ class CompilationManager:
             logits_indices=logits_indices,
             input_logprob_indices=None,
             capture_hidden_mode=(
-                CaptureHiddenMode.FULL if self.multimodal else CaptureHiddenMode.NULL
+                CaptureHiddenMode.FULL if self.capture_hidden_states else CaptureHiddenMode.NULL
             ),
             spec_algorithm=spec_algorithm_value,
             lora_ids=lora_ids,

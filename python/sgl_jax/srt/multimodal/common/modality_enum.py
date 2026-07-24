@@ -76,9 +76,9 @@ def tensor_hash(tensor_list: Any) -> int:
 def pad_input_tokens(
     input_ids: list[int],
     mm_items: list["MultimodalDataItem"],
-    im_token_id: int = None,
-    video_token_id: int = None,
-    audio_token_id: int = None,
+    im_token_id: int | None = None,
+    video_token_id: int | None = None,
+    audio_token_id: int | None = None,
 ) -> list[int]:
     """
     Replace multimodal placeholder tokens in input_ids with corresponding pad_values from mm_items.
@@ -96,55 +96,13 @@ def pad_input_tokens(
     """
     if not input_ids or not mm_items:
         return input_ids
-
-    # Build mapping from token_id to list of pad_values for each modality
-    # We need to handle multiple items of the same modality
-    image_pad_values = []
-    video_pad_values = []
-    audio_pad_values = []
-
+    padded_ids = list(input_ids)
     for item in mm_items:
         if item.pad_value is None:
             item.set_pad_value()
-
-        if item.is_image() and im_token_id is not None:
-            image_pad_values.append(item.pad_value)
-        elif item.is_video() and video_token_id is not None:
-            video_pad_values.append(item.pad_value)
-        elif item.is_audio() and audio_token_id is not None:
-            audio_pad_values.append(item.pad_value)
-
-    # Create a mutable copy of input_ids
-    padded_ids = list(input_ids)
-
-    # Replace image tokens
-    if im_token_id is not None and image_pad_values:
-        image_idx = 0
-        for i, token_id in enumerate(padded_ids):
-            if token_id == im_token_id:
-                # Use the pad_value for current image, cycling through if needed
-                pad_value = image_pad_values[min(image_idx, len(image_pad_values) - 1)]
-                padded_ids[i] = pad_value
-                # Don't increment image_idx for each token, only when we hit a boundary
-                # Actually, for simple replacement, use same pad_value for all tokens of an image
-
-    # Replace video tokens
-    if video_token_id is not None and video_pad_values:
-        video_idx = 0
-        for i, token_id in enumerate(padded_ids):
-            if token_id == video_token_id:
-                # Use the pad_value for current video
-                pad_value = video_pad_values[min(video_idx, len(video_pad_values) - 1)]
-                padded_ids[i] = pad_value
-
-    # Replace audio tokens
-    if audio_token_id is not None and audio_pad_values:
-        audio_idx = 0
-        for i, token_id in enumerate(padded_ids):
-            if token_id == audio_token_id:
-                pad_value = audio_pad_values[min(audio_idx, len(audio_pad_values) - 1)]
-                padded_ids[i] = pad_value
-
+        if item.placeholder_ranges is not None:
+            for start, end in item.placeholder_ranges:
+                padded_ids[start:end] = [item.pad_value] * (end - start)  # type: ignore[list-item]
     return padded_ids
 
 
@@ -179,7 +137,8 @@ class MultimodalDataItem:
     modality: Modality
     hash: int | None = None
     pad_value: int | None = None
-    offsets: list | None = None
+    # Half-open token-index ranges [start, end) of multimodal placeholders in input_ids (per request).
+    placeholder_ranges: list[tuple[int, int]] | None = None
 
     # Raw features returned by processor, e.g. pixel_values or audio_features
     feature: jax.Array | np.ndarray | None = None
@@ -288,9 +247,9 @@ class MultimodalDataItem:
                     [jax.device_put(self.feature), jax.device_put(other.feature)], axis=0
                 )
 
-        # Merge offsets
-        if self.offsets is not None and other.offsets is not None:
-            self.offsets += other.offsets
+        # Merge placeholder ranges
+        if self.placeholder_ranges is not None and other.placeholder_ranges is not None:
+            self.placeholder_ranges += other.placeholder_ranges
 
         # Update hash
         self.hash = hash((self.hash, other.hash))

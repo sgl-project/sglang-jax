@@ -29,23 +29,32 @@ logger = logging.getLogger(__name__)
 
 GRAMMAR_BACKEND_CHOICES = ["llguidance", "none"]
 _REJECTED_PD_HOST_ALIASES = frozenset({"localhost"})
+_MULTIMODAL_CHUNKED_PREFILL_ARCHITECTURES = frozenset({"Qwen2_5_VLForConditionalGeneration"})
+_MULTIMODAL_MIXED_CHUNK_ARCHITECTURES = frozenset({"Qwen2_5_VLForConditionalGeneration"})
+_MULTIMODAL_RADIX_CACHE_ARCHITECTURES = frozenset({"Qwen2_5_VLForConditionalGeneration"})
 
 
 def apply_multimodal_model_defaults(server_args, model_config) -> None:
     if not model_config.is_multimodal:
         return
 
-    if not server_args.disable_radix_cache:
+    hf_config = getattr(model_config, "hf_config", None)
+    architectures = set(getattr(hf_config, "architectures", None) or [])
+
+    supports_radix_cache = bool(architectures & _MULTIMODAL_RADIX_CACHE_ARCHITECTURES)
+    if not supports_radix_cache and not server_args.disable_radix_cache:
         logger.info("Multimodal model detected, disabling radix cache")
         server_args.disable_radix_cache = True
-    if not server_args.disable_overlap_schedule:
-        logger.info("Multimodal model detected, disabling overlap schedule")
-        server_args.disable_overlap_schedule = True
-    if server_args.chunked_prefill_size is None or server_args.chunked_prefill_size > 0:
+
+    supports_chunked_prefill = bool(architectures & _MULTIMODAL_CHUNKED_PREFILL_ARCHITECTURES)
+    if not supports_chunked_prefill and (
+        server_args.chunked_prefill_size is None or server_args.chunked_prefill_size > 0
+    ):
         logger.info("Multimodal model detected, disabling chunked prefill")
         server_args.chunked_prefill_size = -1
-    if server_args.enable_mixed_chunk:
-        logger.info("Multimodal model detected, disabling mixed chunk")
+    supports_mixed_chunk = bool(architectures & _MULTIMODAL_MIXED_CHUNK_ARCHITECTURES)
+    if server_args.enable_mixed_chunk and not supports_mixed_chunk:
+        logger.info("Multimodal model does not support mixed chunk; disabling it")
         server_args.enable_mixed_chunk = False
     if server_args.limit_mm_data_per_request is None:
         server_args.limit_mm_data_per_request = {"image": 16}
@@ -54,8 +63,7 @@ def apply_multimodal_model_defaults(server_args, model_config) -> None:
 def _validate_disaggregation_host_ip(host_ip: str) -> str:
     if host_ip in _REJECTED_PD_HOST_ALIASES:
         raise ValueError(
-            "--disaggregation-host-ip must be a routable address; "
-            f"got loopback alias {host_ip!r}"
+            f"--disaggregation-host-ip must be a routable address; got loopback alias {host_ip!r}"
         )
     try:
         addr = ipaddress.ip_address(host_ip)
@@ -64,8 +72,7 @@ def _validate_disaggregation_host_ip(host_ip: str) -> str:
     if addr.is_loopback or addr.is_unspecified:
         kind = "loopback" if addr.is_loopback else "bind/unspecified"
         raise ValueError(
-            "--disaggregation-host-ip must be a routable address; "
-            f"got {kind} address {host_ip!r}"
+            f"--disaggregation-host-ip must be a routable address; got {kind} address {host_ip!r}"
         )
     return host_ip
 
@@ -208,6 +215,12 @@ class ServerArgs:
 
     precompile_token_paddings: list[int] | None = None
     precompile_bs_paddings: list[int] | None = None
+    precompile_vision_patch_paddings: list[int] | None = None
+    precompile_vision_merge_paddings: list[int] | None = None
+
+    # Vision encoder parallelism: "dp" replicates the ViT and data-parallelizes
+    # its batch across all devices; "tp" shards ViT weights over the tensor axis.
+    vision_encoder_parallel: str = "dp"
 
     disable_precompile: bool = False
 
@@ -1360,6 +1373,29 @@ class ServerArgs:
             help="Set the list of batch sizes buckets for jax jit",
         )
         parser.add_argument(
+            "--precompile-vision-patch-paddings",
+            type=int,
+            nargs="+",
+            default=ServerArgs.precompile_vision_patch_paddings,
+            help="Padding buckets for the vision encoder patch dimension (VLM precompile).",
+        )
+        parser.add_argument(
+            "--precompile-vision-merge-paddings",
+            type=int,
+            nargs="+",
+            default=ServerArgs.precompile_vision_merge_paddings,
+            help="Padding capacities for VLM encoder-output merge staging.",
+        )
+        parser.add_argument(
+            "--vision-encoder-parallel",
+            type=str,
+            choices=["dp", "tp"],
+            default=ServerArgs.vision_encoder_parallel,
+            help="Vision encoder parallelism. 'dp' (default) replicates the ViT and "
+            "data-parallelizes its batch across all devices; 'tp' shards ViT weights "
+            "over the tensor axis (only takes effect when tp_size > 1).",
+        )
+        parser.add_argument(
             "--disable-precompile",
             action="store_true",
             help="whether disable precompile",
@@ -1639,7 +1675,7 @@ class ServerArgs:
             "--disaggregation-bootstrap-timeout-seconds",
             type=float,
             default=ServerArgs.disaggregation_bootstrap_timeout_seconds,
-            help="Bootstrap-server query timeout in seconds. <=0 to " "disable.",
+            help="Bootstrap-server query timeout in seconds. <=0 to disable.",
         )
         parser.add_argument(
             "--disaggregation-pull-timeout-seconds",
@@ -1662,7 +1698,7 @@ class ServerArgs:
             "--disaggregation-orphan-reaper-interval-seconds",
             type=float,
             default=ServerArgs.disaggregation_orphan_reaper_interval_seconds,
-            help="How often the background reaper scans for orphan " "senders/receivers.",
+            help="How often the background reaper scans for orphan senders/receivers.",
         )
         parser.add_argument(
             "--disaggregation-decode-watchdog-seconds",

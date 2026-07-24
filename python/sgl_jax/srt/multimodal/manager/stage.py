@@ -10,6 +10,10 @@ import psutil
 from sgl_jax.srt.managers.communication import QueueBackend
 from sgl_jax.srt.managers.scheduler import Scheduler as AutoRegressiveScheduler
 from sgl_jax.srt.models.qwen2 import Qwen2ForCausalLM
+from sgl_jax.srt.models.qwen2_5_vl import (
+    Qwen2_5_VisionTransformer,
+    Qwen2_5_VLForConditionalGeneration,
+)
 from sgl_jax.srt.models.umt5 import UMT5EncoderModel
 from sgl_jax.srt.multimodal.manager.device_manager import DeviceManager
 from sgl_jax.srt.multimodal.manager.scheduler.audio_backbone_scheduler import (
@@ -239,6 +243,8 @@ def get_model_class(name: str) -> type | list[type]:
         "WanTransformer3DModel": WanTransformer3DModel,
         "WanDualTransformer3DModel": WanDualTransformer3DModel,
         "Qwen2ForCausalLM": Qwen2ForCausalLM,
+        "Qwen2_5_VL_VisionModel": Qwen2_5_VisionTransformer,
+        "Qwen2_5_VL_Generation": Qwen2_5_VLForConditionalGeneration,
         "Qwen3OmniMoeThinkerEmbedding": Qwen3OmniMoeThinkerEmbedding,
         "Qwen3OmniMoeThinkerTextForConditionalGeneration": (
             Qwen3OmniMoeThinkerTextForConditionalGeneration
