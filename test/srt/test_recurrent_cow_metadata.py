@@ -1,5 +1,4 @@
-"""_build_recurrent_cow_src_indices must return None (not an all-zero array)
-when no clone is pending, so cold extends skip the donated-buffer CoW scatter."""
+"""CoW metadata keeps a stable array structure while zero remains the no-op sentinel."""
 
 import unittest
 from unittest.mock import MagicMock
@@ -17,11 +16,13 @@ def _req(rid, cow_src=None):
 
 
 class TestBuildRecurrentCowSrcIndices(unittest.TestCase):
-    def test_all_zero_returns_none(self):
-        self.assertIsNone(_build_recurrent_cow_src_indices([_req(0), _req(1)]))
+    def test_all_zero_returns_array(self):
+        out = _build_recurrent_cow_src_indices([_req(0), _req(1)])
+        np.testing.assert_array_equal(out, np.zeros(2, dtype=np.int32))
 
-    def test_empty_returns_none(self):
-        self.assertIsNone(_build_recurrent_cow_src_indices([]))
+    def test_empty_returns_array(self):
+        out = _build_recurrent_cow_src_indices([])
+        np.testing.assert_array_equal(out, np.empty(0, dtype=np.int32))
 
     def test_mixed_returns_array(self):
         out = _build_recurrent_cow_src_indices([_req(0, 0), _req(1, 7)])

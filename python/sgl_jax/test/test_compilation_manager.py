@@ -1,5 +1,7 @@
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
+
+import numpy as np
 
 from sgl_jax.srt.model_executor.compilation_manager import CompilationManager
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
@@ -42,6 +44,55 @@ def _make_server_args(**overrides):
     for k, v in overrides.items():
         setattr(args, k, v)
     return args
+
+
+def _make_precompile_manager(
+    *,
+    page_size=128,
+    has_recurrent_state=False,
+    supports_recurrent_cow=False,
+    supports_recurrent_track=False,
+):
+    return CompilationManager(
+        server_args=_make_server_args(
+            precompile_token_paddings=[4, 8],
+            precompile_bs_paddings=[2, 4],
+        ),
+        max_padded_batch_size=4,
+        max_padded_num_tokens=8,
+        dp_size=1,
+        tp_size=1,
+        page_size=page_size,
+        max_req_len=8,
+        vocab_size=32,
+        has_recurrent_state=has_recurrent_state,
+        supports_recurrent_cow=supports_recurrent_cow,
+        supports_recurrent_track=supports_recurrent_track,
+    )
+
+
+def _collect_precompile_batches(cm, mode):
+    batches = []
+
+    def forward_fn(batch, **_kwargs):
+        batches.append(batch)
+
+    with (
+        patch(
+            "sgl_jax.srt.model_executor.forward_batch_info.ForwardBatch.init_new",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "sgl_jax.srt.sampling.sampling_batch_info." "SamplingMetadata.from_model_worker_batch",
+            return_value=MagicMock(),
+        ),
+    ):
+        if mode == ForwardMode.EXTEND:
+            cm._precompile_extend(forward_fn, MagicMock(), MagicMock(), None, None)
+        else:
+            cm._precompile_decode(forward_fn, MagicMock(), MagicMock(), None, None)
+
+    return batches
 
 
 class TestBucketComputation(unittest.TestCase):
@@ -207,6 +258,81 @@ class TestLazyCompilation(unittest.TestCase):
         assert cm.register_variant_if_new(key1) is True
         assert cm.register_variant_if_new(key2) is True
         assert cm.register_variant_if_new(key1) is False
+
+
+class TestRecurrentPrecompileStructure(unittest.TestCase):
+    @staticmethod
+    def _presence(batch):
+        return (
+            batch.recurrent_cow_src_indices is not None,
+            batch.recurrent_track_indices is not None,
+        )
+
+    def test_non_recurrent_preserves_original_structure(self):
+        cm = _make_precompile_manager()
+
+        extend_batches = _collect_precompile_batches(cm, ForwardMode.EXTEND)
+        decode_batches = _collect_precompile_batches(cm, ForwardMode.DECODE)
+
+        assert len(extend_batches) == len(cm.token_buckets)
+        assert len(decode_batches) == len(cm.bs_buckets)
+        assert all(self._presence(batch) == (False, False) for batch in extend_batches)
+        assert all(self._presence(batch) == (False, False) for batch in decode_batches)
+
+    def test_recurrent_without_capabilities_preserves_original_structure(self):
+        cm = _make_precompile_manager(has_recurrent_state=True)
+
+        extend_batches = _collect_precompile_batches(cm, ForwardMode.EXTEND)
+        decode_batches = _collect_precompile_batches(cm, ForwardMode.DECODE)
+
+        assert len(extend_batches) == len(cm.token_buckets)
+        assert len(decode_batches) == len(cm.bs_buckets)
+        assert all(self._presence(batch) == (False, False) for batch in extend_batches)
+        assert all(self._presence(batch) == (False, False) for batch in decode_batches)
+
+    def test_page_size_one_recurrent_uses_fixed_extend_cow_structure(self):
+        cm = _make_precompile_manager(
+            page_size=1,
+            has_recurrent_state=True,
+            supports_recurrent_cow=True,
+        )
+
+        extend_batches = _collect_precompile_batches(cm, ForwardMode.EXTEND)
+        decode_batches = _collect_precompile_batches(cm, ForwardMode.DECODE)
+
+        assert len(extend_batches) == len(cm.token_buckets)
+        assert len(decode_batches) == len(cm.bs_buckets)
+        assert all(self._presence(batch) == (True, False) for batch in extend_batches)
+        assert all(self._presence(batch) == (False, False) for batch in decode_batches)
+
+    def test_extra_buffer_uses_one_fixed_structure_per_mode(self):
+        cm = _make_precompile_manager(
+            has_recurrent_state=True,
+            supports_recurrent_cow=True,
+            supports_recurrent_track=True,
+        )
+
+        extend_batches = _collect_precompile_batches(cm, ForwardMode.EXTEND)
+        decode_batches = _collect_precompile_batches(cm, ForwardMode.DECODE)
+
+        assert len(extend_batches) == len(cm.token_buckets)
+        assert len(decode_batches) == len(cm.bs_buckets)
+        assert all(self._presence(batch) == (True, True) for batch in extend_batches)
+        assert all(self._presence(batch) == (False, True) for batch in decode_batches)
+
+        for batch in extend_batches + decode_batches:
+            for value in (
+                batch.recurrent_cow_src_indices,
+                batch.recurrent_track_indices,
+                batch.recurrent_track_mask,
+            ):
+                if value is not None:
+                    assert value.shape == (batch.real_bs,)
+                    assert value.dtype == np.int32
+            assert (batch.recurrent_track_indices is None) == (batch.recurrent_track_mask is None)
+
+        assert all(batch.recurrent_cow_src_indices is None for batch in decode_batches)
+        assert all(len(key) == 4 for key in cm._compiled_variants)
 
 
 class TestDummyBatch(unittest.TestCase):

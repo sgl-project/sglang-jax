@@ -260,6 +260,7 @@ class ModelWorker:
         # precompile
         from sgl_jax.srt.model_executor.compilation_manager import CompilationManager
 
+        has_recurrent_state = self.model_runner.linear_recurrent_config is not None
         self.compilation_manager = CompilationManager(
             server_args=server_args,
             max_padded_batch_size=self.max_padded_batch_size,
@@ -278,7 +279,15 @@ class ModelWorker:
                 self.max_total_num_tokens if os.getenv("JAX_PLATFORMS") == "proxy" else 0
             ),
             multimodal=server_args.multimodal,
-            has_recurrent_state=self.model_runner.linear_recurrent_config is not None,
+            has_recurrent_state=has_recurrent_state,
+            supports_recurrent_cow=(
+                has_recurrent_state
+                and server_args.enable_unified_radix_tree
+                and not server_args.disable_radix_cache
+            ),
+            supports_recurrent_track=(
+                has_recurrent_state and server_args.enable_recurrent_extra_buffer
+            ),
             moe_backend=effective_moe_backend,
         )
 

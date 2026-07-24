@@ -740,20 +740,17 @@ class ScheduleReqsInfo:
     # Recurrent state indices for hybrid recurrent models (per DP)
     recurrent_indices: np.ndarray | None = None
 
-    # Recurrent CoW src slot per req (0 = no clone), per DP
+    # Recurrent CoW src slot per req (0 = no clone), per DP.
     recurrent_cow_src_indices: np.ndarray | None = None
 
-    # Recurrent track metadata per DP (extra-buffer; set only on a track boundary).
+    # Recurrent track metadata per DP (extra-buffer; mask 0 = no boundary).
     recurrent_track_indices: np.ndarray | None = None
     recurrent_track_mask: np.ndarray | None = None
 
 
-def _build_recurrent_cow_src_indices(reqs: list[Req]) -> np.ndarray | None:
-    """None when no clone is pending, so cold extends skip the donated-buffer
-    CoW scatter in _maybe_apply_recurrent_cow."""
+def _build_recurrent_cow_src_indices(reqs: list[Req]) -> np.ndarray:
+    """Build fixed-shape CoW metadata; zero means no clone for that request."""
     vals = [r.recurrent_cow_src_index or 0 for r in reqs]
-    if not any(vals):
-        return None
     return np.asarray(vals, dtype=np.int32)
 
 
@@ -787,10 +784,7 @@ def _recurrent_track_entry(
 def _build_recurrent_track_entries(
     reqs: list[Req], final_seq_lens: list[int], *, interval: int, pool, is_extend: bool
 ):
-    """Two np.int32 arrays (indices, mask as 0/1) aligned with ``reqs``, or
-    ``(None, None)`` when no req hits a boundary -- mirroring
-    ``_build_recurrent_cow_src_indices``'s one-shot None return so the backend
-    skips the snapshot path entirely on a boundary-free batch."""
+    """Build fixed-shape track indices and a 0/1 boundary mask."""
     indices: list[int] = []
     mask: list[int] = []
     for req, final_seq_len in zip(reqs, final_seq_lens):
@@ -799,8 +793,6 @@ def _build_recurrent_track_entries(
         )
         indices.append(entry.track_index)
         mask.append(1 if entry.track_mask else 0)
-    if not any(mask):
-        return None, None
     return (
         np.asarray(indices, dtype=np.int32),
         np.asarray(mask, dtype=np.int32),
@@ -2969,12 +2961,6 @@ class ScheduleBatch:
                 info.recurrent_cow_src_indices = None
                 for r in info.reqs or []:
                     r.recurrent_cow_src_index = None
-            if (
-                recurrent_cow_src_indices_cpu is not None
-                and not recurrent_cow_src_indices_cpu.any()
-            ):
-                recurrent_cow_src_indices_cpu = None
-
         # Merge recurrent track metadata (extra-buffer; see ScheduleReqsInfo).
         recurrent_track_indices_cpu = None
         recurrent_track_mask_cpu = None
@@ -2998,11 +2984,6 @@ class ScheduleBatch:
             for info in self.reqs_info:
                 info.recurrent_track_indices = None
                 info.recurrent_track_mask = None
-            # No boundary this batch: None skips the snapshot path entirely.
-            if not recurrent_track_mask_cpu.any():
-                recurrent_track_indices_cpu = None
-                recurrent_track_mask_cpu = None
-
         # has_initial_state[i] = True iff slot i already holds
         # prior KV/recurrent state (extend with prefix, or any decode slot).
         has_initial_state_cpu = np.ones(total_bs, dtype=np.bool_)

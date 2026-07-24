@@ -1,7 +1,6 @@
 """recurrent_track_indices / recurrent_track_mask must ride the same plumbing as
 recurrent_cow_src_indices (scheduler -> ModelWorkerBatch -> ForwardBatch -> backend
-metadata) in lockstep: populated only on a track boundary, distinct sentinels catch
-swapped fields, None round-trips to None."""
+metadata) in lockstep; distinct sentinels catch swapped fields."""
 
 import unittest
 
@@ -158,15 +157,16 @@ class TestRecurrentTrackEntryBuilder(unittest.TestCase):
         self.assertEqual(req.recurrent_next_track_idx, 0)
         self.assertEqual(req.recurrent_last_track_seqlen, 128)
 
-    def test_builder_none_when_no_boundary(self):
+    def test_builder_returns_zero_arrays_when_no_boundary(self):
         reqs = [
             _FakeReq(extend_input_len=100, buffer=[40, 41]),
             _FakeReq(extend_input_len=50, buffer=[42, 43]),
         ]
-        out = _build_recurrent_track_entries(
+        indices, mask = _build_recurrent_track_entries(
             reqs, [200, 150], interval=128, pool=_PingPongPool(), is_extend=True
         )
-        self.assertEqual(out, (None, None))
+        np.testing.assert_array_equal(indices, np.zeros(2, dtype=np.int32))
+        np.testing.assert_array_equal(mask, np.zeros(2, dtype=np.int32))
         # No req mutated when nothing hit a boundary.
         self.assertTrue(all(r.recurrent_last_track_seqlen is None for r in reqs))
 
