@@ -261,6 +261,8 @@ Assistant: {% endif %}"""
         # transformers>=5) inherits UserDict, not dict — use Mapping to cover both.
         if isinstance(prompt_ids, Mapping) and "input_ids" in prompt_ids:
             prompt_ids = prompt_ids["input_ids"]
+        if isinstance(prompt_ids, list) and prompt_ids and isinstance(prompt_ids[0], list):
+            prompt_ids = prompt_ids[0]
 
         if assistant_prefix:
             encoded = self.tokenizer_manager.tokenizer.encode(assistant_prefix)

@@ -280,6 +280,7 @@ class ModelWorker:
             multimodal=server_args.multimodal,
             has_recurrent_state=self.model_runner.linear_recurrent_config is not None,
             moe_backend=effective_moe_backend,
+            msa_ctx_page_buckets=getattr(self.model_runner, "msa_ctx_page_buckets", None),
         )
 
         # Allocate the persistent cache_loc host buffer once (reused every step
