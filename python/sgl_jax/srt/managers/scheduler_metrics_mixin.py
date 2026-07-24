@@ -134,8 +134,13 @@ class SchedulerMetricsMixin:
             and self.draft_token > 0
             and self.spec_num_forward_ct > 0
         ):
-            accept_ratio = self.accept_token / self.draft_token
             accept_len = self.accept_token / self.spec_num_forward_ct
+            num_draft_tokens = self.draft_token / self.spec_num_forward_ct
+            accept_ratio = (
+                (accept_len - 1) / (num_draft_tokens - 1) if num_draft_tokens > 1 else 0.0
+            )
+            self.spec_num_total_accepted_tokens += self.accept_token
+            self.spec_num_total_forward_ct += self.spec_num_forward_ct
             self.accept_token = 0
             self.draft_token = 0
             self.spec_num_forward_ct = 0

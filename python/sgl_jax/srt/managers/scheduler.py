@@ -1471,6 +1471,11 @@ class Scheduler(
         ret["disagg_prealloc_queue_size"] = len(self.disagg_prealloc_queue or ())
         ret["disagg_transfer_queue_size"] = len(self.disagg_transfer_queue or ())
 
+        if self.spec_num_total_forward_ct > 0:
+            ret["avg_spec_accept_length"] = (
+                self.spec_num_total_accepted_tokens / self.spec_num_total_forward_ct
+            )
+
         return GetInternalStateReqOutput(internal_state=ret)
 
     def set_internal_state(self, recv_req: SetInternalStateReq):
