@@ -54,6 +54,10 @@ from sgl_jax.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sgl_jax.srt.multimodal.common.mm_plan import MultimodalEmbedPlan
 from sgl_jax.srt.multimodal.common.modality_enum import MultimodalInputs
+from sgl_jax.srt.multimodal.layers.vision_sharding import (
+    encode_lane_count,
+    resolve_encoder_tp,
+)
 from sgl_jax.srt.precision_tracer import (
     PrecisionTracerRequestMetadata,
     precision_tracer,
@@ -79,6 +83,7 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "speculative_accept_threshold_single",
     "speculative_accept_threshold_acc",
     "enable_deterministic_sampling",
+    "vision_encoder_parallel",
 ]
 
 PADDING_BUCKETS = [1 << i for i in range(6, 21)]
@@ -478,7 +483,7 @@ class Req:
                 )
                 match_result = tree_cache.match_prefix(
                     MatchPrefixParams(
-                        key=RadixKey(self.adjust_max_prefix_ids(), self.extra_key, self.dp_rank),
+                        key=RadixKey(self.match_key_ids(), self.extra_key, self.dp_rank),
                         cow_recurrent=(
                             tree_cache.supports_recurrent() and not is_running_recurrent
                         ),
@@ -512,6 +517,48 @@ class Req:
 
         max_prefix_len = max(max_prefix_len, 0)
         return self.fill_ids[:max_prefix_len]
+
+    def compute_cache_input_ids(
+        self, im_token_id=None, video_token_id=None, audio_token_id=None
+    ) -> None:
+        """Set ``cache_input_ids`` to ``origin_input_ids`` with multimodal
+        placeholders replaced by per-item hash pad_values, so the radix key
+        distinguishes different images/videos that share placeholder tokens.
+
+        Never touches ``fill_ids`` / ``origin_input_ids`` -- those stay the real
+        model input; only the radix key is affected.
+        """
+        from sgl_jax.srt.multimodal.common.modality_enum import (
+            MultimodalInputs,
+            pad_input_tokens,
+        )
+
+        mm_inputs = self.mm_inputs
+        if not isinstance(mm_inputs, MultimodalInputs) or not mm_inputs.mm_items:
+            self.cache_input_ids = None
+            return
+        padded = pad_input_tokens(
+            self.origin_input_ids,
+            mm_inputs.mm_items,
+            im_token_id=im_token_id,
+            video_token_id=video_token_id,
+            audio_token_id=audio_token_id,
+        )
+        self.cache_input_ids = padded if padded != list(self.origin_input_ids) else None
+
+    def match_key_ids(self):
+        """Prefix ids for the radix key. Uses hash-substituted ``cache_input_ids``
+        when set (to distinguish multimodal content) but keeps ``fill_ids`` as the
+        real model input; length is identical to ``adjust_max_prefix_ids`` so
+        ``extend_input_len`` math is unchanged.
+        """
+        real_prefix = self.adjust_max_prefix_ids()
+        if self.cache_input_ids is None:
+            return real_prefix
+        key_fill = (
+            self.cache_input_ids + self.output_ids if self.output_ids else self.cache_input_ids
+        )
+        return key_fill[: len(real_prefix)]
 
     def pop_committed_kv_cache(self) -> int:
         # Idempotent: the PD prefill abort path can run release a second time
@@ -3032,15 +3079,21 @@ class ScheduleBatch:
         mrope_positions = _mm["mrope_positions"]
         apply_for_deepstack = _mm["apply_for_deepstack"]
         deepstack_visual_embedding = _mm["deepstack_visual_embedding"]
-        # Build the vision encode/merge plan only for ordinary prefill. Other
-        # forward modes leave the plan unset, and the runner treats a non-None
-        # plan as the sole vision-forward signal.
+        # Build a vision encode/merge plan for the current extend window. For
+        # chunked prefill, the builder clips full-prompt placeholder ranges to
+        # [prefix_len, seq_len); chunks without visual rows return no plan.
         if self.contains_mm_inputs() and self.forward_mode == ForwardMode.EXTEND:
+            encoder_tp = resolve_encoder_tp(
+                self.mesh, global_server_args_dict.get("vision_encoder_parallel", "dp")
+            )
             mm_embed_plan = build_mm_embed_plan(
                 self.reqs_info,
                 self.dp_size,
                 self.model_config,
                 per_dp_token_padding,
+                # DP-Encoder fans a DP rank's requests across the tensor devices;
+                # TP-Encoder keeps a single collaborative lane per DP rank.
+                tp_size=encode_lane_count(self.mesh, encoder_tp),
             )
         else:
             mm_embed_plan = None

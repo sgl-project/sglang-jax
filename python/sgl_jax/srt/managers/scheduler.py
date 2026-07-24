@@ -274,9 +274,13 @@ class Scheduler(
         self.init_tokenizer()
 
         self.enable_overlap = not server_args.disable_overlap_schedule
+        # The standalone multimodal stage pipeline has its own schedulers and
+        # does not support the autoregressive overlap loop yet. In-model
+        # multimodal models use the regular worker protocol and can follow the
+        # generic overlap flag without an architecture allowlist.
         if server_args.multimodal:
-            logger.info("Multimodal mode enabled, disabling overlap schedule")
             self.enable_overlap = False
+            logger.info("Overlap scheduler is disabled for the multimodal stage pipeline.")
         if server_args.disaggregation_mode != "null":
             logger.info("PD disaggregation mode enabled, disabling overlap schedule")
             self.enable_overlap = False
@@ -1262,6 +1266,13 @@ class Scheduler(
                 req.deepstack_visual_embedding = _extract_mm_value(
                     recv_req.mm_inputs, "deepstack_visual_embedding"
                 )
+            # Hash-substitute placeholder tokens so the radix cache distinguishes
+            # different images/videos sharing the same placeholder token ids.
+            req.compute_cache_input_ids(
+                im_token_id=getattr(self.model_config, "image_token_id", None),
+                video_token_id=getattr(self.model_config, "video_token_id", None),
+                audio_token_id=getattr(self.model_config, "audio_token_id", None),
+            )
         # Validate prompt length
         error_msg = validate_input_length(
             req,
