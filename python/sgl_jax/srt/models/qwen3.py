@@ -9,7 +9,12 @@ from jax.sharding import PartitionSpec as P
 from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig
-from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, RotaryEmbedding
+from sgl_jax.srt.layers.embeddings import (
+    Embed,
+    MRotaryEmbedding,
+    ParallelLMHead,
+    RotaryEmbedding,
+)
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
@@ -23,6 +28,111 @@ from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 logger = logging.getLogger(__name__)
 
 init_fn = nnx.initializers.uniform()
+
+
+def create_qwen3_weight_mappings(
+    config,
+    source_prefix: str = "model",
+    target_prefix: str = "model",
+) -> dict:
+    mappings = {
+        f"{source_prefix}.embed_tokens.weight": WeightMapping(
+            target_path=f"{target_prefix}.embed_tokens.embedding",
+            sharding=("tensor", None),
+            transpose=False,
+        ),
+        f"{source_prefix}.norm.weight": WeightMapping(
+            target_path=f"{target_prefix}.norm.scale", sharding=(None,), transpose=False
+        ),
+    }
+    if not getattr(config, "tie_word_embeddings", False):
+        mappings["lm_head.weight"] = WeightMapping(
+            target_path="lm_head.embedding", sharding=("tensor", None), transpose=False
+        )
+    for layer_idx in range(config.num_hidden_layers):
+        mappings.update(
+            create_qwen3_layer_mappings(config, layer_idx, source_prefix, target_prefix)
+        )
+    return mappings
+
+
+def create_qwen3_layer_mappings(
+    config,
+    layer_idx: int,
+    source_prefix: str = "model",
+    target_prefix: str = "model",
+) -> dict:
+    source = f"{source_prefix}.layers.{layer_idx}"
+    target = f"{target_prefix}.layers.{layer_idx}"
+    mappings = {
+        f"{source}.input_layernorm.weight": WeightMapping(
+            target_path=f"{target}.input_layernorm.scale", sharding=(None,), transpose=False
+        ),
+        f"{source}.post_attention_layernorm.weight": WeightMapping(
+            target_path=f"{target}.post_attention_layernorm.scale",
+            sharding=(None,),
+            transpose=False,
+        ),
+        f"{source}.self_attn.q_proj.weight": WeightMapping(
+            target_path=f"{target}.self_attn.q_proj.weight",
+            sharding=(None, "tensor"),
+            transpose=True,
+            kv_head_padding=False,
+        ),
+        f"{source}.self_attn.k_proj.weight": WeightMapping(
+            target_path=f"{target}.self_attn.k_proj.weight",
+            sharding=(None, "tensor"),
+            transpose=True,
+            kv_head_padding=True,
+        ),
+        f"{source}.self_attn.v_proj.weight": WeightMapping(
+            target_path=f"{target}.self_attn.v_proj.weight",
+            sharding=(None, "tensor"),
+            transpose=True,
+            kv_head_padding=True,
+        ),
+        f"{source}.self_attn.o_proj.weight": WeightMapping(
+            target_path=f"{target}.self_attn.o_proj.weight",
+            sharding=("tensor", None),
+            transpose=True,
+            kv_head_padding=False,
+        ),
+        f"{source}.self_attn.q_norm.weight": WeightMapping(
+            target_path=f"{target}.self_attn.q_norm.scale", sharding=(None,), transpose=False
+        ),
+        f"{source}.self_attn.k_norm.weight": WeightMapping(
+            target_path=f"{target}.self_attn.k_norm.scale", sharding=(None,), transpose=False
+        ),
+        f"{source}.mlp.gate_proj.weight": WeightMapping(
+            target_path=f"{target}.mlp.gate_proj.weight",
+            sharding=(None, "tensor"),
+            transpose=True,
+        ),
+        f"{source}.mlp.up_proj.weight": WeightMapping(
+            target_path=f"{target}.mlp.up_proj.weight",
+            sharding=(None, "tensor"),
+            transpose=True,
+        ),
+        f"{source}.mlp.down_proj.weight": WeightMapping(
+            target_path=f"{target}.mlp.down_proj.weight",
+            sharding=("tensor", None),
+            transpose=True,
+        ),
+    }
+    if getattr(config, "attention_bias", False):
+        for name, padding in (("q_proj", False), ("k_proj", True), ("v_proj", True)):
+            mappings[f"{source}.self_attn.{name}.bias"] = WeightMapping(
+                target_path=f"{target}.self_attn.{name}.bias",
+                sharding=(None,),
+                transpose=False,
+                kv_head_padding=padding,
+            )
+        mappings[f"{source}.self_attn.o_proj.bias"] = WeightMapping(
+            target_path=f"{target}.self_attn.o_proj.bias",
+            sharding=(None,),
+            transpose=False,
+        )
+    return mappings
 
 
 class QWen3Attention(nnx.Module):
@@ -95,14 +205,26 @@ class QWen3Attention(nnx.Module):
             mesh=mesh,
             scope_name="o_proj",
         )
-        self.rotary_emb = RotaryEmbedding(
-            head_size=self.head_dim,
-            rotary_dim=self.head_dim,
-            max_position_embeddings=max_position_embeddings,
-            base=rope_theta,
-            is_neox_style=True,
-            dtype=dtype,
-        )
+        if rope_scaling and "mrope_section" in rope_scaling:
+            self.rotary_emb = MRotaryEmbedding(
+                self.head_dim,
+                self.head_dim,
+                max_position_embeddings,
+                rope_theta,
+                True,
+                dtype,
+                mrope_section=rope_scaling["mrope_section"],
+                mrope_interleaved=rope_scaling.get("mrope_interleaved", False),
+            )
+        else:
+            self.rotary_emb = RotaryEmbedding(
+                self.head_dim,
+                self.head_dim,
+                max_position_embeddings,
+                rope_theta,
+                True,
+                dtype,
+            )
 
         self.attn = RadixAttention(
             num_heads=num_heads,
@@ -344,28 +466,41 @@ class QWen3Model(nnx.Module):
         # For EAGLE3 support
         self.layers_to_capture = []
 
+    def get_input_embeddings(self):
+        return self.embed_tokens
+
     def __call__(
         self,
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
     ):
         residual = None
-        hidden_states = self.embed_tokens(forward_batch.input_ids)
+        input_embedding = getattr(forward_batch, "input_embedding", None)
+        hidden_states = (
+            self.embed_tokens(forward_batch.input_ids)
+            if input_embedding is None
+            else input_embedding
+        )
         layers_kv_fused = []
         layers_callback_flag = []
         aux_hidden_states = []
+        rope_positions = getattr(forward_batch, "mrope_positions", None)
+        rope_positions = forward_batch.positions if rope_positions is None else rope_positions
         for layer_id, layer in enumerate(self.layers):
             if layer_id in self.layers_to_capture:
                 aux_hidden_states.append(
                     hidden_states + residual if residual is not None else hidden_states
                 )
             hidden_states, residual, kv_fused, callback_flag = layer(
-                forward_batch.positions,
+                rope_positions,
                 hidden_states,
                 forward_batch,
                 token_to_kv_pool,
                 residual,
             )
+            deepstack = getattr(forward_batch, "deepstack_visual_embedding", None)
+            if deepstack is not None and layer_id < deepstack.shape[0]:
+                hidden_states += deepstack[layer_id].astype(hidden_states.dtype)
             layers_kv_fused.append(kv_fused)
             layers_callback_flag.extend(callback_flag)
 
@@ -419,124 +554,10 @@ class Qwen3ForCausalLM(nnx.Module):
         logger.info("Qwen3 weights loaded successfully!")
 
     def _create_qwen3_weight_mappings(self) -> dict:
-        mappings = {
-            "model.embed_tokens.weight": WeightMapping(
-                target_path="model.embed_tokens.embedding",
-                sharding=("tensor", None),
-                transpose=False,
-            ),
-            "model.norm.weight": WeightMapping(
-                target_path="model.norm.scale", sharding=(None,), transpose=False
-            ),
-        }
-
-        if not getattr(self.config, "tie_word_embeddings", False):
-            mappings["lm_head.weight"] = WeightMapping(
-                target_path="lm_head.embedding", sharding=("tensor", None), transpose=False
-            )
-
-        num_layers = self.config.num_hidden_layers
-        for layer_idx in range(num_layers):
-            layer_mappings = self._create_layer_mappings(layer_idx)
-            mappings.update(layer_mappings)
-
-        return mappings
+        return create_qwen3_weight_mappings(self.config)
 
     def _create_layer_mappings(self, layer_idx: int) -> dict:
-        prefix = f"model.layers.{layer_idx}"
-        target_prefix = f"model.layers.{layer_idx}"
-
-        mappings = {
-            f"{prefix}.input_layernorm.weight": WeightMapping(
-                target_path=f"{target_prefix}.input_layernorm.scale",
-                sharding=(None,),
-                transpose=False,
-            ),
-            f"{prefix}.post_attention_layernorm.weight": WeightMapping(
-                target_path=f"{target_prefix}.post_attention_layernorm.scale",
-                sharding=(None,),
-                transpose=False,
-            ),
-            f"{prefix}.self_attn.q_proj.weight": WeightMapping(
-                target_path=f"{target_prefix}.self_attn.q_proj.weight",
-                sharding=(None, "tensor"),
-                transpose=True,
-                kv_head_padding=False,
-            ),
-            f"{prefix}.self_attn.k_proj.weight": WeightMapping(
-                target_path=f"{target_prefix}.self_attn.k_proj.weight",
-                sharding=(None, "tensor"),
-                transpose=True,
-                kv_head_padding=True,
-            ),
-            f"{prefix}.self_attn.v_proj.weight": WeightMapping(
-                target_path=f"{target_prefix}.self_attn.v_proj.weight",
-                sharding=(None, "tensor"),
-                transpose=True,
-                kv_head_padding=True,
-            ),
-            f"{prefix}.self_attn.o_proj.weight": WeightMapping(
-                target_path=f"{target_prefix}.self_attn.o_proj.weight",
-                sharding=("tensor", None),
-                transpose=True,
-                kv_head_padding=False,
-            ),
-            f"{prefix}.self_attn.q_norm.weight": WeightMapping(
-                target_path=f"{target_prefix}.self_attn.q_norm.scale",
-                sharding=(None,),
-                transpose=False,
-            ),
-            f"{prefix}.self_attn.k_norm.weight": WeightMapping(
-                target_path=f"{target_prefix}.self_attn.k_norm.scale",
-                sharding=(None,),
-                transpose=False,
-            ),
-            f"{prefix}.mlp.gate_proj.weight": WeightMapping(
-                target_path=f"{target_prefix}.mlp.gate_proj.weight",
-                sharding=(None, "tensor"),
-                transpose=True,
-            ),
-            f"{prefix}.mlp.up_proj.weight": WeightMapping(
-                target_path=f"{target_prefix}.mlp.up_proj.weight",
-                sharding=(None, "tensor"),
-                transpose=True,
-            ),
-            f"{prefix}.mlp.down_proj.weight": WeightMapping(
-                target_path=f"{target_prefix}.mlp.down_proj.weight",
-                sharding=("tensor", None),
-                transpose=True,
-            ),
-        }
-
-        if getattr(self.config, "attention_bias", False):
-            bias_mappings = {
-                f"{prefix}.self_attn.q_proj.bias": WeightMapping(
-                    target_path=f"{target_prefix}.self_attn.q_proj.bias",
-                    sharding=(None,),
-                    transpose=False,
-                    kv_head_padding=False,
-                ),
-                f"{prefix}.self_attn.k_proj.bias": WeightMapping(
-                    target_path=f"{target_prefix}.self_attn.k_proj.bias",
-                    sharding=(None,),
-                    transpose=False,
-                    kv_head_padding=True,
-                ),
-                f"{prefix}.self_attn.v_proj.bias": WeightMapping(
-                    target_path=f"{target_prefix}.self_attn.v_proj.bias",
-                    sharding=(None,),
-                    transpose=False,
-                    kv_head_padding=True,
-                ),
-                f"{prefix}.self_attn.o_proj.bias": WeightMapping(
-                    target_path=f"{target_prefix}.self_attn.o_proj.bias",
-                    sharding=(None,),
-                    transpose=False,
-                ),
-            }
-            mappings.update(bias_mappings)
-
-        return mappings
+        return create_qwen3_layer_mappings(self.config, layer_idx)
 
     def get_embed_and_head(self):
         return (

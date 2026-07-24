@@ -1,6 +1,52 @@
 import numpy as np
 
 
+def compute_qwen3vl_mrope_positions(
+    *,
+    mm_token_type_ids,
+    image_grid_thw,
+    video_grid_thw,
+    spatial_merge_size,
+) -> tuple[np.ndarray, int]:
+    token_types = np.asarray(mm_token_type_ids, dtype=np.int32).reshape(-1)
+    if token_types.size == 0:
+        return np.zeros((3, 0), dtype=np.int32), 0
+    video_frames = [(1, int(h), int(w)) for t, h, w in video_grid_thw or [] for _ in range(int(t))]
+    grids = {1: iter(image_grid_thw or []), 2: iter(video_frames)}
+    groups = []
+    start = 0
+    for index in range(1, token_types.size + 1):
+        if index == token_types.size or token_types[index] != token_types[start]:
+            groups.append((int(token_types[start]), start, index))
+            start = index
+
+    position_groups = []
+    current = 0
+    for modality, start, end in groups:
+        if modality == 0:
+            length = end - start
+            position_groups.append(
+                np.broadcast_to(np.arange(length, dtype=np.int32), (3, length)) + current
+            )
+            current += length
+            continue
+        try:
+            t, h, w = next(grids[modality])
+        except (KeyError, StopIteration) as exc:
+            raise ValueError("Qwen3-VL token types do not match vision grids.") from exc
+        t, h, w = int(t), int(h) // spatial_merge_size, int(w) // spatial_merge_size
+        if end - start != t * h * w:
+            raise ValueError("Qwen3-VL vision token group does not match grid_thw.")
+        temporal, height, width = np.meshgrid(
+            np.arange(t), np.arange(h), np.arange(w), indexing="ij"
+        )
+        position_groups.append(np.stack((temporal, height, width), axis=0).reshape(3, -1) + current)
+        current += max(t, h, w)
+
+    positions = np.concatenate(position_groups, axis=1).astype(np.int32)
+    return positions, int(positions.max() + 1 - token_types.size)
+
+
 def compute_mrope_positions(
     *,
     input_ids: list[int],

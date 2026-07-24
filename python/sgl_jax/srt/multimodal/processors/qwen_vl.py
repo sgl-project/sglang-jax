@@ -14,7 +14,10 @@ from sgl_jax.srt.multimodal.common.modality_enum import (
     MultimodalDataItem,
     MultimodalInputs,
 )
-from sgl_jax.srt.multimodal.manager.mrope_utils import compute_mrope_positions
+from sgl_jax.srt.multimodal.manager.mrope_utils import (
+    compute_mrope_positions,
+    compute_qwen3vl_mrope_positions,
+)
 from sgl_jax.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 
 logger = logging.getLogger(__name__)
@@ -96,6 +99,7 @@ def _resize_video_frames(video: np.ndarray, video_config: dict) -> np.ndarray:
         raise ValueError(f"Expected video array with 4 dims (T,H,W,C), got {video.shape}")
 
     nframes, height, width = video.shape[0], video.shape[1], video.shape[2]
+    factor = int(video_config.get("factor", IMAGE_FACTOR))
     min_pixels = video_config.get("min_pixels", VIDEO_MIN_PIXELS)
     total_pixels = video_config.get("total_pixels", VIDEO_TOTAL_PIXELS)
     max_pixels = max(
@@ -112,13 +116,13 @@ def _resize_video_frames(video: np.ndarray, video_config: dict) -> np.ndarray:
         resized_height, resized_width = smart_resize(
             video_config["resized_height"],
             video_config["resized_width"],
-            factor=IMAGE_FACTOR,
+            factor=factor,
         )
     else:
         resized_height, resized_width = smart_resize(
             height,
             width,
-            factor=IMAGE_FACTOR,
+            factor=factor,
             min_pixels=min_pixels,
             max_pixels=max_pixels,
         )
@@ -225,6 +229,7 @@ class QwenVLProcessor(BaseMultimodalProcessor):
     models = (
         "Qwen2VLForConditionalGeneration",
         "Qwen2_5_VLForConditionalGeneration",
+        "Qwen3VLForConditionalGeneration",
     )
 
     async def process_mm_data_async(
@@ -251,6 +256,9 @@ class QwenVLProcessor(BaseMultimodalProcessor):
                 "do_sample_frames": False,
                 "fps": video_config.get("fps", FPS),
             }
+        is_qwen3vl = "Qwen3VLForConditionalGeneration" in self.hf_config.architectures
+        if is_qwen3vl:
+            processor_kwargs["return_mm_token_type_ids"] = True
 
         processor_output = self.processor(
             text=[input_text],
@@ -269,6 +277,7 @@ class QwenVLProcessor(BaseMultimodalProcessor):
         pixel_values_videos = self._to_numpy(processor_output.get("pixel_values_videos"))
         image_grid_thw = self._to_grid_list(processor_output.get("image_grid_thw"))
         video_grid_thw = self._to_grid_list(processor_output.get("video_grid_thw"))
+        mm_token_type_ids = self._to_numpy(processor_output.get("mm_token_type_ids"))
         if images or videos:
             logger.info(
                 "Qwen-VL processor output: images=%s, videos=%s, image_grid_thw=%s, "
@@ -286,26 +295,42 @@ class QwenVLProcessor(BaseMultimodalProcessor):
         second_per_grid_ts = self._to_list(second_per_grid_ts_value)
 
         vision_config = self.hf_config.vision_config
-        image_offsets = self._compute_image_offsets(
-            input_ids=input_ids,
-            grids=image_grid_thw,
-            image_token_id=self.hf_config.image_token_id,
-            spatial_merge_size=vision_config.spatial_merge_size,
-        )
         video_token_id = getattr(self.hf_config, "video_token_id", None)
-        video_offsets = self._compute_offsets(
-            input_ids=input_ids,
-            grids=video_grid_thw,
-            token_id=video_token_id,
-            spatial_merge_size=vision_config.spatial_merge_size,
-            modality_name="VIDEO",
-        )
+        if is_qwen3vl:
+            mm_token_type_ids = (
+                np.zeros(len(input_ids), dtype=np.int32)
+                if mm_token_type_ids is None
+                else mm_token_type_ids.reshape(-1).copy()
+            )
+            input_ids_array = np.asarray(input_ids)
+            mm_token_type_ids[input_ids_array == self.hf_config.image_token_id] = 1
+            mm_token_type_ids[input_ids_array == video_token_id] = 2
+            image_placeholder_ranges = self._grouped_placeholder_ranges(
+                mm_token_type_ids, 1, image_grid_thw, vision_config.spatial_merge_size
+            )
+            video_placeholder_ranges = self._grouped_placeholder_ranges(
+                mm_token_type_ids, 2, video_grid_thw, vision_config.spatial_merge_size, True
+            )
+        else:
+            image_placeholder_ranges = self._compute_image_placeholder_ranges(
+                input_ids=input_ids,
+                grids=image_grid_thw,
+                image_token_id=self.hf_config.image_token_id,
+                spatial_merge_size=vision_config.spatial_merge_size,
+            )
+            video_placeholder_ranges = self._compute_placeholder_ranges(
+                input_ids=input_ids,
+                grids=video_grid_thw,
+                token_id=video_token_id,
+                spatial_merge_size=vision_config.spatial_merge_size,
+                modality_name="VIDEO",
+            )
         mm_items = []
         mm_items.extend(
             self._build_items(
                 pixel_values,
                 image_grid_thw,
-                image_offsets,
+                image_placeholder_ranges,
                 Modality.IMAGE,
                 "image_grid_thw",
             )
@@ -314,7 +339,7 @@ class QwenVLProcessor(BaseMultimodalProcessor):
             self._build_items(
                 pixel_values_videos,
                 video_grid_thw,
-                video_offsets,
+                video_placeholder_ranges,
                 Modality.VIDEO,
                 "video_grid_thw",
             )
@@ -322,17 +347,25 @@ class QwenVLProcessor(BaseMultimodalProcessor):
         for item in mm_items:
             item.set_pad_value()
 
-        mrope_positions, mrope_position_delta = compute_mrope_positions(
-            input_ids=input_ids,
-            image_grid_thw=image_grid_thw,
-            video_grid_thw=video_grid_thw,
-            second_per_grid_ts=second_per_grid_ts,
-            vision_start_token_id=self.hf_config.vision_start_token_id,
-            image_token_id=self.hf_config.image_token_id,
-            video_token_id=video_token_id,
-            spatial_merge_size=vision_config.spatial_merge_size,
-            tokens_per_second=getattr(vision_config, "tokens_per_second", None),
-        )
+        if is_qwen3vl:
+            mrope_positions, mrope_position_delta = compute_qwen3vl_mrope_positions(
+                mm_token_type_ids=mm_token_type_ids,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+                spatial_merge_size=vision_config.spatial_merge_size,
+            )
+        else:
+            mrope_positions, mrope_position_delta = compute_mrope_positions(
+                input_ids=input_ids,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+                second_per_grid_ts=second_per_grid_ts,
+                vision_start_token_id=self.hf_config.vision_start_token_id,
+                image_token_id=self.hf_config.image_token_id,
+                video_token_id=video_token_id,
+                spatial_merge_size=vision_config.spatial_merge_size,
+                tokens_per_second=getattr(vision_config, "tokens_per_second", None),
+            )
         mrope_position_delta = np.asarray([[mrope_position_delta]], dtype=np.int32)
 
         return MultimodalInputs(
@@ -347,15 +380,15 @@ class QwenVLProcessor(BaseMultimodalProcessor):
         )
 
     @staticmethod
-    def _build_items(features, grids, offsets, modality, grid_key):
+    def _build_items(features, grids, placeholder_ranges, modality, grid_key):
         if features is None:
             return []
         if not grids:
             raise ValueError(f"Missing {grid_key} metadata for {modality.name} inputs.")
-        if len(offsets) != len(grids):
+        if len(placeholder_ranges) != len(grids):
             raise ValueError(
-                f"{modality.name} offset count does not match grid metadata: "
-                f"{len(offsets)} != {len(grids)}."
+                f"{modality.name} placeholder range count does not match grid metadata: "
+                f"{len(placeholder_ranges)} != {len(grids)}."
             )
 
         feature_counts = [int(np.prod(grid)) for grid in grids]
@@ -373,7 +406,8 @@ class QwenVLProcessor(BaseMultimodalProcessor):
                 feature=features[offset : offset + count],
             )
             item.set(grid_key, np.asarray([grid], dtype=np.int32))
-            item.offsets = [offsets[len(items)]]
+            ranges = placeholder_ranges[len(items)]
+            item.placeholder_ranges = [ranges] if isinstance(ranges, tuple) else ranges
             items.append(item)
             offset += count
         return items
@@ -384,8 +418,8 @@ class QwenVLProcessor(BaseMultimodalProcessor):
         )
 
     @staticmethod
-    def _compute_image_offsets(input_ids, grids, image_token_id, spatial_merge_size):
-        return QwenVLProcessor._compute_offsets(
+    def _compute_image_placeholder_ranges(input_ids, grids, image_token_id, spatial_merge_size):
+        return QwenVLProcessor._compute_placeholder_ranges(
             input_ids=input_ids,
             grids=grids,
             token_id=image_token_id,
@@ -394,13 +428,13 @@ class QwenVLProcessor(BaseMultimodalProcessor):
         )
 
     @staticmethod
-    def _compute_offsets(input_ids, grids, token_id, spatial_merge_size, modality_name):
+    def _compute_placeholder_ranges(input_ids, grids, token_id, spatial_merge_size, modality_name):
         if not grids:
             return []
         if token_id is None:
             raise ValueError(f"{modality_name} token id is not configured.")
 
-        offsets = []
+        placeholder_ranges = []
         search_start = 0
         for grid in grids:
             token_count = int(np.prod(grid) // (spatial_merge_size**2))
@@ -414,17 +448,45 @@ class QwenVLProcessor(BaseMultimodalProcessor):
                     f"Missing {modality_name} placeholder tokens in processor input_ids."
                 )
 
-            end = start + token_count - 1
-            if end >= len(input_ids) or any(
-                input_token_id != token_id for input_token_id in input_ids[start : end + 1]
+            end = start + token_count
+            if end > len(input_ids) or any(
+                input_token_id != token_id for input_token_id in input_ids[start:end]
             ):
                 raise ValueError(
                     f"{modality_name} placeholder token span does not match grid metadata."
                 )
-            offsets.append((start, end))
-            search_start = end + 1
+            placeholder_ranges.append((start, end))
+            search_start = end
 
-        return offsets
+        return placeholder_ranges
+
+    @staticmethod
+    def _grouped_placeholder_ranges(token_types, modality, grids, merge, split_temporal=False):
+        groups = []
+        start = 0
+        token_types = np.asarray(token_types)
+        if token_types.size == 0:
+            if grids:
+                raise ValueError("Qwen3-VL token types do not match vision grid metadata.")
+            return []
+        for index in range(1, token_types.size + 1):
+            if index == token_types.size or token_types[index] != token_types[start]:
+                if token_types[start] == modality:
+                    groups.append((start, index))
+                start = index
+        result = []
+        offset = 0
+        for t, h, w in grids or []:
+            count = int(t) if split_temporal else 1
+            ranges = groups[offset : offset + count]
+            expected = int(t * h * w // (merge * merge))
+            if len(ranges) != count or sum(end - start for start, end in ranges) != expected:
+                raise ValueError("Qwen3-VL token types do not match vision grid metadata.")
+            result.append(ranges)
+            offset += count
+        if offset != len(groups):
+            raise ValueError("Qwen3-VL has unmatched vision token groups.")
+        return result
 
     async def _load_videos_async(self, video_data, video_config):
         return await asyncio.gather(
@@ -434,9 +496,9 @@ class QwenVLProcessor(BaseMultimodalProcessor):
             )
         )
 
-    @staticmethod
-    def _build_video_config(request_obj):
-        video_config = {}
+    def _build_video_config(self, request_obj):
+        vision_config = self.hf_config.vision_config
+        video_config = {"factor": int(vision_config.patch_size * vision_config.spatial_merge_size)}
         fps = getattr(request_obj, "fps", None)
         if fps is not None:
             video_config["fps"] = fps
