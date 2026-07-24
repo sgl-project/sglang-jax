@@ -78,6 +78,7 @@ from sgl_jax.srt.managers.tp_worker_overlap_thread import ModelWorkerClient
 from sgl_jax.srt.managers.utils import validate_input_length
 from sgl_jax.srt.mem_cache.base_prefix_cache import MatchPrefixParams
 from sgl_jax.srt.mem_cache.chunk_cache import ChunkCache
+from sgl_jax.srt.mem_cache.common import release_kv_cache
 from sgl_jax.srt.mem_cache.kv_cache_builder import build_kv_cache
 from sgl_jax.srt.mem_cache.radix_cache import RadixKey
 from sgl_jax.srt.mem_cache.swa_radix_cache import SWARadixCache
@@ -449,6 +450,7 @@ class Scheduler(
         if self.chunked_prefill_size <= 0:  # -1 means disable
             self.chunked_prefill_size = None
         self.chunked_reqs = [None] * self.dp_size  # Per-DP chunked requests
+        self._pending_chunked_abort_reqs = [None] * self.dp_size
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and server_args.enable_mixed_chunk
         )
@@ -1053,10 +1055,7 @@ class Scheduler(
                         sum(len(i.reqs) for i in self.running_batch.reqs_info),
                     )
             else:
-                # When the server is idle, do self-check and re-init some states
-                self.check_memory()
-                self.check_tree_cache()
-                self.new_token_ratio = self.init_new_token_ratio
+                self.on_idle()
 
                 # Elegant wait if idle
                 if self._comm_backend is not None:
@@ -1149,10 +1148,7 @@ class Scheduler(
                     tmp_batch, tmp_result, batch.launch_done if batch else None
                 )
             elif batch is None:
-                # When the server is idle, do self-check and re-init some states
-                self.check_memory()
-                self.check_tree_cache()
-                self.new_token_ratio = self.init_new_token_ratio
+                self.on_idle()
 
             self.last_batch = batch
             if _pd_iter_trace:
@@ -1426,6 +1422,7 @@ class Scheduler(
         # state for pause/continue generation
         ret["engine_paused"] = self._engine_paused
         ret["waiting_queue_size"] = len(self.waiting_queue)
+        ret["pending_dp_reqs_size"] = len(self.pending_dp_reqs)
         ret["running_batch_size"] = (
             0 if self.running_batch.is_empty() else self.running_batch.batch_size()
         )
@@ -1438,6 +1435,7 @@ class Scheduler(
         ret["cur_batch_is_none"] = self.cur_batch is None
         ret["last_batch_is_none"] = self.last_batch is None
         ret["chunked_req_is_none"] = all(r is None for r in self.chunked_reqs)
+        ret["chunked_req_rids"] = [r.rid if r is not None else None for r in self.chunked_reqs]
 
         # request cache stat
         if isinstance(self.tree_cache, ChunkCache):
@@ -1459,6 +1457,10 @@ class Scheduler(
 
         # physical kv cache stat
         ret["available_kv_tokens"] = self.token_to_kv_pool_allocator.available_size()
+        ret["available_kv_tokens_per_dp"] = [
+            self.token_to_kv_pool_allocator.available_size(dp_rank)
+            for dp_rank in range(self.dp_size)
+        ]
 
         # counters
         ret["num_generated_tokens"] = self.num_generated_tokens
@@ -1551,6 +1553,7 @@ class Scheduler(
             return 0 if batch.is_empty() else batch.batch_size()
 
         waiting_reqs = len(self.waiting_queue)
+        grammar_reqs = len(self.grammar_queue)
         pending_dp_reqs = len(self.pending_dp_reqs)
         running_reqs = _batch_size(self.running_batch)
         current_batch_reqs = _batch_size(self.cur_batch)
@@ -1560,6 +1563,7 @@ class Scheduler(
 
         has_pending = (
             waiting_reqs > 0
+            or grammar_reqs > 0
             or pending_dp_reqs > 0
             or running_reqs > 0
             or current_batch_reqs > 0
@@ -1571,19 +1575,35 @@ class Scheduler(
         pd_prefill = len(self.disagg_prefill_queue or ())
         pd_prealloc = len(self.disagg_prealloc_queue or ())
         pd_transfer = len(self.disagg_transfer_queue or ())
-        has_pending = has_pending or pd_prefill > 0 or pd_prealloc > 0 or pd_transfer > 0
+        pd_bootstrap = len(self._pd_pending_bootstrap)
+        has_pending = (
+            has_pending or pd_prefill > 0 or pd_prealloc > 0 or pd_transfer > 0 or pd_bootstrap > 0
+        )
 
         if has_pending:
             msg = (
                 "Cache not flushed because there are pending requests. "
-                f"waiting={waiting_reqs}, pending_dp={pending_dp_reqs}, running={running_reqs}, "
+                f"waiting={waiting_reqs}, grammar={grammar_reqs}, "
+                f"pending_dp={pending_dp_reqs}, running={running_reqs}, "
                 f"cur_batch={current_batch_reqs}, last_batch={last_batch_reqs}, "
                 f"chunked={chunked_pending}, pending_results={pending_results}, "
-                f"pd_prefill={pd_prefill}, pd_prealloc={pd_prealloc}, pd_transfer={pd_transfer}"
+                f"pd_prefill={pd_prefill}, pd_prealloc={pd_prealloc}, "
+                f"pd_transfer={pd_transfer}, pd_bootstrap={pd_bootstrap}"
             )
             return False, msg
 
         return True, ""
+
+    def is_fully_idle(self) -> bool:
+        can_flush, _ = self._can_flush_cache()
+        return can_flush
+
+    def on_idle(self):
+        if not self.is_fully_idle():
+            return
+        self.check_memory()
+        self.check_tree_cache()
+        self.new_token_ratio = self.init_new_token_ratio
 
     def flush_cache(self) -> tuple[bool, str, int]:
         can_flush, message = self._can_flush_cache()
@@ -1607,6 +1627,7 @@ class Scheduler(
         )
         self.pending_dp_reqs = []
         self.chunked_reqs = [None] * self.dp_size
+        self._pending_chunked_abort_reqs = [None] * self.dp_size
         if self.enable_overlap:
             self.result_queue = deque()
 
@@ -1742,6 +1763,103 @@ class Scheduler(
             swa_evictable_size,
         )
 
+    def _sync_chunked_req_owners(self) -> None:
+        if self.last_batch and self.last_batch.forward_mode.is_extend():
+            for dp_rank, info in enumerate(self.last_batch.reqs_info):
+                if info.chunked_req is None:
+                    continue
+                active_req = self.chunked_reqs[dp_rank]
+                if active_req is None:
+                    self.chunked_reqs[dp_rank] = info.chunked_req
+                else:
+                    assert (
+                        active_req is info.chunked_req
+                    ), f"Chunked request mismatch for DP rank {dp_rank}"
+
+    def _prepare_chunked_reqs_to_exclude(self) -> dict[int, Req]:
+        """Retain scheduler ownership before removing chunked requests from a batch."""
+        self._sync_chunked_req_owners()
+
+        chunked_req_to_exclude: dict[int, Req] = {}
+        for dp_rank, req in enumerate(self.chunked_reqs):
+            if req is None:
+                continue
+            chunked_req_to_exclude[dp_rank] = req
+            if self._pending_chunked_abort_reqs[dp_rank] is None and len(req.fill_ids) > len(
+                req.prefix_indices
+            ):
+                self.tree_cache.cache_unfinished_req(req)
+        return chunked_req_to_exclude
+
+    def _mark_pending_chunked_aborts(self, recv_req: AbortReq) -> None:
+        if self.pd == "pathways":
+            return
+        for dp_rank, req in enumerate(self.chunked_reqs):
+            if req is None or (not recv_req.abort_all and not req.rid.startswith(recv_req.rid)):
+                continue
+            pending_req = self._pending_chunked_abort_reqs[dp_rank]
+            assert pending_req is None or pending_req is req
+            self._pending_chunked_abort_reqs[dp_rank] = req
+            req.to_finish = FINISH_ABORT()
+
+    def _process_pending_chunked_aborts(self) -> dict[int, Req]:
+        consumed: dict[int, Req] = {}
+        if self.pd == "pathways":
+            return consumed
+        for dp_rank, req in enumerate(self._pending_chunked_abort_reqs):
+            if req is None:
+                continue
+            assert self.chunked_reqs[dp_rank] is req
+            if req.is_chunked > 0:
+                continue
+
+            self._finalize_chunked_abort(req, dp_rank)
+            abort_out = AbortReq(rid=req.rid)
+            if self._comm_backend is not None:
+                self._comm_backend.send_pyobj(abort_out)
+            else:
+                self.send_to_tokenizer.send_pyobj(abort_out)
+            consumed[dp_rank] = req
+        return consumed
+
+    def _retire_chunked_req_batch_owners(self, consumed: dict[int, Req]) -> None:
+        if not consumed or self.last_batch is None or not self.last_batch.forward_mode.is_extend():
+            return
+
+        self.last_batch.filter_batch(chunked_req_to_exclude=consumed)
+        for dp_rank, req in consumed.items():
+            info = self.last_batch.reqs_info[dp_rank]
+            if info.chunked_req is None:
+                continue
+            assert info.chunked_req is req
+            info.chunked_req = None
+
+    def _retract_parked_chunked_reqs(self, retracted_reqs: list[Req]) -> None:
+        if self.pd == "pathways":
+            return
+        retracted_request_ids = {id(req) for req in retracted_reqs}
+        for dp_rank, req in enumerate(self.chunked_reqs):
+            if req is None:
+                continue
+            if id(req) in retracted_request_ids:
+                assert self._pending_chunked_abort_reqs[dp_rank] is None
+                self.chunked_reqs[dp_rank] = None
+                continue
+            assert self._pending_chunked_abort_reqs[dp_rank] is None
+            assert req.is_chunked == 0
+            self._release_prefill_host_buffer(req)
+            release_kv_cache(
+                req,
+                self.tree_cache,
+                is_insert=False,
+                allow_overallocated=(
+                    self.spec_algorithm is not None and not self.spec_algorithm.is_none()
+                ),
+            )
+            self.chunked_reqs[dp_rank] = None
+            req.reset_for_retract()
+            self._add_request_to_queue(req)
+
     def get_next_batch_to_run(self) -> ScheduleBatch | None:
         if self.pd == "pathways":
             return self._pd_get_next_batch_async()
@@ -1755,15 +1873,8 @@ class Scheduler(
                     self.running_batch.merge_batch(self._pd_pending_migrate)
                 self._pd_pending_migrate = None
 
-        # Process chunked requests for each DP rank
-        chunked_req_to_exclude = {}
-        _chunk_tree = self.p_tree if self.pd else self.tree_cache
-        for dp_rank in range(self.dp_size):
-            if self.chunked_reqs[dp_rank] is not None:
-                # Move the chunked request out of the batch so that we can merge
-                # only finished requests to running_batch.
-                chunked_req_to_exclude[dp_rank] = self.chunked_reqs[dp_rank]
-                _chunk_tree.cache_unfinished_req(self.chunked_reqs[dp_rank])
+        chunked_req_to_exclude = self._prepare_chunked_reqs_to_exclude()
+        self._process_pending_chunked_aborts()
 
         # Merge the prefill batch into the running batch
         if self.last_batch and self.last_batch.forward_mode.is_extend():
@@ -1772,14 +1883,9 @@ class Scheduler(
             for dp_rank in range(self.dp_size):
                 info = self.last_batch.reqs_info[dp_rank]
                 if info.chunked_req is not None:
-                    # Verify consistency: info.chunked_req should match self.chunked_reqs[dp_rank]
-                    if dp_rank in chunked_req_to_exclude:
-                        assert (
-                            chunked_req_to_exclude[dp_rank] is info.chunked_req
-                        ), f"Chunked request mismatch for DP rank {dp_rank}"
-                    else:
-                        # This shouldn't happen, but handle it gracefully
-                        chunked_req_to_exclude[dp_rank] = info.chunked_req
+                    assert (
+                        chunked_req_to_exclude.get(dp_rank) is info.chunked_req
+                    ), f"Chunked request owner missing for DP rank {dp_rank}"
 
             # Filter batch
             # Track per-DP batch sizes before filtering
@@ -1920,9 +2026,10 @@ class Scheduler(
 
         # Process existing chunked requests for each DP rank
         for dp_rank in range(self.dp_size):
-            if self.chunked_reqs[dp_rank] is not None:
-                self.chunked_reqs[dp_rank].init_next_round_input()
-                self.chunked_reqs[dp_rank] = adder.add_chunked_req(self.chunked_reqs[dp_rank])
+            req = self.chunked_reqs[dp_rank]
+            if req is not None and self._pending_chunked_abort_reqs[dp_rank] is None:
+                req.init_next_round_input()
+                self.chunked_reqs[dp_rank] = adder.add_chunked_req(req)
 
         # Collect existing LoRA IDs in the running batch if LoRA is enabled
         if self.lora_paths is not None:
@@ -2522,6 +2629,9 @@ class Scheduler(
         self.parent_process.send_signal(signal.SIGQUIT)
 
     def abort_request(self, recv_req: AbortReq):
+        self._sync_chunked_req_owners()
+        self._mark_pending_chunked_aborts(recv_req)
+
         # Delete requests in the waiting queue
         to_del = []
         for i, req in enumerate(self.waiting_queue):
@@ -2617,28 +2727,39 @@ class Scheduler(
                     survivors.append(req)
             self._pd_pending_bootstrap = survivors
 
+        if self._engine_paused:
+            consumed = self._process_pending_chunked_aborts()
+            self._retire_chunked_req_batch_owners(consumed)
+
     def pause_generation(self, recv_req: PauseGenerationReqInput):
         self._engine_paused = True
 
         # finish all in-flight request; in overlap mode, last_batch is running
+        self._sync_chunked_req_owners()
         if self.enable_overlap and self.last_batch:
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
             self.last_batch = None
             self.cur_batch = None
 
+        consumed = self._process_pending_chunked_aborts()
+        self._retire_chunked_req_batch_owners(consumed)
+
         if recv_req.mode == "retract":
             self.running_batch.filter_batch()
             all_reqs = [
                 req for info in self.running_batch.reqs_info for req in info.reqs if info.reqs
             ]
+            retracted_reqs = []
             if len(all_reqs) != 0:
                 # clear the kv cache
                 retracted_reqs = self.running_batch.retract_all(self.server_args)
                 for req in retracted_reqs:
                     self._add_request_to_queue(req)
 
-            self.chunked_reqs = [None] * self.dp_size
+            self._retract_parked_chunked_reqs(retracted_reqs)
+            self.last_batch = None
+            self.cur_batch = None
             logger.info("Paused generation retracted")
         elif recv_req.mode == "in_place":
             logger.info("Paused generation in place")
