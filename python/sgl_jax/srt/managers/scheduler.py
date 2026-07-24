@@ -275,6 +275,23 @@ class Scheduler(
         # Init tokenizer
         self.init_tokenizer()
 
+        if self.enable_overlap and self.spec_algorithm.is_nextn():
+            from sgl_jax.srt.speculative.draft_extend_fused import (
+                _requires_non_overlap_target_verify,
+            )
+
+            if _requires_non_overlap_target_verify(
+                server_args,
+                self.spec_algorithm,
+                self.model_config.hf_config,
+            ):
+                logger.warning(
+                    "Disabling overlap schedule because decode-loop target verify "
+                    "requires non-overlap speculative state."
+                )
+                self.enable_overlap = False
+                server_args.disable_overlap_schedule = True
+
         # Init grammar backend for structured output
         self.grammar_backend = None
         self.grammar_queue: list[Req] = []  # Requests waiting for grammar compilation
@@ -1417,6 +1434,11 @@ class Scheduler(
 
     def get_internal_state(self, recv_req: GetInternalStateReq):
         ret = dict(global_server_args_dict)
+        hf_config = self.model_config.hf_config
+        ret["model_type"] = getattr(hf_config, "model_type", None)
+        ret["model_architectures"] = list(getattr(hf_config, "architectures", None) or [])
+        ret["enable_overlap"] = self.enable_overlap
+        ret["spec_multi_layer"] = self._spec_multi_layer
         ret["last_gen_throughput"] = self.last_gen_throughput
         ret["memory_usage"] = {
             "kvcache": round(self.token_to_kv_pool_allocator.get_kvcache().mem_usage, 2),

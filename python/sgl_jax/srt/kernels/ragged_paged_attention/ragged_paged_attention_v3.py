@@ -1515,7 +1515,7 @@ def get_default_block_sizes(
     num_q_heads_per_kv_head = next_power_of_2(actual_num_q_heads_per_kv_head)
 
     max_q = next_power_of_2(max_num_tokens)
-    max_kv = pages_per_seq * page_size
+    max_kv = max(pages_per_seq * page_size, page_size)
 
     min_bkv_sz_to_peak = 16 * 1024 * 1024 * kv_packing // 4 // head_dim // num_kv_heads_x2
 
@@ -1555,9 +1555,9 @@ def get_default_block_sizes(
 
     bkv_alignment = max(page_size, kv_packing)
     bq_sz = max(1, bq_sz)
-    bkv_sz = align_to(bkv_sz, bkv_alignment)
+    bkv_sz = max(bkv_alignment, align_to(bkv_sz, bkv_alignment))
     bq_csz = max(1, bq_csz)
-    bkv_csz = align_to(bkv_csz, bkv_alignment)
+    bkv_csz = max(bkv_alignment, align_to(bkv_csz, bkv_alignment))
 
     # Reduce block sizes if VMEM estimate exceeds limit.
     # Use 30% of vmem_limit to account for compiler overhead (intermediates,

@@ -274,10 +274,15 @@ suites = {
         TestFile("python/sgl_jax/test/multimodal/test_vae_scheduler.py", 0.2),
         TestFile("python/sgl_jax/test/multimodal/test_flash_attention_kernel.py", 0.1),
         TestFile("python/sgl_jax/test/layers/test_group_rmsnorm.py", 0.1, runner="pytest"),
+        TestFile("python/sgl_jax/test/layers/test_epmoe_swiglu_limit.py", 0.1, runner="pytest"),
         TestFile("test/srt/lora/test_bgmv_backend.py", 7),
         TestFile("test/srt/lora/test_align_lora_accuracy.py", 5.5),
         TestFile("python/sgl_jax/test/kernels/simple_gla_fused_test.py", 1, runner="pytest"),
         TestFile("python/sgl_jax/test/layers/test_merged_column_parallel_linear.py", 0.1),
+        # Plan 4: flash==naive parity (closes flash==HF via naive==HF ∧ flash==naive).
+        TestFile("python/sgl_jax/test/models/test_step3p5_flash_vs_naive.py", 3.0, runner="pytest"),
+        # Plan 4: engine self-consistency skeletons (skip on CPU, run on TPU).
+        TestFile("python/sgl_jax/test/models/test_step3p5_engine.py", 0.5, runner="pytest"),
     ],
     # CPU-only unit tests — moved off arc-runner-v6e-1 to a dedicated
     # CPU runner so they don't consume TPU capacity. Either pure
@@ -311,6 +316,10 @@ suites = {
         TestFile("python/sgl_jax/test/test_compilation_manager.py", 1),
         TestFile("python/sgl_jax/test/test_kernel_utils.py", 1),
         TestFile("python/sgl_jax/test/speculative/test_spec_info.py", 0.2, runner="pytest"),
+        TestFile(
+            "python/sgl_jax/test/speculative/test_decode_loop_helpers.py", 0.1, runner="pytest"
+        ),
+        TestFile("python/sgl_jax/test/kernels/test_rpa_block_sizes.py", 0.1, runner="pytest"),
         TestFile("python/sgl_jax/test/models/test_mimo_v2_nextn.py", 0.2, runner="pytest"),
         TestFile(
             "python/sgl_jax/test/multimodal/test_kimi_k25_weight_mapping.py", 0.2, runner="pytest"
@@ -319,6 +328,22 @@ suites = {
             "python/sgl_jax/test/multimodal/test_stage_config_routing.py", 0.1, runner="pytest"
         ),
         TestFile("python/sgl_jax/test/models/test_qwen3_5.py", 2, runner="pytest"),
+        # step3p5 CPU tests (Plan 2 Tasks 5+6).
+        # Flash==naive / prefill==decode / SWA==full parity is Plan 4 (L1 completion).
+        TestFile("python/sgl_jax/test/models/test_step3p5_skeleton.py", 0.5, runner="pytest"),
+        TestFile("python/sgl_jax/test/models/test_step3p5_attention.py", 1.0, runner="pytest"),
+        TestFile("python/sgl_jax/test/models/test_step3p5_moe.py", 0.5, runner="pytest"),
+        TestFile("python/sgl_jax/test/models/test_step3p5_model.py", 2.0, runner="pytest"),
+        TestFile("python/sgl_jax/test/models/test_step3p5_invariants.py", 1.0, runner="pytest"),
+        TestFile("python/sgl_jax/test/models/test_step3p5_alignment.py", 5.0, runner="pytest"),
+        TestFile("python/sgl_jax/test/models/test_step3p5_nextn.py", 0.2, runner="pytest"),
+        TestFile("python/sgl_jax/test/models/test_weight_loader_assert.py", 0.5, runner="pytest"),
+        TestFile("test/srt/test_step3p5_mtp_e2e.py", 0.2, runner="pytest"),
+        TestFile(
+            "python/sgl_jax/test/utils/test_weight_loader_prestacked_moe.py",
+            0.1,
+            runner="pytest",
+        ),
         TestFile("python/sgl_jax/test/mem_cache/test_req_to_token_pool.py", 1),
         TestFile("python/sgl_jax/test/mem_cache/test_hybrid_req_to_token_pool.py", 1),
         TestFile("python/sgl_jax/test/mem_cache/test_swa_allocator.py", 1),
@@ -420,11 +445,15 @@ suites = {
             8,
             ["TestUnifiedRadixCacheServing"],
         ),
+        # Step 3.5 serving self-consistency (microscale dummy weights, single chip).
+        TestFile("test/srt/test_step3p5_serving_e2e.py", 3, runner="pytest"),
     ],
     "e2e-test-tpu-v6e-4": [
         TestFile("test/srt/openai_server/basic/test_tool_calls.py", 2),
         TestFile("test/srt/test_features.py", 3),
         TestFile("test/srt/test_chunked_prefill_size.py", 2),
+        # Step 3.5 tp/dp invariance (microscale dummy weights, multi-chip).
+        TestFile("test/srt/test_step3p5_tp_dp.py", 3, runner="pytest"),
         # TestFile("test/srt/test_sliding_window_attention.py", 30), # add after gpt-oss supported
         TestFile("test/srt/test_logprobs_dp.py", 3),
         TestFile("test/srt/test_model_loader.py", 1),

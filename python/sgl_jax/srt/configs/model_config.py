@@ -221,6 +221,23 @@ class ModelConfig:
                 ignored = list(self.quantization_config.ignored_layers or [])
                 ignored.extend(["model.eh_proj", "model.mtp_block.self_attn.o_proj"])
                 self.quantization_config.ignored_layers = ignored
+
+        if is_draft_model and self.hf_config.architectures[0] == "Step3p5ForCausalLM":
+            self.hf_config.architectures[0] = "Step3p5MTPForCausalLM"
+            # Each MTP draft runner is a single sliding-window layer; without this
+            # the KV pool sizes for all 45 target layers and OOMs.
+            self.hf_config.num_hidden_layers = 1
+            # MTP layers (45/46/47) use sliding-window attention, whose head config
+            # lives in `attention_other_setting` (not the top-level fields). Override
+            # the KV-sizing fields so the draft KV cache matches the SWA layer.
+            aos = getattr(self.hf_config, "attention_other_setting", None) or {}
+            self.hf_config.num_key_value_heads = aos.get(
+                "num_attention_groups", self.hf_config.num_key_value_heads
+            )
+            self.hf_config.num_attention_heads = aos.get(
+                "num_attention_heads", self.hf_config.num_attention_heads
+            )
+            self.hf_config.head_dim = aos.get("head_dim", self.hf_config.head_dim)
         # Check model type
         self.is_generation = is_generation_model(self.hf_config.architectures, is_embedding)
         self.is_multimodal = False
@@ -800,6 +817,16 @@ class ModelConfig:
             f"tensor parallel size ({tensor_parallel_size}). "
             f"Got remainder: {self.num_attention_heads % tensor_parallel_size}"
         )
+        attention_other_setting = getattr(self.hf_config, "attention_other_setting", None)
+        if attention_other_setting is not None:
+            alternate_num_heads = attention_other_setting.get("num_attention_heads")
+            if alternate_num_heads is not None:
+                assert alternate_num_heads % tensor_parallel_size == 0, (
+                    "Alternate attention head count "
+                    f"({alternate_num_heads}) must be divisible by tensor parallel size "
+                    f"({tensor_parallel_size}). Got remainder: "
+                    f"{alternate_num_heads % tensor_parallel_size}"
+                )
 
     # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
     def _parse_quant_hf_config(self):
