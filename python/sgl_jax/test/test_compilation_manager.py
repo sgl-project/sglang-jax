@@ -307,7 +307,7 @@ class TestDummyBatch(unittest.TestCase):
         assert batch.per_dp_bs_size == 16
         assert batch.real_bs_per_dp == [16, 16, 16, 16]
 
-    def test_multimodal_capture_hidden(self):
+    def test_multistage_capture_hidden(self):
         cm = CompilationManager(
             server_args=_make_server_args(),
             max_padded_batch_size=32,
@@ -317,7 +317,7 @@ class TestDummyBatch(unittest.TestCase):
             page_size=128,
             max_req_len=4096,
             vocab_size=32000,
-            multimodal=True,
+            capture_hidden_states=True,
         )
         batch = cm._make_dummy_batch(32, 128, ForwardMode.EXTEND, 512)
         assert batch.capture_hidden_mode == CaptureHiddenMode.FULL

@@ -36,7 +36,8 @@ class CompilationManager:
         page_size: int,
         max_req_len: int,
         vocab_size: int,
-        multimodal: bool = False,
+        precompile_in_model_vision: bool = False,
+        capture_hidden_states: bool = False,
         has_recurrent_state: bool = False,
         moe_backend: str | None = None,
     ):
@@ -47,7 +48,8 @@ class CompilationManager:
         self.max_padded_batch_size = max_padded_batch_size
         self.max_padded_num_tokens = max_padded_num_tokens
         self.vocab_size = vocab_size
-        self.multimodal = multimodal
+        self.precompile_in_model_vision = precompile_in_model_vision
+        self.capture_hidden_states = capture_hidden_states
         self.has_recurrent_state = has_recurrent_state
         # Callers pass the *effective* backend (ModelConfig.moe_backend), which
         # resolves architectures that hard-code FusedEPMoE (e.g. Qwen3.5) to
@@ -128,7 +130,7 @@ class CompilationManager:
         self._precompile_extend(
             forward_fn, model_runner, mesh, prepare_lora_fn, future_token_ids_map
         )
-        if self.multimodal:
+        if self.precompile_in_model_vision:
             self._precompile_vision(model_runner, mesh)
         self._precompile_decode(
             forward_fn, model_runner, mesh, prepare_lora_fn, future_token_ids_map
@@ -441,7 +443,7 @@ class CompilationManager:
             logits_indices=logits_indices,
             input_logprob_indices=None,
             capture_hidden_mode=(
-                CaptureHiddenMode.FULL if self.multimodal else CaptureHiddenMode.NULL
+                CaptureHiddenMode.FULL if self.capture_hidden_states else CaptureHiddenMode.NULL
             ),
             spec_algorithm=spec_algorithm_value,
             lora_ids=lora_ids,
