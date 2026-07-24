@@ -24,7 +24,6 @@ from sgl_jax.srt.layers.routed_experts_capturer import (
 )
 from sgl_jax.srt.layers.sampler import Sampler, compute_logprobs
 from sgl_jax.srt.lora.context_manager import LoraBatchContext
-from sgl_jax.srt.managers.mm_utils import general_mm_embed_routine
 from sgl_jax.srt.managers.schedule_batch import (
     GLOBAL_SERVER_ARGS_KEYS,
     global_server_args_dict,
@@ -38,6 +37,7 @@ from sgl_jax.srt.model_executor.model_runner_kv_cache_mixin import (
     _build_non_hybrid_memory_pools,
 )
 from sgl_jax.srt.model_loader.loader import get_model_loader
+from sgl_jax.srt.multimodal.in_model.host_orchestration import general_mm_embed_routine
 from sgl_jax.srt.precision_tracer import precision_tracer
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 from sgl_jax.srt.server_args import ServerArgs

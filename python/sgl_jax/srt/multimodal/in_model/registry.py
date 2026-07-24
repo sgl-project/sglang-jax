@@ -2,8 +2,8 @@
 
 The registry is deliberately modality-agnostic: it stores a factory that turns a
 :class:`ModelConfig` into an object exposing ``build(reqs_info, dp_size,
-per_dp_token, tp_size)``. Vision models register through
-``vision_plan_builder.register_vision_encoder``; this module never sees their
+per_dp_token, tp_size)``. Encoder models register through
+``encoder_plan_builder.register_encoder``; this module never sees their
 modality-specific details.
 """
 
@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 if TYPE_CHECKING:
     from sgl_jax.srt.configs.model_config import ModelConfig
     from sgl_jax.srt.managers.schedule_batch import ScheduleReqsInfo
-    from sgl_jax.srt.multimodal.common.mm_plan import MultimodalEmbedPlan
+    from sgl_jax.srt.multimodal.in_model.plan import MultimodalEmbedPlan
 
 
 class InModelPlanBuilder(Protocol):
@@ -37,7 +37,7 @@ def register_in_model_plan_builder(arch: str, factory: Any) -> None:
 
 def resolve_in_model_plan_builder(
     model_config: ModelConfig,
-    patch_buckets: Any | None = None,
+    input_buckets: Any | None = None,
     merge_buckets: Any | None = None,
 ) -> InModelPlanBuilder | None:
     hf_config = getattr(model_config, "hf_config", None)
@@ -47,9 +47,9 @@ def resolve_in_model_plan_builder(
         return None
     builder = factory(model_config)
     # Bucket kwargs are optional so text-only builders (which never define these
-    # attributes) stay untouched; vision builders pad patch_k/merge to them.
-    if patch_buckets is not None and hasattr(builder, "patch_buckets"):
-        builder.patch_buckets = tuple(patch_buckets)
+    # attributes) stay untouched; encoder builders pad input_capacity/merge to them.
+    if input_buckets is not None and hasattr(builder, "input_buckets"):
+        builder.input_buckets = tuple(input_buckets)
     if merge_buckets is not None and hasattr(builder, "merge_buckets"):
         builder.merge_buckets = tuple(merge_buckets)
     return builder

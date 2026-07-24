@@ -31,7 +31,6 @@ from jax._src import mesh as mesh_lib
 
 from sgl_jax.global_config import global_config
 from sgl_jax.srt.configs.model_config import ModelConfig
-from sgl_jax.srt.managers.mm_utils import build_mm_embed_plan
 from sgl_jax.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
@@ -52,8 +51,9 @@ from sgl_jax.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPo
 from sgl_jax.srt.mem_cache.radix_cache import RadixKey
 from sgl_jax.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
-from sgl_jax.srt.multimodal.common.mm_plan import MultimodalEmbedPlan
 from sgl_jax.srt.multimodal.common.modality_enum import MultimodalInputs
+from sgl_jax.srt.multimodal.in_model.host_orchestration import build_mm_embed_plan
+from sgl_jax.srt.multimodal.in_model.plan import MultimodalEmbedPlan
 from sgl_jax.srt.multimodal.layers.vision_sharding import (
     encode_lane_count,
     resolve_encoder_tp,
@@ -3103,7 +3103,7 @@ class ScheduleBatch:
                 tp_size=encode_lane_count(self.mesh, encoder_tp),
                 # Pad encode inputs and use the configured fixed output capacity;
                 # token routing itself follows per_dp_token_padding.
-                patch_buckets=resolve_vision_patch_buckets(
+                input_buckets=resolve_vision_patch_buckets(
                     global_server_args_dict.get("precompile_vision_patch_paddings")
                 ),
                 merge_buckets=resolve_vision_merge_buckets(

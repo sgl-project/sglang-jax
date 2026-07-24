@@ -4,9 +4,9 @@ Split out of the main model file ``models/qwen2_5_vl.py`` but still Qwen2.5-VL
 arch code. The main model file imports and calls
 ``register_qwen25vl_vision_encoder()`` at top level, which registers a
 :class:`Qwen25VLVisionEncoderPlugin` with
-``multimodal/common/vision_plan_builder`` so that ``ModelRegistry`` loading
+``multimodal/common/encoder_plan_builder`` so that ``ModelRegistry`` loading
 Qwen2.5-VL wires in the encoder. The plugin subclasses the framework's
-``VisionEncoderPlugin`` base; the main model file only consumes the produced
+``EncoderPlugin`` base; the main model file only consumes the produced
 ``meta`` in its ViT encode body.
 """
 
@@ -17,16 +17,16 @@ import numpy as np
 from jax.tree_util import register_pytree_node_class
 
 from sgl_jax.srt.multimodal.common.modality_enum import Modality, MultimodalDataItem
-from sgl_jax.srt.multimodal.common.vision_plan_builder import (
-    VisionEncoderPlugin,
-    register_vision_encoder,
+from sgl_jax.srt.multimodal.in_model.encoder_planning import (
+    EncoderPlugin,
+    register_encoder,
 )
 
 
 @register_pytree_node_class
 @dataclass
 class Qwen25VLVisionMetadata:
-    """Qwen2.5-VL ViT aux for one DP encode round.
+    """Qwen2.5-VL ViT aux for one encode round.
 
     Common code treats this as an opaque pytree. The Qwen ViT encode body reads
     the concrete fields, in flatten order:
@@ -85,8 +85,8 @@ def _placeholder_rows(item) -> int:
     return sum(int(end) - int(start) for start, end in item.placeholder_ranges or [])
 
 
-class Qwen25VLVisionEncoderPlugin(VisionEncoderPlugin):
-    """Qwen2.5-VL implementation of the framework ``VisionEncoderPlugin``.
+class Qwen25VLVisionEncoderPlugin(EncoderPlugin):
+    """Qwen2.5-VL implementation of the framework ``EncoderPlugin``.
 
     Most of the body is host-side ViT metadata math (rotary / window index /
     padding); the class also supplies the plugin shape constants
@@ -95,11 +95,14 @@ class Qwen25VLVisionEncoderPlugin(VisionEncoderPlugin):
     plugin owns the Qwen metadata roles and their padding semantics.
 
     - ``get_metadata(items)`` consumes one request's image items and returns
-      request-level metadata without a DP axis.
-    - ``stack_metadata(lane_metadata, patch_k)`` consumes one native metadata object per
-      DP rank (or ``None`` for a dummy lane) and returns a pad-stacked metadata
-      pytree for one encode round.
+      metadata for that single lane.
+    - ``pad_metadata(meta, input_capacity)`` pads one lane's native metadata to
+      the round's patch-row capacity; the framework fills empty lanes with
+      ``dummy_metadata`` and stacks the padded lanes itself.
     """
+
+    # Image and video items feed the vision encoder.
+    input_modalities = (Modality.IMAGE, Modality.MULTI_IMAGES, Modality.VIDEO)
 
     # Merged encoder rows land under the image modality.
     output_modality = Modality.IMAGE
@@ -254,22 +257,22 @@ class Qwen25VLVisionEncoderPlugin(VisionEncoderPlugin):
             cu_image_seqlens=np.asarray([expected_patch_rows], dtype=np.int32),
         )
 
-    def dummy_metadata(self, patch_k: int) -> Qwen25VLVisionMetadata:
-        """Valid single-image metadata for a synthetic grid of exactly ``patch_k``
+    def dummy_metadata(self, input_capacity: int) -> Qwen25VLVisionMetadata:
+        """Valid single-image metadata for a synthetic grid of exactly ``input_capacity``
         patches, used to warm ``encode_jit`` during precompile.
 
-        The grid ``(t=1, h=sms, w=patch_k // sms)`` yields ``patch_k`` patches with
+        The grid ``(t=1, h=sms, w=input_capacity // sms)`` yields ``input_capacity`` patches with
         both spatial dims divisible by ``spatial_merge_size``, so the produced
         metadata drives the real ViT encode path (no degenerate zero-length
         window/image boundaries).
         """
         sms = self.spatial_merge_size
-        if patch_k <= 0 or patch_k % self.spatial_merge_unit != 0:
+        if input_capacity <= 0 or input_capacity % self.spatial_merge_unit != 0:
             raise ValueError(
                 "Qwen2.5-VL dummy patch bucket must be a positive multiple of "
-                f"spatial_merge_unit={self.spatial_merge_unit}, got patch_k={patch_k}."
+                f"spatial_merge_unit={self.spatial_merge_unit}, got input_capacity={input_capacity}."
             )
-        t, h, w = 1, sms, patch_k // sms
+        t, h, w = 1, sms, input_capacity // sms
         window_index, cu_window_seqlens = self._window_index_thw(t, h, w)
         rope_units = self._rotary_pos_emb_thw(t, h, w)
         rope = rope_units[window_index, :, :].reshape(-1, self.rot_dim).astype(np.float32)
@@ -277,7 +280,7 @@ class Qwen25VLVisionEncoderPlugin(VisionEncoderPlugin):
             window_index=window_index.astype(np.int32),
             cu_window_seqlens=cu_window_seqlens.astype(np.int32),
             rotary_pos_emb=rope,
-            cu_image_seqlens=np.asarray([patch_k], dtype=np.int32),
+            cu_image_seqlens=np.asarray([input_capacity], dtype=np.int32),
         )
 
     def _pack_request_metadata(self, per_img_metas) -> Qwen25VLVisionMetadata:
@@ -288,7 +291,7 @@ class Qwen25VLVisionEncoderPlugin(VisionEncoderPlugin):
                 in the same order as the request's concatenated patch features.
 
         Returns:
-            Request-level metadata without a DP axis. Shapes are
+            Request-level metadata for one lane. Shapes are
             ``window_index=[sum_units]``, ``cu_window_seqlens=[sum_windows]``,
             ``rotary_pos_emb=[sum_patches, rot_dim]``, and
             ``cu_image_seqlens=[num_images]``.
@@ -324,103 +327,85 @@ class Qwen25VLVisionEncoderPlugin(VisionEncoderPlugin):
             cu_image_seqlens=np.asarray(cu_image_seqlens, dtype=np.int32),
         )
 
-    def stack_metadata(self, lane_metadata, patch_k):
-        """Pad and stack native per-rank metadata for one encode round.
+    def pad_metadata(self, meta, input_capacity):
+        """Pad one lane's native metadata to ``input_capacity`` patch rows.
 
-        ``lane_metadata[r]`` is this rank's round-k native-size
-        :class:`Qwen25VLVisionMetadata`, or ``None`` for a dummy lane (rank owns
-        no image in this round). ``patch_k`` is the round's cross-rank patch-row
-        bucket and is used as the sentinel for cumulative boundaries.
+        Single-lane only; the framework fills empty lanes with
+        :meth:`dummy_metadata` and stacks lanes itself.
 
         Padding contract:
         - ``window_index`` stays a valid permutation via identity tail padding.
-        - cumulative-boundary arrays are padded to ``patch_k / spatial_merge_unit``;
+        - cumulative-boundary arrays are padded to ``input_capacity / spatial_merge_unit``;
           every window/image contains at least one merge unit, so this is a
           shape-stable upper bound independent of aspect ratio and image count.
-        - ``cu_window_seqlens`` uses ``patch_k`` sentinel tail padding.
-        - ``rotary_pos_emb`` uses zero row padding to ``patch_k``.
-        - ``cu_image_seqlens`` uses ``patch_k`` sentinel tail padding.
+        - ``cu_window_seqlens`` uses ``input_capacity`` sentinel tail padding.
+        - ``rotary_pos_emb`` uses zero row padding to ``input_capacity``.
+        - ``cu_image_seqlens`` uses ``input_capacity`` sentinel tail padding.
         """
-        if patch_k % self.spatial_merge_unit != 0:
+        if input_capacity % self.spatial_merge_unit != 0:
             raise ValueError(
                 "Qwen2.5-VL metadata patch bucket must be divisible by "
-                f"spatial_merge_unit={self.spatial_merge_unit}, got patch_k={patch_k}."
+                f"spatial_merge_unit={self.spatial_merge_unit}, got input_capacity={input_capacity}."
             )
-
-        present = [m for m in lane_metadata if m is not None]
-        if not present:
-            raise ValueError("Qwen2.5-VL stack_metadata requires at least one real metadata lane.")
-        units_k = patch_k // self.spatial_merge_unit
+        units_k = input_capacity // self.spatial_merge_unit
         boundary_k = units_k
-        rot_dim = int(present[0].rotary_pos_emb.shape[-1])
-        window_indices, cu_window_seqlens_rows, rotary_rows, cu_image_rows = [], [], [], []
-        for m in lane_metadata:
-            if m is None:  # dummy lane
-                window_indices.append(np.arange(units_k, dtype=np.int32))  # identity perm
-                cu_window_seqlens_rows.append(np.full(boundary_k, patch_k, dtype=np.int32))
-                rotary_rows.append(np.zeros((patch_k, rot_dim), dtype=np.float32))
-                cu_image_rows.append(np.full(boundary_k, patch_k, dtype=np.int32))
-            else:
-                # window_index: true values + arange continuation for the pad tail.
-                w = np.arange(units_k, dtype=np.int32)
-                n_units = int(m.window_index.shape[0])
-                # Defensive for direct calls with undersized patch_k; scheduler
-                # normally derives patch_k from the same round's patch features.
-                if n_units > units_k:
-                    raise ValueError(
-                        "Qwen2.5-VL window_index exceeds patch bucket: "
-                        f"n_units={n_units}, units_k={units_k}."
-                    )
-                w[:n_units] = np.asarray(m.window_index, dtype=np.int32)
-                # cu_window_seqlens: true values + patch_k sentinel tail.
-                n_win = int(m.cu_window_seqlens.shape[0])
-                if n_win > boundary_k:
-                    raise ValueError(
-                        "Qwen2.5-VL window boundary count exceeds patch bucket capacity: "
-                        f"n_win={n_win}, boundary_k={boundary_k}."
-                    )
-                c = np.full(boundary_k, patch_k, dtype=np.int32)
-                c[:n_win] = np.asarray(m.cu_window_seqlens, dtype=np.int32)
-                # rotary_pos_emb: true rows + zero pad to patch_k.
-                r = np.zeros((patch_k, rot_dim), dtype=np.float32)
-                rp = np.asarray(m.rotary_pos_emb, dtype=np.float32)
-                # Defensive for direct calls with undersized patch_k; scheduler
-                # normally derives patch_k from the same round's patch features.
-                if rp.shape[0] > patch_k:
-                    raise ValueError(
-                        "Qwen2.5-VL rotary rows exceed patch bucket: "
-                        f"rows={rp.shape[0]}, patch_k={patch_k}."
-                    )
-                r[: rp.shape[0]] = rp
-                # cu_image_seqlens: true per-image ends + patch_k sentinel tail.
-                n_img = int(m.cu_image_seqlens.shape[0])
-                if n_img > boundary_k:
-                    raise ValueError(
-                        "Qwen2.5-VL image boundary count exceeds patch bucket capacity: "
-                        f"n_img={n_img}, boundary_k={boundary_k}."
-                    )
-                ci = np.full(boundary_k, patch_k, dtype=np.int32)
-                ci[:n_img] = np.asarray(m.cu_image_seqlens, dtype=np.int32)
-                window_indices.append(w)
-                cu_window_seqlens_rows.append(c)
-                rotary_rows.append(r)
-                cu_image_rows.append(ci)
-        return Qwen25VLVisionMetadata(
-            np.stack(window_indices),
-            np.stack(cu_window_seqlens_rows),
-            np.stack(rotary_rows),
-            np.stack(cu_image_rows),
-        )
+        rot_dim = int(meta.rotary_pos_emb.shape[-1])
 
-    def get_num_output_tokens(self, num_input_patches: int) -> int:
-        if num_input_patches % self.spatial_merge_unit != 0:
+        # window_index: true values + arange continuation for the pad tail.
+        w = np.arange(units_k, dtype=np.int32)
+        n_units = int(meta.window_index.shape[0])
+        # Defensive for direct calls with undersized input_capacity; scheduler
+        # normally derives input_capacity from the same round's patch features.
+        if n_units > units_k:
+            raise ValueError(
+                "Qwen2.5-VL window_index exceeds patch bucket: "
+                f"n_units={n_units}, units_k={units_k}."
+            )
+        w[:n_units] = np.asarray(meta.window_index, dtype=np.int32)
+
+        # cu_window_seqlens: true values + input_capacity sentinel tail.
+        n_win = int(meta.cu_window_seqlens.shape[0])
+        if n_win > boundary_k:
+            raise ValueError(
+                "Qwen2.5-VL window boundary count exceeds patch bucket capacity: "
+                f"n_win={n_win}, boundary_k={boundary_k}."
+            )
+        c = np.full(boundary_k, input_capacity, dtype=np.int32)
+        c[:n_win] = np.asarray(meta.cu_window_seqlens, dtype=np.int32)
+
+        # rotary_pos_emb: true rows + zero pad to input_capacity.
+        r = np.zeros((input_capacity, rot_dim), dtype=np.float32)
+        rp = np.asarray(meta.rotary_pos_emb, dtype=np.float32)
+        # Defensive for direct calls with undersized input_capacity; scheduler
+        # normally derives input_capacity from the same round's patch features.
+        if rp.shape[0] > input_capacity:
+            raise ValueError(
+                "Qwen2.5-VL rotary rows exceed patch bucket: "
+                f"rows={rp.shape[0]}, input_capacity={input_capacity}."
+            )
+        r[: rp.shape[0]] = rp
+
+        # cu_image_seqlens: true per-image ends + input_capacity sentinel tail.
+        n_img = int(meta.cu_image_seqlens.shape[0])
+        if n_img > boundary_k:
+            raise ValueError(
+                "Qwen2.5-VL image boundary count exceeds patch bucket capacity: "
+                f"n_img={n_img}, boundary_k={boundary_k}."
+            )
+        ci = np.full(boundary_k, input_capacity, dtype=np.int32)
+        ci[:n_img] = np.asarray(meta.cu_image_seqlens, dtype=np.int32)
+
+        return Qwen25VLVisionMetadata(w, c, r, ci)
+
+    def get_num_output_tokens(self, input_len: int) -> int:
+        if input_len % self.spatial_merge_unit != 0:
             raise ValueError(
                 "Qwen2.5-VL input patch count must be divisible by spatial_merge_unit, "
-                f"got num_input_patches={num_input_patches}, "
+                f"got input_len={input_len}, "
                 f"unit={self.spatial_merge_unit}."
             )
-        return num_input_patches // self.spatial_merge_unit
+        return input_len // self.spatial_merge_unit
 
 
 def register_qwen25vl_vision_encoder() -> None:
-    register_vision_encoder("Qwen2_5_VLForConditionalGeneration", Qwen25VLVisionEncoderPlugin)
+    register_encoder("Qwen2_5_VLForConditionalGeneration", Qwen25VLVisionEncoderPlugin)

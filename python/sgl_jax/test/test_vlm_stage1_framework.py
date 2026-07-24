@@ -8,9 +8,7 @@ import numpy as np
 import pytest
 from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec
 
-from sgl_jax.srt.managers import mm_utils
 from sgl_jax.srt.managers.io_struct import GenerateReqInput
-from sgl_jax.srt.managers.mm_utils import build_mm_embed_plan, merge_jit
 from sgl_jax.srt.managers.schedule_batch import (
     ModelWorkerBatch,
     ScheduleBatch,
@@ -26,25 +24,31 @@ from sgl_jax.srt.models.qwen2_5_vl import (
     _segment_ids_from_cu_seqlens,
     _vision_attention,
 )
-from sgl_jax.srt.models.vision_metadata.qwen2_5_vl import (
-    Qwen25VLVisionEncoderPlugin,
-    Qwen25VLVisionMetadata,
-)
-from sgl_jax.srt.multimodal.common import mm_plan
-from sgl_jax.srt.multimodal.common.in_model_plan_builder import (
-    register_in_model_plan_builder,
-    resolve_in_model_plan_builder,
-)
 from sgl_jax.srt.multimodal.common.modality_enum import (
     Modality,
     MultimodalDataItem,
     MultimodalInputs,
 )
-from sgl_jax.srt.multimodal.common.vision_plan_builder import (
-    InModelVisionPlanBuilder,
+from sgl_jax.srt.multimodal.in_model import host_orchestration
+from sgl_jax.srt.multimodal.in_model import plan as mm_plan
+from sgl_jax.srt.multimodal.in_model.encoder_planning import (
+    EncodeInputs,
+    InModelEncoderPlanBuilder,
     MergeSlice,
-    VisionEncodeInputs,
     _ceil_to_bucket,
+    _stack_metadata,
+)
+from sgl_jax.srt.multimodal.in_model.encoders.qwen2_5_vl import (
+    Qwen25VLVisionEncoderPlugin,
+    Qwen25VLVisionMetadata,
+)
+from sgl_jax.srt.multimodal.in_model.host_orchestration import (
+    build_mm_embed_plan,
+    merge_jit,
+)
+from sgl_jax.srt.multimodal.in_model.registry import (
+    register_in_model_plan_builder,
+    resolve_in_model_plan_builder,
 )
 from sgl_jax.srt.multimodal.layers.attention.flash_attention_backend import (
     VisionFlashAttentionBackend,
@@ -173,8 +177,8 @@ def _host_plan(dp=1, tp=1, patches=4, tokens=2, mask=False):
     metadata = jax.tree.map(lambda x: np.asarray(x).reshape(dp, tp, *x.shape[1:]), metadata)
     return {
         Modality.IMAGE: mm_plan.ModalityEmbedBatch(
-            encode_inputs=VisionEncodeInputs(
-                patches=np.ones((dp, tp, patches, 1), dtype=np.float32),
+            encode_inputs=EncodeInputs(
+                features=np.ones((dp, tp, patches, 1), dtype=np.float32),
                 valid=np.full((dp, tp), patches, dtype=np.int32),
                 meta=metadata,
             ),
@@ -227,7 +231,7 @@ def test_plan_builder_registry():
     config = SimpleNamespace(hf_config=SimpleNamespace(architectures=["TestArchitecture"]))
     assert isinstance(resolve_in_model_plan_builder(config), Builder)
     assert resolve_in_model_plan_builder(_model_config(arch="MissingArchitecture")) is None
-    assert isinstance(resolve_in_model_plan_builder(_model_config()), InModelVisionPlanBuilder)
+    assert isinstance(resolve_in_model_plan_builder(_model_config()), InModelEncoderPlanBuilder)
 
 
 @jax.tree_util.register_pytree_node_class
@@ -273,9 +277,9 @@ def test_embed_mm_inputs_accepts_opaque_encoder_inputs(monkeypatch):
         assert features.shape == (1, 2, 4, 2)
         return running
 
-    monkeypatch.setattr(mm_utils, "merge_jit", merge)
+    monkeypatch.setattr(host_orchestration, "merge_jit", merge)
     running = jnp.zeros((1, 2), dtype=jnp.float32)
-    result = mm_utils.embed_mm_inputs(
+    result = host_orchestration.embed_mm_inputs(
         {Modality.AUDIO: batch},
         jnp.array([1]),
         lambda _: running,
@@ -309,7 +313,7 @@ def test_flatten_device_batch_preserves_explicit_sharding(logical_tp, input_spec
     out_sharding = NamedSharding(mesh, output_spec)
 
     with jax.set_mesh(mesh):
-        output = mm_utils._flatten_device_batch(
+        output = host_orchestration._flatten_device_batch(
             values,
             out_sharding=out_sharding,
         )
@@ -326,8 +330,8 @@ def test_plan_balances_images_across_tp_lanes():
     )
     batch = _plan(items, config=_vision_config(), tp_size=2)[Modality.IMAGE]
     np.testing.assert_array_equal(batch.encode_inputs.valid, [[10, 10]])
-    np.testing.assert_array_equal(batch.encode_inputs.patches[0, 0, :, 0], [*range(8), 18, 19])
-    np.testing.assert_array_equal(batch.encode_inputs.patches[0, 1, :, 0], range(8, 18))
+    np.testing.assert_array_equal(batch.encode_inputs.features[0, 0, :, 0], [*range(8), 18, 19])
+    np.testing.assert_array_equal(batch.encode_inputs.features[0, 1, :, 0], range(8, 18))
     _assert_lane(batch.merge, 0, 0, [*range(8), 18, 19], range(10))
     _assert_lane(batch.merge, 0, 1, range(8, 18), range(10))
 
@@ -378,7 +382,7 @@ def test_plan_pads_uneven_dp_ranks():
         12,
     )
     batch = plan[Modality.IMAGE]
-    assert batch.encode_inputs.patches.shape == (2, 1, 32, 1)
+    assert batch.encode_inputs.features.shape == (2, 1, 32, 1)
     np.testing.assert_array_equal(batch.encode_inputs.valid, [[24], [32]])
     _assert_lane(batch.merge, 0, 0, [0, 1, 3, 4, 5, 6], range(6))
     _assert_lane(batch.merge, 1, 0, [1, 2, 4, 5, 7, 8, 9, 10], range(8))
@@ -439,9 +443,9 @@ def test_metadata_packs_image_boundaries():
 
 
 def test_metadata_stacks_real_and_dummy_lanes():
-    builder = _plugin()
-    metadata = builder.get_metadata(_items([(1, 2, 4), (1, 4, 4)], [(0, 2), (2, 6)]))
-    stacked = builder.stack_metadata([metadata, None], patch_k=24)
+    plugin = _plugin()
+    metadata = plugin.get_metadata(_items([(1, 2, 4), (1, 4, 4)], [(0, 2), (2, 6)]))
+    stacked = _stack_metadata(plugin, [metadata, None], 24)
     assert jax.tree.map(np.shape, stacked) == Qwen25VLVisionMetadata(
         (2, 6), (2, 6), (2, 24, 40), (2, 6)
     )
@@ -465,13 +469,13 @@ def test_metadata_validates_grid_counts(feature_rows, ranges, match):
         _plugin().get_metadata([item])
 
 
-def test_metadata_validates_stack_inputs():
-    builder = _plugin()
-    metadata = builder.get_metadata(_items([(1, 2, 4)], [(0, 2)]))
-    with pytest.raises(ValueError, match="at least one real"):
-        builder.stack_metadata([None], patch_k=0)
+def test_metadata_validates_pad_inputs():
+    plugin = _plugin()
+    metadata = plugin.get_metadata(_items([(1, 2, 4)], [(0, 2)]))
+    with pytest.raises(ValueError, match="positive"):
+        plugin.dummy_metadata(0)
     with pytest.raises(ValueError, match="divisible"):
-        builder.stack_metadata([metadata], patch_k=10)
+        plugin.pad_metadata(metadata, 10)
 
 
 class _NaiveSegmentAttention:
@@ -494,8 +498,8 @@ def test_packed_attention_is_block_diagonal():
     features = np.arange(1, 8, dtype=np.float32).reshape(7, 1)
     packed_items = _build_items(features, [(1, 2, 2), (1, 1, 3)], [(0, 4), (4, 7)])
     single_items = _build_items(features[:4], [(1, 2, 2)], [(0, 4)])
-    packed_meta = builder.stack_metadata([builder.get_metadata(packed_items)], 7)
-    single_meta = builder.stack_metadata([builder.get_metadata(single_items)], 4)
+    packed_meta = _stack_metadata(builder, [builder.get_metadata(packed_items)], 7)
+    single_meta = _stack_metadata(builder, [builder.get_metadata(single_items)], 4)
 
     def compute(value, metadata):
         return visual._compute(
@@ -691,7 +695,10 @@ def test_device_put_plan_shards_lane_axes():
 
 @pytest.mark.parametrize(
     ("arch", "chunked", "radix", "mixed_chunk"),
-    [(ARCH, 4096, False, True), ("UnsupportedVLM", -1, True, False)],
+    [
+        (ARCH, 4096, False, True),
+        ("UnsupportedVLM", -1, True, False),
+    ],
 )
 def test_multimodal_defaults_follow_capabilities(arch, chunked, radix, mixed_chunk):
     args = SimpleNamespace(
@@ -819,9 +826,9 @@ def test_multimodal_item_reads_common_and_model_fields():
 
 def _dummy_builder():
     config = _qwen_config(in_channels=3, temporal_patch_size=2)
-    return InModelVisionPlanBuilder(
+    return InModelEncoderPlanBuilder(
         _plugin(config),
-        patch_buckets=[256, 1024],
+        input_buckets=[256, 1024],
         merge_buckets=[64, 256],
     )
 
@@ -830,7 +837,7 @@ def _dummy_builder():
 def test_dummy_plan_uses_bucketed_shapes(tp, patches, tokens):
     builder = _dummy_builder()
     batch = builder.dummy_plan(1, tp, patches, tokens)[Modality.IMAGE]
-    assert batch.encode_inputs.patches.shape == (1, tp, patches, builder.plugin.feature_dim)
+    assert batch.encode_inputs.features.shape == (1, tp, patches, builder.plugin.feature_dim)
     assert batch.merge.mask.shape == (1, tp, tokens)
     assert batch.source_capacity == 256
     assert not batch.merge.mask.any()

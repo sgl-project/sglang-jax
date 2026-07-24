@@ -153,15 +153,17 @@ class CompilationManager:
         import jax
         from jax.sharding import NamedSharding, PartitionSpec
 
-        from sgl_jax.srt.managers.mm_utils import general_mm_embed_routine
         from sgl_jax.srt.model_executor.forward_batch_info import _device_put_embed_plan
-        from sgl_jax.srt.multimodal.common.in_model_plan_builder import (
+        from sgl_jax.srt.multimodal.in_model.host_orchestration import (
+            general_mm_embed_routine,
+        )
+        from sgl_jax.srt.multimodal.in_model.registry import (
             resolve_in_model_plan_builder,
         )
 
         builder = resolve_in_model_plan_builder(
             model_runner.model_config,
-            patch_buckets=self.vision_patch_buckets,
+            input_buckets=self.vision_patch_buckets,
             merge_buckets=self.vision_merge_buckets,
         )
         if builder is None or not hasattr(builder, "dummy_plan"):

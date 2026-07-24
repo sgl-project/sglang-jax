@@ -9,11 +9,9 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import NamedSharding, PartitionSpec
 
-from sgl_jax.srt.multimodal.common.in_model_plan_builder import (
-    resolve_in_model_plan_builder,
-)
-from sgl_jax.srt.multimodal.common.mm_plan import MultimodalEmbedPlan
 from sgl_jax.srt.multimodal.common.modality_enum import Modality, MultimodalInputs
+from sgl_jax.srt.multimodal.in_model.plan import MultimodalEmbedPlan
+from sgl_jax.srt.multimodal.in_model.registry import resolve_in_model_plan_builder
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -59,19 +57,19 @@ def build_mm_embed_plan(
     model_config: ModelConfig,
     per_dp_token: int,
     tp_size: int = 1,
-    patch_buckets: Sequence[int] | None = None,
+    input_buckets: Sequence[int] | None = None,
     merge_buckets: Sequence[int] | None = None,
 ) -> MultimodalEmbedPlan | None:
     """Build an multimodal encode/merge plan.
 
-    ``patch_buckets`` pads encoder inputs; ``merge_buckets`` is retained as the
+    ``input_buckets`` pads encoder inputs; ``merge_buckets`` is retained as the
     configured encoder-output capacity list. Routing itself is padded to
     ``per_dp_token`` and has no independent shape bucket.
     """
     if not _has_in_model_multimodal_inputs(reqs_info):
         return None
     builder = resolve_in_model_plan_builder(
-        model_config, patch_buckets=patch_buckets, merge_buckets=merge_buckets
+        model_config, input_buckets=input_buckets, merge_buckets=merge_buckets
     )
     if builder is None:
         return None
@@ -162,11 +160,13 @@ def _pad_features_jit(features: jax.Array, capacity: int) -> jax.Array:
 
 
 def embed_mm_inputs(
-    mm_embed_plan: MultimodalEmbedPlan,
-    input_ids: jax.Array,
-    input_embedding: Callable[[jax.Array], jax.Array],
-    multimodal_model: _MultimodalModel,
-) -> jax.Array:
+    mm_embed_plan,
+    input_ids,
+    input_embedding,
+    multimodal_model,
+    *,
+    return_deepstack=False,
+):
     """Encode each fixed-shape modality batch and merge it into token embeddings.
 
     ``running`` starts as the plain text embedding. Each modality batch encodes
@@ -180,6 +180,7 @@ def embed_mm_inputs(
     encoder_tp = getattr(multimodal_model, "encoder_tp", False)
     tp_axis = None if encoder_tp else "tensor"
     running = input_embedding(input_ids)
+    deepstack_running = None
     for modality, batch in mm_embed_plan.items():
         encoder = multimodal_model.get_multimodal_encoder(modality)
         device_inputs = batch.encode_inputs
@@ -194,7 +195,8 @@ def embed_mm_inputs(
 
         # [dp,tp,...] lanes -> flat [dp*tp,...] batch for the ViT
         model_inputs = jax.tree.map(flatten_device_batch, device_inputs)
-        features = encoder(model_inputs)
+        encoded = encoder(model_inputs)
+        features, deepstack = encoded if isinstance(encoded, tuple) else (encoded, None)
         feature_shape = (dp_size, tp_size, *features.shape[1:])
         features = jax.lax.reshape(
             features,
@@ -215,7 +217,44 @@ def embed_mm_inputs(
             batch.merge.mask,
             encoder_tp=encoder_tp,
         )
-    return running
+        if deepstack is not None:
+            layer_shape = (dp_size, tp_size, *deepstack.shape[1:])
+            deepstack = jax.lax.reshape(
+                deepstack,
+                layer_shape,
+                out_sharding=NamedSharding(
+                    mesh,
+                    PartitionSpec("data", tp_axis, *([None] * (len(layer_shape) - 2))),
+                ),
+            )
+            merged_layers = []
+            layer_sharding = NamedSharding(
+                mesh, PartitionSpec(None, "data", *([None] * (running.ndim - 1)))
+            )
+            for layer in range(deepstack.shape[2]):
+                layer_features = deepstack[:, :, layer]
+                if batch.source_capacity is not None:
+                    layer_features = _pad_features_jit(
+                        layer_features, capacity=batch.source_capacity
+                    )
+                base = (
+                    jnp.zeros_like(running)
+                    if deepstack_running is None
+                    else deepstack_running[layer]
+                )
+                merged = merge_jit(
+                    mesh,
+                    base,
+                    layer_features,
+                    batch.merge.src_idx,
+                    batch.merge.mask,
+                    encoder_tp=encoder_tp,
+                )
+                merged_layers.append(
+                    jax.lax.reshape(merged, (1, *merged.shape), out_sharding=layer_sharding)
+                )
+            deepstack_running = jax.lax.concatenate(merged_layers, dimension=0)
+    return (running, deepstack_running) if return_deepstack else running
 
 
 def general_mm_embed_routine(
@@ -231,10 +270,13 @@ def general_mm_embed_routine(
     ``input_ids``.
     """
     embed_tokens = language_model.get_input_embeddings()
-    input_embeds = embed_mm_inputs(
+    input_embeds, deepstack = embed_mm_inputs(
         mm_embed_plan,
         input_ids,
         embed_tokens,
         multimodal_model,
+        return_deepstack=True,
     )
     forward_batch.input_embedding = input_embeds
+    forward_batch.deepstack_visual_embedding = deepstack
+    forward_batch.apply_for_deepstack = deepstack is not None
