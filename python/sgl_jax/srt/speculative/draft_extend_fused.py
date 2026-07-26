@@ -20,6 +20,10 @@ from sgl_jax.srt.speculative.relay_buffer import (
     make_dp_valid_mask,
     update_spec_relay_buffers,
 )
+from sgl_jax.srt.speculative.spec_utils import (
+    SIMULATED_ACCEPTANCE_CONFIG,
+    apply_simulated_acceptance,
+)
 
 
 class GreedyDraftInputs(NamedTuple):
@@ -160,10 +164,13 @@ def _prepare_draft_inputs(
         gathered_positions = positions.at[safe_index].get(out_sharding=positions_sharding)
     else:
         gathered_positions = positions[safe_index]
+    new_seq_lens = seq_lens + accept_length + 1
+    if SIMULATED_ACCEPTANCE_CONFIG.enabled:
+        new_seq_lens = jnp.where(seq_lens > 0, new_seq_lens, 0)
     return GreedyDraftInputs(
         hidden_states=gathered_hidden,
         positions=gathered_positions,
-        new_seq_lens=seq_lens + accept_length + 1,
+        new_seq_lens=new_seq_lens,
         select_index=select_index,
         verified_id=verified_id,
         accept_lens=accept_length,
@@ -180,6 +187,7 @@ def _verify_greedy(
     target_predict,
     speculative_num_steps,
     speculative_num_draft_tokens,
+    simulation_rng=None,
 ):
     bs = seq_lens.shape[0]
     n = speculative_num_draft_tokens
@@ -200,9 +208,20 @@ def _verify_greedy(
     accept_index_children = jnp.where(accepted_children, base + child_offsets, -1)
     accept_index_2d = jnp.concatenate([base, accept_index_children], axis=1)
     accept_index_2d = jnp.where(is_padding[:, None], -1, accept_index_2d)
-    accept_index = accept_index_2d.reshape(-1)
 
     predict = target_predict.astype(jnp.int32).reshape(-1)
+    accept_index_2d, predict, accept_length = apply_simulated_acceptance(
+        accept_index=accept_index_2d,
+        predict=predict,
+        accept_lens=accept_length,
+        candidates=draft_2d,
+        target_predict=target_predict_2d,
+        valid_mask=~is_padding,
+        spec_steps=speculative_num_steps,
+        topk=1,
+        rng=simulation_rng,
+    )
+    accept_index = accept_index_2d.reshape(-1)
     accept_width = speculative_num_steps + 1
     req_ids = (
         jnp.zeros_like(accept_index)
@@ -253,6 +272,7 @@ def _verify_rejection_sampling(
     enable_top_p,
     speculative_num_steps,
     speculative_num_draft_tokens,
+    simulation_rng=None,
 ):
     """Non-greedy counterpart of the greedy chain verify.
 
@@ -336,6 +356,18 @@ def _verify_rejection_sampling(
     accept_index_children = jnp.where(accepted_children, base + child_offsets, -1)
     accept_index_2d = jnp.concatenate([base, accept_index_children], axis=1)
     accept_index_2d = jnp.where(is_padding[:, None], -1, accept_index_2d)
+    target_predict_2d = jnp.argmax(tl, axis=-1).astype(jnp.int32).reshape(bs, n)
+    accept_index_2d, predict, accept_length = apply_simulated_acceptance(
+        accept_index=accept_index_2d,
+        predict=predict,
+        accept_lens=accept_length,
+        candidates=draft_2d,
+        target_predict=target_predict_2d,
+        valid_mask=~is_padding,
+        spec_steps=speculative_num_steps,
+        topk=1,
+        rng=simulation_rng,
+    )
     accept_index = accept_index_2d.reshape(-1)
 
     accept_width = speculative_num_steps + 1
@@ -895,6 +927,8 @@ def _build_verify(topk: int):
         mesh = sh.mesh if isinstance(sh, NamedSharding) else None
         target_logits = target_output.next_token_logits
         target_hidden = target_output.hidden_states
+        sampling_rng = jax.random.fold_in(sampling_base_rng, sampling_step)
+        simulation_rng = jax.random.fold_in(sampling_rng, 1)
         if is_greedy:
             target_predict = jnp.argmax(target_logits, axis=-1).astype(jnp.int32).reshape(-1)
             prepared = _verify_greedy(
@@ -903,6 +937,7 @@ def _build_verify(topk: int):
                 seq_lens=target_forward_batch.seq_lens,
                 draft_tokens=draft_tokens,
                 target_predict=target_predict,
+                simulation_rng=simulation_rng,
                 speculative_num_steps=speculative_num_steps,
                 speculative_num_draft_tokens=speculative_num_draft_tokens,
             )
@@ -912,7 +947,6 @@ def _build_verify(topk: int):
             # the threefry/uniform ops fused into this module instead of becoming
             # standalone eager dispatches (the reason the earlier host-side jax.random
             # attempt was reverted).
-            sampling_rng = jax.random.fold_in(sampling_base_rng, sampling_step)
             coins_key, coin_f_key = jax.random.split(sampling_rng)
             coins = jax.random.uniform(
                 coins_key,
@@ -931,6 +965,7 @@ def _build_verify(topk: int):
                 top_ps=top_ps,
                 coins=coins,
                 coin_f=coin_f,
+                simulation_rng=simulation_rng,
                 threshold_single=threshold_single,
                 threshold_acc=threshold_acc,
                 enable_top_k=enable_top_k,
