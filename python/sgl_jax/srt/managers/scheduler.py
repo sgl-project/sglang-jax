@@ -114,6 +114,16 @@ TEST_RETRACT = get_bool_env_var("SGLANG_TEST_RETRACT")
 TEST_RETRACT_INTERVAL = int(os.environ.get("SGLANG_TEST_RETRACT_INTERVAL", "3"))
 TEST_RETRACT_NO_PREFILL_BS = int(os.environ.get("SGLANG_TEST_RETRACT_NO_PREFILL_BS", str(2**31)))
 RECORD_STEP_TIME = get_bool_env_var("SGLANG_RECORD_STEP_TIME")
+# Debug: log per-phase scheduler-loop timing (recv / schedule / launch / result)
+# as running averages, to see what fraction of the step the scheduler thread
+# actually spends where. Off by default (zero prod overhead).
+SCHED_PHASE_TIME = get_bool_env_var("SGLANG_SCHED_PHASE_TIME")
+SCHED_PHASE_INTERVAL = int(os.environ.get("SGLANG_SCHED_PHASE_INTERVAL", "200"))
+# Optional: dump one row per forward step (step,bs,recv,sched,build,result in ms)
+# to this CSV path, so the host/forward ratio distribution (mean + percentiles)
+# can be computed offline. Implies phase timing. Off by default.
+SCHED_PHASE_CSV = os.environ.get("SGLANG_SCHED_PHASE_CSV")
+SCHED_PHASE_TIME = SCHED_PHASE_TIME or bool(SCHED_PHASE_CSV)
 GRAMMAR_TIMEOUT = float(os.environ.get("SGLANG_GRAMMAR_TIMEOUT", 300))
 
 
@@ -1081,13 +1091,23 @@ class Scheduler(
                 _gc.get_threshold(),
             )
 
+        _pt_acc = [0.0, 0.0, 0.0, 0.0]  # recv, schedule, build(run_batch), result
+        _pt_steps = 0  # forward steps only (batch non-None; run_batch fired)
+        _pt_iters = 0  # total loop iterations (spin ratio = iters/steps)
+        _pt_step_ct = 0  # monotonic step counter for the CSV
+        _pt_csv_rows = []  # buffered per-step rows, flushed every interval
+        if SCHED_PHASE_CSV:
+            with open(SCHED_PHASE_CSV, "w") as _f:
+                _f.write("step,bs,recv_ms,sched_ms,build_ms,result_ms\n")
         while True:
+            _pt0 = time.perf_counter() if SCHED_PHASE_TIME else 0.0
             _it0 = time.perf_counter() if _pd_iter_trace else 0.0
             recv_reqs = (
                 self._comm_backend.recv_requests()
                 if self._comm_backend is not None
                 else self.recv_requests()
             )
+            _pt_recv = time.perf_counter() if SCHED_PHASE_TIME else 0.0
             # Assign DP rank to incoming requests
             recv_reqs = self.select_dp_for_request(recv_reqs)
             self.process_input_requests(recv_reqs)
@@ -1099,6 +1119,7 @@ class Scheduler(
 
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
+            _pt_sched = time.perf_counter() if SCHED_PHASE_TIME else 0.0
             _it2 = time.perf_counter() if _pd_iter_trace else 0.0
 
             # HiCache: stage_load was issued during last round; flush must wait
@@ -1138,6 +1159,7 @@ class Scheduler(
                     with jax.profiler.TraceAnnotation("process_batch_result"):
                         self.process_batch_result(tmp_batch, None, batch.launch_done)
 
+            _pt_launch = time.perf_counter() if SCHED_PHASE_TIME else 0.0
             if self.last_batch:
                 # Process the results of the last batch
                 tmp_batch, tmp_result = self.result_queue.popleft()
@@ -1154,6 +1176,54 @@ class Scheduler(
                 self.check_tree_cache()
                 self.new_token_ratio = self.init_new_token_ratio
 
+            if SCHED_PHASE_TIME:
+                _pt_iters += 1
+                # Only count iterations that actually launched a forward (run_batch
+                # fired). The loop spins with batch=None while a forward is in flight;
+                # averaging over those spins dilutes the real per-step host cost.
+                if batch is not None:
+                    _pt_proc = time.perf_counter()
+                    _pt_acc[0] += _pt_recv - _pt0          # recv
+                    _pt_acc[1] += _pt_sched - _pt_recv     # schedule
+                    _pt_acc[2] += _pt_launch - _pt_sched   # build = run_batch (get_model_worker_batch + dispatch)
+                    _pt_acc[3] += _pt_proc - _pt_launch    # result = process_batch_result (forward-wait + D2H)
+                    _pt_steps += 1
+                    if SCHED_PHASE_CSV:
+                        _pt_step_ct += 1
+                        _pt_csv_rows.append(
+                            "%d,%d,%.4f,%.4f,%.4f,%.4f"
+                            % (
+                                _pt_step_ct,
+                                len(batch.reqs),
+                                (_pt_recv - _pt0) * 1e3,
+                                (_pt_sched - _pt_recv) * 1e3,
+                                (_pt_launch - _pt_sched) * 1e3,
+                                (_pt_proc - _pt_launch) * 1e3,
+                            )
+                        )
+                        if len(_pt_csv_rows) >= SCHED_PHASE_INTERVAL:
+                            with open(SCHED_PHASE_CSV, "a") as _f:
+                                _f.write("\n".join(_pt_csv_rows) + "\n")
+                            _pt_csv_rows = []
+                    if _pt_steps % SCHED_PHASE_INTERVAL == 0:
+                        _host = _pt_acc[0] + _pt_acc[1] + _pt_acc[2]  # recv+sched+build
+                        _fwdwait = _pt_acc[3]                          # result (mostly forward wait)
+                        logger.info(
+                            "[sched/fwd-step avg/%d steps, spin=%.0fx] HOST(recv+sched+build)=%.2fms "
+                            "[recv=%.2f sched=%.2f build=%.2f] | result(fwd-wait+D2H)=%.2fms  "
+                            "-> host %s forward",
+                            _pt_steps,
+                            _pt_iters / max(1, _pt_steps),
+                            _host / _pt_steps * 1e3,
+                            _pt_acc[0] / _pt_steps * 1e3,
+                            _pt_acc[1] / _pt_steps * 1e3,
+                            _pt_acc[2] / _pt_steps * 1e3,
+                            _fwdwait / _pt_steps * 1e3,
+                            "<" if _host < _fwdwait else ">=",
+                        )
+                        _pt_acc = [0.0, 0.0, 0.0, 0.0]
+                        _pt_steps = 0
+                        _pt_iters = 0
             self.last_batch = batch
             if _pd_iter_trace:
                 _it3 = time.perf_counter()

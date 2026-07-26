@@ -1,0 +1,70 @@
+# Managed spot v6e-4 job for #293: masking-ratio DISTRIBUTION + GUARD in one run.
+# Runs random prompts with length variance (--random-range-ratio 0.5 => lengths
+# in [0.5L, L]) so batch shapes vary, dumps one row per forward step to a CSV
+# (SGLANG_SCHED_PHASE_CSV), then reports the mean AND distribution (p50/p90/p99 +
+# histogram) of host/forward AND exits non-zero if p99 >= margin (regression).
+#   sky jobs launch scripts/eval_scheduler_masking.sky.yaml -y   # job status = verdict
+name: scheduler-masking
+
+resources:
+  accelerators: tpu-v6e-4
+  accelerator_args:
+    tpu_vm: True
+    runtime_version: v2-alpha-tpuv6e
+  use_spot: True
+
+file_mounts:
+  /tmp/overlay_scheduler.py: ./python/sgl_jax/srt/managers/scheduler.py
+  /tmp/overlay_scripts: ./scripts
+
+setup: |
+  if [ -d "sglang-jax" ]; then pip uninstall -y sgl-jax || true && rm -rf sglang-jax; fi
+  git clone https://github.com/sgl-project/sglang-jax.git
+  cd sglang-jax   # main
+  echo "cloned main @ $(git rev-parse --short HEAD)"
+  cp -f /tmp/overlay_scheduler.py python/sgl_jax/srt/managers/scheduler.py
+  cp -f /tmp/overlay_scripts/*.sh scripts/ 2>/dev/null || true
+  cp -f /tmp/overlay_scripts/*.py scripts/ 2>/dev/null || true
+  uv venv --python 3.12
+  source .venv/bin/activate
+  uv pip install -e "python[all]"
+  bash scripts/killall_sglang.sh || true
+
+run: |
+  cd sglang-jax
+  source .venv/bin/activate
+  CSV=/tmp/phase.csv
+
+  echo "########## LAUNCH SERVER (per-step CSV on) ##########"
+  SGLANG_SCHED_PHASE_CSV=$CSV SGLANG_SCHED_PHASE_INTERVAL=50 \
+  python -m sgl_jax.launch_server --model-path Qwen/Qwen3-8B --trust-remote-code \
+    --device tpu --dtype bfloat16 --tp-size 4 \
+    --mem-fraction-static 0.8 --page-size 64 --attention-backend fa \
+    --chunked-prefill-size 8192 --download-dir /dev/shm/ \
+    --host 127.0.0.1 --port 30000 > /tmp/server.log 2>&1 &
+  for _ in $(seq 1 120); do curl -sf http://127.0.0.1:30000/health >/dev/null 2>&1 && break; sleep 5; done
+  echo "  server ready"
+
+  echo "########## WARMUP (precompile) ##########"
+  python -m sgl_jax.bench_serving --backend sgl-jax --model Qwen/Qwen3-8B \
+    --base-url http://127.0.0.1:30000 --dataset-name random --num-prompts 8 \
+    --random-input-len 1024 --random-output-len 64 --random-range-ratio 1 \
+    --max-concurrency 8 --warmup-requests 0 > /tmp/warmup.log 2>&1 || true
+
+  # Drop warmup steps so the distribution reflects only the varied load.
+  rm -f $CSV
+
+  echo "########## VARIED LOAD: 200 random prompts, lengths in [0.5x,1x], conc=16 ##########"
+  python -m sgl_jax.bench_serving --backend sgl-jax --model Qwen/Qwen3-8B \
+    --base-url http://127.0.0.1:30000 --dataset-name random --num-prompts 200 \
+    --random-input-len 1024 --random-output-len 1024 --random-range-ratio 0.5 \
+    --max-concurrency 16 --warmup-requests 0 > /tmp/bench.log 2>&1 || true
+
+  echo "########## MASKING RATIO DISTRIBUTION + GUARD ##########"
+  python scripts/summarize_phase.py $CSV --margin 0.85
+  rc=$?   # 0 = masked (p99 < margin), 1 = #293 regression -> job status = verdict
+  echo "########## bench summary ##########"
+  grep -iE "throughput|concurrency|latency|Successful" /tmp/bench.log | head -15
+  echo "########## rows: $(wc -l < $CSV) (incl header), GUARD rc=$rc ##########"
+  bash scripts/killall_sglang.sh >/dev/null 2>&1 || true
+  exit $rc
