@@ -319,6 +319,11 @@ suites = {
         TestFile(
             "python/sgl_jax/test/multimodal/test_stage_config_routing.py", 0.1, runner="pytest"
         ),
+        TestFile(
+            "python/sgl_jax/test/multimodal/test_mimo_audio_tokenizer_model.py",
+            0.2,
+            runner="pytest",
+        ),
         TestFile("python/sgl_jax/test/models/test_qwen3_5.py", 2, runner="pytest"),
         TestFile("python/sgl_jax/test/mem_cache/test_req_to_token_pool.py", 1),
         TestFile("python/sgl_jax/test/mem_cache/test_hybrid_req_to_token_pool.py", 1),
