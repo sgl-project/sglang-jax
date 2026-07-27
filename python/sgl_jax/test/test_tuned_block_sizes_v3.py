@@ -71,6 +71,7 @@ def test_sliding_window_separates_buckets(monkeypatch):
             mnt,
         ),
     )
+    mod.TUNED_BLOCK_SIZES_V3["TPU v7"].clear()
 
     # Add a non-SWA entry only
     mod.TUNED_BLOCK_SIZES_V3["TPU v7"][("d", None, "bfloat16", "bfloat16", 32, 2, 256, 256, 64)] = (
