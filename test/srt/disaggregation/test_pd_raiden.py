@@ -10,14 +10,18 @@ from unittest import mock
 import pytest
 
 from sgl_jax.srt.disaggregation.base.kv_manager import KVPoll
-from sgl_jax.srt.disaggregation.bootstrap import _Registry, check_prefill_compat
-from sgl_jax.srt.disaggregation.jax_transfer.conn import (
-    JaxTransferKVManager,
-    PMetadata,
+from sgl_jax.srt.disaggregation.base.transfer import (
+    AdmissionState,
+    DecodeTransferContext,
 )
-from sgl_jax.srt.disaggregation.jax_transfer.wrapper import (
-    RaidenTransferWrapper,
+from sgl_jax.srt.disaggregation.bootstrap import _Registry, check_prefill_compat
+from sgl_jax.srt.disaggregation.raiden_transfer.conn import (
+    RaidenMetadata,
+    RaidenTransferKVManager,
     _uuid_to_int,
+)
+from sgl_jax.srt.disaggregation.raiden_transfer.wrapper import (
+    RaidenTransferWrapper,
 )
 from sgl_jax.srt.server_args import ServerArgs
 
@@ -25,13 +29,17 @@ from sgl_jax.srt.server_args import ServerArgs
 class _FakeBootstrap:
     def __init__(self) -> None:
         self.registered: list[tuple[tuple, dict]] = []
-        self.popped: list[int] = []
+        self.popped: list[tuple[int, dict]] = []
+        self.transfer_info = None
 
     def register_transfer(self, *args, **kwargs) -> None:
         self.registered.append((args, kwargs))
 
-    def pop_transfer(self, room: int) -> None:
-        self.popped.append(room)
+    def pop_transfer(self, room: int, **kwargs) -> None:
+        self.popped.append((room, kwargs))
+
+    def get_transfer_info(self, room: int, **kwargs):  # noqa: ARG002
+        return self.transfer_info
 
 
 class _FakeRaiden:
@@ -55,12 +63,7 @@ class _FakeRaiden:
 
 
 def _manager(fake_raiden: _FakeRaiden, bootstrap: _FakeBootstrap):
-    return JaxTransferKVManager(
-        wrapper=None,
-        zmq_notifier=None,
-        raiden_wrapper=fake_raiden,
-        bootstrap_client=bootstrap,
-    )
+    return RaidenTransferKVManager(fake_raiden, bootstrap)
 
 
 def test_raiden_sender_registers_once_and_completes_from_poll_stats():
@@ -74,8 +77,11 @@ def test_raiden_sender_registers_once_and_completes_from_poll_stats():
     sender.send()
 
     assert raiden.registered == [("wire-1", _uuid_to_int("wire-1"), [3, 8, 13])]
-    assert bootstrap.registered[0][0] == (42, "wire-1", [3, 8, 13])
-    assert bootstrap.registered[0][1]["local_control_port"] == 7777
+    assert bootstrap.registered[0][0] == (42, "wire-1")
+    assert bootstrap.registered[0][1] == {
+        "jax_process_index": 0,
+        "transport_metadata": {"remote_block_ids": [3, 8, 13]},
+    }
     assert sender.poll() == KVPoll.TRANSFERRING
 
     raiden.stats = (["wire-1"], [], [])
@@ -89,12 +95,8 @@ def test_raiden_receiver_starts_direct_block_read_and_pops_metadata():
     manager = _manager(raiden, bootstrap)
     receiver = manager.create_receiver("req-2")
     receiver.init(
-        PMetadata(
-            remote_addr="10.0.0.1:1",
+        RaidenMetadata(
             uuid="wire-2",
-            specs={},
-            p_side_channel_host="10.0.0.1",
-            p_side_channel_port=2,
             remote_endpoint="10.0.0.1:7777",
             remote_block_ids=(1, 4),
             local_block_ids=(9, 10),
@@ -103,13 +105,11 @@ def test_raiden_receiver_starts_direct_block_read_and_pops_metadata():
     )
 
     assert receiver.poll() == KVPoll.TRANSFERRING
-    assert raiden.started == [
-        ("wire-2", _uuid_to_int("wire-2"), "10.0.0.1:7777", [1, 4], [9, 10])
-    ]
+    assert raiden.started == [("wire-2", _uuid_to_int("wire-2"), "10.0.0.1:7777", [1, 4], [9, 10])]
 
     raiden.stats = ([], ["wire-2"], [])
     assert receiver.poll() == KVPoll.SUCCESS
-    assert bootstrap.popped == [43]
+    assert bootstrap.popped == [(43, {"jax_process_index": 0})]
     assert "req-2" not in manager._receivers
 
 
@@ -119,12 +119,8 @@ def test_raiden_failure_and_abort_cleanup_are_terminal_and_idempotent():
     manager = _manager(raiden, bootstrap)
     receiver = manager.create_receiver("req-3")
     receiver.init(
-        PMetadata(
-            remote_addr="",
+        RaidenMetadata(
             uuid="wire-3",
-            specs={},
-            p_side_channel_host="",
-            p_side_channel_port=0,
             remote_endpoint="10.0.0.1:7777",
             remote_block_ids=(1,),
             local_block_ids=(2,),
@@ -135,7 +131,102 @@ def test_raiden_failure_and_abort_cleanup_are_terminal_and_idempotent():
     raiden.stats = ([], [], ["wire-3"])
     assert receiver.poll() == KVPoll.FAILED
     receiver.abort()
-    assert bootstrap.popped == [44]
+    assert bootstrap.popped == [(44, {"jax_process_index": 0})]
+
+
+def test_raiden_manager_owns_decode_admission_and_endpoint_mapping():
+    raiden = _FakeRaiden()
+    bootstrap = _FakeBootstrap()
+    bootstrap.transfer_info = {
+        "transfer_id": "wire-4",
+        "transport_metadata": {"remote_block_ids": [3, 4]},
+    }
+    manager = _manager(raiden, bootstrap)
+    context = DecodeTransferContext(
+        req_id="req-4",
+        transfer_id="wire-4",
+        bootstrap_room=45,
+        peer_info={
+            "host": "10.0.0.1",
+            "transport_metadata": {
+                "engine": "raiden",
+                "local_control_port": 7777,
+                "endpoints": raiden.endpoints,
+            },
+        },
+        kv_indices=[18, 19, 20, 21],
+        page_size=2,
+        prompt_tokens=4,
+        spec_factory=lambda: None,
+    )
+
+    admission = manager.try_start_decode(context)
+
+    assert admission.state == AdmissionState.ADMITTED
+    assert admission.receiver is not None
+    assert admission.receiver.poll() == KVPoll.TRANSFERRING
+    assert raiden.started == [("wire-4", _uuid_to_int("wire-4"), "10.0.0.1:7777", [3, 4], [9, 10])]
+
+
+def test_raiden_manager_accepts_legacy_flat_peer_metadata():
+    raiden = _FakeRaiden()
+    bootstrap = _FakeBootstrap()
+    bootstrap.transfer_info = {
+        "transfer_id": "wire-legacy",
+        "transport_metadata": {"remote_block_ids": [3]},
+    }
+    manager = _manager(raiden, bootstrap)
+
+    admission = manager.try_start_decode(
+        DecodeTransferContext(
+            req_id="req-legacy",
+            transfer_id="wire-legacy",
+            bootstrap_room=47,
+            peer_info={
+                "host": "10.0.0.1",
+                "local_control_port": 7777,
+                "raiden_endpoints_json": '[{"endpoint":"10.0.0.1:7777","shards":[0]}]',
+            },
+            kv_indices=[18, 19],
+            page_size=2,
+            prompt_tokens=2,
+            spec_factory=lambda: None,
+        )
+    )
+
+    assert admission.state == AdmissionState.ADMITTED
+
+
+def test_raiden_manager_defers_until_request_metadata_is_published():
+    manager = _manager(_FakeRaiden(), _FakeBootstrap())
+    admission = manager.try_start_decode(
+        DecodeTransferContext(
+            req_id="req-5",
+            transfer_id="wire-5",
+            bootstrap_room=46,
+            peer_info={},
+            kv_indices=[],
+            page_size=128,
+            prompt_tokens=1,
+            spec_factory=lambda: None,
+        )
+    )
+    assert admission.state == AdmissionState.DEFERRED
+
+
+def test_raiden_prefill_metadata_requires_a_bound_control_port():
+    raiden = _FakeRaiden()
+    raiden.endpoints = []
+    raiden.control_port = 0
+
+    with pytest.raises(RuntimeError, match="valid control endpoint"):
+        _manager(raiden, _FakeBootstrap()).prefill_transport_metadata()
+
+
+def test_raiden_uuid_is_stable_and_json_safe():
+    assert _uuid_to_int("wire") == _uuid_to_int("wire")
+    assert _uuid_to_int("wire") != _uuid_to_int("other")
+    assert 0 <= _uuid_to_int("wire") < 2**50
 
 
 def test_transfer_metadata_is_single_shot_reusable_and_ttl_bounded():
@@ -154,20 +245,33 @@ def test_transfer_metadata_is_single_shot_reusable_and_ttl_bounded():
         {
             "bootstrap_room": 7,
             "transfer_id": "second",
-            "remote_block_ids": [9],
+            "jax_process_index": 0,
+            "transport_metadata": {"remote_block_ids": [9]},
         }
     )
-    assert registry.get_transfer(7)["remote_block_ids"] == [9]
+    registry.register_transfer(
+        {
+            "bootstrap_room": 7,
+            "transfer_id": "peer",
+            "jax_process_index": 1,
+            "transport_metadata": {"remote_block_ids": [11]},
+        }
+    )
+    assert registry.get_transfer(7, 0)["transfer_id"] == "second"
+    assert registry.get_transfer(7, 1)["transfer_id"] == "peer"
+    registry.pop_room(7, 0)
+    assert registry.get_transfer(7, 0) is None
+    assert registry.get_transfer(7, 1)["transfer_id"] == "peer"
     now[0] += 6.0
-    assert registry.get_transfer(7) is None
+    assert registry.get_transfer(7, 1) is None
 
 
 def test_prefill_decode_transfer_engines_must_match():
     info = {
-        "protocol_version": 2,
+        "protocol_version": 3,
         "page_size": 128,
         "kv_dtype": "bfloat16",
-        "transfer_engine": "raiden",
+        "transport_metadata": {"engine": "raiden"},
     }
     check_prefill_compat(
         info,
@@ -204,9 +308,7 @@ def test_raiden_cli_is_opt_in_and_exposes_control_port():
 
 def test_raiden_wrapper_uses_public_jax_api_and_configured_parallelism():
     engine = mock.MagicMock()
-    engine.get_local_endpoints.return_value = [
-        {"endpoint": "127.0.0.1:7788", "shards": [0]}
-    ]
+    engine.get_local_endpoints.return_value = [{"endpoint": "127.0.0.1:7788", "shards": [0]}]
     manager_cls = mock.MagicMock(return_value=engine)
     modules = {
         "tpu_raiden": types.ModuleType("tpu_raiden"),

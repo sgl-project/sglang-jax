@@ -16,13 +16,8 @@ def _raiden_requested() -> bool:
     return requested
 
 
-# Engine-first XLA load: when the raiden data plane is enabled, import raiden's
-# compiled JAX extension before anything imports jax/jaxlib. The extension
-# embeds its own XLA runtime; loading it after jaxlib's libjax_common.so makes
-# the two XLA copies collide in static initializers. This mirrors
-# tpu-inference/tpu_inference/__init__.py. Gated so normal (path-A / non-PD)
-# runs are unaffected. Inspecting argv makes the server flag sufficient for the
-# normal CLI entrypoint; programmatic launchers can set SGLANG_JAX_USE_RAIDEN=1.
+# Raiden embeds XLA and must load before jaxlib to avoid static-initializer
+# collisions. Programmatic launchers opt in through SGLANG_JAX_USE_RAIDEN.
 if _raiden_requested():
     if (
         "jax" in sys.modules or "jaxlib" in sys.modules

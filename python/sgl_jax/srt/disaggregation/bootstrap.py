@@ -12,7 +12,7 @@ from dataclasses import asdict, dataclass, field
 import httpx
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field as PydanticField
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +24,7 @@ TRANSFER_METADATA_TTL_SECONDS = 300.0
 
 # PD wire protocol version. Bump when ``PrefillInfo``
 # or any of the 4 endpoint payloads change shape.
-PROTOCOL_VERSION: int = 2
+PROTOCOL_VERSION: int = 3
 MIN_COMPATIBLE_VERSION: int = 1
 
 
@@ -54,19 +54,9 @@ class PrefillInfo:
     jax_process_index: int = 0
     jax_process_count: int = 1
     protocol_version: int = PROTOCOL_VERSION
-    # KV layout. Decode must match these or the transferred KV would be
-    # silently misinterpreted. Defaults (0 / "") mean "not reported" so a
-    # peer predating these fields skips the check.
     page_size: int = 0
     kv_dtype: str = ""
-    # Raiden control-plane endpoint. Empty means
-    # "not a raiden peer" (path-A). ``local_control_port`` is the resolved TCP
-    # port raiden's KVCacheManager listens on; ``raiden_endpoints_json`` is the
-    # JSON-encoded ``get_local_endpoints()`` descriptor list that decode passes
-    # verbatim to ``start_read(remote_endpoint=...)``.
-    local_control_port: int = 0
-    raiden_endpoints_json: str = ""
-    transfer_engine: str = "jax"
+    transport_metadata: dict[str, object] = field(default_factory=lambda: {"engine": "jax"})
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -136,7 +126,11 @@ def check_prefill_compat(
             f"kv_dtype={peer_kv_dtype!r} but this decode uses "
             f"kv_dtype={local_kv_dtype!r}; KV layout incompatible"
         )
-    peer_engine = str(info.get("transfer_engine", "jax"))
+    transport_metadata = info.get("transport_metadata", {})
+    if isinstance(transport_metadata, dict) and "engine" in transport_metadata:
+        peer_engine = str(transport_metadata["engine"])
+    else:
+        peer_engine = str(info.get("transfer_engine", "jax"))
     if expected_transfer_engine is not None and peer_engine != expected_transfer_engine:
         raise ValueError(
             f"PD transfer engine mismatch: prefill={peer_engine}, decode={expected_transfer_engine}"
@@ -156,29 +150,14 @@ class RegisterPrefillRequest(BaseModel):
     protocol_version: int = PROTOCOL_VERSION
     page_size: int = 0
     kv_dtype: str = ""
-    local_control_port: int = 0
-    raiden_endpoints_json: str = ""
-    transfer_engine: str = "jax"
+    transport_metadata: dict[str, object] = PydanticField(default_factory=lambda: {"engine": "jax"})
 
 
 class RegisterTransferRequest(BaseModel):
-    """Per-request block metadata P publishes so D can pull with raiden.
-
-    raiden's ``start_read`` needs the producer's device block ids
-    (``remote_block_ids``). Those are per-request and only P knows them (the
-    paged allocator picks non-contiguous blocks), so they cannot be derived by
-    D deterministically — P registers them here keyed by ``bootstrap_room`` and
-    D fetches them at admission. This is the raiden analogue of path-A's
-    crc32(uuid) pairing (which only needed a shared int, not the block layout).
-    """
-
     bootstrap_room: int
     transfer_id: str
-    remote_block_ids: list[int]
-    # Endpoint + control port are also on PrefillInfo, but a decode that already
-    # resolved its peer can skip the second lookup by reading them here.
-    local_control_port: int = 0
-    raiden_endpoints_json: str = ""
+    jax_process_index: int = 0
+    transport_metadata: dict[str, object]
 
 
 class HeartbeatRequest(BaseModel):
@@ -198,11 +177,9 @@ class _Registry:
     lock: threading.Lock = field(default_factory=threading.Lock)
     ttl_seconds: float = HEARTBEAT_TTL_SECONDS
     clock: Callable[[], float] = time.monotonic
-    # Raiden per-request block metadata, keyed by bootstrap_room. P publishes it
-    # once after the final prefill chunk; D reads it at admission and pops it at
-    # terminal. TTL eviction covers abandoned rooms.
-    transfers: dict[int, dict[str, object]] = field(default_factory=dict)
-    transfer_last_seen: dict[int, float] = field(default_factory=dict)
+    # A multi-host request has distinct physical page IDs on every P process.
+    transfers: dict[tuple[int, int], dict[str, object]] = field(default_factory=dict)
+    transfer_last_seen: dict[tuple[int, int], float] = field(default_factory=dict)
     transfer_ttl_seconds: float = TRANSFER_METADATA_TTL_SECONDS
 
     def now(self) -> float:
@@ -257,33 +234,35 @@ class _Registry:
 
     def _evict_stale_transfers_locked(self) -> None:
         cutoff = self.now() - self.transfer_ttl_seconds
-        stale = [room for room, seen_at in self.transfer_last_seen.items() if seen_at < cutoff]
-        for room in stale:
-            self.transfers.pop(room, None)
-            self.transfer_last_seen.pop(room, None)
+        stale = [key for key, seen_at in self.transfer_last_seen.items() if seen_at < cutoff]
+        for key in stale:
+            self.transfers.pop(key, None)
+            self.transfer_last_seen.pop(key, None)
 
     def register_transfer(self, info: dict[str, object]) -> None:
         with self.lock:
             self._evict_stale_transfers_locked()
             room = int(info["bootstrap_room"])
+            process_index = int(info.get("jax_process_index", 0))
             if not str(info.get("transfer_id", "")):
                 raise ValueError("transfer_id must be non-empty")
-            self.transfers[room] = info
-            self.transfer_last_seen[room] = self.now()
+            key = (room, process_index)
+            self.transfers[key] = info
+            self.transfer_last_seen[key] = self.now()
 
-    def get_transfer(self, bootstrap_room: int) -> dict[str, object] | None:
-        """Read without consuming the completed request's block metadata."""
+    def get_transfer(
+        self, bootstrap_room: int, jax_process_index: int = 0
+    ) -> dict[str, object] | None:
         with self.lock:
             self._evict_stale_transfers_locked()
-            info = self.transfers.get(int(bootstrap_room))
+            info = self.transfers.get((int(bootstrap_room), int(jax_process_index)))
             return dict(info) if info is not None else None
 
-    def pop_room(self, bootstrap_room: int) -> None:
-        """Drop terminal request metadata for ``bootstrap_room``."""
+    def pop_room(self, bootstrap_room: int, jax_process_index: int = 0) -> None:
         with self.lock:
-            room = int(bootstrap_room)
-            self.transfers.pop(room, None)
-            self.transfer_last_seen.pop(room, None)
+            key = (int(bootstrap_room), int(jax_process_index))
+            self.transfers.pop(key, None)
+            self.transfer_last_seen.pop(key, None)
 
 
 def build_app(
@@ -370,20 +349,23 @@ def build_app(
         return {"status": "registered"}
 
     @app.get("/get_transfer_info")
-    def get_transfer_info(bootstrap_room: int) -> dict[str, object]:
-        info = registry.get_transfer(bootstrap_room)
+    def get_transfer_info(bootstrap_room: int, jax_process_index: int = 0) -> dict[str, object]:
+        info = registry.get_transfer(bootstrap_room, jax_process_index)
         if info is None:
             # Not registered yet: 404 lets the decode side treat it as
             # "defer + retry" (never abort) rather than a hard error.
             raise HTTPException(
                 status_code=404,
-                detail=f"no transfer info for bootstrap_room={bootstrap_room}",
+                detail=(
+                    f"no transfer info for bootstrap_room={bootstrap_room}, "
+                    f"jax_process_index={jax_process_index}"
+                ),
             )
         return info
 
     @app.post("/pop_transfer")
-    def pop_transfer(bootstrap_room: int) -> dict[str, str]:
-        registry.pop_room(bootstrap_room)
+    def pop_transfer(bootstrap_room: int, jax_process_index: int = 0) -> dict[str, str]:
+        registry.pop_room(bootstrap_room, jax_process_index)
         return {"status": "popped"}
 
     # Bootstrap runs as a standalone single process and does NOT inherit
@@ -546,9 +528,7 @@ class BootstrapClient:
         protocol_version: int = PROTOCOL_VERSION,
         page_size: int = 0,
         kv_dtype: str = "",
-        local_control_port: int = 0,
-        raiden_endpoints_json: str = "",
-        transfer_engine: str = "jax",
+        transport_metadata: dict[str, object] | None = None,
     ) -> None:
         payload = {
             "bootstrap_key": bootstrap_key,
@@ -563,9 +543,7 @@ class BootstrapClient:
             "protocol_version": protocol_version,
             "page_size": page_size,
             "kv_dtype": kv_dtype,
-            "local_control_port": local_control_port,
-            "raiden_endpoints_json": raiden_endpoints_json,
-            "transfer_engine": transfer_engine,
+            "transport_metadata": transport_metadata or {"engine": "jax"},
         }
         last_err: Exception | None = None
         for attempt in range(self._register_retries):
@@ -637,19 +615,15 @@ class BootstrapClient:
         self,
         bootstrap_room: int,
         transfer_id: str,
-        remote_block_ids: list[int],
         *,
-        local_control_port: int = 0,
-        raiden_endpoints_json: str = "",
+        jax_process_index: int = 0,
+        transport_metadata: dict[str, object],
     ) -> None:
-        """P: publish complete prompt block metadata for a Raiden pull."""
-
         payload = {
             "bootstrap_room": bootstrap_room,
             "transfer_id": transfer_id,
-            "remote_block_ids": list(remote_block_ids),
-            "local_control_port": local_control_port,
-            "raiden_endpoints_json": raiden_endpoints_json,
+            "jax_process_index": jax_process_index,
+            "transport_metadata": transport_metadata,
         }
         r = self._client.post(
             f"{self._base_url}/register_transfer",
@@ -659,12 +633,15 @@ class BootstrapClient:
         )
         r.raise_for_status()
 
-    def get_transfer_info(self, bootstrap_room: int) -> dict[str, object] | None:
-        """D: fetch complete block metadata, or None until P publishes it."""
-
+    def get_transfer_info(
+        self, bootstrap_room: int, *, jax_process_index: int = 0
+    ) -> dict[str, object] | None:
         r = self._client.get(
             f"{self._base_url}/get_transfer_info",
-            params={"bootstrap_room": bootstrap_room},
+            params={
+                "bootstrap_room": bootstrap_room,
+                "jax_process_index": jax_process_index,
+            },
             timeout=self._timeout_s,
             headers=self._headers(),
         )
@@ -673,12 +650,13 @@ class BootstrapClient:
         r.raise_for_status()
         return r.json()
 
-    def pop_transfer(self, bootstrap_room: int) -> None:
-        """D: drop terminal request metadata, keeping the table bounded."""
-
+    def pop_transfer(self, bootstrap_room: int, *, jax_process_index: int = 0) -> None:
         r = self._client.post(
             f"{self._base_url}/pop_transfer",
-            params={"bootstrap_room": bootstrap_room},
+            params={
+                "bootstrap_room": bootstrap_room,
+                "jax_process_index": jax_process_index,
+            },
             timeout=self._timeout_s,
             headers=self._headers(),
         )

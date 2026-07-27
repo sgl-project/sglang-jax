@@ -6,6 +6,7 @@ import threading
 import time
 
 from sgl_jax.srt.disaggregation.base.kv_manager import KVPoll
+from sgl_jax.srt.disaggregation.base.transfer import DecodeAdmission
 from sgl_jax.srt.disaggregation.common.core import CommonKVManager
 from sgl_jax.srt.disaggregation.decode import (
     DecodeBookkeeping,
@@ -392,6 +393,11 @@ class _KVManager:
         self.created.append((rid, r))
         return r
 
+    def try_start_decode(self, context):
+        receiver = self.create_receiver(context.req_id)
+        receiver.init(context)
+        return DecodeAdmission.admitted(receiver)
+
 
 class _AdmServerArgs:
     def __init__(self, reserved, max_inflight=0):
@@ -404,6 +410,7 @@ class _AdmReq:
     def __init__(self, rid, seqlen):
         self.rid = rid
         self.disagg_transfer_id = None
+        self.bootstrap_room = 1
         self.origin_input_ids = list(range(seqlen))
 
 

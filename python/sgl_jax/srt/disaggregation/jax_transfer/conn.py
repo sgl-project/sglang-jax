@@ -29,6 +29,12 @@ from sgl_jax.srt.disaggregation.base.kv_manager import (
     KVSender,
     StateHolder,
 )
+from sgl_jax.srt.disaggregation.base.transfer import (
+    DecodeAdmission,
+    DecodeTransferContext,
+    PrefillTransfer,
+    PrefillTransferContext,
+)
 from sgl_jax.srt.disaggregation.common.core import (
     CommonKVManager,
     TerminalTransferRecord,
@@ -38,11 +44,7 @@ from sgl_jax.srt.disaggregation.common.metrics import (
     time_phase,
 )
 from sgl_jax.srt.disaggregation.common.zmq_notifier import ZmqPullNotifier
-from sgl_jax.srt.disaggregation.jax_transfer.wrapper import (
-    JaxTransferWrapper,
-    RaidenTransferWrapper,
-    _uuid_to_int,
-)
+from sgl_jax.srt.disaggregation.jax_transfer.wrapper import JaxTransferWrapper
 from sgl_jax.srt.mem_cache.host_kv_pool import HostKVPool
 
 __all__ = [
@@ -68,14 +70,6 @@ class PMetadata:
     ``specs`` maps entry names to their shape/dtype so the receiver can
     construct sub-uuid pulls for each entry independently.
 
-    Raiden fields: ``remote_endpoint`` is Raiden's
-    control endpoint descriptor (from P's ``get_local_endpoints()``, or a
-    ``"host:control_port"`` string); ``remote_block_ids`` are P's device block
-    (page) ids for this request; ``local_block_ids`` are D's pre-allocated
-    device block ids. All None/empty on the path-A code path.
-
-    ``bootstrap_room`` is retained so terminal and abort paths can remove the
-    short-lived block metadata from bootstrap.
     """
 
     remote_addr: str
@@ -83,10 +77,6 @@ class PMetadata:
     specs: dict[str, jax.ShapeDtypeStruct]
     p_side_channel_host: str
     p_side_channel_port: int
-    remote_endpoint: object | None = None
-    remote_block_ids: tuple[int, ...] | None = None
-    local_block_ids: tuple[int, ...] | None = None
-    bootstrap_room: int | None = None
 
 
 @dataclass
@@ -115,14 +105,15 @@ class JaxTransferKVManager(CommonKVManager):
     * (optional) :class:`HostKVPool` — path-A D2H staging
     """
 
+    engine_name = "jax"
+
     def __init__(
         self,
-        wrapper: JaxTransferWrapper | None,
-        zmq_notifier: ZmqPullNotifier | None,
+        wrapper: JaxTransferWrapper,
+        zmq_notifier: ZmqPullNotifier,
         *,
         host_pool: HostKVPool | None = None,
-        raiden_wrapper: RaidenTransferWrapper | None = None,
-        bootstrap_client: object | None = None,
+        use_d2h_staging: bool = False,
         ack_timeout_seconds: float = 60.0,
         pull_timeout_seconds: float = 30.0,
         reaper_interval_seconds: float = 5.0,
@@ -136,25 +127,7 @@ class JaxTransferKVManager(CommonKVManager):
         self._wrapper = wrapper
         self._zmq_notifier = zmq_notifier
         self._host_pool = host_pool
-        # Raiden data plane. When ``_raiden_wrapper`` is set the KV
-        # data plane is served by tpu-raiden instead of the path-A wrapper +
-        # host pool + zmq ack. ``_bootstrap_client`` carries the per-request
-        # block metadata P->D (raiden's start_read needs P's block ids).
-        self._raiden_wrapper = raiden_wrapper
-        self._bootstrap_client = bootstrap_client
-        # raiden's ``poll_stats()`` is process-global (returns req_id lists for
-        # all in-flight transfers). Poll it once per manager tick and cache the
-        # cumulative done/failed sets so every sender/receiver ``poll()`` reads
-        # membership without re-querying the engine. Guarded because senders,
-        # receivers and the reaper all read it from different threads.
-        self._raiden_poll_lock = threading.Lock()
-        self._raiden_done_sending: set[str] = set()
-        self._raiden_done_recving: set[str] = set()
-        self._raiden_failed_recving: set[str] = set()
-        if (wrapper is None) == (raiden_wrapper is None):
-            raise ValueError("configure exactly one PD transfer engine")
-        if wrapper is not None and zmq_notifier is None:
-            raise ValueError("jax transfer requires a ZmqPullNotifier")
+        self._use_d2h_staging = use_d2h_staging
         # A pool of long-lived workers drains the pull queue and runs the
         # blocking ``wrapper.pull`` off the decode event-loop thread (on TPU
         # ``link.pull`` is a synchronous native call). ``pull_worker_count`` is
@@ -164,15 +137,14 @@ class JaxTransferKVManager(CommonKVManager):
         self._pull_worker_count = max(1, int(pull_worker_count))
         self._pull_queue: _queue.Queue[JaxTransferKVReceiver | None] = _queue.Queue()
         self._pull_workers: list[threading.Thread] = []
-        if wrapper is not None:
-            for i in range(self._pull_worker_count):
-                t = threading.Thread(
-                    target=self._pull_worker_loop,
-                    name=f"jax-kv-pull-worker-{i}",
-                    daemon=True,
-                )
-                t.start()
-                self._pull_workers.append(t)
+        for i in range(self._pull_worker_count):
+            t = threading.Thread(
+                target=self._pull_worker_loop,
+                name=f"jax-kv-pull-worker-{i}",
+                daemon=True,
+            )
+            t.start()
+            self._pull_workers.append(t)
 
     def enqueue_pull(self, receiver: JaxTransferKVReceiver) -> None:
         """Hand a TRANSFERRING receiver to the background pull worker.
@@ -198,11 +170,11 @@ class JaxTransferKVManager(CommonKVManager):
     # ------------------------------------------------------------------
 
     @property
-    def wrapper(self) -> JaxTransferWrapper | None:
+    def wrapper(self) -> JaxTransferWrapper:
         return self._wrapper
 
     @property
-    def zmq_notifier(self) -> ZmqPullNotifier | None:
+    def zmq_notifier(self) -> ZmqPullNotifier:
         return self._zmq_notifier
 
     @property
@@ -210,58 +182,69 @@ class JaxTransferKVManager(CommonKVManager):
         return self._host_pool
 
     @property
-    def raiden_wrapper(self) -> RaidenTransferWrapper | None:
-        return self._raiden_wrapper
+    def requires_host_staging(self) -> bool:
+        return self._use_d2h_staging
 
-    @property
-    def use_raiden(self) -> bool:
-        return self._raiden_wrapper is not None
+    def reserve_prefill_buffer(self, existing: int | None) -> int | None:
+        if not self._use_d2h_staging or existing is not None:
+            return existing
+        if self._host_pool is None:
+            raise RuntimeError("D2H staging is enabled without a host KV pool")
+        buffer_id = self._host_pool.reserve()
+        if buffer_id is None:
+            raise RuntimeError("host KV pool is full")
+        return buffer_id
 
-    @property
-    def bootstrap_client(self) -> object | None:
-        return self._bootstrap_client
+    def prefill_transport_metadata(self) -> dict[str, object]:
+        return {"engine": self.engine_name}
 
-    def poll_raiden(self) -> None:
-        """Refresh the cached raiden done/failed sets from the engine.
-
-        Non-blocking. Idempotent per tick — sender/receiver ``poll()`` call
-        this then read the cached membership. ``poll_stats()`` reports each
-        req_id once when it transitions to done, so the sets accumulate.
-        """
-
-        if self._raiden_wrapper is None:
-            return
+    def start_prefill(self, context: PrefillTransferContext) -> PrefillTransfer:
+        sender = self.create_sender(context.req_id)
         try:
-            done_s, done_r, failed_r = self._raiden_wrapper.poll_stats()
-        except Exception:  # noqa: BLE001
-            logger.exception("raiden poll_stats() raised")
-            return
-        with self._raiden_poll_lock:
-            self._raiden_done_sending.update(done_s)
-            self._raiden_done_recving.update(done_r)
-            self._raiden_failed_recving.update(failed_r)
+            payload = context.payload_factory()
+            if context.on_payload is not None:
+                context.on_payload(payload)
+            sender.init(None, transfer_id=context.transfer_id)
+            sender.attach_payload(
+                payload,
+                use_d2h_staging=self._use_d2h_staging,
+                buffer_id=context.buffer_id,
+            )
+            if context.on_ready is not None:
+                context.on_ready()
+            sender.send()
+        except Exception:
+            with suppress(Exception):
+                sender.abort()
+            with suppress(Exception):
+                sender.clear()
+            raise
+        return PrefillTransfer(
+            sender=sender,
+            release_device_kv=self._use_d2h_staging or jax.process_count() > 1,
+        )
 
-    def raiden_sender_done(self, req_id: str) -> bool:
-        with self._raiden_poll_lock:
-            return req_id in self._raiden_done_sending
+    def try_start_decode(self, context: DecodeTransferContext) -> DecodeAdmission:
+        receiver = self.create_receiver(context.req_id)
+        try:
+            peer = context.peer_info
+            receiver.init(
+                PMetadata(
+                    remote_addr=f"{peer['host']}:{peer['transfer_port']}",
+                    uuid=context.transfer_id,
+                    specs={"kv": context.spec_factory()},
+                    p_side_channel_host=str(peer["host"]),
+                    p_side_channel_port=int(peer["side_channel_port"]),
+                )
+            )
+        except Exception:
+            with suppress(Exception):
+                receiver.fail(reason="receiver_init")
+            raise
+        return DecodeAdmission.admitted(receiver)
 
-    def raiden_receiver_state(self, req_id: str) -> str | None:
-        """Return ``"done"`` / ``"failed"`` / ``None`` for a receiver req_id."""
-
-        with self._raiden_poll_lock:
-            if req_id in self._raiden_failed_recving:
-                return "failed"
-            if req_id in self._raiden_done_recving:
-                return "done"
-            return None
-
-    def raiden_forget(self, req_id: str) -> None:
-        """Drop cached raiden state for a retired req_id (bounds the sets)."""
-
-        with self._raiden_poll_lock:
-            self._raiden_done_sending.discard(req_id)
-            self._raiden_done_recving.discard(req_id)
-            self._raiden_failed_recving.discard(req_id)
+    def cleanup_transfer(self, bootstrap_room: int | None) -> None:  # noqa: ARG002
+        return
 
     # ------------------------------------------------------------------
     # KV-domain: prefill-side handoff (path A / path B)
@@ -286,8 +269,6 @@ class JaxTransferKVManager(CommonKVManager):
 
         if not payload:
             raise ValueError("payload must be a non-empty dict")
-        if self._wrapper is None:
-            raise RuntimeError("producer_handoff requires the jax transfer engine")
         for name in payload:
             if ":" in name:
                 raise ValueError(f"entry name {name!r} must not contain ':'")
@@ -334,60 +315,6 @@ class JaxTransferKVManager(CommonKVManager):
         return TransferStatus(uuid=uuid, sub_uuids=tuple(sub_uuids), on_done=lambda: None)
 
     # ------------------------------------------------------------------
-    # KV-domain: Raiden prefill-side handoff
-    # ------------------------------------------------------------------
-
-    def producer_register_read(
-        self,
-        req_id: str,
-        uuid: str,
-        block_ids: list[int],
-        *,
-        bootstrap_room: int | None = None,
-        transfer_id: str | None = None,
-    ) -> bool:
-        """raiden producer handoff: mark ``block_ids`` readable and publish the
-        per-request block metadata to bootstrap so D can pull.
-
-        Returns raiden's ``register_read`` result (False = nothing to transfer).
-        Unlike path-A there is no D2H staging and no HBM buffer to keep alive:
-        raiden references the device pool blocks directly and pulls them on
-        demand, so the sender holds no payload reference.
-
-        Registration is deliberately single-shot after the final prefill chunk;
-        transfer/forward overlap is outside this integration's scope.
-        """
-
-        if self._raiden_wrapper is None:
-            raise RuntimeError("producer_register_read requires a raiden_wrapper on the manager")
-        needed = self._raiden_wrapper.register_read(req_id, _uuid_to_int(uuid), block_ids)
-        logger.debug(
-            "RAIDEN-P register_read req_id=%s uuid=%s uuid_int=%s room=%s nblocks=%d blocks=%s needed=%s",
-            req_id,
-            uuid,
-            _uuid_to_int(uuid),
-            bootstrap_room,
-            len(block_ids),
-            list(block_ids)[:8],
-            needed,
-        )
-        # Publish the block layout + control endpoint for D. Even when
-        # ``needed`` is False we register (empty transfers still resolve on the
-        # decode side); an empty block list means D's start_read is a no-op.
-        if self._bootstrap_client is not None and bootstrap_room is not None:
-            import json as _json
-
-            endpoints = self._raiden_wrapper.endpoints
-            self._bootstrap_client.register_transfer(
-                bootstrap_room,
-                transfer_id or uuid,
-                block_ids,
-                local_control_port=self._raiden_wrapper.control_port,
-                raiden_endpoints_json=_json.dumps(endpoints) if endpoints is not None else "",
-            )
-        return needed
-
-    # ------------------------------------------------------------------
     # ABC — factory methods
     # ------------------------------------------------------------------
 
@@ -424,11 +351,6 @@ class JaxTransferKVSender(KVSender, StateHolder):
         self._use_d2h_staging: bool | None = None
         self._buffer_id: int | None = None
         self._status: TransferStatus | None = None
-        # raiden path: device block ids to register + bootstrap room for the
-        # P->D block-metadata publish. ``_use_raiden`` mirrors the manager.
-        self._use_raiden: bool = bool(getattr(mgr, "use_raiden", False))
-        self._block_ids: list[int] | None = None
-        self._bootstrap_room: int | None = None
         self._state_lock = threading.Lock()
         self._ack_timer: object | None = None
         self._transfer_started_at: float | None = None
@@ -461,18 +383,7 @@ class JaxTransferKVSender(KVSender, StateHolder):
         self._use_d2h_staging = use_d2h_staging
         self._buffer_id = buffer_id
 
-    def attach_block_ids(self, block_ids: list[int], *, bootstrap_room: int | None) -> None:
-        """Attach the producer device blocks used by Raiden's direct pull."""
-
-        if self._block_ids is not None:
-            raise RuntimeError(f"sender {self._req_id!r} block_ids already attached")
-        self._block_ids = list(block_ids)
-        self._bootstrap_room = bootstrap_room
-
     def send(self) -> None:
-        if self._use_raiden:
-            self._send_raiden()
-            return
         if self._payload is None:
             raise RuntimeError(
                 f"sender {self._req_id!r} has no payload attached; "
@@ -481,8 +392,6 @@ class JaxTransferKVSender(KVSender, StateHolder):
         assert self._use_d2h_staging is not None
         callback_uuid = self.uuid.encode("utf-8")
         notifier = self._mgr.zmq_notifier
-        if notifier is None:
-            raise RuntimeError("jax transfer sender requires a ZmqPullNotifier")
         with self._state_lock:
             # Register callback before producer_handoff so the ack can't
             # arrive between data registration and callback registration.
@@ -511,59 +420,9 @@ class JaxTransferKVSender(KVSender, StateHolder):
 
             self._transfer_started_at = _time.monotonic()
 
-    def _send_raiden(self) -> None:
-        """Register all prompt blocks once the final prefill chunk is ready."""
-
-        if self._block_ids is None:
-            raise RuntimeError(
-                f"sender {self._req_id!r} has no block_ids attached; "
-                "call attach_block_ids() before send()"
-            )
-        with self._state_lock:
-            self._mgr.producer_register_read(
-                self.uuid,
-                self.uuid,
-                self._block_ids,
-                bootstrap_room=self._bootstrap_room,
-                transfer_id=self.uuid,
-            )
-            self._transition_to(KVPoll.TRANSFERRING)
-            self._ack_timer = time_phase("ack", "prefill")
-            self._ack_timer.__enter__()
-            import time as _time
-
-            self._transfer_started_at = _time.monotonic()
-
     def poll(self) -> KVPoll:
-        if self._use_raiden:
-            return self._poll_raiden()
         with self._state_lock:
             return self.state
-
-    def _poll_raiden(self) -> KVPoll:
-        with self._state_lock:
-            if self.state != KVPoll.TRANSFERRING:
-                return self.state
-        # Refresh the manager's cached raiden done set, then check membership.
-        self._mgr.poll_raiden()
-        if not self._mgr.raiden_sender_done(self.uuid):
-            return KVPoll.TRANSFERRING
-        with self._state_lock:
-            if self.state != KVPoll.TRANSFERRING:
-                return self.state
-            self._transition_to(KVPoll.SUCCESS)
-            self._close_ack_timer()
-            self._transfer_started_at = None
-            self._mgr.record_terminal(
-                self._req_id,
-                role="prefill",
-                transfer_id=self.uuid,
-                state=KVPoll.SUCCESS,
-                reason="raiden_done_sending",
-            )
-        self._mgr.raiden_forget(self.uuid)
-        self._mgr._prune_sender(self._req_id)
-        return KVPoll.SUCCESS
 
     def clear(self) -> None:
         self._mgr._clear_terminal_record(self._req_id, role="prefill")
@@ -585,13 +444,8 @@ class JaxTransferKVSender(KVSender, StateHolder):
         raise RuntimeError(f"Prefill transfer failed for req_id={self._req_id!r}: {record.reason}")
 
     def fail(self, *, reason: str = "sender_fail") -> None:
-        if self._use_raiden:
-            self._fail_raiden(reason=reason)
-            return
         callback_uuid = self.uuid.encode("utf-8")
         notifier = self._mgr.zmq_notifier
-        if notifier is None:
-            raise RuntimeError("jax transfer sender requires a ZmqPullNotifier")
         with self._state_lock:
             if self.state in (KVPoll.SUCCESS, KVPoll.FAILED):
                 return
@@ -619,35 +473,9 @@ class JaxTransferKVSender(KVSender, StateHolder):
             PD_TRANSFER_FAILURES_TOTAL.labels(reason=reason, role="prefill").inc()
         self._mgr._prune_sender(self._req_id)
 
-    def _fail_raiden(self, *, reason: str) -> None:
-        with self._state_lock:
-            if self.state in (KVPoll.SUCCESS, KVPoll.FAILED):
-                return
-            self._transition_to(KVPoll.FAILED)
-            self._close_ack_timer()
-            self._transfer_started_at = None
-            bootstrap_room = self._bootstrap_room
-            transfer_id = self.uuid
-            self._mgr.record_terminal(
-                self._req_id,
-                role="prefill",
-                transfer_id=transfer_id,
-                state=KVPoll.FAILED,
-                reason=reason,
-            )
-        self._mgr.raiden_forget(transfer_id)
-        if bootstrap_room is not None and self._mgr.bootstrap_client is not None:
-            with suppress(Exception):
-                self._mgr.bootstrap_client.pop_transfer(bootstrap_room)
-        with suppress(Exception):
-            PD_TRANSFER_FAILURES_TOTAL.labels(reason=reason, role="prefill").inc()
-        self._mgr._prune_sender(self._req_id)
-
     def _on_ack(self, _uuid_bytes: bytes) -> None:
         callback_uuid = self.uuid.encode("utf-8")
         notifier = self._mgr.zmq_notifier
-        if notifier is None:
-            raise RuntimeError("jax transfer sender requires a ZmqPullNotifier")
         try:
             with self._state_lock:
                 try:
@@ -722,9 +550,6 @@ class JaxTransferKVReceiver(KVReceiver, StateHolder):
         self._results: dict[str, jax.Array] | None = None
         self._pull_timer: object | None = None
         self._transfer_started_at: float | None = None
-        # raiden path: one start_read after the complete prompt is published.
-        self._use_raiden: bool = bool(getattr(mgr, "use_raiden", False))
-        self._started_read = False
         self._state_lock = threading.Lock()
 
     @property
@@ -741,6 +566,11 @@ class JaxTransferKVReceiver(KVReceiver, StateHolder):
 
     def clear(self) -> None:
         self._mgr._clear_terminal_record(self._req_id, role="decode")
+
+    def commit(self, install: Callable[[object], None]) -> None:
+        if self.state != KVPoll.SUCCESS or self._results is None:
+            raise RuntimeError("cannot commit an incomplete JAX transfer")
+        install(self._results["kv"])
 
     def abort(self) -> None:
         self.fail(reason="abort")
@@ -759,9 +589,6 @@ class JaxTransferKVReceiver(KVReceiver, StateHolder):
         raise RuntimeError(f"Decode transfer failed for req_id={self._req_id!r}: {record.reason}")
 
     def fail(self, *, reason: str = "receiver_fail") -> None:
-        if self._use_raiden:
-            self._fail_raiden(reason=reason)
-            return
         with self._state_lock:
             if self.state in (KVPoll.SUCCESS, KVPoll.FAILED):
                 return
@@ -795,8 +622,6 @@ class JaxTransferKVReceiver(KVReceiver, StateHolder):
         self._transition_to(KVPoll.WAITING_FOR_INPUT)
 
     def poll(self) -> KVPoll:
-        if self._use_raiden:
-            return self._poll_raiden()
         state = self.state
         if state == KVPoll.WAITING_FOR_INPUT:
             if self._metadata is None:
@@ -829,8 +654,6 @@ class JaxTransferKVReceiver(KVReceiver, StateHolder):
                 return state
             assert self._metadata is not None
             notifier = self._mgr.zmq_notifier
-            if notifier is None:
-                raise RuntimeError("jax transfer receiver requires a ZmqPullNotifier")
             with self._state_lock:
                 if self.state != KVPoll.TRANSFERRING:
                     return self.state
@@ -868,110 +691,6 @@ class JaxTransferKVReceiver(KVReceiver, StateHolder):
             self._mgr._prune_receiver(self._req_id)
         return self.state
 
-    def _poll_raiden(self) -> KVPoll:
-        """Start one direct device-block read and poll it to completion."""
-
-        state = self.state
-        if state == KVPoll.WAITING_FOR_INPUT:
-            if self._metadata is None:
-                raise RuntimeError("JaxTransferKVReceiver.init() must be called before poll()")
-            import time as _time
-
-            with self._state_lock:
-                if self.state != KVPoll.WAITING_FOR_INPUT:
-                    return self.state
-                self._transition_to(KVPoll.TRANSFERRING)
-                self._pull_timer = time_phase("pull", "decode")
-                self._pull_timer.__enter__()
-                self._transfer_started_at = _time.monotonic()
-                should_start = not self._started_read
-                self._started_read = True
-            if should_start:
-                md = self._metadata
-                wrapper = self._mgr.raiden_wrapper
-                if wrapper is None:
-                    self._fail_raiden(reason="raiden_wrapper_missing")
-                    return self.state
-                try:
-                    wrapper.start_read(
-                        md.uuid,
-                        _uuid_to_int(md.uuid),
-                        md.remote_endpoint,
-                        list(md.remote_block_ids or ()),
-                        list(md.local_block_ids or ()),
-                    )
-                except Exception:  # noqa: BLE001
-                    logger.exception("raiden start_read raised for req_id=%s", self._req_id)
-                    self._fail_raiden(reason="raiden_start_read")
-                    return self.state
-            return self.state
-
-        if state == KVPoll.TRANSFERRING:
-            self._mgr.poll_raiden()
-            assert self._metadata is not None
-            rstate = self._mgr.raiden_receiver_state(self._metadata.uuid)
-            if rstate is None:
-                return self.state
-            if rstate == "failed":
-                self._fail_raiden(reason="raiden_failed_recving")
-                return self.state
-            with self._state_lock:
-                if self.state != KVPoll.TRANSFERRING:
-                    return self.state
-                self._transition_to(KVPoll.SUCCESS)
-                self._close_pull_timer()
-                self._transfer_started_at = None
-                self._mgr.record_terminal(
-                    self._req_id,
-                    role="decode",
-                    transfer_id=self._metadata.uuid,
-                    state=KVPoll.SUCCESS,
-                    reason="raiden_done_recving",
-                )
-            self._mgr.raiden_forget(self._metadata.uuid)
-            self._pop_bootstrap_room()
-            self._mgr._prune_receiver(self._req_id)
-        return self.state
-
-    def _fail_raiden(self, *, reason: str) -> None:
-        """Fail a Raiden receive and drop its cached/bootstrap metadata."""
-
-        with self._state_lock:
-            if self.state in (KVPoll.SUCCESS, KVPoll.FAILED):
-                return
-            try:
-                self._transition_to(KVPoll.FAILED)
-            except ValueError:
-                return
-            self._close_pull_timer()
-            self._transfer_started_at = None
-            md = self._metadata
-            transfer_id = md.uuid if md is not None else self._req_id
-            self._mgr.record_terminal(
-                self._req_id,
-                role="decode",
-                transfer_id=transfer_id,
-                state=KVPoll.FAILED,
-                reason=reason,
-            )
-        with suppress(Exception):
-            PD_TRANSFER_FAILURES_TOTAL.labels(reason=reason, role="decode").inc()
-        self._mgr.raiden_forget(transfer_id)
-        self._pop_bootstrap_room()
-        self._mgr._prune_receiver(self._req_id)
-
-    def _pop_bootstrap_room(self) -> None:
-        """Best-effort removal of per-request Raiden block metadata."""
-
-        md = self._metadata
-        if md is None or md.bootstrap_room is None:
-            return
-        bc = self._mgr.bootstrap_client
-        if bc is None:
-            return
-        with suppress(Exception):
-            bc.pop_transfer(md.bootstrap_room)
-
     def _run_pull(self) -> None:
         """Run the pull on a background worker thread, off the decode
         event-loop thread. Results are stored under ``_state_lock`` and only
@@ -982,8 +701,6 @@ class JaxTransferKVReceiver(KVReceiver, StateHolder):
 
         assert self._metadata is not None
         wrapper = self._mgr.wrapper
-        if wrapper is None:
-            raise RuntimeError("jax transfer receiver requires JaxTransferWrapper")
         try:
             results: dict[str, jax.Array] = {}
             for name, spec in self._metadata.specs.items():

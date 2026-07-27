@@ -1,0 +1,64 @@
+# Render only the listed deployment fields so pod-time variables remain intact:
+# envsubst '${TPU_ACCELERATOR} ${TPU_TOPOLOGY} ${PD_IMAGE} ${MODEL_PATH} ${RAIDEN_WHEEL_DIR} ${MODEL_CACHE_PVC}'
+apiVersion: v1
+kind: Service
+metadata:
+  name: pd-raiden-smoke
+spec:
+  clusterIP: None
+  selector:
+    job-name: pd-raiden-smoke
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: pd-raiden-smoke
+spec:
+  completionMode: Indexed
+  completions: 2
+  parallelism: 2
+  backoffLimit: 0
+  template:
+    spec:
+      subdomain: pd-raiden-smoke
+      restartPolicy: Never
+      nodeSelector:
+        cloud.google.com/gke-tpu-accelerator: ${TPU_ACCELERATOR}
+        cloud.google.com/gke-tpu-topology: ${TPU_TOPOLOGY}
+      tolerations:
+      - key: google.com/tpu
+        operator: Exists
+        effect: NoSchedule
+      containers:
+      - name: server
+        image: ${PD_IMAGE}
+        command: [bash, -lc]
+        args:
+        - |
+          set -euo pipefail
+          wheel=$(<"${RAIDEN_WHEEL_DIR}/READY")
+          (cd "${RAIDEN_WHEEL_DIR}" && sha256sum -c SHA256SUMS)
+          python -m pip install --no-deps "${RAIDEN_WHEEL_DIR}/${wheel}"
+          export ROLE=$([[ "${JOB_COMPLETION_INDEX}" = 0 ]] && echo prefill || echo decode)
+          exec scripts/disaggregation/run_raiden_smoke.sh
+        env:
+        - name: PREFILL_HOST
+          value: pd-raiden-smoke-0.pd-raiden-smoke
+        - name: MODEL_PATH
+          value: ${MODEL_PATH}
+        - name: RAIDEN_WHEEL_DIR
+          value: ${RAIDEN_WHEEL_DIR}
+        - name: SGLANG_JAX_USE_RAIDEN
+          value: "1"
+        resources:
+          requests:
+            google.com/tpu: 1
+          limits:
+            google.com/tpu: 1
+        volumeMounts:
+        - name: model-cache
+          mountPath: /models
+      volumes:
+      - name: model-cache
+        persistentVolumeClaim:
+          claimName: ${MODEL_CACHE_PVC}
