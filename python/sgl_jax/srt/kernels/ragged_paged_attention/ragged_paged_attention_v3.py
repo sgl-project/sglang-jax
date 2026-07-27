@@ -2012,10 +2012,8 @@ def ragged_paged_attention(
 
     def _prepare_block_sizes(block_sizes, case):
         if block_sizes is None:
-            # The tuned table is measured on v7 (full VMEM). Restrict lookups to
-            # v7 so v6e/v5 keep main's heuristic path unchanged (the v7-tuned
-            # entries are not valid for the v6e //2 budget and regress its
-            # perf guard). v6e/v5 tuning can be added later under their own keys.
+            # v6e and v7 have device-specific entries tuned for their respective
+            # VMEM budgets. Keep earlier TPU generations on the heuristic path.
             tuned = (
                 get_tuned_block_sizes_v3(
                     case.symbol,
@@ -2028,7 +2026,7 @@ def ragged_paged_attention(
                     max_num_tokens,
                     sliding_window=sliding_window,
                 )
-                if tpu_version == 7
+                if tpu_version in (6, 7)
                 else None
             )
             if tuned is not None:
