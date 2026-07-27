@@ -105,6 +105,7 @@ class NativeAttention(AttentionBackend):
             is_causal,
             forward_batch.forward_mode,
             self.kv_sharding,
+            page_size=token_to_kv_pool.page_size,
             mesh=self.mesh,
             xai_temperature_len=xai_temp_len,
             attention_sink=attention_sink,
@@ -185,6 +186,8 @@ def forward_attention(
     attention_sink: jax.Array | None = None,
     sliding_window_size: int | None = None,
     softmax_dtype: jnp.dtype | None = None,
+    *,
+    page_size: int,
 ):
     """
     Forward pass using native JAX implementation with block-diagonal attention.
@@ -204,6 +207,7 @@ def forward_attention(
         xai_temperature_len: length of the xai temperature
         attention_sink: per-head bias for phantom attention sink token
         sliding_window_size: sliding window size for attention
+        page_size: KV pool page size; decode `loc` blocks are page-aligned per request
 
     Returns:
         Output tensor of shape[batch_size, hidden_size]
@@ -295,7 +299,9 @@ def forward_attention(
             mesh=mesh,
         )
     else:
-        attn_logits = _apply_decode_mask(attn_logits, seq_lengths, sliding_window_size, mesh=mesh)
+        attn_logits = _apply_decode_mask(
+            attn_logits, seq_lengths, page_size, sliding_window_size, mesh=mesh
+        )
 
     # Softmax (with optional attention sink)
     # Cast to softmax_dtype if specified for improved numerical stability
@@ -399,6 +405,7 @@ def _apply_extend_mask(
 def _apply_decode_mask(
     attn_weights: jax.Array,
     seq_lengths: jax.Array,
+    page_size: int,
     sliding_window_size: int | None = None,
     mesh: Mesh | None = None,
 ):
@@ -412,7 +419,10 @@ def _apply_decode_mask(
 
     def create_decode_sequence_mask():
         total_prefix_len = key_len
-        seq_starts = jnp.cumsum(jnp.concatenate([jnp.array([0]), seq_lengths[:-1]]))
+        # `cache_loc` blocks are page-aligned per request (_merge_cache_loc), so the offsets
+        # step by aligned lengths while each span stays at the real length, excluding page tails.
+        aligned_lengths = ((seq_lengths + page_size - 1) // page_size) * page_size
+        seq_starts = jnp.cumsum(jnp.concatenate([jnp.array([0]), aligned_lengths[:-1]]))
         seq_ends = seq_starts + seq_lengths
         all_positions = jnp.arange(total_prefix_len)
         seq_mask = (all_positions[None, :] >= seq_starts[:, None]) & (
