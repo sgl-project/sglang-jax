@@ -1850,9 +1850,9 @@ class ServerArgs:
                     )
                     self.speculative_num_draft_tokens = draft_config.block_size
             if self.enable_lora or self.enable_static_lora or self.lora_paths:
-                raise ValueError("DFLASH stage2 does not support LoRA.")
+                raise ValueError("DFLASH does not support LoRA.")
             if self.grammar_backend not in (None, "none"):
-                raise ValueError("DFLASH stage2 does not support constrained decoding.")
+                raise ValueError("DFLASH does not support constrained decoding.")
 
     def check_lora_server_args(self):
         """Validate and normalize LoRA-related server arguments."""

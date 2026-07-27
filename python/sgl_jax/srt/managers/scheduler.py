@@ -151,8 +151,8 @@ class GenerationBatchResult:
 def validate_dflash_request(req) -> str | None:
     """Per-request DFLASH guard (mirrors SGLang PR 22077).
 
-    Returns an error message if the request uses a feature DFLASH stage C does
-    not support yet, otherwise None.
+    Returns an error message if the request uses an unsupported DFLASH feature,
+    otherwise None.
     """
     if req.return_logprob or req.return_output_logprob_only:
         return "DFLASH speculative decoding does not support return_logprob yet."
@@ -166,6 +166,16 @@ def validate_dflash_request(req) -> str | None:
         return "DFLASH speculative decoding does not support grammar-constrained decoding yet."
     if sp.top_k != 1:
         return "DFLASH speculative decoding currently only supports greedy sampling."
+    if (
+        sp.frequency_penalty != 0.0
+        or sp.presence_penalty != 0.0
+        or sp.repetition_penalty != 1.0
+        or sp.min_new_tokens != 0
+    ):
+        return (
+            "DFLASH speculative decoding does not support frequency, presence, "
+            "or repetition penalties, or min_new_tokens yet."
+        )
     return None
 
 
