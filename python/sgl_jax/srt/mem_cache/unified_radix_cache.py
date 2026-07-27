@@ -37,6 +37,7 @@ from sgl_jax.srt.mem_cache.radix_cache import (
     _key_match_page_size1,
     _key_match_paged,
     get_child_key,
+    request_cache_key_ids,
 )
 from sgl_jax.srt.mem_cache.unified_cache_components import (
     _NUM_COMPONENT_TYPES,
@@ -335,6 +336,7 @@ class UnifiedRadixCache(BasePrefixCache):
             return
 
         token_ids = (req.origin_input_ids + req.output_ids)[:committed_kv_len]
+        token_ids = request_cache_key_ids(req, token_ids)
         # For the EAGLE bigram key the key length is one less than the token
         # length, so the corresponding kv length is reduced by one as well.
         actual_kv_len = committed_kv_len - 1 if self.is_eagle else committed_kv_len
@@ -412,7 +414,7 @@ class UnifiedRadixCache(BasePrefixCache):
             return
 
         dp_rank = req.dp_rank if req.dp_rank is not None else 0
-        token_ids = req.fill_ids
+        token_ids = request_cache_key_ids(req, req.fill_ids)
         all_token_len = len(token_ids)
         actual_kv_len = all_token_len - 1 if self.is_eagle else all_token_len
         kv_indices = self.req_to_token_pool.read(req.req_pool_idx, all_token_len)

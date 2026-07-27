@@ -53,10 +53,7 @@ from sgl_jax.srt.mem_cache.radix_cache import RadixKey
 from sgl_jax.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sgl_jax.srt.multimodal.common.mm_plan import MultimodalEmbedPlan
-from sgl_jax.srt.multimodal.common.modality_enum import (
-    MultimodalInputs,
-    pad_input_tokens,
-)
+from sgl_jax.srt.multimodal.common.modality_enum import MultimodalInputs
 from sgl_jax.srt.precision_tracer import (
     PrecisionTracerRequestMetadata,
     precision_tracer,
@@ -515,16 +512,6 @@ class Req:
 
         max_prefix_len = max(max_prefix_len, 0)
         return self.fill_ids[:max_prefix_len]
-
-    def compute_cache_input_ids(self) -> None:
-        """Build hash-substituted multimodal IDs used only for cache keys."""
-        mm_inputs = self.mm_inputs
-        self.cache_input_ids = None
-        if not isinstance(mm_inputs, MultimodalInputs) or not mm_inputs.mm_items:
-            return
-        padded_ids = pad_input_tokens(self.origin_input_ids, mm_inputs.mm_items)
-        if padded_ids != self.origin_input_ids:
-            self.cache_input_ids = padded_ids
 
     def match_key_ids(self):
         """Prefix ids for the radix key. Uses hash-substituted ``cache_input_ids``

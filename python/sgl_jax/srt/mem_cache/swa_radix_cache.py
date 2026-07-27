@@ -26,7 +26,7 @@ from sgl_jax.srt.mem_cache.radix_cache import (
     _key_match_page_size1 as _key_match_page_size1_radix,
 )
 from sgl_jax.srt.mem_cache.radix_cache import _key_match_paged as _key_match_paged_radix
-from sgl_jax.srt.mem_cache.radix_cache import get_child_key
+from sgl_jax.srt.mem_cache.radix_cache import get_child_key, request_cache_key_ids
 
 if TYPE_CHECKING:
     from sgl_jax.srt.managers.schedule_batch import Req
@@ -411,6 +411,7 @@ class SWARadixCache(BasePrefixCache):
             return
 
         token_ids = (req.origin_input_ids + req.output_ids)[:committed_kv_len]
+        token_ids = request_cache_key_ids(req, token_ids)
         kv_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx, : len(token_ids)]
 
         if self.page_size != 1:
@@ -451,7 +452,7 @@ class SWARadixCache(BasePrefixCache):
             req.prefix_indices = kv_indices.copy()
             return
 
-        token_ids = req.fill_ids
+        token_ids = request_cache_key_ids(req, req.fill_ids)
         kv_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx, : len(token_ids)]
 
         if self.page_size != 1:

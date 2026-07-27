@@ -76,24 +76,8 @@ def tensor_hash(tensor_list: Any) -> int:
 def pad_input_tokens(
     input_ids: list[int],
     mm_items: list["MultimodalDataItem"],
-    im_token_id: int | None = None,
-    video_token_id: int | None = None,
-    audio_token_id: int | None = None,
 ) -> list[int]:
-    """
-    Replace multimodal placeholder tokens in input_ids with corresponding pad_values from mm_items.
-    This is critical for radix cache to differentiate between different images/videos.
-    Different images/videos will have different pad_values (hash-based), so the cache
-    will correctly identify them as different prefixes.
-    Args:
-        input_ids: The input token IDs containing placeholder tokens
-        mm_items: List of multimodal data items with pad_value set
-        im_token_id: Token ID used for image placeholders
-        video_token_id: Token ID used for video placeholders
-        audio_token_id: Token ID used for audio placeholders
-    Returns:
-        Modified input_ids with placeholder tokens replaced by pad_values
-    """
+    """Replace placeholder ranges with per-item Radix identity tokens."""
     if not input_ids or not mm_items:
         return input_ids
     padded_ids = list(input_ids)
@@ -381,3 +365,19 @@ class MultimodalInputs:
             self.num_image_tokens += other.num_image_tokens
         elif self.num_image_tokens is None:
             self.num_image_tokens = other.num_image_tokens
+
+
+def build_cache_input_ids(
+    input_ids: list[int] | None,
+    mm_inputs: MultimodalInputs | dict | None,
+) -> list[int] | None:
+    """Build hash-substituted IDs used only for multimodal cache keys."""
+    if (
+        not isinstance(mm_inputs, MultimodalInputs)
+        or not mm_inputs.mm_items
+        or not input_ids
+        or not isinstance(input_ids[0], int)
+    ):
+        return None
+    padded_ids = pad_input_tokens(input_ids, mm_inputs.mm_items)
+    return padded_ids if padded_ids != input_ids else None

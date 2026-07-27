@@ -1,10 +1,32 @@
 import numpy as np
 import pytest
 
-from sgl_jax.srt.multimodal.common.modality_enum import Modality
+from sgl_jax.srt.multimodal.common.modality_enum import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputs,
+    build_cache_input_ids,
+)
 from sgl_jax.srt.multimodal.processors.qwen_vl import QwenVLProcessor
 
 IMAGE_TOKEN = 151655
+
+
+def test_build_cache_input_ids_uses_item_hash():
+    input_ids = [1, IMAGE_TOKEN, IMAGE_TOKEN, 2]
+    item = MultimodalDataItem(
+        modality=Modality.IMAGE,
+        pad_value=123456,
+        placeholder_ranges=[(1, 3)],
+    )
+
+    assert build_cache_input_ids(input_ids, MultimodalInputs([item])) == [
+        1,
+        123456,
+        123456,
+        2,
+    ]
+    assert input_ids == [1, IMAGE_TOKEN, IMAGE_TOKEN, 2]
 
 
 def test_placeholder_ranges_are_half_open():
