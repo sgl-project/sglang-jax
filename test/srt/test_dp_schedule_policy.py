@@ -107,6 +107,14 @@ def test_match_key_uses_reusable_prefix_not_full():
     assert match_key(_req([1, 2, 3, 4], extra_key="lora-a")) == ([1, 2, 3], "lora-a")
 
 
+def test_match_key_prefers_multimodal_cache_input_ids():
+    req = _req([1, 99, 99, 4])
+    assert match_key(req, [1, 123456, 123456, 4]) == (
+        [1, 123456, 123456],
+        None,
+    )
+
+
 def test_match_key_appends_lora_id():
     # Matches Req.__init__: lora_id is concatenated into extra_key.
     assert match_key(_req([1, 2, 3, 4], extra_key="salt:", lora_id="adapter")) == (

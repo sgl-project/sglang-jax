@@ -86,6 +86,10 @@ from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.model_executor.model_runner_kv_cache_mixin import (
     recurrent_admission_blocked,
 )
+from sgl_jax.srt.multimodal.common.modality_enum import (
+    MultimodalInputs,
+    pad_input_tokens,
+)
 from sgl_jax.srt.multimodal.tokenizer_utils import resolve_tokenizer_subdir
 from sgl_jax.srt.precision_tracer import precision_tracer
 from sgl_jax.srt.server_args import (
@@ -896,7 +900,10 @@ class Scheduler(
         if not eligible:
             return None
 
-        token_ids, extra_key = req_prefix_match_key(req)
+        cache_input_ids = None
+        if isinstance(req.mm_inputs, MultimodalInputs) and req.mm_inputs.mm_items:
+            cache_input_ids = pad_input_tokens(req.input_ids, req.mm_inputs.mm_items)
+        token_ids, extra_key = req_prefix_match_key(req, cache_input_ids)
         matches: dict[int, int] = {}
         prompt_len = len(token_ids) if token_ids else 0
         if token_ids:
@@ -1266,13 +1273,7 @@ class Scheduler(
                 req.deepstack_visual_embedding = _extract_mm_value(
                     recv_req.mm_inputs, "deepstack_visual_embedding"
                 )
-            # Hash-substitute placeholder tokens so the radix cache distinguishes
-            # different images/videos sharing the same placeholder token ids.
-            req.compute_cache_input_ids(
-                im_token_id=getattr(self.model_config, "image_token_id", None),
-                video_token_id=getattr(self.model_config, "video_token_id", None),
-                audio_token_id=getattr(self.model_config, "audio_token_id", None),
-            )
+            req.compute_cache_input_ids()
         # Validate prompt length
         error_msg = validate_input_length(
             req,

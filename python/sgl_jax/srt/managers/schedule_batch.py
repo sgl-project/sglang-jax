@@ -53,7 +53,10 @@ from sgl_jax.srt.mem_cache.radix_cache import RadixKey
 from sgl_jax.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sgl_jax.srt.multimodal.common.mm_plan import MultimodalEmbedPlan
-from sgl_jax.srt.multimodal.common.modality_enum import MultimodalInputs
+from sgl_jax.srt.multimodal.common.modality_enum import (
+    MultimodalInputs,
+    pad_input_tokens,
+)
 from sgl_jax.srt.precision_tracer import (
     PrecisionTracerRequestMetadata,
     precision_tracer,
@@ -513,33 +516,15 @@ class Req:
         max_prefix_len = max(max_prefix_len, 0)
         return self.fill_ids[:max_prefix_len]
 
-    def compute_cache_input_ids(
-        self, im_token_id=None, video_token_id=None, audio_token_id=None
-    ) -> None:
-        """Set ``cache_input_ids`` to ``origin_input_ids`` with multimodal
-        placeholders replaced by per-item hash pad_values, so the radix key
-        distinguishes different images/videos that share placeholder tokens.
-
-        Never touches ``fill_ids`` / ``origin_input_ids`` -- those stay the real
-        model input; only the radix key is affected.
-        """
-        from sgl_jax.srt.multimodal.common.modality_enum import (
-            MultimodalInputs,
-            pad_input_tokens,
-        )
-
+    def compute_cache_input_ids(self) -> None:
+        """Build hash-substituted multimodal IDs used only for cache keys."""
         mm_inputs = self.mm_inputs
+        self.cache_input_ids = None
         if not isinstance(mm_inputs, MultimodalInputs) or not mm_inputs.mm_items:
-            self.cache_input_ids = None
             return
-        padded = pad_input_tokens(
-            self.origin_input_ids,
-            mm_inputs.mm_items,
-            im_token_id=im_token_id,
-            video_token_id=video_token_id,
-            audio_token_id=audio_token_id,
-        )
-        self.cache_input_ids = padded if padded != list(self.origin_input_ids) else None
+        padded_ids = pad_input_tokens(self.origin_input_ids, mm_inputs.mm_items)
+        if padded_ids != self.origin_input_ids:
+            self.cache_input_ids = padded_ids
 
     def match_key_ids(self):
         """Prefix ids for the radix key. Uses hash-substituted ``cache_input_ids``
