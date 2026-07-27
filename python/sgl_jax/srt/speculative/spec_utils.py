@@ -110,7 +110,7 @@ def apply_simulated_acceptance(
     simulated_lens = jnp.where(valid_mask, simulated_len, 0).astype(jnp.int32)
 
     if config.token_mode == "fixed":
-        return simulated_index, jnp.full_like(predict, 100), simulated_lens
+        return simulated_index, jnp.full_like(predict, 32), simulated_lens
 
     if target_predict is None:
         raise ValueError(
