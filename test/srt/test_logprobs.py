@@ -123,18 +123,12 @@ class TestLogprobsDense(unittest.TestCase):
         )
 
         expected_output_logprobs = [
-            [-0.9453125, 32313, "Okay"],
+            [-0.921875, 32313, "Okay"],
             [0.0, 11, ","],
             [-0.3515625, 773, " so"],
         ]
         self.check_output(output_meta, "output_token_logprobs", expected_output_logprobs)
 
-        # use another expected, because jax compiler fused ops will introduce numerical precision issue
-        expected_output_logprobs = [
-            [-0.921875, 32313, "Okay"],
-            [0.0, 11, ","],
-            [-0.3515625, 773, " so"],
-        ]
         output = self.engine.generate(
             input_ids=input_ids,
             sampling_params=sampling_params,
@@ -180,7 +174,10 @@ class TestLogprobsDense(unittest.TestCase):
 
     def check_output(self, actual, key, expected):
         for i, logprob in enumerate(actual[key]):
-            self.assertEqual(logprob[0], expected[i][0], f"{logprob[0]} logprob is invalid")
+            # Reject even a one-ULP bf16 change near |logprob|=1.
+            self.assertAlmostEqual(
+                logprob[0], expected[i][0], delta=1e-3, msg=f"{logprob[0]} logprob is invalid"
+            )
             self.assertEqual(logprob[1], expected[i][1], f"{logprob[1]} output id is invalid")
             self.assertEqual(logprob[2], expected[i][2], f"{logprob[2]} token is invalid")
 

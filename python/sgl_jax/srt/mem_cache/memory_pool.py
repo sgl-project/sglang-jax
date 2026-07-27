@@ -597,7 +597,7 @@ class MHATokenToKVPool(KVCache):
             total_memory_per_layer / GB,
             self.dtype,
         )
-        with self.mesh:
+        with jax.set_mesh(self.mesh):
             self.kv_buffer = []
             allocate = _get_kv_zero_allocator(fused_buffer_shape, self.dtype, self.kv_sharding)
             for _ in range(self.layer_num):
@@ -1343,7 +1343,7 @@ class MLATokenToKVPool(KVCache):
             per_layer_bytes / GB,
         )
 
-        with self.mesh:
+        with jax.set_mesh(self.mesh):
             self.kv_buffer = []
             allocate = _get_kv_zero_allocator(buffer_shape, self.dtype, self.kv_sharding)
             for _ in range(self.layer_num):

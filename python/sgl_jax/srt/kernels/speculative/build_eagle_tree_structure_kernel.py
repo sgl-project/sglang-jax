@@ -233,7 +233,7 @@ def _build_eagle_tree_structure_kernel(
             cur_position = tid - 1  # Convert to 0-indexed for selected_index
 
             def body(state):
-                while_break, position, cur_position = state
+                it, while_break, position, cur_position = state
                 position += 1
                 mask_idx = token_tree_idx + cur_position
 
@@ -273,13 +273,13 @@ def _build_eagle_tree_structure_kernel(
                     parent_tb_idx_not_equal_to_0,
                     cur_position,
                 )
-                return while_break, position, cur_position
+                return it + 1, while_break, position, cur_position
 
             def cond(state):
-                while_break, _, _ = state
-                return while_break != 1
+                it, while_break, _, _ = state
+                return (while_break != 1) & (it < draft_token_num)
 
-            _, position, _ = jax.lax.while_loop(cond, body, (0, position, cur_position))
+            _, _, position, _ = jax.lax.while_loop(cond, body, (0, 0, position, cur_position))
 
             o_positions_ref.at[global_token_idx].set(position + seq_len)
             o_retrive_index_ref.at[bid, tid].set(global_token_idx)
@@ -344,14 +344,14 @@ def build_eagle_tree_structure_pallas_call(
 
     in_specs = [
         # all zero array
-        pl.BlockSpec(memory_space=pltpu.ANY),
+        pl.BlockSpec(memory_space=pl.ANY),
         # all one array
-        pl.BlockSpec(memory_space=pltpu.ANY),
+        pl.BlockSpec(memory_space=pl.ANY),
     ]
 
     out_specs = [
         # tree mask, shape: (draft_token_num, tree_mask_capacity, 128)
-        pl.BlockSpec(memory_space=pltpu.ANY),
+        pl.BlockSpec(memory_space=pl.ANY),
         # positions, shape: (bs*draft_token_num,)
         pl.BlockSpec(memory_space=pltpu.SMEM),
         # retrive_index, shape: (bs, draft_token_num)

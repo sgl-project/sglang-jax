@@ -91,8 +91,8 @@ def get_dtype_packing(dtype):
 def swigluoai(
     gate: jax.Array, up: jax.Array, *, alpha: float = 1.702, limit: float = 7.0
 ) -> jax.Array:
-    gate = jnp.clip(gate, a_max=limit)
-    up = jnp.clip(up, a_min=-limit, a_max=limit)
+    gate = jnp.clip(gate, max=limit)
+    up = jnp.clip(up, min=-limit, max=limit)
     glu = gate * jax.nn.sigmoid(alpha * gate)
     return (up + 1.0) * glu
 
@@ -111,8 +111,8 @@ def activation_fn(acc1, acc3, act_fn, swiglu_limit=None):
     # single-sided and the up branch double-sided before the multiply. None =
     # disabled (default), preserving prior behavior bit-for-bit.
     if swiglu_limit is not None:
-        act = jnp.clip(act, a_max=swiglu_limit)
-        acc3 = jnp.clip(acc3, a_min=-swiglu_limit, a_max=swiglu_limit)
+        act = jnp.clip(act, max=swiglu_limit)
+        acc3 = jnp.clip(acc3, min=-swiglu_limit, max=swiglu_limit)
     return act * acc3
 
 
@@ -504,12 +504,12 @@ def _fused_ep_moe_kernel(
     @jax.named_scope("sync_barrier")
     def sync_barrier():
         for i in range(num_devices):
-            pltpu.semaphore_signal(
+            pl.semaphore_signal(
                 barrier_sem,
                 device_id=get_mesh_device_id(i),
-                device_id_type=pltpu.DeviceIdType.MESH,
+                device_id_type=pl.DeviceIdType.MESH,
             )
-        pltpu.semaphore_wait(barrier_sem, num_devices)
+        pl.semaphore_wait(barrier_sem, num_devices)
 
     # ===== Topk fetch/wait =====
     @jax.named_scope("topk_fetch")
@@ -605,7 +605,7 @@ def _fused_ep_moe_kernel(
                     send_sem=md_send_sem,
                     recv_sem=md_recv_sem,
                     device_id=get_mesh_device_id(peer_id),
-                    device_id_type=pltpu.DeviceIdType.MESH,
+                    device_id_type=pl.DeviceIdType.MESH,
                 ).start()
                 return None
 
@@ -726,7 +726,7 @@ def _fused_ep_moe_kernel(
                             send_sem=scatter_send_sem(a2a_bank_id, e_sem_id_k),
                             recv_sem=scatter_recv_sem(a2a_bank_id, e_sem_id_k),
                             device_id=get_mesh_device_id(recv_id),
-                            device_id_type=pltpu.DeviceIdType.MESH,
+                            device_id_type=pl.DeviceIdType.MESH,
                         ).start()
 
             return None
@@ -822,7 +822,7 @@ def _fused_ep_moe_kernel(
                         send_sem=gather_send_sem_ref(gather_bank_id, e_sem_id),
                         recv_sem=a2a_gather_sem_ref(gather_bank_id),
                         device_id=get_mesh_device_id(recv_id),
-                        device_id_type=pltpu.DeviceIdType.MESH,
+                        device_id_type=pl.DeviceIdType.MESH,
                     ).start()
 
             start += sz

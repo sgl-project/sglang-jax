@@ -400,9 +400,23 @@ class TestAttention(CustomTestCase):
         if xai_temperature_len is not None and xai_temperature_len > 0:
             attn.xai_temperature_len = xai_temperature_len
 
+        # Place only the backend sink on the model parameter layout.
+        attention_sink_backend = (
+            None
+            if attention_sink is None
+            else jax.device_put(attention_sink, NamedSharding(mesh, P("tensor")))
+        )
+
         @jax.jit
         def jit_attn(q, k, v, forward_batch, token_to_kv_pool):
-            out = attn(q, k, v, forward_batch, token_to_kv_pool, attention_sink=attention_sink)
+            out = attn(
+                q,
+                k,
+                v,
+                forward_batch,
+                token_to_kv_pool,
+                attention_sink=attention_sink_backend,
+            )
             return out
 
         # run

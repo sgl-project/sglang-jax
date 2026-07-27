@@ -664,7 +664,7 @@ class Qwen2_5_VL_VisionModel(nnx.Module):
         weight_mappings = self._create_qwen2_5_vl_vision_weight_mappings()
 
         if self.mesh is not None:
-            with self.mesh:
+            with jax.set_mesh(self.mesh):
                 loader.load_weights_from_safetensors(weight_mappings)
         else:
             loader.load_weights_from_safetensors(weight_mappings)

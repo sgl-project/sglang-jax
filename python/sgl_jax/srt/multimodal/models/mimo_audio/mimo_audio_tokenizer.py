@@ -301,7 +301,7 @@ class ISTFTHead(nnx.Module):
         mag = mag.astype(jnp.float32)
         phase = phase.astype(jnp.float32)
 
-        mag = jnp.clip(jnp.exp(mag), a_max=1e2)
+        mag = jnp.clip(jnp.exp(mag), max=1e2)
         real = jnp.cos(phase)
         imag = jnp.sin(phase)
         spec = mag * (real + 1j * imag)

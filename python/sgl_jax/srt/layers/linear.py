@@ -253,6 +253,18 @@ class QuantizedLinear(nnx.Module):
             if n_out is not None:
                 weight_scale = expand_block_scale(weight_scale, n_out, int(weight_block_size[0]))
 
+        if (
+            mesh is not None
+            and kernel_axes is not None
+            and not isinstance(weight_scale, jax.ShapeDtypeStruct)
+        ):
+            scale_spec = (
+                P(kernel_axes[0], None, kernel_axes[1])
+                if weight_scale.ndim == 3
+                else P(kernel_axes[1])
+            )
+            weight_scale = jax.device_put(weight_scale, NamedSharding(mesh, scale_spec))
+
         self.weight_q = nnx.Param(weight_q)
         self.weight_scale = nnx.Param(weight_scale)
         self.bias = nnx.Param(bias) if bias is not None else None

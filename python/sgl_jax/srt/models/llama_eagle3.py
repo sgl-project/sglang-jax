@@ -75,7 +75,7 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
             input_size=2 * config.hidden_size,
             output_size=config.num_key_value_heads * self.self_attn.head_dim,
             use_bias=attention_bias,
-            kernel_axes=("tensor", None),
+            kernel_axes=(None, "tensor"),
             params_dtype=dtype,
             mesh=mesh,
         )

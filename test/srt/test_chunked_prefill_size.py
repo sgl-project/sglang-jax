@@ -30,6 +30,8 @@ class TestChunkedPrefillSize(CustomTestCase):
                 "4",
                 "--random-seed",
                 "3",
+                # Keep sampling independent of concurrent request scheduling.
+                "--enable-deterministic-sampling",
                 "--mem-fraction-static",
                 "0.8",
                 "--download-dir",

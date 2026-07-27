@@ -1,12 +1,39 @@
 import unittest
+from unittest import mock
 
 import jax.numpy as jnp
 import numpy as np
 
+from sgl_jax.srt.kernels.ragged_paged_attention import (
+    ragged_paged_attention_v3 as rpa_v3,
+)
 from sgl_jax.test.flashattention_common import AttentionTestBase
 
 
 class TestFlashAttentionGQA(AttentionTestBase):
+    def test_v6_custom_mask_caps_query_tiles(self):
+        kwargs = dict(
+            q_dtype=jnp.bfloat16,
+            kv_dtype=jnp.bfloat16,
+            actual_num_q_heads=128,
+            actual_num_kv_heads=8,
+            head_dim=128,
+            page_size=16,
+            max_num_tokens=256,
+            max_num_seqs=3,
+            pages_per_seq=16,
+            case=rpa_v3.RpaCase.MIXED,
+        )
+
+        with mock.patch.object(rpa_v3, "get_tpu_version", return_value=6):
+            without_mask = rpa_v3.get_default_block_sizes(**kwargs, use_custom_mask=False)
+            with_mask = rpa_v3.get_default_block_sizes(**kwargs, use_custom_mask=True)
+
+        self.assertEqual(without_mask["bq_sz"], 32)
+        self.assertEqual(without_mask["bq_csz"], 32)
+        self.assertEqual(with_mask["bq_sz"], 16)
+        self.assertEqual(with_mask["bq_csz"], 16)
+
     def test_gqa_prefill_accuracy_page_size_64(self):
         """Test JAX attention accuracy against PyTorch reference"""
         # Parameters
@@ -180,7 +207,7 @@ class TestFlashAttentionGQA(AttentionTestBase):
         rng = np.random.RandomState(202)
         attention_sink = jnp.array(rng.randn(num_heads).astype(np.float32))
 
-        self.run_test(
+        self.run_test_on_single_device(
             "decode",
             lens,
             (num_heads, head_dim, num_kv_heads, 1, jnp.bfloat16),
@@ -203,7 +230,7 @@ class TestFlashAttentionGQA(AttentionTestBase):
         rng = np.random.RandomState(303)
         attention_sink = jnp.array(rng.randn(num_heads).astype(np.float32))
 
-        self.run_test(
+        self.run_test_on_single_device(
             "prefill",
             lens,
             (num_heads, head_dim, num_kv_heads, 1, jnp.bfloat16),

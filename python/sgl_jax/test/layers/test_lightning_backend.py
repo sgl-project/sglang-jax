@@ -92,6 +92,11 @@ def _make_fake_layer(layer_id=_LAYER_ID, num_heads=_H, head_dim=_K):
     return SimpleNamespace(layer_id=layer_id, mesh=mesh, num_heads=num_heads, head_dim=head_dim)
 
 
+def _put(x, *axes):
+    """Place an array on the layout produced for the backend."""
+    return jax.device_put(x, jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(*axes)))
+
+
 def _make_mock_pool(layer_id, recurrent_state, recurrent_indices=None):
     """Create a mock recurrent state pool."""
     B = recurrent_state.shape[0]
@@ -99,7 +104,9 @@ def _make_mock_pool(layer_id, recurrent_state, recurrent_indices=None):
         recurrent_indices = np.arange(1, B + 1, dtype=np.int32)
     N_plus_1 = int(max(recurrent_indices)) + 1
     buf = jnp.zeros((N_plus_1,) + recurrent_state.shape[1:], dtype=recurrent_state.dtype)
-    buf = buf.at[jnp.array(recurrent_indices)].set(recurrent_state)
+    # Build the reference buffer from a host copy before placing its backend layout.
+    buf = buf.at[jnp.array(recurrent_indices)].set(np.asarray(recurrent_state))
+    buf = _put(buf, "data", "tensor", None, None)
     return MockRecurrentStatePool(layer_caches={layer_id: (buf, [])}), recurrent_indices
 
 
@@ -189,7 +196,10 @@ def _run_backend_extend(lens, H, K, dtype, h0, rng_seed, layer_id=_LAYER_ID):
         layer = _make_fake_layer(layer_id=layer_id, num_heads=H, head_dim=K)
         fb = SimpleNamespace(forward_mode=ForwardMode.EXTEND)
 
-        out_backend, pu = backend(q, k, v, layer=layer, forward_batch=fb, recurrent_state_pool=pool)
+        qs, ks, vs = (_put(t, "data", "tensor", None) for t in (q, k, v))
+        out_backend, pu = backend(
+            qs, ks, vs, layer=layer, forward_batch=fb, recurrent_state_pool=pool
+        )
         state_backend = _extract_state(pu, rec_indices)
 
     # Reference
@@ -240,7 +250,10 @@ def _run_backend_extend_bucket_padded(lens, H, K, dtype, h0, rng_seed, layer_id=
         layer = _make_fake_layer(layer_id=layer_id, num_heads=H, head_dim=K)
         fb = SimpleNamespace(forward_mode=ForwardMode.EXTEND)
 
-        out_backend, pu = backend(q, k, v, layer=layer, forward_batch=fb, recurrent_state_pool=pool)
+        qs, ks, vs = (_put(t, "data", "tensor", None) for t in (q, k, v))
+        out_backend, pu = backend(
+            qs, ks, vs, layer=layer, forward_batch=fb, recurrent_state_pool=pool
+        )
         state_backend = _extract_state(pu, rec_indices)
 
     cu_seqlens = np.concatenate([np.array([0], dtype=np.int32), np.cumsum(lens, dtype=np.int32)])
@@ -300,9 +313,9 @@ def _run_backend_decode(B, H, K, dtype, h0, rng_seed, layer_id=_LAYER_ID):
         layer = _make_fake_layer(layer_id=layer_id, num_heads=H, head_dim=K)
         fb = SimpleNamespace(forward_mode=ForwardMode.DECODE)
 
-        q_in = q.reshape(B, H, K)
-        k_in = k.reshape(B, H, K)
-        v_in = v.reshape(B, H, K)
+        q_in = _put(q.reshape(B, H, K), "data", "tensor", None)
+        k_in = _put(k.reshape(B, H, K), "data", "tensor", None)
+        v_in = _put(v.reshape(B, H, K), "data", "tensor", None)
 
         out_backend, pu = backend(
             q_in, k_in, v_in, layer=layer, forward_batch=fb, recurrent_state_pool=pool

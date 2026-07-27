@@ -255,9 +255,10 @@ suites = {
         TestFile("python/sgl_jax/test/kernels/quantized_linear_test.py", 0.3, runner="pytest"),
         TestFile("python/sgl_jax/test/kernels/moe_block_quant_test.py", 0.2, runner="pytest"),
         TestFile("python/sgl_jax/test/kernels/kda_test.py", 10, runner="pytest"),
-        TestFile("python/sgl_jax/test/test_flashattention_mha.py", 11),
-        TestFile("python/sgl_jax/test/test_flashattention_gqa.py", 11),
-        TestFile("python/sgl_jax/test/test_flashattention_misc.py", 7),
+        # Pytest tears down the shared FlashAttention mesh cleanly on JAX 0.10.2.
+        TestFile("python/sgl_jax/test/test_flashattention_mha.py", 11, runner="pytest"),
+        TestFile("python/sgl_jax/test/test_flashattention_gqa.py", 11, runner="pytest"),
+        TestFile("python/sgl_jax/test/test_flashattention_misc.py", 7, runner="pytest"),
         TestFile("python/sgl_jax/test/test_mla_attention.py", 2.5),
         TestFile("python/sgl_jax/test/test_moe_topk.py", 0.3),
         TestFile("python/sgl_jax/test/kernels/fused_moe_v1_test.py", 9),
@@ -317,6 +318,11 @@ suites = {
         ),
         TestFile(
             "python/sgl_jax/test/multimodal/test_stage_config_routing.py", 0.1, runner="pytest"
+        ),
+        TestFile(
+            "python/sgl_jax/test/multimodal/test_mimo_audio_tokenizer_model.py",
+            0.2,
+            runner="pytest",
         ),
         TestFile("python/sgl_jax/test/models/test_qwen3_5.py", 2, runner="pytest"),
         TestFile("python/sgl_jax/test/mem_cache/test_req_to_token_pool.py", 1),

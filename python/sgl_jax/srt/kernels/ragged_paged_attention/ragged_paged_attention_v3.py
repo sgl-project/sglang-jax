@@ -1554,6 +1554,10 @@ def get_default_block_sizes(
             raise NotImplementedError(f"Unsupported {tpu_version=}.")
 
     bkv_alignment = max(page_size, kv_packing)
+    # Custom-mask intermediates exceed v5/v6 scoped VMEM with a 32-row query tile.
+    if use_custom_mask and tpu_version in (5, 6):
+        bq_sz = min(bq_sz, 16)
+        bq_csz = min(bq_csz, bq_sz)
     bq_sz = max(1, bq_sz)
     bkv_sz = align_to(bkv_sz, bkv_alignment)
     bq_csz = max(1, bq_csz)
