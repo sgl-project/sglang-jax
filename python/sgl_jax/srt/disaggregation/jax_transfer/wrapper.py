@@ -122,7 +122,7 @@ class JaxTransferWrapper:
             )
             self._started = True
             logger.info(
-                "JaxTransferWrapper started at %s " "(channel_number=%d, jax_version=%s)",
+                "JaxTransferWrapper started at %s (channel_number=%d, jax_version=%s)",
                 server_addr,
                 self._channel_number,
                 jax.__version__,
@@ -152,9 +152,7 @@ class JaxTransferWrapper:
         """
 
         if not self._started:
-            raise RuntimeError(
-                "JaxTransferWrapper.start() must be called before " "register_pull()"
-            )
+            raise RuntimeError("JaxTransferWrapper.start() must be called before register_pull()")
         sharding = getattr(data, "sharding", None)
         if sharding is not None and not data.is_fully_addressable:
             raise ValueError(
@@ -280,3 +278,237 @@ def _reset_singleton_for_test() -> None:
     global _GLOBAL_WRAPPER
     with _GLOBAL_LOCK:
         _GLOBAL_WRAPPER = None
+
+
+# =====================================================================
+# Raiden data plane: tpu-raiden TransferEngine wrapper
+# =====================================================================
+#
+# The raiden path replaces the four ``jax.experimental.transfer`` calls above
+# with tpu-raiden's ``KVCacheManager`` (repurposed as a TransferEngine). Unlike
+# path-A — which registers per-request host/HBM *buffers* keyed by a crc32 uuid
+# and pulls them whole — raiden references the *device KV pool tensors directly*
+# and moves them at *block* granularity:
+#
+#   * producer(P): ``register_read(req_id, uuid, block_ids)`` marks the device
+#     blocks (= sgl-jax pages) of a request as readable.
+#   * consumer(D): ``start_read(req_id, uuid, remote_endpoint, remote_block_ids,
+#     local_block_ids)`` asynchronously pulls those blocks straight into D's
+#     device KV pool blocks (no Pallas write-back needed).
+#   * both sides poll ``poll_stats() -> (done_sending, done_recving,
+#     failed_recving)`` — lists of *req_id strings* (NOT uuids). Completion is
+#     ``req_id in done_*``; this replaces the ZMQ pull-done ack side channel.
+#
+# The control plane is raiden's own TCP socket (``local_control_port``); the
+# endpoint descriptors are read back from ``get_local_endpoints()`` and
+# advertised over bootstrap so D can reach P.
+
+_GLOBAL_RAIDEN_LOCK = threading.Lock()
+_GLOBAL_RAIDEN_WRAPPER: RaidenTransferWrapper | None = None
+
+
+class RaidenTransferWrapper:
+    """Process-level wrapper over tpu-raiden's ``KVCacheManager``.
+
+    One engine per process, constructed lazily in :meth:`start` from the
+    device KV pool's per-layer tensors. The engine *references* those tensors
+    (does not own them), so the pool must already be created and sharded before
+    ``start()`` is called.
+
+    Thread-safety: ``register_read`` / ``start_read`` / ``poll_stats`` are thin
+    pass-throughs to the compiled engine; the module keeps no per-request book
+    (raiden tracks state internally, keyed by ``req_id``). ``start()`` is
+    idempotent and guarded.
+    """
+
+    def __init__(
+        self,
+        host_ip: str,
+        control_port: int = 0,
+        *,
+        parallelism: int = 1,
+    ) -> None:
+        self._host_ip = host_ip
+        self._control_port = control_port
+        self._parallelism = max(1, int(parallelism))
+        self._init_lock = threading.Lock()
+        self._engine: Any | None = None
+        self._started = False
+        self._endpoints: list[Any] | None = None
+
+    @property
+    def host_ip(self) -> str:
+        return self._host_ip
+
+    @property
+    def is_started(self) -> bool:
+        return self._started
+
+    @property
+    def control_port(self) -> int:
+        return self._control_port
+
+    @property
+    def parallelism(self) -> int:
+        return self._parallelism
+
+    @property
+    def engine(self) -> Any:
+        return self._engine
+
+    @property
+    def endpoints(self) -> list[Any] | None:
+        """raiden endpoint descriptors (from ``get_local_endpoints()``).
+
+        These are what D passes as ``remote_endpoint`` to ``start_read`` and
+        what P advertises via bootstrap. Available only after :meth:`start`.
+        """
+
+        return self._endpoints
+
+    def start(
+        self,
+        kv_caches: list[Any],
+        *,
+        max_blocks: int,
+        num_slots: int,
+        timeout_s: float = 120.0,
+    ) -> Any:
+        """Idempotent. Construct the KVCacheManager over ``kv_caches``.
+
+        ``kv_caches`` is the device KV pool's per-layer tensor list; raiden
+        references them for both send (P) and receive (D).
+
+        ``max_blocks`` is the max device pages a single request can pull (one
+        staging slot must fit it) and ``num_slots`` is the number of concurrent
+        transfer slots. These MUST be passed (not ``host_blocks_to_allocate``):
+        the legacy ``host_blocks_to_allocate`` ctor overload leaves
+        ``local_control_port`` at -1 so raiden skips slot-pool setup entirely
+        (``max_blocks_=0``), and every ``start_read`` then fails the
+        ``local_block_ids.size() > max_blocks_`` guard immediately.
+        """
+
+        if self._started:
+            return self._engine
+        with self._init_lock:
+            if self._started:
+                return self._engine
+            try:
+                from tpu_raiden.api.jax.kv_cache_manager import KVCacheManager
+            except ModuleNotFoundError as exc:
+                raise RuntimeError(
+                    "Raiden was selected but tpu_raiden is not installed; install "
+                    "a tpu_raiden_jax wheel matching this JAX/libtpu build"
+                ) from exc
+
+            if not kv_caches:
+                raise ValueError("RaidenTransferWrapper.start requires kv_caches")
+            if max_blocks <= 0 or num_slots <= 0:
+                raise ValueError("Raiden max_blocks and num_slots must be positive")
+            self._engine = KVCacheManager(
+                kv_caches=list(kv_caches),
+                local_control_port=self._control_port,
+                max_blocks=int(max_blocks),
+                num_slots=int(num_slots),
+                timeout_s=float(timeout_s),
+                parallelism=self._parallelism,
+                unsafe_skip_buffer_lock=True,
+            )
+            # Read back the real endpoint descriptors (kernel may have chosen
+            # the control port when control_port==0). These are advertised over
+            # bootstrap and used verbatim by the consumer's start_read.
+            self._endpoints = self._engine.get_local_endpoints()
+            self._started = True
+            logger.info(
+                "RaidenTransferWrapper started host=%s control_port=%s "
+                "endpoints=%s (jax_version=%s)",
+                self._host_ip,
+                self._control_port,
+                self._endpoints,
+                jax.__version__,
+            )
+        return self._engine
+
+    def register_read(self, req_id: str, uuid: int, block_ids: list[int]) -> bool:
+        """Producer: mark ``block_ids`` of ``req_id`` readable. Returns False
+        if raiden decides nothing needs transferring."""
+
+        if not self._started:
+            raise RuntimeError(
+                "RaidenTransferWrapper.start() must be called before register_read()"
+            )
+        return bool(self._engine.register_read(req_id, uuid, list(block_ids)))
+
+    def start_read(
+        self,
+        req_id: str,
+        uuid: int,
+        remote_endpoint: Any,
+        remote_block_ids: list[int],
+        local_block_ids: list[int],
+        *,
+        parallelism: int | None = None,
+    ) -> None:
+        """Consumer: asynchronously pull ``remote_block_ids`` from the producer
+        at ``remote_endpoint`` into ``local_block_ids`` of the local pool."""
+
+        if not self._started:
+            raise RuntimeError("RaidenTransferWrapper.start() must be called before start_read()")
+        self._engine.start_read(
+            req_id,
+            uuid,
+            remote_endpoint,
+            list(remote_block_ids),
+            list(local_block_ids),
+            self._parallelism if parallelism is None else parallelism,
+        )
+
+    def poll_stats(self) -> tuple[list[str], list[str], list[str]]:
+        """Non-blocking poll: ``(done_sending, done_recving, failed_recving)``
+        as lists of *req_id strings*."""
+
+        if not self._started:
+            raise RuntimeError("RaidenTransferWrapper.start() must be called before poll_stats()")
+        return self._engine.poll_stats()
+
+
+def get_or_create_raiden_wrapper(
+    host_ip: str,
+    control_port: int = 0,
+    *,
+    parallelism: int = 1,
+) -> RaidenTransferWrapper:
+    """Return the process-level raiden wrapper, creating it on first call.
+
+    Only stores config; the engine is constructed on :meth:`start` once the KV
+    pool tensors are available.
+    """
+
+    global _GLOBAL_RAIDEN_WRAPPER
+    with _GLOBAL_RAIDEN_LOCK:
+        if _GLOBAL_RAIDEN_WRAPPER is None:
+            _GLOBAL_RAIDEN_WRAPPER = RaidenTransferWrapper(
+                host_ip, control_port, parallelism=parallelism
+            )
+            return _GLOBAL_RAIDEN_WRAPPER
+        existing = _GLOBAL_RAIDEN_WRAPPER
+        if (existing.host_ip, existing.control_port) != (host_ip, control_port):
+            raise RuntimeError(
+                "RaidenTransferWrapper already configured for "
+                f"{existing.host_ip}:{existing.control_port}, cannot rebind to "
+                f"{host_ip}:{control_port}"
+            )
+        if existing.parallelism != max(1, int(parallelism)):
+            raise RuntimeError(
+                "RaidenTransferWrapper already created with "
+                f"parallelism={existing.parallelism}, cannot change to {parallelism}"
+            )
+        return existing
+
+
+def _reset_raiden_singleton_for_test() -> None:
+    """Test-only: clear the module-level raiden singleton between cases."""
+
+    global _GLOBAL_RAIDEN_WRAPPER
+    with _GLOBAL_RAIDEN_LOCK:
+        _GLOBAL_RAIDEN_WRAPPER = None

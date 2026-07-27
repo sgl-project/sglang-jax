@@ -20,10 +20,11 @@ logger = logging.getLogger(__name__)
 HEARTBEAT_TTL_SECONDS = 30.0
 # Beat at ~TTL/3 so a single missed beat doesn't evict the entry.
 HEARTBEAT_INTERVAL_SECONDS = HEARTBEAT_TTL_SECONDS / 3.0
+TRANSFER_METADATA_TTL_SECONDS = 300.0
 
 # PD wire protocol version. Bump when ``PrefillInfo``
 # or any of the 4 endpoint payloads change shape.
-PROTOCOL_VERSION: int = 1
+PROTOCOL_VERSION: int = 2
 MIN_COMPATIBLE_VERSION: int = 1
 
 
@@ -58,6 +59,14 @@ class PrefillInfo:
     # peer predating these fields skips the check.
     page_size: int = 0
     kv_dtype: str = ""
+    # Raiden control-plane endpoint. Empty means
+    # "not a raiden peer" (path-A). ``local_control_port`` is the resolved TCP
+    # port raiden's KVCacheManager listens on; ``raiden_endpoints_json`` is the
+    # JSON-encoded ``get_local_endpoints()`` descriptor list that decode passes
+    # verbatim to ``start_read(remote_endpoint=...)``.
+    local_control_port: int = 0
+    raiden_endpoints_json: str = ""
+    transfer_engine: str = "jax"
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -104,6 +113,7 @@ def check_prefill_compat(
     *,
     local_page_size: int,
     local_kv_dtype: str,
+    expected_transfer_engine: str | None = None,
 ) -> None:
     """Raise ``ValueError`` if the prefill peer's KV layout is incompatible.
 
@@ -126,6 +136,11 @@ def check_prefill_compat(
             f"kv_dtype={peer_kv_dtype!r} but this decode uses "
             f"kv_dtype={local_kv_dtype!r}; KV layout incompatible"
         )
+    peer_engine = str(info.get("transfer_engine", "jax"))
+    if expected_transfer_engine is not None and peer_engine != expected_transfer_engine:
+        raise ValueError(
+            f"PD transfer engine mismatch: prefill={peer_engine}, decode={expected_transfer_engine}"
+        )
 
 
 class RegisterPrefillRequest(BaseModel):
@@ -141,6 +156,29 @@ class RegisterPrefillRequest(BaseModel):
     protocol_version: int = PROTOCOL_VERSION
     page_size: int = 0
     kv_dtype: str = ""
+    local_control_port: int = 0
+    raiden_endpoints_json: str = ""
+    transfer_engine: str = "jax"
+
+
+class RegisterTransferRequest(BaseModel):
+    """Per-request block metadata P publishes so D can pull with raiden.
+
+    raiden's ``start_read`` needs the producer's device block ids
+    (``remote_block_ids``). Those are per-request and only P knows them (the
+    paged allocator picks non-contiguous blocks), so they cannot be derived by
+    D deterministically — P registers them here keyed by ``bootstrap_room`` and
+    D fetches them at admission. This is the raiden analogue of path-A's
+    crc32(uuid) pairing (which only needed a shared int, not the block layout).
+    """
+
+    bootstrap_room: int
+    transfer_id: str
+    remote_block_ids: list[int]
+    # Endpoint + control port are also on PrefillInfo, but a decode that already
+    # resolved its peer can skip the second lookup by reading them here.
+    local_control_port: int = 0
+    raiden_endpoints_json: str = ""
 
 
 class HeartbeatRequest(BaseModel):
@@ -160,6 +198,12 @@ class _Registry:
     lock: threading.Lock = field(default_factory=threading.Lock)
     ttl_seconds: float = HEARTBEAT_TTL_SECONDS
     clock: Callable[[], float] = time.monotonic
+    # Raiden per-request block metadata, keyed by bootstrap_room. P publishes it
+    # once after the final prefill chunk; D reads it at admission and pops it at
+    # terminal. TTL eviction covers abandoned rooms.
+    transfers: dict[int, dict[str, object]] = field(default_factory=dict)
+    transfer_last_seen: dict[int, float] = field(default_factory=dict)
+    transfer_ttl_seconds: float = TRANSFER_METADATA_TTL_SECONDS
 
     def now(self) -> float:
         return self.clock()  # type: ignore[no-any-return]
@@ -210,6 +254,36 @@ class _Registry:
             keys = sorted(self.prefills.keys())
             chosen = keys[bootstrap_room % len(keys)]
             return self.prefills[chosen]
+
+    def _evict_stale_transfers_locked(self) -> None:
+        cutoff = self.now() - self.transfer_ttl_seconds
+        stale = [room for room, seen_at in self.transfer_last_seen.items() if seen_at < cutoff]
+        for room in stale:
+            self.transfers.pop(room, None)
+            self.transfer_last_seen.pop(room, None)
+
+    def register_transfer(self, info: dict[str, object]) -> None:
+        with self.lock:
+            self._evict_stale_transfers_locked()
+            room = int(info["bootstrap_room"])
+            if not str(info.get("transfer_id", "")):
+                raise ValueError("transfer_id must be non-empty")
+            self.transfers[room] = info
+            self.transfer_last_seen[room] = self.now()
+
+    def get_transfer(self, bootstrap_room: int) -> dict[str, object] | None:
+        """Read without consuming the completed request's block metadata."""
+        with self.lock:
+            self._evict_stale_transfers_locked()
+            info = self.transfers.get(int(bootstrap_room))
+            return dict(info) if info is not None else None
+
+    def pop_room(self, bootstrap_room: int) -> None:
+        """Drop terminal request metadata for ``bootstrap_room``."""
+        with self.lock:
+            room = int(bootstrap_room)
+            self.transfers.pop(room, None)
+            self.transfer_last_seen.pop(room, None)
 
 
 def build_app(
@@ -286,6 +360,31 @@ def build_app(
                 detail="no prefill workers registered",
             )
         return info.to_dict()
+
+    @app.post("/register_transfer")
+    def register_transfer(req: RegisterTransferRequest) -> dict[str, str]:
+        try:
+            registry.register_transfer(req.model_dump())
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"status": "registered"}
+
+    @app.get("/get_transfer_info")
+    def get_transfer_info(bootstrap_room: int) -> dict[str, object]:
+        info = registry.get_transfer(bootstrap_room)
+        if info is None:
+            # Not registered yet: 404 lets the decode side treat it as
+            # "defer + retry" (never abort) rather than a hard error.
+            raise HTTPException(
+                status_code=404,
+                detail=f"no transfer info for bootstrap_room={bootstrap_room}",
+            )
+        return info
+
+    @app.post("/pop_transfer")
+    def pop_transfer(bootstrap_room: int) -> dict[str, str]:
+        registry.pop_room(bootstrap_room)
+        return {"status": "popped"}
 
     # Bootstrap runs as a standalone single process and does NOT inherit
     # PROMETHEUS_MULTIPROC_DIR, so it exposes its own default-registry
@@ -390,7 +489,7 @@ class BootstrapServer:
                 last_err = e
             time.sleep(0.05)
         raise TimeoutError(
-            f"BootstrapServer did not become ready within {timeout_s}s " f"(last error: {last_err})"
+            f"BootstrapServer did not become ready within {timeout_s}s (last error: {last_err})"
         )
 
 
@@ -447,6 +546,9 @@ class BootstrapClient:
         protocol_version: int = PROTOCOL_VERSION,
         page_size: int = 0,
         kv_dtype: str = "",
+        local_control_port: int = 0,
+        raiden_endpoints_json: str = "",
+        transfer_engine: str = "jax",
     ) -> None:
         payload = {
             "bootstrap_key": bootstrap_key,
@@ -461,6 +563,9 @@ class BootstrapClient:
             "protocol_version": protocol_version,
             "page_size": page_size,
             "kv_dtype": kv_dtype,
+            "local_control_port": local_control_port,
+            "raiden_endpoints_json": raiden_endpoints_json,
+            "transfer_engine": transfer_engine,
         }
         last_err: Exception | None = None
         for attempt in range(self._register_retries):
@@ -477,8 +582,7 @@ class BootstrapClient:
                 last_err = e
                 if attempt + 1 < self._register_retries:
                     logger.warning(
-                        "bootstrap register_prefill attempt %d/%d "
-                        "failed (%s); retrying in %.1fs",
+                        "bootstrap register_prefill attempt %d/%d failed (%s); retrying in %.1fs",
                         attempt + 1,
                         self._register_retries,
                         e,
@@ -486,8 +590,7 @@ class BootstrapClient:
                     )
                     time.sleep(self._register_retry_delay_s)
         raise RuntimeError(
-            f"bootstrap register_prefill failed after "
-            f"{self._register_retries} attempts: {last_err}"
+            f"bootstrap register_prefill failed after {self._register_retries} attempts: {last_err}"
         )
 
     def heartbeat(self, bootstrap_key: str) -> None:
@@ -529,6 +632,57 @@ class BootstrapClient:
         # Reject peers below the supported protocol floor.
         _reject_if_below_protocol_floor(info)
         return info
+
+    def register_transfer(
+        self,
+        bootstrap_room: int,
+        transfer_id: str,
+        remote_block_ids: list[int],
+        *,
+        local_control_port: int = 0,
+        raiden_endpoints_json: str = "",
+    ) -> None:
+        """P: publish complete prompt block metadata for a Raiden pull."""
+
+        payload = {
+            "bootstrap_room": bootstrap_room,
+            "transfer_id": transfer_id,
+            "remote_block_ids": list(remote_block_ids),
+            "local_control_port": local_control_port,
+            "raiden_endpoints_json": raiden_endpoints_json,
+        }
+        r = self._client.post(
+            f"{self._base_url}/register_transfer",
+            json=payload,
+            timeout=self._timeout_s,
+            headers=self._headers(),
+        )
+        r.raise_for_status()
+
+    def get_transfer_info(self, bootstrap_room: int) -> dict[str, object] | None:
+        """D: fetch complete block metadata, or None until P publishes it."""
+
+        r = self._client.get(
+            f"{self._base_url}/get_transfer_info",
+            params={"bootstrap_room": bootstrap_room},
+            timeout=self._timeout_s,
+            headers=self._headers(),
+        )
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+        return r.json()
+
+    def pop_transfer(self, bootstrap_room: int) -> None:
+        """D: drop terminal request metadata, keeping the table bounded."""
+
+        r = self._client.post(
+            f"{self._base_url}/pop_transfer",
+            params={"bootstrap_room": bootstrap_room},
+            timeout=self._timeout_s,
+            headers=self._headers(),
+        )
+        r.raise_for_status()
 
 
 class PrefillInfoCache:

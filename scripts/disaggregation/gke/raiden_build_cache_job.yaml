@@ -1,0 +1,145 @@
+# Build tpu-raiden once on the GKE CPU node and publish an immutable wheel to
+# the GCS bucket mounted at /models. TPU runtime jobs install this cached wheel
+# and never compile tpu-raiden during startup.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: raiden-build-jax0102-8756479
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      annotations:
+        gke-gcsfuse/volumes: "true"
+    spec:
+      restartPolicy: Never
+      serviceAccountName: gcs-account
+      nodeSelector:
+        cloud.google.com/gke-tpu-accelerator: tpu-v6e-slice
+        cloud.google.com/gke-tpu-topology: "1x1"
+        cloud.google.com/gke-nodepool: pd-v6e-1
+      tolerations:
+      - key: google.com/tpu
+        operator: Exists
+        effect: NoSchedule
+      containers:
+      - name: builder
+        image: us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest
+        env:
+        - name: RAIDEN_REPO
+          value: https://github.com/google/tpu-raiden.git
+        - name: RAIDEN_COMMIT
+          value: 87564793fda8269164e670fa4c4a44548840e153
+        - name: JAX_VERSION
+          value: 0.10.2
+        - name: LIBTPU_VERSION
+          value: 0.0.42.1
+        - name: CACHE_ROOT
+          value: /models/raiden-cache/tpu-raiden-jax/87564793fda8269164e670fa4c4a44548840e153-jax0.10.2-jaxlib0.10.2-libtpu0.0.42.1-cp312-manylinux_2_31_x86_64
+        command:
+        - bash
+        - -lc
+        - |
+          set -euxo pipefail
+
+          if [ -f "${CACHE_ROOT}/READY" ] && [ -f "${CACHE_ROOT}/SHA256SUMS" ]; then
+            cd "${CACHE_ROOT}"
+            sha256sum -c SHA256SUMS
+            echo "Validated existing cached wheel; no rebuild required."
+            exit 0
+          fi
+
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq
+          apt-get install -y -qq git ca-certificates curl wget gnupg >/dev/null
+          if ! command -v clang-18 >/dev/null; then
+            wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key \
+              | gpg --dearmor -o /usr/share/keyrings/llvm.gpg
+            echo "deb [signed-by=/usr/share/keyrings/llvm.gpg] http://apt.llvm.org/jammy/ llvm-toolchain-jammy-18 main" \
+              > /etc/apt/sources.list.d/llvm18.list
+            apt-get update -qq
+            apt-get install -y -qq clang-18 >/dev/null
+          fi
+          export CC=/usr/bin/clang-18
+          export CXX=/usr/bin/clang++-18
+
+          git clone "${RAIDEN_REPO}" /workspace/tpu-raiden
+          cd /workspace/tpu-raiden
+          git checkout "${RAIDEN_COMMIT}"
+          test "$(git rev-parse HEAD)" = "${RAIDEN_COMMIT}"
+
+          # PR #1461 and this Raiden commit intentionally share one dependency
+          # stack. Fail before compilation if either source drifts.
+          grep -q "jax==${JAX_VERSION}" requirements.txt
+          grep -q "jaxlib==${JAX_VERSION}" requirements.txt
+          grep -q "libtpu==${LIBTPU_VERSION}" requirements.txt
+          grep -q "jax==${JAX_VERSION}" ci/wheel/BUILD.bazel
+          grep -q "libtpu==${LIBTPU_VERSION}" ci/wheel/BUILD.bazel
+
+          export HERMETIC_PYTHON_VERSION=3.12
+          export BAZEL_CACHE_DIR=/workspace/bazel-cache
+          export BAZEL_OUTPUT_BASE=/workspace/bazel-output
+          export WHEEL_VERSION_EXTRAS=.dev2026072701
+          ./build.sh jax //ci/wheel:raiden_jax_wheel \
+            --repo_env="WHEEL_VERSION_EXTRAS=${WHEEL_VERSION_EXTRAS}" \
+            2>&1 | tee /workspace/raiden-build.log
+
+          wheel_path=$(ls -1 bazel-bin/ci/wheel/tpu_raiden_jax-*.whl | tail -n 1)
+          test -f "${wheel_path}"
+          wheel_listing=$(python3.12 -m zipfile -l "${wheel_path}")
+          grep -q '_tpu_raiden_jax.*\.so' <<< "${wheel_listing}"
+          grep -q '_kv_cache_manager_ffi.*\.so' <<< "${wheel_listing}"
+          grep -q '_weight_synchronizer_ffi.*\.so' <<< "${wheel_listing}"
+          python3.12 -m pip install -q twine
+          python3.12 -m twine check "${wheel_path}"
+
+          stage_dir=/workspace/cache-stage
+          mkdir -p "${stage_dir}"
+          cp "${wheel_path}" "${stage_dir}/"
+          cp /workspace/raiden-build.log "${stage_dir}/build.log"
+          cat > "${stage_dir}/BUILD_INFO" <<BUILD_INFO
+          raiden_repo=${RAIDEN_REPO}
+          raiden_commit=${RAIDEN_COMMIT}
+          jax_version=${JAX_VERSION}
+          jaxlib_version=${JAX_VERSION}
+          libtpu_version=${LIBTPU_VERSION}
+          python=3.12
+          bazel=7.7.0
+          compiler=clang-18
+          build_job=${HOSTNAME}
+          BUILD_INFO
+          cd "${stage_dir}"
+          sha256sum tpu_raiden_jax-*.whl > SHA256SUMS
+
+          mkdir -p "${CACHE_ROOT}"
+          cp tpu_raiden_jax-*.whl SHA256SUMS BUILD_INFO build.log "${CACHE_ROOT}/"
+          cd "${CACHE_ROOT}"
+          sha256sum -c SHA256SUMS
+          basename "${wheel_path}" > READY
+          ls -lah
+        resources:
+          requests:
+            cpu: "10"
+            memory: 40Gi
+            ephemeral-storage: 38Gi
+            google.com/tpu: 1
+          limits:
+            cpu: "13"
+            memory: 52Gi
+            ephemeral-storage: 42Gi
+            google.com/tpu: 1
+        volumeMounts:
+        - name: workspace
+          mountPath: /workspace
+        - name: model-storage
+          mountPath: /models
+      volumes:
+      - name: workspace
+        emptyDir:
+          sizeLimit: 42Gi
+      - name: model-storage
+        csi:
+          driver: gcsfuse.csi.storage.gke.io
+          volumeAttributes:
+            bucketName: model-storage-sglang
+            mountOptions: "implicit-dirs,metadata-cache:ttl-secs:0,metadata-cache:stat-cache-max-size-mb:64,metadata-cache:type-cache-max-size-mb:64,file-cache:max-size-mb:1024,file-cache:cache-file-for-range-read:true"

@@ -6,6 +6,7 @@ import ipaddress
 import json
 import logging
 import os
+import sys
 import tempfile
 
 import jax
@@ -34,8 +35,7 @@ _REJECTED_PD_HOST_ALIASES = frozenset({"localhost"})
 def _validate_disaggregation_host_ip(host_ip: str) -> str:
     if host_ip in _REJECTED_PD_HOST_ALIASES:
         raise ValueError(
-            "--disaggregation-host-ip must be a routable address; "
-            f"got loopback alias {host_ip!r}"
+            f"--disaggregation-host-ip must be a routable address; got loopback alias {host_ip!r}"
         )
     try:
         addr = ipaddress.ip_address(host_ip)
@@ -44,8 +44,7 @@ def _validate_disaggregation_host_ip(host_ip: str) -> str:
     if addr.is_loopback or addr.is_unspecified:
         kind = "loopback" if addr.is_loopback else "bind/unspecified"
         raise ValueError(
-            "--disaggregation-host-ip must be a routable address; "
-            f"got {kind} address {host_ip!r}"
+            f"--disaggregation-host-ip must be a routable address; got {kind} address {host_ip!r}"
         )
     return host_ip
 
@@ -250,12 +249,20 @@ class ServerArgs:
     # a host pool would fail every prefill request with
     # ``RuntimeError("use_d2h_staging=True requires a host_pool")``.
     disaggregation_enable_d2h: bool = False
+    # Data-plane backend selector. When True the KV data plane is served by
+    # tpu-raiden's TransferEngine (KVCacheManager): block-addressed device pool
+    # transfer with Raiden's own control-plane TCP and direct decode-pool writes.
+    # The existing jax.experimental.transfer backend stays runnable for A/B
+    # baselining by leaving this False (the default).
+    disaggregation_use_raiden: bool = False
+    # raiden control-plane TCP port. 0 = kernel picks a free port; the real port
+    # is read back from KVCacheManager.get_local_endpoints() and advertised via
+    # bootstrap so decode can reach it.
+    disaggregation_raiden_control_port: int = 0
     disaggregation_side_channel_port: int = 9600
     disaggregation_d2h_pool_size: int = 64
     disaggregation_d2h_max_tokens: int | None = None
-    # Parallel ``jax_transfer`` channels per (P, D) pair. Four is the
-    # current validated default on v6e; set to 0/None to keep the
-    # wrapper's own default.
+    # Parallel transfer channels per (P, D) pair, used by both engines.
     disaggregation_channel_number: int = 4
     # Per-host IP this process publishes to the bootstrap server. If
     # None, resolve it during startup from HOSTNAME with a
@@ -311,9 +318,9 @@ class ServerArgs:
         # update device
         if self.device:
             platform_env = os.environ.get("JAX_PLATFORMS", self.device)
-            assert (
-                self.device == platform_env
-            ), f"device {self.device} is not consistent with 'JAX_PLATFORMS' {platform_env}"
+            assert self.device == platform_env, (
+                f"device {self.device} is not consistent with 'JAX_PLATFORMS' {platform_env}"
+            )
         else:
             platform_env = os.environ.get("JAX_PLATFORMS", "")
             if platform_env != "":
@@ -540,6 +547,28 @@ class ServerArgs:
                     f"deployments (the validated bucket; see "
                     f"docs/operations/pd_e2e_matrix.md)."
                 )
+            if self.disaggregation_use_raiden:
+                if self.device != "tpu":
+                    raise ValueError("--disaggregation-use-raiden requires --device=tpu")
+                if "tpu_raiden.frameworks.jax._tpu_raiden_jax" not in sys.modules:
+                    raise RuntimeError(
+                        "Raiden must load before jaxlib. Select it on the process "
+                        "command line with --disaggregation-use-raiden, or set "
+                        "SGLANG_JAX_USE_RAIDEN=1 before importing sgl_jax in a "
+                        "programmatic launcher."
+                    )
+                if self.disaggregation_enable_d2h:
+                    raise ValueError(
+                        "--disaggregation-use-raiden and --disaggregation-enable-d2h "
+                        "select different transfer engines and cannot be combined"
+                    )
+                if self.disaggregation_max_inflight_transfers <= 0:
+                    raise ValueError(
+                        "Raiden requires --disaggregation-max-inflight-transfers > 0 "
+                        "so its staging-slot count matches decode admission"
+                    )
+                if not 0 <= self.disaggregation_raiden_control_port <= 65535:
+                    raise ValueError("--disaggregation-raiden-control-port must be in [0, 65535]")
             # PD-mode warmup is one-sided (the dummy warmup request
             # has no peer counterpart), so it gets stuck and the
             # allocator memory-leak check trips. Auto-skip unless
@@ -563,6 +592,11 @@ class ServerArgs:
                     "disaggregation_enable_d2h",
                     self.disaggregation_enable_d2h,
                     ServerArgs.disaggregation_enable_d2h,
+                ),
+                (
+                    "disaggregation_use_raiden",
+                    self.disaggregation_use_raiden,
+                    ServerArgs.disaggregation_use_raiden,
                 ),
             ]
             non_default = [name for name, value, default in pd_overrides if value != default]
@@ -975,8 +1009,7 @@ class ServerArgs:
             dest="pd_prefill_ep_size",
             type=int,
             default=ServerArgs.pd_prefill_ep_size,
-            help="Prefill-side ep_size for pathways PD hetero-TP. "
-            "0 = scale ep_size by tp_p/tp_d.",
+            help="Prefill-side ep_size for pathways PD hetero-TP. 0 = scale ep_size by tp_p/tp_d.",
         )
 
         parser.add_argument(
@@ -1597,6 +1630,23 @@ class ServerArgs:
             "prefill HBM pressure via the host pool. Default OFF.",
         )
         parser.add_argument(
+            "--disaggregation-use-raiden",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.disaggregation_use_raiden,
+            help="Serve the PD KV data plane with tpu-raiden's TransferEngine "
+            "(block-addressed device-pool transfer) instead of the existing "
+            "jax.experimental.transfer engine. Completed prompts land directly "
+            "in decode KV pages without host staging or a write-back copy. "
+            "The existing engine stays the default. Default OFF.",
+        )
+        parser.add_argument(
+            "--disaggregation-raiden-control-port",
+            type=int,
+            default=ServerArgs.disaggregation_raiden_control_port,
+            help="raiden control-plane TCP port. 0 lets the kernel pick a free "
+            "port (read back and advertised via bootstrap). Default 0.",
+        )
+        parser.add_argument(
             "--disaggregation-side-channel-port",
             type=int,
             default=ServerArgs.disaggregation_side_channel_port,
@@ -1664,7 +1714,7 @@ class ServerArgs:
             "--disaggregation-bootstrap-timeout-seconds",
             type=float,
             default=ServerArgs.disaggregation_bootstrap_timeout_seconds,
-            help="Bootstrap-server query timeout in seconds. <=0 to " "disable.",
+            help="Bootstrap-server query timeout in seconds. <=0 to disable.",
         )
         parser.add_argument(
             "--disaggregation-pull-timeout-seconds",
@@ -1687,7 +1737,7 @@ class ServerArgs:
             "--disaggregation-orphan-reaper-interval-seconds",
             type=float,
             default=ServerArgs.disaggregation_orphan_reaper_interval_seconds,
-            help="How often the background reaper scans for orphan " "senders/receivers.",
+            help="How often the background reaper scans for orphan senders/receivers.",
         )
         parser.add_argument(
             "--disaggregation-decode-watchdog-seconds",
@@ -1734,8 +1784,9 @@ class ServerArgs:
             type=int,
             default=ServerArgs.disaggregation_channel_number,
             help="Parallel jax_transfer channels per (P, D) pair. "
-            "Four is the validated default on v6e; increase for "
-            "higher-bandwidth interconnects.",
+            "For Raiden this is passed as TransferEngine parallelism. Four is "
+            "the validated default on v6e; increase for higher-bandwidth "
+            "interconnects.",
         )
 
     @classmethod
@@ -1796,9 +1847,9 @@ class ServerArgs:
         # Check chunked prefill
         # Skip validation if chunked prefill is disabled (i.e., size <= 0).
         if self.chunked_prefill_size > 0:
-            assert (
-                self.chunked_prefill_size % self.page_size == 0
-            ), "chunked_prefill_size must be divisible by page_size"
+            assert self.chunked_prefill_size % self.page_size == 0, (
+                "chunked_prefill_size must be divisible by page_size"
+            )
 
         # Check LoRA configuration
         self.check_lora_server_args()
@@ -1878,9 +1929,9 @@ class ServerArgs:
         if not self.enable_lora and not self.enable_static_lora:
             return
 
-        assert not (
-            self.enable_lora and self.enable_static_lora
-        ), f"{self.enable_lora} and {self.enable_static_lora} can not be enable at the same time"
+        assert not (self.enable_lora and self.enable_static_lora), (
+            f"{self.enable_lora} and {self.enable_static_lora} can not be enable at the same time"
+        )
 
         self.enable_lora = True
 
@@ -1891,27 +1942,27 @@ class ServerArgs:
         if self.lora_target_modules:
             self.lora_target_modules = set(self.lora_target_modules)
             if "all" in self.lora_target_modules:
-                assert (
-                    len(self.lora_target_modules) == 1
-                ), "If 'all' is specified in --lora-target-modules, it should be the only module specified."
+                assert len(self.lora_target_modules) == 1, (
+                    "If 'all' is specified in --lora-target-modules, it should be the only module specified."
+                )
                 self.lora_target_modules = set(SUPPORTED_LORA_TARGET_MODULES)
 
         # Ensure sufficient information is provided for LoRA initialization.
-        assert self.lora_paths or (
-            self.max_lora_rank and self.lora_target_modules
-        ), "When no initial --lora-paths is provided, you need to specify both --max-lora-rank and --lora-target-modules for LoRA initialization."
+        assert self.lora_paths or (self.max_lora_rank and self.lora_target_modules), (
+            "When no initial --lora-paths is provided, you need to specify both --max-lora-rank and --lora-target-modules for LoRA initialization."
+        )
 
         def check_static_lora_args():
-            assert (
-                self.lora_scaling is not None
-            ), "lora_scaling is required when enable-static-lora is enabled"
+            assert self.lora_scaling is not None, (
+                "lora_scaling is required when enable-static-lora is enabled"
+            )
 
-            assert (
-                self.lora_paths is None
-            ), "lora-paths is not required when enable-static-lora is enabled"
-            assert (
-                self.max_loras_per_batch == 1
-            ), "max-loras-per-batch is required to be 1 when enable-static-lora is enabled"
+            assert self.lora_paths is None, (
+                "lora-paths is not required when enable-static-lora is enabled"
+            )
+            assert self.max_loras_per_batch == 1, (
+                "max-loras-per-batch is required to be 1 when enable-static-lora is enabled"
+            )
 
         def check_dynamic_lora_args():
             # Normalize lora_paths to List[LoRARef]
@@ -1971,9 +2022,9 @@ class ServerArgs:
 
                     # Validate max_loaded_loras
                     if self.max_loaded_loras is not None:
-                        assert (
-                            self.max_loaded_loras >= self.max_loras_per_batch
-                        ), "max_loaded_loras must be >= max_loras_per_batch"
+                        assert self.max_loaded_loras >= self.max_loras_per_batch, (
+                            "max_loaded_loras must be >= max_loras_per_batch"
+                        )
 
                     logger.info(
                         "Loaded %d LoRA adapters: %s",

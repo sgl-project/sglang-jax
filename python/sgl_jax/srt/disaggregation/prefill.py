@@ -140,7 +140,7 @@ class PrefillBootstrapQueue:
     ) -> None:
         with self._lock:
             if req_id in self._entries:
-                raise ValueError(f"PrefillBootstrapQueue already tracks " f"req_id={req_id!r}")
+                raise ValueError(f"PrefillBootstrapQueue already tracks req_id={req_id!r}")
             self._entries[req_id] = PrefillBookkeeping(
                 req_id=req_id, sender=sender, on_terminal=on_terminal
             )
@@ -224,18 +224,57 @@ class SchedulerDisaggregationPrefillMixin:
         self.set_next_batch_sampling_info_done(batch)
 
         chunked_now = tuple(r for r in getattr(self, "chunked_reqs", ()) if r is not None)
+        use_raiden = self.disagg_kv_manager.use_raiden
         for req in batch.reqs:
             if req.bootstrap_room is None:
                 continue
-            if any(req is cr for cr in chunked_now):
+            req_id = req.rid
+            is_mid_chunk = any(req is cr for cr in chunked_now)
+            if is_mid_chunk:
                 # Still mid-chunk: KV is incomplete, and releasing the
                 # req_pool_idx here would leak the slot the next chunk
-                # round re-allocates. Extract on the final chunk.
+                # round re-allocates. Both engines transfer only after the final
+                # chunk; transfer/forward overlap is intentionally out of scope.
                 assert req.is_chunked > 0
                 req.is_chunked -= 1
                 continue
-            req_id = req.rid
             if req_id in self.disagg_prefill_queue._entries:
+                continue
+            if use_raiden:
+                sender = None
+                try:
+                    # Raiden reads the KV pool outside XLA. Make the completed
+                    # prompt visible before registering its physical pages.
+                    jax.effects_barrier()
+                    block_ids = self._extract_req_block_ids(req)
+                    sender = self.disagg_kv_manager.create_sender(req_id)
+                    sender.init(
+                        kv_indices=None,
+                        transfer_id=req.disagg_transfer_id or req_id,
+                    )
+                    sender.attach_block_ids(block_ids, bootstrap_room=req.bootstrap_room)
+                    self._pd_mark_time(req, "transfer_start")
+                    sender.send()
+                except Exception as exc:
+                    logger.exception("raiden sender init/send failed for req_id=%s", req_id)
+                    if sender is not None:
+                        with suppress(Exception):
+                            sender.abort()
+                        with suppress(Exception):
+                            sender.clear()
+                    self._abort_prefill_req(
+                        req,
+                        f"Prefill raiden sender failed for req_id={req_id!r}: {exc}",
+                        metric_reason="sender_init",
+                    )
+                    continue
+
+                # Raiden references device pages until done_sending, so the
+                # terminal callback is the single owner that releases them.
+                def _on_terminal(req_obj=req, sender_obj=sender):
+                    self._on_prefill_transfer_terminal(req_obj, sender_obj, already_released=False)
+
+                self.disagg_prefill_queue.add(req_id, sender, on_terminal=_on_terminal)
                 continue
             try:
                 device_kv = self._extract_req_kv(req)
@@ -360,6 +399,23 @@ class SchedulerDisaggregationPrefillMixin:
             ts = TimeStats(role)
             req.pd_time_stats = ts
         ts.mark(name)
+
+    def _extract_req_block_ids(self: Scheduler, req: Req) -> list[int]:
+        """Return the exact physical pages occupied by the completed prompt."""
+
+        import numpy as _np
+
+        req_to_token = self.req_to_token_pool.req_to_token
+        kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
+        page_size = kv_pool.page_size
+        seqlen = len(req.origin_input_ids)
+        num_pages = (seqlen + page_size - 1) // page_size
+        page_id_source = req_to_token[
+            req.req_pool_idx,
+            : num_pages * page_size : page_size,
+        ]
+        page_ids = _np.asarray(page_id_source) // page_size
+        return [int(p) for p in page_ids]
 
     def _extract_req_kv(self: Scheduler, req: Req):
         """Gather prefilled KV from the paged pool for ``req``.
@@ -517,8 +573,7 @@ class SchedulerDisaggregationPrefillMixin:
         from sgl_jax.srt.managers.schedule_batch import FINISH_ABORT
 
         error_message = (
-            f"Prefill transfer failed for req_id={req.rid!r} "
-            f"bootstrap_room={req.bootstrap_room!r}"
+            f"Prefill transfer failed for req_id={req.rid!r} bootstrap_room={req.bootstrap_room!r}"
         )
         try:
             sender.failure_exception()

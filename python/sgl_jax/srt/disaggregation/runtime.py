@@ -23,8 +23,7 @@ def install_disaggregation_wiring(scheduler: Scheduler, server_args: ServerArgs)
         return
     if server_args.dp_size > 1:
         raise RuntimeError(
-            f"PD disaggregation does not yet support dp_size>1 "
-            f"(got dp_size={server_args.dp_size})."
+            f"PD disaggregation does not yet support dp_size>1 (got dp_size={server_args.dp_size})."
         )
     if server_args.disaggregation_bootstrap_url is None:
         raise RuntimeError("disaggregation_mode != null requires bootstrap_url")
@@ -55,7 +54,10 @@ def install_disaggregation_wiring(scheduler: Scheduler, server_args: ServerArgs)
     from sgl_jax.srt.disaggregation.decode_watchdog import EventLoopWatchdog
     from sgl_jax.srt.disaggregation.host_ip import resolve_host_ip
     from sgl_jax.srt.disaggregation.jax_transfer.conn import JaxTransferKVManager
-    from sgl_jax.srt.disaggregation.jax_transfer.wrapper import get_or_create_wrapper
+    from sgl_jax.srt.disaggregation.jax_transfer.wrapper import (
+        get_or_create_raiden_wrapper,
+        get_or_create_wrapper,
+    )
     from sgl_jax.srt.disaggregation.pd_auth import resolve_secret
     from sgl_jax.srt.disaggregation.prefill import PrefillBootstrapQueue
 
@@ -78,21 +80,28 @@ def install_disaggregation_wiring(scheduler: Scheduler, server_args: ServerArgs)
             server_args.disaggregation_bootstrap_port,
         )
 
-    wrapper = get_or_create_wrapper(
-        local_host,
-        transfer_port,
-        channel_number=server_args.disaggregation_channel_number,
-    )
-    wrapper.start()
-    notifier = ZmqPullNotifier(
-        role,
-        local_host,
-        side_channel_port,
-        shared_secret=shared_secret,
-    )
-    notifier.start()
+    wrapper = None
+    notifier = None
+    if not server_args.disaggregation_use_raiden:
+        wrapper = get_or_create_wrapper(
+            local_host,
+            transfer_port,
+            channel_number=server_args.disaggregation_channel_number,
+        )
+        wrapper.start()
+        notifier = ZmqPullNotifier(
+            role,
+            local_host,
+            side_channel_port,
+            shared_secret=shared_secret,
+        )
+        notifier.start()
     host_pool = None
-    if server_args.disaggregation_enable_d2h and mode == "prefill":
+    if (
+        server_args.disaggregation_enable_d2h
+        and mode == "prefill"
+        and not server_args.disaggregation_use_raiden
+    ):
         from sgl_jax.srt.disaggregation.prefill import (
             _KV_GATHER_PAGE_BUCKETS,
             _pad_to_page_bucket,
@@ -123,18 +132,65 @@ def install_disaggregation_wiring(scheduler: Scheduler, server_args: ServerArgs)
             pool_name="pd_prefill",
         )
         logger.info(
-            "D2H host pool wired: pool_size=%d max_padded_pages=%d layer_num=%d "
-            "per_layer_shape=%s",
+            "D2H host pool wired: pool_size=%d max_padded_pages=%d layer_num=%d per_layer_shape=%s",
             server_args.disaggregation_d2h_pool_size,
             max_padded_pages,
             kv_pool.layer_num,
             per_layer_shape,
         )
 
+    scheduler.disagg_bootstrap_client = BootstrapClient(
+        server_args.disaggregation_bootstrap_url,
+        timeout_s=server_args.disaggregation_bootstrap_timeout_seconds,
+        shared_secret=shared_secret,
+    )
+
+    # Raiden data plane. When enabled, construct the process-level
+    # RaidenTransferWrapper over the device KV pool's per-layer tensors and hand
+    # it (plus the bootstrap client, used for the P->D per-request block-metadata
+    # channel) to the manager. path-A stays fully wired so it can be selected by
+    # leaving --disaggregation-use-raiden off for A/B baselining.
+    raiden_wrapper = None
+    if server_args.disaggregation_use_raiden:
+        kv_pool = scheduler.token_to_kv_pool_allocator.get_kvcache()
+        raiden_wrapper = get_or_create_raiden_wrapper(
+            local_host,
+            server_args.disaggregation_raiden_control_port,
+            parallelism=server_args.disaggregation_channel_number,
+        )
+        # raiden staging-slot sizing. ``max_blocks`` must fit the largest
+        # per-request page count (a single slot holds one request's pages);
+        # ``num_slots`` bounds concurrent in-flight receives on decode. Passing
+        # ``host_blocks_to_allocate`` instead routes to raiden's legacy ctor
+        # overload that leaves the slot pool unconfigured (max_blocks_=0) so
+        # every start_read fails the size guard immediately. Add headroom over
+        # max_seq_len/page_size: a max-length prompt spills into one extra page
+        # once BOS / chat-template tokens push it past the page boundary
+        # (observed 33 pages for a 4096-token input at page_size 128).
+        page_size = max(1, int(server_args.page_size))
+        max_request_tokens = int(scheduler.max_req_input_len)
+        max_blocks = (max_request_tokens + page_size - 1) // page_size + 8
+        num_slots = max(16, int(server_args.disaggregation_max_inflight_transfers) * 2)
+        raiden_wrapper.start(
+            kv_caches=list(kv_pool.kv_buffer),
+            max_blocks=max_blocks,
+            num_slots=num_slots,
+            timeout_s=float(server_args.disaggregation_pull_timeout_seconds),
+        )
+        logger.info(
+            "raiden data plane enabled: control_port=%s max_blocks=%d num_slots=%d layer_num=%d",
+            server_args.disaggregation_raiden_control_port,
+            max_blocks,
+            num_slots,
+            kv_pool.layer_num,
+        )
+
     scheduler.disagg_kv_manager = JaxTransferKVManager(
         wrapper,
         notifier,
         host_pool=host_pool,
+        raiden_wrapper=raiden_wrapper,
+        bootstrap_client=scheduler.disagg_bootstrap_client,
         ack_timeout_seconds=server_args.disaggregation_ack_timeout_seconds,
         pull_timeout_seconds=server_args.disaggregation_pull_timeout_seconds,
         reaper_interval_seconds=(server_args.disaggregation_orphan_reaper_interval_seconds),
@@ -143,18 +199,31 @@ def install_disaggregation_wiring(scheduler: Scheduler, server_args: ServerArgs)
     scheduler.disagg_kv_manager.start_reaper()
     scheduler.disagg_use_d2h_staging = server_args.disaggregation_enable_d2h
 
-    scheduler.disagg_bootstrap_client = BootstrapClient(
-        server_args.disaggregation_bootstrap_url,
-        timeout_s=server_args.disaggregation_bootstrap_timeout_seconds,
-        shared_secret=shared_secret,
-    )
-
     if mode == "prefill":
         import jax
 
         scheduler.disagg_prefill_queue = PrefillBootstrapQueue()
-        bootstrap_key = f"{local_host}:{transfer_port}"
         prefill_kv_pool = scheduler.token_to_kv_pool_allocator.get_kvcache()
+        kv_dtype_name = resolve_kv_dtype_name(prefill_kv_pool.dtype)
+
+        # raiden: advertise the control endpoint so D can reach P's TransferEngine.
+        raiden_control_port = 0
+        raiden_endpoints_json = ""
+        if raiden_wrapper is not None:
+            import json as _json
+
+            raiden_control_port = server_args.disaggregation_raiden_control_port
+            endpoints = raiden_wrapper.endpoints
+            raiden_endpoints_json = _json.dumps(endpoints) if endpoints is not None else ""
+            if endpoints:
+                try:
+                    raiden_control_port = int(str(endpoints[0]["endpoint"]).rsplit(":", 1)[1])
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise RuntimeError(
+                        f"invalid Raiden endpoint descriptor: {endpoints[0]!r}"
+                    ) from exc
+
+        bootstrap_key = f"{local_host}:{transfer_port}"
         scheduler.disagg_bootstrap_client.register_prefill(
             bootstrap_key=bootstrap_key,
             host=local_host,
@@ -166,7 +235,10 @@ def install_disaggregation_wiring(scheduler: Scheduler, server_args: ServerArgs)
             jax_process_index=jax.process_index(),
             jax_process_count=jax.process_count(),
             page_size=server_args.page_size,
-            kv_dtype=resolve_kv_dtype_name(prefill_kv_pool.dtype),
+            kv_dtype=kv_dtype_name,
+            local_control_port=raiden_control_port,
+            raiden_endpoints_json=raiden_endpoints_json,
+            transfer_engine=("raiden" if raiden_wrapper is not None else "jax"),
         )
         scheduler.disagg_heartbeat = HeartbeatDaemon(
             scheduler.disagg_bootstrap_client, bootstrap_key
@@ -231,8 +303,10 @@ def _make_disagg_shutdown(scheduler: Scheduler, mode: str):
                 "PD shutdown: manager.graceful_shutdown failed",
                 exc_info=True,
             )
-        with suppress(Exception):
-            scheduler.disagg_kv_manager.zmq_notifier.stop()
+        notifier = scheduler.disagg_kv_manager.zmq_notifier
+        if notifier is not None:
+            with suppress(Exception):
+                notifier.stop()
         if scheduler.disagg_decode_watchdog is not None:
             with suppress(Exception):
                 scheduler.disagg_decode_watchdog.stop()
