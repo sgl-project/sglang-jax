@@ -1415,8 +1415,8 @@ class ServerArgs:
             action="store_true",
             default=ServerArgs.enable_grouped_topk_kernel,
             help=(
-                "Enable the Pallas grouped-topk kernel for biased grouped top-k "
-                "routing (TPU only). Default off, using the pure JAX implementation."
+                "Enable Pallas kernels for biased top-k routing, including grouped "
+                "and non-grouped paths (TPU only). Default off, using pure JAX."
             ),
         )
 

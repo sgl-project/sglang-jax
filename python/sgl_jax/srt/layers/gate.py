@@ -12,11 +12,12 @@ from sgl_jax.srt.eplb.expert_location import (
     get_global_server_args,
     topk_ids_logical_to_physical,
 )
+from sgl_jax.srt.kernels.biased_topk import biased_topk_pallas
 from sgl_jax.srt.kernels.grouped_topk.v1.kernel import grouped_topk_pallas
 from sgl_jax.srt.utils.profiling_utils import named_scope
 
 
-def _grouped_topk_kernel_enabled() -> bool:
+def _topk_kernel_enabled() -> bool:
     server_args = get_global_server_args()
     return (
         server_args is not None
@@ -132,6 +133,30 @@ class TopK(nnx.Module):
         return jax.lax.top_k(router_logits, self.topk)
 
     def _biased_topk(self, router_logits, correction_bias):
+        if not _topk_kernel_enabled() or router_logits.shape[-1] % 128 != 0:
+            return self._biased_topk_jax(router_logits, correction_bias)
+        fn = functools.partial(
+            biased_topk_pallas,
+            topk=self.topk,
+        )
+        # Mosaic/Pallas kernels cannot be auto-partitioned by JAX's SPMD compiler;
+        # wrap in shard_map so each device runs the kernel on its local token slice.
+        if self.mesh is not None:
+            fn = jax.shard_map(
+                fn,
+                mesh=self.mesh,
+                in_specs=(P("data", None), P(None)),
+                out_specs=(P("data", None), P("data", None)),
+                check_vma=False,
+            )
+        try:
+            return fn(router_logits, correction_bias)
+        except ValueError as exc:
+            if "no VMEM-safe block_tokens" not in str(exc):
+                raise
+            return self._biased_topk_jax(router_logits, correction_bias)
+
+    def _biased_topk_jax(self, router_logits, correction_bias):
         n_routed_experts = router_logits.shape[-1]
         scores_for_choice = router_logits.reshape(-1, n_routed_experts) + jnp.expand_dims(
             correction_bias, axis=0
@@ -179,7 +204,7 @@ class TopK(nnx.Module):
         correction_bias: jax.Array = None,
         packed: bool = False,
     ):
-        if not _grouped_topk_kernel_enabled():
+        if not _topk_kernel_enabled():
             return self._biased_grouped_topk_jax(router_logits, correction_bias)
         fn = functools.partial(
             grouped_topk_pallas,
