@@ -663,9 +663,7 @@ def _repack_page_indices(
     offset_deltas = src_offsets - dst_offsets
     offsets_sharding = jax.typeof(offset_deltas).sharding
     offsets_out_sharding = offsets_sharding if isinstance(offsets_sharding, NamedSharding) else None
-    slot_offset_deltas = offset_deltas.at[dp_ids, slot_ids].get(
-        out_sharding=offsets_out_sharding
-    )
+    slot_offset_deltas = offset_deltas.at[dp_ids, slot_ids].get(out_sharding=offsets_out_sharding)
     gather_src = (
         dp_ids * pages_per_dp
         + slot_offset_deltas
