@@ -2545,6 +2545,9 @@ class Scheduler(
                 ]
 
     def _prepare_relay_metadata(self, batch, worker_batch):
+        if batch.forward_mode.is_decode():
+            return
+
         total_tokens = len(worker_batch.input_ids)
         per_dp_tokens = total_tokens // self.dp_size
         indices = np.zeros(total_tokens, dtype=np.int32)
@@ -2553,13 +2556,6 @@ class Scheduler(
         for dp_rank, info in enumerate(batch.reqs_info):
             reqs = info.reqs or []
             offset = dp_rank * per_dp_tokens
-            if batch.forward_mode.is_decode():
-                size = len(reqs)
-                if size:
-                    indices[offset : offset + size] = info.req_pool_indices
-                    mask[offset : offset + size] = True
-                continue
-
             decoding_reqs = {id(req) for req in (info.decoding_reqs or [])}
             req_pool_indices = info.req_pool_indices if info.req_pool_indices is not None else ()
             for req, req_pool_idx, extend_len in zip(
