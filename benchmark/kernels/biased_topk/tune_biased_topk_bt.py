@@ -1,4 +1,4 @@
-"""Sweep biased-topk token block sizes on TPU v7."""
+"""Sweep biased-topk token block sizes on TPU."""
 
 import argparse
 import functools
@@ -13,6 +13,7 @@ from benchmark.kernels.biased_topk.bench_biased_topk import (
     reference_biased_topk,
 )
 from sgl_jax.srt.kernels.biased_topk import biased_topk_pallas
+from sgl_jax.srt.kernels.biased_topk.tuned_block_sizes import _device_name
 
 EXPERTS = 384
 TOPK = 8
@@ -139,7 +140,7 @@ def main():
         if block_tokens is not None:
             best[(tokens, EXPERTS, TOPK)] = block_tokens
 
-    print("\n# paste into TUNED_BT['TPU v7']")
+    print(f"\n# paste into TUNED_BT[{_device_name()!r}]")
     for key, block_tokens in best.items():
         print(f"{key!r}: {block_tokens},")
     if args.output:

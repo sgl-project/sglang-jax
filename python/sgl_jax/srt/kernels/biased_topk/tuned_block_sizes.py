@@ -17,6 +17,18 @@ def _device_name() -> str:
 # device_name -> {(T, E, k): block_tokens}
 # TPU v7 E=384/k=8 entries are populated from the real-device tuner.
 TUNED_BT: dict[str, dict[tuple[int, int, int], int]] = {
+    "TPU v6e": {
+        (64, 384, 8): 64,
+        (128, 384, 8): 128,
+        (256, 384, 8): 256,
+        (512, 384, 8): 256,
+        (1024, 384, 8): 256,
+        (2048, 384, 8): 1024,
+        (4096, 384, 8): 1024,
+        (8192, 384, 8): 1024,
+        (16384, 384, 8): 1024,
+        (32768, 384, 8): 1024,
+    },
     "TPU v7": {
         (64, 384, 8): 64,
         (128, 384, 8): 128,

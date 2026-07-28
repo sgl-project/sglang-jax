@@ -383,6 +383,28 @@ def test_v7_tuned_block_sizes_cover_mimo_sweep(monkeypatch):
     assert tuned_block_sizes.get_tuned_bt(1024, 256, 8) is None
 
 
+def test_v6e_tuned_block_sizes_cover_mimo_sweep(monkeypatch):
+    from sgl_jax.srt.kernels.biased_topk import tuned_block_sizes
+
+    monkeypatch.setattr(tuned_block_sizes, "_device_name", lambda: "TPU v6e")
+    expected = {
+        64: 64,
+        128: 128,
+        256: 256,
+        512: 256,
+        1024: 256,
+        2048: 1024,
+        4096: 1024,
+        8192: 1024,
+        16384: 1024,
+        32768: 1024,
+    }
+
+    for tokens, block_tokens in expected.items():
+        assert tuned_block_sizes.get_tuned_bt(tokens, 384, 8) == block_tokens
+    assert tuned_block_sizes.get_tuned_bt(1024, 256, 8) is None
+
+
 def test_topk_kernel_path_preserves_logical_to_physical_mapping(monkeypatch):
     from sgl_jax.srt.eplb.expert_location import (
         ExpertLocationMetadata,
