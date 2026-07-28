@@ -1,14 +1,19 @@
 """Auto-tuned block sizes for ragged paged attention v3.
 
 The v3 kernel splits into three pallas_calls (DECODE / PREFILL / MIXED), each
-with its own (bq_sz, bkv_sz, bq_csz, bkv_csz) 4-tuple. This table is keyed by
-device + stage + sliding-window bucket + the same workload signature used by v2.
+with its own (bq_sz, bkv_sz, bq_csz, bkv_csz) 4-tuple. Batched target
+verification still executes the MIXED pallas_call, but uses lookup stage
+``"v"`` because its many short queries over long KV prefixes need different
+tiling from ordinary mixed/prefill traffic.
 
 Schema:
     TUNED_BLOCK_SIZES_V3[device_name][key] = (bq_sz, bkv_sz, bq_csz, bkv_csz)
-    key = (stage, sliding_window, q_dtype, kv_dtype, q_heads, kv_heads,
+    key = (stage, sliding_window, ..., q_dtype, kv_dtype, q_heads, kv_heads,
            head_dim, page_size, max_num_tokens)
-    stage in {"d", "p", "m"}
+    stage in {"d", "p", "m", "v"}
+    stage "v" is lookup-only; the selected tuple is passed to the MIXED
+    pallas_call. Its bq fields are caps that are clamped to tokens_per_seq at
+    trace time.
     sliding_window: None for full-attention layers; int for SWA layers
                     (a different sliding_window value is a different entry —
                     e.g., bkv ~= sliding_window is usually optimal so SWA must
@@ -1002,6 +1007,21 @@ TUNED_BLOCK_SIZES_V3: dict[str, dict[tuple, tuple[int, int, int, int]]] = {
         ("m", None, "bfloat16", "bfloat16", 64, 16, 128, 256, 2048): (32, 256, 32, 256),
     },
     "TPU v7": {
+        # Target verify on MiMo v2.5 Pro: short per-request query segments over
+        # a long prefix. Lookup stage "v" still executes the MIXED pallas_call.
+        # Full attention was stable at bkv=2048 across 4K--32K contexts.
+        ("v", None, "bfloat16", "bfloat16", 16, 1, 256, 256, 16): (32, 2048, 32, 2048),
+        ("v", None, "bfloat16", "bfloat16", 16, 1, 256, 256, 32): (32, 2048, 32, 2048),
+        ("v", None, "bfloat16", "bfloat16", 16, 1, 256, 256, 64): (32, 2048, 32, 2048),
+        ("v", None, "bfloat16", "bfloat16", 16, 1, 256, 256, 128): (32, 2048, 32, 2048),
+        ("v", None, "bfloat16", "bfloat16", 16, 1, 256, 256, 256): (32, 2048, 32, 2048),
+        # SWA128 only reads a 128-token window. One 256-token page/block is
+        # consistently faster than carrying the full-attention bkv=2048.
+        ("v", 128, "bfloat16", "bfloat16", 16, 1, 256, 256, 16): (32, 256, 32, 256),
+        ("v", 128, "bfloat16", "bfloat16", 16, 1, 256, 256, 32): (32, 256, 32, 256),
+        ("v", 128, "bfloat16", "bfloat16", 16, 1, 256, 256, 64): (32, 256, 32, 256),
+        ("v", 128, "bfloat16", "bfloat16", 16, 1, 256, 256, 128): (32, 256, 32, 256),
+        ("v", 128, "bfloat16", "bfloat16", 16, 1, 256, 256, 256): (32, 256, 32, 256),
         ("d", 128, "bfloat16", "bfloat16", 16, 1, 256, 128, 1): (1, 256, 1, 256),
         ("d", 128, "bfloat16", "bfloat16", 16, 1, 256, 128, 2): (1, 256, 1, 256),
         ("d", 128, "bfloat16", "bfloat16", 16, 1, 256, 128, 4): (1, 256, 1, 256),
@@ -2150,6 +2170,7 @@ def get_tuned_block_sizes_v3(
     page_size: int,
     max_num_tokens: int,
     sliding_window: int | None = None,
+    tokens_per_seq: int | None = None,
 ) -> tuple[int, int, int, int] | None:
     """Look up (bq_sz, bkv_sz, bq_csz, bkv_csz) from the v3 tuned table.
 
@@ -2160,8 +2181,10 @@ def get_tuned_block_sizes_v3(
     Returns None if no entry matches; caller should fall back to the heuristic
     in ragged_paged_attention_v3.get_default_block_sizes.
     """
-    if stage not in ("d", "p", "m"):
-        raise ValueError(f"stage must be one of d/p/m, got {stage!r}")
+    if stage not in ("d", "p", "m", "v"):
+        raise ValueError(f"stage must be one of d/p/m/v, got {stage!r}")
+    if stage == "v" and tokens_per_seq is None:
+        raise ValueError("tokens_per_seq is required for target-verify stage v")
 
     tpu_version = get_tpu_version()
     if tpu_version < 5:
@@ -2191,5 +2214,16 @@ def get_tuned_block_sizes_v3(
             "to enable tuning for this shape.",
             device_name,
             key,
+        )
+    if hit is not None and stage == "v":
+        # Verify has many static q_len-sized query segments. The table stores a
+        # reusable query-tile cap, while draft_token_num specializes bq at trace
+        # time without adding a one-off key dimension.
+        assert tokens_per_seq is not None
+        return (
+            min(hit[0], tokens_per_seq),
+            hit[1],
+            min(hit[2], tokens_per_seq),
+            hit[3],
         )
     return hit

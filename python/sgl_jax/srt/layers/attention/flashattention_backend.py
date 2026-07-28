@@ -12,6 +12,9 @@ from jax.tree_util import register_pytree_node_class
 from sgl_jax.srt.kernels.ragged_paged_attention.ragged_paged_attention_v3 import (
     ragged_paged_attention as ragged_paged_attention_v3,
 )
+from sgl_jax.srt.kernels.ragged_paged_attention.tuned_block_sizes_v3 import (
+    get_tuned_block_sizes_v3,
+)
 from sgl_jax.srt.layers.attention.base_attn_backend import AttentionBackend
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
@@ -430,7 +433,6 @@ class FlashAttention(AttentionBackend):
         return metadata
 
     def get_eagle_multi_step_metadata(self, batch: ModelWorkerBatch):
-
         indices = np.arange(0, len(batch.cache_loc), self.page_size)
         # NOTE: Use original_selected_cache_locs as the source of truth for all steps
         # to avoid the bug where selected_cache_locs is overwritten by truncated data in loops.
@@ -646,10 +648,37 @@ class FlashAttention(AttentionBackend):
             self.forward_metadata.custom_mask is not None
             and forward_batch.forward_mode.is_target_verify()
         )
+        target_verify_tokens_per_seq = (
+            getattr(forward_batch.spec_info, "draft_token_num", None)
+            if forward_batch.forward_mode.is_target_verify()
+            else None
+        )
 
         def _ragged_paged_attention_with_fused_kv(*args):
             queries, keys, values, kv_cache_fused = args[:4]
             other_args = args[4:]
+            # Target verify is semantically many short decode-like query
+            # segments over long prefixes, although it must execute in the
+            # MIXED kernel for q_len > 1. Keep its tuning namespace separate
+            # from ordinary mixed/prefill. The current table is for causal
+            # chain verification; custom tree masks retain the generic path.
+            target_verify_m_block_sizes = (
+                get_tuned_block_sizes_v3(
+                    "v",
+                    queries.dtype,
+                    kv_cache_fused.dtype,
+                    queries.shape[1],
+                    keys.shape[1],
+                    queries.shape[2],
+                    kv_cache_fused.shape[1],
+                    queries.shape[0],
+                    sliding_window=layer.sliding_window_size,
+                    tokens_per_seq=target_verify_tokens_per_seq,
+                )
+                if target_verify_tokens_per_seq is not None
+                and self.forward_metadata.custom_mask is None
+                else None
+            )
 
             # Call fused KV kernel with head interleaving
             result, updated_kv_cache_fused = ragged_paged_attention_v3(
@@ -667,6 +696,7 @@ class FlashAttention(AttentionBackend):
                 ),
                 softmax_dtype=layer.softmax_dtype,
                 mask_aligned_to_cu_kv=mask_aligned_to_cu_kv,
+                m_block_sizes=target_verify_m_block_sizes,
             )
 
             return result, updated_kv_cache_fused
