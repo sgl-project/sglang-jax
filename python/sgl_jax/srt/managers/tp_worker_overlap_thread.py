@@ -163,6 +163,14 @@ class ModelWorkerClient:
                 self.mesh,
             )
             next_token_ids = self.async_gather_fn(next_token_ids)
+            # Kick off the D2H transfer here, on the forward thread, so the
+            # scheduler's resolve_last_batch_result finds the copy in flight
+            # instead of paying the full interactive device_get round-trip.
+            # Matters most under the Pathways proxy backend, where a blocking
+            # device_get of even a few hundred bytes costs ~20 ms of
+            # client->proxy->worker RTT (#772).
+            if hasattr(next_token_ids, "copy_to_host_async"):
+                next_token_ids.copy_to_host_async()
             self.output_queue.put((None, logits_output, next_token_ids, cache_miss_count))
 
     def resolve_last_batch_result(self, launch_done: threading.Event | None = None):

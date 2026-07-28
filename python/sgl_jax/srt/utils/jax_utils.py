@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import gc
 from collections import defaultdict
+from functools import cache
 from typing import Any
 
 import jax
@@ -218,9 +219,33 @@ def get_available_device_memory(
     return int(free_gpu_memory * (1 << 10))
 
 
+@cache
+def _canonical_named_sharding(mesh, spec, memory_kind) -> "jax.sharding.NamedSharding":
+    return jax.sharding.NamedSharding(mesh, spec, memory_kind=memory_kind)
+
+
+def canonicalize_sharding(sharding):
+    """Map equal NamedShardings onto one canonical object per (mesh, spec).
+
+    jaxlib's PjitFunctionCache fast-path compares input shardings by object
+    pointer; handing pjit a fresh NamedSharding every step defeats that
+    fast-path and, under dp=1 + Pathways proxy, misses the cpp cache entirely
+    (issue #1452). Shardings with explicit logical device ids are passed
+    through untouched, as they are not covered by the (mesh, spec,
+    memory_kind) cache key.
+    """
+    if isinstance(sharding, jax.sharding.NamedSharding) and (
+        getattr(sharding, "_logical_device_ids", None) is None
+    ):
+        return _canonical_named_sharding(sharding.mesh, sharding.spec, sharding.memory_kind)
+    return sharding
+
+
 def device_array(data, sharding=None, **kwargs) -> jax.Array:
     if sharding is None:
         return jax.device_put(data, device=sharding, **kwargs)
+
+    sharding = canonicalize_sharding(sharding)
 
     def _to_device(arr):
         arr = np.asarray(arr)
