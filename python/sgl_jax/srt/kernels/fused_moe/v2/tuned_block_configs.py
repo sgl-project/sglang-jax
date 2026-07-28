@@ -36,8 +36,8 @@ TUNED_BLOCK_CONFIGS: dict[str, dict[tuple, tuple[int, ...]]] = {
         ('bfloat16', 'float8_e4m3fn', 128, 384, 8, 6144, 2048, 32, False, False): (8, 512, 8, 256, 8),
         ('bfloat16', 'float8_e4m3fn', 256, 384, 8, 6144, 2048, 32, False, False): (8, 512, 16, 256, 16),
         ('bfloat16', 'float8_e4m3fn', 512, 384, 8, 6144, 2048, 32, False, False): (16, 1024, 32, 256, 32),
-        # Tuned on a (dp=4, tp=8) mesh with 768 valid tokens (2026-07-28).
-        ('bfloat16', 'float8_e4m3fn', 1024, 384, 8, 6144, 2048, 32, False, False): (32, 512, 24, 256, 24),
+        # Tuned on a (dp=4, tp=8) mesh for the BS=192 decode bucket (2026-07-28).
+        ('bfloat16', 'float8_e4m3fn', 768, 384, 8, 6144, 2048, 32, False, False): (24, 1024, 32, 256, 32),
         # Prefill configs
         ('bfloat16', 'float8_e4m3fn', 2048, 384, 8, 6144, 2048, 32, False, False): (128, 512, 128, 256, None),
         ('bfloat16', 'float8_e4m3fn', 4096, 384, 8, 6144, 2048, 32, False, False): (128, 512, 128, 256, None),
