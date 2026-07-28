@@ -1,14 +1,18 @@
 """Auto-tuned block sizes for ragged paged attention v3.
 
 The v3 kernel splits into three pallas_calls (DECODE / PREFILL / MIXED), each
-with its own (bq_sz, bkv_sz, bq_csz, bkv_csz) 4-tuple. This table is keyed by
-device + stage + sliding-window bucket + the same workload signature used by v2.
+with its own (bq_sz, bkv_sz, bq_csz, bkv_csz) 4-tuple. Batched target
+verification still executes the MIXED pallas_call, but uses lookup stage
+``"v"`` because its many short queries over long KV prefixes need different
+tiling from ordinary mixed/prefill traffic.
 
 Schema:
     TUNED_BLOCK_SIZES_V3[device_name][key] = (bq_sz, bkv_sz, bq_csz, bkv_csz)
-    key = (stage, sliding_window, q_dtype, kv_dtype, q_heads, kv_heads,
+    key = (stage, sliding_window, ..., q_dtype, kv_dtype, q_heads, kv_heads,
            head_dim, page_size, max_num_tokens)
-    stage in {"d", "p", "m"}
+    stage in {"d", "p", "m", "v"}
+    stage "v" inserts tokens_per_seq after sliding_window and is lookup-only;
+    the selected tuple is passed to the MIXED pallas_call.
     sliding_window: None for full-attention layers; int for SWA layers
                     (a different sliding_window value is a different entry —
                     e.g., bkv ~= sliding_window is usually optimal so SWA must
@@ -1002,6 +1006,25 @@ TUNED_BLOCK_SIZES_V3: dict[str, dict[tuple, tuple[int, int, int, int]]] = {
         ("m", None, "bfloat16", "bfloat16", 64, 16, 128, 256, 2048): (32, 256, 32, 256),
     },
     "TPU v7": {
+        # Target verify on MiMo v2.5 Pro: short per-request query segments over
+        # a long prefix. Lookup stage "v" still executes the MIXED pallas_call.
+        # Full attention was stable at bkv=2048 across 4K--32K contexts.
+        ("v", None, 4, "bfloat16", "bfloat16", 16, 1, 256, 256, 16): (4, 2048, 4, 2048),
+        ("v", None, 4, "bfloat16", "bfloat16", 16, 1, 256, 256, 32): (4, 2048, 4, 2048),
+        ("v", None, 4, "bfloat16", "bfloat16", 16, 1, 256, 256, 64): (4, 2048, 4, 2048),
+        ("v", None, 4, "bfloat16", "bfloat16", 16, 1, 256, 256, 128): (4, 2048, 4, 2048),
+        ("v", None, 4, "bfloat16", "bfloat16", 16, 1, 256, 256, 256): (4, 2048, 4, 2048),
+        ("v", None, 2, "bfloat16", "bfloat16", 16, 1, 256, 256, 128): (2, 2048, 2, 2048),
+        ("v", None, 8, "bfloat16", "bfloat16", 16, 1, 256, 256, 128): (8, 2048, 8, 2048),
+        # SWA128 only reads a 128-token window. One 256-token page/block is
+        # consistently faster than carrying the full-attention bkv=2048.
+        ("v", 128, 4, "bfloat16", "bfloat16", 16, 1, 256, 256, 16): (4, 256, 4, 256),
+        ("v", 128, 4, "bfloat16", "bfloat16", 16, 1, 256, 256, 32): (4, 256, 4, 256),
+        ("v", 128, 4, "bfloat16", "bfloat16", 16, 1, 256, 256, 64): (4, 256, 4, 256),
+        ("v", 128, 4, "bfloat16", "bfloat16", 16, 1, 256, 256, 128): (4, 256, 4, 256),
+        ("v", 128, 4, "bfloat16", "bfloat16", 16, 1, 256, 256, 256): (4, 256, 4, 256),
+        ("v", 128, 2, "bfloat16", "bfloat16", 16, 1, 256, 256, 128): (2, 256, 2, 256),
+        ("v", 128, 8, "bfloat16", "bfloat16", 16, 1, 256, 256, 128): (8, 256, 8, 256),
         ("d", 128, "bfloat16", "bfloat16", 16, 1, 256, 128, 1): (1, 256, 1, 256),
         ("d", 128, "bfloat16", "bfloat16", 16, 1, 256, 128, 2): (1, 256, 1, 256),
         ("d", 128, "bfloat16", "bfloat16", 16, 1, 256, 128, 4): (1, 256, 1, 256),
@@ -2150,6 +2173,7 @@ def get_tuned_block_sizes_v3(
     page_size: int,
     max_num_tokens: int,
     sliding_window: int | None = None,
+    tokens_per_seq: int | None = None,
 ) -> tuple[int, int, int, int] | None:
     """Look up (bq_sz, bkv_sz, bq_csz, bkv_csz) from the v3 tuned table.
 
@@ -2160,8 +2184,10 @@ def get_tuned_block_sizes_v3(
     Returns None if no entry matches; caller should fall back to the heuristic
     in ragged_paged_attention_v3.get_default_block_sizes.
     """
-    if stage not in ("d", "p", "m"):
-        raise ValueError(f"stage must be one of d/p/m, got {stage!r}")
+    if stage not in ("d", "p", "m", "v"):
+        raise ValueError(f"stage must be one of d/p/m/v, got {stage!r}")
+    if stage == "v" and tokens_per_seq is None:
+        raise ValueError("tokens_per_seq is required for target-verify stage v")
 
     tpu_version = get_tpu_version()
     if tpu_version < 5:
@@ -2181,7 +2207,11 @@ def get_tuned_block_sizes_v3(
     if not table:
         return None
 
-    key = (stage, sliding_window, *signature)
+    key = (
+        (stage, sliding_window, tokens_per_seq, *signature)
+        if stage == "v"
+        else (stage, sliding_window, *signature)
+    )
     hit = table.get(key)
     if hit is None and key not in _WARNED_MISSES:
         _WARNED_MISSES.add(key)

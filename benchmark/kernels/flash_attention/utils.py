@@ -1,8 +1,7 @@
 import jax
 import jax.numpy as jnp
 
-from sgl_jax.srt.kernels.ragged_paged_attention.util import get_dtype_packing
-from sgl_jax.srt.utils import cdiv
+from sgl_jax.srt.kernels.ragged_paged_attention.util import cdiv, get_dtype_packing
 
 
 def create_kv_cache_data(
@@ -164,6 +163,109 @@ def create_decode_uniform_data(
         v,
         kv_cache,
         seq_lens,
+        page_indices,
+        cu_q_lens,
+        cu_kv_lens,
+        num_seqs,
+        seq_lens,
+        cache_loc,
+        distribution,
+    )
+
+
+def create_target_verify_uniform_data(
+    *,
+    batch_size: int,
+    draft_token_num: int,
+    prefix_len: int,
+    page_indices_capacity: int,
+    max_kv_cache_tokens: int,
+    q_head_num: int,
+    kv_head_num: int,
+    head_dim: int,
+    page_size: int = 128,
+    dtype=jnp.bfloat16,
+    seed: int = 42,
+):
+    """Create the padded MIXED workload used by batched target verification.
+
+    Unlike ``create_prefill_uniform_data``, this models many short query
+    segments attending to long existing prefixes. ``cu_kv_lens`` follows the
+    production target-verify path and advances by page-aligned KV lengths,
+    while ``kv_lens`` retains the actual (prefix + draft) length.
+    """
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be positive, got {batch_size}")
+    if draft_token_num <= 0:
+        raise ValueError(f"draft_token_num must be positive, got {draft_token_num}")
+    if prefix_len < 0:
+        raise ValueError(f"prefix_len must be non-negative, got {prefix_len}")
+
+    total_q_tokens = batch_size * draft_token_num
+    kv_len = prefix_len + draft_token_num
+    aligned_kv_len = cdiv(kv_len, page_size) * page_size
+    pages_per_seq = cdiv(kv_len, page_size)
+    required_page_indices = batch_size * pages_per_seq
+    if page_indices_capacity < required_page_indices:
+        raise ValueError(
+            "page_indices_capacity is too small: "
+            f"required={required_page_indices}, got={page_indices_capacity}"
+        )
+
+    q, k, v = create_qkv_data(
+        total_q_tokens,
+        q_head_num,
+        kv_head_num,
+        head_dim,
+        dtype,
+        seed,
+    )
+    packing = get_dtype_packing(dtype)
+    total_num_pages = cdiv(max_kv_cache_tokens, page_size)
+    if total_num_pages < required_page_indices:
+        raise ValueError(
+            "max_kv_cache_tokens is too small: "
+            f"required_pages={required_page_indices}, got_pages={total_num_pages}"
+        )
+    # Cache contents do not affect kernel timing. Avoid allocating random
+    # generation intermediates for the multi-GB production-shaped cache.
+    kv_cache = jnp.zeros(
+        (total_num_pages, page_size, kv_head_num * 2 // packing, packing, head_dim),
+        dtype=dtype,
+    )
+
+    kv_lens = jnp.full((batch_size,), kv_len, dtype=jnp.int32)
+    cu_q_lens = jnp.arange(
+        0,
+        total_q_tokens + 1,
+        draft_token_num,
+        dtype=jnp.int32,
+    )
+    cu_kv_lens = jnp.arange(
+        0,
+        batch_size * aligned_kv_len + 1,
+        aligned_kv_len,
+        dtype=jnp.int32,
+    )
+
+    page_indices = jnp.pad(
+        jnp.arange(required_page_indices, dtype=jnp.int32),
+        (0, page_indices_capacity - required_page_indices),
+        constant_values=0,
+    )
+    num_seqs = jnp.array([batch_size], dtype=jnp.int32)
+    seq_lens = kv_lens
+    cache_loc = jnp.arange(total_q_tokens, dtype=jnp.int32)
+    # TARGET_VERIFY metadata starts as [0, N, N]. RPA remaps the middle
+    # boundary to zero when chunk_prefill_size=None, so all rows execute in
+    # the MIXED pallas_call.
+    distribution = jnp.array([0, batch_size, batch_size], dtype=jnp.int32)
+    return (
+        q,
+        k,
+        v,
+        kv_cache,
+        kv_lens,
         page_indices,
         cu_q_lens,
         cu_kv_lens,
