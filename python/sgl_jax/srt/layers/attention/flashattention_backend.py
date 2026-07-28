@@ -36,6 +36,36 @@ def _per_dp_cumsum(lens, dp_size: int, per_dp_bs: int) -> np.ndarray:
     return cu.ravel()
 
 
+def _pad_page_indices(
+    page_indices: np.ndarray,
+    max_num_seqs: int,
+    fixed_capacity: int | None = None,
+) -> np.ndarray:
+    """Pad page indices to either a fixed capacity or a per-sequence bucket."""
+    page_indices = np.asarray(page_indices, dtype=np.int32)
+    if fixed_capacity is not None:
+        target_len = int(fixed_capacity)
+        if target_len < len(page_indices):
+            raise ValueError(
+                "page_indices exceed fixed capacity: "
+                f"required={len(page_indices)}, capacity={target_len}"
+            )
+    elif max_num_seqs > 0 and len(page_indices) > 0:
+        current_pps = cdiv(len(page_indices), max_num_seqs)
+        bucketed_pps = max(16, 1 << max(0, (current_pps - 1)).bit_length())
+        target_len = max_num_seqs * bucketed_pps
+    else:
+        return page_indices
+
+    if len(page_indices) < target_len:
+        page_indices = np.pad(
+            page_indices,
+            (0, target_len - len(page_indices)),
+            constant_values=0,
+        )
+    return page_indices
+
+
 @register_pytree_node_class
 @dataclass
 class FlashAttentionMetadata:
@@ -203,13 +233,27 @@ class FlashAttention(AttentionBackend):
         )
         return metadata
 
-    def get_eagle_forward_metadata(self, batch: ModelWorkerBatch):
+    # TODO: Make this a common speculative metadata builder in the next PR;
+    # DFlash and EAGLE already share this path.
+    def get_eagle_forward_metadata(
+        self,
+        batch: ModelWorkerBatch,
+        *,
+        page_indices: np.ndarray | None = None,
+        page_indices_capacity: int | None = None,
+        extend_seq_lens: np.ndarray | None = None,
+        cu_q_lens: jax.Array | None = None,
+        distribution: jax.Array | None = None,
+    ):
         """Return the metadata for a forward pass."""
         # below code is for verify and draft extend phase
         metadata = FlashAttentionMetadata()
-        indices = np.arange(0, len(batch.cache_loc), self.page_size)
-        selected_cache_locs = batch.cache_loc[indices]
-        page_indices = (selected_cache_locs // self.page_size).astype(np.int32)
+        if page_indices is None:
+            indices = np.arange(0, len(batch.cache_loc), self.page_size)
+            selected_cache_locs = batch.cache_loc[indices]
+            page_indices = (selected_cache_locs // self.page_size).astype(np.int32)
+        else:
+            page_indices = np.asarray(page_indices, dtype=np.int32)
 
         if batch.forward_mode == ForwardMode.TARGET_VERIFY:
             metadata.custom_mask = batch.spec_info_padded.custom_mask
@@ -223,12 +267,20 @@ class FlashAttention(AttentionBackend):
         dp_size = batch.dp_size
         per_dp_bs = batch.per_dp_bs_size if dp_size > 1 else len(batch.seq_lens)
         if batch.forward_mode.is_target_verify():
-            padded_batch_size = len(batch.seq_lens)
-            extend_seq_lens = np.zeros(padded_batch_size, dtype=np.int32)
-            extend_seq_lens[batch.logits_indices_selector] = batch.spec_info_padded.draft_token_num
+            if extend_seq_lens is None:
+                padded_batch_size = len(batch.seq_lens)
+                extend_seq_lens = np.zeros(padded_batch_size, dtype=np.int32)
+                extend_seq_lens[batch.logits_indices_selector] = (
+                    batch.spec_info_padded.draft_token_num
+                )
         else:
             extend_seq_lens = batch.extend_seq_lens
-        cu_q_lens = _per_dp_cumsum(extend_seq_lens, dp_size, per_dp_bs)
+        if cu_q_lens is None:
+            cu_q_lens = _per_dp_cumsum(extend_seq_lens, dp_size, per_dp_bs)
+            cu_q_lens = device_array(
+                cu_q_lens,
+                sharding=NamedSharding(self.mesh, P("data")),
+            )
 
         seq_lens = np.copy(batch.seq_lens)
 
@@ -279,6 +331,7 @@ class FlashAttention(AttentionBackend):
                     packed,
                     sharding=NamedSharding(self.mesh, P("data")),
                 )
+
         else:
             aligned_seq_lens = (
                 (batch.seq_lens + self.page_size - 1) // self.page_size
@@ -319,21 +372,44 @@ class FlashAttention(AttentionBackend):
                 dst_off[r] += n
             page_indices = new_pi
 
-        seq_2d = np.asarray(batch.seq_lens).reshape(dp_size, per_dp_bs)
-        local_n = np.sum(seq_2d > 0, axis=1, dtype=np.int32)
-        distribution = np.column_stack([np.zeros_like(local_n), local_n, local_n]).ravel()
+        if distribution is None:
+            seq_2d = np.asarray(batch.seq_lens).reshape(dp_size, per_dp_bs)
+            local_n = np.sum(seq_2d > 0, axis=1, dtype=np.int32)
+            distribution = np.column_stack([np.zeros_like(local_n), local_n, local_n]).ravel()
         page_indices = np.array(page_indices)
-        seq_lens = np.array(seq_lens)
-        (
-            metadata.cu_q_lens,
-            metadata.cu_kv_lens,
-            metadata.page_indices,
-            metadata.seq_lens,
-            metadata.distribution,
-        ) = device_array(
-            (cu_q_lens, cu_kv_lens, page_indices, seq_lens, distribution),
-            sharding=(NamedSharding(self.mesh, P("data"))),
+
+        # DFlash can provide one pool-sized capacity for every prefix length,
+        # removing pages-per-sequence from the JIT cache key. Other speculative
+        # paths retain the smaller per-sequence power-of-two buckets.
+        max_num_seqs = dp_size * per_dp_bs
+        page_indices = _pad_page_indices(
+            page_indices,
+            max_num_seqs,
+            fixed_capacity=page_indices_capacity,
         )
+
+        seq_lens = np.array(seq_lens)
+        metadata.cu_q_lens = cu_q_lens
+        if isinstance(distribution, jax.Array):
+            metadata.distribution = distribution
+            (
+                metadata.cu_kv_lens,
+                metadata.page_indices,
+                metadata.seq_lens,
+            ) = device_array(
+                (cu_kv_lens, page_indices, seq_lens),
+                sharding=(NamedSharding(self.mesh, P("data"))),
+            )
+        else:
+            (
+                metadata.cu_kv_lens,
+                metadata.page_indices,
+                metadata.seq_lens,
+                metadata.distribution,
+            ) = device_array(
+                (cu_kv_lens, page_indices, seq_lens, distribution),
+                sharding=(NamedSharding(self.mesh, P("data"))),
+            )
         # Hybrid SWA targets need swa_page_indices for TARGET_VERIFY too,
         # otherwise SWA layers index the swa sub-pool with full-pool page ids.
         swa_mapping = getattr(self, "swa_index_mapping", None)
@@ -524,6 +600,9 @@ class FlashAttention(AttentionBackend):
             else layer.scaling
         )
 
+        attn_type = getattr(layer, "attn_type", None)
+        if getattr(attn_type, "value", attn_type) == "encoder_only":
+            causal = 0
         if self.forward_metadata.custom_mask is not None:
             causal = 0
         # Select page indices and remap to SWA pool if KV cache supports it

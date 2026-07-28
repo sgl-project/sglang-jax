@@ -98,6 +98,18 @@ class TestPagedAllocatorMultiDP(CustomTestCase):
                 f"Rank {rank} should have all pages back after free",
             )
 
+    def test_backup_restore_restores_paged_free_pages(self):
+        allocator = self._create_allocator(dp_size=1)
+        initial_available = allocator.available_size(dp_rank=0)
+
+        state = allocator.backup_state()
+        indices = allocator.alloc(self.page_size, dp_rank=0)
+        self.assertIsNotNone(indices)
+        self.assertEqual(allocator.available_size(dp_rank=0), initial_available - self.page_size)
+
+        allocator.restore_state(state)
+        self.assertEqual(allocator.available_size(dp_rank=0), initial_available)
+
     def test_free_group_batching_single_rank(self):
         """Test free_group_begin/end batching for single DP rank (dp_size=1)."""
         allocator = self._create_allocator(dp_size=1)

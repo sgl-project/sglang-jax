@@ -68,6 +68,22 @@ def use_legacy_eagle3_non_overlap(enable_overlap, spec_algorithm) -> bool:
     )
 
 
+def can_merge_spec_non_overlap_prefill(enable_overlap, spec_algorithm) -> bool:
+    """Whether non-overlap spec decode may merge completed prefills into decode.
+
+    Eagle3 historically used the ``use_legacy_eagle3_non_overlap`` path for
+    this. DFlash needs the same scheduling behavior to keep decode batches
+    full, but it must keep its own accepted-length KV accounting, so do not
+    fold it into the legacy Eagle3 helper.
+    """
+    return (
+        not enable_overlap
+        and spec_algorithm is not None
+        and not spec_algorithm.is_none()
+        and (spec_algorithm.is_eagle3() or spec_algorithm.is_dflash())
+    )
+
+
 def resolve_spec_decode_token_ids(result, batch, draft_token_num: int):
     """Resolve per-request accepted token ids from a speculative verify result."""
     if hasattr(result.next_token_ids, "copy_to_host_async"):

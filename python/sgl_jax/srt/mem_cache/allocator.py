@@ -398,6 +398,16 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def load_cpu_copy(self, kv_cache_cpu, indices):
         return self._kvcache.load_cpu_copy(kv_cache_cpu, indices)
 
+    def backup_state(self):
+        return (
+            [pages.copy() for pages in self.free_pages],
+            [pages.copy() for pages in self.release_pages],
+        )
+
+    def restore_state(self, state):
+        assert len(state) == 2
+        self.free_pages, self.release_pages = state
+
 
 class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     """Allocator for SWA hybrid KV cache."""

@@ -1658,7 +1658,9 @@ class ScheduleBatch:
         # prepare_for_decode requires cross-rank-flat allocate_lens
         # (asserts shape[0] == batch_size); rebuild via _concat, run it, then
         # split allocate_lens back to per-rank.
-        if self.spec_algorithm is not None and self.spec_algorithm.is_eagle():
+        if self.spec_algorithm is not None and (
+            self.spec_algorithm.is_eagle() or self.spec_algorithm.is_dflash()
+        ):
             for info in self.reqs_info:
                 if not info.reqs:
                     info.input_ids = None
@@ -2684,6 +2686,62 @@ class ScheduleBatch:
         (== ``logits_indices_selector``). Returns a new ``EagleDraftInput``;
         the cross-round flat state on ``reqs_info[r].spec_info`` is unchanged.
         """
+        from sgl_jax.srt.speculative.dflash_info import DFlashDraftInput
+
+        if isinstance(flat, DFlashDraftInput):
+
+            def _scatter_dflash_1d(arr, field: str, *, fill_value: int = 0):
+                if arr is None:
+                    raise ValueError(f"DFLASH state field {field!r} is missing before DP scatter.")
+                a = np.asarray(arr)
+                if a.shape[0] != len(selector):
+                    raise ValueError(
+                        "DFLASH state length does not match real request slots before DP scatter: "
+                        f"field={field}, state_bs={a.shape[0]}, real_bs={len(selector)}."
+                    )
+                out = np.full((total_bs,), fill_value, dtype=a.dtype)
+                out[selector] = a
+                return out
+
+            def _scatter_dflash_hidden(arr):
+                if arr is None:
+                    return None
+                a = np.asarray(arr)
+                if a.shape[0] != len(selector):
+                    return None
+                out = np.zeros((total_bs,) + a.shape[1:], dtype=a.dtype)
+                out[selector] = a
+                return out
+
+            relay_state = flat.future_indices is not None
+            return DFlashDraftInput(
+                verified_id=(
+                    None if relay_state else _scatter_dflash_1d(flat.verified_id, "verified_id")
+                ),
+                target_hidden=_scatter_dflash_hidden(flat.target_hidden),
+                ctx_lens=(None if relay_state else _scatter_dflash_1d(flat.ctx_lens, "ctx_lens")),
+                draft_seq_lens=(
+                    None
+                    if relay_state
+                    else _scatter_dflash_1d(flat.draft_seq_lens, "draft_seq_lens")
+                ),
+                allocate_lens=(
+                    None
+                    if flat.allocate_lens is None
+                    else _scatter_dflash_1d(flat.allocate_lens, "allocate_lens")
+                ),
+                reservation_base_lens=(
+                    None
+                    if flat.reservation_base_lens is None
+                    else _scatter_dflash_1d(flat.reservation_base_lens, "reservation_base_lens")
+                ),
+                future_indices=(
+                    None
+                    if flat.future_indices is None
+                    else _scatter_dflash_1d(flat.future_indices, "future_indices")
+                ),
+                block_size=flat.block_size,
+            )
 
         def _scatter1(arr, *, require_selector_len: bool = True, data_sharded: bool = False):
             if arr is None:
@@ -2737,6 +2795,43 @@ class ScheduleBatch:
         """
         if flat is None:
             return [None] * len(real_bs_per_dp)
+
+        from sgl_jax.srt.speculative.dflash_info import DFlashDraftInput
+
+        if isinstance(flat, DFlashDraftInput):
+
+            def _slice(v, start: int, end: int):
+                return None if v is None else v[start:end]
+
+            relay_state = flat.future_indices is not None
+            out = []
+            offset = 0
+            for n in real_bs_per_dp:
+                if n == 0:
+                    out.append(None)
+                    continue
+
+                end = offset + n
+                out.append(
+                    DFlashDraftInput(
+                        verified_id=(
+                            None if relay_state else _slice(flat.verified_id, offset, end)
+                        ),
+                        target_hidden=(
+                            None if relay_state else _slice(flat.target_hidden, offset, end)
+                        ),
+                        ctx_lens=None if relay_state else _slice(flat.ctx_lens, offset, end),
+                        draft_seq_lens=(
+                            None if relay_state else _slice(flat.draft_seq_lens, offset, end)
+                        ),
+                        allocate_lens=_slice(flat.allocate_lens, offset, end),
+                        reservation_base_lens=_slice(flat.reservation_base_lens, offset, end),
+                        future_indices=_slice(flat.future_indices, offset, end),
+                        block_size=flat.block_size,
+                    )
+                )
+                offset = end
+            return out
 
         has_future_indices = getattr(flat, "future_indices", None) is not None
         if getattr(flat, "pending_draft_extend_result", None) is not None:
@@ -2811,46 +2906,82 @@ class ScheduleBatch:
 
     @staticmethod
     def _concat_spec_info_per_rank(per_rank: list):
-        """Concat per-rank EagleDraftInputs into a single cross-rank-flat one.
+        """Concat per-rank draft inputs into a single cross-rank-flat one.
 
         ``None`` entries are skipped. Returns ``None`` if every entry is ``None``.
         Used at forward input boundary (``_get_spec_decode_mwb_dp``) to build the
         flat shape ``_scatter_spec_info_to_dp_slots`` expects.
         """
+        from sgl_jax.srt.speculative.dflash_info import DFlashDraftInput
+
         nonempty = [s for s in per_rank if s is not None]
         if not nonempty:
             return None
 
-        has_future_indices = any(getattr(s, "future_indices", None) is not None for s in nonempty)
-        if has_future_indices:
-            assert all(getattr(s, "future_indices", None) is not None for s in nonempty), (
-                "_concat_spec_info_per_rank requires every nonempty rank to carry "
-                "future_indices on the relay-buffer path"
+        is_dflash = isinstance(nonempty[0], DFlashDraftInput)
+        if is_dflash:
+            has_future_indices = any(s.future_indices is not None for s in nonempty)
+            if has_future_indices and not all(s.future_indices is not None for s in nonempty):
+                raise ValueError(
+                    "DFLASH overlap concat requires future_indices on every nonempty rank."
+                )
+            per_req_fields = (
+                "verified_id",
+                "ctx_lens",
+                "draft_seq_lens",
+                "target_hidden",
+                "allocate_lens",
+                "reservation_base_lens",
+                "future_indices",
             )
-        elif any(getattr(s, "pending_draft_extend_result", None) is not None for s in nonempty):
-            for spec_info in nonempty:
-                spec_info.resolve_pending_draft_extend_result()
         else:
-            for spec_info in nonempty:
-                spec_info.resolve_pending_draft_extend_result()
+            has_future_indices = any(
+                getattr(s, "future_indices", None) is not None for s in nonempty
+            )
+            if has_future_indices:
+                assert all(getattr(s, "future_indices", None) is not None for s in nonempty), (
+                    "_concat_spec_info_per_rank requires every nonempty rank to carry "
+                    "future_indices on the relay-buffer path"
+                )
+            else:
+                for spec_info in nonempty:
+                    spec_info.resolve_pending_draft_extend_result()
 
-        per_req_fields = (
-            "topk_p",
-            "topk_index",
-            "hidden_states",
-            "verified_id",
-            "allocate_lens",
-            "accept_length",
-            "accept_length_cpu",
-            "new_seq_lens",
-            "future_indices",
-        )
+            per_req_fields = (
+                "topk_p",
+                "topk_index",
+                "hidden_states",
+                "verified_id",
+                "allocate_lens",
+                "accept_length",
+                "accept_length_cpu",
+                "new_seq_lens",
+                "future_indices",
+            )
 
-        kwargs = {
-            "capture_hidden_mode": nonempty[0].capture_hidden_mode,
-        }
+        kwargs = {} if is_dflash else {"capture_hidden_mode": nonempty[0].capture_hidden_mode}
+        if is_dflash:
+            kwargs["block_size"] = nonempty[0].block_size
         for f in per_req_fields:
             vals = [getattr(s, f, None) for s in nonempty]
+            if (
+                is_dflash
+                and has_future_indices
+                and f
+                in (
+                    "verified_id",
+                    "ctx_lens",
+                    "draft_seq_lens",
+                    "target_hidden",
+                )
+            ):
+                kwargs[f] = None
+                continue
+            if is_dflash and f == "target_hidden":
+                materialized = [v for v in vals if v is not None and v.shape[0] > 0]
+                if not materialized:
+                    kwargs[f] = None
+                    continue
             nonnull = [v for v in vals if v is not None]
             if not nonnull:
                 kwargs[f] = None
