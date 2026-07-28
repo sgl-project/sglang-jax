@@ -255,6 +255,13 @@ class LogitsProcessor(nnx.Module):
         self.mesh = mesh
 
     def _select_hidden_states(self, hidden_states: jax.Array, indices: jax.Array) -> jax.Array:
+        # Sequence parallelism may shard the token axis over both data and
+        # tensor. Gather indices are DP-local, so restore the full token rows
+        # within each data shard before entering shard_map.
+        hidden_states = jax.sharding.reshard(
+            hidden_states, NamedSharding(self.mesh, P("data", None))
+        )
+
         def select_local_fn(local_states, local_indices):
             return local_states[local_indices]
 
