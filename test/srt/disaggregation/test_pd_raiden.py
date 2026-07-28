@@ -9,12 +9,13 @@ from unittest import mock
 
 import pytest
 
+from sgl_jax.raiden import raiden_requested
 from sgl_jax.srt.disaggregation.base.kv_manager import KVPoll
 from sgl_jax.srt.disaggregation.base.transfer import (
     AdmissionState,
     DecodeTransferContext,
 )
-from sgl_jax.srt.disaggregation.bootstrap import _Registry, check_prefill_compat
+from sgl_jax.srt.disaggregation.factory import create_transfer_backend
 from sgl_jax.srt.disaggregation.raiden_transfer.conn import (
     RaidenMetadata,
     RaidenTransferKVManager,
@@ -105,7 +106,9 @@ def test_raiden_receiver_starts_direct_block_read_and_pops_metadata():
     )
 
     assert receiver.poll() == KVPoll.TRANSFERRING
-    assert raiden.started == [("wire-2", _uuid_to_int("wire-2"), "10.0.0.1:7777", [1, 4], [9, 10])]
+    assert raiden.started == [
+        ("wire-2", _uuid_to_int("wire-2"), "10.0.0.1:7777", [1, 4], [9, 10])
+    ]
 
     raiden.stats = ([], ["wire-2"], [])
     assert receiver.poll() == KVPoll.SUCCESS
@@ -165,7 +168,9 @@ def test_raiden_manager_owns_decode_admission_and_endpoint_mapping():
     assert admission.state == AdmissionState.ADMITTED
     assert admission.receiver is not None
     assert admission.receiver.poll() == KVPoll.TRANSFERRING
-    assert raiden.started == [("wire-4", _uuid_to_int("wire-4"), "10.0.0.1:7777", [3, 4], [9, 10])]
+    assert raiden.started == [
+        ("wire-4", _uuid_to_int("wire-4"), "10.0.0.1:7777", [3, 4], [9, 10])
+    ]
 
 
 def test_raiden_manager_accepts_legacy_flat_peer_metadata():
@@ -229,86 +234,56 @@ def test_raiden_uuid_is_stable_and_json_safe():
     assert 0 <= _uuid_to_int("wire") < 2**50
 
 
-def test_transfer_metadata_is_single_shot_reusable_and_ttl_bounded():
-    now = [100.0]
-    registry = _Registry(clock=lambda: now[0], transfer_ttl_seconds=5.0)
-    registry.register_transfer(
-        {
-            "bootstrap_room": 7,
-            "transfer_id": "first",
-            "remote_block_ids": [1, 2],
-        }
+def test_raiden_loader_is_opt_in():
+    assert not raiden_requested([])
+    assert raiden_requested(["--disaggregation-use-raiden"])
+    assert not raiden_requested(
+        ["--disaggregation-use-raiden", "--no-disaggregation-use-raiden"]
     )
-    assert registry.get_transfer(7)["transfer_id"] == "first"
-
-    registry.register_transfer(
-        {
-            "bootstrap_room": 7,
-            "transfer_id": "second",
-            "jax_process_index": 0,
-            "transport_metadata": {"remote_block_ids": [9]},
-        }
-    )
-    registry.register_transfer(
-        {
-            "bootstrap_room": 7,
-            "transfer_id": "peer",
-            "jax_process_index": 1,
-            "transport_metadata": {"remote_block_ids": [11]},
-        }
-    )
-    assert registry.get_transfer(7, 0)["transfer_id"] == "second"
-    assert registry.get_transfer(7, 1)["transfer_id"] == "peer"
-    registry.pop_room(7, 0)
-    assert registry.get_transfer(7, 0) is None
-    assert registry.get_transfer(7, 1)["transfer_id"] == "peer"
-    now[0] += 6.0
-    assert registry.get_transfer(7, 1) is None
 
 
-def test_prefill_decode_transfer_engines_must_match():
-    info = {
-        "protocol_version": 3,
-        "page_size": 128,
-        "kv_dtype": "bfloat16",
-        "transport_metadata": {"engine": "raiden"},
-    }
-    check_prefill_compat(
-        info,
-        local_page_size=128,
-        local_kv_dtype="bfloat16",
-        expected_transfer_engine="raiden",
-    )
-    with pytest.raises(ValueError, match="engine mismatch"):
-        check_prefill_compat(
-            info,
-            local_page_size=128,
-            local_kv_dtype="bfloat16",
-            expected_transfer_engine="jax",
-        )
-
-
-def test_raiden_cli_is_opt_in_and_exposes_control_port():
+def test_raiden_cli_is_opt_in():
     parser = argparse.ArgumentParser()
     ServerArgs.add_cli_args(parser)
     defaults = parser.parse_args(["--model-path", "dummy"])
-    selected = parser.parse_args(
-        [
-            "--model-path",
-            "dummy",
-            "--disaggregation-use-raiden",
-            "--disaggregation-raiden-control-port",
-            "7777",
-        ]
-    )
+    selected = parser.parse_args(["--model-path", "dummy", "--disaggregation-use-raiden"])
     assert defaults.disaggregation_use_raiden is False
     assert selected.disaggregation_use_raiden is True
-    assert selected.disaggregation_raiden_control_port == 7777
+
+
+@pytest.mark.parametrize(
+    ("override", "error"),
+    [
+        ({"device": "cpu"}, "device=tpu"),
+        ({"disaggregation_enable_d2h": True}, "D2H staging"),
+        ({"disaggregation_max_inflight_transfers": 0}, "max_inflight_transfers"),
+    ],
+)
+def test_raiden_factory_rejects_invalid_config(override, error):
+    config = {
+        "disaggregation_use_raiden": True,
+        "device": "tpu",
+        "disaggregation_enable_d2h": False,
+        "disaggregation_max_inflight_transfers": 1,
+    }
+    config.update(override)
+
+    with pytest.raises(ValueError, match=error):
+        create_transfer_backend(
+            None,
+            types.SimpleNamespace(**config),
+            local_host="127.0.0.1",
+            role="prefill",
+            shared_secret=None,
+            bootstrap_client=None,
+        )
 
 
 def test_raiden_wrapper_uses_public_jax_api_and_configured_parallelism():
     engine = mock.MagicMock()
-    engine.get_local_endpoints.return_value = [{"endpoint": "127.0.0.1:7788", "shards": [0]}]
+    engine.get_local_endpoints.return_value = [
+        {"endpoint": "127.0.0.1:7788", "shards": [0]}
+    ]
     manager_cls = mock.MagicMock(return_value=engine)
     modules = {
         "tpu_raiden": types.ModuleType("tpu_raiden"),

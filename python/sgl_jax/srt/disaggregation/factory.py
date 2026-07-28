@@ -111,6 +111,17 @@ def _create_raiden_backend(
     local_host: str,
     bootstrap_client: object,
 ):
+    if server_args.device != "tpu":
+        raise ValueError("Raiden requires device=tpu")
+    if server_args.disaggregation_enable_d2h:
+        raise ValueError("Raiden and D2H staging select different transfer engines")
+    if server_args.disaggregation_max_inflight_transfers <= 0:
+        raise ValueError("Raiden requires max_inflight_transfers > 0")
+
+    from sgl_jax.raiden import require_raiden_preloaded
+
+    require_raiden_preloaded()
+
     from sgl_jax.srt.disaggregation.raiden_transfer.conn import RaidenTransferKVManager
     from sgl_jax.srt.disaggregation.raiden_transfer.wrapper import (
         get_or_create_raiden_wrapper,
@@ -119,7 +130,7 @@ def _create_raiden_backend(
     kv_pool = scheduler.token_to_kv_pool_allocator.get_kvcache()
     wrapper = get_or_create_raiden_wrapper(
         local_host,
-        server_args.disaggregation_raiden_control_port,
+        0,
         parallelism=server_args.disaggregation_channel_number,
     )
     page_size = max(1, int(server_args.page_size))

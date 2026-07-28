@@ -2,9 +2,13 @@
 
 import os
 
-from sgl_jax.srt.entrypoints import http_server
-from sgl_jax.srt.server_args import ServerArgs
-from sgl_jax.srt.utils import kill_process_tree
+from sgl_jax.raiden import preload_raiden_if_requested
+
+preload_raiden_if_requested()
+
+from sgl_jax.srt.entrypoints import http_server  # noqa: E402
+from sgl_jax.srt.server_args import ServerArgs  # noqa: E402
+from sgl_jax.srt.utils import kill_process_tree  # noqa: E402
 
 
 def main():

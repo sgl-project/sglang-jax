@@ -6,7 +6,6 @@ import ipaddress
 import json
 import logging
 import os
-import sys
 import tempfile
 
 import jax
@@ -252,7 +251,6 @@ class ServerArgs:
     # ``RuntimeError("use_d2h_staging=True requires a host_pool")``.
     disaggregation_enable_d2h: bool = False
     disaggregation_use_raiden: bool = False
-    disaggregation_raiden_control_port: int = 0
     disaggregation_side_channel_port: int = 9600
     disaggregation_d2h_pool_size: int = 64
     disaggregation_d2h_max_tokens: int | None = None
@@ -540,28 +538,6 @@ class ServerArgs:
                     f"deployments (the validated bucket; see "
                     f"docs/operations/pd_e2e_matrix.md)."
                 )
-            if self.disaggregation_use_raiden:
-                if self.device != "tpu":
-                    raise ValueError("--disaggregation-use-raiden requires --device=tpu")
-                if "tpu_raiden.frameworks.jax._tpu_raiden_jax" not in sys.modules:
-                    raise RuntimeError(
-                        "Raiden must load before jaxlib. Select it on the process "
-                        "command line with --disaggregation-use-raiden, or set "
-                        "SGLANG_JAX_USE_RAIDEN=1 before importing sgl_jax in a "
-                        "programmatic launcher."
-                    )
-                if self.disaggregation_enable_d2h:
-                    raise ValueError(
-                        "--disaggregation-use-raiden and --disaggregation-enable-d2h "
-                        "select different transfer engines and cannot be combined"
-                    )
-                if self.disaggregation_max_inflight_transfers <= 0:
-                    raise ValueError(
-                        "Raiden requires --disaggregation-max-inflight-transfers > 0 "
-                        "so its staging-slot count matches decode admission"
-                    )
-                if not 0 <= self.disaggregation_raiden_control_port <= 65535:
-                    raise ValueError("--disaggregation-raiden-control-port must be in [0, 65535]")
             # PD-mode warmup is one-sided (the dummy warmup request
             # has no peer counterpart), so it gets stuck and the
             # allocator memory-leak check trips. Auto-skip unless
@@ -1628,12 +1604,6 @@ class ServerArgs:
             action=argparse.BooleanOptionalAction,
             default=ServerArgs.disaggregation_use_raiden,
             help="Use tpu-raiden for direct block transfer into decode KV pages.",
-        )
-        parser.add_argument(
-            "--disaggregation-raiden-control-port",
-            type=int,
-            default=ServerArgs.disaggregation_raiden_control_port,
-            help="Raiden control-plane TCP port. 0 chooses a free port.",
         )
         parser.add_argument(
             "--disaggregation-side-channel-port",

@@ -290,14 +290,15 @@ suites = {
     # cpu-test CI job sets that env var.
     "unit-test-cpu": [
         TestFile("test/srt/test_tokenizer_manager_event.py", 0.1),
-        TestFile("test/srt/disaggregation/test_pd_transfer.py", 0.5, runner="pytest"),
-        TestFile("test/srt/disaggregation/test_pd_bootstrap.py", 0.5, runner="pytest"),
         TestFile("test/srt/disaggregation/test_pd_auth.py", 0.3, runner="pytest"),
-        TestFile("test/srt/disaggregation/test_pd_router.py", 0.5, runner="pytest"),
-        TestFile("test/srt/disaggregation/test_pd_prefill.py", 0.5, runner="pytest"),
+        TestFile("test/srt/disaggregation/test_pd_bootstrap.py", 0.5, runner="pytest"),
         TestFile("test/srt/disaggregation/test_pd_decode.py", 0.5, runner="pytest"),
         TestFile("test/srt/disaggregation/test_pd_lifecycle.py", 0.5, runner="pytest"),
         TestFile("test/srt/disaggregation/test_pd_metrics.py", 0.3, runner="pytest"),
+        TestFile("test/srt/disaggregation/test_pd_prefill.py", 0.5, runner="pytest"),
+        TestFile("test/srt/disaggregation/test_pd_raiden.py", 0.5, runner="pytest"),
+        TestFile("test/srt/disaggregation/test_pd_router.py", 0.5, runner="pytest"),
+        TestFile("test/srt/disaggregation/test_pd_transfer.py", 0.5, runner="pytest"),
         TestFile(
             "python/sgl_jax/test/test_model_runner_kv_cache_mixin.py",
             0.2,

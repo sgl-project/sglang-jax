@@ -48,8 +48,6 @@ spec:
           value: ${MODEL_PATH}
         - name: RAIDEN_WHEEL_DIR
           value: ${RAIDEN_WHEEL_DIR}
-        - name: SGLANG_JAX_USE_RAIDEN
-          value: "1"
         resources:
           requests:
             google.com/tpu: 1
