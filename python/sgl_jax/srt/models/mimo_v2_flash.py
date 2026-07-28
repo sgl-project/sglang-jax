@@ -168,7 +168,11 @@ class MiMoV2Moe(nnx.Module):
     ):
         router_logits = self.moe_gate(hidden_states)
         correction_bias = self.correction_bias.value if self.correction_bias is not None else None
-        topk_weights, topk_ids = self.topk(router_logits, correction_bias=correction_bias)
+        topk_weights, topk_ids = self.topk(
+            router_logits,
+            correction_bias=correction_bias,
+            routing_sharding=out_sharding,
+        )
         if self.use_fused:
             token_valid_mask = forward_batch.get_token_valid_mask(
                 hidden_states.shape[0],

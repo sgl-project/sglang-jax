@@ -24,6 +24,14 @@ def _topk_kernel_enabled() -> bool:
     )
 
 
+def _routing_partition_spec(routing_sharding: jax.sharding.Sharding | None) -> P:
+    """Translate an explicit router sharding into a shard_map partition spec."""
+    spec = getattr(routing_sharding, "spec", None)
+    if spec is None or len(spec) != 2 or spec[1] is not None:
+        return P("data", None)
+    return P(spec[0], None)
+
+
 class GateLogit(nnx.Module):
     def __init__(
         self,
@@ -99,21 +107,33 @@ class TopK(nnx.Module):
         router_logits: jax.Array,
         correction_bias: jax.Array = None,
         dispatch_info: ExpertLocationMetadata | None = None,
+        routing_sharding: jax.sharding.Sharding | None = None,
     ):
         router_logits = router_logits.astype(jnp.float32)
+        routing_spec = _routing_partition_spec(routing_sharding)
 
         if self.num_expert_group > 0 or self.topk_group > 0:
             if correction_bias is not None:
                 topk_weights, topk_ids = self._biased_grouped_topk(
-                    router_logits, correction_bias, packed=router_logits.dtype == jnp.bfloat16
+                    router_logits,
+                    correction_bias,
+                    packed=router_logits.dtype == jnp.bfloat16,
+                    routing_spec=routing_spec,
                 )
             else:
                 topk_weights, topk_ids = self._grouped_topk(router_logits)
         else:
             if correction_bias is not None:
-                topk_weights, topk_ids = self._biased_topk(router_logits, correction_bias)
+                topk_weights, topk_ids = self._biased_topk(
+                    router_logits,
+                    correction_bias,
+                    routing_spec=routing_spec,
+                )
             else:
-                topk_weights, topk_ids = self._topk(router_logits)
+                topk_weights, topk_ids = self._topk(
+                    router_logits,
+                    routing_spec=routing_spec,
+                )
 
         if dispatch_info is not None:
             topk_ids = topk_ids_logical_to_physical(topk_ids, dispatch_info, self.layer_id)
@@ -127,7 +147,9 @@ class TopK(nnx.Module):
 
         return topk_weights, topk_ids
 
-    def _topk(self, router_logits):
+    def _topk(self, router_logits, *, routing_spec=None):
+        if routing_spec is None:
+            routing_spec = P("data", None)
         if not _topk_kernel_enabled() or router_logits.shape[-1] % 128 != 0:
             return jax.lax.top_k(router_logits, self.topk)
         fn = functools.partial(
@@ -138,8 +160,8 @@ class TopK(nnx.Module):
             fn = jax.shard_map(
                 fn,
                 mesh=self.mesh,
-                in_specs=(P("data", None),),
-                out_specs=(P("data", None), P("data", None)),
+                in_specs=(routing_spec,),
+                out_specs=(routing_spec, routing_spec),
                 check_vma=False,
             )
         try:
@@ -149,7 +171,15 @@ class TopK(nnx.Module):
                 raise
             return jax.lax.top_k(router_logits, self.topk)
 
-    def _biased_topk(self, router_logits, correction_bias):
+    def _biased_topk(
+        self,
+        router_logits,
+        correction_bias,
+        *,
+        routing_spec=None,
+    ):
+        if routing_spec is None:
+            routing_spec = P("data", None)
         if not _topk_kernel_enabled() or router_logits.shape[-1] % 128 != 0:
             return self._biased_topk_jax(router_logits, correction_bias)
         fn = functools.partial(
@@ -162,8 +192,8 @@ class TopK(nnx.Module):
             fn = jax.shard_map(
                 fn,
                 mesh=self.mesh,
-                in_specs=(P("data", None), P(None)),
-                out_specs=(P("data", None), P("data", None)),
+                in_specs=(routing_spec, P(None)),
+                out_specs=(routing_spec, routing_spec),
                 check_vma=False,
             )
         try:
@@ -220,7 +250,10 @@ class TopK(nnx.Module):
         router_logits: jax.Array,
         correction_bias: jax.Array = None,
         packed: bool = False,
+        routing_spec=None,
     ):
+        if routing_spec is None:
+            routing_spec = P("data", None)
         if not _topk_kernel_enabled():
             return self._biased_grouped_topk_jax(router_logits, correction_bias)
         fn = functools.partial(
@@ -236,8 +269,8 @@ class TopK(nnx.Module):
             fn = jax.shard_map(
                 fn,
                 mesh=self.mesh,
-                in_specs=(P("data", None), P(None)),
-                out_specs=(P("data", None), P("data", None)),
+                in_specs=(routing_spec, P(None)),
+                out_specs=(routing_spec, routing_spec),
                 check_vma=False,
             )
         return fn(router_logits, correction_bias)

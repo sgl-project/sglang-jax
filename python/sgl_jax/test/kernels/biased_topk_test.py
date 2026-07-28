@@ -7,6 +7,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.sharding import Mesh, NamedSharding
+from jax.sharding import PartitionSpec as P
 
 
 def _reference(router_logits, correction_bias, *, topk):
@@ -347,6 +349,79 @@ def test_topk_shared_flag_dispatches_grouped_biased_routing(monkeypatch):
         np.asarray(expected_weights),
         rtol=0,
         atol=0,
+    )
+
+
+@pytest.mark.parametrize("token_axis", ["data", ("data", "tensor")])
+@pytest.mark.parametrize("mode", ["plain", "biased", "grouped"])
+def test_topk_kernel_preserves_router_token_sharding(monkeypatch, token_axis, mode):
+    from sgl_jax.srt.eplb.expert_location import (
+        get_global_server_args,
+        set_global_server_args,
+    )
+    from sgl_jax.srt.layers.gate import TopK, _routing_partition_spec
+
+    monkeypatch.setenv("PALLAS_INTERPRET", "1")
+    devices = np.asarray(jax.devices())
+    mesh_shape = (len(devices), 1) if token_axis == "data" else (1, len(devices))
+    mesh = Mesh(devices.reshape(mesh_shape), ("data", "tensor"))
+    tokens = 256 * len(devices)
+    experts = 256 if mode == "grouped" else 128
+    routing_sharding = NamedSharding(mesh, P(token_axis, None))
+    logits = jax.device_put(
+        jax.nn.sigmoid(
+            jax.random.normal(
+                jax.random.key(experts),
+                (tokens, experts),
+                dtype=jnp.float32,
+            )
+        ),
+        routing_sharding,
+    )
+    bias = jax.device_put(
+        jax.random.normal(jax.random.key(17), (experts,), dtype=jnp.float32) * 0.1,
+        NamedSharding(mesh, P(None)),
+    )
+    module = TopK(
+        topk=8,
+        renormalize=False,
+        num_expert_group=8 if mode == "grouped" else 0,
+        topk_group=4 if mode == "grouped" else 0,
+        mesh=mesh,
+    )
+
+    if mode == "plain":
+        expected_weights, expected_ids = jax.lax.top_k(logits, 8)
+        correction_bias = None
+    elif mode == "biased":
+        expected_weights, expected_ids = module._biased_topk_jax(logits, bias)
+        correction_bias = bias
+    else:
+        expected_weights, expected_ids = module._biased_grouped_topk_jax(logits, bias)
+        correction_bias = bias
+
+    previous_server_args = get_global_server_args()
+    set_global_server_args(SimpleNamespace(enable_topk_kernel=True, device="tpu"))
+    try:
+        actual_weights, actual_ids = module(
+            logits,
+            correction_bias=correction_bias,
+            routing_sharding=routing_sharding,
+        )
+    finally:
+        set_global_server_args(previous_server_args)
+
+    expected_spec = P(token_axis, None)
+    assert _routing_partition_spec(routing_sharding) == expected_spec
+    if len(devices) > 1:
+        assert actual_weights.sharding.spec == expected_spec
+        assert actual_ids.sharding.spec == expected_spec
+    np.testing.assert_array_equal(np.asarray(actual_ids), np.asarray(expected_ids))
+    np.testing.assert_allclose(
+        np.asarray(actual_weights),
+        np.asarray(expected_weights),
+        rtol=0,
+        atol=1e-6,
     )
 
 
