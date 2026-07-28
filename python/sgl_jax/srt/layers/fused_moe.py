@@ -482,6 +482,11 @@ class FusedEPMoE(nnx.Module):
 
         quant_block_k = self.quant_block_k if self.quant_block_k is not None else None
 
+        kernel_sharding = jax.sharding.NamedSharding(self.mesh, P(("data", "tensor"), None))
+        hidden_states = jax.sharding.reshard(hidden_states, kernel_sharding)
+        topk_weights = jax.sharding.reshard(topk_weights, kernel_sharding)
+        topk_ids = jax.sharding.reshard(topk_ids, kernel_sharding)
+
         output = fused_ep_moe(
             mesh=self.mesh,
             tokens=hidden_states,
