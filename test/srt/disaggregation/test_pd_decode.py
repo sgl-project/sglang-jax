@@ -358,18 +358,22 @@ class _Allocator:
         self._capacity = capacity
         self._used = 0
         self.freed = []
+        self.available_ranks = []
+        self.alloc_ranks = []
 
-    def available_size(self):
+    def available_size(self, dp_rank=0):
+        self.available_ranks.append(dp_rank)
         return self._capacity - self._used
 
-    def alloc(self, n):
+    def alloc(self, n, dp_rank=0):
+        self.alloc_ranks.append(dp_rank)
         if self._used + n > self._capacity:
             return None
         self._used += n
         return object()
 
-    def free(self, idx):
-        self.freed.append(idx)
+    def free(self, idx, dp_rank=0):
+        self.freed.append((idx, dp_rank))
 
 
 class _Receiver:
@@ -412,6 +416,8 @@ class _AdmReq:
         self.disagg_transfer_id = None
         self.bootstrap_room = 1
         self.origin_input_ids = list(range(seqlen))
+        self.dp_rank = 0
+        self.disagg_prefill_dp_rank = 0
 
 
 class _Batch:
@@ -426,6 +432,7 @@ class _AdmScheduler:
         self, capacity, reserved, page_size=1, n_running=0, raise_on_init=False, max_inflight=0
     ):
         self.token_to_kv_pool_allocator = _Allocator(capacity, page_size)
+        self.dp_size = 1
         self.server_args = _AdmServerArgs(reserved, max_inflight=max_inflight)
         self.running_batch = _Batch(n_running)
         self.disagg_prealloc_queue = DecodePreallocQueue()
@@ -443,8 +450,8 @@ class _AdmScheduler:
     def _record_decode_transfer_failure(self, reason):
         self.failures.append(reason)
 
-    def _release_decode_kv_indices(self, kv_indices):
-        self.token_to_kv_pool_allocator.free(kv_indices)
+    def _release_decode_kv_indices(self, kv_indices, dp_rank):
+        self.token_to_kv_pool_allocator.free(kv_indices, dp_rank=dp_rank)
 
     def _abort_decode_request(self, req, reason):
         self.aborted.append((req.rid, reason))
@@ -470,6 +477,22 @@ def test_admit_when_capacity_sufficient():
     assert len(sched.disagg_prealloc_queue) == 0
     assert len(sched.disagg_transfer_queue) == 2
     assert sched.aborted == []
+
+
+def test_admission_routes_allocator_and_transfer_to_destination_and_source_ranks():
+    sched = _AdmScheduler(capacity=100, reserved=0)
+    sched.dp_size = 4
+    entry = _enqueue(sched, "cross-rank", seqlen=4)
+    entry.req.dp_rank = 3
+    entry.req.disagg_prefill_dp_rank = 1
+
+    sched._admit_decode_prealloc()
+
+    assert sched.token_to_kv_pool_allocator.available_ranks[-1] == 3
+    assert sched.token_to_kv_pool_allocator.alloc_ranks == [3]
+    context = sched.disagg_kv_manager.created[0][1].inited
+    assert context.local_dp_rank == 3
+    assert context.source_dp_rank == 1
 
 
 def test_defer_when_capacity_insufficient_does_not_abort():
@@ -606,6 +629,8 @@ class _Req:
         self.bootstrap_room = room
         self.disagg_transfer_id = None
         self.origin_input_ids = [1, 2, 3, 4]
+        self.dp_rank = 0
+        self.disagg_prefill_dp_rank = 0
 
 
 class _ServerArgs:
@@ -631,7 +656,7 @@ class _FakeCache:
         self._results = list(results)
         self.calls = 0
 
-    def pick_for_room(self, room):
+    def pick_for_room(self, room, dp_rank=0):  # noqa: ARG002
         self.calls += 1
         return self._results.pop(0) if self._results else None
 
@@ -646,6 +671,7 @@ class _FakeScheduler:
 
     def __init__(self, cache):
         self.server_args = _ServerArgs()
+        self.dp_size = 1
         self.waiting_queue = []
         self.disagg_prefill_info_cache = cache
         self.disagg_prealloc_queue = DecodePreallocQueue()

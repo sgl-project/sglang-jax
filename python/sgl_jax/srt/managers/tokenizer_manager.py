@@ -378,13 +378,47 @@ class TokenizerManager:
             obj.return_routed_experts,
         )
 
+        disagg_mode = getattr(self.server_args, "disaggregation_mode", "null")
+        dp_size = int(getattr(self.server_args, "dp_size", 1))
+        dp_rank = getattr(obj, "dp_rank", None)
+        if disagg_mode != "null":
+            if dp_rank is None:
+                if dp_size > 1:
+                    raise ValueError(
+                        f"disaggregation_mode={disagg_mode} with dp_size={dp_size} "
+                        "requires an explicit dp_rank"
+                    )
+                dp_rank = 0
+            if isinstance(dp_rank, bool) or not isinstance(dp_rank, int):
+                raise ValueError(f"dp_rank must be an integer, got {dp_rank!r}")
+            if not 0 <= dp_rank < dp_size:
+                raise ValueError(f"dp_rank={dp_rank} is outside [0, {dp_size})")
+
+        prefill_dp_rank = getattr(obj, "disagg_prefill_dp_rank", None)
+        if disagg_mode == "decode":
+            if prefill_dp_rank is None:
+                if dp_size > 1:
+                    raise ValueError(
+                        f"disaggregation_mode=decode with dp_size={dp_size} requires "
+                        "an explicit disagg_prefill_dp_rank"
+                    )
+                prefill_dp_rank = 0
+            if isinstance(prefill_dp_rank, bool) or not isinstance(prefill_dp_rank, int):
+                raise ValueError(
+                    f"disagg_prefill_dp_rank must be an integer, got {prefill_dp_rank!r}"
+                )
+            if not 0 <= prefill_dp_rank < dp_size:
+                raise ValueError(
+                    f"disagg_prefill_dp_rank={prefill_dp_rank} is outside [0, {dp_size})"
+                )
+
         # PD disaggregation passthrough. When the engine is
         # running in disaggregation_mode=decode, the request body MUST
         # carry bootstrap_{host,port,room}.
         #
         # If the request didn't carry bootstrap_* fields but the engine
         # knows its bootstrap URL, auto-derive them.
-        if getattr(self.server_args, "disaggregation_mode", "null") == "decode":
+        if disagg_mode == "decode":
             bootstrap_url = getattr(self.server_args, "disaggregation_bootstrap_url", None)
             if (
                 obj.bootstrap_host is None or obj.bootstrap_port is None
@@ -416,6 +450,8 @@ class TokenizerManager:
         tokenized_obj.bootstrap_host = getattr(obj, "bootstrap_host", None)
         tokenized_obj.bootstrap_port = getattr(obj, "bootstrap_port", None)
         tokenized_obj.bootstrap_room = getattr(obj, "bootstrap_room", None)
+        tokenized_obj.dp_rank = dp_rank
+        tokenized_obj.disagg_prefill_dp_rank = prefill_dp_rank
         tokenized_obj.disagg_transfer_id = getattr(obj, "disagg_transfer_id", None)
         # note: When only `return_logprob` is specified, we assume that only the output probability is required.
         if (
@@ -1031,6 +1067,12 @@ class TokenizerManager:
                 "finish_reason": recv_obj.finished_reasons[i],
                 "prompt_tokens": recv_obj.prompt_tokens[i],
             }
+            dp_rank = getattr(state.obj, "dp_rank", None)
+            if dp_rank is not None:
+                meta_info["dp_rank"] = dp_rank
+            disagg_prefill_dp_rank = getattr(state.obj, "disagg_prefill_dp_rank", None)
+            if disagg_prefill_dp_rank is not None:
+                meta_info["disagg_prefill_dp_rank"] = disagg_prefill_dp_rank
 
             if getattr(state.obj, "return_logprob", False) or getattr(
                 state.obj, "return_output_logprob_only", False

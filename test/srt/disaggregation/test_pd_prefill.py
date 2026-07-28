@@ -284,6 +284,22 @@ def test_room_modulo_selection_matches_server():
     assert cache.pick_for_room(4)["bootstrap_key"] == "b"  # 4 % 3 == 1
 
 
+def test_prefill_info_cache_filters_by_dp_rank():
+    clock = _Clock()
+    client = _FakeClient(
+        [
+            _pf("rank-1", system_dp_rank=1),
+            _pf("rank-0", system_dp_rank=0),
+            _pf("rank-3", system_dp_rank=3),
+            _pf("rank-2", system_dp_rank=2),
+        ]
+    )
+    cache = PrefillInfoCache(client, refresh_interval_s=1.0, clock=clock)
+
+    for rank in range(4):
+        assert cache.pick_for_room(123, rank)["bootstrap_key"] == f"rank-{rank}"
+
+
 def test_miss_is_rate_limited_then_resolves():
     clock = _Clock()
     client = _FakeClient([])  # no prefill registered yet

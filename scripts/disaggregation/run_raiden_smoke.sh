@@ -10,6 +10,14 @@ PREFILL_PORT=${PREFILL_PORT:-10000}
 DECODE_PORT=${DECODE_PORT:-10001}
 ROUTER_PORT=${ROUTER_PORT:-30000}
 MAX_INFLIGHT=${MAX_INFLIGHT:-2}
+DP_SIZE=${DP_SIZE:-1}
+TP_SIZE=${TP_SIZE:-1}
+
+if (( DP_SIZE < 1 || TP_SIZE < 1 || TP_SIZE % DP_SIZE != 0 )); then
+  printf 'TP_SIZE (%s) must be positive and divisible by DP_SIZE (%s)\n' \
+    "${TP_SIZE}" "${DP_SIZE}" >&2
+  exit 2
+fi
 
 wait_for_health() {
   local url=$1
@@ -22,6 +30,8 @@ wait_for_health() {
 
 common_args=(
   --model-path "${MODEL_PATH}"
+  --tp-size "${TP_SIZE}"
+  --dp-size "${DP_SIZE}"
   --page-size 128
   --disable-radix-cache
   --disaggregation-bootstrap-url "http://${PREFILL_HOST}:${BOOTSTRAP_PORT}"

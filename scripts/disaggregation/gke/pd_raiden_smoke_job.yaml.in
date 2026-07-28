@@ -1,5 +1,5 @@
 # Render only the listed deployment fields so pod-time variables remain intact:
-# envsubst '${TPU_ACCELERATOR} ${TPU_TOPOLOGY} ${PD_IMAGE} ${MODEL_PATH} ${RAIDEN_WHEEL_DIR} ${MODEL_CACHE_PVC}'
+# envsubst '${TPU_ACCELERATOR} ${TPU_TOPOLOGY} ${PD_IMAGE} ${MODEL_PATH} ${RAIDEN_WHEEL_DIR} ${MODEL_CACHE_PVC} ${DP_SIZE} ${TP_SIZE}'
 apiVersion: v1
 kind: Service
 metadata:
@@ -48,6 +48,10 @@ spec:
           value: ${MODEL_PATH}
         - name: RAIDEN_WHEEL_DIR
           value: ${RAIDEN_WHEEL_DIR}
+        - name: DP_SIZE
+          value: "${DP_SIZE}"
+        - name: TP_SIZE
+          value: "${TP_SIZE}"
         resources:
           requests:
             google.com/tpu: 1

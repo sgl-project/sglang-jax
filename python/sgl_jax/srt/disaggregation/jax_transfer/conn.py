@@ -199,7 +199,7 @@ class JaxTransferKVManager(CommonKVManager):
     def prepare_prefill_batch(self, kv_buffers: Any) -> None:  # noqa: ARG002
         return
 
-    def prefill_transport_metadata(self) -> dict[str, object]:
+    def prefill_transport_metadata(self, dp_rank: int = 0) -> dict[str, object]:  # noqa: ARG002
         return {"engine": self.engine_name}
 
     def start_prefill(self, context: PrefillTransferContext) -> PrefillTransfer:
@@ -254,6 +254,7 @@ class JaxTransferKVManager(CommonKVManager):
         bootstrap_room: int | None,
         *,
         jax_process_index: int | None = None,  # noqa: ARG002
+        source_dp_rank: int = 0,  # noqa: ARG002
     ) -> None:  # noqa: ARG002
         return
 

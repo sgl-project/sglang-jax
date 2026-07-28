@@ -51,6 +51,7 @@ class PrefillTransferContext:
     req_id: str
     transfer_id: str
     bootstrap_room: int | None
+    dp_rank: int
     buffer_id: int | None
     payload_factory: Callable[[], dict[str, Any]]
     block_ids_factory: Callable[[], list[int]]
@@ -71,6 +72,8 @@ class DecodeTransferContext:
     req_id: str
     transfer_id: str
     bootstrap_room: int | None
+    local_dp_rank: int
+    source_dp_rank: int
     peer_info: Mapping[str, object]
     kv_indices: Any
     page_size: int
@@ -112,13 +115,14 @@ class TransferBackend(Protocol):
 
     def try_start_decode(self, context: DecodeTransferContext) -> DecodeAdmission: ...
 
-    def prefill_transport_metadata(self) -> dict[str, object]: ...
+    def prefill_transport_metadata(self, dp_rank: int = 0) -> dict[str, object]: ...
 
     def cleanup_transfer(
         self,
         bootstrap_room: int | None,
         *,
         jax_process_index: int | None = None,
+        source_dp_rank: int = 0,
     ) -> None: ...
 
     def inflight_count(self) -> tuple[int, int]: ...

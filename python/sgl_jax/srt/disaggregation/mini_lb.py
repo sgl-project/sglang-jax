@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import random
 from http import HTTPStatus
 from itertools import chain
@@ -9,6 +10,13 @@ from itertools import chain
 logger = logging.getLogger(__name__)
 
 AIOHTTP_STREAM_READ_CHUNK_SIZE = 1024 * 64
+
+
+def _get_dp_size(server_info: dict) -> int:
+    dp_size = server_info.get("dp_size")
+    if dp_size is not None:
+        return int(dp_size)
+    return max(1, len(server_info.get("internal_states") or []))
 
 
 class MiniLoadBalancer:
@@ -63,8 +71,8 @@ class MiniLoadBalancer:
                 self.decode_urls[0],
                 ("get_server_info", "server_info"),
             )
-        self.prefill_dp_size = len(prefill_info.get("internal_states", [1]))
-        self.decode_dp_size = len(decode_info.get("internal_states", [1]))
+        self.prefill_dp_size = _get_dp_size(prefill_info)
+        self.decode_dp_size = _get_dp_size(decode_info)
         logger.info(
             "[MiniLB] DP sizes: prefill=%s, decode=%s",
             self.prefill_dp_size,
@@ -72,16 +80,54 @@ class MiniLoadBalancer:
         )
 
     def _fork_dp_requests(self, request: dict):
+        if self.prefill_dp_size != self.decode_dp_size:
+            raise RuntimeError(
+                "PD Raiden requires homogeneous DP topology: "
+                f"prefill dp_size={self.prefill_dp_size}, "
+                f"decode dp_size={self.decode_dp_size}"
+            )
         p_rank = random.randint(0, self.prefill_dp_size - 1)
         d_rank = random.randint(0, self.decode_dp_size - 1)
 
         prefill_req = request.copy()
         decode_req = request.copy()
-        prefill_req["routed_dp_rank"] = p_rank
-        decode_req["routed_dp_rank"] = d_rank
+        prefill_req["dp_rank"] = p_rank
+        decode_req["dp_rank"] = d_rank
         decode_req["disagg_prefill_dp_rank"] = p_rank
 
         return prefill_req, decode_req, d_rank
+
+    @staticmethod
+    def _room_rank(bootstrap_room, dp_size: int):
+        if isinstance(bootstrap_room, list):
+            return [int(room) % dp_size for room in bootstrap_room]
+        return int(bootstrap_room) % dp_size
+
+    async def _align_dp_requests(self, request: dict):
+        await self._ensure_dp_sizes()
+        p_size = int(self.prefill_dp_size or 1)
+        d_size = int(self.decode_dp_size or 1)
+        if p_size != d_size:
+            raise RuntimeError(
+                "PD Raiden requires homogeneous DP topology: "
+                f"prefill dp_size={p_size}, decode dp_size={d_size}"
+            )
+
+        forced_rank = os.getenv("SGLANG_JAX_PD_FORCE_DP_RANK")
+        if forced_rank is not None:
+            forced = int(forced_rank)
+            if not 0 <= forced < p_size:
+                raise ValueError(f"SGLANG_JAX_PD_FORCE_DP_RANK={forced} is outside [0, {p_size})")
+            dp_rank = forced
+        else:
+            dp_rank = self._room_rank(request["bootstrap_room"], p_size)
+
+        prefill_req = request.copy()
+        decode_req = request.copy()
+        prefill_req["dp_rank"] = dp_rank
+        decode_req["dp_rank"] = dp_rank
+        decode_req["disagg_prefill_dp_rank"] = dp_rank
+        return prefill_req, decode_req
 
     def select_pair(self) -> tuple[str, int | None, str]:
         pidx = random.randint(0, len(self.prefill_urls) - 1)
@@ -113,8 +159,7 @@ class MiniLoadBalancer:
                 expected_decode_dp_rank,
             ) = self._fork_dp_requests(modified_request)
         else:
-            prefill_req = modified_request
-            decode_req = modified_request
+            prefill_req, decode_req = await self._align_dp_requests(modified_request)
 
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=self.timeout)
@@ -176,13 +221,15 @@ class MiniLoadBalancer:
 
         assert endpoint[0] != "/", f"Endpoint should not start with '/': {endpoint}"
 
+        prefill_req, decode_req = await self._align_dp_requests(modified_request)
+
         async def stream_results():
             async with aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=self.timeout)
             ) as session:
                 tasks = [
-                    session.post(f"{prefill_server}/{endpoint}", json=modified_request),
-                    session.post(f"{decode_server}/{endpoint}", json=modified_request),
+                    session.post(f"{prefill_server}/{endpoint}", json=prefill_req),
+                    session.post(f"{decode_server}/{endpoint}", json=decode_req),
                 ]
                 prefill_response, decode_response = await asyncio.gather(*tasks)
 

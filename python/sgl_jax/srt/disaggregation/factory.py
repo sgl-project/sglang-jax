@@ -145,13 +145,15 @@ def _create_raiden_backend(
         kv_caches=list(kv_pool.kv_buffer),
         max_blocks=max_blocks,
         num_slots=num_slots,
+        dp_size=server_args.dp_size,
         timeout_s=float(server_args.disaggregation_pull_timeout_seconds),
     )
     logger.info(
-        "Raiden backend ready: max_blocks=%d num_slots=%d layers=%d",
+        "Raiden backend ready: max_blocks=%d num_slots=%d layers=%d dp_size=%d",
         max_blocks,
         num_slots,
         kv_pool.layer_num,
+        server_args.dp_size,
     )
     return RaidenTransferKVManager(
         wrapper,
