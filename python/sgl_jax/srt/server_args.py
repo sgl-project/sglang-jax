@@ -185,7 +185,7 @@ class ServerArgs:
     dsa_use_pallas: bool = True  # deprecated no-op; jnp-ref e2e path removed
     moe_backend: str = "epmoe"
     disable_jax_allreduce_metadata: bool = False
-    enable_grouped_topk_kernel: bool = False
+    enable_topk_kernel: bool = True
 
     grammar_backend: str | None = None
 
@@ -1421,12 +1421,14 @@ class ServerArgs:
             ),
         )
         parser.add_argument(
-            "--enable-grouped-topk-kernel",
-            action="store_true",
-            default=ServerArgs.enable_grouped_topk_kernel,
+            "--disable-topk-kernel",
+            dest="enable_topk_kernel",
+            action="store_false",
+            default=ServerArgs.enable_topk_kernel,
             help=(
-                "Enable the Pallas grouped-topk kernel for biased grouped top-k "
-                "routing (TPU only). Default off, using the pure JAX implementation."
+                "Disable Pallas kernels for top-k routing, including grouped, biased, "
+                "and plain paths (TPU only), and use pure JAX instead. "
+                "The kernels are enabled by default."
             ),
         )
 

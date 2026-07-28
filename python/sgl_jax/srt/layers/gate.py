@@ -12,17 +12,24 @@ from sgl_jax.srt.eplb.expert_location import (
     get_global_server_args,
     topk_ids_logical_to_physical,
 )
+from sgl_jax.srt.kernels.biased_topk import biased_topk_pallas, topk_pallas
 from sgl_jax.srt.kernels.grouped_topk.v1.kernel import grouped_topk_pallas
 from sgl_jax.srt.utils.profiling_utils import named_scope
 
 
-def _grouped_topk_kernel_enabled() -> bool:
+def _topk_kernel_enabled() -> bool:
     server_args = get_global_server_args()
     return (
-        server_args is not None
-        and server_args.enable_grouped_topk_kernel
-        and server_args.device == "tpu"
+        server_args is not None and server_args.enable_topk_kernel and server_args.device == "tpu"
     )
+
+
+def _routing_partition_spec(routing_sharding: jax.sharding.Sharding | None) -> P:
+    """Translate an explicit router sharding into a shard_map partition spec."""
+    spec = getattr(routing_sharding, "spec", None)
+    if spec is None or len(spec) != 2 or spec[1] is not None:
+        return P("data", None)
+    return P(spec[0], None)
 
 
 class GateLogit(nnx.Module):
@@ -100,21 +107,33 @@ class TopK(nnx.Module):
         router_logits: jax.Array,
         correction_bias: jax.Array = None,
         dispatch_info: ExpertLocationMetadata | None = None,
+        routing_sharding: jax.sharding.Sharding | None = None,
     ):
         router_logits = router_logits.astype(jnp.float32)
+        routing_spec = _routing_partition_spec(routing_sharding)
 
         if self.num_expert_group > 0 or self.topk_group > 0:
             if correction_bias is not None:
                 topk_weights, topk_ids = self._biased_grouped_topk(
-                    router_logits, correction_bias, packed=router_logits.dtype == jnp.bfloat16
+                    router_logits,
+                    correction_bias,
+                    packed=router_logits.dtype == jnp.bfloat16,
+                    routing_spec=routing_spec,
                 )
             else:
                 topk_weights, topk_ids = self._grouped_topk(router_logits)
         else:
             if correction_bias is not None:
-                topk_weights, topk_ids = self._biased_topk(router_logits, correction_bias)
+                topk_weights, topk_ids = self._biased_topk(
+                    router_logits,
+                    correction_bias,
+                    routing_spec=routing_spec,
+                )
             else:
-                topk_weights, topk_ids = self._topk(router_logits)
+                topk_weights, topk_ids = self._topk(
+                    router_logits,
+                    routing_spec=routing_spec,
+                )
 
         if dispatch_info is not None:
             topk_ids = topk_ids_logical_to_physical(topk_ids, dispatch_info, self.layer_id)
@@ -128,10 +147,63 @@ class TopK(nnx.Module):
 
         return topk_weights, topk_ids
 
-    def _topk(self, router_logits):
-        return jax.lax.top_k(router_logits, self.topk)
+    def _topk(self, router_logits, *, routing_spec=None):
+        if routing_spec is None:
+            routing_spec = P("data", None)
+        if not _topk_kernel_enabled() or router_logits.shape[-1] % 128 != 0:
+            return jax.lax.top_k(router_logits, self.topk)
+        fn = functools.partial(
+            topk_pallas,
+            topk=self.topk,
+        )
+        if self.mesh is not None:
+            fn = jax.shard_map(
+                fn,
+                mesh=self.mesh,
+                in_specs=(routing_spec,),
+                out_specs=(routing_spec, routing_spec),
+                check_vma=False,
+            )
+        try:
+            return fn(router_logits)
+        except ValueError as exc:
+            if "no VMEM-safe block_tokens" not in str(exc):
+                raise
+            return jax.lax.top_k(router_logits, self.topk)
 
-    def _biased_topk(self, router_logits, correction_bias):
+    def _biased_topk(
+        self,
+        router_logits,
+        correction_bias,
+        *,
+        routing_spec=None,
+    ):
+        if routing_spec is None:
+            routing_spec = P("data", None)
+        if not _topk_kernel_enabled() or router_logits.shape[-1] % 128 != 0:
+            return self._biased_topk_jax(router_logits, correction_bias)
+        fn = functools.partial(
+            biased_topk_pallas,
+            topk=self.topk,
+        )
+        # Mosaic/Pallas kernels cannot be auto-partitioned by JAX's SPMD compiler;
+        # wrap in shard_map so each device runs the kernel on its local token slice.
+        if self.mesh is not None:
+            fn = jax.shard_map(
+                fn,
+                mesh=self.mesh,
+                in_specs=(routing_spec, P(None)),
+                out_specs=(routing_spec, routing_spec),
+                check_vma=False,
+            )
+        try:
+            return fn(router_logits, correction_bias)
+        except ValueError as exc:
+            if "no VMEM-safe block_tokens" not in str(exc):
+                raise
+            return self._biased_topk_jax(router_logits, correction_bias)
+
+    def _biased_topk_jax(self, router_logits, correction_bias):
         n_routed_experts = router_logits.shape[-1]
         scores_for_choice = router_logits.reshape(-1, n_routed_experts) + jnp.expand_dims(
             correction_bias, axis=0
@@ -178,8 +250,11 @@ class TopK(nnx.Module):
         router_logits: jax.Array,
         correction_bias: jax.Array = None,
         packed: bool = False,
+        routing_spec=None,
     ):
-        if not _grouped_topk_kernel_enabled():
+        if routing_spec is None:
+            routing_spec = P("data", None)
+        if not _topk_kernel_enabled():
             return self._biased_grouped_topk_jax(router_logits, correction_bias)
         fn = functools.partial(
             grouped_topk_pallas,
@@ -194,8 +269,8 @@ class TopK(nnx.Module):
             fn = jax.shard_map(
                 fn,
                 mesh=self.mesh,
-                in_specs=(P("data", None), P(None)),
-                out_specs=(P("data", None), P("data", None)),
+                in_specs=(routing_spec, P(None)),
+                out_specs=(routing_spec, routing_spec),
                 check_vma=False,
             )
         return fn(router_logits, correction_bias)
