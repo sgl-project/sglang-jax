@@ -12,7 +12,7 @@ from sgl_jax.srt.eplb.expert_location import (
     get_global_server_args,
     topk_ids_logical_to_physical,
 )
-from sgl_jax.srt.kernels.biased_topk import biased_topk_pallas
+from sgl_jax.srt.kernels.biased_topk import biased_topk_pallas, topk_pallas
 from sgl_jax.srt.kernels.grouped_topk.v1.kernel import grouped_topk_pallas
 from sgl_jax.srt.utils.profiling_utils import named_scope
 
@@ -20,9 +20,7 @@ from sgl_jax.srt.utils.profiling_utils import named_scope
 def _topk_kernel_enabled() -> bool:
     server_args = get_global_server_args()
     return (
-        server_args is not None
-        and server_args.enable_grouped_topk_kernel
-        and server_args.device == "tpu"
+        server_args is not None and server_args.enable_topk_kernel and server_args.device == "tpu"
     )
 
 
@@ -130,7 +128,26 @@ class TopK(nnx.Module):
         return topk_weights, topk_ids
 
     def _topk(self, router_logits):
-        return jax.lax.top_k(router_logits, self.topk)
+        if not _topk_kernel_enabled() or router_logits.shape[-1] % 128 != 0:
+            return jax.lax.top_k(router_logits, self.topk)
+        fn = functools.partial(
+            topk_pallas,
+            topk=self.topk,
+        )
+        if self.mesh is not None:
+            fn = jax.shard_map(
+                fn,
+                mesh=self.mesh,
+                in_specs=(P("data", None),),
+                out_specs=(P("data", None), P("data", None)),
+                check_vma=False,
+            )
+        try:
+            return fn(router_logits)
+        except ValueError as exc:
+            if "no VMEM-safe block_tokens" not in str(exc):
+                raise
+            return jax.lax.top_k(router_logits, self.topk)
 
     def _biased_topk(self, router_logits, correction_bias):
         if not _topk_kernel_enabled() or router_logits.shape[-1] % 128 != 0:

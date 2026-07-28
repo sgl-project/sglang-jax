@@ -1,5 +1,6 @@
-"""Equivalence tests for the sort-free biased top-k Pallas kernel."""
+"""Equivalence tests for the sort-free top-k Pallas kernels."""
 
+import argparse
 from types import SimpleNamespace
 
 import jax
@@ -40,6 +41,41 @@ def test_mimo_shape_matches_reference():
         rtol=0,
         atol=1e-6,
     )
+
+
+def test_unbiased_topk_matches_lax_top_k():
+    from sgl_jax.srt.kernels.biased_topk import topk_pallas
+
+    tokens, experts, topk = 128, 384, 8
+    logits = jax.random.normal(jax.random.key(15), (tokens, experts), dtype=jnp.float32)
+    expected_weights, expected_ids = jax.lax.top_k(logits, topk)
+
+    actual_weights, actual_ids = topk_pallas(
+        logits,
+        topk=topk,
+        block_tokens=tokens,
+        interpret=True,
+    )
+
+    np.testing.assert_array_equal(np.asarray(actual_ids), np.asarray(expected_ids))
+    np.testing.assert_array_equal(np.asarray(actual_weights), np.asarray(expected_weights))
+
+
+def test_unbiased_topk_flat_ties_choose_lowest_expert_ids():
+    from sgl_jax.srt.kernels.biased_topk import topk_pallas
+
+    tokens, experts, topk = 64, 384, 8
+    logits = jnp.ones((tokens, experts), dtype=jnp.float32)
+    actual_weights, actual_ids = topk_pallas(
+        logits,
+        topk=topk,
+        block_tokens=tokens,
+        interpret=True,
+    )
+
+    expected_weights, expected_ids = jax.lax.top_k(logits, topk)
+    np.testing.assert_array_equal(np.asarray(actual_ids), np.asarray(expected_ids))
+    np.testing.assert_array_equal(np.asarray(actual_weights), np.asarray(expected_weights))
 
 
 def test_auto_block_tokens_rejects_unsafe_large_token_shape():
@@ -205,7 +241,7 @@ def test_topk_shared_flag_dispatches_plain_biased_routing(monkeypatch):
 
     monkeypatch.setattr(gate, "biased_topk_pallas", fake_biased_topk)
     previous_server_args = get_global_server_args()
-    set_global_server_args(SimpleNamespace(enable_grouped_topk_kernel=True, device="tpu"))
+    set_global_server_args(SimpleNamespace(enable_topk_kernel=True, device="tpu"))
     try:
         actual_weights, actual_ids = gate.TopK(
             topk=topk,
@@ -222,6 +258,52 @@ def test_topk_shared_flag_dispatches_plain_biased_routing(monkeypatch):
         rtol=0,
         atol=0,
     )
+
+
+def test_topk_shared_flag_dispatches_unbiased_routing(monkeypatch):
+    from sgl_jax.srt.eplb.expert_location import (
+        get_global_server_args,
+        set_global_server_args,
+    )
+    from sgl_jax.srt.layers import gate
+
+    tokens, experts, topk = 128, 128, 8
+    logits = jax.random.normal(jax.random.key(16), (tokens, experts), dtype=jnp.float32)
+    expected_weights, expected_ids = jax.lax.top_k(logits, topk)
+    called = False
+
+    def fake_topk(router_logits, *, topk, **_):
+        nonlocal called
+        called = True
+        return jax.lax.top_k(router_logits, topk)
+
+    monkeypatch.setattr(gate, "topk_pallas", fake_topk)
+    previous_server_args = get_global_server_args()
+    set_global_server_args(SimpleNamespace(enable_topk_kernel=True, device="tpu"))
+    try:
+        actual_weights, actual_ids = gate.TopK(
+            topk=topk,
+            renormalize=False,
+        )(logits)
+    finally:
+        set_global_server_args(previous_server_args)
+
+    assert called
+    np.testing.assert_array_equal(np.asarray(actual_ids), np.asarray(expected_ids))
+    np.testing.assert_array_equal(np.asarray(actual_weights), np.asarray(expected_weights))
+
+
+def test_topk_kernel_cli_is_enabled_by_default_and_can_be_disabled():
+    from sgl_jax.srt.server_args import ServerArgs
+
+    parser = argparse.ArgumentParser()
+    ServerArgs.add_cli_args(parser)
+
+    default_args = parser.parse_args(["--model-path", "dummy-model"])
+    disabled_args = parser.parse_args(["--model-path", "dummy-model", "--disable-topk-kernel"])
+
+    assert default_args.enable_topk_kernel is True
+    assert disabled_args.enable_topk_kernel is False
 
 
 def test_topk_shared_flag_dispatches_grouped_biased_routing(monkeypatch):
@@ -252,7 +334,7 @@ def test_topk_shared_flag_dispatches_grouped_biased_routing(monkeypatch):
 
     monkeypatch.setattr(gate, "grouped_topk_pallas", fake_grouped_topk)
     previous_server_args = get_global_server_args()
-    set_global_server_args(SimpleNamespace(enable_grouped_topk_kernel=True, device="tpu"))
+    set_global_server_args(SimpleNamespace(enable_topk_kernel=True, device="tpu"))
     try:
         actual_weights, actual_ids = module(logits, correction_bias=bias)
     finally:
@@ -283,7 +365,7 @@ def test_topk_flag_off_keeps_jax_path(monkeypatch):
 
     monkeypatch.setattr(gate, "biased_topk_pallas", fail_if_called)
     previous_server_args = get_global_server_args()
-    set_global_server_args(SimpleNamespace(enable_grouped_topk_kernel=False, device="tpu"))
+    set_global_server_args(SimpleNamespace(enable_topk_kernel=False, device="tpu"))
     try:
         actual_weights, actual_ids = gate.TopK(
             topk=8,
@@ -293,6 +375,34 @@ def test_topk_flag_off_keeps_jax_path(monkeypatch):
         set_global_server_args(previous_server_args)
 
     expected_weights, expected_ids = _reference(logits, bias, topk=8)
+    np.testing.assert_array_equal(np.asarray(actual_ids), np.asarray(expected_ids))
+    np.testing.assert_array_equal(np.asarray(actual_weights), np.asarray(expected_weights))
+
+
+def test_topk_flag_off_keeps_unbiased_jax_path(monkeypatch):
+    from sgl_jax.srt.eplb.expert_location import (
+        get_global_server_args,
+        set_global_server_args,
+    )
+    from sgl_jax.srt.layers import gate
+
+    logits = jnp.arange(128, dtype=jnp.float32)[None, :]
+
+    def fail_if_called(*_, **__):
+        raise AssertionError("Pallas kernel must not run when the flag is disabled")
+
+    monkeypatch.setattr(gate, "topk_pallas", fail_if_called)
+    previous_server_args = get_global_server_args()
+    set_global_server_args(SimpleNamespace(enable_topk_kernel=False, device="tpu"))
+    try:
+        actual_weights, actual_ids = gate.TopK(
+            topk=8,
+            renormalize=False,
+        )(logits)
+    finally:
+        set_global_server_args(previous_server_args)
+
+    expected_weights, expected_ids = jax.lax.top_k(logits, 8)
     np.testing.assert_array_equal(np.asarray(actual_ids), np.asarray(expected_ids))
     np.testing.assert_array_equal(np.asarray(actual_weights), np.asarray(expected_weights))
 
@@ -314,7 +424,7 @@ def test_topk_kernel_path_preserves_normalization_and_scaling(monkeypatch):
     expected_weights = raw_weights / raw_weights.sum(axis=-1, keepdims=True) * 1.75
 
     previous_server_args = get_global_server_args()
-    set_global_server_args(SimpleNamespace(enable_grouped_topk_kernel=True, device="tpu"))
+    set_global_server_args(SimpleNamespace(enable_topk_kernel=True, device="tpu"))
     try:
         actual_weights, actual_ids = TopK(
             topk=topk,
@@ -348,7 +458,7 @@ def test_topk_unsafe_large_token_shape_falls_back_to_jax():
     expected_weights, expected_ids = _reference(logits, bias, topk=topk)
 
     previous_server_args = get_global_server_args()
-    set_global_server_args(SimpleNamespace(enable_grouped_topk_kernel=True, device="tpu"))
+    set_global_server_args(SimpleNamespace(enable_topk_kernel=True, device="tpu"))
     try:
         actual_weights, actual_ids = TopK(
             topk=topk,
@@ -429,7 +539,7 @@ def test_topk_kernel_path_preserves_logical_to_physical_mapping(monkeypatch):
     )
 
     previous_server_args = get_global_server_args()
-    set_global_server_args(SimpleNamespace(enable_grouped_topk_kernel=True, device="tpu"))
+    set_global_server_args(SimpleNamespace(enable_topk_kernel=True, device="tpu"))
     try:
         _, physical_ids = TopK(
             topk=topk,
