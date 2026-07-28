@@ -52,72 +52,6 @@ jobs:
           --commit-author "$COMMIT_AUTHOR"
           --slack-output slack_summary.txt
 
-      - name: AI bug analysis
-        id: ai_analysis
-        if: steps.classify.outputs.has_bugs == 'true'
-        uses: anthropics/claude-code-action@v1
-        with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
-          track_progress: false
-          prompt: |
-            # Nightly CI Bug Analysis
-
-            REPO: ${{ github.repository }}
-            RUN_ID: ${{ github.event.workflow_run.id || github.event.inputs.run_id }}
-
-            You are analyzing failed nightly CI jobs that have been
-            pre-classified as likely bugs (not timeouts, resource exhaustion,
-            or infrastructure issues).
-
-            The file `classification.json` in the working directory contains
-            the failure classification for all jobs. Focus ONLY on jobs where
-            `failure_type` is `"bug"`.
-
-            ## Investigation steps
-
-            1. Read `classification.json` to identify bug-type jobs.
-            2. Fetch failure logs:
-               `gh run view <RUN_ID> --log-failed`
-               Focus on tracebacks, assertion errors, and test failures.
-               If logs are large, grep for the actual failing assertion /
-               traceback / non-zero exit rather than reading everything.
-            3. Inspect the source code at HEAD to understand the failing
-               code paths if needed.
-            4. Summarize the root cause in 1-2 sentences per job.
-
-            ## Required output
-
-            Write `ai_analysis.json` in the working directory with this exact
-            shape — one entry per bug-type job, key point only:
-
-            {"jobs": [{"name": "<exact job name from classification.json>",
-                       "root_cause": "<one short sentence: the single key reason>",
-                       "fix": "<one short, actionable sentence>"}]}
-
-            Rules:
-            - Use the exact job names from classification.json; bug-type jobs only.
-            - One sentence per field. No stack traces, code blocks, or file:line
-              dumps — those live in the run logs.
-
-            ## Discipline
-
-            - Do not invent facts. If evidence is unavailable, say so.
-            - Do not push code changes.
-            - English output throughout.
-          claude_args: |
-            --model claude-opus-4-7
-            --allowedTools "Read,Grep,Glob,Bash(gh run view:*),Bash(gh api:*),Bash(cat:*),Bash(echo:*),Write"
-        env:
-          ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
-          API_TIMEOUT_MS: "3000000"
-          CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
-          ANTHROPIC_MODEL: claude-opus-4-7
-          ANTHROPIC_SMALL_FAST_MODEL: claude-opus-4-7
-          ANTHROPIC_DEFAULT_SONNET_MODEL: claude-sonnet-4-6
-          ANTHROPIC_DEFAULT_OPUS_MODEL: claude-opus-4-7
-          ANTHROPIC_DEFAULT_HAIKU_MODEL: claude-opus-4-7
-          CLAUDE_CODE_LOG_LEVEL: debug
-
       - name: Create or update CI failure issues
         if: always() && steps.classify.conclusion == 'success' && hashFiles('classification.json') != ''
         env:
@@ -138,7 +72,6 @@ jobs:
           --commit-sha "$COMMIT_SHA"
           --commit-author "$COMMIT_AUTHOR"
           --classification classification.json
-          --ai-analysis ai_analysis.json
           --output failure_issues.json
 
       - name: Find latest successful nightly
@@ -206,7 +139,7 @@ jobs:
           fi
           python3 scripts/ci/publish.py --data-type status --source-dir .
 
-      - name: Finalize summary with AI analysis and issue links
+      - name: Finalize summary with issue links
         if: always() && steps.classify.conclusion == 'success' && hashFiles('classification.json') != ''
         env:
           REPO: ${{ github.repository }}
@@ -225,7 +158,6 @@ jobs:
             --commit-sha "$COMMIT_SHA"
             --commit-author "$COMMIT_AUTHOR"
             --from-classification classification.json
-            --ai-analysis ai_analysis.json
             --slack-output slack_summary.txt
           )
           if [ -f failure_issues.json ]; then
@@ -262,7 +194,6 @@ jobs:
             classification.json
             failure_issues.json
             nightly-status.json
-            ai_analysis.json
             latest_successful_nightly.json
           retention-days: 14
           if-no-files-found: ignore
