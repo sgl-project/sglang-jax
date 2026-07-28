@@ -5,6 +5,8 @@ Supports config sweeping via comma-separated env vars.
 
 Env vars:
   BENCH_TOKENS  — comma-separated token counts (default: 4096)
+  BENCH_VALID_TOKENS — valid tokens within a single static token shape
+  BENCH_DP      — logical data-axis size (default: 1)
   BENCH_BT      — comma-separated bt candidates (default: 128)
   BENCH_BF      — comma-separated bf candidates (default: 256)
   BENCH_BTC     — comma-separated btc candidates (default: 128)
@@ -18,6 +20,8 @@ Env vars:
   BENCH_WARMUP  — warmup iterations (default: 2)
   BENCH_ITERS   — timed iterations (default: 5)
   BENCH_CHECK   — 1 to run correctness check (single-host only)
+  BENCH_OUTPUT  — optional rank-0 metrics JSONL output path
+  BENCH_VARIANT — variant label written to BENCH_OUTPUT
   BENCH_SWIGLU_LIMIT — SwiGLU clamp limit for routed experts (default: off)
   BENCH_SHARED_SWIGLU_LIMIT — SwiGLU clamp limit for the shared expert (default: off)
   BENCH_D/F/E/TOPK — model dims (default: MiMo V2 Pro)
@@ -255,11 +259,17 @@ from sgl_jax.srt.kernels.fused_moe.v2.tuned_block_configs import (
     DEFAULT_V2_BLOCK_CONFIG,
     get_tuned_fused_moe_v2_block_config,
 )
+from sgl_jax.srt.utils.mesh_utils import create_device_mesh
 
 P = jax.sharding.PartitionSpec
 num_devices = jax.device_count()
-devices = np.array(jax.devices()).reshape(1, num_devices)
-mesh = jax.sharding.Mesh(devices, ("data", "tensor"))
+bench_dp_size = int(os.environ.get("BENCH_DP", "1"))
+if bench_dp_size <= 0 or num_devices % bench_dp_size != 0:
+    raise ValueError(f"BENCH_DP must be a positive divisor of {num_devices=}, got {bench_dp_size}.")
+mesh = create_device_mesh(
+    ici_parallelism=[bench_dp_size, num_devices // bench_dp_size],
+    dcn_parallelism=[1, 1],
+)
 ep_size = num_devices
 
 d = int(os.environ.get("BENCH_D", "6144"))
@@ -330,6 +340,21 @@ bf_candidates = parse_csv_int("BENCH_BF", [256])
 btc_candidates = parse_csv_int("BENCH_BTC", [128])
 bts_candidates = parse_csv_int_or_none("BENCH_BTS")
 token_candidates = parse_csv_int("BENCH_TOKENS", [4096])
+valid_tokens_env = os.environ.get("BENCH_VALID_TOKENS")
+if len(token_candidates) != 1 and valid_tokens_env is not None:
+    raise ValueError("BENCH_VALID_TOKENS requires exactly one BENCH_TOKENS value.")
+requested_valid_tokens = int(valid_tokens_env) if valid_tokens_env is not None else None
+if requested_valid_tokens is not None and (
+    requested_valid_tokens <= 0 or requested_valid_tokens > token_candidates[0]
+):
+    raise ValueError(
+        f"BENCH_VALID_TOKENS must be in [1, {token_candidates[0]}], got {requested_valid_tokens}."
+    )
+if requested_valid_tokens is not None and requested_valid_tokens % bench_dp_size != 0:
+    raise ValueError(
+        f"BENCH_VALID_TOKENS={requested_valid_tokens} must be divisible by "
+        f"BENCH_DP={bench_dp_size}."
+    )
 
 # Tuned-first defaulting: when the user did NOT explicitly pin any block-shape
 # param (BT/BF/BTC/BTS) and we're not sweeping (BENCH_TUNE), look the shape up in
@@ -564,15 +589,10 @@ def generate_tune_candidates(
         )
     )
 
-    bt_list = []
+    bt_list = _aligned_divisors(local_num_tokens, 8)
     for p_val in [2, 4]:
         if local_num_tokens == p_val:
             bt_list.append(p_val)
-    p = 8
-    while p <= local_num_tokens:
-        if local_num_tokens % p == 0:
-            bt_list.append(p)
-        p *= 2
     if not bt_list:
         bt_list = [local_num_tokens]
     bt_list = sorted(set(bt_list))
@@ -720,7 +740,14 @@ if tune_mode:
 
 ep_sharding = jax.sharding.NamedSharding(mesh, P(("data", "tensor")))
 
-log(f"model: E={E} d={d} f={f} k={top_k} ep={ep_size} fp8={use_fp8}")
+log(
+    f"model: E={E} d={d} f={f} k={top_k} ep={ep_size} "
+    f"mesh=({bench_dp_size},{num_devices // bench_dp_size}) fp8={use_fp8}"
+)
+log(
+    f"tokens: static={token_candidates} "
+    f"valid={requested_valid_tokens if requested_valid_tokens is not None else 'all'}"
+)
 if routing_mode != "random":
     log(f"routing_mode={routing_mode}")
 log(
@@ -909,6 +936,7 @@ results: list[tuple[int, str, float, list[float]]] = []
 
 for num_tokens in token_candidates:
     log(f"--- tokens={num_tokens} ---")
+    valid_tokens = requested_valid_tokens if requested_valid_tokens is not None else num_tokens
 
     if tune_mode:
         local_nt = num_tokens // ep_size
@@ -998,6 +1026,15 @@ for num_tokens in token_candidates:
         _, topk_idx = lax.top_k(gating, top_k)
         topk_logits = jnp.take_along_axis(gating, topk_idx, axis=-1)
         topk_wts = jax.nn.softmax(topk_logits, axis=-1)
+
+    if valid_tokens < num_tokens:
+        per_dp_tokens = num_tokens // bench_dp_size
+        valid_tokens_per_dp = valid_tokens // bench_dp_size
+        valid_mask = (
+            jnp.arange(num_tokens, dtype=jnp.int32).reshape(bench_dp_size, per_dp_tokens)
+            < valid_tokens_per_dp
+        ).reshape(-1)
+        topk_idx = jnp.where(valid_mask[:, None], topk_idx, -1)
 
     configs_to_try = [
         (bc_raw, *flags)
@@ -1135,6 +1172,34 @@ if jax.process_index() == 0 and results:
         if len(entries) > 1:
             for tag, avg, _ in entries[1:]:
                 log(f"    {avg:.3f}ms [{tag}]")
+
+    output_path = os.environ.get("BENCH_OUTPUT")
+    if output_path:
+        output = pathlib.Path(output_path)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        variant = os.environ.get("BENCH_VARIANT", "tune")
+        with output.open("w") as f_out:
+            for num_tokens, tag, avg, times in results:
+                row_valid_tokens = (
+                    requested_valid_tokens if requested_valid_tokens is not None else num_tokens
+                )
+                f_out.write(
+                    json.dumps(
+                        {
+                            "variant": variant,
+                            "tokens": num_tokens,
+                            "valid_tokens": row_valid_tokens,
+                            "dp_size": bench_dp_size,
+                            "tp_size": num_devices // bench_dp_size,
+                            "ep_size": ep_size,
+                            "config": tag,
+                            "latency_ms": float(avg),
+                            "samples_ms": [float(t) for t in times],
+                        }
+                    )
+                    + "\n"
+                )
+        log(f"wrote metrics: {output}")
 
 # --- Correctness check (optional, single-host only) ---
 if check_correctness:
