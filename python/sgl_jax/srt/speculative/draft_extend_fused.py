@@ -660,14 +660,16 @@ def _repack_page_indices(
     valid = jnp.any(in_req, axis=2)
 
     dp_ids = jnp.arange(dp_size, dtype=jnp.int32)[:, None]
-    offsets_sharding = jax.typeof(src_offsets).sharding
+    offset_deltas = src_offsets - dst_offsets
+    offsets_sharding = jax.typeof(offset_deltas).sharding
     offsets_out_sharding = offsets_sharding if isinstance(offsets_sharding, NamedSharding) else None
-    src_slot_offsets = src_offsets.at[dp_ids, slot_ids].get(out_sharding=offsets_out_sharding)
-    dst_slot_offsets = dst_offsets.at[dp_ids, slot_ids].get(out_sharding=offsets_out_sharding)
+    slot_offset_deltas = offset_deltas.at[dp_ids, slot_ids].get(
+        out_sharding=offsets_out_sharding
+    )
     gather_src = (
         dp_ids * pages_per_dp
-        + src_slot_offsets
-        + (jnp.arange(pages_per_dp, dtype=jnp.int32)[None, :] - dst_slot_offsets)
+        + slot_offset_deltas
+        + jnp.arange(pages_per_dp, dtype=jnp.int32)[None, :]
     )
     page_sharding = jax.typeof(page_indices).sharding
     out_sharding = page_sharding if isinstance(page_sharding, NamedSharding) else None
