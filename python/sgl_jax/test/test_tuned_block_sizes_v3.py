@@ -108,8 +108,8 @@ def test_sliding_window_separates_buckets(monkeypatch):
     ) == (1, 256, 1, 256)
 
 
-def test_target_verify_uses_tokens_per_seq_bucket(monkeypatch):
-    """Target verify must not share a key with ordinary MIXED traffic."""
+def test_target_verify_clamps_query_tile_without_extra_key_dimension(monkeypatch):
+    """Target verify uses the common key schema and specializes bq at trace time."""
     from sgl_jax.srt.kernels.ragged_paged_attention import tuned_block_sizes_v3 as mod
 
     monkeypatch.setattr(mod, "get_tpu_version", lambda: 7)
@@ -129,8 +129,8 @@ def test_target_verify_uses_tokens_per_seq_bucket(monkeypatch):
     )
     mod.TUNED_BLOCK_SIZES_V3["TPU v7"].clear()
     mod.TUNED_BLOCK_SIZES_V3["TPU v7"][
-        ("v", None, 4, "bfloat16", "bfloat16", 16, 1, 256, 256, 128)
-    ] = (4, 2048, 4, 2048)
+        ("v", None, "bfloat16", "bfloat16", 16, 1, 256, 256, 128)
+    ] = (32, 2048, 32, 2048)
 
     assert mod.get_tuned_block_sizes_v3(
         "v",
@@ -143,20 +143,17 @@ def test_target_verify_uses_tokens_per_seq_bucket(monkeypatch):
         128,
         tokens_per_seq=4,
     ) == (4, 2048, 4, 2048)
-    assert (
-        mod.get_tuned_block_sizes_v3(
-            "v",
-            jnp.bfloat16,
-            jnp.bfloat16,
-            16,
-            1,
-            256,
-            256,
-            128,
-            tokens_per_seq=8,
-        )
-        is None
-    )
+    assert mod.get_tuned_block_sizes_v3(
+        "v",
+        jnp.bfloat16,
+        jnp.bfloat16,
+        16,
+        1,
+        256,
+        256,
+        128,
+        tokens_per_seq=8,
+    ) == (8, 2048, 8, 2048)
     assert (
         mod.get_tuned_block_sizes_v3(
             "m",
