@@ -340,6 +340,11 @@ suites = {
             runner="pytest",
         ),
         TestFile("python/sgl_jax/test/models/test_qwen3_5.py", 2, runner="pytest"),
+        TestFile(
+            "python/sgl_jax/test/test_moe_weight_loader_sharding.py",
+            0.2,
+            runner="pytest",
+        ),
         TestFile("python/sgl_jax/test/mem_cache/test_req_to_token_pool.py", 1),
         TestFile("python/sgl_jax/test/mem_cache/test_hybrid_req_to_token_pool.py", 1),
         TestFile("python/sgl_jax/test/mem_cache/test_swa_allocator.py", 1),

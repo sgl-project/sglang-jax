@@ -1855,6 +1855,8 @@ class WeightLoader:
         t2 = time.monotonic()
         if defer_transpose and result.ndim >= 3:
             result = jnp.transpose(result, (0, 2, 1))
+            assert target_sharding is not None
+            result = jax.sharding.reshard(result, target_sharding)
         t_defer = time.monotonic() - t2
         if _callback_times:
             defer_msg = f" defer_transpose={t_defer:.3f}s" if defer_transpose else ""
