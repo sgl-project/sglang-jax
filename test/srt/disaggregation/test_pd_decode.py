@@ -620,6 +620,25 @@ def test_cancel_matching_retains_inflight_entry_until_terminal():
     assert len(queue) == 1
 
 
+def test_inflight_cap_is_partitioned_per_rank_without_cross_rank_head_of_line():
+    # Global cap 8 over DP4 gives each rank 2 Raiden slots. A third rank-0
+    # request must stay queued, while a later rank-1 request can still use its
+    # own manager's capacity.
+    sched = _AdmScheduler(capacity=100, reserved=0, max_inflight=8)
+    sched.dp_size = 4
+    _enqueue(sched, "rank0-a", seqlen=4).req.dp_rank = 0
+    _enqueue(sched, "rank0-b", seqlen=4).req.dp_rank = 0
+    _enqueue(sched, "rank0-c", seqlen=4).req.dp_rank = 0
+    _enqueue(sched, "rank1-a", seqlen=4).req.dp_rank = 1
+
+    sched._admit_decode_prealloc()
+
+    assert len(sched.disagg_transfer_queue) == 3
+    assert len(sched.disagg_prealloc_queue) == 1
+    assert sched.token_to_kv_pool_allocator.alloc_ranks == [0, 0, 1]
+    assert sched.aborted == []
+
+
 # ---- from test_pd_decode_bootstrap_cache.py ----
 
 

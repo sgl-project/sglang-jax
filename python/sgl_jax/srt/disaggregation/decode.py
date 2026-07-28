@@ -21,6 +21,7 @@ from sgl_jax.srt.disaggregation.base.transfer import (
     TransferBackend,
 )
 from sgl_jax.srt.disaggregation.bootstrap import BootstrapClient, PrefillInfoCache
+from sgl_jax.srt.disaggregation.common.capacity import per_rank_inflight_limit
 from sgl_jax.srt.mem_cache.memory_pool import write_kv_layer
 
 if TYPE_CHECKING:
@@ -526,6 +527,7 @@ class SchedulerDisaggregationDecodeMixin:
         page_size = allocator.page_size
         reserved_per = self.server_args.disaggregation_num_reserved_decode_tokens
         max_inflight = self.server_args.disaggregation_max_inflight_transfers
+        per_rank_inflight = per_rank_inflight_limit(max_inflight, self.dp_size)
         n_transfer = len(self.disagg_transfer_queue)
         admitted = 0
         transfer_per_dp = [0] * self.dp_size
@@ -546,6 +548,15 @@ class SchedulerDisaggregationDecodeMixin:
             # and retry next tick (deferral, never abort).
             if max_inflight > 0 and (n_transfer + admitted) >= max_inflight:
                 break
+            # Each DP rank owns one Raiden manager and its own fixed slot pool.
+            # Skip a saturated rank while allowing later requests for other
+            # ranks to proceed, preventing cross-rank head-of-line blocking.
+            if (
+                per_rank_inflight > 0
+                and transfer_per_dp[local_dp_rank] + admitted_per_dp[local_dp_rank]
+                >= per_rank_inflight
+            ):
+                continue
             seqlen = len(entry.req.origin_input_ids)
             page_aligned = ((seqlen + page_size - 1) // page_size) * page_size
             n_running = _batch_req_count_for_dp(self.running_batch, local_dp_rank)
