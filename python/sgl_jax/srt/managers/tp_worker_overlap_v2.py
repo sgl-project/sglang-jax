@@ -13,6 +13,7 @@ from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 from sgl_jax.srt.managers.tp_worker import ModelWorker
 from sgl_jax.srt.utils.overlap_utils import (
     create_relay_buffers,
+    resolve_decode_relay_inputs,
     resolve_relay_inputs,
     update_relay_buffers,
 )
@@ -61,6 +62,15 @@ class ModelWorkerOverlap(ModelWorker):
             ),
             out_shardings=input_sharding,
         )
+        self._resolve_decode_relay = jax.jit(
+            partial(
+                resolve_decode_relay_inputs,
+                dp_size=self.dp_size,
+                relay_sharding=relay_sharding,
+                output_sharding=input_sharding,
+            ),
+            out_shardings=input_sharding,
+        )
         self._update_relay = jax.jit(
             partial(
                 update_relay_buffers,
@@ -89,7 +99,13 @@ class ModelWorkerOverlap(ModelWorker):
         if self.server_args.enable_lora:
             self.prepare_lora_batch(batch)
         forward_batch = ForwardBatch.init_new(batch, self.model_runner)
-        if batch.relay_input_indices is not None:
+        if batch.forward_mode.is_decode():
+            forward_batch.input_ids = self._resolve_decode_relay(
+                self.relay_buffers,
+                forward_batch.req_pool_indices,
+                forward_batch.input_ids,
+            )
+        elif batch.relay_input_indices is not None:
             input_sharding = forward_batch.input_ids.sharding
             indices = jax.device_put(batch.relay_input_indices, input_sharding)
             mask = jax.device_put(batch.relay_input_mask, input_sharding)
@@ -139,14 +155,9 @@ class ModelWorkerOverlap(ModelWorker):
         if sampled_output is not None:
             logits_output = sampled_output
 
-        sharding = NamedSharding(self.mesh, P("data"))
-        indices = np.asarray(batch.req_pool_indices, dtype=np.int32)
-        valid_mask = indices >= 0
-        safe_indices = np.where(valid_mask, indices, 0)
         self.relay_buffers = self._update_relay(
             self.relay_buffers,
-            jax.device_put(safe_indices, sharding),
-            jax.device_put(valid_mask, sharding),
+            batch.forward_batch.req_pool_indices,
             next_token_ids,
         )
 

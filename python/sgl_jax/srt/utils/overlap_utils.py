@@ -30,22 +30,20 @@ def create_relay_buffers(
 
 def update_relay_buffers(
     buffers: RelayBuffers,
-    indices,
-    valid_mask,
+    req_pool_indices,
     next_token_ids,
     *,
     dp_size: int,
     output_sharding,
 ) -> RelayBuffers:
-    per_dp_bs = indices.shape[0] // dp_size
-    indices = indices.reshape((dp_size, per_dp_bs))
-    valid = valid_mask.reshape((dp_size, per_dp_bs))
+    per_dp_bs = req_pool_indices.shape[0] // dp_size
+    req_pool_indices = req_pool_indices.reshape((dp_size, per_dp_bs))
     next_token_ids = next_token_ids.reshape((dp_size, per_dp_bs))
     dp_indices = jnp.arange(dp_size, dtype=jnp.int32)[:, None]
     scatter_indices = jnp.where(
-        valid,
-        indices,
-        jnp.full_like(indices, buffers.next_token_ids.shape[1]),
+        req_pool_indices >= 0,
+        req_pool_indices,
+        jnp.full_like(req_pool_indices, buffers.next_token_ids.shape[1]),
     )
     return RelayBuffers(
         next_token_ids=buffers.next_token_ids.at[dp_indices, scatter_indices].set(
@@ -92,3 +90,25 @@ def resolve_relay_inputs(
     )
     relay_ids = jax.sharding.reshard(relay_ids, output_sharding)
     return jnp.where(valid_mask, relay_ids, input_ids)
+
+
+def resolve_decode_relay_inputs(
+    buffers: RelayBuffers,
+    req_pool_indices,
+    input_ids,
+    *,
+    dp_size: int,
+    relay_sharding,
+    output_sharding,
+) -> jax.Array:
+    valid_mask = req_pool_indices >= 0
+    safe_indices = jnp.where(valid_mask, req_pool_indices, 0)
+    return resolve_relay_inputs(
+        buffers,
+        safe_indices,
+        valid_mask,
+        input_ids,
+        dp_size=dp_size,
+        relay_sharding=relay_sharding,
+        output_sharding=output_sharding,
+    )
