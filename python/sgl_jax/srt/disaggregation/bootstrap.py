@@ -12,7 +12,8 @@ from dataclasses import asdict, dataclass, field
 import httpx
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
-from pydantic import BaseModel, Field as PydanticField
+from pydantic import BaseModel
+from pydantic import Field as PydanticField
 
 logger = logging.getLogger(__name__)
 

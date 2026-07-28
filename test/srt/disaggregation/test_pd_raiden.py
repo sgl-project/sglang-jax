@@ -21,9 +21,7 @@ from sgl_jax.srt.disaggregation.raiden_transfer.conn import (
     RaidenTransferKVManager,
     _uuid_to_int,
 )
-from sgl_jax.srt.disaggregation.raiden_transfer.wrapper import (
-    RaidenTransferWrapper,
-)
+from sgl_jax.srt.disaggregation.raiden_transfer.wrapper import RaidenTransferWrapper
 from sgl_jax.srt.server_args import ServerArgs
 
 
@@ -106,9 +104,7 @@ def test_raiden_receiver_starts_direct_block_read_and_pops_metadata():
     )
 
     assert receiver.poll() == KVPoll.TRANSFERRING
-    assert raiden.started == [
-        ("wire-2", _uuid_to_int("wire-2"), "10.0.0.1:7777", [1, 4], [9, 10])
-    ]
+    assert raiden.started == [("wire-2", _uuid_to_int("wire-2"), "10.0.0.1:7777", [1, 4], [9, 10])]
 
     raiden.stats = ([], ["wire-2"], [])
     assert receiver.poll() == KVPoll.SUCCESS
@@ -168,9 +164,7 @@ def test_raiden_manager_owns_decode_admission_and_endpoint_mapping():
     assert admission.state == AdmissionState.ADMITTED
     assert admission.receiver is not None
     assert admission.receiver.poll() == KVPoll.TRANSFERRING
-    assert raiden.started == [
-        ("wire-4", _uuid_to_int("wire-4"), "10.0.0.1:7777", [3, 4], [9, 10])
-    ]
+    assert raiden.started == [("wire-4", _uuid_to_int("wire-4"), "10.0.0.1:7777", [3, 4], [9, 10])]
 
 
 def test_raiden_manager_accepts_legacy_flat_peer_metadata():
@@ -237,9 +231,7 @@ def test_raiden_uuid_is_stable_and_json_safe():
 def test_raiden_loader_is_opt_in():
     assert not raiden_requested([])
     assert raiden_requested(["--disaggregation-use-raiden"])
-    assert not raiden_requested(
-        ["--disaggregation-use-raiden", "--no-disaggregation-use-raiden"]
-    )
+    assert not raiden_requested(["--disaggregation-use-raiden", "--no-disaggregation-use-raiden"])
 
 
 def test_raiden_cli_is_opt_in():
@@ -281,9 +273,7 @@ def test_raiden_factory_rejects_invalid_config(override, error):
 
 def test_raiden_wrapper_uses_public_jax_api_and_configured_parallelism():
     engine = mock.MagicMock()
-    engine.get_local_endpoints.return_value = [
-        {"endpoint": "127.0.0.1:7788", "shards": [0]}
-    ]
+    engine.get_local_endpoints.return_value = [{"endpoint": "127.0.0.1:7788", "shards": [0]}]
     manager_cls = mock.MagicMock(return_value=engine)
     modules = {
         "tpu_raiden": types.ModuleType("tpu_raiden"),
