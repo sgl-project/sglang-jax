@@ -5,8 +5,6 @@
 - [Architecture Principles](#architecture-principles)
 - [CI/CD Pipeline Workflows](#cicd-pipeline-workflows)
   - [Slash Command Handler](#slash-command-handler-slash-commandyml)
-  - [PR Review](#pr-review-pr-reviewyml)
-  - [CI Auto Bisect](#ci-auto-bisect-ci-auto-bisectyml)
   - [Pull Request Testing](#pull-request-testing-pr-testyml)
   - [Nightly Testing](#nightly-testing)
   - [Release Automation](#release-automation)
@@ -75,7 +73,7 @@ re-running the entire workflow.
 | `/test perf` | Add the `test:perf` label — the label event triggers CI with perf tests enabled |
 | `/rerun-group <suite>` | Run a specific test suite on the matching runner via `rerun-test.yml`. Suite names from `test/srt/run_suite.py`; runner derived from suffix (`-v6e-1`, `-v6e-4`, `-cpu`) |
 | `/rerun-stage <stage>` | Dispatch all suites in a stage independently via `rerun-test.yml`. Stage: `1`/`fast` (unit), `2`/`medium` (e2e+accuracy), `3`/`heavy` (performance) |
-| `/run-nightly <case_key>` | Run a single nightly case against the PR HEAD via `nightly-test-daily.yml` (`job_filter` + `--cases`); the result is posted back on the PR. `<case_key>` is a case name (e.g. `qwen3-8b-fa`). A 🚀 reaction marks the nightly as started (it comments PASS/FAIL back); an invalid key gets 😕 plus the valid list; a failed case also gets an AI bisect comment |
+| `/run-nightly <case_key>` | Run a single nightly case against the PR HEAD via `nightly-test-daily.yml` (`job_filter` + `--cases`); the result is posted back on the PR. `<case_key>` is a case name (e.g. `qwen3-8b-fa`). A 🚀 reaction marks the nightly as started (it comments PASS/FAIL back); an invalid key gets 😕 plus the valid list |
 | `/run-nightly` or `/run-nightly ?` | List the available `case_key`s (grouped by job). Use this to discover what you can run |
 
 *Where the case_keys come from:* not a hand-maintained list — the slash parser enumerates the single-host suite runner's catalog by invoking its `--caselist` (`test/srt/nightly/single_host/suite_runner.py`, a subprocess; the case list is dependency-light and needs no jax, so it runs on the CPU runner), so **adding a case to a suite makes it runnable via `/run-nightly` with nothing else to update**. It exposes all accuracy cases plus each perf model's representative point (`PerfCase.capture_trace`), since the sweep's other points only make sense as a set. Multi-host is not wired into `/run-nightly` — its nightly job stays `if: false` until CI has 4-node v6e capacity. The parser holds only a single-host suite→job map; any suite the runner exposes but the map doesn't name is silently skipped.
@@ -84,7 +82,7 @@ re-running the entire workflow.
 - **Discover:** comment `/run-nightly ?` (or bare `/run-nightly`) → it replies with the runnable `case_key`s, grouped by job.
 - **Run one case:** comment `/run-nightly <case_key>` — e.g. `/run-nightly qwen3-8b-fa` (an accuracy case) or `/run-nightly qwen3-32b-c32-i4096-o1024` (a perf representative point). It runs that one case against the PR HEAD.
 - **Who can trigger:** `OWNER` / `MEMBER` / `COLLABORATOR` only (the shared slash-command permission gate); anyone else is rejected. Review a fork PR's diff first — this runs PR-HEAD code with elevated permissions.
-- **What you get:** a 🚀 reaction when the run starts, then a `PASS`/`FAIL` comment (with a run link) when it finishes. An invalid `case_key` gets a 😕 reaction plus the list of valid keys; a failed case also gets an AI root-cause (`ci-auto-bisect`) comment.
+- **What you get:** a 🚀 reaction when the run starts, then a `PASS`/`FAIL` comment (with a run link) when it finishes. An invalid `case_key` gets a 😕 reaction plus the list of valid keys.
 
 *Architecture:*
 - `scripts/ci/slash_command_parse.py` — pure-Python parser (stdlib only), reads
@@ -98,23 +96,11 @@ re-running the entire workflow.
   reusable workflow (`uses:` from slash-command.yml) with `ref=refs/pull/<N>/head`
   (resolves for fork PRs too), `job_filter`, `cases`, and `pr_number`. Running it via
   `uses:` keeps the nightly part of the Slash Command Handler run, so it never appears
-  as a standalone "Nightly Test Daily" run for the notifier / auto-bisect to mistake
+  as a standalone "Nightly Test Daily" run for the notifier to mistake
   for the scheduled nightly. The run job (read-only, no write token) executes the case; a separate clean job posts PASS/FAIL back to the PR
 - Most commands react 👍 and post result comments; `/run-nightly` instead reacts
   🚀 when the nightly starts / 😕 on an invalid key, to keep the PR thread quiet — only
   the final PASS/FAIL (and the on-demand case list) are comments
-
-### PR Review (pr-review.yml)
-
-AI-powered code review using Claude Code Action. Auto-triggers on PR open/ready_for_review;
-also available on-demand via `/review` comment (`OWNER`/`COLLABORATOR` only).
-
-### CI Auto Bisect (ci-auto-bisect.yml)
-
-AI-powered CI failure analysis. Auto-triggers on failed workflow runs (PR Test, Nightly Test, etc.);
-also available on-demand via `/auto-bisect [run_id]` comment (`OWNER`/`COLLABORATOR` only).
-Classifies failures as `code_regression`, `flaky_test`, `infrastructure`, or `environment`
-and posts analysis results on the associated PR.
 
 ### Pull Request Testing (pr-test.yml)
 *Purpose:* Comprehensive testing for JAX

@@ -40,7 +40,7 @@ on:
         type: string
   # Reusable entry for /run-nightly: invoked via `uses:` from slash-command.yml, so a
   # PR-triggered nightly is part of the Slash Command Handler run — no standalone
-  # "Nightly Test Daily" run, so the notifier / auto-bisect that watch it don't fire.
+  # "Nightly Test Daily" run, so the notifier that watches it doesn't fire.
   workflow_call:
     inputs:
       ref:

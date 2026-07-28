@@ -194,8 +194,8 @@ jobs:
 
   run-nightly:
     # One nightly case on the PR HEAD, run as a reusable workflow so it stays part of
-    # this run — no standalone "Nightly Test Daily" run for the notifier/auto-bisect to
-    # mistake for the scheduled nightly. Comments PASS/FAIL back via pr_number.
+    # this run — no standalone "Nightly Test Daily" run for the notifier to mistake
+    # for the scheduled nightly. Comments PASS/FAIL back via pr_number.
     needs: handle-command
     if: needs.handle-command.outputs.action == 'run_nightly'
     permissions:
@@ -210,21 +210,3 @@ jobs:
       cases: ${{ needs.handle-command.outputs.nightly_cases }}
       pr_number: ${{ github.event.issue.number }}
     secrets: inherit
-
-  bisect-on-nightly-failure:
-    # On a failed /run-nightly, dispatch ci-auto-bisect to analyze this run and comment
-    # the root cause on the PR. issue_number is explicit (this run's head_branch=main).
-    needs: run-nightly
-    if: always() && needs.run-nightly.result == 'failure'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      actions: write
-    steps:
-      - name: Trigger AI bisect on the failed nightly run
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh workflow run ci-auto-bisect.yml \
-            -f run_id=${{ github.run_id }} \
-            -f issue_number=${{ github.event.issue.number }}
