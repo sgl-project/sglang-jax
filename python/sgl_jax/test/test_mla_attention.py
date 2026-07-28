@@ -21,6 +21,7 @@ build the two index layouts side by side and dispatch them to the right call.
 """
 
 import unittest
+from unittest import mock
 
 import jax
 import jax.numpy as jnp
@@ -353,6 +354,89 @@ class TestMLAAttention(CustomTestCase):
             self.skipTest("JAX not available")
         self.rng_key = jax.random.PRNGKey(0)
         np.random.seed(0)
+
+    def test_backend_reshards_new_k_pe_for_shard_map(self):
+        captured_inputs = {}
+
+        def fake_shard_map(_fn, *, in_specs, out_specs, check_vma):
+            del in_specs, out_specs, check_vma
+
+            def invoke(*args):
+                captured_inputs["new_k_pe"] = args[3]
+                return args[0], args[4]
+
+            return invoke
+
+        num_heads = mesh.shape["tensor"]
+        backend = MLAAttentionBackend(
+            num_attn_heads=num_heads,
+            kv_lora_rank=4,
+            qk_nope_head_dim=4,
+            qk_rope_head_dim=4,
+            v_head_dim=4,
+            page_size=16,
+            mesh=mesh,
+            attention_data_partition_axis="data",
+            vmem_limit_bytes=1,
+        )
+        metadata_sharding = NamedSharding(mesh, P("data"))
+        for field in (
+            "seq_lens",
+            "page_indices",
+            "cu_q_lens",
+            "cu_kv_lens",
+            "distribution",
+        ):
+            setattr(
+                backend.forward_metadata,
+                field,
+                jax.device_put(jnp.zeros((1,), dtype=jnp.int32), metadata_sharding),
+            )
+
+        q = jax.device_put(
+            jnp.ones((1, num_heads, 4), dtype=jnp.bfloat16),
+            NamedSharding(mesh, P("data", "tensor", None)),
+        )
+        k = jax.device_put(
+            jnp.ones((1, 1, 4), dtype=jnp.bfloat16),
+            NamedSharding(mesh, P("data", None, None)),
+        )
+        k_rope = jax.device_put(
+            jnp.ones((1, 1, 4), dtype=jnp.bfloat16),
+            NamedSharding(mesh, P(None, None, None)),
+        )
+        cache = jax.device_put(
+            jnp.zeros((1, 1, 1, 8), dtype=jnp.bfloat16),
+            NamedSharding(mesh, P("data", None, None, None)),
+        )
+        layer = mock.Mock(
+            layer_id=0,
+            scaling=1.0,
+            sliding_window_size=None,
+            logit_cap=None,
+        )
+        pool = mock.Mock()
+        pool.get_fused_kv_buffer.return_value = cache
+
+        with mock.patch(
+            "sgl_jax.srt.layers.attention.mla_backend.jax.shard_map",
+            side_effect=fake_shard_map,
+        ):
+            backend(
+                q,
+                k,
+                k,
+                layer,
+                forward_batch=None,
+                token_to_kv_pool=pool,
+                q_rope=q,
+                k_rope=k_rope,
+            )
+
+        self.assertEqual(
+            captured_inputs["new_k_pe"].sharding.spec,
+            P("data", None),
+        )
 
     def run_test(
         self,
