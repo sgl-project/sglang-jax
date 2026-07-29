@@ -19,6 +19,10 @@ from sgl_jax.srt.kernels.gdn.gated_delta import (
     jax_causal_conv1d_update,
     ragged_gated_delta_rule_ref,
 )
+from sgl_jax.srt.kernels.gdn.tpu_inference_adapter import (
+    GDNPrefillCapabilityError,
+    tpu_inference_v3_prefill,
+)
 
 __all__ = [
     "chunked_gated_delta_rule_jax",
@@ -26,4 +30,6 @@ __all__ = [
     "jax_causal_conv1d_prefill",
     "jax_causal_conv1d_update",
     "ragged_gated_delta_rule_ref",
+    "GDNPrefillCapabilityError",
+    "tpu_inference_v3_prefill",
 ]

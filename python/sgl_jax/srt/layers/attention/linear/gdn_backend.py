@@ -25,6 +25,10 @@ inference. Returns ``(core_attn_out, new_conv, new_rec)`` shaped for
 
 from __future__ import annotations
 
+import logging
+import os
+from collections.abc import Callable
+from functools import partial
 from typing import TYPE_CHECKING
 
 import jax
@@ -36,10 +40,14 @@ from sgl_jax.srt.kernels.gdn import (
     decode_gated_delta_rule_ref,
     jax_causal_conv1d_prefill,
     jax_causal_conv1d_update,
+    tpu_inference_v3_prefill,
 )
+from sgl_jax.srt.kernels.gdn.tpu_inference_adapter import validate_tpu_inference_v3_capability
 from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
     LinearRecurrentAttnBackend,
 )
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sgl_jax.srt.layers.radix_linear_attention import RadixLinearAttention
@@ -74,6 +82,7 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
         head_v_dim: int,
         conv_kernel_size: int,
         mesh: jax.sharding.Mesh,
+        dtype: jnp.dtype | None = None,
     ):
         super().__init__(mesh=mesh)
         self.num_k_heads = num_k_heads
@@ -113,6 +122,38 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
                 f"GDNAttnBackend: num_v_heads={num_v_heads} must be a multiple "
                 f"of num_k_heads={num_k_heads} (GQA repeat factor)."
             )
+
+        self.requested_prefill_impl = os.environ.get("SGLANG_JAX_GDN_PREFILL_IMPL", "reference")
+        if self.requested_prefill_impl not in {"reference", "tpu_inference_v3"}:
+            raise ValueError(
+                "SGLANG_JAX_GDN_PREFILL_IMPL must be one of 'reference' or 'tpu_inference_v3'."
+            )
+        self.fallback_reason = None
+        self._decode_callable: Callable[..., tuple[jax.Array, jax.Array]] = (
+            decode_gated_delta_rule_ref
+        )
+        self._prefill_callable: Callable[..., tuple[jax.Array, jax.Array, jax.Array]]
+        if self.requested_prefill_impl == "reference":
+            self.effective_prefill_impl = "reference"
+            self._prefill_callable = self._forward_extend_reference
+        else:
+            validate_tpu_inference_v3_capability(
+                mesh=mesh,
+                dtype=dtype,
+                num_k_heads=num_k_heads,
+                num_v_heads=num_v_heads,
+                head_k_dim=head_k_dim,
+                head_v_dim=head_v_dim,
+                conv_kernel_size=conv_kernel_size,
+            )
+            self.effective_prefill_impl = "tpu_inference_v3"
+            self._prefill_callable = partial(tpu_inference_v3_prefill, self)
+        logger.info(
+            "GDN prefill implementation requested=%s effective=%s fallback_reason=%s",
+            self.requested_prefill_impl,
+            self.effective_prefill_impl,
+            self.fallback_reason,
+        )
 
     # ------------------------------------------------------------------
     # Dispatch
@@ -241,7 +282,7 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
                 track_indices=track_indices_l,
                 track_mask=track_mask_l,
             )
-            new_rec, out = decode_gated_delta_rule_ref(
+            new_rec, out = self._decode_callable(
                 conv_out,
                 b_l,
                 a_l,
@@ -307,6 +348,29 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
     # ------------------------------------------------------------------
 
     def forward_extend(
+        self,
+        mixed_qkv: jax.Array,
+        conv_state_in: jax.Array,
+        recurrent_state_in: jax.Array,
+        b: jax.Array,
+        a: jax.Array,
+        conv1d_weight: jax.Array,
+        A_log: jax.Array,
+        dt_bias: jax.Array,
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        """Run the prefill callable selected and frozen at initialization."""
+        return self._prefill_callable(
+            mixed_qkv,
+            conv_state_in,
+            recurrent_state_in,
+            b,
+            a,
+            conv1d_weight,
+            A_log,
+            dt_bias,
+        )
+
+    def _forward_extend_reference(
         self,
         mixed_qkv: jax.Array,
         conv_state_in: jax.Array,
