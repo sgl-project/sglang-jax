@@ -7,7 +7,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from jax.sharding import Mesh, NamedSharding
+from jax.sharding import AxisType, Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
 
@@ -364,7 +364,11 @@ def test_topk_kernel_preserves_router_token_sharding(monkeypatch, token_axis, mo
     monkeypatch.setenv("PALLAS_INTERPRET", "1")
     devices = np.asarray(jax.devices())
     mesh_shape = (len(devices), 1) if token_axis == "data" else (1, len(devices))
-    mesh = Mesh(devices.reshape(mesh_shape), ("data", "tensor"))
+    mesh = Mesh(
+        devices.reshape(mesh_shape),
+        ("data", "tensor"),
+        axis_types=(AxisType.Explicit, AxisType.Explicit),
+    )
     tokens = 256 * len(devices)
     experts = 256 if mode == "grouped" else 128
     routing_sharding = NamedSharding(mesh, P(token_axis, None))
