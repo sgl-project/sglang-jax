@@ -53,13 +53,7 @@ def _manual_shard_map_for_pallas(
         axes=mesh.axis_names,
         out_sharding=out_sharding,
     )
-
-    @functools.wraps(fn)
-    def wrapped(*args):
-        with jax.set_mesh(mesh):
-            return fn(*args)
-
-    return wrapped
+    return fn
 
 
 class GateLogit(nnx.Module):

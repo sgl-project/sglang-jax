@@ -364,7 +364,12 @@ class Qwen3_5MoeBlock(nnx.Module):
             num_experts=self.num_experts,
             weight_dtype=dtype,
         )
-        self.topk = TopK(topk=self.top_k, renormalize=renorm, layer_id=layer_id)
+        self.topk = TopK(
+            topk=self.top_k,
+            renormalize=renorm,
+            layer_id=layer_id,
+            mesh=mesh,
+        )
         self.experts = FusedEPMoE(
             hidden_size=hidden,
             num_experts=self.num_experts,

@@ -297,6 +297,7 @@ class TestQwen3_5(unittest.TestCase):
 
         tc = self.cfg.text_config
         block = Qwen3_5MoeBlock(self.cfg, self.mesh, layer_id=0)
+        self.assertIs(block.topk.mesh, self.mesh)
         self.assertEqual(
             block.experts.w1.value.shape, (tc.num_experts, tc.hidden_size, tc.moe_intermediate_size)
         )

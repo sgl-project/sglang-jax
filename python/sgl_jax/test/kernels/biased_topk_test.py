@@ -466,12 +466,19 @@ def test_topk_pallas_boundary_manualizes_explicit_mesh_axes(monkeypatch):
     previous_server_args = get_global_server_args()
     set_global_server_args(SimpleNamespace(enable_topk_kernel=True, device="tpu"))
     try:
-        with jax.set_mesh(mesh):
-            weights, ids = gate.TopK(
+
+        def run_topk(values):
+            return gate.TopK(
                 topk=8,
                 renormalize=False,
                 mesh=mesh,
-            )(logits, routing_sharding=routing_sharding)
+            )(values, routing_sharding=routing_sharding)
+
+        with jax.set_mesh(mesh):
+            weights, ids = jax.jit(
+                run_topk,
+                out_shardings=(routing_sharding, routing_sharding),
+            )(logits)
             weights.block_until_ready()
             ids.block_until_ready()
     finally:
