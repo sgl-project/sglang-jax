@@ -1,4 +1,10 @@
-"""Process-level wrapper over ``jax.experimental.transfer``."""
+"""Process-level wrapper over ``jax.experimental.transfer``.
+
+The native API registers a buffer and returns immediately, so this wrapper
+keeps the source pytree alive until the decoder ack releases it. It also owns
+one server per process, caches native links per peer, and validates result
+sharding before the native API fails deeper in the stack.
+"""
 
 from __future__ import annotations
 
@@ -16,18 +22,28 @@ _GLOBAL_WRAPPER: JaxTransferWrapper | None = None
 
 
 def _uuid_to_int(uuid: str) -> int:
+    """Map public IDs deterministically to the transfer API's 32-bit key.
+
+    CRC32 is stable across processes and Python versions; collision risk is
+    acceptable for the bounded number of concurrent transfers.
+    """
+
     return zlib.crc32(uuid.encode("utf-8")) & 0xFFFFFFFF
 
 
 class JaxTransferWrapper:
+    """One lazily started transfer server per process."""
+
     def __init__(self, host_ip: str, port: int, channel_number: int = 1) -> None:
         self._host_ip = host_ip
         self._port = port
         self._channel_number = channel_number
         self._init_lock = threading.Lock()
         self._server: Any | None = None
+        # Registration and side-channel ack run on different threads.
         self._pending_lock = threading.Lock()
         self._pending: dict[str, Any] = {}
+        # Pulls normally share one worker, but guard future multi-worker use.
         self._links_lock = threading.Lock()
         self._links: dict[str, Any] = {}
 
@@ -52,6 +68,12 @@ class JaxTransferWrapper:
         return self._server
 
     def start(self) -> Any:
+        """Start the native server once and return it on repeated calls.
+
+        The first-start log records the JAX version because this wrapper is a
+        compatibility boundary around an experimental API.
+        """
+
         if self._server is not None:
             return self._server
         with self._init_lock:
@@ -77,6 +99,13 @@ class JaxTransferWrapper:
         return self._server
 
     def register_pull(self, uuid: str, data: Any) -> None:
+        """Register a pytree and retain it until :meth:`release` is called.
+
+        ``await_pull`` is non-blocking and does not own the Python reference;
+        retaining ``data`` here prevents its buffers from being reclaimed
+        before the decoder ack arrives.
+        """
+
         if self._server is None:
             raise RuntimeError("JaxTransferWrapper.start() must be called before register_pull()")
         sharding = getattr(data, "sharding", None)
@@ -87,7 +116,9 @@ class JaxTransferWrapper:
             )
         with self._pending_lock:
             if uuid in self._pending:
-                raise RuntimeError(f"uuid {uuid!r} is already registered")
+                raise RuntimeError(
+                    f"uuid {uuid!r} is already registered; release it before re-registering"
+                )
             # Registration and the retained reference must become visible
             # atomically with respect to release from the ack thread.
             self._server.await_pull(_uuid_to_int(uuid), data)
@@ -104,6 +135,12 @@ class JaxTransferWrapper:
             pass
 
     def pull(self, uuid: str, spec: Any, remote_addr: str | None = None) -> Any:
+        """Pull a registered pytree using explicitly sharded result specs.
+
+        The experimental transfer API dereferences ``sharding.device_set``
+        internally, so failing early gives callers a useful contract error.
+        """
+
         for leaf in jax.tree.leaves(spec):
             if getattr(leaf, "sharding", None) is None:
                 raise ValueError("JAX transfer requires sharding on every result spec")
@@ -114,6 +151,8 @@ class JaxTransferWrapper:
         return self._connect(remote_addr).pull(_uuid_to_int(uuid), spec)
 
     def release(self, uuid: str) -> None:
+        """Drop the retained producer reference after the decoder ack."""
+
         with self._pending_lock:
             self._pending.pop(uuid, None)
 
@@ -131,6 +170,8 @@ def get_or_create_wrapper(
     port: int,
     channel_number: int = 1,
 ) -> JaxTransferWrapper:
+    """Return the singleton and reject attempts to rebind its endpoint."""
+
     global _GLOBAL_WRAPPER
     with _GLOBAL_LOCK:
         if _GLOBAL_WRAPPER is None:

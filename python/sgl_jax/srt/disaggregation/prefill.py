@@ -165,6 +165,16 @@ class PrefillBootstrapQueue:
                     out.append(self._entries.pop(req_id))
         return out
 
+    def cancel_matching(self, rid_prefix: str, abort_all: bool) -> list[PrefillBookkeeping]:
+        """Return matching entries without releasing their owned KV pages."""
+
+        with self._lock:
+            return [
+                entry
+                for req_id, entry in self._entries.items()
+                if abort_all or req_id.startswith(rid_prefix)
+            ]
+
 
 class SchedulerDisaggregationPrefillMixin:
     """Mixin for PD prefill mode on Scheduler."""
@@ -224,6 +234,15 @@ class SchedulerDisaggregationPrefillMixin:
         self.set_next_batch_sampling_info_done(batch)
 
         chunked_now = tuple(r for r in getattr(self, "chunked_reqs", ()) if r is not None)
+        ready_to_transfer = [
+            req
+            for req in pd_reqs
+            if not any(req is chunked_req for chunked_req in chunked_now)
+            and req.rid not in self.disagg_prefill_queue._entries
+        ]
+        if ready_to_transfer:
+            kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
+            self.disagg_kv_manager.prepare_prefill_batch(kv_pool.kv_buffer)
         for req in batch.reqs:
             if req.bootstrap_room is None:
                 continue
@@ -311,19 +330,17 @@ class SchedulerDisaggregationPrefillMixin:
         ts.mark(name)
 
     def _extract_req_block_ids(self: Scheduler, req: Req) -> list[int]:
-        import numpy as _np
+        from sgl_jax.srt.disaggregation.base.transfer import slots_to_page_ids
 
         req_to_token = self.req_to_token_pool.req_to_token
         kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
         page_size = kv_pool.page_size
         seqlen = len(req.origin_input_ids)
-        num_pages = (seqlen + page_size - 1) // page_size
-        page_id_source = req_to_token[
+        slot_source = req_to_token[
             req.req_pool_idx,
-            : num_pages * page_size : page_size,
+            :seqlen,
         ]
-        page_ids = _np.asarray(page_id_source) // page_size
-        return [int(p) for p in page_ids]
+        return list(slots_to_page_ids(slot_source, page_size, seqlen))
 
     def _extract_req_kv(self: Scheduler, req: Req):
         """Gather prefilled KV from the paged pool for ``req``.

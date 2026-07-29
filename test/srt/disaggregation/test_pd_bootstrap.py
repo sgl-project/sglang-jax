@@ -78,6 +78,21 @@ def test_registry_register_list_get(server_and_client):
     assert info["bootstrap_key"] == "p0"
 
 
+def test_bootstrap_advertises_transfer_metadata_capability(server_and_client):
+    _, client = server_and_client
+    client.require_capability("transfer_metadata")
+
+
+def test_bootstrap_rejects_missing_required_capability():
+    client = BootstrapClient("http://old-bootstrap")
+    response = mock.MagicMock()
+    response.json.return_value = {"status": "ok"}
+    client._client.get = mock.MagicMock(return_value=response)
+
+    with pytest.raises(RuntimeError, match="upgrade the bootstrap"):
+        client.require_capability("transfer_metadata")
+
+
 def test_register_multiple_room_hashing(server_and_client):
     _, client = server_and_client
     for i in range(3):

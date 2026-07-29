@@ -105,6 +105,11 @@ class Engine(EngineBase):
             else:
                 server_args = ServerArgs(**kwargs)
 
+        if getattr(server_args, "disaggregation_use_raiden", False):
+            from sgl_jax.raiden import require_raiden_preloaded
+
+            require_raiden_preloaded()
+
         # Shutdown the subprocesses automatically when the program exits
         atexit.register(self.shutdown)
 

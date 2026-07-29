@@ -47,6 +47,7 @@ class DecodeBookkeeping:
     # Prefill-side info from bootstrap, stashed at intake so KV alloc +
     # receiver setup can be deferred to the capacity-gated admission step.
     p_info: dict | None = None
+    cancelled: bool = False
     created_at: float = field(default_factory=time.monotonic)
 
 
@@ -130,6 +131,17 @@ class DecodeTransferQueue:
             for rid in list(self._entries):
                 if abort_all or rid.startswith(rid_prefix):
                     out.append(self._entries.pop(rid))
+        return out
+
+    def cancel_matching(self, rid_prefix: str, abort_all: bool) -> list[DecodeBookkeeping]:
+        """Mark matching transfers cancelled while retaining their KV pages."""
+
+        out: list[DecodeBookkeeping] = []
+        with self._lock:
+            for rid, entry in self._entries.items():
+                if abort_all or rid.startswith(rid_prefix):
+                    entry.cancelled = True
+                    out.append(entry)
         return out
 
 
@@ -262,6 +274,8 @@ class SchedulerDisaggregationDecodeMixin:
                 self._pd_pending_bootstrap.append(req)
                 continue
 
+            req.disagg_peer_process_index = int(p_info.get("jax_process_index", 0))
+
             try:
                 from sgl_jax.srt.disaggregation.bootstrap import (
                     check_prefill_compat,
@@ -327,6 +341,10 @@ class SchedulerDisaggregationDecodeMixin:
                 except Exception:
                     logger.exception("receiver.poll() raised for req_id=%s", entry.req_id)
                     state = KVPoll.FAILED
+            if entry.cancelled:
+                if entry.kv_indices is not None:
+                    self._release_decode_kv_indices(entry.kv_indices)
+                continue
             if state == KVPoll.SUCCESS:
                 try:
                     entry.receiver.commit(
@@ -357,7 +375,11 @@ class SchedulerDisaggregationDecodeMixin:
                     )
                     if entry.kv_indices is not None:
                         self._release_decode_kv_indices(entry.kv_indices)
-                    self._abort_decode_request(entry.req, "kv_writeback")
+                    self._abort_decode_request(
+                        entry.req,
+                        "kv_writeback",
+                        cleanup_transfer=False,
+                    )
             else:
                 logger.warning(
                     "KVReceiver for req_id=%s reached %s; releasing resources and aborting request",
@@ -367,7 +389,11 @@ class SchedulerDisaggregationDecodeMixin:
                 self._record_decode_transfer_failure("receiver_terminal_failed")
                 if entry.kv_indices is not None:
                     self._release_decode_kv_indices(entry.kv_indices)
-                self._abort_decode_request(entry.req, "receiver_terminal_failed")
+                self._abort_decode_request(
+                    entry.req,
+                    "receiver_terminal_failed",
+                    cleanup_transfer=False,
+                )
 
     def _pick_prefill_peer_for_this_host(self: Scheduler) -> dict[str, object]:
         """Multi-host: find the P host whose jax_process_index matches ours.
@@ -485,6 +511,9 @@ class SchedulerDisaggregationDecodeMixin:
                         page_size=page_size,
                         prompt_tokens=len(entry.req.origin_input_ids),
                         spec_factory=lambda req=entry.req: self._build_kv_spec_for_req(req),
+                        direct_commit=lambda expected, req=entry.req, indices=kv_indices: (
+                            self._commit_direct_received_kv(req, indices, expected)
+                        ),
                     )
                 )
             except Exception:
@@ -575,6 +604,27 @@ class SchedulerDisaggregationDecodeMixin:
         self._maybe_log_decode_pull_debug(req, kv)
         self._write_kv_to_pool(req, kv_indices, kv)
         self._record_decode_transfer_bytes(kv)
+
+    def _commit_direct_received_kv(
+        self: Scheduler,
+        req: Req,
+        kv_indices,
+        expected_debug: dict[str, object] | None,
+    ) -> None:
+        """Record a backend that wrote the destination KV pages directly."""
+
+        kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
+        num_pages = (len(req.origin_input_ids) + kv_pool.page_size - 1) // kv_pool.page_size
+        total = 0
+        for layer in kv_pool.kv_buffer:
+            total += num_pages * (int(layer.nbytes) // int(layer.shape[0]))
+        with suppress(Exception):
+            from sgl_jax.srt.disaggregation.common.metrics import (
+                PD_TRANSFER_BYTES_TOTAL,
+            )
+
+            PD_TRANSFER_BYTES_TOTAL.labels(direction="h2d", role="decode").inc(total)
+        self._maybe_verify_direct_receive_debug(req, kv_indices, expected_debug)
 
     def _write_kv_to_pool(self: Scheduler, req: Req, kv_indices, kv: jax.Array) -> None:
         """Write pulled KV into the local paged pool (in place)."""
@@ -687,14 +737,23 @@ class SchedulerDisaggregationDecodeMixin:
                 req.rid,
             )
 
-    def _abort_decode_request(self: Scheduler, req: Req, reason: str) -> None:
+    def _abort_decode_request(
+        self: Scheduler,
+        req: Req,
+        reason: str,
+        *,
+        cleanup_transfer: bool = True,
+    ) -> None:
         """Release resources AND send AbortReq back to tokenizer."""
 
         manager = getattr(self, "disagg_kv_manager", None)
         room = getattr(req, "bootstrap_room", None)
-        if manager is not None:
+        if manager is not None and cleanup_transfer:
             with suppress(Exception):
-                manager.cleanup_transfer(room)
+                manager.cleanup_transfer(
+                    room,
+                    jax_process_index=getattr(req, "disagg_peer_process_index", None),
+                )
         self._release_decode_req_resources(req)
         try:
             from sgl_jax.srt.managers.io_struct import AbortReq
@@ -806,4 +865,87 @@ class SchedulerDisaggregationDecodeMixin:
             expected.sample_page_digests(),
             actual.sample_page_digests(),
             page_ids_padded.tolist(),
+        )
+
+    def _maybe_verify_direct_receive_debug(
+        self: Scheduler,
+        req: Req,
+        kv_indices,
+        expected_metadata: dict[str, object] | None,
+    ) -> None:
+        from jax.sharding import NamedSharding, PartitionSpec
+
+        from sgl_jax.srt.disaggregation.base.transfer import slots_to_page_ids
+        from sgl_jax.srt.disaggregation.debug_utils import (
+            KVDebugSnapshot,
+            build_kv_debug_snapshot,
+            count_kv_debug_mismatches,
+            find_first_kv_debug_mismatch,
+            kv_debug_enabled,
+        )
+        from sgl_jax.srt.disaggregation.prefill import _jit_gather_all_layers
+
+        if not kv_debug_enabled(req.rid):
+            return
+
+        kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
+        page_ids = np.asarray(
+            slots_to_page_ids(kv_indices, kv_pool.page_size, len(req.origin_input_ids)),
+            dtype=np.int32,
+        )
+        page_ids_jax = jax.device_put(
+            page_ids,
+            NamedSharding(kv_pool.mesh, PartitionSpec(None)),
+        )
+        gather_out_sharding = NamedSharding(
+            kv_pool.mesh,
+            PartitionSpec(None, *kv_pool.kv_sharding.spec[1:]),
+        )
+        layer_buffers = [
+            kv_pool.get_kv_buffer(layer_id)
+            for layer_id in range(
+                kv_pool.start_layer,
+                kv_pool.start_layer + kv_pool.layer_num,
+            )
+        ]
+        readback = jnp.stack(
+            _jit_gather_all_layers(layer_buffers, page_ids_jax, gather_out_sharding),
+            axis=0,
+        )
+        actual = build_kv_debug_snapshot(readback)
+        if expected_metadata is None:
+            logger.warning(
+                "PD-KV-DEBUG raiden_direct req_id=%s digest=%s sample=%s "
+                "expected=missing page_ids=%s",
+                req.rid,
+                actual.global_digest,
+                actual.sample_page_digests(),
+                page_ids.tolist(),
+            )
+            return
+
+        expected = KVDebugSnapshot(
+            shape=tuple(int(value) for value in expected_metadata.get("shape", ())),
+            dtype=str(expected_metadata.get("dtype", "")),
+            sharding="prefill",
+            global_digest=str(expected_metadata.get("global_digest", "")),
+            page_digests=tuple(
+                tuple(str(digest) for digest in row)
+                for row in expected_metadata.get("page_digests", ())
+            ),
+        )
+        mismatch_count = count_kv_debug_mismatches(expected, actual)
+        first_mismatch = find_first_kv_debug_mismatch(expected, actual)
+        logger.warning(
+            "PD-KV-DEBUG raiden_direct req_id=%s expected_digest=%s "
+            "readback_digest=%s mismatch_count=%d first_mismatch=%s "
+            "expected_sample=%s readback_sample=%s page_ids=%s",
+            req.rid,
+            expected.global_digest,
+            actual.global_digest,
+            mismatch_count,
+            first_mismatch,
+            expected.sample_page_digests(),
+            actual.sample_page_digests(),
+            page_ids.tolist(),
         )

@@ -20,6 +20,7 @@ import threading
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
+from typing import Any
 
 import jax
 
@@ -195,6 +196,9 @@ class JaxTransferKVManager(CommonKVManager):
             raise RuntimeError("host KV pool is full")
         return buffer_id
 
+    def prepare_prefill_batch(self, kv_buffers: Any) -> None:  # noqa: ARG002
+        return
+
     def prefill_transport_metadata(self) -> dict[str, object]:
         return {"engine": self.engine_name}
 
@@ -221,6 +225,8 @@ class JaxTransferKVManager(CommonKVManager):
             raise
         return PrefillTransfer(
             sender=sender,
+            # Host staging owns a copy; multi-process gather also produces a
+            # separate local buffer. Both can release paged-pool HBM early.
             release_device_kv=self._use_d2h_staging or jax.process_count() > 1,
         )
 
@@ -243,7 +249,12 @@ class JaxTransferKVManager(CommonKVManager):
             raise
         return DecodeAdmission.admitted(receiver)
 
-    def cleanup_transfer(self, bootstrap_room: int | None) -> None:  # noqa: ARG002
+    def cleanup_transfer(
+        self,
+        bootstrap_room: int | None,
+        *,
+        jax_process_index: int | None = None,  # noqa: ARG002
+    ) -> None:  # noqa: ARG002
         return
 
     # ------------------------------------------------------------------

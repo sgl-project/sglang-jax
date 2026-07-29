@@ -117,6 +117,11 @@ def _create_raiden_backend(
         raise ValueError("Raiden and D2H staging select different transfer engines")
     if server_args.disaggregation_max_inflight_transfers <= 0:
         raise ValueError("Raiden requires max_inflight_transfers > 0")
+    if not getattr(server_args, "disable_radix_cache", False):
+        raise ValueError("Raiden requires --disable-radix-cache")
+    if bootstrap_client is None or not hasattr(bootstrap_client, "require_capability"):
+        raise RuntimeError("Raiden requires a bootstrap client with capability probing")
+    bootstrap_client.require_capability("transfer_metadata")
 
     from sgl_jax.raiden import require_raiden_preloaded
 

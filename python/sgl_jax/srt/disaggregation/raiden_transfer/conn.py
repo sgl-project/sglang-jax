@@ -3,17 +3,15 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any
 
 import jax
-import numpy as np
 
 from sgl_jax.srt.disaggregation.base.kv_manager import (
     KVPoll,
@@ -26,6 +24,7 @@ from sgl_jax.srt.disaggregation.base.transfer import (
     DecodeTransferContext,
     PrefillTransfer,
     PrefillTransferContext,
+    slots_to_page_ids,
 )
 from sgl_jax.srt.disaggregation.common.core import CommonKVManager
 from sgl_jax.srt.disaggregation.common.metrics import (
@@ -44,6 +43,90 @@ def _uuid_to_int(value: str) -> int:
     return int.from_bytes(digest, "big") & ((1 << 50) - 1)
 
 
+def _normalize_peer_endpoint(endpoint: object, peer_host: str) -> str:
+    value = str(endpoint)
+    try:
+        host, port_text = value.rsplit(":", 1)
+        port = int(port_text)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"invalid Raiden endpoint: {value!r}") from exc
+    if not 0 < port <= 65535:
+        raise ValueError(f"invalid Raiden endpoint port: {port}")
+    host = host.strip("[]")
+    if host in {"", "0.0.0.0", "127.0.0.1", "::", "::1", "localhost"}:
+        host = peer_host
+    if ":" in host:
+        host = f"[{host}]"
+    return f"{host}:{port}"
+
+
+def _endpoint_descriptors(
+    endpoints: object,
+    *,
+    peer_host: str,
+) -> list[dict[str, object]]:
+    if not isinstance(endpoints, list) or not endpoints:
+        raise ValueError("Raiden peer did not publish endpoint descriptors")
+    descriptors: list[dict[str, object]] = []
+    for item in endpoints:
+        if not isinstance(item, Mapping):
+            raise TypeError("Raiden endpoint descriptor must be a mapping")
+        shards = item.get("shards", [])
+        if not isinstance(shards, list):
+            raise TypeError("Raiden endpoint shards must be a list")
+        descriptors.append(
+            {
+                "endpoint": _normalize_peer_endpoint(item.get("endpoint", ""), peer_host),
+                "shards": [int(shard) for shard in shards],
+            }
+        )
+    return descriptors
+
+
+def _validate_endpoint_topology(
+    peer_endpoints: list[dict[str, object]],
+    local_endpoints: list[object],
+) -> None:
+    if not local_endpoints:
+        raise RuntimeError("local Raiden engine did not publish endpoints")
+    if len(peer_endpoints) == len(local_endpoints) == 1:
+        return
+
+    def _shards(items: list[object]) -> set[int]:
+        out: set[int] = set()
+        for item in items:
+            if not isinstance(item, Mapping):
+                raise TypeError("Raiden endpoint descriptor must be a mapping")
+            values = item.get("shards", [])
+            if not isinstance(values, list):
+                raise TypeError("Raiden endpoint shards must be a list")
+            out.update(int(value) for value in values)
+        return out
+
+    peer_shards = _shards(list(peer_endpoints))
+    local_shards = _shards(local_endpoints)
+    if not peer_shards or peer_shards != local_shards:
+        raise ValueError(
+            "Raiden endpoint shard topology mismatch: "
+            f"prefill={sorted(peer_shards)}, decode={sorted(local_shards)}"
+        )
+
+
+def _debug_metadata(payload: dict[str, Any], num_blocks: int) -> dict[str, object]:
+    from sgl_jax.srt.disaggregation.debug_utils import build_kv_debug_snapshot
+
+    kv = payload.get("kv")
+    if not isinstance(kv, (list, tuple)):
+        raise TypeError("Raiden debug payload must contain per-layer KV arrays")
+    snapshot = build_kv_debug_snapshot([layer[:num_blocks] for layer in kv])
+    return {
+        "shape": list(snapshot.shape),
+        "dtype": snapshot.dtype,
+        "global_digest": snapshot.global_digest,
+        "page_digests": [list(row) for row in snapshot.page_digests],
+    }
+
+
 @dataclass(frozen=True)
 class RaidenMetadata:
     uuid: str
@@ -52,6 +135,8 @@ class RaidenMetadata:
     local_block_ids: tuple[int, ...]
     bootstrap_room: int | None
     jax_process_index: int = 0
+    direct_commit: Callable[[Mapping[str, object] | None], None] | None = None
+    expected_debug: Mapping[str, object] | None = None
 
 
 class RaidenTransferKVManager(CommonKVManager):
@@ -83,6 +168,11 @@ class RaidenTransferKVManager(CommonKVManager):
     def reserve_prefill_buffer(self, existing: int | None) -> int | None:
         return existing
 
+    def prepare_prefill_batch(self, kv_buffers: Any) -> None:
+        # Raiden reads raw PJRT buffer aliases outside the XLA program, so the
+        # serving layer must finish the donated KV writes before registration.
+        jax.block_until_ready(kv_buffers)
+
     def prefill_transport_metadata(self) -> dict[str, object]:
         endpoints = list(self.wrapper.endpoints or [])
         control_port = self.wrapper.control_port
@@ -99,12 +189,19 @@ class RaidenTransferKVManager(CommonKVManager):
     def start_prefill(self, context: PrefillTransferContext) -> PrefillTransfer:
         sender = self.create_sender(context.req_id)
         try:
-            jax.effects_barrier()
             sender.init(None, transfer_id=context.transfer_id)
+            block_ids = context.block_ids_factory()
             sender.attach_block_ids(
-                context.block_ids_factory(),
+                block_ids,
                 bootstrap_room=context.bootstrap_room,
             )
+            from sgl_jax.srt.disaggregation.debug_utils import kv_debug_enabled
+
+            if kv_debug_enabled(context.req_id):
+                payload = context.payload_factory()
+                if context.on_payload is not None:
+                    context.on_payload(payload)
+                sender.attach_debug_metadata(_debug_metadata(payload, len(block_ids)))
             if context.on_ready is not None:
                 context.on_ready()
             sender.send()
@@ -158,43 +255,22 @@ class RaidenTransferKVManager(CommonKVManager):
                 peer_metadata = context.peer_info
             if not isinstance(peer_metadata, dict):
                 raise TypeError("prefill transport_metadata must be a mapping")
-            peer_endpoints = peer_metadata.get("endpoints")
-            if peer_endpoints is None:
-                serialized_endpoints = peer_metadata.get("raiden_endpoints_json", "")
-                peer_endpoints = (
-                    json.loads(str(serialized_endpoints)) if serialized_endpoints else []
-                )
-            if not isinstance(peer_endpoints, list):
-                raise TypeError("Raiden endpoints must be a list")
-            base_port = int(peer_metadata.get("local_control_port", 0))
-            if peer_endpoints:
-                base_port = int(str(peer_endpoints[0]["endpoint"]).rsplit(":", 1)[1])
-            if not 0 < base_port <= 65535:
-                raise ValueError(f"invalid Raiden control port: {base_port}")
-
-            local_endpoints = list(self.wrapper.endpoints or [])
-            if peer_endpoints and len(peer_endpoints) != len(local_endpoints):
-                raise ValueError(
-                    "Raiden endpoint topology mismatch: "
-                    f"prefill={len(peer_endpoints)}, decode={len(local_endpoints)}"
-                )
             peer_host = str(context.peer_info["host"])
-            if len(local_endpoints) <= 1:
-                remote_endpoint: object = f"{peer_host}:{base_port}"
-            else:
-                # The structured form keeps each local sub-manager matched to
-                # the producer sub-manager serving the same shards.
-                remote_endpoint = [
-                    {
-                        "endpoint": f"{peer_host}:{base_port + index}",
-                        "shards": list(endpoint["shards"]),
-                    }
-                    for index, endpoint in enumerate(local_endpoints)
-                ]
+            peer_endpoints = _endpoint_descriptors(
+                peer_metadata.get("endpoints"),
+                peer_host=peer_host,
+            )
+            local_endpoints = list(self.wrapper.endpoints or [])
+            _validate_endpoint_topology(peer_endpoints, local_endpoints)
+            remote_endpoint: object = (
+                peer_endpoints[0]["endpoint"] if len(peer_endpoints) == 1 else peer_endpoints
+            )
 
-            kv_indices = np.asarray(context.kv_indices)
-            local_pages = kv_indices[:: context.page_size] // context.page_size
-            local_block_ids = tuple(int(v) for v in local_pages[: len(remote_block_ids)])
+            local_block_ids = slots_to_page_ids(
+                context.kv_indices,
+                context.page_size,
+                context.prompt_tokens,
+            )
             if len(local_block_ids) != len(remote_block_ids):
                 raise ValueError(
                     f"Raiden local block count mismatch: remote={len(remote_block_ids)}, "
@@ -210,6 +286,12 @@ class RaidenTransferKVManager(CommonKVManager):
                     local_block_ids=local_block_ids,
                     bootstrap_room=context.bootstrap_room,
                     jax_process_index=peer_process_index,
+                    direct_commit=context.direct_commit,
+                    expected_debug=(
+                        metadata.get("kv_debug")
+                        if isinstance(metadata.get("kv_debug"), Mapping)
+                        else None
+                    ),
                 )
             )
             return DecodeAdmission.admitted(receiver)
@@ -224,17 +306,29 @@ class RaidenTransferKVManager(CommonKVManager):
         req_id: str,
         transfer_id: str,
         block_ids: list[int],
-        bootstrap_room: int | None,
     ) -> bool:
-        needed = self.wrapper.register_read(req_id, _uuid_to_int(transfer_id), block_ids)
-        if bootstrap_room is not None:
-            self.bootstrap_client.register_transfer(
-                bootstrap_room,
-                transfer_id,
-                jax_process_index=jax.process_index(),
-                transport_metadata={"remote_block_ids": list(block_ids)},
-            )
-        return needed
+        if not block_ids:
+            raise ValueError("Raiden transfer requires at least one KV block")
+        return self.wrapper.register_read(req_id, _uuid_to_int(transfer_id), block_ids)
+
+    def publish_transfer(
+        self,
+        transfer_id: str,
+        block_ids: list[int],
+        bootstrap_room: int | None,
+        debug_metadata: Mapping[str, object] | None,
+    ) -> None:
+        if bootstrap_room is None:
+            return
+        transport_metadata: dict[str, object] = {"remote_block_ids": list(block_ids)}
+        if debug_metadata is not None:
+            transport_metadata["kv_debug"] = dict(debug_metadata)
+        self.bootstrap_client.register_transfer(
+            bootstrap_room,
+            transfer_id,
+            jax_process_index=jax.process_index(),
+            transport_metadata=transport_metadata,
+        )
 
     def cleanup_transfer(
         self,
@@ -262,6 +356,35 @@ class RaidenTransferKVManager(CommonKVManager):
             self._done_sending.update(sent)
             self._done_receiving.update(received)
             self._failed_receiving.update(failed)
+
+    def reap_once(self, now: float) -> tuple[list[str], list[str]]:
+        """Request logical cancellation without releasing engine-owned pages."""
+
+        timed_out_senders: list[str] = []
+        timed_out_receivers: list[str] = []
+        if self._ack_timeout_s > 0:
+            with self._senders_lock:
+                senders = list(self._senders.items())
+            for req_id, sender in senders:
+                started = getattr(sender, "transfer_started_at", None)
+                if (
+                    started is not None
+                    and now - started >= self._ack_timeout_s
+                    and sender.request_abort("timeout")
+                ):
+                    timed_out_senders.append(req_id)
+        if self._pull_timeout_s > 0:
+            with self._receivers_lock:
+                receivers = list(self._receivers.items())
+            for req_id, receiver in receivers:
+                started = getattr(receiver, "transfer_started_at", None)
+                if (
+                    started is not None
+                    and now - started >= self._pull_timeout_s
+                    and receiver.request_abort("timeout")
+                ):
+                    timed_out_receivers.append(req_id)
+        return timed_out_senders, timed_out_receivers
 
     def sender_done(self, req_id: str) -> bool:
         with self._poll_lock:
@@ -303,6 +426,8 @@ class RaidenTransferKVSender(KVSender, StateHolder):
         self._state_lock = threading.Lock()
         self._timer: object | None = None
         self._transfer_started_at: float | None = None
+        self._pending_failure_reason: str | None = None
+        self._debug_metadata: Mapping[str, object] | None = None
 
     @property
     def uuid(self) -> str:
@@ -322,20 +447,36 @@ class RaidenTransferKVSender(KVSender, StateHolder):
         self._block_ids = list(block_ids)
         self._bootstrap_room = bootstrap_room
 
+    def attach_debug_metadata(self, metadata: Mapping[str, object]) -> None:
+        self._debug_metadata = dict(metadata)
+
     def send(self) -> None:
         if self._block_ids is None:
             raise RuntimeError(f"sender {self._req_id!r} has no block IDs")
         with self._state_lock:
-            self._manager.register_read(
+            needed = self._manager.register_read(
                 self.uuid,
                 self.uuid,
                 self._block_ids,
-                self._bootstrap_room,
             )
             self._transition_to(KVPoll.TRANSFERRING)
-            self._timer = time_phase("ack", "prefill")
-            self._timer.__enter__()
-            self._transfer_started_at = time.monotonic()
+            if needed:
+                self._timer = time_phase("ack", "prefill")
+                self._timer.__enter__()
+                self._transfer_started_at = time.monotonic()
+        if not needed:
+            self._finish(KVPoll.SUCCESS, "raiden_transfer_not_needed")
+            return
+        try:
+            self._manager.publish_transfer(
+                self.uuid,
+                self._block_ids,
+                self._bootstrap_room,
+                self._debug_metadata,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Raiden transfer metadata publish failed for %s", self._req_id)
+            self.request_abort("bootstrap_register")
 
     def poll(self) -> KVPoll:
         with self._state_lock:
@@ -344,28 +485,17 @@ class RaidenTransferKVSender(KVSender, StateHolder):
         self._manager.poll_engine()
         if not self._manager.sender_done(self.uuid):
             return KVPoll.TRANSFERRING
-        with self._state_lock:
-            if self.state != KVPoll.TRANSFERRING:
-                return self.state
-            self._transition_to(KVPoll.SUCCESS)
-            self._finish_timer()
-            self._transfer_started_at = None
-            self._manager.record_terminal(
-                self._req_id,
-                role="prefill",
-                transfer_id=self.uuid,
-                state=KVPoll.SUCCESS,
-                reason="raiden_done_sending",
-            )
-        self._manager.forget(self.uuid)
-        self._manager._prune_sender(self._req_id)
-        return KVPoll.SUCCESS
+        reason = self._pending_failure_reason
+        return self._finish(
+            KVPoll.FAILED if reason is not None else KVPoll.SUCCESS,
+            reason or "raiden_done_sending",
+        )
 
     def clear(self) -> None:
         self._manager._clear_terminal_record(self._req_id, role="prefill")
 
     def abort(self) -> None:
-        self.fail(reason="abort")
+        self.request_abort("abort")
 
     def failure_exception(self) -> None:
         record = self._manager.get_terminal_record(self._req_id, role="prefill")
@@ -374,24 +504,42 @@ class RaidenTransferKVSender(KVSender, StateHolder):
         raise RuntimeError(f"Prefill transfer failed for {self._req_id!r}: {record.reason}")
 
     def fail(self, *, reason: str = "sender_fail") -> None:
+        self.request_abort(reason)
+
+    def request_abort(self, reason: str) -> bool:
+        finish_now = False
         with self._state_lock:
             if self.state in (KVPoll.SUCCESS, KVPoll.FAILED):
-                return
-            self._transition_to(KVPoll.FAILED)
+                return False
+            if self._pending_failure_reason is not None:
+                return False
+            self._pending_failure_reason = reason
+            finish_now = self.state != KVPoll.TRANSFERRING
+        if finish_now:
+            self._finish(KVPoll.FAILED, reason)
+        return True
+
+    def _finish(self, state: KVPoll, reason: str) -> KVPoll:
+        with self._state_lock:
+            if self.state in (KVPoll.SUCCESS, KVPoll.FAILED):
+                return self.state
+            self._transition_to(state)
             self._finish_timer()
             self._transfer_started_at = None
             self._manager.record_terminal(
                 self._req_id,
                 role="prefill",
                 transfer_id=self.uuid,
-                state=KVPoll.FAILED,
+                state=state,
                 reason=reason,
             )
         self._manager.forget(self.uuid)
         self._manager.cleanup_transfer(self._bootstrap_room)
-        with suppress(Exception):
-            PD_TRANSFER_FAILURES_TOTAL.labels(reason=reason, role="prefill").inc()
+        if state == KVPoll.FAILED:
+            with suppress(Exception):
+                PD_TRANSFER_FAILURES_TOTAL.labels(reason=reason, role="prefill").inc()
         self._manager._prune_sender(self._req_id)
+        return state
 
     def _finish_timer(self) -> None:
         timer = self._timer
@@ -411,6 +559,7 @@ class RaidenTransferKVReceiver(KVReceiver, StateHolder):
         self._started = False
         self._timer: object | None = None
         self._transfer_started_at: float | None = None
+        self._pending_failure_reason: str | None = None
 
     @property
     def transfer_started_at(self) -> float | None:
@@ -446,7 +595,7 @@ class RaidenTransferKVReceiver(KVReceiver, StateHolder):
                     )
                 except Exception:  # noqa: BLE001
                     logger.exception("Raiden start_read() failed for %s", self._req_id)
-                    self.fail(reason="raiden_start_read")
+                    self._finish(KVPoll.FAILED, "raiden_start_read")
             return self.state
 
         if state == KVPoll.TRANSFERRING:
@@ -456,38 +605,29 @@ class RaidenTransferKVReceiver(KVReceiver, StateHolder):
             if remote_state is None:
                 return self.state
             if remote_state == "failed":
-                self.fail(reason="raiden_failed_receiving")
-                return self.state
-            with self._state_lock:
-                if self.state != KVPoll.TRANSFERRING:
-                    return self.state
-                self._transition_to(KVPoll.SUCCESS)
-                self._finish_timer()
-                self._transfer_started_at = None
-                self._manager.record_terminal(
-                    self._req_id,
-                    role="decode",
-                    transfer_id=self._metadata.uuid,
-                    state=KVPoll.SUCCESS,
-                    reason="raiden_done_receiving",
+                return self._finish(
+                    KVPoll.FAILED,
+                    self._pending_failure_reason or "raiden_failed_receiving",
                 )
-            self._manager.forget(self._metadata.uuid)
-            self._manager.cleanup_transfer(
-                self._metadata.bootstrap_room,
-                jax_process_index=self._metadata.jax_process_index,
+            reason = self._pending_failure_reason
+            return self._finish(
+                KVPoll.FAILED if reason is not None else KVPoll.SUCCESS,
+                reason or "raiden_done_receiving",
             )
-            self._manager._prune_receiver(self._req_id)
         return self.state
 
     def commit(self, install: Callable[[Any], None]) -> None:  # noqa: ARG002
         if self.state != KVPoll.SUCCESS:
             raise RuntimeError("cannot commit an incomplete Raiden receive")
+        assert self._metadata is not None
+        if self._metadata.direct_commit is not None:
+            self._metadata.direct_commit(self._metadata.expected_debug)
 
     def clear(self) -> None:
         self._manager._clear_terminal_record(self._req_id, role="decode")
 
     def abort(self) -> None:
-        self.fail(reason="abort")
+        self.request_abort("abort")
 
     def failure_exception(self) -> None:
         record = self._manager.get_terminal_record(self._req_id, role="decode")
@@ -496,13 +636,26 @@ class RaidenTransferKVReceiver(KVReceiver, StateHolder):
         raise RuntimeError(f"Decode transfer failed for {self._req_id!r}: {record.reason}")
 
     def fail(self, *, reason: str = "receiver_fail") -> None:
+        self.request_abort(reason)
+
+    def request_abort(self, reason: str) -> bool:
+        finish_now = False
         with self._state_lock:
             if self.state in (KVPoll.SUCCESS, KVPoll.FAILED):
-                return
-            try:
-                self._transition_to(KVPoll.FAILED)
-            except ValueError:
-                return
+                return False
+            if self._pending_failure_reason is not None:
+                return False
+            self._pending_failure_reason = reason
+            finish_now = self.state != KVPoll.TRANSFERRING
+        if finish_now:
+            self._finish(KVPoll.FAILED, reason)
+        return True
+
+    def _finish(self, state: KVPoll, reason: str) -> KVPoll:
+        with self._state_lock:
+            if self.state in (KVPoll.SUCCESS, KVPoll.FAILED):
+                return self.state
+            self._transition_to(state)
             self._finish_timer()
             self._transfer_started_at = None
             metadata = self._metadata
@@ -511,7 +664,7 @@ class RaidenTransferKVReceiver(KVReceiver, StateHolder):
                 self._req_id,
                 role="decode",
                 transfer_id=transfer_id,
-                state=KVPoll.FAILED,
+                state=state,
                 reason=reason,
             )
         self._manager.forget(transfer_id)
@@ -519,9 +672,11 @@ class RaidenTransferKVReceiver(KVReceiver, StateHolder):
             metadata.bootstrap_room if metadata else None,
             jax_process_index=metadata.jax_process_index if metadata else None,
         )
-        with suppress(Exception):
-            PD_TRANSFER_FAILURES_TOTAL.labels(reason=reason, role="decode").inc()
+        if state == KVPoll.FAILED:
+            with suppress(Exception):
+                PD_TRANSFER_FAILURES_TOTAL.labels(reason=reason, role="decode").inc()
         self._manager._prune_receiver(self._req_id)
+        return state
 
     def _finish_timer(self) -> None:
         timer = self._timer

@@ -22,6 +22,7 @@ HEARTBEAT_TTL_SECONDS = 30.0
 # Beat at ~TTL/3 so a single missed beat doesn't evict the entry.
 HEARTBEAT_INTERVAL_SECONDS = HEARTBEAT_TTL_SECONDS / 3.0
 TRANSFER_METADATA_TTL_SECONDS = 300.0
+BOOTSTRAP_CAPABILITIES = ("transfer_metadata",)
 
 # PD wire protocol version. Bump when ``PrefillInfo``
 # or any of the 4 endpoint payloads change shape.
@@ -304,8 +305,12 @@ def build_app(
             return await call_next(request)
 
     @app.get("/health")
-    def health() -> dict[str, str]:
-        return {"status": "ok"}
+    def health() -> dict[str, object]:
+        return {
+            "status": "ok",
+            "protocol_version": PROTOCOL_VERSION,
+            "capabilities": list(BOOTSTRAP_CAPABILITIES),
+        }
 
     @app.post("/register_prefill")
     def register_prefill(req: RegisterPrefillRequest) -> dict[str, str]:
@@ -513,6 +518,16 @@ class BootstrapClient:
     def health(self) -> bool:
         r = self._client.get(f"{self._base_url}/health", timeout=self._timeout_s)
         return r.status_code == 200
+
+    def require_capability(self, capability: str) -> None:
+        r = self._client.get(f"{self._base_url}/health", timeout=self._timeout_s)
+        r.raise_for_status()
+        capabilities = r.json().get("capabilities", [])
+        if capability not in capabilities:
+            raise RuntimeError(
+                f"bootstrap at {self._base_url} does not advertise required "
+                f"capability {capability!r}; upgrade the bootstrap service"
+            )
 
     def register_prefill(
         self,

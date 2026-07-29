@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -27,6 +25,7 @@ from sgl_jax.srt.disaggregation.jax_transfer.conn import (
 from sgl_jax.srt.disaggregation.jax_transfer.wrapper import JaxTransferWrapper
 from sgl_jax.srt.disaggregation.prefill import (
     _KV_GATHER_PAGE_BUCKETS,
+    PrefillBootstrapQueue,
     _jit_gather_all_layers,
     _jit_gather_one_layer,
     _pad_to_page_bucket,
@@ -99,6 +98,17 @@ def test_path_b_send_keeps_device_payload():
     # Path B pulls straight from HBM; the payload must stay alive until ack.
     assert sender._payload is payload
     assert sender.poll() == KVPoll.TRANSFERRING
+
+
+def test_cancel_matching_retains_prefill_entry_until_sender_terminal():
+    queue = PrefillBootstrapQueue()
+    _, sender = _make_sender()
+    queue.add("req-a", sender, on_terminal=object())
+
+    cancelled = queue.cancel_matching("req-a", abort_all=False)
+
+    assert [entry.req_id for entry in cancelled] == ["req-a"]
+    assert len(queue) == 1
 
 
 def test_staging_send_handoff_failure_unregisters_and_keeps_payload():

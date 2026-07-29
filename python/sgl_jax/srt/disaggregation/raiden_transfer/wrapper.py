@@ -86,6 +86,8 @@ class RaidenTransferWrapper:
                 num_slots=int(num_slots),
                 timeout_s=float(timeout_s),
                 parallelism=self._parallelism,
+                # A manager-lifetime PJRT hold would block serving compute;
+                # request pages stay owned until Raiden reports terminal.
                 unsafe_skip_buffer_lock=True,
             )
             self._endpoints = self._engine.get_local_endpoints()

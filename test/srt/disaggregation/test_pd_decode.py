@@ -585,6 +585,18 @@ def test_inflight_cap_recovers_after_transfer_drains():
     assert len(sched.disagg_prealloc_queue) == 0
 
 
+def test_cancel_matching_retains_inflight_entry_until_terminal():
+    queue = DecodeTransferQueue()
+    entry = DecodeBookkeeping(req_id="a", req=_AdmReq("a", 4), receiver=object())
+    queue.add(entry)
+
+    cancelled = queue.cancel_matching("a", abort_all=False)
+
+    assert cancelled == [entry]
+    assert entry.cancelled is True
+    assert len(queue) == 1
+
+
 # ---- from test_pd_decode_bootstrap_cache.py ----
 
 
