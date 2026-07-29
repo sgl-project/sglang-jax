@@ -294,12 +294,15 @@ class BaseSpecWorker:
             # legacy recurrent draft loop. Steady-state rounds consume the chain
             # produced by the previous fused recurrent draft-extend without
             # launching more draft forwards here.
-            self.draft_worker.draft(model_worker_batch)
+            draft_to_target_token_ids = self.draft_worker.prepare_for_fused_verify(
+                model_worker_batch
+            )
             batch_output = spec_decode_verify(
                 self,
                 model_worker_batch,
                 cur_allocate_lens,
-                prebuilt_verify_inputs=True,
+                draft_to_target_token_ids=draft_to_target_token_ids,
+                draft_padding_prepared=True,
             )
             eagle3_recurrent_draft_extend_for_decode(
                 self.draft_worker,

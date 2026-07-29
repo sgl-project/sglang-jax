@@ -197,6 +197,18 @@ class EagleDraftWorker(BaseDraftWorker):
             draft_token_num=self.speculative_num_draft_tokens,
         )
 
+    def prepare_for_fused_verify(self, model_worker_batch: ModelWorkerBatch):
+        """Prepare only the token chain; fused verify builds tree inputs in-JIT."""
+        topk_index = model_worker_batch.spec_info_padded.topk_index
+        has_raw_recurrent_chain = self._has_precomputed_recurrent_chain(topk_index)
+        self.padding_for_decode(
+            model_worker_batch,
+            map_hot_token_ids=not has_raw_recurrent_chain,
+        )
+        _, token_list, _ = self.draft_forward(model_worker_batch)
+        model_worker_batch.spec_info_padded.topk_index = token_list
+        return self.hot_token_ids if has_raw_recurrent_chain else None
+
     def draft_extend_for_prefill(
         self,
         model_worker_batch: ModelWorkerBatch,
@@ -326,7 +338,12 @@ class EagleDraftWorker(BaseDraftWorker):
         draft_input.topk_index = topk_index
         draft_input.hidden_states = hidden
 
-    def padding_for_decode(self, model_worker_batch: ModelWorkerBatch):
+    def padding_for_decode(
+        self,
+        model_worker_batch: ModelWorkerBatch,
+        *,
+        map_hot_token_ids: bool = True,
+    ):
         # At dp>1 the incoming mwb is already DP-padded to total_bs (== a bucket
         # value, see _get_spec_decode_mwb_dp); use the larger of real_bs and the
         # incoming seq_lens length so we don't shrink below the DP layout.
@@ -393,7 +410,7 @@ class EagleDraftWorker(BaseDraftWorker):
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
 
         topk_index = spec_info.topk_index
-        if self.hot_token_ids is not None:
+        if map_hot_token_ids and self.hot_token_ids is not None:
             model_worker_batch.spec_info_padded.topk_index = self._map_hot_token_ids(topk_index)
         if self.topk > 1:
             self.draft_model_runner.attn_backend.forward_metadata.custom_mask = (
@@ -451,9 +468,9 @@ class EagleDraftWorker(BaseDraftWorker):
         )
         if self._has_precomputed_recurrent_chain(topk_index):
             # The fused recurrent draft-extend already ran every EAGLE3 step in
-            # the previous round. Keep draft() as the lightweight verify-input
-            # builder instead of forwarding the draft model again.
-            return None, topk_index.astype(jnp.int32), None
+            # the previous round. Keep the raw draft-vocabulary ids unchanged;
+            # fused verify maps and packs the chain inside its own JIT.
+            return None, topk_index, None
 
         bs = model_worker_batch.seq_lens.shape[0]
         step_min_1 = self.speculative_num_steps - 1

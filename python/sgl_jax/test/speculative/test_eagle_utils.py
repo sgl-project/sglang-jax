@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import Mock
 
 import jax
 import jax.numpy as jnp
@@ -198,6 +199,94 @@ class TestVerifyTree(CustomTestCase):
         self.assertIsNone(scores)
         self.assertIsNone(parents)
         np.testing.assert_array_equal(np.asarray(tokens), np.asarray(token_chain))
+
+    def test_fused_verify_preparation_keeps_recurrent_chain_raw(self):
+        from types import SimpleNamespace
+
+        from sgl_jax.srt.speculative.eagle_draft_worker import EagleDraftWorker
+        from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        worker = object.__new__(EagleDraftWorker)
+        worker.speculative_algorithm = SpeculativeAlgorithm.EAGLE3
+        worker.speculative_num_steps = 3
+        worker.topk = 1
+        worker.hot_token_ids = object()
+        worker.padding_for_decode = Mock()
+        token_chain = jnp.array([[11, 12, 13], [21, 22, 23]], dtype=jnp.int32)
+        worker.draft_forward = Mock(return_value=(None, token_chain, None))
+        batch = SimpleNamespace(
+            spec_info_padded=SimpleNamespace(topk_index=token_chain),
+        )
+
+        mapping = worker.prepare_for_fused_verify(batch)
+
+        self.assertIs(mapping, worker.hot_token_ids)
+        self.assertIs(batch.spec_info_padded.topk_index, token_chain)
+        worker.padding_for_decode.assert_called_once_with(
+            batch,
+            map_hot_token_ids=False,
+        )
+
+    def test_fused_verify_bootstrap_chain_is_already_mapped(self):
+        from types import SimpleNamespace
+
+        from sgl_jax.srt.speculative.eagle_draft_worker import EagleDraftWorker
+        from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        worker = object.__new__(EagleDraftWorker)
+        worker.speculative_algorithm = SpeculativeAlgorithm.EAGLE3
+        worker.speculative_num_steps = 3
+        worker.topk = 1
+        worker.hot_token_ids = object()
+        worker.padding_for_decode = Mock()
+        seed = jnp.array([[11], [21]], dtype=jnp.int32)
+        mapped_chain = jnp.array([[101, 102, 103], [201, 202, 203]], dtype=jnp.int32)
+        worker.draft_forward = Mock(return_value=(None, mapped_chain, None))
+        batch = SimpleNamespace(
+            spec_info_padded=SimpleNamespace(topk_index=seed),
+        )
+
+        mapping = worker.prepare_for_fused_verify(batch)
+
+        self.assertIsNone(mapping)
+        self.assertIs(batch.spec_info_padded.topk_index, mapped_chain)
+        worker.padding_for_decode.assert_called_once_with(
+            batch,
+            map_hot_token_ids=True,
+        )
+
+    def test_fused_verify_maps_and_builds_recurrent_chain_in_one_jit(self):
+        from sgl_jax.srt.speculative.draft_extend_fused import (
+            _build_chain_verify_arrays,
+            _map_eagle3_token_ids,
+        )
+
+        @jax.jit
+        def prepare_chain(verified_id, raw_chain, seq_lens, hot_token_ids):
+            mapped_chain = _map_eagle3_token_ids(raw_chain, hot_token_ids)
+            return _build_chain_verify_arrays(
+                verified_id=verified_id,
+                token_list=mapped_chain,
+                seq_lens=seq_lens,
+                num_verify_tokens=4,
+                batch_size=2,
+            )
+
+        packed = prepare_chain(
+            jnp.array([7, 8], dtype=jnp.int32),
+            jnp.array([[1, 2, 3], [4, 5, 6]], dtype=jnp.int32),
+            jnp.array([10, 20], dtype=jnp.int32),
+            jnp.arange(100, 200, dtype=jnp.int32),
+        )
+
+        np.testing.assert_array_equal(
+            np.asarray(packed[0]),
+            np.array([7, 101, 102, 103, 8, 104, 105, 106], dtype=np.int32),
+        )
+        np.testing.assert_array_equal(
+            np.asarray(packed[1]),
+            np.array([10, 11, 12, 13, 20, 21, 22, 23], dtype=np.int32),
+        )
 
     def test_eagle3_decode_metadata_uses_one_query_per_slot(self):
         from sgl_jax.srt.layers.attention.flashattention_backend import (

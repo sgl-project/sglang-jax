@@ -887,12 +887,15 @@ def _eagle3_raw_and_mapped_token_from_logits(logits, hot_token_ids):
     raw_token = jnp.argmax(logits, axis=-1).astype(jnp.int32)
     if hot_token_ids is None:
         return raw_token, raw_token
-    out_sharding = jax.typeof(raw_token).sharding
+    return raw_token, _map_eagle3_token_ids(raw_token, hot_token_ids)
+
+
+def _map_eagle3_token_ids(token_ids, hot_token_ids):
+    """Map draft-vocabulary ids while preserving the token array sharding."""
+    out_sharding = jax.typeof(token_ids).sharding
     if isinstance(out_sharding, NamedSharding):
-        mapped_token = hot_token_ids.at[raw_token].get(out_sharding=out_sharding)
-    else:
-        mapped_token = hot_token_ids[raw_token]
-    return raw_token, mapped_token
+        return hot_token_ids.at[token_ids].get(out_sharding=out_sharding)
+    return hot_token_ids[token_ids]
 
 
 def _build_eagle3_recurrent_draft_extend(num_steps: int, topk: int):
@@ -1048,7 +1051,6 @@ def _build_verify(topk: int):
             "threshold_acc",
             "enable_top_k",
             "enable_top_p",
-            "prebuilt_verify_inputs",
         ],
     )
     def fused_verify(
@@ -1060,6 +1062,7 @@ def _build_verify(topk: int):
         target_logits_metadata,
         previous_verified_id,
         previous_token_list,
+        draft_to_target_token_ids,
         relay_buffers,
         relay_future_indices,
         verify_allocate_lens,
@@ -1079,10 +1082,7 @@ def _build_verify(topk: int):
         threshold_acc=1.0,
         enable_top_k=False,
         enable_top_p=False,
-        prebuilt_verify_inputs=False,
     ):
-        if prebuilt_verify_inputs and use_relay_state:
-            raise ValueError("Prebuilt EAGLE3 verify inputs do not use NEXTN relay state.")
         if use_relay_state:
             relay_topk_index, _, relay_verified_id, relay_new_seq_lens = gather_spec_relay_buffers(
                 relay_buffers,
@@ -1106,34 +1106,33 @@ def _build_verify(topk: int):
             previous_verified_id = relay_verified_id
             previous_token_list = relay_topk_index
 
+        if draft_to_target_token_ids is not None:
+            previous_token_list = _map_eagle3_token_ids(
+                previous_token_list,
+                draft_to_target_token_ids,
+            )
+
         target_bs = target_forward_batch.seq_lens.shape[0]
-        if prebuilt_verify_inputs:
-            draft_tokens = target_forward_batch.spec_info.draft_token
-            positions = target_forward_batch.spec_info.positions
-            retrive_index = target_forward_batch.spec_info.retrive_index
-            retrive_next_token = target_forward_batch.spec_info.retrive_next_token
-            retrive_next_sibling = target_forward_batch.spec_info.retrive_next_sibling
-        else:
-            (
-                draft_tokens,
-                positions,
-                retrive_index_flat,
-                retrive_next_token_flat,
-                retrive_next_sibling_flat,
-            ) = _build_chain_verify_arrays(
-                verified_id=previous_verified_id,
-                token_list=previous_token_list,
-                seq_lens=target_forward_batch.seq_lens,
-                num_verify_tokens=speculative_num_draft_tokens,
-                batch_size=target_bs,
-            )
-            retrive_index = retrive_index_flat.reshape(target_bs, speculative_num_draft_tokens)
-            retrive_next_token = retrive_next_token_flat.reshape(
-                target_bs, speculative_num_draft_tokens
-            )
-            retrive_next_sibling = retrive_next_sibling_flat.reshape(
-                target_bs, speculative_num_draft_tokens
-            )
+        (
+            draft_tokens,
+            positions,
+            retrive_index_flat,
+            retrive_next_token_flat,
+            retrive_next_sibling_flat,
+        ) = _build_chain_verify_arrays(
+            verified_id=previous_verified_id,
+            token_list=previous_token_list,
+            seq_lens=target_forward_batch.seq_lens,
+            num_verify_tokens=speculative_num_draft_tokens,
+            batch_size=target_bs,
+        )
+        retrive_index = retrive_index_flat.reshape(target_bs, speculative_num_draft_tokens)
+        retrive_next_token = retrive_next_token_flat.reshape(
+            target_bs, speculative_num_draft_tokens
+        )
+        retrive_next_sibling = retrive_next_sibling_flat.reshape(
+            target_bs, speculative_num_draft_tokens
+        )
 
         target_forward_batch.input_ids = draft_tokens
         target_forward_batch.positions = positions
@@ -1441,7 +1440,12 @@ def _build_prefill(num_layers: int, topk: int):
     return fused_prefill
 
 
-def _prepare_verify(draft_worker, model_worker_batch):
+def _prepare_verify(
+    draft_worker,
+    model_worker_batch,
+    *,
+    draft_padding_prepared: bool = False,
+):
     """Prepare fixed-shape verify placeholders while keeping chain build inside JIT."""
     from sgl_jax.srt.speculative.eagle_info import EagleVerifyInput
 
@@ -1466,7 +1470,8 @@ def _prepare_verify(draft_worker, model_worker_batch):
             dtype=np.float32,
         )
 
-    draft_worker.padding_for_decode(model_worker_batch)
+    if not draft_padding_prepared:
+        draft_worker.padding_for_decode(model_worker_batch)
     draft_input = model_worker_batch.spec_info_padded
     previous_verified_id = draft_input.verified_id
     if isinstance(previous_verified_id, np.ndarray):
@@ -1484,7 +1489,7 @@ def _prepare_verify(draft_worker, model_worker_batch):
         previous_token_list = topk_index[:, :, 0]
     if isinstance(previous_token_list, np.ndarray):
         previous_token_list = np.asarray(previous_token_list, dtype=np.int32)
-    else:
+    elif previous_token_list.dtype != jnp.int32:
         previous_token_list = previous_token_list.astype(jnp.int32)
 
     bs = model_worker_batch.seq_lens.shape[0]
@@ -2184,7 +2189,8 @@ def spec_decode_verify(
     model_worker_batch,
     cur_allocate_lens,
     *,
-    prebuilt_verify_inputs: bool = False,
+    draft_to_target_token_ids=None,
+    draft_padding_prepared: bool = False,
 ):
     """Run target verify as the first speculative decode JIT."""
     from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
@@ -2203,19 +2209,12 @@ def spec_decode_verify(
     if use_relay_state:
         relay_future_indices = np.asarray(draft_input.future_indices, dtype=np.int32)
         relay_future_indices = np.where(relay_future_indices >= 0, relay_future_indices, 0)
-    if prebuilt_verify_inputs:
-        spec_info = model_worker_batch.spec_info_padded
-        draft_tokens_2d = spec_info.draft_token.reshape(
-            model_worker_batch.seq_lens.shape[0],
-            draft_worker.speculative_num_draft_tokens,
-        )
-        previous_verified_id = draft_tokens_2d[:, 0]
-        previous_token_list = draft_tokens_2d[:, 1:]
-    else:
-        previous_verified_id, previous_token_list = _prepare_verify(
-            draft_worker, model_worker_batch
-        )
-        spec_info = model_worker_batch.spec_info_padded
+    previous_verified_id, previous_token_list = _prepare_verify(
+        draft_worker,
+        model_worker_batch,
+        draft_padding_prepared=draft_padding_prepared,
+    )
+    spec_info = model_worker_batch.spec_info_padded
     return_target_logits = bool(
         getattr(model_worker_batch, "return_logprob", False)
         or getattr(model_worker_batch, "return_output_logprob_only", False)
@@ -2311,6 +2310,7 @@ def spec_decode_verify(
             target_logits_metadata,
             previous_verified_id,
             previous_token_list,
+            draft_to_target_token_ids,
             getattr(spec_worker, "spec_relay_buffers", None),
             relay_future_indices,
             verify_allocate_lens,
@@ -2329,7 +2329,6 @@ def spec_decode_verify(
             threshold_acc=_sv_thr_acc,
             enable_top_k=_sv_enable_top_k,
             enable_top_p=_sv_enable_top_p,
-            prebuilt_verify_inputs=prebuilt_verify_inputs,
         )
         cache_miss_count = count()
 
