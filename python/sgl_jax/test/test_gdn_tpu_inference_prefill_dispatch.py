@@ -46,7 +46,7 @@ def test_unset_selector_uses_frozen_reference_prefill(monkeypatch, caplog):
     assert backend.requested_prefill_impl == "reference"
     assert backend.effective_prefill_impl == "reference"
     assert backend.fallback_reason is None
-    assert backend._prefill_callable == backend._forward_extend_reference
+    assert backend._prefill_callable is GDNAttnBackend._forward_extend_reference
     assert backend._decode_callable is decode_gated_delta_rule_ref
     assert (
         sum(
@@ -61,7 +61,7 @@ def test_explicit_reference_uses_existing_prefill(monkeypatch):
     backend = _backend(monkeypatch, impl="reference")
 
     assert backend.effective_prefill_impl == "reference"
-    assert backend._prefill_callable == backend._forward_extend_reference
+    assert backend._prefill_callable is GDNAttnBackend._forward_extend_reference
     assert backend._decode_callable is decode_gated_delta_rule_ref
 
 
@@ -76,7 +76,7 @@ def test_tpu_inference_v3_uses_distinct_frozen_adapter(monkeypatch):
     assert backend.requested_prefill_impl == "tpu_inference_v3"
     assert backend.effective_prefill_impl == "tpu_inference_v3"
     assert backend.fallback_reason is None
-    assert backend._prefill_callable.func is tpu_inference_v3_prefill
+    assert backend._prefill_callable is tpu_inference_v3_prefill
     assert backend._decode_callable is decode_gated_delta_rule_ref
 
 

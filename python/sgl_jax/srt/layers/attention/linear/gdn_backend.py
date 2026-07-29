@@ -28,7 +28,6 @@ from __future__ import annotations
 import logging
 import os
 from collections.abc import Callable
-from functools import partial
 from typing import TYPE_CHECKING
 
 import jax
@@ -135,7 +134,7 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
         self._prefill_callable: Callable[..., tuple[jax.Array, jax.Array, jax.Array]]
         if self.requested_prefill_impl == "reference":
             self.effective_prefill_impl = "reference"
-            self._prefill_callable = self._forward_extend_reference
+            self._prefill_callable = GDNAttnBackend._forward_extend_reference
         else:
             validate_tpu_inference_v3_capability(
                 mesh=mesh,
@@ -147,7 +146,7 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
                 conv_kernel_size=conv_kernel_size,
             )
             self.effective_prefill_impl = "tpu_inference_v3"
-            self._prefill_callable = partial(tpu_inference_v3_prefill, self)
+            self._prefill_callable = tpu_inference_v3_prefill
         logger.info(
             "GDN prefill implementation requested=%s effective=%s fallback_reason=%s",
             self.requested_prefill_impl,
@@ -362,6 +361,7 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         """Run the prefill callable selected and frozen at initialization."""
         return self._prefill_callable(
+            self,
             mixed_qkv,
             conv_state_in,
             recurrent_state_in,
