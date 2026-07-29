@@ -224,6 +224,7 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
                 conv1d_weight,
                 A_log,
                 dt_bias,
+                seq_lens=forward_batch.seq_lens,
             )
         # Flatten head dim into channel dim to match KDA's contract
         # (model layer reshapes back to [T, n_v, d_v] before output norm).
@@ -357,6 +358,7 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
         conv1d_weight: jax.Array,
         A_log: jax.Array,
         dt_bias: jax.Array,
+        seq_lens: jax.Array,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         """Run the prefill callable selected and frozen at initialization."""
         return self._prefill_callable(
@@ -368,6 +370,7 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
             conv1d_weight,
             A_log,
             dt_bias,
+            seq_lens,
         )
 
     def _forward_extend_reference(
@@ -380,8 +383,10 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
         conv1d_weight: jax.Array,
         A_log: jax.Array,
         dt_bias: jax.Array,
+        seq_lens: jax.Array,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         """Packed ragged batch through ``chunked_gated_delta_rule_jax``."""
+        del seq_lens
         meta = self.forward_metadata
         cu_seqlens = meta.cu_q_lens
         state_indices = meta.recurrent_indices
