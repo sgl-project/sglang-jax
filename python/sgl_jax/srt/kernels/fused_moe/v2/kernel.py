@@ -290,6 +290,7 @@ def _fused_ep_moe_kernel(
     n_active_x2_smem,  # (smem_banks, 1) — compact loop
     a2a_s_sends_x2_smem,  # (expert_buffer_count,) or (2, expert_buffer_count)
     # --- VMEM scratch ---
+    d2e_count_x2_vmem,  # (2, num_devices, 1, padded_num_experts)
     a2a_g_acc_vmem,  # (2, top_k, acc_bt, t_packing, h_per_t)
     b_topk_weights_x2_vmem,  # (2, bt, padded_top_k)
     b_topk_ids_x2_vmem,  # (2, bt, padded_top_k)
@@ -548,10 +549,15 @@ def _fused_ep_moe_kernel(
 
         offsets_sem = local_sems.at[bt_sem_id, 8]
         routing_sem = local_sems.at[bt_sem_id, 9]
+        # Keep the direct-all-gather mailbox alive for the full kernel. Two
+        # banks are sufficient: before a rank can start metadata generation
+        # N+2, it must receive generation N+1 from every peer, which means
+        # every peer has already finished consuming generation N.
+        md_bank_id = bt_id & jnp.int32(1)
+        d2e_count_vmem = d2e_count_x2_vmem.at[md_bank_id]
 
         def _inkernel_allreduce(
             t2e_routing_vmem,
-            d2e_count_vmem,
             offsets_vmem,
             starts_vmem,
             sizes_vmem,
@@ -588,8 +594,6 @@ def _fused_ep_moe_kernel(
             d2e_count_vmem[...] = jnp.zeros_like(d2e_count_vmem)
             d2e_count_vmem[my_id] = local_sizes
 
-            sync_barrier()
-
             # Metadata all-reduce = 1-round direct all-gather of per-device
             # histogram rows via fori_loop + dynamic device_id. No static unroll
             # (compile-safe at any ep), no per-round sync_barrier (the old log2(N)
@@ -620,7 +624,6 @@ def _fused_ep_moe_kernel(
                 return None
 
             lax.fori_loop(1, num_devices, _md_drain, None, unroll=False)
-            sync_barrier()
 
             reduced_sizes = jnp.zeros((1, padded_num_experts), dtype=jnp.int32)
             reduced_starts = jnp.zeros((1, padded_num_experts), dtype=jnp.int32)
@@ -661,7 +664,6 @@ def _fused_ep_moe_kernel(
         pl.run_scoped(
             _inkernel_allreduce,
             pltpu.VMEM(t2e_routing_x2_smem.shape[1:], t2e_routing_x2_smem.dtype),
-            pltpu.VMEM(d2e_count_x2_smem.shape[1:], d2e_count_x2_smem.dtype),
             pltpu.VMEM(expert_offsets_x2_smem.shape[1:], expert_offsets_x2_smem.dtype),
             pltpu.VMEM(expert_starts_x2_smem.shape[1:], expert_starts_x2_smem.dtype),
             pltpu.VMEM(expert_sizes_x2_smem.shape[1:], expert_sizes_x2_smem.dtype),
@@ -2549,6 +2551,11 @@ def fused_ep_moe_v2(
             if use_bt_banking
             else pltpu.SMEM((expert_buffer_count,), jnp.int32)
         ),  # a2a_s_sends
+        # VMEM: double-buffered metadata all-gather mailbox. Keeping this
+        # kernel-scoped makes peer destinations valid without a metadata-entry
+        # barrier; alternating banks prevents the next block from clobbering a
+        # peer that is still materializing the previous generation.
+        pltpu.VMEM((2, num_devices, 1, padded_num_experts), jnp.int32),
         # VMEM: gather accumulation
         pltpu.VMEM((2, top_k, acc_bt, out_packing, h_per_out), out_dtype),  # a2a_g_acc
         # VMEM: topk
