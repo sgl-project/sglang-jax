@@ -45,7 +45,7 @@ TUNED_BLOCK_CONFIGS: dict[str, dict[tuple, tuple[int, ...]]] = {
         # MiMo V2 Pro with activation quantization, ep=128
         ('bfloat16', 'float8_e4m3fn', 512, 384, 8, 6144, 2048, 128, False, False, True): (8, 1024, 32, 256, 32),
         ('bfloat16', 'float8_e4m3fn', 768, 384, 8, 6144, 2048, 128, False, False, True): (8, 1024, 32, 256, 32),
-        ('bfloat16', 'float8_e4m3fn', 2048, 384, 8, 6144, 2048, 128, False, False, True): (16, 1024, 8, 256, 56),
+        ('bfloat16', 'float8_e4m3fn', 2048, 384, 8, 6144, 2048, 128, False, False, True): (16, 1024, 56, 256, 56),
         ('bfloat16', 'float8_e4m3fn', 3072, 384, 8, 6144, 2048, 128, False, False, True): (24, 1024, 16, 256, 80),
         ('bfloat16', 'float8_e4m3fn', 4096, 384, 8, 6144, 2048, 128, False, False, True): (32, 1024, 112, 256, 112),
         ('bfloat16', 'float8_e4m3fn', 65536, 384, 8, 6144, 2048, 128, False, False, True): (256, 128, 8, 256, 856),
