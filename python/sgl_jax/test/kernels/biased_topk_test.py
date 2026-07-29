@@ -429,6 +429,64 @@ def test_topk_kernel_preserves_router_token_sharding(monkeypatch, token_axis, mo
     )
 
 
+def test_topk_pallas_boundary_manualizes_explicit_mesh_axes(monkeypatch):
+    from sgl_jax.srt.eplb.expert_location import (
+        get_global_server_args,
+        set_global_server_args,
+    )
+    from sgl_jax.srt.layers import gate
+
+    monkeypatch.setenv("PALLAS_INTERPRET", "1")
+    devices = np.asarray(jax.devices())
+    mesh = Mesh(
+        devices.reshape((len(devices), 1)),
+        ("data", "tensor"),
+        axis_types=(AxisType.Explicit, AxisType.Explicit),
+    )
+    routing_sharding = NamedSharding(mesh, P("data", None))
+    logits = jax.device_put(
+        jnp.ones((128 * len(devices), 128), dtype=jnp.float32),
+        routing_sharding,
+    )
+    shard_map_meshes = []
+    auto_axes_calls = []
+    original_shard_map = jax.shard_map
+    original_auto_axes = jax.sharding.auto_axes
+
+    def recording_shard_map(*args, **kwargs):
+        shard_map_meshes.append(kwargs.get("mesh"))
+        return original_shard_map(*args, **kwargs)
+
+    def recording_auto_axes(*args, **kwargs):
+        auto_axes_calls.append(kwargs)
+        return original_auto_axes(*args, **kwargs)
+
+    monkeypatch.setattr(jax, "shard_map", recording_shard_map)
+    monkeypatch.setattr(jax.sharding, "auto_axes", recording_auto_axes)
+    previous_server_args = get_global_server_args()
+    set_global_server_args(SimpleNamespace(enable_topk_kernel=True, device="tpu"))
+    try:
+        with jax.set_mesh(mesh):
+            weights, ids = gate.TopK(
+                topk=8,
+                renormalize=False,
+                mesh=mesh,
+            )(logits, routing_sharding=routing_sharding)
+            weights.block_until_ready()
+            ids.block_until_ready()
+    finally:
+        set_global_server_args(previous_server_args)
+
+    assert shard_map_meshes == [None]
+    assert len(auto_axes_calls) == 1
+    assert auto_axes_calls[0]["axes"] == mesh.axis_names
+    out_sharding = auto_axes_calls[0]["out_sharding"]
+    assert tuple(sharding.spec for sharding in out_sharding) == (
+        P("data", None),
+        P("data", None),
+    )
+
+
 def test_topk_flag_off_keeps_jax_path(monkeypatch):
     from sgl_jax.srt.eplb.expert_location import (
         get_global_server_args,
