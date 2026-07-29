@@ -288,6 +288,136 @@ class TestVerifyTree(CustomTestCase):
             np.array([10, 11, 12, 13, 20, 21, 22, 23], dtype=np.int32),
         )
 
+    def test_fused_verify_reuses_device_placeholders(self):
+        from types import SimpleNamespace
+
+        from jax.sharding import Mesh
+
+        from sgl_jax.srt.speculative.draft_extend_fused import _prepare_verify
+        from sgl_jax.srt.speculative.eagle_info import EagleDraftInput
+
+        mesh = Mesh(np.asarray(jax.devices()), ("data",))
+        worker = SimpleNamespace(
+            mesh=mesh,
+            speculative_num_steps=3,
+            speculative_num_draft_tokens=4,
+        )
+
+        def make_draft_input():
+            return EagleDraftInput(
+                verified_id=np.array([7, 8], dtype=np.int32),
+                topk_index=np.array([[1, 2, 3], [4, 5, 6]], dtype=np.int32),
+            )
+
+        batch = SimpleNamespace(
+            seq_lens=np.array([10, 20], dtype=np.int32),
+            spec_info_padded=make_draft_input(),
+        )
+        _prepare_verify(worker, batch, draft_padding_prepared=True)
+        first = batch.spec_info_padded
+
+        batch.spec_info_padded = make_draft_input()
+        _prepare_verify(worker, batch, draft_padding_prepared=True)
+
+        self.assertIs(batch.spec_info_padded, first)
+
+    def test_target_verify_logits_metadata_has_no_unused_device_inputs(self):
+        from types import SimpleNamespace
+
+        from sgl_jax.srt.model_executor.forward_batch_info import (
+            CaptureHiddenMode,
+            ForwardMode,
+        )
+        from sgl_jax.srt.speculative.draft_extend_fused import (
+            _prepare_logits_metadata,
+        )
+
+        metadata = _prepare_logits_metadata(
+            SimpleNamespace(
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
+            ),
+            mesh=None,
+        )
+
+        self.assertIsNone(metadata.extend_seq_lens)
+        self.assertIsNone(metadata.logits_indices)
+        self.assertIsNone(metadata.accept_lens)
+
+    def test_eagle_base_metadata_uploads_only_page_ids(self):
+        from types import SimpleNamespace
+
+        from jax.sharding import Mesh
+
+        from sgl_jax.srt.layers.attention.flashattention_backend import FlashAttention
+        from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
+
+        backend = SimpleNamespace(
+            page_size=2,
+            mesh=Mesh(np.asarray(jax.devices()), ("data",)),
+            swa_index_mapping=None,
+        )
+        batch = SimpleNamespace(
+            cache_loc=np.array([0, 0, 4, 0, 8, 0, 12, 0], dtype=np.int32),
+            dp_size=1,
+            per_dp_bs_size=2,
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            spec_info_padded=SimpleNamespace(custom_mask=None),
+        )
+
+        metadata = FlashAttention.get_eagle_base_metadata(backend, batch)
+
+        np.testing.assert_array_equal(
+            np.asarray(metadata.page_indices)[:4],
+            np.array([0, 2, 4, 6], dtype=np.int32),
+        )
+        self.assertIsNone(metadata.cu_q_lens)
+        self.assertIsNone(metadata.cu_kv_lens)
+        self.assertIsNone(metadata.seq_lens)
+        self.assertIsNone(metadata.distribution)
+
+    def test_no_overlap_reuses_cache_loc_buffer_without_clearing(self):
+        from types import SimpleNamespace
+
+        from sgl_jax.srt.speculative.eagle_draft_worker import EagleDraftWorker
+
+        worker = object.__new__(EagleDraftWorker)
+        worker.server_args = SimpleNamespace(disable_overlap_schedule=True)
+        first = worker._get_decode_cache_loc_buffer(16)
+        first[3] = 99
+
+        second = worker._get_decode_cache_loc_buffer(16)
+
+        self.assertIs(second, first)
+        self.assertEqual(second[3], 99)
+
+    def test_no_overlap_only_copies_padding_inputs_to_host(self):
+        from types import SimpleNamespace
+
+        from sgl_jax.srt.speculative.eagle_draft_worker import EagleDraftWorker
+
+        worker = object.__new__(EagleDraftWorker)
+        worker.server_args = SimpleNamespace(disable_overlap_schedule=True)
+        untouched = jnp.arange(4, dtype=jnp.int32)
+        batch = SimpleNamespace(
+            input_ids=untouched,
+            seq_lens=jnp.array([8], dtype=jnp.int32),
+            out_cache_loc=untouched,
+            positions=untouched,
+            req_pool_indices=jnp.array([3], dtype=jnp.int32),
+            cache_loc=untouched,
+            extend_prefix_lens=untouched,
+            extend_seq_lens=untouched,
+        )
+
+        worker.copy_model_worker_batch_to_cpu(batch)
+
+        self.assertIsInstance(batch.seq_lens, np.ndarray)
+        self.assertIsInstance(batch.req_pool_indices, np.ndarray)
+        self.assertIs(batch.input_ids, untouched)
+        self.assertIs(batch.cache_loc, untouched)
+        self.assertIs(batch.extend_seq_lens, untouched)
+
     def test_eagle3_decode_metadata_uses_one_query_per_slot(self):
         from sgl_jax.srt.layers.attention.flashattention_backend import (
             FlashAttentionMetadata,

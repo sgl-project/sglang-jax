@@ -219,6 +219,8 @@ class EagleDraftInput:
         draft_model_runner: Any,
         batch_output: GenerationBatchResult,
         speculative_num_draft_tokens: int,
+        *,
+        use_device_metadata: bool = False,
     ):
         legacy_non_overlap = (
             model_worker_batch.spec_algorithm is not None
@@ -253,18 +255,26 @@ class EagleDraftInput:
         model_worker_batch.spec_info_padded.hidden_states = (
             batch_output.next_draft_input.hidden_states
         )
-        if legacy_non_overlap or model_worker_batch.spec_info_padded.accept_length is None:
+        if (
+            (legacy_non_overlap and not use_device_metadata)
+            or model_worker_batch.spec_info_padded.accept_length is None
+        ):
             model_worker_batch.spec_info_padded.accept_length = batch_output.accept_lens
         model_worker_batch.input_ids = batch_output.next_draft_input.verified_id
-        forward_metadata = draft_model_runner.attn_backend.get_eagle_forward_metadata(
-            model_worker_batch
-        )
+        if use_device_metadata:
+            forward_metadata = draft_model_runner.attn_backend.get_eagle_base_metadata(
+                model_worker_batch
+            )
+        else:
+            forward_metadata = draft_model_runner.attn_backend.get_eagle_forward_metadata(
+                model_worker_batch
+            )
 
         draft_model_runner.attn_backend.forward_metadata = forward_metadata
         from sgl_jax.srt.layers.logits_processor import LogitsMetadata
         from sgl_jax.srt.utils.jax_utils import device_array
 
-        if legacy_non_overlap or model_worker_batch.return_logprob:
+        if (legacy_non_overlap and not use_device_metadata) or model_worker_batch.return_logprob:
             logits_metadata = LogitsMetadata.from_model_worker_batch(
                 model_worker_batch, draft_model_runner.mesh
             )

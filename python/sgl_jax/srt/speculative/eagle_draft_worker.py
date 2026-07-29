@@ -380,7 +380,7 @@ class EagleDraftWorker(BaseDraftWorker):
         per_dp_bs = model_worker_batch.per_dp_bs_size if dp_size > 1 else len(seq_lens_cpu)
         assert total_cache_loc_size % dp_size == 0
         per_dp_cache_len = total_cache_loc_size // dp_size
-        cache_loc_cpu = np.zeros(total_cache_loc_size, dtype=np.int32)
+        cache_loc_cpu = self._get_decode_cache_loc_buffer(total_cache_loc_size)
         valid_mask = seq_lens_cpu > 0
         if np.any(valid_mask):
             valid_indices = np.where(valid_mask)[0]
@@ -544,17 +544,36 @@ class EagleDraftWorker(BaseDraftWorker):
         max_seq_len = max(int(max_seq_len), 1)
         return 1 << (max_seq_len - 1).bit_length()
 
+    def _get_decode_cache_loc_buffer(self, total_cache_loc_size: int):
+        if not self.server_args.disable_overlap_schedule:
+            return np.zeros(total_cache_loc_size, dtype=np.int32)
+        cache_loc_buffers = getattr(self, "_decode_cache_loc_buffers", None)
+        if cache_loc_buffers is None:
+            cache_loc_buffers = self._decode_cache_loc_buffers = {}
+        cache_loc_cpu = cache_loc_buffers.get(total_cache_loc_size)
+        if cache_loc_cpu is None:
+            cache_loc_cpu = np.zeros(total_cache_loc_size, dtype=np.int32)
+            cache_loc_buffers[total_cache_loc_size] = cache_loc_cpu
+        return cache_loc_cpu
+
     def copy_model_worker_batch_to_cpu(self, model_worker_batch: ModelWorkerBatch):
         mwb = model_worker_batch
-        fields = [
-            "input_ids",
-            "seq_lens",
-            "out_cache_loc",
-            "positions",
-            "req_pool_indices",
-            "cache_loc",
-        ]
-        optional = ["extend_prefix_lens", "extend_seq_lens"]
+        if self.server_args.disable_overlap_schedule:
+            # padding_for_decode only consumes these two host arrays. The other
+            # fields are replaced before the next forward, so copying them here
+            # duplicates device-to-host traffic in the no-overlap path.
+            fields = ["seq_lens", "req_pool_indices"]
+            optional = []
+        else:
+            fields = [
+                "input_ids",
+                "seq_lens",
+                "out_cache_loc",
+                "positions",
+                "req_pool_indices",
+                "cache_loc",
+            ]
+            optional = ["extend_prefix_lens", "extend_seq_lens"]
 
         for name in fields:
             arr = getattr(mwb, name)
