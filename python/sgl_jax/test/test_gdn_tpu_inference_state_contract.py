@@ -36,10 +36,10 @@ def _inputs():
     )
     b = jnp.arange(6, dtype=jnp.bfloat16).reshape(3, N_V)
     a = b + jnp.asarray(10, dtype=jnp.bfloat16)
-    conv_state = jnp.arange(7 * DIM * (KERNEL_SIZE - 1), dtype=jnp.bfloat16).reshape(
-        7, DIM, KERNEL_SIZE - 1
+    conv_state = jnp.arange(8 * DIM * (KERNEL_SIZE - 1), dtype=jnp.bfloat16).reshape(
+        8, DIM, KERNEL_SIZE - 1
     )
-    recurrent_state = jnp.arange(7 * N_V * D_K * D_V, dtype=jnp.float32).reshape(7, N_V, D_K, D_V)
+    recurrent_state = jnp.arange(8 * N_V * D_K * D_V, dtype=jnp.float32).reshape(8, N_V, D_K, D_V)
     conv_weight = jnp.arange(DIM * KERNEL_SIZE, dtype=jnp.bfloat16).reshape(DIM, KERNEL_SIZE)
     a_log = jnp.asarray([0.25, 0.5], dtype=jnp.float32)
     dt_bias = jnp.asarray([0.75, 1.0], dtype=jnp.float32)
@@ -123,8 +123,8 @@ def test_adapter_converts_layout_metadata_and_preserves_pool_contract():
         # Deterministically emulate the vendor's full-pool result. Deliberately
         # corrupt slot 0 and an unused slot: the adapter must consume only the
         # active running-slot values from the vendor result.
-        new_conv = conv_state.at[0].set(-100).at[6].set(-600)
-        new_recurrent = recurrent_state.at[0].set(-1000).at[6].set(-6000)
+        new_conv = conv_state.at[0].set(-100).at[7].set(-700)
+        new_recurrent = recurrent_state.at[0].set(-1000).at[7].set(-7000)
         for row in range(state_indices.shape[0]):
             idx = state_indices[row]
             has_tokens = query_lens[row] > 0
@@ -183,7 +183,7 @@ def test_adapter_converts_layout_metadata_and_preserves_pool_contract():
     # zero; continuing and zero-length request states are gathered unchanged.
     vendor_conv = np.asarray(captured["conv_state"])
     vendor_recurrent = np.asarray(captured["recurrent_state"])
-    assert vendor_conv.shape == (7, KERNEL_SIZE - 1, DIM)
+    assert vendor_conv.shape == (8, KERNEL_SIZE - 1, DIM)
     np.testing.assert_array_equal(vendor_conv[1], np.zeros((2, DIM)))
     np.testing.assert_array_equal(vendor_conv[2], np.asarray(conv_state[2]).T)
     np.testing.assert_array_equal(vendor_conv[3], np.asarray(conv_state[3]).T)
@@ -223,13 +223,15 @@ def test_adapter_converts_layout_metadata_and_preserves_pool_contract():
     np.testing.assert_array_equal(new_recurrent[0], recurrent_state[0])
     np.testing.assert_array_equal(new_conv[3], conv_state[3])
     np.testing.assert_array_equal(new_recurrent[3], recurrent_state[3])
+    np.testing.assert_array_equal(new_conv[7], conv_state[7])
+    np.testing.assert_array_equal(new_recurrent[7], recurrent_state[7])
 
 
 @pytest.mark.parametrize(
     ("track_indices", "match"),
     [
         ([4, 4, 0], "duplicate"),
-        ([4, 7, 0], "out of range"),
+        ([4, 8, 0], "out of range"),
         ([1, 5, 0], "running state"),
     ],
 )
