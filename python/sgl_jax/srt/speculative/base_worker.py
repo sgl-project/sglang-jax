@@ -314,7 +314,7 @@ class BaseSpecWorker:
 
         spec_info: EagleVerifyInput = model_worker_batch.spec_info_padded
         spec_info.allocate_lens = cur_allocate_lens
-        spec_info.prepare_for_verify(model_worker_batch, self.page_size, self.target_worker)
+        spec_info.prepare_for_verify(model_worker_batch)
         forward_metadata = self.target_worker.model_runner.attn_backend.get_eagle_forward_metadata(
             model_worker_batch
         )

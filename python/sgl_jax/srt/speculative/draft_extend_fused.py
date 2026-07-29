@@ -1215,7 +1215,6 @@ def _build_prefill(num_layers: int, topk: int):
 
 def _prepare_verify(draft_worker, model_worker_batch):
     """Prepare fixed-shape verify placeholders while keeping chain build inside JIT."""
-    from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode
     from sgl_jax.srt.speculative.eagle_util import EagleVerifyInput
 
     draft_input = model_worker_batch.spec_info_padded
@@ -1270,13 +1269,8 @@ def _prepare_verify(draft_worker, model_worker_batch):
         retrive_index=np.zeros((bs, n), dtype=np.int32),
         retrive_next_token=np.zeros((bs, n), dtype=np.int32),
         retrive_next_sibling=np.zeros((bs, n), dtype=np.int32),
-        retrive_cum_len=None,
         spec_steps=draft_worker.speculative_num_steps,
-        topk=draft_worker.topk,
         draft_token_num=draft_worker.speculative_num_draft_tokens,
-        capture_hidden_mode=CaptureHiddenMode.LAST,
-        seq_lens_sum=model_worker_batch.seq_lens_sum,
-        seq_lens_cpu=model_worker_batch.seq_lens,
     )
     return previous_verified_id, previous_token_list
 
@@ -1848,7 +1842,7 @@ def spec_decode_verify(spec_worker, model_worker_batch, cur_allocate_lens):
     )
 
     spec_info.allocate_lens = cur_allocate_lens
-    spec_info.prepare_for_verify(model_worker_batch, spec_worker.page_size, target_worker)
+    spec_info.prepare_for_verify(model_worker_batch)
     target_mr.attn_backend.forward_metadata = target_mr.attn_backend.get_eagle_forward_metadata(
         model_worker_batch
     )

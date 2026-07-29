@@ -1,5 +1,4 @@
 import functools
-import logging
 
 import jax
 import jax.numpy as jnp
@@ -27,11 +26,7 @@ from sgl_jax.srt.speculative.eagle_util import (
 )
 from sgl_jax.srt.speculative.overlap_utils import use_legacy_eagle3_non_overlap
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
-from sgl_jax.srt.utils.common_utils import get_bool_env_var
 from sgl_jax.srt.utils.jax_utils import device_array
-
-logger = logging.getLogger(__name__)
-RETURN_ORIGINAL_LOGPROB = get_bool_env_var("RETURN_ORIGINAL_LOGPROB")
 
 
 class EagleDraftWorker(BaseDraftWorker):
@@ -100,14 +95,6 @@ class EagleDraftWorker(BaseDraftWorker):
                     sharding=(NamedSharding(self._worker.mesh, P())),
                 )
         else:
-            if self.hot_token_ids is not None:
-                head = head.clone()
-                self.hot_token_ids = device_array(
-                    self.draft_model_runner.model.hot_token_ids,
-                    sharding=(NamedSharding(self._worker.mesh, P())),
-                )
-                head.data = head.data[self.hot_token_ids]
-
             self.draft_model_runner.model.set_embed_and_head(embed, head)
 
     @property
@@ -207,13 +194,8 @@ class EagleDraftWorker(BaseDraftWorker):
             retrive_index=retrive_index,
             retrive_next_token=retrive_next_token,
             retrive_next_sibling=retrive_next_sibling,
-            retrive_cum_len=None,
             spec_steps=self.speculative_num_steps,
-            topk=self.topk,
             draft_token_num=self.speculative_num_draft_tokens,
-            capture_hidden_mode=CaptureHiddenMode.LAST,
-            seq_lens_sum=model_worker_batch.seq_lens_sum,
-            seq_lens_cpu=model_worker_batch.seq_lens,
         )
 
     def draft_extend_for_prefill(
@@ -349,14 +331,11 @@ class EagleDraftWorker(BaseDraftWorker):
         # At dp>1 the incoming mwb is already DP-padded to total_bs (== a bucket
         # value, see _get_spec_decode_mwb_dp); use the larger of real_bs and the
         # incoming seq_lens length so we don't shrink below the DP layout.
-        _, padding_bs_index = self.get_padding_bs(
+        padding_bs_index = self._get_padding_bs_index(
             max(model_worker_batch.real_bs, len(model_worker_batch.seq_lens))
         )
         self.copy_model_worker_batch_to_cpu(model_worker_batch)
-        model_worker_batch.spec_info_padded.prepare_for_draft_decode(
-            model_worker_batch, self.topk, self.speculative_num_steps
-        )
-        model_worker_batch.seq_lens = model_worker_batch.seq_lens
+        model_worker_batch.spec_info_padded.prepare_for_draft_decode(model_worker_batch, self.topk)
         seq_lens_cpu = model_worker_batch.seq_lens
         page_size = self.page_size
         req_to_token_pool, _ = self.target_worker_ref.get_memory_pool()
@@ -483,7 +462,6 @@ class EagleDraftWorker(BaseDraftWorker):
             np.repeat(model_worker_batch.seq_lens, self.topk),
             sharding=(NamedSharding(self.mesh, P())),
         )
-        logits_metadata = None
         metadata_per_step = self.draft_model_runner.attn_backend.get_eagle_multi_step_metadata(
             model_worker_batch,
         )
@@ -497,7 +475,6 @@ class EagleDraftWorker(BaseDraftWorker):
         forward_batch.spec_info = EagleDraftInput()
         forward_batch.spec_info.hidden_states = jnp.empty((bs * self.topk, hidden_states.shape[1]))
         for i in range(self.speculative_num_steps):
-
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
                 i, topk_p, topk_index, hidden_states, scores, self.topk
             )
@@ -565,18 +542,16 @@ class EagleDraftWorker(BaseDraftWorker):
             if arr is not None:
                 setattr(mwb, name, np.asarray(arr))
 
-    def get_padding_bs(self, real_bs: int) -> int:
+    def _get_padding_bs_index(self, real_bs: int) -> int:
         self.precompile_bs_paddings.sort()
         select_bs_index = -1
-        bs_padding_size = 0
         for i, size in enumerate(self.precompile_bs_paddings):
             if size >= real_bs:
-                bs_padding_size = size - real_bs
                 select_bs_index = i
                 break
         if select_bs_index < 0:
             raise RuntimeError("did not get comperate padding bs, it should not happened")
-        return bs_padding_size, select_bs_index
+        return select_bs_index
 
 
 # ---------------------------------------------------------------------------
@@ -585,36 +560,17 @@ class EagleDraftWorker(BaseDraftWorker):
 
 
 @functools.partial(jax.jit, static_argnames=["topk"])
-def topk_probs_from_logits(
-    logits: jax.Array, topk: int, axis: int = -1
-) -> tuple[jax.Array, jax.Array]:
+def topk_probs_from_logits(logits: jax.Array, topk: int) -> tuple[jax.Array, jax.Array]:
     """Return top-k probabilities without materializing the full softmax tensor."""
-    working_logits = jnp.moveaxis(logits, axis, -1) if axis != -1 else logits
     # TODO(#1053 Phase 2): replace this all-gather with a sharded top-k +
     # logsumexp over the vocab axis for DP/TP scalability.
-    sh = jax.typeof(working_logits).sharding
+    sh = jax.typeof(logits).sharding
     if isinstance(sh, NamedSharding):
-        working_logits = jax.sharding.reshard(working_logits, NamedSharding(sh.mesh, P()))
-    topk_logits, topk_index = jax.lax.top_k(working_logits, topk)
-    logsumexp = jax.nn.logsumexp(working_logits, axis=-1, keepdims=True)
+        logits = jax.sharding.reshard(logits, NamedSharding(sh.mesh, P()))
+    topk_logits, topk_index = jax.lax.top_k(logits, topk)
+    logsumexp = jax.nn.logsumexp(logits, axis=-1, keepdims=True)
     topk_probs = jnp.exp(topk_logits - logsumexp)
-
-    if axis != -1:
-        topk_probs = jnp.moveaxis(topk_probs, -1, axis)
-        topk_index = jnp.moveaxis(topk_index, -1, axis)
-
     return topk_probs, topk_index
-
-
-def fast_topk(values, topk, axis=-1):
-    working_values = jnp.moveaxis(values, axis, -1) if axis != -1 else values
-    result_vals, result_indices = jax.lax.top_k(working_values, topk)
-
-    if axis != -1:
-        result_vals = jnp.moveaxis(result_vals, -1, axis)
-        result_indices = jnp.moveaxis(result_indices, -1, axis)
-
-    return result_vals, result_indices
 
 
 @functools.partial(jax.jit, static_argnames=["i", "topk"])
@@ -679,7 +635,7 @@ def select_top_k_tokens(
     topk: int,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     if i == 0:
-        return select_top_k_tokens_step_0(topk_p, topk_index, hidden_states, scores, topk)
+        return select_top_k_tokens_step_0(topk_p, topk_index, hidden_states, topk)
     else:
         return select_top_k_tokens_step_greater_0(
             jnp.asarray(i), topk_p, topk_index, hidden_states, scores, topk
@@ -691,7 +647,6 @@ def select_top_k_tokens_step_0(
     topk_p: jax.Array,
     topk_index: jax.Array,
     hidden_states: jax.Array,
-    scores: jax.Array,
     topk: int,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     input_ids = topk_index.flatten()
@@ -722,8 +677,8 @@ def select_top_k_tokens_step_greater_0(
     # V2 Flash), so promote before lax.mul which requires matching dtypes.
     scores = scores.astype(topk_p.dtype)
     expand_scores = jax.lax.mul(jnp.expand_dims(scores, axis=2), topk_p.reshape(-1, topk, topk))
-    topk_cs_p, topk_cs_index = fast_topk(
-        expand_scores.reshape(expand_scores.shape[0], -1), topk, axis=-1
+    topk_cs_p, topk_cs_index = jax.lax.top_k(
+        expand_scores.reshape(expand_scores.shape[0], -1), topk
     )
     scores = topk_cs_p
     topk_index = topk_index.reshape(-1, topk**2)

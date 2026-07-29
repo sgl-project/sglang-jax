@@ -288,13 +288,8 @@ def create_test_data(
             retrive_index=None,
             retrive_next_token=None,
             retrive_next_sibling=None,
-            retrive_cum_len=None,
-            seq_lens_cpu=None,
             spec_steps=None,
-            topk=None,
             draft_token_num=None,
-            seq_lens_sum=None,
-            capture_hidden_mode=None,
         )
     else:
         forward_mode = ForwardMode.EXTEND if mode == "prefill" else ForwardMode.DECODE
