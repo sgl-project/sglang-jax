@@ -507,8 +507,27 @@ class EagleDraftInput:
         spec_info._ensure_host()
         self.hidden_states = np.concatenate([self.hidden_states, spec_info.hidden_states], axis=0)
         self.verified_id = np.concatenate([self.verified_id, spec_info.verified_id], axis=0)
-        self.topk_p = np.concatenate([self.topk_p, spec_info.topk_p])
-        self.topk_index = np.concatenate([self.topk_index, spec_info.topk_index])
+        self_topk_p = np.asarray(self.topk_p)
+        other_topk_p = np.asarray(spec_info.topk_p)
+        self_topk_index = np.asarray(self.topk_index)
+        other_topk_index = np.asarray(spec_info.topk_index)
+        if self_topk_index.shape[1] != other_topk_index.shape[1]:
+            widths = {self_topk_index.shape[1], other_topk_index.shape[1]}
+            if 1 not in widths:
+                raise ValueError(
+                    "Cannot merge EAGLE draft states with incompatible widths: "
+                    f"{self_topk_index.shape[1]} and {other_topk_index.shape[1]}"
+                )
+            # A newly prefetched EAGLE3 request carries only its first draft
+            # seed, while steady-state fused requests carry the full recurrent
+            # chain. Downgrade the mixed batch to the common seed so one
+            # bootstrap draft pass can rebuild every row consistently.
+            self_topk_p = self_topk_p[:, :1]
+            other_topk_p = other_topk_p[:, :1]
+            self_topk_index = self_topk_index[:, :1]
+            other_topk_index = other_topk_index[:, :1]
+        self.topk_p = np.concatenate([self_topk_p, other_topk_p])
+        self.topk_index = np.concatenate([self_topk_index, other_topk_index])
         self.allocate_lens = np.concatenate([self.allocate_lens, spec_info.allocate_lens])
         if self.new_seq_lens is not None and spec_info.new_seq_lens is not None:
             self.new_seq_lens = np.concatenate(

@@ -84,11 +84,19 @@ class BaseSpecWorker:
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
-        self._can_use_fused_spec_decode = (
-            self.speculative_algorithm.is_nextn()
-            and self.topk == 1
+        can_use_linear_fused_verify = (
+            self.topk == 1
             and self.speculative_num_steps > 1
             and self.speculative_num_draft_tokens == self.speculative_num_steps + 1
+        )
+        self._can_use_fused_spec_decode = (
+            self.speculative_algorithm.is_nextn() and can_use_linear_fused_verify
+        )
+        self._can_use_fused_eagle3_verify = (
+            self.speculative_algorithm.is_eagle3()
+            and can_use_linear_fused_verify
+            and server_args.attention_backend == "fa"
+            and os.getenv("SGL_JAX_DISABLE_FUSED_EAGLE3_RECURRENT_DRAFT") != "1"
         )
 
         self.req_to_token_pool, self.token_to_kv_pool_allocator = target_worker.get_memory_pool()
@@ -272,6 +280,32 @@ class BaseSpecWorker:
             from sgl_jax.srt.speculative.draft_extend_fused import spec_decode
 
             batch_output = spec_decode(self, model_worker_batch, cur_allocate_lens)
+            launch_done = getattr(model_worker_batch, "launch_done", None)
+            if launch_done is not None:
+                launch_done.set()
+            return batch_output
+        if self._can_use_fused_eagle3_verify and model_worker_batch.sampling_info.is_all_greedy:
+            from sgl_jax.srt.speculative.draft_extend_fused import (
+                eagle3_recurrent_draft_extend_for_decode,
+                spec_decode_verify,
+            )
+
+            # The first decode after prefill bootstraps the token chain with the
+            # legacy recurrent draft loop. Steady-state rounds consume the chain
+            # produced by the previous fused recurrent draft-extend without
+            # launching more draft forwards here.
+            self.draft_worker.draft(model_worker_batch)
+            batch_output = spec_decode_verify(
+                self,
+                model_worker_batch,
+                cur_allocate_lens,
+                prebuilt_verify_inputs=True,
+            )
+            eagle3_recurrent_draft_extend_for_decode(
+                self.draft_worker,
+                model_worker_batch,
+                batch_output,
+            )
             launch_done = getattr(model_worker_batch, "launch_done", None)
             if launch_done is not None:
                 launch_done.set()

@@ -375,9 +375,9 @@ class EagleDraftWorker(BaseDraftWorker):
             ):
                 r = int(seq_idx) // per_dp_bs
                 base = r * per_dp_cache_len + intra_rank_off[r]
-                assert (
-                    base + aligned_len <= (r + 1) * per_dp_cache_len
-                ), f"rank {r} cache_loc overflow: {intra_rank_off[r]+aligned_len} > {per_dp_cache_len}"
+                assert base + aligned_len <= (r + 1) * per_dp_cache_len, (
+                    f"rank {r} cache_loc overflow: {intra_rank_off[r] + aligned_len} > {per_dp_cache_len}"
+                )
                 if legacy_non_overlap:
                     cache_loc_cpu[base : base + allocate_len] = token_indices_with_all_reqs[
                         seq_idx, :allocate_len
@@ -449,6 +449,12 @@ class EagleDraftWorker(BaseDraftWorker):
             model_worker_batch.spec_info_padded.topk_index,
             model_worker_batch.spec_info_padded.hidden_states,
         )
+        if self._has_precomputed_recurrent_chain(topk_index):
+            # The fused recurrent draft-extend already ran every EAGLE3 step in
+            # the previous round. Keep draft() as the lightweight verify-input
+            # builder instead of forwarding the draft model again.
+            return None, topk_index.astype(jnp.int32), None
+
         bs = model_worker_batch.seq_lens.shape[0]
         step_min_1 = self.speculative_num_steps - 1
         score_list: jax.Array = jnp.empty((bs, 1 + step_min_1 * self.topk, self.topk))
@@ -501,6 +507,15 @@ class EagleDraftWorker(BaseDraftWorker):
             hidden_states = replicate_to_mesh(self.mesh, logits_output.hidden_states)
 
         return score_list, token_list, parents_list
+
+    def _has_precomputed_recurrent_chain(self, topk_index) -> bool:
+        return (
+            self.speculative_algorithm.is_eagle3()
+            and self.topk == 1
+            and topk_index is not None
+            and len(topk_index.shape) == 2
+            and topk_index.shape[1] == self.speculative_num_steps
+        )
 
     def _map_hot_token_ids(self, topk_index):
         out_sharding = jax.typeof(topk_index).sharding

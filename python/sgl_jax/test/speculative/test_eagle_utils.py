@@ -174,6 +174,81 @@ class TestVerifyTree(CustomTestCase):
         np.testing.assert_array_equal(np.asarray(out.new_seq_lens), np.array([1, 14]))
         np.testing.assert_array_equal(np.asarray(out.sel_pos), np.array([0, 2]))
 
+    def test_recurrent_eagle3_chain_skips_draft_model_forward(self):
+        from types import SimpleNamespace
+
+        from sgl_jax.srt.speculative.eagle_draft_worker import EagleDraftWorker
+        from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        worker = object.__new__(EagleDraftWorker)
+        worker.speculative_algorithm = SpeculativeAlgorithm.EAGLE3
+        worker.speculative_num_steps = 3
+        worker.topk = 1
+        token_chain = jnp.array([[11, 12, 13], [21, 22, 23]], dtype=jnp.int32)
+        batch = SimpleNamespace(
+            spec_info_padded=SimpleNamespace(
+                topk_p=jnp.ones_like(token_chain, dtype=jnp.float32),
+                topk_index=token_chain,
+                hidden_states=jnp.zeros((2, 4), dtype=jnp.float32),
+            )
+        )
+
+        scores, tokens, parents = worker.draft_forward(batch)
+
+        self.assertIsNone(scores)
+        self.assertIsNone(parents)
+        np.testing.assert_array_equal(np.asarray(tokens), np.asarray(token_chain))
+
+    def test_eagle3_decode_metadata_uses_one_query_per_slot(self):
+        from sgl_jax.srt.layers.attention.flashattention_backend import (
+            FlashAttentionMetadata,
+        )
+        from sgl_jax.srt.speculative.draft_extend_fused import (
+            _make_eagle3_decode_metadata,
+        )
+
+        old_metadata = FlashAttentionMetadata(
+            cu_q_lens=jnp.array([0, 1, 2], dtype=jnp.int32),
+            cu_kv_lens=jnp.array([0, 8, 16], dtype=jnp.int32),
+            page_indices=jnp.arange(16, dtype=jnp.int32),
+            swa_page_indices=None,
+            seq_lens=jnp.array([4, 0], dtype=jnp.int32),
+            distribution=jnp.array([0, 0, 1], dtype=jnp.int32),
+            custom_mask=None,
+        )
+
+        metadata = _make_eagle3_decode_metadata(
+            old_metadata,
+            seq_lens=jnp.array([5, 0], dtype=jnp.int32),
+            allocated_lens=jnp.array([8, 8], dtype=jnp.int32),
+            page_size=1,
+            dp_size=1,
+        )
+
+        np.testing.assert_array_equal(np.asarray(metadata.cu_q_lens), np.array([0, 1, 2]))
+        np.testing.assert_array_equal(np.asarray(metadata.cu_kv_lens), np.array([0, 5, 5]))
+        np.testing.assert_array_equal(np.asarray(metadata.distribution), np.array([0, 0, 1]))
+        np.testing.assert_array_equal(np.asarray(metadata.seq_lens), np.array([5, 0]))
+
+    def test_eagle3_recurrent_token_keeps_raw_id_for_cross_round_state(self):
+        from sgl_jax.srt.speculative.draft_extend_fused import (
+            _eagle3_raw_and_mapped_token_from_logits,
+        )
+
+        logits = jnp.array(
+            [
+                [0.0, 1.0, 5.0, 2.0],
+                [4.0, 1.0, 0.0, 2.0],
+            ],
+            dtype=jnp.float32,
+        )
+        hot_token_ids = jnp.array([100, 101, 102, 103], dtype=jnp.int32)
+
+        raw, mapped = _eagle3_raw_and_mapped_token_from_logits(logits, hot_token_ids)
+
+        np.testing.assert_array_equal(np.asarray(raw), np.array([2, 0], dtype=np.int32))
+        np.testing.assert_array_equal(np.asarray(mapped), np.array([102, 100], dtype=np.int32))
+
     def test_greedy_prepare_uses_original_seq_lens_for_new_seq_lens(self):
         from sgl_jax.srt.speculative.draft_extend_fused import _prepare_draft_inputs
 

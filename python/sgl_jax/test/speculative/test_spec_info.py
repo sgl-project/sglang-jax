@@ -27,6 +27,30 @@ def test_eagle_draft_input_pytree_round_trip():
     np.testing.assert_array_equal(restored.future_indices, draft_input.future_indices)
 
 
+def test_eagle_draft_input_merge_downgrades_recurrent_chain_for_prefill_seed():
+    running = EagleDraftInput(
+        topk_p=np.ones((1, 3), dtype=np.float32),
+        topk_index=np.array([[11, 12, 13]], dtype=np.int32),
+        hidden_states=np.ones((1, 4), dtype=np.float32),
+        verified_id=np.array([10], dtype=np.int32),
+        allocate_lens=np.array([32], dtype=np.int32),
+    )
+    prefetched = EagleDraftInput(
+        topk_p=np.ones((1, 1), dtype=np.float32),
+        topk_index=np.array([[21]], dtype=np.int32),
+        hidden_states=np.full((1, 4), 2, dtype=np.float32),
+        verified_id=np.array([20], dtype=np.int32),
+        allocate_lens=np.array([48], dtype=np.int32),
+    )
+
+    running.merge_batch(prefetched)
+
+    assert running.topk_p.shape == (2, 1)
+    np.testing.assert_array_equal(running.topk_index, np.array([[11], [21]], dtype=np.int32))
+    np.testing.assert_array_equal(running.verified_id, np.array([10, 20], dtype=np.int32))
+    np.testing.assert_array_equal(running.allocate_lens, np.array([32, 48], dtype=np.int32))
+
+
 def test_eagle_verify_input_pytree_round_trip():
     verify_input = EagleVerifyInput(
         draft_token=np.arange(8, dtype=np.int32),
