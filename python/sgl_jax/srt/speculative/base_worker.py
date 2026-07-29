@@ -310,7 +310,7 @@ class BaseSpecWorker:
 
     def verify(self, model_worker_batch: ModelWorkerBatch, cur_allocate_lens: jax.Array):
         from sgl_jax.srt.managers.scheduler import GenerationBatchResult
-        from sgl_jax.srt.speculative.eagle_util import EagleDraftInput, EagleVerifyInput
+        from sgl_jax.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 
         spec_info: EagleVerifyInput = model_worker_batch.spec_info_padded
         spec_info.allocate_lens = cur_allocate_lens

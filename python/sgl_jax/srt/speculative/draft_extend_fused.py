@@ -1215,7 +1215,7 @@ def _build_prefill(num_layers: int, topk: int):
 
 def _prepare_verify(draft_worker, model_worker_batch):
     """Prepare fixed-shape verify placeholders while keeping chain build inside JIT."""
-    from sgl_jax.srt.speculative.eagle_util import EagleVerifyInput
+    from sgl_jax.srt.speculative.eagle_info import EagleVerifyInput
 
     draft_input = model_worker_batch.spec_info_padded
     use_relay_state = (
@@ -1442,7 +1442,7 @@ def launch_fused_draft_extend_for_decode(
     relay_valid_mask=None,
 ):
     """Launch fused MTP draft extend and return deferred host restore state."""
-    from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
+    from sgl_jax.srt.speculative.eagle_info import EagleDraftInput
 
     if batch_output.next_draft_input.verified_id.shape[0] <= 0:
         return None
@@ -1636,7 +1636,7 @@ def spec_prefill(spec_worker, model_worker_batch, launch_done=None, *, update_re
         CaptureHiddenMode,
         ForwardBatch,
     )
-    from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
+    from sgl_jax.srt.speculative.eagle_info import EagleDraftInput
 
     draft_worker = spec_worker.draft_worker
     target_worker = spec_worker.target_worker
@@ -1761,7 +1761,7 @@ def spec_prefill(spec_worker, model_worker_batch, launch_done=None, *, update_re
 
     sel = np.asarray(model_worker_batch.logits_indices_selector)
     if update_relay:
-        from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
+        from sgl_jax.srt.speculative.eagle_info import EagleDraftInput
 
         future_indices = np.asarray(model_worker_batch.req_pool_indices, dtype=np.int32)[sel]
         model_worker_batch.spec_info_padded = EagleDraftInput(
@@ -1820,7 +1820,7 @@ def spec_decode_verify(spec_worker, model_worker_batch, cur_allocate_lens):
     """Run target verify as the first speculative decode JIT."""
     from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
     from sgl_jax.srt.managers.scheduler import GenerationBatchResult
-    from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
+    from sgl_jax.srt.speculative.eagle_info import EagleDraftInput
 
     draft_worker = spec_worker.draft_worker
     target_worker = spec_worker.target_worker

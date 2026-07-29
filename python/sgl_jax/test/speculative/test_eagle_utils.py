@@ -15,10 +15,10 @@ from sgl_jax.test.test_utils import CustomTestCase
 
 class TestVerifyTree(CustomTestCase):
     def test_as_int32_array_keeps_host_metadata_on_host(self):
-        from sgl_jax.srt.speculative import eagle_util
+        from sgl_jax.srt.speculative import eagle_info
 
-        original_jnp_asarray = eagle_util.jnp.asarray
-        original_jnp_empty = eagle_util.jnp.empty
+        original_jnp_asarray = eagle_info.jnp.asarray
+        original_jnp_empty = eagle_info.jnp.empty
 
         def fail_jnp_asarray(*args, **kwargs):
             raise AssertionError("host metadata conversion must not call jnp.asarray")
@@ -27,15 +27,15 @@ class TestVerifyTree(CustomTestCase):
             raise AssertionError("host metadata placeholder must not call jnp.empty")
 
         try:
-            eagle_util.jnp.asarray = fail_jnp_asarray
-            eagle_util.jnp.empty = fail_jnp_empty
-            arr = eagle_util._as_int32_array(np.array([1, 2], dtype=np.int64))
-            scalar = eagle_util._as_int32_array(3)
-            listed = eagle_util._as_int32_array([4, 5])
-            children, _ = eagle_util.EagleDraftInput().tree_flatten()
+            eagle_info.jnp.asarray = fail_jnp_asarray
+            eagle_info.jnp.empty = fail_jnp_empty
+            arr = eagle_info._as_int32_array(np.array([1, 2], dtype=np.int64))
+            scalar = eagle_info._as_int32_array(3)
+            listed = eagle_info._as_int32_array([4, 5])
+            children, _ = eagle_info.EagleDraftInput().tree_flatten()
         finally:
-            eagle_util.jnp.asarray = original_jnp_asarray
-            eagle_util.jnp.empty = original_jnp_empty
+            eagle_info.jnp.asarray = original_jnp_asarray
+            eagle_info.jnp.empty = original_jnp_empty
 
         self.assertIsInstance(arr, np.ndarray)
         self.assertEqual(arr.dtype, np.int32)
@@ -49,7 +49,7 @@ class TestVerifyTree(CustomTestCase):
         self.assertEqual(children[7].shape, (0,))
 
         device_arr = jnp.array([6], dtype=jnp.int32)
-        self.assertIs(eagle_util._as_int32_array(device_arr), device_arr)
+        self.assertIs(eagle_info._as_int32_array(device_arr), device_arr)
 
     def test_build_chain_verify_inputs_device_matches_linear_chain_layout(self):
         from sgl_jax.srt.speculative.eagle_util import build_chain_verify_inputs_device

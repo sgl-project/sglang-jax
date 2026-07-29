@@ -90,7 +90,7 @@ from sgl_jax.srt.multimodal.tokenizer_utils import resolve_tokenizer_subdir
 from sgl_jax.srt.precision_tracer import precision_tracer
 from sgl_jax.srt.server_args import PortArgs, ServerArgs
 from sgl_jax.srt.speculative.dflash_info import DFlashDraftInput
-from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
+from sgl_jax.srt.speculative.eagle_info import EagleDraftInput
 from sgl_jax.srt.speculative.overlap_utils import (
     can_merge_spec_non_overlap_prefill,
     can_use_spec_decode_overlap,

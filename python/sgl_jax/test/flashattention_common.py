@@ -17,7 +17,7 @@ from sgl_jax.srt.mem_cache.memory_pool import (
     merge_kv,
 )
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sgl_jax.srt.speculative.eagle_util import EagleVerifyInput
+from sgl_jax.srt.speculative.eagle_info import EagleVerifyInput
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
 from sgl_jax.test.test_utils import CustomTestCase
 

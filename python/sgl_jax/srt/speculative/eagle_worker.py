@@ -13,7 +13,7 @@ from sgl_jax.srt.managers.tp_worker import ModelWorker
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sgl_jax.srt.speculative.base_worker import BaseSpecWorker
 from sgl_jax.srt.speculative.eagle_draft_worker import EagleDraftWorker
-from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
+from sgl_jax.srt.speculative.eagle_info import EagleDraftInput
 
 logger = logging.getLogger(__name__)
 

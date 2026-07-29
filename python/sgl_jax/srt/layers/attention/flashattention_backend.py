@@ -20,7 +20,7 @@ from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
+from sgl_jax.srt.speculative.eagle_info import EagleDraftInput
 from sgl_jax.srt.utils import cdiv
 from sgl_jax.srt.utils.jax_utils import device_array
 from sgl_jax.srt.utils.profiling_utils import named_scope

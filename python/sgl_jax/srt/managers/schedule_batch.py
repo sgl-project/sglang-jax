@@ -62,7 +62,7 @@ from sgl_jax.srt.speculative.overlap_utils import use_legacy_eagle3_non_overlap
 from sgl_jax.srt.utils.common_utils import get_bool_env_var, pad_to_bucket
 
 if TYPE_CHECKING:
-    from sgl_jax.srt.speculative.eagle_util import EagleDraftInput, EagleVerifyInput
+    from sgl_jax.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
     from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5

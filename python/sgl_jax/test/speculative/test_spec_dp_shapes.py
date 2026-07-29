@@ -23,7 +23,7 @@ from sgl_jax.srt.managers.scheduler_output_processor_mixin import (
     SchedulerOutputProcessorMixin,
 )
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
-from sgl_jax.srt.speculative.eagle_util import EagleDraftInput
+from sgl_jax.srt.speculative.eagle_info import EagleDraftInput
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 
 HIDDEN = 8

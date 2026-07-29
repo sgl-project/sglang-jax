@@ -16,9 +16,8 @@ from sgl_jax.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sgl_jax.srt.speculative.base_worker import BaseDraftWorker, replicate_to_mesh
+from sgl_jax.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sgl_jax.srt.speculative.eagle_util import (
-    EagleDraftInput,
-    EagleVerifyInput,
     build_chain_verify_inputs,
     build_chain_verify_inputs_device,
     build_tree_kernel_efficient,

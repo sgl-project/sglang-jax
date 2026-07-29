@@ -12,7 +12,8 @@ Core files involved:
 - `speculative/eagle_worker.py` — `EAGLEWorker(BaseSpecWorker)`, manages the full Draft-Verify loop (verify + invokes the draft worker)
 - `speculative/eagle_draft_worker.py` — `EagleDraftWorker(BaseDraftWorker)`, encapsulates multi-step generation of the draft model
 - `speculative/spec_info.py` — `SpeculativeAlgorithm` enum, `SpecInput` Protocol, NaN detection utilities
-- `speculative/eagle_util.py` — `EagleDraftInput`, `EagleVerifyInput`, tree construction, sampling, verification logic
+- `speculative/eagle_info.py` — `EagleDraftInput`, `EagleVerifyInput`, batch-state transitions, sampling, verification logic
+- `speculative/eagle_util.py` — tree construction and shared KV mapping helpers
 - `kernels/speculative/` — Tree construction / sampling / verification Pallas kernels
 - `models/llama_eagle3.py` — EAGLE3 draft model implementation
 - `models/mimo_mtp.py` — MiMo V1 MTP draft model
@@ -433,9 +434,9 @@ for i, req in enumerate(batch.reqs):
 | `EAGLEWorker.draft()` | `speculative/eagle_worker.py` | Multi-step draft + tree construction |
 | `EAGLEWorker.verify()` | `speculative/eagle_worker.py` | Target verification + token acceptance |
 | `EAGLEWorker.draft_extend_after_verify()` | `speculative/eagle_worker.py` | Post-verify draft state update |
-| `EagleDraftInput` | `speculative/eagle_util.py` | Draft input (pytree-registered) |
-| `EagleVerifyInput` | `speculative/eagle_util.py` | Verify input (tree mask + LCRS pointers) |
-| `EagleVerifyInput.sample()` | `speculative/eagle_util.py` | Verification dispatch (Greedy / Stochastic) |
+| `EagleDraftInput` | `speculative/eagle_info.py` | Draft input (pytree-registered) |
+| `EagleVerifyInput` | `speculative/eagle_info.py` | Verify input (tree mask + LCRS pointers) |
+| `EagleVerifyInput.sample()` | `speculative/eagle_info.py` | Verification dispatch (Greedy / Stochastic) |
 | `build_tree_kernel_efficient()` | `speculative/eagle_util.py` | Two-stage tree construction |
 | `topk_probs_from_logits()` | `speculative/eagle_util.py` | Efficient Top-K probability extraction (JIT) |
 | `build_eagle_tree_structure()` | `kernels/speculative/` | Pallas tree-structure kernel |

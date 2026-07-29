@@ -1,7 +1,7 @@
 import jax
 import numpy as np
 
-from sgl_jax.srt.speculative.eagle_util import EagleDraftInput, EagleVerifyInput
+from sgl_jax.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 
 
 def test_eagle_draft_input_pytree_round_trip():
