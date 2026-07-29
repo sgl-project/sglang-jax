@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
@@ -65,7 +66,10 @@ def test_explicit_reference_uses_existing_prefill(monkeypatch):
 
 
 def test_tpu_inference_v3_uses_distinct_frozen_adapter(monkeypatch):
-    monkeypatch.setenv("PALLAS_INTERPRET", "1")
+    monkeypatch.setattr(
+        "sgl_jax.srt.kernels.gdn.tpu_inference_adapter._mesh_devices",
+        lambda _: (SimpleNamespace(platform="tpu"),),
+    )
     backend = _backend(monkeypatch, impl="tpu_inference_v3", dtype=jnp.bfloat16)
     monkeypatch.setenv("SGLANG_JAX_GDN_PREFILL_IMPL", "reference")
 
@@ -90,13 +94,16 @@ def test_invalid_selector_fails_during_initialization(monkeypatch):
     ],
 )
 def test_tpu_inference_v3_rejects_unsupported_startup_capability(monkeypatch, dtype, kwargs, match):
-    monkeypatch.setenv("PALLAS_INTERPRET", "1")
+    monkeypatch.setattr(
+        "sgl_jax.srt.kernels.gdn.tpu_inference_adapter._mesh_devices",
+        lambda _: (SimpleNamespace(platform="tpu"),),
+    )
     with pytest.raises(GDNPrefillCapabilityError, match=match):
         _backend(monkeypatch, impl="tpu_inference_v3", dtype=dtype, **kwargs)
 
 
-def test_tpu_inference_v3_requires_tpu_mesh_without_interpret(monkeypatch):
-    monkeypatch.delenv("PALLAS_INTERPRET", raising=False)
+def test_tpu_inference_v3_requires_tpu_mesh_even_with_interpret(monkeypatch):
+    monkeypatch.setenv("PALLAS_INTERPRET", "1")
 
     with pytest.raises(GDNPrefillCapabilityError, match="TPU"):
         _backend(monkeypatch, impl="tpu_inference_v3", dtype=jnp.bfloat16)

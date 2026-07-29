@@ -245,8 +245,12 @@ def test_invalid_track_indices_fail_before_vendor_call(track_indices, match):
 
 
 def test_forward_extend_rejects_active_dummy_track_before_vendor(monkeypatch):
-    monkeypatch.setenv("PALLAS_INTERPRET", "1")
     monkeypatch.setenv("SGLANG_JAX_GDN_PREFILL_IMPL", "tpu_inference_v3")
+    monkeypatch.setattr(
+        gdn_backend,
+        "validate_tpu_inference_v3_capability",
+        lambda **_: None,
+    )
 
     def vendor(*args, **kwargs):
         del args, kwargs
@@ -388,8 +392,12 @@ class _ForwardFixture:
 
 
 def test_forward_extend_executes_the_callable_frozen_at_initialization(monkeypatch):
-    monkeypatch.setenv("PALLAS_INTERPRET", "1")
     monkeypatch.setenv("SGLANG_JAX_GDN_PREFILL_IMPL", "tpu_inference_v3")
+    monkeypatch.setattr(
+        gdn_backend,
+        "validate_tpu_inference_v3_capability",
+        lambda **_: None,
+    )
     fixture = _ForwardFixture()
     monkeypatch.setattr(adapter, "_vendor_fused_conv1d_gdn", fixture.vendor, raising=False)
     backend = gdn_backend.GDNAttnBackend(

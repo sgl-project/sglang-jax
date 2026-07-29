@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from collections.abc import Iterable
 
 import jax
@@ -13,11 +12,6 @@ from jax.sharding import PartitionSpec as P
 
 class GDNPrefillCapabilityError(RuntimeError):
     """An explicitly requested GDN prefill implementation is unsupported."""
-
-
-def pallas_interpret_enabled() -> bool:
-    """Whether Pallas interpret mode explicitly permits local correctness runs."""
-    return os.environ.get("PALLAS_INTERPRET", "").strip().lower() in ("1", "true")
 
 
 def _mesh_devices(mesh) -> tuple[object, ...]:
@@ -47,9 +41,10 @@ def validate_tpu_inference_v3_capability(
     mesh_is_tpu = bool(devices) and all(
         getattr(device, "platform", None) == "tpu" for device in devices
     )
-    if not mesh_is_tpu and not pallas_interpret_enabled():
+    if not mesh_is_tpu:
         raise GDNPrefillCapabilityError(
-            "tpu_inference_v3 requires a TPU mesh unless PALLAS_INTERPRET is enabled."
+            "tpu_inference_v3 requires a TPU mesh; CPU Pallas interpret is not "
+            "a supported execution path for the fused DMA/state pipeline."
         )
     if dtype is None:
         raise GDNPrefillCapabilityError("tpu_inference_v3 requires a BF16 activation dtype.")
