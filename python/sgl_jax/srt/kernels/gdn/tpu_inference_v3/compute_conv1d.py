@@ -53,7 +53,7 @@ def causal_conv1d(
 
     # Last prev_kernel_size elements needs to be returned as conv_state. However,
     # real_sizes may be smaller than chunk_size. Therefore, slicing last
-    # prev_kernel_size elements does not gurantee numeric correctness. Instead,
+    # prev_kernel_size elements does not guarantee numeric correctness. Instead,
     # kernel iterate each rows and perform masking to fetch correct values.
     # NOTE: lhs[:, : prev_kernel_size] can be skipped since they were loaded from
     # previous conv states.
