@@ -170,16 +170,25 @@ class BaseSpecWorker:
                 "Spec decode-overlap entry only supports decode batches; "
                 "prefill overlap uses forward_batch_speculative_generation()."
             )
-        if not self._can_use_fused_spec_decode:
-            raise NotImplementedError("Spec overlap entry only supports fused NEXTN topk=1 decode.")
+        if not (self._can_use_fused_spec_decode or self._can_use_fused_eagle3_verify):
+            raise NotImplementedError(
+                "Spec overlap entry only supports fused linear NEXTN or EAGLE3 decode."
+            )
 
         self.init_spec_relay_buffers()
         self._prepare_overlap_sampling_info(model_worker_batch)
         cur_allocate_lens = self._get_cur_allocate_lens(model_worker_batch)
 
-        from sgl_jax.srt.speculative.draft_extend_fused import spec_decode_overlap
+        if self._can_use_fused_eagle3_verify:
+            from sgl_jax.srt.speculative.draft_extend_fused import (
+                spec_decode_eagle3_overlap,
+            )
 
-        result = spec_decode_overlap(self, model_worker_batch, cur_allocate_lens)
+            result = spec_decode_eagle3_overlap(self, model_worker_batch, cur_allocate_lens)
+        else:
+            from sgl_jax.srt.speculative.draft_extend_fused import spec_decode_overlap
+
+            result = spec_decode_overlap(self, model_worker_batch, cur_allocate_lens)
         launch_done = getattr(model_worker_batch, "launch_done", None)
         if launch_done is not None:
             launch_done.set()
@@ -261,6 +270,14 @@ class BaseSpecWorker:
             self.draft_worker.draft_extend_for_prefill(
                 model_worker_batch, logits_output.hidden_states, next_token_ids
             )
+            # The generic overlap loop waits for the *current* batch to finish
+            # enqueueing before it resolves the previous batch.  Fused prefill
+            # publishes this event inside spec_prefill(); the recurrent EAGLE
+            # prefill path above must do the same, otherwise two consecutive
+            # prefills wait on an event that nobody sets.
+            batch_launch_done = getattr(model_worker_batch, "launch_done", None)
+            if batch_launch_done is not None:
+                batch_launch_done.set()
             return GenerationBatchResult(
                 logits_output=logits_output,
                 next_token_ids=next_token_ids,

@@ -1,5 +1,6 @@
 import jax
 import numpy as np
+import pytest
 
 from sgl_jax.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 
@@ -49,6 +50,36 @@ def test_eagle_draft_input_merge_downgrades_recurrent_chain_for_prefill_seed():
     np.testing.assert_array_equal(running.topk_index, np.array([[11], [21]], dtype=np.int32))
     np.testing.assert_array_equal(running.verified_id, np.array([10, 20], dtype=np.int32))
     np.testing.assert_array_equal(running.allocate_lens, np.array([32, 48], dtype=np.int32))
+
+
+def test_eagle_draft_input_relay_merge_and_filter_preserve_request_indices():
+    running = EagleDraftInput(
+        future_indices=np.array([3, 5], dtype=np.int32),
+        allocate_lens=np.array([32, 48], dtype=np.int32),
+    )
+    joined = EagleDraftInput(
+        future_indices=np.array([7], dtype=np.int32),
+        allocate_lens=np.array([64], dtype=np.int32),
+    )
+
+    running.merge_batch(joined)
+    running.filter_batch(np.array([2, 0], dtype=np.int32), has_been_filtered=False)
+
+    np.testing.assert_array_equal(running.future_indices, np.array([7, 3], dtype=np.int32))
+    np.testing.assert_array_equal(running.allocate_lens, np.array([64, 32], dtype=np.int32))
+
+
+def test_eagle_draft_input_rejects_bootstrap_relay_merge():
+    relay = EagleDraftInput(future_indices=np.array([3], dtype=np.int32))
+    bootstrap = EagleDraftInput(
+        topk_p=np.ones((1, 1), dtype=np.float32),
+        topk_index=np.array([[11]], dtype=np.int32),
+        hidden_states=np.ones((1, 4), dtype=np.float32),
+        verified_id=np.array([10], dtype=np.int32),
+    )
+
+    with pytest.raises(AssertionError, match="future_indices"):
+        relay.merge_batch(bootstrap)
 
 
 def test_eagle_verify_input_pytree_round_trip():

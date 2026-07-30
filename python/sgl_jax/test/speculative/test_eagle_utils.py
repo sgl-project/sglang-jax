@@ -15,6 +15,41 @@ from sgl_jax.test.test_utils import CustomTestCase
 
 
 class TestVerifyTree(CustomTestCase):
+    def test_eagle3_overlap_server_args_allow_linear_fa(self):
+        from sgl_jax.srt.server_args import ServerArgs
+
+        args = ServerArgs(
+            model_path="target",
+            speculative_algorithm="EAGLE3",
+            speculative_draft_model_path="draft",
+            speculative_num_steps=3,
+            speculative_num_draft_tokens=4,
+            speculative_eagle_topk=1,
+            attention_backend="fa",
+            disable_overlap_schedule=False,
+            grammar_backend="none",
+        )
+
+        args.check_server_args()
+
+    def test_eagle3_overlap_server_args_reject_non_fa(self):
+        from sgl_jax.srt.server_args import ServerArgs
+
+        args = ServerArgs(
+            model_path="target",
+            speculative_algorithm="EAGLE3",
+            speculative_draft_model_path="draft",
+            speculative_num_steps=3,
+            speculative_num_draft_tokens=4,
+            speculative_eagle_topk=1,
+            attention_backend="native",
+            disable_overlap_schedule=False,
+            grammar_backend="none",
+        )
+
+        with self.assertRaisesRegex(ValueError, "EAGLE3\\+FA"):
+            args.check_server_args()
+
     def test_as_int32_array_keeps_host_metadata_on_host(self):
         from sgl_jax.srt.speculative import eagle_info
 
@@ -288,6 +323,103 @@ class TestVerifyTree(CustomTestCase):
             np.array([10, 11, 12, 13, 20, 21, 22, 23], dtype=np.int32),
         )
 
+    def test_fused_chain_builder_aligns_replicated_bootstrap_to_data(self):
+        from jax.sharding import Mesh, NamedSharding
+        from jax.sharding import PartitionSpec as P
+
+        from sgl_jax.srt.speculative.draft_extend_fused import (
+            _build_chain_verify_arrays,
+        )
+
+        mesh = Mesh(
+            np.asarray(jax.devices()),
+            ("data",),
+            axis_types=(jax.sharding.AxisType.Explicit,),
+        )
+        verified_id = jax.device_put(
+            jnp.array([7, 8], dtype=jnp.int32),
+            NamedSharding(mesh, P("data")),
+        )
+        token_list = jax.device_put(
+            jnp.array([[11, 12, 13], [21, 22, 23]], dtype=jnp.int32),
+            NamedSharding(mesh, P(None, None)),
+        )
+        seq_lens = jax.device_put(
+            jnp.array([10, 20], dtype=jnp.int32),
+            NamedSharding(mesh, P("data")),
+        )
+
+        build = jax.jit(
+            lambda verified, tokens, lengths: _build_chain_verify_arrays(
+                verified_id=verified,
+                token_list=tokens,
+                seq_lens=lengths,
+                num_verify_tokens=4,
+                batch_size=2,
+            )
+        )
+        draft_tokens, *_ = build(verified_id, token_list, seq_lens)
+
+        np.testing.assert_array_equal(
+            np.asarray(draft_tokens),
+            np.array([7, 11, 12, 13, 8, 21, 22, 23], dtype=np.int32),
+        )
+
+    def test_spec_relay_gather_restores_flat_data_sharding(self):
+        from jax.sharding import Mesh, NamedSharding
+        from jax.sharding import PartitionSpec as P
+
+        from sgl_jax.srt.speculative.relay_buffer import (
+            SpecRelayBuffers,
+            gather_spec_relay_buffers,
+        )
+
+        mesh = Mesh(
+            np.asarray(jax.devices()),
+            ("data",),
+            axis_types=(jax.sharding.AxisType.Explicit,),
+        )
+        state_sharding = NamedSharding(mesh, P("data", None, None))
+        id_sharding = NamedSharding(mesh, P("data", None))
+        buffers = SpecRelayBuffers(
+            topk_index=jax.device_put(
+                jnp.arange(12, dtype=jnp.int32).reshape(1, 4, 3),
+                state_sharding,
+            ),
+            hidden_states=jax.device_put(
+                jnp.arange(8, dtype=jnp.float32).reshape(1, 4, 2),
+                state_sharding,
+            ),
+            verified_id=jax.device_put(
+                jnp.array([[10, 11, 12, 13]], dtype=jnp.int32),
+                id_sharding,
+            ),
+            new_seq_lens=jax.device_put(
+                jnp.array([[20, 21, 22, 23]], dtype=jnp.int32),
+                id_sharding,
+            ),
+        )
+        future_indices = jax.device_put(
+            jnp.array([1, 3], dtype=jnp.int32),
+            NamedSharding(mesh, P("data")),
+        )
+
+        with jax.set_mesh(mesh):
+            topk_index, hidden_states, verified_id, new_seq_lens = (
+                gather_spec_relay_buffers(
+                    buffers,
+                    future_indices,
+                    dp_size=1,
+                )
+            )
+
+        self.assertEqual(topk_index.sharding.spec, P("data", None))
+        self.assertEqual(hidden_states.sharding.spec, P("data", None))
+        self.assertEqual(verified_id.sharding.spec, P("data"))
+        self.assertEqual(new_seq_lens.sharding.spec, P("data"))
+        np.testing.assert_array_equal(np.asarray(verified_id), np.array([11, 13]))
+        np.testing.assert_array_equal(np.asarray(new_seq_lens), np.array([21, 23]))
+
     def test_fused_verify_reuses_device_placeholders(self):
         from types import SimpleNamespace
 
@@ -320,6 +452,35 @@ class TestVerifyTree(CustomTestCase):
         _prepare_verify(worker, batch, draft_padding_prepared=True)
 
         self.assertIs(batch.spec_info_padded, first)
+
+    def test_fused_verify_relay_skips_eager_hot_token_mapping(self):
+        from types import SimpleNamespace
+
+        from jax.sharding import Mesh
+
+        from sgl_jax.srt.speculative.draft_extend_fused import _prepare_verify
+        from sgl_jax.srt.speculative.eagle_info import EagleDraftInput
+
+        calls = []
+        worker = SimpleNamespace(
+            mesh=Mesh(np.asarray(jax.devices()), ("data",)),
+            speculative_num_steps=3,
+            speculative_num_draft_tokens=4,
+            model_config=SimpleNamespace(hidden_size=8),
+            padding_for_decode=lambda _batch, *, map_hot_token_ids: calls.append(
+                map_hot_token_ids
+            ),
+        )
+        batch = SimpleNamespace(
+            seq_lens=np.array([10, 20], dtype=np.int32),
+            spec_info_padded=EagleDraftInput(
+                future_indices=np.array([3, 5], dtype=np.int32)
+            ),
+        )
+
+        _prepare_verify(worker, batch)
+
+        self.assertEqual(calls, [False])
 
     def test_target_verify_logits_metadata_has_no_unused_device_inputs(self):
         from types import SimpleNamespace
@@ -448,6 +609,33 @@ class TestVerifyTree(CustomTestCase):
         np.testing.assert_array_equal(np.asarray(metadata.cu_kv_lens), np.array([0, 5, 5]))
         np.testing.assert_array_equal(np.asarray(metadata.distribution), np.array([0, 0, 1]))
         np.testing.assert_array_equal(np.asarray(metadata.seq_lens), np.array([5, 0]))
+
+    def test_target_verify_metadata_accepts_page_only_base_metadata(self):
+        from sgl_jax.srt.layers.attention.flashattention_backend import (
+            FlashAttentionMetadata,
+        )
+        from sgl_jax.srt.speculative.draft_extend_fused import (
+            _make_target_verify_metadata,
+        )
+
+        metadata = _make_target_verify_metadata(
+            FlashAttentionMetadata(
+                page_indices=jnp.arange(16, dtype=jnp.int32),
+                swa_page_indices=None,
+                seq_lens=None,
+                custom_mask=None,
+            ),
+            verify_seq_lens=jnp.array([4, 0], dtype=jnp.int32),
+            allocated_lens=jnp.array([8, 8], dtype=jnp.int32),
+            speculative_num_draft_tokens=4,
+            page_size=1,
+            dp_size=1,
+        )
+
+        np.testing.assert_array_equal(np.asarray(metadata.cu_q_lens), np.array([0, 4, 4]))
+        np.testing.assert_array_equal(np.asarray(metadata.cu_kv_lens), np.array([0, 8, 8]))
+        np.testing.assert_array_equal(np.asarray(metadata.seq_lens), np.array([8, 0]))
+        np.testing.assert_array_equal(np.asarray(metadata.distribution), np.array([0, 1, 1]))
 
     def test_eagle3_recurrent_token_keeps_raw_id_for_cross_round_state(self):
         from sgl_jax.srt.speculative.draft_extend_fused import (

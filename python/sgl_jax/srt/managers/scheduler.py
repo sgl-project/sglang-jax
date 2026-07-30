@@ -474,6 +474,11 @@ class Scheduler(
         self.cur_batch: ScheduleBatch | None = None
         # The last forward batch
         self.last_batch: ScheduleBatch | None = None
+        # EAGLE3 recurrent prefill produces a width-1 bootstrap state, while
+        # overlap steady state is req-indexed relay state.  When new prefills
+        # join an active decode batch, park the latter for one round while the
+        # former runs its first decode and transitions to relay state.
+        self._eagle3_overlap_parked_batch: ScheduleBatch | None = None
         self.forward_ct = 0
         # HiCache: per-round H2D flush plans from PrefillAdder, drained donation-safe.
         self._pending_h2d: list[tuple[list[int], list[int]]] = []
@@ -1926,6 +1931,22 @@ class Scheduler(
         chunked_req_to_exclude = self._prepare_chunked_reqs_to_exclude()
         self._process_pending_chunked_aborts()
 
+        force_eagle3_bootstrap_decode = False
+        if (
+            self._eagle3_overlap_parked_batch is not None
+            and not (self.last_batch and self.last_batch.forward_mode.is_extend())
+        ):
+            # The isolated bootstrap decode has now published relay state.
+            # Restore the older running requests first so request/spec state
+            # ordering stays stable across the temporary split.
+            parked_batch = self._eagle3_overlap_parked_batch
+            if self.running_batch.is_empty():
+                self.running_batch = parked_batch
+            else:
+                parked_batch.merge_batch(self.running_batch)
+                self.running_batch = parked_batch
+            self._eagle3_overlap_parked_batch = None
+
         # Merge the prefill batch into the running batch
         if self.last_batch and self.last_batch.forward_mode.is_extend():
             # Consistency check: each last_batch.reqs_info[dp_rank].chunked_req should match
@@ -1960,6 +1981,31 @@ class Scheduler(
                     # D pool full: park and retry migrate after D reqs finish.
                     assert self._pd_pending_migrate is None
                     self._pd_pending_migrate = self.last_batch
+                elif (
+                    self.enable_overlap
+                    and self.spec_algorithm is not None
+                    and self.spec_algorithm.is_eagle3()
+                    and any(
+                        info.reqs
+                        and (
+                            info.spec_info is None
+                            or getattr(info.spec_info, "future_indices", None) is None
+                        )
+                        for info in self.last_batch.reqs_info
+                    )
+                ):
+                    # A recurrent EAGLE3 prefill carries only the first draft
+                    # token.  Run its first decode in isolation so that
+                    # spec_decode_eagle3_overlap can expand the chain and
+                    # publish req-indexed relay state.  Directly merging this
+                    # bootstrap state with an existing relay batch either
+                    # violates EagleDraftInput's invariant or creates a device
+                    # dependency cycle.
+                    assert self._eagle3_overlap_parked_batch is None
+                    if not self.running_batch.is_empty():
+                        self._eagle3_overlap_parked_batch = self.running_batch
+                    self.running_batch = self.last_batch
+                    force_eagle3_bootstrap_decode = True
                 elif self.running_batch.is_empty():
                     self.running_batch = self.last_batch
                 elif (
@@ -1994,7 +2040,11 @@ class Scheduler(
             and not self.running_batch.is_prefill_only
             and self._consec_decode < df
         )
-        if skip_prefill or (self.pd and self._pd_pending_migrate is not None):
+        if (
+            force_eagle3_bootstrap_decode
+            or skip_prefill
+            or (self.pd and self._pd_pending_migrate is not None)
+        ):
             new_batch = None
         elif self.pd:
             with self._pd_swap_p_pool():
