@@ -2107,7 +2107,7 @@ def calculate_metrics(
         max_output_tokens_per_s=max_output_tokens_per_s,
         max_concurrent_requests=max_concurrent_requests,
         total_cached_tokens=total_cached,
-        cache_hit_rate=total_cached / total_prompt_tokens if total_prompt_tokens > 0 else 0.0,
+        cache_hit_rate=(total_cached / total_prompt_tokens if total_prompt_tokens > 0 else 0.0),
     )
 
     return metrics, output_lens
@@ -2117,8 +2117,8 @@ MULTI_TURN_BACKENDS = {"sglang-oai-chat", "vllm-chat", "lmdeploy-chat"}
 
 
 def _is_multi_turn_prompt(prompt: Any) -> bool:
-    return isinstance(prompt, list) and bool(prompt) and all(
-        isinstance(turn, str) for turn in prompt
+    return (
+        isinstance(prompt, list) and bool(prompt) and all(isinstance(turn, str) for turn in prompt)
     )
 
 

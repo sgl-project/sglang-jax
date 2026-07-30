@@ -106,9 +106,7 @@ def _validate_track_indices(
             & ~jnp.eye(track_indices.size, dtype=jnp.bool_)
         )
         active_dummy = jnp.any(active & (track_indices == 0))
-        out_of_range = jnp.any(
-            active & ((track_indices < 0) | (track_indices >= pool_size))
-        )
+        out_of_range = jnp.any(active & ((track_indices < 0) | (track_indices >= pool_size)))
         aliases_running = jnp.any(
             active[:, None] & (track_indices[:, None] == state_indices[None, :])
         )
@@ -301,9 +299,7 @@ def tpu_inference_v3_prefill(
         raise ValueError("track_indices and track_mask must either both be set or both be None.")
     dp = int(backend.mesh.shape.get("data", 1))
     if conv_state.shape[0] % dp:
-        raise ValueError(
-            f"state pool size {conv_state.shape[0]} must be divisible by DP={dp}."
-        )
+        raise ValueError(f"state pool size {conv_state.shape[0]} must be divisible by DP={dp}.")
     invalid_track = _validate_track_indices(
         track_indices,
         state_indices,

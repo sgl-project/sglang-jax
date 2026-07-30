@@ -117,7 +117,6 @@ class MetadataRef:
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class BaseBufferedRef(pltpu.BufferedRef):
-
     cfg: config.GDNConfig = dataclasses.field(metadata=dict(static=True))
     # NOTE: Despite being ref, metadata_ref should be set to static. This is
     # because the memory will be allocated outside of kernel and metadata_ref
@@ -147,8 +146,7 @@ class BaseBufferedRef(pltpu.BufferedRef):
             cfg=cfg,
             metadata_ref=metadata_ref,
             **{
-                f.name: getattr(standard_ref, f.name)
-                for f in dataclasses.fields(pltpu.BufferedRef)
+                f.name: getattr(standard_ref, f.name) for f in dataclasses.fields(pltpu.BufferedRef)
             },
         )
 
@@ -156,7 +154,6 @@ class BaseBufferedRef(pltpu.BufferedRef):
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class InBufferedRef(BaseBufferedRef):
-
     def copy_in(self, src_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
         assert self.sem_recvs is not None
         assert self.window_ref is not None
@@ -196,7 +193,6 @@ class InBufferedRef(BaseBufferedRef):
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class OutBufferedRef(BaseBufferedRef):
-
     def copy_out(self, dst_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
         assert self.sem_sends is not None
         assert self.window_ref is not None
@@ -259,12 +255,10 @@ class StateBufferedRef(BaseBufferedRef):
         p_id = grid_indices[0]
 
         for idx in range(self.cfg.seq_tile_size):
-
             is_first_tile = self.metadata_ref.p_id_is_first_tile[p_id, idx]
             s_idx = self.metadata_ref.p_id_to_s_idx[p_id, idx]
             state_idx = self.metadata_ref.s_idx_to_state_indices[s_idx]
-            has_initial_state = self.metadata_ref.s_idx_has_initial_state[
-                s_idx]
+            has_initial_state = self.metadata_ref.s_idx_has_initial_state[s_idx]
             should_read = jnp.logical_and(is_first_tile, has_initial_state)
             dma_size = jnp.where(should_read, 1, 0)
 
@@ -289,8 +283,7 @@ class StateBufferedRef(BaseBufferedRef):
         for idx in range(self.cfg.seq_tile_size):
             is_first_tile = self.metadata_ref.p_id_is_first_tile[p_id, idx]
             s_idx = self.metadata_ref.p_id_to_s_idx[p_id, idx]
-            has_initial_state = self.metadata_ref.s_idx_has_initial_state[
-                s_idx]
+            has_initial_state = self.metadata_ref.s_idx_has_initial_state[s_idx]
             should_read = jnp.logical_and(is_first_tile, has_initial_state)
             dma_size += jnp.where(should_read, 1, 0)
 
@@ -358,12 +351,12 @@ def create_allocs(
     recurrent_state_ref: jax.Array,
     cfg: config.GDNConfig,
 ) -> tuple[
-        InBufferedRef,
-        InBufferedRef,
-        InBufferedRef,
-        StateBufferedRef,
-        StateBufferedRef,
-        OutBufferedRef,
+    InBufferedRef,
+    InBufferedRef,
+    InBufferedRef,
+    StateBufferedRef,
+    StateBufferedRef,
+    OutBufferedRef,
 ]:
     qkv_shape = (cfg.seq_tile_size, cfg.chunk_size, 1, cfg.dim_size)
     ba_shape = (cfg.seq_tile_size, cfg.chunk_size, 1, cfg.aligned_num_v_heads)
@@ -376,8 +369,13 @@ def create_allocs(
     )
     # One state checkpoint per window position per sequence (a single one
     # without speculative decoding, where window_size is 1).
-    conv_shape = (cfg.seq_tile_size, cfg.window_size, cfg.prev_kernel_size, 1,
-                  cfg.dim_size)
+    conv_shape = (
+        cfg.seq_tile_size,
+        cfg.window_size,
+        cfg.prev_kernel_size,
+        1,
+        cfg.dim_size,
+    )
     recurrent_shape = (
         cfg.seq_tile_size,
         cfg.window_size,
@@ -386,13 +384,12 @@ def create_allocs(
         cfg.v_head_dim,
     )
 
-    pipeline_mode = pl.Buffered(buffer_count=cfg.num_buffers,
-                                use_lookahead=False)
+    pipeline_mode = pl.Buffered(buffer_count=cfg.num_buffers, use_lookahead=False)
 
     block_spec_partial = functools.partial(
         pl.BlockSpec,
         memory_space=pltpu.VMEM,
-        index_map=lambda i: (i, ),
+        index_map=lambda i: (i,),
         pipeline_mode=pipeline_mode,
     )
 
@@ -427,9 +424,7 @@ def create_allocs(
         cfg=cfg,
         metadata_ref=metadata_ref,
     )
-    conv_alloc = state_buffered_partial(spec=conv_spec,
-                                        dtype_or_type=conv_state_ref)
-    recurrent_alloc = state_buffered_partial(spec=recurrent_spec,
-                                             dtype_or_type=recurrent_state_ref)
+    conv_alloc = state_buffered_partial(spec=conv_spec, dtype_or_type=conv_state_ref)
+    recurrent_alloc = state_buffered_partial(spec=recurrent_spec, dtype_or_type=recurrent_state_ref)
 
     return qkv_alloc, b_alloc, a_alloc, conv_alloc, recurrent_alloc, out_alloc

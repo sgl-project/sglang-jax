@@ -19,8 +19,7 @@ from sgl_jax.srt.kernels.gdn.tpu_inference_v3 import config
 
 
 def l2_norm(x: jax.Array, eps: float = 1e-6) -> jax.Array:
-    norm = jnp.sqrt(
-        jnp.sum(x * x, axis=-1, keepdims=True, dtype=x.dtype) + eps)
+    norm = jnp.sqrt(jnp.sum(x * x, axis=-1, keepdims=True, dtype=x.dtype) + eps)
     return x / norm
 
 
@@ -74,7 +73,7 @@ def invert_triangular_matrix(t: jax.Array, block_size=16) -> jax.Array:
             prev_sum = jax.lax.dot(
                 interaction_t,
                 solved_x,
-                dimension_numbers=(((2, ), (1, )), ((0, ), (0, ))),
+                dimension_numbers=(((2,), (1,)), ((0,), (0,))),
                 preferred_element_type=jnp.float32,
             )
             target_b = e_block - prev_sum
@@ -87,8 +86,7 @@ def invert_triangular_matrix(t: jax.Array, block_size=16) -> jax.Array:
     return jnp.concatenate(x_blocks, axis=1)
 
 
-def fused_transpose_broadcast(x: jax.Array, src_dim: int,
-                              dst_dim: int) -> jax.Array:
+def fused_transpose_broadcast(x: jax.Array, src_dim: int, dst_dim: int) -> jax.Array:
     """Perform 1D transpose where results are broadcasted along src_dim."""
     assert x.shape[dst_dim] == 1
 
@@ -122,22 +120,18 @@ def chunked_gdn_per_seq(
     # [1, 1, num_v_heads]
     g_cum_sum_list = [gating_log[:, :1]]
     for row in range(1, cfg.chunk_size):
-        g_cum_sum_list.append(g_cum_sum_list[-1] + gating_log[:, row:row + 1])
+        g_cum_sum_list.append(g_cum_sum_list[-1] + gating_log[:, row : row + 1])
     # [1, chunk, num_v_heads]
     g_cum_sum_log = jnp.concat(g_cum_sum_list, axis=1)
 
     # [num_v_heads, chunk, 1]
-    g_cum_sum_log = fused_transpose_broadcast(g_cum_sum_log,
-                                              src_dim=2,
-                                              dst_dim=0)
-    g_cum_sum_log = g_cum_sum_log[:cfg.num_v_heads]
+    g_cum_sum_log = fused_transpose_broadcast(g_cum_sum_log, src_dim=2, dst_dim=0)
+    g_cum_sum_log = g_cum_sum_log[: cfg.num_v_heads]
     beta = fused_transpose_broadcast(beta, src_dim=2, dst_dim=0)
-    beta_large = beta[:cfg.num_v_heads]
+    beta_large = beta[: cfg.num_v_heads]
 
     # [num_v_heads, 1, chunk]
-    g_cum_sum_log_t = fused_transpose_broadcast(g_cum_sum_log,
-                                                src_dim=1,
-                                                dst_dim=2)
+    g_cum_sum_log_t = fused_transpose_broadcast(g_cum_sum_log, src_dim=1, dst_dim=2)
     # [num_v_heads, chunk, chunk]
     g_cum_sum_diff_log = g_cum_sum_log - g_cum_sum_log_t
     gating_map = jnp.exp(g_cum_sum_diff_log)
@@ -164,7 +158,7 @@ def chunked_gdn_per_seq(
     beta_k_k_t = jax.lax.dot(
         k_beta_repeat,
         k_repeat,
-        dimension_numbers=(((2, ), (2, )), ((0, ), (0, ))),
+        dimension_numbers=(((2,), (2,)), ((0,), (0,))),
         preferred_element_type=jnp.float32,
     ).astype(cfg.dtypes.compute)
     gating_beta_k_k_t = gating_map_masked * beta_k_k_t
@@ -185,7 +179,7 @@ def chunked_gdn_per_seq(
     merged_uw = jax.lax.dot(
         t_inv,
         merged_v_k,
-        dimension_numbers=(((2, ), (1, )), ((0, ), (0, ))),
+        dimension_numbers=(((2,), (1,)), ((0,), (0,))),
         preferred_element_type=jnp.float32,
     ).astype(cfg.dtypes.compute)
 
@@ -202,7 +196,7 @@ def chunked_gdn_per_seq(
     merged_ws_out_updated = jax.lax.dot(
         merged_w_q,
         state_prev,
-        dimension_numbers=(((2, ), (1, )), ((0, ), (0, ))),
+        dimension_numbers=(((2,), (1,)), ((0,), (0,))),
         preferred_element_type=jnp.float32,
     )
 
@@ -220,7 +214,7 @@ def chunked_gdn_per_seq(
     state_new = jax.lax.dot(
         k_repeat_gating,
         u_ws,
-        dimension_numbers=(((1, ), (1, )), ((0, ), (0, ))),
+        dimension_numbers=(((1,), (1,)), ((0,), (0,))),
         preferred_element_type=jnp.float32,
     )
 
@@ -232,7 +226,7 @@ def chunked_gdn_per_seq(
     out_qk = jax.lax.dot(
         q_large,
         k_large,
-        dimension_numbers=(((2, ), (2, )), ((0, ), (0, ))),
+        dimension_numbers=(((2,), (2,)), ((0,), (0,))),
         preferred_element_type=jnp.float32,
     ).astype(cfg.dtypes.compute)
     # NOTE: must perform repeat after matmul to reduce required compute.
@@ -245,7 +239,7 @@ def chunked_gdn_per_seq(
     out_new = jax.lax.dot(
         out_qk,
         u_ws,
-        dimension_numbers=(((2, ), (1, )), ((0, ), (0, ))),
+        dimension_numbers=(((2,), (1,)), ((0,), (0,))),
         preferred_element_type=jnp.float32,
     )
     out = out_updated + out_new
@@ -275,9 +269,7 @@ def chunked_gdn(
     assert not cfg.use_recurrent
 
     mask_dtype = get_mask_dtype(cfg.dtypes.compute)
-    iota = jax.lax.broadcasted_iota(mask_dtype,
-                                    (cfg.seq_tile_size, 1, cfg.chunk_size, 1),
-                                    2)
+    iota = jax.lax.broadcasted_iota(mask_dtype, (cfg.seq_tile_size, 1, cfg.chunk_size, 1), 2)
     mask = iota < real_sizes.reshape(-1, 1, 1, 1).astype(mask_dtype)
 
     # [seqs, num_kq_heads, chunk, kq_head_dim]
@@ -373,7 +365,7 @@ def recurrent_gdn_per_seq(
         v_updated = jax.lax.dot(
             k_curr,
             state_updated,
-            dimension_numbers=(((2, ), (1, )), ((0, ), (0, ))),
+            dimension_numbers=(((2,), (1,)), ((0,), (0,))),
             preferred_element_type=jnp.float32,
         ).astype(cfgs.dtypes.compute)
 
@@ -392,7 +384,7 @@ def recurrent_gdn_per_seq(
         out = jax.lax.dot(
             q_curr,
             state,
-            dimension_numbers=(((2, ), (1, )), ((0, ), (0, ))),
+            dimension_numbers=(((2,), (1,)), ((0,), (0,))),
             preferred_element_type=jnp.float32,
         ).astype(cfgs.dtypes.compute)
 
@@ -428,8 +420,7 @@ def recurrent_gdn(
     """
 
     mask_dtype = get_mask_dtype(cfg.dtypes.compute)
-    iota = jax.lax.broadcasted_iota(
-        mask_dtype, (cfg.seq_tile_size, 1, cfg.chunk_size, 1, 1), 2)
+    iota = jax.lax.broadcasted_iota(mask_dtype, (cfg.seq_tile_size, 1, cfg.chunk_size, 1, 1), 2)
     mask = iota < real_sizes.reshape(-1, 1, 1, 1, 1).astype(mask_dtype)
 
     # [seqs, num_kq_heads, chunk, 1, kq_head_dim]
@@ -462,9 +453,9 @@ def recurrent_gdn(
     gating_log = jnp.exp(gating_log)
 
     beta = fused_transpose_broadcast(beta, src_dim=4, dst_dim=1)
-    beta = beta[:, :cfg.num_v_heads]
+    beta = beta[:, : cfg.num_v_heads]
     gating_log = fused_transpose_broadcast(gating_log, src_dim=4, dst_dim=1)
-    gating_log = gating_log[:, :cfg.num_v_heads]
+    gating_log = gating_log[:, : cfg.num_v_heads]
 
     out_list = []
     new_state_list = []

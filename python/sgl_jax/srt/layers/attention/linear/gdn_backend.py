@@ -41,7 +41,9 @@ from sgl_jax.srt.kernels.gdn import (
     jax_causal_conv1d_update,
     tpu_inference_v3_prefill,
 )
-from sgl_jax.srt.kernels.gdn.tpu_inference_adapter import validate_tpu_inference_v3_capability
+from sgl_jax.srt.kernels.gdn.tpu_inference_adapter import (
+    validate_tpu_inference_v3_capability,
+)
 from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
     LinearRecurrentAttnBackend,
 )
@@ -105,11 +107,11 @@ class GDNAttnBackend(LinearRecurrentAttnBackend):
         tp = _mesh_tp_size(mesh)
         if num_k_heads % tp != 0:
             raise ValueError(
-                f"GDNAttnBackend: num_k_heads={num_k_heads} must be divisible " f"by TP={tp}."
+                f"GDNAttnBackend: num_k_heads={num_k_heads} must be divisible by TP={tp}."
             )
         if num_v_heads % tp != 0:
             raise ValueError(
-                f"GDNAttnBackend: num_v_heads={num_v_heads} must be divisible " f"by TP={tp}."
+                f"GDNAttnBackend: num_v_heads={num_v_heads} must be divisible by TP={tp}."
             )
         if self.conv_dim % tp != 0:
             raise ValueError(

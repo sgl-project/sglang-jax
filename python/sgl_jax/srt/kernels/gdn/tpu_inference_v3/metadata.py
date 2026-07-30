@@ -91,8 +91,7 @@ def compute_per_seq_metadata(
     # Calculate number of tiles needed for each sequence.
     s_idx_to_num_tiles = pl.cdiv(query_lens, cfg.chunk_size)
     # Calculate starting p_id of each sequence.
-    s_idx_to_start_p_id = jnp.cumulative_sum(s_idx_to_num_tiles,
-                                             include_initial=True)
+    s_idx_to_start_p_id = jnp.cumulative_sum(s_idx_to_num_tiles, include_initial=True)
     # Map tile index to seq index.
     # Consider following case:
     # all_seqs = [0 1 2 3 4]
@@ -105,14 +104,11 @@ def compute_per_seq_metadata(
     # introduces padding to p_id_to_s_idx[i] where i >= num_tiles. Since the
     # kernel only checks value up-to p_id_to_s_idx[num_tiles-1], padded value
     # will not impact kernel execution.
-    p_id_to_s_idx = jnp.repeat(all_seqs,
-                               s_idx_to_num_tiles,
-                               total_repeat_length=max_tokens)
+    p_id_to_s_idx = jnp.repeat(all_seqs, s_idx_to_num_tiles, total_repeat_length=max_tokens)
     # Map program id (p_id) to tile id of a sequence.
     p_id_to_t_id = all_tokens - s_idx_to_start_p_id[p_id_to_s_idx]
     # Map tile index to starting row of its activation.
-    p_id_to_r_base = (query_start_loc[p_id_to_s_idx] +
-                      p_id_to_t_id * cfg.chunk_size)
+    p_id_to_r_base = query_start_loc[p_id_to_s_idx] + p_id_to_t_id * cfg.chunk_size
     # Calculate number of rows to calculate / fetch for each tile.
     p_id_to_r_size = jnp.minimum(
         query_start_loc[p_id_to_s_idx + 1] - p_id_to_r_base,

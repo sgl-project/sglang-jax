@@ -44,7 +44,7 @@ def causal_conv1d(
         start_idx = 1 + end_idx - cfg.kernel_size
         for k in range(cfg.kernel_size):
             lhs_curr = lhs[:, start_idx + k]
-            out += lhs_curr * conv_weight[k:k + 1]
+            out += lhs_curr * conv_weight[k : k + 1]
 
         if conv_bias is not None:
             out += conv_bias.reshape(1, 1, -1)
@@ -65,11 +65,11 @@ def causal_conv1d(
         last_row = 1 + cfg.chunk_size - cfg.window_size + w_idx
         # Checkpoint of sequences whose last real token is at or past this
         # window position; shorter ones are picked by the masking loop below.
-        new_conv_state = lhs[:, last_row:last_row + cfg.prev_kernel_size]
+        new_conv_state = lhs[:, last_row : last_row + cfg.prev_kernel_size]
         for c_idx in range(1, last_row):
             new_conv_state = jnp.where(
                 c_idx == real_sizes,
-                lhs[:, c_idx:c_idx + cfg.prev_kernel_size],
+                lhs[:, c_idx : c_idx + cfg.prev_kernel_size],
                 new_conv_state,
             )
         state_list.append(new_conv_state)

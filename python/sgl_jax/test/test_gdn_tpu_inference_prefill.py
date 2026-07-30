@@ -34,12 +34,8 @@ LENGTHS = (1, 63, 64, 65, 127, 128, 129, 0)
 NUM_REQUESTS = len(LENGTHS)
 POOL_SIZE = 2 * NUM_REQUESTS + 2
 STATE_INDICES = np.arange(1, NUM_REQUESTS + 1, dtype=np.int32)
-TRACK_INDICES = np.arange(
-    NUM_REQUESTS + 1, 2 * NUM_REQUESTS + 1, dtype=np.int32
-)
-HAS_INITIAL_STATE = np.asarray(
-    [False, True, False, True, True, False, True, True], dtype=np.bool_
-)
+TRACK_INDICES = np.arange(NUM_REQUESTS + 1, 2 * NUM_REQUESTS + 1, dtype=np.int32)
+HAS_INITIAL_STATE = np.asarray([False, True, False, True, True, False, True, True], dtype=np.bool_)
 
 
 @dataclass(frozen=True)
@@ -68,16 +64,12 @@ def _make_fixture(seed: int = 311) -> _Fixture:
     total_tokens = sum(LENGTHS)
     cu_seqlens = np.concatenate(([0], np.cumsum(LENGTHS))).astype(np.int32)
     # Continuing requests must have total length greater than this query chunk.
-    seq_lens = np.asarray(LENGTHS, dtype=np.int32) + HAS_INITIAL_STATE.astype(
-        np.int32
-    ) * 17
+    seq_lens = np.asarray(LENGTHS, dtype=np.int32) + HAS_INITIAL_STATE.astype(np.int32) * 17
     return _Fixture(
         mixed_qkv=_random_bf16(rng, (total_tokens, DIM)),
         b=_random_bf16(rng, (total_tokens, N_V)),
         a=_random_bf16(rng, (total_tokens, N_V)),
-        conv_state=_random_bf16(
-            rng, (POOL_SIZE, DIM, KERNEL_SIZE - 1), scale=0.03
-        ),
+        conv_state=_random_bf16(rng, (POOL_SIZE, DIM, KERNEL_SIZE - 1), scale=0.03),
         recurrent_state=jnp.asarray(
             rng.standard_normal((POOL_SIZE, N_V, D_K, D_V)) * 0.01,
             dtype=jnp.float32,

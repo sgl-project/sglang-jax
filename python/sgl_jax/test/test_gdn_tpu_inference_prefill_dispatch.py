@@ -110,6 +110,8 @@ def test_tpu_inference_v3_requires_tpu_mesh_even_with_interpret(monkeypatch):
 
 
 def test_production_constructor_passes_model_dtype_to_backend():
-    source = (Path(__file__).parents[1] / "srt" / "layers" / "attention" / "hybrid_linear_attn_backend.py").read_text()
+    source = (
+        Path(__file__).parents[1] / "srt" / "layers" / "attention" / "hybrid_linear_attn_backend.py"
+    ).read_text()
 
     assert "dtype=runner.model_config.dtype" in source

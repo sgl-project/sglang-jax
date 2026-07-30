@@ -7,10 +7,7 @@ import importlib
 import sys
 from pathlib import Path
 
-
-VENDOR_DIR = (
-    Path(__file__).parents[2] / "srt" / "kernels" / "gdn" / "tpu_inference_v3"
-)
+VENDOR_DIR = Path(__file__).parents[2] / "srt" / "kernels" / "gdn" / "tpu_inference_v3"
 PROVENANCE = VENDOR_DIR / "PROVENANCE.md"
 MODULES = {
     "__init__.py",
