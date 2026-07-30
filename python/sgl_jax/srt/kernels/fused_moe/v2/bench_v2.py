@@ -461,11 +461,14 @@ def _estimate_vmem_bytes_v2(
     # Output staging: (bts, t_packing, h_per_t) t_dtype
     b_y_stage = bts * hidden_size * token_bytes
 
+    # Kernel-scoped double-buffered metadata mailbox:
+    # (2, num_devices, 1, padded_num_experts) i32.
+    b_metadata_mailbox = 2 * ep_size * padded_num_experts * 4
+
     # Scoped metadata temporaries (run_scoped, only one path active)
     local_num_experts = num_experts // ep_size
     b_scoped = (
         bt * padded_top_k * 4  # t2e_routing
-        + ep_size * padded_num_experts * 4  # d2e_count
         + 2 * padded_num_experts * 4  # expert_offsets
         + padded_num_experts * 4  # expert_starts
         + padded_num_experts * 4  # expert_sizes
@@ -505,6 +508,7 @@ def _estimate_vmem_bytes_v2(
         + b_x
         + b_y_acc
         + b_y_stage
+        + b_metadata_mailbox
         + b_scoped
         + b_sems
     )
@@ -527,6 +531,9 @@ def _estimate_vmem_bytes_v2(
             log(f"      W2 dequant:     {mb(b_w2_dq)} MB")
         log(f"      gate+up acc:    {mb(b_gate_acc + b_up_acc)} MB  ({bts},{bf}) f32")
         log(f"      x+y_acc+y_stg:  {mb(b_x + b_y_acc + b_y_stage)} MB")
+        log(
+            f"      metadata mbox:  {mb(b_metadata_mailbox)} MB  (2,{ep_size},{padded_num_experts}) i32"
+        )
         log(f"      scoped+sems:    {mb(b_scoped + b_sems)} MB")
         log(f"      Total:          {mb(total)} MB")
 
