@@ -1017,7 +1017,18 @@ class WeightLoader:
             weight.shape[1],
             n_out,
         )
-        return expand_block_scale(weight, n_out, block_size_out)
+        expanded = expand_block_scale(weight, n_out, block_size_out)
+        # The expansion inherits the compact 2D scale's (effectively replicated)
+        # layout, but the model placeholder declares the kernel-boundary sharding
+        # (e.g. P(None, None, "tensor")). jax 0.8.x shard_map silently reshards on
+        # this textual mismatch; jax 0.10.x checks strictly and raises. Same class
+        # of fix as the MoE/MLA boundaries in #1493.
+        target_sharding = getattr(model_param.value, "sharding", None)
+        if target_sharding is not None and expanded.ndim == len(
+            getattr(target_sharding, "spec", ())
+        ):
+            expanded = jax.sharding.reshard(expanded, target_sharding)
+        return expanded
 
     def _scan_weight_info(self) -> dict[str, list[dict]]:
         """
