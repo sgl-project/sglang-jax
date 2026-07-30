@@ -465,6 +465,8 @@ class RaidenTransferKVSender(KVSender, StateHolder):
                 self._timer.__enter__()
                 self._transfer_started_at = time.monotonic()
         if not needed:
+            # tpu-raiden@8756479 register_read documents False as "nothing to
+            # transfer"; NotifyForRead does not use it for slot admission.
             self._finish(KVPoll.SUCCESS, "raiden_transfer_not_needed")
             return
         try:
@@ -485,6 +487,8 @@ class RaidenTransferKVSender(KVSender, StateHolder):
         self._manager.poll_engine()
         if not self._manager.sender_done(self.uuid):
             return KVPoll.TRANSFERRING
+        # tpu-raiden@8756479 CompleteReadRaw reports send-side failures and
+        # timeouts through done_sending; failed_recving is receiver-only.
         reason = self._pending_failure_reason
         return self._finish(
             KVPoll.FAILED if reason is not None else KVPoll.SUCCESS,

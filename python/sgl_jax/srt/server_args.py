@@ -1681,7 +1681,9 @@ class ServerArgs:
             default=ServerArgs.disaggregation_pull_timeout_seconds,
             help="Decode-side pull timeout in seconds. A receiver "
             "stuck in TRANSFERRING longer than this is reaped to "
-            "FAILED. <=0 to disable.",
+            "FAILED. With Raiden, this also bounds engine terminalization "
+            "after abort, so FINISH_ABORT may be delayed by up to this "
+            "interval. <=0 to disable.",
         )
         parser.add_argument(
             "--disaggregation-ack-timeout-seconds",
