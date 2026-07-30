@@ -26,6 +26,7 @@ from sgl_jax.srt.disaggregation.bootstrap import (
     BootstrapServer,
     PrefillInfo,
     _Registry,
+    check_prefill_compat,
 )
 from sgl_jax.srt.disaggregation.host_ip import resolve_host_ip
 from sgl_jax.srt.managers.io_struct import GenerateReqInput, TokenizedGenerateReqInput
@@ -75,6 +76,21 @@ def test_registry_register_list_get(server_and_client):
 
     info = client.get_prefill_info(bootstrap_room=42)
     assert info["bootstrap_key"] == "p0"
+
+
+def test_bootstrap_advertises_transfer_metadata_capability(server_and_client):
+    _, client = server_and_client
+    client.require_capability("transfer_metadata")
+
+
+def test_bootstrap_rejects_missing_required_capability():
+    client = BootstrapClient("http://old-bootstrap")
+    response = mock.MagicMock()
+    response.json.return_value = {"status": "ok"}
+    client._client.get = mock.MagicMock(return_value=response)
+
+    with pytest.raises(RuntimeError, match="upgrade the bootstrap"):
+        client.require_capability("transfer_metadata")
 
 
 def test_register_multiple_room_hashing(server_and_client):
@@ -347,6 +363,65 @@ def test_registry_stores_protocol_version():
     )
     rows = reg.list_all()
     assert rows[0].protocol_version == PROTOCOL_VERSION
+
+
+def test_transfer_metadata_is_reusable_per_process_and_ttl_bounded():
+    clock = _ManualClock(100.0)
+    registry = _Registry(clock=clock, transfer_ttl_seconds=5.0)
+    registry.register_transfer(
+        {
+            "bootstrap_room": 7,
+            "transfer_id": "first",
+            "remote_block_ids": [1, 2],
+        }
+    )
+    assert registry.get_transfer(7)["transfer_id"] == "first"
+
+    registry.register_transfer(
+        {
+            "bootstrap_room": 7,
+            "transfer_id": "second",
+            "jax_process_index": 0,
+            "transport_metadata": {"remote_block_ids": [9]},
+        }
+    )
+    registry.register_transfer(
+        {
+            "bootstrap_room": 7,
+            "transfer_id": "peer",
+            "jax_process_index": 1,
+            "transport_metadata": {"remote_block_ids": [11]},
+        }
+    )
+    assert registry.get_transfer(7, 0)["transfer_id"] == "second"
+    assert registry.get_transfer(7, 1)["transfer_id"] == "peer"
+    registry.pop_room(7, 0)
+    assert registry.get_transfer(7, 0) is None
+    assert registry.get_transfer(7, 1)["transfer_id"] == "peer"
+    clock.t += 6.0
+    assert registry.get_transfer(7, 1) is None
+
+
+def test_prefill_decode_transfer_engines_must_match():
+    info = {
+        "protocol_version": 3,
+        "page_size": 128,
+        "kv_dtype": "bfloat16",
+        "transport_metadata": {"engine": "raiden"},
+    }
+    check_prefill_compat(
+        info,
+        local_page_size=128,
+        local_kv_dtype="bfloat16",
+        expected_transfer_engine="raiden",
+    )
+    with pytest.raises(ValueError, match="engine mismatch"):
+        check_prefill_compat(
+            info,
+            local_page_size=128,
+            local_kv_dtype="bfloat16",
+            expected_transfer_engine="jax",
+        )
 
 
 # ---- register retry (ref: upstream test_register_to_bootstrap.py) -----------

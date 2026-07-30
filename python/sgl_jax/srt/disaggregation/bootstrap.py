@@ -13,6 +13,7 @@ import httpx
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
+from pydantic import Field as PydanticField
 
 logger = logging.getLogger(__name__)
 
@@ -20,10 +21,12 @@ logger = logging.getLogger(__name__)
 HEARTBEAT_TTL_SECONDS = 30.0
 # Beat at ~TTL/3 so a single missed beat doesn't evict the entry.
 HEARTBEAT_INTERVAL_SECONDS = HEARTBEAT_TTL_SECONDS / 3.0
+TRANSFER_METADATA_TTL_SECONDS = 300.0
+BOOTSTRAP_CAPABILITIES = ("transfer_metadata",)
 
 # PD wire protocol version. Bump when ``PrefillInfo``
 # or any of the 4 endpoint payloads change shape.
-PROTOCOL_VERSION: int = 1
+PROTOCOL_VERSION: int = 3
 MIN_COMPATIBLE_VERSION: int = 1
 
 
@@ -53,11 +56,9 @@ class PrefillInfo:
     jax_process_index: int = 0
     jax_process_count: int = 1
     protocol_version: int = PROTOCOL_VERSION
-    # KV layout. Decode must match these or the transferred KV would be
-    # silently misinterpreted. Defaults (0 / "") mean "not reported" so a
-    # peer predating these fields skips the check.
     page_size: int = 0
     kv_dtype: str = ""
+    transport_metadata: dict[str, object] = field(default_factory=lambda: {"engine": "jax"})
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -104,6 +105,7 @@ def check_prefill_compat(
     *,
     local_page_size: int,
     local_kv_dtype: str,
+    expected_transfer_engine: str | None = None,
 ) -> None:
     """Raise ``ValueError`` if the prefill peer's KV layout is incompatible.
 
@@ -126,6 +128,15 @@ def check_prefill_compat(
             f"kv_dtype={peer_kv_dtype!r} but this decode uses "
             f"kv_dtype={local_kv_dtype!r}; KV layout incompatible"
         )
+    transport_metadata = info.get("transport_metadata", {})
+    if isinstance(transport_metadata, dict) and "engine" in transport_metadata:
+        peer_engine = str(transport_metadata["engine"])
+    else:
+        peer_engine = str(info.get("transfer_engine", "jax"))
+    if expected_transfer_engine is not None and peer_engine != expected_transfer_engine:
+        raise ValueError(
+            f"PD transfer engine mismatch: prefill={peer_engine}, decode={expected_transfer_engine}"
+        )
 
 
 class RegisterPrefillRequest(BaseModel):
@@ -141,6 +152,14 @@ class RegisterPrefillRequest(BaseModel):
     protocol_version: int = PROTOCOL_VERSION
     page_size: int = 0
     kv_dtype: str = ""
+    transport_metadata: dict[str, object] = PydanticField(default_factory=lambda: {"engine": "jax"})
+
+
+class RegisterTransferRequest(BaseModel):
+    bootstrap_room: int
+    transfer_id: str
+    jax_process_index: int = 0
+    transport_metadata: dict[str, object]
 
 
 class HeartbeatRequest(BaseModel):
@@ -160,6 +179,10 @@ class _Registry:
     lock: threading.Lock = field(default_factory=threading.Lock)
     ttl_seconds: float = HEARTBEAT_TTL_SECONDS
     clock: Callable[[], float] = time.monotonic
+    # A multi-host request has distinct physical page IDs on every P process.
+    transfers: dict[tuple[int, int], dict[str, object]] = field(default_factory=dict)
+    transfer_last_seen: dict[tuple[int, int], float] = field(default_factory=dict)
+    transfer_ttl_seconds: float = TRANSFER_METADATA_TTL_SECONDS
 
     def now(self) -> float:
         return self.clock()  # type: ignore[no-any-return]
@@ -211,6 +234,38 @@ class _Registry:
             chosen = keys[bootstrap_room % len(keys)]
             return self.prefills[chosen]
 
+    def _evict_stale_transfers_locked(self) -> None:
+        cutoff = self.now() - self.transfer_ttl_seconds
+        stale = [key for key, seen_at in self.transfer_last_seen.items() if seen_at < cutoff]
+        for key in stale:
+            self.transfers.pop(key, None)
+            self.transfer_last_seen.pop(key, None)
+
+    def register_transfer(self, info: dict[str, object]) -> None:
+        with self.lock:
+            self._evict_stale_transfers_locked()
+            room = int(info["bootstrap_room"])
+            process_index = int(info.get("jax_process_index", 0))
+            if not str(info.get("transfer_id", "")):
+                raise ValueError("transfer_id must be non-empty")
+            key = (room, process_index)
+            self.transfers[key] = info
+            self.transfer_last_seen[key] = self.now()
+
+    def get_transfer(
+        self, bootstrap_room: int, jax_process_index: int = 0
+    ) -> dict[str, object] | None:
+        with self.lock:
+            self._evict_stale_transfers_locked()
+            info = self.transfers.get((int(bootstrap_room), int(jax_process_index)))
+            return dict(info) if info is not None else None
+
+    def pop_room(self, bootstrap_room: int, jax_process_index: int = 0) -> None:
+        with self.lock:
+            key = (int(bootstrap_room), int(jax_process_index))
+            self.transfers.pop(key, None)
+            self.transfer_last_seen.pop(key, None)
+
 
 def build_app(
     registry: _Registry | None = None,
@@ -250,8 +305,12 @@ def build_app(
             return await call_next(request)
 
     @app.get("/health")
-    def health() -> dict[str, str]:
-        return {"status": "ok"}
+    def health() -> dict[str, object]:
+        return {
+            "status": "ok",
+            "protocol_version": PROTOCOL_VERSION,
+            "capabilities": list(BOOTSTRAP_CAPABILITIES),
+        }
 
     @app.post("/register_prefill")
     def register_prefill(req: RegisterPrefillRequest) -> dict[str, str]:
@@ -286,6 +345,34 @@ def build_app(
                 detail="no prefill workers registered",
             )
         return info.to_dict()
+
+    @app.post("/register_transfer")
+    def register_transfer(req: RegisterTransferRequest) -> dict[str, str]:
+        try:
+            registry.register_transfer(req.model_dump())
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"status": "registered"}
+
+    @app.get("/get_transfer_info")
+    def get_transfer_info(bootstrap_room: int, jax_process_index: int = 0) -> dict[str, object]:
+        info = registry.get_transfer(bootstrap_room, jax_process_index)
+        if info is None:
+            # Not registered yet: 404 lets the decode side treat it as
+            # "defer + retry" (never abort) rather than a hard error.
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"no transfer info for bootstrap_room={bootstrap_room}, "
+                    f"jax_process_index={jax_process_index}"
+                ),
+            )
+        return info
+
+    @app.post("/pop_transfer")
+    def pop_transfer(bootstrap_room: int, jax_process_index: int = 0) -> dict[str, str]:
+        registry.pop_room(bootstrap_room, jax_process_index)
+        return {"status": "popped"}
 
     # Bootstrap runs as a standalone single process and does NOT inherit
     # PROMETHEUS_MULTIPROC_DIR, so it exposes its own default-registry
@@ -390,7 +477,7 @@ class BootstrapServer:
                 last_err = e
             time.sleep(0.05)
         raise TimeoutError(
-            f"BootstrapServer did not become ready within {timeout_s}s " f"(last error: {last_err})"
+            f"BootstrapServer did not become ready within {timeout_s}s (last error: {last_err})"
         )
 
 
@@ -432,6 +519,16 @@ class BootstrapClient:
         r = self._client.get(f"{self._base_url}/health", timeout=self._timeout_s)
         return r.status_code == 200
 
+    def require_capability(self, capability: str) -> None:
+        r = self._client.get(f"{self._base_url}/health", timeout=self._timeout_s)
+        r.raise_for_status()
+        capabilities = r.json().get("capabilities", [])
+        if capability not in capabilities:
+            raise RuntimeError(
+                f"bootstrap at {self._base_url} does not advertise required "
+                f"capability {capability!r}; upgrade the bootstrap service"
+            )
+
     def register_prefill(
         self,
         bootstrap_key: str,
@@ -447,6 +544,7 @@ class BootstrapClient:
         protocol_version: int = PROTOCOL_VERSION,
         page_size: int = 0,
         kv_dtype: str = "",
+        transport_metadata: dict[str, object] | None = None,
     ) -> None:
         payload = {
             "bootstrap_key": bootstrap_key,
@@ -461,6 +559,7 @@ class BootstrapClient:
             "protocol_version": protocol_version,
             "page_size": page_size,
             "kv_dtype": kv_dtype,
+            "transport_metadata": transport_metadata or {"engine": "jax"},
         }
         last_err: Exception | None = None
         for attempt in range(self._register_retries):
@@ -477,8 +576,7 @@ class BootstrapClient:
                 last_err = e
                 if attempt + 1 < self._register_retries:
                     logger.warning(
-                        "bootstrap register_prefill attempt %d/%d "
-                        "failed (%s); retrying in %.1fs",
+                        "bootstrap register_prefill attempt %d/%d failed (%s); retrying in %.1fs",
                         attempt + 1,
                         self._register_retries,
                         e,
@@ -486,8 +584,7 @@ class BootstrapClient:
                     )
                     time.sleep(self._register_retry_delay_s)
         raise RuntimeError(
-            f"bootstrap register_prefill failed after "
-            f"{self._register_retries} attempts: {last_err}"
+            f"bootstrap register_prefill failed after {self._register_retries} attempts: {last_err}"
         )
 
     def heartbeat(self, bootstrap_key: str) -> None:
@@ -529,6 +626,57 @@ class BootstrapClient:
         # Reject peers below the supported protocol floor.
         _reject_if_below_protocol_floor(info)
         return info
+
+    def register_transfer(
+        self,
+        bootstrap_room: int,
+        transfer_id: str,
+        *,
+        jax_process_index: int = 0,
+        transport_metadata: dict[str, object],
+    ) -> None:
+        payload = {
+            "bootstrap_room": bootstrap_room,
+            "transfer_id": transfer_id,
+            "jax_process_index": jax_process_index,
+            "transport_metadata": transport_metadata,
+        }
+        r = self._client.post(
+            f"{self._base_url}/register_transfer",
+            json=payload,
+            timeout=self._timeout_s,
+            headers=self._headers(),
+        )
+        r.raise_for_status()
+
+    def get_transfer_info(
+        self, bootstrap_room: int, *, jax_process_index: int = 0
+    ) -> dict[str, object] | None:
+        r = self._client.get(
+            f"{self._base_url}/get_transfer_info",
+            params={
+                "bootstrap_room": bootstrap_room,
+                "jax_process_index": jax_process_index,
+            },
+            timeout=self._timeout_s,
+            headers=self._headers(),
+        )
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+        return r.json()
+
+    def pop_transfer(self, bootstrap_room: int, *, jax_process_index: int = 0) -> None:
+        r = self._client.post(
+            f"{self._base_url}/pop_transfer",
+            params={
+                "bootstrap_room": bootstrap_room,
+                "jax_process_index": jax_process_index,
+            },
+            timeout=self._timeout_s,
+            headers=self._headers(),
+        )
+        r.raise_for_status()
 
 
 class PrefillInfoCache:

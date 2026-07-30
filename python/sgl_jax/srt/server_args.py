@@ -250,12 +250,10 @@ class ServerArgs:
     # a host pool would fail every prefill request with
     # ``RuntimeError("use_d2h_staging=True requires a host_pool")``.
     disaggregation_enable_d2h: bool = False
+    disaggregation_use_raiden: bool = False
     disaggregation_side_channel_port: int = 9600
     disaggregation_d2h_pool_size: int = 64
     disaggregation_d2h_max_tokens: int | None = None
-    # Parallel ``jax_transfer`` channels per (P, D) pair. Four is the
-    # current validated default on v6e; set to 0/None to keep the
-    # wrapper's own default.
     disaggregation_channel_number: int = 4
     # Per-host IP this process publishes to the bootstrap server. If
     # None, resolve it during startup from HOSTNAME with a
@@ -563,6 +561,11 @@ class ServerArgs:
                     "disaggregation_enable_d2h",
                     self.disaggregation_enable_d2h,
                     ServerArgs.disaggregation_enable_d2h,
+                ),
+                (
+                    "disaggregation_use_raiden",
+                    self.disaggregation_use_raiden,
+                    ServerArgs.disaggregation_use_raiden,
                 ),
             ]
             non_default = [name for name, value, default in pd_overrides if value != default]
@@ -1597,6 +1600,12 @@ class ServerArgs:
             "prefill HBM pressure via the host pool. Default OFF.",
         )
         parser.add_argument(
+            "--disaggregation-use-raiden",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.disaggregation_use_raiden,
+            help="Use tpu-raiden for direct block transfer into decode KV pages.",
+        )
+        parser.add_argument(
             "--disaggregation-side-channel-port",
             type=int,
             default=ServerArgs.disaggregation_side_channel_port,
@@ -1672,7 +1681,9 @@ class ServerArgs:
             default=ServerArgs.disaggregation_pull_timeout_seconds,
             help="Decode-side pull timeout in seconds. A receiver "
             "stuck in TRANSFERRING longer than this is reaped to "
-            "FAILED. <=0 to disable.",
+            "FAILED. With Raiden, this also bounds engine terminalization "
+            "after abort, so FINISH_ABORT may be delayed by up to this "
+            "interval. <=0 to disable.",
         )
         parser.add_argument(
             "--disaggregation-ack-timeout-seconds",
@@ -1733,9 +1744,7 @@ class ServerArgs:
             "--disaggregation-channel-number",
             type=int,
             default=ServerArgs.disaggregation_channel_number,
-            help="Parallel jax_transfer channels per (P, D) pair. "
-            "Four is the validated default on v6e; increase for "
-            "higher-bandwidth interconnects.",
+            help="Parallel transfer channels per (P, D) pair.",
         )
 
     @classmethod

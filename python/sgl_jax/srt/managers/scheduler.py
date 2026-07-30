@@ -2730,17 +2730,9 @@ class Scheduler(
         # Abort PD disaggregation queues
         prefill_q = self.disagg_prefill_queue
         if prefill_q is not None:
-            for entry in prefill_q.abort_matching(recv_req.rid, recv_req.abort_all):
+            for entry in prefill_q.cancel_matching(recv_req.rid, recv_req.abort_all):
                 logger.debug("Abort prefill queue request. rid=%s", entry.req_id)
                 entry.sender.abort()
-                if entry.on_terminal is not None:
-                    try:
-                        entry.on_terminal()
-                    except Exception:
-                        logger.exception(
-                            "on_terminal for aborted prefill req_id=%s raised",
-                            entry.req_id,
-                        )
 
         prealloc_q = self.disagg_prealloc_queue
         if prealloc_q is not None:
@@ -2750,17 +2742,23 @@ class Scheduler(
                     entry.receiver.abort()
                 if entry.kv_indices is not None:
                     self._release_decode_kv_indices(entry.kv_indices)
-                self._abort_decode_request(entry.req, "abort_request")
+                self._abort_decode_request(
+                    entry.req,
+                    "abort_request",
+                    cleanup_transfer=entry.receiver is None,
+                )
 
         transfer_q = self.disagg_transfer_queue
         if transfer_q is not None:
-            for entry in transfer_q.abort_matching(recv_req.rid, recv_req.abort_all):
+            for entry in transfer_q.cancel_matching(recv_req.rid, recv_req.abort_all):
                 logger.debug("Abort transfer queue request. rid=%s", entry.req_id)
                 if entry.receiver is not None:
                     entry.receiver.abort()
-                if entry.kv_indices is not None:
-                    self._release_decode_kv_indices(entry.kv_indices)
-                self._abort_decode_request(entry.req, "abort_request")
+                self._abort_decode_request(
+                    entry.req,
+                    "abort_request",
+                    cleanup_transfer=False,
+                )
 
         # Decode reqs deferred because no prefill was registered yet hold no KV
         # or receiver, but abort_request must still drop them so a cancelled

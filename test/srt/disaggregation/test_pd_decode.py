@@ -6,6 +6,7 @@ import threading
 import time
 
 from sgl_jax.srt.disaggregation.base.kv_manager import KVPoll
+from sgl_jax.srt.disaggregation.base.transfer import DecodeAdmission
 from sgl_jax.srt.disaggregation.common.core import CommonKVManager
 from sgl_jax.srt.disaggregation.decode import (
     DecodeBookkeeping,
@@ -392,6 +393,11 @@ class _KVManager:
         self.created.append((rid, r))
         return r
 
+    def try_start_decode(self, context):
+        receiver = self.create_receiver(context.req_id)
+        receiver.init(context)
+        return DecodeAdmission.admitted(receiver)
+
 
 class _AdmServerArgs:
     def __init__(self, reserved, max_inflight=0):
@@ -404,6 +410,7 @@ class _AdmReq:
     def __init__(self, rid, seqlen):
         self.rid = rid
         self.disagg_transfer_id = None
+        self.bootstrap_room = 1
         self.origin_input_ids = list(range(seqlen))
 
 
@@ -576,6 +583,18 @@ def test_inflight_cap_recovers_after_transfer_drains():
     sched._admit_decode_prealloc()
     assert len(sched.disagg_transfer_queue) == 2  # "c" now admitted
     assert len(sched.disagg_prealloc_queue) == 0
+
+
+def test_cancel_matching_retains_inflight_entry_until_terminal():
+    queue = DecodeTransferQueue()
+    entry = DecodeBookkeeping(req_id="a", req=_AdmReq("a", 4), receiver=object())
+    queue.add(entry)
+
+    cancelled = queue.cancel_matching("a", abort_all=False)
+
+    assert cancelled == [entry]
+    assert entry.cancelled is True
+    assert len(queue) == 1
 
 
 # ---- from test_pd_decode_bootstrap_cache.py ----

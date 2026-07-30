@@ -226,6 +226,7 @@ class Req:
         self.bootstrap_room: int | None = None
         self.disagg_transfer_id: str | None = None
         self.disagg_host_buffer_id: int | None = None
+        self.disagg_peer_process_index: int = 0
 
         # Memory pool info
         self.req_pool_idx: int | None = None

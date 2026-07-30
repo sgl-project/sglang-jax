@@ -20,6 +20,7 @@ import threading
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
+from typing import Any
 
 import jax
 
@@ -28,6 +29,12 @@ from sgl_jax.srt.disaggregation.base.kv_manager import (
     KVReceiver,
     KVSender,
     StateHolder,
+)
+from sgl_jax.srt.disaggregation.base.transfer import (
+    DecodeAdmission,
+    DecodeTransferContext,
+    PrefillTransfer,
+    PrefillTransferContext,
 )
 from sgl_jax.srt.disaggregation.common.core import (
     CommonKVManager,
@@ -63,6 +70,7 @@ class PMetadata:
 
     ``specs`` maps entry names to their shape/dtype so the receiver can
     construct sub-uuid pulls for each entry independently.
+
     """
 
     remote_addr: str
@@ -98,12 +106,15 @@ class JaxTransferKVManager(CommonKVManager):
     * (optional) :class:`HostKVPool` — path-A D2H staging
     """
 
+    engine_name = "jax"
+
     def __init__(
         self,
         wrapper: JaxTransferWrapper,
         zmq_notifier: ZmqPullNotifier,
         *,
         host_pool: HostKVPool | None = None,
+        use_d2h_staging: bool = False,
         ack_timeout_seconds: float = 60.0,
         pull_timeout_seconds: float = 30.0,
         reaper_interval_seconds: float = 5.0,
@@ -117,6 +128,7 @@ class JaxTransferKVManager(CommonKVManager):
         self._wrapper = wrapper
         self._zmq_notifier = zmq_notifier
         self._host_pool = host_pool
+        self._use_d2h_staging = use_d2h_staging
         # A pool of long-lived workers drains the pull queue and runs the
         # blocking ``wrapper.pull`` off the decode event-loop thread (on TPU
         # ``link.pull`` is a synchronous native call). ``pull_worker_count`` is
@@ -169,6 +181,81 @@ class JaxTransferKVManager(CommonKVManager):
     @property
     def host_pool(self) -> HostKVPool | None:
         return self._host_pool
+
+    @property
+    def requires_host_staging(self) -> bool:
+        return self._use_d2h_staging
+
+    def reserve_prefill_buffer(self, existing: int | None) -> int | None:
+        if not self._use_d2h_staging or existing is not None:
+            return existing
+        if self._host_pool is None:
+            raise RuntimeError("D2H staging is enabled without a host KV pool")
+        buffer_id = self._host_pool.reserve()
+        if buffer_id is None:
+            raise RuntimeError("host KV pool is full")
+        return buffer_id
+
+    def prepare_prefill_batch(self, kv_buffers: Any) -> None:  # noqa: ARG002
+        return
+
+    def prefill_transport_metadata(self) -> dict[str, object]:
+        return {"engine": self.engine_name}
+
+    def start_prefill(self, context: PrefillTransferContext) -> PrefillTransfer:
+        sender = self.create_sender(context.req_id)
+        try:
+            payload = context.payload_factory()
+            if context.on_payload is not None:
+                context.on_payload(payload)
+            sender.init(None, transfer_id=context.transfer_id)
+            sender.attach_payload(
+                payload,
+                use_d2h_staging=self._use_d2h_staging,
+                buffer_id=context.buffer_id,
+            )
+            if context.on_ready is not None:
+                context.on_ready()
+            sender.send()
+        except Exception:
+            with suppress(Exception):
+                sender.abort()
+            with suppress(Exception):
+                sender.clear()
+            raise
+        return PrefillTransfer(
+            sender=sender,
+            # Host staging owns a copy; multi-process gather also produces a
+            # separate local buffer. Both can release paged-pool HBM early.
+            release_device_kv=self._use_d2h_staging or jax.process_count() > 1,
+        )
+
+    def try_start_decode(self, context: DecodeTransferContext) -> DecodeAdmission:
+        receiver = self.create_receiver(context.req_id)
+        try:
+            peer = context.peer_info
+            receiver.init(
+                PMetadata(
+                    remote_addr=f"{peer['host']}:{peer['transfer_port']}",
+                    uuid=context.transfer_id,
+                    specs={"kv": context.spec_factory()},
+                    p_side_channel_host=str(peer["host"]),
+                    p_side_channel_port=int(peer["side_channel_port"]),
+                )
+            )
+        except Exception:
+            with suppress(Exception):
+                receiver.fail(reason="receiver_init")
+            raise
+        return DecodeAdmission.admitted(receiver)
+
+    def cleanup_transfer(
+        self,
+        bootstrap_room: int | None,
+        *,
+        jax_process_index: int | None = None,  # noqa: ARG002
+    ) -> None:  # noqa: ARG002
+        return
 
     # ------------------------------------------------------------------
     # KV-domain: prefill-side handoff (path A / path B)
@@ -315,10 +402,11 @@ class JaxTransferKVSender(KVSender, StateHolder):
             )
         assert self._use_d2h_staging is not None
         callback_uuid = self.uuid.encode("utf-8")
+        notifier = self._mgr.zmq_notifier
         with self._state_lock:
             # Register callback before producer_handoff so the ack can't
             # arrive between data registration and callback registration.
-            self._mgr.zmq_notifier.register_callback(callback_uuid, self._on_ack)
+            notifier.register_callback(callback_uuid, self._on_ack)
             try:
                 status = self._mgr.producer_handoff(
                     self.uuid,
@@ -327,7 +415,7 @@ class JaxTransferKVSender(KVSender, StateHolder):
                     buffer_id=self._buffer_id,
                 )
             except Exception:
-                self._mgr.zmq_notifier.unregister_callback(callback_uuid)
+                notifier.unregister_callback(callback_uuid)
                 raise
             self._status = status
             if self._use_d2h_staging:
@@ -357,23 +445,22 @@ class JaxTransferKVSender(KVSender, StateHolder):
         record = self._mgr.get_terminal_record(self._req_id, role="prefill")
         if record is None:
             raise RuntimeError(
-                f"Prefill transfer has no terminal record for " f"req_id={self._req_id!r}"
+                f"Prefill transfer has no terminal record for req_id={self._req_id!r}"
             )
         if record.state != KVPoll.FAILED:
             raise RuntimeError(
                 f"Prefill transfer did not fail for req_id="
                 f"{self._req_id!r}; state={record.state.value}"
             )
-        raise RuntimeError(
-            f"Prefill transfer failed for req_id={self._req_id!r}: " f"{record.reason}"
-        )
+        raise RuntimeError(f"Prefill transfer failed for req_id={self._req_id!r}: {record.reason}")
 
     def fail(self, *, reason: str = "sender_fail") -> None:
         callback_uuid = self.uuid.encode("utf-8")
+        notifier = self._mgr.zmq_notifier
         with self._state_lock:
             if self.state in (KVPoll.SUCCESS, KVPoll.FAILED):
                 return
-            claimed = self._mgr.zmq_notifier.unregister_callback(callback_uuid)
+            claimed = notifier.unregister_callback(callback_uuid)
             if claimed is not None and self._status is not None:
                 for sub_uuid in self._status.sub_uuids:
                     self._mgr.wrapper.release(sub_uuid)
@@ -381,7 +468,7 @@ class JaxTransferKVSender(KVSender, StateHolder):
             self._transition_to(KVPoll.FAILED)
             self._close_ack_timer()
             self._transfer_started_at = None
-            self._mgr.zmq_notifier.mark_retired(
+            notifier.mark_retired(
                 callback_uuid,
                 state=KVPoll.FAILED.value,
                 reason=reason,
@@ -399,6 +486,7 @@ class JaxTransferKVSender(KVSender, StateHolder):
 
     def _on_ack(self, _uuid_bytes: bytes) -> None:
         callback_uuid = self.uuid.encode("utf-8")
+        notifier = self._mgr.zmq_notifier
         try:
             with self._state_lock:
                 try:
@@ -411,7 +499,7 @@ class JaxTransferKVSender(KVSender, StateHolder):
                         self._transition_to(KVPoll.FAILED)
                         self._close_ack_timer()
                         self._transfer_started_at = None
-                        self._mgr.zmq_notifier.mark_retired(
+                        notifier.mark_retired(
                             callback_uuid,
                             state=KVPoll.FAILED.value,
                             reason="ack_cleanup",
@@ -432,7 +520,7 @@ class JaxTransferKVSender(KVSender, StateHolder):
                     self._transition_to(KVPoll.SUCCESS)
                     self._close_ack_timer()
                     self._transfer_started_at = None
-                    self._mgr.zmq_notifier.mark_retired(
+                    notifier.mark_retired(
                         callback_uuid,
                         state=KVPoll.SUCCESS.value,
                         reason="ack",
@@ -490,6 +578,11 @@ class JaxTransferKVReceiver(KVReceiver, StateHolder):
     def clear(self) -> None:
         self._mgr._clear_terminal_record(self._req_id, role="decode")
 
+    def commit(self, install: Callable[[object], None]) -> None:
+        if self.state != KVPoll.SUCCESS or self._results is None:
+            raise RuntimeError("cannot commit an incomplete JAX transfer")
+        install(self._results["kv"])
+
     def abort(self) -> None:
         self.fail(reason="abort")
 
@@ -497,16 +590,14 @@ class JaxTransferKVReceiver(KVReceiver, StateHolder):
         record = self._mgr.get_terminal_record(self._req_id, role="decode")
         if record is None:
             raise RuntimeError(
-                f"Decode transfer has no terminal record for " f"req_id={self._req_id!r}"
+                f"Decode transfer has no terminal record for req_id={self._req_id!r}"
             )
         if record.state != KVPoll.FAILED:
             raise RuntimeError(
                 f"Decode transfer did not fail for req_id="
                 f"{self._req_id!r}; state={record.state.value}"
             )
-        raise RuntimeError(
-            f"Decode transfer failed for req_id={self._req_id!r}: " f"{record.reason}"
-        )
+        raise RuntimeError(f"Decode transfer failed for req_id={self._req_id!r}: {record.reason}")
 
     def fail(self, *, reason: str = "receiver_fail") -> None:
         with self._state_lock:
@@ -532,7 +623,7 @@ class JaxTransferKVReceiver(KVReceiver, StateHolder):
 
     def init(self, p_metadata: PMetadata) -> None:
         if not isinstance(p_metadata, PMetadata):
-            raise TypeError(f"p_metadata must be PMetadata, got " f"{type(p_metadata).__name__}")
+            raise TypeError(f"p_metadata must be PMetadata, got {type(p_metadata).__name__}")
         self._metadata = p_metadata
         # Do NOT pre-connect here: the link is a native handle and must be
         # created and used on the same thread. ``_run_pull`` connects lazily
@@ -573,11 +664,12 @@ class JaxTransferKVReceiver(KVReceiver, StateHolder):
             ):
                 return state
             assert self._metadata is not None
+            notifier = self._mgr.zmq_notifier
             with self._state_lock:
                 if self.state != KVPoll.TRANSFERRING:
                     return self.state
                 try:
-                    self._mgr.zmq_notifier.send_done(
+                    notifier.send_done(
                         self._metadata.uuid.encode("utf-8"),
                         self._metadata.p_side_channel_host,
                         self._metadata.p_side_channel_port,
@@ -619,11 +711,12 @@ class JaxTransferKVReceiver(KVReceiver, StateHolder):
         """
 
         assert self._metadata is not None
+        wrapper = self._mgr.wrapper
         try:
             results: dict[str, jax.Array] = {}
             for name, spec in self._metadata.specs.items():
                 sub_uuid = f"{self._metadata.uuid}:{name}"
-                results[name] = self._mgr.wrapper.pull(
+                results[name] = wrapper.pull(
                     sub_uuid,
                     spec,
                     remote_addr=self._metadata.remote_addr,

@@ -2,13 +2,17 @@
 
 import os
 
-from sgl_jax.srt.entrypoints import http_server
-from sgl_jax.srt.server_args import ServerArgs
-from sgl_jax.srt.utils import kill_process_tree
+from sgl_jax.raiden import preload_raiden_if_requested
+
+preload_raiden_if_requested()
 
 
 def main():
     """Main entry point for launching the server."""
+    from sgl_jax.srt.entrypoints import http_server
+    from sgl_jax.srt.server_args import ServerArgs
+    from sgl_jax.srt.utils import kill_process_tree
+
     try:
         server_args = ServerArgs.from_cli()
         if server_args.multimodal:

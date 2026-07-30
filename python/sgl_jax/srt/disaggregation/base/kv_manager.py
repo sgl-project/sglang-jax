@@ -13,6 +13,8 @@ from __future__ import annotations
 import abc
 import enum
 import logging
+from collections.abc import Callable
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -140,6 +142,10 @@ class KVReceiver(abc.ABC):
 
     @abc.abstractmethod
     def poll(self) -> KVPoll: ...
+
+    @abc.abstractmethod
+    def commit(self, install: Callable[[Any], None]) -> None:
+        """Make a successful receive visible to the decode scheduler."""
 
     @abc.abstractmethod
     def clear(self) -> None:
