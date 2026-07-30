@@ -178,6 +178,36 @@ For deeper scheduler behavior, see [Scheduler](../architecture/03-scheduler.md) 
 
 For the compiled model path, see [Global JIT Compile](global_jit_compile.md). For backend selection, see [Attention Backend](attention_backend.md).
 
+### GDN Prefill Implementation
+
+`SGLANG_JAX_GDN_PREFILL_IMPL` selects the Gated DeltaNet prefill
+implementation at server startup. It is an environment variable rather than a
+`launch_server` argument.
+
+| Value | Behavior |
+|---|---|
+| `reference` | Use the existing SGL-JAX Conv1D and GDN prefill path. This is the default. |
+| `tpu_inference_v3` | Use the vendored TPU-Inference v3 fused Conv1D+GDN prefill path. Decode remains on the existing SGL-JAX reference path. |
+
+The optimized path is an explicit TPU/BF16 opt-in. Unsupported configurations
+fail during backend initialization; they do not silently fall back to
+`reference`. The requested and effective implementations are frozen at backend
+initialization and logged once.
+
+Example:
+
+```bash
+SGLANG_JAX_GDN_PREFILL_IMPL=tpu_inference_v3 \
+python3 -u -m sgl_jax.launch_server \
+  --model-path <QWEN3_5_MODEL_PATH> \
+  --device tpu \
+  --dtype bfloat16 \
+  <OTHER_SERVE_ARGUMENTS>
+```
+
+See [TPU-Inference v3 GDN Prefill](../developer_guide/gdn_tpu_inference_v3.md)
+for capability requirements, provenance, verification, and benchmark results.
+
 ## Feature-Specific Flags
 
 | Area | Arguments |
