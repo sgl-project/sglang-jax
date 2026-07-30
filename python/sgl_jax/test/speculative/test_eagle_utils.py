@@ -1,19 +1,120 @@
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.sharding import Mesh, NamedSharding
+from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.kernels.speculative.kernel import create_extend_after_decode_spec_info
 from sgl_jax.srt.kernels.speculative.tree_speculative_sampling_target_only_kernel import (
     tree_speculative_sampling_target_only_pallas_call,
 )
 from sgl_jax.srt.kernels.speculative.verify_tree_greedy_kernel import verify_tree_greedy
-from sgl_jax.srt.speculative.eagle_util import build_tree_mask_for_draft_decode
+from sgl_jax.srt.layers import sampler
+from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
+from sgl_jax.srt.speculative.eagle_util import (
+    EagleDraftInput,
+    build_tree_mask_for_draft_decode,
+)
+from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 from sgl_jax.test.test_utils import CustomTestCase
 
 
+def _explicit_mesh():
+    return Mesh(
+        np.asarray(jax.devices()),
+        ("data",),
+        axis_types=(jax.sharding.AxisType.Explicit,),
+    )
+
+
 class TestVerifyTree(CustomTestCase):
+    def test_speculative_logprobs_use_accept_width_and_verified_ids(self):
+        mesh = _explicit_mesh()
+        logits = jnp.arange(12 * 3, dtype=jnp.float32).reshape(12, 3) / 10
+        logits = jax.device_put(logits, NamedSharding(mesh, P("data", None)))
+        verified_id = np.tile([1, 2, 0], 4).astype(np.int32)
+        temperatures = jnp.repeat(jnp.asarray([2.0, 4.0, 2.0, 4.0]), 3)[:, None]
+        batch = SimpleNamespace(
+            sampling_info=SimpleNamespace(temperatures=jnp.asarray([[2.0], [4.0], [2.0], [4.0]])),
+            top_logprobs_nums=[1, 2, 1, 2],
+            token_ids_logprobs=[[0], [1, 2], [0], [1, 2]],
+        )
+        for return_original in (False, True):
+            with self.subTest(return_original=return_original):
+                output = LogitsProcessorOutput(next_token_logits=logits)
+                with mock.patch.object(sampler, "RETURN_ORIGINAL_LOGPROB", return_original):
+                    sampler.populate_speculative_output_logprobs(
+                        output,
+                        verified_id,
+                        model_worker_batch=batch,
+                        speculative_num_steps=2,
+                        mesh=mesh,
+                    )
+
+                expected_logits = logits if return_original else logits / temperatures
+                expected = np.asarray(jax.nn.log_softmax(expected_logits, axis=-1))
+                np.testing.assert_allclose(
+                    np.asarray(output.next_token_logprobs),
+                    expected[np.arange(12), verified_id],
+                )
+                self.assertEqual(
+                    output.next_token_logprobs.sharding.spec,
+                    P(None),
+                )
+                self.assertEqual(output.next_token_top_logprobs_val.shape, (12, 2))
+                self.assertEqual(output.next_token_token_ids_logprobs_val.shape, (12, 3))
+
+    def test_draft_extend_metadata_ignores_request_logprob(self):
+        mesh = jax.sharding.Mesh(np.array(jax.devices()), ("data",))
+        draft_input = EagleDraftInput(
+            hidden_states=jnp.zeros((1, 4), dtype=jnp.float32),
+            allocate_lens=np.array([8], dtype=np.int32),
+        )
+        model_worker_batch = SimpleNamespace(
+            spec_info_padded=None,
+            logits_indices_selector=np.array([0], dtype=np.int64),
+            seq_lens=np.array([8], dtype=np.int32),
+            input_ids=np.array([10, 11], dtype=np.int32),
+            positions=np.array([8, 9], dtype=np.int32),
+            dp_size=1,
+            per_dp_bs_size=1,
+            return_logprob=True,
+            top_logprobs_nums=None,
+            token_ids_logprobs=None,
+            extend_input_logprob_token_ids=None,
+        )
+        batch_output = SimpleNamespace(
+            accept_lens=np.array([1], dtype=np.int32),
+            next_draft_input=SimpleNamespace(
+                hidden_states=jnp.zeros((1, 4), dtype=jnp.float32),
+                verified_id=np.array([12, 13], dtype=np.int32),
+            ),
+        )
+        draft_model_runner = SimpleNamespace(
+            mesh=mesh,
+            attn_backend=SimpleNamespace(
+                get_eagle_forward_metadata=lambda _batch: object(),
+                forward_metadata=None,
+            ),
+        )
+        for spec_algorithm in (SpeculativeAlgorithm.NEXTN, SpeculativeAlgorithm.EAGLE3):
+            model_worker_batch.spec_algorithm = spec_algorithm
+
+            _, logits_metadata = draft_input.prepare_for_extend_after_verify(
+                model_worker_batch,
+                draft_model_runner,
+                batch_output,
+                speculative_num_draft_tokens=4,
+            )
+
+            self.assertFalse(logits_metadata.extend_return_logprob)
+            self.assertFalse(logits_metadata.extend_return_top_logprob)
+            self.assertFalse(logits_metadata.extend_token_ids_logprob)
+
     def test_as_int32_array_keeps_host_metadata_on_host(self):
         from sgl_jax.srt.speculative import eagle_util
 

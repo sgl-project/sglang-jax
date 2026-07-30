@@ -11,8 +11,11 @@ from sgl_jax.srt.constrained.bitmask_ops import apply_token_bitmask
 from sgl_jax.srt.layers.binary_search import topk_mask, topp_mask
 from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
+from sgl_jax.srt.utils.common_utils import get_bool_env_var
 from sgl_jax.srt.utils.jax_utils import is_tpu_runtime
 from sgl_jax.srt.utils.profiling_utils import named_scope
+
+RETURN_ORIGINAL_LOGPROB = get_bool_env_var("RETURN_ORIGINAL_LOGPROB")
 
 
 class Sampler(nnx.Module):
@@ -108,6 +111,7 @@ class Sampler(nnx.Module):
 
         return LogitsProcessorOutput(
             next_token_logits=logits_output.next_token_logits,
+            hidden_states=logits_output.hidden_states,
             next_token_logprobs=next_token_logprobs,
             next_token_top_logprobs_val=next_token_top_logprobs_val,
             next_token_top_logprobs_idx=next_token_top_logprobs_idx,
@@ -236,6 +240,46 @@ def get_token_ids_logprobs(logprobs: jax.Array, token_ids_logprobs: list[list[in
     # length varies per req.
     del token_ids_logprobs, mesh  # unused; kept for API parity
     return logprobs
+
+
+def populate_speculative_output_logprobs(
+    logits_output,
+    verified_ids,
+    *,
+    model_worker_batch,
+    speculative_num_steps: int,
+    mesh,
+    temperatures=None,
+):
+    rows_per_req = speculative_num_steps + 1
+    if temperatures is None:
+        temperatures = model_worker_batch.sampling_info.temperatures
+    logits = logits_output.next_token_logits.astype(jnp.float32)
+    if temperatures is not None and not RETURN_ORIGINAL_LOGPROB:
+        row_temperatures = jnp.repeat(
+            jnp.asarray(temperatures, dtype=jnp.float32).reshape(-1), rows_per_req
+        )[:, None]
+        logits = logits / row_temperatures
+
+    logprobs = jax.nn.log_softmax(logits, axis=-1)
+    verified_ids = jnp.asarray(verified_ids, dtype=jnp.int32).reshape(-1)
+    logits_output.next_token_logprobs = compute_logprobs(mesh, logprobs, verified_ids)
+
+    top_logprobs_nums = model_worker_batch.top_logprobs_nums
+    if top_logprobs_nums is not None and any(num > 0 for num in top_logprobs_nums):
+        repeated_nums = [num for num in top_logprobs_nums for _ in range(rows_per_req)]
+        (
+            logits_output.next_token_top_logprobs_val,
+            logits_output.next_token_top_logprobs_idx,
+        ) = get_top_logprobs(logprobs, repeated_nums, mesh)
+
+    token_ids_logprobs = model_worker_batch.token_ids_logprobs
+    if token_ids_logprobs is not None and any(ids is not None for ids in token_ids_logprobs):
+        repeated_ids = [ids for ids in token_ids_logprobs for _ in range(rows_per_req)]
+        logits_output.next_token_token_ids_logprobs_val = get_token_ids_logprobs(
+            logprobs, repeated_ids, mesh
+        )
+        logits_output.next_token_token_ids_logprobs_idx = None
 
 
 def multinomial(

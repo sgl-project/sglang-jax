@@ -28,6 +28,7 @@ from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardM
 from sgl_jax.srt.model_executor.model_runner import MockModelRunner, ModelRunner
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 from sgl_jax.srt.server_args import ServerArgs
+from sgl_jax.srt.utils.jax_utils import materialize_to_host
 from sgl_jax.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -554,9 +555,14 @@ class ModelWorker:
                 forward_batch.forward_mode,
             )
 
+        # `selector` reorders DP-interleaved per-req tensors back to
+        # original request order. For DP=1 it's just np.arange(real_bs).
+        selector = model_worker_batch.logits_indices_selector
         if skip_sample:
             next_token_ids_device = None
             new_logits_output = None
+            if model_worker_batch.return_logprob:
+                self._materialize_logprobs_to_host(logits_output, model_worker_batch, selector)
         else:
             import jax._src.test_util as jtu
 
@@ -570,12 +576,9 @@ class ModelWorker:
                     sampling_metadata,
                 )
                 cache_miss_count += count()
-            # `selector` reorders DP-interleaved per-req tensors back to
-            # original request order. For DP=1 it's just np.arange(real_bs).
-            selector = model_worker_batch.logits_indices_selector
             if model_worker_batch.return_output_logprob_only:
                 logprobs = self.model_runner.compute_logprobs(token_logprobs, next_token_ids_device)
-                logits_output.next_token_logprobs = jax.device_get(logprobs)[selector]
+                logits_output.next_token_logprobs = materialize_to_host(logprobs)[selector]
         if new_logits_output is not None:
             logits_output = new_logits_output
             self._materialize_logprobs_to_host(logits_output, model_worker_batch, selector)
@@ -607,12 +610,12 @@ class ModelWorker:
         def gather(arr, *, as_float=False):
             if as_float:
                 arr = arr.astype(jnp.float32)
-            return jax.device_get(arr)[selector]
+            return materialize_to_host(arr)[selector]
 
         if logits_output.next_token_logprobs is not None:
-            logits_output.next_token_logprobs = jax.device_get(logits_output.next_token_logprobs)[
-                selector
-            ]
+            logits_output.next_token_logprobs = materialize_to_host(
+                logits_output.next_token_logprobs
+            )[selector]
 
         top_nums = model_worker_batch.top_logprobs_nums
         tok_ids = model_worker_batch.token_ids_logprobs
@@ -642,11 +645,11 @@ class ModelWorker:
             logits_output.next_token_token_ids_logprobs_idx = per_req_idxs
 
         # input_* per-token logprobs use the padded layout; split per req via the
-        # helper. (A dp>1 tight fallback never reaches here — it crashes earlier
-        # at the sharded slice; dp=1 is a single section, base 0.)
+        # helper. dp=1 is a single section with base 0; dp>1 gathers the padded
+        # sections above before splitting.
         if logits_output.input_top_logprobs_val is not None:
-            vals = jax.device_get(logits_output.input_top_logprobs_val.astype(jnp.float32))
-            idxs = jax.device_get(logits_output.input_top_logprobs_idx)
+            vals = materialize_to_host(logits_output.input_top_logprobs_val.astype(jnp.float32))
+            idxs = materialize_to_host(logits_output.input_top_logprobs_idx)
             per_req_vals, per_req_idxs = [], []
             for slot, off, plen in _iter_padded_input_logprob_reqs(
                 model_worker_batch, vals.shape[0]
@@ -662,7 +665,9 @@ class ModelWorker:
             logits_output.input_top_logprobs_idx = per_req_idxs
 
         if logits_output.input_token_ids_logprobs_val is not None:
-            full = jax.device_get(logits_output.input_token_ids_logprobs_val.astype(jnp.float32))
+            full = materialize_to_host(
+                logits_output.input_token_ids_logprobs_val.astype(jnp.float32)
+            )
             per_req_vals, per_req_idxs = [], []
             for slot, off, plen in _iter_padded_input_logprob_reqs(
                 model_worker_batch, full.shape[0]
