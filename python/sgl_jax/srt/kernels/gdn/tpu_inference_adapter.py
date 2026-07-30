@@ -9,6 +9,8 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import PartitionSpec as P
 
+_TPU_LANE_WIDTH = 128
+
 
 class GDNPrefillCapabilityError(RuntimeError):
     """An explicitly requested GDN prefill implementation is unsupported."""
@@ -54,6 +56,12 @@ def validate_tpu_inference_v3_capability(
         raise GDNPrefillCapabilityError(
             "tpu_inference_v3 requires positive head counts and dimensions."
         )
+    for name, head_dim in (("head_k_dim", head_k_dim), ("head_v_dim", head_v_dim)):
+        if head_dim % _TPU_LANE_WIDTH:
+            raise GDNPrefillCapabilityError(
+                f"tpu_inference_v3 requires {name} to be divisible by "
+                f"the TPU lane width {_TPU_LANE_WIDTH}; got {head_dim}."
+            )
     if num_v_heads % num_k_heads != 0:
         raise GDNPrefillCapabilityError(
             "tpu_inference_v3 requires num_v_heads to be divisible by num_k_heads."
@@ -149,6 +157,47 @@ def _validate_track_indices(
     if np.intersect1d(active_track, running).size:
         raise ValueError("track_indices aliases a running state slot.")
     return None
+
+
+def _validate_track_indices_per_dp(
+    track_indices: jax.Array | None,
+    state_indices: jax.Array,
+    pool_size: int,
+    dp: int,
+    track_mask: jax.Array | None = None,
+) -> jax.Array | None:
+    """Validate local state-pool indices independently for each DP rank."""
+    if track_indices is None:
+        return None
+    if track_indices.shape != state_indices.shape:
+        raise ValueError(
+            "track_indices must have the same shape as state_indices; "
+            f"got {track_indices.shape} and {state_indices.shape}."
+        )
+    if track_mask is not None and track_mask.shape != track_indices.shape:
+        raise ValueError(
+            "track_mask must have the same shape as track_indices; "
+            f"got {track_mask.shape} and {track_indices.shape}."
+        )
+    if track_indices.size % dp:
+        raise ValueError(f"track_indices size {track_indices.size} must be divisible by DP={dp}.")
+
+    track_by_dp = track_indices.reshape(dp, -1)
+    state_by_dp = state_indices.reshape(dp, -1)
+    mask_by_dp = None if track_mask is None else track_mask.reshape(dp, -1)
+    invalid_per_dp = []
+    for dp_rank in range(dp):
+        invalid = _validate_track_indices(
+            track_by_dp[dp_rank],
+            state_by_dp[dp_rank],
+            pool_size,
+            track_mask=None if mask_by_dp is None else mask_by_dp[dp_rank],
+        )
+        if invalid is not None:
+            invalid_per_dp.append(invalid)
+    if not invalid_per_dp:
+        return None
+    return jnp.any(jnp.stack(invalid_per_dp))
 
 
 def _scatter_active(
@@ -300,10 +349,11 @@ def tpu_inference_v3_prefill(
     dp = int(backend.mesh.shape.get("data", 1))
     if conv_state.shape[0] % dp:
         raise ValueError(f"state pool size {conv_state.shape[0]} must be divisible by DP={dp}.")
-    invalid_track = _validate_track_indices(
+    invalid_track = _validate_track_indices_per_dp(
         track_indices,
         state_indices,
         conv_state.shape[0] // dp,
+        dp,
         track_mask=track_mask,
     )
 

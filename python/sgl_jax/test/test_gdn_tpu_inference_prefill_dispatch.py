@@ -29,8 +29,8 @@ def _backend(monkeypatch, *, impl=None, dtype=None, **overrides):
     config = dict(
         num_k_heads=2,
         num_v_heads=4,
-        head_k_dim=64,
-        head_v_dim=64,
+        head_k_dim=128,
+        head_v_dim=128,
         conv_kernel_size=4,
         mesh=_mesh(),
         dtype=dtype,
@@ -91,6 +91,8 @@ def test_invalid_selector_fails_during_initialization(monkeypatch):
         (None, {}, "dtype"),
         (jnp.float32, {}, "BF16"),
         (jnp.bfloat16, {"conv_kernel_size": 1}, "conv_kernel_size"),
+        (jnp.bfloat16, {"head_k_dim": 64}, "head_k_dim"),
+        (jnp.bfloat16, {"head_v_dim": 192}, "head_v_dim"),
     ],
 )
 def test_tpu_inference_v3_rejects_unsupported_startup_capability(monkeypatch, dtype, kwargs, match):

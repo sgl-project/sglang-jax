@@ -16,13 +16,44 @@ from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
     LinearRecurrentAttnBackendMetadata,
 )
 
-
 N_KQ = 1
 N_V = 2
 D_K = 1
 D_V = 1
 KERNEL_SIZE = 3
 DIM = 2 * N_KQ * D_K + N_V * D_V
+
+
+def _mesh():
+    return jax.sharding.Mesh(jax.devices()[:1], ("tensor",))
+
+
+def test_track_indices_are_validated_per_dp_rank():
+    track_indices = jnp.asarray([2, 3, 2, 3], dtype=jnp.int32)
+    state_indices = jnp.asarray([1, 4, 1, 4], dtype=jnp.int32)
+    track_mask = jnp.ones((4,), dtype=jnp.bool_)
+
+    assert (
+        adapter._validate_track_indices_per_dp(
+            track_indices,
+            state_indices,
+            pool_size=5,
+            dp=2,
+            track_mask=track_mask,
+        )
+        is None
+    )
+
+
+def test_track_indices_still_reject_duplicates_within_a_dp_rank():
+    with pytest.raises(ValueError, match="duplicate checkpoint"):
+        adapter._validate_track_indices_per_dp(
+            jnp.asarray([2, 2, 2, 3], dtype=jnp.int32),
+            jnp.asarray([1, 4, 1, 4], dtype=jnp.int32),
+            pool_size=5,
+            dp=2,
+            track_mask=jnp.ones((4,), dtype=jnp.bool_),
+        )
 
 
 def _inputs():
@@ -263,7 +294,7 @@ def test_forward_extend_rejects_active_dummy_track_before_vendor(monkeypatch):
         head_k_dim=D_K,
         head_v_dim=D_V,
         conv_kernel_size=KERNEL_SIZE,
-        mesh=jax.sharding.Mesh(jax.devices()[:1], ("tensor",)),
+        mesh=_mesh(),
         dtype=jnp.bfloat16,
     )
     backend.forward_metadata = LinearRecurrentAttnBackendMetadata(
@@ -290,12 +321,12 @@ def test_forward_extend_rejects_active_dummy_track_before_vendor(monkeypatch):
 
 def test_prefill_rejects_track_outside_dp_local_pool_before_shard_map(monkeypatch):
     metadata = LinearRecurrentAttnBackendMetadata(
-        cu_q_lens=jnp.asarray([0, 1], dtype=jnp.int32),
-        recurrent_indices=jnp.asarray([1], dtype=jnp.int32),
-        has_initial_state=jnp.asarray([True]),
+        cu_q_lens=jnp.asarray([0, 1, 2], dtype=jnp.int32),
+        recurrent_indices=jnp.asarray([1, 1], dtype=jnp.int32),
+        has_initial_state=jnp.asarray([True, True]),
         # Global pool size is 8, but DP=2 makes the rank-local size 4.
-        recurrent_track_indices=jnp.asarray([4], dtype=jnp.int32),
-        recurrent_track_mask=jnp.asarray([True]),
+        recurrent_track_indices=jnp.asarray([4, 2], dtype=jnp.int32),
+        recurrent_track_mask=jnp.asarray([True, True]),
     )
     backend = SimpleNamespace(
         forward_metadata=metadata,
@@ -317,15 +348,15 @@ def test_prefill_rejects_track_outside_dp_local_pool_before_shard_map(monkeypatc
     with pytest.raises(ValueError, match="out of range"):
         adapter.tpu_inference_v3_prefill(
             backend,
-            jnp.ones((1, DIM), dtype=jnp.bfloat16),
+            jnp.ones((2, DIM), dtype=jnp.bfloat16),
             jnp.zeros((8, DIM, KERNEL_SIZE - 1), dtype=jnp.bfloat16),
             jnp.zeros((8, N_V, D_K, D_V), dtype=jnp.float32),
-            jnp.zeros((1, N_V), dtype=jnp.bfloat16),
-            jnp.zeros((1, N_V), dtype=jnp.bfloat16),
+            jnp.zeros((2, N_V), dtype=jnp.bfloat16),
+            jnp.zeros((2, N_V), dtype=jnp.bfloat16),
             jnp.zeros((DIM, KERNEL_SIZE), dtype=jnp.bfloat16),
             jnp.zeros((N_V,), dtype=jnp.float32),
             jnp.zeros((N_V,), dtype=jnp.float32),
-            jnp.asarray([1], dtype=jnp.int32),
+            jnp.asarray([1, 1], dtype=jnp.int32),
         )
 
 
@@ -335,12 +366,10 @@ def test_jitted_invalid_track_does_not_execute_vendor(monkeypatch):
     def vendor(qkv, b, a, conv_state, recurrent_state, *args, **kwargs):
         del b, a, args, kwargs
         jax.debug.callback(lambda: vendor_calls.append("called"))
-        return (conv_state, recurrent_state), jnp.zeros(
-            (qkv.shape[0], N_V * D_V), dtype=qkv.dtype
-        )
+        return (conv_state, recurrent_state), jnp.zeros((qkv.shape[0], N_V * D_V), dtype=qkv.dtype)
 
     monkeypatch.setattr(adapter, "_vendor_fused_conv1d_gdn", vendor)
-    mesh = jax.sharding.Mesh(jax.devices()[:1], ("tensor",))
+    mesh = _mesh()
 
     @jax.jit
     def run(track_indices):
@@ -372,7 +401,7 @@ def test_jitted_invalid_track_does_not_execute_vendor(monkeypatch):
             jnp.asarray([1], dtype=jnp.int32),
         )
 
-    with pytest.raises(Exception, match="active track.*dummy"):
+    with jax.sharding.set_mesh(mesh), pytest.raises(Exception, match="active track.*dummy"):
         jax.block_until_ready(run(jnp.asarray([0], dtype=jnp.int32)))
     assert vendor_calls == []
 
@@ -406,17 +435,9 @@ def test_forward_extend_executes_the_callable_frozen_at_initialization(monkeypat
         head_k_dim=D_K,
         head_v_dim=D_V,
         conv_kernel_size=KERNEL_SIZE,
-        mesh=jax.sharding.Mesh(jax.devices()[:1], ("tensor",)),
+        mesh=_mesh(),
         dtype=jnp.bfloat16,
     )
-    backend.forward_metadata = LinearRecurrentAttnBackendMetadata(
-        cu_q_lens=jnp.asarray([0, 2], dtype=jnp.int32),
-        recurrent_indices=jnp.asarray([1], dtype=jnp.int32),
-        has_initial_state=jnp.asarray([False]),
-        recurrent_track_indices=jnp.asarray([2], dtype=jnp.int32),
-        recurrent_track_mask=jnp.asarray([True]),
-    )
-
     # Mutating both selector state and the backend module's symbol after
     # construction must not replace the initialized callable.
     monkeypatch.setenv("SGLANG_JAX_GDN_PREFILL_IMPL", "reference")
@@ -426,17 +447,28 @@ def test_forward_extend_executes_the_callable_frozen_at_initialization(monkeypat
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("not frozen")),
     )
 
-    output, new_conv, new_recurrent = backend.forward_extend(
-        jnp.ones((2, DIM), dtype=jnp.bfloat16),
-        jnp.zeros((3, DIM, KERNEL_SIZE - 1), dtype=jnp.bfloat16),
-        jnp.zeros((3, N_V, D_K, D_V), dtype=jnp.float32),
-        jnp.zeros((2, N_V), dtype=jnp.bfloat16),
-        jnp.zeros((2, N_V), dtype=jnp.bfloat16),
-        jnp.zeros((DIM, KERNEL_SIZE), dtype=jnp.bfloat16),
-        jnp.zeros((N_V,), dtype=jnp.float32),
-        jnp.zeros((N_V,), dtype=jnp.float32),
-        seq_lens=jnp.asarray([2], dtype=jnp.int32),
-    )
+    with jax.sharding.set_mesh(backend.mesh):
+        backend.forward_metadata = LinearRecurrentAttnBackendMetadata(
+            cu_q_lens=jnp.asarray([0, 2], dtype=jnp.int32),
+            recurrent_indices=jnp.asarray([1], dtype=jnp.int32),
+            has_initial_state=jnp.asarray([False]),
+            recurrent_track_indices=jnp.asarray([2], dtype=jnp.int32),
+            recurrent_track_mask=jnp.asarray([True]),
+        )
+        output, new_conv, new_recurrent = backend.forward_extend(
+            jnp.ones((2, DIM), dtype=jnp.bfloat16),
+            jnp.zeros((3, DIM, KERNEL_SIZE - 1), dtype=jnp.bfloat16),
+            jnp.zeros((3, N_V, D_K, D_V), dtype=jnp.float32),
+            jnp.zeros((2, N_V), dtype=jnp.bfloat16),
+            jnp.zeros((2, N_V), dtype=jnp.bfloat16),
+            jnp.zeros((DIM, KERNEL_SIZE), dtype=jnp.bfloat16),
+            jnp.zeros((N_V,), dtype=jnp.float32),
+            jnp.zeros((N_V,), dtype=jnp.float32),
+            seq_lens=jnp.asarray([2], dtype=jnp.int32),
+        )
+        output = np.asarray(output)
+        new_conv = np.asarray(new_conv)
+        new_recurrent = np.asarray(new_recurrent)
 
     np.testing.assert_array_equal(output, fixture.output_value)
     np.testing.assert_array_equal(new_conv[1], fixture.conv_value)
