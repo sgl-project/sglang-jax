@@ -169,6 +169,9 @@ jobs:
   nightly-test-accuracy-text-models-4-tpu-daily:
     if: github.repository == 'sgl-project/sglang-jax' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-accuracy-text-models-4-tpu-daily')
     runs-on: arc-runner-v6e-4
+    outputs:
+      accuracy_result: ${{ steps.run.outcome }}
+      determinism_result: ${{ steps.recurrent_determinism.outcome }}
     # Read-only + persist-credentials:false — this job runs PR-HEAD code, so it must not
     # hold a write token; PASS/FAIL is posted from the separate comment job below.
     permissions:
@@ -196,6 +199,7 @@ jobs:
           cd test/srt
           python3 nightly/single_host/suite_runner.py --suite accuracy-text-models-v6e-4 ${CASES:+--cases "$CASES"}
       - name: Run recurrent determinism e2e
+        id: recurrent_determinism
         if: ${{ !cancelled() && (inputs.cases == '' || contains(format(',{0},', inputs.cases), ',recurrent-gsm8k,')) }}
         timeout-minutes: 120
         run: |
@@ -245,11 +249,30 @@ jobs:
           PR_NUMBER: ${{ inputs.pr_number }}
           CASE_KEY: ${{ inputs.cases || 'accuracy-text-models-v6e-4' }}
           RESULT: ${{ needs.nightly-test-accuracy-text-models-4-tpu-daily.result }}
+          ACCURACY_RESULT: ${{ needs.nightly-test-accuracy-text-models-4-tpu-daily.outputs.accuracy_result }}
+          DETERMINISM_RESULT: ${{ needs.nightly-test-accuracy-text-models-4-tpu-daily.outputs.determinism_result }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          if [ "$RESULT" = "success" ]; then status="PASS"; else status="FAIL"; fi
-          gh pr comment "$PR_NUMBER" --repo "$REPO" \
-            --body "> **Nightly** [\`$CASE_KEY\`]($RUN_URL): **$status** — see the run's step summary for gate details."
+          if [ "$ACCURACY_RESULT" = "success" ]; then
+            accuracy_status="PASS"
+          elif [ "$ACCURACY_RESULT" = "failure" ]; then
+            accuracy_status="FAIL"
+          else
+            accuracy_status="NOT RUN"
+          fi
+
+          body="> **Nightly accuracy** [\`$CASE_KEY\`]($RUN_URL): **$accuracy_status**"
+          if [ -n "$DETERMINISM_RESULT" ] && [ "$DETERMINISM_RESULT" != "skipped" ]; then
+            if [ "$DETERMINISM_RESULT" = "success" ]; then
+              determinism_status="PASS"
+            else
+              determinism_status="FAIL"
+            fi
+            body="${body}"$'\n'"> **Nightly determinism** [\`recurrent-determinism\`]($RUN_URL): **$determinism_status**"
+          elif [ "$RESULT" = "failure" ] && [ "$ACCURACY_RESULT" != "failure" ]; then
+            body="${body}"$'\n'"> **Nightly job** [\`$CASE_KEY\`]($RUN_URL): **FAIL**"
+          fi
+          gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$body"
 
   nightly-test-perf-text-models-4-tpu-daily:
     if: github.repository == 'sgl-project/sglang-jax' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-perf-text-models-4-tpu-daily')

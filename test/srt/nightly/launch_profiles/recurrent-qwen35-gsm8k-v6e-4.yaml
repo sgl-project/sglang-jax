@@ -14,7 +14,9 @@ server_args:
   - --mem-fraction-static
   - "0.8"
   - --chunked-prefill-size
-  - "512"
+  - "4096"
+  - --recurrent-track-interval
+  - "4096"
   - --page-size
   - "128"
   - --max-running-requests
@@ -28,10 +30,11 @@ server_args:
   # Keep this recurrent-cache accuracy gate independent of optional MoE
   # routing-kernel changes; the JAX top-k path remains the stable baseline.
   - --disable-topk-kernel
-  - --disable-overlap-schedule
   - --precompile-bs-paddings
   - "8"
   - "16"
   - --precompile-token-paddings
   - "512"
   - "1024"
+  - "2048"
+  - "4096"
