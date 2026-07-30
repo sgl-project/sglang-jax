@@ -6,6 +6,11 @@ from results import write_perf_json
 
 
 def run_perf_case(case: PerfCase, profile: LaunchProfile) -> None:
+    if case.workload != "random":
+        raise NotImplementedError(
+            f"Multi-host perf only supports random workloads, got {case.workload!r}"
+        )
+
     from sgl_jax.bench_serving import run_benchmark
     from sgl_jax.test.test_utils import get_benchmark_args
 
