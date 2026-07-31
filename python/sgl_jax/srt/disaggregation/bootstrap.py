@@ -871,13 +871,16 @@ class HeartbeatDaemon:
 
     def _loop(self) -> None:
         while not self._stop_event.is_set():
+            self._heartbeat_once()
+            self._stop_event.wait(self._interval_s)
+
+    def _heartbeat_once(self) -> None:
+        for bootstrap_key in self._bootstrap_keys:
             try:
-                for bootstrap_key in self._bootstrap_keys:
-                    self._client.heartbeat(bootstrap_key)
+                self._client.heartbeat(bootstrap_key)
             except Exception:
                 logger.warning(
                     "bootstrap heartbeat for %s failed; will retry",
-                    self._bootstrap_keys,
+                    bootstrap_key,
                     exc_info=True,
                 )
-            self._stop_event.wait(self._interval_s)

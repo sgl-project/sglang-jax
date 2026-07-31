@@ -167,19 +167,20 @@ def _make_disagg_shutdown(scheduler: Scheduler, mode: str):
             return
         state["done"] = True
         if mode == "prefill":
-            try:
-                keys = getattr(
-                    scheduler,
-                    "disagg_bootstrap_keys",
-                    [scheduler.disagg_bootstrap_key],
-                )
-                for key in keys:
+            keys = getattr(
+                scheduler,
+                "disagg_bootstrap_keys",
+                [scheduler.disagg_bootstrap_key],
+            )
+            for key in keys:
+                try:
                     scheduler.disagg_bootstrap_client.unregister_prefill(key)
-            except Exception:
-                logger.warning(
-                    "PD shutdown: unregister_prefill failed",
-                    exc_info=True,
-                )
+                except Exception:
+                    logger.warning(
+                        "PD shutdown: unregister_prefill failed for %s",
+                        key,
+                        exc_info=True,
+                    )
             with suppress(Exception):
                 scheduler.disagg_heartbeat.stop()
         try:

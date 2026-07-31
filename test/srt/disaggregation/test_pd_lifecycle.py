@@ -47,7 +47,9 @@ class TestConstants:
         assert MIN_COMPATIBLE_VERSION <= PROTOCOL_VERSION
 
     def test_prefill_info_defaults_to_current_version(self):
-        info = PrefillInfo(bootstrap_key="h:1", host="h", transfer_port=1, side_channel_port=2)
+        info = PrefillInfo(
+            bootstrap_key="h:1", host="h", transfer_port=1, side_channel_port=2
+        )
         assert info.protocol_version == PROTOCOL_VERSION
 
 
@@ -146,7 +148,11 @@ class TestGracefulShutdown:
         assert r.failed_reason == "shutdown"
 
     def test_stops_reaper(self):
-        m = _Mgr(ack_timeout_seconds=10.0, pull_timeout_seconds=10.0, reaper_interval_seconds=0.01)
+        m = _Mgr(
+            ack_timeout_seconds=10.0,
+            pull_timeout_seconds=10.0,
+            reaper_interval_seconds=0.01,
+        )
         m.start_reaper()
         assert m._reaper_thread is not None
         m.graceful_shutdown(drain_timeout_seconds=0.0)
@@ -241,6 +247,24 @@ class TestRuntimeShutdownClosure:
         sched.disagg_bootstrap_client.unregister_prefill = _boom
         shutdown = _make_disagg_shutdown(sched, "prefill")
         shutdown()
+        assert sched.disagg_kv_manager.shutdown_calls == 1
+
+    def test_prefill_unregister_attempts_every_dp_rank_after_one_failure(self):
+        sched = _FakeScheduler()
+        sched.disagg_bootstrap_keys = ["h:1:dp_0", "h:1:dp_1"]
+        attempted = []
+
+        def _unregister(key):
+            attempted.append(key)
+            if key.endswith("dp_0"):
+                raise RuntimeError("rank-0 unregister failed")
+
+        sched.disagg_bootstrap_client.unregister_prefill = _unregister
+        shutdown = _make_disagg_shutdown(sched, "prefill")
+
+        shutdown()
+
+        assert attempted == ["h:1:dp_0", "h:1:dp_1"]
         assert sched.disagg_kv_manager.shutdown_calls == 1
 
 

@@ -316,6 +316,23 @@ def test_heartbeat_daemon_survives_transient_server_errors():
         daemon.stop()
 
 
+def test_heartbeat_daemon_attempts_every_dp_rank_after_one_failure():
+    from sgl_jax.srt.disaggregation.bootstrap import HeartbeatDaemon
+
+    client = mock.MagicMock()
+
+    def _heartbeat(key):
+        if key == "rank-0":
+            raise RuntimeError("rank-0 transient")
+
+    client.heartbeat.side_effect = _heartbeat
+    daemon = HeartbeatDaemon(client, ["rank-0", "rank-1"])
+
+    daemon._heartbeat_once()
+
+    assert client.heartbeat.call_args_list == [mock.call("rank-0"), mock.call("rank-1")]
+
+
 # --- Protocol version skew tests ---
 
 
