@@ -402,6 +402,10 @@ def build_scatter_runner(
         starts_ref,
         sizes_ref,
         out_ref,
+        topk_smem,
+        starts_smem,
+        sizes_smem,
+        metadata_sems,
         offsets_smem,
         sends_smem,
         send_sems,
@@ -431,6 +435,23 @@ def build_scatter_runner(
             pl.semaphore_wait(barrier_sem, ep_size)
 
         def scatter_bt(bt_id, _):
+            bt_start = bt_id * bt
+            topk_copy = pltpu.async_copy(
+                src_ref=topk_ref.at[pl.ds(bt_start, bt)],
+                dst_ref=topk_smem,
+                sem=metadata_sems.at[0],
+            )
+            starts_copy = pltpu.async_copy(
+                src_ref=starts_ref.at[bt_id],
+                dst_ref=starts_smem,
+                sem=metadata_sems.at[1],
+            )
+            sizes_copy = pltpu.async_copy(
+                src_ref=sizes_ref.at[bt_id],
+                dst_ref=sizes_smem,
+                sem=metadata_sems.at[2],
+            )
+
             def clear_offset(expert_id, _):
                 offsets_smem[expert_id] = jnp.int32(0)
                 return None
@@ -441,17 +462,19 @@ def build_scatter_runner(
 
             lax.fori_loop(0, plan.num_experts, clear_offset, None, unroll=False)
             lax.fori_loop(0, local_experts, clear_send, None, unroll=False)
-            bt_start = bt_id * bt
+            topk_copy.wait()
+            starts_copy.wait()
+            sizes_copy.wait()
 
             def scatter_one(token_id, _):
                 src_token_id = bt_start + token_id
                 for k_id in range(plan.top_k):
-                    expert_id = topk_ref[src_token_id, k_id]
+                    expert_id = topk_smem[token_id, k_id]
                     expert_slot = expert_id % jnp.int32(local_experts)
                     recv_id = expert_id // jnp.int32(local_experts)
                     offset = offsets_smem[expert_id]
                     offsets_smem[expert_id] = offset + jnp.int32(1)
-                    start = starts_ref[bt_id, my_id, expert_id] + offset
+                    start = starts_smem[my_id, expert_id] + offset
                     is_local = recv_id == my_id
 
                     with jax.named_scope("a2a_scatter_remote_sends"):
@@ -516,7 +539,7 @@ def build_scatter_runner(
 
                 def wait_recv(expert_slot, _):
                     expert_id = my_id * local_experts + expert_slot
-                    recv_rows = sizes_ref[bt_id, expert_id]
+                    recv_rows = sizes_smem[expert_id]
 
                     @pl.when(recv_rows != 0)
                     def wait(_expert_slot=expert_slot, _recv_rows=recv_rows):
@@ -548,6 +571,10 @@ def build_scatter_runner(
             in_specs=[hbm_spec, vmem_spec, vmem_spec, vmem_spec],
             out_specs=hbm_spec,
             scratch_shapes=[
+                pltpu.SMEM((bt, plan.top_k), jnp.int32),
+                pltpu.SMEM((ep_size, plan.num_experts), jnp.int32),
+                pltpu.SMEM((plan.num_experts,), jnp.int32),
+                pltpu.SemaphoreType.DMA((3,)),
                 pltpu.SMEM((plan.num_experts,), jnp.int32),
                 pltpu.SMEM((local_experts,), jnp.int32),
                 pltpu.SemaphoreType.DMA((local_experts,)),
@@ -621,6 +648,9 @@ def build_gather_runner(
         counts_ref,
         sizes_ref,
         out_ref,
+        counts_smem,
+        sizes_smem,
+        metadata_sems,
         send_sems,
         recv_sem,
         barrier_sem,
@@ -653,13 +683,26 @@ def build_gather_runner(
             pl.semaphore_wait(barrier_sem, ep_size)
 
         def gather_bt(bt_id, _):
+            counts_copy = pltpu.async_copy(
+                src_ref=counts_ref.at[bt_id],
+                dst_ref=counts_smem,
+                sem=metadata_sems.at[0],
+            )
+            sizes_copy = pltpu.async_copy(
+                src_ref=sizes_ref.at[bt_id],
+                dst_ref=sizes_smem,
+                sem=metadata_sems.at[1],
+            )
+            counts_copy.wait()
+            sizes_copy.wait()
+
             with jax.named_scope("a2a_gather"):
 
                 def gather_expert(expert_slot, _):
                     expert_id = my_id * local_experts + expert_slot
                     start = jnp.int32(0)
                     for recv_id in range(ep_size):
-                        rows = counts_ref[bt_id, recv_id, expert_id]
+                        rows = counts_smem[recv_id, expert_id]
                         is_local = recv_id == my_id
 
                         with jax.named_scope("a2a_gather_local_copy"):
@@ -725,8 +768,8 @@ def build_gather_runner(
 
                 def wait_one_send(expert_slot, _):
                     expert_id = my_id * local_experts + expert_slot
-                    total_rows = sizes_ref[bt_id, expert_id]
-                    local_rows = counts_ref[bt_id, my_id, expert_id]
+                    total_rows = sizes_smem[expert_id]
+                    local_rows = counts_smem[my_id, expert_id]
                     remote_rows = total_rows - local_rows
 
                     @pl.when(remote_rows != 0)
@@ -748,7 +791,7 @@ def build_gather_runner(
             with jax.named_scope("a2a_gather_recv_wait"):
 
                 def wait_one_recv(expert_id, _):
-                    recv_rows = counts_ref[bt_id, my_id, expert_id]
+                    recv_rows = counts_smem[my_id, expert_id]
 
                     @pl.when(recv_rows != 0)
                     def wait_recv(
@@ -779,6 +822,9 @@ def build_gather_runner(
             in_specs=[hbm_spec, vmem_spec, vmem_spec],
             out_specs=hbm_spec,
             scratch_shapes=[
+                pltpu.SMEM((ep_size, plan.num_experts), jnp.int32),
+                pltpu.SMEM((plan.num_experts,), jnp.int32),
+                pltpu.SemaphoreType.DMA((2,)),
                 pltpu.SemaphoreType.DMA((local_experts,)),
                 pltpu.SemaphoreType.DMA,
                 pltpu.SemaphoreType.BARRIER,
