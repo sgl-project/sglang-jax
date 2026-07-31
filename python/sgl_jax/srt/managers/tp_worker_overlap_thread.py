@@ -16,7 +16,11 @@ from jax.sharding import NamedSharding, PartitionSpec
 
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 from sgl_jax.srt.managers.tp_worker import ModelWorker
-from sgl_jax.srt.managers.utils import resolve_future_token_ids, set_future_token_ids
+from sgl_jax.srt.managers.utils import (
+    future_slot_indices,
+    resolve_future_token_ids,
+    set_future_token_ids,
+)
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 from sgl_jax.srt.server_args import ServerArgs
@@ -45,10 +49,11 @@ class ModelWorkerClient:
         self.device = self.worker.device
         self.cur_sampling_info = None
 
-        # Init future mappings
-        self.future_token_ids_ct = 0
-        self.future_token_ids_limit = self.max_running_requests * 3
-        self.future_token_ids_map = jnp.zeros((self.max_running_requests * 5,), dtype=jnp.int32)
+        # Init future mappings. The map is indexed by req_pool_idx + 1 (one
+        # pending-token slot per request slot; index 0 reserved), not by a
+        # running cursor -- see set_future_token_ids.
+        self.future_map_size = self.worker.model_runner.req_to_token_pool.size + 2
+        self.future_token_ids_map = jnp.zeros((self.future_map_size,), dtype=jnp.int32)
         self.mesh = mesh
         sharding = NamedSharding(mesh, PartitionSpec(None))
         self.future_token_ids_map = jax.device_put(self.future_token_ids_map, sharding)
@@ -109,7 +114,7 @@ class ModelWorkerClient:
         while True:
             (
                 model_worker_batch,
-                future_token_ids_ct,
+                future_slot_indices_np,
                 sampling_metadata,
                 forward_metadata,
             ) = self.input_queue.get()
@@ -131,7 +136,7 @@ class ModelWorkerClient:
                             sampling_metadata=sampling_metadata,
                             forward_metadata=forward_metadata,
                             future_map=self.future_token_ids_map,
-                            future_ct=future_token_ids_ct,
+                            future_slots=future_slot_indices_np,
                         )
                     )
                 self.future_token_ids_map = new_future_map
@@ -158,7 +163,7 @@ class ModelWorkerClient:
             # set_future's cpp-fastpath cache hits; async_gather afterwards.
             self.future_token_ids_map = set_future_token_ids(
                 self.future_token_ids_map,
-                future_token_ids_ct,
+                future_slot_indices_np,
                 next_token_ids,
                 self.mesh,
             )
@@ -284,26 +289,24 @@ class ModelWorkerClient:
             model_worker_batch, self.worker.get_model_runner()
         )
 
+        # Per-request slots: placeholder value -(req_pool_idx + 1) round-trips
+        # through resolve_future_token_ids (map[-id]); padding rows get 0
+        # (a non-negative id, resolved as-is and never consumed).
+        seq_lens_np = np.asarray(model_worker_batch.seq_lens)
+        req_pool_np = np.asarray(model_worker_batch.req_pool_indices)
+        slots = future_slot_indices(seq_lens_np, req_pool_np, self.future_map_size)
+
         # Push a new batch to the queue (JAX handles synchronization automatically)
         self.input_queue.put(
             (
                 model_worker_batch,
-                self.future_token_ids_ct,
+                slots,
                 sampling_metadata,
                 forward_metadata,
             )
         )
 
-        # Allocate output future objects
-        bs = len(model_worker_batch.seq_lens)
-
-        future_next_token_ids = np.arange(
-            -(self.future_token_ids_ct + 1),
-            -(self.future_token_ids_ct + 1 + bs),
-            -1,
-            dtype=np.int32,
-        )
-        self.future_token_ids_ct = (self.future_token_ids_ct + bs) % self.future_token_ids_limit
+        future_next_token_ids = np.where(seq_lens_np > 0, -slots, 0).astype(np.int32)
         return None, future_next_token_ids, 0
 
     def run_precompile(self, only: str | None = None):

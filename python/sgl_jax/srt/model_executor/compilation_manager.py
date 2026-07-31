@@ -252,7 +252,14 @@ class CompilationManager:
                 )
                 if future_token_ids_map is not None:
                     _, next_token_ids, _ = result
-                    set_future_token_ids(future_token_ids_map, 0, next_token_ids, mesh)
+                    from sgl_jax.srt.managers.utils import future_slot_indices
+
+                    slots = future_slot_indices(
+                        np.asarray(batch.seq_lens),
+                        np.asarray(batch.req_pool_indices),
+                        future_token_ids_map.shape[0],
+                    )
+                    set_future_token_ids(future_token_ids_map, slots, next_token_ids, mesh)
                 self._compiled_variants.add((ForwardMode.DECODE, bs_val, bs_val, False))
 
         end_time = time.perf_counter()

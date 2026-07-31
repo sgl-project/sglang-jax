@@ -54,8 +54,31 @@ def resolve_future_token_ids(input_ids, future_token_ids_map, mesh):
     return jax.sharding.reshard(input_ids_global, NamedSharding(mesh, P("data")))
 
 
+def future_slot_indices(seq_lens_np, req_pool_indices_np, map_size):
+    """Per-request future-map slots: real rows -> req_pool_idx + 1 (slot 0 is
+    reserved so 0 stays a valid "no placeholder" input id), padding rows ->
+    map_size (out of bounds, dropped by the scatter)."""
+    import numpy as np
+
+    return np.where(
+        seq_lens_np > 0,
+        req_pool_indices_np.astype(np.int32) + 1,
+        np.int32(map_size),
+    ).astype(np.int32)
+
+
 @jax.jit(static_argnames=("mesh"))
-def set_future_token_ids(future_token_ids_map, future_token_ids_ct, next_token_ids, mesh):
+def set_future_token_ids(future_token_ids_map, slot_indices, next_token_ids, mesh):
+    """Write each request's pending next token at its req-pool slot.
+
+    Slot addressing replaces the previous ring-buffer cursor: the cursor
+    advanced by the PADDED batch size (padded seq_lens), so a burst of
+    prefill batches wrapped the 3x ring and overwrote outstanding
+    placeholders before their first decode resolved them (silent first-token
+    corruption that grows with concurrency). A per-request slot cannot be
+    overwritten by another request; padding rows scatter out of bounds and
+    are dropped.
+    """
     next_token_ids_global = jax.sharding.reshard(next_token_ids, NamedSharding(mesh, P()))
-    start_indices = (future_token_ids_ct + 1,)
-    return jax.lax.dynamic_update_slice(future_token_ids_map, next_token_ids_global, start_indices)
+    slot_indices_global = jax.sharding.reshard(slot_indices, NamedSharding(mesh, P()))
+    return future_token_ids_map.at[slot_indices_global].set(next_token_ids_global, mode="drop")

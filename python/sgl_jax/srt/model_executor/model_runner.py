@@ -375,7 +375,6 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             rng_step,
             sampling_metadata,
             future_token_ids_map,
-            future_token_ids_ct,
         ):
             # resolve_future_token_ids inlined: negative ids are future placeholders.
             ids = forward_batch.input_ids
@@ -407,11 +406,17 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 use_sort_for_toppk_minp=use_sort_for_toppk_minp,
                 rng_override=rng_key,
             )
-            # async_gather + set_future_token_ids inlined.
+            # async_gather + set_future_token_ids inlined. Per-request slot
+            # scatter (req_pool_idx + 1); padding rows (seq_lens == 0) go out
+            # of bounds and are dropped. See managers/utils.set_future_token_ids.
             next_ids = jax.lax.with_sharding_constraint(next_ids, NamedSharding(_fused_mesh, P()))
-            new_future_map = jax.lax.dynamic_update_slice(
-                future_token_ids_map, next_ids, (future_token_ids_ct + 1,)
+            slot_ids = jnp.where(
+                forward_batch.seq_lens > 0,
+                forward_batch.req_pool_indices.astype(jnp.int32) + 1,
+                jnp.int32(future_token_ids_map.shape[0]),
             )
+            slot_ids = jax.lax.with_sharding_constraint(slot_ids, NamedSharding(_fused_mesh, P()))
+            new_future_map = future_token_ids_map.at[slot_ids].set(next_ids, mode="drop")
             return (
                 next_ids,
                 output,
@@ -422,9 +427,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 new_future_map,
             )
 
-        def run_and_sample_wrapper(
-            forward_batch, logits_metadata, sampling_metadata, future_map, future_ct
-        ):
+        def run_and_sample_wrapper(forward_batch, logits_metadata, sampling_metadata, future_map):
             self._sampler_step += 1
             return jitted_run_and_sample(
                 model_def,
@@ -440,7 +443,6 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 self._sampler_step,
                 sampling_metadata,
                 future_map,
-                jnp.asarray(future_ct, dtype=jnp.int32),
             )
 
         self.jitted_run_and_sample = run_and_sample_wrapper
@@ -748,9 +750,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         # layers_topk_ids required real_bs and original_input_len which could not be stored in ForwardBatch
         return output, cache_miss_count, layers_topk_ids
 
-    def forward_and_sample(
-        self, forward_batch, logits_metadata, sampling_metadata, future_map, future_ct
-    ):
+    def forward_and_sample(self, forward_batch, logits_metadata, sampling_metadata, future_map):
         import jax._src.test_util as jtu
 
         self.forward_pass_id += 1
@@ -769,7 +769,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                     token_logprobs,
                     new_future_map,
                 ) = self.jitted_run_and_sample(
-                    forward_batch, logits_metadata, sampling_metadata, future_map, future_ct
+                    forward_batch, logits_metadata, sampling_metadata, future_map
                 )
                 cache_miss_count = count()
             if self.tp_size == 1 and isinstance(pool_updates, list):
