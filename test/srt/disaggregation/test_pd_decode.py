@@ -333,9 +333,13 @@ def test_manager_owns_persistent_pull_worker_pool():
     """The manager starts a pool of long-lived workers that drain the queue
     and run each receiver's blocking pull off the event loop."""
 
-    mgr = JaxTransferKVManager(wrapper=object(), zmq_notifier=object(), pull_worker_count=4)
+    mgr = JaxTransferKVManager(
+        wrapper=object(), zmq_notifier=object(), pull_worker_count=4
+    )
 
-    worker_threads = [t for t in threading.enumerate() if t.name.startswith("jax-kv-pull-worker")]
+    worker_threads = [
+        t for t in threading.enumerate() if t.name.startswith("jax-kv-pull-worker")
+    ]
     assert len(worker_threads) == 4
     assert all(t.daemon for t in worker_threads)
 
@@ -429,7 +433,13 @@ class _AdmScheduler:
     _admit_decode_prealloc = SchedulerDisaggregationDecodeMixin._admit_decode_prealloc
 
     def __init__(
-        self, capacity, reserved, page_size=1, n_running=0, raise_on_init=False, max_inflight=0
+        self,
+        capacity,
+        reserved,
+        page_size=1,
+        n_running=0,
+        raise_on_init=False,
+        max_inflight=0,
     ):
         self.token_to_kv_pool_allocator = _Allocator(capacity, page_size)
         self.dp_size = 1
@@ -462,7 +472,9 @@ def _adm_p_info():
 
 
 def _enqueue(sched, rid, seqlen):
-    entry = DecodeBookkeeping(req_id=rid, req=_AdmReq(rid, seqlen), p_info=_adm_p_info())
+    entry = DecodeBookkeeping(
+        req_id=rid, req=_AdmReq(rid, seqlen), p_info=_adm_p_info()
+    )
     sched.disagg_prealloc_queue.add(entry)
     return entry
 
@@ -618,6 +630,40 @@ def test_cancel_matching_retains_inflight_entry_until_terminal():
     assert cancelled == [entry]
     assert entry.cancelled is True
     assert len(queue) == 1
+
+
+def test_cancelled_terminal_transfer_releases_destination_rank_pages():
+    class _CancelledDrainScheduler:
+        process_decode_queue = SchedulerDisaggregationDecodeMixin.process_decode_queue
+
+        def __init__(self, entry):
+            self.entry = entry
+            self.released = []
+
+        def _admit_decode_prealloc(self):
+            return
+
+        def _drain_transfer_queue_synced(self):
+            return [self.entry]
+
+        def _release_decode_kv_indices(self, kv_indices, dp_rank):
+            self.released.append((kv_indices, dp_rank))
+
+    req = _AdmReq("cancelled", 4)
+    req.dp_rank = 3
+    entry = DecodeBookkeeping(
+        req_id=req.rid,
+        req=req,
+        receiver=object(),
+        kv_indices=[12, 13, 14, 15],
+        synced_state=KVPoll.SUCCESS,
+        cancelled=True,
+    )
+    sched = _CancelledDrainScheduler(entry)
+
+    sched.process_decode_queue()
+
+    assert sched.released == [([12, 13, 14, 15], 3)]
 
 
 def test_inflight_cap_is_partitioned_per_rank_without_cross_rank_head_of_line():
@@ -868,7 +914,11 @@ class TestReaperLifecycle:
         assert m._reaper_thread is None
 
     def test_reaper_thread_fails_stale_participant(self):
-        m = _Mgr(ack_timeout_seconds=0.05, pull_timeout_seconds=0.0, reaper_interval_seconds=0.01)
+        m = _Mgr(
+            ack_timeout_seconds=0.05,
+            pull_timeout_seconds=0.0,
+            reaper_interval_seconds=0.01,
+        )
         s = _FakeParticipant(started_at=time.monotonic() - 1.0)
         m.register_sender("r1", s)
         m.start_reaper()
@@ -885,7 +935,11 @@ class TestTerminalRecords:
     def test_record_and_get(self):
         m = _mgr()
         m.record_terminal(
-            "r1", role="prefill", transfer_id="t1", state=KVPoll.FAILED, reason="timeout"
+            "r1",
+            role="prefill",
+            transfer_id="t1",
+            state=KVPoll.FAILED,
+            reason="timeout",
         )
         rec = m.get_terminal_record("r1", role="prefill")
         assert rec is not None
@@ -898,6 +952,8 @@ class TestTerminalRecords:
 
     def test_register_clears_prior_terminal_record(self):
         m = _mgr()
-        m.record_terminal("r1", role="prefill", transfer_id="t1", state=KVPoll.FAILED, reason="x")
+        m.record_terminal(
+            "r1", role="prefill", transfer_id="t1", state=KVPoll.FAILED, reason="x"
+        )
         m.register_sender("r1", _FakeParticipant(1.0))
         assert m.get_terminal_record("r1", role="prefill") is None

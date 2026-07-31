@@ -180,7 +180,9 @@ class TestPrefillInfoFields:
         assert d["kv_dtype"] == "bfloat16"
 
     def test_defaults_are_backward_compatible(self):
-        info = PrefillInfo(bootstrap_key="h:1", host="h", transfer_port=1, side_channel_port=2)
+        info = PrefillInfo(
+            bootstrap_key="h:1", host="h", transfer_port=1, side_channel_port=2
+        )
         assert info.page_size == 0
         assert info.kv_dtype == ""
 
@@ -417,7 +419,9 @@ def _make_pool(pool_size=2):
 def _layers(padded_pages, seed=0):
     rng = np.random.default_rng(seed)
     return [
-        jnp.asarray(rng.standard_normal((padded_pages, *_PER_LAYER_SHAPE)).astype(np.float32))
+        jnp.asarray(
+            rng.standard_normal((padded_pages, *_PER_LAYER_SHAPE)).astype(np.float32)
+        )
         for _ in range(_LAYER_NUM)
     ]
 
@@ -530,7 +534,13 @@ def _make_mesh():
 def _make_kv_buffers(mesh, num_layers=_NUM_LAYERS, rng_seed=42):
     """Create per-layer KV buffers mimicking memory_pool.py layout."""
     rng = np.random.default_rng(rng_seed)
-    shape = (_NUM_PAGES_POOL, _PAGE_SIZE, _HEAD_NUM_KV * 2 // _PACKING, _PACKING, _HEAD_DIM)
+    shape = (
+        _NUM_PAGES_POOL,
+        _PAGE_SIZE,
+        _HEAD_NUM_KV * 2 // _PACKING,
+        _PACKING,
+        _HEAD_DIM,
+    )
     sharding = NamedSharding(mesh, P("data", None, "tensor", None, None))
     buffers = []
     for _ in range(num_layers):
@@ -579,14 +589,22 @@ class TestPerLayerGather:
             idx_sharding,
         )
         results = _jit_gather_all_layers(buffers, page_indices, gather_sharding)
-        expected_shape = (num_pages, _PAGE_SIZE, _HEAD_NUM_KV * 2 // _PACKING, _PACKING, _HEAD_DIM)
+        expected_shape = (
+            num_pages,
+            _PAGE_SIZE,
+            _HEAD_NUM_KV * 2 // _PACKING,
+            _PACKING,
+            _HEAD_DIM,
+        )
         for result in results:
             assert result.shape == expected_shape
 
     def test_gather_single_layer(self, setup):
         """_jit_gather_one_layer works correctly standalone."""
         buffers, gather_sharding, idx_sharding, _ = setup
-        page_indices = jax.device_put(jnp.array([0, 3, 7], dtype=jnp.int32), idx_sharding)
+        page_indices = jax.device_put(
+            jnp.array([0, 3, 7], dtype=jnp.int32), idx_sharding
+        )
         result = _jit_gather_one_layer(buffers[0], page_indices, gather_sharding)
         expected = np.asarray(buffers[0])[[0, 3, 7]]
         np.testing.assert_array_equal(np.asarray(result), expected)
@@ -594,7 +612,9 @@ class TestPerLayerGather:
     def test_gather_stack_matches_monolithic(self, setup):
         """jnp.stack(per_layer_results) matches what a monolithic gather would produce."""
         buffers, gather_sharding, idx_sharding, _ = setup
-        page_indices = jax.device_put(jnp.array([1, 5, 10, 20], dtype=jnp.int32), idx_sharding)
+        page_indices = jax.device_put(
+            jnp.array([1, 5, 10, 20], dtype=jnp.int32), idx_sharding
+        )
         per_layer = _jit_gather_all_layers(buffers, page_indices, gather_sharding)
         stacked = jnp.stack(per_layer, axis=0)
         assert stacked.shape[0] == _NUM_LAYERS
@@ -610,7 +630,9 @@ class TestPerLayerGather:
     def test_gather_duplicate_indices(self, setup):
         """Gathering same page multiple times works correctly."""
         buffers, gather_sharding, idx_sharding, _ = setup
-        page_indices = jax.device_put(jnp.array([0, 0, 0, 0], dtype=jnp.int32), idx_sharding)
+        page_indices = jax.device_put(
+            jnp.array([0, 0, 0, 0], dtype=jnp.int32), idx_sharding
+        )
         results = _jit_gather_all_layers(buffers, page_indices, gather_sharding)
         for i, result in enumerate(results):
             page0 = np.asarray(buffers[i])[0]
@@ -675,8 +697,12 @@ class TestGatherCompileCaching:
         _ = _jit_gather_one_layer(buffers[0], page_indices, gather_sharding)
 
         # Subsequent calls should use cached compilation
-        lowered_0 = _jit_gather_one_layer.lower(buffers[0], page_indices, gather_sharding)
-        lowered_1 = _jit_gather_one_layer.lower(buffers[1], page_indices, gather_sharding)
+        lowered_0 = _jit_gather_one_layer.lower(
+            buffers[0], page_indices, gather_sharding
+        )
+        lowered_1 = _jit_gather_one_layer.lower(
+            buffers[1], page_indices, gather_sharding
+        )
         # Same HLO text means same compiled kernel will be reused
         assert lowered_0.as_text() == lowered_1.as_text()
 
@@ -704,7 +730,10 @@ class _FakePool:
 
     def copy_from_device(self, layers, buffer_id):
         self.copy_calls.append((layers, buffer_id))
-        if self._raise_on_call is not None and len(self.copy_calls) == self._raise_on_call:
+        if (
+            self._raise_on_call is not None
+            and len(self.copy_calls) == self._raise_on_call
+        ):
             raise RuntimeError("simulated D2H failure")
         return StagedData(buffer_id=buffer_id, array_pytree=layers)
 
@@ -719,7 +748,9 @@ def test_path_a_uses_reserved_buffer_and_no_op_on_done():
     mgr._wrapper = w
     mgr._host_pool = pool
     layers = [jnp.ones((2, 3)), jnp.ones((2, 3))]
-    status = mgr.producer_handoff("uuid-1", {"kv": layers}, use_d2h_staging=True, buffer_id=5)
+    status = mgr.producer_handoff(
+        "uuid-1", {"kv": layers}, use_d2h_staging=True, buffer_id=5
+    )
     # copy_from_device called once with the reserved buffer id
     assert pool.copy_calls == [(layers, 5)]
     # registered under the sub-uuid as the pytree

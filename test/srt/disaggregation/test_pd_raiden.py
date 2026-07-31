@@ -217,7 +217,7 @@ def test_raiden_abort_waits_for_engine_terminal_before_cleanup():
     raiden.stats = (["wire-abort"], [], [])
     assert sender.poll() == KVPoll.FAILED
     assert "req-abort" not in manager._senders
-    assert bootstrap.popped == [(48, {"jax_process_index": 0})]
+    assert bootstrap.popped == [(48, {"jax_process_index": 0, "source_dp_rank": 0})]
 
 
 def test_raiden_receiver_abort_waits_for_engine_terminal():
@@ -245,7 +245,7 @@ def test_raiden_receiver_abort_waits_for_engine_terminal():
     raiden.stats = ([], ["wire-abort"], [])
     assert receiver.poll() == KVPoll.FAILED
     assert "req-abort" not in manager._receivers
-    assert bootstrap.popped == [(49, {"jax_process_index": 0})]
+    assert bootstrap.popped == [(49, {"jax_process_index": 0, "source_dp_rank": 0})]
 
 
 def test_raiden_reaper_marks_timeout_without_pruning_sender():
@@ -376,7 +376,7 @@ def test_raiden_manager_routes_all_dp4_source_destination_pairs(
     assert bootstrap.transfer_info is not None
     assert admission.receiver.poll() == KVPoll.TRANSFERRING
     args, kwargs = raiden.started[-1]
-    assert args[2] == f"10.0.0.9:{7777 + source_dp_rank * 10}"
+    assert args[2] == f"10.0.0.1:{7777 + source_dp_rank * 10}"
     assert args[3:] == ([1], [1])
     assert kwargs == {"local_dp_rank": local_dp_rank}
 
@@ -397,6 +397,8 @@ def test_raiden_manager_rejects_peer_without_endpoint_descriptors():
                 req_id="req-legacy",
                 transfer_id="wire-legacy",
                 bootstrap_room=47,
+                local_dp_rank=0,
+                source_dp_rank=0,
                 peer_info={
                     "host": "10.0.0.1",
                     "local_control_port": 7777,
@@ -446,7 +448,7 @@ def test_raiden_preserves_published_shard_endpoints():
 
     assert admission.receiver is not None
     admission.receiver.poll()
-    assert raiden.started[0][2] == [
+    assert raiden.started[0][0][2] == [
         {"endpoint": "10.0.0.1:7001", "shards": [0, 2]},
         {"endpoint": "10.0.0.1:7013", "shards": [1, 3]},
     ]

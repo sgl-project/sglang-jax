@@ -283,10 +283,12 @@ class SchedulerDisaggregationPrefillMixin:
                         buffer_id=req.disagg_host_buffer_id,
                         payload_factory=lambda req_obj=req: {"kv": self._extract_req_kv(req_obj)},
                         block_ids_factory=lambda req_obj=req: self._extract_req_block_ids(req_obj),
-                        on_payload=lambda payload, req_obj=req: self._maybe_log_prefill_extract_debug(
-                            req_obj,
-                            payload["kv"],
-                            use_d2h_staging=self.disagg_use_d2h_staging,
+                        on_payload=lambda payload, req_obj=req: (
+                            self._maybe_log_prefill_extract_debug(
+                                req_obj,
+                                payload["kv"],
+                                use_d2h_staging=self.disagg_use_d2h_staging,
+                            )
                         ),
                         on_ready=lambda req_obj=req: self._pd_mark_time(req_obj, "transfer_start"),
                     )

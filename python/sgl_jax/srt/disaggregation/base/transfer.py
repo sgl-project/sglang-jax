@@ -22,8 +22,7 @@ def slots_to_page_ids(slots: Any, page_size: int, token_count: int) -> tuple[int
     values = np.asarray(slots).reshape(-1)
     if values.size < token_count:
         raise ValueError(
-            f"KV slot count is smaller than token count: slots={values.size}, "
-            f"tokens={token_count}"
+            f"KV slot count is smaller than token count: slots={values.size}, tokens={token_count}"
         )
     values = values[:token_count].astype(np.int64, copy=False)
     pages: list[int] = []

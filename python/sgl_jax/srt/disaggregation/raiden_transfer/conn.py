@@ -293,9 +293,7 @@ class RaidenTransferKVManager(CommonKVManager):
                 peer_host=peer_host,
             )
             try:
-                local_endpoints = list(
-                    self.wrapper.endpoints_by_dp_rank[context.local_dp_rank]
-                )
+                local_endpoints = list(self.wrapper.endpoints_by_dp_rank[context.local_dp_rank])
             except KeyError as exc:
                 raise ValueError(
                     f"Raiden has no local manager for dp_rank={context.local_dp_rank}"

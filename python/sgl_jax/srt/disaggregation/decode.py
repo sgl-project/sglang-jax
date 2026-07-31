@@ -389,7 +389,7 @@ class SchedulerDisaggregationDecodeMixin:
                     state = KVPoll.FAILED
             if entry.cancelled:
                 if entry.kv_indices is not None:
-                    self._release_decode_kv_indices(entry.kv_indices)
+                    self._release_decode_kv_indices(entry.kv_indices, entry.req.dp_rank)
                 continue
             if state == KVPoll.SUCCESS:
                 try:
