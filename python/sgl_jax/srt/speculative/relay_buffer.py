@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import NamedTuple
 
 import jax
@@ -22,6 +23,31 @@ class SpecRelayBuffers(NamedTuple):
 class DFlashRelayBuffers(NamedTuple):
     verified_id: jax.Array
     new_seq_lens: jax.Array
+
+
+@dataclass(frozen=True)
+class RelayBatchPlan:
+    """Host-side request indices used to read and publish one relay round."""
+
+    future_indices: np.ndarray
+    padded_indices: np.ndarray
+    valid_mask: np.ndarray
+
+
+def build_relay_batch_plan(model_worker_batch) -> RelayBatchPlan:
+    """Build compact state references and DP-padded safe scatter indices."""
+    req_pool_indices = np.asarray(model_worker_batch.req_pool_indices, dtype=np.int32)
+    selector = np.asarray(model_worker_batch.logits_indices_selector, dtype=np.int32)
+    valid_mask = make_dp_valid_mask(
+        model_worker_batch.real_bs_per_dp,
+        total_bs=req_pool_indices.shape[0],
+        per_dp_bs=model_worker_batch.per_dp_bs_size,
+    )
+    return RelayBatchPlan(
+        future_indices=req_pool_indices[selector],
+        padded_indices=np.where(valid_mask, req_pool_indices, 0),
+        valid_mask=valid_mask,
+    )
 
 
 def create_spec_relay_buffers(
@@ -74,157 +100,65 @@ def create_dflash_relay_buffers(
     )
 
 
-def update_spec_relay_buffers(
-    buffers: SpecRelayBuffers,
+def scatter_relay_buffers(
+    buffers,
     future_indices,
     valid_mask,
-    topk_index,
-    hidden_states,
-    verified_id,
-    new_seq_lens,
+    payload,
     *,
     dp_size: int,
-) -> SpecRelayBuffers:
-    """Write DP-padded draft state into relay buffers without touching padded rows."""
+):
+    """Scatter a relay payload without writing DP padding rows."""
     per_dp_bs = future_indices.shape[0] // dp_size
     indices = future_indices.reshape((dp_size, per_dp_bs))
     valid = valid_mask.reshape((dp_size, per_dp_bs))
     dp_indices = jnp.arange(dp_size, dtype=jnp.int32)[:, None]
+    first_buffer = jax.tree_util.tree_leaves(buffers)[0]
     scatter_indices = jnp.where(
         valid,
         indices,
-        jnp.full_like(indices, buffers.topk_index.shape[1]),
+        jnp.full_like(indices, first_buffer.shape[1]),
     )
 
-    topk_index = topk_index.reshape((dp_size, per_dp_bs) + topk_index.shape[1:])
-    hidden_states = hidden_states.reshape((dp_size, per_dp_bs) + hidden_states.shape[1:])
-    verified_id = verified_id.reshape((dp_size, per_dp_bs))
-    new_seq_lens = new_seq_lens.reshape((dp_size, per_dp_bs))
+    def _scatter_leaf(buffer, value):
+        value = value.reshape((dp_size, per_dp_bs) + value.shape[1:])
+        sharding = jax.typeof(buffer).sharding
+        if isinstance(sharding, NamedSharding) and not sharding.mesh.empty:
+            return buffer.at[dp_indices, scatter_indices].set(
+                value,
+                mode="drop",
+                out_sharding=sharding.spec,
+            )
+        return buffer.at[dp_indices, scatter_indices].set(value, mode="drop")
 
-    return SpecRelayBuffers(
-        topk_index=buffers.topk_index.at[dp_indices, scatter_indices].set(
-            topk_index,
-            mode="drop",
-            out_sharding=RELAY_STATE_SPEC,
-        ),
-        hidden_states=buffers.hidden_states.at[dp_indices, scatter_indices].set(
-            hidden_states,
-            mode="drop",
-            out_sharding=RELAY_STATE_SPEC,
-        ),
-        verified_id=buffers.verified_id.at[dp_indices, scatter_indices].set(
-            verified_id,
-            mode="drop",
-            out_sharding=RELAY_ID_SPEC,
-        ),
-        new_seq_lens=buffers.new_seq_lens.at[dp_indices, scatter_indices].set(
-            new_seq_lens,
-            mode="drop",
-            out_sharding=RELAY_ID_SPEC,
-        ),
-    )
+    return jax.tree.map(_scatter_leaf, buffers, payload)
 
 
-def update_dflash_relay_buffers(
-    buffers: DFlashRelayBuffers,
-    future_indices,
-    valid_mask,
-    verified_id,
-    new_seq_lens,
-    *,
-    dp_size: int,
-) -> DFlashRelayBuffers:
-    """Publish one DP-padded DFlash round without writing padded slots."""
-    per_dp_bs = future_indices.shape[0] // dp_size
-    indices = future_indices.reshape((dp_size, per_dp_bs))
-    valid = valid_mask.reshape((dp_size, per_dp_bs))
-    dp_indices = jnp.arange(dp_size, dtype=jnp.int32)[:, None]
-    scatter_indices = jnp.where(
-        valid,
-        indices,
-        jnp.full_like(indices, buffers.verified_id.shape[1]),
-    )
-    verified_id = verified_id.reshape((dp_size, per_dp_bs))
-    new_seq_lens = new_seq_lens.reshape((dp_size, per_dp_bs))
-    return DFlashRelayBuffers(
-        verified_id=buffers.verified_id.at[dp_indices, scatter_indices].set(
-            verified_id,
-            mode="drop",
-            out_sharding=RELAY_ID_SPEC,
-        ),
-        new_seq_lens=buffers.new_seq_lens.at[dp_indices, scatter_indices].set(
-            new_seq_lens,
-            mode="drop",
-            out_sharding=RELAY_ID_SPEC,
-        ),
-    )
-
-
-def gather_spec_relay_buffers(
-    buffers: SpecRelayBuffers,
-    future_indices,
-    *,
-    dp_size: int,
-):
-    """Gather DP-padded draft state for the next batch."""
+def gather_relay_buffers(buffers, future_indices, *, dp_size: int):
+    """Gather a relay payload and restore flat ``P("data", ...)`` sharding."""
     per_dp_bs = future_indices.shape[0] // dp_size
     indices = future_indices.reshape((dp_size, per_dp_bs))
     dp_indices = jnp.arange(dp_size, dtype=jnp.int32)[:, None]
-    topk_index = (
-        buffers.topk_index.at[dp_indices, indices]
-        .get(out_sharding=RELAY_STATE_SPEC)
-        .reshape(future_indices.shape + buffers.topk_index.shape[2:])
-    )
-    hidden_states = (
-        buffers.hidden_states.at[dp_indices, indices]
-        .get(out_sharding=RELAY_STATE_SPEC)
-        .reshape(future_indices.shape + buffers.hidden_states.shape[2:])
-    )
-    verified_id = (
-        buffers.verified_id.at[dp_indices, indices]
-        .get(out_sharding=RELAY_ID_SPEC)
-        .reshape(future_indices.shape)
-    )
-    new_seq_lens = (
-        buffers.new_seq_lens.at[dp_indices, indices]
-        .get(out_sharding=RELAY_ID_SPEC)
-        .reshape(future_indices.shape)
-    )
     flat_sharding = jax.typeof(future_indices).sharding
-    if isinstance(flat_sharding, NamedSharding) and not flat_sharding.mesh.empty:
-        state_sharding = NamedSharding(flat_sharding.mesh, P("data", None))
-        topk_index = jax.sharding.reshard(topk_index, state_sharding)
-        hidden_states = jax.sharding.reshard(hidden_states, state_sharding)
-        verified_id = jax.sharding.reshard(verified_id, flat_sharding)
-        new_seq_lens = jax.sharding.reshard(new_seq_lens, flat_sharding)
-    return topk_index, hidden_states, verified_id, new_seq_lens
 
+    def _gather_leaf(buffer):
+        buffer_sharding = jax.typeof(buffer).sharding
+        if isinstance(buffer_sharding, NamedSharding) and not buffer_sharding.mesh.empty:
+            gathered = buffer.at[dp_indices, indices].get(
+                out_sharding=buffer_sharding.spec
+            )
+        else:
+            gathered = buffer.at[dp_indices, indices].get()
+        gathered = gathered.reshape(future_indices.shape + buffer.shape[2:])
+        if isinstance(flat_sharding, NamedSharding) and not flat_sharding.mesh.empty:
+            flat_spec = P("data", *(None for _ in range(gathered.ndim - 1)))
+            gathered = jax.sharding.reshard(
+                gathered,
+                NamedSharding(flat_sharding.mesh, flat_spec),
+            )
+        return gathered
 
-def gather_dflash_relay_buffers(
-    buffers: DFlashRelayBuffers,
-    future_indices,
-    *,
-    dp_size: int,
-):
-    """Gather the DFlash seed token and logical length for the next round."""
-    per_dp_bs = future_indices.shape[0] // dp_size
-    indices = future_indices.reshape((dp_size, per_dp_bs))
-    dp_indices = jnp.arange(dp_size, dtype=jnp.int32)[:, None]
-    verified_id = (
-        buffers.verified_id.at[dp_indices, indices]
-        .get(out_sharding=RELAY_ID_SPEC)
-        .reshape(future_indices.shape)
-    )
-    new_seq_lens = (
-        buffers.new_seq_lens.at[dp_indices, indices]
-        .get(out_sharding=RELAY_ID_SPEC)
-        .reshape(future_indices.shape)
-    )
-    flat_sharding = jax.typeof(future_indices).sharding
-    if isinstance(flat_sharding, NamedSharding) and not flat_sharding.mesh.empty:
-        verified_id = jax.sharding.reshard(verified_id, flat_sharding)
-        new_seq_lens = jax.sharding.reshard(new_seq_lens, flat_sharding)
-    return verified_id, new_seq_lens
+    return jax.tree.map(_gather_leaf, buffers)
 
 
 def make_dp_valid_mask(real_bs_per_dp, *, total_bs: int, per_dp_bs: int) -> np.ndarray:

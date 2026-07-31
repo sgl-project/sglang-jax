@@ -33,11 +33,13 @@ from sgl_jax.srt.speculative.dflash_util import (
     parse_dflash_draft_config,
     resolve_mask_token_id,
 )
+from sgl_jax.srt.speculative.overlap_utils import prefetch_published_new_seq_lens
 from sgl_jax.srt.speculative.relay_buffer import (
+    DFlashRelayBuffers,
+    build_relay_batch_plan,
     create_dflash_relay_buffers,
-    gather_dflash_relay_buffers,
-    make_dp_valid_mask,
-    update_dflash_relay_buffers,
+    gather_relay_buffers,
+    scatter_relay_buffers,
 )
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 from sgl_jax.srt.speculative.spec_utils import greedy_chain_verify
@@ -264,7 +266,6 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             draft_seq_lens=None,
             block_size=self.block_size,
         )
-        next_draft_input.new_seq_lens = new_seq_lens
         next_draft_input._target_verify_plan = plan
 
         # Start the small round-state copies as soon as target futures exist.
@@ -286,6 +287,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             logits_output=logits_output,
             next_token_ids=next_token_ids_flat,
             next_draft_input=next_draft_input,
+            published_new_seq_lens=new_seq_lens,
             accept_lens=accept_lens_out,
             bid=model_worker_batch.bid,
             cache_miss_count=cache_miss_count,
@@ -337,7 +339,6 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         next_draft_input.verified_id = verified_id
         next_draft_input.ctx_lens = np.zeros_like(accept_lens)
         next_draft_input.draft_seq_lens = plan.target_prefix_lens + accept_lens
-        next_draft_input.new_seq_lens = plan.seq_lens + accept_lens
         next_draft_input.target_hidden = None
         batch_output.accept_lens = accept_lens
         self._unpad_draft_state(
@@ -393,20 +394,10 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         )
         self._append_target_hidden_to_draft_kv(model_worker_batch, materialize_input)
 
-        total_bs = int(model_worker_batch.req_pool_indices.shape[0])
-        valid_mask = make_dp_valid_mask(
-            model_worker_batch.real_bs_per_dp,
-            total_bs=total_bs,
-            per_dp_bs=model_worker_batch.per_dp_bs_size,
-        )
-        safe_indices = np.where(
-            valid_mask,
-            np.asarray(model_worker_batch.req_pool_indices, dtype=np.int32),
-            0,
-        )
+        relay_plan = build_relay_batch_plan(model_worker_batch)
         data_sharding = NamedSharding(self.mesh, P("data"))
-        relay_indices = jax.device_put(safe_indices, data_sharding)
-        relay_valid_mask = jax.device_put(valid_mask, data_sharding)
+        relay_indices = jax.device_put(relay_plan.padded_indices, data_sharding)
+        relay_valid_mask = jax.device_put(relay_plan.valid_mask, data_sharding)
         relay_new_seq_lens = jax.device_put(
             np.asarray(seq_lens, dtype=np.int32) + 1,
             data_sharding,
@@ -421,9 +412,8 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
 
         output_token_ids = _prepare_spec_prefill_output_token_ids(self, next_token_ids)
         output_token_ids.copy_to_host_async()
-        future_indices = np.asarray(model_worker_batch.req_pool_indices, dtype=np.int32)[sel]
         next_draft_input = DFlashDraftInput(
-            future_indices=future_indices,
+            future_indices=relay_plan.future_indices,
             block_size=self.block_size,
         )
         model_worker_batch.spec_info_padded = next_draft_input
@@ -453,11 +443,11 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
 
         self.draft(model_worker_batch)
         batch_output = self.verify(model_worker_batch, update_relay=True)
-        published_new_seq_lens = batch_output.next_draft_input.new_seq_lens
+        published_new_seq_lens = prefetch_published_new_seq_lens(batch_output)
 
-        sel = np.asarray(model_worker_batch.logits_indices_selector, dtype=np.int32)
+        relay_plan = build_relay_batch_plan(model_worker_batch)
         next_draft_input = DFlashDraftInput(
-            future_indices=np.asarray(model_worker_batch.req_pool_indices, dtype=np.int32)[sel],
+            future_indices=relay_plan.future_indices,
             block_size=self.block_size,
         )
         batch_output.next_draft_input = next_draft_input
@@ -730,7 +720,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
         ):
             target_prefix_lens = forward_batch.seq_lens
             if use_relay_state:
-                verified_id, relay_new_seq_lens = gather_dflash_relay_buffers(
+                verified_id, relay_new_seq_lens = gather_relay_buffers(
                     relay_buffers,
                     relay_future_indices,
                     dp_size=dp_size,
@@ -945,12 +935,14 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
             new_seq_lens = jax.sharding.reshard(new_seq_lens, token_sharding)
             updated_relay_buffers = relay_buffers
             if update_relay:
-                updated_relay_buffers = update_dflash_relay_buffers(
+                updated_relay_buffers = scatter_relay_buffers(
                     relay_buffers,
                     relay_future_indices,
                     relay_valid_mask,
-                    new_verified_id,
-                    new_seq_lens,
+                    DFlashRelayBuffers(
+                        verified_id=new_verified_id,
+                        new_seq_lens=new_seq_lens,
+                    ),
                     dp_size=dp_size,
                 )
             return (
@@ -1232,12 +1224,14 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 mask = jax.sharding.reshard(mask, data_sharding)
                 token_ids = jax.sharding.reshard(token_ids, data_sharding)
                 seq_lens = jax.sharding.reshard(seq_lens, data_sharding)
-                return update_dflash_relay_buffers(
+                return scatter_relay_buffers(
                     buffers,
                     indices,
                     mask,
-                    token_ids,
-                    seq_lens,
+                    DFlashRelayBuffers(
+                        verified_id=token_ids,
+                        new_seq_lens=seq_lens,
+                    ),
                     dp_size=dp_size,
                 )
 

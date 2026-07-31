@@ -178,15 +178,13 @@ def test_build_page_indices_handles_uneven_dp_ranks():
     )
 
 
-def test_unpad_draft_state_removes_dp_padding_but_keeps_new_seq_lens():
+def test_unpad_draft_state_removes_dp_padding():
     di = DFlashDraftInput(
         verified_id=np.array([10, 20, 0, 30, 0, 0], dtype=np.int32),
         target_hidden=None,
         ctx_lens=np.array([1, 2, 0, 3, 0, 0], dtype=np.int32),
         draft_seq_lens=np.array([5, 6, 0, 7, 0, 0], dtype=np.int32),
     )
-    di.new_seq_lens = np.array([6, 8, 0, 10, 0, 0], dtype=np.int32)
-
     DFlashWorker._unpad_draft_state(
         di,
         np.array([0, 1, 3], dtype=np.int32),
@@ -195,7 +193,6 @@ def test_unpad_draft_state_removes_dp_padding_but_keeps_new_seq_lens():
     np.testing.assert_array_equal(di.verified_id, np.array([10, 20, 30], dtype=np.int32))
     np.testing.assert_array_equal(di.ctx_lens, np.array([1, 2, 3], dtype=np.int32))
     np.testing.assert_array_equal(di.draft_seq_lens, np.array([5, 6, 7], dtype=np.int32))
-    np.testing.assert_array_equal(di.new_seq_lens, np.array([6, 8, 0, 10, 0, 0]))
 
 
 def test_verify_write_cache_loc_selects_valid_half_per_dp_rank():

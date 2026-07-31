@@ -14,8 +14,9 @@ def resolve_spec_prefill_token_ids(result):
     return np.asarray(token_ids_arr).tolist()
 
 
-def publish_spec_decode_new_seq_lens(batch_output):
-    new_seq_lens = batch_output.next_draft_input.new_seq_lens
+def prefetch_published_new_seq_lens(result):
+    """Start the scheduler-visible length copy without reading draft state."""
+    new_seq_lens = result.published_new_seq_lens
     if new_seq_lens is not None and hasattr(new_seq_lens, "copy_to_host_async"):
         new_seq_lens.copy_to_host_async()
     return new_seq_lens

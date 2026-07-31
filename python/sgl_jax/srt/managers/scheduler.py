@@ -95,7 +95,7 @@ from sgl_jax.srt.speculative.overlap_utils import (
     can_merge_spec_non_overlap_prefill,
     can_use_spec_decode_overlap,
     can_use_spec_prefill_overlap,
-    publish_spec_decode_new_seq_lens,
+    prefetch_published_new_seq_lens,
     uses_host_eagle_state,
 )
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -144,6 +144,7 @@ class GenerationBatchResult:
     next_draft_input: EagleDraftInput | DFlashDraftInput | None = None
     spec_relay_buffers: object | None = None
     prefill_relay_future_indices: object | None = None
+    published_new_seq_lens: object | None = None
 
     num_accepted_tokens: int | None = None
     accept_lens: np.ndarray | None = None
@@ -2649,7 +2650,7 @@ class Scheduler(
                 published_new_seq_lens = None
             else:
                 published_new_seq_lens = (
-                    publish_spec_decode_new_seq_lens(batch_output)
+                    prefetch_published_new_seq_lens(batch_output)
                     if batch.forward_mode.is_decode()
                     else None
                 )

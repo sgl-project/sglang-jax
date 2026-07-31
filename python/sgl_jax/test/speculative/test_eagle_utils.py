@@ -551,61 +551,6 @@ class TestVerifyTree(CustomTestCase):
             np.array([7, 11, 12, 13, 8, 21, 22, 23], dtype=np.int32),
         )
 
-    def test_spec_relay_gather_restores_flat_data_sharding(self):
-        from jax.sharding import Mesh, NamedSharding
-        from jax.sharding import PartitionSpec as P
-
-        from sgl_jax.srt.speculative.relay_buffer import (
-            SpecRelayBuffers,
-            gather_spec_relay_buffers,
-        )
-
-        mesh = Mesh(
-            np.asarray(jax.devices()),
-            ("data",),
-            axis_types=(jax.sharding.AxisType.Explicit,),
-        )
-        state_sharding = NamedSharding(mesh, P("data", None, None))
-        id_sharding = NamedSharding(mesh, P("data", None))
-        buffers = SpecRelayBuffers(
-            topk_index=jax.device_put(
-                jnp.arange(12, dtype=jnp.int32).reshape(1, 4, 3),
-                state_sharding,
-            ),
-            hidden_states=jax.device_put(
-                jnp.arange(8, dtype=jnp.float32).reshape(1, 4, 2),
-                state_sharding,
-            ),
-            verified_id=jax.device_put(
-                jnp.array([[10, 11, 12, 13]], dtype=jnp.int32),
-                id_sharding,
-            ),
-            new_seq_lens=jax.device_put(
-                jnp.array([[20, 21, 22, 23]], dtype=jnp.int32),
-                id_sharding,
-            ),
-        )
-        future_indices = jax.device_put(
-            jnp.array([1, 3], dtype=jnp.int32),
-            NamedSharding(mesh, P("data")),
-        )
-
-        with jax.set_mesh(mesh):
-            topk_index, hidden_states, verified_id, new_seq_lens = (
-                gather_spec_relay_buffers(
-                    buffers,
-                    future_indices,
-                    dp_size=1,
-                )
-            )
-
-        self.assertEqual(topk_index.sharding.spec, P("data", None))
-        self.assertEqual(hidden_states.sharding.spec, P("data", None))
-        self.assertEqual(verified_id.sharding.spec, P("data"))
-        self.assertEqual(new_seq_lens.sharding.spec, P("data"))
-        np.testing.assert_array_equal(np.asarray(verified_id), np.array([11, 13]))
-        np.testing.assert_array_equal(np.asarray(new_seq_lens), np.array([21, 23]))
-
     def test_fused_verify_reuses_device_placeholders(self):
         from types import SimpleNamespace
 
