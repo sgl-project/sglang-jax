@@ -393,6 +393,7 @@ def build_scatter_runner(
         else (local_experts, plan.a2a_max_tokens, packing, h_per_pack)
     )
     hbm_spec = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
+    vmem_spec = pl.BlockSpec(memory_space=pltpu.MemorySpace.VMEM)
     tag = f"fused_moe_v2_a2a_scatter_t{plan.tokens}_{jnp.dtype(dtype).name}"
 
     def pallas_kernel(
@@ -540,7 +541,11 @@ def build_scatter_runner(
         out_shape=jax.ShapeDtypeStruct(local_out_shape, dtype),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=0,
-            in_specs=[hbm_spec, hbm_spec, hbm_spec, hbm_spec],
+            # The production kernel stages routing metadata from HBM through
+            # VMEM into SMEM before dynamically indexing it.  Keeping the
+            # payload in HBM and metadata in VMEM preserves the communication
+            # operation while satisfying Mosaic's reference-load rules.
+            in_specs=[hbm_spec, vmem_spec, vmem_spec, vmem_spec],
             out_specs=hbm_spec,
             scratch_shapes=[
                 pltpu.SMEM((plan.num_experts,), jnp.int32),
@@ -608,6 +613,7 @@ def build_gather_runner(
         else (plan.num_experts, bt, packing, h_per_pack)
     )
     hbm_spec = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
+    vmem_spec = pl.BlockSpec(memory_space=pltpu.MemorySpace.VMEM)
     tag = f"fused_moe_v2_a2a_gather_t{plan.tokens}_bfloat16"
 
     def pallas_kernel(
@@ -770,7 +776,7 @@ def build_gather_runner(
         out_shape=jax.ShapeDtypeStruct(local_out_shape, dtype),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=0,
-            in_specs=[hbm_spec, hbm_spec, hbm_spec],
+            in_specs=[hbm_spec, vmem_spec, vmem_spec],
             out_specs=hbm_spec,
             scratch_shapes=[
                 pltpu.SemaphoreType.DMA((local_experts,)),
