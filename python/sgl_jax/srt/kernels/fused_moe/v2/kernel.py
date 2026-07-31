@@ -327,8 +327,8 @@ def _fused_ep_moe_kernel(
     gather_send_x2_sems,  # DMA(expert_buffer_count,)
     a2a_gather_sem,  # DMA (num_experts,) — per-expert gather recv
     a2a_acc_sems,  # DMA(1,)
-    md_send_sem,  # DMA scalar
-    md_recv_sem,  # DMA scalar
+    md_send_sems,  # (2,) — one DMA semaphore per metadata mailbox bank
+    md_recv_sems,  # (2,) — one DMA semaphore per metadata mailbox bank
     barrier_sem,  # BARRIER
     *,
     # Static params
@@ -552,9 +552,13 @@ def _fused_ep_moe_kernel(
         # Keep the direct-all-gather mailbox alive for the full kernel. Two
         # banks are sufficient: before a rank can start metadata generation
         # N+2, it must receive generation N+1 from every peer, which means
-        # every peer has already finished consuming generation N.
+        # every peer has already finished consuming generation N. The DMA
+        # semaphores must use the same bank so an N+1 completion cannot satisfy
+        # an N wait while ranks progress at different speeds.
         md_bank_id = bt_id & jnp.int32(1)
         d2e_count_vmem = d2e_count_x2_vmem.at[md_bank_id]
+        md_send_sem = md_send_sems.at[md_bank_id]
+        md_recv_sem = md_recv_sems.at[md_bank_id]
 
         def _inkernel_allreduce(
             t2e_routing_vmem,
@@ -591,7 +595,9 @@ def _fused_ep_moe_kernel(
                 keepdims=True,
             ).reshape(1, padded_num_experts)
 
-            d2e_count_vmem[...] = jnp.zeros_like(d2e_count_vmem)
+            # Every peer writes its complete histogram row before the reduction,
+            # so no receiver-side initialization is needed. Clearing the full
+            # bank here is racy: a faster peer may already have written its row.
             d2e_count_vmem[my_id] = local_sizes
 
             # Metadata all-reduce = 1-round direct all-gather of per-device
@@ -2633,8 +2639,8 @@ def fused_ep_moe_v2(
             pltpu.SemaphoreType.DMA((num_bt_banks,)) if use_gather_bank else pltpu.SemaphoreType.DMA
         ),  # a2a_gather
         pltpu.SemaphoreType.DMA((1,)),  # a2a_acc
-        pltpu.SemaphoreType.DMA,  # md_send
-        pltpu.SemaphoreType.DMA,  # md_recv
+        pltpu.SemaphoreType.DMA((2,)),  # md_send, banked with metadata mailbox
+        pltpu.SemaphoreType.DMA((2,)),  # md_recv, banked with metadata mailbox
         pltpu.SemaphoreType.BARRIER,  # barrier
     )
 

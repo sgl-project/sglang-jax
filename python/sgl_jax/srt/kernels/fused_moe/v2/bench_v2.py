@@ -486,7 +486,7 @@ def _estimate_vmem_bytes_v2(
             else local_num_experts * 4
         )
         + (num_bt_banks * 4 if use_gather_bank else 4)  # a2a_gather
-        + 3 * 4  # a2a_acc + md_send + md_recv + barrier
+        + 6 * 4  # a2a_acc + md_send[2] + md_recv[2] + barrier
     )
 
     total = (
