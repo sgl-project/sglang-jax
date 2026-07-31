@@ -384,6 +384,7 @@ def build_scatter_runner(
     local_experts = plan.local_experts
     num_bt = plan.num_bt
     bt = plan.bt
+    routing_width = max(128, plan.top_k)
     packing = 32 // (jnp.dtype(dtype).itemsize * 8)
     h_per_pack = plan.hidden_size // packing
     use_banks = num_bt > 1
@@ -571,7 +572,9 @@ def build_scatter_runner(
             in_specs=[hbm_spec, vmem_spec, vmem_spec, vmem_spec],
             out_specs=hbm_spec,
             scratch_shapes=[
-                pltpu.SMEM((bt, plan.top_k), jnp.int32),
+                # Match fused-MoE v2's default top-k padding so the VMEM-to-SMEM
+                # metadata DMA is aligned to TPU's 128-column tiling.
+                pltpu.SMEM((bt, routing_width), jnp.int32),
                 pltpu.SMEM((ep_size, plan.num_experts), jnp.int32),
                 pltpu.SMEM((plan.num_experts,), jnp.int32),
                 pltpu.SemaphoreType.DMA((3,)),
@@ -947,7 +950,9 @@ def main() -> None:
             hidden_size=args.hidden_size,
             base_bt=args.base_bt,
         )
-        topk_global = plan.topk_ids.reshape(tokens, args.top_k)
+        routing_width = max(128, args.top_k)
+        topk_global = np.full((tokens, routing_width), -1, dtype=np.int32)
+        topk_global[:, : args.top_k] = plan.topk_ids.reshape(tokens, args.top_k)
         topk_array = _make_array_from_numpy(topk_global, topk_sharding)
         starts_array = _make_array_from_numpy(plan.starts, replicated)
         sizes_array = _make_array_from_numpy(plan.sizes, replicated)
