@@ -29,7 +29,7 @@ class SpecInput(Protocol):
 
     Implementations MUST NOT hold worker/runner/pool/future/callback handles
     in pytree children (these would enter the JIT cache key). Device arrays
-    (``topk_p``, ``hidden_states``, ``draft_token``, ...) stay on device;
+    (``topk_index``, ``hidden_states``, ``draft_token``, ...) stay on device;
     lengths/indices stay host-side ``np.ndarray``.
 
     DP layout (Route 1, target+draft both DP): all per-request fields use
@@ -60,27 +60,27 @@ class SpeculativeAlgorithm(IntEnum):
     EAGLE = auto()
     EAGLE3 = auto()
     NEXTN = auto()
-    STANDALONE = auto()
     DFLASH = auto()
 
     def is_none(self):
         return self == SpeculativeAlgorithm.NONE
 
+    def is_eagle3(self):
+        return self == SpeculativeAlgorithm.EAGLE3
+
     def is_eagle(self):
+        """Whether the algorithm uses EAGLE-style speculative state."""
         return self in (
             SpeculativeAlgorithm.EAGLE,
             SpeculativeAlgorithm.EAGLE3,
             SpeculativeAlgorithm.NEXTN,
         )
 
-    def is_eagle3(self):
-        return self == SpeculativeAlgorithm.EAGLE3
+    def is_eagle_family(self):
+        return self in (SpeculativeAlgorithm.EAGLE, SpeculativeAlgorithm.EAGLE3)
 
     def is_nextn(self):
         return self == SpeculativeAlgorithm.NEXTN
-
-    def is_standalone(self):
-        return self == SpeculativeAlgorithm.STANDALONE
 
     def is_dflash(self):
         return self == SpeculativeAlgorithm.DFLASH
@@ -91,13 +91,40 @@ class SpeculativeAlgorithm(IntEnum):
             "EAGLE": SpeculativeAlgorithm.EAGLE,
             "EAGLE3": SpeculativeAlgorithm.EAGLE3,
             "NEXTN": SpeculativeAlgorithm.NEXTN,
-            "STANDALONE": SpeculativeAlgorithm.STANDALONE,
             "DFLASH": SpeculativeAlgorithm.DFLASH,
             None: SpeculativeAlgorithm.NONE,
         }
         if name is not None:
             name = name.upper()
         return name_map[name]
+
+
+def assign_req_to_token_pool(
+    req_pool_indices,
+    req_to_token_pool,
+    start_offsets,
+    end_offsets,
+    out_cache_loc,
+):
+    """Assign newly allocated KV slots to each request on the host."""
+    start_offsets = np.asarray(start_offsets, dtype=np.int32)
+    end_offsets = np.asarray(end_offsets, dtype=np.int32)
+    out_cache_loc = np.asarray(out_cache_loc, dtype=np.int32)
+
+    lengths = end_offsets - start_offsets
+    total = int(np.sum(lengths))
+    assert total == out_cache_loc.shape[0], (
+        "not all allocated cache locations were assigned to req_to_token_pool: "
+        f"assigned={total}, allocated={out_cache_loc.shape[0]}"
+    )
+    if total == 0:
+        return
+
+    row_indices = np.repeat(req_pool_indices, lengths)
+    block_starts = np.concatenate(([0], np.cumsum(lengths)[:-1]))
+    local_offsets = np.arange(total) - np.repeat(block_starts, lengths)
+    col_indices = local_offsets + np.repeat(start_offsets, lengths)
+    req_to_token_pool.req_to_token[row_indices, col_indices] = out_cache_loc
 
 
 def detect_nan(logits_output: LogitsProcessorOutput):

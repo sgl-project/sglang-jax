@@ -201,7 +201,7 @@ class ServerArgs:
     speculative_draft_model_path: str | None = None
     speculative_draft_model_revision: str | None = None
     speculative_num_steps: int = 4
-    speculative_eagle_topk: int = 5
+    speculative_eagle_topk: int = 1
     speculative_num_draft_tokens: int = 4
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
@@ -1445,7 +1445,7 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "DFLASH"],
+            choices=["EAGLE", "EAGLE3", "NEXTN", "DFLASH"],
             help="Speculative algorithm.",
             default=ServerArgs.speculative_algorithm,
         )
@@ -1473,7 +1473,7 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-eagle-topk",
             type=int,
-            help="The number of tokens sampled from the draft model in eagle2 each step.",
+            help="Draft width for EAGLE/EAGLE3/NEXTN. Only topk=1 is supported.",
             default=ServerArgs.speculative_eagle_topk,
         )
         parser.add_argument(
@@ -1812,29 +1812,34 @@ class ServerArgs:
         # Check LoRA configuration
         self.check_lora_server_args()
 
-        # Speculative overlap uses a fused linear-chain path or DFlash's
-        # dedicated relay-backed draft/verify path.
-        if self.speculative_algorithm is not None and not self.disable_overlap_schedule:
-            supports_nextn_overlap = (
-                self.speculative_algorithm == "NEXTN"
-                and self.speculative_eagle_topk == 1
-                and self.speculative_num_draft_tokens == self.speculative_num_steps + 1
+        if self.speculative_algorithm not in (
+            None,
+            "EAGLE",
+            "EAGLE3",
+            "NEXTN",
+            "DFLASH",
+        ):
+            raise ValueError(
+                "Only fused topk=1 EAGLE/EAGLE3/NEXTN and DFLASH speculative "
+                "decoding are supported."
             )
-            supports_eagle3_overlap = (
-                self.speculative_algorithm == "EAGLE3"
-                and self.speculative_eagle_topk == 1
-                and self.speculative_num_draft_tokens == self.speculative_num_steps + 1
-                and self.attention_backend == "fa"
-            )
-            supports_dflash_overlap = self.speculative_algorithm == "DFLASH"
-            if not (
-                supports_nextn_overlap or supports_eagle3_overlap or supports_dflash_overlap
-            ):
+
+        if self.speculative_algorithm in ("EAGLE", "EAGLE3", "NEXTN"):
+            algorithm = self.speculative_algorithm
+            if self.speculative_eagle_topk != 1:
+                raise ValueError(f"{algorithm} requires --speculative-eagle-topk=1.")
+            if self.speculative_num_steps <= 1:
                 raise ValueError(
-                    "Speculative overlap scheduler only supports DFLASH, EAGLE3+FA, "
-                    "or NEXTN with --speculative-eagle-topk=1 and "
-                    "--speculative-num-draft-tokens == --speculative-num-steps + 1. "
-                    "Please pass --disable-overlap-schedule for other speculative configs."
+                    f"{algorithm} fused decode requires --speculative-num-steps>1."
+                )
+            if self.speculative_num_draft_tokens != self.speculative_num_steps + 1:
+                raise ValueError(
+                    f"{algorithm} requires --speculative-num-draft-tokens == "
+                    "--speculative-num-steps + 1."
+                )
+            if self.attention_backend != "fa":
+                raise ValueError(
+                    f"{algorithm}+FA fused decode requires --attention-backend=fa."
                 )
 
         # DFLASH: non-causal one-shot diffusion draft + linear-chain greedy verify.

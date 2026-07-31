@@ -19,11 +19,9 @@ import numpy as np
 import pytest
 
 from sgl_jax.srt.managers.schedule_batch import ScheduleBatch, ScheduleReqsInfo
-from sgl_jax.srt.managers.scheduler_output_processor_mixin import (
-    SchedulerOutputProcessorMixin,
-)
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.speculative.eagle_info import EagleDraftInput
+from sgl_jax.srt.speculative.overlap_utils import resolve_spec_decode_token_ids
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 
 HIDDEN = 8
@@ -53,7 +51,6 @@ class _Req:
 
 def _mk_spec_info(real_bs: int) -> EagleDraftInput:
     return EagleDraftInput(
-        topk_p=np.ones((real_bs, TOPK), np.float32),
         topk_index=np.zeros((real_bs, TOPK), np.int32),
         hidden_states=np.zeros((real_bs, HIDDEN), np.float32),
         verified_id=np.zeros((real_bs,), np.int32),
@@ -102,7 +99,7 @@ def _mk_batch(dp_size: int, bs_per_rank: list[int]) -> ScheduleBatch:
             return_logprob=False,
             return_output_logprob_only=False,
             return_hidden_states=False,
-            spec_algorithm=SpeculativeAlgorithm.NEXTN,
+            spec_algorithm=SpeculativeAlgorithm.EAGLE3,
             tree_cache=None,
             launch_done=None,
             has_grammar=False,
@@ -356,7 +353,7 @@ def test_draft_page_indices_dp_segmented(dp, bs_per_rank):
         b = r * L_tok + intra[r]
         cache_loc[b : b + al[s]] = k
         intra[r] += aligned[s]
-    # multi_step gather (mirror of get_eagle_multi_step_metadata step 0).
+    # Per-DP-rank page gather for the first fused EAGLE3 draft step.
     src_locs = cache_loc[::page]
     L_pg = L_tok // page
     alloc_pg = ((al[sel] + page - 1) // page).astype(np.int64)
@@ -414,9 +411,9 @@ def test_resolve_spec_decode_token_ids(dp, bs_per_rank, accept_per_slot):
         accept_lens=np.asarray(accept_per_slot, dtype=np.int32),
         num_accepted_tokens=None,
     )
-    sched = SimpleNamespace(draft_worker=SimpleNamespace(speculative_num_draft_tokens=DRAFT_N))
-    out = SchedulerOutputProcessorMixin._resolve_spec_decode_token_ids(sched, result, sb)
+    out, accept_lens = resolve_spec_decode_token_ids(result, sb, DRAFT_N)
     assert len(out) == total_bs
+    assert accept_lens == accept_per_slot
     per_dp = sb.per_dp_bs_size
     for r, bs in enumerate(bs_per_rank):
         for j in range(per_dp):
@@ -426,7 +423,6 @@ def test_resolve_spec_decode_token_ids(dp, bs_per_rank, accept_per_slot):
                 assert out[slot] == list(
                     range(slot * 1000, slot * 1000 + a)
                 ), f"slot {slot}: got {out[slot]}, want {a} tokens from {slot*1000}"
-                assert sb.reqs_info[r].reqs[j].spec_accepted_tokens == a
             else:
                 assert out[slot] == [], f"pad slot {slot} should be []"
 
@@ -439,10 +435,8 @@ def test_resolve_spec_decode_token_ids(dp, bs_per_rank, accept_per_slot):
 def _mk_distinct_spec_info(real_bs: int, seed: int = 0) -> EagleDraftInput:
     """Like ``_mk_spec_info`` but with distinct values so we can detect
     row reordering / mis-slicing after round-trip."""
-    rng = np.random.default_rng(seed)
     base = np.arange(real_bs, dtype=np.int32) + seed * 1000
     return EagleDraftInput(
-        topk_p=rng.random((real_bs, TOPK), dtype=np.float32),
         topk_index=np.tile(base[:, None], (1, TOPK)).astype(np.int32),
         hidden_states=np.tile(base[:, None], (1, HIDDEN)).astype(np.float32),
         verified_id=base.copy(),
@@ -474,7 +468,7 @@ def test_split_concat_spec_info_round_trip(real_bs_per_dp):
             assert p is None
         else:
             assert p is not None
-            assert p.topk_p.shape == (n, TOPK)
+            assert p.topk_index.shape == (n, TOPK)
             assert p.verified_id.shape == (n,)
             assert p.capture_hidden_mode == flat.capture_hidden_mode
 
@@ -484,7 +478,6 @@ def test_split_concat_spec_info_round_trip(real_bs_per_dp):
     np.testing.assert_array_equal(np.asarray(back.verified_id), np.asarray(flat.verified_id))
     np.testing.assert_array_equal(np.asarray(back.allocate_lens), np.asarray(flat.allocate_lens))
     np.testing.assert_array_equal(np.asarray(back.hidden_states), np.asarray(flat.hidden_states))
-    np.testing.assert_allclose(np.asarray(back.topk_p), np.asarray(flat.topk_p))
 
 
 def test_split_spec_info_none_passthrough():

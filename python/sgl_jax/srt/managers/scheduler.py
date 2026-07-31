@@ -96,7 +96,7 @@ from sgl_jax.srt.speculative.overlap_utils import (
     can_use_spec_decode_overlap,
     can_use_spec_prefill_overlap,
     publish_spec_decode_new_seq_lens,
-    use_legacy_eagle3_non_overlap,
+    uses_host_eagle_state,
 )
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 from sgl_jax.srt.utils.common_utils import (
@@ -381,13 +381,11 @@ class Scheduler(
         # launch draft worker
         self._spec_multi_layer = False
         if self.spec_algorithm is not None and self.spec_algorithm.is_eagle():
-            # Multi-layer vs single-layer is a model property (how many MTP heads
-            # the target ships), not a CLI-algorithm property. NEXTN with a single
-            # MTP head behaves exactly like EAGLE (same head run N times).
-            # DeepSeek-style configs expose num_nextn_predict_layers; MiMo-style
-            # configs don't, so fall back to --speculative-num-steps under NEXTN
-            # (one MTP weight set per step).
-            n_mtp = getattr(self.tp_worker.model_config.hf_config, "num_nextn_predict_layers", None)
+            n_mtp = getattr(
+                self.tp_worker.model_config.hf_config,
+                "num_nextn_predict_layers",
+                None,
+            )
             if n_mtp is None and self.spec_algorithm.is_nextn():
                 n_mtp = server_args.speculative_num_steps
             self._spec_multi_layer = n_mtp is not None and n_mtp > 1
@@ -474,11 +472,11 @@ class Scheduler(
         self.cur_batch: ScheduleBatch | None = None
         # The last forward batch
         self.last_batch: ScheduleBatch | None = None
-        # EAGLE3 recurrent prefill produces a width-1 bootstrap state, while
-        # overlap steady state is req-indexed relay state.  When new prefills
-        # join an active decode batch, park the latter for one round while the
-        # former runs its first decode and transitions to relay state.
-        self._eagle3_overlap_parked_batch: ScheduleBatch | None = None
+        # EAGLE-style prefill produces direct draft state, while overlap steady
+        # state is req-indexed relay state. When new prefills join an active
+        # decode batch, park the latter for one round while the former runs its
+        # first decode and transitions to relay state.
+        self._eagle_overlap_parked_batch: ScheduleBatch | None = None
         self.forward_ct = 0
         # HiCache: per-round H2D flush plans from PrefillAdder, drained donation-safe.
         self._pending_h2d: list[tuple[list[int], list[int]]] = []
@@ -1931,21 +1929,21 @@ class Scheduler(
         chunked_req_to_exclude = self._prepare_chunked_reqs_to_exclude()
         self._process_pending_chunked_aborts()
 
-        force_eagle3_bootstrap_decode = False
+        force_eagle_bootstrap_decode = False
         if (
-            self._eagle3_overlap_parked_batch is not None
+            self._eagle_overlap_parked_batch is not None
             and not (self.last_batch and self.last_batch.forward_mode.is_extend())
         ):
             # The isolated bootstrap decode has now published relay state.
             # Restore the older running requests first so request/spec state
             # ordering stays stable across the temporary split.
-            parked_batch = self._eagle3_overlap_parked_batch
+            parked_batch = self._eagle_overlap_parked_batch
             if self.running_batch.is_empty():
                 self.running_batch = parked_batch
             else:
                 parked_batch.merge_batch(self.running_batch)
                 self.running_batch = parked_batch
-            self._eagle3_overlap_parked_batch = None
+            self._eagle_overlap_parked_batch = None
 
         # Merge the prefill batch into the running batch
         if self.last_batch and self.last_batch.forward_mode.is_extend():
@@ -1984,7 +1982,7 @@ class Scheduler(
                 elif (
                     self.enable_overlap
                     and self.spec_algorithm is not None
-                    and self.spec_algorithm.is_eagle3()
+                    and self.spec_algorithm.is_eagle()
                     and any(
                         info.reqs
                         and (
@@ -1994,18 +1992,15 @@ class Scheduler(
                         for info in self.last_batch.reqs_info
                     )
                 ):
-                    # A recurrent EAGLE3 prefill carries only the first draft
-                    # token.  Run its first decode in isolation so that
-                    # spec_decode_eagle3_overlap can expand the chain and
-                    # publish req-indexed relay state.  Directly merging this
-                    # bootstrap state with an existing relay batch either
-                    # violates EagleDraftInput's invariant or creates a device
-                    # dependency cycle.
-                    assert self._eagle3_overlap_parked_batch is None
+                    # Direct EAGLE/NEXTN prefill state cannot merge with an
+                    # existing relay batch. Run its first decode in isolation
+                    # so it publishes req-indexed relay state without creating
+                    # a state invariant violation or device dependency cycle.
+                    assert self._eagle_overlap_parked_batch is None
                     if not self.running_batch.is_empty():
-                        self._eagle3_overlap_parked_batch = self.running_batch
+                        self._eagle_overlap_parked_batch = self.running_batch
                     self.running_batch = self.last_batch
-                    force_eagle3_bootstrap_decode = True
+                    force_eagle_bootstrap_decode = True
                 elif self.running_batch.is_empty():
                     self.running_batch = self.last_batch
                 elif (
@@ -2041,7 +2036,7 @@ class Scheduler(
             and self._consec_decode < df
         )
         if (
-            force_eagle3_bootstrap_decode
+            force_eagle_bootstrap_decode
             or skip_prefill
             or (self.pd and self._pd_pending_migrate is not None)
         ):
@@ -2540,7 +2535,10 @@ class Scheduler(
                 batch_output.next_token_ids
                 if (
                     self.spec_algorithm is not None
-                    and (self.spec_algorithm.is_eagle() or self.spec_algorithm.is_dflash())
+                    and (
+                        self.spec_algorithm.is_eagle()
+                        or self.spec_algorithm.is_dflash()
+                    )
                     and (batch.forward_mode.is_decode() or defer_spec_prefill_output)
                     and self.enable_overlap
                 )
@@ -2630,8 +2628,9 @@ class Scheduler(
         use_spec_prefill_overlap = can_use_spec_prefill_overlap(
             self.enable_overlap, self.spec_algorithm, batch
         ) and self.draft_worker._can_use_fused_spec_prefill(model_worker_batch)
-        use_legacy_eagle3_decode = batch.forward_mode.is_decode() and use_legacy_eagle3_non_overlap(
-            self.enable_overlap, self.spec_algorithm
+        uses_host_eagle_decode_state = (
+            batch.forward_mode.is_decode()
+            and uses_host_eagle_state(self.enable_overlap, self.spec_algorithm)
         )
         if use_spec_decode_overlap:
             batch_output, published_new_seq_lens = (
@@ -2646,7 +2645,7 @@ class Scheduler(
             batch_output = self.draft_worker.forward_batch_speculative_generation(
                 model_worker_batch
             )
-            if use_legacy_eagle3_decode:
+            if uses_host_eagle_decode_state:
                 published_new_seq_lens = None
             else:
                 published_new_seq_lens = (
@@ -2663,7 +2662,7 @@ class Scheduler(
                 batch.reqs_info[r].spec_info = s
 
         if not use_spec_decode_overlap:
-            if use_legacy_eagle3_decode and batch_output.accept_lens is not None:
+            if uses_host_eagle_decode_state and batch_output.accept_lens is not None:
                 new_seq_lens = np.asarray(jax.device_get(batch_output.accept_lens))
                 advance_from_accept_lens = True
             else:

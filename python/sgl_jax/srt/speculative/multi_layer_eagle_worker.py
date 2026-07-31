@@ -1,10 +1,4 @@
-"""MiMo-V2.5-Pro multi-layer MTP spec orchestrator (#1053 P1-4).
-
-Thin wrapper over ``EAGLEWorker`` that swaps the draft worker for
-``MultiLayerDraftWorker``. Orchestration (prefill/decode dispatch,
-``verify()``, precompile) is identical to standard EAGLE — only the draft
-side differs (N runners, layer→layer hidden chaining).
-"""
+"""NEXTN/MTP orchestrator using one fused topk=1 runner per prediction layer."""
 
 from __future__ import annotations
 
@@ -14,7 +8,6 @@ from sgl_jax.srt.speculative.multi_layer_draft_worker import MultiLayerDraftWork
 
 
 class MultiLayerEAGLEWorker(EAGLEWorker):
-
     def __init__(self, server_args, target_worker: ModelWorker):
         super().__init__(
             server_args,

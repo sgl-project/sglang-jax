@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+import pytest
+
 from sgl_jax.srt.server_args import ServerArgs
 from sgl_jax.srt.speculative import dflash_util
 
@@ -99,3 +101,13 @@ def test_dflash_server_args_allows_data_parallel_attention(monkeypatch):
 
     assert args.dp_size == 2
     assert args.tp_size // args.dp_size == 2
+
+
+def test_dflash_server_args_rejects_topk_greater_than_one():
+    args = _dflash_args(
+        speculative_num_draft_tokens=16,
+        speculative_eagle_topk=2,
+    )
+
+    with pytest.raises(ValueError, match="topk=1"):
+        args.check_server_args()

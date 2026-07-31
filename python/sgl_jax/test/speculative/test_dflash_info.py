@@ -11,7 +11,7 @@ from sgl_jax.srt.speculative.dflash_info import (
 )
 from sgl_jax.srt.speculative.overlap_utils import (
     can_merge_spec_non_overlap_prefill,
-    use_legacy_eagle3_non_overlap,
+    uses_host_eagle_state,
 )
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 
@@ -291,9 +291,9 @@ def test_dflash_draft_input_dp_scatter_and_compact_split_round_trip():
     np.testing.assert_array_equal(rank1.verified_id, np.array([30], dtype=np.int32))
 
 
-def test_dflash_non_overlap_can_merge_without_legacy_eagle3_accounting():
+def test_dflash_non_overlap_can_merge_without_host_eagle_accounting():
     assert can_merge_spec_non_overlap_prefill(False, SpeculativeAlgorithm.DFLASH)
-    assert not use_legacy_eagle3_non_overlap(False, SpeculativeAlgorithm.DFLASH)
+    assert not uses_host_eagle_state(False, SpeculativeAlgorithm.DFLASH)
 
 
 def test_build_dflash_draft_block():

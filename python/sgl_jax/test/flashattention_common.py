@@ -17,7 +17,6 @@ from sgl_jax.srt.mem_cache.memory_pool import (
     merge_kv,
 )
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sgl_jax.srt.speculative.eagle_info import EagleVerifyInput
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
 from sgl_jax.test.test_utils import CustomTestCase
 
@@ -281,16 +280,7 @@ def create_test_data(
     if not causal:
         forward_mode = ForwardMode.EXTEND
         custom_mask = create_custom_mask(lens)
-        spec_info = EagleVerifyInput(
-            draft_token=None,
-            custom_mask=custom_mask,
-            positions=None,
-            retrive_index=None,
-            retrive_next_token=None,
-            retrive_next_sibling=None,
-            spec_steps=None,
-            draft_token_num=None,
-        )
+        spec_info = None
     else:
         forward_mode = ForwardMode.EXTEND if mode == "prefill" else ForwardMode.DECODE
         spec_info = None
@@ -341,11 +331,11 @@ def create_test_data(
         spec_info=spec_info,
     )
     fb.attn_backend.forward_metadata = attention_backend.get_forward_metadata(mwb)
-    if fb.spec_info is not None:
+    if not causal:
         from sgl_jax.srt.utils.jax_utils import device_array
 
         fb.attn_backend.forward_metadata.custom_mask = device_array(
-            (fb.spec_info.custom_mask),
+            custom_mask,
             sharding=(NamedSharding(attention_backend.mesh, P("data"))),
         )
     return fb, current_kv_cache, q, k, v
@@ -466,9 +456,7 @@ class AttentionTestBase(CustomTestCase):
             page_table,
             ref_cu_q_lens,
             jnp.array([forward_batch.batch_size], dtype=jnp.int32),
-            custom_mask=(
-                forward_batch.spec_info.custom_mask if forward_batch.spec_info is not None else None
-            ),
+            custom_mask=forward_batch.attn_backend.forward_metadata.custom_mask,
             causal=causal,
             sm_scale=head_dim**-0.5,
             sliding_window=sliding_window,

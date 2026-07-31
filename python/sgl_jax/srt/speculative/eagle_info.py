@@ -2,42 +2,27 @@
 
 from __future__ import annotations
 
-import copy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar
 
 import jax
-import jax.numpy as jnp
 import numpy as np
-from flax import nnx
-from jax.sharding import Mesh, NamedSharding
+from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 from jax.tree_util import register_pytree_node_class
 
-from sgl_jax.srt.kernels.speculative.kernel import (
-    top_k_renorm_prob,
-    top_p_renorm_prob,
-    tree_speculative_sampling_target_only,
-)
-from sgl_jax.srt.kernels.speculative.verify_tree_greedy_kernel import verify_tree_greedy
-from sgl_jax.srt.layers.logits_processor import LogitsProcessorOutput
 from sgl_jax.srt.managers.schedule_batch import (
     ModelWorkerBatch,
     ScheduleBatch,
     get_last_loc,
-    global_server_args_dict,
 )
 from sgl_jax.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
 )
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
-from sgl_jax.srt.speculative.eagle_util import assign_req_to_token_pool
-from sgl_jax.srt.speculative.overlap_utils import use_legacy_eagle3_non_overlap
-from sgl_jax.srt.speculative.spec_utils import (
-    SIMULATED_ACCEPTANCE_CONFIG,
-    apply_simulated_acceptance,
-)
+from sgl_jax.srt.speculative.overlap_utils import uses_host_eagle_state
+from sgl_jax.srt.speculative.spec_info import assign_req_to_token_pool
 
 if TYPE_CHECKING:
     from sgl_jax.srt.managers.scheduler import GenerationBatchResult
@@ -83,13 +68,11 @@ class EagleDraftInput:
     ALLOC_LEN_PER_DECODE: ClassVar[int] = None
 
     # --- Cross-round draft state (device arrays, consumed by next draft) ---
-    #: device ``(b, topk)`` — top-k probs from previous draft/draft_extend.
-    topk_p: jax.Array | None = None
-    #: device ``(b, topk)`` — top-k token ids.
+    #: device ``(b, width)`` — raw draft-vocabulary token ids. Width is one
+    #: after prefill and ``num_steps`` after recurrent expansion.
     topk_index: jax.Array | None = None
-    #: device ``(b, hidden_size)`` — minimal hidden state for next draft step.
-    #: Multi-layer MTP keeps per-step hidden locally inside one
-    #: ``MultiLayerDraftWorker.draft()``; only this cross-round slice persists.
+    #: device ``(b, hidden_size)`` — minimal hidden state for the next fused
+    #: EAGLE/EAGLE3 draft-extend.
     hidden_states: jax.Array | None = None
     #: static metadata (pytree aux); changing it triggers a new compile shape.
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL
@@ -142,7 +125,6 @@ class EagleDraftInput:
         num_tokens_for_logprob_arr = _as_int32_array(self.num_tokens_for_logprob_per_batch)
 
         children = (
-            self.topk_p,
             self.topk_index,
             self.hidden_states,
             self.verified_id,
@@ -163,17 +145,16 @@ class EagleDraftInput:
     def tree_unflatten(cls, aux_data, children):
         obj = cls.__new__(cls)
         obj.capture_hidden_mode = aux_data["capture_hidden_mode"]
-        obj.topk_p = children[0]
-        obj.topk_index = children[1]
-        obj.hidden_states = children[2]
-        obj.verified_id = children[3]
-        obj.accept_length = children[4]
-        obj.kv_indices = children[5]
-        obj.future_indices = children[6]
+        obj.topk_index = children[0]
+        obj.hidden_states = children[1]
+        obj.verified_id = children[2]
+        obj.accept_length = children[3]
+        obj.kv_indices = children[4]
+        obj.future_indices = children[5]
 
-        obj.accept_length_cpu = children[7]
-        obj.num_tokens_per_batch = children[8]
-        obj.num_tokens_for_logprob_per_batch = children[9]
+        obj.accept_length_cpu = children[6]
+        obj.num_tokens_per_batch = children[7]
+        obj.num_tokens_for_logprob_per_batch = children[8]
 
         return obj
 
@@ -219,12 +200,10 @@ class EagleDraftInput:
         draft_model_runner: Any,
         batch_output: GenerationBatchResult,
         speculative_num_draft_tokens: int,
-        *,
-        use_device_metadata: bool = False,
     ):
-        legacy_non_overlap = (
+        uses_host_state = (
             model_worker_batch.spec_algorithm is not None
-            and model_worker_batch.spec_algorithm.is_eagle3()
+            and model_worker_batch.spec_algorithm.is_eagle()
             and getattr(batch_output.next_draft_input, "future_indices", None) is None
         )
         model_worker_batch.spec_info_padded = self
@@ -235,7 +214,7 @@ class EagleDraftInput:
         bs = batch_output.accept_lens.shape[0]
         step_plus_1 = model_worker_batch.input_ids.shape[0] // bs
         positions = getattr(batch_output.next_draft_input, "positions", None)
-        if positions is not None and not legacy_non_overlap:
+        if positions is not None and not uses_host_state:
             model_worker_batch.positions = positions
         model_worker_batch.extend_seq_lens = np.zeros((bs,), dtype=np.int32)
         model_worker_batch.extend_seq_lens[sel] = step_plus_1
@@ -255,26 +234,18 @@ class EagleDraftInput:
         model_worker_batch.spec_info_padded.hidden_states = (
             batch_output.next_draft_input.hidden_states
         )
-        if (
-            (legacy_non_overlap and not use_device_metadata)
-            or model_worker_batch.spec_info_padded.accept_length is None
-        ):
+        if model_worker_batch.spec_info_padded.accept_length is None:
             model_worker_batch.spec_info_padded.accept_length = batch_output.accept_lens
         model_worker_batch.input_ids = batch_output.next_draft_input.verified_id
-        if use_device_metadata:
-            forward_metadata = draft_model_runner.attn_backend.get_eagle_base_metadata(
-                model_worker_batch
-            )
-        else:
-            forward_metadata = draft_model_runner.attn_backend.get_eagle_forward_metadata(
-                model_worker_batch
-            )
+        forward_metadata = draft_model_runner.attn_backend.prepare_paged_kv_layout(
+            model_worker_batch
+        )
 
         draft_model_runner.attn_backend.forward_metadata = forward_metadata
         from sgl_jax.srt.layers.logits_processor import LogitsMetadata
         from sgl_jax.srt.utils.jax_utils import device_array
 
-        if (legacy_non_overlap and not use_device_metadata) or model_worker_batch.return_logprob:
+        if model_worker_batch.return_logprob:
             logits_metadata = LogitsMetadata.from_model_worker_batch(
                 model_worker_batch, draft_model_runner.mesh
             )
@@ -338,14 +309,14 @@ class EagleDraftInput:
         page_size = schedule_batch.token_to_kv_pool_allocator.page_size
         new_alloc_chunks = []
         flat_off = 0
-        legacy_non_overlap = use_legacy_eagle3_non_overlap(
+        uses_host_state = uses_host_eagle_state(
             schedule_batch.enable_overlap, schedule_batch.spec_algorithm
         )
         for dp_rank, info in enumerate(schedule_batch.reqs_info):
             if info.seq_lens is None or len(info.seq_lens) == 0:
                 continue
             bs_r = len(info.seq_lens)
-            if legacy_non_overlap:
+            if uses_host_state:
                 seq_r = np.asarray(info.seq_lens)
                 new_r = seq_r + self.ALLOC_LEN_PER_DECODE - 1
                 old_r = self.allocate_lens[flat_off : flat_off + bs_r]
@@ -382,17 +353,17 @@ class EagleDraftInput:
             for req, allocated_len in zip(info.reqs, new_r):
                 req.decode_batch_idx += 1
                 req.kv_allocated_len = int(allocated_len)
-                if not legacy_non_overlap:
+                if not uses_host_state:
                     req.kv_committed_len += 1
             flat_off += bs_r
             info.seq_lens_sum = np.sum(info.seq_lens).item()
 
         self.allocate_lens = np.concatenate(new_alloc_chunks)
 
-    def prepare_for_draft_decode(self, model_worker_batch: ModelWorkerBatch, topk: int):
+    def prepare_for_draft_decode(self, model_worker_batch: ModelWorkerBatch):
         self.capture_hidden_mode = CaptureHiddenMode.LAST
-        self.num_tokens_per_batch = topk
-        self.num_tokens_for_logprob_per_batch = topk
+        self.num_tokens_per_batch = 1
+        self.num_tokens_for_logprob_per_batch = 1
         model_worker_batch.return_hidden_states = False
         model_worker_batch.seq_lens_sum = np.sum(model_worker_batch.seq_lens)
 
@@ -405,7 +376,7 @@ class EagleDraftInput:
         Converting to numpy first and re-uploading at bucket-padded size in
         _scatter_spec_info_to_dp_slots eliminates those persistent cache misses.
         """
-        device_fields = ("topk_p", "topk_index", "hidden_states", "verified_id", "accept_length")
+        device_fields = ("topk_index", "hidden_states", "verified_id", "accept_length")
         to_copy = []
         for f in device_fields:
             v = getattr(self, f, None)
@@ -434,8 +405,7 @@ class EagleDraftInput:
             return
 
         self._ensure_host()
-        if has_been_filtered and len(new_indices) == len(self.topk_p):
-            self.topk_p = self.topk_p[: len(new_indices)]
+        if has_been_filtered and len(new_indices) == len(self.topk_index):
             self.topk_index = self.topk_index[: len(new_indices)]
             self.hidden_states = self.hidden_states[: len(new_indices)]
             self.verified_id = self.verified_id[: len(new_indices)]
@@ -444,7 +414,6 @@ class EagleDraftInput:
             if self.new_seq_lens is not None:
                 self.new_seq_lens = np.asarray(self.new_seq_lens)[: len(new_indices)]
         else:
-            self.topk_p = self.topk_p[new_indices]
             self.topk_index = self.topk_index[new_indices]
             self.hidden_states = self.hidden_states[new_indices]
             self.verified_id = self.verified_id[new_indices]
@@ -456,7 +425,6 @@ class EagleDraftInput:
     def trim_to_length(self, n: int):
         self._ensure_host()
         for f in (
-            "topk_p",
             "topk_index",
             "hidden_states",
             "verified_id",
@@ -506,7 +474,6 @@ class EagleDraftInput:
         if self.hidden_states is None:
             self.hidden_states = spec_info.hidden_states
             self.verified_id = spec_info.verified_id
-            self.topk_p = spec_info.topk_p
             self.topk_index = spec_info.topk_index
             self.allocate_lens = spec_info.allocate_lens
             self.new_seq_lens = spec_info.new_seq_lens
@@ -517,8 +484,6 @@ class EagleDraftInput:
         spec_info._ensure_host()
         self.hidden_states = np.concatenate([self.hidden_states, spec_info.hidden_states], axis=0)
         self.verified_id = np.concatenate([self.verified_id, spec_info.verified_id], axis=0)
-        self_topk_p = np.asarray(self.topk_p)
-        other_topk_p = np.asarray(spec_info.topk_p)
         self_topk_index = np.asarray(self.topk_index)
         other_topk_index = np.asarray(spec_info.topk_index)
         if self_topk_index.shape[1] != other_topk_index.shape[1]:
@@ -528,15 +493,12 @@ class EagleDraftInput:
                     "Cannot merge EAGLE draft states with incompatible widths: "
                     f"{self_topk_index.shape[1]} and {other_topk_index.shape[1]}"
                 )
-            # A newly prefetched EAGLE3 request carries only its first draft
+            # A newly prefetched EAGLE/EAGLE3 request carries only its first draft
             # seed, while steady-state fused requests carry the full recurrent
             # chain. Downgrade the mixed batch to the common seed so one
             # bootstrap draft pass can rebuild every row consistently.
-            self_topk_p = self_topk_p[:, :1]
-            other_topk_p = other_topk_p[:, :1]
             self_topk_index = self_topk_index[:, :1]
             other_topk_index = other_topk_index[:, :1]
-        self.topk_p = np.concatenate([self_topk_p, other_topk_p])
         self.topk_index = np.concatenate([self_topk_index, other_topk_index])
         self.allocate_lens = np.concatenate([self.allocate_lens, spec_info.allocate_lens])
         if self.new_seq_lens is not None and spec_info.new_seq_lens is not None:
@@ -550,63 +512,27 @@ class EagleDraftInput:
 @register_pytree_node_class
 @dataclass
 class EagleVerifyInput:
-    """Target-verify input.
-
-    Fully describes token/position/mask/tree-index for verify so
-    ``BaseSpecWorker.verify()`` never reads draft-worker internal state.
-    Under DP (Route 1), per-request fields use DP-padded order; verify
-    metadata must reshape to per-DP view before generating cu_q/kv_lens.
-    """
+    """Minimal transient input for fused topk=1 target verification."""
 
     # --- Device arrays (enter target verify forward / sampling) ---
     #: device ``(b*draft_token_num,)`` — flattened draft tokens to verify.
     draft_token: jax.Array
-    #: device ``(sum(q_i*kv_i),)`` — tree attention mask; shape participates
-    #: in the JIT cache key.  ``None`` when topk=1 (chain mode uses causal).
-    custom_mask: jax.Array | None
     #: device ``(b*draft_token_num,)`` — verify positions (follows
     #: ``ForwardBatch`` host/device convention).
     positions: jax.Array
-    #: device — tree verify index (sampling-kernel convention).
-    retrive_index: jax.Array
-    #: device — tree child pointer for tree sampling.
-    retrive_next_token: jax.Array
-    #: device — tree sibling pointer for tree sampling.
-    retrive_next_sibling: jax.Array
-
-    # --- Static metadata (pytree aux; changes trigger new compile shape) ---
-    spec_steps: int
-    #: per-request verify token count (constant within a precompile shape).
-    draft_token_num: int
 
     def tree_flatten(self):
         children = (
             self.draft_token,
-            self.custom_mask,
             self.positions,
-            self.retrive_index,
-            self.retrive_next_token,
-            self.retrive_next_sibling,
         )
-
-        aux_data = {
-            "spec_steps": self.spec_steps,
-            "draft_token_num": self.draft_token_num,
-        }
-        return (children, aux_data)
+        return (children, None)
 
     @classmethod
     def tree_unflatten(cls, aux_data, children):
         obj = cls.__new__(cls)
-        obj.spec_steps = aux_data["spec_steps"]
-        obj.draft_token_num = aux_data["draft_token_num"]
-
         obj.draft_token = children[0]
-        obj.custom_mask = children[1]
-        obj.positions = children[2]
-        obj.retrive_index = children[3]
-        obj.retrive_next_token = children[4]
-        obj.retrive_next_sibling = children[5]
+        obj.positions = children[1]
 
         return obj
 
@@ -619,136 +545,4 @@ class EagleVerifyInput:
         model_worker_batch.forward_mode = ForwardMode.TARGET_VERIFY
         model_worker_batch.spec_info_padded = self
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
-        model_worker_batch.extend_seq_lens = self.draft_token
-
-    def sample(
-        self,
-        model_worker_batch: ModelWorkerBatch,
-        logits_output: LogitsProcessorOutput,
-        rng: nnx.Rngs,
-        mesh: Mesh,
-    ) -> jax.Array:
-        """
-        Verify and find accepted tokens based on logits output and batch
-        (which contains spec decoding information).
-
-        WARNING: This API in-place modifies the states of logits_output
-
-        This API updates values inside logits_output based on the accepted
-        tokens. I.e., logits_output.next_token_logits only contains
-        accepted token logits.
-        """
-        sampling_info = model_worker_batch.sampling_info
-        bs = self.retrive_index.shape[0]
-        if bs != len(sampling_info):
-            sampling_info = copy.deepcopy(sampling_info)
-            # NOTE: retrive_index are the indices of the requests that are kept.
-            # FIXME(pc)
-            sampling_info.filter_batch(np.arange(len(sampling_info)))
-
-        # TODO: support custom sampler, apply the custom logit processors if registered in the sampling info.
-        # if sampling_info.has_custom_logit_processor:
-        #     pass
-        # TODO: Apply penalty
-        # if sampling_info.penalizer_orchestrator.is_required:
-        #     pass
-        # TODO: Apply grammar mask
-        # if vocab_mask is not None:
-        #     pass
-
-        is_all_greedy = sampling_info.is_all_greedy
-        candidates = self.draft_token.reshape(bs, self.draft_token_num)
-
-        if is_all_greedy:
-            with jax.set_mesh(mesh):
-                accept_index, accept_length, predict = verify_tree_greedy(
-                    speculative_num_steps=self.spec_steps,
-                    num_draft_tokens=self.draft_token_num,
-                    draft_tokens=self.draft_token,
-                    retrive_index=self.retrive_index,
-                    retrive_next_token=self.retrive_next_token,
-                    retrive_next_sibling=self.retrive_next_sibling,
-                    next_token_logits=logits_output.next_token_logits,
-                )
-        else:
-            bs = self.retrive_index.shape[0]
-            predict_shape = list(logits_output.next_token_logits.shape)[:-1]
-            predict_shape[-1] += 1
-            predict = jnp.zeros(predict_shape, dtype=jnp.int32)
-
-            accept_index = jnp.full((bs, self.spec_steps + 1), -1, dtype=jnp.int32)
-            accept_length = jnp.zeros((bs,), dtype=jnp.int32)
-            # apply temperature and get target probs
-            expanded_temperature = jnp.repeat(
-                sampling_info.temperatures, self.draft_token_num
-            )  # (bs * draft_token_num, 1)
-            expanded_temperature = jnp.expand_dims(expanded_temperature, axis=-1)
-            target_probs = jax.nn.softmax(
-                logits_output.next_token_logits / expanded_temperature, axis=-1
-            )  # (bs * draft_token_num, vocab_size)
-            target_probs = top_k_renorm_prob(
-                target_probs, jnp.repeat(sampling_info.top_ks, self.draft_token_num)
-            )
-
-            if not jnp.all(sampling_info.top_ps == 1.0):
-                target_probs = top_p_renorm_prob(
-                    target_probs, jnp.repeat(sampling_info.top_ps, self.draft_token_num)
-                )
-
-            # TODO: optimize top_k and top_p by avoiding sort
-            rngs = jax.random.split(rng.params(), 3)
-
-            draft_probs = jnp.zeros(target_probs.shape, dtype=jnp.float32)
-
-            # coins for rejection sampling
-            coins = jax.random.uniform(rngs[1], candidates.shape, dtype=jnp.float32)
-            # coins for final sampling
-            coins_for_final_sampling = jax.random.uniform(rngs[2], (bs,), dtype=jnp.float32)
-            accept_index, accept_length, predict = tree_speculative_sampling_target_only(
-                predicts=predict,
-                accept_index=accept_index,
-                accept_token_num=accept_length,
-                candidates=candidates,
-                retrive_index=self.retrive_index,
-                retrive_next_token=self.retrive_next_token,
-                retrive_next_sibling=self.retrive_next_sibling,
-                uniform_samples=coins,
-                uniform_samples_for_final_sampling=coins_for_final_sampling,
-                target_probs=target_probs,
-                draft_probs=draft_probs,
-                threshold_single=global_server_args_dict["speculative_accept_threshold_single"],
-                threshold_acc=global_server_args_dict["speculative_accept_threshold_acc"],
-                deterministic=True,
-            )
-
-        accept_length = accept_length + 1
-        if SIMULATED_ACCEPTANCE_CONFIG.enabled:
-            target_predict = None
-            if SIMULATED_ACCEPTANCE_CONFIG.token_mode == "real-draft-token":
-                target_predict = jnp.argmax(
-                    logits_output.next_token_logits, axis=-1
-                ).reshape(bs, self.draft_token_num)
-            simulation_rng = jax.random.split(rng.params())[1]
-            accept_index, predict, accept_length = apply_simulated_acceptance(
-                accept_index=accept_index,
-                predict=predict,
-                accept_lens=accept_length,
-                candidates=candidates,
-                target_predict=target_predict,
-                valid_mask=accept_index[:, 0] >= 0,
-                spec_steps=self.spec_steps,
-                topk=model_worker_batch.speculative_eagle_topk,
-                rng=simulation_rng,
-            )
-
-        for arr in (predict, accept_index, accept_length):
-            if hasattr(arr, "copy_to_host_async"):
-                arr.copy_to_host_async()
-        predict = np.asarray(predict)
-        accept_index = np.asarray(accept_index)
-        accept_length = np.asarray(accept_length)
-
-        accept_index = accept_index.flatten()
-        verified_id = np.zeros_like(accept_index, dtype=predict.dtype)
-        verified_id[accept_index != -1] = predict[accept_index[accept_index != -1]]
-        return predict, verified_id, accept_length, accept_index
+        model_worker_batch.extend_seq_lens = None

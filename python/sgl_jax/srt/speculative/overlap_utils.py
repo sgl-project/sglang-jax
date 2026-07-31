@@ -44,12 +44,8 @@ def can_use_spec_decode_overlap(enable_overlap, spec_algorithm, batch) -> bool:
 
 
 def can_use_spec_prefill_overlap(enable_overlap, spec_algorithm, batch) -> bool:
-    # Cheap pre-filter only. The authoritative check is
-    # EAGLEWorker._can_use_fused_spec_prefill(model_worker_batch), which the
-    # scheduler ANDs in before dispatching to the fused prefill overlap entry
-    # (it needs the merged model_worker_batch sampling_info plus the worker's
-    # NEXTN/topk/num_steps config). Keep this gate to the conditions decidable
-    # from the ScheduleBatch alone so the two never drift.
+    # Cheap pre-filter only. The worker decides whether its algorithm-specific
+    # fused prefill-overlap path supports the merged batch.
     if not enable_overlap:
         return False
     if spec_algorithm is None or spec_algorithm.is_none():
@@ -59,28 +55,28 @@ def can_use_spec_prefill_overlap(enable_overlap, spec_algorithm, batch) -> bool:
     return not (batch.return_logprob or batch.return_output_logprob_only)
 
 
-def use_legacy_eagle3_non_overlap(enable_overlap, spec_algorithm) -> bool:
+def uses_host_eagle_state(enable_overlap, spec_algorithm) -> bool:
+    """Whether fused EAGLE/EAGLE3/NEXTN carries round state on the host."""
     return (
         not enable_overlap
         and spec_algorithm is not None
         and not spec_algorithm.is_none()
-        and spec_algorithm.is_eagle3()
+        and spec_algorithm.is_eagle()
     )
 
 
 def can_merge_spec_non_overlap_prefill(enable_overlap, spec_algorithm) -> bool:
     """Whether non-overlap spec decode may merge completed prefills into decode.
 
-    Eagle3 historically used the ``use_legacy_eagle3_non_overlap`` path for
-    this. DFlash needs the same scheduling behavior to keep decode batches
-    full, but it must keep its own accepted-length KV accounting, so do not
-    fold it into the legacy Eagle3 helper.
+    EAGLE/EAGLE3/NEXTN use host-carried state here. DFlash needs the same
+    scheduling behavior to keep decode batches full, but it keeps separate
+    accepted-length KV accounting.
     """
     return (
         not enable_overlap
         and spec_algorithm is not None
         and not spec_algorithm.is_none()
-        and (spec_algorithm.is_eagle3() or spec_algorithm.is_dflash())
+        and (spec_algorithm.is_eagle() or spec_algorithm.is_dflash())
     )
 
 

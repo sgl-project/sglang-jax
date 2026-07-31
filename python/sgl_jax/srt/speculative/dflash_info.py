@@ -213,7 +213,7 @@ class DFlashDraftInput:
             alloc_paged_token_slots_extend,
             alloc_token_slots,
         )
-        from sgl_jax.srt.speculative.eagle_util import assign_req_to_token_pool
+        from sgl_jax.srt.speculative.spec_info import assign_req_to_token_pool
 
         block_size = self.block_size
         page_size = schedule_batch.token_to_kv_pool_allocator.page_size
@@ -432,7 +432,6 @@ class DFlashVerifyInput:
 
     draft_token: jax.Array
     draft_token_num: int
-    custom_mask = None
 
     def tree_flatten(self):
         return (self.draft_token,), {"draft_token_num": int(self.draft_token_num)}

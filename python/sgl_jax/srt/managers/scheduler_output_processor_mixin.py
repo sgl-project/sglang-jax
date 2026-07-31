@@ -16,7 +16,7 @@ from sgl_jax.srt.mem_cache.common import release_kv_cache
 from sgl_jax.srt.precision_tracer import precision_tracer
 from sgl_jax.srt.speculative.overlap_utils import (
     resolve_spec_prefill_token_ids,
-    use_legacy_eagle3_non_overlap,
+    uses_host_eagle_state,
 )
 
 if TYPE_CHECKING:
@@ -382,7 +382,7 @@ class SchedulerOutputProcessorMixin:
             result.cache_miss_count,
         )
         is_spec_decode = self.spec_algorithm is not None and not self.spec_algorithm.is_none()
-        legacy_eagle3_non_overlap = use_legacy_eagle3_non_overlap(
+        uses_host_state = uses_host_eagle_state(
             self.enable_overlap, self.spec_algorithm
         )
         if is_spec_decode:
@@ -499,7 +499,7 @@ class SchedulerOutputProcessorMixin:
 
                 if req.finished():
                     self.maybe_collect_routed_experts(req)
-                    if legacy_eagle3_non_overlap:
+                    if uses_host_state:
                         actual_token_len = len(req.origin_input_ids) + max(
                             len(req.output_ids) - 1, 0
                         )
@@ -517,8 +517,11 @@ class SchedulerOutputProcessorMixin:
                     )
                 elif (
                     is_spec_decode
-                    and (self.spec_algorithm.is_eagle() or self.spec_algorithm.is_dflash())
-                    and not legacy_eagle3_non_overlap
+                    and (
+                        self.spec_algorithm.is_eagle()
+                        or self.spec_algorithm.is_dflash()
+                    )
+                    and not uses_host_state
                 ):
                     req.kv_committed_len += new_accepted_len - 1
 

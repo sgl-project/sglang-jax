@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 
 class EAGLEWorker(BaseSpecWorker):
-    """Standard EAGLE speculative decode orchestrator.
+    """Fused topk=1 EAGLE/EAGLE3 speculative decode orchestrator.
 
     Composes a ``target_worker`` (full model) with an ``EagleDraftWorker``
     (draft model).  Implements the ``BaseSpecWorker`` contract so the
@@ -153,19 +153,10 @@ class EAGLEWorker(BaseSpecWorker):
                 assert not model_worker_batch.return_output_logprob_only
                 assert model_worker_batch.sampling_info.is_all_greedy
                 num_steps = self.speculative_num_steps
-                from sgl_jax.srt.speculative.multi_layer_draft_worker import (
-                    MultiLayerDraftWorker,
-                )
-
-                is_multi_layer = isinstance(self.draft_worker, MultiLayerDraftWorker)
-                if is_multi_layer and self.topk == 1:
-                    topk_shape = (bs, num_steps)
-                else:
-                    topk_shape = (bs, num_steps, self.topk) if is_multi_layer else (bs, self.topk)
+                chain_shape = (bs, num_steps)
                 data_sharding = NamedSharding(self.mesh, P("data"))
                 spec_info = EagleDraftInput(
-                    topk_p=jax.device_put(np.ones(topk_shape, dtype=np.float32), data_sharding),
-                    topk_index=jax.device_put(np.ones(topk_shape, dtype=np.int32), data_sharding),
+                    topk_index=jax.device_put(np.ones(chain_shape, dtype=np.int32), data_sharding),
                     hidden_states=np.ones(
                         (bs, self.draft_worker.model_config.hidden_size),
                         dtype=(
