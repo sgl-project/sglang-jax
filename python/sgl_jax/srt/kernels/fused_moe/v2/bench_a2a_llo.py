@@ -1069,8 +1069,20 @@ def main() -> None:
         "cases": handoff_cases,
     }
     write_json(output_dir / "handoff_summary.json", handoff)
+    (output_dir / "handoff_summary.compact.json").write_text(
+        json.dumps(handoff, sort_keys=True) + "\n"
+    )
     if jax.process_index() == 0:
-        print("A2A_HANDOFF_JSON=" + json.dumps(handoff, sort_keys=True), flush=True)
+        print(
+            json.dumps(
+                {
+                    "handoff_summary": "handoff_summary.json",
+                    "handoff_summary_compact": "handoff_summary.compact.json",
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
 
 
 if __name__ == "__main__":
