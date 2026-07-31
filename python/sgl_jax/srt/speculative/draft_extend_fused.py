@@ -28,6 +28,7 @@ from sgl_jax.srt.speculative.relay_buffer import (
 from sgl_jax.srt.speculative.spec_utils import (
     SIMULATED_ACCEPTANCE_CONFIG,
     apply_simulated_acceptance,
+    greedy_chain_verify,
 )
 
 
@@ -190,7 +191,7 @@ def _verify_greedy(
     positions,
     seq_lens,
     draft_tokens,
-    target_predict,
+    target_logits,
     speculative_num_steps,
     speculative_num_draft_tokens,
     simulation_rng=None,
@@ -198,21 +199,22 @@ def _verify_greedy(
     bs = seq_lens.shape[0]
     n = speculative_num_draft_tokens
     width = speculative_num_steps + 1
-    draft_2d = draft_tokens.reshape(bs, n)
-    target_predict_2d = target_predict.reshape(bs, n)
-    predict_sharding = jax.typeof(target_predict).sharding
-    mesh = predict_sharding.mesh if isinstance(predict_sharding, NamedSharding) else None
-    if mesh is not None and not mesh.empty:
-        data_2d = NamedSharding(mesh, P("data", None))
-        draft_2d = jax.sharding.reshard(draft_2d, data_2d)
-        target_predict_2d = jax.sharding.reshard(target_predict_2d, data_2d)
+    if width != n:
+        raise ValueError(
+            "Greedy linear verify requires speculative_num_draft_tokens "
+            f"({n}) == speculative_num_steps + 1 ({width})."
+        )
 
-    child_matches = draft_2d[:, 1:] == target_predict_2d[:, :-1]
+    verify_result = greedy_chain_verify(
+        draft_tokens,
+        target_logits,
+        draft_width=speculative_num_draft_tokens,
+        valid_mask=seq_lens > 0,
+    )
     is_padding = seq_lens == 0
-    accepted_children = jnp.cumprod(child_matches.astype(jnp.int32), axis=1).astype(jnp.bool_)
-    accepted_children = jnp.where(is_padding[:, None], False, accepted_children)
-    accept_length_raw = jnp.sum(accepted_children.astype(jnp.int32), axis=1)
-    accept_length = jnp.where(is_padding, 0, accept_length_raw + 1)
+    accepted_children = verify_result.accepted_children
+    accept_length_raw = verify_result.accepted_draft_lens
+    accept_length = verify_result.accept_lens
 
     row_ids = jnp.zeros_like(accept_length_raw) + jnp.arange(bs, dtype=jnp.int32)
     base = row_ids[:, None] * n
@@ -220,7 +222,9 @@ def _verify_greedy(
     accept_index_children = jnp.where(accepted_children, base + child_offsets, -1)
     accept_index_2d = jnp.concatenate([base, accept_index_children], axis=1)
     accept_index_2d = jnp.where(is_padding[:, None], -1, accept_index_2d)
-    predict = target_predict_2d.astype(jnp.int32).reshape(-1)
+    draft_2d = draft_tokens.reshape(bs, n)
+    target_predict_2d = verify_result.target_predict.reshape(bs, n)
+    predict = verify_result.target_predict
     accept_index_2d, predict, accept_length = apply_simulated_acceptance(
         accept_index=accept_index_2d,
         predict=predict,
@@ -1150,13 +1154,12 @@ def _build_verify():
         sampling_rng = jax.random.fold_in(sampling_base_rng, sampling_step)
         simulation_rng = jax.random.fold_in(sampling_rng, 1)
         if is_greedy:
-            target_predict = jnp.argmax(target_logits, axis=-1).astype(jnp.int32).reshape(-1)
             prepared = _verify_greedy(
                 target_hidden=target_hidden,
                 positions=target_forward_batch.positions,
                 seq_lens=target_forward_batch.seq_lens,
                 draft_tokens=draft_tokens,
-                target_predict=target_predict,
+                target_logits=target_logits,
                 simulation_rng=simulation_rng,
                 speculative_num_steps=speculative_num_steps,
                 speculative_num_draft_tokens=speculative_num_draft_tokens,

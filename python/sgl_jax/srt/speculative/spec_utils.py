@@ -5,9 +5,12 @@ from __future__ import annotations
 import math
 import os
 from dataclasses import dataclass
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 
 
 @dataclass(frozen=True)
@@ -138,3 +141,89 @@ def apply_simulated_acceptance(
         out_sharding=jax.typeof(predict).sharding,
     )
     return simulated_index, predict, simulated_lens
+
+
+class GreedyChainVerifyOutput(NamedTuple):
+    """Common result of topk=1 linear-chain greedy verification."""
+
+    target_predict: jax.Array
+    accepted_children: jax.Array
+    accepted_draft_lens: jax.Array
+    accept_lens: jax.Array
+    next_verified_id: jax.Array
+
+
+def greedy_chain_verify(
+    draft_tokens: jax.Array,
+    target_logits: jax.Array,
+    *,
+    draft_width: int,
+    valid_mask: jax.Array | None = None,
+) -> GreedyChainVerifyOutput:
+    """Verify a topk=1 draft chain against target-model logits.
+
+    ``draft_tokens`` contains the verified root in column zero. ``accept_lens``
+    includes that root, while ``accepted_draft_lens`` counts only accepted
+    children. Invalid padding rows produce zero lengths and next token.
+    """
+    target_predict = jnp.argmax(target_logits, axis=-1).astype(jnp.int32)
+    draft_2d = draft_tokens.reshape((-1, int(draft_width))).astype(jnp.int32)
+    target_predict_2d = target_predict.reshape(draft_2d.shape).astype(jnp.int32)
+
+    predict_sharding = jax.typeof(target_predict).sharding
+    mesh = predict_sharding.mesh if isinstance(predict_sharding, NamedSharding) else None
+    if mesh is not None and mesh.empty:
+        mesh = None
+    if mesh is not None:
+        data_2d = NamedSharding(mesh, P("data", None))
+        draft_2d = jax.sharding.reshard(draft_2d, data_2d)
+        target_predict_2d = jax.sharding.reshard(target_predict_2d, data_2d)
+
+    child_matches = draft_2d[:, 1:] == target_predict_2d[:, :-1]
+    accepted_children = jnp.cumprod(child_matches.astype(jnp.int32), axis=1).astype(
+        jnp.bool_
+    )
+    if valid_mask is not None:
+        accepted_children = jnp.where(
+            valid_mask.reshape((-1, 1)),
+            accepted_children,
+            False,
+        )
+
+    accepted_draft_lens = jnp.sum(accepted_children.astype(jnp.int32), axis=1)
+    accept_lens = accepted_draft_lens + 1
+    if valid_mask is not None:
+        accept_lens = jnp.where(valid_mask, accept_lens, 0)
+
+    if mesh is None:
+        next_verified_id = jnp.take_along_axis(
+            target_predict_2d,
+            accepted_draft_lens[:, None],
+            axis=1,
+        ).reshape(-1)
+    else:
+
+        def _select_local_next_id(local_predict, local_accept_len):
+            return jnp.take_along_axis(
+                local_predict,
+                local_accept_len[:, None],
+                axis=1,
+            ).reshape(-1)
+
+        next_verified_id = jax.shard_map(
+            _select_local_next_id,
+            mesh=mesh,
+            in_specs=(P("data", None), P("data")),
+            out_specs=P("data"),
+        )(target_predict_2d, accepted_draft_lens)
+
+    if valid_mask is not None:
+        next_verified_id = jnp.where(valid_mask, next_verified_id, 0)
+
+    return GreedyChainVerifyOutput(
+        target_predict=target_predict_2d.reshape(-1),
+        accepted_children=accepted_children,
+        accepted_draft_lens=accepted_draft_lens.astype(jnp.int32),
+        accept_lens=accept_lens.astype(jnp.int32),
+        next_verified_id=next_verified_id.astype(jnp.int32),
+    )

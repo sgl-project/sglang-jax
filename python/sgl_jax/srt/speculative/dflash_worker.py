@@ -28,7 +28,6 @@ from sgl_jax.srt.speculative.dflash_info import (
     DFlashVerifyInput,
     _mask_draft_kv_writes,
     build_dflash_draft_block,
-    dflash_greedy_verify,
 )
 from sgl_jax.srt.speculative.dflash_util import (
     parse_dflash_draft_config,
@@ -41,6 +40,7 @@ from sgl_jax.srt.speculative.relay_buffer import (
     update_dflash_relay_buffers,
 )
 from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
+from sgl_jax.srt.speculative.spec_utils import greedy_chain_verify
 
 logger = logging.getLogger(__name__)
 
@@ -929,11 +929,15 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 output, pool_updates, _, layers_topk_ids = model(
                     forward_batch, memory_pools, logits_metadata
                 )
-            accept_lens_out, next_token_ids_flat, new_verified_id, _ = dflash_greedy_verify(
+            verify_result = greedy_chain_verify(
                 draft_token,
                 output.next_token_logits,
-                draft_token_num=draft_token_num,
+                draft_width=draft_token_num,
+                valid_mask=relay_valid_mask,
             )
+            accept_lens_out = verify_result.accept_lens
+            next_token_ids_flat = verify_result.target_predict
+            new_verified_id = verify_result.next_verified_id
             accept_lens_out = jax.sharding.reshard(accept_lens_out, token_sharding)
             next_token_ids_flat = jax.sharding.reshard(next_token_ids_flat, token_sharding)
             new_verified_id = jax.sharding.reshard(new_verified_id, token_sharding)

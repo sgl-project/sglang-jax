@@ -81,57 +81,6 @@ def build_dflash_draft_block(
     return block_ids, positions.astype(np.int32)
 
 
-# TODO: Share greedy chain verification through common speculative helpers.
-def dflash_greedy_verify(
-    draft_token: jax.Array,
-    target_logits: jax.Array,
-    *,
-    draft_token_num: int,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    """Pure JAX target-logits argmax and greedy DFlash verification."""
-    candidates = draft_token.reshape((-1, int(draft_token_num)))
-    target_predict_flat = jnp.argmax(target_logits, axis=-1).astype(jnp.int32)
-    mesh = getattr(jax.typeof(target_predict_flat).sharding, "mesh", None)
-    if mesh is not None and getattr(mesh, "empty", False):
-        mesh = None
-    target_predict = target_predict_flat.reshape(candidates.shape)
-    if mesh is not None:
-        from jax.sharding import NamedSharding
-        from jax.sharding import PartitionSpec as P
-
-        data_2d = NamedSharding(mesh, P("data", None))
-        candidates = jax.sharding.reshard(candidates, data_2d)
-        target_predict = jax.sharding.reshard(target_predict, data_2d)
-
-    matches = candidates[:, 1:] == target_predict[:, :-1]
-    accept_len_draft = jnp.sum(jnp.cumprod(matches.astype(jnp.int32), axis=1), axis=1)
-    target_predict_flat = target_predict.reshape(-1).astype(jnp.int32)
-    if mesh is None:
-        bonus = jnp.take_along_axis(
-            target_predict,
-            accept_len_draft[:, None],
-            axis=1,
-        ).reshape(-1)
-    else:
-
-        def _select_local_bonus(local_predict, local_accept_len):
-            return jnp.take_along_axis(
-                local_predict,
-                local_accept_len[:, None],
-                axis=1,
-            ).reshape(-1)
-
-        bonus = jax.shard_map(
-            _select_local_bonus,
-            mesh=mesh,
-            in_specs=(P("data", None), P("data")),
-            out_specs=P("data"),
-        )(target_predict, accept_len_draft)
-
-    accept_lens_out = (accept_len_draft + 1).astype(jnp.int32)
-    return accept_lens_out, target_predict_flat, bonus, accept_len_draft.astype(jnp.int32)
-
-
 @dataclass
 class DFlashDraftInput(SpecDraftStateMixin):
     """Host-side DFlash state carried between decode iterations."""

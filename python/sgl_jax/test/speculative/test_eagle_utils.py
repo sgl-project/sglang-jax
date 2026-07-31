@@ -272,6 +272,8 @@ class TestVerifyTree(CustomTestCase):
             ],
             dtype=np.int32,
         )
+        logits = np.full((target_predict.size, 128), -1.0, dtype=np.float32)
+        logits[np.arange(target_predict.size), target_predict] = 10.0
         chain = _verify_greedy(
             target_hidden=jnp.arange(bs * num_draft_tokens * 2, dtype=jnp.float32).reshape(
                 bs * num_draft_tokens, 2
@@ -279,7 +281,7 @@ class TestVerifyTree(CustomTestCase):
             positions=jnp.arange(bs * num_draft_tokens, dtype=jnp.int32),
             seq_lens=jnp.array([100, 200, 300, 400], dtype=jnp.int32),
             draft_tokens=draft_tokens,
-            target_predict=jnp.asarray(target_predict),
+            target_logits=jnp.asarray(logits),
             speculative_num_steps=speculative_num_steps,
             speculative_num_draft_tokens=num_draft_tokens,
         )
@@ -300,12 +302,20 @@ class TestVerifyTree(CustomTestCase):
     def test_fused_chain_verify_zeroes_padding_accept_length(self):
         from sgl_jax.srt.speculative.draft_extend_fused import _verify_greedy
 
+        draft_tokens = jnp.array(
+            [0, 0, 0, 0, 20, 21, 22, 23],
+            dtype=jnp.int32,
+        )
+        target_predict = np.array([0, 0, 0, 0, 21, 22, 99, 24], dtype=np.int32)
+        logits = np.full((target_predict.size, 128), -1.0, dtype=np.float32)
+        logits[np.arange(target_predict.size), target_predict] = 10.0
+        seq_lens = jnp.array([0, 10], dtype=jnp.int32)
         out = _verify_greedy(
             target_hidden=jnp.arange(8 * 2, dtype=jnp.float32).reshape(8, 2),
             positions=jnp.arange(8, dtype=jnp.int32),
-            seq_lens=jnp.array([0, 10], dtype=jnp.int32),
-            draft_tokens=jnp.array([0, 0, 0, 0, 20, 21, 22, 23], dtype=jnp.int32),
-            target_predict=jnp.array([0, 0, 0, 0, 21, 22, 99, 24], dtype=jnp.int32),
+            seq_lens=seq_lens,
+            draft_tokens=draft_tokens,
+            target_logits=jnp.asarray(logits),
             speculative_num_steps=3,
             speculative_num_draft_tokens=4,
         )
