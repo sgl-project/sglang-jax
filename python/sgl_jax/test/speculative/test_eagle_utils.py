@@ -1,8 +1,14 @@
+import argparse
+import os
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.sharding import Mesh, NamedSharding
+from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.kernels.speculative.kernel import create_extend_after_decode_spec_info
 from sgl_jax.srt.kernels.speculative.tree_speculative_sampling_target_only_kernel import (
@@ -10,10 +16,249 @@ from sgl_jax.srt.kernels.speculative.tree_speculative_sampling_target_only_kerne
 )
 from sgl_jax.srt.kernels.speculative.verify_tree_greedy_kernel import verify_tree_greedy
 from sgl_jax.srt.speculative.eagle_util import build_tree_mask_for_draft_decode
+from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 from sgl_jax.test.test_utils import CustomTestCase
 
 
 class TestVerifyTree(CustomTestCase):
+    def _decode_loop_policy(
+        self,
+        *,
+        mode="auto",
+        algorithm=None,
+        topk=1,
+        is_greedy=True,
+        use_relay_state=False,
+        target_model_type="step3p5",
+        target_architectures=("Step3p5ForCausalLM",),
+        env=None,
+    ):
+        from sgl_jax.srt.speculative.draft_extend_fused import (
+            _should_use_decode_loop_target_verify,
+        )
+        from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        if algorithm is None:
+            algorithm = SpeculativeAlgorithm.NEXTN
+
+        spec_worker = SimpleNamespace(
+            server_args=SimpleNamespace(speculative_target_verify_mode=mode),
+            speculative_algorithm=algorithm,
+            target_worker=SimpleNamespace(
+                model_config=SimpleNamespace(
+                    hf_config=SimpleNamespace(
+                        model_type=target_model_type,
+                        architectures=list(target_architectures),
+                    )
+                )
+            ),
+        )
+        draft_worker = SimpleNamespace(topk=topk)
+        model_worker_batch = SimpleNamespace(spec_algorithm=algorithm)
+        with patch.dict("os.environ", {}, clear=False):
+            os.environ.pop("SGL_JAX_TARGET_VERIFY_DECODE_LOOP", None)
+            if env is not None:
+                os.environ["SGL_JAX_TARGET_VERIFY_DECODE_LOOP"] = env
+            return _should_use_decode_loop_target_verify(
+                spec_worker=spec_worker,
+                draft_worker=draft_worker,
+                model_worker_batch=model_worker_batch,
+                is_greedy=is_greedy,
+                use_relay_state=use_relay_state,
+            )
+
+    def test_decode_loop_policy_auto_enables_nextn_greedy_topk1(self):
+        self.assertTrue(self._decode_loop_policy())
+
+    def test_decode_loop_policy_auto_rejects_unsupported_verify_shapes(self):
+        from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        self.assertFalse(self._decode_loop_policy(is_greedy=False))
+        self.assertFalse(self._decode_loop_policy(topk=2))
+        self.assertFalse(self._decode_loop_policy(algorithm=SpeculativeAlgorithm.EAGLE3))
+
+    def test_decode_loop_policy_rejects_relay_instead_of_silent_fallback(self):
+        with self.assertRaisesRegex(RuntimeError, "cannot run with speculative relay state"):
+            self._decode_loop_policy(use_relay_state=True)
+        with self.assertRaisesRegex(RuntimeError, "cannot run with speculative relay state"):
+            self._decode_loop_policy(mode="decode-loop", use_relay_state=True)
+
+    def test_decode_loop_policy_auto_only_enables_step3p5_nextn(self):
+        self.assertFalse(
+            self._decode_loop_policy(
+                target_model_type="qwen3_5_moe",
+                target_architectures=("Qwen3_5MoeForCausalLM",),
+            )
+        )
+
+    def test_decode_loop_policy_mode_and_env_override_auto(self):
+        self.assertFalse(self._decode_loop_policy(mode="batched"))
+        self.assertTrue(self._decode_loop_policy(mode="decode-loop"))
+        self.assertFalse(self._decode_loop_policy(env="0"))
+        self.assertTrue(self._decode_loop_policy(mode="batched", env="1"))
+
+    def test_target_verify_overlap_policy_matches_decode_loop_gate(self):
+        from sgl_jax.srt.speculative.draft_extend_fused import (
+            _requires_non_overlap_target_verify,
+        )
+
+        step3p5 = SimpleNamespace(model_type="step3p5", architectures=["Step3p5ForCausalLM"])
+        other = SimpleNamespace(model_type="qwen3_5_moe", architectures=["Qwen3_5MoeForCausalLM"])
+
+        def args(mode="auto", topk=1):
+            return SimpleNamespace(
+                speculative_target_verify_mode=mode,
+                speculative_eagle_topk=topk,
+            )
+
+        self.assertTrue(
+            _requires_non_overlap_target_verify(args(), SpeculativeAlgorithm.NEXTN, step3p5)
+        )
+        self.assertFalse(
+            _requires_non_overlap_target_verify(args(), SpeculativeAlgorithm.NEXTN, other)
+        )
+        self.assertTrue(
+            _requires_non_overlap_target_verify(
+                args("decode-loop"), SpeculativeAlgorithm.NEXTN, other
+            )
+        )
+        self.assertFalse(
+            _requires_non_overlap_target_verify(
+                args("batched"), SpeculativeAlgorithm.NEXTN, step3p5
+            )
+        )
+        self.assertFalse(
+            _requires_non_overlap_target_verify(args(topk=2), SpeculativeAlgorithm.NEXTN, step3p5)
+        )
+
+    def test_speculative_sampling_params_reject_constraints(self):
+        from sgl_jax.srt.managers.tokenizer_manager import (
+            _validate_speculative_sampling_params,
+        )
+        from sgl_jax.srt.sampling.sampling_params import SamplingParams
+
+        step3p5 = SimpleNamespace(
+            vocab_size=32000,
+            hf_config=SimpleNamespace(model_type="step3p5", architectures=["Step3p5ForCausalLM"]),
+        )
+        other = SimpleNamespace(
+            vocab_size=32000,
+            hf_config=SimpleNamespace(
+                model_type="qwen3_5_moe", architectures=["Qwen3_5MoeForCausalLM"]
+            ),
+        )
+        speculative = SimpleNamespace(
+            speculative_algorithm="NEXTN",
+            speculative_target_verify_mode="auto",
+            speculative_eagle_topk=1,
+        )
+        plain = SimpleNamespace(
+            speculative_algorithm=None,
+            speculative_target_verify_mode="auto",
+            speculative_eagle_topk=1,
+        )
+
+        _validate_speculative_sampling_params(speculative, step3p5, SamplingParams(temperature=0))
+        _validate_speculative_sampling_params(
+            plain, step3p5, SamplingParams(temperature=0, frequency_penalty=0.5)
+        )
+        _validate_speculative_sampling_params(
+            speculative, other, SamplingParams(temperature=0, frequency_penalty=0.5)
+        )
+        with self.assertRaisesRegex(ValueError, "token penalties"):
+            _validate_speculative_sampling_params(
+                speculative,
+                step3p5,
+                SamplingParams(temperature=0, frequency_penalty=0.5),
+            )
+        with self.assertRaisesRegex(ValueError, "grammar constraints"):
+            _validate_speculative_sampling_params(
+                speculative, step3p5, SamplingParams(temperature=0, regex="[a-z]+")
+            )
+
+    def test_decode_loop_policy_warns_once_for_step3p5_auto_fallback(self):
+        from sgl_jax.srt.speculative import draft_extend_fused
+        from sgl_jax.srt.speculative.draft_extend_fused import (
+            _should_use_decode_loop_target_verify,
+        )
+        from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        spec_worker = SimpleNamespace(
+            server_args=SimpleNamespace(speculative_target_verify_mode="auto"),
+            speculative_algorithm=SpeculativeAlgorithm.NEXTN,
+            target_worker=SimpleNamespace(
+                model_config=SimpleNamespace(
+                    hf_config=SimpleNamespace(
+                        model_type="step3p5",
+                        architectures=["Step3p5ForCausalLM"],
+                    )
+                )
+            ),
+        )
+        draft_worker = SimpleNamespace(topk=1)
+        batch = SimpleNamespace(spec_algorithm=SpeculativeAlgorithm.NEXTN)
+
+        with (
+            patch.dict("os.environ", {}, clear=False),
+            patch.object(draft_extend_fused.logger, "warning") as warning,
+        ):
+            os.environ.pop("SGL_JAX_STEP3P5_DECODE_LOOP_VERIFY_WARNED", None)
+            self.assertTrue(
+                _should_use_decode_loop_target_verify(
+                    spec_worker=spec_worker,
+                    draft_worker=draft_worker,
+                    model_worker_batch=batch,
+                    is_greedy=True,
+                    use_relay_state=False,
+                )
+            )
+            self.assertTrue(
+                _should_use_decode_loop_target_verify(
+                    spec_worker=spec_worker,
+                    draft_worker=draft_worker,
+                    model_worker_batch=batch,
+                    is_greedy=True,
+                    use_relay_state=False,
+                )
+            )
+
+        self.assertEqual(warning.call_count, 1)
+        self.assertIn("correctness-preserving decode-loop verify", warning.call_args.args[0])
+
+    def test_host_array_for_decode_loop_raises_transfer_errors(self):
+        from sgl_jax.srt.speculative.draft_extend_fused import (
+            _host_array_for_decode_loop,
+        )
+
+        class BadArray:
+            is_fully_addressable = True
+
+            def __array__(self, dtype=None):
+                raise RuntimeError("host transfer failed")
+
+        with self.assertRaisesRegex(RuntimeError, "host transfer failed"):
+            _host_array_for_decode_loop(BadArray())
+
+    def test_server_args_exposes_speculative_target_verify_mode(self):
+        from sgl_jax.srt.server_args import ServerArgs
+
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        args = parser.parse_args(
+            ["--model-path", "dummy-model", "--speculative-target-verify-mode", "batched"]
+        )
+        server_args = ServerArgs.from_cli_args(args)
+
+        self.assertEqual(
+            ServerArgs(model_path="dummy-model").speculative_target_verify_mode, "auto"
+        )
+        self.assertEqual(server_args.speculative_target_verify_mode, "batched")
+        with self.assertRaises(ValueError):
+            ServerArgs(
+                model_path="dummy-model",
+                speculative_target_verify_mode="unknown",
+            )
+
     def test_as_int32_array_keeps_host_metadata_on_host(self):
         from sgl_jax.srt.speculative import eagle_util
 
@@ -156,6 +401,17 @@ class TestVerifyTree(CustomTestCase):
             np.asarray(chain.verified_id)[select_index],
             np.array([99, 99, 99, 44], dtype=np.int32),
         )
+        np.testing.assert_array_equal(np.asarray(chain.draft_extend_verified_id), target_predict)
+        np.testing.assert_array_equal(
+            np.asarray(chain.draft_extend_positions),
+            np.arange(bs * num_draft_tokens, dtype=np.int32),
+        )
+        np.testing.assert_array_equal(
+            np.asarray(chain.draft_extend_hidden_states),
+            np.arange(bs * num_draft_tokens * 2, dtype=np.float32).reshape(
+                bs * num_draft_tokens, 2
+            ),
+        )
 
     def test_fused_chain_verify_zeroes_padding_accept_length(self):
         from sgl_jax.srt.speculative.draft_extend_fused import _verify_greedy
@@ -192,6 +448,145 @@ class TestVerifyTree(CustomTestCase):
             np.asarray(out.new_seq_lens),
             np.array([105, 308], dtype=np.int32),
         )
+
+    def test_greedy_verify_can_replicate_gather_outputs(self):
+        from sgl_jax.srt.speculative.draft_extend_fused import _verify_greedy
+
+        mesh = Mesh(np.asarray(jax.devices()), ("data",))
+        data_hidden = NamedSharding(mesh, P("data", None))
+        data_1d = NamedSharding(mesh, P("data"))
+        replicated = NamedSharding(mesh, P())
+        bs = 4
+        num_draft_tokens = 4
+        out = _verify_greedy(
+            target_hidden=jax.device_put(
+                jnp.arange(bs * num_draft_tokens * 2, dtype=jnp.float32).reshape(
+                    bs * num_draft_tokens, 2
+                ),
+                data_hidden,
+            ),
+            positions=jax.device_put(
+                jnp.arange(bs * num_draft_tokens, dtype=jnp.int32),
+                data_1d,
+            ),
+            seq_lens=jax.device_put(
+                jnp.array([10, 20, 30, 40], dtype=jnp.int32),
+                data_1d,
+            ),
+            draft_tokens=jax.device_put(
+                jnp.array(
+                    [
+                        10,
+                        11,
+                        12,
+                        13,
+                        20,
+                        21,
+                        22,
+                        23,
+                        30,
+                        31,
+                        32,
+                        33,
+                        40,
+                        41,
+                        42,
+                        43,
+                    ],
+                    dtype=jnp.int32,
+                ),
+                data_1d,
+            ),
+            target_predict=jax.device_put(
+                jnp.array(
+                    [
+                        11,
+                        12,
+                        99,
+                        14,
+                        21,
+                        99,
+                        23,
+                        24,
+                        31,
+                        32,
+                        33,
+                        34,
+                        41,
+                        42,
+                        43,
+                        44,
+                    ],
+                    dtype=jnp.int32,
+                ),
+                data_1d,
+            ),
+            speculative_num_steps=3,
+            speculative_num_draft_tokens=num_draft_tokens,
+            preserve_gather_sharding=False,
+            gather_out_sharding=replicated,
+        )
+
+        np.testing.assert_array_equal(np.asarray(out.accept_lens), np.array([3, 2, 4, 4]))
+        self.assertTrue(out.hidden_states.is_fully_replicated)
+        self.assertTrue(out.positions.is_fully_replicated)
+
+    def test_gather_rows_can_use_explicit_replicated_out_sharding(self):
+        from sgl_jax.srt.speculative.draft_extend_fused import (
+            _gather_rows_preserve_sharding,
+        )
+
+        mesh = Mesh(np.asarray(jax.devices()), ("data",))
+        values = jax.device_put(
+            jnp.arange(5 * 3, dtype=jnp.float32).reshape(5, 3),
+            NamedSharding(mesh, P("data", None)),
+        )
+        index = jax.device_put(jnp.array([3, 0, 4], dtype=jnp.int32), NamedSharding(mesh, P()))
+        out = _gather_rows_preserve_sharding(
+            values,
+            index,
+            out_sharding=NamedSharding(mesh, P()),
+        )
+
+        np.testing.assert_array_equal(
+            np.asarray(out),
+            np.array([[9, 10, 11], [0, 1, 2], [12, 13, 14]], dtype=np.float32),
+        )
+        self.assertTrue(out.is_fully_replicated)
+
+    def test_decode_loop_output_values_are_device_put_to_target_sharding(self):
+        from sgl_jax.srt.speculative import draft_extend_fused
+
+        mesh = Mesh(np.asarray(jax.devices()), ("data",))
+        data = NamedSharding(mesh, P("data"))
+        calls = []
+        original_device_put = draft_extend_fused.jax.device_put
+
+        def record_device_put(value, sharding):
+            calls.append((value, sharding))
+            return ("placed", value, sharding)
+
+        try:
+            draft_extend_fused.jax.device_put = record_device_put
+            placed = draft_extend_fused._device_put_values(data, "a", "b")
+        finally:
+            draft_extend_fused.jax.device_put = original_device_put
+
+        self.assertEqual(placed, (("placed", "a", data), ("placed", "b", data)))
+        self.assertEqual(calls, [("a", data), ("b", data)])
+
+    def test_decode_loop_output_shardings_use_worker_mesh(self):
+        from sgl_jax.srt.speculative.draft_extend_fused import (
+            _decode_loop_output_shardings,
+        )
+
+        mesh = Mesh(np.asarray(jax.devices()), ("data",))
+        rep, data = _decode_loop_output_shardings(mesh)
+
+        self.assertIs(rep.mesh, mesh)
+        self.assertIs(data.mesh, mesh)
+        self.assertEqual(rep.spec, P())
+        self.assertEqual(data.spec, P("data"))
 
     def test_verify_tree_greedy(self):
         candidates = jnp.array(
