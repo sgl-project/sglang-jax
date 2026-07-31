@@ -1,7 +1,7 @@
 schema_version: 1
-exp_id: exp-us6ys5dhkj
+exp_id: exp-l0eek2ue0t
 spec:
-  name: fused-moe-v2-a2a-operator-analysis
+  name: fused-moe-v2-a2a-operator-analysis-r2
   plugin_names: [operator-analysis]
   params:
     mode: single

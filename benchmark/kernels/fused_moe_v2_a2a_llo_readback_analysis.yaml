@@ -1,0 +1,92 @@
+schema_version: 1
+exp_id: exp-l0eek2ue0t
+spec:
+  name: fused-moe-v2-a2a-artifact-readback-r2
+  command: python3 "$FALCON_SCRIPT_PATH"
+  script_content: |
+    import hashlib
+    import json
+    import os
+    from pathlib import Path
+
+    artifact = Path(os.environ["ARTIFACT_LOCAL_DIR"])
+    result = Path(os.environ["RESULT_LOCAL_DIR"])
+    result.mkdir(parents=True, exist_ok=True)
+
+    handoff_paths = sorted(artifact.glob("rank-*/benchmark/handoff_summary.json"))
+    if not handoff_paths:
+        raise SystemExit("handoff_summary.json not found")
+    handoff = json.loads(handoff_paths[0].read_text())
+    (result / "handoff_summary.json").write_text(
+        json.dumps(handoff, indent=2, sort_keys=True) + "\n"
+    )
+
+    metrics = []
+    for path in sorted(artifact.glob("rank-*/benchmark/metrics.jsonl")):
+        for line in path.read_text().splitlines():
+            if not line:
+                continue
+            row = json.loads(line)
+            row["artifact_path"] = path.relative_to(artifact).as_posix()
+            metrics.append(row)
+    (result / "metrics.json").write_text(
+        json.dumps({"records": metrics}, indent=2, sort_keys=True) + "\n"
+    )
+
+    final_llo_paths = sorted(
+        (artifact / "rank-0" / "compiler" / "llo").glob("*post-finalize-llo.txt")
+    )
+    if not final_llo_paths:
+        raise SystemExit("rank-0 finalized LLO files not found")
+    llo_inventory = []
+    with (result / "rank-0-final-llo.txt").open("w") as output:
+        for path in final_llo_paths:
+            payload = path.read_bytes()
+            relative = path.relative_to(artifact).as_posix()
+            llo_inventory.append(
+                {
+                    "path": relative,
+                    "bytes": len(payload),
+                    "sha256": hashlib.sha256(payload).hexdigest(),
+                }
+            )
+            output.write(f"===== {relative} =====\n")
+            output.write(payload.decode(errors="replace"))
+            output.write("\n")
+
+    report = [
+        "# Fused MoE v2 A2A compiler handoff",
+        "",
+        f"- handoff source: `{handoff_paths[0].relative_to(artifact).as_posix()}`",
+        f"- metric records: {len(metrics)}",
+        f"- rank-0 finalized LLO files: {len(llo_inventory)}",
+        "",
+        "## Finalized LLO inventory",
+        "",
+    ]
+    report.extend(
+        f"- `{row['path']}`: {row['bytes']} bytes, SHA256 `{row['sha256']}`"
+        for row in llo_inventory
+    )
+    (result / "report.md").write_text("\n".join(report) + "\n")
+  outputs:
+    - path: report.md
+      type: markdown
+      required: true
+      description: compiler handoff inventory
+    - path: handoff_summary.json
+      type: json
+      required: true
+      description: topology and logical/physical payload matrices
+    - path: metrics.json
+      type: json
+      required: true
+      description: all per-rank timing records
+    - path: rank-0-final-llo.txt
+      type: text
+      required: true
+      description: concatenated finalized LLO for all rank-0 A2A kernels
+  params:
+    mode: readback
+  resources:
+    memory_limit: 1Gi
