@@ -1,4 +1,4 @@
-name: sgl-jax-fused-moe-v2-a2a-llo-v7x32-r8
+name: sgl-jax-fused-moe-v2-a2a-llo-v7x32-r9
 exp_type: PROFILING
 artifact_type: operator-profile
 cluster_name: tpu-training-antgroup
@@ -36,6 +36,7 @@ role_to_task_spec:
       python3 -m pip install --upgrade --quiet \
         "jax[tpu]==0.9.1" \
         -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+      export SGLJAX_COMMIT="$(git rev-parse HEAD)"
 
       export LIBTPU_INIT_ARGS="--xla_enable_custom_call_region_trace=true --xla_xprof_register_llo_debug_info=true --xla_mosaic_dump_to=$OUT/compiler/llo"
       export JAX_COMPILATION_CACHE_DIR="/tmp/jax_compilation_cache"
@@ -58,6 +59,7 @@ role_to_task_spec:
           "operator_family": "fused_moe",
           "operator_name": "pallas_fused_moe_v2_a2a_scatter_gather",
           "model": "zai-org/GLM-5.2",
+          "source_commit": os.environ["SGLJAX_COMMIT"],
           "hardware": {
               "device_type": "v7x",
               "visible_devices": 32,

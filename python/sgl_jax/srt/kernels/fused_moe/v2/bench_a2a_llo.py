@@ -1045,6 +1045,32 @@ def main() -> None:
             "cases": report_cases,
         },
     )
+    handoff_cases = []
+    for case in report_cases:
+        compact_loads = {}
+        for variant, load in case["physical_load"].items():
+            compact_loads[variant] = {
+                key: value
+                for key, value in load.items()
+                if key
+                not in {
+                    "payload_bytes_matrix",
+                    "per_source_payload_bytes",
+                    "per_destination_payload_bytes",
+                }
+            }
+        handoff_cases.append(
+            {key: value for key, value in case.items() if key not in {"physical_load", "source"}}
+            | {"physical_load": compact_loads}
+        )
+    handoff = {
+        "model": "zai-org/GLM-5.2",
+        "topology": topology,
+        "cases": handoff_cases,
+    }
+    write_json(output_dir / "handoff_summary.json", handoff)
+    if jax.process_index() == 0:
+        print("A2A_HANDOFF_JSON=" + json.dumps(handoff, sort_keys=True), flush=True)
 
 
 if __name__ == "__main__":

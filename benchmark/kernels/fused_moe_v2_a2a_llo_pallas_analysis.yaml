@@ -1,0 +1,7 @@
+schema_version: 1
+exp_id: exp-us6ys5dhkj
+spec:
+  name: fused-moe-v2-a2a-pallas-llo-analysis
+  plugin_names: [pallas-llo-analysis]
+  params:
+    mode: single

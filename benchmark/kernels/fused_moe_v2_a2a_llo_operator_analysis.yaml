@@ -1,0 +1,8 @@
+schema_version: 1
+exp_id: exp-us6ys5dhkj
+spec:
+  name: fused-moe-v2-a2a-operator-analysis
+  plugin_names: [operator-analysis]
+  params:
+    mode: single
+    primary_metric: latency_ms
