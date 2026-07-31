@@ -430,8 +430,16 @@ def build_scatter_runner(
             pl.semaphore_wait(barrier_sem, ep_size)
 
         def scatter_bt(bt_id, _):
-            offsets_smem[...] = jnp.zeros_like(offsets_smem)
-            sends_smem[...] = jnp.zeros_like(sends_smem)
+            def clear_offset(expert_id, _):
+                offsets_smem[expert_id] = jnp.int32(0)
+                return None
+
+            def clear_send(expert_slot, _):
+                sends_smem[expert_slot] = jnp.int32(0)
+                return None
+
+            lax.fori_loop(0, plan.num_experts, clear_offset, None, unroll=False)
+            lax.fori_loop(0, local_experts, clear_send, None, unroll=False)
             bt_start = bt_id * bt
 
             def scatter_one(token_id, _):
