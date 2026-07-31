@@ -448,7 +448,7 @@ def build_scatter_runner(
                 sem=metadata_sems.at[1],
             )
             sizes_copy = pltpu.async_copy(
-                src_ref=sizes_ref.at[pl.ds(bt_id, 1)],
+                src_ref=sizes_ref.at[bt_id],
                 dst_ref=sizes_smem,
                 sem=metadata_sems.at[2],
             )
@@ -576,7 +576,7 @@ def build_scatter_runner(
                 # metadata DMA is aligned to TPU's 128-column tiling.
                 pltpu.SMEM((bt, routing_width), jnp.int32),
                 pltpu.SMEM((ep_size, plan.num_experts), jnp.int32),
-                pltpu.SMEM((1, plan.num_experts), jnp.int32),
+                pltpu.SMEM((8, plan.num_experts), jnp.int32),
                 pltpu.SemaphoreType.DMA((3,)),
                 pltpu.SMEM((plan.num_experts,), jnp.int32),
                 pltpu.SMEM((local_experts,), jnp.int32),
@@ -692,7 +692,7 @@ def build_gather_runner(
                 sem=metadata_sems.at[0],
             )
             sizes_copy = pltpu.async_copy(
-                src_ref=sizes_ref.at[pl.ds(bt_id, 1)],
+                src_ref=sizes_ref.at[bt_id],
                 dst_ref=sizes_smem,
                 sem=metadata_sems.at[1],
             )
@@ -826,7 +826,7 @@ def build_gather_runner(
             out_specs=hbm_spec,
             scratch_shapes=[
                 pltpu.SMEM((ep_size, plan.num_experts), jnp.int32),
-                pltpu.SMEM((1, plan.num_experts), jnp.int32),
+                pltpu.SMEM((8, plan.num_experts), jnp.int32),
                 pltpu.SemaphoreType.DMA((2,)),
                 pltpu.SemaphoreType.DMA((local_experts,)),
                 pltpu.SemaphoreType.DMA,
@@ -955,7 +955,12 @@ def main() -> None:
         topk_global[:, : args.top_k] = plan.topk_ids.reshape(tokens, args.top_k)
         topk_array = _make_array_from_numpy(topk_global, topk_sharding)
         starts_array = _make_array_from_numpy(plan.starts, replicated)
-        sizes_array = _make_array_from_numpy(plan.sizes, replicated)
+        sizes_staging = np.zeros(
+            (plan.num_bt, 8, plan.num_experts),
+            dtype=np.int32,
+        )
+        sizes_staging[:, 0, :] = plan.sizes
+        sizes_array = _make_array_from_numpy(sizes_staging, replicated)
         counts_array = _make_array_from_numpy(plan.counts, replicated)
         case_report = logical_plan_dict(plan)
         case_report["physical_load"] = {}
