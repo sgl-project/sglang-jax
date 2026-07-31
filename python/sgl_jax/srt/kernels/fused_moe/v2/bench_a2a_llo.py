@@ -448,7 +448,7 @@ def build_scatter_runner(
                 sem=metadata_sems.at[1],
             )
             sizes_copy = pltpu.async_copy(
-                src_ref=sizes_ref.at[bt_id],
+                src_ref=sizes_ref.at[pl.ds(bt_id, 1)],
                 dst_ref=sizes_smem,
                 sem=metadata_sems.at[2],
             )
@@ -540,7 +540,7 @@ def build_scatter_runner(
 
                 def wait_recv(expert_slot, _):
                     expert_id = my_id * local_experts + expert_slot
-                    recv_rows = sizes_smem[expert_id]
+                    recv_rows = sizes_smem[0, expert_id]
 
                     @pl.when(recv_rows != 0)
                     def wait(_expert_slot=expert_slot, _recv_rows=recv_rows):
@@ -576,7 +576,7 @@ def build_scatter_runner(
                 # metadata DMA is aligned to TPU's 128-column tiling.
                 pltpu.SMEM((bt, routing_width), jnp.int32),
                 pltpu.SMEM((ep_size, plan.num_experts), jnp.int32),
-                pltpu.SMEM((plan.num_experts,), jnp.int32),
+                pltpu.SMEM((1, plan.num_experts), jnp.int32),
                 pltpu.SemaphoreType.DMA((3,)),
                 pltpu.SMEM((plan.num_experts,), jnp.int32),
                 pltpu.SMEM((local_experts,), jnp.int32),
@@ -692,7 +692,7 @@ def build_gather_runner(
                 sem=metadata_sems.at[0],
             )
             sizes_copy = pltpu.async_copy(
-                src_ref=sizes_ref.at[bt_id],
+                src_ref=sizes_ref.at[pl.ds(bt_id, 1)],
                 dst_ref=sizes_smem,
                 sem=metadata_sems.at[1],
             )
@@ -771,7 +771,7 @@ def build_gather_runner(
 
                 def wait_one_send(expert_slot, _):
                     expert_id = my_id * local_experts + expert_slot
-                    total_rows = sizes_smem[expert_id]
+                    total_rows = sizes_smem[0, expert_id]
                     local_rows = counts_smem[my_id, expert_id]
                     remote_rows = total_rows - local_rows
 
@@ -826,7 +826,7 @@ def build_gather_runner(
             out_specs=hbm_spec,
             scratch_shapes=[
                 pltpu.SMEM((ep_size, plan.num_experts), jnp.int32),
-                pltpu.SMEM((plan.num_experts,), jnp.int32),
+                pltpu.SMEM((1, plan.num_experts), jnp.int32),
                 pltpu.SemaphoreType.DMA((2,)),
                 pltpu.SemaphoreType.DMA((local_experts,)),
                 pltpu.SemaphoreType.DMA,
