@@ -1,0 +1,105 @@
+name: sgl-jax-fused-moe-v2-a2a-llo-v7x32-r1
+exp_type: PROFILING
+artifact_type: operator-profile
+cluster_name: tpu-training-antgroup
+profile: true
+tags: [profile, operator-optimization, fused-moe, pallas, llo, a2a, v7x-32]
+model_version: GLM-5.2
+role_to_task_spec:
+  worker:
+    image: us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.9.0-rev1
+    device_type: v7x
+    device_count: 8
+    device_topo: 2x2x4
+    replica: 4
+    sources:
+      - name: sglang-jax
+        type: git
+        repo: https://github.com/sgl-project/sglang-jax.git
+        ref: dev/fused-moe-a2a-llo
+        path: /workspace/sglang-jax
+    envs:
+      JAX_PLATFORMS: "tpu"
+      PYTHONUNBUFFERED: "1"
+      TMPDIR: "/tmp/tpu_logs/tmp"
+      PIP_CACHE_DIR: "/tmp/tpu_logs/pip-cache"
+      UV_CACHE_DIR: "/tmp/tpu_logs/uv-cache"
+    command: |
+      set -eu
+      ulimit -c 0
+
+      RANK="${FALCON_JAX_PROCESS_ID:-${FALCON_RANK:-0}}"
+      ROOT="${ARTIFACT_LOCAL_DIR:-/tmp/operator-artifact}"
+      OUT="$ROOT/rank-$RANK"
+      mkdir -p "$OUT/benchmark" "$OUT/compiler/llo" "$ROOT/profiling" \
+        /tmp/tpu_logs/tmp /tmp/tpu_logs/pip-cache /tmp/tpu_logs/uv-cache
+
+      cd /workspace/sglang-jax
+      python3 -m pip install --upgrade --quiet \
+        "jax[tpu]==0.9.1" \
+        -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+
+      export LIBTPU_INIT_ARGS="--xla_enable_custom_call_region_trace=true --xla_xprof_register_llo_debug_info=true --xla_mosaic_dump_to=$OUT/compiler/llo"
+      export JAX_COMPILATION_CACHE_DIR="/tmp/jax_compilation_cache"
+      mkdir -p "$JAX_COMPILATION_CACHE_DIR"
+
+      if [ "$RANK" = "0" ]; then
+        python3 - <<'PY'
+      import importlib.metadata as md
+      import json
+      import os
+      from pathlib import Path
+
+      root = Path(os.environ.get("ARTIFACT_LOCAL_DIR", "/tmp/operator-artifact"))
+      versions = {}
+      for package in ("jax", "jaxlib", "libtpu"):
+          versions[package] = md.version(package)
+      (root / "manifest.json").write_text(json.dumps({
+          "schema_version": 1,
+          "workflow": "operator-optimization",
+          "operator_family": "fused_moe",
+          "operator_name": "pallas_fused_moe_v2_a2a_scatter_gather",
+          "model": "zai-org/GLM-5.2",
+          "hardware": {
+              "device_type": "v7x",
+              "visible_devices": 32,
+              "chips": 16,
+              "device_topology": "2x2x4",
+              "hosts": 4,
+          },
+          "dimensions": {
+              "tokens": [512, 16384],
+              "ep_size": 32,
+              "num_experts": 256,
+              "top_k": 8,
+              "hidden_size": 6144,
+              "scatter_dtypes": ["fp8", "bf16"],
+              "gather_dtype": "bf16",
+              "base_bt": 32,
+          },
+          "software": versions,
+      }, indent=2, sort_keys=True))
+      with (root / "profiling" / "python-packages.txt").open("w") as handle:
+          for package, version in sorted(versions.items()):
+              handle.write(f"{package}={version}\n")
+      PY
+        env | sort | grep -E '^(LIBTPU_INIT_ARGS|JAX_|FALCON_)=' \
+          > "$ROOT/profiling/env.txt" || true
+      fi
+
+      if ! python3 python/sgl_jax/srt/kernels/fused_moe/v2/bench_a2a_llo.py \
+        --tokens 512 16384 \
+        --num-experts 256 \
+        --top-k 8 \
+        --hidden-size 6144 \
+        --base-bt 32 \
+        --dp-size 1 \
+        --variants scatter_fp8 scatter_bf16 gather_bf16 \
+        --warmup-runs 2 \
+        --sample-runs 5 \
+        --output-dir "$OUT/benchmark" \
+        > "$OUT/benchmark/run.log" 2>&1; then
+        cat "$OUT/benchmark/run.log"
+        exit 1
+      fi
+      cat "$OUT/benchmark/run.log"
