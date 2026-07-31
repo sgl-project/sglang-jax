@@ -8,7 +8,7 @@ import numpy as np
 from sgl_jax.test.test_utils import CustomTestCase
 
 
-class TestVerifyTree(CustomTestCase):
+class TestFusedEagle(CustomTestCase):
     def test_eagle_overlap_server_args_allow_linear_fa(self):
         from sgl_jax.srt.server_args import ServerArgs
 
