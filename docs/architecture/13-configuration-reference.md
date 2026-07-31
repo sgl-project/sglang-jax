@@ -522,8 +522,9 @@ See [11-quantization](11-quantization.md#112-quantizationconfig).
 
 | Env var | Default | Description |
 |----------|--------|------|
-| `SIMULATE_ACC_LEN` | — | Simulate accept length (testing) |
-| `SIMULATE_ACC_METHOD` | `"multinomial"` | Simulated acceptance method |
+| `SIMULATE_ACC_LEN` | `-1` | Simulated total accept length, including the bonus token; values greater than 0 enable simulation |
+| `SIMULATE_ACC_METHOD` | `"match-expected"` | Acceptance-length sampling method (`match-expected` / `multinomial`) |
+| `SIMULATE_ACC_TOKEN_MODE` | `"fixed"` | Simulated token source (`fixed` / `real-draft-token`); real draft tokens require top-k 1 |
 | `RETURN_ORIGINAL_LOGPROB` | `"false"` | Return original log probability |
 
 ### Data Dump

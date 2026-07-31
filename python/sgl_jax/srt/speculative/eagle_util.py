@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import copy
 import functools
-import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar
@@ -43,9 +42,10 @@ from sgl_jax.srt.mem_cache.common import (
 )
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sgl_jax.srt.speculative.overlap_utils import use_legacy_eagle3_non_overlap
-
-SIMULATE_ACC_LEN = os.environ.get("SIMULATE_ACC_LEN")
-SIMULATE_ACC_METHOD = os.environ.get("SIMULATE_ACC_METHOD", "multinomial")
+from sgl_jax.srt.speculative.spec_utils import (
+    SIMULATED_ACCEPTANCE_CONFIG,
+    apply_simulated_acceptance,
+)
 
 
 def _is_jax_leaf(value: Any) -> bool:
@@ -1107,6 +1107,7 @@ class EagleVerifyInput:
         #     pass
 
         is_all_greedy = sampling_info.is_all_greedy
+        candidates = self.draft_token.reshape(bs, self.draft_token_num)
 
         if is_all_greedy:
             with jax.set_mesh(mesh):
@@ -1121,7 +1122,6 @@ class EagleVerifyInput:
                 )
         else:
             bs = self.retrive_index.shape[0]
-            candidates = self.draft_token.reshape(bs, self.draft_token_num)
             predict_shape = list(logits_output.next_token_logits.shape)[:-1]
             predict_shape[-1] += 1
             predict = jnp.zeros(predict_shape, dtype=jnp.int32)
@@ -1170,17 +1170,25 @@ class EagleVerifyInput:
                 threshold_acc=global_server_args_dict["speculative_accept_threshold_acc"],
                 deterministic=True,
             )
-        if SIMULATE_ACC_LEN:
-            # Do simulation
-            _, rng = jax.random.split(rng.params())
-            accept_index, accept_length, predict = _generate_simulated_accept_index(
+
+        accept_length = accept_length + 1
+        if SIMULATED_ACCEPTANCE_CONFIG.enabled:
+            target_predict = None
+            if SIMULATED_ACCEPTANCE_CONFIG.token_mode == "real-draft-token":
+                target_predict = jnp.argmax(logits_output.next_token_logits, axis=-1).reshape(
+                    bs, self.draft_token_num
+                )
+            simulation_rng = jax.random.split(rng.params())[1]
+            accept_index, predict, accept_length = apply_simulated_acceptance(
                 accept_index=accept_index,
                 predict=predict,
-                accept_length=accept_length,
-                simulate_acc_len=SIMULATE_ACC_LEN,
-                bs=bs,
+                accept_lens=accept_length,
+                candidates=candidates,
+                target_predict=target_predict,
+                valid_mask=accept_index[:, 0] >= 0,
                 spec_steps=self.spec_steps,
-                rng=rng,
+                topk=self.topk,
+                rng=simulation_rng,
             )
 
         for arr in (predict, accept_index, accept_length):
@@ -1190,62 +1198,10 @@ class EagleVerifyInput:
         accept_index = np.asarray(accept_index)
         accept_length = np.asarray(accept_length)
 
-        accept_length = accept_length + 1
         accept_index = accept_index.flatten()
         verified_id = np.zeros_like(accept_index, dtype=predict.dtype)
         verified_id[accept_index != -1] = predict[accept_index[accept_index != -1]]
         return predict, verified_id, accept_length, accept_index
-
-
-def _generate_simulated_accept_index(
-    accept_index: jax.Array,
-    predict,
-    accept_length,
-    simulate_acc_len,
-    bs,
-    spec_steps,
-    rng: nnx.Rngs,
-):
-    simulate_acc_len_float = float(simulate_acc_len)
-    if SIMULATE_ACC_METHOD == "multinomial":
-        # here data is on cpu
-        simulated_values = numpy.random.normal(
-            loc=simulate_acc_len_float,
-            scale=1.0,
-            size=(1,),
-        )
-        # clamp simulated values to be between 1 and self.spec_steps
-        simulated_values = jnp.clip(simulated_values, min=1.0, max=spec_steps + 1)
-        simulate_acc_len = int(simulated_values.round().item())
-    elif SIMULATE_ACC_METHOD == "match-expected":
-        # multinomial sampling does not match the expected length
-        # we keep it for the sake of compatibility of existing tests
-        # but it's better to use "match-expected" for the cases that need to
-        # match the expected length, One caveat is that this will only sample
-        # either round down or round up of the expected length
-        simulate_acc_len_float = max(1.0, min(spec_steps + 1, simulate_acc_len_float))
-        lower = int(simulate_acc_len_float // 1)
-        upper = lower + 1 if lower < spec_steps + 1 else lower
-        if lower == upper:
-            simulate_acc_len = lower
-        else:
-            weight_upper = simulate_acc_len_float - lower
-            weight_lower = 1.0 - weight_upper
-            # here, data is on cpu
-            probs = jnp.array([weight_lower, weight_upper])
-            sampled_index = jax.random.categorical(rng, jnp.log(probs))
-            simulate_acc_len = lower if sampled_index == 0 else upper
-    else:
-        raise ValueError(f"Invalid simulate_acc_method: {SIMULATE_ACC_METHOD}")
-
-    accept_indx_first_col = accept_index[:, 0].reshape(-1, 1)
-    sim_accept_index = jnp.full((bs, spec_steps + 1), -1, dtype=jnp.int32)
-    sim_accept_index = sim_accept_index.at[:, :simulate_acc_len].set(
-        accept_indx_first_col + jnp.arange(simulate_acc_len)
-    )
-    accept_length = accept_length.at[:].set(simulate_acc_len - 1)
-    predict = predict.at[:].set(100)  # some legit token id
-    return sim_accept_index, accept_length, predict
 
 
 def assign_req_to_token_pool(
