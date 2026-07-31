@@ -360,7 +360,13 @@ def _make_constant_array(
     np_dtype = np.dtype(dtype)
 
     def callback(index):
-        local_shape = tuple(part.stop - part.start for part in index)
+        local_shape = []
+        for axis, part in enumerate(index):
+            if isinstance(part, slice):
+                start, stop, step = part.indices(shape[axis])
+                local_shape.append(len(range(start, stop, step)))
+            else:
+                local_shape.append(1)
         return np.ones(local_shape, dtype=np_dtype)
 
     return jax.make_array_from_callback(shape, sharding, callback)

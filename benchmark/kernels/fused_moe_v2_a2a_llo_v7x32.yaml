@@ -1,4 +1,4 @@
-name: sgl-jax-fused-moe-v2-a2a-llo-v7x32-r1
+name: sgl-jax-fused-moe-v2-a2a-llo-v7x32-r2
 exp_type: PROFILING
 artifact_type: operator-profile
 cluster_name: tpu-training-antgroup
@@ -12,12 +12,6 @@ role_to_task_spec:
     device_count: 8
     device_topo: 2x2x4
     replica: 4
-    sources:
-      - name: sglang-jax
-        type: git
-        repo: https://github.com/sgl-project/sglang-jax.git
-        ref: dev/fused-moe-a2a-llo
-        path: /workspace/sglang-jax
     envs:
       JAX_PLATFORMS: "tpu"
       PYTHONUNBUFFERED: "1"
@@ -34,6 +28,10 @@ role_to_task_spec:
       mkdir -p "$OUT/benchmark" "$OUT/compiler/llo" "$ROOT/profiling" \
         /tmp/tpu_logs/tmp /tmp/tpu_logs/pip-cache /tmp/tpu_logs/uv-cache
 
+      if [ ! -d /workspace/sglang-jax/.git ]; then
+        git clone --depth 1 --branch dev/fused-moe-a2a-llo \
+          https://github.com/sgl-project/sglang-jax.git /workspace/sglang-jax
+      fi
       cd /workspace/sglang-jax
       python3 -m pip install --upgrade --quiet \
         "jax[tpu]==0.9.1" \
