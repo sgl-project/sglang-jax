@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -8,6 +9,13 @@ import numpy as np
 from jax.tree_util import register_pytree_node_class
 
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode
+from sgl_jax.srt.speculative.spec_info import (
+    SpecConcatPolicy,
+    SpecDraftStateMixin,
+    SpecRelayPolicy,
+    SpecStateField,
+    SpecStateLayout,
+)
 
 
 def _mask_draft_kv_writes(
@@ -125,8 +133,37 @@ def dflash_greedy_verify(
 
 
 @dataclass
-class DFlashDraftInput:
+class DFlashDraftInput(SpecDraftStateMixin):
     """Host-side DFlash state carried between decode iterations."""
+
+    STATE_LAYOUT: ClassVar[SpecStateLayout] = SpecStateLayout(
+        name="DFLASH",
+        fields=(
+            SpecStateField(
+                "verified_id",
+                relay=SpecRelayPolicy.DROP,
+                required_for_scatter=True,
+            ),
+            SpecStateField(
+                "target_hidden",
+                concat=SpecConcatPolicy.EMPTY_IS_NONE,
+            ),
+            SpecStateField(
+                "ctx_lens",
+                relay=SpecRelayPolicy.DROP,
+                required_for_scatter=True,
+            ),
+            SpecStateField(
+                "draft_seq_lens",
+                relay=SpecRelayPolicy.DROP,
+                required_for_scatter=True,
+            ),
+            SpecStateField("allocate_lens", relay=SpecRelayPolicy.KEEP),
+            SpecStateField("reservation_base_lens", relay=SpecRelayPolicy.KEEP),
+            SpecStateField("future_indices", relay=SpecRelayPolicy.KEEP),
+        ),
+        static_fields=("block_size",),
+    )
 
     verified_id: jax.Array | np.ndarray = None
     target_hidden: jax.Array | None = None

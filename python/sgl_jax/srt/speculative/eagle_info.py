@@ -22,7 +22,14 @@ from sgl_jax.srt.mem_cache.common import (
 )
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sgl_jax.srt.speculative.overlap_utils import uses_host_eagle_state
-from sgl_jax.srt.speculative.spec_info import assign_req_to_token_pool
+from sgl_jax.srt.speculative.spec_info import (
+    SpecConcatPolicy,
+    SpecDraftStateMixin,
+    SpecRelayPolicy,
+    SpecStateField,
+    SpecStateLayout,
+    assign_req_to_token_pool,
+)
 
 if TYPE_CHECKING:
     from sgl_jax.srt.managers.scheduler import GenerationBatchResult
@@ -58,7 +65,7 @@ def _as_int32_array(value: Any, *, fallback: int = -1) -> Any:
 
 @register_pytree_node_class
 @dataclass
-class EagleDraftInput:
+class EagleDraftInput(SpecDraftStateMixin):
     """Next-round draft state — the only persistent cross-round spec state.
 
     MUST NOT hold worker/runner/pool/future handles.
@@ -66,6 +73,38 @@ class EagleDraftInput:
     """
 
     ALLOC_LEN_PER_DECODE: ClassVar[int] = None
+    STATE_LAYOUT: ClassVar[SpecStateLayout] = SpecStateLayout(
+        name="EAGLE",
+        fields=(
+            SpecStateField(
+                "topk_index",
+                required_for_split=True,
+                data_sharded=True,
+            ),
+            SpecStateField("hidden_states", required_for_split=True),
+            SpecStateField(
+                "verified_id",
+                required_for_split=True,
+                data_sharded=True,
+            ),
+            SpecStateField("allocate_lens", relay=SpecRelayPolicy.KEEP),
+            SpecStateField(
+                "accept_length",
+                preserve_compact_on_host=True,
+                concat=SpecConcatPolicy.DROP_IF_PARTIAL,
+            ),
+            SpecStateField(
+                "accept_length_cpu",
+                relay=SpecRelayPolicy.KEEP,
+                preserve_compact_on_host=True,
+                concat=SpecConcatPolicy.DROP_IF_PARTIAL,
+            ),
+            SpecStateField("new_seq_lens", relay=SpecRelayPolicy.KEEP),
+            SpecStateField("future_indices", relay=SpecRelayPolicy.KEEP),
+        ),
+        static_fields=("capture_hidden_mode",),
+        ensure_host_before_split=True,
+    )
 
     # --- Cross-round draft state (device arrays, consumed by next draft) ---
     #: device ``(b, width)`` — raw draft-vocabulary token ids. Width is one
@@ -160,9 +199,9 @@ class EagleDraftInput:
 
     def prepare_for_extend_after_target_prefill(self, model_worker_batch: ModelWorkerBatch):
         # Prefill only generate 1 token.
-        assert self.verified_id.shape[0] == model_worker_batch.real_bs, (
-            f"{self.verified_id.shape=} {model_worker_batch.real_bs=}"
-        )
+        assert (
+            self.verified_id.shape[0] == model_worker_batch.real_bs
+        ), f"{self.verified_id.shape=} {model_worker_batch.real_bs=}"
 
         # Walk the DP-padded layout in (rank, slot) order so token offsets line
         # up with mwb.input_ids' token-major DP layout. Iterating real_bs and
@@ -303,9 +342,9 @@ class EagleDraftInput:
         # back to global-flat. (#1053 P1-5b — was dp_rank=0 for all, so rank>0
         # reqs allocated from rank 0's pool / updated swa_mapping[0].)
         bs = schedule_batch.batch_size()
-        assert self.allocate_lens.shape[0] == bs, (
-            f" {self.allocate_lens.shape[0]=} but batch_size is {bs} "
-        )
+        assert (
+            self.allocate_lens.shape[0] == bs
+        ), f" {self.allocate_lens.shape[0]=} but batch_size is {bs} "
         page_size = schedule_batch.token_to_kv_pool_allocator.page_size
         new_alloc_chunks = []
         flat_off = 0
@@ -421,22 +460,6 @@ class EagleDraftInput:
                 self.allocate_lens = np.asarray(self.allocate_lens)[new_indices]
             if self.new_seq_lens is not None:
                 self.new_seq_lens = np.asarray(self.new_seq_lens)[new_indices]
-
-    def trim_to_length(self, n: int):
-        self._ensure_host()
-        for f in (
-            "topk_index",
-            "hidden_states",
-            "verified_id",
-            "allocate_lens",
-            "new_seq_lens",
-            "accept_length",
-            "accept_length_cpu",
-            "future_indices",
-        ):
-            v = getattr(self, f, None)
-            if v is not None and len(v) != n:
-                setattr(self, f, np.asarray(v)[:n])
 
     def merge_batch(self, spec_info: EagleDraftInput):
         if self.future_indices is not None or spec_info.future_indices is not None:

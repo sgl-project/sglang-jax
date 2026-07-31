@@ -62,8 +62,11 @@ from sgl_jax.srt.speculative.overlap_utils import uses_host_eagle_state
 from sgl_jax.srt.utils.common_utils import get_bool_env_var, pad_to_bucket
 
 if TYPE_CHECKING:
-    from sgl_jax.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
-    from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
+    from sgl_jax.srt.speculative.spec_info import (
+        SpecDraftState,
+        SpecForwardInput,
+        SpeculativeAlgorithm,
+    )
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
@@ -734,7 +737,7 @@ class ScheduleReqsInfo:
     extend_input_logprob_token_ids: np.ndarray | None = None
 
     # Speculative decoding info (per DP)
-    spec_info: EagleDraftInput | EagleVerifyInput | None = None
+    spec_info: SpecDraftState | None = None
 
     # Whether this DP rank's batch is full
     batch_is_full: bool = False
@@ -1660,9 +1663,7 @@ class ScheduleBatch:
         # prepare_for_decode requires cross-rank-flat allocate_lens
         # (asserts shape[0] == batch_size); rebuild via _concat, run it, then
         # split allocate_lens back to per-rank.
-        if self.spec_algorithm is not None and (
-            self.spec_algorithm.is_eagle() or self.spec_algorithm.is_dflash()
-        ):
+        if self.spec_algorithm is not None and not self.spec_algorithm.is_none():
             for info in self.reqs_info:
                 if not info.reqs:
                     info.input_ids = None
@@ -1701,9 +1702,6 @@ class ScheduleBatch:
                 continue
 
             bs = len(reqs)
-
-            if self.spec_algorithm is not None and not self.spec_algorithm.is_none():
-                continue  # Skip to next DP rank
 
             # Handle penalizer if required
             if info.sampling_info.penalizer_orchestrator.is_required:
@@ -1880,7 +1878,7 @@ class ScheduleBatch:
             if info.sampling_info is not None:
                 info.sampling_info.filter_batch(np.array(keep_indices_dp))
 
-            # Filter spec_info (per-rank EagleDraftInput; handles all 5 spec arrays).
+            # Filter per-rank speculative state together with the requests.
             if info.spec_info is not None:
                 if chunked_req_to_exclude is not None and len(chunked_req_to_exclude) > 0:
                     has_been_filtered = False
@@ -2528,11 +2526,11 @@ class ScheduleBatch:
     ) -> ModelWorkerBatch:
         """DP-aware spec-decode ModelWorkerBatch (#1053 P1-5b).
 
-        Reuses the nospec ``_merge_*`` helpers for per-rank seq_lens /
-        req_pool_indices / sampling_info. ``spec_info`` is global (DP-padded
-        order, see ``EagleDraftInput`` docstring) and lives only on
-        ``reqs_info[0]``. ``input_ids``/``positions``/``cache_loc`` are
-        placeholders — ``EagleDraftWorker.padding_for_decode`` rebuilds them.
+        Reuses the nospec ``_merge_*`` helpers for per-rank seq_lens,
+        req_pool_indices, and sampling_info. Per-rank draft state is combined
+        and scattered into DP-padded order before dispatch. Input ids,
+        positions, and cache locations are placeholders rebuilt by the
+        speculative draft worker.
         """
         # Pin total_bs to the largest precompile bucket so every cell shares
         # one jit cache entry regardless of runtime bs. Without this, each
@@ -2578,14 +2576,12 @@ class ScheduleBatch:
                 f"future_indices length mismatch on dp_rank={dp_rank}: "
                 f"{len(future_indices)=}, {num_reqs=}"
             )
-        # Concat per-rank spec_info into a cross-rank-flat EagleDraftInput,
+        # Concat per-rank spec_info into a cross-rank-flat draft state,
         # then scatter into DP-padded (total_bs, ...) slots so spec_info[i]
         # aligns with seq_lens[i]. Returns a new object — does not mutate
         # the per-rank cross-round state on reqs_info[r].spec_info.
         flat_spec = self._concat_spec_info_per_rank([info.spec_info for info in self.reqs_info])
-        uses_host_state = uses_host_eagle_state(
-            self.enable_overlap, self.spec_algorithm
-        )
+        uses_host_state = uses_host_eagle_state(self.enable_overlap, self.spec_algorithm)
         spec_info = self._scatter_spec_info_to_dp_slots(
             flat_spec,
             logits_indices_selector,
@@ -2611,7 +2607,7 @@ class ScheduleBatch:
         # smaller draft-token count, otherwise high-running batches can escape
         # precompile with shapes like 656/928/1024.
         max_chunk_len = max((len(c) for c in ocl_chunks), default=0)
-        if uses_host_eagle_state(self.enable_overlap, self.spec_algorithm):
+        if uses_host_state:
             target_per_rank_ocl = max(per_dp_bs * draft_token_num, max_chunk_len)
         else:
             target_per_rank_ocl = per_dp_bs * draft_token_num * 2
@@ -2678,323 +2674,31 @@ class ScheduleBatch:
         mesh: mesh_lib.Mesh = None,
         host_state_scatter: bool = False,
     ):
-        """Scatter global-flat spec_info arrays into DP-padded ``(total_bs, …)``.
-
-        ``selector[k]`` is the DP-padded slot of the k-th global-flat req
-        (== ``logits_indices_selector``). Returns a new ``EagleDraftInput``;
-        the cross-round flat state on ``reqs_info[r].spec_info`` is unchanged.
-        """
-        from sgl_jax.srt.speculative.dflash_info import DFlashDraftInput
-
-        if isinstance(flat, DFlashDraftInput):
-
-            def _scatter_dflash_1d(arr, field: str, *, fill_value: int = 0):
-                if arr is None:
-                    raise ValueError(f"DFLASH state field {field!r} is missing before DP scatter.")
-                a = np.asarray(arr)
-                if a.shape[0] != len(selector):
-                    raise ValueError(
-                        "DFLASH state length does not match real request slots before DP scatter: "
-                        f"field={field}, state_bs={a.shape[0]}, real_bs={len(selector)}."
-                    )
-                out = np.full((total_bs,), fill_value, dtype=a.dtype)
-                out[selector] = a
-                return out
-
-            def _scatter_dflash_hidden(arr):
-                if arr is None:
-                    return None
-                a = np.asarray(arr)
-                if a.shape[0] != len(selector):
-                    return None
-                out = np.zeros((total_bs,) + a.shape[1:], dtype=a.dtype)
-                out[selector] = a
-                return out
-
-            relay_state = flat.future_indices is not None
-            return DFlashDraftInput(
-                verified_id=(
-                    None if relay_state else _scatter_dflash_1d(flat.verified_id, "verified_id")
-                ),
-                target_hidden=_scatter_dflash_hidden(flat.target_hidden),
-                ctx_lens=(None if relay_state else _scatter_dflash_1d(flat.ctx_lens, "ctx_lens")),
-                draft_seq_lens=(
-                    None
-                    if relay_state
-                    else _scatter_dflash_1d(flat.draft_seq_lens, "draft_seq_lens")
-                ),
-                allocate_lens=(
-                    None
-                    if flat.allocate_lens is None
-                    else _scatter_dflash_1d(flat.allocate_lens, "allocate_lens")
-                ),
-                reservation_base_lens=(
-                    None
-                    if flat.reservation_base_lens is None
-                    else _scatter_dflash_1d(flat.reservation_base_lens, "reservation_base_lens")
-                ),
-                future_indices=(
-                    None
-                    if flat.future_indices is None
-                    else _scatter_dflash_1d(flat.future_indices, "future_indices")
-                ),
-                block_size=flat.block_size,
-            )
-
-        def _scatter1(arr, *, require_selector_len: bool = True, data_sharded: bool = False):
-            if arr is None:
-                return None
-            a = np.asarray(arr)
-            if require_selector_len and a.shape[0] != len(selector):
-                return None
-            out = np.zeros((total_bs,) + a.shape[1:], dtype=a.dtype)
-            out[selector] = a
-            if data_sharded and mesh is not None:
-                from jax.sharding import NamedSharding
-                from jax.sharding import PartitionSpec as P
-
-                return jax.device_put(out, NamedSharding(mesh, P("data")))
-            return out
-
-        if host_state_scatter:
-            return type(flat)(
-                topk_index=_scatter1(flat.topk_index),
-                hidden_states=_scatter1(flat.hidden_states),
-                verified_id=_scatter1(flat.verified_id),
-                allocate_lens=_scatter1(flat.allocate_lens),
-                capture_hidden_mode=flat.capture_hidden_mode,
-                accept_length=flat.accept_length,
-                accept_length_cpu=flat.accept_length_cpu,
-                new_seq_lens=_scatter1(flat.new_seq_lens),
-                future_indices=_scatter1(flat.future_indices),
-            )
-
-        return type(flat)(
-            topk_index=_scatter1(flat.topk_index, data_sharded=True),
-            hidden_states=_scatter1(flat.hidden_states),
-            verified_id=_scatter1(flat.verified_id, data_sharded=True),
-            allocate_lens=_scatter1(flat.allocate_lens),
-            capture_hidden_mode=flat.capture_hidden_mode,
-            accept_length=_scatter1(flat.accept_length),
-            accept_length_cpu=_scatter1(flat.accept_length_cpu),
-            new_seq_lens=_scatter1(flat.new_seq_lens),
-            future_indices=_scatter1(flat.future_indices),
+        """Scatter compact draft state into DP-padded request slots."""
+        return flat.scatter_to_dp_slots(
+            selector,
+            total_bs,
+            mesh=mesh,
+            host_state_scatter=host_state_scatter,
         )
 
     @staticmethod
     def _split_spec_info_per_rank(flat, real_bs_per_dp: list[int]) -> list:
-        """Slice a cross-rank-flat EagleDraftInput into per-rank EagleDraftInputs.
-
-        ``flat`` layout is ``[rank0 reqs ++ rank1 reqs ++ …]`` with total length
-        ``sum(real_bs_per_dp)``. Empty ranks (``real_bs == 0``) yield ``None``.
-        Used at forward output boundary to write back ``reqs_info[r].spec_info``.
-        """
+        """Split rank-major compact draft state into one state per DP rank."""
         if flat is None:
             return [None] * len(real_bs_per_dp)
-
-        from sgl_jax.srt.speculative.dflash_info import DFlashDraftInput
-
-        if isinstance(flat, DFlashDraftInput):
-
-            def _slice(v, start: int, end: int):
-                return None if v is None else v[start:end]
-
-            relay_state = flat.future_indices is not None
-            out = []
-            offset = 0
-            for n in real_bs_per_dp:
-                if n == 0:
-                    out.append(None)
-                    continue
-
-                end = offset + n
-                out.append(
-                    DFlashDraftInput(
-                        verified_id=(
-                            None if relay_state else _slice(flat.verified_id, offset, end)
-                        ),
-                        target_hidden=(
-                            None if relay_state else _slice(flat.target_hidden, offset, end)
-                        ),
-                        ctx_lens=None if relay_state else _slice(flat.ctx_lens, offset, end),
-                        draft_seq_lens=(
-                            None if relay_state else _slice(flat.draft_seq_lens, offset, end)
-                        ),
-                        allocate_lens=_slice(flat.allocate_lens, offset, end),
-                        reservation_base_lens=_slice(flat.reservation_base_lens, offset, end),
-                        future_indices=_slice(flat.future_indices, offset, end),
-                        block_size=flat.block_size,
-                    )
-                )
-                offset = end
-            return out
-
-        has_future_indices = getattr(flat, "future_indices", None) is not None
-        if not has_future_indices:
-            flat._ensure_host()
-            required_fields = ("topk_index", "hidden_states", "verified_id")
-            missing = [f for f in required_fields if getattr(flat, f, None) is None]
-            if missing:
-
-                def _field_state(v):
-                    if v is None:
-                        return None
-                    shape = getattr(v, "shape", None)
-                    if shape is not None:
-                        return shape
-                    return len(v)
-
-                field_states = {
-                    f: _field_state(getattr(flat, f, None))
-                    for f in (
-                        "topk_index",
-                        "hidden_states",
-                        "verified_id",
-                        "allocate_lens",
-                        "accept_length",
-                        "accept_length_cpu",
-                        "new_seq_lens",
-                        "future_indices",
-                    )
-                }
-                raise RuntimeError(
-                    "_split_spec_info_per_rank got incomplete EagleDraftInput "
-                    f"missing={missing}, "
-                    f"field_states={field_states}, real_bs_per_dp={real_bs_per_dp}"
-                )
-
-        per_req_fields = (
-            "topk_index",
-            "hidden_states",
-            "verified_id",
-            "allocate_lens",
-            "accept_length",
-            "accept_length_cpu",
-            "new_seq_lens",
-            "future_indices",
-        )
-
-        out = []
-        offset = 0
-        for n in real_bs_per_dp:
-            if n == 0:
-                out.append(None)
-                continue
-            kwargs = {"capture_hidden_mode": flat.capture_hidden_mode}
-            for f in per_req_fields:
-                v = getattr(flat, f, None)
-                if has_future_indices and f not in (
-                    "allocate_lens",
-                    "new_seq_lens",
-                    "accept_length_cpu",
-                    "future_indices",
-                ):
-                    kwargs[f] = None
-                else:
-                    kwargs[f] = None if v is None else v[offset : offset + n]
-            out.append(type(flat)(**kwargs))
-            offset += n
-        return out
+        return flat.split_per_rank(real_bs_per_dp)
 
     @staticmethod
     def _concat_spec_info_per_rank(per_rank: list):
-        """Concat per-rank draft inputs into a single cross-rank-flat one.
-
-        ``None`` entries are skipped. Returns ``None`` if every entry is ``None``.
-        Used at forward input boundary (``_get_spec_decode_mwb_dp``) to build the
-        flat shape ``_scatter_spec_info_to_dp_slots`` expects.
-        """
-        from sgl_jax.srt.speculative.dflash_info import DFlashDraftInput
-
+        """Concatenate per-rank draft state into rank-major compact state."""
         nonempty = [s for s in per_rank if s is not None]
         if not nonempty:
             return None
-
-        is_dflash = isinstance(nonempty[0], DFlashDraftInput)
-        if is_dflash:
-            has_future_indices = any(s.future_indices is not None for s in nonempty)
-            if has_future_indices and not all(s.future_indices is not None for s in nonempty):
-                raise ValueError(
-                    "DFLASH overlap concat requires future_indices on every nonempty rank."
-                )
-            per_req_fields = (
-                "verified_id",
-                "ctx_lens",
-                "draft_seq_lens",
-                "target_hidden",
-                "allocate_lens",
-                "reservation_base_lens",
-                "future_indices",
-            )
-        else:
-            has_future_indices = any(
-                getattr(s, "future_indices", None) is not None for s in nonempty
-            )
-            if has_future_indices:
-                assert all(getattr(s, "future_indices", None) is not None for s in nonempty), (
-                    "_concat_spec_info_per_rank requires every nonempty rank to carry "
-                    "future_indices on the relay-buffer path"
-                )
-
-            per_req_fields = (
-                "topk_index",
-                "hidden_states",
-                "verified_id",
-                "allocate_lens",
-                "accept_length",
-                "accept_length_cpu",
-                "new_seq_lens",
-                "future_indices",
-            )
-
-        kwargs = {} if is_dflash else {"capture_hidden_mode": nonempty[0].capture_hidden_mode}
-        if is_dflash:
-            kwargs["block_size"] = nonempty[0].block_size
-        for f in per_req_fields:
-            vals = [getattr(s, f, None) for s in nonempty]
-            if (
-                is_dflash
-                and has_future_indices
-                and f
-                in (
-                    "verified_id",
-                    "ctx_lens",
-                    "draft_seq_lens",
-                    "target_hidden",
-                )
-            ):
-                kwargs[f] = None
-                continue
-            if is_dflash and f == "target_hidden":
-                materialized = [v for v in vals if v is not None and v.shape[0] > 0]
-                if not materialized:
-                    kwargs[f] = None
-                    continue
-            nonnull = [v for v in vals if v is not None]
-            if not nonnull:
-                kwargs[f] = None
-                continue
-            if f in ("accept_length", "accept_length_cpu") and len(nonnull) != len(nonempty):
-                kwargs[f] = None
-                continue
-            # All nonempty ranks should agree on which optional fields they
-            # carry — they came from the same per-rank verify split. A partial
-            # mix means the concat length would silently drift from
-            # ``sum(real_bs_per_dp)``; fail loudly instead.
-            assert len(nonnull) == len(nonempty), (
-                f"_concat_spec_info_per_rank: field {f!r} is None on "
-                f"{len(nonempty) - len(nonnull)}/{len(nonempty)} nonempty rank(s); "
-                "all-or-nothing required"
-            )
-            if len(nonnull) == 1:
-                kwargs[f] = nonnull[0]
-                continue
-            if isinstance(nonnull[0], np.ndarray):
-                kwargs[f] = np.concatenate(nonnull, axis=0)
-            else:
-                nonnull = [np.asarray(v) for v in nonnull]
-                kwargs[f] = np.concatenate(nonnull, axis=0)
-        return type(nonempty[0])(**kwargs)
+        state_type = type(nonempty[0])
+        if not all(type(state) is state_type for state in nonempty):
+            raise TypeError("Cannot concatenate different speculative draft state types.")
+        return state_type.concat_per_rank(nonempty)
 
     def get_model_worker_batch(
         self,
@@ -3685,10 +3389,10 @@ class ModelWorkerBatch:
     forward_batch: Any | None = None
 
     # Cross-rank-flat (or scatter-padded under dp>1) spec input at forward
-    # entry. Forward internals may mutate it through EagleVerifyInput before
-    # returning a fresh EagleDraftInput. Scheduler-persisted per-rank spec
+    # entry. Forward internals may replace it with algorithm-specific verify
+    # state before returning fresh draft state. Scheduler-persisted per-rank
     # state lives on ScheduleBatch.reqs_info[r].spec_info.
-    spec_info_padded: EagleDraftInput | EagleVerifyInput | None = None
+    spec_info_padded: SpecForwardInput | None = None
     spec_algorithm: SpeculativeAlgorithm = None
     speculative_num_steps: int = 0
     speculative_eagle_topk: int = 0

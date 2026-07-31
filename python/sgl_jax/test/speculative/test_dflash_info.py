@@ -102,6 +102,29 @@ def test_dflash_draft_input_filter_batch():
     np.testing.assert_array_equal(di.draft_seq_lens, np.array([7, 5], dtype=np.int32))
 
 
+def test_dflash_draft_input_trim_to_length():
+    di = DFlashDraftInput(
+        verified_id=np.array([10, 20, 30], dtype=np.int32),
+        target_hidden=jnp.arange(12, dtype=jnp.float32).reshape(3, 4),
+        ctx_lens=np.array([1, 2, 3], dtype=np.int32),
+        draft_seq_lens=np.array([5, 6, 7], dtype=np.int32),
+        allocate_lens=np.array([8, 9, 10], dtype=np.int32),
+        reservation_base_lens=np.array([4, 5, 6], dtype=np.int32),
+    )
+
+    di.trim_to_length(2)
+
+    np.testing.assert_array_equal(di.verified_id, np.array([10, 20], dtype=np.int32))
+    np.testing.assert_array_equal(di.ctx_lens, np.array([1, 2], dtype=np.int32))
+    np.testing.assert_array_equal(di.draft_seq_lens, np.array([5, 6], dtype=np.int32))
+    np.testing.assert_array_equal(di.allocate_lens, np.array([8, 9], dtype=np.int32))
+    np.testing.assert_array_equal(
+        di.reservation_base_lens,
+        np.array([4, 5], dtype=np.int32),
+    )
+    assert di.target_hidden.shape == (2, 4)
+
+
 def test_dflash_draft_input_new_tokens_required_next_decode_page_aligned():
     class Req:
         def __init__(self, committed, allocated):
