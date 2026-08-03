@@ -31,7 +31,6 @@ from jax._src import mesh as mesh_lib
 
 from sgl_jax.global_config import global_config
 from sgl_jax.srt.configs.model_config import ModelConfig
-from sgl_jax.srt.managers.mm_utils import build_mm_embed_plan
 from sgl_jax.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
@@ -49,11 +48,11 @@ from sgl_jax.srt.mem_cache.common import (
     release_kv_cache,
 )
 from sgl_jax.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
-from sgl_jax.srt.mem_cache.radix_cache import RadixKey
+from sgl_jax.srt.mem_cache.radix_cache import RadixKey, request_cache_key_ids
 from sgl_jax.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
-from sgl_jax.srt.multimodal.common.mm_plan import MultimodalEmbedPlan
 from sgl_jax.srt.multimodal.common.modality_enum import MultimodalInputs
+from sgl_jax.srt.multimodal.in_model.host_orchestration import build_multimodal_batch
 from sgl_jax.srt.precision_tracer import (
     PrecisionTracerRequestMetadata,
     precision_tracer,
@@ -80,6 +79,8 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "speculative_accept_threshold_acc",
     "enable_deterministic_sampling",
     "pd_disaggregation",
+    "precompile_vision_patch_paddings",
+    "vision_encoder_parallel",
 ]
 
 PADDING_BUCKETS = [1 << i for i in range(6, 21)]
@@ -516,19 +517,9 @@ class Req:
         max_prefix_len = max(max_prefix_len, 0)
         return self.fill_ids[:max_prefix_len]
 
-    def match_key_ids(self):
-        """Prefix ids for the radix key. Uses hash-substituted ``cache_input_ids``
-        when set (to distinguish multimodal content) but keeps ``fill_ids`` as the
-        real model input; length is identical to ``adjust_max_prefix_ids`` so
-        ``extend_input_len`` math is unchanged.
-        """
+    def match_key_ids(self) -> list[int]:
         real_prefix = self.adjust_max_prefix_ids()
-        if self.cache_input_ids is None:
-            return real_prefix
-        key_fill = (
-            self.cache_input_ids + self.output_ids if self.output_ids else self.cache_input_ids
-        )
-        return key_fill[: len(real_prefix)]
+        return request_cache_key_ids(self, real_prefix)
 
     def pop_committed_kv_cache(self) -> int:
         # Idempotent: the PD prefill abort path can run release a second time
@@ -986,19 +977,6 @@ class ScheduleBatch:
     @property
     def batch_is_full(self) -> bool:
         return all(info.batch_is_full for info in self.reqs_info)
-
-    def contains_mm_inputs(self) -> bool:
-        """Whether any request in this batch carries multimodal inputs.
-
-        Mirrors the per-req mm detection used by ``_merge_multimodal`` /
-        ``build_mm_embed_plan`` so pure-text batches skip all multimodal work.
-        """
-        return any(
-            getattr(req, "mm_inputs", None) is not None
-            for info in self.reqs_info
-            if info.reqs
-            for req in info.reqs
-        )
 
     def batch_size(self) -> int:
         """Get total number of requests across all DP ranks."""
@@ -3180,18 +3158,16 @@ class ScheduleBatch:
         mrope_positions = _mm["mrope_positions"]
         apply_for_deepstack = _mm["apply_for_deepstack"]
         deepstack_visual_embedding = _mm["deepstack_visual_embedding"]
-        # Build the vision encode/merge plan only for ordinary prefill. Other
-        # forward modes leave the plan unset, and the runner treats a non-None
-        # plan as the sole vision-forward signal.
-        if self.contains_mm_inputs() and self.forward_mode == ForwardMode.EXTEND:
-            mm_embed_plan = build_mm_embed_plan(
+        # Keep items whose placeholder rows intersect the current extend window.
+        if self.forward_mode == ForwardMode.EXTEND:
+            multimodal_batch = build_multimodal_batch(
                 self.reqs_info,
                 self.dp_size,
                 self.model_config,
                 per_dp_token_padding,
             )
         else:
-            mm_embed_plan = None
+            multimodal_batch = None
 
         # Merge per-DP top_logprobs_nums / token_ids_logprobs with the same
         # offset_bs += per_dp_bs_padding padding scheme used in _merge_batch_metadata.
@@ -3296,7 +3272,7 @@ class ScheduleBatch:
             per_dp_bs_size=per_dp_bs_padding,
             launch_done=self.launch_done,
             input_embedding=input_embedding,
-            mm_embed_plan=mm_embed_plan,
+            multimodal_batch=multimodal_batch,
             apply_for_deepstack=apply_for_deepstack,
             deepstack_visual_embedding=deepstack_visual_embedding,
             recurrent_indices=recurrent_indices_cpu,
@@ -3749,9 +3725,8 @@ class ModelWorkerBatch:
     tree_cache: BasePrefixCache = None
 
     input_embedding: np.ndarray | None = None
-    # In-model VLM owning-rank DP embed plan (host-side). Array leaves get
-    # device_put in ForwardBatch.init_new; never a backbone-JIT pytree child.
-    mm_embed_plan: MultimodalEmbedPlan | None = None
+
+    multimodal_batch: object | None = None
     apply_for_deepstack: bool = False
     deepstack_visual_embedding: np.ndarray | None = None
 
