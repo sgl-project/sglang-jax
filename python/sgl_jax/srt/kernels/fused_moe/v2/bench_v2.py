@@ -15,6 +15,9 @@ Env vars:
   BENCH_DIRECT_SCALED_DOT — 1 to use direct-scaled-dot for both FFN1/FFN2
   BENCH_INTERLEAVE_BT — comma-separated 0/1 interleave BT gather banking
   BENCH_TUNE    — 1 to auto-generate bt/bf candidates
+  BENCH_MAX_CONFIGS — maximum auto-tune candidates per token shape (default: 48)
+  BENCH_TUNE_VMEM_HEADROOM — VMEM budget ratio used by the tuner (default: 0.95)
+  BENCH_JSONL   — optional path for rank-0 structured measurements
   BENCH_WARMUP  — warmup iterations (default: 2)
   BENCH_ITERS   — timed iterations (default: 5)
   BENCH_CHECK   — 1 to run correctness check (single-host only)
@@ -47,7 +50,7 @@ TRACE_ROOT = "/tmp/tpu_logs/v2_trace"
 
 
 def log(msg):
-    print(f"[{time.time()-t0:.1f}s][p{jax.process_index()}] {msg}", flush=True)
+    print(f"[{time.time() - t0:.1f}s][p{jax.process_index()}] {msg}", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -285,6 +288,9 @@ use_fp8 = os.environ.get("BENCH_FP8", "0") == "1"
 _qbk_str = os.environ.get("BENCH_QBK", "128")
 quant_block_k = None if _qbk_str.lower() == "none" else int(_qbk_str)
 tune_mode = os.environ.get("BENCH_TUNE", "0") == "1"
+tune_max_configs = int(os.environ.get("BENCH_MAX_CONFIGS", "48"))
+tune_vmem_headroom = float(os.environ.get("BENCH_TUNE_VMEM_HEADROOM", "0.95"))
+metrics_jsonl = os.environ.get("BENCH_JSONL")
 use_wall = os.environ.get("BENCH_WALL", "0") == "1"
 use_split = os.environ.get("BENCH_SPLIT", "0") == "1"
 direct_scaled_dot = os.environ.get("BENCH_DIRECT_SCALED_DOT", "0") == "1"
@@ -307,8 +313,7 @@ if invalid_modes:
 valid_routing_modes = {"random", "deterministic", "hot_expert"}
 if routing_mode not in valid_routing_modes:
     raise ValueError(
-        f"Unsupported BENCH_ROUTING_MODE={routing_mode!r}; "
-        "expected one of random or deterministic."
+        f"Unsupported BENCH_ROUTING_MODE={routing_mode!r}; expected one of random or deterministic."
     )
 if use_split:
     timeit_fn = None
@@ -514,7 +519,7 @@ def _estimate_vmem_bytes_v2(
     )
 
     if verbose:
-        mb = lambda b: f"{b / (1024*1024):.2f}"
+        mb = lambda b: f"{b / (1024 * 1024):.2f}"
         log(f"    VMEM Breakdown (bt={bt} bf={bf} btc={btc} bts={bts}):")
         log(f"      a2a_g_acc:      {mb(b_a2a_g_acc)} MB  (2,{top_k},{acc_bt},{hidden_size})")
         log(f"      topk_weights:   {mb(b_topk_w)} MB  ({smem_banks},{bt},{padded_top_k}) f32")
@@ -678,8 +683,8 @@ def generate_tune_candidates(
                             log(
                                 f"  VMEM skip bt={bc_eff.bt},bf={bc_eff.bf},"
                                 f"btc={bc_eff.btc},bts={bc_eff.bts},bse={bc_eff.bse}: "
-                                f"{est/(1024*1024):.1f}MB > "
-                                f"{effective_budget/(1024*1024):.1f}MB"
+                                f"{est / (1024 * 1024):.1f}MB > "
+                                f"{effective_budget / (1024 * 1024):.1f}MB"
                             )
                             continue
                         configs.append(bc)
@@ -693,7 +698,33 @@ def generate_tune_candidates(
         bk = (cfg.bt, cfg.bts or cfg.bt)
         buckets.setdefault(bk, []).append(cfg)
     for bk in buckets:
-        buckets[bk].sort(key=lambda c: (c.bf, c.bse, c.btc), reverse=True)
+        # Preserve BF and BTC diversity under the max-config cap. Sorting the
+        # whole bucket by BF first can spend every slot on bf=1024; naively
+        # round-robining BF can then spend every slot on the same btc. Build a
+        # small Latin-style traversal over (BF, BTC), starting near btc=32 but
+        # rotating the starting BTC for each BF.
+        by_pair = {}
+        for cfg in buckets[bk]:
+            by_pair.setdefault((cfg.bf, cfg.btc), []).append(cfg)
+        for pair in by_pair:
+            by_pair[pair].sort(key=lambda c: c.bse, reverse=True)
+        ordered = []
+        bf_keys = sorted({cfg.bf for cfg in buckets[bk]}, reverse=True)
+        btc_keys = sorted(
+            {cfg.btc for cfg in buckets[bk]},
+            key=lambda btc: (abs(math.log2(btc / 32)), -btc),
+        )
+        round_idx = 0
+        while any(by_pair[pair] for pair in by_pair):
+            for bf_idx, bf in enumerate(bf_keys):
+                for offset in range(len(btc_keys)):
+                    btc = btc_keys[(round_idx + bf_idx + offset) % len(btc_keys)]
+                    queue = by_pair.get((bf, btc), [])
+                    if queue:
+                        ordered.append(queue.pop(0))
+                        break
+            round_idx += 1
+        buckets[bk] = ordered
 
     selected = []
     selected_keys = set()
@@ -882,10 +913,12 @@ if use_fp8:
     qbk_arg = quant_block_k
     log("fp8 quantization done")
 
-# Shared-expert fp8 quant (per-channel, replicated). The in-kernel SE reuses the
-# routed fp8 weight/token/output VMEM buffers, so SE weights must also be fp8.
+# Shared-expert fp8 quant (per-channel, replicated). Production uses per-channel
+# shared-expert scales even when routed experts use block-wise FP8 scales. The
+# in-kernel SE reuses the routed fp8 weight/token/output VMEM buffers, so SE
+# weights must also be fp8 when activation quantization is enabled.
 w1_shared_scale = w2_shared_scale = w3_shared_scale = None
-if use_shared_expert and use_fp8 and quant_block_k is None:
+if use_shared_expert and use_fp8:
     log("quantizing shared-expert weights to fp8 (per-channel, replicated)...")
     repl_sharding2 = jax.sharding.NamedSharding(mesh, P())
 
@@ -935,6 +968,8 @@ for num_tokens in token_candidates:
             bse=bse,
             use_shared_expert=use_shared_expert,
             se_inter=se_inter,
+            vmem_headroom=tune_vmem_headroom,
+            max_configs=tune_max_configs,
             verbose=(num_tokens == token_candidates[0]),
         )
         block_configs_to_try = tune_configs
@@ -1142,6 +1177,38 @@ if jax.process_index() == 0 and results:
         if len(entries) > 1:
             for tag, avg, _ in entries[1:]:
                 log(f"    {avg:.3f}ms [{tag}]")
+
+    if metrics_jsonl:
+        metrics_path = pathlib.Path(metrics_jsonl)
+        metrics_path.parent.mkdir(parents=True, exist_ok=True)
+        with metrics_path.open("w", encoding="utf-8") as fh:
+            for nt in sorted(by_tokens):
+                entries = sorted(by_tokens[nt], key=lambda x: x[1])
+                best_avg = entries[0][1]
+                for tag, avg, times in entries:
+                    record = {
+                        "variant": "fused_moe_v2_tune",
+                        "tokens": nt,
+                        "num_experts": E,
+                        "top_k": top_k,
+                        "hidden_size": d,
+                        "intermediate_size": f,
+                        "ep_size": ep_size,
+                        "activation_dtype": "bfloat16",
+                        "weight_dtype": "float8_e4m3fn" if use_fp8 else "bfloat16",
+                        "quant_block_k": quant_block_k,
+                        "use_shared_expert": use_shared_expert,
+                        "shared_expert_intermediate_size": se_inter if use_shared_expert else 0,
+                        "enable_act_quant": enable_act_quant,
+                        "block_config": tag,
+                        "latency_ms": float(avg),
+                        "latency_p50_ms": float(np.median(times)),
+                        "latency_min_ms": float(np.min(times)),
+                        "samples_ms": [float(t) for t in times],
+                        "is_best_for_tokens": bool(avg == best_avg),
+                    }
+                    fh.write(json.dumps(record, sort_keys=True) + "\n")
+        log(f"wrote structured metrics to {metrics_path}")
 
 # --- Correctness check (optional, single-host only) ---
 if check_correctness:
