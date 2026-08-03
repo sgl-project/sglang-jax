@@ -677,10 +677,6 @@ class PathwaysPDSchedulerMixin:
             t_enq_ready,
         ) = item
         p_alloc, p_r2t, p_tree = self.p_allocs[p_idx], self.p_r2ts[p_idx], self.p_trees[p_idx]
-        # This batch is no longer in flight for its reqs (#1486); any
-        # pending_abort entry that reaches outstanding == 0 below is
-        # finalized on the matching path (done / mid-chunk / failure).
-        self._pd_batch_outstanding(batch, -1)
         chunked_excl = {
             dp: info.chunked_req
             for dp, info in enumerate(batch.reqs_info)
@@ -689,6 +685,7 @@ class PathwaysPDSchedulerMixin:
         if result is None:
             # prefill thread reported failure; free P, clear inflight/chunked.
             # TODO: proper stream-abort to client (currently client times out).
+            self._pd_batch_outstanding(batch, -1)
             all_reqs = []
             for info in batch.reqs_info:
                 for r in info.reqs or ():
@@ -735,6 +732,11 @@ class PathwaysPDSchedulerMixin:
                     )
                 return
             self._pd_defer_ticks = 0
+        # Only now is this batch really consumed (#1501 review): decrementing
+        # before the capacity gate would let a deferred item hit outstanding==0
+        # while still parked in _pd_defer, so an abort in that window could
+        # finalize the req (freeing its P slots) under the deferred item.
+        self._pd_batch_outstanding(batch, -1)
         d_pages_all = []
         for r, p_slots, p_pages in done_per_req:
             seq_len = len(r.fill_ids)
@@ -957,15 +959,24 @@ class PathwaysPDSchedulerMixin:
         if n_marked:
             logger.info("[pd_async] abort matched %d in-flight P-pipeline request(s)", n_marked)
 
-    def _pd_quiesce(self, timeout_s: float = 30.0) -> None:
+    def _pd_quiesce(self, warn_interval_s: float = 30.0) -> None:
         """Drain the whole async P pipeline before pause/retract (#1486): wait
         out in-flight prefill batches and consume every ready/deferred item so
         no late P result can merge into running_batch next to a requeued copy
-        of the same request."""
+        of the same request.
+
+        Fail-closed (#1501 review): blocks until the pipeline is actually
+        drained rather than proceeding on a timeout -- a late P result after
+        retract would recreate exactly the race this drain exists to prevent,
+        and its P-side pages cannot be reclaimed while the prefill thread may
+        still be executing on them. Long waits (e.g. a cold-shape compile on
+        the P thread) are surfaced with a periodic warning instead.
+        """
         if getattr(self, "_pd_inflight", None) is None:
             return
-        deadline = time.perf_counter() + timeout_s
-        while time.perf_counter() < deadline:
+        t0 = time.perf_counter()
+        last_warn = t0
+        while True:
             self._pd_drain_ready_multi()
             busy = (
                 any(not q.empty() for q in self._pd_prefill_qs)
@@ -977,13 +988,16 @@ class PathwaysPDSchedulerMixin:
             if not busy:
                 return
             time.sleep(0.01)
-        logger.warning(
-            "[pd_async] quiesce timed out after %.0fs: inflight=%d ready=%d defer=%d",
-            timeout_s,
-            len(self._pd_inflight),
-            self._pd_ready_q.qsize(),
-            len(self._pd_defer),
-        )
+            now = time.perf_counter()
+            if now - last_warn >= warn_interval_s:
+                last_warn = now
+                logger.warning(
+                    "[pd_async] quiesce still draining after %.0fs: inflight=%d ready=%d defer=%d",
+                    now - t0,
+                    len(self._pd_inflight),
+                    self._pd_ready_q.qsize(),
+                    len(self._pd_defer),
+                )
 
     def _pd_finalize_aborted(self, entry) -> None:
         """Exactly-once teardown of an aborted in-flight req: free P-side KV
@@ -1003,6 +1017,32 @@ class PathwaysPDSchedulerMixin:
         self._pd_untrack_inflight(r)
         self.stream_output([r], False, False)
         logger.info("[pd_async] aborted in-flight request finalized. rid=%s", r.rid)
+
+    def _pd_retract_chunked_owners(self) -> list:
+        """Retract chunked owners parked between chunks in the P pools (#1501
+        review). _retract_parked_chunked_reqs is a no-op under pathways PD, so
+        without this a mid-chunk request would survive retract holding P-side
+        KV and later resume from its pre-retract prefix -- stale KV if retract
+        preceded a weight update. Frees P KV + req slot, drops registry and
+        admission accounting, resets the req, and returns it for requeueing so
+        it recomputes from scratch. Call only after _pd_quiesce (no batch in
+        flight for these owners)."""
+        out = []
+        for p_idx in range(len(self.p_chunked_reqs)):
+            for dp, owner in enumerate(self.p_chunked_reqs[p_idx]):
+                if owner is None:
+                    continue
+                if owner.req_pool_idx is not None:
+                    self.p_trees[p_idx].cache_finished_req(owner)
+                    self.p_r2ts[p_idx].free_slots.append(owner.req_pool_idx)
+                    owner.req_pool_idx = None
+                self.p_chunked_reqs[p_idx][dp] = None
+                self._pd_untrack_inflight(owner)
+                owner.reset_for_retract()
+                out.append(owner)
+        if out:
+            logger.info("[pd_async] retracted %d parked chunked owner(s)", len(out))
+        return out
 
     def _pd_token_gate_closed(self) -> bool:
         """D-side token-level admission reservation (#1427 follow-up).
@@ -1077,13 +1117,23 @@ class PathwaysPDSchedulerMixin:
             i = (self._pd_next_p + _off) % n_p
             # Aborted chunked owner with no batch in flight: finalize here so
             # its P KV frees and no chunk N+1 is ever built (#1486). Owners
-            # with a batch still in flight finalize on that batch's drain.
+            # with a batch still in flight finalize on that batch's drain --
+            # and until then, skip building on this slice entirely (#1501
+            # review): the P thread clears _pd_chunk_pending before the
+            # result is drained, so without this guard an abort landing in
+            # that window would still enqueue chunk N+1.
+            abort_pending_owner = False
             for dp, owner in enumerate(self.p_chunked_reqs[i]):
                 if owner is None:
                     continue
                 entry = self._pd_inflight.get(owner.rid)
-                if entry is not None and entry.pending_abort and entry.outstanding == 0:
-                    self._pd_finalize_aborted(entry)
+                if entry is not None and entry.pending_abort:
+                    if entry.outstanding == 0:
+                        self._pd_finalize_aborted(entry)
+                    else:
+                        abort_pending_owner = True
+            if abort_pending_owner:
+                continue
             if self._pd_chunk_pending[i]:
                 continue
             if self._pd_prefill_qs[i].full():

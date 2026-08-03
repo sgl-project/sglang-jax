@@ -2821,6 +2821,13 @@ class Scheduler(
                     self._add_request_to_queue(req)
 
             self._retract_parked_chunked_reqs(retracted_reqs)
+            # Pathways PD: the helper above is a no-op there, but chunked
+            # owners parked in the P pools must also be retracted or they
+            # would resume on pre-retract KV (#1501 review). Guarded no-op
+            # outside pathways PD.
+            if getattr(self, "_pd_inflight", None) is not None:
+                for req in self._pd_retract_chunked_owners():
+                    self._add_request_to_queue(req)
             self.last_batch = None
             self.cur_batch = None
             logger.info("Paused generation retracted")

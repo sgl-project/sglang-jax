@@ -879,7 +879,7 @@ def test_abort_prefix_matching_only():
 
 
 @pytest.mark.unit
-def test_quiesce_returns_when_pipeline_empty_and_times_out_when_stuck():
+def test_quiesce_returns_when_empty_and_blocks_until_drained():
     fake = _FakeLifecycleSelf()
     fake._pd_prefill_qs = [queue.Queue()]
     fake._pd_chunk_pending = [False]
@@ -893,12 +893,51 @@ def test_quiesce_returns_when_pipeline_empty_and_times_out_when_stuck():
 
     fake._pd_drain_ready_multi = _drain
     # empty pipeline: returns immediately after one drain sweep
-    PathwaysPDSchedulerMixin._pd_quiesce(fake, timeout_s=1.0)
+    PathwaysPDSchedulerMixin._pd_quiesce(fake, warn_interval_s=1.0)
     assert fake.drained == 1
-    # stuck outstanding batch: must hit the timeout, not hang forever
+    # stuck outstanding batch: fail-closed -- must NOT return until the
+    # pipeline actually drains (#1501 review), even past a warn interval.
     r = _FakeLcReq("req-q")
     fake._pd_track_inflight(r, p_idx=0)
     fake._pd_inflight["req-q"].outstanding = 1
+    release_after = fake.drained + 12  # ~0.12s of ticks, > warn interval below
+
+    def _drain_then_release():
+        fake.drained += 1
+        if fake.drained >= release_after:
+            fake._pd_inflight["req-q"].outstanding = 0
+        return 0
+
+    fake._pd_drain_ready_multi = _drain_then_release
     t0 = time.perf_counter()
-    PathwaysPDSchedulerMixin._pd_quiesce(fake, timeout_s=0.2)
-    assert 0.15 < time.perf_counter() - t0 < 2.0
+    PathwaysPDSchedulerMixin._pd_quiesce(fake, warn_interval_s=0.05)
+    assert fake.drained >= release_after  # waited through, didn't bail early
+    assert time.perf_counter() - t0 < 5.0
+
+
+def test_retract_requeues_parked_chunked_owner():
+    fake = _FakeLifecycleSelf()
+
+    class _FakeRetractReq(_FakeLcReq):
+        def __init__(self, rid):
+            super().__init__(rid)
+            self.reset_calls = 0
+
+        def reset_for_retract(self):
+            self.reset_calls += 1
+
+    owner = _FakeRetractReq("req-ret")
+    fake._pd_track_inflight(owner, p_idx=0)
+    fake.p_chunked_reqs[0][0] = owner
+    out = PathwaysPDSchedulerMixin._pd_retract_chunked_owners(fake)
+    assert out == [owner]
+    assert fake.p_chunked_reqs[0][0] is None
+    assert owner.req_pool_idx is None
+    assert fake.p_trees[0].finished == ["req-ret"]
+    assert fake.p_r2ts[0].free_slots == [3]
+    assert "req-ret" not in fake._pd_inflight  # registry + ledger released
+    assert owner.reset_calls == 1
+    assert owner.finished() is False  # requeued, NOT aborted to the client
+    assert fake.streamed == []
+    # idempotent on empty state
+    assert PathwaysPDSchedulerMixin._pd_retract_chunked_owners(fake) == []
