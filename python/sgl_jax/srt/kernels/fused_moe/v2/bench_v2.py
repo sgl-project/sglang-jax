@@ -258,11 +258,6 @@ log(f"initialized: {jax.device_count()} devices, {jax.process_count()} procs")
 
 from kernel import FusedMoEBlockConfig, fused_ep_moe_v2, ref_moe
 
-from sgl_jax.srt.kernels.fused_moe.v2.tuned_block_configs import (
-    DEFAULT_V2_BLOCK_CONFIG,
-    get_tuned_fused_moe_v2_block_config,
-)
-
 P = jax.sharding.PartitionSpec
 num_devices = jax.device_count()
 devices = np.array(jax.devices()).reshape(1, num_devices)
@@ -295,6 +290,11 @@ tune_mode = os.environ.get("BENCH_TUNE", "0") == "1"
 tune_max_configs = int(os.environ.get("BENCH_MAX_CONFIGS", "48"))
 tune_vmem_headroom = float(os.environ.get("BENCH_TUNE_VMEM_HEADROOM", "0.95"))
 metrics_jsonl = os.environ.get("BENCH_JSONL")
+if not tune_mode:
+    from sgl_jax.srt.kernels.fused_moe.v2.tuned_block_configs import (
+        DEFAULT_V2_BLOCK_CONFIG,
+        get_tuned_fused_moe_v2_block_config,
+    )
 use_wall = os.environ.get("BENCH_WALL", "0") == "1"
 use_split = os.environ.get("BENCH_SPLIT", "0") == "1"
 direct_scaled_dot = os.environ.get("BENCH_DIRECT_SCALED_DOT", "0") == "1"
