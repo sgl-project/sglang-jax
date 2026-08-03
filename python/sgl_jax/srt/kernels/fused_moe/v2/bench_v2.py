@@ -35,6 +35,7 @@ import math
 import os
 import pathlib
 import re
+import shutil
 import sys
 import time
 from typing import Any
@@ -157,12 +158,15 @@ def trace_timeit(run_fn, warmup: int, iters: int) -> list[float]:
             jax.block_until_ready(out)
 
     if jax.process_index() != 0:
+        shutil.rmtree(trace_dir, ignore_errors=True)
         return []
     try:
         trace = _load_trace(trace_dir)
         return _extract_durations_ms(trace)
     except FileNotFoundError:
         return []
+    finally:
+        shutil.rmtree(trace_dir, ignore_errors=True)
 
 
 def wall_timeit(run_fn, warmup: int, iters: int) -> list[float]:
