@@ -24,6 +24,7 @@ from jax.tree_util import register_pytree_node_class
 
 from sgl_jax.srt.kernels.dsa.ref import streamindex_page_topk_ref, streamindex_topk_ref
 from sgl_jax.srt.kernels.dsa.sparse_mla import compute_topk_pages, sparse_mla_page_level
+from sgl_jax.srt.kernels.dsa.sparse_mla_prefill import prefill_write_and_attend
 from sgl_jax.srt.kernels.dsa.streamindex_topk import streamindex_topk
 from sgl_jax.srt.kernels.mla.v2.kernel import mla_ragged_paged_attention
 from sgl_jax.srt.layers.attention.mla_backend import MLAAttentionBackend
@@ -37,7 +38,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _SPARSE_PALLAS_MAX_T = 1
-_DEBUG_N_HIT = False
 # Page-budget for the page-scoring indexer path: the indexer max-pools token
 # scores per page and selects this many pages directly (0 = off, use the
 # token-topk + page-union path with k_pages_max=512). Bounds sparse-MLA cost
@@ -52,6 +52,14 @@ _INDEXER_KERNEL = os.environ.get("DSA_INDEXER_KERNEL", "0") == "1"
 # bkv block of 64 pages (4K tokens @ page 64) benched fastest across
 # B=8..64, ctx 8K..128K on v7x/v6e.
 _INDEXER_KERNEL_KV_PAGES_PER_BLOCK = 64
+
+# Opt-in: run EXTEND/prefill through the fused sparse-MLA prefill kernel
+# (``sparse_mla_prefill.sparse_mla_attention``) at page granularity instead of the
+# dense fallback. Default OFF ⇒ prefill behaviour is unchanged. Page-level
+# selection (read_block == page_size) consumes the indexer's page-topk directly.
+# Scope: single-sequence extend (the padded-bucket TTFT case); multi-seq ragged
+# extend still needs per-token page tables (follow-up) — leave the flag off there.
+_PREFILL_SPARSE = int(os.environ.get("DSA_PREFILL_SPARSE", "0"))
 
 
 @register_pytree_node_class
@@ -197,11 +205,51 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             )
             return o, DSAFusedCache(kv=kv_cache, idx=idx_cache, topk=topk, topk_pages=topk_pages)
 
-        # ── prefill/mixed → dense fallback: page_level is decode-only (one
-        # query token per seq). EXTEND/MIXED chunks route to plain dense; the
-        # indexer still writes idx cache so subsequent decode steps get valid
-        # topk. Multi-request DECODE (T>1) does go through the sparse path.
+        # ── prefill/mixed ─────────────────────────────────────────────────
+        # Default: dense fallback (page_level is decode-only; the indexer still
+        # writes the idx cache so later decode steps get valid topk).
+        # Opt-in (DSA_PREFILL_SPARSE): run the fused sparse-MLA *prefill* kernel
+        # over the indexer's page-topk — this is the EXTEND-sparsity gap PR.
         if not is_decode:
+            if _PREFILL_SPARSE:
+                idx_cache, topk_pages = self._maybe_index_prefill_pages(
+                    is_full, q_idx, k_idx, idx_weights, idx_cache, dpa, md
+                )
+                # Page selection for the sparse-prefill attend. A FULL (indexer)
+                # layer just produced [T, k_pages] page-topk; a SHARED layer gets
+                # None from `_maybe_index_prefill_pages` and reuses the preceding
+                # full layer's pages threaded via `dsa_topk_pages_in` (IndexShare).
+                # During prefill that thread is ALSO [T, k_pages] over the SAME T
+                # query rows (the full layer above ran the same single-shot prefill)
+                # — NOT the decode one-query-per-seq shape. None (a shared layer
+                # before any full layer) ⇒ fall through to the dense attend below.
+                topk_pages_use = topk_pages if is_full else dsa_topk_pages_in
+                if topk_pages_use is not None:
+                    o, kv_cache = self._run_sparse_prefill(
+                        q,
+                        q_rope,
+                        new_kv_c,
+                        new_k_pe,
+                        kv_cache,
+                        topk_pages_use,
+                        sm_scale,
+                        dpa,
+                        md,
+                        forward_batch,
+                    )
+                    return o, DSAFusedCache(
+                        kv=kv_cache,
+                        idx=idx_cache,
+                        topk=None,
+                        topk_pages=topk_pages if is_full else None,
+                    )
+                # no selection available (shared layer before any full) → dense
+                # fallback; idx cache already written above.
+                o, kv_cache = self._run_dense(
+                    q, q_rope, new_kv_c, new_k_pe, kv_cache, sm_scale, layer, dpa, md
+                )
+                return o, DSAFusedCache(kv=kv_cache, idx=idx_cache, topk=None, topk_pages=None)
+
             o, kv_cache = self._run_dense(
                 q, q_rope, new_kv_c, new_k_pe, kv_cache, sm_scale, layer, dpa, md
             )
@@ -348,13 +396,6 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                     pages_per_seq=pages_per_seq,
                     k_pages_max=512,
                 )
-                if _DEBUG_N_HIT:
-                    jax.debug.print(
-                        "dsa_n_hit min={} max={} mean={}",
-                        jnp.min(jnp.sum(topk_pages >= 0, -1)),
-                        jnp.max(jnp.sum(topk_pages >= 0, -1)),
-                        jnp.mean(jnp.sum(topk_pages >= 0, -1).astype(jnp.float32)),
-                    )
             else:
                 topk_pages = jnp.full((topk.shape[0], 1), -1, jnp.int32)
             return cache3d.reshape(cache_.shape), topk, topk_pages
@@ -433,6 +474,113 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             md.cu_q_lens,
             md.cu_kv_lens,
             md.distribution,
+        )
+
+    def _maybe_index_prefill_pages(self, is_full, q_idx, k_idx, idx_weights, idx_cache, dpa, md):
+        """Prefill page-topk: scatter ``k_idx`` into the paged indexer cache and,
+        on full layers, compute per-query **causal** page-level top-k via the
+        general (non-decode, ``one_token_per_seq=False``) indexer path.
+
+        Returns ``(idx_cache, topk_pages)`` where ``topk_pages`` is ``[T, k_pages]``
+        seq-local page ids (-1 padded) — exactly the sparse kernel's per-query
+        unit ids at ``read_block == page_size``. ``topk_pages`` is ``None`` on
+        shared layers / when no indexer is wired (caller reuses the threaded one).
+        """
+        if not is_full or q_idx is None:
+            return idx_cache, None
+        k_pages = (self.index_topk + self.page_size - 1) // self.page_size
+        in_specs = (
+            P(dpa, None, None),  # q_idx    [T, H_idx, D_idx] replicated
+            P(dpa, None),  # k_idx    [T, D_idx]
+            P(dpa, None),  # weights  [T, H_idx]
+            P(dpa, None, None, None),  # idx_cache paged
+            P(dpa),  # seq_lens
+            P(dpa),  # page_indices
+            P(dpa),  # cu_q_lens
+            P(dpa),  # cu_kv_lens
+            P(dpa),  # distribution
+        )
+        out_specs = (P(dpa, None, None, None), P(dpa, None))
+
+        def _run(q_, k_, w_, cache_, seq_lens_, pi_, cuq_, cukv_, dist_):
+            page_size = cache_.shape[1] * cache_.shape[2]
+            idx_dim = cache_.shape[3]
+            pages_per_seq = pi_.shape[0] // seq_lens_.shape[0]
+            cache3d = cache_.reshape(cache_.shape[0], page_size, idx_dim)
+            cache3d = _scatter_paged(cache3d, k_, seq_lens_, pi_, cuq_, cukv_, pages_per_seq)
+            topk_pages = streamindex_page_topk_ref(
+                q_,
+                w_,
+                cache3d,
+                seq_lens_,
+                pi_,
+                cuq_,
+                cukv_,
+                dist_,
+                k_pages=k_pages,
+                pages_per_seq=pages_per_seq,
+                one_token_per_seq=False,  # prefill: T>1 tokens/seq, per-query causal
+            )
+            return cache3d.reshape(cache_.shape), topk_pages
+
+        idx_cache, topk_pages = jax.shard_map(
+            _run, in_specs=in_specs, out_specs=out_specs, check_vma=False
+        )(
+            q_idx,
+            k_idx,
+            idx_weights,
+            idx_cache,
+            md.seq_lens,
+            md.page_indices,
+            md.cu_q_lens,
+            md.cu_kv_lens,
+            md.distribution,
+        )
+        return idx_cache, topk_pages
+
+    def _run_sparse_prefill(
+        self, ql, qpe, kvc, kpe, cache, topk_pages, sm_scale, dpa, md, forward_batch
+    ):
+        """Fused sparse-MLA prefill: self-write the current chunk's latent into the
+        paged fused cache, then attend only the page-topk pages. Single-sequence
+        extend scope (see ``_PREFILL_SPARSE``). Returns ``(o_latent, updated_cache)``.
+        """
+        loc = forward_batch.out_cache_loc.astype(jnp.int32)
+        positions = forward_batch.positions.astype(jnp.int32)
+        page_size = self.page_size
+        kv_lora_rank = self.kv_lora_rank
+        sm = float(sm_scale)
+
+        in_specs = (
+            P(dpa, "tensor", None),  # ql   [T, H, kv_lora_rank]
+            P(dpa, "tensor", None),  # qpe  [T, H, rope]
+            P(dpa, None),  # kvc  [T, kv_lora_rank]
+            P(dpa, None),  # kpe  [T, rope]
+            P(dpa, None, None, None),  # cache
+            P(dpa, None),  # topk_pages [T, K]
+            P(dpa),  # positions [T]
+            P(dpa),  # loc [T]
+        )
+        out_specs = (P(dpa, "tensor", None), P(dpa, None, None, None))
+
+        def _run(ql_, qpe_, kvc_, kpe_, cache_, tp_, pos_, loc_):
+            o, cache_new = prefill_write_and_attend(
+                ql_,
+                qpe_,
+                kvc_,
+                kpe_,
+                cache_,
+                tp_,
+                pos_,
+                loc_,
+                kv_lora_rank=kv_lora_rank,
+                page_size=page_size,
+                sm_scale=sm,
+            )
+            return o.astype(ql_.dtype), cache_new
+
+        return jax.shard_map(_run, in_specs=in_specs, out_specs=out_specs, check_vma=False)(
+            ql, qpe, kvc, kpe, cache, topk_pages, positions, loc
         )
 
     def _run_dense(self, ql, qpe, kvc, kpe, cache, sm_scale, layer, dpa, md):
