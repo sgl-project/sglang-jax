@@ -20,8 +20,10 @@ Recurrence kernels — both take post-conv ``mixed_qkv`` plus the full
 per-layer ``recurrent_state`` table and ``state_indices``, gather per-seq
 state internally, and return per-request new state plus per-token output:
 
+* :func:`chunked_gated_delta_rule_jax` — chunkwise-parallel gated delta-rule
+  recurrence in pure JAX (used in extend / chunked-prefill paths).
 * :func:`ragged_gated_delta_rule_ref` — token-by-token ``lax.scan`` over a
-  packed ragged batch (used in extend / chunked-prefill paths).
+  packed ragged batch (reference oracle).
 * :func:`decode_gated_delta_rule_ref` — single recurrence step parallelised
   across the batch axis (used in the decode fast path; one token per
   request, no scan).
@@ -35,7 +37,7 @@ Conv1d helpers that front-run the delta rule:
   decode; takes per-request state directly.
 
 Internal helper :func:`_gated_delta_step` is leading-dim-agnostic and
-shared between the two recurrence kernels.
+shared between the recurrence kernels.
 """
 
 from __future__ import annotations
@@ -349,7 +351,384 @@ def jax_causal_conv1d_update(
 
 
 # ---------------------------------------------------------------------------
-# Recurrence kernels (extend + decode reference implementations)
+# Chunked recurrence kernels (Phase 1: Pure JAX chunkwise-parallel recurrence)
+# ---------------------------------------------------------------------------
+
+
+def _solve_unit_lower_triangular(A: jax.Array, b: jax.Array) -> jax.Array:
+    """Solve (I + A) x = b where A is strictly lower triangular.
+
+    Args:
+        A: [BT, BT] strictly lower triangular matrix (zeros on diagonal).
+        b: [BT, D] right-hand side.
+
+    Returns:
+        x: [BT, D] solution.
+    """
+    BT, D = b.shape
+    BS = 16
+    num_blocks = BT // BS
+    A = A.astype(jnp.float32)
+    b = b.astype(jnp.float32)
+
+    blocks = list(jnp.split(b, num_blocks, axis=0))
+
+    for i in range(num_blocks):
+        start = i * BS
+        end = (i + 1) * BS
+        A_ii = A[start:end, start:end]
+        x_block = blocks[i]
+
+        rows = [x_block[r] for r in range(BS)]
+        for j in range(BS):
+            if j > 0:
+                vec = A_ii[j, :j][None, :]
+                mat = jnp.stack(rows[:j])
+                correction = jax.lax.dot_general(
+                    vec,
+                    mat,
+                    (((1,), (0,)), ((), ())),
+                    preferred_element_type=jnp.float32,
+                ).squeeze(axis=0)
+                rows[j] = rows[j] - correction
+
+        x_block = jnp.stack(rows)
+        blocks[i] = x_block
+
+        if i < num_blocks - 1:
+            rest_start = (i + 1) * BS
+            x_rest = jnp.concatenate(blocks[i + 1 :], axis=0)
+            A_rest = A[rest_start:, start:end]
+            update = jax.lax.dot_general(
+                A_rest,
+                x_block,
+                (((1,), (0,)), ((), ())),
+                preferred_element_type=jnp.float32,
+            )
+            x_rest = x_rest - update
+            remaining = num_blocks - 1 - i
+            new_blocks = jnp.split(x_rest, remaining, axis=0)
+            for idx, nb in enumerate(new_blocks):
+                blocks[i + 1 + idx] = nb
+
+    return jnp.concatenate(blocks, axis=0)
+
+
+def _chunk_gdn_intra_fn(
+    q: jax.Array,  # [BT, d_k] float32
+    k: jax.Array,  # [BT, d_k] float32
+    v: jax.Array,  # [BT, d_v] float32
+    beta: jax.Array,  # [BT] float32
+    g: jax.Array,  # [BT] float32
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Intra-chunk solve for a single (chunk, head) block."""
+    BT = q.shape[0]
+    gamma = jnp.cumsum(g)  # [BT]
+    diff_g = gamma[:, None] - gamma[None, :]  # [BT, BT]
+
+    causal_mask = jnp.tril(jnp.ones((BT, BT), dtype=bool))
+    strict_mask = jnp.tril(jnp.ones((BT, BT), dtype=bool), k=-1)
+
+    safe_diff_g = jnp.where(causal_mask, diff_g, -126.0)
+    decay = jnp.exp(safe_diff_g)  # [BT, BT]
+
+    kk = jnp.matmul(k, k.T)  # [BT, BT]
+    L = kk * decay * beta[:, None] * strict_mask  # [BT, BT]
+
+    qk = jnp.matmul(q, k.T)  # [BT, BT]
+    A_qk = qk * decay * causal_mask  # [BT, BT]
+
+    safe_gamma = jnp.maximum(gamma, -126.0)
+    v_b = v * beta[:, None]  # [BT, d_v]
+    k_eg_b = k * jnp.exp(safe_gamma)[:, None] * beta[:, None]  # [BT, d_k]
+    rhs = jnp.concatenate([v_b, k_eg_b], axis=-1)  # [BT, d_v + d_k]
+
+    sol = _solve_unit_lower_triangular(L, rhs)
+    d_v = v.shape[-1]
+    d_k = k.shape[-1]
+    u = sol[:, :d_v]
+    w = sol[:, d_v : d_v + d_k]
+
+    gamma_end = gamma[-1]
+    safe_end_diff = jnp.maximum(gamma_end - gamma, -126.0)
+    k_g = k * jnp.exp(safe_end_diff)[:, None]  # [BT, d_k]
+    q_g = q * jnp.exp(safe_gamma)[:, None]  # [BT, d_k]
+
+    return u, w, k_g, q_g, A_qk, gamma_end
+
+
+def _chunk_gdn_inter_scan(
+    u: jax.Array,  # [NC, n_v, BT, d_v]
+    w: jax.Array,  # [NC, n_v, BT, d_k]
+    k_g: jax.Array,  # [NC, n_v, BT, d_k]
+    gamma_end: jax.Array,  # [NC, n_v]
+    init_state: jax.Array,  # [B, n_v, d_k, d_v]
+    seq_id: jax.Array,  # [NC]
+    is_first_chunk: jax.Array,  # [NC] bool
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Inter-chunk recurrence scan across NC chunk boundaries."""
+
+    def scan_step(running_states, xs):
+        u_c, w_c, k_g_c, gamma_end_c, s_id, is_first = xs
+
+        state_in = jnp.where(
+            is_first,
+            init_state[s_id],
+            running_states[s_id],
+        )  # [n_v, d_k, d_v]
+
+        v_hist = jnp.einsum("h t k, h k v -> h t v", w_c, state_in)
+        v_new = u_c - v_hist  # [n_v, BT, d_v]
+
+        delta_S = jnp.einsum("h t k, h t v -> h k v", k_g_c, v_new)
+
+        decay_chunk = jnp.exp(gamma_end_c)[:, None, None]  # [n_v, 1, 1]
+        state_out = state_in * decay_chunk + delta_S  # [n_v, d_k, d_v]
+
+        new_running_states = running_states.at[s_id].set(state_out)
+        return new_running_states, (state_in, v_new)
+
+    final_running_states, (state_in_all, v_new_all) = jax.lax.scan(
+        scan_step,
+        init_state,
+        (u, w, k_g, gamma_end, seq_id, is_first_chunk),
+    )
+    return final_running_states, state_in_all, v_new_all
+
+
+def _chunk_gdn_output_fwd(
+    q_g: jax.Array,  # [NC, n_v, BT, d_k]
+    state_in: jax.Array,  # [NC, n_v, d_k, d_v]
+    A_qk: jax.Array,  # [NC, n_v, BT, BT]
+    v_new: jax.Array,  # [NC, n_v, BT, d_v]
+) -> jax.Array:
+    """Compute chunk outputs in parallel across all chunks and heads."""
+    o_inter = jnp.einsum("c h t k, c h k v -> c h t v", q_g, state_in)
+    o_intra = jnp.einsum("c h t s, c h s v -> c h t v", A_qk, v_new)
+    return o_inter + o_intra
+
+
+def _align_seqs_gdn(
+    q: jax.Array,  # [T, n_v, d_k]
+    k: jax.Array,  # [T, n_v, d_k]
+    v: jax.Array,  # [T, n_v, d_v]
+    beta: jax.Array,  # [T, n_v]
+    g: jax.Array,  # [T, n_v]
+    cu_seqlens: jax.Array,  # [B + 1]
+    align: int,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Pad and align ragged sequences to multiples of `align`."""
+    B = int(cu_seqlens.shape[0]) - 1
+    T_old = int(q.shape[0])
+
+    seg_lens = cu_seqlens[1:] - cu_seqlens[:-1]  # [B]
+    padded_lens = ((seg_lens + align - 1) // align) * align  # [B]
+    padded_cu = jnp.concatenate([jnp.zeros(1, dtype=jnp.int32), jnp.cumsum(padded_lens)])  # [B + 1]
+    T_new = ((T_old + B * (align - 1) + align - 1) // align) * align
+
+    def _build_gather(i, gather_idx):
+        old_start = cu_seqlens[i]
+        new_start = padded_cu[i]
+        sl = seg_lens[i]
+        j = jnp.arange(T_new)
+        in_seg = (j >= new_start) & (j < new_start + sl)
+        src = old_start + (j - new_start)
+        return jnp.where(in_seg, src, gather_idx)
+
+    gather_idx = jnp.full(T_new, T_old, dtype=jnp.int32)
+    gather_idx = jax.lax.fori_loop(0, B, _build_gather, gather_idx)
+
+    pad_t = lambda t: jnp.pad(t, ((0, 1),) + ((0, 0),) * (t.ndim - 1))
+    q_pad = pad_t(q)
+    k_pad = pad_t(k)
+    v_pad = pad_t(v)
+    beta_pad = pad_t(beta)
+    g_pad = pad_t(g)
+
+    q_aligned = q_pad[gather_idx]
+    k_aligned = k_pad[gather_idx]
+    v_aligned = v_pad[gather_idx]
+    beta_aligned = beta_pad[gather_idx]
+    g_aligned = g_pad[gather_idx]
+
+    valid_mask = gather_idx < T_old
+
+    # Mask padding positions: zero for q, k, v, beta, g (g=0 -> exp(0)=1, no decay)
+    q_aligned = jnp.where(valid_mask[:, None, None], q_aligned, 0.0)
+    k_aligned = jnp.where(valid_mask[:, None, None], k_aligned, 0.0)
+    v_aligned = jnp.where(valid_mask[:, None, None], v_aligned, 0.0)
+    beta_aligned = jnp.where(valid_mask[:, None], beta_aligned, 0.0)
+    g_aligned = jnp.where(valid_mask[:, None], g_aligned, 0.0)
+
+    return q_aligned, k_aligned, v_aligned, beta_aligned, g_aligned, padded_cu, gather_idx
+
+
+def _unalign_output_gdn(
+    o_aligned: jax.Array,  # [T_new, n_v, d_v]
+    orig_cu_seqlens: jax.Array,  # [B + 1]
+    aligned_cu_seqlens: jax.Array,  # [B + 1]
+    T_out: int,
+) -> jax.Array:
+    """Extract valid tokens from aligned output buffer."""
+    B = int(orig_cu_seqlens.shape[0]) - 1
+    orig_seg_lens = orig_cu_seqlens[1:] - orig_cu_seqlens[:-1]
+
+    def _build_gather(i, gather_idx):
+        orig_start = orig_cu_seqlens[i]
+        aligned_start = aligned_cu_seqlens[i]
+        sl = orig_seg_lens[i]
+        j = jnp.arange(T_out)
+        in_seg = (j >= orig_start) & (j < orig_start + sl)
+        src = aligned_start + (j - orig_start)
+        return jnp.where(in_seg, src, gather_idx)
+
+    gather_idx = jnp.zeros(T_out, dtype=jnp.int32)
+    gather_idx = jax.lax.fori_loop(0, B, _build_gather, gather_idx)
+    o_unaligned = o_aligned[gather_idx]
+
+    valid_out = jnp.arange(T_out) < orig_cu_seqlens[-1]
+    return jnp.where(valid_out[:, None, None], o_unaligned, 0.0)
+
+
+def chunked_gated_delta_rule_jax(
+    mixed_qkv: jax.Array,
+    b: jax.Array,
+    a: jax.Array,
+    recurrent_state: jax.Array,
+    A_log: jax.Array,
+    dt_bias: jax.Array,
+    cu_seqlens: jax.Array,
+    state_indices: jax.Array,
+    has_initial_state: jax.Array,
+    *,
+    n_kq: int,
+    n_v: int,
+    d_k: int,
+    d_v: int,
+    chunk_size: int = 64,
+    track_indices: jax.Array | None = None,
+    track_mask: jax.Array | None = None,
+) -> tuple[jax.Array, jax.Array]:
+    """Chunked Gated Delta-Rule forward (extend / prefill) in pure JAX.
+
+    Replaces the per-token lax.scan with a chunkwise-parallel recurrence:
+    intra-chunk dense matrix multiplications and triangular solve, plus
+    inter-chunk state propagation across chunk boundaries.
+
+    Args:
+        mixed_qkv: Packed ``(Q | K | V)`` tokens of shape
+            ``[num_tokens, 2 * n_kq * d_k + n_v * d_v]``.
+        b: Pre-sigmoid beta input, ``[num_tokens, n_v]``.
+        a: Pre-softplus delta-t input, ``[num_tokens, n_v]``.
+        recurrent_state: Full per-layer state table,
+            ``[num_blocks, n_v, d_k, d_v]``.
+        A_log: ``[n_v]`` log-A parameter.
+        dt_bias: ``[n_v]`` delta-t bias.
+        cu_seqlens: ``[B + 1]`` int32 cumulative sequence lengths in the
+            packed buffer; ``cu_seqlens[-1]`` is the number of valid
+            (non-padding) tokens.
+        state_indices: ``[B]`` int32 mapping request index to slot in
+            ``recurrent_state``.
+        has_initial_state: ``[B]`` bool.
+        n_kq: Number of key/query heads (per-shard).
+        n_v: Number of value heads (per-shard). Must be a multiple of n_kq.
+        d_k: Per-head key/query dim.
+        d_v: Per-head value dim.
+        chunk_size: Chunk size (default 64).
+        track_indices: Optional ``[B]`` track slot indices.
+        track_mask: Optional ``[B]`` boundary mask.
+
+    Returns:
+        ``(new_recurrent_state, output)`` where ``new_recurrent_state``
+        is the full pool table ``[num_blocks, n_v, d_k, d_v]`` and
+        ``output`` has shape ``[num_tokens, n_v, d_v]`` in ``mixed_qkv.dtype``.
+    """
+    num_tokens = mixed_qkv.shape[0]
+    B = state_indices.shape[0]
+    BT = chunk_size
+    key_dim = n_kq * d_k
+
+    query = mixed_qkv[..., :key_dim].reshape(num_tokens, n_kq, d_k)
+    key = mixed_qkv[..., key_dim : 2 * key_dim].reshape(num_tokens, n_kq, d_k)
+    value = mixed_qkv[..., 2 * key_dim :].reshape(num_tokens, n_v, d_v)
+    repeat_factor = n_v // n_kq
+    if repeat_factor > 1:
+        query = jnp.repeat(query, repeat_factor, axis=1)
+        key = jnp.repeat(key, repeat_factor, axis=1)
+
+    scale = d_k**-0.5
+    query = _l2norm(query.astype(jnp.float32)) * scale
+    key = _l2norm(key.astype(jnp.float32))
+    value = value.astype(jnp.float32)
+    beta = jax.nn.sigmoid(b.astype(jnp.float32))
+    A = jnp.exp(A_log.astype(jnp.float32))
+    dt_bias_f32 = dt_bias.astype(jnp.float32)
+    g = -A * jax.nn.softplus(a.astype(jnp.float32) + dt_bias_f32)
+
+    # Gather per-seq initial state
+    recurrent_state = jax.lax.optimization_barrier(recurrent_state)
+    init_state = recurrent_state[state_indices].astype(jnp.float32)
+    init_state = jnp.where(
+        has_initial_state[:, None, None, None],
+        init_state,
+        jnp.zeros_like(init_state),
+    )
+
+    # Align sequences to multiples of BT
+    (
+        q_al,
+        k_al,
+        v_al,
+        b_al,
+        g_al,
+        padded_cu,
+        _,
+    ) = _align_seqs_gdn(query, key, value, beta, g, cu_seqlens, BT)
+
+    T_new = q_al.shape[0]
+    NC = T_new // BT
+
+    # Reshape to [NC, n_v, BT, ...]
+    q_c = jnp.transpose(q_al.reshape(NC, BT, n_v, d_k), (0, 2, 1, 3))
+    k_c = jnp.transpose(k_al.reshape(NC, BT, n_v, d_k), (0, 2, 1, 3))
+    v_c = jnp.transpose(v_al.reshape(NC, BT, n_v, d_v), (0, 2, 1, 3))
+    b_c = jnp.transpose(b_al.reshape(NC, BT, n_v), (0, 2, 1))
+    g_c = jnp.transpose(g_al.reshape(NC, BT, n_v), (0, 2, 1))
+
+    # Stage 1: Intra-chunk solve in parallel across NC and n_v
+    u, w, k_g, q_g, A_qk, gamma_end = jax.vmap(
+        jax.vmap(_chunk_gdn_intra_fn, in_axes=(0, 0, 0, 0, 0)),
+        in_axes=(0, 0, 0, 0, 0),
+    )(q_c, k_c, v_c, b_c, g_c)
+
+    # Stage 2: Inter-chunk recurrence scan across NC steps
+    chunk_starts = jnp.arange(NC, dtype=jnp.int32) * BT
+    seq_id = jnp.minimum(jnp.searchsorted(padded_cu[1:], chunk_starts, side="right"), B - 1)
+    is_first_chunk = chunk_starts == padded_cu[seq_id]
+
+    final_states, state_in_all, v_new_all = _chunk_gdn_inter_scan(
+        u, w, k_g, gamma_end, init_state, seq_id, is_first_chunk
+    )
+
+    # Stage 3: Parallel output computation
+    o_c = _chunk_gdn_output_fwd(q_g, state_in_all, A_qk, v_new_all)
+    o_al = jnp.transpose(o_c, (0, 2, 1, 3)).reshape(T_new, n_v, d_v)
+
+    # Unalign output to original packed layout
+    output = _unalign_output_gdn(o_al, cu_seqlens, padded_cu, num_tokens)
+    output = output.astype(mixed_qkv.dtype)
+
+    # Scatter final states back into full pool table
+    new_recurrent_state = _scatter_idx0_safe(recurrent_state, state_indices, final_states)
+    if track_indices is not None:
+        new_recurrent_state = _scatter_track(
+            new_recurrent_state, track_indices, track_mask, final_states
+        )
+    return new_recurrent_state, output
+
+
+# ---------------------------------------------------------------------------
+# Recurrence kernels (reference oracle + decode)
 # ---------------------------------------------------------------------------
 
 
