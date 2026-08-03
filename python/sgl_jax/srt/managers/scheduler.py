@@ -87,6 +87,7 @@ from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.model_executor.model_runner_kv_cache_mixin import (
     recurrent_admission_blocked,
 )
+from sgl_jax.srt.multimodal.common.modality_enum import build_cache_input_ids
 from sgl_jax.srt.multimodal.tokenizer_utils import resolve_tokenizer_subdir
 from sgl_jax.srt.precision_tracer import precision_tracer
 from sgl_jax.srt.server_args import (
@@ -308,9 +309,13 @@ class Scheduler(
         self.init_tokenizer()
 
         self.enable_overlap = not server_args.disable_overlap_schedule
+        # The standalone multimodal stage pipeline has its own schedulers and
+        # does not support the autoregressive overlap loop yet. In-model
+        # multimodal models use the regular worker protocol and can follow the
+        # generic overlap flag without an architecture allowlist.
         if server_args.multimodal:
-            logger.info("Multimodal mode enabled, disabling overlap schedule")
             self.enable_overlap = False
+            logger.info("Overlap scheduler is disabled for the multimodal stage pipeline.")
         if server_args.disaggregation_mode != "null":
             logger.info("PD disaggregation mode enabled, disabling overlap schedule")
             self.enable_overlap = False
@@ -951,7 +956,8 @@ class Scheduler(
         if not eligible:
             return None
 
-        token_ids, extra_key = req_prefix_match_key(req)
+        cache_input_ids = build_cache_input_ids(req.input_ids, req.mm_inputs)
+        token_ids, extra_key = req_prefix_match_key(req, cache_input_ids)
         matches: dict[int, int] = {}
         prompt_len = len(token_ids) if token_ids else 0
         if token_ids:
@@ -1352,6 +1358,7 @@ class Scheduler(
                 req.deepstack_visual_embedding = _extract_mm_value(
                     recv_req.mm_inputs, "deepstack_visual_embedding"
                 )
+            req.cache_input_ids = build_cache_input_ids(req.origin_input_ids, req.mm_inputs)
         # Validate prompt length
         error_msg = validate_input_length(
             req,

@@ -29,19 +29,26 @@ logger = logging.getLogger(__name__)
 
 GRAMMAR_BACKEND_CHOICES = ["llguidance", "none"]
 _REJECTED_PD_HOST_ALIASES = frozenset({"localhost"})
+_MULTIMODAL_CHUNKED_PREFILL_ARCHITECTURES = frozenset({"Qwen2_5_VLForConditionalGeneration"})
+_MULTIMODAL_RADIX_CACHE_ARCHITECTURES = frozenset({"Qwen2_5_VLForConditionalGeneration"})
 
 
 def apply_multimodal_model_defaults(server_args, model_config) -> None:
     if not model_config.is_multimodal:
         return
 
-    if not server_args.disable_radix_cache:
+    hf_config = getattr(model_config, "hf_config", None)
+    architectures = set(getattr(hf_config, "architectures", None) or [])
+
+    supports_radix_cache = bool(architectures & _MULTIMODAL_RADIX_CACHE_ARCHITECTURES)
+    if not supports_radix_cache and not server_args.disable_radix_cache:
         logger.info("Multimodal model detected, disabling radix cache")
         server_args.disable_radix_cache = True
-    if not server_args.disable_overlap_schedule:
-        logger.info("Multimodal model detected, disabling overlap schedule")
-        server_args.disable_overlap_schedule = True
-    if server_args.chunked_prefill_size is None or server_args.chunked_prefill_size > 0:
+
+    supports_chunked_prefill = bool(architectures & _MULTIMODAL_CHUNKED_PREFILL_ARCHITECTURES)
+    if not supports_chunked_prefill and (
+        server_args.chunked_prefill_size is None or server_args.chunked_prefill_size > 0
+    ):
         logger.info("Multimodal model detected, disabling chunked prefill")
         server_args.chunked_prefill_size = -1
     if server_args.enable_mixed_chunk:

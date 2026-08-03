@@ -492,7 +492,7 @@ class Req:
                 )
                 match_result = tree_cache.match_prefix(
                     MatchPrefixParams(
-                        key=RadixKey(self.adjust_max_prefix_ids(), self.extra_key, self.dp_rank),
+                        key=RadixKey(self.match_key_ids(), self.extra_key, self.dp_rank),
                         cow_recurrent=(
                             tree_cache.supports_recurrent() and not is_running_recurrent
                         ),
@@ -526,6 +526,20 @@ class Req:
 
         max_prefix_len = max(max_prefix_len, 0)
         return self.fill_ids[:max_prefix_len]
+
+    def match_key_ids(self):
+        """Prefix ids for the radix key. Uses hash-substituted ``cache_input_ids``
+        when set (to distinguish multimodal content) but keeps ``fill_ids`` as the
+        real model input; length is identical to ``adjust_max_prefix_ids`` so
+        ``extend_input_len`` math is unchanged.
+        """
+        real_prefix = self.adjust_max_prefix_ids()
+        if self.cache_input_ids is None:
+            return real_prefix
+        key_fill = (
+            self.cache_input_ids + self.output_ids if self.output_ids else self.cache_input_ids
+        )
+        return key_fill[: len(real_prefix)]
 
     def pop_committed_kv_cache(self) -> int:
         # Idempotent: the PD prefill abort path can run release a second time

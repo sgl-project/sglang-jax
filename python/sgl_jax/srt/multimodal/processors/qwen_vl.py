@@ -286,14 +286,14 @@ class QwenVLProcessor(BaseMultimodalProcessor):
         second_per_grid_ts = self._to_list(second_per_grid_ts_value)
 
         vision_config = self.hf_config.vision_config
-        image_offsets = self._compute_image_offsets(
+        image_placeholder_ranges = self._compute_image_placeholder_ranges(
             input_ids=input_ids,
             grids=image_grid_thw,
             image_token_id=self.hf_config.image_token_id,
             spatial_merge_size=vision_config.spatial_merge_size,
         )
         video_token_id = getattr(self.hf_config, "video_token_id", None)
-        video_offsets = self._compute_offsets(
+        video_placeholder_ranges = self._compute_placeholder_ranges(
             input_ids=input_ids,
             grids=video_grid_thw,
             token_id=video_token_id,
@@ -305,7 +305,7 @@ class QwenVLProcessor(BaseMultimodalProcessor):
             self._build_items(
                 pixel_values,
                 image_grid_thw,
-                image_offsets,
+                image_placeholder_ranges,
                 Modality.IMAGE,
                 "image_grid_thw",
             )
@@ -314,7 +314,7 @@ class QwenVLProcessor(BaseMultimodalProcessor):
             self._build_items(
                 pixel_values_videos,
                 video_grid_thw,
-                video_offsets,
+                video_placeholder_ranges,
                 Modality.VIDEO,
                 "video_grid_thw",
             )
@@ -347,15 +347,15 @@ class QwenVLProcessor(BaseMultimodalProcessor):
         )
 
     @staticmethod
-    def _build_items(features, grids, offsets, modality, grid_key):
+    def _build_items(features, grids, placeholder_ranges, modality, grid_key):
         if features is None:
             return []
         if not grids:
             raise ValueError(f"Missing {grid_key} metadata for {modality.name} inputs.")
-        if len(offsets) != len(grids):
+        if len(placeholder_ranges) != len(grids):
             raise ValueError(
-                f"{modality.name} offset count does not match grid metadata: "
-                f"{len(offsets)} != {len(grids)}."
+                f"{modality.name} placeholder range count does not match grid metadata: "
+                f"{len(placeholder_ranges)} != {len(grids)}."
             )
 
         feature_counts = [int(np.prod(grid)) for grid in grids]
@@ -373,7 +373,7 @@ class QwenVLProcessor(BaseMultimodalProcessor):
                 feature=features[offset : offset + count],
             )
             item.set(grid_key, np.asarray([grid], dtype=np.int32))
-            item.offsets = [offsets[len(items)]]
+            item.placeholder_ranges = [placeholder_ranges[len(items)]]
             items.append(item)
             offset += count
         return items
@@ -384,8 +384,8 @@ class QwenVLProcessor(BaseMultimodalProcessor):
         )
 
     @staticmethod
-    def _compute_image_offsets(input_ids, grids, image_token_id, spatial_merge_size):
-        return QwenVLProcessor._compute_offsets(
+    def _compute_image_placeholder_ranges(input_ids, grids, image_token_id, spatial_merge_size):
+        return QwenVLProcessor._compute_placeholder_ranges(
             input_ids=input_ids,
             grids=grids,
             token_id=image_token_id,
@@ -394,13 +394,13 @@ class QwenVLProcessor(BaseMultimodalProcessor):
         )
 
     @staticmethod
-    def _compute_offsets(input_ids, grids, token_id, spatial_merge_size, modality_name):
+    def _compute_placeholder_ranges(input_ids, grids, token_id, spatial_merge_size, modality_name):
         if not grids:
             return []
         if token_id is None:
             raise ValueError(f"{modality_name} token id is not configured.")
 
-        offsets = []
+        placeholder_ranges = []
         search_start = 0
         for grid in grids:
             token_count = int(np.prod(grid) // (spatial_merge_size**2))
@@ -414,17 +414,17 @@ class QwenVLProcessor(BaseMultimodalProcessor):
                     f"Missing {modality_name} placeholder tokens in processor input_ids."
                 )
 
-            end = start + token_count - 1
-            if end >= len(input_ids) or any(
-                input_token_id != token_id for input_token_id in input_ids[start : end + 1]
+            end = start + token_count
+            if end > len(input_ids) or any(
+                input_token_id != token_id for input_token_id in input_ids[start:end]
             ):
                 raise ValueError(
                     f"{modality_name} placeholder token span does not match grid metadata."
                 )
-            offsets.append((start, end))
-            search_start = end + 1
+            placeholder_ranges.append((start, end))
+            search_start = end
 
-        return offsets
+        return placeholder_ranges
 
     async def _load_videos_async(self, video_data, video_config):
         return await asyncio.gather(

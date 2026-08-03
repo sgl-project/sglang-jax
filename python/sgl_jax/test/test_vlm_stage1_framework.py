@@ -47,11 +47,11 @@ from sgl_jax.srt.multimodal.processors.qwen_vl import QwenVLProcessor
 from sgl_jax.srt.server_args import apply_multimodal_model_defaults
 
 
-def _build_image_items(features, grids, offsets):
+def _build_image_items(features, grids, placeholder_ranges):
     return QwenVLProcessor._build_items(
         features,
         grids,
-        offsets,
+        placeholder_ranges,
         Modality.IMAGE,
         "image_grid_thw",
     )
@@ -344,7 +344,7 @@ def test_vision_full_attention_keeps_packed_images_block_diagonal_on_cpu():
     packed_items = _build_image_items(
         packed_features,
         [(1, 2, 2), (1, 1, 3)],
-        [(0, 3), (4, 6)],
+        [(0, 4), (4, 7)],
     )
     packed_meta = builder.stack_metadata(
         [builder.get_metadata(packed_items)],
@@ -354,7 +354,7 @@ def test_vision_full_attention_keeps_packed_images_block_diagonal_on_cpu():
     single_item = _build_image_items(
         packed_features[:4],
         [(1, 2, 2)],
-        [(0, 3)],
+        [(0, 4)],
     )[0]
     single_meta = builder.stack_metadata(
         [builder.get_metadata([single_item])],
@@ -419,7 +419,7 @@ def test_vision_single_image_request_matches_single_image_encode_on_cpu():
     item = _build_image_items(
         patch_features,
         [(1, 2, 2)],
-        [(0, 3)],
+        [(0, 4)],
     )[0]
     native_meta = builder.stack_metadata([builder._get_image_metadata(item)], patch_k=4)
     packed_meta = builder.stack_metadata(
@@ -587,7 +587,7 @@ def test_device_put_embed_plan_places_qwen_metadata_data_leading():
     assert tuple(rnd.mask.sharding.spec) == ("data",)
 
 
-def test_multimodal_model_defaults_disable_unsupported_scheduler_features():
+def test_multimodal_model_defaults_keep_overlap_enabled():
     server_args = SimpleNamespace(
         disable_radix_cache=False,
         disable_overlap_schedule=False,
@@ -600,7 +600,7 @@ def test_multimodal_model_defaults_disable_unsupported_scheduler_features():
     apply_multimodal_model_defaults(server_args, model_config)
 
     assert server_args.disable_radix_cache is True
-    assert server_args.disable_overlap_schedule is True
+    assert server_args.disable_overlap_schedule is False
     assert server_args.chunked_prefill_size == -1
     assert server_args.enable_mixed_chunk is False
     assert server_args.limit_mm_data_per_request == {"image": 16}
@@ -778,14 +778,14 @@ def test_multimodal_data_item_get_reads_common_and_model_specific_fields():
         {
             "modality": "image",
             "feature": np.ones((2, 1), dtype=np.float32),
-            "offsets": [(1, 2)],
+            "placeholder_ranges": [(1, 3)],
             "image_grid_thw": np.array([[1, 2, 4]], dtype=np.int32),
         }
     )
 
     assert item.is_image()
     np.testing.assert_array_equal(item.get("feature"), np.ones((2, 1), dtype=np.float32))
-    assert item.get("offsets") == [(1, 2)]
+    assert item.get("placeholder_ranges") == [(1, 3)]
     np.testing.assert_array_equal(
         item.get("image_grid_thw"),
         np.array([[1, 2, 4]], dtype=np.int32),
@@ -809,7 +809,7 @@ def test_qwen_metadata_builder_packs_request_metadata_with_image_boundaries():
     items = _build_image_items(
         features,
         [(1, 16, 16), (1, 4, 4)],
-        [(0, 63), (64, 67)],
+        [(0, 64), (64, 68)],
     )
 
     packed = builder.get_metadata(items)
@@ -844,7 +844,7 @@ def test_qwen_metadata_builder_single_image_request_metadata_degenerates_to_nati
     item = _build_image_items(
         np.arange(8, dtype=np.float32).reshape(8, 1),
         [(1, 2, 4)],
-        [(0, 1)],
+        [(0, 2)],
     )[0]
 
     native = builder._get_image_metadata(item)
@@ -871,7 +871,7 @@ def test_qwen_metadata_builder_stack_metadata_pads_multi_image_and_dummy_rank():
     items = _build_image_items(
         np.arange(24, dtype=np.float32).reshape(24, 1),
         [(1, 2, 4), (1, 4, 4)],
-        [(0, 1), (2, 5)],
+        [(0, 2), (2, 6)],
     )
     meta = builder.get_metadata(items)
 
@@ -918,7 +918,7 @@ def test_qwen_metadata_builder_stack_metadata_checks_patch_bucket_divisibility()
     item = _build_image_items(
         np.arange(8, dtype=np.float32).reshape(8, 1),
         [(1, 2, 4)],
-        [(0, 1)],
+        [(0, 2)],
     )[0]
     meta = builder._get_image_metadata(item)
 
@@ -944,7 +944,7 @@ def test_collect_image_requests_preserves_owner_rank_request_base():
             mm_items=_build_image_items(
                 feature,
                 [(1, 2, 4)],
-                [(1, 2)],
+                [(1, 3)],
             )
         ),
         extend_input_len=4,
@@ -954,7 +954,7 @@ def test_collect_image_requests_preserves_owner_rank_request_base():
             mm_items=_build_image_items(
                 feature,
                 [(1, 2, 4)],
-                [(0, 1)],
+                [(0, 2)],
             )
         ),
         extend_input_len=2,
@@ -990,7 +990,7 @@ def test_build_embed_round_derives_pixels_metadata_and_merge_idx_from_one_unit_o
     items = _build_image_items(
         np.arange(24, dtype=np.float32).reshape(24, 1),
         [(1, 2, 4), (1, 4, 4)],
-        [(2, 3), (5, 8)],
+        [(2, 4), (5, 9)],
     )
 
     rnd = _build_embed_round(
@@ -1026,7 +1026,7 @@ def test_build_embed_round_keeps_merge_row_contiguous_across_multi_placeholder_i
     items = _build_image_items(
         np.arange(32, dtype=np.float32).reshape(32, 1),
         [(1, 2, 4), (1, 4, 6)],
-        [(0, 1), (4, 9)],
+        [(0, 2), (4, 10)],
     )
 
     rnd = _build_embed_round(
@@ -1057,7 +1057,7 @@ def test_build_embed_round_fails_fast_on_placeholder_token_out_of_rank_slot():
     item = MultimodalDataItem(
         modality=Modality.IMAGE,
         feature=np.ones((3, 1), dtype=np.float32),
-        offsets=[(0, 2)],
+        placeholder_ranges=[(0, 3)],
         model_specific_data={"image_grid_thw": np.array([[1, 1, 3]], dtype=np.int32)},
     )
 
@@ -1073,8 +1073,8 @@ def test_build_embed_round_fails_fast_on_placeholder_token_out_of_rank_slot():
 def test_mm_embed_plan_keeps_placeholder_count_separate_from_encode_rows():
     features = np.arange(24, dtype=np.float32).reshape(24, 1)
     grids = [(1, 2, 4), (1, 4, 4)]
-    offsets = [(2, 3), (5, 8)]
-    items = _build_image_items(features, grids, offsets)
+    placeholder_ranges = [(2, 4), (5, 9)]
+    items = _build_image_items(features, grids, placeholder_ranges)
     req = SimpleNamespace(
         mm_inputs=MultimodalInputs(mm_items=items),
         extend_input_len=10,
@@ -1112,12 +1112,12 @@ def test_mm_embed_plan_keeps_placeholder_count_separate_from_encode_rows():
     np.testing.assert_array_equal(rounds[0].src_idx[[2, 3, 5, 6, 7, 8]], np.arange(6))
 
 
-def test_mm_embed_plan_fails_fast_on_overlapping_placeholder_offsets():
+def test_mm_embed_plan_fails_fast_on_overlapping_placeholder_ranges():
     features = np.arange(3, dtype=np.float32).reshape(3, 1)
     item = MultimodalDataItem(
         modality=Modality.IMAGE,
         feature=features,
-        offsets=[(0, 1), (1, 1)],
+        placeholder_ranges=[(0, 2), (1, 2)],
         model_specific_data={"image_grid_thw": np.array([[1, 1, 3]], dtype=np.int32)},
     )
     req = SimpleNamespace(
@@ -1172,7 +1172,7 @@ def test_mm_embed_plan_packs_per_request_with_dp_dummy_lane():
             mm_items=_build_image_items(
                 np.arange(8, dtype=np.float32).reshape(8, 1),
                 [(1, 2, 4)],
-                [(1, 2)],
+                [(1, 3)],
             )
         ),
         extend_input_len=4,
@@ -1182,7 +1182,7 @@ def test_mm_embed_plan_packs_per_request_with_dp_dummy_lane():
             mm_items=_build_image_items(
                 np.arange(16, dtype=np.float32).reshape(16, 1),
                 [(1, 4, 4)],
-                [(0, 3)],
+                [(0, 4)],
             )
         ),
         extend_input_len=5,
@@ -1192,7 +1192,7 @@ def test_mm_embed_plan_packs_per_request_with_dp_dummy_lane():
             mm_items=_build_image_items(
                 np.arange(8, dtype=np.float32).reshape(8, 1),
                 [(1, 2, 4)],
-                [(2, 3)],
+                [(2, 4)],
             )
         ),
         extend_input_len=4,
@@ -1240,12 +1240,12 @@ def test_mm_embed_plan_pads_dp_ranks_with_uneven_multi_image_requests():
     rank0_items = _build_image_items(
         np.arange(24, dtype=np.float32).reshape(24, 1),
         [(1, 2, 4), (1, 4, 4)],
-        [(0, 1), (3, 6)],
+        [(0, 2), (3, 7)],
     )
     rank1_items = _build_image_items(
         np.arange(32, dtype=np.float32).reshape(32, 1),
         [(1, 2, 4), (1, 2, 4), (1, 4, 4)],
-        [(1, 2), (4, 5), (7, 10)],
+        [(1, 3), (4, 6), (7, 11)],
     )
     rank0_req = SimpleNamespace(
         mm_inputs=MultimodalInputs(mm_items=rank0_items),
@@ -1294,7 +1294,7 @@ def test_qwen_metadata_builder_checks_feature_rows_match_grid():
     item = MultimodalDataItem(
         modality=Modality.IMAGE,
         feature=np.ones((7, 1), dtype=np.float32),
-        offsets=[(0, 1)],
+        placeholder_ranges=[(0, 2)],
         model_specific_data={"image_grid_thw": np.array([[1, 2, 4]], dtype=np.int32)},
     )
 
@@ -1317,7 +1317,7 @@ def test_qwen_metadata_builder_checks_placeholder_rows_match_grid():
     item = MultimodalDataItem(
         modality=Modality.IMAGE,
         feature=np.ones((8, 1), dtype=np.float32),
-        offsets=[(0, 0)],
+        placeholder_ranges=[(0, 1)],
         model_specific_data={"image_grid_thw": np.array([[1, 2, 4]], dtype=np.int32)},
     )
 
@@ -1333,7 +1333,7 @@ def test_mm_embed_plan_rejects_dict_mm_inputs():
                 {
                     "modality": "image",
                     "feature": feature,
-                    "offsets": [(0, 1)],
+                    "placeholder_ranges": [(0, 2)],
                     "image_grid_thw": np.array([[1, 2, 4]], dtype=np.int32),
                 }
             ]
@@ -1398,7 +1398,7 @@ def test_mm_embed_plan_returns_none_before_resolving_builder_without_images():
 
 def test_mm_embed_plan_fails_fast_when_qwen_vision_config_missing():
     features = np.arange(8, dtype=np.float32).reshape(8, 1)
-    items = _build_image_items(features, [(1, 2, 4)], [(0, 1)])
+    items = _build_image_items(features, [(1, 2, 4)], [(0, 2)])
     req = SimpleNamespace(
         mm_inputs=MultimodalInputs(mm_items=items),
         extend_input_len=2,

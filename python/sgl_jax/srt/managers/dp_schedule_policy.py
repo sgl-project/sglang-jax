@@ -17,7 +17,9 @@ BALANCE_REL = 1.1
 CACHE_THRESHOLD = 0.5
 
 
-def req_prefix_match_key(req) -> tuple[list[int] | None, str | None]:
+def req_prefix_match_key(
+    req, cache_input_ids: list[int] | None = None
+) -> tuple[list[int] | None, str | None]:
     """Effective ``(token_ids, extra_key)`` for a cache-affinity prefix probe.
 
     Mirrors the key the request will use for its *real* radix lookup, so the
@@ -36,7 +38,7 @@ def req_prefix_match_key(req) -> tuple[list[int] | None, str | None]:
     prefix (an unexpanded batch, an empty/one-token prompt, or a request whose
     reusable prefix clamps to zero), so the caller falls back to load balancing.
     """
-    input_ids = req.input_ids
+    input_ids = cache_input_ids or req.input_ids
     if not isinstance(input_ids, list) or not input_ids or not isinstance(input_ids[0], int):
         return None, None
 
