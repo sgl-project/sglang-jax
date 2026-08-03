@@ -4,6 +4,7 @@ import itertools
 import logging
 import time
 from collections.abc import Callable
+from contextlib import nullcontext
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -35,7 +36,8 @@ class CompilationManager:
         max_req_len: int,
         vocab_size: int,
         max_total_num_tokens: int = 0,
-        multimodal: bool = False,
+        precompile_in_model_multimodal: bool = False,
+        capture_hidden_states: bool = False,
         has_recurrent_state: bool = False,
         supports_recurrent_cow: bool = False,
         supports_recurrent_track: bool = False,
@@ -49,7 +51,8 @@ class CompilationManager:
         self.max_padded_batch_size = max_padded_batch_size
         self.max_padded_num_tokens = max_padded_num_tokens
         self.vocab_size = vocab_size
-        self.multimodal = multimodal
+        self.precompile_in_model_multimodal = precompile_in_model_multimodal
+        self.capture_hidden_states = capture_hidden_states
         self.has_recurrent_state = has_recurrent_state
         self.supports_recurrent_cow = supports_recurrent_cow
         self.supports_recurrent_track = supports_recurrent_track
@@ -63,7 +66,6 @@ class CompilationManager:
         self.token_buckets = self._compute_token_buckets(server_args.precompile_token_paddings)
         self.bs_buckets = self._compute_bs_buckets(server_args.precompile_bs_paddings)
         self.cache_loc_buckets = self._compute_cache_loc_buckets()
-
         self._compiled_variants: set[tuple] = set()
 
     def _compute_token_buckets(self, user_paddings: list[int] | None) -> list[int]:
@@ -127,6 +129,139 @@ class CompilationManager:
             for bs in self.bs_buckets
         ]
 
+    def _extend_variant_names(self) -> tuple[str, ...]:
+        variants = ["text"]
+        if self.precompile_in_model_multimodal:
+            variants.append("multimodal")
+        return tuple(variants)
+
+    @staticmethod
+    def _populate_dummy_multimodal_inputs(batch, model_runner: ModelRunner) -> None:
+        """Populate the array leaves produced by the runtime vision merge.
+
+        The values are irrelevant for compilation. Shapes, dtypes, and shardings
+        are established by ``ForwardBatch.init_new`` to match real VLM EXTEND
+        batches.
+        """
+        hidden_size = model_runner.model_config.hidden_size
+        num_tokens = len(batch.input_ids)
+        dtype = np.dtype(model_runner.model_config.dtype)
+        batch.input_embedding = np.zeros((num_tokens, hidden_size), dtype=dtype)
+
+        deepstack_layers = getattr(model_runner.model, "deepstack_visual_layers", 0)
+        if isinstance(deepstack_layers, int) and deepstack_layers > 0:
+            batch.deepstack_visual_embedding = np.zeros(
+                (deepstack_layers, num_tokens, hidden_size),
+                dtype=dtype,
+            )
+            # Real Qwen3-VL requests carry True. Keeping the dummy identical also
+            # exercises the DeepStack addition branch while adding only zeros.
+            batch.apply_for_deepstack = True
+
+    @staticmethod
+    def _packed_multimodal_shapes(model_runner: ModelRunner) -> tuple[tuple[int, int], ...]:
+        getter = getattr(
+            model_runner.model,
+            "get_multimodal_embedding_packed_shapes",
+            None,
+        )
+        if not callable(getter):
+            return ()
+        shapes = tuple((int(rows), int(cap)) for rows, cap in getter())
+        if any(rows <= 0 or cap <= 0 for rows, cap in shapes):
+            raise ValueError(f"invalid multimodal packed shapes: {shapes}")
+        return shapes
+
+    @staticmethod
+    def _embedding_pool(model_runner: ModelRunner):
+        from sgl_jax.srt.multimodal.in_model.embedding_pool import EmbeddingPool
+
+        pool = getattr(model_runner, "embedding_pool", None)
+        return pool if isinstance(pool, EmbeddingPool) else None
+
+    @staticmethod
+    def _warm_multimodal_merge(
+        forward_batch,
+        input_embedding: Callable,
+        packed_shapes: tuple[tuple[int, int], ...] = (),
+        embedding_pool=None,
+        mesh=None,
+    ) -> None:
+        import jax
+        import jax.numpy as jnp
+        from jax.sharding import NamedSharding, PartitionSpec
+
+        from sgl_jax.srt.multimodal.in_model.embedding_pool import EmbeddingPoolEntry
+        from sgl_jax.srt.multimodal.in_model.host_orchestration import (
+            ItemTask,
+            _gather_from_pool,
+            _gather_merge,
+            _MergeMapping,
+        )
+        from sgl_jax.srt.multimodal.in_model.interface import PackedMultimodalEmbedding
+
+        if mesh is None:
+            mesh = getattr(getattr(forward_batch.input_ids, "sharding", None), "mesh", None)
+        with jax.set_mesh(mesh) if mesh is not None else nullcontext():
+            target = input_embedding(forward_batch.input_ids)  # [T, H]
+            num_tokens, hidden = target.shape[0], target.shape[1]
+
+            def _replicated(shape) -> jax.Array:
+                zeros = jnp.zeros(shape, target.dtype)
+                if mesh is not None:
+                    zeros = jax.device_put(
+                        zeros,
+                        NamedSharding(mesh, PartitionSpec(*([None] * len(shape)))),
+                    )
+                return zeros
+
+            deepstack = getattr(forward_batch, "deepstack_visual_embedding", None)
+            deepstack_dim = deepstack.shape[0] if deepstack is not None else 0
+            shapes = packed_shapes or ((1, num_tokens),)
+            running, merged_deepstack = target, None
+            for num_lanes, cap in shapes:
+                length = min(num_tokens, cap)
+                task = ItemTask(
+                    item=None,
+                    output_len=length,
+                    merge_mappings=(_MergeMapping(0, 0, length),),
+                )
+                packed = PackedMultimodalEmbedding(
+                    output=_replicated((num_lanes, cap, hidden * (1 + deepstack_dim))),
+                    placements=((0, 0, length),),
+                    num_lanes=num_lanes,
+                    cap=cap,
+                    deepstack_dim=deepstack_dim,
+                )
+                running, merged_deepstack = _gather_merge(target, None, packed, (task,), mesh)
+                jax.block_until_ready(running)
+                if merged_deepstack is not None:
+                    jax.block_until_ready(merged_deepstack)
+
+            if embedding_pool is not None:
+                length = min(num_tokens, embedding_pool.page_size)
+                task = ItemTask(
+                    item=None,
+                    output_len=length,
+                    merge_mappings=(_MergeMapping(0, 0, length),),
+                )
+                entry = EmbeddingPoolEntry(np.asarray([0], dtype=np.int32), length)
+                running, merged_deepstack = _gather_from_pool(
+                    target,
+                    None,
+                    embedding_pool,
+                    (task,),
+                    (entry,),
+                    mesh,
+                )
+                jax.block_until_ready(running)
+                if merged_deepstack is not None:
+                    jax.block_until_ready(merged_deepstack)
+
+        forward_batch.input_embedding = running
+        if merged_deepstack is not None:
+            forward_batch.deepstack_visual_embedding = merged_deepstack
+
     # ---- Pre-compilation ----
 
     def precompile_all(
@@ -140,6 +275,12 @@ class CompilationManager:
         self._precompile_extend(
             forward_fn, model_runner, mesh, prepare_lora_fn, future_token_ids_map
         )
+        if self.precompile_in_model_multimodal:
+            model_runner.model.precompile_multimodal()
+            embedding_pool = self._embedding_pool(model_runner)
+            if embedding_pool is not None:
+                for num_lanes, cap in self._packed_multimodal_shapes(model_runner):
+                    embedding_pool.precompile_packed_write(num_lanes, cap)
         self._precompile_decode(
             forward_fn, model_runner, mesh, prepare_lora_fn, future_token_ids_map
         )
@@ -157,18 +298,22 @@ class CompilationManager:
         from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 
         start_time = time.perf_counter()
+        packed_shapes = self._packed_multimodal_shapes(model_runner)
+        embedding_pool = self._embedding_pool(model_runner)
         bs = self.max_padded_batch_size
+        variant_names = self._extend_variant_names()
         logger.info(
-            "[EXTEND] Begin to precompile bs_paddings=%s token_paddings=%s",
+            "[EXTEND] Begin to precompile variants=%s bs_paddings=%s token_paddings=%s",
+            variant_names,
             [bs],
             self.token_buckets,
         )
 
-        pairs = list(itertools.product([bs], self.token_buckets))
+        pairs = list(itertools.product(variant_names, [bs], self.token_buckets))
         with tqdm(pairs, desc="[EXTEND] PRECOMPILE", leave=False) as pbar:
             for pair in pbar:
-                bs_val, num_tokens = pair
-                pbar.set_postfix(bs=bs_val, tokens=num_tokens)
+                variant_name, bs_val, num_tokens = pair
+                pbar.set_postfix(variant=variant_name, bs=bs_val, tokens=num_tokens)
                 if bs_val > num_tokens:
                     logger.warning("bs=%s > num_tokens=%s, skip this pair", bs_val, num_tokens)
                     continue
@@ -180,12 +325,22 @@ class CompilationManager:
                     dp_size=self.dp_size,
                     per_dp_bs_size=bs_val // self.dp_size,
                 )
+                if variant_name == "multimodal":
+                    self._populate_dummy_multimodal_inputs(batch, model_runner)
                 if prepare_lora_fn is not None:
                     prepare_lora_fn(batch)
                 sampling_metadata = SamplingMetadata.from_model_worker_batch(
                     batch, 0, mesh, self.vocab_size
                 )
                 batch.forward_batch = ForwardBatch.init_new(batch, model_runner)
+                if variant_name == "multimodal":
+                    self._warm_multimodal_merge(
+                        batch.forward_batch,
+                        model_runner.model.get_input_embeddings(),
+                        packed_shapes,
+                        embedding_pool,
+                        mesh,
+                    )
                 if future_token_ids_map is not None:
                     from sgl_jax.srt.managers.utils import resolve_future_token_ids
 
@@ -195,10 +350,14 @@ class CompilationManager:
                 forward_fn(
                     batch,
                     launch_done=None,
-                    skip_sample=False,
+                    skip_sample=variant_name == "multimodal",
                     sampling_metadata=sampling_metadata,
                 )
-                self._compiled_variants.add((ForwardMode.EXTEND, num_tokens, bs_val, False))
+                if variant_name == "text":
+                    variant_key = (ForwardMode.EXTEND, num_tokens, bs_val, False)
+                else:
+                    variant_key = ("VLM_EXTEND", num_tokens, bs_val)
+                self._compiled_variants.add(variant_key)
 
         end_time = time.perf_counter()
         logger.info("[EXTEND] Precompile finished in %.0f secs", end_time - start_time)
@@ -355,7 +514,7 @@ class CompilationManager:
             logits_indices=logits_indices,
             input_logprob_indices=None,
             capture_hidden_mode=(
-                CaptureHiddenMode.FULL if self.multimodal else CaptureHiddenMode.NULL
+                CaptureHiddenMode.FULL if self.capture_hidden_states else CaptureHiddenMode.NULL
             ),
             spec_algorithm=spec_algorithm_value,
             lora_ids=lora_ids,

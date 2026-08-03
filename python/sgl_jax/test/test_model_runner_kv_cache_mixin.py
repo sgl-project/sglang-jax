@@ -52,3 +52,41 @@ def test_recurrent_admission_cap_already_aligned_unchanged():
     # 16 // 2 = 8 is already a dp_size=4 multiple.
     cap = ModelRunnerKVCacheMixin._resolve_max_num_reqs(_fake_runner(16, 4), 1000)
     assert cap == 8
+
+
+def test_profile_available_bytes_reserves_only_static_fraction():
+    runner = types.SimpleNamespace(
+        get_available_device_memory=lambda: 900,
+        mem_fraction_static=0.8,
+        embedding_pool_bytes=0,
+        linear_recurrent_config=None,
+    )
+    assert ModelRunnerKVCacheMixin._profile_available_bytes(runner, 1000) == 700
+
+
+def test_embedding_pool_bytes_reserved_from_kv_budget():
+    runner = types.SimpleNamespace(
+        get_available_device_memory=lambda: 900,
+        mem_fraction_static=0.8,
+        embedding_pool_bytes=100,
+        linear_recurrent_config=None,
+    )
+    assert ModelRunnerKVCacheMixin._profile_available_bytes(runner, 1000) == 600
+
+
+def test_embedding_pool_bytes_only_for_in_model_prefill():
+    from sgl_jax.srt.model_executor.model_runner import _embedding_pool_bytes
+
+    config = types.SimpleNamespace(
+        is_multimodal=True,
+        hf_config=types.SimpleNamespace(architectures=["Qwen2_5_VLForConditionalGeneration"]),
+    )
+    args = types.SimpleNamespace(
+        mm_embedding_cache_size_mb=128,
+        multimodal=False,
+        enable_lora=False,
+        disaggregation_mode="null",
+    )
+    assert _embedding_pool_bytes(config, args) == 128 * 1024**2
+    args.multimodal = True
+    assert _embedding_pool_bytes(config, args) == 0

@@ -347,8 +347,11 @@ class ModelRunnerKVCacheMixin:
 
     def _profile_available_bytes(self: ModelRunner, total_device_memory: int) -> int:
         """Profile available bytes for KV cache (+ recurrent state)."""
-        available_device_memory = self.get_available_device_memory()
-        rest_memory = available_device_memory - total_device_memory * (1 - self.mem_fraction_static)
+        rest_memory = (
+            self.get_available_device_memory()
+            - total_device_memory * (1 - self.mem_fraction_static)
+            - self.embedding_pool_bytes
+        )
         if rest_memory <= 0:
             raise RuntimeError("Not enough memory. Please try to increase --mem-fraction-static.")
 
