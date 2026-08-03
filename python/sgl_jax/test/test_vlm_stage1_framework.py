@@ -8,1412 +8,1037 @@ import pytest
 from flax import nnx
 from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec
 
-from sgl_jax.srt.managers.io_struct import GenerateReqInput
-from sgl_jax.srt.managers.mm_utils import (
-    _build_embed_round,
-    _collect_image_requests,
-    build_mm_embed_plan,
-    merge_jit,
-)
 from sgl_jax.srt.managers.schedule_batch import (
     ModelWorkerBatch,
     ScheduleBatch,
     ScheduleReqsInfo,
 )
-from sgl_jax.srt.model_executor.forward_batch_info import (
-    ForwardBatch,
-    ForwardMode,
-    _device_put_embed_plan,
-)
-from sgl_jax.srt.models.qwen2_5_vl import Qwen2_5_VisionTransformer
-from sgl_jax.srt.models.vision_metadata import (  # noqa: F401
-    qwen2_5_vl as _qwen25vl_vision_metadata,
-)
-from sgl_jax.srt.models.vision_metadata.qwen2_5_vl import (
-    Qwen25VLVisionMetadata,
-    Qwen25VLVisionMetadataBuilder,
-)
-from sgl_jax.srt.multimodal.common.mm_plan import (
-    EmbedRound,
-    MultimodalEmbedPlan,
-    VisionEncodeInputs,
-)
+from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sgl_jax.srt.models.qwen2_5_vl import Qwen2_5_VisionTransformer, _vision_attention
+from sgl_jax.srt.models.qwen3_vl import Qwen3VLVisionModel
 from sgl_jax.srt.multimodal.common.modality_enum import (
     Modality,
     MultimodalDataItem,
     MultimodalInputs,
 )
+from sgl_jax.srt.multimodal.in_model import host_orchestration
+from sgl_jax.srt.multimodal.in_model.embedding_pool import EmbeddingPool
+from sgl_jax.srt.multimodal.in_model.host_orchestration import (
+    _MergeMapping,
+    build_multimodal_batch,
+)
+from sgl_jax.srt.multimodal.in_model.interface import (
+    InModelMultimodalContract,
+    PackedMultimodalEmbedding,
+)
+from sgl_jax.srt.multimodal.in_model.lane_packing import balance_lanes
+from sgl_jax.srt.multimodal.kernels.flash_attention import SegmentIds
+from sgl_jax.srt.multimodal.layers.attention.flash_attention_backend import (
+    VisionFlashAttentionBackend,
+)
+from sgl_jax.srt.multimodal.layers.vision_sharding import VisionShardSpecs
 from sgl_jax.srt.multimodal.processors.qwen_vl import QwenVLProcessor
 from sgl_jax.srt.server_args import apply_multimodal_model_defaults
 
+ARCH = "Qwen2_5_VLForConditionalGeneration"
 
-def _build_image_items(features, grids, placeholder_ranges):
-    return QwenVLProcessor._build_items(
-        features,
-        grids,
-        placeholder_ranges,
-        Modality.IMAGE,
-        "image_grid_thw",
+
+class _TestInModelModel(InModelMultimodalContract):
+    def get_input_embeddings(self):
+        return lambda input_ids: input_ids
+
+
+def _vision_config(**overrides):
+    values = {
+        "patch_size": 1,
+        "temporal_patch_size": 1,
+        "in_channels": 1,
+        "hidden_size": 4,
+        "depth": 0,
+        "intermediate_size": 8,
+        "hidden_act": "silu",
+        "num_heads": 1,
+        "out_hidden_size": 4,
+        "spatial_merge_size": 1,
+        "fullatt_block_indexes": [],
+        "window_size": 1,
+        "rope_theta": 10000.0,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def _qwen_config(**overrides):
+    values = {
+        "patch_size": 14,
+        "window_size": 112,
+        "spatial_merge_size": 2,
+        "num_heads": 16,
+        "hidden_size": 1280,
+        "out_hidden_size": 1280,
+    }
+    values.update(overrides)
+    return _vision_config(**values)
+
+
+def _model_config(vision_config=None, arch=ARCH):
+    return SimpleNamespace(
+        is_multimodal=True,
+        hf_config=SimpleNamespace(
+            architectures=[arch],
+            vision_config=vision_config or _qwen_config(),
+        ),
     )
 
 
-class _NaiveSegmentAttentionBackend:
-    def __call__(self, q, k, v, segment_ids):
-        q_seg = segment_ids.q
-        kv_seg = segment_ids.kv
-        scores = jnp.einsum("dnth,dnsh->dnts", q, k)
-        mask = (q_seg[:, None, :, None] == kv_seg[:, None, None, :]) & (
-            q_seg[:, None, :, None] >= 0
-        )
-        scores = jnp.where(mask, scores, jnp.asarray(-1e9, dtype=scores.dtype))
-        probs = jax.nn.softmax(scores, axis=-1)
-        return jnp.einsum("dnts,dnsh->dnth", probs, v)
-
-
-def _two_data_devices():
-    devices = jax.devices()
-    if len(devices) < 2:
-        pytest.skip("requires at least two devices for real data-axis sharding")
-    return np.array(devices[:2])
-
-
-def test_vision_transformer_uses_default_norm_eps_when_hf_vision_config_omits_it():
-    vision_config = SimpleNamespace(
-        patch_size=1,
-        temporal_patch_size=1,
-        in_channels=3,
-        hidden_size=4,
-        depth=1,
-        intermediate_size=8,
-        hidden_act="silu",
-        num_heads=1,
-        out_hidden_size=4,
-        spatial_merge_size=1,
-        fullatt_block_indexes=[],
-    )
-
-    mesh = Mesh(np.array(jax.devices()[:1]), ("data",))
+def _visual(config=None, mesh=None, encoder_tp=False, input_buckets=(32,)):
+    mesh = mesh or _mesh()
     with jax.set_mesh(mesh):
-        Qwen2_5_VisionTransformer(
-            config=vision_config,
-            dtype=jnp.float32,
-            mesh=None,
-            norm_eps=1e-6,
-        )
-
-
-def test_vision_transformer_encode_jit_accepts_unhashable_vision_config():
-    class UnhashableVisionConfig(SimpleNamespace):
-        __hash__ = None
-
-    vision_config = UnhashableVisionConfig(
-        patch_size=1,
-        temporal_patch_size=1,
-        in_channels=1,
-        hidden_size=4,
-        depth=0,
-        intermediate_size=8,
-        hidden_act="silu",
-        num_heads=1,
-        out_hidden_size=4,
-        spatial_merge_size=1,
-        fullatt_block_indexes=[],
-    )
-    mesh = Mesh(np.array(jax.devices()[:1]), ("data",))
-    meta = Qwen25VLVisionMetadata(
-        window_index=jnp.zeros((1, 2), dtype=jnp.int32),
-        cu_window_seqlens=jnp.array([[2]], dtype=jnp.int32),
-        rotary_pos_emb=jnp.zeros((1, 2, 2), dtype=jnp.float32),
-        cu_image_seqlens=jnp.array([[2]], dtype=jnp.int32),
-    )
-
-    with jax.set_mesh(mesh):
-        visual = Qwen2_5_VisionTransformer(
-            config=vision_config,
-            dtype=jnp.float32,
+        return Qwen2_5_VisionTransformer(
+            config or _vision_config(),
+            jnp.float32,
             mesh=mesh,
-            norm_eps=1e-6,
-        )
-        features = visual.encode_jit(
-            jnp.ones((1, 2, 1), dtype=jnp.float32),
-            meta,
-            jnp.array([2], dtype=jnp.int32),
+            vision_tp=encoder_tp,
+            input_buckets=input_buckets,
         )
 
-    assert features.shape == (1, 2, 4)
+
+def _build_items(features, grids, ranges, modality=Modality.IMAGE):
+    key = "image_grid_thw" if modality == Modality.IMAGE else "video_grid_thw"
+    return QwenVLProcessor._build_items(features, grids, ranges, modality, key)
 
 
-def test_vision_transformer_encode_jit_uses_reshard_for_explicit_mesh(monkeypatch):
-    vision_config = SimpleNamespace(
-        patch_size=1,
-        temporal_patch_size=1,
-        in_channels=1,
-        hidden_size=4,
-        depth=0,
-        intermediate_size=8,
-        hidden_act="silu",
-        num_heads=1,
-        out_hidden_size=4,
-        spatial_merge_size=1,
-        fullatt_block_indexes=[],
-    )
-    mesh = Mesh(np.array(jax.devices()[:1]), ("data",), axis_types=(AxisType.Explicit,))
-    meta = Qwen25VLVisionMetadata(
-        window_index=jnp.zeros((1, 2), dtype=jnp.int32),
-        cu_window_seqlens=jnp.array([[2]], dtype=jnp.int32),
-        rotary_pos_emb=jnp.zeros((1, 2, 2), dtype=jnp.float32),
-        cu_image_seqlens=jnp.array([[2]], dtype=jnp.int32),
+def _items(grids, ranges, modality=Modality.IMAGE):
+    rows = sum(int(np.prod(grid)) for grid in grids)
+    features = np.arange(rows, dtype=np.float32).reshape(rows, 1)
+    return _build_items(features, grids, ranges, modality)
+
+
+def _req(items, extend_len):
+    return SimpleNamespace(
+        mm_inputs=MultimodalInputs(mm_items=items),
+        extend_input_len=extend_len,
+        lora_id="0",
     )
 
-    with jax.set_mesh(mesh):
-        visual = Qwen2_5_VisionTransformer(
-            config=vision_config,
-            dtype=jnp.float32,
-            mesh=mesh,
-            norm_eps=1e-6,
+
+def _batch(items, *, config=None, prefix=0, extend=None, per_dp_token=None):
+    ends = [end for item in items for _, end in (item.placeholder_ranges or [])]
+    max_end = max(ends, default=extend or 1)
+    extend = max_end - prefix if extend is None else extend
+    per_dp_token = extend if per_dp_token is None else per_dp_token
+    info = ScheduleReqsInfo(
+        reqs=[_req(items, extend)],
+        prefix_lens=[prefix],
+        extend_lens=[extend],
+        seq_lens=np.array([prefix + extend], dtype=np.int32),
+    )
+    return build_multimodal_batch(
+        [info],
+        1,
+        _model_config(config),
+        per_dp_token,
+    )
+
+
+def _batch_dp(items_by_dp, *, config=None, per_dp_token):
+    infos = []
+    for items in items_by_dp:
+        ends = [end for item in items for _, end in (item.placeholder_ranges or [])]
+        extend = max(ends, default=1)
+        infos.append(
+            ScheduleReqsInfo(
+                reqs=[_req(items, extend)] if items else [],
+                prefix_lens=[0] if items else [],
+                extend_lens=[extend] if items else [],
+                seq_lens=np.asarray([extend] if items else [], dtype=np.int32),
+            )
+        )
+    return build_multimodal_batch(
+        infos,
+        len(items_by_dp),
+        _model_config(config),
+        per_dp_token,
+    )
+
+
+def _mesh(dp=1, tp=1):
+    count = dp * tp
+    if len(jax.devices()) < count:
+        pytest.skip(f"requires {count} devices")
+    return Mesh(
+        np.asarray(jax.devices()[:count]).reshape(dp, tp),
+        ("data", "tensor"),
+        axis_types=(AxisType.Explicit, AxisType.Explicit),
+    )
+
+
+def _schedule_batch(req, model_config=None):
+    input_ids = np.arange(req.extend_input_len, dtype=np.int32)
+    info = ScheduleReqsInfo(
+        reqs=[req],
+        input_ids=input_ids,
+        seq_lens=np.array([len(input_ids)], dtype=np.int32),
+        out_cache_loc=np.arange(1, len(input_ids) + 1, dtype=np.int32),
+        req_pool_indices=np.array([0], dtype=np.int32),
+        prefix_lens=np.array([0], dtype=np.int32),
+        extend_lens=np.array([len(input_ids)], dtype=np.int32),
+        extend_logprob_start_lens=np.array([0], dtype=np.int32),
+    )
+    batch = ScheduleBatch(
+        reqs_info=[info],
+        dp_size=1,
+        forward_mode=ForwardMode.EXTEND,
+        return_logprob=False,
+        model_config=model_config,
+    )
+    batch._merge_sampling_info = lambda *_: None
+    batch._merge_cache_loc = lambda *_: info.out_cache_loc
+    return batch
+
+
+@pytest.mark.parametrize(
+    ("vision_tp", "expected_lanes"),
+    [
+        (False, [[0], [3], [4], [1, 2]]),
+        (True, [[0, 1, 2], [3, 4]]),
+    ],
+)
+def test_vision_batch_layout_uses_all_encoder_lanes(vision_tp, expected_lanes):
+    lengths = (8, 4, 2, 7, 6)
+    data_size, tensor_size = 2, 2
+    num_lanes = data_size * (1 if vision_tp else tensor_size)
+    lanes = balance_lanes(lengths, num_lanes)
+    assert lanes == expected_lanes
+
+    fake_mesh = SimpleNamespace(axis_names=("data", "tensor"))
+    expected_axis = "data" if vision_tp else ("data", "tensor")
+    assert VisionShardSpecs(fake_mesh, vision_tp).batch_spec(None) == PartitionSpec(
+        expected_axis,
+        None,
+    )
+
+
+def _assert_vision_precompile(visual):
+    calls = []
+
+    def encode(patches, metadata, valid):
+        calls.append(
+            (
+                patches.shape,
+                valid.shape,
+                tuple(leaf.shape[0] for leaf in jax.tree.leaves(metadata)),
+            )
         )
 
-        def fail_with_sharding_constraint(*args, **kwargs):
-            raise AssertionError("with_sharding_constraint must not be used in Qwen vision encode")
+    with patch.object(type(visual), "encode", side_effect=encode):
+        visual.precompile()
 
-        reshard_specs = []
-        original_reshard = jax.sharding.reshard
-
-        def record_reshard(x, out_sharding):
-            reshard_specs.append(tuple(out_sharding.spec))
-            return original_reshard(x, out_sharding)
-
-        monkeypatch.setattr(jax.lax, "with_sharding_constraint", fail_with_sharding_constraint)
-        monkeypatch.setattr(jax.sharding, "reshard", record_reshard)
-
-        features = visual.encode_jit(
-            jnp.ones((1, 2, 1), dtype=jnp.float32),
-            meta,
-            jnp.array([2], dtype=jnp.int32),
-        )
-
-    assert features.shape == (1, 2, 4)
-    assert reshard_specs == [
-        ("data", None, None, None, None, None),
-        ("data", None, None),
-        ("data", None, None),
+    assert calls == [
+        ((1, 4, 1), (1,), (1, 1, 1, 1)),
+        ((1, 8, 1), (1,), (1, 1, 1, 1)),
     ]
 
 
-def test_vision_transformer_encode_binds_mesh_for_sharded_inputs_without_callsite_context(
-    monkeypatch,
-):
-    vision_config = SimpleNamespace(
-        patch_size=1,
-        temporal_patch_size=1,
-        in_channels=1,
-        hidden_size=4,
-        depth=2,
-        intermediate_size=16,
-        hidden_act="silu",
-        num_heads=1,
-        out_hidden_size=4,
+def test_qwen2_vision_precompile_warms_configured_buckets():
+    config = _vision_config(
         spatial_merge_size=2,
-        fullatt_block_indexes=[1],
+        window_size=2,
+        num_position_embeddings=16,
+        deepstack_visual_indexes=[],
     )
-    mesh = Mesh(np.array(jax.devices()[:1]), ("data",), axis_types=(AxisType.Explicit,))
-    with jax.set_mesh(mesh):
-        visual = Qwen2_5_VisionTransformer(
-            config=vision_config,
-            dtype=jnp.float32,
-            mesh=mesh,
-            norm_eps=1e-6,
-        )
-        for block in visual.blocks:
-            block.attn.attn_backend = None
+    _assert_vision_precompile(_visual(config=config, input_buckets=(4, 8)))
 
-    def fake_vision_attention(backend, q, k, v, seg):
-        return jnp.zeros_like(q)
 
-    monkeypatch.setattr(
-        "sgl_jax.srt.models.qwen2_5_vl._vision_attention",
-        fake_vision_attention,
+def test_qwen2_vision_rejects_unaligned_buckets():
+    with pytest.raises(ValueError, match="positive multiples of 4"):
+        _visual(config=_vision_config(spatial_merge_size=2), input_buckets=(3,))
+
+
+@pytest.mark.parametrize("encoder_tp", [False, True])
+def test_qwen2_global_batch_spmd(encoder_tp):
+    mesh = _mesh(dp=2, tp=2)
+    visual = _visual(
+        mesh=mesh,
+        encoder_tp=encoder_tp,
+        input_buckets=(8,),
     )
+    items = _items(
+        [(1, 1, length) for length in (8, 4, 2, 7, 6)],
+        [(0, length) for length in (8, 4, 2, 7, 6)],
+    )
+    patches, _, valid, placements = visual._batch_items(items)
 
-    plan = MultimodalEmbedPlan(
-        rounds_by_modality={
-            Modality.IMAGE: [
-                EmbedRound(
-                    encode_inputs=VisionEncodeInputs(
-                        pixels=np.ones((1, 4, 1), dtype=np.float32),
-                        valid=np.array([4], dtype=np.int32),
-                        meta=Qwen25VLVisionMetadata(
-                            window_index=np.array([[0]], dtype=np.int32),
-                            cu_window_seqlens=np.array([[4]], dtype=np.int32),
-                            rotary_pos_emb=np.zeros((1, 4, 2), dtype=np.float32),
-                            cu_image_seqlens=np.array([[4]], dtype=np.int32),
-                        ),
-                    ),
-                    src_idx=np.zeros((1,), dtype=np.int32),
-                    mask=np.zeros((1,), dtype=np.bool_),
-                )
-            ]
+    if encoder_tp:
+        assert placements == ((0, 0, 8), (0, 8, 4), (0, 12, 2), (1, 0, 7), (1, 7, 6))
+        expected_valid = {
+            mesh.devices[0, 0]: (14,),
+            mesh.devices[0, 1]: (14,),
+            mesh.devices[1, 0]: (13,),
+            mesh.devices[1, 1]: (13,),
         }
+        expected_patches = {
+            mesh.devices[0, 0]: tuple(range(14)) + (0, 0),
+            mesh.devices[0, 1]: tuple(range(14)) + (0, 0),
+            mesh.devices[1, 0]: tuple(range(14, 27)) + (0, 0, 0),
+            mesh.devices[1, 1]: tuple(range(14, 27)) + (0, 0, 0),
+        }
+        expected_spec = PartitionSpec("data")
+    else:
+        assert placements == ((0, 0, 8), (3, 0, 4), (3, 4, 2), (1, 0, 7), (2, 0, 6))
+        expected_valid = {
+            mesh.devices[0, 0]: (8,),
+            mesh.devices[0, 1]: (7,),
+            mesh.devices[1, 0]: (6,),
+            mesh.devices[1, 1]: (6,),
+        }
+        expected_patches = {
+            mesh.devices[0, 0]: tuple(range(8)),
+            mesh.devices[0, 1]: tuple(range(14, 21)) + (0,),
+            mesh.devices[1, 0]: tuple(range(21, 27)) + (0, 0),
+            mesh.devices[1, 1]: tuple(range(8, 14)) + (0, 0),
+        }
+        expected_spec = PartitionSpec(("data", "tensor"))
+
+    assert patches.sharding.spec[0] == expected_spec[0]
+    valid_shards = {
+        shard.device: tuple(int(value) for value in np.asarray(shard.data).reshape(-1))
+        for shard in valid.addressable_shards
+    }
+    patch_shards = {
+        shard.device: tuple(int(value) for value in np.asarray(shard.data).reshape(-1))
+        for shard in patches.addressable_shards
+    }
+    assert valid_shards == expected_valid
+    assert patch_shards == expected_patches
+
+
+@pytest.mark.parametrize("encoder_tp", [False, True])
+def test_qwen2_encode_items_spmd(encoder_tp):
+    mesh = _mesh(dp=2, tp=2)
+    visual = _visual(
+        mesh=mesh,
+        encoder_tp=encoder_tp,
+        input_buckets=(4,),
     )
-    _device_put_embed_plan(plan, mesh)
-    enc = plan.rounds_by_modality[Modality.IMAGE][0].encode_inputs
+    items = _items([(1, 1, 4), (1, 1, 2)], [(0, 4), (4, 6)])
+    patches, metadata, valid, _ = visual._batch_items(items)
+    encoded = visual.encode(patches, metadata, valid)
+    assert encoded.sharding.is_fully_replicated
+    assert encoded.sharding.spec == PartitionSpec(None, None, None)
+    packed = visual.encode_items(items)
+    assert packed.output.sharding.is_fully_replicated
+    assert packed.output.sharding.device_set == set(mesh.devices.flat)
+    assert [length for _, _, length in packed.placements] == [4, 2]
+    calls = 0
 
-    features = visual.encode(enc.pixels, enc.meta, enc.valid)
+    class Model(_TestInModelModel):
+        mesh = visual.mesh
 
-    assert features.shape == (1, 1, 4)
+        def get_multimodal_encode_funcs(self):
+            return {Modality.IMAGE: self.encode}
 
+        @staticmethod
+        def encode(values):
+            nonlocal calls
+            calls += 1
+            return visual.encode_items(values)
 
-def test_vision_patch_embed_calls_conv_with_single_batch_dim(monkeypatch):
-    vision_config = SimpleNamespace(
-        patch_size=1,
-        temporal_patch_size=1,
-        in_channels=1,
-        hidden_size=4,
-        depth=0,
-        intermediate_size=8,
-        hidden_act="silu",
-        num_heads=1,
-        out_hidden_size=4,
-        spatial_merge_size=1,
-        fullatt_block_indexes=[],
+    running = jax.device_put(
+        jnp.zeros((8, 4)),
+        NamedSharding(mesh, PartitionSpec("data", None)),
     )
-    mesh = Mesh(np.array(jax.devices()[:1]), ("data",), axis_types=(AxisType.Explicit,))
-    meta = Qwen25VLVisionMetadata(
-        window_index=jnp.tile(jnp.arange(3, dtype=jnp.int32)[None, :], (2, 1)),
-        cu_window_seqlens=jnp.array([[3], [3]], dtype=jnp.int32),
-        rotary_pos_emb=jnp.zeros((2, 3, 2), dtype=jnp.float32),
-        cu_image_seqlens=jnp.array([[3], [3]], dtype=jnp.int32),
+    runtime_items = _items([(1, 1, 4), (1, 1, 2)], [(0, 4), (0, 2)])
+    args = (
+        _batch_dp(([runtime_items[0]], [runtime_items[1]]), per_dp_token=4),
+        jnp.zeros(8, dtype=jnp.int32),
+        lambda _: running,
+        Model(),
     )
-
-    seen_input_shapes = []
-    original_call = nnx.Conv.__call__
-
-    def record_conv_input_shape(self, inputs, *args, **kwargs):
-        seen_input_shapes.append(inputs.shape)
-        return original_call(self, inputs, *args, **kwargs)
-
-    monkeypatch.setattr(nnx.Conv, "__call__", record_conv_input_shape)
-
-    with jax.set_mesh(mesh):
-        visual = Qwen2_5_VisionTransformer(
-            config=vision_config,
-            dtype=jnp.float32,
-            mesh=mesh,
-            norm_eps=1e-6,
-        )
-        features = visual.encode_jit(
-            jnp.ones((2, 3, 1), dtype=jnp.float32),
-            meta,
-            jnp.array([3, 3], dtype=jnp.int32),
-        )
-
-    assert features.shape == (2, 3, 4)
-    assert seen_input_shapes == [(6, 1, 1, 1, 1)]
+    first, _ = host_orchestration.embed_multimodal_inputs(*args)
+    second, _ = host_orchestration.embed_multimodal_inputs(*args)
+    np.testing.assert_array_equal(first, second)
+    assert first.sharding.spec == PartitionSpec("data", None)
+    assert calls == 2
 
 
-def test_vision_full_attention_keeps_packed_images_block_diagonal_on_cpu():
-    vision_config = SimpleNamespace(
-        patch_size=1,
-        temporal_patch_size=1,
-        in_channels=1,
-        hidden_size=4,
-        depth=1,
-        intermediate_size=8,
-        hidden_act="silu",
-        num_heads=1,
-        out_hidden_size=4,
-        spatial_merge_size=1,
-        fullatt_block_indexes=[0],
-        window_size=1,
-        rope_theta=10000.0,
-    )
-    mesh = Mesh(np.array(jax.devices()[:1]), ("data",))
-    with jax.set_mesh(mesh):
-        visual = Qwen2_5_VisionTransformer(
-            config=vision_config,
-            dtype=jnp.float32,
-            mesh=None,
-            norm_eps=1e-6,
-        )
-    visual.blocks[0].attn.attn_backend = _NaiveSegmentAttentionBackend()
-    builder = Qwen25VLVisionMetadataBuilder(
-        SimpleNamespace(hf_config=SimpleNamespace(vision_config=vision_config))
-    )
-
-    packed_features = np.arange(1, 8, dtype=np.float32).reshape(7, 1)
-    packed_items = _build_image_items(
-        packed_features,
-        [(1, 2, 2), (1, 1, 3)],
-        [(0, 4), (4, 7)],
-    )
-    packed_meta = builder.stack_metadata(
-        [builder.get_metadata(packed_items)],
-        patch_k=7,
-    )
-
-    single_item = _build_image_items(
-        packed_features[:4],
-        [(1, 2, 2)],
-        [(0, 4)],
-    )[0]
-    single_meta = builder.stack_metadata(
-        [builder.get_metadata([single_item])],
-        patch_k=4,
-    )
-
-    packed_out = visual.compute_hidden_states(
-        jnp.asarray(packed_features[None, :, :]),
-        jnp.asarray(packed_meta.window_index),
-        jnp.asarray(packed_meta.cu_window_seqlens),
-        jnp.asarray(packed_meta.rotary_pos_emb),
-        jnp.asarray(packed_meta.cu_image_seqlens),
-        jnp.array([7], dtype=jnp.int32),
-    )
-    single_out = visual.compute_hidden_states(
-        jnp.asarray(packed_features[None, :4, :]),
-        jnp.asarray(single_meta.window_index),
-        jnp.asarray(single_meta.cu_window_seqlens),
-        jnp.asarray(single_meta.rotary_pos_emb),
-        jnp.asarray(single_meta.cu_image_seqlens),
-        jnp.array([4], dtype=jnp.int32),
-    )
-
-    np.testing.assert_allclose(
-        np.asarray(packed_out[:, :4, :]),
-        np.asarray(single_out),
-        rtol=1e-5,
-        atol=1e-5,
-    )
-
-
-def test_vision_single_image_request_matches_single_image_encode_on_cpu():
-    vision_config = SimpleNamespace(
-        patch_size=1,
-        temporal_patch_size=1,
-        in_channels=1,
-        hidden_size=4,
-        depth=1,
-        intermediate_size=8,
-        hidden_act="silu",
-        num_heads=1,
-        out_hidden_size=4,
-        spatial_merge_size=1,
-        fullatt_block_indexes=[0],
-        window_size=1,
-        rope_theta=10000.0,
-    )
-    mesh = Mesh(np.array(jax.devices()[:1]), ("data",))
-    with jax.set_mesh(mesh):
-        visual = Qwen2_5_VisionTransformer(
-            config=vision_config,
-            dtype=jnp.float32,
-            mesh=None,
-            norm_eps=1e-6,
-        )
-    visual.blocks[0].attn.attn_backend = _NaiveSegmentAttentionBackend()
-    builder = Qwen25VLVisionMetadataBuilder(
-        SimpleNamespace(hf_config=SimpleNamespace(vision_config=vision_config))
-    )
-
-    patch_features = np.arange(1, 5, dtype=np.float32).reshape(4, 1)
-    item = _build_image_items(
-        patch_features,
-        [(1, 2, 2)],
-        [(0, 4)],
-    )[0]
-    native_meta = builder.stack_metadata([builder._get_image_metadata(item)], patch_k=4)
-    packed_meta = builder.stack_metadata(
-        [builder._pack_request_metadata([builder._get_image_metadata(item)])],
-        patch_k=4,
-    )
-
-    native_out = visual.compute_hidden_states(
-        jnp.asarray(patch_features[None, :, :]),
-        jnp.asarray(native_meta.window_index),
-        jnp.asarray(native_meta.cu_window_seqlens),
-        jnp.asarray(native_meta.rotary_pos_emb),
-        jnp.asarray(native_meta.cu_image_seqlens),
-        jnp.array([4], dtype=jnp.int32),
-    )
-    packed_out = visual.compute_hidden_states(
-        jnp.asarray(patch_features[None, :, :]),
-        jnp.asarray(packed_meta.window_index),
-        jnp.asarray(packed_meta.cu_window_seqlens),
-        jnp.asarray(packed_meta.rotary_pos_emb),
-        jnp.asarray(packed_meta.cu_image_seqlens),
-        jnp.array([4], dtype=jnp.int32),
-    )
-
-    np.testing.assert_allclose(np.asarray(packed_out), np.asarray(native_out), rtol=1e-5, atol=1e-5)
-
-
-def test_vision_encode_runs_on_real_dp2_data_mesh(monkeypatch):
-    mesh = Mesh(_two_data_devices(), ("data",), axis_types=(AxisType.Explicit,))
-    vision_config = SimpleNamespace(
-        patch_size=1,
-        temporal_patch_size=1,
-        in_channels=1,
-        hidden_size=4,
-        depth=2,
-        intermediate_size=16,
-        hidden_act="silu",
-        num_heads=1,
-        out_hidden_size=4,
+def test_qwen3_vision_precompile_warms_configured_buckets():
+    config = _vision_config(
         spatial_merge_size=2,
-        fullatt_block_indexes=[1],
+        window_size=2,
+        num_position_embeddings=16,
+        deepstack_visual_indexes=[],
     )
-
-    def fake_vision_attention(backend, q, k, v, seg):
-        return jnp.zeros_like(q)
-
-    monkeypatch.setattr(
-        "sgl_jax.srt.models.qwen2_5_vl._vision_attention",
-        fake_vision_attention,
-    )
-
+    mesh = _mesh()
     with jax.set_mesh(mesh):
-        visual = Qwen2_5_VisionTransformer(
-            config=vision_config,
-            dtype=jnp.float32,
+        visual = Qwen3VLVisionModel(
+            config,
+            jnp.float32,
             mesh=mesh,
-            norm_eps=1e-6,
+            input_buckets=(4, 8),
         )
-        for block in visual.blocks:
-            block.attn.attn_backend = None
+    _assert_vision_precompile(visual)
 
-    plan = MultimodalEmbedPlan(
-        rounds_by_modality={
-            Modality.IMAGE: [
-                EmbedRound(
-                    encode_inputs=VisionEncodeInputs(
-                        pixels=np.ones((2, 8, 1), dtype=np.float32),
-                        valid=np.array([8, 4], dtype=np.int32),
-                        meta=Qwen25VLVisionMetadata(
-                            window_index=np.array([[1, 0], [0, 1]], dtype=np.int32),
-                            cu_window_seqlens=np.array([[8], [4]], dtype=np.int32),
-                            rotary_pos_emb=np.zeros((2, 8, 2), dtype=np.float32),
-                            cu_image_seqlens=np.array([[8], [4]], dtype=np.int32),
-                        ),
-                    ),
-                    src_idx=np.zeros((8,), dtype=np.int32),
-                    mask=np.zeros((8,), dtype=np.bool_),
-                )
-            ]
-        }
+
+def test_qwen3_vision_rejects_unaligned_buckets():
+    with pytest.raises(ValueError, match="positive multiples of 4"):
+        Qwen3VLVisionModel(
+            _vision_config(spatial_merge_size=2),
+            jnp.float32,
+            mesh=_mesh(),
+            input_buckets=(3,),
+        )
+
+
+@pytest.mark.parametrize("encoder_tp", [False, True])
+def test_qwen3_encode_items_spmd(encoder_tp):
+    mesh = _mesh(dp=2, tp=2)
+    config = _vision_config(
+        num_position_embeddings=16,
+        depth=1,
+        deepstack_visual_indexes=[0],
+        num_heads=2,
     )
-    _device_put_embed_plan(plan, mesh)
-    enc = plan.rounds_by_modality[Modality.IMAGE][0].encode_inputs
-
-    features = visual.encode(enc.pixels, enc.meta, enc.valid)
-
-    assert features.shape == (2, 2, 4)
-    assert tuple(features.sharding.spec) == ("data", None, None)
-
-
-def test_merge_jit_consumes_dp_leading_features():
-    mesh = Mesh(np.array(jax.devices()[:1]), ("data",))
-    running = jnp.zeros((2, 3), dtype=jnp.float32)
-    features = jnp.array([[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]], dtype=jnp.float32)
-    src_idx = jnp.array([0, 1], dtype=jnp.int32)
-    mask = jnp.array([True, True])
-
-    out = merge_jit(mesh, running, features, src_idx, mask)
-
-    np.testing.assert_array_equal(np.asarray(out), np.asarray(features[0]))
+    with jax.set_mesh(mesh):
+        visual = Qwen3VLVisionModel(
+            config,
+            jnp.float32,
+            mesh=mesh,
+            tp=encoder_tp,
+            input_buckets=(4,),
+        )
+    items = _items([(1, 1, 2), (1, 1, 4)], [(0, 2), (2, 6)])
+    packed = visual.encode_items(items)
+    assert [length for _, _, length in packed.placements] == [2, 4]
+    assert packed.output.sharding.is_fully_replicated
+    assert packed.output.sharding.device_set == set(mesh.devices.flat)
+    assert packed.deepstack is not None
+    assert packed.deepstack.sharding.is_fully_replicated
+    assert packed.deepstack.sharding.device_set == set(mesh.devices.flat)
 
 
-def test_merge_jit_uses_rank_local_features_on_real_dp2_mesh():
-    mesh = Mesh(_two_data_devices(), ("data",), axis_types=(AxisType.Explicit,))
-    running = np.arange(12, dtype=np.float32).reshape(6, 2)
-    features = np.array(
+def test_batch_separates_patch_and_placeholder_counts():
+    items = _items([(1, 2, 4), (1, 4, 4)], [(2, 4), (5, 9)])
+    tasks = _batch(items, extend=10, per_dp_token=10)[Modality.IMAGE]
+    assert [task.item for task in tasks] == items
+    assert [task.output_len for task in tasks] == [2, 4]
+    assert [task.merge_mappings for task in tasks] == [
+        (_MergeMapping(0, 2, 2),),
+        (_MergeMapping(0, 5, 4),),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("prefix", "extend", "destination", "source"),
+    [
+        (0, 4, [2, 3], [0, 1]),
+        (4, 4, [0, 1], [2, 3]),
+        (6, 2, None, None),
+    ],
+)
+def test_batch_clips_to_chunk_boundaries(prefix, extend, destination, source):
+    items = _items([(1, 4, 4)], [(2, 6)])
+    batch = _batch(items, prefix=prefix, extend=extend, per_dp_token=extend)
+    if destination is None:
+        assert batch is None
+    else:
+        mapping = batch[Modality.IMAGE][0].merge_mappings[0]
+        np.testing.assert_array_equal(
+            range(
+                mapping.destination_start,
+                mapping.destination_start + mapping.length,
+            ),
+            destination,
+        )
+        np.testing.assert_array_equal(
+            range(mapping.source_start, mapping.source_start + mapping.length),
+            source,
+        )
+
+
+def test_batch_preserves_encoder_offsets_across_chunks():
+    items = _items([(1, 4, 4), (1, 4, 4)], [(2, 6), (6, 10)])
+    tasks = _batch(items, prefix=4, extend=4)[Modality.IMAGE]
+    assert tasks[0].merge_mappings == (_MergeMapping(2, 0, 2),)
+    assert tasks[1].merge_mappings == (_MergeMapping(0, 2, 2),)
+
+
+def test_batch_uses_global_token_indices_for_dp_ranks():
+    rank0 = _req(_items([(1, 2, 4), (1, 4, 4)], [(0, 2), (3, 7)]), 8)
+    rank1 = _req(
+        _items([(1, 2, 4), (1, 2, 4), (1, 4, 4)], [(1, 3), (4, 6), (7, 11)]),
+        12,
+    )
+    batch = build_multimodal_batch(
+        [ScheduleReqsInfo(reqs=[rank0]), ScheduleReqsInfo(reqs=[rank1])],
+        2,
+        _model_config(),
+        12,
+    )
+    tasks = batch[Modality.IMAGE]
+    destinations = [
         [
-            [[10.0, 11.0], [20.0, 21.0]],
-            [[100.0, 101.0], [200.0, 201.0]],
-        ],
-        dtype=np.float32,
+            token
+            for mapping in task.merge_mappings
+            for token in range(
+                mapping.destination_start,
+                mapping.destination_start + mapping.length,
+            )
+        ]
+        for task in tasks
+    ]
+    assert destinations == [[0, 1], [3, 4, 5, 6], [13, 14], [16, 17], [19, 20, 21, 22]]
+
+
+def test_batch_routes_video_modality():
+    video = _items([(1, 2, 4)], [(0, 2)], Modality.VIDEO)
+    batch = _batch(video)
+    assert tuple(batch) == (Modality.VIDEO,)
+    assert batch[Modality.VIDEO][0].item is video[0]
+
+
+@pytest.mark.parametrize(
+    ("max_segment_len", "alignment"),
+    [(None, 2048), (64, 256)],
+)
+def test_long_vision_attention_pads_to_tuned_alignment(max_segment_len, alignment):
+    class _CaptureBackend:
+        def __init__(self):
+            self.max_segment_len = max_segment_len
+            self.shape = None
+
+        def __call__(self, q, k, v, segment_ids):
+            del k, v, segment_ids
+            self.shape = q.shape
+            return q
+
+    sequence_length = 64 * 1024 + 1
+    shape = (1, sequence_length, 1, 1)
+    q = jnp.ones(shape, dtype=jnp.bfloat16)
+    backend = _CaptureBackend()
+
+    output = _vision_attention(
+        backend,
+        q,
+        q,
+        q,
+        jnp.zeros((1, sequence_length), dtype=jnp.int32),
     )
-    src_idx = np.array([1, 0, 0, 0, 0, 1], dtype=np.int32)
-    mask = np.array([True, True, False, True, False, True])
 
-    running_d = jax.device_put(running, NamedSharding(mesh, PartitionSpec("data", None)))
-    features_d = jax.device_put(features, NamedSharding(mesh, PartitionSpec("data", None, None)))
-    src_idx_d = jax.device_put(src_idx, NamedSharding(mesh, PartitionSpec("data")))
-    mask_d = jax.device_put(mask, NamedSharding(mesh, PartitionSpec("data")))
-
-    out = merge_jit(mesh, running_d, features_d, src_idx_d, mask_d)
-
-    expected = running.copy()
-    expected[0] = features[0, 1]
-    expected[1] = features[0, 0]
-    expected[3] = features[1, 0]
-    expected[5] = features[1, 1]
-    np.testing.assert_array_equal(np.asarray(out), expected)
+    expected_length = ((sequence_length + alignment - 1) // alignment) * alignment
+    assert backend.shape == (1, 1, expected_length, 1)
+    assert output.shape == shape
 
 
-def test_device_put_embed_plan_places_qwen_metadata_data_leading():
-    mesh = Mesh(np.array(jax.devices()[:1]), ("data",), axis_types=(AxisType.Explicit,))
-    plan = MultimodalEmbedPlan(
-        rounds_by_modality={
-            Modality.IMAGE: [
-                EmbedRound(
-                    encode_inputs=VisionEncodeInputs(
-                        pixels=np.ones((1, 4, 1), dtype=np.float32),
-                        valid=np.array([4], dtype=np.int32),
-                        meta=Qwen25VLVisionMetadata(
-                            window_index=np.array([[0]], dtype=np.int32),
-                            cu_window_seqlens=np.array([[4]], dtype=np.int32),
-                            rotary_pos_emb=np.zeros((1, 4, 2), dtype=np.float32),
-                            cu_image_seqlens=np.array([[4]], dtype=np.int32),
-                        ),
-                    ),
-                    src_idx=np.zeros((2,), dtype=np.int32),
-                    mask=np.zeros((2,), dtype=np.bool_),
+def test_qwen_window_blocks_enable_bounded_segment_grid():
+    config = _vision_config(
+        depth=2,
+        fullatt_block_indexes=[1],
+        patch_size=14,
+        spatial_merge_size=2,
+        window_size=112,
+    )
+    with jax.set_mesh(_mesh()):
+        visual = Qwen2_5_VisionTransformer(
+            config,
+            jnp.bfloat16,
+            mesh=_mesh(),
+            norm_eps=1e-6,
+        )
+
+    assert visual.blocks[0].attn.attn_backend.max_segment_len == 64
+    assert not visual.blocks[0].attn.attn_backend.block_sparse_segments
+    assert visual.blocks[1].attn.attn_backend.max_segment_len is None
+    assert visual.blocks[1].attn.attn_backend.block_sparse_segments
+
+
+@pytest.mark.skipif(
+    "TPU" not in jax.devices()[0].device_kind or jax.device_count() < 4,
+    reason="Requires a four-device TPU mesh.",
+)
+def test_block_sparse_vision_backend_tpu_integration():
+    mesh = Mesh(
+        np.asarray(jax.devices()[:4]).reshape(1, 4),
+        ("data", "tensor"),
+    )
+    batch_size = 4
+    seq_len = 64 * 1024
+    qkv_shape = (batch_size, 1, seq_len, 80)
+    qkv_sharding = NamedSharding(
+        mesh,
+        PartitionSpec(("data", "tensor"), None, None, None),
+    )
+    segment_sharding = NamedSharding(
+        mesh,
+        PartitionSpec(("data", "tensor"), None),
+    )
+    qkv = jax.device_put(jnp.ones(qkv_shape, dtype=jnp.bfloat16), qkv_sharding)
+    segments = jax.device_put(
+        jnp.broadcast_to(
+            (jnp.arange(seq_len, dtype=jnp.int32) // (16 * 1024))[None, :],
+            (batch_size, seq_len),
+        ),
+        segment_sharding,
+    )
+    backend = VisionFlashAttentionBackend(
+        mesh,
+        block_sparse_segments=True,
+    )
+
+    output = jax.jit(
+        lambda qkv, segments: backend(
+            qkv,
+            qkv,
+            qkv,
+            SegmentIds(q=segments, kv=segments),
+        )
+    )(qkv, segments)
+
+    assert output.shape == qkv_shape
+    assert float(output[0, 0, 0, 0]) == 1.0
+
+
+def test_vision_weight_tp_specs():
+    mesh = _mesh(tp=4)
+    config = _vision_config(
+        hidden_size=8, out_hidden_size=8, intermediate_size=16, num_heads=4, depth=1
+    )
+    with jax.set_mesh(mesh):
+        visual = Qwen2_5_VisionTransformer(
+            config,
+            jnp.float32,
+            mesh=mesh,
+            norm_eps=1e-6,
+            vision_tp=True,
+        )
+    block = visual.blocks[0]
+    assert block.attn.q_proj.weight.value.sharding.spec == PartitionSpec(None, "tensor")
+    assert block.attn.proj.weight.value.sharding.spec == PartitionSpec("tensor", None)
+    assert visual.merger.mlp_fc2.weight.value.sharding.spec == PartitionSpec("tensor", None)
+
+
+def test_merge_preserves_unmasked_tokens():
+    item = MultimodalDataItem(
+        Modality.AUDIO,
+        feature=np.ones((2, 1)),
+        placeholder_ranges=[(0, 1), (2, 3)],
+    )
+    batch = build_multimodal_batch(
+        [ScheduleReqsInfo(reqs=[_req([item], 3)])],
+        1,
+        _model_config(),
+        3,
+    )
+
+    class Model(_TestInModelModel):
+        def get_multimodal_encode_funcs(self):
+            return {
+                Modality.AUDIO: lambda _: PackedMultimodalEmbedding(
+                    output=jnp.array([[[10.0, 11.0], [20.0, 21.0]]]),  # [1, 2, 2]
+                    placements=((0, 0, 2),),
+                    num_lanes=1,
+                    cap=2,
                 )
-            ]
-        }
+            }
+
+    running = jnp.array([[1, 2], [3, 4], [5, 6]], dtype=jnp.float32)
+    output, _ = host_orchestration.embed_multimodal_inputs(
+        batch,
+        jnp.zeros(3, dtype=jnp.int32),
+        lambda _: running,
+        Model(),
+    )
+    np.testing.assert_array_equal(output, [[10, 11], [3, 4], [20, 21]])
+
+
+def test_packed_gather_merge_preserves_data_sharding():
+    """The fast gather path merges the encoder's packed output + deepstack."""
+    mesh = _mesh(dp=2)
+    rank0 = MultimodalDataItem(
+        Modality.IMAGE, hash=0, feature=np.ones((2, 1)), placeholder_ranges=[(0, 2)]
+    )
+    rank1 = MultimodalDataItem(
+        Modality.IMAGE, hash=1, feature=np.ones((2, 1)), placeholder_ranges=[(0, 2)]
+    )
+    batch = build_multimodal_batch(
+        [
+            ScheduleReqsInfo(reqs=[_req([rank0], 2)]),
+            ScheduleReqsInfo(reqs=[_req([rank1], 2)]),
+        ],
+        2,
+        _model_config(),
+        2,
     )
 
-    _device_put_embed_plan(plan, mesh)
-    rnd = plan.rounds_by_modality[Modality.IMAGE][0]
-    enc = rnd.encode_inputs
+    # output[row, pos, (1+D)*H]; item i lives at placements[i] = (row, offset, length).
+    # Primary is [..., :H]; the single deepstack plane is [..., H:].
+    output = jnp.asarray(
+        [[[10.0, 30.0], [11.0, 31.0]], [[20.0, 40.0], [21.0, 41.0]]]
+    )  # [num_lanes=2, cap=2, (1+D)*H=2]
 
-    assert tuple(enc.pixels.sharding.spec) == ("data", None, None)
-    assert tuple(enc.valid.sharding.spec) == ("data",)
-    assert tuple(enc.meta.window_index.sharding.spec) == ("data", None)
-    assert tuple(enc.meta.cu_window_seqlens.sharding.spec) == ("data", None)
-    assert tuple(enc.meta.rotary_pos_emb.sharding.spec) == ("data", None, None)
-    assert tuple(enc.meta.cu_image_seqlens.sharding.spec) == ("data", None)
-    assert tuple(rnd.src_idx.sharding.spec) == ("data",)
-    assert tuple(rnd.mask.sharding.spec) == ("data",)
+    class Model(_TestInModelModel):
+        def get_multimodal_encode_funcs(self):
+            def encode(items):
+                assert items == [rank0, rank1]
+                return PackedMultimodalEmbedding(
+                    output=jax.device_put(
+                        output, NamedSharding(mesh, PartitionSpec(None, None, None))
+                    ),
+                    placements=((0, 0, 2), (1, 0, 2)),
+                    num_lanes=2,
+                    cap=2,
+                    deepstack_dim=1,
+                )
+
+            return {Modality.IMAGE: encode}
+
+    Model.mesh = mesh
+    running = jax.device_put(jnp.zeros((4, 1)), NamedSharding(mesh, PartitionSpec("data", None)))
+    out, ds = host_orchestration.embed_multimodal_inputs(
+        batch, jnp.zeros(4, dtype=jnp.int32), lambda _: running, Model()
+    )
+    np.testing.assert_array_equal(out[:, 0], [10, 11, 20, 21])
+    np.testing.assert_array_equal(ds[0, :, 0], [30, 31, 40, 41])
+    assert out.sharding.spec == PartitionSpec("data", None)
+    assert ds.sharding.spec == PartitionSpec(None, "data", None)
 
 
-def test_multimodal_model_defaults_keep_overlap_enabled():
-    server_args = SimpleNamespace(
+def test_packed_gather_merge_handles_chunk_split():
+    """A placeholder only partly visible in the chunk uses source_start > 0."""
+    # Item spans tokens [0, 4); chunk covers [1, 4) so only 3 of its 4 tokens show.
+    item = MultimodalDataItem(
+        Modality.IMAGE, hash=7, feature=np.ones((4, 1)), placeholder_ranges=[(0, 4)]
+    )
+    batch = build_multimodal_batch(
+        [ScheduleReqsInfo(reqs=[_req([item], 3)], prefix_lens=[1], extend_lens=[3])],
+        1,
+        _model_config(),
+        3,
+    )
+    # Full item output is 4 rows; the chunk should pull rows 1..4 into dest 0..3.
+    full = jnp.asarray([[10.0], [11.0], [12.0], [13.0]])  # [cap=4, H=1] on row 0
+
+    class Model(_TestInModelModel):
+        def get_multimodal_encode_funcs(self):
+            return {
+                Modality.IMAGE: lambda items: PackedMultimodalEmbedding(
+                    output=full[None], placements=((0, 0, 4),), num_lanes=1, cap=4
+                )
+            }
+
+    running = jnp.zeros((3, 1))
+    out, _ = host_orchestration.embed_multimodal_inputs(
+        batch, jnp.zeros(3, dtype=jnp.int32), lambda _: running, Model()
+    )
+    np.testing.assert_array_equal(out[:, 0], [11, 12, 13])
+
+
+def test_embedding_pool_replays_encoder_output():
+    """A second request for the same item is served from the pool, not the encoder."""
+    item = MultimodalDataItem(
+        Modality.IMAGE, hash=5, feature=np.ones((2, 1)), placeholder_ranges=[(0, 2)]
+    )
+    calls = 0
+    output = jnp.asarray([[[10.0], [11.0]]])  # [num_lanes=1, cap=2, H=1]
+
+    class Model(_TestInModelModel):
+        def get_multimodal_encode_funcs(self):
+            def encode(items):
+                nonlocal calls
+                calls += 1
+                return PackedMultimodalEmbedding(
+                    output=output, placements=((0, 0, 2),), num_lanes=1, cap=2
+                )
+
+            return {Modality.IMAGE: encode}
+
+    pool = EmbeddingPool(num_pages=4, page_size=2, hidden=1, dtype=jnp.float32)
+    args = (
+        _batch([item]),
+        jnp.zeros(2, dtype=jnp.int32),
+        lambda _: jnp.zeros((2, 1), dtype=jnp.float32),
+        Model(),
+        pool,
+    )
+    first, _ = host_orchestration.embed_multimodal_inputs(*args)
+    second, _ = host_orchestration.embed_multimodal_inputs(*args)
+    np.testing.assert_array_equal(first[:, 0], [10, 11])
+    np.testing.assert_array_equal(second[:, 0], [10, 11])
+    assert calls == 1  # second call hits the pool
+
+
+def test_embedding_pool_hit_matches_miss_with_deepstack():
+    item = MultimodalDataItem(
+        Modality.IMAGE, hash=6, feature=np.ones((2, 1)), placeholder_ranges=[(0, 2)]
+    )
+    output = jnp.asarray([[[10.0, 30.0], [11.0, 31.0]]])  # [num_lanes=1, cap=2, (1+D)*H=2]
+
+    class Model(_TestInModelModel):
+        def get_multimodal_encode_funcs(self):
+            return {
+                Modality.IMAGE: lambda items: PackedMultimodalEmbedding(
+                    output=output,
+                    placements=((0, 0, 2),),
+                    num_lanes=1,
+                    cap=2,
+                    deepstack_dim=1,
+                )
+            }
+
+    pool = EmbeddingPool(num_pages=4, page_size=2, hidden=1, dtype=jnp.float32, deepstack_dim=1)
+    args = (
+        _batch([item]),
+        jnp.zeros(2, dtype=jnp.int32),
+        lambda _: jnp.zeros((2, 1), dtype=jnp.float32),
+        Model(),
+        pool,
+    )
+    first, first_ds = host_orchestration.embed_multimodal_inputs(*args)
+    second, second_ds = host_orchestration.embed_multimodal_inputs(*args)
+    np.testing.assert_array_equal(first[:, 0], [10, 11])
+    np.testing.assert_array_equal(second[:, 0], [10, 11])
+    np.testing.assert_array_equal(first_ds[0, :, 0], [30, 31])
+    np.testing.assert_array_equal(second_ds[0, :, 0], [30, 31])
+
+
+def test_embedding_pool_reads_hit_before_miss_can_evict_it():
+    hit = MultimodalDataItem(
+        Modality.IMAGE, hash=10, feature=np.ones((1, 1)), placeholder_ranges=[(0, 1)]
+    )
+    miss = MultimodalDataItem(
+        Modality.IMAGE, hash=20, feature=np.ones((1, 1)), placeholder_ranges=[(1, 2)]
+    )
+
+    class Model(_TestInModelModel):
+        def get_multimodal_encode_funcs(self):
+            def encode(items):
+                assert items == [miss]
+                return PackedMultimodalEmbedding(
+                    output=jnp.asarray([[[20.0]]]),
+                    placements=((0, 0, 1),),
+                    num_lanes=1,
+                    cap=1,
+                )
+
+            return {Modality.IMAGE: encode}
+
+    pool = EmbeddingPool(num_pages=1, page_size=1, hidden=1, dtype=jnp.float32)
+    pool.write_packed((hit.hash,), jnp.asarray([[[10.0]]]), ((0, 0, 1),))
+    out, _ = host_orchestration.embed_multimodal_inputs(
+        _batch([hit, miss]),
+        jnp.zeros(2, dtype=jnp.int32),
+        lambda _: jnp.zeros((2, 1), dtype=jnp.float32),
+        Model(),
+        pool,
+    )
+
+    np.testing.assert_array_equal(out[:, 0], [10, 20])
+    assert pool.lookup(hit.hash) is None
+    miss_entry = pool.lookup(miss.hash)
+    assert miss_entry is not None
+    np.testing.assert_array_equal(
+        np.asarray(pool.pages[int(miss_entry.page_ids[0]), 0, 0]),
+        20,
+    )
+
+
+def test_embedding_pool_reuses_full_item_across_chunks():
+    """The encoder produces the full item once; a later chunk hits the pool."""
+    item = MultimodalDataItem(
+        Modality.IMAGE, hash=7, feature=np.ones((4, 1)), placeholder_ranges=[(0, 4)]
+    )
+    calls = 0
+    output = jnp.asarray([[[10.0], [11.0], [12.0], [13.0]]])  # [num_lanes=1, cap=4, H=1]
+
+    class Model(_TestInModelModel):
+        def get_multimodal_encode_funcs(self):
+            def encode(items):
+                nonlocal calls
+                calls += 1
+                return PackedMultimodalEmbedding(
+                    output=output, placements=((0, 0, 4),), num_lanes=1, cap=4
+                )
+
+            return {Modality.IMAGE: encode}
+
+    pool = EmbeddingPool(num_pages=4, page_size=2, hidden=1, dtype=jnp.float32)
+    model = Model()
+    first, _ = host_orchestration.embed_multimodal_inputs(
+        _batch([item], prefix=0, extend=2, per_dp_token=2),
+        jnp.zeros(2, dtype=jnp.int32),
+        lambda _: jnp.zeros((2, 1), dtype=jnp.float32),
+        model,
+        pool,
+    )
+    second, _ = host_orchestration.embed_multimodal_inputs(
+        _batch([item], prefix=2, extend=2, per_dp_token=2),
+        jnp.zeros(2, dtype=jnp.int32),
+        lambda _: jnp.zeros((2, 1), dtype=jnp.float32),
+        model,
+        pool,
+    )
+    np.testing.assert_array_equal(first[:, 0], [10, 11])
+    np.testing.assert_array_equal(second[:, 0], [12, 13])  # tail served from the pool
+    assert calls == 1
+
+
+@pytest.mark.parametrize(
+    ("arch", "chunked", "radix", "mixed_chunk"),
+    [
+        (ARCH, 4096, False, True),
+        ("Qwen3VLForConditionalGeneration", 4096, False, False),
+        ("UnsupportedVLM", -1, True, False),
+    ],
+)
+def test_multimodal_defaults_follow_capabilities(arch, chunked, radix, mixed_chunk):
+    args = SimpleNamespace(
         disable_radix_cache=False,
         disable_overlap_schedule=False,
         chunked_prefill_size=4096,
         enable_mixed_chunk=True,
         limit_mm_data_per_request=None,
     )
-    model_config = SimpleNamespace(is_multimodal=True)
-
-    apply_multimodal_model_defaults(server_args, model_config)
-
-    assert server_args.disable_radix_cache is True
-    assert server_args.disable_overlap_schedule is False
-    assert server_args.chunked_prefill_size == -1
-    assert server_args.enable_mixed_chunk is False
-    assert server_args.limit_mm_data_per_request == {"image": 16}
+    apply_multimodal_model_defaults(args, _model_config(arch=arch))
+    assert (args.chunked_prefill_size, args.disable_radix_cache) == (chunked, radix)
+    assert args.disable_overlap_schedule is False
+    assert args.enable_mixed_chunk is mixed_chunk
+    assert args.limit_mm_data_per_request == {"image": 16}
 
 
-def test_generate_req_getitem_preserves_media_fields():
-    req = GenerateReqInput(
-        text=["a", "b"],
-        sampling_params=[{}, {}],
-        rid=["r0", "r1"],
-        return_logprob=[False, False],
-        logprob_start_len=[-1, -1],
-        top_logprobs_num=[0, 0],
-        token_ids_logprob=[None, None],
-        return_routed_experts=[False, False],
-        image_data=[["image0"], ["image1"]],
-        video_data=[["video0"], ["video1"]],
-        audio_data=[["audio0"], ["audio1"]],
-    )
-    req.input_embeds = [["emb0"], ["emb1"]]
-
-    item = req[1]
-
-    assert item.image_data == ["image1"]
-    assert item.video_data == ["video1"]
-    assert item.audio_data == ["audio1"]
-    assert item.input_embeds == ["emb1"]
-
-
-def test_forward_batch_input_embedding_uses_data_axis_sharding():
-    devices = np.array(jax.devices()[:1])
-    mesh = Mesh(devices, ("data",))
+def test_forward_batch_shards_input_embeddings():
     batch = ModelWorkerBatch(
         bid=1,
         forward_mode=ForwardMode.EXTEND,
-        input_ids=np.array([1], dtype=np.int32),
+        input_ids=np.array([1]),
         real_input_ids_len=1,
-        seq_lens=np.array([1], dtype=np.int32),
-        out_cache_loc=np.array([1], dtype=np.int32),
-        req_pool_indices=np.array([0], dtype=np.int32),
+        seq_lens=np.array([1]),
+        out_cache_loc=np.array([1]),
+        req_pool_indices=np.array([0]),
         sampling_info=None,
-        positions=np.array([0], dtype=np.int32),
-        cache_loc=np.array([1], dtype=np.int32),
+        positions=np.array([0]),
+        cache_loc=np.array([1]),
         return_logprob=False,
         return_output_logprob_only=False,
         top_logprobs_nums=None,
         token_ids_logprobs=None,
-        extend_seq_lens=np.array([1], dtype=np.int32),
-        extend_prefix_lens=np.array([0], dtype=np.int32),
+        extend_seq_lens=np.array([1]),
+        extend_prefix_lens=np.array([0]),
         extend_logprob_start_lens=None,
         extend_input_logprob_token_ids=None,
-        logits_indices=np.array([0], dtype=np.int32),
+        logits_indices=np.array([0]),
         real_bs=1,
         real_bs_per_dp=[1],
-        input_embedding=np.ones((1, 4), dtype=np.float32),
+        input_embedding=np.ones((1, 4)),
     )
     runner = SimpleNamespace(
-        mesh=mesh,
+        mesh=Mesh(np.asarray(jax.devices()[:1]), ("data",)),
         attn_backend=None,
         model_config=SimpleNamespace(
             is_embedding=False,
             hf_config=SimpleNamespace(architectures=[]),
         ),
     )
-    captured_specs = []
-
-    def fake_device_array(values, sharding):
-        captured_specs.append(sharding.spec)
-        return values
-
+    specs = []
     with patch(
         "sgl_jax.srt.model_executor.forward_batch_info.device_array",
-        side_effect=fake_device_array,
+        side_effect=lambda values, sharding: specs.append(sharding.spec) or values,
     ):
         ForwardBatch.init_new(batch, runner)
-
-    assert PartitionSpec("data", None) in captured_specs
-
-
-def test_mm_embed_plan_device_put_uses_data_leading_sharding():
-    devices = np.array(jax.devices()[:1])
-    mesh = Mesh(devices, ("data",))
-    plan = MultimodalEmbedPlan(
-        rounds_by_modality={
-            Modality.IMAGE: [
-                EmbedRound(
-                    encode_inputs=VisionEncodeInputs(
-                        pixels=np.ones((1, 4, 3), dtype=np.float32),
-                        valid=np.array([4], dtype=np.int32),
-                        meta=Qwen25VLVisionMetadata(
-                            window_index=np.zeros((1, 1), dtype=np.int32),
-                            cu_window_seqlens=np.ones((1, 1), dtype=np.int32),
-                            rotary_pos_emb=np.ones((1, 4, 2), dtype=np.float32),
-                            cu_image_seqlens=np.array([[4]], dtype=np.int32),
-                        ),
-                    ),
-                    src_idx=np.zeros((4,), dtype=np.int32),
-                    mask=np.zeros((4,), dtype=np.bool_),
-                )
-            ]
-        }
-    )
-    captured_specs = []
-
-    def fake_device_array(values, sharding):
-        captured_specs.append(sharding.spec)
-        return values
-
-    with patch(
-        "sgl_jax.srt.model_executor.forward_batch_info.device_array",
-        side_effect=fake_device_array,
-    ):
-        _device_put_embed_plan(plan, mesh)
-
-    assert captured_specs == [
-        PartitionSpec("data", None, None),
-        PartitionSpec("data"),
-        PartitionSpec("data", None),
-        PartitionSpec("data", None),
-        PartitionSpec("data", None, None),
-        PartitionSpec("data", None),
-        PartitionSpec("data"),
-        PartitionSpec("data"),
-    ]
+    assert PartitionSpec("data", None) in specs
 
 
-def test_mrope_positions_propagate_through_model_worker_batch():
-    mrope_positions = np.array(
-        [
-            [0, 10, 2],
-            [0, 11, 2],
-            [0, 12, 2],
-        ],
-        dtype=np.int32,
-    )
-    batch = ScheduleBatch(
-        reqs_info=[
-            ScheduleReqsInfo(
-                reqs=[
-                    SimpleNamespace(
-                        mm_inputs={
-                            "mrope_positions": mrope_positions,
-                        },
-                        lora_id="0",
-                    )
-                ],
-                input_ids=np.array([1, 151655, 2], dtype=np.int32),
-                seq_lens=np.array([3], dtype=np.int32),
-                out_cache_loc=np.array([1, 2, 3], dtype=np.int32),
-                req_pool_indices=np.array([0], dtype=np.int32),
-                prefix_lens=np.array([0], dtype=np.int32),
-                extend_lens=np.array([3], dtype=np.int32),
-                extend_logprob_start_lens=np.array([0], dtype=np.int32),
-            )
-        ],
-        dp_size=1,
-        forward_mode=ForwardMode.EXTEND,
-        return_logprob=False,
-    )
-    batch._merge_sampling_info = lambda per_dp_bs_size, total_bs: None
-    batch._merge_cache_loc = lambda *args: np.array([1, 2, 3], dtype=np.int32)
-
-    mwb = batch.get_model_worker_batch(
+def test_mrope_positions_reach_worker_batch():
+    positions = np.array([[0, 10, 2], [0, 11, 2], [0, 12, 2]], dtype=np.int32)
+    req = SimpleNamespace(mm_inputs={"mrope_positions": positions}, extend_input_len=3, lora_id="0")
+    worker_batch = _schedule_batch(req).get_model_worker_batch(
         token_paddings=[3],
         bs_paddings=[1],
         cache_loc_paddings=[3],
         page_size=1,
     )
+    np.testing.assert_array_equal(worker_batch.mrope_positions[:, :3], positions)
 
-    np.testing.assert_array_equal(mwb.mrope_positions[:, :3], mrope_positions)
 
-
-def test_multimodal_data_item_get_reads_common_and_model_specific_fields():
-    item = MultimodalDataItem.from_dict(
-        {
-            "modality": "image",
-            "feature": np.ones((2, 1), dtype=np.float32),
-            "placeholder_ranges": [(1, 3)],
-            "image_grid_thw": np.array([[1, 2, 4]], dtype=np.int32),
-        }
+def test_overlap_copy_rebuilds_multimodal_batch_from_requests():
+    items = _items([(1, 2, 4)], [(1, 3)])
+    batch = _schedule_batch(_req(items, 3), _model_config())
+    worker_batch = batch.get_model_worker_batch(
+        token_paddings=[3],
+        bs_paddings=[1],
+        cache_loc_paddings=[3],
+        page_size=1,
     )
+    copied = batch.copy()
+    rebuilt = build_multimodal_batch(copied.reqs_info, 1, _model_config(), 3)
+    assert Modality.IMAGE in worker_batch.multimodal_batch
+    assert getattr(copied, "multimodal_batch", None) is None
+    assert Modality.IMAGE in rebuilt
 
-    assert item.is_image()
-    np.testing.assert_array_equal(item.get("feature"), np.ones((2, 1), dtype=np.float32))
-    assert item.get("placeholder_ranges") == [(1, 3)]
-    np.testing.assert_array_equal(
-        item.get("image_grid_thw"),
-        np.array([[1, 2, 4]], dtype=np.int32),
+
+def test_qwen2_item_metadata_is_cached_per_grid():
+    visual = _visual(
+        config=_vision_config(spatial_merge_size=2, window_size=2),
+        input_buckets=(8,),
     )
-    assert item.get("missing", "fallback") == "fallback"
+    grid = (1, 2, 4)
+    (item_a,) = _items([grid], [(0, int(np.prod(grid)))])
+    (item_b,) = _items([grid], [(0, int(np.prod(grid)))])
+
+    first = visual._item_metadata(item_a)
+    second = visual._item_metadata(item_b)
+
+    # Same resolution -> served from cache (identity), not recomputed.
+    assert first is second
+    assert list(visual._metadata_cache) == [grid]
+
+    other = (2, 2, 4)
+    (item_c,) = _items([other], [(0, int(np.prod(other)))])
+    third = visual._item_metadata(item_c)
+    assert third is not first
+    assert set(visual._metadata_cache) == {grid, other}
 
 
-def test_qwen_metadata_builder_packs_request_metadata_with_image_boundaries():
-    vision_config = SimpleNamespace(
-        patch_size=14,
-        window_size=112,
+def test_qwen3_grid_metadata_is_cached_per_grid():
+    config = _vision_config(
         spatial_merge_size=2,
-        num_heads=16,
-        hidden_size=1280,
-        rope_theta=10000.0,
+        window_size=2,
+        num_position_embeddings=16,
+        deepstack_visual_indexes=[],
     )
-    builder = Qwen25VLVisionMetadataBuilder(
-        SimpleNamespace(hf_config=SimpleNamespace(vision_config=vision_config))
-    )
-    features = np.arange(272, dtype=np.float32).reshape(272, 1)
-    items = _build_image_items(
-        features,
-        [(1, 16, 16), (1, 4, 4)],
-        [(0, 64), (64, 68)],
-    )
+    mesh = _mesh()
+    with jax.set_mesh(mesh):
+        visual = Qwen3VLVisionModel(config, jnp.float32, mesh=mesh, input_buckets=(4, 8))
 
-    packed = builder.get_metadata(items)
+    grid = (1, 2, 2)
+    first = visual._grid_metadata(grid)
+    second = visual._grid_metadata(grid)
+    assert first is second
+    assert grid in visual._metadata_cache
 
-    np.testing.assert_array_equal(
-        packed.cu_window_seqlens,
-        np.array([64, 128, 192, 256, 272], dtype=np.int32),
-    )
-    np.testing.assert_array_equal(
-        packed.cu_image_seqlens,
-        np.array([256, 272], dtype=np.int32),
-    )
-    np.testing.assert_array_equal(
-        np.sort(packed.window_index),
-        np.arange(68, dtype=np.int32),
-    )
-    assert packed.rotary_pos_emb.shape[0] == 272
+    other = (1, 2, 4)
+    assert visual._grid_metadata(other) is not first
+    assert set(visual._metadata_cache) >= {grid, other}
 
 
-def test_qwen_metadata_builder_single_image_request_metadata_degenerates_to_native():
-    vision_config = SimpleNamespace(
-        patch_size=14,
-        window_size=112,
+def test_qwen3_grid_metadata_survives_abstract_model_construction():
+    config = _vision_config(
         spatial_merge_size=2,
-        num_heads=16,
-        hidden_size=1280,
-        rope_theta=10000.0,
+        window_size=2,
+        num_position_embeddings=16,
+        deepstack_visual_indexes=[],
     )
-    builder = Qwen25VLVisionMetadataBuilder(
-        SimpleNamespace(hf_config=SimpleNamespace(vision_config=vision_config))
-    )
-    item = _build_image_items(
-        np.arange(8, dtype=np.float32).reshape(8, 1),
-        [(1, 2, 4)],
-        [(0, 2)],
-    )[0]
-
-    native = builder._get_image_metadata(item)
-    packed = builder._pack_request_metadata([native])
-
-    np.testing.assert_array_equal(packed.window_index, native.window_index)
-    np.testing.assert_array_equal(packed.cu_window_seqlens, native.cu_window_seqlens)
-    np.testing.assert_array_equal(packed.rotary_pos_emb, native.rotary_pos_emb)
-    np.testing.assert_array_equal(packed.cu_image_seqlens, np.array([8], dtype=np.int32))
-
-
-def test_qwen_metadata_builder_stack_metadata_pads_multi_image_and_dummy_rank():
-    vision_config = SimpleNamespace(
-        patch_size=14,
-        window_size=112,
-        spatial_merge_size=2,
-        num_heads=16,
-        hidden_size=1280,
-        rope_theta=10000.0,
-    )
-    builder = Qwen25VLVisionMetadataBuilder(
-        SimpleNamespace(hf_config=SimpleNamespace(vision_config=vision_config))
-    )
-    items = _build_image_items(
-        np.arange(24, dtype=np.float32).reshape(24, 1),
-        [(1, 2, 4), (1, 4, 4)],
-        [(0, 2), (2, 6)],
-    )
-    meta = builder.get_metadata(items)
-
-    stacked = builder.stack_metadata([meta, None], patch_k=24)
-
-    assert stacked.window_index.shape == (2, 6)
-    assert stacked.cu_window_seqlens.shape == (2, 2)
-    assert stacked.rotary_pos_emb.shape == (2, 24, 40)
-    assert stacked.cu_image_seqlens.shape == (2, 2)
-    np.testing.assert_array_equal(stacked.cu_image_seqlens[0], np.array([8, 24], dtype=np.int32))
-    np.testing.assert_array_equal(stacked.cu_image_seqlens[1], np.array([24, 24], dtype=np.int32))
-    np.testing.assert_array_equal(stacked.window_index[1], np.arange(6, dtype=np.int32))
-
-
-def test_qwen_metadata_builder_stack_metadata_fails_fast_on_all_dummy_lanes():
-    vision_config = SimpleNamespace(
-        patch_size=14,
-        window_size=112,
-        spatial_merge_size=2,
-        num_heads=16,
-        hidden_size=1280,
-        rope_theta=10000.0,
-    )
-    builder = Qwen25VLVisionMetadataBuilder(
-        SimpleNamespace(hf_config=SimpleNamespace(vision_config=vision_config))
-    )
-
-    with pytest.raises(ValueError, match="at least one real"):
-        builder.stack_metadata([None, None], patch_k=0)
-
-
-def test_qwen_metadata_builder_stack_metadata_checks_patch_bucket_divisibility():
-    vision_config = SimpleNamespace(
-        patch_size=14,
-        window_size=112,
-        spatial_merge_size=2,
-        num_heads=16,
-        hidden_size=1280,
-        rope_theta=10000.0,
-    )
-    builder = Qwen25VLVisionMetadataBuilder(
-        SimpleNamespace(hf_config=SimpleNamespace(vision_config=vision_config))
-    )
-    item = _build_image_items(
-        np.arange(8, dtype=np.float32).reshape(8, 1),
-        [(1, 2, 4)],
-        [(0, 2)],
-    )[0]
-    meta = builder._get_image_metadata(item)
-
-    with pytest.raises(ValueError, match="divisible"):
-        builder.stack_metadata([meta], patch_k=10)
-
-
-def test_collect_image_requests_preserves_owner_rank_request_base():
-    feature = np.arange(8, dtype=np.float32).reshape(8, 1)
-    rank0_req0 = SimpleNamespace(
-        mm_inputs=MultimodalInputs(
-            mm_items=[
-                MultimodalDataItem(
-                    modality=Modality.AUDIO,
-                    feature=np.ones((1, 1), dtype=np.float32),
-                )
-            ]
-        ),
-        extend_input_len=3,
-    )
-    rank0_req1 = SimpleNamespace(
-        mm_inputs=MultimodalInputs(
-            mm_items=_build_image_items(
-                feature,
-                [(1, 2, 4)],
-                [(1, 3)],
+    mesh = _mesh()
+    with jax.set_mesh(mesh):
+        visual = nnx.eval_shape(
+            lambda: Qwen3VLVisionModel(
+                config,
+                jnp.float32,
+                mesh=mesh,
+                input_buckets=(4, 8),
             )
-        ),
-        extend_input_len=4,
-    )
-    rank1_req0 = SimpleNamespace(
-        mm_inputs=MultimodalInputs(
-            mm_items=_build_image_items(
-                feature,
-                [(1, 2, 4)],
-                [(0, 2)],
-            )
-        ),
-        extend_input_len=2,
-    )
-
-    per_rank_units = _collect_image_requests(
-        [ScheduleReqsInfo(reqs=[rank0_req0, rank0_req1]), ScheduleReqsInfo(reqs=[rank1_req0])],
-        dp_size=2,
-    )
-
-    assert len(per_rank_units) == 2
-    assert len(per_rank_units[0]) == 1
-    assert per_rank_units[0][0].req_base == 3
-    assert len(per_rank_units[0][0].images) == 1
-    assert per_rank_units[0][0].images[0].is_image()
-    assert len(per_rank_units[1]) == 1
-    assert per_rank_units[1][0].req_base == 0
-
-
-def test_build_embed_round_derives_pixels_metadata_and_merge_idx_from_one_unit_order():
-    vision_config = SimpleNamespace(
-        patch_size=14,
-        window_size=112,
-        spatial_merge_size=2,
-        fullatt_block_indexes=[],
-        num_heads=16,
-        hidden_size=1280,
-        rope_theta=10000.0,
-    )
-    builder = Qwen25VLVisionMetadataBuilder(
-        SimpleNamespace(hf_config=SimpleNamespace(vision_config=vision_config))
-    )
-    items = _build_image_items(
-        np.arange(24, dtype=np.float32).reshape(24, 1),
-        [(1, 2, 4), (1, 4, 4)],
-        [(2, 4), (5, 9)],
-    )
-
-    rnd = _build_embed_round(
-        [SimpleNamespace(images=items, req_base=0)],
-        builder=builder,
-        dp_size=1,
-        per_dp_token=10,
-    )
-
-    np.testing.assert_array_equal(rnd.encode_inputs.valid, np.array([24], dtype=np.int32))
-    np.testing.assert_array_equal(rnd.encode_inputs.pixels[0, :, 0], np.arange(24))
-    np.testing.assert_array_equal(
-        rnd.encode_inputs.meta.cu_image_seqlens,
-        np.array([[8, 24]], dtype=np.int32),
-    )
-    np.testing.assert_array_equal(np.flatnonzero(rnd.mask), np.array([2, 3, 5, 6, 7, 8]))
-    np.testing.assert_array_equal(rnd.src_idx[[2, 3, 5, 6, 7, 8]], np.arange(6))
-
-
-def test_build_embed_round_keeps_merge_row_contiguous_across_multi_placeholder_images():
-    vision_config = SimpleNamespace(
-        patch_size=14,
-        window_size=112,
-        spatial_merge_size=2,
-        fullatt_block_indexes=[],
-        num_heads=16,
-        hidden_size=1280,
-        rope_theta=10000.0,
-    )
-    builder = Qwen25VLVisionMetadataBuilder(
-        SimpleNamespace(hf_config=SimpleNamespace(vision_config=vision_config))
-    )
-    items = _build_image_items(
-        np.arange(32, dtype=np.float32).reshape(32, 1),
-        [(1, 2, 4), (1, 4, 6)],
-        [(0, 2), (4, 10)],
-    )
-
-    rnd = _build_embed_round(
-        [SimpleNamespace(images=items, req_base=0)],
-        builder=builder,
-        dp_size=1,
-        per_dp_token=12,
-    )
-
-    np.testing.assert_array_equal(rnd.src_idx[[0, 1]], np.array([0, 1], dtype=np.int32))
-    assert rnd.src_idx[4] == 2
-    np.testing.assert_array_equal(rnd.src_idx[[4, 5, 6, 7, 8, 9]], np.arange(2, 8))
-
-
-def test_build_embed_round_fails_fast_on_placeholder_token_out_of_rank_slot():
-    vision_config = SimpleNamespace(
-        patch_size=14,
-        window_size=112,
-        spatial_merge_size=1,
-        fullatt_block_indexes=[],
-        num_heads=16,
-        hidden_size=1280,
-        rope_theta=10000.0,
-    )
-    builder = Qwen25VLVisionMetadataBuilder(
-        SimpleNamespace(hf_config=SimpleNamespace(vision_config=vision_config))
-    )
-    item = MultimodalDataItem(
-        modality=Modality.IMAGE,
-        feature=np.ones((3, 1), dtype=np.float32),
-        placeholder_ranges=[(0, 3)],
-        model_specific_data={"image_grid_thw": np.array([[1, 1, 3]], dtype=np.int32)},
-    )
-
-    with pytest.raises(ValueError, match="outside its packed rank slot"):
-        _build_embed_round(
-            [SimpleNamespace(images=[item], req_base=2)],
-            builder=builder,
-            dp_size=1,
-            per_dp_token=4,
         )
 
-
-def test_mm_embed_plan_keeps_placeholder_count_separate_from_encode_rows():
-    features = np.arange(24, dtype=np.float32).reshape(24, 1)
-    grids = [(1, 2, 4), (1, 4, 4)]
-    placeholder_ranges = [(2, 4), (5, 9)]
-    items = _build_image_items(features, grids, placeholder_ranges)
-    req = SimpleNamespace(
-        mm_inputs=MultimodalInputs(mm_items=items),
-        extend_input_len=10,
-    )
-    vision_config = SimpleNamespace(
-        patch_size=14,
-        window_size=112,
-        spatial_merge_size=2,
-        fullatt_block_indexes=[],
-        num_heads=16,
-        hidden_size=1280,
-        rope_theta=10000.0,
-    )
-    model_config = SimpleNamespace(
-        is_multimodal=True,
-        hf_config=SimpleNamespace(
-            architectures=["Qwen2_5_VLForConditionalGeneration"],
-            vision_config=vision_config,
-        ),
-    )
-
-    plan = build_mm_embed_plan(
-        reqs_info=[ScheduleReqsInfo(reqs=[req])],
-        dp_size=1,
-        model_config=model_config,
-        per_dp_token=10,
-    )
-
-    rounds = plan.rounds_by_modality[items[0].modality]
-    assert len(rounds) == 1
-
-    np.testing.assert_array_equal(rounds[0].encode_inputs.valid, np.array([24], dtype=np.int32))
-
-    np.testing.assert_array_equal(np.flatnonzero(rounds[0].mask), np.array([2, 3, 5, 6, 7, 8]))
-    np.testing.assert_array_equal(rounds[0].src_idx[[2, 3, 5, 6, 7, 8]], np.arange(6))
-
-
-def test_mm_embed_plan_fails_fast_on_overlapping_placeholder_ranges():
-    features = np.arange(3, dtype=np.float32).reshape(3, 1)
-    item = MultimodalDataItem(
-        modality=Modality.IMAGE,
-        feature=features,
-        placeholder_ranges=[(0, 2), (1, 2)],
-        model_specific_data={"image_grid_thw": np.array([[1, 1, 3]], dtype=np.int32)},
-    )
-    req = SimpleNamespace(
-        mm_inputs=MultimodalInputs(mm_items=[item]),
-        extend_input_len=3,
-    )
-    vision_config = SimpleNamespace(
-        patch_size=14,
-        window_size=112,
-        spatial_merge_size=1,
-        fullatt_block_indexes=[],
-        num_heads=16,
-        hidden_size=1280,
-        rope_theta=10000.0,
-    )
-    model_config = SimpleNamespace(
-        is_multimodal=True,
-        hf_config=SimpleNamespace(
-            architectures=["Qwen2_5_VLForConditionalGeneration"],
-            vision_config=vision_config,
-        ),
-    )
-
-    with pytest.raises(ValueError, match="assigned more than once"):
-        build_mm_embed_plan(
-            reqs_info=[ScheduleReqsInfo(reqs=[req])],
-            dp_size=1,
-            model_config=model_config,
-            per_dp_token=3,
-        )
-
-
-def test_mm_embed_plan_packs_per_request_with_dp_dummy_lane():
-    vision_config = SimpleNamespace(
-        patch_size=14,
-        window_size=112,
-        spatial_merge_size=2,
-        fullatt_block_indexes=[],
-        num_heads=16,
-        hidden_size=1280,
-        rope_theta=10000.0,
-    )
-    model_config = SimpleNamespace(
-        is_multimodal=True,
-        hf_config=SimpleNamespace(
-            architectures=["Qwen2_5_VLForConditionalGeneration"],
-            vision_config=vision_config,
-        ),
-    )
-    rank0_req0 = SimpleNamespace(
-        mm_inputs=MultimodalInputs(
-            mm_items=_build_image_items(
-                np.arange(8, dtype=np.float32).reshape(8, 1),
-                [(1, 2, 4)],
-                [(1, 3)],
-            )
-        ),
-        extend_input_len=4,
-    )
-    rank0_req1 = SimpleNamespace(
-        mm_inputs=MultimodalInputs(
-            mm_items=_build_image_items(
-                np.arange(16, dtype=np.float32).reshape(16, 1),
-                [(1, 4, 4)],
-                [(0, 4)],
-            )
-        ),
-        extend_input_len=5,
-    )
-    rank1_req0 = SimpleNamespace(
-        mm_inputs=MultimodalInputs(
-            mm_items=_build_image_items(
-                np.arange(8, dtype=np.float32).reshape(8, 1),
-                [(1, 2, 4)],
-                [(2, 4)],
-            )
-        ),
-        extend_input_len=4,
-    )
-
-    plan = build_mm_embed_plan(
-        reqs_info=[
-            ScheduleReqsInfo(reqs=[rank0_req0, rank0_req1]),
-            ScheduleReqsInfo(reqs=[rank1_req0]),
-        ],
-        dp_size=2,
-        model_config=model_config,
-        per_dp_token=10,
-    )
-
-    rounds = plan.rounds_by_modality[Modality.IMAGE]
-    assert len(rounds) == 2
-    np.testing.assert_array_equal(rounds[0].encode_inputs.valid, np.array([8, 8], dtype=np.int32))
-    np.testing.assert_array_equal(rounds[1].encode_inputs.valid, np.array([16, 0], dtype=np.int32))
-    np.testing.assert_array_equal(np.flatnonzero(rounds[0].mask), np.array([1, 2, 12, 13]))
-    np.testing.assert_array_equal(np.flatnonzero(rounds[1].mask), np.array([4, 5, 6, 7]))
-    np.testing.assert_array_equal(
-        rounds[1].encode_inputs.meta.cu_image_seqlens,
-        np.array([[16], [16]], dtype=np.int32),
-    )
-
-
-def test_mm_embed_plan_pads_dp_ranks_with_uneven_multi_image_requests():
-    vision_config = SimpleNamespace(
-        patch_size=14,
-        window_size=112,
-        spatial_merge_size=2,
-        fullatt_block_indexes=[],
-        num_heads=16,
-        hidden_size=1280,
-        rope_theta=10000.0,
-    )
-    model_config = SimpleNamespace(
-        is_multimodal=True,
-        hf_config=SimpleNamespace(
-            architectures=["Qwen2_5_VLForConditionalGeneration"],
-            vision_config=vision_config,
-        ),
-    )
-    rank0_items = _build_image_items(
-        np.arange(24, dtype=np.float32).reshape(24, 1),
-        [(1, 2, 4), (1, 4, 4)],
-        [(0, 2), (3, 7)],
-    )
-    rank1_items = _build_image_items(
-        np.arange(32, dtype=np.float32).reshape(32, 1),
-        [(1, 2, 4), (1, 2, 4), (1, 4, 4)],
-        [(1, 3), (4, 6), (7, 11)],
-    )
-    rank0_req = SimpleNamespace(
-        mm_inputs=MultimodalInputs(mm_items=rank0_items),
-        extend_input_len=8,
-    )
-    rank1_req = SimpleNamespace(
-        mm_inputs=MultimodalInputs(mm_items=rank1_items),
-        extend_input_len=12,
-    )
-
-    plan = build_mm_embed_plan(
-        reqs_info=[ScheduleReqsInfo(reqs=[rank0_req]), ScheduleReqsInfo(reqs=[rank1_req])],
-        dp_size=2,
-        model_config=model_config,
-        per_dp_token=12,
-    )
-
-    rounds = plan.rounds_by_modality[Modality.IMAGE]
-    assert len(rounds) == 1
-    rnd = rounds[0]
-    np.testing.assert_array_equal(rnd.encode_inputs.valid, np.array([24, 32], dtype=np.int32))
-    assert rnd.encode_inputs.pixels.shape == (2, 32, 1)
-    np.testing.assert_array_equal(
-        rnd.encode_inputs.meta.cu_image_seqlens,
-        np.array([[8, 24, 32], [8, 16, 32]], dtype=np.int32),
-    )
-    np.testing.assert_array_equal(
-        np.flatnonzero(rnd.mask), np.array([0, 1, 3, 4, 5, 6, 13, 14, 16, 17, 19, 20, 21, 22])
-    )
-    np.testing.assert_array_equal(rnd.src_idx[[0, 1, 3, 4, 5, 6]], np.arange(6))
-    np.testing.assert_array_equal(rnd.src_idx[[13, 14, 16, 17, 19, 20, 21, 22]], np.arange(8))
-
-
-def test_qwen_metadata_builder_checks_feature_rows_match_grid():
-    vision_config = SimpleNamespace(
-        patch_size=14,
-        window_size=112,
-        spatial_merge_size=2,
-        num_heads=16,
-        hidden_size=1280,
-        rope_theta=10000.0,
-    )
-    builder = Qwen25VLVisionMetadataBuilder(
-        SimpleNamespace(hf_config=SimpleNamespace(vision_config=vision_config))
-    )
-    item = MultimodalDataItem(
-        modality=Modality.IMAGE,
-        feature=np.ones((7, 1), dtype=np.float32),
-        placeholder_ranges=[(0, 2)],
-        model_specific_data={"image_grid_thw": np.array([[1, 2, 4]], dtype=np.int32)},
-    )
-
-    with pytest.raises(ValueError, match="feature rows"):
-        builder._get_image_metadata(item)
-
-
-def test_qwen_metadata_builder_checks_placeholder_rows_match_grid():
-    vision_config = SimpleNamespace(
-        patch_size=14,
-        window_size=112,
-        spatial_merge_size=2,
-        num_heads=16,
-        hidden_size=1280,
-        rope_theta=10000.0,
-    )
-    builder = Qwen25VLVisionMetadataBuilder(
-        SimpleNamespace(hf_config=SimpleNamespace(vision_config=vision_config))
-    )
-    item = MultimodalDataItem(
-        modality=Modality.IMAGE,
-        feature=np.ones((8, 1), dtype=np.float32),
-        placeholder_ranges=[(0, 1)],
-        model_specific_data={"image_grid_thw": np.array([[1, 2, 4]], dtype=np.int32)},
-    )
-
-    with pytest.raises(ValueError, match="placeholder rows"):
-        builder._get_image_metadata(item)
-
-
-def test_mm_embed_plan_rejects_dict_mm_inputs():
-    feature = np.arange(8, dtype=np.float32).reshape(8, 1)
-    req = SimpleNamespace(
-        mm_inputs={
-            "mm_items": [
-                {
-                    "modality": "image",
-                    "feature": feature,
-                    "placeholder_ranges": [(0, 2)],
-                    "image_grid_thw": np.array([[1, 2, 4]], dtype=np.int32),
-                }
-            ]
-        },
-        extend_input_len=2,
-    )
-    vision_config = SimpleNamespace(
-        patch_size=14,
-        window_size=112,
-        spatial_merge_size=2,
-        fullatt_block_indexes=[],
-        num_heads=16,
-        hidden_size=1280,
-        rope_theta=10000.0,
-    )
-    model_config = SimpleNamespace(
-        is_multimodal=True,
-        hf_config=SimpleNamespace(
-            architectures=["Qwen2_5_VLForConditionalGeneration"],
-            vision_config=vision_config,
-        ),
-    )
-
-    with pytest.raises(TypeError, match="MultimodalInputs"):
-        build_mm_embed_plan(
-            reqs_info=[ScheduleReqsInfo(reqs=[req])],
-            dp_size=1,
-            model_config=model_config,
-            per_dp_token=2,
-        )
-
-
-def test_mm_embed_plan_returns_none_before_resolving_builder_without_images():
-    req = SimpleNamespace(
-        mm_inputs=MultimodalInputs(
-            mm_items=[
-                MultimodalDataItem(
-                    modality=Modality.AUDIO,
-                    feature=np.ones((4, 2), dtype=np.float32),
-                )
-            ]
-        ),
-        extend_input_len=4,
-    )
-    model_config = SimpleNamespace(
-        is_multimodal=True,
-        hf_config=SimpleNamespace(
-            architectures=["NoVisionBuilderForAudioOnly"],
-            vision_config=SimpleNamespace(),
-        ),
-    )
-
-    plan = build_mm_embed_plan(
-        reqs_info=[ScheduleReqsInfo(reqs=[req])],
-        dp_size=1,
-        model_config=model_config,
-        per_dp_token=4,
-    )
-
-    assert plan is None
-
-
-def test_mm_embed_plan_fails_fast_when_qwen_vision_config_missing():
-    features = np.arange(8, dtype=np.float32).reshape(8, 1)
-    items = _build_image_items(features, [(1, 2, 4)], [(0, 2)])
-    req = SimpleNamespace(
-        mm_inputs=MultimodalInputs(mm_items=items),
-        extend_input_len=2,
-    )
-    model_config = SimpleNamespace(
-        is_multimodal=True,
-        hf_config=SimpleNamespace(
-            architectures=["Qwen2_5_VLForConditionalGeneration"],
-        ),
-    )
-
-    with pytest.raises(ValueError, match="vision_config"):
-        build_mm_embed_plan(
-            reqs_info=[ScheduleReqsInfo(reqs=[req])],
-            dp_size=1,
-            model_config=model_config,
-            per_dp_token=2,
-        )
+    metadata = visual._grid_metadata((1, 2, 2))
+    assert isinstance(metadata.rotary_pos_emb, np.ndarray)
+    assert metadata.rotary_pos_emb.shape == (4, 2)
+    assert np.isfinite(metadata.rotary_pos_emb).all()
