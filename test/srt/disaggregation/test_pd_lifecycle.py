@@ -47,9 +47,7 @@ class TestConstants:
         assert MIN_COMPATIBLE_VERSION <= PROTOCOL_VERSION
 
     def test_prefill_info_defaults_to_current_version(self):
-        info = PrefillInfo(
-            bootstrap_key="h:1", host="h", transfer_port=1, side_channel_port=2
-        )
+        info = PrefillInfo(bootstrap_key="h:1", host="h", transfer_port=1, side_channel_port=2)
         assert info.protocol_version == PROTOCOL_VERSION
 
 

@@ -82,9 +82,7 @@ class TestEnsureRequestIdentityFields:
         assert result["disagg_transfer_id"] == "abc123"
 
     def test_preserves_existing_transfer_id(self):
-        result = ensure_request_identity_fields(
-            {"text": "hello", "disagg_transfer_id": "tid123"}
-        )
+        result = ensure_request_identity_fields({"text": "hello", "disagg_transfer_id": "tid123"})
         assert result["rid"] == "tid123"
         assert result["disagg_transfer_id"] == "tid123"
 
@@ -302,9 +300,7 @@ class TestDpRouting:
         lb_instance.prefill_dp_size = 4
         lb_instance.decode_dp_size = 4
         prefill, decode = asyncio.run(
-            lb_instance._align_dp_requests(
-                {"bootstrap_room": [4, 7], "text": ["a", "b"]}
-            )
+            lb_instance._align_dp_requests({"bootstrap_room": [4, 7], "text": ["a", "b"]})
         )
         assert prefill["dp_rank"] == [0, 3]
         assert decode["dp_rank"] == [0, 3]
@@ -360,9 +356,7 @@ class TestV1CompletionsEndpoint:
 
 class TestBootstrapInjection:
     @patch("aiohttp.ClientSession")
-    def test_generate_injects_bootstrap_fields(
-        self, mock_session_cls, client, lb_instance
-    ):
+    def test_generate_injects_bootstrap_fields(self, mock_session_cls, client, lb_instance):
         captured_requests = []
 
         async def capture_post(url, json=None):
@@ -730,9 +724,7 @@ class TestOtherArgs:
         assert args.port == 8080
 
     def test_flags(self):
-        args = _parse(
-            ["--mini-lb", "--pd-disaggregation", "--test-external-dp-routing"]
-        )
+        args = _parse(["--mini-lb", "--pd-disaggregation", "--test-external-dp-routing"])
         assert args.mini_lb is True
         assert args.pd_disaggregation is True
         assert args.test_external_dp_routing is True

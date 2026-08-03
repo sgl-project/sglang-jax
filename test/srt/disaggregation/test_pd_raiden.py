@@ -10,6 +10,7 @@ import types
 from unittest import mock
 
 import pytest
+
 from sgl_jax.raiden import raiden_requested
 from sgl_jax.srt.disaggregation.base.kv_manager import KVPoll
 from sgl_jax.srt.disaggregation.base.transfer import (
@@ -68,10 +69,7 @@ class _FakeRaiden:
 
     @property
     def endpoints_by_dp_rank(self):
-        return {
-            rank: list(endpoints)
-            for rank, endpoints in self._endpoints_by_dp_rank.items()
-        }
+        return {rank: list(endpoints) for rank, endpoints in self._endpoints_by_dp_rank.items()}
 
     @property
     def endpoints(self):
@@ -106,9 +104,7 @@ def test_raiden_sender_registers_once_and_completes_from_poll_stats():
 
     sender.send()
 
-    assert raiden.registered == [
-        (("wire-1", _uuid_to_int("wire-1"), [3, 8, 13]), {"dp_rank": 0})
-    ]
+    assert raiden.registered == [(("wire-1", _uuid_to_int("wire-1"), [3, 8, 13]), {"dp_rank": 0})]
     assert bootstrap.registered[0][0] == (42, "wire-1")
     assert bootstrap.registered[0][1] == {
         "jax_process_index": 0,
@@ -335,9 +331,7 @@ def test_raiden_manager_owns_decode_admission_and_endpoint_mapping():
     ("source_dp_rank", "local_dp_rank"),
     [(source, destination) for source in range(4) for destination in range(4)],
 )
-def test_raiden_manager_routes_all_dp4_source_destination_pairs(
-    source_dp_rank, local_dp_rank
-):
+def test_raiden_manager_routes_all_dp4_source_destination_pairs(source_dp_rank, local_dp_rank):
     raiden = _FakeRaiden(dp_size=4)
     bootstrap = _FakeBootstrap()
     bootstrap.transfer_info = {
@@ -566,9 +560,7 @@ def test_register_read_false_does_not_publish_stale_metadata():
 def test_raiden_loader_is_opt_in():
     assert not raiden_requested([])
     assert raiden_requested(["--disaggregation-use-raiden"])
-    assert not raiden_requested(
-        ["--disaggregation-use-raiden", "--no-disaggregation-use-raiden"]
-    )
+    assert not raiden_requested(["--disaggregation-use-raiden", "--no-disaggregation-use-raiden"])
 
 
 def test_launch_server_spawn_reimport_preloads_raiden_before_jax():
@@ -605,9 +597,7 @@ def test_raiden_cli_is_opt_in():
     parser = argparse.ArgumentParser()
     ServerArgs.add_cli_args(parser)
     defaults = parser.parse_args(["--model-path", "dummy"])
-    selected = parser.parse_args(
-        ["--model-path", "dummy", "--disaggregation-use-raiden"]
-    )
+    selected = parser.parse_args(["--model-path", "dummy", "--disaggregation-use-raiden"])
     assert defaults.disaggregation_use_raiden is False
     assert selected.disaggregation_use_raiden is True
 
@@ -616,9 +606,7 @@ def test_raiden_cli_is_opt_in():
     ("max_inflight", "dp_size", "expected"),
     [(8, 1, 8), (8, 2, 4), (32, 4, 8), (10, 4, 3), (0, 4, 0)],
 )
-def test_raiden_inflight_capacity_is_partitioned_per_rank(
-    max_inflight, dp_size, expected
-):
+def test_raiden_inflight_capacity_is_partitioned_per_rank(max_inflight, dp_size, expected):
     assert per_rank_inflight_limit(max_inflight, dp_size) == expected
 
 
@@ -654,9 +642,7 @@ def test_raiden_factory_rejects_invalid_config(override, error):
 
 def test_raiden_wrapper_uses_public_jax_api_and_configured_parallelism():
     engine = mock.MagicMock()
-    engine.get_local_endpoints.return_value = [
-        {"endpoint": "127.0.0.1:7788", "shards": [0]}
-    ]
+    engine.get_local_endpoints.return_value = [{"endpoint": "127.0.0.1:7788", "shards": [0]}]
     manager_cls = mock.MagicMock(return_value=engine)
     modules = {
         "tpu_raiden": types.ModuleType("tpu_raiden"),

@@ -333,13 +333,9 @@ def test_manager_owns_persistent_pull_worker_pool():
     """The manager starts a pool of long-lived workers that drain the queue
     and run each receiver's blocking pull off the event loop."""
 
-    mgr = JaxTransferKVManager(
-        wrapper=object(), zmq_notifier=object(), pull_worker_count=4
-    )
+    mgr = JaxTransferKVManager(wrapper=object(), zmq_notifier=object(), pull_worker_count=4)
 
-    worker_threads = [
-        t for t in threading.enumerate() if t.name.startswith("jax-kv-pull-worker")
-    ]
+    worker_threads = [t for t in threading.enumerate() if t.name.startswith("jax-kv-pull-worker")]
     assert len(worker_threads) == 4
     assert all(t.daemon for t in worker_threads)
 
@@ -472,9 +468,7 @@ def _adm_p_info():
 
 
 def _enqueue(sched, rid, seqlen):
-    entry = DecodeBookkeeping(
-        req_id=rid, req=_AdmReq(rid, seqlen), p_info=_adm_p_info()
-    )
+    entry = DecodeBookkeeping(req_id=rid, req=_AdmReq(rid, seqlen), p_info=_adm_p_info())
     sched.disagg_prealloc_queue.add(entry)
     return entry
 
@@ -952,8 +946,6 @@ class TestTerminalRecords:
 
     def test_register_clears_prior_terminal_record(self):
         m = _mgr()
-        m.record_terminal(
-            "r1", role="prefill", transfer_id="t1", state=KVPoll.FAILED, reason="x"
-        )
+        m.record_terminal("r1", role="prefill", transfer_id="t1", state=KVPoll.FAILED, reason="x")
         m.register_sender("r1", _FakeParticipant(1.0))
         assert m.get_terminal_record("r1", role="prefill") is None

@@ -309,9 +309,9 @@ def test_heartbeat_daemon_survives_transient_server_errors():
     daemon.start()
     try:
         time.sleep(0.1)
-        assert call_count["n"] >= 3, (
-            f"daemon should have kept beating after raises, saw n={call_count['n']}"
-        )
+        assert (
+            call_count["n"] >= 3
+        ), f"daemon should have kept beating after raises, saw n={call_count['n']}"
     finally:
         daemon.stop()
 
@@ -764,9 +764,7 @@ def test_tokenizer_passes_bootstrap_fields_through_in_decode_mode():
         mock.patch.object(SamplingParams, "normalize", lambda self, t: None),
         mock.patch.object(SamplingParams, "verify", lambda self, v: None),
     ):
-        tokenized = tm._create_tokenized_object(
-            obj, input_text="hi", input_ids=[1, 2, 3]
-        )
+        tokenized = tm._create_tokenized_object(obj, input_text="hi", input_ids=[1, 2, 3])
     assert tokenized.bootstrap_host == "10.0.0.1"
     assert tokenized.bootstrap_port == 8998
     assert tokenized.bootstrap_room == 42
@@ -790,9 +788,7 @@ def test_tokenizer_requires_explicit_source_and_destination_rank_for_dp():
         mock.patch.object(SamplingParams, "verify", lambda self, v: None),
         pytest.raises(ValueError, match="explicit dp_rank"),
     ):
-        tm._create_tokenized_object(
-            GenerateReqInput(**base), input_text="hi", input_ids=[1, 2, 3]
-        )
+        tm._create_tokenized_object(GenerateReqInput(**base), input_text="hi", input_ids=[1, 2, 3])
 
     with (
         mock.patch.object(SamplingParams, "normalize", lambda self, t: None),
@@ -844,9 +840,7 @@ def test_tokenizer_allows_missing_fields_in_null_mode():
         mock.patch.object(SamplingParams, "normalize", lambda self, t: None),
         mock.patch.object(SamplingParams, "verify", lambda self, v: None),
     ):
-        tokenized = tm._create_tokenized_object(
-            obj, input_text="hi", input_ids=[1, 2, 3]
-        )
+        tokenized = tm._create_tokenized_object(obj, input_text="hi", input_ids=[1, 2, 3])
     assert tokenized.bootstrap_room is None
 
 
@@ -863,9 +857,7 @@ def test_tokenizer_allows_missing_fields_in_prefill_mode():
         mock.patch.object(SamplingParams, "normalize", lambda self, t: None),
         mock.patch.object(SamplingParams, "verify", lambda self, v: None),
     ):
-        tokenized = tm._create_tokenized_object(
-            obj, input_text="hi", input_ids=[1, 2, 3]
-        )
+        tokenized = tm._create_tokenized_object(obj, input_text="hi", input_ids=[1, 2, 3])
     assert tokenized.bootstrap_room is None
 
 
@@ -913,9 +905,7 @@ def test_decode_mode_auto_derives_from_bootstrap_url():
         mock.patch.object(SamplingParams, "normalize", lambda self, t: None),
         mock.patch.object(SamplingParams, "verify", lambda self, v: None),
     ):
-        tokenized = tm._create_tokenized_object(
-            obj, input_text="hi", input_ids=[1, 2, 3]
-        )
+        tokenized = tm._create_tokenized_object(obj, input_text="hi", input_ids=[1, 2, 3])
     assert tokenized.bootstrap_host == "10.0.0.5"
     assert tokenized.bootstrap_port == 8998
     # Stable CRC32 of "r-auto".
@@ -941,9 +931,7 @@ def test_decode_mode_auto_derive_brackets_ipv6_host():
         mock.patch.object(SamplingParams, "normalize", lambda self, t: None),
         mock.patch.object(SamplingParams, "verify", lambda self, v: None),
     ):
-        tokenized = tm._create_tokenized_object(
-            obj, input_text="hi", input_ids=[1, 2, 3]
-        )
+        tokenized = tm._create_tokenized_object(obj, input_text="hi", input_ids=[1, 2, 3])
     assert tokenized.bootstrap_host == "[fe80::1]"
     assert tokenized.bootstrap_port == 8998
 
@@ -966,9 +954,7 @@ def test_decode_mode_explicit_values_win_over_auto_derive():
         mock.patch.object(SamplingParams, "normalize", lambda self, t: None),
         mock.patch.object(SamplingParams, "verify", lambda self, v: None),
     ):
-        tokenized = tm._create_tokenized_object(
-            obj, input_text="hi", input_ids=[1, 2, 3]
-        )
+        tokenized = tm._create_tokenized_object(obj, input_text="hi", input_ids=[1, 2, 3])
     assert tokenized.bootstrap_host == "10.0.0.99"
     assert tokenized.bootstrap_port == 9999
     assert tokenized.bootstrap_room == 42
