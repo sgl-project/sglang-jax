@@ -290,6 +290,7 @@ def _fused_ep_moe_kernel(
     n_active_x2_smem,  # (smem_banks, 1) — compact loop
     a2a_s_sends_x2_smem,  # (expert_buffer_count,) or (2, expert_buffer_count)
     # --- VMEM scratch ---
+    d2e_count_x2_vmem,  # (2, num_devices, 1, padded_num_experts)
     a2a_g_acc_vmem,  # (2, top_k, acc_bt, t_packing, h_per_t)
     b_topk_weights_x2_vmem,  # (2, bt, padded_top_k)
     b_topk_ids_x2_vmem,  # (2, bt, padded_top_k)
@@ -326,8 +327,8 @@ def _fused_ep_moe_kernel(
     gather_send_x2_sems,  # DMA(expert_buffer_count,)
     a2a_gather_sem,  # DMA (num_experts,) — per-expert gather recv
     a2a_acc_sems,  # DMA(1,)
-    md_send_sem,  # DMA scalar
-    md_recv_sem,  # DMA scalar
+    md_send_sems,  # (2,) — one DMA semaphore per metadata mailbox bank
+    md_recv_sems,  # (2,) — one DMA semaphore per metadata mailbox bank
     barrier_sem,  # BARRIER
     *,
     # Static params
@@ -548,10 +549,19 @@ def _fused_ep_moe_kernel(
 
         offsets_sem = local_sems.at[bt_sem_id, 8]
         routing_sem = local_sems.at[bt_sem_id, 9]
+        # Keep the direct-all-gather mailbox alive for the full kernel. Two
+        # banks are sufficient: before a rank can start metadata generation
+        # N+2, it must receive generation N+1 from every peer, which means
+        # every peer has already finished consuming generation N. The DMA
+        # semaphores must use the same bank so an N+1 completion cannot satisfy
+        # an N wait while ranks progress at different speeds.
+        md_bank_id = bt_id & jnp.int32(1)
+        d2e_count_vmem = d2e_count_x2_vmem.at[md_bank_id]
+        md_send_sem = md_send_sems.at[md_bank_id]
+        md_recv_sem = md_recv_sems.at[md_bank_id]
 
         def _inkernel_allreduce(
             t2e_routing_vmem,
-            d2e_count_vmem,
             offsets_vmem,
             starts_vmem,
             sizes_vmem,
@@ -585,10 +595,10 @@ def _fused_ep_moe_kernel(
                 keepdims=True,
             ).reshape(1, padded_num_experts)
 
-            d2e_count_vmem[...] = jnp.zeros_like(d2e_count_vmem)
+            # Every peer writes its complete histogram row before the reduction,
+            # so no receiver-side initialization is needed. Clearing the full
+            # bank here is racy: a faster peer may already have written its row.
             d2e_count_vmem[my_id] = local_sizes
-
-            sync_barrier()
 
             # Metadata all-reduce = 1-round direct all-gather of per-device
             # histogram rows via fori_loop + dynamic device_id. No static unroll
@@ -620,7 +630,6 @@ def _fused_ep_moe_kernel(
                 return None
 
             lax.fori_loop(1, num_devices, _md_drain, None, unroll=False)
-            sync_barrier()
 
             reduced_sizes = jnp.zeros((1, padded_num_experts), dtype=jnp.int32)
             reduced_starts = jnp.zeros((1, padded_num_experts), dtype=jnp.int32)
@@ -661,7 +670,6 @@ def _fused_ep_moe_kernel(
         pl.run_scoped(
             _inkernel_allreduce,
             pltpu.VMEM(t2e_routing_x2_smem.shape[1:], t2e_routing_x2_smem.dtype),
-            pltpu.VMEM(d2e_count_x2_smem.shape[1:], d2e_count_x2_smem.dtype),
             pltpu.VMEM(expert_offsets_x2_smem.shape[1:], expert_offsets_x2_smem.dtype),
             pltpu.VMEM(expert_starts_x2_smem.shape[1:], expert_starts_x2_smem.dtype),
             pltpu.VMEM(expert_sizes_x2_smem.shape[1:], expert_sizes_x2_smem.dtype),
@@ -2549,6 +2557,11 @@ def fused_ep_moe_v2(
             if use_bt_banking
             else pltpu.SMEM((expert_buffer_count,), jnp.int32)
         ),  # a2a_s_sends
+        # VMEM: double-buffered metadata all-gather mailbox. Keeping this
+        # kernel-scoped makes peer destinations valid without a metadata-entry
+        # barrier; alternating banks prevents the next block from clobbering a
+        # peer that is still materializing the previous generation.
+        pltpu.VMEM((2, num_devices, 1, padded_num_experts), jnp.int32),
         # VMEM: gather accumulation
         pltpu.VMEM((2, top_k, acc_bt, out_packing, h_per_out), out_dtype),  # a2a_g_acc
         # VMEM: topk
@@ -2626,8 +2639,8 @@ def fused_ep_moe_v2(
             pltpu.SemaphoreType.DMA((num_bt_banks,)) if use_gather_bank else pltpu.SemaphoreType.DMA
         ),  # a2a_gather
         pltpu.SemaphoreType.DMA((1,)),  # a2a_acc
-        pltpu.SemaphoreType.DMA,  # md_send
-        pltpu.SemaphoreType.DMA,  # md_recv
+        pltpu.SemaphoreType.DMA((2,)),  # md_send, banked with metadata mailbox
+        pltpu.SemaphoreType.DMA((2,)),  # md_recv, banked with metadata mailbox
         pltpu.SemaphoreType.BARRIER,  # barrier
     )
 
