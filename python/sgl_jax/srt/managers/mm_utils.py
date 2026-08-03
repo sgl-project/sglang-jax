@@ -123,8 +123,8 @@ def _build_embed_round(
                 )
 
             patch_features.append(feat)
-            for start, end in item.offsets or []:
-                for o in range(int(start), int(end) + 1):
+            for start, end in item.placeholder_ranges or []:
+                for o in range(int(start), int(end)):
                     tok = rank_base + unit.req_base + o
                     if tok < rank_base or tok >= rank_base + per_dp_token:
                         raise ValueError(

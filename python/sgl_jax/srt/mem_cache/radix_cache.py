@@ -57,6 +57,14 @@ class RadixKey:
         return f"RadixKey(extra_key={self.extra_key!r}, dp_rank={self.dp_rank!r}, token_ids={preview}{'...' if len(self.token_ids) > 10 else ''})"
 
 
+def request_cache_key_ids(req: Req, token_ids: list[int]) -> list[int]:
+    cache_input_ids = getattr(req, "cache_input_ids", None)
+    if cache_input_ids is None:
+        return token_ids
+    cache_key_ids = cache_input_ids + req.output_ids if req.output_ids else cache_input_ids
+    return cache_key_ids[: len(token_ids)]
+
+
 class TreeNode:
     counter = 0
 
@@ -299,6 +307,7 @@ class RadixCache(BasePrefixCache):
             return
 
         token_ids = (req.origin_input_ids + req.output_ids)[:committed_kv_len]
+        token_ids = request_cache_key_ids(req, token_ids)
         # For EAGLE radix cache, we will convert the key to bigram key, e.g. [1,2,3,4] -> [(1,2), (2,3), (3,4)], the length will -1. ((len([(1,2), (2,3), (3,4)]) = len([1,2,3,4]) - 1))
         # So for the corresponding kv length should also -1. Then we get the actual_kv_len, and use it to do later calculation and slicing.
         actual_kv_len = committed_kv_len - 1 if self.is_eagle else committed_kv_len
@@ -346,8 +355,7 @@ class RadixCache(BasePrefixCache):
             return
 
         dp_rank = req.dp_rank if req.dp_rank is not None else 0
-        token_ids = req.fill_ids
-        all_token_len = len(token_ids)
+        all_token_len = len(req.fill_ids)
         # For EAGLE radix cache, we will convert the key to bigram key, e.g. [1,2,3,4] -> [(1,2), (2,3), (3,4)], the length will -1. ((len([(1,2), (2,3), (3,4)]) = len([1,2,3,4]) - 1))
         # So for the corresponding kv length should also -1. Then we get the actual_kv_len, and use it to do later calculation and slicing.
         actual_kv_len = all_token_len - 1 if self.is_eagle else all_token_len
@@ -362,7 +370,8 @@ class RadixCache(BasePrefixCache):
 
         # For EAGLE, the page_aligned_len is for the bigram key, the normal key len should +1
         page_aligned_token_len = page_aligned_len + 1 if self.is_eagle else page_aligned_len
-        page_aligned_token_ids = token_ids[:page_aligned_token_len]
+        # Real fill_ids drive kv slicing above; the KEY uses the hash-substituted ids.
+        page_aligned_token_ids = request_cache_key_ids(req, req.fill_ids[:page_aligned_token_len])
 
         # cache_protected_len, not len(prefix_indices): see cache_finished_req above.
         old_prefix_len = req.cache_protected_len

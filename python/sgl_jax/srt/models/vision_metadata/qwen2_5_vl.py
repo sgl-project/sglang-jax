@@ -78,7 +78,7 @@ def _item_grid_thw(item: MultimodalDataItem) -> tuple:
 
 
 def _placeholder_rows(item) -> int:
-    return sum(int(end) - int(start) + 1 for start, end in item.offsets or [])
+    return sum(int(end) - int(start) for start, end in item.placeholder_ranges or [])
 
 
 class Qwen25VLVisionMetadataBuilder:
