@@ -424,11 +424,17 @@ def _fused_ep_moe_kernel(
     n_sg = h_per_t // ffn1_qbk if ffn1_qbk is not None else 1
     n_sg2 = bf // ffn2_qbk if ffn2_qbk is not None else 1
 
-    ablation_metadata_only = kernel_ablation_mode == "metadata_only"
+    ablation_stop_after_metadata = kernel_ablation_mode in (
+        "metadata_only",
+        "metadata_prequant",
+    )
+    ablation_skip_prequant = kernel_ablation_mode == "metadata_only"
     ablation_scatter_only = kernel_ablation_mode == "scatter_only"
-    ablation_ffn_io_only = kernel_ablation_mode == "ffn_io_only"
+    ablation_token_io_only = kernel_ablation_mode == "token_io_only"
+    ablation_ffn_io_only = kernel_ablation_mode in ("token_io_only", "ffn_io_only")
     ablation_stop_before_gather = kernel_ablation_mode in (
         "scatter_only",
+        "token_io_only",
         "ffn_io_only",
         "routed_no_gather",
     )
@@ -446,7 +452,7 @@ def _fused_ep_moe_kernel(
     # direct and dequant paths.
     can_split_w13_w2_prefetch = can_cross_expert_prefetch and not full_cross_expert_prefetch
     can_full_cross_expert_prefetch = can_cross_expert_prefetch and full_cross_expert_prefetch
-    can_bt_scatter_overlap = use_bt_scatter_bank and not ablation_metadata_only
+    can_bt_scatter_overlap = use_bt_scatter_bank and not ablation_stop_after_metadata
 
     se_inter_size = 0
     se_total_blocks = 0
@@ -1678,20 +1684,21 @@ def _fused_ep_moe_kernel(
                     ...
                 ] = jnp.zeros((bts, t_packing), jnp.float8_e4m3fn)
 
-            start_fetch_w13_w2(local_e_id, 0, 0)
-            if num_bf >= 2:
-                start_fetch_w13_w2(local_e_id, 1, 1)
-            for bf_id in range(num_bf):
-                slot = bf_id % 2
-                wait_fetch_w1(slot)
-                wait_fetch_w3(slot)
-                dequant_w1(slot)
-                dequant_w3(slot)
-                wait_fetch_w2(slot)
-                dequant_w2(slot)
-                next_bf_id = bf_id + 2
-                if next_bf_id < num_bf:
-                    start_fetch_w13_w2(local_e_id, slot, next_bf_id)
+            if not ablation_token_io_only:
+                start_fetch_w13_w2(local_e_id, 0, 0)
+                if num_bf >= 2:
+                    start_fetch_w13_w2(local_e_id, 1, 1)
+                for bf_id in range(num_bf):
+                    slot = bf_id % 2
+                    wait_fetch_w1(slot)
+                    wait_fetch_w3(slot)
+                    dequant_w1(slot)
+                    dequant_w3(slot)
+                    wait_fetch_w2(slot)
+                    dequant_w2(slot)
+                    next_bf_id = bf_id + 2
+                    if next_bf_id < num_bf:
+                        start_fetch_w13_w2(local_e_id, slot, next_bf_id)
             return None
 
         lax.fori_loop(0, num_bts_tiles, _bts_body, None, unroll=False)
@@ -2042,7 +2049,7 @@ def _fused_ep_moe_kernel(
     # Needs bt<=bts.
     use_per_bt_prequant = (
         enable_act_quant
-        and not ablation_metadata_only
+        and not ablation_skip_prequant
         and bt <= bts
         and not os.environ.get("SGLJAX_SKIP_PREQUANT")
     )
@@ -2138,7 +2145,7 @@ def _fused_ep_moe_kernel(
 
         t2e_routing = b_topk_ids_x2_vmem[bt_sem_id]
 
-        if ablation_metadata_only:
+        if ablation_stop_after_metadata:
             return e_sem_id
 
         if not skip_post_gather:
@@ -2300,7 +2307,7 @@ def _fused_ep_moe_kernel(
 
     if (
         enable_act_quant
-        and not ablation_metadata_only
+        and not ablation_skip_prequant
         and not use_per_bt_prequant
         and not os.environ.get("SGLJAX_SKIP_PREQUANT")
     ):
@@ -2367,7 +2374,7 @@ def _fused_ep_moe_kernel(
 
         lax.fori_loop(0, num_bt, _run_bt_expert_only, jnp.int32(0), unroll=False)
 
-        if ablation_metadata_only:
+        if ablation_stop_after_metadata:
             sync_barrier()
             return
 
@@ -2411,7 +2418,7 @@ def _fused_ep_moe_kernel(
     else:
         lax.fori_loop(0, num_bt, run_bt, jnp.int32(0), unroll=False)
 
-    if ablation_metadata_only or ablation_stop_before_gather:
+    if ablation_stop_after_metadata or ablation_stop_before_gather:
         sync_barrier()
         return
 
@@ -2500,7 +2507,9 @@ def fused_ep_moe_v2(
         "no_weight_hbm",
         "routed_no_gather",
         "ffn_io_only",
+        "token_io_only",
         "scatter_only",
+        "metadata_prequant",
         "metadata_only",
     }
     if kernel_ablation_mode not in valid_kernel_ablation_modes:

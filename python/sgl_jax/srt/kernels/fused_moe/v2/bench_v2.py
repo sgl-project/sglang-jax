@@ -325,7 +325,9 @@ valid_kernel_ablation_modes = {
     "no_weight_hbm",
     "routed_no_gather",
     "ffn_io_only",
+    "token_io_only",
     "scatter_only",
+    "metadata_prequant",
     "metadata_only",
 }
 if kernel_ablation_mode not in valid_kernel_ablation_modes:
