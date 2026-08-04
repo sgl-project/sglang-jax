@@ -14,6 +14,7 @@ Env vars:
   BENCH_QBK     — quant_block_k for fp8 (default: 128)
   BENCH_DIRECT_SCALED_DOT — 1 to use direct-scaled-dot for both FFN1/FFN2
   BENCH_INTERLEAVE_BT — comma-separated 0/1 interleave BT gather banking
+  BENCH_VARIANT — label written to BENCH_JSONL for ablation tracking
   BENCH_TUNE    — 1 to auto-generate bt/bf candidates
   BENCH_MAX_CONFIGS — maximum auto-tune candidates per token shape (default: 48)
   BENCH_TUNE_VMEM_HEADROOM — VMEM budget ratio used by the tuner (default: 0.95)
@@ -290,6 +291,7 @@ tune_mode = os.environ.get("BENCH_TUNE", "0") == "1"
 tune_max_configs = int(os.environ.get("BENCH_MAX_CONFIGS", "48"))
 tune_vmem_headroom = float(os.environ.get("BENCH_TUNE_VMEM_HEADROOM", "0.95"))
 metrics_jsonl = os.environ.get("BENCH_JSONL")
+benchmark_variant = os.environ.get("BENCH_VARIANT", "fused_moe_v2_tune")
 if not tune_mode:
     from sgl_jax.srt.kernels.fused_moe.v2.tuned_block_configs import (
         DEFAULT_V2_BLOCK_CONFIG,
@@ -1191,7 +1193,7 @@ if jax.process_index() == 0 and results:
                 best_avg = entries[0][1]
                 for tag, avg, times in entries:
                     record = {
-                        "variant": "fused_moe_v2_tune",
+                        "variant": benchmark_variant,
                         "tokens": nt,
                         "num_experts": E,
                         "top_k": top_k,
@@ -1204,6 +1206,8 @@ if jax.process_index() == 0 and results:
                         "use_shared_expert": use_shared_expert,
                         "shared_expert_intermediate_size": se_inter if use_shared_expert else 0,
                         "enable_act_quant": enable_act_quant,
+                        "enable_bt_scatter_overlap": enable_bt_scatter_overlap,
+                        "routing_mode": routing_mode,
                         "block_config": tag,
                         "latency_ms": float(avg),
                         "latency_p50_ms": float(np.median(times)),
