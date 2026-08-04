@@ -158,9 +158,6 @@ def trace_timeit(run_fn, warmup: int, iters: int) -> list[float]:
             out = run_fn()
             jax.block_until_ready(out)
 
-    if jax.process_index() != 0:
-        shutil.rmtree(trace_dir, ignore_errors=True)
-        return []
     try:
         trace = _load_trace(trace_dir)
         return _extract_durations_ms(trace)
@@ -1170,7 +1167,7 @@ for num_tokens in token_candidates:
             continue
 
 # --- Summary ---
-if jax.process_index() == 0 and results:
+if results:
     log("")
     log("=== Summary ===")
     by_tokens: dict[int, list[tuple[str, float, list[float]]]] = {}
@@ -1200,6 +1197,7 @@ if jax.process_index() == 0 and results:
                         "hidden_size": d,
                         "intermediate_size": f,
                         "ep_size": ep_size,
+                        "process_index": jax.process_index(),
                         "activation_dtype": "bfloat16",
                         "weight_dtype": "float8_e4m3fn" if use_fp8 else "bfloat16",
                         "quant_block_k": quant_block_k,
