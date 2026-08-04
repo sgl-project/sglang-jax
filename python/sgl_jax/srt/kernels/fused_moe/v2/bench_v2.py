@@ -15,6 +15,7 @@ Env vars:
   BENCH_DIRECT_SCALED_DOT — 1 to use direct-scaled-dot for both FFN1/FFN2
   BENCH_INTERLEAVE_BT — comma-separated 0/1 interleave BT gather banking
   BENCH_VARIANT — label written to BENCH_JSONL for ablation tracking
+  BENCH_KERNEL_ABLATION — static in-kernel stage cut (default: full)
   BENCH_TUNE    — 1 to auto-generate bt/bf candidates
   BENCH_MAX_CONFIGS — maximum auto-tune candidates per token shape (default: 48)
   BENCH_TUNE_VMEM_HEADROOM — VMEM budget ratio used by the tuner (default: 0.95)
@@ -289,6 +290,7 @@ tune_max_configs = int(os.environ.get("BENCH_MAX_CONFIGS", "48"))
 tune_vmem_headroom = float(os.environ.get("BENCH_TUNE_VMEM_HEADROOM", "0.95"))
 metrics_jsonl = os.environ.get("BENCH_JSONL")
 benchmark_variant = os.environ.get("BENCH_VARIANT", "fused_moe_v2_tune")
+kernel_ablation_mode = os.environ.get("BENCH_KERNEL_ABLATION", "full")
 _explicit_block_shape = any(
     os.environ.get(k) is not None for k in ("BENCH_BT", "BENCH_BF", "BENCH_BTC", "BENCH_BTS")
 )
@@ -317,6 +319,22 @@ if invalid_modes:
         f"Unsupported BENCH_CROSS_EXPERT_PREFETCH values {invalid_modes}; "
         "expected one of none, full, or w13."
     )
+valid_kernel_ablation_modes = {
+    "full",
+    "no_shared",
+    "no_weight_hbm",
+    "routed_no_gather",
+    "ffn_io_only",
+    "scatter_only",
+    "metadata_only",
+}
+if kernel_ablation_mode not in valid_kernel_ablation_modes:
+    raise ValueError(
+        f"Unsupported BENCH_KERNEL_ABLATION={kernel_ablation_mode!r}; "
+        f"expected one of {sorted(valid_kernel_ablation_modes)}."
+    )
+if check_correctness and kernel_ablation_mode != "full":
+    raise ValueError("BENCH_CHECK=1 is only valid with BENCH_KERNEL_ABLATION=full.")
 valid_routing_modes = {"random", "deterministic", "hot_expert"}
 if routing_mode not in valid_routing_modes:
     raise ValueError(
@@ -334,6 +352,8 @@ if direct_scaled_dot:
 if enable_bt_scatter_overlap:
     log("bt_scatter_overlap=True (next-BT scatter HBM bank overlap)")
 log(f"cross_expert_prefetch={cross_expert_prefetch_modes}")
+if kernel_ablation_mode != "full":
+    log(f"kernel_ablation_mode={kernel_ablation_mode} (benchmark-only, output is invalid)")
 if interleave_bt_modes != [True]:
     log(f"interleave_bt sweep: {interleave_bt_modes}")
 
@@ -1063,7 +1083,8 @@ for num_tokens in token_candidates:
             f"bt={bt},bf={bf},btc={btc},bts={bts},bse={bc.bse},"
             f"xprefetch={xprefetch_mode},"
             f"direct={int(direct_scaled_dot)},"
-            f"ilv_bt={int(interleave_bt)}"
+            f"ilv_bt={int(interleave_bt)},"
+            f"ablation={kernel_ablation_mode}"
         )
 
         padded_nt = num_tokens
@@ -1084,7 +1105,8 @@ for num_tokens in token_candidates:
             f"btc={bc_resolved.btc},bts={bc_resolved.bts},bse={bc_resolved.bse},"
             f"xprefetch={xprefetch_mode},"
             f"direct={int(direct_scaled_dot)},"
-            f"ilv_bt={int(interleave_bt)}"
+            f"ilv_bt={int(interleave_bt)},"
+            f"ablation={kernel_ablation_mode}"
         )
         resolved_key = (
             bc_resolved.bt,
@@ -1094,6 +1116,7 @@ for num_tokens in token_candidates:
             xprefetch_mode,
             direct_scaled_dot,
             interleave_bt,
+            kernel_ablation_mode,
         )
         if resolved_key in seen_resolved_configs:
             log(f"  SKIP duplicate resolved config {tag} -> {tag_resolved}")
@@ -1128,6 +1151,7 @@ for num_tokens in token_candidates:
                 cross_expert_prefetch_mode=xprefetch_mode,
                 interleave_bt=interleave_bt,
                 enable_bt_scatter_overlap=enable_bt_scatter_overlap,
+                kernel_ablation_mode=kernel_ablation_mode,
             )
 
         try:
@@ -1203,6 +1227,7 @@ if results:
                         "shared_expert_intermediate_size": se_inter if use_shared_expert else 0,
                         "enable_act_quant": enable_act_quant,
                         "enable_bt_scatter_overlap": enable_bt_scatter_overlap,
+                        "kernel_ablation_mode": kernel_ablation_mode,
                         "routing_mode": routing_mode,
                         "block_config": tag,
                         "latency_ms": float(avg),
