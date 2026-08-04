@@ -431,11 +431,17 @@ def _fused_ep_moe_kernel(
     ablation_skip_prequant = kernel_ablation_mode == "metadata_only"
     ablation_scatter_only = kernel_ablation_mode == "scatter_only"
     ablation_token_io_only = kernel_ablation_mode == "token_io_only"
-    ablation_ffn_io_only = kernel_ablation_mode in ("token_io_only", "ffn_io_only")
+    ablation_ffn_io_store_only = kernel_ablation_mode == "ffn_io_store_only"
+    ablation_ffn_io_only = kernel_ablation_mode in (
+        "token_io_only",
+        "ffn_io_only",
+        "ffn_io_store_only",
+    )
     ablation_stop_before_gather = kernel_ablation_mode in (
         "scatter_only",
         "token_io_only",
         "ffn_io_only",
+        "ffn_io_store_only",
         "routed_no_gather",
     )
     ablation_skip_weight_hbm = kernel_ablation_mode == "no_weight_hbm"
@@ -1650,7 +1656,9 @@ def _fused_ep_moe_kernel(
         This is a benchmark-only stage cut. It preserves the production bytes
         (including FP8 scales) and DMA waits, but deliberately uses a simple
         within-expert double-buffer schedule so the result is an exposed-IO
-        bound rather than a claim that IO and compute are additive.
+        bound rather than a claim that IO and compute are additive. The
+        ffn_io_store_only mode additionally stores one production-sized expert
+        result tile to HBM; its VMEM contents are intentionally unspecified.
         """
         e_id = my_id * local_num_experts + local_e_id
         dyn_sz = expert_sizes_x2_smem[bt_sem_id, 0, e_id]
@@ -1699,6 +1707,22 @@ def _fused_ep_moe_kernel(
                     next_bf_id = bf_id + 2
                     if next_bf_id < num_bf:
                         start_fetch_w13_w2(local_e_id, slot, next_bf_id)
+
+            if ablation_ffn_io_store_only:
+                # Reproduce the production expert-result DMA exactly, without
+                # materializing the result through FFN arithmetic or f32->bf16
+                # writeback. The payload size, destination, semaphore, and wait
+                # are the same as expert_store_dma above.
+                pltpu.make_async_copy(
+                    src_ref=b_y_stage_vmem,
+                    dst_ref=a2a_s_acc_ref(a2a_bank_id, e_sem_id, tile_start, bts),
+                    sem=y_store_sem.at[0],
+                ).start()
+                pltpu.make_async_copy(
+                    src_ref=b_y_stage_vmem,
+                    dst_ref=b_y_stage_vmem,
+                    sem=y_store_sem.at[0],
+                ).wait()
             return None
 
         lax.fori_loop(0, num_bts_tiles, _bts_body, None, unroll=False)
@@ -2506,6 +2530,7 @@ def fused_ep_moe_v2(
         "no_shared",
         "no_weight_hbm",
         "routed_no_gather",
+        "ffn_io_store_only",
         "ffn_io_only",
         "token_io_only",
         "scatter_only",

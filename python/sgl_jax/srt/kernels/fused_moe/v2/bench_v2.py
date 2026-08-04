@@ -324,6 +324,7 @@ valid_kernel_ablation_modes = {
     "no_shared",
     "no_weight_hbm",
     "routed_no_gather",
+    "ffn_io_store_only",
     "ffn_io_only",
     "token_io_only",
     "scatter_only",
