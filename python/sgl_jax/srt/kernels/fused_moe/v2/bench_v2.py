@@ -1133,7 +1133,7 @@ for num_tokens in token_candidates:
         try:
             if use_split:
                 dispatch_times, wait_times = split_timeit(run_fn, warmup=warmup, iters=iters)
-                if jax.process_index() == 0 and dispatch_times:
+                if dispatch_times:
                     d_avg = np.mean(dispatch_times)
                     w_avg = np.mean(wait_times)
                     wall_avg = d_avg + w_avg
@@ -1152,15 +1152,14 @@ for num_tokens in token_candidates:
                     )
             else:
                 times = timeit_fn(run_fn, warmup=warmup, iters=iters)
-                if jax.process_index() == 0:
-                    if times:
-                        avg = np.mean(times)
-                        log(
-                            f"  {tag_resolved}: {avg:.3f} ms ({timing_label}) | samples={[round(t, 3) for t in times]}"
-                        )
-                        results.append((num_tokens, tag_resolved, avg, times))
-                    else:
-                        log(f"  {tag_resolved}: no timing data")
+                if times:
+                    avg = np.mean(times)
+                    log(
+                        f"  {tag_resolved}: {avg:.3f} ms ({timing_label}) | samples={[round(t, 3) for t in times]}"
+                    )
+                    results.append((num_tokens, tag_resolved, avg, times))
+                else:
+                    log(f"  {tag_resolved}: no timing data")
         except Exception as e:
             log(f"  FAIL {tag}: {e}")
             continue
