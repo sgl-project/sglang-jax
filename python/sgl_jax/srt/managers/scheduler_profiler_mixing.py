@@ -131,9 +131,9 @@ class _ProfileManager:
         logger.info("Stage-based profiling: starting trace for '%s' -> %s", stage, stage_dir)
 
         profiler_options = jax.profiler.ProfileOptions()
-        if self._host_tracer_level:
+        if self._host_tracer_level is not None:
             profiler_options.host_tracer_level = self._host_tracer_level
-        if self._python_tracer_level:
+        if self._python_tracer_level is not None:
             profiler_options.python_tracer_level = self._python_tracer_level
 
         jax.profiler.start_trace(stage_dir, profiler_options=profiler_options)
@@ -213,9 +213,9 @@ class SchedulerProfilerMixin:
         )
 
         profiler_options = jax.profiler.ProfileOptions()
-        if host_tracer_level:
+        if host_tracer_level is not None:
             profiler_options.host_tracer_level = host_tracer_level
-        if python_tracer_level:
+        if python_tracer_level is not None:
             profiler_options.python_tracer_level = python_tracer_level
 
         print(f"profiler_options: {profiler_options}")
