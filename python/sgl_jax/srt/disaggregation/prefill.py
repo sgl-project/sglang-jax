@@ -50,6 +50,42 @@ def _pad_to_page_bucket(num_pages: int) -> int:
     return ((num_pages + largest - 1) // largest) * largest
 
 
+def _globalize_rank_local_page_ids(
+    page_ids,
+    *,
+    dp_rank: int,
+    dp_size: int,
+    total_pages: int,
+):
+    """Map allocator-local page IDs onto the global data-sharded page axis.
+
+    Every DP shard owns a leading padding page at local ID 0, followed by its
+    independently allocated pages. The global KV buffer concatenates those
+    equally sized shards along the page axis.
+    """
+
+    import numpy as np
+
+    ids = np.asarray(page_ids)
+    dp_rank = int(dp_rank)
+    dp_size = int(dp_size)
+    total_pages = int(total_pages)
+    if dp_size <= 0:
+        raise ValueError(f"dp_size must be positive, got {dp_size}")
+    if not 0 <= dp_rank < dp_size:
+        raise ValueError(f"dp_rank={dp_rank} is outside [0, {dp_size})")
+    if total_pages <= 0 or total_pages % dp_size:
+        raise ValueError(
+            f"global KV page count {total_pages} is not divisible by dp_size={dp_size}"
+        )
+    pages_per_rank = total_pages // dp_size
+    if np.any(ids < 0) or np.any(ids >= pages_per_rank):
+        raise ValueError(
+            f"rank-local KV page IDs must be in [0, {pages_per_rank}); got {ids.tolist()}"
+        )
+    return ids + dp_rank * pages_per_rank
+
+
 @partial(jax.jit, static_argnames=("out_sharding",))
 def _jit_gather_one_layer(buf, page_indices, out_sharding):
     """Gather ``page_indices`` from a single per-layer KV buffer.
@@ -386,12 +422,6 @@ class SchedulerDisaggregationPrefillMixin:
             page_ids = _np.concatenate(
                 [page_ids, _np.zeros(padded_pages - num_pages, dtype=page_ids.dtype)]
             )
-        idx_sharding = _NamedSharding(kv_pool.mesh, _P(None))
-        page_indices = jax.device_put(page_ids, idx_sharding)
-        # out_sharding describes the gather output, not the pool.
-        pool_pspec = kv_pool.kv_sharding.spec
-        gather_pspec = _P(None, *pool_pspec[1:])
-        gather_out_sharding = _NamedSharding(kv_pool.mesh, gather_pspec)
         layer_buffers = [
             kv_pool.get_kv_buffer(layer_id)
             for layer_id in range(
@@ -399,6 +429,20 @@ class SchedulerDisaggregationPrefillMixin:
                 kv_pool.start_layer + kv_pool.layer_num,
             )
         ]
+        if not layer_buffers:
+            raise ValueError("cannot gather debug KV from an empty layer range")
+        page_ids = _globalize_rank_local_page_ids(
+            page_ids,
+            dp_rank=int(getattr(req, "dp_rank", 0) or 0),
+            dp_size=int(getattr(kv_pool, "dp_size", 1)),
+            total_pages=int(layer_buffers[0].shape[0]),
+        )
+        idx_sharding = _NamedSharding(kv_pool.mesh, _P(None))
+        page_indices = jax.device_put(page_ids, idx_sharding)
+        # out_sharding describes the gather output, not the pool.
+        pool_pspec = kv_pool.kv_sharding.spec
+        gather_pspec = _P(None, *pool_pspec[1:])
+        gather_out_sharding = _NamedSharding(kv_pool.mesh, gather_pspec)
         layer_kvs = _jit_gather_all_layers(layer_buffers, page_indices, gather_out_sharding)
         if jax.process_count() > 1:
             # Multi-host: expose only this host's TP shard as a fully-addressable

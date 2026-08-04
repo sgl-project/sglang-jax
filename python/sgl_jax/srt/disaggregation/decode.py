@@ -150,6 +150,15 @@ class DecodeTransferQueue:
                 raise ValueError(f"DecodeTransferQueue already tracks req_id={entry.req_id!r}")
             self._entries[entry.req_id] = entry
 
+    def count_by_rank(self, dp_size: int) -> list[int]:
+        """Return an atomic snapshot of in-flight transfers per Decode rank."""
+
+        counts = [0] * dp_size
+        with self._lock:
+            for entry in self._entries.values():
+                counts[_request_dp_rank(entry.req, dp_size)] += 1
+        return counts
+
     def drain_terminal(self) -> list[DecodeBookkeeping]:
         """Return entries whose receiver reached SUCCESS or FAILED."""
 
@@ -530,12 +539,9 @@ class SchedulerDisaggregationDecodeMixin:
         per_rank_inflight = per_rank_inflight_limit(max_inflight, self.dp_size)
         n_transfer = len(self.disagg_transfer_queue)
         admitted = 0
-        transfer_per_dp = [0] * self.dp_size
-        with self.disagg_transfer_queue._lock:
-            for transfer_entry in self.disagg_transfer_queue._entries.values():
-                rank = _request_dp_rank(transfer_entry.req, self.dp_size)
-                transfer_per_dp[rank] += 1
+        transfer_per_dp = self.disagg_transfer_queue.count_by_rank(self.dp_size)
         admitted_per_dp = [0] * self.dp_size
+        capacity_blocked_ranks: set[int] = set()
 
         for entry in self.disagg_prealloc_queue.items_fifo():
             local_dp_rank = _request_dp_rank(entry.req, self.dp_size)
@@ -548,6 +554,11 @@ class SchedulerDisaggregationDecodeMixin:
             # and retry next tick (deferral, never abort).
             if max_inflight > 0 and (n_transfer + admitted) >= max_inflight:
                 break
+            # Once one request cannot fit a rank-local KV pool, retain FIFO
+            # within that rank for the rest of this admission pass. Other
+            # ranks remain independent and may continue making progress.
+            if local_dp_rank in capacity_blocked_ranks:
+                continue
             # Each DP rank owns one Raiden manager and its own fixed slot pool.
             # Skip a saturated rank while allowing later requests for other
             # ranks to proceed, preventing cross-rank head-of-line blocking.
@@ -564,14 +575,16 @@ class SchedulerDisaggregationDecodeMixin:
                 n_running + transfer_per_dp[local_dp_rank] + admitted_per_dp[local_dp_rank]
             )
             if page_aligned + reserved > allocator.available_size(local_dp_rank):
-                # Insufficient capacity: defer this and all later (FIFO) reqs.
-                break
+                capacity_blocked_ranks.add(local_dp_rank)
+                continue
 
             kv_indices = allocator.alloc(page_aligned, dp_rank=local_dp_rank)
             if kv_indices is None:
                 # Budget check should prevent this; treat a surprise shortfall
-                # as transient and retry next tick rather than abort.
-                break
+                # as transient. Block only this rank so other ranks can still
+                # make progress without violating rank-local FIFO.
+                capacity_blocked_ranks.add(local_dp_rank)
+                continue
 
             try:
                 admission = self.disagg_kv_manager.try_start_decode(
@@ -826,12 +839,35 @@ class SchedulerDisaggregationDecodeMixin:
         manager = getattr(self, "disagg_kv_manager", None)
         room = getattr(req, "bootstrap_room", None)
         if manager is not None and cleanup_transfer:
-            with suppress(Exception):
-                manager.cleanup_transfer(
+            try:
+                source_dp_rank = _request_dp_rank(req, self.dp_size, source=True)
+            except Exception:
+                logger.warning(
+                    "cannot resolve source DP rank while cleaning up aborted "
+                    "req_id=%s bootstrap_room=%s reason=%s; transfer metadata "
+                    "will expire by TTL",
+                    req.rid,
                     room,
-                    jax_process_index=getattr(req, "disagg_peer_process_index", None),
-                    source_dp_rank=_request_dp_rank(req, self.dp_size, source=True),
+                    reason,
+                    exc_info=True,
                 )
+            else:
+                try:
+                    manager.cleanup_transfer(
+                        room,
+                        jax_process_index=getattr(req, "disagg_peer_process_index", None),
+                        source_dp_rank=source_dp_rank,
+                    )
+                except Exception:
+                    logger.warning(
+                        "failed to clean up transfer metadata for req_id=%s "
+                        "bootstrap_room=%s source_dp_rank=%s reason=%s",
+                        req.rid,
+                        room,
+                        source_dp_rank,
+                        reason,
+                        exc_info=True,
+                    )
         self._release_decode_req_resources(req)
         try:
             from sgl_jax.srt.managers.io_struct import AbortReq

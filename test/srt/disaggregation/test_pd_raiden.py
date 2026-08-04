@@ -9,7 +9,10 @@ import sys
 import types
 from unittest import mock
 
+import jax
+import numpy as np
 import pytest
+from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec
 
 from sgl_jax.raiden import raiden_requested
 from sgl_jax.srt.disaggregation.base.kv_manager import KVPoll
@@ -25,7 +28,10 @@ from sgl_jax.srt.disaggregation.raiden_transfer.conn import (
     RaidenTransferKVManager,
     _uuid_to_int,
 )
-from sgl_jax.srt.disaggregation.raiden_transfer.wrapper import RaidenTransferWrapper
+from sgl_jax.srt.disaggregation.raiden_transfer.wrapper import (
+    RaidenTransferWrapper,
+    _rank_local_array,
+)
 from sgl_jax.srt.server_args import ServerArgs
 
 
@@ -708,3 +714,55 @@ def test_raiden_wrapper_routes_each_operation_to_its_dp_manager():
     assert sorted(wrapper.endpoints_by_dp_rank) == [0, 1, 2, 3]
     engines[2].register_read.assert_called_once_with("req", 7, [1])
     engines[3].start_read.assert_called_once_with("req", 7, "remote:1", [1], [2], 2)
+
+
+def test_raiden_wrapper_preserves_drained_events_when_one_rank_poll_fails(caplog):
+    engines = [mock.MagicMock() for _ in range(3)]
+    engines[0].poll_stats.return_value = (["sent-0"], [], ["failed-0"])
+    engines[1].poll_stats.side_effect = RuntimeError("rank poll failed")
+    engines[2].poll_stats.return_value = ([], ["received-2"], [])
+    wrapper = RaidenTransferWrapper("127.0.0.1")
+    wrapper._engines = {rank: engine for rank, engine in enumerate(engines)}
+
+    with caplog.at_level("ERROR"):
+        stats = wrapper.poll_stats()
+
+    assert stats == (["sent-0"], ["received-2"], ["failed-0"])
+    assert "Raiden poll_stats failed for dp_rank=1" in caplog.text
+
+
+def test_rank_local_array_builds_real_views_for_each_data_rank():
+    devices = jax.local_devices()
+    if jax.process_count() != 1 or len(devices) < 2 or len(devices) % 2:
+        pytest.skip("requires an even number of locally addressable JAX devices")
+    mesh = Mesh(
+        np.asarray(devices).reshape(2, len(devices) // 2),
+        ("data", "tensor"),
+        axis_types=(AxisType.Explicit, AxisType.Explicit),
+    )
+    sharding = NamedSharding(mesh, PartitionSpec("data", None))
+    source = np.arange(32, dtype=np.int32).reshape(8, 4)
+    array = jax.device_put(source, sharding)
+
+    rank0 = _rank_local_array(array, dp_rank=0, dp_size=2)
+    rank1 = _rank_local_array(array, dp_rank=1, dp_size=2)
+
+    assert rank0.shape == rank1.shape == (4, 4)
+    np.testing.assert_array_equal(np.asarray(rank0), source[:4])
+    np.testing.assert_array_equal(np.asarray(rank1), source[4:])
+
+
+def test_rank_local_array_rejects_kv_replicated_across_data_axis():
+    devices = jax.local_devices()
+    if jax.process_count() != 1 or len(devices) < 2 or len(devices) % 2:
+        pytest.skip("requires an even number of locally addressable JAX devices")
+    mesh = Mesh(
+        np.asarray(devices).reshape(2, len(devices) // 2),
+        ("data", "tensor"),
+        axis_types=(AxisType.Explicit, AxisType.Explicit),
+    )
+    sharding = NamedSharding(mesh, PartitionSpec(None, None))
+    array = jax.device_put(np.arange(32, dtype=np.int32).reshape(8, 4), sharding)
+
+    with pytest.raises(ValueError, match="KV PartitionSpec"):
+        _rank_local_array(array, dp_rank=0, dp_size=2)

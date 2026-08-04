@@ -162,8 +162,15 @@ class RaidenTransferWrapper:
         sent: list[str] = []
         received: list[str] = []
         failed: list[str] = []
-        for engine in self._engines.values():
-            rank_sent, rank_received, rank_failed = engine.poll_stats()
+        for dp_rank, engine in self._engines.items():
+            try:
+                rank_sent, rank_received, rank_failed = engine.poll_stats()
+            except Exception:
+                # Raiden poll_stats destructively drains completion events. Do
+                # not discard results already drained from healthy ranks when
+                # one manager fails to poll.
+                logger.exception("Raiden poll_stats failed for dp_rank=%d", dp_rank)
+                continue
             sent.extend(rank_sent)
             received.extend(rank_received)
             failed.extend(rank_failed)
@@ -205,6 +212,18 @@ def _rank_local_array(array: Any, dp_rank: int, dp_size: int) -> Any:
     if not 0 <= dp_rank < dp_size:
         raise ValueError(f"dp_rank={dp_rank} is outside [0, {dp_size})")
 
+    original_spec = tuple(sharding.spec)
+    data_sharded_dims = []
+    for dim, partition in enumerate(original_spec):
+        axes = partition if isinstance(partition, tuple) else (partition,)
+        if "data" in axes:
+            data_sharded_dims.append(dim)
+    if not data_sharded_dims:
+        raise ValueError(
+            "Raiden DP requires the KV PartitionSpec to shard a tensor "
+            f"dimension along the data mesh axis; got spec={sharding.spec}"
+        )
+
     data_axis = axis_names.index("data")
     rank_devices = np.take(np.asarray(mesh.devices), dp_rank, axis=data_axis)
     rank_axis_names = tuple(axis for axis in axis_names if axis != "data")
@@ -213,7 +232,6 @@ def _rank_local_array(array: Any, dp_rank: int, dp_size: int) -> Any:
         rank_axis_names = ("_raiden",)
     rank_mesh = Mesh(rank_devices, rank_axis_names)
 
-    original_spec = tuple(sharding.spec)
     rank_spec = tuple(_partition_without_data_axis(partition) for partition in original_spec)
     rank_sharding = NamedSharding(rank_mesh, PartitionSpec(*rank_spec))
 

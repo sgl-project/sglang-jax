@@ -26,6 +26,7 @@ from sgl_jax.srt.disaggregation.jax_transfer.wrapper import JaxTransferWrapper
 from sgl_jax.srt.disaggregation.prefill import (
     _KV_GATHER_PAGE_BUCKETS,
     PrefillBootstrapQueue,
+    _globalize_rank_local_page_ids,
     _jit_gather_all_layers,
     _jit_gather_one_layer,
     _pad_to_page_bucket,
@@ -670,6 +671,29 @@ class TestPadToPageBucket:
     )
     def test_bucket_selection(self, input_pages, expected_bucket):
         assert _pad_to_page_bucket(input_pages) == expected_bucket
+
+
+class TestGlobalizeRankLocalPageIds:
+    def test_offsets_each_rank_by_its_padded_global_page_shard(self):
+        local_ids = np.array([0, 1, 4], dtype=np.int32)
+
+        actual = _globalize_rank_local_page_ids(
+            local_ids,
+            dp_rank=2,
+            dp_size=4,
+            total_pages=20,
+        )
+
+        np.testing.assert_array_equal(actual, np.array([10, 11, 14], dtype=np.int32))
+
+    def test_rejects_page_ids_outside_the_rank_local_shard(self):
+        with pytest.raises(ValueError, match="rank-local KV page IDs"):
+            _globalize_rank_local_page_ids(
+                np.array([5], dtype=np.int32),
+                dp_rank=0,
+                dp_size=4,
+                total_pages=20,
+            )
 
 
 class TestGatherCompileCaching:

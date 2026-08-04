@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
+from types import SimpleNamespace
+from unittest import mock
 
 from sgl_jax.srt.disaggregation.base.kv_manager import KVPoll
 from sgl_jax.srt.disaggregation.base.transfer import DecodeAdmission
@@ -376,6 +379,29 @@ class _Allocator:
         self.freed.append((idx, dp_rank))
 
 
+class _PerRankAllocator:
+    def __init__(self, capacities, *, fail_alloc_ranks=()):
+        self.page_size = 1
+        self._capacities = list(capacities)
+        self._used = [0] * len(self._capacities)
+        self._fail_alloc_ranks = set(fail_alloc_ranks)
+        self.freed = []
+
+    def available_size(self, dp_rank=0):
+        return self._capacities[dp_rank] - self._used[dp_rank]
+
+    def alloc(self, n, dp_rank=0):
+        if dp_rank in self._fail_alloc_ranks:
+            return None
+        if self._used[dp_rank] + n > self._capacities[dp_rank]:
+            return None
+        self._used[dp_rank] += n
+        return (dp_rank, n)
+
+    def free(self, idx, dp_rank=0):
+        self.freed.append((idx, dp_rank))
+
+
 class _Receiver:
     def __init__(self, raise_on_init=False):
         self._raise = raise_on_init
@@ -467,6 +493,34 @@ def _adm_p_info():
     return {"host": "1.2.3.4", "transfer_port": 5000, "side_channel_port": 5001}
 
 
+def test_abort_logs_when_source_rank_cannot_be_resolved(caplog):
+    class _AbortScheduler:
+        _abort_decode_request = SchedulerDisaggregationDecodeMixin._abort_decode_request
+
+        def __init__(self):
+            self.dp_size = 2
+            self.disagg_kv_manager = mock.Mock()
+            self._comm_backend = None
+            self.send_to_tokenizer = SimpleNamespace(send_pyobj=mock.Mock())
+
+        def _release_decode_req_resources(self, req):
+            pass
+
+    sched = _AbortScheduler()
+    req = SimpleNamespace(
+        rid="missing-source-rank",
+        bootstrap_room=17,
+        disagg_prefill_dp_rank=None,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        sched._abort_decode_request(req, "bootstrap_lookup")
+
+    sched.disagg_kv_manager.cleanup_transfer.assert_not_called()
+    assert "cannot resolve source DP rank" in caplog.text
+    sched.send_to_tokenizer.send_pyobj.assert_called_once()
+
+
 def _enqueue(sched, rid, seqlen):
     entry = DecodeBookkeeping(req_id=rid, req=_AdmReq(rid, seqlen), p_info=_adm_p_info())
     sched.disagg_prealloc_queue.add(entry)
@@ -499,6 +553,41 @@ def test_admission_routes_allocator_and_transfer_to_destination_and_source_ranks
     context = sched.disagg_kv_manager.created[0][1].inited
     assert context.local_dp_rank == 3
     assert context.source_dp_rank == 1
+
+
+def test_rank_local_capacity_block_does_not_starve_other_ranks_or_break_rank_fifo():
+    sched = _AdmScheduler(capacity=100, reserved=0, max_inflight=4)
+    sched.dp_size = 2
+    sched.token_to_kv_pool_allocator = _PerRankAllocator([0, 100])
+    rank0_head = _enqueue(sched, "rank0-head", seqlen=4)
+    rank0_head.req.dp_rank = 0
+    rank1 = _enqueue(sched, "rank1", seqlen=4)
+    rank1.req.dp_rank = 1
+    rank0_tail = _enqueue(sched, "rank0-tail", seqlen=1)
+    rank0_tail.req.dp_rank = 0
+
+    sched._admit_decode_prealloc()
+
+    assert sched.disagg_transfer_queue.count_by_rank(2) == [0, 1]
+    assert [entry.req_id for entry in sched.disagg_prealloc_queue.items_fifo()] == [
+        "rank0-head",
+        "rank0-tail",
+    ]
+
+
+def test_rank_local_alloc_shortfall_does_not_starve_other_ranks():
+    sched = _AdmScheduler(capacity=100, reserved=0, max_inflight=4)
+    sched.dp_size = 2
+    sched.token_to_kv_pool_allocator = _PerRankAllocator([100, 100], fail_alloc_ranks={0})
+    rank0 = _enqueue(sched, "rank0", seqlen=4)
+    rank0.req.dp_rank = 0
+    rank1 = _enqueue(sched, "rank1", seqlen=4)
+    rank1.req.dp_rank = 1
+
+    sched._admit_decode_prealloc()
+
+    assert sched.disagg_transfer_queue.count_by_rank(2) == [0, 1]
+    assert [entry.req_id for entry in sched.disagg_prealloc_queue.items_fifo()] == ["rank0"]
 
 
 def test_defer_when_capacity_insufficient_does_not_abort():
