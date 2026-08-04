@@ -211,6 +211,32 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
         model_def, model_state = nnx.split(self.model)
         # note export for external modification
         self.model_state_leaves, model_state_def = jax.tree_util.tree_flatten(model_state)
+        # Static-quant checkpoints can leave jax.ShapeDtypeStruct placeholders
+        # in module state (e.g. the pre-quant weight slot of QuantizedLinear
+        # when the weight mapping targets .weight_q). jaxlib's ToPyArgSignature
+        # rejects ShapeDtypeStruct, so ComputeCallSignature fails and every
+        # jitted_run_model call falls back to the python dispatch path -- the
+        # per-decode-step cpp cache miss of #1452. The placeholders are dead
+        # on the forward path (a used leaf with a changed shape would fail to
+        # compile); swap them for zero-length arrays so the cpp fastpath can
+        # build a signature.
+        _sds_paths = []
+        _state_paths = None
+        for _i, _x in enumerate(self.model_state_leaves):
+            if isinstance(_x, jax.ShapeDtypeStruct):
+                if _state_paths is None:
+                    _state_paths = jax.tree_util.tree_flatten_with_path(model_state)[0]
+                _sds_paths.append(jax.tree_util.keystr(_state_paths[_i][0]))
+                self.model_state_leaves[_i] = jax.device_put(
+                    jnp.zeros((0,), dtype=_x.dtype), NamedSharding(self.mesh, P())
+                )
+        if _sds_paths:
+            logger.info(
+                "[model_runner] replaced %d ShapeDtypeStruct state placeholders "
+                "with empty arrays (pjit cpp fastpath, #1452); e.g. %s",
+                len(_sds_paths),
+                _sds_paths[:4],
+            )
         self._model_def = model_def
         self._model_state_def = model_state_def
         sampler_def, sampler_state = nnx.split(self.sampler)

@@ -1204,7 +1204,7 @@ class Scheduler(
                         (_it2 - _it1) * 1e3,
                         (_it3 - _it2) * 1e3,
                         sum(len(i.reqs) for i in self.running_batch.reqs_info),
-                        len(getattr(self, "_pd_inflight_rids", ())),
+                        len(getattr(self, "_pd_inflight", ())),
                     )
 
     def run_publisher(self, recv_reqs):
@@ -2760,6 +2760,13 @@ class Scheduler(
                     cleanup_transfer=False,
                 )
 
+        # Pathways single-process PD: requests inside the async P pipeline
+        # (prefill queues / forward / ready_q / defer / migrate) are invisible
+        # to every container above; mark them via the in-flight registry so
+        # they finalize exactly once (#1486). No-op unless pathways PD is on.
+        if getattr(self, "_pd_inflight", None) is not None:
+            self._pd_abort_matching(recv_req)
+
         # Decode reqs deferred because no prefill was registered yet hold no KV
         # or receiver, but abort_request must still drop them so a cancelled
         # request is not re-admitted on the next decode tick.
@@ -2792,6 +2799,13 @@ class Scheduler(
         consumed = self._process_pending_chunked_aborts()
         self._retire_chunked_req_batch_owners(consumed)
 
+        # Pathways single-process PD: drain the async P pipeline as well so a
+        # late prefill result cannot merge into running_batch alongside a
+        # requeued copy of the same request after retract (#1486). No-op
+        # unless pathways PD is on.
+        if getattr(self, "_pd_inflight", None) is not None:
+            self._pd_quiesce()
+
         if recv_req.mode == "retract":
             self.running_batch.filter_batch()
             all_reqs = [
@@ -2805,6 +2819,13 @@ class Scheduler(
                     self._add_request_to_queue(req)
 
             self._retract_parked_chunked_reqs(retracted_reqs)
+            # Pathways PD: the helper above is a no-op there, but chunked
+            # owners parked in the P pools must also be retracted or they
+            # would resume on pre-retract KV (#1501 review). Guarded no-op
+            # outside pathways PD.
+            if getattr(self, "_pd_inflight", None) is not None:
+                for req in self._pd_retract_chunked_owners():
+                    self._add_request_to_queue(req)
             self.last_batch = None
             self.cur_batch = None
             logger.info("Paused generation retracted")

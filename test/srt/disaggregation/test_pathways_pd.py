@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 from types import SimpleNamespace
 
 import jax
@@ -635,7 +636,7 @@ class _FakeGateSelf(PathwaysPDSchedulerMixin):
         self.dp_size = dp_size
         self._pd_reserved_per = reserved_per
         self._d_running = d_running
-        self._pd_inflight_rids = set()
+        self._pd_inflight = {}
         self._pd_inflight_tokens = 0
         self._pd_gate_ticks = 0
 
@@ -661,7 +662,7 @@ def test_track_untrack_inflight_idempotent():
     assert fake._pd_inflight_tokens == 8
     PathwaysPDSchedulerMixin._pd_untrack_inflight(fake, r)
     assert fake._pd_inflight_tokens == 0
-    assert not fake._pd_inflight_rids
+    assert not fake._pd_inflight
     # double-untrack (failure path after success path) must not go negative
     PathwaysPDSchedulerMixin._pd_untrack_inflight(fake, r)
     assert fake._pd_inflight_tokens == 0
@@ -730,3 +731,213 @@ def test_fuse_for_batch_is_batch_level():
     assert not w._pd_fuse_for_batch(prefill)
     w._pd_fuse_sample = False
     assert not w._pd_fuse_for_batch(plain)
+
+
+# ---------------------------------------------------------------------------
+# #1486: in-flight registry + abort/retract lifecycle
+# ---------------------------------------------------------------------------
+
+from sgl_jax.srt.disaggregation.pathways_scheduler import _PdInflight  # noqa: E402
+
+
+class _FakeLcReq:
+    def __init__(self, rid, n_input=8, pool_idx=3):
+        self.rid = rid
+        self.origin_input_ids = list(range(n_input))
+        self.req_pool_idx = pool_idx
+        self._finished = False
+        self.finish_reason = None
+
+    def finished(self):
+        return self._finished
+
+    def set_finish_with_abort(self, msg):
+        self._finished = True
+        self.finish_reason = msg
+
+
+class _FakeTree:
+    def __init__(self):
+        self.finished = []
+
+    def cache_finished_req(self, r):
+        self.finished.append(r.rid)
+
+
+class _FakeLifecycleSelf:
+    """Minimal state for registry/abort mixin methods."""
+
+    page_size = 4
+
+    def __init__(self, n_p=1, dp=1):
+        self._pd_inflight = {}
+        self._pd_inflight_tokens = 0
+        self.p_trees = [_FakeTree() for _ in range(n_p)]
+        self.p_r2ts = [SimpleNamespace(free_slots=[]) for _ in range(n_p)]
+        self.p_chunked_reqs = [[None] * dp for _ in range(n_p)]
+        self.streamed = []
+
+    def stream_output(self, reqs, a, b):
+        self.streamed.extend(r.rid for r in reqs)
+
+    # bind mixin methods under test
+    _pd_req_kv_tokens = PathwaysPDSchedulerMixin._pd_req_kv_tokens
+    _pd_track_inflight = PathwaysPDSchedulerMixin._pd_track_inflight
+    _pd_untrack_inflight = PathwaysPDSchedulerMixin._pd_untrack_inflight
+    _pd_batch_outstanding = PathwaysPDSchedulerMixin._pd_batch_outstanding
+    _pd_abort_matching = PathwaysPDSchedulerMixin._pd_abort_matching
+    _pd_finalize_aborted = PathwaysPDSchedulerMixin._pd_finalize_aborted
+
+
+def _fake_batch(*reqs):
+    return SimpleNamespace(reqs_info=[SimpleNamespace(reqs=list(reqs))])
+
+
+@pytest.mark.unit
+def test_registry_track_idempotent_untrack_exact():
+    fake = _FakeLifecycleSelf()
+    r = _FakeLcReq("req-a", n_input=10)  # 10 tokens -> 3 pages * 4 = 12
+    fake._pd_track_inflight(r, p_idx=0)
+    fake._pd_track_inflight(r, p_idx=0)  # chunk-2 re-track: no double count
+    assert fake._pd_inflight_tokens == 12
+    assert fake._pd_inflight["req-a"].outstanding == 0
+    r.origin_input_ids.extend([0] * 100)  # mutate after track
+    fake._pd_untrack_inflight(r)  # must release exactly what was reserved
+    assert fake._pd_inflight_tokens == 0
+    assert fake._pd_inflight == {}
+
+
+@pytest.mark.unit
+def test_batch_outstanding_bump_and_floor():
+    fake = _FakeLifecycleSelf()
+    r = _FakeLcReq("req-b")
+    fake._pd_track_inflight(r, p_idx=0)
+    b = _fake_batch(r)
+    fake._pd_batch_outstanding(b, +1)
+    fake._pd_batch_outstanding(b, +1)
+    assert fake._pd_inflight["req-b"].outstanding == 2
+    fake._pd_batch_outstanding(b, -1)
+    fake._pd_batch_outstanding(b, -1)
+    fake._pd_batch_outstanding(b, -1)  # floor at 0, never negative
+    assert fake._pd_inflight["req-b"].outstanding == 0
+
+
+@pytest.mark.unit
+def test_abort_idle_entry_finalizes_exactly_once():
+    fake = _FakeLifecycleSelf()
+    r = _FakeLcReq("req-c", pool_idx=7)
+    fake._pd_track_inflight(r, p_idx=0)
+    fake.p_chunked_reqs[0][0] = r  # chunked owner between chunks
+    fake._pd_abort_matching(SimpleNamespace(rid="req-c", abort_all=False))
+    assert fake._pd_inflight == {}  # released
+    assert fake._pd_inflight_tokens == 0
+    assert fake.p_trees[0].finished == ["req-c"]  # P KV freed once
+    assert fake.p_r2ts[0].free_slots == [7]
+    assert fake.p_chunked_reqs[0][0] is None  # owner cleared
+    assert r.finished() and fake.streamed == ["req-c"]
+    # second abort for same rid: no entry left, must be a no-op
+    fake._pd_abort_matching(SimpleNamespace(rid="req-c", abort_all=False))
+    assert fake.p_trees[0].finished == ["req-c"]
+
+
+@pytest.mark.unit
+def test_abort_inflight_entry_marks_but_defers():
+    fake = _FakeLifecycleSelf()
+    r = _FakeLcReq("req-d")
+    fake._pd_track_inflight(r, p_idx=0)
+    fake._pd_batch_outstanding(_fake_batch(r), +1)  # batch in flight
+    fake._pd_abort_matching(SimpleNamespace(rid="req-d", abort_all=False))
+    entry = fake._pd_inflight["req-d"]
+    assert entry.pending_abort and entry.outstanding == 1
+    assert fake.p_trees[0].finished == []  # nothing freed yet
+    assert not r.finished()
+    # batch drains -> outstanding 0 -> the drain path finalizes
+    fake._pd_batch_outstanding(_fake_batch(r), -1)
+    fake._pd_finalize_aborted(entry)
+    assert fake._pd_inflight == {} and fake.streamed == ["req-d"]
+
+
+@pytest.mark.unit
+def test_abort_all_matches_every_entry():
+    fake = _FakeLifecycleSelf()
+    r1, r2 = _FakeLcReq("x-1"), _FakeLcReq("y-2")
+    fake._pd_track_inflight(r1, p_idx=0)
+    fake._pd_track_inflight(r2, p_idx=0)
+    fake._pd_abort_matching(SimpleNamespace(rid="", abort_all=True))
+    assert fake._pd_inflight == {}
+    assert sorted(fake.streamed) == ["x-1", "y-2"]
+
+
+@pytest.mark.unit
+def test_abort_prefix_matching_only():
+    fake = _FakeLifecycleSelf()
+    r1, r2 = _FakeLcReq("abc-1"), _FakeLcReq("xyz-2")
+    fake._pd_track_inflight(r1, p_idx=0)
+    fake._pd_track_inflight(r2, p_idx=0)
+    fake._pd_abort_matching(SimpleNamespace(rid="abc", abort_all=False))
+    assert "xyz-2" in fake._pd_inflight and "abc-1" not in fake._pd_inflight
+
+
+@pytest.mark.unit
+def test_quiesce_returns_when_empty_and_blocks_until_drained():
+    fake = _FakeLifecycleSelf()
+    fake._pd_prefill_qs = [queue.Queue()]
+    fake._pd_chunk_pending = [False]
+    fake._pd_ready_q = queue.Queue()
+    fake._pd_defer = []
+    fake.drained = 0
+
+    def _drain():
+        fake.drained += 1
+        return 0
+
+    fake._pd_drain_ready_multi = _drain
+    # empty pipeline: returns immediately after one drain sweep
+    PathwaysPDSchedulerMixin._pd_quiesce(fake, warn_interval_s=1.0)
+    assert fake.drained == 1
+    # stuck outstanding batch: fail-closed -- must NOT return until the
+    # pipeline actually drains (#1501 review), even past a warn interval.
+    r = _FakeLcReq("req-q")
+    fake._pd_track_inflight(r, p_idx=0)
+    fake._pd_inflight["req-q"].outstanding = 1
+    release_after = fake.drained + 12  # ~0.12s of ticks, > warn interval below
+
+    def _drain_then_release():
+        fake.drained += 1
+        if fake.drained >= release_after:
+            fake._pd_inflight["req-q"].outstanding = 0
+        return 0
+
+    fake._pd_drain_ready_multi = _drain_then_release
+    t0 = time.perf_counter()
+    PathwaysPDSchedulerMixin._pd_quiesce(fake, warn_interval_s=0.05)
+    assert fake.drained >= release_after  # waited through, didn't bail early
+    assert time.perf_counter() - t0 < 5.0
+
+
+def test_retract_requeues_parked_chunked_owner():
+    fake = _FakeLifecycleSelf()
+
+    class _FakeRetractReq(_FakeLcReq):
+        def __init__(self, rid):
+            super().__init__(rid)
+            self.reset_calls = 0
+
+        def reset_for_retract(self):
+            self.reset_calls += 1
+
+    owner = _FakeRetractReq("req-ret")
+    fake._pd_track_inflight(owner, p_idx=0)
+    fake.p_chunked_reqs[0][0] = owner
+    out = PathwaysPDSchedulerMixin._pd_retract_chunked_owners(fake)
+    assert out == [owner]
+    assert fake.p_chunked_reqs[0][0] is None
+    assert owner.req_pool_idx is None
+    assert fake.p_trees[0].finished == ["req-ret"]
+    assert fake.p_r2ts[0].free_slots == [3]
+    assert "req-ret" not in fake._pd_inflight  # registry + ledger released
+    assert owner.reset_calls == 1
+    assert owner.finished() is False  # requeued, NOT aborted to the client
+    assert fake.streamed == []
+    # idempotent on empty state
+    assert PathwaysPDSchedulerMixin._pd_retract_chunked_owners(fake) == []

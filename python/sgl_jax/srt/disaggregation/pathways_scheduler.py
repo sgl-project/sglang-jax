@@ -7,6 +7,7 @@ carries the wiring hooks. See design in issue #1427.
 from __future__ import annotations
 
 import copy
+import dataclasses
 import logging
 import os
 import threading
@@ -34,6 +35,24 @@ from sgl_jax.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
 logger = logging.getLogger(__name__)
 _PD_DBG = bool(os.environ.get("SGLANG_PD_DBG"))
 _PD_DBG_TIMING = bool(os.environ.get("SGLANG_PD_DBG_TIMING")) or _PD_DBG
+
+
+@dataclasses.dataclass
+class _PdInflight:
+    """Lifecycle handle for one request in the async P pipeline (#1486).
+
+    outstanding counts P batches currently in flight (queued or forwarding or
+    waiting in ready_q/defer) that carry this req: a chunked req can have
+    chunk N draining while chunk N+1 forwards. Abort finalization (P KV +
+    reservation release + client abort) may only run when outstanding == 0 --
+    otherwise the in-flight batch drains later and finalizes exactly once.
+    """
+
+    req: object
+    p_idx: int
+    tokens: int
+    outstanding: int = 0
+    pending_abort: bool = False
 
 
 class PathwaysPDSchedulerMixin:
@@ -225,8 +244,12 @@ class PathwaysPDSchedulerMixin:
         # ready_q items whose D-pool alloc was deferred (avail < need+reserved)
         self._pd_defer: list = []
         # reqs pushed to prefill_q but not yet drained into running_batch;
-        # tracked by rid so a chunked req counts once, not once-per-chunk.
-        self._pd_inflight_rids: set[str] = set()
+        # keyed by rid so a chunked req counts once, not once-per-chunk.
+        # Registry (#1486): each entry keeps a handle on the req across the
+        # whole async P pipeline (queue -> prefill thread -> ready_q/defer ->
+        # migrate), so abort/retract can always find it -- previously a req
+        # past its final chunk existed only as a rid string.
+        self._pd_inflight: dict[str, _PdInflight] = {}
         # D-pool tokens the inflight rids will need at migrate time (page-
         # padded full IL per req) -- the admission-side reservation ledger.
         self._pd_inflight_tokens = 0
@@ -662,6 +685,7 @@ class PathwaysPDSchedulerMixin:
         if result is None:
             # prefill thread reported failure; free P, clear inflight/chunked.
             # TODO: proper stream-abort to client (currently client times out).
+            self._pd_batch_outstanding(batch, -1)
             all_reqs = []
             for info in batch.reqs_info:
                 for r in info.reqs or ():
@@ -682,7 +706,7 @@ class PathwaysPDSchedulerMixin:
         allocator = self.token_to_kv_pool_allocator
         if done_per_req:
             n_running = sum(len(x.reqs) for x in self.running_batch.reqs_info if x.reqs)
-            reserved = self._pd_reserved_per * (n_running + len(self._pd_inflight_rids))
+            reserved = self._pd_reserved_per * (n_running + len(self._pd_inflight))
             reserved_per_rank = reserved // max(1, self.dp_size)
             need_by_rank = defaultdict(int)
             for r, _, p in done_per_req:
@@ -708,6 +732,11 @@ class PathwaysPDSchedulerMixin:
                     )
                 return
             self._pd_defer_ticks = 0
+        # Only now is this batch really consumed (#1501 review): decrementing
+        # before the capacity gate would let a deferred item hit outstanding==0
+        # while still parked in _pd_defer, so an abort in that window could
+        # finalize the req (freeing its P slots) under the deferred item.
+        self._pd_batch_outstanding(batch, -1)
         d_pages_all = []
         for r, p_slots, p_pages in done_per_req:
             seq_len = len(r.fill_ids)
@@ -782,6 +811,15 @@ class PathwaysPDSchedulerMixin:
                     (time.perf_counter() - t0) * 1e3,
                     len(done_per_req),
                 )
+        # Aborted reqs that just migrated: flag them finished so the standard
+        # prefill-result path below caches/frees their D KV and streams the
+        # abort to the client -- keeps the gather/scatter page layout of live
+        # reqs in the same mixed batch untouched (#1486).
+        for r, _, _ in done_per_req:
+            entry = self._pd_inflight.get(r.rid)
+            if entry is not None and entry.pending_abort and not r.finished():
+                r.set_finish_with_abort("Aborted by AbortReq.")
+                logger.info("[pd_async] aborted request dropped after migrate. rid=%s", r.rid)
         batch.req_to_token_pool = self.req_to_token_pool
         batch.token_to_kv_pool_allocator = self.token_to_kv_pool_allocator
         batch.tree_cache = self.tree_cache
@@ -793,6 +831,13 @@ class PathwaysPDSchedulerMixin:
         with jax.profiler.TraceAnnotation("pd_process_prefill"):
             self.process_batch_result_prefill(batch, result, None)
         for r in chunked_excl.values():
+            # Aborted mid-chunk owner whose last in-flight batch just drained:
+            # finalize (frees P KV, clears the owner slot, streams the abort)
+            # instead of caching for a chunk N+1 that must never build (#1486).
+            entry = self._pd_inflight.get(r.rid)
+            if entry is not None and entry.pending_abort and entry.outstanding == 0:
+                self._pd_finalize_aborted(entry)
+                continue
             # Redundant with the prefill thread's own update (same numpy read,
             # done right after forward — see _pd_prefill_loop) but harmless
             # and kept as a safety net. _pd_chunk_pending is NOT touched here:
@@ -869,18 +914,135 @@ class PathwaysPDSchedulerMixin:
         n = len(r.origin_input_ids)
         return -(-n // self.page_size) * self.page_size
 
-    def _pd_track_inflight(self, r) -> None:
-        """Reserve r's D-pool footprint at admission. Idempotent per rid so
-        a chunked req's chunk-2..N batches don't double-count."""
-        if r.rid not in self._pd_inflight_rids:
-            self._pd_inflight_rids.add(r.rid)
-            self._pd_inflight_tokens += self._pd_req_kv_tokens(r)
+    def _pd_track_inflight(self, r, p_idx: int = 0) -> None:
+        """Reserve r's D-pool footprint at admission and register its
+        lifecycle handle (#1486). Idempotent per rid so a chunked req's
+        chunk-2..N batches don't double-count the reservation; the per-batch
+        outstanding count is bumped separately by the batch-build loop."""
+        if r.rid not in self._pd_inflight:
+            tokens = self._pd_req_kv_tokens(r)
+            self._pd_inflight[r.rid] = _PdInflight(req=r, p_idx=p_idx, tokens=tokens)
+            self._pd_inflight_tokens += tokens
 
     def _pd_untrack_inflight(self, r) -> None:
-        """Release r's reservation (migrated into D, or prefill failed)."""
-        if r.rid in self._pd_inflight_rids:
-            self._pd_inflight_rids.discard(r.rid)
-            self._pd_inflight_tokens = max(0, self._pd_inflight_tokens - self._pd_req_kv_tokens(r))
+        """Release r's reservation (migrated into D, aborted, or prefill
+        failed). Releases exactly the tokens reserved at track time."""
+        entry = self._pd_inflight.pop(r.rid, None)
+        if entry is not None:
+            self._pd_inflight_tokens = max(0, self._pd_inflight_tokens - entry.tokens)
+
+    def _pd_batch_outstanding(self, batch, delta: int) -> None:
+        """Adjust the in-flight batch count for every tracked req in batch."""
+        for info in batch.reqs_info:
+            for r in info.reqs or ():
+                entry = self._pd_inflight.get(r.rid)
+                if entry is not None:
+                    entry.outstanding = max(0, entry.outstanding + delta)
+
+    def _pd_abort_matching(self, recv_req) -> None:
+        """Pathways-side abort coverage (#1486): mark matching in-flight
+        entries pending_abort; anything still carried by an in-flight P batch
+        finalizes exactly once when that batch drains, idle entries (e.g. a
+        chunked owner between chunks) finalize immediately."""
+        if getattr(self, "_pd_inflight", None) is None:
+            return
+        abort_all = getattr(recv_req, "abort_all", False)
+        rid = getattr(recv_req, "rid", "") or ""
+        n_marked = 0
+        for entry in list(self._pd_inflight.values()):
+            if not (abort_all or entry.req.rid.startswith(rid)):
+                continue
+            entry.pending_abort = True
+            n_marked += 1
+            if entry.outstanding == 0:
+                self._pd_finalize_aborted(entry)
+        if n_marked:
+            logger.info("[pd_async] abort matched %d in-flight P-pipeline request(s)", n_marked)
+
+    def _pd_quiesce(self, warn_interval_s: float = 30.0) -> None:
+        """Drain the whole async P pipeline before pause/retract (#1486): wait
+        out in-flight prefill batches and consume every ready/deferred item so
+        no late P result can merge into running_batch next to a requeued copy
+        of the same request.
+
+        Fail-closed (#1501 review): blocks until the pipeline is actually
+        drained rather than proceeding on a timeout -- a late P result after
+        retract would recreate exactly the race this drain exists to prevent,
+        and its P-side pages cannot be reclaimed while the prefill thread may
+        still be executing on them. Long waits (e.g. a cold-shape compile on
+        the P thread) are surfaced with a periodic warning instead.
+        """
+        if getattr(self, "_pd_inflight", None) is None:
+            return
+        t0 = time.perf_counter()
+        last_warn = t0
+        while True:
+            self._pd_drain_ready_multi()
+            busy = (
+                any(not q.empty() for q in self._pd_prefill_qs)
+                or any(self._pd_chunk_pending)
+                or not self._pd_ready_q.empty()
+                or bool(self._pd_defer)
+                or any(e.outstanding > 0 for e in self._pd_inflight.values())
+            )
+            if not busy:
+                return
+            time.sleep(0.01)
+            now = time.perf_counter()
+            if now - last_warn >= warn_interval_s:
+                last_warn = now
+                logger.warning(
+                    "[pd_async] quiesce still draining after %.0fs: inflight=%d ready=%d defer=%d",
+                    now - t0,
+                    len(self._pd_inflight),
+                    self._pd_ready_q.qsize(),
+                    len(self._pd_defer),
+                )
+
+    def _pd_finalize_aborted(self, entry) -> None:
+        """Exactly-once teardown of an aborted in-flight req: free P-side KV
+        and req slot, drop the chunked-owner pointer, release the admission
+        reservation, and stream the abort to the client."""
+        r = entry.req
+        p_idx = entry.p_idx
+        if r.req_pool_idx is not None:
+            self.p_trees[p_idx].cache_finished_req(r)
+            self.p_r2ts[p_idx].free_slots.append(r.req_pool_idx)
+            r.req_pool_idx = None
+        for dp, owner in enumerate(self.p_chunked_reqs[p_idx]):
+            if owner is not None and owner.rid == r.rid:
+                self.p_chunked_reqs[p_idx][dp] = None
+        if not r.finished():
+            r.set_finish_with_abort("Aborted by AbortReq.")
+        self._pd_untrack_inflight(r)
+        self.stream_output([r], False, False)
+        logger.info("[pd_async] aborted in-flight request finalized. rid=%s", r.rid)
+
+    def _pd_retract_chunked_owners(self) -> list:
+        """Retract chunked owners parked between chunks in the P pools (#1501
+        review). _retract_parked_chunked_reqs is a no-op under pathways PD, so
+        without this a mid-chunk request would survive retract holding P-side
+        KV and later resume from its pre-retract prefix -- stale KV if retract
+        preceded a weight update. Frees P KV + req slot, drops registry and
+        admission accounting, resets the req, and returns it for requeueing so
+        it recomputes from scratch. Call only after _pd_quiesce (no batch in
+        flight for these owners)."""
+        out = []
+        for p_idx in range(len(self.p_chunked_reqs)):
+            for dp, owner in enumerate(self.p_chunked_reqs[p_idx]):
+                if owner is None:
+                    continue
+                if owner.req_pool_idx is not None:
+                    self.p_trees[p_idx].cache_finished_req(owner)
+                    self.p_r2ts[p_idx].free_slots.append(owner.req_pool_idx)
+                    owner.req_pool_idx = None
+                self.p_chunked_reqs[p_idx][dp] = None
+                self._pd_untrack_inflight(owner)
+                owner.reset_for_retract()
+                out.append(owner)
+        if out:
+            logger.info("[pd_async] retracted %d parked chunked owner(s)", len(out))
+        return out
 
     def _pd_token_gate_closed(self) -> bool:
         """D-side token-level admission reservation (#1427 follow-up).
@@ -902,9 +1064,7 @@ class PathwaysPDSchedulerMixin:
         for alloc in self.d_allocs:
             f = getattr(alloc, "full_available_size", alloc.available_size)
             avail += sum(f(dp_rank=rk) for rk in range(self.dp_size))
-        reserved = self._pd_reserved_per * (
-            self._pd_total_d_running() + len(self._pd_inflight_rids)
-        )
+        reserved = self._pd_reserved_per * (self._pd_total_d_running() + len(self._pd_inflight))
         closed = self._pd_inflight_tokens + reserved >= avail
         if closed:
             self._pd_gate_ticks += 1
@@ -913,7 +1073,7 @@ class PathwaysPDSchedulerMixin:
                     "[pd-backpressure] admission paused x%d: inflight=%d reqs "
                     "%d tok + reserved %d >= D avail %d",
                     self._pd_gate_ticks,
-                    len(self._pd_inflight_rids),
+                    len(self._pd_inflight),
                     self._pd_inflight_tokens,
                     reserved,
                     avail,
@@ -955,6 +1115,25 @@ class PathwaysPDSchedulerMixin:
         gate_closed = self._pd_token_gate_closed()
         for _off in range(n_p):
             i = (self._pd_next_p + _off) % n_p
+            # Aborted chunked owner with no batch in flight: finalize here so
+            # its P KV frees and no chunk N+1 is ever built (#1486). Owners
+            # with a batch still in flight finalize on that batch's drain --
+            # and until then, skip building on this slice entirely (#1501
+            # review): the P thread clears _pd_chunk_pending before the
+            # result is drained, so without this guard an abort landing in
+            # that window would still enqueue chunk N+1.
+            abort_pending_owner = False
+            for dp, owner in enumerate(self.p_chunked_reqs[i]):
+                if owner is None:
+                    continue
+                entry = self._pd_inflight.get(owner.rid)
+                if entry is not None and entry.pending_abort:
+                    if entry.outstanding == 0:
+                        self._pd_finalize_aborted(entry)
+                    else:
+                        abort_pending_owner = True
+            if abort_pending_owner:
+                continue
             if self._pd_chunk_pending[i]:
                 continue
             if self._pd_prefill_qs[i].full():
@@ -976,11 +1155,11 @@ class PathwaysPDSchedulerMixin:
             # d_running reached 64, freezing P admission for ~2min bursts and
             # capping C128 D running at 64.)
             # n_decode>1: total D r2t slots = n_d * saved * dp_size, and
-            # d_running/_pd_inflight_rids are already summed across all D.
+            # d_running/_pd_inflight are already summed across all D.
             self.per_dp_max_running_requests = max(
                 0,
                 saved * self._pd_n_decode
-                - (len(self._pd_inflight_rids) + d_running + self.dp_size - 1) // self.dp_size,
+                - (len(self._pd_inflight) + d_running + self.dp_size - 1) // self.dp_size,
             )
             try:
                 with self._pd_swap_p_pool(i):
@@ -1021,7 +1200,8 @@ class PathwaysPDSchedulerMixin:
             ), "[pd_async] return_hidden_states not yet supported on the async prefill path"
             for info in new_batch.reqs_info:
                 for r in info.reqs or ():
-                    self._pd_track_inflight(r)
+                    self._pd_track_inflight(r, p_idx=i)
+            self._pd_batch_outstanding(new_batch, +1)
             # Set pending only when this batch has a mid-chunk req (whose next
             # chunk depends on this one draining). Final-chunk / non-chunked
             # batches leave pending untouched so the main loop can immediately
@@ -1179,7 +1359,7 @@ class PathwaysPDSchedulerMixin:
                     (_it2 - _it1) * 1e3,
                     (_it3 - _it2) * 1e3,
                     _runs,
-                    len(self._pd_inflight_rids),
+                    len(self._pd_inflight),
                 )
 
     def _pd_gather_output(self, arr, is_prefill: bool) -> np.ndarray:
