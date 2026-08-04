@@ -683,8 +683,8 @@ class ProfileReqInput:
     num_steps: int | None = None
     # Sets the trace level for host-side activities.
     # 0: Disables host (CPU) tracing entirely.
-    # 1: Enables tracing of only user-instrumented TraceMe events (this is the default).
-    # 2: Includes level 1 traces plus high-level program execution details like expensive XLA operations.
+    # 1: Enables tracing of only user-instrumented TraceMe events.
+    # 2: Includes level 1 traces plus high-level program execution details like expensive XLA operations (this is the default).
     # 3: Includes level 2 traces plus more verbose, low-level program execution details such as cheap XLA operations.
     host_tracer_level: int | None = None
     # Controls whether Python tracing is enabled.
