@@ -62,11 +62,11 @@ def _maybe_apply_recurrent_cow(forward_batch, memory_pools):
         return memory_pools
     rsp = memory_pools.recurrent_state_pool
     new_recurrent, new_conv = rsp.copy_slots(src, forward_batch.recurrent_indices)
-    _, aux = rsp.tree_flatten()
-    new_rsp = type(rsp).tree_unflatten(aux, (new_recurrent, new_conv))
-    pools = dict(memory_pools._pools)
-    pools["recurrent_state_pool"] = new_rsp
-    return type(memory_pools)(**pools)
+    # Preserve the input MemoryPools pytree so the enclosing donated JIT can
+    # alias its buffers to the clone outputs instead of allocating a second
+    # pool container. The model subsequently reads these replacement leaves.
+    rsp.replace_buffer((new_recurrent, new_conv))
+    return memory_pools
 
 
 class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
@@ -394,6 +394,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
 
             model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
             model = nnx.merge(model_def, model_state)
+            memory_pools = _maybe_apply_recurrent_cow(forward_batch, memory_pools)
             with LoraBatchContext.set_batch(forward_batch):
                 output, pool_updates, aux, layers_topk_ids = model(
                     forward_batch, memory_pools, logits_metadata
