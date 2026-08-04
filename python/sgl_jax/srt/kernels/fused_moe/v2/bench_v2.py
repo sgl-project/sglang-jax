@@ -289,7 +289,11 @@ tune_max_configs = int(os.environ.get("BENCH_MAX_CONFIGS", "48"))
 tune_vmem_headroom = float(os.environ.get("BENCH_TUNE_VMEM_HEADROOM", "0.95"))
 metrics_jsonl = os.environ.get("BENCH_JSONL")
 benchmark_variant = os.environ.get("BENCH_VARIANT", "fused_moe_v2_tune")
-if not tune_mode:
+_explicit_block_shape = any(
+    os.environ.get(k) is not None for k in ("BENCH_BT", "BENCH_BF", "BENCH_BTC", "BENCH_BTS")
+)
+auto_tuned_block = (not tune_mode) and (not _explicit_block_shape)
+if auto_tuned_block:
     from sgl_jax.srt.kernels.fused_moe.v2.tuned_block_configs import (
         DEFAULT_V2_BLOCK_CONFIG,
         get_tuned_fused_moe_v2_block_config,
@@ -339,17 +343,12 @@ btc_candidates = parse_csv_int("BENCH_BTC", [128])
 bts_candidates = parse_csv_int_or_none("BENCH_BTS")
 token_candidates = parse_csv_int("BENCH_TOKENS", [4096])
 
+
 # Tuned-first defaulting: when the user did NOT explicitly pin any block-shape
 # param (BT/BF/BTC/BTS) and we're not sweeping (BENCH_TUNE), look the shape up in
 # tuned_block_configs per token count and use that. Falls back to the BENCH_BT/BF
 # defaults only when no tuned entry matches. Avoids silently benchmarking the
 # default bf=256 when a tuned (e.g. bf=1024) config exists for the shape.
-_explicit_block_shape = any(
-    os.environ.get(k) is not None for k in ("BENCH_BT", "BENCH_BF", "BENCH_BTC", "BENCH_BTS")
-)
-auto_tuned_block = (not tune_mode) and (not _explicit_block_shape)
-
-
 def _align_to(x, a):
     return ((x + a - 1) // a) * a
 
