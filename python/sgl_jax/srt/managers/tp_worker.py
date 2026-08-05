@@ -473,7 +473,7 @@ class ModelWorker:
         sampling_metadata: SamplingMetadata = None,
         forward_metadata=None,
         future_map=None,
-        future_ct=None,
+        future_slots=None,
     ) -> tuple[LogitsProcessorOutput, jax.Array | None, int]:
         # Prepare LoRA batch if LoRA is enabled
         if self.worker.server_args.enable_lora and self.need_prepare_lora_batch:
@@ -509,7 +509,6 @@ class ModelWorker:
             if model_worker_batch.sampling_info:
                 self._update_grammar_vocab_mask(model_worker_batch, sampling_metadata)
             fmap = future_map if future_map is not None else self._pd_dummy_future_map
-            fct = future_ct if future_ct is not None else 0
             (
                 next_token_ids_device,
                 logits_output,
@@ -518,7 +517,7 @@ class ModelWorker:
                 layers_topk_ids,
                 new_future_map,
             ) = self.model_runner.forward_and_sample(
-                forward_batch, logits_metadata, sampling_metadata, fmap, fct
+                forward_batch, logits_metadata, sampling_metadata, fmap
             )
             self.dump_topk_ids(layers_topk_ids, model_worker_batch)
             if launch_done is not None:

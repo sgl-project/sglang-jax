@@ -309,6 +309,11 @@ suites = {
             0.2,
             runner="pytest",
         ),
+        TestFile(
+            "python/sgl_jax/test/managers/test_future_token_map.py",
+            0.2,
+            runner="pytest",
+        ),
         TestFile("python/sgl_jax/test/test_scheduler_idle_check.py", 0.1),
         TestFile("python/sgl_jax/test/test_scheduler_chunked_ownership.py", 0.1),
         TestFile("test/srt/test_dtype_config_llama.py", 1),
