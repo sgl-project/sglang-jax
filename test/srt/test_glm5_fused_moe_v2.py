@@ -4,6 +4,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from sgl_jax.srt.configs.model_config import MoEBackend, _assert_fused_moe_v2_supported
+from sgl_jax.srt.layers.fused_moe import _pad_fused_moe_tokens_to_ep
 from sgl_jax.srt.models.glm5_moe import (
     Glm5ForCausalLM,
     _requantize_blockwise_shared_weight,
@@ -12,6 +13,24 @@ from sgl_jax.srt.utils.quantization.quantization_utils import (
     dequantize_tensor,
     quantize_tensor,
 )
+
+
+def test_fused_v2_pads_small_decode_batch_to_ep_size():
+    hidden_states = jnp.ones((8, 4), dtype=jnp.bfloat16)
+    topk_weights = jnp.ones((8, 2), dtype=jnp.float32)
+    topk_ids = jnp.zeros((8, 2), dtype=jnp.int32)
+
+    padded_states, padded_weights, padded_ids, original_num_tokens = _pad_fused_moe_tokens_to_ep(
+        hidden_states, topk_weights, topk_ids, ep_size=16
+    )
+
+    assert original_num_tokens == 8
+    assert padded_states.shape == (16, 4)
+    assert padded_weights.shape == (16, 2)
+    assert padded_ids.shape == (16, 2)
+    np.testing.assert_array_equal(padded_states[8:], 0)
+    np.testing.assert_array_equal(padded_weights[8:], 0)
+    np.testing.assert_array_equal(padded_ids[8:], -1)
 
 
 def test_glm_moe_dsa_allows_fused_moe_v2():
