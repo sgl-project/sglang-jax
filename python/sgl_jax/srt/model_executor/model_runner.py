@@ -702,6 +702,8 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
                 index_n_heads=cfg.index_n_heads,
                 skip_offset=getattr(cfg, "index_skip_topk_offset", 0),
                 full_slot=full_slot,
+                sparse_impl=self.server_args.dsa_sparse_impl,
+                topk_impl=self.server_args.dsa_topk_impl,
                 num_attn_heads=self.num_attn_heads,
                 kv_lora_rank=cfg.kv_lora_rank,
                 qk_nope_head_dim=cfg.qk_nope_head_dim,

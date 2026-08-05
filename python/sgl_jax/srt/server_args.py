@@ -183,6 +183,8 @@ class ServerArgs:
     # Kernel backend
     attention_backend: str | None = "fa"
     dsa_use_pallas: bool = True  # deprecated no-op; jnp-ref e2e path removed
+    dsa_sparse_impl: str = "page"
+    dsa_topk_impl: str = "approx"
     moe_backend: str = "epmoe"
     disable_jax_allreduce_metadata: bool = False
     enable_topk_kernel: bool = True
@@ -1404,6 +1406,24 @@ class ServerArgs:
             action="store_true",
             default=ServerArgs.dsa_use_pallas,
             help="Use Pallas kernels for the dsa_sparse backend (default: jnp reference).",
+        )
+        parser.add_argument(
+            "--dsa-sparse-impl",
+            choices=["page", "exact"],
+            default=ServerArgs.dsa_sparse_impl,
+            help=(
+                "DSA attention implementation: legacy page-level decode with dense extend, "
+                "or exact SparseCore-gather + TensorCore attention for extend and decode."
+            ),
+        )
+        parser.add_argument(
+            "--dsa-topk-impl",
+            choices=["approx", "exact_lax"],
+            default=ServerArgs.dsa_topk_impl,
+            help=(
+                "Lightning-indexer selection implementation. exact_lax is a correctness-first "
+                "functional fallback until the optimized exact top-k kernel is integrated."
+            ),
         )
         parser.add_argument(
             "--moe-backend",

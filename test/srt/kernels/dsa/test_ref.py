@@ -2,7 +2,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-
 from sgl_jax.srt.kernels.dsa.ref import (
     build_index_share_map,
     sparse_mla_ref,
@@ -21,7 +20,9 @@ def test_build_index_share_map_glm52():
     types += ["shared"] * (78 - len(types))
     assert len(types) == 78
 
-    full_slot, src_slot, num_full = build_index_share_map(types, skip_offset=3, num_layers=78)
+    full_slot, src_slot, num_full = build_index_share_map(
+        types, skip_offset=3, num_layers=78
+    )
 
     assert num_full == types.count("full")
     assert full_slot[0] == 0 and full_slot[1] == 1 and full_slot[2] == 2
@@ -32,7 +33,9 @@ def test_build_index_share_map_glm52():
 
 
 def test_build_index_share_map_none_is_all_full():
-    full_slot, src_slot, num_full = build_index_share_map(None, skip_offset=0, num_layers=4)
+    full_slot, src_slot, num_full = build_index_share_map(
+        None, skip_offset=0, num_layers=4
+    )
     assert num_full == 4
     assert full_slot == {0: 0, 1: 1, 2: 2, 3: 3}
     assert src_slot == full_slot
@@ -88,10 +91,46 @@ def test_streamindex_topk_matches_numpy():
         s[abs_t + 1 :] = -np.inf
         n_valid = abs_t + 1
         want = set(np.argsort(-s)[: min(k, n_valid)].tolist())
-        got_t = set(x for x in got[t].tolist() if x >= 0)
+        got_t = {x for x in got[t].tolist() if x >= 0}
         recall = len(got_t & want) / max(len(want), 1)
         assert recall >= 0.9, f"t={t}: recall {recall:.2%} got {got_t} want {want}"
         assert (got[t] == -1).sum() == max(0, k - n_valid)
+
+
+def test_streamindex_exact_topk_matches_numpy():
+    rng = np.random.default_rng(11)
+    T, H, D, KV, page_size, k = 3, 2, 8, 24, 8, 7
+    q = rng.normal(size=(T, H, D)).astype(np.float32)
+    weights = rng.normal(size=(T, H)).astype(np.float32)
+    keys = rng.normal(size=(KV, D)).astype(np.float32)
+    cache, page_idx = _make_paged(keys, page_size)
+
+    got = np.asarray(
+        streamindex_topk_ref(
+            jnp.array(q),
+            jnp.array(weights),
+            jnp.array(cache),
+            jnp.array([KV], np.int32),
+            jnp.array(page_idx),
+            jnp.array([0, T], np.int32),
+            jnp.array([0, cache.shape[0] * page_size], np.int32),
+            jnp.array([0, 1, 1], np.int32),
+            k=k,
+            pages_per_seq=cache.shape[0],
+            exact=True,
+        )
+    )
+
+    for t in range(T):
+        abs_t = KV - T + t
+        scores = np.einsum(
+            "h,hk->k",
+            weights[t],
+            np.maximum(np.einsum("hd,kd->hk", q[t], keys), 0),
+        )
+        scores[abs_t + 1 :] = -np.inf
+        expected = np.argsort(-scores)[:k]
+        np.testing.assert_array_equal(got[t], expected)
 
 
 def test_sparse_mla_full_topk_equals_dense():
@@ -176,11 +215,60 @@ def test_scatter_paged_padding_seq_no_leak():
     new_tokens = jnp.asarray([[1.0] * D, [99.0] * D], jnp.float32)
 
     out = np.asarray(
-        _scatter_paged(cache, new_tokens, seq_lens, page_indices, cu_q_lens, cu_kv_lens, pps)
+        _scatter_paged(
+            cache, new_tokens, seq_lens, page_indices, cu_q_lens, cu_kv_lens, pps
+        )
     )
     assert out[0, 2, 0] == 1.0  # real seq0 write
     # padding seq1 must NOT leak into any non-sentinel page
-    assert not np.any(out[: P - 1] == 99.0), f"leaked: {np.argwhere(out[:P-1]==99.0)}"
+    assert not np.any(out[: P - 1] == 99.0), (
+        f"leaked: {np.argwhere(out[: P - 1] == 99.0)}"
+    )
+
+
+def test_logical_topk_to_physical_slots_uses_ragged_page_offsets():
+    from sgl_jax.srt.layers.attention.dsa_sparse_backend import (
+        _logical_topk_to_physical_slots,
+    )
+
+    topk = jnp.asarray([[0, 5, 6, -1], [0, 2, -1, -1]], jnp.int32)
+    seq_lens = jnp.asarray([7, 3], jnp.int32)
+    cu_q = jnp.asarray([0, 1, 2], jnp.int32)
+    cu_kv = jnp.asarray([0, 8, 12], jnp.int32)
+    page_indices = jnp.asarray([5, 9, 3, 12], jnp.int32)
+
+    slots, counts = _logical_topk_to_physical_slots(
+        topk, seq_lens, page_indices, cu_q, cu_kv, page_size=4
+    )
+
+    np.testing.assert_array_equal(np.asarray(slots), [[20, 37, 38, 0], [12, 14, 0, 0]])
+    np.testing.assert_array_equal(np.asarray(counts), [3, 2])
+
+
+def test_scatter_fused_kv_matches_mla_cache_layout():
+    from sgl_jax.srt.layers.attention.dsa_sparse_backend import _scatter_fused_kv_paged
+
+    cache = jnp.zeros((3, 4, 640), jnp.bfloat16)
+    latent = jnp.arange(2 * 512, dtype=jnp.float32).reshape(2, 512)
+    rope = jnp.arange(2 * 64, dtype=jnp.float32).reshape(2, 64) + 2000
+    out = _scatter_fused_kv_paged(
+        cache,
+        latent,
+        rope,
+        jnp.asarray([6], jnp.int32),
+        jnp.asarray([1, 0, 2], jnp.int32),
+        jnp.asarray([0, 2], jnp.int32),
+        jnp.asarray([0, 8], jnp.int32),
+        kv_lora_rank=512,
+    )
+    out = np.asarray(out)
+    np.testing.assert_array_equal(
+        out[0, 0, :512], np.asarray(latent[0].astype(jnp.bfloat16))
+    )
+    np.testing.assert_array_equal(
+        out[0, 1, 512:576], np.asarray(rope[1].astype(jnp.bfloat16))
+    )
+    assert not np.any(out[0, :2, 576:])
 
 
 def test_sparse_mla_multi_seq_packed_layout():
@@ -200,7 +288,9 @@ def test_sparse_mla_multi_seq_packed_layout():
     cache[0, :4] = kv0[:4]
     cache[1, :3] = kv0[4:7]
     cache[2, :3] = kv1
-    page_idx = np.array([0, 1, 2, 3], np.int32)  # packed: seq0@[0:2], seq1@[2:3], pad@[3:]
+    page_idx = np.array(
+        [0, 1, 2, 3], np.int32
+    )  # packed: seq0@[0:2], seq1@[2:3], pad@[3:]
     seq_lens = np.array([7, 3], np.int32)
     cu_q = np.array([0, 1, 2], np.int32)
     cu_kv = np.array([0, 8, 12], np.int32)  # aligned cumsum → seq1 starts at page 2
@@ -232,10 +322,14 @@ def test_sparse_mla_multi_seq_packed_layout():
         np.testing.assert_allclose(o[t], want, rtol=1e-3, atol=1e-4)
 
 
-def _page_topk_oracle(q, weights, keys, kv_len, abs_t, page_size, pages_per_seq, k_pages):
+def _page_topk_oracle(
+    q, weights, keys, kv_len, abs_t, page_size, pages_per_seq, k_pages
+):
     """Numpy oracle: token scores -> causal mask -> page max-pool -> top-k pages."""
     s = np.einsum(
-        "h,hk->k", weights.astype(np.float32), np.maximum(np.einsum("hd,kd->hk", q, keys), 0)
+        "h,hk->k",
+        weights.astype(np.float32),
+        np.maximum(np.einsum("hd,kd->hk", q, keys), 0),
     )
     max_kv = pages_per_seq * page_size
     padded = np.full(max_kv, -np.inf, np.float32)
@@ -302,7 +396,9 @@ def test_page_topk_top1_page_contains_top1_token():
         jnp.array([0, pages_per_seq * page_size], np.int32),
         jnp.array([0, 1, 1], np.int32),
     )
-    top1_token = np.asarray(streamindex_topk_ref(*args, k=1, pages_per_seq=pages_per_seq))[0, 0]
+    top1_token = np.asarray(
+        streamindex_topk_ref(*args, k=1, pages_per_seq=pages_per_seq)
+    )[0, 0]
     top1_page = np.asarray(
         streamindex_page_topk_ref(*args, k_pages=1, pages_per_seq=pages_per_seq)
     )[0, 0]
@@ -371,7 +467,9 @@ def test_page_topk_multi_seq_packed_layout():
             jnp.array(kv_lens, np.int32),
             jnp.array(page_idx),
             jnp.array([0, 1, 2], np.int32),
-            jnp.array([0, pages_per_seq * page_size, 2 * pages_per_seq * page_size], np.int32),
+            jnp.array(
+                [0, pages_per_seq * page_size, 2 * pages_per_seq * page_size], np.int32
+            ),
             jnp.array([0, 2, 2], np.int32),
             k_pages=2,
             pages_per_seq=pages_per_seq,
@@ -419,7 +517,9 @@ def test_page_topk_decode_fast_path_matches_general():
     )
     for k_pages in (1, 2, 4):
         general = np.asarray(
-            streamindex_page_topk_ref(*args, k_pages=k_pages, pages_per_seq=pages_per_seq)
+            streamindex_page_topk_ref(
+                *args, k_pages=k_pages, pages_per_seq=pages_per_seq
+            )
         )
         fast = np.asarray(
             streamindex_page_topk_ref(

@@ -5,9 +5,10 @@ attention runs over at most ``index_topk`` KV positions per query. IndexShare
 (GLM-5.2) is realised by threading the last full-layer's ``topk_indices``
 through the model's per-layer loop and reusing it on ``shared`` layers.
 
-Phase A path uses jnp reference kernels (:mod:`sgl_jax.srt.kernels.dsa.ref`);
-DECODE runs the Pallas ``sparse_mla_page_level``; EXTEND falls back to
-plain dense (the indexer still writes idx cache for later decode steps).
+The legacy path runs page-level sparse MLA for decode and dense MLA for
+extend. The exact path uses a functional ``lax.top_k`` StreamIndex fallback,
+maps sequence-local positions to physical cache slots, and runs the fused
+SparseCore-gather + TensorCore-attention kernel for both extend and decode.
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 from jax.tree_util import register_pytree_node_class
 
+from sgl_jax.srt.kernels.dsa.exact_attention import sparse_core_tensor_core_dsa
 from sgl_jax.srt.kernels.dsa.ref import streamindex_page_topk_ref, streamindex_topk_ref
 from sgl_jax.srt.kernels.dsa.sparse_mla import compute_topk_pages, sparse_mla_page_level
 from sgl_jax.srt.kernels.mla.v2.kernel import mla_ragged_paged_attention
@@ -81,6 +83,8 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         index_n_heads: int,
         skip_offset: int,
         full_slot: dict[int, int],
+        sparse_impl: str = "page",
+        topk_impl: str = "approx",
         **mla_kwargs,
     ):
         super().__init__(**mla_kwargs)
@@ -89,6 +93,12 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         self.index_n_heads = index_n_heads
         self.skip_offset = skip_offset
         self.full_slot = full_slot
+        if sparse_impl not in ("page", "exact"):
+            raise ValueError(f"unknown DSA sparse implementation: {sparse_impl}")
+        if topk_impl not in ("approx", "exact_lax"):
+            raise ValueError(f"unknown DSA top-k implementation: {topk_impl}")
+        self.sparse_impl = sparse_impl
+        self.topk_impl = topk_impl
 
     def tree_flatten(self):
         children, aux = super().tree_flatten()
@@ -99,6 +109,8 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             "index_n_heads": self.index_n_heads,
             "skip_offset": self.skip_offset,
             "full_slot": self.full_slot,
+            "sparse_impl": self.sparse_impl,
+            "topk_impl": self.topk_impl,
         }
         return children, aux
 
@@ -110,6 +122,8 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             index_n_heads=aux_data["index_n_heads"],
             skip_offset=aux_data["skip_offset"],
             full_slot=aux_data["full_slot"],
+            sparse_impl=aux_data.get("sparse_impl", "page"),
+            topk_impl=aux_data.get("topk_impl", "approx"),
             num_attn_heads=aux_data["num_attn_heads"],
             kv_lora_rank=aux_data["kv_lora_rank"],
             qk_nope_head_dim=aux_data["qk_nope_head_dim"],
@@ -170,10 +184,14 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         # fall back to plain absorbed-MLA. The kv cache write still happens
         # inside the dense kernel via input_output_aliases.
         is_decode = forward_batch.forward_mode.is_decode()
+        use_exact = self.sparse_impl == "exact"
         if layer_id < self.skip_offset or (is_full and q_idx is None):
             o, kv_cache = self._run_dense(
                 q, q_rope, new_kv_c, new_k_pe, kv_cache, sm_scale, layer, dpa, md
             )
+            # Only the final dense-prefix layer feeds an exact sparse layer.
+            # The legacy decode path keeps its historical per-full-layer top-k.
+            needs_prefix_topk = use_exact and layer_id == self.skip_offset - 1
             idx_cache, topk, topk_pages = self._maybe_index(
                 is_full,
                 q_idx,
@@ -182,8 +200,9 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                 idx_cache,
                 dpa,
                 md,
-                compute_topk=is_decode,
-                compute_pages=is_decode,
+                compute_topk=needs_prefix_topk or (is_decode and not use_exact),
+                compute_pages=is_decode and not use_exact,
+                one_token_per_seq=is_decode,
             )
             return o, DSAFusedCache(kv=kv_cache, idx=idx_cache, topk=topk, topk_pages=topk_pages)
 
@@ -191,7 +210,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         # query token per seq). EXTEND/MIXED chunks route to plain dense; the
         # indexer still writes idx cache so subsequent decode steps get valid
         # topk. Multi-request DECODE (T>1) does go through the sparse path.
-        if not is_decode:
+        if not is_decode and not use_exact:
             o, kv_cache = self._run_dense(
                 q, q_rope, new_kv_c, new_k_pe, kv_cache, sm_scale, layer, dpa, md
             )
@@ -205,17 +224,26 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                 md,
                 compute_topk=False,
                 compute_pages=False,
+                one_token_per_seq=False,
             )
             return o, DSAFusedCache(kv=kv_cache, idx=idx_cache, topk=None, topk_pages=None)
 
         # ── indexer top-k (full) or reuse (shared) ─────────────────────────
         idx_cache, topk, topk_pages = self._maybe_index(
-            is_full, q_idx, k_idx, idx_weights, idx_cache, dpa, md, compute_pages=True
+            is_full,
+            q_idx,
+            k_idx,
+            idx_weights,
+            idx_cache,
+            dpa,
+            md,
+            compute_pages=not use_exact,
+            one_token_per_seq=is_decode,
         )
         if not is_full:
-            assert (
-                dsa_topk_in is not None
-            ), f"shared layer {layer_id} requires dsa_topk_in from preceding full layer"
+            assert dsa_topk_in is not None, (
+                f"shared layer {layer_id} requires dsa_topk_in from preceding full layer"
+            )
             topk_use = dsa_topk_in
             topk_pages_use = dsa_topk_pages_in
         else:
@@ -223,9 +251,31 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             topk_pages_use = topk_pages
 
         # ── sparse MLA over top-k ─────────────────────────────────────────
-        o, kv_cache = self._run_sparse(
-            q, q_rope, new_kv_c, new_k_pe, kv_cache, topk_use, topk_pages_use, sm_scale, dpa, md
-        )
+        if use_exact:
+            o, kv_cache = self._run_exact(
+                q,
+                q_rope,
+                new_kv_c,
+                new_k_pe,
+                kv_cache,
+                topk_use,
+                sm_scale,
+                dpa,
+                md,
+            )
+        else:
+            o, kv_cache = self._run_sparse(
+                q,
+                q_rope,
+                new_kv_c,
+                new_k_pe,
+                kv_cache,
+                topk_use,
+                topk_pages_use,
+                sm_scale,
+                dpa,
+                md,
+            )
         return o, DSAFusedCache(
             kv=kv_cache,
             idx=idx_cache,
@@ -249,6 +299,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         *,
         compute_topk=True,
         compute_pages=False,
+        one_token_per_seq=False,
     ):
         """On full layers: write k_idx into paged indexer cache, compute top-k
         (and, when ``compute_pages``, the unique-page list for IndexShare).
@@ -311,8 +362,8 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                     dist_,
                     k=self.index_topk,
                     pages_per_seq=pages_per_seq,
-                    # compute_topk is decode-only: token i belongs to seq i.
-                    one_token_per_seq=True,
+                    one_token_per_seq=one_token_per_seq,
+                    exact=self.topk_impl == "exact_lax",
                 )
             else:
                 topk = jnp.full((q_.shape[0], 1), -1, jnp.int32)
@@ -348,6 +399,77 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             md.distribution,
         )
         return idx_cache, topk, (topk_pages if compute_pages else None)
+
+    def _run_exact(self, ql, qpe, kvc, kpe, cache, topk, sm_scale, dpa, md):
+        """Write the fused KV cache, map logical top-k to slots, then attend."""
+        in_specs = (
+            P(dpa, "tensor", None),
+            P(dpa, "tensor", None),
+            P(dpa, None),
+            P(dpa, None),
+            P(dpa, None, None, None),
+            P(dpa, None),
+            P(dpa),
+            P(dpa),
+            P(dpa),
+            P(dpa),
+            P(dpa),
+        )
+        out_specs = (P(dpa, "tensor", None), P(dpa, None, None, None))
+
+        def _run(ql_, qpe_, kvc_, kpe_, cache_, topk_, seq_lens_, pi_, cuq_, cukv_, dist_):
+            del dist_
+            page_size = cache_.shape[1] * cache_.shape[2]
+            cache3d = cache_.reshape(cache_.shape[0], page_size, cache_.shape[-1])
+            cache3d = _scatter_fused_kv_paged(
+                cache3d,
+                kvc_,
+                kpe_,
+                seq_lens_,
+                pi_,
+                cuq_,
+                cukv_,
+                kv_lora_rank=self.kv_lora_rank,
+            )
+            physical_slots, selected_counts = _logical_topk_to_physical_slots(
+                topk_, seq_lens_, pi_, cuq_, cukv_, page_size
+            )
+
+            # SparseCore requires bq_sparse*K to be a gather-wave multiple.
+            # For C=2 decode, bq_sparse=2 is the smallest valid choice at K=2048.
+            # Larger extend batches use the kernel's validated 128-query tile.
+            bq_sparse = 2 if ql_.shape[0] < 128 else 128
+            bq = 1 if bq_sparse == 2 else 32
+            q_padded = _pad_first_axis(ql_, bq_sparse)
+            qpe_padded = _pad_first_axis(qpe_, bq_sparse)
+            slots_padded = _pad_first_axis(physical_slots, bq_sparse)
+            counts_padded = _pad_first_axis(selected_counts, bq_sparse)
+            output = sparse_core_tensor_core_dsa(
+                q_padded,
+                qpe_padded,
+                cache3d.reshape(-1, cache3d.shape[-1]),
+                slots_padded,
+                counts_padded,
+                sm_scale,
+                bq_sparse=bq_sparse,
+                bq=bq,
+                b_topk=128,
+            )
+            return output[: ql_.shape[0]], cache3d.reshape(cache_.shape)
+
+        return jax.shard_map(_run, in_specs=in_specs, out_specs=out_specs, check_vma=False)(
+            ql,
+            qpe,
+            kvc,
+            kpe,
+            cache,
+            topk,
+            md.seq_lens,
+            md.page_indices,
+            md.cu_q_lens,
+            md.cu_kv_lens,
+            md.distribution,
+        )
 
     def _run_sparse(self, ql, qpe, kvc, kpe, cache, topk, topk_pages, sm_scale, dpa, md):
         has_pages = topk_pages is not None
@@ -498,3 +620,81 @@ def _scatter_paged(
     safe_page = jnp.where(valid, page, sentinel)
     safe_off = jnp.where(valid, offset, 0)
     return cache3d.at[safe_page, safe_off].set(new_tokens.astype(cache3d.dtype))
+
+
+def _scatter_fused_kv_paged(
+    cache3d: jax.Array,
+    new_kv_c: jax.Array,
+    new_k_pe: jax.Array,
+    seq_lens: jax.Array,
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+    cu_kv_lens: jax.Array,
+    *,
+    kv_lora_rank: int,
+) -> jax.Array:
+    """Pack latent KV + RoPE exactly as ``MLATokenToKVPool`` and scatter it."""
+    rope_offset = (kv_lora_rank + 127) // 128 * 128
+    packed = jnp.zeros((new_kv_c.shape[0], cache3d.shape[-1]), dtype=cache3d.dtype)
+    packed = packed.at[:, :kv_lora_rank].set(new_kv_c.astype(cache3d.dtype))
+    packed = packed.at[:, rope_offset : rope_offset + new_k_pe.shape[-1]].set(
+        new_k_pe.astype(cache3d.dtype)
+    )
+    pages_per_seq = page_indices.shape[0] // seq_lens.shape[0]
+    return _scatter_paged(
+        cache3d,
+        packed,
+        seq_lens,
+        page_indices,
+        cu_q_lens,
+        cu_kv_lens,
+        pages_per_seq,
+    )
+
+
+def _logical_topk_to_physical_slots(
+    topk: jax.Array,
+    seq_lens: jax.Array,
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+    cu_kv_lens: jax.Array,
+    page_size: int,
+) -> tuple[jax.Array, jax.Array]:
+    """Map per-sequence logical token positions to flattened cache rows.
+
+    ``page_indices`` is ragged-packed. Sequence ``i`` starts at
+    ``cu_kv_lens[i] // page_size``; using a fixed ``i * pages_per_seq`` stride
+    would silently cross sequence boundaries for unequal context lengths.
+    """
+    num_tokens, topk_size = topk.shape
+    token_ids = jnp.arange(num_tokens, dtype=jnp.int32)
+    seq_ids = jnp.searchsorted(cu_q_lens[1:], token_ids, side="right")
+    seq_ids = jnp.clip(seq_ids, 0, seq_lens.shape[0] - 1)
+
+    logical = jnp.maximum(topk, 0)
+    page_ptr = cu_kv_lens[seq_ids, None] // page_size + logical // page_size
+    ptr_in_bounds = (page_ptr >= 0) & (page_ptr < page_indices.shape[0])
+    safe_ptr = jnp.clip(page_ptr, 0, page_indices.shape[0] - 1)
+    physical_pages = page_indices[safe_ptr]
+    query_valid = token_ids < cu_q_lens[-1]
+    valid = (
+        query_valid[:, None]
+        & (topk >= 0)
+        & (logical < seq_lens[seq_ids, None])
+        & ptr_in_bounds
+        & (physical_pages >= 0)
+    )
+    physical_slots = physical_pages * page_size + logical % page_size
+    physical_slots = jnp.where(valid, physical_slots, jnp.int32(0))
+    selected_counts = jnp.sum(valid, axis=1, dtype=jnp.int32)
+
+    # ``lax.top_k`` places all finite values before -inf padding, so valid
+    # entries are a prefix as required by selected_counts. Keep this helper
+    # pure/JIT-compatible; correctness tests cover the prefix invariant.
+    del topk_size
+    return physical_slots.astype(jnp.int32), selected_counts
+
+
+def _pad_first_axis(x: jax.Array, multiple: int) -> jax.Array:
+    pad = (-x.shape[0]) % multiple
+    return jnp.pad(x, ((0, pad), *((0, 0),) * (x.ndim - 1)))
