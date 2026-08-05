@@ -54,9 +54,7 @@ def main():
     if args.conv_history < 1:
         raise ValueError("--conv-history must be positive")
 
-    temporal = jnp.zeros(
-        (args.slots, args.heads, args.head_dim, args.head_dim), dtype=jnp.float32
-    )
+    temporal = jnp.zeros((args.slots, args.heads, args.head_dim, args.head_dim), dtype=jnp.float32)
     conv = jnp.zeros((args.slots, args.conv_proj, args.conv_history), dtype=jnp.bfloat16)
     src = jnp.arange(1, args.clones + 1, dtype=jnp.int32)
     dst = jnp.arange(args.clones + 1, 2 * args.clones + 1, dtype=jnp.int32)
@@ -76,10 +74,9 @@ def main():
 
     fast_us = _time_us(fast, args.tries)
     slow_us = _time_us(slow, args.tries)
-    slot_bytes = (
-        args.heads * args.head_dim * args.head_dim * _dtype_bytes(jnp.float32)
-        + args.conv_proj * args.conv_history * _dtype_bytes(jnp.bfloat16)
-    )
+    slot_bytes = args.heads * args.head_dim * args.head_dim * _dtype_bytes(
+        jnp.float32
+    ) + args.conv_proj * args.conv_history * _dtype_bytes(jnp.bfloat16)
     state_bytes = args.layers * args.clones * slot_bytes
     roofline_us = 2 * state_bytes / (args.peak_hbm_gbps * 1e9) * 1e6
     fast_total_us = fast_us * args.layers
