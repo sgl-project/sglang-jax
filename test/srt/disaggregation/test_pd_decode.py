@@ -493,7 +493,7 @@ def _adm_p_info():
     return {"host": "1.2.3.4", "transfer_port": 5000, "side_channel_port": 5001}
 
 
-def test_abort_logs_when_source_rank_cannot_be_resolved(caplog):
+def test_abort_logs_when_prefill_rank_cannot_be_resolved(caplog):
     class _AbortScheduler:
         _abort_decode_request = SchedulerDisaggregationDecodeMixin._abort_decode_request
 
@@ -508,7 +508,7 @@ def test_abort_logs_when_source_rank_cannot_be_resolved(caplog):
 
     sched = _AbortScheduler()
     req = SimpleNamespace(
-        rid="missing-source-rank",
+        rid="missing-prefill-rank",
         bootstrap_room=17,
         disagg_prefill_dp_rank=None,
     )
@@ -517,7 +517,7 @@ def test_abort_logs_when_source_rank_cannot_be_resolved(caplog):
         sched._abort_decode_request(req, "bootstrap_lookup")
 
     sched.disagg_kv_manager.cleanup_transfer.assert_not_called()
-    assert "cannot resolve source DP rank" in caplog.text
+    assert "cannot resolve Prefill DP rank" in caplog.text
     sched.send_to_tokenizer.send_pyobj.assert_called_once()
 
 
@@ -539,7 +539,7 @@ def test_admit_when_capacity_sufficient():
     assert sched.aborted == []
 
 
-def test_admission_routes_allocator_and_transfer_to_destination_and_source_ranks():
+def test_admission_routes_allocator_and_transfer_to_decode_and_prefill_ranks():
     sched = _AdmScheduler(capacity=100, reserved=0)
     sched.dp_size = 4
     entry = _enqueue(sched, "cross-rank", seqlen=4)
@@ -551,8 +551,8 @@ def test_admission_routes_allocator_and_transfer_to_destination_and_source_ranks
     assert sched.token_to_kv_pool_allocator.available_ranks[-1] == 3
     assert sched.token_to_kv_pool_allocator.alloc_ranks == [3]
     context = sched.disagg_kv_manager.created[0][1].inited
-    assert context.local_dp_rank == 3
-    assert context.source_dp_rank == 1
+    assert context.decode_dp_rank == 3
+    assert context.prefill_dp_rank == 1
 
 
 def test_rank_local_capacity_block_does_not_starve_other_ranks_or_break_rank_fifo():
@@ -715,7 +715,7 @@ def test_cancel_matching_retains_inflight_entry_until_terminal():
     assert len(queue) == 1
 
 
-def test_cancelled_terminal_transfer_releases_destination_rank_pages():
+def test_cancelled_terminal_transfer_releases_decode_rank_pages():
     class _CancelledDrainScheduler:
         process_decode_queue = SchedulerDisaggregationDecodeMixin.process_decode_queue
 
@@ -750,9 +750,6 @@ def test_cancelled_terminal_transfer_releases_destination_rank_pages():
 
 
 def test_inflight_cap_is_partitioned_per_rank_without_cross_rank_head_of_line():
-    # Global cap 8 over DP4 gives each rank 2 Raiden slots. A third rank-0
-    # request must stay queued, while a later rank-1 request can still use its
-    # own manager's capacity.
     sched = _AdmScheduler(capacity=100, reserved=0, max_inflight=8)
     sched.dp_size = 4
     _enqueue(sched, "rank0-a", seqlen=4).req.dp_rank = 0
@@ -804,7 +801,7 @@ class _FakeCache:
         self._results = list(results)
         self.calls = 0
 
-    def pick_for_room(self, room, dp_rank=0):  # noqa: ARG002
+    def pick_for_room(self, _room, _dp_rank=0):
         self.calls += 1
         return self._results.pop(0) if self._results else None
 

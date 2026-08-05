@@ -436,15 +436,15 @@ def test_transfer_metadata_is_reusable_per_process_and_ttl_bounded():
     assert registry.get_transfer(7, 1) is None
 
 
-def test_transfer_metadata_namespaces_same_page_ids_by_source_dp_rank():
+def test_transfer_metadata_namespaces_same_page_ids_by_prefill_dp_rank():
     registry = _Registry()
-    for source_dp_rank in range(4):
+    for prefill_dp_rank in range(4):
         registry.register_transfer(
             {
                 "bootstrap_room": 9,
-                "transfer_id": f"rank-{source_dp_rank}",
+                "transfer_id": f"rank-{prefill_dp_rank}",
                 "jax_process_index": 0,
-                "source_dp_rank": source_dp_rank,
+                "prefill_dp_rank": prefill_dp_rank,
                 "transport_metadata": {"remote_block_ids": [1, 2]},
             }
         )
@@ -495,7 +495,7 @@ def test_prefill_decode_dp_topology_must_match():
         expected_dp_rank=2,
         expected_dp_size=4,
     )
-    with pytest.raises(ValueError, match="source rank mismatch"):
+    with pytest.raises(ValueError, match="Prefill rank mismatch"):
         check_prefill_compat(
             info,
             local_page_size=128,

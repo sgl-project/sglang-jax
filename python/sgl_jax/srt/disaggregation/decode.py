@@ -55,8 +55,8 @@ def _batch_req_count_for_dp(batch, dp_rank: int) -> int:
     )
 
 
-def _request_dp_rank(req, dp_size: int, *, source: bool = False) -> int:
-    field = "disagg_prefill_dp_rank" if source else "dp_rank"
+def _request_dp_rank(req, dp_size: int, *, prefill: bool = False) -> int:
+    field = "disagg_prefill_dp_rank" if prefill else "dp_rank"
     value = getattr(req, field, None)
     if value is None:
         if dp_size == 1:
@@ -151,8 +151,6 @@ class DecodeTransferQueue:
             self._entries[entry.req_id] = entry
 
     def count_by_rank(self, dp_size: int) -> list[int]:
-        """Return an atomic snapshot of in-flight transfers per Decode rank."""
-
         counts = [0] * dp_size
         with self._lock:
             for entry in self._entries.values():
@@ -296,19 +294,19 @@ class SchedulerDisaggregationDecodeMixin:
             try:
                 from sgl_jax.srt.disaggregation.common.metrics import time_phase
 
-                source_dp_rank = _request_dp_rank(req, self.dp_size, source=True)
+                prefill_dp_rank = _request_dp_rank(req, self.dp_size, prefill=True)
                 self._pd_mark_time(req, "bootstrap_start")
                 with time_phase("bootstrap", "decode"):
                     if jax.process_count() > 1:
                         # Multi-host caches the matched peer after the first
                         # lookup, so this does no per-request network I/O.
-                        p_info = self._pick_prefill_peer_for_this_host(source_dp_rank)
+                        p_info = self._pick_prefill_peer_for_this_host(prefill_dp_rank)
                     else:
                         # Local cache resolution (sglang-style): a warm cache
                         # does zero network I/O, so this no longer blocks the
                         # event loop.
                         p_info = self.disagg_prefill_info_cache.pick_for_room(
-                            req.bootstrap_room, source_dp_rank
+                            req.bootstrap_room, prefill_dp_rank
                         )
                 self._pd_mark_time(req, "bootstrap_done")
             except Exception:
@@ -342,7 +340,7 @@ class SchedulerDisaggregationDecodeMixin:
                     local_page_size=self.server_args.page_size,
                     local_kv_dtype=resolve_kv_dtype_name(local_kv_pool.dtype),
                     expected_transfer_engine=(None if manager is None else manager.engine_name),
-                    expected_dp_rank=source_dp_rank,
+                    expected_dp_rank=prefill_dp_rank,
                     expected_dp_size=self.dp_size,
                 )
             except ValueError as exc:
@@ -518,16 +516,7 @@ class SchedulerDisaggregationDecodeMixin:
         return out
 
     def _admit_decode_prealloc(self: Scheduler) -> None:
-        """Capacity-gated FIFO admission of preallocated PD reqs.
-
-        Pops reqs from the prealloc queue into the transfer queue only while
-        the paged pool has room, reserving ``num_reserved_decode_tokens`` of
-        headroom per in-flight/running request so a running decode step can
-        always alloc its next token even when every other req is mid-transfer
-        (transfer-queue reqs cannot be retracted). KV indices are allocated
-        here, not at intake. Reqs that don't fit stay queued and retry next
-        tick — deferral, never abort.
-        """
+        """Admit transfers without consuming non-retractable Decode headroom."""
 
         allocator = self.token_to_kv_pool_allocator
         if allocator is None:
@@ -544,46 +533,33 @@ class SchedulerDisaggregationDecodeMixin:
         capacity_blocked_ranks: set[int] = set()
 
         for entry in self.disagg_prealloc_queue.items_fifo():
-            local_dp_rank = _request_dp_rank(entry.req, self.dp_size)
-            source_dp_rank = _request_dp_rank(entry.req, self.dp_size, source=True)
-            # In-flight transfer cap: each admitted transfer holds a pulled KV
-            # destination buffer on decode HBM (untracked by the paged-pool
-            # budget below) until it is scattered. Stop admitting once the cap
-            # is reached so a burst of concurrent requests cannot allocate that
-            # many transient buffers at once and OOM. Excess reqs stay queued
-            # and retry next tick (deferral, never abort).
+            decode_dp_rank = _request_dp_rank(entry.req, self.dp_size)
+            prefill_dp_rank = _request_dp_rank(entry.req, self.dp_size, prefill=True)
+            # Pulled KV buffers remain outside paged-pool accounting until scatter.
             if max_inflight > 0 and (n_transfer + admitted) >= max_inflight:
                 break
-            # Once one request cannot fit a rank-local KV pool, retain FIFO
-            # within that rank for the rest of this admission pass. Other
-            # ranks remain independent and may continue making progress.
-            if local_dp_rank in capacity_blocked_ranks:
+            # Preserve FIFO within a blocked rank without stalling other ranks.
+            if decode_dp_rank in capacity_blocked_ranks:
                 continue
-            # Each DP rank owns one Raiden manager and its own fixed slot pool.
-            # Skip a saturated rank while allowing later requests for other
-            # ranks to proceed, preventing cross-rank head-of-line blocking.
             if (
                 per_rank_inflight > 0
-                and transfer_per_dp[local_dp_rank] + admitted_per_dp[local_dp_rank]
+                and transfer_per_dp[decode_dp_rank] + admitted_per_dp[decode_dp_rank]
                 >= per_rank_inflight
             ):
                 continue
             seqlen = len(entry.req.origin_input_ids)
             page_aligned = ((seqlen + page_size - 1) // page_size) * page_size
-            n_running = _batch_req_count_for_dp(self.running_batch, local_dp_rank)
+            n_running = _batch_req_count_for_dp(self.running_batch, decode_dp_rank)
             reserved = reserved_per * (
-                n_running + transfer_per_dp[local_dp_rank] + admitted_per_dp[local_dp_rank]
+                n_running + transfer_per_dp[decode_dp_rank] + admitted_per_dp[decode_dp_rank]
             )
-            if page_aligned + reserved > allocator.available_size(local_dp_rank):
-                capacity_blocked_ranks.add(local_dp_rank)
+            if page_aligned + reserved > allocator.available_size(decode_dp_rank):
+                capacity_blocked_ranks.add(decode_dp_rank)
                 continue
 
-            kv_indices = allocator.alloc(page_aligned, dp_rank=local_dp_rank)
+            kv_indices = allocator.alloc(page_aligned, dp_rank=decode_dp_rank)
             if kv_indices is None:
-                # Budget check should prevent this; treat a surprise shortfall
-                # as transient. Block only this rank so other ranks can still
-                # make progress without violating rank-local FIFO.
-                capacity_blocked_ranks.add(local_dp_rank)
+                capacity_blocked_ranks.add(decode_dp_rank)
                 continue
 
             try:
@@ -592,8 +568,8 @@ class SchedulerDisaggregationDecodeMixin:
                         req_id=entry.req.rid,
                         transfer_id=entry.req.disagg_transfer_id or entry.req.rid,
                         bootstrap_room=entry.req.bootstrap_room,
-                        local_dp_rank=local_dp_rank,
-                        source_dp_rank=source_dp_rank,
+                        decode_dp_rank=decode_dp_rank,
+                        prefill_dp_rank=prefill_dp_rank,
                         peer_info=entry.p_info or {},
                         kv_indices=kv_indices,
                         page_size=page_size,
@@ -610,13 +586,13 @@ class SchedulerDisaggregationDecodeMixin:
                     entry.req.rid,
                 )
                 self._record_decode_transfer_failure("receiver_init")
-                self._release_decode_kv_indices(kv_indices, local_dp_rank)
+                self._release_decode_kv_indices(kv_indices, decode_dp_rank)
                 self.disagg_prealloc_queue.remove(entry.req_id)
                 self._abort_decode_request(entry.req, "receiver_init")
                 continue
 
             if admission.state == AdmissionState.DEFERRED:
-                self._release_decode_kv_indices(kv_indices, local_dp_rank)
+                self._release_decode_kv_indices(kv_indices, decode_dp_rank)
                 timeout_s = self.server_args.disaggregation_pull_timeout_seconds
                 if timeout_s > 0 and time.monotonic() - entry.created_at >= timeout_s:
                     self.disagg_prealloc_queue.remove(entry.req_id)
@@ -635,7 +611,7 @@ class SchedulerDisaggregationDecodeMixin:
             self.disagg_prealloc_queue.remove(entry.req_id)
             self.disagg_transfer_queue.add(entry)
             admitted += 1
-            admitted_per_dp[local_dp_rank] += 1
+            admitted_per_dp[decode_dp_rank] += 1
 
     # ------------------------------------------------------------------
     # Overridable / test-friendly hooks
@@ -840,10 +816,10 @@ class SchedulerDisaggregationDecodeMixin:
         room = getattr(req, "bootstrap_room", None)
         if manager is not None and cleanup_transfer:
             try:
-                source_dp_rank = _request_dp_rank(req, self.dp_size, source=True)
+                prefill_dp_rank = _request_dp_rank(req, self.dp_size, prefill=True)
             except Exception:
                 logger.warning(
-                    "cannot resolve source DP rank while cleaning up aborted "
+                    "cannot resolve Prefill DP rank while cleaning up aborted "
                     "req_id=%s bootstrap_room=%s reason=%s; transfer metadata "
                     "will expire by TTL",
                     req.rid,
@@ -856,15 +832,15 @@ class SchedulerDisaggregationDecodeMixin:
                     manager.cleanup_transfer(
                         room,
                         jax_process_index=getattr(req, "disagg_peer_process_index", None),
-                        source_dp_rank=source_dp_rank,
+                        prefill_dp_rank=prefill_dp_rank,
                     )
                 except Exception:
                     logger.warning(
                         "failed to clean up transfer metadata for req_id=%s "
-                        "bootstrap_room=%s source_dp_rank=%s reason=%s",
+                        "bootstrap_room=%s prefill_dp_rank=%s reason=%s",
                         req.rid,
                         room,
-                        source_dp_rank,
+                        prefill_dp_rank,
                         reason,
                         exc_info=True,
                     )

@@ -71,8 +71,8 @@ class DecodeTransferContext:
     req_id: str
     transfer_id: str
     bootstrap_room: int | None
-    local_dp_rank: int
-    source_dp_rank: int
+    decode_dp_rank: int
+    prefill_dp_rank: int
     peer_info: Mapping[str, object]
     kv_indices: Any
     page_size: int
@@ -121,7 +121,7 @@ class TransferBackend(Protocol):
         bootstrap_room: int | None,
         *,
         jax_process_index: int | None = None,
-        source_dp_rank: int = 0,
+        prefill_dp_rank: int = 0,
     ) -> None: ...
 
     def inflight_count(self) -> tuple[int, int]: ...

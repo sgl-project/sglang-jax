@@ -57,12 +57,7 @@ def _globalize_rank_local_page_ids(
     dp_size: int,
     total_pages: int,
 ):
-    """Map allocator-local page IDs onto the global data-sharded page axis.
-
-    Every DP shard owns a leading padding page at local ID 0, followed by its
-    independently allocated pages. The global KV buffer concatenates those
-    equally sized shards along the page axis.
-    """
+    """Preserve each DP shard's padding page when indexing the global page axis."""
 
     import numpy as np
 
@@ -439,7 +434,7 @@ class SchedulerDisaggregationPrefillMixin:
         )
         idx_sharding = _NamedSharding(kv_pool.mesh, _P(None))
         page_indices = jax.device_put(page_ids, idx_sharding)
-        # out_sharding describes the gather output, not the pool.
+        # Page indices are replicated; preserve pool sharding on the remaining axes.
         pool_pspec = kv_pool.kv_sharding.spec
         gather_pspec = _P(None, *pool_pspec[1:])
         gather_out_sharding = _NamedSharding(kv_pool.mesh, gather_pspec)

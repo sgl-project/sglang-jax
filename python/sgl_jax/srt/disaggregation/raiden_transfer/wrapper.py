@@ -104,8 +104,7 @@ class RaidenTransferWrapper:
                     num_slots=int(num_slots),
                     timeout_s=float(timeout_s),
                     parallelism=self._parallelism,
-                    # A manager-lifetime PJRT hold would block serving compute;
-                    # request pages stay owned until Raiden reports terminal.
+                    # A manager-lifetime PJRT hold would block serving compute.
                     unsafe_skip_buffer_lock=True,
                 )
                 endpoints = list(engine.get_local_endpoints())
@@ -143,11 +142,11 @@ class RaidenTransferWrapper:
         remote_block_ids: list[int],
         local_block_ids: list[int],
         *,
-        local_dp_rank: int = 0,
+        decode_dp_rank: int = 0,
     ) -> None:
         if not self._engines:
             raise RuntimeError("RaidenTransferWrapper.start() must be called first")
-        self._engine_for_rank(local_dp_rank).start_read(
+        self._engine_for_rank(decode_dp_rank).start_read(
             req_id,
             uuid,
             remote_endpoint,
@@ -166,9 +165,7 @@ class RaidenTransferWrapper:
             try:
                 rank_sent, rank_received, rank_failed = engine.poll_stats()
             except Exception:
-                # Raiden poll_stats destructively drains completion events. Do
-                # not discard results already drained from healthy ranks when
-                # one manager fails to poll.
+                # Preserve events already drained from healthy ranks.
                 logger.exception("Raiden poll_stats failed for dp_rank=%d", dp_rank)
                 continue
             sent.extend(rank_sent)
@@ -189,7 +186,7 @@ def _partition_without_data_axis(partition: object) -> object:
 
 
 def _rank_local_array(array: Any, dp_rank: int, dp_size: int) -> Any:
-    """Build a zero-copy fully-addressable view for one mesh ``data`` rank."""
+    """Expose one data shard without changing physical buffer ownership."""
 
     import numpy as np
     from jax.sharding import Mesh, NamedSharding, PartitionSpec

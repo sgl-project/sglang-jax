@@ -142,7 +142,7 @@ def check_prefill_compat(
     peer_dp_rank = int(info.get("system_dp_rank", 0))
     if expected_dp_rank is not None and peer_dp_rank != expected_dp_rank:
         raise ValueError(
-            f"PD source rank mismatch: prefill={peer_dp_rank}, expected={expected_dp_rank}"
+            f"PD Prefill rank mismatch: prefill={peer_dp_rank}, expected={expected_dp_rank}"
         )
     peer_dp_size = int(
         transport_metadata.get("dp_size", 1) if isinstance(transport_metadata, dict) else 1
@@ -174,7 +174,7 @@ class RegisterTransferRequest(BaseModel):
     bootstrap_room: int
     transfer_id: str
     jax_process_index: int = 0
-    source_dp_rank: int = 0
+    prefill_dp_rank: int = 0
     transport_metadata: dict[str, object]
 
 
@@ -267,10 +267,10 @@ class _Registry:
             self._evict_stale_transfers_locked()
             room = int(info["bootstrap_room"])
             process_index = int(info.get("jax_process_index", 0))
-            source_dp_rank = int(info.get("source_dp_rank", 0))
+            prefill_dp_rank = int(info.get("prefill_dp_rank", 0))
             if not str(info.get("transfer_id", "")):
                 raise ValueError("transfer_id must be non-empty")
-            key = (room, process_index, source_dp_rank)
+            key = (room, process_index, prefill_dp_rank)
             self.transfers[key] = info
             self.transfer_last_seen[key] = self.now()
 
@@ -278,12 +278,12 @@ class _Registry:
         self,
         bootstrap_room: int,
         jax_process_index: int = 0,
-        source_dp_rank: int = 0,
+        prefill_dp_rank: int = 0,
     ) -> dict[str, object] | None:
         with self.lock:
             self._evict_stale_transfers_locked()
             info = self.transfers.get(
-                (int(bootstrap_room), int(jax_process_index), int(source_dp_rank))
+                (int(bootstrap_room), int(jax_process_index), int(prefill_dp_rank))
             )
             return dict(info) if info is not None else None
 
@@ -291,10 +291,10 @@ class _Registry:
         self,
         bootstrap_room: int,
         jax_process_index: int = 0,
-        source_dp_rank: int = 0,
+        prefill_dp_rank: int = 0,
     ) -> None:
         with self.lock:
-            key = (int(bootstrap_room), int(jax_process_index), int(source_dp_rank))
+            key = (int(bootstrap_room), int(jax_process_index), int(prefill_dp_rank))
             self.transfers.pop(key, None)
             self.transfer_last_seen.pop(key, None)
 
@@ -390,9 +390,9 @@ def build_app(
     def get_transfer_info(
         bootstrap_room: int,
         jax_process_index: int = 0,
-        source_dp_rank: int = 0,
+        prefill_dp_rank: int = 0,
     ) -> dict[str, object]:
-        info = registry.get_transfer(bootstrap_room, jax_process_index, source_dp_rank)
+        info = registry.get_transfer(bootstrap_room, jax_process_index, prefill_dp_rank)
         if info is None:
             # Not registered yet: 404 lets the decode side treat it as
             # "defer + retry" (never abort) rather than a hard error.
@@ -401,7 +401,7 @@ def build_app(
                 detail=(
                     f"no transfer info for bootstrap_room={bootstrap_room}, "
                     f"jax_process_index={jax_process_index}, "
-                    f"source_dp_rank={source_dp_rank}"
+                    f"prefill_dp_rank={prefill_dp_rank}"
                 ),
             )
         return info
@@ -410,9 +410,9 @@ def build_app(
     def pop_transfer(
         bootstrap_room: int,
         jax_process_index: int = 0,
-        source_dp_rank: int = 0,
+        prefill_dp_rank: int = 0,
     ) -> dict[str, str]:
-        registry.pop_room(bootstrap_room, jax_process_index, source_dp_rank)
+        registry.pop_room(bootstrap_room, jax_process_index, prefill_dp_rank)
         return {"status": "popped"}
 
     # Bootstrap runs as a standalone single process and does NOT inherit
@@ -674,14 +674,14 @@ class BootstrapClient:
         transfer_id: str,
         *,
         jax_process_index: int = 0,
-        source_dp_rank: int = 0,
+        prefill_dp_rank: int = 0,
         transport_metadata: dict[str, object],
     ) -> None:
         payload = {
             "bootstrap_room": bootstrap_room,
             "transfer_id": transfer_id,
             "jax_process_index": jax_process_index,
-            "source_dp_rank": source_dp_rank,
+            "prefill_dp_rank": prefill_dp_rank,
             "transport_metadata": transport_metadata,
         }
         r = self._client.post(
@@ -697,14 +697,14 @@ class BootstrapClient:
         bootstrap_room: int,
         *,
         jax_process_index: int = 0,
-        source_dp_rank: int = 0,
+        prefill_dp_rank: int = 0,
     ) -> dict[str, object] | None:
         r = self._client.get(
             f"{self._base_url}/get_transfer_info",
             params={
                 "bootstrap_room": bootstrap_room,
                 "jax_process_index": jax_process_index,
-                "source_dp_rank": source_dp_rank,
+                "prefill_dp_rank": prefill_dp_rank,
             },
             timeout=self._timeout_s,
             headers=self._headers(),
@@ -719,14 +719,14 @@ class BootstrapClient:
         bootstrap_room: int,
         *,
         jax_process_index: int = 0,
-        source_dp_rank: int = 0,
+        prefill_dp_rank: int = 0,
     ) -> None:
         r = self._client.post(
             f"{self._base_url}/pop_transfer",
             params={
                 "bootstrap_room": bootstrap_room,
                 "jax_process_index": jax_process_index,
-                "source_dp_rank": source_dp_rank,
+                "prefill_dp_rank": prefill_dp_rank,
             },
             timeout=self._timeout_s,
             headers=self._headers(),

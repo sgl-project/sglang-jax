@@ -165,14 +165,13 @@ class TokenizedGenerateReqInput:
     return_hidden_states: bool = False
     # multimodal inputs (e.g., mrope positions, embeddings)
     mm_inputs: dict | None = None
-    # The data parallel rank for this request
+    # Decode DP rank selected by request routing.
     dp_rank: int | None = None
     # PD disaggregation routing keys.
     bootstrap_host: str | None = None
     bootstrap_port: int | None = None
     bootstrap_room: int | None = None
-    # Prefill rank that owns the source KV pages. Decode may use a different
-    # local ``dp_rank`` for explicit cross-rank correctness testing.
+    # Prefill DP rank that owns this request's KV cache.
     disagg_prefill_dp_rank: int | None = None
     # Optional wire-level transfer identity. When omitted we fall back
     # to ``rid``; callers that may reuse ``rid`` across retries should
@@ -318,7 +317,7 @@ class GenerateReqInput:
 
     return_routed_experts: list[bool] | bool | None = None
 
-    # The data parallel rank for this request.
+    # Decode DP rank selected by request routing.
     dp_rank: list[int] | int | None = None
 
     # PD disaggregation routing keys.

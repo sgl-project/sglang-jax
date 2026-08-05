@@ -135,8 +135,8 @@ class RaidenMetadata:
     local_block_ids: tuple[int, ...]
     bootstrap_room: int | None
     jax_process_index: int = 0
-    source_dp_rank: int = 0
-    local_dp_rank: int = 0
+    prefill_dp_rank: int = 0
+    decode_dp_rank: int = 0
     direct_commit: Callable[[Mapping[str, object] | None], None] | None = None
     expected_debug: Mapping[str, object] | None = None
 
@@ -232,7 +232,7 @@ class RaidenTransferKVManager(CommonKVManager):
             info = self.bootstrap_client.get_transfer_info(
                 context.bootstrap_room,
                 jax_process_index=peer_process_index,
-                source_dp_rank=context.source_dp_rank,
+                prefill_dp_rank=context.prefill_dp_rank,
             )
         except Exception as exc:  # transient bootstrap failure
             logger.warning(
@@ -251,11 +251,11 @@ class RaidenTransferKVManager(CommonKVManager):
                     "Raiden transfer ID mismatch: "
                     f"expected={context.transfer_id!r}, got={info.get('transfer_id')!r}"
                 )
-            published_source_rank = int(info.get("source_dp_rank", 0))
-            if published_source_rank != context.source_dp_rank:
+            metadata_prefill_dp_rank = int(info.get("prefill_dp_rank", 0))
+            if metadata_prefill_dp_rank != context.prefill_dp_rank:
                 raise ValueError(
-                    "Raiden transfer source rank mismatch: "
-                    f"expected={context.source_dp_rank}, got={published_source_rank}"
+                    "Raiden transfer Prefill rank mismatch: "
+                    f"expected={context.prefill_dp_rank}, got={metadata_prefill_dp_rank}"
                 )
             metadata = info.get("transport_metadata", info)
             if not isinstance(metadata, dict):
@@ -276,10 +276,10 @@ class RaidenTransferKVManager(CommonKVManager):
             peer_dp_rank = int(
                 peer_metadata.get("dp_rank", context.peer_info.get("system_dp_rank", 0))
             )
-            if peer_dp_rank != context.source_dp_rank:
+            if peer_dp_rank != context.prefill_dp_rank:
                 raise ValueError(
                     "prefill endpoint rank mismatch: "
-                    f"expected={context.source_dp_rank}, got={peer_dp_rank}"
+                    f"expected={context.prefill_dp_rank}, got={peer_dp_rank}"
                 )
             peer_dp_size = int(peer_metadata.get("dp_size", self.wrapper.dp_size))
             if peer_dp_size != self.wrapper.dp_size:
@@ -293,10 +293,10 @@ class RaidenTransferKVManager(CommonKVManager):
                 peer_host=peer_host,
             )
             try:
-                local_endpoints = list(self.wrapper.endpoints_by_dp_rank[context.local_dp_rank])
+                local_endpoints = list(self.wrapper.endpoints_by_dp_rank[context.decode_dp_rank])
             except KeyError as exc:
                 raise ValueError(
-                    f"Raiden has no local manager for dp_rank={context.local_dp_rank}"
+                    f"Raiden has no Decode manager for dp_rank={context.decode_dp_rank}"
                 ) from exc
             _validate_endpoint_topology(peer_endpoints, local_endpoints)
             remote_endpoint: object = (
@@ -323,8 +323,8 @@ class RaidenTransferKVManager(CommonKVManager):
                     local_block_ids=local_block_ids,
                     bootstrap_room=context.bootstrap_room,
                     jax_process_index=peer_process_index,
-                    source_dp_rank=context.source_dp_rank,
-                    local_dp_rank=context.local_dp_rank,
+                    prefill_dp_rank=context.prefill_dp_rank,
+                    decode_dp_rank=context.decode_dp_rank,
                     direct_commit=context.direct_commit,
                     expected_debug=(
                         metadata.get("kv_debug")
@@ -373,7 +373,7 @@ class RaidenTransferKVManager(CommonKVManager):
             bootstrap_room,
             transfer_id,
             jax_process_index=jax.process_index(),
-            source_dp_rank=dp_rank,
+            prefill_dp_rank=dp_rank,
             transport_metadata=transport_metadata,
         )
 
@@ -382,7 +382,7 @@ class RaidenTransferKVManager(CommonKVManager):
         bootstrap_room: int | None,
         *,
         jax_process_index: int | None = None,
-        source_dp_rank: int = 0,
+        prefill_dp_rank: int = 0,
     ) -> None:
         if bootstrap_room is None:
             return
@@ -392,7 +392,7 @@ class RaidenTransferKVManager(CommonKVManager):
             self.bootstrap_client.pop_transfer(
                 bootstrap_room,
                 jax_process_index=jax_process_index,
-                source_dp_rank=source_dp_rank,
+                prefill_dp_rank=prefill_dp_rank,
             )
 
     def poll_engine(self) -> None:
@@ -487,7 +487,8 @@ class RaidenTransferKVSender(KVSender, StateHolder):
     def transfer_started_at(self) -> float | None:
         return self._transfer_started_at
 
-    def init(self, kv_indices, transfer_id: str | None = None) -> None:  # noqa: ARG002
+    def init(self, kv_indices, transfer_id: str | None = None) -> None:
+        del kv_indices
         self._transfer_id = transfer_id or self._req_id
         self._transition_to(KVPoll.WAITING_FOR_INPUT)
 
@@ -599,7 +600,7 @@ class RaidenTransferKVSender(KVSender, StateHolder):
         self._manager.forget(self.uuid)
         self._manager.cleanup_transfer(
             self._bootstrap_room,
-            source_dp_rank=self._dp_rank,
+            prefill_dp_rank=self._dp_rank,
         )
         if state == KVPoll.FAILED:
             with suppress(Exception):
@@ -658,7 +659,7 @@ class RaidenTransferKVReceiver(KVReceiver, StateHolder):
                         self._metadata.remote_endpoint,
                         list(self._metadata.remote_block_ids),
                         list(self._metadata.local_block_ids),
-                        local_dp_rank=self._metadata.local_dp_rank,
+                        decode_dp_rank=self._metadata.decode_dp_rank,
                     )
                 except Exception:  # noqa: BLE001
                     logger.exception("Raiden start_read() failed for %s", self._req_id)
@@ -683,7 +684,8 @@ class RaidenTransferKVReceiver(KVReceiver, StateHolder):
             )
         return self.state
 
-    def commit(self, install: Callable[[Any], None]) -> None:  # noqa: ARG002
+    def commit(self, install: Callable[[Any], None]) -> None:
+        del install
         if self.state != KVPoll.SUCCESS:
             raise RuntimeError("cannot commit an incomplete Raiden receive")
         assert self._metadata is not None
@@ -738,7 +740,7 @@ class RaidenTransferKVReceiver(KVReceiver, StateHolder):
         self._manager.cleanup_transfer(
             metadata.bootstrap_room if metadata else None,
             jax_process_index=metadata.jax_process_index if metadata else None,
-            source_dp_rank=metadata.source_dp_rank if metadata else 0,
+            prefill_dp_rank=metadata.prefill_dp_rank if metadata else 0,
         )
         if state == KVPoll.FAILED:
             with suppress(Exception):
