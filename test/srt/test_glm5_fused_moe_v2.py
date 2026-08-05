@@ -22,14 +22,16 @@ def test_glm_moe_dsa_allows_fused_moe_v2():
 
 
 def test_glm5_fused_v2_shared_expert_mappings():
-    model = object.__new__(Glm5ForCausalLM)
-    model.config = SimpleNamespace(
-        n_routed_experts=2,
-        n_shared_experts=1,
-        moe_backend="fused_v2",
+    model = SimpleNamespace(
+        config=SimpleNamespace(
+            n_routed_experts=2,
+            n_shared_experts=1,
+            moe_backend="fused_v2",
+        )
     )
 
-    mappings = model._create_moe_layer_mappings(
+    mappings = Glm5ForCausalLM._create_moe_layer_mappings(
+        model,
         layer_idx=3,
         target_idx=3,
         is_mlp_layer=False,
