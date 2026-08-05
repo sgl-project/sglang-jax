@@ -17,32 +17,6 @@ def _expand_moe_block_scale(scale_3d: jax.Array, n_out: int, block_n: int) -> ja
     return scale_per_channel[:, :, None, :]
 
 
-def _pad_fused_moe_tokens_to_ep(
-    hidden_states: jax.Array,
-    topk_weights: jax.Array,
-    topk_ids: jax.Array,
-    ep_size: int,
-) -> tuple[jax.Array, jax.Array, jax.Array, int]:
-    """Pad the global token axis so every EP shard receives at least one row."""
-    if ep_size <= 0:
-        raise ValueError(f"Expected {ep_size=} > 0.")
-
-    num_tokens = hidden_states.shape[0]
-    pad_tokens = (-num_tokens) % ep_size
-    if pad_tokens == 0:
-        return hidden_states, topk_weights, topk_ids, num_tokens
-
-    hidden_states = jnp.pad(hidden_states, ((0, pad_tokens), (0, 0)))
-    topk_weights = jnp.pad(topk_weights, ((0, pad_tokens), (0, 0)), constant_values=0.0)
-    topk_ids = jnp.pad(
-        topk_ids,
-        ((0, pad_tokens), (0, 0)),
-        mode="constant",
-        constant_values=-1,
-    )
-    return hidden_states, topk_weights, topk_ids, num_tokens
-
-
 class FusedEPMoE(nnx.Module):
     """
     Expert Parallel MoE layer using fused TPU kernel.
@@ -588,17 +562,6 @@ class FusedEPMoEV2(FusedEPMoE):
 
         assert hidden_states.ndim == 2
 
-        # Decode batches may have fewer global rows than EP devices (for
-        # example, bs=8 with EP16). shard_map requires the global token axis to
-        # be EP-divisible; pad fake routes before the tuned lookup and trim the
-        # corresponding outputs after the kernel.
-        hidden_states, topk_weights, topk_ids, original_num_tokens = _pad_fused_moe_tokens_to_ep(
-            hidden_states,
-            topk_weights,
-            topk_ids,
-            self.ep_size,
-        )
-
         w1_scale = self.w1_scale.value if self.w1_scale is not None else None
         w3_scale = self.w3_scale.value if self.w3_scale is not None else None
         w2_scale = self.w2_scale.value if self.w2_scale is not None else None
@@ -681,15 +644,10 @@ class FusedEPMoEV2(FusedEPMoE):
         # (('data','tensor') on the scatter dim); without it we fall back to the
         # plain DP layout P('data', None). b79f9951 dropped this arg and hardcoded
         # the DP layout, which silently broke SP for MoE layers — restored here.
-        # Do this before removing decode padding: the kernel output is sharded
-        # across all EP devices, so slicing it to fewer rows than EP is not a
-        # legal operation until it has been moved to the caller-compatible
-        # sharding.
         if out_sharding is not None:
             output = jax.sharding.reshard(output, out_sharding)
         else:
             output = jax.sharding.reshard(
                 output, jax.sharding.NamedSharding(self.mesh, P("data", None))
             )
-        output = output[:original_num_tokens]
         return output

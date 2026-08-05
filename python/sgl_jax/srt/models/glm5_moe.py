@@ -61,7 +61,14 @@ def _requantize_blockwise_shared_weight(
 
 
 def _requantize_glm5_shared_expert(mlp: FusedEPMoEV2) -> None:
-    """Finish loading GLM-5.2 static block-wise shared-expert weights."""
+    """Finish loading GLM-5.2 static block-wise shared-expert weights.
+
+    TODO: This is a temporary checkpoint-compatibility bridge. GLM-5.2 stores
+    shared-expert FP8 weights with 2D block-wise scales, while the fused-v2
+    in-kernel shared-expert path currently accepts only one scale per output
+    channel. Dequantizing and requantizing introduces a second FP8 rounding;
+    remove this conversion once that kernel consumes block-wise scales directly.
+    """
     if not hasattr(mlp, "w1_shared_block_scale"):
         return
 
