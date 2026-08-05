@@ -7,6 +7,12 @@ them. The map is now indexed by req_pool_idx + 1; these tests pin the
 set/resolve round trip, padding-row drop, and wraparound immunity.
 """
 
+import os
+
+# CPU CI job runs this file with USE_DEVICE_TYPE=cpu (see run_suite.py unit-test-cpu)
+if os.environ.get("USE_DEVICE_TYPE") == "cpu":
+    os.environ["JAX_PLATFORMS"] = "cpu"
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -59,6 +65,35 @@ def test_padding_rows_do_not_clobber_slot_zero(mesh):
 
     assert int(fmap[1]) == 555  # pool idx 0 slot untouched by padding rows
     assert int(fmap[4]) == 777
+
+
+def test_runtime_padding_sentinel_rows_are_dropped(mesh):
+    """Pin the actual runtime padding contract: get_model_worker_batch pads
+    with req_pool_indices=-1 and seq_lens=0 (schedule_batch). Those rows must
+    resolve to the out-of-bounds slot and be dropped by the scatter, leaving
+    every other slot untouched."""
+    fmap = _map()
+    # a real request at pool idx 0 has an outstanding placeholder in slot 1
+    slots_a = future_slot_indices(
+        np.array([4], dtype=np.int32), np.array([0], dtype=np.int32), fmap.shape[0]
+    )
+    fmap = set_future_token_ids(fmap, slots_a, jnp.array([555], dtype=jnp.int32), mesh)
+
+    # padded batch exactly as the runtime builds it: -1 pool sentinel, seq_len 0
+    seq_lens = np.array([6, 0, 0, 0], dtype=np.int32)
+    req_pool = np.array([3, -1, -1, -1], dtype=np.int32)
+    slots = future_slot_indices(seq_lens, req_pool, fmap.shape[0])
+    np.testing.assert_array_equal(slots[1:], fmap.shape[0])  # out of bounds
+
+    before = np.asarray(fmap).copy()
+    fmap = set_future_token_ids(fmap, slots, jnp.array([777, -1, -1, -1], dtype=jnp.int32), mesh)
+    after = np.asarray(fmap)
+
+    assert after[1] == 555  # outstanding placeholder untouched
+    assert after[4] == 777  # real row landed in its own slot
+    untouched = np.ones_like(before, dtype=bool)
+    untouched[[1, 4]] = False
+    np.testing.assert_array_equal(after[untouched], before[untouched])
 
 
 def test_prefill_burst_does_not_wrap(mesh):
