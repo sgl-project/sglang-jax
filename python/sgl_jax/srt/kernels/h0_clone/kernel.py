@@ -14,6 +14,7 @@ import os
 
 import jax
 import jax.experimental.pallas as pl
+import jax.experimental.pallas.tpu as pltpu
 import jax.numpy as jnp
 
 
@@ -29,20 +30,29 @@ def _block_size(num_elements: int) -> int:
     raise AssertionError("every positive integer has a divisor in [1, num_elements]")
 
 
-def _clone_slots_kernel(src_ref, dst_ref, buffer_ref, out_ref, *, block_size: int):
+def _clone_slots_kernel(
+    src_ref, dst_ref, buffer_ref, out_ref, scratch_ref, sem, *, block_size: int
+):
     """Copy one contiguous payload tile for one (src, dst) pair."""
     pair = pl.program_id(0)
     tile = pl.program_id(1)
-    src = src_ref[0]
-    dst = dst_ref[0]
+    src = src_ref[pair]
+    dst = dst_ref[pair]
     offset = tile * block_size
     payload_slice = pl.ds(offset, block_size)
 
-    # ``src == 0`` is the fixed-shape no-op sentinel. Reading the output in
-    # that case makes the aliasing contract explicit and preserves slot zero.
-    src_payload = buffer_ref[src, payload_slice]
-    dst_payload = out_ref[dst, payload_slice]
-    out_ref[dst, payload_slice] = jnp.where(src == 0, dst_payload, src_payload)
+    # Pool buffers live in HBM (pl.ANY), so Mosaic requires DMA rather than a
+    # direct load/store.  For the no-op sentinel, copy dst onto itself; this
+    # avoids a read from the output alias while preserving its contents.
+    source_slot = jnp.where(src == 0, dst, src)
+    gather = pltpu.make_async_copy(
+        buffer_ref.at[source_slot, payload_slice], scratch_ref, sem
+    )
+    gather.start()
+    gather.wait()
+    scatter = pltpu.make_async_copy(scratch_ref, out_ref.at[dst, payload_slice], sem)
+    scatter.start()
+    scatter.wait()
 
 
 def _slow_clone(buffer: jax.Array, src_indices: jax.Array, dst_indices: jax.Array) -> jax.Array:
@@ -98,15 +108,19 @@ def clone_slots_inplace(
         return _slow_clone(buffer, src_indices, dst_indices)
 
     kernel = functools.partial(_clone_slots_kernel, block_size=block_size)
+    grid_spec = pltpu.PrefetchScalarGridSpec(
+        num_scalar_prefetch=2,
+        in_specs=[pl.BlockSpec(memory_space=pl.ANY)],
+        out_specs=pl.BlockSpec(memory_space=pl.ANY),
+        grid=(src_indices.shape[0], slot_payload // block_size),
+        scratch_shapes=[
+            pltpu.VMEM((block_size,), buffer.dtype),
+            pltpu.SemaphoreType.DMA,
+        ],
+    )
     cloned_2d = pl.pallas_call(
         kernel,
-        grid=(src_indices.shape[0], slot_payload // block_size),
-        in_specs=[
-            pl.BlockSpec((1,), lambda pair, _tile: (pair,)),
-            pl.BlockSpec((1,), lambda pair, _tile: (pair,)),
-            pl.BlockSpec(memory_space=pl.ANY),
-        ],
-        out_specs=pl.BlockSpec(memory_space=pl.ANY),
+        grid_spec=grid_spec,
         out_shape=jax.ShapeDtypeStruct(buffer_2d.shape, buffer_2d.dtype),
         input_output_aliases={2: 0},
         interpret=interpret,
