@@ -1,4 +1,5 @@
 import logging
+from functools import partial
 from typing import Any
 
 import jax
@@ -17,6 +18,7 @@ from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sgl_jax.srt.layers.moe import (
     EPMoE,
     FusedEPMoE,
+    FusedEPMoEV2,
     GateLogit,
     TopK,
     create_moe_weights_mapping,
@@ -24,9 +26,75 @@ from sgl_jax.srt.layers.moe import (
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.mem_cache.memory_pool import KVCache
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
+from sgl_jax.srt.utils.quantization.quantization_utils import (
+    dequantize_tensor,
+    quantize_tensor,
+)
 from sgl_jax.srt.utils.weight_utils import WeightLoader, WeightMapping
 
 logger = logging.getLogger(__name__)
+
+
+@partial(jax.jit, static_argnames=("quantized_dtype",))
+def _requantize_blockwise_shared_weight(
+    weight_q: jax.Array,
+    block_scale: jax.Array,
+    *,
+    quantized_dtype: jnp.dtype,
+) -> tuple[jax.Array, jax.Array]:
+    """Convert a transposed HF block-wise FP8 weight to per-channel FP8.
+
+    GLM-5.2-FP8 stores shared-expert weights as ``[out, in]`` with a
+    ``[out_blocks, in_blocks]`` scale grid. The fused-v2 layer stores the
+    transposed weight as ``[in, out]``, while its shared-expert kernel accepts
+    one scale per output channel. Dequantize with the transposed block grid
+    before requantizing; reshaping the original block scales would change the
+    represented weight values.
+    """
+    weight = dequantize_tensor(
+        weight_q,
+        jnp.transpose(block_scale),
+        axis=(0, 1),
+        out_dtype=jnp.float32,
+    )
+    return quantize_tensor(quantized_dtype, weight, axis=0)
+
+
+def _requantize_glm5_shared_expert(mlp: FusedEPMoEV2) -> None:
+    """Finish loading GLM-5.2 static block-wise shared-expert weights."""
+    if not hasattr(mlp, "w1_shared_block_scale"):
+        return
+
+    if mlp.quantized_dtype is None:
+        raise ValueError("GLM-5.2 block-wise shared-expert conversion requires FP8 weights")
+
+    with jax.set_mesh(mlp.mesh):
+        for weight_name in ("w1_shared", "w3_shared", "w2_shared"):
+            scale_name = f"{weight_name}_scale"
+            block_scale_name = f"{weight_name}_block_scale"
+            weight_q, scale = _requantize_blockwise_shared_weight(
+                getattr(mlp, weight_name).value,
+                getattr(mlp, block_scale_name).value,
+                quantized_dtype=mlp.quantized_dtype,
+            )
+            # Model loading runs once per layer. Drain each conversion before
+            # dropping the block-scale input so 75 layers do not queue all
+            # dequant/requant temporaries in device memory at once.
+            weight_q.block_until_ready()
+            scale.block_until_ready()
+            setattr(
+                mlp,
+                weight_name,
+                nnx.Param(weight_q, out_sharding=P(None, None)),
+            )
+            setattr(
+                mlp,
+                scale_name,
+                nnx.Param(scale.reshape(1, 1, -1), out_sharding=P(None, None, None)),
+            )
+            delattr(mlp, block_scale_name)
+
+    logger.info("Requantized GLM-5.2 shared expert from block-wise to per-channel FP8")
 
 
 # No-op: FP32 accumulation logic removed to keep native BF16 execution.
@@ -713,7 +781,9 @@ class Glm5DecoderLayer(nnx.Module):
             )
 
             self.moe_backend = getattr(config, "moe_backend", MoEBackend.EPMOE)
-            self.use_fused = self.moe_backend == MoEBackend.FUSED
+            self.use_fused = self.moe_backend in (MoEBackend.FUSED, MoEBackend.FUSED_V2)
+            num_shared_experts = getattr(config, "n_shared_experts", 0)
+            use_inkernel_se = self.moe_backend == MoEBackend.FUSED_V2 and num_shared_experts > 0
 
             self.topk = TopK(
                 topk=config.num_experts_per_tok,
@@ -725,7 +795,70 @@ class Glm5DecoderLayer(nnx.Module):
                 mesh=mesh,
             )
 
-            if self.use_fused:
+            if self.moe_backend == MoEBackend.FUSED_V2:
+                self.mlp = FusedEPMoEV2(
+                    hidden_size=config.hidden_size,
+                    num_experts=config.n_routed_experts,
+                    num_experts_per_tok=config.num_experts_per_tok,
+                    intermediate_dim=config.moe_intermediate_size,
+                    mesh=mesh,
+                    ep_size=getattr(config, "ep_size", 1),
+                    weight_dtype=dtype,
+                    dtype=dtype,
+                    layer_id=layer_id,
+                    renormalize_topk_logits=config.norm_topk_prob,
+                    routed_scaling_factor=getattr(config, "routed_scaling_factor", 1.0),
+                    use_grouped_topk=getattr(config, "n_group", 1) > 1,
+                    num_groups=getattr(config, "n_group", 1),
+                    top_k_groups=getattr(config, "topk_group", 1),
+                    num_shared_experts=num_shared_experts if use_inkernel_se else 0,
+                    moe_shared_expert_intermediate_size=config.moe_intermediate_size,
+                    quantization_config=getattr(config, "quantization_config", None),
+                )
+
+                quant_config = getattr(config, "quantization_config", None)
+                weight_block_size = (
+                    getattr(quant_config, "weight_block_size", None) if quant_config else None
+                )
+                if (
+                    use_inkernel_se
+                    and getattr(quant_config, "is_static_checkpoint", False)
+                    and weight_block_size is not None
+                ):
+                    block_n, block_k = map(int, weight_block_size)
+                    shared_intermediate = config.moe_intermediate_size * num_shared_experts
+                    if (
+                        config.hidden_size % block_k
+                        or shared_intermediate % block_n
+                        or config.hidden_size % block_n
+                        or shared_intermediate % block_k
+                    ):
+                        raise ValueError(
+                            "GLM-5.2 shared-expert dimensions must be divisible by "
+                            f"weight_block_size={weight_block_size}"
+                        )
+                    self.mlp.w1_shared_block_scale = nnx.Param(
+                        jnp.zeros(
+                            (shared_intermediate // block_n, config.hidden_size // block_k),
+                            dtype=jnp.float32,
+                        ),
+                        out_sharding=P(None, None),
+                    )
+                    self.mlp.w3_shared_block_scale = nnx.Param(
+                        jnp.zeros(
+                            (shared_intermediate // block_n, config.hidden_size // block_k),
+                            dtype=jnp.float32,
+                        ),
+                        out_sharding=P(None, None),
+                    )
+                    self.mlp.w2_shared_block_scale = nnx.Param(
+                        jnp.zeros(
+                            (config.hidden_size // block_n, shared_intermediate // block_k),
+                            dtype=jnp.float32,
+                        ),
+                        out_sharding=P(None, None),
+                    )
+            elif self.use_fused:
                 self.mlp = FusedEPMoE(
                     hidden_size=config.hidden_size,
                     num_experts=config.n_routed_experts,
@@ -759,7 +892,6 @@ class Glm5DecoderLayer(nnx.Module):
                     quantization_config=getattr(config, "quantization_config", None),
                 )
 
-            num_shared_experts = getattr(config, "n_shared_experts", 0)
             if num_shared_experts > 0 and not self.use_fused:
                 self.shared_experts = Glm5MLP(
                     hidden_size=config.hidden_size,
@@ -979,6 +1111,8 @@ class Glm5ForCausalLM(nnx.Module):
 
         for layer in self.model.layers:
             layer.self_attn.post_load_weights()
+            if isinstance(getattr(layer, "mlp", None), FusedEPMoEV2):
+                _requantize_glm5_shared_expert(layer.mlp)
             if hasattr(layer, "mlp") and hasattr(layer.mlp, "post_load_weights"):
                 layer.mlp.post_load_weights()
             if (
@@ -1180,10 +1314,29 @@ class Glm5ForCausalLM(nnx.Module):
             num_shared = getattr(self.config, "n_shared_experts", 0)
             if num_shared > 0:
                 sp = f"{prefix}.mlp.shared_experts"
-                st = f"{target_prefix}.shared_experts"
-                add_linear(f"{sp}.gate_proj", f"{st}.gate_proj", (None, "tensor"))
-                add_linear(f"{sp}.up_proj", f"{st}.up_proj", (None, "tensor"))
-                add_linear(f"{sp}.down_proj", f"{st}.down_proj", ("tensor", None))
+                if moe_backend == "fused_v2":
+                    for hf_name, target_name in (
+                        ("gate_proj", "w1_shared"),
+                        ("up_proj", "w3_shared"),
+                        ("down_proj", "w2_shared"),
+                    ):
+                        target_path = f"{target_prefix}.mlp.{target_name}"
+                        mappings[f"{sp}.{hf_name}.weight"] = WeightMapping(
+                            target_path=target_path,
+                            sharding=(None, None),
+                            transpose=True,
+                        )
+                        if is_static_quant:
+                            mappings[f"{sp}.{hf_name}.weight_scale_inv"] = WeightMapping(
+                                target_path=f"{target_path}_block_scale",
+                                sharding=(None, None),
+                                transpose=False,
+                            )
+                else:
+                    st = f"{target_prefix}.shared_experts"
+                    add_linear(f"{sp}.gate_proj", f"{st}.gate_proj", (None, "tensor"))
+                    add_linear(f"{sp}.up_proj", f"{st}.up_proj", (None, "tensor"))
+                    add_linear(f"{sp}.down_proj", f"{st}.down_proj", ("tensor", None))
 
         return mappings
 

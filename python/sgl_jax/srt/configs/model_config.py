@@ -50,6 +50,7 @@ _FUSED_MOE_V2_SUPPORTED_ARCHITECTURES = frozenset(
         "BailingMoeV2_5ForCausalLM",
         "MiMoV2ForCausalLM",
         "MiMoV2FlashForCausalLM",
+        "GlmMoeDsaForCausalLM",
     }
 )
 
@@ -62,7 +63,7 @@ def _assert_fused_moe_v2_supported(moe_backend: MoEBackend, architectures: list[
         return
 
     assert any(arch in _FUSED_MOE_V2_SUPPORTED_ARCHITECTURES for arch in architectures), (
-        "moe_backend='fused_v2' only supports Bailing/MiMo model architectures for now; "
+        "moe_backend='fused_v2' only supports Bailing/MiMo/GLM model architectures for now; "
         f"got architectures={architectures}"
     )
 
