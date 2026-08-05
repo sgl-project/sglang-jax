@@ -1,0 +1,122 @@
+# Tunix GRPO training with AInfer rollout engine on 2x2 TPU v6e.
+#
+# Prerequisites:
+#   - 2x2 TPU v6e node pool
+#   - Model: gs://wenqiao-ainfer-test/models/inclusionAI/Ling-mini-2.0
+#   - AInfer deploy: gs://ainfer-tpu-bench-code/ainfer-tpu-deploy.tar.gz
+#   - Tunix + AInfer patches uploaded to GCS
+#
+# Deploy:
+#   kubectl apply -f grpo-ainfer-job.yaml
+#
+# Monitor:
+#   kubectl logs -f job/grpo-ainfer
+#
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: grpo-ainfer
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 5400
+  template:
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        cloud.google.com/gke-tpu-accelerator: tpu-v6e-slice
+        cloud.google.com/gke-tpu-topology: "2x2"
+      tolerations:
+        - key: google.com/tpu
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: grpo
+          image: python:3.12-slim
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -ex
+
+              # ── Install system deps ──
+              apt-get update -qq && apt-get install -y -qq git build-essential curl && rm -rf /var/lib/apt/lists/*
+
+              # ── Install Python deps ──
+              pip install -q "numpy>=1.26"
+              pip install -q torch --index-url https://download.pytorch.org/whl/cpu
+              pip install -q transformers huggingface_hub safetensors tokenizers gcsfs
+              pip install -q datasets tensorflow-cpu
+              pip install -q "jax[tpu]==0.10.1" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+              pip install -q "flax==0.12.4"
+              pip install -q triton setuptools
+              pip cache purge 2>/dev/null || true
+              apt-get clean
+              rm -rf /root/.cache/pip /root/.cache/huggingface /tmp/*.tar.gz /tmp/pip-* 2>/dev/null || true
+
+              python3 -c "import jax; print(f'TPU={jax.device_count()}'); assert jax.device_count()==4"
+
+              # ── Install Tunix (from GCS tarball, ant-ling branch) ──
+              python3 -c "import gcsfs; fs=gcsfs.GCSFileSystem(); fs.get('gs://wenqiao-ainfer-test/wenqiao/tunix-ant-ling.tar.gz','/tmp/tunix.tar.gz')"
+              mkdir -p /app/tunix-repo && cd /app/tunix-repo && tar xzf /tmp/tunix.tar.gz && rm /tmp/tunix.tar.gz
+              pip install -q -e .
+              pip cache purge 2>/dev/null || true
+
+              # ── Install AInfer ──
+              python3 -c "import gcsfs; fs=gcsfs.GCSFileSystem(); fs.get('gs://ainfer-tpu-bench-code/ainfer-tpu-deploy.tar.gz','/tmp/ainfer.tar.gz')"
+              mkdir -p /app/ainfer && cd /app/ainfer && tar xzf /tmp/ainfer.tar.gz && rm /tmp/ainfer.tar.gz
+              python3 -c "import gcsfs; fs=gcsfs.GCSFileSystem(); fs.get('gs://wenqiao-ainfer-test/wenqiao/ainfer-p11-kernel-sync.tar.gz','/tmp/ksync.tar.gz')"
+              cd /app/ainfer && tar xzf /tmp/ksync.tar.gz && rm /tmp/ksync.tar.gz
+              python3 -c "import gcsfs; fs=gcsfs.GCSFileSystem(); fs.get('gs://wenqiao-ainfer-test/wenqiao/async_n4_patch/llm_engine.py','/app/ainfer/ainfer/engine/tpu_managers/llm_engine.py')"
+              # AInfer device_indexes patch
+              python3 -c "import gcsfs; fs=gcsfs.GCSFileSystem(); fs.get('gs://wenqiao-ainfer-test/wenqiao/ainfer-device-indexes-patch.tar.gz','/tmp/di-patch.tar.gz')"
+              cd /app/ainfer && tar xzf /tmp/di-patch.tar.gz && rm /tmp/di-patch.tar.gz
+              export PYTHONPATH=/app/ainfer:$PYTHONPATH
+
+              # ── Download model ──
+              mkdir -p /tmp/models
+              python3 -c "import gcsfs; fs=gcsfs.GCSFileSystem(); fs.get('gs://wenqiao-ainfer-test/models/inclusionAI/Ling-mini-2.0','/tmp/models/inclusionAI/Ling-mini-2.0',recursive=True); print('Model OK')"
+
+              # ── Download GRPO config ──
+              python3 -c "import gcsfs; fs=gcsfs.GCSFileSystem(); fs.get('gs://wenqiao-ainfer-test/wenqiao/grpo-ainfer-config.yaml','/app/grpo-ainfer-config.yaml')"
+
+              # ── Run GRPO training ──
+              echo "=== Starting GRPO training with AInfer rollout ==="
+              cd /app/tunix-repo
+              python3 -m tunix.cli.grpo_main /app/grpo-ainfer-config.yaml \
+                2>&1 | tee /tmp/grpo_ainfer.log
+              echo "DONE_GRPO_AINFER"
+          env:
+            - name: SKIP_XPROF
+              value: "1"
+            - name: TPU_COMPILE_CACHE_DIR
+              value: "gs://wenqiao-ainfer-test/jax_cache/"
+            - name: AINFER_OVERLAP
+              value: "1"
+            - name: AINFER_MULTI_STEP
+              value: "8"
+            - name: AINFER_ASYNC_DISPATCH
+              value: "1"
+            - name: AINFER_MOE_KERNEL_VERSION
+              value: "1"
+            - name: PALLAS_COMPILER_PARAMS
+              value: "--disable_sparse_core_dma_merging=true"
+            - name: PALLAS_ENABLE_STRICT_DONE_BIT_CHECKS
+              value: "true"
+            - name: TPU_MESH_CONTROLLER_TIMEOUT_MS
+              value: "120000"
+            - name: LIBTPU_INIT_ARGS
+              value: "--xla_tpu_all_gather_collective_matmul_mode=post_spmd --xla_tpu_reduce_scatter_collective_matmul_mode=post_spmd"
+            - name: TPU_MIN_LOG_LEVEL
+              value: "1"
+            - name: TF_CPP_MIN_LOG_LEVEL
+              value: "1"
+            - name: TPU_STDERR_LOG_LEVEL
+              value: "0"
+            - name: HF_TOKEN
+              value: "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"
+          resources:
+            requests:
+              google.com/tpu: "4"
+              ephemeral-storage: "38Gi"
+            limits:
+              google.com/tpu: "4"
+              ephemeral-storage: "95Gi"

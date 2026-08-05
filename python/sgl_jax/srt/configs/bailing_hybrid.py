@@ -6,7 +6,11 @@ from transformers import PretrainedConfig
 
 
 class BailingHybridConfig(PretrainedConfig):
-    """Minimal Bailing hybrid config for Ling/Ring 2.5 linear-attention models."""
+    """Minimal Bailing hybrid config for Ling/Ring linear-attention models.
+
+    Supports both V2.5 (GLA / Lightning linear attention) and V3 (KDA /
+    Kimi Delta Attention).
+    """
 
     model_type = "bailing_hybrid"
     keys_to_ignore_at_inference = ["past_key_values"]
@@ -49,6 +53,8 @@ class BailingHybridConfig(PretrainedConfig):
         linear_silu: bool = False,
         use_linear_silu: bool | None = None,
         linear_rope: bool = True,
+        linear_attn_type: str = "gla",
+        short_conv_kernel_size: int = 1,
         full_attention_type: str = "mla",
         kv_lora_rank: int = 512,
         q_lora_rank: int | None = None,
@@ -96,6 +102,8 @@ class BailingHybridConfig(PretrainedConfig):
         self.linear_silu = linear_silu if use_linear_silu is None else use_linear_silu
         self.use_linear_silu = self.linear_silu
         self.linear_rope = linear_rope
+        self.linear_attn_type = linear_attn_type
+        self.short_conv_kernel_size = short_conv_kernel_size
         self.num_linear_key_value_heads = num_attention_heads
         self.full_attention_type = full_attention_type
 
@@ -158,6 +166,16 @@ class BailingHybridConfig(PretrainedConfig):
             if str(block_type).lower() in {"attention", "full_attention"}
         ]
 
+    def is_kda_layer(self, layer_idx: int) -> bool:
+        """True when `layer_idx` uses KDA (Kimi Delta Attention) linear attention.
+
+        Only meaningful when ``linear_attn_type == "kda"``; for GLA-based models
+        this always returns False.
+        """
+        if self.linear_attn_type != "kda":
+            return False
+        return layer_idx in self.linear_layer_ids
+
     @property
     def linear_state_params(self):
         from sgl_jax.srt.mem_cache.recurrent_state_pool import (
@@ -169,18 +187,43 @@ class BailingHybridConfig(PretrainedConfig):
             layers=self.linear_layer_ids,
             num_heads=self.num_linear_key_value_heads,
             head_dim=self.head_dim,
-            conv_kernel_size=1,
+            conv_kernel_size=self.short_conv_kernel_size,
             dtype=recurrent_state_dtype(),
         )
 
     @property
     def linear_attn_config(self) -> dict[str, Any]:
-        return {
+        cfg = {
             "kda_layers": self.linear_layer_ids,
             "num_heads": self.num_attention_heads,
             "head_dim": self.head_dim,
-            "short_conv_kernel_size": 1,
+            "short_conv_kernel_size": self.short_conv_kernel_size,
         }
+        if self.linear_attn_type:
+            cfg["linear_attn_type"] = self.linear_attn_type
+        return cfg
+
+
+def _derive_linear_attn_type(hf_config: Any, current: str | None) -> str | None:
+    """Return the resolved linear_attn_type ('kda'/'gla').
+
+    V3 (BailingMoeV3ForCausalLM) uses KDA, detected by architecture name or
+    KDA-specific config fields (short_conv_kernel_size > 1, no_kda_lora,
+    kda_safe_gate). V2.5 keeps the GLA default. An explicit non-default value
+    already on the config wins.
+    """
+    if current and current != "gla":
+        return current
+    architectures = getattr(hf_config, "architectures", None) or []
+    is_v3 = any(str(a) == "BailingMoeV3ForCausalLM" for a in architectures)
+    has_kda_fields = (
+        int(getattr(hf_config, "short_conv_kernel_size", 1) or 1) > 1
+        or getattr(hf_config, "no_kda_lora", None) is not None
+        or getattr(hf_config, "kda_safe_gate", None) is not None
+    )
+    if is_v3 or has_kda_fields:
+        return "kda"
+    return current
 
 
 def get_bailing_hybrid_config(hf_config: Any) -> BailingHybridConfig | None:
@@ -193,10 +236,23 @@ def get_bailing_hybrid_config(hf_config: Any) -> BailingHybridConfig | None:
         return None
 
     if isinstance(hf_config, BailingHybridConfig):
+        # Already a BailingHybridConfig; ensure linear_attn_type is resolved
+        # (it may still hold the GLA default if rebuilt from a V3 checkpoint
+        # whose config.json predates the linear_attn_type field).
+        resolved = _derive_linear_attn_type(
+            hf_config, getattr(hf_config, "linear_attn_type", None)
+        )
+        if resolved is not None:
+            hf_config.linear_attn_type = resolved
         return hf_config
 
     config_kwargs = hf_config.to_dict() if hasattr(hf_config, "to_dict") else dict(vars(hf_config))
     config_kwargs["layers_block_type"] = list(hf_config.layers_block_type)
+
+    resolved = _derive_linear_attn_type(hf_config, config_kwargs.get("linear_attn_type"))
+    if resolved is not None:
+        config_kwargs["linear_attn_type"] = resolved
+
     return BailingHybridConfig(**config_kwargs)
 
 
@@ -204,7 +260,10 @@ def _is_bailing_hybrid_config(hf_config: Any) -> bool:
     if getattr(hf_config, "model_type", None) == "bailing_hybrid":
         return True
     architectures = getattr(hf_config, "architectures", None) or []
-    return any(str(arch) == "BailingMoeV2_5ForCausalLM" for arch in architectures)
+    return any(
+        str(arch) in ("BailingMoeV2_5ForCausalLM", "BailingMoeV3ForCausalLM")
+        for arch in architectures
+    )
 
 
 def _get_layer_ids(hf_config: Any, num_hidden_layers: int) -> tuple[list[int], list[int]]:

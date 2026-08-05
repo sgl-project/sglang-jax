@@ -56,12 +56,19 @@ class FusedMoEBlockConfig:
         dtype: jnp.dtype,
         quant_block_k: int | None = None,
         intermediate_size: int | None = None,
+        hidden_size: int | None = None,
     ) -> FusedMoEBlockConfig:
         """Return the *effective* config after applying kernel override rules.
 
         If *intermediate_size* is given and ``self.bf`` does not divide it,
         ``bf`` (and correspondingly ``bfc``) are jointly reduced to the largest
         multiple of 128 that satisfies both divisibility constraints.
+
+        If *hidden_size* is given and ``self.bd1``/``self.bd2`` do not divide it,
+        each (with its corresponding ``bd1c``/``bd2c`` compute tile) is reduced to
+        the largest valid block that divides ``hidden_size``. This lets the kernel
+        run on models whose hidden_size is not a multiple of the tuned/default
+        bd block (e.g. hidden_size=1536, default bd=1024).
 
         Important: validate after overrides, because these overrides affect the
         actual compiled kernel shapes/scratch.
@@ -134,18 +141,33 @@ class FusedMoEBlockConfig:
                     f"{intermediate_size=} with a feasible bfc{quant_info}."
                 )
 
+        bd1 = self.bd1
+        bd2 = self.bd2
+        bd2c = self.bd2c
+        if hidden_size is not None:
+            tile_align = t_packing * 128
+            # bd1c must additionally stay a multiple of the quant group size when
+            # weights are quantized (see validate_fused_moe_block_config).
+            bd1c_quant = quant_block_k * t_packing if quant_block_k is not None else None
+            bd1, bd1c = _reduce_bd_for_hidden(
+                bd1, bd1c, hidden_size, tile_align, "bd1", quant_align=bd1c_quant
+            )
+            bd2, bd2c = _reduce_bd_for_hidden(
+                bd2, bd2c, hidden_size, tile_align, "bd2", quant_align=None
+            )
+
         bse = bf if self.bse is None else self.bse
 
         return FusedMoEBlockConfig(
             bt=bt,
             bts=bts,
             bf=bf,
-            bd1=self.bd1,
-            bd2=self.bd2,
+            bd1=bd1,
+            bd2=bd2,
             btc=btc,
             bfc=bfc,
             bd1c=bd1c,
-            bd2c=self.bd2c,
+            bd2c=bd2c,
             bse=bse,
         )
 
@@ -192,6 +214,56 @@ class FusedMoEBlockConfig:
             "bse": self.bse,
         }
         return out
+
+
+def _reduce_bd_for_hidden(
+    bd: int,
+    bdc: int,
+    hidden_size: int,
+    tile_align: int,
+    name: str,
+    *,
+    quant_align: int | None,
+) -> tuple[int, int]:
+    """Reduce a hidden-dim block ``bd`` (and its compute tile ``bdc``) so it
+    divides ``hidden_size``.
+
+    Mirrors the ``bf``/``bfc`` reduction: when the tuned/default ``bd`` does not
+    divide ``hidden_size`` (e.g. bd=1024 for hidden_size=1536), step ``bd`` down
+    by ``tile_align`` to the largest value that both divides ``hidden_size`` and
+    stays a multiple of ``tile_align``. ``bdc`` is then capped to ``bd`` and
+    reduced until it divides ``bd`` (and any quant-group alignment holds).
+
+    No-op when ``bd`` already divides ``hidden_size`` (the aligned common case),
+    so models with hidden_size that is a multiple of the tuned bd are unaffected.
+    """
+    if hidden_size % bd == 0:
+        return bd, bdc
+    new_bd = None
+    for cand in range(bd - tile_align, 0, -tile_align):
+        if hidden_size % cand == 0:
+            new_bd = cand
+            break
+    if new_bd is None:
+        raise ValueError(
+            f"Cannot find a valid {name} (multiple of {tile_align=}) that divides "
+            f"{hidden_size=}."
+        )
+    new_bdc = min(bdc, new_bd)
+    while new_bdc > tile_align and (
+        new_bd % new_bdc != 0
+        or new_bdc % tile_align != 0
+        or (quant_align is not None and new_bdc % quant_align != 0)
+    ):
+        new_bdc -= tile_align
+    if new_bd % new_bdc != 0 or new_bdc % tile_align != 0 or (
+        quant_align is not None and new_bdc % quant_align != 0
+    ):
+        raise ValueError(
+            f"Cannot find a valid {name}c for reduced {name}={new_bd} "
+            f"({hidden_size=}, {tile_align=}, {quant_align=})."
+        )
+    return new_bd, new_bdc
 
 
 def align_to(x, a):
@@ -3381,6 +3453,7 @@ def fused_ep_moe(
         dtype=tokens.dtype,
         quant_block_k=quant_block_k,
         intermediate_size=intermediate_size,
+        hidden_size=tokens.shape[1],
     )
     _validate_fused_ep_moe_args(
         mesh=mesh,

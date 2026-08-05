@@ -1,0 +1,135 @@
+# sglang-jax 4x4 (16 chips) multi-node benchmark on GKE TPU v6e.
+#
+# Prerequisites:
+#   - GKE cluster with 4x4 TPU v6e node pool (4 nodes x 4 chips)
+#   - JobSet CRD installed (GKE >= 1.35 has it built-in)
+#   - Model, sglang-jax source, and benchmark script uploaded to GCS
+#
+# Deploy:
+#   kubectl apply -f sglang-4x4-bench-jobset.yaml
+#
+# Monitor (worker 0 logs):
+#   kubectl logs -f $(kubectl get pods -l jobset.sigs.k8s.io/jobset-name=sglang-4x4-bench \
+#       -o jsonpath='{.items[0].metadata.name}')
+#
+# Customize GCS paths:
+#   Edit the env vars MODEL_GCS_PATH, SGLANG_GCS_PATH, BENCH_GCS_PATH below.
+#
+# Known limitations:
+#   - dp_size>1 + enable_single_process=True + nnodes>1 has a bug in sglang-jax
+#     (scheduler_pipe_readers unbound for node_rank>=1). Use tp_size=16 only.
+#   - tp=16 is suboptimal for small models (hidden_dim=2048); dp=4,tp=4 would be
+#     better but requires the sglang-jax bug fix above.
+#   - Workers 1-3 show Failed status after worker 0 exits — this is expected.
+#
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: sglang-4x4-bench
+  annotations:
+    alpha.jobset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool
+spec:
+  failurePolicy:
+    maxRestarts: 0
+  replicatedJobs:
+    - name: worker
+      replicas: 1
+      template:
+        spec:
+          parallelism: 4
+          completions: 4
+          backoffLimit: 0
+          template:
+            spec:
+              restartPolicy: Never
+              nodeSelector:
+                cloud.google.com/gke-tpu-accelerator: tpu-v6e-slice
+                cloud.google.com/gke-tpu-topology: "4x4"
+              tolerations:
+                - key: google.com/tpu
+                  operator: Exists
+                  effect: NoSchedule
+              containers:
+                - name: bench
+                  image: python:3.12-slim
+                  command: ["/bin/bash", "-c"]
+                  args:
+                    - |
+                      set -e
+
+                      # ── Install dependencies ──
+                      apt-get update -qq && apt-get install -y -qq git curl && rm -rf /var/lib/apt/lists/*
+                      pip install -q "numpy>=1.26"
+                      pip install -q torch --index-url https://download.pytorch.org/whl/cpu
+                      pip install -q transformers huggingface_hub safetensors tokenizers gcsfs
+                      pip install -q datasets
+                      pip install -q setuptools
+
+                      # ── Install sglang-jax ──
+                      python3 -c "import gcsfs; fs=gcsfs.GCSFileSystem(); fs.get('${SGLANG_GCS_PATH}','/tmp/sglang-jax.tar.gz')"
+                      mkdir -p /app/sglang-jax && cd /app/sglang-jax && tar xzf /tmp/sglang-jax.tar.gz && rm /tmp/sglang-jax.tar.gz
+                      cd /app/sglang-jax/python && pip install -e ".[tpu]" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+                      pip cache purge 2>/dev/null || true
+
+                      # ── Download model and benchmark script ──
+                      mkdir -p /tmp/models
+                      python3 -c "import gcsfs; fs=gcsfs.GCSFileSystem(); fs.get('${MODEL_GCS_PATH}','${MODEL_DIR}',recursive=True); print('Model OK')"
+                      python3 -c "import gcsfs; fs=gcsfs.GCSFileSystem(); fs.get('${BENCH_GCS_PATH}','/app/sglang_bench.py')"
+
+                      # ── Derive coordinator address from GKE-injected env ──
+                      COORD_HOST=$(echo "${TPU_WORKER_HOSTNAMES}" | cut -d',' -f1)
+                      export DIST_INIT_ADDR="${COORD_HOST}:29500"
+
+                      # ── Run benchmark ──
+                      python3 -u /app/sglang_bench.py
+                  env:
+                    # ── GCS paths (customize these) ──
+                    - name: MODEL_GCS_PATH
+                      value: "gs://wenqiao-ainfer-test/models/inclusionAI/Ling-mini-2.0"
+                    - name: SGLANG_GCS_PATH
+                      value: "gs://wenqiao-ainfer-test/sglang-jax.tar.gz"
+                    - name: BENCH_GCS_PATH
+                      value: "gs://wenqiao-ainfer-test/wenqiao/sglang_bench.py"
+                    # ── Benchmark config ──
+                    - name: MODEL_DIR
+                      value: "/tmp/models/inclusionAI/Ling-mini-2.0"
+                    - name: TP_SIZE
+                      value: "16"
+                    - name: DP_SIZE
+                      value: "4"
+                    - name: NNODES
+                      value: "4"
+                    - name: WARMUP_ROUNDS
+                      value: "1"
+                    - name: TIMED_ROUNDS
+                      value: "2"
+                    # ── TPU runtime ──
+                    - name: SKIP_XPROF
+                      value: "1"
+                    - name: JAX_COMPILATION_CACHE_DIR
+                      value: "gs://wenqiao-ainfer-test/sglang_jax_cache_4x4"
+                    - name: PALLAS_COMPILER_PARAMS
+                      value: "--disable_sparse_core_dma_merging=true"
+                    - name: PALLAS_ENABLE_STRICT_DONE_BIT_CHECKS
+                      value: "true"
+                    - name: TPU_MESH_CONTROLLER_TIMEOUT_MS
+                      value: "300000"
+                    - name: LIBTPU_INIT_ARGS
+                      value: "--xla_tpu_all_gather_collective_matmul_mode=post_spmd --xla_tpu_reduce_scatter_collective_matmul_mode=post_spmd"
+                    - name: TPU_MIN_LOG_LEVEL
+                      value: "1"
+                    - name: TF_CPP_MIN_LOG_LEVEL
+                      value: "1"
+                    - name: TPU_STDERR_LOG_LEVEL
+                      value: "0"
+                  ports:
+                    - containerPort: 8471
+                    - containerPort: 8080
+                    - containerPort: 29500
+                  resources:
+                    requests:
+                      google.com/tpu: "4"
+                      ephemeral-storage: "40Gi"
+                    limits:
+                      google.com/tpu: "4"
+                      ephemeral-storage: "100Gi"

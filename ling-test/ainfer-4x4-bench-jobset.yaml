@@ -1,0 +1,146 @@
+# AInfer 4x4 benchmark — 4 independent instances via TPU process isolation.
+#
+# Each Pod overrides TPU_WORKER_HOSTNAMES to see only its own IP,
+# making JAX treat it as a single-host with 4 local chips (tp=4).
+# No jax.distributed.initialize() needed. Full async+multi-step retained.
+#
+# Aggregate throughput = 4 × single-node throughput.
+#
+# Deploy:
+#   kubectl apply -f ainfer-4x4-bench-jobset.yaml
+#
+# Collect all results:
+#   for pod in $(kubectl get pods -l jobset.sigs.k8s.io/jobset-name=ainfer-4x4-bench \
+#       -o jsonpath='{.items[*].metadata.name}'); do
+#     echo "=== $pod ===" && kubectl logs $pod | grep tok_per_s
+#   done
+#
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: ainfer-4x4-bench
+  annotations:
+    alpha.jobset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool
+spec:
+  failurePolicy:
+    maxRestarts: 0
+  replicatedJobs:
+    - name: worker
+      replicas: 1
+      template:
+        spec:
+          parallelism: 4
+          completions: 4
+          backoffLimit: 0
+          template:
+            spec:
+              restartPolicy: Never
+              nodeSelector:
+                cloud.google.com/gke-tpu-accelerator: tpu-v6e-slice
+                cloud.google.com/gke-tpu-topology: "4x4"
+              tolerations:
+                - key: google.com/tpu
+                  operator: Exists
+                  effect: NoSchedule
+              containers:
+                - name: bench
+                  image: python:3.12-slim
+                  command: ["/bin/bash", "-c"]
+                  args:
+                    - |
+                      set -e
+
+                      # ── Force single-host mode ──
+                      # Override GKE-injected TPU_WORKER_HOSTNAMES to isolate
+                      # each Pod to its own 4 chips. JAX sees 4 local devices.
+                      export TPU_WORKER_HOSTNAMES=$(hostname)
+                      export TPU_WORKER_ID=0
+
+                      # ── Install dependencies ──
+                      apt-get update -qq && apt-get install -y -qq git curl && rm -rf /var/lib/apt/lists/*
+                      pip install -q "numpy>=1.26"
+                      pip install -q torch --index-url https://download.pytorch.org/whl/cpu
+                      pip install -q transformers huggingface_hub safetensors tokenizers gcsfs
+                      pip install -q datasets
+                      pip install -q "jax[tpu]==0.10.1" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+                      pip install -q "flax==0.12.4"
+                      pip install -q triton
+                      pip cache purge 2>/dev/null || true
+
+                      python3 -c "import jax; print(f'TPU={jax.device_count()}'); assert jax.device_count()==4"
+
+                      # ── Download model ──
+                      mkdir -p /tmp/models
+                      python3 -c "import gcsfs; fs=gcsfs.GCSFileSystem(); fs.get('${MODEL_GCS_PATH}','${MODEL_DIR}',recursive=True); print('Model OK')"
+
+                      # ── Install AInfer (original, no patches needed) ──
+                      python3 -c "import gcsfs; fs=gcsfs.GCSFileSystem(); fs.get('${AINFER_GCS_PATH}','/tmp/ainfer.tar.gz')"
+                      mkdir -p /app/ainfer && cd /app/ainfer && tar xzf /tmp/ainfer.tar.gz && rm /tmp/ainfer.tar.gz
+                      python3 -c "import gcsfs; fs=gcsfs.GCSFileSystem(); fs.get('${KERNEL_PATCH_GCS_PATH}','/tmp/ksync.tar.gz')"
+                      cd /app/ainfer && tar xzf /tmp/ksync.tar.gz && rm /tmp/ksync.tar.gz
+                      python3 -c "import gcsfs; fs=gcsfs.GCSFileSystem(); fs.get('${ASYNC_PATCH_GCS_PATH}','/app/ainfer/ainfer/engine/tpu_managers/llm_engine.py')"
+                      export PYTHONPATH=/app/ainfer:$PYTHONPATH
+
+                      # ── Download benchmark script ──
+                      python3 -c "import gcsfs; fs=gcsfs.GCSFileSystem(); fs.get('${BENCH_GCS_PATH}','/app/ainfer_bench.py')"
+
+                      # ── Run benchmark ──
+                      echo "=== Node $(hostname): Starting AInfer benchmark (tp=4, independent) ==="
+                      python3 -u /app/ainfer_bench.py
+                  env:
+                    # ── GCS paths ──
+                    - name: MODEL_GCS_PATH
+                      value: "gs://wenqiao-ainfer-test/models/inclusionAI/Ling-mini-2.0"
+                    - name: AINFER_GCS_PATH
+                      value: "gs://ainfer-tpu-bench-code/ainfer-tpu-deploy.tar.gz"
+                    - name: KERNEL_PATCH_GCS_PATH
+                      value: "gs://wenqiao-ainfer-test/wenqiao/ainfer-p11-kernel-sync.tar.gz"
+                    - name: ASYNC_PATCH_GCS_PATH
+                      value: "gs://wenqiao-ainfer-test/wenqiao/async_n4_patch/llm_engine.py"
+                    - name: BENCH_GCS_PATH
+                      value: "gs://wenqiao-ainfer-test/wenqiao/ainfer_bench.py"
+                    # ── Benchmark config ──
+                    - name: MODEL_DIR
+                      value: "/tmp/models/inclusionAI/Ling-mini-2.0"
+                    - name: WARMUP_ROUNDS
+                      value: "1"
+                    - name: TIMED_ROUNDS
+                      value: "2"
+                    # ── AInfer runtime (full optimization) ──
+                    - name: SKIP_XPROF
+                      value: "1"
+                    - name: TPU_COMPILE_CACHE_DIR
+                      value: "gs://wenqiao-ainfer-test/jax_cache/"
+                    - name: AINFER_OVERLAP
+                      value: "1"
+                    - name: AINFER_MULTI_STEP
+                      value: "8"
+                    - name: AINFER_ASYNC_DISPATCH
+                      value: "1"
+                    - name: AINFER_MOE_KERNEL_VERSION
+                      value: "1"
+                    - name: AINFER_MOE_EAGER
+                      value: "0"
+                    - name: TRACE_EXTRACT_WAIT
+                      value: "0"
+                    - name: PALLAS_COMPILER_PARAMS
+                      value: "--disable_sparse_core_dma_merging=true"
+                    - name: PALLAS_ENABLE_STRICT_DONE_BIT_CHECKS
+                      value: "true"
+                    - name: TPU_MESH_CONTROLLER_TIMEOUT_MS
+                      value: "120000"
+                    - name: LIBTPU_INIT_ARGS
+                      value: "--xla_tpu_all_gather_collective_matmul_mode=post_spmd --xla_tpu_reduce_scatter_collective_matmul_mode=post_spmd"
+                    - name: TPU_MIN_LOG_LEVEL
+                      value: "1"
+                    - name: TF_CPP_MIN_LOG_LEVEL
+                      value: "1"
+                    - name: TPU_STDERR_LOG_LEVEL
+                      value: "0"
+                  resources:
+                    requests:
+                      google.com/tpu: "4"
+                      ephemeral-storage: "30Gi"
+                    limits:
+                      google.com/tpu: "4"
+                      ephemeral-storage: "80Gi"

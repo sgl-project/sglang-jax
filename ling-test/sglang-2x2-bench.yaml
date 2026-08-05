@@ -1,0 +1,107 @@
+# sglang-jax 2x2 (4 chips) single-node benchmark on GKE TPU v6e.
+#
+# Prerequisites:
+#   - GKE cluster with 2x2 TPU v6e node pool (1 node, 4 chips)
+#   - Model and sglang-jax source uploaded to GCS (see env vars below)
+#
+# Deploy:
+#   kubectl apply -f sglang-2x2-bench.yaml
+#
+# Monitor:
+#   kubectl logs -f job/sglang-2x2-bench
+#
+# Customize GCS paths:
+#   Edit the env vars MODEL_GCS_PATH, SGLANG_GCS_PATH, BENCH_GCS_PATH below.
+#
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: sglang-2x2-bench
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        cloud.google.com/gke-tpu-accelerator: tpu-v6e-slice
+        cloud.google.com/gke-tpu-topology: "2x2"
+      tolerations:
+        - key: google.com/tpu
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: bench
+          image: python:3.12-slim
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -e
+
+              # ── Install dependencies ──
+              apt-get update -qq && apt-get install -y -qq git curl && rm -rf /var/lib/apt/lists/*
+              pip install -q "numpy>=1.26"
+              pip install -q torch --index-url https://download.pytorch.org/whl/cpu
+              pip install -q transformers huggingface_hub safetensors tokenizers gcsfs
+              pip install -q datasets
+              pip install -q setuptools
+
+              # ── Install sglang-jax ──
+              python3 -c "import gcsfs; fs=gcsfs.GCSFileSystem(); fs.get('${SGLANG_GCS_PATH}','/tmp/sglang-jax.tar.gz')"
+              mkdir -p /app/sglang-jax && cd /app/sglang-jax && tar xzf /tmp/sglang-jax.tar.gz && rm /tmp/sglang-jax.tar.gz
+              cd /app/sglang-jax/python && pip install -e ".[tpu]" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+              pip cache purge 2>/dev/null || true
+
+              python3 -c "import jax; print(f'TPU={jax.device_count()}'); assert jax.device_count()==4"
+
+              # ── Download model and benchmark script ──
+              mkdir -p /tmp/models
+              python3 -c "import gcsfs; fs=gcsfs.GCSFileSystem(); fs.get('${MODEL_GCS_PATH}','${MODEL_DIR}',recursive=True); print('Model OK')"
+              python3 -c "import gcsfs; fs=gcsfs.GCSFileSystem(); fs.get('${BENCH_GCS_PATH}','/app/sglang_bench.py')"
+
+              # ── Run benchmark ──
+              python3 -u /app/sglang_bench.py
+          env:
+            # ── GCS paths (customize these) ──
+            - name: MODEL_GCS_PATH
+              value: "gs://wenqiao-ainfer-test/models/inclusionAI/Ling-mini-2.0"
+            - name: SGLANG_GCS_PATH
+              value: "gs://wenqiao-ainfer-test/sglang-jax.tar.gz"
+            - name: BENCH_GCS_PATH
+              value: "gs://wenqiao-ainfer-test/wenqiao/sglang_bench.py"
+            # ── Benchmark config ──
+            - name: MODEL_DIR
+              value: "/tmp/models/inclusionAI/Ling-mini-2.0"
+            - name: TP_SIZE
+              value: "4"
+            - name: NNODES
+              value: "1"
+            - name: WARMUP_ROUNDS
+              value: "1"
+            - name: TIMED_ROUNDS
+              value: "2"
+            # ── TPU runtime ──
+            - name: SKIP_XPROF
+              value: "1"
+            - name: JAX_COMPILATION_CACHE_DIR
+              value: "gs://wenqiao-ainfer-test/sglang_jax_cache_2x2"
+            - name: PALLAS_COMPILER_PARAMS
+              value: "--disable_sparse_core_dma_merging=true"
+            - name: PALLAS_ENABLE_STRICT_DONE_BIT_CHECKS
+              value: "true"
+            - name: TPU_MESH_CONTROLLER_TIMEOUT_MS
+              value: "120000"
+            - name: LIBTPU_INIT_ARGS
+              value: "--xla_tpu_all_gather_collective_matmul_mode=post_spmd --xla_tpu_reduce_scatter_collective_matmul_mode=post_spmd"
+            - name: TPU_MIN_LOG_LEVEL
+              value: "1"
+            - name: TF_CPP_MIN_LOG_LEVEL
+              value: "1"
+            - name: TPU_STDERR_LOG_LEVEL
+              value: "0"
+          resources:
+            requests:
+              google.com/tpu: "4"
+              ephemeral-storage: "30Gi"
+            limits:
+              google.com/tpu: "4"
+              ephemeral-storage: "80Gi"

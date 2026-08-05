@@ -1,0 +1,85 @@
+# Ling-mini-2.0 GRPO with AInfer rollout on 4x4 TPU v6e (4 workers × 4 chips each)
+# Each worker runs independently with (1,4) mesh using its 4 local chips
+model_config:
+  model_name: "ling-mini-2.0"
+  model_source: "huggingface"
+  model_download_path: "/tmp/models"
+  intermediate_ckpt_dir: "/tmp/intermediate_ckpt/"
+
+reference_model_config:
+  model_id: "inclusionAI/Ling-mini-2.0"
+  mesh: null
+  same_mesh_as: "actor"
+
+actor_model_config:
+  mesh:
+    shape: "(4, 4)"
+    axis_names: "('fsdp','tp')"
+  lora_config:
+    module_path: ".*q_proj|.*k_proj|.*v_proj|.*o_proj|.*gate_proj|.*up_proj|.*down_proj|.*router"
+    rank: 64
+    alpha: 2.0
+
+rollout_model_config:
+  mesh: null
+  same_mesh_as: "actor"
+
+tokenizer_config:
+  tokenizer_type: "huggingface"
+  tokenizer_path: "inclusionAI/Ling-mini-2.0"
+  add_bos: true
+  add_eos: false
+
+data_source: "tfds"
+dataset_name: "gsm8k"
+batch_size: 1
+num_batches: null
+num_train_epochs: 1
+apply_chat_template_to_dataset: true
+tfds_download: true
+offload_to_cpu: false
+
+rl_training_config:
+  max_steps: 5
+  eval_every_n_steps: 5
+  # null = checkpoint manager disabled (checkpoint_manager.py:50). Perf A/B runs
+  # don't need checkpoints; /tmp/ckpts is pod-local (not shared across hosts) and
+  # orbax multi-process save deadlocks → 600s timeout. Disable for these runs.
+  checkpoint_root_directory: null
+  actor_optimizer_config:
+    opt_type: "adamw"
+    learning_rate: 1e-6
+    b1: 0.9
+    b2: 0.95
+    eps: 1e-4
+    weight_decay: 0.0
+
+rollout_config:
+  total_generation_steps: 128
+  max_prompt_length: 256
+  temperature: 0.9
+  top_p: 1.0
+  top_k: 50
+  rollout_ainfer_model_version: "/tmp/models/inclusionAI/Ling-mini-2.0"
+  rollout_ainfer_compile_cache_dir: "gs://wenqiao-ainfer-test/jax_cache_ainfer/"
+  rollout_ainfer_mem_fraction_static: 0.85
+  rollout_ainfer_init_with_random_weights: false
+  rollout_ainfer_multi_step: 8
+  rollout_ainfer_async_dispatch: false  # A2 crashed on tp=16 multi-host (future_tokens.py sharding); deferred to Stage 2 tp=4
+  rollout_ainfer_overlap: false
+  rollout_ainfer_moe_kernel_version: 1
+  rollout_ainfer_max_num_seqs: 32
+  rollout_ainfer_bs_paddings: [1, 2, 4, 8, 16, 32]
+  rollout_ainfer_token_paddings: [128, 256]
+  rollout_ainfer_page_size: 128
+
+rollout_engine: "ainfer"
+
+grpo_config:
+  num_generations: 8
+  num_iterations: 1
+  beta: 0.08
+  epsilon: 0.2
+
+reward_functions:
+  - "tunix/cli/reward_fn/gsm8k.py"

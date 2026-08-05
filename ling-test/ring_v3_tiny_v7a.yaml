@@ -1,0 +1,72 @@
+# ring_v3_tiny (BailingMoeV3: MLA+KDA+MoE) correctness test on TPU v7x.
+# Node pool: tpu-v7-4-a (2x2x1, 4 chips). Cluster: asystem-rl-bench.
+#
+# Deploy:  kubectl apply -f ring_v3_tiny_v7a.yaml
+# Monitor: kubectl logs -f job/ring-v3-tiny-test
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ring-v3-tiny-test
+  namespace: default
+spec:
+  backoffLimit: 0
+  completions: 1
+  parallelism: 1
+  template:
+    spec:
+      containers:
+      - name: test
+        image: python:3.12-slim
+        command: ["/bin/bash","-c"]
+        args:
+        - |
+          set -e
+          export PIP_DEFAULT_TIMEOUT=120; export PIP_RETRIES=10
+          pipi() { for n in 1 2 3 4 5; do pip install -q "$@" && return 0; echo "pip retry $n"; sleep 5; done; return 1; }
+          apt-get update -qq
+          apt-get install -y -qq git curl gnupg lsb-release fuse >/dev/null
+          rm -rf /var/lib/apt/lists/*
+          export GCSFUSE_REPO=gcsfuse-$(lsb_release -c -s)
+          echo "deb https://packages.cloud.google.com/apt $GCSFUSE_REPO main" > /etc/apt/sources.list.d/gcsfuse.list
+          curl -s https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg 2>/dev/null
+          sed -i 's|deb |deb [signed-by=/usr/share/keyrings/cloud.google.gpg] |' /etc/apt/sources.list.d/gcsfuse.list
+          apt-get update -qq && apt-get install -y -qq gcsfuse >/dev/null
+          pipi "numpy>=1.26"
+          pipi torch --index-url https://download.pytorch.org/whl/cpu
+          pipi transformers huggingface_hub safetensors tokenizers gcsfs
+          # ── Install sglang-jax (with TPU deps) ──
+          python3 -c "import gcsfs; fs=gcsfs.GCSFileSystem(); fs.get('${SGLANG_GCS_PATH}','/tmp/sglang-jax.tar.gz')"
+          mkdir -p /app/sglang-jax && cd /app/sglang-jax && tar xzf /tmp/sglang-jax.tar.gz && rm /tmp/sglang-jax.tar.gz
+          cd /app/sglang-jax/python && pipi -e ".[tpu]" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+          pip cache purge 2>/dev/null || true
+          python3 -c "import jax; print('TPU devices:', jax.device_count()); assert jax.device_count()>=4"
+          # ── Mount weights via gcsfuse ──
+          mkdir -p ${MODEL_DIR}
+          gcsfuse --implicit-dirs -o ro --only-dir ${WEIGHTS_SUBDIR} --metadata-cache-ttl-secs=-1 ${WEIGHTS_BUCKET} ${MODEL_DIR}
+          ls -la ${MODEL_DIR}/
+          [ -f "${MODEL_DIR}/config.json" ] || { echo FATAL-noconfig; exit 2; }
+          # ── Fetch test script and run ──
+          python3 -c "import gcsfs; fs=gcsfs.GCSFileSystem(); fs.get('${SCRIPT_GCS_PATH}','/app/test.py')"
+          python3 -u /app/test.py
+        env:
+        - {name: SGLANG_GCS_PATH, value: "gs://ainfer-tpu-bench-code/sglang-jax-v3.tar.gz"}
+        - {name: WEIGHTS_BUCKET, value: "ant_asystem"}
+        - {name: WEIGHTS_SUBDIR, value: "models/ring_v3_tiny"}
+        - {name: SCRIPT_GCS_PATH, value: "gs://ainfer-tpu-bench-code/ring_v3_tiny_test.py"}
+        - {name: MODEL_DIR, value: "/tmp/models/ring_v3_tiny"}
+        - {name: TP_SIZE, value: "8"}
+        - {name: TPU_COMPILE_CACHE_DIR, value: "gs://ant_asystem/compile_cache/ring_v3_tiny_sgljax"}
+        - {name: PALLAS_COMPILER_PARAMS, value: "--disable_sparse_core_dma_merging=true"}
+        - {name: TPU_MIN_LOG_LEVEL, value: "1"}
+        - {name: TF_CPP_MIN_LOG_LEVEL, value: "1"}
+        resources:
+          limits: {ephemeral-storage: 40Gi, google.com/tpu: "4"}
+          requests: {ephemeral-storage: 30Gi, google.com/tpu: "4"}
+        securityContext: {privileged: true}
+      nodeSelector:
+        cloud.google.com/gke-nodepool: tpu-v7-4-a
+        cloud.google.com/gke-tpu-accelerator: tpu7x
+        cloud.google.com/gke-tpu-topology: 2x2x1
+      restartPolicy: Never
+      tolerations:
+      - {effect: NoSchedule, key: google.com/tpu, operator: Equal, value: present}
