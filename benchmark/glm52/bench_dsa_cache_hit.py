@@ -198,7 +198,7 @@ def _run_native_batch_with_admission_barrier(
     *,
     label: str,
     on_admitted: Callable[[], None],
-    timeout_s: float = 60,
+    timeout_s: float = 180,
 ) -> dict:
     """Queue a native batch atomically before releasing the scheduler.
 
@@ -251,7 +251,7 @@ def _run_native_batch_with_admission_barrier(
                         f"expected_min_per_dp={len(input_ids) // len(waiting_sizes) if waiting_sizes else 'unknown'}, "
                         f"observed={waiting_sizes}"
                     )
-                time.sleep(0.1)
+                time.sleep(0.5)
 
             on_admitted()
         finally:
