@@ -1,7 +1,7 @@
 # GLM-5.2 FP8 8-chip stage profile: one cache-hit extend forward and a few
 # decode forwards from one TPU chip on rank 0. The request still runs to 1K
 # output tokens after tracing stops so the serving shape matches the benchmark.
-name: glm52-fused-v2-radix-dp16-c32-128k-one-chip-profile-20260806-r1
+name: glm52-fused-v2-radix-dp16-c32-128k-one-chip-profile-20260806-r2
 exp_type: PROFILING
 artifact_type: trace
 cluster_name: tpu-training-antgroup
@@ -33,7 +33,7 @@ role_to_task_spec:
       export JAX_COMPILATION_CACHE_DIR="${JAX_COMPILATION_CACHE_DIR:-/tmp/tpu_logs/jax-compilation-cache}"
       export SGLANG_PROFILE_MAX_HOSTS=1
       export SGLANG_PROFILE_NUM_CHIPS_PER_TASK=1
-      export LIBTPU_INIT_ARGS="${LIBTPU_INIT_ARGS:+$LIBTPU_INIT_ARGS }--xla_tpu_dvfs_p_state=7 --xla_enable_custom_call_region_trace=true --xla_xprof_register_llo_debug_info=true"
+      export LIBTPU_INIT_ARGS="${LIBTPU_INIT_ARGS:+$LIBTPU_INIT_ARGS }--xla_tpu_dvfs_p_state=7"
 
       OUT="${ARTIFACT_LOCAL_DIR:-/tmp/glm52-fused-v2-radix-dp16-one-chip-profile-artifact}"
       RANK="${FALCON_RANK:-${FALCON_JAX_PROCESS_ID:-${JOB_COMPLETION_INDEX:-0}}}"
