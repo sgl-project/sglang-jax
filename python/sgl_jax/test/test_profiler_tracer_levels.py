@@ -1,10 +1,14 @@
+import os
 import tempfile
 import unittest
 from unittest import mock
 
 import jax
 
-from sgl_jax.srt.managers.scheduler_profiler_mixing import _ProfileManager
+from sgl_jax.srt.managers.scheduler_profiler_mixing import (
+    _ProfileManager,
+    _should_profile_this_process,
+)
 
 
 class TestProfilerTracerLevels(unittest.TestCase):
@@ -41,6 +45,13 @@ class TestProfilerTracerLevels(unittest.TestCase):
         options = self._captured_options(host_tracer_level=3, python_tracer_level=1)
         self.assertEqual(options.host_tracer_level, 3)
         self.assertEqual(options.python_tracer_level, 1)
+
+    def test_profile_max_hosts_limits_pjrt_processes(self):
+        with mock.patch.dict(os.environ, {"SGLANG_PROFILE_MAX_HOSTS": "1"}):
+            with mock.patch.object(jax, "process_index", return_value=0):
+                self.assertTrue(_should_profile_this_process())
+            with mock.patch.object(jax, "process_index", return_value=1):
+                self.assertFalse(_should_profile_this_process())
 
 
 if __name__ == "__main__":

@@ -12,6 +12,21 @@ from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 logger = logging.getLogger(__name__)
 
 
+def _should_profile_this_process() -> bool:
+    """Whether this PJRT process is inside the requested host trace limit."""
+
+    raw_max_hosts = os.getenv("SGLANG_PROFILE_MAX_HOSTS")
+    if raw_max_hosts is None:
+        return True
+    try:
+        max_hosts = int(raw_max_hosts)
+    except ValueError as exc:
+        raise ValueError("SGLANG_PROFILE_MAX_HOSTS must be a positive integer") from exc
+    if max_hosts <= 0:
+        raise ValueError("SGLANG_PROFILE_MAX_HOSTS must be a positive integer")
+    return jax.process_index() < max_hosts
+
+
 def _get_stage_from_forward_mode(forward_mode: ForwardMode) -> str | None:
     if forward_mode.is_prefill():
         return "prefill"
@@ -126,6 +141,14 @@ class _ProfileManager:
         self._trigger.reset()
 
     def _do_start(self, stage: str):
+        if not _should_profile_this_process():
+            logger.info(
+                "Stage-based profiling skipped on process %d due to "
+                "SGLANG_PROFILE_MAX_HOSTS",
+                jax.process_index(),
+            )
+            return
+
         stage_dir = os.path.join(self._output_dir, stage)
         Path(stage_dir).mkdir(parents=True, exist_ok=True)
         logger.info("Stage-based profiling: starting trace for '%s' -> %s", stage, stage_dir)
@@ -156,6 +179,7 @@ class SchedulerProfilerMixin:
         self.profile_in_progress: bool = False
         self.host_tracer_level: int | None = None
         self.python_tracer_level: int | None = None
+        self.profiler_trace_active: bool = False
         self._profile_manager = _ProfileManager()
 
     def start_profile(
@@ -221,7 +245,17 @@ class SchedulerProfilerMixin:
         print(f"profiler_options: {profiler_options}")
 
         if os.getenv("JAX_PLATFORMS") != "proxy":
-            jax.profiler.start_trace(self.profiler_output_dir, profiler_options=profiler_options)
+            if _should_profile_this_process():
+                jax.profiler.start_trace(
+                    self.profiler_output_dir,
+                    profiler_options=profiler_options,
+                )
+                self.profiler_trace_active = True
+            else:
+                logger.info(
+                    "Profiling skipped on process %d due to SGLANG_PROFILE_MAX_HOSTS",
+                    jax.process_index(),
+                )
         elif self.profiler_output_dir.startswith("gs://"):
             # Pathways: worker device trace only. Client-side python tracer
             # OOMs head pod on stop (millions of events); patch it out.
@@ -234,11 +268,13 @@ class SchedulerProfilerMixin:
                 profiler_options=profiler_options,
                 max_num_hosts=int(os.getenv("SGLANG_PROFILE_MAX_HOSTS", "8")),
             )
+            self.profiler_trace_active = True
         else:
             # Pathways local: client-side host trace only (bypass worker RPC)
             from pathwaysutils.profiling import _original_start_trace
 
             _original_start_trace(self.profiler_output_dir, profiler_options=profiler_options)
+            self.profiler_trace_active = True
 
         self.profile_in_progress = True
         return ProfileReqOutput(success=True, message="Succeeded")
@@ -300,14 +336,19 @@ class SchedulerProfilerMixin:
             )
 
         logger.info("Stop profiling...")
-        if os.getenv("JAX_PLATFORMS") != "proxy" or self.profiler_output_dir.startswith("gs://"):
-            jax.profiler.stop_trace()
-        else:
-            if not Path(self.profiler_output_dir).exists():
-                Path(self.profiler_output_dir).mkdir(parents=True, exist_ok=True)
-            from pathwaysutils.profiling import _original_stop_trace
+        if self.profiler_trace_active:
+            if (
+                os.getenv("JAX_PLATFORMS") != "proxy"
+                or self.profiler_output_dir.startswith("gs://")
+            ):
+                jax.profiler.stop_trace()
+            else:
+                if not Path(self.profiler_output_dir).exists():
+                    Path(self.profiler_output_dir).mkdir(parents=True, exist_ok=True)
+                from pathwaysutils.profiling import _original_stop_trace
 
-            _original_stop_trace()
+                _original_stop_trace()
+            self.profiler_trace_active = False
 
         logger.info(
             "Profiling done. Traces are saved to: %s",
