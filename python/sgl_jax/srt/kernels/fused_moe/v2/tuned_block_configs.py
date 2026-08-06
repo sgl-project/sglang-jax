@@ -88,6 +88,9 @@ TUNED_BLOCK_CONFIGS: dict[str, dict[tuple, tuple[int, ...]]] = {
         ('bfloat16', 'float8_e4m3fn', 4096, 256, 8, 6144, 2048, 32, True, False, True): (128, 1024, 32, 1024, 160),
         ('bfloat16', 'float8_e4m3fn', 8192, 256, 8, 6144, 2048, 32, True, False, True): (128, 1024, 32, 1024, 160),
         ('bfloat16', 'float8_e4m3fn', 16384, 256, 8, 6144, 2048, 32, True, False, True): (128, 1024, 32, 1024, 160),
+        # 65536 uses interleave_bt=False. Broad-tuned on 2026-08-06 with
+        # Falcon exp-xcd5xzd8tk and confirmed by exp-aj0v4d01se.
+        ('bfloat16', 'float8_e4m3fn', 65536, 256, 8, 6144, 2048, 32, True, False, True): (128, 1024, 32, 1024, 160),
         # Ling 2.6-1T: E=256, H=8192, I=2048, top_k=8, fp8 e4m3 per-channel, ep=32
         # Tuned 2026-05-27
         ('bfloat16', 'float8_e4m3fn', 64, 256, 8, 8192, 2048, 32, False, True): (8, 256, 8, 256, 8),
