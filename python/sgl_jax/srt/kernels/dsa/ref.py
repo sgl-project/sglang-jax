@@ -12,6 +12,8 @@ import functools
 import jax
 import jax.numpy as jnp
 
+from sgl_jax.srt.kernels.dsa.topk import select_indexer_topk
+
 _NEG_INF = float("-inf")
 
 
@@ -50,12 +52,12 @@ def build_index_share_map(
 
 @functools.partial(
     jax.jit,
-    static_argnames=("k", "pages_per_seq", "one_token_per_seq", "exact"),
+    static_argnames=("k", "pages_per_seq", "one_token_per_seq", "topk_impl"),
 )
-def streamindex_topk_ref(
-    q: jax.Array,
-    weights: jax.Array,
-    cache_kv: jax.Array,
+def score_and_select_index_tokens(
+    q_idx: jax.Array,
+    idx_weights: jax.Array,
+    index_key_cache: jax.Array,
     seq_lens: jax.Array,
     page_indices: jax.Array,
     cu_q_lens: jax.Array,
@@ -65,9 +67,9 @@ def streamindex_topk_ref(
     k: int,
     pages_per_seq: int,
     one_token_per_seq: bool = False,
-    exact: bool = False,
+    topk_impl: str,
 ) -> jax.Array:
-    """Reference lightning-indexer top-k.
+    """Score cached index keys and select the top-k token positions.
 
     ``one_token_per_seq=True`` (decode: T == num_seqs, token i belongs to
     seq i) scores only each iteration's own query row — O(S * max_kv) total
@@ -77,12 +79,12 @@ def streamindex_topk_ref(
     sits before the head sum, the naive ``[T, H, max_kv]`` intermediate OOMs
     at chunked-prefill sizes; instead we accumulate over the H heads (H=32)
     with a ``fori_loop`` so peak memory is a single ``[T, max_kv]`` buffer,
-    then take ``top_k`` once via XLA (Pallas TPU has no ``top_k`` lowering).
+    then hand that score buffer to the configured top-k selection backend.
 
     Args:
-      q:            f[T, H, D]  indexer query heads
-      weights:      f[T, H]     per-head mixing weights
-      cache_kv:     f[P, page_size, D]  paged indexer keys
+      q_idx:         f[T, H, D]  indexer query heads
+      idx_weights:   f[T, H]     per-head mixing weights
+      index_key_cache: f[P, page_size, D]  paged indexer keys
       seq_lens:     i32[S]      kv length per sequence
       page_indices: i32[N_pages]  packed; seq i's pages start at cu_kv_lens[i]//page_size
       cu_q_lens:    i32[S+1]
@@ -90,18 +92,18 @@ def streamindex_topk_ref(
       distribution: i32[3]      (decode_end, prefill_end, num_seqs)
       k:            top-k budget
       pages_per_seq: static, maximum pages materialized per sequence
-      exact: use only ``lax.top_k``. This is the functional bring-up path for
-        the exact DSA kernel until the optimized StreamIndex kernel is wired.
+      topk_impl: selection backend: approximate XLA, exact XLA, or exact
+        SparseCore radix selection (``approx``, ``exact_lax``, or ``radix``).
 
     Returns:
       i32[T, k]  top-k kv positions per query token; -1 for padding.
     """
-    T, H, D = q.shape
-    page_size = cache_kv.shape[1]
+    T, H, D = q_idx.shape
+    page_size = index_key_cache.shape[1]
     max_kv = pages_per_seq * page_size
     num_seqs = seq_lens.shape[0]
 
-    w = weights.astype(jnp.float32)
+    idx_weights_f32 = idx_weights.astype(jnp.float32)
     out = jnp.full((T, k), -1, dtype=jnp.int32)
     if one_token_per_seq:
 
@@ -110,21 +112,16 @@ def streamindex_topk_ref(
             seq_pages = jax.lax.dynamic_slice_in_dim(
                 page_indices, cu_kv_lens[seq_id] // page_size, pages_per_seq
             )
-            keys = cache_kv[seq_pages].reshape(max_kv, D)
-            q_i = jax.lax.dynamic_slice_in_dim(q, seq_id, 1, axis=0)  # [1, H, D]
-            w_i = jax.lax.dynamic_slice_in_dim(w, seq_id, 1, axis=0)  # [1, H]
-            s = jnp.einsum("thd,kd->thk", q_i, keys, preferred_element_type=jnp.float32)
-            scores = jnp.einsum("th,thk->tk", w_i, jax.nn.relu(s))  # [1, max_kv]
+            seq_k_idx = index_key_cache[seq_pages].reshape(max_kv, D)
+            q_idx_i = jax.lax.dynamic_slice_in_dim(q_idx, seq_id, 1, axis=0)  # [1, H, D]
+            idx_weights_i = jax.lax.dynamic_slice_in_dim(
+                idx_weights_f32, seq_id, 1, axis=0
+            )  # [1, H]
+            s = jnp.einsum("thd,kd->thk", q_idx_i, seq_k_idx, preferred_element_type=jnp.float32)
+            scores = jnp.einsum("th,thk->tk", idx_weights_i, jax.nn.relu(s))  # [1, max_kv]
             mask = (jnp.arange(max_kv) < kv_len)[None, :]
             scores = jnp.where(mask, scores, _NEG_INF)
-            if exact:
-                vals, idx = jax.lax.top_k(scores, k)
-            else:
-                cand_v, cand_i = jax.lax.approx_max_k(
-                    scores, k, recall_target=0.70, aggregate_to_topk=False
-                )
-                vals, sel = jax.lax.top_k(cand_v, k)
-                idx = jnp.take_along_axis(cand_i, sel, axis=-1)
+            vals, idx = select_indexer_topk(scores, k=k, implementation=topk_impl)
             n_valid = mask.sum(-1, keepdims=True)
             idx = jnp.where((jnp.arange(k)[None, :] < n_valid) & (vals > _NEG_INF), idx, -1)
             return jax.lax.dynamic_update_slice_in_dim(out, idx, seq_id, axis=0)
@@ -138,7 +135,7 @@ def streamindex_topk_ref(
         seq_pages = jax.lax.dynamic_slice_in_dim(
             page_indices, cu_kv_lens[seq_id] // page_size, pages_per_seq
         )
-        keys = cache_kv[seq_pages].reshape(max_kv, D)
+        seq_k_idx = index_key_cache[seq_pages].reshape(max_kv, D)
 
         kv_pos = jnp.arange(max_kv)
 
@@ -148,34 +145,29 @@ def streamindex_topk_ref(
         mask = in_seq_q[:, None] & (kv_pos[None, :] < kv_len) & (kv_pos[None, :] <= abs_q[:, None])
 
         if T * H * max_kv <= 1 << 26:
-            s = jnp.einsum("thd,kd->thk", q, keys, preferred_element_type=jnp.float32)
-            scores = jnp.einsum("th,thk->tk", w, jax.nn.relu(s))
+            s = jnp.einsum("thd,kd->thk", q_idx, seq_k_idx, preferred_element_type=jnp.float32)
+            scores = jnp.einsum("th,thk->tk", idx_weights_f32, jax.nn.relu(s))
         else:
 
             def h_step(h, acc):
-                q_h = jax.lax.dynamic_index_in_dim(q, h, axis=1, keepdims=False)
-                w_h = jax.lax.dynamic_index_in_dim(w, h, axis=1, keepdims=True)
-                s_h = jnp.einsum("td,kd->tk", q_h, keys, preferred_element_type=jnp.float32)
-                return acc + jax.nn.relu(s_h) * w_h
+                q_idx_h = jax.lax.dynamic_index_in_dim(q_idx, h, axis=1, keepdims=False)
+                idx_weights_h = jax.lax.dynamic_index_in_dim(
+                    idx_weights_f32, h, axis=1, keepdims=True
+                )
+                s_h = jnp.einsum(
+                    "td,kd->tk", q_idx_h, seq_k_idx, preferred_element_type=jnp.float32
+                )
+                return acc + jax.nn.relu(s_h) * idx_weights_h
 
             scores = jax.lax.fori_loop(0, H, h_step, jnp.zeros((T, max_kv), jnp.float32))
         scores = jnp.where(mask, scores, _NEG_INF)
-        # Two-stage approx topk: aggregate_to_topk=False skips the internal
-        # sort (returns L>=k unsorted candidates) which is the dominant cost;
-        # a second top_k over the small candidate set is cheap. On v7x @128K:
-        # 0.35ms vs 0.57ms (agg=True) vs 1.35ms (exact). recall ~95%.
-        if exact:
-            vals, idx = jax.lax.top_k(scores, k)
-        else:
-            cand_v, cand_i = jax.lax.approx_max_k(
-                scores, k, recall_target=0.70, aggregate_to_topk=False
-            )
-            vals, sel = jax.lax.top_k(cand_v, k)
-            idx = jnp.take_along_axis(cand_i, sel, axis=-1)
+        # Score construction is shared by all selection implementations. The
+        # adapter owns approximate candidate refinement and exact radix ordering.
+        vals, idx = select_indexer_topk(scores, k=k, implementation=topk_impl)
         n_valid = mask.sum(-1, keepdims=True)
-        # approx_max_k with recall<1 may return -inf-scored (out-of-range)
-        # candidates inside the top n_valid slots on TPU; guard both by rank
-        # and by value so downstream sparse_mla never gathers stale kv slots.
+        # Approximate selection and radix input padding can return -inf-scored
+        # candidates. Guard both by rank and by value so downstream sparse MLA
+        # never gathers stale cache slots.
         idx = jnp.where((jnp.arange(k)[None, :] < n_valid) & (vals > _NEG_INF), idx, -1)
         return jnp.where(in_seq_q[:, None], idx, out)
 
@@ -206,7 +198,7 @@ def streamindex_page_topk_ref(
     path's O(S * T * max_kv), which collapses under multi-request decode
     (each iteration would score the full [T, max_kv] and mask all but one row).
 
-    Vs the token-level path (``streamindex_topk_ref`` + page union, which
+    Vs the token-level path (``score_and_select_index_tokens`` + page union, which
     saturates k_pages_max at long context): the page budget is exact, the
     top_k runs over [T, pages_per_seq] instead of [T, max_kv] (page_size×
     smaller), and sparse-MLA cost becomes a true O(k_pages) flat.

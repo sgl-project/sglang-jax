@@ -15,7 +15,7 @@ import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 from jax.tree_util import register_pytree_node_class
 
-from sgl_jax.srt.kernels.dsa.ref import streamindex_topk_ref
+from sgl_jax.srt.kernels.dsa.ref import score_and_select_index_tokens
 from sgl_jax.srt.layers.attention.dsa_cache_ops import scatter_paged_cache
 from sgl_jax.srt.utils.profiling_utils import named_scope
 
@@ -50,7 +50,7 @@ def update_index_cache_and_select(
     *,
     index_topk: int,
     compute_topk: bool,
-    exact_topk: bool,
+    topk_impl: str,
     one_token_per_seq: bool,
     attention_data_partition_axis: str = "data",
 ) -> DSAIndexerOutput:
@@ -90,7 +90,7 @@ def update_index_cache_and_select(
         )
 
         if compute_topk:
-            topk = streamindex_topk_ref(
+            topk = score_and_select_index_tokens(
                 q_,
                 w_,
                 cache3d,
@@ -102,7 +102,7 @@ def update_index_cache_and_select(
                 k=index_topk,
                 pages_per_seq=pages_per_seq,
                 one_token_per_seq=one_token_per_seq,
-                exact=exact_topk,
+                topk_impl=topk_impl,
             )
         else:
             # Keep shard_map's output tree static.  The placeholder is discarded

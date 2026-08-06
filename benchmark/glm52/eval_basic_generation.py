@@ -46,9 +46,7 @@ def main() -> None:
         if "\ufffd" in generated:
             raise RuntimeError(f"invalid replacement character for prompt {prompt_id}")
         if int(meta.get("completion_tokens", 0)) < 1:
-            raise RuntimeError(
-                f"no completion tokens for prompt {prompt_id}: {payload}"
-            )
+            raise RuntimeError(f"no completion tokens for prompt {prompt_id}: {payload}")
         results.append(
             {
                 "prompt_id": prompt_id,
