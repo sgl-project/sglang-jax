@@ -29,21 +29,15 @@ def _reference(q_latent, q_rope, cache, slots, counts, scale):
     probabilities = jax.nn.softmax(scores, axis=-1) * valid[:, None, :]
     normalizer = jnp.maximum(probabilities.sum(axis=-1, keepdims=True), 1.0e-30)
     probabilities /= normalizer
-    return jnp.einsum(
-        "qhk,qkv->qhv", probabilities, gathered[..., : q_latent.shape[-1]]
-    )
+    return jnp.einsum("qhk,qkv->qhv", probabilities, gathered[..., : q_latent.shape[-1]])
 
 
 def test_exact_dsa_matches_reference() -> None:
     _require_sparse_core_tpu()
     q_size, heads, latent, rope, topk, cache_size = 128, 8, 512, 64, 128, 512
     keys = jax.random.split(jax.random.PRNGKey(17), 4)
-    q_latent = (jax.random.normal(keys[0], (q_size, heads, latent)) * 0.1).astype(
-        jnp.bfloat16
-    )
-    q_rope = (jax.random.normal(keys[1], (q_size, heads, rope)) * 0.1).astype(
-        jnp.bfloat16
-    )
+    q_latent = (jax.random.normal(keys[0], (q_size, heads, latent)) * 0.1).astype(jnp.bfloat16)
+    q_rope = (jax.random.normal(keys[1], (q_size, heads, rope)) * 0.1).astype(jnp.bfloat16)
     cache = (jax.random.normal(keys[2], (cache_size, 640)) * 0.1).astype(jnp.bfloat16)
     slots = jax.random.randint(keys[3], (q_size, topk), 0, cache_size, dtype=jnp.int32)
     counts = (jnp.arange(q_size, dtype=jnp.int32) * 13) % (topk + 1)

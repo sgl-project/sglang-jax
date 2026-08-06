@@ -123,6 +123,9 @@ global layer_id
 | [`GlmDsaLayerPlan`](../../python/sgl_jax/srt/models/glm5_moe.py) | 一次性固化每层 dense/full/shared、cache slot 与是否需要产出 top-k |
 | [`GlmDsaIndexer`](../../python/sgl_jax/srt/models/glm5_moe.py) | projection、cache slot 所有权、调用 index cache write/top-k |
 | [`update_index_cache_and_select`](../../python/sgl_jax/srt/layers/attention/dsa_indexer_ops.py) | 单一 `shard_map` 内的函数式 cache write 和 token top-k |
+| [`select_indexer_topk`](../../python/sgl_jax/srt/kernels/dsa/topk.py) | 将 `approx`、`exact_lax`、`radix` 统一成有序的 `(values, indices)` ABI，并处理 radix 输入对齐 |
+| [`radix_topk_pallas`](../../python/sgl_jax/srt/kernels/radix_topk/__init__.py) | 稳定的公共 kernel 入口；当前导出 versioned `v1` SparseCore 实现 |
+| [`tuned_configs`](../../python/sgl_jax/srt/kernels/radix_topk/tuned_configs.py) | 按 TPU 设备和 `(score_size, topk)` 查询 radix 静态参数；未命中时回退安全默认值 |
 | [`Glm5Attention`](../../python/sgl_jax/srt/models/glm5_moe.py) | 按 layer plan 调用 full Indexer或消费 shared top-k，并调用 Attention |
 | [`Glm5Model`](../../python/sgl_jax/srt/models/glm5_moe.py) | 维护最近 full layer 的 `topk_indices`，汇总两类 cache 更新 |
 | [`DSASparseAttentionBackend`](../../python/sgl_jax/srt/layers/attention/dsa_sparse_backend.py) | 消费最终 top-k，更新 MLA KV cache，执行 dense/exact sparse MLA |
@@ -132,6 +135,7 @@ global layer_id
 
 - score 仍为 `sum_h(relu(q_h @ k) * weight_h)`；
 - `index_topk` 仍由模型 config 控制；
+- `dsa_topk_impl` 只选择 top-k backend，模型层不感知 radix 的窗口和 digit 参数；
 - 无效和 padding 位置仍输出 `-1`；
 - 当前 token 的 index key 和 latent KV 都在本轮 attention 前完成函数式写入；
 - full layer 才运行新的 Indexer，shared layer 复用最近 full layer 的结果；

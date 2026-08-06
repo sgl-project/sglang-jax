@@ -17,7 +17,6 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
 
-
 _SC_GATHER_WINDOW = 128
 
 
@@ -145,7 +144,9 @@ def _sparse_core_gather(
                     output_bf16[
                         pl.ds(0, row_subchunk_size),
                         pl.ds(column, 32),
-                    ] = jnp.stack(rows, axis=0).astype(jnp.bfloat16)
+                    ] = jnp.stack(
+                        rows, axis=0
+                    ).astype(jnp.bfloat16)
 
             data_pipeline(
                 table_hbm.bitcast(jnp.int32),

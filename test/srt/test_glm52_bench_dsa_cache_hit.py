@@ -3,7 +3,6 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
-
 BENCHMARK_PATH = (
     Path(__file__).resolve().parents[2] / "benchmark" / "glm52" / "bench_dsa_cache_hit.py"
 )

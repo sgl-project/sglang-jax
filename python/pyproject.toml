@@ -149,6 +149,7 @@ ignore = [
 "sgl_jax/srt/kernels/fused_moe/v1/kernel.py" = ["B023"]
 "sgl_jax/srt/kernels/fused_moe/v2/kernel.py" = ["B023", "F841", "SIM102", "SIM108"]
 "sgl_jax/srt/kernels/mla/v2/kernel.py" = ["B023"]
+"sgl_jax/srt/kernels/radix_topk/v1/kernel.py" = ["B023"]
 # TPU benchmark/debug scripts intentionally initialize distributed JAX before
 # importing local kernels, and benchmark closures capture loop-state values.
 "sgl_jax/srt/kernels/fused_moe/v2/bench_compare.py" = ["B023", "E402"]

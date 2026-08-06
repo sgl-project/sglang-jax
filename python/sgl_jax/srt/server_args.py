@@ -1418,11 +1418,11 @@ class ServerArgs:
         )
         parser.add_argument(
             "--dsa-topk-impl",
-            choices=["approx", "exact_lax"],
+            choices=["approx", "exact_lax", "radix"],
             default=ServerArgs.dsa_topk_impl,
             help=(
-                "Lightning-indexer selection implementation. exact_lax is a correctness-first "
-                "functional fallback until the optimized exact top-k kernel is integrated."
+                "Lightning-indexer selection implementation: approximate XLA, exact XLA, "
+                "or exact SparseCore radix top-k."
             ),
         )
         parser.add_argument(

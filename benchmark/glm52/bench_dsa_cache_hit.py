@@ -116,8 +116,7 @@ def _run_native_batch(
             int(final_meta[i].get("cached_tokens", 0)) for i in range(len(input_ids))
         ],
         "completion_tokens": [
-            int(final_meta[i].get("completion_tokens", 0))
-            for i in range(len(input_ids))
+            int(final_meta[i].get("completion_tokens", 0)) for i in range(len(input_ids))
         ],
     }
 
@@ -148,9 +147,7 @@ def main() -> None:
     )
     if args.prefix_mode == "shared":
         if args.dp_size > args.concurrency:
-            raise ValueError(
-                "dp_size cannot exceed concurrency for shared-prefix warmup"
-            )
+            raise ValueError("dp_size cannot exceed concurrency for shared-prefix warmup")
         # With round-robin DP scheduling, one identical request per rank installs
         # the shared prefix on every rank. The measured C=2/DP batch can then hit
         # the same rank-local prefix without recomputing 32 independent prefixes.
@@ -172,9 +169,7 @@ def main() -> None:
             f"expected>={minimum_expected_hit}"
         )
     if measured["completion_tokens"] != [args.output_len] * args.concurrency:
-        raise RuntimeError(
-            f"completion invariant failed: {measured['completion_tokens']}"
-        )
+        raise RuntimeError(f"completion invariant failed: {measured['completion_tokens']}")
 
     ttft = measured["ttft_s"]
     decode = measured["decode_s"]
@@ -198,9 +193,7 @@ def main() -> None:
         "decode_p50_s": statistics.median(decode),
         "tpot_p50_ms": statistics.median(tpots_ms),
         "tpot_p95_ms": _percentile(tpots_ms, 0.95),
-        "output_throughput_tok_s": args.concurrency
-        * args.output_len
-        / measured["wall_s"],
+        "output_throughput_tok_s": args.concurrency * args.output_len / measured["wall_s"],
         "cached_tokens_min": min(measured["cached_tokens"]),
         "cached_tokens_max": max(measured["cached_tokens"]),
         "cached_tokens": measured["cached_tokens"],

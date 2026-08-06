@@ -218,7 +218,7 @@ class GlmDsaIndexer(nnx.Module):
         self.mesh = mesh
         self.topk_impl = topk_impl
         self.attention_data_partition_axis = attention_data_partition_axis
-        if topk_impl not in ("approx", "exact_lax"):
+        if topk_impl not in ("approx", "exact_lax", "radix"):
             raise ValueError(f"unknown DSA top-k implementation: {topk_impl}")
 
         self.wq_b = LinearBase(
@@ -319,7 +319,7 @@ class GlmDsaIndexer(nnx.Module):
             metadata,
             index_topk=self.index_topk,
             compute_topk=compute_topk,
-            exact_topk=self.topk_impl == "exact_lax",
+            topk_impl=self.topk_impl,
             one_token_per_seq=forward_batch.forward_mode.is_decode(),
             attention_data_partition_axis=self.attention_data_partition_axis,
         )
