@@ -625,9 +625,9 @@ class ModelRunnerKVCacheMixin:
     ):
         """Build dense-MLA and sparse-DSA layer pools behind one router.
 
-        Both children intentionally use ``MLATokenToKVPool`` today. Keeping
-        them as independent children makes the future DSA kernel layout a
-        local substitution without changing model or allocator interfaces.
+        Dense MLA keeps the packed 4D Pallas ABI. Exact DSA stores cache pages
+        natively as ``[num_pages, page_size, dim]`` so its scatter/gather path
+        does not copy every full cache layer through a physical 4D<->3D reshape.
         """
 
         from sgl_jax.srt.kernels.dsa.ref import build_index_share_map
@@ -679,6 +679,8 @@ class ModelRunnerKVCacheMixin:
         pools = {}
         for pool_name, layer_ids in layer_ids_by_pool.items():
             child_kwargs = dict(pool_kwargs)
+            if pool_name == "dsa" and self.server_args.dsa_sparse_impl == "exact":
+                child_kwargs["page_layout"] = "flat"
             if pool_name == indexer_pool_name:
                 child_kwargs.update(
                     indexer_key_dim=config.index_head_dim,
@@ -690,10 +692,10 @@ class ModelRunnerKVCacheMixin:
             )
 
         logger.info(
-            "DSA layerwise KV pool: MLA layers=%s, DSA layers=%s; "
-            "both currently use MLATokenToKVPool layout",
+            "DSA layerwise KV pool: MLA layers=%s, DSA layers=%s, DSA layout=%s",
             dense_layer_ids,
             dsa_layer_ids,
+            "flat" if self.server_args.dsa_sparse_impl == "exact" else "mla",
         )
         return LayerwiseHybridKVPool(
             pools=pools,

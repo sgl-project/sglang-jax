@@ -261,6 +261,104 @@ def test_scatter_fused_kv_matches_mla_cache_layout():
     assert not np.any(out[0, :2, 576:])
 
 
+def test_exact_dsa_pool_uses_native_flat_page_layout():
+    from jax.sharding import Mesh
+
+    from sgl_jax.srt.mem_cache.memory_pool import MLATokenToKVPool
+
+    mesh = Mesh(np.asarray(jax.devices()).reshape(1, 1), ("data", "tensor"))
+    common = {
+        "size": 128,
+        "page_size": 64,
+        "dtype": jnp.bfloat16,
+        "kv_lora_rank": 512,
+        "qk_rope_head_dim": 64,
+        "layer_num": 1,
+        "mesh": mesh,
+        "indexer_key_dim": 128,
+        "num_indexer_layers": 1,
+    }
+    mla_pool = MLATokenToKVPool(**common)
+    dsa_pool = MLATokenToKVPool(**common, page_layout="flat")
+
+    assert mla_pool.kv_buffer[0].shape == (3, 32, 2, 640)
+    assert dsa_pool.kv_buffer[0].shape == (3, 64, 640)
+    assert dsa_pool.indexer_key_buffer[0].shape == (3, 64, 128)
+    assert dsa_pool.kv_sharding.spec == jax.sharding.PartitionSpec("data", None, None)
+    assert dsa_pool.get_kv_size_bytes() == mla_pool.get_kv_size_bytes()
+
+    leaves, tree = jax.tree_util.tree_flatten(dsa_pool)
+    restored = jax.tree_util.tree_unflatten(tree, leaves)
+    assert restored.page_layout == "flat"
+    assert restored.kv_buffer[0].shape == dsa_pool.kv_buffer[0].shape
+
+
+def test_exact_dsa_backend_preserves_native_cache_layout(monkeypatch):
+    from jax.sharding import Mesh, NamedSharding
+    from jax.sharding import PartitionSpec as P
+
+    import sgl_jax.srt.layers.attention.dsa_sparse_backend as dsa_backend
+    from sgl_jax.srt.layers.attention.mla_backend import MLAAttentionMetadata
+
+    mesh = Mesh(np.asarray(jax.devices()).reshape(1, 1), ("data", "tensor"))
+
+    def put(value, spec):
+        return jax.device_put(value, NamedSharding(mesh, spec))
+
+    backend = dsa_backend.DSASparseAttentionBackend(
+        sparse_impl="exact",
+        num_attn_heads=1,
+        kv_lora_rank=4,
+        qk_nope_head_dim=4,
+        qk_rope_head_dim=2,
+        v_head_dim=4,
+        page_size=4,
+        mesh=mesh,
+        vmem_limit_bytes=1 << 20,
+    )
+
+    def fake_exact_attention(q, qpe, cache, slots, counts, scale, **kwargs):
+        del qpe, cache, slots, counts, scale, kwargs
+        return jnp.zeros_like(q)
+
+    monkeypatch.setattr(
+        dsa_backend, "sparse_core_tensor_core_dsa", fake_exact_attention
+    )
+    metadata = MLAAttentionMetadata(
+        cu_q_lens=put(jnp.array([0, 1], jnp.int32), P("data")),
+        cu_kv_lens=put(jnp.array([0, 4], jnp.int32), P("data")),
+        page_indices=put(jnp.array([0], jnp.int32), P("data")),
+        seq_lens=put(jnp.array([1], jnp.int32), P("data")),
+        distribution=put(jnp.array([0, 1, 1], jnp.int32), P("data")),
+    )
+    common_args = (
+        put(jnp.ones((1, 1, 4), jnp.bfloat16), P("data", "tensor", None)),
+        put(jnp.ones((1, 1, 2), jnp.bfloat16), P("data", "tensor", None)),
+        put(jnp.arange(4, dtype=jnp.bfloat16).reshape(1, 4), P("data", None)),
+        put(jnp.arange(2, dtype=jnp.bfloat16).reshape(1, 2), P("data", None)),
+    )
+    topk = put(jnp.array([[0]], jnp.int32), P("data", None))
+
+    with jax.set_mesh(mesh):
+        flat = put(jnp.zeros((2, 4, 256), jnp.bfloat16), P("data", None, None))
+        packed = put(
+            jnp.zeros((2, 2, 2, 256), jnp.bfloat16),
+            P("data", None, None, None),
+        )
+        _, flat_out = backend._run_exact(
+            *common_args, flat, topk, 1.0, "data", metadata
+        )
+        _, packed_out = backend._run_exact(
+            *common_args, packed, topk, 1.0, "data", metadata
+        )
+
+    assert flat_out.shape == flat.shape
+    assert packed_out.shape == packed.shape
+    np.testing.assert_array_equal(
+        np.asarray(flat_out), np.asarray(packed_out).reshape(flat.shape)
+    )
+
+
 def test_sparse_mla_multi_seq_packed_layout():
     """Regression: page_indices is packed at cu_kv_lens[i]//page_size (variable
     stride via cumsum(aligned_lens)), NOT seq_id*pages_per_seq. With 2 seqs of

@@ -134,12 +134,13 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
 
     def _run_exact(self, ql, qpe, kvc, kpe, cache, topk, sm_scale, dpa, md):
         """Write the fused KV cache, map logical top-k to slots, then attend."""
+        cache_spec = P(dpa, None, None) if cache.ndim == 3 else P(dpa, None, None, None)
         in_specs = (
             P(dpa, "tensor", None),
             P(dpa, "tensor", None),
             P(dpa, None),
             P(dpa, None),
-            P(dpa, None, None, None),
+            cache_spec,
             P(dpa, None),
             P(dpa),
             P(dpa),
@@ -147,12 +148,17 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             P(dpa),
             P(dpa),
         )
-        out_specs = (P(dpa, "tensor", None), P(dpa, None, None, None))
+        out_specs = (P(dpa, "tensor", None), cache_spec)
 
         def _run(ql_, qpe_, kvc_, kpe_, cache_, topk_, seq_lens_, pi_, cuq_, cukv_, dist_):
             del dist_
-            page_size = cache_.shape[1] * cache_.shape[2]
-            cache3d = cache_.reshape(cache_.shape[0], page_size, cache_.shape[-1])
+            flat_page_layout = cache_.ndim == 3
+            page_size = cache_.shape[1] if flat_page_layout else cache_.shape[1] * cache_.shape[2]
+            cache3d = (
+                cache_
+                if flat_page_layout
+                else cache_.reshape(cache_.shape[0], page_size, cache_.shape[-1])
+            )
             cache3d = _scatter_fused_kv_paged(
                 cache3d,
                 kvc_,
@@ -187,7 +193,8 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                 bq=bq,
                 b_topk=128,
             )
-            return output[: ql_.shape[0]], cache3d.reshape(cache_.shape)
+            updated_cache = cache3d if flat_page_layout else cache3d.reshape(cache_.shape)
+            return output[: ql_.shape[0]], updated_cache
 
         return jax.shard_map(_run, in_specs=in_specs, out_specs=out_specs, check_vma=False)(
             ql,
