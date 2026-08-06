@@ -409,7 +409,9 @@ def test_transfer_metadata_is_reusable_per_process_and_ttl_bounded():
             "remote_block_ids": [1, 2],
         }
     )
-    assert registry.get_transfer(7)["transfer_id"] == "first"
+    first = registry.get_transfer(7)
+    assert first["base_transfer_id"] == "first"
+    assert first["chunks"][0]["transfer_id"] == "first"
 
     registry.register_transfer(
         {
@@ -427,11 +429,11 @@ def test_transfer_metadata_is_reusable_per_process_and_ttl_bounded():
             "transport_metadata": {"remote_block_ids": [11]},
         }
     )
-    assert registry.get_transfer(7, 0)["transfer_id"] == "second"
-    assert registry.get_transfer(7, 1)["transfer_id"] == "peer"
+    assert registry.get_transfer(7, 0)["chunks"][0]["transfer_id"] == "second"
+    assert registry.get_transfer(7, 1)["chunks"][0]["transfer_id"] == "peer"
     registry.pop_room(7, 0)
     assert registry.get_transfer(7, 0) is None
-    assert registry.get_transfer(7, 1)["transfer_id"] == "peer"
+    assert registry.get_transfer(7, 1)["chunks"][0]["transfer_id"] == "peer"
     clock.t += 6.0
     assert registry.get_transfer(7, 1) is None
 
@@ -449,7 +451,7 @@ def test_transfer_metadata_namespaces_same_page_ids_by_prefill_dp_rank():
             }
         )
 
-    assert [registry.get_transfer(9, 0, rank)["transfer_id"] for rank in range(4)] == [
+    assert [registry.get_transfer(9, 0, rank)["chunks"][0]["transfer_id"] for rank in range(4)] == [
         "rank-0",
         "rank-1",
         "rank-2",
@@ -457,7 +459,72 @@ def test_transfer_metadata_namespaces_same_page_ids_by_prefill_dp_rank():
     ]
     registry.pop_room(9, 0, 2)
     assert registry.get_transfer(9, 0, 2) is None
-    assert registry.get_transfer(9, 0, 1)["transfer_id"] == "rank-1"
+    assert registry.get_transfer(9, 0, 1)["chunks"][0]["transfer_id"] == "rank-1"
+
+
+def _chunk_transfer_info(
+    base_transfer_id: str,
+    chunk_index: int,
+    *,
+    num_chunks: int = 0,
+    chunk_page_offset: int | None = None,
+) -> dict[str, object]:
+    return {
+        "bootstrap_room": 17,
+        "transfer_id": f"{base_transfer_id}#c{chunk_index}",
+        "base_transfer_id": base_transfer_id,
+        "jax_process_index": 2,
+        "prefill_dp_rank": 3,
+        "chunk_index": chunk_index,
+        "num_chunks": num_chunks,
+        "chunk_page_offset": (chunk_index * 2 if chunk_page_offset is None else chunk_page_offset),
+        "transport_metadata": {"remote_block_ids": [10 + chunk_index]},
+    }
+
+
+def test_chunk_transfer_registry_accumulates_and_finalizes_out_of_order():
+    registry = _Registry()
+    final = _chunk_transfer_info("wire", 2, num_chunks=3)
+    first = _chunk_transfer_info("wire", 0)
+    middle = _chunk_transfer_info("wire", 1)
+
+    registry.register_transfer(final)
+    registry.register_transfer(first)
+    registry.register_transfer(middle)
+
+    bundle = registry.get_transfer(17, 2, 3)
+    assert bundle["base_transfer_id"] == "wire"
+    assert bundle["num_chunks"] == 3
+    assert sorted(bundle["chunks"]) == [0, 1, 2]
+    assert bundle["chunks"][2]["chunk_page_offset"] == 4
+
+
+def test_chunk_transfer_registry_is_idempotent_and_rejects_conflicts():
+    registry = _Registry()
+    chunk = _chunk_transfer_info("wire", 0)
+    registry.register_transfer(chunk)
+    registry.register_transfer(dict(chunk))
+
+    conflicting = _chunk_transfer_info("wire", 0, chunk_page_offset=1)
+    with pytest.raises(ValueError, match="conflicting transfer metadata"):
+        registry.register_transfer(conflicting)
+
+    bad_final = _chunk_transfer_info("wire", 1, num_chunks=3)
+    with pytest.raises(ValueError, match="final chunk"):
+        registry.register_transfer(bad_final)
+
+
+def test_chunk_zero_replaces_stale_room_but_later_chunk_cannot():
+    registry = _Registry()
+    registry.register_transfer(_chunk_transfer_info("old", 0))
+
+    with pytest.raises(ValueError, match="only from chunk zero"):
+        registry.register_transfer(_chunk_transfer_info("new", 1))
+
+    registry.register_transfer(_chunk_transfer_info("new", 0))
+    bundle = registry.get_transfer(17, 2, 3)
+    assert bundle["base_transfer_id"] == "new"
+    assert bundle["chunks"][0]["transfer_id"] == "new#c0"
 
 
 def test_prefill_decode_transfer_engines_must_match():

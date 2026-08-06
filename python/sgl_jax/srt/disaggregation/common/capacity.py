@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+# At most this many child pulls per parent request are submitted concurrently.
+# The Raiden staging pool reserves the same number of slot waves.
+CHUNK_TRANSFER_WINDOW = 2
+
 
 def per_rank_inflight_limit(max_inflight: int, dp_size: int) -> int:
     """Split the global transfer budget across rank-local managers."""

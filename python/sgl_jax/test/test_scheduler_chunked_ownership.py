@@ -2,6 +2,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import numpy as np
+
 from sgl_jax.srt.managers.io_struct import AbortReq, PauseGenerationReqInput
 from sgl_jax.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
 from sgl_jax.srt.managers.scheduler import GenerationBatchResult, Scheduler
@@ -349,6 +351,113 @@ class TestSchedulerChunkedOwnership(unittest.TestCase):
         self.assertTrue(req.finished())
         self.assertEqual(scheduler.chunked_reqs, [None])
         self.assertEqual(scheduler._pending_chunked_abort_reqs, [None])
+
+    def test_pd_continuation_preserves_committed_prefix_after_middle_result(self):
+        req = self._make_req("pd-continuation", [1, 2, 3, 4], [10, 11])
+        req.bootstrap_room = 7
+        req.is_chunked = 0
+        req.kv_committed_len = 2
+
+        req.init_next_round_input(SimpleNamespace(root_node=object(), disable=True))
+
+        self.assertEqual(list(req.prefix_indices), [10, 11])
+        self.assertEqual(req.extend_input_len, 2)
+
+    def test_pd_fresh_request_drops_uncommitted_stale_prefix(self):
+        req = self._make_req("pd-fresh", [1, 2, 3, 4], [10, 11])
+        req.bootstrap_room = 7
+        req.kv_committed_len = 0
+
+        req.init_next_round_input(SimpleNamespace(root_node=object(), disable=True))
+
+        self.assertEqual(req.prefix_indices, [])
+        self.assertEqual(req.extend_input_len, 4)
+
+    def test_pd_raiden_handoff_streams_page_aligned_chunks_once(self):
+        req = self._make_req("pd-chunks", [1, 2, 3, 4, 5, 6], [])
+        req.bootstrap_room = 91
+        req.disagg_transfer_id = "wire-pd-chunks"
+        req.req_pool_idx = 0
+        req.fill_ids = req.origin_input_ids[:4]
+        req.extend_input_len = 4
+        req.is_chunked = 1
+
+        class _Sender:
+            def __init__(self):
+                self.calls = []
+                self.has_pending_failure = False
+                self.has_started_chunks = False
+
+            def init(self, _indices, transfer_id=None):
+                self.transfer_id = transfer_id
+
+            def send_chunk(self, *args, **kwargs):
+                self.calls.append((args, kwargs))
+                self.has_started_chunks = True
+
+            def poll(self):
+                return None
+
+            def clear(self):
+                return None
+
+        class _Manager:
+            host_pool = None
+
+            def __init__(self):
+                self.sender = _Sender()
+                self.prepared = []
+
+            def create_sender(self, _req_id):
+                return self.sender
+
+            def prepare_prefill_batch(self, kv_buffer):
+                self.prepared.append(kv_buffer)
+
+        class _Queue:
+            def __init__(self):
+                self._entries = {}
+
+            def add(self, req_id, sender, on_terminal=None):
+                self._entries[req_id] = (sender, on_terminal)
+
+        scheduler, _ = self._make_scheduler(req, active_reqs=req)
+        scheduler.pd = "prefill"
+        scheduler.server_args = SimpleNamespace(
+            enable_request_time_stats_logging=False,
+            disaggregation_enable_chunk_prefill_transfer=True,
+        )
+        scheduler.disagg_kv_manager = _Manager()
+        scheduler.disagg_prefill_queue = _Queue()
+        kv_pool = SimpleNamespace(page_size=2, kv_buffer=object())
+        scheduler.token_to_kv_pool_allocator = SimpleNamespace(get_kvcache=lambda: kv_pool)
+        scheduler.req_to_token_pool = SimpleNamespace(
+            req_to_token=np.asarray([[8, 9, 20, 21, 30, 31]], dtype=np.int32)
+        )
+
+        scheduler.process_prefill_chunk(scheduler.last_batch, SimpleNamespace())
+
+        sender = scheduler.disagg_kv_manager.sender
+        self.assertEqual(sender.transfer_id, "wire-pd-chunks")
+        self.assertEqual(sender.calls[0][0], (0, [4, 10]))
+        self.assertEqual(sender.calls[0][1]["chunk_page_offset"], 0)
+        self.assertFalse(sender.calls[0][1]["is_final"])
+        self.assertEqual(req.start_send_idx, 4)
+        self.assertEqual(req.is_chunked, 0)
+        self.assertEqual(len(scheduler.disagg_prefill_queue._entries), 1)
+
+        req.fill_ids = list(req.origin_input_ids)
+        req.extend_input_len = 2
+        scheduler.chunked_reqs = [None]
+        scheduler.process_prefill_chunk(scheduler.last_batch, SimpleNamespace())
+
+        self.assertEqual(sender.calls[1][0], (1, [15]))
+        self.assertEqual(sender.calls[1][1]["chunk_page_offset"], 2)
+        self.assertTrue(sender.calls[1][1]["is_final"])
+        self.assertEqual(req.start_send_idx, 6)
+        self.assertEqual(req.disagg_chunk_index, 2)
+        self.assertEqual(len(scheduler.disagg_prefill_queue._entries), 1)
+        self.assertEqual(len(scheduler.disagg_kv_manager.prepared), 2)
 
     def test_retract_requeues_parked_chunk_after_releasing_allocation(self):
         req = self._make_req("parked", [1, 2], [10, 11])

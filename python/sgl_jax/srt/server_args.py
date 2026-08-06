@@ -251,6 +251,9 @@ class ServerArgs:
     # ``RuntimeError("use_d2h_staging=True requires a host_pool")``.
     disaggregation_enable_d2h: bool = False
     disaggregation_use_raiden: bool = False
+    # Stream each completed prefill chunk through Raiden instead of waiting
+    # for the whole prompt. Opt-in while the v5 protocol is validated.
+    disaggregation_enable_chunk_prefill_transfer: bool = False
     disaggregation_side_channel_port: int = 9600
     disaggregation_d2h_pool_size: int = 64
     disaggregation_d2h_max_tokens: int | None = None
@@ -550,6 +553,27 @@ class ServerArgs:
                     self.disaggregation_mode,
                 )
                 self.skip_server_warmup = True
+            if self.disaggregation_enable_chunk_prefill_transfer:
+                if not self.disaggregation_use_raiden:
+                    raise ValueError(
+                        "--disaggregation-enable-chunk-prefill-transfer requires "
+                        "--disaggregation-use-raiden"
+                    )
+                if not self.disable_radix_cache:
+                    raise ValueError(
+                        "--disaggregation-enable-chunk-prefill-transfer requires "
+                        "--disable-radix-cache"
+                    )
+                if self.chunked_prefill_size is None or self.chunked_prefill_size <= 0:
+                    raise ValueError(
+                        "--disaggregation-enable-chunk-prefill-transfer requires "
+                        "--chunked-prefill-size > 0"
+                    )
+                if self.chunked_prefill_size % self.page_size:
+                    raise ValueError(
+                        "--disaggregation-enable-chunk-prefill-transfer requires "
+                        "--chunked-prefill-size to be divisible by --page-size"
+                    )
         else:
             # null mode ignores the PD fields; warn so a misconfigured
             # deployment isn't silently ignored.
@@ -566,6 +590,11 @@ class ServerArgs:
                     "disaggregation_use_raiden",
                     self.disaggregation_use_raiden,
                     ServerArgs.disaggregation_use_raiden,
+                ),
+                (
+                    "disaggregation_enable_chunk_prefill_transfer",
+                    self.disaggregation_enable_chunk_prefill_transfer,
+                    ServerArgs.disaggregation_enable_chunk_prefill_transfer,
                 ),
             ]
             non_default = [name for name, value, default in pd_overrides if value != default]
@@ -1604,6 +1633,14 @@ class ServerArgs:
             action=argparse.BooleanOptionalAction,
             default=ServerArgs.disaggregation_use_raiden,
             help="Use tpu-raiden for direct block transfer into decode KV pages.",
+        )
+        parser.add_argument(
+            "--disaggregation-enable-chunk-prefill-transfer",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.disaggregation_enable_chunk_prefill_transfer,
+            help="Register and pull each completed prefill chunk through Raiden "
+            "so transfer overlaps the next chunk forward. Requires Raiden, "
+            "ChunkCache, and chunked prefill. Default OFF.",
         )
         parser.add_argument(
             "--disaggregation-side-channel-port",

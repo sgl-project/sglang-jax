@@ -13,6 +13,7 @@ from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.disaggregation.base.kv_manager import KVPoll
 from sgl_jax.srt.disaggregation.bootstrap import (
+    PROTOCOL_VERSION,
     PrefillInfo,
     PrefillInfoCache,
     build_app,
@@ -235,7 +236,7 @@ def _pf(key, **kw):
         "host": "h",
         "transfer_port": 1,
         "side_channel_port": 2,
-        "protocol_version": 1,
+        "protocol_version": PROTOCOL_VERSION,
     }
     d.update(kw)
     return d

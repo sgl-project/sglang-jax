@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 import threading
 import time
@@ -22,12 +23,14 @@ HEARTBEAT_TTL_SECONDS = 30.0
 # Beat at ~TTL/3 so a single missed beat doesn't evict the entry.
 HEARTBEAT_INTERVAL_SECONDS = HEARTBEAT_TTL_SECONDS / 3.0
 TRANSFER_METADATA_TTL_SECONDS = 300.0
-BOOTSTRAP_CAPABILITIES = ("transfer_metadata",)
+BOOTSTRAP_CAPABILITIES = ("transfer_metadata", "chunk_transfer_metadata")
 
 # PD wire protocol version. Bump when ``PrefillInfo``
 # or any of the 4 endpoint payloads change shape.
-PROTOCOL_VERSION: int = 4
-MIN_COMPATIBLE_VERSION: int = 1
+PROTOCOL_VERSION: int = 5
+# v5 changes request transfer metadata from a single descriptor into a
+# per-chunk envelope. Mixed v4/v5 P/D peers are therefore unsupported.
+MIN_COMPATIBLE_VERSION: int = PROTOCOL_VERSION
 
 
 def _set_registry_size(n: int) -> None:
@@ -173,8 +176,14 @@ class RegisterPrefillRequest(BaseModel):
 class RegisterTransferRequest(BaseModel):
     bootstrap_room: int
     transfer_id: str
+    base_transfer_id: str | None = None
     jax_process_index: int = 0
     prefill_dp_rank: int = 0
+    chunk_index: int = 0
+    # Request-level transfer is represented as one final chunk. Chunked
+    # prefill publishes zero until the final descriptor fixes the total.
+    num_chunks: int = 1
+    chunk_page_offset: int = 0
     transport_metadata: dict[str, object]
 
 
@@ -270,8 +279,61 @@ class _Registry:
             prefill_dp_rank = int(info.get("prefill_dp_rank", 0))
             if not str(info.get("transfer_id", "")):
                 raise ValueError("transfer_id must be non-empty")
+            transfer_id = str(info["transfer_id"])
+            base_transfer_id = str(info.get("base_transfer_id") or transfer_id)
+            chunk_index = int(info.get("chunk_index", 0))
+            num_chunks = int(info.get("num_chunks", 1))
+            chunk_page_offset = int(info.get("chunk_page_offset", 0))
+            if chunk_index < 0:
+                raise ValueError("chunk_index must be non-negative")
+            if chunk_page_offset < 0:
+                raise ValueError("chunk_page_offset must be non-negative")
+            if num_chunks < 0:
+                raise ValueError("num_chunks must be non-negative")
+            if num_chunks and num_chunks != chunk_index + 1:
+                raise ValueError("the final chunk must publish num_chunks == chunk_index + 1")
+            expected_transfer_id = (
+                base_transfer_id
+                if base_transfer_id == transfer_id
+                else f"{base_transfer_id}#c{chunk_index}"
+            )
+            if transfer_id != expected_transfer_id:
+                raise ValueError(
+                    "chunk transfer_id must match base_transfer_id and chunk_index: "
+                    f"expected={expected_transfer_id!r}, got={transfer_id!r}"
+                )
             key = (room, process_index, prefill_dp_rank)
-            self.transfers[key] = info
+            bundle = self.transfers.get(key)
+            if bundle is not None and bundle.get("base_transfer_id") != base_transfer_id:
+                if chunk_index != 0:
+                    raise ValueError(
+                        "a new transfer may replace room metadata only from chunk zero"
+                    )
+                bundle = None
+            if bundle is None:
+                bundle = {
+                    "base_transfer_id": base_transfer_id,
+                    "chunks": {},
+                    "num_chunks": 0,
+                }
+                self.transfers[key] = bundle
+            chunks = bundle["chunks"]
+            assert isinstance(chunks, dict)
+            existing = chunks.get(chunk_index)
+            if existing is not None and existing != info:
+                raise ValueError(f"conflicting transfer metadata for chunk_index={chunk_index}")
+            known_total = int(bundle.get("num_chunks", 0))
+            if known_total and chunk_index >= known_total:
+                raise ValueError(
+                    f"chunk_index={chunk_index} is outside finalized num_chunks={known_total}"
+                )
+            if num_chunks and known_total not in (0, num_chunks):
+                raise ValueError(
+                    f"conflicting num_chunks: existing={known_total}, new={num_chunks}"
+                )
+            chunks[chunk_index] = dict(info)
+            if num_chunks:
+                bundle["num_chunks"] = num_chunks
             self.transfer_last_seen[key] = self.now()
 
     def get_transfer(
@@ -285,7 +347,7 @@ class _Registry:
             info = self.transfers.get(
                 (int(bootstrap_room), int(jax_process_index), int(prefill_dp_rank))
             )
-            return dict(info) if info is not None else None
+            return copy.deepcopy(info) if info is not None else None
 
     def pop_room(
         self,
@@ -673,15 +735,23 @@ class BootstrapClient:
         bootstrap_room: int,
         transfer_id: str,
         *,
+        base_transfer_id: str | None = None,
         jax_process_index: int = 0,
         prefill_dp_rank: int = 0,
+        chunk_index: int = 0,
+        num_chunks: int = 1,
+        chunk_page_offset: int = 0,
         transport_metadata: dict[str, object],
     ) -> None:
         payload = {
             "bootstrap_room": bootstrap_room,
             "transfer_id": transfer_id,
+            "base_transfer_id": base_transfer_id or transfer_id,
             "jax_process_index": jax_process_index,
             "prefill_dp_rank": prefill_dp_rank,
+            "chunk_index": chunk_index,
+            "num_chunks": num_chunks,
+            "chunk_page_offset": chunk_page_offset,
             "transport_metadata": transport_metadata,
         }
         r = self._client.post(

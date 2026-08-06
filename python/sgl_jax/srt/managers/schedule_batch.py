@@ -228,6 +228,8 @@ class Req:
         self.disagg_transfer_id: str | None = None
         self.disagg_host_buffer_id: int | None = None
         self.disagg_peer_process_index: int = 0
+        self.disagg_chunk_index: int = 0
+        self.disagg_chunk_sender = None
 
         # Memory pool info
         self.req_pool_idx: int | None = None
@@ -306,9 +308,9 @@ class Req:
         # but not by the tree (page_size > 1 chunked prefill).
         self.cache_protected_len = 0
 
-        # Whether or not if it is chunked. It increments whenever
-        # it is chunked, and decrement whenever chunked request is
-        # processed.
+        # Number of middle chunks that have been dispatched but whose results
+        # have not been processed yet. This is deliberately transient: use
+        # kv_committed_len for persistent chunked-prefill ownership.
         self.is_chunked = 0
 
         # For retraction
@@ -454,7 +456,11 @@ class Req:
         # continuation rounds must also preserve/update last_node and radix
         # lock state, not just prefix_indices.
         if getattr(self, "bootstrap_room", None) is not None and not self.output_ids:
-            if getattr(self, "is_chunked", 0) == 0:
+            # A completed middle chunk decrements is_chunked before
+            # this continuation round is initialized. kv_committed_len, not the
+            # in-flight counter, is the durable signal that prefix_indices owns
+            # already-computed prompt KV (#1496).
+            if self.kv_committed_len == 0:
                 self.prefix_indices = []
                 self.last_matched_prefix_len = 0
             self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
@@ -663,6 +669,9 @@ class Req:
         self.decode_batch_idx = 0
         self.routed_experts = None
         self.latest_bid = None
+        self.start_send_idx = 0
+        self.disagg_chunk_index = 0
+        self.disagg_chunk_sender = None
         self.cache_protected_len = 0
         self.recurrent_pool_idx = None
         self.recurrent_cow_src_index = None
