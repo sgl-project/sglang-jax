@@ -119,7 +119,36 @@ def test_stop_profile_is_a_noop_after_stage_profile_auto_completes() -> None:
     idle_response.raise_for_status.assert_called_once_with()
 
 
-def test_profile_admission_barrier_queues_full_native_batch_before_resume() -> None:
+def test_parallel_single_requests_preserve_result_order() -> None:
+    def fake_run_native_batch(base_url, input_ids, output_len, *, label):
+        request_id = input_ids[0][0]
+        return {
+            "wall_s": float(request_id),
+            "ttft_s": [request_id + 0.1],
+            "decode_s": [request_id + 0.2],
+            "cached_tokens": [request_id + 10],
+            "completion_tokens": [request_id + 20],
+        }
+
+    with mock.patch.object(
+        BENCHMARK, "_run_native_batch", side_effect=fake_run_native_batch
+    ) as run_native_batch:
+        result = BENCHMARK._run_parallel_single_requests(
+            "http://server", [[1], [2], [3], [4]], 1, label="profile"
+        )
+
+    assert result["wall_s"] >= 0
+    assert result["ttft_s"] == [1.1, 2.1, 3.1, 4.1]
+    assert result["decode_s"] == [1.2, 2.2, 3.2, 4.2]
+    assert result["cached_tokens"] == [11, 12, 13, 14]
+    assert result["completion_tokens"] == [21, 22, 23, 24]
+    assert run_native_batch.call_count == 4
+    assert all(
+        len(call.args[1]) == 1 for call in run_native_batch.call_args_list
+    )
+
+
+def test_profile_admission_barrier_queues_all_requests_before_resume() -> None:
     paused_response = mock.Mock()
     resumed_response = mock.Mock()
     server_info_response = mock.Mock()
@@ -142,7 +171,7 @@ def test_profile_admission_barrier_queues_full_native_batch_before_resume() -> N
         resumed.set()
         return resumed_response
 
-    def fake_run_native_batch(*args, **kwargs):
+    def fake_run_parallel_single_requests(*args, **kwargs):
         assert resumed.wait(timeout=2)
         return {"wall_s": 1.0}
 
@@ -152,7 +181,9 @@ def test_profile_admission_barrier_queues_full_native_batch_before_resume() -> N
             BENCHMARK.requests, "get", return_value=server_info_response
         ):
             with mock.patch.object(
-                BENCHMARK, "_run_native_batch", side_effect=fake_run_native_batch
+                BENCHMARK,
+                "_run_parallel_single_requests",
+                side_effect=fake_run_parallel_single_requests,
             ):
                 result = BENCHMARK._run_native_batch_with_admission_barrier(
                     "http://server",

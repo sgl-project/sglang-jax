@@ -147,6 +147,41 @@ def _run_native_batch(
     }
 
 
+def _run_parallel_single_requests(
+    base_url: str,
+    input_ids: list[list[int]],
+    output_len: int,
+    *,
+    label: str,
+) -> dict:
+    """Submit one request per HTTP handler and combine their measurements."""
+    started = time.perf_counter()
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=len(input_ids)
+    ) as executor:
+        futures = [
+            executor.submit(
+                _run_native_batch,
+                base_url,
+                [request_input_ids],
+                output_len,
+                label=f"{label}-{request_id}",
+            )
+            for request_id, request_input_ids in enumerate(input_ids)
+        ]
+        results = [future.result() for future in futures]
+
+    return {
+        "wall_s": time.perf_counter() - started,
+        "ttft_s": [result["ttft_s"][0] for result in results],
+        "decode_s": [result["decode_s"][0] for result in results],
+        "cached_tokens": [result["cached_tokens"][0] for result in results],
+        "completion_tokens": [
+            result["completion_tokens"][0] for result in results
+        ],
+    }
+
+
 def _start_profile(
     base_url: str,
     output_dir: Path,
@@ -200,12 +235,12 @@ def _run_native_batch_with_admission_barrier(
     on_admitted: Callable[[], None],
     timeout_s: float = 180,
 ) -> dict:
-    """Queue a native batch atomically before releasing the scheduler.
+    """Queue independent HTTP requests before releasing the scheduler.
 
-    Profiling startup can otherwise race the tokenizer manager's per-request
-    enqueue loop and split a native C32 request into, for example, C29 + C3.
-    Pausing an idle scheduler lets every request reach the waiting queue before
-    the stage profiler is armed and inference resumes.
+    A paused tokenizer handler does not expose the members of one native batch
+    to the scheduler until the handler has finished processing the whole batch.
+    Independent handlers let all C32 requests reach the waiting queue while the
+    scheduler is paused. Profiling is then armed before inference resumes.
     """
     pause = requests.post(
         f"{base_url}/pause_generation",
@@ -216,7 +251,7 @@ def _run_native_batch_with_admission_barrier(
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
         future = executor.submit(
-            _run_native_batch,
+            _run_parallel_single_requests,
             base_url,
             input_ids,
             output_len,
