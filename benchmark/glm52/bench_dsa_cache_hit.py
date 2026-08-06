@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import statistics
 import time
 from pathlib import Path
@@ -31,24 +32,46 @@ def _make_inputs(
     extend_len: int,
     *,
     prefix_mode: str,
+    random_seed: int = 3,
+    random_token_min: int = 1000,
+    random_token_max: int = 32000,
 ) -> tuple[list, list]:
+    if concurrency < 1:
+        raise ValueError("concurrency must be positive")
     if prefix_len < 2:
         raise ValueError("prefix_len must be at least 2")
+    if extend_len < 1:
+        raise ValueError("extend_len must be positive")
     if prefix_mode not in ("independent", "shared"):
         raise ValueError(f"unknown prefix_mode: {prefix_mode}")
+    if random_token_min < 0 or random_token_max <= random_token_min:
+        raise ValueError("random token range must be non-negative and non-empty")
+    if random_token_max - random_token_min < 2 * concurrency:
+        raise ValueError("random token range must contain at least 2 * concurrency IDs")
+
+    rng = random.Random(random_seed)
+
+    def random_tokens(length: int) -> list[int]:
+        return [
+            rng.randrange(random_token_min, random_token_max) for _ in range(length)
+        ]
 
     prefixes = []
     extended = []
-    shared_prefix = [1000 + (i % 4096) for i in range(prefix_len)]
+    shared_prefix = random_tokens(prefix_len)
     for request_id in range(concurrency):
         if prefix_mode == "shared":
             prefix = shared_prefix.copy()
         else:
-            # Keep the first/body/extend tokens distinct across requests so radix
-            # sharing cannot turn independent-prefix capacity into a shared-prefix case.
-            prefix = [100 + request_id, 200 + request_id]
-            prefix += [1000 + request_id] * (prefix_len - len(prefix))
-        extension = [10000 + request_id] * extend_len
+            prefix = random_tokens(prefix_len)
+            # Force distinct request heads so radix sharing cannot turn independent
+            # prefix capacity into a shared-prefix case.
+            prefix[0] = random_token_min + concurrency + request_id
+
+        extension = random_tokens(extend_len)
+        # Force a distinct branch immediately after the cached prefix. The remainder
+        # stays random so router/top-k and fused MoE see varied token representations.
+        extension[0] = random_token_min + request_id
         prefixes.append(prefix)
         extended.append(prefix + extension)
     return prefixes, extended
@@ -116,7 +139,8 @@ def _run_native_batch(
             int(final_meta[i].get("cached_tokens", 0)) for i in range(len(input_ids))
         ],
         "completion_tokens": [
-            int(final_meta[i].get("completion_tokens", 0)) for i in range(len(input_ids))
+            int(final_meta[i].get("completion_tokens", 0))
+            for i in range(len(input_ids))
         ],
     }
 
@@ -129,6 +153,9 @@ def main() -> None:
     parser.add_argument("--prefix-len", type=int, default=16 * 1024)
     parser.add_argument("--extend-len", type=int, default=1024)
     parser.add_argument("--output-len", type=int, default=1024)
+    parser.add_argument("--random-seed", type=int, default=3)
+    parser.add_argument("--random-token-min", type=int, default=1000)
+    parser.add_argument("--random-token-max", type=int, default=32000)
     parser.add_argument(
         "--prefix-mode",
         choices=("independent", "shared"),
@@ -144,10 +171,15 @@ def main() -> None:
         args.prefix_len,
         args.extend_len,
         prefix_mode=args.prefix_mode,
+        random_seed=args.random_seed,
+        random_token_min=args.random_token_min,
+        random_token_max=args.random_token_max,
     )
     if args.prefix_mode == "shared":
         if args.dp_size > args.concurrency:
-            raise ValueError("dp_size cannot exceed concurrency for shared-prefix warmup")
+            raise ValueError(
+                "dp_size cannot exceed concurrency for shared-prefix warmup"
+            )
         # With round-robin DP scheduling, one identical request per rank installs
         # the shared prefix on every rank. The measured C=2/DP batch can then hit
         # the same rank-local prefix without recomputing 32 independent prefixes.
@@ -169,7 +201,9 @@ def main() -> None:
             f"expected>={minimum_expected_hit}"
         )
     if measured["completion_tokens"] != [args.output_len] * args.concurrency:
-        raise RuntimeError(f"completion invariant failed: {measured['completion_tokens']}")
+        raise RuntimeError(
+            f"completion invariant failed: {measured['completion_tokens']}"
+        )
 
     ttft = measured["ttft_s"]
     decode = measured["decode_s"]
@@ -183,6 +217,9 @@ def main() -> None:
         "prefix_len": args.prefix_len,
         "extend_len": args.extend_len,
         "output_len": args.output_len,
+        "random_seed": args.random_seed,
+        "random_token_min": args.random_token_min,
+        "random_token_max": args.random_token_max,
         "minimum_expected_cache_hit": minimum_expected_hit,
         "warm_wall_s": warm["wall_s"],
         "wall_s": measured["wall_s"],
@@ -193,7 +230,9 @@ def main() -> None:
         "decode_p50_s": statistics.median(decode),
         "tpot_p50_ms": statistics.median(tpots_ms),
         "tpot_p95_ms": _percentile(tpots_ms, 0.95),
-        "output_throughput_tok_s": args.concurrency * args.output_len / measured["wall_s"],
+        "output_throughput_tok_s": args.concurrency
+        * args.output_len
+        / measured["wall_s"],
         "cached_tokens_min": min(measured["cached_tokens"]),
         "cached_tokens_max": max(measured["cached_tokens"]),
         "cached_tokens": measured["cached_tokens"],
