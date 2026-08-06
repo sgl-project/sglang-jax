@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
+from unittest import mock
 
 BENCHMARK_PATH = (
     Path(__file__).resolve().parents[2]
@@ -40,3 +41,35 @@ def test_random_inputs_are_reproducible_by_seed() -> None:
 
     assert first == repeated
     assert first != different
+
+
+def test_profile_wraps_only_the_measured_phase_api() -> None:
+    start_response = mock.Mock()
+    stop_response = mock.Mock()
+    status_response = mock.Mock()
+    status_response.json.return_value = {"status": "idle"}
+
+    with mock.patch.object(
+        BENCHMARK.requests,
+        "post",
+        side_effect=(start_response, stop_response),
+    ) as post:
+        with mock.patch.object(BENCHMARK.requests, "get", return_value=status_response):
+            BENCHMARK._start_profile(
+                "http://server",
+                Path("/tmp/profile"),
+                host_tracer_level=0,
+                python_tracer_level=0,
+            )
+            BENCHMARK._stop_profile("http://server")
+
+    assert post.call_args_list[0].args == ("http://server/start_profile",)
+    assert post.call_args_list[0].kwargs["json"] == {
+        "output_dir": "/tmp/profile",
+        "host_tracer_level": 0,
+        "python_tracer_level": 0,
+    }
+    assert post.call_args_list[1].args == ("http://server/stop_profile",)
+    start_response.raise_for_status.assert_called_once_with()
+    stop_response.raise_for_status.assert_called_once_with()
+    status_response.raise_for_status.assert_called_once_with()

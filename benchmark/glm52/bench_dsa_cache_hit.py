@@ -145,6 +145,34 @@ def _run_native_batch(
     }
 
 
+def _start_profile(
+    base_url: str,
+    output_dir: Path,
+    *,
+    host_tracer_level: int,
+    python_tracer_level: int,
+) -> None:
+    response = requests.post(
+        f"{base_url}/start_profile",
+        json={
+            "output_dir": str(output_dir),
+            "host_tracer_level": host_tracer_level,
+            "python_tracer_level": python_tracer_level,
+        },
+        timeout=(30, None),
+    )
+    response.raise_for_status()
+
+
+def _stop_profile(base_url: str) -> None:
+    response = requests.post(f"{base_url}/stop_profile", timeout=(30, None))
+    response.raise_for_status()
+    status = requests.get(f"{base_url}/profile_status", timeout=60)
+    status.raise_for_status()
+    if status.json().get("status") != "idle":
+        raise RuntimeError(f"profile did not stop cleanly: {status.text}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-url", default="http://localhost:30000")
@@ -156,6 +184,13 @@ def main() -> None:
     parser.add_argument("--random-seed", type=int, default=3)
     parser.add_argument("--random-token-min", type=int, default=1000)
     parser.add_argument("--random-token-max", type=int, default=32000)
+    parser.add_argument(
+        "--profile-output-dir",
+        type=Path,
+        help="Profile only the measured cache-hit extend/decode request.",
+    )
+    parser.add_argument("--profile-host-tracer-level", type=int, default=0)
+    parser.add_argument("--profile-python-tracer-level", type=int, default=0)
     parser.add_argument(
         "--prefix-mode",
         choices=("independent", "shared"),
@@ -190,9 +225,22 @@ def main() -> None:
     flush = requests.post(f"{base_url}/flush_cache", timeout=60)
     flush.raise_for_status()
     warm = _run_native_batch(base_url, warm_inputs, 1, label="warm-prefix")
-    measured = _run_native_batch(
-        base_url, extended, args.output_len, label="cache-hit-extend-decode"
-    )
+    profile_started = False
+    try:
+        if args.profile_output_dir is not None:
+            _start_profile(
+                base_url,
+                args.profile_output_dir,
+                host_tracer_level=args.profile_host_tracer_level,
+                python_tracer_level=args.profile_python_tracer_level,
+            )
+            profile_started = True
+        measured = _run_native_batch(
+            base_url, extended, args.output_len, label="cache-hit-extend-decode"
+        )
+    finally:
+        if profile_started:
+            _stop_profile(base_url)
 
     minimum_expected_hit = args.prefix_len - args.cache_hit_tolerance
     if min(measured["cached_tokens"]) < minimum_expected_hit:
@@ -220,6 +268,9 @@ def main() -> None:
         "random_seed": args.random_seed,
         "random_token_min": args.random_token_min,
         "random_token_max": args.random_token_max,
+        "profile_output_dir": (
+            str(args.profile_output_dir) if args.profile_output_dir is not None else None
+        ),
         "minimum_expected_cache_hit": minimum_expected_hit,
         "warm_wall_s": warm["wall_s"],
         "wall_s": measured["wall_s"],
