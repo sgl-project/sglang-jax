@@ -134,6 +134,12 @@ def _create_jax_backend(
     )
 
 
+def _tree_cache_supports_swa(tree_cache: object) -> bool:
+    """Probe optional SWA support without requiring every cache to implement it."""
+    supports_swa = getattr(tree_cache, "supports_swa", None)
+    return bool(supports_swa()) if callable(supports_swa) else False
+
+
 def _create_raiden_backend(
     scheduler: Scheduler,
     server_args: ServerArgs,
@@ -155,7 +161,7 @@ def _create_raiden_backend(
     if (
         chunk_transfer_enabled
         and getattr(scheduler, "tree_cache", None) is not None
-        and scheduler.tree_cache.supports_swa()
+        and _tree_cache_supports_swa(scheduler.tree_cache)
     ):
         raise ValueError("Raiden chunk prefill transfer does not support sliding-window KV")
     if bootstrap_client is None or not hasattr(bootstrap_client, "require_capability"):

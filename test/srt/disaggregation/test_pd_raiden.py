@@ -24,6 +24,7 @@ from sgl_jax.srt.disaggregation.base.transfer import (
 from sgl_jax.srt.disaggregation.common.capacity import per_rank_inflight_limit
 from sgl_jax.srt.disaggregation.factory import (
     _raiden_transfer_pool_shape,
+    _tree_cache_supports_swa,
     create_transfer_backend,
 )
 from sgl_jax.srt.disaggregation.raiden_transfer.conn import (
@@ -1029,6 +1030,14 @@ def test_raiden_chunk_pool_uses_two_chunk_sized_slot_waves():
         chunk_prefill_size=1024,
         chunk_transfer_enabled=False,
     ) == (256, 4)
+
+
+def test_raiden_chunk_factory_allows_plain_chunk_cache_without_swa_probe():
+    plain_chunk_cache = types.SimpleNamespace()
+    swa_chunk_cache = types.SimpleNamespace(supports_swa=lambda: True)
+
+    assert _tree_cache_supports_swa(plain_chunk_cache) is False
+    assert _tree_cache_supports_swa(swa_chunk_cache) is True
 
 
 @pytest.mark.parametrize(
