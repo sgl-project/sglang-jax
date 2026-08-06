@@ -73,3 +73,10 @@ def test_profile_wraps_only_the_measured_phase_api() -> None:
     start_response.raise_for_status.assert_called_once_with()
     stop_response.raise_for_status.assert_called_once_with()
     status_response.raise_for_status.assert_called_once_with()
+
+
+def test_variant_flag_can_label_radix_topk() -> None:
+    parser_source = BENCHMARK_PATH.read_text()
+
+    assert '"--variant"' in parser_source
+    assert '"variant": args.variant' in parser_source

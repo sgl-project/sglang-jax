@@ -185,6 +185,11 @@ def main() -> None:
     parser.add_argument("--random-token-min", type=int, default=1000)
     parser.add_argument("--random-token-max", type=int, default=32000)
     parser.add_argument(
+        "--variant",
+        default="exact_dsa_exact_lax_topk",
+        help="Label recorded in the output metrics for the serving variant.",
+    )
+    parser.add_argument(
         "--profile-output-dir",
         type=Path,
         help="Profile only the measured cache-hit extend/decode request.",
@@ -257,7 +262,7 @@ def main() -> None:
     decode = measured["decode_s"]
     tpots_ms = [value * 1000 / max(args.output_len - 1, 1) for value in decode]
     result = {
-        "variant": "exact_dsa_exact_lax_topk",
+        "variant": args.variant,
         "concurrency": args.concurrency,
         "dp_size": args.dp_size,
         "prefix_mode": args.prefix_mode,
