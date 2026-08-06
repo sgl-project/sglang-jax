@@ -203,7 +203,7 @@ def sparse_mla_attention(
     kv_lora_rank: int = 512,
     read_block: int = 1,
     block_units: int | None = None,  # units gathered+matmul'd per chunk (G; parallelism knob)
-    sm_scale: float | None = None,
+    sm_scale: float | None = None,  # REQUIRED: 1/sqrt(qk_nope_head_dim + qk_rope_head_dim)
     interpret: bool = False,
     page_table=None,  # [B, max_pages] int32: logical page -> physical page. When set,
     # ``kv`` is the packed 4D paged cache and the kernel gathers from it.
@@ -212,6 +212,10 @@ def sparse_mla_attention(
 ):
     """Sparse MLA-latent attention (head-minor chunked kernel).
     Returns ``[B, S, H, kv_lora_rank]`` (float32).
+
+    ``sm_scale`` is **required**: the score is the absorbed q·k over the latent
+    ``Dk`` but the correct scale is the original ``1/sqrt(qk_nope_head_dim +
+    qk_rope_head_dim)`` (= 1/√192 for DS/GLM), which the latent dim doesn't encode.
 
     ``indices`` are *unit ids* (one unit = ``read_block`` contiguous tokens); set
     ``read_block=1`` for token-granular (exact) DSA, or e.g. 128 for page-sized block
@@ -236,7 +240,17 @@ def sparse_mla_attention(
     if not block_units or block_units < 1:
         raise ValueError("sparse_mla_attention requires block_units >= 1")
     if sm_scale is None:
-        sm_scale = 1.0 / (Dk**0.5)  # note: true (unpadded) Dk
+        # No safe default: the score is the absorbed q·k over the full latent Dk
+        # (kv_lora_rank + qk_rope_head_dim), but the correct scale is the ORIGINAL
+        # attention head dim 1/sqrt(qk_nope_head_dim + qk_rope_head_dim) (= 1/sqrt(192)
+        # for DS/GLM), which cannot be recovered from Dk or kv_lora_rank alone.
+        # Deriving it from the latent dim (the old 1/sqrt(Dk) default) silently
+        # under-scales the logits, so require the caller to pass it explicitly.
+        raise ValueError(
+            "sparse_mla_attention requires an explicit sm_scale "
+            "(1/sqrt(qk_nope_head_dim + qk_rope_head_dim)); the latent Dk is not the "
+            "score head dim, so there is no safe default."
+        )
 
     # TPU/Mosaic wants the lane (last) dim %128; the MLA latent is 576 = 512 + 64
     # rope, so pad the feature dim with zeros to the next multiple of 128 (640).
