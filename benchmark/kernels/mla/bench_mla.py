@@ -13,11 +13,15 @@ Mirrors `benchmark/kernels/flash_attention/bench_flashattention.py`:
 Usage:
     SGLANG_JAX_IS_IN_CI=true python benchmark/kernels/mla/bench_mla.py   # CI test
     python benchmark/kernels/mla/bench_mla.py                            # full grid
+    python benchmark/kernels/mla/bench_mla.py --scenario glm52-dp16-128k
 """
 
 from __future__ import annotations
 
+import argparse
 import functools
+import json
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -30,9 +34,10 @@ from sgl_jax.srt.utils.jax_utils import get_device_name
 
 # Hardcoded-default config (matches kernel.py:1411 fallback when no tuned
 # entry exists). Bench this to anchor expected baselines.
-_DEFAULT_DECODE_BLOCK = (3, 1)  # (num_kv_pages_per_block_slot0, num_queries_per_block_slot0)
+# Tuples are (num_kv_pages_per_block, num_queries_per_block).
+_DEFAULT_DECODE_BLOCK = (3, 1)
 _DEFAULT_DECODE_DBS = 4
-_DEFAULT_MIXED_BLOCK = (1, 16)  # (num_kv_pages_per_block_slot2, num_queries_per_block_slot2)
+_DEFAULT_MIXED_BLOCK = (1, 16)
 
 
 def benchmark_backend(
@@ -45,6 +50,7 @@ def benchmark_backend(
     kv_len: int,
     *,
     use_lookup: bool,
+    mixed_num_seqs: int = 1,
     tries: int = 3,
     dtype=jnp.bfloat16,
 ) -> float:
@@ -56,6 +62,7 @@ def benchmark_backend(
             tuned-table lookup runs (table or hardcoded fallback). If False,
             pass the explicit hardcoded defaults so the bench is independent
             of table state — used for stable CI baselines.
+        mixed_num_seqs: number of uniform local sequences for mixed/extend.
     """
     if case == "decode":
         inputs = create_mla_decode_uniform_data(
@@ -75,6 +82,7 @@ def benchmark_backend(
             qk_rope_head_dim=qk_rope_head_dim,
             page_size=page_size,
             kv_len=max(kv_len, max_num_tokens),
+            num_seqs=mixed_num_seqs,
             dtype=dtype,
         )
     else:
@@ -189,60 +197,98 @@ _LING_LKV = 512
 _LING_R = 64
 
 
-def full_benchmark():
-    print("[MLA-V2] BENCHMARK RESULTS")
+def _run_benchmark(
+    *,
+    scenario: str,
+    cases: list[tuple[str, int, int, int, int]],
+    num_q_heads: int,
+) -> list[dict]:
+    print(f"[MLA-V2] BENCHMARK RESULTS scenario={scenario}")
     print(f"# device={get_device_name()}, devices={jax.devices()}")
     print()
 
-    cases = [
-        # (case, mnt, page_size, kv_len)
-        # Decode bs_buckets / dp=4 = {16, 32, 64, 128}
-        ("decode", 16, 256, 16384),
-        ("decode", 32, 256, 16384),
-        ("decode", 64, 256, 16384),
-        ("decode", 128, 256, 16384),
-        # Mixed token_buckets / dp=4 = {128, 256, 512, 1024, 2048}
-        ("mixed", 128, 256, 16384),
-        ("mixed", 256, 256, 16384),
-        ("mixed", 512, 256, 16384),  # ← user's hot prefill chunk
-        ("mixed", 1024, 256, 16384),
-        ("mixed", 2048, 256, 16384),
-    ]
-
-    for case, mnt, page_size, kv_len in cases:
+    rows = []
+    for case, mnt, page_size, kv_len, num_seqs in cases:
         print(
-            f"# case={case} num_q_heads={_LING_HEADS} page_size={page_size} "
-            f"mnt={mnt} kv_len={kv_len}"
+            f"# case={case} num_q_heads={num_q_heads} page_size={page_size} "
+            f"mnt={mnt} kv_len={kv_len} num_seqs={num_seqs}"
         )
         try:
             t_default = benchmark_backend(
                 case=case,
                 max_num_tokens=mnt,
-                num_q_heads=_LING_HEADS,
+                num_q_heads=num_q_heads,
                 kv_lora_rank=_LING_LKV,
                 qk_rope_head_dim=_LING_R,
                 page_size=page_size,
                 kv_len=kv_len,
                 use_lookup=False,
+                mixed_num_seqs=num_seqs,
             )
             t_lookup = benchmark_backend(
                 case=case,
                 max_num_tokens=mnt,
-                num_q_heads=_LING_HEADS,
+                num_q_heads=num_q_heads,
                 kv_lora_rank=_LING_LKV,
                 qk_rope_head_dim=_LING_R,
                 page_size=page_size,
                 kv_len=kv_len,
                 use_lookup=True,
+                mixed_num_seqs=num_seqs,
             )
         except Exception as e:  # noqa: BLE001
             print(f"  FAILED: {type(e).__name__}: {e}")
             continue
         delta = (t_default - t_lookup) / t_default * 100.0
-        print(
-            f"  default: {t_default * 1000:.4f}ms   "
-            f"lookup: {t_lookup * 1000:.4f}ms   Δ={delta:+.1f}%"
+        print(f"  default: {t_default:.4f}ms   lookup: {t_lookup:.4f}ms   Δ={delta:+.1f}%")
+        rows.append(
+            {
+                "scenario": scenario,
+                "case": case,
+                "num_q_heads": num_q_heads,
+                "page_size": page_size,
+                "max_num_tokens": mnt,
+                "kv_len": kv_len,
+                "num_seqs": num_seqs,
+                "heuristic_latency_ms": t_default,
+                "latency_ms": t_lookup,
+                "speedup_pct": delta,
+            }
         )
+    return rows
+
+
+def full_benchmark() -> list[dict]:
+    cases = [
+        # (case, mnt, page_size, kv_len, num_seqs)
+        # Decode bs_buckets / dp=4 = {16, 32, 64, 128}
+        ("decode", 16, 256, 16384, 16),
+        ("decode", 32, 256, 16384, 32),
+        ("decode", 64, 256, 16384, 64),
+        ("decode", 128, 256, 16384, 128),
+        # Mixed token_buckets / dp=4 = {128, 256, 512, 1024, 2048}
+        ("mixed", 128, 256, 16384, 1),
+        ("mixed", 256, 256, 16384, 1),
+        ("mixed", 512, 256, 16384, 1),  # ← user's hot prefill chunk
+        ("mixed", 1024, 256, 16384, 1),
+        ("mixed", 2048, 256, 16384, 1),
+    ]
+    return _run_benchmark(
+        scenario="ling",
+        cases=cases,
+        num_q_heads=_LING_HEADS,
+    )
+
+
+def glm52_benchmark() -> list[dict]:
+    return _run_benchmark(
+        scenario="glm52-dp16-128k",
+        cases=[
+            ("decode", 2, 64, 133120, 2),
+            ("mixed", 2048, 64, 132096, 2),
+        ],
+        num_q_heads=64,
+    )
 
 
 def _import_test_utils():
@@ -316,5 +362,17 @@ if __name__ == "__main__":
         print("Run MLA v2 Kernel Performance Test...")
         TestPerformance().test_mla_kernel_performance()
     else:
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--scenario", choices=("ling", "glm52-dp16-128k"), default="ling")
+        parser.add_argument("--output-jsonl", default=None)
+        args = parser.parse_args()
+
         print("Run MLA v2 Full Benchmark...")
-        full_benchmark()
+        rows = glm52_benchmark() if args.scenario == "glm52-dp16-128k" else full_benchmark()
+        if args.output_jsonl:
+            output_path = Path(args.output_jsonl)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            with output_path.open("w", encoding="utf-8") as output_file:
+                for row in rows:
+                    output_file.write(json.dumps(row, sort_keys=True) + "\n")
+            print(f"# wrote metrics: {output_path}")

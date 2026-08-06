@@ -1448,9 +1448,14 @@ class MLATokenToKVPool(KVCache):
     def replace_buffer(self, kv_buffer) -> None:
         if isinstance(kv_buffer, tuple):
             kv_buffer, idx_buffer = kv_buffer
-            if idx_buffer:
-                self.indexer_key_buffer[: len(idx_buffer)] = idx_buffer
+            self.replace_indexer_key_buffer(idx_buffer)
         self.kv_buffer[self.start_layer : self.start_layer + len(kv_buffer)] = kv_buffer
+
+    def replace_indexer_key_buffer(self, indexer_key_buffer: list[jax.Array]) -> None:
+        """Commit functional Indexer-cache updates independently of MLA KV."""
+
+        if indexer_key_buffer:
+            self.indexer_key_buffer[: len(indexer_key_buffer)] = indexer_key_buffer
 
     def get_cpu_copy(self, indices):
         """Get CPU copy of KV cache for specified indices.
@@ -1469,6 +1474,269 @@ class MLATokenToKVPool(KVCache):
             kv_host = kv_cache_host[layer_id]
             kv_device = jax.device_put(kv_host, self.kv_sharding)
             self.kv_buffer[layer_id] = self.kv_buffer[layer_id].at[indices].set(kv_device)
+
+
+class _LayerwiseKVBufferView:
+    """Compatibility sequence that forwards buffer access to child pools."""
+
+    def __init__(self, owner: LayerwiseHybridKVPool):
+        self._owner = owner
+
+    def __len__(self):
+        return self._owner.layer_num
+
+    def __iter__(self):
+        for index in range(len(self)):
+            yield self[index]
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return [self[i] for i in range(*index.indices(len(self)))]
+        layer_id = self._owner.layer_ids[index]
+        pool, local_layer_id = self._owner._resolve(layer_id)
+        return pool.kv_buffer[local_layer_id]
+
+    def __setitem__(self, index, value):
+        if isinstance(index, slice):
+            indices = range(*index.indices(len(self)))
+            values = list(value)
+            if len(indices) != len(values):
+                raise ValueError("layerwise KV buffer slice assignment changes its length")
+            for child_index, child_value in zip(indices, values):
+                self[child_index] = child_value
+            return
+        layer_id = self._owner.layer_ids[index]
+        pool, local_layer_id = self._owner._resolve(layer_id)
+        pool.kv_buffer[local_layer_id] = value
+
+
+@register_pytree_node_class
+class LayerwiseHybridKVPool(KVCache):
+    """Route global layer IDs to independently structured KV sub-pools.
+
+    All sub-pools share the same logical token/page address space, but may use
+    different physical layouts and kernel-specific buffer implementations.
+    Model writebacks remain ordered by global layer ID and are regrouped here
+    before being committed to each child pool.
+    """
+
+    def __init__(
+        self,
+        *,
+        pools: dict[str, KVCache],
+        layer_ids_by_pool: dict[str, list[int]],
+        indexer_pool_name: str | None = None,
+    ):
+        self.pool_names = tuple(sorted(pools))
+        self.pools = {name: pools[name] for name in self.pool_names}
+        self.layer_ids_by_pool = {name: tuple(layer_ids_by_pool[name]) for name in self.pool_names}
+        self.indexer_pool_name = indexer_pool_name
+        self._configure()
+
+    def _configure(self) -> None:
+        if not self.pool_names:
+            raise ValueError("LayerwiseHybridKVPool requires at least one child pool")
+        if set(self.pools) != set(self.layer_ids_by_pool):
+            raise ValueError(
+                "LayerwiseHybridKVPool pool names and layer mapping names must match: "
+                f"pools={sorted(self.pools)}, mappings={sorted(self.layer_ids_by_pool)}"
+            )
+        if self.indexer_pool_name is not None and self.indexer_pool_name not in self.pools:
+            raise ValueError(f"unknown Indexer pool {self.indexer_pool_name!r}")
+
+        first_pool = self.pools[self.pool_names[0]]
+        self.size = first_pool.size
+        self.page_size = first_pool.page_size
+        self.dtype = first_pool.dtype
+        self.mesh = first_pool.mesh
+        self.dp_size = getattr(first_pool, "dp_size", 1)
+
+        self.layers_mapping: dict[int, tuple[str, int]] = {}
+        for pool_name in self.pool_names:
+            pool = self.pools[pool_name]
+            layer_ids = self.layer_ids_by_pool[pool_name]
+            if len(layer_ids) != pool.layer_num:
+                raise ValueError(
+                    f"pool {pool_name!r} has {pool.layer_num} buffers but "
+                    f"{len(layer_ids)} layer IDs"
+                )
+            for attr in ("size", "page_size", "dtype"):
+                if getattr(pool, attr) != getattr(first_pool, attr):
+                    raise ValueError(
+                        f"all layerwise KV pools must share {attr}; "
+                        f"{self.pool_names[0]}={getattr(first_pool, attr)!r}, "
+                        f"{pool_name}={getattr(pool, attr)!r}"
+                    )
+            if getattr(pool, "dp_size", 1) != self.dp_size:
+                raise ValueError(
+                    "all layerwise KV pools must share dp_size; "
+                    f"{self.pool_names[0]}={self.dp_size}, "
+                    f"{pool_name}={getattr(pool, 'dp_size', 1)}"
+                )
+            for local_layer_id, global_layer_id in enumerate(layer_ids):
+                if global_layer_id in self.layers_mapping:
+                    raise ValueError(f"layer {global_layer_id} is assigned to multiple KV pools")
+                self.layers_mapping[global_layer_id] = (pool_name, local_layer_id)
+
+        self.layer_ids = tuple(sorted(self.layers_mapping))
+        if not self.layer_ids:
+            raise ValueError("LayerwiseHybridKVPool requires at least one mapped layer")
+        self.layer_num = len(self.layer_ids)
+        self.start_layer = self.layer_ids[0]
+        self.end_layer = self.layer_ids[-1]
+        self.mem_usage = sum(pool.mem_usage for pool in self.pools.values())
+
+        self.kv_shardings = {
+            name: getattr(pool, "kv_sharding", None) for name, pool in self.pools.items()
+        }
+        unique_shardings = {repr(sharding) for sharding in self.kv_shardings.values()}
+        self.kv_sharding = (
+            next(iter(self.kv_shardings.values())) if len(unique_shardings) == 1 else None
+        )
+
+        self.kv_partition_axes = {
+            name: getattr(pool, "kv_partition_axis", None) for name, pool in self.pools.items()
+        }
+        unique_partition_axes = set(self.kv_partition_axes.values())
+        self.kv_partition_axis = (
+            next(iter(self.kv_partition_axes.values())) if len(unique_partition_axes) == 1 else None
+        )
+
+    @property
+    def kv_buffer(self):
+        """Global-layer ordered compatibility view over child buffer lists."""
+
+        return _LayerwiseKVBufferView(self)
+
+    def _resolve(self, layer_id: int) -> tuple[KVCache, int]:
+        try:
+            pool_name, local_layer_id = self.layers_mapping[layer_id]
+        except KeyError:
+            raise ValueError(
+                f"layer {layer_id} has no KV pool; configured layers={self.layer_ids}"
+            ) from None
+        return self.pools[pool_name], local_layer_id
+
+    def pool_name_for_layer(self, layer_id: int) -> str:
+        try:
+            return self.layers_mapping[layer_id][0]
+        except KeyError:
+            raise ValueError(
+                f"layer {layer_id} has no KV pool; configured layers={self.layer_ids}"
+            ) from None
+
+    def get_kv_sharding(self, layer_id: int):
+        return self.kv_shardings[self.pool_name_for_layer(layer_id)]
+
+    def get_fused_kv_buffer(self, layer_id: int) -> jax.Array:
+        pool, local_layer_id = self._resolve(layer_id)
+        return pool.get_fused_kv_buffer(local_layer_id)
+
+    def get_kv_buffer(self, layer_id: int):
+        pool, local_layer_id = self._resolve(layer_id)
+        return pool.get_kv_buffer(local_layer_id)
+
+    def set_kv_buffer(
+        self,
+        layer_id: int,
+        loc: jax.Array,
+        cache_k: jax.Array,
+        cache_v: jax.Array = None,
+        is_decode: bool = False,
+    ) -> None:
+        pool, local_layer_id = self._resolve(layer_id)
+        pool.set_kv_buffer(local_layer_id, loc, cache_k, cache_v, is_decode)
+
+    def get_indexer_key_buffer(self, slot_id: int) -> jax.Array:
+        if self.indexer_pool_name is None:
+            raise ValueError("LayerwiseHybridKVPool has no configured Indexer cache owner")
+        indexer_pool = self.pools[self.indexer_pool_name]
+        return indexer_pool.get_indexer_key_buffer(slot_id)
+
+    def replace_indexer_key_buffer(self, indexer_key_buffer: list[jax.Array]) -> None:
+        if self.indexer_pool_name is None:
+            raise ValueError("received Indexer writeback without an Indexer cache owner")
+        indexer_pool = self.pools[self.indexer_pool_name]
+        replace_indexer = getattr(indexer_pool, "replace_indexer_key_buffer", None)
+        if replace_indexer is None:
+            raise TypeError(
+                f"KV pool {self.indexer_pool_name!r} does not support Indexer writeback"
+            )
+        replace_indexer(indexer_key_buffer)
+
+    def _group_by_pool(self, values, *, value_name: str) -> dict[str, list]:
+        if len(values) != self.layer_num:
+            raise ValueError(
+                f"LayerwiseHybridKVPool expected {self.layer_num} {value_name} entries "
+                f"in global layer order {self.layer_ids}, got {len(values)}"
+            )
+        grouped = {name: [] for name in self.pool_names}
+        for layer_id, value in zip(self.layer_ids, values):
+            grouped[self.pool_name_for_layer(layer_id)].append(value)
+        return grouped
+
+    def replace_buffer(self, kv_buffer) -> None:
+        indexer_key_buffer = None
+        if isinstance(kv_buffer, tuple):
+            kv_buffer, indexer_key_buffer = kv_buffer
+
+        grouped = self._group_by_pool(kv_buffer, value_name="KV writeback")
+        for pool_name in self.pool_names:
+            self.pools[pool_name].replace_buffer(grouped[pool_name])
+
+        if indexer_key_buffer is not None:
+            self.replace_indexer_key_buffer(indexer_key_buffer)
+
+    def get_kv_size_bytes(self):
+        sizes = [self.pools[name].get_kv_size_bytes() for name in self.pool_names]
+        if isinstance(sizes[0], tuple):
+            if not all(isinstance(size, tuple) and len(size) == len(sizes[0]) for size in sizes):
+                raise TypeError("layerwise KV pools returned incompatible size formats")
+            return tuple(sum(size[i] for size in sizes) for i in range(len(sizes[0])))
+        if any(isinstance(size, tuple) for size in sizes):
+            raise TypeError("layerwise KV pools returned incompatible size formats")
+        return sum(sizes)
+
+    def get_cpu_copy(self, indices):
+        copies = {name: self.pools[name].get_cpu_copy(indices) for name in self.pool_names}
+        return [
+            copies[pool_name][local_layer_id]
+            for layer_id in self.layer_ids
+            for pool_name, local_layer_id in (self.layers_mapping[layer_id],)
+        ]
+
+    def load_cpu_copy(self, kv_cache_host, indices):
+        grouped = self._group_by_pool(kv_cache_host, value_name="host KV")
+        for pool_name in self.pool_names:
+            self.pools[pool_name].load_cpu_copy(grouped[pool_name], indices)
+
+    def clear_cache(self, indices: jax.Array):
+        for pool_name in self.pool_names:
+            clear_cache = getattr(self.pools[pool_name], "clear_cache", None)
+            if clear_cache is None:
+                raise NotImplementedError(f"KV pool {pool_name!r} does not support clear_cache")
+            clear_cache(indices)
+
+    def tree_flatten(self):
+        children = tuple(self.pools[name] for name in self.pool_names)
+        aux_data = {
+            "pool_names": self.pool_names,
+            "layer_ids_by_pool": tuple(
+                (name, self.layer_ids_by_pool[name]) for name in self.pool_names
+            ),
+            "indexer_pool_name": self.indexer_pool_name,
+        }
+        return children, aux_data
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        obj = object.__new__(cls)
+        obj.pool_names = tuple(aux_data["pool_names"])
+        obj.pools = dict(zip(obj.pool_names, children))
+        obj.layer_ids_by_pool = dict(aux_data["layer_ids_by_pool"])
+        obj.indexer_pool_name = aux_data["indexer_pool_name"]
+        obj._configure()
+        return obj
 
 
 @register_pytree_node_class
@@ -1620,7 +1888,7 @@ class MemoryPools:
             return self._pools[name]
         except KeyError:
             raise AttributeError(
-                f"MemoryPools has no pool '{name}'. " f"Available pools: {sorted(self._pools)}"
+                f"MemoryPools has no pool '{name}'. Available pools: {sorted(self._pools)}"
             ) from None
 
     def tree_flatten(self):

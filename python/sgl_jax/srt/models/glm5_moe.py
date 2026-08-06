@@ -1,4 +1,5 @@
 import logging
+from dataclasses import dataclass
 from typing import Any
 
 import jax
@@ -9,7 +10,12 @@ from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig, MoEBackend
 from sgl_jax.srt.eplb.expert_location import ExpertLocationMetadata
+from sgl_jax.srt.kernels.dsa.ref import build_index_share_map
 from sgl_jax.srt.kernels.fused_mlp import apply_fused_mlp_with_padding
+from sgl_jax.srt.layers.attention.dsa_indexer_ops import (
+    DSAIndexerOutput,
+    update_index_cache_and_select,
+)
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, RotaryEmbedding
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
@@ -52,6 +58,69 @@ def get_hadamard_matrix(n):
     return jnp.block([[h, h], [h, -h]])
 
 
+@dataclass(frozen=True)
+class GlmDsaLayerPlan:
+    """Static model policy for one layer's dense and IndexShare roles."""
+
+    indexer_type: str
+    index_cache_slot: int | None
+    is_dense_attention: bool
+    produces_topk: bool
+
+
+def _full_indexer_serves_sparse_layer(
+    indexer_types: list[str] | tuple[str, ...],
+    layer_id: int,
+    dense_layer_count: int,
+) -> bool:
+    """Whether a full layer's IndexShare group reaches sparse attention."""
+
+    if indexer_types[layer_id] != "full":
+        return False
+    group_end = len(indexer_types)
+    for next_layer in range(layer_id + 1, len(indexer_types)):
+        if indexer_types[next_layer] == "full":
+            group_end = next_layer
+            break
+    return max(layer_id, dense_layer_count) < group_end
+
+
+def _build_dsa_layer_plans(config: PretrainedConfig) -> tuple[GlmDsaLayerPlan, ...]:
+    """Build the model-owned dense/IndexShare plan exactly once."""
+
+    num_layers = config.num_hidden_layers
+    indexer_types = getattr(config, "indexer_types", None)
+    if indexer_types is None:
+        indexer_types = ["full"] * num_layers
+    if len(indexer_types) != num_layers:
+        raise ValueError(f"indexer_types has {len(indexer_types)} entries for {num_layers} layers")
+
+    dense_layer_count = getattr(config, "index_skip_topk_offset", 0)
+    if not 0 <= dense_layer_count <= num_layers:
+        raise ValueError(
+            f"index_skip_topk_offset must be in [0, {num_layers}], got {dense_layer_count}"
+        )
+
+    full_slot, _, _ = build_index_share_map(
+        indexer_types,
+        dense_layer_count,
+        num_layers,
+    )
+    return tuple(
+        GlmDsaLayerPlan(
+            indexer_type=indexer_type,
+            index_cache_slot=full_slot.get(layer_id),
+            is_dense_attention=layer_id < dense_layer_count,
+            produces_topk=_full_indexer_serves_sparse_layer(
+                indexer_types,
+                layer_id,
+                dense_layer_count,
+            ),
+        )
+        for layer_id, indexer_type in enumerate(indexer_types)
+    )
+
+
 class GlmDsaIndexer(nnx.Module):
     def __init__(
         self,
@@ -59,13 +128,23 @@ class GlmDsaIndexer(nnx.Module):
         q_lora_rank: int,
         index_head_dim: int,
         index_n_heads: int,
+        index_topk: int,
+        cache_slot: int,
         mesh: jax.sharding.Mesh,
+        topk_impl: str = "exact_lax",
+        attention_data_partition_axis: str = "data",
         dtype: jnp.dtype = jnp.bfloat16,
         scope_name: str = "indexer",
     ):
         self.head_dim = index_head_dim
         self.n_head = index_n_heads
+        self.index_topk = index_topk
+        self.cache_slot = cache_slot
         self.mesh = mesh
+        self.topk_impl = topk_impl
+        self.attention_data_partition_axis = attention_data_partition_axis
+        if topk_impl not in ("approx", "exact_lax"):
+            raise ValueError(f"unknown DSA top-k implementation: {topk_impl}")
 
         self.wq_b = LinearBase(
             input_size=q_lora_rank,
@@ -97,13 +176,13 @@ class GlmDsaIndexer(nnx.Module):
             scope_name="weights_proj",
         )
 
-    def project(
+    def _project(
         self, hidden_states: jax.Array, qr: jax.Array, positions: jax.Array, rotary_emb: Any
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
-        """Indexer projections only (query, key, per-head weights); no top-k.
+        """Project query, key, and per-head gates for Indexer scoring.
 
         Returns query [T, n_head, head_dim], key [T, head_dim], weights [T, n_head]
-        after RoPE + Hadamard, ready for the DSA backend's streamindex_topk.
+        after RoPE + Hadamard, ready for the DSA indexer runtime.
         """
         query, _ = self.wq_b(qr)
         query = query.reshape(-1, self.n_head, self.head_dim)
@@ -126,52 +205,49 @@ class GlmDsaIndexer(nnx.Module):
         return query, key, weights
 
     def __call__(
-        self, hidden_states: jax.Array, qr: jax.Array, positions: jax.Array, rotary_emb: Any
-    ) -> jax.Array:
-        # 1. Project Query and Key
-        query, _ = self.wq_b(qr)
-        query = query.reshape(-1, self.n_head, self.head_dim)
+        self,
+        hidden_states: jax.Array,
+        q_compressed: jax.Array,
+        positions: jax.Array,
+        rotary_emb: Any,
+        forward_batch: ForwardBatch,
+        token_to_kv_pool: KVCache,
+        *,
+        compute_topk: bool,
+    ) -> DSAIndexerOutput:
+        """Run the complete Indexer pipeline for one full IndexShare layer.
 
-        key, _ = self.wk(hidden_states)
-        key = self.k_norm(key)
+        The owning module performs projection and delegates only the functional
+        cache/scoring primitive.  Shared layers never instantiate or call this
+        module.
+        """
 
-        # Apply RoPE
-        rope_dim = 64
-        q_rope = query[:, :, :rope_dim]
-        k_rope = key[:, :rope_dim]
-        k_rope = k_rope[:, None, :]  # Add head dim for RoPE
-
-        q_rope, k_rope = rotary_emb(positions, q_rope, k_rope)
-        k_rope = k_rope.squeeze(1)  # Remove head dim
-
-        query = query.at[:, :, :rope_dim].set(q_rope)
-        key = key.at[:, :rope_dim].set(k_rope)
-
-        # Apply Hadamard Transform
-        h_matrix = get_hadamard_matrix(128)
-        h_matrix = h_matrix * (128**-0.5)
-
-        query = jnp.einsum("thd,de->the", query, h_matrix)
-        key = jnp.einsum("td,de->te", key, h_matrix)
-
-        # 2. Compute Logits (simplified dense dot product)
-        key_replicated = jax.sharding.reshard(
-            key, jax.sharding.NamedSharding(self.mesh, P(None, None))
+        q_idx, k_idx, idx_weights = self._project(
+            hidden_states,
+            q_compressed,
+            positions,
+            rotary_emb,
         )
-        logits = jnp.einsum("ijk,lk->ijl", query, key_replicated)
 
-        # 3. Apply weights_proj
-        weights, _ = self.weights_proj(hidden_states)
+        attention_backend = forward_batch.attn_backend
+        metadata_owner = getattr(attention_backend, "full_attn_backend", attention_backend)
+        metadata = getattr(metadata_owner, "forward_metadata", None)
+        if metadata is None:
+            raise ValueError("DSA Indexer requires initialized MLA forward metadata")
 
-        # Scale and apply weights
-        scaling = self.head_dim**-0.5
-        logits = logits * scaling * weights[:, :, None]
-
-        # 4. Top-K Selection (Top-1 for now to match dummy shape [T, n_head])
-        _, topk_ids = jax.lax.top_k(logits, 1)
-        topk_ids = topk_ids.squeeze(-1)
-
-        return topk_ids
+        index_cache = token_to_kv_pool.get_indexer_key_buffer(self.cache_slot)
+        return update_index_cache_and_select(
+            q_idx,
+            k_idx,
+            idx_weights,
+            index_cache,
+            metadata,
+            index_topk=self.index_topk,
+            compute_topk=compute_topk,
+            exact_topk=self.topk_impl == "exact_lax",
+            one_token_per_seq=forward_batch.forward_mode.is_decode(),
+            attention_data_partition_axis=self.attention_data_partition_axis,
+        )
 
 
 class Glm5Attention(nnx.Module):
@@ -194,6 +270,12 @@ class Glm5Attention(nnx.Module):
         use_absorbed: bool = True,
         has_indexer: bool = True,
         indexer_type: str = "full",
+        index_topk: int = 2048,
+        index_cache_slot: int | None = None,
+        produces_topk: bool = True,
+        is_dense_attention: bool = False,
+        sparse_impl: str = "exact",
+        topk_impl: str = "exact_lax",
         use_dsa_sparse: bool = False,
     ):
         super().__init__()
@@ -202,7 +284,14 @@ class Glm5Attention(nnx.Module):
         self.num_heads = num_heads
         self.kv_head_num = num_kv_heads
         self.indexer_type = indexer_type
+        self.produces_topk = produces_topk
+        self.is_dense_attention = is_dense_attention
+        self.sparse_impl = sparse_impl
         self.use_dsa_sparse = use_dsa_sparse
+        if indexer_type not in ("full", "shared"):
+            raise ValueError(f"unknown indexer_type {indexer_type!r} at layer {layer_id}")
+        if sparse_impl not in ("page", "exact"):
+            raise ValueError(f"unknown DSA sparse implementation: {sparse_impl}")
 
         self.qk_nope_head_dim = 192
         self.qk_rope_head_dim = 64
@@ -277,12 +366,17 @@ class Glm5Attention(nnx.Module):
         )
 
         if has_indexer:
+            if index_cache_slot is None:
+                raise ValueError(f"full Indexer layer {layer_id} requires an index-cache slot")
             self.indexer = GlmDsaIndexer(
                 hidden_size=hidden_size,
                 q_lora_rank=self.q_lora_rank,
                 index_head_dim=128,
                 index_n_heads=32,
+                index_topk=index_topk,
+                cache_slot=index_cache_slot,
                 mesh=mesh,
+                topk_impl=topk_impl,
                 dtype=dtype,
                 scope_name="indexer",
             )
@@ -374,7 +468,7 @@ class Glm5Attention(nnx.Module):
         k_rope: jax.Array,
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
-        **dsa_kwargs,
+        topk_indices: jax.Array | None = None,
     ) -> tuple[jax.Array, jax.Array]:
         # "thd,rhd->thr" — fp32 accumulate: on v7x the default bf16
         # accumulator drops enough precision on this small batched dot
@@ -398,7 +492,7 @@ class Glm5Attention(nnx.Module):
             token_to_kv_pool=token_to_kv_pool,
             q_rope=q_rope,
             k_rope=k_rope,
-            **dsa_kwargs,
+            topk_indices=topk_indices,
         )
         # "thr,rhd->thd" — fp32 accumulate; see ql_nope above.
         o_v = jax.lax.dot_general(
@@ -445,28 +539,46 @@ class Glm5Attention(nnx.Module):
         hidden_states: jax.Array,
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
-        dsa_topk_in: jax.Array | None = None,
-        dsa_topk_pages_in: jax.Array | None = None,
-    ) -> tuple[jax.Array, jax.Array]:
+        prev_topk_indices: jax.Array | None = None,
+    ) -> tuple[jax.Array, jax.Array, jax.Array | None, jax.Array | None]:
         q_compressed, _ = self.q_a_proj(hidden_states)
         q_compressed = self.q_a_layernorm(q_compressed)
+
+        indexer_output = None
+        if self.use_dsa_sparse:
+            if self.indexer_type == "full":
+                if self.indexer is None:
+                    raise ValueError(f"full Indexer layer {self.layer_id} has no Indexer module")
+                compute_topk = self.produces_topk and (
+                    self.sparse_impl == "exact" or forward_batch.forward_mode.is_decode()
+                )
+                indexer_output = self.indexer(
+                    hidden_states,
+                    q_compressed,
+                    positions,
+                    self.rotary_emb,
+                    forward_batch,
+                    token_to_kv_pool,
+                    compute_topk=compute_topk,
+                )
+                selected_topk = indexer_output.topk_indices
+            else:
+                selected_topk = prev_topk_indices
+
+            if (
+                not self.is_dense_attention
+                and self.sparse_impl == "exact"
+                and selected_topk is None
+            ):
+                raise ValueError(
+                    f"sparse shared layer {self.layer_id} requires top-k from a preceding full layer"
+                )
+            attention_topk = None if self.is_dense_attention else selected_topk
+        else:
+            attention_topk = None
+
         q, _ = self.q_b_proj(q_compressed)
         q = q.reshape(-1, self.num_heads, self.qk_head_dim)
-
-        dsa_kwargs = {}
-        if self.use_dsa_sparse:
-            dsa_kwargs["indexer_type"] = self.indexer_type
-            dsa_kwargs["dsa_topk_in"] = dsa_topk_in
-            dsa_kwargs["dsa_topk_pages_in"] = dsa_topk_pages_in
-            if self.indexer is not None:
-                q_idx, k_idx, idx_w = self.indexer.project(
-                    hidden_states, q_compressed, positions, self.rotary_emb
-                )
-                dsa_kwargs["q_idx"] = q_idx
-                dsa_kwargs["k_idx"] = k_idx
-                dsa_kwargs["idx_weights"] = idx_w
-        elif self.indexer is not None:
-            _ = self.indexer(hidden_states, q_compressed, positions, self.rotary_emb)
 
         q_nope = q[:, :, : self.qk_nope_head_dim]
         q_rope = q[:, :, self.qk_nope_head_dim :]
@@ -480,7 +592,13 @@ class Glm5Attention(nnx.Module):
 
         if self.use_absorbed:
             attn_output, kv_fused = self._forward_mqa(
-                q_nope, q_rope, compressed, k_rope, forward_batch, token_to_kv_pool, **dsa_kwargs
+                q_nope,
+                q_rope,
+                compressed,
+                k_rope,
+                forward_batch,
+                token_to_kv_pool,
+                topk_indices=attention_topk,
             )
         else:
             attn_output, kv_fused = self._forward_mha(
@@ -488,7 +606,12 @@ class Glm5Attention(nnx.Module):
             )
 
         output, _ = self.o_proj(attn_output)
-        return output, kv_fused
+        return (
+            output,
+            kv_fused,
+            indexer_output.index_cache if indexer_output is not None else None,
+            indexer_output.topk_indices if indexer_output is not None else None,
+        )
 
 
 class Glm5MLP(nnx.Module):
@@ -646,6 +769,7 @@ class Glm5DecoderLayer(nnx.Module):
         mesh: jax.sharding.Mesh,
         layer_id: int = 0,
         dtype: jnp.dtype = jnp.bfloat16,
+        dsa_plan: GlmDsaLayerPlan | None = None,
     ):
         self.layer_id = layer_id
         self.hidden_size = config.hidden_size
@@ -659,12 +783,11 @@ class Glm5DecoderLayer(nnx.Module):
         partial_rotary_factor = getattr(config, "partial_rotary_factor", 0.5)
         rotary_dim = int(self.head_dim * partial_rotary_factor)
 
-        # GLM-5.2 IndexShare: layers tagged "shared" reuse the previous "full"
-        # layer's top-k and ship no indexer weights. Dense MLA discards indexer
-        # output anyway, so just skip building the module on shared layers.
-        indexer_types = getattr(config, "indexer_types", None)
-        indexer_type = "full" if indexer_types is None else indexer_types[layer_id]
-        has_indexer = indexer_type == "full"
+        # Dense-attention policy and IndexShare ownership are orthogonal. A
+        # dense full layer can still seed top-k for sparse shared followers.
+        if dsa_plan is None:
+            dsa_plan = _build_dsa_layer_plans(config)[layer_id]
+        has_indexer = dsa_plan.indexer_type == "full"
         use_dsa_sparse = getattr(config, "use_dsa_sparse", False)
 
         self.self_attn = Glm5Attention(
@@ -684,7 +807,13 @@ class Glm5DecoderLayer(nnx.Module):
             mesh=mesh,
             use_absorbed=True,
             has_indexer=has_indexer,
-            indexer_type=indexer_type,
+            indexer_type=dsa_plan.indexer_type,
+            index_topk=getattr(config, "index_topk", 2048),
+            index_cache_slot=dsa_plan.index_cache_slot,
+            produces_topk=dsa_plan.produces_topk,
+            is_dense_attention=dsa_plan.is_dense_attention,
+            sparse_impl=getattr(config, "dsa_sparse_impl", "exact"),
+            topk_impl=getattr(config, "dsa_topk_impl", "exact_lax"),
             use_dsa_sparse=use_dsa_sparse,
         )
 
@@ -794,9 +923,15 @@ class Glm5DecoderLayer(nnx.Module):
         token_to_kv_pool: KVCache,
         residual: jax.Array | None = None,
         dispatch_info: ExpertLocationMetadata | None = None,
-        dsa_topk_in: jax.Array | None = None,
-        dsa_topk_pages_in: jax.Array | None = None,
-    ) -> tuple[jax.Array, jax.Array]:
+        prev_topk_indices: jax.Array | None = None,
+    ) -> tuple[
+        jax.Array,
+        jax.Array,
+        jax.Array,
+        jax.Array | None,
+        jax.Array | None,
+        jax.Array | None,
+    ]:
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -805,13 +940,12 @@ class Glm5DecoderLayer(nnx.Module):
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
 
-        hidden_states, kv_fused = self.self_attn(
+        hidden_states, kv_fused, index_cache, fresh_topk_indices = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
             token_to_kv_pool=token_to_kv_pool,
-            dsa_topk_in=dsa_topk_in,
-            dsa_topk_pages_in=dsa_topk_pages_in,
+            prev_topk_indices=prev_topk_indices,
         )
         hidden_states += residual
         residual = hidden_states
@@ -839,7 +973,7 @@ class Glm5DecoderLayer(nnx.Module):
             hidden_states = self.mlp(hidden_states)
             topk_ids = None
 
-        return hidden_states, residual, kv_fused, topk_ids
+        return hidden_states, residual, kv_fused, index_cache, fresh_topk_indices, topk_ids
 
 
 class Glm5Model(nnx.Module):
@@ -862,6 +996,7 @@ class Glm5Model(nnx.Module):
             mesh=mesh,
         )
 
+        dsa_layer_plans = _build_dsa_layer_plans(config)
         self.layers = nnx.data(
             [
                 Glm5DecoderLayer(
@@ -869,6 +1004,7 @@ class Glm5Model(nnx.Module):
                     layer_id=i,
                     dtype=dtype,
                     mesh=mesh,
+                    dsa_plan=dsa_layer_plans[i],
                 )
                 for i in range(config.num_hidden_layers)
             ]
@@ -883,36 +1019,36 @@ class Glm5Model(nnx.Module):
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
     ) -> jax.Array:
-        from sgl_jax.srt.layers.attention.dsa_sparse_backend import DSAFusedCache
-
         hidden_states = self.embed_tokens(forward_batch.input_ids)
         residual = None
         layers_kv_fused = []
         layers_idx_fused = []
         layers_topk_ids = []
-        dsa_topk = None
-        dsa_topk_pages = None
+        prev_topk_indices = None
         for layer in self.layers:
-            hidden_states, residual, kv_fused, topk_ids = layer(
+            (
+                hidden_states,
+                residual,
+                kv_fused,
+                index_cache,
+                fresh_topk_indices,
+                topk_ids,
+            ) = layer(
                 forward_batch.positions,
                 hidden_states,
                 forward_batch,
                 token_to_kv_pool,
                 residual,
                 dispatch_info=forward_batch.expert_location_metadata,
-                dsa_topk_in=dsa_topk,
-                dsa_topk_pages_in=dsa_topk_pages,
+                prev_topk_indices=prev_topk_indices,
             )
-            if isinstance(kv_fused, DSAFusedCache):
-                layers_kv_fused.append(kv_fused.kv)
-                if kv_fused.idx is not None:
-                    layers_idx_fused.append(kv_fused.idx)
-                if kv_fused.topk is not None:
-                    dsa_topk = kv_fused.topk
-                if kv_fused.topk_pages is not None:
-                    dsa_topk_pages = kv_fused.topk_pages
-            else:
-                layers_kv_fused.append(kv_fused)
+            layers_kv_fused.append(kv_fused)
+            if index_cache is not None:
+                layers_idx_fused.append(index_cache)
+            if layer.self_attn.indexer_type == "full":
+                # A full layer starts a new IndexShare group.  ``None`` clears
+                # stale state when that group never reaches sparse attention.
+                prev_topk_indices = fresh_topk_indices
             layers_topk_ids.append(topk_ids)
 
         if residual is not None:
@@ -1207,8 +1343,8 @@ class GlmMoeDsaForCausalLM(Glm5ForCausalLM):
                 mc.quantization_config.ignored_layers or []
             ) + ["indexer.weights_proj"]
             # indexer.wk has out_dim=128 == block_size_out (single N-block); the
-            # narrow-N guard would reject it but the indexer output is currently
-            # discarded so accuracy is unaffected. Match deepseek_v3 config.
+            # narrow-N guard would reject it. Keep the checkpoint-compatible
+            # exception used by the existing GLM/DeepSeek Indexer loading path.
             mc.quantization_config.allow_narrow_n_blockwise = True
         # Under dynamic (in-framework) quant, Glm5MLP.post_load_weights merges
         # BF16 w_gu/w_d and nulls gate/up/down_proj *before* quantize_model

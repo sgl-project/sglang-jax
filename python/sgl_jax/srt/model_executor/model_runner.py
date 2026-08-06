@@ -519,9 +519,16 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             "fa",
             "dsa_sparse",
         )
-        self.model_config.hf_config.use_dsa_sparse = (
-            self.server_args.attention_backend == "dsa_sparse"
-        )
+        use_dsa_sparse = self.server_args.attention_backend == "dsa_sparse"
+        # Model construction may consume either the root HF config or its text
+        # sub-config. Keep the DSA layer plan identical on both objects.
+        for runtime_config in (
+            self.model_config.hf_config,
+            self.model_config.hf_text_config,
+        ):
+            runtime_config.use_dsa_sparse = use_dsa_sparse
+            runtime_config.dsa_sparse_impl = self.server_args.dsa_sparse_impl
+            runtime_config.dsa_topk_impl = self.server_args.dsa_topk_impl
         self.model_config.hf_config.enable_sequence_parallel = (
             self.server_args.enable_sequence_parallel
         )
@@ -685,25 +692,13 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             )
 
         elif backend == "dsa_sparse" and self.use_mla_backend:
-            from sgl_jax.srt.kernels.dsa.ref import build_index_share_map
             from sgl_jax.srt.layers.attention.dsa_sparse_backend import (
                 DSASparseAttentionBackend,
             )
 
             cfg = self.model_config.hf_text_config
-            full_slot, _, _ = build_index_share_map(
-                getattr(cfg, "indexer_types", None),
-                getattr(cfg, "index_skip_topk_offset", 0),
-                cfg.num_hidden_layers,
-            )
             full_attn_backend = DSASparseAttentionBackend(
-                index_topk=cfg.index_topk,
-                index_head_dim=cfg.index_head_dim,
-                index_n_heads=cfg.index_n_heads,
-                skip_offset=getattr(cfg, "index_skip_topk_offset", 0),
-                full_slot=full_slot,
                 sparse_impl=self.server_args.dsa_sparse_impl,
-                topk_impl=self.server_args.dsa_topk_impl,
                 num_attn_heads=self.num_attn_heads,
                 kv_lora_rank=cfg.kv_lora_rank,
                 qk_nope_head_dim=cfg.qk_nope_head_dim,

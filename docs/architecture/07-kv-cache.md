@@ -72,17 +72,19 @@ The memory pool layer manages on-device memory through three independent class h
 ReqToTokenPool                          KVCache (ABC)                       RecurrentStatePool       MemoryPools
   └── HybridReqToTokenPool                ├── MHATokenToKVPool              (standalone)              (aggregator)
                                           ├── MLATokenToKVPool
-                                          ├── SWAKVPool          ←── composes 2 MHATokenToKVPool
-                                          └── HybridLinearKVPool ←── composes 1 MHA/MLATokenToKVPool
+                                          ├── SWAKVPool             ←── composes 2 MHATokenToKVPool
+                                          ├── HybridLinearKVPool    ←── composes 1 MHA/MLATokenToKVPool
+                                          └── LayerwiseHybridKVPool ←── composes N layout-specific KV pools
 ```
 
-`SWAKVPool` and `HybridLinearKVPool` are composition wrappers over inner MHA/MLA pools, not new storage layouts. `MemoryPools` bundles the active pools into one pytree and is passed across the JIT boundary via `donate_argnames=["memory_pools"]`.
+`SWAKVPool`, `HybridLinearKVPool`, and `LayerwiseHybridKVPool` are composition wrappers over inner pools, not new storage layouts. `MemoryPools` bundles the active pools into one pytree and is passed across the JIT boundary via `donate_argnames=["memory_pools"]`.
 
 `ModelRunner._init_pools()` produces one of two configurations depending on the model:
 
 | Configuration | ReqToTokenPool | KVCache pool | RecurrentStatePool | Allocator |
 |---|---|---|---|---|
 | **Standard** (Llama / Qwen / DeepSeek absorbed-MLA; Gemma2 SWA) | `ReqToTokenPool` | `MHA` / `MLA` / `SWAKVPool` | — | `PagedTokenToKVPoolAllocator` (default), `TokenToKVPoolAllocator` (page_size=1), `SWATokenToKVPoolAllocator` (SWA) |
+| **GLM-5.2 DSA** | `ReqToTokenPool` | `LayerwiseHybridKVPool` (`mla` + `dsa` children) | — | `PagedTokenToKVPoolAllocator` |
 | **Hybrid** (Kimi-Linear — attention + linear recurrent) | `HybridReqToTokenPool` | `HybridLinearKVPool` (full-attn layers only) | `RecurrentStatePool` | `PagedTokenToKVPoolAllocator` |
 
 ### 7.2.1 `MemoryPools`
@@ -149,7 +151,7 @@ The lifecycles of req-pool slots and recurrent slots must be synchronized: `allo
 
 ### 7.2.4 KVCache
 
-The KV cache layer stores Key-Value caches for attention layers. All concrete pools inherit from the `KVCache` abstract base class — four direct subclasses (`MHA`, `MLA`, `SWAKVPool`, `HybridLinearKVPool`); the last two are *composition wrappers* over the first two.
+The KV cache layer stores Key-Value caches for attention layers. All concrete pools inherit from the `KVCache` abstract base class. `MHA` and `MLA` own physical layouts; `SWAKVPool`, `HybridLinearKVPool`, and `LayerwiseHybridKVPool` are composition wrappers.
 
 #### 7.2.4.1 Abstract Base
 
@@ -245,6 +247,19 @@ Used by **hybrid models** that mix attention with linear-recurrent layers (e.g.,
 The model still iterates over a contiguous global `layer_id` range; every accessor calls `_to_physical(layer_id)` to translate to the inner pool's compacted index. Passing a non-full-attention layer ID raises `ValueError` — those layers must write to `RecurrentStatePool` instead.
 
 `replace_buffer(kv_buffer)` expects a **compacted** list of length `full_layer_nums` (not full-length like `SWAKVPool`), since KDA layers don't produce KV writebacks at all.
+
+#### 7.2.4.6 LayerwiseHybridKVPool
+
+Used when different transformer layers share one logical token/page address space but may require different physical KV layouts. It owns named child pools and a mapping from global layer ID to `(pool_name, pool-local layer ID)`.
+
+GLM-5.2 DSA currently configures two children:
+
+- `mla`: the model-defined dense prefix;
+- `dsa`: layers that execute sparse DSA attention.
+
+Both children currently use `MLATokenToKVPool`, so the refactor does not change cache tensors or numerical behavior. The separation is structural: a future DSA-specific child may use a different rank or layout without changing global layer IDs, the allocator, or model writeback ordering.
+
+`replace_buffer()` accepts values in sorted global-layer order and groups them for each child pool. `get_fused_kv_buffer(layer_id)`, `get_kv_buffer(layer_id)`, and `set_kv_buffer(layer_id, ...)` route through the same mapping. `get_kv_sharding(layer_id)` exposes the per-child sharding; the compatibility `kv_sharding` attribute is populated only when all children share one sharding.
 
 ### 7.2.5 RecurrentStatePool
 
