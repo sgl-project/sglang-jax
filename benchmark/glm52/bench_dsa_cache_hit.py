@@ -151,20 +151,36 @@ def _start_profile(
     *,
     host_tracer_level: int,
     python_tracer_level: int,
+    num_steps: int | None = None,
+    profile_by_stage: bool = False,
+    profile_stages: list[str] | None = None,
 ) -> None:
+    payload = {
+        "output_dir": str(output_dir),
+        "host_tracer_level": host_tracer_level,
+        "python_tracer_level": python_tracer_level,
+    }
+    if num_steps is not None:
+        payload["num_steps"] = num_steps
+    if profile_by_stage:
+        payload["profile_by_stage"] = True
+    if profile_stages is not None:
+        payload["profile_stages"] = profile_stages
+
     response = requests.post(
         f"{base_url}/start_profile",
-        json={
-            "output_dir": str(output_dir),
-            "host_tracer_level": host_tracer_level,
-            "python_tracer_level": python_tracer_level,
-        },
+        json=payload,
         timeout=(30, None),
     )
     response.raise_for_status()
 
 
 def _stop_profile(base_url: str) -> None:
+    status = requests.get(f"{base_url}/profile_status", timeout=60)
+    status.raise_for_status()
+    if status.json().get("status") == "idle":
+        return
+
     response = requests.post(f"{base_url}/stop_profile", timeout=(30, None))
     response.raise_for_status()
     status = requests.get(f"{base_url}/profile_status", timeout=60)
@@ -196,6 +212,22 @@ def main() -> None:
     )
     parser.add_argument("--profile-host-tracer-level", type=int, default=0)
     parser.add_argument("--profile-python-tracer-level", type=int, default=0)
+    parser.add_argument(
+        "--profile-num-steps",
+        type=int,
+        help="Number of forward steps to trace per selected stage.",
+    )
+    parser.add_argument(
+        "--profile-by-stage",
+        action="store_true",
+        help="Write separate traces for the selected prefill/decode stages.",
+    )
+    parser.add_argument(
+        "--profile-stages",
+        nargs="+",
+        choices=("prefill", "decode"),
+        help="Stages to trace when --profile-by-stage is set.",
+    )
     parser.add_argument(
         "--prefix-mode",
         choices=("independent", "shared"),
@@ -238,6 +270,9 @@ def main() -> None:
                 args.profile_output_dir,
                 host_tracer_level=args.profile_host_tracer_level,
                 python_tracer_level=args.profile_python_tracer_level,
+                num_steps=args.profile_num_steps,
+                profile_by_stage=args.profile_by_stage,
+                profile_stages=args.profile_stages,
             )
             profile_started = True
         measured = _run_native_batch(

@@ -7,6 +7,7 @@ import jax
 
 from sgl_jax.srt.managers.scheduler_profiler_mixing import (
     _ProfileManager,
+    _make_profiler_options,
     _should_profile_this_process,
 )
 
@@ -52,6 +53,25 @@ class TestProfilerTracerLevels(unittest.TestCase):
                 self.assertTrue(_should_profile_this_process())
             with mock.patch.object(jax, "process_index", return_value=1):
                 self.assertFalse(_should_profile_this_process())
+
+    def test_profile_num_chips_per_task_is_applied(self):
+        with mock.patch.dict(
+            os.environ,
+            {"SGLANG_PROFILE_NUM_CHIPS_PER_TASK": "1"},
+        ):
+            options = _make_profiler_options(0, 0)
+
+        self.assertEqual(options.tpu_num_chips_to_profile_per_task, 1)
+
+    def test_profile_num_chips_per_task_must_be_positive(self):
+        for value in ("0", "-1", "not-an-integer"):
+            with self.subTest(value=value):
+                with mock.patch.dict(
+                    os.environ,
+                    {"SGLANG_PROFILE_NUM_CHIPS_PER_TASK": value},
+                ):
+                    with self.assertRaisesRegex(ValueError, "positive integer"):
+                        _make_profiler_options(0, 0)
 
 
 if __name__ == "__main__":

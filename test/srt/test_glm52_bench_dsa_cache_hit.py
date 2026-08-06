@@ -46,15 +46,21 @@ def test_random_inputs_are_reproducible_by_seed() -> None:
 def test_profile_wraps_only_the_measured_phase_api() -> None:
     start_response = mock.Mock()
     stop_response = mock.Mock()
-    status_response = mock.Mock()
-    status_response.json.return_value = {"status": "idle"}
+    running_response = mock.Mock()
+    running_response.json.return_value = {"status": "in_progress"}
+    idle_response = mock.Mock()
+    idle_response.json.return_value = {"status": "idle"}
 
     with mock.patch.object(
         BENCHMARK.requests,
         "post",
         side_effect=(start_response, stop_response),
     ) as post:
-        with mock.patch.object(BENCHMARK.requests, "get", return_value=status_response):
+        with mock.patch.object(
+            BENCHMARK.requests,
+            "get",
+            side_effect=(running_response, idle_response),
+        ):
             BENCHMARK._start_profile(
                 "http://server",
                 Path("/tmp/profile"),
@@ -72,7 +78,44 @@ def test_profile_wraps_only_the_measured_phase_api() -> None:
     assert post.call_args_list[1].args == ("http://server/stop_profile",)
     start_response.raise_for_status.assert_called_once_with()
     stop_response.raise_for_status.assert_called_once_with()
-    status_response.raise_for_status.assert_called_once_with()
+    running_response.raise_for_status.assert_called_once_with()
+    idle_response.raise_for_status.assert_called_once_with()
+
+
+def test_stage_profile_request_selects_prefill_and_decode() -> None:
+    response = mock.Mock()
+
+    with mock.patch.object(BENCHMARK.requests, "post", return_value=response) as post:
+        BENCHMARK._start_profile(
+            "http://server",
+            Path("/tmp/profile"),
+            host_tracer_level=0,
+            python_tracer_level=0,
+            num_steps=3,
+            profile_by_stage=True,
+            profile_stages=["prefill", "decode"],
+        )
+
+    assert post.call_args.kwargs["json"] == {
+        "output_dir": "/tmp/profile",
+        "host_tracer_level": 0,
+        "python_tracer_level": 0,
+        "num_steps": 3,
+        "profile_by_stage": True,
+        "profile_stages": ["prefill", "decode"],
+    }
+
+
+def test_stop_profile_is_a_noop_after_stage_profile_auto_completes() -> None:
+    idle_response = mock.Mock()
+    idle_response.json.return_value = {"status": "idle"}
+
+    with mock.patch.object(BENCHMARK.requests, "get", return_value=idle_response):
+        with mock.patch.object(BENCHMARK.requests, "post") as post:
+            BENCHMARK._stop_profile("http://server")
+
+    post.assert_not_called()
+    idle_response.raise_for_status.assert_called_once_with()
 
 
 def test_variant_flag_can_label_radix_topk() -> None:
